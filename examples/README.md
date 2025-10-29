@@ -4,6 +4,54 @@ This directory contains example programs and ClassAd files demonstrating various
 
 ## Example Programs
 
+### simple_reader
+**Location:** `examples/simple_reader/main.go`
+
+A command-line tool for reading and displaying ClassAds from files:
+- Accepts a filename as argument
+- Supports both new-style and old-style formats (use `--old` flag)
+- Displays all attributes of each ClassAd
+- Useful for testing and inspecting ClassAd files
+
+Run with:
+```bash
+go run examples/simple_reader/main.go examples/jobs-multiple.ad
+go run examples/simple_reader/main.go examples/machines-old.ad --old
+```
+
+### reader_demo
+**Location:** `examples/reader_demo/main.go`
+
+Demonstrates reading multiple ClassAds from various sources using the Reader API:
+- **Reading new-style ClassAds**: Parsing bracketed ClassAds from strings/files
+- **Reading old-style ClassAds**: Parsing newline-delimited ClassAds separated by blank lines
+- **For-loop iteration**: Using the Reader in idiomatic Go for-loops
+- **Filtering**: Processing only ClassAds that match certain criteria
+- **File I/O**: Reading ClassAds from files
+- **Nested structures**: Working with nested ClassAds in iteration
+
+Run with:
+```bash
+go run examples/reader_demo/main.go
+```
+
+### range_demo
+**Location:** `examples/range_demo/main.go`
+
+Demonstrates Go 1.23+ range-over-function iterator pattern:
+- **Simple iteration**: Using `for ad := range classad.All(reader)`
+- **Indexed iteration**: Using `for i, ad := range classad.AllWithIndex(reader)`
+- **Error handling**: Using `AllWithError` to capture errors during iteration
+- **Old-style support**: Using `AllOld` for newline-delimited ClassAds
+- **File I/O**: Reading ClassAds from files with range syntax
+
+This example showcases the modern, ergonomic way to iterate over ClassAds using Go 1.23+ features.
+
+Run with:
+```bash
+go run examples/range_demo/main.go
+```
+
 ### features_demo
 **Location:** `examples/features_demo/main.go`
 

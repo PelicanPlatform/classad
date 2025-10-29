@@ -60,6 +60,28 @@ TargetType = "Job"
 Cpus = 4
 Memory = 8192`)
 
+// Read multiple ClassAds from a file (traditional pattern)
+file, _ := os.Open("jobs.classads")
+defer file.Close()
+
+reader := classad.NewReader(file)
+for reader.Next() {
+    ad := reader.ClassAd()
+    if owner, ok := ad.EvaluateAttrString("Owner"); ok {
+        fmt.Printf("Owner: %s\n", owner)
+    }
+}
+if err := reader.Err(); err != nil {
+    log.Fatal(err)
+}
+
+// Or use Go 1.23+ range-over-function:
+for ad := range classad.All(file) {
+    if owner, ok := ad.EvaluateAttrString("Owner"); ok {
+        fmt.Printf("Owner: %s\n", owner)
+    }
+}
+
 // Evaluate attributes
 if cpus, ok := jobAd.EvaluateAttrInt("Cpus"); ok {
     fmt.Printf("Cpus = %d\n", cpus)
@@ -98,6 +120,9 @@ golang-classads/
 ├── examples/         # Example ClassAd files and demos
 │   ├── api_demo/     # Basic API examples
 │   ├── features_demo/    # Advanced features demo
+│   ├── reader_demo/      # Reader/iterator demo
+│   ├── range_demo/       # Go 1.23+ range-over-function demo
+│   ├── simple_reader/    # CLI tool for reading ClassAd files
 │   ├── README.md     # Examples documentation
 │   ├── machine.ad
 │   ├── job.ad
@@ -113,7 +138,7 @@ golang-classads/
 
 ### Prerequisites
 
-- Go 1.21 or later
+- Go 1.23 or later (required for range-over-function iterators)
 - goyacc (for generating parser)
 
 ### Install goyacc

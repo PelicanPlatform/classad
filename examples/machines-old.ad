@@ -1,0 +1,20 @@
+MyType = "Machine"
+Name = "worker01.example.com"
+Cpus = 8
+Memory = 16384
+Arch = "X86_64"
+State = "Unclaimed"
+
+MyType = "Machine"
+Name = "worker02.example.com"
+Cpus = 16
+Memory = 32768
+Arch = "X86_64"
+State = "Claimed"
+
+MyType = "Machine"
+Name = "worker03.example.com"
+Cpus = 4
+Memory = 8192
+Arch = "ARM64"
+State = "Unclaimed"

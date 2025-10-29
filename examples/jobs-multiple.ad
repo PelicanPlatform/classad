@@ -1,0 +1,4 @@
+[JobId = 1001; Owner = "alice"; Cpus = 2; Memory = 2048; Status = "Running"]
+[JobId = 1002; Owner = "bob"; Cpus = 4; Memory = 4096; Status = "Idle"]
+[JobId = 1003; Owner = "charlie"; Cpus = 1; Memory = 1024; Status = "Running"]
+[JobId = 1004; Owner = "alice"; Cpus = 8; Memory = 8192; Status = "Held"]

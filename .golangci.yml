@@ -26,6 +26,7 @@ linters-settings:
       - hugeParam  # Value struct is intentionally passed by value
       - ifElseChain  # if-else chains are often clearer than switches
       - unnamedResult  # Named results not always needed for simple returns
+      - ptrToRefParam  # Pointer parameters are valid for error capture in iterators
 
   revive:
     confidence: 0.8

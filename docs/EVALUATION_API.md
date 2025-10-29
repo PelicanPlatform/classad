@@ -51,6 +51,89 @@ The `ClassAd` type represents a ClassAd object and provides methods for manipula
 - `Parse(input string) (*ClassAd, error)` - Parses a ClassAd from a string (new format)
 - `ParseOld(input string) (*ClassAd, error)` - Parses a ClassAd from a string (old format)
 
+#### Reading Multiple ClassAds
+
+The library provides two styles of iterators for parsing multiple ClassAds from an `io.Reader`.
+
+**Traditional Iterator Pattern (Go 1.21+):**
+
+- `NewReader(r io.Reader) *Reader` - Creates a Reader for new-style ClassAds (with brackets)
+- `NewOldReader(r io.Reader) *Reader` - Creates a Reader for old-style ClassAds (newline-delimited)
+- `Next() bool` - Advances to the next ClassAd, returns true if one was found
+- `ClassAd() *ClassAd` - Returns the current ClassAd (call after Next() returns true)
+- `Err() error` - Returns any error that occurred during iteration
+
+**Go 1.23+ Range-over-Function Pattern:**
+
+- `All(r io.Reader) Seq` - Iterator for new-style ClassAds
+- `AllOld(r io.Reader) Seq` - Iterator for old-style ClassAds
+- `AllWithIndex(r io.Reader) Seq2` - Iterator with index for new-style ClassAds
+- `AllOldWithIndex(r io.Reader) Seq2` - Iterator with index for old-style ClassAds
+- `AllWithError(r io.Reader, errPtr *error) Seq` - Iterator with error capture for new-style
+- `AllOldWithError(r io.Reader, errPtr *error) Seq` - Iterator with error capture for old-style
+
+**Example Usage (Traditional Pattern):**
+```go
+import (
+    "os"
+    "github.com/bbockelm/golang-classads/classad"
+)
+
+// Read new-style ClassAds from file
+file, _ := os.Open("jobs.classads")
+defer file.Close()
+
+reader := classad.NewReader(file)
+for reader.Next() {
+    ad := reader.ClassAd()
+    // Process ClassAd...
+}
+if err := reader.Err(); err != nil {
+    log.Fatal(err)
+}
+
+// Read old-style ClassAds
+oldFile, _ := os.Open("machines.classads")
+defer oldFile.Close()
+
+oldReader := classad.NewOldReader(oldFile)
+for oldReader.Next() {
+    ad := oldReader.ClassAd()
+    // Process ClassAd...
+}
+if err := oldReader.Err(); err != nil {
+    log.Fatal(err)
+}
+```
+
+**Example Usage (Go 1.23+ Range-over-Function):**
+```go
+import (
+    "os"
+    "strings"
+    "github.com/bbockelm/golang-classads/classad"
+)
+
+// Simple iteration
+for ad := range classad.All(strings.NewReader(input)) {
+    // Process ClassAd...
+}
+
+// Iteration with index
+for i, ad := range classad.AllWithIndex(file) {
+    fmt.Printf("ClassAd %d: %v\n", i, ad)
+}
+
+// Iteration with error handling
+var err error
+for ad := range classad.AllWithError(file, &err) {
+    // Process ClassAd...
+}
+if err != nil {
+    log.Fatal(err)
+}
+```
+
 #### Attribute Manipulation
 
 - `InsertAttr(name string, value interface{})` - Inserts an attribute (auto-detects type)
