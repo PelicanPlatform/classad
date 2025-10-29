@@ -159,11 +159,11 @@ upper, _ := ad.EvaluateAttrString("upperGreeting")
 ad, _ := classad.Parse(`[
     x = 5;
     y = 5.0;
-    
+
     valueEqual = (x == y);    // true (coerces types)
     strictEqual = (x is y);   // false (different types)
     notEqual = (x isnt y);    // true (different types)
-    
+
     // Meta-equal operator aliases
     metaEqual = (x =?= y);    // false (same as 'is')
     metaNotEqual = (x =!= y)  // true (same as 'isnt')
@@ -196,7 +196,7 @@ ad, _ := classad.Parse(`[
     fruits = {"apple", "banana", "cherry"};
     person = [name = "Bob"; age = 30];
     matrix = {{1, 2, 3}, {4, 5, 6}};
-    
+
     first = fruits[0];
     personName = person["name"];
     element = matrix[1][2]

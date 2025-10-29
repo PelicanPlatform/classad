@@ -71,7 +71,7 @@ type StringLiteral struct {
 }
 
 func (s *StringLiteral) String() string {
-	return fmt.Sprintf("\"%s\"", s.Value)
+	return fmt.Sprintf("%q", s.Value)
 }
 
 func (s *StringLiteral) exprNode() {}

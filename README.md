@@ -1,5 +1,9 @@
 # Golang ClassAds Parser
 
+[![Tests](https://github.com/bbockelm/golang-classads/actions/workflows/test.yml/badge.svg)](https://github.com/bbockelm/golang-classads/actions/workflows/test.yml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Go Report Card](https://goreportcard.com/badge/github.com/bbockelm/golang-classads)](https://goreportcard.com/report/github.com/bbockelm/golang-classads)
+
 A Go implementation of a parser, lexer, and evaluator for the HTCondor ClassAds language, built using goyacc.
 
 ## Overview
@@ -177,12 +181,12 @@ func main() {
         fmt.Println("Error:", err)
         return
     }
-    
+
     // Evaluate attributes
     if cpus, ok := ad.EvaluateAttrInt("Cpus"); ok {
         fmt.Printf("Cpus: %d\n", cpus)
     }
-    
+
     if req, ok := ad.EvaluateAttrBool("Requirements"); ok {
         fmt.Printf("Requirements: %v\n", req)
     }
@@ -456,15 +460,42 @@ The ClassAds language is documented in:
 
 ## License
 
+This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+
 This project implements the ClassAds language specification from HTCondor.
 
 ## Contributing
+
+### Development Setup
+
+1. Install [pre-commit](https://pre-commit.com/) for automatic code quality checks:
+   ```bash
+   pip install pre-commit
+   # or: brew install pre-commit
+   ```
+
+2. Install the git hooks:
+   ```bash
+   pre-commit install
+   ```
+
+3. (Optional) Run pre-commit against all files:
+   ```bash
+   pre-commit run --all-files
+   ```
+
+See [.pre-commit-setup.md](.pre-commit-setup.md) for detailed setup instructions.
+
+### Making Changes
 
 1. Make changes to the appropriate files
 2. Regenerate parser if grammar was modified: `go generate ./...`
 3. Run tests: `go test ./...`
 4. Format code: `go fmt ./...`
-5. Submit a pull request
+5. Pre-commit hooks will run automatically on `git commit`
+6. Submit a pull request
+
+The CI pipeline will automatically run tests on your PR for Go versions 1.21, 1.22, and 1.23.
 
 ## Troubleshooting
 

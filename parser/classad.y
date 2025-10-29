@@ -54,7 +54,7 @@ import (
 
 start
 	: classad
-		{ 
+		{
 			if lex, ok := yylex.(interface{ SetResult(ast.Node) }); ok {
 				lex.SetResult($1)
 			}
@@ -221,7 +221,7 @@ primary_expr
 	: literal
 		{ $$ = $1 }
 	| IDENTIFIER
-		{ 
+		{
 			name, scope := ParseScopedIdentifier($1)
 			$$ = &ast.AttributeReference{Name: name, Scope: scope}
 		}

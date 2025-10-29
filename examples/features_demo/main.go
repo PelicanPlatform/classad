@@ -51,10 +51,10 @@ func main() {
 	compareAd, _ := classad.Parse(`[
 		intValue = 5;
 		realValue = 5.0;
-		
+
 		equalCompare = (intValue == realValue);
 		isCompare = (intValue is realValue);
-		
+
 		undefCheck = (undefined is undefined);
 		typeCheck = ("hello" isnt 42)
 	]`)
@@ -101,14 +101,14 @@ func main() {
 	mathAd, _ := classad.Parse(`[
 		pi = 3.14159;
 		e = 2.71828;
-		
+
 		piFloor = floor(pi);
 		eCeiling = ceiling(e);
 		roundPi = round(pi);
-		
+
 		convertToInt = int(3.9);
 		convertToReal = real(42);
-		
+
 		random100 = random(100)
 	]`)
 
@@ -136,7 +136,7 @@ func main() {
 		boolVal = true;
 		listVal = {1, 2, 3};
 		nestedAd = [x = 1];
-		
+
 		checkString = isString(stringVal);
 		checkInt = isInteger(intVal);
 		checkReal = isReal(realVal);
@@ -168,12 +168,12 @@ func main() {
 	listAd, _ := classad.Parse(`[
 		allowedUsers = {"alice", "bob", "charlie", "david"};
 		numbers = {1, 2, 3, 5, 8, 13, 21};
-		
+
 		hasAlice = member("alice", allowedUsers);
 		hasEve = member("eve", allowedUsers);
 		hasThirteen = member(13, numbers);
 		hasFourteen = member(14, numbers);
-		
+
 		userCount = size(allowedUsers);
 		numberCount = size(numbers)
 	]`)
@@ -201,8 +201,8 @@ func main() {
 		RequestCpus = 4;
 		RequestMemory = 8192;
 		RequestDisk = 100000;
-		Requirements = (Cpus >= RequestCpus) && 
-		              (Memory >= RequestMemory) && 
+		Requirements = (Cpus >= RequestCpus) &&
+		              (Memory >= RequestMemory) &&
 		              (Disk >= RequestDisk) &&
 		              member(Arch, {"X86_64", "ARM64"})
 	]`)
@@ -226,14 +226,14 @@ func main() {
 		MachineMemory = 16384;
 		MachineDisk = 500000;
 		MachineArch = "X86_64";
-		
+
 		cpuMatch = (MachineCpus >= JobRequestCpus);
 		memMatch = (MachineMemory >= JobRequestMemory);
 		diskMatch = (MachineDisk >= JobRequestDisk);
 		archMatch = member(MachineArch, {"X86_64", "ARM64"});
-		
+
 		overallMatch = cpuMatch && memMatch && diskMatch && archMatch;
-		
+
 		matchScore = MachineCpus * 100 + (MachineMemory / 1024)
 	]`)
 
@@ -263,11 +263,11 @@ func main() {
 	metaAd, _ := classad.Parse(`[
 		intVal = 5;
 		realVal = 5.0;
-		
+
 		regularEqual = (intVal == realVal);
 		metaEqual = (intVal =?= realVal);
 		metaNotEqual = (intVal =!= realVal);
-		
+
 		sameTypeEqual = (5 =?= 5);
 		undefCheck = (undefined =?= undefined)
 	]`)
@@ -317,14 +317,14 @@ func main() {
 		fruits = {"apple", "banana", "cherry", "date"};
 		numbers = {10, 20, 30, 40, 50};
 		matrix = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
-		
+
 		person = [name = "John"; age = 35; city = "Boston"];
-		
+
 		firstFruit = fruits[0];
 		thirdFruit = fruits[2];
 		secondNumber = numbers[1];
 		matrixElement = matrix[1][2];
-		
+
 		personName = person["name"];
 		personAge = person["age"]
 	]`)
@@ -361,8 +361,8 @@ func main() {
 		firstEmp = company.employees[0];
 		firstEmpName = company.employees[0].name;
 		secondEmpSalary = company.employees[1].salary;
-		avgSalary = (company.employees[0].salary + 
-		            company.employees[1].salary + 
+		avgSalary = (company.employees[0].salary +
+		            company.employees[1].salary +
 		            company.employees[2].salary) / 3
 	]`)
 

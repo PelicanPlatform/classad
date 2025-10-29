@@ -156,16 +156,16 @@ The evaluator supports:
 ad, _ := classad.Parse(`[
     x = 10;
     y = 20;
-    
+
     // Ternary operator
     maxTernary = (x > y) ? x : y;
-    
+
     // Functional form (useful in nested expressions)
     maxFunc = ifThenElse(x > y, x, y);
-    
+
     // Can return different types
     status = ifThenElse(x > 5, "high", 0);
-    
+
     // Handles undefined and error properly
     safeDiv = ifThenElse(y != 0, x / y, undefined)
 ]`)
@@ -320,7 +320,7 @@ ad, _ := classad.Parse(`[
     equalNotIs = (5 == 5.0);          // true - == allows type coercion
     undefCheck = (undefined is undefined);  // true
     errorCheck = (error is error);          // true
-    
+
     // Meta-equal operator aliases
     metaEqual = (5 =?= 5);            // true - same as 'is'
     metaNotEqual = (5 =!= 5.0);       // true - same as 'isnt'
@@ -357,13 +357,13 @@ ad, _ := classad.Parse(`[
     len = size("Hello");
     lower = toLower("HELLO");
     upper = toUpper("world");
-    
+
     // String list membership
     colors = "red,green,blue";
     hasRed = stringListMember("red", colors);           // true
     hasYellow = stringListMember("yellow", colors);     // false
     hasGreen = stringListMember("GREEN", colors, "i");  // true (case-insensitive)
-    
+
     // Regular expression matching
     email = "user@example.com";
     validEmail = regexp("^[^@]+@[^@]+\\.[^@]+$", email);  // true
@@ -493,7 +493,7 @@ Use integer indices (0-based) to access list elements:
 ad, _ := classad.Parse(`[
     fruits = {"apple", "banana", "cherry"};
     matrix = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
-    
+
     first = fruits[0];
     third = fruits[2];
     element = matrix[1][2]
@@ -646,11 +646,11 @@ matchAd := classad.NewMatchClassAd(job, machine)
 
 if matchAd.Match() {
     fmt.Println("Match successful!")
-    
+
     // Evaluate ranks
     jobRank := matchAd.EvaluateRankLeft("Rank")
     machineRank := matchAd.EvaluateRankRight("Rank")
-    
+
     if jobRank.IsReal() && machineRank.IsReal() {
         jr, _ := jobRank.RealValue()
         mr, _ := machineRank.RealValue()

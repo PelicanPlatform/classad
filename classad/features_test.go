@@ -359,7 +359,7 @@ func TestTypeCheckingFunctions(t *testing.T) {
 		rec = [a = 1];
 		undef = undefined;
 		err = error;
-		
+
 		checkStr = isString(str);
 		checkInt = isInteger(num);
 		checkReal = isReal(flt);
@@ -368,7 +368,7 @@ func TestTypeCheckingFunctions(t *testing.T) {
 		checkClassAd = isClassAd(rec);
 		checkUndef = isUndefined(undef);
 		checkErr = isError(err);
-		
+
 		notStr = isString(num);
 		notInt = isInteger(str)
 	]`)
@@ -540,7 +540,7 @@ func TestMetaEqualOperator(t *testing.T) {
 	ad, err := Parse(`[
 		intValue = 5;
 		realValue = 5.0;
-		
+
 		metaEqual1 = (intValue =?= intValue);
 		metaEqual2 = (intValue =?= realValue);
 		metaEqual3 = (5 =?= 5);
@@ -582,7 +582,7 @@ func TestMetaNotEqualOperator(t *testing.T) {
 	ad, err := Parse(`[
 		intValue = 5;
 		realValue = 5.0;
-		
+
 		metaNotEqual1 = (intValue =!= realValue);
 		metaNotEqual2 = (intValue =!= intValue);
 		metaNotEqual3 = ("hello" =!= "world");
@@ -621,7 +621,7 @@ func TestMetaEqualWithLists(t *testing.T) {
 		list1 = {1, 2, 3};
 		list2 = {1, 2, 3};
 		list3 = {1, 2, 3, 4};
-		
+
 		same = (list1 =?= list2);
 		different = (list1 =!= list3)
 	]`)
@@ -1227,15 +1227,15 @@ func TestMatchClassAdComplexScenario(t *testing.T) {
 	machine.InsertAttrString("Arch", "X86_64")
 
 	// Job requirements
-	jobReqExpr, _ := Parse(`[r = (TARGET.Cpus >= RequestCpus) && 
-	                              (TARGET.Memory >= RequestMemory) && 
+	jobReqExpr, _ := Parse(`[r = (TARGET.Cpus >= RequestCpus) &&
+	                              (TARGET.Memory >= RequestMemory) &&
 	                              (TARGET.Disk >= RequestDisk) &&
 	                              (TARGET.Arch == "X86_64")]`)
 	job.Insert("Requirements", jobReqExpr.Lookup("r"))
 
 	// Machine requirements
-	machineReqExpr, _ := Parse(`[r = (TARGET.RequestCpus <= Cpus) && 
-	                                  (TARGET.RequestMemory <= Memory) && 
+	machineReqExpr, _ := Parse(`[r = (TARGET.RequestCpus <= Cpus) &&
+	                                  (TARGET.RequestMemory <= Memory) &&
 	                                  (TARGET.RequestDisk <= Disk)]`)
 	machine.Insert("Requirements", machineReqExpr.Lookup("r"))
 

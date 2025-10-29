@@ -96,7 +96,7 @@ func (c *ClassAd) InsertAttrFloat(name string, value float64) {
 }
 
 // InsertAttrString inserts an attribute with a string value.
-func (c *ClassAd) InsertAttrString(name string, value string) {
+func (c *ClassAd) InsertAttrString(name, value string) {
 	c.Insert(name, &ast.StringLiteral{Value: value})
 }
 

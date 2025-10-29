@@ -8,6 +8,8 @@ linters-settings:
 
   govet:
     enable-all: true
+    disable:
+      - fieldalignment  # Field order optimizations often reduce readability
 
   gofmt:
     simplify: true
@@ -20,6 +22,10 @@ linters-settings:
       - diagnostic
       - style
       - performance
+    disabled-checks:
+      - hugeParam  # Value struct is intentionally passed by value
+      - ifElseChain  # if-else chains are often clearer than switches
+      - unnamedResult  # Named results not always needed for simple returns
 
   revive:
     confidence: 0.8
@@ -65,6 +71,24 @@ issues:
       linters:
         - errcheck
         - unparam
+
+    # Exclude safe type conversions in evaluator (type is checked before calling)
+    - path: classad/evaluator\.go
+      text: "Error return value of.*Value.*is not checked"
+      linters:
+        - errcheck
+
+    # Exclude safe type conversions in functions (type is checked before calling)
+    - path: classad/functions\.go
+      text: "Error return value of.*Value.*is not checked"
+      linters:
+        - errcheck
+
+    # Exclude safe type conversions in matchclassad (type is checked before calling)
+    - path: classad/matchclassad\.go
+      text: "Error return value of.*Value.*is not checked"
+      linters:
+        - errcheck
 
   max-issues-per-linter: 0
   max-same-issues: 0
