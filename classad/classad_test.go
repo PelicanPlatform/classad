@@ -3,7 +3,7 @@ package classad
 import (
 	"testing"
 
-	"github.com/bbockelm/golang-classads/ast"
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 func TestNewClassAd(t *testing.T) {

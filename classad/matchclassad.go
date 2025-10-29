@@ -2,7 +2,7 @@
 package classad
 
 import (
-	"github.com/bbockelm/golang-classads/ast"
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 // MatchClassAd represents a pair of ClassAds for matching.

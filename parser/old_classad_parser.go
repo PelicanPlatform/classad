@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bbockelm/golang-classads/ast"
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 // ParseOldClassAd parses a ClassAd in the "old" HTCondor format.

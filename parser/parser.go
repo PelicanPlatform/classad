@@ -5,7 +5,7 @@ package parser
 import (
 	"strings"
 
-	"github.com/bbockelm/golang-classads/ast"
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 // Parse parses a ClassAd expression string and returns the AST.

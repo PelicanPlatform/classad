@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/bbockelm/golang-classads/classad"
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 func main() {

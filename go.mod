@@ -1,3 +1,3 @@
-module github.com/bbockelm/golang-classads
+module github.com/PelicanPlatform/classad
 
 go 1.23

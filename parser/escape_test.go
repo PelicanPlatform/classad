@@ -3,7 +3,7 @@ package parser
 import (
 	"testing"
 
-	"github.com/bbockelm/golang-classads/ast"
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 func TestStringEscapeSequences(t *testing.T) {

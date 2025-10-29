@@ -1,8 +1,8 @@
 # Golang ClassAds Parser
 
-[![Tests](https://github.com/bbockelm/golang-classads/actions/workflows/test.yml/badge.svg)](https://github.com/bbockelm/golang-classads/actions/workflows/test.yml)
+[![Tests](https://github.com/PelicanPlatform/classad/actions/workflows/test.yml/badge.svg)](https://github.com/PelicanPlatform/classad/actions/workflows/test.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
-[![Go Report Card](https://goreportcard.com/badge/github.com/bbockelm/golang-classads)](https://goreportcard.com/report/github.com/bbockelm/golang-classads)
+[![Go Report Card](https://goreportcard.com/badge/github.com/PelicanPlatform/classad)](https://goreportcard.com/report/github.com/PelicanPlatform/classad)
 
 A Go implementation of a parser, lexer, and evaluator for the HTCondor ClassAds language, built using goyacc.
 
@@ -40,7 +40,7 @@ This project provides a complete parser and evaluation engine for the ClassAds l
 ## Quick Start
 
 ```go
-import "github.com/bbockelm/golang-classads/classad"
+import "github.com/PelicanPlatform/classad/classad"
 
 // Create a ClassAd programmatically
 ad := classad.New()
@@ -192,7 +192,7 @@ package main
 
 import (
     "fmt"
-    "github.com/bbockelm/golang-classads/classad"
+    "github.com/PelicanPlatform/classad/classad"
 )
 
 func main() {
@@ -225,7 +225,7 @@ package main
 
 import (
     "fmt"
-    "github.com/bbockelm/golang-classads/parser"
+    "github.com/PelicanPlatform/classad/parser"
 )
 
 func main() {

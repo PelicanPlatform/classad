@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/bbockelm/golang-classads/ast"
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 // ValueType represents the type of a ClassAd value.

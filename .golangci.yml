@@ -15,7 +15,7 @@ linters-settings:
     simplify: true
 
   goimports:
-    local-prefixes: github.com/bbockelm/golang-classads
+    local-prefixes: github.com/PelicanPlatform/classad
 
   gocritic:
     enabled-tags:

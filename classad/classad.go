@@ -5,8 +5,8 @@ package classad
 import (
 	"fmt"
 
-	"github.com/bbockelm/golang-classads/ast"
-	"github.com/bbockelm/golang-classads/parser"
+	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 // ClassAd represents a ClassAd with attributes that can be evaluated.

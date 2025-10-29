@@ -3,9 +3,9 @@ package main
 import (
 	"fmt"
 
-	"github.com/bbockelm/golang-classads/ast"
-	"github.com/bbockelm/golang-classads/classad"
-	"github.com/bbockelm/golang-classads/parser"
+	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 func main() {

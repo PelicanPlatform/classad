@@ -2,7 +2,7 @@
 package parser
 
 import (
-	"github.com/bbockelm/golang-classads/ast"
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 %}

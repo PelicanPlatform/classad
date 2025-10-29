@@ -18,7 +18,6 @@ vendor/
 go.work
 
 # Generated parser files
-parser/y.go
 parser/y.output
 y.output
 

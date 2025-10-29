@@ -13,7 +13,7 @@ The `classad` package provides a high-level API for working with ClassAds, inclu
 ## Quick Start
 
 ```go
-import "github.com/bbockelm/golang-classads/classad"
+import "github.com/PelicanPlatform/classad/classad"
 
 // Create a new ClassAd
 ad := classad.New()
@@ -76,7 +76,7 @@ The library provides two styles of iterators for parsing multiple ClassAds from 
 ```go
 import (
     "os"
-    "github.com/bbockelm/golang-classads/classad"
+    "github.com/PelicanPlatform/classad/classad"
 )
 
 // Read new-style ClassAds from file
@@ -111,7 +111,7 @@ if err := oldReader.Err(); err != nil {
 import (
     "os"
     "strings"
-    "github.com/bbockelm/golang-classads/classad"
+    "github.com/PelicanPlatform/classad/classad"
 )
 
 // Simple iteration
@@ -634,7 +634,7 @@ The `MatchClassAd` type provides symmetric matching between two ClassAds, inspir
 ### Creating a MatchClassAd
 
 ```go
-import "github.com/bbockelm/golang-classads/classad"
+import "github.com/PelicanPlatform/classad/classad"
 
 // Create job and machine ClassAds
 job := classad.New()

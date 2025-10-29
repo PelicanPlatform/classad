@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/bbockelm/golang-classads/parser"
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 func main() {
