@@ -10,7 +10,7 @@ This project provides a complete parser and evaluation engine for the ClassAds l
 
 - **Complete Lexer**: Tokenizes ClassAd syntax including:
   - Literals (integers, reals, strings, booleans, undefined, error)
-  - Operators (arithmetic, logical, comparison, bitwise, shift)
+  - Operators (arithmetic, logical, comparison, bitwise, shift, is/isnt)
   - Attribute references and assignments
   - Lists and nested records
   - Function calls
@@ -18,7 +18,11 @@ This project provides a complete parser and evaluation engine for the ClassAds l
 
 - **goyacc-based Parser**: Generates efficient parser from grammar specification
 - **AST Representation**: Clean Abstract Syntax Tree structures for all ClassAd constructs
-- **Evaluation Engine**: Evaluates ClassAd expressions with type safety
+- **Evaluation Engine**: Evaluates ClassAd expressions with:
+  - Type safety and automatic coercion
+  - Nested ClassAds and lists
+  - Strict identity operators (`is`/`isnt`)
+  - 20+ built-in functions (string, math, type checking, list operations)
 - **Public API**: High-level API mimicking the C++ HTCondor ClassAd library
 - **Go Generate Support**: Easy regeneration of parser from grammar
 
@@ -62,7 +66,9 @@ golang-classads/
 │   ├── classad.go
 │   ├── classad_test.go
 │   ├── evaluator.go
-│   └── evaluator_test.go
+│   ├── evaluator_test.go
+│   ├── features_test.go  # Tests for advanced features
+│   └── functions.go      # Built-in functions
 ├── parser/           # Parser and lexer (generated parser from .y file)
 │   ├── classad.y     # goyacc grammar specification
 │   ├── lexer.go      # Lexer implementation
@@ -73,7 +79,9 @@ golang-classads/
 │   └── classad-parser/
 │       └── main.go
 ├── examples/         # Example ClassAd files and demos
-│   ├── api_demo/     # Comprehensive API examples
+│   ├── api_demo/     # Basic API examples
+│   ├── features_demo/    # Advanced features demo
+│   ├── README.md     # Examples documentation
 │   ├── machine.ad
 │   ├── job.ad
 │   └── expressions.txt
@@ -207,6 +215,31 @@ This demonstrates:
 - Modifying ClassAds
 - Real-world HTCondor scenarios
 
+Run the advanced features demo:
+
+```bash
+go run ./examples/features_demo/main.go
+```
+
+This demonstrates:
+- Nested ClassAds and lists
+- IS/ISNT operators (strict identity checking)
+- Built-in string functions (strcat, substr, toUpper, toLower, size)
+- Built-in math functions (floor, ceiling, round, int, real, random)
+- Built-in type checking functions (isString, isInteger, isList, etc.)
+- List operations (member, size)
+- HTCondor job matching simulation
+
+See [examples/README.md](examples/README.md) for detailed examples and usage patterns.
+- Creating ClassAds programmatically
+- Parsing ClassAd strings
+- Evaluating expressions
+- Type-safe attribute access
+- Arithmetic, comparison, and logical operations
+- Conditional expressions
+- Modifying ClassAds
+- Real-world HTCondor scenarios
+
 ### Command-Line Tool
 
 Parse a ClassAd:
@@ -240,18 +273,46 @@ Parse a more complex example:
 - **Logical**: `&&`, `||`, `!`
 - **Bitwise**: `&`, `|`, `^`, `~`
 - **Shift**: `<<`, `>>`, `>>>`
-- **Special**: `is`, `isnt`
+- **Strict Identity**: `is`, `isnt` (type and value must match exactly)
 
 ### Expressions
 
 - **Attribute Assignment**: `name = value`
 - **Attribute Reference**: `TARGET.Memory`
 - **Conditional**: `x > 0 ? "positive" : "negative"`
-- **Function Call**: `strcat("hello", " ", "world")`
+- **Function Call**: `strcat("hello", " ", "world")`, `floor(3.14)`, `member(x, list)`
 - **List**: `{1, 2, 3, 4, 5}`
-- **Record**: `[a = 1; b = 2]`
+- **Nested Record**: `[a = 1; b = [x = 10; y = 20]]`
 - **Selection**: `record.field`
 - **Subscript**: `list[0]`
+
+### Built-in Functions
+
+The evaluator supports 20+ built-in functions:
+
+**String Functions:**
+- `strcat(s1, s2, ...)` - Concatenate strings
+- `substr(str, offset, length)` - Extract substring
+- `size(str)` / `length(str)` - String/list length
+- `toUpper(str)` / `toLower(str)` - Case conversion
+
+**Math Functions:**
+- `floor(x)`, `ceiling(x)`, `round(x)` - Rounding
+- `int(x)`, `real(x)` - Type conversion
+- `random(max)` - Random number generation
+
+**Type Checking:**
+- `isUndefined(x)`, `isError(x)` - Special value checks
+- `isString(x)`, `isInteger(x)`, `isReal(x)`, `isBoolean(x)` - Type checks
+- `isList(x)`, `isClassAd(x)` - Structure checks
+
+**List Operations:**
+- `member(item, list)` - Check list membership
+
+**Time:**
+- `time()` - Current Unix timestamp
+
+See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete function documentation.
 
 ### Example ClassAd
 
@@ -304,7 +365,10 @@ go test -cover ./...
 Test packages include:
 - `ast` - AST node tests
 - `parser` - Lexer and parser tests
-- `classad` - Evaluation API tests (ClassAd CRUD, expression evaluation, type coercion, error handling)
+- `classad` - Evaluation API tests:
+  - classad_test.go: ClassAd CRUD operations
+  - evaluator_test.go: Expression evaluation, type coercion, error handling
+  - features_test.go: Nested structures, is/isnt operators, built-in functions
 
 ### Code Formatting
 
@@ -369,8 +433,9 @@ goyacc -o parser/y.go -p yy parser/classad.y
 
 ## TODO
 
-- [ ] Implement expression evaluator
-- [ ] Add more built-in functions
+- [ ] Support for attribute selection expressions (record.field)
+- [ ] Support for subscript expressions (list[index])
+- [ ] Additional built-in functions (stringListMember, regexp, etc.)
 - [ ] Support for old ClassAd syntax
 - [ ] XML serialization/deserialization
 - [ ] ClassAd matching and ranking

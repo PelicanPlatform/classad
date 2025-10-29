@@ -273,6 +273,9 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 	case *ast.RecordLiteral:
 		return NewClassAdValue(&ClassAd{ad: v.ClassAd})
 
+	case *ast.FunctionCall:
+		return e.evaluateFunctionCall(v)
+
 	default:
 		return NewErrorValue()
 	}
@@ -295,7 +298,15 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 	left := e.Evaluate(op.Left)
 	right := e.Evaluate(op.Right)
 
-	// Handle error propagation
+	// For 'is' and 'isnt' operators, don't propagate errors - they are part of the comparison
+	if op.Op == "is" {
+		return e.evaluateIs(left, right)
+	}
+	if op.Op == "isnt" {
+		return e.evaluateIsnt(left, right)
+	}
+
+	// Handle error propagation for other operators
 	if left.IsError() || right.IsError() {
 		return NewErrorValue()
 	}
@@ -646,6 +657,78 @@ func (e *Evaluator) evaluateNotEqual(left, right Value) Value {
 	return NewBoolValue(!boolVal)
 }
 
+// evaluateIs checks for strict identity (same type and same value).
+// Unlike ==, this distinguishes between undefined and error, and does not perform type coercion.
+func (e *Evaluator) evaluateIs(left, right Value) Value {
+	// IS operator: strict identity check
+	// - Different types -> false
+	// - Same type -> compare values
+	// - Undefined IS Undefined -> true
+	// - Error IS Error -> true
+
+	if left.Type() != right.Type() {
+		return NewBoolValue(false)
+	}
+
+	switch left.Type() {
+	case UndefinedValue:
+		return NewBoolValue(true) // undefined is undefined
+	case ErrorValue:
+		return NewBoolValue(true) // error is error
+	case BooleanValue:
+		leftBool, _ := left.BoolValue()
+		rightBool, _ := right.BoolValue()
+		return NewBoolValue(leftBool == rightBool)
+	case IntegerValue:
+		leftInt, _ := left.IntValue()
+		rightInt, _ := right.IntValue()
+		return NewBoolValue(leftInt == rightInt)
+	case RealValue:
+		leftReal, _ := left.RealValue()
+		rightReal, _ := right.RealValue()
+		return NewBoolValue(leftReal == rightReal)
+	case StringValue:
+		leftStr, _ := left.StringValue()
+		rightStr, _ := right.StringValue()
+		return NewBoolValue(leftStr == rightStr)
+	case ListValue:
+		// Lists: compare element-wise
+		leftList, _ := left.ListValue()
+		rightList, _ := right.ListValue()
+		if len(leftList) != len(rightList) {
+			return NewBoolValue(false)
+		}
+		for i := range leftList {
+			elemResult := e.evaluateIs(leftList[i], rightList[i])
+			if elemResult.IsError() {
+				return elemResult
+			}
+			match, _ := elemResult.BoolValue()
+			if !match {
+				return NewBoolValue(false)
+			}
+		}
+		return NewBoolValue(true)
+	case ClassAdValue:
+		// ClassAds: pointer comparison (same object)
+		leftAd, _ := left.ClassAdValue()
+		rightAd, _ := right.ClassAdValue()
+		return NewBoolValue(leftAd == rightAd)
+	default:
+		return NewErrorValue()
+	}
+}
+
+// evaluateIsnt is the negation of evaluateIs.
+func (e *Evaluator) evaluateIsnt(left, right Value) Value {
+	result := e.evaluateIs(left, right)
+	if result.IsError() {
+		return result
+	}
+	boolVal, _ := result.BoolValue()
+	return NewBoolValue(!boolVal)
+}
+
 // Logical operations
 func (e *Evaluator) evaluateAnd(left, right Value) Value {
 	if left.IsError() || right.IsError() {
@@ -697,4 +780,74 @@ func (e *Evaluator) evaluateOr(left, right Value) Value {
 	leftBool, _ := left.BoolValue()
 	rightBool, _ := right.BoolValue()
 	return NewBoolValue(leftBool || rightBool)
+}
+
+// Built-in function evaluation
+func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
+	// Evaluate all arguments
+	args := make([]Value, len(fc.Args))
+	for i, arg := range fc.Args {
+		args[i] = e.Evaluate(arg)
+	}
+
+	// Dispatch to the appropriate function
+	switch fc.Name {
+	// String functions
+	case "strcat":
+		return builtinStrcat(args)
+	case "substr":
+		return builtinSubstr(args)
+	case "size":
+		return builtinSize(args)
+	case "length":
+		return builtinLength(args)
+	case "toLower", "tolower":
+		return builtinToLower(args)
+	case "toUpper", "toupper":
+		return builtinToUpper(args)
+
+	// Math functions
+	case "floor":
+		return builtinFloor(args)
+	case "ceiling", "ceil":
+		return builtinCeiling(args)
+	case "round":
+		return builtinRound(args)
+	case "random":
+		return builtinRandom(args)
+	case "int":
+		return builtinInt(args)
+	case "real":
+		return builtinReal(args)
+
+	// Type checking functions
+	case "isUndefined":
+		return builtinIsUndefined(args)
+	case "isError":
+		return builtinIsError(args)
+	case "isString":
+		return builtinIsString(args)
+	case "isInteger":
+		return builtinIsInteger(args)
+	case "isReal":
+		return builtinIsReal(args)
+	case "isBoolean":
+		return builtinIsBoolean(args)
+	case "isList":
+		return builtinIsList(args)
+	case "isClassAd":
+		return builtinIsClassAd(args)
+
+	// Time functions
+	case "time":
+		return builtinTime(args)
+
+	// List functions
+	case "member":
+		return builtinMember(args)
+
+	default:
+		// Unknown function
+		return NewErrorValue()
+	}
 }

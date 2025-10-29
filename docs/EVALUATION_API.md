@@ -201,6 +201,158 @@ The test suite includes:
 - Arithmetic, comparison, and logical operations
 - Unary operations
 - Complex expressions
+- Nested ClassAds and lists
+- IS/ISNT operators
+- Built-in functions
+
+## Nested ClassAds and Lists
+
+ClassAds support nested structures:
+
+```go
+// Lists
+ad, _ := classad.Parse(`[numbers = {1, 2, 3, 4, 5}]`)
+numbersVal := ad.EvaluateAttr("numbers")
+if numbersVal.IsList() {
+    list, _ := numbersVal.ListValue()
+    // Access list elements
+}
+
+// Nested ClassAds
+ad, _ := classad.Parse(`[
+    server = [host = "example.com"; port = 8080];
+    name = "web-server"
+]`)
+serverVal := ad.EvaluateAttr("server")
+if serverVal.IsClassAd() {
+    serverAd, _ := serverVal.ClassAdValue()
+    host, _ := serverAd.EvaluateAttrString("host")
+    port, _ := serverAd.EvaluateAttrInt("port")
+}
+```
+
+## IS and ISNT Operators
+
+The `is` and `isnt` operators provide strict identity checking (type and value):
+
+```go
+// Unlike ==, 'is' checks type identity
+ad, _ := classad.Parse(`[
+    sameType = (5 is 5);              // true - same type and value
+    diffType = (5 is 5.0);            // false - different types (int vs real)
+    equalNotIs = (5 == 5.0);          // true - == allows type coercion
+    undefCheck = (undefined is undefined);  // true
+    errorCheck = (error is error);          // true
+]`)
+```
+
+Key differences from `==`:
+- `is` requires exact type match (no coercion)
+- `is` can compare `undefined` and `error` values
+- `is` compares list elements recursively
+- `isnt` is the negation of `is`
+
+## Built-in Functions
+
+### String Functions
+
+- `strcat(str1, str2, ...)` - Concatenates strings
+- `substr(string, offset[, length])` - Extracts substring (supports negative offsets)
+- `size(string_or_list)` - Returns length of string or list
+- `length(string_or_list)` - Alias for `size()`
+- `toLower(string)` / `tolower(string)` - Converts to lowercase
+- `toUpper(string)` / `toupper(string)` - Converts to uppercase
+
+```go
+ad, _ := classad.Parse(`[
+    greeting = strcat("Hello", " ", "World");
+    sub = substr("Hello World", 0, 5);
+    len = size("Hello");
+    lower = toLower("HELLO");
+    upper = toUpper("world")
+]`)
+// greeting = "Hello World"
+// sub = "Hello"
+// len = 5
+// lower = "hello"
+// upper = "WORLD"
+```
+
+### Math Functions
+
+- `floor(number)` - Returns floor as integer
+- `ceiling(number)` / `ceil(number)` - Returns ceiling as integer
+- `round(number)` - Rounds to nearest integer
+- `random([max])` - Returns random real 0-1 (or 0-max)
+- `int(value)` - Converts to integer
+- `real(value)` - Converts to real
+
+```go
+ad, _ := classad.Parse(`[
+    f = floor(3.7);       // 3
+    c = ceiling(3.2);     // 4
+    r = round(3.5);       // 4
+    i = int(3.9);         // 3
+    rl = real(5);         // 5.0
+    rand = random(100)    // random float 0-100
+]`)
+```
+
+### Type Checking Functions
+
+- `isUndefined(value)` - Returns true if value is undefined
+- `isError(value)` - Returns true if value is an error
+- `isString(value)` - Returns true if value is a string
+- `isInteger(value)` - Returns true if value is an integer
+- `isReal(value)` - Returns true if value is a real number
+- `isBoolean(value)` - Returns true if value is a boolean
+- `isList(value)` - Returns true if value is a list
+- `isClassAd(value)` - Returns true if value is a ClassAd
+
+```go
+ad, _ := classad.Parse(`[
+    x = 42;
+    checkInt = isInteger(x);      // true
+    checkStr = isString(x);       // false
+    checkUndef = isUndefined(y)   // true (y doesn't exist)
+]`)
+```
+
+### List Functions
+
+- `member(element, list)` - Returns true if element is in list
+
+```go
+ad, _ := classad.Parse(`[
+    nums = {1, 2, 3, 4, 5};
+    hasThree = member(3, nums);   // true
+    hasTen = member(10, nums)     // false
+]`)
+```
+
+### Time Functions
+
+- `time()` - Returns current Unix timestamp (seconds since epoch)
+
+```go
+ad, _ := classad.Parse(`[now = time()]`)
+```
+
+## Error Handling
+
+Functions properly propagate undefined and error values:
+
+```go
+ad, _ := classad.Parse(`[
+    x = undefined;
+    result = size(x)  // result is undefined
+]`)
+
+ad2, _ := classad.Parse(`[
+    x = error;
+    result = size(x)  // result is error
+]`)
+```
 
 ## Compatibility
 
@@ -209,14 +361,27 @@ This API is designed to mimic the C++ HTCondor ClassAd library, providing simila
 - `EvaluateAttr*()` methods for type-safe evaluation
 - `Lookup()` for accessing raw expressions
 - Value type system matching ClassAd semantics
+- Built-in functions matching HTCondor ClassAd functions
+- IS/ISNT operators for strict identity checking
 
-## Future Enhancements
+## Implementation Status
 
-Planned features not yet implemented:
-- Function calls (strcat, size, etc.)
+✅ **Implemented:**
+- Complete ClassAd CRUD API
+- Expression evaluation (arithmetic, logical, comparison)
+- Conditional expressions
+- Nested ClassAds and lists
+- IS/ISNT operators
+- Built-in functions:
+  - String functions (strcat, substr, size, toLower, toUpper)
+  - Math functions (floor, ceiling, round, random, int, real)
+  - Type checking functions (isUndefined, isError, isString, etc.)
+  - List functions (member)
+  - Time functions (time)
+
+🚧 **Future Enhancements:**
 - Select expressions (record.field)
 - Subscript expressions (list[index])
 - Bitwise operators (&, |, ^, ~)
 - Shift operators (<<, >>, >>>)
-- Is/IsNot operators
-- List and nested ClassAd evaluation
+- Additional built-in functions as needed
