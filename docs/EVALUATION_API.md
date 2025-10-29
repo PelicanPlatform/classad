@@ -141,7 +141,9 @@ if err != nil {
 - `InsertAttrFloat(name string, value float64)` - Inserts a float attribute
 - `InsertAttrString(name string, value string)` - Inserts a string attribute
 - `InsertAttrBool(name string, value bool)` - Inserts a boolean attribute
-- `Lookup(name string) ast.Expr` - Returns the expression for an attribute (or nil)
+- `Insert(name string, expr ast.Expr)` - Inserts an attribute with an AST expression
+- `InsertExpr(name string, expr *Expr)` - Inserts an attribute with an Expr (see Expression API)
+- `Lookup(name string) (*Expr, bool)` - Returns the unevaluated expression for an attribute
 - `Delete(name string) bool` - Deletes an attribute
 - `Clear()` - Removes all attributes
 - `Size() int` - Returns the number of attributes
@@ -157,6 +159,145 @@ if err != nil {
 - `EvaluateAttrBool(name string) (bool, bool)` - Evaluates as boolean
 - `EvaluateExpr(expr ast.Expr) Value` - Evaluates an AST expression
 - `EvaluateExprString(exprStr string) (Value, error)` - Parses and evaluates an expression string
+- `EvaluateExprWithTarget(expr *Expr, target *ClassAd) Value` - Evaluates an Expr with a target ClassAd (see Scoped Evaluation)
+
+## Expression API
+
+The Expression API provides first-class support for working with unevaluated ClassAd expressions. This enables advanced use cases such as copying expressions between ClassAds, inspecting expressions, and evaluating expressions with explicit scope contexts.
+
+### Expr Type
+
+The `Expr` type represents an unevaluated ClassAd expression. It wraps the internal AST representation and provides methods for evaluation and inspection.
+
+#### Creating Expressions
+
+**ParseExpr** - Parse an expression from a string:
+
+```go
+expr, err := classad.ParseExpr("Cpus * 2 + Memory / 1024")
+if err != nil {
+    log.Fatal(err)
+}
+fmt.Println(expr.String())  // "((Cpus * 2) + (Memory / 1024))"
+```
+
+**Lookup** - Get unevaluated expressions from ClassAds:
+
+```go
+ad, _ := classad.Parse("[x = 10; y = x * 2]")
+if expr, ok := ad.Lookup("y"); ok {
+    fmt.Println(expr.String())  // "(x * 2)"
+}
+```
+
+#### Evaluating Expressions
+
+**Eval** - Evaluate in a ClassAd context:
+
+```go
+expr, _ := classad.ParseExpr("Cpus * 2")
+ad := classad.New()
+ad.InsertAttr("Cpus", 8)
+
+result := expr.Eval(ad)
+if value, ok := result.IntValue(); ok {
+    fmt.Printf("Result: %d\n", value)  // Result: 16
+}
+```
+
+**EvalWithContext** - Evaluate with explicit MY and TARGET scopes:
+
+```go
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+
+machine := classad.New()
+machine.InsertAttr("Cpus", 8)
+
+expr, _ := classad.ParseExpr("MY.RequestCpus <= TARGET.Cpus")
+result := expr.EvalWithContext(job, machine)  // job=MY, machine=TARGET
+
+if matches, ok := result.BoolValue(); ok {
+    fmt.Printf("Match: %v\n", matches)  // Match: true
+}
+```
+
+#### Expr Methods
+
+- `String() string` - Returns the string representation of the expression
+- `Eval(scope *ClassAd) Value` - Evaluates the expression in the given ClassAd context
+- `EvalWithContext(scope, target *ClassAd) Value` - Evaluates with explicit MY (scope) and TARGET contexts
+
+### Copying Expressions
+
+Expressions can be copied between ClassAds without evaluation:
+
+```go
+// Create a template ClassAd with common expressions
+template, _ := classad.Parse(`[
+    StandardReq = (Cpus >= 2) && (Memory >= 4096);
+    ResourceScore = Cpus * 1000 + Memory / 1024
+]`)
+
+// Create a new ClassAd and copy expressions
+newAd := classad.New()
+newAd.InsertAttr("Cpus", 4)
+newAd.InsertAttr("Memory", 8192)
+
+// Copy the StandardReq expression
+if req, ok := template.Lookup("StandardReq"); ok {
+    newAd.InsertExpr("Requirements", req)
+}
+
+// Copy the ResourceScore expression
+if score, ok := template.Lookup("ResourceScore"); ok {
+    newAd.InsertExpr("Score", score)
+}
+
+// Evaluate in new context
+if reqVal, ok := newAd.EvaluateAttrBool("Requirements"); ok {
+    fmt.Printf("Requirements: %v\n", reqVal)  // true
+}
+if scoreVal, ok := newAd.EvaluateAttrInt("Score"); ok {
+    fmt.Printf("Score: %d\n", scoreVal)  // 4008
+}
+```
+
+### Scoped Evaluation
+
+The Expression API provides explicit control over MY and TARGET scopes for match-making scenarios:
+
+```go
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+job.InsertAttr("RequestMemory", 8192)
+
+machine := classad.New()
+machine.InsertAttr("Cpus", 8)
+machine.InsertAttr("Memory", 16384)
+
+// Job requirements: MY=job, TARGET=machine
+jobReq, _ := classad.ParseExpr("MY.RequestCpus <= TARGET.Cpus && MY.RequestMemory <= TARGET.Memory")
+jobMatches := jobReq.EvalWithContext(job, machine)
+
+// Machine requirements: MY=machine, TARGET=job
+machineReq, _ := classad.ParseExpr("TARGET.RequestCpus <= MY.Cpus")
+machineAccepts := machineReq.EvalWithContext(machine, job)
+
+// Or use the ClassAd method
+jobMatches = job.EvaluateExprWithTarget(jobReq, machine)
+machineAccepts = machine.EvaluateExprWithTarget(machineReq, job)
+```
+
+#### Use Cases
+
+- **Expression Templates**: Define common expressions once and copy to multiple ClassAds
+- **Cross-ClassAd Evaluation**: Evaluate expressions that reference attributes from multiple ClassAds
+- **Match-Making**: Implement symmetric job-machine matching with explicit scopes
+- **Expression Libraries**: Build reusable expression libraries for common requirements
+- **Dynamic Policies**: Parse policy expressions at runtime and apply to ClassAds
+
+See [examples/expr_demo](../examples/expr_demo/main.go) for comprehensive examples.
 
 ### Value Type
 

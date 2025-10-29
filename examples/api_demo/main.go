@@ -41,7 +41,7 @@ func main() {
 
 	// Example 3: Looking up attributes
 	fmt.Println("Example 3: Looking up attributes")
-	if expr := jobAd.Lookup("JobId"); expr != nil {
+	if expr, ok := jobAd.Lookup("JobId"); ok {
 		fmt.Printf("Found JobId expression: %v\n", expr)
 	}
 	fmt.Println()

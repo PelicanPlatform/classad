@@ -314,7 +314,7 @@ func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Valu
 		return NewUndefinedValue()
 	}
 
-	expr := targetClassAd.Lookup(ref.Name)
+	expr := targetClassAd.lookupInternal(ref.Name)
 	if expr == nil {
 		return NewUndefinedValue()
 	}

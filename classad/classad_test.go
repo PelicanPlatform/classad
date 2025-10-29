@@ -2,8 +2,6 @@ package classad
 
 import (
 	"testing"
-
-	"github.com/PelicanPlatform/classad/ast"
 )
 
 func TestNewClassAd(t *testing.T) {
@@ -143,16 +141,16 @@ func TestInsertAttr(t *testing.T) {
 	}
 
 	// Test that attributes were inserted correctly
-	if val := ad.Lookup("x"); val == nil {
+	if val, ok := ad.Lookup("x"); !ok || val == nil {
 		t.Error("Attribute 'x' not found")
 	}
-	if val := ad.Lookup("y"); val == nil {
+	if val, ok := ad.Lookup("y"); !ok || val == nil {
 		t.Error("Attribute 'y' not found")
 	}
-	if val := ad.Lookup("name"); val == nil {
+	if val, ok := ad.Lookup("name"); !ok || val == nil {
 		t.Error("Attribute 'name' not found")
 	}
-	if val := ad.Lookup("flag"); val == nil {
+	if val, ok := ad.Lookup("flag"); !ok || val == nil {
 		t.Error("Attribute 'flag' not found")
 	}
 }
@@ -161,23 +159,20 @@ func TestLookup(t *testing.T) {
 	ad := New()
 	ad.InsertAttr("x", 10)
 
-	expr := ad.Lookup("x")
-	if expr == nil {
-		t.Fatal("Lookup('x') returned nil")
+	expr, ok := ad.Lookup("x")
+	if !ok || expr == nil {
+		t.Fatal("Lookup('x') should return expression")
 	}
 
-	intLit, ok := expr.(*ast.IntegerLiteral)
-	if !ok {
-		t.Fatal("Lookup('x') did not return IntegerLiteral")
-	}
-	if intLit.Value != 10 {
-		t.Errorf("Expected value 10, got %d", intLit.Value)
+	// Verify the expression string representation
+	if expr.String() != "10" {
+		t.Errorf("Expected expression string '10', got '%s'", expr.String())
 	}
 
 	// Test non-existent attribute
-	expr = ad.Lookup("nonexistent")
-	if expr != nil {
-		t.Error("Lookup('nonexistent') should return nil")
+	expr, ok = ad.Lookup("nonexistent")
+	if ok || expr != nil {
+		t.Error("Lookup('nonexistent') should return false")
 	}
 }
 
@@ -190,7 +185,7 @@ func TestDelete(t *testing.T) {
 		t.Error("Delete('x') should return true")
 	}
 
-	if ad.Lookup("x") != nil {
+	if _, ok := ad.Lookup("x"); ok {
 		t.Error("Attribute 'x' should be deleted")
 	}
 

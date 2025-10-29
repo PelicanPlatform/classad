@@ -976,8 +976,11 @@ func TestTargetScopedReference(t *testing.T) {
 	}
 
 	// Copy the requirement to job
-	reqValue := reqExpr.Lookup("req")
-	job.Insert("Requirements", reqValue)
+	reqValue, ok := reqExpr.Lookup("req")
+	if !ok {
+		t.Fatal("Failed to lookup req attribute")
+	}
+	job.InsertExpr("Requirements", reqValue)
 
 	// Evaluate
 	matches, ok := job.EvaluateAttrBool("Requirements")
@@ -1004,8 +1007,11 @@ func TestParentScopedReference(t *testing.T) {
 	}
 
 	// Copy expression to child
-	resultExpr := expr.Lookup("result")
-	child.Insert("Total", resultExpr)
+	resultExpr, ok := expr.Lookup("result")
+	if !ok {
+		t.Fatal("Failed to lookup result attribute")
+	}
+	child.InsertExpr("Total", resultExpr)
 
 	// Evaluate
 	total, ok := child.EvaluateAttrInt("Total")
@@ -1027,8 +1033,11 @@ func TestScopedReferenceUndefined(t *testing.T) {
 		t.Fatalf("Parse error: %v", err)
 	}
 
-	resultExpr := expr.Lookup("result")
-	ad.Insert("Result", resultExpr)
+	resultExpr, ok := expr.Lookup("result")
+	if !ok {
+		t.Fatal("Failed to lookup result attribute")
+	}
+	ad.InsertExpr("Result", resultExpr)
 
 	// Should be undefined since no target is set
 	val := ad.EvaluateAttr("Result")
@@ -1050,11 +1059,15 @@ func TestNestedScopedReferences(t *testing.T) {
 
 	// Job requires machine to have enough CPUs
 	jobReqExpr, _ := Parse(`[req = TARGET.Cpus >= MY.RequestCpus]`)
-	job.Insert("Requirements", jobReqExpr.Lookup("req"))
+	if jobReq, ok := jobReqExpr.Lookup("req"); ok {
+		job.InsertExpr("Requirements", jobReq)
+	}
 
 	// Machine requires job to not exceed MaxCpus
 	machineReqExpr, _ := Parse(`[req = TARGET.RequestCpus <= MY.MaxCpus]`)
-	machine.Insert("Requirements", machineReqExpr.Lookup("req"))
+	if machineReq, ok := machineReqExpr.Lookup("req"); ok {
+		machine.InsertExpr("Requirements", machineReq)
+	}
 
 	jobReq, ok1 := job.EvaluateAttrBool("Requirements")
 	machineReq, ok2 := machine.EvaluateAttrBool("Requirements")
@@ -1105,10 +1118,14 @@ func TestMatchClassAdSymmetry(t *testing.T) {
 
 	// Parse requirements with TARGET references
 	jobReqExpr, _ := Parse(`[r = (TARGET.Cpus >= RequestCpus) && (TARGET.Memory >= RequestMemory)]`)
-	job.Insert("Requirements", jobReqExpr.Lookup("r"))
+	if jobReq, ok := jobReqExpr.Lookup("r"); ok {
+		job.InsertExpr("Requirements", jobReq)
+	}
 
 	machineReqExpr, _ := Parse(`[r = (TARGET.RequestCpus <= Cpus) && (TARGET.RequestMemory <= Memory)]`)
-	machine.Insert("Requirements", machineReqExpr.Lookup("r"))
+	if machineReq, ok := machineReqExpr.Lookup("r"); ok {
+		machine.InsertExpr("Requirements", machineReq)
+	}
 
 	match := NewMatchClassAd(job, machine)
 
@@ -1129,10 +1146,14 @@ func TestMatchClassAdSymmetryFailure(t *testing.T) {
 	machine.InsertAttr("Cpus", 8)
 
 	jobReqExpr, _ := Parse(`[r = TARGET.Cpus >= RequestCpus]`)
-	job.Insert("Requirements", jobReqExpr.Lookup("r"))
+	if jobReq, ok := jobReqExpr.Lookup("r"); ok {
+		job.InsertExpr("Requirements", jobReq)
+	}
 
 	machineReqExpr, _ := Parse(`[r = TARGET.RequestCpus <= Cpus]`)
-	machine.Insert("Requirements", machineReqExpr.Lookup("r"))
+	if machineReq, ok := machineReqExpr.Lookup("r"); ok {
+		machine.InsertExpr("Requirements", machineReq)
+	}
 
 	match := NewMatchClassAd(job, machine)
 
@@ -1170,7 +1191,9 @@ func TestMatchClassAdRankWithTarget(t *testing.T) {
 
 	// Machine ranks jobs by their priority
 	rankExpr, _ := Parse(`[r = TARGET.Priority * 10]`)
-	machine.Insert("Rank", rankExpr.Lookup("r"))
+	if rank, ok := rankExpr.Lookup("r"); ok {
+		machine.InsertExpr("Rank", rank)
+	}
 
 	match := NewMatchClassAd(job, machine)
 
@@ -1231,21 +1254,29 @@ func TestMatchClassAdComplexScenario(t *testing.T) {
 	                              (TARGET.Memory >= RequestMemory) &&
 	                              (TARGET.Disk >= RequestDisk) &&
 	                              (TARGET.Arch == "X86_64")]`)
-	job.Insert("Requirements", jobReqExpr.Lookup("r"))
+	if jobReq, ok := jobReqExpr.Lookup("r"); ok {
+		job.InsertExpr("Requirements", jobReq)
+	}
 
 	// Machine requirements
 	machineReqExpr, _ := Parse(`[r = (TARGET.RequestCpus <= Cpus) &&
 	                                  (TARGET.RequestMemory <= Memory) &&
 	                                  (TARGET.RequestDisk <= Disk)]`)
-	machine.Insert("Requirements", machineReqExpr.Lookup("r"))
+	if machineReq, ok := machineReqExpr.Lookup("r"); ok {
+		machine.InsertExpr("Requirements", machineReq)
+	}
 
 	// Job ranks machines by available memory
 	jobRankExpr, _ := Parse(`[r = TARGET.Memory]`)
-	job.Insert("Rank", jobRankExpr.Lookup("r"))
+	if jobRank, ok := jobRankExpr.Lookup("r"); ok {
+		job.InsertExpr("Rank", jobRank)
+	}
 
 	// Machine ranks jobs by requesting fewer resources
 	machineRankExpr, _ := Parse(`[r = Cpus - TARGET.RequestCpus]`)
-	machine.Insert("Rank", machineRankExpr.Lookup("r"))
+	if machineRank, ok := machineRankExpr.Lookup("r"); ok {
+		machine.InsertExpr("Rank", machineRank)
+	}
 
 	match := NewMatchClassAd(job, machine)
 

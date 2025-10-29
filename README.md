@@ -239,6 +239,64 @@ func main() {
 }
 ```
 
+### Working with Expressions
+
+The library provides a powerful Expression API for working with unevaluated expressions:
+
+```go
+// Parse an expression directly
+expr, err := classad.ParseExpr("Cpus * 2 + Memory / 1024")
+if err != nil {
+    log.Fatal(err)
+}
+
+// Evaluate it in a ClassAd context
+ad := classad.New()
+ad.InsertAttr("Cpus", 8)
+ad.InsertAttr("Memory", 16384)
+
+result := expr.Eval(ad)
+if value, ok := result.IntValue(); ok {
+    fmt.Printf("Result: %d\n", value)  // Result: 32
+}
+
+// Look up unevaluated expressions from ClassAds
+sourceAd, _ := classad.Parse("[Formula = Cpus * 2]")
+if formula, ok := sourceAd.Lookup("Formula"); ok {
+    // Copy expression to another ClassAd
+    targetAd := classad.New()
+    targetAd.InsertAttr("Cpus", 16)
+    targetAd.InsertExpr("Computation", formula)
+
+    if value, ok := targetAd.EvaluateAttrInt("Computation"); ok {
+        fmt.Printf("Computed: %d\n", value)  // Computed: 32
+    }
+}
+
+// Scoped evaluation with MY and TARGET contexts
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+job.InsertAttr("RequestMemory", 8192)
+
+machine := classad.New()
+machine.InsertAttr("Cpus", 8)
+machine.InsertAttr("Memory", 16384)
+
+// Parse requirements with MY and TARGET references
+reqExpr, _ := classad.ParseExpr("MY.RequestCpus <= TARGET.Cpus && MY.RequestMemory <= TARGET.Memory")
+
+// Evaluate with job as MY scope, machine as TARGET scope
+result := reqExpr.EvalWithContext(job, machine)
+if matches, ok := result.BoolValue(); ok {
+    fmt.Printf("Match: %v\n", matches)  // Match: true
+}
+
+// Or use the ClassAd method
+result = job.EvaluateExprWithTarget(reqExpr, machine)
+```
+
+See [examples/expr_demo](examples/expr_demo/main.go) for comprehensive Expression API examples.
+
 ### Examples
 
 Run the comprehensive API demo:
