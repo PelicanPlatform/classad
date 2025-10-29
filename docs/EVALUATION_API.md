@@ -149,6 +149,37 @@ The evaluator supports:
 
 ### Conditional Operator
 - Ternary: `condition ? true_value : false_value`
+- Functional form: `ifThenElse(condition, true_value, false_value)` - Evaluates condition and returns appropriate branch
+
+```go
+ad, _ := classad.Parse(`[
+    x = 10;
+    y = 20;
+    
+    // Ternary operator
+    maxTernary = (x > y) ? x : y;
+    
+    // Functional form (useful in nested expressions)
+    maxFunc = ifThenElse(x > y, x, y);
+    
+    // Can return different types
+    status = ifThenElse(x > 5, "high", 0);
+    
+    // Handles undefined and error properly
+    safeDiv = ifThenElse(y != 0, x / y, undefined)
+]`)
+// maxTernary = 20
+// maxFunc = 20
+// status = "high"
+// safeDiv = 0.5
+```
+
+**ifThenElse behavior:**
+- Evaluates first argument as condition
+- If condition is `true`, returns second argument
+- If condition is `false`, returns third argument
+- If condition is `undefined` or `error`, returns that value
+- If condition is not boolean, returns `error`
 
 ### Attribute References
 - Simple: `Cpus`
@@ -315,6 +346,8 @@ ad, _ := classad.Parse(`[
 - `length(string_or_list)` - Alias for `size()`
 - `toLower(string)` / `tolower(string)` - Converts to lowercase
 - `toUpper(string)` / `toupper(string)` - Converts to uppercase
+- `stringListMember(string, string_list[, options])` - Tests if string is in comma-separated list
+- `regexp(pattern, target[, options])` - Tests if target matches regular expression pattern
 
 ```go
 ad, _ := classad.Parse(`[
@@ -322,14 +355,41 @@ ad, _ := classad.Parse(`[
     sub = substr("Hello World", 0, 5);
     len = size("Hello");
     lower = toLower("HELLO");
-    upper = toUpper("world")
+    upper = toUpper("world");
+    
+    // String list membership
+    colors = "red,green,blue";
+    hasRed = stringListMember("red", colors);           // true
+    hasYellow = stringListMember("yellow", colors);     // false
+    hasGreen = stringListMember("GREEN", colors, "i");  // true (case-insensitive)
+    
+    // Regular expression matching
+    email = "user@example.com";
+    validEmail = regexp("^[^@]+@[^@]+\\.[^@]+$", email);  // true
+    startsWithUser = regexp("^user", email);              // true
+    caseMatch = regexp("USER", email, "i");               // true (case-insensitive)
 ]`)
 // greeting = "Hello World"
 // sub = "Hello"
 // len = 5
 // lower = "hello"
 // upper = "WORLD"
+// hasRed = true
+// hasYellow = false
+// hasGreen = true
+// validEmail = true
+// startsWithUser = true
+// caseMatch = true
 ```
+
+**stringListMember options:**
+- `"i"` or `"icase"` - Case-insensitive comparison
+
+**regexp options:**
+- `"i"` - Case-insensitive matching
+- `"m"` - Multiline mode (^ and $ match line boundaries)
+- `"s"` - Single-line mode (. matches newlines)
+- Options can be combined: `"im"`, `"ims"`, etc.
 
 ### Math Functions
 
@@ -651,21 +711,25 @@ This API is designed to mimic the C++ HTCondor ClassAd library, providing simila
 ✅ **Implemented:**
 - Complete ClassAd CRUD API
 - Expression evaluation (arithmetic, logical, comparison)
-- Conditional expressions
+- Conditional expressions (ternary operator and ifThenElse function)
 - Nested ClassAds and lists
 - IS/ISNT operators (with `=?=` and `=!=` aliases)
 - Attribute selection expressions (`record.field`)
 - Subscript expressions (`list[index]`, `record["key"]`)
+- Scoped attribute references (MY., TARGET., PARENT.)
+- ClassAd matching with MatchClassAd
 - Built-in functions:
-  - String functions (strcat, substr, size, toLower, toUpper)
+  - String functions (strcat, substr, size, toLower, toUpper, stringListMember, regexp)
   - Math functions (floor, ceiling, round, random, int, real)
   - Type checking functions (isUndefined, isError, isString, etc.)
   - List functions (member)
   - Time functions (time)
+  - Conditional function (ifThenElse)
+- String escape sequences per HTCondor specification:
+  - Standard escapes: `\b`, `\t`, `\n`, `\f`, `\r`, `\\`, `\"`, `\'`
+  - Octal sequences: `\0-7` (3 digits for 0-3, 2 digits for 4-7)
 
 🚧 **Future Enhancements:**
-- Select expressions (record.field)
-- Subscript expressions (list[index])
 - Bitwise operators (&, |, ^, ~)
 - Shift operators (<<, >>, >>>)
 - Additional built-in functions as needed

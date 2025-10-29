@@ -277,17 +277,61 @@ func (l *Lexer) scanString() string {
 				escaped := l.peek()
 				l.advance()
 				switch escaped {
-				case 'n':
-					result.WriteRune('\n')
+				case 'b':
+					result.WriteRune('\b') // Backspace (8)
 				case 't':
-					result.WriteRune('\t')
+					result.WriteRune('\t') // Tab (9)
+				case 'n':
+					result.WriteRune('\n') // Newline (10)
+				case 'f':
+					result.WriteRune('\f') // Formfeed (12)
 				case 'r':
-					result.WriteRune('\r')
+					result.WriteRune('\r') // Carriage return (13)
 				case '\\':
-					result.WriteRune('\\')
+					result.WriteRune('\\') // Backslash (92)
 				case '"':
-					result.WriteRune('"')
+					result.WriteRune('"') // Quote (34)
+				case '\'':
+					result.WriteRune('\'') // Apostrophe (39)
+				case '0', '1', '2', '3', '4', '5', '6', '7':
+					// Octal escape sequence
+					// If first digit is 0-3, read up to 3 digits
+					// If first digit is 4-7, read up to 2 digits
+					var octalStr strings.Builder
+					octalStr.WriteRune(escaped)
+					
+					maxDigits := 2
+					if escaped >= '0' && escaped <= '3' {
+						maxDigits = 3
+					}
+					
+					// Read additional octal digits
+					for i := 1; i < maxDigits && l.pos < len(l.input); i++ {
+						nextCh := l.peek()
+						if nextCh >= '0' && nextCh <= '7' {
+							octalStr.WriteRune(nextCh)
+							l.advance()
+						} else {
+							break
+						}
+					}
+					
+					// Convert octal string to integer
+					octalValue := int64(0)
+					for _, digit := range octalStr.String() {
+						octalValue = octalValue*8 + int64(digit-'0')
+					}
+					
+					// Check for null (value 0) which is not allowed
+					if octalValue == 0 {
+						l.Error(fmt.Sprintf("null character (\\%s) not allowed in string at position %d", octalStr.String(), l.pos-len(octalStr.String())-2))
+						return result.String()
+					}
+					
+					result.WriteRune(rune(octalValue))
 				default:
+					// Unknown escape sequence - this is an error according to spec
+					l.Error(fmt.Sprintf("invalid escape sequence \\%c at position %d", escaped, l.pos-2))
 					result.WriteRune(escaped)
 				}
 			}

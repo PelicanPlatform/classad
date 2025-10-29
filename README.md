@@ -10,6 +10,7 @@ This project provides a complete parser and evaluation engine for the ClassAds l
 
 - **Complete Lexer**: Tokenizes ClassAd syntax including:
   - Literals (integers, reals, strings, booleans, undefined, error)
+  - String escape sequences per HTCondor spec (`\b`, `\t`, `\n`, `\f`, `\r`, `\\`, `\"`, `\'`, octal)
   - Operators (arithmetic, logical, comparison, bitwise, shift, is/isnt, =?=/=!=)
   - Attribute references and assignments
   - Scoped attribute references (MY., TARGET., PARENT.)
@@ -27,7 +28,7 @@ This project provides a complete parser and evaluation engine for the ClassAds l
   - Strict identity operators (`is`/`isnt`, `=?=`/`=!=`)
   - Scoped attribute references for parent/target relationships
   - Attribute selection and subscripting
-  - 20+ built-in functions (string, math, type checking, list operations)
+  - 25+ built-in functions (string, math, type checking, list operations, conditional)
 - **ClassAd Matching**: MatchClassAd type for symmetric matching (job/machine matching)
 - **Public API**: High-level API mimicking the C++ HTCondor ClassAd library
 - **Go Generate Support**: Easy regeneration of parser from grammar
@@ -296,13 +297,15 @@ Parse a more complex example:
 
 ### Built-in Functions
 
-The evaluator supports 20+ built-in functions:
+The evaluator supports 25+ built-in functions:
 
 **String Functions:**
 - `strcat(s1, s2, ...)` - Concatenate strings
 - `substr(str, offset, length)` - Extract substring
 - `size(str)` / `length(str)` - String/list length
 - `toUpper(str)` / `toLower(str)` - Case conversion
+- `stringListMember(str, list, options)` - Test membership in comma-separated list
+- `regexp(pattern, target, options)` - Regular expression matching
 
 **Math Functions:**
 - `floor(x)`, `ceiling(x)`, `round(x)` - Rounding
@@ -316,6 +319,9 @@ The evaluator supports 20+ built-in functions:
 
 **List Operations:**
 - `member(item, list)` - Check list membership
+
+**Conditional:**
+- `ifThenElse(cond, trueVal, falseVal)` - Functional conditional expression
 
 **Time:**
 - `time()` - Current Unix timestamp
@@ -441,9 +447,5 @@ goyacc -o parser/y.go -p yy parser/classad.y
 
 ## TODO
 
-- [ ] Additional built-in functions (stringListMember, regexp, ifThenElse, etc.)
+- [ ] Additional built-in functions as needed
 - [ ] Support for old ClassAd syntax
-- [ ] XML serialization/deserialization
-- [ ] ClassAd matching and ranking
-- [ ] Performance optimizations
-- [ ] Scoped attribute references (MY., TARGET., PARENT.)

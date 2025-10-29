@@ -1,8 +1,10 @@
+// Package classad provides ClassAd matching functionality.
 package classad
 
 import (
 	"math"
 	"math/rand"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -423,4 +425,155 @@ func builtinMember(args []Value) Value {
 	}
 
 	return NewBoolValue(false)
+}
+
+// builtinStringListMember checks if a string is a member of a comma-separated string list
+// stringListMember(string item, string list [, string options])
+// The list is a comma-separated string. Options can contain:
+// - "i" or "I": case-insensitive comparison
+func builtinStringListMember(args []Value) Value {
+	if len(args) < 2 || len(args) > 3 {
+		return NewErrorValue()
+	}
+
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
+	}
+	if args[0].IsUndefined() || args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
+
+	if !args[0].IsString() || !args[1].IsString() {
+		return NewErrorValue()
+	}
+
+	item, _ := args[0].StringValue()
+	listStr, _ := args[1].StringValue()
+
+	// Check for options
+	ignoreCase := false
+	if len(args) == 3 {
+		if args[2].IsError() {
+			return NewErrorValue()
+		}
+		if args[2].IsUndefined() {
+			return NewUndefinedValue()
+		}
+		if !args[2].IsString() {
+			return NewErrorValue()
+		}
+		options, _ := args[2].StringValue()
+		if strings.ContainsAny(options, "iI") {
+			ignoreCase = true
+		}
+	}
+
+	// Split the list by commas and check each element
+	elements := strings.Split(listStr, ",")
+	for _, elem := range elements {
+		// Trim whitespace from each element
+		elem = strings.TrimSpace(elem)
+		if ignoreCase {
+			if strings.EqualFold(elem, item) {
+				return NewBoolValue(true)
+			}
+		} else {
+			if elem == item {
+				return NewBoolValue(true)
+			}
+		}
+	}
+
+	return NewBoolValue(false)
+}
+
+// builtinRegexp checks if a string matches a regular expression
+// regexp(string pattern, string target [, string options])
+// Options can contain:
+// - "i" or "I": case-insensitive
+// - "m" or "M": multi-line mode (^ and $ match line boundaries)
+// - "s" or "S": single-line mode (. matches newline)
+func builtinRegexp(args []Value) Value {
+	if len(args) < 2 || len(args) > 3 {
+		return NewErrorValue()
+	}
+
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
+	}
+	if args[0].IsUndefined() || args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
+
+	if !args[0].IsString() || !args[1].IsString() {
+		return NewErrorValue()
+	}
+
+	pattern, _ := args[0].StringValue()
+	target, _ := args[1].StringValue()
+
+	// Check for options
+	var flags string
+	if len(args) == 3 {
+		if args[2].IsError() {
+			return NewErrorValue()
+		}
+		if args[2].IsUndefined() {
+			return NewUndefinedValue()
+		}
+		if !args[2].IsString() {
+			return NewErrorValue()
+		}
+		options, _ := args[2].StringValue()
+		
+		// Build Go regex flags
+		if strings.ContainsAny(options, "iI") {
+			flags += "(?i)"
+		}
+		if strings.ContainsAny(options, "mM") {
+			flags += "(?m)"
+		}
+		if strings.ContainsAny(options, "sS") {
+			flags += "(?s)"
+		}
+	}
+
+	// Compile the regex with flags prepended
+	fullPattern := flags + pattern
+	re, err := regexp.Compile(fullPattern)
+	if err != nil {
+		return NewErrorValue()
+	}
+
+	return NewBoolValue(re.MatchString(target))
+}
+
+// builtinIfThenElse is the conditional operator as a function
+// ifThenElse(condition, trueValue, falseValue)
+// This is equivalent to (condition ? trueValue : falseValue)
+// Unlike the ternary operator, this is a function so all arguments are evaluated first
+func builtinIfThenElse(args []Value) Value {
+	if len(args) != 3 {
+		return NewErrorValue()
+	}
+
+	// Check first argument for error/undefined
+	if args[0].IsError() {
+		return NewErrorValue()
+	}
+	if args[0].IsUndefined() {
+		return NewUndefinedValue()
+	}
+
+	if !args[0].IsBool() {
+		return NewErrorValue()
+	}
+
+	condition, _ := args[0].BoolValue()
+	
+	// Return appropriate value based on condition
+	if condition {
+		return args[1]
+	}
+	return args[2]
 }
