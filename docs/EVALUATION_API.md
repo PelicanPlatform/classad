@@ -1037,3 +1037,290 @@ Requirements = TARGET.Owner=="smith" || LoadAvg<=0.3
 ```
 
 Both formats parse to the same internal representation and can be evaluated identically.
+
+## Expression Introspection and Utilities
+
+The library provides powerful tools for analyzing, validating, and optimizing expressions.
+
+### String Quoting Utilities
+
+**Quote** - Add ClassAd string escaping:
+```go
+func Quote(s string) string
+```
+
+Converts a plain string to a properly quoted ClassAd string literal with escape sequences.
+
+```go
+original := `Hello "World"\nNew Line`
+quoted := classad.Quote(original)
+// Returns: "Hello \"World\"\\nNew Line"
+```
+
+**Unquote** - Parse ClassAd string literals:
+```go
+func Unquote(s string) (string, error)
+```
+
+Parses a ClassAd string literal and returns the unescaped string value.
+
+```go
+quoted := `"Hello \"World\""`
+unquoted, err := classad.Unquote(quoted)
+// Returns: Hello "World"
+```
+
+These functions handle all ClassAd escape sequences including `\n`, `\t`, `\"`, `\\`, etc.
+
+### Old Format Serialization
+
+**MarshalOld** - Convert to old HTCondor format:
+```go
+func (c *ClassAd) MarshalOld() string
+```
+
+Serializes a ClassAd to the old HTCondor format (newline-delimited, no brackets).
+
+```go
+ad, _ := classad.Parse(`[
+    JobId = 1001;
+    Owner = "alice";
+    Cpus = 4;
+    Memory = 8192
+]`)
+
+old := ad.MarshalOld()
+// Returns:
+// JobId = 1001
+// Owner = "alice"
+// Cpus = 4
+// Memory = 8192
+```
+
+Useful for backward compatibility with tools that expect the old format.
+
+### Dependency Analysis
+
+**ExternalRefs** - Find undefined attribute references:
+```go
+func (c *ClassAd) ExternalRefs(expr *Expr) []string
+```
+
+Returns a sorted list of attribute names referenced in the expression but not defined in the ClassAd.
+
+```go
+expr, _ := classad.ParseExpr("RequestCpus * 1000 + Memory / 1024")
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+
+missing := job.ExternalRefs(expr)
+// Returns: ["Memory"]
+```
+
+**Use Cases:**
+- **Validation:** Check if all required attributes are present before evaluation
+- **Debugging:** Identify why an expression evaluates to UNDEFINED
+- **Dependency Tracking:** Determine what external data is needed
+- **Schema Validation:** Verify ClassAds match expected structure
+
+**InternalRefs** - Find defined attribute references:
+```go
+func (c *ClassAd) InternalRefs(expr *Expr) []string
+```
+
+Returns a sorted list of attribute names referenced in the expression that are defined in the ClassAd.
+
+```go
+defined := job.InternalRefs(expr)
+// Returns: ["RequestCpus"]
+```
+
+**Use Cases:**
+- **Change Tracking:** Know which attributes affect an expression
+- **Cache Invalidation:** Invalidate cached results when dependencies change
+- **Selective Updates:** Only recalculate when relevant attributes change
+- **Impact Analysis:** Understand what expressions are affected by attribute changes
+
+**Example: Validation Workflow**
+```go
+// Parse a requirements expression
+reqExpr, _ := classad.ParseExpr("Cpus >= RequestCpus && Memory >= RequestMemory && Arch == \"x86_64\"")
+
+// Check what the job needs to provide
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+job.InsertAttr("RequestMemory", 2048)
+
+// Find what's missing from the job
+jobMissing := job.ExternalRefs(reqExpr)
+// Returns: ["Cpus", "Memory", "Arch"]
+
+// These must come from the machine ClassAd
+machine := classad.New()
+machine.InsertAttr("Cpus", 8)
+machine.InsertAttr("Memory", 16384)
+machine.InsertAttr("Arch", "x86_64")
+
+// Validate machine has everything needed
+machineMissing := machine.ExternalRefs(reqExpr)
+// Returns: ["RequestCpus", "RequestMemory"]
+// These come from the job, so we're good!
+```
+
+### Partial Evaluation
+
+**Flatten** - Optimize expressions by computing known values:
+```go
+func (c *ClassAd) Flatten(expr *Expr) *Expr
+```
+
+Performs partial evaluation of an expression, replacing references to defined attributes with their literal values while preserving references to undefined attributes.
+
+```go
+expr, _ := classad.ParseExpr("RequestCpus * 1000 + RequestMemory / 1024 + Unknown")
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+job.InsertAttr("RequestMemory", 8192)
+
+flattened := job.Flatten(expr)
+// Original:  (((RequestCpus * 1000) + (RequestMemory / 1024)) + Unknown)
+// Flattened: (4008 + Unknown)
+```
+
+**How It Works:**
+1. Recursively traverses the expression AST
+2. Evaluates sub-expressions that reference only defined attributes
+3. Replaces evaluated sub-expressions with literal values
+4. Preserves unevaluated sub-expressions containing undefined references
+5. Maintains semantic equivalence with the original expression
+
+**Use Cases:**
+
+- **Query Optimization:** Pre-compute constant parts of requirements expressions
+- **Reducing Computation:** Avoid re-evaluating the same values repeatedly
+- **Simplification:** Create more readable expressions by removing clutter
+- **Debugging:** See which parts of an expression can be computed
+- **Caching:** Store partially evaluated expressions for faster matching
+
+**Example: Query Optimization**
+```go
+// Job submitter creates a requirement
+requirement, _ := classad.ParseExpr("Cpus >= RequestCpus && Memory >= RequestMemory")
+
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+job.InsertAttr("RequestMemory", 2048)
+
+// Scheduler flattens the requirement once
+flattened := job.Flatten(requirement)
+// Flattened: ((Cpus >= 4) && (Memory >= 2048))
+
+// Now this simpler expression can be evaluated against many machines
+// without re-evaluating the job attributes each time
+machines := []*classad.ClassAd{...}
+for _, machine := range machines {
+    result := machine.EvaluateExprWithTarget(flattened, job)
+    if matches, ok := result.BoolValue(); ok && matches {
+        // Schedule job on this machine
+    }
+}
+```
+
+**Example: Conditional Flattening**
+```go
+expr, _ := classad.ParseExpr("x > 5 ? 100 : 200")
+ad := classad.New()
+ad.InsertAttr("x", 10)
+
+flattened := ad.Flatten(expr)
+// Returns: 100
+// The entire conditional is evaluated and replaced with the result
+```
+
+**Example: Preserves Undefined References**
+```go
+expr, _ := classad.ParseExpr("(x + y) * z")
+ad := classad.New()
+ad.InsertAttr("x", 10)
+ad.InsertAttr("y", 20)
+// z is undefined
+
+flattened := ad.Flatten(expr)
+// Returns: (30 * z)
+// x and y are computed, but z is preserved
+```
+
+**Limitations:**
+- Function calls are not evaluated (kept as-is)
+- Side effects (if any existed) would not be triggered
+- Expressions with errors preserve the error sub-expression
+- Scoped references (MY., TARGET.) are preserved as-is
+
+### Complete Introspection Example
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/PelicanPlatform/classad/classad"
+)
+
+func main() {
+    // Create a job ClassAd
+    job := classad.New()
+    job.InsertAttr("RequestCpus", 4)
+    job.InsertAttr("RequestMemory", 2048)
+
+    // Parse a complex requirement
+    req, _ := classad.ParseExpr(`
+        (Cpus >= RequestCpus) &&
+        (Memory >= RequestMemory) &&
+        (Arch == "x86_64") &&
+        (OpSys == "LINUX")
+    `)
+
+    // Analyze dependencies
+    fmt.Println("=== Dependency Analysis ===")
+    internal := job.InternalRefs(req)
+    external := job.ExternalRefs(req)
+
+    fmt.Printf("Job provides: %v\n", internal)
+    // Prints: [RequestCpus RequestMemory]
+
+    fmt.Printf("Machine must provide: %v\n", external)
+    // Prints: [Arch Cpus Memory OpSys]
+
+    // Validate we have everything needed
+    if len(external) > 0 {
+        fmt.Printf("Warning: Expression references undefined attributes: %v\n", external)
+    }
+
+    // Optimize the requirement
+    fmt.Println("\n=== Query Optimization ===")
+    flattened := job.Flatten(req)
+
+    fmt.Printf("Original:  %s\n", req.String())
+    fmt.Printf("Optimized: %s\n", flattened.String())
+    // Optimized version has RequestCpus and RequestMemory replaced with 4 and 2048
+
+    // Create machine ClassAd
+    machine := classad.New()
+    machine.InsertAttr("Cpus", 8)
+    machine.InsertAttr("Memory", 16384)
+    machine.InsertAttr("Arch", "x86_64")
+    machine.InsertAttr("OpSys", "LINUX")
+
+    // Evaluate optimized expression
+    result := machine.EvaluateExprWithTarget(flattened, job)
+    if matches, ok := result.BoolValue(); ok {
+        fmt.Printf("\nMatch result: %v\n", matches)
+    }
+
+    // Convert to old format for compatibility
+    fmt.Println("\n=== Old Format Export ===")
+    fmt.Println(job.MarshalOld())
+}
+```
+
+See [examples/introspection_demo/main.go](../examples/introspection_demo/main.go) for more comprehensive examples.

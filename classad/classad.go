@@ -41,6 +41,39 @@ func ParseExpr(input string) (*Expr, error) {
 	return nil, fmt.Errorf("unable to extract expression from parsed result")
 }
 
+// Quote escapes a string for safe use in ClassAd expressions.
+// It adds surrounding quotes and escapes special characters according to ClassAd syntax.
+//
+// Example:
+//
+//	quoted := classad.Quote(`value with "quotes"`)
+//	// Returns: "value with \"quotes\""
+func Quote(s string) string {
+	return fmt.Sprintf("%q", s)
+}
+
+// Unquote removes ClassAd string quoting and unescapes special characters.
+// It expects the input to be a quoted string (with surrounding quotes).
+//
+// Example:
+//
+//	original, err := classad.Unquote(`"value with \"quotes\""`)
+//	// Returns: value with "quotes"
+func Unquote(s string) (string, error) {
+	// Use Go's strconv unquoting which handles the same escape sequences
+	if len(s) < 2 || s[0] != '"' || s[len(s)-1] != '"' {
+		return "", fmt.Errorf("string must be quoted")
+	}
+
+	// Parse using Go's string literal rules which match ClassAd escaping
+	var result string
+	_, err := fmt.Sscanf(s, "%q", &result)
+	if err != nil {
+		return "", fmt.Errorf("failed to unquote string: %w", err)
+	}
+	return result, nil
+}
+
 // String returns the string representation of the expression.
 func (e *Expr) String() string {
 	if e.expr == nil {
@@ -147,6 +180,29 @@ func (c *ClassAd) String() string {
 		return "[]"
 	}
 	return c.ad.String()
+}
+
+// ToOldFormat serializes the ClassAd to old HTCondor format (newline-delimited).
+// Old format has one attribute per line without surrounding brackets.
+//
+// Example:
+//
+//	ad, _ := classad.Parse("[Cpus = 4; Memory = 8192]")
+//	oldFmt := ad.MarshalOld()
+//	// Returns: "Cpus = 4\nMemory = 8192"
+func (c *ClassAd) MarshalOld() string {
+	if c.ad == nil || len(c.ad.Attributes) == 0 {
+		return ""
+	}
+
+	result := ""
+	for i, attr := range c.ad.Attributes {
+		if i > 0 {
+			result += "\n"
+		}
+		result += fmt.Sprintf("%s = %s", attr.Name, attr.Value.String())
+	}
+	return result
 }
 
 // Insert inserts an attribute with an expression into the ClassAd.
@@ -433,4 +489,330 @@ func (c *ClassAd) EvaluateExprWithTarget(expr *Expr, target *ClassAd) Value {
 		return NewUndefinedValue()
 	}
 	return expr.EvalWithContext(c, target)
+}
+
+// ExternalRefs returns a list of attribute names referenced in the expression
+// but not defined in this ClassAd. This is useful for validating that a ClassAd
+// has all required attributes before evaluation.
+//
+// Example:
+//
+//	ad, _ := classad.Parse("[Cpus = 4; Memory = 8192]")
+//	expr, _ := classad.ParseExpr("Cpus * 2 + ExternalAttr")
+//	external := ad.ExternalRefs(expr)  // Returns: ["ExternalAttr"]
+func (c *ClassAd) ExternalRefs(expr *Expr) []string {
+	if expr == nil {
+		return []string{}
+	}
+
+	allRefs := c.collectRefs(expr.expr)
+	external := []string{}
+
+	for _, ref := range allRefs {
+		if _, ok := c.Lookup(ref); !ok {
+			external = append(external, ref)
+		}
+	}
+
+	return external
+}
+
+// InternalRefs returns a list of attribute names referenced in the expression
+// that are defined in this ClassAd.
+//
+// Example:
+//
+//	ad, _ := classad.Parse("[Cpus = 4; Memory = 8192]")
+//	expr, _ := classad.ParseExpr("Cpus * 2 + ExternalAttr")
+//	internal := ad.InternalRefs(expr)  // Returns: ["Cpus"]
+func (c *ClassAd) InternalRefs(expr *Expr) []string {
+	if expr == nil {
+		return []string{}
+	}
+
+	allRefs := c.collectRefs(expr.expr)
+	internal := []string{}
+
+	for _, ref := range allRefs {
+		if _, ok := c.Lookup(ref); ok {
+			internal = append(internal, ref)
+		}
+	}
+
+	return internal
+}
+
+// collectRefs recursively collects all attribute references from an expression
+func (c *ClassAd) collectRefs(expr ast.Expr) []string {
+	if expr == nil {
+		return []string{}
+	}
+
+	refs := make(map[string]bool)
+	c.collectRefsHelper(expr, refs)
+
+	// Convert map to slice
+	result := make([]string, 0, len(refs))
+	for ref := range refs {
+		result = append(result, ref)
+	}
+	return result
+}
+
+// collectRefsHelper is a recursive helper for collectRefs
+func (c *ClassAd) collectRefsHelper(expr ast.Expr, refs map[string]bool) {
+	switch v := expr.(type) {
+	case *ast.AttributeReference:
+		// Only collect non-scoped references (no MY., TARGET., PARENT.)
+		if v.Scope == ast.NoScope {
+			refs[v.Name] = true
+		}
+
+	case *ast.BinaryOp:
+		c.collectRefsHelper(v.Left, refs)
+		c.collectRefsHelper(v.Right, refs)
+
+	case *ast.UnaryOp:
+		c.collectRefsHelper(v.Expr, refs)
+
+	case *ast.ConditionalExpr:
+		c.collectRefsHelper(v.Condition, refs)
+		c.collectRefsHelper(v.TrueExpr, refs)
+		c.collectRefsHelper(v.FalseExpr, refs)
+
+	case *ast.FunctionCall:
+		for _, arg := range v.Args {
+			c.collectRefsHelper(arg, refs)
+		}
+
+	case *ast.ListLiteral:
+		for _, elem := range v.Elements {
+			c.collectRefsHelper(elem, refs)
+		}
+
+	case *ast.ClassAd:
+		for _, attr := range v.Attributes {
+			c.collectRefsHelper(attr.Value, refs)
+		}
+
+	case *ast.SelectExpr:
+		c.collectRefsHelper(v.Record, refs)
+
+	case *ast.SubscriptExpr:
+		c.collectRefsHelper(v.Container, refs)
+		c.collectRefsHelper(v.Index, refs)
+
+	// Literals don't contain references
+	case *ast.IntegerLiteral, *ast.RealLiteral, *ast.StringLiteral,
+		*ast.BooleanLiteral, *ast.UndefinedLiteral, *ast.ErrorLiteral:
+		// Nothing to do
+	}
+}
+
+// Flatten partially evaluates an expression in the context of this ClassAd.
+// Attributes that are defined in the ClassAd are evaluated and replaced with their values.
+// Undefined attributes are left as references. This is useful for optimizing expressions
+// by pre-computing constant sub-expressions.
+//
+// Example:
+//
+//	ad, _ := classad.Parse("[RequestMemory = 2048]")
+//	expr, _ := classad.ParseExpr("RequestMemory * 1024 * 1024")
+//	flattened := ad.Flatten(expr)  // Returns expression equivalent to: 2147483648
+func (c *ClassAd) Flatten(expr *Expr) *Expr {
+	if expr == nil {
+		return nil
+	}
+
+	flattened := c.flattenExpr(expr.expr)
+	return &Expr{expr: flattened}
+}
+
+// flattenExpr recursively flattens an AST expression
+func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
+	if expr == nil {
+		return nil
+	}
+
+	switch v := expr.(type) {
+	case *ast.AttributeReference:
+		// Try to evaluate the reference
+		if v.Scope == ast.NoScope {
+			if _, ok := c.Lookup(v.Name); ok {
+				// Evaluate the attribute
+				val := c.EvaluateAttr(v.Name)
+				return c.valueToExpr(val)
+			}
+		}
+		// Keep the reference if undefined or scoped
+		return expr
+
+	case *ast.BinaryOp:
+		// Flatten both sides
+		left := c.flattenExpr(v.Left)
+		right := c.flattenExpr(v.Right)
+
+		// Try to evaluate if both sides are literals
+		leftVal := c.exprToValue(left)
+		rightVal := c.exprToValue(right)
+
+		if !leftVal.IsUndefined() && !rightVal.IsUndefined() {
+			// Try to compute the operation
+			result := c.evaluateBinaryOp(v.Op, leftVal, rightVal)
+			if !result.IsUndefined() && !result.IsError() {
+				return c.valueToExpr(result)
+			}
+		}
+
+		// Return with flattened operands
+		return &ast.BinaryOp{
+			Op:    v.Op,
+			Left:  left,
+			Right: right,
+		}
+
+	case *ast.UnaryOp:
+		operand := c.flattenExpr(v.Expr)
+		operandVal := c.exprToValue(operand)
+
+		if !operandVal.IsUndefined() {
+			result := c.evaluateUnaryOp(v.Op, operandVal)
+			if !result.IsUndefined() && !result.IsError() {
+				return c.valueToExpr(result)
+			}
+		}
+
+		return &ast.UnaryOp{
+			Op:   v.Op,
+			Expr: operand,
+		}
+
+	case *ast.ConditionalExpr:
+		condition := c.flattenExpr(v.Condition)
+		trueExpr := c.flattenExpr(v.TrueExpr)
+		falseExpr := c.flattenExpr(v.FalseExpr)
+
+		// If condition is a literal boolean, return the appropriate branch
+		condVal := c.exprToValue(condition)
+		if condVal.IsBool() {
+			if boolVal, _ := condVal.BoolValue(); boolVal {
+				return trueExpr
+			} else {
+				return falseExpr
+			}
+		}
+
+		return &ast.ConditionalExpr{
+			Condition: condition,
+			TrueExpr:  trueExpr,
+			FalseExpr: falseExpr,
+		}
+
+	case *ast.FunctionCall:
+		// Flatten arguments
+		args := make([]ast.Expr, len(v.Args))
+		for i, arg := range v.Args {
+			args[i] = c.flattenExpr(arg)
+		}
+		return &ast.FunctionCall{
+			Name: v.Name,
+			Args: args,
+		}
+
+	case *ast.ListLiteral:
+		elements := make([]ast.Expr, len(v.Elements))
+		for i, elem := range v.Elements {
+			elements[i] = c.flattenExpr(elem)
+		}
+		return &ast.ListLiteral{
+			Elements: elements,
+		}
+
+	case *ast.SelectExpr:
+		record := c.flattenExpr(v.Record)
+		return &ast.SelectExpr{
+			Record: record,
+			Attr:   v.Attr,
+		}
+
+	case *ast.SubscriptExpr:
+		container := c.flattenExpr(v.Container)
+		index := c.flattenExpr(v.Index)
+		return &ast.SubscriptExpr{
+			Container: container,
+			Index:     index,
+		}
+
+	// Literals are already fully evaluated
+	default:
+		return expr
+	}
+}
+
+// exprToValue converts a literal expression to a Value, returns undefined for non-literals
+func (c *ClassAd) exprToValue(expr ast.Expr) Value {
+	switch v := expr.(type) {
+	case *ast.IntegerLiteral:
+		return NewIntValue(v.Value)
+	case *ast.RealLiteral:
+		return NewRealValue(v.Value)
+	case *ast.StringLiteral:
+		return NewStringValue(v.Value)
+	case *ast.BooleanLiteral:
+		return NewBoolValue(v.Value)
+	case *ast.UndefinedLiteral:
+		return NewUndefinedValue()
+	case *ast.ErrorLiteral:
+		return NewErrorValue()
+	default:
+		return NewUndefinedValue()
+	}
+}
+
+// valueToExpr converts a Value to an AST expression
+func (c *ClassAd) valueToExpr(val Value) ast.Expr {
+	switch val.Type() {
+	case IntegerValue:
+		if intVal, err := val.IntValue(); err == nil {
+			return &ast.IntegerLiteral{Value: intVal}
+		}
+	case RealValue:
+		if realVal, err := val.RealValue(); err == nil {
+			return &ast.RealLiteral{Value: realVal}
+		}
+	case StringValue:
+		if strVal, err := val.StringValue(); err == nil {
+			return &ast.StringLiteral{Value: strVal}
+		}
+	case BooleanValue:
+		if boolVal, err := val.BoolValue(); err == nil {
+			return &ast.BooleanLiteral{Value: boolVal}
+		}
+	case UndefinedValue:
+		return &ast.UndefinedLiteral{}
+	case ErrorValue:
+		return &ast.ErrorLiteral{}
+	}
+	return &ast.UndefinedLiteral{}
+}
+
+// Helper functions for evaluating operations during flattening
+func (c *ClassAd) evaluateBinaryOp(op string, left, right Value) Value {
+	// Create a temporary evaluator to use its operator logic
+	evaluator := NewEvaluator(c)
+	tempOp := &ast.BinaryOp{
+		Op:    op,
+		Left:  c.valueToExpr(left),
+		Right: c.valueToExpr(right),
+	}
+	return evaluator.Evaluate(tempOp)
+}
+
+func (c *ClassAd) evaluateUnaryOp(op string, operand Value) Value {
+	evaluator := NewEvaluator(c)
+	tempOp := &ast.UnaryOp{
+		Op:   op,
+		Expr: c.valueToExpr(operand),
+	}
+	return evaluator.Evaluate(tempOp)
 }

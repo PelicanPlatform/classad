@@ -297,6 +297,64 @@ result = job.EvaluateExprWithTarget(reqExpr, machine)
 
 See [examples/expr_demo](examples/expr_demo/main.go) for comprehensive Expression API examples.
 
+### Expression Introspection and Utilities
+
+The library provides powerful introspection and utility methods for analyzing and optimizing expressions:
+
+**Quote/Unquote** - String escaping helpers:
+```go
+// Quote strings with proper escaping
+quoted := classad.Quote(`Hello "World"`)  // Returns: "Hello \"World\""
+
+// Unquote escaped strings
+original, err := classad.Unquote(quoted)  // Returns: Hello "World"
+```
+
+**MarshalOld** - Convert to old HTCondor format:
+```go
+ad, _ := classad.Parse(`[Cpus = 4; Memory = 8192]`)
+oldFormat := ad.MarshalOld()
+// Returns:
+// Cpus = 4
+// Memory = 8192
+```
+
+**ExternalRefs** - Find undefined attribute dependencies:
+```go
+expr, _ := classad.ParseExpr("RequestCpus * 1000 + Memory / 1024")
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+
+missing := job.ExternalRefs(expr)
+// Returns: ["Memory"]
+// Useful for validation, debugging, and dependency tracking
+```
+
+**InternalRefs** - Find defined attribute dependencies:
+```go
+defined := job.InternalRefs(expr)
+// Returns: ["RequestCpus"]
+// Useful for change tracking and cache invalidation
+```
+
+**Flatten** - Partial evaluation for optimization:
+```go
+expr, _ := classad.ParseExpr("RequestCpus * 1000 + Memory / 1024 + Unknown")
+job := classad.New()
+job.InsertAttr("RequestCpus", 4)
+job.InsertAttr("Memory", 8192)
+
+flattened := job.Flatten(expr)
+// Returns expression: (4008 + Unknown)
+// Known values replaced with literals, unknown values preserved
+```
+
+See [examples/introspection_demo](examples/introspection_demo/main.go) for comprehensive introspection examples including:
+- Dependency analysis and validation
+- Query optimization with partial evaluation
+- Cache key computation
+- Old format compatibility
+
 ### Examples
 
 Run the comprehensive API demo:

@@ -86,6 +86,40 @@ Run with:
 go run examples/api_demo/main.go
 ```
 
+### expr_demo
+**Location:** `examples/expr_demo/main.go`
+
+Demonstrates the Expression API for working with unevaluated expressions:
+- **Parsing expressions**: Creating Expr objects from strings
+- **Expression evaluation**: Evaluating in ClassAd contexts
+- **Lookup and insertion**: Getting and setting unevaluated expressions
+- **Scoped evaluation**: Using MY and TARGET contexts
+- **Formula copying**: Reusing expressions across ClassAds
+- **Template patterns**: Dynamic expression evaluation
+
+Run with:
+```bash
+go run examples/expr_demo/main.go
+```
+
+### introspection_demo
+**Location:** `examples/introspection_demo/main.go`
+
+Comprehensive demonstration of expression introspection and utility features:
+- **Quote/Unquote**: String escaping and parsing helpers
+- **MarshalOld**: Converting ClassAds to old HTCondor format
+- **ExternalRefs**: Finding undefined attribute dependencies
+- **InternalRefs**: Finding defined attribute dependencies
+- **Flatten**: Partial evaluation and query optimization
+- **Validation workflows**: Checking if expressions can be evaluated
+- **Dependency tracking**: Cache invalidation and change detection
+- **Query optimization**: Pre-computing constant parts of expressions
+
+Run with:
+```bash
+go run examples/introspection_demo/main.go
+```
+
 ## Example ClassAd Files
 
 ### job.ad
