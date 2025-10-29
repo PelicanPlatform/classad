@@ -1,0 +1,12 @@
+[
+  ClusterId = 12345;
+  ProcId = 0;
+  Owner = "alice";
+  Cmd = "/usr/bin/myapp";
+  Args = "--input data.txt --output results.txt";
+  Requirements = (TARGET.Cpus >= 2) && (TARGET.Memory >= 4096) && (TARGET.Disk >= 10000);
+  RequestCpus = 2;
+  RequestMemory = 4096;
+  RequestDisk = 10000;
+  Priority = 10;
+]

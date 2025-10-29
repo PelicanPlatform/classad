@@ -1,0 +1,17 @@
+// Simple arithmetic expression
+2 + 3 * 4
+
+// Boolean expression
+(x > 5) && (y < 10)
+
+// List literal
+{1, 2, 3, 4, 5}
+
+// Nested record
+[a = 1; b = [c = 2; d = 3]; e = 4]
+
+// Function call
+strcat("Hello", " ", "World")
+
+// Conditional expression
+x > 0 ? "positive" : "non-positive"
