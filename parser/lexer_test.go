@@ -180,7 +180,7 @@ func TestLexerResult(t *testing.T) {
 	lex := NewLexer("test")
 	expectedResult := &ast.ClassAd{}
 	lex.result = expectedResult
-	
+
 	result, err := lex.Result()
 	if err != nil {
 		t.Errorf("Expected no error, got %v", err)

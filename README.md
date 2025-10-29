@@ -1,10 +1,10 @@
 # Golang ClassAds Parser
 
-A Go implementation of a parser and lexer for the HTCondor ClassAds language, built using goyacc.
+A Go implementation of a parser, lexer, and evaluator for the HTCondor ClassAds language, built using goyacc.
 
 ## Overview
 
-This project provides a complete parser for the ClassAds language used by HTCondor (High-Throughput Computing). ClassAds are attribute-based language for representing and querying structured data, supporting expressions with operators, functions, and nested structures.
+This project provides a complete parser and evaluation engine for the ClassAds language used by HTCondor (High-Throughput Computing). ClassAds are an attribute-based language for representing and querying structured data, supporting expressions with operators, functions, and nested structures.
 
 ## Features
 
@@ -18,7 +18,38 @@ This project provides a complete parser for the ClassAds language used by HTCond
 
 - **goyacc-based Parser**: Generates efficient parser from grammar specification
 - **AST Representation**: Clean Abstract Syntax Tree structures for all ClassAd constructs
+- **Evaluation Engine**: Evaluates ClassAd expressions with type safety
+- **Public API**: High-level API mimicking the C++ HTCondor ClassAd library
 - **Go Generate Support**: Easy regeneration of parser from grammar
+
+## Quick Start
+
+```go
+import "github.com/bbockelm/golang-classads/classad"
+
+// Create a ClassAd programmatically
+ad := classad.New()
+ad.InsertAttr("Cpus", 4)
+ad.InsertAttrFloat("Memory", 8192.0)
+
+// Parse from string
+jobAd, err := classad.Parse(`[
+    JobId = 1001;
+    Owner = "alice";
+    Requirements = (Cpus >= 2) && (Memory >= 2048)
+]`)
+
+// Evaluate attributes
+if cpus, ok := jobAd.EvaluateAttrInt("Cpus"); ok {
+    fmt.Printf("Cpus = %d\n", cpus)
+}
+
+if requirements, ok := jobAd.EvaluateAttrBool("Requirements"); ok {
+    fmt.Printf("Requirements = %v\n", requirements)
+}
+```
+
+See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete API documentation.
 
 ## Project Structure
 
@@ -27,6 +58,11 @@ golang-classads/
 ├── ast/              # Abstract Syntax Tree definitions
 │   ├── ast.go
 │   └── ast_test.go
+├── classad/          # Public ClassAd API and evaluator
+│   ├── classad.go
+│   ├── classad_test.go
+│   ├── evaluator.go
+│   └── evaluator_test.go
 ├── parser/           # Parser and lexer (generated parser from .y file)
 │   ├── classad.y     # goyacc grammar specification
 │   ├── lexer.go      # Lexer implementation
@@ -36,10 +72,13 @@ golang-classads/
 ├── cmd/              # Command-line tools
 │   └── classad-parser/
 │       └── main.go
-├── examples/         # Example ClassAd files
+├── examples/         # Example ClassAd files and demos
+│   ├── api_demo/     # Comprehensive API examples
 │   ├── machine.ad
 │   ├── job.ad
 │   └── expressions.txt
+├── docs/             # Documentation
+│   └── EVALUATION_API.md
 ├── generate.go       # go generate directive
 ├── go.mod
 └── README.md
@@ -96,6 +135,41 @@ go build -o bin/classad-parser ./cmd/classad-parser
 
 ### As a Library
 
+Using the high-level ClassAd API:
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/bbockelm/golang-classads/classad"
+)
+
+func main() {
+    // Parse a ClassAd
+    ad, err := classad.Parse(`[
+        Cpus = 4;
+        Memory = 8192;
+        Requirements = (Cpus >= 2) && (Memory >= 4096)
+    ]`)
+    if err != nil {
+        fmt.Println("Error:", err)
+        return
+    }
+    
+    // Evaluate attributes
+    if cpus, ok := ad.EvaluateAttrInt("Cpus"); ok {
+        fmt.Printf("Cpus: %d\n", cpus)
+    }
+    
+    if req, ok := ad.EvaluateAttrBool("Requirements"); ok {
+        fmt.Printf("Requirements: %v\n", req)
+    }
+}
+```
+
+Using the lower-level parser directly:
+
 ```go
 package main
 
@@ -114,6 +188,24 @@ func main() {
     fmt.Println(result.String())
 }
 ```
+
+### Examples
+
+Run the comprehensive API demo:
+
+```bash
+go run ./examples/api_demo/main.go
+```
+
+This demonstrates:
+- Creating ClassAds programmatically
+- Parsing ClassAd strings
+- Evaluating expressions
+- Type-safe attribute access
+- Arithmetic, comparison, and logical operations
+- Conditional expressions
+- Modifying ClassAds
+- Real-world HTCondor scenarios
 
 ### Command-Line Tool
 
@@ -208,6 +300,11 @@ Run tests with coverage:
 ```bash
 go test -cover ./...
 ```
+
+Test packages include:
+- `ast` - AST node tests
+- `parser` - Lexer and parser tests
+- `classad` - Evaluation API tests (ClassAd CRUD, expression evaluation, type coercion, error handling)
 
 ### Code Formatting
 
