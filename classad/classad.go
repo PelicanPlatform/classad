@@ -38,6 +38,24 @@ func Parse(input string) (*ClassAd, error) {
 	return &ClassAd{ad: ad}, nil
 }
 
+// ParseOld parses a ClassAd in the "old" HTCondor format and returns a ClassAd object.
+// Old ClassAds have attributes separated by newlines without surrounding brackets.
+// Example:
+//
+//	Foo = 3
+//	Bar = "hello"
+//	Moo = Foo =!= Undefined
+func ParseOld(input string) (*ClassAd, error) {
+	ad, err := parser.ParseOldClassAd(input)
+	if err != nil {
+		return nil, err
+	}
+	if ad == nil {
+		return nil, fmt.Errorf("failed to parse old ClassAd")
+	}
+	return &ClassAd{ad: ad}, nil
+}
+
 // String returns the string representation of the ClassAd.
 func (c *ClassAd) String() string {
 	if c.ad == nil {

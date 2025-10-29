@@ -48,7 +48,8 @@ The `ClassAd` type represents a ClassAd object and provides methods for manipula
 #### Creation and Parsing
 
 - `New() *ClassAd` - Creates a new empty ClassAd
-- `Parse(input string) (*ClassAd, error)` - Parses a ClassAd from a string
+- `Parse(input string) (*ClassAd, error)` - Parses a ClassAd from a string (new format)
+- `ParseOld(input string) (*ClassAd, error)` - Parses a ClassAd from a string (old format)
 
 #### Attribute Manipulation
 
@@ -718,6 +719,7 @@ This API is designed to mimic the C++ HTCondor ClassAd library, providing simila
 - Subscript expressions (`list[index]`, `record["key"]`)
 - Scoped attribute references (MY., TARGET., PARENT.)
 - ClassAd matching with MatchClassAd
+- Old ClassAd format support (newline-delimited, no brackets)
 - Built-in functions:
   - String functions (strcat, substr, size, toLower, toUpper, stringListMember, regexp)
   - Math functions (floor, ceiling, round, random, int, real)
@@ -733,3 +735,81 @@ This API is designed to mimic the C++ HTCondor ClassAd library, providing simila
 - Bitwise operators (&, |, ^, ~)
 - Shift operators (<<, >>, >>>)
 - Additional built-in functions as needed
+
+## Old ClassAd Format
+
+The library supports both "old" and "new" ClassAd formats used by HTCondor:
+
+### New Format (Default)
+
+```go
+ad, err := classad.Parse(`[
+    Foo = 3;
+    Bar = "hello";
+    Moo = Foo =!= Undefined
+]`)
+```
+
+**Characteristics:**
+- Enclosed in square brackets `[ ]`
+- Attributes separated by semicolons `;`
+- Standard in HTCondor 7.5.1 and later
+- Supports all ClassAd features
+
+### Old Format
+
+```go
+ad, err := classad.ParseOld(`Foo = 3
+Bar = "hello"
+Moo = Foo =!= Undefined`)
+```
+
+**Characteristics:**
+- No surrounding brackets
+- Attributes separated by newlines
+- Used in HTCondor versions before 7.5.1
+- Compatible with older HTCondor tools and output
+
+### Implementation Details
+
+The old ClassAd parser converts the old format to new format internally by:
+1. Adding surrounding brackets `[ ]`
+2. Adding semicolons `;` after each attribute assignment
+3. Preserving comments and empty lines
+4. Reusing the existing parser for full feature support
+
+This ensures that old ClassAds have access to all features including:
+- Nested ClassAds and lists
+- Scoped attribute references
+- Built-in functions
+- All operators and expressions
+
+### Example: Equivalent Formats
+
+**Old Format:**
+```
+MyType = "Machine"
+TargetType = "Job"
+Machine = "froth.cs.wisc.edu"
+Arch = "INTEL"
+OpSys = "LINUX"
+Disk = 35882
+Memory = 128
+Requirements = TARGET.Owner=="smith" || LoadAvg<=0.3
+```
+
+**New Format:**
+```
+[
+MyType = "Machine";
+TargetType = "Job";
+Machine = "froth.cs.wisc.edu";
+Arch = "INTEL";
+OpSys = "LINUX";
+Disk = 35882;
+Memory = 128;
+Requirements = TARGET.Owner=="smith" || LoadAvg<=0.3
+]
+```
+
+Both formats parse to the same internal representation and can be evaluated identically.

@@ -42,6 +42,94 @@ func TestParseClassAd(t *testing.T) {
 	}
 }
 
+func TestParseOldClassAd(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"empty old classad", "", false},
+		{"simple old classad", "x = 1", false},
+		{"multiple attrs old", "x = 1\ny = 2", false},
+		{
+			"HTCondor machine example",
+			`MyType = "Machine"
+TargetType = "Job"
+Machine = "froth.cs.wisc.edu"
+Arch = "INTEL"
+OpSys = "LINUX"`,
+			false,
+		},
+		{
+			"old classad with expressions",
+			`X = 10
+Y = 20
+Sum = X + Y
+Max = (X > Y) ? X : Y`,
+			false,
+		},
+		{
+			"old classad with scoped refs",
+			`Cpus = 2
+Requirements = TARGET.Cpus >= MY.Cpus`,
+			false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ad, err := ParseOld(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseOld() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && ad == nil {
+				t.Error("ParseOld() returned nil ClassAd")
+			}
+		})
+	}
+}
+
+func TestOldAndNewFormatEquivalence(t *testing.T) {
+	// Test that the same data parsed in old and new format produces equivalent results
+	oldFormat := `X = 10
+Y = 20
+Sum = X + Y`
+
+	newFormat := `[
+X = 10;
+Y = 20;
+Sum = X + Y
+]`
+
+	oldAd, err := ParseOld(oldFormat)
+	if err != nil {
+		t.Fatalf("ParseOld() error = %v", err)
+	}
+
+	newAd, err := Parse(newFormat)
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+
+	// Check that both have the same number of attributes
+	if oldAd.Size() != newAd.Size() {
+		t.Errorf("Different sizes: old=%d, new=%d", oldAd.Size(), newAd.Size())
+	}
+
+	// Check that evaluation produces same results
+	oldSum, oldOk := oldAd.EvaluateAttrInt("Sum")
+	newSum, newOk := newAd.EvaluateAttrInt("Sum")
+
+	if oldOk != newOk {
+		t.Errorf("Different evaluation results: oldOk=%v, newOk=%v", oldOk, newOk)
+	}
+
+	if oldOk && newOk && oldSum != newSum {
+		t.Errorf("Different sum values: old=%d, new=%d", oldSum, newSum)
+	}
+}
+
 func TestInsertAttr(t *testing.T) {
 	ad := New()
 

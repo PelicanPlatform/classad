@@ -525,7 +525,7 @@ func builtinRegexp(args []Value) Value {
 			return NewErrorValue()
 		}
 		options, _ := args[2].StringValue()
-		
+
 		// Build Go regex flags
 		if strings.ContainsAny(options, "iI") {
 			flags += "(?i)"
@@ -570,7 +570,7 @@ func builtinIfThenElse(args []Value) Value {
 	}
 
 	condition, _ := args[0].BoolValue()
-	
+
 	// Return appropriate value based on condition
 	if condition {
 		return args[1]

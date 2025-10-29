@@ -43,12 +43,18 @@ ad := classad.New()
 ad.InsertAttr("Cpus", 4)
 ad.InsertAttrFloat("Memory", 8192.0)
 
-// Parse from string
+// Parse from string (new format)
 jobAd, err := classad.Parse(`[
     JobId = 1001;
     Owner = "alice";
     Requirements = (Cpus >= 2) && (Memory >= 2048)
 ]`)
+
+// Parse old ClassAd format (newline-delimited, no brackets)
+oldAd, err := classad.ParseOld(`MyType = "Machine"
+TargetType = "Job"
+Cpus = 4
+Memory = 8192`)
 
 // Evaluate attributes
 if cpus, ok := jobAd.EvaluateAttrInt("Cpus"); ok {
@@ -249,7 +255,7 @@ See [examples/README.md](examples/README.md) for detailed examples and usage pat
 
 ### Command-Line Tool
 
-Parse a ClassAd:
+Parse a ClassAd (new format):
 
 ```bash
 ./bin/classad-parser '[x = 10; y = x + 5]'
@@ -261,6 +267,19 @@ Parse a more complex example:
 ```bash
 ./bin/classad-parser '[Cpus = 4; Memory = 8192; Requirements = (Cpus >= 2) && (Memory >= 4096)]'
 # Output: [Cpus = 4; Memory = 8192; Requirements = ((Cpus >= 2) && (Memory >= 4096))]
+```
+
+Parse old ClassAd format:
+
+```bash
+./bin/classad-parser -old $'Foo = 3\nBar = "hello"\nMoo = Foo + 2'
+# Output: [Foo = 3; Bar = "hello"; Moo = (Foo + 2)]
+```
+
+View help:
+
+```bash
+./bin/classad-parser -help
 ```
 
 ## ClassAds Language Features
@@ -330,6 +349,7 @@ See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete function docum
 
 ### Example ClassAd
 
+**New Format:**
 ```classad
 [
   Machine = "execute.example.com";
@@ -342,6 +362,37 @@ See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete function docum
   IsAvailable = LoadAvg < 1.0;
 ]
 ```
+
+**Old Format:**
+```classad
+Machine = "execute.example.com"
+Cpus = 4
+Memory = 8192
+Disk = 1000000
+Requirements = (TARGET.Cpus >= 2) && (TARGET.Memory >= 4096)
+Rank = TARGET.Memory
+LoadAvg = 0.5
+IsAvailable = LoadAvg < 1.0
+```
+
+### Old vs New ClassAd Format
+
+This library supports both the old and new ClassAd formats used by HTCondor:
+
+**New Format (default):**
+- Enclosed in square brackets `[ ]`
+- Attributes separated by semicolons `;`
+- Standard in HTCondor 7.5.1 and later
+- Supports all ClassAd features (lists, nested ClassAds, etc.)
+
+**Old Format:**
+- No surrounding brackets
+- Attributes separated by newlines
+- Used in HTCondor versions before 7.5.1
+- Compatible with older HTCondor tools
+- Use `ParseOld()` API or `-old` flag in CLI
+
+The library automatically converts old format to new format internally, ensuring full compatibility and feature support.
 
 ## Development
 
@@ -448,4 +499,3 @@ goyacc -o parser/y.go -p yy parser/classad.y
 ## TODO
 
 - [ ] Additional built-in functions as needed
-- [ ] Support for old ClassAd syntax

@@ -54,6 +54,16 @@ Example HTCondor machine/slot ClassAd showing:
 - Architecture and operating system
 - Start/Requirements expressions
 
+**Format:** New ClassAd format (with brackets and semicolons)
+
+### machine_old.ad
+Same machine ClassAd in old HTCondor format showing:
+- Newline-delimited attributes
+- No surrounding brackets
+- Compatible with HTCondor pre-7.5.1
+
+**Format:** Old ClassAd format (newline-delimited, no brackets)
+
 ### expressions.txt
 Collection of sample ClassAd expressions demonstrating:
 - Arithmetic operators
@@ -66,7 +76,7 @@ Collection of sample ClassAd expressions demonstrating:
 
 ## Usage Examples
 
-### Parsing a ClassAd from a file
+### Parsing a ClassAd from a file (new format)
 ```go
 data, err := os.ReadFile("examples/job.ad")
 if err != nil {
@@ -74,6 +84,19 @@ if err != nil {
 }
 
 ad, err := classad.Parse(string(data))
+if err != nil {
+    log.Fatal(err)
+}
+```
+
+### Parsing a ClassAd from a file (old format)
+```go
+data, err := os.ReadFile("examples/machine_old.ad")
+if err != nil {
+    log.Fatal(err)
+}
+
+ad, err := classad.ParseOld(string(data))
 if err != nil {
     log.Fatal(err)
 }

@@ -214,14 +214,14 @@ func TestIfThenElse(t *testing.T) {
 				t.Fatalf("Failed to parse: %v", err)
 			}
 			val := ad.EvaluateAttr("test")
-			
+
 			if tt.isError {
 				if !val.IsError() {
 					t.Errorf("Expected error, got %v", val.Type())
 				}
 				return
 			}
-			
+
 			if tt.isUndef {
 				if !val.IsUndefined() {
 					t.Errorf("Expected undefined, got %v", val.Type())

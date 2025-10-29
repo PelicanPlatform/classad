@@ -1,0 +1,8 @@
+Machine = "execute.example.com"
+Cpus = 4
+Memory = 8192
+Disk = 1000000
+Requirements = (TARGET.Cpus >= 2) && (TARGET.Memory >= 4096)
+Rank = TARGET.Memory
+LoadAvg = 0.5
+IsAvailable = LoadAvg < 1.0

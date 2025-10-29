@@ -299,12 +299,12 @@ func (l *Lexer) scanString() string {
 					// If first digit is 4-7, read up to 2 digits
 					var octalStr strings.Builder
 					octalStr.WriteRune(escaped)
-					
+
 					maxDigits := 2
 					if escaped >= '0' && escaped <= '3' {
 						maxDigits = 3
 					}
-					
+
 					// Read additional octal digits
 					for i := 1; i < maxDigits && l.pos < len(l.input); i++ {
 						nextCh := l.peek()
@@ -315,19 +315,19 @@ func (l *Lexer) scanString() string {
 							break
 						}
 					}
-					
+
 					// Convert octal string to integer
 					octalValue := int64(0)
 					for _, digit := range octalStr.String() {
 						octalValue = octalValue*8 + int64(digit-'0')
 					}
-					
+
 					// Check for null (value 0) which is not allowed
 					if octalValue == 0 {
 						l.Error(fmt.Sprintf("null character (\\%s) not allowed in string at position %d", octalStr.String(), l.pos-len(octalStr.String())-2))
 						return result.String()
 					}
-					
+
 					result.WriteRune(rune(octalValue))
 				default:
 					// Unknown escape sequence - this is an error according to spec
