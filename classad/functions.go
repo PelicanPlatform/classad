@@ -233,8 +233,8 @@ func builtinRandom(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	max, _ := args[0].NumberValue()
-	return NewRealValue(rand.Float64() * max)
+	maxVal, _ := args[0].NumberValue()
+	return NewRealValue(rand.Float64() * maxVal)
 }
 
 // builtinInt converts to integer

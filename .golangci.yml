@@ -45,7 +45,7 @@ linters:
     - misspell
     - unparam
     - unconvert
-    - exportloopref
+    # Note: copyloopvar (Go 1.22+) not needed for this project
 
   disable:
     - typecheck  # Disabled because of generated parser code
@@ -93,9 +93,10 @@ issues:
   max-issues-per-linter: 0
   max-same-issues: 0
 
+  exclude-dirs:
+    - bin
+    - vendor
+
 run:
   timeout: 5m
   tests: true
-  skip-dirs:
-    - bin
-    - vendor
