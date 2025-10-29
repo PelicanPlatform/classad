@@ -10,8 +10,11 @@ This project provides a complete parser and evaluation engine for the ClassAds l
 
 - **Complete Lexer**: Tokenizes ClassAd syntax including:
   - Literals (integers, reals, strings, booleans, undefined, error)
-  - Operators (arithmetic, logical, comparison, bitwise, shift, is/isnt)
+  - Operators (arithmetic, logical, comparison, bitwise, shift, is/isnt, =?=/=!=)
   - Attribute references and assignments
+  - Scoped attribute references (MY., TARGET., PARENT.)
+  - Attribute selection (`record.field`)
+  - Subscript expressions (`list[index]`, `record["key"]`)
   - Lists and nested records
   - Function calls
   - Comments (line and block)
@@ -21,8 +24,11 @@ This project provides a complete parser and evaluation engine for the ClassAds l
 - **Evaluation Engine**: Evaluates ClassAd expressions with:
   - Type safety and automatic coercion
   - Nested ClassAds and lists
-  - Strict identity operators (`is`/`isnt`)
+  - Strict identity operators (`is`/`isnt`, `=?=`/`=!=`)
+  - Scoped attribute references for parent/target relationships
+  - Attribute selection and subscripting
   - 20+ built-in functions (string, math, type checking, list operations)
+- **ClassAd Matching**: MatchClassAd type for symmetric matching (job/machine matching)
 - **Public API**: High-level API mimicking the C++ HTCondor ClassAd library
 - **Go Generate Support**: Easy regeneration of parser from grammar
 
@@ -273,7 +279,9 @@ Parse a more complex example:
 - **Logical**: `&&`, `||`, `!`
 - **Bitwise**: `&`, `|`, `^`, `~`
 - **Shift**: `<<`, `>>`, `>>>`
-- **Strict Identity**: `is`, `isnt` (type and value must match exactly)
+- **Strict Identity**: `is`, `isnt`, `=?=`, `=!=` (type and value must match exactly)
+  - `=?=` is an alias for `is` (meta-equal)
+  - `=!=` is an alias for `isnt` (meta-not-equal)
 
 ### Expressions
 
@@ -283,8 +291,8 @@ Parse a more complex example:
 - **Function Call**: `strcat("hello", " ", "world")`, `floor(3.14)`, `member(x, list)`
 - **List**: `{1, 2, 3, 4, 5}`
 - **Nested Record**: `[a = 1; b = [x = 10; y = 20]]`
-- **Selection**: `record.field`
-- **Subscript**: `list[0]`
+- **Selection**: `record.field`, `a.b.c` (chaining supported)
+- **Subscript**: `list[0]`, `record["key"]`, `matrix[1][2]` (chaining supported)
 
 ### Built-in Functions
 
@@ -433,10 +441,9 @@ goyacc -o parser/y.go -p yy parser/classad.y
 
 ## TODO
 
-- [ ] Support for attribute selection expressions (record.field)
-- [ ] Support for subscript expressions (list[index])
-- [ ] Additional built-in functions (stringListMember, regexp, etc.)
+- [ ] Additional built-in functions (stringListMember, regexp, ifThenElse, etc.)
 - [ ] Support for old ClassAd syntax
 - [ ] XML serialization/deserialization
 - [ ] ClassAd matching and ranking
 - [ ] Performance optimizations
+- [ ] Scoped attribute references (MY., TARGET., PARENT.)

@@ -10,6 +10,9 @@ This directory contains example programs and ClassAd files demonstrating various
 A comprehensive demonstration of advanced ClassAd features including:
 - **Nested ClassAds**: Working with hierarchical data structures
 - **IS and ISNT operators**: Strict identity checking vs. value equality
+- **Meta-equal operators**: `=?=` and `=!=` aliases for `is` and `isnt`
+- **Attribute selection**: `record.field` syntax for accessing nested attributes
+- **Subscript expressions**: `list[index]` and `record["key"]` for indexing
 - **String functions**: `strcat`, `substr`, `size`, `toUpper`, `toLower`
 - **Math functions**: `floor`, `ceiling`, `round`, `int`, `real`, `random`
 - **Type checking**: `isString`, `isInteger`, `isReal`, `isBoolean`, `isList`, `isClassAd`, `isUndefined`
@@ -136,12 +139,66 @@ ad, _ := classad.Parse(`[
     
     valueEqual = (x == y);    // true (coerces types)
     strictEqual = (x is y);   // false (different types)
-    notEqual = (x isnt y)     // true (different types)
+    notEqual = (x isnt y);    // true (different types)
+    
+    // Meta-equal operator aliases
+    metaEqual = (x =?= y);    // false (same as 'is')
+    metaNotEqual = (x =!= y)  // true (same as 'isnt')
 ]`)
 
 valueEq, _ := ad.EvaluateAttrBool("valueEqual")
 strictEq, _ := ad.EvaluateAttrBool("strictEqual")
 notEq, _ := ad.EvaluateAttrBool("notEqual")
+metaEq, _ := ad.EvaluateAttrBool("metaEqual")
+```
+
+### Using attribute selection
+```go
+ad, _ := classad.Parse(`[
+    employee = [
+        name = "Alice";
+        department = [name = "Engineering"; location = "Building A"]
+    ];
+    empName = employee.name;
+    deptName = employee.department.name
+]`)
+
+name, _ := ad.EvaluateAttrString("empName")      // "Alice"
+dept, _ := ad.EvaluateAttrString("deptName")     // "Engineering"
+```
+
+### Using subscript expressions
+```go
+ad, _ := classad.Parse(`[
+    fruits = {"apple", "banana", "cherry"};
+    person = [name = "Bob"; age = 30];
+    matrix = {{1, 2, 3}, {4, 5, 6}};
+    
+    first = fruits[0];
+    personName = person["name"];
+    element = matrix[1][2]
+]`)
+
+first, _ := ad.EvaluateAttrString("first")       // "apple"
+name, _ := ad.EvaluateAttrString("personName")   // "Bob"
+elem, _ := ad.EvaluateAttrInt("element")         // 6
+```
+
+### Combining selection and subscripting
+```go
+ad, _ := classad.Parse(`[
+    company = [
+        employees = {
+            [name = "Alice"; salary = 100000],
+            [name = "Bob"; salary = 95000]
+        }
+    ];
+    firstEmpName = company.employees[0].name;
+    secondSalary = company.employees[1].salary
+]`)
+
+name, _ := ad.EvaluateAttrString("firstEmpName")    // "Alice"
+salary, _ := ad.EvaluateAttrInt("secondSalary")     // 95000
 ```
 
 ## Learn More

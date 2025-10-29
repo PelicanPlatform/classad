@@ -533,3 +533,742 @@ func TestFunctionChaining(t *testing.T) {
 		t.Errorf("Expected 'HELLO', got '%s'", result)
 	}
 }
+
+// Tests for =?= and =!= operators (meta-equal operators)
+
+func TestMetaEqualOperator(t *testing.T) {
+	ad, err := Parse(`[
+		intValue = 5;
+		realValue = 5.0;
+		
+		metaEqual1 = (intValue =?= intValue);
+		metaEqual2 = (intValue =?= realValue);
+		metaEqual3 = (5 =?= 5);
+		metaEqual4 = ("hello" =?= "hello");
+		metaEqual5 = (true =?= true);
+		metaEqual6 = (undefined =?= undefined);
+		metaEqual7 = (error =?= error)
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	tests := []struct {
+		attr     string
+		expected bool
+	}{
+		{"metaEqual1", true},  // same type and value
+		{"metaEqual2", false}, // different types
+		{"metaEqual3", true},  // same literal
+		{"metaEqual4", true},  // same string
+		{"metaEqual5", true},  // same boolean
+		{"metaEqual6", true},  // both undefined
+		{"metaEqual7", true},  // both error
+	}
+
+	for _, test := range tests {
+		val, ok := ad.EvaluateAttrBool(test.attr)
+		if !ok {
+			t.Errorf("%s: failed to evaluate", test.attr)
+			continue
+		}
+		if val != test.expected {
+			t.Errorf("%s: expected %v, got %v", test.attr, test.expected, val)
+		}
+	}
+}
+
+func TestMetaNotEqualOperator(t *testing.T) {
+	ad, err := Parse(`[
+		intValue = 5;
+		realValue = 5.0;
+		
+		metaNotEqual1 = (intValue =!= realValue);
+		metaNotEqual2 = (intValue =!= intValue);
+		metaNotEqual3 = ("hello" =!= "world");
+		metaNotEqual4 = (true =!= false);
+		metaNotEqual5 = (5 =!= 6)
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	tests := []struct {
+		attr     string
+		expected bool
+	}{
+		{"metaNotEqual1", true},  // different types
+		{"metaNotEqual2", false}, // same type and value
+		{"metaNotEqual3", true},  // different strings
+		{"metaNotEqual4", true},  // different booleans
+		{"metaNotEqual5", true},  // different values
+	}
+
+	for _, test := range tests {
+		val, ok := ad.EvaluateAttrBool(test.attr)
+		if !ok {
+			t.Errorf("%s: failed to evaluate", test.attr)
+			continue
+		}
+		if val != test.expected {
+			t.Errorf("%s: expected %v, got %v", test.attr, test.expected, val)
+		}
+	}
+}
+
+func TestMetaEqualWithLists(t *testing.T) {
+	ad, err := Parse(`[
+		list1 = {1, 2, 3};
+		list2 = {1, 2, 3};
+		list3 = {1, 2, 3, 4};
+		
+		same = (list1 =?= list2);
+		different = (list1 =!= list3)
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	same, ok := ad.EvaluateAttrBool("same")
+	if !ok || !same {
+		t.Error("Expected list1 =?= list2 to be true")
+	}
+
+	different, ok := ad.EvaluateAttrBool("different")
+	if !ok || !different {
+		t.Error("Expected list1 =!= list3 to be true")
+	}
+}
+
+// Tests for attribute selection expressions
+
+func TestSelectExpr(t *testing.T) {
+	ad, err := Parse(`[
+		person = [name = "Alice"; age = 30; city = "NYC"];
+		personName = person.name;
+		personAge = person.age;
+		personCity = person.city
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	name, ok := ad.EvaluateAttrString("personName")
+	if !ok || name != "Alice" {
+		t.Errorf("Expected 'Alice', got '%s'", name)
+	}
+
+	age, ok := ad.EvaluateAttrInt("personAge")
+	if !ok || age != 30 {
+		t.Errorf("Expected 30, got %d", age)
+	}
+
+	city, ok := ad.EvaluateAttrString("personCity")
+	if !ok || city != "NYC" {
+		t.Errorf("Expected 'NYC', got '%s'", city)
+	}
+}
+
+func TestSelectExprNested(t *testing.T) {
+	ad, err := Parse(`[
+		company = [
+			name = "TechCorp";
+			ceo = [
+				name = "Bob";
+				age = 45
+			]
+		];
+		ceoName = company.ceo.name;
+		companyName = company.name
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	ceoName, ok := ad.EvaluateAttrString("ceoName")
+	if !ok || ceoName != "Bob" {
+		t.Errorf("Expected 'Bob', got '%s'", ceoName)
+	}
+
+	companyName, ok := ad.EvaluateAttrString("companyName")
+	if !ok || companyName != "TechCorp" {
+		t.Errorf("Expected 'TechCorp', got '%s'", companyName)
+	}
+}
+
+func TestSelectExprUndefined(t *testing.T) {
+	ad, err := Parse(`[
+		person = [name = "Alice"];
+		missingAttr = person.nonexistent
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	val := ad.EvaluateAttr("missingAttr")
+	if !val.IsUndefined() {
+		t.Error("Expected undefined for non-existent attribute")
+	}
+}
+
+func TestSelectExprError(t *testing.T) {
+	ad, err := Parse(`[
+		notARecord = 42;
+		result = notARecord.someAttr
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	val := ad.EvaluateAttr("result")
+	if !val.IsError() {
+		t.Error("Expected error when selecting from non-ClassAd")
+	}
+}
+
+// Tests for subscript expressions
+
+func TestSubscriptExprList(t *testing.T) {
+	ad, err := Parse(`[
+		numbers = {10, 20, 30, 40, 50};
+		first = numbers[0];
+		third = numbers[2];
+		last = numbers[4]
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	first, ok := ad.EvaluateAttrInt("first")
+	if !ok || first != 10 {
+		t.Errorf("Expected 10, got %d", first)
+	}
+
+	third, ok := ad.EvaluateAttrInt("third")
+	if !ok || third != 30 {
+		t.Errorf("Expected 30, got %d", third)
+	}
+
+	last, ok := ad.EvaluateAttrInt("last")
+	if !ok || last != 50 {
+		t.Errorf("Expected 50, got %d", last)
+	}
+}
+
+func TestSubscriptExprListOutOfBounds(t *testing.T) {
+	ad, err := Parse(`[
+		numbers = {10, 20, 30};
+		outOfBounds = numbers[5];
+		negative = numbers[-1]
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	outOfBounds := ad.EvaluateAttr("outOfBounds")
+	if !outOfBounds.IsUndefined() {
+		t.Error("Expected undefined for out-of-bounds index")
+	}
+
+	negative := ad.EvaluateAttr("negative")
+	if !negative.IsUndefined() {
+		t.Error("Expected undefined for negative index")
+	}
+}
+
+func TestSubscriptExprClassAd(t *testing.T) {
+	ad, err := Parse(`[
+		person = [name = "Alice"; age = 30; city = "NYC"];
+		personName = person["name"];
+		personAge = person["age"];
+		personCity = person["city"]
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	name, ok := ad.EvaluateAttrString("personName")
+	if !ok || name != "Alice" {
+		t.Errorf("Expected 'Alice', got '%s'", name)
+	}
+
+	age, ok := ad.EvaluateAttrInt("personAge")
+	if !ok || age != 30 {
+		t.Errorf("Expected 30, got %d", age)
+	}
+
+	city, ok := ad.EvaluateAttrString("personCity")
+	if !ok || city != "NYC" {
+		t.Errorf("Expected 'NYC', got '%s'", city)
+	}
+}
+
+func TestSubscriptExprNestedLists(t *testing.T) {
+	ad, err := Parse(`[
+		matrix = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
+		row1 = matrix[0];
+		element = matrix[1][2]
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	row1Val := ad.EvaluateAttr("row1")
+	if !row1Val.IsList() {
+		t.Fatal("row1 should be a list")
+	}
+
+	row1, _ := row1Val.ListValue()
+	if len(row1) != 3 {
+		t.Errorf("Expected row1 length 3, got %d", len(row1))
+	}
+
+	element, ok := ad.EvaluateAttrInt("element")
+	if !ok || element != 6 {
+		t.Errorf("Expected 6, got %d", element)
+	}
+}
+
+func TestSubscriptExprError(t *testing.T) {
+	ad, err := Parse(`[
+		notAList = 42;
+		result = notAList[0]
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	val := ad.EvaluateAttr("result")
+	if !val.IsError() {
+		t.Error("Expected error when subscripting non-list/non-ClassAd")
+	}
+}
+
+func TestSubscriptExprListWithNonIntegerIndex(t *testing.T) {
+	ad, err := Parse(`[
+		numbers = {10, 20, 30};
+		result = numbers["invalid"]
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	val := ad.EvaluateAttr("result")
+	if !val.IsError() {
+		t.Error("Expected error when using non-integer index on list")
+	}
+}
+
+func TestSubscriptExprClassAdWithNonStringKey(t *testing.T) {
+	ad, err := Parse(`[
+		person = [name = "Alice"; age = 30];
+		result = person[0]
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	val := ad.EvaluateAttr("result")
+	if !val.IsError() {
+		t.Error("Expected error when using non-string key on ClassAd")
+	}
+}
+
+// Integration tests combining multiple features
+
+func TestSelectAndSubscriptCombined(t *testing.T) {
+	ad, err := Parse(`[
+		data = [
+			users = {"alice", "bob", "charlie"};
+			scores = {95, 87, 92}
+		];
+		firstUser = data.users[0];
+		secondScore = data.scores[1];
+		userCount = size(data.users)
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	firstUser, ok := ad.EvaluateAttrString("firstUser")
+	if !ok || firstUser != "alice" {
+		t.Errorf("Expected 'alice', got '%s'", firstUser)
+	}
+
+	secondScore, ok := ad.EvaluateAttrInt("secondScore")
+	if !ok || secondScore != 87 {
+		t.Errorf("Expected 87, got %d", secondScore)
+	}
+
+	userCount, ok := ad.EvaluateAttrInt("userCount")
+	if !ok || userCount != 3 {
+		t.Errorf("Expected 3, got %d", userCount)
+	}
+}
+
+func TestComplexNestedAccessPatterns(t *testing.T) {
+	ad, err := Parse(`[
+		company = [
+			name = "TechCorp";
+			departments = {
+				[name = "Engineering"; headcount = 50],
+				[name = "Sales"; headcount = 30],
+				[name = "HR"; headcount = 10]
+			}
+		];
+		engDept = company.departments[0];
+		engName = company.departments[0].name;
+		salesHeadcount = company.departments[1].headcount
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	engDeptVal := ad.EvaluateAttr("engDept")
+	if !engDeptVal.IsClassAd() {
+		t.Error("engDept should be a ClassAd")
+	}
+
+	engName, ok := ad.EvaluateAttrString("engName")
+	if !ok || engName != "Engineering" {
+		t.Errorf("Expected 'Engineering', got '%s'", engName)
+	}
+
+	salesHeadcount, ok := ad.EvaluateAttrInt("salesHeadcount")
+	if !ok || salesHeadcount != 30 {
+		t.Errorf("Expected 30, got %d", salesHeadcount)
+	}
+}
+
+// Tests for scoped attribute references (MY., TARGET., PARENT.)
+
+func TestMyScopedReference(t *testing.T) {
+	ad, err := Parse(`[
+		x = 10;
+		y = MY.x + 5
+	]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	y, ok := ad.EvaluateAttrInt("y")
+	if !ok || y != 15 {
+		t.Errorf("Expected 15, got %d", y)
+	}
+}
+
+func TestTargetScopedReference(t *testing.T) {
+	job := New()
+	job.InsertAttr("RequestCpus", 4)
+	job.InsertAttr("RequestMemory", 8192)
+
+	machine := New()
+	machine.InsertAttr("Cpus", 8)
+	machine.InsertAttr("Memory", 16384)
+
+	// Set target for job to reference machine
+	job.SetTarget(machine)
+
+	// Parse requirements expression that references TARGET
+	reqExpr, err := Parse(`[req = (TARGET.Cpus >= RequestCpus) && (TARGET.Memory >= RequestMemory)]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Copy the requirement to job
+	reqValue := reqExpr.Lookup("req")
+	job.Insert("Requirements", reqValue)
+
+	// Evaluate
+	matches, ok := job.EvaluateAttrBool("Requirements")
+	if !ok {
+		t.Fatal("Failed to evaluate Requirements")
+	}
+	if !matches {
+		t.Error("Expected Requirements to be true")
+	}
+}
+
+func TestParentScopedReference(t *testing.T) {
+	parent := New()
+	parent.InsertAttr("ParentValue", 100)
+
+	child := New()
+	child.InsertAttr("ChildValue", 50)
+	child.SetParent(parent)
+
+	// Parse expression with PARENT reference
+	expr, err := Parse(`[result = ChildValue + PARENT.ParentValue]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	// Copy expression to child
+	resultExpr := expr.Lookup("result")
+	child.Insert("Total", resultExpr)
+
+	// Evaluate
+	total, ok := child.EvaluateAttrInt("Total")
+	if !ok {
+		t.Fatal("Failed to evaluate Total")
+	}
+	if total != 150 {
+		t.Errorf("Expected 150, got %d", total)
+	}
+}
+
+func TestScopedReferenceUndefined(t *testing.T) {
+	ad := New()
+	ad.InsertAttr("x", 10)
+
+	// Parse expression with TARGET reference (but no target set)
+	expr, err := Parse(`[result = TARGET.SomeAttr]`)
+	if err != nil {
+		t.Fatalf("Parse error: %v", err)
+	}
+
+	resultExpr := expr.Lookup("result")
+	ad.Insert("Result", resultExpr)
+
+	// Should be undefined since no target is set
+	val := ad.EvaluateAttr("Result")
+	if !val.IsUndefined() {
+		t.Error("Expected undefined when TARGET not set")
+	}
+}
+
+func TestNestedScopedReferences(t *testing.T) {
+	job := New()
+	job.InsertAttr("RequestCpus", 4)
+
+	machine := New()
+	machine.InsertAttr("Cpus", 8)
+	machine.InsertAttr("MaxCpus", 16)
+
+	job.SetTarget(machine)
+	machine.SetTarget(job)
+
+	// Job requires machine to have enough CPUs
+	jobReqExpr, _ := Parse(`[req = TARGET.Cpus >= MY.RequestCpus]`)
+	job.Insert("Requirements", jobReqExpr.Lookup("req"))
+
+	// Machine requires job to not exceed MaxCpus
+	machineReqExpr, _ := Parse(`[req = TARGET.RequestCpus <= MY.MaxCpus]`)
+	machine.Insert("Requirements", machineReqExpr.Lookup("req"))
+
+	jobReq, ok1 := job.EvaluateAttrBool("Requirements")
+	machineReq, ok2 := machine.EvaluateAttrBool("Requirements")
+
+	if !ok1 || !jobReq {
+		t.Error("Job requirements should be true")
+	}
+	if !ok2 || !machineReq {
+		t.Error("Machine requirements should be true")
+	}
+}
+
+// Tests for MatchClassAd
+
+func TestMatchClassAdCreation(t *testing.T) {
+	job := New()
+	job.InsertAttr("JobId", 1001)
+
+	machine := New()
+	machine.InsertAttrString("Name", "slot1@worker1")
+
+	match := NewMatchClassAd(job, machine)
+
+	if match.GetLeftAd() != job {
+		t.Error("Left ad should be job")
+	}
+	if match.GetRightAd() != machine {
+		t.Error("Right ad should be machine")
+	}
+
+	// Check that TARGET references are set up
+	if job.GetTarget() != machine {
+		t.Error("Job target should be machine")
+	}
+	if machine.GetTarget() != job {
+		t.Error("Machine target should be job")
+	}
+}
+
+func TestMatchClassAdSymmetry(t *testing.T) {
+	job := New()
+	job.InsertAttr("RequestCpus", 4)
+	job.InsertAttr("RequestMemory", 8192)
+
+	machine := New()
+	machine.InsertAttr("Cpus", 8)
+	machine.InsertAttr("Memory", 16384)
+
+	// Parse requirements with TARGET references
+	jobReqExpr, _ := Parse(`[r = (TARGET.Cpus >= RequestCpus) && (TARGET.Memory >= RequestMemory)]`)
+	job.Insert("Requirements", jobReqExpr.Lookup("r"))
+
+	machineReqExpr, _ := Parse(`[r = (TARGET.RequestCpus <= Cpus) && (TARGET.RequestMemory <= Memory)]`)
+	machine.Insert("Requirements", machineReqExpr.Lookup("r"))
+
+	match := NewMatchClassAd(job, machine)
+
+	if !match.Symmetry("Requirements", "Requirements") {
+		t.Error("Symmetric requirements should be true")
+	}
+
+	if !match.Match() {
+		t.Error("Match() should return true")
+	}
+}
+
+func TestMatchClassAdSymmetryFailure(t *testing.T) {
+	job := New()
+	job.InsertAttr("RequestCpus", 16) // Too many CPUs
+
+	machine := New()
+	machine.InsertAttr("Cpus", 8)
+
+	jobReqExpr, _ := Parse(`[r = TARGET.Cpus >= RequestCpus]`)
+	job.Insert("Requirements", jobReqExpr.Lookup("r"))
+
+	machineReqExpr, _ := Parse(`[r = TARGET.RequestCpus <= Cpus]`)
+	machine.Insert("Requirements", machineReqExpr.Lookup("r"))
+
+	match := NewMatchClassAd(job, machine)
+
+	if match.Match() {
+		t.Error("Match() should return false when requirements not met")
+	}
+}
+
+func TestMatchClassAdRank(t *testing.T) {
+	job := New()
+	job.InsertAttrBool("Requirements", true)
+
+	machine := New()
+	machine.InsertAttrBool("Requirements", true)
+	machine.InsertAttr("Rank", 100)
+
+	match := NewMatchClassAd(job, machine)
+
+	rank, ok := match.EvaluateRankRight()
+	if !ok {
+		t.Fatal("Failed to evaluate rank")
+	}
+	if rank != 100.0 {
+		t.Errorf("Expected rank 100.0, got %f", rank)
+	}
+}
+
+func TestMatchClassAdRankWithTarget(t *testing.T) {
+	job := New()
+	job.InsertAttr("Priority", 10)
+	job.InsertAttrBool("Requirements", true)
+
+	machine := New()
+	machine.InsertAttrBool("Requirements", true)
+
+	// Machine ranks jobs by their priority
+	rankExpr, _ := Parse(`[r = TARGET.Priority * 10]`)
+	machine.Insert("Rank", rankExpr.Lookup("r"))
+
+	match := NewMatchClassAd(job, machine)
+
+	rank, ok := match.EvaluateRankRight()
+	if !ok {
+		t.Fatal("Failed to evaluate rank with TARGET")
+	}
+	if rank != 100.0 {
+		t.Errorf("Expected rank 100.0, got %f", rank)
+	}
+}
+
+func TestMatchClassAdReplace(t *testing.T) {
+	job1 := New()
+	job1.InsertAttr("JobId", 1)
+
+	job2 := New()
+	job2.InsertAttr("JobId", 2)
+
+	machine := New()
+	machine.InsertAttrString("Name", "worker1")
+
+	match := NewMatchClassAd(job1, machine)
+
+	// Replace left ad
+	match.ReplaceLeftAd(job2)
+
+	if match.GetLeftAd() != job2 {
+		t.Error("Left ad should be job2")
+	}
+
+	// Check TARGET references updated
+	if job2.GetTarget() != machine {
+		t.Error("job2 target should be machine")
+	}
+	if machine.GetTarget() != job2 {
+		t.Error("machine target should be job2")
+	}
+}
+
+func TestMatchClassAdComplexScenario(t *testing.T) {
+	// Simulate HTCondor-style job/machine matching
+	job := New()
+	job.InsertAttrString("Owner", "alice")
+	job.InsertAttr("RequestCpus", 4)
+	job.InsertAttr("RequestMemory", 8192)
+	job.InsertAttr("RequestDisk", 100000)
+
+	machine := New()
+	machine.InsertAttrString("Name", "slot1@execute-node-01")
+	machine.InsertAttr("Cpus", 8)
+	machine.InsertAttr("Memory", 16384)
+	machine.InsertAttr("Disk", 500000)
+	machine.InsertAttrString("Arch", "X86_64")
+
+	// Job requirements
+	jobReqExpr, _ := Parse(`[r = (TARGET.Cpus >= RequestCpus) && 
+	                              (TARGET.Memory >= RequestMemory) && 
+	                              (TARGET.Disk >= RequestDisk) &&
+	                              (TARGET.Arch == "X86_64")]`)
+	job.Insert("Requirements", jobReqExpr.Lookup("r"))
+
+	// Machine requirements
+	machineReqExpr, _ := Parse(`[r = (TARGET.RequestCpus <= Cpus) && 
+	                                  (TARGET.RequestMemory <= Memory) && 
+	                                  (TARGET.RequestDisk <= Disk)]`)
+	machine.Insert("Requirements", machineReqExpr.Lookup("r"))
+
+	// Job ranks machines by available memory
+	jobRankExpr, _ := Parse(`[r = TARGET.Memory]`)
+	job.Insert("Rank", jobRankExpr.Lookup("r"))
+
+	// Machine ranks jobs by requesting fewer resources
+	machineRankExpr, _ := Parse(`[r = Cpus - TARGET.RequestCpus]`)
+	machine.Insert("Rank", machineRankExpr.Lookup("r"))
+
+	match := NewMatchClassAd(job, machine)
+
+	// Check match
+	if !match.Match() {
+		t.Fatal("Job and machine should match")
+	}
+
+	// Check job rank
+	jobRank, ok := match.EvaluateRankLeft()
+	if !ok {
+		t.Fatal("Failed to evaluate job rank")
+	}
+	if jobRank != 16384.0 {
+		t.Errorf("Expected job rank 16384.0, got %f", jobRank)
+	}
+
+	// Check machine rank
+	machineRank, ok := match.EvaluateRankRight()
+	if !ok {
+		t.Fatal("Failed to evaluate machine rank")
+	}
+	if machineRank != 4.0 {
+		t.Errorf("Expected machine rank 4.0, got %f", machineRank)
+	}
+}

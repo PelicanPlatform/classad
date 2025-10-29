@@ -108,13 +108,37 @@ func (e *ErrorLiteral) String() string {
 
 func (e *ErrorLiteral) exprNode() {}
 
+// AttributeScope represents the scope of an attribute reference.
+type AttributeScope int
+
+const (
+	// NoScope represents an unscoped attribute reference
+	NoScope AttributeScope = iota
+	// MyScope represents MY.attr (current ClassAd)
+	MyScope
+	// TargetScope represents TARGET.attr (target ClassAd in matching)
+	TargetScope
+	// ParentScope represents PARENT.attr (parent ClassAd)
+	ParentScope
+)
+
 // AttributeReference represents a reference to an attribute by name.
 type AttributeReference struct {
-	Name string
+	Name  string
+	Scope AttributeScope
 }
 
 func (a *AttributeReference) String() string {
-	return a.Name
+	switch a.Scope {
+	case MyScope:
+		return fmt.Sprintf("MY.%s", a.Name)
+	case TargetScope:
+		return fmt.Sprintf("TARGET.%s", a.Name)
+	case ParentScope:
+		return fmt.Sprintf("PARENT.%s", a.Name)
+	default:
+		return a.Name
+	}
 }
 
 func (a *AttributeReference) exprNode() {}

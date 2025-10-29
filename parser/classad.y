@@ -221,7 +221,10 @@ primary_expr
 	: literal
 		{ $$ = $1 }
 	| IDENTIFIER
-		{ $$ = &ast.AttributeReference{Name: $1} }
+		{ 
+			name, scope := ParseScopedIdentifier($1)
+			$$ = &ast.AttributeReference{Name: name, Scope: scope}
+		}
 	| '(' expr ')'
 		{ $$ = $2 }
 	| '{' opt_expr_list '}'

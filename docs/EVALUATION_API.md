@@ -154,6 +154,46 @@ The evaluator supports:
 - Simple: `Cpus`
 - In expressions: `Cpus * 2 + Memory / 1024`
 
+### Scoped Attribute References
+
+ClassAds support scoped attribute references for accessing attributes in related ClassAds:
+
+- `MY.attr` - References an attribute in the current ClassAd
+- `TARGET.attr` - References an attribute in the target ClassAd (set via `SetTarget()`)
+- `PARENT.attr` - References an attribute in the parent ClassAd (set via `SetParent()`)
+
+```go
+// Create a job and machine ClassAd
+job := classad.New()
+job.InsertAttr("Cpus", 2)
+job.InsertAttr("Memory", 2048)
+job.InsertAttrString("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+
+machine := classad.New()
+machine.InsertAttr("Cpus", 4)
+machine.InsertAttr("Memory", 8192)
+
+// Set target to enable TARGET.* references
+job.SetTarget(machine)
+
+// Evaluate Requirements with TARGET references
+if requirements, ok := job.EvaluateAttrBool("Requirements"); ok {
+    fmt.Printf("Match: %v\n", requirements)  // true
+}
+```
+
+**Scoped Reference API:**
+- `SetTarget(target *ClassAd)` - Sets the target ClassAd for TARGET.* references
+- `GetTarget() *ClassAd` - Returns the current target ClassAd
+- `SetParent(parent *ClassAd)` - Sets the parent ClassAd for PARENT.* references
+- `GetParent() *ClassAd` - Returns the current parent ClassAd
+
+**Behavior:**
+- `MY.attr` always references the current ClassAd (equivalent to `attr`)
+- `TARGET.attr` evaluates to `undefined` if no target is set
+- `PARENT.attr` evaluates to `undefined` if no parent is set
+- Scoped references work in all expressions (requirements, rank, etc.)
+
 ### Type Coercion
 - Integer + Real → Real
 - Comparisons work across numeric types
@@ -180,9 +220,14 @@ See `examples/api_demo/main.go` for comprehensive examples of:
 10. Real-world HTCondor scenarios
 11. Handling undefined values
 
+See `examples/features_demo/main.go` for advanced features including:
+- Scoped attribute references (MY., TARGET., PARENT.)
+- ClassAd matching with MatchClassAd
+
 Run the examples with:
 ```bash
 go run ./examples/api_demo/main.go
+go run ./examples/features_demo/main.go
 ```
 
 ## Testing
@@ -233,7 +278,7 @@ if serverVal.IsClassAd() {
 
 ## IS and ISNT Operators
 
-The `is` and `isnt` operators provide strict identity checking (type and value):
+The `is` and `isnt` operators (and their aliases `=?=` and `=!=`) provide strict identity checking (type and value):
 
 ```go
 // Unlike ==, 'is' checks type identity
@@ -243,14 +288,22 @@ ad, _ := classad.Parse(`[
     equalNotIs = (5 == 5.0);          // true - == allows type coercion
     undefCheck = (undefined is undefined);  // true
     errorCheck = (error is error);          // true
+    
+    // Meta-equal operator aliases
+    metaEqual = (5 =?= 5);            // true - same as 'is'
+    metaNotEqual = (5 =!= 5.0);       // true - same as 'isnt'
 ]`)
 ```
 
-Key differences from `==`:
-- `is` requires exact type match (no coercion)
-- `is` can compare `undefined` and `error` values
-- `is` compares list elements recursively
-- `isnt` is the negation of `is`
+**Operator Aliases:**
+- `=?=` is an alias for `is` (meta-equal operator)
+- `=!=` is an alias for `isnt` (meta-not-equal operator)
+
+**Key differences from `==`:**
+- `is`/`=?=` requires exact type match (no coercion)
+- `is`/`=?=` can compare `undefined` and `error` values
+- `is`/`=?=` compares list elements recursively
+- `isnt`/`=!=` is the negation of `is`/`=?=`
 
 ## Built-in Functions
 
@@ -338,6 +391,235 @@ ad, _ := classad.Parse(`[
 ad, _ := classad.Parse(`[now = time()]`)
 ```
 
+## Attribute Selection Expressions
+
+Access nested ClassAd attributes using dot notation (`record.field`):
+
+```go
+ad, _ := classad.Parse(`[
+    employee = [
+        name = "Alice";
+        department = [
+            name = "Engineering";
+            location = "Building A"
+        ]
+    ];
+    empName = employee.name;
+    deptName = employee.department.name;
+    deptLoc = employee.department.location
+]`)
+
+// Access values
+name, _ := ad.EvaluateAttrString("empName")           // "Alice"
+dept, _ := ad.EvaluateAttrString("deptName")          // "Engineering"
+location, _ := ad.EvaluateAttrString("deptLoc")       // "Building A"
+```
+
+**Behavior:**
+- Returns `undefined` if attribute doesn't exist
+- Returns `error` if left side is not a ClassAd
+- Can chain multiple selections: `a.b.c.d`
+
+## Subscript Expressions
+
+Access list elements or ClassAd attributes using subscript notation:
+
+### List Subscripting
+
+Use integer indices (0-based) to access list elements:
+
+```go
+ad, _ := classad.Parse(`[
+    fruits = {"apple", "banana", "cherry"};
+    matrix = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
+    
+    first = fruits[0];
+    third = fruits[2];
+    element = matrix[1][2]
+]`)
+
+first, _ := ad.EvaluateAttrString("first")    // "apple"
+third, _ := ad.EvaluateAttrString("third")    // "cherry"
+element, _ := ad.EvaluateAttrInt("element")   // 6
+```
+
+### ClassAd Subscripting
+
+Use string keys to access ClassAd attributes:
+
+```go
+ad, _ := classad.Parse(`[
+    person = [name = "Bob"; age = 30];
+    personName = person["name"];
+    personAge = person["age"]
+]`)
+
+name, _ := ad.EvaluateAttrString("personName")  // "Bob"
+age, _ := ad.EvaluateAttrInt("personAge")       // 30
+```
+
+### Combined Selection and Subscripting
+
+Mix selection and subscripting for complex data access:
+
+```go
+ad, _ := classad.Parse(`[
+    company = [
+        employees = {
+            [name = "Alice"; salary = 100000],
+            [name = "Bob"; salary = 95000]
+        }
+    ];
+    firstEmpName = company.employees[0].name;
+    secondSalary = company.employees[1].salary
+]`)
+
+name, _ := ad.EvaluateAttrString("firstEmpName")    // "Alice"
+salary, _ := ad.EvaluateAttrInt("secondSalary")     // 95000
+```
+
+**Subscript Behavior:**
+- **Lists:** Index must be integer, returns `undefined` if out of bounds
+- **ClassAds:** Key must be string, returns `undefined` if not found
+- Returns `error` for type mismatches (e.g., string index on list)
+
+## ClassAd Matching with MatchClassAd
+
+The `MatchClassAd` type provides symmetric matching between two ClassAds, inspired by the HTCondor C++ API. It automatically sets up bidirectional TARGET references to enable requirements like `TARGET.Memory >= MY.Memory`.
+
+### Creating a MatchClassAd
+
+```go
+import "github.com/bbockelm/golang-classads/classad"
+
+// Create job and machine ClassAds
+job := classad.New()
+job.InsertAttr("Cpus", 2)
+job.InsertAttr("Memory", 2048)
+job.InsertAttrString("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+
+machine := classad.New()
+machine.InsertAttr("Cpus", 4)
+machine.InsertAttr("Memory", 8192)
+machine.InsertAttrString("Requirements", "TARGET.Cpus <= MY.Cpus && TARGET.Memory <= MY.Memory")
+
+// Create MatchClassAd - automatically sets up TARGET references
+matchAd := classad.NewMatchClassAd(job, machine)
+```
+
+### MatchClassAd API
+
+- `NewMatchClassAd(left, right *ClassAd) *MatchClassAd` - Creates a MatchClassAd with bidirectional TARGET setup
+- `GetLeftAd() *ClassAd` - Returns the left ClassAd
+- `GetRightAd() *ClassAd` - Returns the right ClassAd
+- `ReplaceLeftAd(ad *ClassAd)` - Replaces the left ClassAd and updates TARGET references
+- `ReplaceRightAd(ad *ClassAd)` - Replaces the right ClassAd and updates TARGET references
+
+### Symmetric Matching
+
+The `Symmetry()` and `Match()` methods evaluate requirements from both sides:
+
+```go
+// Check if both Requirements attributes evaluate to true
+match := matchAd.Match()
+if match {
+    fmt.Println("Job and machine match!")
+}
+
+// Or use custom requirement attribute names
+leftReq := "JobRequirements"
+rightReq := "MachineRequirements"
+customMatch := matchAd.Symmetry(leftReq, rightReq)
+```
+
+**Match Behavior:**
+- `Match()` uses the default "Requirements" attribute
+- `Symmetry(leftReq, rightReq)` uses custom attribute names
+- Returns `true` only if **both** requirements evaluate to `true`
+- Returns `false` if either requirement is `false`, `undefined`, or `error`
+
+### Rank Evaluation
+
+After matching, you can evaluate rank expressions to prioritize matches:
+
+```go
+// Evaluate rank from the left side's perspective
+job.InsertAttrString("Rank", "TARGET.Memory * 2 + TARGET.Cpus")
+leftRank := matchAd.EvaluateRankLeft("Rank")
+if leftRank.IsReal() {
+    rank, _ := leftRank.RealValue()
+    fmt.Printf("Job rank: %.2f\n", rank)
+}
+
+// Evaluate rank from the right side's perspective
+machine.InsertAttrString("Rank", "1000 / TARGET.Memory")
+rightRank := matchAd.EvaluateRankRight("Rank")
+```
+
+**Rank Methods:**
+- `EvaluateRankLeft(rankName string) Value` - Evaluates rank attribute from left ClassAd
+- `EvaluateRankRight(rankName string) Value` - Evaluates rank attribute from right ClassAd
+- Rank expressions can reference both MY.* and TARGET.* attributes
+
+### Complete Matching Example
+
+```go
+// Job ClassAd
+job := classad.New()
+job.InsertAttr("Cpus", 2)
+job.InsertAttr("Memory", 2048)
+job.InsertAttrString("Owner", "alice")
+job.InsertAttrString("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+job.InsertAttrString("Rank", "TARGET.Memory")  // Prefer more memory
+
+// Machine ClassAd
+machine := classad.New()
+machine.InsertAttr("Cpus", 4)
+machine.InsertAttr("Memory", 8192)
+machine.InsertAttrString("Name", "slot1@worker1")
+machine.InsertAttrString("Requirements", "TARGET.Cpus <= MY.Cpus")
+machine.InsertAttrString("Rank", "1000 - TARGET.Memory")  // Prefer lighter jobs
+
+// Create MatchClassAd and check match
+matchAd := classad.NewMatchClassAd(job, machine)
+
+if matchAd.Match() {
+    fmt.Println("Match successful!")
+    
+    // Evaluate ranks
+    jobRank := matchAd.EvaluateRankLeft("Rank")
+    machineRank := matchAd.EvaluateRankRight("Rank")
+    
+    if jobRank.IsReal() && machineRank.IsReal() {
+        jr, _ := jobRank.RealValue()
+        mr, _ := machineRank.RealValue()
+        fmt.Printf("Job rank: %.2f, Machine rank: %.2f\n", jr, mr)
+    }
+}
+```
+
+### Dynamic Replacement
+
+You can replace ClassAds in a MatchClassAd while preserving the bidirectional TARGET setup:
+
+```go
+matchAd := classad.NewMatchClassAd(job1, machine1)
+
+// Replace with new ClassAds - TARGET references automatically updated
+matchAd.ReplaceLeftAd(job2)
+matchAd.ReplaceRightAd(machine2)
+
+// Check match with new ads
+if matchAd.Match() {
+    fmt.Println("New match successful!")
+}
+```
+
+This is useful for:
+- Reusing MatchClassAd objects in matching loops
+- Testing multiple job-machine combinations
+- Implementing HTCondor-style matchmaking algorithms
+
 ## Error Handling
 
 Functions properly propagate undefined and error values:
@@ -371,7 +653,9 @@ This API is designed to mimic the C++ HTCondor ClassAd library, providing simila
 - Expression evaluation (arithmetic, logical, comparison)
 - Conditional expressions
 - Nested ClassAds and lists
-- IS/ISNT operators
+- IS/ISNT operators (with `=?=` and `=!=` aliases)
+- Attribute selection expressions (`record.field`)
+- Subscript expressions (`list[index]`, `record["key"]`)
 - Built-in functions:
   - String functions (strcat, substr, size, toLower, toUpper)
   - Math functions (floor, ceiling, round, random, int, real)

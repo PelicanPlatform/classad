@@ -20,6 +20,7 @@ go.work
 # Generated parser files
 parser/y.go
 parser/y.output
+y.output
 
 # IDE files
 .vscode/

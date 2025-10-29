@@ -12,7 +12,9 @@ import (
 // ClassAd represents a ClassAd with attributes that can be evaluated.
 // This is the main type for working with ClassAds.
 type ClassAd struct {
-	ad *ast.ClassAd
+	ad     *ast.ClassAd
+	parent *ClassAd
+	target *ClassAd
 }
 
 // New creates a new empty ClassAd.
@@ -142,6 +144,28 @@ func (c *ClassAd) GetAttributes() []string {
 		names[i] = attr.Name
 	}
 	return names
+}
+
+// SetParent sets the parent ClassAd for this ClassAd.
+// The parent is used for PARENT.attr references during evaluation.
+func (c *ClassAd) SetParent(parent *ClassAd) {
+	c.parent = parent
+}
+
+// GetParent returns the parent ClassAd, if any.
+func (c *ClassAd) GetParent() *ClassAd {
+	return c.parent
+}
+
+// SetTarget sets the target ClassAd for this ClassAd.
+// The target is used for TARGET.attr references during evaluation.
+func (c *ClassAd) SetTarget(target *ClassAd) {
+	c.target = target
+}
+
+// GetTarget returns the target ClassAd, if any.
+func (c *ClassAd) GetTarget() *ClassAd {
+	return c.target
 }
 
 // EvaluateAttr evaluates an attribute and returns its value.

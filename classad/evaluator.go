@@ -276,22 +276,52 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 	case *ast.FunctionCall:
 		return e.evaluateFunctionCall(v)
 
+	case *ast.SelectExpr:
+		return e.evaluateSelectExpr(v)
+
+	case *ast.SubscriptExpr:
+		return e.evaluateSubscriptExpr(v)
+
 	default:
 		return NewErrorValue()
 	}
 }
 
 func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Value {
-	if e.classad == nil {
+	var targetClassAd *ClassAd
+
+	// Determine which ClassAd to look up the attribute in based on scope
+	switch ref.Scope {
+	case ast.MyScope:
+		// MY.attr - always refers to the current ClassAd
+		targetClassAd = e.classad
+	case ast.TargetScope:
+		// TARGET.attr - refers to the target ClassAd
+		if e.classad != nil {
+			targetClassAd = e.classad.target
+		}
+	case ast.ParentScope:
+		// PARENT.attr - refers to the parent ClassAd
+		if e.classad != nil {
+			targetClassAd = e.classad.parent
+		}
+	default:
+		// No scope - look in current ClassAd
+		targetClassAd = e.classad
+	}
+
+	if targetClassAd == nil {
 		return NewUndefinedValue()
 	}
 
-	expr := e.classad.Lookup(ref.Name)
+	expr := targetClassAd.Lookup(ref.Name)
 	if expr == nil {
 		return NewUndefinedValue()
 	}
 
-	return e.Evaluate(expr)
+	// Create evaluator for the target ClassAd
+	evaluator := NewEvaluator(targetClassAd)
+	return evaluator.Evaluate(expr)
 }
 
 func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
@@ -414,6 +444,82 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 		values[i] = e.Evaluate(elem)
 	}
 	return NewListValue(values)
+}
+
+func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
+	// Evaluate the record expression
+	recordVal := e.Evaluate(sel.Record)
+
+	// Handle undefined and error
+	if recordVal.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if recordVal.IsError() {
+		return NewErrorValue()
+	}
+
+	// Must be a ClassAd
+	if !recordVal.IsClassAd() {
+		return NewErrorValue()
+	}
+
+	// Get the ClassAd and lookup the attribute
+	ad, _ := recordVal.ClassAdValue()
+	return ad.EvaluateAttr(sel.Attr)
+}
+
+func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
+	// Evaluate the container
+	containerVal := e.Evaluate(sub.Container)
+
+	// Handle undefined and error
+	if containerVal.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if containerVal.IsError() {
+		return NewErrorValue()
+	}
+
+	// Evaluate the index
+	indexVal := e.Evaluate(sub.Index)
+
+	// Handle undefined and error in index
+	if indexVal.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if indexVal.IsError() {
+		return NewErrorValue()
+	}
+
+	// Handle list subscripting with integer index
+	if containerVal.IsList() {
+		if !indexVal.IsInteger() {
+			return NewErrorValue()
+		}
+
+		list, _ := containerVal.ListValue()
+		index, _ := indexVal.IntValue()
+
+		// Check bounds
+		if index < 0 || index >= int64(len(list)) {
+			return NewUndefinedValue()
+		}
+
+		return list[index]
+	}
+
+	// Handle ClassAd subscripting with string key
+	if containerVal.IsClassAd() {
+		if !indexVal.IsString() {
+			return NewErrorValue()
+		}
+
+		ad, _ := containerVal.ClassAdValue()
+		key, _ := indexVal.StringValue()
+		return ad.EvaluateAttr(key)
+	}
+
+	return NewErrorValue()
 }
 
 // Arithmetic operations

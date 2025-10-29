@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 
+	"github.com/bbockelm/golang-classads/ast"
 	"github.com/bbockelm/golang-classads/classad"
+	"github.com/bbockelm/golang-classads/parser"
 )
 
 func main() {
@@ -254,6 +256,246 @@ func main() {
 	fmt.Printf("  Arch match: %v\n", archMatch)
 	fmt.Printf("Overall match: %v\n", overallMatch)
 	fmt.Printf("Match score: %d\n", matchScore)
+	fmt.Println()
+
+	// Example 8: Meta-equal operators (=?= and =!=)
+	fmt.Println("Example 8: Meta-equal operators (=?= and =!=)")
+	metaAd, _ := classad.Parse(`[
+		intVal = 5;
+		realVal = 5.0;
+		
+		regularEqual = (intVal == realVal);
+		metaEqual = (intVal =?= realVal);
+		metaNotEqual = (intVal =!= realVal);
+		
+		sameTypeEqual = (5 =?= 5);
+		undefCheck = (undefined =?= undefined)
+	]`)
+
+	regularEq, _ := metaAd.EvaluateAttrBool("regularEqual")
+	metaEq, _ := metaAd.EvaluateAttrBool("metaEqual")
+	metaNotEq, _ := metaAd.EvaluateAttrBool("metaNotEqual")
+	sameTypeEq, _ := metaAd.EvaluateAttrBool("sameTypeEqual")
+	undefMetaCheck, _ := metaAd.EvaluateAttrBool("undefCheck")
+
+	fmt.Printf("5 == 5.0: %v (regular equality with type coercion)\n", regularEq)
+	fmt.Printf("5 =?= 5.0: %v (meta-equal, requires exact type match)\n", metaEq)
+	fmt.Printf("5 =!= 5.0: %v (meta-not-equal)\n", metaNotEq)
+	fmt.Printf("5 =?= 5: %v (same type and value)\n", sameTypeEq)
+	fmt.Printf("undefined =?= undefined: %v\n", undefMetaCheck)
+	fmt.Println()
+
+	// Example 9: Attribute selection expressions
+	fmt.Println("Example 9: Attribute selection (record.field)")
+	selectAd, _ := classad.Parse(`[
+		employee = [
+			name = "Jane Smith";
+			id = 1234;
+			department = [
+				name = "Engineering";
+				location = "Building A"
+			]
+		];
+		empName = employee.name;
+		empId = employee.id;
+		deptName = employee.department.name;
+		deptLoc = employee.department.location
+	]`)
+
+	empName, _ := selectAd.EvaluateAttrString("empName")
+	empId, _ := selectAd.EvaluateAttrInt("empId")
+	deptName, _ := selectAd.EvaluateAttrString("deptName")
+	deptLoc, _ := selectAd.EvaluateAttrString("deptLoc")
+
+	fmt.Printf("Employee: %s (ID: %d)\n", empName, empId)
+	fmt.Printf("Department: %s, %s\n", deptName, deptLoc)
+	fmt.Println()
+
+	// Example 10: Subscript expressions
+	fmt.Println("Example 10: Subscript expressions (list[index] and record[key])")
+	subscriptAd, _ := classad.Parse(`[
+		fruits = {"apple", "banana", "cherry", "date"};
+		numbers = {10, 20, 30, 40, 50};
+		matrix = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}};
+		
+		person = [name = "John"; age = 35; city = "Boston"];
+		
+		firstFruit = fruits[0];
+		thirdFruit = fruits[2];
+		secondNumber = numbers[1];
+		matrixElement = matrix[1][2];
+		
+		personName = person["name"];
+		personAge = person["age"]
+	]`)
+
+	firstFruit, _ := subscriptAd.EvaluateAttrString("firstFruit")
+	thirdFruit, _ := subscriptAd.EvaluateAttrString("thirdFruit")
+	secondNumber, _ := subscriptAd.EvaluateAttrInt("secondNumber")
+	matrixElement, _ := subscriptAd.EvaluateAttrInt("matrixElement")
+	personName, _ := subscriptAd.EvaluateAttrString("personName")
+	personAge, _ := subscriptAd.EvaluateAttrInt("personAge")
+
+	fmt.Printf("List indexing:\n")
+	fmt.Printf("  fruits[0] = %s\n", firstFruit)
+	fmt.Printf("  fruits[2] = %s\n", thirdFruit)
+	fmt.Printf("  numbers[1] = %d\n", secondNumber)
+	fmt.Printf("Nested list indexing:\n")
+	fmt.Printf("  matrix[1][2] = %d\n", matrixElement)
+	fmt.Printf("ClassAd subscripting:\n")
+	fmt.Printf("  person[\"name\"] = %s\n", personName)
+	fmt.Printf("  person[\"age\"] = %d\n", personAge)
+	fmt.Println()
+
+	// Example 11: Combined selection and subscripting
+	fmt.Println("Example 11: Combined selection and subscripting")
+	combinedAd, _ := classad.Parse(`[
+		company = [
+			name = "DataCorp";
+			employees = {
+				[name = "Alice"; salary = 100000],
+				[name = "Bob"; salary = 95000],
+				[name = "Charlie"; salary = 105000]
+			}
+		];
+		firstEmp = company.employees[0];
+		firstEmpName = company.employees[0].name;
+		secondEmpSalary = company.employees[1].salary;
+		avgSalary = (company.employees[0].salary + 
+		            company.employees[1].salary + 
+		            company.employees[2].salary) / 3
+	]`)
+
+	firstEmpVal := combinedAd.EvaluateAttr("firstEmp")
+	if firstEmpVal.IsClassAd() {
+		empAd, _ := firstEmpVal.ClassAdValue()
+		name, _ := empAd.EvaluateAttrString("name")
+		fmt.Printf("First employee (via variable): %s\n", name)
+	}
+
+	firstEmpName, _ := combinedAd.EvaluateAttrString("firstEmpName")
+	secondEmpSalary, _ := combinedAd.EvaluateAttrInt("secondEmpSalary")
+	avgSalary, _ := combinedAd.EvaluateAttrInt("avgSalary")
+
+	fmt.Printf("First employee (via direct access): %s\n", firstEmpName)
+	fmt.Printf("Second employee salary: $%d\n", secondEmpSalary)
+	fmt.Printf("Average salary: $%d\n", avgSalary)
+	fmt.Println()
+
+	// Example 12: Scoped attribute references (MY., TARGET., PARENT.)
+	fmt.Println("Example 12: Scoped attribute references")
+
+	// Helper function to parse an expression by wrapping it in a ClassAd
+	parseExpr := func(exprStr string) ast.Expr {
+		tempAd, err := parser.ParseClassAd("[__temp = " + exprStr + "]")
+		if err != nil {
+			return nil
+		}
+		for _, attr := range tempAd.Attributes {
+			if attr.Name == "__temp" {
+				return attr.Value
+			}
+		}
+		return nil
+	}
+
+	// Create job and machine ClassAds
+	job := classad.New()
+	job.InsertAttr("Cpus", 2)
+	job.InsertAttr("Memory", 2048)
+	job.Insert("Requirements", parseExpr("TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory"))
+
+	machine1 := classad.New()
+	machine1.InsertAttr("Cpus", 4)
+	machine1.InsertAttr("Memory", 8192)
+	machine1.InsertAttrString("Name", "worker1")
+
+	machine2 := classad.New()
+	machine2.InsertAttr("Cpus", 1)
+	machine2.InsertAttr("Memory", 1024)
+	machine2.InsertAttrString("Name", "worker2")
+
+	// Test TARGET references with machine1
+	job.SetTarget(machine1)
+	match1, _ := job.EvaluateAttrBool("Requirements")
+	m1Name, _ := machine1.EvaluateAttrString("Name")
+	fmt.Printf("Job requires 2 CPUs, 2048 MB\n")
+	fmt.Printf("  Machine %s has 4 CPUs, 8192 MB: Match = %v\n", m1Name, match1)
+
+	// Test TARGET references with machine2
+	job.SetTarget(machine2)
+	match2, _ := job.EvaluateAttrBool("Requirements")
+	m2Name, _ := machine2.EvaluateAttrString("Name")
+	fmt.Printf("  Machine %s has 1 CPU, 1024 MB: Match = %v\n", m2Name, match2)
+
+	// Demonstrate PARENT references
+	parent := classad.New()
+	parent.InsertAttr("MaxCpus", 8)
+
+	child := classad.New()
+	child.InsertAttr("Cpus", 4)
+	child.Insert("CpuCheck", parseExpr("MY.Cpus <= PARENT.MaxCpus"))
+	child.SetParent(parent)
+
+	cpuCheck, _ := child.EvaluateAttrBool("CpuCheck")
+	fmt.Printf("\nParent allows max 8 CPUs, child has 4 CPUs: %v\n", cpuCheck)
+	fmt.Println()
+
+	// Example 13: ClassAd matching with MatchClassAd
+	fmt.Println("Example 13: ClassAd matching with MatchClassAd")
+
+	// Create job ClassAd
+	jobAd := classad.New()
+	jobAd.InsertAttr("Cpus", 2)
+	jobAd.InsertAttr("Memory", 2048)
+	jobAd.InsertAttrString("Owner", "alice")
+	jobAd.Insert("Requirements", parseExpr("TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory"))
+	jobAd.Insert("Rank", parseExpr("TARGET.Memory"))
+
+	// Create machine ClassAd
+	machineAd := classad.New()
+	machineAd.InsertAttr("Cpus", 4)
+	machineAd.InsertAttr("Memory", 8192)
+	machineAd.InsertAttrString("Name", "slot1@worker1")
+	machineAd.Insert("Requirements", parseExpr("TARGET.Cpus <= MY.Cpus"))
+	machineAd.Insert("Rank", parseExpr("1000 - TARGET.Memory"))
+
+	// Create MatchClassAd (automatically sets up bidirectional TARGET references)
+	matchClassAd := classad.NewMatchClassAd(jobAd, machineAd)
+
+	// Check if job and machine match
+	matches := matchClassAd.Match()
+	jobOwner, _ := jobAd.EvaluateAttrString("Owner")
+	machName, _ := machineAd.EvaluateAttrString("Name")
+
+	fmt.Printf("Job (Owner: %s, Cpus: 2, Memory: 2048)\n", jobOwner)
+	fmt.Printf("Machine (%s, Cpus: 4, Memory: 8192)\n", machName)
+	fmt.Printf("Symmetric match (both Requirements satisfied): %v\n", matches)
+
+	// Evaluate ranks from both perspectives
+	if matches {
+		jobRank, jobRankOk := matchClassAd.EvaluateRankLeft()
+		machineRank, machineRankOk := matchClassAd.EvaluateRankRight()
+
+		if jobRankOk && machineRankOk {
+			fmt.Printf("Job rank (prefers more memory): %.2f\n", jobRank)
+			fmt.Printf("Machine rank (prefers lighter jobs): %.2f\n", machineRank)
+		}
+	}
+
+	// Demonstrate match failure
+	fmt.Println("\nTesting with incompatible machine:")
+	smallMachine := classad.New()
+	smallMachine.InsertAttr("Cpus", 1)
+	smallMachine.InsertAttr("Memory", 1024)
+	smallMachine.InsertAttrString("Name", "slot1@small-worker")
+	smallMachine.Insert("Requirements", parseExpr("TARGET.Cpus <= MY.Cpus"))
+
+	matchClassAd.ReplaceRightAd(smallMachine)
+	matchesSmall := matchClassAd.Match()
+	smallName, _ := smallMachine.EvaluateAttrString("Name")
+	fmt.Printf("Machine (%s, Cpus: 1, Memory: 1024)\n", smallName)
+	fmt.Printf("Symmetric match: %v (job requires 2 CPUs)\n", matchesSmall)
 	fmt.Println()
 
 	fmt.Println("=== Demo Complete ===")

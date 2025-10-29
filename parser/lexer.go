@@ -104,6 +104,24 @@ func (l *Lexer) Lex(lval *yySymType) int {
 		if l.peek() == '=' {
 			l.advance()
 			return EQ
+		} else if l.peek() == '?' {
+			l.advance()
+			if l.peek() == '=' {
+				l.advance()
+				return IS // =?= is an alias for 'is'
+			}
+			// Put back the '?'
+			l.pos--
+			return int('=')
+		} else if l.peek() == '!' {
+			l.advance()
+			if l.peek() == '=' {
+				l.advance()
+				return ISNT // =!= is an alias for 'isnt'
+			}
+			// Put back the '!'
+			l.pos--
+			return int('=')
 		}
 		return int('=')
 	case '!':
@@ -341,6 +359,34 @@ func (l *Lexer) scanIdentifierOrKeyword(lval *yySymType) int {
 	}
 
 	text := l.input[start:l.pos]
+
+	// Check for scoped attribute references (MY., TARGET., PARENT.)
+	textUpper := strings.ToUpper(text)
+	if l.peek() == '.' {
+		switch textUpper {
+		case "MY", "TARGET", "PARENT":
+			// Consume the dot
+			l.advance()
+			// Now scan the attribute name
+			if unicode.IsLetter(l.peek()) || l.peek() == '_' {
+				l.advance()
+				for l.pos < len(l.input) {
+					ch := l.peek()
+					if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' {
+						l.advance()
+					} else {
+						break
+					}
+				}
+				// Return the full scoped reference (e.g., "MY.Cpus")
+				scopedName := l.input[start:l.pos]
+				lval.str = scopedName
+				return IDENTIFIER
+			}
+			// If no valid identifier follows, put the dot back and continue
+			l.pos--
+		}
+	}
 
 	// Check for keywords
 	switch strings.ToLower(text) {
