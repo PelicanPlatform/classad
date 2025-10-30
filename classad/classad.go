@@ -708,11 +708,10 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		// If condition is a literal boolean, return the appropriate branch
 		condVal := c.exprToValue(condition)
 		if condVal.IsBool() {
-			if boolVal, _ := condVal.BoolValue(); boolVal {
+			if boolVal, err := condVal.BoolValue(); err == nil && boolVal {
 				return trueExpr
-			} else {
-				return falseExpr
 			}
+			return falseExpr
 		}
 
 		return &ast.ConditionalExpr{
