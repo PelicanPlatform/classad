@@ -508,3 +508,40 @@ func TestUndefinedValue(t *testing.T) {
 		t.Error("Expected undefined value for non-existent attribute")
 	}
 }
+
+func TestInsertAttrClassAd(t *testing.T) {
+	parent := New()
+
+	child := New()
+	child.InsertAttr("a", 1)
+	child.InsertAttrString("b", "x")
+
+	parent.InsertAttrClassAd("nested", child)
+
+	// Validate type and values via evaluation
+	v := parent.EvaluateAttr("nested")
+	if !v.IsClassAd() {
+		t.Fatal("nested should evaluate to a ClassAd")
+	}
+
+	nested, err := v.ClassAdValue()
+	if err != nil {
+		t.Fatalf("ClassAdValue() error: %v", err)
+	}
+
+	if a, ok := nested.EvaluateAttrInt("a"); !ok || a != 1 {
+		t.Errorf("Expected nested.a = 1, got %d, ok=%v", a, ok)
+	}
+	if b, ok := nested.EvaluateAttrString("b"); !ok || b != "x" {
+		t.Errorf("Expected nested.b = 'x', got %q, ok=%v", b, ok)
+	}
+
+	// String form should contain a nested record
+	s := parent.String()
+	if s == "" || s == "[]" {
+		t.Fatalf("Unexpected empty string for parent: %q", s)
+	}
+	if want := "[nested = [a = 1; b = \"x\"]]"; s != want {
+		t.Errorf("Unexpected parent string. want=%s got=%s", want, s)
+	}
+}

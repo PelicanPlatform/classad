@@ -3,11 +3,13 @@
 //line parser/classad.y:2
 package parser
 
-import (
-	__yyfmt__ "fmt"
+import __yyfmt__ "fmt"
 
+//line parser/classad.y:2
+
+import (
 	"github.com/PelicanPlatform/classad/ast"
-) //line parser/classad.y:2
+)
 
 //line parser/classad.y:10
 type yySymType struct {
