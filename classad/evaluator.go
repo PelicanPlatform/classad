@@ -431,7 +431,10 @@ func (e *Evaluator) evaluateConditional(cond *ast.ConditionalExpr) Value {
 		return NewErrorValue()
 	}
 
-	boolVal, _ := condVal.BoolValue()
+	boolVal, err := condVal.BoolValue()
+	if err != nil {
+		return NewErrorValue()
+	}
 	if boolVal {
 		return e.Evaluate(cond.TrueExpr)
 	}

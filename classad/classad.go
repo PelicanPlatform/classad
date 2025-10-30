@@ -260,6 +260,19 @@ func (c *ClassAd) InsertAttrBool(name string, value bool) {
 	c.Insert(name, &ast.BooleanLiteral{Value: value})
 }
 
+// InsertAttrClassAd inserts an attribute with a nested ClassAd value.
+// The provided ClassAd will be embedded as a record literal.
+func (c *ClassAd) InsertAttrClassAd(name string, value *ClassAd) {
+	var inner *ast.ClassAd
+	if value != nil {
+		inner = value.ad
+	}
+	if inner == nil {
+		inner = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
+	}
+	c.Insert(name, &ast.RecordLiteral{ClassAd: inner})
+}
+
 // Lookup returns the unevaluated expression for an attribute.
 // Returns nil if the attribute doesn't exist.
 // This is useful for inspecting or copying expressions without evaluating them.
@@ -695,11 +708,10 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		// If condition is a literal boolean, return the appropriate branch
 		condVal := c.exprToValue(condition)
 		if condVal.IsBool() {
-			if boolVal, _ := condVal.BoolValue(); boolVal {
+			if boolVal, err := condVal.BoolValue(); err == nil && boolVal {
 				return trueExpr
-			} else {
-				return falseExpr
 			}
+			return falseExpr
 		}
 
 		return &ast.ConditionalExpr{
