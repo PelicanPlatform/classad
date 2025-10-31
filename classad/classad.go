@@ -363,11 +363,6 @@ func (c *ClassAd) InsertAttrListBool(name string, values []bool) {
 //	resultAd.InsertAttrListClassAd("items", []*classad.ClassAd{ad1, ad2})
 //	// Result: items = {[x = 1], [y = 2]}
 func (c *ClassAd) InsertAttrListClassAd(name string, values []*ClassAd) {
-	if len(values) == 0 {
-		c.InsertAttrList(name, []ast.Expr{})
-		return
-	}
-
 	elements := make([]ast.Expr, len(values))
 	for i, value := range values {
 		var inner *ast.ClassAd
