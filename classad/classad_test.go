@@ -2,6 +2,8 @@ package classad
 
 import (
 	"testing"
+
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 func TestNewClassAd(t *testing.T) {
@@ -152,6 +154,153 @@ func TestInsertAttr(t *testing.T) {
 	}
 	if val, ok := ad.Lookup("flag"); !ok || val == nil {
 		t.Error("Attribute 'flag' not found")
+	}
+}
+
+func TestInsertListElement(t *testing.T) {
+	ad := New()
+
+	// Test creating a new list
+	ad.InsertListElement("items", &ast.StringLiteral{Value: "first"})
+	if ad.Size() != 1 {
+		t.Errorf("Expected size 1, got %d", ad.Size())
+	}
+
+	// Verify it's a list
+	expr, ok := ad.Lookup("items")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'items' not found")
+	}
+	if expr.String() != "{\"first\"}" {
+		t.Errorf("Expected list {\"first\"}, got %s", expr.String())
+	}
+
+	// Test appending to existing list
+	ad.InsertListElement("items", &ast.StringLiteral{Value: "second"})
+	ad.InsertListElement("items", &ast.IntegerLiteral{Value: 42})
+
+	expr, ok = ad.Lookup("items")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'items' not found after append")
+	}
+	expected := "{\"first\", \"second\", 42}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+
+	// Test that size didn't change (still one attribute)
+	if ad.Size() != 1 {
+		t.Errorf("Expected size 1, got %d", ad.Size())
+	}
+
+	// Test replacing non-list attribute with list
+	ad.InsertAttr("x", 100)
+	ad.InsertListElement("x", &ast.IntegerLiteral{Value: 200})
+
+	expr, ok = ad.Lookup("x")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'x' not found")
+	}
+	if expr.String() != "{200}" {
+		t.Errorf("Expected list {200}, got %s", expr.String())
+	}
+}
+
+func TestInsertAttrList(t *testing.T) {
+	ad := New()
+
+	// Test InsertAttrList with mixed types
+	elements := []ast.Expr{
+		&ast.StringLiteral{Value: "hello"},
+		&ast.IntegerLiteral{Value: 42},
+		&ast.BooleanLiteral{Value: true},
+		&ast.RealLiteral{Value: 3.14},
+	}
+	ad.InsertAttrList("mixed", elements)
+
+	expr, ok := ad.Lookup("mixed")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'mixed' not found")
+	}
+	expected := "{\"hello\", 42, true, 3.14}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+
+	// Test empty list
+	ad.InsertAttrList("empty", []ast.Expr{})
+	expr, ok = ad.Lookup("empty")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'empty' not found")
+	}
+	if expr.String() != "{}" {
+		t.Errorf("Expected empty list {}, got %s", expr.String())
+	}
+}
+
+func TestInsertAttrListInt(t *testing.T) {
+	ad := New()
+	ad.InsertAttrListInt("numbers", []int64{1, 2, 3, 4, 5})
+
+	expr, ok := ad.Lookup("numbers")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'numbers' not found")
+	}
+	expected := "{1, 2, 3, 4, 5}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+
+	// Test empty list
+	ad.InsertAttrListInt("emptyInts", []int64{})
+	expr, ok = ad.Lookup("emptyInts")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'emptyInts' not found")
+	}
+	if expr.String() != "{}" {
+		t.Errorf("Expected empty list {}, got %s", expr.String())
+	}
+}
+
+func TestInsertAttrListFloat(t *testing.T) {
+	ad := New()
+	ad.InsertAttrListFloat("values", []float64{1.5, 2.7, 3.14})
+
+	expr, ok := ad.Lookup("values")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'values' not found")
+	}
+	expected := "{1.5, 2.7, 3.14}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+}
+
+func TestInsertAttrListString(t *testing.T) {
+	ad := New()
+	ad.InsertAttrListString("names", []string{"Alice", "Bob", "Charlie"})
+
+	expr, ok := ad.Lookup("names")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'names' not found")
+	}
+	expected := "{\"Alice\", \"Bob\", \"Charlie\"}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+}
+
+func TestInsertAttrListBool(t *testing.T) {
+	ad := New()
+	ad.InsertAttrListBool("flags", []bool{true, false, true})
+
+	expr, ok := ad.Lookup("flags")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'flags' not found")
+	}
+	expected := "{true, false, true}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
 	}
 }
 

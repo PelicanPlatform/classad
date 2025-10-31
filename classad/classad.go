@@ -273,6 +273,152 @@ func (c *ClassAd) InsertAttrClassAd(name string, value *ClassAd) {
 	c.Insert(name, &ast.RecordLiteral{ClassAd: inner})
 }
 
+// InsertAttrList inserts an attribute with a list of expressions.
+// This is the most general method for inserting list attributes.
+//
+// Example:
+//
+//	ad := classad.New()
+//	elements := []ast.Expr{
+//	    &ast.StringLiteral{Value: "hello"},
+//	    &ast.IntegerLiteral{Value: 42},
+//	    &ast.BooleanLiteral{Value: true},
+//	}
+//	ad.InsertAttrList("items", elements)
+//	// Result: items = {"hello", 42, true}
+func (c *ClassAd) InsertAttrList(name string, elements []ast.Expr) {
+	c.Insert(name, &ast.ListLiteral{Elements: elements})
+}
+
+// InsertAttrListInt inserts an attribute with a list of integer values.
+//
+// Example:
+//
+//	ad := classad.New()
+//	ad.InsertAttrListInt("numbers", []int64{1, 2, 3, 4, 5})
+//	// Result: numbers = {1, 2, 3, 4, 5}
+func (c *ClassAd) InsertAttrListInt(name string, values []int64) {
+	elements := make([]ast.Expr, len(values))
+	for i, v := range values {
+		elements[i] = &ast.IntegerLiteral{Value: v}
+	}
+	c.InsertAttrList(name, elements)
+}
+
+// InsertAttrListFloat inserts an attribute with a list of float values.
+//
+// Example:
+//
+//	ad := classad.New()
+//	ad.InsertAttrListFloat("values", []float64{1.5, 2.7, 3.14})
+//	// Result: values = {1.5, 2.7, 3.14}
+func (c *ClassAd) InsertAttrListFloat(name string, values []float64) {
+	elements := make([]ast.Expr, len(values))
+	for i, v := range values {
+		elements[i] = &ast.RealLiteral{Value: v}
+	}
+	c.InsertAttrList(name, elements)
+}
+
+// InsertAttrListString inserts an attribute with a list of string values.
+//
+// Example:
+//
+//	ad := classad.New()
+//	ad.InsertAttrListString("names", []string{"Alice", "Bob", "Charlie"})
+//	// Result: names = {"Alice", "Bob", "Charlie"}
+func (c *ClassAd) InsertAttrListString(name string, values []string) {
+	elements := make([]ast.Expr, len(values))
+	for i, v := range values {
+		elements[i] = &ast.StringLiteral{Value: v}
+	}
+	c.InsertAttrList(name, elements)
+}
+
+// InsertAttrListBool inserts an attribute with a list of boolean values.
+//
+// Example:
+//
+//	ad := classad.New()
+//	ad.InsertAttrListBool("flags", []bool{true, false, true})
+//	// Result: flags = {true, false, true}
+func (c *ClassAd) InsertAttrListBool(name string, values []bool) {
+	elements := make([]ast.Expr, len(values))
+	for i, v := range values {
+		elements[i] = &ast.BooleanLiteral{Value: v}
+	}
+	c.InsertAttrList(name, elements)
+}
+
+// InsertAttrListClassAd inserts an attribute with a list of nested ClassAd values.
+// Each ClassAd will be embedded as a record literal in the list.
+//
+// Example:
+//
+//	ad1 := classad.New()
+//	ad1.InsertAttr("x", 1)
+//	ad2 := classad.New()
+//	ad2.InsertAttr("y", 2)
+//	resultAd := classad.New()
+//	resultAd.InsertAttrListClassAd("items", []*classad.ClassAd{ad1, ad2})
+//	// Result: items = {[x = 1], [y = 2]}
+func (c *ClassAd) InsertAttrListClassAd(name string, values []*ClassAd) {
+	if len(values) == 0 {
+		c.InsertAttrList(name, []ast.Expr{})
+		return
+	}
+
+	elements := make([]ast.Expr, len(values))
+	for i, value := range values {
+		var inner *ast.ClassAd
+		if value != nil {
+			inner = value.ad
+		}
+		if inner == nil {
+			inner = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
+		}
+		elements[i] = &ast.RecordLiteral{ClassAd: inner}
+	}
+	c.InsertAttrList(name, elements)
+}
+
+// InsertListElement inserts an element into a list attribute.
+// If the attribute doesn't exist, it creates a new list with the element.
+// If the attribute exists and is a list, it appends the element to the existing list.
+// If the attribute exists but is not a list, it replaces it with a new list containing the element.
+//
+// Example:
+//
+//	ad := classad.New()
+//	ad.InsertListElement("items", &ast.StringLiteral{Value: "first"})
+//	ad.InsertListElement("items", &ast.StringLiteral{Value: "second"})
+//	// Result: items = {"first", "second"}
+func (c *ClassAd) InsertListElement(name string, element ast.Expr) {
+	if c.ad == nil {
+		c.ad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
+	}
+
+	// Check if attribute already exists
+	for i, attr := range c.ad.Attributes {
+		if attr.Name == name {
+			// If it's a list, append to it
+			if list, ok := attr.Value.(*ast.ListLiteral); ok {
+				list.Elements = append(list.Elements, element)
+				return
+			}
+			// Otherwise, replace with a new list containing the element
+			c.ad.Attributes[i].Value = &ast.ListLiteral{Elements: []ast.Expr{element}}
+			return
+		}
+	}
+
+	// Add new list attribute
+	c.ad.Attributes = append(c.ad.Attributes, &ast.AttributeAssignment{
+		Name:  name,
+		Value: &ast.ListLiteral{Elements: []ast.Expr{element}},
+	})
+}
+
 // Lookup returns the unevaluated expression for an attribute.
 // Returns nil if the attribute doesn't exist.
 // This is useful for inspecting or copying expressions without evaluating them.
