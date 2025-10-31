@@ -161,7 +161,8 @@ func TestInsertListElement(t *testing.T) {
 	ad := New()
 
 	// Test creating a new list
-	ad.InsertListElement("items", &ast.StringLiteral{Value: "first"})
+	expr1 := &Expr{expr: &ast.StringLiteral{Value: "first"}}
+	ad.InsertListElement("items", expr1)
 	if ad.Size() != 1 {
 		t.Errorf("Expected size 1, got %d", ad.Size())
 	}
@@ -176,8 +177,10 @@ func TestInsertListElement(t *testing.T) {
 	}
 
 	// Test appending to existing list
-	ad.InsertListElement("items", &ast.StringLiteral{Value: "second"})
-	ad.InsertListElement("items", &ast.IntegerLiteral{Value: 42})
+	expr2 := &Expr{expr: &ast.StringLiteral{Value: "second"}}
+	expr3 := &Expr{expr: &ast.IntegerLiteral{Value: 42}}
+	ad.InsertListElement("items", expr2)
+	ad.InsertListElement("items", expr3)
 
 	expr, ok = ad.Lookup("items")
 	if !ok || expr == nil {
@@ -195,7 +198,8 @@ func TestInsertListElement(t *testing.T) {
 
 	// Test replacing non-list attribute with list
 	ad.InsertAttr("x", 100)
-	ad.InsertListElement("x", &ast.IntegerLiteral{Value: 200})
+	expr4 := &Expr{expr: &ast.IntegerLiteral{Value: 200}}
+	ad.InsertListElement("x", expr4)
 
 	expr, ok = ad.Lookup("x")
 	if !ok || expr == nil {
@@ -209,39 +213,8 @@ func TestInsertListElement(t *testing.T) {
 func TestInsertAttrList(t *testing.T) {
 	ad := New()
 
-	// Test InsertAttrList with mixed types
-	elements := []ast.Expr{
-		&ast.StringLiteral{Value: "hello"},
-		&ast.IntegerLiteral{Value: 42},
-		&ast.BooleanLiteral{Value: true},
-		&ast.RealLiteral{Value: 3.14},
-	}
-	ad.InsertAttrList("mixed", elements)
-
-	expr, ok := ad.Lookup("mixed")
-	if !ok || expr == nil {
-		t.Fatal("Attribute 'mixed' not found")
-	}
-	expected := "{\"hello\", 42, true, 3.14}"
-	if expr.String() != expected {
-		t.Errorf("Expected list %s, got %s", expected, expr.String())
-	}
-
-	// Test empty list
-	ad.InsertAttrList("empty", []ast.Expr{})
-	expr, ok = ad.Lookup("empty")
-	if !ok || expr == nil {
-		t.Fatal("Attribute 'empty' not found")
-	}
-	if expr.String() != "{}" {
-		t.Errorf("Expected empty list {}, got %s", expr.String())
-	}
-}
-
-func TestInsertAttrListInt(t *testing.T) {
-	ad := New()
-	ad.InsertAttrListInt("numbers", []int64{1, 2, 3, 4, 5})
-
+	// Test with integers
+	InsertAttrList(ad, "numbers", []int64{1, 2, 3, 4, 5})
 	expr, ok := ad.Lookup("numbers")
 	if !ok || expr == nil {
 		t.Fatal("Attribute 'numbers' not found")
@@ -251,8 +224,75 @@ func TestInsertAttrListInt(t *testing.T) {
 		t.Errorf("Expected list %s, got %s", expected, expr.String())
 	}
 
-	// Test empty list
-	ad.InsertAttrListInt("emptyInts", []int64{})
+	// Test with strings
+	InsertAttrList(ad, "names", []string{"Alice", "Bob", "Charlie"})
+	expr, ok = ad.Lookup("names")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'names' not found")
+	}
+	expected = "{\"Alice\", \"Bob\", \"Charlie\"}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+
+	// Test with floats
+	InsertAttrList(ad, "values", []float64{1.5, 2.7, 3.14})
+	expr, ok = ad.Lookup("values")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'values' not found")
+	}
+	expected = "{1.5, 2.7, 3.14}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+
+	// Test with bools
+	InsertAttrList(ad, "flags", []bool{true, false, true})
+	expr, ok = ad.Lookup("flags")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'flags' not found")
+	}
+	expected = "{true, false, true}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+
+	// Test with ClassAds
+	ad1 := New()
+	ad1.InsertAttr("x", 1)
+	ad2 := New()
+	ad2.InsertAttr("y", 2)
+	ad3 := New()
+	ad3.InsertAttr("z", 3)
+	InsertAttrList(ad, "items", []*ClassAd{ad1, ad2, ad3})
+	expr, ok = ad.Lookup("items")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'items' not found")
+	}
+	expected = "{[x = 1], [y = 2], [z = 3]}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+
+	// Test with Exprs
+	elements := []*Expr{
+		{expr: &ast.StringLiteral{Value: "hello"}},
+		{expr: &ast.IntegerLiteral{Value: 42}},
+		{expr: &ast.BooleanLiteral{Value: true}},
+		{expr: &ast.RealLiteral{Value: 3.14}},
+	}
+	InsertAttrList(ad, "mixed", elements)
+	expr, ok = ad.Lookup("mixed")
+	if !ok || expr == nil {
+		t.Fatal("Attribute 'mixed' not found")
+	}
+	expected = "{\"hello\", 42, true, 3.14}"
+	if expr.String() != expected {
+		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	}
+
+	// Test empty lists
+	InsertAttrList(ad, "emptyInts", []int64{})
 	expr, ok = ad.Lookup("emptyInts")
 	if !ok || expr == nil {
 		t.Fatal("Attribute 'emptyInts' not found")
@@ -260,47 +300,14 @@ func TestInsertAttrListInt(t *testing.T) {
 	if expr.String() != "{}" {
 		t.Errorf("Expected empty list {}, got %s", expr.String())
 	}
-}
 
-func TestInsertAttrListFloat(t *testing.T) {
-	ad := New()
-	ad.InsertAttrListFloat("values", []float64{1.5, 2.7, 3.14})
-
-	expr, ok := ad.Lookup("values")
+	InsertAttrList(ad, "emptyExprs", []*Expr{})
+	expr, ok = ad.Lookup("emptyExprs")
 	if !ok || expr == nil {
-		t.Fatal("Attribute 'values' not found")
+		t.Fatal("Attribute 'emptyExprs' not found")
 	}
-	expected := "{1.5, 2.7, 3.14}"
-	if expr.String() != expected {
-		t.Errorf("Expected list %s, got %s", expected, expr.String())
-	}
-}
-
-func TestInsertAttrListString(t *testing.T) {
-	ad := New()
-	ad.InsertAttrListString("names", []string{"Alice", "Bob", "Charlie"})
-
-	expr, ok := ad.Lookup("names")
-	if !ok || expr == nil {
-		t.Fatal("Attribute 'names' not found")
-	}
-	expected := "{\"Alice\", \"Bob\", \"Charlie\"}"
-	if expr.String() != expected {
-		t.Errorf("Expected list %s, got %s", expected, expr.String())
-	}
-}
-
-func TestInsertAttrListBool(t *testing.T) {
-	ad := New()
-	ad.InsertAttrListBool("flags", []bool{true, false, true})
-
-	expr, ok := ad.Lookup("flags")
-	if !ok || expr == nil {
-		t.Fatal("Attribute 'flags' not found")
-	}
-	expected := "{true, false, true}"
-	if expr.String() != expected {
-		t.Errorf("Expected list %s, got %s", expected, expr.String())
+	if expr.String() != "{}" {
+		t.Errorf("Expected empty list {}, got %s", expr.String())
 	}
 }
 

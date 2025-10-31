@@ -273,108 +273,63 @@ func (c *ClassAd) InsertAttrClassAd(name string, value *ClassAd) {
 	c.Insert(name, &ast.RecordLiteral{ClassAd: inner})
 }
 
-// InsertAttrList inserts an attribute with a list of expressions.
-// This is the most general method for inserting list attributes.
+// InsertAttrList inserts an attribute with a list of values using generics.
+// Supported types are: int64, float64, string, bool, *ClassAd, and *Expr.
 //
 // Example:
 //
 //	ad := classad.New()
-//	elements := []ast.Expr{
-//	    &ast.StringLiteral{Value: "hello"},
-//	    &ast.IntegerLiteral{Value: 42},
-//	    &ast.BooleanLiteral{Value: true},
-//	}
-//	ad.InsertAttrList("items", elements)
-//	// Result: items = {"hello", 42, true}
-func (c *ClassAd) InsertAttrList(name string, elements []ast.Expr) {
+//	InsertAttrList(ad, "numbers", []int64{1, 2, 3, 4, 5})
+//	InsertAttrList(ad, "names", []string{"Alice", "Bob", "Charlie"})
+//	InsertAttrList(ad, "flags", []bool{true, false, true})
+//	InsertAttrList(ad, "values", []float64{1.5, 2.7, 3.14})
+//
+//	// Also works with ClassAds
+//	ad1, ad2 := classad.New(), classad.New()
+//	ad1.InsertAttr("x", 1)
+//	ad2.InsertAttr("y", 2)
+//	InsertAttrList(ad, "items", []*classad.ClassAd{ad1, ad2})
+//
+//	// And with expressions
+//	expr1, _ := classad.ParseExpr("\"hello\"")
+//	expr2, _ := classad.ParseExpr("42")
+//	InsertAttrList(ad, "mixed", []*classad.Expr{expr1, expr2})
+func InsertAttrList[T int64 | float64 | string | bool | *ClassAd | *Expr](c *ClassAd, name string, values []T) {
+	elements := make([]ast.Expr, len(values))
+	for i, v := range values {
+		elements[i] = valueToAstExpr(v)
+	}
 	c.Insert(name, &ast.ListLiteral{Elements: elements})
 }
 
-// InsertAttrListInt inserts an attribute with a list of integer values.
-//
-// Example:
-//
-//	ad := classad.New()
-//	ad.InsertAttrListInt("numbers", []int64{1, 2, 3, 4, 5})
-//	// Result: numbers = {1, 2, 3, 4, 5}
-func (c *ClassAd) InsertAttrListInt(name string, values []int64) {
-	elements := make([]ast.Expr, len(values))
-	for i, v := range values {
-		elements[i] = &ast.IntegerLiteral{Value: v}
-	}
-	c.InsertAttrList(name, elements)
-}
-
-// InsertAttrListFloat inserts an attribute with a list of float values.
-//
-// Example:
-//
-//	ad := classad.New()
-//	ad.InsertAttrListFloat("values", []float64{1.5, 2.7, 3.14})
-//	// Result: values = {1.5, 2.7, 3.14}
-func (c *ClassAd) InsertAttrListFloat(name string, values []float64) {
-	elements := make([]ast.Expr, len(values))
-	for i, v := range values {
-		elements[i] = &ast.RealLiteral{Value: v}
-	}
-	c.InsertAttrList(name, elements)
-}
-
-// InsertAttrListString inserts an attribute with a list of string values.
-//
-// Example:
-//
-//	ad := classad.New()
-//	ad.InsertAttrListString("names", []string{"Alice", "Bob", "Charlie"})
-//	// Result: names = {"Alice", "Bob", "Charlie"}
-func (c *ClassAd) InsertAttrListString(name string, values []string) {
-	elements := make([]ast.Expr, len(values))
-	for i, v := range values {
-		elements[i] = &ast.StringLiteral{Value: v}
-	}
-	c.InsertAttrList(name, elements)
-}
-
-// InsertAttrListBool inserts an attribute with a list of boolean values.
-//
-// Example:
-//
-//	ad := classad.New()
-//	ad.InsertAttrListBool("flags", []bool{true, false, true})
-//	// Result: flags = {true, false, true}
-func (c *ClassAd) InsertAttrListBool(name string, values []bool) {
-	elements := make([]ast.Expr, len(values))
-	for i, v := range values {
-		elements[i] = &ast.BooleanLiteral{Value: v}
-	}
-	c.InsertAttrList(name, elements)
-}
-
-// InsertAttrListClassAd inserts an attribute with a list of nested ClassAd values.
-// Each ClassAd will be embedded as a record literal in the list.
-//
-// Example:
-//
-//	ad1 := classad.New()
-//	ad1.InsertAttr("x", 1)
-//	ad2 := classad.New()
-//	ad2.InsertAttr("y", 2)
-//	resultAd := classad.New()
-//	resultAd.InsertAttrListClassAd("items", []*classad.ClassAd{ad1, ad2})
-//	// Result: items = {[x = 1], [y = 2]}
-func (c *ClassAd) InsertAttrListClassAd(name string, values []*ClassAd) {
-	elements := make([]ast.Expr, len(values))
-	for i, value := range values {
+// valueToAstExpr converts a value to an ast.Expr based on its type.
+func valueToAstExpr[T int64 | float64 | string | bool | *ClassAd | *Expr](v T) ast.Expr {
+	switch val := any(v).(type) {
+	case int64:
+		return &ast.IntegerLiteral{Value: val}
+	case float64:
+		return &ast.RealLiteral{Value: val}
+	case string:
+		return &ast.StringLiteral{Value: val}
+	case bool:
+		return &ast.BooleanLiteral{Value: val}
+	case *ClassAd:
 		var inner *ast.ClassAd
-		if value != nil {
-			inner = value.ad
+		if val != nil {
+			inner = val.ad
 		}
 		if inner == nil {
 			inner = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
 		}
-		elements[i] = &ast.RecordLiteral{ClassAd: inner}
+		return &ast.RecordLiteral{ClassAd: inner}
+	case *Expr:
+		if val == nil {
+			return &ast.UndefinedLiteral{}
+		}
+		return val.internal()
+	default:
+		return &ast.UndefinedLiteral{}
 	}
-	c.InsertAttrList(name, elements)
 }
 
 // InsertListElement inserts an element into a list attribute.
@@ -385,12 +340,21 @@ func (c *ClassAd) InsertAttrListClassAd(name string, values []*ClassAd) {
 // Example:
 //
 //	ad := classad.New()
-//	ad.InsertListElement("items", &ast.StringLiteral{Value: "first"})
-//	ad.InsertListElement("items", &ast.StringLiteral{Value: "second"})
+//	expr1, _ := classad.ParseExpr("\"first\"")
+//	expr2, _ := classad.ParseExpr("\"second\"")
+//	ad.InsertListElement("items", expr1)
+//	ad.InsertListElement("items", expr2)
 //	// Result: items = {"first", "second"}
-func (c *ClassAd) InsertListElement(name string, element ast.Expr) {
+func (c *ClassAd) InsertListElement(name string, element *Expr) {
 	if c.ad == nil {
 		c.ad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
+	}
+
+	var astExpr ast.Expr
+	if element == nil {
+		astExpr = &ast.UndefinedLiteral{}
+	} else {
+		astExpr = element.internal()
 	}
 
 	// Check if attribute already exists
@@ -398,11 +362,11 @@ func (c *ClassAd) InsertListElement(name string, element ast.Expr) {
 		if attr.Name == name {
 			// If it's a list, append to it
 			if list, ok := attr.Value.(*ast.ListLiteral); ok {
-				list.Elements = append(list.Elements, element)
+				list.Elements = append(list.Elements, astExpr)
 				return
 			}
 			// Otherwise, replace with a new list containing the element
-			c.ad.Attributes[i].Value = &ast.ListLiteral{Elements: []ast.Expr{element}}
+			c.ad.Attributes[i].Value = &ast.ListLiteral{Elements: []ast.Expr{astExpr}}
 			return
 		}
 	}
@@ -410,7 +374,7 @@ func (c *ClassAd) InsertListElement(name string, element ast.Expr) {
 	// Add new list attribute
 	c.ad.Attributes = append(c.ad.Attributes, &ast.AttributeAssignment{
 		Name:  name,
-		Value: &ast.ListLiteral{Elements: []ast.Expr{element}},
+		Value: &ast.ListLiteral{Elements: []ast.Expr{astExpr}},
 	})
 }
 
