@@ -27,4 +27,3 @@ repos:
     rev: v1.55.2
     hooks:
       - id: golangci-lint
-        args: [--fast]
