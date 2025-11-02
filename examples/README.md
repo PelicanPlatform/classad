@@ -4,6 +4,76 @@ This directory contains example programs and ClassAd files demonstrating various
 
 ## Example Programs
 
+### generic_api_demo
+**Location:** `examples/generic_api_demo/main.go`
+
+**⭐ Recommended starting point** - Demonstrates the modern generic API for working with ClassAds:
+- **Set()**: Setting attributes with any type
+- **GetAs[T]()**: Type-safe attribute retrieval with generics
+- **GetOr[T]()**: Getting attributes with default values
+- **Type conversions**: Automatic safe conversions (int ↔ float64)
+- **Slices and complex types**: Working with lists and nested data
+- **Comparison**: Side-by-side with traditional API
+
+This example showcases the **recommended idiomatic API** for new Go code.
+
+Run with:
+```bash
+go run examples/generic_api_demo/main.go
+```
+
+### api_demo
+**Location:** `examples/api_demo/main.go`
+
+Comprehensive demonstration of the ClassAd API including:
+- Creating ClassAds programmatically with **Set()**
+- Parsing ClassAds from strings
+- Type-safe retrieval with **GetAs[T]()** and **GetOr[T]()**
+- Evaluating attributes (both new and traditional APIs)
+- Working with different value types
+- Arithmetic and logical expressions
+- Modifying ClassAds
+- Real-world HTCondor scenarios
+
+Run with:
+```bash
+go run examples/api_demo/main.go
+```
+
+### reader_demo
+**Location:** `examples/reader_demo/main.go`
+
+Demonstrates reading multiple ClassAds from various sources using the Reader API with generic API:
+- **Reading new-style ClassAds**: Parsing bracketed ClassAds from strings/files
+- **Reading old-style ClassAds**: Parsing newline-delimited ClassAds separated by blank lines
+- **For-loop iteration**: Using the Reader in idiomatic Go for-loops
+- **Filtering**: Processing only ClassAds that match certain criteria (using **GetAs[T]**)
+- **File I/O**: Reading ClassAds from files
+- **Nested structures**: Working with nested ClassAds in iteration
+
+Run with:
+```bash
+go run examples/reader_demo/main.go
+```
+
+### range_demo
+**Location:** `examples/range_demo/main.go`
+
+Demonstrates Go 1.23+ range-over-function iterator pattern with generic API:
+- **Simple iteration**: Using `for ad := range classad.All(reader)`
+- **Indexed iteration**: Using `for i, ad := range classad.AllWithIndex(reader)`
+- **Error handling**: Using `AllWithError` to capture errors during iteration
+- **Old-style support**: Using `AllOld` for newline-delimited ClassAds
+- **File I/O**: Reading ClassAds from files with range syntax
+- **Generic API**: Using **GetOr[T]()** for safe attribute access
+
+This example showcases the modern, ergonomic way to iterate over ClassAds using Go 1.23+ features.
+
+Run with:
+```bash
+go run examples/range_demo/main.go
+```
+
 ### simple_reader
 **Location:** `examples/simple_reader/main.go`
 
@@ -17,73 +87,6 @@ Run with:
 ```bash
 go run examples/simple_reader/main.go examples/jobs-multiple.ad
 go run examples/simple_reader/main.go examples/machines-old.ad --old
-```
-
-### reader_demo
-**Location:** `examples/reader_demo/main.go`
-
-Demonstrates reading multiple ClassAds from various sources using the Reader API:
-- **Reading new-style ClassAds**: Parsing bracketed ClassAds from strings/files
-- **Reading old-style ClassAds**: Parsing newline-delimited ClassAds separated by blank lines
-- **For-loop iteration**: Using the Reader in idiomatic Go for-loops
-- **Filtering**: Processing only ClassAds that match certain criteria
-- **File I/O**: Reading ClassAds from files
-- **Nested structures**: Working with nested ClassAds in iteration
-
-Run with:
-```bash
-go run examples/reader_demo/main.go
-```
-
-### range_demo
-**Location:** `examples/range_demo/main.go`
-
-Demonstrates Go 1.23+ range-over-function iterator pattern:
-- **Simple iteration**: Using `for ad := range classad.All(reader)`
-- **Indexed iteration**: Using `for i, ad := range classad.AllWithIndex(reader)`
-- **Error handling**: Using `AllWithError` to capture errors during iteration
-- **Old-style support**: Using `AllOld` for newline-delimited ClassAds
-- **File I/O**: Reading ClassAds from files with range syntax
-
-This example showcases the modern, ergonomic way to iterate over ClassAds using Go 1.23+ features.
-
-Run with:
-```bash
-go run examples/range_demo/main.go
-```
-
-### features_demo
-**Location:** `examples/features_demo/main.go`
-
-A comprehensive demonstration of advanced ClassAd features including:
-- **Nested ClassAds**: Working with hierarchical data structures
-- **IS and ISNT operators**: Strict identity checking vs. value equality
-- **Meta-equal operators**: `=?=` and `=!=` aliases for `is` and `isnt`
-- **Attribute selection**: `record.field` syntax for accessing nested attributes
-- **Subscript expressions**: `list[index]` and `record["key"]` for indexing
-- **String functions**: `strcat`, `substr`, `size`, `toUpper`, `toLower`
-- **Math functions**: `floor`, `ceiling`, `round`, `int`, `real`, `random`
-- **Type checking**: `isString`, `isInteger`, `isReal`, `isBoolean`, `isList`, `isClassAd`, `isUndefined`
-- **List operations**: `member`, `size`
-- **Real-world scenario**: HTCondor job matching simulation
-
-Run with:
-```bash
-go run examples/features_demo/main.go
-```
-
-### api_demo
-**Location:** `examples/api_demo/main.go`
-
-Basic demonstration of the ClassAd API including:
-- Parsing ClassAds from strings
-- Evaluating attributes
-- Working with different value types
-- Attribute references and expressions
-
-Run with:
-```bash
-go run examples/api_demo/main.go
 ```
 
 ### expr_demo
@@ -158,6 +161,29 @@ Collection of sample ClassAd expressions demonstrating:
 
 ## Usage Examples
 
+### Modern API (Recommended)
+
+#### Creating and accessing attributes with generics
+```go
+// Create a ClassAd
+ad := classad.New()
+
+// Set attributes with any type
+ad.Set("Cpus", 4)
+ad.Set("Memory", 8192.0)
+ad.Set("Owner", "alice")
+ad.Set("Tags", []string{"prod", "gpu"})
+
+// Type-safe retrieval with GetAs[T]()
+if cpus, ok := classad.GetAs[int](ad, "Cpus"); ok {
+    fmt.Printf("Cpus: %d\n", cpus)
+}
+
+// Get with default values using GetOr[T]()
+owner := classad.GetOr(ad, "Owner", "unknown")
+priority := classad.GetOr(ad, "Priority", 10)  // Uses default if missing
+```
+
 ### Parsing a ClassAd from a file (new format)
 ```go
 data, err := os.ReadFile("examples/job.ad")
@@ -169,6 +195,10 @@ ad, err := classad.Parse(string(data))
 if err != nil {
     log.Fatal(err)
 }
+
+// Access attributes with generic API
+jobId := classad.GetOr(ad, "JobId", 0)
+owner := classad.GetOr(ad, "Owner", "unknown")
 ```
 
 ### Parsing a ClassAd from a file (old format)
@@ -184,12 +214,14 @@ if err != nil {
 }
 ```
 
-### Evaluating attributes
+### Traditional API (Still Supported)
+
+#### Evaluating attributes
 ```go
 // Evaluate to specific type
-owner, err := ad.EvaluateAttrString("Owner")
-cpus, err := ad.EvaluateAttrInt("RequestCpus")
-memory, err := ad.EvaluateAttrInt("RequestMemory")
+owner, ok := ad.EvaluateAttrString("Owner")
+cpus, ok := ad.EvaluateAttrInt("RequestCpus")
+memory, ok := ad.EvaluateAttrInt("RequestMemory")
 
 // Evaluate to generic Value
 val := ad.EvaluateAttr("Requirements")

@@ -42,10 +42,12 @@ This project provides a complete parser and evaluation engine for the ClassAds l
 ```go
 import "github.com/PelicanPlatform/classad/classad"
 
-// Create a ClassAd programmatically
+// Create a ClassAd programmatically with generic Set() API
 ad := classad.New()
-ad.InsertAttr("Cpus", 4)
-ad.InsertAttrFloat("Memory", 8192.0)
+ad.Set("Cpus", 4)
+ad.Set("Memory", 8192.0)
+ad.Set("Name", "worker-01")
+ad.Set("Tags", []string{"production", "gpu"})
 
 // Parse from string (new format)
 jobAd, err := classad.Parse(`[
@@ -67,7 +69,8 @@ defer file.Close()
 reader := classad.NewReader(file)
 for reader.Next() {
     ad := reader.ClassAd()
-    if owner, ok := ad.EvaluateAttrString("Owner"); ok {
+    // Use generic GetAs[T]() for type-safe retrieval
+    if owner, ok := classad.GetAs[string](ad, "Owner"); ok {
         fmt.Printf("Owner: %s\n", owner)
     }
 }
@@ -77,22 +80,65 @@ if err := reader.Err(); err != nil {
 
 // Or use Go 1.23+ range-over-function:
 for ad := range classad.All(file) {
-    if owner, ok := ad.EvaluateAttrString("Owner"); ok {
+    if owner, ok := classad.GetAs[string](ad, "Owner"); ok {
         fmt.Printf("Owner: %s\n", owner)
     }
 }
 
-// Evaluate attributes
-if cpus, ok := jobAd.EvaluateAttrInt("Cpus"); ok {
+// Get attributes with type-safe generic API
+if cpus, ok := classad.GetAs[int](jobAd, "Cpus"); ok {
     fmt.Printf("Cpus = %d\n", cpus)
 }
 
+// GetOr() provides defaults for missing values
+owner := classad.GetOr(jobAd, "Owner", "unknown")
+fmt.Printf("Owner: %s\n", owner)
+
+// Traditional evaluation methods still available
 if requirements, ok := jobAd.EvaluateAttrBool("Requirements"); ok {
     fmt.Printf("Requirements = %v\n", requirements)
 }
 ```
 
 See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete API documentation.
+
+## Generic Get/Set API
+
+The library provides a modern, idiomatic API using Go generics for type-safe attribute access:
+
+```go
+ad := classad.New()
+
+// Set() accepts any type
+ad.Set("Cpus", 4)
+ad.Set("Memory", 8192.0)
+ad.Set("Owner", "alice")
+ad.Set("Tags", []string{"prod", "gpu"})
+ad.Set("IsActive", true)
+
+// GetAs[T]() for type-safe retrieval with two-value return
+if cpus, ok := classad.GetAs[int](ad, "Cpus"); ok {
+    fmt.Printf("Cpus: %d\n", cpus)
+}
+
+if memory, ok := classad.GetAs[float64](ad, "Memory"); ok {
+    fmt.Printf("Memory: %.0f MB\n", memory)
+}
+
+// GetOr[T]() provides defaults for missing or wrong-type values
+owner := classad.GetOr(ad, "Owner", "unknown")
+priority := classad.GetOr(ad, "Priority", 10)  // Uses default if missing
+
+// Works with slices
+tags := classad.GetOr(ad, "Tags", []string{"default"})
+
+// Type conversions happen automatically where safe
+cpusFloat := classad.GetOr(ad, "Cpus", 0.0)  // int -> float64
+```
+
+The generic API is recommended for new code. Traditional methods like `EvaluateAttrInt()`, `InsertAttr()`, etc. remain available for compatibility.
+
+See [examples/generic_api_demo](examples/generic_api_demo/) for comprehensive examples.
 
 ## Struct Marshaling
 
@@ -230,7 +276,38 @@ go build -o bin/classad-parser ./cmd/classad-parser
 
 ### As a Library
 
-Using the high-level ClassAd API:
+Using the modern generic API (recommended):
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/PelicanPlatform/classad/classad"
+)
+
+func main() {
+    // Create a ClassAd with Set()
+    ad := classad.New()
+    ad.Set("Cpus", 4)
+    ad.Set("Memory", 8192.0)
+    ad.Set("Owner", "alice")
+    ad.Set("Tags", []string{"prod", "gpu"})
+
+    // Type-safe retrieval with GetAs[T]()
+    if cpus, ok := classad.GetAs[int](ad, "Cpus"); ok {
+        fmt.Printf("Cpus: %d\n", cpus)
+    }
+
+    // Get with defaults using GetOr[T]()
+    owner := classad.GetOr(ad, "Owner", "unknown")
+    priority := classad.GetOr(ad, "Priority", 10)
+
+    fmt.Printf("Owner: %s, Priority: %d\n", owner, priority)
+}
+```
+
+Using the traditional API (still supported):
 
 ```go
 package main

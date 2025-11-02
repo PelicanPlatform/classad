@@ -13,7 +13,7 @@ func main() {
 	fmt.Println("=== ClassAd Reader Demo ===")
 	fmt.Println()
 
-	// Example 1: Reading new-style ClassAds
+	// Example 1: Reading new-style ClassAds with generic API
 	fmt.Println("Example 1: Reading new-style ClassAds from string")
 	newStyleAds := `
 [JobId = 1; Owner = "alice"; Cpus = 2; Memory = 2048]
@@ -25,10 +25,10 @@ func main() {
 	fmt.Println("Jobs:")
 	for reader.Next() {
 		ad := reader.ClassAd()
-		jobId, _ := ad.EvaluateAttrInt("JobId")
-		owner, _ := ad.EvaluateAttrString("Owner")
-		cpus, _ := ad.EvaluateAttrInt("Cpus")
-		memory, _ := ad.EvaluateAttrInt("Memory")
+		jobId := classad.GetOr(ad, "JobId", 0)
+		owner := classad.GetOr(ad, "Owner", "unknown")
+		cpus := classad.GetOr(ad, "Cpus", 0)
+		memory := classad.GetOr(ad, "Memory", 0)
 
 		fmt.Printf("  Job %d: Owner=%s, Cpus=%d, Memory=%dMB\n",
 			jobId, owner, cpus, memory)
@@ -39,7 +39,7 @@ func main() {
 	}
 	fmt.Println()
 
-	// Example 2: Reading old-style ClassAds
+	// Example 2: Reading old-style ClassAds with generic API
 	fmt.Println("Example 2: Reading old-style ClassAds from string")
 	oldStyleAds := `MyType = "Machine"
 Name = "worker01.example.com"
@@ -64,10 +64,10 @@ Arch = "ARM64"
 	fmt.Println("Machines:")
 	for oldReader.Next() {
 		ad := oldReader.ClassAd()
-		name, _ := ad.EvaluateAttrString("Name")
-		cpus, _ := ad.EvaluateAttrInt("Cpus")
-		memory, _ := ad.EvaluateAttrInt("Memory")
-		arch, _ := ad.EvaluateAttrString("Arch")
+		name := classad.GetOr(ad, "Name", "unknown")
+		cpus := classad.GetOr(ad, "Cpus", 0)
+		memory := classad.GetOr(ad, "Memory", 0)
+		arch := classad.GetOr(ad, "Arch", "unknown")
 
 		fmt.Printf("  %s: %d CPUs, %dMB RAM, %s\n",
 			name, cpus, memory, arch)
@@ -78,7 +78,7 @@ Arch = "ARM64"
 	}
 	fmt.Println()
 
-	// Example 3: Processing with filtering
+	// Example 3: Processing with filtering using generic API
 	fmt.Println("Example 3: Filtering ClassAds (jobs requiring >= 4 CPUs)")
 	filterAds := `
 [JobId = 100; Cpus = 2; Priority = 10]
@@ -93,14 +93,14 @@ Arch = "ARM64"
 	count := 0
 	for filterReader.Next() {
 		ad := filterReader.ClassAd()
-		cpus, ok := ad.EvaluateAttrInt("Cpus")
+		cpus, ok := classad.GetAs[int](ad, "Cpus")
 		if !ok {
 			continue
 		}
 
 		if cpus >= 4 {
-			jobId, _ := ad.EvaluateAttrInt("JobId")
-			priority, _ := ad.EvaluateAttrInt("Priority")
+			jobId := classad.GetOr(ad, "JobId", 0)
+			priority := classad.GetOr(ad, "Priority", 0)
 			fmt.Printf("  Job %d: %d CPUs (priority=%d)\n", jobId, cpus, priority)
 			count++
 		}
@@ -126,11 +126,11 @@ Arch = "ARM64"
 			ad := fileReader.ClassAd()
 			fmt.Printf("  Successfully read ClassAd from %s\n", filename)
 
-			// Try to get some attributes
-			if owner, ok := ad.EvaluateAttrString("Owner"); ok {
+			// Try to get some attributes with generic API
+			if owner, ok := classad.GetAs[string](ad, "Owner"); ok {
 				fmt.Printf("  Owner: %s\n", owner)
 			}
-			if jobId, ok := ad.EvaluateAttrInt("JobId"); ok {
+			if jobId, ok := classad.GetAs[int](ad, "JobId"); ok {
 				fmt.Printf("  JobId: %d\n", jobId)
 			}
 		}
