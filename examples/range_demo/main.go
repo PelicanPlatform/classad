@@ -33,16 +33,16 @@ func main() {
 }
 
 func example1() {
-	fmt.Println("Example 1: Simple iteration")
+	fmt.Println("Example 1: Simple iteration with generic API")
 
 	input := `[JobId = 1; Owner = "alice"; Cpus = 2]
 [JobId = 2; Owner = "bob"; Cpus = 4]
 [JobId = 3; Owner = "charlie"; Cpus = 8]`
 
 	for ad := range classad.All(strings.NewReader(input)) {
-		jobId, _ := ad.EvaluateAttrInt("JobId")
-		owner, _ := ad.EvaluateAttrString("Owner")
-		cpus, _ := ad.EvaluateAttrInt("Cpus")
+		jobId := classad.GetOr(ad, "JobId", 0)
+		owner := classad.GetOr(ad, "Owner", "unknown")
+		cpus := classad.GetOr(ad, "Cpus", 0)
 		fmt.Printf("  Job %d: owner=%s, cpus=%d\n", jobId, owner, cpus)
 	}
 
@@ -50,15 +50,15 @@ func example1() {
 }
 
 func example2() {
-	fmt.Println("Example 2: Iteration with index")
+	fmt.Println("Example 2: Iteration with index and generic API")
 
 	input := `[Name = "Machine1"; Available = true]
 [Name = "Machine2"; Available = false]
 [Name = "Machine3"; Available = true]`
 
 	for i, ad := range classad.AllWithIndex(strings.NewReader(input)) {
-		name, _ := ad.EvaluateAttrString("Name")
-		available, _ := ad.EvaluateAttrBool("Available")
+		name := classad.GetOr(ad, "Name", "unknown")
+		available := classad.GetOr(ad, "Available", false)
 		fmt.Printf("  [%d] %s: available=%v\n", i, name, available)
 	}
 
@@ -66,7 +66,7 @@ func example2() {
 }
 
 func example3() {
-	fmt.Println("Example 3: Iteration with error handling")
+	fmt.Println("Example 3: Iteration with error handling and generic API")
 
 	// Valid input
 	input := `[Status = "Running"]
@@ -75,7 +75,7 @@ func example3() {
 	var err error
 
 	for ad := range classad.AllWithError(strings.NewReader(input), &err) {
-		status, _ := ad.EvaluateAttrString("Status")
+		status := classad.GetOr(ad, "Status", "unknown")
 		fmt.Printf("  Status: %s\n", status)
 	}
 
@@ -103,7 +103,7 @@ func example3() {
 }
 
 func example4() {
-	fmt.Println("Example 4: Old-style ClassAds")
+	fmt.Println("Example 4: Old-style ClassAds with generic API")
 
 	input := `MyType = "Machine"
 Name = "slot1@server1"
@@ -114,8 +114,8 @@ Name = "slot2@server2"
 Cpus = 8`
 
 	for ad := range classad.AllOld(strings.NewReader(input)) {
-		name, _ := ad.EvaluateAttrString("Name")
-		cpus, _ := ad.EvaluateAttrInt("Cpus")
+		name := classad.GetOr(ad, "Name", "unknown")
+		cpus := classad.GetOr(ad, "Cpus", 0)
 		fmt.Printf("  %s: %d CPUs\n", name, cpus)
 	}
 
@@ -123,7 +123,7 @@ Cpus = 8`
 }
 
 func example5() {
-	fmt.Println("Example 5: Reading from file")
+	fmt.Println("Example 5: Reading from file with generic API")
 
 	// Try to open the example file
 	file, err := os.Open("../jobs-multiple.ad")
@@ -136,8 +136,8 @@ func example5() {
 
 	count := 0
 	for ad := range classad.All(file) {
-		jobId, _ := ad.EvaluateAttrInt("JobId")
-		owner, _ := ad.EvaluateAttrString("Owner")
+		jobId := classad.GetOr(ad, "JobId", 0)
+		owner := classad.GetOr(ad, "Owner", "unknown")
 		fmt.Printf("  Job %d: %s\n", jobId, owner)
 		count++
 	}

@@ -42,10 +42,12 @@ This project provides a complete parser and evaluation engine for the ClassAds l
 ```go
 import "github.com/PelicanPlatform/classad/classad"
 
-// Create a ClassAd programmatically
+// Create a ClassAd programmatically with generic Set() API
 ad := classad.New()
-ad.InsertAttr("Cpus", 4)
-ad.InsertAttrFloat("Memory", 8192.0)
+ad.Set("Cpus", 4)
+ad.Set("Memory", 8192.0)
+ad.Set("Name", "worker-01")
+ad.Set("Tags", []string{"production", "gpu"})
 
 // Parse from string (new format)
 jobAd, err := classad.Parse(`[
@@ -67,7 +69,8 @@ defer file.Close()
 reader := classad.NewReader(file)
 for reader.Next() {
     ad := reader.ClassAd()
-    if owner, ok := ad.EvaluateAttrString("Owner"); ok {
+    // Use generic GetAs[T]() for type-safe retrieval
+    if owner, ok := classad.GetAs[string](ad, "Owner"); ok {
         fmt.Printf("Owner: %s\n", owner)
     }
 }
@@ -77,22 +80,106 @@ if err := reader.Err(); err != nil {
 
 // Or use Go 1.23+ range-over-function:
 for ad := range classad.All(file) {
-    if owner, ok := ad.EvaluateAttrString("Owner"); ok {
+    if owner, ok := classad.GetAs[string](ad, "Owner"); ok {
         fmt.Printf("Owner: %s\n", owner)
     }
 }
 
-// Evaluate attributes
-if cpus, ok := jobAd.EvaluateAttrInt("Cpus"); ok {
+// Get attributes with type-safe generic API
+if cpus, ok := classad.GetAs[int](jobAd, "Cpus"); ok {
     fmt.Printf("Cpus = %d\n", cpus)
 }
 
+// GetOr() provides defaults for missing values
+owner := classad.GetOr(jobAd, "Owner", "unknown")
+fmt.Printf("Owner: %s\n", owner)
+
+// Traditional evaluation methods still available
 if requirements, ok := jobAd.EvaluateAttrBool("Requirements"); ok {
     fmt.Printf("Requirements = %v\n", requirements)
 }
 ```
 
 See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete API documentation.
+
+## Generic Get/Set API
+
+The library provides a modern, idiomatic API using Go generics for type-safe attribute access:
+
+```go
+ad := classad.New()
+
+// Set() accepts any type
+ad.Set("Cpus", 4)
+ad.Set("Memory", 8192.0)
+ad.Set("Owner", "alice")
+ad.Set("Tags", []string{"prod", "gpu"})
+ad.Set("IsActive", true)
+
+// GetAs[T]() for type-safe retrieval with two-value return
+if cpus, ok := classad.GetAs[int](ad, "Cpus"); ok {
+    fmt.Printf("Cpus: %d\n", cpus)
+}
+
+if memory, ok := classad.GetAs[float64](ad, "Memory"); ok {
+    fmt.Printf("Memory: %.0f MB\n", memory)
+}
+
+// GetOr[T]() provides defaults for missing or wrong-type values
+owner := classad.GetOr(ad, "Owner", "unknown")
+priority := classad.GetOr(ad, "Priority", 10)  // Uses default if missing
+
+// Works with slices
+tags := classad.GetOr(ad, "Tags", []string{"default"})
+
+// Type conversions happen automatically where safe
+cpusFloat := classad.GetOr(ad, "Cpus", 0.0)  // int -> float64
+```
+
+The generic API is recommended for new code. Traditional methods like `EvaluateAttrInt()`, `InsertAttr()`, etc. remain available for compatibility.
+
+See [examples/generic_api_demo](examples/generic_api_demo/) for comprehensive examples.
+
+## Struct Marshaling
+
+The library supports marshaling Go structs to/from both ClassAd and JSON formats:
+
+```go
+// Define a struct with tags
+type Job struct {
+    ID       int      `classad:"JobId"`
+    Owner    string   `classad:"Owner"`
+    CPUs     int      `json:"cpus"`        // Falls back to json tag
+    Tags     []string `classad:"Tags,omitempty"`
+}
+
+// Marshal to ClassAd format
+job := Job{ID: 123, Owner: "alice", CPUs: 4, Tags: []string{"prod"}}
+classadStr, _ := classad.Marshal(job)
+// Result: [JobId = 123; Owner = "alice"; cpus = 4; Tags = {"prod"}]
+
+// Unmarshal from ClassAd format
+var job2 Job
+classad.Unmarshal(classadStr, &job2)
+
+// JSON marshaling with expression support
+ad, _ := classad.Parse(`[x = 5; y = x + 3]`)
+jsonBytes, _ := json.Marshal(ad)
+// Result: {"x":5,"y":"\/Expr(x + 3)\/"}
+
+// JSON unmarshaling
+var ad2 classad.ClassAd
+json.Unmarshal(jsonBytes, &ad2)
+```
+
+Features:
+- Struct tags: `classad:"name"` or falls back to `json:"name"`
+- Options: `omitempty`, `-` (skip field)
+- Nested structs and slices
+- Map support: `map[string]T`, `map[string]interface{}`
+- JSON expressions with `/Expr(...))/` format
+
+See [docs/MARSHALING.md](docs/MARSHALING.md) for complete marshaling documentation.
 
 ## Project Structure
 
@@ -122,13 +209,17 @@ golang-classads/
 │   ├── features_demo/    # Advanced features demo
 │   ├── reader_demo/      # Reader/iterator demo
 │   ├── range_demo/       # Go 1.23+ range-over-function demo
+│   ├── struct_demo/      # Struct marshaling examples
+│   ├── json_demo/        # JSON marshaling examples
 │   ├── simple_reader/    # CLI tool for reading ClassAd files
 │   ├── README.md     # Examples documentation
 │   ├── machine.ad
 │   ├── job.ad
 │   └── expressions.txt
 ├── docs/             # Documentation
-│   └── EVALUATION_API.md
+│   ├── EVALUATION_API.md       # API reference for evaluation
+│   ├── MARSHALING.md           # Struct marshaling guide (ClassAd & JSON)
+│   └── MARSHALING_QUICKREF.md  # Quick reference card
 ├── generate.go       # go generate directive
 ├── go.mod
 └── README.md
@@ -185,7 +276,38 @@ go build -o bin/classad-parser ./cmd/classad-parser
 
 ### As a Library
 
-Using the high-level ClassAd API:
+Using the modern generic API (recommended):
+
+```go
+package main
+
+import (
+    "fmt"
+    "github.com/PelicanPlatform/classad/classad"
+)
+
+func main() {
+    // Create a ClassAd with Set()
+    ad := classad.New()
+    ad.Set("Cpus", 4)
+    ad.Set("Memory", 8192.0)
+    ad.Set("Owner", "alice")
+    ad.Set("Tags", []string{"prod", "gpu"})
+
+    // Type-safe retrieval with GetAs[T]()
+    if cpus, ok := classad.GetAs[int](ad, "Cpus"); ok {
+        fmt.Printf("Cpus: %d\n", cpus)
+    }
+
+    // Get with defaults using GetOr[T]()
+    owner := classad.GetOr(ad, "Owner", "unknown")
+    priority := classad.GetOr(ad, "Priority", 10)
+
+    fmt.Printf("Owner: %s, Priority: %d\n", owner, priority)
+}
+```
+
+Using the traditional API (still supported):
 
 ```go
 package main

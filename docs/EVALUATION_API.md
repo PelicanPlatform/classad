@@ -10,16 +10,23 @@ The `classad` package provides a high-level API for working with ClassAds, inclu
 - Evaluating expressions with type safety
 - Modifying ClassAd attributes
 
+The library offers two API styles:
+- **Modern Generic API** (recommended): `Set()`, `GetAs[T]()`, `GetOr[T]()`
+- **Traditional API** (still supported): `InsertAttr*()`, `EvaluateAttr*()`
+
 ## Quick Start
+
+### Modern API (Recommended)
 
 ```go
 import "github.com/PelicanPlatform/classad/classad"
 
-// Create a new ClassAd
+// Create a new ClassAd with Set()
 ad := classad.New()
-ad.InsertAttr("Cpus", 4)
-ad.InsertAttrFloat("Memory", 8192.0)
-ad.InsertAttrString("Name", "worker-01")
+ad.Set("Cpus", 4)
+ad.Set("Memory", 8192.0)
+ad.Set("Name", "worker-01")
+ad.Set("Tags", []string{"prod", "gpu"})
 
 // Parse a ClassAd from string
 jobAd, err := classad.Parse(`[
@@ -29,7 +36,30 @@ jobAd, err := classad.Parse(`[
     Requirements = (Cpus >= 2) && (Memory >= 2048)
 ]`)
 
-// Evaluate attributes with type safety
+// Type-safe retrieval with GetAs[T]()
+if cpus, ok := classad.GetAs[int](jobAd, "Cpus"); ok {
+    fmt.Printf("Cpus = %d\n", cpus)
+}
+
+if owner, ok := classad.GetAs[string](jobAd, "Owner"); ok {
+    fmt.Printf("Owner = %s\n", owner)
+}
+
+// Get with defaults using GetOr[T]()
+priority := classad.GetOr(jobAd, "Priority", 10)
+status := classad.GetOr(jobAd, "Status", "Unknown")
+```
+
+### Traditional API (Still Supported)
+
+```go
+// Create a new ClassAd with InsertAttr methods
+ad := classad.New()
+ad.InsertAttr("Cpus", 4)
+ad.InsertAttrFloat("Memory", 8192.0)
+ad.InsertAttrString("Name", "worker-01")
+
+// Evaluate attributes with type-specific methods
 if cpus, ok := jobAd.EvaluateAttrInt("Cpus"); ok {
     fmt.Printf("Cpus = %d\n", cpus)
 }
@@ -86,7 +116,9 @@ defer file.Close()
 reader := classad.NewReader(file)
 for reader.Next() {
     ad := reader.ClassAd()
-    // Process ClassAd...
+    // Process ClassAd with modern API
+    owner := classad.GetOr(ad, "Owner", "unknown")
+    cpus := classad.GetOr(ad, "Cpus", 0)
 }
 if err := reader.Err(); err != nil {
     log.Fatal(err)
@@ -114,20 +146,25 @@ import (
     "github.com/PelicanPlatform/classad/classad"
 )
 
-// Simple iteration
+// Simple iteration with modern API
 for ad := range classad.All(strings.NewReader(input)) {
-    // Process ClassAd...
+    owner := classad.GetOr(ad, "Owner", "unknown")
+    cpus := classad.GetOr(ad, "Cpus", 0)
+    fmt.Printf("Owner: %s, Cpus: %d\n", owner, cpus)
 }
 
 // Iteration with index
 for i, ad := range classad.AllWithIndex(file) {
-    fmt.Printf("ClassAd %d: %v\n", i, ad)
+    jobId := classad.GetOr(ad, "JobId", 0)
+    fmt.Printf("ClassAd %d: JobId=%d\n", i, jobId)
 }
 
 // Iteration with error handling
 var err error
 for ad := range classad.AllWithError(file, &err) {
-    // Process ClassAd...
+    if name, ok := classad.GetAs[string](ad, "Name"); ok {
+        fmt.Printf("Name: %s\n", name)
+    }
 }
 if err != nil {
     log.Fatal(err)
@@ -136,11 +173,22 @@ if err != nil {
 
 #### Attribute Manipulation
 
+**Modern API (Recommended):**
+
+- `Set(name string, value any) error` - Sets an attribute with any type (generic)
+- `GetAs[T any](ad *ClassAd, name string) (T, bool)` - Type-safe generic retrieval
+- `GetOr[T any](ad *ClassAd, name string, defaultValue T) T` - Get with default value
+
+**Traditional API (Still Supported):**
+
 - `InsertAttr(name string, value interface{})` - Inserts an attribute (auto-detects type)
 - `InsertAttrInt(name string, value int64)` - Inserts an integer attribute
 - `InsertAttrFloat(name string, value float64)` - Inserts a float attribute
 - `InsertAttrString(name string, value string)` - Inserts a string attribute
 - `InsertAttrBool(name string, value bool)` - Inserts a boolean attribute
+
+**Common Methods:**
+
 - `Insert(name string, expr ast.Expr)` - Inserts an attribute with an AST expression
 - `InsertExpr(name string, expr *Expr)` - Inserts an attribute with an Expr (see Expression API)
 - `Lookup(name string) (*Expr, bool)` - Returns the unevaluated expression for an attribute
@@ -150,6 +198,27 @@ if err != nil {
 - `GetAttributes() []string` - Returns a list of all attribute names
 
 #### Evaluation Methods
+
+**Modern API (Recommended):**
+
+Using the generic functions:
+```go
+// Type-safe retrieval with two-value return
+if cpus, ok := classad.GetAs[int](ad, "Cpus"); ok {
+    fmt.Printf("Cpus: %d\n", cpus)
+}
+
+if owner, ok := classad.GetAs[string](ad, "Owner"); ok {
+    fmt.Printf("Owner: %s\n", owner)
+}
+
+// Get with defaults (no error checking needed)
+priority := classad.GetOr(ad, "Priority", 10)
+status := classad.GetOr(ad, "Status", "Unknown")
+tags := classad.GetOr(ad, "Tags", []string{"default"})
+```
+
+**Traditional API (Still Supported):**
 
 - `EvaluateAttr(name string) Value` - Evaluates an attribute and returns a Value
 - `EvaluateAttrInt(name string) (int64, bool)` - Evaluates as integer
@@ -197,7 +266,7 @@ if expr, ok := ad.Lookup("y"); ok {
 ```go
 expr, _ := classad.ParseExpr("Cpus * 2")
 ad := classad.New()
-ad.InsertAttr("Cpus", 8)
+ad.Set("Cpus", 8)
 
 result := expr.Eval(ad)
 if value, ok := result.IntValue(); ok {
@@ -209,10 +278,10 @@ if value, ok := result.IntValue(); ok {
 
 ```go
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
+job.Set("RequestCpus", 4)
 
 machine := classad.New()
-machine.InsertAttr("Cpus", 8)
+machine.Set("Cpus", 8)
 
 expr, _ := classad.ParseExpr("MY.RequestCpus <= TARGET.Cpus")
 result := expr.EvalWithContext(job, machine)  // job=MY, machine=TARGET
@@ -241,8 +310,8 @@ template, _ := classad.Parse(`[
 
 // Create a new ClassAd and copy expressions
 newAd := classad.New()
-newAd.InsertAttr("Cpus", 4)
-newAd.InsertAttr("Memory", 8192)
+newAd.Set("Cpus", 4)
+newAd.Set("Memory", 8192)
 
 // Copy the StandardReq expression
 if req, ok := template.Lookup("StandardReq"); ok {
@@ -254,11 +323,11 @@ if score, ok := template.Lookup("ResourceScore"); ok {
     newAd.InsertExpr("Score", score)
 }
 
-// Evaluate in new context
-if reqVal, ok := newAd.EvaluateAttrBool("Requirements"); ok {
+// Evaluate in new context with modern API
+if reqVal, ok := classad.GetAs[bool](newAd, "Requirements"); ok {
     fmt.Printf("Requirements: %v\n", reqVal)  // true
 }
-if scoreVal, ok := newAd.EvaluateAttrInt("Score"); ok {
+if scoreVal, ok := classad.GetAs[int](newAd, "Score"); ok {
     fmt.Printf("Score: %d\n", scoreVal)  // 4008
 }
 ```
@@ -269,12 +338,12 @@ The Expression API provides explicit control over MY and TARGET scopes for match
 
 ```go
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
-job.InsertAttr("RequestMemory", 8192)
+job.Set("RequestCpus", 4)
+job.Set("RequestMemory", 8192)
 
 machine := classad.New()
-machine.InsertAttr("Cpus", 8)
-machine.InsertAttr("Memory", 16384)
+machine.Set("Cpus", 8)
+machine.Set("Memory", 16384)
 
 // Job requirements: MY=job, TARGET=machine
 jobReq, _ := classad.ParseExpr("MY.RequestCpus <= TARGET.Cpus && MY.RequestMemory <= TARGET.Memory")
@@ -463,18 +532,21 @@ if requirements, ok := job.EvaluateAttrBool("Requirements"); ok {
 
 ## Examples
 
-See `examples/api_demo/main.go` for comprehensive examples of:
-1. Creating ClassAds programmatically
+See `examples/api_demo/main.go` for comprehensive examples using the modern API:
+1. Creating ClassAds programmatically with `Set()`
 2. Parsing ClassAds from strings
 3. Looking up attributes
-4. Evaluating with type safety
-5. Complex expressions
-6. Arithmetic operations
-7. Logical expressions
-8. Conditional expressions
-9. Modifying ClassAds
-10. Real-world HTCondor scenarios
-11. Handling undefined values
+4. Type-safe retrieval with `GetAs[T]()`
+5. Using `GetOr[T]()` with defaults
+6. Complex expressions
+7. Arithmetic operations
+8. Logical expressions
+9. Conditional expressions
+10. Modifying ClassAds
+11. Real-world HTCondor scenarios
+12. Handling undefined values
+
+See `examples/generic_api_demo/main.go` for focused examples of the modern generic API.
 
 See `examples/features_demo/main.go` for advanced features including:
 - Scoped attribute references (MY., TARGET., PARENT.)
@@ -483,6 +555,7 @@ See `examples/features_demo/main.go` for advanced features including:
 Run the examples with:
 ```bash
 go run ./examples/api_demo/main.go
+go run ./examples/generic_api_demo/main.go
 go run ./examples/features_demo/main.go
 ```
 
@@ -505,10 +578,37 @@ The test suite includes:
 - Nested ClassAds and lists
 - IS/ISNT operators
 - Built-in functions
+- Generic API (Set, GetAs, GetOr)
 
 ## Nested ClassAds and Lists
 
 ClassAds support nested structures:
+
+### Using Modern API
+
+```go
+// Lists
+ad, _ := classad.Parse(`[numbers = {1, 2, 3, 4, 5}]`)
+
+// Get list with type safety
+if numbers, ok := classad.GetAs[[]interface{}](ad, "numbers"); ok {
+    fmt.Printf("Numbers: %v\n", numbers)
+}
+
+// Nested ClassAds
+ad, _ := classad.Parse(`[
+    server = [host = "example.com"; port = 8080];
+    name = "web-server"
+]`)
+
+if server, ok := classad.GetAs[*classad.ClassAd](ad, "server"); ok {
+    host := classad.GetOr(server, "host", "localhost")
+    port := classad.GetOr(server, "port", 80)
+    fmt.Printf("Server: %s:%d\n", host, port)
+}
+```
+
+### Using Traditional API
 
 ```go
 // Lists
@@ -759,6 +859,11 @@ ad, _ := classad.Parse(`[
     secondSalary = company.employees[1].salary
 ]`)
 
+// Modern API
+name := classad.GetOr(ad, "firstEmpName", "")        // "Alice"
+salary := classad.GetOr(ad, "secondSalary", 0)       // 95000
+
+// Traditional API
 name, _ := ad.EvaluateAttrString("firstEmpName")    // "Alice"
 salary, _ := ad.EvaluateAttrInt("secondSalary")     // 95000
 ```
@@ -777,16 +882,16 @@ The `MatchClassAd` type provides symmetric matching between two ClassAds, inspir
 ```go
 import "github.com/PelicanPlatform/classad/classad"
 
-// Create job and machine ClassAds
+// Create job and machine ClassAds with modern API
 job := classad.New()
-job.InsertAttr("Cpus", 2)
-job.InsertAttr("Memory", 2048)
-job.InsertAttrString("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+job.Set("Cpus", 2)
+job.Set("Memory", 2048)
+job.Set("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
 
 machine := classad.New()
-machine.InsertAttr("Cpus", 4)
-machine.InsertAttr("Memory", 8192)
-machine.InsertAttrString("Requirements", "TARGET.Cpus <= MY.Cpus && TARGET.Memory <= MY.Memory")
+machine.Set("Cpus", 4)
+machine.Set("Memory", 8192)
+machine.Set("Requirements", "TARGET.Cpus <= MY.Cpus && TARGET.Memory <= MY.Memory")
 
 // Create MatchClassAd - automatically sets up TARGET references
 matchAd := classad.NewMatchClassAd(job, machine)
@@ -849,21 +954,21 @@ rightRank := matchAd.EvaluateRankRight("Rank")
 ### Complete Matching Example
 
 ```go
-// Job ClassAd
+// Job ClassAd with modern API
 job := classad.New()
-job.InsertAttr("Cpus", 2)
-job.InsertAttr("Memory", 2048)
-job.InsertAttrString("Owner", "alice")
-job.InsertAttrString("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
-job.InsertAttrString("Rank", "TARGET.Memory")  // Prefer more memory
+job.Set("Cpus", 2)
+job.Set("Memory", 2048)
+job.Set("Owner", "alice")
+job.Set("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+job.Set("Rank", "TARGET.Memory")  // Prefer more memory
 
-// Machine ClassAd
+// Machine ClassAd with modern API
 machine := classad.New()
-machine.InsertAttr("Cpus", 4)
-machine.InsertAttr("Memory", 8192)
-machine.InsertAttrString("Name", "slot1@worker1")
-machine.InsertAttrString("Requirements", "TARGET.Cpus <= MY.Cpus")
-machine.InsertAttrString("Rank", "1000 - TARGET.Memory")  // Prefer lighter jobs
+machine.Set("Cpus", 4)
+machine.Set("Memory", 8192)
+machine.Set("Name", "slot1@worker1")
+machine.Set("Requirements", "TARGET.Cpus <= MY.Cpus")
+machine.Set("Rank", "1000 - TARGET.Memory")  // Prefer lighter jobs
 
 // Create MatchClassAd and check match
 matchAd := classad.NewMatchClassAd(job, machine)
@@ -1111,7 +1216,7 @@ Returns a sorted list of attribute names referenced in the expression but not de
 ```go
 expr, _ := classad.ParseExpr("RequestCpus * 1000 + Memory / 1024")
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
+job.Set("RequestCpus", 4)
 
 missing := job.ExternalRefs(expr)
 // Returns: ["Memory"]
@@ -1208,8 +1313,8 @@ flattened := job.Flatten(expr)
 requirement, _ := classad.ParseExpr("Cpus >= RequestCpus && Memory >= RequestMemory")
 
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
-job.InsertAttr("RequestMemory", 2048)
+job.Set("RequestCpus", 4)
+job.Set("RequestMemory", 2048)
 
 // Scheduler flattens the requirement once
 flattened := job.Flatten(requirement)
@@ -1230,7 +1335,7 @@ for _, machine := range machines {
 ```go
 expr, _ := classad.ParseExpr("x > 5 ? 100 : 200")
 ad := classad.New()
-ad.InsertAttr("x", 10)
+ad.Set("x", 10)
 
 flattened := ad.Flatten(expr)
 // Returns: 100
@@ -1241,8 +1346,8 @@ flattened := ad.Flatten(expr)
 ```go
 expr, _ := classad.ParseExpr("(x + y) * z")
 ad := classad.New()
-ad.InsertAttr("x", 10)
-ad.InsertAttr("y", 20)
+ad.Set("x", 10)
+ad.Set("y", 20)
 // z is undefined
 
 flattened := ad.Flatten(expr)
