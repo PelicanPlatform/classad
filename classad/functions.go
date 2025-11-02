@@ -827,11 +827,8 @@ func builtinQuantize(args []Value) Value {
 
 	if bIsInt && aIsInt {
 		return NewIntValue(int64(result))
-	} else if bIsInt {
-		return NewRealValue(result)
-	} else {
-		return NewRealValue(result)
 	}
+	return NewRealValue(result)
 }
 
 // builtinSum sums numeric values in a list
@@ -1142,7 +1139,7 @@ func builtinJoin(args []Value) Value {
 	}
 	sep, _ := args[0].StringValue()
 
-	// join(sep, list)
+	// Two-argument form: join(separator, list)
 	if len(args) == 2 && args[1].IsList() {
 		if args[1].IsError() {
 			return NewErrorValue()
