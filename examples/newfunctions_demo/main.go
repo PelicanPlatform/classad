@@ -132,5 +132,66 @@ func main() {
 	hasTest := classAd5.EvaluateAttr("hasTest")
 	fmt.Printf("  stringListRegexpMember(\"^test\", \"test1,foo,test2,bar\") = %v\n\n", hasTest)
 
-	fmt.Println("=== All 16 new functions working! ===")
+	// unparse() function
+	fmt.Println("6. Expression Introspection")
+	fmt.Println("----------------------------")
+
+	ad6 := `[
+		x = 10;
+		y = 20;
+		sum = x + y;
+		product = x * y;
+		condition = x > 5 ? "yes" : "no";
+		sum_str = unparse(sum);
+		product_str = unparse(product);
+		condition_str = unparse(condition);
+	]`
+
+	classAd6, err := classad.Parse(ad6)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sumStr := classAd6.EvaluateAttr("sum_str")
+	productStr := classAd6.EvaluateAttr("product_str")
+	conditionStr := classAd6.EvaluateAttr("condition_str")
+
+	fmt.Printf("  unparse(sum) = %v\n", sumStr)
+	fmt.Printf("  unparse(product) = %v\n", productStr)
+	fmt.Printf("  unparse(condition) = %v\n\n", conditionStr)
+
+	// eval() function
+	fmt.Println("7. Dynamic Expression Evaluation")
+	fmt.Println("---------------------------------")
+
+	ad7 := `[
+		x = 10;
+		y = 20;
+		expr1 = "x + y";
+		expr2 = "x * y";
+		expr3 = "x > 5 ? 100 : 0";
+		result1 = eval(expr1);
+		result2 = eval(expr2);
+		result3 = eval(expr3);
+		slot5 = 500;
+		slotId = 5;
+		dynamicAttr = eval(strcat("slot", string(slotId)));
+	]`
+
+	classAd7, err := classad.Parse(ad7)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	result1 := classAd7.EvaluateAttr("result1")
+	result2 := classAd7.EvaluateAttr("result2")
+	result3 := classAd7.EvaluateAttr("result3")
+	dynamicAttr := classAd7.EvaluateAttr("dynamicAttr")
+
+	fmt.Printf("  eval(\"x + y\") where x=10, y=20 = %v\n", result1)
+	fmt.Printf("  eval(\"x * y\") where x=10, y=20 = %v\n", result2)
+	fmt.Printf("  eval(\"x > 5 ? 100 : 0\") where x=10 = %v\n", result3)
+	fmt.Printf("  eval(strcat(\"slot\", string(5))) where slot5=500 = %v\n\n", dynamicAttr)
+
+	fmt.Println("=== All 19 new functions working! ===")
 }

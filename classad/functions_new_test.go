@@ -131,6 +131,289 @@ func TestStringListIMember(t *testing.T) {
 	}
 }
 
+func TestUnparse(t *testing.T) {
+	tests := []struct {
+		name     string
+		classad  string
+		attr     string
+		expected string
+	}{
+		{
+			name:     "simple integer",
+			classad:  `[x = 42; result = unparse(x)]`,
+			attr:     "result",
+			expected: "42",
+		},
+		{
+			name:     "arithmetic expression",
+			classad:  `[x = 3; y = x + 5; result = unparse(y)]`,
+			attr:     "result",
+			expected: "(x + 5)",
+		},
+		{
+			name:     "string literal",
+			classad:  `[msg = "hello"; result = unparse(msg)]`,
+			attr:     "result",
+			expected: `"hello"`,
+		},
+		{
+			name:     "boolean expression",
+			classad:  `[x = 10; cond = x > 5; result = unparse(cond)]`,
+			attr:     "result",
+			expected: "(x > 5)",
+		},
+		{
+			name:     "function call",
+			classad:  `[name = "John"; upper = toUpper(name); result = unparse(upper)]`,
+			attr:     "result",
+			expected: "toUpper(name)",
+		},
+		{
+			name:     "conditional expression",
+			classad:  `[x = 10; val = x > 5 ? x : 0; result = unparse(val)]`,
+			attr:     "result",
+			expected: "((x > 5) ? x : 0)",
+		},
+		{
+			name:     "list literal",
+			classad:  `[nums = {1, 2, 3}; result = unparse(nums)]`,
+			attr:     "result",
+			expected: "{1, 2, 3}",
+		},
+		{
+			name:     "nested record",
+			classad:  `[rec = [a = 1; b = 2]; result = unparse(rec)]`,
+			attr:     "result",
+			expected: "[a = 1; b = 2]",
+		},
+		{
+			name:     "attribute reference",
+			classad:  `[x = 5; y = x * 2; result = unparse(y)]`,
+			attr:     "result",
+			expected: "(x * 2)",
+		},
+		{
+			name:     "complex expression",
+			classad:  `[x = 10; y = 20; z = (x + y) * 2; result = unparse(z)]`,
+			attr:     "result",
+			expected: "((x + y) * 2)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ad, err := Parse(tt.classad)
+			if err != nil {
+				t.Fatalf("Failed to parse: %v", err)
+			}
+			val := ad.EvaluateAttr(tt.attr)
+			if !val.IsString() {
+				t.Fatalf("Expected string, got %v", val.Type())
+			}
+			result, _ := val.StringValue()
+			if result != tt.expected {
+				t.Errorf("Expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+
+	// Test undefined attribute
+	t.Run("undefined attribute", func(t *testing.T) {
+		ad, err := Parse(`[x = 5; result = unparse(missing)]`)
+		if err != nil {
+			t.Fatalf("Failed to parse: %v", err)
+		}
+		val := ad.EvaluateAttr("result")
+		if !val.IsUndefined() {
+			t.Errorf("Expected undefined, got %v", val.Type())
+		}
+	})
+
+	// Test with scoped references
+	t.Run("MY scope", func(t *testing.T) {
+		ad, err := Parse(`[x = 10; result = unparse(MY.x)]`)
+		if err != nil {
+			t.Fatalf("Failed to parse: %v", err)
+		}
+		val := ad.EvaluateAttr("result")
+		if !val.IsString() {
+			t.Fatalf("Expected string, got %v", val.Type())
+		}
+		result, _ := val.StringValue()
+		if result != "10" {
+			t.Errorf("Expected %q, got %q", "10", result)
+		}
+	})
+}
+
+func TestEval(t *testing.T) {
+	tests := []struct {
+		name        string
+		classad     string
+		attr        string
+		expected    interface{}
+		expectError bool
+		expectUndef bool
+	}{
+		{
+			name:     "simple integer expression",
+			classad:  `[result = eval("5 + 3")]`,
+			attr:     "result",
+			expected: int64(8),
+		},
+		{
+			name:     "string concatenation",
+			classad:  `[result = eval("strcat(\"hello\", \" \", \"world\")")]`,
+			attr:     "result",
+			expected: "hello world",
+		},
+		{
+			name:     "attribute reference",
+			classad:  `[x = 10; result = eval("x * 2")]`,
+			attr:     "result",
+			expected: int64(20),
+		},
+		{
+			name:     "boolean expression",
+			classad:  `[x = 15; result = eval("x > 10")]`,
+			attr:     "result",
+			expected: true,
+		},
+		{
+			name:     "function call in eval",
+			classad:  `[name = "world"; result = eval("strcat(\"hello \", name)")]`,
+			attr:     "result",
+			expected: "hello world",
+		},
+		{
+			name:     "conditional expression",
+			classad:  `[x = 5; result = eval("x > 3 ? \"yes\" : \"no\"")]`,
+			attr:     "result",
+			expected: "yes",
+		},
+		{
+			name:     "list expression",
+			classad:  `[result = eval("{1, 2, 3}")]`,
+			attr:     "result",
+			expected: []int{1, 2, 3},
+		},
+		{
+			name:     "dynamic attribute name construction",
+			classad:  `[slot1 = 100; slot2 = 200; id = 1; attrname = strcat("slot", string(id)); result = eval(attrname)]`,
+			attr:     "result",
+			expected: int64(100),
+		},
+		{
+			name:     "nested eval",
+			classad:  `[x = 5; expr = "x + 10"; result = eval(expr)]`,
+			attr:     "result",
+			expected: int64(15),
+		},
+		{
+			name:     "arithmetic with multiple attributes",
+			classad:  `[a = 10; b = 20; c = 30; result = eval("a + b + c")]`,
+			attr:     "result",
+			expected: int64(60),
+		},
+		{
+			name:        "invalid expression string",
+			classad:     `[result = eval("this is not valid")]`,
+			attr:        "result",
+			expectError: true,
+		},
+		{
+			name:        "empty string",
+			classad:     `[result = eval("")]`,
+			attr:        "result",
+			expectError: true,
+		},
+		{
+			name:     "real number arithmetic",
+			classad:  `[x = 2.5; result = eval("x * 4.0")]`,
+			attr:     "result",
+			expected: 10.0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ad, err := Parse(tt.classad)
+			if err != nil {
+				t.Fatalf("Failed to parse: %v", err)
+			}
+			val := ad.EvaluateAttr(tt.attr)
+
+			if tt.expectError {
+				if !val.IsError() {
+					t.Errorf("Expected error, got %v", val.Type())
+				}
+				return
+			}
+
+			if tt.expectUndef {
+				if !val.IsUndefined() {
+					t.Errorf("Expected undefined, got %v", val.Type())
+				}
+				return
+			}
+
+			// Check the type and value based on expected
+			switch exp := tt.expected.(type) {
+			case int64:
+				if !val.IsInteger() {
+					t.Fatalf("Expected integer, got %v", val.Type())
+				}
+				result, _ := val.IntValue()
+				if result != exp {
+					t.Errorf("Expected %d, got %d", exp, result)
+				}
+			case float64:
+				if !val.IsReal() {
+					t.Fatalf("Expected real, got %v", val.Type())
+				}
+				result, _ := val.RealValue()
+				if result != exp {
+					t.Errorf("Expected %f, got %f", exp, result)
+				}
+			case string:
+				if !val.IsString() {
+					t.Fatalf("Expected string, got %v", val.Type())
+				}
+				result, _ := val.StringValue()
+				if result != exp {
+					t.Errorf("Expected %q, got %q", exp, result)
+				}
+			case bool:
+				if !val.IsBool() {
+					t.Fatalf("Expected bool, got %v", val.Type())
+				}
+				result, _ := val.BoolValue()
+				if result != exp {
+					t.Errorf("Expected %v, got %v", exp, result)
+				}
+			case []int:
+				if !val.IsList() {
+					t.Fatalf("Expected list, got %v", val.Type())
+				}
+				list, _ := val.ListValue()
+				if len(list) != len(exp) {
+					t.Errorf("Expected list length %d, got %d", len(exp), len(list))
+				}
+				for i, expectedVal := range exp {
+					if !list[i].IsInteger() {
+						t.Errorf("Element %d: expected integer, got %v", i, list[i].Type())
+						continue
+					}
+					actualVal, _ := list[i].IntValue()
+					if actualVal != int64(expectedVal) {
+						t.Errorf("Element %d: expected %d, got %d", i, expectedVal, actualVal)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestRegexp(t *testing.T) {
 	tests := []struct {
 		name     string

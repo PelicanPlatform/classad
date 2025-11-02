@@ -5,6 +5,7 @@ import (
 	"math"
 
 	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 // ValueType represents the type of a ClassAd value.
@@ -891,8 +892,108 @@ func (e *Evaluator) evaluateOr(left, right Value) Value {
 	return NewBoolValue(leftBool || rightBool)
 }
 
+// evaluateUnparse handles the unparse() function which returns the string representation
+// of an attribute's expression without evaluating it.
+// unparse(attribute_name) - Returns the unparsed expression string for the given attribute
+func (e *Evaluator) evaluateUnparse(args []ast.Expr) Value {
+	if len(args) != 1 {
+		return NewErrorValue()
+	}
+
+	// The argument should be an attribute reference
+	attrRef, ok := args[0].(*ast.AttributeReference)
+	if !ok {
+		return NewErrorValue()
+	}
+
+	// Determine which ClassAd to look up the attribute in based on scope
+	var targetClassAd *ClassAd
+	switch attrRef.Scope {
+	case ast.MyScope:
+		targetClassAd = e.classad
+	case ast.TargetScope:
+		if e.classad != nil {
+			targetClassAd = e.classad.target
+		}
+	case ast.ParentScope:
+		if e.classad != nil {
+			targetClassAd = e.classad.parent
+		}
+	default:
+		targetClassAd = e.classad
+	}
+
+	if targetClassAd == nil {
+		return NewUndefinedValue()
+	}
+
+	// Look up the attribute's expression (not evaluated)
+	expr := targetClassAd.lookupInternal(attrRef.Name)
+	if expr == nil {
+		return NewUndefinedValue()
+	}
+
+	// Return the string representation of the expression
+	return NewStringValue(expr.String())
+}
+
+// evaluateEval handles the eval() function which parses and evaluates a string expression
+// in the context of the current ClassAd.
+// eval(string_expr) - Parses the string as a ClassAd expression and evaluates it
+func (e *Evaluator) evaluateEval(args []ast.Expr) Value {
+	if len(args) != 1 {
+		return NewErrorValue()
+	}
+
+	// Evaluate the argument to get the string to parse
+	val := e.Evaluate(args[0])
+
+	if val.IsError() {
+		return NewErrorValue()
+	}
+	if val.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if !val.IsString() {
+		return NewErrorValue()
+	}
+
+	exprStr, _ := val.StringValue()
+
+	// The parser expects a full ClassAd, so we wrap the expression in a temporary attribute
+	// Parse it as "[__eval_tmp = <expression>]" and extract the expression
+	wrappedStr := "[__eval_tmp = " + exprStr + "]"
+
+	node, err := parser.Parse(wrappedStr)
+	if err != nil {
+		return NewErrorValue()
+	}
+
+	// The result should be a ClassAd
+	classAd, ok := node.(*ast.ClassAd)
+	if !ok || len(classAd.Attributes) != 1 {
+		return NewErrorValue()
+	}
+
+	// Extract the expression from the temporary attribute
+	expr := classAd.Attributes[0].Value
+
+	// Evaluate the expression in the current context
+	return e.Evaluate(expr)
+}
+
 // Built-in function evaluation
 func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
+	// Handle unparse() specially - it needs access to the raw AST and ClassAd context
+	if fc.Name == "unparse" {
+		return e.evaluateUnparse(fc.Args)
+	}
+
+	// Handle eval() specially - it needs to parse and evaluate in the current context
+	if fc.Name == "eval" {
+		return e.evaluateEval(fc.Args)
+	}
+
 	// Evaluate all arguments
 	args := make([]Value, len(fc.Args))
 	for i, arg := range fc.Args {
