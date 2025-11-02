@@ -94,6 +94,47 @@ if requirements, ok := jobAd.EvaluateAttrBool("Requirements"); ok {
 
 See [docs/EVALUATION_API.md](docs/EVALUATION_API.md) for complete API documentation.
 
+## Struct Marshaling
+
+The library supports marshaling Go structs to/from both ClassAd and JSON formats:
+
+```go
+// Define a struct with tags
+type Job struct {
+    ID       int      `classad:"JobId"`
+    Owner    string   `classad:"Owner"`
+    CPUs     int      `json:"cpus"`        // Falls back to json tag
+    Tags     []string `classad:"Tags,omitempty"`
+}
+
+// Marshal to ClassAd format
+job := Job{ID: 123, Owner: "alice", CPUs: 4, Tags: []string{"prod"}}
+classadStr, _ := classad.Marshal(job)
+// Result: [JobId = 123; Owner = "alice"; cpus = 4; Tags = {"prod"}]
+
+// Unmarshal from ClassAd format
+var job2 Job
+classad.Unmarshal(classadStr, &job2)
+
+// JSON marshaling with expression support
+ad, _ := classad.Parse(`[x = 5; y = x + 3]`)
+jsonBytes, _ := json.Marshal(ad)
+// Result: {"x":5,"y":"\/Expr(x + 3)\/"}
+
+// JSON unmarshaling
+var ad2 classad.ClassAd
+json.Unmarshal(jsonBytes, &ad2)
+```
+
+Features:
+- Struct tags: `classad:"name"` or falls back to `json:"name"`
+- Options: `omitempty`, `-` (skip field)
+- Nested structs and slices
+- Map support: `map[string]T`, `map[string]interface{}`
+- JSON expressions with `/Expr(...))/` format
+
+See [docs/MARSHALING.md](docs/MARSHALING.md) for complete marshaling documentation.
+
 ## Project Structure
 
 ```
@@ -122,13 +163,17 @@ golang-classads/
 │   ├── features_demo/    # Advanced features demo
 │   ├── reader_demo/      # Reader/iterator demo
 │   ├── range_demo/       # Go 1.23+ range-over-function demo
+│   ├── struct_demo/      # Struct marshaling examples
+│   ├── json_demo/        # JSON marshaling examples
 │   ├── simple_reader/    # CLI tool for reading ClassAd files
 │   ├── README.md     # Examples documentation
 │   ├── machine.ad
 │   ├── job.ad
 │   └── expressions.txt
 ├── docs/             # Documentation
-│   └── EVALUATION_API.md
+│   ├── EVALUATION_API.md       # API reference for evaluation
+│   ├── MARSHALING.md           # Struct marshaling guide (ClassAd & JSON)
+│   └── MARSHALING_QUICKREF.md  # Quick reference card
 ├── generate.go       # go generate directive
 ├── go.mod
 └── README.md

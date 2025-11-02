@@ -3,7 +3,9 @@
 package classad
 
 import (
+	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/parser"
@@ -932,4 +934,193 @@ func (c *ClassAd) evaluateUnaryOp(op string, operand Value) Value {
 		Expr: c.valueToExpr(operand),
 	}
 	return evaluator.Evaluate(tempOp)
+}
+
+// MarshalJSON implements the json.Marshaler interface for ClassAd.
+// ClassAds are serialized as JSON objects where:
+//   - Attribute names are JSON keys
+//   - Simple values (strings, numbers, booleans) are JSON values
+//   - Lists are JSON arrays
+//   - Nested ClassAds are JSON objects
+//   - Expressions are serialized as strings with the format "/Expr(<expression>)/"
+//     (which appears as "\/Expr(<expression>)\/" in JSON due to escaping)
+//
+// Example:
+//
+//	ad, _ := classad.Parse(`[x = 5; y = x + 3; name = "test"]`)
+//	jsonBytes, _ := json.Marshal(ad)
+//	// {"name":"test","x":5,"y":"\/Expr(x + 3)\/"}
+func (c *ClassAd) MarshalJSON() ([]byte, error) {
+	if c.ad == nil {
+		return []byte("{}"), nil
+	}
+
+	result := make(map[string]interface{})
+	for _, attr := range c.ad.Attributes {
+		value, err := c.marshalValue(attr.Value)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal attribute %s: %w", attr.Name, err)
+		}
+		result[attr.Name] = value
+	}
+
+	jsonBytes, err := json.Marshal(result)
+	if err != nil {
+		return nil, err
+	}
+
+	// Post-process to escape forward slashes in /Expr(...)/ patterns
+	// Go's json.Marshal doesn't escape / by default, but we prefer \/ for expressions
+	jsonBytes = []byte(strings.ReplaceAll(string(jsonBytes), "\"/Expr(", "\"\\/Expr("))
+	jsonBytes = []byte(strings.ReplaceAll(string(jsonBytes), ")/\"", ")\\/\""))
+
+	return jsonBytes, nil
+}
+
+// marshalValue converts an AST expression to a JSON-serializable value.
+// Simple literals are converted directly, complex expressions are wrapped.
+func (c *ClassAd) marshalValue(expr ast.Expr) (interface{}, error) {
+	switch v := expr.(type) {
+	case *ast.IntegerLiteral:
+		return v.Value, nil
+	case *ast.RealLiteral:
+		return v.Value, nil
+	case *ast.StringLiteral:
+		return v.Value, nil
+	case *ast.BooleanLiteral:
+		return v.Value, nil
+	case *ast.UndefinedLiteral:
+		return nil, nil
+	case *ast.ListLiteral:
+		list := make([]interface{}, len(v.Elements))
+		for i, elem := range v.Elements {
+			val, err := c.marshalValue(elem)
+			if err != nil {
+				return nil, err
+			}
+			list[i] = val
+		}
+		return list, nil
+	case *ast.RecordLiteral:
+		// Nested ClassAd
+		nested := &ClassAd{ad: v.ClassAd}
+		nestedMap := make(map[string]interface{})
+		for _, attr := range v.ClassAd.Attributes {
+			val, err := nested.marshalValue(attr.Value)
+			if err != nil {
+				return nil, err
+			}
+			nestedMap[attr.Name] = val
+		}
+		return nestedMap, nil
+	default:
+		// Complex expression - serialize as string with special markers
+		// Format: /Expr(<expression>)/
+		exprStr := expr.String()
+		return fmt.Sprintf("/Expr(%s)/", exprStr), nil
+	}
+}
+
+// UnmarshalJSON implements the json.Unmarshaler interface for ClassAd.
+// Deserializes JSON into a ClassAd, handling the special expression format.
+// Strings matching the pattern "/Expr(<expression>)/" are parsed as expressions.
+// Note: When unmarshaling from JSON, the Go json package automatically unescapes
+// "\/Expr(...)\/" to "/Expr(...)/" so only the unescaped format is checked.
+//
+// Example:
+//
+//	jsonStr := `{"name":"test","x":5,"y":"\/Expr(x + 3)\/"}`
+//	var ad ClassAd
+//	json.Unmarshal([]byte(jsonStr), &ad)
+func (c *ClassAd) UnmarshalJSON(data []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	attributes := make([]*ast.AttributeAssignment, 0, len(raw))
+	for name, value := range raw {
+		expr, err := c.unmarshalValue(value)
+		if err != nil {
+			return fmt.Errorf("failed to unmarshal attribute %s: %w", name, err)
+		}
+		attributes = append(attributes, &ast.AttributeAssignment{
+			Name:  name,
+			Value: expr,
+		})
+	}
+
+	c.ad = &ast.ClassAd{Attributes: attributes}
+	return nil
+}
+
+// unmarshalValue converts a JSON value back into an AST expression.
+func (c *ClassAd) unmarshalValue(value interface{}) (ast.Expr, error) {
+	switch v := value.(type) {
+	case nil:
+		return &ast.UndefinedLiteral{}, nil
+	case bool:
+		return &ast.BooleanLiteral{Value: v}, nil
+	case float64:
+		// JSON numbers are always float64
+		// Check if it's actually an integer
+		if v == float64(int64(v)) {
+			return &ast.IntegerLiteral{Value: int64(v)}, nil
+		}
+		return &ast.RealLiteral{Value: v}, nil
+	case string:
+		// Check if it's an expression string
+		// Only accept the format /Expr(...)/
+		if strings.HasPrefix(v, "/Expr(") && strings.HasSuffix(v, ")/") {
+			exprStr := v[6 : len(v)-2] // Remove "/Expr(" and ")/"
+			return c.parseExpression(exprStr)
+		}
+		// Regular string literal
+		return &ast.StringLiteral{Value: v}, nil
+	case []interface{}:
+		// JSON array -> ListLiteral
+		elements := make([]ast.Expr, len(v))
+		for i, elem := range v {
+			expr, err := c.unmarshalValue(elem)
+			if err != nil {
+				return nil, err
+			}
+			elements[i] = expr
+		}
+		return &ast.ListLiteral{Elements: elements}, nil
+	case map[string]interface{}:
+		// JSON object -> RecordLiteral (nested ClassAd)
+		attributes := make([]*ast.AttributeAssignment, 0, len(v))
+		for name, val := range v {
+			expr, err := c.unmarshalValue(val)
+			if err != nil {
+				return nil, err
+			}
+			attributes = append(attributes, &ast.AttributeAssignment{
+				Name:  name,
+				Value: expr,
+			})
+		}
+		return &ast.RecordLiteral{
+			ClassAd: &ast.ClassAd{Attributes: attributes},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported JSON value type: %T", value)
+	}
+}
+
+// parseExpression parses an expression string into an AST expression.
+func (c *ClassAd) parseExpression(exprStr string) (ast.Expr, error) {
+	// Wrap in a temporary ClassAd for parsing
+	wrapped := fmt.Sprintf("[__tmp__ = %s]", exprStr)
+	node, err := parser.Parse(wrapped)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse expression %q: %w", exprStr, err)
+	}
+
+	if ad, ok := node.(*ast.ClassAd); ok && len(ad.Attributes) == 1 {
+		return ad.Attributes[0].Value, nil
+	}
+
+	return nil, fmt.Errorf("unable to extract expression from parsed result")
 }
