@@ -965,6 +965,100 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	case "ifThenElse":
 		return builtinIfThenElse(args)
 
+	// Type conversion functions
+	case "string":
+		return builtinString(args)
+	case "bool":
+		return builtinBool(args)
+
+	// Math functions
+	case "pow":
+		return builtinPow(args)
+	case "quantize":
+		return builtinQuantize(args)
+
+	// List aggregation functions
+	case "sum":
+		return builtinSum(args)
+	case "avg":
+		return builtinAvg(args)
+	case "min":
+		return builtinMin(args)
+	case "max":
+		return builtinMax(args)
+
+	// String manipulation functions
+	case "join":
+		return builtinJoin(args)
+	case "split":
+		return builtinSplit(args)
+	case "splitUserName":
+		return builtinSplitUserName(args)
+	case "splitSlotName":
+		return builtinSplitSlotName(args)
+	case "strcmp":
+		return builtinStrcmp(args)
+	case "stricmp":
+		return builtinStricmp(args)
+
+	// Version comparison functions
+	case "versioncmp":
+		return builtinVersioncmp(args)
+	case "version_gt":
+		return builtinVersionGT(args)
+	case "version_ge":
+		return builtinVersionGE(args)
+	case "version_lt":
+		return builtinVersionLT(args)
+	case "version_le":
+		return builtinVersionLE(args)
+	case "version_eq":
+		return builtinVersionEQ(args)
+	case "version_in_range":
+		return builtinVersionInRange(args)
+
+	// Time formatting functions
+	case "formatTime":
+		return builtinFormatTime(args)
+	case "interval":
+		return builtinInterval(args)
+
+	// List comparison functions
+	case "identicalMember":
+		return builtinIdenticalMember(args)
+	case "anyCompare":
+		return builtinAnyCompare(args)
+	case "allCompare":
+		return builtinAllCompare(args)
+
+	// StringList functions
+	case "stringListSize":
+		return builtinStringListSize(args)
+	case "stringListSum":
+		return builtinStringListSum(args)
+	case "stringListAvg":
+		return builtinStringListAvg(args)
+	case "stringListMin":
+		return builtinStringListMin(args)
+	case "stringListMax":
+		return builtinStringListMax(args)
+	case "stringListsIntersect":
+		return builtinStringListsIntersect(args)
+	case "stringListSubsetMatch":
+		return builtinStringListSubsetMatch(args)
+	case "stringListRegexpMember":
+		return builtinStringListRegexpMember(args)
+
+	// Regex functions
+	case "regexpMember":
+		return builtinRegexpMember(args)
+	case "regexps":
+		return builtinRegexps(args)
+	case "replace":
+		return builtinReplace(args)
+	case "replaceAll":
+		return builtinReplaceAll(args)
+
 	default:
 		// Unknown function
 		return NewErrorValue()
