@@ -70,6 +70,67 @@ func TestStringListMember(t *testing.T) {
 	}
 }
 
+func TestStringListIMember(t *testing.T) {
+	tests := []struct {
+		name     string
+		expr     string
+		expected bool
+	}{
+		{
+			name:     "case insensitive match lowercase",
+			expr:     `stringListIMember("apple", "Apple,Banana,Cherry")`,
+			expected: true,
+		},
+		{
+			name:     "case insensitive match uppercase",
+			expr:     `stringListIMember("BANANA", "apple,banana,cherry")`,
+			expected: true,
+		},
+		{
+			name:     "case insensitive match mixed",
+			expr:     `stringListIMember("BaNaNa", "apple,banana,cherry")`,
+			expected: true,
+		},
+		{
+			name:     "no match",
+			expr:     `stringListIMember("grape", "apple,banana,cherry")`,
+			expected: false,
+		},
+		{
+			name:     "match with spaces",
+			expr:     `stringListIMember("APPLE", "apple, banana, cherry")`,
+			expected: true,
+		},
+		{
+			name:     "empty list",
+			expr:     `stringListIMember("apple", "")`,
+			expected: false,
+		},
+		{
+			name:     "single element match",
+			expr:     `stringListIMember("APPLE", "apple")`,
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ad, err := Parse("[test = " + tt.expr + "]")
+			if err != nil {
+				t.Fatalf("Failed to parse: %v", err)
+			}
+			val := ad.EvaluateAttr("test")
+			if !val.IsBool() {
+				t.Fatalf("Expected bool, got %v", val.Type())
+			}
+			result, _ := val.BoolValue()
+			if result != tt.expected {
+				t.Errorf("Expected %v, got %v", tt.expected, result)
+			}
+		})
+	}
+}
+
 func TestRegexp(t *testing.T) {
 	tests := []struct {
 		name     string

@@ -44,6 +44,7 @@ func main() {
 		avg = stringListAvg(list1);
 		min = stringListMin(list1);
 		max = stringListMax(list1);
+		has_apple = stringListIMember("APPLE", list2);
 	]`
 
 	classAd2, err := classad.Parse(ad2)
@@ -56,12 +57,14 @@ func main() {
 	avg := classAd2.EvaluateAttr("avg")
 	min := classAd2.EvaluateAttr("min")
 	max := classAd2.EvaluateAttr("max")
+	hasApple := classAd2.EvaluateAttr("has_apple")
 
 	fmt.Printf("  stringListSize(\"10,20,30,40,50\") = %v\n", size)
 	fmt.Printf("  stringListSum(\"10,20,30,40,50\") = %v\n", sum)
 	fmt.Printf("  stringListAvg(\"10,20,30,40,50\") = %v\n", avg)
 	fmt.Printf("  stringListMin(\"10,20,30,40,50\") = %v\n", min)
-	fmt.Printf("  stringListMax(\"10,20,30,40,50\") = %v\n\n", max)
+	fmt.Printf("  stringListMax(\"10,20,30,40,50\") = %v\n", max)
+	fmt.Printf("  stringListIMember(\"APPLE\", \"apple,banana,cherry\") = %v (case-insensitive)\n\n", hasApple)
 
 	// StringList set operations
 	fmt.Println("3. StringList Set Operations")

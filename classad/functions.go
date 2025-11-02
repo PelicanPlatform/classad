@@ -488,6 +488,18 @@ func builtinStringListMember(args []Value) Value {
 	return NewBoolValue(false)
 }
 
+// builtinStringListIMember is a convenience wrapper for stringListMember with case-insensitive matching.
+// stringListIMember(string item, string list)
+// Returns true if item is in list (case-insensitive), false otherwise
+func builtinStringListIMember(args []Value) Value {
+	if len(args) != 2 {
+		return NewErrorValue()
+	}
+
+	// Call stringListMember with "i" option for case-insensitive matching
+	return builtinStringListMember([]Value{args[0], args[1], NewStringValue("i")})
+}
+
 // builtinRegexp checks if a string matches a regular expression
 // regexp(string pattern, string target [, string options])
 // Options can contain:

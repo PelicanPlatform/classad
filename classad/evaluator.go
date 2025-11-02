@@ -956,6 +956,8 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinMember(args)
 	case "stringListMember":
 		return builtinStringListMember(args)
+	case "stringListIMember":
+		return builtinStringListIMember(args)
 
 	// Pattern matching functions
 	case "regexp":
