@@ -5,6 +5,7 @@ package classad
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -418,6 +419,135 @@ func (c *ClassAd) lookupInternal(name string) ast.Expr {
 		}
 	}
 	return nil
+}
+
+// Set is a generic method that accepts any Go value and inserts it as an attribute.
+// This provides a more idiomatic alternative to the type-specific Insert* methods.
+// Supported types: int/int64/etc., float64, string, bool, []T, *ClassAd, *Expr, and structs.
+//
+// Example:
+//
+//	ad := classad.New()
+//	ad.Set("cpus", 4)                    // int
+//	ad.Set("name", "job-1")              // string
+//	ad.Set("price", 3.14)                // float64
+//	ad.Set("enabled", true)              // bool
+//	ad.Set("tags", []string{"a", "b"})   // slice
+//	ad.Set("config", nestedClassAd)      // *ClassAd
+func (c *ClassAd) Set(name string, value any) error {
+	if value == nil {
+		c.Insert(name, &ast.UndefinedLiteral{})
+		return nil
+	}
+
+	val := reflect.ValueOf(value)
+
+	// Handle special types first
+	switch v := value.(type) {
+	case *ClassAd:
+		c.InsertAttrClassAd(name, v)
+		return nil
+	case *Expr:
+		c.InsertExpr(name, v)
+		return nil
+	case int64:
+		c.InsertAttr(name, v)
+		return nil
+	case float64:
+		c.InsertAttrFloat(name, v)
+		return nil
+	case string:
+		c.InsertAttrString(name, v)
+		return nil
+	case bool:
+		c.InsertAttrBool(name, v)
+		return nil
+	}
+
+	// Handle other integer types
+	switch val.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32:
+		c.InsertAttr(name, val.Int())
+		return nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		c.InsertAttr(name, int64(val.Uint()))
+		return nil
+	case reflect.Float32:
+		c.InsertAttrFloat(name, val.Float())
+		return nil
+	}
+
+	// Try to marshal the value using the struct marshaling logic
+	expr, err := marshalValue(val)
+	if err != nil {
+		return fmt.Errorf("failed to marshal value of type %T: %w", value, err)
+	}
+	c.Insert(name, expr)
+	return nil
+}
+
+// GetAs retrieves and evaluates an attribute, converting it to the specified type.
+// This is a type-safe generic getter that handles type conversions automatically.
+// Returns the zero value and false if the attribute doesn't exist or conversion fails.
+//
+// Example:
+//
+//	cpus, ok := classad.GetAs[int](ad, "cpus")
+//	name, ok := classad.GetAs[string](ad, "name")
+//	price, ok := classad.GetAs[float64](ad, "price")
+//	tags, ok := classad.GetAs[[]string](ad, "tags")
+//	config, ok := classad.GetAs[*classad.ClassAd](ad, "config")
+func GetAs[T any](c *ClassAd, name string) (T, bool) {
+	var zero T
+
+	// Special case for *Expr - return unevaluated expression
+	if _, isExpr := any(zero).(*Expr); isExpr {
+		expr, ok := c.Lookup(name)
+		if !ok {
+			return zero, false
+		}
+		// Safe type assertion since we checked isExpr above
+		result, ok := any(expr).(T)
+		if !ok {
+			return zero, false
+		}
+		return result, true
+	}
+
+	// For other types, evaluate the attribute
+	val := c.EvaluateAttr(name)
+	if val.IsUndefined() {
+		return zero, false
+	}
+
+	// Try to unmarshal into the target type
+	target := reflect.New(reflect.TypeOf(zero)).Elem()
+	if err := unmarshalValueInto(val, target); err != nil {
+		return zero, false
+	}
+
+	// Safe type assertion since unmarshalValueInto ensures type compatibility
+	result, ok := target.Interface().(T)
+	if !ok {
+		return zero, false
+	}
+	return result, true
+}
+
+// GetOr retrieves and evaluates an attribute with a default value.
+// If the attribute doesn't exist or conversion fails, returns the default value.
+// This is a type-safe generic getter with fallback.
+//
+// Example:
+//
+//	cpus := classad.GetOr(ad, "cpus", 1)           // Defaults to 1
+//	name := classad.GetOr(ad, "name", "unknown")   // Defaults to "unknown"
+//	timeout := classad.GetOr(ad, "timeout", 300)   // Defaults to 300
+func GetOr[T any](c *ClassAd, name string, defaultValue T) T {
+	if value, ok := GetAs[T](c, name); ok {
+		return value
+	}
+	return defaultValue
 }
 
 // Delete removes an attribute from the ClassAd.
