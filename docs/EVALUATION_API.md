@@ -315,12 +315,12 @@ newAd.Set("Memory", 8192)
 
 // Copy the StandardReq expression
 if req, ok := template.Lookup("StandardReq"); ok {
-    newAd.InsertExpr("Requirements", req)
+    newAd.Set("Requirements", req)
 }
 
 // Copy the ResourceScore expression
 if score, ok := template.Lookup("ResourceScore"); ok {
-    newAd.InsertExpr("Score", score)
+    newAd.Set("Score", score)
 }
 
 // Evaluate in new context with modern API
@@ -490,19 +490,22 @@ ClassAds support scoped attribute references for accessing attributes in related
 ```go
 // Create a job and machine ClassAd
 job := classad.New()
-job.InsertAttr("Cpus", 2)
-job.InsertAttr("Memory", 2048)
-job.InsertAttrString("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+job.Set("Cpus", 2)
+job.Set("Memory", 2048)
+
+// Insert Requirements as an expression, not a string
+reqExpr, _ := classad.ParseExpr("TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+job.Set("Requirements", reqExpr)
 
 machine := classad.New()
-machine.InsertAttr("Cpus", 4)
-machine.InsertAttr("Memory", 8192)
+machine.Set("Cpus", 4)
+machine.Set("Memory", 8192)
 
 // Set target to enable TARGET.* references
 job.SetTarget(machine)
 
 // Evaluate Requirements with TARGET references
-if requirements, ok := job.EvaluateAttrBool("Requirements"); ok {
+if requirements, ok := classad.GetAs[bool](job, "Requirements"); ok {
     fmt.Printf("Match: %v\n", requirements)  // true
 }
 ```
@@ -794,10 +797,10 @@ ad, _ := classad.Parse(`[
     deptLoc = employee.department.location
 ]`)
 
-// Access values
-name, _ := ad.EvaluateAttrString("empName")           // "Alice"
-dept, _ := ad.EvaluateAttrString("deptName")          // "Engineering"
-location, _ := ad.EvaluateAttrString("deptLoc")       // "Building A"
+// Access values with modern API
+name := classad.GetOr(ad, "empName", "")              // "Alice"
+dept := classad.GetOr(ad, "deptName", "")             // "Engineering"
+location := classad.GetOr(ad, "deptLoc", "")          // "Building A"
 ```
 
 **Behavior:**
@@ -823,9 +826,10 @@ ad, _ := classad.Parse(`[
     element = matrix[1][2]
 ]`)
 
-first, _ := ad.EvaluateAttrString("first")    // "apple"
-third, _ := ad.EvaluateAttrString("third")    // "cherry"
-element, _ := ad.EvaluateAttrInt("element")   // 6
+// Access with modern API
+first := classad.GetOr(ad, "first", "")      // "apple"
+third := classad.GetOr(ad, "third", "")      // "cherry"
+element := classad.GetOr(ad, "element", 0)   // 6
 ```
 
 ### ClassAd Subscripting
@@ -839,8 +843,9 @@ ad, _ := classad.Parse(`[
     personAge = person["age"]
 ]`)
 
-name, _ := ad.EvaluateAttrString("personName")  // "Bob"
-age, _ := ad.EvaluateAttrInt("personAge")       // 30
+// Access with modern API
+name := classad.GetOr(ad, "personName", "")  // "Bob"
+age := classad.GetOr(ad, "personAge", 0)     // 30
 ```
 
 ### Combined Selection and Subscripting
@@ -862,10 +867,6 @@ ad, _ := classad.Parse(`[
 // Modern API
 name := classad.GetOr(ad, "firstEmpName", "")        // "Alice"
 salary := classad.GetOr(ad, "secondSalary", 0)       // 95000
-
-// Traditional API
-name, _ := ad.EvaluateAttrString("firstEmpName")    // "Alice"
-salary, _ := ad.EvaluateAttrInt("secondSalary")     // 95000
 ```
 
 **Subscript Behavior:**
@@ -886,12 +887,17 @@ import "github.com/PelicanPlatform/classad/classad"
 job := classad.New()
 job.Set("Cpus", 2)
 job.Set("Memory", 2048)
-job.Set("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+
+// Insert Requirements as expressions
+jobReq, _ := classad.ParseExpr("TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+job.Set("Requirements", jobReq)
 
 machine := classad.New()
 machine.Set("Cpus", 4)
 machine.Set("Memory", 8192)
-machine.Set("Requirements", "TARGET.Cpus <= MY.Cpus && TARGET.Memory <= MY.Memory")
+
+machineReq, _ := classad.ParseExpr("TARGET.Cpus <= MY.Cpus && TARGET.Memory <= MY.Memory")
+machine.Set("Requirements", machineReq)
 
 // Create MatchClassAd - automatically sets up TARGET references
 matchAd := classad.NewMatchClassAd(job, machine)
@@ -934,7 +940,8 @@ After matching, you can evaluate rank expressions to prioritize matches:
 
 ```go
 // Evaluate rank from the left side's perspective
-job.InsertAttrString("Rank", "TARGET.Memory * 2 + TARGET.Cpus")
+rankExpr, _ := classad.ParseExpr("TARGET.Memory * 2 + TARGET.Cpus")
+job.Set("Rank", rankExpr)
 leftRank := matchAd.EvaluateRankLeft("Rank")
 if leftRank.IsReal() {
     rank, _ := leftRank.RealValue()
@@ -942,7 +949,8 @@ if leftRank.IsReal() {
 }
 
 // Evaluate rank from the right side's perspective
-machine.InsertAttrString("Rank", "1000 / TARGET.Memory")
+machineRankExpr, _ := classad.ParseExpr("1000 / TARGET.Memory")
+machine.Set("Rank", machineRankExpr)
 rightRank := matchAd.EvaluateRankRight("Rank")
 ```
 
@@ -959,16 +967,25 @@ job := classad.New()
 job.Set("Cpus", 2)
 job.Set("Memory", 2048)
 job.Set("Owner", "alice")
-job.Set("Requirements", "TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
-job.Set("Rank", "TARGET.Memory")  // Prefer more memory
+
+// Insert Requirements and Rank as expressions
+jobReq, _ := classad.ParseExpr("TARGET.Cpus >= MY.Cpus && TARGET.Memory >= MY.Memory")
+job.Set("Requirements", jobReq)
+
+jobRank, _ := classad.ParseExpr("TARGET.Memory")  // Prefer more memory
+job.Set("Rank", jobRank)
 
 // Machine ClassAd with modern API
 machine := classad.New()
 machine.Set("Cpus", 4)
 machine.Set("Memory", 8192)
 machine.Set("Name", "slot1@worker1")
-machine.Set("Requirements", "TARGET.Cpus <= MY.Cpus")
-machine.Set("Rank", "1000 - TARGET.Memory")  // Prefer lighter jobs
+
+machineReq, _ := classad.ParseExpr("TARGET.Cpus <= MY.Cpus")
+machine.Set("Requirements", machineReq)
+
+machineRank, _ := classad.ParseExpr("1000 - TARGET.Memory")  // Prefer lighter jobs
+machine.Set("Rank", machineRank)
 
 // Create MatchClassAd and check match
 matchAd := classad.NewMatchClassAd(job, machine)
@@ -1253,8 +1270,8 @@ reqExpr, _ := classad.ParseExpr("Cpus >= RequestCpus && Memory >= RequestMemory 
 
 // Check what the job needs to provide
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
-job.InsertAttr("RequestMemory", 2048)
+job.Set("RequestCpus", 4)
+job.Set("RequestMemory", 2048)
 
 // Find what's missing from the job
 jobMissing := job.ExternalRefs(reqExpr)
@@ -1262,9 +1279,9 @@ jobMissing := job.ExternalRefs(reqExpr)
 
 // These must come from the machine ClassAd
 machine := classad.New()
-machine.InsertAttr("Cpus", 8)
-machine.InsertAttr("Memory", 16384)
-machine.InsertAttr("Arch", "x86_64")
+machine.Set("Cpus", 8)
+machine.Set("Memory", 16384)
+machine.Set("Arch", "x86_64")
 
 // Validate machine has everything needed
 machineMissing := machine.ExternalRefs(reqExpr)
@@ -1284,8 +1301,8 @@ Performs partial evaluation of an expression, replacing references to defined at
 ```go
 expr, _ := classad.ParseExpr("RequestCpus * 1000 + RequestMemory / 1024 + Unknown")
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
-job.InsertAttr("RequestMemory", 8192)
+job.Set("RequestCpus", 4)
+job.Set("RequestMemory", 8192)
 
 flattened := job.Flatten(expr)
 // Original:  (((RequestCpus * 1000) + (RequestMemory / 1024)) + Unknown)
@@ -1374,8 +1391,8 @@ import (
 func main() {
     // Create a job ClassAd
     job := classad.New()
-    job.InsertAttr("RequestCpus", 4)
-    job.InsertAttr("RequestMemory", 2048)
+    job.Set("RequestCpus", 4)
+    job.Set("RequestMemory", 2048)
 
     // Parse a complex requirement
     req, _ := classad.ParseExpr(`
@@ -1411,10 +1428,10 @@ func main() {
 
     // Create machine ClassAd
     machine := classad.New()
-    machine.InsertAttr("Cpus", 8)
-    machine.InsertAttr("Memory", 16384)
-    machine.InsertAttr("Arch", "x86_64")
-    machine.InsertAttr("OpSys", "LINUX")
+    machine.Set("Cpus", 8)
+    machine.Set("Memory", 16384)
+    machine.Set("Arch", "x86_64")
+    machine.Set("OpSys", "LINUX")
 
     // Evaluate optimized expression
     result := machine.EvaluateExprWithTarget(flattened, job)

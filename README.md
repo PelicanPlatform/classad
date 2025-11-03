@@ -94,7 +94,7 @@ if cpus, ok := classad.GetAs[int](jobAd, "Cpus"); ok {
 owner := classad.GetOr(jobAd, "Owner", "unknown")
 fmt.Printf("Owner: %s\n", owner)
 
-// Traditional evaluation methods still available
+// Complex expressions are evaluated automatically
 if requirements, ok := jobAd.EvaluateAttrBool("Requirements"); ok {
     fmt.Printf("Requirements = %v\n", requirements)
 }
@@ -135,8 +135,6 @@ tags := classad.GetOr(ad, "Tags", []string{"default"})
 // Type conversions happen automatically where safe
 cpusFloat := classad.GetOr(ad, "Cpus", 0.0)  // int -> float64
 ```
-
-The generic API is recommended for new code. Traditional methods like `EvaluateAttrInt()`, `InsertAttr()`, etc. remain available for compatibility.
 
 See [examples/generic_api_demo](examples/generic_api_demo/) for comprehensive examples.
 
@@ -307,60 +305,6 @@ func main() {
 }
 ```
 
-Using the traditional API (still supported):
-
-```go
-package main
-
-import (
-    "fmt"
-    "github.com/PelicanPlatform/classad/classad"
-)
-
-func main() {
-    // Parse a ClassAd
-    ad, err := classad.Parse(`[
-        Cpus = 4;
-        Memory = 8192;
-        Requirements = (Cpus >= 2) && (Memory >= 4096)
-    ]`)
-    if err != nil {
-        fmt.Println("Error:", err)
-        return
-    }
-
-    // Evaluate attributes
-    if cpus, ok := ad.EvaluateAttrInt("Cpus"); ok {
-        fmt.Printf("Cpus: %d\n", cpus)
-    }
-
-    if req, ok := ad.EvaluateAttrBool("Requirements"); ok {
-        fmt.Printf("Requirements: %v\n", req)
-    }
-}
-```
-
-Using the lower-level parser directly:
-
-```go
-package main
-
-import (
-    "fmt"
-    "github.com/PelicanPlatform/classad/parser"
-)
-
-func main() {
-    input := "[x = 10; y = x + 5]"
-    result, err := parser.Parse(input)
-    if err != nil {
-        fmt.Println("Error:", err)
-        return
-    }
-    fmt.Println(result.String())
-}
-```
-
 ### Working with Expressions
 
 The library provides a powerful Expression API for working with unevaluated expressions:
@@ -374,8 +318,8 @@ if err != nil {
 
 // Evaluate it in a ClassAd context
 ad := classad.New()
-ad.InsertAttr("Cpus", 8)
-ad.InsertAttr("Memory", 16384)
+ad.Set("Cpus", 8)
+ad.Set("Memory", 16384)
 
 result := expr.Eval(ad)
 if value, ok := result.IntValue(); ok {
@@ -387,22 +331,22 @@ sourceAd, _ := classad.Parse("[Formula = Cpus * 2]")
 if formula, ok := sourceAd.Lookup("Formula"); ok {
     // Copy expression to another ClassAd
     targetAd := classad.New()
-    targetAd.InsertAttr("Cpus", 16)
+    targetAd.Set("Cpus", 16)
     targetAd.InsertExpr("Computation", formula)
 
-    if value, ok := targetAd.EvaluateAttrInt("Computation"); ok {
+    if value, ok := classad.GetAs[int](targetAd, "Computation"); ok {
         fmt.Printf("Computed: %d\n", value)  // Computed: 32
     }
 }
 
 // Scoped evaluation with MY and TARGET contexts
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
-job.InsertAttr("RequestMemory", 8192)
+job.Set("RequestCpus", 4)
+job.Set("RequestMemory", 8192)
 
 machine := classad.New()
-machine.InsertAttr("Cpus", 8)
-machine.InsertAttr("Memory", 16384)
+machine.Set("Cpus", 8)
+machine.Set("Memory", 16384)
 
 // Parse requirements with MY and TARGET references
 reqExpr, _ := classad.ParseExpr("MY.RequestCpus <= TARGET.Cpus && MY.RequestMemory <= TARGET.Memory")
@@ -445,7 +389,7 @@ oldFormat := ad.MarshalOld()
 ```go
 expr, _ := classad.ParseExpr("RequestCpus * 1000 + Memory / 1024")
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
+job.Set("RequestCpus", 4)
 
 missing := job.ExternalRefs(expr)
 // Returns: ["Memory"]
@@ -463,8 +407,8 @@ defined := job.InternalRefs(expr)
 ```go
 expr, _ := classad.ParseExpr("RequestCpus * 1000 + Memory / 1024 + Unknown")
 job := classad.New()
-job.InsertAttr("RequestCpus", 4)
-job.InsertAttr("Memory", 8192)
+job.Set("RequestCpus", 4)
+job.Set("Memory", 8192)
 
 flattened := job.Flatten(expr)
 // Returns expression: (4008 + Unknown)
@@ -479,46 +423,67 @@ See [examples/introspection_demo](examples/introspection_demo/main.go) for compr
 
 ### Examples
 
-Run the comprehensive API demo:
+The `examples/` directory contains several demonstration programs showcasing different aspects of the library:
 
+#### Getting Started Examples
+
+**Generic API Demo** - Modern idiomatic Go API:
+```bash
+go run ./examples/generic_api_demo/main.go
+```
+Demonstrates the recommended `Set()`, `GetAs[T]()`, and `GetOr[T]()` APIs with type safety.
+
+**API Demo** - Comprehensive API overview:
 ```bash
 go run ./examples/api_demo/main.go
 ```
+Shows creating ClassAds, parsing, evaluating expressions, type-safe attribute access, arithmetic/logical operations, and real-world scenarios.
 
-This demonstrates:
-- Creating ClassAds programmatically
-- Parsing ClassAd strings
-- Evaluating expressions
-- Type-safe attribute access
-- Arithmetic, comparison, and logical operations
-- Conditional expressions
-- Modifying ClassAds
-- Real-world HTCondor scenarios
+**Reader Demo** - Reading multiple ClassAds:
+```bash
+go run ./examples/reader_demo/main.go
+```
+Demonstrates reading ClassAds from various sources using the Reader API and filtering.
 
-Run the advanced features demo:
+**Range Demo** - Go 1.23+ iterators:
+```bash
+go run ./examples/range_demo/main.go
+```
+Shows modern range-over-function patterns for iterating ClassAds.
 
+#### Advanced Examples
+
+**Features Demo** - Advanced ClassAd features:
 ```bash
 go run ./examples/features_demo/main.go
 ```
+Demonstrates nested ClassAds, IS/ISNT operators, built-in functions (string, math, type checking), list operations, and job matching.
 
-This demonstrates:
-- Nested ClassAds and lists
-- IS/ISNT operators (strict identity checking)
-- Built-in string functions (strcat, substr, toUpper, toLower, size)
-- Built-in math functions (floor, ceiling, round, int, real, random)
-- Built-in type checking functions (isString, isInteger, isList, etc.)
-- List operations (member, size)
-- HTCondor job matching simulation
+**Expression Demo** - Working with unevaluated expressions:
+```bash
+go run ./examples/expr_demo/main.go
+```
+Shows parsing expressions, evaluation in contexts, copying expressions between ClassAds, and scoped evaluation with MY/TARGET.
 
-See [examples/README.md](examples/README.md) for detailed examples and usage patterns.
-- Creating ClassAds programmatically
-- Parsing ClassAd strings
-- Evaluating expressions
-- Type-safe attribute access
-- Arithmetic, comparison, and logical operations
-- Conditional expressions
-- Modifying ClassAds
-- Real-world HTCondor scenarios
+**Introspection Demo** - Expression analysis and optimization:
+```bash
+go run ./examples/introspection_demo/main.go
+```
+Demonstrates dependency analysis, partial evaluation (Flatten), and expression utilities.
+
+**Struct Demo** - Marshaling Go structs:
+```bash
+go run ./examples/struct_demo/main.go
+```
+Shows marshaling/unmarshaling between Go structs and ClassAd format using struct tags.
+
+**JSON Demo** - JSON serialization:
+```bash
+go run ./examples/json_demo/main.go
+```
+Demonstrates JSON marshaling/unmarshaling with special `/Expr(...)/` syntax for expressions.
+
+See [examples/README.md](examples/README.md) for detailed documentation of all examples.
 
 ### Command-Line Tool
 
