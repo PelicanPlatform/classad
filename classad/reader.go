@@ -83,9 +83,10 @@ func (r *Reader) nextNew() bool {
 
 			// Count brackets to handle nested ClassAds
 			for _, ch := range line {
-				if ch == '[' {
+				switch ch {
+				case '[':
 					bracketDepth++
-				} else if ch == ']' {
+				case ']':
 					bracketDepth--
 				}
 			}

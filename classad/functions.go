@@ -1742,31 +1742,32 @@ func builtinIdenticalMember(args []Value) Value {
 			continue
 		}
 
-		if args[0].valueType == IntegerValue {
+		switch args[0].valueType {
+		case IntegerValue:
 			v1, _ := args[0].IntValue()
 			v2, _ := item.IntValue()
 			if v1 == v2 {
 				return NewBoolValue(true)
 			}
-		} else if args[0].valueType == RealValue {
+		case RealValue:
 			v1, _ := args[0].RealValue()
 			v2, _ := item.RealValue()
 			if v1 == v2 {
 				return NewBoolValue(true)
 			}
-		} else if args[0].valueType == StringValue {
+		case StringValue:
 			v1, _ := args[0].StringValue()
 			v2, _ := item.StringValue()
 			if v1 == v2 {
 				return NewBoolValue(true)
 			}
-		} else if args[0].valueType == BooleanValue {
+		case BooleanValue:
 			v1, _ := args[0].BoolValue()
 			v2, _ := item.BoolValue()
 			if v1 == v2 {
 				return NewBoolValue(true)
 			}
-		} else if args[0].valueType == UndefinedValue {
+		case UndefinedValue:
 			return NewBoolValue(true)
 		}
 	}
