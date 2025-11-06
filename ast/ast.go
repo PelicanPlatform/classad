@@ -231,6 +231,19 @@ func (c *ConditionalExpr) String() string {
 
 func (c *ConditionalExpr) exprNode() {}
 
+// ElvisExpr represents the Elvis operator (expr1 ?: expr2).
+// If expr1 evaluates to undefined, returns expr2; otherwise returns expr1.
+type ElvisExpr struct {
+	Left  Expr // The expression to test for undefined
+	Right Expr // The fallback expression if Left is undefined
+}
+
+func (e *ElvisExpr) String() string {
+	return fmt.Sprintf("(%s ?: %s)", e.Left.String(), e.Right.String())
+}
+
+func (e *ElvisExpr) exprNode() {}
+
 // SelectExpr represents attribute selection (expr.attr).
 type SelectExpr struct {
 	Record Expr

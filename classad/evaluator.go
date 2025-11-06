@@ -268,6 +268,9 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 	case *ast.ConditionalExpr:
 		return e.evaluateConditional(v)
 
+	case *ast.ElvisExpr:
+		return e.evaluateElvis(v)
+
 	case *ast.ListLiteral:
 		return e.evaluateList(v)
 
@@ -440,6 +443,20 @@ func (e *Evaluator) evaluateConditional(cond *ast.ConditionalExpr) Value {
 		return e.Evaluate(cond.TrueExpr)
 	}
 	return e.Evaluate(cond.FalseExpr)
+}
+
+// evaluateElvis evaluates the Elvis operator (expr1 ?: expr2).
+// If expr1 evaluates to undefined, returns expr2; otherwise returns expr1.
+func (e *Evaluator) evaluateElvis(elvis *ast.ElvisExpr) Value {
+	leftVal := e.Evaluate(elvis.Left)
+
+	// If left side is undefined, evaluate and return the right side
+	if leftVal.IsUndefined() {
+		return e.Evaluate(elvis.Right)
+	}
+
+	// Otherwise, return the left side value (including error values)
+	return leftVal
 }
 
 func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {

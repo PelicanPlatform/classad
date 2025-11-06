@@ -171,3 +171,47 @@ func TestRecordLiteralString(t *testing.T) {
 		t.Errorf("RecordLiteral.String() = %q, want %q", s, want)
 	}
 }
+
+func TestElvisExprString(t *testing.T) {
+	tests := []struct {
+		name string
+		expr *ElvisExpr
+		want string
+	}{
+		{
+			name: "simple attribute elvis",
+			expr: &ElvisExpr{
+				Left:  &AttributeReference{Name: "foo"},
+				Right: &IntegerLiteral{Value: 3},
+			},
+			want: "(foo ?: 3)",
+		},
+		{
+			name: "nested elvis",
+			expr: &ElvisExpr{
+				Left: &AttributeReference{Name: "a"},
+				Right: &ElvisExpr{
+					Left:  &AttributeReference{Name: "b"},
+					Right: &IntegerLiteral{Value: 5},
+				},
+			},
+			want: "(a ?: (b ?: 5))",
+		},
+		{
+			name: "elvis with undefined",
+			expr: &ElvisExpr{
+				Left:  &UndefinedLiteral{},
+				Right: &StringLiteral{Value: "default"},
+			},
+			want: `(undefined ?: "default")`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if s := tt.expr.String(); s != tt.want {
+				t.Errorf("ElvisExpr.String() = %q, want %q", s, tt.want)
+			}
+		})
+	}
+}

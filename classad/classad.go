@@ -830,6 +830,10 @@ func (c *ClassAd) collectRefsHelper(expr ast.Expr, refs map[string]bool) {
 		c.collectRefsHelper(v.TrueExpr, refs)
 		c.collectRefsHelper(v.FalseExpr, refs)
 
+	case *ast.ElvisExpr:
+		c.collectRefsHelper(v.Left, refs)
+		c.collectRefsHelper(v.Right, refs)
+
 	case *ast.FunctionCall:
 		for _, arg := range v.Args {
 			c.collectRefsHelper(arg, refs)
@@ -955,6 +959,21 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 			Condition: condition,
 			TrueExpr:  trueExpr,
 			FalseExpr: falseExpr,
+		}
+
+	case *ast.ElvisExpr:
+		left := c.flattenExpr(v.Left)
+		right := c.flattenExpr(v.Right)
+
+		// If left is a literal undefined, return right
+		leftVal := c.exprToValue(left)
+		if leftVal.IsUndefined() {
+			return right
+		}
+
+		return &ast.ElvisExpr{
+			Left:  left,
+			Right: right,
 		}
 
 	case *ast.FunctionCall:

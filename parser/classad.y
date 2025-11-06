@@ -99,6 +99,8 @@ cond_expr
 		{ $$ = $1 }
 	| logical_or_expr '?' expr ':' cond_expr
 		{ $$ = &ast.ConditionalExpr{Condition: $1, TrueExpr: $3, FalseExpr: $5} }
+	| logical_or_expr '?' ':' cond_expr
+		{ $$ = &ast.ElvisExpr{Left: $1, Right: $4} }
 	;
 
 logical_or_expr

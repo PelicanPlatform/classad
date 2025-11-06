@@ -1,103 +1,95 @@
-# golangci-lint configuration
-# For full options see: https://golangci-lint.run/usage/configuration/
-
-linters-settings:
-  errcheck:
-    check-type-assertions: true
-    check-blank: true
-
-  govet:
-    enable-all: true
-    disable:
-      - fieldalignment  # Field order optimizations often reduce readability
-
-  gofmt:
-    simplify: true
-
-  goimports:
-    local-prefixes: github.com/PelicanPlatform/classad
-
-  gocritic:
-    enabled-tags:
-      - diagnostic
-      - style
-      - performance
-    disabled-checks:
-      - hugeParam  # Value struct is intentionally passed by value
-      - ifElseChain  # if-else chains are often clearer than switches
-      - unnamedResult  # Named results not always needed for simple returns
-      - ptrToRefParam  # Pointer parameters are valid for error capture in iterators
-
-  revive:
-    confidence: 0.8
-
+version: "2"
+run:
+  tests: true
 linters:
   enable:
-    - errcheck
-    - gosimple
-    - govet
-    - ineffassign
-    - staticcheck
-    - unused
-    - gofmt
-    - goimports
     - gocritic
-    - revive
     - misspell
-    - unparam
+    - revive
     - unconvert
-    # Note: copyloopvar (Go 1.22+) not needed for this project
-
-  disable:
-    - typecheck  # Disabled because of generated parser code
-
+    - unparam
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    gocritic:
+      disabled-checks:
+        - hugeParam
+        - ifElseChain
+        - unnamedResult
+        - ptrToRefParam
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+    govet:
+      disable:
+        - fieldalignment
+      enable-all: true
+    revive:
+      confidence: 0.8
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - errcheck
+          - gocritic
+          - govet
+          - ineffassign
+          - revive
+          - staticcheck
+          - unconvert
+          - unparam
+          - unused
+        path: parser/y\.go
+      - linters:
+          - errcheck
+          - unparam
+        path: _test\.go
+      - linters:
+          - errcheck
+        path: examples/
+      - linters:
+          - errcheck
+        path: classad/evaluator\.go
+        text: Error return value of.*Value.*is not checked
+      - linters:
+          - errcheck
+        path: classad/functions\.go
+        text: Error return value of.*Value.*is not checked
+      - linters:
+          - errcheck
+        path: classad/matchclassad\.go
+        text: Error return value of.*Value.*is not checked
+    paths:
+      - bin
+      - vendor
+      - third_party$
+      - builtin$
+      - examples$
 issues:
-  exclude-rules:
-    # Exclude generated parser code from most checks
-    - path: parser/y\.go
-      linters:
-        - errcheck
-        - gosimple
-        - govet
-        - ineffassign
-        - staticcheck
-        - unused
-        - gocritic
-        - revive
-        - unparam
-        - unconvert
-
-    # Exclude test files from certain checks
-    - path: _test\.go
-      linters:
-        - errcheck
-        - unparam
-
-    # Exclude safe type conversions in evaluator (type is checked before calling)
-    - path: classad/evaluator\.go
-      text: "Error return value of.*Value.*is not checked"
-      linters:
-        - errcheck
-
-    # Exclude safe type conversions in functions (type is checked before calling)
-    - path: classad/functions\.go
-      text: "Error return value of.*Value.*is not checked"
-      linters:
-        - errcheck
-
-    # Exclude safe type conversions in matchclassad (type is checked before calling)
-    - path: classad/matchclassad\.go
-      text: "Error return value of.*Value.*is not checked"
-      linters:
-        - errcheck
-
   max-issues-per-linter: 0
   max-same-issues: 0
-
-  exclude-dirs:
-    - bin
-    - vendor
-
-run:
-  timeout: 5m
-  tests: true
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true
+    goimports:
+      local-prefixes:
+        - github.com/PelicanPlatform/classad
+  exclusions:
+    generated: lax
+    paths:
+      - bin
+      - vendor
+      - third_party$
+      - builtin$
+      - examples$
