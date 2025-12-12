@@ -166,7 +166,7 @@ func (r *Reader) handleEOF() bool {
 // It returns the ClassAd string, any remaining data, and whether a complete ClassAd was found.
 // This handles strings and comments properly so brackets inside them don't affect depth.
 // The function uses byte-level iteration for efficiency, properly handling UTF-8 sequences.
-func (r *Reader) findCompleteClassAd() (classAdStr string, remaining string, found bool) {
+func (r *Reader) findCompleteClassAd() (classAdStr, remaining string, found bool) {
 	bufStr := r.buffer.String()
 	if bufStr == "" {
 		return "", "", false
@@ -254,13 +254,14 @@ func (r *Reader) findCompleteClassAd() (classAdStr string, remaining string, fou
 		// Only process brackets when not in string or comment
 		// Brackets are ASCII (single-byte), so byte-level comparison is safe
 		if !inString && !inLineComment && !inBlockComment {
-			if ch == '[' {
+			switch ch {
+			case '[':
 				if depth == 0 {
 					startPos = i
 				}
 				depth++
 				i++
-			} else if ch == ']' {
+			case ']':
 				depth--
 				if depth == 0 && startPos >= 0 {
 					// Found complete ClassAd
@@ -269,7 +270,7 @@ func (r *Reader) findCompleteClassAd() (classAdStr string, remaining string, fou
 					return classAdStr, remaining, true
 				}
 				i++
-			} else {
+			default:
 				// Not a bracket - advance by rune for UTF-8 handling
 				_, size := utf8.DecodeRuneInString(bufStr[i:])
 				if size == 0 {

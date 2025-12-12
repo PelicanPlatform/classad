@@ -716,7 +716,7 @@ func TestNewReader_BufferSizeLimit(t *testing.T) {
 	// We need enough data to fill multiple chunks and exceed the limit
 	largeValueSize := maxBufferSize + 1 // Just one byte over the limit
 	largeValue := strings.Repeat("x", largeValueSize)
-	input := fmt.Sprintf(`[LargeAttr = "%s"]`, largeValue)
+	input := fmt.Sprintf(`[LargeAttr = %q]`, largeValue)
 	reader := NewReader(strings.NewReader(input))
 
 	// Should fail due to buffer size limit
