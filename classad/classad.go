@@ -177,22 +177,6 @@ func ParseOld(input string) (*ClassAd, error) {
 	return &ClassAd{ad: ad}, nil
 }
 
-// ParseMultiple parses a string containing one or more concatenated ClassAds
-// (e.g., "][" without whitespace) and returns a list of ClassAd objects.
-// This function handles the HTCondor format where ClassAds may be concatenated
-// without whitespace between them.
-func ParseMultiple(input string) ([]*ClassAd, error) {
-	classads, err := parser.ParseMultipleClassAds(input)
-	if err != nil {
-		return nil, err
-	}
-	result := make([]*ClassAd, len(classads))
-	for i, ad := range classads {
-		result[i] = &ClassAd{ad: ad}
-	}
-	return result, nil
-}
-
 // String returns the string representation of the ClassAd.
 func (c *ClassAd) String() string {
 	if c.ad == nil {
