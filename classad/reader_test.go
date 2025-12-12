@@ -566,3 +566,74 @@ Name = "third"`
 		t.Errorf("Expected 3 ClassAds, got %d", count)
 	}
 }
+
+// TestNewReader_ConcatenatedClassAds tests parsing ClassAds that are concatenated
+// without whitespace between them (e.g., "]["). This format is used by HTCondor
+// when writing ClassAds to plugin input files.
+func TestNewReader_ConcatenatedClassAds(t *testing.T) {
+	// Test concatenated format without newlines: ][
+	input := `[Url = "pelican://example.com/file1"; LocalFileName = "/tmp/file1"][Url = "pelican://example.com/file2"; LocalFileName = "/tmp/file2"][Url = "pelican://example.com/file3"; LocalFileName = "/tmp/file3"]`
+	reader := NewReader(strings.NewReader(input))
+
+	count := 0
+	urls := []string{}
+
+	for reader.Next() {
+		ad := reader.ClassAd()
+		url, ok := ad.EvaluateAttrString("Url")
+		if !ok {
+			t.Error("Expected Url attribute")
+		}
+		urls = append(urls, url)
+		count++
+	}
+
+	if reader.Err() != nil {
+		t.Errorf("Unexpected error: %v", reader.Err())
+	}
+
+	if count != 3 {
+		t.Errorf("Expected 3 ClassAds, got %d", count)
+	}
+
+	expectedUrls := []string{
+		"pelican://example.com/file1",
+		"pelican://example.com/file2",
+		"pelican://example.com/file3",
+	}
+	for i, url := range urls {
+		if url != expectedUrls[i] {
+			t.Errorf("Expected Url=%s, got %s", expectedUrls[i], url)
+		}
+	}
+}
+
+// TestAll_ConcatenatedClassAds tests the iterator pattern with concatenated ClassAds
+func TestAll_ConcatenatedClassAds(t *testing.T) {
+	// Test concatenated format without newlines: ][
+	input := `[ID = 1; Name = "first"][ID = 2; Name = "second"][ID = 3; Name = "third"]`
+
+	count := 0
+	ids := []int64{}
+
+	All(strings.NewReader(input))(func(ad *ClassAd) bool {
+		count++
+		id, ok := ad.EvaluateAttrInt("ID")
+		if !ok {
+			t.Error("Expected ID attribute")
+		}
+		ids = append(ids, id)
+		return true
+	})
+
+	if count != 3 {
+		t.Errorf("Expected 3 ClassAds, got %d", count)
+	}
+
+	expectedIds := []int64{1, 2, 3}
+	for i, id := range ids {
+		if id != expectedIds[i] {
+			t.Errorf("Expected ID=%d, got %d", expectedIds[i], id)
+		}
+	}
+}

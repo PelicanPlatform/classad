@@ -20,17 +20,21 @@ type Token struct {
 
 // Lexer represents a lexical scanner for ClassAd expressions.
 type Lexer struct {
-	input  string
-	pos    int
-	result ast.Node
-	err    error
+	input      string
+	pos        int
+	result     ast.Node
+	resultList []*ast.ClassAd
+	err        error
 }
 
 // NewLexer creates a new lexer for the given input.
 func NewLexer(input string) *Lexer {
 	return &Lexer{
-		input: input,
-		pos:   0,
+		input:      input,
+		pos:        0,
+		result:     nil,
+		resultList: nil,
+		err:        nil,
 	}
 }
 
@@ -210,9 +214,19 @@ func (l *Lexer) Result() (ast.Node, error) {
 	return l.result, l.err
 }
 
+// ResultList returns the parsed list of ClassAds and any error.
+func (l *Lexer) ResultList() ([]*ast.ClassAd, error) {
+	return l.resultList, l.err
+}
+
 // SetResult sets the parse result.
 func (l *Lexer) SetResult(node ast.Node) {
 	l.result = node
+}
+
+// SetResultList sets the parse result as a list of ClassAds.
+func (l *Lexer) SetResultList(classads []*ast.ClassAd) {
+	l.resultList = classads
 }
 
 func (l *Lexer) peek() rune {

@@ -10,6 +10,8 @@ import (
 // Reader provides an iterator for parsing multiple ClassAds from an io.Reader.
 // It supports both new-style (bracketed) and old-style (newline-delimited) formats.
 type Reader struct {
+	classads []*ClassAd
+	index    int
 	scanner  *bufio.Scanner
 	oldStyle bool
 	err      error
@@ -18,13 +20,45 @@ type Reader struct {
 
 // NewReader creates a new Reader for parsing new-style ClassAds (with brackets).
 // Each ClassAd should be on its own, separated by whitespace or comments.
+// This function natively supports concatenated ClassAds (e.g., "][") through
+// grammar-level parsing.
 // Example format:
 //
 //	[Foo = 1; Bar = 2]
 //	[Baz = 3; Qux = 4]
+//
+// Also supports concatenated format:
+//
+//	[Foo = 1; Bar = 2][Baz = 3; Qux = 4]
 func NewReader(r io.Reader) *Reader {
+	// Read all input and parse as multiple ClassAds using the grammar
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return &Reader{
+			err: err,
+		}
+	}
+
+	input := strings.TrimSpace(string(data))
+	if input == "" {
+		// Empty input - return reader with no ClassAds
+		return &Reader{
+			classads: []*ClassAd{},
+			index:    0,
+			oldStyle: false,
+		}
+	}
+
+	classads, err := ParseMultiple(input)
+	if err != nil {
+		return &Reader{
+			err: err,
+		}
+	}
+
 	return &Reader{
-		scanner:  bufio.NewScanner(r),
+		classads: classads,
+		index:    0,
 		oldStyle: false,
 	}
 }
@@ -59,71 +93,14 @@ func (r *Reader) Next() bool {
 	return r.nextNew()
 }
 
-// nextNew reads the next new-style ClassAd (with brackets)
+// nextNew reads the next new-style ClassAd from the parsed list
 func (r *Reader) nextNew() bool {
-	var lines []string
-	inClassAd := false
-	bracketDepth := 0
-
-	for r.scanner.Scan() {
-		line := strings.TrimSpace(r.scanner.Text())
-
-		// Skip empty lines and comments outside of ClassAds
-		if !inClassAd && (line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*")) {
-			continue
-		}
-
-		// Check if this line starts a ClassAd
-		if !inClassAd && strings.HasPrefix(line, "[") {
-			inClassAd = true
-		}
-
-		if inClassAd {
-			lines = append(lines, line)
-
-			// Count brackets to handle nested ClassAds
-			for _, ch := range line {
-				switch ch {
-				case '[':
-					bracketDepth++
-				case ']':
-					bracketDepth--
-				}
-			}
-
-			// If we've closed all brackets, we have a complete ClassAd
-			if bracketDepth == 0 {
-				classAdStr := strings.Join(lines, "\n")
-				ad, err := Parse(classAdStr)
-				if err != nil {
-					r.err = err
-					return false
-				}
-				r.current = ad
-				return true
-			}
-		}
-	}
-
-	// Check for scanner errors
-	if err := r.scanner.Err(); err != nil {
-		r.err = err
+	if r.index >= len(r.classads) {
 		return false
 	}
-
-	// If we have accumulated lines but hit EOF, try to parse them
-	if len(lines) > 0 {
-		classAdStr := strings.Join(lines, "\n")
-		ad, err := Parse(classAdStr)
-		if err != nil {
-			r.err = err
-			return false
-		}
-		r.current = ad
-		return true
-	}
-
-	return false
+	r.current = r.classads[r.index]
+	r.index++
+	return true
 }
 
 // nextOld reads the next old-style ClassAd (newline-delimited, separated by blank lines)

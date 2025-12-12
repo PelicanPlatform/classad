@@ -9,9 +9,20 @@ import (
 )
 
 // Parse parses a ClassAd expression string and returns the AST.
+// For backward compatibility, if the input contains a single ClassAd,
+// it returns that ClassAd. If it contains multiple ClassAds, it returns
+// the first one.
 func Parse(input string) (ast.Node, error) {
 	lex := NewLexer(input)
 	yyParse(lex)
+
+	// Check if we got a list of ClassAds
+	if list, err := lex.ResultList(); err == nil && len(list) > 0 {
+		// For backward compatibility, return the first ClassAd
+		return list[0], nil
+	}
+
+	// Fall back to single result (for backward compatibility)
 	return lex.Result()
 }
 
@@ -25,6 +36,16 @@ func ParseClassAd(input string) (*ast.ClassAd, error) {
 		return classad, nil
 	}
 	return nil, nil
+}
+
+// ParseMultipleClassAds parses a string containing one or more concatenated ClassAds
+// (e.g., "][" without whitespace) and returns a list of ClassAd AST nodes.
+// This function handles the HTCondor format where ClassAds may be concatenated
+// without whitespace between them.
+func ParseMultipleClassAds(input string) ([]*ast.ClassAd, error) {
+	lex := NewLexer(input)
+	yyParse(lex)
+	return lex.ResultList()
 }
 
 // ParseScopedIdentifier parses an identifier that may have a scope prefix.

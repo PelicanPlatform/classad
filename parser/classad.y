@@ -11,6 +11,7 @@ import (
 	node      ast.Node
 	expr      ast.Expr
 	classad   *ast.ClassAd
+	classads  []*ast.ClassAd
 	attr      *ast.AttributeAssignment
 	attrs     []*ast.AttributeAssignment
 	exprlist  []ast.Expr
@@ -42,6 +43,7 @@ import (
 %left '.' '[' '('
 
 %type <classad> classad record_literal
+%type <classads> classad_list
 %type <attrs> attr_list
 %type <attr> attr_assign
 %type <expr> expr literal primary_expr postfix_expr unary_expr
@@ -53,12 +55,22 @@ import (
 %%
 
 start
-	: classad
+	: classad_list
 		{
-			if lex, ok := yylex.(interface{ SetResult(ast.Node) }); ok {
-				lex.SetResult($1)
+			if lex, ok := yylex.(interface{ SetResultList([]*ast.ClassAd) }); ok {
+				lex.SetResultList($1)
+			} else if lex, ok := yylex.(interface{ SetResult(ast.Node) }); ok && len($1) == 1 {
+				// For backward compatibility: if only one ClassAd, set as single result
+				lex.SetResult($1[0])
 			}
 		}
+	;
+
+classad_list
+	: classad
+		{ $$ = []*ast.ClassAd{$1} }
+	| classad_list classad
+		{ $$ = append($1, $2) }
 	;
 
 classad
