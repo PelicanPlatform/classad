@@ -2,20 +2,31 @@ package classad
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"iter"
 	"strings"
+	"unicode/utf8"
+)
+
+const (
+	// maxBufferSize limits the buffer size to prevent unbounded memory growth
+	// when processing malformed or very large inputs
+	maxBufferSize = 10 * 1024 * 1024 // 10MB
+	// readChunkSize is the size of chunks read from the io.Reader
+	readChunkSize = 4096 // 4KB
 )
 
 // Reader provides an iterator for parsing multiple ClassAds from an io.Reader.
 // It supports both new-style (bracketed) and old-style (newline-delimited) formats.
 type Reader struct {
-	classads []*ClassAd
-	index    int
-	scanner  *bufio.Scanner
-	oldStyle bool
-	err      error
-	current  *ClassAd
+	// For new-style (bracketed) ClassAds
+	bufReader *bufio.Reader
+	buffer    strings.Builder
+	oldStyle  bool
+	scanner   *bufio.Scanner
+	err       error
+	current   *ClassAd
 }
 
 // NewReader creates a new Reader for parsing new-style ClassAds (with brackets).
@@ -30,36 +41,13 @@ type Reader struct {
 // Also supports concatenated format:
 //
 //	[Foo = 1; Bar = 2][Baz = 3; Qux = 4]
+//
+// This implementation streams data from the io.Reader, processing ClassAds
+// one at a time without buffering the entire input in memory.
 func NewReader(r io.Reader) *Reader {
-	// Read all input and parse as multiple ClassAds using the grammar
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return &Reader{
-			err: err,
-		}
-	}
-
-	input := strings.TrimSpace(string(data))
-	if input == "" {
-		// Empty input - return reader with no ClassAds
-		return &Reader{
-			classads: []*ClassAd{},
-			index:    0,
-			oldStyle: false,
-		}
-	}
-
-	classads, err := ParseMultiple(input)
-	if err != nil {
-		return &Reader{
-			err: err,
-		}
-	}
-
 	return &Reader{
-		classads: classads,
-		index:    0,
-		oldStyle: false,
+		bufReader: bufio.NewReader(r),
+		oldStyle:  false,
 	}
 }
 
@@ -93,14 +81,238 @@ func (r *Reader) Next() bool {
 	return r.nextNew()
 }
 
-// nextNew reads the next new-style ClassAd from the parsed list
+// nextNew reads the next new-style ClassAd by streaming from the reader.
+// It tracks bracket depth to detect complete ClassAds, handling strings
+// and comments properly.
 func (r *Reader) nextNew() bool {
-	if r.index >= len(r.classads) {
-		return false
+	// Read data incrementally until we have a complete ClassAd
+	for {
+		// Check buffer size limit before expensive scan to prevent unbounded growth
+		if r.buffer.Len() > maxBufferSize {
+			r.err = fmt.Errorf("buffer exceeded maximum size (%d bytes): input may be malformed or too large", maxBufferSize)
+			return false
+		}
+
+		// Check if we already have a complete ClassAd in the buffer
+		adStr, remaining, found := r.findCompleteClassAd()
+		if found {
+			// Parse the complete ClassAd
+			ad, err := Parse(adStr)
+			if err != nil {
+				r.err = err
+				return false
+			}
+			r.current = ad
+			// Update buffer with remaining data
+			r.buffer.Reset()
+			r.buffer.WriteString(remaining)
+			return true
+		}
+
+		// Need more data - read a chunk
+		chunk := make([]byte, readChunkSize)
+		n, err := r.bufReader.Read(chunk)
+		if n > 0 {
+			r.buffer.Write(chunk[:n])
+			// Check buffer size after writing to catch cases where a single chunk exceeds limit
+			if r.buffer.Len() > maxBufferSize {
+				r.err = fmt.Errorf("buffer exceeded maximum size (%d bytes): input may be malformed or too large", maxBufferSize)
+				return false
+			}
+		}
+		if err == io.EOF {
+			return r.handleEOF()
+		}
+		if err != nil {
+			r.err = err
+			return false
+		}
 	}
-	r.current = r.classads[r.index]
-	r.index++
-	return true
+}
+
+// handleEOF processes remaining data when EOF is reached.
+// It attempts to parse any complete ClassAd or remaining data in the buffer.
+func (r *Reader) handleEOF() bool {
+	// Check if we have a complete ClassAd in buffer
+	adStr, remaining, found := r.findCompleteClassAd()
+	if found {
+		ad, parseErr := Parse(adStr)
+		if parseErr != nil {
+			r.err = parseErr
+			return false
+		}
+		r.current = ad
+		r.buffer.Reset()
+		r.buffer.WriteString(remaining)
+		return true
+	}
+	// Check if there's any remaining data that might be a ClassAd
+	remainingStr := strings.TrimSpace(r.buffer.String())
+	if remainingStr != "" {
+		// Try to parse what's left
+		ad, parseErr := Parse(remainingStr)
+		if parseErr != nil {
+			r.err = parseErr
+			return false
+		}
+		r.current = ad
+		r.buffer.Reset()
+		return true
+	}
+	return false
+}
+
+// findCompleteClassAd scans the buffer to find a complete ClassAd (balanced brackets).
+// It returns the ClassAd string, any remaining data, and whether a complete ClassAd was found.
+// This handles strings and comments properly so brackets inside them don't affect depth.
+// The function uses byte-level iteration for efficiency, properly handling UTF-8 sequences.
+func (r *Reader) findCompleteClassAd() (classAdStr string, remaining string, found bool) {
+	bufStr := r.buffer.String()
+	if bufStr == "" {
+		return "", "", false
+	}
+
+	// Track bracket depth, handling strings and comments
+	depth := 0
+	inString := false
+	inLineComment := false
+	inBlockComment := false
+	escapeNext := false
+	startPos := -1
+
+	// Skip leading whitespace and comments to find the start of a ClassAd
+	skipWhitespace := true
+
+	// Use byte-level iteration for efficiency (brackets are ASCII, single-byte)
+	// But properly handle UTF-8 sequences when advancing
+	for i := 0; i < len(bufStr); {
+		ch := bufStr[i]
+
+		// Skip whitespace before finding the first bracket
+		if skipWhitespace {
+			if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+				i++
+				continue
+			}
+			// Check for line comment
+			if i+1 < len(bufStr) && ch == '/' && bufStr[i+1] == '/' {
+				// Skip to end of line
+				for i < len(bufStr) && bufStr[i] != '\n' {
+					i++
+				}
+				continue
+			}
+			// Check for block comment
+			if i+1 < len(bufStr) && ch == '/' && bufStr[i+1] == '*' {
+				// Skip block comment
+				i += 2
+				for i+1 < len(bufStr) {
+					if bufStr[i] == '*' && bufStr[i+1] == '/' {
+						i += 2
+						break
+					}
+					// Advance by rune to handle UTF-8 in comments
+					_, size := utf8.DecodeRuneInString(bufStr[i:])
+					if size == 0 {
+						break
+					}
+					i += size
+				}
+				continue
+			}
+			skipWhitespace = false
+		}
+
+		// Handle escape sequences in strings
+		if escapeNext {
+			escapeNext = false
+			// Advance by rune to handle UTF-8 escape sequences properly
+			_, size := utf8.DecodeRuneInString(bufStr[i:])
+			if size == 0 {
+				break
+			}
+			i += size
+			continue
+		}
+
+		// Handle escape sequences in strings
+		if inString && ch == '\\' {
+			escapeNext = true
+			i++
+			continue
+		}
+
+		// Handle strings
+		if !inLineComment && !inBlockComment {
+			if ch == '"' {
+				inString = !inString
+				i++
+				continue
+			}
+		}
+
+		// Only process brackets when not in string or comment
+		// Brackets are ASCII (single-byte), so byte-level comparison is safe
+		if !inString && !inLineComment && !inBlockComment {
+			if ch == '[' {
+				if depth == 0 {
+					startPos = i
+				}
+				depth++
+				i++
+			} else if ch == ']' {
+				depth--
+				if depth == 0 && startPos >= 0 {
+					// Found complete ClassAd
+					classAdStr = bufStr[startPos : i+1]
+					remaining = strings.TrimSpace(bufStr[i+1:])
+					return classAdStr, remaining, true
+				}
+				i++
+			} else {
+				// Not a bracket - advance by rune for UTF-8 handling
+				_, size := utf8.DecodeRuneInString(bufStr[i:])
+				if size == 0 {
+					break
+				}
+				i += size
+			}
+			continue
+		}
+
+		// Handle comments (only when not in string)
+		if !inString {
+			if !inBlockComment && i+1 < len(bufStr) && ch == '/' && bufStr[i+1] == '/' {
+				inLineComment = true
+				i += 2
+				continue
+			}
+			if inLineComment && ch == '\n' {
+				inLineComment = false
+				i++
+				continue
+			}
+			if !inLineComment && !inBlockComment && i+1 < len(bufStr) && ch == '/' && bufStr[i+1] == '*' {
+				inBlockComment = true
+				i += 2
+				continue
+			}
+			if inBlockComment && i+1 < len(bufStr) && ch == '*' && bufStr[i+1] == '/' {
+				inBlockComment = false
+				i += 2
+				continue
+			}
+		}
+
+		// Advance by rune to handle UTF-8 properly in strings and comments
+		_, size := utf8.DecodeRuneInString(bufStr[i:])
+		if size == 0 {
+			break
+		}
+		i += size
+	}
+
+	return "", "", false
 }
 
 // nextOld reads the next old-style ClassAd (newline-delimited, separated by blank lines)

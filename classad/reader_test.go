@@ -1,6 +1,7 @@
 package classad
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -635,5 +636,146 @@ func TestAll_ConcatenatedClassAds(t *testing.T) {
 		if id != expectedIds[i] {
 			t.Errorf("Expected ID=%d, got %d", expectedIds[i], id)
 		}
+	}
+}
+
+// TestNewReader_UTF8Characters tests handling of UTF-8 characters in ClassAds
+func TestNewReader_UTF8Characters(t *testing.T) {
+	// Test with UTF-8 characters in attribute values
+	input := `[Name = "José"; City = "São Paulo"; Emoji = "🚀"]`
+	reader := NewReader(strings.NewReader(input))
+
+	if !reader.Next() {
+		t.Fatalf("Expected ClassAd, got error: %v", reader.Err())
+	}
+
+	ad := reader.ClassAd()
+	name, _ := ad.EvaluateAttrString("Name")
+	if name != "José" {
+		t.Errorf("Expected Name=José, got %s", name)
+	}
+
+	city, _ := ad.EvaluateAttrString("City")
+	if city != "São Paulo" {
+		t.Errorf("Expected City=São Paulo, got %s", city)
+	}
+
+	emoji, _ := ad.EvaluateAttrString("Emoji")
+	if emoji != "🚀" {
+		t.Errorf("Expected Emoji=🚀, got %s", emoji)
+	}
+}
+
+// TestNewReader_UTF8InStrings tests UTF-8 characters inside strings with brackets
+func TestNewReader_UTF8InStrings(t *testing.T) {
+	// Test that brackets inside UTF-8 strings don't break parsing
+	input := `[Message = "Hello [world] 🌍"; Value = 42]`
+	reader := NewReader(strings.NewReader(input))
+
+	if !reader.Next() {
+		t.Fatalf("Expected ClassAd, got error: %v", reader.Err())
+	}
+
+	ad := reader.ClassAd()
+	message, _ := ad.EvaluateAttrString("Message")
+	if message != "Hello [world] 🌍" {
+		t.Errorf("Expected Message='Hello [world] 🌍', got %s", message)
+	}
+
+	value, _ := ad.EvaluateAttrInt("Value")
+	if value != 42 {
+		t.Errorf("Expected Value=42, got %d", value)
+	}
+}
+
+// TestNewReader_EmptyBrackets tests empty ClassAd brackets
+func TestNewReader_EmptyBrackets(t *testing.T) {
+	input := `[]`
+	reader := NewReader(strings.NewReader(input))
+
+	if !reader.Next() {
+		t.Fatalf("Expected ClassAd, got error: %v", reader.Err())
+	}
+
+	ad := reader.ClassAd()
+	if ad == nil {
+		t.Fatal("Expected ClassAd, got nil")
+	}
+
+	// Empty ClassAd should be valid
+	if reader.Next() {
+		t.Error("Expected no more ClassAds")
+	}
+}
+
+// TestNewReader_BufferSizeLimit tests that buffer size limit is enforced
+func TestNewReader_BufferSizeLimit(t *testing.T) {
+	// Create input that will cause the buffer to exceed the limit
+	// We'll create a stream that grows the buffer past the limit
+	// Use a size that's just over maxBufferSize to trigger the check quickly
+	// We need enough data to fill multiple chunks and exceed the limit
+	largeValueSize := maxBufferSize + 1 // Just one byte over the limit
+	largeValue := strings.Repeat("x", largeValueSize)
+	input := fmt.Sprintf(`[LargeAttr = "%s"]`, largeValue)
+	reader := NewReader(strings.NewReader(input))
+
+	// Should fail due to buffer size limit
+	// The reader will read chunks until the buffer exceeds the limit
+	// We check the buffer size before the expensive scan, so this should be fast
+	if reader.Next() {
+		t.Error("Expected Next() to return false due to buffer size limit")
+	}
+
+	if reader.Err() == nil {
+		t.Error("Expected error for buffer size limit exceeded")
+		return
+	}
+
+	errMsg := reader.Err().Error()
+	if !strings.Contains(errMsg, "buffer exceeded maximum size") {
+		t.Errorf("Expected buffer size error, got: %v", reader.Err())
+	}
+}
+
+// TestNewReader_UnclosedBrackets tests handling of unclosed brackets
+func TestNewReader_UnclosedBrackets(t *testing.T) {
+	// Test with unclosed bracket (should eventually fail or timeout)
+	input := `[Foo = 1; Bar = 2`
+	reader := NewReader(strings.NewReader(input))
+
+	// Should not find a complete ClassAd
+	if reader.Next() {
+		t.Error("Expected Next() to return false for unclosed bracket")
+	}
+
+	// Should have an error when trying to parse incomplete data
+	if reader.Err() == nil {
+		t.Error("Expected error for unclosed bracket")
+	}
+}
+
+// TestNewReader_MultipleUTF8ClassAds tests multiple ClassAds with UTF-8
+func TestNewReader_MultipleUTF8ClassAds(t *testing.T) {
+	input := `[Name = "José"; ID = 1][Name = "François"; ID = 2][Name = "北京"; ID = 3]`
+	reader := NewReader(strings.NewReader(input))
+
+	expectedNames := []string{"José", "François", "北京"}
+	count := 0
+
+	for reader.Next() {
+		ad := reader.ClassAd()
+		name, _ := ad.EvaluateAttrString("Name")
+		if count < len(expectedNames) && name != expectedNames[count] {
+			t.Errorf("Expected Name=%s, got %s", expectedNames[count], name)
+		}
+		count++
+	}
+
+	if reader.Err() != nil {
+		t.Errorf("Unexpected error: %v", reader.Err())
+	}
+
+	if count != 3 {
+		t.Errorf("Expected 3 ClassAds, got %d", count)
 	}
 }
