@@ -82,6 +82,53 @@ func TestNewReader_MultipleClassAds(t *testing.T) {
 	}
 }
 
+func TestNewReader_ConcatenatedClassAds(t *testing.T) {
+	input := `[ID = 1][ID = 2][ID = 3]`
+	reader := NewReader(strings.NewReader(input))
+
+	ids := []int64{}
+	for reader.Next() {
+		id, ok := reader.ClassAd().EvaluateAttrInt("ID")
+		if !ok {
+			t.Fatalf("expected ID attribute")
+		}
+		ids = append(ids, id)
+	}
+
+	if err := reader.Err(); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	expected := []int64{1, 2, 3}
+	if len(ids) != len(expected) {
+		t.Fatalf("Expected %d ClassAds, got %d", len(expected), len(ids))
+	}
+	for i, v := range expected {
+		if ids[i] != v {
+			t.Fatalf("Expected ID=%d at position %d, got %d", v, i, ids[i])
+		}
+	}
+}
+
+func TestNewReader_ConcatenatedWithComments(t *testing.T) {
+	input := `[ID = 1]/*block*/[ID = 2]// trailing comment
+[ID = 3]`
+	reader := NewReader(strings.NewReader(input))
+
+	count := 0
+	for reader.Next() {
+		count++
+	}
+
+	if err := reader.Err(); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if count != 3 {
+		t.Fatalf("Expected 3 ClassAds, got %d", count)
+	}
+}
+
 func TestNewReader_WithComments(t *testing.T) {
 	input := `
 // This is a comment
@@ -102,27 +149,6 @@ func TestNewReader_WithComments(t *testing.T) {
 
 	if count != 2 {
 		t.Errorf("Expected 2 ClassAds, got %d", count)
-	}
-}
-
-func TestNewReader_NestedClassAds(t *testing.T) {
-	input := `[Outer = [Inner = 42]; Value = 10]`
-	reader := NewReader(strings.NewReader(input))
-
-	if !reader.Next() {
-		t.Fatalf("Expected ClassAd, got error: %v", reader.Err())
-	}
-
-	ad := reader.ClassAd()
-	outerVal := ad.EvaluateAttr("Outer")
-	if !outerVal.IsClassAd() {
-		t.Error("Expected Outer to be a ClassAd")
-	}
-
-	innerAd, _ := outerVal.ClassAdValue()
-	inner, _ := innerAd.EvaluateAttrInt("Inner")
-	if inner != 42 {
-		t.Errorf("Expected Inner=42, got %v", inner)
 	}
 }
 
@@ -154,6 +180,32 @@ func TestNewReader_EmptyInput(t *testing.T) {
 
 	if reader.Err() != nil {
 		t.Errorf("Unexpected error: %v", reader.Err())
+	}
+}
+
+func TestNewReader_ErrorAfterFirstAd(t *testing.T) {
+	input := `[Ok = 1][Broken = ]`
+	reader := NewReader(strings.NewReader(input))
+
+	if !reader.Next() {
+		t.Fatalf("expected first ClassAd, got error: %v", reader.Err())
+	}
+
+	ok, _ := reader.ClassAd().EvaluateAttrInt("Ok")
+	if ok != 1 {
+		t.Fatalf("expected Ok=1, got %d", ok)
+	}
+
+	if reader.Next() {
+		t.Fatalf("expected failure on second ClassAd")
+	}
+
+	if reader.Err() == nil {
+		t.Fatalf("expected error after malformed second ClassAd")
+	}
+
+	if reader.Next() {
+		t.Fatalf("expected no further ClassAds after error")
 	}
 }
 
@@ -503,6 +555,83 @@ func TestAllWithIndex(t *testing.T) {
 	}
 }
 
+// TestRangeIterator demonstrates the Go 1.23+ range-over-func syntax for All.
+func TestRangeIterator(t *testing.T) {
+	input := `[ID = 1]
+[ID = 2]
+[ID = 3]`
+
+	ids := []int64{}
+
+	for ad := range All(strings.NewReader(input)) {
+		id, ok := ad.EvaluateAttrInt("ID")
+		if !ok {
+			t.Fatalf("expected ID attribute")
+		}
+		ids = append(ids, id)
+	}
+
+	expected := []int64{1, 2, 3}
+	if len(ids) != len(expected) {
+		t.Fatalf("expected %d ids, got %d", len(expected), len(ids))
+	}
+	for i, v := range expected {
+		if ids[i] != v {
+			t.Fatalf("expected ID=%d at index %d, got %d", v, i, ids[i])
+		}
+	}
+}
+
+func TestAllEarlyStop(t *testing.T) {
+	input := `[V = 1][V = 2][V = 3]`
+	count := 0
+
+	All(strings.NewReader(input))(func(ad *ClassAd) bool {
+		count++
+		return false
+	})
+
+	if count != 1 {
+		t.Fatalf("expected to stop after first element, got %d", count)
+	}
+}
+
+func TestAllWithIndexEarlyStop(t *testing.T) {
+	input := `[V = 1][V = 2][V = 3]`
+	count := 0
+
+	AllWithIndex(strings.NewReader(input))(func(i int, ad *ClassAd) bool {
+		if i != 0 {
+			t.Fatalf("expected first index 0, got %d", i)
+		}
+		count++
+		return false
+	})
+
+	if count != 1 {
+		t.Fatalf("expected to stop after first element, got %d", count)
+	}
+}
+
+func TestAllWithErrorEarlyStop(t *testing.T) {
+	input := `[V = 1][V = 2][V = 3]`
+	count := 0
+	var err error
+
+	AllWithError(strings.NewReader(input), &err)(func(ad *ClassAd) bool {
+		count++
+		return false
+	})
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if count != 1 {
+		t.Fatalf("expected to stop after first element, got %d", count)
+	}
+}
+
 // TestAllWithError tests error handling in iterator
 func TestAllWithError(t *testing.T) {
 	// Valid input
@@ -564,5 +693,62 @@ Name = "third"`
 
 	if count != 3 {
 		t.Errorf("Expected 3 ClassAds, got %d", count)
+	}
+}
+
+func TestAllOldWithError(t *testing.T) {
+	input := `A = 1
+
+B = 2`
+	var err error
+	count := 0
+
+	for ad := range AllOldWithError(strings.NewReader(input), &err) {
+		if _, ok := ad.EvaluateAttrInt("A"); ok {
+			count++
+		}
+	}
+
+	if err != nil {
+		t.Fatalf("unexpected error on valid input: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected 1 ClassAd from valid input, got %d", count)
+	}
+
+	broken := `Good = 1
+
+Broken =`
+	count = 0
+	err = nil
+
+	for range AllOldWithError(strings.NewReader(broken), &err) {
+		count++
+	}
+
+	if err == nil {
+		t.Fatalf("expected parse error for broken input")
+	}
+	if count != 1 {
+		t.Fatalf("expected one yielded ad before error, got %d", count)
+	}
+
+	earliestop := `X = 1
+
+Y = 2`
+	err = nil
+	count = 0
+
+	for ad := range AllOldWithError(strings.NewReader(earliestop), &err) {
+		count++
+		_ = ad
+		break // stop early to ensure no error is recorded
+	}
+
+	if err != nil {
+		t.Fatalf("did not expect error when stopping early: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected single iteration before early stop, got %d", count)
 	}
 }

@@ -1,6 +1,7 @@
 package classad
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -150,6 +151,36 @@ func TestMarshal_WithOmitEmpty(t *testing.T) {
 	tags := ad.EvaluateAttr("Tags")
 	if !tags.IsUndefined() {
 		t.Errorf("Expected Tags to be omitted, got %v", tags)
+	}
+}
+
+func TestMarshal_OmitEmptyVariants(t *testing.T) {
+	ptrVal := 5
+	type Example struct {
+		S string  `classad:"s,omitempty"`
+		I int     `classad:"i,omitempty"`
+		B bool    `classad:"b,omitempty"`
+		L []int   `classad:"l,omitempty"`
+		P *int    `classad:"p,omitempty"`
+		F float64 `classad:"f,omitempty"`
+	}
+
+	value := Example{I: 7, P: &ptrVal}
+	ad, err := Marshal(value)
+	if err != nil {
+		t.Fatalf("unexpected marshal error: %v", err)
+	}
+
+	if !strings.Contains(ad, "i = 7") {
+		t.Fatalf("expected integer field to be marshaled, got %s", ad)
+	}
+	if !strings.Contains(ad, "p = 5") {
+		t.Fatalf("expected pointer field to be marshaled, got %s", ad)
+	}
+	for _, unwanted := range []string{"s =", "b =", "l =", "f ="} {
+		if strings.Contains(ad, unwanted) {
+			t.Fatalf("unexpected omitted field %q present in %s", unwanted, ad)
+		}
 	}
 }
 

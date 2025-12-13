@@ -5,11 +5,16 @@ import (
 	"io"
 	"iter"
 	"strings"
+
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 // Reader provides an iterator for parsing multiple ClassAds from an io.Reader.
 // It supports both new-style (bracketed) and old-style (newline-delimited) formats.
+// New-style ClassAds can be concatenated without delimiters or whitespace.
 type Reader struct {
+	reader   *bufio.Reader
+	parser   *parser.ReaderParser
 	scanner  *bufio.Scanner
 	oldStyle bool
 	err      error
@@ -17,14 +22,16 @@ type Reader struct {
 }
 
 // NewReader creates a new Reader for parsing new-style ClassAds (with brackets).
-// Each ClassAd should be on its own, separated by whitespace or comments.
+// ClassAds may be concatenated directly; whitespace and comments are optional.
 // Example format:
 //
 //	[Foo = 1; Bar = 2]
 //	[Baz = 3; Qux = 4]
 func NewReader(r io.Reader) *Reader {
+	br := bufio.NewReader(r)
 	return &Reader{
-		scanner:  bufio.NewScanner(r),
+		reader:   br,
+		parser:   parser.NewReaderParser(br),
 		oldStyle: false,
 	}
 }
@@ -61,69 +68,17 @@ func (r *Reader) Next() bool {
 
 // nextNew reads the next new-style ClassAd (with brackets)
 func (r *Reader) nextNew() bool {
-	var lines []string
-	inClassAd := false
-	bracketDepth := 0
-
-	for r.scanner.Scan() {
-		line := strings.TrimSpace(r.scanner.Text())
-
-		// Skip empty lines and comments outside of ClassAds
-		if !inClassAd && (line == "" || strings.HasPrefix(line, "//") || strings.HasPrefix(line, "/*")) {
-			continue
+	ad, err := r.parser.ParseClassAd()
+	if err != nil {
+		if err == io.EOF {
+			return false
 		}
-
-		// Check if this line starts a ClassAd
-		if !inClassAd && strings.HasPrefix(line, "[") {
-			inClassAd = true
-		}
-
-		if inClassAd {
-			lines = append(lines, line)
-
-			// Count brackets to handle nested ClassAds
-			for _, ch := range line {
-				switch ch {
-				case '[':
-					bracketDepth++
-				case ']':
-					bracketDepth--
-				}
-			}
-
-			// If we've closed all brackets, we have a complete ClassAd
-			if bracketDepth == 0 {
-				classAdStr := strings.Join(lines, "\n")
-				ad, err := Parse(classAdStr)
-				if err != nil {
-					r.err = err
-					return false
-				}
-				r.current = ad
-				return true
-			}
-		}
-	}
-
-	// Check for scanner errors
-	if err := r.scanner.Err(); err != nil {
 		r.err = err
 		return false
 	}
 
-	// If we have accumulated lines but hit EOF, try to parse them
-	if len(lines) > 0 {
-		classAdStr := strings.Join(lines, "\n")
-		ad, err := Parse(classAdStr)
-		if err != nil {
-			r.err = err
-			return false
-		}
-		r.current = ad
-		return true
-	}
-
-	return false
+	r.current = &ClassAd{ad: ad}
+	return true
 }
 
 // nextOld reads the next old-style ClassAd (newline-delimited, separated by blank lines)

@@ -176,6 +176,101 @@ func TestLexerError(t *testing.T) {
 	}
 }
 
+func TestLexerErrorFormattingUnexpectedChar(t *testing.T) {
+	lex := NewLexer("foo\n  @")
+	lval := &yySymType{}
+	for {
+		if tok := lex.Lex(lval); tok == 0 {
+			break
+		}
+	}
+	_, err := lex.Result()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	const expected = "parse error at line 2, col 3: unexpected character: @\n  @\n  ^"
+	if err.Error() != expected {
+		t.Fatalf("unexpected error message:\n got: %q\nwant: %q", err.Error(), expected)
+	}
+}
+
+func TestLexerErrorFormattingUnterminatedString(t *testing.T) {
+	lex := NewLexer("\"foo")
+	lval := &yySymType{}
+	for {
+		if tok := lex.Lex(lval); tok == 0 {
+			break
+		}
+	}
+	_, err := lex.Result()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	const expected = "parse error at line 1, col 4: unterminated string starting at byte 0\n\"foo\n   ^"
+	if err.Error() != expected {
+		t.Fatalf("unexpected error message:\n got: %q\nwant: %q", err.Error(), expected)
+	}
+}
+
+func TestLexerErrorFormattingUnterminatedBlockComment(t *testing.T) {
+	lex := NewLexer("/* unterminated")
+	lval := &yySymType{}
+	for {
+		if tok := lex.Lex(lval); tok == 0 {
+			break
+		}
+	}
+	_, err := lex.Result()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	const expected = "parse error at line 1, col 15: unterminated block comment\n/* unterminated\n              ^"
+	if err.Error() != expected {
+		t.Fatalf("unexpected error message:\n got: %q\nwant: %q", err.Error(), expected)
+	}
+}
+
+func TestLexerErrorFormattingNullOctalInString(t *testing.T) {
+	lex := NewLexer("\"\\000\"")
+	lval := &yySymType{}
+	for {
+		if tok := lex.Lex(lval); tok == 0 {
+			break
+		}
+	}
+	_, err := lex.Result()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	const expected = "parse error at line 1, col 6: unterminated string starting at byte 5\n\"\\000\"\n     ^"
+	if err.Error() != expected {
+		t.Fatalf("unexpected error message:\n got: %q\nwant: %q", err.Error(), expected)
+	}
+}
+
+func TestLexerErrorFormattingInvalidNumber(t *testing.T) {
+	lex := NewLexer("1e+")
+	lval := &yySymType{}
+	for {
+		if tok := lex.Lex(lval); tok == 0 {
+			break
+		}
+	}
+	_, err := lex.Result()
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+
+	const expected = "parse error at line 1, col 3: invalid real number: 1e+\n1e+\n  ^"
+	if err.Error() != expected {
+		t.Fatalf("unexpected error message:\n got: %q\nwant: %q", err.Error(), expected)
+	}
+}
+
 func TestLexerResult(t *testing.T) {
 	lex := NewLexer("test")
 	expectedResult := &ast.ClassAd{}
