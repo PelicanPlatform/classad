@@ -3,6 +3,8 @@
 package parser
 
 import (
+	"fmt"
+	"io"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -25,6 +27,43 @@ func ParseClassAd(input string) (*ast.ClassAd, error) {
 		return classad, nil
 	}
 	return nil, nil
+}
+
+// ReaderParser parses consecutive ClassAds from a buffered reader without
+// requiring delimiters between ads. It reuses a single streaming lexer instance
+// for efficiency.
+type ReaderParser struct {
+	lex *StreamingLexer
+}
+
+// NewReaderParser creates a reusable parser that pulls consecutive ClassAds
+// from the provided reader without requiring delimiters. Non-buffered readers
+// are wrapped internally for efficiency.
+func NewReaderParser(r io.Reader) *ReaderParser {
+	return &ReaderParser{lex: NewStreamingLexer(r)}
+}
+
+// ParseClassAd parses the next ClassAd from the underlying reader.
+// It reuses the same streaming lexer instance to avoid per-call allocations.
+// It returns io.EOF when there is no more data to parse.
+func (p *ReaderParser) ParseClassAd() (*ast.ClassAd, error) {
+	p.lex.resetForNext()
+	if err := p.lex.skipTrivia(); err != nil {
+		if err == io.EOF {
+			return nil, io.EOF
+		}
+		return nil, err
+	}
+
+	yyParse(p.lex)
+	node, err := p.lex.Result()
+	if err != nil {
+		return nil, err
+	}
+	if classad, ok := node.(*ast.ClassAd); ok {
+		return classad, nil
+	}
+	return nil, fmt.Errorf("failed to parse ClassAd")
 }
 
 // ParseScopedIdentifier parses an identifier that may have a scope prefix.

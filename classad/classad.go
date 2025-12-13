@@ -1056,6 +1056,20 @@ func (c *ClassAd) valueToExpr(val Value) ast.Expr {
 		if boolVal, err := val.BoolValue(); err == nil {
 			return &ast.BooleanLiteral{Value: boolVal}
 		}
+	case ListValue:
+		list, err := val.ListValue()
+		if err == nil {
+			elements := make([]ast.Expr, 0, len(list))
+			for _, item := range list {
+				elements = append(elements, c.valueToExpr(item))
+			}
+			return &ast.ListLiteral{Elements: elements}
+		}
+	case ClassAdValue:
+		adVal, err := val.ClassAdValue()
+		if err == nil && adVal != nil {
+			return &ast.RecordLiteral{ClassAd: adVal.ad}
+		}
 	case UndefinedValue:
 		return &ast.UndefinedLiteral{}
 	case ErrorValue:
