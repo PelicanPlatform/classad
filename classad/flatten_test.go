@@ -113,3 +113,141 @@ func TestFlattenPreservesUnknownReference(t *testing.T) {
 		t.Fatalf("expected unknown reference to remain, got %s", flat.String())
 	}
 }
+
+func TestFlattenBooleanAndShortCircuitFalse(t *testing.T) {
+	ad := New()
+	ad.InsertAttrString("User", "brian")
+
+	expr, err := ParseExpr(`User == "bbockelm" && (Unknown > 0) && true`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+
+	flat := ad.Flatten(expr)
+	if flat.String() != "false" {
+		t.Fatalf("expected short-circuited false, got %s", flat.String())
+	}
+}
+
+func TestFlattenBooleanAndPropagatesRightWhenTrue(t *testing.T) {
+	ad := New()
+	ad.InsertAttrBool("Flag", true)
+
+	expr, err := ParseExpr(`Flag && (Unknown > 0)`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+
+	flat := ad.Flatten(expr)
+	if !strings.Contains(flat.String(), "Unknown > 0") {
+		t.Fatalf("expected right-hand expression to remain, got %s", flat.String())
+	}
+}
+
+func TestFlattenBooleanOrShortCircuitTrue(t *testing.T) {
+	ad := New()
+	ad.InsertAttrBool("Flag", true)
+
+	expr, err := ParseExpr(`Flag || (Unknown > 0)`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+
+	flat := ad.Flatten(expr)
+	if flat.String() != "true" {
+		t.Fatalf("expected short-circuited true, got %s", flat.String())
+	}
+}
+
+func TestFlattenBooleanOrPropagatesRightWhenFalse(t *testing.T) {
+	ad := New()
+	ad.InsertAttrBool("Flag", false)
+
+	expr, err := ParseExpr(`Flag || (Unknown > 0)`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+
+	flat := ad.Flatten(expr)
+	if !strings.Contains(flat.String(), "Unknown > 0") {
+		t.Fatalf("expected right-hand expression to remain, got %s", flat.String())
+	}
+}
+
+func TestFlattenBooleanAndRightLiteralFalse(t *testing.T) {
+	ad := New()
+	ad.InsertAttrBool("Flag", true)
+
+	expr, err := ParseExpr(`Unknown > 0 && false`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+
+	flat := ad.Flatten(expr)
+	if flat.String() != "false" {
+		t.Fatalf("expected false due to right-hand literal, got %s", flat.String())
+	}
+}
+
+func TestFlattenBooleanOrRightLiteralTrue(t *testing.T) {
+	ad := New()
+	ad.InsertAttrBool("Flag", false)
+
+	expr, err := ParseExpr(`Unknown > 0 || true`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+
+	flat := ad.Flatten(expr)
+	if flat.String() != "true" {
+		t.Fatalf("expected true due to right-hand literal, got %s", flat.String())
+	}
+}
+
+func TestFlattenConditionalLiteralCondition(t *testing.T) {
+	ad := New()
+	ad.InsertAttr("X", 1)
+
+	expr, err := ParseExpr(`true ? X : Unknown`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+
+	flat := ad.Flatten(expr)
+	if flat.String() != "1" {
+		t.Fatalf("expected true branch to evaluate to literal, got %s", flat.String())
+	}
+
+	expr2, err := ParseExpr(`false ? X : Unknown`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+	flat2 := ad.Flatten(expr2)
+	if flat2.String() != "Unknown" {
+		t.Fatalf("expected false branch to remain, got %s", flat2.String())
+	}
+}
+
+func TestFlattenIfThenElseLiteralCondition(t *testing.T) {
+	ad := New()
+	ad.InsertAttr("X", 1)
+
+	expr, err := ParseExpr(`ifThenElse(true, X, Unknown)`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+
+	flat := ad.Flatten(expr)
+	if flat.String() != "1" {
+		t.Fatalf("expected true branch to evaluate to literal, got %s", flat.String())
+	}
+
+	expr2, err := ParseExpr(`ifThenElse(false, X, Unknown)`)
+	if err != nil {
+		t.Fatalf("parse expr failed: %v", err)
+	}
+	flat2 := ad.Flatten(expr2)
+	if flat2.String() != "Unknown" {
+		t.Fatalf("expected false branch to remain, got %s", flat2.String())
+	}
+}

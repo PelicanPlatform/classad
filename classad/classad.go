@@ -910,6 +910,44 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		leftVal := c.exprToValue(left)
 		rightVal := c.exprToValue(right)
 
+		// Apply boolean short-circuiting when either side is a literal bool.
+		if v.Op == "&&" || v.Op == "||" {
+			if leftVal.IsBool() {
+				boolVal, err := leftVal.BoolValue()
+				if err != nil {
+					return &ast.ErrorLiteral{}
+				}
+				if v.Op == "&&" {
+					if !boolVal {
+						return &ast.BooleanLiteral{Value: false}
+					}
+					return right
+				}
+				// v.Op == "||"
+				if boolVal {
+					return &ast.BooleanLiteral{Value: true}
+				}
+				return right
+			}
+			if rightVal.IsBool() {
+				boolVal, err := rightVal.BoolValue()
+				if err != nil {
+					return &ast.ErrorLiteral{}
+				}
+				if v.Op == "&&" {
+					if !boolVal {
+						return &ast.BooleanLiteral{Value: false}
+					}
+					return left
+				}
+				// v.Op == "||"
+				if boolVal {
+					return &ast.BooleanLiteral{Value: true}
+				}
+				return left
+			}
+		}
+
 		if !leftVal.IsUndefined() && !rightVal.IsUndefined() {
 			// Try to compute the operation
 			result := c.evaluateBinaryOp(v.Op, leftVal, rightVal)
@@ -982,10 +1020,23 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		for i, arg := range v.Args {
 			args[i] = c.flattenExpr(arg)
 		}
-		return &ast.FunctionCall{
-			Name: v.Name,
-			Args: args,
+
+		// Fold ifThenElse when the condition is a literal boolean after flattening.
+		if strings.EqualFold(v.Name, "ifThenElse") && len(args) == 3 {
+			condVal := c.exprToValue(args[0])
+			if condVal.IsBool() {
+				boolVal, err := condVal.BoolValue()
+				if err != nil {
+					return &ast.ErrorLiteral{}
+				}
+				if boolVal {
+					return args[1]
+				}
+				return args[2]
+			}
 		}
+
+		return &ast.FunctionCall{Name: v.Name, Args: args}
 
 	case *ast.ListLiteral:
 		elements := make([]ast.Expr, len(v.Elements))
