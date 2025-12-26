@@ -1,6 +1,7 @@
 package classad
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 )
@@ -152,6 +153,22 @@ func TestMarshalJSON_NestedClassAd(t *testing.T) {
 	}
 	if config["server"] != "example.com" {
 		t.Errorf("Expected server='example.com', got %v", config["server"])
+	}
+}
+
+func TestUnmarshalJSON_SortsKeys(t *testing.T) {
+	jsonStr := `{"b": 1, "a": 2, "c": 3}`
+	var ad ClassAd
+	if err := json.Unmarshal([]byte(jsonStr), &ad); err != nil {
+		t.Fatalf("UnmarshalJSON failed: %v", err)
+	}
+
+	if ad.String() != "[a = 2; b = 1; c = 3]" {
+		t.Fatalf("expected sorted keys, got %s", ad.String())
+	}
+
+	if ad.MarshalOld() != "a = 2\nb = 1\nc = 3" {
+		t.Fatalf("expected sorted keys in old format, got %s", ad.MarshalOld())
 	}
 }
 
@@ -330,6 +347,53 @@ func TestRoundTrip_ComplexClassAd(t *testing.T) {
 
 	if result1.String() != result2.String() {
 		t.Errorf("Value mismatch: %v vs %v", result1, result2)
+	}
+}
+
+func TestRoundTrip_JSONIdentityWithNested(t *testing.T) {
+	// Intentionally unsorted keys to verify deterministic ordering survives round-trip.
+	source := `[
+		Z = 1;
+		nested = [b = 2; A = 1; c = 3];
+		alpha = [y = 20; x = 10];
+		outer = [
+			inner = [b = 5; a = 4];
+			num = 7
+		];
+		list = { [z = 9; y = 8; x = 7], 5, 4 }
+	]`
+
+	ad1, err := Parse(source)
+	if err != nil {
+		t.Fatalf("failed to parse source ClassAd: %v", err)
+	}
+
+	jsonBytes1, err := json.Marshal(ad1)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	var ad2 ClassAd
+	err = json.Unmarshal(jsonBytes1, &ad2)
+	if err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	// Structural identity: string and old-format renderings must match.
+	if ad1.String() != ad2.String() {
+		t.Fatalf("String mismatch after round-trip:\norig: %s\nnew:  %s", ad1.String(), ad2.String())
+	}
+	if ad1.MarshalOld() != ad2.MarshalOld() {
+		t.Fatalf("MarshalOld mismatch after round-trip:\norig:\n%s\nnew:\n%s", ad1.MarshalOld(), ad2.MarshalOld())
+	}
+
+	// Deterministic JSON: re-marshal should produce identical bytes.
+	jsonBytes2, marshalErr := json.Marshal(&ad2)
+	if marshalErr != nil {
+		t.Fatalf("second marshal failed: %v", marshalErr)
+	}
+	if !bytes.Equal(jsonBytes1, jsonBytes2) {
+		t.Fatalf("JSON not deterministic after round-trip:\nfirst:  %s\nsecond: %s", string(jsonBytes1), string(jsonBytes2))
 	}
 }
 

@@ -142,6 +142,40 @@ func TestSet_Struct(t *testing.T) {
 	}
 }
 
+func TestCaseInsensitiveLookupAndEvaluate(t *testing.T) {
+	ad := New()
+	ad.InsertAttr("Foo", 1)
+
+	if _, ok := ad.Lookup("foo"); !ok {
+		t.Fatalf("Lookup should be case-insensitive")
+	}
+
+	if got, ok := ad.EvaluateAttrInt("FOO"); !ok || got != 1 {
+		t.Fatalf("EvaluateAttrInt should be case-insensitive, got %d", got)
+	}
+}
+
+func TestSetCaseInsensitivePreserveCase(t *testing.T) {
+	ad := New()
+
+	if err := ad.Set("BaR", int64(3)); err != nil {
+		t.Fatalf("initial Set failed: %v", err)
+	}
+
+	if err := ad.Set("bar", int64(5)); err != nil {
+		t.Fatalf("second Set failed: %v", err)
+	}
+
+	attrs := ad.GetAttributes()
+	if len(attrs) != 1 || attrs[0] != "BaR" {
+		t.Fatalf("expected case to be preserved, got %+v", attrs)
+	}
+
+	if got, ok := ad.EvaluateAttrInt("BAR"); !ok || got != 5 {
+		t.Fatalf("expected updated value with case-insensitive lookup, got %d", got)
+	}
+}
+
 func TestGetAs_BasicTypes(t *testing.T) {
 	ad := New()
 	ad.InsertAttr("int", 42)
