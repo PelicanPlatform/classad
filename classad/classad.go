@@ -3,9 +3,12 @@
 package classad
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -17,6 +20,17 @@ import (
 // and to inspect its structure.
 type Expr struct {
 	expr ast.Expr
+}
+
+// Equal reports structural equality between two expressions.
+func (e *Expr) Equal(other *Expr) bool {
+	if e == nil && other == nil {
+		return true
+	}
+	if e == nil || other == nil {
+		return false
+	}
+	return exprEqual(e.internal(), other.internal())
 }
 
 // ParseExpr parses a ClassAd expression string and returns an Expr object.
@@ -133,9 +147,101 @@ func (e *Expr) EvalWithContext(scope, target *ClassAd) Value {
 // ClassAd represents a ClassAd with attributes that can be evaluated.
 // This is the main type for working with ClassAds.
 type ClassAd struct {
-	ad     *ast.ClassAd
-	parent *ClassAd
-	target *ClassAd
+	ad         *ast.ClassAd
+	parent     *ClassAd
+	target     *ClassAd
+	index      map[string]*ast.Expr
+	attrsDirty bool // true when attributes changed since last sort
+}
+
+// Equal reports whether two ClassAds have the same attributes and values, ignoring
+// attribute order and casing of attribute names.
+func (c *ClassAd) Equal(other *ClassAd) bool {
+	if c == nil && other == nil {
+		return true
+	}
+	if c == nil || other == nil {
+		return false
+	}
+
+	c.ensureSorted()
+	other.ensureSorted()
+
+	if len(c.ad.Attributes) != len(other.ad.Attributes) {
+		return false
+	}
+
+	for i := range c.ad.Attributes {
+		left := c.ad.Attributes[i]
+		right := other.ad.Attributes[i]
+		if normalizeName(left.Name) != normalizeName(right.Name) {
+			return false
+		}
+		if !exprEqual(left.Value, right.Value) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// normalizeName returns a case-insensitive key for attribute lookups.
+func normalizeName(name string) string {
+	return strings.ToLower(name)
+}
+
+// rebuildIndex recreates the fast lookup map from the underlying attributes.
+func (c *ClassAd) rebuildIndex() {
+	if c.ad == nil {
+		c.index = nil
+		return
+	}
+	if c.index == nil {
+		c.index = make(map[string]*ast.Expr, len(c.ad.Attributes))
+	} else {
+		for k := range c.index {
+			delete(c.index, k)
+		}
+	}
+	for i := range c.ad.Attributes {
+		attr := c.ad.Attributes[i]
+		c.index[normalizeName(attr.Name)] = &attr.Value
+	}
+}
+
+// ensureSorted sorts attributes in-place by normalized name when dirty,
+// then rebuilds the index so pointers remain valid.
+func (c *ClassAd) ensureSorted() {
+	if c.ad == nil {
+		c.attrsDirty = false
+		return
+	}
+	if !c.attrsDirty {
+		c.ensureIndex()
+		return
+	}
+
+	sort.SliceStable(c.ad.Attributes, func(i, j int) bool {
+		iName := normalizeName(c.ad.Attributes[i].Name)
+		jName := normalizeName(c.ad.Attributes[j].Name)
+		if iName == jName {
+			return c.ad.Attributes[i].Name < c.ad.Attributes[j].Name
+		}
+		return iName < jName
+	})
+	c.attrsDirty = false
+	c.rebuildIndex()
+}
+
+func (c *ClassAd) markDirty() {
+	c.attrsDirty = true
+}
+
+// ensureIndex lazily initializes the lookup map if needed.
+func (c *ClassAd) ensureIndex() {
+	if c.index == nil {
+		c.rebuildIndex()
+	}
 }
 
 // New creates a new empty ClassAd.
@@ -144,6 +250,8 @@ func New() *ClassAd {
 		ad: &ast.ClassAd{
 			Attributes: []*ast.AttributeAssignment{},
 		},
+		index:      map[string]*ast.Expr{},
+		attrsDirty: false,
 	}
 }
 
@@ -156,7 +264,9 @@ func Parse(input string) (*ClassAd, error) {
 	if ad == nil {
 		return nil, fmt.Errorf("failed to parse ClassAd")
 	}
-	return &ClassAd{ad: ad}, nil
+	obj := &ClassAd{ad: ad, attrsDirty: true}
+	obj.rebuildIndex()
+	return obj, nil
 }
 
 // ParseOld parses a ClassAd in the "old" HTCondor format and returns a ClassAd object.
@@ -174,7 +284,9 @@ func ParseOld(input string) (*ClassAd, error) {
 	if ad == nil {
 		return nil, fmt.Errorf("failed to parse old ClassAd")
 	}
-	return &ClassAd{ad: ad}, nil
+	obj := &ClassAd{ad: ad, attrsDirty: true}
+	obj.rebuildIndex()
+	return obj, nil
 }
 
 // String returns the string representation of the ClassAd.
@@ -182,7 +294,20 @@ func (c *ClassAd) String() string {
 	if c.ad == nil {
 		return "[]"
 	}
-	return c.ad.String()
+
+	c.ensureSorted()
+	var b strings.Builder
+	b.WriteByte('[')
+	for i, attr := range c.ad.Attributes {
+		if i > 0 {
+			b.WriteString("; ")
+		}
+		b.WriteString(attr.Name)
+		b.WriteString(" = ")
+		b.WriteString(attr.Value.String())
+	}
+	b.WriteByte(']')
+	return b.String()
 }
 
 // ToOldFormat serializes the ClassAd to old HTCondor format (newline-delimited).
@@ -198,6 +323,7 @@ func (c *ClassAd) MarshalOld() string {
 		return ""
 	}
 
+	c.ensureSorted()
 	result := ""
 	for i, attr := range c.ad.Attributes {
 		if i > 0 {
@@ -213,13 +339,13 @@ func (c *ClassAd) Insert(name string, expr ast.Expr) {
 	if c.ad == nil {
 		c.ad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
 	}
+	c.ensureIndex()
+	c.markDirty()
 
-	// Check if attribute already exists and update it
-	for i, attr := range c.ad.Attributes {
-		if attr.Name == name {
-			c.ad.Attributes[i].Value = expr
-			return
-		}
+	normalized := normalizeName(name)
+	if ptr, ok := c.index[normalized]; ok {
+		*ptr = expr
+		return
 	}
 
 	// Add new attribute
@@ -227,6 +353,7 @@ func (c *ClassAd) Insert(name string, expr ast.Expr) {
 		Name:  name,
 		Value: expr,
 	})
+	c.index[normalized] = &c.ad.Attributes[len(c.ad.Attributes)-1].Value
 }
 
 // InsertExpr inserts an attribute with an Expr value into the ClassAd.
@@ -352,6 +479,8 @@ func (c *ClassAd) InsertListElement(name string, element *Expr) {
 	if c.ad == nil {
 		c.ad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
 	}
+	c.ensureIndex()
+	c.markDirty()
 
 	var astExpr ast.Expr
 	if element == nil {
@@ -360,18 +489,13 @@ func (c *ClassAd) InsertListElement(name string, element *Expr) {
 		astExpr = element.internal()
 	}
 
-	// Check if attribute already exists
-	for i, attr := range c.ad.Attributes {
-		if attr.Name == name {
-			// If it's a list, append to it
-			if list, ok := attr.Value.(*ast.ListLiteral); ok {
-				list.Elements = append(list.Elements, astExpr)
-				return
-			}
-			// Otherwise, replace with a new list containing the element
-			c.ad.Attributes[i].Value = &ast.ListLiteral{Elements: []ast.Expr{astExpr}}
+	if ptr, ok := c.index[normalizeName(name)]; ok {
+		if list, ok := (*ptr).(*ast.ListLiteral); ok {
+			list.Elements = append(list.Elements, astExpr)
 			return
 		}
+		*ptr = &ast.ListLiteral{Elements: []ast.Expr{astExpr}}
+		return
 	}
 
 	// Add new list attribute
@@ -379,6 +503,7 @@ func (c *ClassAd) InsertListElement(name string, element *Expr) {
 		Name:  name,
 		Value: &ast.ListLiteral{Elements: []ast.Expr{astExpr}},
 	})
+	c.index[normalizeName(name)] = &c.ad.Attributes[len(c.ad.Attributes)-1].Value
 }
 
 // Lookup returns the unevaluated expression for an attribute.
@@ -396,11 +521,10 @@ func (c *ClassAd) Lookup(name string) (*Expr, bool) {
 	if c.ad == nil {
 		return nil, false
 	}
+	c.ensureIndex()
 
-	for _, attr := range c.ad.Attributes {
-		if attr.Name == name {
-			return &Expr{expr: attr.Value}, true
-		}
+	if ptr, ok := c.index[normalizeName(name)]; ok {
+		return &Expr{expr: *ptr}, true
 	}
 	return nil, false
 }
@@ -412,11 +536,10 @@ func (c *ClassAd) lookupInternal(name string) ast.Expr {
 	if c.ad == nil {
 		return nil
 	}
+	c.ensureIndex()
 
-	for _, attr := range c.ad.Attributes {
-		if attr.Name == name {
-			return attr.Value
-		}
+	if ptr, ok := c.index[normalizeName(name)]; ok {
+		return *ptr
 	}
 	return nil
 }
@@ -556,10 +679,20 @@ func (c *ClassAd) Delete(name string) bool {
 	if c.ad == nil {
 		return false
 	}
+	c.ensureIndex()
+	c.markDirty()
 
-	for i, attr := range c.ad.Attributes {
-		if attr.Name == name {
+	normalized := normalizeName(name)
+	ptr, ok := c.index[normalized]
+	if !ok {
+		return false
+	}
+
+	// Find the matching attribute by pointer equality on Value.
+	for i := range c.ad.Attributes {
+		if &c.ad.Attributes[i].Value == ptr {
 			c.ad.Attributes = append(c.ad.Attributes[:i], c.ad.Attributes[i+1:]...)
+			delete(c.index, normalized)
 			return true
 		}
 	}
@@ -579,6 +712,8 @@ func (c *ClassAd) Clear() {
 	if c.ad != nil {
 		c.ad.Attributes = []*ast.AttributeAssignment{}
 	}
+	c.index = map[string]*ast.Expr{}
+	c.attrsDirty = false
 }
 
 // GetAttributes returns a list of all attribute names.
@@ -1129,6 +1264,111 @@ func (c *ClassAd) valueToExpr(val Value) ast.Expr {
 	return &ast.UndefinedLiteral{}
 }
 
+// exprEqual compares two ast expressions for structural equality.
+func exprEqual(a, b ast.Expr) bool {
+	if a == nil && b == nil {
+		return true
+	}
+	if a == nil || b == nil {
+		return false
+	}
+
+	switch av := a.(type) {
+	case *ast.IntegerLiteral:
+		bv, ok := b.(*ast.IntegerLiteral)
+		return ok && av.Value == bv.Value
+	case *ast.RealLiteral:
+		bv, ok := b.(*ast.RealLiteral)
+		return ok && floatEqual(av.Value, bv.Value)
+	case *ast.StringLiteral:
+		bv, ok := b.(*ast.StringLiteral)
+		return ok && av.Value == bv.Value
+	case *ast.BooleanLiteral:
+		bv, ok := b.(*ast.BooleanLiteral)
+		return ok && av.Value == bv.Value
+	case *ast.UndefinedLiteral:
+		_, ok := b.(*ast.UndefinedLiteral)
+		return ok
+	case *ast.ErrorLiteral:
+		_, ok := b.(*ast.ErrorLiteral)
+		return ok
+	case *ast.AttributeReference:
+		bv, ok := b.(*ast.AttributeReference)
+		return ok && av.Scope == bv.Scope && strings.EqualFold(av.Name, bv.Name)
+	case *ast.BinaryOp:
+		bv, ok := b.(*ast.BinaryOp)
+		return ok && av.Op == bv.Op && exprEqual(av.Left, bv.Left) && exprEqual(av.Right, bv.Right)
+	case *ast.UnaryOp:
+		bv, ok := b.(*ast.UnaryOp)
+		return ok && av.Op == bv.Op && exprEqual(av.Expr, bv.Expr)
+	case *ast.ConditionalExpr:
+		bv, ok := b.(*ast.ConditionalExpr)
+		return ok && exprEqual(av.Condition, bv.Condition) && exprEqual(av.TrueExpr, bv.TrueExpr) && exprEqual(av.FalseExpr, bv.FalseExpr)
+	case *ast.ElvisExpr:
+		bv, ok := b.(*ast.ElvisExpr)
+		return ok && exprEqual(av.Left, bv.Left) && exprEqual(av.Right, bv.Right)
+	case *ast.FunctionCall:
+		bv, ok := b.(*ast.FunctionCall)
+		if !ok || !strings.EqualFold(av.Name, bv.Name) || len(av.Args) != len(bv.Args) {
+			return false
+		}
+		for i := range av.Args {
+			if !exprEqual(av.Args[i], bv.Args[i]) {
+				return false
+			}
+		}
+		return true
+	case *ast.ListLiteral:
+		bv, ok := b.(*ast.ListLiteral)
+		if !ok || len(av.Elements) != len(bv.Elements) {
+			return false
+		}
+		for i := range av.Elements {
+			if !exprEqual(av.Elements[i], bv.Elements[i]) {
+				return false
+			}
+		}
+		return true
+	case *ast.RecordLiteral:
+		bv, ok := b.(*ast.RecordLiteral)
+		if !ok {
+			return false
+		}
+		left := &ClassAd{ad: av.ClassAd, attrsDirty: true}
+		left.rebuildIndex()
+		right := &ClassAd{ad: bv.ClassAd, attrsDirty: true}
+		right.rebuildIndex()
+		return left.Equal(right)
+	case *ast.SelectExpr:
+		bv, ok := b.(*ast.SelectExpr)
+		return ok && strings.EqualFold(av.Attr, bv.Attr) && exprEqual(av.Record, bv.Record)
+	case *ast.SubscriptExpr:
+		bv, ok := b.(*ast.SubscriptExpr)
+		return ok && exprEqual(av.Container, bv.Container) && exprEqual(av.Index, bv.Index)
+	default:
+		return false
+	}
+}
+
+// floatEqual compares two float64 values with a relative tolerance to account for
+// floating point rounding. NaN only equals NaN; +Inf/-Inf must match exactly.
+func floatEqual(a, b float64) bool {
+	if math.IsNaN(a) || math.IsNaN(b) {
+		return math.IsNaN(a) && math.IsNaN(b)
+	}
+	if math.IsInf(a, 0) || math.IsInf(b, 0) {
+		return math.IsInf(a, 1) == math.IsInf(b, 1) && math.IsInf(a, -1) == math.IsInf(b, -1)
+	}
+
+	const relTol = 1e-9
+	diff := math.Abs(a - b)
+	if diff == 0 {
+		return true
+	}
+	mag := math.Max(math.Abs(a), math.Abs(b))
+	return diff <= relTol*mag
+}
+
 // Helper functions for evaluating operations during flattening
 func (c *ClassAd) evaluateBinaryOp(op string, left, right Value) Value {
 	// Create a temporary evaluator to use its operator logic
@@ -1169,22 +1409,32 @@ func (c *ClassAd) MarshalJSON() ([]byte, error) {
 		return []byte("{}"), nil
 	}
 
-	result := make(map[string]interface{})
-	for _, attr := range c.ad.Attributes {
+	c.ensureSorted()
+	var buf bytes.Buffer
+	buf.WriteByte('{')
+	for i, attr := range c.ad.Attributes {
+		if i > 0 {
+			buf.WriteByte(',')
+		}
+		keyBytes, err := json.Marshal(attr.Name)
+		if err != nil {
+			return nil, err
+		}
 		value, err := c.marshalValue(attr.Value)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal attribute %s: %w", attr.Name, err)
 		}
-		result[attr.Name] = value
+		valBytes, err := json.Marshal(value)
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(keyBytes)
+		buf.WriteByte(':')
+		buf.Write(valBytes)
 	}
+	buf.WriteByte('}')
 
-	jsonBytes, err := json.Marshal(result)
-	if err != nil {
-		return nil, err
-	}
-
-	// Post-process to escape forward slashes in /Expr(...)/ patterns
-	// Go's json.Marshal doesn't escape / by default, but we prefer \/ for expressions
+	jsonBytes := buf.Bytes()
 	jsonBytes = []byte(strings.ReplaceAll(string(jsonBytes), "\"/Expr(", "\"\\/Expr("))
 	jsonBytes = []byte(strings.ReplaceAll(string(jsonBytes), ")/\"", ")\\/\""))
 
@@ -1216,17 +1466,14 @@ func (c *ClassAd) marshalValue(expr ast.Expr) (interface{}, error) {
 		}
 		return list, nil
 	case *ast.RecordLiteral:
-		// Nested ClassAd
-		nested := &ClassAd{ad: v.ClassAd}
-		nestedMap := make(map[string]interface{})
-		for _, attr := range v.ClassAd.Attributes {
-			val, err := nested.marshalValue(attr.Value)
-			if err != nil {
-				return nil, err
-			}
-			nestedMap[attr.Name] = val
+		// Nested ClassAd: serialize deterministically and embed as raw JSON.
+		nested := &ClassAd{ad: v.ClassAd, attrsDirty: true}
+		nested.rebuildIndex()
+		nestedBytes, err := nested.MarshalJSON()
+		if err != nil {
+			return nil, err
 		}
-		return nestedMap, nil
+		return json.RawMessage(nestedBytes), nil
 	default:
 		// Complex expression - serialize as string with special markers
 		// Format: /Expr(<expression>)/
@@ -1263,9 +1510,25 @@ func (c *ClassAd) UnmarshalJSON(data []byte) error {
 			Value: expr,
 		})
 	}
+	sortAttributeAssignments(attributes)
 
 	c.ad = &ast.ClassAd{Attributes: attributes}
+	c.attrsDirty = true
+	c.rebuildIndex()
 	return nil
+}
+
+// sortAttributeAssignments provides deterministic ordering by case-insensitive name with
+// a secondary case-sensitive tie-breaker to preserve stable behavior.
+func sortAttributeAssignments(attrs []*ast.AttributeAssignment) {
+	sort.SliceStable(attrs, func(i, j int) bool {
+		iName := normalizeName(attrs[i].Name)
+		jName := normalizeName(attrs[j].Name)
+		if iName == jName {
+			return attrs[i].Name < attrs[j].Name
+		}
+		return iName < jName
+	})
 }
 
 // unmarshalValue converts a JSON value back into an AST expression.
@@ -1283,8 +1546,7 @@ func (c *ClassAd) unmarshalValue(value interface{}) (ast.Expr, error) {
 		}
 		return &ast.RealLiteral{Value: v}, nil
 	case string:
-		// Check if it's an expression string
-		// Only accept the format /Expr(...)/
+		// Check if it's an expression string.
 		if strings.HasPrefix(v, "/Expr(") && strings.HasSuffix(v, ")/") {
 			exprStr := v[6 : len(v)-2] // Remove "/Expr(" and ")/"
 			return c.parseExpression(exprStr)
@@ -1315,6 +1577,7 @@ func (c *ClassAd) unmarshalValue(value interface{}) (ast.Expr, error) {
 				Value: expr,
 			})
 		}
+		sortAttributeAssignments(attributes)
 		return &ast.RecordLiteral{
 			ClassAd: &ast.ClassAd{Attributes: attributes},
 		}, nil
