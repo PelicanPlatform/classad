@@ -28,7 +28,7 @@ func ParseClassAd(input string) (*ast.ClassAd, error) {
 	if classad, ok := node.(*ast.ClassAd); ok {
 		return classad, nil
 	}
-	return nil, fmt.Errorf("parsed input is not a ClassAd")
+	return nil, fmt.Errorf("parsed input is not a ClassAd, got %T", node)
 }
 
 // ParseExpr parses an expression string and returns the expression AST.
@@ -41,7 +41,7 @@ func ParseExpr(input string) (ast.Expr, error) {
 	if expr, ok := node.(ast.Expr); ok {
 		return expr, nil
 	}
-	return nil, fmt.Errorf("parsed input is not an expression")
+	return nil, fmt.Errorf("parsed input is not an expression, got %T", node)
 }
 
 // ReaderParser parses consecutive ClassAds from a buffered reader without
