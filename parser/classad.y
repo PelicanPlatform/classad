@@ -59,6 +59,12 @@ start
 				lex.SetResult($1)
 			}
 		}
+	| expr
+		{
+			if lex, ok := yylex.(interface{ SetResult(ast.Node) }); ok {
+				lex.SetResult($1)
+			}
+		}
 	;
 
 classad
