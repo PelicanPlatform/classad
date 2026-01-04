@@ -10,7 +10,8 @@ import (
 	"github.com/PelicanPlatform/classad/ast"
 )
 
-// Parse parses a ClassAd expression string and returns the AST.
+// Parse parses a ClassAd or expression string and returns the AST.
+// For ClassAd-only parsing, use ParseClassAd. For expression-only parsing, use ParseExpr.
 func Parse(input string) (ast.Node, error) {
 	lex := NewLexer(input)
 	yyParse(lex)
@@ -18,6 +19,7 @@ func Parse(input string) (ast.Node, error) {
 }
 
 // ParseClassAd parses a ClassAd and returns a ClassAd AST node.
+// Returns an error if the input is not a valid ClassAd (e.g., if it's a bare expression).
 func ParseClassAd(input string) (*ast.ClassAd, error) {
 	node, err := Parse(input)
 	if err != nil {
@@ -26,7 +28,20 @@ func ParseClassAd(input string) (*ast.ClassAd, error) {
 	if classad, ok := node.(*ast.ClassAd); ok {
 		return classad, nil
 	}
-	return nil, nil
+	return nil, fmt.Errorf("parsed input is not a ClassAd, got %T", node)
+}
+
+// ParseExpr parses an expression string and returns the expression AST.
+// Returns an error if the input is not a valid expression.
+func ParseExpr(input string) (ast.Expr, error) {
+	node, err := Parse(input)
+	if err != nil {
+		return nil, err
+	}
+	if expr, ok := node.(ast.Expr); ok {
+		return expr, nil
+	}
+	return nil, fmt.Errorf("parsed input is not an expression, got %T", node)
 }
 
 // ReaderParser parses consecutive ClassAds from a buffered reader without

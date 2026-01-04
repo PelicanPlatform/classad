@@ -2,6 +2,7 @@ package parser
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -373,5 +374,142 @@ func TestStreamingLexerSingleCharOperators(t *testing.T) {
 		if lex.err != nil {
 			t.Fatalf("input %q: unexpected error %v", tc.input, lex.err)
 		}
+	}
+}
+
+func TestParseExpr(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{
+			name:    "simple integer",
+			input:   "42",
+			wantErr: false,
+		},
+		{
+			name:    "simple arithmetic",
+			input:   "2 + 3",
+			wantErr: false,
+		},
+		{
+			name:    "complex arithmetic",
+			input:   "2 + 3 * 4",
+			wantErr: false,
+		},
+		{
+			name:    "boolean expression",
+			input:   "(x > 5) && (y < 10)",
+			wantErr: false,
+		},
+		{
+			name:    "string literal",
+			input:   `"hello world"`,
+			wantErr: false,
+		},
+		{
+			name:    "list literal",
+			input:   "{1, 2, 3, 4, 5}",
+			wantErr: false,
+		},
+		{
+			name:    "function call",
+			input:   `strcat("Hello", " ", "World")`,
+			wantErr: false,
+		},
+		{
+			name:    "conditional expression",
+			input:   `x > 0 ? "positive" : "non-positive"`,
+			wantErr: false,
+		},
+		{
+			name:    "attribute reference",
+			input:   "MY.attr",
+			wantErr: false,
+		},
+		{
+			name:    "boolean literal",
+			input:   "true",
+			wantErr: false,
+		},
+		{
+			name:    "undefined literal",
+			input:   "undefined",
+			wantErr: false,
+		},
+		{
+			name:    "error literal",
+			input:   "error",
+			wantErr: false,
+		},
+		{
+			name:    "record literal",
+			input:   "[a = 1; b = 2]",
+			wantErr: false,
+		},
+		{
+			name:    "nested expression",
+			input:   "((1 + 2) * (3 + 4))",
+			wantErr: false,
+		},
+		{
+			name:    "syntax error",
+			input:   "2 + +",
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := ParseExpr(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseExpr(%q) expected error, got nil", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseExpr(%q) unexpected error: %v", tt.input, err)
+			}
+			if expr == nil {
+				t.Fatalf("ParseExpr(%q) returned nil expression", tt.input)
+			}
+			// Verify it implements ast.Expr interface
+			if _, ok := expr.(ast.Expr); !ok {
+				t.Fatalf("ParseExpr(%q) result does not implement ast.Expr", tt.input)
+			}
+		})
+	}
+}
+
+func TestParseExprTypeChecking(t *testing.T) {
+	// Test that ParseExpr returns different types for different inputs
+	tests := []struct {
+		name        string
+		input       string
+		expectedTyp string
+	}{
+		{"integer", "42", "*ast.IntegerLiteral"},
+		{"real", "3.14", "*ast.RealLiteral"},
+		{"string", `"hello"`, "*ast.StringLiteral"},
+		{"boolean", "true", "*ast.BooleanLiteral"},
+		{"list", "{1, 2}", "*ast.ListLiteral"},
+		{"binary op", "1 + 2", "*ast.BinaryOp"},
+		{"attribute ref", "x", "*ast.AttributeReference"},
+		{"function call", "func()", "*ast.FunctionCall"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := ParseExpr(tt.input)
+			if err != nil {
+				t.Fatalf("ParseExpr(%q) unexpected error: %v", tt.input, err)
+			}
+			typeName := fmt.Sprintf("%T", expr)
+			if typeName != tt.expectedTyp {
+				t.Fatalf("ParseExpr(%q) returned type %s, want %s", tt.input, typeName, tt.expectedTyp)
+			}
+		})
 	}
 }
