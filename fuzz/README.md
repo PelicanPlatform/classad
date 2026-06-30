@@ -200,6 +200,9 @@ renders them. Value semantics still use the eagerly-evaluated elements.
 - **Integer-literal overflow** (`9223372036854775808`): the reference engine
   silently evaluates it to `0` (a libclassad bug, reported upstream); Go rejects
   it at parse time. Not mirrored.
+Surprising or likely-buggy libclassad behaviors found along the way are
+collected in [`CPP_QUIRKS.md`](CPP_QUIRKS.md) for upstream reporting.
+
 - **libclassad cyclic-evaluation hang** (`[A0 = 0 ? e : A0]`): libclassad
   infinite-loops on a cyclic self-reference reached through a lazy operand (a
   ternary/elvis branch, an unknown call, …) where its cycle guard never fires.
