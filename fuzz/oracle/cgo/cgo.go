@@ -21,6 +21,7 @@ package cgo
 import "C"
 
 import (
+	"sync"
 	"time"
 	"unsafe"
 
@@ -30,10 +31,21 @@ import (
 // Name identifies this engine in divergence reports.
 const Name = "cpp"
 
+// cppMu serializes all calls into libclassad. libclassad is not thread-safe
+// (it carries global/static evaluation state), so two concurrent evaluations
+// corrupt each other. This matters because EvalAdTimeout abandons a goroutine
+// that is stuck in a libclassad infinite loop (see below); without this lock
+// that leaked goroutine would run concurrently with the next input and produce
+// spurious divergences.
+var cppMu sync.Mutex
+
 // EvalAd parses src as a single ClassAd and evaluates every top-level
 // attribute. It returns the canonical encoding of the resulting ad. parsed is
 // false when libclassad rejects the input at parse time.
 func EvalAd(src string) (encoded string, parsed bool) {
+	cppMu.Lock()
+	defer cppMu.Unlock()
+
 	csrc := C.CString(src)
 	defer C.free(unsafe.Pointer(csrc))
 
@@ -50,10 +62,14 @@ func EvalAd(src string) (encoded string, parsed bool) {
 // on some cyclic self-references reached through lazy operands (e.g.
 // [A0 = 0 ? e : A0], where its cycle guard never fires) -- a libclassad bug.
 // A cgo call cannot be interrupted, so the work runs in a separate goroutine;
-// on timeout we abandon it (the goroutine leaks, spinning in the C++ loop) and
-// report timedOut. The Go engine detects these cycles and returns error, so
-// such inputs are uncomparable rather than a Go bug; the differ treats a
-// timeout as a non-divergence.
+// on timeout we abandon it (the goroutine leaks, spinning in the C++ loop while
+// holding cppMu) and report timedOut. The Go engine detects these cycles and
+// returns error, so such inputs are uncomparable rather than a Go bug; the
+// differ treats a timeout as a non-divergence. Because the leaked goroutine
+// keeps cppMu held, later evaluations in the same process block on the lock and
+// also time out (rather than running concurrently and corrupting libclassad's
+// global state) -- correctness is preserved at the cost of throughput after a
+// hang, which a fresh process (a new fuzz worker) resets.
 func EvalAdTimeout(src string, timeout time.Duration) (encoded string, parsed, timedOut bool) {
 	type result struct {
 		enc string
