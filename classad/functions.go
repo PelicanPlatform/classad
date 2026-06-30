@@ -185,13 +185,17 @@ func builtinSubstr(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// Check for error or undefined
+	// In the reference engine an undefined argument dominates over an error
+	// one (e.g. substr(error, undefined, 1) is undefined), so check all
+	// arguments for undefined first, then for error.
+	for _, arg := range args {
+		if arg.IsUndefined() {
+			return NewUndefinedValue()
+		}
+	}
 	for _, arg := range args {
 		if arg.IsError() {
 			return NewErrorValue()
-		}
-		if arg.IsUndefined() {
-			return NewUndefinedValue()
 		}
 	}
 

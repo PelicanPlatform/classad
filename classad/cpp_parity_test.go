@@ -146,6 +146,11 @@ func TestCppParity(t *testing.T) {
 		{`quantize(12, {5, 10, 15, 20})`, "I:15"},
 		{`quantize(25, {5, 10, 15, 20})`, "I:40"},
 
+		// substr: an undefined argument dominates over an error one.
+		{`substr(error, 1, 2)`, "E"},
+		{`substr(error, undefined, 1)`, "U"},
+		{`substr(error, error, undefined)`, "U"},
+
 		// string()/strcat() scalar coercion; reals use %.15E (0 -> "0.0").
 		{`string(1.5)`, "S:1.500000000000000E+00"},
 		{`string(0.0)`, "S:0.0"},
