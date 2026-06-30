@@ -152,9 +152,13 @@ precedence (`substr`/`strcmp`/`member`), real division by zero (`+Inf`→error,
 `-Inf`/`NaN`→value), large-integer `round`/`floor` precision, list coercion via
 the sink unparse format, and removing the non-reference `length()`.
 
-The bucketed `cafuzz` survey, plus fixing a harness bug (see below), drove the
-semantic-divergence rate (random ads, `-ignore-parse`) from ~3800/5000 down to
-~10–18/5000 (~99.7%).
+The bucketed `cafuzz` survey, plus a harness-bug fix and the list refactor
+(below), drove the semantic-divergence rate over random generated ads
+(`-ignore-parse`) to **0 in 240,000**. Coverage-guided mutation (`go test
+-fuzz`) then found further operator/function gaps the generator does not emit,
+which were also fixed (bitwise operators, case-insensitive function names,
+`substr` negative/out-of-range offsets, duplicate attribute names, and cyclic
+references — see the `classad:` commits).
 
 #### A harness bug, not a Go bug
 
@@ -169,37 +173,28 @@ evaluating elements (`shim.cc`). Lesson: when a differential harness reaches
 into one engine's internals, it can manufacture divergences — verify surprising
 ones against the real CLI (`classad_eval`).
 
+#### The list refactor
+
+String coercion of a list/nested-ad with non-literal elements once differed
+(`string({1, 1+1})` is `"{ 1,1 + 1 }"` in the reference — the *source*
+expression — but Go had only the evaluated value). This is now matched: list
+values carry their source element expressions ([`classad/evaluator.go`](../classad/evaluator.go)),
+the parser preserves explicit parentheses, and a reference-faithful expression
+unparser ([`classad/unparse.go`](../classad/unparse.go), a port of `sink.cpp`)
+renders them. Value semantics still use the eagerly-evaluated elements.
+
 ### Known remaining divergences
 
-The residual ~0.3% is **one genuine issue**: string coercion of a **list or
-nested classad whose elements are non-literal expressions**. The reference
-engine unparses the *source expressions* —
-
-```
-string({1, 1+1})  →  "{ 1,1 + 1 }"   (reference)   vs   "{ 1,2 }"   (Go)
-toUpper({a+1})    →  "{ A + 1 }"      (reference)   vs   "{ ... }" of the value
-```
-
-— because a libclassad list value *is* its unevaluated `ExprList`, whereas the
-Go engine evaluates list elements eagerly and keeps only the values. Value
-semantics (subscript, comparison, `member`, canonical equality) are already
-correct; only this *stringification* differs, and only when elements are
-non-literal. Lists of literals/scalars match.
-
-Closing it requires (a) carrying the source element expressions on a list value
-and (b) a Go expression unparser that reproduces `ClassAdUnParser` *exactly*
-(operator precedence/parenthesization, `{ a,b }` spacing, `%.15E` reals, string
-escaping, …). Go's existing `ast` `String()` is close but not byte-identical
-(`{(a + 1)}` vs `{ a + 1 }`). That unparser is a sizeable, precedence-aware port
-of `sink.cpp` whose only beneficiary is this narrow stringify-a-list-of-
-expressions case — deliberately left for a focused follow-up.
-
-Closing this fully would require representing list values as lazy expression
-lists in the Go evaluator — a larger change than the targeted semantic fixes
-above.
-
-Two further intentional non-fixes:
-
+- **Nested-ad parent-scope resolution.** A nested ad literal that selects an
+  attribute resolving up its parent scope chain into a cycle —
+  `[A = [].A]` — is `error` in the reference (it resolves `.A` to the parent's
+  cyclic `A`) but `undefined` in Go (select only looks in the immediate ad).
+  Matching it needs nested-ad scope-chain resolution plus cross-scope cycle
+  detection; the case is pathological (cyclic) and left for a focused
+  follow-up. (`[B = [].A]` and other non-cyclic selects already match.)
+- **Non-UTF-8 string literals.** The Go lexer decodes string literals as UTF-8
+  (an invalid byte becomes the 3-byte U+FFFD) while libclassad keeps raw bytes.
+  `FuzzDifferential` skips non-UTF-8 inputs; ClassAd source is text.
 - **`length(...)`** *was* a Go alias for `size()`; the reference engine has no
   such function, so it has been removed (now an error), matching the reference.
 - **Integer-literal overflow** (`9223372036854775808`): the reference engine
