@@ -1102,6 +1102,13 @@ func TestJoin(t *testing.T) {
 		{`join(",", error)`, "E"},
 		{`join(",", 1, 2)`, "S:1,2"},
 		{`join({"a","b"})`, "S:ab"},
+		// With no contributing items, an undefined separator (or any undefined
+		// item) yields undefined, while a defined separator yields "".
+		{`join(undefined, {})`, "U"},
+		{`join(undefined)`, "U"},
+		{`join("-", {})`, "S:"},
+		{`join("-", {undefined})`, "U"},
+		{`join(undefined, {"a","b"})`, "S:ab"},
 	}
 	for _, tc := range cases {
 		ad, err := Parse("[ x = " + tc.expr + " ]")

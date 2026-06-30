@@ -1421,7 +1421,8 @@ func builtinJoin(args []Value) Value {
 		return NewErrorValue()
 	}
 	sep := ""
-	if !args[0].IsUndefined() {
+	sepUndef := args[0].IsUndefined()
+	if !sepUndef {
 		s, ok := classadString(args[0])
 		if !ok {
 			return NewErrorValue()
@@ -1449,7 +1450,10 @@ func builtinJoin(args []Value) Value {
 		buf.WriteString(s)
 		defFlag = true
 	}
-	if undefFlag && !defFlag {
+	// With no contributing (defined) items, the result is undefined if either
+	// the separator or any item was undefined; otherwise it is the empty
+	// string (so join("-", {}) is "" but join(undefined, {}) is undefined).
+	if (undefFlag || sepUndef) && !defFlag {
 		return NewUndefinedValue()
 	}
 	return NewStringValue(buf.String())
