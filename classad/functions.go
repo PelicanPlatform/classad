@@ -297,16 +297,21 @@ func builtinSubstr(args []Value) Value {
 	}
 
 	str, _ := args[0].StringValue()
-	offset, _ := args[1].IntValue()
+	offset64, _ := args[1].IntValue()
 
 	threeArg := len(args) == 3
-	var length int64 // defaults to 0 for the two-argument form
+	var length64 int64 // defaults to 0 for the two-argument form
 	if threeArg {
 		if !args[2].IsInteger() {
 			return NewErrorValue()
 		}
-		length, _ = args[2].IntValue()
+		length64, _ = args[2].IntValue()
 	}
+	// The reference engine reads the offset and length into 32-bit ints, so an
+	// out-of-int32-range argument is truncated (e.g. a huge offset can wrap to
+	// a small or negative value); mirror that before clamping.
+	offset := int64(int32(offset64))
+	length := int64(int32(length64))
 	origLen := length
 
 	// Perl-like substr (matching subString in fnCall.cpp): a negative offset
