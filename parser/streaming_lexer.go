@@ -145,7 +145,10 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 					l.err = err
 					return 0
 				}
-				if peek, err := l.peekRune(); err == nil && peek == '=' {
+				// peekRuneRaw (not peekRune): a non-'=' here must leave nothing
+				// staged as pending, or the following unreadRune('?') would
+				// clobber it and silently drop the peeked character.
+				if peek, err := l.peekRuneRaw(); err == nil && peek == '=' {
 					if err := l.discardRune(); err != nil {
 						l.err = err
 						return 0
@@ -160,7 +163,11 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 					l.err = err
 					return 0
 				}
-				if peek, err := l.peekRune(); err == nil && peek == '=' {
+				// peekRuneRaw (not peekRune): a non-'=' here must leave nothing
+				// staged as pending, or the following unreadRune('!') would
+				// clobber it and silently drop the peeked character (so e.g.
+				// "x=!10" lexed as "x = !0", evaluating !10 to true).
+				if peek, err := l.peekRuneRaw(); err == nil && peek == '=' {
 					if err := l.discardRune(); err != nil {
 						l.err = err
 						return 0

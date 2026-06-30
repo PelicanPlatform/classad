@@ -49,8 +49,12 @@ func TestStreamingLexerOperators(t *testing.T) {
 		expected []int
 	}{
 		{"IS", "a=?=b", []int{IDENTIFIER, IS, IDENTIFIER}},
-		{"UnreadQuestion", "=?x", []int{int('='), int('?')}},
-		{"UnreadBang", "=!x", []int{int('='), int('!')}},
+		// A '=' followed by '?'/'!' that is not '=?='/'=!=' must put back the
+		// second character AND keep the one after it: "=?x"/"=!x" lex as
+		// '=', '?'/'!', then the identifier x (the trailing char must not be
+		// dropped, which it was before the peekRuneRaw fix).
+		{"UnreadQuestion", "=?x", []int{int('='), int('?'), IDENTIFIER}},
+		{"UnreadBang", "=!x", []int{int('='), int('!'), IDENTIFIER}},
 		{"URSHIFT", "1>>>2", []int{INTEGER_LITERAL, URSHIFT, INTEGER_LITERAL}},
 		{"LSHIFT", "1<<2", []int{INTEGER_LITERAL, LSHIFT, INTEGER_LITERAL}},
 	}

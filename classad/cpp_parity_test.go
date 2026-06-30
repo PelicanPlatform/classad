@@ -491,3 +491,28 @@ func TestLazyListSelfReference(t *testing.T) {
 		t.Errorf("a = a+1 should be error, got %v", v.Type())
 	}
 }
+
+// TestNotAfterEquals guards a lexer bug where "=!" (an attribute "=" directly
+// followed by logical not) dropped the character after "!": "A = !10" lexed as
+// "A = !0" and evaluated to true instead of false. The same applied to "=?".
+func TestNotAfterEquals(t *testing.T) {
+	cases := []struct {
+		src  string
+		want bool
+	}{
+		{`[ A = !10 ]`, false}, // !10: 10 is true, so !10 is false
+		{`[ A = !0 ]`, true},
+		{`[ A = !1 ]`, false},
+	}
+	for _, tc := range cases {
+		ad, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.src, err)
+		}
+		v := ad.EvaluateAttr("A")
+		got, gerr := v.BoolValue()
+		if gerr != nil || got != tc.want {
+			t.Errorf("%s: A = %v, want %v", tc.src, v, tc.want)
+		}
+	}
+}
