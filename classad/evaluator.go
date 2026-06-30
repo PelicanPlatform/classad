@@ -1367,6 +1367,33 @@ func (e *Evaluator) evaluateIfThenElse(args []ast.Expr) Value {
 	}
 }
 
+// knownFunctions is the set of built-in function names (lower-cased) the engine
+// recognizes, used to reject an unknown function before evaluating its
+// arguments. It must list every name handled by evaluateFunctionCall (the
+// switch below plus the specially-cased unparse/eval/ifthenelse);
+// TestKnownFunctionsCoversDispatch guards that they stay in sync.
+var knownFunctions = map[string]bool{
+	"unparse": true, "eval": true, "ifthenelse": true,
+	"strcat": true, "substr": true, "size": true, "tolower": true,
+	"toupper": true, "floor": true, "ceiling": true, "ceil": true,
+	"round": true, "random": true, "int": true, "real": true,
+	"isundefined": true, "iserror": true, "isstring": true, "isinteger": true,
+	"isreal": true, "isboolean": true, "islist": true, "isclassad": true,
+	"time": true, "member": true, "stringlistmember": true,
+	"stringlistimember": true, "regexp": true, "string": true, "bool": true,
+	"pow": true, "quantize": true, "sum": true, "avg": true, "min": true,
+	"max": true, "join": true, "split": true, "splitusername": true,
+	"splitslotname": true, "strcmp": true, "stricmp": true, "versioncmp": true,
+	"version_gt": true, "version_ge": true, "version_lt": true,
+	"version_le": true, "version_eq": true, "version_in_range": true,
+	"formattime": true, "interval": true, "identicalmember": true,
+	"anycompare": true, "allcompare": true, "stringlistsize": true,
+	"stringlistsum": true, "stringlistavg": true, "stringlistmin": true,
+	"stringlistmax": true, "stringlistsintersect": true,
+	"stringlistsubsetmatch": true, "stringlistregexpmember": true,
+	"regexpmember": true, "regexps": true, "replace": true, "replaceall": true,
+}
+
 // Built-in function evaluation
 func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// Function names are matched case-insensitively, like the reference engine
@@ -1388,6 +1415,13 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// self-referential B), rather than eagerly evaluating all arguments.
 	if funcName == "ifthenelse" {
 		return e.evaluateIfThenElse(fc.Args)
+	}
+
+	// An unknown function is an error and its arguments are NOT evaluated,
+	// matching the reference engine: A((A0)) is error (not a cyclic-reference
+	// failure on the unevaluated argument), so 0 =!= A((A0)) is true.
+	if !knownFunctions[funcName] {
+		return NewErrorValue()
 	}
 
 	// Evaluate all arguments
