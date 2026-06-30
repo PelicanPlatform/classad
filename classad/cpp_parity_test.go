@@ -659,3 +659,22 @@ func TestUndefinedConditionEvaluatesBothBranches(t *testing.T) {
 		t.Errorf("1 ? 5 : A0 should short-circuit to 5")
 	}
 }
+
+// TestWrongArityNoArgEval guards that a known function called with the wrong
+// number of arguments is an error WITHOUT evaluating its arguments (the
+// reference engine checks arity first). So pow with one argument is error and
+// never evaluates a cyclic argument: A0 = (A ? pow(t) : 0); t = A0 yields
+// undefined (the wrong-arity true branch is an absorbed error value), not the
+// cycle-error Go produced when it evaluated pow's argument. Also: 0-argument
+// aggregates are wrong arity (error), matching the reference.
+func TestWrongArityNoArgEval(t *testing.T) {
+	if ad, _ := Parse(`[ A0 = (A ? pow(t) : 0); t = A0 ]`); !ad.EvaluateAttr("A0").IsUndefined() {
+		t.Errorf("A ? pow(t) : 0 (cyclic t, wrong arity) should be undefined, got %v", ad.EvaluateAttr("A0"))
+	}
+	for _, src := range []string{`[x=sum()]`, `[x=avg()]`, `[x=min()]`, `[x=max()]`, `[x=pow(1)]`, `[x=size(1,2)]`} {
+		ad, _ := Parse(src)
+		if !ad.EvaluateAttr("x").IsError() {
+			t.Errorf("%s should be error (wrong arity)", src)
+		}
+	}
+}

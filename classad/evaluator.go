@@ -1375,31 +1375,47 @@ func (e *Evaluator) evaluateIfThenElse(args []ast.Expr) Value {
 	}
 }
 
-// knownFunctions is the set of built-in function names (lower-cased) the engine
-// recognizes, used to reject an unknown function before evaluating its
-// arguments. It must list every name handled by evaluateFunctionCall (the
-// switch below plus the specially-cased unparse/eval/ifthenelse);
-// TestKnownFunctionsCoversDispatch guards that they stay in sync.
-var knownFunctions = map[string]bool{
-	"unparse": true, "eval": true, "ifthenelse": true,
-	"strcat": true, "substr": true, "size": true, "tolower": true,
-	"toupper": true, "floor": true, "ceiling": true, "ceil": true,
-	"round": true, "random": true, "int": true, "real": true,
-	"isundefined": true, "iserror": true, "isstring": true, "isinteger": true,
-	"isreal": true, "isboolean": true, "islist": true, "isclassad": true,
-	"time": true, "member": true, "stringlistmember": true,
-	"stringlistimember": true, "regexp": true, "string": true, "bool": true,
-	"pow": true, "quantize": true, "sum": true, "avg": true, "min": true,
-	"max": true, "join": true, "split": true, "splitusername": true,
-	"splitslotname": true, "strcmp": true, "stricmp": true, "versioncmp": true,
-	"version_gt": true, "version_ge": true, "version_lt": true,
-	"version_le": true, "version_eq": true, "version_in_range": true,
-	"formattime": true, "interval": true, "identicalmember": true,
-	"anycompare": true, "allcompare": true, "stringlistsize": true,
-	"stringlistsum": true, "stringlistavg": true, "stringlistmin": true,
-	"stringlistmax": true, "stringlistsintersect": true,
-	"stringlistsubsetmatch": true, "stringlistregexpmember": true,
-	"regexpmember": true, "regexps": true, "replace": true, "replaceall": true,
+// funcArity is the accepted argument-count range of a built-in: [min, max],
+// with max == -1 meaning unbounded (variadic).
+type funcArity struct {
+	min, max int
+}
+
+func (a funcArity) accepts(n int) bool {
+	return n >= a.min && (a.max < 0 || n <= a.max)
+}
+
+// functionArity is the set of built-in function names (lower-cased) the engine
+// recognizes, each mapped to its accepted argument-count range. It is used to
+// reject an unknown function -- or a known function called with the wrong
+// number of arguments -- BEFORE evaluating its arguments, matching the
+// reference engine (which checks arity first, so a cyclic/erroring argument to
+// a wrong-arity call is never evaluated). It must list every name handled by
+// evaluateFunctionCall (the switch below plus the specially-cased
+// unparse/eval/ifthenelse); TestKnownFunctionsCoversDispatch guards that they
+// stay in sync.
+var functionArity = map[string]funcArity{
+	"unparse": {1, 1}, "eval": {1, 1}, "ifthenelse": {3, 3},
+	"strcat": {0, -1}, "substr": {2, 3}, "size": {1, 1}, "tolower": {1, 1},
+	"toupper": {1, 1}, "floor": {1, 1}, "ceiling": {1, 1}, "ceil": {1, 1},
+	"round": {1, 1}, "random": {0, 1}, "int": {1, 1}, "real": {1, 1},
+	"isundefined": {1, 1}, "iserror": {1, 1}, "isstring": {1, 1},
+	"isinteger": {1, 1}, "isreal": {1, 1}, "isboolean": {1, 1},
+	"islist": {1, 1}, "isclassad": {1, 1}, "time": {0, 0}, "member": {2, 2},
+	"stringlistmember": {2, 3}, "stringlistimember": {2, 2}, "regexp": {2, 3},
+	"string": {1, 1}, "bool": {1, 1}, "pow": {2, 2}, "quantize": {2, 2},
+	"sum": {1, 1}, "avg": {1, 1}, "min": {1, 1}, "max": {1, 1}, "join": {1, -1},
+	"split": {1, 2}, "splitusername": {1, 1}, "splitslotname": {1, 1},
+	"strcmp": {2, 2}, "stricmp": {2, 2}, "versioncmp": {2, 2},
+	"version_gt": {2, 2}, "version_ge": {2, 2}, "version_lt": {2, 2},
+	"version_le": {2, 2}, "version_eq": {2, 2}, "version_in_range": {3, 3},
+	"formattime": {0, 2}, "interval": {1, 1}, "identicalmember": {2, 2},
+	"anycompare": {3, 3}, "allcompare": {3, 3}, "stringlistsize": {1, 2},
+	"stringlistsum": {1, 2}, "stringlistavg": {1, 2}, "stringlistmin": {1, 2},
+	"stringlistmax": {1, 2}, "stringlistsintersect": {2, 3},
+	"stringlistsubsetmatch": {2, 3}, "stringlistregexpmember": {2, 4},
+	"regexpmember": {2, 3}, "regexps": {3, 4}, "replace": {3, 4},
+	"replaceall": {3, 4},
 }
 
 // Built-in function evaluation
@@ -1425,10 +1441,13 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return e.evaluateIfThenElse(fc.Args)
 	}
 
-	// An unknown function is an error and its arguments are NOT evaluated,
-	// matching the reference engine: A((A0)) is error (not a cyclic-reference
-	// failure on the unevaluated argument), so 0 =!= A((A0)) is true.
-	if !knownFunctions[funcName] {
+	// An unknown function, or a known function called with the wrong number of
+	// arguments, is an error and its arguments are NOT evaluated, matching the
+	// reference engine (which checks arity before evaluating args). So
+	// A((A0)) and pow(A0) -- with A0 the attribute itself -- are error without
+	// the cyclic argument ever being evaluated.
+	arity, known := functionArity[funcName]
+	if !known || !arity.accepts(len(fc.Args)) {
 		return NewErrorValue()
 	}
 

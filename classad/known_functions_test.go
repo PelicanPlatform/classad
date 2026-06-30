@@ -32,8 +32,8 @@ func TestKnownFunctionsCoversDispatch(t *testing.T) {
 	for _, m := range caseRe.FindAllStringSubmatch(region, -1) {
 		for _, s := range strRe.FindAllStringSubmatch(m[1], -1) {
 			n++
-			if !knownFunctions[s[1]] {
-				t.Errorf("dispatch case %q is missing from knownFunctions", s[1])
+			if _, ok := functionArity[s[1]]; !ok {
+				t.Errorf("dispatch case %q is missing from functionArity", s[1])
 			}
 		}
 	}

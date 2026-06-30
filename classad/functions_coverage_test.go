@@ -169,9 +169,11 @@ func TestBuiltinAvg(t *testing.T) {
 			expected: 0.0,
 		},
 		{
-			name:     "no arguments",
-			input:    `[x = avg()]`,
-			expected: 0.0,
+			// 0 arguments is wrong arity: error (the engine rejects it before
+			// evaluating args), matching the reference engine.
+			name:    "no arguments",
+			input:   `[x = avg()]`,
+			isError: true,
 		},
 		{
 			name:    "all undefined",
@@ -264,9 +266,10 @@ func TestBuiltinMin(t *testing.T) {
 			isUndef: true,
 		},
 		{
+			// 0 arguments is wrong arity: error, matching the reference engine.
 			name:    "no arguments",
 			input:   `[x = min()]`,
-			isUndef: true,
+			isError: true,
 		},
 		{
 			name:    "all undefined",
@@ -360,9 +363,10 @@ func TestBuiltinMax(t *testing.T) {
 			isUndef: true,
 		},
 		{
+			// 0 arguments is wrong arity: error, matching the reference engine.
 			name:    "no arguments",
 			input:   `[x = max()]`,
-			isUndef: true,
+			isError: true,
 		},
 		{
 			name:    "all undefined",

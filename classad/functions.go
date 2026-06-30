@@ -1028,7 +1028,9 @@ func builtinSum(args []Value) Value {
 	}
 
 	if len(args) == 0 {
-		return NewIntValue(0)
+		// 0 arguments is wrong arity (the engine rejects it before
+		// evaluating args); the reference engine errors here too.
+		return NewErrorValue()
 	}
 
 	if args[0].IsError() {
@@ -1089,7 +1091,9 @@ func builtinAvg(args []Value) Value {
 	}
 
 	if len(args) == 0 {
-		return NewRealValue(0.0)
+		// 0 arguments is wrong arity (the engine rejects it before
+		// evaluating args); the reference engine errors here too.
+		return NewErrorValue()
 	}
 
 	if args[0].IsError() {
@@ -1152,7 +1156,9 @@ func builtinMin(args []Value) Value {
 	}
 
 	if len(args) == 0 {
-		return NewUndefinedValue()
+		// 0 arguments is wrong arity (the engine rejects it before
+		// evaluating args); the reference engine errors here too.
+		return NewErrorValue()
 	}
 
 	if args[0].IsError() {
@@ -1218,7 +1224,9 @@ func builtinMax(args []Value) Value {
 	}
 
 	if len(args) == 0 {
-		return NewUndefinedValue()
+		// 0 arguments is wrong arity (the engine rejects it before
+		// evaluating args); the reference engine errors here too.
+		return NewErrorValue()
 	}
 
 	if args[0].IsError() {
