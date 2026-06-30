@@ -550,6 +550,14 @@ func (e *Evaluator) evaluateConditional(cond *ast.ConditionalExpr) Value {
 	case lsFalse:
 		return e.Evaluate(cond.FalseExpr)
 	case lsUndef:
+		// An undefined condition yields undefined, but -- unlike a true/false
+		// condition, which evaluates only the taken branch -- the reference
+		// engine still evaluates BOTH branches. An error *value* in a branch is
+		// absorbed (the result stays undefined), but a cyclic self-reference is
+		// a hard failure that propagates: undefined ? 1 : error is undefined,
+		// while undefined ? {} : A0 (with A0 the attribute itself) is error.
+		e.Evaluate(cond.TrueExpr)
+		e.Evaluate(cond.FalseExpr)
 		return NewUndefinedValue()
 	default:
 		return NewErrorValue()

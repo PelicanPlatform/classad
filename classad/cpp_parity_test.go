@@ -638,3 +638,24 @@ func TestElvisPostfixRightGrouping(t *testing.T) {
 		t.Errorf("a = %v, want int(0)", v)
 	}
 }
+
+// TestUndefinedConditionEvaluatesBothBranches guards that a ternary with an
+// undefined condition yields undefined but still evaluates both branches like
+// the reference engine: an error-value branch is absorbed (undefined ? 1 :
+// error is undefined), but a cyclic self-reference branch propagates to error
+// (undefined ? {} : A0, with A0 the attribute itself). A true/false condition
+// still evaluates only the taken branch.
+func TestUndefinedConditionEvaluatesBothBranches(t *testing.T) {
+	// error value in a branch is absorbed -> undefined
+	if ad, _ := Parse(`[ A0 = (undefined ? 1 : error) ]`); !ad.EvaluateAttr("A0").IsUndefined() {
+		t.Errorf("undefined ? 1 : error should be undefined")
+	}
+	// cyclic self-reference in a branch propagates -> error
+	if ad, _ := Parse(`[ A0 = (undefined ? {} : A0) ]`); !ad.EvaluateAttr("A0").IsError() {
+		t.Errorf("undefined ? {} : A0 (self-ref) should be error")
+	}
+	// a true/false condition still short-circuits the untaken (cyclic) branch
+	if ad, _ := Parse(`[ A0 = (1 ? 5 : A0) ]`); func() bool { v := ad.EvaluateAttr("A0"); i, _ := v.IntValue(); return v.IsInteger() && i == 5 }() == false {
+		t.Errorf("1 ? 5 : A0 should short-circuit to 5")
+	}
+}
