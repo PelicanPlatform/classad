@@ -626,9 +626,14 @@ func (e *Evaluator) evaluateDivide(left, right Value) Value {
 	if left.IsInteger() && right.IsInteger() {
 		leftInt, _ := left.IntValue()
 		rightInt, _ := right.IntValue()
-		if leftInt%rightInt == 0 {
-			return NewIntValue(leftInt / rightInt)
+		// Integer / integer yields an integer (truncated toward zero), matching
+		// the C++ reference engine. Guard the one signed-overflow case
+		// (MinInt64 / -1) that would panic in Go; libclassad yields MaxInt64
+		// there, so mirror that.
+		if leftInt == math.MinInt64 && rightInt == -1 {
+			return NewIntValue(math.MaxInt64)
 		}
+		return NewIntValue(leftInt / rightInt)
 	}
 
 	return NewRealValue(leftNum / rightNum)
@@ -648,6 +653,12 @@ func (e *Evaluator) evaluateModulo(left, right Value) Value {
 
 	if rightInt == 0 {
 		return NewErrorValue()
+	}
+
+	// Any integer modulo ±1 is 0; special-casing -1 also avoids the
+	// MinInt64 % -1 signed-overflow panic in Go.
+	if rightInt == -1 {
+		return NewIntValue(0)
 	}
 
 	return NewIntValue(leftInt % rightInt)
