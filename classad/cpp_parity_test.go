@@ -182,6 +182,13 @@ func TestCppParity(t *testing.T) {
 		{`substr(error, 1, 2)`, "E"},
 		{`substr(error, undefined, 1)`, "U"},
 		{`substr(error, error, undefined)`, "U"},
+		// Perl-like negative offsets/lengths with clamping.
+		{`substr("hello", 1, -1)`, "S:ell"},
+		{`substr("hello", -2)`, "S:lo"},
+		{`substr("hello", -1, -1)`, "S:"},
+		{`substr("hello", 0, -1)`, "S:hell"},
+		{`substr("hello", 2, 100)`, "S:llo"},
+		{`substr("hello", 10)`, "S:"},
 		{`strcmp(error, undefined)`, "U"},
 		{`stricmp(undefined, error)`, "U"},
 		{`member(error, undefined)`, "U"},
@@ -276,7 +283,7 @@ func checkValue(v Value, want string) string {
 		if v.String() != want[2:] {
 			return "want " + want[2:] + ", got " + v.String()
 		}
-	case len(want) > 2 && want[:2] == "S:":
+	case len(want) >= 2 && want[:2] == "S:":
 		s, _ := v.StringValue()
 		if !v.IsString() {
 			return "want string, got " + describe()

@@ -299,31 +299,43 @@ func builtinSubstr(args []Value) Value {
 	str, _ := args[0].StringValue()
 	offset, _ := args[1].IntValue()
 
-	// Handle negative offset (from end)
-	if offset < 0 {
-		offset = int64(len(str)) + offset
-	}
-
-	if offset < 0 || offset >= int64(len(str)) {
-		return NewStringValue("")
-	}
-
-	if len(args) == 3 {
+	threeArg := len(args) == 3
+	var length int64 // defaults to 0 for the two-argument form
+	if threeArg {
 		if !args[2].IsInteger() {
 			return NewErrorValue()
 		}
-		length, _ := args[2].IntValue()
+		length, _ = args[2].IntValue()
+	}
+	origLen := length
+
+	// Perl-like substr (matching subString in fnCall.cpp): a negative offset
+	// counts from the end (clamped to 0), an offset past the end is the end; a
+	// non-positive length counts from the end of the string (clamped to 0),
+	// and a too-large length is clamped to what remains.
+	alen := int64(len(str))
+	if offset < 0 {
+		offset = alen + offset
+		if offset < 0 {
+			offset = 0
+		}
+	} else if offset >= alen {
+		offset = alen
+	}
+	if length <= 0 {
+		length = alen - offset + length
 		if length < 0 {
-			return NewErrorValue()
+			length = 0
 		}
-		end := offset + length
-		if end > int64(len(str)) {
-			end = int64(len(str))
-		}
-		return NewStringValue(str[offset:end])
+	} else if length > alen-offset {
+		length = alen - offset
+	}
+	// An explicitly-supplied length of 0 yields the empty string.
+	if threeArg && origLen == 0 {
+		length = 0
 	}
 
-	return NewStringValue(str[offset:])
+	return NewStringValue(str[offset : offset+length])
 }
 
 // builtinSize returns the size of a string or list
