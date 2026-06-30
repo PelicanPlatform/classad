@@ -198,18 +198,27 @@ func (c *ClassAd) dedupAttributes() {
 	if c.ad == nil || len(c.ad.Attributes) < 2 {
 		return
 	}
-	lastIdx := make(map[string]int, len(c.ad.Attributes))
+	// Attribute names are case-insensitive. The reference engine keeps the
+	// first occurrence's name (its casing and position) but the last
+	// occurrence's value: [A=1; a=2] is A==2.
+	firstIdx := make(map[string]int, len(c.ad.Attributes))
+	lastValue := make(map[string]ast.Expr, len(c.ad.Attributes))
+	order := make([]string, 0, len(c.ad.Attributes))
 	for i, attr := range c.ad.Attributes {
-		lastIdx[normalizeName(attr.Name)] = i
+		n := normalizeName(attr.Name)
+		if _, seen := firstIdx[n]; !seen {
+			firstIdx[n] = i
+			order = append(order, n)
+		}
+		lastValue[n] = attr.Value
 	}
-	if len(lastIdx) == len(c.ad.Attributes) {
+	if len(firstIdx) == len(c.ad.Attributes) {
 		return // no duplicates
 	}
-	kept := make([]*ast.AttributeAssignment, 0, len(lastIdx))
-	for i, attr := range c.ad.Attributes {
-		if lastIdx[normalizeName(attr.Name)] == i {
-			kept = append(kept, attr)
-		}
+	kept := make([]*ast.AttributeAssignment, 0, len(firstIdx))
+	for _, n := range order {
+		first := c.ad.Attributes[firstIdx[n]]
+		kept = append(kept, &ast.AttributeAssignment{Name: first.Name, Value: lastValue[n]})
 	}
 	c.ad.Attributes = kept
 }

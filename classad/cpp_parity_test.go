@@ -355,4 +355,17 @@ func TestDuplicateAttributesLastWins(t *testing.T) {
 	if v, _ := ad.EvaluateAttr("B").IntValue(); v != 3 {
 		t.Errorf("B = %d, want 3 (last assignment wins)", v)
 	}
+
+	// Names are case-insensitive: the first occurrence's name casing is kept,
+	// but the last occurrence's value wins ([A=1; a=2] is A==2).
+	ci, err := Parse(`[ A = 1; a = 2 ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := ci.GetAttributes(); len(got) != 1 || got[0] != "A" {
+		t.Errorf("expected single attribute named A, got %v", got)
+	}
+	if v, _ := ci.EvaluateAttr("A").IntValue(); v != 2 {
+		t.Errorf("A = %d, want 2 (last value wins across case-insensitive dup)", v)
+	}
 }
