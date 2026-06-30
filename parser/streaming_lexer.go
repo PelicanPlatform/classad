@@ -345,6 +345,27 @@ func (l *StreamingLexer) peekRune() (rune, error) {
 	return ch, nil
 }
 
+// peekRuneRaw returns the next rune without consuming it and without using the
+// single-slot pending buffer. It is needed where a rune already needs to be
+// pushed back into the pending slot but we still want to look one further
+// ahead (e.g. distinguishing the '/' operator from a "//" or "/*" comment in
+// skipTrivia); using the pending-based peekRune there would clobber the rune
+// being pushed back and silently drop a character such as the divisor in
+// "1/2".
+func (l *StreamingLexer) peekRuneRaw() (rune, error) {
+	if l.hasPending {
+		return l.pendingRune, nil
+	}
+	ch, _, err := l.r.ReadRune()
+	if err != nil {
+		return 0, err
+	}
+	if uerr := l.r.UnreadRune(); uerr != nil {
+		return 0, uerr
+	}
+	return ch, nil
+}
+
 // discardRune consumes a rune and returns any read error.
 func (l *StreamingLexer) discardRune() error {
 	_, _, err := l.readRune()
@@ -363,7 +384,7 @@ func (l *StreamingLexer) skipTrivia() error {
 		}
 
 		if ch == '/' {
-			next, err := l.peekRune()
+			next, err := l.peekRuneRaw()
 			if err == nil {
 				switch next {
 				case '/':
