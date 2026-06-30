@@ -152,26 +152,47 @@ precedence (`substr`/`strcmp`/`member`), real division by zero (`+Inf`→error,
 `-Inf`/`NaN`→value), large-integer `round`/`floor` precision, list coercion via
 the sink unparse format, and removing the non-reference `length()`.
 
-The bucketed `cafuzz` survey drove the semantic-divergence rate (random ads,
-`-ignore-parse`) from ~3800/5000 down to ~50/5000 (~98.7%).
+The bucketed `cafuzz` survey, plus fixing a harness bug (see below), drove the
+semantic-divergence rate (random ads, `-ignore-parse`) from ~3800/5000 down to
+~10–18/5000 (~99.7%).
+
+#### A harness bug, not a Go bug
+
+Much of what first *looked* like an "architectural list" divergence
+(~35/5000) was actually a bug in this fuzzer's C++ oracle: it encoded a list
+value by evaluating each element with the static
+`ClassAd::EvaluateExpr(ad, tree, val)`, which cannot set the parent scope, so a
+bare attribute reference inside a list element (`result = {{a0}[0], 99}`)
+wrongly evaluated to `undefined` instead of resolving against the ad. The Go
+engine was *correct*. Fixed by reconnecting the list's parent scope before
+evaluating elements (`shim.cc`). Lesson: when a differential harness reaches
+into one engine's internals, it can manufacture divergences — verify surprising
+ones against the real CLI (`classad_eval`).
 
 ### Known remaining divergences
 
-Essentially all of the residual ~1% trace to **one architectural difference**:
-the Go engine evaluates list elements **eagerly** and stores evaluated values,
-whereas the reference engine keeps a list as its *unevaluated* expression list
-and evaluates elements lazily in their defining scope. This surfaces as:
+The residual ~0.3% is **one genuine issue**: string coercion of a **list or
+nested classad whose elements are non-literal expressions**. The reference
+engine unparses the *source expressions* —
 
-- **String coercion of lists with non-literal elements** —
-  `string({1, 1+1})` is `"{ 1,1 + 1 }"` in the reference (the source
-  expression) but `"{ 1,2 }"` here (the evaluated value). Lists of literals /
-  scalars do match; `string`/`strcat`/`strcmp`/`stricmp`/`quantize` of such
-  lists are handled.
-- **List/nested-subscript element evaluation** — an element that is a reference
-  or compound expression can evaluate to a different undefined/error/value
-  under eager vs. lazy/scoped evaluation.
-- **`string()`/… of a nested classad** — likewise unparses attribute
-  expressions; still left erroring.
+```
+string({1, 1+1})  →  "{ 1,1 + 1 }"   (reference)   vs   "{ 1,2 }"   (Go)
+toUpper({a+1})    →  "{ A + 1 }"      (reference)   vs   "{ ... }" of the value
+```
+
+— because a libclassad list value *is* its unevaluated `ExprList`, whereas the
+Go engine evaluates list elements eagerly and keeps only the values. Value
+semantics (subscript, comparison, `member`, canonical equality) are already
+correct; only this *stringification* differs, and only when elements are
+non-literal. Lists of literals/scalars match.
+
+Closing it requires (a) carrying the source element expressions on a list value
+and (b) a Go expression unparser that reproduces `ClassAdUnParser` *exactly*
+(operator precedence/parenthesization, `{ a,b }` spacing, `%.15E` reals, string
+escaping, …). Go's existing `ast` `String()` is close but not byte-identical
+(`{(a + 1)}` vs `{ a + 1 }`). That unparser is a sizeable, precedence-aware port
+of `sink.cpp` whose only beneficiary is this narrow stringify-a-list-of-
+expressions case — deliberately left for a focused follow-up.
 
 Closing this fully would require representing list values as lazy expression
 lists in the Go evaluator — a larger change than the targeted semantic fixes
