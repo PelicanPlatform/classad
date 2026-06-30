@@ -13,14 +13,23 @@ import (
 // Built-in string functions
 
 // builtinStrcat concatenates strings
-// classadReal renders a real the way the reference engine's string conversion
-// does: exactly 0 prints as "0.0", everything else in %.15E form (e.g.
+// classadReal renders a real exactly as the reference unparser does
+// (ClassAdUnParser::UnparseReal): zero via %.1f ("0.0"/"-0.0"), the non-finite
+// values via the real("...") forms, everything else via %1.15E (e.g.
 // 1.5 -> "1.500000000000000E+00").
 func classadReal(r float64) string {
-	if r == 0 {
-		return "0.0"
+	switch {
+	case math.IsNaN(r):
+		return `real("NaN")`
+	case math.IsInf(r, -1):
+		return `real("-INF")`
+	case math.IsInf(r, 1):
+		return `real("INF")`
+	case r == 0:
+		return fmt.Sprintf("%.1f", r)
+	default:
+		return fmt.Sprintf("%1.15E", r)
 	}
-	return fmt.Sprintf("%.15E", r)
 }
 
 // classadScalarString converts a scalar value to its reference string form,
