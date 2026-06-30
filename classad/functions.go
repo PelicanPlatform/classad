@@ -540,11 +540,13 @@ func builtinMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
-		return NewErrorValue()
-	}
+	// An undefined argument dominates over an error one (matching the
+	// reference): check undefined first, then error.
 	if args[0].IsUndefined() || args[1].IsUndefined() {
 		return NewUndefinedValue()
+	}
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
 	}
 
 	if !args[1].IsList() {
@@ -1415,12 +1417,13 @@ func builtinStrcmp(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
-		return NewErrorValue()
-	}
-	// strcmp/stricmp propagate undefined (matching the reference).
+	// An undefined argument dominates over an error one (matching the
+	// reference): check undefined first, then error.
 	if args[0].IsUndefined() || args[1].IsUndefined() {
 		return NewUndefinedValue()
+	}
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
 	}
 
 	// Coerce both arguments to their string form (matching string()/strcat()).
@@ -1440,12 +1443,13 @@ func builtinStricmp(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
-		return NewErrorValue()
-	}
-	// strcmp/stricmp propagate undefined (matching the reference).
+	// An undefined argument dominates over an error one (matching the
+	// reference): check undefined first, then error.
 	if args[0].IsUndefined() || args[1].IsUndefined() {
 		return NewUndefinedValue()
+	}
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
 	}
 
 	// Coerce both arguments to their string form (matching string()/strcat()).

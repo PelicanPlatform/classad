@@ -153,6 +153,9 @@ func TestCppParity(t *testing.T) {
 		{`substr(error, 1, 2)`, "E"},
 		{`substr(error, undefined, 1)`, "U"},
 		{`substr(error, error, undefined)`, "U"},
+		{`strcmp(error, undefined)`, "U"},
+		{`stricmp(undefined, error)`, "U"},
+		{`member(error, undefined)`, "U"},
 
 		// Division by zero: integer divisor errors; for a real divisor only a
 		// +Inf result is an error, while -Inf and NaN are real values.
