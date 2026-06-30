@@ -1432,9 +1432,8 @@ var functionArity = map[string]funcArity{
 	"sum": {1, 1}, "avg": {1, 1}, "min": {1, 1}, "max": {1, 1}, "join": {1, -1},
 	"split": {1, 2}, "splitusername": {1, 1}, "splitslotname": {1, 1},
 	"strcmp": {2, 2}, "stricmp": {2, 2}, "versioncmp": {2, 2},
-	"version_gt": {2, 2}, "version_ge": {2, 2}, "version_lt": {2, 2},
-	"version_le": {2, 2}, "version_eq": {2, 2}, "version_in_range": {3, 3},
-	"formattime": {0, 2}, "interval": {1, 1}, "identicalmember": {2, 2},
+	"version_in_range": {3, 3},
+	"formattime":       {0, 2}, "interval": {1, 1}, "identicalmember": {2, 2},
 	"anycompare": {3, 3}, "allcompare": {3, 3}, "stringlistsize": {1, 2},
 	"stringlistsum": {1, 2}, "stringlistavg": {1, 2}, "stringlistmin": {1, 2},
 	"stringlistmax": {1, 2}, "stringlistsintersect": {2, 3},
@@ -1613,19 +1612,13 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	case "stricmp":
 		return builtinStricmp(args)
 
-	// Version comparison functions
+	// Version comparison functions. (The reference engine's per-operator helpers
+	// are spelled versionGT/GE/LT/LE/EQ -- camelCase and case-sensitive, see
+	// CPP_QUIRKS.md -- which Go's case-insensitive dispatch cannot represent, so
+	// they are intentionally not provided here. versioncmp and version_in_range
+	// are the lowercase-friendly ones.)
 	case "versioncmp":
 		return builtinVersioncmp(args)
-	case "version_gt":
-		return builtinVersionGT(args)
-	case "version_ge":
-		return builtinVersionGE(args)
-	case "version_lt":
-		return builtinVersionLT(args)
-	case "version_le":
-		return builtinVersionLE(args)
-	case "version_eq":
-		return builtinVersionEQ(args)
 	case "version_in_range":
 		return builtinVersionInRange(args)
 

@@ -112,10 +112,11 @@ func TestVersionComparisons(t *testing.T) {
 		t.Fatalf("expected 1.2 < 1.10, got %d", v)
 	}
 
-	if gt := evalBuiltin(t, `version_gt("8.9.1", "8.8.9")`); !gt.IsBool() {
-		t.Fatalf("version_gt should return bool")
-	} else if b, _ := gt.BoolValue(); !b {
-		t.Fatalf("expected version_gt to be true")
+	// version_gt/ge/lt/le/eq (underscore) are not reference function names -- the
+	// reference spells them versionGT/... (camelCase, case-sensitive; see
+	// CPP_QUIRKS.md) and errors on the underscore forms, so Go does too.
+	if gt := evalBuiltin(t, `version_gt("8.9.1", "8.8.9")`); !gt.IsError() {
+		t.Fatalf("version_gt (non-reference name) should be error, got %v", gt.Type())
 	}
 
 	inRange := evalBuiltin(t, `version_in_range("8.8.0", "8.7.0", "8.9.0")`)

@@ -57,8 +57,7 @@ var (
 		"split", "splitUserName", "splitSlotName", "interval", "sum", "avg",
 		"min", "max", "stringListSize"}
 	fns2 = []string{"strcat", "pow", "quantize", "strcmp", "stricmp", "member",
-		"join", "versioncmp", "version_gt", "version_ge", "version_lt",
-		"version_le", "version_eq", "identicalMember", "stringListMember",
+		"join", "versioncmp", "identicalMember", "stringListMember",
 		"stringListIMember", "stringListSize", "stringListSum", "stringListAvg",
 		"stringListMin", "stringListMax", "stringListsIntersect",
 		"stringListSubsetMatch"}

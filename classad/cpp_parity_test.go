@@ -897,3 +897,34 @@ func TestAnyAllCompareThreeValued(t *testing.T) {
 		}
 	}
 }
+
+// TestVersionInRange guards version_in_range: it coerces numeric arguments to
+// strings (5 -> "5") and does a natural/version comparison min <= v <= max; an
+// undefined min or max is undefined, but an undefined version (arg0) is an
+// error, and an error argument is an error. The underscore-spelled per-operator
+// helpers (version_gt/ge/lt/le/eq) are not reference functions and are error.
+func TestVersionInRange(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`version_in_range("1.5", "1.0", "2.0")`, "B:true"},
+		{`version_in_range("3.0", "1.0", "2.0")`, "B:false"},
+		{`version_in_range(5, "1", "9")`, "B:true"},
+		{`version_in_range(1, 2, 3)`, "B:false"},
+		{`version_in_range(undefined, "1", "2")`, "E"},
+		{`version_in_range("1", undefined, "2")`, "U"},
+		{`version_in_range(1, 2, undefined)`, "U"},
+		{`version_gt("2.0", "1.0")`, "E"},
+		{`version_eq("1", "1")`, "E"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}

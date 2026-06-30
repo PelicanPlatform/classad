@@ -1729,81 +1729,30 @@ func builtinVersioncmp(args []Value) Value {
 	return NewIntValue(int64(result))
 }
 
-// builtinVersionGT checks if left > right
-func builtinVersionGT(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val > 0)
-}
-
-// builtinVersionGE checks if left >= right
-func builtinVersionGE(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val >= 0)
-}
-
-// builtinVersionLT checks if left < right
-func builtinVersionLT(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val < 0)
-}
-
-// builtinVersionLE checks if left <= right
-func builtinVersionLE(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val <= 0)
-}
-
-// builtinVersionEQ checks if left == right
-func builtinVersionEQ(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val == 0)
-}
-
-// builtinVersionInRange checks if min <= version <= max
+// builtinVersionInRange checks if min <= version <= max, matching the reference
+// engine: an error argument is an error; an undefined min or max is undefined
+// (but an undefined version, arg0, is an error); each argument is coerced to a
+// string the way convertValueToStringValue does (numbers/bools become their
+// string form), and a value that cannot be coerced (undefined version, list, or
+// ad) is an error. The comparison is the natural/version comparison.
 func builtinVersionInRange(args []Value) Value {
 	if len(args) != 3 {
 		return NewErrorValue()
 	}
-
-	// Check version >= min
-	minCheck := builtinVersionGE([]Value{args[0], args[1]})
-	if minCheck.IsError() || minCheck.IsUndefined() {
-		return minCheck
+	if args[0].IsError() || args[1].IsError() || args[2].IsError() {
+		return NewErrorValue()
 	}
-	minOk, _ := minCheck.BoolValue()
-
-	if !minOk {
-		return NewBoolValue(false)
+	if args[1].IsUndefined() || args[2].IsUndefined() {
+		return NewUndefinedValue()
 	}
-
-	// Check version <= max
-	maxCheck := builtinVersionLE([]Value{args[0], args[2]})
-	if maxCheck.IsError() || maxCheck.IsUndefined() {
-		return maxCheck
+	version, ok0 := classadScalarString(args[0])
+	minStr, ok1 := classadScalarString(args[1])
+	maxStr, ok2 := classadScalarString(args[2])
+	if !ok0 || !ok1 || !ok2 {
+		return NewErrorValue()
 	}
-	maxOk, _ := maxCheck.BoolValue()
-
-	return NewBoolValue(maxOk)
+	inRange := versionCompare(minStr, version) <= 0 && versionCompare(version, maxStr) <= 0
+	return NewBoolValue(inRange)
 }
 
 // builtinFormatTime formats a Unix timestamp

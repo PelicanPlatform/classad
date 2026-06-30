@@ -1149,14 +1149,12 @@ func TestBuiltinVersionComparisonFunctions(t *testing.T) {
 		expr     string
 		expected bool
 	}{
-		{"version_gt true", `version_gt("2.0", "1.9")`, true},
-		{"version_gt false", `version_gt("1.9", "2.0")`, false},
-		{"version_ge equal", `version_ge("1.5", "1.5")`, true},
-		{"version_lt true", `version_lt("1.0", "2.0")`, true},
-		{"version_le equal", `version_le("3.0", "3.0")`, true},
-		{"version_eq true", `version_eq("1.2.3", "1.2.3")`, true},
+		// Only versioncmp and version_in_range are reference functions; the
+		// per-operator version_gt/ge/lt/le/eq names are not (the reference uses
+		// camelCase versionGT/... -- see CPP_QUIRKS.md -- and errors on these).
 		{"version_in_range true", `version_in_range("1.5", "1.0", "2.0")`, true},
 		{"version_in_range false", `version_in_range("2.5", "1.0", "2.0")`, false},
+		{"version_in_range coerces ints", `version_in_range(5, "1", "9")`, true},
 	}
 
 	for _, tt := range tests {
@@ -1177,6 +1175,18 @@ func TestBuiltinVersionComparisonFunctions(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	// The underscore-spelled per-operator helpers are not reference functions.
+	for _, expr := range []string{
+		`version_gt("2.0", "1.9")`, `version_ge("1.5", "1.5")`,
+		`version_lt("1.0", "2.0")`, `version_le("3.0", "3.0")`,
+		`version_eq("1.2.3", "1.2.3")`,
+	} {
+		ad, _ := Parse("[test = " + expr + "]")
+		if !ad.EvaluateAttr("test").IsError() {
+			t.Errorf("%s (non-reference name) should be error", expr)
+		}
 	}
 }
 
