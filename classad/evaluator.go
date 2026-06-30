@@ -3,6 +3,7 @@ package classad
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/parser"
@@ -1137,13 +1138,17 @@ func (e *Evaluator) evaluateEval(args []ast.Expr) Value {
 
 // Built-in function evaluation
 func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
+	// Function names are matched case-insensitively, like the reference engine
+	// (so SUBSTR, suBstr and substr are the same function).
+	funcName := strings.ToLower(fc.Name)
+
 	// Handle unparse() specially - it needs access to the raw AST and ClassAd context
-	if fc.Name == "unparse" {
+	if funcName == "unparse" {
 		return e.evaluateUnparse(fc.Args)
 	}
 
 	// Handle eval() specially - it needs to parse and evaluate in the current context
-	if fc.Name == "eval" {
+	if funcName == "eval" {
 		return e.evaluateEval(fc.Args)
 	}
 
@@ -1153,8 +1158,8 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		args[i] = e.Evaluate(arg)
 	}
 
-	// Dispatch to the appropriate function
-	switch fc.Name {
+	// Dispatch to the appropriate function (funcName is already lower-cased)
+	switch funcName {
 	// String functions
 	case "strcat":
 		return builtinStrcat(args)
@@ -1162,9 +1167,9 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinSubstr(args)
 	case "size":
 		return builtinSize(args)
-	case "toLower", "tolower":
+	case "tolower":
 		return builtinToLower(args)
-	case "toUpper", "toupper":
+	case "toupper":
 		return builtinToUpper(args)
 
 	// Math functions
@@ -1182,21 +1187,21 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinReal(args)
 
 	// Type checking functions
-	case "isUndefined":
+	case "isundefined":
 		return builtinIsUndefined(args)
-	case "isError":
+	case "iserror":
 		return builtinIsError(args)
-	case "isString":
+	case "isstring":
 		return builtinIsString(args)
-	case "isInteger":
+	case "isinteger":
 		return builtinIsInteger(args)
-	case "isReal":
+	case "isreal":
 		return builtinIsReal(args)
-	case "isBoolean":
+	case "isboolean":
 		return builtinIsBoolean(args)
-	case "isList":
+	case "islist":
 		return builtinIsList(args)
-	case "isClassAd":
+	case "isclassad":
 		return builtinIsClassAd(args)
 
 	// Time functions
@@ -1206,9 +1211,9 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// List functions
 	case "member":
 		return builtinMember(args)
-	case "stringListMember":
+	case "stringlistmember":
 		return builtinStringListMember(args)
-	case "stringListIMember":
+	case "stringlistimember":
 		return builtinStringListIMember(args)
 
 	// Pattern matching functions
@@ -1216,7 +1221,7 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinRegexp(args)
 
 	// Control flow functions
-	case "ifThenElse":
+	case "ifthenelse":
 		return builtinIfThenElse(args)
 
 	// Type conversion functions
@@ -1246,9 +1251,9 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinJoin(args)
 	case "split":
 		return builtinSplit(args)
-	case "splitUserName":
+	case "splitusername":
 		return builtinSplitUserName(args)
-	case "splitSlotName":
+	case "splitslotname":
 		return builtinSplitSlotName(args)
 	case "strcmp":
 		return builtinStrcmp(args)
@@ -1272,45 +1277,45 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinVersionInRange(args)
 
 	// Time formatting functions
-	case "formatTime":
+	case "formattime":
 		return builtinFormatTime(args)
 	case "interval":
 		return builtinInterval(args)
 
 	// List comparison functions
-	case "identicalMember":
+	case "identicalmember":
 		return builtinIdenticalMember(args)
-	case "anyCompare":
+	case "anycompare":
 		return builtinAnyCompare(args)
-	case "allCompare":
+	case "allcompare":
 		return builtinAllCompare(args)
 
 	// StringList functions
-	case "stringListSize":
+	case "stringlistsize":
 		return builtinStringListSize(args)
-	case "stringListSum":
+	case "stringlistsum":
 		return builtinStringListSum(args)
-	case "stringListAvg":
+	case "stringlistavg":
 		return builtinStringListAvg(args)
-	case "stringListMin":
+	case "stringlistmin":
 		return builtinStringListMin(args)
-	case "stringListMax":
+	case "stringlistmax":
 		return builtinStringListMax(args)
-	case "stringListsIntersect":
+	case "stringlistsintersect":
 		return builtinStringListsIntersect(args)
-	case "stringListSubsetMatch":
+	case "stringlistsubsetmatch":
 		return builtinStringListSubsetMatch(args)
-	case "stringListRegexpMember":
+	case "stringlistregexpmember":
 		return builtinStringListRegexpMember(args)
 
 	// Regex functions
-	case "regexpMember":
+	case "regexpmember":
 		return builtinRegexpMember(args)
 	case "regexps":
 		return builtinRegexps(args)
 	case "replace":
 		return builtinReplace(args)
-	case "replaceAll":
+	case "replaceall":
 		return builtinReplaceAll(args)
 
 	default:

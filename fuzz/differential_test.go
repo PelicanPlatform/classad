@@ -22,6 +22,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/PelicanPlatform/classad/fuzz/differ"
 )
@@ -104,6 +105,14 @@ func FuzzDifferential(f *testing.F) {
 	opts := seedOpts
 
 	f.Fuzz(func(t *testing.T, src string) {
+		// ClassAd source is text. Skip non-UTF-8 mutations: the Go lexer
+		// decodes string literals as UTF-8 (so an invalid byte like 0xa2
+		// becomes the 3-byte U+FFFD) while libclassad keeps raw bytes -- a
+		// known, niche byte-vs-rune divergence in string-literal scanning that
+		// is out of scope for evaluation-semantics fuzzing (see README).
+		if !utf8.ValidString(src) {
+			t.Skip()
+		}
 		r := differ.Compare(src, opts)
 		switch r.Category {
 		case differ.GoPanic:

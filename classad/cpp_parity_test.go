@@ -128,6 +128,12 @@ func TestCppParity(t *testing.T) {
 		{`length("hello")`, "E"},
 		{`length({1, 2})`, "E"},
 
+		// Function names are matched case-insensitively.
+		{`suBstr("hello", 0, 2)`, "S:he"},
+		{`STRCAT("a", "b")`, "S:ab"},
+		{`ToLower("ABC")`, "S:abc"},
+		{`IfThenElse(true, 1, 2)`, "I:1"},
+
 		// List coercion: string()/strcat()/etc. unparse a list in sink form.
 		{`string({})`, "S:{  }"},
 		{`string({1, 2})`, "S:{ 1,2 }"},
