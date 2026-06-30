@@ -664,6 +664,45 @@ func (e *Evaluator) evaluateModulo(left, right Value) Value {
 	return NewIntValue(leftInt % rightInt)
 }
 
+// lowerASCII folds an ASCII upper-case byte to lower case, leaving every other
+// byte unchanged. This matches the C ctype/strcasecmp behavior the reference
+// engine uses (it is intentionally ASCII-only, not Unicode-aware).
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
+}
+
+// compareStringsFold compares two strings case-insensitively, byte for byte,
+// like strcasecmp: it returns -1, 0, or 1. The relational and equality
+// operators (< <= > >= == !=) use this because the C++ reference engine
+// compares strings case-insensitively. (=?=/=!= remain case-sensitive; see
+// evaluateIs.)
+func compareStringsFold(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		ca, cb := lowerASCII(a[i]), lowerASCII(b[i])
+		if ca != cb {
+			if ca < cb {
+				return -1
+			}
+			return 1
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	default:
+		return 0
+	}
+}
+
 // Comparison operations
 func (e *Evaluator) evaluateLessThan(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
@@ -679,7 +718,7 @@ func (e *Evaluator) evaluateLessThan(left, right Value) Value {
 	if left.IsString() && right.IsString() {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr < rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) < 0)
 	}
 
 	return NewErrorValue()
@@ -699,7 +738,7 @@ func (e *Evaluator) evaluateGreaterThan(left, right Value) Value {
 	if left.IsString() && right.IsString() {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr > rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) > 0)
 	}
 
 	return NewErrorValue()
@@ -719,7 +758,7 @@ func (e *Evaluator) evaluateLessOrEqual(left, right Value) Value {
 	if left.IsString() && right.IsString() {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr <= rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) <= 0)
 	}
 
 	return NewErrorValue()
@@ -780,7 +819,7 @@ func (e *Evaluator) evaluateEqual(left, right Value) Value {
 	case StringValue:
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr == rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) == 0)
 	default:
 		return NewErrorValue()
 	}
