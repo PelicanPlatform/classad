@@ -765,14 +765,16 @@ func TestSubscriptExprListOutOfBounds(t *testing.T) {
 		t.Fatalf("Parse error: %v", err)
 	}
 
+	// An out-of-range or negative list index is an error in the reference
+	// engine, not undefined.
 	outOfBounds := ad.EvaluateAttr("outOfBounds")
-	if !outOfBounds.IsUndefined() {
-		t.Error("Expected undefined for out-of-bounds index")
+	if !outOfBounds.IsError() {
+		t.Error("Expected error for out-of-bounds index")
 	}
 
 	negative := ad.EvaluateAttr("negative")
-	if !negative.IsUndefined() {
-		t.Error("Expected undefined for negative index")
+	if !negative.IsError() {
+		t.Error("Expected error for negative index")
 	}
 }
 

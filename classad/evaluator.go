@@ -396,6 +396,12 @@ func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
 		return val
 	}
 
+	// Unary operators propagate undefined (e.g. -undefined, +undefined,
+	// !undefined are all undefined in the reference engine).
+	if val.IsUndefined() {
+		return NewUndefinedValue()
+	}
+
 	switch op.Op {
 	case "-":
 		if val.IsInteger() {
@@ -534,9 +540,10 @@ func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
 		list, _ := containerVal.ListValue()
 		index, _ := indexVal.IntValue()
 
-		// Check bounds
+		// An out-of-range (including negative) list index is an error in the
+		// reference engine, not undefined.
 		if index < 0 || index >= int64(len(list)) {
-			return NewUndefinedValue()
+			return NewErrorValue()
 		}
 
 		return list[index]
