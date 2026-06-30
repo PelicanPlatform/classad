@@ -109,10 +109,22 @@ void encodeValue(std::string &out, const Value &v, const ClassAd *scope, int dep
 		out += 'S';
 		putLenStr(out, std::string(s ? s : ""));
 	} else if (v.IsListValue(lst)) {
+		// Evaluate each element in the ad's scope. The static
+		// ClassAd::EvaluateExpr cannot set the parent scope, so a bare
+		// attribute reference inside an element (e.g. {a0}[0]) would wrongly
+		// evaluate to undefined. Reconnect the list's parent scope to the ad
+		// and evaluate each element with an EvalState rooted there, matching
+		// how the subscript operator resolves list elements.
+		ExprList *mlst = const_cast<ExprList *>(lst);
+		if (scope != nullptr) {
+			mlst->SetParentScope(scope);
+		}
 		std::vector<Value> evaled;
-		for (auto it = lst->begin(); it != lst->end(); ++it) {
+		for (auto it = mlst->begin(); it != mlst->end(); ++it) {
 			Value ev;
-			if (!ClassAd::EvaluateExpr(scope, *it, ev)) {
+			EvalState state;
+			state.SetScopes(scope);
+			if (*it == nullptr || !(*it)->Evaluate(state, ev)) {
 				ev.SetErrorValue();
 			}
 			evaled.push_back(ev);
