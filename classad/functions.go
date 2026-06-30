@@ -777,10 +777,6 @@ func builtinMember(args []Value) Value {
 	return NewBoolValue(false)
 }
 
-// builtinStringListMember checks if a string is a member of a comma-separated string list
-// stringListMember(string item, string list [, string options])
-// The list is a comma-separated string. Options can contain:
-// - "i" or "I": case-insensitive comparison
 // stringListStrArg coerces a stringList membership/subset argument to its
 // string form, treating undefined as the empty string -- these functions treat
 // an undefined item/list as empty rather than propagating undefined, so e.g.
@@ -799,7 +795,12 @@ func stringListStrArg(v Value) (s string, ok bool) {
 	return "", false
 }
 
-func builtinStringListMember(args []Value) Value {
+// stringListMemberImpl backs stringListMember (case-sensitive) and
+// stringListIMember (case-insensitive). The signature is
+// (item, list [, delimiter]) -- the optional third argument is the delimiter
+// set (NOT a case-sensitivity option; case sensitivity is fixed by the
+// function name) -- and an undefined item or list acts as the empty string.
+func stringListMemberImpl(args []Value, ignoreCase bool) Value {
 	if len(args) < 2 || len(args) > 3 {
 		return NewErrorValue()
 	}
@@ -816,47 +817,38 @@ func builtinStringListMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// Check for options
-	ignoreCase := false
+	delim := ""
 	if len(args) == 3 {
-		options, ok2 := stringListStrArg(args[2])
+		d, ok2 := stringListStrArg(args[2])
 		if !ok2 {
 			return NewErrorValue()
 		}
-		if strings.ContainsAny(options, "iI") {
-			ignoreCase = true
-		}
+		delim = d
 	}
 
-	// Split the list by commas and check each element
-	elements := strings.Split(listStr, ",")
-	for _, elem := range elements {
-		// Trim whitespace from each element
-		elem = strings.TrimSpace(elem)
+	for _, elem := range parseStringList(listStr, delim) {
 		if ignoreCase {
 			if strings.EqualFold(elem, item) {
 				return NewBoolValue(true)
 			}
-		} else {
-			if elem == item {
-				return NewBoolValue(true)
-			}
+		} else if elem == item {
+			return NewBoolValue(true)
 		}
 	}
 
 	return NewBoolValue(false)
 }
 
-// builtinStringListIMember is a convenience wrapper for stringListMember with case-insensitive matching.
-// stringListIMember(string item, string list)
-// Returns true if item is in list (case-insensitive), false otherwise
-func builtinStringListIMember(args []Value) Value {
-	if len(args) != 2 {
-		return NewErrorValue()
-	}
+// builtinStringListMember checks whether item is a member of a delimited string
+// list. stringListMember(item, list [, delimiter]) is case-sensitive.
+func builtinStringListMember(args []Value) Value {
+	return stringListMemberImpl(args, false)
+}
 
-	// Call stringListMember with "i" option for case-insensitive matching
-	return builtinStringListMember([]Value{args[0], args[1], NewStringValue("i")})
+// builtinStringListIMember is the case-insensitive variant.
+// stringListIMember(item, list [, delimiter]).
+func builtinStringListIMember(args []Value) Value {
+	return stringListMemberImpl(args, true)
 }
 
 // builtinRegexp checks if a string matches a regular expression
@@ -2102,14 +2094,20 @@ func compareValues(op string, left, right Value) Value {
 	}
 }
 
-// parseStringList splits a string list by delimiter (default comma)
+// parseStringList tokenizes a string list the way the reference engine's
+// StringList does: the delimiter argument is a SET of delimiter characters
+// (the default is comma plus space), tokens are maximal runs of non-delimiter
+// characters, empty tokens are dropped (so "a,,b" and "  a  " collapse), and
+// each token has its surrounding whitespace trimmed.
 func parseStringList(listStr, delimiter string) []string {
 	if delimiter == "" {
-		delimiter = ","
+		delimiter = ", "
 	}
 
-	parts := strings.Split(listStr, delimiter)
-	var result []string
+	parts := strings.FieldsFunc(listStr, func(r rune) bool {
+		return strings.ContainsRune(delimiter, r)
+	})
+	result := make([]string, 0, len(parts))
 	for _, part := range parts {
 		result = append(result, strings.TrimSpace(part))
 	}
@@ -2128,7 +2126,7 @@ func stringListArgs(args []Value) (listStr, delim string, bad *Value) {
 		return "", "", &e
 	}
 	listStr, _ = args[0].StringValue()
-	delim = ","
+	delim = ", "
 	if len(args) == 2 {
 		if !args[1].IsString() {
 			return "", "", &e
@@ -2313,7 +2311,7 @@ func builtinStringListsIntersect(args []Value) Value {
 
 	list1Str, _ := args[0].StringValue()
 	list2Str, _ := args[1].StringValue()
-	delimiter := ","
+	delimiter := ", "
 
 	if len(args) == 3 {
 		if args[2].IsError() {
@@ -2366,7 +2364,7 @@ func builtinStringListSubsetMatch(args []Value) Value {
 	if !ok0 || !ok1 {
 		return NewErrorValue()
 	}
-	delimiter := ","
+	delimiter := ", "
 
 	if len(args) == 3 {
 		d, ok2 := stringListStrArg(args[2])
@@ -2415,7 +2413,7 @@ func builtinStringListRegexpMember(args []Value) Value {
 
 	pattern, _ := args[0].StringValue()
 	listStr, _ := args[1].StringValue()
-	delimiter := ","
+	delimiter := ", "
 	options := ""
 
 	// Parse optional arguments

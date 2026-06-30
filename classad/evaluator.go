@@ -1427,7 +1427,7 @@ var functionArity = map[string]funcArity{
 	"isundefined": {1, 1}, "iserror": {1, 1}, "isstring": {1, 1},
 	"isinteger": {1, 1}, "isreal": {1, 1}, "isboolean": {1, 1},
 	"islist": {1, 1}, "isclassad": {1, 1}, "time": {0, 0}, "member": {2, 2},
-	"stringlistmember": {2, 3}, "stringlistimember": {2, 2}, "regexp": {2, 3},
+	"stringlistmember": {2, 3}, "stringlistimember": {2, 3}, "regexp": {2, 3},
 	"string": {1, 1}, "bool": {1, 1}, "pow": {2, 2}, "quantize": {2, 2},
 	"sum": {1, 1}, "avg": {1, 1}, "min": {1, 1}, "max": {1, 1}, "join": {1, -1},
 	"split": {1, 2}, "splitusername": {1, 1}, "splitslotname": {1, 1},

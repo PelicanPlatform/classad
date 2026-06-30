@@ -31,13 +31,16 @@ func TestStringListMember(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "case insensitive match",
+			// The third argument is the delimiter set, not a case option, and
+			// stringListMember is always case-sensitive: with delimiter "i"
+			// the list has no 'i' to split on, so "Apple" is not a member.
+			name:     "third arg is delimiter, not case option",
 			expr:     `stringListMember("Apple", "apple,banana,cherry", "i")`,
-			expected: true,
+			expected: false,
 		},
 		{
-			name:     "case insensitive uppercase option",
-			expr:     `stringListMember("BANANA", "apple,banana,cherry", "I")`,
+			name:     "custom delimiter match",
+			expr:     `stringListMember("banana", "apple;banana;cherry", ";")`,
 			expected: true,
 		},
 		{

@@ -933,6 +933,40 @@ func TestStringListMembership(t *testing.T) {
 	}
 }
 
+// TestStringListDelimiters guards the stringList* tokenizer: the default
+// delimiter set is comma plus space (not comma alone), tabs/newlines are not
+// delimiters, empty tokens are dropped, and the optional trailing argument to
+// stringListMember/IMember is the delimiter set -- not a case-sensitivity
+// option (case sensitivity is fixed by the function name).
+func TestStringListDelimiters(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`stringListSize("x y")`, "I:2"},
+		{`stringListSize("a b c")`, "I:3"},
+		{`stringListSize("a  b")`, "I:2"},     // collapsed whitespace
+		{`stringListSize("a,,b")`, "I:2"},     // dropped empty token
+		{`stringListSize("a b", ",")`, "I:1"}, // explicit comma-only delimiter
+		{`stringListSum("1 2 3")`, "I:6"},
+		{`stringListsIntersect("a b", "b c")`, "B:true"},
+		// Third argument is the delimiter set; the function name fixes case.
+		{`stringListMember("a", "a;b", ";")`, "B:true"},
+		{`stringListMember("Apple", "apple,banana", "i")`, "B:false"},
+		{`stringListIMember("A", "a,b")`, "B:true"},
+		{`stringListIMember("a", "a;b", ";")`, "B:true"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}
+
 // TestAnyAllCompare guards anyCompare/allCompare three-valued aggregation: the
 // element comparisons use the engine's real semantics (1 == undefined is
 // undefined, not error); a comparison that errors makes the call error; a bad
