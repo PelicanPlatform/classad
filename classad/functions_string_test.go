@@ -173,12 +173,13 @@ func TestStringListBuiltins(t *testing.T) {
 		t.Fatalf("unexpected stringListSize: %d", v)
 	}
 
-	sum := evalBuiltin(t, `stringListSum("1,2.5,bad")`)
-	if sum.IsInteger() {
-		t.Fatalf("expected real sum due to decimal input")
+	// A non-numeric list item ("bad") is an error in the reference engine, not
+	// a silently-skipped element.
+	if sum := evalBuiltin(t, `stringListSum("1,2.5,bad")`); !sum.IsError() {
+		t.Fatalf("expected error for non-numeric item, got %v", sum.Type())
 	}
-	if v, _ := sum.RealValue(); v != 3.5 {
-		t.Fatalf("unexpected stringListSum: %g", v)
+	if sum := evalBuiltin(t, `stringListSum("1,2.5")`); func() bool { v, _ := sum.RealValue(); return !sum.IsReal() || v != 3.5 }() {
+		t.Fatalf("unexpected stringListSum for reals")
 	}
 
 	avg := evalBuiltin(t, `stringListAvg("")`)
@@ -269,9 +270,11 @@ func TestMembershipFunctions(t *testing.T) {
 		t.Fatalf("expected case-insensitive member to match")
 	}
 
+	// All-integer average uses integer division and is an integer (the
+	// reference engine), so stringListAvg("1,2,3") is int(2), not real.
 	avg := evalBuiltin(t, `stringListAvg("1,2,3")`)
-	if v, _ := avg.RealValue(); v != 2 {
-		t.Fatalf("unexpected average value: %g", v)
+	if v, _ := avg.IntValue(); !avg.IsInteger() || v != 2 {
+		t.Fatalf("unexpected average value: %v %v", avg.Type(), v)
 	}
 	avgDelim := evalBuiltin(t, `stringListAvg("1.0|2.0", "|")`)
 	if v, _ := avgDelim.RealValue(); v != 1.5 {
@@ -281,9 +284,11 @@ func TestMembershipFunctions(t *testing.T) {
 	if !avgErr.IsError() {
 		t.Fatalf("expected error for non-string average input")
 	}
+	// An undefined argument is an error here (these HTCondor functions do not
+	// propagate undefined), matching the reference engine.
 	avgUndef := evalBuiltin(t, `stringListAvg(undefined)`)
-	if !avgUndef.IsUndefined() {
-		t.Fatalf("expected undefined when average input is undefined")
+	if !avgUndef.IsError() {
+		t.Fatalf("expected error when average input is undefined, got %v", avgUndef.Type())
 	}
 
 	stricmpInt := evalBuiltin(t, `stricmp(10, 10)`)

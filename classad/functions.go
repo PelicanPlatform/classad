@@ -2168,41 +2168,63 @@ func parseStringList(listStr, delimiter string) []string {
 }
 
 // builtinStringListSize returns the number of elements in a string list
+// stringListArgs validates the (list [, delimiter]) arguments shared by the
+// stringList* functions and returns the list string and delimiter. The
+// reference engine requires string arguments and errors on anything else --
+// including undefined (these HTCondor functions do not propagate undefined) --
+// so a non-string argument yields a non-nil error Value to return.
+func stringListArgs(args []Value) (listStr, delim string, bad *Value) {
+	e := NewErrorValue()
+	if !args[0].IsString() {
+		return "", "", &e
+	}
+	listStr, _ = args[0].StringValue()
+	delim = ","
+	if len(args) == 2 {
+		if !args[1].IsString() {
+			return "", "", &e
+		}
+		delim, _ = args[1].StringValue()
+	}
+	return listStr, delim, nil
+}
+
+// parseNumericStringList parses the non-empty items of a delimited list as
+// numbers for the stringListSum/Avg/Min/Max family. A plain decimal integer
+// item stays an integer; anything else (a real, or a hex/inf form strtod
+// accepts) is parsed via strtod and marks the whole result real (hasReal). A
+// non-numeric item makes ok=false, which the reference treats as error.
+func parseNumericStringList(listStr, delim string) (vals []float64, hasReal, ok bool) {
+	for _, part := range parseStringList(listStr, delim) {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if iv, err := strconv.ParseInt(p, 10, 64); err == nil {
+			vals = append(vals, float64(iv))
+			continue
+		}
+		f, fok := parseLeadingFloat(p)
+		if !fok {
+			return nil, false, false
+		}
+		hasReal = true
+		vals = append(vals, f)
+	}
+	return vals, hasReal, true
+}
+
 func builtinStringListSize(args []Value) Value {
 	if len(args) < 1 || len(args) > 2 {
 		return NewErrorValue()
 	}
-
-	if args[0].IsError() {
-		return NewErrorValue()
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
-	// Don't count empty strings
+	// Don't count empty strings.
 	count := 0
-	for _, part := range parts {
+	for _, part := range parseStringList(listStr, delim) {
 		if part != "" {
 			count++
 		}
@@ -2216,59 +2238,21 @@ func builtinStringListSum(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() {
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	vals, hasReal, ok := parseNumericStringList(listStr, delim)
+	if !ok {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if len(vals) == 0 {
+		return NewRealValue(0) // empty sum is real 0.0 in the reference
 	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
 	var sum float64
-	hasReal := false
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		var val float64
-		if strings.Contains(part, ".") {
-			_, err := fmt.Sscanf(part, "%f", &val)
-			if err != nil {
-				continue
-			}
-			hasReal = true
-		} else {
-			var intVal int64
-			_, err := fmt.Sscanf(part, "%d", &intVal)
-			if err != nil {
-				continue
-			}
-			val = float64(intVal)
-		}
-		sum += val
+	for _, v := range vals {
+		sum += v
 	}
-
 	if hasReal {
 		return NewRealValue(sum)
 	}
@@ -2281,55 +2265,27 @@ func builtinStringListAvg(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() {
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	vals, hasReal, ok := parseNumericStringList(listStr, delim)
+	if !ok {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if len(vals) == 0 {
+		return NewRealValue(0) // empty average is real 0.0 in the reference
 	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
 	var sum float64
-	count := 0
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		var val float64
-		_, err := fmt.Sscanf(part, "%f", &val)
-		if err != nil {
-			continue
-		}
-		sum += val
-		count++
+	for _, v := range vals {
+		sum += v
 	}
-
-	if count == 0 {
-		return NewRealValue(0.0)
+	// All-integer items use integer division (avg("1,2") is 1, not 1.5),
+	// matching the reference; a real item makes the average real.
+	if hasReal {
+		return NewRealValue(sum / float64(len(vals)))
 	}
-
-	return NewRealValue(sum / float64(count))
+	return NewIntValue(int64(sum) / int64(len(vals)))
 }
 
 // builtinStringListMin finds minimum numeric value in a string list
@@ -2338,68 +2294,23 @@ func builtinStringListMin(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() {
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	vals, hasReal, ok := parseNumericStringList(listStr, delim)
+	if !ok {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if len(vals) == 0 {
+		return NewUndefinedValue() // empty list has no minimum
 	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
-	var minVal float64
-	hasValue := false
-	hasReal := false
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		var val float64
-		if strings.Contains(part, ".") {
-			_, err := fmt.Sscanf(part, "%f", &val)
-			if err != nil {
-				continue
-			}
-			hasReal = true
-		} else {
-			var intVal int64
-			_, err := fmt.Sscanf(part, "%d", &intVal)
-			if err != nil {
-				continue
-			}
-			val = float64(intVal)
-		}
-
-		if !hasValue || val < minVal {
-			minVal = val
-			hasValue = true
+	minVal := vals[0]
+	for _, v := range vals[1:] {
+		if v < minVal {
+			minVal = v
 		}
 	}
-
-	if !hasValue {
-		return NewUndefinedValue()
-	}
-
 	if hasReal {
 		return NewRealValue(minVal)
 	}
@@ -2412,68 +2323,23 @@ func builtinStringListMax(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() {
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	vals, hasReal, ok := parseNumericStringList(listStr, delim)
+	if !ok {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if len(vals) == 0 {
+		return NewUndefinedValue() // empty list has no maximum
 	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
-	var maxVal float64
-	hasValue := false
-	hasReal := false
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		var val float64
-		if strings.Contains(part, ".") {
-			_, err := fmt.Sscanf(part, "%f", &val)
-			if err != nil {
-				continue
-			}
-			hasReal = true
-		} else {
-			var intVal int64
-			_, err := fmt.Sscanf(part, "%d", &intVal)
-			if err != nil {
-				continue
-			}
-			val = float64(intVal)
-		}
-
-		if !hasValue || val > maxVal {
-			maxVal = val
-			hasValue = true
+	maxVal := vals[0]
+	for _, v := range vals[1:] {
+		if v > maxVal {
+			maxVal = v
 		}
 	}
-
-	if !hasValue {
-		return NewUndefinedValue()
-	}
-
 	if hasReal {
 		return NewRealValue(maxVal)
 	}

@@ -1502,44 +1502,30 @@ func TestStringListSum(t *testing.T) {
 }
 
 func TestStringListAvg(t *testing.T) {
+	// Matching the reference engine: an all-integer list averages with integer
+	// division and an integer result; a real item makes the result real; an
+	// empty list is real 0.0.
 	tests := []struct {
 		name     string
 		listStr  string
 		expected float64
+		isReal   bool
 	}{
-		{
-			name:     "integers",
-			listStr:  "2,4,6,8",
-			expected: 5.0,
-		},
-		{
-			name:     "reals",
-			listStr:  "1.0,2.0,3.0",
-			expected: 2.0,
-		},
-		{
-			name:     "single value",
-			listStr:  "42",
-			expected: 42.0,
-		},
-		{
-			name:     "empty list",
-			listStr:  "",
-			expected: 0.0,
-		},
+		{name: "integers", listStr: "2,4,6,8", expected: 5},
+		{name: "reals", listStr: "1.0,2.0,3.0", expected: 2.0, isReal: true},
+		{name: "single value", listStr: "42", expected: 42},
+		{name: "empty list", listStr: "", expected: 0.0, isReal: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			args := []Value{NewStringValue(tt.listStr)}
-			val := builtinStringListAvg(args)
-			if !val.IsReal() {
-				t.Errorf("stringListAvg() did not return real, got %v", val.Type())
-			} else {
-				result, _ := val.RealValue()
-				if result != tt.expected {
-					t.Errorf("stringListAvg() = %v, want %v", result, tt.expected)
-				}
+			val := builtinStringListAvg([]Value{NewStringValue(tt.listStr)})
+			if val.IsReal() != tt.isReal {
+				t.Errorf("stringListAvg(%q) type = %v, want isReal=%v", tt.listStr, val.Type(), tt.isReal)
+			}
+			result, _ := val.NumberValue()
+			if result != tt.expected {
+				t.Errorf("stringListAvg(%q) = %v, want %v", tt.listStr, result, tt.expected)
 			}
 		})
 	}

@@ -790,3 +790,43 @@ func TestIntRealStrtodParsing(t *testing.T) {
 		}
 	}
 }
+
+// TestStringListAggregates guards the numeric stringList functions' reference
+// semantics, found by fuzzing once the shim registered HTCondor's functions:
+// an undefined/non-string argument and a non-numeric list item are errors (not
+// undefined / silently skipped); sum/avg of an empty list is real 0.0; min/max
+// of an empty list is undefined; an all-integer list keeps integer typing
+// (avg uses integer division) while any real/hex item makes the result real.
+func TestStringListAggregates(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`stringListSize(undefined)`, "E"},
+		{`stringListSize("a,b,c")`, "I:3"},
+		{`stringListSum("1,2,3")`, "I:6"},
+		{`stringListSum("1.5,2")`, "R:3.5"},
+		{`stringListSum("0x10")`, "R:16"},
+		{`stringListSum("a,b")`, "E"},
+		{`stringListSum("")`, "R:0"},
+		{`stringListSum(undefined)`, "E"},
+		{`stringListAvg("1,2,3")`, "I:2"},
+		{`stringListAvg("1,2")`, "I:1"},
+		{`stringListAvg("1,2,3.0")`, "R:2"},
+		{`stringListMin("3,1,2")`, "I:1"},
+		{`stringListMin("1.5,2")`, "R:1.5"},
+		{`stringListMin("a,b")`, "E"},
+		{`stringListMin("")`, "U"},
+		{`stringListMax("1,3,2")`, "I:3"},
+		{`stringListMax(undefined)`, "E"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}
