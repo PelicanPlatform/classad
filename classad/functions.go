@@ -32,6 +32,106 @@ func classadReal(r float64) string {
 	}
 }
 
+// unparseString renders a string in the reference sink form: wrapped in double
+// quotes with control characters escaped and non-printable bytes written as
+// octal (ClassAdUnParser::UnparseString). Used for string elements nested
+// inside a list, where they appear quoted (a top-level string() of a string is
+// unquoted, handled by classadScalarString).
+func unparseString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\a':
+			b.WriteString(`\a`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\v':
+			b.WriteString(`\v`)
+		default:
+			if c < 0x20 || c > 0x7e { // !isprint
+				fmt.Fprintf(&b, "\\%03o", c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// unparseValueNested renders a value as it appears inside a list literal: like
+// classadScalarString but strings are quoted and undefined/error print as their
+// keywords. Returns ok=false for nested classads (not yet supported).
+func unparseValueNested(v Value) (string, bool) {
+	switch {
+	case v.IsUndefined():
+		return "undefined", true
+	case v.IsError():
+		return "error", true
+	case v.IsString():
+		s, _ := v.StringValue()
+		return unparseString(s), true
+	case v.IsList():
+		return unparseList(v)
+	default:
+		return classadScalarString(v)
+	}
+}
+
+// unparseList renders a list value in reference sink form, "{ e1,e2 }" (and
+// "{  }" when empty). Returns ok=false if any element cannot be unparsed.
+func unparseList(v Value) (string, bool) {
+	elems, err := v.ListValue()
+	if err != nil {
+		return "", false
+	}
+	var b strings.Builder
+	b.WriteString("{ ")
+	for i, e := range elems {
+		s, ok := unparseValueNested(e)
+		if !ok {
+			return "", false
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(s)
+	}
+	b.WriteString(" }")
+	return b.String(), true
+}
+
+// classadString converts a value to the string form used by string(), strcat(),
+// strcmp()/stricmp() and toUpper()/toLower(): a bare scalar uses its plain
+// string form (a top-level string is unquoted), while a list is unparsed in
+// sink form with its elements quoted/escaped. ok=false for values that cannot
+// be converted (currently nested classads), which callers turn into an error.
+//
+// NOTE: lists hold already-evaluated elements, so this matches the reference
+// engine for lists of literal/scalar values but not for elements that were
+// non-trivial expressions (the reference unparses the original expression,
+// e.g. string({1, 1+1}) is "{ 1,1 + 1 }" there but "{ 1,2 }" here).
+func classadString(v Value) (string, bool) {
+	if v.IsList() {
+		return unparseList(v)
+	}
+	return classadScalarString(v)
+}
+
 // classadScalarString converts a scalar value to its reference string form,
 // used by string() and strcat(). It reports ok=false for values that are not
 // scalars (lists, classads), which those builtins still reject. Callers handle
@@ -70,7 +170,7 @@ func builtinStrcat(args []Value) Value {
 		if arg.IsUndefined() {
 			return NewUndefinedValue()
 		}
-		str, ok := classadScalarString(arg)
+		str, ok := classadString(arg)
 		if !ok {
 			return NewErrorValue()
 		}
@@ -169,7 +269,7 @@ func builtinToLower(args []Value) Value {
 	}
 	// Non-string scalars are coerced to their string form first (so
 	// toLower(1.5) lowercases "1.500000000000000E+00").
-	str, ok := classadScalarString(args[0])
+	str, ok := classadString(args[0])
 	if !ok {
 		return NewErrorValue()
 	}
@@ -188,7 +288,7 @@ func builtinToUpper(args []Value) Value {
 	if args[0].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	str, ok := classadScalarString(args[0])
+	str, ok := classadString(args[0])
 	if !ok {
 		return NewErrorValue()
 	}
@@ -643,7 +743,7 @@ func builtinString(args []Value) Value {
 
 	// Convert scalars to their reference string form (reals use %.15E, e.g.
 	// 1.5 -> "1.500000000000000E+00"). Lists/classads are not handled here.
-	if s, ok := classadScalarString(args[0]); ok {
+	if s, ok := classadString(args[0]); ok {
 		return NewStringValue(s)
 	}
 
@@ -1342,8 +1442,8 @@ func builtinStrcmp(args []Value) Value {
 	}
 
 	// Coerce both arguments to their string form (matching string()/strcat()).
-	str1, ok1 := classadScalarString(args[0])
-	str2, ok2 := classadScalarString(args[1])
+	str1, ok1 := classadString(args[0])
+	str2, ok2 := classadString(args[1])
 	if !ok1 || !ok2 {
 		return NewErrorValue()
 	}
@@ -1367,8 +1467,8 @@ func builtinStricmp(args []Value) Value {
 	}
 
 	// Coerce both arguments to their string form (matching string()/strcat()).
-	str1, ok1 := classadScalarString(args[0])
-	str2, ok2 := classadScalarString(args[1])
+	str1, ok1 := classadString(args[0])
+	str2, ok2 := classadString(args[1])
 	if !ok1 || !ok2 {
 		return NewErrorValue()
 	}

@@ -99,8 +99,10 @@ func TestStringComparisons(t *testing.T) {
 		t.Fatalf("expected string compare 10 vs 2 to be negative, got %d", v)
 	}
 
-	if errVal := evalBuiltin(t, `strcmp({1}, "x")`); !errVal.IsError() {
-		t.Fatalf("expected error for invalid strcmp types")
+	// A list is coerced to its sink string form ("{ 1 }") and compared,
+	// matching the reference engine: strcmp("{ 1 }", "x") == 1.
+	if v, _ := evalBuiltin(t, `strcmp({1}, "x")`).IntValue(); v != 1 {
+		t.Fatalf("expected strcmp({1}, \"x\") == 1, got %d", v)
 	}
 }
 

@@ -114,6 +114,17 @@ func TestCppParity(t *testing.T) {
 		{`length("hello")`, "E"},
 		{`length({1, 2})`, "E"},
 
+		// List coercion: string()/strcat()/etc. unparse a list in sink form.
+		{`string({})`, "S:{  }"},
+		{`string({1, 2})`, "S:{ 1,2 }"},
+		{`string({"a", 1})`, `S:{ "a",1 }`},
+		{`string({true, undefined})`, "S:{ true,undefined }"},
+		{`string({{1}, 2})`, "S:{ { 1 },2 }"},
+		{`strcat({1, 2}, "!")`, "S:{ 1,2 }!"},
+		{`strcat({1, 2}, x0)`, "U"},
+		{`toUpper({1})`, "S:{ 1 }"},
+		{`stricmp({}, 1)`, "I:1"},
+
 		// string()/strcat() scalar coercion; reals use %.15E (0 -> "0.0").
 		{`string(1.5)`, "S:1.500000000000000E+00"},
 		{`string(0.0)`, "S:0.0"},
