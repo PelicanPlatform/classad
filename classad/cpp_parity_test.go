@@ -1001,6 +1001,53 @@ func TestVersionInRange(t *testing.T) {
 	}
 }
 
+// TestSplitDelimiters guards split()'s tokenizer: the default delimiter set is
+// comma plus whitespace, where whitespace runs collapse without producing empty
+// fields but each maximal run of hard (non-whitespace) delimiters emits
+// (count-1) empty fields, regardless of position. An explicit second argument
+// supplies the delimiter set.
+func TestSplitDelimiters(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string // each element rendered as "(elem)"; "" means an empty list
+	}{
+		{`split("a,b,c")`, "(a)(b)(c)"},
+		{`split("a, b, c")`, "(a)(b)(c)"},
+		{`split("a,,b")`, "(a)()(b)"},
+		{`split("a b c")`, "(a)(b)(c)"},
+		{`split("  a  b  ")`, "(a)(b)"},
+		{`split("a,b c,d")`, "(a)(b)(c)(d)"},
+		{`split(",,")`, "()"},  // one empty string
+		{`split(" , ")`, ""},   // empty list
+		{`split(",a")`, "(a)"}, // leading comma stripped
+		{`split("a,")`, "(a)"}, // trailing comma stripped
+		{`split("a, ,b")`, "(a)()(b)"},
+		{`split("a;b")`, "(a;b)"}, // ';' is not a default delimiter
+		{`split("a;;b", ";")`, "(a)()(b)"},
+		{`split("x.y..z", ".")`, "(x)(y)()(z)"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		v := ad.EvaluateAttr("x")
+		list, lerr := v.ListValue()
+		if lerr != nil {
+			t.Errorf("%s: expected list, got %v", tc.expr, v)
+			continue
+		}
+		got := ""
+		for _, e := range list {
+			s, _ := e.StringValue()
+			got += "(" + s + ")"
+		}
+		if got != tc.want {
+			t.Errorf("%s => %q, want %q", tc.expr, got, tc.want)
+		}
+	}
+}
+
 // TestVersioncmpPrefix guards versioncmp's natural-compare tail: when one
 // operand is a prefix of the other, the reference returns the difference of
 // the first unmatched bytes (treating end-of-string as a 0 byte), not the

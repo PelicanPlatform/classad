@@ -1471,32 +1471,56 @@ func builtinSplit(args []Value) Value {
 
 	str, _ := args[0].StringValue()
 
-	// Default delimiter is whitespace
-	if len(args) == 1 {
-		fields := strings.Fields(str)
-		var result []Value
-		for _, field := range fields {
-			result = append(result, NewStringValue(field))
+	// The delimiter set defaults to comma plus whitespace; an explicit second
+	// argument replaces it with that string's characters.
+	delim := ", \t\r\n\v\f"
+	if len(args) == 2 {
+		if !args[1].IsString() {
+			return NewErrorValue()
 		}
-		return NewListValue(result)
+		delim, _ = args[1].StringValue()
 	}
 
-	// Custom delimiter
-	if !args[1].IsString() {
-		return NewErrorValue()
-	}
-	delim, _ := args[1].StringValue()
+	return NewListValue(splitDelimited(str, delim))
+}
 
-	// Split on any character in delimiter string
-	fields := strings.FieldsFunc(str, func(r rune) bool {
-		return strings.ContainsRune(delim, r)
-	})
+// classadIsSpace reports whether b is a whitespace byte (matching C isspace for
+// the ASCII range).
+func classadIsSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\v' || b == '\f' || b == '\r'
+}
+
+// splitDelimited implements the reference split() tokenizer. A character is a
+// delimiter if it appears in delim; a delimiter is "soft" if it is whitespace
+// and "hard" otherwise. Content runs are emitted verbatim, and each maximal
+// delimiter run emits (number of hard delimiters in the run - 1) empty strings
+// -- so whitespace collapses without producing empties while repeated hard
+// delimiters (e.g. ",,") produce empty fields, regardless of position.
+func splitDelimited(str, delim string) []Value {
+	isDelim := func(b byte) bool { return strings.IndexByte(delim, b) >= 0 }
 
 	var result []Value
-	for _, field := range fields {
-		result = append(result, NewStringValue(field))
+	for i := 0; i < len(str); {
+		if isDelim(str[i]) {
+			hard := 0
+			for i < len(str) && isDelim(str[i]) {
+				if !classadIsSpace(str[i]) {
+					hard++
+				}
+				i++
+			}
+			for k := 0; k < hard-1; k++ {
+				result = append(result, NewStringValue(""))
+			}
+		} else {
+			start := i
+			for i < len(str) && !isDelim(str[i]) {
+				i++
+			}
+			result = append(result, NewStringValue(str[start:i]))
+		}
 	}
-	return NewListValue(result)
+	return result
 }
 
 // builtinSplitUserName splits "user@domain" into {"user", "domain"}
