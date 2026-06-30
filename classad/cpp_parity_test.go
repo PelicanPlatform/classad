@@ -1062,6 +1062,13 @@ func TestVersioncmpPrefix(t *testing.T) {
 		{`versioncmp("1.2", "1")`, "I:46"},  // '.'
 		{`versioncmp("a", "ab")`, "I:-98"},  // -'b'
 		{`versioncmp("abc", "abc")`, "I:0"}, // equal
+		// Numeric-aware (strverscmp-style) comparisons: longer non-zero number
+		// runs sort higher, and a trailing zero is not treated as a leading
+		// zero (so "...876" vs "0" keeps "0" as a length-1 number => 19-1).
+		{`versioncmp("2467760345006695876", "0")`, "I:18"},
+		{`versioncmp("100", "99")`, "I:1"},    // 3-digit vs 2-digit
+		{`versioncmp("1.10", "1.9")`, "I:1"},  // 2-digit vs 1-digit run
+		{`versioncmp("a012", "a12")`, "I:-1"}, // more leading zeros sorts first
 	}
 	for _, tc := range cases {
 		ad, err := Parse("[ x = " + tc.expr + " ]")

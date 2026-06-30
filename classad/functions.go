@@ -1640,81 +1640,85 @@ func builtinStricmp(args []Value) Value {
 
 // versionCompare implements HTCondor version comparison logic
 // Lexicographic except numeric sequences are compared numerically
+// versionCompare is a faithful port of HTCondor's natural_cmp (a strverscmp(3)
+// style compare that takes numeric portions into account). Keeping it
+// byte-for-byte equivalent to the reference -- including its leading-zero and
+// trailing-zero handling -- is what lets versioncmp() match libclassad on
+// every input. Indices at or past the end of a string read as a 0 byte (NUL),
+// mirroring the C++ null-terminated pointer arithmetic.
 func versionCompare(left, right string) int {
-	i, j := 0, 0
-
-	for i < len(left) && j < len(right) {
-		// Check if both are at the start of a numeric sequence
-		if left[i] >= '0' && left[i] <= '9' && right[j] >= '0' && right[j] <= '9' {
-			// Count leading zeros
-			zeros1, zeros2 := 0, 0
-			for i < len(left) && left[i] == '0' {
-				zeros1++
-				i++
-			}
-			for j < len(right) && right[j] == '0' {
-				zeros2++
-				j++
-			}
-
-			// Extract remaining digits
-			numEnd1, numEnd2 := i, j
-			for numEnd1 < len(left) && left[numEnd1] >= '0' && left[numEnd1] <= '9' {
-				numEnd1++
-			}
-			for numEnd2 < len(right) && right[numEnd2] >= '0' && right[numEnd2] <= '9' {
-				numEnd2++
-			}
-
-			// Compare numeric values
-			if i < numEnd1 || j < numEnd2 {
-				// At least one has non-zero digits
-				num1Len := numEnd1 - i
-				num2Len := numEnd2 - j
-
-				if num1Len != num2Len {
-					return num1Len - num2Len
-				}
-
-				// Same length, compare digit by digit
-				for k := 0; k < num1Len; k++ {
-					if left[i+k] != right[j+k] {
-						return int(left[i+k]) - int(right[j+k])
-					}
-				}
-
-				i = numEnd1
-				j = numEnd2
-			} else {
-				// Both are all zeros - more zeros means smaller
-				if zeros1 != zeros2 {
-					return zeros2 - zeros1
-				}
-				i = numEnd1
-				j = numEnd2
-			}
-		} else {
-			// Lexicographic comparison
-			if left[i] != right[j] {
-				return int(left[i]) - int(right[j])
-			}
-			i++
-			j++
+	at := func(s string, i int) byte {
+		if i < 0 || i >= len(s) {
+			return 0
 		}
+		return s[i]
+	}
+	isdigit := func(b byte) bool { return b >= '0' && b <= '9' }
+
+	// find first mismatch (i and j advance together, so they stay equal)
+	i, j := 0, 0
+	for at(left, i) != 0 && at(left, i) == at(right, j) {
+		i++
+		j++
+	}
+	if at(left, i) == at(right, j) {
+		return 0
 	}
 
-	// One string is a prefix of the other: the reference's natural compare
-	// returns the difference of the first unmatched bytes, treating the end of
-	// a string as a 0 byte (so "abc" vs "" yields 'a', and "1.2" vs "1" yields
-	// '.'), rather than the difference in lengths.
-	var lc, rc int
-	if i < len(left) {
-		lc = int(left[i])
+	// find digits leading up to the mismatch
+	n1beg := i
+	for n1beg > 0 && isdigit(at(left, n1beg-1)) {
+		n1beg--
 	}
-	if j < len(right) {
-		rc = int(right[j])
+	n2beg := j - (i - n1beg)
+
+	// just compare the mismatch unless it touches a digit in both strings
+	if n1beg == i && (!isdigit(at(left, i)) || !isdigit(at(right, j))) {
+		return int(at(left, i)) - int(at(right, j))
 	}
-	return lc - rc
+
+	// find leading zeros
+	z1end := n1beg
+	for at(left, z1end) == '0' {
+		z1end++
+	}
+	z2end := n2beg
+	for at(right, z2end) == '0' {
+		z2end++
+	}
+
+	// don't count a final trailing zero as a leading zero
+	if z1end > n1beg && !isdigit(at(left, z1end)) {
+		z1end--
+	}
+	if z2end > n2beg && !isdigit(at(right, z2end)) {
+		z2end--
+	}
+
+	// fewer leading zeros comes first
+	if z1end-n1beg != z2end-n2beg {
+		return (z2end - n2beg) - (z1end - n1beg)
+	}
+
+	// for an equal positive number of leading zeros, compare the mismatch
+	if z1end > n1beg {
+		return int(at(left, i)) - int(at(right, j))
+	}
+
+	// no leading zeros: the rest is an arbitrary-length numeric compare
+	n1end := z1end
+	for isdigit(at(left, n1end)) {
+		n1end++
+	}
+	n2end := z2end
+	for isdigit(at(right, n2end)) {
+		n2end++
+	}
+
+	if n1end-n1beg != n2end-n2beg {
+		return (n1end - n1beg) - (n2end - n2beg)
+	}
+	return int(at(left, i)) - int(at(right, j))
 }
 
 // builtinVersioncmp compares version strings
