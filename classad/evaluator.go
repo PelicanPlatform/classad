@@ -415,6 +415,15 @@ func (e *Evaluator) evalAttrIn(ad *ClassAd, name string) Value {
 }
 
 func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
+	// && and || implement short-circuit three-valued logic: the right operand
+	// is evaluated only when the left does not already determine the result, so
+	// "false && q" is false even when q would cycle or error (and likewise
+	// "true || q"). This must run before the generic error/undefined
+	// propagation below ("false && error" is false, "true || undefined" true).
+	if op.Op == "&&" || op.Op == "||" {
+		return e.evaluateShortCircuit(op)
+	}
+
 	left := e.Evaluate(op.Left)
 	right := e.Evaluate(op.Right)
 
@@ -424,15 +433,6 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 	}
 	if op.Op == "isnt" {
 		return e.evaluateIsnt(left, right)
-	}
-	// && and || implement short-circuit three-valued logic and must run before
-	// the generic error/undefined propagation below: e.g. "false && error" is
-	// false, not error, and "true || undefined" is true, not undefined.
-	if op.Op == "&&" {
-		return e.evaluateAnd(left, right)
-	}
-	if op.Op == "||" {
-		return e.evaluateOr(left, right)
 	}
 
 	// Handle error propagation for other operators
@@ -1185,6 +1185,32 @@ func mapState(s logicalState) Value {
 	default:
 		return NewErrorValue()
 	}
+}
+
+// evaluateShortCircuit evaluates a && / || expression, deferring evaluation of
+// the right operand until the left operand's truth value requires it. A false
+// (for &&) or true (for ||) left operand decides the result outright; an error
+// left operand is an error; only a true/undefined (&&) or false/undefined (||)
+// left operand evaluates the right and applies the full three-valued logic.
+func (e *Evaluator) evaluateShortCircuit(op *ast.BinaryOp) Value {
+	left := e.Evaluate(op.Left)
+	switch logicalView(left) {
+	case lsErr:
+		return NewErrorValue()
+	case lsFalse:
+		if op.Op == "&&" {
+			return NewBoolValue(false)
+		}
+	case lsTrue:
+		if op.Op == "||" {
+			return NewBoolValue(true)
+		}
+	}
+	right := e.Evaluate(op.Right)
+	if op.Op == "&&" {
+		return e.evaluateAnd(left, right)
+	}
+	return e.evaluateOr(left, right)
 }
 
 func (e *Evaluator) evaluateAnd(left, right Value) Value {

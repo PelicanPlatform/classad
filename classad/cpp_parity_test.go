@@ -572,3 +572,28 @@ func TestSizeCountsWithoutEvaluating(t *testing.T) {
 		t.Errorf("A[0] = %v, want int(1)", got[0])
 	}
 }
+
+// TestShortCircuitLazyOperand guards that && / || evaluate the right operand
+// only when the left does not already decide the result: "false && q" is false
+// and "true || q" is true even when q is a self-referential cycle (which would
+// otherwise evaluate to error).
+func TestShortCircuitLazyOperand(t *testing.T) {
+	cases := []struct {
+		src  string
+		want bool
+	}{
+		{`[ q = (false && q) ]`, false},
+		{`[ q = (true || q) ]`, true},
+	}
+	for _, tc := range cases {
+		ad, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.src, err)
+		}
+		v := ad.EvaluateAttr("q")
+		got, gerr := v.BoolValue()
+		if gerr != nil || got != tc.want {
+			t.Errorf("%s: q = %v, want %v", tc.src, v, tc.want)
+		}
+	}
+}
