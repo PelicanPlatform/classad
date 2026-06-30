@@ -39,6 +39,13 @@ type Value struct {
 	strVal     string
 	listVal    []Value
 	classAdVal *ClassAd
+	// listExprs holds the source element expressions of a list that came from
+	// a list literal (nil for lists built programmatically by functions). The
+	// reference engine stores a list as its unevaluated ExprList; carrying the
+	// source expressions lets string()/strcat()/etc. unparse them exactly,
+	// e.g. string({1, 1+1}) is "{ 1,1 + 1 }" rather than "{ 1,2 }". It does
+	// not affect value semantics, which use the eagerly-evaluated listVal.
+	listExprs []ast.Expr
 }
 
 // NewUndefinedValue creates an undefined value.
@@ -476,7 +483,16 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 	for i, elem := range list.Elements {
 		values[i] = e.Evaluate(elem)
 	}
-	return NewListValue(values)
+	v := NewListValue(values)
+	// Carry the source element expressions (non-nil even when empty, to
+	// distinguish a literal from a programmatically-built list) so string
+	// coercion can unparse them like the reference engine.
+	exprs := list.Elements
+	if exprs == nil {
+		exprs = []ast.Expr{}
+	}
+	v.listExprs = exprs
+	return v
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {

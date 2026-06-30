@@ -135,6 +135,13 @@ func TestCppParity(t *testing.T) {
 		{`string({true, undefined})`, "S:{ true,undefined }"},
 		{`string({{1}, 2})`, "S:{ { 1 },2 }"},
 		{`strcat({1, 2}, "!")`, "S:{ 1,2 }!"},
+		// List string-coercion unparses the source element EXPRESSIONS
+		// (reference engine stores a list as its unevaluated ExprList), so a
+		// compound element keeps its source form rather than its value.
+		{`string({1, 1+1})`, "S:{ 1,1 + 1 }"},
+		{`string({(a + 1)})`, "S:{ (a + 1) }"},
+		{`string({(undefined ? error : false)})`, "S:{ (undefined ? error : false) }"},
+		{`toUpper({a + 1})`, "S:{ A + 1 }"},
 		{`strcat({1, 2}, x0)`, "U"},
 		{`toUpper({1})`, "S:{ 1 }"},
 		{`stricmp({}, 1)`, "I:1"},

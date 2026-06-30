@@ -168,7 +168,26 @@ func unparseValueNested(v Value) (string, bool) {
 
 // unparseList renders a list value in reference sink form, "{ e1,e2 }" (and
 // "{  }" when empty). Returns ok=false if any element cannot be unparsed.
+//
+// A list from a literal carries its source element expressions, which are
+// unparsed directly (so string({1, 1+1}) is "{ 1,1 + 1 }", matching the
+// reference engine, which stores a list as its unevaluated ExprList). A list
+// built programmatically (e.g. by split()) has no source expressions, so its
+// already-evaluated element values are unparsed instead.
 func unparseList(v Value) (string, bool) {
+	if v.listExprs != nil {
+		var b strings.Builder
+		b.WriteString("{ ")
+		for i, e := range v.listExprs {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(unparseExprString(e))
+		}
+		b.WriteString(" }")
+		return b.String(), true
+	}
+
 	elems, err := v.ListValue()
 	if err != nil {
 		return "", false
