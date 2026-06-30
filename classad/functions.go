@@ -837,30 +837,6 @@ func builtinRegexp(args []Value) Value {
 	return NewBoolValue(re.MatchString(target))
 }
 
-// builtinIfThenElse is the conditional operator as a function
-// ifThenElse(condition, trueValue, falseValue)
-// This is equivalent to (condition ? trueValue : falseValue)
-// Unlike the ternary operator, this is a function so all arguments are evaluated first
-func builtinIfThenElse(args []Value) Value {
-	if len(args) != 3 {
-		return NewErrorValue()
-	}
-
-	// The condition coerces a number's truthiness exactly like the ?: operator
-	// (ifThenElse(1, a, b) selects a); undefined yields undefined and a
-	// non-coercible condition is an error.
-	switch logicalView(args[0]) {
-	case lsTrue:
-		return args[1]
-	case lsFalse:
-		return args[2]
-	case lsUndef:
-		return NewUndefinedValue()
-	default:
-		return NewErrorValue()
-	}
-}
-
 // builtinString converts any value to string
 func builtinString(args []Value) Value {
 	if len(args) != 1 {

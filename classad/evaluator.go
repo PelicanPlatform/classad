@@ -1284,6 +1284,28 @@ func (e *Evaluator) evaluateEval(args []ast.Expr) Value {
 	return e.Evaluate(expr)
 }
 
+// evaluateIfThenElse implements ifThenElse(cond, t, f) with the same lazy,
+// number-coercing semantics as the ?: operator (see evaluateConditional): the
+// condition's truthiness selects a branch and only that branch is evaluated, so
+// a self-referential or erroring unselected branch is never touched
+// (ifThenElse(1, 0, B) is 0). Undefined yields undefined; a non-coercible
+// condition is an error.
+func (e *Evaluator) evaluateIfThenElse(args []ast.Expr) Value {
+	if len(args) != 3 {
+		return NewErrorValue()
+	}
+	switch logicalView(e.Evaluate(args[0])) {
+	case lsTrue:
+		return e.Evaluate(args[1])
+	case lsFalse:
+		return e.Evaluate(args[2])
+	case lsUndef:
+		return NewUndefinedValue()
+	default:
+		return NewErrorValue()
+	}
+}
+
 // Built-in function evaluation
 func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// Function names are matched case-insensitively, like the reference engine
@@ -1298,6 +1320,13 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// Handle eval() specially - it needs to parse and evaluate in the current context
 	if funcName == "eval" {
 		return e.evaluateEval(fc.Args)
+	}
+
+	// Handle ifThenElse() specially - like the ?: operator it evaluates only
+	// the selected branch (so ifThenElse(1, 0, B) is 0 and never evaluates a
+	// self-referential B), rather than eagerly evaluating all arguments.
+	if funcName == "ifthenelse" {
+		return e.evaluateIfThenElse(fc.Args)
 	}
 
 	// Evaluate all arguments
@@ -1369,8 +1398,7 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinRegexp(args)
 
 	// Control flow functions
-	case "ifthenelse":
-		return builtinIfThenElse(args)
+	// ifThenElse is handled lazily before argument evaluation (above).
 
 	// Type conversion functions
 	case "string":
