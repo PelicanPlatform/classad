@@ -860,3 +860,40 @@ func TestStringListMembership(t *testing.T) {
 		}
 	}
 }
+
+// TestAnyAllCompare guards anyCompare/allCompare three-valued aggregation: the
+// element comparisons use the engine's real semantics (1 == undefined is
+// undefined, not error); a comparison that errors makes the call error; a bad
+// operator is an error; the target may be undefined (anyCompare then has no
+// true element -> false; allCompare has a non-true element -> false). op/list
+// undefined stays undefined; an empty list is vacuously true for allCompare,
+// false for anyCompare.
+func TestAnyAllCompareThreeValued(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`anyCompare("==", {1,2}, undefined)`, "B:false"},
+		{`anyCompare("==", {1}, 1)`, "B:true"},
+		{`anyCompare("<", {1}, error)`, "E"},
+		{`anyCompare("bad", {1}, 1)`, "E"},
+		{`anyCompare("==", {}, 1)`, "B:false"},
+		{`anyCompare(undefined, {1}, 1)`, "U"},
+		{`anyCompare("is", {1}, 1)`, "B:true"},
+		{`allCompare("==", {1,1}, 1)`, "B:true"},
+		{`allCompare("==", {1,2}, 1)`, "B:false"},
+		{`allCompare("==", {1,undefined}, 1)`, "B:false"},
+		{`allCompare("==", {1,error}, 1)`, "E"},
+		{`allCompare("<", {1,2}, undefined)`, "B:false"},
+		{`allCompare("==", {}, 1)`, "B:true"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}

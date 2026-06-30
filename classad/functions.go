@@ -2011,148 +2011,104 @@ func builtinIdenticalMember(args []Value) Value {
 	return NewBoolValue(false)
 }
 
-// builtinAnyCompare checks if any element in list satisfies comparison with t
-// anyCompare(op, list, target) where op is "<", "<=", "==", "!=", ">=", ">"
-func builtinAnyCompare(args []Value) Value {
+// compareList implements anyCompare/allCompare: it applies the comparison
+// operator op (arg0) between each element of the list (arg1) and the target
+// (arg2). An error in op/list/target, a non-string op, a non-list second
+// argument, or an unrecognized operator is an error; an undefined op or list is
+// undefined; but the target may be undefined (a comparison against it just
+// yields undefined). Each element comparison uses the engine's three-valued
+// semantics: a comparison that errors makes the whole call error; for
+// anyCompare a true element wins (else false), for allCompare a non-true
+// element (false or undefined) loses (else true, vacuously true for []).
+func compareList(args []Value, all bool) Value {
 	if len(args) != 3 {
 		return NewErrorValue()
 	}
-
 	if args[0].IsError() || args[1].IsError() || args[2].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() || args[1].IsUndefined() || args[2].IsUndefined() {
+	if args[0].IsUndefined() || args[1].IsUndefined() {
 		return NewUndefinedValue()
 	}
-
 	if !args[0].IsString() || !args[1].IsList() {
 		return NewErrorValue()
 	}
-
 	op, _ := args[0].StringValue()
+	if !validCompareOp(op) {
+		return NewErrorValue()
+	}
 	list, _ := args[1].ListValue()
 	target := args[2]
 
 	for _, item := range list {
-		if item.IsUndefined() {
-			continue
+		r := compareValues(op, item, target)
+		if r.IsError() {
+			return NewErrorValue()
 		}
-
-		result := compareValues(op, item, target)
-		if result.IsBool() {
-			match, _ := result.BoolValue()
-			if match {
-				return NewBoolValue(true)
-			}
+		isTrue := false
+		if r.IsBool() {
+			isTrue, _ = r.BoolValue()
 		}
-	}
-
-	return NewBoolValue(false)
-}
-
-// builtinAllCompare checks if all elements in list satisfy comparison with t
-func builtinAllCompare(args []Value) Value {
-	if len(args) != 3 {
-		return NewErrorValue()
-	}
-
-	if args[0].IsError() || args[1].IsError() || args[2].IsError() {
-		return NewErrorValue()
-	}
-	if args[0].IsUndefined() || args[1].IsUndefined() || args[2].IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !args[0].IsString() || !args[1].IsList() {
-		return NewErrorValue()
-	}
-
-	op, _ := args[0].StringValue()
-	list, _ := args[1].ListValue()
-	target := args[2]
-
-	if len(list) == 0 {
-		return NewBoolValue(true) // vacuously true
-	}
-
-	for _, item := range list {
-		if item.IsUndefined() {
-			continue
-		}
-
-		result := compareValues(op, item, target)
-		if result.IsBool() {
-			match, _ := result.BoolValue()
-			if !match {
+		if all {
+			if !isTrue {
 				return NewBoolValue(false)
 			}
-		} else {
-			return NewBoolValue(false)
+		} else if isTrue {
+			return NewBoolValue(true)
 		}
 	}
+	return NewBoolValue(all)
+}
 
-	return NewBoolValue(true)
+// builtinAnyCompare checks if any element in list satisfies the comparison.
+// anyCompare(op, list, target), op one of < <= == != >= > is isnt =?= =!=
+func builtinAnyCompare(args []Value) Value {
+	return compareList(args, false)
+}
+
+// builtinAllCompare checks if all elements in list satisfy the comparison.
+func builtinAllCompare(args []Value) Value {
+	return compareList(args, true)
 }
 
 // compareValues performs comparison based on operator string
+// validCompareOp reports whether op is a comparison operator accepted by
+// anyCompare/allCompare. An unrecognized operator makes those functions error.
+func validCompareOp(op string) bool {
+	switch op {
+	case "<", "<=", ">", ">=", "==", "!=", "is", "isnt", "=?=", "=!=":
+		return true
+	}
+	return false
+}
+
+// compareValues applies a comparison operator to two values using the engine's
+// real (three-valued) comparison semantics, so anyCompare/allCompare see the
+// same undefined/error/case-insensitive behavior as the corresponding operator
+// (e.g. 1 == undefined is undefined, not error). An unrecognized operator is an
+// error.
 func compareValues(op string, left, right Value) Value {
-	// Handle numeric comparison
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-
-		switch op {
-		case "<":
-			return NewBoolValue(leftNum < rightNum)
-		case "<=":
-			return NewBoolValue(leftNum <= rightNum)
-		case "==":
-			return NewBoolValue(leftNum == rightNum)
-		case "!=":
-			return NewBoolValue(leftNum != rightNum)
-		case ">=":
-			return NewBoolValue(leftNum >= rightNum)
-		case ">":
-			return NewBoolValue(leftNum > rightNum)
-		}
+	e := &Evaluator{}
+	switch op {
+	case "<":
+		return e.evaluateLessThan(left, right)
+	case "<=":
+		return e.evaluateLessOrEqual(left, right)
+	case ">":
+		return e.evaluateGreaterThan(left, right)
+	case ">=":
+		return e.evaluateGreaterOrEqual(left, right)
+	case "==":
+		return e.evaluateEqual(left, right)
+	case "!=":
+		return e.evaluateNotEqual(left, right)
+	case "is", "=?=":
+		return e.evaluateIs(left, right)
+	case "isnt", "=!=":
+		return e.evaluateIsnt(left, right)
+	default:
+		return NewErrorValue()
 	}
-
-	// Handle string comparison
-	if left.IsString() && right.IsString() {
-		leftStr, _ := left.StringValue()
-		rightStr, _ := right.StringValue()
-		cmp := strings.Compare(leftStr, rightStr)
-
-		switch op {
-		case "<":
-			return NewBoolValue(cmp < 0)
-		case "<=":
-			return NewBoolValue(cmp <= 0)
-		case "==":
-			return NewBoolValue(cmp == 0)
-		case "!=":
-			return NewBoolValue(cmp != 0)
-		case ">=":
-			return NewBoolValue(cmp >= 0)
-		case ">":
-			return NewBoolValue(cmp > 0)
-		}
-	}
-
-	// Handle boolean comparison
-	if left.IsBool() && right.IsBool() {
-		leftBool, _ := left.BoolValue()
-		rightBool, _ := right.BoolValue()
-
-		switch op {
-		case "==":
-			return NewBoolValue(leftBool == rightBool)
-		case "!=":
-			return NewBoolValue(leftBool != rightBool)
-		}
-	}
-
-	return NewErrorValue()
 }
 
 // parseStringList splits a string list by delimiter (default comma)
