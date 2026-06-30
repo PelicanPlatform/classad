@@ -55,7 +55,8 @@ var (
 )
 
 var binops = []string{"+", "-", "*", "/", "%", "<", "<=", ">", ">=",
-	"==", "!=", "=?=", "=!=", "&&", "||"}
+	"==", "!=", "=?=", "=!=", "&&", "||",
+	"&", "|", "^", "<<", ">>", ">>>"}
 
 // ClassAd generates one ClassAd as source text (always [ ... ] form).
 func (g *Generator) ClassAd() string {
