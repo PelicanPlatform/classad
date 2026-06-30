@@ -544,124 +544,124 @@ func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
 }
 
 // Arithmetic operations
+// numericOperand reports whether v can act as a number in arithmetic and
+// relational contexts. Booleans participate as integers (true=1, false=0),
+// matching the C++ reference engine where BOOLEAN_VALUE is part of the numeric
+// value mask. isInt is true for integers and booleans (so int/bool operands
+// keep an integer result type); iv/rv carry the integer and real views.
+//
+// Note this is operator-level coercion only: the value's own type is unchanged,
+// so isInteger()/isReal() still report false for a boolean.
+func numericOperand(v Value) (isNum, isInt bool, iv int64, rv float64) {
+	switch v.valueType {
+	case IntegerValue:
+		return true, true, v.intVal, float64(v.intVal)
+	case RealValue:
+		return true, false, 0, v.realVal
+	case BooleanValue:
+		if v.boolVal {
+			return true, true, 1, 1
+		}
+		return true, true, 0, 0
+	default:
+		return false, false, 0, 0
+	}
+}
+
 func (e *Evaluator) evaluateAdd(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsNumber() || !right.IsNumber() {
+	ln, li, liv, lrv := numericOperand(left)
+	rn, ri, riv, rrv := numericOperand(right)
+	if !ln || !rn {
 		return NewErrorValue()
 	}
-
-	leftNum, _ := left.NumberValue()
-	rightNum, _ := right.NumberValue()
-
-	if left.IsInteger() && right.IsInteger() {
-		leftInt, _ := left.IntValue()
-		rightInt, _ := right.IntValue()
-		return NewIntValue(leftInt + rightInt)
+	if li && ri {
+		return NewIntValue(liv + riv)
 	}
-
-	return NewRealValue(leftNum + rightNum)
+	return NewRealValue(lrv + rrv)
 }
 
 func (e *Evaluator) evaluateSubtract(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsNumber() || !right.IsNumber() {
+	ln, li, liv, lrv := numericOperand(left)
+	rn, ri, riv, rrv := numericOperand(right)
+	if !ln || !rn {
 		return NewErrorValue()
 	}
-
-	leftNum, _ := left.NumberValue()
-	rightNum, _ := right.NumberValue()
-
-	if left.IsInteger() && right.IsInteger() {
-		leftInt, _ := left.IntValue()
-		rightInt, _ := right.IntValue()
-		return NewIntValue(leftInt - rightInt)
+	if li && ri {
+		return NewIntValue(liv - riv)
 	}
-
-	return NewRealValue(leftNum - rightNum)
+	return NewRealValue(lrv - rrv)
 }
 
 func (e *Evaluator) evaluateMultiply(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsNumber() || !right.IsNumber() {
+	ln, li, liv, lrv := numericOperand(left)
+	rn, ri, riv, rrv := numericOperand(right)
+	if !ln || !rn {
 		return NewErrorValue()
 	}
-
-	leftNum, _ := left.NumberValue()
-	rightNum, _ := right.NumberValue()
-
-	if left.IsInteger() && right.IsInteger() {
-		leftInt, _ := left.IntValue()
-		rightInt, _ := right.IntValue()
-		return NewIntValue(leftInt * rightInt)
+	if li && ri {
+		return NewIntValue(liv * riv)
 	}
-
-	return NewRealValue(leftNum * rightNum)
+	return NewRealValue(lrv * rrv)
 }
 
 func (e *Evaluator) evaluateDivide(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsNumber() || !right.IsNumber() {
+	ln, li, liv, lrv := numericOperand(left)
+	rn, ri, riv, rrv := numericOperand(right)
+	if !ln || !rn {
+		return NewErrorValue()
+	}
+	if rrv == 0 {
 		return NewErrorValue()
 	}
 
-	rightNum, _ := right.NumberValue()
-	if rightNum == 0 {
-		return NewErrorValue()
-	}
-
-	leftNum, _ := left.NumberValue()
-
-	if left.IsInteger() && right.IsInteger() {
-		leftInt, _ := left.IntValue()
-		rightInt, _ := right.IntValue()
+	if li && ri {
 		// Integer / integer yields an integer (truncated toward zero), matching
 		// the C++ reference engine. Guard the one signed-overflow case
 		// (MinInt64 / -1) that would panic in Go; libclassad yields MaxInt64
 		// there, so mirror that.
-		if leftInt == math.MinInt64 && rightInt == -1 {
+		if liv == math.MinInt64 && riv == -1 {
 			return NewIntValue(math.MaxInt64)
 		}
-		return NewIntValue(leftInt / rightInt)
+		return NewIntValue(liv / riv)
 	}
 
-	return NewRealValue(leftNum / rightNum)
+	return NewRealValue(lrv / rrv)
 }
 
 func (e *Evaluator) evaluateModulo(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsInteger() || !right.IsInteger() {
+	ln, li, liv, _ := numericOperand(left)
+	rn, ri, riv, _ := numericOperand(right)
+	// Modulo requires integer-typed operands (booleans count as integers).
+	if !ln || !rn || !li || !ri {
 		return NewErrorValue()
 	}
 
-	leftInt, _ := left.IntValue()
-	rightInt, _ := right.IntValue()
-
-	if rightInt == 0 {
+	if riv == 0 {
 		return NewErrorValue()
 	}
 
 	// Any integer modulo ±1 is 0; special-casing -1 also avoids the
 	// MinInt64 % -1 signed-overflow panic in Go.
-	if rightInt == -1 {
+	if riv == -1 {
 		return NewIntValue(0)
 	}
 
-	return NewIntValue(leftInt % rightInt)
+	return NewIntValue(liv % riv)
 }
 
 // lowerASCII folds an ASCII upper-case byte to lower case, leaving every other
@@ -709,10 +709,10 @@ func (e *Evaluator) evaluateLessThan(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-		return NewBoolValue(leftNum < rightNum)
+	if ln, _, _, lrv := numericOperand(left); ln {
+		if rn, _, _, rrv := numericOperand(right); rn {
+			return NewBoolValue(lrv < rrv)
+		}
 	}
 
 	if left.IsString() && right.IsString() {
@@ -729,10 +729,10 @@ func (e *Evaluator) evaluateGreaterThan(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-		return NewBoolValue(leftNum > rightNum)
+	if ln, _, _, lrv := numericOperand(left); ln {
+		if rn, _, _, rrv := numericOperand(right); rn {
+			return NewBoolValue(lrv > rrv)
+		}
 	}
 
 	if left.IsString() && right.IsString() {
@@ -749,10 +749,10 @@ func (e *Evaluator) evaluateLessOrEqual(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-		return NewBoolValue(leftNum <= rightNum)
+	if ln, _, _, lrv := numericOperand(left); ln {
+		if rn, _, _, rrv := numericOperand(right); rn {
+			return NewBoolValue(lrv <= rrv)
+		}
 	}
 
 	if left.IsString() && right.IsString() {
@@ -769,10 +769,10 @@ func (e *Evaluator) evaluateGreaterOrEqual(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-		return NewBoolValue(leftNum >= rightNum)
+	if ln, _, _, lrv := numericOperand(left); ln {
+		if rn, _, _, rrv := numericOperand(right); rn {
+			return NewBoolValue(lrv >= rrv)
+		}
 	}
 
 	if left.IsString() && right.IsString() {
@@ -794,11 +794,15 @@ func (e *Evaluator) evaluateEqual(left, right Value) Value {
 	}
 
 	if left.Type() != right.Type() {
-		// Allow numeric comparison between int and real
-		if left.IsNumber() && right.IsNumber() {
-			leftNum, _ := left.NumberValue()
-			rightNum, _ := right.NumberValue()
-			return NewBoolValue(math.Abs(leftNum-rightNum) < 1e-9)
+		// Allow numeric comparison across int/real/bool (a boolean compares as
+		// 1/0), matching the C++ reference where booleans are numeric values.
+		ln, li, liv, lrv := numericOperand(left)
+		rn, ri, riv, rrv := numericOperand(right)
+		if ln && rn {
+			if li && ri {
+				return NewBoolValue(liv == riv)
+			}
+			return NewBoolValue(math.Abs(lrv-rrv) < 1e-9)
 		}
 		return NewBoolValue(false)
 	}

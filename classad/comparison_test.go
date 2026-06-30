@@ -13,7 +13,9 @@ func TestEvaluatorComparisonOperators(t *testing.T) {
 		{"1 >= 2", false, false},
 		{"\"b\" <= \"a\"", false, false},
 		{"\"b\" >= \"a\"", false, true},
-		{"true > false", true, false},
+		// Booleans are numeric (true=1, false=0) in the reference engine, so
+		// this is 1 > 0 == true, not an error.
+		{"true > false", false, true},
 		{"1 >= \"a\"", true, false},
 		{"\"c\" > \"b\"", false, true},
 	}
