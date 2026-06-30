@@ -319,3 +319,19 @@ func (t ValueType) describe() string {
 		return "unknown"
 	}
 }
+
+// TestDuplicateAttributesLastWins verifies that a ClassAd with repeated
+// attribute names keeps only the last assignment, like the reference engine
+// (which stores attributes in a map).
+func TestDuplicateAttributesLastWins(t *testing.T) {
+	ad, err := Parse(`[ B = 1; B = 2; B = 3; c = 9 ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := ad.GetAttributes(); len(got) != 2 {
+		t.Errorf("expected 2 distinct attributes, got %v", got)
+	}
+	if v, _ := ad.EvaluateAttr("B").IntValue(); v != 3 {
+		t.Errorf("B = %d, want 3 (last assignment wins)", v)
+	}
+}

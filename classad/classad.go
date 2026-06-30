@@ -190,8 +190,33 @@ func normalizeName(name string) string {
 	return strings.ToLower(name)
 }
 
+// dedupAttributes collapses duplicate attribute names, keeping each name's
+// last assignment, matching the reference engine -- a ClassAd is a map there,
+// so a later "x = ..." overwrites an earlier one ([B=1;B=2] has B==2). The
+// retained entries keep the order of their last occurrence.
+func (c *ClassAd) dedupAttributes() {
+	if c.ad == nil || len(c.ad.Attributes) < 2 {
+		return
+	}
+	lastIdx := make(map[string]int, len(c.ad.Attributes))
+	for i, attr := range c.ad.Attributes {
+		lastIdx[normalizeName(attr.Name)] = i
+	}
+	if len(lastIdx) == len(c.ad.Attributes) {
+		return // no duplicates
+	}
+	kept := make([]*ast.AttributeAssignment, 0, len(lastIdx))
+	for i, attr := range c.ad.Attributes {
+		if lastIdx[normalizeName(attr.Name)] == i {
+			kept = append(kept, attr)
+		}
+	}
+	c.ad.Attributes = kept
+}
+
 // rebuildIndex recreates the fast lookup map from the underlying attributes.
 func (c *ClassAd) rebuildIndex() {
+	c.dedupAttributes()
 	if c.ad == nil {
 		c.index = nil
 		return
