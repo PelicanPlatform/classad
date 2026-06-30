@@ -442,26 +442,19 @@ func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
 func (e *Evaluator) evaluateConditional(cond *ast.ConditionalExpr) Value {
 	condVal := e.Evaluate(cond.Condition)
 
-	if condVal.IsError() {
-		return NewErrorValue()
-	}
-
-	if condVal.IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !condVal.IsBool() {
-		return NewErrorValue()
-	}
-
-	boolVal, err := condVal.BoolValue()
-	if err != nil {
-		return NewErrorValue()
-	}
-	if boolVal {
+	// The condition coerces a number to its truthiness like && / || do, so
+	// "1 ? a : b" selects a and "0 ? a : b" selects b. Undefined yields
+	// undefined; a non-coercible condition (string/list/error) is an error.
+	switch logicalView(condVal) {
+	case lsTrue:
 		return e.Evaluate(cond.TrueExpr)
+	case lsFalse:
+		return e.Evaluate(cond.FalseExpr)
+	case lsUndef:
+		return NewUndefinedValue()
+	default:
+		return NewErrorValue()
 	}
-	return e.Evaluate(cond.FalseExpr)
 }
 
 // evaluateElvis evaluates the Elvis operator (expr1 ?: expr2).
