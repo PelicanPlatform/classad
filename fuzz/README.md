@@ -142,19 +142,45 @@ the `classad:` / `parser:` commits and `classad/cpp_parity_test.go`):
 | `round(2.5)` | `3` | `2` | Round half to even. |
 | `string(1.5)` | `"1.5"` | `"1.50…E+00"` | Reals stringify as `%.15E`. |
 
-Driving the fixes with the bucketed `cafuzz` survey took the semantic-divergence
-rate (random ads, `-ignore-parse`) from ~3800/5000 down to ~250/5000 (~94%).
+…and many more found by driving the fuzzer iteratively (see the `classad:`
+commits and `classad/cpp_parity_test.go`): boolean numeric coercion, per-function
+undefined handling, `ifThenElse`/`?:` condition coercion, exact real equality,
+mismatched-type `==` → error, `quantize`/`pow` typing, integer division/modulo
+overflow, `int()`/`real()`/`floor()`/`pow()`/… string parsing, `member()`
+`==`-semantics, `=?=`/`=!=` on lists → error, undefined-dominates-error argument
+precedence (`substr`/`strcmp`/`member`), real division by zero (`+Inf`→error,
+`-Inf`/`NaN`→value), large-integer `round`/`floor` precision, list coercion via
+the sink unparse format, and removing the non-reference `length()`.
 
-### Known remaining divergences (intentionally not fixed)
+The bucketed `cafuzz` survey drove the semantic-divergence rate (random ads,
+`-ignore-parse`) from ~3800/5000 down to ~50/5000 (~98.7%).
 
-- **`string()`/`strcat()`/`strcmp()`/`stricmp()`/`quantize()` of a list or
-  nested ad.** The reference engine unparses the *unevaluated element
-  expressions* (`string({1, 1+1})` → `"{ 1,1 + 1 }"`), whereas the Go engine
-  evaluates list elements eagerly and no longer has the source expressions. The
-  scalar cases are matched; composite coercion is an architectural mismatch and
-  is left erroring. This is the bulk of what remains.
-- **`length(...)`** is a documented Go alias for `size()`; the reference engine
-  has no such function (it always errors). Left as a deliberate Go extension.
+### Known remaining divergences
+
+Essentially all of the residual ~1% trace to **one architectural difference**:
+the Go engine evaluates list elements **eagerly** and stores evaluated values,
+whereas the reference engine keeps a list as its *unevaluated* expression list
+and evaluates elements lazily in their defining scope. This surfaces as:
+
+- **String coercion of lists with non-literal elements** —
+  `string({1, 1+1})` is `"{ 1,1 + 1 }"` in the reference (the source
+  expression) but `"{ 1,2 }"` here (the evaluated value). Lists of literals /
+  scalars do match; `string`/`strcat`/`strcmp`/`stricmp`/`quantize` of such
+  lists are handled.
+- **List/nested-subscript element evaluation** — an element that is a reference
+  or compound expression can evaluate to a different undefined/error/value
+  under eager vs. lazy/scoped evaluation.
+- **`string()`/… of a nested classad** — likewise unparses attribute
+  expressions; still left erroring.
+
+Closing this fully would require representing list values as lazy expression
+lists in the Go evaluator — a larger change than the targeted semantic fixes
+above.
+
+Two further intentional non-fixes:
+
+- **`length(...)`** *was* a Go alias for `size()`; the reference engine has no
+  such function, so it has been removed (now an error), matching the reference.
 - **Integer-literal overflow** (`9223372036854775808`): the reference engine
   silently evaluates it to `0` (a libclassad bug, reported upstream); Go rejects
   it at parse time. Not mirrored.
