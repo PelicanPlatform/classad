@@ -1670,12 +1670,14 @@ func builtinVersioncmp(args []Value) Value {
 	if args[0].IsUndefined() || args[1].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	if !args[0].IsString() || !args[1].IsString() {
+	// Non-string arguments are coerced to their string form (numbers/bools), as
+	// the reference does via convertValueToStringValue: versioncmp(2, 1) is 1
+	// and versioncmp("a", 1) is 48. A list/ad is not coercible -> error.
+	left, ok0 := classadString(args[0])
+	right, ok1 := classadString(args[1])
+	if !ok0 || !ok1 {
 		return NewErrorValue()
 	}
-
-	left, _ := args[0].StringValue()
-	right, _ := args[1].StringValue()
 
 	result := versionCompare(left, right)
 	return NewIntValue(int64(result))
@@ -1697,9 +1699,9 @@ func builtinVersionInRange(args []Value) Value {
 	if args[1].IsUndefined() || args[2].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	version, ok0 := classadScalarString(args[0])
-	minStr, ok1 := classadScalarString(args[1])
-	maxStr, ok2 := classadScalarString(args[2])
+	version, ok0 := classadString(args[0])
+	minStr, ok1 := classadString(args[1])
+	maxStr, ok2 := classadString(args[2])
 	if !ok0 || !ok1 || !ok2 {
 		return NewErrorValue()
 	}
