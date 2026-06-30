@@ -110,10 +110,11 @@ func (e *Expr) internal() ast.Expr {
 
 // Eval evaluates the expression in the context of the given ClassAd.
 // This is equivalent to calling classad.EvaluateExpr(expr).
-func (e *Expr) Eval(scope *ClassAd) Value {
+func (e *Expr) Eval(scope *ClassAd) (result Value) {
 	if e.expr == nil {
 		return NewUndefinedValue()
 	}
+	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(scope)
 	return evaluator.Evaluate(e.expr)
 }
@@ -127,7 +128,7 @@ func (e *Expr) Eval(scope *ClassAd) Value {
 //
 //	expr, _ := classad.ParseExpr("MY.Cpus > TARGET.Cpus")
 //	result := expr.EvalWithContext(jobAd, machineAd)
-func (e *Expr) EvalWithContext(scope, target *ClassAd) Value {
+func (e *Expr) EvalWithContext(scope, target *ClassAd) (result Value) {
 	if e.expr == nil {
 		return NewUndefinedValue()
 	}
@@ -140,6 +141,7 @@ func (e *Expr) EvalWithContext(scope, target *ClassAd) Value {
 		defer func() { scope.target = oldTarget }()
 	}
 
+	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(scope)
 	return evaluator.Evaluate(e.expr)
 }
@@ -792,12 +794,13 @@ func (c *ClassAd) GetTarget() *ClassAd {
 }
 
 // EvaluateAttr evaluates an attribute and returns its value.
-func (c *ClassAd) EvaluateAttr(name string) Value {
+func (c *ClassAd) EvaluateAttr(name string) (result Value) {
 	expr := c.lookupInternal(name)
 	if expr == nil {
 		return NewUndefinedValue()
 	}
 
+	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(c)
 	return evaluator.Evaluate(expr)
 }
@@ -874,7 +877,8 @@ func (c *ClassAd) EvaluateAttrBool(name string) (bool, bool) {
 }
 
 // EvaluateExpr evaluates an arbitrary expression in the context of this ClassAd.
-func (c *ClassAd) EvaluateExpr(expr ast.Expr) Value {
+func (c *ClassAd) EvaluateExpr(expr ast.Expr) (result Value) {
+	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(c)
 	return evaluator.Evaluate(expr)
 }

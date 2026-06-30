@@ -374,7 +374,10 @@ func TestDuplicateAttributesLastWins(t *testing.T) {
 // error instead of recursing until the stack overflows (the reference engine
 // reports a failed evaluation for such cycles).
 func TestCyclicReferencesError(t *testing.T) {
-	for _, src := range []string{`[a=a]`, `[a=a+1]`, `[a=b;b=a]`, `[a=eval("a")]`} {
+	// The cycle aborts the whole evaluation, even when the cyclic reference is
+	// an operand of =?= / =!= (which otherwise compare a literal error as a
+	// type rather than propagating it).
+	for _, src := range []string{`[a=a]`, `[a=a+1]`, `[a=b;b=a]`, `[a=eval("a")]`, `[a=(0 =!= a)]`} {
 		ad, err := Parse(src)
 		if err != nil {
 			t.Fatalf("parse %q: %v", src, err)

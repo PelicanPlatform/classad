@@ -229,6 +229,24 @@ func (v Value) String() string {
 	}
 }
 
+// cyclicEvalError is panicked when a cyclic attribute reference is detected
+// during evaluation; recoverCyclic turns it into an error value at the
+// top-level evaluation entry points.
+type cyclicEvalError struct{}
+
+// recoverCyclic recovers a cyclicEvalError panic and stores an error value in
+// result; any other panic is re-raised. Use as `defer recoverCyclic(&result)`
+// with a named return value.
+func recoverCyclic(result *Value) {
+	if r := recover(); r != nil {
+		if _, ok := r.(cyclicEvalError); ok {
+			*result = NewErrorValue()
+			return
+		}
+		panic(r)
+	}
+}
+
 // Evaluator handles evaluation of ClassAd expressions.
 type Evaluator struct {
 	classad *ClassAd
@@ -333,10 +351,13 @@ func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Valu
 
 	// Detect cyclic references: if this attribute is already being evaluated in
 	// the target ad, evaluating it again would recurse forever. The reference
-	// engine treats such a cycle as a failed evaluation (error).
+	// engine treats such a cycle as a failed evaluation that aborts the whole
+	// expression (distinct from an error *value*, which =?= / =!= would compare
+	// as a type), so panic with a sentinel recovered at the top-level entry
+	// points, turning the whole evaluation into error.
 	norm := normalizeName(ref.Name)
 	if targetClassAd.evaluating[norm] {
-		return NewErrorValue()
+		panic(cyclicEvalError{})
 	}
 	if targetClassAd.evaluating == nil {
 		targetClassAd.evaluating = make(map[string]bool)
