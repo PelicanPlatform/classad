@@ -98,9 +98,11 @@ func TestEvaluateExprUnaryAndDivide(t *testing.T) {
 		t.Fatalf("-(4) = %d, want -4", got)
 	}
 
-	notErr := evalExpr(t, "!1")
-	if !notErr.IsError() {
-		t.Fatalf("expected error from logical not on non-bool")
+	// Logical not coerces a number's truthiness like the reference engine:
+	// !1 is false (1 is truthy), not an error.
+	notOne := evalExpr(t, "!1")
+	if b, _ := notOne.BoolValue(); notOne.IsError() || b {
+		t.Fatalf("!1 = %v, want false", notOne)
 	}
 
 	plErr := evalExpr(t, "+\"str\"")

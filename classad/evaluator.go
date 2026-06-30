@@ -339,6 +339,15 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 	if op.Op == "isnt" {
 		return e.evaluateIsnt(left, right)
 	}
+	// && and || implement short-circuit three-valued logic and must run before
+	// the generic error/undefined propagation below: e.g. "false && error" is
+	// false, not error, and "true || undefined" is true, not undefined.
+	if op.Op == "&&" {
+		return e.evaluateAnd(left, right)
+	}
+	if op.Op == "||" {
+		return e.evaluateOr(left, right)
+	}
 
 	// Handle error propagation for other operators
 	if left.IsError() || right.IsError() {
@@ -372,11 +381,8 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 	case "!=":
 		return e.evaluateNotEqual(left, right)
 
-	// Logical operators
-	case "&&":
-		return e.evaluateAnd(left, right)
-	case "||":
-		return e.evaluateOr(left, right)
+	// Logical operators (&& and ||) are handled before the generic error
+	// propagation above.
 
 	default:
 		return NewErrorValue()
@@ -409,11 +415,18 @@ func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
 		return NewErrorValue()
 
 	case "!":
-		if val.IsBool() {
-			boolVal, _ := val.BoolValue()
-			return NewBoolValue(!boolVal)
+		// Logical not uses the same three-valued, number-coercing view as
+		// && / ||: !undefined is undefined, !0 is true, !5 is false.
+		switch logicalView(val) {
+		case lsTrue:
+			return NewBoolValue(false)
+		case lsFalse:
+			return NewBoolValue(true)
+		case lsUndef:
+			return NewUndefinedValue()
+		default:
+			return NewErrorValue()
 		}
-		return NewErrorValue()
 
 	default:
 		return NewErrorValue()
@@ -910,57 +923,104 @@ func (e *Evaluator) evaluateIsnt(left, right Value) Value {
 	return NewBoolValue(!boolVal)
 }
 
-// Logical operations
-func (e *Evaluator) evaluateAnd(left, right Value) Value {
-	if left.IsError() || right.IsError() {
+// Logical operations.
+//
+// The reference engine uses three-valued logic with short-circuiting. Operands
+// are coerced to booleans the same way the truthiness of a number is taken:
+// a non-zero number is true, zero is false, undefined stays undefined, and any
+// other type (string, list, classad, error) behaves like error. The
+// short-circuit operand wins regardless of what the other side is, so
+// "false && error" is false and "true || undefined" is true.
+
+// logicalState is the boolean view of an operand for && / ||.
+type logicalState int
+
+const (
+	lsFalse logicalState = iota
+	lsTrue
+	lsUndef
+	lsErr // error, or a value not coercible to boolean
+)
+
+func logicalView(v Value) logicalState {
+	switch v.valueType {
+	case BooleanValue:
+		if v.boolVal {
+			return lsTrue
+		}
+		return lsFalse
+	case IntegerValue:
+		if v.intVal != 0 {
+			return lsTrue
+		}
+		return lsFalse
+	case RealValue:
+		if v.realVal != 0 {
+			return lsTrue
+		}
+		return lsFalse
+	case UndefinedValue:
+		return lsUndef
+	default:
+		return lsErr
+	}
+}
+
+// mapState turns a logicalState back into a Value (used for the non-short-
+// circuiting branch where the result is simply the other operand's truth).
+func mapState(s logicalState) Value {
+	switch s {
+	case lsTrue:
+		return NewBoolValue(true)
+	case lsFalse:
+		return NewBoolValue(false)
+	case lsUndef:
+		return NewUndefinedValue()
+	default:
 		return NewErrorValue()
 	}
+}
 
-	// Short-circuit evaluation
-	if left.IsBool() {
-		leftBool, _ := left.BoolValue()
-		if !leftBool {
+func (e *Evaluator) evaluateAnd(left, right Value) Value {
+	l, r := logicalView(left), logicalView(right)
+	switch l {
+	case lsFalse:
+		return NewBoolValue(false) // false && anything == false
+	case lsErr:
+		return NewErrorValue()
+	case lsTrue:
+		return mapState(r) // true && x == x
+	default: // lsUndef
+		switch r {
+		case lsFalse:
 			return NewBoolValue(false)
+		case lsErr:
+			return NewErrorValue()
+		default: // true or undefined
+			return NewUndefinedValue()
 		}
 	}
-
-	if left.IsUndefined() || right.IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !left.IsBool() || !right.IsBool() {
-		return NewErrorValue()
-	}
-
-	leftBool, _ := left.BoolValue()
-	rightBool, _ := right.BoolValue()
-	return NewBoolValue(leftBool && rightBool)
 }
 
 func (e *Evaluator) evaluateOr(left, right Value) Value {
-	if left.IsError() || right.IsError() {
+	l, r := logicalView(left), logicalView(right)
+	switch l {
+	case lsTrue:
+		return NewBoolValue(true) // true || anything == true
+	case lsErr:
 		return NewErrorValue()
-	}
-
-	// Short-circuit evaluation
-	if left.IsBool() {
-		leftBool, _ := left.BoolValue()
-		if leftBool {
+	case lsFalse:
+		return mapState(r) // false || x == x
+	default: // lsUndef
+		switch r {
+		case lsTrue:
 			return NewBoolValue(true)
+		case lsErr:
+			return NewErrorValue()
+		default: // false or undefined
+			return NewUndefinedValue()
 		}
 	}
-
-	if left.IsUndefined() || right.IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !left.IsBool() || !right.IsBool() {
-		return NewErrorValue()
-	}
-
-	leftBool, _ := left.BoolValue()
-	rightBool, _ := right.BoolValue()
-	return NewBoolValue(leftBool || rightBool)
 }
 
 // evaluateUnparse handles the unparse() function which returns the string representation
