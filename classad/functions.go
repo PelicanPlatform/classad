@@ -60,6 +60,30 @@ func parseLeadingFloat(s string) (float64, bool) {
 	return f, true
 }
 
+// coerceToReal converts a value to a real the way the reference engine's
+// convertValueToRealValue does, for the math builtins (floor/ceiling/round/
+// pow/quantize): integers, reals and booleans convert directly, and a string
+// is parsed via strtod. Undefined, error, lists and classads cannot convert.
+// (This is deliberately distinct from numericOperand, which the arithmetic and
+// comparison operators use and which does NOT coerce strings.)
+func coerceToReal(v Value) (float64, bool) {
+	switch v.valueType {
+	case IntegerValue:
+		return float64(v.intVal), true
+	case RealValue:
+		return v.realVal, true
+	case BooleanValue:
+		if v.boolVal {
+			return 1, true
+		}
+		return 0, true
+	case StringValue:
+		return parseLeadingFloat(v.strVal)
+	default:
+		return 0, false
+	}
+}
+
 // Built-in string functions
 
 // builtinStrcat concatenates strings
@@ -365,11 +389,11 @@ func builtinFloor(args []Value) Value {
 	if args[0].IsInteger() {
 		return args[0]
 	}
-	// floor/ceiling/round coerce booleans to numbers but treat any other
-	// non-number (including undefined) as an error -- unlike int()/real()
+	// Booleans and numeric strings coerce to a number (floor("2.5") == 2);
+	// undefined or any other non-number is an error -- unlike int()/real()
 	// which propagate undefined.
-	isNum, _, _, num := numericOperand(args[0])
-	if !isNum {
+	num, ok := coerceToReal(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
 	return NewIntValue(int64(math.Floor(num)))
@@ -387,8 +411,8 @@ func builtinCeiling(args []Value) Value {
 	if args[0].IsInteger() {
 		return args[0]
 	}
-	isNum, _, _, num := numericOperand(args[0])
-	if !isNum {
+	num, ok := coerceToReal(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
 	return NewIntValue(int64(math.Ceil(num)))
@@ -406,8 +430,8 @@ func builtinRound(args []Value) Value {
 	if args[0].IsInteger() {
 		return args[0]
 	}
-	isNum, _, _, num := numericOperand(args[0])
-	if !isNum {
+	num, ok := coerceToReal(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
 	// The reference engine rounds half to even (C rint), so round(2.5) == 2
@@ -897,8 +921,8 @@ func builtinPow(args []Value) Value {
 	}
 
 	// Real path: coerce base and exponent (int/real/bool) to real.
-	bn, _, _, base := numericOperand(args[0])
-	en, _, _, exp := numericOperand(args[1])
+	base, bn := coerceToReal(args[0])
+	exp, en := coerceToReal(args[1])
 	if !bn || !en {
 		return NewErrorValue()
 	}
@@ -920,7 +944,7 @@ func builtinQuantize(args []Value) Value {
 	}
 
 	// arg must coerce to a number (bool counts).
-	an, _, _, rval := numericOperand(args[0])
+	rval, an := coerceToReal(args[0])
 	if !an {
 		return NewErrorValue()
 	}
@@ -933,7 +957,7 @@ func builtinQuantize(args []Value) Value {
 		var last Value
 		haveLast := false
 		for _, item := range list {
-			in, _, _, iv := numericOperand(item)
+			iv, in := coerceToReal(item)
 			if !in {
 				return NewErrorValue()
 			}
@@ -958,7 +982,7 @@ func builtinQuantize(args []Value) Value {
 //   - an integer base with an integer arg yields an integer via ceil division;
 //   - otherwise the result is a real.
 func quantizeScalar(arg Value, rval float64, base Value) Value {
-	bn, _, _, rbase := numericOperand(base)
+	rbase, bn := coerceToReal(base)
 	if !bn {
 		return NewErrorValue()
 	}

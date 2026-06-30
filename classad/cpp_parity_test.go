@@ -100,6 +100,12 @@ func TestCppParity(t *testing.T) {
 		{`pow(2, -1)`, "R:0.5"},
 		{`pow(2, true)`, "R:2"},
 		{`pow(true, true)`, "R:1"},
+		// math builtins parse numeric string arguments (via strtod).
+		{`floor("2.5")`, "I:2"},
+		{`round("3.5")`, "I:4"},
+		{`floor("abc")`, "E"},
+		{`pow("2", "3")`, "R:8"},
+		{`quantize("10", "3")`, "R:12"},
 		{`pow(undefined, 2)`, "E"},
 		{`quantize(undefined, 4)`, "E"},
 		{`split(undefined)`, "E"},
