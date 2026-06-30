@@ -798,26 +798,29 @@ func (e *Evaluator) evaluateGreaterOrEqual(left, right Value) Value {
 }
 
 func (e *Evaluator) evaluateEqual(left, right Value) Value {
-	if left.IsUndefined() && right.IsUndefined() {
-		return NewBoolValue(true)
-	}
-
+	// Regular == / != propagate undefined even when both sides are undefined
+	// (undefined == undefined is undefined). Identity (=?=) handles the
+	// "undefined is undefined -> true" case separately in evaluateIs.
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
 
 	if left.Type() != right.Type() {
-		// Allow numeric comparison across int/real/bool (a boolean compares as
-		// 1/0), matching the C++ reference where booleans are numeric values.
+		// Numeric types (int/real/bool) coerce and compare across types; a
+		// boolean compares as 1/0. Any other cross-type comparison -- e.g.
+		// string vs int, or list/classad vs anything -- is an error in the
+		// reference engine (coerceToNumber), not false.
 		ln, li, liv, lrv := numericOperand(left)
 		rn, ri, riv, rrv := numericOperand(right)
 		if ln && rn {
 			if li && ri {
 				return NewBoolValue(liv == riv)
 			}
-			return NewBoolValue(math.Abs(lrv-rrv) < 1e-9)
+			// The reference engine compares reals with exact IEEE equality
+			// (no tolerance), so 0.1 + 0.2 == 0.3 is false.
+			return NewBoolValue(lrv == rrv)
 		}
-		return NewBoolValue(false)
+		return NewErrorValue()
 	}
 
 	switch left.Type() {
@@ -832,7 +835,7 @@ func (e *Evaluator) evaluateEqual(left, right Value) Value {
 	case RealValue:
 		leftReal, _ := left.RealValue()
 		rightReal, _ := right.RealValue()
-		return NewBoolValue(math.Abs(leftReal-rightReal) < 1e-9)
+		return NewBoolValue(leftReal == rightReal)
 	case StringValue:
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
