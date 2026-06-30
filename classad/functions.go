@@ -804,6 +804,12 @@ func builtinStringListMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
+	// When both the item and the list are undefined the result is undefined
+	// (with only one undefined, the undefined acts as the empty string).
+	if args[0].IsUndefined() && args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
+
 	item, ok0 := stringListStrArg(args[0])
 	listStr, ok1 := stringListStrArg(args[1])
 	if !ok0 || !ok1 {
@@ -1880,62 +1886,31 @@ func builtinIdenticalMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
+	// The list (second argument): error -> error, undefined -> undefined,
+	// non-list -> error. The item (first argument) may be any scalar value,
+	// including error or undefined, and is compared to each element with =?=
+	// (identical) semantics -- so identicalMember(error, {error}) is true and
+	// identicalMember(error, {1}) is false. A list/classad item is an error.
+	if args[1].IsError() {
 		return NewErrorValue()
 	}
-
-	// First arg must be scalar
-	if args[0].IsList() || args[0].IsClassAd() {
-		return NewErrorValue()
-	}
-
-	// An undefined list propagates as undefined; otherwise the second arg must
-	// be a list.
 	if args[1].IsUndefined() {
 		return NewUndefinedValue()
 	}
 	if !args[1].IsList() {
 		return NewErrorValue()
 	}
+	if args[0].IsList() || args[0].IsClassAd() {
+		return NewErrorValue()
+	}
 
 	list, _ := args[1].ListValue()
-
+	e := &Evaluator{}
 	for _, item := range list {
-		// Strict identity check - same type and value
-		if args[0].valueType != item.valueType {
-			continue
-		}
-
-		switch args[0].valueType {
-		case IntegerValue:
-			v1, _ := args[0].IntValue()
-			v2, _ := item.IntValue()
-			if v1 == v2 {
-				return NewBoolValue(true)
-			}
-		case RealValue:
-			v1, _ := args[0].RealValue()
-			v2, _ := item.RealValue()
-			if v1 == v2 {
-				return NewBoolValue(true)
-			}
-		case StringValue:
-			v1, _ := args[0].StringValue()
-			v2, _ := item.StringValue()
-			if v1 == v2 {
-				return NewBoolValue(true)
-			}
-		case BooleanValue:
-			v1, _ := args[0].BoolValue()
-			v2, _ := item.BoolValue()
-			if v1 == v2 {
-				return NewBoolValue(true)
-			}
-		case UndefinedValue:
+		if b, _ := e.evaluateIs(args[0], item).BoolValue(); b {
 			return NewBoolValue(true)
 		}
 	}
-
 	return NewBoolValue(false)
 }
 
@@ -2306,8 +2281,12 @@ func builtinStringListSubsetMatch(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// undefined is treated as the empty list (so subsetMatch(undefined, "a") is
-	// true -- the empty list is a subset of anything), error is an error.
+	// When both lists are undefined the result is undefined; otherwise undefined
+	// is treated as the empty list (so subsetMatch(undefined, "a") is true --
+	// the empty list is a subset of anything), and error is an error.
+	if args[0].IsUndefined() && args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
 	list1Str, ok0 := stringListStrArg(args[0])
 	list2Str, ok1 := stringListStrArg(args[1])
 	if !ok0 || !ok1 {
