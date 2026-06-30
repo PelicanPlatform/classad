@@ -92,6 +92,9 @@ func TestCppParity(t *testing.T) {
 		{`round(0.5)`, "I:0"},
 		{`round(-2.5)`, "I:-2"},
 		{`round(2.6)`, "I:3"},
+		// An integer argument is returned unchanged (no lossy float round-trip).
+		{`round(188587117711686808)`, "I:188587117711686808"},
+		{`floor(9223372036854775807)`, "I:9223372036854775807"},
 		// pow: integer result only for genuine ints with non-negative exponent.
 		{`pow(2, 3)`, "I:8"},
 		{`pow(2, -1)`, "R:0.5"},

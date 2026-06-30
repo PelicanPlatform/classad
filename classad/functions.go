@@ -310,6 +310,11 @@ func builtinFloor(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
+	// An integer argument is returned unchanged (matching the reference): a
+	// float round-trip would lose precision for large magnitudes.
+	if args[0].IsInteger() {
+		return args[0]
+	}
 	// floor/ceiling/round coerce booleans to numbers but treat any other
 	// non-number (including undefined) as an error -- unlike int()/real()
 	// which propagate undefined.
@@ -329,6 +334,9 @@ func builtinCeiling(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
+	if args[0].IsInteger() {
+		return args[0]
+	}
 	isNum, _, _, num := numericOperand(args[0])
 	if !isNum {
 		return NewErrorValue()
@@ -344,6 +352,9 @@ func builtinRound(args []Value) Value {
 
 	if args[0].IsError() {
 		return NewErrorValue()
+	}
+	if args[0].IsInteger() {
+		return args[0]
 	}
 	isNum, _, _, num := numericOperand(args[0])
 	if !isNum {
