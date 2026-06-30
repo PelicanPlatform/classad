@@ -1664,11 +1664,13 @@ func builtinVersioncmp(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
-		return NewErrorValue()
-	}
+	// undefined dominates error here: versioncmp(undefined, error) and
+	// versioncmp(error, undefined) are both undefined, so check undefined first.
 	if args[0].IsUndefined() || args[1].IsUndefined() {
 		return NewUndefinedValue()
+	}
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
 	}
 	// Non-string arguments are coerced to their string form (numbers/bools), as
 	// the reference does via convertValueToStringValue: versioncmp(2, 1) is 1
@@ -1827,14 +1829,30 @@ func builtinInterval(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
-	if !args[0].IsInteger() {
+	// The argument is coerced to an integer number of seconds (bool, real, and
+	// numeric string included, as the reference does); undefined and any
+	// non-coercible value are errors (interval does not propagate undefined).
+	var seconds int64
+	switch {
+	case args[0].IsInteger():
+		seconds, _ = args[0].IntValue()
+	case args[0].IsBool():
+		if b, _ := args[0].BoolValue(); b {
+			seconds = 1
+		}
+	case args[0].IsReal():
+		r, _ := args[0].RealValue()
+		seconds = floatToInt64(r)
+	case args[0].IsString():
+		s, _ := args[0].StringValue()
+		f, ok := parseLeadingFloat(s)
+		if !ok {
+			return NewErrorValue()
+		}
+		seconds = floatToInt64(f)
+	default:
 		return NewErrorValue()
 	}
-
-	seconds, _ := args[0].IntValue()
 
 	days := seconds / 86400
 	seconds %= 86400
@@ -1852,7 +1870,8 @@ func builtinInterval(args []Value) Value {
 	if minutes > 0 {
 		return NewStringValue(fmt.Sprintf("%d:%02d", minutes, seconds))
 	}
-	return NewStringValue(fmt.Sprintf("0:%02d", seconds))
+	// Under a minute (including zero and small negatives) is just the seconds.
+	return NewStringValue(fmt.Sprintf("%d", seconds))
 }
 
 // builtinIdenticalMember checks if m is in list using =?= (strict identity)

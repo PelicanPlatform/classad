@@ -1228,7 +1228,8 @@ func TestBuiltinInterval(t *testing.T) {
 		expr     string
 		expected string
 	}{
-		{"seconds only", `interval(45)`, "0:45"},
+		// Under a minute is just the seconds (matching the reference engine).
+		{"seconds only", `interval(45)`, "45"},
 		{"minutes", `interval(125)`, "2:05"},
 		{"hours", `interval(3665)`, "1:01:05"},
 		{"days", `interval(90125)`, "1+01:02:05"},
