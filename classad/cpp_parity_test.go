@@ -932,6 +932,12 @@ func TestStringListMembership(t *testing.T) {
 		{`stringListSubsetMatch(undefined, "a")`, "B:true"},
 		{`stringListSubsetMatch("a", undefined)`, "B:false"},
 		{`stringListSubsetMatch("a", "a,b")`, "B:true"},
+		// libclassad quirk (mirrored): a non-empty all-delimiter string is not
+		// the empty subset, so it is false, while a genuinely empty string is
+		// true. See fuzz/CPP_QUIRKS.md and TestCppQuirks.
+		{`stringListSubsetMatch(" ", "a")`, "B:false"},
+		{`stringListSubsetMatch(",", "a")`, "B:false"},
+		{`stringListSubsetMatch("", "a")`, "B:true"},
 	}
 	for _, tc := range cases {
 		ad, err := Parse("[ x = " + tc.expr + " ]")

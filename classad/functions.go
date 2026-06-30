@@ -2392,6 +2392,15 @@ func builtinStringListSubsetMatch(args []Value) Value {
 	list1 := parseStringList(list1Str, delimiter)
 	list2 := parseStringList(list2Str, delimiter)
 
+	// Mirror a libclassad quirk: a NON-EMPTY string that tokenizes to no
+	// elements (all delimiters, e.g. " ") is treated as a single non-matchable
+	// element, so it is not the empty subset and the result is false. A
+	// genuinely empty string (or undefined, coerced to "") is the empty subset
+	// and yields true. See fuzz/CPP_QUIRKS.md.
+	if len(list1) == 0 {
+		return NewBoolValue(list1Str == "")
+	}
+
 	// Create a set from list2
 	set := make(map[string]bool)
 	for _, item := range list2 {

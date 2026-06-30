@@ -137,12 +137,19 @@ classad_eval -quiet '[ a = stringListSubsetMatch("", "a") ]' a         # true  (
 classad_eval -quiet '[ a = stringListSubsetMatch(" ", "a") ]' a        # false (!!)  -- " " acts non-empty
 ```
 
-Since `" "` and `""` both have size 0, the empty list `" "` ought to be a subset
-of `{ "a" }` just like `""` is. The reference disagrees only for the
-whitespace-only (but non-empty) string. This is internally inconsistent in
-libclassad (`size` says 0, `subsetMatch` iterates as if 1), so the Go engine
-deliberately does **not** mirror it — `stringListSubsetMatch(" ", "a")` is
-`true` in Go.
+Since `" "` and `""` both have size 0, the empty list `" "` might be expected to
+be a subset of `{ "a" }` just like `""` is. The reference disagrees only for a
+whitespace-only (or otherwise all-delimiter, e.g. `","`) **non-empty** string,
+treating it as a single non-matchable element. This is internally inconsistent
+in libclassad (`size` says 0, `subsetMatch` acts as if 1).
+
+The Go engine **mirrors** this behavior for parity: `stringListSubsetMatch` of a
+non-empty string that tokenizes to zero elements is `false`, while a genuinely
+empty string (or `undefined`) is `true`. The reference value is pinned by
+`TestCppQuirks` in `fuzz/oracle/cgo/quirks_test.go`, which evaluates these
+inputs in libclassad itself — so if a future libclassad release changes this
+(e.g. fixes the inconsistency), that test fails and flags the Go mirror and this
+note for revision.
 
 ## Observed (reasonable) semantics, recorded for completeness
 
