@@ -811,6 +811,14 @@ func (e *Evaluator) evaluateGreaterOrEqual(left, right Value) Value {
 }
 
 func (e *Evaluator) evaluateEqual(left, right Value) Value {
+	return valuesEqual(left, right)
+}
+
+// valuesEqual implements the == operator's value semantics (also used by
+// member()): numeric types coerce across int/real/bool, strings compare
+// case-insensitively, reals compare exactly, and any other cross-type or
+// list/classad comparison is an error. Undefined propagates.
+func valuesEqual(left, right Value) Value {
 	// Regular == / != propagate undefined even when both sides are undefined
 	// (undefined == undefined is undefined). Identity (=?=) handles the
 	// "undefined is undefined -> true" case separately in evaluateIs.

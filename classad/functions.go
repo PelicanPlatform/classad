@@ -620,40 +620,23 @@ func builtinMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if !args[1].IsList() {
+	// The list to search must be a list, and the target must be comparable:
+	// a list or classad target is an error (matching the reference).
+	if !args[1].IsList() || args[0].IsList() || args[0].IsClassAd() {
 		return NewErrorValue()
 	}
 
 	element := args[0]
 	list, _ := args[1].ListValue()
 
+	// Membership uses the == operator's semantics (numeric coercion,
+	// case-insensitive strings). A comparison that is not boolean-true -- including
+	// one that evaluates to error or undefined -- simply does not match, so a
+	// non-comparable element does not abort the search.
 	for _, item := range list {
-		// Use simple equality check
-		if element.Type() == item.Type() {
-			if element.IsInteger() {
-				e, _ := element.IntValue()
-				i, _ := item.IntValue()
-				if e == i {
-					return NewBoolValue(true)
-				}
-			} else if element.IsReal() {
-				e, _ := element.RealValue()
-				i, _ := item.RealValue()
-				if e == i {
-					return NewBoolValue(true)
-				}
-			} else if element.IsString() {
-				e, _ := element.StringValue()
-				i, _ := item.StringValue()
-				if e == i {
-					return NewBoolValue(true)
-				}
-			} else if element.IsBool() {
-				e, _ := element.BoolValue()
-				i, _ := item.BoolValue()
-				if e == i {
-					return NewBoolValue(true)
-				}
+		if eq := valuesEqual(item, element); eq.IsBool() {
+			if b, _ := eq.BoolValue(); b {
+				return NewBoolValue(true)
 			}
 		}
 	}

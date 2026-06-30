@@ -168,6 +168,14 @@ func TestCppParity(t *testing.T) {
 		{`stricmp(undefined, error)`, "U"},
 		{`member(error, undefined)`, "U"},
 
+		// member: list/classad target errors; comparison uses == semantics
+		// (numeric coercion, case-insensitive) and ignores incomparable items.
+		{`member({}, {"x y"})`, "E"},
+		{`member(1, {1.0})`, "B:true"},
+		{`member("ABC", {"abc"})`, "B:true"},
+		{`member(1, {"a", 1})`, "B:true"},
+		{`member(5, {"a"})`, "B:false"},
+
 		// Division by zero: integer divisor errors; for a real divisor only a
 		// +Inf result is an error, while -Inf and NaN are real values.
 		{`1 / 0`, "E"},
