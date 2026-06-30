@@ -831,6 +831,67 @@ func TestStringListAggregates(t *testing.T) {
 	}
 }
 
+// TestListAggregates guards the list-valued sum/avg/min/max (not the
+// stringList* family): undefined elements are skipped, booleans coerce to
+// their numeric value (true->1, false->0), and an empty/all-undefined list
+// yields int 0 for sum/avg and undefined for min/max -- matching the
+// reference engine.
+func TestListAggregates(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`sum({1,2,3})`, "I:6"},
+		{`sum({1,2,false})`, "I:3"},
+		{`sum({1.5,1.5,false})`, "R:3"},
+		{`sum({1,undefined})`, "I:1"},
+		{`sum({undefined})`, "I:0"},
+		{`sum({})`, "I:0"},
+		{`avg({1,2})`, "R:1.5"},
+		{`avg({undefined,2})`, "R:2"},
+		{`avg({undefined})`, "I:0"},
+		{`avg({})`, "I:0"},
+		{`min({true,2})`, "I:1"},
+		{`min({3.14,false})`, "R:0"},
+		{`min({undefined,3})`, "I:3"},
+		{`min({undefined})`, "U"},
+		{`max({true,2})`, "I:2"},
+		{`max({undefined})`, "U"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}
+
+// TestIntervalOverflow guards interval()'s 32-bit truncation: the reference
+// truncates its argument to a signed 32-bit integer before formatting, so a
+// large value wraps rather than producing an enormous day count.
+func TestIntervalOverflow(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`interval(10000000000)`, "S:16320+04:50:08"},
+		{`interval("inf")`, "S:-1"},
+		{`interval(45)`, "S:45"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}
+
 // TestStringListMembership guards the stringList membership/subset functions'
 // undefined handling: undefined is treated as the empty string (not propagated)
 // -- stringListMember(undefined, "a") is false, stringListSubsetMatch(undefined,

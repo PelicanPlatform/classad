@@ -1131,32 +1131,30 @@ func builtinSum(args []Value) Value {
 
 	var sum float64
 	hasReal := false
-	allUndefined := true
 
 	for _, item := range list {
 		if item.IsError() {
 			return NewErrorValue()
 		}
-		if item.IsUndefined() {
+		// Undefined elements are skipped (so sum of all-undefined is int 0), and
+		// booleans coerce to numbers (true=1, false=0), matching the reference.
+		switch {
+		case item.IsUndefined():
 			continue
-		}
-
-		allUndefined = false
-
-		if item.IsInteger() {
+		case item.IsInteger():
 			val, _ := item.IntValue()
 			sum += float64(val)
-		} else if item.IsReal() {
+		case item.IsBool():
+			if b, _ := item.BoolValue(); b {
+				sum++
+			}
+		case item.IsReal():
 			val, _ := item.RealValue()
 			sum += val
 			hasReal = true
-		} else {
+		default:
 			return NewErrorValue()
 		}
-	}
-
-	if allUndefined {
-		return NewUndefinedValue()
 	}
 
 	if hasReal {
@@ -1194,39 +1192,36 @@ func builtinAvg(args []Value) Value {
 
 	var sum float64
 	count := 0
-	allUndefined := true
-
 	for _, item := range list {
 		if item.IsError() {
 			return NewErrorValue()
 		}
-		if item.IsUndefined() {
+		// Undefined elements are skipped, and booleans coerce to numbers,
+		// matching the reference.
+		switch {
+		case item.IsUndefined():
 			continue
-		}
-
-		allUndefined = false
-
-		if item.IsInteger() {
-			val, _ := item.IntValue()
-			sum += float64(val)
+		case item.IsInteger():
+			v, _ := item.IntValue()
+			sum += float64(v)
 			count++
-		} else if item.IsReal() {
-			val, _ := item.RealValue()
-			sum += val
+		case item.IsBool():
+			if b, _ := item.BoolValue(); b {
+				sum++
+			}
 			count++
-		} else {
+		case item.IsReal():
+			v, _ := item.RealValue()
+			sum += v
+			count++
+		default:
 			return NewErrorValue()
 		}
 	}
 
-	if allUndefined {
-		return NewUndefinedValue()
-	}
-
 	if count == 0 {
-		return NewRealValue(0.0)
+		return NewIntValue(0) // all elements undefined (or empty): int 0
 	}
-
 	return NewRealValue(sum / float64(count))
 }
 
@@ -1274,6 +1269,10 @@ func builtinMin(args []Value) Value {
 		if item.IsInteger() {
 			v, _ := item.IntValue()
 			val = float64(v)
+		} else if item.IsBool() {
+			if b, _ := item.BoolValue(); b {
+				val = 1
+			}
 		} else if item.IsReal() {
 			val, _ = item.RealValue()
 			hasReal = true
@@ -1294,6 +1293,11 @@ func builtinMin(args []Value) Value {
 
 	if hasReal {
 		return NewRealValue(minVal)
+	}
+	// minItem is returned to preserve exact int64 precision, but a boolean
+	// element must coerce to its numeric value (true->1, false->0).
+	if minItem.IsBool() {
+		return NewIntValue(int64(minVal))
 	}
 	return minItem
 }
@@ -1342,6 +1346,10 @@ func builtinMax(args []Value) Value {
 		if item.IsInteger() {
 			v, _ := item.IntValue()
 			val = float64(v)
+		} else if item.IsBool() {
+			if b, _ := item.BoolValue(); b {
+				val = 1
+			}
 		} else if item.IsReal() {
 			val, _ = item.RealValue()
 			hasReal = true
@@ -1362,6 +1370,11 @@ func builtinMax(args []Value) Value {
 
 	if hasReal {
 		return NewRealValue(maxVal)
+	}
+	// maxItem is returned to preserve exact int64 precision, but a boolean
+	// element must coerce to its numeric value (true->1, false->0).
+	if maxItem.IsBool() {
+		return NewIntValue(int64(maxVal))
 	}
 	return maxItem
 }
@@ -1859,6 +1872,10 @@ func builtinInterval(args []Value) Value {
 	default:
 		return NewErrorValue()
 	}
+	// The reference takes the seconds as a 32-bit int, so a large or infinite
+	// value wraps (interval(10000000000) and interval("inf") match libclassad's
+	// truncated results rather than overflowing differently).
+	seconds = int64(int32(seconds))
 
 	days := seconds / 86400
 	seconds %= 86400

@@ -179,9 +179,12 @@ func TestBuiltinAvg(t *testing.T) {
 			isError: true,
 		},
 		{
-			name:    "all undefined",
-			input:   `[x = avg({undefined, undefined})]`,
-			isUndef: true,
+			// All-undefined elements are skipped, leaving an empty average:
+			// int 0 in the reference engine (same as an empty list).
+			name:     "all undefined",
+			input:    `[x = avg({undefined, undefined})]`,
+			expected: 0.0,
+			isInt:    true,
 		},
 		{
 			name:    "error in list",
