@@ -1531,9 +1531,8 @@ func builtinSplitUserName(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
+	// undefined is not propagated: a non-string argument (including undefined)
+	// is an error, matching the reference engine.
 	if !args[0].IsString() {
 		return NewErrorValue()
 	}
@@ -1564,9 +1563,8 @@ func builtinSplitSlotName(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
+	// undefined is not propagated: a non-string argument (including undefined)
+	// is an error, matching the reference engine.
 	if !args[0].IsString() {
 		return NewErrorValue()
 	}

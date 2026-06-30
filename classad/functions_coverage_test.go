@@ -452,9 +452,11 @@ func TestBuiltinSplitSlotName(t *testing.T) {
 			expected: []string{"slot1", "sub@machine.example.com"},
 		},
 		{
+			// A non-string argument (including undefined) is an error in the
+			// reference engine; splitSlotName does not propagate undefined.
 			name:    "undefined",
 			input:   `[x = splitSlotName(undefined)]`,
-			isUndef: true,
+			isError: true,
 		},
 		{
 			name:    "error",
