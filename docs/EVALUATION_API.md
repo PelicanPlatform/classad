@@ -671,7 +671,6 @@ ad, _ := classad.Parse(`[
 - `strcat(str1, str2, ...)` - Concatenates strings
 - `substr(string, offset[, length])` - Extracts substring (supports negative offsets)
 - `size(string_or_list)` - Returns length of string or list
-- `length(string_or_list)` - Alias for `size()`
 - `toLower(string)` / `tolower(string)` - Converts to lowercase
 - `toUpper(string)` / `toupper(string)` - Converts to uppercase
 - `stringListMember(string, string_list[, options])` - Tests if string is in comma-separated list

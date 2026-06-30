@@ -155,11 +155,6 @@ func builtinSize(args []Value) Value {
 	return NewErrorValue()
 }
 
-// builtinLength is an alias for size
-func builtinLength(args []Value) Value {
-	return builtinSize(args)
-}
-
 // builtinToLower converts string to lowercase
 func builtinToLower(args []Value) Value {
 	if len(args) != 1 {

@@ -1143,8 +1143,6 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinSubstr(args)
 	case "size":
 		return builtinSize(args)
-	case "length":
-		return builtinLength(args)
 	case "toLower", "tolower":
 		return builtinToLower(args)
 	case "toUpper", "toupper":

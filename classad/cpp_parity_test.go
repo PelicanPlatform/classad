@@ -110,6 +110,10 @@ func TestCppParity(t *testing.T) {
 		{`toLower(1.5)`, "S:1.500000000000000e+00"},
 		{`stricmp(true, "x")`, "I:-1"},
 
+		// length() is not a reference function; it evaluates to error (size()).
+		{`length("hello")`, "E"},
+		{`length({1, 2})`, "E"},
+
 		// string()/strcat() scalar coercion; reals use %.15E (0 -> "0.0").
 		{`string(1.5)`, "S:1.500000000000000E+00"},
 		{`string(0.0)`, "S:0.0"},

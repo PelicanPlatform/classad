@@ -4,70 +4,23 @@ import (
 	"testing"
 )
 
-// TestBuiltinLength tests the length() function (alias for size())
-func TestBuiltinLength(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected int64
-		isError  bool
-		isUndef  bool
-	}{
-		{
-			name:     "string length",
-			input:    `[x = length("hello")]`,
-			expected: 5,
-		},
-		{
-			name:     "list length",
-			input:    `[x = length({1, 2, 3, 4})]`,
-			expected: 4,
-		},
-		{
-			name:     "empty list",
-			input:    `[x = length({})]`,
-			expected: 0,
-		},
-		{
-			name:    "undefined",
-			input:   `[x = length(undefined)]`,
-			isUndef: true,
-		},
-		{
-			name:    "error",
-			input:   `[x = length(error)]`,
-			isError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ad, err := Parse(tt.input)
-			if err != nil {
-				t.Fatalf("Parse() error = %v", err)
-			}
-			val := ad.EvaluateAttr("x")
-			if tt.isError {
-				if !val.IsError() {
-					t.Errorf("Expected error, got %v", val)
-				}
-				return
-			}
-			if tt.isUndef {
-				if !val.IsUndefined() {
-					t.Errorf("Expected undefined, got %v", val)
-				}
-				return
-			}
-			if !val.IsInteger() {
-				t.Errorf("Expected integer, got %v", val.Type())
-				return
-			}
-			result, _ := val.IntValue()
-			if result != tt.expected {
-				t.Errorf("length() = %d, want %d", result, tt.expected)
-			}
-		})
+// TestLengthIsUnknownFunction verifies that length() is not a recognized
+// function: the reference ClassAd engine has no such builtin, so any call to
+// it evaluates to error (use size() instead).
+func TestLengthIsUnknownFunction(t *testing.T) {
+	for _, input := range []string{
+		`[x = length("hello")]`,
+		`[x = length({1, 2, 3, 4})]`,
+		`[x = length({})]`,
+		`[x = length(undefined)]`,
+	} {
+		ad, err := Parse(input)
+		if err != nil {
+			t.Fatalf("Parse(%q) error = %v", input, err)
+		}
+		if val := ad.EvaluateAttr("x"); !val.IsError() {
+			t.Errorf("%s: expected error (length is not a function), got %v", input, val.Type())
+		}
 	}
 }
 
