@@ -830,3 +830,33 @@ func TestStringListAggregates(t *testing.T) {
 		}
 	}
 }
+
+// TestStringListMembership guards the stringList membership/subset functions'
+// undefined handling: undefined is treated as the empty string (not propagated)
+// -- stringListMember(undefined, "a") is false, stringListSubsetMatch(undefined,
+// "a") is true (empty subset) and stringListSubsetMatch("a", undefined) is
+// false -- while an error argument is an error.
+func TestStringListMembership(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`stringListMember(undefined, "a")`, "B:false"},
+		{`stringListMember("a", undefined)`, "B:false"},
+		{`stringListMember("a", "a,b")`, "B:true"},
+		{`stringListMember(error, "a")`, "E"},
+		{`stringListIMember(undefined, "a")`, "B:false"},
+		{`stringListSubsetMatch(undefined, "a")`, "B:true"},
+		{`stringListSubsetMatch("a", undefined)`, "B:false"},
+		{`stringListSubsetMatch("a", "a,b")`, "B:true"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}

@@ -781,38 +781,42 @@ func builtinMember(args []Value) Value {
 // stringListMember(string item, string list [, string options])
 // The list is a comma-separated string. Options can contain:
 // - "i" or "I": case-insensitive comparison
+// stringListStrArg coerces a stringList membership/subset argument to its
+// string form, treating undefined as the empty string -- these functions treat
+// an undefined item/list as empty rather than propagating undefined, so e.g.
+// stringListMember(undefined, "a") is false and stringListSubsetMatch(undefined,
+// "a") is true (the empty list is a subset of anything). It reports ok=false for
+// an argument that is neither a string nor undefined (error, number, list, ...),
+// which the caller turns into an error.
+func stringListStrArg(v Value) (s string, ok bool) {
+	if v.IsUndefined() {
+		return "", true
+	}
+	if v.IsString() {
+		s, _ = v.StringValue()
+		return s, true
+	}
+	return "", false
+}
+
 func builtinStringListMember(args []Value) Value {
 	if len(args) < 2 || len(args) > 3 {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
+	item, ok0 := stringListStrArg(args[0])
+	listStr, ok1 := stringListStrArg(args[1])
+	if !ok0 || !ok1 {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !args[0].IsString() || !args[1].IsString() {
-		return NewErrorValue()
-	}
-
-	item, _ := args[0].StringValue()
-	listStr, _ := args[1].StringValue()
 
 	// Check for options
 	ignoreCase := false
 	if len(args) == 3 {
-		if args[2].IsError() {
+		options, ok2 := stringListStrArg(args[2])
+		if !ok2 {
 			return NewErrorValue()
 		}
-		if args[2].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[2].IsString() {
-			return NewErrorValue()
-		}
-		options, _ := args[2].StringValue()
 		if strings.ContainsAny(options, "iI") {
 			ignoreCase = true
 		}
@@ -2406,31 +2410,21 @@ func builtinStringListSubsetMatch(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
+	// undefined is treated as the empty list (so subsetMatch(undefined, "a") is
+	// true -- the empty list is a subset of anything), error is an error.
+	list1Str, ok0 := stringListStrArg(args[0])
+	list2Str, ok1 := stringListStrArg(args[1])
+	if !ok0 || !ok1 {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewUndefinedValue()
-	}
-	if !args[0].IsString() || !args[1].IsString() {
-		return NewErrorValue()
-	}
-
-	list1Str, _ := args[0].StringValue()
-	list2Str, _ := args[1].StringValue()
 	delimiter := ","
 
 	if len(args) == 3 {
-		if args[2].IsError() {
+		d, ok2 := stringListStrArg(args[2])
+		if !ok2 {
 			return NewErrorValue()
 		}
-		if args[2].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[2].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[2].StringValue()
+		delimiter = d
 	}
 
 	list1 := parseStringList(list1Str, delimiter)
