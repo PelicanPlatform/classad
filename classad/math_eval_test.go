@@ -80,9 +80,11 @@ func TestEvaluateExprMathErrorPaths(t *testing.T) {
 		t.Fatalf("expected error from quantize non-numeric input")
 	}
 
+	// A list base whose element does not convert to a number is an error in
+	// the reference engine, not undefined.
 	quantizeUndef := evalExpr(t, "quantize(12, {undefined})")
-	if !quantizeUndef.IsUndefined() {
-		t.Fatalf("expected undefined from quantize with all undefined list entries")
+	if !quantizeUndef.IsError() {
+		t.Fatalf("expected error from quantize with non-numeric list entry, got %v", quantizeUndef.Type())
 	}
 }
 

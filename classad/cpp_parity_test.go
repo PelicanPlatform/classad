@@ -135,6 +135,17 @@ func TestCppParity(t *testing.T) {
 		{`real(false)`, "R:0"},
 		{`int(true)`, "I:1"},
 
+		// quantize: bool coercion, zero base returns the arg unchanged
+		// (type preserved), integer ceil-division, and list bases.
+		{`quantize(true, false)`, "B:true"},
+		{`quantize(7, 0)`, "I:7"},
+		{`quantize(5, 3)`, "I:6"},
+		{`quantize(8, 3)`, "I:9"},
+		{`quantize(true, 2)`, "R:2"},
+		{`quantize(5, true)`, "R:5"},
+		{`quantize(12, {5, 10, 15, 20})`, "I:15"},
+		{`quantize(25, {5, 10, 15, 20})`, "I:40"},
+
 		// string()/strcat() scalar coercion; reals use %.15E (0 -> "0.0").
 		{`string(1.5)`, "S:1.500000000000000E+00"},
 		{`string(0.0)`, "S:0.0"},

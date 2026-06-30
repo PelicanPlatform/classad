@@ -46,9 +46,11 @@ func TestBuiltinQuantize(t *testing.T) {
 			expected: 12.0,
 		},
 		{
+			// Integer ceil-division truncates toward zero, matching the
+			// reference: ((-10 + 3 - 1) / 3) * 3 == -6.
 			name:     "quantize negative",
 			input:    `[x = quantize(-10, 3)]`,
-			expected: -9,
+			expected: -6,
 			isInt:    true,
 		},
 		{
@@ -70,9 +72,12 @@ func TestBuiltinQuantize(t *testing.T) {
 			isInt:    true,
 		},
 		{
-			name:    "quantize divide by zero",
-			input:   `[x = quantize(10, 0)]`,
-			isError: true,
+			// A zero base means "do not quantize": the value is returned
+			// unchanged (matching the reference), not an error.
+			name:     "quantize zero base",
+			input:    `[x = quantize(10, 0)]`,
+			expected: 10,
+			isInt:    true,
 		},
 		{
 			// quantize treats undefined as an error, matching the reference.

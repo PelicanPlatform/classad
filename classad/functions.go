@@ -848,103 +848,67 @@ func builtinQuantize(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// If second arg is a list
+	// arg must coerce to a number (bool counts).
+	an, _, _, rval := numericOperand(args[0])
+	if !an {
+		return NewErrorValue()
+	}
+
+	// If the base is a list, find the first element >= arg and return that
+	// element unchanged; if none, quantize using the last element as the base.
+	// An empty list means "do not quantize" and returns arg unchanged.
 	if args[1].IsList() {
 		list, _ := args[1].ListValue()
-
-		// Get first numeric value from args[0]
-		var a float64
-		if args[0].IsInteger() {
-			val, _ := args[0].IntValue()
-			a = float64(val)
-		} else if args[0].IsReal() {
-			a, _ = args[0].RealValue()
-		} else {
-			return NewErrorValue()
-		}
-
-		// Find first value in list >= a
-		var lastVal Value
+		var last Value
+		haveLast := false
 		for _, item := range list {
-			if item.IsError() {
+			in, _, _, iv := numericOperand(item)
+			if !in {
 				return NewErrorValue()
 			}
-			if item.IsUndefined() {
-				continue
-			}
-
-			var itemVal float64
-			if item.IsInteger() {
-				val, _ := item.IntValue()
-				itemVal = float64(val)
-			} else if item.IsReal() {
-				itemVal, _ = item.RealValue()
-			} else {
-				return NewErrorValue()
-			}
-
-			if itemVal >= a {
+			if iv >= rval {
 				return item
 			}
-			lastVal = item
+			last, haveLast = item, true
 		}
-
-		// No value >= a, compute integral multiple of last value
-		if lastVal.valueType != UndefinedValue {
-			var lastFloat float64
-			if lastVal.IsInteger() {
-				val, _ := lastVal.IntValue()
-				lastFloat = float64(val)
-			} else if lastVal.IsReal() {
-				lastFloat, _ = lastVal.RealValue()
-			}
-
-			quotient := a / lastFloat
-			result := math.Ceil(quotient) * lastFloat
-
-			if lastVal.IsInteger() {
-				return NewIntValue(int64(result))
-			}
-			return NewRealValue(result)
+		if !haveLast {
+			return args[0]
 		}
-
-		return NewUndefinedValue()
+		return quantizeScalar(args[0], rval, last)
 	}
 
-	// Scalar case: compute ceiling(a/b)*b
-	var a, b float64
-	aIsInt := args[0].IsInteger()
-	bIsInt := args[1].IsInteger()
+	return quantizeScalar(args[0], rval, args[1])
+}
 
-	if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		a = float64(val)
-	} else if args[0].IsReal() {
-		a, _ = args[0].RealValue()
-	} else {
+// quantizeScalar quantizes arg (whose real value is rval) to the next integral
+// multiple of base, matching the reference engine (fnCall.cpp doMath2):
+//   - a zero base (integer 0 or |real| <= 1e-8) returns arg unchanged,
+//     preserving its type;
+//   - an integer base with an integer arg yields an integer via ceil division;
+//   - otherwise the result is a real.
+func quantizeScalar(arg Value, rval float64, base Value) Value {
+	bn, _, _, rbase := numericOperand(base)
+	if !bn {
 		return NewErrorValue()
 	}
 
-	if args[1].IsInteger() {
-		val, _ := args[1].IntValue()
-		b = float64(val)
-	} else if args[1].IsReal() {
-		b, _ = args[1].RealValue()
-	} else {
-		return NewErrorValue()
+	if base.IsInteger() {
+		ibase, _ := base.IntValue()
+		if ibase == 0 {
+			return arg
+		}
+		if arg.IsInteger() {
+			ival, _ := arg.IntValue()
+			return NewIntValue(((ival + ibase - 1) / ibase) * ibase)
+		}
+		return NewRealValue(math.Ceil(rval/float64(ibase)) * float64(ibase))
 	}
 
-	if b == 0 {
-		return NewErrorValue()
+	const epsilon = 1e-8
+	if rbase >= -epsilon && rbase <= epsilon {
+		return arg
 	}
-
-	quotient := a / b
-	result := math.Ceil(quotient) * b
-
-	if bIsInt && aIsInt {
-		return NewIntValue(int64(result))
-	}
-	return NewRealValue(result)
+	return NewRealValue(math.Ceil(rval/rbase) * rbase)
 }
 
 // builtinSum sums numeric values in a list
