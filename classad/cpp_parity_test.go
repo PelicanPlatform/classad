@@ -1,6 +1,9 @@
 package classad
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // TestCppParity pins behaviors that were brought into line with the reference
 // C++ ClassAd engine (libclassad) after differential fuzzing found Go
@@ -744,5 +747,46 @@ func TestCyclicFunctionArg(t *testing.T) {
 	}
 	if ad, _ := Parse(`[ A0 = strcat(A0, "x") ]`); !ad.EvaluateAttr("A0").IsError() {
 		t.Errorf("strcat(cyclic, \"x\") should be error")
+	}
+}
+
+// TestIntRealStrtodParsing guards that int()/real() parse strings like C strtod:
+// hexadecimal (with or without a binary exponent), inf/nan, decimal (not octal),
+// and leading-prefix forms; int() saturates out-of-range / infinite values and
+// maps NaN to 0. Found because the generator's string alphabet had no hex/inf
+// strings, so real("0X01") (== 1, not 0) slipped through.
+func TestIntRealStrtodParsing(t *testing.T) {
+	intCases := map[string]int64{
+		`int("0x1")`: 1, `int("0X01")`: 1, `int("0xff")`: 255, `int("0x1p4")`: 16,
+		`int("010")`: 10, `int("1e3")`: 1000, `int("12abc")`: 12,
+		`int("inf")`: math.MaxInt64, `int("-inf")`: math.MinInt64, `int("nan")`: 0,
+		`int("1e30")`: math.MaxInt64, `int("-1e30")`: math.MinInt64, `int("0b101")`: 0,
+	}
+	for expr, want := range intCases {
+		ad, err := Parse(`[ x = ` + expr + ` ]`)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", expr, err)
+		}
+		v := ad.EvaluateAttr("x")
+		if got, _ := v.IntValue(); !v.IsInteger() || got != want {
+			t.Errorf("%s = %v, want int(%d)", expr, v, want)
+		}
+	}
+	realCases := map[string]float64{
+		`real("0x1")`: 1, `real("0xff")`: 255, `real("0x1p4")`: 16, `real("3.14")`: 3.14,
+	}
+	for expr, want := range realCases {
+		ad, _ := Parse(`[ x = ` + expr + ` ]`)
+		v := ad.EvaluateAttr("x")
+		if got, _ := v.RealValue(); !v.IsReal() || got != want {
+			t.Errorf("%s = %v, want real(%g)", expr, v, want)
+		}
+	}
+	// "ff" (no 0x) and "abc" are not numbers -> error.
+	for _, expr := range []string{`int("ff")`, `int("abc")`, `real("x")`} {
+		ad, _ := Parse(`[ x = ` + expr + ` ]`)
+		if !ad.EvaluateAttr("x").IsError() {
+			t.Errorf("%s should be error", expr)
+		}
 	}
 }

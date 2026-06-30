@@ -205,6 +205,10 @@ func (g *Generator) randReal() string {
 
 func (g *Generator) randString() string {
 	alphabet := []string{"", "a", "abc", "Hello World", "x y", "1", "true",
-		"a,b,c", "UPPER", "MiXeD", " ", "/", "@example.com"}
+		"a,b,c", "UPPER", "MiXeD", " ", "/", "@example.com",
+		// numeric-looking strings exercise int()/real()/strtod parsing:
+		// decimal, leading-prefix, hex (0x), hex float, and inf/nan spellings.
+		"0", "-3.7", "1e10", " 5 ", "12abc", "0x1", "0X01", "0xff", "0x1p4",
+		"010", "inf", "-inf", "nan", "1e30"}
 	return alphabet[g.rng.Intn(len(alphabet))]
 }

@@ -11,12 +11,35 @@ import (
 	"time"
 )
 
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+// floatToInt64 converts a real to int64 the way int() does in the reference
+// engine: NaN is 0, and a value out of int64 range (including +/-Inf)
+// saturates to the nearest bound rather than wrapping (Go's int64(f) is
+// undefined out of range). In range, it truncates toward zero.
+func floatToInt64(f float64) int64 {
+	switch {
+	case math.IsNaN(f):
+		return 0
+	case f >= 9223372036854775807: // >= 2^63-1; +Inf included
+		return math.MaxInt64
+	case f <= -9223372036854775808: // <= -2^63; -Inf included
+		return math.MinInt64
+	default:
+		return int64(f)
+	}
+}
+
 // parseLeadingFloat mimics C strtod, which int()/real() use to convert a
 // string: skip leading whitespace, then parse the longest valid
 // floating-point prefix (so "5abc" yields 5 and " 5 " yields 5). It reports
-// ok=false only when no numeric characters are consumed ("abc", ""). Hex
-// floats and inf/nan spellings are not handled (the reference accepts "0x10"
-// via strtod; that case is rare and left unmatched).
+// ok=false only when no numeric characters are consumed ("abc", ""). It accepts
+// the same forms as strtod: decimal, hexadecimal (0x1, 0xff, hex floats like
+// 0x1p4 -- with or without the binary exponent that Go's ParseFloat requires),
+// and the inf/infinity/nan spellings. So real("0x1") is 1, int("0xff") is 255,
+// and int("inf") is +Inf (which builtinInt saturates).
 func parseLeadingFloat(s string) (float64, bool) {
 	i := 0
 	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '\v' || s[i] == '\f') {
@@ -25,6 +48,54 @@ func parseLeadingFloat(s string) (float64, bool) {
 	start := i
 	if i < len(s) && (s[i] == '+' || s[i] == '-') {
 		i++
+	}
+	rest := s[i:]
+	// inf / infinity / nan (case-insensitive), as strtod accepts.
+	for _, word := range []string{"infinity", "inf", "nan"} {
+		if len(rest) >= len(word) && strings.EqualFold(rest[:len(word)], word) {
+			f, err := strconv.ParseFloat(s[start:i+len(word)], 64)
+			return f, err == nil
+		}
+	}
+	// Hexadecimal: 0x<hex>[.<hex>][p[+/-]<dec>]. Go's ParseFloat parses hex
+	// floats only with a binary 'p' exponent, so synthesize "p0" when absent.
+	if i+1 < len(s) && s[i] == '0' && (s[i+1] == 'x' || s[i+1] == 'X') {
+		j := i + 2
+		mant := false
+		for j < len(s) && isHexDigit(s[j]) {
+			j++
+			mant = true
+		}
+		if j < len(s) && s[j] == '.' {
+			j++
+			for j < len(s) && isHexDigit(s[j]) {
+				j++
+				mant = true
+			}
+		}
+		if mant {
+			hasExp := false
+			if j < len(s) && (s[j] == 'p' || s[j] == 'P') {
+				k := j + 1
+				if k < len(s) && (s[k] == '+' || s[k] == '-') {
+					k++
+				}
+				if k < len(s) && s[k] >= '0' && s[k] <= '9' {
+					j = k
+					for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+						j++
+					}
+					hasExp = true
+				}
+			}
+			tok := s[start:j]
+			if !hasExp {
+				tok += "p0"
+			}
+			f, err := strconv.ParseFloat(tok, 64)
+			return f, err == nil
+		}
+		// "0x" with no hex digit: the leading "0" parses as decimal zero.
 	}
 	digits := false
 	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
@@ -520,7 +591,7 @@ func builtinInt(args []Value) Value {
 
 	if args[0].IsReal() {
 		num, _ := args[0].RealValue()
-		return NewIntValue(int64(num))
+		return NewIntValue(floatToInt64(num))
 	}
 
 	if args[0].IsBool() {
@@ -533,11 +604,11 @@ func builtinInt(args []Value) Value {
 
 	// A string is parsed as a number (via strtod) and truncated toward zero,
 	// matching the reference: int("1.9") == 1, int("-3.7") == -3, int("abc")
-	// is an error.
+	// is an error. int("0xff") == 255, int("inf") saturates to MaxInt64.
 	if args[0].IsString() {
 		s, _ := args[0].StringValue()
 		if f, ok := parseLeadingFloat(s); ok {
-			return NewIntValue(int64(f))
+			return NewIntValue(floatToInt64(f))
 		}
 		return NewErrorValue()
 	}
