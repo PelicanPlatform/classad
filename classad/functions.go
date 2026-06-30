@@ -1868,7 +1868,11 @@ func builtinIdenticalMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// Second arg must be list
+	// An undefined list propagates as undefined; otherwise the second arg must
+	// be a list.
+	if args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
 	if !args[1].IsList() {
 		return NewErrorValue()
 	}
