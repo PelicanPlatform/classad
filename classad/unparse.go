@@ -136,21 +136,17 @@ func paren(b *strings.Builder, on bool, body func()) {
 // +/- applied directly to a numeric literal into a signed literal ("(-5)"),
 // while any other unary operand keeps the leading-space operator ("( -a)").
 func unparseUnary(b *strings.Builder, v *ast.UnaryOp) {
-	if v.Op == "-" || v.Op == "+" {
+	// Only unary MINUS on a numeric literal folds into a signed literal
+	// ("(-5)"): the reference lexer makes "-5" a negative literal but keeps
+	// "+5" as a unary plus, so unary plus is never folded (and a non-literal
+	// operand keeps the leading-space operator, e.g. "( -a)", "( +0)").
+	if v.Op == "-" {
 		switch lit := v.Expr.(type) {
 		case *ast.IntegerLiteral:
-			n := lit.Value
-			if v.Op == "-" {
-				n = -n
-			}
-			b.WriteString(strconv.FormatInt(n, 10))
+			b.WriteString(strconv.FormatInt(-lit.Value, 10))
 			return
 		case *ast.RealLiteral:
-			r := lit.Value
-			if v.Op == "-" {
-				r = -r
-			}
-			b.WriteString(classadReal(r))
+			b.WriteString(classadReal(-lit.Value))
 			return
 		}
 	}
