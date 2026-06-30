@@ -379,3 +379,40 @@ func TestStreamingLexerSingleCharOperators(t *testing.T) {
 		}
 	}
 }
+
+// TestQuotedAttributeNames covers single-quoted attribute names, which may
+// contain spaces and reserved words and accept backslash escapes. Previously
+// the lexer skipped the quotes as unknown characters, so 'a b' failed to parse
+// and ” vanished entirely (making ”(0) lex as (0) == 0).
+func TestQuotedAttributeNames(t *testing.T) {
+	cases := []struct {
+		src      string
+		wantName string
+	}{
+		{`[ 'foo' = 5 ]`, "foo"},
+		{`[ 'a b' = 5 ]`, "a b"},
+		{`[ 'true' = 5 ]`, "true"},
+		{`[ 'a\'b' = 5 ]`, "a'b"},
+	}
+	for _, tc := range cases {
+		n, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.src, err)
+		}
+		ad := n.(*ast.ClassAd)
+		if len(ad.Attributes) != 1 || ad.Attributes[0].Name != tc.wantName {
+			t.Errorf("%s: name = %q, want %q", tc.src, ad.Attributes[0].Name, tc.wantName)
+		}
+	}
+
+	// An empty quoted name used as a call target is an (unknown) function call,
+	// not a vanished token: ''(0) must not parse as the integer 0.
+	n, err := Parse(`[ A = ''(0) ]`)
+	if err != nil {
+		t.Fatalf("''(0): parse: %v", err)
+	}
+	v := n.(*ast.ClassAd).Attributes[0].Value
+	if _, ok := v.(*ast.FunctionCall); !ok {
+		t.Errorf("''(0): value = %T, want *ast.FunctionCall", v)
+	}
+}

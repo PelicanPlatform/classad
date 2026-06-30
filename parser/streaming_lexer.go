@@ -131,6 +131,8 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 		str := l.scanString()
 		lval.str = str
 		return STRING_LITERAL
+	case '\'':
+		return l.scanQuotedIdentifier(lval)
 	case '=':
 		if next, err := l.peekRune(); err == nil {
 			switch next {
@@ -547,6 +549,42 @@ func (l *StreamingLexer) scanString() string {
 		}
 
 		result.WriteRune(ch)
+	}
+}
+
+// scanQuotedIdentifier scans a single-quoted attribute name (the opening quote
+// has already been consumed) and returns it as an IDENTIFIER token. Unlike a
+// bare identifier, a quoted name may contain spaces and reserved words
+// ('true', 'a b') and is never reinterpreted as a keyword, matching the
+// reference engine. A backslash escapes the following character (so 'a\'b' is
+// the name a'b); a newline or end of input before the closing quote is an
+// error.
+func (l *StreamingLexer) scanQuotedIdentifier(lval *yySymType) int {
+	startPos := l.pos - utf8.RuneLen('\'')
+	var sb strings.Builder
+	for {
+		ch, _, err := l.readRune()
+		if err != nil {
+			l.Error(fmt.Sprintf("unterminated quoted attribute name starting at byte %d", startPos))
+			return 0
+		}
+		switch ch {
+		case '\'':
+			lval.str = sb.String()
+			return IDENTIFIER
+		case '\n':
+			l.Error(fmt.Sprintf("newline in quoted attribute name starting at byte %d", startPos))
+			return 0
+		case '\\':
+			escaped, _, eerr := l.readRune()
+			if eerr != nil {
+				l.Error(fmt.Sprintf("unterminated quoted attribute name starting at byte %d", startPos))
+				return 0
+			}
+			sb.WriteRune(escaped)
+		default:
+			sb.WriteRune(ch)
+		}
 	}
 }
 
