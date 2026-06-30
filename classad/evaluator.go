@@ -778,9 +778,31 @@ func (e *Evaluator) evaluateBitwise(op string, left, right Value) Value {
 	case "<<":
 		return NewIntValue(l << uint(r&63))
 	case ">>":
-		return NewIntValue(l >> uint(r&63))
+		// Arithmetic right shift. For a negative value the reference engine
+		// shifts one bit at a time, re-forcing the sign bit, for min(64, count)
+		// steps -- so a count >= 64 saturates to -1 rather than wrapping.
+		if l >= 0 {
+			return NewIntValue(l >> uint(r&63))
+		}
+		steps := r
+		if steps > 64 {
+			steps = 64
+		}
+		val := l
+		for i := int64(0); i < steps; i++ {
+			val = (val >> 1) | math.MinInt64
+		}
+		return NewIntValue(val)
 	case ">>>":
-		return NewIntValue(int64(uint64(l) >> uint(r&63)))
+		// Logical right shift. The reference engine, for a negative value,
+		// shifts right one, clears the sign bit, then shifts the remaining
+		// count-1 (masked & 63) -- so e.g. (-29 >>> 0) is 0, not -29.
+		if l >= 0 {
+			return NewIntValue(l >> uint(r&63))
+		}
+		val := (l >> 1) & math.MaxInt64
+		val >>= uint((r - 1) & 63)
+		return NewIntValue(val)
 	default:
 		return NewErrorValue()
 	}

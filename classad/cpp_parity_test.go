@@ -45,6 +45,13 @@ func TestCppParity(t *testing.T) {
 		{`6 & true`, "E"},
 		{`6 & undefined`, "U"},
 		{`~undefined`, "U"},
+		// shift edge cases: >>> on a negative clears the sign bit then shifts
+		// count-1, and >> on a negative saturates to -1 for counts >= 64.
+		{`-29 >>> 0`, "I:0"},
+		{`5 >>> 0`, "I:5"},
+		{`-1 >>> 0`, "I:0"},
+		{`-8 >> 64`, "I:-1"},
+		{`-8 >> 2`, "I:-2"},
 
 		// Case-insensitive string comparison for < <= > >= == != ...
 		{`"B" < "a"`, "B:false"},
