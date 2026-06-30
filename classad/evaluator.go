@@ -331,6 +331,19 @@ func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Valu
 		return NewUndefinedValue()
 	}
 
+	// Detect cyclic references: if this attribute is already being evaluated in
+	// the target ad, evaluating it again would recurse forever. The reference
+	// engine treats such a cycle as a failed evaluation (error).
+	norm := normalizeName(ref.Name)
+	if targetClassAd.evaluating[norm] {
+		return NewErrorValue()
+	}
+	if targetClassAd.evaluating == nil {
+		targetClassAd.evaluating = make(map[string]bool)
+	}
+	targetClassAd.evaluating[norm] = true
+	defer delete(targetClassAd.evaluating, norm)
+
 	// Create evaluator for the target ClassAd
 	evaluator := NewEvaluator(targetClassAd)
 	return evaluator.Evaluate(expr)

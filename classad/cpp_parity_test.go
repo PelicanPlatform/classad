@@ -369,3 +369,23 @@ func TestDuplicateAttributesLastWins(t *testing.T) {
 		t.Errorf("A = %d, want 2 (last value wins across case-insensitive dup)", v)
 	}
 }
+
+// TestCyclicReferencesError verifies that a cyclic attribute reference yields
+// error instead of recursing until the stack overflows (the reference engine
+// reports a failed evaluation for such cycles).
+func TestCyclicReferencesError(t *testing.T) {
+	for _, src := range []string{`[a=a]`, `[a=a+1]`, `[a=b;b=a]`, `[a=eval("a")]`} {
+		ad, err := Parse(src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		if v := ad.EvaluateAttr("a"); !v.IsError() {
+			t.Errorf("%s: a = %v, want error (cycle)", src, v.Type())
+		}
+	}
+	// A finite reference chain must still evaluate fully.
+	ad, _ := Parse(`[ a0 = 1; a1 = a0; a2 = a1 ]`)
+	if v, _ := ad.EvaluateAttr("a2").IntValue(); v != 1 {
+		t.Errorf("finite chain a2 = %d, want 1", v)
+	}
+}

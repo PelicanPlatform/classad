@@ -152,6 +152,12 @@ type ClassAd struct {
 	target     *ClassAd
 	index      map[string]*ast.Expr
 	attrsDirty bool // true when attributes changed since last sort
+	// evaluating holds the normalized names of attributes currently being
+	// evaluated in this ad, to detect cyclic references (e.g. [a=a] or
+	// [a=b;b=a]). The reference engine reports such a cycle as a failed
+	// evaluation; without this guard the Go evaluator would recurse until the
+	// stack overflows.
+	evaluating map[string]bool
 }
 
 // Equal reports whether two ClassAds have the same attributes and values, ignoring
