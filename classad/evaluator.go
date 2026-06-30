@@ -197,18 +197,22 @@ func (v Value) ListValue() ([]Value, error) {
 		vals := make([]Value, len(v.listExprs))
 		ev := NewEvaluator(v.listScope)
 		for i, e := range v.listExprs {
-			vals[i] = evalListElement(ev, e)
+			vals[i] = evalRecoveringCyclic(ev, e)
 		}
 		return vals, nil
 	}
 	return v.listVal, nil
 }
 
-// evalListElement evaluates a lazy list element, turning a cyclic-reference
-// panic into an error value. Because materialization can happen anywhere
-// (canonical encoding, String, size's siblings), it must not let the
-// cyclicEvalError sentinel escape the recover-protected entry points.
-func evalListElement(ev *Evaluator, e ast.Expr) (result Value) {
+// evalRecoveringCyclic evaluates an expression, turning a cyclic-reference panic
+// into an error value rather than letting it propagate. It is used where the
+// reference engine localizes a cyclic sub-evaluation to an error *value* that
+// the surrounding construct then handles -- a lazy list element (materialization
+// can also happen outside the recover-protected entry points: canonical
+// encoding, String) and a function argument (so e.g. strcat(undefined, A2) with
+// a cyclic A2 is undefined: the cyclic argument becomes error and strcat's
+// first-argument precedence wins, rather than the cycle aborting the call).
+func evalRecoveringCyclic(ev *Evaluator, e ast.Expr) (result Value) {
 	defer recoverCyclic(&result)
 	return ev.Evaluate(e)
 }
@@ -228,7 +232,7 @@ func (v Value) listLen() int {
 // ensure v is a list and 0 <= i < listLen().
 func (v Value) listElementAt(i int) Value {
 	if v.listExprs != nil {
-		return evalListElement(NewEvaluator(v.listScope), v.listExprs[i])
+		return evalRecoveringCyclic(NewEvaluator(v.listScope), v.listExprs[i])
 	}
 	return v.listVal[i]
 }
@@ -1475,10 +1479,13 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return NewErrorValue()
 	}
 
-	// Evaluate all arguments
+	// Evaluate all arguments. A cyclic argument becomes an error value (rather
+	// than aborting the call) so the function's own undefined/error precedence
+	// applies, matching the reference engine: strcat(undefined, A2) with a
+	// cyclic A2 is undefined (first-argument-undefined wins), not error.
 	args := make([]Value, len(fc.Args))
 	for i, arg := range fc.Args {
-		args[i] = e.Evaluate(arg)
+		args[i] = evalRecoveringCyclic(e, arg)
 	}
 
 	// Dispatch to the appropriate function (funcName is already lower-cased)
