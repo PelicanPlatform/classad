@@ -44,7 +44,11 @@ import (
 %left '+' '-'
 %left '*' '/' '%'
 %right UNARY '!' '~'
-%left '.' '[' '(' ELVIS
+/* ELVIS is just below '.' / '[' so the elvis right operand greedily grabs a
+   trailing subscript/selection: (0) ?: {}[0] is (0) ?: ({}[0]), not
+   ((0) ?: {})[0], matching the reference parser's recursive postfix right. */
+%left ELVIS
+%left '.' '[' '('
 
 %type <classad> classad record_literal
 %type <attrs> attr_list

@@ -623,3 +623,18 @@ func TestElvisPrecedence(t *testing.T) {
 		}
 	}
 }
+
+// TestElvisPostfixRightGrouping guards that the elvis right operand greedily
+// takes a trailing subscript: (0) ?: {}[0] is (0) ?: ({}[0]) == 0 (a defined
+// left short-circuits), not ((0) ?: {})[0] which would subscript an int and
+// error. Matches the reference parser.
+func TestElvisPostfixRightGrouping(t *testing.T) {
+	ad, err := Parse(`[ a = (0) ?: {}[0] ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	v := ad.EvaluateAttr("a")
+	if got, _ := v.IntValue(); !v.IsInteger() || got != 0 {
+		t.Errorf("a = %v, want int(0)", v)
+	}
+}
