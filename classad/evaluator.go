@@ -318,56 +318,57 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 }
 
 func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Value {
-	var targetClassAd *ClassAd
-
-	// Determine which ClassAd to look up the attribute in based on scope
 	switch ref.Scope {
 	case ast.MyScope:
-		// MY.attr - always refers to the current ClassAd
-		targetClassAd = e.classad
+		// MY.attr - always the current ClassAd (no scope-chain fallthrough).
+		return e.evalAttrIn(e.classad, ref.Name)
 	case ast.TargetScope:
-		// TARGET.attr - refers to the target ClassAd
-		if e.classad != nil {
-			targetClassAd = e.classad.target
+		if e.classad == nil {
+			return NewUndefinedValue()
 		}
+		return e.evalAttrIn(e.classad.target, ref.Name)
 	case ast.ParentScope:
-		// PARENT.attr - refers to the parent ClassAd
-		if e.classad != nil {
-			targetClassAd = e.classad.parent
+		if e.classad == nil {
+			return NewUndefinedValue()
 		}
+		return e.evalAttrIn(e.classad.parent, ref.Name)
 	default:
-		// No scope - look in current ClassAd
-		targetClassAd = e.classad
-	}
-
-	if targetClassAd == nil {
+		// Unscoped: search the current ad, then up the enclosing (parent) scope
+		// chain, matching the reference engine. The chain is established by the
+		// select operator (see evaluateSelectExpr); a top-level ad has no parent
+		// so this is just a lookup in the current ad.
+		for ad := e.classad; ad != nil; ad = ad.parent {
+			if ad.lookupInternal(ref.Name) != nil {
+				return e.evalAttrIn(ad, ref.Name)
+			}
+		}
 		return NewUndefinedValue()
 	}
+}
 
-	expr := targetClassAd.lookupInternal(ref.Name)
+// evalAttrIn looks up name in ad and evaluates it, with cyclic-reference
+// detection. A cycle (the attribute is already being evaluated in ad) panics a
+// cyclicEvalError sentinel, recovered as error at the top-level entry points
+// (distinct from an error value, which =?= / =!= would compare as a type).
+func (e *Evaluator) evalAttrIn(ad *ClassAd, name string) Value {
+	if ad == nil {
+		return NewUndefinedValue()
+	}
+	expr := ad.lookupInternal(name)
 	if expr == nil {
 		return NewUndefinedValue()
 	}
-
-	// Detect cyclic references: if this attribute is already being evaluated in
-	// the target ad, evaluating it again would recurse forever. The reference
-	// engine treats such a cycle as a failed evaluation that aborts the whole
-	// expression (distinct from an error *value*, which =?= / =!= would compare
-	// as a type), so panic with a sentinel recovered at the top-level entry
-	// points, turning the whole evaluation into error.
-	norm := normalizeName(ref.Name)
-	if targetClassAd.evaluating[norm] {
+	norm := normalizeName(name)
+	if ad.evaluating[norm] {
 		panic(cyclicEvalError{})
 	}
-	if targetClassAd.evaluating == nil {
-		targetClassAd.evaluating = make(map[string]bool)
+	if ad.evaluating == nil {
+		ad.evaluating = make(map[string]bool)
 	}
-	targetClassAd.evaluating[norm] = true
-	defer delete(targetClassAd.evaluating, norm)
+	ad.evaluating[norm] = true
+	defer delete(ad.evaluating, norm)
 
-	// Create evaluator for the target ClassAd
-	evaluator := NewEvaluator(targetClassAd)
-	return evaluator.Evaluate(expr)
+	return NewEvaluator(ad).Evaluate(expr)
 }
 
 func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
@@ -560,9 +561,21 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 		return NewErrorValue()
 	}
 
-	// Get the ClassAd and lookup the attribute
 	ad, _ := recordVal.ClassAdValue()
-	return ad.EvaluateAttr(sel.Attr)
+	if ad == nil {
+		return NewErrorValue()
+	}
+
+	// Connect the nested ad's scope to the selecting scope, so that an
+	// attribute missing from the nested ad -- or an unscoped reference inside
+	// the selected attribute's value -- resolves up the enclosing scope chain,
+	// matching the reference engine ([x=1].A resolves A in the enclosing ad,
+	// and [A=[].A] is a cycle). The nested ad value is freshly built per
+	// evaluation, so setting its parent here is safe. Resolve the attribute as
+	// an unscoped reference so it chains (and participates in cycle detection).
+	ad.parent = e.classad
+	nested := NewEvaluator(ad)
+	return nested.evaluateAttributeReference(&ast.AttributeReference{Name: sel.Attr})
 }
 
 func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {

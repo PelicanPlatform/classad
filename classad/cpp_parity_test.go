@@ -399,3 +399,67 @@ func TestCyclicReferencesError(t *testing.T) {
 		t.Errorf("finite chain a2 = %d, want 1", v)
 	}
 }
+
+// TestNestedAdScopeResolution verifies that selecting an attribute from a
+// nested ad resolves up the enclosing scope chain (matching the reference
+// engine), including the cyclic case, while a standalone nested-ad value does
+// not chain.
+func TestNestedAdScopeResolution(t *testing.T) {
+	cases := []struct {
+		src  string
+		attr string
+		want string // E=error, U=undefined, or an integer literal
+	}{
+		{`[ x = 1; B = [].x ]`, "B", "1"},      // missing attr chains to parent
+		{`[ x = 1; y = [z = x].z ]`, "y", "1"}, // ref inside selected value chains
+		{`[ x = 1; B = [w = 2].x ]`, "B", "1"}, // chains past a non-matching attr
+		{`[ x = 1; B = [x = 2].x ]`, "B", "2"}, // local attr shadows parent
+		{`[ B = [].A ]`, "B", "U"},             // missing everywhere -> undefined
+		{`[ A = [].A ]`, "A", "E"},             // resolves to cyclic parent -> error
+	}
+	for _, tc := range cases {
+		ad, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.src, err)
+		}
+		v := ad.EvaluateAttr(tc.attr)
+		switch tc.want {
+		case "E":
+			if !v.IsError() {
+				t.Errorf("%s: %s = %v, want error", tc.src, tc.attr, v.Type())
+			}
+		case "U":
+			if !v.IsUndefined() {
+				t.Errorf("%s: %s = %v, want undefined", tc.src, tc.attr, v.Type())
+			}
+		default:
+			if got, _ := v.IntValue(); !v.IsInteger() || got != mustAtoi(tc.want) {
+				t.Errorf("%s: %s = %v, want %s", tc.src, tc.attr, v, tc.want)
+			}
+		}
+	}
+
+	// A standalone nested-ad value does NOT chain: z stays undefined.
+	ad, _ := Parse(`[ x = 1; y = [z = x] ]`)
+	y := ad.EvaluateAttr("y")
+	sub, _ := y.ClassAdValue()
+	if sub == nil || !sub.EvaluateAttr("z").IsUndefined() {
+		t.Errorf("standalone nested-ad y.z should be undefined (no chaining)")
+	}
+}
+
+func mustAtoi(s string) int64 {
+	var n int64
+	neg := false
+	for i, c := range s {
+		if i == 0 && c == '-' {
+			neg = true
+			continue
+		}
+		n = n*10 + int64(c-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n
+}
