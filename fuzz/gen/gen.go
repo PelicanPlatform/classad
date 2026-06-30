@@ -45,13 +45,30 @@ func New(seed int64, cfg Config) *Generator {
 	return &Generator{cfg: cfg, rng: rand.New(rand.NewSource(seed))}
 }
 
-// pure deterministic builtins, grouped by arity, that both engines implement.
+// pure deterministic builtins, grouped by the arity the generator calls them
+// with, that both engines implement. (Non-deterministic builtins -- time,
+// random, currentTime -- are excluded; formatTime is omitted as timezone/locale
+// dependent.) A function is listed in the group for an arity it accepts, even
+// if it accepts a range; this exercises a representative call.
 var (
 	fns1 = []string{"floor", "ceiling", "round", "int", "real", "string", "bool",
 		"isUndefined", "isError", "isString", "isInteger", "isReal", "isBoolean",
-		"isList", "isClassAd", "toLower", "toUpper", "size", "length"}
-	fns2 = []string{"strcat", "pow", "quantize", "strcmp", "stricmp", "member"}
-	fns3 = []string{"ifThenElse", "substr"}
+		"isList", "isClassAd", "toLower", "toUpper", "size", "length",
+		"split", "splitUserName", "splitSlotName", "interval", "sum", "avg",
+		"min", "max", "stringListSize"}
+	fns2 = []string{"strcat", "pow", "quantize", "strcmp", "stricmp", "member",
+		"join", "versioncmp", "version_gt", "version_ge", "version_lt",
+		"version_le", "version_eq", "identicalMember", "stringListMember",
+		"stringListIMember", "stringListSize", "stringListSum", "stringListAvg",
+		"stringListMin", "stringListMax", "stringListsIntersect",
+		"stringListSubsetMatch"}
+	fns3 = []string{"ifThenElse", "substr", "version_in_range", "anyCompare",
+		"allCompare"}
+	// The regex family (regexp/regexpMember/regexps/replace/stringListRegexpMember)
+	// is held out of the generator on purpose: Go uses RE2 and libclassad uses
+	// PCRE, so they diverge on many patterns in ways that are an engine choice,
+	// not a fixable bug. unparse is held out because it requires an attribute-
+	// reference argument, which the generator does not produce.
 )
 
 var binops = []string{"+", "-", "*", "/", "%", "<", "<=", ">", ">=",

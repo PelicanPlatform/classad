@@ -14,7 +14,7 @@ package cgo
 
 /*
 #cgo CXXFLAGS: -std=c++20 -I/usr/include
-#cgo LDFLAGS: -lclassad -lstdc++
+#cgo LDFLAGS: -lclassad -lcondor_utils_25_11_0 -lstdc++
 #include <stdlib.h>
 #include "shim.h"
 */

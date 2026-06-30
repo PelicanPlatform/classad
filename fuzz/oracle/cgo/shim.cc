@@ -20,6 +20,15 @@
 
 using namespace classad;
 
+// ClassAdReconfig (from libcondor_utils) registers HTCondor's extra ClassAd
+// functions -- split, splitUserName, splitSlotName, and the stringList* family
+// -- which bare libclassad does not include. The classad2 Python bindings and
+// the classad_eval CLI call it on startup; the shim must too, or those
+// functions evaluate to error here and manufacture false divergences against
+// the Go engine (which implements them). It is a plain C++ symbol (not extern
+// "C") exported by libcondor_utils.
+void ClassAdReconfig();
+
 namespace {
 
 // Append a length-prefixed string field: "<len>,<bytes>".
@@ -150,6 +159,11 @@ void encodeValue(std::string &out, const Value &v, const ClassAd *scope, int dep
 } // namespace
 
 extern "C" int classad_eval_ad(const char *adStr, char **out) {
+	// Register HTCondor's extra ClassAd functions once, before the first
+	// evaluation (thread-safe function-local static initialization).
+	static const bool reconfigured = [] { ClassAdReconfig(); return true; }();
+	(void)reconfigured;
+
 	*out = nullptr;
 	try {
 		ClassAdParser parser;
