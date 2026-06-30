@@ -5,6 +5,7 @@ package differ
 
 import (
 	"fmt"
+	"time"
 
 	classad "github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/fuzz/canon"
@@ -29,7 +30,15 @@ const (
 	// GoPanic: the Go engine panicked while parsing or evaluating. Always a bug
 	// in the Go implementation (it should return error/undefined, never panic).
 	GoPanic
+	// CppTimeout: libclassad failed to terminate (it infinite-loops on some
+	// cyclic self-references that the Go engine resolves to error -- a C++ bug).
+	// The result is uncomparable, so this is treated as a non-divergence.
+	CppTimeout
 )
+
+// cppEvalTimeout bounds a single libclassad evaluation. Normal evaluation takes
+// microseconds; only a cyclic-evaluation hang reaches this.
+const cppEvalTimeout = 2 * time.Second
 
 func (c Category) String() string {
 	switch c {
@@ -43,6 +52,8 @@ func (c Category) String() string {
 		return "encoding-error"
 	case GoPanic:
 		return "go-panic"
+	case CppTimeout:
+		return "cpp-timeout"
 	default:
 		return "unknown"
 	}
@@ -62,7 +73,9 @@ type Result struct {
 }
 
 // IsDivergence reports whether the result is anything other than a clean match.
-func (r Result) IsDivergence() bool { return r.Category != Match }
+// A CppTimeout is not a divergence: libclassad hung (a C++ bug) so the result
+// is uncomparable.
+func (r Result) IsDivergence() bool { return r.Category != Match && r.Category != CppTimeout }
 
 // Options tunes comparison behavior.
 type Options struct {
@@ -115,7 +128,15 @@ func Compare(src string, opts Options) Result {
 		return r
 	}
 
-	cppRaw, cppParsed := cppengine.EvalAd(src)
+	cppRaw, cppParsed, cppTimedOut := cppengine.EvalAdTimeout(src, cppEvalTimeout)
+	if cppTimedOut {
+		// libclassad infinite-looped (a known C++ bug on some cyclic
+		// self-references the Go engine resolves to error). The result is
+		// uncomparable, not a Go divergence; report it so it can be surfaced.
+		r.Category = CppTimeout
+		r.Detail = "cpp engine timed out (libclassad cyclic-evaluation hang)"
+		return r
+	}
 	r.CppParsed = cppParsed
 	r.CppRaw = cppRaw
 

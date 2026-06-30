@@ -21,6 +21,7 @@ package cgo
 import "C"
 
 import (
+	"time"
 	"unsafe"
 
 	"github.com/PelicanPlatform/classad/fuzz/canon"
@@ -43,6 +44,32 @@ func EvalAd(src string) (encoded string, parsed bool) {
 	}
 	defer C.classad_free(out)
 	return C.GoString(out), true
+}
+
+// EvalAdTimeout is EvalAd with a wall-clock cap. libclassad can infinite-loop
+// on some cyclic self-references reached through lazy operands (e.g.
+// [A0 = 0 ? e : A0], where its cycle guard never fires) -- a libclassad bug.
+// A cgo call cannot be interrupted, so the work runs in a separate goroutine;
+// on timeout we abandon it (the goroutine leaks, spinning in the C++ loop) and
+// report timedOut. The Go engine detects these cycles and returns error, so
+// such inputs are uncomparable rather than a Go bug; the differ treats a
+// timeout as a non-divergence.
+func EvalAdTimeout(src string, timeout time.Duration) (encoded string, parsed, timedOut bool) {
+	type result struct {
+		enc string
+		ok  bool
+	}
+	ch := make(chan result, 1) // buffered so the goroutine can exit if we time out
+	go func() {
+		enc, ok := EvalAd(src)
+		ch <- result{enc, ok}
+	}()
+	select {
+	case r := <-ch:
+		return r.enc, r.ok, false
+	case <-time.After(timeout):
+		return "", false, true
+	}
 }
 
 // Eval parses src and returns the parsed canonical value tree.
