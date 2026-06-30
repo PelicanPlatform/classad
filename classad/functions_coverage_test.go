@@ -142,6 +142,7 @@ func TestBuiltinAvg(t *testing.T) {
 		expected float64
 		isError  bool
 		isUndef  bool
+		isInt    bool
 	}{
 		{
 			name:     "average of integers",
@@ -164,9 +165,11 @@ func TestBuiltinAvg(t *testing.T) {
 			expected: 2.0,
 		},
 		{
+			// avg of an empty list is int 0 in the reference engine.
 			name:     "empty list",
 			input:    `[x = avg({})]`,
 			expected: 0.0,
+			isInt:    true,
 		},
 		{
 			// 0 arguments is wrong arity: error (the engine rejects it before
@@ -213,6 +216,12 @@ func TestBuiltinAvg(t *testing.T) {
 			if tt.isUndef {
 				if !val.IsUndefined() {
 					t.Errorf("Expected undefined, got %v", val)
+				}
+				return
+			}
+			if tt.isInt {
+				if got, _ := val.IntValue(); !val.IsInteger() || got != int64(tt.expected) {
+					t.Errorf("Expected int %d, got %v", int64(tt.expected), val)
 				}
 				return
 			}

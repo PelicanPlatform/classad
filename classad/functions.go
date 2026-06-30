@@ -1189,7 +1189,7 @@ func builtinAvg(args []Value) Value {
 
 	list, _ := args[0].ListValue()
 	if len(list) == 0 {
-		return NewRealValue(0.0)
+		return NewIntValue(0) // avg of an empty list is int 0 in the reference
 	}
 
 	var sum float64
@@ -1403,7 +1403,7 @@ func builtinJoin(args []Value) Value {
 	}
 	sep := ""
 	if !args[0].IsUndefined() {
-		s, ok := classadScalarString(args[0])
+		s, ok := classadString(args[0])
 		if !ok {
 			return NewErrorValue()
 		}
@@ -1420,7 +1420,7 @@ func builtinJoin(args []Value) Value {
 			undefFlag = true
 			continue
 		}
-		s, ok := classadScalarString(item)
+		s, ok := classadString(item)
 		if !ok {
 			return NewErrorValue()
 		}
