@@ -126,21 +126,38 @@ CGO_ENABLED=1 go run ./fuzz/cmd/genseeds > fuzz/corpus/seeds.txt
 
 These were found within seconds and confirmed independently against the
 `classad_eval` reference CLI — they are real engine differences, not harness
-artifacts:
+artifacts. **All of the rows below have since been fixed in the Go engine** (see
+the `classad:` / `parser:` commits and `classad/cpp_parity_test.go`):
 
-| Input | Go | C++ | Nature |
+| Input | Go (before) | C++ | Nature |
 |-------|----|----|--------|
-| `1 / 2` | `real(0.5)` | `int(0)` | Integer division: C++ does integer division for integer operands; Go always produces a real. |
-| `"B" < "a"` | `true` | `false` | String ordering: Go compares case-sensitively (ASCII); C++ orders case-insensitively. **Silent wrong boolean.** |
-| `true < false` | `error` | `false` | C++ treats booleans as orderable numbers; Go errors. |
-| `6/3`, `1.0/2.0` | parse error | parses | Go's lexer rejects `/` adjacent to a digit (only `1 / 2` with spaces parses). |
-| `[A=A();A=A()]` | 2 attrs named `A` | 1 attr | Duplicate attribute names: Go keeps both; C++ keeps one. |
+| `1 / 2` | `real(0.5)` | `int(0)` | Integer division for integer operands. |
+| `"B" < "a"` | `true` | `false` | Case-insensitive string ordering. **Silent wrong boolean.** |
+| `true < false` | `error` | `false` | Booleans are orderable numbers (1/0). |
+| `6/3`, `1.0/2.0` | parse error | parses | Lexer dropped a char after `/` adjacent to a digit. |
+| `false && error` | `error` | `false` | Three-valued short-circuit logic. |
+| `{}[0]` | `undefined` | `error` | Out-of-range list subscript is an error. |
+| `1 ? a : b` | `error` | `a` | Ternary condition coerces a number's truthiness. |
+| `0.1 + 0.2 == 0.3` | `true` | `false` | Reals compare with exact (not epsilon) equality. |
+| `round(2.5)` | `3` | `2` | Round half to even. |
+| `string(1.5)` | `"1.5"` | `"1.50…E+00"` | Reals stringify as `%.15E`. |
 
-Aggregate over 20k random ads (`-ignore-parse`): the dominant classes are
-`undefined`↔`error` propagation differences (hundreds of buckets) and direct
-boolean flips (`go=true cpp=false` and the reverse, ~200 combined) — the latter
-being the most severe since they are silently-wrong answers rather than
-error-signaling.
+Driving the fixes with the bucketed `cafuzz` survey took the semantic-divergence
+rate (random ads, `-ignore-parse`) from ~3800/5000 down to ~250/5000 (~94%).
+
+### Known remaining divergences (intentionally not fixed)
+
+- **`string()`/`strcat()`/`strcmp()`/`stricmp()`/`quantize()` of a list or
+  nested ad.** The reference engine unparses the *unevaluated element
+  expressions* (`string({1, 1+1})` → `"{ 1,1 + 1 }"`), whereas the Go engine
+  evaluates list elements eagerly and no longer has the source expressions. The
+  scalar cases are matched; composite coercion is an architectural mismatch and
+  is left erroring. This is the bulk of what remains.
+- **`length(...)`** is a documented Go alias for `size()`; the reference engine
+  has no such function (it always errors). Left as a deliberate Go extension.
+- **Integer-literal overflow** (`9223372036854775808`): the reference engine
+  silently evaluates it to `0` (a libclassad bug, reported upstream); Go rejects
+  it at parse time. Not mirrored.
 
 ## Extending
 
