@@ -1927,17 +1927,31 @@ func compareList(args []Value, all bool) Value {
 	if len(args) != 3 {
 		return NewErrorValue()
 	}
-	if args[0].IsError() || args[1].IsError() || args[2].IsError() {
+	// Arguments are checked in order -- operator, then list, then target -- so an
+	// undefined operator yields undefined even when the list is an error, etc.
+	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() || args[1].IsUndefined() {
+	if args[0].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	if !args[0].IsString() || !args[1].IsList() {
+	if !args[0].IsString() {
 		return NewErrorValue()
 	}
 	op, _ := args[0].StringValue()
 	if !validCompareOp(op) {
+		return NewErrorValue()
+	}
+	if args[1].IsError() {
+		return NewErrorValue()
+	}
+	if args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if !args[1].IsList() {
+		return NewErrorValue()
+	}
+	if args[2].IsError() {
 		return NewErrorValue()
 	}
 	list, _ := args[1].ListValue()
