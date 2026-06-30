@@ -804,7 +804,7 @@ func (e *Evaluator) evaluateGreaterOrEqual(left, right Value) Value {
 	if left.IsString() && right.IsString() {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr >= rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) >= 0)
 	}
 
 	return NewErrorValue()
