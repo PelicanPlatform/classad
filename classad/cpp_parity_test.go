@@ -463,3 +463,31 @@ func mustAtoi(s string) int64 {
 	}
 	return n
 }
+
+// TestLazyListSelfReference verifies that a self-referential list is a (lazy,
+// circular) list value -- not a construction-time cycle error -- matching the
+// reference engine, while a self-referential *scalar* attribute is still error.
+func TestLazyListSelfReference(t *testing.T) {
+	// A self-referential list evaluates to a list value (its elements are not
+	// eagerly evaluated), not error.
+	ad, err := Parse(`[ A = {{A[1]}} ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	a := ad.EvaluateAttr("A")
+	if !a.IsList() {
+		t.Fatalf("A = %v, want a list value (lazy self-reference)", a.Type())
+	}
+	// A[1] is out of range (A has one element), so deep access yields error,
+	// not infinite recursion.
+	inner, _ := a.ListValue()
+	if len(inner) != 1 || !inner[0].IsList() {
+		t.Fatalf("A[0] = %v, want a list", inner)
+	}
+
+	// A self-referential scalar is still a cyclic error (no lazy list to defer).
+	scalar, _ := Parse(`[ a = a + 1 ]`)
+	if v := scalar.EvaluateAttr("a"); !v.IsError() {
+		t.Errorf("a = a+1 should be error, got %v", v.Type())
+	}
+}

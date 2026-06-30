@@ -40,13 +40,17 @@ type Value struct {
 	strVal     string
 	listVal    []Value
 	classAdVal *ClassAd
-	// listExprs holds the source element expressions of a list that came from
-	// a list literal (nil for lists built programmatically by functions). The
-	// reference engine stores a list as its unevaluated ExprList; carrying the
-	// source expressions lets string()/strcat()/etc. unparse them exactly,
-	// e.g. string({1, 1+1}) is "{ 1,1 + 1 }" rather than "{ 1,2 }". It does
-	// not affect value semantics, which use the eagerly-evaluated listVal.
+	// listExprs / listScope make a list value from a literal lazy: it holds its
+	// source element expressions and the scope to evaluate them in, rather than
+	// pre-evaluated values, mirroring the reference engine (a list value is its
+	// unevaluated ExprList). Elements are evaluated on demand by ListValue().
+	// This lets string()/strcat()/etc. unparse the source expressions exactly
+	// (string({1, 1+1}) is "{ 1,1 + 1 }"), and a self-referential list
+	// (A0 = {{A0}}) is a list value rather than a construction-time cycle
+	// error. Lists built programmatically by functions leave these nil and use
+	// the eager listVal instead.
 	listExprs []ast.Expr
+	listScope *ClassAd
 }
 
 // NewUndefinedValue creates an undefined value.
@@ -188,6 +192,15 @@ func (v Value) ListValue() ([]Value, error) {
 	if v.valueType != ListValue {
 		return nil, fmt.Errorf("value is not a list")
 	}
+	if v.listExprs != nil {
+		// Lazy list: evaluate each element expression in its stored scope now.
+		vals := make([]Value, len(v.listExprs))
+		ev := NewEvaluator(v.listScope)
+		for i, e := range v.listExprs {
+			vals[i] = ev.Evaluate(e)
+		}
+		return vals, nil
+	}
 	return v.listVal, nil
 }
 
@@ -218,7 +231,8 @@ func (v Value) String() string {
 	case StringValue:
 		return fmt.Sprintf("%q", v.strVal)
 	case ListValue:
-		return fmt.Sprintf("%v", v.listVal)
+		elems, _ := v.ListValue()
+		return fmt.Sprintf("%v", elems)
 	case ClassAdValue:
 		if v.classAdVal != nil {
 			return v.classAdVal.String()
@@ -528,20 +542,18 @@ func (e *Evaluator) evaluateElvis(elvis *ast.ElvisExpr) Value {
 }
 
 func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
-	values := make([]Value, len(list.Elements))
-	for i, elem := range list.Elements {
-		values[i] = e.Evaluate(elem)
-	}
-	v := NewListValue(values)
-	// Carry the source element expressions (non-nil even when empty, to
-	// distinguish a literal from a programmatically-built list) so string
-	// coercion can unparse them like the reference engine.
+	// Lazy: do not evaluate the elements now. Carry the source expressions
+	// (non-nil even when empty, to distinguish a literal from a
+	// programmatically-built list) and the scope to evaluate them in. Elements
+	// are evaluated on demand by ListValue(). This matches the reference engine
+	// (a list value is its unevaluated ExprList): string coercion can unparse
+	// the source expressions, and a self-referential list is a value rather
+	// than a construction-time cycle error.
 	exprs := list.Elements
 	if exprs == nil {
 		exprs = []ast.Expr{}
 	}
-	v.listExprs = exprs
-	return v
+	return Value{valueType: ListValue, listExprs: exprs, listScope: e.classad}
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
