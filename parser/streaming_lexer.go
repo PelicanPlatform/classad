@@ -110,6 +110,16 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 	case ',':
 		return int(',')
 	case '?':
+		// An adjacent "?:" is the high-precedence elvis operator; a spaced
+		// "? :" stays two tokens and binds at ternary precedence (matching the
+		// reference lexer, which only fuses an immediately-following ':').
+		if next, err := l.peekRune(); err == nil && next == ':' {
+			if err := l.discardRune(); err != nil {
+				l.err = err
+				return 0
+			}
+			return ELVIS
+		}
 		return int('?')
 	case ':':
 		return int(':')

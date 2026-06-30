@@ -597,3 +597,29 @@ func TestShortCircuitLazyOperand(t *testing.T) {
 		}
 	}
 }
+
+// TestElvisPrecedence guards that the adjacent "?:" elvis operator binds at
+// postfix precedence (tighter than arithmetic), so 10 ?: 2 + 3 is (10 ?: 2) + 3
+// == 13, while a spaced "? :" stays at ternary precedence (10 ? : 2 + 3 is
+// 10 ?: (2 + 3) == 10). Matches the reference parser.
+func TestElvisPrecedence(t *testing.T) {
+	cases := []struct {
+		src  string
+		want int64
+	}{
+		{`[ a = 10 ?: 2 + 3 ]`, 13},  // adjacent: (10 ?: 2) + 3
+		{`[ a = 10 ? : 2 + 3 ]`, 10}, // spaced: 10 ?: (2 + 3)
+		{`[ a = 0 ?: 3 + 4 ?: 9 ]`, 4},
+		{`[ a = 1 ?: 2 ?: 3 ]`, 1},
+	}
+	for _, tc := range cases {
+		ad, err := Parse(tc.src)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.src, err)
+		}
+		v := ad.EvaluateAttr("a")
+		if got, _ := v.IntValue(); !v.IsInteger() || got != tc.want {
+			t.Errorf("%s: a = %v, want int(%d)", tc.src, v, tc.want)
+		}
+	}
+}
