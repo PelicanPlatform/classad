@@ -58,8 +58,10 @@ func TestStringListSetOperations(t *testing.T) {
 }
 
 func TestStricmpErrorAndBoolCompare(t *testing.T) {
-	if val := evalBuiltin(t, `stricmp(true, "x")`); !val.IsError() {
-		t.Fatalf("expected error for invalid stricmp argument types")
+	// stricmp coerces non-string scalars to their string form, so
+	// stricmp(true, "x") compares "true" to "x" (-1), matching the reference.
+	if val, _ := evalBuiltin(t, `stricmp(true, "x")`).IntValue(); val != -1 {
+		t.Fatalf("expected stricmp(true, \"x\") == -1, got %d", val)
 	}
 
 	boolCompare := evalBuiltin(t, `anyCompare("==", {true, false}, true)`)

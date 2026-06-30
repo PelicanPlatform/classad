@@ -104,6 +104,12 @@ func TestCppParity(t *testing.T) {
 		{`bool(undefined)`, "U"},
 		{`strcmp(undefined, "a")`, "U"},
 
+		// toUpper/toLower/strcmp/stricmp coerce non-string scalars to string.
+		{`toUpper(5)`, "S:5"},
+		{`toUpper(true)`, "S:TRUE"},
+		{`toLower(1.5)`, "S:1.500000000000000e+00"},
+		{`stricmp(true, "x")`, "I:-1"},
+
 		// string()/strcat() scalar coercion; reals use %.15E (0 -> "0.0").
 		{`string(1.5)`, "S:1.500000000000000E+00"},
 		{`string(0.0)`, "S:0.0"},

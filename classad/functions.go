@@ -172,11 +172,12 @@ func builtinToLower(args []Value) Value {
 	if args[0].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	if !args[0].IsString() {
+	// Non-string scalars are coerced to their string form first (so
+	// toLower(1.5) lowercases "1.500000000000000E+00").
+	str, ok := classadScalarString(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
-
-	str, _ := args[0].StringValue()
 	return NewStringValue(strings.ToLower(str))
 }
 
@@ -192,11 +193,10 @@ func builtinToUpper(args []Value) Value {
 	if args[0].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	if !args[0].IsString() {
+	str, ok := classadScalarString(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
-
-	str, _ := args[0].StringValue()
 	return NewStringValue(strings.ToUpper(str))
 }
 
@@ -1346,29 +1346,10 @@ func builtinStrcmp(args []Value) Value {
 		return NewUndefinedValue()
 	}
 
-	// Convert to strings
-	var str1, str2 string
-	if args[0].IsString() {
-		str1, _ = args[0].StringValue()
-	} else if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		str1 = fmt.Sprintf("%d", val)
-	} else if args[0].IsReal() {
-		val, _ := args[0].RealValue()
-		str1 = fmt.Sprintf("%g", val)
-	} else {
-		return NewErrorValue()
-	}
-
-	if args[1].IsString() {
-		str2, _ = args[1].StringValue()
-	} else if args[1].IsInteger() {
-		val, _ := args[1].IntValue()
-		str2 = fmt.Sprintf("%d", val)
-	} else if args[1].IsReal() {
-		val, _ := args[1].RealValue()
-		str2 = fmt.Sprintf("%g", val)
-	} else {
+	// Coerce both arguments to their string form (matching string()/strcat()).
+	str1, ok1 := classadScalarString(args[0])
+	str2, ok2 := classadScalarString(args[1])
+	if !ok1 || !ok2 {
 		return NewErrorValue()
 	}
 
@@ -1390,29 +1371,10 @@ func builtinStricmp(args []Value) Value {
 		return NewUndefinedValue()
 	}
 
-	// Convert to strings
-	var str1, str2 string
-	if args[0].IsString() {
-		str1, _ = args[0].StringValue()
-	} else if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		str1 = fmt.Sprintf("%d", val)
-	} else if args[0].IsReal() {
-		val, _ := args[0].RealValue()
-		str1 = fmt.Sprintf("%g", val)
-	} else {
-		return NewErrorValue()
-	}
-
-	if args[1].IsString() {
-		str2, _ = args[1].StringValue()
-	} else if args[1].IsInteger() {
-		val, _ := args[1].IntValue()
-		str2 = fmt.Sprintf("%d", val)
-	} else if args[1].IsReal() {
-		val, _ := args[1].RealValue()
-		str2 = fmt.Sprintf("%g", val)
-	} else {
+	// Coerce both arguments to their string form (matching string()/strcat()).
+	str1, ok1 := classadScalarString(args[0])
+	str2, ok2 := classadScalarString(args[1])
+	if !ok1 || !ok2 {
 		return NewErrorValue()
 	}
 
