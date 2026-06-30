@@ -148,11 +148,6 @@ type BinaryOp struct {
 	Op    string
 	Left  Expr
 	Right Expr
-	// Parenthesized records whether the source wrapped this operation in
-	// explicit parentheses. It does not affect evaluation; it is preserved so
-	// that unparsing reproduces the reference engine's output, which echoes
-	// source parentheses verbatim (it adds none of its own).
-	Parenthesized bool
 }
 
 func (b *BinaryOp) String() string {
@@ -163,9 +158,8 @@ func (b *BinaryOp) exprNode() {}
 
 // UnaryOp represents a unary operation (e.g., -, !, ~).
 type UnaryOp struct {
-	Op            string
-	Expr          Expr
-	Parenthesized bool
+	Op   string
+	Expr Expr
 }
 
 func (u *UnaryOp) String() string {
@@ -226,10 +220,9 @@ func (f *FunctionCall) exprNode() {}
 
 // ConditionalExpr represents a ternary conditional expression (cond ? true_expr : false_expr).
 type ConditionalExpr struct {
-	Condition     Expr
-	TrueExpr      Expr
-	FalseExpr     Expr
-	Parenthesized bool
+	Condition Expr
+	TrueExpr  Expr
+	FalseExpr Expr
 }
 
 func (c *ConditionalExpr) String() string {
@@ -241,9 +234,8 @@ func (c *ConditionalExpr) exprNode() {}
 // ElvisExpr represents the Elvis operator (expr1 ?: expr2).
 // If expr1 evaluates to undefined, returns expr2; otherwise returns expr1.
 type ElvisExpr struct {
-	Left          Expr // The expression to test for undefined
-	Right         Expr // The fallback expression if Left is undefined
-	Parenthesized bool
+	Left  Expr // The expression to test for undefined
+	Right Expr // The fallback expression if Left is undefined
 }
 
 func (e *ElvisExpr) String() string {
@@ -276,21 +268,31 @@ func (s *SubscriptExpr) String() string {
 
 func (s *SubscriptExpr) exprNode() {}
 
-// Parenthesize marks an expression as having been wrapped in explicit
-// parentheses in the source, for operation nodes where unparsing must echo
-// those parentheses (matching the reference engine). It is a no-op for other
-// node types (the generator and grammar only parenthesize operations). The
-// expression is returned for convenient use in grammar actions.
-func Parenthesize(e Expr) Expr {
-	switch v := e.(type) {
-	case *BinaryOp:
-		v.Parenthesized = true
-	case *UnaryOp:
-		v.Parenthesized = true
-	case *ConditionalExpr:
-		v.Parenthesized = true
-	case *ElvisExpr:
-		v.Parenthesized = true
+// ParenExpr is an expression wrapped in explicit source parentheses. The
+// reference engine echoes parentheses verbatim when unparsing -- around any
+// expression, including primaries ((x), (5)) and nested ((x)) -- so they are
+// preserved as a node rather than a flag. Evaluation is transparent (the inner
+// expression's value).
+type ParenExpr struct {
+	Inner Expr
+}
+
+// String is transparent: the AST's String() methods are a debug representation
+// that already always-parenthesizes operators, so echoing the explicit source
+// parentheses here would double them. The reference-faithful unparser
+// (classad/unparse.go) is what emits the preserved parentheses.
+func (p *ParenExpr) String() string {
+	if p.Inner == nil {
+		return "()"
 	}
-	return e
+	return p.Inner.String()
+}
+func (p *ParenExpr) exprNode() {}
+
+// Parenthesize wraps an expression in a ParenExpr, recording that the source
+// parenthesized it so unparsing can echo the parentheses (matching the
+// reference engine). The wrapped expression is returned for use in grammar
+// actions.
+func Parenthesize(e Expr) Expr {
+	return &ParenExpr{Inner: e}
 }

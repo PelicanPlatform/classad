@@ -307,6 +307,11 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 	}
 
 	switch v := expr.(type) {
+	case *ast.ParenExpr:
+		// Parentheses are transparent to evaluation (they only affect parsing
+		// precedence and unparsing).
+		return e.Evaluate(v.Inner)
+
 	case *ast.IntegerLiteral:
 		return NewIntValue(v.Value)
 

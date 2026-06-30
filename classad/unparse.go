@@ -10,7 +10,7 @@ import (
 // This file reproduces HTCondor's ClassAdUnParser (src/classad/sink.cpp) for
 // expression trees, so that string()/strcat()/etc. of a list or nested ad emit
 // exactly what the reference engine does. The reference unparser echoes source
-// parentheses verbatim and adds none of its own (hence the Parenthesized flag
+// parentheses verbatim and adds none of its own (hence the ast.ParenExpr nodes
 // preserved by the parser); operators carry their spacing in the tables below.
 
 // binaryOpUnparse maps a Go AST binary operator to its reference unparse
@@ -65,28 +65,28 @@ func unparseExpr(b *strings.Builder, e ast.Expr) {
 			b.WriteString("PARENT.")
 		}
 		b.WriteString(v.Name)
+	case *ast.ParenExpr:
+		// Explicit source parentheses are echoed verbatim (around any
+		// expression, and nested), matching the reference engine.
+		b.WriteByte('(')
+		unparseExpr(b, v.Inner)
+		b.WriteByte(')')
 	case *ast.BinaryOp:
-		paren(b, v.Parenthesized, func() {
-			unparseExpr(b, v.Left)
-			b.WriteString(binaryOpUnparse[v.Op])
-			unparseExpr(b, v.Right)
-		})
+		unparseExpr(b, v.Left)
+		b.WriteString(binaryOpUnparse[v.Op])
+		unparseExpr(b, v.Right)
 	case *ast.UnaryOp:
-		paren(b, v.Parenthesized, func() { unparseUnary(b, v) })
+		unparseUnary(b, v)
 	case *ast.ConditionalExpr:
-		paren(b, v.Parenthesized, func() {
-			unparseExpr(b, v.Condition)
-			b.WriteString(" ? ")
-			unparseExpr(b, v.TrueExpr)
-			b.WriteString(" : ")
-			unparseExpr(b, v.FalseExpr)
-		})
+		unparseExpr(b, v.Condition)
+		b.WriteString(" ? ")
+		unparseExpr(b, v.TrueExpr)
+		b.WriteString(" : ")
+		unparseExpr(b, v.FalseExpr)
 	case *ast.ElvisExpr:
-		paren(b, v.Parenthesized, func() {
-			unparseExpr(b, v.Left)
-			b.WriteString(" ?: ")
-			unparseExpr(b, v.Right)
-		})
+		unparseExpr(b, v.Left)
+		b.WriteString(" ?: ")
+		unparseExpr(b, v.Right)
 	case *ast.ListLiteral:
 		b.WriteString("{ ")
 		for i, el := range v.Elements {
@@ -119,16 +119,6 @@ func unparseExpr(b *strings.Builder, e ast.Expr) {
 		unparseRecord(b, v.ClassAd)
 	default:
 		b.WriteString("error")
-	}
-}
-
-func paren(b *strings.Builder, on bool, body func()) {
-	if on {
-		b.WriteByte('(')
-	}
-	body()
-	if on {
-		b.WriteByte(')')
 	}
 }
 

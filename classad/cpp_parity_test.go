@@ -678,3 +678,30 @@ func TestWrongArityNoArgEval(t *testing.T) {
 		}
 	}
 }
+
+// TestParenthesesPreserved guards that explicit source parentheses are echoed
+// when unparsing -- around any expression including primaries and nested --
+// matching the reference engine, which is visible through string-coercing a
+// list of parenthesized elements.
+func TestParenthesesPreserved(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`string({(x)})`, "{ (x) }"},
+		{`string({(5)})`, "{ (5) }"},
+		{`string({((x))})`, "{ ((x)) }"},
+		{`string({(1+2)})`, "{ (1 + 2) }"},
+		{`string({(f(1))})`, "{ (f(1)) }"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse(`[ r = ` + tc.expr + ` ]`)
+		if err != nil {
+			t.Fatalf("%s: parse: %v", tc.expr, err)
+		}
+		v := ad.EvaluateAttr("r")
+		if got, _ := v.StringValue(); !v.IsString() || got != tc.want {
+			t.Errorf("%s = %q, want %q", tc.expr, got, tc.want)
+		}
+	}
+}

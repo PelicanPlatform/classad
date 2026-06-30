@@ -127,9 +127,15 @@ func TestReaderParserComplexExpression(t *testing.T) {
 		t.Fatalf("expected + op at root, got %s", bin.Op)
 	}
 
-	left, ok := bin.Left.(*ast.BinaryOp)
+	// The source parenthesized the left operand, which is now preserved as a
+	// ParenExpr node; unwrap it to reach the nested binary op.
+	leftParen, ok := bin.Left.(*ast.ParenExpr)
 	if !ok {
-		t.Fatalf("expected left child to be binary op, got %T", bin.Left)
+		t.Fatalf("expected left child to be a parenthesized expr, got %T", bin.Left)
+	}
+	left, ok := leftParen.Inner.(*ast.BinaryOp)
+	if !ok {
+		t.Fatalf("expected left child to be binary op, got %T", leftParen.Inner)
 	}
 	if left.Op != "/" {
 		t.Fatalf("expected / in nested op, got %s", left.Op)

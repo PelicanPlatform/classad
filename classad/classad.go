@@ -991,6 +991,9 @@ func (c *ClassAd) collectRefs(expr ast.Expr) []string {
 // collectRefsHelper is a recursive helper for collectRefs
 func (c *ClassAd) collectRefsHelper(expr ast.Expr, refs map[string]bool) {
 	switch v := expr.(type) {
+	case *ast.ParenExpr:
+		c.collectRefsHelper(v.Inner, refs)
+
 	case *ast.AttributeReference:
 		// Only collect non-scoped references (no MY., TARGET., PARENT.)
 		if v.Scope == ast.NoScope {
@@ -1068,6 +1071,19 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 	}
 
 	switch v := expr.(type) {
+	case *ast.ParenExpr:
+		inner := c.flattenExpr(v.Inner)
+		// Keep the parentheses only around an operator, where they carry
+		// precedence; drop them once the inner expression has collapsed to a
+		// literal/primary so constant folding can see it (and so the flattened
+		// form is not littered with cosmetic parens).
+		switch inner.(type) {
+		case *ast.BinaryOp, *ast.UnaryOp, *ast.ConditionalExpr, *ast.ElvisExpr:
+			return &ast.ParenExpr{Inner: inner}
+		default:
+			return inner
+		}
+
 	case *ast.AttributeReference:
 		// Try to evaluate the reference
 		if v.Scope == ast.NoScope {
@@ -1315,6 +1331,22 @@ func exprEqual(a, b ast.Expr) bool {
 	}
 	if a == nil || b == nil {
 		return false
+	}
+
+	// Parentheses are transparent to structural equality.
+	for {
+		if p, ok := a.(*ast.ParenExpr); ok {
+			a = p.Inner
+		} else {
+			break
+		}
+	}
+	for {
+		if p, ok := b.(*ast.ParenExpr); ok {
+			b = p.Inner
+		} else {
+			break
+		}
 	}
 
 	switch av := a.(type) {
