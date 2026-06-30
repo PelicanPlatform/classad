@@ -99,7 +99,7 @@ than arithmetic); a **spaced** `? :` binds at low ternary precedence:
 
 ```
 classad_eval -quiet '[ a = 10 ?: 2 + 3 ]' a        # 13   -> (10 ?: 2) + 3
-classad_eval -quiet '[ a = 10 ? : 2 + 3 ]' a        # 10   -> 10 ?: (2 + 3)
+         # 10   -> 10 ?: (2 + 3)
 ```
 
 Inserting a space between `?` and `:` changes the parse tree (and the result).
@@ -108,6 +108,22 @@ This stems from the lexer fusing only an immediately-adjacent `?:` into a single
 expressions parsing differently by whitespace is surprising.
 
 ---
+
+## 6. version comparison functions are camelCase and case-sensitive — surprising
+
+ClassAd function names are otherwise case-insensitive (`SUBSTR` == `substr`), but
+the version-comparison helpers are spelled in camelCase and only match that exact
+case:
+
+```
+classad_eval -quiet '[ a = versionGT("2.0","1.0") ]' a    # true
+classad_eval -quiet '[ a = versiongt("2.0","1.0") ]' a    # error  (lowercase not recognized)
+classad_eval -quiet '[ a = version_gt("2.0","1.0") ]' a   # error  (underscore not recognized)
+```
+
+So `versionGT`/`versionGE`/`versionLT`/`versionLE`/`versionEQ` work, but only with
+that capitalization — inconsistent with every other builtin. (`version_in_range`
+and `versioncmp` are the lowercase-friendly ones.)
 
 ## Observed (reasonable) semantics, recorded for completeness
 
