@@ -63,9 +63,11 @@ func TestEvaluateExprMathErrorPaths(t *testing.T) {
 		t.Fatalf("expected floor on string to be error, got %v", errVal.Type())
 	}
 
-	undefVal := evalExpr(t, "floor(undefined)")
-	if !undefVal.IsUndefined() {
-		t.Fatalf("expected undefined from floor(undefined), got %v", undefVal.Type())
+	// floor of a non-number, including undefined, is an error (matching the
+	// reference engine, unlike int()/real() which propagate undefined).
+	floorUndef := evalExpr(t, "floor(undefined)")
+	if !floorUndef.IsError() {
+		t.Fatalf("expected error from floor(undefined), got %v", floorUndef.Type())
 	}
 
 	powErr := evalExpr(t, "pow(\"x\", 2)")

@@ -163,9 +163,8 @@ func builtinFloor(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
+	// floor/ceiling/round treat a non-number (including undefined) as an
+	// error, matching the reference engine (unlike int()/real()).
 	if !args[0].IsNumber() {
 		return NewErrorValue()
 	}
@@ -183,9 +182,6 @@ func builtinCeiling(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
 	if !args[0].IsNumber() {
 		return NewErrorValue()
 	}
@@ -202,9 +198,6 @@ func builtinRound(args []Value) Value {
 
 	if args[0].IsError() {
 		return NewErrorValue()
-	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
 	}
 	if !args[0].IsNumber() {
 		return NewErrorValue()
@@ -600,8 +593,9 @@ func builtinString(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
+	// string() propagates undefined (matching the reference).
 	if args[0].IsUndefined() {
-		return NewErrorValue()
+		return NewUndefinedValue()
 	}
 
 	// Convert based on type
@@ -636,8 +630,9 @@ func builtinBool(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
+	// bool() propagates undefined (matching the reference).
 	if args[0].IsUndefined() {
-		return NewErrorValue()
+		return NewUndefinedValue()
 	}
 
 	// Already boolean
@@ -681,8 +676,10 @@ func builtinPow(args []Value) Value {
 	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
+	// pow treats undefined operands as an error (matching the reference),
+	// not undefined.
 	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewUndefinedValue()
+		return NewErrorValue()
 	}
 
 	// Get base value as real
@@ -728,8 +725,9 @@ func builtinQuantize(args []Value) Value {
 	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
+	// quantize treats undefined operands as an error (matching the reference).
 	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewUndefinedValue()
+		return NewErrorValue()
 	}
 
 	// If second arg is a list
@@ -1099,8 +1097,9 @@ func builtinJoin(args []Value) Value {
 		if args[0].IsError() {
 			return NewErrorValue()
 		}
+		// join propagates undefined (matching the reference).
 		if args[0].IsUndefined() {
-			return NewErrorValue()
+			return NewUndefinedValue()
 		}
 		if !args[0].IsList() {
 			return NewErrorValue()
@@ -1213,9 +1212,7 @@ func builtinSplit(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
+	// split of a non-string (including undefined) is an error in the reference.
 	if !args[0].IsString() {
 		return NewErrorValue()
 	}
@@ -1324,8 +1321,9 @@ func builtinStrcmp(args []Value) Value {
 	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
+	// strcmp/stricmp propagate undefined (matching the reference).
 	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewErrorValue()
+		return NewUndefinedValue()
 	}
 
 	// Convert to strings
@@ -1367,8 +1365,9 @@ func builtinStricmp(args []Value) Value {
 	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
+	// strcmp/stricmp propagate undefined (matching the reference).
 	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewErrorValue()
+		return NewUndefinedValue()
 	}
 
 	// Convert to strings

@@ -289,8 +289,9 @@ func TestMembershipFunctions(t *testing.T) {
 		t.Fatalf("expected stricmp to treat integers as equal, got %d", v)
 	}
 
-	if errVal := evalBuiltin(t, `stricmp(undefined, "x")`); !errVal.IsError() {
-		t.Fatalf("expected error when stricmp receives undefined")
+	// stricmp propagates undefined (matching the reference engine).
+	if undefVal := evalBuiltin(t, `stricmp(undefined, "x")`); !undefVal.IsUndefined() {
+		t.Fatalf("expected undefined when stricmp receives undefined")
 	}
 
 	regexMember := evalBuiltin(t, `regexpMember("foo", {"FOO"}, "i")`)

@@ -122,9 +122,10 @@ func TestBuiltinQuantize(t *testing.T) {
 			isError: true,
 		},
 		{
+			// quantize treats undefined as an error, matching the reference.
 			name:    "quantize undefined",
 			input:   `[x = quantize(undefined, 3)]`,
-			isUndef: true,
+			isError: true,
 		},
 		{
 			name:    "quantize error",
