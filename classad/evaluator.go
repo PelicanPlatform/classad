@@ -389,6 +389,10 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 	case "!=":
 		return e.evaluateNotEqual(left, right)
 
+	// Bitwise operators (integer-only).
+	case "&", "|", "^", "<<", ">>", ">>>":
+		return e.evaluateBitwise(op.Op, left, right)
+
 	// Logical operators (&& and ||) are handled before the generic error
 	// propagation above.
 
@@ -441,6 +445,15 @@ func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
 		default:
 			return NewErrorValue()
 		}
+
+	case "~":
+		// Bitwise not requires a genuine integer (undefined already handled
+		// above); a real or boolean operand is an error.
+		if val.IsInteger() {
+			i, _ := val.IntValue()
+			return NewIntValue(^i)
+		}
+		return NewErrorValue()
 
 	default:
 		return NewErrorValue()
@@ -705,6 +718,38 @@ func (e *Evaluator) evaluateModulo(left, right Value) Value {
 	}
 
 	return NewIntValue(liv % riv)
+}
+
+// evaluateBitwise implements the integer bitwise operators. Both operands must
+// be genuine integers (a real or boolean operand is an error, unlike the
+// arithmetic operators), and undefined propagates. Shift counts are masked with
+// & 63 like the reference engine (and C on 64-bit), so the shift never panics
+// and e.g. 1 << 64 == 1; >> is arithmetic (sign-extending) and >>> is logical.
+func (e *Evaluator) evaluateBitwise(op string, left, right Value) Value {
+	if left.IsUndefined() || right.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if !left.IsInteger() || !right.IsInteger() {
+		return NewErrorValue()
+	}
+	l, _ := left.IntValue()
+	r, _ := right.IntValue()
+	switch op {
+	case "&":
+		return NewIntValue(l & r)
+	case "|":
+		return NewIntValue(l | r)
+	case "^":
+		return NewIntValue(l ^ r)
+	case "<<":
+		return NewIntValue(l << uint(r&63))
+	case ">>":
+		return NewIntValue(l >> uint(r&63))
+	case ">>>":
+		return NewIntValue(int64(uint64(l) >> uint(r&63)))
+	default:
+		return NewErrorValue()
+	}
 }
 
 // lowerASCII folds an ASCII upper-case byte to lower case, leaving every other

@@ -31,6 +31,21 @@ func TestCppParity(t *testing.T) {
 		{`7 % 3`, "I:1"},
 		{`-7 % 3`, "I:-1"},
 
+		// Bitwise operators (integer-only; bool/real operands error; shift count
+		// masked & 63; >> arithmetic, >>> logical; undefined propagates).
+		{`6 & 3`, "I:2"},
+		{`6 | 1`, "I:7"},
+		{`6 ^ 3`, "I:5"},
+		{`1 << 4`, "I:16"},
+		{`-8 >> 1`, "I:-4"},
+		{`-8 >>> 1`, "I:9223372036854775804"},
+		{`~5`, "I:-6"},
+		{`1 << 64`, "I:1"},
+		{`6 & 3.0`, "E"},
+		{`6 & true`, "E"},
+		{`6 & undefined`, "U"},
+		{`~undefined`, "U"},
+
 		// Case-insensitive string comparison for < <= > >= == != ...
 		{`"B" < "a"`, "B:false"},
 		{`"a" < "B"`, "B:true"},
