@@ -901,29 +901,11 @@ func (e *Evaluator) evaluateIs(left, right Value) Value {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
 		return NewBoolValue(leftStr == rightStr)
-	case ListValue:
-		// Lists: compare element-wise
-		leftList, _ := left.ListValue()
-		rightList, _ := right.ListValue()
-		if len(leftList) != len(rightList) {
-			return NewBoolValue(false)
-		}
-		for i := range leftList {
-			elemResult := e.evaluateIs(leftList[i], rightList[i])
-			if elemResult.IsError() {
-				return elemResult
-			}
-			match, _ := elemResult.BoolValue()
-			if !match {
-				return NewBoolValue(false)
-			}
-		}
-		return NewBoolValue(true)
-	case ClassAdValue:
-		// ClassAds: pointer comparison (same object)
-		leftAd, _ := left.ClassAdValue()
-		rightAd, _ := right.ClassAdValue()
-		return NewBoolValue(leftAd == rightAd)
+	case ListValue, ClassAdValue:
+		// The reference engine cannot compare lists or classads with =?= / =!=:
+		// such a comparison is an error (only the type-mismatch case above
+		// yields a boolean, e.g. {1} =?= 1 is false).
+		return NewErrorValue()
 	default:
 		return NewErrorValue()
 	}

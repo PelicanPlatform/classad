@@ -194,6 +194,11 @@ func TestCppParity(t *testing.T) {
 		{`"a" == 1`, "E"},
 		{`{1} == 1`, "E"},
 		{`{1, 2} == {1, 2}`, "E"},
+		// =?= / =!= cannot compare lists or classads (error), but a type
+		// mismatch like list vs int is still a plain boolean.
+		{`{1} =?= {1}`, "E"},
+		{`{1} =!= {2}`, "E"},
+		{`{1} =?= 1`, "B:false"},
 	}
 
 	for _, tc := range cases {

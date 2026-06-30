@@ -208,12 +208,13 @@ func TestIsWithLists(t *testing.T) {
 		t.Fatalf("Parse error: %v", err)
 	}
 
-	if same, ok := ad.EvaluateAttrBool("same"); !ok || !same {
-		t.Error("Identical lists should be 'is' each other")
+	// 'is' (=?=) cannot compare lists in the reference engine; the result is
+	// an error, not a structural comparison.
+	if v := ad.EvaluateAttr("same"); !v.IsError() {
+		t.Errorf("list1 is list2 should be error, got %v", v.Type())
 	}
-
-	if diff, ok := ad.EvaluateAttrBool("diff"); !ok || diff {
-		t.Error("Different lists should not be 'is' each other")
+	if v := ad.EvaluateAttr("diff"); !v.IsError() {
+		t.Errorf("list1 is list3 should be error, got %v", v.Type())
 	}
 }
 
@@ -629,14 +630,13 @@ func TestMetaEqualWithLists(t *testing.T) {
 		t.Fatalf("Parse error: %v", err)
 	}
 
-	same, ok := ad.EvaluateAttrBool("same")
-	if !ok || !same {
-		t.Error("Expected list1 =?= list2 to be true")
+	// The reference engine cannot compare lists with =?= / =!=; both are
+	// errors (not structural comparisons).
+	if v := ad.EvaluateAttr("same"); !v.IsError() {
+		t.Errorf("Expected list1 =?= list2 to be error, got %v", v.Type())
 	}
-
-	different, ok := ad.EvaluateAttrBool("different")
-	if !ok || !different {
-		t.Error("Expected list1 =!= list3 to be true")
+	if v := ad.EvaluateAttr("different"); !v.IsError() {
+		t.Errorf("Expected list1 =!= list3 to be error, got %v", v.Type())
 	}
 }
 
