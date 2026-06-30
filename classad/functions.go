@@ -362,8 +362,10 @@ func builtinSize(args []Value) Value {
 	}
 
 	if args[0].IsList() {
-		list, _ := args[0].ListValue()
-		return NewIntValue(int64(len(list)))
+		// Count elements without evaluating them (size({C}) is 1 even when C
+		// would cycle), matching the reference engine, which counts the
+		// unevaluated ExprList.
+		return NewIntValue(int64(args[0].listLen()))
 	}
 
 	return NewErrorValue()

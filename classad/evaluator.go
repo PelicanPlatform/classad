@@ -197,11 +197,20 @@ func (v Value) ListValue() ([]Value, error) {
 		vals := make([]Value, len(v.listExprs))
 		ev := NewEvaluator(v.listScope)
 		for i, e := range v.listExprs {
-			vals[i] = ev.Evaluate(e)
+			vals[i] = evalListElement(ev, e)
 		}
 		return vals, nil
 	}
 	return v.listVal, nil
+}
+
+// evalListElement evaluates a lazy list element, turning a cyclic-reference
+// panic into an error value. Because materialization can happen anywhere
+// (canonical encoding, String, size's siblings), it must not let the
+// cyclicEvalError sentinel escape the recover-protected entry points.
+func evalListElement(ev *Evaluator, e ast.Expr) (result Value) {
+	defer recoverCyclic(&result)
+	return ev.Evaluate(e)
 }
 
 // listLen returns the number of elements in a list value without evaluating
@@ -219,7 +228,7 @@ func (v Value) listLen() int {
 // ensure v is a list and 0 <= i < listLen().
 func (v Value) listElementAt(i int) Value {
 	if v.listExprs != nil {
-		return NewEvaluator(v.listScope).Evaluate(v.listExprs[i])
+		return evalListElement(NewEvaluator(v.listScope), v.listExprs[i])
 	}
 	return v.listVal[i]
 }

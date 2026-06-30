@@ -548,3 +548,27 @@ func TestListProjection(t *testing.T) {
 		}
 	}
 }
+
+// TestSizeCountsWithoutEvaluating guards that size() of a list counts elements
+// without evaluating them, so size({C}) is 1 even when element C would cycle
+// (C = size(A); A = {C}). Previously size materialized the lazy list and the
+// cyclic-reference panic escaped.
+func TestSizeCountsWithoutEvaluating(t *testing.T) {
+	ad, err := Parse(`[ A = {C}; C = size(A) ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	c := ad.EvaluateAttr("C")
+	if i, _ := c.IntValue(); !c.IsInteger() || i != 1 {
+		t.Errorf("C = size(A) = %v, want int(1)", c)
+	}
+	// A must materialize (no panic) to the list {1}.
+	a := ad.EvaluateAttr("A")
+	got, _ := a.ListValue()
+	if !a.IsList() || len(got) != 1 {
+		t.Fatalf("A = %v, want a one-element list", a)
+	}
+	if i, _ := got[0].IntValue(); !got[0].IsInteger() || i != 1 {
+		t.Errorf("A[0] = %v, want int(1)", got[0])
+	}
+}
