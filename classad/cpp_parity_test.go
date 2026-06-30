@@ -854,6 +854,10 @@ func TestListAggregates(t *testing.T) {
 		{`sum({undefined,true})`, "B:true"},
 		{`sum({1,false})`, "I:1"},
 		{`sum({false,true})`, "I:1"},
+		// Integer sums stay exact past float64's 2^53 mantissa (a float64
+		// accumulator would round these large values).
+		{`sum({6481474181450294316})`, "I:6481474181450294316"},
+		{`sum({1, 9193271669532363544})`, "I:9193271669532363545"},
 		{`avg({1,2})`, "R:1.5"},
 		{`avg({undefined,2})`, "R:2"},
 		{`avg({undefined})`, "I:0"},

@@ -1121,7 +1121,11 @@ func builtinSum(args []Value) Value {
 		return NewIntValue(0)
 	}
 
-	var sum float64
+	// Integers accumulate in int64 so an all-integer sum stays exact (a float64
+	// accumulator would lose precision past 2^53); floatSum mirrors every
+	// contribution and is used only once a real element forces a real result.
+	var intSum int64
+	var floatSum float64
 	hasReal := false
 	contributing := 0
 	var single Value
@@ -1137,14 +1141,16 @@ func builtinSum(args []Value) Value {
 			continue
 		case item.IsInteger():
 			val, _ := item.IntValue()
-			sum += float64(val)
+			intSum += val
+			floatSum += float64(val)
 		case item.IsBool():
 			if b, _ := item.BoolValue(); b {
-				sum++
+				intSum++
+				floatSum++
 			}
 		case item.IsReal():
 			val, _ := item.RealValue()
-			sum += val
+			floatSum += val
 			hasReal = true
 		default:
 			return NewErrorValue()
@@ -1154,14 +1160,14 @@ func builtinSum(args []Value) Value {
 	}
 
 	if hasReal {
-		return NewRealValue(sum)
+		return NewRealValue(floatSum)
 	}
 	// A single contributing boolean element keeps its type (the reference only
 	// coerces it to an integer once it is added to another element).
 	if contributing == 1 && single.IsBool() {
 		return single
 	}
-	return NewIntValue(int64(sum))
+	return NewIntValue(intSum)
 }
 
 // builtinAvg computes average of numeric values in a list
