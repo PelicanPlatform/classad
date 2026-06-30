@@ -676,6 +676,7 @@ func TestBuiltinBool(t *testing.T) {
 		expr     string
 		expected bool
 		isError  bool
+		isUndef  bool
 	}{
 		{
 			name:     "string true",
@@ -720,10 +721,12 @@ func TestBuiltinBool(t *testing.T) {
 			expected: false,
 		},
 		{
+			// A non-true/false string is undefined (not error), matching the
+			// reference engine.
 			name:    "invalid string",
 			classad: "[]",
 			expr:    `bool("invalid")`,
-			isError: true,
+			isUndef: true,
 		},
 	}
 
@@ -744,6 +747,12 @@ func TestBuiltinBool(t *testing.T) {
 			if tt.isError {
 				if !val.IsError() {
 					t.Errorf("Expected ERROR, got %v", val)
+				}
+				return
+			}
+			if tt.isUndef {
+				if !val.IsUndefined() {
+					t.Errorf("Expected UNDEFINED, got %v", val)
 				}
 				return
 			}

@@ -879,16 +879,17 @@ func builtinBool(args []Value) Value {
 		return NewBoolValue(val != 0.0)
 	}
 
-	// String: "true" is true, "false" is false, others are ERROR
+	// String: "true"/"false" (case-insensitive) convert; any other string is
+	// undefined (not error), matching the reference.
 	if args[0].IsString() {
 		str, _ := args[0].StringValue()
-		if str == "true" {
+		if strings.EqualFold(str, "true") {
 			return NewBoolValue(true)
 		}
-		if str == "false" {
+		if strings.EqualFold(str, "false") {
 			return NewBoolValue(false)
 		}
-		return NewErrorValue()
+		return NewUndefinedValue()
 	}
 
 	return NewErrorValue()

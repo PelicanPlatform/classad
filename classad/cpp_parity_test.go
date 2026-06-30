@@ -111,6 +111,11 @@ func TestCppParity(t *testing.T) {
 		{`split(undefined)`, "E"},
 		{`string(undefined)`, "U"},
 		{`bool(undefined)`, "U"},
+		{`bool("TRUE")`, "B:true"},
+		{`bool("x")`, "U"},
+		// case-insensitive >= on strings (regression guard for all 4 orderings)
+		{`"Hello" >= "a"`, "B:true"},
+		{`"Hello World" >= "a,b,c"`, "B:true"},
 		{`strcmp(undefined, "a")`, "U"},
 
 		// toUpper/toLower/strcmp/stricmp coerce non-string scalars to string.
