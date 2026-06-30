@@ -154,11 +154,11 @@ the sink unparse format, and removing the non-reference `length()`.
 
 The bucketed `cafuzz` survey, plus a harness-bug fix and the list refactor
 (below), drove the semantic-divergence rate over random generated ads
-(`-ignore-parse`) to **0 in 240,000**. Coverage-guided mutation (`go test
--fuzz`) then found further operator/function gaps the generator does not emit,
-which were also fixed (bitwise operators, case-insensitive function names,
-`substr` negative/out-of-range offsets, duplicate attribute names, and cyclic
-references — see the `classad:` commits).
+(`-ignore-parse`) to **0 in 240,000** *for the generator as it stood then*.
+Coverage-guided mutation (`go test -fuzz`) then found further operator/function
+gaps the generator does not emit, which were also fixed (bitwise operators,
+case-insensitive function names, `substr` negative/out-of-range offsets,
+duplicate attribute names, and cyclic references — see the `classad:` commits).
 
 A second, deeper round of coverage-guided mutation drove out a family of
 *lazy-evaluation* and *parsing* divergences (all with regression tests in
@@ -217,6 +217,46 @@ values carry their source element expressions ([`classad/evaluator.go`](../class
 the parser preserves explicit parentheses, and a reference-faithful expression
 unparser ([`classad/unparse.go`](../classad/unparse.go), a port of `sink.cpp`)
 renders them. Value semantics still use the eagerly-evaluated elements.
+
+#### The extension-function round
+
+The earlier "0 in 240,000" was reached with a generator that did not exercise
+HTCondor's *extension* functions (`split`, `stringList*`, `join`,
+`versioncmp`/`version_in_range`, `interval`, …) or hex/`inf`/`nan` string
+literals. Two changes opened that surface:
+
+- The shim now calls `ClassAdReconfig()` (linking `libcondor_utils`) so
+  libclassad registers HTCondor's extension functions; without it the reference
+  lacked them and produced *false* divergences ([`oracle/cgo/shim.cc`](oracle/cgo/shim.cc)).
+- The generator's alphabet and builtin lists were widened (hex/`inf`/`nan`
+  strings, ~57 builtins) ([`gen/gen.go`](gen/gen.go)).
+
+That surfaced ~1,900 real divergences, all since fixed and regression-tested in
+`cpp_parity_test.go`:
+
+- **`split`** splits on commas *and* whitespace, with hard (non-whitespace)
+  delimiters producing empty fields (`split("a,,b")` is `{"a","","b"}`).
+- **`stringList*`** tokenize on comma + space (not comma alone), drop empty
+  tokens, and take a *delimiter* set as their optional trailing argument;
+  `stringListMember`/`stringListIMember`'s third argument is that delimiter, not
+  a case option (case is fixed by the function name).
+- **`join`** coerces its separator/items to strings, skips undefined items, and
+  is undefined (not `""`) when no items contribute and the separator is undefined.
+- **`versioncmp`** is a faithful port of `natural_cmp.cpp` (strverscmp-style,
+  including its leading/trailing-zero handling).
+- **`interval`** truncates to a signed 32-bit second count and formats a
+  negative magnitude with a leading `-`.
+- **`sum`/`avg`/`min`/`max`** skip undefined elements, coerce booleans to
+  numbers, preserve a *lone* boolean element's type, and accumulate integer sums
+  in `int64` so they stay exact past 2^53.
+
+This drove the rate back to **0 divergences across 360,000** generated ads
+(12 seeds × 30k, `-ignore-parse`). The one residual — a whitespace-only string
+treated as a non-empty list by `stringListSubsetMatch` — is an internal
+libclassad inconsistency that the Go engine now mirrors for parity; its
+reference value is pinned by `TestCppQuirks` in
+[`oracle/cgo/quirks_test.go`](oracle/cgo/quirks_test.go) so a future libclassad
+change is caught (see [`CPP_QUIRKS.md`](CPP_QUIRKS.md)).
 
 ### Known remaining divergences
 

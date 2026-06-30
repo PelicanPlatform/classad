@@ -673,7 +673,8 @@ ad, _ := classad.Parse(`[
 - `size(string_or_list)` - Returns length of string or list
 - `toLower(string)` / `tolower(string)` - Converts to lowercase
 - `toUpper(string)` / `toupper(string)` - Converts to uppercase
-- `stringListMember(string, string_list[, options])` - Tests if string is in comma-separated list
+- `stringListMember(string, string_list[, delimiter])` - Tests if string is in a delimited list (default delimiters: comma and space; case-sensitive)
+- `stringListIMember(string, string_list[, delimiter])` - Case-insensitive variant of `stringListMember`
 - `regexp(pattern, target[, options])` - Tests if target matches regular expression pattern
 
 ```go
@@ -688,7 +689,7 @@ ad, _ := classad.Parse(`[
     colors = "red,green,blue";
     hasRed = stringListMember("red", colors);           // true
     hasYellow = stringListMember("yellow", colors);     // false
-    hasGreen = stringListMember("GREEN", colors, "i");  // true (case-insensitive)
+    hasGreen = stringListIMember("GREEN", colors);      // true (case-insensitive)
 
     // Regular expression matching
     email = "user@example.com";
@@ -709,8 +710,10 @@ ad, _ := classad.Parse(`[
 // caseMatch = true
 ```
 
-**stringListMember options:**
-- `"i"` or `"icase"` - Case-insensitive comparison
+**stringList delimiters:**
+- The optional trailing argument to `stringListMember`/`stringListIMember` is the
+  set of delimiter characters (default: comma and space), not a case option. Use
+  `stringListIMember` for case-insensitive matching.
 
 **regexp options:**
 - `"i"` - Case-insensitive matching
