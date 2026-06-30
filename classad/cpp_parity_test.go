@@ -151,6 +151,15 @@ func TestCppParity(t *testing.T) {
 		{`substr(error, undefined, 1)`, "U"},
 		{`substr(error, error, undefined)`, "U"},
 
+		// Division by zero: integer divisor errors; for a real divisor only a
+		// +Inf result is an error, while -Inf and NaN are real values.
+		{`1 / 0`, "E"},
+		{`1 / 0.0`, "E"},
+		{`1.0 / 0.0`, "E"},
+		{`-1.0 / 0.0`, "R:-Inf"},
+		{`0.0 / 0.0`, "R:NaN"},
+		{`5.0 / 2.0`, "R:2.5"},
+
 		// string()/strcat() scalar coercion; reals use %.15E (0 -> "0.0").
 		{`string(1.5)`, "S:1.500000000000000E+00"},
 		{`string(0.0)`, "S:0.0"},

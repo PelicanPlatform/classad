@@ -581,6 +581,17 @@ func numericOperand(v Value) (isNum, isInt bool, iv int64, rv float64) {
 	}
 }
 
+// realArithResult mirrors the reference engine's doRealArithmetic result check:
+// a result of +Inf (HUGE_VAL) is an error, while -Inf and NaN are returned as
+// ordinary real values. (1.0/0.0 is error, but -1.0/0.0 is -INF and 0.0/0.0 is
+// NaN.)
+func realArithResult(comp float64) Value {
+	if math.IsInf(comp, 1) {
+		return NewErrorValue()
+	}
+	return NewRealValue(comp)
+}
+
 func (e *Evaluator) evaluateAdd(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
@@ -593,7 +604,7 @@ func (e *Evaluator) evaluateAdd(left, right Value) Value {
 	if li && ri {
 		return NewIntValue(liv + riv)
 	}
-	return NewRealValue(lrv + rrv)
+	return realArithResult(lrv + rrv)
 }
 
 func (e *Evaluator) evaluateSubtract(left, right Value) Value {
@@ -608,7 +619,7 @@ func (e *Evaluator) evaluateSubtract(left, right Value) Value {
 	if li && ri {
 		return NewIntValue(liv - riv)
 	}
-	return NewRealValue(lrv - rrv)
+	return realArithResult(lrv - rrv)
 }
 
 func (e *Evaluator) evaluateMultiply(left, right Value) Value {
@@ -623,7 +634,7 @@ func (e *Evaluator) evaluateMultiply(left, right Value) Value {
 	if li && ri {
 		return NewIntValue(liv * riv)
 	}
-	return NewRealValue(lrv * rrv)
+	return realArithResult(lrv * rrv)
 }
 
 func (e *Evaluator) evaluateDivide(left, right Value) Value {
@@ -635,22 +646,24 @@ func (e *Evaluator) evaluateDivide(left, right Value) Value {
 	if !ln || !rn {
 		return NewErrorValue()
 	}
-	if rrv == 0 {
-		return NewErrorValue()
-	}
 
 	if li && ri {
 		// Integer / integer yields an integer (truncated toward zero), matching
-		// the C++ reference engine. Guard the one signed-overflow case
-		// (MinInt64 / -1) that would panic in Go; libclassad yields MaxInt64
-		// there, so mirror that.
+		// the C++ reference engine; integer division by zero is an error. Guard
+		// the one signed-overflow case (MinInt64 / -1) that would panic in Go;
+		// libclassad yields MaxInt64 there, so mirror that.
+		if riv == 0 {
+			return NewErrorValue()
+		}
 		if liv == math.MinInt64 && riv == -1 {
 			return NewIntValue(math.MaxInt64)
 		}
 		return NewIntValue(liv / riv)
 	}
 
-	return NewRealValue(lrv / rrv)
+	// Real division: division by zero produces +Inf/-Inf/NaN; only +Inf is an
+	// error (handled by realArithResult), so -1.0/0.0 is -INF and 0.0/0.0 NaN.
+	return realArithResult(lrv / rrv)
 }
 
 func (e *Evaluator) evaluateModulo(left, right Value) Value {
