@@ -728,13 +728,19 @@ func TestProjectionCyclePropagates(t *testing.T) {
 	}
 }
 
-// TestCyclicFunctionArgIsErrorValue guards that a cyclic function argument
-// becomes an error value (rather than aborting the call), so the function's own
-// undefined/error precedence applies: strcat(undefined, A2) with a cyclic A2 is
-// undefined (first-argument-undefined wins), while strcat(A2, "x") is error.
-func TestCyclicFunctionArgIsErrorValue(t *testing.T) {
+// TestCyclicFunctionArg guards how a cyclic function argument behaves. A cyclic
+// argument that is actually evaluated propagates (the call is error), but strcat
+// short-circuits at the first undefined argument and never reaches a later
+// cyclic one:
+//   - strcat(undefined, A2) with a cyclic A2 is undefined (A2 not evaluated).
+//   - strcmp(undefined, A2) evaluates both args, so the cyclic A2 makes it error.
+//   - strcat(A2, "x") evaluates the cyclic A2 first, so it is error.
+func TestCyclicFunctionArg(t *testing.T) {
 	if ad, _ := Parse(`[ A2 = strcat(A, A2); A = undefined ]`); !ad.EvaluateAttr("A2").IsUndefined() {
-		t.Errorf("strcat(undefined, cyclic) should be undefined, got %v", ad.EvaluateAttr("A2"))
+		t.Errorf("strcat(undefined, cyclic) should be undefined (short-circuit), got %v", ad.EvaluateAttr("A2"))
+	}
+	if ad, _ := Parse(`[ A2 = strcmp(A, A2); A = undefined ]`); !ad.EvaluateAttr("A2").IsError() {
+		t.Errorf("strcmp(undefined, cyclic) should be error (cycle propagates), got %v", ad.EvaluateAttr("A2"))
 	}
 	if ad, _ := Parse(`[ A0 = strcat(A0, "x") ]`); !ad.EvaluateAttr("A0").IsError() {
 		t.Errorf("strcat(cyclic, \"x\") should be error")

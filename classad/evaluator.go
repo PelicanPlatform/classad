@@ -204,14 +204,11 @@ func (v Value) ListValue() ([]Value, error) {
 	return v.listVal, nil
 }
 
-// evalRecoveringCyclic evaluates an expression, turning a cyclic-reference panic
-// into an error value rather than letting it propagate. It is used where the
-// reference engine localizes a cyclic sub-evaluation to an error *value* that
-// the surrounding construct then handles -- a lazy list element (materialization
-// can also happen outside the recover-protected entry points: canonical
-// encoding, String) and a function argument (so e.g. strcat(undefined, A2) with
-// a cyclic A2 is undefined: the cyclic argument becomes error and strcat's
-// first-argument precedence wins, rather than the cycle aborting the call).
+// evalRecoveringCyclic evaluates a lazy list element, turning a cyclic-reference
+// panic into an error value rather than letting it escape. A lazy list can be
+// materialized outside the recover-protected entry points (canonical encoding,
+// String), so the sentinel must not propagate there; a cyclic element becomes
+// that element's error value (the list survives), matching the reference engine.
 func evalRecoveringCyclic(ev *Evaluator, e ast.Expr) (result Value) {
 	defer recoverCyclic(&result)
 	return ev.Evaluate(e)
@@ -1446,6 +1443,27 @@ var functionArity = map[string]funcArity{
 	"replaceall": {3, 4},
 }
 
+// evaluateStrcat implements strcat with the reference engine's short-circuit:
+// arguments are evaluated left-to-right and evaluation stops at the first
+// undefined or error one, so a later cyclic argument is never reached --
+// strcat(undefined, A2) with a self-referential A2 is undefined, not error.
+// (Lists and ads are concatenable: they stringify via unparse, so strcat does
+// not stop on them.) The collected prefix (through the first undefined/error
+// value) is handed to builtinStrcat, whose flag logic would have stopped at the
+// same point. A cyclic argument reached before any stop still propagates (its
+// Evaluate panics) and fails the call.
+func (e *Evaluator) evaluateStrcat(argExprs []ast.Expr) Value {
+	args := make([]Value, 0, len(argExprs))
+	for _, ax := range argExprs {
+		v := e.Evaluate(ax)
+		args = append(args, v)
+		if v.IsUndefined() || v.IsError() {
+			break // strcat stops at the first undefined/error argument
+		}
+	}
+	return builtinStrcat(args)
+}
+
 // Built-in function evaluation
 func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// Function names are matched case-insensitively, like the reference engine
@@ -1479,13 +1497,19 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return NewErrorValue()
 	}
 
-	// Evaluate all arguments. A cyclic argument becomes an error value (rather
-	// than aborting the call) so the function's own undefined/error precedence
-	// applies, matching the reference engine: strcat(undefined, A2) with a
-	// cyclic A2 is undefined (first-argument-undefined wins), not error.
+	// strcat evaluates its arguments left-to-right and stops at the first one it
+	// cannot concatenate (undefined/error/list/ad), so a later cyclic argument
+	// is never reached: strcat(undefined, A2) with a cyclic A2 is undefined.
+	if funcName == "strcat" {
+		return e.evaluateStrcat(fc.Args)
+	}
+
+	// Evaluate all arguments. A cyclic argument propagates (the reference
+	// engine's argument Evaluate returns false on a cycle, failing the call):
+	// strcmp(undefined, A2) with a cyclic A2 is error, not undefined.
 	args := make([]Value, len(fc.Args))
 	for i, arg := range fc.Args {
-		args[i] = evalRecoveringCyclic(e, arg)
+		args[i] = e.Evaluate(arg)
 	}
 
 	// Dispatch to the appropriate function (funcName is already lower-cased)
