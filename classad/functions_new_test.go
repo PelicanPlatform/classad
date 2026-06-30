@@ -610,10 +610,11 @@ func TestBuiltinString(t *testing.T) {
 			expected: "42",
 		},
 		{
+			// The reference engine renders reals in %.15E form.
 			name:     "real to string",
 			classad:  "[]",
 			expr:     "string(3.14)",
-			expected: "3.14",
+			expected: "3.140000000000000E+00",
 		},
 		{
 			name:     "boolean true to string",

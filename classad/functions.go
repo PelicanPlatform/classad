@@ -13,8 +13,47 @@ import (
 // Built-in string functions
 
 // builtinStrcat concatenates strings
+// classadReal renders a real the way the reference engine's string conversion
+// does: exactly 0 prints as "0.0", everything else in %.15E form (e.g.
+// 1.5 -> "1.500000000000000E+00").
+func classadReal(r float64) string {
+	if r == 0 {
+		return "0.0"
+	}
+	return fmt.Sprintf("%.15E", r)
+}
+
+// classadScalarString converts a scalar value to its reference string form,
+// used by string() and strcat(). It reports ok=false for values that are not
+// scalars (lists, classads), which those builtins still reject. Callers handle
+// undefined/error before calling this.
+func classadScalarString(v Value) (string, bool) {
+	switch {
+	case v.IsString():
+		s, _ := v.StringValue()
+		return s, true
+	case v.IsInteger():
+		i, _ := v.IntValue()
+		return fmt.Sprintf("%d", i), true
+	case v.IsBool():
+		b, _ := v.BoolValue()
+		if b {
+			return "true", true
+		}
+		return "false", true
+	case v.IsReal():
+		r, _ := v.RealValue()
+		return classadReal(r), true
+	default:
+		return "", false
+	}
+}
+
 func builtinStrcat(args []Value) Value {
 	var result strings.Builder
+	// Arguments are processed left to right; the first error or undefined wins
+	// (strcat(error, undefined) is error, strcat(undefined, error) is
+	// undefined). Other scalars are coerced to their string form.
 	for _, arg := range args {
 		if arg.IsError() {
 			return NewErrorValue()
@@ -22,10 +61,10 @@ func builtinStrcat(args []Value) Value {
 		if arg.IsUndefined() {
 			return NewUndefinedValue()
 		}
-		if !arg.IsString() {
+		str, ok := classadScalarString(arg)
+		if !ok {
 			return NewErrorValue()
 		}
-		str, _ := arg.StringValue()
 		result.WriteString(str)
 	}
 	return NewStringValue(result.String())
@@ -598,24 +637,10 @@ func builtinString(args []Value) Value {
 		return NewUndefinedValue()
 	}
 
-	// Convert based on type
-	if args[0].IsString() {
-		return args[0]
-	}
-	if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		return NewStringValue(fmt.Sprintf("%d", val))
-	}
-	if args[0].IsReal() {
-		val, _ := args[0].RealValue()
-		return NewStringValue(fmt.Sprintf("%g", val))
-	}
-	if args[0].IsBool() {
-		val, _ := args[0].BoolValue()
-		if val {
-			return NewStringValue("true")
-		}
-		return NewStringValue("false")
+	// Convert scalars to their reference string form (reals use %.15E, e.g.
+	// 1.5 -> "1.500000000000000E+00"). Lists/classads are not handled here.
+	if s, ok := classadScalarString(args[0]); ok {
+		return NewStringValue(s)
 	}
 
 	return NewErrorValue()
