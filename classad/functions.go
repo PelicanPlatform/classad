@@ -1123,6 +1123,8 @@ func builtinSum(args []Value) Value {
 
 	var sum float64
 	hasReal := false
+	contributing := 0
+	var single Value
 
 	for _, item := range list {
 		if item.IsError() {
@@ -1147,10 +1149,17 @@ func builtinSum(args []Value) Value {
 		default:
 			return NewErrorValue()
 		}
+		contributing++
+		single = item
 	}
 
 	if hasReal {
 		return NewRealValue(sum)
+	}
+	// A single contributing boolean element keeps its type (the reference only
+	// coerces it to an integer once it is added to another element).
+	if contributing == 1 && single.IsBool() {
+		return single
 	}
 	return NewIntValue(int64(sum))
 }

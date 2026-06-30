@@ -847,6 +847,13 @@ func TestListAggregates(t *testing.T) {
 		{`sum({1,undefined})`, "I:1"},
 		{`sum({undefined})`, "I:0"},
 		{`sum({})`, "I:0"},
+		// A single contributing boolean element keeps its type (coercion to int
+		// only happens once it is added to another element).
+		{`sum({false})`, "B:false"},
+		{`sum({true})`, "B:true"},
+		{`sum({undefined,true})`, "B:true"},
+		{`sum({1,false})`, "I:1"},
+		{`sum({false,true})`, "I:1"},
 		{`avg({1,2})`, "R:1.5"},
 		{`avg({undefined,2})`, "R:2"},
 		{`avg({undefined})`, "I:0"},
