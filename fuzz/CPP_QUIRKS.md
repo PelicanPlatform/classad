@@ -125,6 +125,25 @@ So `versionGT`/`versionGE`/`versionLT`/`versionLE`/`versionEQ` work, but only wi
 that capitalization — inconsistent with every other builtin. (`version_in_range`
 and `versioncmp` are the lowercase-friendly ones.)
 
+## 7. `stringListSubsetMatch` treats a whitespace-only list as non-empty — inconsistent with `stringListSize`
+
+A whitespace-only string tokenizes to *zero* elements according to
+`stringListSize`, but `stringListSubsetMatch` behaves as though it contains a
+(non-matching) element, so the empty-subset shortcut does not apply:
+
+```
+classad_eval -quiet '[ a = stringListSize(" ") ]' a                    # 0  (empty list)
+classad_eval -quiet '[ a = stringListSubsetMatch("", "a") ]' a         # true  (empty subset)
+classad_eval -quiet '[ a = stringListSubsetMatch(" ", "a") ]' a        # false (!!)  -- " " acts non-empty
+```
+
+Since `" "` and `""` both have size 0, the empty list `" "` ought to be a subset
+of `{ "a" }` just like `""` is. The reference disagrees only for the
+whitespace-only (but non-empty) string. This is internally inconsistent in
+libclassad (`size` says 0, `subsetMatch` iterates as if 1), so the Go engine
+deliberately does **not** mirror it — `stringListSubsetMatch(" ", "a")` is
+`true` in Go.
+
 ## Observed (reasonable) semantics, recorded for completeness
 
 These are not bugs, but were non-obvious and are now matched by the Go engine:
