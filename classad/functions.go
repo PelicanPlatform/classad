@@ -6,9 +6,59 @@ import (
 	"math"
 	"math/rand"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// parseLeadingFloat mimics C strtod, which int()/real() use to convert a
+// string: skip leading whitespace, then parse the longest valid
+// floating-point prefix (so "5abc" yields 5 and " 5 " yields 5). It reports
+// ok=false only when no numeric characters are consumed ("abc", ""). Hex
+// floats and inf/nan spellings are not handled (the reference accepts "0x10"
+// via strtod; that case is rare and left unmatched).
+func parseLeadingFloat(s string) (float64, bool) {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '\v' || s[i] == '\f') {
+		i++
+	}
+	start := i
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	digits := false
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+		digits = true
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+			digits = true
+		}
+	}
+	if digits && i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		j := i + 1
+		if j < len(s) && (s[j] == '+' || s[j] == '-') {
+			j++
+		}
+		if j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			i = j
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+		}
+	}
+	if !digits {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s[start:i], 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}
 
 // Built-in string functions
 
@@ -419,6 +469,17 @@ func builtinInt(args []Value) Value {
 		return NewIntValue(0)
 	}
 
+	// A string is parsed as a number (via strtod) and truncated toward zero,
+	// matching the reference: int("1.9") == 1, int("-3.7") == -3, int("abc")
+	// is an error.
+	if args[0].IsString() {
+		s, _ := args[0].StringValue()
+		if f, ok := parseLeadingFloat(s); ok {
+			return NewIntValue(int64(f))
+		}
+		return NewErrorValue()
+	}
+
 	return NewErrorValue()
 }
 
@@ -451,6 +512,16 @@ func builtinReal(args []Value) Value {
 			return NewRealValue(1)
 		}
 		return NewRealValue(0)
+	}
+
+	// A string is parsed as a real (via strtod): real("3.14") == 3.14,
+	// real("x") is an error.
+	if args[0].IsString() {
+		s, _ := args[0].StringValue()
+		if f, ok := parseLeadingFloat(s); ok {
+			return NewRealValue(f)
+		}
+		return NewErrorValue()
 	}
 
 	return NewErrorValue()

@@ -138,6 +138,17 @@ func TestCppParity(t *testing.T) {
 		{`real(false)`, "R:0"},
 		{`int(true)`, "I:1"},
 
+		// int()/real() parse string arguments via strtod.
+		{`int("42")`, "I:42"},
+		{`int("1.9")`, "I:1"},
+		{`int("-3.7")`, "I:-3"},
+		{`int(" 5 ")`, "I:5"},
+		{`int("1e-10")`, "I:0"},
+		{`int("abc")`, "E"},
+		{`int("")`, "E"},
+		{`real("3.14")`, "R:3.14"},
+		{`real("x")`, "E"},
+
 		// quantize: bool coercion, zero base returns the arg unchanged
 		// (type preserved), integer ceil-division, and list bases.
 		{`quantize(true, false)`, "B:true"},
