@@ -1256,6 +1256,7 @@ func builtinMin(args []Value) Value {
 	var minItem Value
 	hasValue := false
 	hasReal := false
+	contributing := 0
 
 	for _, item := range list {
 		if item.IsError() {
@@ -1280,6 +1281,7 @@ func builtinMin(args []Value) Value {
 			return NewErrorValue()
 		}
 
+		contributing++
 		if !hasValue || val < minVal {
 			minVal = val
 			minItem = item
@@ -1294,9 +1296,10 @@ func builtinMin(args []Value) Value {
 	if hasReal {
 		return NewRealValue(minVal)
 	}
-	// minItem is returned to preserve exact int64 precision, but a boolean
-	// element must coerce to its numeric value (true->1, false->0).
-	if minItem.IsBool() {
+	// minItem is returned to preserve exact int64 precision. The reference only
+	// coerces a boolean extremum to an integer once a comparison happens (two
+	// or more contributing elements); a lone boolean element keeps its type.
+	if contributing >= 2 && minItem.IsBool() {
 		return NewIntValue(int64(minVal))
 	}
 	return minItem
@@ -1333,6 +1336,7 @@ func builtinMax(args []Value) Value {
 	var maxItem Value
 	hasValue := false
 	hasReal := false
+	contributing := 0
 
 	for _, item := range list {
 		if item.IsError() {
@@ -1357,6 +1361,7 @@ func builtinMax(args []Value) Value {
 			return NewErrorValue()
 		}
 
+		contributing++
 		if !hasValue || val > maxVal {
 			maxVal = val
 			maxItem = item
@@ -1371,9 +1376,10 @@ func builtinMax(args []Value) Value {
 	if hasReal {
 		return NewRealValue(maxVal)
 	}
-	// maxItem is returned to preserve exact int64 precision, but a boolean
-	// element must coerce to its numeric value (true->1, false->0).
-	if maxItem.IsBool() {
+	// maxItem is returned to preserve exact int64 precision. The reference only
+	// coerces a boolean extremum to an integer once a comparison happens (two
+	// or more contributing elements); a lone boolean element keeps its type.
+	if contributing >= 2 && maxItem.IsBool() {
 		return NewIntValue(int64(maxVal))
 	}
 	return maxItem
@@ -1673,8 +1679,18 @@ func versionCompare(left, right string) int {
 		}
 	}
 
-	// One string is a prefix of the other
-	return len(left) - len(right)
+	// One string is a prefix of the other: the reference's natural compare
+	// returns the difference of the first unmatched bytes, treating the end of
+	// a string as a 0 byte (so "abc" vs "" yields 'a', and "1.2" vs "1" yields
+	// '.'), rather than the difference in lengths.
+	var lc, rc int
+	if i < len(left) {
+		lc = int(left[i])
+	}
+	if j < len(right) {
+		rc = int(right[j])
+	}
+	return lc - rc
 }
 
 // builtinVersioncmp compares version strings
@@ -1877,6 +1893,15 @@ func builtinInterval(args []Value) Value {
 	// truncated results rather than overflowing differently).
 	seconds = int64(int32(seconds))
 
+	// The reference formats the magnitude into d+HH:MM:SS and prepends a "-"
+	// for negative intervals (so interval(-1) is "-1", not a malformed
+	// breakdown of a negative remainder).
+	sign := ""
+	if seconds < 0 {
+		sign = "-"
+		seconds = -seconds
+	}
+
 	days := seconds / 86400
 	seconds %= 86400
 	hours := seconds / 3600
@@ -1885,16 +1910,16 @@ func builtinInterval(args []Value) Value {
 	seconds %= 60
 
 	if days > 0 {
-		return NewStringValue(fmt.Sprintf("%d+%02d:%02d:%02d", days, hours, minutes, seconds))
+		return NewStringValue(fmt.Sprintf("%s%d+%02d:%02d:%02d", sign, days, hours, minutes, seconds))
 	}
 	if hours > 0 {
-		return NewStringValue(fmt.Sprintf("%d:%02d:%02d", hours, minutes, seconds))
+		return NewStringValue(fmt.Sprintf("%s%d:%02d:%02d", sign, hours, minutes, seconds))
 	}
 	if minutes > 0 {
-		return NewStringValue(fmt.Sprintf("%d:%02d", minutes, seconds))
+		return NewStringValue(fmt.Sprintf("%s%d:%02d", sign, minutes, seconds))
 	}
-	// Under a minute (including zero and small negatives) is just the seconds.
-	return NewStringValue(fmt.Sprintf("%d", seconds))
+	// Under a minute (including zero) is just the seconds.
+	return NewStringValue(fmt.Sprintf("%s%d", sign, seconds))
 }
 
 // builtinIdenticalMember checks if m is in list using =?= (strict identity)

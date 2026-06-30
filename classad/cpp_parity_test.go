@@ -857,6 +857,13 @@ func TestListAggregates(t *testing.T) {
 		{`min({undefined})`, "U"},
 		{`max({true,2})`, "I:2"},
 		{`max({undefined})`, "U"},
+		// A lone boolean element keeps its type; coercion to int only happens
+		// once a comparison occurs (two or more contributing elements).
+		{`max({false})`, "B:false"},
+		{`max({true})`, "B:true"},
+		{`min({false})`, "B:false"},
+		{`max({undefined,false})`, "B:false"},
+		{`min({false,2})`, "I:0"},
 	}
 	for _, tc := range cases {
 		ad, err := Parse("[ x = " + tc.expr + " ]")
@@ -880,6 +887,10 @@ func TestIntervalOverflow(t *testing.T) {
 		{`interval(10000000000)`, "S:16320+04:50:08"},
 		{`interval("inf")`, "S:-1"},
 		{`interval(45)`, "S:45"},
+		// Negative intervals (after 32-bit truncation) format the magnitude
+		// with a leading "-", not a malformed negative-remainder breakdown.
+		{`interval(5027817586528867761)`, "S:-7667+05:31:59"},
+		{`interval(2147483648)`, "S:-24855+03:14:08"},
 	}
 	for _, tc := range cases {
 		ad, err := Parse("[ x = " + tc.expr + " ]")
@@ -978,6 +989,32 @@ func TestVersionInRange(t *testing.T) {
 		{`version_in_range(1, 2, undefined)`, "U"},
 		{`version_gt("2.0", "1.0")`, "E"},
 		{`version_eq("1", "1")`, "E"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}
+
+// TestVersioncmpPrefix guards versioncmp's natural-compare tail: when one
+// operand is a prefix of the other, the reference returns the difference of
+// the first unmatched bytes (treating end-of-string as a 0 byte), not the
+// difference in lengths.
+func TestVersioncmpPrefix(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`versioncmp("abc", "")`, "I:97"},   // 'a'
+		{`versioncmp("", "abc")`, "I:-97"},  // -'a'
+		{`versioncmp("1.2", "1")`, "I:46"},  // '.'
+		{`versioncmp("a", "ab")`, "I:-98"},  // -'b'
+		{`versioncmp("abc", "abc")`, "I:0"}, // equal
 	}
 	for _, tc := range cases {
 		ad, err := Parse("[ x = " + tc.expr + " ]")
