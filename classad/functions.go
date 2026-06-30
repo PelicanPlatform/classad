@@ -1367,115 +1367,67 @@ func builtinJoin(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// join(list) - no separator
-	if len(args) == 1 {
-		if args[0].IsError() {
+	// 1- or 2-argument form whose last argument is a list: expand the list into
+	// the items to join, with the separator being arg0 (2-arg) or "" (1-arg).
+	// This mirrors the reference engine's strCat join special case.
+	if len(args) <= 2 {
+		last := args[len(args)-1]
+		if last.IsError() {
 			return NewErrorValue()
 		}
-		// join propagates undefined (matching the reference).
-		if args[0].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[0].IsList() {
-			return NewErrorValue()
-		}
-
-		list, _ := args[0].ListValue()
-		var result strings.Builder
-		for _, item := range list {
-			if item.IsUndefined() {
-				continue
+		if last.IsList() {
+			items, _ := last.ListValue()
+			var sep Value
+			if len(args) == 2 {
+				sep = args[0]
+			} else {
+				sep = NewStringValue("")
 			}
-			if item.IsString() {
-				str, _ := item.StringValue()
-				result.WriteString(str)
-			} else if item.IsInteger() {
-				val, _ := item.IntValue()
-				result.WriteString(fmt.Sprintf("%d", val))
-			} else if item.IsReal() {
-				val, _ := item.RealValue()
-				result.WriteString(fmt.Sprintf("%g", val))
-			} else if item.IsBool() {
-				val, _ := item.BoolValue()
-				if val {
-					result.WriteString("true")
-				} else {
-					result.WriteString("false")
-				}
-			}
+			args = append([]Value{sep}, items...)
 		}
-		return NewStringValue(result.String())
 	}
 
-	// Get separator
-	if !args[0].IsString() {
+	// args[0] is the separator; args[1:] are the items. Matching the reference
+	// (strCat with the join flag): an error separator/item is an error, an
+	// undefined separator acts as the empty string, undefined items are skipped
+	// (join keeps going), a non-coercible item (list/ad) is an error, and if
+	// every item is undefined (none defined) the result is undefined.
+	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	sep, _ := args[0].StringValue()
-
-	// Two-argument form: join(separator, list)
-	if len(args) == 2 && args[1].IsList() {
-		if args[1].IsError() {
+	sep := ""
+	if !args[0].IsUndefined() {
+		s, ok := classadScalarString(args[0])
+		if !ok {
 			return NewErrorValue()
 		}
-
-		list, _ := args[1].ListValue()
-		var parts []string
-		for _, item := range list {
-			if item.IsUndefined() {
-				continue
-			}
-			if item.IsString() {
-				str, _ := item.StringValue()
-				parts = append(parts, str)
-			} else if item.IsInteger() {
-				val, _ := item.IntValue()
-				parts = append(parts, fmt.Sprintf("%d", val))
-			} else if item.IsReal() {
-				val, _ := item.RealValue()
-				parts = append(parts, fmt.Sprintf("%g", val))
-			} else if item.IsBool() {
-				val, _ := item.BoolValue()
-				if val {
-					parts = append(parts, "true")
-				} else {
-					parts = append(parts, "false")
-				}
-			}
-		}
-		return NewStringValue(strings.Join(parts, sep))
+		sep = s
 	}
 
-	// join(sep, arg1, arg2, ...)
-	var parts []string
-	for i := 1; i < len(args); i++ {
-		if args[i].IsError() {
+	var buf strings.Builder
+	undefFlag, defFlag := false, false
+	for _, item := range args[1:] {
+		if item.IsError() {
 			return NewErrorValue()
 		}
-		if args[i].IsUndefined() {
+		if item.IsUndefined() {
+			undefFlag = true
 			continue
 		}
-
-		if args[i].IsString() {
-			str, _ := args[i].StringValue()
-			parts = append(parts, str)
-		} else if args[i].IsInteger() {
-			val, _ := args[i].IntValue()
-			parts = append(parts, fmt.Sprintf("%d", val))
-		} else if args[i].IsReal() {
-			val, _ := args[i].RealValue()
-			parts = append(parts, fmt.Sprintf("%g", val))
-		} else if args[i].IsBool() {
-			val, _ := args[i].BoolValue()
-			if val {
-				parts = append(parts, "true")
-			} else {
-				parts = append(parts, "false")
-			}
+		s, ok := classadScalarString(item)
+		if !ok {
+			return NewErrorValue()
 		}
+		if defFlag {
+			buf.WriteString(sep)
+		}
+		buf.WriteString(s)
+		defFlag = true
 	}
-
-	return NewStringValue(strings.Join(parts, sep))
+	if undefFlag && !defFlag {
+		return NewUndefinedValue()
+	}
+	return NewStringValue(buf.String())
 }
 
 // builtinSplit splits a string into a list

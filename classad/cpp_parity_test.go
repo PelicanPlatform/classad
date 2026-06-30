@@ -928,3 +928,36 @@ func TestVersionInRange(t *testing.T) {
 		}
 	}
 }
+
+// TestJoin guards join's reference (strCat join-path) semantics: the separator
+// and items coerce to strings (numbers/bools too); undefined items are skipped;
+// an all-undefined item set yields undefined; an undefined separator acts as
+// "" ; an error argument is an error; and the 1-/2-argument list form expands
+// the list.
+func TestJoin(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`join(",", {"x","y"})`, "S:x,y"},
+		{`join("-", "a", "b", "c")`, "S:a-b-c"},
+		{`join(5, "x", "y")`, "S:x5y"},
+		{`join(",", undefined)`, "U"},
+		{`join(-1, undefined)`, "U"},
+		{`join(",", "a", undefined, "b")`, "S:a,b"},
+		{`join(",")`, "S:"},
+		{`join(undefined, "a")`, "S:a"},
+		{`join(",", error)`, "E"},
+		{`join(",", 1, 2)`, "S:1,2"},
+		{`join({"a","b"})`, "S:ab"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}

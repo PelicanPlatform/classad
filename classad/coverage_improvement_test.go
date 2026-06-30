@@ -564,13 +564,14 @@ func TestBuiltinJoinEdgeCases(t *testing.T) {
 		t.Fatal("Expected string result")
 	}
 
-	// Test with non-string separator
+	// A numeric separator is coerced to its string form (matching the reference
+	// engine), not an error: join(123, {"a","b","c"}) is "a123b123c".
 	InsertAttrList(ad, "list", []string{"a", "b", "c"})
 	expr3, _ := ParseExpr("join(123, list)")
 	result3 := expr3.Eval(ad)
 
-	if !result3.IsError() {
-		t.Error("Expected error for non-string separator")
+	if s, _ := result3.StringValue(); !result3.IsString() || s != "a123b123c" {
+		t.Errorf("join(123, list) = %v %q, want \"a123b123c\"", result3.Type(), s)
 	}
 }
 

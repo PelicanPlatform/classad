@@ -17,8 +17,10 @@ func TestJoinVariants(t *testing.T) {
 		t.Fatalf("expected error for empty join, got %v", val.Type())
 	}
 
+	// Undefined items are skipped; numbers/bools coerce to their reference
+	// string form (a real uses %.15E, matching the reference engine).
 	noSep := evalBuiltin(t, `join({"a", undefined, 2, true, 1.5})`)
-	if s, _ := noSep.StringValue(); s != "a2true1.5" {
+	if s, _ := noSep.StringValue(); s != "a2true1.500000000000000E+00" {
 		t.Fatalf("unexpected join(list) result: %q", s)
 	}
 
@@ -32,8 +34,10 @@ func TestJoinVariants(t *testing.T) {
 		t.Fatalf("unexpected join variadic result: %q", s)
 	}
 
-	if val := evalBuiltin(t, `join(123, "a")`); !val.IsError() {
-		t.Fatalf("expected error for non-string separator, got %v", val.Type())
+	// A numeric separator coerces to its string form (a single item needs no
+	// separator), matching the reference engine.
+	if val := evalBuiltin(t, `join(123, "a")`); func() bool { s, _ := val.StringValue(); return !val.IsString() || s != "a" }() {
+		t.Fatalf("join(123, \"a\") should be \"a\", got %v", val.Type())
 	}
 }
 
