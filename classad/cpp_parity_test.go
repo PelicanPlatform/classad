@@ -705,3 +705,25 @@ func TestParenthesesPreserved(t *testing.T) {
 		}
 	}
 }
+
+// TestProjectionCyclePropagates guards that a cyclic reference reached through
+// a list projection aborts the whole select to error (not list[error]): with
+// A = {0 % A0} and A0 = A.A, A0 is error while A (a list literal whose element
+// cycles) is list[error]. Projection evaluates the record's elements with cycle
+// propagation, unlike plain list materialization which localizes a cycle.
+func TestProjectionCyclePropagates(t *testing.T) {
+	ad, err := Parse(`[ A0 = ((A.A)); A = {0 % A0} ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if v := ad.EvaluateAttr("A0"); !v.IsError() {
+		t.Errorf("A0 = A.A should be error (projection cycle propagates), got %v", v)
+	}
+	a := ad.EvaluateAttr("A")
+	if !a.IsList() {
+		t.Fatalf("A = %v, want list[error]", a)
+	}
+	if elems, _ := a.ListValue(); len(elems) != 1 || !elems[0].IsError() {
+		t.Errorf("A = %v, want list[error]", a)
+	}
+}

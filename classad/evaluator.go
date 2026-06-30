@@ -616,7 +616,7 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 	// the enclosing scope), {1,2,3}.A is {error,error,error} (a non-ad element
 	// selects to error), and {}.A is the empty list.
 	if recordVal.IsList() {
-		elems, _ := recordVal.ListValue()
+		elems := recordVal.listElementsPropagating()
 		results := make([]Value, len(elems))
 		for i, el := range elems {
 			results[i] = e.selectAttr(el, sel.Attr)
@@ -625,6 +625,25 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 	}
 
 	return e.selectAttr(recordVal, sel.Attr)
+}
+
+// listElementsPropagating evaluates a list value's elements WITHOUT recovering
+// a cyclic-reference panic (unlike ListValue, which localizes a cycle to an
+// error element). Used by list projection so that a cyclic element aborts the
+// whole select to error -- matching the reference engine, where (A.A) with
+// A = {0 % A0} and A0 = A.A is error, not list[error]. The panic propagates to
+// the nearest recover (the enclosing attribute evaluation, or the outermost
+// ListValue if projection happens during a later materialization).
+func (v Value) listElementsPropagating() []Value {
+	if v.listExprs != nil {
+		vals := make([]Value, len(v.listExprs))
+		ev := NewEvaluator(v.listScope)
+		for i, e := range v.listExprs {
+			vals[i] = ev.Evaluate(e)
+		}
+		return vals
+	}
+	return v.listVal
 }
 
 // selectAttr resolves record.attr for an already-evaluated record value (a
