@@ -148,6 +148,11 @@ type BinaryOp struct {
 	Op    string
 	Left  Expr
 	Right Expr
+	// Parenthesized records whether the source wrapped this operation in
+	// explicit parentheses. It does not affect evaluation; it is preserved so
+	// that unparsing reproduces the reference engine's output, which echoes
+	// source parentheses verbatim (it adds none of its own).
+	Parenthesized bool
 }
 
 func (b *BinaryOp) String() string {
@@ -158,8 +163,9 @@ func (b *BinaryOp) exprNode() {}
 
 // UnaryOp represents a unary operation (e.g., -, !, ~).
 type UnaryOp struct {
-	Op   string
-	Expr Expr
+	Op            string
+	Expr          Expr
+	Parenthesized bool
 }
 
 func (u *UnaryOp) String() string {
@@ -220,9 +226,10 @@ func (f *FunctionCall) exprNode() {}
 
 // ConditionalExpr represents a ternary conditional expression (cond ? true_expr : false_expr).
 type ConditionalExpr struct {
-	Condition Expr
-	TrueExpr  Expr
-	FalseExpr Expr
+	Condition     Expr
+	TrueExpr      Expr
+	FalseExpr     Expr
+	Parenthesized bool
 }
 
 func (c *ConditionalExpr) String() string {
@@ -234,8 +241,9 @@ func (c *ConditionalExpr) exprNode() {}
 // ElvisExpr represents the Elvis operator (expr1 ?: expr2).
 // If expr1 evaluates to undefined, returns expr2; otherwise returns expr1.
 type ElvisExpr struct {
-	Left  Expr // The expression to test for undefined
-	Right Expr // The fallback expression if Left is undefined
+	Left          Expr // The expression to test for undefined
+	Right         Expr // The fallback expression if Left is undefined
+	Parenthesized bool
 }
 
 func (e *ElvisExpr) String() string {
@@ -267,3 +275,22 @@ func (s *SubscriptExpr) String() string {
 }
 
 func (s *SubscriptExpr) exprNode() {}
+
+// Parenthesize marks an expression as having been wrapped in explicit
+// parentheses in the source, for operation nodes where unparsing must echo
+// those parentheses (matching the reference engine). It is a no-op for other
+// node types (the generator and grammar only parenthesize operations). The
+// expression is returned for convenient use in grammar actions.
+func Parenthesize(e Expr) Expr {
+	switch v := e.(type) {
+	case *BinaryOp:
+		v.Parenthesized = true
+	case *UnaryOp:
+		v.Parenthesized = true
+	case *ConditionalExpr:
+		v.Parenthesized = true
+	case *ElvisExpr:
+		v.Parenthesized = true
+	}
+	return e
+}

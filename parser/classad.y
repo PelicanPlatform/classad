@@ -228,7 +228,7 @@ primary_expr
 			$$ = &ast.AttributeReference{Name: name, Scope: scope}
 		}
 	| '(' expr ')'
-		{ $$ = $2 }
+		{ $$ = ast.Parenthesize($2) }
 	| '{' opt_expr_list '}'
 		{ $$ = &ast.ListLiteral{Elements: $2} }
 	| record_literal
