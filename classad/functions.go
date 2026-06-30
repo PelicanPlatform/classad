@@ -1693,9 +1693,11 @@ func builtinVersionInRange(args []Value) Value {
 	if len(args) != 3 {
 		return NewErrorValue()
 	}
-	if args[0].IsError() || args[1].IsError() || args[2].IsError() {
-		return NewErrorValue()
-	}
+	// Matching the reference engine's order: an undefined min or max yields
+	// undefined BEFORE any other argument is examined (so version_in_range(
+	// error, undefined, x) is undefined, not error). Then each argument is
+	// coerced to a string; a non-coercible one -- an undefined version, an
+	// error, or a value that does not stringify -- is an error.
 	if args[1].IsUndefined() || args[2].IsUndefined() {
 		return NewUndefinedValue()
 	}
