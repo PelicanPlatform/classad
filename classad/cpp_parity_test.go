@@ -125,6 +125,16 @@ func TestCppParity(t *testing.T) {
 		{`toUpper({1})`, "S:{ 1 }"},
 		{`stricmp({}, 1)`, "I:1"},
 
+		// ifThenElse coerces its condition like ?:, and int()/real() coerce bools.
+		{`ifThenElse(1, 10, 20)`, "I:10"},
+		{`ifThenElse(0, 10, 20)`, "I:20"},
+		{`ifThenElse(1.5, 10, 20)`, "I:10"},
+		{`ifThenElse(undefined, 1, 2)`, "U"},
+		{`ifThenElse("x", 1, 2)`, "E"},
+		{`real(true)`, "R:1"},
+		{`real(false)`, "R:0"},
+		{`int(true)`, "I:1"},
+
 		// string()/strcat() scalar coercion; reals use %.15E (0 -> "0.0").
 		{`string(1.5)`, "S:1.500000000000000E+00"},
 		{`string(0.0)`, "S:0.0"},

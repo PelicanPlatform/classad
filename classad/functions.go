@@ -429,6 +429,15 @@ func builtinReal(args []Value) Value {
 		return NewRealValue(float64(num))
 	}
 
+	// Booleans convert to 1.0 / 0.0, matching the reference engine.
+	if args[0].IsBool() {
+		b, _ := args[0].BoolValue()
+		if b {
+			return NewRealValue(1)
+		}
+		return NewRealValue(0)
+	}
+
 	return NewErrorValue()
 }
 
@@ -706,25 +715,19 @@ func builtinIfThenElse(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// Check first argument for error/undefined
-	if args[0].IsError() {
-		return NewErrorValue()
-	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !args[0].IsBool() {
-		return NewErrorValue()
-	}
-
-	condition, _ := args[0].BoolValue()
-
-	// Return appropriate value based on condition
-	if condition {
+	// The condition coerces a number's truthiness exactly like the ?: operator
+	// (ifThenElse(1, a, b) selects a); undefined yields undefined and a
+	// non-coercible condition is an error.
+	switch logicalView(args[0]) {
+	case lsTrue:
 		return args[1]
+	case lsFalse:
+		return args[2]
+	case lsUndef:
+		return NewUndefinedValue()
+	default:
+		return NewErrorValue()
 	}
-	return args[2]
 }
 
 // builtinString converts any value to string

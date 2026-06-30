@@ -544,10 +544,11 @@ func TestIfThenElse(t *testing.T) {
 			isError:  true,
 		},
 		{
-			name:     "non-boolean condition",
+			// A numeric condition coerces its truthiness (42 is true), matching
+			// the ?: operator and the reference engine.
+			name:     "numeric condition",
 			expr:     `ifThenElse(42, "yes", "no")`,
-			expected: nil,
-			isError:  true,
+			expected: "yes",
 		},
 	}
 
