@@ -211,13 +211,13 @@ func builtinFloor(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	// floor/ceiling/round treat a non-number (including undefined) as an
-	// error, matching the reference engine (unlike int()/real()).
-	if !args[0].IsNumber() {
+	// floor/ceiling/round coerce booleans to numbers but treat any other
+	// non-number (including undefined) as an error -- unlike int()/real()
+	// which propagate undefined.
+	isNum, _, _, num := numericOperand(args[0])
+	if !isNum {
 		return NewErrorValue()
 	}
-
-	num, _ := args[0].NumberValue()
 	return NewIntValue(int64(math.Floor(num)))
 }
 
@@ -230,11 +230,10 @@ func builtinCeiling(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if !args[0].IsNumber() {
+	isNum, _, _, num := numericOperand(args[0])
+	if !isNum {
 		return NewErrorValue()
 	}
-
-	num, _ := args[0].NumberValue()
 	return NewIntValue(int64(math.Ceil(num)))
 }
 
@@ -247,12 +246,13 @@ func builtinRound(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if !args[0].IsNumber() {
+	isNum, _, _, num := numericOperand(args[0])
+	if !isNum {
 		return NewErrorValue()
 	}
-
-	num, _ := args[0].NumberValue()
-	return NewIntValue(int64(math.Round(num)))
+	// The reference engine rounds half to even (C rint), so round(2.5) == 2
+	// and round(3.5) == 4, not half-away-from-zero.
+	return NewIntValue(int64(math.RoundToEven(num)))
 }
 
 // builtinRandom returns a random real number between 0 and 1 (or up to max if specified)
@@ -716,38 +716,24 @@ func builtinPow(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// Get base value as real
-	var base float64
-	if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		base = float64(val)
-	} else if args[0].IsReal() {
-		base, _ = args[0].RealValue()
-	} else {
+	// Integer result only when both operands are genuine integers and the
+	// exponent is non-negative (booleans take the real path), matching the
+	// reference engine, which rounds the integer result via +0.5.
+	if args[0].IsInteger() && args[1].IsInteger() {
+		base, _ := args[0].IntValue()
+		exp, _ := args[1].IntValue()
+		if exp >= 0 {
+			return NewIntValue(int64(math.Pow(float64(base), float64(exp)) + 0.5))
+		}
+	}
+
+	// Real path: coerce base and exponent (int/real/bool) to real.
+	bn, _, _, base := numericOperand(args[0])
+	en, _, _, exp := numericOperand(args[1])
+	if !bn || !en {
 		return NewErrorValue()
 	}
-
-	// Get exponent value
-	var exp float64
-	expIsInt := false
-	if args[1].IsInteger() {
-		val, _ := args[1].IntValue()
-		exp = float64(val)
-		expIsInt = true
-	} else if args[1].IsReal() {
-		exp, _ = args[1].RealValue()
-	} else {
-		return NewErrorValue()
-	}
-
-	result := math.Pow(base, exp)
-
-	// Return integer if both inputs were integer and exp >= 0
-	if expIsInt && args[0].IsInteger() && exp >= 0 {
-		return NewIntValue(int64(result))
-	}
-
-	return NewRealValue(result)
+	return NewRealValue(math.Pow(base, exp))
 }
 
 // builtinQuantize computes ceiling(a/b)*b for scalars, or finds first value in list >= a

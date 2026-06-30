@@ -81,6 +81,22 @@ func TestCppParity(t *testing.T) {
 		// Per-function undefined handling: math fns error, string fns propagate.
 		{`floor(undefined)`, "E"},
 		{`round(undefined)`, "E"},
+
+		// Math functions coerce booleans to numbers (floor/ceiling/round -> int).
+		{`round(true)`, "I:1"},
+		{`floor(true)`, "I:1"},
+		{`ceiling(false)`, "I:0"},
+		// round is round-half-to-even (C rint), not half-away-from-zero.
+		{`round(2.5)`, "I:2"},
+		{`round(3.5)`, "I:4"},
+		{`round(0.5)`, "I:0"},
+		{`round(-2.5)`, "I:-2"},
+		{`round(2.6)`, "I:3"},
+		// pow: integer result only for genuine ints with non-negative exponent.
+		{`pow(2, 3)`, "I:8"},
+		{`pow(2, -1)`, "R:0.5"},
+		{`pow(2, true)`, "R:2"},
+		{`pow(true, true)`, "R:1"},
 		{`pow(undefined, 2)`, "E"},
 		{`quantize(undefined, 4)`, "E"},
 		{`split(undefined)`, "E"},

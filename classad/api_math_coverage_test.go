@@ -64,8 +64,10 @@ func TestClassAdAPIAndMathEvaluation(t *testing.T) {
 	if !res2.IsInteger() {
 		t.Fatalf("expected integer from EvaluateExprWithTarget")
 	}
-	if val, _ := res2.IntValue(); val != 8 {
-		t.Fatalf("expected 8 from MY/TARGET math, got %d", val)
+	// round(2.5) is 2 (round half to even, matching the reference engine), so
+	// 2 + 3 + round(2.5) == 7.
+	if val, _ := res2.IntValue(); val != 7 {
+		t.Fatalf("expected 7 from MY/TARGET math, got %d", val)
 	}
 
 	bin := ad.evaluateBinaryOp("-", NewIntValue(10), NewRealValue(3.5))
