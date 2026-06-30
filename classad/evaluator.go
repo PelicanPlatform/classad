@@ -588,11 +588,37 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 		return NewErrorValue()
 	}
 
-	// Must be a ClassAd
+	// List projection: selecting an attribute from a list maps the select over
+	// each element, matching the reference engine. So {[A=1],[A=2]}.A is
+	// {1,2}, {[A=1],[B=2]}.A is {1,undefined} (the missing attribute chains to
+	// the enclosing scope), {1,2,3}.A is {error,error,error} (a non-ad element
+	// selects to error), and {}.A is the empty list.
+	if recordVal.IsList() {
+		elems, _ := recordVal.ListValue()
+		results := make([]Value, len(elems))
+		for i, el := range elems {
+			results[i] = e.selectAttr(el, sel.Attr)
+		}
+		return NewListValue(results)
+	}
+
+	return e.selectAttr(recordVal, sel.Attr)
+}
+
+// selectAttr resolves record.attr for an already-evaluated record value (a
+// single element of a `.` select). A non-ad record is an error.
+func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
+	// undefined/error elements propagate (so {undefined,[A=1]}.A is
+	// {undefined,1}); any other non-ad element selects to error.
+	if recordVal.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if recordVal.IsError() {
+		return NewErrorValue()
+	}
 	if !recordVal.IsClassAd() {
 		return NewErrorValue()
 	}
-
 	ad, _ := recordVal.ClassAdValue()
 	if ad == nil {
 		return NewErrorValue()
@@ -607,7 +633,7 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 	// an unscoped reference so it chains (and participates in cycle detection).
 	ad.parent = e.classad
 	nested := NewEvaluator(ad)
-	return nested.evaluateAttributeReference(&ast.AttributeReference{Name: sel.Attr})
+	return nested.evaluateAttributeReference(&ast.AttributeReference{Name: attr})
 }
 
 func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {

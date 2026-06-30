@@ -516,3 +516,35 @@ func TestNotAfterEquals(t *testing.T) {
 		}
 	}
 }
+
+// TestListProjection covers selecting an attribute from a list, which the
+// reference engine maps over each element: {[A=1],[A=2]}.A is {1,2}. Non-ad
+// elements project to error, a missing attribute to undefined, and
+// undefined/error elements propagate.
+func TestListProjection(t *testing.T) {
+	ad, err := Parse(`[ L = {[A=1], [B=2], 3, undefined, error}; P = L.A ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	p := ad.EvaluateAttr("P")
+	if !p.IsList() {
+		t.Fatalf("P = %v, want a list", p.Type())
+	}
+	got, _ := p.ListValue()
+	if len(got) != 5 {
+		t.Fatalf("P has %d elements, want 5", len(got))
+	}
+	// [A=1].A=1, [B=2].A=undefined, 3.A=error, undefined.A=undefined, error.A=error
+	checks := []func(Value) bool{
+		func(v Value) bool { i, _ := v.IntValue(); return v.IsInteger() && i == 1 },
+		func(v Value) bool { return v.IsUndefined() },
+		func(v Value) bool { return v.IsError() },
+		func(v Value) bool { return v.IsUndefined() },
+		func(v Value) bool { return v.IsError() },
+	}
+	for i, ok := range checks {
+		if !ok(got[i]) {
+			t.Errorf("P[%d] = %v unexpected", i, got[i])
+		}
+	}
+}
