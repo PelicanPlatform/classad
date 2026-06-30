@@ -204,6 +204,26 @@ func (v Value) ListValue() ([]Value, error) {
 	return v.listVal, nil
 }
 
+// listLen returns the number of elements in a list value without evaluating
+// them (for a lazy list). The caller must ensure v is a list.
+func (v Value) listLen() int {
+	if v.listExprs != nil {
+		return len(v.listExprs)
+	}
+	return len(v.listVal)
+}
+
+// listElementAt evaluates and returns the i-th element of a list value,
+// evaluating only that element for a lazy list (so e.g. {selfRef, x}[1]
+// evaluates x without touching the self-referential element 0). The caller must
+// ensure v is a list and 0 <= i < listLen().
+func (v Value) listElementAt(i int) Value {
+	if v.listExprs != nil {
+		return NewEvaluator(v.listScope).Evaluate(v.listExprs[i])
+	}
+	return v.listVal[i]
+}
+
 // ClassAdValue returns the ClassAd value. Returns error if not a ClassAd.
 func (v Value) ClassAdValue() (*ClassAd, error) {
 	if v.valueType != ClassAdValue {
@@ -619,16 +639,18 @@ func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
 			return NewErrorValue()
 		}
 
-		list, _ := containerVal.ListValue()
 		index, _ := indexVal.IntValue()
 
 		// An out-of-range (including negative) list index is an error in the
 		// reference engine, not undefined.
-		if index < 0 || index >= int64(len(list)) {
+		if index < 0 || index >= int64(containerVal.listLen()) {
 			return NewErrorValue()
 		}
 
-		return list[index]
+		// Evaluate only the indexed element (a lazy list does not evaluate its
+		// other elements), so {selfRef, x}[1] yields x without cycling on the
+		// self-referential element.
+		return containerVal.listElementAt(int(index))
 	}
 
 	// Handle ClassAd subscripting with string key
