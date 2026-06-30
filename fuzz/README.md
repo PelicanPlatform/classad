@@ -160,6 +160,41 @@ which were also fixed (bitwise operators, case-insensitive function names,
 `substr` negative/out-of-range offsets, duplicate attribute names, and cyclic
 references — see the `classad:` commits).
 
+A second, deeper round of coverage-guided mutation drove out a family of
+*lazy-evaluation* and *parsing* divergences (all with regression tests in
+`cpp_parity_test.go`):
+
+- **Lazy list values.** A list value is its unevaluated element expressions
+  (like the reference's `ExprList`): a subscript evaluates only the indexed
+  element, `size()` counts without evaluating, and a self-referential list is a
+  value rather than a construction-time error.
+- **Short-circuit / lazy operators.** `&&`/`||` evaluate the right operand only
+  when the left does not decide the result; `ifThenElse` and `?:` evaluate only
+  the taken branch — except a `?:` with an *undefined* condition evaluates
+  *both* branches; `strcat` stops at its first undefined/error argument.
+- **Unknown / wrong-arity calls** are an error *without* evaluating arguments
+  (an `functionArity` table checks arity before evaluation); `sum()/avg()/min()/max()`
+  with no argument are error.
+- **List projection.** `list.attr` maps the select over each element
+  (`{[A=1],[A=2]}.A` is `{1,2}`).
+- **Parsing.** Adjacent `?:` is a high-precedence postfix elvis operator (so
+  `10 ?: 2 + 3` is `13`); single-quoted attribute names (`'a b'`) are supported;
+  a `=!`/`=?` that is not `=!=`/`=?=` no longer drops the following character;
+  explicit parentheses are preserved through an `ast.ParenExpr` node when
+  unparsing.
+- **Cyclic-reference handling** matched where libclassad is self-consistent: a
+  cyclic function argument propagates (the call errors), a cyclic list-literal
+  element is localized to that element's error, and a cyclic projection
+  propagates. Where libclassad is *not* self-consistent (it hangs or behaves
+  differently by syntactic path), the cases are recorded in
+  [`CPP_QUIRKS.md`](CPP_QUIRKS.md) rather than mirrored.
+
+Coverage-guided mutation can still surface non-reproducing flaky failures whose
+saved input is a parse error in both engines or a libclassad cyclic hang; these
+are a consequence of fuzzing an in-process engine that can infinite-loop, not Go
+bugs (see the cyclic-hang note below and `CPP_QUIRKS.md`). The single-process
+`cafuzz` survey is the reliable divergence counter.
+
 #### A harness bug, not a Go bug
 
 Much of what first *looked* like an "architectural list" divergence
