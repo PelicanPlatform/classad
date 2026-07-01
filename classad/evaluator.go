@@ -51,6 +51,13 @@ type Value struct {
 	// the eager listVal instead.
 	listExprs []ast.Expr
 	listScope *ClassAd
+	// listDepth records the evaluator recursion depth at which a lazy list value
+	// was created. Materializing the list's elements (ListValue/String/subscript)
+	// resumes depth accounting from here, so a value that is cyclic only through
+	// list materialization (A = {A}) -- where each materialization step would
+	// otherwise start a fresh evaluator at depth 0 -- still hits maxEvalDepth and
+	// resolves to error instead of overflowing the goroutine stack.
+	listDepth int
 }
 
 // NewUndefinedValue creates an undefined value.
@@ -195,7 +202,7 @@ func (v Value) ListValue() ([]Value, error) {
 	if v.listExprs != nil {
 		// Lazy list: evaluate each element expression in its stored scope now.
 		vals := make([]Value, len(v.listExprs))
-		ev := NewEvaluator(v.listScope)
+		ev := v.lazyEvaluator(nil)
 		for i, e := range v.listExprs {
 			vals[i] = evalRecoveringCyclic(ev, e)
 		}
@@ -229,18 +236,22 @@ func (v Value) listLen() int {
 // ensure v is a list and 0 <= i < listLen().
 func (v Value) listElementAt(i int, parent *Evaluator) Value {
 	if v.listExprs != nil {
-		return evalRecoveringCyclic(subEvaluator(parent, v.listScope), v.listExprs[i])
+		return evalRecoveringCyclic(v.lazyEvaluator(parent), v.listExprs[i])
 	}
 	return v.listVal[i]
 }
 
-// subEvaluator builds a sub-evaluator for ad, continuing parent's recursion
-// depth accounting (parent may be nil at a top-level materialization entry).
-func subEvaluator(parent *Evaluator, ad *ClassAd) *Evaluator {
-	if parent == nil {
-		return NewEvaluator(ad)
+// lazyEvaluator builds the evaluator for materializing a lazy list's elements in
+// its stored scope. Its depth is the greater of the caller's current depth
+// (parent, which may be nil at a top-level entry such as ListValue/String) and
+// the depth at which the list value was created, so recursion accounting never
+// resets going into materialization and a materialization-only cycle terminates.
+func (v Value) lazyEvaluator(parent *Evaluator) *Evaluator {
+	depth := v.listDepth
+	if parent != nil && parent.depth > depth {
+		depth = parent.depth
 	}
-	return parent.child(ad)
+	return &Evaluator{classad: v.listScope, depth: depth}
 }
 
 // ClassAdValue returns the ClassAd value. Returns error if not a ClassAd.
@@ -627,7 +638,7 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 	if exprs == nil {
 		exprs = []ast.Expr{}
 	}
-	return Value{valueType: ListValue, listExprs: exprs, listScope: e.classad}
+	return Value{valueType: ListValue, listExprs: exprs, listScope: e.classad, listDepth: e.depth}
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
@@ -669,7 +680,7 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 func (v Value) listElementsPropagating(parent *Evaluator) []Value {
 	if v.listExprs != nil {
 		vals := make([]Value, len(v.listExprs))
-		ev := subEvaluator(parent, v.listScope)
+		ev := v.lazyEvaluator(parent)
 		for i, e := range v.listExprs {
 			vals[i] = ev.Evaluate(e)
 		}

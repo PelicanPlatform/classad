@@ -1,6 +1,9 @@
 package classad
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestParserCompat pins parser accept/reject decisions to libclassad's, for
 // grammar/lexer differences found by the differential parser fuzzer
@@ -127,6 +130,40 @@ func TestCyclicEvalNoCrash(t *testing.T) {
 		}
 		if msg := checkValue(v, tc.want); msg != "" {
 			t.Errorf("%s: %s => %s", tc.src, tc.attr, msg)
+		}
+	}
+}
+
+// TestCyclicListStringNoCrash guards the materialization paths that run OUTSIDE
+// the recover-protected evaluator entry points -- Value.String() and
+// Value.ListValue() -- against a list value that is cyclic only through
+// materialization (A = {A}). Each level used to spin up a fresh evaluator at
+// depth 0, so the per-evaluator depth guard never tripped and printing/listing
+// the value overflowed the goroutine stack. The list's creation depth is now
+// carried on the value, so materialization keeps accounting for depth and a
+// self-referential list resolves to a finite nesting ending in error -- exactly
+// what the reference engine produces (a ~64-deep list[...[error]]).
+func TestCyclicListStringNoCrash(t *testing.T) {
+	for _, src := range []string{`[A={A}]`, `[A={{A}}]`, `[A={A}; B=A]`} {
+		ad, err := Parse(src)
+		if err != nil {
+			t.Errorf("%s: parse error: %v", src, err)
+			continue
+		}
+		v := ad.EvaluateAttr("A")
+		// Must terminate (no stack overflow) and be finite.
+		s := v.String()
+		if s == "" {
+			t.Errorf("%s: empty String()", src)
+		}
+		elems, lerr := v.ListValue()
+		if lerr != nil || len(elems) != 1 {
+			t.Errorf("%s: ListValue()=%v,%v want a one-element list", src, elems, lerr)
+			continue
+		}
+		// The self-reference bottoms out in an error once the depth bound is hit.
+		if !strings.Contains(s, "error") {
+			t.Errorf("%s: String()=%q, want it to bottom out in error", src, s)
 		}
 	}
 }
