@@ -65,6 +65,18 @@ func TestParserCompat(t *testing.T) {
 		{`[a = "x"  "y"  "z"]`, true},
 		{`[a = """"]`, true},
 
+		// Trailing content after a complete top-level ClassAd is rejected --
+		// including trailing input that triggers a lexer error, which used to
+		// be silently accepted (the Lexer wrapper masked the streaming lexer's
+		// error once a complete prefix had been parsed).
+		{`[a=1]`, true},
+		{`[a=1] `, true},
+		{"[a=1]\n", true},
+		{`[a=1]x`, false},
+		{`[a=1]#`, false},
+		{`[a=1]00`, false},
+		{`[]00`, false},
+
 		// INT64_MIN parses; a bare 2^63 (positive overflow) does not.
 		{`[a = -9223372036854775808]`, true},
 		{`[a = 9223372036854775808]`, false},
