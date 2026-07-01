@@ -25,6 +25,12 @@ import (
 %token <real> REAL_LITERAL
 %token <boolean> BOOLEAN_LITERAL
 %token UNDEFINED ERROR
+/* The magnitude 2^63 overflows a signed 64-bit int, so it is valid only as the
+   operand of a unary minus (yielding INT64_MIN). The lexer emits this token for
+   it; the grammar accepts it ONLY after '-'. A bare 2^63 has no rule and stays
+   a syntax error -- positive integer overflow, which the Go engine rejects
+   rather than wrapping to 0 the way libclassad does. */
+%token INT64_MIN_MAGNITUDE
 /* ELVIS is the adjacent "?:" operator. Unlike the spaced "? :" (which the
    lexer leaves as two tokens and which binds at ternary precedence), it is a
    high-precedence postfix operator alongside '.' and '[', matching the
@@ -209,6 +215,8 @@ unary_expr
 		{ $$ = $1 }
 	| '-' unary_expr %prec UNARY
 		{ $$ = &ast.UnaryOp{Op: "-", Expr: $2} }
+	| '-' INT64_MIN_MAGNITUDE %prec UNARY
+		{ $$ = &ast.IntegerLiteral{Value: -9223372036854775808} }
 	| '+' unary_expr %prec UNARY
 		{ $$ = &ast.UnaryOp{Op: "+", Expr: $2} }
 	| '!' unary_expr

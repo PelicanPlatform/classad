@@ -31,19 +31,20 @@ const REAL_LITERAL = 57349
 const BOOLEAN_LITERAL = 57350
 const UNDEFINED = 57351
 const ERROR = 57352
-const ELVIS = 57353
-const OR = 57354
-const AND = 57355
-const EQ = 57356
-const NE = 57357
-const IS = 57358
-const ISNT = 57359
-const LE = 57360
-const GE = 57361
-const LSHIFT = 57362
-const RSHIFT = 57363
-const URSHIFT = 57364
-const UNARY = 57365
+const INT64_MIN_MAGNITUDE = 57353
+const ELVIS = 57354
+const OR = 57355
+const AND = 57356
+const EQ = 57357
+const NE = 57358
+const IS = 57359
+const ISNT = 57360
+const LE = 57361
+const GE = 57362
+const LSHIFT = 57363
+const RSHIFT = 57364
+const URSHIFT = 57365
+const UNARY = 57366
 
 var yyToknames = [...]string{
 	"$end",
@@ -56,6 +57,7 @@ var yyToknames = [...]string{
 	"BOOLEAN_LITERAL",
 	"UNDEFINED",
 	"ERROR",
+	"INT64_MIN_MAGNITUDE",
 	"ELVIS",
 	"'?'",
 	"':'",
@@ -101,7 +103,7 @@ const yyEofCode = 1
 const yyErrCode = 2
 const yyInitialStackSize = 16
 
-//line parser/classad.y:278
+//line parser/classad.y:286
 
 //line yacctab:1
 var yyExca = [...]int8{
@@ -112,45 +114,47 @@ var yyExca = [...]int8{
 
 const yyPrivate = 57344
 
-const yyLast = 144
+const yyLast = 163
 
 var yyAct = [...]int8{
-	76, 13, 74, 23, 21, 18, 25, 19, 24, 108,
-	22, 12, 107, 31, 38, 36, 37, 39, 40, 41,
-	16, 113, 80, 106, 109, 9, 20, 10, 8, 9,
-	112, 65, 66, 17, 73, 68, 69, 70, 71, 27,
-	26, 72, 3, 48, 79, 28, 29, 47, 42, 33,
-	62, 63, 64, 84, 34, 15, 85, 46, 90, 91,
-	92, 93, 4, 45, 97, 98, 82, 103, 94, 95,
-	96, 99, 100, 101, 104, 105, 86, 87, 88, 89,
-	83, 7, 111, 110, 31, 38, 36, 37, 39, 40,
-	41, 31, 38, 36, 37, 39, 40, 41, 7, 102,
-	81, 67, 60, 61, 6, 77, 57, 58, 59, 114,
-	27, 26, 115, 43, 11, 44, 28, 29, 78, 42,
-	33, 53, 54, 55, 56, 34, 42, 33, 65, 66,
-	7, 1, 34, 75, 14, 5, 49, 50, 51, 52,
-	30, 32, 35, 2,
+	77, 13, 75, 23, 19, 109, 25, 18, 24, 108,
+	22, 12, 31, 38, 36, 37, 39, 40, 41, 114,
+	107, 10, 81, 21, 31, 38, 36, 37, 39, 40,
+	41, 69, 110, 9, 74, 68, 70, 71, 72, 27,
+	26, 20, 8, 9, 80, 28, 29, 113, 42, 33,
+	73, 27, 26, 86, 34, 85, 17, 28, 29, 16,
+	42, 33, 15, 4, 98, 99, 34, 104, 95, 96,
+	97, 100, 101, 102, 105, 3, 106, 91, 92, 93,
+	94, 7, 48, 112, 31, 38, 36, 37, 39, 40,
+	41, 87, 88, 89, 90, 31, 38, 36, 37, 39,
+	40, 41, 7, 84, 47, 83, 78, 82, 67, 46,
+	115, 27, 26, 116, 65, 66, 45, 28, 29, 79,
+	42, 33, 62, 63, 64, 43, 34, 44, 60, 61,
+	111, 42, 33, 103, 7, 65, 66, 34, 1, 76,
+	5, 57, 58, 59, 53, 54, 55, 56, 49, 50,
+	51, 52, 6, 14, 30, 32, 35, 2, 0, 0,
+	0, 0, 11,
 }
 
 var yyPact = [...]int16{
-	3, -32768, -32768, 94, -13, -32768, -32768, -16, -32768, 126,
-	80, -32768, -32768, -32768, 101, 48, 41, 30, 25, 117,
-	98, 79, 72, 18, -32768, 90, 80, 80, 80, 80,
-	-32768, 1, -32768, 80, 80, -32768, -32768, -32768, -32768, -32768,
-	-32768, -32768, 77, 9, 80, 80, 80, 80, 80, 80,
+	35, -32768, -32768, 98, 0, -32768, -32768, -23, -32768, 130,
+	80, -32768, -32768, -32768, 112, 100, 92, 86, 63, 128,
+	120, 113, 97, 89, -32768, 96, 20, 80, 80, 80,
+	-32768, 9, -32768, 80, 80, -32768, -32768, -32768, -32768, -32768,
+	-32768, -32768, 77, 8, 80, 80, 80, 80, 80, 80,
 	80, 80, 80, 80, 80, 80, 80, 80, 80, 80,
-	80, 80, 80, 80, 80, 95, 80, 87, -32768, -32768,
-	-32768, -32768, 80, -21, -34, -38, -32768, -17, -32768, 70,
-	80, 48, 41, 30, 25, 117, 98, 98, 98, 98,
-	79, 79, 79, 79, 72, 72, 72, 18, 18, -32768,
-	-32768, -32768, -32768, -11, -7, -23, -32768, -32768, 80, -32768,
-	80, -32768, -32768, -32768, -32768, -32768,
+	80, 80, 80, 80, 80, 129, 80, 91, -32768, -32768,
+	-32768, -32768, -32768, 80, -25, -38, -43, -32768, -10, -32768,
+	116, 80, 100, 92, 86, 63, 128, 120, 120, 120,
+	120, 113, 113, 113, 113, 97, 97, 97, 89, 89,
+	-32768, -32768, -32768, -32768, 5, 75, -26, -32768, -32768, 80,
+	-32768, 80, -32768, -32768, -32768, -32768, -32768,
 }
 
 var yyPgo = [...]uint8{
-	0, 143, 142, 62, 104, 0, 141, 140, 6, 8,
-	3, 10, 4, 26, 7, 5, 33, 20, 55, 134,
-	1, 133, 2, 131,
+	0, 157, 156, 63, 152, 0, 155, 154, 6, 8,
+	3, 10, 23, 41, 4, 7, 56, 59, 62, 153,
+	1, 139, 2, 138,
 }
 
 var yyR1 = [...]int8{
@@ -159,8 +163,9 @@ var yyR1 = [...]int8{
 	16, 16, 15, 15, 14, 14, 14, 14, 14, 13,
 	13, 13, 13, 13, 12, 12, 12, 12, 11, 11,
 	11, 10, 10, 10, 10, 9, 9, 9, 9, 9,
-	8, 8, 8, 8, 8, 7, 7, 7, 7, 7,
-	6, 6, 6, 6, 6, 6, 22, 22, 21, 21,
+	9, 8, 8, 8, 8, 8, 7, 7, 7, 7,
+	7, 6, 6, 6, 6, 6, 6, 22, 22, 21,
+	21,
 }
 
 var yyR2 = [...]int8{
@@ -169,60 +174,61 @@ var yyR2 = [...]int8{
 	1, 3, 1, 3, 1, 3, 3, 3, 3, 1,
 	3, 3, 3, 3, 1, 3, 3, 3, 1, 3,
 	3, 1, 3, 3, 3, 1, 2, 2, 2, 2,
-	1, 3, 4, 3, 4, 1, 1, 3, 3, 1,
-	1, 1, 1, 1, 1, 1, 0, 1, 1, 3,
+	2, 1, 3, 4, 3, 4, 1, 1, 3, 3,
+	1, 1, 1, 1, 1, 1, 1, 0, 1, 1,
+	3,
 }
 
 var yyChk = [...]int16{
-	-32768, -23, -1, 39, -3, 41, -4, 4, 41, 42,
-	43, -4, -5, -20, -19, -18, -17, -16, -15, -14,
-	-13, -12, -11, -10, -9, -8, 31, 30, 36, 37,
-	-7, 4, -6, 40, 45, -2, 6, 7, 5, 8,
-	9, 10, 39, 12, 14, 15, 16, 17, 18, 19,
-	20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-	30, 31, 32, 33, 34, 38, 39, 11, -9, -9,
-	-9, -9, 40, -5, -22, -21, -5, -3, 41, -5,
-	13, -18, -17, -16, -15, -14, -13, -13, -13, -13,
-	-12, -12, -12, -12, -11, -11, -11, -10, -10, -9,
-	-9, -9, 4, -5, -8, -22, 44, 46, 47, 41,
-	13, -20, 41, 44, -5, -20,
+	-32768, -23, -1, 40, -3, 42, -4, 4, 42, 43,
+	44, -4, -5, -20, -19, -18, -17, -16, -15, -14,
+	-13, -12, -11, -10, -9, -8, 32, 31, 37, 38,
+	-7, 4, -6, 41, 46, -2, 6, 7, 5, 8,
+	9, 10, 40, 13, 15, 16, 17, 18, 19, 20,
+	21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+	31, 32, 33, 34, 35, 39, 40, 12, -9, 11,
+	-9, -9, -9, 41, -5, -22, -21, -5, -3, 42,
+	-5, 14, -18, -17, -16, -15, -14, -13, -13, -13,
+	-13, -12, -12, -12, -12, -11, -11, -11, -10, -10,
+	-9, -9, -9, 4, -5, -8, -22, 45, 47, 48,
+	42, 14, -20, 42, 45, -5, -20,
 }
 
 var yyDef = [...]int8{
 	0, -2, 1, 0, 0, 3, 6, 0, 2, 8,
 	0, 7, 9, 10, 11, 14, 16, 18, 20, 22,
 	24, 29, 34, 38, 41, 45, 0, 0, 0, 0,
-	50, 56, 55, 0, 66, 59, 60, 61, 62, 63,
-	64, 65, 0, 0, 0, 0, 0, 0, 0, 0,
+	51, 57, 56, 0, 67, 60, 61, 62, 63, 64,
+	65, 66, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 46, 47,
-	48, 49, 66, 0, 0, 67, 68, 0, 5, 0,
-	0, 15, 17, 19, 21, 23, 25, 26, 27, 28,
-	30, 31, 32, 33, 35, 36, 37, 39, 40, 42,
-	43, 44, 51, 0, 53, 0, 57, 58, 0, 4,
-	0, 13, 52, 54, 69, 12,
+	48, 49, 50, 67, 0, 0, 68, 69, 0, 5,
+	0, 0, 15, 17, 19, 21, 23, 25, 26, 27,
+	28, 30, 31, 32, 33, 35, 36, 37, 39, 40,
+	42, 43, 44, 52, 0, 54, 0, 58, 59, 0,
+	4, 0, 13, 53, 55, 70, 12,
 }
 
 var yyTok1 = [...]int8{
 	1, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-	3, 3, 3, 36, 3, 3, 3, 34, 18, 3,
-	40, 44, 32, 30, 47, 31, 38, 33, 3, 3,
-	3, 3, 3, 3, 3, 3, 3, 3, 13, 42,
-	23, 43, 24, 12, 3, 3, 3, 3, 3, 3,
+	3, 3, 3, 37, 3, 3, 3, 35, 19, 3,
+	41, 45, 33, 31, 48, 32, 39, 34, 3, 3,
+	3, 3, 3, 3, 3, 3, 3, 3, 14, 43,
+	24, 44, 25, 13, 3, 3, 3, 3, 3, 3,
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-	3, 39, 3, 41, 17, 3, 3, 3, 3, 3,
+	3, 40, 3, 42, 18, 3, 3, 3, 3, 3,
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
 	3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
-	3, 3, 3, 45, 16, 46, 37,
+	3, 3, 3, 46, 17, 47, 38,
 }
 
 var yyTok2 = [...]int8{
 	2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-	14, 15, 19, 20, 21, 22, 25, 26, 27, 28,
-	29, 35,
+	12, 15, 16, 20, 21, 22, 23, 26, 27, 28,
+	29, 30, 36,
 }
 
 var yyTok3 = [...]int8{
@@ -568,7 +574,7 @@ yydefault:
 
 	case 1:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:66
+//line parser/classad.y:72
 		{
 			if lex, ok := yylex.(interface{ SetResult(ast.Node) }); ok {
 				lex.SetResult(yyDollar[1].classad)
@@ -576,410 +582,416 @@ yydefault:
 		}
 	case 2:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:75
+//line parser/classad.y:81
 		{
 			yyVAL.classad = &ast.ClassAd{Attributes: yyDollar[2].attrs}
 		}
 	case 3:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line parser/classad.y:77
+//line parser/classad.y:83
 		{
 			yyVAL.classad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
 		}
 	case 4:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:82
+//line parser/classad.y:88
 		{
 			yyVAL.classad = &ast.ClassAd{Attributes: yyDollar[2].attrs}
 		}
 	case 5:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line parser/classad.y:84
+//line parser/classad.y:90
 		{
 			yyVAL.classad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
 		}
 	case 6:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:89
+//line parser/classad.y:95
 		{
 			yyVAL.attrs = []*ast.AttributeAssignment{yyDollar[1].attr}
 		}
 	case 7:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:91
+//line parser/classad.y:97
 		{
 			yyVAL.attrs = append(yyDollar[1].attrs, yyDollar[3].attr)
 		}
 	case 8:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line parser/classad.y:93
+//line parser/classad.y:99
 		{
 			yyVAL.attrs = yyDollar[1].attrs
 		}
 	case 9:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:98
+//line parser/classad.y:104
 		{
 			yyVAL.attr = &ast.AttributeAssignment{Name: yyDollar[1].str, Value: yyDollar[3].expr}
 		}
 	case 10:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:103
+//line parser/classad.y:109
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 11:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:108
+//line parser/classad.y:114
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 12:
 		yyDollar = yyS[yypt-5 : yypt+1]
-//line parser/classad.y:110
+//line parser/classad.y:116
 		{
 			yyVAL.expr = &ast.ConditionalExpr{Condition: yyDollar[1].expr, TrueExpr: yyDollar[3].expr, FalseExpr: yyDollar[5].expr}
 		}
 	case 13:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line parser/classad.y:112
+//line parser/classad.y:118
 		{
 			yyVAL.expr = &ast.ElvisExpr{Left: yyDollar[1].expr, Right: yyDollar[4].expr}
 		}
 	case 14:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:117
+//line parser/classad.y:123
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 15:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:119
+//line parser/classad.y:125
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "||", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 16:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:124
+//line parser/classad.y:130
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 17:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:126
+//line parser/classad.y:132
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "&&", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 18:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:131
+//line parser/classad.y:137
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 19:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:133
+//line parser/classad.y:139
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "|", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 20:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:138
+//line parser/classad.y:144
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 21:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:140
+//line parser/classad.y:146
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "^", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 22:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:145
+//line parser/classad.y:151
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 23:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:147
+//line parser/classad.y:153
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "&", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 24:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:152
+//line parser/classad.y:158
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 25:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:154
+//line parser/classad.y:160
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "==", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 26:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:156
+//line parser/classad.y:162
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "!=", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 27:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:158
+//line parser/classad.y:164
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "is", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 28:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:160
+//line parser/classad.y:166
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "isnt", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 29:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:165
+//line parser/classad.y:171
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 30:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:167
+//line parser/classad.y:173
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "<", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 31:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:169
+//line parser/classad.y:175
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: ">", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 32:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:171
+//line parser/classad.y:177
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "<=", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 33:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:173
+//line parser/classad.y:179
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: ">=", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 34:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:178
+//line parser/classad.y:184
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 35:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:180
+//line parser/classad.y:186
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "<<", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 36:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:182
+//line parser/classad.y:188
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: ">>", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 37:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:184
+//line parser/classad.y:190
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: ">>>", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 38:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:189
+//line parser/classad.y:195
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 39:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:191
+//line parser/classad.y:197
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "+", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 40:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:193
+//line parser/classad.y:199
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "-", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 41:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:198
+//line parser/classad.y:204
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 42:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:200
+//line parser/classad.y:206
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "*", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 43:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:202
+//line parser/classad.y:208
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "/", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 44:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:204
+//line parser/classad.y:210
 		{
 			yyVAL.expr = &ast.BinaryOp{Op: "%", Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
 	case 45:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:209
+//line parser/classad.y:215
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
 	case 46:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line parser/classad.y:211
+//line parser/classad.y:217
 		{
 			yyVAL.expr = &ast.UnaryOp{Op: "-", Expr: yyDollar[2].expr}
 		}
 	case 47:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line parser/classad.y:213
+//line parser/classad.y:219
 		{
-			yyVAL.expr = &ast.UnaryOp{Op: "+", Expr: yyDollar[2].expr}
+			yyVAL.expr = &ast.IntegerLiteral{Value: -9223372036854775808}
 		}
 	case 48:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line parser/classad.y:215
+//line parser/classad.y:221
 		{
-			yyVAL.expr = &ast.UnaryOp{Op: "!", Expr: yyDollar[2].expr}
+			yyVAL.expr = &ast.UnaryOp{Op: "+", Expr: yyDollar[2].expr}
 		}
 	case 49:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line parser/classad.y:217
+//line parser/classad.y:223
+		{
+			yyVAL.expr = &ast.UnaryOp{Op: "!", Expr: yyDollar[2].expr}
+		}
+	case 50:
+		yyDollar = yyS[yypt-2 : yypt+1]
+//line parser/classad.y:225
 		{
 			yyVAL.expr = &ast.UnaryOp{Op: "~", Expr: yyDollar[2].expr}
 		}
-	case 50:
+	case 51:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:222
+//line parser/classad.y:230
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
-	case 51:
+	case 52:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:224
+//line parser/classad.y:232
 		{
 			yyVAL.expr = &ast.SelectExpr{Record: yyDollar[1].expr, Attr: yyDollar[3].str}
 		}
-	case 52:
+	case 53:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line parser/classad.y:226
+//line parser/classad.y:234
 		{
 			yyVAL.expr = &ast.SubscriptExpr{Container: yyDollar[1].expr, Index: yyDollar[3].expr}
 		}
-	case 53:
+	case 54:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:228
+//line parser/classad.y:236
 		{
 			yyVAL.expr = &ast.ElvisExpr{Left: yyDollar[1].expr, Right: yyDollar[3].expr}
 		}
-	case 54:
+	case 55:
 		yyDollar = yyS[yypt-4 : yypt+1]
-//line parser/classad.y:230
+//line parser/classad.y:238
 		{
 			yyVAL.expr = &ast.FunctionCall{Name: yyDollar[1].str, Args: yyDollar[3].exprlist}
 		}
-	case 55:
+	case 56:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:235
+//line parser/classad.y:243
 		{
 			yyVAL.expr = yyDollar[1].expr
 		}
-	case 56:
+	case 57:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:237
+//line parser/classad.y:245
 		{
 			name, scope := ParseScopedIdentifier(yyDollar[1].str)
 			yyVAL.expr = &ast.AttributeReference{Name: name, Scope: scope}
 		}
-	case 57:
+	case 58:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:242
+//line parser/classad.y:250
 		{
 			yyVAL.expr = ast.Parenthesize(yyDollar[2].expr)
 		}
-	case 58:
+	case 59:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:244
+//line parser/classad.y:252
 		{
 			yyVAL.expr = &ast.ListLiteral{Elements: yyDollar[2].exprlist}
 		}
-	case 59:
+	case 60:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:246
+//line parser/classad.y:254
 		{
 			yyVAL.expr = &ast.RecordLiteral{ClassAd: yyDollar[1].classad}
 		}
-	case 60:
-		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:251
-		{
-			yyVAL.expr = &ast.IntegerLiteral{Value: yyDollar[1].integer}
-		}
 	case 61:
-		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:253
-		{
-			yyVAL.expr = &ast.RealLiteral{Value: yyDollar[1].real}
-		}
-	case 62:
-		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:255
-		{
-			yyVAL.expr = &ast.StringLiteral{Value: yyDollar[1].str}
-		}
-	case 63:
-		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:257
-		{
-			yyVAL.expr = &ast.BooleanLiteral{Value: yyDollar[1].boolean}
-		}
-	case 64:
 		yyDollar = yyS[yypt-1 : yypt+1]
 //line parser/classad.y:259
 		{
-			yyVAL.expr = &ast.UndefinedLiteral{}
+			yyVAL.expr = &ast.IntegerLiteral{Value: yyDollar[1].integer}
 		}
-	case 65:
+	case 62:
 		yyDollar = yyS[yypt-1 : yypt+1]
 //line parser/classad.y:261
 		{
-			yyVAL.expr = &ast.ErrorLiteral{}
+			yyVAL.expr = &ast.RealLiteral{Value: yyDollar[1].real}
+		}
+	case 63:
+		yyDollar = yyS[yypt-1 : yypt+1]
+//line parser/classad.y:263
+		{
+			yyVAL.expr = &ast.StringLiteral{Value: yyDollar[1].str}
+		}
+	case 64:
+		yyDollar = yyS[yypt-1 : yypt+1]
+//line parser/classad.y:265
+		{
+			yyVAL.expr = &ast.BooleanLiteral{Value: yyDollar[1].boolean}
+		}
+	case 65:
+		yyDollar = yyS[yypt-1 : yypt+1]
+//line parser/classad.y:267
+		{
+			yyVAL.expr = &ast.UndefinedLiteral{}
 		}
 	case 66:
+		yyDollar = yyS[yypt-1 : yypt+1]
+//line parser/classad.y:269
+		{
+			yyVAL.expr = &ast.ErrorLiteral{}
+		}
+	case 67:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line parser/classad.y:266
+//line parser/classad.y:274
 		{
 			yyVAL.exprlist = []ast.Expr{}
 		}
-	case 67:
+	case 68:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:268
+//line parser/classad.y:276
 		{
 			yyVAL.exprlist = yyDollar[1].exprlist
 		}
-	case 68:
+	case 69:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:273
+//line parser/classad.y:281
 		{
 			yyVAL.exprlist = []ast.Expr{yyDollar[1].expr}
 		}
-	case 69:
+	case 70:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:275
+//line parser/classad.y:283
 		{
 			yyVAL.exprlist = append(yyDollar[1].exprlist, yyDollar[3].expr)
 		}

@@ -693,6 +693,13 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 
 	val, err := strconv.ParseInt(text, 10, 64)
 	if err != nil {
+		// 2^63 overflows int64 but is the magnitude of INT64_MIN. Emit a
+		// dedicated token so the grammar can fold '-' 2^63 into INT64_MIN; a
+		// bare 2^63 has no grammar rule and stays a syntax error (positive
+		// overflow, which the Go engine rejects rather than wrapping).
+		if u, uerr := strconv.ParseUint(text, 10, 64); uerr == nil && u == 1<<63 {
+			return INT64_MIN_MAGNITUDE
+		}
 		l.Error(fmt.Sprintf("invalid integer: %s", text))
 		return 0
 	}
