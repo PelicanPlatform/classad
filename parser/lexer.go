@@ -52,14 +52,19 @@ func (l *Lexer) Error(s string) {
 	l.err = l.lex.err
 }
 
-// Result returns the parsed result and any error.
+// Result returns the parsed result and any error. It must surface an error
+// recorded on the underlying streaming lexer even when the parser produced a
+// (partial) result -- e.g. trailing input that triggers a lexer error after a
+// complete ClassAd, which the reference parser rejects.
 func (l *Lexer) Result() (ast.Node, error) {
-	if l.result != nil || l.err != nil {
-		return l.result, l.err
-	}
 	res, err := l.lex.Result()
-	l.result = res
-	l.err = err
+	if res == nil {
+		res = l.result
+	}
+	if err == nil {
+		err = l.err
+	}
+	l.result, l.err = res, err
 	return res, err
 }
 

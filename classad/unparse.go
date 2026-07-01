@@ -64,7 +64,7 @@ func unparseExpr(b *strings.Builder, e ast.Expr) {
 		case ast.ParentScope:
 			b.WriteString("PARENT.")
 		}
-		b.WriteString(v.Name)
+		b.WriteString(unparseAttrName(v.Name))
 	case *ast.ParenExpr:
 		// Explicit source parentheses are echoed verbatim (around any
 		// expression, and nested), matching the reference engine.
@@ -113,8 +113,15 @@ func unparseExpr(b *strings.Builder, e ast.Expr) {
 		b.WriteByte(']')
 	case *ast.SelectExpr:
 		unparseExpr(b, v.Record)
+		// A bare numeric literal before '.' would re-lex as a real ("0.A"),
+		// so separate it with a space. The selected attribute is quoted when
+		// it is not a bare identifier (e.g. a keyword like 'true').
+		switch v.Record.(type) {
+		case *ast.IntegerLiteral, *ast.RealLiteral:
+			b.WriteByte(' ')
+		}
 		b.WriteByte('.')
-		b.WriteString(v.Attr)
+		b.WriteString(unparseAttrName(v.Attr))
 	case *ast.RecordLiteral:
 		unparseRecord(b, v.ClassAd)
 	default:
@@ -133,8 +140,14 @@ func unparseUnary(b *strings.Builder, v *ast.UnaryOp) {
 	if v.Op == "-" {
 		switch lit := v.Expr.(type) {
 		case *ast.IntegerLiteral:
-			b.WriteString(strconv.FormatInt(-lit.Value, 10))
-			return
+			// A bare negative integer literal only comes from the parser's
+			// -9223372036854775808 (INT64_MIN) rule. The reference does not
+			// fold a further unary minus onto it, so keep the leading-space
+			// operator ("- -9223372036854775808") instead of collapsing it.
+			if lit.Value >= 0 {
+				b.WriteString(strconv.FormatInt(-lit.Value, 10))
+				return
+			}
 		case *ast.RealLiteral:
 			b.WriteString(classadReal(-lit.Value))
 			return
@@ -151,7 +164,7 @@ func unparseRecord(b *strings.Builder, ad *ast.ClassAd) {
 		if i > 0 {
 			b.WriteString("; ")
 		}
-		b.WriteString(attr.Name)
+		b.WriteString(unparseAttrName(attr.Name))
 		b.WriteString(" = ")
 		unparseExpr(b, attr.Value)
 	}

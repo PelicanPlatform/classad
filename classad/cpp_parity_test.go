@@ -1099,6 +1099,39 @@ func TestSplitDelimiters(t *testing.T) {
 	}
 }
 
+// TestInt64MinLiteral guards parsing of the most-negative int64. Its magnitude
+// (2^63) overflows a signed 64-bit int, so the lexer accepts it only as the
+// operand of a unary minus (-> INT64_MIN); a bare 2^63 stays a syntax error
+// (positive overflow, which the engine rejects rather than wrapping like the
+// reference). Regression for a parser bug that rejected -9223372036854775808
+// and hid ~40% of generated ads from the differential fuzzer.
+func TestInt64MinLiteral(t *testing.T) {
+	ok := []struct {
+		expr string
+		want string
+	}{
+		{`-9223372036854775808`, "I:-9223372036854775808"},
+		{`{-9223372036854775808}[0]`, "I:-9223372036854775808"},
+		{`--9223372036854775808`, "I:-9223372036854775808"}, // -(INT64_MIN) wraps to INT64_MIN
+		{`1 == -9223372036854775808`, "B:false"},
+		{`-9223372036854775807`, "I:-9223372036854775807"}, // one above min, always fine
+	}
+	for _, tc := range ok {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Errorf("%s: unexpected parse error: %v", tc.expr, err)
+			continue
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+	// A bare 2^63 must remain a parse error (positive overflow).
+	if _, err := Parse(`[ x = 9223372036854775808 ]`); err == nil {
+		t.Errorf("bare 9223372036854775808 (2^63) should be a parse error, but parsed")
+	}
+}
+
 // TestVersioncmpPrefix guards versioncmp's natural-compare tail: when one
 // operand is a prefix of the other, the reference returns the difference of
 // the first unmatched bytes (treating end-of-string as a 0 byte), not the

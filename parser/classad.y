@@ -25,6 +25,12 @@ import (
 %token <real> REAL_LITERAL
 %token <boolean> BOOLEAN_LITERAL
 %token UNDEFINED ERROR
+/* The magnitude 2^63 overflows a signed 64-bit int, so it is valid only as the
+   operand of a unary minus (yielding INT64_MIN). The lexer emits this token for
+   it; the grammar accepts it ONLY after '-'. A bare 2^63 has no rule and stays
+   a syntax error -- positive integer overflow, which the Go engine rejects
+   rather than wrapping to 0 the way libclassad does. */
+%token INT64_MIN_MAGNITUDE
 /* ELVIS is the adjacent "?:" operator. Unlike the spaced "? :" (which the
    lexer leaves as two tokens and which binds at ternary precedence), it is a
    high-precedence postfix operator alongside '.' and '[', matching the
@@ -52,7 +58,8 @@ import (
 
 %type <classad> classad record_literal
 %type <attrs> attr_list
-%type <attr> attr_assign
+%type <attr> attr_assign attr_stmt
+%type <str> strings
 %type <expr> expr literal primary_expr postfix_expr unary_expr
 %type <expr> mult_expr add_expr shift_expr rel_expr eq_expr
 %type <expr> and_expr xor_expr or_expr logical_and_expr logical_or_expr
@@ -73,23 +80,28 @@ start
 classad
 	: '[' attr_list ']'
 		{ $$ = &ast.ClassAd{Attributes: $2} }
-	| '[' ']'
-		{ $$ = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}} }
 	;
 
 record_literal
 	: '[' attr_list ']'
 		{ $$ = &ast.ClassAd{Attributes: $2} }
-	| '[' ']'
-		{ $$ = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}} }
 	;
 
+/* Assignments are separated by ';', but empty statements are allowed anywhere
+   (leading, trailing, doubled, or a semicolon-only/empty body), matching the
+   reference parser: "[;a=1;;b=2;]" and "[ ; ]" and "[]" all parse. Two
+   assignments with no ';' between them ("[a=1 b=2]") is still an error. */
 attr_list
-	: attr_assign
-		{ $$ = []*ast.AttributeAssignment{$1} }
-	| attr_list ';' attr_assign
-		{ $$ = append($1, $3) }
-	| attr_list ';'
+	: attr_stmt
+		{ if $1 != nil { $$ = []*ast.AttributeAssignment{$1} } else { $$ = []*ast.AttributeAssignment{} } }
+	| attr_list ';' attr_stmt
+		{ if $3 != nil { $$ = append($1, $3) } else { $$ = $1 } }
+	;
+
+attr_stmt
+	: /* empty */
+		{ $$ = nil }
+	| attr_assign
 		{ $$ = $1 }
 	;
 
@@ -209,6 +221,8 @@ unary_expr
 		{ $$ = $1 }
 	| '-' unary_expr %prec UNARY
 		{ $$ = &ast.UnaryOp{Op: "-", Expr: $2} }
+	| '-' INT64_MIN_MAGNITUDE %prec UNARY
+		{ $$ = &ast.IntegerLiteral{Value: -9223372036854775808} }
 	| '+' unary_expr %prec UNARY
 		{ $$ = &ast.UnaryOp{Op: "+", Expr: $2} }
 	| '!' unary_expr
@@ -238,6 +252,13 @@ primary_expr
 			name, scope := ParseScopedIdentifier($1)
 			$$ = &ast.AttributeReference{Name: name, Scope: scope}
 		}
+	| '.' IDENTIFIER
+		{
+			// A leading-dot reference (".A") is a plain reference in the
+			// reference engine (".A" resolves identically to "A").
+			name, scope := ParseScopedIdentifier($2)
+			$$ = &ast.AttributeReference{Name: name, Scope: scope}
+		}
 	| '(' expr ')'
 		{ $$ = ast.Parenthesize($2) }
 	| '{' opt_expr_list '}'
@@ -251,7 +272,7 @@ literal
 		{ $$ = &ast.IntegerLiteral{Value: $1} }
 	| REAL_LITERAL
 		{ $$ = &ast.RealLiteral{Value: $1} }
-	| STRING_LITERAL
+	| strings
 		{ $$ = &ast.StringLiteral{Value: $1} }
 	| BOOLEAN_LITERAL
 		{ $$ = &ast.BooleanLiteral{Value: $1} }
@@ -259,6 +280,14 @@ literal
 		{ $$ = &ast.UndefinedLiteral{} }
 	| ERROR
 		{ $$ = &ast.ErrorLiteral{} }
+	;
+
+/* Adjacent string literals concatenate, C-style: "a" "b" is "ab". */
+strings
+	: STRING_LITERAL
+		{ $$ = $1 }
+	| strings STRING_LITERAL
+		{ $$ = $1 + $2 }
 	;
 
 opt_expr_list

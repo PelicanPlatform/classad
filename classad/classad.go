@@ -332,6 +332,12 @@ func ParseOld(input string) (*ClassAd, error) {
 }
 
 // String returns the string representation of the ClassAd.
+// unparseAttrName renders an attribute name so it re-parses (see
+// ast.QuoteAttributeName).
+func unparseAttrName(name string) string {
+	return ast.QuoteAttributeName(name)
+}
+
 func (c *ClassAd) String() string {
 	if c.ad == nil {
 		return "[]"
@@ -344,7 +350,7 @@ func (c *ClassAd) String() string {
 		if i > 0 {
 			b.WriteString("; ")
 		}
-		b.WriteString(attr.Name)
+		b.WriteString(unparseAttrName(attr.Name))
 		b.WriteString(" = ")
 		b.WriteString(attr.Value.String())
 	}
@@ -371,7 +377,7 @@ func (c *ClassAd) MarshalOld() string {
 		if i > 0 {
 			result += "\n"
 		}
-		result += fmt.Sprintf("%s = %s", attr.Name, attr.Value.String())
+		result += fmt.Sprintf("%s = %s", unparseAttrName(attr.Name), attr.Value.String())
 	}
 	return result
 }

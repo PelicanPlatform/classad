@@ -54,6 +54,18 @@ func (l *StreamingLexer) resetForNext() {
 	l.seen = l.seen[:0]
 }
 
+// isASCIILetter and isASCIIDigit define the character classes for identifiers
+// and numeric literals. The reference lexer is ASCII-only, so a Unicode letter
+// or digit (e.g. "ǒ") is not a valid identifier/number character even though
+// unicode.IsLetter/IsDigit would accept it.
+func isASCIILetter(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
+}
+
+func isASCIIDigit(r rune) bool {
+	return r >= '0' && r <= '9'
+}
+
 // Lex implements the goyacc Lexer interface.
 func (l *StreamingLexer) Lex(lval *yySymType) int {
 	if l.done {
@@ -136,6 +148,12 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 	case '%':
 		return int('%')
 	case '.':
+		// A '.' immediately before a digit begins a fractional float literal
+		// (".5"), which the reference accepts; otherwise it is the selection
+		// operator.
+		if next, err := l.peekRune(); err == nil && isASCIIDigit(next) {
+			return l.scanNumber('.', lval)
+		}
 		return int('.')
 	case '"':
 		str := l.scanString()
@@ -290,18 +308,20 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 	}
 
 	// Numbers
-	if unicode.IsDigit(ch) {
+	if isASCIIDigit(ch) {
 		return l.scanNumber(ch, lval)
 	}
 
 	// Identifiers and keywords
-	if unicode.IsLetter(ch) || ch == '_' {
+	if isASCIILetter(ch) || ch == '_' {
 		return l.scanIdentifierOrKeyword(ch, lval)
 	}
 
-	// Unknown character
+	// Unknown character: report the error and stop (return EOF) rather than
+	// silently skipping it and lexing on, which would accept malformed input
+	// like "[#]" that the reference parser rejects.
 	l.Error(fmt.Sprintf("unexpected character: %c", ch))
-	return l.Lex(lval)
+	return 0
 }
 
 // Error implements the goyacc Lexer interface.
@@ -633,7 +653,8 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 	var sb strings.Builder
 	sb.WriteRune(first)
 
-	hasDecimal := false
+	// first may be '.' when the literal has no integer part (".5").
+	hasDecimal := first == '.'
 	hasExponent := false
 
 	for {
@@ -642,7 +663,7 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 			break
 		}
 
-		if unicode.IsDigit(ch) {
+		if isASCIIDigit(ch) {
 			if err := l.discardRune(); err != nil {
 				return 0
 			}
@@ -656,6 +677,13 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 				return 0
 			}
 			sb.WriteRune(ch)
+			// The reference requires a digit after the decimal point, so "1.",
+			// "5.", and "1.e5" are rejected (a leading-dot ".5" is fine because
+			// the caller only starts a number on '.' when a digit follows).
+			if next, perr := l.peekRune(); perr != nil || !isASCIIDigit(next) {
+				l.Error(fmt.Sprintf("expected digit after decimal point in %q", sb.String()))
+				return 0
+			}
 			continue
 		}
 
@@ -691,8 +719,23 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 		return REAL_LITERAL
 	}
 
+	// The reference parser rejects an integer literal with a leading zero (only
+	// a bare "0" is allowed); it is not read as octal. Match that rather than
+	// silently treating "010" as decimal 10.
+	if len(text) > 1 && text[0] == '0' {
+		l.Error(fmt.Sprintf("leading zero in integer literal: %s", text))
+		return 0
+	}
+
 	val, err := strconv.ParseInt(text, 10, 64)
 	if err != nil {
+		// 2^63 overflows int64 but is the magnitude of INT64_MIN. Emit a
+		// dedicated token so the grammar can fold '-' 2^63 into INT64_MIN; a
+		// bare 2^63 has no grammar rule and stays a syntax error (positive
+		// overflow, which the Go engine rejects rather than wrapping).
+		if u, uerr := strconv.ParseUint(text, 10, 64); uerr == nil && u == 1<<63 {
+			return INT64_MIN_MAGNITUDE
+		}
 		l.Error(fmt.Sprintf("invalid integer: %s", text))
 		return 0
 	}
@@ -709,7 +752,7 @@ func (l *StreamingLexer) scanIdentifierOrKeyword(first rune, lval *yySymType) in
 		if err != nil {
 			break
 		}
-		if unicode.IsLetter(ch) || unicode.IsDigit(ch) || ch == '_' {
+		if isASCIILetter(ch) || isASCIIDigit(ch) || ch == '_' {
 			if err := l.discardRune(); err != nil {
 				return 0
 			}
@@ -730,7 +773,7 @@ func (l *StreamingLexer) scanIdentifierOrKeyword(first rune, lval *yySymType) in
 				return 0
 			}
 			peek, err := l.peekRune()
-			if err == nil && (unicode.IsLetter(peek) || peek == '_') {
+			if err == nil && (isASCIILetter(peek) || peek == '_') {
 				if err := l.discardRune(); err != nil {
 					return 0
 				}
@@ -741,7 +784,7 @@ func (l *StreamingLexer) scanIdentifierOrKeyword(first rune, lval *yySymType) in
 					if err != nil {
 						break
 					}
-					if unicode.IsLetter(nextCh) || unicode.IsDigit(nextCh) || nextCh == '_' {
+					if isASCIILetter(nextCh) || isASCIIDigit(nextCh) || nextCh == '_' {
 						if err := l.discardRune(); err != nil {
 							return 0
 						}
