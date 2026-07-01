@@ -191,7 +191,30 @@ literals), because comparing a UB result against any fixed choice is
 meaningless. This is a good candidate to fix upstream by guarding the cast
 (range-check + `isnan`/`isinf`).
 
-## Observed (reasonable) semantics, recorded for completeness
+## 9. `=?=` / `=!=` between two lists depends on their internal representation — likely bug
+
+`=?=` (and `=!=`) between two list operands is **error** when both lists have
+the same internal representation, but **false** when they differ:
+
+```
+classad_eval -quiet '[ a = ({1} =?= {1}) ]' a                              # error
+classad_eval -quiet '[ L = splitSlotName("a@b"); a = (L =?= L) ]' a        # error
+classad_eval -quiet '[ L = splitSlotName("a@b"); a = ({1} =?= L) ]' a      # false (!!)
+classad_eval -quiet '[ a = ({1} =?= split("x")) ]' a                       # false (!!)
+```
+
+A `{...}` literal is an `ExprList`, while a list *returned by a function*
+(`split`, `splitSlotName`, `splitUserName`, …) is an `SList`. `=?=` compares the
+two operands' internal type tags: same tag (two `ExprList`s, or two `SList`s) is
+an unsupported list comparison → error, but different tags (`ExprList` vs
+`SList`) look like a type mismatch → false. So the result of `X =?= Y` depends
+on *how the lists were produced*, not just their contents.
+
+The Go engine has a single list type, so `list =?= list` is consistently
+`error` (it never sees a spurious type mismatch). It does **not** mirror this —
+reproducing it would mean tagging list values with their origin purely to copy
+a representation leak. Go's behavior matches the reference for the same-tag
+cases and differs only for the mixed literal-vs-function case.
 
 These are not bugs, but were non-obvious and are now matched by the Go engine:
 
