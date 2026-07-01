@@ -40,7 +40,53 @@ func knownParseDelta(src string, r differ.Result) bool {
 	if !r.GoParsed && r.CppParsed && strings.Contains(src, "..") {
 		return true
 	}
+	// libclassad's parser leniently recovers from unbalanced or mismatched
+	// brackets (e.g. "{(0?[0:0)}" is accepted as "{0}"); the Go parser rejects
+	// them. CPP_QUIRKS #11; not mirrored.
+	if !r.GoParsed && r.CppParsed && !bracketsBalanced(src) {
+		return true
+	}
 	return false
+}
+
+// bracketsBalanced reports whether (), [], and {} nest properly in src, ignoring
+// brackets inside "..." string literals and '...' quoted attribute names.
+func bracketsBalanced(src string) bool {
+	var stack []byte
+	inDQ, inSQ := false, false
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		switch {
+		case inDQ:
+			if c == '\\' {
+				i++
+			} else if c == '"' {
+				inDQ = false
+			}
+		case inSQ:
+			if c == '\\' {
+				i++
+			} else if c == '\'' {
+				inSQ = false
+			}
+		case c == '"':
+			inDQ = true
+		case c == '\'':
+			inSQ = true
+		case c == '[':
+			stack = append(stack, ']')
+		case c == '(':
+			stack = append(stack, ')')
+		case c == '{':
+			stack = append(stack, '}')
+		case c == ']' || c == ')' || c == '}':
+			if len(stack) == 0 || stack[len(stack)-1] != c {
+				return false
+			}
+			stack = stack[:len(stack)-1]
+		}
+	}
+	return len(stack) == 0
 }
 
 // containsOverflowingInt reports whether src contains a bare decimal integer

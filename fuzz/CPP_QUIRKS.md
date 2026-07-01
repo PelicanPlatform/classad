@@ -232,6 +232,19 @@ This is not mirrored; the differential parser fuzzer allowlists it as
 CPP_QUIRKS #10. (Note: `.e5` is *not* a malformed float -- it is a leading-dot
 reference to the attribute `e5`, which the Go parser now handles.)
 
+## 11. The parser leniently recovers from unbalanced/mismatched brackets — likely bug
+
+libclassad's parser accepts some inputs with unbalanced or mismatched brackets,
+recovering to a partial result, where a strict parser reports a syntax error:
+
+```
+classad_eval -quiet '[ A = {(0?[0:0)} ]' A     # { 0 }  -- note the mismatched "[" ... ")"
+```
+
+The Go parser rejects such input. This is a libclassad leniency, not mirrored;
+the differential parser fuzzer allowlists parse disagreements whose input has
+unbalanced brackets as CPP_QUIRKS #11.
+
 ## Observed (reasonable) semantics, recorded for completeness
 
 These are not bugs, but were non-obvious and are now matched by the Go engine:
