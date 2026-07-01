@@ -91,6 +91,15 @@ func TestParserCompat(t *testing.T) {
 		// INT64_MIN parses; a bare 2^63 (positive overflow) does not.
 		{`[a = -9223372036854775808]`, true},
 		{`[a = 9223372036854775808]`, false},
+
+		// A real literal whose magnitude overflows float64 is accepted as
+		// +/-Inf (matching strtod), not rejected; a tiny one underflows to 0.
+		// Unlike integer overflow, this is standard IEEE behavior, not a quirk.
+		{`[a = 1e1000]`, true},
+		{`[a = -1e1000]`, true},
+		{`[a = ((1e1000))]`, true},
+		{`[a = 1e-1000]`, true},
+		{`[a = 1.5e308]`, true},
 	}
 	for _, tc := range cases {
 		_, err := Parse(tc.src)

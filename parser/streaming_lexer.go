@@ -711,7 +711,11 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 
 	if hasDecimal || hasExponent {
 		val, err := strconv.ParseFloat(text, 64)
-		if err != nil {
+		// A range error still yields the correctly-rounded value: an
+		// out-of-range magnitude overflows to +/-Inf and a tiny one underflows
+		// to 0, exactly as the reference's strtod does (e.g. "1e1000" is
+		// real(inf)). Only a genuine syntax error is fatal.
+		if err != nil && !errors.Is(err, strconv.ErrRange) {
 			l.Error(fmt.Sprintf("invalid real number: %s", text))
 			return 0
 		}
