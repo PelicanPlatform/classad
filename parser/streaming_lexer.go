@@ -299,9 +299,11 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 		return l.scanIdentifierOrKeyword(ch, lval)
 	}
 
-	// Unknown character
+	// Unknown character: report the error and stop (return EOF) rather than
+	// silently skipping it and lexing on, which would accept malformed input
+	// like "[#]" that the reference parser rejects.
 	l.Error(fmt.Sprintf("unexpected character: %c", ch))
-	return l.Lex(lval)
+	return 0
 }
 
 // Error implements the goyacc Lexer interface.
@@ -689,6 +691,14 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 		}
 		lval.real = val
 		return REAL_LITERAL
+	}
+
+	// The reference parser rejects an integer literal with a leading zero (only
+	// a bare "0" is allowed); it is not read as octal. Match that rather than
+	// silently treating "010" as decimal 10.
+	if len(text) > 1 && text[0] == '0' {
+		l.Error(fmt.Sprintf("leading zero in integer literal: %s", text))
+		return 0
 	}
 
 	val, err := strconv.ParseInt(text, 10, 64)

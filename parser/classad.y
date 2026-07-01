@@ -58,7 +58,7 @@ import (
 
 %type <classad> classad record_literal
 %type <attrs> attr_list
-%type <attr> attr_assign
+%type <attr> attr_assign attr_stmt
 %type <expr> expr literal primary_expr postfix_expr unary_expr
 %type <expr> mult_expr add_expr shift_expr rel_expr eq_expr
 %type <expr> and_expr xor_expr or_expr logical_and_expr logical_or_expr
@@ -79,23 +79,28 @@ start
 classad
 	: '[' attr_list ']'
 		{ $$ = &ast.ClassAd{Attributes: $2} }
-	| '[' ']'
-		{ $$ = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}} }
 	;
 
 record_literal
 	: '[' attr_list ']'
 		{ $$ = &ast.ClassAd{Attributes: $2} }
-	| '[' ']'
-		{ $$ = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}} }
 	;
 
+/* Assignments are separated by ';', but empty statements are allowed anywhere
+   (leading, trailing, doubled, or a semicolon-only/empty body), matching the
+   reference parser: "[;a=1;;b=2;]" and "[ ; ]" and "[]" all parse. Two
+   assignments with no ';' between them ("[a=1 b=2]") is still an error. */
 attr_list
-	: attr_assign
-		{ $$ = []*ast.AttributeAssignment{$1} }
-	| attr_list ';' attr_assign
-		{ $$ = append($1, $3) }
-	| attr_list ';'
+	: attr_stmt
+		{ if $1 != nil { $$ = []*ast.AttributeAssignment{$1} } else { $$ = []*ast.AttributeAssignment{} } }
+	| attr_list ';' attr_stmt
+		{ if $3 != nil { $$ = append($1, $3) } else { $$ = $1 } }
+	;
+
+attr_stmt
+	: /* empty */
+		{ $$ = nil }
+	| attr_assign
 		{ $$ = $1 }
 	;
 
