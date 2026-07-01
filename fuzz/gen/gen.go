@@ -223,8 +223,16 @@ func (g *Generator) randString() string {
 	alphabet := []string{"", "a", "abc", "Hello World", "x y", "1", "true",
 		"a,b,c", "UPPER", "MiXeD", " ", "/", "@example.com",
 		// numeric-looking strings exercise int()/real()/strtod parsing:
-		// decimal, leading-prefix, hex (0x), hex float, and inf/nan spellings.
+		// decimal, leading-prefix, hex (0x), and hex-float spellings.
+		//
+		// "inf"/"nan" and overflowing magnitudes like "1e30" are deliberately
+		// EXCLUDED: int()/floor()/etc. convert a real to an integer with an
+		// unguarded (long long) cast in libclassad, which is undefined behavior
+		// for a non-finite or out-of-int64-range value and yields a
+		// platform-dependent result (INT64_MIN on x86-64, saturation on ARM).
+		// Comparing that against the Go engine's deterministic choice is
+		// meaningless, so we don't generate the trigger. See CPP_QUIRKS.md.
 		"0", "-3.7", "1e10", " 5 ", "12abc", "0x1", "0X01", "0xff", "0x1p4",
-		"010", "inf", "-inf", "nan", "1e30"}
+		"010"}
 	return alphabet[g.rng.Intn(len(alphabet))]
 }

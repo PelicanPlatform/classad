@@ -152,6 +152,45 @@ inputs in libclassad itself — so if a future libclassad release changes this
 note for revision. It links libclassad, so run it with the build tag:
 `CGO_ENABLED=1 go test -tags libclassad ./fuzz/oracle/cgo/`.
 
+## 8. `int()` / `floor()` / `ceiling()` / `round()` of a non-finite or out-of-range real is undefined behavior — likely bug
+
+`convertValueToIntegerValue` (src/classad/value.cpp) turns a real into an
+integer with an **unguarded C++ cast**:
+
+```cpp
+case Value::REAL_VALUE:
+    value.IsRealValue(rvalue);
+    integerValue.SetIntegerValue((long long) rvalue);   // UB if !isfinite or |rvalue| >= 2^63
+
+case Value::STRING_VALUE:
+    ivalue = (long long) strtod(buf.c_str(), &end);      // same, e.g. int("nan")
+```
+
+Casting a `NaN`, `±Inf`, or out-of-`int64`-range `double` to `long long` is
+undefined behavior in C++ (C++20 [conv.fpint]/1). The result is **CPU/compiler
+dependent**:
+
+| Input | x86-64 (`cvttsd2si`) | AArch64 (`fcvtzs`) |
+| --- | --- | --- |
+| `int("nan")`  | `-9223372036854775808` (INT64_MIN) | `0` |
+| `int("inf")`  | `-9223372036854775808` (INT64_MIN) | `9223372036854775807` (saturates) |
+| `int("-inf")` | `-9223372036854775808` (INT64_MIN) | `-9223372036854775808` |
+| `int("1e30")` | `-9223372036854775808` (INT64_MIN) | `9223372036854775807` (saturates) |
+
+So the *same* HTCondor source produces different `int("nan")` results on an
+x86-64 build vs. an ARM build. It is also reachable through arithmetic
+(`int(0.0/0.0)`, `int(pow(10, 1000))`, integer-overflowing products, …), not
+just string literals.
+
+The Go engine does **not** mirror this — it cannot portably reproduce UB, and
+mirroring one CPU's result would be wrong on another. `floatToInt64` picks a
+sane, deterministic, platform-independent behavior (NaN → 0, +Inf → INT64_MAX,
+−Inf/underflow → INT64_MIN — i.e. saturation). The differential fuzzer avoids
+generating the trigger (the generator no longer emits `"inf"`/`"nan"`/`"1e30"`
+literals), because comparing a UB result against any fixed choice is
+meaningless. This is a good candidate to fix upstream by guarding the cast
+(range-check + `isnan`/`isinf`).
+
 ## Observed (reasonable) semantics, recorded for completeness
 
 These are not bugs, but were non-obvious and are now matched by the Go engine:
