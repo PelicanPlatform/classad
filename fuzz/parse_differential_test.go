@@ -46,6 +46,122 @@ func knownParseDelta(src string, r differ.Result) bool {
 	if !r.GoParsed && r.CppParsed && !bracketsBalanced(src) {
 		return true
 	}
+	// Inside a conditional, libclassad's error recovery accepts a then-branch
+	// that ends in a dangling binary operator with no right operand before the
+	// ':' (e.g. "a ? b % : c"); the Go parser rejects it. CPP_QUIRKS #12; not
+	// mirrored. A well-formed ternary's then-expression never ends in a binary
+	// operator, so an operator immediately before ':' is the signature.
+	if !r.GoParsed && r.CppParsed && danglingOpBeforeColon(src) {
+		return true
+	}
+	// libclassad's error recovery accepts a ';' inside a function call's
+	// argument list (e.g. "f(0;1)"), where the Go parser requires ','. A bare
+	// grouping "(0;1)" is rejected by both, so it is specific to call parens.
+	// CPP_QUIRKS #13; not mirrored.
+	if !r.GoParsed && r.CppParsed && semicolonInCallArgs(src) {
+		return true
+	}
+	return false
+}
+
+// semicolonInCallArgs reports whether a ';' appears directly inside a function
+// call's parentheses (a '(' preceded by an identifier character, ')' or ']').
+// Brackets and separators inside "..." string literals and '...' quoted
+// attribute names are ignored.
+func semicolonInCallArgs(src string) bool {
+	isIdent := func(c byte) bool {
+		return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9')
+	}
+	inDQ, inSQ := false, false
+	var callParen []bool // one entry per open '(': true if it is a call
+	var prev byte
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		switch {
+		case inDQ:
+			if c == '\\' {
+				i++
+			} else if c == '"' {
+				inDQ = false
+			}
+			continue
+		case inSQ:
+			if c == '\\' {
+				i++
+			} else if c == '\'' {
+				inSQ = false
+			}
+			continue
+		case c == '"':
+			inDQ = true
+		case c == '\'':
+			inSQ = true
+		case c == '(':
+			callParen = append(callParen, isIdent(prev) || prev == ')' || prev == ']')
+		case c == ')':
+			if len(callParen) > 0 {
+				callParen = callParen[:len(callParen)-1]
+			}
+		case c == ';':
+			if len(callParen) > 0 && callParen[len(callParen)-1] {
+				return true
+			}
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			continue // do not update prev across whitespace
+		}
+		prev = c
+	}
+	return false
+}
+
+// danglingOpBeforeColon reports whether a ':' in src is immediately preceded
+// (ignoring whitespace) by a binary-operator character -- i.e. an expression
+// with a missing right operand sits just before the ternary ':'. Brackets and
+// operators inside "..." string literals and '...' quoted attribute names are
+// ignored.
+func danglingOpBeforeColon(src string) bool {
+	// Characters that terminate a ClassAd binary operator (+ - * / %, & | ^,
+	// < > << >> <= >=, == != =?= =!= =). A valid operand never ends in one.
+	isOpEnd := func(c byte) bool {
+		switch c {
+		case '+', '-', '*', '/', '%', '&', '|', '^', '<', '>', '=', '!':
+			return true
+		}
+		return false
+	}
+	inDQ, inSQ := false, false
+	var prev byte // last non-space significant char, 0 if none
+	for i := 0; i < len(src); i++ {
+		c := src[i]
+		switch {
+		case inDQ:
+			if c == '\\' {
+				i++
+			} else if c == '"' {
+				inDQ = false
+			}
+			continue
+		case inSQ:
+			if c == '\\' {
+				i++
+			} else if c == '\'' {
+				inSQ = false
+			}
+			continue
+		case c == '"':
+			inDQ = true
+		case c == '\'':
+			inSQ = true
+		case c == ':':
+			if isOpEnd(prev) {
+				return true
+			}
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r':
+			continue // do not update prev across whitespace
+		}
+		prev = c
+	}
 	return false
 }
 
