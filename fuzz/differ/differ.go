@@ -36,6 +36,10 @@ const (
 	// cyclic self-references that the Go engine resolves to error -- a C++ bug).
 	// The result is uncomparable, so this is treated as a non-divergence.
 	CppTimeout
+	// KnownQuirk: the engines disagree, but entirely because of a documented
+	// libclassad quirk the Go engine deliberately does not mirror (see
+	// fuzz/CPP_QUIRKS.md). Treated as a non-divergence.
+	KnownQuirk
 )
 
 // cppEvalTimeout bounds a single libclassad evaluation. Normal evaluation takes
@@ -56,6 +60,8 @@ func (c Category) String() string {
 		return "go-panic"
 	case CppTimeout:
 		return "cpp-timeout"
+	case KnownQuirk:
+		return "known-quirk"
 	default:
 		return "unknown"
 	}
@@ -77,7 +83,9 @@ type Result struct {
 // IsDivergence reports whether the result is anything other than a clean match.
 // A CppTimeout is not a divergence: libclassad hung (a C++ bug) so the result
 // is uncomparable.
-func (r Result) IsDivergence() bool { return r.Category != Match && r.Category != CppTimeout }
+func (r Result) IsDivergence() bool {
+	return r.Category != Match && r.Category != CppTimeout && r.Category != KnownQuirk
+}
 
 // Options tunes comparison behavior.
 type Options struct {
@@ -174,6 +182,14 @@ func Compare(src string, opts Options) Result {
 	// Slow path: structural compare with float tolerance.
 	if canon.Equal(goVal, cppVal, opts.Tol) {
 		r.Category = Match
+		return r
+	}
+
+	// A divergence explained entirely by a documented libclassad quirk the Go
+	// engine does not mirror is not a real divergence.
+	if explainedByListIsQuirk(src, goVal, cppVal) {
+		r.Category = KnownQuirk
+		r.Detail = "CPP_QUIRKS #9: =?=/=!= on a list literal vs a function-produced list"
 		return r
 	}
 
