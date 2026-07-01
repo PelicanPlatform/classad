@@ -136,6 +136,12 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 	case '%':
 		return int('%')
 	case '.':
+		// A '.' immediately before a digit begins a fractional float literal
+		// (".5"), which the reference accepts; otherwise it is the selection
+		// operator.
+		if next, err := l.peekRune(); err == nil && unicode.IsDigit(next) {
+			return l.scanNumber('.', lval)
+		}
 		return int('.')
 	case '"':
 		str := l.scanString()
@@ -635,7 +641,8 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 	var sb strings.Builder
 	sb.WriteRune(first)
 
-	hasDecimal := false
+	// first may be '.' when the literal has no integer part (".5").
+	hasDecimal := first == '.'
 	hasExponent := false
 
 	for {

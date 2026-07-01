@@ -26,6 +26,13 @@ func TestParserCompat(t *testing.T) {
 		{`[a = 0.5]`, true},
 		{`[a = 0e5]`, true},
 
+		// A fractional float with no integer part (".5") is accepted; "." on
+		// its own is still the selection operator.
+		{`[a = .5]`, true},
+		{`[a = .0]`, true},
+		{`[a = .5e2]`, true},
+		{`[n = [x=1]; y = n.x]`, true},
+
 		// ';' separates assignments but empty statements are allowed anywhere;
 		// two assignments with no ';' between them is still an error.
 		{`[;a=1]`, true},
