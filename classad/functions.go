@@ -1855,7 +1855,7 @@ func convertStrftimeToGo(t time.Time, format string) string {
 			case 'I':
 				result.WriteString(t.Format("03"))
 			case 'j':
-				result.WriteString(fmt.Sprintf("%03d", t.YearDay()))
+				fmt.Fprintf(&result, "%03d", t.YearDay())
 			case 'm':
 				result.WriteString(t.Format("01"))
 			case 'M':
@@ -1867,9 +1867,9 @@ func convertStrftimeToGo(t time.Time, format string) string {
 			case 'U', 'W':
 				// Week number - simplified
 				_, week := t.ISOWeek()
-				result.WriteString(fmt.Sprintf("%02d", week))
+				fmt.Fprintf(&result, "%02d", week)
 			case 'w':
-				result.WriteString(fmt.Sprintf("%d", t.Weekday()))
+				fmt.Fprintf(&result, "%d", t.Weekday())
 			case 'x':
 				result.WriteString(t.Format("01/02/06"))
 			case 'X':
