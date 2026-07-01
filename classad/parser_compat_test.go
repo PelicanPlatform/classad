@@ -65,6 +65,14 @@ func TestParserCompat(t *testing.T) {
 		{`[a = "x"  "y"  "z"]`, true},
 		{`[a = """"]`, true},
 
+		// Identifiers and numbers are ASCII-only; a Unicode letter is not a
+		// valid identifier character even though unicode.IsLetter accepts it.
+		{`[A=((ǒ))]`, false},
+		{`[ǒ=1]`, false},
+		{`[café=1]`, false},
+		{`[a1=1]`, true},
+		{`[_x=1]`, true},
+
 		// Trailing content after a complete top-level ClassAd is rejected --
 		// including trailing input that triggers a lexer error, which used to
 		// be silently accepted (the Lexer wrapper masked the streaming lexer's
