@@ -262,20 +262,6 @@ rejects the input. This is a libclassad leniency, not mirrored; the differential
 parser fuzzer allowlists parse disagreements whose input has a binary operator
 immediately before a ':' as CPP_QUIRKS #12.
 
-## 13. Error recovery accepts ';' as a function-call argument separator — likely bug
-
-libclassad's parser accepts a `;` where a call's argument list expects a `,`:
-
-```
-classad_eval -quiet '[ a = f(0;1) ]' a    # undefined  -- ';' between call arguments
-```
-
-A bare grouping with the same content (`[a = (0;1)]`) is rejected by both
-engines, so the leniency is specific to a function call's parentheses. The Go
-parser rejects the `;`. This is a libclassad leniency, not mirrored; the
-differential parser fuzzer allowlists parse disagreements whose input has a `;`
-inside call parentheses as CPP_QUIRKS #13.
-
 ## Observed (reasonable) semantics, recorded for completeness
 
 These are not bugs, but were non-obvious and are now matched by the Go engine:
