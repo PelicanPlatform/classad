@@ -52,6 +52,12 @@ jobs:
           bash -euo pipefail -c '
             echo "== reference libclassad =="; condor_version | head -1 || true
 
+            # We run as root over a bind mount owned by the runner user, so git
+            # reports "dubious ownership" and Go cannot stamp VCS info. The fuzz
+            # binaries are throwaway, so disable VCS stamping for every go
+            # command (build/test/run).
+            export GOFLAGS=-buildvcs=false
+
             echo "== build the cgo harness (-tags libclassad) =="
             go build -tags libclassad ./...
 
