@@ -1,3 +1,5 @@
+//go:build libclassad
+
 // Package differ runs one ClassAd through both evaluation engines (the native
 // Go implementation and the reference C++ libclassad via cgo) and classifies
 // any divergence between them.

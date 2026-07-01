@@ -35,6 +35,15 @@ leaves a reproducer. A C++ crash is itself a finding.
   it).
 - `CGO_ENABLED=1` and a C++20 compiler (the headers use `operator<=>`).
 
+Because those requirements are not present on a stock CI runner, everything that
+links `libclassad` — the [`oracle/cgo`](oracle/cgo) package, the
+[`differ`](differ), [`cmd/cafuzz`](cmd/cafuzz), and the `FuzzDifferential` /
+`TestCppQuirks` tests — is behind the **`libclassad` build tag**. A plain
+`go build ./...` / `go test ./...` (as CI runs) simply skips those packages; the
+pure-Go pieces ([`canon`](canon), [`gen`](gen), `cmd/genseeds`) still build and
+test everywhere. To include the C++ engine, pass `-tags libclassad` (as the
+commands below do); the devcontainer has everything the tag needs.
+
 ## Components
 
 | Path | Role |
@@ -73,19 +82,19 @@ thousand times):
 
 ```sh
 # 100k generated ads from seed 1
-CGO_ENABLED=1 go run ./fuzz/cmd/cafuzz -n 100000
+CGO_ENABLED=1 go run -tags libclassad ./fuzz/cmd/cafuzz -n 100000
 
 # focus on evaluation semantics, ignore known parser grammar differences
-CGO_ENABLED=1 go run ./fuzz/cmd/cafuzz -n 100000 -ignore-parse
+CGO_ENABLED=1 go run -tags libclassad ./fuzz/cmd/cafuzz -n 100000 -ignore-parse
 
 # replay a corpus file, one ad per line
-CGO_ENABLED=1 go run ./fuzz/cmd/cafuzz -corpus fuzz/corpus/seeds.txt
+CGO_ENABLED=1 go run -tags libclassad ./fuzz/cmd/cafuzz -corpus fuzz/corpus/seeds.txt
 
 # inspect a single ad in both engines
-CGO_ENABLED=1 go run ./fuzz/cmd/cafuzz -ad '[ a = 1 / 2 ]'
+CGO_ENABLED=1 go run -tags libclassad ./fuzz/cmd/cafuzz -ad '[ a = 1 / 2 ]'
 
 # crash-reproducer journaling (for hunting libclassad crashes)
-CGO_ENABLED=1 go run ./fuzz/cmd/cafuzz -n 1000000 -journal /tmp/last.ad
+CGO_ENABLED=1 go run -tags libclassad ./fuzz/cmd/cafuzz -n 1000000 -journal /tmp/last.ad
 ```
 
 `cafuzz` exits non-zero if any divergence is found.
@@ -94,10 +103,10 @@ CGO_ENABLED=1 go run ./fuzz/cmd/cafuzz -n 1000000 -journal /tmp/last.ad
 
 ```sh
 # explore from a matching baseline; saves any divergence to testdata/fuzz/
-CGO_ENABLED=1 go test ./fuzz -run='xxx' -fuzz='FuzzDifferential' -fuzztime=60s
+CGO_ENABLED=1 go test -tags libclassad ./fuzz -run='xxx' -fuzz='FuzzDifferential' -fuzztime=60s
 
 # re-run a saved finding
-CGO_ENABLED=1 go test ./fuzz -run='FuzzDifferential/<hash>'
+CGO_ENABLED=1 go test -tags libclassad ./fuzz -run='FuzzDifferential/<hash>'
 ```
 
 The fuzz target seeds itself only with inputs the engines currently *agree* on

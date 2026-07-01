@@ -1,3 +1,5 @@
+//go:build libclassad
+
 // Package cgo wraps the reference C++ libclassad evaluation engine and exposes
 // it as an in-process Go engine for differential fuzzing. The C++ work is done
 // by shim.cc, which cgo compiles and links automatically.

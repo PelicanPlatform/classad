@@ -1,3 +1,5 @@
+//go:build libclassad
+
 // Package fuzz hosts the coverage-guided differential fuzz target. It is a thin
 // wrapper around the differ: Go's native fuzzing engine mutates ClassAd source
 // text, and each input is evaluated in both the Go engine and the reference C++

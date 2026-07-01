@@ -149,7 +149,8 @@ empty string (or `undefined`) is `true`. The reference value is pinned by
 `TestCppQuirks` in `fuzz/oracle/cgo/quirks_test.go`, which evaluates these
 inputs in libclassad itself — so if a future libclassad release changes this
 (e.g. fixes the inconsistency), that test fails and flags the Go mirror and this
-note for revision.
+note for revision. It links libclassad, so run it with the build tag:
+`CGO_ENABLED=1 go test -tags libclassad ./fuzz/oracle/cgo/`.
 
 ## Observed (reasonable) semantics, recorded for completeness
 

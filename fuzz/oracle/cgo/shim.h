@@ -1,3 +1,5 @@
+//go:build libclassad
+
 #ifndef CLASSAD_FUZZ_SHIM_H
 #define CLASSAD_FUZZ_SHIM_H
 

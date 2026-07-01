@@ -1,3 +1,5 @@
+//go:build libclassad
+
 package cgo
 
 import (

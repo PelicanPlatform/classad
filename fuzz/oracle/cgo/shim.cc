@@ -1,3 +1,5 @@
+//go:build libclassad
+
 // C++ shim exposing the reference libclassad evaluation engine to Go via a
 // plain C ABI (cgo cannot call C++ directly). It parses a ClassAd, evaluates
 // every top-level attribute in the ad's scope, and serializes the results into

@@ -1,3 +1,5 @@
+//go:build libclassad
+
 // Command cafuzz is the standalone differential driver for the ClassAd
 // evaluation engines. It generates random valid ClassAds (or reads them from a
 // corpus), evaluates each in both the Go engine and the reference C++
