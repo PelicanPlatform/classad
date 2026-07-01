@@ -59,6 +59,7 @@ import (
 %type <classad> classad record_literal
 %type <attrs> attr_list
 %type <attr> attr_assign attr_stmt
+%type <str> strings
 %type <expr> expr literal primary_expr postfix_expr unary_expr
 %type <expr> mult_expr add_expr shift_expr rel_expr eq_expr
 %type <expr> and_expr xor_expr or_expr logical_and_expr logical_or_expr
@@ -264,7 +265,7 @@ literal
 		{ $$ = &ast.IntegerLiteral{Value: $1} }
 	| REAL_LITERAL
 		{ $$ = &ast.RealLiteral{Value: $1} }
-	| STRING_LITERAL
+	| strings
 		{ $$ = &ast.StringLiteral{Value: $1} }
 	| BOOLEAN_LITERAL
 		{ $$ = &ast.BooleanLiteral{Value: $1} }
@@ -272,6 +273,14 @@ literal
 		{ $$ = &ast.UndefinedLiteral{} }
 	| ERROR
 		{ $$ = &ast.ErrorLiteral{} }
+	;
+
+/* Adjacent string literals concatenate, C-style: "a" "b" is "ab". */
+strings
+	: STRING_LITERAL
+		{ $$ = $1 }
+	| strings STRING_LITERAL
+		{ $$ = $1 + $2 }
 	;
 
 opt_expr_list

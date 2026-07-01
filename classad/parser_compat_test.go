@@ -52,6 +52,12 @@ func TestParserCompat(t *testing.T) {
 		{`[;a=1;;b=2;]`, true},
 		{`[a=1 b=2]`, false},
 
+		// Adjacent string literals concatenate (C-style): "a" "b" is "ab".
+		{`[a = "x""y"]`, true},
+		{`[a = "x" "y"]`, true},
+		{`[a = "x"  "y"  "z"]`, true},
+		{`[a = """"]`, true},
+
 		// INT64_MIN parses; a bare 2^63 (positive overflow) does not.
 		{`[a = -9223372036854775808]`, true},
 		{`[a = 9223372036854775808]`, false},

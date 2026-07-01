@@ -98,8 +98,10 @@ func FuzzParseDifferential(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, src string) {
 		// Non-UTF-8 string-literal scanning is a known byte-vs-rune lexer delta
-		// (see README); out of scope for parser-agreement fuzzing.
-		if !utf8.ValidString(src) {
+		// (see README); out of scope for parser-agreement fuzzing. An embedded
+		// NUL is similar: libclassad's C-string lexer treats it as a terminator
+		// (so it rejects a string containing one) while the Go lexer keeps it.
+		if !utf8.ValidString(src) || strings.IndexByte(src, 0) >= 0 {
 			t.Skip()
 		}
 		r := differ.Compare(src, opts)
