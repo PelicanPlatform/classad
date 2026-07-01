@@ -227,11 +227,20 @@ func (v Value) listLen() int {
 // evaluating only that element for a lazy list (so e.g. {selfRef, x}[1]
 // evaluates x without touching the self-referential element 0). The caller must
 // ensure v is a list and 0 <= i < listLen().
-func (v Value) listElementAt(i int) Value {
+func (v Value) listElementAt(i int, parent *Evaluator) Value {
 	if v.listExprs != nil {
-		return evalRecoveringCyclic(NewEvaluator(v.listScope), v.listExprs[i])
+		return evalRecoveringCyclic(subEvaluator(parent, v.listScope), v.listExprs[i])
 	}
 	return v.listVal[i]
+}
+
+// subEvaluator builds a sub-evaluator for ad, continuing parent's recursion
+// depth accounting (parent may be nil at a top-level materialization entry).
+func subEvaluator(parent *Evaluator, ad *ClassAd) *Evaluator {
+	if parent == nil {
+		return NewEvaluator(ad)
+	}
+	return parent.child(ad)
 }
 
 // ClassAdValue returns the ClassAd value. Returns error if not a ClassAd.
@@ -294,11 +303,27 @@ func recoverCyclic(result *Value) {
 // Evaluator handles evaluation of ClassAd expressions.
 type Evaluator struct {
 	classad *ClassAd
+	// depth is the current evaluation recursion depth. It is inherited by
+	// child evaluators created during evaluation (list-element and nested-ad
+	// scopes) so a cyclic value that escapes the per-attribute cycle guard --
+	// e.g. a lazy list element referencing its own attribute, A = {A[0]} --
+	// fails at maxEvalDepth instead of overflowing the goroutine stack.
+	depth int
 }
+
+// maxEvalDepth bounds evaluation recursion. It is far below what overflows the
+// goroutine stack, and deeper than any legitimate expression reaches.
+const maxEvalDepth = 2000
 
 // NewEvaluator creates a new evaluator for the given ClassAd.
 func NewEvaluator(ad *ClassAd) *Evaluator {
 	return &Evaluator{classad: ad}
+}
+
+// child creates a sub-evaluator for ad that continues this evaluator's
+// recursion-depth accounting.
+func (e *Evaluator) child(ad *ClassAd) *Evaluator {
+	return &Evaluator{classad: ad, depth: e.depth}
 }
 
 // Evaluate evaluates an expression in the context of the ClassAd.
@@ -306,6 +331,12 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 	if expr == nil {
 		return NewUndefinedValue()
 	}
+	if e.depth >= maxEvalDepth {
+		// Too deep to be anything but a cycle; treat it as one.
+		panic(cyclicEvalError{})
+	}
+	e.depth++
+	defer func() { e.depth-- }()
 
 	switch v := expr.(type) {
 	case *ast.ParenExpr:
@@ -417,7 +448,7 @@ func (e *Evaluator) evalAttrIn(ad *ClassAd, name string) Value {
 	ad.evaluating[norm] = true
 	defer delete(ad.evaluating, norm)
 
-	return NewEvaluator(ad).Evaluate(expr)
+	return e.child(ad).Evaluate(expr)
 }
 
 func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
@@ -617,7 +648,7 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 	// the enclosing scope), {1,2,3}.A is {error,error,error} (a non-ad element
 	// selects to error), and {}.A is the empty list.
 	if recordVal.IsList() {
-		elems := recordVal.listElementsPropagating()
+		elems := recordVal.listElementsPropagating(e)
 		results := make([]Value, len(elems))
 		for i, el := range elems {
 			results[i] = e.selectAttr(el, sel.Attr)
@@ -635,10 +666,10 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 // A = {0 % A0} and A0 = A.A is error, not list[error]. The panic propagates to
 // the nearest recover (the enclosing attribute evaluation, or the outermost
 // ListValue if projection happens during a later materialization).
-func (v Value) listElementsPropagating() []Value {
+func (v Value) listElementsPropagating(parent *Evaluator) []Value {
 	if v.listExprs != nil {
 		vals := make([]Value, len(v.listExprs))
-		ev := NewEvaluator(v.listScope)
+		ev := subEvaluator(parent, v.listScope)
 		for i, e := range v.listExprs {
 			vals[i] = ev.Evaluate(e)
 		}
@@ -674,7 +705,7 @@ func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
 	// evaluation, so setting its parent here is safe. Resolve the attribute as
 	// an unscoped reference so it chains (and participates in cycle detection).
 	ad.parent = e.classad
-	nested := NewEvaluator(ad)
+	nested := e.child(ad)
 	return nested.evaluateAttributeReference(&ast.AttributeReference{Name: attr})
 }
 
@@ -718,7 +749,7 @@ func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
 		// Evaluate only the indexed element (a lazy list does not evaluate its
 		// other elements), so {selfRef, x}[1] yields x without cycling on the
 		// self-referential element.
-		return containerVal.listElementAt(int(index))
+		return containerVal.listElementAt(int(index), e)
 	}
 
 	// Handle ClassAd subscripting with string key

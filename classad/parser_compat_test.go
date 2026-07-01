@@ -96,3 +96,37 @@ func TestParserCompat(t *testing.T) {
 		}
 	}
 }
+
+// TestCyclicEvalNoCrash guards against unbounded evaluation recursion: a value
+// that references its own attribute through a lazy list element (A = {A[0]})
+// once escaped the per-attribute cycle guard and overflowed the goroutine stack
+// (an unrecoverable crash). Such cycles must resolve to error, like the
+// reference engine, not crash.
+func TestCyclicEvalNoCrash(t *testing.T) {
+	cases := []struct {
+		src, attr, want string
+	}{
+		{`[A={A[0]}]`, "A", "list[E]"}, // {error}
+		{`[A=A]`, "A", "E"},
+		{`[A=B; B=A]`, "A", "E"},
+		{`[a={1,2}; b=a[0]]`, "b", "I:1"}, // non-cyclic subscript still works
+	}
+	for _, tc := range cases {
+		ad, err := Parse(tc.src)
+		if err != nil {
+			t.Errorf("%s: parse error: %v", tc.src, err)
+			continue
+		}
+		v := ad.EvaluateAttr(tc.attr)
+		if tc.want == "list[E]" {
+			elems, lerr := v.ListValue()
+			if lerr != nil || len(elems) != 1 || !elems[0].IsError() {
+				t.Errorf("%s: %s = %v, want a one-element list of error", tc.src, tc.attr, v)
+			}
+			continue
+		}
+		if msg := checkValue(v, tc.want); msg != "" {
+			t.Errorf("%s: %s => %s", tc.src, tc.attr, msg)
+		}
+	}
+}
