@@ -665,6 +665,13 @@ func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
 				return 0
 			}
 			sb.WriteRune(ch)
+			// The reference requires a digit after the decimal point, so "1.",
+			// "5.", and "1.e5" are rejected (a leading-dot ".5" is fine because
+			// the caller only starts a number on '.' when a digit follows).
+			if next, perr := l.peekRune(); perr != nil || !unicode.IsDigit(next) {
+				l.Error(fmt.Sprintf("expected digit after decimal point in %q", sb.String()))
+				return 0
+			}
 			continue
 		}
 

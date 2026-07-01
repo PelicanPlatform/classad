@@ -32,6 +32,14 @@ func TestParserCompat(t *testing.T) {
 		{`[a = .0]`, true},
 		{`[a = .5e2]`, true},
 		{`[n = [x=1]; y = n.x]`, true},
+		// A decimal point (and exponent) must be followed by a digit; a
+		// trailing dot is rejected (the reference rejects "1." and "1.e5").
+		{`[a = 1.]`, false},
+		{`[a = 5.]`, false},
+		{`[a = 0.]`, false},
+		{`[a = 1.e5]`, false},
+		{`[a = 1.5e3]`, true},
+		{`[a = 00.5]`, true},
 
 		// ';' separates assignments but empty statements are allowed anywhere;
 		// two assignments with no ';' between them is still an error.

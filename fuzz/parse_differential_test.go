@@ -14,6 +14,7 @@ package fuzz
 
 import (
 	"strconv"
+	"strings"
 	"testing"
 	"unicode/utf8"
 
@@ -30,6 +31,13 @@ func knownParseDelta(src string, r differ.Result) bool {
 	// a generic "syntax error", so detect the overflowing literal in the source
 	// instead.)
 	if !r.GoParsed && r.CppParsed && containsOverflowingInt(src) {
+		return true
+	}
+	// libclassad's number lexer is strtod-lenient and accepts malformed floats
+	// the Go lexer rejects: a doubled leading dot ("..5" -> 0.0) and a bare
+	// exponent after a dot (".e5" -> undefined). CPP_QUIRKS #10; not mirrored.
+	if !r.GoParsed && r.CppParsed &&
+		(strings.Contains(src, "..") || strings.Contains(src, ".e") || strings.Contains(src, ".E")) {
 		return true
 	}
 	return false
