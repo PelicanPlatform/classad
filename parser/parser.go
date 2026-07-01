@@ -10,14 +10,17 @@ import (
 	"github.com/PelicanPlatform/classad/ast"
 )
 
-// Parse parses a ClassAd expression string and returns the AST.
+// Parse parses a ClassAd string (a bracketed record, "[ a = 1; ... ]") and
+// returns its AST. It does not accept a bare expression; to parse a standalone
+// expression such as "a + 1" or "{1, 2}", use ParseExpr.
 func Parse(input string) (ast.Node, error) {
 	lex := NewLexer(input)
 	yyParse(lex)
 	return lex.Result()
 }
 
-// ParseClassAd parses a ClassAd and returns a ClassAd AST node.
+// ParseClassAd parses a ClassAd and returns a ClassAd AST node. It returns an
+// error if the input is not a ClassAd (for example a bare expression).
 func ParseClassAd(input string) (*ast.ClassAd, error) {
 	node, err := Parse(input)
 	if err != nil {
@@ -26,7 +29,29 @@ func ParseClassAd(input string) (*ast.ClassAd, error) {
 	if classad, ok := node.(*ast.ClassAd); ok {
 		return classad, nil
 	}
-	return nil, nil
+	return nil, fmt.Errorf("parsed input is not a ClassAd, got %T", node)
+}
+
+// ParseExpr parses a standalone ClassAd expression (for example "a + 1",
+// `strcat("x", "y")`, or "{1, 2, 3}") and returns its expression AST. It returns
+// an error if the input is not a single well-formed expression.
+//
+// The grammar's top-level production is a ClassAd, so the expression is parsed
+// inside a throwaway single-attribute wrapper and the attribute's value is
+// returned. This keeps Parse ClassAd-only -- avoiding grammar ambiguity between
+// a record literal and a bare expression -- while still giving callers direct
+// expression access.
+func ParseExpr(input string) (ast.Expr, error) {
+	const wrapAttr = "__classad_parse_expr__"
+	node, err := Parse("[" + wrapAttr + " = " + input + "]")
+	if err != nil {
+		return nil, err
+	}
+	ad, ok := node.(*ast.ClassAd)
+	if !ok || len(ad.Attributes) != 1 {
+		return nil, fmt.Errorf("input is not a single expression")
+	}
+	return ad.Attributes[0].Value, nil
 }
 
 // ReaderParser parses consecutive ClassAds from a buffered reader without

@@ -43,19 +43,11 @@ func (e *Expr) Equal(other *Expr) bool {
 //	    log.Fatal(err)
 //	}
 func ParseExpr(input string) (*Expr, error) {
-	// Wrap the expression in a temporary ClassAd for parsing
-	wrapped := fmt.Sprintf("[__expr__ = %s]", input)
-	node, err := parser.Parse(wrapped)
+	expr, err := parser.ParseExpr(input)
 	if err != nil {
 		return nil, err
 	}
-
-	// Extract the expression from the temporary attribute
-	if ad, ok := node.(*ast.ClassAd); ok && len(ad.Attributes) == 1 {
-		return &Expr{expr: ad.Attributes[0].Value}, nil
-	}
-
-	return nil, fmt.Errorf("unable to extract expression from parsed result")
+	return &Expr{expr: expr}, nil
 }
 
 // Quote escapes a string for safe use in ClassAd expressions.
@@ -1670,16 +1662,9 @@ func (c *ClassAd) unmarshalValue(value interface{}) (ast.Expr, error) {
 
 // parseExpression parses an expression string into an AST expression.
 func (c *ClassAd) parseExpression(exprStr string) (ast.Expr, error) {
-	// Wrap in a temporary ClassAd for parsing
-	wrapped := fmt.Sprintf("[__tmp__ = %s]", exprStr)
-	node, err := parser.Parse(wrapped)
+	expr, err := parser.ParseExpr(exprStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse expression %q: %w", exprStr, err)
 	}
-
-	if ad, ok := node.(*ast.ClassAd); ok && len(ad.Attributes) == 1 {
-		return ad.Attributes[0].Value, nil
-	}
-
-	return nil, fmt.Errorf("unable to extract expression from parsed result")
+	return expr, nil
 }
