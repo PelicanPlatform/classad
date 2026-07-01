@@ -63,14 +63,18 @@ RUN dnf install -y 'dnf-command(config-manager)' && \
 #
 # condor-devel provides the C++ ClassAd headers (/usr/include/classad/*.h) so
 # the differential fuzzer can also link libclassad directly via cgo (see
-# fuzz/oracle/cgo). The linker needs an unversioned libclassad.so symlink, which
-# the -devel package may not create on every arch, so add it explicitly.
+# fuzz/oracle/cgo). The linker needs unversioned libclassad.so and
+# libcondor_utils.so symlinks (the latter holds ClassAdReconfig, which registers
+# HTCondor's extension functions). The versioned SONAME is recorded in the
+# resulting binary, so these symlinks make the cgo link version-independent
+# without changing what is loaded at runtime.
 RUN dnf install -y \
     'condor >= 25.7.2' \
     python3-condor \
     condor-devel \
     && dnf clean all && \
-    ln -sf "$(ldconfig -p | awk '/libclassad\.so/{print $NF; exit}')" /usr/lib64/libclassad.so
+    ln -sf "$(ldconfig -p | awk '/libclassad\.so/{print $NF; exit}')" /usr/lib64/libclassad.so && \
+    ln -sf "$(ldconfig -p | awk '/libcondor_utils.*\.so/{print $NF; exit}')" /usr/lib64/libcondor_utils.so
 
 # Sanity-check that the reference Python ClassAd bindings import cleanly.
 RUN python3 -c "import classad2 as classad; ad = classad.parseAds('[ x = 1 + 2 ]'); print('classad2 bindings OK')" || \

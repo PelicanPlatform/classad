@@ -31,8 +31,10 @@ leaves a reproducer. A C++ crash is itself a finding.
 
 - `condor-devel` (provides `/usr/include/classad/*.h`) — already in the
   [devcontainer Dockerfile](../.devcontainer/Dockerfile).
-- An unversioned `libclassad.so` symlink for the linker (the Dockerfile creates
-  it).
+- Unversioned `libclassad.so` and `libcondor_utils.so` symlinks for the linker
+  (the Dockerfile creates both). The cgo link uses these unversioned names, so
+  it does not hard-code an HTCondor version; the versioned SONAME is still what
+  the binary loads at runtime.
 - `CGO_ENABLED=1` and a C++20 compiler (the headers use `operator<=>`).
 
 Because those requirements are not present on a stock CI runner, everything that
