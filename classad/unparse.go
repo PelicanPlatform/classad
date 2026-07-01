@@ -140,8 +140,14 @@ func unparseUnary(b *strings.Builder, v *ast.UnaryOp) {
 	if v.Op == "-" {
 		switch lit := v.Expr.(type) {
 		case *ast.IntegerLiteral:
-			b.WriteString(strconv.FormatInt(-lit.Value, 10))
-			return
+			// A bare negative integer literal only comes from the parser's
+			// -9223372036854775808 (INT64_MIN) rule. The reference does not
+			// fold a further unary minus onto it, so keep the leading-space
+			// operator ("- -9223372036854775808") instead of collapsing it.
+			if lit.Value >= 0 {
+				b.WriteString(strconv.FormatInt(-lit.Value, 10))
+				return
+			}
 		case *ast.RealLiteral:
 			b.WriteString(classadReal(-lit.Value))
 			return
