@@ -252,6 +252,13 @@ primary_expr
 			name, scope := ParseScopedIdentifier($1)
 			$$ = &ast.AttributeReference{Name: name, Scope: scope}
 		}
+	| '.' IDENTIFIER
+		{
+			// A leading-dot reference (".A") is a plain reference in the
+			// reference engine (".A" resolves identically to "A").
+			name, scope := ParseScopedIdentifier($2)
+			$$ = &ast.AttributeReference{Name: name, Scope: scope}
+		}
 	| '(' expr ')'
 		{ $$ = ast.Parenthesize($2) }
 	| '{' opt_expr_list '}'

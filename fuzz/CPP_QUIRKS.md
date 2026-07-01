@@ -216,21 +216,21 @@ reproducing it would mean tagging list values with their origin purely to copy
 a representation leak. Go's behavior matches the reference for the same-tag
 cases and differs only for the mixed literal-vs-function case.
 
-## 10. The number lexer is strtod-lenient and accepts some malformed floats — likely bug
+## 10. The number lexer is strtod-lenient and accepts a doubled leading dot — likely bug
 
-libclassad's numeric-literal scanner is lenient (strtod-based) and accepts a few
-malformed floats that a stricter parser rejects:
+libclassad's numeric-literal scanner is lenient (strtod-based) and accepts a
+doubled leading dot that a stricter parser rejects:
 
 ```
-classad_eval -quiet '[ x = ..5 ]' x     # 0.0        (doubled leading dot)
-classad_eval -quiet '[ x = .e5 ]' x     # undefined  (dot then bare exponent)
+classad_eval -quiet '[ x = ..5 ]' x     # 0.0   (doubled leading dot)
 ```
 
-`..5` scans as `0.0` and `.e5` as `undefined`, while `.5.5`, `1..5`, `1.2.3`,
-`5.`, `..`, and `1.e5` are all (correctly) rejected. The Go lexer requires a
-well-formed float -- a digit on the fractional side of the dot and after any
-exponent -- so it rejects `..5`/`.e5`. This is not mirrored; the differential
-parser fuzzer allowlists these as CPP_QUIRKS #10.
+`..5` scans as `0.0`, while `.5.5`, `1..5`, `1.2.3`, `5.`, `..`, and `1.e5` are
+all (correctly) rejected. The Go lexer requires a well-formed float -- a digit
+on the fractional side of the dot and after any exponent -- so it rejects `..5`.
+This is not mirrored; the differential parser fuzzer allowlists it as
+CPP_QUIRKS #10. (Note: `.e5` is *not* a malformed float -- it is a leading-dot
+reference to the attribute `e5`, which the Go parser now handles.)
 
 ## Observed (reasonable) semantics, recorded for completeness
 

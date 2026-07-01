@@ -52,6 +52,13 @@ func TestParserCompat(t *testing.T) {
 		{`[;a=1;;b=2;]`, true},
 		{`[a=1 b=2]`, false},
 
+		// A leading-dot reference (".A") is accepted (it resolves like "A").
+		{`[A=1; B=.A]`, true},
+		{`[x=.A]`, true},
+		{`[x=.foo.bar]`, true},
+		{`[x=.e5]`, true}, // a reference to e5, not a malformed float
+		{`[e5=7; x=.e5]`, true},
+
 		// Adjacent string literals concatenate (C-style): "a" "b" is "ab".
 		{`[a = "x""y"]`, true},
 		{`[a = "x" "y"]`, true},

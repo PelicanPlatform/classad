@@ -33,11 +33,11 @@ func knownParseDelta(src string, r differ.Result) bool {
 	if !r.GoParsed && r.CppParsed && containsOverflowingInt(src) {
 		return true
 	}
-	// libclassad's number lexer is strtod-lenient and accepts malformed floats
-	// the Go lexer rejects: a doubled leading dot ("..5" -> 0.0) and a bare
-	// exponent after a dot (".e5" -> undefined). CPP_QUIRKS #10; not mirrored.
-	if !r.GoParsed && r.CppParsed &&
-		(strings.Contains(src, "..") || strings.Contains(src, ".e") || strings.Contains(src, ".E")) {
+	// libclassad's number lexer is strtod-lenient and accepts a doubled leading
+	// dot ("..5" -> 0.0) that the Go lexer rejects. CPP_QUIRKS #10; not
+	// mirrored. (".e5" is a leading-dot reference to e5, handled by the parser,
+	// not a float quirk.)
+	if !r.GoParsed && r.CppParsed && strings.Contains(src, "..") {
 		return true
 	}
 	return false

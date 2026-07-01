@@ -103,7 +103,7 @@ const yyEofCode = 1
 const yyErrCode = 2
 const yyInitialStackSize = 16
 
-//line parser/classad.y:300
+//line parser/classad.y:307
 
 //line yacctab:1
 var yyExca = [...]int8{
@@ -114,46 +114,47 @@ var yyExca = [...]int8{
 
 const yyPrivate = 57344
 
-const yyLast = 158
+const yyLast = 163
 
 var yyAct = [...]int8{
-	78, 13, 76, 23, 21, 18, 25, 19, 24, 110,
-	22, 12, 109, 31, 43, 36, 37, 39, 40, 41,
-	16, 115, 108, 82, 111, 9, 114, 20, 17, 10,
-	8, 9, 66, 67, 75, 69, 71, 72, 73, 4,
-	27, 26, 74, 3, 49, 81, 28, 29, 15, 42,
-	33, 63, 64, 65, 86, 34, 48, 87, 47, 92,
-	93, 94, 95, 61, 62, 99, 100, 84, 105, 96,
-	97, 98, 101, 102, 103, 106, 85, 107, 88, 89,
-	90, 91, 80, 46, 113, 31, 43, 36, 37, 39,
-	40, 41, 70, 44, 83, 45, 31, 43, 36, 37,
-	39, 40, 41, 31, 43, 36, 37, 39, 40, 41,
-	112, 116, 27, 26, 117, 68, 5, 79, 28, 29,
-	104, 42, 33, 27, 26, 7, 11, 34, 1, 28,
-	29, 77, 42, 33, 58, 59, 60, 14, 34, 42,
-	33, 30, 66, 67, 32, 34, 54, 55, 56, 57,
-	50, 51, 52, 53, 38, 6, 35, 2,
+	80, 13, 78, 25, 23, 21, 19, 112, 18, 24,
+	22, 12, 16, 111, 31, 44, 37, 38, 40, 41,
+	42, 117, 110, 10, 84, 113, 9, 20, 17, 8,
+	9, 116, 67, 68, 3, 77, 70, 72, 73, 74,
+	4, 27, 26, 75, 62, 63, 83, 28, 29, 33,
+	43, 34, 64, 65, 66, 50, 35, 89, 88, 49,
+	86, 94, 95, 96, 97, 48, 47, 101, 102, 107,
+	98, 99, 100, 108, 103, 104, 105, 87, 109, 90,
+	91, 92, 93, 15, 82, 114, 115, 31, 44, 37,
+	38, 40, 41, 42, 71, 59, 60, 61, 31, 44,
+	37, 38, 40, 41, 42, 81, 31, 44, 37, 38,
+	40, 41, 42, 118, 27, 26, 119, 69, 5, 106,
+	28, 29, 33, 43, 34, 27, 26, 7, 11, 35,
+	85, 28, 29, 33, 43, 34, 55, 56, 57, 58,
+	35, 33, 43, 34, 67, 68, 76, 1, 35, 51,
+	52, 53, 54, 45, 79, 46, 14, 30, 32, 39,
+	6, 36, 2,
 }
 
 var yyPact = [...]int16{
-	3, -32768, -32768, 121, -12, -32768, -32768, -15, -32768, 121,
-	92, -32768, -32768, -32768, 80, 67, 41, 38, 25, 130,
-	122, 106, 32, 18, -32768, 103, 81, 92, 92, 92,
-	-32768, 1, -32768, 92, 92, -32768, -32768, -32768, 112, -32768,
-	-32768, -32768, 121, -32768, 9, 92, 92, 92, 92, 92,
-	92, 92, 92, 92, 92, 92, 92, 92, 92, 92,
-	92, 92, 92, 92, 92, 92, 116, 92, 99, -32768,
-	-32768, -32768, -32768, -32768, 92, -23, -35, -39, -32768, -32768,
-	-18, 96, 92, 67, 41, 38, 25, 130, 122, 122,
-	122, 122, 106, 106, 106, 106, 32, 32, 32, 18,
-	18, -32768, -32768, -32768, -32768, -16, -7, -24, -32768, -32768,
-	92, -32768, 92, -32768, -32768, -32768, -32768, -32768,
+	-6, -32768, -32768, 123, -13, -32768, -32768, -21, -32768, 123,
+	94, -32768, -32768, -32768, 140, 50, 48, 41, 36, 129,
+	112, 67, 13, 19, -32768, 105, 83, 94, 94, 94,
+	-32768, 2, -32768, 142, 94, 94, -32768, -32768, -32768, 100,
+	-32768, -32768, -32768, 123, -32768, 10, 94, 94, 94, 94,
+	94, 94, 94, 94, 94, 94, 94, 94, 94, 94,
+	94, 94, 94, 94, 94, 94, 94, 115, 94, 102,
+	-32768, -32768, -32768, -32768, -32768, 94, -32768, -23, -34, -41,
+	-32768, -32768, -17, 71, 94, 50, 48, 41, 36, 129,
+	112, 112, 112, 112, 67, 67, 67, 67, 13, 13,
+	13, 19, 19, -32768, -32768, -32768, -32768, -11, -7, -24,
+	-32768, -32768, 94, -32768, 94, -32768, -32768, -32768, -32768, -32768,
 }
 
 var yyPgo = [...]uint8{
-	0, 157, 156, 39, 155, 116, 154, 0, 144, 141,
-	6, 8, 3, 10, 4, 27, 7, 5, 28, 20,
-	48, 137, 1, 131, 2, 128,
+	0, 162, 161, 40, 160, 118, 159, 0, 158, 157,
+	3, 9, 4, 10, 5, 27, 6, 8, 28, 12,
+	83, 156, 1, 154, 2, 147,
 }
 
 var yyR1 = [...]int8{
@@ -163,8 +164,8 @@ var yyR1 = [...]int8{
 	15, 15, 15, 14, 14, 14, 14, 13, 13, 13,
 	12, 12, 12, 12, 11, 11, 11, 11, 11, 11,
 	10, 10, 10, 10, 10, 9, 9, 9, 9, 9,
-	8, 8, 8, 8, 8, 8, 6, 6, 24, 24,
-	23, 23,
+	9, 8, 8, 8, 8, 8, 8, 6, 6, 24,
+	24, 23, 23,
 }
 
 var yyR2 = [...]int8{
@@ -173,39 +174,39 @@ var yyR2 = [...]int8{
 	3, 1, 3, 1, 3, 3, 3, 3, 1, 3,
 	3, 3, 3, 1, 3, 3, 3, 1, 3, 3,
 	1, 3, 3, 3, 1, 2, 2, 2, 2, 2,
-	1, 3, 4, 3, 4, 1, 1, 3, 3, 1,
-	1, 1, 1, 1, 1, 1, 1, 2, 0, 1,
-	1, 3,
+	1, 3, 4, 3, 4, 1, 1, 2, 3, 3,
+	1, 1, 1, 1, 1, 1, 1, 1, 2, 0,
+	1, 1, 3,
 }
 
 var yyChk = [...]int16{
 	-32768, -25, -1, 40, -3, -5, -4, 4, 42, 43,
 	44, -5, -7, -22, -21, -20, -19, -18, -17, -16,
 	-15, -14, -13, -12, -11, -10, 32, 31, 37, 38,
-	-9, 4, -8, 41, 46, -2, 6, 7, -6, 8,
-	9, 10, 40, 5, 13, 15, 16, 17, 18, 19,
-	20, 21, 22, 23, 24, 25, 26, 27, 28, 29,
-	30, 31, 32, 33, 34, 35, 39, 40, 12, -11,
-	11, -11, -11, -11, 41, -7, -24, -23, -7, 5,
-	-3, -7, 14, -20, -19, -18, -17, -16, -15, -15,
-	-15, -15, -14, -14, -14, -14, -13, -13, -13, -12,
-	-12, -11, -11, -11, 4, -7, -10, -24, 45, 47,
-	48, 42, 14, -22, 42, 45, -7, -22,
+	-9, 4, -8, 39, 41, 46, -2, 6, 7, -6,
+	8, 9, 10, 40, 5, 13, 15, 16, 17, 18,
+	19, 20, 21, 22, 23, 24, 25, 26, 27, 28,
+	29, 30, 31, 32, 33, 34, 35, 39, 40, 12,
+	-11, 11, -11, -11, -11, 41, 4, -7, -24, -23,
+	-7, 5, -3, -7, 14, -20, -19, -18, -17, -16,
+	-15, -15, -15, -15, -14, -14, -14, -14, -13, -13,
+	-13, -12, -12, -11, -11, -11, 4, -7, -10, -24,
+	45, 47, 48, 42, 14, -22, 42, 45, -7, -22,
 }
 
 var yyDef = [...]int8{
 	0, -2, 1, 6, 0, 4, 7, 0, 2, 6,
 	0, 5, 8, 9, 10, 13, 15, 17, 19, 21,
 	23, 28, 33, 37, 40, 44, 0, 0, 0, 0,
-	50, 56, 55, 0, 68, 59, 60, 61, 62, 63,
-	64, 65, 6, 66, 0, 0, 0, 0, 0, 0,
+	50, 56, 55, 0, 0, 69, 60, 61, 62, 63,
+	64, 65, 66, 6, 67, 0, 0, 0, 0, 0,
 	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 45,
-	46, 47, 48, 49, 68, 0, 0, 69, 70, 67,
-	0, 0, 0, 14, 16, 18, 20, 22, 24, 25,
-	26, 27, 29, 30, 31, 32, 34, 35, 36, 38,
-	39, 41, 42, 43, 51, 0, 53, 0, 57, 58,
-	0, 3, 0, 12, 52, 54, 71, 11,
+	0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+	45, 46, 47, 48, 49, 69, 57, 0, 0, 70,
+	71, 68, 0, 0, 0, 14, 16, 18, 20, 22,
+	24, 25, 26, 27, 29, 30, 31, 32, 34, 35,
+	36, 38, 39, 41, 42, 43, 51, 0, 53, 0,
+	58, 59, 0, 3, 0, 12, 52, 54, 72, 11,
 }
 
 var yyTok1 = [...]int8{
@@ -919,92 +920,101 @@ yydefault:
 			yyVAL.expr = &ast.AttributeReference{Name: name, Scope: scope}
 		}
 	case 57:
-		yyDollar = yyS[yypt-3 : yypt+1]
+		yyDollar = yyS[yypt-2 : yypt+1]
 //line parser/classad.y:256
 		{
-			yyVAL.expr = ast.Parenthesize(yyDollar[2].expr)
+			// A leading-dot reference (".A") is a plain reference in the
+			// reference engine (".A" resolves identically to "A").
+			name, scope := ParseScopedIdentifier(yyDollar[2].str)
+			yyVAL.expr = &ast.AttributeReference{Name: name, Scope: scope}
 		}
 	case 58:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:258
+//line parser/classad.y:263
+		{
+			yyVAL.expr = ast.Parenthesize(yyDollar[2].expr)
+		}
+	case 59:
+		yyDollar = yyS[yypt-3 : yypt+1]
+//line parser/classad.y:265
 		{
 			yyVAL.expr = &ast.ListLiteral{Elements: yyDollar[2].exprlist}
 		}
-	case 59:
-		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:260
-		{
-			yyVAL.expr = &ast.RecordLiteral{ClassAd: yyDollar[1].classad}
-		}
 	case 60:
-		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:265
-		{
-			yyVAL.expr = &ast.IntegerLiteral{Value: yyDollar[1].integer}
-		}
-	case 61:
 		yyDollar = yyS[yypt-1 : yypt+1]
 //line parser/classad.y:267
 		{
-			yyVAL.expr = &ast.RealLiteral{Value: yyDollar[1].real}
+			yyVAL.expr = &ast.RecordLiteral{ClassAd: yyDollar[1].classad}
+		}
+	case 61:
+		yyDollar = yyS[yypt-1 : yypt+1]
+//line parser/classad.y:272
+		{
+			yyVAL.expr = &ast.IntegerLiteral{Value: yyDollar[1].integer}
 		}
 	case 62:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:269
+//line parser/classad.y:274
 		{
-			yyVAL.expr = &ast.StringLiteral{Value: yyDollar[1].str}
+			yyVAL.expr = &ast.RealLiteral{Value: yyDollar[1].real}
 		}
 	case 63:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:271
+//line parser/classad.y:276
 		{
-			yyVAL.expr = &ast.BooleanLiteral{Value: yyDollar[1].boolean}
+			yyVAL.expr = &ast.StringLiteral{Value: yyDollar[1].str}
 		}
 	case 64:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:273
+//line parser/classad.y:278
 		{
-			yyVAL.expr = &ast.UndefinedLiteral{}
+			yyVAL.expr = &ast.BooleanLiteral{Value: yyDollar[1].boolean}
 		}
 	case 65:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:275
+//line parser/classad.y:280
 		{
-			yyVAL.expr = &ast.ErrorLiteral{}
+			yyVAL.expr = &ast.UndefinedLiteral{}
 		}
 	case 66:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:281
+//line parser/classad.y:282
+		{
+			yyVAL.expr = &ast.ErrorLiteral{}
+		}
+	case 67:
+		yyDollar = yyS[yypt-1 : yypt+1]
+//line parser/classad.y:288
 		{
 			yyVAL.str = yyDollar[1].str
 		}
-	case 67:
+	case 68:
 		yyDollar = yyS[yypt-2 : yypt+1]
-//line parser/classad.y:283
+//line parser/classad.y:290
 		{
 			yyVAL.str = yyDollar[1].str + yyDollar[2].str
 		}
-	case 68:
+	case 69:
 		yyDollar = yyS[yypt-0 : yypt+1]
-//line parser/classad.y:288
+//line parser/classad.y:295
 		{
 			yyVAL.exprlist = []ast.Expr{}
 		}
-	case 69:
+	case 70:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:290
+//line parser/classad.y:297
 		{
 			yyVAL.exprlist = yyDollar[1].exprlist
 		}
-	case 70:
+	case 71:
 		yyDollar = yyS[yypt-1 : yypt+1]
-//line parser/classad.y:295
+//line parser/classad.y:302
 		{
 			yyVAL.exprlist = []ast.Expr{yyDollar[1].expr}
 		}
-	case 71:
+	case 72:
 		yyDollar = yyS[yypt-3 : yypt+1]
-//line parser/classad.y:297
+//line parser/classad.y:304
 		{
 			yyVAL.exprlist = append(yyDollar[1].exprlist, yyDollar[3].expr)
 		}
