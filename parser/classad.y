@@ -64,7 +64,7 @@ import (
 %type <expr> mult_expr add_expr shift_expr rel_expr eq_expr
 %type <expr> and_expr xor_expr or_expr logical_and_expr logical_or_expr
 %type <expr> cond_expr
-%type <exprlist> expr_list opt_expr_list
+%type <exprlist> expr_list opt_expr_list arg_list opt_arg_list
 
 %%
 
@@ -240,7 +240,7 @@ postfix_expr
 		{ $$ = &ast.SubscriptExpr{Container: $1, Index: $3} }
 	| postfix_expr ELVIS postfix_expr
 		{ $$ = &ast.ElvisExpr{Left: $1, Right: $3} }
-	| IDENTIFIER '(' opt_expr_list ')'
+	| IDENTIFIER '(' opt_arg_list ')'
 		{ $$ = &ast.FunctionCall{Name: $1, Args: $3} }
 	;
 
@@ -301,6 +301,26 @@ expr_list
 	: expr
 		{ $$ = []ast.Expr{$1} }
 	| expr_list ',' expr
+		{ $$ = append($1, $3) }
+	;
+
+/* Function-call arguments may be separated by ',' or ';' -- the reference
+   engine treats the two interchangeably (f(a;b) == f(a,b)), evaluating both to
+   the same value. (List literals, by contrast, accept only ','; "{1;2}" is a
+   syntax error in the reference too, so they keep using expr_list.) */
+opt_arg_list
+	: /* empty */
+		{ $$ = []ast.Expr{} }
+	| arg_list
+		{ $$ = $1 }
+	;
+
+arg_list
+	: expr
+		{ $$ = []ast.Expr{$1} }
+	| arg_list ',' expr
+		{ $$ = append($1, $3) }
+	| arg_list ';' expr
 		{ $$ = append($1, $3) }
 	;
 

@@ -91,11 +91,60 @@ func TestParserCompat(t *testing.T) {
 		// INT64_MIN parses; a bare 2^63 (positive overflow) does not.
 		{`[a = -9223372036854775808]`, true},
 		{`[a = 9223372036854775808]`, false},
+
+		// A real literal whose magnitude overflows float64 is accepted as
+		// +/-Inf (matching strtod), not rejected; a tiny one underflows to 0.
+		// Unlike integer overflow, this is standard IEEE behavior, not a quirk.
+		{`[a = 1e1000]`, true},
+		{`[a = -1e1000]`, true},
+		{`[a = ((1e1000))]`, true},
+		{`[a = 1e-1000]`, true},
+		{`[a = 1.5e308]`, true},
+
+		// Function-call arguments may be separated by ';' as well as ',' (the
+		// reference treats them interchangeably); list literals and grouping
+		// keep accepting only ',', so "{1;2}" and "(1;2)" remain errors.
+		{`[a = strcat("x"; "y")]`, true},
+		{`[a = f(1; 2; 3)]`, true},
+		{`[a = f(1, 2; 3)]`, true},
+		{`[a = f()]`, true},
+		{`[a = {1; 2}]`, false},
+		{`[a = (1; 2)]`, false},
 	}
 	for _, tc := range cases {
 		_, err := Parse(tc.src)
 		if got := err == nil; got != tc.parse {
 			t.Errorf("Parse(%q): parsed=%v, want %v (err=%v)", tc.src, got, tc.parse, err)
+		}
+	}
+}
+
+// TestSemicolonArgSeparator pins that ';' works as a function-call argument
+// separator identically to ',' -- the reference engine treats them
+// interchangeably (strcat("a";"b") is "ab", not an error). See TestParserCompat
+// for the accept/reject side.
+func TestSemicolonArgSeparator(t *testing.T) {
+	// Each pair must evaluate x to the same value with ',' and with ';'.
+	pairs := [][2]string{
+		{`[x = strcat("a", "b")]`, `[x = strcat("a"; "b")]`},
+		{`[x = pow(2, 3)]`, `[x = pow(2; 3)]`},
+		{`[x = substr("hello", 1, 3)]`, `[x = substr("hello"; 1; 3)]`},
+		{`[x = ifThenElse(true, 1, 2)]`, `[x = ifThenElse(true; 1; 2)]`},
+		{`[x = strcat("a", "b", "c")]`, `[x = strcat("a", "b"; "c")]`}, // mixed
+	}
+	for _, p := range pairs {
+		var got [2]string
+		for i, src := range p {
+			ad, err := Parse(src)
+			if err != nil {
+				t.Errorf("Parse(%q): %v", src, err)
+				got[i] = "parse-error"
+				continue
+			}
+			got[i] = ad.EvaluateAttr("x").String()
+		}
+		if got[0] != got[1] {
+			t.Errorf("',' vs ';' differ: %q=>%s  %q=>%s", p[0], got[0], p[1], got[1])
 		}
 	}
 }

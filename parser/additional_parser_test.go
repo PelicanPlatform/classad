@@ -2,6 +2,7 @@ package parser
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -414,5 +415,81 @@ func TestQuotedAttributeNames(t *testing.T) {
 	v := n.(*ast.ClassAd).Attributes[0].Value
 	if _, ok := v.(*ast.FunctionCall); !ok {
 		t.Errorf("''(0): value = %T, want *ast.FunctionCall", v)
+	}
+}
+
+// TestParseExpr checks that ParseExpr accepts standalone expressions and
+// rejects input that is not a single well-formed expression. (Fixes #8.)
+func TestParseExpr(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+	}{
+		{"integer", "42", false},
+		{"arithmetic", "2 + 3", false},
+		{"precedence", "2 + 3 * 4", false},
+		{"boolean", "(x > 5) && (y < 10)", false},
+		{"string", `"hello world"`, false},
+		{"list", "{1, 2, 3, 4, 5}", false},
+		{"function call", `strcat("Hello", " ", "World")`, false},
+		{"conditional", `x > 0 ? "positive" : "non-positive"`, false},
+		{"scoped ref", "MY.attr", false},
+		{"true", "true", false},
+		{"undefined", "undefined", false},
+		{"error", "error", false},
+		{"record literal", "[a = 1; b = 2]", false},
+		{"nested", "((1 + 2) * (3 + 4))", false},
+		{"empty", "", true},
+		{"syntax error", "2 + +", true},
+		{"trailing junk", "1 2", true},
+		{"two statements", "a = 1; b = 2", true},
+		{"unterminated", "1 +", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := ParseExpr(tt.input)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("ParseExpr(%q): expected error, got %T", tt.input, expr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseExpr(%q): unexpected error: %v", tt.input, err)
+			}
+			if expr == nil {
+				t.Fatalf("ParseExpr(%q): returned nil expression", tt.input)
+			}
+		})
+	}
+}
+
+// TestParseExprType checks that ParseExpr returns the genuine expression AST
+// node (not a wrapper), so callers can type-switch on the result.
+func TestParseExprType(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"42", "*ast.IntegerLiteral"},
+		{"3.14", "*ast.RealLiteral"},
+		{`"hello"`, "*ast.StringLiteral"},
+		{"true", "*ast.BooleanLiteral"},
+		{"{1, 2}", "*ast.ListLiteral"},
+		{"1 + 2", "*ast.BinaryOp"},
+		{"x", "*ast.AttributeReference"},
+		{"func()", "*ast.FunctionCall"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			expr, err := ParseExpr(tt.input)
+			if err != nil {
+				t.Fatalf("ParseExpr(%q): unexpected error: %v", tt.input, err)
+			}
+			if got := fmt.Sprintf("%T", expr); got != tt.want {
+				t.Errorf("ParseExpr(%q): type = %s, want %s", tt.input, got, tt.want)
+			}
+		})
 	}
 }
