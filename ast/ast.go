@@ -1,7 +1,88 @@
 // Package ast defines the Abstract Syntax Tree node types for ClassAds expressions.
 package ast
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+	"unicode"
+)
+
+// QuoteAttributeName renders an attribute name so it re-parses: a valid bare
+// identifier is returned as-is; anything else (empty, non-identifier
+// characters, or a name that would lex as a reserved keyword/literal) is
+// single-quoted with '\” and '\\' escaped, matching the lexer's
+// quoted-attribute-name unescaping.
+func QuoteAttributeName(name string) string {
+	if isBareAttributeName(name) {
+		return name
+	}
+	var b strings.Builder
+	b.WriteByte('\'')
+	for _, r := range name {
+		if r == '\'' || r == '\\' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('\'')
+	return b.String()
+}
+
+// QuoteString renders a string value as a double-quoted ClassAd string literal
+// that the lexer can read back: it uses only the escapes the lexer decodes
+// (\b \f \n \r \t \\ \"), octal (\NNN) for other control characters, and emits
+// everything else (printable ASCII and valid Unicode) verbatim. It deliberately
+// avoids Go's \xNN hex escapes, which the lexer does not understand.
+func QuoteString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			if r < 0x20 {
+				fmt.Fprintf(&b, "\\%03o", r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+func isBareAttributeName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i, r := range name {
+		if i == 0 {
+			if !unicode.IsLetter(r) && r != '_' {
+				return false
+			}
+		} else if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' {
+			return false
+		}
+	}
+	switch strings.ToLower(name) {
+	case "true", "false", "undefined", "error", "is", "isnt":
+		return false
+	}
+	return true
+}
 
 // Node is the base interface for all AST nodes.
 type Node interface {
@@ -40,7 +121,7 @@ type AttributeAssignment struct {
 }
 
 func (a *AttributeAssignment) String() string {
-	return fmt.Sprintf("%s = %s", a.Name, a.Value.String())
+	return fmt.Sprintf("%s = %s", QuoteAttributeName(a.Name), a.Value.String())
 }
 
 // IntegerLiteral represents an integer constant.
@@ -71,7 +152,7 @@ type StringLiteral struct {
 }
 
 func (s *StringLiteral) String() string {
-	return fmt.Sprintf("%q", s.Value)
+	return QuoteString(s.Value)
 }
 
 func (s *StringLiteral) exprNode() {}
@@ -129,15 +210,16 @@ type AttributeReference struct {
 }
 
 func (a *AttributeReference) String() string {
+	name := QuoteAttributeName(a.Name)
 	switch a.Scope {
 	case MyScope:
-		return fmt.Sprintf("MY.%s", a.Name)
+		return "MY." + name
 	case TargetScope:
-		return fmt.Sprintf("TARGET.%s", a.Name)
+		return "TARGET." + name
 	case ParentScope:
-		return fmt.Sprintf("PARENT.%s", a.Name)
+		return "PARENT." + name
 	default:
-		return a.Name
+		return name
 	}
 }
 
@@ -251,7 +333,15 @@ type SelectExpr struct {
 }
 
 func (s *SelectExpr) String() string {
-	return fmt.Sprintf("%s.%s", s.Record.String(), s.Attr)
+	// A bare numeric literal before '.' would re-lex as a real ("0.A"), so
+	// separate it with a space; the attribute is quoted if it is not a bare
+	// identifier (e.g. a keyword like 'true').
+	sep := "."
+	switch s.Record.(type) {
+	case *IntegerLiteral, *RealLiteral:
+		sep = " ."
+	}
+	return s.Record.String() + sep + QuoteAttributeName(s.Attr)
 }
 
 func (s *SelectExpr) exprNode() {}
