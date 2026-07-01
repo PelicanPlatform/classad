@@ -553,7 +553,7 @@ The evaluator supports 25+ built-in functions:
 **String Functions:**
 - `strcat(s1, s2, ...)` - Concatenate strings
 - `substr(str, offset, length)` - Extract substring
-- `size(str)` / `length(str)` - String/list length
+- `size(str)` - String/list length
 - `toUpper(str)` / `toLower(str)` - Case conversion
 - `stringListMember(str, list, options)` - Test membership in comma-separated list
 - `regexp(pattern, target, options)` - Regular expression matching

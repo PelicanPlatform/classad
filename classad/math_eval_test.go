@@ -63,9 +63,11 @@ func TestEvaluateExprMathErrorPaths(t *testing.T) {
 		t.Fatalf("expected floor on string to be error, got %v", errVal.Type())
 	}
 
-	undefVal := evalExpr(t, "floor(undefined)")
-	if !undefVal.IsUndefined() {
-		t.Fatalf("expected undefined from floor(undefined), got %v", undefVal.Type())
+	// floor of a non-number, including undefined, is an error (matching the
+	// reference engine, unlike int()/real() which propagate undefined).
+	floorUndef := evalExpr(t, "floor(undefined)")
+	if !floorUndef.IsError() {
+		t.Fatalf("expected error from floor(undefined), got %v", floorUndef.Type())
 	}
 
 	powErr := evalExpr(t, "pow(\"x\", 2)")
@@ -78,9 +80,11 @@ func TestEvaluateExprMathErrorPaths(t *testing.T) {
 		t.Fatalf("expected error from quantize non-numeric input")
 	}
 
+	// A list base whose element does not convert to a number is an error in
+	// the reference engine, not undefined.
 	quantizeUndef := evalExpr(t, "quantize(12, {undefined})")
-	if !quantizeUndef.IsUndefined() {
-		t.Fatalf("expected undefined from quantize with all undefined list entries")
+	if !quantizeUndef.IsError() {
+		t.Fatalf("expected error from quantize with non-numeric list entry, got %v", quantizeUndef.Type())
 	}
 }
 
@@ -98,9 +102,11 @@ func TestEvaluateExprUnaryAndDivide(t *testing.T) {
 		t.Fatalf("-(4) = %d, want -4", got)
 	}
 
-	notErr := evalExpr(t, "!1")
-	if !notErr.IsError() {
-		t.Fatalf("expected error from logical not on non-bool")
+	// Logical not coerces a number's truthiness like the reference engine:
+	// !1 is false (1 is truthy), not an error.
+	notOne := evalExpr(t, "!1")
+	if b, _ := notOne.BoolValue(); notOne.IsError() || b {
+		t.Fatalf("!1 = %v, want false", notOne)
 	}
 
 	plErr := evalExpr(t, "+\"str\"")

@@ -260,26 +260,26 @@ func TestUnmarshalClassAd(t *testing.T) {
 func TestBuiltinToLowerError(t *testing.T) {
 	ad := New()
 
-	// Test with non-string argument (should return error)
+	// A numeric argument is coerced to its string form (matching the
+	// reference engine): toLower(123) == "123".
 	ad.InsertAttr("num", 123)
 	expr, _ := ParseExpr("toLower(num)")
 	result := expr.Eval(ad)
 
-	if !result.IsError() {
-		t.Error("Expected error for non-string argument")
+	if s, _ := result.StringValue(); !result.IsString() || s != "123" {
+		t.Errorf("Expected \"123\", got %v", result)
 	}
 }
 
 func TestBuiltinToUpperError(t *testing.T) {
 	ad := New()
 
-	// Test with non-string argument (should return error)
 	ad.InsertAttr("num", 123)
 	expr, _ := ParseExpr("toUpper(num)")
 	result := expr.Eval(ad)
 
-	if !result.IsError() {
-		t.Error("Expected error for non-string argument")
+	if s, _ := result.StringValue(); !result.IsString() || s != "123" {
+		t.Errorf("Expected \"123\", got %v", result)
 	}
 }
 
@@ -478,14 +478,15 @@ func TestBuiltinStrcmpEdgeCases(t *testing.T) {
 		})
 	}
 
-	// Test error cases - boolean type
+	// A boolean argument is coerced to its string form ("true") and compared,
+	// matching the reference engine: strcmp("true", "hello") == 1.
 	ad.Clear()
 	ad.InsertAttrBool("bool", true)
 	expr, _ := ParseExpr("strcmp(bool, \"hello\")")
 	result := expr.Eval(ad)
 
-	if !result.IsError() {
-		t.Error("Expected error for boolean argument")
+	if v, _ := result.IntValue(); v != 1 {
+		t.Errorf("Expected 1 for coerced boolean argument, got %v", result)
 	}
 }
 
@@ -524,14 +525,15 @@ func TestBuiltinStricmpEdgeCases(t *testing.T) {
 		})
 	}
 
-	// Test error cases - boolean type
+	// A boolean argument is coerced to its string form ("true") and compared,
+	// matching the reference engine: stricmp("true", "hello") == 1.
 	ad.Clear()
 	ad.InsertAttrBool("bool", true)
 	expr, _ := ParseExpr("stricmp(bool, \"hello\")")
 	result := expr.Eval(ad)
 
-	if !result.IsError() {
-		t.Error("Expected error for boolean argument")
+	if v, _ := result.IntValue(); v != 1 {
+		t.Errorf("Expected 1 for coerced boolean argument, got %v", result)
 	}
 }
 
@@ -562,13 +564,14 @@ func TestBuiltinJoinEdgeCases(t *testing.T) {
 		t.Fatal("Expected string result")
 	}
 
-	// Test with non-string separator
+	// A numeric separator is coerced to its string form (matching the reference
+	// engine), not an error: join(123, {"a","b","c"}) is "a123b123c".
 	InsertAttrList(ad, "list", []string{"a", "b", "c"})
 	expr3, _ := ParseExpr("join(123, list)")
 	result3 := expr3.Eval(ad)
 
-	if !result3.IsError() {
-		t.Error("Expected error for non-string separator")
+	if s, _ := result3.StringValue(); !result3.IsString() || s != "a123b123c" {
+		t.Errorf("join(123, list) = %v %q, want \"a123b123c\"", result3.Type(), s)
 	}
 }
 

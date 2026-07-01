@@ -110,10 +110,11 @@ func (e *Expr) internal() ast.Expr {
 
 // Eval evaluates the expression in the context of the given ClassAd.
 // This is equivalent to calling classad.EvaluateExpr(expr).
-func (e *Expr) Eval(scope *ClassAd) Value {
+func (e *Expr) Eval(scope *ClassAd) (result Value) {
 	if e.expr == nil {
 		return NewUndefinedValue()
 	}
+	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(scope)
 	return evaluator.Evaluate(e.expr)
 }
@@ -127,7 +128,7 @@ func (e *Expr) Eval(scope *ClassAd) Value {
 //
 //	expr, _ := classad.ParseExpr("MY.Cpus > TARGET.Cpus")
 //	result := expr.EvalWithContext(jobAd, machineAd)
-func (e *Expr) EvalWithContext(scope, target *ClassAd) Value {
+func (e *Expr) EvalWithContext(scope, target *ClassAd) (result Value) {
 	if e.expr == nil {
 		return NewUndefinedValue()
 	}
@@ -140,6 +141,7 @@ func (e *Expr) EvalWithContext(scope, target *ClassAd) Value {
 		defer func() { scope.target = oldTarget }()
 	}
 
+	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(scope)
 	return evaluator.Evaluate(e.expr)
 }
@@ -152,6 +154,12 @@ type ClassAd struct {
 	target     *ClassAd
 	index      map[string]*ast.Expr
 	attrsDirty bool // true when attributes changed since last sort
+	// evaluating holds the normalized names of attributes currently being
+	// evaluated in this ad, to detect cyclic references (e.g. [a=a] or
+	// [a=b;b=a]). The reference engine reports such a cycle as a failed
+	// evaluation; without this guard the Go evaluator would recurse until the
+	// stack overflows.
+	evaluating map[string]bool
 }
 
 // Equal reports whether two ClassAds have the same attributes and values, ignoring
@@ -190,8 +198,42 @@ func normalizeName(name string) string {
 	return strings.ToLower(name)
 }
 
+// dedupAttributes collapses duplicate attribute names, keeping each name's
+// last assignment, matching the reference engine -- a ClassAd is a map there,
+// so a later "x = ..." overwrites an earlier one ([B=1;B=2] has B==2). The
+// retained entries keep the order of their last occurrence.
+func (c *ClassAd) dedupAttributes() {
+	if c.ad == nil || len(c.ad.Attributes) < 2 {
+		return
+	}
+	// Attribute names are case-insensitive. The reference engine keeps the
+	// first occurrence's name (its casing and position) but the last
+	// occurrence's value: [A=1; a=2] is A==2.
+	firstIdx := make(map[string]int, len(c.ad.Attributes))
+	lastValue := make(map[string]ast.Expr, len(c.ad.Attributes))
+	order := make([]string, 0, len(c.ad.Attributes))
+	for i, attr := range c.ad.Attributes {
+		n := normalizeName(attr.Name)
+		if _, seen := firstIdx[n]; !seen {
+			firstIdx[n] = i
+			order = append(order, n)
+		}
+		lastValue[n] = attr.Value
+	}
+	if len(firstIdx) == len(c.ad.Attributes) {
+		return // no duplicates
+	}
+	kept := make([]*ast.AttributeAssignment, 0, len(firstIdx))
+	for _, n := range order {
+		first := c.ad.Attributes[firstIdx[n]]
+		kept = append(kept, &ast.AttributeAssignment{Name: first.Name, Value: lastValue[n]})
+	}
+	c.ad.Attributes = kept
+}
+
 // rebuildIndex recreates the fast lookup map from the underlying attributes.
 func (c *ClassAd) rebuildIndex() {
+	c.dedupAttributes()
 	if c.ad == nil {
 		c.index = nil
 		return
@@ -752,12 +794,13 @@ func (c *ClassAd) GetTarget() *ClassAd {
 }
 
 // EvaluateAttr evaluates an attribute and returns its value.
-func (c *ClassAd) EvaluateAttr(name string) Value {
+func (c *ClassAd) EvaluateAttr(name string) (result Value) {
 	expr := c.lookupInternal(name)
 	if expr == nil {
 		return NewUndefinedValue()
 	}
 
+	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(c)
 	return evaluator.Evaluate(expr)
 }
@@ -834,7 +877,8 @@ func (c *ClassAd) EvaluateAttrBool(name string) (bool, bool) {
 }
 
 // EvaluateExpr evaluates an arbitrary expression in the context of this ClassAd.
-func (c *ClassAd) EvaluateExpr(expr ast.Expr) Value {
+func (c *ClassAd) EvaluateExpr(expr ast.Expr) (result Value) {
+	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(c)
 	return evaluator.Evaluate(expr)
 }
@@ -947,6 +991,9 @@ func (c *ClassAd) collectRefs(expr ast.Expr) []string {
 // collectRefsHelper is a recursive helper for collectRefs
 func (c *ClassAd) collectRefsHelper(expr ast.Expr, refs map[string]bool) {
 	switch v := expr.(type) {
+	case *ast.ParenExpr:
+		c.collectRefsHelper(v.Inner, refs)
+
 	case *ast.AttributeReference:
 		// Only collect non-scoped references (no MY., TARGET., PARENT.)
 		if v.Scope == ast.NoScope {
@@ -1024,6 +1071,19 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 	}
 
 	switch v := expr.(type) {
+	case *ast.ParenExpr:
+		inner := c.flattenExpr(v.Inner)
+		// Keep the parentheses only around an operator, where they carry
+		// precedence; drop them once the inner expression has collapsed to a
+		// literal/primary so constant folding can see it (and so the flattened
+		// form is not littered with cosmetic parens).
+		switch inner.(type) {
+		case *ast.BinaryOp, *ast.UnaryOp, *ast.ConditionalExpr, *ast.ElvisExpr:
+			return &ast.ParenExpr{Inner: inner}
+		default:
+			return inner
+		}
+
 	case *ast.AttributeReference:
 		// Try to evaluate the reference
 		if v.Scope == ast.NoScope {
@@ -1271,6 +1331,22 @@ func exprEqual(a, b ast.Expr) bool {
 	}
 	if a == nil || b == nil {
 		return false
+	}
+
+	// Parentheses are transparent to structural equality.
+	for {
+		if p, ok := a.(*ast.ParenExpr); ok {
+			a = p.Inner
+		} else {
+			break
+		}
+	}
+	for {
+		if p, ok := b.(*ast.ParenExpr); ok {
+			b = p.Inner
+		} else {
+			break
+		}
 	}
 
 	switch av := a.(type) {

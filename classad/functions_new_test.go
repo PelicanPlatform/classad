@@ -31,13 +31,16 @@ func TestStringListMember(t *testing.T) {
 			expected: false,
 		},
 		{
-			name:     "case insensitive match",
+			// The third argument is the delimiter set, not a case option, and
+			// stringListMember is always case-sensitive: with delimiter "i"
+			// the list has no 'i' to split on, so "Apple" is not a member.
+			name:     "third arg is delimiter, not case option",
 			expr:     `stringListMember("Apple", "apple,banana,cherry", "i")`,
-			expected: true,
+			expected: false,
 		},
 		{
-			name:     "case insensitive uppercase option",
-			expr:     `stringListMember("BANANA", "apple,banana,cherry", "I")`,
+			name:     "custom delimiter match",
+			expr:     `stringListMember("banana", "apple;banana;cherry", ";")`,
 			expected: true,
 		},
 		{
@@ -544,10 +547,11 @@ func TestIfThenElse(t *testing.T) {
 			isError:  true,
 		},
 		{
-			name:     "non-boolean condition",
+			// A numeric condition coerces its truthiness (42 is true), matching
+			// the ?: operator and the reference engine.
+			name:     "numeric condition",
 			expr:     `ifThenElse(42, "yes", "no")`,
-			expected: nil,
-			isError:  true,
+			expected: "yes",
 		},
 	}
 
@@ -610,10 +614,11 @@ func TestBuiltinString(t *testing.T) {
 			expected: "42",
 		},
 		{
+			// The reference engine renders reals in %.15E form.
 			name:     "real to string",
 			classad:  "[]",
 			expr:     "string(3.14)",
-			expected: "3.14",
+			expected: "3.140000000000000E+00",
 		},
 		{
 			name:     "boolean true to string",
@@ -674,6 +679,7 @@ func TestBuiltinBool(t *testing.T) {
 		expr     string
 		expected bool
 		isError  bool
+		isUndef  bool
 	}{
 		{
 			name:     "string true",
@@ -718,10 +724,12 @@ func TestBuiltinBool(t *testing.T) {
 			expected: false,
 		},
 		{
+			// A non-true/false string is undefined (not error), matching the
+			// reference engine.
 			name:    "invalid string",
 			classad: "[]",
 			expr:    `bool("invalid")`,
-			isError: true,
+			isUndef: true,
 		},
 	}
 
@@ -742,6 +750,12 @@ func TestBuiltinBool(t *testing.T) {
 			if tt.isError {
 				if !val.IsError() {
 					t.Errorf("Expected ERROR, got %v", val)
+				}
+				return
+			}
+			if tt.isUndef {
+				if !val.IsUndefined() {
+					t.Errorf("Expected UNDEFINED, got %v", val)
 				}
 				return
 			}
@@ -1138,14 +1152,12 @@ func TestBuiltinVersionComparisonFunctions(t *testing.T) {
 		expr     string
 		expected bool
 	}{
-		{"version_gt true", `version_gt("2.0", "1.9")`, true},
-		{"version_gt false", `version_gt("1.9", "2.0")`, false},
-		{"version_ge equal", `version_ge("1.5", "1.5")`, true},
-		{"version_lt true", `version_lt("1.0", "2.0")`, true},
-		{"version_le equal", `version_le("3.0", "3.0")`, true},
-		{"version_eq true", `version_eq("1.2.3", "1.2.3")`, true},
+		// Only versioncmp and version_in_range are reference functions; the
+		// per-operator version_gt/ge/lt/le/eq names are not (the reference uses
+		// camelCase versionGT/... -- see CPP_QUIRKS.md -- and errors on these).
 		{"version_in_range true", `version_in_range("1.5", "1.0", "2.0")`, true},
 		{"version_in_range false", `version_in_range("2.5", "1.0", "2.0")`, false},
+		{"version_in_range coerces ints", `version_in_range(5, "1", "9")`, true},
 	}
 
 	for _, tt := range tests {
@@ -1166,6 +1178,18 @@ func TestBuiltinVersionComparisonFunctions(t *testing.T) {
 				}
 			}
 		})
+	}
+
+	// The underscore-spelled per-operator helpers are not reference functions.
+	for _, expr := range []string{
+		`version_gt("2.0", "1.9")`, `version_ge("1.5", "1.5")`,
+		`version_lt("1.0", "2.0")`, `version_le("3.0", "3.0")`,
+		`version_eq("1.2.3", "1.2.3")`,
+	} {
+		ad, _ := Parse("[test = " + expr + "]")
+		if !ad.EvaluateAttr("test").IsError() {
+			t.Errorf("%s (non-reference name) should be error", expr)
+		}
 	}
 }
 
@@ -1207,7 +1231,8 @@ func TestBuiltinInterval(t *testing.T) {
 		expr     string
 		expected string
 	}{
-		{"seconds only", `interval(45)`, "0:45"},
+		// Under a minute is just the seconds (matching the reference engine).
+		{"seconds only", `interval(45)`, "45"},
 		{"minutes", `interval(125)`, "2:05"},
 		{"hours", `interval(3665)`, "1:01:05"},
 		{"days", `interval(90125)`, "1+01:02:05"},
@@ -1491,44 +1516,30 @@ func TestStringListSum(t *testing.T) {
 }
 
 func TestStringListAvg(t *testing.T) {
+	// Matching the reference engine: an all-integer list averages with integer
+	// division and an integer result; a real item makes the result real; an
+	// empty list is real 0.0.
 	tests := []struct {
 		name     string
 		listStr  string
 		expected float64
+		isReal   bool
 	}{
-		{
-			name:     "integers",
-			listStr:  "2,4,6,8",
-			expected: 5.0,
-		},
-		{
-			name:     "reals",
-			listStr:  "1.0,2.0,3.0",
-			expected: 2.0,
-		},
-		{
-			name:     "single value",
-			listStr:  "42",
-			expected: 42.0,
-		},
-		{
-			name:     "empty list",
-			listStr:  "",
-			expected: 0.0,
-		},
+		{name: "integers", listStr: "2,4,6,8", expected: 5},
+		{name: "reals", listStr: "1.0,2.0,3.0", expected: 2.0, isReal: true},
+		{name: "single value", listStr: "42", expected: 42},
+		{name: "empty list", listStr: "", expected: 0.0, isReal: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			args := []Value{NewStringValue(tt.listStr)}
-			val := builtinStringListAvg(args)
-			if !val.IsReal() {
-				t.Errorf("stringListAvg() did not return real, got %v", val.Type())
-			} else {
-				result, _ := val.RealValue()
-				if result != tt.expected {
-					t.Errorf("stringListAvg() = %v, want %v", result, tt.expected)
-				}
+			val := builtinStringListAvg([]Value{NewStringValue(tt.listStr)})
+			if val.IsReal() != tt.isReal {
+				t.Errorf("stringListAvg(%q) type = %v, want isReal=%v", tt.listStr, val.Type(), tt.isReal)
+			}
+			result, _ := val.NumberValue()
+			if result != tt.expected {
+				t.Errorf("stringListAvg(%q) = %v, want %v", tt.listStr, result, tt.expected)
 			}
 		})
 	}

@@ -1,0 +1,75 @@
+name: Fuzz
+
+# Differential fuzzing of the Go ClassAd engine against HTCondor's reference
+# C++ libclassad. This needs libclassad + the extension-function library, which
+# a stock runner does not have, so everything runs inside the repo's
+# devcontainer image (.devcontainer/Dockerfile: Rocky Linux 9 + Go + HTCondor).
+# The libclassad-linked code is behind the `libclassad` build tag (see
+# fuzz/README.md); the rest of CI (.github/workflows/test.yml) builds without it.
+
+on:
+  pull_request:
+    branches: [ main, develop ]
+  push:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      count:
+        description: "Generated ads per seed in the differential survey"
+        default: "20000"
+      seeds:
+        description: "Space-separated survey seeds"
+        default: "1 2 3 4"
+
+jobs:
+  differential:
+    name: Differential fuzz (Go vs libclassad)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build dev image (Go + HTCondor + libclassad)
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: .devcontainer/Dockerfile
+        tags: classad-dev:latest
+        load: true
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build, unit-test, and run the differential survey
+      env:
+        COUNT: ${{ github.event.inputs.count || '20000' }}
+        SEEDS: ${{ github.event.inputs.seeds || '1 2 3 4' }}
+      run: |
+        docker run --rm -u root -e HOME=/root -e COUNT="$COUNT" -e SEEDS="$SEEDS" \
+          -v "$PWD:/workspace" -w /workspace classad-dev:latest \
+          bash -euo pipefail -c '
+            echo "== reference libclassad =="; condor_version | head -1 || true
+
+            # We run as root over a bind mount owned by the runner user, so git
+            # reports "dubious ownership" and Go cannot stamp VCS info. The fuzz
+            # binaries are throwaway, so disable VCS stamping for every go
+            # command (build/test/run).
+            export GOFLAGS=-buildvcs=false
+
+            echo "== build the cgo harness (-tags libclassad) =="
+            go build -tags libclassad ./...
+
+            echo "== unit tests, incl. TestCppQuirks (pins libclassad behavior) =="
+            go test -tags libclassad -count=1 ./fuzz/...
+
+            # Deterministic per-seed survey: cafuzz exits non-zero on any
+            # divergence between the Go engine and libclassad, so a regression
+            # in either fails this job. -ignore-parse focuses on evaluation
+            # semantics (known parser-grammar differences are out of scope here).
+            for seed in $SEEDS; do
+              echo "== cafuzz survey: seed $seed, n=$COUNT =="
+              go run -tags libclassad ./fuzz/cmd/cafuzz -n "$COUNT" -seed "$seed" -ignore-parse
+            done
+          '

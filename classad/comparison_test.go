@@ -13,7 +13,9 @@ func TestEvaluatorComparisonOperators(t *testing.T) {
 		{"1 >= 2", false, false},
 		{"\"b\" <= \"a\"", false, false},
 		{"\"b\" >= \"a\"", false, true},
-		{"true > false", true, false},
+		// Booleans are numeric (true=1, false=0) in the reference engine, so
+		// this is 1 > 0 == true, not an error.
+		{"true > false", false, true},
 		{"1 >= \"a\"", true, false},
 		{"\"c\" > \"b\"", false, true},
 	}
@@ -52,10 +54,15 @@ func TestEvaluatorEqualityNonScalar(t *testing.T) {
 }
 
 func TestEvaluatorEqualityVariants(t *testing.T) {
-	if v := evalBuiltin(t, `undefined == undefined`); !v.IsBool() {
-		t.Fatalf("expected bool for undefined==undefined")
+	// Regular == propagates undefined even when both sides are undefined
+	// (identity =?= is the operator that yields true here).
+	if v := evalBuiltin(t, `undefined == undefined`); !v.IsUndefined() {
+		t.Fatalf("expected undefined for undefined==undefined, got %v", v.Type())
+	}
+	if v := evalBuiltin(t, `undefined =?= undefined`); !v.IsBool() {
+		t.Fatalf("expected bool for undefined=?=undefined")
 	} else if b, _ := v.BoolValue(); !b {
-		t.Fatalf("expected undefined==undefined to be true")
+		t.Fatalf("expected undefined=?=undefined to be true")
 	}
 
 	if v := evalBuiltin(t, `true == true`); !v.IsBool() {
@@ -64,15 +71,16 @@ func TestEvaluatorEqualityVariants(t *testing.T) {
 		t.Fatalf("expected true==true")
 	}
 
+	// Reals compare with exact IEEE equality (no tolerance).
 	if v := evalBuiltin(t, `1 == 1.0000000001`); !v.IsBool() {
-		t.Fatalf("expected bool for numeric near-equality")
-	} else if b, _ := v.BoolValue(); !b {
-		t.Fatalf("expected near-equal numeric values to compare true")
+		t.Fatalf("expected bool for numeric equality")
+	} else if b, _ := v.BoolValue(); b {
+		t.Fatalf("expected 1 == 1.0000000001 to be false (exact comparison)")
 	}
 
-	if v := evalBuiltin(t, `"a" == 1`); !v.IsBool() {
-		t.Fatalf("expected bool for type-mismatch equality")
-	} else if b, _ := v.BoolValue(); b {
-		t.Fatalf("expected string vs int equality to be false")
+	// Comparing a string to a non-string is an error in the reference engine,
+	// not false.
+	if v := evalBuiltin(t, `"a" == 1`); !v.IsError() {
+		t.Fatalf("expected error for string vs int equality, got %v", v.Type())
 	}
 }

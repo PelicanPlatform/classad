@@ -68,6 +68,11 @@ linters:
           - errcheck
         path: classad/matchclassad\.go
         text: Error return value of.*Value.*is not checked
+      # gocritic mis-analyzes the cgo preamble in the C++ oracle binding
+      # (spurious dupImport/dupSubExpr on the generated `import "C"` glue).
+      - linters:
+          - gocritic
+        path: fuzz/oracle/cgo/
     paths:
       - bin
       - vendor

@@ -110,6 +110,16 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 	case ',':
 		return int(',')
 	case '?':
+		// An adjacent "?:" is the high-precedence elvis operator; a spaced
+		// "? :" stays two tokens and binds at ternary precedence (matching the
+		// reference lexer, which only fuses an immediately-following ':').
+		if next, err := l.peekRune(); err == nil && next == ':' {
+			if err := l.discardRune(); err != nil {
+				l.err = err
+				return 0
+			}
+			return ELVIS
+		}
 		return int('?')
 	case ':':
 		return int(':')
@@ -131,6 +141,8 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 		str := l.scanString()
 		lval.str = str
 		return STRING_LITERAL
+	case '\'':
+		return l.scanQuotedIdentifier(lval)
 	case '=':
 		if next, err := l.peekRune(); err == nil {
 			switch next {
@@ -145,7 +157,10 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 					l.err = err
 					return 0
 				}
-				if peek, err := l.peekRune(); err == nil && peek == '=' {
+				// peekRuneRaw (not peekRune): a non-'=' here must leave nothing
+				// staged as pending, or the following unreadRune('?') would
+				// clobber it and silently drop the peeked character.
+				if peek, err := l.peekRuneRaw(); err == nil && peek == '=' {
 					if err := l.discardRune(); err != nil {
 						l.err = err
 						return 0
@@ -160,7 +175,11 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 					l.err = err
 					return 0
 				}
-				if peek, err := l.peekRune(); err == nil && peek == '=' {
+				// peekRuneRaw (not peekRune): a non-'=' here must leave nothing
+				// staged as pending, or the following unreadRune('!') would
+				// clobber it and silently drop the peeked character (so e.g.
+				// "x=!10" lexed as "x = !0", evaluating !10 to true).
+				if peek, err := l.peekRuneRaw(); err == nil && peek == '=' {
 					if err := l.discardRune(); err != nil {
 						l.err = err
 						return 0
@@ -345,6 +364,27 @@ func (l *StreamingLexer) peekRune() (rune, error) {
 	return ch, nil
 }
 
+// peekRuneRaw returns the next rune without consuming it and without using the
+// single-slot pending buffer. It is needed where a rune already needs to be
+// pushed back into the pending slot but we still want to look one further
+// ahead (e.g. distinguishing the '/' operator from a "//" or "/*" comment in
+// skipTrivia); using the pending-based peekRune there would clobber the rune
+// being pushed back and silently drop a character such as the divisor in
+// "1/2".
+func (l *StreamingLexer) peekRuneRaw() (rune, error) {
+	if l.hasPending {
+		return l.pendingRune, nil
+	}
+	ch, _, err := l.r.ReadRune()
+	if err != nil {
+		return 0, err
+	}
+	if uerr := l.r.UnreadRune(); uerr != nil {
+		return 0, uerr
+	}
+	return ch, nil
+}
+
 // discardRune consumes a rune and returns any read error.
 func (l *StreamingLexer) discardRune() error {
 	_, _, err := l.readRune()
@@ -363,7 +403,7 @@ func (l *StreamingLexer) skipTrivia() error {
 		}
 
 		if ch == '/' {
-			next, err := l.peekRune()
+			next, err := l.peekRuneRaw()
 			if err == nil {
 				switch next {
 				case '/':
@@ -519,6 +559,42 @@ func (l *StreamingLexer) scanString() string {
 		}
 
 		result.WriteRune(ch)
+	}
+}
+
+// scanQuotedIdentifier scans a single-quoted attribute name (the opening quote
+// has already been consumed) and returns it as an IDENTIFIER token. Unlike a
+// bare identifier, a quoted name may contain spaces and reserved words
+// ('true', 'a b') and is never reinterpreted as a keyword, matching the
+// reference engine. A backslash escapes the following character (so 'a\'b' is
+// the name a'b); a newline or end of input before the closing quote is an
+// error.
+func (l *StreamingLexer) scanQuotedIdentifier(lval *yySymType) int {
+	startPos := l.pos - utf8.RuneLen('\'')
+	var sb strings.Builder
+	for {
+		ch, _, err := l.readRune()
+		if err != nil {
+			l.Error(fmt.Sprintf("unterminated quoted attribute name starting at byte %d", startPos))
+			return 0
+		}
+		switch ch {
+		case '\'':
+			lval.str = sb.String()
+			return IDENTIFIER
+		case '\n':
+			l.Error(fmt.Sprintf("newline in quoted attribute name starting at byte %d", startPos))
+			return 0
+		case '\\':
+			escaped, _, eerr := l.readRune()
+			if eerr != nil {
+				l.Error(fmt.Sprintf("unterminated quoted attribute name starting at byte %d", startPos))
+				return 0
+			}
+			sb.WriteRune(escaped)
+		default:
+			sb.WriteRune(ch)
+		}
 	}
 }
 

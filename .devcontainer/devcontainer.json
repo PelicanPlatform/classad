@@ -1,0 +1,29 @@
+{
+  "name": "golang-classads",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+  "containerEnv": {
+    "GOPATH": "/go",
+    "CONDOR_CONFIG": "/etc/condor/condor_config"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "golang.go",
+        "ms-python.python"
+      ],
+      "settings": {
+        "go.gopath": "/go",
+        "go.toolsManagement.checkForUpdates": "off",
+        "go.useLanguageServer": true
+      }
+    }
+  },
+  "postCreateCommand": "go version && go env GOPATH && (python3 -c 'import classad2 as c; print(\"classad2:\", c.version())' || python3 -c 'import classad; print(\"classad ok\")') && go mod download",
+  "features": {}
+}

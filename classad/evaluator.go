@@ -3,6 +3,7 @@ package classad
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/parser"
@@ -39,6 +40,17 @@ type Value struct {
 	strVal     string
 	listVal    []Value
 	classAdVal *ClassAd
+	// listExprs / listScope make a list value from a literal lazy: it holds its
+	// source element expressions and the scope to evaluate them in, rather than
+	// pre-evaluated values, mirroring the reference engine (a list value is its
+	// unevaluated ExprList). Elements are evaluated on demand by ListValue().
+	// This lets string()/strcat()/etc. unparse the source expressions exactly
+	// (string({1, 1+1}) is "{ 1,1 + 1 }"), and a self-referential list
+	// (A0 = {{A0}}) is a list value rather than a construction-time cycle
+	// error. Lists built programmatically by functions leave these nil and use
+	// the eager listVal instead.
+	listExprs []ast.Expr
+	listScope *ClassAd
 }
 
 // NewUndefinedValue creates an undefined value.
@@ -180,7 +192,46 @@ func (v Value) ListValue() ([]Value, error) {
 	if v.valueType != ListValue {
 		return nil, fmt.Errorf("value is not a list")
 	}
+	if v.listExprs != nil {
+		// Lazy list: evaluate each element expression in its stored scope now.
+		vals := make([]Value, len(v.listExprs))
+		ev := NewEvaluator(v.listScope)
+		for i, e := range v.listExprs {
+			vals[i] = evalRecoveringCyclic(ev, e)
+		}
+		return vals, nil
+	}
 	return v.listVal, nil
+}
+
+// evalRecoveringCyclic evaluates a lazy list element, turning a cyclic-reference
+// panic into an error value rather than letting it escape. A lazy list can be
+// materialized outside the recover-protected entry points (canonical encoding,
+// String), so the sentinel must not propagate there; a cyclic element becomes
+// that element's error value (the list survives), matching the reference engine.
+func evalRecoveringCyclic(ev *Evaluator, e ast.Expr) (result Value) {
+	defer recoverCyclic(&result)
+	return ev.Evaluate(e)
+}
+
+// listLen returns the number of elements in a list value without evaluating
+// them (for a lazy list). The caller must ensure v is a list.
+func (v Value) listLen() int {
+	if v.listExprs != nil {
+		return len(v.listExprs)
+	}
+	return len(v.listVal)
+}
+
+// listElementAt evaluates and returns the i-th element of a list value,
+// evaluating only that element for a lazy list (so e.g. {selfRef, x}[1]
+// evaluates x without touching the self-referential element 0). The caller must
+// ensure v is a list and 0 <= i < listLen().
+func (v Value) listElementAt(i int) Value {
+	if v.listExprs != nil {
+		return evalRecoveringCyclic(NewEvaluator(v.listScope), v.listExprs[i])
+	}
+	return v.listVal[i]
 }
 
 // ClassAdValue returns the ClassAd value. Returns error if not a ClassAd.
@@ -210,7 +261,8 @@ func (v Value) String() string {
 	case StringValue:
 		return fmt.Sprintf("%q", v.strVal)
 	case ListValue:
-		return fmt.Sprintf("%v", v.listVal)
+		elems, _ := v.ListValue()
+		return fmt.Sprintf("%v", elems)
 	case ClassAdValue:
 		if v.classAdVal != nil {
 			return v.classAdVal.String()
@@ -218,6 +270,24 @@ func (v Value) String() string {
 		return "[]"
 	default:
 		return "unknown"
+	}
+}
+
+// cyclicEvalError is panicked when a cyclic attribute reference is detected
+// during evaluation; recoverCyclic turns it into an error value at the
+// top-level evaluation entry points.
+type cyclicEvalError struct{}
+
+// recoverCyclic recovers a cyclicEvalError panic and stores an error value in
+// result; any other panic is re-raised. Use as `defer recoverCyclic(&result)`
+// with a named return value.
+func recoverCyclic(result *Value) {
+	if r := recover(); r != nil {
+		if _, ok := r.(cyclicEvalError); ok {
+			*result = NewErrorValue()
+			return
+		}
+		panic(r)
 	}
 }
 
@@ -238,6 +308,11 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 	}
 
 	switch v := expr.(type) {
+	case *ast.ParenExpr:
+		// Parentheses are transparent to evaluation (they only affect parsing
+		// precedence and unparsing).
+		return e.Evaluate(v.Inner)
+
 	case *ast.IntegerLiteral:
 		return NewIntValue(v.Value)
 
@@ -292,43 +367,69 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 }
 
 func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Value {
-	var targetClassAd *ClassAd
-
-	// Determine which ClassAd to look up the attribute in based on scope
 	switch ref.Scope {
 	case ast.MyScope:
-		// MY.attr - always refers to the current ClassAd
-		targetClassAd = e.classad
+		// MY.attr - always the current ClassAd (no scope-chain fallthrough).
+		return e.evalAttrIn(e.classad, ref.Name)
 	case ast.TargetScope:
-		// TARGET.attr - refers to the target ClassAd
-		if e.classad != nil {
-			targetClassAd = e.classad.target
+		if e.classad == nil {
+			return NewUndefinedValue()
 		}
+		return e.evalAttrIn(e.classad.target, ref.Name)
 	case ast.ParentScope:
-		// PARENT.attr - refers to the parent ClassAd
-		if e.classad != nil {
-			targetClassAd = e.classad.parent
+		if e.classad == nil {
+			return NewUndefinedValue()
 		}
+		return e.evalAttrIn(e.classad.parent, ref.Name)
 	default:
-		// No scope - look in current ClassAd
-		targetClassAd = e.classad
-	}
-
-	if targetClassAd == nil {
+		// Unscoped: search the current ad, then up the enclosing (parent) scope
+		// chain, matching the reference engine. The chain is established by the
+		// select operator (see evaluateSelectExpr); a top-level ad has no parent
+		// so this is just a lookup in the current ad.
+		for ad := e.classad; ad != nil; ad = ad.parent {
+			if ad.lookupInternal(ref.Name) != nil {
+				return e.evalAttrIn(ad, ref.Name)
+			}
+		}
 		return NewUndefinedValue()
 	}
+}
 
-	expr := targetClassAd.lookupInternal(ref.Name)
+// evalAttrIn looks up name in ad and evaluates it, with cyclic-reference
+// detection. A cycle (the attribute is already being evaluated in ad) panics a
+// cyclicEvalError sentinel, recovered as error at the top-level entry points
+// (distinct from an error value, which =?= / =!= would compare as a type).
+func (e *Evaluator) evalAttrIn(ad *ClassAd, name string) Value {
+	if ad == nil {
+		return NewUndefinedValue()
+	}
+	expr := ad.lookupInternal(name)
 	if expr == nil {
 		return NewUndefinedValue()
 	}
+	norm := normalizeName(name)
+	if ad.evaluating[norm] {
+		panic(cyclicEvalError{})
+	}
+	if ad.evaluating == nil {
+		ad.evaluating = make(map[string]bool)
+	}
+	ad.evaluating[norm] = true
+	defer delete(ad.evaluating, norm)
 
-	// Create evaluator for the target ClassAd
-	evaluator := NewEvaluator(targetClassAd)
-	return evaluator.Evaluate(expr)
+	return NewEvaluator(ad).Evaluate(expr)
 }
 
 func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
+	// && and || implement short-circuit three-valued logic: the right operand
+	// is evaluated only when the left does not already determine the result, so
+	// "false && q" is false even when q would cycle or error (and likewise
+	// "true || q"). This must run before the generic error/undefined
+	// propagation below ("false && error" is false, "true || undefined" true).
+	if op.Op == "&&" || op.Op == "||" {
+		return e.evaluateShortCircuit(op)
+	}
+
 	left := e.Evaluate(op.Left)
 	right := e.Evaluate(op.Right)
 
@@ -372,11 +473,12 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 	case "!=":
 		return e.evaluateNotEqual(left, right)
 
-	// Logical operators
-	case "&&":
-		return e.evaluateAnd(left, right)
-	case "||":
-		return e.evaluateOr(left, right)
+	// Bitwise operators (integer-only).
+	case "&", "|", "^", "<<", ">>", ">>>":
+		return e.evaluateBitwise(op.Op, left, right)
+
+	// Logical operators (&& and ||) are handled before the generic error
+	// propagation above.
 
 	default:
 		return NewErrorValue()
@@ -388,6 +490,12 @@ func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
 
 	if val.IsError() {
 		return val
+	}
+
+	// Unary operators propagate undefined (e.g. -undefined, +undefined,
+	// !undefined are all undefined in the reference engine).
+	if val.IsUndefined() {
+		return NewUndefinedValue()
 	}
 
 	switch op.Op {
@@ -409,9 +517,25 @@ func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
 		return NewErrorValue()
 
 	case "!":
-		if val.IsBool() {
-			boolVal, _ := val.BoolValue()
-			return NewBoolValue(!boolVal)
+		// Logical not uses the same three-valued, number-coercing view as
+		// && / ||: !undefined is undefined, !0 is true, !5 is false.
+		switch logicalView(val) {
+		case lsTrue:
+			return NewBoolValue(false)
+		case lsFalse:
+			return NewBoolValue(true)
+		case lsUndef:
+			return NewUndefinedValue()
+		default:
+			return NewErrorValue()
+		}
+
+	case "~":
+		// Bitwise not requires a genuine integer (undefined already handled
+		// above); a real or boolean operand is an error.
+		if val.IsInteger() {
+			i, _ := val.IntValue()
+			return NewIntValue(^i)
 		}
 		return NewErrorValue()
 
@@ -423,26 +547,27 @@ func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
 func (e *Evaluator) evaluateConditional(cond *ast.ConditionalExpr) Value {
 	condVal := e.Evaluate(cond.Condition)
 
-	if condVal.IsError() {
-		return NewErrorValue()
-	}
-
-	if condVal.IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !condVal.IsBool() {
-		return NewErrorValue()
-	}
-
-	boolVal, err := condVal.BoolValue()
-	if err != nil {
-		return NewErrorValue()
-	}
-	if boolVal {
+	// The condition coerces a number to its truthiness like && / || do, so
+	// "1 ? a : b" selects a and "0 ? a : b" selects b. Undefined yields
+	// undefined; a non-coercible condition (string/list/error) is an error.
+	switch logicalView(condVal) {
+	case lsTrue:
 		return e.Evaluate(cond.TrueExpr)
+	case lsFalse:
+		return e.Evaluate(cond.FalseExpr)
+	case lsUndef:
+		// An undefined condition yields undefined, but -- unlike a true/false
+		// condition, which evaluates only the taken branch -- the reference
+		// engine still evaluates BOTH branches. An error *value* in a branch is
+		// absorbed (the result stays undefined), but a cyclic self-reference is
+		// a hard failure that propagates: undefined ? 1 : error is undefined,
+		// while undefined ? {} : A0 (with A0 the attribute itself) is error.
+		e.Evaluate(cond.TrueExpr)
+		e.Evaluate(cond.FalseExpr)
+		return NewUndefinedValue()
+	default:
+		return NewErrorValue()
 	}
-	return e.Evaluate(cond.FalseExpr)
 }
 
 // evaluateElvis evaluates the Elvis operator (expr1 ?: expr2).
@@ -460,11 +585,18 @@ func (e *Evaluator) evaluateElvis(elvis *ast.ElvisExpr) Value {
 }
 
 func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
-	values := make([]Value, len(list.Elements))
-	for i, elem := range list.Elements {
-		values[i] = e.Evaluate(elem)
+	// Lazy: do not evaluate the elements now. Carry the source expressions
+	// (non-nil even when empty, to distinguish a literal from a
+	// programmatically-built list) and the scope to evaluate them in. Elements
+	// are evaluated on demand by ListValue(). This matches the reference engine
+	// (a list value is its unevaluated ExprList): string coercion can unparse
+	// the source expressions, and a self-referential list is a value rather
+	// than a construction-time cycle error.
+	exprs := list.Elements
+	if exprs == nil {
+		exprs = []ast.Expr{}
 	}
-	return NewListValue(values)
+	return Value{valueType: ListValue, listExprs: exprs, listScope: e.classad}
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
@@ -479,14 +611,71 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 		return NewErrorValue()
 	}
 
-	// Must be a ClassAd
+	// List projection: selecting an attribute from a list maps the select over
+	// each element, matching the reference engine. So {[A=1],[A=2]}.A is
+	// {1,2}, {[A=1],[B=2]}.A is {1,undefined} (the missing attribute chains to
+	// the enclosing scope), {1,2,3}.A is {error,error,error} (a non-ad element
+	// selects to error), and {}.A is the empty list.
+	if recordVal.IsList() {
+		elems := recordVal.listElementsPropagating()
+		results := make([]Value, len(elems))
+		for i, el := range elems {
+			results[i] = e.selectAttr(el, sel.Attr)
+		}
+		return NewListValue(results)
+	}
+
+	return e.selectAttr(recordVal, sel.Attr)
+}
+
+// listElementsPropagating evaluates a list value's elements WITHOUT recovering
+// a cyclic-reference panic (unlike ListValue, which localizes a cycle to an
+// error element). Used by list projection so that a cyclic element aborts the
+// whole select to error -- matching the reference engine, where (A.A) with
+// A = {0 % A0} and A0 = A.A is error, not list[error]. The panic propagates to
+// the nearest recover (the enclosing attribute evaluation, or the outermost
+// ListValue if projection happens during a later materialization).
+func (v Value) listElementsPropagating() []Value {
+	if v.listExprs != nil {
+		vals := make([]Value, len(v.listExprs))
+		ev := NewEvaluator(v.listScope)
+		for i, e := range v.listExprs {
+			vals[i] = ev.Evaluate(e)
+		}
+		return vals
+	}
+	return v.listVal
+}
+
+// selectAttr resolves record.attr for an already-evaluated record value (a
+// single element of a `.` select). A non-ad record is an error.
+func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
+	// undefined/error elements propagate (so {undefined,[A=1]}.A is
+	// {undefined,1}); any other non-ad element selects to error.
+	if recordVal.IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if recordVal.IsError() {
+		return NewErrorValue()
+	}
 	if !recordVal.IsClassAd() {
 		return NewErrorValue()
 	}
-
-	// Get the ClassAd and lookup the attribute
 	ad, _ := recordVal.ClassAdValue()
-	return ad.EvaluateAttr(sel.Attr)
+	if ad == nil {
+		return NewErrorValue()
+	}
+
+	// Connect the nested ad's scope to the selecting scope, so that an
+	// attribute missing from the nested ad -- or an unscoped reference inside
+	// the selected attribute's value -- resolves up the enclosing scope chain,
+	// matching the reference engine ([x=1].A resolves A in the enclosing ad,
+	// and [A=[].A] is a cycle). The nested ad value is freshly built per
+	// evaluation, so setting its parent here is safe. Resolve the attribute as
+	// an unscoped reference so it chains (and participates in cycle detection).
+	ad.parent = e.classad
+	nested := NewEvaluator(ad)
+	return nested.evaluateAttributeReference(&ast.AttributeReference{Name: attr})
 }
 
 func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
@@ -518,15 +707,18 @@ func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
 			return NewErrorValue()
 		}
 
-		list, _ := containerVal.ListValue()
 		index, _ := indexVal.IntValue()
 
-		// Check bounds
-		if index < 0 || index >= int64(len(list)) {
-			return NewUndefinedValue()
+		// An out-of-range (including negative) list index is an error in the
+		// reference engine, not undefined.
+		if index < 0 || index >= int64(containerVal.listLen()) {
+			return NewErrorValue()
 		}
 
-		return list[index]
+		// Evaluate only the indexed element (a lazy list does not evaluate its
+		// other elements), so {selfRef, x}[1] yields x without cycling on the
+		// self-referential element.
+		return containerVal.listElementAt(int(index))
 	}
 
 	// Handle ClassAd subscripting with string key
@@ -544,113 +736,230 @@ func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {
 }
 
 // Arithmetic operations
+// numericOperand reports whether v can act as a number in arithmetic and
+// relational contexts. Booleans participate as integers (true=1, false=0),
+// matching the C++ reference engine where BOOLEAN_VALUE is part of the numeric
+// value mask. isInt is true for integers and booleans (so int/bool operands
+// keep an integer result type); iv/rv carry the integer and real views.
+//
+// Note this is operator-level coercion only: the value's own type is unchanged,
+// so isInteger()/isReal() still report false for a boolean.
+func numericOperand(v Value) (isNum, isInt bool, iv int64, rv float64) {
+	switch v.valueType {
+	case IntegerValue:
+		return true, true, v.intVal, float64(v.intVal)
+	case RealValue:
+		return true, false, 0, v.realVal
+	case BooleanValue:
+		if v.boolVal {
+			return true, true, 1, 1
+		}
+		return true, true, 0, 0
+	default:
+		return false, false, 0, 0
+	}
+}
+
+// realArithResult mirrors the reference engine's doRealArithmetic result check:
+// a result of +Inf (HUGE_VAL) is an error, while -Inf and NaN are returned as
+// ordinary real values. (1.0/0.0 is error, but -1.0/0.0 is -INF and 0.0/0.0 is
+// NaN.)
+func realArithResult(comp float64) Value {
+	if math.IsInf(comp, 1) {
+		return NewErrorValue()
+	}
+	return NewRealValue(comp)
+}
+
 func (e *Evaluator) evaluateAdd(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsNumber() || !right.IsNumber() {
+	ln, li, liv, lrv := numericOperand(left)
+	rn, ri, riv, rrv := numericOperand(right)
+	if !ln || !rn {
 		return NewErrorValue()
 	}
-
-	leftNum, _ := left.NumberValue()
-	rightNum, _ := right.NumberValue()
-
-	if left.IsInteger() && right.IsInteger() {
-		leftInt, _ := left.IntValue()
-		rightInt, _ := right.IntValue()
-		return NewIntValue(leftInt + rightInt)
+	if li && ri {
+		return NewIntValue(liv + riv)
 	}
-
-	return NewRealValue(leftNum + rightNum)
+	return realArithResult(lrv + rrv)
 }
 
 func (e *Evaluator) evaluateSubtract(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsNumber() || !right.IsNumber() {
+	ln, li, liv, lrv := numericOperand(left)
+	rn, ri, riv, rrv := numericOperand(right)
+	if !ln || !rn {
 		return NewErrorValue()
 	}
-
-	leftNum, _ := left.NumberValue()
-	rightNum, _ := right.NumberValue()
-
-	if left.IsInteger() && right.IsInteger() {
-		leftInt, _ := left.IntValue()
-		rightInt, _ := right.IntValue()
-		return NewIntValue(leftInt - rightInt)
+	if li && ri {
+		return NewIntValue(liv - riv)
 	}
-
-	return NewRealValue(leftNum - rightNum)
+	return realArithResult(lrv - rrv)
 }
 
 func (e *Evaluator) evaluateMultiply(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsNumber() || !right.IsNumber() {
+	ln, li, liv, lrv := numericOperand(left)
+	rn, ri, riv, rrv := numericOperand(right)
+	if !ln || !rn {
 		return NewErrorValue()
 	}
-
-	leftNum, _ := left.NumberValue()
-	rightNum, _ := right.NumberValue()
-
-	if left.IsInteger() && right.IsInteger() {
-		leftInt, _ := left.IntValue()
-		rightInt, _ := right.IntValue()
-		return NewIntValue(leftInt * rightInt)
+	if li && ri {
+		return NewIntValue(liv * riv)
 	}
-
-	return NewRealValue(leftNum * rightNum)
+	return realArithResult(lrv * rrv)
 }
 
 func (e *Evaluator) evaluateDivide(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
-
-	if !left.IsNumber() || !right.IsNumber() {
+	ln, li, liv, lrv := numericOperand(left)
+	rn, ri, riv, rrv := numericOperand(right)
+	if !ln || !rn {
 		return NewErrorValue()
 	}
 
-	rightNum, _ := right.NumberValue()
-	if rightNum == 0 {
-		return NewErrorValue()
-	}
-
-	leftNum, _ := left.NumberValue()
-
-	if left.IsInteger() && right.IsInteger() {
-		leftInt, _ := left.IntValue()
-		rightInt, _ := right.IntValue()
-		if leftInt%rightInt == 0 {
-			return NewIntValue(leftInt / rightInt)
+	if li && ri {
+		// Integer / integer yields an integer (truncated toward zero), matching
+		// the C++ reference engine; integer division by zero is an error. Guard
+		// the one signed-overflow case (MinInt64 / -1) that would panic in Go;
+		// libclassad yields MaxInt64 there, so mirror that.
+		if riv == 0 {
+			return NewErrorValue()
 		}
+		if liv == math.MinInt64 && riv == -1 {
+			return NewIntValue(math.MaxInt64)
+		}
+		return NewIntValue(liv / riv)
 	}
 
-	return NewRealValue(leftNum / rightNum)
+	// Real division: division by zero produces +Inf/-Inf/NaN; only +Inf is an
+	// error (handled by realArithResult), so -1.0/0.0 is -INF and 0.0/0.0 NaN.
+	return realArithResult(lrv / rrv)
 }
 
 func (e *Evaluator) evaluateModulo(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
+	ln, li, liv, _ := numericOperand(left)
+	rn, ri, riv, _ := numericOperand(right)
+	// Modulo requires integer-typed operands (booleans count as integers).
+	if !ln || !rn || !li || !ri {
+		return NewErrorValue()
+	}
 
+	if riv == 0 {
+		return NewErrorValue()
+	}
+
+	// Any integer modulo ±1 is 0; special-casing -1 also avoids the
+	// MinInt64 % -1 signed-overflow panic in Go.
+	if riv == -1 {
+		return NewIntValue(0)
+	}
+
+	return NewIntValue(liv % riv)
+}
+
+// evaluateBitwise implements the integer bitwise operators. Both operands must
+// be genuine integers (a real or boolean operand is an error, unlike the
+// arithmetic operators), and undefined propagates. Shift counts are masked with
+// & 63 like the reference engine (and C on 64-bit), so the shift never panics
+// and e.g. 1 << 64 == 1; >> is arithmetic (sign-extending) and >>> is logical.
+func (e *Evaluator) evaluateBitwise(op string, left, right Value) Value {
+	if left.IsUndefined() || right.IsUndefined() {
+		return NewUndefinedValue()
+	}
 	if !left.IsInteger() || !right.IsInteger() {
 		return NewErrorValue()
 	}
-
-	leftInt, _ := left.IntValue()
-	rightInt, _ := right.IntValue()
-
-	if rightInt == 0 {
+	l, _ := left.IntValue()
+	r, _ := right.IntValue()
+	switch op {
+	case "&":
+		return NewIntValue(l & r)
+	case "|":
+		return NewIntValue(l | r)
+	case "^":
+		return NewIntValue(l ^ r)
+	case "<<":
+		return NewIntValue(l << uint(r&63))
+	case ">>":
+		// Arithmetic right shift. For a negative value the reference engine
+		// shifts one bit at a time, re-forcing the sign bit, for min(64, count)
+		// steps -- so a count >= 64 saturates to -1 rather than wrapping.
+		if l >= 0 {
+			return NewIntValue(l >> uint(r&63))
+		}
+		steps := r
+		if steps > 64 {
+			steps = 64
+		}
+		val := l
+		for i := int64(0); i < steps; i++ {
+			val = (val >> 1) | math.MinInt64
+		}
+		return NewIntValue(val)
+	case ">>>":
+		// Logical right shift. The reference engine, for a negative value,
+		// shifts right one, clears the sign bit, then shifts the remaining
+		// count-1 (masked & 63) -- so e.g. (-29 >>> 0) is 0, not -29.
+		if l >= 0 {
+			return NewIntValue(l >> uint(r&63))
+		}
+		val := (l >> 1) & math.MaxInt64
+		val >>= uint((r - 1) & 63)
+		return NewIntValue(val)
+	default:
 		return NewErrorValue()
 	}
+}
 
-	return NewIntValue(leftInt % rightInt)
+// lowerASCII folds an ASCII upper-case byte to lower case, leaving every other
+// byte unchanged. This matches the C ctype/strcasecmp behavior the reference
+// engine uses (it is intentionally ASCII-only, not Unicode-aware).
+func lowerASCII(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + ('a' - 'A')
+	}
+	return c
+}
+
+// compareStringsFold compares two strings case-insensitively, byte for byte,
+// like strcasecmp: it returns -1, 0, or 1. The relational and equality
+// operators (< <= > >= == !=) use this because the C++ reference engine
+// compares strings case-insensitively. (=?=/=!= remain case-sensitive; see
+// evaluateIs.)
+func compareStringsFold(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		ca, cb := lowerASCII(a[i]), lowerASCII(b[i])
+		if ca != cb {
+			if ca < cb {
+				return -1
+			}
+			return 1
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	default:
+		return 0
+	}
 }
 
 // Comparison operations
@@ -659,16 +968,16 @@ func (e *Evaluator) evaluateLessThan(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-		return NewBoolValue(leftNum < rightNum)
+	if ln, _, _, lrv := numericOperand(left); ln {
+		if rn, _, _, rrv := numericOperand(right); rn {
+			return NewBoolValue(lrv < rrv)
+		}
 	}
 
 	if left.IsString() && right.IsString() {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr < rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) < 0)
 	}
 
 	return NewErrorValue()
@@ -679,16 +988,16 @@ func (e *Evaluator) evaluateGreaterThan(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-		return NewBoolValue(leftNum > rightNum)
+	if ln, _, _, lrv := numericOperand(left); ln {
+		if rn, _, _, rrv := numericOperand(right); rn {
+			return NewBoolValue(lrv > rrv)
+		}
 	}
 
 	if left.IsString() && right.IsString() {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr > rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) > 0)
 	}
 
 	return NewErrorValue()
@@ -699,16 +1008,16 @@ func (e *Evaluator) evaluateLessOrEqual(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-		return NewBoolValue(leftNum <= rightNum)
+	if ln, _, _, lrv := numericOperand(left); ln {
+		if rn, _, _, rrv := numericOperand(right); rn {
+			return NewBoolValue(lrv <= rrv)
+		}
 	}
 
 	if left.IsString() && right.IsString() {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr <= rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) <= 0)
 	}
 
 	return NewErrorValue()
@@ -719,38 +1028,53 @@ func (e *Evaluator) evaluateGreaterOrEqual(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-		return NewBoolValue(leftNum >= rightNum)
+	if ln, _, _, lrv := numericOperand(left); ln {
+		if rn, _, _, rrv := numericOperand(right); rn {
+			return NewBoolValue(lrv >= rrv)
+		}
 	}
 
 	if left.IsString() && right.IsString() {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr >= rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) >= 0)
 	}
 
 	return NewErrorValue()
 }
 
 func (e *Evaluator) evaluateEqual(left, right Value) Value {
-	if left.IsUndefined() && right.IsUndefined() {
-		return NewBoolValue(true)
-	}
+	return valuesEqual(left, right)
+}
 
+// valuesEqual implements the == operator's value semantics (also used by
+// member()): numeric types coerce across int/real/bool, strings compare
+// case-insensitively, reals compare exactly, and any other cross-type or
+// list/classad comparison is an error. Undefined propagates.
+func valuesEqual(left, right Value) Value {
+	// Regular == / != propagate undefined even when both sides are undefined
+	// (undefined == undefined is undefined). Identity (=?=) handles the
+	// "undefined is undefined -> true" case separately in evaluateIs.
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
 
 	if left.Type() != right.Type() {
-		// Allow numeric comparison between int and real
-		if left.IsNumber() && right.IsNumber() {
-			leftNum, _ := left.NumberValue()
-			rightNum, _ := right.NumberValue()
-			return NewBoolValue(math.Abs(leftNum-rightNum) < 1e-9)
+		// Numeric types (int/real/bool) coerce and compare across types; a
+		// boolean compares as 1/0. Any other cross-type comparison -- e.g.
+		// string vs int, or list/classad vs anything -- is an error in the
+		// reference engine (coerceToNumber), not false.
+		ln, li, liv, lrv := numericOperand(left)
+		rn, ri, riv, rrv := numericOperand(right)
+		if ln && rn {
+			if li && ri {
+				return NewBoolValue(liv == riv)
+			}
+			// The reference engine compares reals with exact IEEE equality
+			// (no tolerance), so 0.1 + 0.2 == 0.3 is false.
+			return NewBoolValue(lrv == rrv)
 		}
-		return NewBoolValue(false)
+		return NewErrorValue()
 	}
 
 	switch left.Type() {
@@ -765,11 +1089,11 @@ func (e *Evaluator) evaluateEqual(left, right Value) Value {
 	case RealValue:
 		leftReal, _ := left.RealValue()
 		rightReal, _ := right.RealValue()
-		return NewBoolValue(math.Abs(leftReal-rightReal) < 1e-9)
+		return NewBoolValue(leftReal == rightReal)
 	case StringValue:
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
-		return NewBoolValue(leftStr == rightStr)
+		return NewBoolValue(compareStringsFold(leftStr, rightStr) == 0)
 	default:
 		return NewErrorValue()
 	}
@@ -818,29 +1142,11 @@ func (e *Evaluator) evaluateIs(left, right Value) Value {
 		leftStr, _ := left.StringValue()
 		rightStr, _ := right.StringValue()
 		return NewBoolValue(leftStr == rightStr)
-	case ListValue:
-		// Lists: compare element-wise
-		leftList, _ := left.ListValue()
-		rightList, _ := right.ListValue()
-		if len(leftList) != len(rightList) {
-			return NewBoolValue(false)
-		}
-		for i := range leftList {
-			elemResult := e.evaluateIs(leftList[i], rightList[i])
-			if elemResult.IsError() {
-				return elemResult
-			}
-			match, _ := elemResult.BoolValue()
-			if !match {
-				return NewBoolValue(false)
-			}
-		}
-		return NewBoolValue(true)
-	case ClassAdValue:
-		// ClassAds: pointer comparison (same object)
-		leftAd, _ := left.ClassAdValue()
-		rightAd, _ := right.ClassAdValue()
-		return NewBoolValue(leftAd == rightAd)
+	case ListValue, ClassAdValue:
+		// The reference engine cannot compare lists or classads with =?= / =!=:
+		// such a comparison is an error (only the type-mismatch case above
+		// yields a boolean, e.g. {1} =?= 1 is false).
+		return NewErrorValue()
 	default:
 		return NewErrorValue()
 	}
@@ -856,57 +1162,130 @@ func (e *Evaluator) evaluateIsnt(left, right Value) Value {
 	return NewBoolValue(!boolVal)
 }
 
-// Logical operations
-func (e *Evaluator) evaluateAnd(left, right Value) Value {
-	if left.IsError() || right.IsError() {
-		return NewErrorValue()
-	}
+// Logical operations.
+//
+// The reference engine uses three-valued logic with short-circuiting. Operands
+// are coerced to booleans the same way the truthiness of a number is taken:
+// a non-zero number is true, zero is false, undefined stays undefined, and any
+// other type (string, list, classad, error) behaves like error. The
+// short-circuit operand wins regardless of what the other side is, so
+// "false && error" is false and "true || undefined" is true.
 
-	// Short-circuit evaluation
-	if left.IsBool() {
-		leftBool, _ := left.BoolValue()
-		if !leftBool {
-			return NewBoolValue(false)
+// logicalState is the boolean view of an operand for && / ||.
+type logicalState int
+
+const (
+	lsFalse logicalState = iota
+	lsTrue
+	lsUndef
+	lsErr // error, or a value not coercible to boolean
+)
+
+func logicalView(v Value) logicalState {
+	switch v.valueType {
+	case BooleanValue:
+		if v.boolVal {
+			return lsTrue
 		}
+		return lsFalse
+	case IntegerValue:
+		if v.intVal != 0 {
+			return lsTrue
+		}
+		return lsFalse
+	case RealValue:
+		if v.realVal != 0 {
+			return lsTrue
+		}
+		return lsFalse
+	case UndefinedValue:
+		return lsUndef
+	default:
+		return lsErr
 	}
-
-	if left.IsUndefined() || right.IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !left.IsBool() || !right.IsBool() {
-		return NewErrorValue()
-	}
-
-	leftBool, _ := left.BoolValue()
-	rightBool, _ := right.BoolValue()
-	return NewBoolValue(leftBool && rightBool)
 }
 
-func (e *Evaluator) evaluateOr(left, right Value) Value {
-	if left.IsError() || right.IsError() {
+// mapState turns a logicalState back into a Value (used for the non-short-
+// circuiting branch where the result is simply the other operand's truth).
+func mapState(s logicalState) Value {
+	switch s {
+	case lsTrue:
+		return NewBoolValue(true)
+	case lsFalse:
+		return NewBoolValue(false)
+	case lsUndef:
+		return NewUndefinedValue()
+	default:
 		return NewErrorValue()
 	}
+}
 
-	// Short-circuit evaluation
-	if left.IsBool() {
-		leftBool, _ := left.BoolValue()
-		if leftBool {
+// evaluateShortCircuit evaluates a && / || expression, deferring evaluation of
+// the right operand until the left operand's truth value requires it. A false
+// (for &&) or true (for ||) left operand decides the result outright; an error
+// left operand is an error; only a true/undefined (&&) or false/undefined (||)
+// left operand evaluates the right and applies the full three-valued logic.
+func (e *Evaluator) evaluateShortCircuit(op *ast.BinaryOp) Value {
+	left := e.Evaluate(op.Left)
+	switch logicalView(left) {
+	case lsErr:
+		return NewErrorValue()
+	case lsFalse:
+		if op.Op == "&&" {
+			return NewBoolValue(false)
+		}
+	case lsTrue:
+		if op.Op == "||" {
 			return NewBoolValue(true)
 		}
 	}
-
-	if left.IsUndefined() || right.IsUndefined() {
-		return NewUndefinedValue()
+	right := e.Evaluate(op.Right)
+	if op.Op == "&&" {
+		return e.evaluateAnd(left, right)
 	}
+	return e.evaluateOr(left, right)
+}
 
-	if !left.IsBool() || !right.IsBool() {
+func (e *Evaluator) evaluateAnd(left, right Value) Value {
+	l, r := logicalView(left), logicalView(right)
+	switch l {
+	case lsFalse:
+		return NewBoolValue(false) // false && anything == false
+	case lsErr:
 		return NewErrorValue()
+	case lsTrue:
+		return mapState(r) // true && x == x
+	default: // lsUndef
+		switch r {
+		case lsFalse:
+			return NewBoolValue(false)
+		case lsErr:
+			return NewErrorValue()
+		default: // true or undefined
+			return NewUndefinedValue()
+		}
 	}
+}
 
-	leftBool, _ := left.BoolValue()
-	rightBool, _ := right.BoolValue()
-	return NewBoolValue(leftBool || rightBool)
+func (e *Evaluator) evaluateOr(left, right Value) Value {
+	l, r := logicalView(left), logicalView(right)
+	switch l {
+	case lsTrue:
+		return NewBoolValue(true) // true || anything == true
+	case lsErr:
+		return NewErrorValue()
+	case lsFalse:
+		return mapState(r) // false || x == x
+	default: // lsUndef
+		switch r {
+		case lsTrue:
+			return NewBoolValue(true)
+		case lsErr:
+			return NewErrorValue()
+		default: // false or undefined
+			return NewUndefinedValue()
+		}
+	}
 }
 
 // evaluateUnparse handles the unparse() function which returns the string representation
@@ -999,26 +1378,141 @@ func (e *Evaluator) evaluateEval(args []ast.Expr) Value {
 	return e.Evaluate(expr)
 }
 
+// evaluateIfThenElse implements ifThenElse(cond, t, f) with the same lazy,
+// number-coercing semantics as the ?: operator (see evaluateConditional): the
+// condition's truthiness selects a branch and only that branch is evaluated, so
+// a self-referential or erroring unselected branch is never touched
+// (ifThenElse(1, 0, B) is 0). Undefined yields undefined; a non-coercible
+// condition is an error.
+func (e *Evaluator) evaluateIfThenElse(args []ast.Expr) Value {
+	if len(args) != 3 {
+		return NewErrorValue()
+	}
+	switch logicalView(e.Evaluate(args[0])) {
+	case lsTrue:
+		return e.Evaluate(args[1])
+	case lsFalse:
+		return e.Evaluate(args[2])
+	case lsUndef:
+		return NewUndefinedValue()
+	default:
+		return NewErrorValue()
+	}
+}
+
+// funcArity is the accepted argument-count range of a built-in: [min, max],
+// with max == -1 meaning unbounded (variadic).
+type funcArity struct {
+	min, max int
+}
+
+func (a funcArity) accepts(n int) bool {
+	return n >= a.min && (a.max < 0 || n <= a.max)
+}
+
+// functionArity is the set of built-in function names (lower-cased) the engine
+// recognizes, each mapped to its accepted argument-count range. It is used to
+// reject an unknown function -- or a known function called with the wrong
+// number of arguments -- BEFORE evaluating its arguments, matching the
+// reference engine (which checks arity first, so a cyclic/erroring argument to
+// a wrong-arity call is never evaluated). It must list every name handled by
+// evaluateFunctionCall (the switch below plus the specially-cased
+// unparse/eval/ifthenelse); TestKnownFunctionsCoversDispatch guards that they
+// stay in sync.
+var functionArity = map[string]funcArity{
+	"unparse": {1, 1}, "eval": {1, 1}, "ifthenelse": {3, 3},
+	"strcat": {0, -1}, "substr": {2, 3}, "size": {1, 1}, "tolower": {1, 1},
+	"toupper": {1, 1}, "floor": {1, 1}, "ceiling": {1, 1}, "ceil": {1, 1},
+	"round": {1, 1}, "random": {0, 1}, "int": {1, 1}, "real": {1, 1},
+	"isundefined": {1, 1}, "iserror": {1, 1}, "isstring": {1, 1},
+	"isinteger": {1, 1}, "isreal": {1, 1}, "isboolean": {1, 1},
+	"islist": {1, 1}, "isclassad": {1, 1}, "time": {0, 0}, "member": {2, 2},
+	"stringlistmember": {2, 3}, "stringlistimember": {2, 3}, "regexp": {2, 3},
+	"string": {1, 1}, "bool": {1, 1}, "pow": {2, 2}, "quantize": {2, 2},
+	"sum": {1, 1}, "avg": {1, 1}, "min": {1, 1}, "max": {1, 1}, "join": {1, -1},
+	"split": {1, 2}, "splitusername": {1, 1}, "splitslotname": {1, 1},
+	"strcmp": {2, 2}, "stricmp": {2, 2}, "versioncmp": {2, 2},
+	"version_in_range": {3, 3},
+	"formattime":       {0, 2}, "interval": {1, 1}, "identicalmember": {2, 2},
+	"anycompare": {3, 3}, "allcompare": {3, 3}, "stringlistsize": {1, 2},
+	"stringlistsum": {1, 2}, "stringlistavg": {1, 2}, "stringlistmin": {1, 2},
+	"stringlistmax": {1, 2}, "stringlistsintersect": {2, 3},
+	"stringlistsubsetmatch": {2, 3}, "stringlistregexpmember": {2, 4},
+	"regexpmember": {2, 3}, "regexps": {3, 4}, "replace": {3, 4},
+	"replaceall": {3, 4},
+}
+
+// evaluateStrcat implements strcat with the reference engine's short-circuit:
+// arguments are evaluated left-to-right and evaluation stops at the first
+// undefined or error one, so a later cyclic argument is never reached --
+// strcat(undefined, A2) with a self-referential A2 is undefined, not error.
+// (Lists and ads are concatenable: they stringify via unparse, so strcat does
+// not stop on them.) The collected prefix (through the first undefined/error
+// value) is handed to builtinStrcat, whose flag logic would have stopped at the
+// same point. A cyclic argument reached before any stop still propagates (its
+// Evaluate panics) and fails the call.
+func (e *Evaluator) evaluateStrcat(argExprs []ast.Expr) Value {
+	args := make([]Value, 0, len(argExprs))
+	for _, ax := range argExprs {
+		v := e.Evaluate(ax)
+		args = append(args, v)
+		if v.IsUndefined() || v.IsError() {
+			break // strcat stops at the first undefined/error argument
+		}
+	}
+	return builtinStrcat(args)
+}
+
 // Built-in function evaluation
 func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
+	// Function names are matched case-insensitively, like the reference engine
+	// (so SUBSTR, suBstr and substr are the same function).
+	funcName := strings.ToLower(fc.Name)
+
 	// Handle unparse() specially - it needs access to the raw AST and ClassAd context
-	if fc.Name == "unparse" {
+	if funcName == "unparse" {
 		return e.evaluateUnparse(fc.Args)
 	}
 
 	// Handle eval() specially - it needs to parse and evaluate in the current context
-	if fc.Name == "eval" {
+	if funcName == "eval" {
 		return e.evaluateEval(fc.Args)
 	}
 
-	// Evaluate all arguments
+	// Handle ifThenElse() specially - like the ?: operator it evaluates only
+	// the selected branch (so ifThenElse(1, 0, B) is 0 and never evaluates a
+	// self-referential B), rather than eagerly evaluating all arguments.
+	if funcName == "ifthenelse" {
+		return e.evaluateIfThenElse(fc.Args)
+	}
+
+	// An unknown function, or a known function called with the wrong number of
+	// arguments, is an error and its arguments are NOT evaluated, matching the
+	// reference engine (which checks arity before evaluating args). So
+	// A((A0)) and pow(A0) -- with A0 the attribute itself -- are error without
+	// the cyclic argument ever being evaluated.
+	arity, known := functionArity[funcName]
+	if !known || !arity.accepts(len(fc.Args)) {
+		return NewErrorValue()
+	}
+
+	// strcat evaluates its arguments left-to-right and stops at the first one it
+	// cannot concatenate (undefined/error/list/ad), so a later cyclic argument
+	// is never reached: strcat(undefined, A2) with a cyclic A2 is undefined.
+	if funcName == "strcat" {
+		return e.evaluateStrcat(fc.Args)
+	}
+
+	// Evaluate all arguments. A cyclic argument propagates (the reference
+	// engine's argument Evaluate returns false on a cycle, failing the call):
+	// strcmp(undefined, A2) with a cyclic A2 is error, not undefined.
 	args := make([]Value, len(fc.Args))
 	for i, arg := range fc.Args {
 		args[i] = e.Evaluate(arg)
 	}
 
-	// Dispatch to the appropriate function
-	switch fc.Name {
+	// Dispatch to the appropriate function (funcName is already lower-cased)
+	switch funcName {
 	// String functions
 	case "strcat":
 		return builtinStrcat(args)
@@ -1026,11 +1520,9 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinSubstr(args)
 	case "size":
 		return builtinSize(args)
-	case "length":
-		return builtinLength(args)
-	case "toLower", "tolower":
+	case "tolower":
 		return builtinToLower(args)
-	case "toUpper", "toupper":
+	case "toupper":
 		return builtinToUpper(args)
 
 	// Math functions
@@ -1048,21 +1540,21 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinReal(args)
 
 	// Type checking functions
-	case "isUndefined":
+	case "isundefined":
 		return builtinIsUndefined(args)
-	case "isError":
+	case "iserror":
 		return builtinIsError(args)
-	case "isString":
+	case "isstring":
 		return builtinIsString(args)
-	case "isInteger":
+	case "isinteger":
 		return builtinIsInteger(args)
-	case "isReal":
+	case "isreal":
 		return builtinIsReal(args)
-	case "isBoolean":
+	case "isboolean":
 		return builtinIsBoolean(args)
-	case "isList":
+	case "islist":
 		return builtinIsList(args)
-	case "isClassAd":
+	case "isclassad":
 		return builtinIsClassAd(args)
 
 	// Time functions
@@ -1072,9 +1564,9 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// List functions
 	case "member":
 		return builtinMember(args)
-	case "stringListMember":
+	case "stringlistmember":
 		return builtinStringListMember(args)
-	case "stringListIMember":
+	case "stringlistimember":
 		return builtinStringListIMember(args)
 
 	// Pattern matching functions
@@ -1082,8 +1574,7 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinRegexp(args)
 
 	// Control flow functions
-	case "ifThenElse":
-		return builtinIfThenElse(args)
+	// ifThenElse is handled lazily before argument evaluation (above).
 
 	// Type conversion functions
 	case "string":
@@ -1112,71 +1603,65 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		return builtinJoin(args)
 	case "split":
 		return builtinSplit(args)
-	case "splitUserName":
+	case "splitusername":
 		return builtinSplitUserName(args)
-	case "splitSlotName":
+	case "splitslotname":
 		return builtinSplitSlotName(args)
 	case "strcmp":
 		return builtinStrcmp(args)
 	case "stricmp":
 		return builtinStricmp(args)
 
-	// Version comparison functions
+	// Version comparison functions. (The reference engine's per-operator helpers
+	// are spelled versionGT/GE/LT/LE/EQ -- camelCase and case-sensitive, see
+	// CPP_QUIRKS.md -- which Go's case-insensitive dispatch cannot represent, so
+	// they are intentionally not provided here. versioncmp and version_in_range
+	// are the lowercase-friendly ones.)
 	case "versioncmp":
 		return builtinVersioncmp(args)
-	case "version_gt":
-		return builtinVersionGT(args)
-	case "version_ge":
-		return builtinVersionGE(args)
-	case "version_lt":
-		return builtinVersionLT(args)
-	case "version_le":
-		return builtinVersionLE(args)
-	case "version_eq":
-		return builtinVersionEQ(args)
 	case "version_in_range":
 		return builtinVersionInRange(args)
 
 	// Time formatting functions
-	case "formatTime":
+	case "formattime":
 		return builtinFormatTime(args)
 	case "interval":
 		return builtinInterval(args)
 
 	// List comparison functions
-	case "identicalMember":
+	case "identicalmember":
 		return builtinIdenticalMember(args)
-	case "anyCompare":
+	case "anycompare":
 		return builtinAnyCompare(args)
-	case "allCompare":
+	case "allcompare":
 		return builtinAllCompare(args)
 
 	// StringList functions
-	case "stringListSize":
+	case "stringlistsize":
 		return builtinStringListSize(args)
-	case "stringListSum":
+	case "stringlistsum":
 		return builtinStringListSum(args)
-	case "stringListAvg":
+	case "stringlistavg":
 		return builtinStringListAvg(args)
-	case "stringListMin":
+	case "stringlistmin":
 		return builtinStringListMin(args)
-	case "stringListMax":
+	case "stringlistmax":
 		return builtinStringListMax(args)
-	case "stringListsIntersect":
+	case "stringlistsintersect":
 		return builtinStringListsIntersect(args)
-	case "stringListSubsetMatch":
+	case "stringlistsubsetmatch":
 		return builtinStringListSubsetMatch(args)
-	case "stringListRegexpMember":
+	case "stringlistregexpmember":
 		return builtinStringListRegexpMember(args)
 
 	// Regex functions
-	case "regexpMember":
+	case "regexpmember":
 		return builtinRegexpMember(args)
 	case "regexps":
 		return builtinRegexps(args)
 	case "replace":
 		return builtinReplace(args)
-	case "replaceAll":
+	case "replaceall":
 		return builtinReplaceAll(args)
 
 	default:

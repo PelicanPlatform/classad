@@ -4,70 +4,23 @@ import (
 	"testing"
 )
 
-// TestBuiltinLength tests the length() function (alias for size())
-func TestBuiltinLength(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected int64
-		isError  bool
-		isUndef  bool
-	}{
-		{
-			name:     "string length",
-			input:    `[x = length("hello")]`,
-			expected: 5,
-		},
-		{
-			name:     "list length",
-			input:    `[x = length({1, 2, 3, 4})]`,
-			expected: 4,
-		},
-		{
-			name:     "empty list",
-			input:    `[x = length({})]`,
-			expected: 0,
-		},
-		{
-			name:    "undefined",
-			input:   `[x = length(undefined)]`,
-			isUndef: true,
-		},
-		{
-			name:    "error",
-			input:   `[x = length(error)]`,
-			isError: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ad, err := Parse(tt.input)
-			if err != nil {
-				t.Fatalf("Parse() error = %v", err)
-			}
-			val := ad.EvaluateAttr("x")
-			if tt.isError {
-				if !val.IsError() {
-					t.Errorf("Expected error, got %v", val)
-				}
-				return
-			}
-			if tt.isUndef {
-				if !val.IsUndefined() {
-					t.Errorf("Expected undefined, got %v", val)
-				}
-				return
-			}
-			if !val.IsInteger() {
-				t.Errorf("Expected integer, got %v", val.Type())
-				return
-			}
-			result, _ := val.IntValue()
-			if result != tt.expected {
-				t.Errorf("length() = %d, want %d", result, tt.expected)
-			}
-		})
+// TestLengthIsUnknownFunction verifies that length() is not a recognized
+// function: the reference ClassAd engine has no such builtin, so any call to
+// it evaluates to error (use size() instead).
+func TestLengthIsUnknownFunction(t *testing.T) {
+	for _, input := range []string{
+		`[x = length("hello")]`,
+		`[x = length({1, 2, 3, 4})]`,
+		`[x = length({})]`,
+		`[x = length(undefined)]`,
+	} {
+		ad, err := Parse(input)
+		if err != nil {
+			t.Fatalf("Parse(%q) error = %v", input, err)
+		}
+		if val := ad.EvaluateAttr("x"); !val.IsError() {
+			t.Errorf("%s: expected error (length is not a function), got %v", input, val.Type())
+		}
 	}
 }
 
@@ -93,9 +46,11 @@ func TestBuiltinQuantize(t *testing.T) {
 			expected: 12.0,
 		},
 		{
+			// Integer ceil-division truncates toward zero, matching the
+			// reference: ((-10 + 3 - 1) / 3) * 3 == -6.
 			name:     "quantize negative",
 			input:    `[x = quantize(-10, 3)]`,
-			expected: -9,
+			expected: -6,
 			isInt:    true,
 		},
 		{
@@ -117,14 +72,18 @@ func TestBuiltinQuantize(t *testing.T) {
 			isInt:    true,
 		},
 		{
-			name:    "quantize divide by zero",
-			input:   `[x = quantize(10, 0)]`,
-			isError: true,
+			// A zero base means "do not quantize": the value is returned
+			// unchanged (matching the reference), not an error.
+			name:     "quantize zero base",
+			input:    `[x = quantize(10, 0)]`,
+			expected: 10,
+			isInt:    true,
 		},
 		{
+			// quantize treats undefined as an error, matching the reference.
 			name:    "quantize undefined",
 			input:   `[x = quantize(undefined, 3)]`,
-			isUndef: true,
+			isError: true,
 		},
 		{
 			name:    "quantize error",
@@ -183,6 +142,7 @@ func TestBuiltinAvg(t *testing.T) {
 		expected float64
 		isError  bool
 		isUndef  bool
+		isInt    bool
 	}{
 		{
 			name:     "average of integers",
@@ -205,19 +165,26 @@ func TestBuiltinAvg(t *testing.T) {
 			expected: 2.0,
 		},
 		{
+			// avg of an empty list is int 0 in the reference engine.
 			name:     "empty list",
 			input:    `[x = avg({})]`,
 			expected: 0.0,
+			isInt:    true,
 		},
 		{
-			name:     "no arguments",
-			input:    `[x = avg()]`,
+			// 0 arguments is wrong arity: error (the engine rejects it before
+			// evaluating args), matching the reference engine.
+			name:    "no arguments",
+			input:   `[x = avg()]`,
+			isError: true,
+		},
+		{
+			// All-undefined elements are skipped, leaving an empty average:
+			// int 0 in the reference engine (same as an empty list).
+			name:     "all undefined",
+			input:    `[x = avg({undefined, undefined})]`,
 			expected: 0.0,
-		},
-		{
-			name:    "all undefined",
-			input:   `[x = avg({undefined, undefined})]`,
-			isUndef: true,
+			isInt:    true,
 		},
 		{
 			name:    "error in list",
@@ -252,6 +219,12 @@ func TestBuiltinAvg(t *testing.T) {
 			if tt.isUndef {
 				if !val.IsUndefined() {
 					t.Errorf("Expected undefined, got %v", val)
+				}
+				return
+			}
+			if tt.isInt {
+				if got, _ := val.IntValue(); !val.IsInteger() || got != int64(tt.expected) {
+					t.Errorf("Expected int %d, got %v", int64(tt.expected), val)
 				}
 				return
 			}
@@ -305,9 +278,10 @@ func TestBuiltinMin(t *testing.T) {
 			isUndef: true,
 		},
 		{
+			// 0 arguments is wrong arity: error, matching the reference engine.
 			name:    "no arguments",
 			input:   `[x = min()]`,
-			isUndef: true,
+			isError: true,
 		},
 		{
 			name:    "all undefined",
@@ -401,9 +375,10 @@ func TestBuiltinMax(t *testing.T) {
 			isUndef: true,
 		},
 		{
+			// 0 arguments is wrong arity: error, matching the reference engine.
 			name:    "no arguments",
 			input:   `[x = max()]`,
-			isUndef: true,
+			isError: true,
 		},
 		{
 			name:    "all undefined",
@@ -489,9 +464,11 @@ func TestBuiltinSplitSlotName(t *testing.T) {
 			expected: []string{"slot1", "sub@machine.example.com"},
 		},
 		{
+			// A non-string argument (including undefined) is an error in the
+			// reference engine; splitSlotName does not propagate undefined.
 			name:    "undefined",
 			input:   `[x = splitSlotName(undefined)]`,
-			isUndef: true,
+			isError: true,
 		},
 		{
 			name:    "error",

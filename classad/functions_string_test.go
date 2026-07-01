@@ -17,8 +17,10 @@ func TestJoinVariants(t *testing.T) {
 		t.Fatalf("expected error for empty join, got %v", val.Type())
 	}
 
+	// Undefined items are skipped; numbers/bools coerce to their reference
+	// string form (a real uses %.15E, matching the reference engine).
 	noSep := evalBuiltin(t, `join({"a", undefined, 2, true, 1.5})`)
-	if s, _ := noSep.StringValue(); s != "a2true1.5" {
+	if s, _ := noSep.StringValue(); s != "a2true1.500000000000000E+00" {
 		t.Fatalf("unexpected join(list) result: %q", s)
 	}
 
@@ -32,8 +34,10 @@ func TestJoinVariants(t *testing.T) {
 		t.Fatalf("unexpected join variadic result: %q", s)
 	}
 
-	if val := evalBuiltin(t, `join(123, "a")`); !val.IsError() {
-		t.Fatalf("expected error for non-string separator, got %v", val.Type())
+	// A numeric separator coerces to its string form (a single item needs no
+	// separator), matching the reference engine.
+	if val := evalBuiltin(t, `join(123, "a")`); func() bool { s, _ := val.StringValue(); return !val.IsString() || s != "a" }() {
+		t.Fatalf("join(123, \"a\") should be \"a\", got %v", val.Type())
 	}
 }
 
@@ -99,8 +103,10 @@ func TestStringComparisons(t *testing.T) {
 		t.Fatalf("expected string compare 10 vs 2 to be negative, got %d", v)
 	}
 
-	if errVal := evalBuiltin(t, `strcmp({1}, "x")`); !errVal.IsError() {
-		t.Fatalf("expected error for invalid strcmp types")
+	// A list is coerced to its sink string form ("{ 1 }") and compared,
+	// matching the reference engine: strcmp("{ 1 }", "x") == 1.
+	if v, _ := evalBuiltin(t, `strcmp({1}, "x")`).IntValue(); v != 1 {
+		t.Fatalf("expected strcmp({1}, \"x\") == 1, got %d", v)
 	}
 }
 
@@ -110,10 +116,11 @@ func TestVersionComparisons(t *testing.T) {
 		t.Fatalf("expected 1.2 < 1.10, got %d", v)
 	}
 
-	if gt := evalBuiltin(t, `version_gt("8.9.1", "8.8.9")`); !gt.IsBool() {
-		t.Fatalf("version_gt should return bool")
-	} else if b, _ := gt.BoolValue(); !b {
-		t.Fatalf("expected version_gt to be true")
+	// version_gt/ge/lt/le/eq (underscore) are not reference function names -- the
+	// reference spells them versionGT/... (camelCase, case-sensitive; see
+	// CPP_QUIRKS.md) and errors on the underscore forms, so Go does too.
+	if gt := evalBuiltin(t, `version_gt("8.9.1", "8.8.9")`); !gt.IsError() {
+		t.Fatalf("version_gt (non-reference name) should be error, got %v", gt.Type())
 	}
 
 	inRange := evalBuiltin(t, `version_in_range("8.8.0", "8.7.0", "8.9.0")`)
@@ -171,12 +178,13 @@ func TestStringListBuiltins(t *testing.T) {
 		t.Fatalf("unexpected stringListSize: %d", v)
 	}
 
-	sum := evalBuiltin(t, `stringListSum("1,2.5,bad")`)
-	if sum.IsInteger() {
-		t.Fatalf("expected real sum due to decimal input")
+	// A non-numeric list item ("bad") is an error in the reference engine, not
+	// a silently-skipped element.
+	if sum := evalBuiltin(t, `stringListSum("1,2.5,bad")`); !sum.IsError() {
+		t.Fatalf("expected error for non-numeric item, got %v", sum.Type())
 	}
-	if v, _ := sum.RealValue(); v != 3.5 {
-		t.Fatalf("unexpected stringListSum: %g", v)
+	if sum := evalBuiltin(t, `stringListSum("1,2.5")`); func() bool { v, _ := sum.RealValue(); return !sum.IsReal() || v != 3.5 }() {
+		t.Fatalf("unexpected stringListSum for reals")
 	}
 
 	avg := evalBuiltin(t, `stringListAvg("")`)
@@ -267,9 +275,11 @@ func TestMembershipFunctions(t *testing.T) {
 		t.Fatalf("expected case-insensitive member to match")
 	}
 
+	// All-integer average uses integer division and is an integer (the
+	// reference engine), so stringListAvg("1,2,3") is int(2), not real.
 	avg := evalBuiltin(t, `stringListAvg("1,2,3")`)
-	if v, _ := avg.RealValue(); v != 2 {
-		t.Fatalf("unexpected average value: %g", v)
+	if v, _ := avg.IntValue(); !avg.IsInteger() || v != 2 {
+		t.Fatalf("unexpected average value: %v %v", avg.Type(), v)
 	}
 	avgDelim := evalBuiltin(t, `stringListAvg("1.0|2.0", "|")`)
 	if v, _ := avgDelim.RealValue(); v != 1.5 {
@@ -279,9 +289,11 @@ func TestMembershipFunctions(t *testing.T) {
 	if !avgErr.IsError() {
 		t.Fatalf("expected error for non-string average input")
 	}
+	// An undefined argument is an error here (these HTCondor functions do not
+	// propagate undefined), matching the reference engine.
 	avgUndef := evalBuiltin(t, `stringListAvg(undefined)`)
-	if !avgUndef.IsUndefined() {
-		t.Fatalf("expected undefined when average input is undefined")
+	if !avgUndef.IsError() {
+		t.Fatalf("expected error when average input is undefined, got %v", avgUndef.Type())
 	}
 
 	stricmpInt := evalBuiltin(t, `stricmp(10, 10)`)
@@ -289,8 +301,9 @@ func TestMembershipFunctions(t *testing.T) {
 		t.Fatalf("expected stricmp to treat integers as equal, got %d", v)
 	}
 
-	if errVal := evalBuiltin(t, `stricmp(undefined, "x")`); !errVal.IsError() {
-		t.Fatalf("expected error when stricmp receives undefined")
+	// stricmp propagates undefined (matching the reference engine).
+	if undefVal := evalBuiltin(t, `stricmp(undefined, "x")`); !undefVal.IsUndefined() {
+		t.Fatalf("expected undefined when stricmp receives undefined")
 	}
 
 	regexMember := evalBuiltin(t, `regexpMember("foo", {"FOO"}, "i")`)

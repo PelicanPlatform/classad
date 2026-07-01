@@ -25,6 +25,11 @@ import (
 %token <real> REAL_LITERAL
 %token <boolean> BOOLEAN_LITERAL
 %token UNDEFINED ERROR
+/* ELVIS is the adjacent "?:" operator. Unlike the spaced "? :" (which the
+   lexer leaves as two tokens and which binds at ternary precedence), it is a
+   high-precedence postfix operator alongside '.' and '[', matching the
+   reference parser (10 ?: 2 + 3 is (10 ?: 2) + 3). */
+%token ELVIS
 
 /* Operators - ordered by precedence (lowest to highest) */
 %left '?' ':'
@@ -39,6 +44,10 @@ import (
 %left '+' '-'
 %left '*' '/' '%'
 %right UNARY '!' '~'
+/* ELVIS is just below '.' / '[' so the elvis right operand greedily grabs a
+   trailing subscript/selection: (0) ?: {}[0] is (0) ?: ({}[0]), not
+   ((0) ?: {})[0], matching the reference parser's recursive postfix right. */
+%left ELVIS
 %left '.' '[' '('
 
 %type <classad> classad record_literal
@@ -215,6 +224,8 @@ postfix_expr
 		{ $$ = &ast.SelectExpr{Record: $1, Attr: $3} }
 	| postfix_expr '[' expr ']'
 		{ $$ = &ast.SubscriptExpr{Container: $1, Index: $3} }
+	| postfix_expr ELVIS postfix_expr
+		{ $$ = &ast.ElvisExpr{Left: $1, Right: $3} }
 	| IDENTIFIER '(' opt_expr_list ')'
 		{ $$ = &ast.FunctionCall{Name: $1, Args: $3} }
 	;
@@ -228,7 +239,7 @@ primary_expr
 			$$ = &ast.AttributeReference{Name: name, Scope: scope}
 		}
 	| '(' expr ')'
-		{ $$ = $2 }
+		{ $$ = ast.Parenthesize($2) }
 	| '{' opt_expr_list '}'
 		{ $$ = &ast.ListLiteral{Elements: $2} }
 	| record_literal

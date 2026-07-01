@@ -267,3 +267,32 @@ func (s *SubscriptExpr) String() string {
 }
 
 func (s *SubscriptExpr) exprNode() {}
+
+// ParenExpr is an expression wrapped in explicit source parentheses. The
+// reference engine echoes parentheses verbatim when unparsing -- around any
+// expression, including primaries ((x), (5)) and nested ((x)) -- so they are
+// preserved as a node rather than a flag. Evaluation is transparent (the inner
+// expression's value).
+type ParenExpr struct {
+	Inner Expr
+}
+
+// String is transparent: the AST's String() methods are a debug representation
+// that already always-parenthesizes operators, so echoing the explicit source
+// parentheses here would double them. The reference-faithful unparser
+// (classad/unparse.go) is what emits the preserved parentheses.
+func (p *ParenExpr) String() string {
+	if p.Inner == nil {
+		return "()"
+	}
+	return p.Inner.String()
+}
+func (p *ParenExpr) exprNode() {}
+
+// Parenthesize wraps an expression in a ParenExpr, recording that the source
+// parenthesized it so unparsing can echo the parentheses (matching the
+// reference engine). The wrapped expression is returned for use in grammar
+// actions.
+func Parenthesize(e Expr) Expr {
+	return &ParenExpr{Inner: e}
+}

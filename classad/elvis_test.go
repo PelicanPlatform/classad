@@ -141,10 +141,12 @@ func TestElvisOperatorAST(t *testing.T) {
 					t.Errorf("Expected outer *ast.ElvisExpr, got %T", expr.expr)
 					return
 				}
-				// The right side should also be ElvisExpr (right associative)
-				innerElvis, ok := outerElvis.Right.(*ast.ElvisExpr)
+				// The adjacent "?:" elvis is a left-associative postfix
+				// operator (matching the reference parser), so a ?: b ?: c is
+				// (a ?: b) ?: c -- the nested ElvisExpr is on the LEFT.
+				innerElvis, ok := outerElvis.Left.(*ast.ElvisExpr)
 				if !ok {
-					t.Errorf("Expected nested *ast.ElvisExpr on right, got %T", outerElvis.Right)
+					t.Errorf("Expected nested *ast.ElvisExpr on left, got %T", outerElvis.Left)
 				}
 				_ = innerElvis // Verify it exists
 			},

@@ -6,15 +6,327 @@ import (
 	"math"
 	"math/rand"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
+func isHexDigit(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'a' && b <= 'f') || (b >= 'A' && b <= 'F')
+}
+
+// floatToInt64 converts a real to int64 the way int() does in the reference
+// engine: NaN is 0, and a value out of int64 range (including +/-Inf)
+// saturates to the nearest bound rather than wrapping (Go's int64(f) is
+// undefined out of range). In range, it truncates toward zero.
+func floatToInt64(f float64) int64 {
+	switch {
+	case math.IsNaN(f):
+		return 0
+	case f >= 9223372036854775807: // >= 2^63-1; +Inf included
+		return math.MaxInt64
+	case f <= -9223372036854775808: // <= -2^63; -Inf included
+		return math.MinInt64
+	default:
+		return int64(f)
+	}
+}
+
+// parseLeadingFloat mimics C strtod, which int()/real() use to convert a
+// string: skip leading whitespace, then parse the longest valid
+// floating-point prefix (so "5abc" yields 5 and " 5 " yields 5). It reports
+// ok=false only when no numeric characters are consumed ("abc", ""). It accepts
+// the same forms as strtod: decimal, hexadecimal (0x1, 0xff, hex floats like
+// 0x1p4 -- with or without the binary exponent that Go's ParseFloat requires),
+// and the inf/infinity/nan spellings. So real("0x1") is 1, int("0xff") is 255,
+// and int("inf") is +Inf (which builtinInt saturates).
+func parseLeadingFloat(s string) (float64, bool) {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '\v' || s[i] == '\f') {
+		i++
+	}
+	start := i
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	rest := s[i:]
+	// inf / infinity / nan (case-insensitive), as strtod accepts.
+	for _, word := range []string{"infinity", "inf", "nan"} {
+		if len(rest) >= len(word) && strings.EqualFold(rest[:len(word)], word) {
+			f, err := strconv.ParseFloat(s[start:i+len(word)], 64)
+			return f, err == nil
+		}
+	}
+	// Hexadecimal: 0x<hex>[.<hex>][p[+/-]<dec>]. Go's ParseFloat parses hex
+	// floats only with a binary 'p' exponent, so synthesize "p0" when absent.
+	if i+1 < len(s) && s[i] == '0' && (s[i+1] == 'x' || s[i+1] == 'X') {
+		j := i + 2
+		mant := false
+		for j < len(s) && isHexDigit(s[j]) {
+			j++
+			mant = true
+		}
+		if j < len(s) && s[j] == '.' {
+			j++
+			for j < len(s) && isHexDigit(s[j]) {
+				j++
+				mant = true
+			}
+		}
+		if mant {
+			hasExp := false
+			if j < len(s) && (s[j] == 'p' || s[j] == 'P') {
+				k := j + 1
+				if k < len(s) && (s[k] == '+' || s[k] == '-') {
+					k++
+				}
+				if k < len(s) && s[k] >= '0' && s[k] <= '9' {
+					j = k
+					for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+						j++
+					}
+					hasExp = true
+				}
+			}
+			tok := s[start:j]
+			if !hasExp {
+				tok += "p0"
+			}
+			f, err := strconv.ParseFloat(tok, 64)
+			return f, err == nil
+		}
+		// "0x" with no hex digit: the leading "0" parses as decimal zero.
+	}
+	digits := false
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+		digits = true
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+			digits = true
+		}
+	}
+	if digits && i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		j := i + 1
+		if j < len(s) && (s[j] == '+' || s[j] == '-') {
+			j++
+		}
+		if j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			i = j
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+		}
+	}
+	if !digits {
+		return 0, false
+	}
+	f, err := strconv.ParseFloat(s[start:i], 64)
+	if err != nil {
+		return 0, false
+	}
+	return f, true
+}
+
+// coerceToReal converts a value to a real the way the reference engine's
+// convertValueToRealValue does, for the math builtins (floor/ceiling/round/
+// pow/quantize): integers, reals and booleans convert directly, and a string
+// is parsed via strtod. Undefined, error, lists and classads cannot convert.
+// (This is deliberately distinct from numericOperand, which the arithmetic and
+// comparison operators use and which does NOT coerce strings.)
+func coerceToReal(v Value) (float64, bool) {
+	switch v.valueType {
+	case IntegerValue:
+		return float64(v.intVal), true
+	case RealValue:
+		return v.realVal, true
+	case BooleanValue:
+		if v.boolVal {
+			return 1, true
+		}
+		return 0, true
+	case StringValue:
+		return parseLeadingFloat(v.strVal)
+	default:
+		return 0, false
+	}
+}
+
 // Built-in string functions
 
 // builtinStrcat concatenates strings
+// classadReal renders a real exactly as the reference unparser does
+// (ClassAdUnParser::UnparseReal): zero via %.1f ("0.0"/"-0.0"), the non-finite
+// values via the real("...") forms, everything else via %1.15E (e.g.
+// 1.5 -> "1.500000000000000E+00").
+func classadReal(r float64) string {
+	switch {
+	case math.IsNaN(r):
+		return `real("NaN")`
+	case math.IsInf(r, -1):
+		return `real("-INF")`
+	case math.IsInf(r, 1):
+		return `real("INF")`
+	case r == 0:
+		return fmt.Sprintf("%.1f", r)
+	default:
+		return fmt.Sprintf("%1.15E", r)
+	}
+}
+
+// unparseString renders a string in the reference sink form: wrapped in double
+// quotes with control characters escaped and non-printable bytes written as
+// octal (ClassAdUnParser::UnparseString). Used for string elements nested
+// inside a list, where they appear quoted (a top-level string() of a string is
+// unquoted, handled by classadScalarString).
+func unparseString(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\a':
+			b.WriteString(`\a`)
+		case '\b':
+			b.WriteString(`\b`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\v':
+			b.WriteString(`\v`)
+		default:
+			if c < 0x20 || c > 0x7e { // !isprint
+				fmt.Fprintf(&b, "\\%03o", c)
+			} else {
+				b.WriteByte(c)
+			}
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
+}
+
+// unparseValueNested renders a value as it appears inside a list literal: like
+// classadScalarString but strings are quoted and undefined/error print as their
+// keywords. Returns ok=false for nested classads (not yet supported).
+func unparseValueNested(v Value) (string, bool) {
+	switch {
+	case v.IsUndefined():
+		return "undefined", true
+	case v.IsError():
+		return "error", true
+	case v.IsString():
+		s, _ := v.StringValue()
+		return unparseString(s), true
+	case v.IsList():
+		return unparseList(v)
+	default:
+		return classadScalarString(v)
+	}
+}
+
+// unparseList renders a list value in reference sink form, "{ e1,e2 }" (and
+// "{  }" when empty). Returns ok=false if any element cannot be unparsed.
+//
+// A list from a literal carries its source element expressions, which are
+// unparsed directly (so string({1, 1+1}) is "{ 1,1 + 1 }", matching the
+// reference engine, which stores a list as its unevaluated ExprList). A list
+// built programmatically (e.g. by split()) has no source expressions, so its
+// already-evaluated element values are unparsed instead.
+func unparseList(v Value) (string, bool) {
+	if v.listExprs != nil {
+		var b strings.Builder
+		b.WriteString("{ ")
+		for i, e := range v.listExprs {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			b.WriteString(unparseExprString(e))
+		}
+		b.WriteString(" }")
+		return b.String(), true
+	}
+
+	elems, err := v.ListValue()
+	if err != nil {
+		return "", false
+	}
+	var b strings.Builder
+	b.WriteString("{ ")
+	for i, e := range elems {
+		s, ok := unparseValueNested(e)
+		if !ok {
+			return "", false
+		}
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(s)
+	}
+	b.WriteString(" }")
+	return b.String(), true
+}
+
+// classadString converts a value to the string form used by string(), strcat(),
+// strcmp()/stricmp() and toUpper()/toLower(): a bare scalar uses its plain
+// string form (a top-level string is unquoted), while a list is unparsed in
+// sink form with its elements quoted/escaped. ok=false for values that cannot
+// be converted (currently nested classads), which callers turn into an error.
+//
+// NOTE: lists hold already-evaluated elements, so this matches the reference
+// engine for lists of literal/scalar values but not for elements that were
+// non-trivial expressions (the reference unparses the original expression,
+// e.g. string({1, 1+1}) is "{ 1,1 + 1 }" there but "{ 1,2 }" here).
+func classadString(v Value) (string, bool) {
+	if v.IsList() {
+		return unparseList(v)
+	}
+	return classadScalarString(v)
+}
+
+// classadScalarString converts a scalar value to its reference string form,
+// used by string() and strcat(). It reports ok=false for values that are not
+// scalars (lists, classads), which those builtins still reject. Callers handle
+// undefined/error before calling this.
+func classadScalarString(v Value) (string, bool) {
+	switch {
+	case v.IsString():
+		s, _ := v.StringValue()
+		return s, true
+	case v.IsInteger():
+		i, _ := v.IntValue()
+		return fmt.Sprintf("%d", i), true
+	case v.IsBool():
+		b, _ := v.BoolValue()
+		if b {
+			return "true", true
+		}
+		return "false", true
+	case v.IsReal():
+		r, _ := v.RealValue()
+		return classadReal(r), true
+	default:
+		return "", false
+	}
+}
+
 func builtinStrcat(args []Value) Value {
 	var result strings.Builder
+	// Arguments are processed left to right; the first error or undefined wins
+	// (strcat(error, undefined) is error, strcat(undefined, error) is
+	// undefined). Other scalars are coerced to their string form.
 	for _, arg := range args {
 		if arg.IsError() {
 			return NewErrorValue()
@@ -22,10 +334,10 @@ func builtinStrcat(args []Value) Value {
 		if arg.IsUndefined() {
 			return NewUndefinedValue()
 		}
-		if !arg.IsString() {
+		str, ok := classadString(arg)
+		if !ok {
 			return NewErrorValue()
 		}
-		str, _ := arg.StringValue()
 		result.WriteString(str)
 	}
 	return NewStringValue(result.String())
@@ -37,13 +349,17 @@ func builtinSubstr(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// Check for error or undefined
+	// In the reference engine an undefined argument dominates over an error
+	// one (e.g. substr(error, undefined, 1) is undefined), so check all
+	// arguments for undefined first, then for error.
+	for _, arg := range args {
+		if arg.IsUndefined() {
+			return NewUndefinedValue()
+		}
+	}
 	for _, arg := range args {
 		if arg.IsError() {
 			return NewErrorValue()
-		}
-		if arg.IsUndefined() {
-			return NewUndefinedValue()
 		}
 	}
 
@@ -52,33 +368,50 @@ func builtinSubstr(args []Value) Value {
 	}
 
 	str, _ := args[0].StringValue()
-	offset, _ := args[1].IntValue()
+	offset64, _ := args[1].IntValue()
 
-	// Handle negative offset (from end)
-	if offset < 0 {
-		offset = int64(len(str)) + offset
-	}
-
-	if offset < 0 || offset >= int64(len(str)) {
-		return NewStringValue("")
-	}
-
-	if len(args) == 3 {
+	threeArg := len(args) == 3
+	var length64 int64 // defaults to 0 for the two-argument form
+	if threeArg {
 		if !args[2].IsInteger() {
 			return NewErrorValue()
 		}
-		length, _ := args[2].IntValue()
+		length64, _ = args[2].IntValue()
+	}
+	// The reference engine reads the offset and length into 32-bit ints, so an
+	// out-of-int32-range argument is truncated (e.g. a huge offset can wrap to
+	// a small or negative value); mirror that before clamping.
+	offset := int64(int32(offset64))
+	length := int64(int32(length64))
+	origLen := length
+
+	// Perl-like substr (matching subString in fnCall.cpp): a negative offset
+	// counts from the end (clamped to 0), an offset past the end is the end; a
+	// non-positive length counts from the end of the string (clamped to 0),
+	// and a too-large length is clamped to what remains.
+	alen := int64(len(str))
+	if offset < 0 {
+		offset = alen + offset
+		if offset < 0 {
+			offset = 0
+		}
+	} else if offset >= alen {
+		offset = alen
+	}
+	if length <= 0 {
+		length = alen - offset + length
 		if length < 0 {
-			return NewErrorValue()
+			length = 0
 		}
-		end := offset + length
-		if end > int64(len(str)) {
-			end = int64(len(str))
-		}
-		return NewStringValue(str[offset:end])
+	} else if length > alen-offset {
+		length = alen - offset
+	}
+	// An explicitly-supplied length of 0 yields the empty string.
+	if threeArg && origLen == 0 {
+		length = 0
 	}
 
-	return NewStringValue(str[offset:])
+	return NewStringValue(str[offset : offset+length])
 }
 
 // builtinSize returns the size of a string or list
@@ -100,16 +433,13 @@ func builtinSize(args []Value) Value {
 	}
 
 	if args[0].IsList() {
-		list, _ := args[0].ListValue()
-		return NewIntValue(int64(len(list)))
+		// Count elements without evaluating them (size({C}) is 1 even when C
+		// would cycle), matching the reference engine, which counts the
+		// unevaluated ExprList.
+		return NewIntValue(int64(args[0].listLen()))
 	}
 
 	return NewErrorValue()
-}
-
-// builtinLength is an alias for size
-func builtinLength(args []Value) Value {
-	return builtinSize(args)
 }
 
 // builtinToLower converts string to lowercase
@@ -124,11 +454,12 @@ func builtinToLower(args []Value) Value {
 	if args[0].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	if !args[0].IsString() {
+	// Non-string scalars are coerced to their string form first (so
+	// toLower(1.5) lowercases "1.500000000000000E+00").
+	str, ok := classadString(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
-
-	str, _ := args[0].StringValue()
 	return NewStringValue(strings.ToLower(str))
 }
 
@@ -144,11 +475,10 @@ func builtinToUpper(args []Value) Value {
 	if args[0].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	if !args[0].IsString() {
+	str, ok := classadString(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
-
-	str, _ := args[0].StringValue()
 	return NewStringValue(strings.ToUpper(str))
 }
 
@@ -163,14 +493,18 @@ func builtinFloor(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	// An integer argument is returned unchanged (matching the reference): a
+	// float round-trip would lose precision for large magnitudes.
+	if args[0].IsInteger() {
+		return args[0]
 	}
-	if !args[0].IsNumber() {
+	// Booleans and numeric strings coerce to a number (floor("2.5") == 2);
+	// undefined or any other non-number is an error -- unlike int()/real()
+	// which propagate undefined.
+	num, ok := coerceToReal(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
-
-	num, _ := args[0].NumberValue()
 	return NewIntValue(int64(math.Floor(num)))
 }
 
@@ -183,14 +517,13 @@ func builtinCeiling(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if args[0].IsInteger() {
+		return args[0]
 	}
-	if !args[0].IsNumber() {
+	num, ok := coerceToReal(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
-
-	num, _ := args[0].NumberValue()
 	return NewIntValue(int64(math.Ceil(num)))
 }
 
@@ -203,15 +536,16 @@ func builtinRound(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if args[0].IsInteger() {
+		return args[0]
 	}
-	if !args[0].IsNumber() {
+	num, ok := coerceToReal(args[0])
+	if !ok {
 		return NewErrorValue()
 	}
-
-	num, _ := args[0].NumberValue()
-	return NewIntValue(int64(math.Round(num)))
+	// The reference engine rounds half to even (C rint), so round(2.5) == 2
+	// and round(3.5) == 4, not half-away-from-zero.
+	return NewIntValue(int64(math.RoundToEven(num)))
 }
 
 // builtinRandom returns a random real number between 0 and 1 (or up to max if specified)
@@ -257,7 +591,7 @@ func builtinInt(args []Value) Value {
 
 	if args[0].IsReal() {
 		num, _ := args[0].RealValue()
-		return NewIntValue(int64(num))
+		return NewIntValue(floatToInt64(num))
 	}
 
 	if args[0].IsBool() {
@@ -266,6 +600,17 @@ func builtinInt(args []Value) Value {
 			return NewIntValue(1)
 		}
 		return NewIntValue(0)
+	}
+
+	// A string is parsed as a number (via strtod) and truncated toward zero,
+	// matching the reference: int("1.9") == 1, int("-3.7") == -3, int("abc")
+	// is an error. int("0xff") == 255, int("inf") saturates to MaxInt64.
+	if args[0].IsString() {
+		s, _ := args[0].StringValue()
+		if f, ok := parseLeadingFloat(s); ok {
+			return NewIntValue(floatToInt64(f))
+		}
+		return NewErrorValue()
 	}
 
 	return NewErrorValue()
@@ -291,6 +636,25 @@ func builtinReal(args []Value) Value {
 	if args[0].IsInteger() {
 		num, _ := args[0].IntValue()
 		return NewRealValue(float64(num))
+	}
+
+	// Booleans convert to 1.0 / 0.0, matching the reference engine.
+	if args[0].IsBool() {
+		b, _ := args[0].BoolValue()
+		if b {
+			return NewRealValue(1)
+		}
+		return NewRealValue(0)
+	}
+
+	// A string is parsed as a real (via strtod): real("3.14") == 3.14,
+	// real("x") is an error.
+	if args[0].IsString() {
+		s, _ := args[0].StringValue()
+		if f, ok := parseLeadingFloat(s); ok {
+			return NewRealValue(f)
+		}
+		return NewErrorValue()
 	}
 
 	return NewErrorValue()
@@ -380,47 +744,32 @@ func builtinMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
-		return NewErrorValue()
-	}
+	// An undefined argument dominates over an error one (matching the
+	// reference): check undefined first, then error.
 	if args[0].IsUndefined() || args[1].IsUndefined() {
 		return NewUndefinedValue()
 	}
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
+	}
 
-	if !args[1].IsList() {
+	// The list to search must be a list, and the target must be comparable:
+	// a list or classad target is an error (matching the reference).
+	if !args[1].IsList() || args[0].IsList() || args[0].IsClassAd() {
 		return NewErrorValue()
 	}
 
 	element := args[0]
 	list, _ := args[1].ListValue()
 
+	// Membership uses the == operator's semantics (numeric coercion,
+	// case-insensitive strings). A comparison that is not boolean-true -- including
+	// one that evaluates to error or undefined -- simply does not match, so a
+	// non-comparable element does not abort the search.
 	for _, item := range list {
-		// Use simple equality check
-		if element.Type() == item.Type() {
-			if element.IsInteger() {
-				e, _ := element.IntValue()
-				i, _ := item.IntValue()
-				if e == i {
-					return NewBoolValue(true)
-				}
-			} else if element.IsReal() {
-				e, _ := element.RealValue()
-				i, _ := item.RealValue()
-				if e == i {
-					return NewBoolValue(true)
-				}
-			} else if element.IsString() {
-				e, _ := element.StringValue()
-				i, _ := item.StringValue()
-				if e == i {
-					return NewBoolValue(true)
-				}
-			} else if element.IsBool() {
-				e, _ := element.BoolValue()
-				i, _ := item.BoolValue()
-				if e == i {
-					return NewBoolValue(true)
-				}
+		if eq := valuesEqual(item, element); eq.IsBool() {
+			if b, _ := eq.BoolValue(); b {
+				return NewBoolValue(true)
 			}
 		}
 	}
@@ -428,76 +777,78 @@ func builtinMember(args []Value) Value {
 	return NewBoolValue(false)
 }
 
-// builtinStringListMember checks if a string is a member of a comma-separated string list
-// stringListMember(string item, string list [, string options])
-// The list is a comma-separated string. Options can contain:
-// - "i" or "I": case-insensitive comparison
-func builtinStringListMember(args []Value) Value {
+// stringListStrArg coerces a stringList membership/subset argument to its
+// string form, treating undefined as the empty string -- these functions treat
+// an undefined item/list as empty rather than propagating undefined, so e.g.
+// stringListMember(undefined, "a") is false and stringListSubsetMatch(undefined,
+// "a") is true (the empty list is a subset of anything). It reports ok=false for
+// an argument that is neither a string nor undefined (error, number, list, ...),
+// which the caller turns into an error.
+func stringListStrArg(v Value) (s string, ok bool) {
+	if v.IsUndefined() {
+		return "", true
+	}
+	if v.IsString() {
+		s, _ = v.StringValue()
+		return s, true
+	}
+	return "", false
+}
+
+// stringListMemberImpl backs stringListMember (case-sensitive) and
+// stringListIMember (case-insensitive). The signature is
+// (item, list [, delimiter]) -- the optional third argument is the delimiter
+// set (NOT a case-sensitivity option; case sensitivity is fixed by the
+// function name) -- and an undefined item or list acts as the empty string.
+func stringListMemberImpl(args []Value, ignoreCase bool) Value {
 	if len(args) < 2 || len(args) > 3 {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
-		return NewErrorValue()
-	}
-	if args[0].IsUndefined() || args[1].IsUndefined() {
+	// When both the item and the list are undefined the result is undefined
+	// (with only one undefined, the undefined acts as the empty string).
+	if args[0].IsUndefined() && args[1].IsUndefined() {
 		return NewUndefinedValue()
 	}
 
-	if !args[0].IsString() || !args[1].IsString() {
+	item, ok0 := stringListStrArg(args[0])
+	listStr, ok1 := stringListStrArg(args[1])
+	if !ok0 || !ok1 {
 		return NewErrorValue()
 	}
 
-	item, _ := args[0].StringValue()
-	listStr, _ := args[1].StringValue()
-
-	// Check for options
-	ignoreCase := false
+	delim := ""
 	if len(args) == 3 {
-		if args[2].IsError() {
+		d, ok2 := stringListStrArg(args[2])
+		if !ok2 {
 			return NewErrorValue()
 		}
-		if args[2].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[2].IsString() {
-			return NewErrorValue()
-		}
-		options, _ := args[2].StringValue()
-		if strings.ContainsAny(options, "iI") {
-			ignoreCase = true
-		}
+		delim = d
 	}
 
-	// Split the list by commas and check each element
-	elements := strings.Split(listStr, ",")
-	for _, elem := range elements {
-		// Trim whitespace from each element
-		elem = strings.TrimSpace(elem)
+	for _, elem := range parseStringList(listStr, delim) {
 		if ignoreCase {
 			if strings.EqualFold(elem, item) {
 				return NewBoolValue(true)
 			}
-		} else {
-			if elem == item {
-				return NewBoolValue(true)
-			}
+		} else if elem == item {
+			return NewBoolValue(true)
 		}
 	}
 
 	return NewBoolValue(false)
 }
 
-// builtinStringListIMember is a convenience wrapper for stringListMember with case-insensitive matching.
-// stringListIMember(string item, string list)
-// Returns true if item is in list (case-insensitive), false otherwise
-func builtinStringListIMember(args []Value) Value {
-	if len(args) != 2 {
-		return NewErrorValue()
-	}
+// builtinStringListMember checks whether item is a member of a delimited string
+// list. stringListMember(item, list [, delimiter]) is case-sensitive.
+func builtinStringListMember(args []Value) Value {
+	return stringListMemberImpl(args, false)
+}
 
-	// Call stringListMember with "i" option for case-insensitive matching
-	return builtinStringListMember([]Value{args[0], args[1], NewStringValue("i")})
+// builtinStringListIMember is the case-insensitive variant.
+// stringListIMember(item, list [, delimiter]).
+func builtinStringListIMember(args []Value) Value {
+	return stringListMemberImpl(args, true)
 }
 
 // builtinRegexp checks if a string matches a regular expression
@@ -561,36 +912,6 @@ func builtinRegexp(args []Value) Value {
 	return NewBoolValue(re.MatchString(target))
 }
 
-// builtinIfThenElse is the conditional operator as a function
-// ifThenElse(condition, trueValue, falseValue)
-// This is equivalent to (condition ? trueValue : falseValue)
-// Unlike the ternary operator, this is a function so all arguments are evaluated first
-func builtinIfThenElse(args []Value) Value {
-	if len(args) != 3 {
-		return NewErrorValue()
-	}
-
-	// Check first argument for error/undefined
-	if args[0].IsError() {
-		return NewErrorValue()
-	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !args[0].IsBool() {
-		return NewErrorValue()
-	}
-
-	condition, _ := args[0].BoolValue()
-
-	// Return appropriate value based on condition
-	if condition {
-		return args[1]
-	}
-	return args[2]
-}
-
 // builtinString converts any value to string
 func builtinString(args []Value) Value {
 	if len(args) != 1 {
@@ -600,28 +921,15 @@ func builtinString(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
+	// string() propagates undefined (matching the reference).
 	if args[0].IsUndefined() {
-		return NewErrorValue()
+		return NewUndefinedValue()
 	}
 
-	// Convert based on type
-	if args[0].IsString() {
-		return args[0]
-	}
-	if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		return NewStringValue(fmt.Sprintf("%d", val))
-	}
-	if args[0].IsReal() {
-		val, _ := args[0].RealValue()
-		return NewStringValue(fmt.Sprintf("%g", val))
-	}
-	if args[0].IsBool() {
-		val, _ := args[0].BoolValue()
-		if val {
-			return NewStringValue("true")
-		}
-		return NewStringValue("false")
+	// Convert scalars to their reference string form (reals use %.15E, e.g.
+	// 1.5 -> "1.500000000000000E+00"). Lists/classads are not handled here.
+	if s, ok := classadString(args[0]); ok {
+		return NewStringValue(s)
 	}
 
 	return NewErrorValue()
@@ -636,8 +944,9 @@ func builtinBool(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
+	// bool() propagates undefined (matching the reference).
 	if args[0].IsUndefined() {
-		return NewErrorValue()
+		return NewUndefinedValue()
 	}
 
 	// Already boolean
@@ -657,16 +966,17 @@ func builtinBool(args []Value) Value {
 		return NewBoolValue(val != 0.0)
 	}
 
-	// String: "true" is true, "false" is false, others are ERROR
+	// String: "true"/"false" (case-insensitive) convert; any other string is
+	// undefined (not error), matching the reference.
 	if args[0].IsString() {
 		str, _ := args[0].StringValue()
-		if str == "true" {
+		if strings.EqualFold(str, "true") {
 			return NewBoolValue(true)
 		}
-		if str == "false" {
+		if strings.EqualFold(str, "false") {
 			return NewBoolValue(false)
 		}
-		return NewErrorValue()
+		return NewUndefinedValue()
 	}
 
 	return NewErrorValue()
@@ -681,42 +991,30 @@ func builtinPow(args []Value) Value {
 	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
+	// pow treats undefined operands as an error (matching the reference),
+	// not undefined.
 	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	// Get base value as real
-	var base float64
-	if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		base = float64(val)
-	} else if args[0].IsReal() {
-		base, _ = args[0].RealValue()
-	} else {
 		return NewErrorValue()
 	}
 
-	// Get exponent value
-	var exp float64
-	expIsInt := false
-	if args[1].IsInteger() {
-		val, _ := args[1].IntValue()
-		exp = float64(val)
-		expIsInt = true
-	} else if args[1].IsReal() {
-		exp, _ = args[1].RealValue()
-	} else {
+	// Integer result only when both operands are genuine integers and the
+	// exponent is non-negative (booleans take the real path), matching the
+	// reference engine, which rounds the integer result via +0.5.
+	if args[0].IsInteger() && args[1].IsInteger() {
+		base, _ := args[0].IntValue()
+		exp, _ := args[1].IntValue()
+		if exp >= 0 {
+			return NewIntValue(int64(math.Pow(float64(base), float64(exp)) + 0.5))
+		}
+	}
+
+	// Real path: coerce base and exponent (int/real/bool) to real.
+	base, bn := coerceToReal(args[0])
+	exp, en := coerceToReal(args[1])
+	if !bn || !en {
 		return NewErrorValue()
 	}
-
-	result := math.Pow(base, exp)
-
-	// Return integer if both inputs were integer and exp >= 0
-	if expIsInt && args[0].IsInteger() && exp >= 0 {
-		return NewIntValue(int64(result))
-	}
-
-	return NewRealValue(result)
+	return NewRealValue(math.Pow(base, exp))
 }
 
 // builtinQuantize computes ceiling(a/b)*b for scalars, or finds first value in list >= a
@@ -728,107 +1026,72 @@ func builtinQuantize(args []Value) Value {
 	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
+	// quantize treats undefined operands as an error (matching the reference).
 	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewUndefinedValue()
+		return NewErrorValue()
 	}
 
-	// If second arg is a list
+	// arg must coerce to a number (bool counts).
+	rval, an := coerceToReal(args[0])
+	if !an {
+		return NewErrorValue()
+	}
+
+	// If the base is a list, find the first element >= arg and return that
+	// element unchanged; if none, quantize using the last element as the base.
+	// An empty list means "do not quantize" and returns arg unchanged.
 	if args[1].IsList() {
 		list, _ := args[1].ListValue()
-
-		// Get first numeric value from args[0]
-		var a float64
-		if args[0].IsInteger() {
-			val, _ := args[0].IntValue()
-			a = float64(val)
-		} else if args[0].IsReal() {
-			a, _ = args[0].RealValue()
-		} else {
-			return NewErrorValue()
-		}
-
-		// Find first value in list >= a
-		var lastVal Value
+		var last Value
+		haveLast := false
 		for _, item := range list {
-			if item.IsError() {
+			iv, in := coerceToReal(item)
+			if !in {
 				return NewErrorValue()
 			}
-			if item.IsUndefined() {
-				continue
-			}
-
-			var itemVal float64
-			if item.IsInteger() {
-				val, _ := item.IntValue()
-				itemVal = float64(val)
-			} else if item.IsReal() {
-				itemVal, _ = item.RealValue()
-			} else {
-				return NewErrorValue()
-			}
-
-			if itemVal >= a {
+			if iv >= rval {
 				return item
 			}
-			lastVal = item
+			last, haveLast = item, true
 		}
-
-		// No value >= a, compute integral multiple of last value
-		if lastVal.valueType != UndefinedValue {
-			var lastFloat float64
-			if lastVal.IsInteger() {
-				val, _ := lastVal.IntValue()
-				lastFloat = float64(val)
-			} else if lastVal.IsReal() {
-				lastFloat, _ = lastVal.RealValue()
-			}
-
-			quotient := a / lastFloat
-			result := math.Ceil(quotient) * lastFloat
-
-			if lastVal.IsInteger() {
-				return NewIntValue(int64(result))
-			}
-			return NewRealValue(result)
+		if !haveLast {
+			return args[0]
 		}
-
-		return NewUndefinedValue()
+		return quantizeScalar(args[0], rval, last)
 	}
 
-	// Scalar case: compute ceiling(a/b)*b
-	var a, b float64
-	aIsInt := args[0].IsInteger()
-	bIsInt := args[1].IsInteger()
+	return quantizeScalar(args[0], rval, args[1])
+}
 
-	if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		a = float64(val)
-	} else if args[0].IsReal() {
-		a, _ = args[0].RealValue()
-	} else {
+// quantizeScalar quantizes arg (whose real value is rval) to the next integral
+// multiple of base, matching the reference engine (fnCall.cpp doMath2):
+//   - a zero base (integer 0 or |real| <= 1e-8) returns arg unchanged,
+//     preserving its type;
+//   - an integer base with an integer arg yields an integer via ceil division;
+//   - otherwise the result is a real.
+func quantizeScalar(arg Value, rval float64, base Value) Value {
+	rbase, bn := coerceToReal(base)
+	if !bn {
 		return NewErrorValue()
 	}
 
-	if args[1].IsInteger() {
-		val, _ := args[1].IntValue()
-		b = float64(val)
-	} else if args[1].IsReal() {
-		b, _ = args[1].RealValue()
-	} else {
-		return NewErrorValue()
+	if base.IsInteger() {
+		ibase, _ := base.IntValue()
+		if ibase == 0 {
+			return arg
+		}
+		if arg.IsInteger() {
+			ival, _ := arg.IntValue()
+			return NewIntValue(((ival + ibase - 1) / ibase) * ibase)
+		}
+		return NewRealValue(math.Ceil(rval/float64(ibase)) * float64(ibase))
 	}
 
-	if b == 0 {
-		return NewErrorValue()
+	const epsilon = 1e-8
+	if rbase >= -epsilon && rbase <= epsilon {
+		return arg
 	}
-
-	quotient := a / b
-	result := math.Ceil(quotient) * b
-
-	if bIsInt && aIsInt {
-		return NewIntValue(int64(result))
-	}
-	return NewRealValue(result)
+	return NewRealValue(math.Ceil(rval/rbase) * rbase)
 }
 
 // builtinSum sums numeric values in a list
@@ -838,7 +1101,9 @@ func builtinSum(args []Value) Value {
 	}
 
 	if len(args) == 0 {
-		return NewIntValue(0)
+		// 0 arguments is wrong arity (the engine rejects it before
+		// evaluating args); the reference engine errors here too.
+		return NewErrorValue()
 	}
 
 	if args[0].IsError() {
@@ -856,40 +1121,53 @@ func builtinSum(args []Value) Value {
 		return NewIntValue(0)
 	}
 
-	var sum float64
+	// Integers accumulate in int64 so an all-integer sum stays exact (a float64
+	// accumulator would lose precision past 2^53); floatSum mirrors every
+	// contribution and is used only once a real element forces a real result.
+	var intSum int64
+	var floatSum float64
 	hasReal := false
-	allUndefined := true
+	contributing := 0
+	var single Value
 
 	for _, item := range list {
 		if item.IsError() {
 			return NewErrorValue()
 		}
-		if item.IsUndefined() {
+		// Undefined elements are skipped (so sum of all-undefined is int 0), and
+		// booleans coerce to numbers (true=1, false=0), matching the reference.
+		switch {
+		case item.IsUndefined():
 			continue
-		}
-
-		allUndefined = false
-
-		if item.IsInteger() {
+		case item.IsInteger():
 			val, _ := item.IntValue()
-			sum += float64(val)
-		} else if item.IsReal() {
+			intSum += val
+			floatSum += float64(val)
+		case item.IsBool():
+			if b, _ := item.BoolValue(); b {
+				intSum++
+				floatSum++
+			}
+		case item.IsReal():
 			val, _ := item.RealValue()
-			sum += val
+			floatSum += val
 			hasReal = true
-		} else {
+		default:
 			return NewErrorValue()
 		}
-	}
-
-	if allUndefined {
-		return NewUndefinedValue()
+		contributing++
+		single = item
 	}
 
 	if hasReal {
-		return NewRealValue(sum)
+		return NewRealValue(floatSum)
 	}
-	return NewIntValue(int64(sum))
+	// A single contributing boolean element keeps its type (the reference only
+	// coerces it to an integer once it is added to another element).
+	if contributing == 1 && single.IsBool() {
+		return single
+	}
+	return NewIntValue(intSum)
 }
 
 // builtinAvg computes average of numeric values in a list
@@ -899,7 +1177,9 @@ func builtinAvg(args []Value) Value {
 	}
 
 	if len(args) == 0 {
-		return NewRealValue(0.0)
+		// 0 arguments is wrong arity (the engine rejects it before
+		// evaluating args); the reference engine errors here too.
+		return NewErrorValue()
 	}
 
 	if args[0].IsError() {
@@ -914,44 +1194,41 @@ func builtinAvg(args []Value) Value {
 
 	list, _ := args[0].ListValue()
 	if len(list) == 0 {
-		return NewRealValue(0.0)
+		return NewIntValue(0) // avg of an empty list is int 0 in the reference
 	}
 
 	var sum float64
 	count := 0
-	allUndefined := true
-
 	for _, item := range list {
 		if item.IsError() {
 			return NewErrorValue()
 		}
-		if item.IsUndefined() {
+		// Undefined elements are skipped, and booleans coerce to numbers,
+		// matching the reference.
+		switch {
+		case item.IsUndefined():
 			continue
-		}
-
-		allUndefined = false
-
-		if item.IsInteger() {
-			val, _ := item.IntValue()
-			sum += float64(val)
+		case item.IsInteger():
+			v, _ := item.IntValue()
+			sum += float64(v)
 			count++
-		} else if item.IsReal() {
-			val, _ := item.RealValue()
-			sum += val
+		case item.IsBool():
+			if b, _ := item.BoolValue(); b {
+				sum++
+			}
 			count++
-		} else {
+		case item.IsReal():
+			v, _ := item.RealValue()
+			sum += v
+			count++
+		default:
 			return NewErrorValue()
 		}
 	}
 
-	if allUndefined {
-		return NewUndefinedValue()
-	}
-
 	if count == 0 {
-		return NewRealValue(0.0)
+		return NewIntValue(0) // all elements undefined (or empty): int 0
 	}
-
 	return NewRealValue(sum / float64(count))
 }
 
@@ -962,7 +1239,9 @@ func builtinMin(args []Value) Value {
 	}
 
 	if len(args) == 0 {
-		return NewUndefinedValue()
+		// 0 arguments is wrong arity (the engine rejects it before
+		// evaluating args); the reference engine errors here too.
+		return NewErrorValue()
 	}
 
 	if args[0].IsError() {
@@ -984,6 +1263,7 @@ func builtinMin(args []Value) Value {
 	var minItem Value
 	hasValue := false
 	hasReal := false
+	contributing := 0
 
 	for _, item := range list {
 		if item.IsError() {
@@ -997,6 +1277,10 @@ func builtinMin(args []Value) Value {
 		if item.IsInteger() {
 			v, _ := item.IntValue()
 			val = float64(v)
+		} else if item.IsBool() {
+			if b, _ := item.BoolValue(); b {
+				val = 1
+			}
 		} else if item.IsReal() {
 			val, _ = item.RealValue()
 			hasReal = true
@@ -1004,6 +1288,7 @@ func builtinMin(args []Value) Value {
 			return NewErrorValue()
 		}
 
+		contributing++
 		if !hasValue || val < minVal {
 			minVal = val
 			minItem = item
@@ -1018,6 +1303,12 @@ func builtinMin(args []Value) Value {
 	if hasReal {
 		return NewRealValue(minVal)
 	}
+	// minItem is returned to preserve exact int64 precision. The reference only
+	// coerces a boolean extremum to an integer once a comparison happens (two
+	// or more contributing elements); a lone boolean element keeps its type.
+	if contributing >= 2 && minItem.IsBool() {
+		return NewIntValue(int64(minVal))
+	}
 	return minItem
 }
 
@@ -1028,7 +1319,9 @@ func builtinMax(args []Value) Value {
 	}
 
 	if len(args) == 0 {
-		return NewUndefinedValue()
+		// 0 arguments is wrong arity (the engine rejects it before
+		// evaluating args); the reference engine errors here too.
+		return NewErrorValue()
 	}
 
 	if args[0].IsError() {
@@ -1050,6 +1343,7 @@ func builtinMax(args []Value) Value {
 	var maxItem Value
 	hasValue := false
 	hasReal := false
+	contributing := 0
 
 	for _, item := range list {
 		if item.IsError() {
@@ -1063,6 +1357,10 @@ func builtinMax(args []Value) Value {
 		if item.IsInteger() {
 			v, _ := item.IntValue()
 			val = float64(v)
+		} else if item.IsBool() {
+			if b, _ := item.BoolValue(); b {
+				val = 1
+			}
 		} else if item.IsReal() {
 			val, _ = item.RealValue()
 			hasReal = true
@@ -1070,6 +1368,7 @@ func builtinMax(args []Value) Value {
 			return NewErrorValue()
 		}
 
+		contributing++
 		if !hasValue || val > maxVal {
 			maxVal = val
 			maxItem = item
@@ -1084,6 +1383,12 @@ func builtinMax(args []Value) Value {
 	if hasReal {
 		return NewRealValue(maxVal)
 	}
+	// maxItem is returned to preserve exact int64 precision. The reference only
+	// coerces a boolean extremum to an integer once a comparison happens (two
+	// or more contributing elements); a lone boolean element keeps its type.
+	if contributing >= 2 && maxItem.IsBool() {
+		return NewIntValue(int64(maxVal))
+	}
 	return maxItem
 }
 
@@ -1094,114 +1399,71 @@ func builtinJoin(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	// join(list) - no separator
-	if len(args) == 1 {
-		if args[0].IsError() {
+	// 1- or 2-argument form whose last argument is a list: expand the list into
+	// the items to join, with the separator being arg0 (2-arg) or "" (1-arg).
+	// This mirrors the reference engine's strCat join special case.
+	if len(args) <= 2 {
+		last := args[len(args)-1]
+		if last.IsError() {
 			return NewErrorValue()
 		}
-		if args[0].IsUndefined() {
-			return NewErrorValue()
-		}
-		if !args[0].IsList() {
-			return NewErrorValue()
-		}
-
-		list, _ := args[0].ListValue()
-		var result strings.Builder
-		for _, item := range list {
-			if item.IsUndefined() {
-				continue
+		if last.IsList() {
+			items, _ := last.ListValue()
+			var sep Value
+			if len(args) == 2 {
+				sep = args[0]
+			} else {
+				sep = NewStringValue("")
 			}
-			if item.IsString() {
-				str, _ := item.StringValue()
-				result.WriteString(str)
-			} else if item.IsInteger() {
-				val, _ := item.IntValue()
-				result.WriteString(fmt.Sprintf("%d", val))
-			} else if item.IsReal() {
-				val, _ := item.RealValue()
-				result.WriteString(fmt.Sprintf("%g", val))
-			} else if item.IsBool() {
-				val, _ := item.BoolValue()
-				if val {
-					result.WriteString("true")
-				} else {
-					result.WriteString("false")
-				}
-			}
+			args = append([]Value{sep}, items...)
 		}
-		return NewStringValue(result.String())
 	}
 
-	// Get separator
-	if !args[0].IsString() {
+	// args[0] is the separator; args[1:] are the items. Matching the reference
+	// (strCat with the join flag): an error separator/item is an error, an
+	// undefined separator acts as the empty string, undefined items are skipped
+	// (join keeps going), a non-coercible item (list/ad) is an error, and if
+	// every item is undefined (none defined) the result is undefined.
+	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	sep, _ := args[0].StringValue()
-
-	// Two-argument form: join(separator, list)
-	if len(args) == 2 && args[1].IsList() {
-		if args[1].IsError() {
+	sep := ""
+	sepUndef := args[0].IsUndefined()
+	if !sepUndef {
+		s, ok := classadString(args[0])
+		if !ok {
 			return NewErrorValue()
 		}
-
-		list, _ := args[1].ListValue()
-		var parts []string
-		for _, item := range list {
-			if item.IsUndefined() {
-				continue
-			}
-			if item.IsString() {
-				str, _ := item.StringValue()
-				parts = append(parts, str)
-			} else if item.IsInteger() {
-				val, _ := item.IntValue()
-				parts = append(parts, fmt.Sprintf("%d", val))
-			} else if item.IsReal() {
-				val, _ := item.RealValue()
-				parts = append(parts, fmt.Sprintf("%g", val))
-			} else if item.IsBool() {
-				val, _ := item.BoolValue()
-				if val {
-					parts = append(parts, "true")
-				} else {
-					parts = append(parts, "false")
-				}
-			}
-		}
-		return NewStringValue(strings.Join(parts, sep))
+		sep = s
 	}
 
-	// join(sep, arg1, arg2, ...)
-	var parts []string
-	for i := 1; i < len(args); i++ {
-		if args[i].IsError() {
+	var buf strings.Builder
+	undefFlag, defFlag := false, false
+	for _, item := range args[1:] {
+		if item.IsError() {
 			return NewErrorValue()
 		}
-		if args[i].IsUndefined() {
+		if item.IsUndefined() {
+			undefFlag = true
 			continue
 		}
-
-		if args[i].IsString() {
-			str, _ := args[i].StringValue()
-			parts = append(parts, str)
-		} else if args[i].IsInteger() {
-			val, _ := args[i].IntValue()
-			parts = append(parts, fmt.Sprintf("%d", val))
-		} else if args[i].IsReal() {
-			val, _ := args[i].RealValue()
-			parts = append(parts, fmt.Sprintf("%g", val))
-		} else if args[i].IsBool() {
-			val, _ := args[i].BoolValue()
-			if val {
-				parts = append(parts, "true")
-			} else {
-				parts = append(parts, "false")
-			}
+		s, ok := classadString(item)
+		if !ok {
+			return NewErrorValue()
 		}
+		if defFlag {
+			buf.WriteString(sep)
+		}
+		buf.WriteString(s)
+		defFlag = true
 	}
-
-	return NewStringValue(strings.Join(parts, sep))
+	// With no contributing (defined) items, the result is undefined if either
+	// the separator or any item was undefined; otherwise it is the empty
+	// string (so join("-", {}) is "" but join(undefined, {}) is undefined).
+	if (undefFlag || sepUndef) && !defFlag {
+		return NewUndefinedValue()
+	}
+	return NewStringValue(buf.String())
 }
 
 // builtinSplit splits a string into a list
@@ -1213,41 +1475,63 @@ func builtinSplit(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
+	// split of a non-string (including undefined) is an error in the reference.
 	if !args[0].IsString() {
 		return NewErrorValue()
 	}
 
 	str, _ := args[0].StringValue()
 
-	// Default delimiter is whitespace
-	if len(args) == 1 {
-		fields := strings.Fields(str)
-		var result []Value
-		for _, field := range fields {
-			result = append(result, NewStringValue(field))
+	// The delimiter set defaults to comma plus whitespace; an explicit second
+	// argument replaces it with that string's characters.
+	delim := ", \t\r\n\v\f"
+	if len(args) == 2 {
+		if !args[1].IsString() {
+			return NewErrorValue()
 		}
-		return NewListValue(result)
+		delim, _ = args[1].StringValue()
 	}
 
-	// Custom delimiter
-	if !args[1].IsString() {
-		return NewErrorValue()
-	}
-	delim, _ := args[1].StringValue()
+	return NewListValue(splitDelimited(str, delim))
+}
 
-	// Split on any character in delimiter string
-	fields := strings.FieldsFunc(str, func(r rune) bool {
-		return strings.ContainsRune(delim, r)
-	})
+// classadIsSpace reports whether b is a whitespace byte (matching C isspace for
+// the ASCII range).
+func classadIsSpace(b byte) bool {
+	return b == ' ' || b == '\t' || b == '\n' || b == '\v' || b == '\f' || b == '\r'
+}
+
+// splitDelimited implements the reference split() tokenizer. A character is a
+// delimiter if it appears in delim; a delimiter is "soft" if it is whitespace
+// and "hard" otherwise. Content runs are emitted verbatim, and each maximal
+// delimiter run emits (number of hard delimiters in the run - 1) empty strings
+// -- so whitespace collapses without producing empties while repeated hard
+// delimiters (e.g. ",,") produce empty fields, regardless of position.
+func splitDelimited(str, delim string) []Value {
+	isDelim := func(b byte) bool { return strings.IndexByte(delim, b) >= 0 }
 
 	var result []Value
-	for _, field := range fields {
-		result = append(result, NewStringValue(field))
+	for i := 0; i < len(str); {
+		if isDelim(str[i]) {
+			hard := 0
+			for i < len(str) && isDelim(str[i]) {
+				if !classadIsSpace(str[i]) {
+					hard++
+				}
+				i++
+			}
+			for k := 0; k < hard-1; k++ {
+				result = append(result, NewStringValue(""))
+			}
+		} else {
+			start := i
+			for i < len(str) && !isDelim(str[i]) {
+				i++
+			}
+			result = append(result, NewStringValue(str[start:i]))
+		}
 	}
-	return NewListValue(result)
+	return result
 }
 
 // builtinSplitUserName splits "user@domain" into {"user", "domain"}
@@ -1259,9 +1543,8 @@ func builtinSplitUserName(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
+	// undefined is not propagated: a non-string argument (including undefined)
+	// is an error, matching the reference engine.
 	if !args[0].IsString() {
 		return NewErrorValue()
 	}
@@ -1292,9 +1575,8 @@ func builtinSplitSlotName(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
+	// undefined is not propagated: a non-string argument (including undefined)
+	// is an error, matching the reference engine.
 	if !args[0].IsString() {
 		return NewErrorValue()
 	}
@@ -1321,36 +1603,19 @@ func builtinStrcmp(args []Value) Value {
 		return NewErrorValue()
 	}
 
+	// An undefined argument dominates over an error one (matching the
+	// reference): check undefined first, then error.
+	if args[0].IsUndefined() || args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
 	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewErrorValue()
-	}
 
-	// Convert to strings
-	var str1, str2 string
-	if args[0].IsString() {
-		str1, _ = args[0].StringValue()
-	} else if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		str1 = fmt.Sprintf("%d", val)
-	} else if args[0].IsReal() {
-		val, _ := args[0].RealValue()
-		str1 = fmt.Sprintf("%g", val)
-	} else {
-		return NewErrorValue()
-	}
-
-	if args[1].IsString() {
-		str2, _ = args[1].StringValue()
-	} else if args[1].IsInteger() {
-		val, _ := args[1].IntValue()
-		str2 = fmt.Sprintf("%d", val)
-	} else if args[1].IsReal() {
-		val, _ := args[1].RealValue()
-		str2 = fmt.Sprintf("%g", val)
-	} else {
+	// Coerce both arguments to their string form (matching string()/strcat()).
+	str1, ok1 := classadString(args[0])
+	str2, ok2 := classadString(args[1])
+	if !ok1 || !ok2 {
 		return NewErrorValue()
 	}
 
@@ -1364,36 +1629,19 @@ func builtinStricmp(args []Value) Value {
 		return NewErrorValue()
 	}
 
+	// An undefined argument dominates over an error one (matching the
+	// reference): check undefined first, then error.
+	if args[0].IsUndefined() || args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
 	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() || args[1].IsUndefined() {
-		return NewErrorValue()
-	}
 
-	// Convert to strings
-	var str1, str2 string
-	if args[0].IsString() {
-		str1, _ = args[0].StringValue()
-	} else if args[0].IsInteger() {
-		val, _ := args[0].IntValue()
-		str1 = fmt.Sprintf("%d", val)
-	} else if args[0].IsReal() {
-		val, _ := args[0].RealValue()
-		str1 = fmt.Sprintf("%g", val)
-	} else {
-		return NewErrorValue()
-	}
-
-	if args[1].IsString() {
-		str2, _ = args[1].StringValue()
-	} else if args[1].IsInteger() {
-		val, _ := args[1].IntValue()
-		str2 = fmt.Sprintf("%d", val)
-	} else if args[1].IsReal() {
-		val, _ := args[1].RealValue()
-		str2 = fmt.Sprintf("%g", val)
-	} else {
+	// Coerce both arguments to their string form (matching string()/strcat()).
+	str1, ok1 := classadString(args[0])
+	str2, ok2 := classadString(args[1])
+	if !ok1 || !ok2 {
 		return NewErrorValue()
 	}
 
@@ -1403,71 +1651,85 @@ func builtinStricmp(args []Value) Value {
 
 // versionCompare implements HTCondor version comparison logic
 // Lexicographic except numeric sequences are compared numerically
+// versionCompare is a faithful port of HTCondor's natural_cmp (a strverscmp(3)
+// style compare that takes numeric portions into account). Keeping it
+// byte-for-byte equivalent to the reference -- including its leading-zero and
+// trailing-zero handling -- is what lets versioncmp() match libclassad on
+// every input. Indices at or past the end of a string read as a 0 byte (NUL),
+// mirroring the C++ null-terminated pointer arithmetic.
 func versionCompare(left, right string) int {
-	i, j := 0, 0
-
-	for i < len(left) && j < len(right) {
-		// Check if both are at the start of a numeric sequence
-		if left[i] >= '0' && left[i] <= '9' && right[j] >= '0' && right[j] <= '9' {
-			// Count leading zeros
-			zeros1, zeros2 := 0, 0
-			for i < len(left) && left[i] == '0' {
-				zeros1++
-				i++
-			}
-			for j < len(right) && right[j] == '0' {
-				zeros2++
-				j++
-			}
-
-			// Extract remaining digits
-			numEnd1, numEnd2 := i, j
-			for numEnd1 < len(left) && left[numEnd1] >= '0' && left[numEnd1] <= '9' {
-				numEnd1++
-			}
-			for numEnd2 < len(right) && right[numEnd2] >= '0' && right[numEnd2] <= '9' {
-				numEnd2++
-			}
-
-			// Compare numeric values
-			if i < numEnd1 || j < numEnd2 {
-				// At least one has non-zero digits
-				num1Len := numEnd1 - i
-				num2Len := numEnd2 - j
-
-				if num1Len != num2Len {
-					return num1Len - num2Len
-				}
-
-				// Same length, compare digit by digit
-				for k := 0; k < num1Len; k++ {
-					if left[i+k] != right[j+k] {
-						return int(left[i+k]) - int(right[j+k])
-					}
-				}
-
-				i = numEnd1
-				j = numEnd2
-			} else {
-				// Both are all zeros - more zeros means smaller
-				if zeros1 != zeros2 {
-					return zeros2 - zeros1
-				}
-				i = numEnd1
-				j = numEnd2
-			}
-		} else {
-			// Lexicographic comparison
-			if left[i] != right[j] {
-				return int(left[i]) - int(right[j])
-			}
-			i++
-			j++
+	at := func(s string, i int) byte {
+		if i < 0 || i >= len(s) {
+			return 0
 		}
+		return s[i]
+	}
+	isdigit := func(b byte) bool { return b >= '0' && b <= '9' }
+
+	// find first mismatch (i and j advance together, so they stay equal)
+	i, j := 0, 0
+	for at(left, i) != 0 && at(left, i) == at(right, j) {
+		i++
+		j++
+	}
+	if at(left, i) == at(right, j) {
+		return 0
 	}
 
-	// One string is a prefix of the other
-	return len(left) - len(right)
+	// find digits leading up to the mismatch
+	n1beg := i
+	for n1beg > 0 && isdigit(at(left, n1beg-1)) {
+		n1beg--
+	}
+	n2beg := j - (i - n1beg)
+
+	// just compare the mismatch unless it touches a digit in both strings
+	if n1beg == i && (!isdigit(at(left, i)) || !isdigit(at(right, j))) {
+		return int(at(left, i)) - int(at(right, j))
+	}
+
+	// find leading zeros
+	z1end := n1beg
+	for at(left, z1end) == '0' {
+		z1end++
+	}
+	z2end := n2beg
+	for at(right, z2end) == '0' {
+		z2end++
+	}
+
+	// don't count a final trailing zero as a leading zero
+	if z1end > n1beg && !isdigit(at(left, z1end)) {
+		z1end--
+	}
+	if z2end > n2beg && !isdigit(at(right, z2end)) {
+		z2end--
+	}
+
+	// fewer leading zeros comes first
+	if z1end-n1beg != z2end-n2beg {
+		return (z2end - n2beg) - (z1end - n1beg)
+	}
+
+	// for an equal positive number of leading zeros, compare the mismatch
+	if z1end > n1beg {
+		return int(at(left, i)) - int(at(right, j))
+	}
+
+	// no leading zeros: the rest is an arbitrary-length numeric compare
+	n1end := z1end
+	for isdigit(at(left, n1end)) {
+		n1end++
+	}
+	n2end := z2end
+	for isdigit(at(right, n2end)) {
+		n2end++
+	}
+
+	if n1end-n1beg != n2end-n2beg {
+		return (n1end - n1beg) - (n2end - n2beg)
+	}
+	return int(at(left, i)) - int(at(right, j))
 }
 
 // builtinVersioncmp compares version strings
@@ -1476,98 +1738,53 @@ func builtinVersioncmp(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
-		return NewErrorValue()
-	}
+	// undefined dominates error here: versioncmp(undefined, error) and
+	// versioncmp(error, undefined) are both undefined, so check undefined first.
 	if args[0].IsUndefined() || args[1].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	if !args[0].IsString() || !args[1].IsString() {
+	if args[0].IsError() || args[1].IsError() {
 		return NewErrorValue()
 	}
-
-	left, _ := args[0].StringValue()
-	right, _ := args[1].StringValue()
+	// Non-string arguments are coerced to their string form (numbers/bools), as
+	// the reference does via convertValueToStringValue: versioncmp(2, 1) is 1
+	// and versioncmp("a", 1) is 48. A list/ad is not coercible -> error.
+	left, ok0 := classadString(args[0])
+	right, ok1 := classadString(args[1])
+	if !ok0 || !ok1 {
+		return NewErrorValue()
+	}
 
 	result := versionCompare(left, right)
 	return NewIntValue(int64(result))
 }
 
-// builtinVersionGT checks if left > right
-func builtinVersionGT(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val > 0)
-}
-
-// builtinVersionGE checks if left >= right
-func builtinVersionGE(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val >= 0)
-}
-
-// builtinVersionLT checks if left < right
-func builtinVersionLT(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val < 0)
-}
-
-// builtinVersionLE checks if left <= right
-func builtinVersionLE(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val <= 0)
-}
-
-// builtinVersionEQ checks if left == right
-func builtinVersionEQ(args []Value) Value {
-	result := builtinVersioncmp(args)
-	if result.IsError() || result.IsUndefined() {
-		return result
-	}
-	val, _ := result.IntValue()
-	return NewBoolValue(val == 0)
-}
-
-// builtinVersionInRange checks if min <= version <= max
+// builtinVersionInRange checks if min <= version <= max, matching the reference
+// engine: an error argument is an error; an undefined min or max is undefined
+// (but an undefined version, arg0, is an error); each argument is coerced to a
+// string the way convertValueToStringValue does (numbers/bools become their
+// string form), and a value that cannot be coerced (undefined version, list, or
+// ad) is an error. The comparison is the natural/version comparison.
 func builtinVersionInRange(args []Value) Value {
 	if len(args) != 3 {
 		return NewErrorValue()
 	}
-
-	// Check version >= min
-	minCheck := builtinVersionGE([]Value{args[0], args[1]})
-	if minCheck.IsError() || minCheck.IsUndefined() {
-		return minCheck
+	// Matching the reference engine's order: an undefined min or max yields
+	// undefined BEFORE any other argument is examined (so version_in_range(
+	// error, undefined, x) is undefined, not error). Then each argument is
+	// coerced to a string; a non-coercible one -- an undefined version, an
+	// error, or a value that does not stringify -- is an error.
+	if args[1].IsUndefined() || args[2].IsUndefined() {
+		return NewUndefinedValue()
 	}
-	minOk, _ := minCheck.BoolValue()
-
-	if !minOk {
-		return NewBoolValue(false)
+	version, ok0 := classadString(args[0])
+	minStr, ok1 := classadString(args[1])
+	maxStr, ok2 := classadString(args[2])
+	if !ok0 || !ok1 || !ok2 {
+		return NewErrorValue()
 	}
-
-	// Check version <= max
-	maxCheck := builtinVersionLE([]Value{args[0], args[2]})
-	if maxCheck.IsError() || maxCheck.IsUndefined() {
-		return maxCheck
-	}
-	maxOk, _ := maxCheck.BoolValue()
-
-	return NewBoolValue(maxOk)
+	inRange := versionCompare(minStr, version) <= 0 && versionCompare(version, maxStr) <= 0
+	return NewBoolValue(inRange)
 }
 
 // builtinFormatTime formats a Unix timestamp
@@ -1638,7 +1855,7 @@ func convertStrftimeToGo(t time.Time, format string) string {
 			case 'I':
 				result.WriteString(t.Format("03"))
 			case 'j':
-				result.WriteString(fmt.Sprintf("%03d", t.YearDay()))
+				fmt.Fprintf(&result, "%03d", t.YearDay())
 			case 'm':
 				result.WriteString(t.Format("01"))
 			case 'M':
@@ -1650,9 +1867,9 @@ func convertStrftimeToGo(t time.Time, format string) string {
 			case 'U', 'W':
 				// Week number - simplified
 				_, week := t.ISOWeek()
-				result.WriteString(fmt.Sprintf("%02d", week))
+				fmt.Fprintf(&result, "%02d", week)
 			case 'w':
-				result.WriteString(fmt.Sprintf("%d", t.Weekday()))
+				fmt.Fprintf(&result, "%d", t.Weekday())
 			case 'x':
 				result.WriteString(t.Format("01/02/06"))
 			case 'X':
@@ -1686,14 +1903,43 @@ func builtinInterval(args []Value) Value {
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
-	}
-	if !args[0].IsInteger() {
+	// The argument is coerced to an integer number of seconds (bool, real, and
+	// numeric string included, as the reference does); undefined and any
+	// non-coercible value are errors (interval does not propagate undefined).
+	var seconds int64
+	switch {
+	case args[0].IsInteger():
+		seconds, _ = args[0].IntValue()
+	case args[0].IsBool():
+		if b, _ := args[0].BoolValue(); b {
+			seconds = 1
+		}
+	case args[0].IsReal():
+		r, _ := args[0].RealValue()
+		seconds = floatToInt64(r)
+	case args[0].IsString():
+		s, _ := args[0].StringValue()
+		f, ok := parseLeadingFloat(s)
+		if !ok {
+			return NewErrorValue()
+		}
+		seconds = floatToInt64(f)
+	default:
 		return NewErrorValue()
 	}
+	// The reference takes the seconds as a 32-bit int, so a large or infinite
+	// value wraps (interval(10000000000) and interval("inf") match libclassad's
+	// truncated results rather than overflowing differently).
+	seconds = int64(int32(seconds))
 
-	seconds, _ := args[0].IntValue()
+	// The reference formats the magnitude into d+HH:MM:SS and prepends a "-"
+	// for negative intervals (so interval(-1) is "-1", not a malformed
+	// breakdown of a negative remainder).
+	sign := ""
+	if seconds < 0 {
+		sign = "-"
+		seconds = -seconds
+	}
 
 	days := seconds / 86400
 	seconds %= 86400
@@ -1703,15 +1949,16 @@ func builtinInterval(args []Value) Value {
 	seconds %= 60
 
 	if days > 0 {
-		return NewStringValue(fmt.Sprintf("%d+%02d:%02d:%02d", days, hours, minutes, seconds))
+		return NewStringValue(fmt.Sprintf("%s%d+%02d:%02d:%02d", sign, days, hours, minutes, seconds))
 	}
 	if hours > 0 {
-		return NewStringValue(fmt.Sprintf("%d:%02d:%02d", hours, minutes, seconds))
+		return NewStringValue(fmt.Sprintf("%s%d:%02d:%02d", sign, hours, minutes, seconds))
 	}
 	if minutes > 0 {
-		return NewStringValue(fmt.Sprintf("%d:%02d", minutes, seconds))
+		return NewStringValue(fmt.Sprintf("%s%d:%02d", sign, minutes, seconds))
 	}
-	return NewStringValue(fmt.Sprintf("0:%02d", seconds))
+	// Under a minute (including zero) is just the seconds.
+	return NewStringValue(fmt.Sprintf("%s%d", sign, seconds))
 }
 
 // builtinIdenticalMember checks if m is in list using =?= (strict identity)
@@ -1720,225 +1967,49 @@ func builtinIdenticalMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
+	// The list (second argument): error -> error, undefined -> undefined,
+	// non-list -> error. The item (first argument) may be any scalar value,
+	// including error or undefined, and is compared to each element with =?=
+	// (identical) semantics -- so identicalMember(error, {error}) is true and
+	// identicalMember(error, {1}) is false. A list/classad item is an error.
+	if args[1].IsError() {
 		return NewErrorValue()
 	}
-
-	// First arg must be scalar
+	if args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if !args[1].IsList() {
+		return NewErrorValue()
+	}
 	if args[0].IsList() || args[0].IsClassAd() {
 		return NewErrorValue()
 	}
 
-	// Second arg must be list
-	if !args[1].IsList() {
-		return NewErrorValue()
-	}
-
 	list, _ := args[1].ListValue()
-
+	e := &Evaluator{}
 	for _, item := range list {
-		// Strict identity check - same type and value
-		if args[0].valueType != item.valueType {
-			continue
-		}
-
-		switch args[0].valueType {
-		case IntegerValue:
-			v1, _ := args[0].IntValue()
-			v2, _ := item.IntValue()
-			if v1 == v2 {
-				return NewBoolValue(true)
-			}
-		case RealValue:
-			v1, _ := args[0].RealValue()
-			v2, _ := item.RealValue()
-			if v1 == v2 {
-				return NewBoolValue(true)
-			}
-		case StringValue:
-			v1, _ := args[0].StringValue()
-			v2, _ := item.StringValue()
-			if v1 == v2 {
-				return NewBoolValue(true)
-			}
-		case BooleanValue:
-			v1, _ := args[0].BoolValue()
-			v2, _ := item.BoolValue()
-			if v1 == v2 {
-				return NewBoolValue(true)
-			}
-		case UndefinedValue:
+		if b, _ := e.evaluateIs(args[0], item).BoolValue(); b {
 			return NewBoolValue(true)
 		}
 	}
-
 	return NewBoolValue(false)
 }
 
-// builtinAnyCompare checks if any element in list satisfies comparison with t
-// anyCompare(op, list, target) where op is "<", "<=", "==", "!=", ">=", ">"
-func builtinAnyCompare(args []Value) Value {
+// compareList implements anyCompare/allCompare: it applies the comparison
+// operator op (arg0) between each element of the list (arg1) and the target
+// (arg2). An error in op/list/target, a non-string op, a non-list second
+// argument, or an unrecognized operator is an error; an undefined op or list is
+// undefined; but the target may be undefined (a comparison against it just
+// yields undefined). Each element comparison uses the engine's three-valued
+// semantics: a comparison that errors makes the whole call error; for
+// anyCompare a true element wins (else false), for allCompare a non-true
+// element (false or undefined) loses (else true, vacuously true for []).
+func compareList(args []Value, all bool) Value {
 	if len(args) != 3 {
 		return NewErrorValue()
 	}
-
-	if args[0].IsError() || args[1].IsError() || args[2].IsError() {
-		return NewErrorValue()
-	}
-	if args[0].IsUndefined() || args[1].IsUndefined() || args[2].IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !args[0].IsString() || !args[1].IsList() {
-		return NewErrorValue()
-	}
-
-	op, _ := args[0].StringValue()
-	list, _ := args[1].ListValue()
-	target := args[2]
-
-	for _, item := range list {
-		if item.IsUndefined() {
-			continue
-		}
-
-		result := compareValues(op, item, target)
-		if result.IsBool() {
-			match, _ := result.BoolValue()
-			if match {
-				return NewBoolValue(true)
-			}
-		}
-	}
-
-	return NewBoolValue(false)
-}
-
-// builtinAllCompare checks if all elements in list satisfy comparison with t
-func builtinAllCompare(args []Value) Value {
-	if len(args) != 3 {
-		return NewErrorValue()
-	}
-
-	if args[0].IsError() || args[1].IsError() || args[2].IsError() {
-		return NewErrorValue()
-	}
-	if args[0].IsUndefined() || args[1].IsUndefined() || args[2].IsUndefined() {
-		return NewUndefinedValue()
-	}
-
-	if !args[0].IsString() || !args[1].IsList() {
-		return NewErrorValue()
-	}
-
-	op, _ := args[0].StringValue()
-	list, _ := args[1].ListValue()
-	target := args[2]
-
-	if len(list) == 0 {
-		return NewBoolValue(true) // vacuously true
-	}
-
-	for _, item := range list {
-		if item.IsUndefined() {
-			continue
-		}
-
-		result := compareValues(op, item, target)
-		if result.IsBool() {
-			match, _ := result.BoolValue()
-			if !match {
-				return NewBoolValue(false)
-			}
-		} else {
-			return NewBoolValue(false)
-		}
-	}
-
-	return NewBoolValue(true)
-}
-
-// compareValues performs comparison based on operator string
-func compareValues(op string, left, right Value) Value {
-	// Handle numeric comparison
-	if left.IsNumber() && right.IsNumber() {
-		leftNum, _ := left.NumberValue()
-		rightNum, _ := right.NumberValue()
-
-		switch op {
-		case "<":
-			return NewBoolValue(leftNum < rightNum)
-		case "<=":
-			return NewBoolValue(leftNum <= rightNum)
-		case "==":
-			return NewBoolValue(leftNum == rightNum)
-		case "!=":
-			return NewBoolValue(leftNum != rightNum)
-		case ">=":
-			return NewBoolValue(leftNum >= rightNum)
-		case ">":
-			return NewBoolValue(leftNum > rightNum)
-		}
-	}
-
-	// Handle string comparison
-	if left.IsString() && right.IsString() {
-		leftStr, _ := left.StringValue()
-		rightStr, _ := right.StringValue()
-		cmp := strings.Compare(leftStr, rightStr)
-
-		switch op {
-		case "<":
-			return NewBoolValue(cmp < 0)
-		case "<=":
-			return NewBoolValue(cmp <= 0)
-		case "==":
-			return NewBoolValue(cmp == 0)
-		case "!=":
-			return NewBoolValue(cmp != 0)
-		case ">=":
-			return NewBoolValue(cmp >= 0)
-		case ">":
-			return NewBoolValue(cmp > 0)
-		}
-	}
-
-	// Handle boolean comparison
-	if left.IsBool() && right.IsBool() {
-		leftBool, _ := left.BoolValue()
-		rightBool, _ := right.BoolValue()
-
-		switch op {
-		case "==":
-			return NewBoolValue(leftBool == rightBool)
-		case "!=":
-			return NewBoolValue(leftBool != rightBool)
-		}
-	}
-
-	return NewErrorValue()
-}
-
-// parseStringList splits a string list by delimiter (default comma)
-func parseStringList(listStr, delimiter string) []string {
-	if delimiter == "" {
-		delimiter = ","
-	}
-
-	parts := strings.Split(listStr, delimiter)
-	var result []string
-	for _, part := range parts {
-		result = append(result, strings.TrimSpace(part))
-	}
-	return result
-}
-
-// builtinStringListSize returns the number of elements in a string list
-func builtinStringListSize(args []Value) Value {
-	if len(args) < 1 || len(args) > 2 {
-		return NewErrorValue()
-	}
-
+	// Arguments are checked in order -- operator, then list, then target -- so an
+	// undefined operator yields undefined even when the list is an error, etc.
 	if args[0].IsError() {
 		return NewErrorValue()
 	}
@@ -1948,27 +2019,174 @@ func builtinStringListSize(args []Value) Value {
 	if !args[0].IsString() {
 		return NewErrorValue()
 	}
+	op, _ := args[0].StringValue()
+	if !validCompareOp(op) {
+		return NewErrorValue()
+	}
+	if args[1].IsError() {
+		return NewErrorValue()
+	}
+	if args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if !args[1].IsList() {
+		return NewErrorValue()
+	}
+	if args[2].IsError() {
+		return NewErrorValue()
+	}
+	list, _ := args[1].ListValue()
+	target := args[2]
 
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
+	for _, item := range list {
+		r := compareValues(op, item, target)
+		if r.IsError() {
 			return NewErrorValue()
 		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
+		isTrue := false
+		if r.IsBool() {
+			isTrue, _ = r.BoolValue()
 		}
-		if !args[1].IsString() {
-			return NewErrorValue()
+		if all {
+			if !isTrue {
+				return NewBoolValue(false)
+			}
+		} else if isTrue {
+			return NewBoolValue(true)
 		}
-		delimiter, _ = args[1].StringValue()
+	}
+	return NewBoolValue(all)
+}
+
+// builtinAnyCompare checks if any element in list satisfies the comparison.
+// anyCompare(op, list, target), op one of < <= == != >= > is isnt =?= =!=
+func builtinAnyCompare(args []Value) Value {
+	return compareList(args, false)
+}
+
+// builtinAllCompare checks if all elements in list satisfy the comparison.
+func builtinAllCompare(args []Value) Value {
+	return compareList(args, true)
+}
+
+// compareValues performs comparison based on operator string
+// validCompareOp reports whether op is a comparison operator accepted by
+// anyCompare/allCompare. An unrecognized operator makes those functions error.
+func validCompareOp(op string) bool {
+	switch op {
+	case "<", "<=", ">", ">=", "==", "!=", "is", "isnt", "=?=", "=!=":
+		return true
+	}
+	return false
+}
+
+// compareValues applies a comparison operator to two values using the engine's
+// real (three-valued) comparison semantics, so anyCompare/allCompare see the
+// same undefined/error/case-insensitive behavior as the corresponding operator
+// (e.g. 1 == undefined is undefined, not error). An unrecognized operator is an
+// error.
+func compareValues(op string, left, right Value) Value {
+	e := &Evaluator{}
+	switch op {
+	case "<":
+		return e.evaluateLessThan(left, right)
+	case "<=":
+		return e.evaluateLessOrEqual(left, right)
+	case ">":
+		return e.evaluateGreaterThan(left, right)
+	case ">=":
+		return e.evaluateGreaterOrEqual(left, right)
+	case "==":
+		return e.evaluateEqual(left, right)
+	case "!=":
+		return e.evaluateNotEqual(left, right)
+	case "is", "=?=":
+		return e.evaluateIs(left, right)
+	case "isnt", "=!=":
+		return e.evaluateIsnt(left, right)
+	default:
+		return NewErrorValue()
+	}
+}
+
+// parseStringList tokenizes a string list the way the reference engine's
+// StringList does: the delimiter argument is a SET of delimiter characters
+// (the default is comma plus space), tokens are maximal runs of non-delimiter
+// characters, empty tokens are dropped (so "a,,b" and "  a  " collapse), and
+// each token has its surrounding whitespace trimmed.
+func parseStringList(listStr, delimiter string) []string {
+	if delimiter == "" {
+		delimiter = ", "
 	}
 
-	parts := parseStringList(listStr, delimiter)
-	// Don't count empty strings
-	count := 0
+	parts := strings.FieldsFunc(listStr, func(r rune) bool {
+		return strings.ContainsRune(delimiter, r)
+	})
+	result := make([]string, 0, len(parts))
 	for _, part := range parts {
+		result = append(result, strings.TrimSpace(part))
+	}
+	return result
+}
+
+// builtinStringListSize returns the number of elements in a string list
+// stringListArgs validates the (list [, delimiter]) arguments shared by the
+// stringList* functions and returns the list string and delimiter. The
+// reference engine requires string arguments and errors on anything else --
+// including undefined (these HTCondor functions do not propagate undefined) --
+// so a non-string argument yields a non-nil error Value to return.
+func stringListArgs(args []Value) (listStr, delim string, bad *Value) {
+	e := NewErrorValue()
+	if !args[0].IsString() {
+		return "", "", &e
+	}
+	listStr, _ = args[0].StringValue()
+	delim = ", "
+	if len(args) == 2 {
+		if !args[1].IsString() {
+			return "", "", &e
+		}
+		delim, _ = args[1].StringValue()
+	}
+	return listStr, delim, nil
+}
+
+// parseNumericStringList parses the non-empty items of a delimited list as
+// numbers for the stringListSum/Avg/Min/Max family. A plain decimal integer
+// item stays an integer; anything else (a real, or a hex/inf form strtod
+// accepts) is parsed via strtod and marks the whole result real (hasReal). A
+// non-numeric item makes ok=false, which the reference treats as error.
+func parseNumericStringList(listStr, delim string) (vals []float64, hasReal, ok bool) {
+	for _, part := range parseStringList(listStr, delim) {
+		p := strings.TrimSpace(part)
+		if p == "" {
+			continue
+		}
+		if iv, err := strconv.ParseInt(p, 10, 64); err == nil {
+			vals = append(vals, float64(iv))
+			continue
+		}
+		f, fok := parseLeadingFloat(p)
+		if !fok {
+			return nil, false, false
+		}
+		hasReal = true
+		vals = append(vals, f)
+	}
+	return vals, hasReal, true
+}
+
+func builtinStringListSize(args []Value) Value {
+	if len(args) < 1 || len(args) > 2 {
+		return NewErrorValue()
+	}
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	// Don't count empty strings.
+	count := 0
+	for _, part := range parseStringList(listStr, delim) {
 		if part != "" {
 			count++
 		}
@@ -1982,59 +2200,21 @@ func builtinStringListSum(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() {
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	vals, hasReal, ok := parseNumericStringList(listStr, delim)
+	if !ok {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if len(vals) == 0 {
+		return NewRealValue(0) // empty sum is real 0.0 in the reference
 	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
 	var sum float64
-	hasReal := false
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		var val float64
-		if strings.Contains(part, ".") {
-			_, err := fmt.Sscanf(part, "%f", &val)
-			if err != nil {
-				continue
-			}
-			hasReal = true
-		} else {
-			var intVal int64
-			_, err := fmt.Sscanf(part, "%d", &intVal)
-			if err != nil {
-				continue
-			}
-			val = float64(intVal)
-		}
-		sum += val
+	for _, v := range vals {
+		sum += v
 	}
-
 	if hasReal {
 		return NewRealValue(sum)
 	}
@@ -2047,55 +2227,27 @@ func builtinStringListAvg(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() {
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	vals, hasReal, ok := parseNumericStringList(listStr, delim)
+	if !ok {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if len(vals) == 0 {
+		return NewRealValue(0) // empty average is real 0.0 in the reference
 	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
 	var sum float64
-	count := 0
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		var val float64
-		_, err := fmt.Sscanf(part, "%f", &val)
-		if err != nil {
-			continue
-		}
-		sum += val
-		count++
+	for _, v := range vals {
+		sum += v
 	}
-
-	if count == 0 {
-		return NewRealValue(0.0)
+	// All-integer items use integer division (avg("1,2") is 1, not 1.5),
+	// matching the reference; a real item makes the average real.
+	if hasReal {
+		return NewRealValue(sum / float64(len(vals)))
 	}
-
-	return NewRealValue(sum / float64(count))
+	return NewIntValue(int64(sum) / int64(len(vals)))
 }
 
 // builtinStringListMin finds minimum numeric value in a string list
@@ -2104,68 +2256,23 @@ func builtinStringListMin(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() {
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	vals, hasReal, ok := parseNumericStringList(listStr, delim)
+	if !ok {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if len(vals) == 0 {
+		return NewUndefinedValue() // empty list has no minimum
 	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
-	var minVal float64
-	hasValue := false
-	hasReal := false
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		var val float64
-		if strings.Contains(part, ".") {
-			_, err := fmt.Sscanf(part, "%f", &val)
-			if err != nil {
-				continue
-			}
-			hasReal = true
-		} else {
-			var intVal int64
-			_, err := fmt.Sscanf(part, "%d", &intVal)
-			if err != nil {
-				continue
-			}
-			val = float64(intVal)
-		}
-
-		if !hasValue || val < minVal {
-			minVal = val
-			hasValue = true
+	minVal := vals[0]
+	for _, v := range vals[1:] {
+		if v < minVal {
+			minVal = v
 		}
 	}
-
-	if !hasValue {
-		return NewUndefinedValue()
-	}
-
 	if hasReal {
 		return NewRealValue(minVal)
 	}
@@ -2178,68 +2285,23 @@ func builtinStringListMax(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() {
+	listStr, delim, bad := stringListArgs(args)
+	if bad != nil {
+		return *bad
+	}
+	vals, hasReal, ok := parseNumericStringList(listStr, delim)
+	if !ok {
 		return NewErrorValue()
 	}
-	if args[0].IsUndefined() {
-		return NewUndefinedValue()
+	if len(vals) == 0 {
+		return NewUndefinedValue() // empty list has no maximum
 	}
-	if !args[0].IsString() {
-		return NewErrorValue()
-	}
-
-	listStr, _ := args[0].StringValue()
-	delimiter := ","
-
-	if len(args) == 2 {
-		if args[1].IsError() {
-			return NewErrorValue()
-		}
-		if args[1].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[1].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[1].StringValue()
-	}
-
-	parts := parseStringList(listStr, delimiter)
-	var maxVal float64
-	hasValue := false
-	hasReal := false
-
-	for _, part := range parts {
-		if part == "" {
-			continue
-		}
-
-		var val float64
-		if strings.Contains(part, ".") {
-			_, err := fmt.Sscanf(part, "%f", &val)
-			if err != nil {
-				continue
-			}
-			hasReal = true
-		} else {
-			var intVal int64
-			_, err := fmt.Sscanf(part, "%d", &intVal)
-			if err != nil {
-				continue
-			}
-			val = float64(intVal)
-		}
-
-		if !hasValue || val > maxVal {
-			maxVal = val
-			hasValue = true
+	maxVal := vals[0]
+	for _, v := range vals[1:] {
+		if v > maxVal {
+			maxVal = v
 		}
 	}
-
-	if !hasValue {
-		return NewUndefinedValue()
-	}
-
 	if hasReal {
 		return NewRealValue(maxVal)
 	}
@@ -2264,7 +2326,7 @@ func builtinStringListsIntersect(args []Value) Value {
 
 	list1Str, _ := args[0].StringValue()
 	list2Str, _ := args[1].StringValue()
-	delimiter := ","
+	delimiter := ", "
 
 	if len(args) == 3 {
 		if args[2].IsError() {
@@ -2306,35 +2368,38 @@ func builtinStringListSubsetMatch(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	if args[0].IsError() || args[1].IsError() {
-		return NewErrorValue()
-	}
-	if args[0].IsUndefined() || args[1].IsUndefined() {
+	// When both lists are undefined the result is undefined; otherwise undefined
+	// is treated as the empty list (so subsetMatch(undefined, "a") is true --
+	// the empty list is a subset of anything), and error is an error.
+	if args[0].IsUndefined() && args[1].IsUndefined() {
 		return NewUndefinedValue()
 	}
-	if !args[0].IsString() || !args[1].IsString() {
+	list1Str, ok0 := stringListStrArg(args[0])
+	list2Str, ok1 := stringListStrArg(args[1])
+	if !ok0 || !ok1 {
 		return NewErrorValue()
 	}
-
-	list1Str, _ := args[0].StringValue()
-	list2Str, _ := args[1].StringValue()
-	delimiter := ","
+	delimiter := ", "
 
 	if len(args) == 3 {
-		if args[2].IsError() {
+		d, ok2 := stringListStrArg(args[2])
+		if !ok2 {
 			return NewErrorValue()
 		}
-		if args[2].IsUndefined() {
-			return NewUndefinedValue()
-		}
-		if !args[2].IsString() {
-			return NewErrorValue()
-		}
-		delimiter, _ = args[2].StringValue()
+		delimiter = d
 	}
 
 	list1 := parseStringList(list1Str, delimiter)
 	list2 := parseStringList(list2Str, delimiter)
+
+	// Mirror a libclassad quirk: a NON-EMPTY string that tokenizes to no
+	// elements (all delimiters, e.g. " ") is treated as a single non-matchable
+	// element, so it is not the empty subset and the result is false. A
+	// genuinely empty string (or undefined, coerced to "") is the empty subset
+	// and yields true. See fuzz/CPP_QUIRKS.md.
+	if len(list1) == 0 {
+		return NewBoolValue(list1Str == "")
+	}
 
 	// Create a set from list2
 	set := make(map[string]bool)
@@ -2372,7 +2437,7 @@ func builtinStringListRegexpMember(args []Value) Value {
 
 	pattern, _ := args[0].StringValue()
 	listStr, _ := args[1].StringValue()
-	delimiter := ","
+	delimiter := ", "
 	options := ""
 
 	// Parse optional arguments
