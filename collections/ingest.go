@@ -35,7 +35,7 @@ func (c *Collection) UpdateOld(batch []OldAdUpdate) error {
 		return nil
 	}
 	codec := c.currentCodec()
-	enc := wire.NewStreamEncoder(c.intern, c.currentHotSet())
+	enc := c.newStreamEncoder()
 	seen := make(map[string]struct{}, 128)
 	byShard := make(map[int][]pendingPut, len(c.shards))
 	for i := range batch {
@@ -66,7 +66,7 @@ func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[st
 		if e != nil {
 			return nil, e
 		}
-		return wire.EncodeWithHot(nil, ad.AST(), c.intern, c.currentHotSet()), nil
+		return c.encodeAd(ad.AST()), nil
 	}
 	if err != nil {
 		return nil, err

@@ -16,7 +16,7 @@ import (
 // fellBack before each evaluation.
 type wireScope struct {
 	ad       wire.Ad
-	intern   *wire.InternTable
+	c        *Collection // for mode-aware attribute lookup (interned id vs inline name)
 	fellBack bool
 }
 
@@ -27,11 +27,7 @@ func (ws *wireScope) resolve(name string, scope ast.AttributeScope) classad.Valu
 	if scope == ast.TargetScope || scope == ast.ParentScope {
 		return classad.NewUndefinedValue()
 	}
-	id, ok := ws.intern.LookupID(name)
-	if !ok {
-		return classad.NewUndefinedValue() // no ad ever had this attribute
-	}
-	node, ok := ws.ad.Lookup(id)
+	node, ok := ws.c.wireLookup(ws.ad, name)
 	if !ok {
 		return classad.NewUndefinedValue() // this ad lacks it
 	}

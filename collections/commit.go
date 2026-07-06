@@ -158,4 +158,40 @@ func (sh *shard) sync() {
 	if sh.onSync != nil {
 		sh.onSync()
 	}
+	if sh.alloc == nil {
+		return // in-memory shard
+	}
+	// Persistent shard: msync the pages written since the last sync so the commit
+	// is durable before this returns. Capture the ranges and advance the durable
+	// mark under the lock (dirty is guarded by mu), then msync lock-free — only the
+	// current flusher runs sync() per shard, so no concurrent sync races here.
+	sh.mu.Lock()
+	dirty := sh.dirty
+	sh.dirty = nil
+	sup := sh.dirtySup
+	sh.dirtySup = nil
+	type flushRange struct {
+		seg      *segment
+		from, to int
+	}
+	var ranges []flushRange
+	for _, seg := range dirty {
+		if seg.used > seg.synced {
+			ranges = append(ranges, flushRange{seg, seg.synced, seg.used})
+			seg.synced = seg.used
+		}
+	}
+	sh.mu.Unlock()
+	for _, r := range ranges {
+		_ = r.seg.msyncRange(r.from, r.to)
+	}
+	// Flush delete tombstones: the supersededBySeq field a delete wrote may sit in an
+	// already-synced region (so it is not covered by the append ranges above); msync
+	// its page so the delete survives a crash. Overwrites need no such flush — their
+	// new record is in an append range and recovery's max-seq rule supersedes the old
+	// version regardless.
+	for _, s := range sup {
+		off := int(s.off) + recSupOff
+		_ = s.seg.msyncRange(off, off+8)
+	}
 }

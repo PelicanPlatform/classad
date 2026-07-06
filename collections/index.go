@@ -24,10 +24,14 @@ import (
 // compaction — new/active/compacted segments are simply full-scanned until their
 // next reindex.
 
-// indexSpec is the collection's configured indexes, resolved once at New: interned
-// attribute ids partitioned into categorical (string) and value (numeric). Shared
-// read-only across shards and segments.
+// indexSpec is the collection's configured indexes: interned attribute ids
+// partitioned into categorical (string) and value (numeric). It is immutable once
+// built and published via Collection.spec (an atomic.Pointer); AddIndex/DropIndex
+// swap in a new spec with an incremented gen. A segIndex records the gen it was
+// built under, so Reindex can tell a stale index (built before an add/drop) from a
+// current one. Shared read-only across shards and segments.
 type indexSpec struct {
+	gen    uint64 // bumped on every add/drop, so segIndexes can detect staleness
 	catIDs []uint32
 	valIDs []uint32
 	cat    map[uint32]struct{}
@@ -36,7 +40,7 @@ type indexSpec struct {
 
 func (s *indexSpec) any() bool { return s != nil && (len(s.catIDs) > 0 || len(s.valIDs) > 0) }
 
-// newIndexSpec resolves configured attribute names to interned ids.
+// newIndexSpec resolves configured attribute names to interned ids (gen 0).
 func newIndexSpec(intern *wire.InternTable, catNames, valNames []string) *indexSpec {
 	s := &indexSpec{cat: map[uint32]struct{}{}, val: map[uint32]struct{}{}}
 	for _, name := range catNames {
@@ -56,6 +60,43 @@ func newIndexSpec(intern *wire.InternTable, catNames, valNames []string) *indexS
 	return s
 }
 
+// clone returns a deep copy carrying the same gen (callers bump it after mutating).
+func (s *indexSpec) clone() *indexSpec {
+	n := &indexSpec{
+		gen:    s.gen,
+		catIDs: append([]uint32(nil), s.catIDs...),
+		valIDs: append([]uint32(nil), s.valIDs...),
+		cat:    make(map[uint32]struct{}, len(s.cat)),
+		val:    make(map[uint32]struct{}, len(s.val)),
+	}
+	for id := range s.cat {
+		n.cat[id] = struct{}{}
+	}
+	for id := range s.val {
+		n.val[id] = struct{}{}
+	}
+	return n
+}
+
+// equalIDs reports whether two specs index exactly the same attribute ids in the
+// same buckets (order-insensitive), i.e. an add/drop would be a no-op.
+func (s *indexSpec) equalIDs(o *indexSpec) bool {
+	if len(s.cat) != len(o.cat) || len(s.val) != len(o.val) {
+		return false
+	}
+	for id := range s.cat {
+		if _, ok := o.cat[id]; !ok {
+			return false
+		}
+	}
+	for id := range s.val {
+		if _, ok := o.val[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // catPostings / valPostings map an attribute value to the bitmap of record offsets
 // (within one segment) that hold it, plus an exceptions bitmap for records whose
 // value is present but not the expected literal type.
@@ -69,28 +110,32 @@ type valPostings struct {
 }
 
 // segIndex is one segment's immutable index. It covers records at offsets in
-// [0, upto); the query full-scans anything at or beyond upto.
+// [0, upto); the query full-scans anything at or beyond upto. specGen is the
+// indexSpec generation it was built under, so Reindex can rebuild it when an
+// add/drop has since changed the configured attributes.
 type segIndex struct {
-	upto uint32
-	all  *roaring.Bitmap         // offsets of all covered records (for `!=` = all minus value)
-	cat  map[uint32]*catPostings // interned attr id -> postings
-	val  map[uint32]*valPostings
+	upto    uint32
+	specGen uint64
+	all     *roaring.Bitmap         // offsets of all covered records (for `!=` = all minus value)
+	cat     map[uint32]*catPostings // interned attr id -> postings
+	val     map[uint32]*valPostings
 }
 
-// buildSegIndex scans a segment's records in [0, upto) and returns its index.
-// Reads immutable segment bytes only (no lock needed); decompresses each record to
-// read the indexed attributes.
-func (c *Collection) buildSegIndex(data []byte, upto int, codec Codec) *segIndex {
+// buildSegIndex scans a segment's records in [0, upto) and returns its index for
+// the given spec. Reads immutable segment bytes only (no lock needed); decompresses
+// each record to read the indexed attributes.
+func (c *Collection) buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segIndex {
 	si := &segIndex{
-		upto: uint32(upto),
-		all:  roaring.New(),
-		cat:  make(map[uint32]*catPostings, len(c.spec.catIDs)),
-		val:  make(map[uint32]*valPostings, len(c.spec.valIDs)),
+		upto:    uint32(upto),
+		specGen: spec.gen,
+		all:     roaring.New(),
+		cat:     make(map[uint32]*catPostings, len(spec.catIDs)),
+		val:     make(map[uint32]*valPostings, len(spec.valIDs)),
 	}
-	for _, id := range c.spec.catIDs {
+	for _, id := range spec.catIDs {
 		si.cat[id] = &catPostings{post: map[string]*roaring.Bitmap{}, exc: roaring.New()}
 	}
-	for _, id := range c.spec.valIDs {
+	for _, id := range spec.valIDs {
 		si.val[id] = &valPostings{post: map[float64]*roaring.Bitmap{}, exc: roaring.New()}
 	}
 	var buf []byte
@@ -103,7 +148,7 @@ func (c *Collection) buildSegIndex(data []byte, upto int, codec Codec) *segIndex
 		si.all.Add(o)
 		if w, err := codec.Decompress(buf[:0], recAd(data, o)); err == nil {
 			buf = w
-			si.indexRecord(o, wire.Ad(w), c.spec)
+			si.indexRecord(o, wire.Ad(w), spec)
 		}
 		off += int(total)
 	}

@@ -32,6 +32,19 @@ type shard struct {
 	// surfaced to the caller by Put/Update.
 	alloc    func(id uint32, size int, codec Codec) (*segment, error)
 	writeErr error
+	dirty    []*segment // segments with unsynced writes since the last sync (persistent)
+	// dirtySup lists supersededBySeq fields tombstoned by a delete since the last
+	// sync; their pages must be msync'd for the delete to be durable (unlike an
+	// overwrite, a delete writes no new record, so recovery's max-seq rule cannot
+	// re-derive it — the tombstone itself must reach disk). Guarded by mu.
+	dirtySup []supRef
+}
+
+// supRef identifies a supersededBySeq field (a record's tombstone) that must be
+// flushed to disk for a persistent shard.
+type supRef struct {
+	seg *segment
+	off uint32
 }
 
 func newShard(segSize int, onSync func()) *shard {
@@ -115,6 +128,9 @@ func (sh *shard) del(h uint64, key []byte, seq uint64) bool {
 	seg := sh.segs[old.seg]
 	setRecSuperseded(seg.data, old.off, seq)
 	seg.dead += int64(recTotalLen(seg.data, old.off))
+	if sh.alloc != nil {
+		sh.dirtySup = append(sh.dirtySup, supRef{seg, old.off}) // flush the tombstone
+	}
 	sh.count--
 	return true
 }
@@ -138,6 +154,9 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) 
 		sh.act = seg
 	}
 	off, _ := sh.act.append(seq, next, key, ad)
+	if sh.alloc != nil && (len(sh.dirty) == 0 || sh.dirty[len(sh.dirty)-1] != sh.act) {
+		sh.dirty = append(sh.dirty, sh.act) // track for msync (persistent)
+	}
 	return loc{seg: sh.act.id, off: off}, true
 }
 
@@ -169,10 +188,12 @@ type segWindow struct {
 
 // snapshot captures the shard's scan state under the read lock: the commit
 // sequence S0 and a frozen window over each live segment. The windows hold the
-// segments' immutable backing arrays directly, so a segment retired by a later
+// segments' immutable backing arrays directly. A RAM segment retired by a later
 // compaction stays alive (via the garbage collector) for as long as this scan
-// references it — no manual reclamation is required. Retired segment slots are
-// nil and skipped.
+// references it; an mmap segment is pinned here (see segment.pin) so a compaction
+// that retires it defers the munmap+unlink until releaseWindows drops the pin.
+// Retired segment slots are nil and skipped. The caller MUST releaseWindows(wins)
+// when the scan is done.
 func (sh *shard) snapshot() (s0 uint64, wins []segWindow) {
 	sh.mu.RLock()
 	s0 = sh.commitSeq
@@ -181,10 +202,20 @@ func (sh *shard) snapshot() (s0 uint64, wins []segWindow) {
 		if seg == nil || seg.used == 0 {
 			continue
 		}
+		seg.pin() // no-op for RAM segments
 		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg})
 	}
 	sh.mu.RUnlock()
 	return s0, wins
+}
+
+// releaseWindows drops the pins snapshot took, allowing any mmap segment retired
+// during the scan to be reaped. Balances snapshot; call it exactly once per
+// snapshot (typically deferred). No-op for RAM segments.
+func releaseWindows(wins []segWindow) {
+	for i := range wins {
+		wins[i].seg.unpin()
+	}
 }
 
 // forEachVisible walks the frozen windows and calls fn with the ad bytes (and the

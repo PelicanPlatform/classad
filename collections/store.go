@@ -66,8 +66,22 @@ type Collection struct {
 	codec  atomic.Pointer[codecHolder]  // current codec for new writes; swapped by RetrainDict
 	intern *wire.InternTable            // shared attribute-name interning across the store
 	hotSet atomic.Pointer[hotSetHolder] // interned ids to front-load; swapped by RefreshHotSet
-	spec   *indexSpec                   // configured value/categorical indexes (nil if none)
+	spec   atomic.Pointer[indexSpec]    // configured indexes; swapped by AddIndex/DropIndex (never nil after New)
 	dir    string                       // persistence directory; "" ⇒ in-memory (see persist.go)
+
+	// inline is set for a persistent collection: records store attribute names
+	// inline (no interning), so segment files are self-contained and recoverable.
+	// hotNames (case-folded) drives the hot header in inline mode. See inline.go.
+	inline   bool
+	hotNames map[string]struct{}
+
+	// dicts tracks the ZSTD dictionaries trained over the collection's life so each
+	// persistent segment can be tagged (in its file name) with the dictionary it was
+	// compressed under, and recovery can reconstruct the right codec per segment.
+	// Non-nil after New; persists dictionary bytes only when the collection has a Dir.
+	dicts *dictReg
+
+	demand *demandTracker // per-attribute query demand, for SuggestIndexes
 }
 
 // writeError returns the first sticky segment-allocation error across shards
@@ -130,8 +144,10 @@ func New(opts Options) *Collection {
 		mask:   uint64(n - 1),
 		h:      h,
 		intern: wire.NewInternTable(),
+		demand: newDemandTracker(),
 	}
 	c.codec.Store(&codecHolder{codec})
+	c.dicts = newDictReg(codec) // base codec is dictionary id 0
 	if len(opts.HotAttrs) > 0 {
 		set := make(map[uint32]struct{}, len(opts.HotAttrs))
 		for _, name := range opts.HotAttrs {
@@ -139,9 +155,7 @@ func New(opts Options) *Collection {
 		}
 		c.hotSet.Store(&hotSetHolder{set})
 	}
-	if spec := newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs); spec.any() {
-		c.spec = spec
-	}
+	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
 	return c
 }
 
@@ -154,11 +168,9 @@ func (c *Collection) Update(batch []AdUpdate) error {
 		return nil
 	}
 	codec := c.currentCodec()
-	hot := c.currentHotSet()
 	byShard := make(map[int][]pendingPut, len(c.shards))
 	for i := range batch {
-		wireBytes := wire.EncodeWithHot(nil, batch[i].Ad.AST(), c.intern, hot)
-		stored := codec.Compress(nil, wireBytes)
+		stored := codec.Compress(nil, c.encodeAd(batch[i].Ad.AST()))
 		h := c.h.Hash(batch[i].Key)
 		si := int(h & c.mask)
 		byShard[si] = append(byShard[si], pendingPut{hash: h, key: batch[i].Key, ad: stored, codec: codec})
@@ -174,8 +186,7 @@ func (c *Collection) Update(batch []AdUpdate) error {
 // map allocations: it encodes, compresses, and commits directly to the one shard.
 func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	codec := c.currentCodec()
-	wireBytes := wire.EncodeWithHot(nil, ad.AST(), c.intern, c.currentHotSet())
-	stored := codec.Compress(nil, wireBytes)
+	stored := codec.Compress(nil, c.encodeAd(ad.AST()))
 	h := c.h.Hash(key)
 	c.shards[h&c.mask].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
 	return c.writeError()
@@ -264,7 +275,7 @@ type queryPlan struct {
 func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
 		plan := q.ReadPlan()
-		ws := &wireScope{intern: c.intern}
+		ws := &wireScope{c: c}
 		qp := queryPlan{
 			q:        q,
 			plan:     plan,
@@ -273,9 +284,12 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 			ws:       ws,
 			resolver: ws.resolve, // bound once to avoid a per-ad closure allocation
 		}
-		// If the query has an index-usable constraint, visit only candidate ads;
+		// Record which attributes the query filters on (for SuggestIndexes), then,
+		// if the query has an index-usable constraint, visit only candidate ads;
 		// otherwise fall back to a full scan. Both re-verify the full predicate.
-		usable := c.planIndex(q)
+		probes := q.Probes()
+		c.demand.record(probes)
+		usable := c.planIndex(probes)
 		for _, sh := range c.shards {
 			var cont bool
 			if len(usable) > 0 {
@@ -296,6 +310,7 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 // stopped iteration.
 func (c *Collection) scanShard(sh *shard, qp queryPlan, yield func(*classad.ClassAd) bool) bool {
 	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
 	cont := true
 	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
 	forEachVisible(s0, wins, func(ad []byte, codec Codec) bool {
@@ -307,7 +322,7 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, yield func(*classad.Clas
 		if qp.q != nil && !c.matches(w, qp) {
 			return true
 		}
-		a, err := wire.Decode(w, c.intern)
+		a, err := c.decodeWire(w)
 		if err != nil {
 			return true
 		}
@@ -335,7 +350,7 @@ func (c *Collection) matches(w []byte, qp queryPlan) bool {
 	if qp.plan.PartialSafe {
 		return qp.m.Matches(c.partialDecodeWire(w, qp.plan.Seeds))
 	}
-	a, err := wire.Decode(w, c.intern)
+	a, err := c.decodeWire(w)
 	if err != nil {
 		return false
 	}
@@ -360,15 +375,11 @@ func (c *Collection) partialDecodeWire(w []byte, seeds []string) *classad.ClassA
 			continue
 		}
 		done[fold] = true
-		id, ok := c.intern.LookupID(name)
-		if !ok {
-			continue // no ad ever had this attribute -> undefined
-		}
-		node, ok := a.Lookup(id)
+		node, ok := c.wireLookup(a, name)
 		if !ok {
 			continue // this ad lacks it -> undefined
 		}
-		expr, err := wire.DecodeNode(node, c.intern)
+		expr, err := c.decodeNode(node)
 		if err != nil {
 			continue
 		}
@@ -383,7 +394,7 @@ func (c *Collection) decodeAd(stored []byte, codec Codec) (*classad.ClassAd, err
 	if err != nil {
 		return nil, err
 	}
-	a, err := wire.Decode(wireBytes, c.intern)
+	a, err := c.decodeWire(wireBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -410,6 +421,7 @@ func (c *Collection) CollectSamples(max int) [][]byte {
 			out = append(out, cp)
 			return len(out) < max
 		})
+		releaseWindows(wins)
 	}
 	return out
 }

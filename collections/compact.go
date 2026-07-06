@@ -64,6 +64,12 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// Register the dictionary so segments can be tagged with its id and, for a
+	// persistent collection, its bytes are written durably before any segment
+	// references it (recovery reconstructs the codec from them).
+	if _, err := c.dicts.register(codec, dict); err != nil {
+		return 0, err
+	}
 	c.codec.Store(&codecHolder{codec}) // new writes use the new codec
 	for _, sh := range c.shards {
 		c.compactShard(sh, codec) // recompress to the new codec
@@ -170,6 +176,13 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 	}
 
+	// Make the compacted (destination) records durable BEFORE any source segment is
+	// retired/unlinked, so a crash cannot lose them (the source still holds a copy
+	// until it is reaped, and recovery dedups if both survive). No-op for RAM.
+	for _, seg := range dstSegs {
+		_ = seg.flush()
+	}
+
 	// Phase 3 (lock): finalize, rebuild the directory, and install.
 	sh.mu.Lock()
 	baseID := uint32(len(sh.segs))
@@ -219,8 +232,17 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	}
 
 	sh.segs = append(sh.segs, dstSegs...)
+	// Retire the source segments. RAM segments are just dropped (the GC frees them
+	// once in-flight scans release their windows). mmap segments are munmap'd +
+	// unlinked, but only once no scan references them: retire() reaps immediately if
+	// unpinned, else the last unpin reaps. Defer the actual reap (syscalls) until
+	// after the lock is dropped.
+	var toReap []*segment
 	for i := 0; i < srcCount; i++ {
-		sh.segs[i] = nil // retire source segments (kept alive for scans via GC)
+		if seg := sh.segs[i]; seg != nil && seg.retire() {
+			toReap = append(toReap, seg)
+		}
+		sh.segs[i] = nil
 	}
 	sh.dir = newDir
 	sh.count = count
@@ -228,6 +250,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		sh.act = dstSegs[len(dstSegs)-1]
 	}
 	sh.mu.Unlock()
+
+	for _, seg := range toReap {
+		_ = seg.reap()
+	}
 }
 
 // dirGetOr returns the directory head for hash h, or noLoc.

@@ -7,10 +7,18 @@ package collections
 
 import (
 	"encoding/binary"
+	"hash/crc32"
 	"os"
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
+
+// crcTable is CRC-32C (Castagnoli), hardware-accelerated on modern CPUs. A
+// persistent record ends with a CRC over its immutable bytes so recovery can
+// reject a torn/partial tail (a record whose write did not complete before the
+// crash).
+var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 // Record layout in an arena segment. All multi-byte fields are little-endian and
 // each record starts on an 8-byte boundary so the two 8-byte MVCC fields are
@@ -79,6 +87,62 @@ type segment struct {
 	file   *os.File // backing file (non-nil ⇒ mmap-backed)
 	path   string   // backing file path (for unlink on retirement)
 	synced int      // bytes msync'd to disk (the durable length); guarded by shard lock
+
+	// Reclamation of mmap segments (RAM segments are freed by the GC once scans drop
+	// their windows). A scan pins the segments it reads; a segment retired by
+	// compaction is munmap'd + unlinked only once its pin count drains to zero, so a
+	// scan never reads through a mapping torn down under it. Guarded by reapMu.
+	reapMu  sync.Mutex
+	refs    int  // active scan pins
+	retired bool // removed from the live set by compaction; awaiting reap
+	reaped  bool // reap() has run (guards against a double munmap/unlink)
+}
+
+// pin marks the start of a scan's use of a segment (mmap only; RAM segments rely on
+// the GC). Balanced by unpin. Called under the shard read lock.
+func (s *segment) pin() {
+	if s.file == nil {
+		return
+	}
+	s.reapMu.Lock()
+	s.refs++
+	s.reapMu.Unlock()
+}
+
+// unpin ends a scan's use of a segment; if the segment was retired while pinned and
+// this was the last pin, it is reaped now (munmap + unlink). Called with no lock.
+func (s *segment) unpin() {
+	if s.file == nil {
+		return
+	}
+	s.reapMu.Lock()
+	s.refs--
+	doReap := s.refs == 0 && s.retired && !s.reaped
+	if doReap {
+		s.reaped = true
+	}
+	s.reapMu.Unlock()
+	if doReap {
+		_ = s.reap()
+	}
+}
+
+// retire removes a compaction source segment from the live set. It returns true if
+// the caller should reap() it now (no scan references it); otherwise the last unpin
+// reaps it. For a RAM segment it is a no-op (the caller nils the slot; the GC frees
+// it). Called under the shard write lock.
+func (s *segment) retire() (reapNow bool) {
+	if s.file == nil {
+		return false
+	}
+	s.reapMu.Lock()
+	s.retired = true
+	reapNow = s.refs == 0 && !s.reaped
+	if reapNow {
+		s.reaped = true
+	}
+	s.reapMu.Unlock()
+	return reapNow
 }
 
 func newSegment(id uint32, size int, codec Codec) *segment {
@@ -94,9 +158,19 @@ func newSegment(id uint32, size int, codec Codec) *segment {
 func recAlign(n int) int { return (n + 7) &^ 7 }
 
 // recordLen returns the total on-segment length for a record with the given key
-// and ad byte lengths.
+// and ad byte lengths, including the 4-byte trailing CRC.
 func recordLen(keyLen, adLen int) int {
-	return recAlign(recHeaderSize + keyLen + 4 + adLen)
+	return recAlign(recHeaderSize + keyLen + 4 + adLen + 4)
+}
+
+// recCRC computes the CRC-32C over a record's immutable bytes: the commit seq and
+// the structural/payload region (totalLen, keyLen, key, adLen, ad). It excludes
+// the mutable fields (supersededBySeq, the chain pointer), which are rewritten
+// after the initial append. b is the record's byte slice, crcOff the offset of the
+// trailing CRC within it.
+func recCRC(b []byte, crcOff int) uint32 {
+	c := crc32.Update(0, crcTable, b[recSeqOff:recSeqOff+8])
+	return crc32.Update(c, crcTable, b[recTotalLenOff:crcOff])
 }
 
 // append writes a record for (key, ad) at the current end of the segment and
@@ -124,7 +198,32 @@ func (s *segment) append(seq uint64, next loc, key, ad []byte) (uint32, bool) {
 	adLenOff := recKeyOff + len(key)
 	binary.LittleEndian.PutUint32(b[adLenOff:], uint32(len(ad)))
 	copy(b[adLenOff+4:], ad)
+	// Trailing CRC over the immutable bytes (persistent segments only; recovery
+	// uses it to detect a torn tail). RAM segments never recover, so skip the cost.
+	if s.file != nil {
+		crcOff := adLenOff + 4 + len(ad)
+		binary.LittleEndian.PutUint32(b[crcOff:], recCRC(b, crcOff))
+	}
 	return uint32(off), true
+}
+
+// recVerifyCRC reports whether the record at off has a valid trailing CRC (i.e. it
+// was fully written). Used by recovery to stop at a torn tail. b is the segment's
+// data; the caller has already bounds-checked the record's totalLen.
+func recVerifyCRC(b []byte, off uint32) bool {
+	kl := binary.LittleEndian.Uint32(b[off+recKeyLenOff:])
+	adLenOff := off + recKeyOff + kl
+	if int(adLenOff)+4 > len(b) {
+		return false
+	}
+	adLen := binary.LittleEndian.Uint32(b[adLenOff:])
+	crcOff := int(adLenOff) + 4 + int(adLen)
+	if crcOff+4 > len(b) {
+		return false
+	}
+	rec := b[off : crcOff+4]
+	want := binary.LittleEndian.Uint32(b[crcOff:])
+	return recCRC(rec, crcOff-int(off)) == want
 }
 
 // --- record field accessors (operate on a segment's buf and an offset) ---

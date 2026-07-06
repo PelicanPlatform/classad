@@ -23,6 +23,20 @@ func (s *segment) flush() error {
 	return errNoMmap
 }
 
+func (s *segment) msyncRange(from, to int) error {
+	if s.file == nil {
+		return nil
+	}
+	return errNoMmap
+}
+
+func (s *segment) reap() error {
+	if s.file == nil {
+		return nil
+	}
+	return errNoMmap
+}
+
 func (s *segment) unmap() error {
 	if s.file == nil {
 		return nil

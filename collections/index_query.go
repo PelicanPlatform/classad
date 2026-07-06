@@ -14,12 +14,16 @@ import (
 // segment, covering all records written so far. It reads only immutable segment
 // bytes, so it runs off the write path and does not block writers or compaction.
 // Call it on whatever schedule you like: queries use whatever coverage exists and
-// full-scan the rest, so Reindex only affects query speed, never results. No-op if
-// no indexes are configured.
+// full-scan the rest, so Reindex only affects query speed, never results.
+//
+// Reindex also reconciles segments with the current index configuration: a segment
+// indexed before an AddIndex is rebuilt so the new attribute is backfilled, and one
+// indexed before a DropIndex is rebuilt (or, if nothing is indexed anymore, its
+// index is dropped) so the removed attribute's postings are reclaimed. A whole
+// span of segments therefore evolves toward the current spec at whatever cadence
+// the caller reindexes — no write-path or compaction coupling.
 func (c *Collection) Reindex() {
-	if !c.spec.any() {
-		return
-	}
+	spec := c.spec.Load()
 	for _, sh := range c.shards {
 		// Snapshot segments + watermarks under the read lock, then build off-lock.
 		sh.mu.RLock()
@@ -29,16 +33,32 @@ func (c *Collection) Reindex() {
 		}
 		var tgts []target
 		for _, seg := range sh.segs {
-			if seg == nil || seg.used == 0 {
+			if seg == nil {
 				continue
 			}
-			if cur := seg.idx.Load(); cur == nil || int(cur.upto) < seg.used {
+			cur := seg.idx.Load()
+			if !spec.any() {
+				if cur != nil {
+					tgts = append(tgts, target{seg, seg.used}) // clear a now-orphaned index
+				}
+				continue
+			}
+			if seg.used == 0 {
+				continue
+			}
+			// Rebuild when the index is missing, behind the write watermark, or built
+			// under an older spec generation (an add/drop happened since).
+			if cur == nil || int(cur.upto) < seg.used || cur.specGen != spec.gen {
 				tgts = append(tgts, target{seg, seg.used})
 			}
 		}
 		sh.mu.RUnlock()
 		for _, t := range tgts {
-			t.seg.idx.Store(c.buildSegIndex(t.seg.data, t.used, t.seg.codec))
+			if !spec.any() {
+				t.seg.idx.Store(nil)
+				continue
+			}
+			t.seg.idx.Store(c.buildSegIndex(t.seg.data, t.used, t.seg.codec, spec))
 		}
 	}
 }
@@ -57,23 +77,24 @@ type usableProbe struct {
 
 // planIndex matches the query's probes against the configured indexes. Empty means
 // no index-usable constraint (the store full-scans).
-func (c *Collection) planIndex(q *vm.Query) []usableProbe {
-	if !c.spec.any() {
+func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
+	spec := c.spec.Load()
+	if !spec.any() {
 		return nil
 	}
 	var out []usableProbe
-	for _, p := range q.Probes() {
+	for _, p := range probes {
 		id, ok := c.intern.LookupID(p.Attr)
 		if !ok {
 			continue
 		}
-		if _, isCat := c.spec.cat[id]; isCat {
+		if _, isCat := spec.cat[id]; isCat {
 			if up, ok := catUsable(id, p); ok {
 				out = append(out, up)
 			}
 			continue
 		}
-		if _, isVal := c.spec.val[id]; isVal {
+		if _, isVal := spec.val[id]; isVal {
 			if up, ok := valUsable(id, p); ok {
 				out = append(out, up)
 			}
@@ -244,6 +265,7 @@ func cmpFloat(op string, k, t float64) bool {
 // result is identical to a full scan. Returns false if the consumer stopped.
 func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryPlan, yield func(*classad.ClassAd) bool) bool {
 	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
 	var dbuf []byte
 	// visit tests one record's visibility, re-verifies, and yields; returns
 	// (keepGoing, stopped) where stopped means the consumer asked to stop.

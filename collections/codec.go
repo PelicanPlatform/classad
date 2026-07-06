@@ -95,10 +95,19 @@ func TrainDict(samples [][]byte) ([]byte, error) {
 // concatenating distinct samples up to dictSize — for a pool of similar ClassAds,
 // this captures the shared attribute names and values that later ads back-
 // reference. BuildDict then trains the entropy tables from the full sample set.
-func TrainDictSize(samples [][]byte, dictSize int) ([]byte, error) {
+func TrainDictSize(samples [][]byte, dictSize int) (dict []byte, err error) {
 	if len(samples) == 0 {
 		return nil, errors.New("no samples")
 	}
+	// zstd.BuildDict can panic (integer divide by zero in its Huffman-table training)
+	// on some degenerate sample distributions. Contain it so a public API
+	// (RetrainDict) surfaces an error and keeps the current dictionary rather than
+	// crashing the process.
+	defer func() {
+		if r := recover(); r != nil {
+			dict, err = nil, fmt.Errorf("zstd BuildDict failed: %v", r)
+		}
+	}()
 	// Assemble dictionary content from distinct samples, most-recent-first order
 	// not being meaningful here; dedup exact duplicates to avoid wasting content
 	// space on tiled/identical ads.
