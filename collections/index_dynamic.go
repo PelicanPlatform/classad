@@ -1,5 +1,7 @@
 package collections
 
+import "strings"
+
 // Dynamic index add/drop (auto-detect steps 2 & 3). The configured index set lives
 // behind an atomic pointer (Collection.spec); AddIndex and DropIndex publish a new
 // spec with a bumped generation. Neither touches segment indexes directly: they are
@@ -21,13 +23,19 @@ func (c *Collection) AddIndex(categorical, value []string) bool {
 	for {
 		cur := c.spec.Load()
 		next := cur.clone()
+		intern := func(name string) uint32 {
+			if next.inline {
+				return next.inlineID(name)
+			}
+			return c.intern.Intern(name)
+		}
 		for _, name := range categorical {
-			id := c.intern.Intern(name)
+			id := intern(name)
 			removeID(&next.valIDs, next.val, id) // categorical wins if it was a value index
 			addID(&next.catIDs, next.cat, id)
 		}
 		for _, name := range value {
-			id := c.intern.Intern(name)
+			id := intern(name)
 			if _, isCat := next.cat[id]; isCat {
 				continue // already categorical; do not double-index
 			}
@@ -53,9 +61,15 @@ func (c *Collection) DropIndex(names ...string) bool {
 		cur := c.spec.Load()
 		next := cur.clone()
 		for _, name := range names {
-			id, ok := c.intern.LookupID(name)
+			var id uint32
+			var ok bool
+			if next.inline {
+				id, ok = next.nameToID[strings.ToLower(name)]
+			} else {
+				id, ok = c.intern.LookupID(name)
+			}
 			if !ok {
-				continue // never interned ⇒ never indexed
+				continue // never indexed
 			}
 			removeID(&next.catIDs, next.cat, id)
 			removeID(&next.valIDs, next.val, id)
@@ -74,14 +88,21 @@ func (c *Collection) DropIndex(names ...string) bool {
 // collection's canonical (interned) casing.
 func (c *Collection) IndexedAttrs() (categorical, value []string) {
 	spec := c.spec.Load()
+	name := func(id uint32) (string, bool) {
+		if spec.inline {
+			n, ok := spec.names[id]
+			return n, ok
+		}
+		return c.intern.Name(id)
+	}
 	for _, id := range spec.catIDs {
-		if name, ok := c.intern.Name(id); ok {
-			categorical = append(categorical, name)
+		if n, ok := name(id); ok {
+			categorical = append(categorical, n)
 		}
 	}
 	for _, id := range spec.valIDs {
-		if name, ok := c.intern.Name(id); ok {
-			value = append(value, name)
+		if n, ok := name(id); ok {
+			value = append(value, n)
 		}
 	}
 	return categorical, value

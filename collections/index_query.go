@@ -7,7 +7,6 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // Reindex (re)builds the per-segment value/categorical indexes for every live
@@ -58,7 +57,7 @@ func (c *Collection) Reindex() {
 				t.seg.idx.Store(nil)
 				continue
 			}
-			t.seg.idx.Store(c.buildSegIndex(t.seg.data, t.used, t.seg.codec, spec))
+			t.seg.idx.Store(buildSegIndex(t.seg.data, t.used, t.seg.codec, spec))
 		}
 	}
 }
@@ -84,7 +83,13 @@ func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 	}
 	var out []usableProbe
 	for _, p := range probes {
-		id, ok := c.intern.LookupID(p.Attr)
+		var id uint32
+		var ok bool
+		if spec.inline {
+			id, ok = spec.nameToID[strings.ToLower(p.Attr)]
+		} else {
+			id, ok = c.intern.LookupID(p.Attr)
+		}
 		if !ok {
 			continue
 		}
@@ -281,7 +286,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 		if !c.matches(ww, qp) {
 			return false
 		}
-		a, err := wire.Decode(ww, c.intern)
+		a, err := c.decodeWire(ww) // mode-aware (inline vs interned)
 		if err != nil {
 			return false
 		}

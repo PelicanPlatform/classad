@@ -36,6 +36,38 @@ type indexSpec struct {
 	valIDs []uint32
 	cat    map[uint32]struct{}
 	val    map[uint32]struct{}
+
+	// Inline (persistent) collections have no intern table, so attribute ids are
+	// assigned synthetically here and records' values are looked up by name. In
+	// interned mode these are zero/nil and id == the global intern id. Indexes on a
+	// persistent collection are in-memory only and rebuilt on recovery.
+	inline   bool
+	nextID   uint32            // next synthetic id to assign (inline only)
+	names    map[uint32]string // id -> attribute name (inline only)
+	nameToID map[string]uint32 // folded name -> id (inline only)
+}
+
+// inlineID returns the synthetic id for name, assigning a fresh one on first use.
+// Only valid on a freshly built or cloned (unpublished) inline spec.
+func (s *indexSpec) inlineID(name string) uint32 {
+	fold := strings.ToLower(name)
+	if id, ok := s.nameToID[fold]; ok {
+		return id
+	}
+	id := s.nextID
+	s.nextID++
+	s.nameToID[fold] = id
+	s.names[id] = name
+	return id
+}
+
+// attrNode returns the value node for the attribute with id id in ad, reading it by
+// name for an inline record or by interned id otherwise.
+func (s *indexSpec) attrNode(ad wire.Ad, id uint32) ([]byte, bool) {
+	if s.inline {
+		return ad.LookupByName(s.names[id])
+	}
+	return ad.Lookup(id)
 }
 
 func (s *indexSpec) any() bool { return s != nil && (len(s.catIDs) > 0 || len(s.valIDs) > 0) }
@@ -68,6 +100,8 @@ func (s *indexSpec) clone() *indexSpec {
 		valIDs: append([]uint32(nil), s.valIDs...),
 		cat:    make(map[uint32]struct{}, len(s.cat)),
 		val:    make(map[uint32]struct{}, len(s.val)),
+		inline: s.inline,
+		nextID: s.nextID,
 	}
 	for id := range s.cat {
 		n.cat[id] = struct{}{}
@@ -75,7 +109,48 @@ func (s *indexSpec) clone() *indexSpec {
 	for id := range s.val {
 		n.val[id] = struct{}{}
 	}
+	if s.inline {
+		n.names = make(map[uint32]string, len(s.names))
+		n.nameToID = make(map[string]uint32, len(s.nameToID))
+		for id, name := range s.names {
+			n.names[id] = name
+		}
+		for name, id := range s.nameToID {
+			n.nameToID[name] = id
+		}
+	}
 	return n
+}
+
+// newInlineIndexSpec builds an inline (persistent) index spec, assigning each
+// distinct attribute a synthetic id and recording its name for by-name value lookup.
+// Mirrors newIndexSpec's categorical/value partitioning.
+func newInlineIndexSpec(catNames, valNames []string) *indexSpec {
+	s := &indexSpec{
+		inline:   true,
+		cat:      map[uint32]struct{}{},
+		val:      map[uint32]struct{}{},
+		names:    map[uint32]string{},
+		nameToID: map[string]uint32{},
+	}
+	for _, name := range catNames {
+		id := s.inlineID(name)
+		if _, dup := s.cat[id]; !dup {
+			s.cat[id] = struct{}{}
+			s.catIDs = append(s.catIDs, id)
+		}
+	}
+	for _, name := range valNames {
+		id := s.inlineID(name)
+		if _, isCat := s.cat[id]; isCat {
+			continue // an attr indexed as both: categorical wins (matches AddIndex)
+		}
+		if _, dup := s.val[id]; !dup {
+			s.val[id] = struct{}{}
+			s.valIDs = append(s.valIDs, id)
+		}
+	}
+	return s
 }
 
 // equalIDs reports whether two specs index exactly the same attribute ids in the
@@ -123,8 +198,9 @@ type segIndex struct {
 
 // buildSegIndex scans a segment's records in [0, upto) and returns its index for
 // the given spec. Reads immutable segment bytes only (no lock needed); decompresses
-// each record to read the indexed attributes.
-func (c *Collection) buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segIndex {
+// each record to read the indexed attributes. It has no Collection dependency, so
+// both the live store (Reindex) and the Archive build indexes with it.
+func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segIndex {
 	si := &segIndex{
 		upto:    uint32(upto),
 		specGen: spec.gen,
@@ -160,7 +236,7 @@ func (c *Collection) buildSegIndex(data []byte, upto int, codec Codec, spec *ind
 func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 	for _, id := range spec.catIDs {
 		cp := si.cat[id]
-		node, ok := ad.Lookup(id)
+		node, ok := spec.attrNode(ad, id)
 		if !ok {
 			continue // absent
 		}
@@ -173,7 +249,7 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 	}
 	for _, id := range spec.valIDs {
 		vp := si.val[id]
-		node, ok := ad.Lookup(id)
+		node, ok := spec.attrNode(ad, id)
 		if !ok {
 			continue
 		}

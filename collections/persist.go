@@ -154,18 +154,16 @@ func Open(opts Options) (*Collection, error) {
 	if !mmapSupported {
 		return nil, errNoMmap
 	}
-	if len(opts.CategoricalAttrs) > 0 || len(opts.ValueAttrs) > 0 {
-		// Indexes on a persistent collection are an in-memory-only structure
-		// rebuilt on recovery; wiring the inline (name-based) extraction is a
-		// tracked follow-up. Reject for now rather than silently misindex.
-		return nil, errors.New("collections: indexes are not yet supported with a persistent (Dir) collection")
-	}
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
 		return nil, err
 	}
 	c := New(opts)
 	c.dir = opts.Dir
 	c.inline = true
+	// Indexes on a persistent collection are in-memory only (rebuilt on recovery, see
+	// below). Replace the interned spec New built with an inline one that extracts
+	// values by name (records carry no intern ids).
+	c.spec.Store(newInlineIndexSpec(opts.CategoricalAttrs, opts.ValueAttrs))
 	// Inline mode keys the hot header by (folded) name; carry the folded HotAttrs.
 	if len(opts.HotAttrs) > 0 {
 		c.hotNames = make(map[string]struct{}, len(opts.HotAttrs))
@@ -216,6 +214,11 @@ func Open(opts Options) (*Collection, error) {
 			path := filepath.Join(shardDir, fmt.Sprintf("seg-%d.d%d.dat", n, dictID))
 			return newMmapSegment(id, size, codec, path)
 		}
+	}
+	// Indexes are derived state, not persisted: build them over the recovered
+	// segments so a reopened collection's queries are immediately selective.
+	if c.spec.Load().any() {
+		c.Reindex()
 	}
 	return c, nil
 }
