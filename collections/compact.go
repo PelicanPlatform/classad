@@ -140,6 +140,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		dstSegs = append(dstSegs, cur)
 	}
 	var moved []movedRec
+	// Scratch buffers reused across every record's decompress/recompress: append
+	// copies the record into the destination segment, so these are transient. This
+	// avoids two fresh allocations per record (heavy GC churn at recompaction).
+	var decBuf, encBuf []byte
 	for _, seg := range srcSegs {
 		if seg == nil {
 			continue
@@ -156,8 +160,11 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 				seq := recSeq(seg.data, o)
 				outAd, outCodec := ad, seg.codec
 				if seg.codec != target {
-					if w, err := seg.codec.Decompress(nil, ad); err == nil {
-						outAd, outCodec = target.Compress(nil, w), target
+					if w, err := seg.codec.Decompress(decBuf[:0], ad); err == nil {
+						decBuf = w
+						outAd = target.Compress(encBuf[:0], w)
+						encBuf = outAd
+						outCodec = target
 					}
 				}
 				rl := recordLen(len(key), len(outAd))

@@ -408,16 +408,18 @@ func (c *Collection) decodeAd(stored []byte, codec Codec) (*classad.ClassAd, err
 // each record with the codec it was stored under.
 func (c *Collection) CollectSamples(max int) [][]byte {
 	out := make([][]byte, 0, max)
+	var buf []byte // reused decompression scratch; each sample is copied out exactly
 	for _, sh := range c.shards {
 		if len(out) >= max {
 			break
 		}
 		s0, wins := sh.snapshot()
 		forEachVisible(s0, wins, func(ad []byte, codec Codec) bool {
-			w, err := codec.Decompress(nil, ad)
+			w, err := codec.Decompress(buf[:0], ad)
 			if err != nil {
 				return true
 			}
+			buf = w
 			cp := make([]byte, len(w))
 			copy(cp, w)
 			out = append(out, cp)
