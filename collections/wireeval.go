@@ -6,6 +6,15 @@ import (
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
+// wireCtx supplies the mode-aware wire touchpoints (interned-id vs inline-name
+// attribute lookup and decode) that wire-native matching needs. Both *Collection
+// and *Archive implement it, so they share one match path (matchWire).
+type wireCtx interface {
+	decodeWire(w []byte) (*ast.ClassAd, error)
+	wireLookup(a wire.Ad, name string) ([]byte, bool)
+	decodeNode(node []byte) (ast.Expr, error)
+}
+
 // wireScope resolves attribute references directly from an ad's wire bytes for
 // wire-native query evaluation, so a match test builds no ClassAd. It handles the
 // common case where the queried attributes are scalar literals; if it encounters
@@ -16,7 +25,7 @@ import (
 // fellBack before each evaluation.
 type wireScope struct {
 	ad       wire.Ad
-	c        *Collection // for mode-aware attribute lookup (interned id vs inline name)
+	ctx      wireCtx // for mode-aware attribute lookup (interned id vs inline name)
 	fellBack bool
 }
 
@@ -27,7 +36,7 @@ func (ws *wireScope) resolve(name string, scope ast.AttributeScope) classad.Valu
 	if scope == ast.TargetScope || scope == ast.ParentScope {
 		return classad.NewUndefinedValue()
 	}
-	node, ok := ws.c.wireLookup(ws.ad, name)
+	node, ok := ws.ctx.wireLookup(ws.ad, name)
 	if !ok {
 		return classad.NewUndefinedValue() // this ad lacks it
 	}

@@ -275,7 +275,7 @@ type queryPlan struct {
 func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
 		plan := q.ReadPlan()
-		ws := &wireScope{c: c}
+		ws := &wireScope{ctx: c}
 		qp := queryPlan{
 			q:        q,
 			plan:     plan,
@@ -319,7 +319,7 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, yield func(*classad.Clas
 			return true // skip a record we cannot decode rather than abort the scan
 		}
 		dbuf = w // retain the (possibly grown) backing for the next ad
-		if qp.q != nil && !c.matches(w, qp) {
+		if qp.q != nil && !matchWire(w, qp) {
 			return true
 		}
 		a, err := c.decodeWire(w)
@@ -335,9 +335,11 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, yield func(*classad.Clas
 	return cont
 }
 
-// matches reports whether the query matches the ad with wire bytes w, using the
-// cheapest evaluation path that is exact for this query and ad.
-func (c *Collection) matches(w []byte, qp queryPlan) bool {
+// matchWire reports whether the query matches the ad with wire bytes w, using the
+// cheapest evaluation path that is exact for this query and ad. It is mode-agnostic:
+// the wire touchpoints come from qp.ws.ctx, so both Collection and Archive scans use
+// it.
+func matchWire(w []byte, qp queryPlan) bool {
 	if qp.wireOK {
 		qp.ws.ad = wire.Ad(w)
 		qp.ws.fellBack = false
@@ -348,9 +350,9 @@ func (c *Collection) matches(w []byte, qp queryPlan) bool {
 		// A queried attribute was a non-literal expression; fall back.
 	}
 	if qp.plan.PartialSafe {
-		return qp.m.Matches(c.partialDecodeWire(w, qp.plan.Seeds))
+		return qp.m.Matches(partialDecodeWire(qp.ws.ctx, w, qp.plan.Seeds))
 	}
-	a, err := c.decodeWire(w)
+	a, err := qp.ws.ctx.decodeWire(w)
 	if err != nil {
 		return false
 	}
@@ -362,7 +364,7 @@ func (c *Collection) matches(w []byte, qp queryPlan) bool {
 // bytes without materializing its other (potentially many) attributes. An
 // attribute the ad lacks is simply omitted, so a reference to it evaluates to
 // undefined — exactly as it would against a full decode.
-func (c *Collection) partialDecodeWire(w []byte, seeds []string) *classad.ClassAd {
+func partialDecodeWire(ctx wireCtx, w []byte, seeds []string) *classad.ClassAd {
 	a := wire.Ad(w)
 	out := classad.New()
 	done := make(map[string]bool, len(seeds))
@@ -375,11 +377,11 @@ func (c *Collection) partialDecodeWire(w []byte, seeds []string) *classad.ClassA
 			continue
 		}
 		done[fold] = true
-		node, ok := c.wireLookup(a, name)
+		node, ok := ctx.wireLookup(a, name)
 		if !ok {
 			continue // this ad lacks it -> undefined
 		}
-		expr, err := c.decodeNode(node)
+		expr, err := ctx.decodeNode(node)
 		if err != nil {
 			continue
 		}

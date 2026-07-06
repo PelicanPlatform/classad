@@ -283,7 +283,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 			return false
 		}
 		dbuf = ww
-		if !c.matches(ww, qp) {
+		if !matchWire(ww, qp) {
 			return false
 		}
 		a, err := c.decodeWire(ww) // mode-aware (inline vs interned)

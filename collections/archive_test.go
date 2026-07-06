@@ -2,6 +2,7 @@ package collections
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -111,7 +112,8 @@ func TestArchiveRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer b.Close()
-	for _, qs := range []string{`Owner == "carol"`, `Memory > 4096`, `Owner == "dave" && Memory <= 2048`} {
+	// Includes a != query so the mmap-backed (FromBuffer) all/AndNot path is exercised.
+	for _, qs := range []string{`Owner == "carol"`, `Memory > 4096`, `Owner != "carol"`, `Owner == "dave" && Memory <= 2048`} {
 		q, _ := vm.Parse(qs)
 		got := archiveQueryIDs(t, b, qs)
 		want := bruteIDs(src, q)
@@ -235,7 +237,7 @@ func TestArchiveRotation(t *testing.T) {
 		t.Errorf("kept %d segments, want 2", len(a.segs))
 	}
 	// The oldest segment's files must be gone, remaining ones still queryable.
-	if _, err := readSidecarIndex(a.idxPath(oldestID)); err == nil {
+	if _, err := os.Stat(a.idxPath(oldestID)); err == nil {
 		t.Errorf("dropped segment's sidecar index still present")
 	}
 	got := archiveQueryIDs(t, a, `Owner == "alice"`)
@@ -304,6 +306,117 @@ func TestArchiveConcurrentQueryRotate(t *testing.T) {
 	}
 	close(stop)
 	wg.Wait()
+}
+
+// TestArchiveWireNativeFallback exercises the shared wire-native matcher, including
+// the fallback to a decode when a queried attribute is a non-literal expression.
+func TestArchiveWireNativeFallback(t *testing.T) {
+	dir := t.TempDir()
+	a, err := CreateArchive(ArchiveOptions{
+		Dir: dir, SegmentSize: 8 << 10, CategoricalAttrs: []string{"Owner"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 200; i++ {
+		// Rank is an expression (references Base), so a query on it cannot be resolved
+		// wire-native and must fall back to a partial/full decode inside matchWire.
+		ad, err := classad.Parse(fmt.Sprintf(`[ ID=%d; Owner="u%d"; Base=%d; Rank=Base*2 ]`, i, i%4, i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+		src[i] = ad
+	}
+	if err := a.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	for _, qs := range []string{
+		`Owner == "u1"`,               // pure wire-native (literal attrs)
+		`Rank > 100`,                  // expression attr -> fallback decode
+		`Rank > 100 && Owner == "u2"`, // index-narrowed + fallback re-verify
+	} {
+		q, _ := vm.Parse(qs)
+		got := archiveQueryIDs(t, a, qs)
+		want := bruteIDs(src, q)
+		if !equalInts(got, want) {
+			t.Errorf("query %q: got %v want %v", qs, got, want)
+		}
+	}
+}
+
+// TestArchiveLazyIndexLoad verifies sidecar indexes are not loaded at Open and that
+// a zone-pruned segment never pages its index in (H5).
+func TestArchiveLazyIndexLoad(t *testing.T) {
+	dir := t.TempDir()
+	opts := ArchiveOptions{ValueAttrs: []string{"CompletionDate"}, ZoneAttrs: []string{"CompletionDate"}}
+	a, src := buildArchive(t, dir, 400, opts)
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	opts.Dir = dir
+	b, err := OpenArchive(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+
+	total := len(b.segs)
+	if total < 4 {
+		t.Fatalf("need several segments, got %d", total)
+	}
+	// Lazy: nothing loaded immediately after Open (restart is O(segments)).
+	for _, as := range b.segs {
+		if as.seg.idx.Load() != nil {
+			t.Fatalf("segment %d index loaded eagerly at Open", as.seg.id)
+		}
+	}
+
+	// A zone-selective query touches only the newest segment(s); pruned segments must
+	// stay unloaded.
+	qs := `CompletionDate > 1700000390`
+	q, _ := vm.Parse(qs)
+	got := archiveQueryIDs(t, b, qs)
+	if want := bruteIDs(src, q); !equalInts(got, want) {
+		t.Fatalf("zone query wrong: got %v want %v", got, want)
+	}
+	loaded := 0
+	for _, as := range b.segs {
+		if as.seg.idx.Load() != nil {
+			loaded++
+		}
+	}
+	if loaded == 0 || loaded >= total {
+		t.Errorf("lazy load: %d of %d indexes paged in (want some but not all)", loaded, total)
+	}
+
+	// A non-selective query pages in the rest.
+	for ad := range b.Query(mustParseQuery(t, `CompletionDate > 0`)) {
+		_ = ad
+	}
+	loadedAll := 0
+	for _, as := range b.segs {
+		if as.seg.idx.Load() != nil {
+			loadedAll++
+		}
+	}
+	if loadedAll != total {
+		t.Errorf("after full query, %d of %d indexes loaded", loadedAll, total)
+	}
+}
+
+func mustParseQuery(t *testing.T, qs string) *vm.Query {
+	t.Helper()
+	q, err := vm.Parse(qs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return q
 }
 
 func TestZoneMayMatch(t *testing.T) {

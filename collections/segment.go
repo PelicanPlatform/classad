@@ -96,6 +96,11 @@ type segment struct {
 	refs    int  // active scan pins
 	retired bool // removed from the live set by compaction; awaiting reap
 	reaped  bool // reap() has run (guards against a double munmap/unlink)
+
+	// onReap, if set, runs once right after reap() — used by the Archive to unmap a
+	// segment's mmap'd sidecar index at the same pin-drained moment its data is
+	// reaped, so a query scanning a rotating segment never reads a torn index mapping.
+	onReap func()
 }
 
 // pin marks the start of a scan's use of a segment (mmap only; RAM segments rely on
@@ -123,8 +128,38 @@ func (s *segment) unpin() {
 	}
 	s.reapMu.Unlock()
 	if doReap {
-		_ = s.reap()
+		s.reapAndHook()
 	}
+}
+
+// setOnReap registers a callback run once when the segment is reaped or explicitly
+// unhooked (the Archive's sidecar-index unmap). Guarded by reapMu; set while the
+// segment is pinned, so it is visible to the last unpin that reaps.
+func (s *segment) setOnReap(f func()) {
+	s.reapMu.Lock()
+	s.onReap = f
+	s.reapMu.Unlock()
+}
+
+// runReapHook runs and clears onReap (if any) without touching the data mapping.
+// Close uses it to unmap a segment's sidecar index without unlinking its files.
+func (s *segment) runReapHook() {
+	s.reapMu.Lock()
+	h := s.onReap
+	s.onReap = nil
+	s.reapMu.Unlock()
+	if h != nil {
+		h()
+	}
+}
+
+// reapAndHook reaps the segment (munmap + unlink of its data) and then runs onReap
+// once (the sidecar unmap). Both the deferred (unpin) and immediate (retire==true)
+// reap paths route through it, so onReap fires exactly once when pins have drained.
+func (s *segment) reapAndHook() error {
+	err := s.reap()
+	s.runReapHook()
+	return err
 }
 
 // retire removes a compaction source segment from the live set. It returns true if

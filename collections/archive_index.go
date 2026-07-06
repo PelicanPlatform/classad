@@ -75,17 +75,37 @@ func (a *Archive) writeSidecarIndex(as *archiveSeg) error {
 }
 
 // readSidecarIndex loads a segment's sidecar index file back into a *segIndex.
-func readSidecarIndex(path string) (*segIndex, error) {
-	data, err := os.ReadFile(path)
+// loadSidecar mmaps a sealed segment's sidecar index and parses it into a segIndex
+// whose roaring bitmaps are zero-copy views into the mapping (FromBuffer). It returns
+// the segIndex, the backing bytes, and a closer that unmaps them. The caller must
+// keep the bytes alive (and eventually call the closer) for as long as any query may
+// use the index — the Archive keeps them on the archiveSeg and unmaps at reap.
+//
+// On platforms without mmap the bytes are a heap copy (see archive_mmap_stub.go) and
+// the closer is a no-op; behavior is identical, just not demand-paged.
+func loadSidecar(path string) (si *segIndex, data []byte, closer func() error, err error) {
+	data, closer, err = mapFile(path)
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
-	c := &cursor{b: data}
+	si, err = parseSidecar(data)
+	if err != nil {
+		closer()
+		return nil, nil, nil, err
+	}
+	return si, data, closer, nil
+}
+
+// parseSidecar decodes sidecar bytes into a segIndex, with the bitmaps as zero-copy
+// views into data (data must stay immutable and mapped for the index's life).
+func parseSidecar(data []byte) (*segIndex, error) {
+	var err error
+	c := &cursor{b: data, zeroCopy: true}
 	if c.u32() != sidecarMagic {
-		return nil, fmt.Errorf("archive: bad sidecar magic in %s", path)
+		return nil, fmt.Errorf("archive: bad sidecar magic")
 	}
 	if v := c.u16(); v != sidecarVersion {
-		return nil, fmt.Errorf("archive: unsupported sidecar version %d in %s", v, path)
+		return nil, fmt.Errorf("archive: unsupported sidecar version %d", v)
 	}
 	si := &segIndex{
 		cat: map[uint32]*catPostings{},
@@ -135,7 +155,7 @@ func readSidecarIndex(path string) (*segIndex, error) {
 		si.val[id] = vp
 	}
 	if c.err != nil {
-		return nil, fmt.Errorf("archive: truncated sidecar %s: %w", path, c.err)
+		return nil, fmt.Errorf("archive: truncated sidecar: %w", c.err)
 	}
 	return si, nil
 }
@@ -164,10 +184,13 @@ func appendBitmap(b []byte, bm *roaring.Bitmap) ([]byte, error) {
 
 // cursor reads little-endian fields from a byte slice, latching the first error so
 // callers can check once at the end (an out-of-range read yields zero and sets err).
+// When zeroCopy is set, bitmap() builds roaring bitmaps as views into b (FromBuffer)
+// instead of copying — used when b is an mmap'd sidecar that outlives the index.
 type cursor struct {
-	b   []byte
-	i   int
-	err error
+	b        []byte
+	i        int
+	err      error
+	zeroCopy bool
 }
 
 func (c *cursor) need(n int) bool {
@@ -224,6 +247,14 @@ func (c *cursor) bitmap() (*roaring.Bitmap, error) {
 		return nil, c.err
 	}
 	bm := roaring.New()
+	if c.zeroCopy {
+		// FromBuffer reads the same portable format MarshalBinary writes, referencing
+		// p directly (best-effort, copy-on-write). p must stay immutable and mapped.
+		if _, err := bm.FromBuffer(p); err != nil {
+			return nil, err
+		}
+		return bm, nil
+	}
 	if err := bm.UnmarshalBinary(p); err != nil {
 		return nil, err
 	}

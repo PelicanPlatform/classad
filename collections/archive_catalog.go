@@ -132,13 +132,10 @@ func (a *Archive) loadSegment(cs catalogSeg) (*archiveSeg, error) {
 	}
 	seg.used = cs.ByteLen
 	seg.synced = cs.ByteLen
-	si, err := readSidecarIndex(a.idxPath(cs.ID))
-	if err != nil {
-		seg.unmap()
-		return nil, err
-	}
-	seg.idx.Store(si)
-	return &archiveSeg{seg: seg, recN: cs.RecN, zones: cs.Zones}, nil
+	// The sidecar index loads lazily (mmap) on first query — see ensureIndex — so a
+	// segment queries never touch never pages its index in, and restart stays
+	// O(segments).
+	return &archiveSeg{seg: seg, recN: cs.RecN, zones: cs.Zones, sealed: true}, nil
 }
 
 // recoverOrphans finds segment data files not present in the catalog (a crash left
@@ -198,7 +195,7 @@ func (a *Archive) recoverOrphan(id uint32) error {
 		return nil
 	}
 	seg.used = used
-	as := &archiveSeg{seg: seg, recN: recN}
+	as := &archiveSeg{seg: seg, recN: recN, sealed: true}
 	idx := buildSegIndex(seg.data, used, a.codec, a.spec)
 	seg.idx.Store(idx)
 	as.zones = a.computeZones(seg.data, used)

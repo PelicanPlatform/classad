@@ -31,6 +31,21 @@ func (a *Archive) QueryLimit(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] 
 			}
 		}()
 
+		// Wire-native match plan: each candidate is re-verified against the encoded
+		// bytes without building a ClassAd (falling back to a partial/full decode only
+		// when a queried attribute is a non-literal expression), and only true matches
+		// are decoded to be yielded. This is the same path Collection scans use.
+		plan := q.ReadPlan()
+		ws := &wireScope{ctx: a}
+		qp := queryPlan{
+			q:        q,
+			plan:     plan,
+			m:        q.Matcher(),
+			wireOK:   q.Native() && plan.PartialSafe,
+			ws:       ws,
+			resolver: ws.resolve,
+		}
+
 		n := 0
 		var buf []byte
 		for _, w := range wins {
@@ -40,18 +55,24 @@ func (a *Archive) QueryLimit(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] 
 			if a.scanned != nil {
 				a.scanned(w.seg.id)
 			}
-			offs := a.candidateOffsets(w, usable)
+			idx := a.ensureIndex(w.as)
+			offs := candidateOffsets(idx, w.data, w.used, usable)
 			// Newest-first within the segment: records are laid out oldest-first, so
 			// walk the candidate offsets in reverse.
 			for i := len(offs) - 1; i >= 0; i-- {
-				ad, ok := a.decodeAt(w.data, offs[i], &buf)
-				if !ok {
+				dec, err := a.codec.Decompress(buf[:0], recAd(w.data, offs[i]))
+				if err != nil {
 					continue
 				}
-				if !q.Matches(ad) {
+				buf = dec
+				if !matchWire(dec, qp) {
 					continue
 				}
-				if !yield(ad) {
+				ad, err := wire.Decode(dec, a.intern)
+				if err != nil {
+					continue
+				}
+				if !yield(classad.FromAST(ad)) {
 					return
 				}
 				n++
@@ -64,12 +85,12 @@ func (a *Archive) QueryLimit(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] 
 }
 
 // archiveWindow is a query's pinned view of one segment: immutable bytes up to a
-// snapshotted watermark, plus its (possibly nil) index and zone maps.
+// snapshotted watermark, its owning archiveSeg (for lazy index load), and zone maps.
 type archiveWindow struct {
 	seg   *segment
+	as    *archiveSeg
 	data  []byte
 	used  int
-	idx   *segIndex
 	zones map[uint32]zoneRange
 }
 
@@ -83,8 +104,7 @@ func (a *Archive) snapshotWindows() []archiveWindow {
 	add := func(as *archiveSeg, used int) {
 		as.seg.pin()
 		wins = append(wins, archiveWindow{
-			seg: as.seg, data: as.seg.data, used: used,
-			idx: as.seg.idx.Load(), zones: as.zones,
+			seg: as.seg, as: as, data: as.seg.data, used: used, zones: as.zones,
 		})
 	}
 	if a.active != nil && a.active.seg.used > 0 {
@@ -99,14 +119,14 @@ func (a *Archive) snapshotWindows() []archiveWindow {
 // candidateOffsets returns the ascending record offsets in a window to re-verify: the
 // index-narrowed set when the segment has a covering index and usable probes,
 // otherwise every record (full scan).
-func (a *Archive) candidateOffsets(w archiveWindow, usable []usableProbe) []uint32 {
-	if len(usable) > 0 && w.idx != nil && w.idx.covers(usable) {
-		if cand := w.idx.candidateOffsets(usable); cand != nil {
+func candidateOffsets(idx *segIndex, data []byte, used int, usable []usableProbe) []uint32 {
+	if len(usable) > 0 && idx != nil && idx.covers(usable) {
+		if cand := idx.candidateOffsets(usable); cand != nil {
 			return cand.ToArray()
 		}
 		return nil
 	}
-	return scanOffsets(w.data, w.used)
+	return scanOffsets(data, used)
 }
 
 // scanOffsets walks a segment's records in [0, used) and returns their offsets.

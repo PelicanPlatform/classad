@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -50,6 +51,15 @@ type archiveSeg struct {
 	seg   *segment
 	recN  int
 	zones map[uint32]zoneRange // interned attr id -> [min,max]
+
+	// A segment recovered from disk loads its sidecar index lazily on first query
+	// access: the sidecar file is mmap'd and the roaring bitmaps are zero-copy views
+	// into it, so a segment queries never touch (e.g. zone-pruned) never pages its
+	// index in. The unmap is registered as seg.onReap, so it fires when the segment's
+	// pins drain (rotation) or at Close. A segment sealed in this process keeps its
+	// in-RAM index (seg.idx set, no sidecar map, sealed=true).
+	sealed bool       // has a persisted sidecar index (vs the active, unindexed segment)
+	idxMu  sync.Mutex // guards the lazy sidecar mmap load
 }
 
 // zoneRange is one attribute's numeric span within a segment (a zone map entry).
@@ -231,6 +241,7 @@ func (a *Archive) sealActiveLocked() error {
 	}
 	idx := buildSegIndex(as.seg.data, as.seg.used, a.codec, a.spec)
 	as.seg.idx.Store(idx)
+	as.sealed = true
 	as.zones = a.computeZones(as.seg.data, as.seg.used)
 	if err := a.writeSidecarIndex(as); err != nil {
 		return err
@@ -336,7 +347,7 @@ func (a *Archive) Rotate(now float64) (int, error) {
 			err = e
 		}
 		if as.seg.retire() { // unpinned now ⇒ reap immediately; else last unpin reaps
-			if e := as.seg.reap(); e != nil && err == nil {
+			if e := as.seg.reapAndHook(); e != nil && err == nil { // reap data + unmap sidecar
 				err = e
 			}
 		}
@@ -389,6 +400,7 @@ func (a *Archive) Close() error {
 		err = e
 	}
 	for _, as := range a.segs {
+		as.seg.runReapHook() // unmap the sidecar index if it was lazily mapped
 		if e := as.seg.unmap(); e != nil && err == nil {
 			err = e
 		}
@@ -410,16 +422,47 @@ func (a *Archive) sortSegsByID() {
 	sort.Slice(a.segs, func(i, j int) bool { return a.segs[i].seg.id < a.segs[j].seg.id })
 }
 
-// decodeAt decodes the record at offset o in data to a *classad.ClassAd.
-func (a *Archive) decodeAt(data []byte, o uint32, buf *[]byte) (*classad.ClassAd, bool) {
-	w, err := a.codec.Decompress((*buf)[:0], recAd(data, o))
-	if err != nil {
+// --- wireCtx: mode-aware wire touchpoints for wire-native matching (interned) ---
+
+func (a *Archive) decodeWire(w []byte) (*ast.ClassAd, error) {
+	return wire.Decode(w, a.intern)
+}
+
+func (a *Archive) wireLookup(ad wire.Ad, name string) ([]byte, bool) {
+	id, ok := a.intern.LookupID(name)
+	if !ok {
 		return nil, false
 	}
-	*buf = w
-	ad, err := wire.Decode(w, a.intern)
-	if err != nil {
-		return nil, false
+	return ad.Lookup(id)
+}
+
+func (a *Archive) decodeNode(node []byte) (ast.Expr, error) {
+	return wire.DecodeNode(node, a.intern)
+}
+
+// ensureIndex returns as's segment index, lazily mmap-loading its sidecar the first
+// time a query needs it. A segment queries never reach (e.g. zone-pruned) never
+// pages its index in; the active (unsealed) segment and a missing/corrupt sidecar
+// yield nil, and the caller full-scans. The sidecar unmap is registered as the
+// segment's reap hook so it fires when the segment's pins drain (rotation) or at
+// Close — never under an in-flight scan.
+func (a *Archive) ensureIndex(as *archiveSeg) *segIndex {
+	if si := as.seg.idx.Load(); si != nil {
+		return si
 	}
-	return classad.FromAST(ad), true
+	if !as.sealed {
+		return nil // active segment: no persisted index
+	}
+	as.idxMu.Lock()
+	defer as.idxMu.Unlock()
+	if si := as.seg.idx.Load(); si != nil {
+		return si
+	}
+	si, _, closer, err := loadSidecar(a.idxPath(as.seg.id))
+	if err != nil {
+		return nil
+	}
+	as.seg.setOnReap(func() { _ = closer() })
+	as.seg.idx.Store(si)
+	return si
 }
