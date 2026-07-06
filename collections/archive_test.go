@@ -372,7 +372,7 @@ func TestArchiveLazyIndexLoad(t *testing.T) {
 	}
 	// Lazy: nothing loaded immediately after Open (restart is O(segments)).
 	for _, as := range b.segs {
-		if as.seg.idx.Load() != nil {
+		if as.idx.Load() != nil {
 			t.Fatalf("segment %d index loaded eagerly at Open", as.seg.id)
 		}
 	}
@@ -387,7 +387,7 @@ func TestArchiveLazyIndexLoad(t *testing.T) {
 	}
 	loaded := 0
 	for _, as := range b.segs {
-		if as.seg.idx.Load() != nil {
+		if as.idx.Load() != nil {
 			loaded++
 		}
 	}
@@ -401,7 +401,7 @@ func TestArchiveLazyIndexLoad(t *testing.T) {
 	}
 	loadedAll := 0
 	for _, as := range b.segs {
-		if as.seg.idx.Load() != nil {
+		if as.idx.Load() != nil {
 			loadedAll++
 		}
 	}
@@ -417,6 +417,56 @@ func mustParseQuery(t *testing.T, qs string) *vm.Query {
 		t.Fatal(err)
 	}
 	return q
+}
+
+// TestArchiveHighCardinalityIndex round-trips a value index whose keys are nearly
+// unique per record (the case the v2 sorted-run sidecar keeps pageable rather than
+// resident) and checks equality + range queries still match brute force after a
+// reopen goes through the mmap view.
+func TestArchiveHighCardinalityIndex(t *testing.T) {
+	dir := t.TempDir()
+	opts := ArchiveOptions{ValueAttrs: []string{"Seq"}, CategoricalAttrs: []string{"GJID"}}
+	opts.Dir = dir
+	opts.SegmentSize = 8 << 10
+	a, err := CreateArchive(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 600; i++ {
+		// Seq and GJID are unique per record -> one posting per value.
+		ad, err := classad.Parse(fmt.Sprintf(`[ ID=%d; Seq=%d; GJID="job.%d.0" ]`, i, i*7, i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+		src[i] = ad
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := OpenArchive(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, qs := range []string{
+		`Seq == 700`,               // value equality (binary search)
+		`Seq >= 700 && Seq < 1400`, // value range (boundary scan)
+		`Seq != 700`,               // value negation
+		`GJID == "job.42.0"`,       // categorical equality on unique key
+		`GJID == "JOB.42.0"`,       // case-insensitive fold
+	} {
+		q, _ := vm.Parse(qs)
+		got := archiveQueryIDs(t, b, qs)
+		want := bruteIDs(src, q)
+		if !equalInts(got, want) {
+			t.Errorf("query %q: got %v want %v", qs, got, want)
+		}
+	}
 }
 
 func TestZoneMayMatch(t *testing.T) {

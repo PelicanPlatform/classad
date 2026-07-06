@@ -196,11 +196,12 @@ func (a *Archive) recoverOrphan(id uint32) error {
 	}
 	seg.used = used
 	as := &archiveSeg{seg: seg, recN: recN, sealed: true}
-	idx := buildSegIndex(seg.data, used, a.codec, a.spec)
-	seg.idx.Store(idx)
 	as.zones = a.computeZones(seg.data, used)
-	if err := a.writeSidecarIndex(as); err != nil {
-		return err
+	if a.spec.any() {
+		idx := buildSegIndex(seg.data, used, a.codec, a.spec)
+		if err := writeSidecarIndex(a.idxPath(id), idx); err != nil {
+			return err
+		}
 	}
 	a.segs = append(a.segs, as)
 	if id >= a.nextID {

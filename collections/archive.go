@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
@@ -19,11 +20,12 @@ import (
 // no per-key delete, and no in-RAM key directory: a segment is sealed once, its
 // index persisted as an immutable sidecar, and dropped as a unit on rotation.
 //
-// See docs/history-archive.md for the design. This is the H1–H4 core: sealed
-// segments with persisted sidecar indexes, a segment catalog with zone maps for
-// whole-segment pruning, O(segments) recovery, newest-first + LIMIT queries, and
-// age/size/count rotation. Indexes are loaded fully into RAM per sealed segment;
-// mmap-paged indexes (H5) are a later optimization.
+// See docs/history-archive.md for the design (H1–H5): sealed segments with
+// persisted sidecar indexes, a segment catalog with zone maps for whole-segment
+// pruning, O(segments) recovery, newest-first + LIMIT queries, and age/size/count
+// rotation. Indexes are never held in RAM: each sealed segment's index is an
+// immutable v2 sidecar, mmap'd and queried in place (binary search / range scan over
+// sorted key runs), loaded lazily on first query and demand-paged (see mmapSegIndex).
 type Archive struct {
 	dir     string
 	segSize int
@@ -45,21 +47,21 @@ type Archive struct {
 }
 
 // archiveSeg is one segment of the log: a reused mmap-backed segment plus the
-// metadata the catalog persists. A sealed segment is immutable; its seg.idx holds
-// the loaded sidecar index and zones holds its per-attribute min/max.
+// metadata the catalog persists. A sealed segment is immutable; idx holds its mmap'd
+// sidecar index view (lazily loaded) and zones holds its per-attribute min/max.
 type archiveSeg struct {
 	seg   *segment
 	recN  int
 	zones map[uint32]zoneRange // interned attr id -> [min,max]
 
-	// A segment recovered from disk loads its sidecar index lazily on first query
-	// access: the sidecar file is mmap'd and the roaring bitmaps are zero-copy views
-	// into it, so a segment queries never touch (e.g. zone-pruned) never pages its
-	// index in. The unmap is registered as seg.onReap, so it fires when the segment's
-	// pins drain (rotation) or at Close. A segment sealed in this process keeps its
-	// in-RAM index (seg.idx set, no sidecar map, sealed=true).
-	sealed bool       // has a persisted sidecar index (vs the active, unindexed segment)
-	idxMu  sync.Mutex // guards the lazy sidecar mmap load
+	// A sealed segment's index is its mmap'd sidecar, loaded lazily on first query
+	// access (idx) — a segment queries never touch (e.g. zone-pruned) never pages its
+	// index in. The archive never retains an in-RAM index: at seal the sidecar is
+	// written and the transient build discarded. The sidecar unmap is registered as
+	// seg.onReap, so it fires when the segment's pins drain (rotation) or at Close.
+	sealed bool                         // has a persisted sidecar (vs the active, unindexed segment)
+	idxMu  sync.Mutex                   // guards the lazy sidecar mmap load
+	idx    atomic.Pointer[mmapSegIndex] // the mmap'd sidecar view, or nil until first use
 }
 
 // zoneRange is one attribute's numeric span within a segment (a zone map entry).
@@ -239,12 +241,15 @@ func (a *Archive) sealActiveLocked() error {
 	if err := as.seg.flush(); err != nil {
 		return err
 	}
-	idx := buildSegIndex(as.seg.data, as.seg.used, a.codec, a.spec)
-	as.seg.idx.Store(idx)
-	as.sealed = true
 	as.zones = a.computeZones(as.seg.data, as.seg.used)
-	if err := a.writeSidecarIndex(as); err != nil {
-		return err
+	as.sealed = true
+	// Build the index transiently, serialize it to the sidecar, and discard it — the
+	// archive holds no in-RAM index; queries mmap the sidecar (see ensureIndex).
+	if a.spec.any() {
+		idx := buildSegIndex(as.seg.data, as.seg.used, a.codec, a.spec)
+		if err := writeSidecarIndex(a.idxPath(as.seg.id), idx); err != nil {
+			return err
+		}
 	}
 	a.segs = append(a.segs, as)
 	a.active = nil
@@ -446,8 +451,8 @@ func (a *Archive) decodeNode(node []byte) (ast.Expr, error) {
 // yield nil, and the caller full-scans. The sidecar unmap is registered as the
 // segment's reap hook so it fires when the segment's pins drain (rotation) or at
 // Close — never under an in-flight scan.
-func (a *Archive) ensureIndex(as *archiveSeg) *segIndex {
-	if si := as.seg.idx.Load(); si != nil {
+func (a *Archive) ensureIndex(as *archiveSeg) *mmapSegIndex {
+	if si := as.idx.Load(); si != nil {
 		return si
 	}
 	if !as.sealed {
@@ -455,14 +460,19 @@ func (a *Archive) ensureIndex(as *archiveSeg) *segIndex {
 	}
 	as.idxMu.Lock()
 	defer as.idxMu.Unlock()
-	if si := as.seg.idx.Load(); si != nil {
+	if si := as.idx.Load(); si != nil {
 		return si
 	}
-	si, _, closer, err := loadSidecar(a.idxPath(as.seg.id))
+	data, closer, err := mapFile(a.idxPath(as.seg.id))
 	if err != nil {
+		return nil // no sidecar (e.g. no indexes configured) ⇒ full scan
+	}
+	si, err := parseMmapSidecar(data)
+	if err != nil {
+		_ = closer()
 		return nil
 	}
 	as.seg.setOnReap(func() { _ = closer() })
-	as.seg.idx.Store(si)
+	as.idx.Store(si)
 	return si
 }

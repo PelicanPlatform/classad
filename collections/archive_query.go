@@ -119,7 +119,7 @@ func (a *Archive) snapshotWindows() []archiveWindow {
 // candidateOffsets returns the ascending record offsets in a window to re-verify: the
 // index-narrowed set when the segment has a covering index and usable probes,
 // otherwise every record (full scan).
-func candidateOffsets(idx *segIndex, data []byte, used int, usable []usableProbe) []uint32 {
+func candidateOffsets(idx *mmapSegIndex, data []byte, used int, usable []usableProbe) []uint32 {
 	if len(usable) > 0 && idx != nil && idx.covers(usable) {
 		if cand := idx.candidateOffsets(usable); cand != nil {
 			return cand.ToArray()

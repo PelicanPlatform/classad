@@ -9,11 +9,14 @@
 > Delivered: append/seal/roll-over with immutable roaring sidecar indexes; segment
 > catalog + zone maps with whole-segment pruning; O(segments) + CRC crash recovery;
 > zone-prune → index → wire-native reverify queries, newest-first with LIMIT;
-> age/size/count rotation via retire/reap. H5 sidecar indexes are **lazily mmap'd**
-> (zero-copy roaring `FromBuffer`), so a segment queries never touch never pages its
-> index in. Deferred: a fully-paged key-map (today per-value key maps are resident,
-> only bitmap payloads are demand-paged). A GlobalJobId point index was intentionally
-> skipped — cluster.proc queries are served by the normal ClusterId/ProcId index.
+> age/size/count rotation via retire/reap. H5 sidecar indexes are a **fully
+> demand-paged** v2 format: each attribute's postings are a sorted key run queried
+> directly over the mmap — binary search for equality, boundary scan for range — so
+> resident memory is O(#indexed attributes) regardless of value cardinality (keys,
+> offset arrays, and roaring payloads all stay in the mapping; see `mmapSegIndex`).
+> Indexes load lazily, so a segment queries never touch never pages its index in. A
+> GlobalJobId point index was intentionally skipped — cluster.proc queries are served
+> by the normal ClusterId/ProcId index.
 
 ## 1. Context
 
@@ -151,18 +154,30 @@ Two archive-specific additions:
   archive iterator must thread a remaining-count and honor consumer stop (the
   `yield`-returns-false path already exists).
 
-### 4.5 Pageable indices (the > RAM case)
+### 4.5 Pageable indices (the > RAM case) — delivered
 
-A high-cardinality attribute (e.g. `GlobalJobId`) costs ~2–4 bytes/doc in roaring;
-at 10⁹ ads that is multiple GB **per indexed attribute** — the index itself exceeds
-RAM. Therefore:
+A high-cardinality attribute (e.g. `GlobalJobId`) costs ~2–4 bytes/doc in roaring
+*payload*, but the per-value lookup structure (map key + bitmap header per distinct
+value) is ~100+ bytes/value on the Go heap — so a naive index materialized into maps
+exceeds RAM well before the payloads do. The archive therefore does **not**
+materialize any map. As implemented (`mmapSegIndex`):
 
-- Serialize each `segIndex` with roaring's **portable/frozen** format and **`mmap`**
-  it, so the OS pages in only the postings a query touches.
-- Keep resident only the bounded structures: the catalog and zone maps.
-- The existing `segment.pin/unpin` + `releaseWindows` epoch machinery already
-  guards mapped bytes against teardown under a live scan — extend the same pinning
-  to sidecar-index mappings so rotation can `munmap`+`unlink` an index safely.
+- The v2 sidecar stores each attribute's postings as a **sorted key run** (a sorted
+  `[]string`/`[]float64` + a parallel bitmap-offset array), written once at seal.
+- Queries read it **directly over the mmap**: equality is a binary search, range is a
+  boundary search plus a scan of only the matching keys. Roaring bitmaps are built
+  lazily via zero-copy `FromBuffer` for just the postings a probe touches.
+- Resident memory is therefore **O(#indexed attributes)** — one small directory entry
+  per attribute — regardless of value cardinality. Keys, offset arrays, and payloads
+  all stay in the demand-paged mapping. The catalog + zone maps remain the only always-
+  resident structures.
+- Indexes load **lazily** on first query, so a zone-pruned segment never maps its
+  index. The mmap is unmapped through a `segment.onReap` hook, tied to the existing
+  `pin/unpin/retire/reap` epoch machinery, so rotation `munmap`+`unlink`s an index
+  only after any in-flight scan drops its pin — never a torn read.
+
+This is Option A: a **separate** `mmapSegIndex` view for the immutable archive; the
+live `Collection`'s mutable in-RAM `segIndex` (rebuilt by `Reindex`) is unchanged.
 
 ### 4.6 Rotation & retention
 
