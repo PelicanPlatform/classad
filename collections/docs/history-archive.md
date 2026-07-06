@@ -1,10 +1,19 @@
 # Design: the ClassAd history / archive store
 
-> Status: **proposal** (no code yet). Depends on the mmap segment backend + epoch
-> reclamation that has already landed (`mmapseg.go`, `segment.pin/unpin/retire/reap`,
+> Status: **implemented (H1–H5)** in `collections/archive*.go`. Built on the mmap
+> segment backend + epoch reclamation (`mmapseg.go`, `segment.pin/unpin/retire/reap`,
 > `shard.snapshot`/`releaseWindows`). Companion to the in-memory `collections` store
 > and the persistent-`Collection` effort; this document explains why the archive is
 > a *sibling* store on the same engine rather than a mode of `Collection`.
+>
+> Delivered: append/seal/roll-over with immutable roaring sidecar indexes; segment
+> catalog + zone maps with whole-segment pruning; O(segments) + CRC crash recovery;
+> zone-prune → index → wire-native reverify queries, newest-first with LIMIT;
+> age/size/count rotation via retire/reap. H5 sidecar indexes are **lazily mmap'd**
+> (zero-copy roaring `FromBuffer`), so a segment queries never touch never pages its
+> index in. Deferred: a fully-paged key-map (today per-value key maps are resident,
+> only bitmap payloads are demand-paged). A GlobalJobId point index was intentionally
+> skipped — cluster.proc queries are served by the normal ClusterId/ProcId index.
 
 ## 1. Context
 
