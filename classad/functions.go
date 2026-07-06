@@ -142,9 +142,9 @@ func coerceToReal(v Value) (float64, bool) {
 	case IntegerValue:
 		return float64(v.intVal), true
 	case RealValue:
-		return v.realVal, true
+		return v.real(), true
 	case BooleanValue:
-		if v.boolVal {
+		if v.intVal != 0 {
 			return 1, true
 		}
 		return 0, true
@@ -246,10 +246,10 @@ func unparseValueNested(v Value) (string, bool) {
 // built programmatically (e.g. by split()) has no source expressions, so its
 // already-evaluated element values are unparsed instead.
 func unparseList(v Value) (string, bool) {
-	if v.listExprs != nil {
+	if v.list.exprs != nil {
 		var b strings.Builder
 		b.WriteString("{ ")
-		for i, e := range v.listExprs {
+		for i, e := range v.list.exprs {
 			if i > 0 {
 				b.WriteByte(',')
 			}
