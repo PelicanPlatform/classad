@@ -96,30 +96,65 @@ func AppendQuoteString(dst []byte, s string) []byte {
 		return append(dst, '"')
 	}
 	for _, r := range s {
-		switch r {
-		case '"':
-			dst = append(dst, '\\', '"')
-		case '\\':
-			dst = append(dst, '\\', '\\')
-		case '\b':
-			dst = append(dst, '\\', 'b')
-		case '\f':
-			dst = append(dst, '\\', 'f')
-		case '\n':
-			dst = append(dst, '\\', 'n')
-		case '\r':
-			dst = append(dst, '\\', 'r')
-		case '\t':
-			dst = append(dst, '\\', 't')
-		default:
-			if r < 0x20 {
-				dst = append(dst, fmt.Sprintf("\\%03o", r)...)
-			} else {
-				dst = utf8.AppendRune(dst, r)
-			}
-		}
+		dst = appendEscapedRune(dst, r)
 	}
 	return append(dst, '"')
+}
+
+// AppendQuoteStringBytes is AppendQuoteString for a value that already lives in a
+// byte slice (e.g. a string literal's bytes inside a wire buffer): it quotes s
+// without first copying it into a Go string, producing output identical to
+// AppendQuoteString(dst, string(s)). The common no-escape case is a plain byte
+// copy; the escape path iterates runes via `range string(s)`, which the compiler
+// lowers without allocating a string.
+func AppendQuoteStringBytes(dst, s []byte) []byte {
+	dst = append(dst, '"')
+	if !bytesNeedEscape(s) {
+		dst = append(dst, s...)
+		return append(dst, '"')
+	}
+	for _, r := range string(s) {
+		dst = appendEscapedRune(dst, r)
+	}
+	return append(dst, '"')
+}
+
+// appendEscapedRune appends one rune of a string value using only the escapes the
+// lexer decodes (\b \f \n \r \t \\ \"), octal (\NNN) for other control characters,
+// and the rune verbatim otherwise. Shared by the string and []byte quoters.
+func appendEscapedRune(dst []byte, r rune) []byte {
+	switch r {
+	case '"':
+		return append(dst, '\\', '"')
+	case '\\':
+		return append(dst, '\\', '\\')
+	case '\b':
+		return append(dst, '\\', 'b')
+	case '\f':
+		return append(dst, '\\', 'f')
+	case '\n':
+		return append(dst, '\\', 'n')
+	case '\r':
+		return append(dst, '\\', 'r')
+	case '\t':
+		return append(dst, '\\', 't')
+	default:
+		if r < 0x20 {
+			return append(dst, fmt.Sprintf("\\%03o", r)...)
+		}
+		return utf8.AppendRune(dst, r)
+	}
+}
+
+// bytesNeedEscape is stringNeedsEscape for a byte slice (a quote, a backslash, or
+// a control byte < 0x20; bytes of a multi-byte UTF-8 rune are all >= 0x20).
+func bytesNeedEscape(s []byte) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == '"' || c == '\\' {
+			return true
+		}
+	}
+	return false
 }
 
 // AppendQuoteAttributeName appends QuoteAttributeName(name) to dst and returns the

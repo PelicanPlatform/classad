@@ -28,6 +28,24 @@ type Literal struct {
 	Str  string
 }
 
+// StringLiteralValue returns the raw value bytes of a string-literal node as a
+// subslice of node (no copy), with ok=true, or (nil, false) if node is not a
+// string literal. The returned bytes alias node and are valid only while node is.
+// It lets a caller quote a string value straight from the wire (via
+// ast.AppendQuoteStringBytes) without the string allocation LiteralValue's Str
+// field would incur.
+func StringLiteralValue(node []byte) ([]byte, bool) {
+	if len(node) == 0 || node[0] != nString {
+		return nil, false
+	}
+	l, n := binary.Uvarint(node[1:])
+	if n <= 0 || uint64(len(node)-1-n) < l {
+		return nil, false
+	}
+	start := 1 + n
+	return node[start : start+int(l)], true
+}
+
 // LiteralValue decodes node as a scalar literal, returning (lit, true) if node is
 // one, or (_, false) if it is a list, record, or computed expression (which must
 // be decoded via DecodeNode and evaluated). It is allocation-free except for the

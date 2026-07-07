@@ -429,16 +429,28 @@ func (d *decoder) uint64() (uint64, error) {
 }
 
 func (d *decoder) readString() (string, error) {
-	n, err := d.uvarint()
+	b, err := d.readStringBytes()
 	if err != nil {
 		return "", err
 	}
-	if n > uint64(len(d.b)-d.pos) {
-		return "", fmt.Errorf("%w: string length %d exceeds remaining input", ErrMalformed, n)
+	return string(b), nil
+}
+
+// readStringBytes reads a uvarint-length-prefixed string as a subslice of the
+// decoder's buffer (no allocation). The bytes alias d.b, so a caller that needs to
+// retain them past the next mutation must copy. Used by the append-based renderer,
+// which consumes each string immediately.
+func (d *decoder) readStringBytes() ([]byte, error) {
+	n, err := d.uvarint()
+	if err != nil {
+		return nil, err
 	}
-	s := string(d.b[d.pos : d.pos+int(n)])
+	if n > uint64(len(d.b)-d.pos) {
+		return nil, fmt.Errorf("%w: string length %d exceeds remaining input", ErrMalformed, n)
+	}
+	b := d.b[d.pos : d.pos+int(n)]
 	d.pos += int(n)
-	return s, nil
+	return b, nil
 }
 
 // checkCount rejects element/argument counts larger than the remaining bytes,

@@ -181,6 +181,11 @@ func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int) (out
 // matching ast.Expr.String(). Literals are appended directly (no intermediate
 // string allocation); computed expressions decode to an ast.Expr and render.
 func appendWireValue(dst, node []byte, table *wire.InternTable) ([]byte, error) {
+	// String literals are the most common non-numeric attribute value; quote their
+	// bytes straight from the wire (no string copy) before the general literal path.
+	if s, ok := wire.StringLiteralValue(node); ok {
+		return ast.AppendQuoteStringBytes(dst, s), nil
+	}
 	if lit, ok := wire.LiteralValue(node); ok {
 		switch lit.Kind {
 		case wire.LitInt:

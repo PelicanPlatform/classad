@@ -59,11 +59,11 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 		}
 		return strconv.AppendFloat(dst, math.Float64frombits(bits), 'g', -1, 64), nil
 	case nString:
-		s, err := d.readString()
+		s, err := d.readStringBytes()
 		if err != nil {
 			return dst, err
 		}
-		return ast.AppendQuoteString(dst, s), nil
+		return ast.AppendQuoteStringBytes(dst, s), nil
 	case nAttrRef, nAttrRefStr:
 		scope, err := d.byteAt()
 		if err != nil {
