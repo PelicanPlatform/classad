@@ -10,12 +10,15 @@ import (
 )
 
 // RawAd is a query result rendered as old-ClassAd wire parts -- the "Name = Value"
-// expression strings plus MyType/TargetType -- decoded straight from the stored
-// form with no ast/classad ClassAd. A collector can hand these to
-// message.PutClassAdRaw to stream a result set without ever building an AST. The
-// Exprs slice is freshly allocated per ad; the strings do not alias scan buffers.
+// expression byte slices plus MyType/TargetType -- decoded straight from the stored
+// form with no ast/classad ClassAd. A collector can hand Exprs to
+// message.PutClassAdRawBytes to stream a result set without ever building an AST.
+//
+// Exprs (and their backing bytes) alias a buffer reused across the iteration, so a
+// consumer must finish with one RawAd -- e.g. write it to the wire -- before
+// advancing the iterator to the next.
 type RawAd struct {
-	Exprs      []string
+	Exprs      [][]byte
 	MyType     string
 	TargetType string
 }
@@ -74,15 +77,26 @@ func (c *Collection) ScanRaw() iter.Seq[RawAd] {
 	}
 }
 
-// yieldRaw is the scan emit callback for the raw path: format the decompressed
-// wire bytes straight to old-ClassAd text and yield them.
+// yieldRaw is the scan emit callback for the raw path: render the decompressed
+// wire bytes straight to old-ClassAd text and yield them. The buf/offs/exprs
+// scratch is reused across the whole scan (single-threaded), so no per-ad
+// expression bytes are allocated.
 func (c *Collection) yieldRaw(yield func(RawAd) bool) func(w []byte) bool {
+	var buf []byte
+	var offs []int
+	var exprs [][]byte
 	return func(w []byte) bool {
-		exprs, myType, targetType, ok := c.formatWireAd(w)
+		var mt, tt string
+		var ok bool
+		buf, offs, mt, tt, ok = c.appendWireAd(w, buf, offs)
 		if !ok {
 			return true // undecodable record: skip, keep scanning
 		}
-		return yield(RawAd{Exprs: exprs, MyType: myType, TargetType: targetType})
+		exprs = exprs[:0]
+		for i := 0; i+1 < len(offs); i++ {
+			exprs = append(exprs, buf[offs[i]:offs[i+1]])
+		}
+		return yield(RawAd{Exprs: exprs, MyType: mt, TargetType: tt})
 	}
 }
 
@@ -104,16 +118,30 @@ func (c *Collection) decodeAdRaw(stored []byte, codec Codec, dst []byte) (exprs 
 	if err != nil {
 		return nil, "", "", false
 	}
-	return c.formatWireAd(wireBytes)
-}
-
-// formatWireAd renders already-decompressed wire bytes to old-ClassAd expression
-// strings + MyType/TargetType, with no AST (see decodeAdRaw). It is the emit-side
-// worker shared by decodeAdRaw and the QueryRaw/ScanRaw scan path.
-func (c *Collection) formatWireAd(wireBytes []byte) (exprs []string, myType, targetType string, ok bool) {
-	if c.inline {
+	buf, offs, mt, tt, ok := c.appendWireAd(wireBytes, nil, nil)
+	if !ok {
 		return nil, "", "", false
 	}
+	exprs = make([]string, 0, len(offs)-1)
+	for i := 0; i+1 < len(offs); i++ {
+		exprs = append(exprs, string(buf[offs[i]:offs[i+1]]))
+	}
+	return exprs, mt, tt, true
+}
+
+// appendWireAd renders already-decompressed wire bytes to old-ClassAd expression
+// text with no AST: each "Name = Value" is appended into buf (reset to [:0] and
+// grown as needed), and offs records the boundaries so expression i is
+// buf[offs[i]:offs[i+1]]. MyType/TargetType are returned separately (they are sent
+// as trailing fields, not numbered expressions). Passing the previous ad's buf/offs
+// reuses their backing, so a streaming scan allocates no per-ad expression strings.
+// Returns ok=false for inline-name ads (no intern table).
+func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int) (outBuf []byte, outOffs []int, myType, targetType string, ok bool) {
+	if c.inline {
+		return buf, offs, "", "", false
+	}
+	buf = buf[:0]
+	offs = append(offs[:0], 0)
 	ad := wire.Ad(wireBytes)
 	good := true
 	ad.ForEach(func(id uint32, node []byte) bool {
@@ -122,8 +150,6 @@ func (c *Collection) formatWireAd(wireBytes []byte) (exprs []string, myType, tar
 			good = false
 			return false
 		}
-		// MyType/TargetType are sent as the two trailing string fields, not as
-		// numbered expressions -- carry their raw string value out separately.
 		if name == "MyType" || name == "TargetType" {
 			if lit, lok := wire.LiteralValue(node); lok && lit.Kind == wire.LitString {
 				if name == "MyType" {
@@ -134,46 +160,49 @@ func (c *Collection) formatWireAd(wireBytes []byte) (exprs []string, myType, tar
 				return true
 			}
 		}
-		val, verr := formatWireValue(node, c.intern)
-		if verr != nil {
+		buf = append(buf, name...)
+		buf = append(buf, ' ', '=', ' ')
+		var aerr error
+		buf, aerr = appendWireValue(buf, node, c.intern)
+		if aerr != nil {
 			good = false
 			return false
 		}
-		exprs = append(exprs, name+" = "+val)
+		offs = append(offs, len(buf))
 		return true
 	})
 	if !good {
-		return nil, "", "", false
+		return buf, offs, "", "", false
 	}
-	return exprs, myType, targetType, true
+	return buf, offs, myType, targetType, true
 }
 
-// formatWireValue renders a wire node to canonical ClassAd value text, matching
-// ast.Expr.String(). Literals are formatted directly (allocation-light); computed
-// expressions are decoded to an ast.Expr and rendered.
-func formatWireValue(node []byte, table *wire.InternTable) (string, error) {
+// appendWireValue appends a wire node's canonical ClassAd value text to dst,
+// matching ast.Expr.String(). Literals are appended directly (no intermediate
+// string allocation); computed expressions decode to an ast.Expr and render.
+func appendWireValue(dst, node []byte, table *wire.InternTable) ([]byte, error) {
 	if lit, ok := wire.LiteralValue(node); ok {
 		switch lit.Kind {
 		case wire.LitInt:
-			return strconv.FormatInt(lit.Int, 10), nil
+			return strconv.AppendInt(dst, lit.Int, 10), nil
 		case wire.LitReal:
-			return strconv.FormatFloat(lit.Real, 'g', -1, 64), nil
+			return strconv.AppendFloat(dst, lit.Real, 'g', -1, 64), nil
 		case wire.LitString:
-			return ast.QuoteString(lit.Str), nil
+			return ast.AppendQuoteString(dst, lit.Str), nil
 		case wire.LitBool:
 			if lit.Bool {
-				return "true", nil
+				return append(dst, "true"...), nil
 			}
-			return "false", nil
+			return append(dst, "false"...), nil
 		case wire.LitUndef:
-			return "undefined", nil
+			return append(dst, "undefined"...), nil
 		case wire.LitError:
-			return "error", nil
+			return append(dst, "error"...), nil
 		}
 	}
 	e, err := wire.DecodeNode(node, table)
 	if err != nil {
-		return "", err
+		return dst, err
 	}
-	return e.String(), nil
+	return append(dst, e.String()...), nil
 }
