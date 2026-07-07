@@ -50,11 +50,17 @@ type Options struct {
 	// under this directory and committed writes are flushed to disk (see Open).
 	// Empty ⇒ in-memory (the default). Unix-only.
 	Dir string
-	// QueryParallelism, if >= 2, lets a large full-scan Query fan out across the
-	// collection's segments using up to this many worker goroutines (capped by
-	// GOMAXPROCS and by a collection-wide worker budget shared across concurrent
-	// queries). 0 or 1 ⇒ serial (the default). Small scans and indexed queries run
-	// serial regardless. See parallel_scan.go / docs/PARALLEL_QUERY.md.
+	// QueryParallelism controls cross-segment fan-out for large full-scan queries:
+	//   0 (default) ⇒ auto — the library picks the policy (currently: up to
+	//                 GOMAXPROCS workers per query). The meaning of auto may change
+	//                 across releases.
+	//   1           ⇒ serial (never fan out).
+	//   N ≥ 2       ⇒ fan out with up to N workers per query.
+	// In every non-serial case fan-out is still gated by a work-size threshold, never
+	// exceeds the segment count, and draws from a machine-wide worker budget shared
+	// across concurrent queries (so it degrades to serial under load rather than
+	// oversubscribing). Small scans and indexed queries run serial regardless.
+	// See parallel_scan.go / docs/PARALLEL_QUERY.md.
 	QueryParallelism int
 }
 
@@ -172,15 +178,31 @@ func New(opts Options) *Collection {
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
 	c.parallelMinBytes = defaultParallelMinBytes
-	if opts.QueryParallelism >= 2 {
-		c.queryPar = opts.QueryParallelism
-		budget := runtime.GOMAXPROCS(0)
-		if c.queryPar < budget {
-			budget = c.queryPar
-		}
-		c.qsem = make(chan struct{}, budget) // collection-wide worker budget
+	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
+	if c.queryPar >= 2 {
+		// Machine-wide worker budget: bounds total scan goroutines across all
+		// concurrent queries so per-query fan-out never oversubscribes the cores.
+		c.qsem = make(chan struct{}, runtime.GOMAXPROCS(0))
 	}
 	return c
+}
+
+// resolveQueryParallelism turns the Options knob into the per-query worker cap.
+// 0 (or negative) means "auto": the library's current default policy, which may
+// change over releases. 1 forces serial; N>=2 is an explicit cap.
+func resolveQueryParallelism(opt int) int {
+	switch {
+	case opt == 1:
+		return 1 // serial (explicit)
+	case opt >= 2:
+		return opt // explicit per-query cap
+	default:
+		// Auto. Today: use up to all cores (fan-out is still gated by a work-size
+		// threshold, capped at the segment count, and shared via the worker budget,
+		// so this degrades to serial under concurrent-query load). GOMAXPROCS==1
+		// naturally yields serial.
+		return runtime.GOMAXPROCS(0)
+	}
 }
 
 // Update applies a batch of inserts/updates and returns only once every ad is

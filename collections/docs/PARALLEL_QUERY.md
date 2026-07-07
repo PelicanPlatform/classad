@@ -1,10 +1,12 @@
 # Parallel query execution (across segments)
 
-> Status: **implemented (opt-in)** in `parallel_scan.go`. A full-scan `Query` can
-> fan out across the collection's segments using a bounded worker pool, gated by a
-> work-size threshold and a global concurrency cap. Off by default
-> (`Options.QueryParallelism = 0`); serial and parallel produce identical result
-> sets. Indexed queries and `QueryRaw` remain serial for now (see Limitations).
+> Status: **implemented** in `parallel_scan.go`. A full-scan `Query` can fan out
+> across the collection's segments using a bounded worker pool, gated by a work-size
+> threshold and a machine-wide worker budget. `Options.QueryParallelism = 0` (the
+> default) means **auto** — the library picks the policy (currently: up to GOMAXPROCS
+> workers per query); `1` forces serial; `N ≥ 2` caps workers per query. Serial and
+> parallel produce identical result sets. Indexed queries and `QueryRaw` remain serial
+> for now (see Limitations).
 
 ## Why it is safe (and cheap)
 
@@ -53,23 +55,49 @@ never block writers.
 
 ## When it engages
 
-Parallelism is **opt-in and gated**, because for cheap queries on small collections
-the fixed cost (snapshotting all shards, spinning up workers, channel setup) exceeds
-the scan:
+Fan-out is **gated**, because for cheap queries on small collections the fixed cost
+(snapshotting all shards, spinning up workers, channel setup) exceeds the scan:
 
-- `Options.QueryParallelism` must be ≥ 2 (0/1 ⇒ always serial).
+- `Options.QueryParallelism` ≠ 1 (0 ⇒ auto, N ≥ 2 ⇒ explicit cap; 1 ⇒ always serial).
 - The scan must be large enough: total live segment bytes ≥ a threshold
   (`parallelMinBytes`, benchmark-tuned).
 - There must be at least two segments to split.
 
-**Global concurrency cap.** Intra-query parallelism helps the *latency* of one query
-and helps throughput only when query concurrency is *low* — a store already fielding
-many concurrent queries saturates its cores without it, and the coordination would
-then be pure loss. So a Collection-wide semaphore (size `GOMAXPROCS`) bounds total
-scan workers across all in-flight queries: a worker count is acquired with a
-**non-blocking** try, and if fewer than two tokens are free the query simply runs
-**serial**. Net effect: one big query alone gets all cores; many concurrent queries
-each fall back to serial rather than oversubscribing.
+**Machine-wide worker budget.** Intra-query parallelism helps the *latency* of one
+query and helps throughput only when query concurrency is *low* — a store already
+fielding many concurrent queries saturates its cores without it, and the coordination
+would then be pure loss. So a Collection-wide semaphore (size `GOMAXPROCS`) bounds
+total scan workers across all in-flight queries: each query takes whatever tokens are
+free with a **non-blocking greedy** try, and if it cannot get at least two it runs
+**serial**. Net effect: one big query alone gets all cores; as concurrency rises the
+budget is spoken for and queries fall back to serial rather than oversubscribing.
+
+## Contention: what oversubscription actually does
+
+`BenchmarkQueryContention` runs `GOMAXPROCS` concurrent queries (the saturation
+regime) and varies workers-per-query, with the budget on (real) and off (each query
+gets its full worker count). On a 12-core box, decode-heavy query, aggregate
+throughput:
+
+| workers/query | budget on | budget off |
+|---------------|----------:|-----------:|
+| 1 (serial)    | **53 q/s** (baseline) | — |
+| 2             | 46 q/s | 41 q/s |
+| 4             | 49 q/s | 45 q/s |
+| 8             | 47 q/s | 42 q/s |
+
+Reading it: when the queries alone already fill every core, fan-out **cannot** raise
+throughput — 12 serial queries is the ceiling (53 q/s). Adding workers **degrades
+gracefully** to ~45–49 q/s (≈10–15% off) — it never collapses, even with the budget
+off and up to `12 × 8 = 96` worker goroutines contending (Go's scheduler is
+work-conserving). The budget is worth keeping: `budget on` beats `budget off` at every
+level, i.e. it measurably softens the oversubscription penalty.
+
+The practical consequence for `auto`: fan-out is a large **latency** win at low
+concurrency (up to 8× above) and a small **throughput** cost at saturation. The budget
+keeps that cost bounded and graceful; a future auto policy could drive it to zero by
+also declining to fan out when it observes many queries already in flight (the
+semantics of `auto` are deliberately free to change — see the Status note).
 
 ## Correctness
 

@@ -73,7 +73,10 @@ func forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []byte, codec Codec
 }
 
 // tryAcquire takes up to n tokens from the worker budget without blocking, returning
-// how many it got (0..n). The taken tokens must be released by the caller.
+// how many it got (0..n). The taken tokens must be released by the caller. It is
+// greedy (grab whatever is free) rather than all-or-nothing: under concurrent-query
+// load the budget is mostly spoken for, so a query naturally gets few workers (or
+// falls to serial), which the contention benchmark shows degrades gracefully.
 func tryAcquire(sem chan struct{}, n int) int {
 	got := 0
 	for got < n {

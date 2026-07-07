@@ -2,7 +2,10 @@ package collections
 
 import (
 	"fmt"
+	"runtime"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -80,5 +83,59 @@ func BenchmarkParallelQuery(b *testing.B) {
 				})
 			}
 		}
+	}
+}
+
+// BenchmarkQueryContention measures aggregate throughput when the number of
+// concurrent queries equals the core count -- the regime where per-query fan-out
+// competes with inter-query concurrency. It contrasts the real machine-wide worker
+// budget ("budget=on") with an unbounded one ("budget=off", each query gets its full
+// worker count) so the effect of oversubscription is visible: does throughput
+// plateau, degrade gracefully, or collapse as workers-per-query grows?
+//
+//	go test -run '^$' -bench BenchmarkQueryContention -benchtime 2s .
+func BenchmarkQueryContention(b *testing.B) {
+	sample := loadCorpus(b)
+	q := mustQuery(b, `Cpus >= 8`) // ~half match: real per-query decode work (CPU-bound)
+	clients := runtime.GOMAXPROCS(0)
+
+	mkColl := func(par int, budgeted bool) *Collection {
+		c := New(Options{Shards: 8, SegmentSize: 1 << 14, QueryParallelism: par})
+		if par >= 2 {
+			c.parallelMinBytes = 0 // force fan-out
+			if !budgeted {
+				c.qsem = make(chan struct{}, clients*par) // non-binding: full fan-out per query
+			}
+		}
+		populateInto(b, c, sample, 20000)
+		return c
+	}
+	run := func(name string, c *Collection) {
+		b.Run(name, func(b *testing.B) {
+			b.ResetTimer()
+			var next int64
+			var wg sync.WaitGroup
+			for w := 0; w < clients; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for atomic.AddInt64(&next, 1) <= int64(b.N) {
+						for range c.Query(q) {
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			b.StopTimer()
+			b.ReportMetric(float64(b.N)/b.Elapsed().Seconds(), "queries/s")
+		})
+	}
+
+	// Baseline: every one of the `clients` queries runs serial (one core each) -- the
+	// cores are already fully utilized, so this is the throughput to beat.
+	run(fmt.Sprintf("clients=%d/par=1", clients), mkColl(1, true))
+	for _, par := range []int{2, 4, 8} {
+		run(fmt.Sprintf("clients=%d/budget=on/par=%d", clients, par), mkColl(par, true))
+		run(fmt.Sprintf("clients=%d/budget=off/par=%d", clients, par), mkColl(par, false))
 	}
 }

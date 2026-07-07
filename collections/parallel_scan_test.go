@@ -52,7 +52,7 @@ func queryIDSet(t *testing.T, c *Collection, q *vm.Query) ([]int, bool) {
 func TestParallelQueryMatchesSerial(t *testing.T) {
 	t.Parallel()
 	const n = 4000
-	serial := New(Options{Shards: 4})
+	serial := New(Options{Shards: 4, QueryParallelism: 1})
 	par := New(Options{Shards: 4, SegmentSize: 1 << 12, QueryParallelism: 8})
 	par.parallelMinBytes = 0 // force fan-out even for a small corpus
 	fillParallelCorpus(t, serial, n)
@@ -129,7 +129,7 @@ func TestParallelQueryConcurrent(t *testing.T) {
 	par.parallelMinBytes = 0
 	fillParallelCorpus(t, par, n)
 
-	serial := New(Options{Shards: 4})
+	serial := New(Options{Shards: 4, QueryParallelism: 1})
 	fillParallelCorpus(t, serial, n)
 	q, _ := vm.Parse(`Cpus >= 8 && Owner == "alice"`)
 	want, _ := queryIDSet(t, serial, q)
