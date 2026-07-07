@@ -2,6 +2,7 @@ package collections
 
 import (
 	"iter"
+	"runtime"
 	"strings"
 	"sync/atomic"
 
@@ -49,6 +50,12 @@ type Options struct {
 	// under this directory and committed writes are flushed to disk (see Open).
 	// Empty ⇒ in-memory (the default). Unix-only.
 	Dir string
+	// QueryParallelism, if >= 2, lets a large full-scan Query fan out across the
+	// collection's segments using up to this many worker goroutines (capped by
+	// GOMAXPROCS and by a collection-wide worker budget shared across concurrent
+	// queries). 0 or 1 ⇒ serial (the default). Small scans and indexed queries run
+	// serial regardless. See parallel_scan.go / docs/PARALLEL_QUERY.md.
+	QueryParallelism int
 }
 
 // AdUpdate is one insert-or-update in a batch.
@@ -82,6 +89,14 @@ type Collection struct {
 	dicts *dictReg
 
 	demand *demandTracker // per-attribute query demand, for SuggestIndexes
+
+	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
+	// (0/1 ⇒ serial). qsem is a collection-wide token pool bounding total scan
+	// workers across concurrent queries; nil when parallelism is disabled.
+	// parallelMinBytes gates fan-out to scans large enough to amortize it.
+	queryPar         int
+	qsem             chan struct{}
+	parallelMinBytes int
 }
 
 // writeError returns the first sticky segment-allocation error across shards
@@ -156,6 +171,15 @@ func New(opts Options) *Collection {
 		c.hotSet.Store(&hotSetHolder{set})
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
+	c.parallelMinBytes = defaultParallelMinBytes
+	if opts.QueryParallelism >= 2 {
+		c.queryPar = opts.QueryParallelism
+		budget := runtime.GOMAXPROCS(0)
+		if c.queryPar < budget {
+			budget = c.queryPar
+		}
+		c.qsem = make(chan struct{}, budget) // collection-wide worker budget
+	}
 	return c
 }
 
@@ -291,6 +315,12 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 		probes := q.Probes()
 		c.demand.record(probes)
 		usable := c.planIndex(probes)
+		// A large full-scan query (no index) can fan out across segments; the helper
+		// falls back to a serial scan of the same snapshot when it is not worthwhile.
+		if c.queryPar > 1 && len(usable) == 0 {
+			c.runParallelQuery(q, yield)
+			return
+		}
 		emit := c.yieldAd(yield)
 		for _, sh := range c.shards {
 			var cont bool
