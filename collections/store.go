@@ -244,8 +244,9 @@ func (c *Collection) Len() int {
 func (c *Collection) Scan() iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
 		q := queryPlan{}
+		emit := c.yieldAd(yield)
 		for _, sh := range c.shards {
-			if !c.scanShard(sh, q, yield) {
+			if !c.scanShard(sh, q, emit) {
 				return
 			}
 		}
@@ -290,12 +291,13 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 		probes := q.Probes()
 		c.demand.record(probes)
 		usable := c.planIndex(probes)
+		emit := c.yieldAd(yield)
 		for _, sh := range c.shards {
 			var cont bool
 			if len(usable) > 0 {
-				cont = c.scanShardIndexed(sh, usable, qp, yield)
+				cont = c.scanShardIndexed(sh, usable, qp, emit)
 			} else {
-				cont = c.scanShard(sh, qp, yield)
+				cont = c.scanShard(sh, qp, emit)
 			}
 			if !cont {
 				return
@@ -308,7 +310,12 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 // each ad is match-tested (wire-native, partial decode, or full decode) and only
 // matching ads are fully decoded and yielded. Returns false if the consumer
 // stopped iteration.
-func (c *Collection) scanShard(sh *shard, qp queryPlan, yield func(*classad.ClassAd) bool) bool {
+// scanShard visits every matching visible record in a shard and passes its
+// decompressed wire bytes w to emit; emit returns false to stop the whole scan.
+// Decoding w (to a *classad.ClassAd, or straight to wire text for QueryRaw) is the
+// caller's job, so one scan path serves both Query and QueryRaw. w aliases a
+// reused buffer -- emit must not retain it.
+func (c *Collection) scanShard(sh *shard, qp queryPlan, emit func(w []byte) bool) bool {
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	cont := true
@@ -322,17 +329,25 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, yield func(*classad.Clas
 		if qp.q != nil && !matchWire(w, qp) {
 			return true
 		}
-		a, err := c.decodeWire(w)
-		if err != nil {
-			return true
-		}
-		if !yield(classad.FromAST(a)) {
+		if !emit(w) {
 			cont = false
 			return false
 		}
 		return true
 	})
 	return cont
+}
+
+// yieldAd is the emit callback for the classic Query/Scan path: decode w to a
+// *classad.ClassAd (skipping malformed records) and yield it.
+func (c *Collection) yieldAd(yield func(*classad.ClassAd) bool) func(w []byte) bool {
+	return func(w []byte) bool {
+		a, err := c.decodeWire(w)
+		if err != nil {
+			return true // skip malformed record, keep scanning
+		}
+		return yield(classad.FromAST(a))
+	}
 }
 
 // matchWire reports whether the query matches the ad with wire bytes w, using the

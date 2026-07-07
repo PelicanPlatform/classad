@@ -1,11 +1,90 @@
 package collections
 
 import (
+	"iter"
 	"strconv"
 
 	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
+
+// RawAd is a query result rendered as old-ClassAd wire parts -- the "Name = Value"
+// expression strings plus MyType/TargetType -- decoded straight from the stored
+// form with no ast/classad ClassAd. A collector can hand these to
+// message.PutClassAdRaw to stream a result set without ever building an AST. The
+// Exprs slice is freshly allocated per ad; the strings do not alias scan buffers.
+type RawAd struct {
+	Exprs      []string
+	MyType     string
+	TargetType string
+}
+
+// QueryRaw is Query, but yields each matching ad as RawAd (AST-free) instead of a
+// *classad.ClassAd. It uses the same index/scan machinery -- an indexed lookup
+// still visits only candidate ads -- so it does not regress selective queries.
+// Inline-name (persistent) collections have no intern table, so QueryRaw yields
+// nothing for them; callers that must support those should use Query.
+func (c *Collection) QueryRaw(q *vm.Query) iter.Seq[RawAd] {
+	return func(yield func(RawAd) bool) {
+		if c.inline {
+			return
+		}
+		plan := q.ReadPlan()
+		ws := &wireScope{ctx: c}
+		qp := queryPlan{
+			q:        q,
+			plan:     plan,
+			m:        q.Matcher(),
+			wireOK:   q.Native() && plan.PartialSafe,
+			ws:       ws,
+			resolver: ws.resolve,
+		}
+		probes := q.Probes()
+		c.demand.record(probes)
+		usable := c.planIndex(probes)
+		emit := c.yieldRaw(yield)
+		for _, sh := range c.shards {
+			var cont bool
+			if len(usable) > 0 {
+				cont = c.scanShardIndexed(sh, usable, qp, emit)
+			} else {
+				cont = c.scanShard(sh, qp, emit)
+			}
+			if !cont {
+				return
+			}
+		}
+	}
+}
+
+// ScanRaw is Scan, yielding every ad as RawAd (AST-free).
+func (c *Collection) ScanRaw() iter.Seq[RawAd] {
+	return func(yield func(RawAd) bool) {
+		if c.inline {
+			return
+		}
+		q := queryPlan{}
+		emit := c.yieldRaw(yield)
+		for _, sh := range c.shards {
+			if !c.scanShard(sh, q, emit) {
+				return
+			}
+		}
+	}
+}
+
+// yieldRaw is the scan emit callback for the raw path: format the decompressed
+// wire bytes straight to old-ClassAd text and yield them.
+func (c *Collection) yieldRaw(yield func(RawAd) bool) func(w []byte) bool {
+	return func(w []byte) bool {
+		exprs, myType, targetType, ok := c.formatWireAd(w)
+		if !ok {
+			return true // undecodable record: skip, keep scanning
+		}
+		return yield(RawAd{Exprs: exprs, MyType: myType, TargetType: targetType})
+	}
+}
 
 // decodeAdRaw decodes a stored ad straight to old-ClassAd expression strings
 // ("Name = Value"), plus its MyType/TargetType values, WITHOUT building an
@@ -23,6 +102,16 @@ func (c *Collection) decodeAdRaw(stored []byte, codec Codec, dst []byte) (exprs 
 	}
 	wireBytes, err := codec.Decompress(dst, stored)
 	if err != nil {
+		return nil, "", "", false
+	}
+	return c.formatWireAd(wireBytes)
+}
+
+// formatWireAd renders already-decompressed wire bytes to old-ClassAd expression
+// strings + MyType/TargetType, with no AST (see decodeAdRaw). It is the emit-side
+// worker shared by decodeAdRaw and the QueryRaw/ScanRaw scan path.
+func (c *Collection) formatWireAd(wireBytes []byte) (exprs []string, myType, targetType string, ok bool) {
+	if c.inline {
 		return nil, "", "", false
 	}
 	ad := wire.Ad(wireBytes)

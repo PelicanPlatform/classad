@@ -268,12 +268,12 @@ func cmpFloat(op string, k, t float64) bool {
 // cover (a segment with no index, or the tail beyond its build watermark). Every
 // visited record is MVCC-visibility filtered and full-query re-verified, so the
 // result is identical to a full scan. Returns false if the consumer stopped.
-func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryPlan, yield func(*classad.ClassAd) bool) bool {
+func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryPlan, emit func(w []byte) bool) bool {
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var dbuf []byte
-	// visit tests one record's visibility, re-verifies, and yields; returns
-	// (keepGoing, stopped) where stopped means the consumer asked to stop.
+	// visit tests one record's visibility, re-verifies, and hands its decompressed
+	// wire bytes to emit; returns stop = true when the consumer asked to stop.
 	visit := func(w segWindow, o uint32) (stop bool) {
 		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 			return false
@@ -286,11 +286,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 		if !matchWire(ww, qp) {
 			return false
 		}
-		a, err := c.decodeWire(ww) // mode-aware (inline vs interned)
-		if err != nil {
-			return false
-		}
-		return !yield(classad.FromAST(a))
+		return !emit(ww)
 	}
 	// scanRange full-scans records in [from, to).
 	scanRange := func(w segWindow, from, to int) bool {
