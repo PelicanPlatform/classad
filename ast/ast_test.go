@@ -243,3 +243,22 @@ func TestAppendQuoteStringBytesMatchesString(t *testing.T) {
 		}
 	}
 }
+
+// TestQuoteAttributeNameReserved locks the reserved-word quoting behavior that the
+// allocation-free isReservedWord check replaced strings.ToLower for: a keyword in
+// any case must be single-quoted (it would otherwise re-lex as a literal), while a
+// normal identifier and a keyword-like-but-longer name stay bare.
+func TestQuoteAttributeNameReserved(t *testing.T) {
+	quoted := []string{"true", "True", "TRUE", "false", "undefined", "UnDefined", "error", "is", "IS", "isnt", "IsNt"}
+	for _, name := range quoted {
+		if got := QuoteAttributeName(name); got != "'"+name+"'" {
+			t.Errorf("QuoteAttributeName(%q) = %q, want it single-quoted", name, got)
+		}
+	}
+	bare := []string{"Cpus", "Memory", "TARGET", "trueish", "iso", "iss", "error_", "_is", "Requirements"}
+	for _, name := range bare {
+		if got := QuoteAttributeName(name); got != name {
+			t.Errorf("QuoteAttributeName(%q) = %q, want bare", name, got)
+		}
+	}
+}

@@ -188,11 +188,29 @@ func isBareAttributeName(name string) bool {
 			return false
 		}
 	}
-	switch strings.ToLower(name) {
-	case "true", "false", "undefined", "error", "is", "isnt":
-		return false
+	return !isReservedWord(name)
+}
+
+// isReservedWord reports whether name is a ClassAd keyword/literal
+// (true/false/undefined/error/is/isnt) compared case-insensitively. It avoids
+// strings.ToLower, which allocates a lowercased copy of every mixed-case name --
+// and this runs for every attribute reference in every rendered expression, so
+// that copy was the dominant allocation on the query serialization path. The
+// length switch rejects almost all names before any comparison; strings.EqualFold
+// does the case-insensitive compare without allocating. (Keywords are ASCII and
+// nothing non-ASCII case-folds to them, so byte length is a sound pre-filter.)
+func isReservedWord(name string) bool {
+	switch len(name) {
+	case 2:
+		return strings.EqualFold(name, "is")
+	case 4:
+		return strings.EqualFold(name, "true") || strings.EqualFold(name, "isnt")
+	case 5:
+		return strings.EqualFold(name, "false") || strings.EqualFold(name, "error")
+	case 9:
+		return strings.EqualFold(name, "undefined")
 	}
-	return true
+	return false
 }
 
 // Node is the base interface for all AST nodes.
