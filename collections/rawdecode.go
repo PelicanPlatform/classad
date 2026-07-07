@@ -200,9 +200,7 @@ func appendWireValue(dst, node []byte, table *wire.InternTable) ([]byte, error) 
 			return append(dst, "error"...), nil
 		}
 	}
-	e, err := wire.DecodeNode(node, table)
-	if err != nil {
-		return dst, err
-	}
-	return append(dst, e.String()...), nil
+	// Non-scalar: a list, record, or computed expression. Render it straight from
+	// the wire (AST-free) instead of decoding an ast.Expr and calling String().
+	return wire.AppendNodeText(dst, node, table)
 }

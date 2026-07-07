@@ -122,6 +122,24 @@ func AppendQuoteString(dst []byte, s string) []byte {
 	return append(dst, '"')
 }
 
+// AppendQuoteAttributeName appends QuoteAttributeName(name) to dst and returns the
+// extended slice, the append-to-buffer variant used when rendering many attribute
+// names into a shared buffer (record keys, scoped/selected attr refs) without a
+// per-name string allocation.
+func AppendQuoteAttributeName(dst []byte, name string) []byte {
+	if isBareAttributeName(name) {
+		return append(dst, name...)
+	}
+	dst = append(dst, '\'')
+	for _, r := range name {
+		if r == '\'' || r == '\\' {
+			dst = append(dst, '\\')
+		}
+		dst = utf8.AppendRune(dst, r)
+	}
+	return append(dst, '\'')
+}
+
 func isBareAttributeName(name string) bool {
 	if name == "" {
 		return false
