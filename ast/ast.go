@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // QuoteAttributeName renders an attribute name so it re-parses: a valid bare
@@ -33,8 +34,29 @@ func QuoteAttributeName(name string) string {
 // (\b \f \n \r \t \\ \"), octal (\NNN) for other control characters, and emits
 // everything else (printable ASCII and valid Unicode) verbatim. It deliberately
 // avoids Go's \xNN hex escapes, which the lexer does not understand.
+// stringNeedsEscape reports whether QuoteString must escape any byte of s: a
+// quote, a backslash, or a control character (< 0x20). Bytes >= 0x20, including
+// every byte of a multi-byte UTF-8 rune, pass through unescaped.
+func stringNeedsEscape(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == '"' || c == '\\' {
+			return true
+		}
+	}
+	return false
+}
+
 func QuoteString(s string) string {
+	// Fast path: almost every ClassAd string value (hostnames, arch/OS names,
+	// states, versions, ...) contains nothing that needs escaping, so wrap it
+	// directly in one allocation instead of walking it rune by rune into a
+	// Builder. A byte scan suffices: the escaped set is a quote, a backslash, or a
+	// control byte (< 0x20), none of which appear inside a multi-byte UTF-8 rune.
+	if !stringNeedsEscape(s) {
+		return `"` + s + `"`
+	}
 	var b strings.Builder
+	b.Grow(len(s) + 2)
 	b.WriteByte('"')
 	for _, r := range s {
 		switch r {
@@ -62,6 +84,42 @@ func QuoteString(s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// AppendQuoteString appends QuoteString(s) to dst and returns the extended slice,
+// so a caller building a larger buffer (e.g. an ad's "Name = Value" line) does not
+// allocate an intermediate string per value.
+func AppendQuoteString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	if !stringNeedsEscape(s) {
+		dst = append(dst, s...)
+		return append(dst, '"')
+	}
+	for _, r := range s {
+		switch r {
+		case '"':
+			dst = append(dst, '\\', '"')
+		case '\\':
+			dst = append(dst, '\\', '\\')
+		case '\b':
+			dst = append(dst, '\\', 'b')
+		case '\f':
+			dst = append(dst, '\\', 'f')
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\t':
+			dst = append(dst, '\\', 't')
+		default:
+			if r < 0x20 {
+				dst = append(dst, fmt.Sprintf("\\%03o", r)...)
+			} else {
+				dst = utf8.AppendRune(dst, r)
+			}
+		}
+	}
+	return append(dst, '"')
 }
 
 func isBareAttributeName(name string) bool {
