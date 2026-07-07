@@ -41,6 +41,16 @@ func NewExprLexer(r io.Reader) *StreamingLexer {
 	return l
 }
 
+// ResetForExpr re-arms the lexer to tokenize another standalone expression from its
+// current reader, reusing internal buffers. Reset the underlying reader (e.g.
+// bufio.Reader.Reset) first; this clears the lexer's parse state. It lets a caller
+// pool a lexer across many small parses instead of allocating one per parse.
+func (l *StreamingLexer) ResetForExpr() {
+	l.resetForNext()
+	l.pos = 0
+	l.stopAfterClassAd = false
+}
+
 // Next scans and returns the next token. At end of input its Kind is TokEOF. A
 // lexical error (e.g. an unterminated string or bad escape) is returned as a
 // non-nil error, matching what the goyacc path would report via Error.
