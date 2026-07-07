@@ -22,6 +22,11 @@ const (
 	// parallelBatch caps how many decoded ads a worker buffers before handing them to
 	// the consumer, so a low-selectivity segment does not buffer unboundedly.
 	parallelBatch = 64
+	// defaultAutoQueryWorkers is the per-query worker cap the auto policy
+	// (QueryParallelism=0) uses, clamped to GOMAXPROCS. Deliberately modest: returns
+	// diminish past a few workers, and a lower cap lets several concurrent queries
+	// each fan out rather than one taking the whole worker budget.
+	defaultAutoQueryWorkers = 6
 )
 
 // scanTask is one segment window to scan, tagged with its shard's snapshot sequence

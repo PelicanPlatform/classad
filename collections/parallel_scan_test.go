@@ -2,6 +2,7 @@ package collections
 
 import (
 	"fmt"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -164,5 +165,28 @@ func TestParallelQueryConcurrent(t *testing.T) {
 	wg.Wait()
 	if v := bad.Load(); v != 0 {
 		t.Fatalf("concurrent parallel queries incorrect (code %d)", v)
+	}
+}
+
+func runtimeGOMAXPROCS() int { return runtime.GOMAXPROCS(0) }
+
+// TestResolveQueryParallelism pins the auto/serial/explicit policy.
+func TestResolveQueryParallelism(t *testing.T) {
+	t.Parallel()
+	if got := resolveQueryParallelism(1); got != 1 {
+		t.Errorf("explicit serial: got %d, want 1", got)
+	}
+	if got := resolveQueryParallelism(4); got != 4 {
+		t.Errorf("explicit cap: got %d, want 4", got)
+	}
+	autoWant := runtimeGOMAXPROCS()
+	if autoWant > defaultAutoQueryWorkers {
+		autoWant = defaultAutoQueryWorkers
+	}
+	if got := resolveQueryParallelism(0); got != autoWant {
+		t.Errorf("auto: got %d, want %d", got, autoWant)
+	}
+	if got := resolveQueryParallelism(-3); got != autoWant {
+		t.Errorf("negative treated as auto: got %d, want %d", got, autoWant)
 	}
 }

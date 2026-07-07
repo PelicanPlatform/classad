@@ -3,10 +3,10 @@
 > Status: **implemented** in `parallel_scan.go`. A full-scan `Query` can fan out
 > across the collection's segments using a bounded worker pool, gated by a work-size
 > threshold and a machine-wide worker budget. `Options.QueryParallelism = 0` (the
-> default) means **auto** — the library picks the policy (currently: up to GOMAXPROCS
-> workers per query); `1` forces serial; `N ≥ 2` caps workers per query. Serial and
-> parallel produce identical result sets. Indexed queries and `QueryRaw` remain serial
-> for now (see Limitations).
+> default) means **auto** — the library picks the policy (currently: up to 6 workers
+> per query, clamped to GOMAXPROCS); `1` forces serial; `N ≥ 2` caps workers per
+> query. Serial and parallel produce identical result sets. Indexed queries and
+> `QueryRaw` remain serial for now (see Limitations).
 
 ## Why it is safe (and cheap)
 
@@ -68,9 +68,12 @@ query and helps throughput only when query concurrency is *low* — a store alre
 fielding many concurrent queries saturates its cores without it, and the coordination
 would then be pure loss. So a Collection-wide semaphore (size `GOMAXPROCS`) bounds
 total scan workers across all in-flight queries: each query takes whatever tokens are
-free with a **non-blocking greedy** try, and if it cannot get at least two it runs
-**serial**. Net effect: one big query alone gets all cores; as concurrency rises the
-budget is spoken for and queries fall back to serial rather than oversubscribing.
+free with a **non-blocking greedy** try — it never queues or blocks on a worker slot,
+and if it cannot get at least two it runs **serial** immediately. Net effect: as
+concurrency rises the budget is spoken for and queries fall back to serial rather than
+oversubscribing. The auto per-query cap (6) is deliberately below the budget so that
+*several* concurrent queries can each fan out — fairness — instead of one query taking
+the whole machine and starving the rest to serial.
 
 ## Contention: what oversubscription actually does
 

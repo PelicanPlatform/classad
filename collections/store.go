@@ -51,8 +51,8 @@ type Options struct {
 	// Empty ⇒ in-memory (the default). Unix-only.
 	Dir string
 	// QueryParallelism controls cross-segment fan-out for large full-scan queries:
-	//   0 (default) ⇒ auto — the library picks the policy (currently: up to
-	//                 GOMAXPROCS workers per query). The meaning of auto may change
+	//   0 (default) ⇒ auto — the library picks the policy (currently: up to 6 workers
+	//                 per query, clamped to GOMAXPROCS). The meaning of auto may change
 	//                 across releases.
 	//   1           ⇒ serial (never fan out).
 	//   N ≥ 2       ⇒ fan out with up to N workers per query.
@@ -197,11 +197,16 @@ func resolveQueryParallelism(opt int) int {
 	case opt >= 2:
 		return opt // explicit per-query cap
 	default:
-		// Auto. Today: use up to all cores (fan-out is still gated by a work-size
-		// threshold, capped at the segment count, and shared via the worker budget,
-		// so this degrades to serial under concurrent-query load). GOMAXPROCS==1
-		// naturally yields serial.
-		return runtime.GOMAXPROCS(0)
+		// Auto. Today: a conservative per-query cap (defaultAutoQueryWorkers), not all
+		// cores -- returns diminish past a handful of workers, and a smaller cap lets
+		// several concurrent queries each fan out (fairness) instead of one taking the
+		// whole machine-wide budget and starving the rest to serial. Fan-out is still
+		// gated by a work-size threshold, capped at the segment count, and shared via
+		// the budget, so it degrades to serial under load. This policy may change.
+		if n := runtime.GOMAXPROCS(0); n < defaultAutoQueryWorkers {
+			return n // GOMAXPROCS==1 naturally yields serial
+		}
+		return defaultAutoQueryWorkers
 	}
 }
 
