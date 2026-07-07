@@ -32,32 +32,49 @@ const (
 )
 
 // Value represents the result of evaluating a ClassAd expression.
+//
+// A Value is copied by value constantly -- on every bytecode stack push/pop and
+// every operator call -- so it is kept small: the list payload (which is four
+// words and only used by list values) lives out-of-line behind the list pointer,
+// leaving a Value that is a scalar/string/classad in one compact struct.
 type Value struct {
-	valueType  ValueType
-	boolVal    bool
+	valueType ValueType
+	// intVal holds an integer value, a boolean (0 or 1), and -- for a RealValue --
+	// the IEEE-754 bits of the float64 (see real()/NewRealValue). Folding all three
+	// scalar payloads here keeps Value one word smaller than a separate bool/real
+	// field would, and the bits round-trip exactly (NaN/Inf/-0 included).
 	intVal     int64
-	realVal    float64
 	strVal     string
-	listVal    []Value
 	classAdVal *ClassAd
-	// listExprs / listScope make a list value from a literal lazy: it holds its
-	// source element expressions and the scope to evaluate them in, rather than
-	// pre-evaluated values, mirroring the reference engine (a list value is its
-	// unevaluated ExprList). Elements are evaluated on demand by ListValue().
-	// This lets string()/strcat()/etc. unparse the source expressions exactly
-	// (string({1, 1+1}) is "{ 1,1 + 1 }"), and a self-referential list
-	// (A0 = {{A0}}) is a list value rather than a construction-time cycle
-	// error. Lists built programmatically by functions leave these nil and use
-	// the eager listVal instead.
-	listExprs []ast.Expr
-	listScope *ClassAd
-	// listDepth records the evaluator recursion depth at which a lazy list value
-	// was created. Materializing the list's elements (ListValue/String/subscript)
-	// resumes depth accounting from here, so a value that is cyclic only through
-	// list materialization (A = {A}) -- where each materialization step would
-	// otherwise start a fresh evaluator at depth 0 -- still hits maxEvalDepth and
-	// resolves to error instead of overflowing the goroutine stack.
-	listDepth int
+	// list holds a list value's payload out-of-line; it is non-nil exactly when
+	// valueType == ListValue. See listData.
+	list *listData
+}
+
+// listData is a list value's payload, stored out-of-line to keep Value small. It
+// is immutable once constructed (materialization allocates a fresh []Value rather
+// than mutating), so copies of a list Value may safely share one *listData.
+//
+// exprs / scope make a list value from a literal lazy: they hold the source
+// element expressions and the scope to evaluate them in, rather than pre-evaluated
+// values, mirroring the reference engine (a list value is its unevaluated
+// ExprList). Elements are evaluated on demand by ListValue(). This lets
+// string()/strcat()/etc. unparse the source expressions exactly (string({1, 1+1})
+// is "{ 1,1 + 1 }"), and a self-referential list (A0 = {{A0}}) is a list value
+// rather than a construction-time cycle error. Lists built programmatically by
+// functions leave exprs nil and use the eager vals instead.
+//
+// depth records the evaluator recursion depth at which a lazy list value was
+// created. Materializing the list's elements (ListValue/String/subscript) resumes
+// depth accounting from here, so a value that is cyclic only through list
+// materialization (A = {A}) -- where each materialization step would otherwise
+// start a fresh evaluator at depth 0 -- still hits maxEvalDepth and resolves to
+// error instead of overflowing the goroutine stack.
+type listData struct {
+	vals  []Value
+	exprs []ast.Expr
+	scope *ClassAd
+	depth int
 }
 
 // NewUndefinedValue creates an undefined value.
@@ -72,7 +89,11 @@ func NewErrorValue() Value {
 
 // NewBoolValue creates a boolean value.
 func NewBoolValue(b bool) Value {
-	return Value{valueType: BooleanValue, boolVal: b}
+	var i int64
+	if b {
+		i = 1
+	}
+	return Value{valueType: BooleanValue, intVal: i}
 }
 
 // NewIntValue creates an integer value.
@@ -82,7 +103,14 @@ func NewIntValue(i int64) Value {
 
 // NewRealValue creates a real value.
 func NewRealValue(r float64) Value {
-	return Value{valueType: RealValue, realVal: r}
+	return Value{valueType: RealValue, intVal: int64(math.Float64bits(r))}
+}
+
+// real reinterprets intVal as the float64 it encodes. Valid only when
+// valueType == RealValue. Inlined to a bit reinterpret, so it costs nothing over
+// a plain field read.
+func (v Value) real() float64 {
+	return math.Float64frombits(uint64(v.intVal))
 }
 
 // NewStringValue creates a string value.
@@ -92,7 +120,7 @@ func NewStringValue(s string) Value {
 
 // NewListValue creates a list value.
 func NewListValue(list []Value) Value {
-	return Value{valueType: ListValue, listVal: list}
+	return Value{valueType: ListValue, list: &listData{vals: list}}
 }
 
 // NewClassAdValue creates a ClassAd value.
@@ -155,7 +183,7 @@ func (v Value) BoolValue() (bool, error) {
 	if v.valueType != BooleanValue {
 		return false, fmt.Errorf("value is not a boolean")
 	}
-	return v.boolVal, nil
+	return v.intVal != 0, nil
 }
 
 // IntValue returns the integer value. Returns error if not an integer.
@@ -171,7 +199,7 @@ func (v Value) RealValue() (float64, error) {
 	if v.valueType != RealValue {
 		return 0, fmt.Errorf("value is not a real")
 	}
-	return v.realVal, nil
+	return v.real(), nil
 }
 
 // NumberValue returns the numeric value as a float64, converting integers if needed.
@@ -180,7 +208,7 @@ func (v Value) NumberValue() (float64, error) {
 	case IntegerValue:
 		return float64(v.intVal), nil
 	case RealValue:
-		return v.realVal, nil
+		return v.real(), nil
 	default:
 		return 0, fmt.Errorf("value is not a number")
 	}
@@ -199,16 +227,16 @@ func (v Value) ListValue() ([]Value, error) {
 	if v.valueType != ListValue {
 		return nil, fmt.Errorf("value is not a list")
 	}
-	if v.listExprs != nil {
+	if v.list.exprs != nil {
 		// Lazy list: evaluate each element expression in its stored scope now.
-		vals := make([]Value, len(v.listExprs))
+		vals := make([]Value, len(v.list.exprs))
 		ev := v.lazyEvaluator(nil)
-		for i, e := range v.listExprs {
+		for i, e := range v.list.exprs {
 			vals[i] = evalRecoveringCyclic(ev, e)
 		}
 		return vals, nil
 	}
-	return v.listVal, nil
+	return v.list.vals, nil
 }
 
 // evalRecoveringCyclic evaluates a lazy list element, turning a cyclic-reference
@@ -224,10 +252,10 @@ func evalRecoveringCyclic(ev *Evaluator, e ast.Expr) (result Value) {
 // listLen returns the number of elements in a list value without evaluating
 // them (for a lazy list). The caller must ensure v is a list.
 func (v Value) listLen() int {
-	if v.listExprs != nil {
-		return len(v.listExprs)
+	if v.list.exprs != nil {
+		return len(v.list.exprs)
 	}
-	return len(v.listVal)
+	return len(v.list.vals)
 }
 
 // listElementAt evaluates and returns the i-th element of a list value,
@@ -235,10 +263,10 @@ func (v Value) listLen() int {
 // evaluates x without touching the self-referential element 0). The caller must
 // ensure v is a list and 0 <= i < listLen().
 func (v Value) listElementAt(i int, parent *Evaluator) Value {
-	if v.listExprs != nil {
-		return evalRecoveringCyclic(v.lazyEvaluator(parent), v.listExprs[i])
+	if v.list.exprs != nil {
+		return evalRecoveringCyclic(v.lazyEvaluator(parent), v.list.exprs[i])
 	}
-	return v.listVal[i]
+	return v.list.vals[i]
 }
 
 // lazyEvaluator builds the evaluator for materializing a lazy list's elements in
@@ -247,11 +275,11 @@ func (v Value) listElementAt(i int, parent *Evaluator) Value {
 // the depth at which the list value was created, so recursion accounting never
 // resets going into materialization and a materialization-only cycle terminates.
 func (v Value) lazyEvaluator(parent *Evaluator) *Evaluator {
-	depth := v.listDepth
+	depth := v.list.depth
 	if parent != nil && parent.depth > depth {
 		depth = parent.depth
 	}
-	return &Evaluator{classad: v.listScope, depth: depth}
+	return &Evaluator{classad: v.list.scope, depth: depth}
 }
 
 // ClassAdValue returns the ClassAd value. Returns error if not a ClassAd.
@@ -270,14 +298,14 @@ func (v Value) String() string {
 	case ErrorValue:
 		return "error"
 	case BooleanValue:
-		if v.boolVal {
+		if v.intVal != 0 {
 			return "true"
 		}
 		return "false"
 	case IntegerValue:
 		return fmt.Sprintf("%d", v.intVal)
 	case RealValue:
-		return fmt.Sprintf("%g", v.realVal)
+		return fmt.Sprintf("%g", v.real())
 	case StringValue:
 		return fmt.Sprintf("%q", v.strVal)
 	case ListValue:
@@ -320,6 +348,10 @@ type Evaluator struct {
 	// e.g. a lazy list element referencing its own attribute, A = {A[0]} --
 	// fails at maxEvalDepth instead of overflowing the goroutine stack.
 	depth int
+	// resolver, when non-nil, supplies attribute values instead of the ClassAd
+	// scope (see SetResolver). It lets a caller evaluate against an alternate
+	// backing (e.g. an encoded ad) without materializing a ClassAd.
+	resolver func(name string, scope ast.AttributeScope) Value
 }
 
 // maxEvalDepth bounds evaluation recursion. It is far below what overflows the
@@ -409,47 +441,78 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 }
 
 func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Value {
+	if e.resolver != nil {
+		// A custom resolver replaces ClassAd-scope resolution entirely (used for
+		// evaluating a native program against an encoded ad). It receives the
+		// original-cased name and the reference's scope.
+		return e.resolver(ref.Name, ref.Scope)
+	}
+	// Normalize the reference name once. Attribute lookup and cyclic-reference
+	// tracking are both case-insensitive, and a reference is resolved through
+	// several of them (a scope-chain walk can probe multiple ads); normalizing
+	// here avoids a strings.ToLower allocation at each step.
+	norm := normalizeName(ref.Name)
 	switch ref.Scope {
 	case ast.MyScope:
 		// MY.attr - always the current ClassAd (no scope-chain fallthrough).
-		return e.evalAttrIn(e.classad, ref.Name)
+		return e.evalAttrIn(e.classad, norm)
 	case ast.TargetScope:
 		if e.classad == nil {
 			return NewUndefinedValue()
 		}
-		return e.evalAttrIn(e.classad.target, ref.Name)
+		return e.evalAttrIn(e.classad.target, norm)
 	case ast.ParentScope:
 		if e.classad == nil {
 			return NewUndefinedValue()
 		}
-		return e.evalAttrIn(e.classad.parent, ref.Name)
+		return e.evalAttrIn(e.classad.parent, norm)
 	default:
 		// Unscoped: search the current ad, then up the enclosing (parent) scope
 		// chain, matching the reference engine. The chain is established by the
 		// select operator (see evaluateSelectExpr); a top-level ad has no parent
 		// so this is just a lookup in the current ad.
 		for ad := e.classad; ad != nil; ad = ad.parent {
-			if ad.lookupInternal(ref.Name) != nil {
-				return e.evalAttrIn(ad, ref.Name)
+			if expr := ad.lookupNorm(norm); expr != nil {
+				return e.evalAttrExpr(ad, norm, expr)
 			}
 		}
 		return NewUndefinedValue()
 	}
 }
 
-// evalAttrIn looks up name in ad and evaluates it, with cyclic-reference
-// detection. A cycle (the attribute is already being evaluated in ad) panics a
-// cyclicEvalError sentinel, recovered as error at the top-level entry points
-// (distinct from an error value, which =?= / =!= would compare as a type).
-func (e *Evaluator) evalAttrIn(ad *ClassAd, name string) Value {
+// evalAttrIn looks up an already-normalized name in ad and evaluates its value.
+func (e *Evaluator) evalAttrIn(ad *ClassAd, norm string) Value {
 	if ad == nil {
 		return NewUndefinedValue()
 	}
-	expr := ad.lookupInternal(name)
+	expr := ad.lookupNorm(norm)
 	if expr == nil {
 		return NewUndefinedValue()
 	}
-	norm := normalizeName(name)
+	return e.evalAttrExpr(ad, norm, expr)
+}
+
+// evalAttrExpr evaluates expr -- the value bound to the already-normalized name
+// norm in ad -- with cyclic-reference detection. A cycle (the attribute is
+// already being evaluated in ad) panics a cyclicEvalError sentinel, recovered as
+// error at the top-level entry points (distinct from an error value, which
+// =?= / =!= would compare as a type).
+//
+// The expression is evaluated in ad's context by temporarily rebinding the
+// evaluator's ClassAd rather than allocating a child evaluator per reference.
+// The deferred cleanup restores the ClassAd and clears the cyclic marker even
+// when a cyclic panic unwinds; recursion depth is restored by Evaluate's own
+// deferred decrement (which runs during the same unwind).
+func (e *Evaluator) evalAttrExpr(ad *ClassAd, norm string, expr ast.Expr) Value {
+	// Fast path: a literal attribute value references nothing, so it cannot form a
+	// cyclic reference and its value does not depend on the scope. Skip the
+	// per-reference cyclic-detection bookkeeping (a map insert + deferred delete)
+	// and the scope rebinding entirely. Real ads are overwhelmingly literal-valued
+	// (Cpus = 8, Arch = "X86_64", ...), so this is the common case. A literal
+	// wrapped in parentheses falls to the slow path, which is correct and rare.
+	if isLiteralExpr(expr) {
+		return e.Evaluate(expr)
+	}
 	if ad.evaluating[norm] {
 		panic(cyclicEvalError{})
 	}
@@ -457,9 +520,28 @@ func (e *Evaluator) evalAttrIn(ad *ClassAd, name string) Value {
 		ad.evaluating = make(map[string]bool)
 	}
 	ad.evaluating[norm] = true
-	defer delete(ad.evaluating, norm)
+	saved := e.classad
+	e.classad = ad
+	defer func() {
+		e.classad = saved
+		delete(ad.evaluating, norm)
+	}()
 
-	return e.child(ad).Evaluate(expr)
+	return e.Evaluate(expr)
+}
+
+// isLiteralExpr reports whether e is a literal -- a value that references no
+// attributes and so can neither depend on the scope nor participate in a cyclic
+// reference. Used by evalAttrExpr to skip cyclic-detection bookkeeping. A literal
+// wrapped in a ParenExpr is deliberately not treated as a literal here, to keep
+// the check O(1); the slow path handles it correctly.
+func isLiteralExpr(e ast.Expr) bool {
+	switch e.(type) {
+	case *ast.IntegerLiteral, *ast.RealLiteral, *ast.StringLiteral,
+		*ast.BooleanLiteral, *ast.UndefinedLiteral, *ast.ErrorLiteral:
+		return true
+	}
+	return false
 }
 
 func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
@@ -474,22 +556,37 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 
 	left := e.Evaluate(op.Left)
 	right := e.Evaluate(op.Right)
+	return e.applyBinaryValues(op.Op, left, right)
+}
 
-	// For 'is' and 'isnt' operators, don't propagate errors - they are part of the comparison
-	if op.Op == "is" {
+// applyBinaryValues applies a binary operator to two already-evaluated operand
+// values. It is the value-level core shared by the AST evaluator (above) and the
+// exported ApplyBinaryOp hook used by the bytecode interpreter, so both compute
+// binary operations through identical logic.
+//
+// && and || are included for the interpreter's combine path (after it has decided
+// the right operand must be evaluated); the AST path never reaches here for them
+// because evaluateBinaryOp short-circuits first.
+func (e *Evaluator) applyBinaryValues(op string, left, right Value) Value {
+	// Logical and meta-equality operators do not propagate errors generically.
+	switch op {
+	case "&&":
+		return e.evaluateAnd(left, right)
+	case "||":
+		return e.evaluateOr(left, right)
+	case "is":
 		return e.evaluateIs(left, right)
-	}
-	if op.Op == "isnt" {
+	case "isnt":
 		return e.evaluateIsnt(left, right)
 	}
 
-	// Handle error propagation for other operators
+	// Handle error propagation for the remaining operators.
 	if left.IsError() || right.IsError() {
 		return NewErrorValue()
 	}
 
+	switch op {
 	// Arithmetic operators
-	switch op.Op {
 	case "+":
 		return e.evaluateAdd(left, right)
 	case "-":
@@ -517,10 +614,7 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 
 	// Bitwise operators (integer-only).
 	case "&", "|", "^", "<<", ">>", ">>>":
-		return e.evaluateBitwise(op.Op, left, right)
-
-	// Logical operators (&& and ||) are handled before the generic error
-	// propagation above.
+		return e.evaluateBitwise(op, left, right)
 
 	default:
 		return NewErrorValue()
@@ -528,8 +622,12 @@ func (e *Evaluator) evaluateBinaryOp(op *ast.BinaryOp) Value {
 }
 
 func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
-	val := e.Evaluate(op.Expr)
+	return e.applyUnaryValue(op.Op, e.Evaluate(op.Expr))
+}
 
+// applyUnaryValue applies a unary operator to an already-evaluated operand value.
+// Shared by the AST evaluator and the exported ApplyUnaryOp hook.
+func (e *Evaluator) applyUnaryValue(op string, val Value) Value {
 	if val.IsError() {
 		return val
 	}
@@ -540,7 +638,7 @@ func (e *Evaluator) evaluateUnaryOp(op *ast.UnaryOp) Value {
 		return NewUndefinedValue()
 	}
 
-	switch op.Op {
+	switch op {
 	case "-":
 		if val.IsInteger() {
 			intVal, _ := val.IntValue()
@@ -638,7 +736,7 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 	if exprs == nil {
 		exprs = []ast.Expr{}
 	}
-	return Value{valueType: ListValue, listExprs: exprs, listScope: e.classad, listDepth: e.depth}
+	return Value{valueType: ListValue, list: &listData{exprs: exprs, scope: e.classad, depth: e.depth}}
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
@@ -678,15 +776,15 @@ func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
 // the nearest recover (the enclosing attribute evaluation, or the outermost
 // ListValue if projection happens during a later materialization).
 func (v Value) listElementsPropagating(parent *Evaluator) []Value {
-	if v.listExprs != nil {
-		vals := make([]Value, len(v.listExprs))
+	if v.list.exprs != nil {
+		vals := make([]Value, len(v.list.exprs))
 		ev := v.lazyEvaluator(parent)
-		for i, e := range v.listExprs {
+		for i, e := range v.list.exprs {
 			vals[i] = ev.Evaluate(e)
 		}
 		return vals
 	}
-	return v.listVal
+	return v.list.vals
 }
 
 // selectAttr resolves record.attr for an already-evaluated record value (a
@@ -791,9 +889,9 @@ func numericOperand(v Value) (isNum, isInt bool, iv int64, rv float64) {
 	case IntegerValue:
 		return true, true, v.intVal, float64(v.intVal)
 	case RealValue:
-		return true, false, 0, v.realVal
+		return true, false, 0, v.real()
 	case BooleanValue:
-		if v.boolVal {
+		if v.intVal != 0 {
 			return true, true, 1, 1
 		}
 		return true, true, 0, 0
@@ -1226,7 +1324,7 @@ const (
 func logicalView(v Value) logicalState {
 	switch v.valueType {
 	case BooleanValue:
-		if v.boolVal {
+		if v.intVal != 0 {
 			return lsTrue
 		}
 		return lsFalse
@@ -1236,7 +1334,7 @@ func logicalView(v Value) logicalState {
 		}
 		return lsFalse
 	case RealValue:
-		if v.realVal != 0 {
+		if v.real() != 0 {
 			return lsTrue
 		}
 		return lsFalse

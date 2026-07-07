@@ -42,8 +42,15 @@ func ParseClassAd(input string) (*ast.ClassAd, error) {
 // a record literal and a bare expression -- while still giving callers direct
 // expression access.
 func ParseExpr(input string) (ast.Expr, error) {
-	const wrapAttr = "__classad_parse_expr__"
-	node, err := Parse("[" + wrapAttr + " = " + input + "]")
+	ep, ok := exprParserPool.Get().(*exprParser)
+	if !ok {
+		panic("exprParserPool held an unexpected type") // pool's New only makes *exprParser
+	}
+	ep.reset(input)
+	ep.p.Parse(ep.lex)
+	node, err := ep.lex.Result()
+	ep.lex.result = nil // do not retain the parsed AST in the pooled instance
+	exprParserPool.Put(ep)
 	if err != nil {
 		return nil, err
 	}

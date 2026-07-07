@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // QuoteAttributeName renders an attribute name so it re-parses: a valid bare
@@ -33,8 +34,29 @@ func QuoteAttributeName(name string) string {
 // (\b \f \n \r \t \\ \"), octal (\NNN) for other control characters, and emits
 // everything else (printable ASCII and valid Unicode) verbatim. It deliberately
 // avoids Go's \xNN hex escapes, which the lexer does not understand.
+// stringNeedsEscape reports whether QuoteString must escape any byte of s: a
+// quote, a backslash, or a control character (< 0x20). Bytes >= 0x20, including
+// every byte of a multi-byte UTF-8 rune, pass through unescaped.
+func stringNeedsEscape(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == '"' || c == '\\' {
+			return true
+		}
+	}
+	return false
+}
+
 func QuoteString(s string) string {
+	// Fast path: almost every ClassAd string value (hostnames, arch/OS names,
+	// states, versions, ...) contains nothing that needs escaping, so wrap it
+	// directly in one allocation instead of walking it rune by rune into a
+	// Builder. A byte scan suffices: the escaped set is a quote, a backslash, or a
+	// control byte (< 0x20), none of which appear inside a multi-byte UTF-8 rune.
+	if !stringNeedsEscape(s) {
+		return `"` + s + `"`
+	}
 	var b strings.Builder
+	b.Grow(len(s) + 2)
 	b.WriteByte('"')
 	for _, r := range s {
 		switch r {
@@ -64,6 +86,95 @@ func QuoteString(s string) string {
 	return b.String()
 }
 
+// AppendQuoteString appends QuoteString(s) to dst and returns the extended slice,
+// so a caller building a larger buffer (e.g. an ad's "Name = Value" line) does not
+// allocate an intermediate string per value.
+func AppendQuoteString(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	if !stringNeedsEscape(s) {
+		dst = append(dst, s...)
+		return append(dst, '"')
+	}
+	for _, r := range s {
+		dst = appendEscapedRune(dst, r)
+	}
+	return append(dst, '"')
+}
+
+// AppendQuoteStringBytes is AppendQuoteString for a value that already lives in a
+// byte slice (e.g. a string literal's bytes inside a wire buffer): it quotes s
+// without first copying it into a Go string, producing output identical to
+// AppendQuoteString(dst, string(s)). The common no-escape case is a plain byte
+// copy; the escape path iterates runes via `range string(s)`, which the compiler
+// lowers without allocating a string.
+func AppendQuoteStringBytes(dst, s []byte) []byte {
+	dst = append(dst, '"')
+	if !bytesNeedEscape(s) {
+		dst = append(dst, s...)
+		return append(dst, '"')
+	}
+	for _, r := range string(s) {
+		dst = appendEscapedRune(dst, r)
+	}
+	return append(dst, '"')
+}
+
+// appendEscapedRune appends one rune of a string value using only the escapes the
+// lexer decodes (\b \f \n \r \t \\ \"), octal (\NNN) for other control characters,
+// and the rune verbatim otherwise. Shared by the string and []byte quoters.
+func appendEscapedRune(dst []byte, r rune) []byte {
+	switch r {
+	case '"':
+		return append(dst, '\\', '"')
+	case '\\':
+		return append(dst, '\\', '\\')
+	case '\b':
+		return append(dst, '\\', 'b')
+	case '\f':
+		return append(dst, '\\', 'f')
+	case '\n':
+		return append(dst, '\\', 'n')
+	case '\r':
+		return append(dst, '\\', 'r')
+	case '\t':
+		return append(dst, '\\', 't')
+	default:
+		if r < 0x20 {
+			return append(dst, fmt.Sprintf("\\%03o", r)...)
+		}
+		return utf8.AppendRune(dst, r)
+	}
+}
+
+// bytesNeedEscape is stringNeedsEscape for a byte slice (a quote, a backslash, or
+// a control byte < 0x20; bytes of a multi-byte UTF-8 rune are all >= 0x20).
+func bytesNeedEscape(s []byte) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c < 0x20 || c == '"' || c == '\\' {
+			return true
+		}
+	}
+	return false
+}
+
+// AppendQuoteAttributeName appends QuoteAttributeName(name) to dst and returns the
+// extended slice, the append-to-buffer variant used when rendering many attribute
+// names into a shared buffer (record keys, scoped/selected attr refs) without a
+// per-name string allocation.
+func AppendQuoteAttributeName(dst []byte, name string) []byte {
+	if isBareAttributeName(name) {
+		return append(dst, name...)
+	}
+	dst = append(dst, '\'')
+	for _, r := range name {
+		if r == '\'' || r == '\\' {
+			dst = append(dst, '\\')
+		}
+		dst = utf8.AppendRune(dst, r)
+	}
+	return append(dst, '\'')
+}
+
 func isBareAttributeName(name string) bool {
 	if name == "" {
 		return false
@@ -77,11 +188,29 @@ func isBareAttributeName(name string) bool {
 			return false
 		}
 	}
-	switch strings.ToLower(name) {
-	case "true", "false", "undefined", "error", "is", "isnt":
-		return false
+	return !isReservedWord(name)
+}
+
+// isReservedWord reports whether name is a ClassAd keyword/literal
+// (true/false/undefined/error/is/isnt) compared case-insensitively. It avoids
+// strings.ToLower, which allocates a lowercased copy of every mixed-case name --
+// and this runs for every attribute reference in every rendered expression, so
+// that copy was the dominant allocation on the query serialization path. The
+// length switch rejects almost all names before any comparison; strings.EqualFold
+// does the case-insensitive compare without allocating. (Keywords are ASCII and
+// nothing non-ASCII case-folds to them, so byte length is a sound pre-filter.)
+func isReservedWord(name string) bool {
+	switch len(name) {
+	case 2:
+		return strings.EqualFold(name, "is")
+	case 4:
+		return strings.EqualFold(name, "true") || strings.EqualFold(name, "isnt")
+	case 5:
+		return strings.EqualFold(name, "false") || strings.EqualFold(name, "error")
+	case 9:
+		return strings.EqualFold(name, "undefined")
 	}
-	return true
+	return false
 }
 
 // Node is the base interface for all AST nodes.

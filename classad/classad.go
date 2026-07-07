@@ -364,14 +364,19 @@ func (c *ClassAd) MarshalOld() string {
 	}
 
 	c.ensureSorted()
-	result := ""
+	// Build in a strings.Builder: `result += ...` in a loop is O(n^2) (each += copies
+	// the whole accumulated string), which allocated tens of MB to render a single
+	// large (~21 KB) ad.
+	var b strings.Builder
 	for i, attr := range c.ad.Attributes {
 		if i > 0 {
-			result += "\n"
+			b.WriteByte('\n')
 		}
-		result += fmt.Sprintf("%s = %s", unparseAttrName(attr.Name), attr.Value.String())
+		b.WriteString(unparseAttrName(attr.Name))
+		b.WriteString(" = ")
+		b.WriteString(attr.Value.String())
 	}
-	return result
+	return b.String()
 }
 
 // Insert inserts an attribute with an expression into the ClassAd.
@@ -573,12 +578,20 @@ func (c *ClassAd) Lookup(name string) (*Expr, bool) {
 // Returns nil if the attribute doesn't exist.
 // This is the internal version that returns ast.Expr for backward compatibility.
 func (c *ClassAd) lookupInternal(name string) ast.Expr {
+	return c.lookupNorm(normalizeName(name))
+}
+
+// lookupNorm is lookupInternal for an already-normalized (lower-cased) name. Hot
+// callers that resolve the same reference repeatedly (the evaluator's attribute
+// resolution) normalize once and call this to avoid a strings.ToLower allocation
+// per lookup.
+func (c *ClassAd) lookupNorm(norm string) ast.Expr {
 	if c.ad == nil {
 		return nil
 	}
 	c.ensureIndex()
 
-	if ptr, ok := c.index[normalizeName(name)]; ok {
+	if ptr, ok := c.index[norm]; ok {
 		return *ptr
 	}
 	return nil
@@ -1445,23 +1458,13 @@ func floatEqual(a, b float64) bool {
 
 // Helper functions for evaluating operations during flattening
 func (c *ClassAd) evaluateBinaryOp(op string, left, right Value) Value {
-	// Create a temporary evaluator to use its operator logic
-	evaluator := NewEvaluator(c)
-	tempOp := &ast.BinaryOp{
-		Op:    op,
-		Left:  c.valueToExpr(left),
-		Right: c.valueToExpr(right),
-	}
-	return evaluator.Evaluate(tempOp)
+	// Dispatch directly on the operand values via the shared value-level core,
+	// avoiding a temporary AST + evaluator round-trip.
+	return NewEvaluator(c).applyBinaryValues(op, left, right)
 }
 
 func (c *ClassAd) evaluateUnaryOp(op string, operand Value) Value {
-	evaluator := NewEvaluator(c)
-	tempOp := &ast.UnaryOp{
-		Op:   op,
-		Expr: c.valueToExpr(operand),
-	}
-	return evaluator.Evaluate(tempOp)
+	return NewEvaluator(c).applyUnaryValue(op, operand)
 }
 
 // MarshalJSON implements the json.Marshaler interface for ClassAd.

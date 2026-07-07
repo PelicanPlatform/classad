@@ -11,6 +11,10 @@
 # Output of the go coverage tool
 *.out
 
+# Raw condor_status dumps used to (re)generate the benchmark corpus. Only the
+# small gzipped corpus (collections/vm/testdata/pool_sample.ads.gz) is committed.
+*.ads
+
 # Dependency directories
 vendor/
 

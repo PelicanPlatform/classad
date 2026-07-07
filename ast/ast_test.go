@@ -1,6 +1,7 @@
 package ast
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -213,5 +214,52 @@ func TestElvisExprString(t *testing.T) {
 				t.Errorf("ElvisExpr.String() = %q, want %q", s, tt.want)
 			}
 		})
+	}
+}
+
+// TestAppendQuoteStringBytesMatchesString checks that the []byte quoter produces
+// output identical to AppendQuoteString (and QuoteString) for values with and
+// without characters that need escaping, including control bytes and multi-byte
+// UTF-8, so the wire-side byte path never diverges from the string path.
+func TestAppendQuoteStringBytesMatchesString(t *testing.T) {
+	cases := []string{
+		"",
+		"plain",
+		"slot1@host.example.com",
+		`has "quotes"`,
+		`back\slash`,
+		"tab\tnewline\nreturn\r",
+		"bell\x07null\x00unit\x1f",
+		"unicode: héllo → 世界 ✓",
+		"mix\t\"a\"\\b\x01é",
+	}
+	for _, s := range cases {
+		want := AppendQuoteString(nil, s)
+		got := AppendQuoteStringBytes(nil, []byte(s))
+		if !bytes.Equal(got, want) {
+			t.Errorf("AppendQuoteStringBytes(%q) = %q, want %q", s, got, want)
+		}
+		if string(want) != QuoteString(s) {
+			t.Errorf("AppendQuoteString(%q) = %q, want QuoteString %q", s, want, QuoteString(s))
+		}
+	}
+}
+
+// TestQuoteAttributeNameReserved locks the reserved-word quoting behavior that the
+// allocation-free isReservedWord check replaced strings.ToLower for: a keyword in
+// any case must be single-quoted (it would otherwise re-lex as a literal), while a
+// normal identifier and a keyword-like-but-longer name stay bare.
+func TestQuoteAttributeNameReserved(t *testing.T) {
+	quoted := []string{"true", "True", "TRUE", "false", "undefined", "UnDefined", "error", "is", "IS", "isnt", "IsNt"}
+	for _, name := range quoted {
+		if got := QuoteAttributeName(name); got != "'"+name+"'" {
+			t.Errorf("QuoteAttributeName(%q) = %q, want it single-quoted", name, got)
+		}
+	}
+	bare := []string{"Cpus", "Memory", "TARGET", "trueish", "iso", "iss", "error_", "_is", "Requirements"}
+	for _, name := range bare {
+		if got := QuoteAttributeName(name); got != name {
+			t.Errorf("QuoteAttributeName(%q) = %q, want bare", name, got)
+		}
 	}
 }

@@ -1,0 +1,306 @@
+package collections
+
+import (
+	"encoding/binary"
+	"fmt"
+	"math"
+
+	"github.com/RoaringBitmap/roaring/v2"
+)
+
+// mmapSegIndex is a read-only view of a v2 sidecar index directly over its mmap'd
+// (or heap-read) bytes. Unlike the live store's in-RAM segIndex, it materializes no
+// per-value map: equality is a binary search over the sorted key run and range is a
+// boundary search plus a scan of only the matching keys, so resident memory is
+// O(#indexed attributes) regardless of a segment's value cardinality — the keys,
+// bitmap-offset arrays, and bitmap payloads all stay in the demand-paged mapping.
+// Bitmaps are built lazily via roaring FromBuffer (zero-copy) only for the postings
+// a probe actually touches.
+type mmapSegIndex struct {
+	data    []byte
+	upto    uint32
+	specGen uint64
+	allOff  uint32
+	catDir  map[uint32]uint32 // attr id -> file offset of its cat attr block
+	valDir  map[uint32]uint32 // attr id -> file offset of its val attr block
+}
+
+// parseMmapSidecar reads a v2 sidecar's fixed header and meta directory (a few
+// entries — one per indexed attribute), leaving keys, offsets, and bitmaps in the
+// mapping to be paged in on demand.
+func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
+	c := &cursor{b: data}
+	if c.u32() != sidecarMagic {
+		return nil, fmt.Errorf("archive: bad sidecar magic")
+	}
+	if v := c.u16(); v != sidecarVersion {
+		return nil, fmt.Errorf("archive: unsupported sidecar version %d", v)
+	}
+	metaOff := c.u32()
+	if c.err != nil {
+		return nil, c.err
+	}
+	m := &cursor{b: data, i: int(metaOff)}
+	si := &mmapSegIndex{data: data, catDir: map[uint32]uint32{}, valDir: map[uint32]uint32{}}
+	si.upto = m.u32()
+	si.specGen = m.u64()
+	si.allOff = m.u32()
+	catN := m.u32()
+	for i := uint32(0); i < catN; i++ {
+		id := m.u32()
+		si.catDir[id] = m.u32()
+	}
+	valN := m.u32()
+	for i := uint32(0); i < valN; i++ {
+		id := m.u32()
+		si.valDir[id] = m.u32()
+	}
+	if m.err != nil {
+		return nil, fmt.Errorf("archive: corrupt sidecar meta: %w", m.err)
+	}
+	return si, nil
+}
+
+func le32(b []byte, off uint32) uint32 { return binary.LittleEndian.Uint32(b[off:]) }
+func le64(b []byte, off uint32) uint64 { return binary.LittleEndian.Uint64(b[off:]) }
+
+// bitmapAt returns the length-prefixed roaring bitmap at file offset off as a
+// zero-copy view into the mapping.
+func (si *mmapSegIndex) bitmapAt(off uint32) *roaring.Bitmap {
+	c := &cursor{b: si.data, i: int(off), zeroCopy: true}
+	bm, err := c.bitmap()
+	if err != nil {
+		return roaring.New()
+	}
+	return bm
+}
+
+func (si *mmapSegIndex) allBitmap() *roaring.Bitmap { return si.bitmapAt(si.allOff) }
+
+// covers reports whether every usable probe's attribute is present in this index.
+func (si *mmapSegIndex) covers(usable []usableProbe) bool {
+	for _, up := range usable {
+		if up.cat {
+			if _, ok := si.catDir[up.attrID]; !ok {
+				return false
+			}
+		} else if _, ok := si.valDir[up.attrID]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// candidateOffsets mirrors segIndex.candidateOffsets: intersect every usable probe's
+// offset set (categoricals first — cheaper), returning a superset the caller
+// re-verifies. nil means no usable probe.
+func (si *mmapSegIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
+	var acc *roaring.Bitmap
+	for pass := 0; pass < 2; pass++ {
+		wantCat := pass == 0
+		for _, up := range usable {
+			if up.cat != wantCat {
+				continue
+			}
+			bm := si.probeOffsets(up)
+			if acc == nil {
+				acc = bm
+			} else {
+				acc.And(bm)
+			}
+			if acc.IsEmpty() {
+				return acc
+			}
+		}
+	}
+	return acc
+}
+
+// probeOffsets returns a fresh, mutable offset bitmap for one probe, reading only the
+// touched postings from the mapping.
+func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
+	if up.cat {
+		attrOff, ok := si.catDir[up.attrID]
+		if !ok {
+			return roaring.New()
+		}
+		excOff := le32(si.data, attrOff)
+		switch up.op {
+		case "==", "in":
+			bm := roaring.New()
+			for _, s := range up.svals {
+				if off, ok := si.catFind(attrOff, s); ok {
+					bm.Or(si.bitmapAt(off))
+				}
+			}
+			bm.Or(si.bitmapAt(excOff))
+			return bm
+		case "!=":
+			bm := si.allBitmap().Clone()
+			if off, ok := si.catFind(attrOff, up.svals[0]); ok {
+				bm.AndNot(si.bitmapAt(off))
+			}
+			return bm
+		}
+		return roaring.New()
+	}
+
+	attrOff, ok := si.valDir[up.attrID]
+	if !ok {
+		return roaring.New()
+	}
+	excOff := le32(si.data, attrOff)
+	switch up.op {
+	case "==", "in":
+		bm := roaring.New()
+		for _, f := range up.fvals {
+			if off, ok := si.valFind(attrOff, f); ok {
+				bm.Or(si.bitmapAt(off))
+			}
+		}
+		bm.Or(si.bitmapAt(excOff))
+		return bm
+	case "!=":
+		bm := si.allBitmap().Clone()
+		if off, ok := si.valFind(attrOff, up.fvals[0]); ok {
+			bm.AndNot(si.bitmapAt(off))
+		}
+		return bm
+	case "<", "<=", ">", ">=":
+		bm := si.valRange(attrOff, up.op, up.fvals[0])
+		bm.Or(si.bitmapAt(excOff))
+		return bm
+	}
+	return roaring.New()
+}
+
+// --- categorical attr block: excOff u32; n u32; keyOff[n+1] u32; bmOff[n] u32; keysBlob ---
+
+func (si *mmapSegIndex) catFind(attrOff uint32, key string) (bmOff uint32, ok bool) {
+	d := si.data
+	n := le32(d, attrOff+4)
+	keyOffBase := attrOff + 8
+	bmOffBase := keyOffBase + (n+1)*4
+	blobBase := bmOffBase + n*4
+	lo, hi := 0, int(n)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		ks := blobBase + le32(d, keyOffBase+uint32(mid)*4)
+		ke := blobBase + le32(d, keyOffBase+uint32(mid+1)*4)
+		switch cmpStrBytes(key, d[ks:ke]) {
+		case 0:
+			return le32(d, bmOffBase+uint32(mid)*4), true
+		case -1:
+			hi = mid
+		default:
+			lo = mid + 1
+		}
+	}
+	return 0, false
+}
+
+// --- value attr block: excOff u32; n u32; key[n] f64; bmOff[n] u32 ---
+
+func (si *mmapSegIndex) valKeyAt(keyBase uint32, i int) float64 {
+	return math.Float64frombits(le64(si.data, keyBase+uint32(i)*8))
+}
+
+func (si *mmapSegIndex) valFind(attrOff uint32, f float64) (bmOff uint32, ok bool) {
+	d := si.data
+	n := int(le32(d, attrOff+4))
+	keyBase := attrOff + 8
+	lo, hi := 0, n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		k := si.valKeyAt(keyBase, mid)
+		if k == f {
+			bmOffBase := keyBase + uint32(n)*8
+			return le32(d, bmOffBase+uint32(mid)*4), true
+		}
+		if f < k {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return 0, false
+}
+
+// valRange ORs the bitmaps of every key satisfying (op, t). Keys are sorted, so a
+// boundary search bounds the scan to the matching run — only those keys' pages and
+// bitmaps are touched.
+func (si *mmapSegIndex) valRange(attrOff uint32, op string, t float64) *roaring.Bitmap {
+	d := si.data
+	n := int(le32(d, attrOff+4))
+	keyBase := attrOff + 8
+	bmOffBase := keyBase + uint32(n)*8
+	bm := roaring.New()
+	// [from, to) is the index range of matching keys.
+	var from, to int
+	switch op {
+	case ">":
+		from, to = si.upperBound(keyBase, n, t), n
+	case ">=":
+		from, to = si.lowerBound(keyBase, n, t), n
+	case "<":
+		from, to = 0, si.lowerBound(keyBase, n, t)
+	case "<=":
+		from, to = 0, si.upperBound(keyBase, n, t)
+	}
+	for i := from; i < to; i++ {
+		bm.Or(si.bitmapAt(le32(d, bmOffBase+uint32(i)*4)))
+	}
+	return bm
+}
+
+// lowerBound returns the first index i with key[i] >= t (or n).
+func (si *mmapSegIndex) lowerBound(keyBase uint32, n int, t float64) int {
+	lo, hi := 0, n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if si.valKeyAt(keyBase, mid) < t {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// upperBound returns the first index i with key[i] > t (or n).
+func (si *mmapSegIndex) upperBound(keyBase uint32, n int, t float64) int {
+	lo, hi := 0, n
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		if si.valKeyAt(keyBase, mid) <= t {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo
+}
+
+// cmpStrBytes compares a string to a byte slice without allocating, returning -1, 0,
+// or 1.
+func cmpStrBytes(s string, b []byte) int {
+	n := len(s)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		if s[i] != b[i] {
+			if s[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	switch {
+	case len(s) < len(b):
+		return -1
+	case len(s) > len(b):
+		return 1
+	}
+	return 0
+}
