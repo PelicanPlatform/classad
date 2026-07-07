@@ -109,8 +109,11 @@ func BenchmarkPersistentRecovery(b *testing.B) {
 // for (dropping interning for self-contained records should stay competitive once a
 // dictionary recovers the shared attribute names).
 func TestPersistentDensityReport(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
-	n := 50000
+	// The inline-vs-interned density ratio is per-ad and holds at a few thousand ads;
+	// a dictionary trains just as well on this many, so we avoid a 50k-ad store.
+	n := 5000
 
 	// Interned (in-memory) + dict.
 	ci := populate(t, sample, n)

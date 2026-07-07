@@ -36,6 +36,7 @@ func countQuery(t *testing.T, c *Collection, qs string) int {
 // TestIndexMaintenance verifies an update moves an id between value buckets (the
 // old value's posting no longer matches) and a delete removes it entirely.
 func TestIndexMaintenance(t *testing.T) {
+	t.Parallel()
 	c := New(Options{
 		Shards:           4,
 		CategoricalAttrs: []string{"Arch"},
@@ -88,6 +89,7 @@ func TestIndexMaintenance(t *testing.T) {
 // query invariants hold on a moving target: no duplicate id in a result, and every
 // yielded ad actually matches the query (the re-verify contract).
 func TestIndexConcurrent(t *testing.T) {
+	t.Parallel()
 	c := New(Options{
 		Shards:           8,
 		CategoricalAttrs: []string{"Arch"},

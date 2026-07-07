@@ -57,6 +57,7 @@ func archiveQueryIDs(t *testing.T, a *Archive, qs string) []int {
 }
 
 func TestArchiveRoundTripAndQuery(t *testing.T) {
+	t.Parallel()
 	a, src := buildArchive(t, t.TempDir(), 500, ArchiveOptions{
 		CategoricalAttrs: []string{"Owner", "JobStatus"},
 		ValueAttrs:       []string{"Memory", "ClusterId"},
@@ -94,6 +95,7 @@ func TestArchiveRoundTripAndQuery(t *testing.T) {
 }
 
 func TestArchiveRecovery(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := ArchiveOptions{
 		CategoricalAttrs: []string{"Owner"},
@@ -124,6 +126,7 @@ func TestArchiveRecovery(t *testing.T) {
 }
 
 func TestArchiveCrashRecovery(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := ArchiveOptions{CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}}
 	// Append without Close/Flush: the active (tail) segment is left un-sealed and
@@ -150,6 +153,7 @@ func TestArchiveCrashRecovery(t *testing.T) {
 }
 
 func TestArchiveZonePruning(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// CompletionDate increases monotonically with ID, so successive segments hold
 	// disjoint, increasing time ranges — ideal for zone pruning.
@@ -185,6 +189,7 @@ func TestArchiveZonePruning(t *testing.T) {
 }
 
 func TestArchiveQueryLimitNewestFirst(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	a, _ := buildArchive(t, dir, 400, ArchiveOptions{CategoricalAttrs: []string{"Owner"}})
 	defer a.Close()
@@ -211,6 +216,7 @@ func TestArchiveQueryLimitNewestFirst(t *testing.T) {
 }
 
 func TestArchiveRotation(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	a, _ := buildArchive(t, dir, 400, ArchiveOptions{
 		CategoricalAttrs: []string{"Owner"},
@@ -263,6 +269,7 @@ func TestArchiveRotation(t *testing.T) {
 // and rotation. Run under -race. Every query result must be a valid subset of the
 // still-present ads (never a crash / torn read of a reaped segment).
 func TestArchiveConcurrentQueryRotate(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	a, _ := buildArchive(t, dir, 600, ArchiveOptions{
 		CategoricalAttrs: []string{"Owner"},
@@ -311,6 +318,7 @@ func TestArchiveConcurrentQueryRotate(t *testing.T) {
 // TestArchiveWireNativeFallback exercises the shared wire-native matcher, including
 // the fallback to a decode when a queried attribute is a non-literal expression.
 func TestArchiveWireNativeFallback(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	a, err := CreateArchive(ArchiveOptions{
 		Dir: dir, SegmentSize: 8 << 10, CategoricalAttrs: []string{"Owner"},
@@ -352,6 +360,7 @@ func TestArchiveWireNativeFallback(t *testing.T) {
 // TestArchiveLazyIndexLoad verifies sidecar indexes are not loaded at Open and that
 // a zone-pruned segment never pages its index in (H5).
 func TestArchiveLazyIndexLoad(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := ArchiveOptions{ValueAttrs: []string{"CompletionDate"}, ZoneAttrs: []string{"CompletionDate"}}
 	a, src := buildArchive(t, dir, 400, opts)
@@ -424,6 +433,7 @@ func mustParseQuery(t *testing.T, qs string) *vm.Query {
 // resident) and checks equality + range queries still match brute force after a
 // reopen goes through the mmap view.
 func TestArchiveHighCardinalityIndex(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := ArchiveOptions{ValueAttrs: []string{"Seq"}, CategoricalAttrs: []string{"GJID"}}
 	opts.Dir = dir
@@ -470,6 +480,7 @@ func TestArchiveHighCardinalityIndex(t *testing.T) {
 }
 
 func TestZoneMayMatch(t *testing.T) {
+	t.Parallel()
 	z := zoneRange{Min: 10, Max: 20}
 	cases := []struct {
 		op   string

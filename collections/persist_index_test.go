@@ -95,6 +95,7 @@ func runIndexBattery(t *testing.T, c *Collection, src map[int]*classad.ClassAd, 
 // collection are identical to brute force, both while open and after a reopen (where
 // the in-memory index is rebuilt from the recovered segments).
 func TestPersistentIndexMatchesFullScan(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -131,6 +132,7 @@ func TestPersistentIndexMatchesFullScan(t *testing.T) {
 // updates (a new record supersedes the old, indexed in a newer segment) and deletes,
 // on a persistent collection.
 func TestPersistentIndexAfterUpdatesAndDelete(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -164,6 +166,7 @@ func TestPersistentIndexAfterUpdatesAndDelete(t *testing.T) {
 // mmap segments an index and an in-flight indexed scan reference). Run with -race.
 // Each single query must see every matching key at most once (exactly-once).
 func TestPersistentIndexConcurrent(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

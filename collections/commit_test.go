@@ -12,6 +12,7 @@ import (
 // is dropped by the leader/handoff protocol. A CommitSync counter confirms the
 // sync ran and that coalescing occurred (fewer syncs than ads).
 func TestGroupCommitAllWritesLand(t *testing.T) {
+	t.Parallel()
 	const goroutines, perG = 16, 500
 	var syncs, adsSynced int64
 	c := New(Options{Shards: 4, CommitSync: func() { atomic.AddInt64(&syncs, 1) }})

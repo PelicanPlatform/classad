@@ -36,6 +36,7 @@ func countSegFiles(t *testing.T, shardDir string) int {
 // TestPersistentCompactReclaimsFiles verifies that compaction munmaps + unlinks the
 // source segment files it retires (P4 reclamation), while data stays intact.
 func TestPersistentCompactReclaimsFiles(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -94,6 +95,7 @@ func TestPersistentCompactReclaimsFiles(t *testing.T) {
 // exactly once even though both the source and destination copies may be on disk
 // (retired files are unlinked lazily), so a scan never double-counts.
 func TestPersistentCompactReopenNoDup(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -140,6 +142,7 @@ func TestPersistentCompactReopenNoDup(t *testing.T) {
 // compaction must defer munmap+unlink until the scan finishes (no use-after-munmap).
 // Run with -race. Exactly-once must hold throughout.
 func TestPersistentScanCompactRace(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -229,6 +232,7 @@ func TestPersistentScanCompactRace(t *testing.T) {
 // while open: writes land in segment files on disk, and Get/Scan/Query work.
 // (Recovery on reopen is a later milestone.)
 func TestPersistentBasic(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -311,6 +315,7 @@ func TestPersistentBasic(t *testing.T) {
 // TestPersistentReopen verifies recovery: after writing (incl. updates and
 // deletes) and Close, reopening the same directory rebuilds the exact live state.
 func TestPersistentReopen(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -402,6 +407,7 @@ func TestPersistentReopen(t *testing.T) {
 // (each msync'd by the group-commit sync) are recovered after a simulated crash
 // (reopen without ever calling Close).
 func TestPersistentCrashDurability(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -445,6 +451,7 @@ func TestPersistentCrashDurability(t *testing.T) {
 // persisted durable-length watermark is a tracked follow-up; today recovery stops
 // at the zero tail or an out-of-bounds record length.)
 func TestPersistentRecoveryNoPanicOnGarbageTail(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -494,6 +501,7 @@ func TestPersistentRecoveryNoPanicOnGarbageTail(t *testing.T) {
 // a record's payload mid-file makes recovery stop exactly there, recovering the
 // intact prefix and nothing past the corruption.
 func TestPersistentCRCStopsAtCorruptRecord(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -554,6 +562,7 @@ func TestPersistentCRCStopsAtCorruptRecord(t *testing.T) {
 
 // TestPersistentEmptyDirIsInMemory verifies Open with no Dir behaves like New.
 func TestPersistentEmptyDirIsInMemory(t *testing.T) {
+	t.Parallel()
 	c, err := Open(Options{Shards: 2})
 	if err != nil {
 		t.Fatal(err)
@@ -583,6 +592,7 @@ func retrainAd(t *testing.T, x int) *classad.ClassAd {
 // RetrainDict is persisted and reconstructed on reopen, so segments compressed
 // under it decode correctly across a restart.
 func TestPersistentRetrainDictReopen(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -654,6 +664,7 @@ func TestPersistentRetrainDictReopen(t *testing.T) {
 // crash (no Close) after the last retrain: every generation's dictionary is on disk
 // and recovery reconstructs whichever the surviving segments reference.
 func TestPersistentMultiRetrainReopen(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -703,6 +714,7 @@ func TestPersistentMultiRetrainReopen(t *testing.T) {
 // as an error (rather than panicking the process) on a degenerate sample set, and
 // that the collection keeps its previous codec and stays usable.
 func TestRetrainDictDegenerateNoPanic(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 1})
 	// Many identical, tiny ads: a distribution that trips zstd.BuildDict's Huffman
 	// training (integer divide by zero) absent the recover guard.
@@ -729,6 +741,7 @@ func TestRetrainDictDegenerateNoPanic(t *testing.T) {
 // across a reopen (no Close), and untouched keys remain — exercising the recovery
 // path for tombstones together with the per-commit tombstone flush.
 func TestPersistentDeleteSurvivesReopen(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -777,6 +790,7 @@ func TestPersistentDeleteSurvivesReopen(t *testing.T) {
 // retains dirty mmap pages regardless of msync), so this verifies the durability
 // code path executes rather than its on-disk effect.
 func TestDeleteTombstoneFlushPath(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

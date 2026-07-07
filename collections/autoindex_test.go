@@ -28,6 +28,7 @@ func suggestionMap(s []IndexSuggestion) map[string]IndexSuggestion {
 }
 
 func TestSuggestIndexes(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 4}) // no indexes configured
 	owners := []string{"alice", "bob", "carol", "dave", "eve"}
 	for i := 0; i < 300; i++ {
@@ -75,6 +76,7 @@ func TestSuggestIndexes(t *testing.T) {
 // TestSuggestIndexesExcludesConfigured verifies an already-indexed attribute is not
 // re-suggested.
 func TestSuggestIndexesExcludesConfigured(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 4, CategoricalAttrs: []string{"Owner"}})
 	for i := 0; i < 100; i++ {
 		ad, _ := classad.Parse(fmt.Sprintf(`[ Owner="u%d"; State="Idle" ]`, i%5))
@@ -95,6 +97,7 @@ func TestSuggestIndexesExcludesConfigured(t *testing.T) {
 
 // TestDemandTracking checks the raw demand counters split equality vs range.
 func TestDemandTracking(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 2})
 	c.Put([]byte("k"), mustParse(t, `[ A=1; B="x" ]`))
 	for i := 0; i < 3; i++ {

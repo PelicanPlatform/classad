@@ -20,6 +20,7 @@ func mustAd(t testing.TB, src string) *classad.ClassAd {
 }
 
 func TestPutGetDelete(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 4})
 	if _, ok := c.Get([]byte("missing")); ok {
 		t.Fatal("get of missing key reported found")
@@ -72,6 +73,7 @@ type constHasher struct{}
 func (constHasher) Hash([]byte) uint64 { return 0x1234 }
 
 func TestCollisionChain(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 8, Hasher: constHasher{}})
 	const n = 50
 	for i := 0; i < n; i++ {
@@ -113,6 +115,7 @@ func TestCollisionChain(t *testing.T) {
 }
 
 func TestScanAllOnce(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 8})
 	const n = 1000
 	for i := 0; i < n; i++ {
@@ -141,6 +144,7 @@ func TestScanAllOnce(t *testing.T) {
 }
 
 func TestQuery(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 4})
 	for i := 0; i < 100; i++ {
 		src := fmt.Sprintf(`[Id=%d; Cpus=%d; Owner=%q]`, i, i%8, []string{"alice", "bob"}[i%2])
@@ -176,6 +180,7 @@ func TestQuery(t *testing.T) {
 // shard's scan begins is yielded exactly once, even while concurrent updaters
 // churn existing keys.
 func TestScanExactlyOnceUnderUpdates(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 8})
 	const n = 2000
 	for i := 0; i < n; i++ {

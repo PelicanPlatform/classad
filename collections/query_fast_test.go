@@ -57,6 +57,7 @@ func assertSameMatches(t *testing.T, c *Collection, exprs []string) {
 // full-decode reference on synthetic ads with derived (chained) attributes, MY
 // scope, and an eval() fallback.
 func TestQueryFastPathTransitive(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 4})
 	for i := 0; i < 400; i++ {
 		// C -> B -> A: querying C must transitively decode B and A.
@@ -81,6 +82,7 @@ func TestQueryFastPathTransitive(t *testing.T) {
 
 // TestQueryFastPathReal validates the fast path against real ads.
 func TestQueryFastPathReal(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
 	c := populate(t, sample, 8000)
 	assertSameMatches(t, c, []string{

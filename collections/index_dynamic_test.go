@@ -92,6 +92,7 @@ func segsWithIndex(c *Collection) int {
 // TestDynamicAddBackfill: adding an index at runtime is correct before it is built
 // (full scan), and Reindex backfills it into existing segments.
 func TestDynamicAddBackfill(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 4}) // no indexes
 	src := putDynAds(t, c, 300)
 
@@ -128,6 +129,7 @@ func TestDynamicAddBackfill(t *testing.T) {
 // reclaims its postings at the next Reindex; dropping the last index clears segment
 // indexes entirely.
 func TestDynamicDropReclaim(t *testing.T) {
+	t.Parallel()
 	c := New(Options{
 		Shards:           4,
 		CategoricalAttrs: []string{"Owner"},
@@ -169,6 +171,7 @@ func TestDynamicDropReclaim(t *testing.T) {
 // TestAddDropSemantics covers idempotence, categorical-over-value precedence, and
 // no-op drops.
 func TestAddDropSemantics(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 2})
 
 	if !c.AddIndex([]string{"Owner"}, nil) {
@@ -208,6 +211,7 @@ func TestAddDropSemantics(t *testing.T) {
 }
 
 func TestSuggestDropsUnused(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 4, CategoricalAttrs: []string{"Owner", "Arch"}})
 	src := putDynAds(t, c, 200)
 	c.Reindex()
@@ -233,6 +237,7 @@ func TestSuggestDropsUnused(t *testing.T) {
 }
 
 func TestAutoTuneAdds(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 4})
 	src := putDynAds(t, c, 300)
 	for i := 0; i < 5; i++ {
@@ -264,6 +269,7 @@ func TestAutoTuneAdds(t *testing.T) {
 }
 
 func TestAutoTuneDropsUnused(t *testing.T) {
+	t.Parallel()
 	// Ghost is configured but no ad has it and no query uses it -> unused -> dropped.
 	c := New(Options{Shards: 4, CategoricalAttrs: []string{"Ghost"}})
 	putDynAds(t, c, 100)
@@ -287,6 +293,7 @@ func TestAutoTuneDropsUnused(t *testing.T) {
 // equal the brute-force answer regardless of index state; a mismatch or a race is a
 // bug. Run under -race.
 func TestDynamicConcurrent(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 8})
 	src := putDynAds(t, c, 500)
 	const qs = `Owner == "alice" && Memory > 4096`

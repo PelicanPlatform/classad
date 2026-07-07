@@ -11,8 +11,11 @@ import (
 // stored corpus, and verifies density drops sharply while every ad remains
 // correct and scannable.
 func TestRetrainDictImprovesDensityAndPreservesData(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
-	const n = 20000
+	// A few thousand ads is enough to train a dictionary that measurably improves
+	// density (per-ad gain), and to exercise the preserve-all-data scan.
+	const n = 4000
 	c := populate(t, sample, n)
 
 	before := liveBytes(c)
@@ -51,6 +54,7 @@ func TestRetrainDictImprovesDensityAndPreservesData(t *testing.T) {
 // TestInflightScanAcrossRetrain verifies a scan in progress still yields each key
 // once when the codec is retrained (and all segments recompressed) mid-iteration.
 func TestInflightScanAcrossRetrain(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
 	const n = 4000
 	c := New(Options{Shards: 1})
@@ -82,6 +86,7 @@ func TestInflightScanAcrossRetrain(t *testing.T) {
 // path concurrently with updaters and a scanner. Keys are stable and only
 // updated (never inserted/deleted), so a correct scan yields exactly n ads.
 func TestConcurrentRetrainUnderUpdates(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
 	const n = 4000
 	c := New(Options{Shards: 4})

@@ -23,6 +23,7 @@ func liveBytes(c *Collection) int {
 }
 
 func TestCompactionReclaimsAndPreservesData(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 2, SegmentSize: 1 << 16})
 	const n = 500
 	for i := 0; i < n; i++ {
@@ -81,6 +82,7 @@ func TestCompactionReclaimsAndPreservesData(t *testing.T) {
 // the compaction retires those segments, but the snapshot's windows keep them
 // alive, so the scan is unaffected.
 func TestInflightScanAcrossCompaction(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 1, SegmentSize: 1 << 14})
 	const n = 800
 	for i := 0; i < n; i++ {
@@ -118,6 +120,7 @@ func TestInflightScanAcrossCompaction(t *testing.T) {
 // TestScanExactlyOnceUnderUpdatesAndCompaction stresses the invariant with
 // concurrent updaters and a concurrent compactor while scanning.
 func TestScanExactlyOnceUnderUpdatesAndCompaction(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 8, SegmentSize: 1 << 14})
 	const n = 3000
 	for i := 0; i < n; i++ {

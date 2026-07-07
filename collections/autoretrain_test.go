@@ -6,6 +6,7 @@ import (
 )
 
 func TestAutoRetrain(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
 	c := populate(t, sample, 5000)
 	if c.currentCodec().Name() != "identity" {
@@ -47,6 +48,7 @@ func TestAutoRetrain(t *testing.T) {
 }
 
 func TestRefreshHotSet(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
 	c := populate(t, sample, 5000)
 	if len(c.HotAttrNames()) != 0 {

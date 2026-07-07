@@ -12,6 +12,7 @@ import (
 // does -- so switching a query response to the raw path changes nothing on the
 // wire.
 func TestDecodeRawMatchesFull(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
 	c := populate(t, sample, 500)
 	checked := 0

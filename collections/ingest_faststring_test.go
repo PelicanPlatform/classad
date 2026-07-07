@@ -12,6 +12,7 @@ import (
 // literal byte-for-byte the same as the full parser (the lexer's scanString), and
 // defers to the parser for anything it does not handle.
 func TestFastStringMatchesParser(t *testing.T) {
+	t.Parallel()
 	handled := []string{
 		`"hello"`, `""`, `"a\"b"`, `"a\\b"`, `"tab\tnl\nret\r"`,
 		`"\101\102"`, `"\7"`, `"\40"`, `"\377"`, `"a\'b"`, `"\b\f"`,

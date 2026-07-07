@@ -94,8 +94,11 @@ func populate(tb testing.TB, sample []*classad.ClassAd, n int) *Collection {
 
 // TestStoreDensityReport reports the store's memory density on real ads.
 func TestStoreDensityReport(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
-	n := 50000
+	// Density is per-ad (identity codec), so a few thousand tiled real ads is as
+	// representative as tens of thousands, at a fraction of the memory.
+	n := 5000
 	c := populate(t, sample, n)
 	live := liveBytes(c)
 	t.Logf("stored %d real ads: %d live bytes = %.0f bytes/ad (codec=%s)",

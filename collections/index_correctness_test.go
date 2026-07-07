@@ -85,6 +85,7 @@ func bruteIDs(src map[int]*classad.ClassAd, q *vm.Query) []int {
 }
 
 func TestIndexMatchesFullScan(t *testing.T) {
+	t.Parallel()
 	c, src := buildIndexedCorpus(t)
 	queries := []string{
 		`Arch == "X86_64"`,                     // categorical equality (case-insensitive)

@@ -6,6 +6,7 @@ import (
 )
 
 func TestZSTDCodecRoundTrip(t *testing.T) {
+	t.Parallel()
 	codecs := map[string]func() Codec{
 		"identity": func() Codec { return identityCodec{} },
 		"zstd": func() Codec {
@@ -41,8 +42,11 @@ func TestZSTDCodecRoundTrip(t *testing.T) {
 // TestCodecDensityReport compares stored density across identity, ZSTD, and
 // ZSTD+trained-dictionary on the real-ad corpus.
 func TestCodecDensityReport(t *testing.T) {
+	t.Parallel()
 	sample := loadCorpus(t)
-	const n = 20000
+	// Per-ad compression ratios stabilize well below this; a few thousand ads keeps
+	// the report representative without the memory of a huge store.
+	const n = 5000
 
 	report := func(name string, codec Codec) int {
 		c := New(Options{Shards: 8, Codec: codec})

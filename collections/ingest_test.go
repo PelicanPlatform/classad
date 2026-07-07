@@ -67,6 +67,7 @@ func loadCorpusTexts(tb testing.TB) []string {
 // TestUpdateOldMatchesParseOld verifies that direct old-ClassAd ingestion produces
 // ads equal to the parse-then-Put path, and that queries return identical results.
 func TestUpdateOldMatchesParseOld(t *testing.T) {
+	t.Parallel()
 	texts := loadCorpusTexts(t)
 	direct := New(Options{Shards: 4})
 	viaAST := New(Options{Shards: 4})
