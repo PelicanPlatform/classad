@@ -364,14 +364,19 @@ func (c *ClassAd) MarshalOld() string {
 	}
 
 	c.ensureSorted()
-	result := ""
+	// Build in a strings.Builder: `result += ...` in a loop is O(n^2) (each += copies
+	// the whole accumulated string), which allocated tens of MB to render a single
+	// large (~21 KB) ad.
+	var b strings.Builder
 	for i, attr := range c.ad.Attributes {
 		if i > 0 {
-			result += "\n"
+			b.WriteByte('\n')
 		}
-		result += fmt.Sprintf("%s = %s", unparseAttrName(attr.Name), attr.Value.String())
+		b.WriteString(unparseAttrName(attr.Name))
+		b.WriteString(" = ")
+		b.WriteString(attr.Value.String())
 	}
-	return result
+	return b.String()
 }
 
 // Insert inserts an attribute with an expression into the ClassAd.
