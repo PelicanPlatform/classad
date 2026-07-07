@@ -58,6 +58,12 @@ const (
 // ErrUnsupported for constructs it does not handle (so the caller can fall back to
 // parser.ParseExpr), or a syntax error for malformed input.
 func ParseExprToWire(input string, t *InternTable, dst []byte) ([]byte, error) {
+	return parseExprToWire(input, t, false, dst)
+}
+
+// parseExprToWire is ParseExprToWire with an explicit inline flag (inline-name node
+// variants, no interning), for the persistent-store encoding.
+func parseExprToWire(input string, t *InternTable, inline bool, dst []byte) ([]byte, error) {
 	w := wireParsePool.Get().(*wireParseState)
 	w.sr.Reset(input)
 	w.br.Reset(w.sr)
@@ -66,7 +72,7 @@ func ParseExprToWire(input string, t *InternTable, dst []byte) ([]byte, error) {
 	p.lex = w.lex
 	p.err = nil
 	p.em.t = t
-	p.em.inline = false
+	p.em.inline = inline
 	p.em.buf = dst // scratch retained across pool reuse
 
 	p.advance()

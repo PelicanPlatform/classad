@@ -118,6 +118,13 @@ func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{
 		if fastString(enc, name, val, unesc) {
 			continue
 		}
+		// Computed value: parse the expression straight to wire (no ast.Expr). On any
+		// error -- a construct the native parser does not handle, or malformed text --
+		// fall back to the reference parser, which is authoritative for both the
+		// encoding and the error message. ExprWire leaves no partial entry on error.
+		if err := enc.ExprWire(name, val); err == nil {
+			continue
+		}
 		expr, err := parser.ParseExpr(val)
 		if err != nil {
 			return fmt.Errorf("value of %q: %w", name, err)

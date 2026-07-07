@@ -7,20 +7,6 @@ import (
 	"github.com/PelicanPlatform/classad/parser"
 )
 
-// refNodeBytes encodes input's reference-parsed AST to wire node bytes via the
-// reference encoder, interning into a fresh table (so ids are assigned in the same
-// pre-order the native parser uses).
-func refNodeBytes(t *testing.T, input string) []byte {
-	t.Helper()
-	e, err := parser.ParseExpr(input)
-	if err != nil {
-		t.Fatalf("reference parse %q: %v", input, err)
-	}
-	enc := encoder{t: NewInternTable()}
-	enc.node(e)
-	return enc.buf
-}
-
 var handledExprs = []string{
 	`1`, `-5`, `3.14`, `1.0e10`, `"hi"`, `"a\"b\n"`, `true`, `false`, `undefined`, `error`,
 	`x`, `TARGET.Cpus`, `MY.Rank`,
@@ -40,17 +26,33 @@ var handledExprs = []string{
 }
 
 // TestParseExprToWireMatchesReference asserts the native wire parser produces
-// byte-identical wire to the reference parser+encoder for every handled construct.
+// byte-identical wire to the reference parser+encoder for every handled construct,
+// in both interned and inline modes.
 func TestParseExprToWireMatchesReference(t *testing.T) {
 	for _, in := range handledExprs {
-		want := refNodeBytes(t, in)
-		got, err := ParseExprToWire(in, NewInternTable(), nil)
+		e, err := parser.ParseExpr(in)
 		if err != nil {
-			t.Errorf("ParseExprToWire(%q): %v", in, err)
-			continue
+			t.Fatalf("reference parse %q: %v", in, err)
 		}
-		if !bytes.Equal(got, want) {
-			t.Errorf("%q:\n native %x\n   ref  %x", in, got, want)
+
+		// interned
+		refI := encoder{t: NewInternTable()}
+		refI.node(e)
+		gotI, err := parseExprToWire(in, NewInternTable(), false, nil)
+		if err != nil {
+			t.Errorf("interned %q: %v", in, err)
+		} else if !bytes.Equal(gotI, refI.buf) {
+			t.Errorf("interned %q:\n native %x\n   ref  %x", in, gotI, refI.buf)
+		}
+
+		// inline
+		refN := encoder{inline: true}
+		refN.node(e)
+		gotN, err := parseExprToWire(in, nil, true, nil)
+		if err != nil {
+			t.Errorf("inline %q: %v", in, err)
+		} else if !bytes.Equal(gotN, refN.buf) {
+			t.Errorf("inline %q:\n native %x\n   ref  %x", in, gotN, refN.buf)
 		}
 	}
 }
