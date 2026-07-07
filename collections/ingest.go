@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -37,9 +38,10 @@ func (c *Collection) UpdateOld(batch []OldAdUpdate) error {
 	codec := c.currentCodec()
 	enc := c.newStreamEncoder()
 	seen := make(map[uint32]struct{}, 128)
+	var unesc []byte // reused string-unescape scratch (see fastString)
 	byShard := make(map[int][]pendingPut, len(c.shards))
 	for i := range batch {
-		wireBytes, err := c.encodeOld(batch[i].Text, enc, seen)
+		wireBytes, err := c.encodeOld(batch[i].Text, enc, seen, &unesc)
 		if err != nil {
 			return fmt.Errorf("collections: ad %d: %w", i, err)
 		}
@@ -57,10 +59,10 @@ func (c *Collection) UpdateOld(batch []OldAdUpdate) error {
 // possible and falling back to the full parser for ads with duplicate attribute
 // names (which the parser dedups last-wins). enc and seen are reused across a
 // batch.
-func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[uint32]struct{}) ([]byte, error) {
+func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[uint32]struct{}, unesc *[]byte) ([]byte, error) {
 	enc.Reset()
 	clear(seen)
-	err := encodeOldText(text, enc, seen)
+	err := encodeOldText(text, enc, seen, unesc)
 	if err == errDuplicate {
 		ad, e := classad.ParseOld(text)
 		if e != nil {
@@ -76,7 +78,7 @@ func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[ui
 
 // encodeOldText parses old-ClassAd text (one ad) directly into enc, recording
 // each attribute name in seen to detect duplicates.
-func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{}) error {
+func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{}, unesc *[]byte) error {
 	for len(text) > 0 {
 		var line string
 		if nl := strings.IndexByte(text, '\n'); nl >= 0 {
@@ -111,6 +113,9 @@ func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{
 			return errDuplicate
 		}
 		if fastScalar(enc, name, val) {
+			continue
+		}
+		if fastString(enc, name, val, unesc) {
 			continue
 		}
 		expr, err := parser.ParseExpr(val)
@@ -160,6 +165,88 @@ func fastScalar(enc *wire.StreamEncoder, name, val string) bool {
 		return true
 	}
 	return false
+}
+
+// fastString handles a value that is exactly one double-quoted string literal
+// (with escapes), unescaping it into *unesc byte-for-byte as the lexer's scanString
+// does and emitting a string node -- avoiding the full expression parser for what,
+// on real ads, is the largest and most common non-scalar value (AddressV1 and other
+// escaped strings). It returns false, deferring to the parser, for anything it does
+// not handle identically to the lexer: a value that is not a lone string literal,
+// any non-ASCII byte (to avoid second-guessing the lexer's rune decoding), a null
+// (\0) or unknown escape (which the lexer rejects), or an unterminated string. The
+// parser therefore stays the source of truth for every uncertain case.
+//
+// Escape-free plain-ASCII strings are already handled by fastScalar (simpleStr)
+// without a copy; this covers the with-escape case.
+func fastString(enc *wire.StreamEncoder, name, val string, unesc *[]byte) bool {
+	if len(val) < 2 || val[0] != '"' {
+		return false
+	}
+	buf := (*unesc)[:0]
+	for i := 1; i < len(val); {
+		c := val[i]
+		switch {
+		case c == '"':
+			if i != len(val)-1 {
+				return false // content after the closing quote: not a lone string literal
+			}
+			*unesc = buf
+			enc.StringBytes(name, buf)
+			return true
+		case c >= 0x80:
+			return false // non-ASCII: let the parser's rune decoding handle it
+		case c == '\\':
+			i++
+			if i >= len(val) {
+				return false // unterminated escape
+			}
+			switch e := val[i]; e {
+			case 'b':
+				buf = append(buf, '\b')
+			case 't':
+				buf = append(buf, '\t')
+			case 'n':
+				buf = append(buf, '\n')
+			case 'f':
+				buf = append(buf, '\f')
+			case 'r':
+				buf = append(buf, '\r')
+			case '\\':
+				buf = append(buf, '\\')
+			case '"':
+				buf = append(buf, '"')
+			case '\'':
+				buf = append(buf, '\'')
+			case '0', '1', '2', '3', '4', '5', '6', '7':
+				// \NNN: up to 3 octal digits if the first is 0-3, else up to 2.
+				maxDigits := 2
+				if e <= '3' {
+					maxDigits = 3
+				}
+				oval := int(e - '0')
+				for d := 1; d < maxDigits && i+1 < len(val); d++ {
+					n := val[i+1]
+					if n < '0' || n > '7' {
+						break
+					}
+					oval = oval*8 + int(n-'0')
+					i++
+				}
+				if oval == 0 {
+					return false // \0 (null) -- the lexer rejects it; let it produce the error
+				}
+				buf = utf8.AppendRune(buf, rune(oval))
+			default:
+				return false // unknown escape -- the lexer rejects it
+			}
+			i++
+		default:
+			buf = append(buf, c)
+			i++
+		}
+	}
+	return false // no closing quote
 }
 
 type valClass int

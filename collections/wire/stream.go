@@ -114,6 +114,17 @@ func (s *StreamEncoder) String(name, v string) {
 	s.end(id, off)
 }
 
+// StringBytes writes a string attribute whose (already unescaped) value is in v.
+// It is String for a caller holding the value in a reused byte buffer, so no
+// intermediate string is allocated.
+func (s *StreamEncoder) StringBytes(name string, v []byte) {
+	id, off := s.begin(name)
+	s.entries = append(s.entries, nString)
+	s.entries = binary.AppendUvarint(s.entries, uint64(len(v)))
+	s.entries = append(s.entries, v...)
+	s.end(id, off)
+}
+
 // Bool writes a boolean attribute.
 func (s *StreamEncoder) Bool(name string, v bool) {
 	id, off := s.begin(name)
