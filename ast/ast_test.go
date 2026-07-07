@@ -1,6 +1,7 @@
 package ast
 
 import (
+	"bytes"
 	"testing"
 )
 
@@ -235,7 +236,7 @@ func TestAppendQuoteStringBytesMatchesString(t *testing.T) {
 	for _, s := range cases {
 		want := AppendQuoteString(nil, s)
 		got := AppendQuoteStringBytes(nil, []byte(s))
-		if string(got) != string(want) {
+		if !bytes.Equal(got, want) {
 			t.Errorf("AppendQuoteStringBytes(%q) = %q, want %q", s, got, want)
 		}
 		if string(want) != QuoteString(s) {
