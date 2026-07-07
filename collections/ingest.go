@@ -36,7 +36,7 @@ func (c *Collection) UpdateOld(batch []OldAdUpdate) error {
 	}
 	codec := c.currentCodec()
 	enc := c.newStreamEncoder()
-	seen := make(map[string]struct{}, 128)
+	seen := make(map[uint32]struct{}, 128)
 	byShard := make(map[int][]pendingPut, len(c.shards))
 	for i := range batch {
 		wireBytes, err := c.encodeOld(batch[i].Text, enc, seen)
@@ -57,7 +57,7 @@ func (c *Collection) UpdateOld(batch []OldAdUpdate) error {
 // possible and falling back to the full parser for ads with duplicate attribute
 // names (which the parser dedups last-wins). enc and seen are reused across a
 // batch.
-func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[string]struct{}) ([]byte, error) {
+func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[uint32]struct{}) ([]byte, error) {
 	enc.Reset()
 	clear(seen)
 	err := encodeOldText(text, enc, seen)
@@ -76,7 +76,7 @@ func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[st
 
 // encodeOldText parses old-ClassAd text (one ad) directly into enc, recording
 // each attribute name in seen to detect duplicates.
-func encodeOldText(text string, enc *wire.StreamEncoder, seen map[string]struct{}) error {
+func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{}) error {
 	for len(text) > 0 {
 		var line string
 		if nl := strings.IndexByte(text, '\n'); nl >= 0 {
@@ -211,15 +211,36 @@ func classifyNumberOrString(v string) valClass {
 	return numInt
 }
 
-// markSeen records the case-folded name and returns false if it was already
-// present (a duplicate attribute).
-func markSeen(seen map[string]struct{}, name string) bool {
-	fold := strings.ToLower(name)
-	if _, dup := seen[fold]; dup {
+// markSeen records a case-insensitive hash of the name and returns false if a
+// fold-equal name was already present (a duplicate attribute). Hashing instead of
+// keying the map on strings.ToLower(name) avoids allocating a lowercased copy for
+// every attribute -- which, on the concurrent ingest path, was ~10% of CPU and a
+// meaningful source of memory-allocator lock contention. A hash collision between
+// two distinct names in one ad merely reports a false duplicate, which routes the
+// ad to the parser fallback (encodeOld) -- correct, just slightly slower -- so
+// collisions never cost correctness, only a rare slow path.
+func markSeen(seen map[uint32]struct{}, name string) bool {
+	h := foldHash(name)
+	if _, dup := seen[h]; dup {
 		return false
 	}
-	seen[fold] = struct{}{}
+	seen[h] = struct{}{}
 	return true
+}
+
+// foldHash is an allocation-free case-insensitive FNV-1a hash over a name's bytes
+// (ASCII-folded), matching ClassAd attribute-name case-insensitivity.
+func foldHash(name string) uint32 {
+	const off, prime = 2166136261, 16777619
+	h := uint32(off)
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		h = (h ^ uint32(c)) * prime
+	}
+	return h
 }
 
 // isPlainASCII reports whether s consists only of printable ASCII (0x20–0x7e),
