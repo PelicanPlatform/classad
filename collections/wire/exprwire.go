@@ -1,31 +1,26 @@
 package wire
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
-	"strings"
 	"sync"
 
 	"github.com/PelicanPlatform/classad/parser"
 )
 
-// wireParseState is a reusable text->wire parse context: a strings.Reader and
-// bufio.Reader feeding a StreamingLexer, plus the NodeEmitter (for its scratch
-// buffer). Pooled so ParseExprToWire allocates neither a lexer/reader nor emitter
-// scratch per call -- only the output node bytes.
+// wireParseState is a reusable text->wire parse context: a ByteLexer indexing
+// directly into the input string, plus the NodeEmitter (for its scratch buffer).
+// Pooled so ParseExprToWire allocates neither a lexer nor emitter scratch per
+// call -- only the output node bytes (and, for a string literal with escapes,
+// its unescaped value).
 type wireParseState struct {
-	sr  *strings.Reader
-	br  *bufio.Reader
-	lex *parser.StreamingLexer
+	lex *parser.ByteLexer
 	p   exprParser
 }
 
 var wireParsePool = sync.Pool{
 	New: func() any {
-		sr := strings.NewReader("")
-		br := bufio.NewReader(sr)
-		return &wireParseState{sr: sr, br: br, lex: parser.NewExprLexer(br)}
+		return &wireParseState{lex: parser.NewByteLexer("")}
 	},
 }
 
@@ -65,9 +60,7 @@ func ParseExprToWire(input string, t *InternTable, dst []byte) ([]byte, error) {
 // variants, no interning), for the persistent-store encoding.
 func parseExprToWire(input string, t *InternTable, inline bool, dst []byte) ([]byte, error) {
 	w := wireParsePool.Get().(*wireParseState)
-	w.sr.Reset(input)
-	w.br.Reset(w.sr)
-	w.lex.ResetForExpr()
+	w.lex.Reset(input)
 	p := &w.p
 	p.lex = w.lex
 	p.err = nil
@@ -92,7 +85,7 @@ func parseExprToWire(input string, t *InternTable, inline bool, dst []byte) ([]b
 }
 
 type exprParser struct {
-	lex *parser.StreamingLexer
+	lex *parser.ByteLexer
 	em  NodeEmitter
 	cur parser.LexToken
 	err error
@@ -240,6 +233,12 @@ func (p *exprParser) parseExpr(minBP int) error {
 }
 
 func (p *exprParser) parsePrefix() error {
+	// A lexer error leaves p.cur unchanged (advance is a no-op once p.err is set);
+	// bail before dispatching so a prefix operator (e.g. "!<bad>") cannot recurse
+	// forever on the same token.
+	if p.err != nil {
+		return p.err
+	}
 	switch k := p.cur.Kind; k {
 	case parser.INTEGER_LITERAL:
 		p.em.Int(p.cur.Int)
