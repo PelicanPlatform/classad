@@ -164,6 +164,27 @@ func (e *NodeEmitter) WrapFuncID(mark int, name string, id uint32, argc int) {
 	e.insertAt(mark, e.scratch)
 }
 
+// RecordKey emits a record attribute key -- an interned id, or the inline name --
+// matching the reference encoder's putKey. Call before emitting the attribute's
+// value node.
+func (e *NodeEmitter) RecordKey(name string) {
+	if e.inline {
+		e.putString(name)
+	} else {
+		e.buf = binary.AppendUvarint(e.buf, uint64(e.t.Intern(name)))
+	}
+}
+
+// WrapRecord wraps the attrCount (key, node) pairs at [mark:end] into a record node
+// by inserting the record tag and ad-body header (hotCount 0, attrCount) at mark. A
+// record carries no hot header.
+func (e *NodeEmitter) WrapRecord(mark, attrCount int) {
+	e.scratch = append(e.scratch[:0], nRecord)
+	e.scratch = binary.AppendUvarint(e.scratch, 0) // hotCount
+	e.scratch = binary.AppendUvarint(e.scratch, uint64(attrCount))
+	e.insertAt(mark, e.scratch)
+}
+
 // WrapSelect wraps the record at [mark:end] into a select of attr: the select tag
 // is inserted at mark and the attribute id/name appended after the record (matching
 // the nSelect <record> <attr> layout).

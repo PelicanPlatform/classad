@@ -280,6 +280,8 @@ func (p *exprParser) parsePrefix() error {
 		p.em.WrapParen(mark)
 	case '{':
 		return p.parseList()
+	case '[':
+		return p.parseRecord()
 	case '-', '+', '!', '~':
 		p.advance()
 		p.em.UnOp(string(rune(k)))
@@ -336,5 +338,37 @@ func (p *exprParser) parseList() error {
 	}
 	p.advance()
 	p.em.WrapList(mark, count)
+	return p.err
+}
+
+func (p *exprParser) parseRecord() error {
+	mark := p.em.Mark() // before the (key, node) pairs
+	p.advance()         // consume '['
+	attrCount := 0
+	for p.cur.Kind != ']' {
+		if p.cur.Kind != parser.IDENTIFIER {
+			return ErrUnsupported // quoted/computed key: defer to the reference parser
+		}
+		key := p.cur.Str
+		p.advance()
+		if p.cur.Kind != '=' {
+			return fmt.Errorf("wire: expected '=' in record")
+		}
+		p.advance()
+		p.em.RecordKey(key) // intern the key before its value (reference pre-order)
+		if err := p.parseExpr(0); err != nil {
+			return err
+		}
+		attrCount++
+		if p.cur.Kind != ';' {
+			break
+		}
+		p.advance() // ';' separator (also tolerates a trailing ';')
+	}
+	if p.cur.Kind != ']' {
+		return fmt.Errorf("wire: expected ']' in record")
+	}
+	p.advance()
+	p.em.WrapRecord(mark, attrCount)
 	return p.err
 }

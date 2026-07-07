@@ -23,6 +23,10 @@ var handledExprs = []string{
 	`(TARGET.Cpus >= RequestCpus) && (TARGET.Memory >= RequestMemory)`,
 	`ifThenElse(State == "Claimed", RemoteOwner, "none")`,
 	`(GPUs =?= undefined) || (GPUs == 0) || ((CPUs > 8 * GPUs) && (Memory > 32000 * GPUs))`,
+	// records
+	`[]`, `[a = 1]`, `[a = 1; b = 2]`, `[x = a + b; y = TARGET.Cpus]`,
+	`[a = [b = 1; c = 2]]`, `['a b' = 1]`,
+	`{ [p = "primary"; port = 9618; noUDP = true], [p = "IPv4"; port = 41525] }`, // AddressV1-shaped
 }
 
 // TestParseExprToWireMatchesReference asserts the native wire parser produces
@@ -60,7 +64,9 @@ func TestParseExprToWireMatchesReference(t *testing.T) {
 // TestParseExprToWireFallsBack confirms unsupported constructs return ErrUnsupported
 // (so the caller can fall back) rather than producing wrong wire.
 func TestParseExprToWireFallsBack(t *testing.T) {
-	for _, in := range []string{`[a = 1]`, `[a = 1; b = 2]`} {
+	for _, in := range []string{
+		`-9223372036854775808`, // int64-min magnitude: handled specially by the reference
+	} {
 		if _, err := ParseExprToWire(in, NewInternTable(), nil); err == nil {
 			t.Errorf("ParseExprToWire(%q) succeeded; expected fallback", in)
 		}
