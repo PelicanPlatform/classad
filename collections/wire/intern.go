@@ -11,6 +11,7 @@ package wire
 import (
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // InternTable maps attribute (and function) names to small integer ids so the
@@ -30,16 +31,26 @@ type InternTable struct {
 	// exact names can map to one id (e.g. "Owner", "owner", "OWNER").
 	byExact map[string]uint32
 	byFold  map[string]uint32 // ToLower(name) -> id
-	canon   []string          // id -> first-seen casing
+	// canon (id -> first-seen casing) is published as an immutable, append-only
+	// slice behind an atomic pointer so Name resolves an id with no lock. Name is
+	// called for every attribute of every ad during serialization; an RWMutex.RLock
+	// there -- though logically a read -- serializes on its atomic reader counter
+	// across cores, which alone was ~23% of CPU on concurrent large-ad scans.
+	// Writers (Intern, holding mu) copy-append and atomically publish; existing
+	// entries are never mutated, so a lock-free reader always sees a valid snapshot.
+	canon atomic.Pointer[[]string]
 }
 
 // NewInternTable returns an empty table. Id 0 is a valid id (the first name
 // interned); callers that need a sentinel should track presence separately.
 func NewInternTable() *InternTable {
-	return &InternTable{
+	t := &InternTable{
 		byExact: make(map[string]uint32),
 		byFold:  make(map[string]uint32),
 	}
+	empty := []string{}
+	t.canon.Store(&empty)
+	return t
 }
 
 // Intern returns the id for name, allocating a new id (and recording name's
@@ -65,9 +76,13 @@ func (t *InternTable) Intern(name string) uint32 {
 	id, ok = t.byFold[fold]
 	if !ok {
 		// First time any casing of this name is seen: allocate an id and record
-		// this casing as canonical.
-		id = uint32(len(t.canon))
-		t.canon = append(t.canon, name)
+		// this casing as canonical. Copy-append (cap==len forces a fresh backing
+		// array) so lock-free readers holding the old snapshot are unaffected, then
+		// publish atomically. New names are rare after warmup, so the copy is cheap.
+		old := *t.canon.Load()
+		id = uint32(len(old))
+		next := append(old[:len(old):len(old)], name)
+		t.canon.Store(&next)
 		t.byFold[fold] = id
 	}
 	t.byExact[name] = id
@@ -91,27 +106,23 @@ func (t *InternTable) LookupID(name string) (uint32, bool) {
 // Name returns the canonical (first-seen) casing for id, or ("", false) if id
 // was never allocated.
 func (t *InternTable) Name(id uint32) (string, bool) {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	if int(id) >= len(t.canon) {
+	canon := *t.canon.Load() // lock-free: canon entries are immutable once published
+	if int(id) >= len(canon) {
 		return "", false
 	}
-	return t.canon[id], true
+	return canon[id], true
 }
 
 // Len returns the number of interned names (== the next id to be allocated).
 func (t *InternTable) Len() int {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return len(t.canon)
+	return len(*t.canon.Load())
 }
 
 // snapshotNames returns a copy of the id->name slice, for embedding a standalone
 // intern table into a self-contained ad.
 func (t *InternTable) snapshotNames() []string {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	out := make([]string, len(t.canon))
-	copy(out, t.canon)
+	canon := *t.canon.Load()
+	out := make([]string, len(canon))
+	copy(out, canon)
 	return out
 }
