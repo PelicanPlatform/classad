@@ -248,3 +248,26 @@ func forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec)
 		}
 	}
 }
+
+// forEachVisibleKeyed is forEachVisible that also passes each record's key (a
+// view into the frozen window; the callback must not retain it). Used by the
+// chained scan, which needs a record's key to find its parent.
+func forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec) bool) {
+	for _, w := range wins {
+		for off := 0; off < w.used; {
+			o := uint32(off)
+			total := recTotalLen(w.data, o)
+			if total == 0 {
+				break
+			}
+			seq := recSeq(w.data, o)
+			sup := recSuperseded(w.data, o)
+			if seq <= s0 && sup > s0 {
+				if !fn(recKey(w.data, o), recAd(w.data, o), w.codec) {
+					return
+				}
+			}
+			off += int(total)
+		}
+	}
+}

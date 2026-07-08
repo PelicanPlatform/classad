@@ -82,6 +82,25 @@ type Options struct {
 	// the prior window and re-delivers (at-least-once is preserved). Catch-up is
 	// never coalesced.
 	WatchCoalesce time.Duration
+
+	// ParentKeyFor, if set, gives an ad a parent: it maps a child's key to its
+	// parent's key (return nil for a top-level ad with no parent). A child then
+	// resolves attribute references it lacks by falling through to its parent --
+	// the primitive "join" the job queue needs, where a proc ad chains to its
+	// cluster ad so a query like `DAGManJobId == 42` sees the cluster's attribute.
+	// A family (a root and all its descendants) is co-located in one shard -- the
+	// collection routes every key to the shard of its ultimate root -- so chained
+	// evaluation is consistent and lock-free. Parent bindings are immutable: a
+	// key's parent must not change across updates. Default nil disables chaining
+	// (every ad is standalone) and keeps the plain single-key routing/scan.
+	ParentKeyFor func(key []byte) []byte
+
+	// IsStructural, if set, marks a key as a structural (parent-only) ad that
+	// exists solely to be chained to -- e.g. a job cluster ad. Structural ads are
+	// stored and used as parents but are hidden from Query/Scan/Watch results by
+	// default (like condor_q omitting cluster ads). Default nil treats every ad as
+	// a normal, visible ad. Only meaningful together with ParentKeyFor.
+	IsStructural func(key []byte) bool
 }
 
 // AdUpdate is one insert-or-update in a batch.
@@ -128,6 +147,39 @@ type Collection struct {
 	hub           *watchHub
 	watchBuf      int
 	watchCoalesce time.Duration
+
+	// Parent/child chaining (see docs/PARENT_CHILD.md). parentKeyFor derives a
+	// child's parent key (nil ⇒ no chaining); isStructural marks parent-only ads
+	// hidden from results. Both nil unless configured.
+	parentKeyFor func(key []byte) []byte
+	isStructural func(key []byte) bool
+}
+
+// rootKey returns the key of the family root for key: it follows parentKeyFor to
+// the top (a key with no parent). With no chaining configured it returns key
+// unchanged. The result selects the shard, co-locating a whole family.
+func (c *Collection) rootKey(key []byte) []byte {
+	if c.parentKeyFor == nil {
+		return key
+	}
+	for {
+		p := c.parentKeyFor(key)
+		if p == nil {
+			return key
+		}
+		key = p
+	}
+}
+
+// shardOf selects the shard for key by the family root, so a parent and all its
+// descendants share one shard (enabling consistent, lock-free chained
+// evaluation). h is key's own hash (already computed by the caller for the bucket
+// chain); without chaining the shard is just h & mask, no re-hash.
+func (c *Collection) shardOf(key []byte, h uint64) int {
+	if c.parentKeyFor == nil {
+		return int(h & c.mask)
+	}
+	return int(c.h.Hash(c.rootKey(key)) & c.mask)
 }
 
 // writeError returns the first sticky segment-allocation error across shards
@@ -215,6 +267,8 @@ func New(opts Options) *Collection {
 			sh.delLog = newDeleteLog(opts.WatchHistory, 0)
 		}
 	}
+	c.parentKeyFor = opts.ParentKeyFor
+	c.isStructural = opts.IsStructural
 	c.parallelMinBytes = defaultParallelMinBytes
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
 	if c.queryPar >= 2 {
@@ -261,7 +315,7 @@ func (c *Collection) Update(batch []AdUpdate) error {
 	for i := range batch {
 		stored := codec.Compress(nil, c.encodeAd(batch[i].Ad.AST()))
 		h := c.h.Hash(batch[i].Key)
-		si := int(h & c.mask)
+		si := c.shardOf(batch[i].Key, h)
 		byShard[si] = append(byShard[si], pendingPut{hash: h, key: batch[i].Key, ad: stored, codec: codec})
 	}
 	for si, writes := range byShard {
@@ -277,7 +331,7 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	codec := c.currentCodec()
 	stored := codec.Compress(nil, c.encodeAd(ad.AST()))
 	h := c.h.Hash(key)
-	c.shards[h&c.mask].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
+	c.shards[c.shardOf(key, h)].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
 	return c.writeError()
 }
 
@@ -285,7 +339,7 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 // tombstone: scans already in progress still see the pre-delete version.
 func (c *Collection) Delete(key []byte) bool {
 	h := c.h.Hash(key)
-	sh := c.shards[h&c.mask]
+	sh := c.shards[c.shardOf(key, h)]
 	sh.mu.Lock()
 	seq := sh.commitSeq + 1
 	ok := sh.del(h, key, seq)
@@ -306,7 +360,7 @@ func (c *Collection) Delete(key []byte) bool {
 // Get returns the current ad for key, decoded, or (nil, false).
 func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	h := c.h.Hash(key)
-	sh := c.shards[h&c.mask]
+	sh := c.shards[c.shardOf(key, h)]
 	stored, codec, ok := sh.get(h, key)
 	if !ok {
 		return nil, false
@@ -314,6 +368,18 @@ func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	ad, err := c.decodeAd(stored, codec)
 	if err != nil {
 		return nil, false
+	}
+	// Chain to the parent (same shard) so the returned ad resolves inherited
+	// attributes -- Get mirrors query semantics.
+	if c.parentKeyFor != nil {
+		if pk := c.parentKeyFor(key); pk != nil {
+			ph := c.h.Hash(pk)
+			if pad, pcodec, ok := sh.get(ph, pk); ok {
+				if parent, err := c.decodeAd(pad, pcodec); err == nil {
+					mergeParent(ad, parent)
+				}
+			}
+		}
 	}
 	return ad, true
 }
@@ -336,6 +402,15 @@ func (c *Collection) Len() int {
 // when that shard's scan started.
 func (c *Collection) Scan() iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
+		if c.parentKeyFor != nil {
+			qp := queryPlan{ws: &wireScope{ctx: c}} // q nil ⇒ no filter, just chain + hide structural
+			for _, sh := range c.shards {
+				if !c.scanShardChained(sh, qp, yield) {
+					return
+				}
+			}
+			return
+		}
 		q := queryPlan{}
 		emit := c.yieldAd(yield)
 		for _, sh := range c.shards {
@@ -377,6 +452,17 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 			wireOK:   q.Native() && plan.PartialSafe,
 			ws:       ws,
 			resolver: ws.resolve, // bound once to avoid a per-ad closure allocation
+		}
+		// Chained collection: a serial two-pass scan per shard resolves each ad's
+		// inherited (parent) attributes. Indexes and query fan-out are bypassed here
+		// (they don't yet understand chaining); correctness first.
+		if c.parentKeyFor != nil {
+			for _, sh := range c.shards {
+				if !c.scanShardChained(sh, qp, yield) {
+					return
+				}
+			}
+			return
 		}
 		// Record which attributes the query filters on (for SuggestIndexes), then,
 		// if the query has an index-usable constraint, visit only candidate ads;
@@ -437,6 +523,87 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, emit func(w []byte) bool
 	return cont
 }
 
+// mergeParent flattens into child every attribute of parent that child does not
+// already define (child overrides parent), producing a standalone ad. This is
+// needed for output because SetParent only chains expression evaluation, not
+// direct attribute reads (EvaluateAttr*, GetAttributes) or serialization -- a
+// query result or watch event must carry the inherited attributes inline, as
+// condor_q shows a job's full ad and condor_history flattens it.
+func mergeParent(child, parent *classad.ClassAd) {
+	for _, name := range parent.GetAttributes() {
+		if _, has := child.Lookup(name); has {
+			continue // child overrides
+		}
+		if expr, ok := parent.Lookup(name); ok {
+			child.InsertExpr(name, expr)
+		}
+	}
+}
+
+// scanShardChained scans a shard for a collection with parent/child chaining. It
+// first collects the shard's structural (parent) ads at the snapshot, then
+// evaluates every non-structural ad with its parent chained in -- so a query
+// resolves attributes the child inherits from its parent -- and yields matches
+// with the parent set (SetParent) so the consumer sees the inherited attributes
+// too. Structural (parent-only) ads are hidden from the output. The whole family
+// is co-located in this shard, so both passes read one consistent snapshot with
+// no cross-shard fetch.
+func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*classad.ClassAd) bool) bool {
+	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
+
+	// Pass 1: collect structural (parent) ads' decompressed wire bytes. Parents
+	// are few (one per family), so this map stays small.
+	parents := map[string][]byte{}
+	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		if c.isStructural != nil && c.isStructural(key) {
+			if w, err := codec.Decompress(nil, ad); err == nil {
+				parents[string(key)] = w // owns its buffer (nil dst)
+			}
+		}
+		return true
+	})
+
+	// Pass 2: evaluate children (and standalone ads); skip structural ads.
+	cont := true
+	var dbuf []byte
+	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		if c.isStructural != nil && c.isStructural(key) {
+			return true // structural ads are hidden from results
+		}
+		w, err := codec.Decompress(dbuf[:0], ad)
+		if err != nil {
+			return true
+		}
+		dbuf = w
+		var parentW []byte
+		if pk := c.parentKeyFor(key); pk != nil {
+			parentW = parents[string(pk)]
+		}
+		qp.ws.parent = wire.Ad(parentW) // nil ⇒ no parent
+		if qp.q != nil && !matchWire(w, qp) {
+			return true
+		}
+		a, err := c.decodeWire(w)
+		if err != nil {
+			return true
+		}
+		child := classad.FromAST(a)
+		if parentW != nil {
+			if pa, err := c.decodeWire(parentW); err == nil {
+				mergeParent(child, classad.FromAST(pa))
+			}
+		}
+		if !yield(child) {
+			cont = false
+			return false
+		}
+		return true
+	})
+	qp.ws.parent = nil
+	return cont
+}
+
 // yieldAd is the emit callback for the classic Query/Scan path: decode w to a
 // *classad.ClassAd (skipping malformed records) and yield it.
 func (c *Collection) yieldAd(yield func(*classad.ClassAd) bool) func(w []byte) bool {
@@ -464,13 +631,25 @@ func matchWire(w []byte, qp queryPlan) bool {
 		// A queried attribute was a non-literal expression; fall back.
 	}
 	if qp.plan.PartialSafe {
-		return qp.m.Matches(partialDecodeWire(qp.ws.ctx, w, qp.plan.Seeds))
+		child := partialDecodeWire(qp.ws.ctx, w, qp.plan.Seeds)
+		if qp.ws.parent != nil {
+			// The child inherits any seed it lacks from the parent, so decode the
+			// same seeds from the parent and chain.
+			child.SetParent(partialDecodeWire(qp.ws.ctx, []byte(qp.ws.parent), qp.plan.Seeds))
+		}
+		return qp.m.Matches(child)
 	}
 	a, err := qp.ws.ctx.decodeWire(w)
 	if err != nil {
 		return false
 	}
-	return qp.m.Matches(classad.FromAST(a))
+	child := classad.FromAST(a)
+	if qp.ws.parent != nil {
+		if pa, err := qp.ws.ctx.decodeWire([]byte(qp.ws.parent)); err == nil {
+			child.SetParent(classad.FromAST(pa))
+		}
+	}
+	return qp.m.Matches(child)
 }
 
 // partialDecodeWire builds a ClassAd containing only the attributes named in
