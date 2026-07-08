@@ -62,6 +62,16 @@ type Options struct {
 	// oversubscribing). Small scans and indexed queries run serial regardless.
 	// See parallel_scan.go / docs/PARALLEL_QUERY.md.
 	QueryParallelism int
+	// WatchHistory enables the Watch subscription verb (see docs/WATCH.md). It is the
+	// per-shard capacity of the delete journal — how many recent deletes are retained
+	// so a resuming watcher can be told precisely which keys were removed. 0 (default)
+	// disables Watch entirely (no journal, no live notification, zero write-path cost).
+	// A larger value lets clients resume incrementally from further back before
+	// falling to a full replay.
+	WatchHistory int
+	// WatchBuffer is the per-watcher live event-channel capacity (default 1024). A
+	// watcher that overflows it is told to resync rather than stalling writers.
+	WatchBuffer int
 }
 
 // AdUpdate is one insert-or-update in a batch.
@@ -103,6 +113,10 @@ type Collection struct {
 	queryPar         int
 	qsem             chan struct{}
 	parallelMinBytes int
+
+	// Watch (see watch.go / docs/WATCH.md). hub is nil unless WatchHistory > 0.
+	hub      *watchHub
+	watchBuf int
 }
 
 // writeError returns the first sticky segment-allocation error across shards
@@ -177,6 +191,18 @@ func New(opts Options) *Collection {
 		c.hotSet.Store(&hotSetHolder{set})
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
+	if opts.WatchHistory > 0 {
+		c.hub = newWatchHub()
+		c.watchBuf = opts.WatchBuffer
+		if c.watchBuf <= 0 {
+			c.watchBuf = 1024
+		}
+		for i, sh := range c.shards {
+			sh.idx = i
+			sh.hub = c.hub
+			sh.delLog = newDeleteLog(opts.WatchHistory, 0)
+		}
+	}
 	c.parallelMinBytes = defaultParallelMinBytes
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
 	if c.queryPar >= 2 {
@@ -257,6 +283,10 @@ func (c *Collection) Delete(key []byte) bool {
 	sh.mu.Unlock()
 	if ok {
 		sh.sync() // durability point for the tombstone (not coalesced)
+		if sh.delLog != nil {
+			sh.delLog.record(key, seq) // retain for resuming watchers
+			sh.hub.publish(sh.idx, seq, key, nil, nil, true)
+		}
 	}
 	return ok
 }

@@ -38,6 +38,13 @@ type shard struct {
 	// overwrite, a delete writes no new record, so recovery's max-seq rule cannot
 	// re-derive it — the tombstone itself must reach disk). Guarded by mu.
 	dirtySup []supRef
+
+	// Watch support (see watch.go); nil/zero unless WatchHistory > 0. idx is the
+	// shard's index (used to tag events for the cursor). hub fans committed changes
+	// to live watchers; delLog retains recent deletes for resuming watchers.
+	idx    int
+	hub    *watchHub
+	delLog *deleteLog
 }
 
 // supRef identifies a supersededBySeq field (a record's tombstone) that must be

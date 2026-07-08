@@ -123,6 +123,11 @@ func (sh *shard) applyWrites(writes []pendingPut) {
 	sh.commitSeq = seq
 	sh.mu.Unlock()
 	sh.sync()
+	if sh.hub != nil {
+		for i := range writes {
+			sh.hub.publish(sh.idx, seq, writes[i].key, writes[i].ad, writes[i].codec, false)
+		}
+	}
 }
 
 // applyOne commits a single write under the shard lock at a fresh commit
@@ -134,6 +139,9 @@ func (sh *shard) applyOne(p pendingPut) {
 	sh.commitSeq = seq
 	sh.mu.Unlock()
 	sh.sync()
+	if sh.hub != nil {
+		sh.hub.publish(sh.idx, seq, p.key, p.ad, p.codec, false)
+	}
 }
 
 // applyBatch commits a coalesced batch of requests under the shard lock at a
@@ -149,6 +157,13 @@ func (sh *shard) applyBatch(batch []*commitReq) {
 	sh.commitSeq = seq
 	sh.mu.Unlock()
 	sh.sync()
+	if sh.hub != nil {
+		for _, r := range batch {
+			for i := range r.writes {
+				sh.hub.publish(sh.idx, seq, r.writes[i].key, r.writes[i].ad, r.writes[i].codec, false)
+			}
+		}
+	}
 }
 
 // sync is the durability point: where a future durable collection would fsync or
