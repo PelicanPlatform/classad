@@ -373,6 +373,7 @@ func (c *ClassAd) unparse(includePrivate bool) string {
 //	ad, _ := classad.Parse("[Cpus = 4; Memory = 8192]")
 //	oldFmt := ad.MarshalOld()
 //	// Returns: "Cpus = 4\nMemory = 8192"
+//
 // MarshalOld excludes private (secret) attributes; use MarshalOldWithPrivate for
 // the full ad. See IsPrivateAttribute.
 func (c *ClassAd) MarshalOld() string { return c.marshalOld(false) }
@@ -1509,6 +1510,7 @@ func (c *ClassAd) evaluateUnaryOp(op string, operand Value) Value {
 //	ad, _ := classad.Parse(`[x = 5; y = x + 3; name = "test"]`)
 //	jsonBytes, _ := json.Marshal(ad)
 //	// {"name":"test","x":5,"y":"\/Expr(x + 3)\/"}
+//
 // MarshalJSON implements json.Marshaler, excluding private (secret) attributes so
 // that any HTTP/JSON response that marshals a ClassAd is default-safe -- a job's
 // ClaimId or a slot's Capability never reaches a client through json.Marshal. Use

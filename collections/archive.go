@@ -429,8 +429,10 @@ func (a *Archive) Close() error {
 		err = e
 	}
 	for _, as := range a.segs {
-		as.seg.runReapHook() // unmap the sidecar index if it was lazily mapped
-		if e := as.seg.unmap(); e != nil && err == nil {
+		// Unmap data + sidecar index, but only once no live watch/query still pins the
+		// segment; a pinned segment's unmap is deferred to its last unpin. Unmapping a
+		// mapping a watcher is still reading is a use-after-free that -race flagged.
+		if e := as.seg.closeUnmap(); e != nil && err == nil {
 			err = e
 		}
 	}
