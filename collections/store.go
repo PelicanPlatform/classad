@@ -1,7 +1,6 @@
 package collections
 
 import (
-	"bytes"
 	"iter"
 	"runtime"
 	"strings"
@@ -280,6 +279,20 @@ func New(opts Options) *Collection {
 	}
 	c.parentKeyFor = opts.ParentKeyFor
 	c.isStructural = opts.IsStructural
+	if c.parentKeyFor != nil {
+		// Give each shard a pointer-free child counter keyed by the parent's dir-hash,
+		// so Delete detects an emptied structural parent in O(1). A key is a chained
+		// child iff parentKeyFor returns a parent for it (nil for structural/root ads).
+		for _, sh := range c.shards {
+			sh.childParentHash = func(key []byte) (uint64, bool) {
+				pk := c.parentKeyFor(key)
+				if pk == nil {
+					return 0, false
+				}
+				return c.h.Hash(pk), true
+			}
+		}
+	}
 	if len(opts.ParentPrivateAttrs) > 0 {
 		c.parentPrivate = make(map[string]struct{}, len(opts.ParentPrivateAttrs))
 		for _, a := range opts.ParentPrivateAttrs {
@@ -359,7 +372,7 @@ func (c *Collection) Delete(key []byte) bool {
 	sh := c.shards[c.shardOf(key, h)]
 	sh.mu.Lock()
 	seq := sh.commitSeq + 1
-	ok := sh.del(h, key, seq)
+	ok, parentEmptied := sh.del(h, key, seq)
 	if ok {
 		sh.commitSeq = seq
 	}
@@ -371,36 +384,17 @@ func (c *Collection) Delete(key []byte) bool {
 			sh.hub.publish(sh.idx, seq, key, nil, nil, true)
 		}
 		// Auto-delete a structural parent whose last child just left (HTCondor
-		// ClusterCleanup): a structural ad exists only to be chained to, so once
-		// no child references it, remove it. The parent is co-located in this shard.
-		if c.parentKeyFor != nil && c.isStructural != nil {
-			if pk := c.parentKeyFor(key); pk != nil && c.isStructural(pk) && !c.hasChildren(pk) {
+		// ClusterCleanup): a structural ad exists only to be chained to, so once no
+		// child references it, remove it. sh.del maintained the live-child count and
+		// flags when it hit zero, so this is O(1) -- no shard scan. The parent is
+		// co-located in this shard.
+		if parentEmptied && c.parentKeyFor != nil && c.isStructural != nil {
+			if pk := c.parentKeyFor(key); pk != nil && c.isStructural(pk) {
 				c.Delete(pk)
 			}
 		}
 	}
 	return ok
-}
-
-// hasChildren reports whether any non-structural child of parentKey is present
-// (co-located in the parent's shard). Early-exits at the first child.
-func (c *Collection) hasChildren(parentKey []byte) bool {
-	ph := c.h.Hash(parentKey)
-	sh := c.shards[c.shardOf(parentKey, ph)]
-	s0, wins := sh.snapshot()
-	defer releaseWindows(wins)
-	found := false
-	forEachVisibleKeyed(s0, wins, func(k, _ []byte, _ Codec) bool {
-		if c.isStructural != nil && c.isStructural(k) {
-			return true
-		}
-		if pk := c.parentKeyFor(k); pk != nil && bytes.Equal(pk, parentKey) {
-			found = true
-			return false // stop
-		}
-		return true
-	})
-	return found
 }
 
 // Get returns the current ad for key, decoded, or (nil, false).

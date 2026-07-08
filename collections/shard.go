@@ -45,6 +45,19 @@ type shard struct {
 	idx    int
 	hub    *watchHub
 	delLog *deleteLog
+
+	// Chained-parent child counting (see store.go). childParentHash, if set, maps a
+	// key to its parent's dir-hash and reports whether the key is a chained child;
+	// it is nil unless the collection is configured with ParentKeyFor. childCount
+	// tracks, per parent dir-hash, how many live children chain to it, so Delete can
+	// tell in O(1) when a structural parent's last child has left (auto-delete)
+	// without scanning the shard. The parent is co-located in this shard, so the
+	// count is complete here. Keyed by hash (pointer-free) rather than the parent
+	// key: a hash collision can only mask an auto-delete (a lingering empty parent),
+	// never trigger a wrong one -- childCount[h] reaching zero means every parent
+	// hashing to h has zero children, so this parent does too. Guarded by mu.
+	childParentHash func(key []byte) (uint64, bool)
+	childCount      map[uint64]int
 }
 
 // supRef identifies a supersededBySeq field (a record's tombstone) that must be
@@ -120,17 +133,29 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
 		seg.dead += int64(recTotalLen(seg.data, old.off))
 	} else {
 		sh.count++
+		// A newly-inserted chained child bumps its parent's live-child count. Re-puts
+		// (updates) take the branch above and do not double-count.
+		if sh.childParentHash != nil {
+			if ph, isChild := sh.childParentHash(key); isChild {
+				if sh.childCount == nil {
+					sh.childCount = make(map[uint64]int)
+				}
+				sh.childCount[ph]++
+			}
+		}
 	}
 	sh.dir[h] = newLoc
 }
 
 // del marks the current version of key superseded at seq (an MVCC tombstone: no
-// new record is written). Returns whether a live key was removed. Caller holds
-// the write lock.
-func (sh *shard) del(h uint64, key []byte, seq uint64) bool {
+// new record is written). It returns whether a live key was removed and, for a
+// chained child, whether that removal dropped its parent's live-child count to
+// zero (parentEmptied) -- the signal Delete uses to auto-delete an orphaned
+// structural parent. Caller holds the write lock.
+func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied bool) {
 	old, ok := sh.findCurrent(sh.dirGet(h), key)
 	if !ok {
-		return false
+		return false, false
 	}
 	seg := sh.segs[old.seg]
 	setRecSuperseded(seg.data, old.off, seq)
@@ -139,7 +164,17 @@ func (sh *shard) del(h uint64, key []byte, seq uint64) bool {
 		sh.dirtySup = append(sh.dirtySup, supRef{seg, old.off}) // flush the tombstone
 	}
 	sh.count--
-	return true
+	if sh.childParentHash != nil {
+		if ph, isChild := sh.childParentHash(key); isChild {
+			if n := sh.childCount[ph] - 1; n <= 0 {
+				delete(sh.childCount, ph) // keep the map bounded by parents-with-children
+				parentEmptied = true
+			} else {
+				sh.childCount[ph] = n
+			}
+		}
+	}
+	return true, parentEmptied
 }
 
 // writeRecord appends a record to the active segment and returns its location. A

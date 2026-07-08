@@ -195,3 +195,45 @@ func TestChainedArchiveFlatten(t *testing.T) {
 		t.Errorf("archive query on inherited attrs matched %d, want 2 (flattened procs)", n)
 	}
 }
+
+// TestChainedAutoDeleteCounter drives the in-memory child counter directly: with
+// every family co-located in a single shard, deleting one cluster's procs must
+// auto-delete only that cluster's ad (per-parent counts, no cross-contamination),
+// re-putting a proc must not double-count, and a proc deleted then re-added must
+// keep its parent alive.
+func TestChainedAutoDeleteCounter(t *testing.T) {
+	c := New(Options{Shards: 1, ParentKeyFor: jobParentKey, IsStructural: jobStructural})
+	for _, k := range []string{"1.-1", "1.0", "1.1", "2.-1", "2.0"} {
+		c.Put([]byte(k), mustAd(t, `[X=1]`))
+	}
+	// Same shard (Shards:1) => both families share one childCount map.
+	if c.shardOf([]byte("1.-1"), 0) != c.shardOf([]byte("2.-1"), 0) {
+		t.Fatal("test precondition: clusters not co-located")
+	}
+
+	// Re-put an existing proc: must not inflate the count.
+	c.Put([]byte("1.0"), mustAd(t, `[X=2]`))
+
+	// Delete/re-add a proc: parent must stay (count returns to 2).
+	c.Delete([]byte("1.0"))
+	c.Put([]byte("1.0"), mustAd(t, `[X=3]`))
+	if _, ok := c.Get([]byte("1.-1")); !ok {
+		t.Error("cluster 1 ad deleted while a proc remained (count desync)")
+	}
+
+	// Drain cluster 1: its ad goes; cluster 2 is untouched.
+	c.Delete([]byte("1.0"))
+	c.Delete([]byte("1.1"))
+	if _, ok := c.Get([]byte("1.-1")); ok {
+		t.Error("cluster 1 ad not auto-deleted after its last proc left")
+	}
+	if _, ok := c.Get([]byte("2.-1")); !ok {
+		t.Error("cluster 2 ad wrongly deleted (cross-family count contamination)")
+	}
+
+	// Drain cluster 2: now it goes too.
+	c.Delete([]byte("2.0"))
+	if _, ok := c.Get([]byte("2.-1")); ok {
+		t.Error("cluster 2 ad not auto-deleted after its last proc left")
+	}
+}
