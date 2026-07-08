@@ -330,7 +330,17 @@ func unparseAttrName(name string) string {
 	return ast.QuoteAttributeName(name)
 }
 
-func (c *ClassAd) String() string {
+// String renders the ClassAd in new (bracketed) format, excluding private
+// (secret) attributes -- the default-safe form for any output that may reach a
+// client. Use StringWithPrivate where the full ad, including secrets, is required
+// (internal diagnostics, an authorized private channel).
+func (c *ClassAd) String() string { return c.unparse(false) }
+
+// StringWithPrivate is String including private attributes. Prefer String for
+// anything client-facing; see IsPrivateAttribute.
+func (c *ClassAd) StringWithPrivate() string { return c.unparse(true) }
+
+func (c *ClassAd) unparse(includePrivate bool) string {
 	if c.ad == nil {
 		return "[]"
 	}
@@ -338,10 +348,15 @@ func (c *ClassAd) String() string {
 	c.ensureSorted()
 	var b strings.Builder
 	b.WriteByte('[')
-	for i, attr := range c.ad.Attributes {
-		if i > 0 {
+	first := true
+	for _, attr := range c.ad.Attributes {
+		if !includePrivate && IsPrivateAttribute(attr.Name) {
+			continue
+		}
+		if !first {
 			b.WriteString("; ")
 		}
+		first = false
 		b.WriteString(unparseAttrName(attr.Name))
 		b.WriteString(" = ")
 		b.WriteString(attr.Value.String())
@@ -358,7 +373,15 @@ func (c *ClassAd) String() string {
 //	ad, _ := classad.Parse("[Cpus = 4; Memory = 8192]")
 //	oldFmt := ad.MarshalOld()
 //	// Returns: "Cpus = 4\nMemory = 8192"
-func (c *ClassAd) MarshalOld() string {
+// MarshalOld excludes private (secret) attributes; use MarshalOldWithPrivate for
+// the full ad. See IsPrivateAttribute.
+func (c *ClassAd) MarshalOld() string { return c.marshalOld(false) }
+
+// MarshalOldWithPrivate is MarshalOld including private attributes. Prefer
+// MarshalOld for anything client-facing.
+func (c *ClassAd) MarshalOldWithPrivate() string { return c.marshalOld(true) }
+
+func (c *ClassAd) marshalOld(includePrivate bool) string {
 	if c.ad == nil || len(c.ad.Attributes) == 0 {
 		return ""
 	}
@@ -368,10 +391,15 @@ func (c *ClassAd) MarshalOld() string {
 	// the whole accumulated string), which allocated tens of MB to render a single
 	// large (~21 KB) ad.
 	var b strings.Builder
-	for i, attr := range c.ad.Attributes {
-		if i > 0 {
+	first := true
+	for _, attr := range c.ad.Attributes {
+		if !includePrivate && IsPrivateAttribute(attr.Name) {
+			continue
+		}
+		if !first {
 			b.WriteByte('\n')
 		}
+		first = false
 		b.WriteString(unparseAttrName(attr.Name))
 		b.WriteString(" = ")
 		b.WriteString(attr.Value.String())
@@ -1481,7 +1509,17 @@ func (c *ClassAd) evaluateUnaryOp(op string, operand Value) Value {
 //	ad, _ := classad.Parse(`[x = 5; y = x + 3; name = "test"]`)
 //	jsonBytes, _ := json.Marshal(ad)
 //	// {"name":"test","x":5,"y":"\/Expr(x + 3)\/"}
-func (c *ClassAd) MarshalJSON() ([]byte, error) {
+// MarshalJSON implements json.Marshaler, excluding private (secret) attributes so
+// that any HTTP/JSON response that marshals a ClassAd is default-safe -- a job's
+// ClaimId or a slot's Capability never reaches a client through json.Marshal. Use
+// MarshalJSONWithPrivate where the full ad is required. See IsPrivateAttribute.
+func (c *ClassAd) MarshalJSON() ([]byte, error) { return c.marshalJSON(false) }
+
+// MarshalJSONWithPrivate is MarshalJSON including private attributes. Prefer
+// MarshalJSON for anything client-facing.
+func (c *ClassAd) MarshalJSONWithPrivate() ([]byte, error) { return c.marshalJSON(true) }
+
+func (c *ClassAd) marshalJSON(includePrivate bool) ([]byte, error) {
 	if c.ad == nil {
 		return []byte("{}"), nil
 	}
@@ -1489,10 +1527,15 @@ func (c *ClassAd) MarshalJSON() ([]byte, error) {
 	c.ensureSorted()
 	var buf bytes.Buffer
 	buf.WriteByte('{')
-	for i, attr := range c.ad.Attributes {
-		if i > 0 {
+	first := true
+	for _, attr := range c.ad.Attributes {
+		if !includePrivate && IsPrivateAttribute(attr.Name) {
+			continue
+		}
+		if !first {
 			buf.WriteByte(',')
 		}
+		first = false
 		keyBytes, err := json.Marshal(attr.Name)
 		if err != nil {
 			return nil, err
