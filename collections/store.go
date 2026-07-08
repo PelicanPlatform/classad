@@ -430,6 +430,17 @@ func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	return ad, true
 }
 
+// Flatten returns a standalone, self-contained copy of the ad at key with every
+// inherited parent attribute materialized into it (the child's own values
+// winning, parent-private attributes excluded) and no residual parent link. It
+// is the form to archive as a history record: like condor_history, which stores
+// each completed job flattened rather than as a live cluster/proc pair, so the
+// record stays readable after its structural parent is gone. For a collection
+// without parent chaining this is identical to Get.
+func (c *Collection) Flatten(key []byte) (*classad.ClassAd, bool) {
+	return c.Get(key)
+}
+
 // Len returns the number of live keys across all shards.
 func (c *Collection) Len() int {
 	n := 0

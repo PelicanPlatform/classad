@@ -59,13 +59,17 @@ structural ads, and flattens matches.
 - **No re-parenting** — a key's parent is fixed.
 - **Auto-delete of an empty parent** — a structural parent is removed when its
   last child leaves (HTCondor `ClusterCleanup`); direct parent delete is not a
-  normal operation. *(ref-counted lifecycle — Phase 2)*
+  normal operation. `Delete`, after removing a key, drops the key's structural
+  parent if no children remain (`hasChildren` scans the parent's co-located
+  shard).
 - **Archive flattens** — the append-only archive stores materialized standalone
-  ads (no parent link), like `condor_history`. *(Phase 4)*
+  ads (no parent link), like `condor_history`. The chained collection produces
+  the flattened form (`Get`/`Query`/`Scan`, or `Flatten` by intent); the archive
+  stays a plain standalone store, so a history record outlives its parent.
 - **Watch fan-out on parent change** — a change to an *inherited* parent attribute
   re-emits the affected children; a **parent-private** attribute set (e.g. job
   factory bookkeeping like `JobMaterialize*`, which children don't inherit) is
-  excluded, and a diff suppresses no-op fan-out. *(Phase 3)*
+  excluded, and a diff suppresses no-op fan-out.
 
 ## Current limitations
 

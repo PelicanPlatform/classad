@@ -149,3 +149,49 @@ func TestChainedAutoDeleteParent(t *testing.T) {
 		t.Error("cluster ad not auto-deleted after its last proc left")
 	}
 }
+
+// TestChainedArchiveFlatten verifies the Phase 4 composition: a job that inherits
+// attributes from its (structural) cluster ad is archived as a self-contained,
+// flattened history record -- queryable on the inherited attribute with no parent
+// present, like condor_history. The chained collection produces the flattened ad
+// (Flatten); the append-only Archive stores it standalone.
+func TestChainedArchiveFlatten(t *testing.T) {
+	c := chainedJobsCollection(t) // cluster 1.-1 has DAGManJobId=42, Owner="alice"
+
+	arch, err := CreateArchive(ArchiveOptions{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = arch.Close() }()
+
+	// Archive the flattened form of each proc (what a history writer would do when
+	// a job leaves the live queue).
+	for _, key := range []string{"1.0", "1.1"} {
+		flat, ok := c.Flatten([]byte(key))
+		if !ok {
+			t.Fatalf("Flatten(%s) missing", key)
+		}
+		// The flattened ad is standalone: the inherited attr is materialized, no
+		// parent link needed to read it.
+		if d, _ := flat.EvaluateAttrInt("DAGManJobId"); d != 42 {
+			t.Errorf("Flatten(%s) DAGManJobId=%d, want 42 (inherited)", key, d)
+		}
+		if err := arch.Append(flat); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The archive holds no cluster ad, yet a query on the parent-only attribute
+	// still matches both procs -- proof the records are self-contained.
+	q, err := vm.Parse(`DAGManJobId == 42 && Owner == "alice"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for range arch.Query(q) {
+		n++
+	}
+	if n != 2 {
+		t.Errorf("archive query on inherited attrs matched %d, want 2 (flattened procs)", n)
+	}
+}
