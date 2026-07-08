@@ -310,6 +310,74 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 	}, nil
 }
 
+// WatchFilter wraps a Watch event stream to deliver only events for keys whose
+// ad satisfies match. It keeps a set of the keys currently matching so a filtered
+// view stays correct as ads change:
+//
+//   - an Upsert whose ad matches is delivered (the key is marked matching);
+//   - an Upsert whose ad no longer matches, for a key that was matching, is
+//     converted to a Delete so the client drops it from its filtered view;
+//   - a Delete is delivered for a key known to be matching, and -- during
+//     catch-up (before Synced), where the prior match state of a resumed key is
+//     unknown -- forwarded conservatively (the client no-ops an unknown key);
+//   - Reset clears the matched set; Synced and Resync pass through.
+//
+// A nil match returns seq unchanged (no filtering). match is called on each
+// Upsert's ad and must be safe for concurrent-free sequential use.
+func WatchFilter(seq iter.Seq[WatchEvent], match func(*classad.ClassAd) bool) iter.Seq[WatchEvent] {
+	if match == nil {
+		return seq
+	}
+	return func(yield func(WatchEvent) bool) {
+		matched := map[string]struct{}{}
+		synced := false
+		for ev := range seq {
+			switch ev.Kind {
+			case WatchUpsert:
+				k := string(ev.Key)
+				if match(ev.Ad) {
+					matched[k] = struct{}{}
+					if !yield(ev) {
+						return
+					}
+				} else if _, was := matched[k]; was {
+					delete(matched, k)
+					if !yield(WatchEvent{Kind: WatchDelete, Key: ev.Key, Cursor: ev.Cursor}) {
+						return
+					}
+				}
+			case WatchDelete:
+				k := string(ev.Key)
+				if _, was := matched[k]; was {
+					delete(matched, k)
+					if !yield(ev) {
+						return
+					}
+				} else if !synced {
+					if !yield(ev) {
+						return
+					}
+				}
+			case WatchReset:
+				matched = map[string]struct{}{}
+				synced = false
+				if !yield(ev) {
+					return
+				}
+			case WatchSynced:
+				synced = true
+				if !yield(ev) {
+					return
+				}
+			default: // Resync (and any future kinds) pass through
+				if !yield(ev) {
+					return
+				}
+			}
+		}
+	}
+}
+
 // liveCoalesced streams the live phase in windows of c.watchCoalesce, emitting
 // only the newest event per key in each window (a key upserted several times, or
 // upserted then deleted, collapses to a single event of its settled state). Only
