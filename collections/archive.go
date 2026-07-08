@@ -44,6 +44,12 @@ type Archive struct {
 	// scanned, if set, is called with each segment id a query actually scans (i.e.
 	// not pruned by its zone map). Test seam for asserting pruning; nil in production.
 	scanned func(uint32)
+
+	// Watch (see archive_watch.go / docs/WATCH.md). hub fans appended records to live
+	// watchers; watchEpoch is a persisted per-archive identity for cursor validation.
+	hub            *archiveWatchHub
+	watchEpoch     uint64
+	watchEpochOnce sync.Once
 }
 
 // archiveSeg is one segment of the log: a reused mmap-backed segment plus the
@@ -156,6 +162,7 @@ func newArchiveShell(opts ArchiveOptions) (*Archive, error) {
 		codec:   codec,
 		intern:  wire.NewInternTable(),
 		ret:     opts.Retention,
+		hub:     newArchiveWatchHub(),
 	}, nil
 }
 
@@ -196,26 +203,41 @@ func (a *Archive) Append(ad *classad.ClassAd) error {
 	stored := a.codec.Compress(nil, wireBytes)
 
 	a.mu.Lock()
-	defer a.mu.Unlock()
+	seg, off, err := a.appendLocked(stored)
+	if err == nil {
+		// Publish under the lock so live events reach watchers in log-position order
+		// (concurrent Appends are otherwise unordered once the lock is dropped). The
+		// fan-out is non-blocking, so it does not stall other writers. stored is not
+		// reused, so it is safe to hand to the (read-only) watchers.
+		a.hub.publish(seg, off, stored, a.codec)
+	}
+	a.mu.Unlock()
+	return err
+}
+
+// appendLocked appends stored to the active segment (rolling to a fresh one when it
+// does not fit) and returns the record's segment id and offset. Caller holds a.mu.
+func (a *Archive) appendLocked(stored []byte) (seg, off uint32, err error) {
 	if a.active == nil {
 		if err := a.openActiveLocked(); err != nil {
-			return err
+			return 0, 0, err
 		}
 	}
-	if _, ok := a.active.seg.append(archiveSeq, noLoc, nil, stored); !ok {
+	o, ok := a.active.seg.append(archiveSeq, noLoc, nil, stored)
+	if !ok {
 		// Doesn't fit: seal the active segment and start a fresh one.
 		if err := a.sealActiveLocked(); err != nil {
-			return err
+			return 0, 0, err
 		}
 		if err := a.openActiveLocked(); err != nil {
-			return err
+			return 0, 0, err
 		}
-		if _, ok := a.active.seg.append(archiveSeq, noLoc, nil, stored); !ok {
-			return fmt.Errorf("archive: ad of %d bytes exceeds segment size %d", len(stored), a.segSize)
+		if o, ok = a.active.seg.append(archiveSeq, noLoc, nil, stored); !ok {
+			return 0, 0, fmt.Errorf("archive: ad of %d bytes exceeds segment size %d", len(stored), a.segSize)
 		}
 	}
 	a.active.recN++
-	return nil
+	return a.active.seg.id, o, nil
 }
 
 // openActiveLocked starts a fresh mmap-backed active segment. Caller holds mu.
@@ -348,7 +370,9 @@ func (a *Archive) Rotate(now float64) (int, error) {
 	for a.shouldDropOldest(now) {
 		as := a.segs[0]
 		a.segs = a.segs[1:]
-		if e := os.Remove(a.idxPath(as.seg.id)); e != nil && err == nil {
+		// The sidecar index only exists when the archive is indexed; ignore its
+		// absence so an index-less archive can still rotate.
+		if e := os.Remove(a.idxPath(as.seg.id)); e != nil && !os.IsNotExist(e) && err == nil {
 			err = e
 		}
 		if as.seg.retire() { // unpinned now ⇒ reap immediately; else last unpin reaps

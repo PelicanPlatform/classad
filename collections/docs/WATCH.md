@@ -1,11 +1,13 @@
 # Watch: resumable full-ad subscriptions
 
-> Status: **implemented for the Collection** in `watch.go` (`Collection.Watch`); the
-> Archive variant is a follow-up. Enabled by `Options.WatchHistory > 0`. Reuses the
-> MVCC sequence machinery; the one real limitation is that precise *deletes* are only
-> replayable within the retention window (`WatchHistory`), and older resumes fall back
-> to a full replay the client rebuilds from. The **Event types & client model** and
-> **API** sections below are the canonical protocol for building a listener.
+> Status: **implemented** — `Collection.Watch` (`watch.go`, enabled by
+> `Options.WatchHistory > 0`) and `Archive.Watch` (`archive_watch.go`, always
+> available). The Collection reuses the MVCC sequence machinery; its one real
+> limitation is that precise *deletes* are only replayable within the retention window
+> (`WatchHistory`), older resumes falling back to a full replay the client rebuilds
+> from. The Archive is append-only, so its Watch is a durable log tail with none of
+> that. The **Event types & client model** and **API** sections below are the
+> canonical protocol for building a listener.
 
 ## Goal
 
@@ -109,13 +111,27 @@ archive already keeps per-segment zone maps; the collection would add a cheap mi
 `seq` per segment. Fallback when ranges are unavailable: a full `seq`-filtered scan,
 which is correct, just O(records).
 
-## Archive Watch (simpler)
+## Archive Watch (`Archive.Watch`, implemented)
 
 The archive is append-only — no updates, no deletes — so Watch is a log tail:
-replay records after `logPosition`, then stream new appends. The resumable floor is
-whatever rotation still retains; a cursor older than the oldest retained segment gets
-everything currently retained (and the client learns the floor moved). No delete
-problem, no per-shard vector — just an offset.
+
+```go
+func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error)
+```
+
+- **Cursor** = `{epoch, segment id, offset}` — a durable **log position**, not an MVCC
+  sequence. Segment ids and offsets are stable once written and the catalog persists
+  them, and the epoch is persisted at `<dir>/watch.epoch`, so **a cursor resumes
+  incrementally even across a reopen** (unlike the Collection today). No per-shard
+  vector, no delete journal.
+- **Events**: only `WatchUpsert` (an appended ad; `Key` is nil, `Ad` is the payload),
+  plus `WatchSynced`/`WatchResync`. `WatchReset` here means a **history gap** — the
+  cursor is older than what rotation still retains (or from a different archive), so
+  the replay restarts from the current floor; a log consumer notes it may have missed
+  entries (there is no current state to rebuild).
+- **Catch-up** replays every retained record after the cursor, oldest-first; **live**
+  streams new appends. `Append` publishes under its lock so live events are strictly
+  in log order. Always available (no option); zero cost when no one is watching.
 
 ## Back-pressure
 
@@ -224,13 +240,22 @@ Done (Collection):
    contained). Catch-up emits precise `Delete`s within the window; a cursor past the
    journal horizon (or a mismatched epoch) gets a `Reset` + full replay.
 
+Also done:
+
+4. **Archive Watch** (`archive_watch.go`) — positional `{epoch, seg, off}` cursor,
+   oldest-first catch-up, live tail, Reset-on-rotation-gap. The epoch is persisted at
+   `<dir>/watch.epoch` and segment ids are catalog-stable, so archive resumes survive
+   a reopen incrementally. (Also fixed a `Rotate` bug it surfaced: an index-less
+   archive failed to drop segments because it tried to unlink a sidecar that was never
+   written.)
+
 Deferred:
 
-4. **Catch-up efficiency** — currently a full `seq`-filtered scan of every segment
-   (correct, O(records)). Per-segment `[minSeq,maxSeq]` to skip old segments is a
-   follow-up.
-5. **Archive Watch** — positional cursor + log-tail; not yet built.
-6. **Epoch persistence** — the epoch is per-process, so **a persistent collection that
-   is reopened gets a new epoch and forces watchers to full-replay** (safe, but not
-   incremental across a server restart). Persisting the epoch (and, to resume
-   incrementally across restart, the delete journal) under `Dir` is a follow-up.
+5. **Collection catch-up efficiency** — currently a full `seq`-filtered scan of every
+   segment (correct, O(records)). Per-segment `[minSeq,maxSeq]` to skip old segments
+   is a follow-up.
+6. **Collection epoch persistence** — the Collection's epoch is per-process, so **a
+   reopened persistent collection gets a new epoch and forces watchers to full-replay**
+   (safe, but not incremental across a server restart). Persisting the epoch and the
+   delete journal under `Dir` (as the Archive already does for its epoch) is a
+   follow-up. The Archive already resumes incrementally across a reopen.
