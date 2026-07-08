@@ -810,7 +810,7 @@ func TestDeleteTombstoneFlushPath(t *testing.T) {
 	sh.mu.Lock()
 	sh.dirtySup = nil // clear any prior state
 	seq := sh.commitSeq + 1
-	ok := sh.del(h, key, seq)
+	ok, _ := sh.del(h, key, seq)
 	nQueued := len(sh.dirtySup)
 	sh.mu.Unlock()
 	if !ok {

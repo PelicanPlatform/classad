@@ -1,0 +1,239 @@
+package collections
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/PelicanPlatform/classad/collections/vm"
+)
+
+// jobParentKey maps a job key "cluster.proc" to its cluster ad "cluster.-1"
+// (returning nil for a cluster ad, which has no parent).
+func jobParentKey(key []byte) []byte {
+	s := string(key)
+	dot := strings.LastIndexByte(s, '.')
+	if dot < 0 {
+		return nil
+	}
+	if s[dot+1:] == "-1" {
+		return nil
+	}
+	return []byte(s[:dot] + ".-1")
+}
+
+// jobStructural marks cluster ads (proc == -1) structural.
+func jobStructural(key []byte) bool { return strings.HasSuffix(string(key), ".-1") }
+
+func chainedJobsCollection(t *testing.T) *Collection {
+	t.Helper()
+	c := New(Options{Shards: 8, ParentKeyFor: jobParentKey, IsStructural: jobStructural})
+	// Two DAGs. DAGManJobId and Owner live only on the cluster (parent) ads.
+	c.Put([]byte("1.-1"), mustAd(t, `[DAGManJobId=42; Owner="alice"; Cmd="/bin/sleep"]`))
+	c.Put([]byte("1.0"), mustAd(t, `[ProcId=0; JobStatus=1]`))
+	c.Put([]byte("1.1"), mustAd(t, `[ProcId=1; JobStatus=2]`))
+	c.Put([]byte("2.-1"), mustAd(t, `[DAGManJobId=7; Owner="bob"]`))
+	c.Put([]byte("2.0"), mustAd(t, `[ProcId=0; JobStatus=1]`))
+	return c
+}
+
+// TestChainedColocation verifies a cluster ad and its procs land in one shard.
+func TestChainedColocation(t *testing.T) {
+	c := chainedJobsCollection(t)
+	sc := c.shardOf([]byte("1.-1"), c.h.Hash([]byte("1.-1")))
+	for _, k := range []string{"1.0", "1.1"} {
+		if s := c.shardOf([]byte(k), c.h.Hash([]byte(k))); s != sc {
+			t.Errorf("job %s in shard %d, cluster in shard %d (not co-located)", k, s, sc)
+		}
+	}
+}
+
+// TestChainedQueryFilter verifies a query on a parent-only attribute resolves
+// through the chain: DAGManJobId (only on the cluster ad) selects that cluster's
+// procs, and cluster ads themselves are hidden.
+func TestChainedQueryFilter(t *testing.T) {
+	c := chainedJobsCollection(t)
+
+	q, err := vm.Parse(`DAGManJobId == 42`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for ad := range c.Query(q) {
+		cl, _ := ad.EvaluateAttrInt("ClusterId") // absent; use key-free identity via ProcId+DAGManJobId
+		p, _ := ad.EvaluateAttrInt("ProcId")
+		d, _ := ad.EvaluateAttrInt("DAGManJobId")
+		if d != 42 {
+			t.Errorf("matched ad has DAGManJobId=%d, want 42 (chain broken)", d)
+		}
+		_ = cl
+		got = append(got, fmt.Sprintf("proc%d", p))
+	}
+	sort.Strings(got)
+	if len(got) != 2 || got[0] != "proc0" || got[1] != "proc1" {
+		t.Errorf("DAGManJobId==42 matched %v, want the two procs of cluster 1 (no cluster ad)", got)
+	}
+}
+
+// TestChainedChildOverride verifies a child attribute overrides the parent's.
+func TestChainedChildOverride(t *testing.T) {
+	c := chainedJobsCollection(t)
+	// Give proc 1.0 its own DAGManJobId, overriding the cluster's 42.
+	c.Put([]byte("1.0"), mustAd(t, `[ProcId=0; DAGManJobId=99]`))
+
+	count := func(expr string) int {
+		q, err := vm.Parse(expr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for range c.Query(q) {
+			n++
+		}
+		return n
+	}
+	if n := count(`DAGManJobId == 99`); n != 1 {
+		t.Errorf("DAGManJobId==99 matched %d, want 1 (the overriding proc)", n)
+	}
+	if n := count(`DAGManJobId == 42`); n != 1 {
+		t.Errorf("DAGManJobId==42 matched %d, want 1 (proc 1.1 still inherits; 1.0 overrode)", n)
+	}
+}
+
+// TestChainedStructuralHidden verifies structural (cluster) ads are excluded from
+// Scan, and TestChainedGet verifies Get resolves inherited attributes.
+func TestChainedStructuralHidden(t *testing.T) {
+	c := chainedJobsCollection(t)
+	total := 0
+	for range c.Scan() {
+		total++
+	}
+	if total != 3 {
+		t.Errorf("Scan returned %d ads, want 3 jobs (cluster ads hidden)", total)
+	}
+}
+
+func TestChainedGet(t *testing.T) {
+	c := chainedJobsCollection(t)
+	ad, ok := c.Get([]byte("1.0"))
+	if !ok {
+		t.Fatal("Get 1.0 missing")
+	}
+	if d, _ := ad.EvaluateAttrInt("DAGManJobId"); d != 42 {
+		t.Errorf("Get(1.0) DAGManJobId=%d, want 42 (inherited from cluster)", d)
+	}
+	if o, _ := ad.EvaluateAttrString("Owner"); o != "alice" {
+		t.Errorf("Get(1.0) Owner=%q, want alice (inherited)", o)
+	}
+}
+
+// TestChainedAutoDeleteParent verifies a structural parent is auto-removed when
+// its last child leaves, but not before.
+func TestChainedAutoDeleteParent(t *testing.T) {
+	c := New(Options{Shards: 4, ParentKeyFor: jobParentKey, IsStructural: jobStructural})
+	c.Put([]byte("1.-1"), mustAd(t, `[DAGManJobId=42]`))
+	c.Put([]byte("1.0"), mustAd(t, `[ProcId=0]`))
+	c.Put([]byte("1.1"), mustAd(t, `[ProcId=1]`))
+	if _, ok := c.Get([]byte("1.-1")); !ok {
+		t.Fatal("cluster ad missing after Put")
+	}
+
+	c.Delete([]byte("1.0"))
+	if _, ok := c.Get([]byte("1.-1")); !ok {
+		t.Error("cluster ad auto-deleted too early (proc 1.1 still present)")
+	}
+
+	c.Delete([]byte("1.1"))
+	if _, ok := c.Get([]byte("1.-1")); ok {
+		t.Error("cluster ad not auto-deleted after its last proc left")
+	}
+}
+
+// TestChainedArchiveFlatten verifies the Phase 4 composition: a job that inherits
+// attributes from its (structural) cluster ad is archived as a self-contained,
+// flattened history record -- queryable on the inherited attribute with no parent
+// present, like condor_history. The chained collection produces the flattened ad
+// (Flatten); the append-only Archive stores it standalone.
+func TestChainedArchiveFlatten(t *testing.T) {
+	c := chainedJobsCollection(t) // cluster 1.-1 has DAGManJobId=42, Owner="alice"
+
+	arch, err := CreateArchive(ArchiveOptions{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = arch.Close() }()
+
+	// Archive the flattened form of each proc (what a history writer would do when
+	// a job leaves the live queue).
+	for _, key := range []string{"1.0", "1.1"} {
+		flat, ok := c.Flatten([]byte(key))
+		if !ok {
+			t.Fatalf("Flatten(%s) missing", key)
+		}
+		// The flattened ad is standalone: the inherited attr is materialized, no
+		// parent link needed to read it.
+		if d, _ := flat.EvaluateAttrInt("DAGManJobId"); d != 42 {
+			t.Errorf("Flatten(%s) DAGManJobId=%d, want 42 (inherited)", key, d)
+		}
+		if err := arch.Append(flat); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The archive holds no cluster ad, yet a query on the parent-only attribute
+	// still matches both procs -- proof the records are self-contained.
+	q, err := vm.Parse(`DAGManJobId == 42 && Owner == "alice"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for range arch.Query(q) {
+		n++
+	}
+	if n != 2 {
+		t.Errorf("archive query on inherited attrs matched %d, want 2 (flattened procs)", n)
+	}
+}
+
+// TestChainedAutoDeleteCounter drives the in-memory child counter directly: with
+// every family co-located in a single shard, deleting one cluster's procs must
+// auto-delete only that cluster's ad (per-parent counts, no cross-contamination),
+// re-putting a proc must not double-count, and a proc deleted then re-added must
+// keep its parent alive.
+func TestChainedAutoDeleteCounter(t *testing.T) {
+	c := New(Options{Shards: 1, ParentKeyFor: jobParentKey, IsStructural: jobStructural})
+	for _, k := range []string{"1.-1", "1.0", "1.1", "2.-1", "2.0"} {
+		c.Put([]byte(k), mustAd(t, `[X=1]`))
+	}
+	// Same shard (Shards:1) => both families share one childCount map.
+	if c.shardOf([]byte("1.-1"), 0) != c.shardOf([]byte("2.-1"), 0) {
+		t.Fatal("test precondition: clusters not co-located")
+	}
+
+	// Re-put an existing proc: must not inflate the count.
+	c.Put([]byte("1.0"), mustAd(t, `[X=2]`))
+
+	// Delete/re-add a proc: parent must stay (count returns to 2).
+	c.Delete([]byte("1.0"))
+	c.Put([]byte("1.0"), mustAd(t, `[X=3]`))
+	if _, ok := c.Get([]byte("1.-1")); !ok {
+		t.Error("cluster 1 ad deleted while a proc remained (count desync)")
+	}
+
+	// Drain cluster 1: its ad goes; cluster 2 is untouched.
+	c.Delete([]byte("1.0"))
+	c.Delete([]byte("1.1"))
+	if _, ok := c.Get([]byte("1.-1")); ok {
+		t.Error("cluster 1 ad not auto-deleted after its last proc left")
+	}
+	if _, ok := c.Get([]byte("2.-1")); !ok {
+		t.Error("cluster 2 ad wrongly deleted (cross-family count contamination)")
+	}
+
+	// Drain cluster 2: now it goes too.
+	c.Delete([]byte("2.0"))
+	if _, ok := c.Get([]byte("2.-1")); ok {
+		t.Error("cluster 2 ad not auto-deleted after its last proc left")
+	}
+}

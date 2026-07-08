@@ -21,34 +21,59 @@ type wireCtx interface {
 // an attribute whose value is a non-literal expression (or a list/record), it
 // sets fellBack and the caller retries the ad with a full ClassAd decode.
 //
-// One wireScope is reused across a scan (single-threaded): set ad and clear
-// fellBack before each evaluation.
+// One wireScope is reused across a scan (single-threaded): set ad (and, for a
+// chained child, parent) and clear fellBack before each evaluation.
 type wireScope struct {
 	ad       wire.Ad
+	parent   wire.Ad // the chained parent ad's wire bytes, or nil (no parent)
 	ctx      wireCtx // for mode-aware attribute lookup (interned id vs inline name)
 	fellBack bool
 }
 
 // resolve is the attribute resolver handed to vm.Matcher.EvalResolved.
 func (ws *wireScope) resolve(name string, scope ast.AttributeScope) classad.Value {
-	// A collection ad has no match target or enclosing parent, so TARGET/PARENT
-	// references are undefined — exactly as they evaluate against a stored ad.
-	if scope == ast.TargetScope || scope == ast.ParentScope {
+	switch scope {
+	case ast.TargetScope:
+		// A collection ad has no match target, so TARGET references are undefined.
+		return classad.NewUndefinedValue()
+	case ast.ParentScope:
+		// PARENT.attr reads from the chained parent ad (undefined if none).
+		if ws.parent == nil {
+			return classad.NewUndefinedValue()
+		}
+		v, _ := ws.tryResolve(ws.parent, name)
+		return v
+	default:
+		// Unscoped: this ad, then fall through to its parent (chaining), matching
+		// the ClassAd evaluator's parent walk.
+		if v, found := ws.tryResolve(ws.ad, name); found {
+			return v
+		}
+		if ws.parent != nil {
+			if v, found := ws.tryResolve(ws.parent, name); found {
+				return v
+			}
+		}
 		return classad.NewUndefinedValue()
 	}
-	node, ok := ws.ctx.wireLookup(ws.ad, name)
+}
+
+// tryResolve looks name up in ad. found reports whether ad has the attribute at
+// all (so an unscoped resolve knows whether to fall through to the parent). A
+// non-literal value sets fellBack (the caller retries with a full decode) and
+// still counts as found -- the ad has the attribute, it just can't be read from
+// wire alone.
+func (ws *wireScope) tryResolve(ad wire.Ad, name string) (classad.Value, bool) {
+	node, ok := ws.ctx.wireLookup(ad, name)
 	if !ok {
-		return classad.NewUndefinedValue() // this ad lacks it
+		return classad.NewUndefinedValue(), false
 	}
 	lit, ok := wire.LiteralValue(node)
 	if !ok {
-		// Non-literal (expression/list/record) attribute: cannot resolve without
-		// evaluating in a real scope. Flag fallback; the returned value is
-		// discarded once the caller sees fellBack.
 		ws.fellBack = true
-		return classad.NewUndefinedValue()
+		return classad.NewUndefinedValue(), true
 	}
-	return litToValue(lit)
+	return litToValue(lit), true
 }
 
 func litToValue(l wire.Literal) classad.Value {

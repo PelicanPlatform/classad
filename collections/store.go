@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
@@ -62,6 +63,52 @@ type Options struct {
 	// oversubscribing). Small scans and indexed queries run serial regardless.
 	// See parallel_scan.go / docs/PARALLEL_QUERY.md.
 	QueryParallelism int
+	// WatchHistory enables the Watch subscription verb (see docs/WATCH.md). It is the
+	// per-shard capacity of the delete journal — how many recent deletes are retained
+	// so a resuming watcher can be told precisely which keys were removed. 0 (default)
+	// disables Watch entirely (no journal, no live notification, zero write-path cost).
+	// A larger value lets clients resume incrementally from further back before
+	// falling to a full replay.
+	WatchHistory int
+	// WatchBuffer is the per-watcher live event-channel capacity (default 1024). A
+	// watcher that overflows it is told to resync rather than stalling writers.
+	WatchBuffer int
+	// WatchCoalesce, if > 0, batches live Watch events into windows of this
+	// duration and emits only the newest event per key in each window (default 0 =
+	// off, one event per change). It smooths bursty churn -- e.g. a freshly
+	// submitted job that takes many SetAttribute updates in quick succession is
+	// delivered as a single Upsert of its settled state. Only the last event of a
+	// flushed window carries a cursor, so a mid-window consumer crash resumes from
+	// the prior window and re-delivers (at-least-once is preserved). Catch-up is
+	// never coalesced.
+	WatchCoalesce time.Duration
+
+	// ParentKeyFor, if set, gives an ad a parent: it maps a child's key to its
+	// parent's key (return nil for a top-level ad with no parent). A child then
+	// resolves attribute references it lacks by falling through to its parent --
+	// the primitive "join" the job queue needs, where a proc ad chains to its
+	// cluster ad so a query like `DAGManJobId == 42` sees the cluster's attribute.
+	// A family (a root and all its descendants) is co-located in one shard -- the
+	// collection routes every key to the shard of its ultimate root -- so chained
+	// evaluation is consistent and lock-free. Parent bindings are immutable: a
+	// key's parent must not change across updates. Default nil disables chaining
+	// (every ad is standalone) and keeps the plain single-key routing/scan.
+	ParentKeyFor func(key []byte) []byte
+
+	// IsStructural, if set, marks a key as a structural (parent-only) ad that
+	// exists solely to be chained to -- e.g. a job cluster ad. Structural ads are
+	// stored and used as parents but are hidden from Query/Scan/Watch results by
+	// default (like condor_q omitting cluster ads). Default nil treats every ad as
+	// a normal, visible ad. Only meaningful together with ParentKeyFor.
+	IsStructural func(key []byte) bool
+
+	// ParentPrivateAttrs are parent attributes children do NOT inherit and that do
+	// NOT trigger a watch fan-out when they change -- e.g. a job cluster ad's
+	// factory bookkeeping (JobMaterializeNextProcId, ...), which mutates per proc
+	// materialized but is meaningless to a proc. They are excluded from flattening
+	// and from the parent-change diff, so high-frequency parent-internal churn does
+	// not fan out to every child. Case-insensitive. Only meaningful with ParentKeyFor.
+	ParentPrivateAttrs []string
 }
 
 // AdUpdate is one insert-or-update in a batch.
@@ -103,6 +150,46 @@ type Collection struct {
 	queryPar         int
 	qsem             chan struct{}
 	parallelMinBytes int
+
+	// Watch (see watch.go / docs/WATCH.md). hub is nil unless WatchHistory > 0.
+	hub           *watchHub
+	watchBuf      int
+	watchCoalesce time.Duration
+
+	// Parent/child chaining (see docs/PARENT_CHILD.md). parentKeyFor derives a
+	// child's parent key (nil ⇒ no chaining); isStructural marks parent-only ads
+	// hidden from results; parentPrivate (case-folded) are parent attributes
+	// children don't inherit and that don't trigger fan-out. All nil unless configured.
+	parentKeyFor  func(key []byte) []byte
+	isStructural  func(key []byte) bool
+	parentPrivate map[string]struct{}
+}
+
+// rootKey returns the key of the family root for key: it follows parentKeyFor to
+// the top (a key with no parent). With no chaining configured it returns key
+// unchanged. The result selects the shard, co-locating a whole family.
+func (c *Collection) rootKey(key []byte) []byte {
+	if c.parentKeyFor == nil {
+		return key
+	}
+	for {
+		p := c.parentKeyFor(key)
+		if p == nil {
+			return key
+		}
+		key = p
+	}
+}
+
+// shardOf selects the shard for key by the family root, so a parent and all its
+// descendants share one shard (enabling consistent, lock-free chained
+// evaluation). h is key's own hash (already computed by the caller for the bucket
+// chain); without chaining the shard is just h & mask, no re-hash.
+func (c *Collection) shardOf(key []byte, h uint64) int {
+	if c.parentKeyFor == nil {
+		return int(h & c.mask)
+	}
+	return int(c.h.Hash(c.rootKey(key)) & c.mask)
 }
 
 // writeError returns the first sticky segment-allocation error across shards
@@ -177,6 +264,41 @@ func New(opts Options) *Collection {
 		c.hotSet.Store(&hotSetHolder{set})
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
+	if opts.WatchHistory > 0 {
+		c.hub = newWatchHub()
+		c.watchBuf = opts.WatchBuffer
+		if c.watchBuf <= 0 {
+			c.watchBuf = 1024
+		}
+		c.watchCoalesce = opts.WatchCoalesce
+		for i, sh := range c.shards {
+			sh.idx = i
+			sh.hub = c.hub
+			sh.delLog = newDeleteLog(opts.WatchHistory, 0)
+		}
+	}
+	c.parentKeyFor = opts.ParentKeyFor
+	c.isStructural = opts.IsStructural
+	if c.parentKeyFor != nil {
+		// Give each shard a pointer-free child counter keyed by the parent's dir-hash,
+		// so Delete detects an emptied structural parent in O(1). A key is a chained
+		// child iff parentKeyFor returns a parent for it (nil for structural/root ads).
+		for _, sh := range c.shards {
+			sh.childParentHash = func(key []byte) (uint64, bool) {
+				pk := c.parentKeyFor(key)
+				if pk == nil {
+					return 0, false
+				}
+				return c.h.Hash(pk), true
+			}
+		}
+	}
+	if len(opts.ParentPrivateAttrs) > 0 {
+		c.parentPrivate = make(map[string]struct{}, len(opts.ParentPrivateAttrs))
+		for _, a := range opts.ParentPrivateAttrs {
+			c.parentPrivate[strings.ToLower(a)] = struct{}{}
+		}
+	}
 	c.parallelMinBytes = defaultParallelMinBytes
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
 	if c.queryPar >= 2 {
@@ -223,7 +345,7 @@ func (c *Collection) Update(batch []AdUpdate) error {
 	for i := range batch {
 		stored := codec.Compress(nil, c.encodeAd(batch[i].Ad.AST()))
 		h := c.h.Hash(batch[i].Key)
-		si := int(h & c.mask)
+		si := c.shardOf(batch[i].Key, h)
 		byShard[si] = append(byShard[si], pendingPut{hash: h, key: batch[i].Key, ad: stored, codec: codec})
 	}
 	for si, writes := range byShard {
@@ -239,7 +361,7 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	codec := c.currentCodec()
 	stored := codec.Compress(nil, c.encodeAd(ad.AST()))
 	h := c.h.Hash(key)
-	c.shards[h&c.mask].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
+	c.shards[c.shardOf(key, h)].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
 	return c.writeError()
 }
 
@@ -247,16 +369,30 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 // tombstone: scans already in progress still see the pre-delete version.
 func (c *Collection) Delete(key []byte) bool {
 	h := c.h.Hash(key)
-	sh := c.shards[h&c.mask]
+	sh := c.shards[c.shardOf(key, h)]
 	sh.mu.Lock()
 	seq := sh.commitSeq + 1
-	ok := sh.del(h, key, seq)
+	ok, parentEmptied := sh.del(h, key, seq)
 	if ok {
 		sh.commitSeq = seq
 	}
 	sh.mu.Unlock()
 	if ok {
 		sh.sync() // durability point for the tombstone (not coalesced)
+		if sh.delLog != nil {
+			sh.delLog.record(key, seq) // retain for resuming watchers
+			sh.hub.publish(sh.idx, seq, key, nil, nil, true)
+		}
+		// Auto-delete a structural parent whose last child just left (HTCondor
+		// ClusterCleanup): a structural ad exists only to be chained to, so once no
+		// child references it, remove it. sh.del maintained the live-child count and
+		// flags when it hit zero, so this is O(1) -- no shard scan. The parent is
+		// co-located in this shard.
+		if parentEmptied && c.parentKeyFor != nil && c.isStructural != nil {
+			if pk := c.parentKeyFor(key); pk != nil && c.isStructural(pk) {
+				c.Delete(pk)
+			}
+		}
 	}
 	return ok
 }
@@ -264,7 +400,7 @@ func (c *Collection) Delete(key []byte) bool {
 // Get returns the current ad for key, decoded, or (nil, false).
 func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	h := c.h.Hash(key)
-	sh := c.shards[h&c.mask]
+	sh := c.shards[c.shardOf(key, h)]
 	stored, codec, ok := sh.get(h, key)
 	if !ok {
 		return nil, false
@@ -273,7 +409,30 @@ func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	if err != nil {
 		return nil, false
 	}
+	// Chain to the parent (same shard) so the returned ad resolves inherited
+	// attributes -- Get mirrors query semantics.
+	if c.parentKeyFor != nil {
+		if pk := c.parentKeyFor(key); pk != nil {
+			ph := c.h.Hash(pk)
+			if pad, pcodec, ok := sh.get(ph, pk); ok {
+				if parent, err := c.decodeAd(pad, pcodec); err == nil {
+					c.mergeParent(ad, parent)
+				}
+			}
+		}
+	}
 	return ad, true
+}
+
+// Flatten returns a standalone, self-contained copy of the ad at key with every
+// inherited parent attribute materialized into it (the child's own values
+// winning, parent-private attributes excluded) and no residual parent link. It
+// is the form to archive as a history record: like condor_history, which stores
+// each completed job flattened rather than as a live cluster/proc pair, so the
+// record stays readable after its structural parent is gone. For a collection
+// without parent chaining this is identical to Get.
+func (c *Collection) Flatten(key []byte) (*classad.ClassAd, bool) {
+	return c.Get(key)
 }
 
 // Len returns the number of live keys across all shards.
@@ -294,6 +453,15 @@ func (c *Collection) Len() int {
 // when that shard's scan started.
 func (c *Collection) Scan() iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
+		if c.parentKeyFor != nil {
+			qp := queryPlan{ws: &wireScope{ctx: c}} // q nil ⇒ no filter, just chain + hide structural
+			for _, sh := range c.shards {
+				if !c.scanShardChained(sh, qp, yield) {
+					return
+				}
+			}
+			return
+		}
 		q := queryPlan{}
 		emit := c.yieldAd(yield)
 		for _, sh := range c.shards {
@@ -335,6 +503,17 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 			wireOK:   q.Native() && plan.PartialSafe,
 			ws:       ws,
 			resolver: ws.resolve, // bound once to avoid a per-ad closure allocation
+		}
+		// Chained collection: a serial two-pass scan per shard resolves each ad's
+		// inherited (parent) attributes. Indexes and query fan-out are bypassed here
+		// (they don't yet understand chaining); correctness first.
+		if c.parentKeyFor != nil {
+			for _, sh := range c.shards {
+				if !c.scanShardChained(sh, qp, yield) {
+					return
+				}
+			}
+			return
 		}
 		// Record which attributes the query filters on (for SuggestIndexes), then,
 		// if the query has an index-usable constraint, visit only candidate ads;
@@ -395,6 +574,93 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, emit func(w []byte) bool
 	return cont
 }
 
+// mergeParent flattens into child every (non-private) attribute of parent that
+// child does not already define (child overrides parent), producing a standalone
+// ad. This is needed for output because SetParent only chains expression
+// evaluation, not direct attribute reads (EvaluateAttr*, GetAttributes) or
+// serialization -- a query result or watch event must carry the inherited
+// attributes inline, as condor_q shows a job's full ad and condor_history
+// flattens it. Parent-private attributes (factory bookkeeping) are not inherited.
+func (c *Collection) mergeParent(child, parent *classad.ClassAd) {
+	for _, name := range parent.GetAttributes() {
+		if c.parentPrivate != nil {
+			if _, priv := c.parentPrivate[strings.ToLower(name)]; priv {
+				continue // parent-private: not inherited
+			}
+		}
+		if _, has := child.Lookup(name); has {
+			continue // child overrides
+		}
+		if expr, ok := parent.Lookup(name); ok {
+			child.InsertExpr(name, expr)
+		}
+	}
+}
+
+// scanShardChained scans a shard for a collection with parent/child chaining. It
+// first collects the shard's structural (parent) ads at the snapshot, then
+// evaluates every non-structural ad with its parent chained in -- so a query
+// resolves attributes the child inherits from its parent -- and yields matches
+// with the parent set (SetParent) so the consumer sees the inherited attributes
+// too. Structural (parent-only) ads are hidden from the output. The whole family
+// is co-located in this shard, so both passes read one consistent snapshot with
+// no cross-shard fetch.
+func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*classad.ClassAd) bool) bool {
+	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
+
+	// Pass 1: collect structural (parent) ads' decompressed wire bytes. Parents
+	// are few (one per family), so this map stays small.
+	parents := map[string][]byte{}
+	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		if c.isStructural != nil && c.isStructural(key) {
+			if w, err := codec.Decompress(nil, ad); err == nil {
+				parents[string(key)] = w // owns its buffer (nil dst)
+			}
+		}
+		return true
+	})
+
+	// Pass 2: evaluate children (and standalone ads); skip structural ads.
+	cont := true
+	var dbuf []byte
+	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		if c.isStructural != nil && c.isStructural(key) {
+			return true // structural ads are hidden from results
+		}
+		w, err := codec.Decompress(dbuf[:0], ad)
+		if err != nil {
+			return true
+		}
+		dbuf = w
+		var parentW []byte
+		if pk := c.parentKeyFor(key); pk != nil {
+			parentW = parents[string(pk)]
+		}
+		qp.ws.parent = wire.Ad(parentW) // nil ⇒ no parent
+		if qp.q != nil && !matchWire(w, qp) {
+			return true
+		}
+		a, err := c.decodeWire(w)
+		if err != nil {
+			return true
+		}
+		child := classad.FromAST(a)
+		if parentW != nil {
+			if pa, err := c.decodeWire(parentW); err == nil {
+				c.mergeParent(child, classad.FromAST(pa))
+			}
+		}
+		if !yield(child) {
+			cont = false
+			return false
+		}
+		return true
+	})
+	qp.ws.parent = nil
+	return cont
+}
+
 // yieldAd is the emit callback for the classic Query/Scan path: decode w to a
 // *classad.ClassAd (skipping malformed records) and yield it.
 func (c *Collection) yieldAd(yield func(*classad.ClassAd) bool) func(w []byte) bool {
@@ -422,13 +688,25 @@ func matchWire(w []byte, qp queryPlan) bool {
 		// A queried attribute was a non-literal expression; fall back.
 	}
 	if qp.plan.PartialSafe {
-		return qp.m.Matches(partialDecodeWire(qp.ws.ctx, w, qp.plan.Seeds))
+		child := partialDecodeWire(qp.ws.ctx, w, qp.plan.Seeds)
+		if qp.ws.parent != nil {
+			// The child inherits any seed it lacks from the parent, so decode the
+			// same seeds from the parent and chain.
+			child.SetParent(partialDecodeWire(qp.ws.ctx, []byte(qp.ws.parent), qp.plan.Seeds))
+		}
+		return qp.m.Matches(child)
 	}
 	a, err := qp.ws.ctx.decodeWire(w)
 	if err != nil {
 		return false
 	}
-	return qp.m.Matches(classad.FromAST(a))
+	child := classad.FromAST(a)
+	if qp.ws.parent != nil {
+		if pa, err := qp.ws.ctx.decodeWire([]byte(qp.ws.parent)); err == nil {
+			child.SetParent(classad.FromAST(pa))
+		}
+	}
+	return qp.m.Matches(child)
 }
 
 // partialDecodeWire builds a ClassAd containing only the attributes named in

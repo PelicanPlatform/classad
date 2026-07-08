@@ -95,7 +95,8 @@ type segment struct {
 	reapMu  sync.Mutex
 	refs    int  // active scan pins
 	retired bool // removed from the live set by compaction; awaiting reap
-	reaped  bool // reap() has run (guards against a double munmap/unlink)
+	reaped  bool // reap()/close-unmap has run (guards against a double munmap)
+	closing bool // Archive.Close requested; unmap (no unlink) when pins drain
 
 	// onReap, if set, runs once right after reap() — used by the Archive to unmap a
 	// segment's mmap'd sidecar index at the same pin-drained moment its data is
@@ -122,14 +123,53 @@ func (s *segment) unpin() {
 	}
 	s.reapMu.Lock()
 	s.refs--
+	// Last pin drop: reap (munmap + unlink) a compaction-retired segment, or unmap
+	// (munmap, no unlink) a segment Archive.Close deferred because we were pinning
+	// it. reap wins if both apply. Setting reaped guards against a double free.
 	doReap := s.refs == 0 && s.retired && !s.reaped
-	if doReap {
+	doUnmap := s.refs == 0 && s.closing && !s.retired && !s.reaped
+	if doReap || doUnmap {
 		s.reaped = true
 	}
 	s.reapMu.Unlock()
 	if doReap {
 		s.reapAndHook()
+	} else if doUnmap {
+		_ = s.unmapAndHook()
 	}
+}
+
+// unmapAndHook unmaps the segment's data (munmap + close file, WITHOUT unlinking
+// the file) and then runs onReap once (the sidecar-index unmap). It is the
+// close-time counterpart of reapAndHook: the archive files persist across Close.
+func (s *segment) unmapAndHook() error {
+	err := s.unmap()
+	s.runReapHook()
+	return err
+}
+
+// closeUnmap unmaps the segment for Archive.Close: immediately if no scan pins it,
+// otherwise it defers the unmap to the last unpin (so a live watch never reads a
+// mapping torn down under it -- the bug the pin count exists to prevent). Unlike
+// retire/reap it does not unlink the backing file. Idempotent; caller holds the
+// Archive mutex, so no new pin can be taken concurrently. No-op for RAM segments.
+func (s *segment) closeUnmap() error {
+	if s.file == nil {
+		return nil
+	}
+	s.reapMu.Lock()
+	if s.reaped { // already reaped by compaction or unmapped by a prior Close
+		s.reapMu.Unlock()
+		return nil
+	}
+	if s.refs > 0 {
+		s.closing = true // a live scan pins it; the last unpin will unmap it
+		s.reapMu.Unlock()
+		return nil
+	}
+	s.reaped = true
+	s.reapMu.Unlock()
+	return s.unmapAndHook()
 }
 
 // setOnReap registers a callback run once when the segment is reaped or explicitly
