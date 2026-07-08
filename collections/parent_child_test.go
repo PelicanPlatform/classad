@@ -127,3 +127,25 @@ func TestChainedGet(t *testing.T) {
 		t.Errorf("Get(1.0) Owner=%q, want alice (inherited)", o)
 	}
 }
+
+// TestChainedAutoDeleteParent verifies a structural parent is auto-removed when
+// its last child leaves, but not before.
+func TestChainedAutoDeleteParent(t *testing.T) {
+	c := New(Options{Shards: 4, ParentKeyFor: jobParentKey, IsStructural: jobStructural})
+	c.Put([]byte("1.-1"), mustAd(t, `[DAGManJobId=42]`))
+	c.Put([]byte("1.0"), mustAd(t, `[ProcId=0]`))
+	c.Put([]byte("1.1"), mustAd(t, `[ProcId=1]`))
+	if _, ok := c.Get([]byte("1.-1")); !ok {
+		t.Fatal("cluster ad missing after Put")
+	}
+
+	c.Delete([]byte("1.0"))
+	if _, ok := c.Get([]byte("1.-1")); !ok {
+		t.Error("cluster ad auto-deleted too early (proc 1.1 still present)")
+	}
+
+	c.Delete([]byte("1.1"))
+	if _, ok := c.Get([]byte("1.-1")); ok {
+		t.Error("cluster ad not auto-deleted after its last proc left")
+	}
+}

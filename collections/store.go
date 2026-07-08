@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"iter"
 	"runtime"
 	"strings"
@@ -369,8 +370,37 @@ func (c *Collection) Delete(key []byte) bool {
 			sh.delLog.record(key, seq) // retain for resuming watchers
 			sh.hub.publish(sh.idx, seq, key, nil, nil, true)
 		}
+		// Auto-delete a structural parent whose last child just left (HTCondor
+		// ClusterCleanup): a structural ad exists only to be chained to, so once
+		// no child references it, remove it. The parent is co-located in this shard.
+		if c.parentKeyFor != nil && c.isStructural != nil {
+			if pk := c.parentKeyFor(key); pk != nil && c.isStructural(pk) && !c.hasChildren(pk) {
+				c.Delete(pk)
+			}
+		}
 	}
 	return ok
+}
+
+// hasChildren reports whether any non-structural child of parentKey is present
+// (co-located in the parent's shard). Early-exits at the first child.
+func (c *Collection) hasChildren(parentKey []byte) bool {
+	ph := c.h.Hash(parentKey)
+	sh := c.shards[c.shardOf(parentKey, ph)]
+	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
+	found := false
+	forEachVisibleKeyed(s0, wins, func(k, _ []byte, _ Codec) bool {
+		if c.isStructural != nil && c.isStructural(k) {
+			return true
+		}
+		if pk := c.parentKeyFor(k); pk != nil && bytes.Equal(pk, parentKey) {
+			found = true
+			return false // stop
+		}
+		return true
+	})
+	return found
 }
 
 // Get returns the current ad for key, decoded, or (nil, false).
