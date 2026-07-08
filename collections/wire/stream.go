@@ -159,6 +159,25 @@ func (s *StreamEncoder) Expr(name string, e ast.Expr) {
 	s.end(id, off)
 }
 
+// ExprWire writes a computed (non-literal) attribute by parsing its expression text
+// straight to wire via the native parser -- no ast.Expr. It leaves no partial entry
+// if the native parser cannot handle the expression (a record, an int64-min
+// magnitude, ...): it rolls the buffer back and returns the error, so the caller can
+// fall back to Expr(name, parser.ParseExpr(val)). Interned names added before a
+// rollback are harmless (unused ids in a shared table).
+func (s *StreamEncoder) ExprWire(name, val string) error {
+	start := len(s.entries)
+	id, off := s.begin(name)
+	buf, err := parseExprToWire(val, s.t, s.inline, s.entries)
+	if err != nil {
+		s.entries = s.entries[:start]
+		return err
+	}
+	s.entries = buf
+	s.end(id, off)
+	return nil
+}
+
 // Count returns the number of attributes written so far.
 func (s *StreamEncoder) Count() int { return s.count }
 

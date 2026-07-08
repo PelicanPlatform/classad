@@ -101,17 +101,18 @@ func (p *ReaderParser) ParseClassAd() (*ast.ClassAd, error) {
 // ParseScopedIdentifier parses an identifier that may have a scope prefix.
 // Returns the attribute name and scope.
 func ParseScopedIdentifier(identifier string) (string, ast.AttributeScope) {
-	parts := strings.SplitN(identifier, ".", 2)
-	if len(parts) == 2 {
-		scopeStr := strings.ToUpper(parts[0])
-		attrName := parts[1]
-		switch scopeStr {
-		case "MY":
-			return attrName, ast.MyScope
-		case "TARGET":
-			return attrName, ast.TargetScope
-		case "PARENT":
-			return attrName, ast.ParentScope
+	// Allocation-free: split on the first '.' with a byte index and compare the
+	// prefix case-insensitively (no strings.SplitN slice, no strings.ToUpper copy).
+	// The returned name is a sub-slice of identifier. This runs for every attribute
+	// reference the parsers emit.
+	if dot := strings.IndexByte(identifier, '.'); dot > 0 {
+		switch prefix := identifier[:dot]; {
+		case strings.EqualFold(prefix, "MY"):
+			return identifier[dot+1:], ast.MyScope
+		case strings.EqualFold(prefix, "TARGET"):
+			return identifier[dot+1:], ast.TargetScope
+		case strings.EqualFold(prefix, "PARENT"):
+			return identifier[dot+1:], ast.ParentScope
 		}
 	}
 	return identifier, ast.NoScope
