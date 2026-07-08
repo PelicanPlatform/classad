@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
@@ -72,6 +73,15 @@ type Options struct {
 	// WatchBuffer is the per-watcher live event-channel capacity (default 1024). A
 	// watcher that overflows it is told to resync rather than stalling writers.
 	WatchBuffer int
+	// WatchCoalesce, if > 0, batches live Watch events into windows of this
+	// duration and emits only the newest event per key in each window (default 0 =
+	// off, one event per change). It smooths bursty churn -- e.g. a freshly
+	// submitted job that takes many SetAttribute updates in quick succession is
+	// delivered as a single Upsert of its settled state. Only the last event of a
+	// flushed window carries a cursor, so a mid-window consumer crash resumes from
+	// the prior window and re-delivers (at-least-once is preserved). Catch-up is
+	// never coalesced.
+	WatchCoalesce time.Duration
 }
 
 // AdUpdate is one insert-or-update in a batch.
@@ -115,8 +125,9 @@ type Collection struct {
 	parallelMinBytes int
 
 	// Watch (see watch.go / docs/WATCH.md). hub is nil unless WatchHistory > 0.
-	hub      *watchHub
-	watchBuf int
+	hub           *watchHub
+	watchBuf      int
+	watchCoalesce time.Duration
 }
 
 // writeError returns the first sticky segment-allocation error across shards
@@ -197,6 +208,7 @@ func New(opts Options) *Collection {
 		if c.watchBuf <= 0 {
 			c.watchBuf = 1024
 		}
+		c.watchCoalesce = opts.WatchCoalesce
 		for i, sh := range c.shards {
 			sh.idx = i
 			sh.hub = c.hub

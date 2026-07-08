@@ -8,6 +8,7 @@ import (
 	"iter"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 )
@@ -273,6 +274,10 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 
 		// Live phase: stream buffered + new events, advancing a running cursor vector.
 		vec := append([]uint64(nil), sReg...)
+		if c.watchCoalesce > 0 {
+			c.liveCoalesced(ctx, w, sReg, vec, yield)
+			return
+		}
 		for {
 			if w.lagged.Load() {
 				yield(WatchEvent{Kind: WatchResync})
@@ -303,6 +308,83 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 			}
 		}
 	}, nil
+}
+
+// liveCoalesced streams the live phase in windows of c.watchCoalesce, emitting
+// only the newest event per key in each window (a key upserted several times, or
+// upserted then deleted, collapses to a single event of its settled state). Only
+// the last event of a flushed window carries a cursor, so a consumer that crashes
+// mid-window resumes from the prior window and re-delivers -- at-least-once is
+// preserved. The running cursor vector still advances on every event received.
+func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []uint64, yield func(WatchEvent) bool) {
+	pending := map[string]rawEvent{}
+	order := make([]string, 0, 16) // first-seen order; keys are unique per window
+
+	ticker := time.NewTicker(c.watchCoalesce)
+	defer ticker.Stop()
+
+	// flush emits the coalesced window. Returns false if the consumer stopped.
+	flush := func() bool {
+		if len(pending) == 0 {
+			return true
+		}
+		evs := make([]WatchEvent, 0, len(order))
+		for _, ks := range order {
+			raw := pending[ks]
+			ev := WatchEvent{Key: raw.key}
+			if raw.deleted {
+				ev.Kind = WatchDelete
+			} else {
+				ad, err := c.decodeAd(raw.ad, raw.codec)
+				if err != nil {
+					continue // drop an undecodable ad; its later change will re-emit
+				}
+				ev.Kind = WatchUpsert
+				ev.Ad = ad
+			}
+			evs = append(evs, ev)
+		}
+		pending = map[string]rawEvent{}
+		order = order[:0]
+		if len(evs) == 0 {
+			return true
+		}
+		evs[len(evs)-1].Cursor = encodeCursor(c.hub.epoch, vec)
+		for i := range evs {
+			if !yield(evs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+
+	for {
+		if w.lagged.Load() {
+			if !flush() {
+				return
+			}
+			yield(WatchEvent{Kind: WatchResync})
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !flush() {
+				return
+			}
+		case raw := <-w.ch:
+			if raw.seq <= sReg[raw.shard] {
+				continue // already covered by catch-up
+			}
+			vec[raw.shard] = raw.seq
+			ks := string(raw.key)
+			if _, seen := pending[ks]; !seen {
+				order = append(order, ks)
+			}
+			pending[ks] = raw
+		}
+	}
 }
 
 // catchupUpserts emits an Upsert for every record visible at sReg whose seq is in
