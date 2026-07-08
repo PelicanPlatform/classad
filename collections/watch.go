@@ -1,11 +1,13 @@
 package collections
 
 import (
+	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"iter"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -278,6 +280,7 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 			c.liveCoalesced(ctx, w, sReg, vec, yield)
 			return
 		}
+		parentSig := c.seedParentSig() // parent -> non-private signature (fan-out diff baseline)
 		for {
 			if w.lagged.Load() {
 				yield(WatchEvent{Kind: WatchResync})
@@ -291,13 +294,30 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 					continue // already covered by catch-up
 				}
 				vec[raw.shard] = raw.seq
+				if !raw.deleted && c.watchHidden(raw.key) {
+					// A structural (parent) change: fan out to its children if an
+					// inherited attribute changed; the parent itself is not emitted.
+					for _, ce := range c.fanoutChildren(raw, parentSig) {
+						ad, ok := c.watchAd(ce.key, ce.ad, ce.codec)
+						if !ok {
+							continue
+						}
+						if !yield(WatchEvent{Kind: WatchUpsert, Key: ce.key, Ad: ad, Cursor: encodeCursor(c.hub.epoch, vec)}) {
+							return
+						}
+					}
+					continue
+				}
 				ev := WatchEvent{Key: raw.key, Cursor: encodeCursor(c.hub.epoch, vec)}
 				if raw.deleted {
+					if c.watchHidden(raw.key) {
+						continue // structural delete: hidden
+					}
 					ev.Kind = WatchDelete
 				} else {
-					ad, err := c.decodeAd(raw.ad, raw.codec)
-					if err != nil {
-						continue
+					ad, ok := c.watchAd(raw.key, raw.ad, raw.codec)
+					if !ok {
+						continue // undecodable or a hidden structural ad
 					}
 					ev.Kind = WatchUpsert
 					ev.Ad = ad
@@ -387,6 +407,7 @@ func WatchFilter(seq iter.Seq[WatchEvent], match func(*classad.ClassAd) bool) it
 func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []uint64, yield func(WatchEvent) bool) {
 	pending := map[string]rawEvent{}
 	order := make([]string, 0, 16) // first-seen order; keys are unique per window
+	parentSig := c.seedParentSig()
 
 	ticker := time.NewTicker(c.watchCoalesce)
 	defer ticker.Stop()
@@ -401,11 +422,14 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 			raw := pending[ks]
 			ev := WatchEvent{Key: raw.key}
 			if raw.deleted {
+				if c.watchHidden(raw.key) {
+					continue // structural delete: hidden
+				}
 				ev.Kind = WatchDelete
 			} else {
-				ad, err := c.decodeAd(raw.ad, raw.codec)
-				if err != nil {
-					continue // drop an undecodable ad; its later change will re-emit
+				ad, ok := c.watchAd(raw.key, raw.ad, raw.codec)
+				if !ok {
+					continue // undecodable or a hidden structural ad
 				}
 				ev.Kind = WatchUpsert
 				ev.Ad = ad
@@ -446,6 +470,18 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 				continue // already covered by catch-up
 			}
 			vec[raw.shard] = raw.seq
+			if !raw.deleted && c.watchHidden(raw.key) {
+				// Structural parent change: coalesce its children's synthetic
+				// upserts (the parent itself is not emitted).
+				for _, ce := range c.fanoutChildren(raw, parentSig) {
+					cks := string(ce.key)
+					if _, seen := pending[cks]; !seen {
+						order = append(order, cks)
+					}
+					pending[cks] = ce
+				}
+				continue
+			}
 			ks := string(raw.key)
 			if _, seen := pending[ks]; !seen {
 				order = append(order, ks)
@@ -453,6 +489,137 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 			pending[ks] = raw
 		}
 	}
+}
+
+// watchAd decodes a watched key's stored ad for a WatchUpsert event. For a
+// chained collection it flattens the ad's parent in (so watch events, like query
+// results, carry inherited attributes) and returns ok=false for a structural
+// (parent-only) ad, which is hidden from watches. For a plain collection it just
+// decodes. ok=false also means "skip this event" (undecodable or hidden).
+func (c *Collection) watchAd(key, rawAd []byte, codec Codec) (*classad.ClassAd, bool) {
+	if c.isStructural != nil && c.isStructural(key) {
+		return nil, false // structural ads are hidden from watches
+	}
+	ad, err := c.decodeAd(rawAd, codec)
+	if err != nil {
+		return nil, false
+	}
+	if c.parentKeyFor != nil {
+		if pk := c.parentKeyFor(key); pk != nil {
+			ph := c.h.Hash(pk)
+			sh := c.shards[c.shardOf(pk, ph)]
+			if pad, pcodec, ok := sh.get(ph, pk); ok {
+				if parent, err := c.decodeAd(pad, pcodec); err == nil {
+					c.mergeParent(ad, parent)
+				}
+			}
+		}
+	}
+	return ad, true
+}
+
+// watchHidden reports whether key is a structural ad (hidden from watches),
+// used to suppress structural delete events.
+func (c *Collection) watchHidden(key []byte) bool {
+	return c.isStructural != nil && c.isStructural(key)
+}
+
+// nonPrivateSig renders a parent ad's non-private attributes to a comparable
+// signature, so a parent change that touched only parent-private attributes
+// (factory bookkeeping) is detected and does not fan out to children.
+func (c *Collection) nonPrivateSig(ad *classad.ClassAd) map[string]string {
+	sig := make(map[string]string)
+	for _, name := range ad.GetAttributes() {
+		lname := strings.ToLower(name)
+		if c.parentPrivate != nil {
+			if _, priv := c.parentPrivate[lname]; priv {
+				continue
+			}
+		}
+		if expr, ok := ad.Lookup(name); ok {
+			sig[lname] = expr.String()
+		}
+	}
+	return sig
+}
+
+func sigEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
+// seedParentSig records the current non-private signature of every structural ad,
+// giving the live fan-out a baseline so a parent's first change is diffed (and a
+// change to only parent-private attributes does not fan out). Empty for a
+// non-chained collection.
+func (c *Collection) seedParentSig() map[string]map[string]string {
+	sig := map[string]map[string]string{}
+	if c.parentKeyFor == nil || c.isStructural == nil {
+		return sig
+	}
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+			if c.isStructural(key) {
+				if pad, err := c.decodeAd(ad, codec); err == nil {
+					sig[string(key)] = c.nonPrivateSig(pad)
+				}
+			}
+			return true
+		})
+		releaseWindows(wins)
+	}
+	return sig
+}
+
+// fanoutChildren handles a structural (parent) change during a live watch. If a
+// non-private parent attribute changed since sig last recorded this parent, it
+// returns synthetic upsert events for the parent's children (whose flattened ads
+// changed); otherwise nil. sig caches parents' non-private signatures across the
+// watch so parent-private churn (bumped every proc a factory materializes) does
+// not fan out. The parent itself is never emitted.
+func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]string) []rawEvent {
+	np, err := c.decodeAd(parent.ad, parent.codec)
+	if err != nil {
+		return nil
+	}
+	pkey := string(parent.key)
+	newSig := c.nonPrivateSig(np)
+	old, seen := sig[pkey]
+	sig[pkey] = newSig
+	if seen && sigEqual(old, newSig) {
+		return nil // only parent-private attributes changed: no fan-out
+	}
+	// Collect the parent's children (co-located in the parent's shard) with their
+	// current stored ads, as synthetic upserts stamped at the parent's sequence.
+	ph := c.h.Hash(parent.key)
+	sh := c.shards[c.shardOf(parent.key, ph)]
+	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
+	var out []rawEvent
+	forEachVisibleKeyed(s0, wins, func(k, ad []byte, codec Codec) bool {
+		if c.isStructural != nil && c.isStructural(k) {
+			return true
+		}
+		if pk := c.parentKeyFor(k); pk != nil && bytes.Equal(pk, parent.key) {
+			out = append(out, rawEvent{
+				shard: parent.shard,
+				seq:   parent.seq,
+				key:   append([]byte(nil), k...),
+				ad:    append([]byte(nil), ad...),
+				codec: codec,
+			})
+		}
+		return true
+	})
+	return out
 }
 
 // catchupUpserts emits an Upsert for every record visible at sReg whose seq is in
@@ -470,10 +637,9 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 			}
 			seq := recSeq(wn.data, o)
 			if seq > cursor && seq <= sReg && recSuperseded(wn.data, o) > sReg {
-				ad, err := c.decodeAd(recAd(wn.data, o), wn.codec)
-				if err == nil {
-					key := append([]byte(nil), recKey(wn.data, o)...)
-					if !yield(WatchEvent{Kind: WatchUpsert, Key: key, Ad: ad}) {
+				key := recKey(wn.data, o)
+				if ad, ok := c.watchAd(key, recAd(wn.data, o), wn.codec); ok {
+					if !yield(WatchEvent{Kind: WatchUpsert, Key: append([]byte(nil), key...), Ad: ad}) {
 						return false
 					}
 				}
@@ -487,6 +653,9 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 // catchupDeletes emits a Delete for each journaled delete with seq > cursor.
 func (c *Collection) catchupDeletes(i int, cursor uint64, yield func(WatchEvent) bool) bool {
 	for _, e := range c.shards[i].delLog.since(cursor) {
+		if c.watchHidden(e.key) {
+			continue // structural delete: hidden
+		}
 		if !yield(WatchEvent{Kind: WatchDelete, Key: e.key}) {
 			return false
 		}

@@ -101,6 +101,14 @@ type Options struct {
 	// default (like condor_q omitting cluster ads). Default nil treats every ad as
 	// a normal, visible ad. Only meaningful together with ParentKeyFor.
 	IsStructural func(key []byte) bool
+
+	// ParentPrivateAttrs are parent attributes children do NOT inherit and that do
+	// NOT trigger a watch fan-out when they change -- e.g. a job cluster ad's
+	// factory bookkeeping (JobMaterializeNextProcId, ...), which mutates per proc
+	// materialized but is meaningless to a proc. They are excluded from flattening
+	// and from the parent-change diff, so high-frequency parent-internal churn does
+	// not fan out to every child. Case-insensitive. Only meaningful with ParentKeyFor.
+	ParentPrivateAttrs []string
 }
 
 // AdUpdate is one insert-or-update in a batch.
@@ -150,9 +158,11 @@ type Collection struct {
 
 	// Parent/child chaining (see docs/PARENT_CHILD.md). parentKeyFor derives a
 	// child's parent key (nil ⇒ no chaining); isStructural marks parent-only ads
-	// hidden from results. Both nil unless configured.
-	parentKeyFor func(key []byte) []byte
-	isStructural func(key []byte) bool
+	// hidden from results; parentPrivate (case-folded) are parent attributes
+	// children don't inherit and that don't trigger fan-out. All nil unless configured.
+	parentKeyFor  func(key []byte) []byte
+	isStructural  func(key []byte) bool
+	parentPrivate map[string]struct{}
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to
@@ -269,6 +279,12 @@ func New(opts Options) *Collection {
 	}
 	c.parentKeyFor = opts.ParentKeyFor
 	c.isStructural = opts.IsStructural
+	if len(opts.ParentPrivateAttrs) > 0 {
+		c.parentPrivate = make(map[string]struct{}, len(opts.ParentPrivateAttrs))
+		for _, a := range opts.ParentPrivateAttrs {
+			c.parentPrivate[strings.ToLower(a)] = struct{}{}
+		}
+	}
 	c.parallelMinBytes = defaultParallelMinBytes
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
 	if c.queryPar >= 2 {
@@ -376,7 +392,7 @@ func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 			ph := c.h.Hash(pk)
 			if pad, pcodec, ok := sh.get(ph, pk); ok {
 				if parent, err := c.decodeAd(pad, pcodec); err == nil {
-					mergeParent(ad, parent)
+					c.mergeParent(ad, parent)
 				}
 			}
 		}
@@ -523,14 +539,20 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, emit func(w []byte) bool
 	return cont
 }
 
-// mergeParent flattens into child every attribute of parent that child does not
-// already define (child overrides parent), producing a standalone ad. This is
-// needed for output because SetParent only chains expression evaluation, not
-// direct attribute reads (EvaluateAttr*, GetAttributes) or serialization -- a
-// query result or watch event must carry the inherited attributes inline, as
-// condor_q shows a job's full ad and condor_history flattens it.
-func mergeParent(child, parent *classad.ClassAd) {
+// mergeParent flattens into child every (non-private) attribute of parent that
+// child does not already define (child overrides parent), producing a standalone
+// ad. This is needed for output because SetParent only chains expression
+// evaluation, not direct attribute reads (EvaluateAttr*, GetAttributes) or
+// serialization -- a query result or watch event must carry the inherited
+// attributes inline, as condor_q shows a job's full ad and condor_history
+// flattens it. Parent-private attributes (factory bookkeeping) are not inherited.
+func (c *Collection) mergeParent(child, parent *classad.ClassAd) {
 	for _, name := range parent.GetAttributes() {
+		if c.parentPrivate != nil {
+			if _, priv := c.parentPrivate[strings.ToLower(name)]; priv {
+				continue // parent-private: not inherited
+			}
+		}
 		if _, has := child.Lookup(name); has {
 			continue // child overrides
 		}
@@ -591,7 +613,7 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 		child := classad.FromAST(a)
 		if parentW != nil {
 			if pa, err := c.decodeWire(parentW); err == nil {
-				mergeParent(child, classad.FromAST(pa))
+				c.mergeParent(child, classad.FromAST(pa))
 			}
 		}
 		if !yield(child) {
