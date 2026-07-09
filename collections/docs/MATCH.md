@@ -1,10 +1,13 @@
 # Match, rank, order: negotiator/schedd operations at the collection layer
 
-> Status: **in progress.** `Match` / `MatchSorted` are implemented in `match.go`
-> (v1: serial, reusing `Scan` + `classad.MatchClassAd`; the parallel wire-native +
-> index-pre-filtered path — steps 1–2 below — is the follow-up, and the API is stable
-> across it). The ordered index (#3) and cluster-signature projection (#4) are still
-> proposals. This doc maps the four HTCondor operations onto the collection engine:
+> Status: **in progress.** `Match` / `MatchSorted` are implemented in `match.go`,
+> **parallel** across segments with a **wire-native job-side reject** (skip the full
+> decode of slots the job definitely rejects). On a 40k-slot pool with half rejected,
+> 12-core: 183ms serial → 57.6ms with the reject (3.2×) → 19.1ms at 8 workers (9.6× vs
+> the original serial baseline); sound (any undefined/non-literal/non-native case falls
+> through to the full match). Still open: the **index candidate pre-filter (A2, below)**
+> and the **ordered index (#3)** and **cluster-signature projection (#4)**. This doc
+> maps the four HTCondor operations onto the collection engine:
 > three are one coherent capability — a **ranked/ordered scan**, with symmetric
 > **match** as its richest filter — plus a **maintained filtered ordered index** for
 > the schedd's priority-queue pattern. The fourth (RRL windowing) stays in the app.
@@ -157,16 +160,40 @@ app-side.
 
 ## Recommended build order
 
-1. **`TARGET` ad in wire eval** — the enabler for match. Small, self-contained.
-2. **`Match` / `MatchSorted(job, limit)`** — parallel bilateral scan + indexed
-   pre-filter + top-K by rank; reuses `MatchClassAd` and the parallel-scan/merge code.
-   The flagship, and the highest-value single item.
-3. **Filtered ordered index (`OrderedBy` / `Ordered`)** — the maintained priority index
-   for the schedd. The biggest build; do it once #2 proves out the sort-key extraction
-   and the `classad`-layer compiled-expression evaluation, and settle the
-   snapshot-under-churn structure with a benchmark first.
-4. **Cluster-signature projection** — a small scan-time helper feeding the app's RRL
+1. **`Match` / `MatchSorted(job, limit)` (A1)** — parallel bilateral scan + top-K by
+   rank; reuses `MatchClassAd` and the parallel-scan/merge code. **Done.**
+2. **Wire-native job-side reject (A3)** — compile `job.Requirements` once (`vm.Compile`)
+   and evaluate it against each slot's wire, skipping the full decode of definite
+   rejects; falls through to the full match on any uncertainty. **Done.**
+3. **Index candidate pre-filter (A2)** — *not yet built; see below.*
+4. **Filtered ordered index (`OrderedBy` / `Ordered`)** — the maintained priority index
+   for the schedd (§3 above). The biggest build; settle the snapshot-under-churn
+   structure with a benchmark first.
+5. **Cluster-signature projection** — a small scan-time helper feeding the app's RRL
    fold. Leave the windowing itself in the schedd.
+
+### A2 — index candidate pre-filter (potential + caveats)
+
+Instead of visiting every slot and wire-rejecting the misses one by one (A3), use the
+value/categorical index to visit only *candidate* slots. The mechanism reuses the
+existing indexed-query path: rewrite `job.Requirements` into a query over the slot —
+`TARGET.attr → attr` (the slot's own), `MY.attr → the job's evaluated literal` — then
+`planIndex` + `scanShardIndexed` give candidate offsets; bilaterally match only those.
+
+Worth it **only** when the pool is large, jobs are selective, *and* the queried slot
+attributes are indexed. Two things bound it:
+
+- **Soundness.** The pre-filter must be a *superset* — never reject a real match. That
+  is safe only for a **conjunction** of indexable `TARGET.attr OP job-constant`
+  comparisons: extract those AND-conjuncts as probes and drop the rest (dropping
+  conjuncts widens the candidate set, which is sound). A top-level `OR`/`NOT` cannot be
+  handled by dropping a side, and a `TARGET`-dependent constant cannot be baked in, so
+  those conjuncts (or the whole predicate) fall back to the A1+A3 full scan.
+- **Marginal over A3.** A3 already eliminates the expensive decode on rejects; A2
+  additionally saves the *cheap* wire-native eval + wire-lookup on non-candidates. Real
+  gain only for a huge pool with rare matches over indexed attributes; otherwise it
+  adds machinery (constraint extraction, the rewrite) for little. Benchmark before
+  committing.
 
 ## Caveats / open questions
 
