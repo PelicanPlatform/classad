@@ -11,8 +11,8 @@ import (
 // resuming after `resume` when non-nil.
 func collectPartition(oi *orderedIndex, part orderVal, resume *orderEntry) []string {
 	var got []string
-	oi.ascendPartition(oi.snapshot(), part, resume, func(key string) bool {
-		got = append(got, key)
+	oi.ascendPartition(oi.snapshot(), part, resume, func(e orderEntry) bool {
+		got = append(got, e.key)
 		return true
 	})
 	return got
@@ -115,7 +115,7 @@ func TestOrderedIndexSnapshotIsolation(t *testing.T) {
 	oi.upsert("c", p, []orderVal{numVal(3)})
 	oi.remove("a")
 	var got []string
-	oi.ascendPartition(snap, p, nil, func(k string) bool { got = append(got, k); return true })
+	oi.ascendPartition(snap, p, nil, func(e orderEntry) bool { got = append(got, e.key); return true })
 	if want := []string{"a", "b"}; !eqStrings(got, want) {
 		t.Fatalf("snapshot = %v, want %v (isolated from later writes)", got, want)
 	}
@@ -175,7 +175,7 @@ func TestOrderedIndexConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 2000; i++ {
-				oi.ascendPartition(oi.snapshot(), part, nil, func(string) bool { return true })
+				oi.ascendPartition(oi.snapshot(), part, nil, func(orderEntry) bool { return true })
 			}
 		}()
 	}
