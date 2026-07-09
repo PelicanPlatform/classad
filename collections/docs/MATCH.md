@@ -1,8 +1,11 @@
 # Match, rank, order: negotiator/schedd operations at the collection layer
 
-> Status: **proposal / plan** (not implemented). Maps four HTCondor operations onto
-> the collection engine and recommends which belong here. Verdict: three of the four
-> are one coherent collection capability — a **ranked/ordered scan**, with symmetric
+> Status: **in progress.** `Match` / `MatchSorted` are implemented in `match.go`
+> (v1: serial, reusing `Scan` + `classad.MatchClassAd`; the parallel wire-native +
+> index-pre-filtered path — steps 1–2 below — is the follow-up, and the API is stable
+> across it). The ordered index (#3) and cluster-signature projection (#4) are still
+> proposals. This doc maps the four HTCondor operations onto the collection engine:
+> three are one coherent capability — a **ranked/ordered scan**, with symmetric
 > **match** as its richest filter — plus a **maintained filtered ordered index** for
 > the schedd's priority-queue pattern. The fourth (RRL windowing) stays in the app.
 
