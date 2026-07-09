@@ -164,6 +164,64 @@ does not care about without parsing it (`skipNode`), and a zero-copy `Ad` access
 engine (Chapter 9) read `TARGET.Memory` straight out of the bytes and ignore the other
 forty attributes of a slot ad.
 
+### Byte layout
+
+An encoded ad is a 3-byte header, an optional hot-attribute directory, then the
+attribute entries:
+
+```
+[magic:1=0xCA] [version:1] [flags:1]
+(if flags has flagStandalone:  an embedded intern table — omitted for stored ads)
+[hotCount: uvarint]   hotCount × ( uvarint(key), uvarint(offset) )   // the hot directory
+[attrCount: uvarint]  attrCount × ( key, value-node )                // the entries region
+```
+
+The `key` is a `uvarint(internID)` for an interned ad, or `uvarint(len)+bytes` for an
+inline-names ad. Each `value-node` is a tag byte plus a tag-specific payload — the same
+recursive encoding for a literal or a whole expression. The hot directory's `offset` is
+**relative to the start of the entries region** (not the ad), which avoids a chicken-and-egg
+problem: an absolute offset would depend on the header's own size, which depends on how many
+bytes those offsets take to encode.
+
+The value-node tags are a small closed set. The scalars a query touches most are one byte
+plus a minimal payload:
+
+| Tag | Meaning | Payload |
+|---|---|---|
+| `0x00`–`0x03` | undefined / error / false / true | *(none — the tag is the value)* |
+| `0x04` | integer | zigzag varint |
+| `0x05` | real | 8 bytes IEEE-754 LE |
+| `0x06` | string | `uvarint(len)` + bytes |
+| `0x07` | attribute ref | scope byte + `uvarint(nameID)` |
+| `0x08` | binary op | op byte + node(left) + node(right) |
+| … | list, func, cond, select, … | children encoded inline, pre-order |
+
+Worked example — the ad `[ Arch = "INTEL"; Cpus = 4; Requirements = TARGET.Memory >= 2048 ]`,
+interned (illustrative ids `Arch=10`, `Cpus=11`, `Requirements=12`, `Memory=13`), with
+`Cpus` declared hot:
+
+```
+CA                        magic
+01                        version 1
+00                        flags = 0  (interned, shared table, not inline)
+01                        hotCount = 1
+0B 09                     hot: key=11 (Cpus), offset=9 into the entries region
+03                        attrCount = 3
+── entries region (offset 0 starts here) ───────────────────────────────
+0A  06 05 49 4E 54 45 4C  Arch: id=10, node = string(0x06) len=5 "INTEL"
+0B  04 08                 Cpus: id=11, node = int(0x04) zigzag(4)=8        ← offset 9 = its node
+0C  08 08                 Requirements: id=12, node = binop(0x08) op=">="(8)
+        07 02 0D            left  = attrRef(0x07) scope=TARGET(2) name=13 (Memory)
+        04 80 20            right = int(0x04) zigzag(2048) = uvarint 4096
+```
+
+`Cpus`'s hot offset is 9 because its value node begins 9 bytes into the entries region
+(the `Arch` entry is 8 bytes: 1 id + 7 node). A `Lookup(Cpus)` reads the node directly at
+`entriesStart + 9`; a `Lookup(Arch)` — not hot — skips forward node-by-node with `skipNode`.
+An inline-names ad is identical except each `key` is `uvarint(len)+bytes` (e.g. `04 41 72 63
+68` for `"Arch"`), the hot directory keys are a 32-bit case-folded name hash instead of an id,
+and refs/funcs/selects use the inline-name node variants that carry the name inline.
+
 Attribute names are handled in one of two modes, a deliberate split:
 
 - **Interned** (in-memory `Collection`). A shared `InternTable` maps each name to a
@@ -198,6 +256,42 @@ Two more wire features matter:
   parser for computed values or awkward inputs. End to end this is about 3× faster with
   3× fewer allocations than parse-then-`Put`, and it is differentially tested to produce
   identical results.
+
+### Layout note: interleaved entries vs. a full directory
+
+The current body **interleaves** `key` and `value` — `(id, node)(id, node)…` — and the hot
+directory is a *sparse* index over it: it stores an offset only for the attributes a workload
+actually touches. An alternative worth considering is a **fully split** layout — all keys and
+their offsets first (a complete directory), then all value nodes — essentially promoting every
+attribute to "hot." The trade-offs are real and point in different directions:
+
+- **Random access to a *cold* attribute.** A full directory wins. Today a non-hot `Lookup` is
+  an O(n) `skipNode` walk (recursively parsing each intervening value); a full directory makes
+  it an O(1) offset read (or O(log n) binary search, since entries are already stored in a
+  canonical sorted order). If access were unpredictable — arbitrary attribute projection,
+  interactive exploration — this uniformity would matter.
+- **Name-only scans.** A split layout wins clearly: tallying attribute frequency (what
+  `RefreshHotSet` does), or reading a schema, can walk the key list contiguously without
+  touching — or `skipNode`-ing past — a single value.
+- **Size.** The interleaved + sparse-hot layout wins. A full directory pays an offset for
+  *every* attribute in *every* record; across a large pool with a long tail of rarely-queried
+  attributes, that is real space (and offsets compress less well than the repetitive names and
+  values the dictionary loves). The hot directory pays offsets only for the ~handful of
+  attributes that are actually hot.
+- **Full materialization (the output path).** Interleaving wins on locality: decoding a whole
+  ad is one sequential pass with each name adjacent to its value, rather than two separate
+  regions.
+
+The design bet is that **HTCondor's access pattern is predictable**: queries filter on a small,
+stable set of attributes (`Owner`, `JobStatus`, `RequestMemory`, `Arch`, …), and the output path
+materializes the whole ad. So the sparse, *adaptive* hot directory — which `RefreshHotSet` sizes
+automatically to the attributes a workload observes — gives directory-like O(1) access to exactly
+those, without paying an offset for the long tail, and keeps full-ad decode cache-friendly. A
+full directory would be the better choice for a more ad-hoc, projection-heavy, or schema-inspecting
+workload; it is a clean future variant (the hot header already proves the mechanism), and the two
+could even coexist by letting the hot set grow to cover all attributes for such collections. For
+the negotiator/schedd/collector patterns this engine targets, the interleaved-with-sparse-hot
+layout is the deliberate choice.
 
 Uncompressed, the wire form is roughly 64% of the ClassAd text size; the real win comes
 from compression next.
