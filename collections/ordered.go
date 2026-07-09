@@ -27,6 +27,12 @@ type OrderSpec struct {
 	Partition string    // attribute partitioning the index; empty = one global partition
 	Where     string    // membership predicate; empty = every ad is a member
 	Keys      []SortKey // sort order within a partition
+	// Cluster names the attributes whose combined value forms a member's cluster
+	// signature -- a hash surfaced alongside each ad by Ordered. The schedd's RRL
+	// fold groups the ordered stream into runs of equal signature (a stored-value
+	// compare instead of re-hashing the requirement attributes each cycle). Computed
+	// once on the write path. Empty = no signature (Ordered reports 0). Optional.
+	Cluster []string
 }
 
 // orderVal is one comparable, evaluated value (a partition value or a sort-key
@@ -104,6 +110,7 @@ type orderEntry struct {
 	keys []orderVal
 	seq  uint64
 	key  string
+	sig  uint64 // cluster signature (carried data; not part of the sort order)
 }
 
 // entryLess builds the strict weak order for spec: partition (ascending), then each
@@ -136,11 +143,13 @@ func entryLess(spec OrderSpec) func(a, b orderEntry) bool {
 type orderedIndex struct {
 	spec OrderSpec
 
-	// Compiled membership/partition/sort expressions (populated by compile). where
-	// is nil for an unfiltered index; part is nil for a single global partition.
-	where    *classad.Expr
-	part     *classad.Expr
-	keyExprs []*classad.Expr
+	// Compiled membership/partition/sort/cluster expressions (populated by compile).
+	// where is nil for an unfiltered index; part is nil for a single global partition;
+	// clusterExprs is empty when no cluster signature is configured.
+	where        *classad.Expr
+	part         *classad.Expr
+	keyExprs     []*classad.Expr
+	clusterExprs []*classad.Expr
 
 	mu    sync.Mutex
 	tree  *btree.BTreeG[orderEntry]
@@ -180,16 +189,55 @@ func (oi *orderedIndex) compile() error {
 		}
 		oi.keyExprs = append(oi.keyExprs, e)
 	}
+	for _, ce := range oi.spec.Cluster {
+		e, err := classad.ParseExpr(ce)
+		if err != nil {
+			return fmt.Errorf("ordered index Cluster %q: %w", ce, err)
+		}
+		oi.clusterExprs = append(oi.clusterExprs, e)
+	}
 	return nil
+}
+
+// signature hashes the cluster attributes' evaluated values into a 64-bit cluster
+// signature (FNV-1a over each value's canonical text, delimited). Two ads with equal
+// clustering values hash equal, so the app's run-length fold over the ordered stream
+// compares signatures instead of re-hashing. A hash collision could merge two
+// adjacent runs; with 64 bits over the value bytes that is negligible.
+func (oi *orderedIndex) signature(ad *classad.ClassAd) uint64 {
+	if len(oi.clusterExprs) == 0 {
+		return 0
+	}
+	const off = 1469598103934665603
+	h := uint64(off)
+	for _, e := range oi.clusterExprs {
+		h = fnv1a(h, e.Eval(ad).String())
+		h = fnv1aByte(h, 0) // delimiter so ["a","bc"] and ["ab","c"] differ
+	}
+	return h
+}
+
+func fnv1a(h uint64, s string) uint64 {
+	const prime = 1099511628211
+	for i := 0; i < len(s); i++ {
+		h ^= uint64(s[i])
+		h *= prime
+	}
+	return h
+}
+
+func fnv1aByte(h uint64, b byte) uint64 {
+	const prime = 1099511628211
+	return (h ^ uint64(b)) * prime
 }
 
 // evalAd evaluates the ad against the index: whether it is a member (Where is true,
 // or absent), and if so its partition value and sort-key tuple. Expressions resolve
 // against the ad as given (a chained child's inherited parent attributes are not
 // applied here).
-func (oi *orderedIndex) evalAd(ad *classad.ClassAd) (member bool, part orderVal, keys []orderVal) {
+func (oi *orderedIndex) evalAd(ad *classad.ClassAd) (member bool, part orderVal, keys []orderVal, sig uint64) {
 	if oi.where != nil && !isTrueValue(oi.where.Eval(ad)) {
-		return false, orderVal{}, nil
+		return false, orderVal{}, nil, 0
 	}
 	if oi.part != nil {
 		part = valueToOrderVal(oi.part.Eval(ad))
@@ -198,27 +246,39 @@ func (oi *orderedIndex) evalAd(ad *classad.ClassAd) (member bool, part orderVal,
 	for i, e := range oi.keyExprs {
 		keys[i] = valueToOrderVal(e.Eval(ad))
 	}
-	return true, part, keys
+	return true, part, keys, oi.signature(ad)
 }
 
 // upsert inserts or repositions key's entry for the given partition and sort-key
 // values. An existing member keeps its original insertion sequence (a stable
 // tiebreaker) even when its sort keys change.
 func (oi *orderedIndex) upsert(key string, part orderVal, keys []orderVal) {
+	oi.upsertSig(key, part, keys, 0)
+}
+
+// upsertSig is upsert carrying a cluster signature. When only the signature changes
+// (a clustering attribute moved but the sort position did not) the entry is replaced
+// in place; a partition or sort-key change relocates it.
+func (oi *orderedIndex) upsertSig(key string, part orderVal, keys []orderVal, sig uint64) {
 	oi.mu.Lock()
 	defer oi.mu.Unlock()
 	var seq uint64
 	if old, ok := oi.byKey[key]; ok {
-		if entriesEqual(old, part, keys) {
-			return // no change to partition or order: nothing to do
+		samePos := entriesEqual(old, part, keys)
+		if samePos && old.sig == sig {
+			return // nothing changed
 		}
 		seq = old.seq
-		oi.tree.Delete(old)
+		if !samePos {
+			oi.tree.Delete(old) // relocating: remove from the old position
+		}
+		// If the position is unchanged, Set below replaces the equal-comparing entry
+		// in place (updating its signature) without a move.
 	} else {
 		oi.seq++
 		seq = oi.seq
 	}
-	e := orderEntry{part: part, keys: keys, seq: seq, key: key}
+	e := orderEntry{part: part, keys: keys, seq: seq, key: key, sig: sig}
 	oi.tree.Set(e)
 	oi.byKey[key] = e
 }
@@ -322,8 +382,8 @@ func (c *Collection) maintainOrdered(key []byte, ad *classad.ClassAd) {
 		}
 	}
 	for _, oi := range c.ordered {
-		if member, part, keys := oi.evalAd(ad); member {
-			oi.upsert(k, part, keys)
+		if member, part, keys, sig := oi.evalAd(ad); member {
+			oi.upsertSig(k, part, keys, sig)
 		} else {
 			oi.remove(k)
 		}
@@ -370,21 +430,31 @@ func (c *Collection) removeOrdered(key []byte) {
 }
 
 // OrderCursor marks a position in an ordered scan. Its zero value starts at the
-// beginning of a partition; the value yielded alongside an ad resumes strictly after
+// beginning of a partition; the cursor yielded alongside an ad resumes strictly after
 // that ad, so a negotiator can iterate a partition across several calls.
 type OrderCursor struct {
 	entry *orderEntry
 }
 
+// OrderedAd is one step of an ordered scan: the member ad, a cursor that resumes
+// right after it, and the cluster signature (0 unless OrderSpec.Cluster is set). The
+// signature lets an app run-length-fold the stream into RRLs with a stored-value
+// compare instead of re-hashing each ad's clustering attributes.
+type OrderedAd struct {
+	Ad        *classad.ClassAd
+	Cursor    OrderCursor
+	Signature uint64
+}
+
 // Ordered iterates one partition of the index-th configured ordered index in sort
-// order, yielding each member ad together with a cursor that resumes right after it.
+// order, yielding each member ad with its resume cursor and cluster signature.
 // Iteration is over an O(1) snapshot taken at the call, so it is stable even as the
 // index churns; each ad is fetched live by key, so a member deleted since the
 // snapshot is skipped. For an index configured without a Partition, the partition
 // argument is ignored (there is a single global run). resume's zero value starts at
 // the beginning.
-func (c *Collection) Ordered(index int, partition classad.Value, resume OrderCursor) iter.Seq2[*classad.ClassAd, OrderCursor] {
-	return func(yield func(*classad.ClassAd, OrderCursor) bool) {
+func (c *Collection) Ordered(index int, partition classad.Value, resume OrderCursor) iter.Seq[OrderedAd] {
+	return func(yield func(OrderedAd) bool) {
 		if index < 0 || index >= len(c.ordered) {
 			return
 		}
@@ -400,7 +470,7 @@ func (c *Collection) Ordered(index int, partition classad.Value, resume OrderCur
 				return true // concurrently deleted since the snapshot: skip
 			}
 			ec := e
-			return yield(ad, OrderCursor{entry: &ec})
+			return yield(OrderedAd{Ad: ad, Cursor: OrderCursor{entry: &ec}, Signature: e.sig})
 		})
 	}
 }

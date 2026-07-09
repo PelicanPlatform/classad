@@ -35,8 +35,8 @@ func putJob(t *testing.T, c *Collection, key, owner string, status, prio, qdate 
 func orderedJobs(t *testing.T, c *Collection, owner string) []string {
 	t.Helper()
 	var got []string
-	for ad := range c.Ordered(0, classad.NewStringValue(owner), OrderCursor{}) {
-		j, ok := ad.EvaluateAttrString("Job")
+	for r := range c.Ordered(0, classad.NewStringValue(owner), OrderCursor{}) {
+		j, ok := r.Ad.EvaluateAttrString("Job")
 		if !ok {
 			t.Fatal("ordered ad missing Job")
 		}
@@ -105,10 +105,10 @@ func TestOrderedResumeCursor(t *testing.T) {
 	// First call: take one job, remember the cursor after it.
 	var first []string
 	var cursor OrderCursor
-	for ad, cur := range c.Ordered(0, classad.NewStringValue("u"), OrderCursor{}) {
-		j, _ := ad.EvaluateAttrString("Job")
+	for r := range c.Ordered(0, classad.NewStringValue("u"), OrderCursor{}) {
+		j, _ := r.Ad.EvaluateAttrString("Job")
 		first = append(first, j)
-		cursor = cur
+		cursor = r.Cursor
 		break // stop after the first (negotiator ran out of slots)
 	}
 	if want := []string{"p1"}; !eqStrings(first, want) {
@@ -116,8 +116,8 @@ func TestOrderedResumeCursor(t *testing.T) {
 	}
 	// Resume: the rest, in order, exactly once.
 	var rest []string
-	for ad := range c.Ordered(0, classad.NewStringValue("u"), cursor) {
-		j, _ := ad.EvaluateAttrString("Job")
+	for r := range c.Ordered(0, classad.NewStringValue("u"), cursor) {
+		j, _ := r.Ad.EvaluateAttrString("Job")
 		rest = append(rest, j)
 	}
 	if want := []string{"p2", "p3"}; !eqStrings(rest, want) {
@@ -213,5 +213,109 @@ func TestOrderedChainedInheritedPartition(t *testing.T) {
 	putProc("1.0", 2, 10) // 1.0 starts running -> leaves
 	if got, want := orderedJobs(t, c, "alice"), []string{"1.1"}; !eqStrings(got, want) {
 		t.Fatalf("after 1.0 running = %v, want %v", got, want)
+	}
+}
+
+// clusterQueue orders idle jobs by QDate and computes a cluster signature over the
+// request attributes -- the schedd's RRL grouping key.
+func clusterQueue(t *testing.T) *Collection {
+	t.Helper()
+	return New(Options{
+		Shards: 4,
+		Ordered: []OrderSpec{{
+			Partition: "Owner",
+			Where:     "JobStatus == 1",
+			Keys:      []SortKey{{Expr: "QDate"}},
+			Cluster:   []string{"RequestCpus", "RequestMemory"},
+		}},
+	})
+}
+
+func putCJob(t *testing.T, c *Collection, key, owner string, qdate, cpus, mem int) {
+	t.Helper()
+	ad := mustAd(t, fmt.Sprintf(`[ Owner=%q; JobStatus=1; QDate=%d; RequestCpus=%d; RequestMemory=%d; Job=%q ]`,
+		owner, qdate, cpus, mem, key))
+	if err := c.Put([]byte(key), ad); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// rleRuns folds a partition's ordered stream into runs of equal cluster signature --
+// exactly the schedd's RRL construction -- and returns the run count and the per-ad
+// signatures in order.
+func rleRuns(t *testing.T, c *Collection, owner string) (runs int, sigs []uint64) {
+	t.Helper()
+	var prev uint64
+	have := false
+	for r := range c.Ordered(0, classad.NewStringValue(owner), OrderCursor{}) {
+		sigs = append(sigs, r.Signature)
+		if !have || r.Signature != prev {
+			runs++
+			prev = r.Signature
+			have = true
+		}
+	}
+	return runs, sigs
+}
+
+// TestOrderedClusterSignature: adjacent equal-cluster jobs fold into one RRL; the same
+// jobs interleaved fold into many. This is the A,A,B,B -> 2 vs A,B,A,B -> 4 example.
+func TestOrderedClusterSignature(t *testing.T) {
+	t.Parallel()
+	grouped := clusterQueue(t)
+	putCJob(t, grouped, "a1", "u", 1, 1, 100) // cluster A
+	putCJob(t, grouped, "a2", "u", 2, 1, 100) // cluster A
+	putCJob(t, grouped, "b1", "u", 3, 2, 200) // cluster B
+	putCJob(t, grouped, "b2", "u", 4, 2, 200) // cluster B
+	runs, sigs := rleRuns(t, grouped, "u")
+	if len(sigs) != 4 {
+		t.Fatalf("got %d members, want 4", len(sigs))
+	}
+	if sigs[0] != sigs[1] || sigs[2] != sigs[3] {
+		t.Fatal("equal clustering attributes must hash to equal signatures")
+	}
+	if sigs[0] == sigs[2] {
+		t.Fatal("different clustering attributes must hash to different signatures")
+	}
+	if runs != 2 {
+		t.Fatalf("grouped runs = %d, want 2", runs)
+	}
+
+	interleaved := clusterQueue(t)
+	putCJob(t, interleaved, "a1", "u", 1, 1, 100) // A
+	putCJob(t, interleaved, "b1", "u", 2, 2, 200) // B
+	putCJob(t, interleaved, "a2", "u", 3, 1, 100) // A
+	putCJob(t, interleaved, "b2", "u", 4, 2, 200) // B
+	if runs, _ := rleRuns(t, interleaved, "u"); runs != 4 {
+		t.Fatalf("interleaved runs = %d, want 4", runs)
+	}
+}
+
+// TestOrderedSignatureInPlaceUpdate: changing only a clustering attribute (sort
+// position unchanged) refreshes the surfaced signature without relocating the entry.
+func TestOrderedSignatureInPlaceUpdate(t *testing.T) {
+	t.Parallel()
+	c := clusterQueue(t)
+	putCJob(t, c, "j", "u", 5, 1, 100)
+	_, sigs := rleRuns(t, c, "u")
+	putCJob(t, c, "j", "u", 5, 1, 200) // same QDate (position), different RequestMemory
+	n, sigs2 := rleRuns(t, c, "u")
+	if n != 1 || len(sigs2) != 1 {
+		t.Fatalf("expected 1 member after in-place update, got %d", len(sigs2))
+	}
+	if sigs[0] == sigs2[0] {
+		t.Fatal("signature should change when a clustering attribute changes")
+	}
+}
+
+// TestOrderedNoClusterSignatureZero: without OrderSpec.Cluster, the signature is 0.
+func TestOrderedNoClusterSignatureZero(t *testing.T) {
+	t.Parallel()
+	c := schedQueue(t) // no Cluster configured
+	putJob(t, c, "j1", "u", 1, 10, 0)
+	for r := range c.Ordered(0, classad.NewStringValue("u"), OrderCursor{}) {
+		if r.Signature != 0 {
+			t.Fatalf("unconfigured cluster signature = %d, want 0", r.Signature)
+		}
 	}
 }

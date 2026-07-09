@@ -167,11 +167,15 @@ job (your A,A,B,B → 2 RRLs vs A,B,A,B → 2000 example is exactly RLE over sor
 It is inherently **serial and order-dependent**, so the collection's parallelism has
 nothing to add. It belongs in the schedd, consuming the `Ordered` iteration from #3.
 
-The **one** contribution the collection can make: compute each ad's **cluster
-signature** (a hash of the clustering attributes) during the scan — wire-native,
-parallel, cheap — and surface it alongside the ad, so the schedd's RLE fold is a
-pointer compare rather than re-hashing attributes. The grouping-into-runs stays
-app-side.
+The **one** contribution the collection makes *(implemented)*: compute each ad's
+**cluster signature** (a 64-bit FNV-1a hash of the `OrderSpec.Cluster` attributes'
+values) and surface it as `OrderedAd.Signature`, so the schedd's RLE fold is a
+stored-`uint64` compare rather than re-hashing attributes. It is computed once on the
+write path (alongside membership and the sort key) and stored on the index entry — a
+clustering-attribute change that does not move the sort position refreshes the
+signature in place. The grouping-into-runs stays app-side: fold the `Ordered` stream,
+starting a new RRL whenever `Signature` changes (see `rleRuns` in the tests). A 64-bit
+collision could merge two adjacent runs; over the value bytes that is negligible.
 
 ## Recommended build order
 
@@ -184,7 +188,8 @@ app-side.
 4. **Filtered ordered index (`Options.Ordered` / `Collection.Ordered`)** — the
    maintained priority index for the schedd (§3 above). **Done** (COW B-tree, write-path
    maintenance, snapshot+resume reads, recovery rebuild, and chained-view evaluation).
-5. **Cluster-signature projection** — a small scan-time helper feeding the app's RRL
+5. **Cluster-signature projection** — **Done** (`OrderSpec.Cluster` →
+   `OrderedAd.Signature`). A small write-time helper feeding the app's RRL
    fold. Leave the windowing itself in the schedd.
 
 ### A2 — index candidate pre-filter (potential + caveats)
