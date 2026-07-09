@@ -122,3 +122,102 @@ func TestMatchNilJob(t *testing.T) {
 		t.Fatalf("MatchSorted(nil) = %v, want nil", got)
 	}
 }
+
+// largeMatchCorpus fills c with n slots; even-Id slots match the job below
+// (Memory 8192 >= 4096, Arch X86_64, symmetric Requirements), odd-Id slots fail.
+func largeMatchCorpus(t *testing.T, c *Collection, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		mem, arch := 8192, "X86_64"
+		if i%2 == 1 {
+			mem = 1024 // fails the job's Memory requirement
+		}
+		text := fmt.Sprintf(`[ Id=%d; Memory=%d; Arch=%q; Cpus=%d; Requirements = TARGET.RequestMemory <= Memory ]`,
+			i, mem, arch, i) // Cpus = i ⇒ unique Rank ⇒ deterministic sort order
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func bigMatchJob(t *testing.T) *classad.ClassAd {
+	return mustAd(t, `[ RequestMemory=4096;
+		Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64";
+		Rank = TARGET.Cpus ]`)
+}
+
+// TestMatchParallelEqualsSerial forces the fan-out path on a large pool and checks it
+// yields exactly the same matches (and Rank order) as the serial path. Run with -race.
+func TestMatchParallelEqualsSerial(t *testing.T) {
+	t.Parallel()
+	const n = 3000
+	serial := New(Options{Shards: 4, QueryParallelism: 1})
+	par := New(Options{Shards: 4, SegmentSize: 1 << 12, QueryParallelism: 8})
+	par.parallelMinBytes = 0 // force fan-out
+	largeMatchCorpus(t, serial, n)
+	largeMatchCorpus(t, par, n)
+
+	segs := 0
+	for _, sh := range par.shards {
+		segs += len(sh.segs)
+	}
+	if segs < 8 {
+		t.Fatalf("expected many segments to fan out over, got %d", segs)
+	}
+
+	setOf := func(c *Collection) []int {
+		var ids []int
+		seen := map[int]bool{}
+		for ad := range c.Match(bigMatchJob(t)) {
+			id, _ := ad.EvaluateAttrInt("Id")
+			if seen[int(id)] {
+				t.Fatalf("duplicate match id %d", id)
+			}
+			seen[int(id)] = true
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+		return ids
+	}
+	sIDs, pIDs := setOf(serial), setOf(par)
+	if !equalInts(sIDs, pIDs) {
+		t.Fatalf("parallel matches (%d) != serial matches (%d)", len(pIDs), len(sIDs))
+	}
+	if len(sIDs) != n/2 {
+		t.Fatalf("expected %d matches (even Ids), got %d", n/2, len(sIDs))
+	}
+
+	// MatchSorted order must agree too (top by Rank = Cpus).
+	sSorted := matchIDs(t, serial.MatchSorted(bigMatchJob(t), 10))
+	pSorted := matchIDs(t, par.MatchSorted(bigMatchJob(t), 10))
+	if !equalInts(sSorted, pSorted) {
+		t.Fatalf("top-10 order differs: serial %v vs parallel %v", sSorted, pSorted)
+	}
+}
+
+func benchmarkMatch(b *testing.B, par int) {
+	c := New(Options{Shards: 8, SegmentSize: 1 << 14, QueryParallelism: par})
+	if par >= 2 {
+		c.parallelMinBytes = 0
+	}
+	for i := 0; i < 40000; i++ {
+		mem := 8192
+		if i%2 == 1 {
+			mem = 1024
+		}
+		_ = c.Put([]byte(fmt.Sprintf("s%d", i)),
+			mustAd(b, fmt.Sprintf(`[ Id=%d; Memory=%d; Arch="X86_64"; Cpus=%d; Requirements = TARGET.RequestMemory <= Memory ]`, i, mem, i)))
+	}
+	job := mustAd(b, `[ RequestMemory=4096; Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64"; Rank = TARGET.Cpus ]`)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n := 0
+		for range c.Match(job) {
+			n++
+		}
+	}
+}
+
+func BenchmarkMatchPar1(b *testing.B) { benchmarkMatch(b, 1) }
+func BenchmarkMatchPar4(b *testing.B) { benchmarkMatch(b, 4) }
+func BenchmarkMatchPar8(b *testing.B) { benchmarkMatch(b, 8) }
