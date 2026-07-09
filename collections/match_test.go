@@ -1,0 +1,370 @@
+package collections
+
+import (
+	"fmt"
+	"sort"
+	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
+)
+
+// matchCorpus builds a collection of four slots exercising every match outcome
+// against the job below, and returns the job.
+//
+//	job: needs Memory >= 4096 and Arch X86_64; ranks by the slot's Cpus.
+//	slot 1: matches (rank 16)
+//	slot 2: fails the JOB's requirement  (Memory 2048 < 4096)
+//	slot 3: fails the SLOT's requirement (asymmetric: rejects the job)
+//	slot 4: matches (rank 32)
+func matchCorpus(t *testing.T) (*Collection, *classad.ClassAd) {
+	t.Helper()
+	c := New(Options{Shards: 4})
+	slots := map[int]string{
+		1: `[ Id=1; Memory=8192;  Arch="X86_64"; Cpus=16; Requirements = TARGET.RequestMemory <= Memory ]`,
+		2: `[ Id=2; Memory=2048;  Arch="X86_64"; Cpus=8;  Requirements = true ]`,
+		3: `[ Id=3; Memory=8192;  Arch="X86_64"; Cpus=4;  Requirements = TARGET.RequestMemory <= 1000 ]`,
+		4: `[ Id=4; Memory=16384; Arch="X86_64"; Cpus=32; Requirements = true ]`,
+	}
+	for id, text := range slots {
+		if err := c.Put([]byte(fmt.Sprintf("slot%d", id)), mustAd(t, text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := mustAd(t, `[ RequestMemory = 4096;
+		Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64";
+		Rank = TARGET.Cpus ]`)
+	return c, job
+}
+
+func matchIDs(t *testing.T, ads []*classad.ClassAd) []int {
+	t.Helper()
+	var ids []int
+	for _, ad := range ads {
+		id, ok := ad.EvaluateAttrInt("Id")
+		if !ok {
+			t.Fatal("match result missing Id")
+		}
+		ids = append(ids, int(id))
+	}
+	return ids
+}
+
+func TestMatchSymmetric(t *testing.T) {
+	t.Parallel()
+	c, job := matchCorpus(t)
+	var got []int
+	for ad := range c.Match(job) {
+		id, _ := ad.EvaluateAttrInt("Id")
+		got = append(got, int(id))
+	}
+	sort.Ints(got)
+	if want := []int{1, 4}; !equalInts(got, want) {
+		t.Fatalf("Match = %v, want %v (2 rejected: job-req and slot-req)", got, want)
+	}
+}
+
+func TestMatchSortedByRank(t *testing.T) {
+	t.Parallel()
+	c, job := matchCorpus(t)
+	got := matchIDs(t, c.MatchSorted(job, 0))
+	// slot 4 (Cpus 32) ranks above slot 1 (Cpus 16).
+	if want := []int{4, 1}; !equalInts(got, want) {
+		t.Fatalf("MatchSorted = %v, want %v (by descending Rank)", got, want)
+	}
+}
+
+func TestMatchSortedTopK(t *testing.T) {
+	t.Parallel()
+	c, job := matchCorpus(t)
+	got := matchIDs(t, c.MatchSorted(job, 1))
+	if want := []int{4}; !equalInts(got, want) {
+		t.Fatalf("MatchSorted top-1 = %v, want %v", got, want)
+	}
+}
+
+// TestMatchDoesNotMutateJob checks the caller's job ad is left as it was found.
+func TestMatchDoesNotMutateJob(t *testing.T) {
+	t.Parallel()
+	c, job := matchCorpus(t)
+	before := job.GetTarget()
+	for range c.Match(job) {
+	}
+	c.MatchSorted(job, 0)
+	if job.GetTarget() != before {
+		t.Fatal("Match/MatchSorted left a target set on the caller's job ad")
+	}
+}
+
+// TestMatchNoRequirements: a slot without a Requirements attribute cannot match
+// (symmetry needs both sides true).
+func TestMatchNoRequirements(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2})
+	_ = c.Put([]byte("s1"), mustAd(t, `[ Id=1; Memory=8192; Arch="X86_64"; Cpus=8 ]`)) // no Requirements
+	job := mustAd(t, `[ RequestMemory=4096; Requirements = TARGET.Memory >= RequestMemory; Rank = TARGET.Cpus ]`)
+	n := 0
+	for range c.Match(job) {
+		n++
+	}
+	if n != 0 {
+		t.Fatalf("a slot without Requirements should not match; got %d matches", n)
+	}
+}
+
+// TestMatchNilJob is a defensive no-op.
+func TestMatchNilJob(t *testing.T) {
+	t.Parallel()
+	c, _ := matchCorpus(t)
+	for range c.Match(nil) {
+		t.Fatal("Match(nil) should yield nothing")
+	}
+	if got := c.MatchSorted(nil, 0); got != nil {
+		t.Fatalf("MatchSorted(nil) = %v, want nil", got)
+	}
+}
+
+// largeMatchCorpus fills c with n slots; even-Id slots match the job below
+// (Memory 8192 >= 4096, Arch X86_64, symmetric Requirements), odd-Id slots fail.
+func largeMatchCorpus(t *testing.T, c *Collection, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		mem, arch := 8192, "X86_64"
+		if i%2 == 1 {
+			mem = 1024 // fails the job's Memory requirement
+		}
+		text := fmt.Sprintf(`[ Id=%d; Memory=%d; Arch=%q; Cpus=%d; Requirements = TARGET.RequestMemory <= Memory ]`,
+			i, mem, arch, i) // Cpus = i ⇒ unique Rank ⇒ deterministic sort order
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func bigMatchJob(t *testing.T) *classad.ClassAd {
+	return mustAd(t, `[ RequestMemory=4096;
+		Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64";
+		Rank = TARGET.Cpus ]`)
+}
+
+// TestMatchParallelEqualsSerial forces the fan-out path on a large pool and checks it
+// yields exactly the same matches (and Rank order) as the serial path. Run with -race.
+func TestMatchParallelEqualsSerial(t *testing.T) {
+	t.Parallel()
+	const n = 3000
+	serial := New(Options{Shards: 4, QueryParallelism: 1})
+	par := New(Options{Shards: 4, SegmentSize: 1 << 12, QueryParallelism: 8})
+	par.parallelMinBytes = 0 // force fan-out
+	largeMatchCorpus(t, serial, n)
+	largeMatchCorpus(t, par, n)
+
+	segs := 0
+	for _, sh := range par.shards {
+		segs += len(sh.segs)
+	}
+	if segs < 8 {
+		t.Fatalf("expected many segments to fan out over, got %d", segs)
+	}
+
+	setOf := func(c *Collection) []int {
+		var ids []int
+		seen := map[int]bool{}
+		for ad := range c.Match(bigMatchJob(t)) {
+			id, _ := ad.EvaluateAttrInt("Id")
+			if seen[int(id)] {
+				t.Fatalf("duplicate match id %d", id)
+			}
+			seen[int(id)] = true
+			ids = append(ids, int(id))
+		}
+		sort.Ints(ids)
+		return ids
+	}
+	sIDs, pIDs := setOf(serial), setOf(par)
+	if !equalInts(sIDs, pIDs) {
+		t.Fatalf("parallel matches (%d) != serial matches (%d)", len(pIDs), len(sIDs))
+	}
+	if len(sIDs) != n/2 {
+		t.Fatalf("expected %d matches (even Ids), got %d", n/2, len(sIDs))
+	}
+
+	// MatchSorted order must agree too (top by Rank = Cpus).
+	sSorted := matchIDs(t, serial.MatchSorted(bigMatchJob(t), 10))
+	pSorted := matchIDs(t, par.MatchSorted(bigMatchJob(t), 10))
+	if !equalInts(sSorted, pSorted) {
+		t.Fatalf("top-10 order differs: serial %v vs parallel %v", sSorted, pSorted)
+	}
+}
+
+func benchmarkMatch(b *testing.B, par int) {
+	c := New(Options{Shards: 8, SegmentSize: 1 << 14, QueryParallelism: par})
+	if par >= 2 {
+		c.parallelMinBytes = 0
+	}
+	for i := 0; i < 40000; i++ {
+		mem := 8192
+		if i%2 == 1 {
+			mem = 1024
+		}
+		_ = c.Put([]byte(fmt.Sprintf("s%d", i)),
+			mustAd(b, fmt.Sprintf(`[ Id=%d; Memory=%d; Arch="X86_64"; Cpus=%d; Requirements = TARGET.RequestMemory <= Memory ]`, i, mem, i)))
+	}
+	job := mustAd(b, `[ RequestMemory=4096; Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64"; Rank = TARGET.Cpus ]`)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n := 0
+		for range c.Match(job) {
+			n++
+		}
+	}
+}
+
+func BenchmarkMatchPar1(b *testing.B) { benchmarkMatch(b, 1) }
+func BenchmarkMatchPar4(b *testing.B) { benchmarkMatch(b, 4) }
+func BenchmarkMatchPar8(b *testing.B) { benchmarkMatch(b, 8) }
+
+// TestMatchNonNativeJob exercises the fallback when the job's Requirements is not
+// wire-native evaluable (a function call), so every slot is fully decoded. The result
+// must still be correct.
+func TestMatchNonNativeJob(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2})
+	_ = c.Put([]byte("a"), mustAd(t, `[ Id=1; Memory=8192; Requirements = TARGET.RequestMemory <= Memory ]`))
+	_ = c.Put([]byte("b"), mustAd(t, `[ Id=2; Memory=1024; Requirements = true ]`))
+	job := mustAd(t, `[ RequestMemory=4096;
+		Requirements = ifThenElse(TARGET.Memory >= RequestMemory, true, false);
+		Rank = 0 ]`)
+	var got []int
+	for ad := range c.Match(job) {
+		id, _ := ad.EvaluateAttrInt("Id")
+		got = append(got, int(id))
+	}
+	sort.Ints(got)
+	if want := []int{1}; !equalInts(got, want) {
+		t.Fatalf("non-native job match = %v, want %v", got, want)
+	}
+}
+
+// matchIDSet collects the sorted, deduped Id set of a Match.
+func matchIDSet(t *testing.T, c *Collection, job *classad.ClassAd) []int {
+	t.Helper()
+	seen := map[int]bool{}
+	var ids []int
+	for ad := range c.Match(job) {
+		id, _ := ad.EvaluateAttrInt("Id")
+		if seen[int(id)] {
+			t.Fatalf("duplicate match id %d", id)
+		}
+		seen[int(id)] = true
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+// TestMatchIndexedEqualsFullScan: with the slot attributes indexed, Match uses the
+// index candidate pre-filter (A2); it must return exactly the same matches as the
+// unindexed full scan. Run with -race (indexedMatches fans out across shards).
+func TestMatchIndexedEqualsFullScan(t *testing.T) {
+	t.Parallel()
+	const n = 3000
+	plain := New(Options{Shards: 4})
+	indexed := New(Options{Shards: 4, ValueAttrs: []string{"Memory"}, CategoricalAttrs: []string{"Arch"}})
+	largeMatchCorpus(t, plain, n)
+	largeMatchCorpus(t, indexed, n)
+	indexed.Reindex()
+
+	// The job must actually drive the indexed path.
+	if got := indexed.matchIndexPlan(bigMatchJob(t), jobValues(bigMatchJob(t))); len(got) == 0 {
+		t.Fatal("expected TARGET.Memory/TARGET.Arch to yield usable index probes")
+	}
+
+	pIDs := matchIDSet(t, plain, bigMatchJob(t))
+	iIDs := matchIDSet(t, indexed, bigMatchJob(t))
+	if !equalInts(pIDs, iIDs) {
+		t.Fatalf("indexed matches (%d) != full-scan matches (%d)", len(iIDs), len(pIDs))
+	}
+	if len(pIDs) != n/2 {
+		t.Fatalf("expected %d matches (even Ids), got %d", n/2, len(pIDs))
+	}
+	// Rank order must agree too.
+	if s, i := matchIDs(t, plain.MatchSorted(bigMatchJob(t), 10)), matchIDs(t, indexed.MatchSorted(bigMatchJob(t), 10)); !equalInts(s, i) {
+		t.Fatalf("indexed top-10 %v != full-scan %v", i, s)
+	}
+}
+
+// TestMatchIndexedPartialProbe: when only some of Requirements is index-probeable
+// (an opaque conjunct the rewrite must poison), the pre-filter widens rather than
+// wrongly rejecting -- the full match still yields exactly the full-scan result.
+func TestMatchIndexedPartialProbe(t *testing.T) {
+	t.Parallel()
+	const n = 2000
+	plain := New(Options{Shards: 4})
+	indexed := New(Options{Shards: 4, ValueAttrs: []string{"Memory"}, CategoricalAttrs: []string{"Arch"}})
+	largeMatchCorpus(t, plain, n)
+	largeMatchCorpus(t, indexed, n)
+	indexed.Reindex()
+
+	// Arch is probeable; the Memory test is hidden inside ifThenElse (a function),
+	// so the rewrite poisons it and only Arch drives candidate selection.
+	job := mustAd(t, `[ RequestMemory=4096;
+		Requirements = TARGET.Arch == "X86_64" && ifThenElse(TARGET.Memory >= RequestMemory, true, false);
+		Rank = 0 ]`)
+	if got := indexed.matchIndexPlan(job, jobValues(job)); len(got) != 1 {
+		t.Fatalf("expected exactly the Arch probe, got %d probes", len(got))
+	}
+	if p, i := matchIDSet(t, plain, job), matchIDSet(t, indexed, job); !equalInts(p, i) {
+		t.Fatalf("partial-probe indexed %d != full-scan %d", len(i), len(p))
+	} else if len(p) != n/2 {
+		t.Fatalf("expected %d matches, got %d", n/2, len(p))
+	}
+}
+
+// TestMatchIndexedTargetDependentConst: a job attribute the pre-filter would bake is
+// TARGET-dependent, so it is undefined with no target and its conjunct is dropped
+// from the probes rather than baked as a wrong constant (which could wrongly exclude
+// real matches). Match must still return every true match.
+func TestMatchIndexedTargetDependentConst(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, ValueAttrs: []string{"Memory"}, CategoricalAttrs: []string{"Arch"}})
+	_ = c.Put([]byte("s1"), mustAd(t, `[ Id=1; Memory=8192; Arch="X86_64"; Requirements = true ]`))
+	_ = c.Put([]byte("s2"), mustAd(t, `[ Id=2; Memory=1024; Arch="X86_64"; Requirements = true ]`))
+	c.Reindex()
+	// RequestMemory depends on TARGET, so it is undefined at plan time: the Memory
+	// conjunct is dropped (not baked), only Arch probes. Per slot the full match then
+	// evaluates Memory >= Memory/2, true for both -- so both must match. A pre-filter
+	// that baked a wrong constant would wrongly drop one.
+	job := mustAd(t, `[ RequestMemory = TARGET.Memory / 2;
+		Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64";
+		Rank = 0 ]`)
+	if got, want := matchIDSet(t, c, job), []int{1, 2}; !equalInts(got, want) {
+		t.Fatalf("target-dependent-const match = %v, want %v", got, want)
+	}
+}
+
+func benchmarkMatchSelective(b *testing.B, indexed bool) {
+	opts := Options{Shards: 8, SegmentSize: 1 << 14, QueryParallelism: 8}
+	if indexed {
+		opts.ValueAttrs = []string{"Cpus"}
+	}
+	c := New(opts)
+	c.parallelMinBytes = 0
+	for i := 0; i < 40000; i++ {
+		_ = c.Put([]byte(fmt.Sprintf("s%d", i)),
+			mustAd(b, fmt.Sprintf(`[ Id=%d; Cpus=%d; Arch="X86_64"; Requirements = true ]`, i, i)))
+	}
+	if indexed {
+		c.Reindex()
+	}
+	// Only the top ~2.5% (Cpus >= 39000) qualify.
+	job := mustAd(b, `[ MinCpus=39000; Requirements = TARGET.Cpus >= MinCpus; Rank = TARGET.Cpus ]`)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n := 0
+		for range c.Match(job) {
+			n++
+		}
+	}
+}
+
+func BenchmarkMatchSelectiveFullScan(b *testing.B) { benchmarkMatchSelective(b, false) }
+func BenchmarkMatchSelectiveIndexed(b *testing.B)  { benchmarkMatchSelective(b, true) }

@@ -269,11 +269,27 @@ func cmpFloat(op string, k, t float64) bool {
 // visited record is MVCC-visibility filtered and full-query re-verified, so the
 // result is identical to a full scan. Returns false if the consumer stopped.
 func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryPlan, emit func(w []byte) bool) bool {
+	return c.scanShardCandidates(sh, usable, func(w []byte) bool {
+		if !matchWire(w, qp) {
+			return true // not a match: keep scanning
+		}
+		return emit(w)
+	})
+}
+
+// scanShardCandidates visits the candidate records for `usable` in one shard,
+// handing each candidate's decompressed wire bytes to onCand (which returns false to
+// stop the whole scan). Windows whose per-segment index does not cover the probes,
+// and the un-indexed tail of those that do, are full-scanned -- so onCand sees a
+// superset of the true candidates and the caller must re-verify. Returns false if
+// onCand asked to stop. This is the shared candidate-enumeration used by both the
+// indexed Query path (scanShardIndexed) and index-pre-filtered Match.
+func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand func(w []byte) bool) bool {
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var dbuf []byte
-	// visit tests one record's visibility, re-verifies, and hands its decompressed
-	// wire bytes to emit; returns stop = true when the consumer asked to stop.
+	// visit tests one record's visibility and hands its decompressed wire bytes to
+	// onCand; returns stop = true when the consumer asked to stop.
 	visit := func(w segWindow, o uint32) (stop bool) {
 		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 			return false
@@ -283,10 +299,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 			return false
 		}
 		dbuf = ww
-		if !matchWire(ww, qp) {
-			return false
-		}
-		return !emit(ww)
+		return !onCand(ww)
 	}
 	// scanRange full-scans records in [from, to).
 	scanRange := func(w segWindow, from, to int) bool {
