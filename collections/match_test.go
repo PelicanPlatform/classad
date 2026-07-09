@@ -243,3 +243,128 @@ func TestMatchNonNativeJob(t *testing.T) {
 		t.Fatalf("non-native job match = %v, want %v", got, want)
 	}
 }
+
+// matchIDSet collects the sorted, deduped Id set of a Match.
+func matchIDSet(t *testing.T, c *Collection, job *classad.ClassAd) []int {
+	t.Helper()
+	seen := map[int]bool{}
+	var ids []int
+	for ad := range c.Match(job) {
+		id, _ := ad.EvaluateAttrInt("Id")
+		if seen[int(id)] {
+			t.Fatalf("duplicate match id %d", id)
+		}
+		seen[int(id)] = true
+		ids = append(ids, int(id))
+	}
+	sort.Ints(ids)
+	return ids
+}
+
+// TestMatchIndexedEqualsFullScan: with the slot attributes indexed, Match uses the
+// index candidate pre-filter (A2); it must return exactly the same matches as the
+// unindexed full scan. Run with -race (indexedMatches fans out across shards).
+func TestMatchIndexedEqualsFullScan(t *testing.T) {
+	t.Parallel()
+	const n = 3000
+	plain := New(Options{Shards: 4})
+	indexed := New(Options{Shards: 4, ValueAttrs: []string{"Memory"}, CategoricalAttrs: []string{"Arch"}})
+	largeMatchCorpus(t, plain, n)
+	largeMatchCorpus(t, indexed, n)
+	indexed.Reindex()
+
+	// The job must actually drive the indexed path.
+	if got := indexed.matchIndexPlan(bigMatchJob(t), jobValues(bigMatchJob(t))); len(got) == 0 {
+		t.Fatal("expected TARGET.Memory/TARGET.Arch to yield usable index probes")
+	}
+
+	pIDs := matchIDSet(t, plain, bigMatchJob(t))
+	iIDs := matchIDSet(t, indexed, bigMatchJob(t))
+	if !equalInts(pIDs, iIDs) {
+		t.Fatalf("indexed matches (%d) != full-scan matches (%d)", len(iIDs), len(pIDs))
+	}
+	if len(pIDs) != n/2 {
+		t.Fatalf("expected %d matches (even Ids), got %d", n/2, len(pIDs))
+	}
+	// Rank order must agree too.
+	if s, i := matchIDs(t, plain.MatchSorted(bigMatchJob(t), 10)), matchIDs(t, indexed.MatchSorted(bigMatchJob(t), 10)); !equalInts(s, i) {
+		t.Fatalf("indexed top-10 %v != full-scan %v", i, s)
+	}
+}
+
+// TestMatchIndexedPartialProbe: when only some of Requirements is index-probeable
+// (an opaque conjunct the rewrite must poison), the pre-filter widens rather than
+// wrongly rejecting -- the full match still yields exactly the full-scan result.
+func TestMatchIndexedPartialProbe(t *testing.T) {
+	t.Parallel()
+	const n = 2000
+	plain := New(Options{Shards: 4})
+	indexed := New(Options{Shards: 4, ValueAttrs: []string{"Memory"}, CategoricalAttrs: []string{"Arch"}})
+	largeMatchCorpus(t, plain, n)
+	largeMatchCorpus(t, indexed, n)
+	indexed.Reindex()
+
+	// Arch is probeable; the Memory test is hidden inside ifThenElse (a function),
+	// so the rewrite poisons it and only Arch drives candidate selection.
+	job := mustAd(t, `[ RequestMemory=4096;
+		Requirements = TARGET.Arch == "X86_64" && ifThenElse(TARGET.Memory >= RequestMemory, true, false);
+		Rank = 0 ]`)
+	if got := indexed.matchIndexPlan(job, jobValues(job)); len(got) != 1 {
+		t.Fatalf("expected exactly the Arch probe, got %d probes", len(got))
+	}
+	if p, i := matchIDSet(t, plain, job), matchIDSet(t, indexed, job); !equalInts(p, i) {
+		t.Fatalf("partial-probe indexed %d != full-scan %d", len(i), len(p))
+	} else if len(p) != n/2 {
+		t.Fatalf("expected %d matches, got %d", n/2, len(p))
+	}
+}
+
+// TestMatchIndexedTargetDependentConst: a job attribute the pre-filter would bake is
+// TARGET-dependent, so it is undefined with no target and its conjunct is dropped
+// from the probes rather than baked as a wrong constant (which could wrongly exclude
+// real matches). Match must still return every true match.
+func TestMatchIndexedTargetDependentConst(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, ValueAttrs: []string{"Memory"}, CategoricalAttrs: []string{"Arch"}})
+	_ = c.Put([]byte("s1"), mustAd(t, `[ Id=1; Memory=8192; Arch="X86_64"; Requirements = true ]`))
+	_ = c.Put([]byte("s2"), mustAd(t, `[ Id=2; Memory=1024; Arch="X86_64"; Requirements = true ]`))
+	c.Reindex()
+	// RequestMemory depends on TARGET, so it is undefined at plan time: the Memory
+	// conjunct is dropped (not baked), only Arch probes. Per slot the full match then
+	// evaluates Memory >= Memory/2, true for both -- so both must match. A pre-filter
+	// that baked a wrong constant would wrongly drop one.
+	job := mustAd(t, `[ RequestMemory = TARGET.Memory / 2;
+		Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64";
+		Rank = 0 ]`)
+	if got, want := matchIDSet(t, c, job), []int{1, 2}; !equalInts(got, want) {
+		t.Fatalf("target-dependent-const match = %v, want %v", got, want)
+	}
+}
+
+func benchmarkMatchSelective(b *testing.B, indexed bool) {
+	opts := Options{Shards: 8, SegmentSize: 1 << 14, QueryParallelism: 8}
+	if indexed {
+		opts.ValueAttrs = []string{"Cpus"}
+	}
+	c := New(opts)
+	c.parallelMinBytes = 0
+	for i := 0; i < 40000; i++ {
+		_ = c.Put([]byte(fmt.Sprintf("s%d", i)),
+			mustAd(b, fmt.Sprintf(`[ Id=%d; Cpus=%d; Arch="X86_64"; Requirements = true ]`, i, i)))
+	}
+	if indexed {
+		c.Reindex()
+	}
+	// Only the top ~2.5% (Cpus >= 39000) qualify.
+	job := mustAd(b, `[ MinCpus=39000; Requirements = TARGET.Cpus >= MinCpus; Rank = TARGET.Cpus ]`)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		n := 0
+		for range c.Match(job) {
+			n++
+		}
+	}
+}
+
+func BenchmarkMatchSelectiveFullScan(b *testing.B) { benchmarkMatchSelective(b, false) }
+func BenchmarkMatchSelectiveIndexed(b *testing.B)  { benchmarkMatchSelective(b, true) }

@@ -1,13 +1,16 @@
 # Match, rank, order: negotiator/schedd operations at the collection layer
 
-> Status: **in progress.** `Match` / `MatchSorted` are implemented in `match.go`,
-> **parallel** across segments with a **wire-native job-side reject** (skip the full
-> decode of slots the job definitely rejects). On a 40k-slot pool with half rejected,
-> 12-core: 183ms serial → 57.6ms with the reject (3.2×) → 19.1ms at 8 workers (9.6× vs
-> the original serial baseline); sound (any undefined/non-literal/non-native case falls
-> through to the full match). Still open: the **index candidate pre-filter (A2, below)**
-> and the **ordered index (#3)** and **cluster-signature projection (#4)**. This doc
-> maps the four HTCondor operations onto the collection engine:
+> Status: **all four operations implemented.** `Match` / `MatchSorted` (`match.go`,
+> `match_index.go`) are **parallel** across segments with a **wire-native job-side
+> reject** (skip the full decode of slots the job definitely rejects) and an **index
+> candidate pre-filter** (visit only candidate slots when the job is selective and slot
+> attributes are indexed). On a 40k-slot pool with half rejected, 12-core: 183ms serial
+> → 57.6ms with the reject (3.2×) → 19.1ms at 8 workers (9.6× vs the original serial
+> baseline); with the index pre-filter, a ~2.5%-selective job goes 5.78ms → 1.09ms
+> (5.3× over the wire-reject full scan). All sound (candidates are re-verified by the
+> full match). The maintained **ordered index (#3)** and **cluster-signature projection
+> (#4)** are implemented too. This doc maps the four HTCondor operations onto the
+> collection engine:
 > three are one coherent capability — a **ranked/ordered scan**, with symmetric
 > **match** as its richest filter — plus a **maintained filtered ordered index** for
 > the schedd's priority-queue pattern. The fourth (RRL windowing) stays in the app.
@@ -184,7 +187,7 @@ collision could merge two adjacent runs; over the value bytes that is negligible
 2. **Wire-native job-side reject (A3)** — compile `job.Requirements` once (`vm.Compile`)
    and evaluate it against each slot's wire, skipping the full decode of definite
    rejects; falls through to the full match on any uncertainty. **Done.**
-3. **Index candidate pre-filter (A2)** — *not yet built; see below.*
+3. **Index candidate pre-filter (A2)** — **Done** (`match_index.go`); details below.
 4. **Filtered ordered index (`Options.Ordered` / `Collection.Ordered`)** — the
    maintained priority index for the schedd (§3 above). **Done** (COW B-tree, write-path
    maintenance, snapshot+resume reads, recovery rebuild, and chained-view evaluation).
@@ -192,28 +195,38 @@ collision could merge two adjacent runs; over the value bytes that is negligible
    `OrderedAd.Signature`). A small write-time helper feeding the app's RRL
    fold. Leave the windowing itself in the schedd.
 
-### A2 — index candidate pre-filter (potential + caveats)
+### A2 — index candidate pre-filter (implemented)
 
-Instead of visiting every slot and wire-rejecting the misses one by one (A3), use the
-value/categorical index to visit only *candidate* slots. The mechanism reuses the
-existing indexed-query path: rewrite `job.Requirements` into a query over the slot —
-`TARGET.attr → attr` (the slot's own), `MY.attr → the job's evaluated literal` — then
-`planIndex` + `scanShardIndexed` give candidate offsets; bilaterally match only those.
+Instead of visiting every slot and wire-rejecting the misses one by one (A3), the
+value/categorical index visits only *candidate* slots. The mechanism reuses the
+existing indexed path: `rewriteForSlot` turns `job.Requirements` into a predicate over
+the slot — `TARGET.attr → attr` (the slot's own), and every job reference → its
+evaluated constant (or the undefined literal, poisoning its conjunct). `vm.Compile(…)
+.Probes()` extracts the index-satisfiable conjuncts, `planIndex` maps them to the
+configured indexes, and `scanShardCandidates` (factored out of `scanShardIndexed`)
+visits only candidate records; each is bilaterally matched with the full
+`MatchClassAd` (plus the A3 reject). `Match` takes this path when the job yields any
+usable probe; otherwise it falls back to the A1+A3 full scan. It fans out across
+shards on the same worker budget.
 
-Worth it **only** when the pool is large, jobs are selective, *and* the queried slot
-attributes are indexed. Two things bound it:
+**Soundness — superset by construction.** The rewrite can only ever emit probes on the
+slot's *own* attributes against job *constants*: a `TARGET`-dependent or non-scalar job
+reference evaluates to undefined and its conjunct is dropped (not baked as a wrong
+value); every opaque node (`ifThenElse`, list, ternary, select, …) collapses to the
+undefined literal, so no `MY` reference can leak through as a bare self-scoped
+reference the extractor would misread as a slot attribute. Top-level `OR`/`NOT` yield
+no probe and fall back. Dropping or broadening a probe only widens the candidate set,
+and `MatchClassAd` re-verifies every candidate — so a wrong probe costs selectivity,
+never correctness. Tested: indexed `Match` == full-scan `Match` (and top-K order) over
+a large pool, plus the partial-probe and `TARGET`-dependent-constant paths.
 
-- **Soundness.** The pre-filter must be a *superset* — never reject a real match. That
-  is safe only for a **conjunction** of indexable `TARGET.attr OP job-constant`
-  comparisons: extract those AND-conjuncts as probes and drop the rest (dropping
-  conjuncts widens the candidate set, which is sound). A top-level `OR`/`NOT` cannot be
-  handled by dropping a side, and a `TARGET`-dependent constant cannot be baked in, so
-  those conjuncts (or the whole predicate) fall back to the A1+A3 full scan.
-- **Marginal over A3.** A3 already eliminates the expensive decode on rejects; A2
-  additionally saves the *cheap* wire-native eval + wire-lookup on non-candidates. Real
-  gain only for a huge pool with rare matches over indexed attributes; otherwise it
-  adds machinery (constraint extraction, the rewrite) for little. Benchmark before
-  committing.
+**Payoff.** Bounded by A3 (which already skips the expensive decode on rejects) — the
+extra win is skipping the wire eval + lookup on non-candidates, real only when the pool
+is large, jobs are selective, *and* the slot attributes are indexed. Measured on a
+40k-slot pool with a ~2.5%-selective job: full scan (A3) 5.78ms → indexed (A2) 1.09ms,
+**5.3×**. When indexes are unconfigured or the job has no usable probe, there is no
+change from A1+A3. (The value index is reindex-on-demand: A2 helps once `Reindex` has
+run; an unbuilt index just full-scans the same snapshot.)
 
 ## Caveats / open questions
 
