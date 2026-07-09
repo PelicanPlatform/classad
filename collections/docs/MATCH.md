@@ -198,6 +198,29 @@ at read time by the `seq`/`supersededBySeq` rule.
 - **Recovery** is the one place it rides MVCC: `rebuildOrdered` re-derives the tree from
   each shard's committed snapshot (`forEachVisibleKeyed(s0, …)`).
 
+**Concurrency control.** Two locks that never contend for long: `oi.mu` guards master
+mutation (`upsert`/`remove`) and the `Copy()` in `snapshot()`; and each B-tree carries
+its own `sync.RWMutex`. `Copy()` is O(1) (mint new `isoid`s, share the root), so a
+writer serializes with a snapshot for microseconds, not the walk's duration. The walk
+holds only the *snapshot's* `RLock` (a private tree, uncontended); writers take the
+*master's* `Lock` — different mutexes, no cross-blocking. Copy-on-write makes shared
+nodes read-only after the copy (both trees `isoid`-mismatch and copy-before-write), so
+a reader traversing a node while the master path-copies it is race-free (verified under
+`-race`, `TestOrderedIndexConcurrent`).
+
+**A slow one-at-a-time walk (negotiator feeding RRLs over seconds).** Nothing blocks:
+`Ordered` snapshots once and releases `oi.mu`, so writers keep committing throughout.
+The snapshot freezes *order and membership* at the call, while each ad is fetched live
+per yield — so a job that leaves idle mid-walk is still visited (its live ad reflects
+the new state; the negotiator re-verifies), a deleted one is skipped (`Get` miss), a
+repriced one appears at its old slot with current content, and a newly-idle one is not
+seen until a later snapshot. A single long-held walk also pins the T0 node-set, so
+heavy churn accrues extra memory until it ends. For long feeds, **chunk with the resume
+cursor**: each call re-snapshots in O(1) and resumes after the cursor, bounding pinned
+memory and picking up members added below the cursor between chunks (a job repriced
+across chunks may be re-yielded or skipped — harmless for a re-verifying negotiator).
+See `TestOrderedStreamingWalk`.
+
 ## 4 — RRL windowing / clustering: keep it in the app
 
 Building resource-request lists is "run-length-encode the *ordered* stream by the

@@ -319,3 +319,45 @@ func TestOrderedNoClusterSignatureZero(t *testing.T) {
 		}
 	}
 }
+
+// TestOrderedStreamingWalk models the negotiator consuming RRLs one at a time over a
+// long period (network I/O between steps): the walk holds a snapshot while writers
+// churn the index. It must not block; the snapshot's order/membership stays frozen at
+// the call, while ad content is fetched live; a fresh walk then reflects every change.
+func TestOrderedStreamingWalk(t *testing.T) {
+	t.Parallel()
+	c := schedQueue(t)
+	putJob(t, c, "p1", "u", 1, 50, 0)
+	putJob(t, c, "p2", "u", 1, 40, 0)
+	putJob(t, c, "p3", "u", 1, 30, 0)
+
+	var walked []string
+	mutated := false
+	for r := range c.Ordered(0, classad.NewStringValue("u"), OrderCursor{}) {
+		j, _ := r.Ad.EvaluateAttrString("Job")
+		walked = append(walked, j)
+		if !mutated {
+			mutated = true
+			// Concurrent-style churn mid-walk. None of this blocks the in-flight walk,
+			// nor alters the snapshot's order/membership.
+			putJob(t, c, "p0", "u", 1, 99, 0) // new highest-priority idle job
+			putJob(t, c, "p2", "u", 2, 40, 0) // p2 starts running (leaves the set)
+			c.Delete([]byte("p3"))            // p3 removed entirely
+		}
+		if j == "p2" {
+			// Ad content is live: p2 was set running after the snapshot was taken.
+			if st, _ := r.Ad.EvaluateAttrInt("JobStatus"); st != 2 {
+				t.Fatalf("expected live ad content (p2 JobStatus=2), got %d", st)
+			}
+		}
+	}
+	// Frozen order/membership: p1,p2,p3 as of T0. p0 (added after) is absent; p2 is
+	// still walked though now running; p3 is walked-then-skipped (deleted -> Get miss).
+	if want := []string{"p1", "p2"}; !eqStrings(walked, want) {
+		t.Fatalf("streaming walk = %v, want %v", walked, want)
+	}
+	// A fresh walk reflects every committed change: p0 and p1 are idle, p2 runs, p3 gone.
+	if want := []string{"p0", "p1"}; !eqStrings(orderedJobs(t, c, "u"), want) {
+		t.Fatalf("post-walk fresh scan = %v, want %v", orderedJobs(t, c, "u"), want)
+	}
+}
