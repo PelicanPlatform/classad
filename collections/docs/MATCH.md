@@ -162,6 +162,42 @@ This is the largest new piece (a concurrent, snapshot-able, *filtered* ordered
 structure with write-path maintenance), but it removes the "re-sort every time I talk
 to the negotiator" cost and matches the priority-queue mental model.
 
+### Consistency and MVCC (why not a B-tree per SSTable)
+
+The ordered index is deliberately **not** an MVCC/per-segment structure. It is a single
+in-memory secondary index — one copy-on-write B-tree per `OrderSpec`, holding **one
+entry per key** (current state), maintained imperatively — in contrast to the
+value/categorical index, which is **per-segment** (`seg.idx`) with visibility resolved
+at read time by the `seq`/`supersededBySeq` rule.
+
+- **Why not per-SSTable.** Per-run indexes are *forced* in an LSM because on-disk
+  SSTables are immutable; you index each run and merge at read. This index is in-memory,
+  derived, and rebuilt on `Open` (never persisted), so it is free of that constraint —
+  it is a mutable RDBMS-style secondary index, not an LSM per-run index. Per-segment
+  would also be *worse* here: the negotiator wants a **global** ordered walk, so
+  per-segment trees would force a k-way merge + cross-segment version resolution on
+  every cycle (O(n log M) per walk) — re-introducing exactly the per-cycle merge cost
+  this feature removes. The single tree gives an O(1) snapshot + O(k) walk, and is
+  **decoupled from segment lifecycle** (compaction never rebuilds it, unlike the value
+  index).
+- **Read consistency.** `Ordered` snapshots the tree (COW `Copy`) and then fetches each
+  ad live by key. The *order* is from the snapshot instant; each *ad* is its own
+  point-in-time read. This is not a single global snapshot — but the store never offers
+  one either (`Scan` concatenates independent per-shard snapshots), so it matches the
+  store's consistency level. A member deleted since the snapshot is skipped; a repriced
+  one shows new content at its old slot until the next cycle.
+- **Write consistency.** Maintenance runs *after* commit, not `seq`-ordered. Under
+  **serialized per-key writes** — the schedd's model (its job queue is a single
+  serialized log) — the index is exactly consistent. Under genuinely concurrent writes
+  to the *same* key from different goroutines, the tree can converge to a stale version
+  until that key's next write (the store keeps the authoritative version by max-`seq`;
+  the index self-heals). Full correctness there would need either per-segment indexes
+  (the expensive-read path above) or version tombstones in the index (unbounded state
+  for a filtered index whose non-members dominate) — neither warranted for the
+  single-writer-per-key target.
+- **Recovery** is the one place it rides MVCC: `rebuildOrdered` re-derives the tree from
+  each shard's committed snapshot (`forEachVisibleKeyed(s0, …)`).
+
 ## 4 — RRL windowing / clustering: keep it in the app
 
 Building resource-request lists is "run-length-encode the *ordered* stream by the
