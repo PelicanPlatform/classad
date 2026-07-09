@@ -47,6 +47,12 @@ type Options struct {
 	// scanning all of them. Optional.
 	CategoricalAttrs []string
 	ValueAttrs       []string
+	// Ordered configures maintained, filtered, ordered indexes -- the schedd
+	// priority-queue pattern (see docs/MATCH.md §3 and Collection.Ordered). Each
+	// spec groups members into partitions and keeps them sorted on the write path,
+	// so a negotiator can iterate a partition in order (and resume) without
+	// re-sorting each cycle. A malformed expression in a spec panics New. Optional.
+	Ordered []OrderSpec
 	// Dir, if set, makes the collection persistent: arenas are memory-mapped files
 	// under this directory and committed writes are flushed to disk (see Open).
 	// Empty ⇒ in-memory (the default). Unix-only.
@@ -163,6 +169,10 @@ type Collection struct {
 	parentKeyFor  func(key []byte) []byte
 	isStructural  func(key []byte) bool
 	parentPrivate map[string]struct{}
+
+	// ordered holds the maintained ordered indexes (Options.Ordered), updated on the
+	// write path and read via Collection.Ordered. Empty unless configured.
+	ordered []*orderedIndex
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to
@@ -306,6 +316,13 @@ func New(opts Options) *Collection {
 		// concurrent queries so per-query fan-out never oversubscribes the cores.
 		c.qsem = make(chan struct{}, runtime.GOMAXPROCS(0))
 	}
+	for _, spec := range opts.Ordered {
+		oi := newOrderedIndex(spec)
+		if err := oi.compile(); err != nil {
+			panic("collections.New: " + err.Error())
+		}
+		c.ordered = append(c.ordered, oi)
+	}
 	return c
 }
 
@@ -351,7 +368,13 @@ func (c *Collection) Update(batch []AdUpdate) error {
 	for si, writes := range byShard {
 		c.shards[si].commit(writes)
 	}
-	return c.writeError()
+	err := c.writeError()
+	if err == nil && len(c.ordered) > 0 {
+		for i := range batch {
+			c.maintainOrdered(batch[i].Key, batch[i].Ad)
+		}
+	}
+	return err
 }
 
 // Put inserts or updates a single ad. It is the hot path for the common
@@ -362,7 +385,11 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	stored := codec.Compress(nil, c.encodeAd(ad.AST()))
 	h := c.h.Hash(key)
 	c.shards[c.shardOf(key, h)].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
-	return c.writeError()
+	err := c.writeError()
+	if err == nil {
+		c.maintainOrdered(key, ad)
+	}
+	return err
 }
 
 // Delete removes key, returning whether it was present. The removal is an MVCC
@@ -378,6 +405,7 @@ func (c *Collection) Delete(key []byte) bool {
 	}
 	sh.mu.Unlock()
 	if ok {
+		c.removeOrdered(key)
 		sh.sync() // durability point for the tombstone (not coalesced)
 		if sh.delLog != nil {
 			sh.delLog.record(key, seq) // retain for resuming watchers

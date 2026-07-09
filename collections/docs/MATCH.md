@@ -69,6 +69,13 @@ preemption — layers as additional sort keys on the same mechanism.)
 
 ## 3 — Schedd ordering: a maintained *filtered* ordered index
 
+> **Implemented** (`ordered.go`, `Options.Ordered` / `Collection.Ordered`). Configure
+> one or more `OrderSpec{Partition, Where, Keys}`; the index is maintained on
+> `Put`/`Update`/`Delete` and read via `Ordered(i, partition, resume)`, which yields
+> each member ad plus a resume cursor over an O(1) snapshot. Backed by a copy-on-write
+> B-tree (`github.com/tidwall/btree`). Remaining gaps: rebuild on persistent `Open`
+> (recovery) and chained-view evaluation — both noted below.
+
 The schedd walks its queue in a fixed order (JobPrio, pre/post prio, qdate, order
 entered the queue) to find the next job to run, per user. Re-sorting the queue every
 negotiation cycle throws away work, because the ordering key is **stable across a
@@ -121,24 +128,28 @@ func (c *Collection) Ordered(partition string, resume []byte) (iter.Seq[*classad
 - **"Order entered the queue" is the collection's** — the stable insertion sequence
   (a record's first-insert seq). Expose it as the implicit final tiebreaker so the app
   never has to store or reconstruct it.
-- **Snapshot reads under churn.** Negotiation iterates a consistent view while writes
-  continue. A fully-persistent copy-on-write B-tree path-copies O(log n) nodes per
-  write — fine at low write rates, but the idle-set churn above makes that allocation
-  add up, so the structure choice matters: prefer a **mutable ordered structure (B-tree
-  or skip list) with reader snapshots** — e.g. writers mutate under the order lock and
-  a reader either takes a short read-lock to fix its iteration frontier, or the
-  structure keeps a small ring of versioned roots — over per-write full path-copying.
-  This is the main design question the churn raises; a benchmark of the real
-  insert/delete/read mix should pick it.
-- **Resumable by key, not position.** A cursor encodes the last order key delivered;
-  next cycle resumes "from priority X downward" even though jobs entered/left idle in
-  between — no re-seek from the top, no lost place.
-- **Recovery / persistence.** Like the value indexes, the ordered index is *derived*
-  state: rebuilt by scanning the ads (and re-evaluating `Where`) on `Open`. Not
-  persisted itself.
-- **Chained keys.** The order key / membership may live on the proc ad or be inherited
-  from the cluster ad; the collection evaluates them over the chained view, so it
-  composes with `ParentKeyFor`.
+- **Snapshot reads under churn** *(resolved).* Negotiation iterates a consistent view
+  while writes continue. The open question was mutable-with-snapshots vs. copy-on-write;
+  it is settled pragmatically by `tidwall/btree`, whose `Copy()` is an O(1) COW clone
+  that shares nodes and path-copies only on the *next* write while a snapshot is live.
+  Writers mutate one master under a mutex; each read takes a `Copy()` and iterates it
+  lock-free. Path-copy cost is incurred only for writes during an active snapshot
+  iteration (short, relative to churn), so the allocation concern is bounded. If a
+  benchmark ever shows it dominating, the master could instead publish a versioned root
+  per read — but the COW path is correct, hardened, and simple.
+- **Resumable by key, not position** *(implemented).* The cursor yielded alongside each
+  ad encodes that entry's order position (partition, keys, stable seq); passing it back
+  resumes strictly after it — "from priority X downward" — even though jobs entered/left
+  idle in between. No re-seek from the top, no lost place.
+- **Recovery / persistence** *(gap).* Like the value indexes, the ordered index is
+  *derived* state and should be rebuilt by scanning the ads (re-evaluating `Where`) on
+  persistent `Open`. Not yet wired — an in-memory collection maintains it from empty
+  correctly, but a persistent reopen currently starts with an empty ordered index until
+  the members are re-`Put`.
+- **Chained keys** *(gap).* `evalAd` currently resolves `Where`/`Partition`/`Keys`
+  against the ad as `Put`, not its chained (parent-inherited) view. An order key or
+  membership attribute that lives on the cluster ad is not yet seen; composing with
+  `ParentKeyFor` is future work.
 
 This is the largest new piece (a concurrent, snapshot-able, *filtered* ordered
 structure with write-path maintenance), but it removes the "re-sort every time I talk
@@ -166,9 +177,9 @@ app-side.
    and evaluate it against each slot's wire, skipping the full decode of definite
    rejects; falls through to the full match on any uncertainty. **Done.**
 3. **Index candidate pre-filter (A2)** — *not yet built; see below.*
-4. **Filtered ordered index (`OrderedBy` / `Ordered`)** — the maintained priority index
-   for the schedd (§3 above). The biggest build; settle the snapshot-under-churn
-   structure with a benchmark first.
+4. **Filtered ordered index (`Options.Ordered` / `Collection.Ordered`)** — the
+   maintained priority index for the schedd (§3 above). **Done** (COW B-tree); recovery
+   rebuild and chained-view evaluation remain (see §3 gaps).
 5. **Cluster-signature projection** — a small scan-time helper feeding the app's RRL
    fold. Leave the windowing itself in the schedd.
 

@@ -1,6 +1,8 @@
 package collections
 
 import (
+	"fmt"
+	"iter"
 	"strings"
 	"sync"
 
@@ -134,6 +136,12 @@ func entryLess(spec OrderSpec) func(a, b orderEntry) bool {
 type orderedIndex struct {
 	spec OrderSpec
 
+	// Compiled membership/partition/sort expressions (populated by compile). where
+	// is nil for an unfiltered index; part is nil for a single global partition.
+	where    *classad.Expr
+	part     *classad.Expr
+	keyExprs []*classad.Expr
+
 	mu    sync.Mutex
 	tree  *btree.BTreeG[orderEntry]
 	byKey map[string]orderEntry
@@ -146,6 +154,51 @@ func newOrderedIndex(spec OrderSpec) *orderedIndex {
 		tree:  btree.NewBTreeG[orderEntry](entryLess(spec)),
 		byKey: make(map[string]orderEntry),
 	}
+}
+
+// compile parses the spec's Where, Partition, and Key expressions once. A malformed
+// expression is a static configuration error, reported to New.
+func (oi *orderedIndex) compile() error {
+	if oi.spec.Where != "" {
+		e, err := classad.ParseExpr(oi.spec.Where)
+		if err != nil {
+			return fmt.Errorf("ordered index Where %q: %w", oi.spec.Where, err)
+		}
+		oi.where = e
+	}
+	if oi.spec.Partition != "" {
+		e, err := classad.ParseExpr(oi.spec.Partition)
+		if err != nil {
+			return fmt.Errorf("ordered index Partition %q: %w", oi.spec.Partition, err)
+		}
+		oi.part = e
+	}
+	for _, sk := range oi.spec.Keys {
+		e, err := classad.ParseExpr(sk.Expr)
+		if err != nil {
+			return fmt.Errorf("ordered index Key %q: %w", sk.Expr, err)
+		}
+		oi.keyExprs = append(oi.keyExprs, e)
+	}
+	return nil
+}
+
+// evalAd evaluates the ad against the index: whether it is a member (Where is true,
+// or absent), and if so its partition value and sort-key tuple. Expressions resolve
+// against the ad as given (a chained child's inherited parent attributes are not
+// applied here).
+func (oi *orderedIndex) evalAd(ad *classad.ClassAd) (member bool, part orderVal, keys []orderVal) {
+	if oi.where != nil && !isTrueValue(oi.where.Eval(ad)) {
+		return false, orderVal{}, nil
+	}
+	if oi.part != nil {
+		part = valueToOrderVal(oi.part.Eval(ad))
+	}
+	keys = make([]orderVal, len(oi.keyExprs))
+	for i, e := range oi.keyExprs {
+		keys[i] = valueToOrderVal(e.Eval(ad))
+	}
+	return true, part, keys
 }
 
 // upsert inserts or repositions key's entry for the given partition and sort-key
@@ -220,9 +273,9 @@ func (oi *orderedIndex) startPivot(part orderVal) orderEntry {
 
 // ascendPartition iterates snap over one partition in order, starting at the first
 // member strictly after resume (or the partition's first member when resume is nil),
-// calling fn with each collection key. It stops at the partition boundary. resume is
-// the entry last yielded (its exclusive successor is where iteration continues).
-func (oi *orderedIndex) ascendPartition(snap *btree.BTreeG[orderEntry], part orderVal, resume *orderEntry, fn func(key string) bool) {
+// calling fn with each entry. It stops at the partition boundary. resume is the entry
+// last yielded (its exclusive successor is where iteration continues).
+func (oi *orderedIndex) ascendPartition(snap *btree.BTreeG[orderEntry], part orderVal, resume *orderEntry, fn func(e orderEntry) bool) {
 	pivot := oi.startPivot(part)
 	if resume != nil {
 		pivot = *resume
@@ -234,6 +287,70 @@ func (oi *orderedIndex) ascendPartition(snap *btree.BTreeG[orderEntry], part ord
 		if resume != nil && e.seq == resume.seq && e.key == resume.key {
 			return true // Ascend is inclusive; skip the resume entry itself
 		}
-		return fn(e.key)
+		return fn(e)
 	})
+}
+
+// maintainOrdered updates every ordered index for a just-committed ad: a member is
+// inserted or repositioned, a non-member is removed (it may have just transitioned
+// out, e.g. an idle job that started running). Called after the store commit.
+func (c *Collection) maintainOrdered(key []byte, ad *classad.ClassAd) {
+	if len(c.ordered) == 0 {
+		return
+	}
+	k := string(key)
+	for _, oi := range c.ordered {
+		if member, part, keys := oi.evalAd(ad); member {
+			oi.upsert(k, part, keys)
+		} else {
+			oi.remove(k)
+		}
+	}
+}
+
+// removeOrdered drops a deleted key from every ordered index.
+func (c *Collection) removeOrdered(key []byte) {
+	if len(c.ordered) == 0 {
+		return
+	}
+	k := string(key)
+	for _, oi := range c.ordered {
+		oi.remove(k)
+	}
+}
+
+// OrderCursor marks a position in an ordered scan. Its zero value starts at the
+// beginning of a partition; the value yielded alongside an ad resumes strictly after
+// that ad, so a negotiator can iterate a partition across several calls.
+type OrderCursor struct {
+	entry *orderEntry
+}
+
+// Ordered iterates one partition of the index-th configured ordered index in sort
+// order, yielding each member ad together with a cursor that resumes right after it.
+// Iteration is over an O(1) snapshot taken at the call, so it is stable even as the
+// index churns; each ad is fetched live by key, so a member deleted since the
+// snapshot is skipped. For an index configured without a Partition, the partition
+// argument is ignored (there is a single global run). resume's zero value starts at
+// the beginning.
+func (c *Collection) Ordered(index int, partition classad.Value, resume OrderCursor) iter.Seq2[*classad.ClassAd, OrderCursor] {
+	return func(yield func(*classad.ClassAd, OrderCursor) bool) {
+		if index < 0 || index >= len(c.ordered) {
+			return
+		}
+		oi := c.ordered[index]
+		var part orderVal
+		if oi.part != nil {
+			part = valueToOrderVal(partition)
+		}
+		snap := oi.snapshot()
+		oi.ascendPartition(snap, part, resume.entry, func(e orderEntry) bool {
+			ad, ok := c.Get([]byte(e.key))
+			if !ok {
+				return true // concurrently deleted since the snapshot: skip
+			}
+			ec := e
+			return yield(ad, OrderCursor{entry: &ec})
+		})
+	}
 }
