@@ -135,3 +135,83 @@ func TestOrderedMalformedSpecPanics(t *testing.T) {
 	}()
 	New(Options{Ordered: []OrderSpec{{Keys: []SortKey{{Expr: "this ("}}}}})
 }
+
+// TestOrderedRecoveryRebuild: a persistent collection's ordered index is derived
+// state, rebuilt on reopen. Write jobs, Close, reopen, and confirm Ordered() is
+// correct without re-Putting anything.
+func TestOrderedRecoveryRebuild(t *testing.T) {
+	t.Parallel()
+	if !mmapSupported {
+		t.Skip("mmap unsupported")
+	}
+	dir := t.TempDir()
+	opts := Options{
+		Dir:    dir,
+		Shards: 4,
+		Ordered: []OrderSpec{{
+			Partition: "Owner",
+			Where:     "JobStatus == 1",
+			Keys:      []SortKey{{Expr: "JobPrio", Desc: true}},
+		}},
+	}
+	c, err := Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	putJob(t, c, "j1", "alice", 1, 10, 0) // idle
+	putJob(t, c, "j2", "alice", 1, 20, 0) // idle, higher prio
+	putJob(t, c, "j3", "alice", 2, 99, 0) // running -> excluded
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	if got, want := orderedJobs(t, c2, "alice"), []string{"j2", "j1"}; !eqStrings(got, want) {
+		t.Fatalf("after reopen: alice = %v, want %v (index rebuilt on recovery)", got, want)
+	}
+}
+
+// TestOrderedChainedInheritedPartition: on a chained collection the ordered index
+// evaluates over the inherited view -- Owner lives on the cluster (parent) ad, yet
+// partitions the child procs; structural cluster ads are never members.
+func TestOrderedChainedInheritedPartition(t *testing.T) {
+	t.Parallel()
+	c := New(Options{
+		Shards:       8,
+		ParentKeyFor: jobParentKey,
+		IsStructural: jobStructural,
+		Ordered: []OrderSpec{{
+			Partition: "Owner",
+			Where:     "JobStatus == 1",
+			Keys:      []SortKey{{Expr: "JobPrio", Desc: true}},
+		}},
+	})
+	// Cluster (structural parent) carries Owner; procs carry the dynamic attrs.
+	if err := c.Put([]byte("1.-1"), mustAd(t, `[ Owner="alice" ]`)); err != nil {
+		t.Fatal(err)
+	}
+	putProc := func(key string, status, prio int) {
+		ad := mustAd(t, fmt.Sprintf(`[ JobStatus=%d; JobPrio=%d; Job=%q ]`, status, prio, key))
+		if err := c.Put([]byte(key), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putProc("1.0", 1, 10) // idle
+	putProc("1.1", 1, 20) // idle, higher prio
+	putProc("1.2", 2, 99) // running -> excluded
+
+	// Owner is inherited from the cluster, so all idle procs land in alice's queue.
+	if got, want := orderedJobs(t, c, "alice"), []string{"1.1", "1.0"}; !eqStrings(got, want) {
+		t.Fatalf("chained alice = %v, want %v (Owner inherited from cluster)", got, want)
+	}
+	// The structural cluster ad itself is never a member (it has no JobStatus, and is
+	// hidden regardless).
+	putProc("1.0", 2, 10) // 1.0 starts running -> leaves
+	if got, want := orderedJobs(t, c, "alice"), []string{"1.1"}; !eqStrings(got, want) {
+		t.Fatalf("after 1.0 running = %v, want %v", got, want)
+	}
+}

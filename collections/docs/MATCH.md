@@ -73,8 +73,8 @@ preemption — layers as additional sort keys on the same mechanism.)
 > one or more `OrderSpec{Partition, Where, Keys}`; the index is maintained on
 > `Put`/`Update`/`Delete` and read via `Ordered(i, partition, resume)`, which yields
 > each member ad plus a resume cursor over an O(1) snapshot. Backed by a copy-on-write
-> B-tree (`github.com/tidwall/btree`). Remaining gaps: rebuild on persistent `Open`
-> (recovery) and chained-view evaluation — both noted below.
+> B-tree (`github.com/tidwall/btree`). Rebuilt from the recovered ads on persistent
+> `Open`, and evaluated over the inherited (chained) view — see the resolved notes below.
 
 The schedd walks its queue in a fixed order (JobPrio, pre/post prio, qdate, order
 entered the queue) to find the next job to run, per user. Re-sorting the queue every
@@ -141,15 +141,19 @@ func (c *Collection) Ordered(partition string, resume []byte) (iter.Seq[*classad
   ad encodes that entry's order position (partition, keys, stable seq); passing it back
   resumes strictly after it — "from priority X downward" — even though jobs entered/left
   idle in between. No re-seek from the top, no lost place.
-- **Recovery / persistence** *(gap).* Like the value indexes, the ordered index is
-  *derived* state and should be rebuilt by scanning the ads (re-evaluating `Where`) on
-  persistent `Open`. Not yet wired — an in-memory collection maintains it from empty
-  correctly, but a persistent reopen currently starts with an empty ordered index until
-  the members are re-`Put`.
-- **Chained keys** *(gap).* `evalAd` currently resolves `Where`/`Partition`/`Keys`
-  against the ad as `Put`, not its chained (parent-inherited) view. An order key or
-  membership attribute that lives on the cluster ad is not yet seen; composing with
-  `ParentKeyFor` is future work.
+- **Recovery / persistence** *(resolved).* Like the value indexes, the ordered index
+  is *derived* state, rebuilt by scanning the recovered ads (re-evaluating `Where`) on
+  persistent `Open` — `rebuildOrdered`, run right after `Reindex`. Not persisted itself.
+- **Chained keys** *(resolved).* `maintainOrdered` evaluates over the same inherited
+  view Scan/Query use: a structural (parent-only) ad is never a member, and a child's
+  `Where`/`Partition`/`Keys` resolve parent attributes via the parent chain (attached
+  with `SetParent`, O(1), and detached before return, so the caller's ad is untouched).
+  Two edges remain by design: the parent must be present when a child is written or
+  recovered (submit order / recovery both satisfy this), and a *parent* attribute change
+  does not re-evaluate already-indexed children — fine for static parent attributes like
+  `Owner`, which is the intended partition key. Unlike `mergeParent`, the parent walk
+  does not honor `ParentPrivateAttrs`; ordering expressions are not expected to
+  reference parent-private attributes.
 
 This is the largest new piece (a concurrent, snapshot-able, *filtered* ordered
 structure with write-path maintenance), but it removes the "re-sort every time I talk
@@ -178,8 +182,8 @@ app-side.
    rejects; falls through to the full match on any uncertainty. **Done.**
 3. **Index candidate pre-filter (A2)** — *not yet built; see below.*
 4. **Filtered ordered index (`Options.Ordered` / `Collection.Ordered`)** — the
-   maintained priority index for the schedd (§3 above). **Done** (COW B-tree); recovery
-   rebuild and chained-view evaluation remain (see §3 gaps).
+   maintained priority index for the schedd (§3 above). **Done** (COW B-tree, write-path
+   maintenance, snapshot+resume reads, recovery rebuild, and chained-view evaluation).
 5. **Cluster-signature projection** — a small scan-time helper feeding the app's RRL
    fold. Leave the windowing itself in the schedd.
 

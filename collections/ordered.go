@@ -294,17 +294,67 @@ func (oi *orderedIndex) ascendPartition(snap *btree.BTreeG[orderEntry], part ord
 // maintainOrdered updates every ordered index for a just-committed ad: a member is
 // inserted or repositioned, a non-member is removed (it may have just transitioned
 // out, e.g. an idle job that started running). Called after the store commit.
+//
+// For a chained collection it evaluates over the same inherited view Scan/Query use:
+// a structural (parent-only) ad is never a member (it is hidden from results), and a
+// child's Where/Partition/Keys resolve its parent's attributes via the parent chain.
+// The parent is attached with SetParent (O(1), no clone) and detached before return,
+// so the caller's ad is left untouched. (Unlike mergeParent, the parent walk does not
+// honor ParentPrivateAttrs -- an ordered-index expression referencing a parent-private
+// attribute would resolve it from the parent; such attributes are not meant for
+// ordering and this is not expected to matter in practice.)
 func (c *Collection) maintainOrdered(key []byte, ad *classad.ClassAd) {
 	if len(c.ordered) == 0 {
 		return
 	}
 	k := string(key)
+	if c.parentKeyFor != nil {
+		if c.isStructural != nil && c.isStructural(key) {
+			c.removeOrdered(key) // structural parents are hidden -> never members
+			return
+		}
+		if pk := c.parentKeyFor(key); pk != nil {
+			if parent, ok := c.Get(pk); ok {
+				old := ad.GetParent()
+				ad.SetParent(parent)
+				defer ad.SetParent(old)
+			}
+		}
+	}
 	for _, oi := range c.ordered {
 		if member, part, keys := oi.evalAd(ad); member {
 			oi.upsert(k, part, keys)
 		} else {
 			oi.remove(k)
 		}
+	}
+}
+
+// rebuildOrdered repopulates the ordered indexes from the live ads. The indexes are
+// derived state (not persisted), so a persistent Open must rebuild them after the
+// segments are recovered -- mirroring Reindex for the value indexes. It runs once at
+// Open, single-threaded, before the collection is returned.
+func (c *Collection) rebuildOrdered() {
+	if len(c.ordered) == 0 {
+		return
+	}
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		var dbuf []byte
+		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+			w, err := codec.Decompress(dbuf[:0], ad)
+			if err != nil {
+				return true
+			}
+			dbuf = w
+			node, err := c.decodeWire(w)
+			if err != nil {
+				return true
+			}
+			c.maintainOrdered(key, classad.FromAST(node))
+			return true
+		})
+		releaseWindows(wins)
 	}
 }
 

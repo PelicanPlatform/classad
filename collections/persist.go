@@ -220,6 +220,9 @@ func Open(opts Options) (*Collection, error) {
 	if c.spec.Load().any() {
 		c.Reindex()
 	}
+	// The maintained ordered indexes are likewise derived: rebuild them from the
+	// recovered ads so a reopened collection's Ordered() is immediately correct.
+	c.rebuildOrdered()
 	return c, nil
 }
 
