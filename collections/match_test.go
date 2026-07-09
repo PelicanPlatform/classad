@@ -221,3 +221,25 @@ func benchmarkMatch(b *testing.B, par int) {
 func BenchmarkMatchPar1(b *testing.B) { benchmarkMatch(b, 1) }
 func BenchmarkMatchPar4(b *testing.B) { benchmarkMatch(b, 4) }
 func BenchmarkMatchPar8(b *testing.B) { benchmarkMatch(b, 8) }
+
+// TestMatchNonNativeJob exercises the fallback when the job's Requirements is not
+// wire-native evaluable (a function call), so every slot is fully decoded. The result
+// must still be correct.
+func TestMatchNonNativeJob(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2})
+	_ = c.Put([]byte("a"), mustAd(t, `[ Id=1; Memory=8192; Requirements = TARGET.RequestMemory <= Memory ]`))
+	_ = c.Put([]byte("b"), mustAd(t, `[ Id=2; Memory=1024; Requirements = true ]`))
+	job := mustAd(t, `[ RequestMemory=4096;
+		Requirements = ifThenElse(TARGET.Memory >= RequestMemory, true, false);
+		Rank = 0 ]`)
+	var got []int
+	for ad := range c.Match(job) {
+		id, _ := ad.EvaluateAttrInt("Id")
+		got = append(got, int(id))
+	}
+	sort.Ints(got)
+	if want := []int{1}; !equalInts(got, want) {
+		t.Fatalf("non-native job match = %v, want %v", got, want)
+	}
+}

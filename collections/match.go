@@ -3,10 +3,14 @@ package collections
 import (
 	"iter"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // Matchmaking: given a job ClassAd, find the ads in the collection (typically slot
@@ -112,11 +116,90 @@ func (c *Collection) serialScanMatches(job *classad.ClassAd) []rankedMatch {
 	return out
 }
 
+// matchScope resolves references while evaluating the JOB's Requirements over a slot:
+// TARGET.attr comes from the slot's wire bytes (wire-native, no decode), and unscoped
+// / MY.attr come from the job's precomputed attribute values. If a TARGET attribute is
+// a non-literal expression, it sets fellBack and the caller decodes the slot fully.
+type matchScope struct {
+	slot     wire.Ad
+	ctx      wireCtx
+	jobVals  map[string]classad.Value
+	fellBack bool
+}
+
+func (ms *matchScope) resolve(name string, scope ast.AttributeScope) classad.Value {
+	if scope == ast.TargetScope {
+		node, ok := ms.ctx.wireLookup(ms.slot, name)
+		if !ok {
+			return classad.NewUndefinedValue()
+		}
+		lit, ok := wire.LiteralValue(node)
+		if !ok {
+			ms.fellBack = true // non-literal slot attr: cannot decide wire-native
+			return classad.NewUndefinedValue()
+		}
+		return litToValue(lit)
+	}
+	if v, ok := ms.jobVals[strings.ToLower(name)]; ok {
+		return v
+	}
+	return classad.NewUndefinedValue()
+}
+
+// compileJobSide prepares the wire-native job-side reject: it compiles job.Requirements
+// and precomputes the job's own attribute values (so unscoped/MY references resolve
+// without touching the shared job concurrently). Returns (nil, nil) when the job has no
+// Requirements or it is not wire-native evaluable (then every slot is fully decoded).
+func (c *Collection) compileJobSide(job *classad.ClassAd) (*vm.Query, map[string]classad.Value) {
+	var reqExpr ast.Expr
+	for _, a := range job.AST().Attributes { // AST() sorts once; benign + idempotent
+		if strings.EqualFold(a.Name, "Requirements") {
+			reqExpr = a.Value
+			break
+		}
+	}
+	if reqExpr == nil {
+		return nil, nil
+	}
+	q := vm.Compile(reqExpr)
+	if !q.Native() {
+		return nil, nil // ternary/list/func etc.: no wire-native path
+	}
+	orig := job.GetTarget()
+	job.SetTarget(nil) // evaluate the job's own attrs with no target (TARGET-dependent → undefined)
+	vals := make(map[string]classad.Value)
+	for _, name := range job.GetAttributes() {
+		vals[strings.ToLower(name)] = job.EvaluateAttr(name)
+	}
+	job.SetTarget(orig)
+	return q, vals
+}
+
+// matchWorker is one goroutine's per-match state: a full bilateral matcher (its own
+// job copy, since MatchClassAd mutates targets) and, when available, a wire-native
+// job-side rejecter to skip decoding slots the job cannot accept.
+type matchWorker struct {
+	mc *classad.MatchClassAd
+	jm *vm.Matcher // job.Requirements matcher, or nil (no wire-native reject)
+	ms *matchScope
+}
+
+func newMatchWorker(job *classad.ClassAd, c *Collection, jobReq *vm.Query, jobVals map[string]classad.Value) *matchWorker {
+	mw := &matchWorker{mc: classad.NewMatchClassAd(job, nil)}
+	if jobReq != nil {
+		mw.jm = jobReq.Matcher()
+		mw.ms = &matchScope{ctx: c, jobVals: jobVals}
+	}
+	return mw
+}
+
 // taskMatches matches over the collection's segments directly (non-chained), fanning
 // out across workers when the scan is large enough and the worker budget allows.
 func (c *Collection) taskMatches(job *classad.ClassAd) []rankedMatch {
 	tasks, totalBytes, release := c.gatherTasks()
 	defer release()
+
+	jobReq, jobVals := c.compileJobSide(job)
 
 	W := 0
 	// A worker needs its own job copy; if the job cannot round-trip, stay single-
@@ -134,7 +217,15 @@ func (c *Collection) taskMatches(job *classad.ClassAd) []rankedMatch {
 		for i := 0; i < W; i++ {
 			<-c.qsem
 		}
-		return c.matchTasksSerial(job, tasks)
+		orig := job.GetTarget()
+		defer job.SetTarget(orig)
+		mw := newMatchWorker(job, c, jobReq, jobVals)
+		var dbuf []byte
+		var out []rankedMatch
+		for _, t := range tasks {
+			c.matchWindow(t, mw, &dbuf, &out)
+		}
+		return out
 	}
 	defer func() {
 		for i := 0; i < W; i++ {
@@ -150,7 +241,7 @@ func (c *Collection) taskMatches(job *classad.ClassAd) []rankedMatch {
 		go func(wi int) {
 			defer wg.Done()
 			jobCopy, _ := classad.Parse(jobText) // validated above
-			m := classad.NewMatchClassAd(jobCopy, nil)
+			mw := newMatchWorker(jobCopy, c, jobReq, jobVals)
 			var dbuf []byte
 			var local []rankedMatch
 			for {
@@ -158,7 +249,7 @@ func (c *Collection) taskMatches(job *classad.ClassAd) []rankedMatch {
 				if idx >= len(tasks) {
 					break
 				}
-				c.matchWindow(tasks[idx], m, &dbuf, &local)
+				c.matchWindow(tasks[idx], mw, &dbuf, &local)
 			}
 			perWorker[wi] = local
 		}(i)
@@ -171,34 +262,32 @@ func (c *Collection) taskMatches(job *classad.ClassAd) []rankedMatch {
 	return out
 }
 
-// matchTasksSerial matches the gathered tasks on the calling goroutine (small scans
-// or an exhausted worker budget). Uses the original job, restoring its target.
-func (c *Collection) matchTasksSerial(job *classad.ClassAd, tasks []scanTask) []rankedMatch {
-	orig := job.GetTarget()
-	defer job.SetTarget(orig)
-	m := classad.NewMatchClassAd(job, nil)
-	var dbuf []byte
-	var out []rankedMatch
-	for _, t := range tasks {
-		c.matchWindow(t, m, &dbuf, &out)
-	}
-	return out
-}
-
-// matchWindow decodes each visible record in one window and appends its matches.
-func (c *Collection) matchWindow(t scanTask, m *classad.MatchClassAd, dbuf *[]byte, out *[]rankedMatch) {
+// matchWindow visits each visible record in one window: it first tries the wire-native
+// job-side reject (skipping the full decode of slots the job definitely rejects), then
+// decodes and bilaterally matches the survivors.
+func (c *Collection) matchWindow(t scanTask, mw *matchWorker, dbuf *[]byte, out *[]rankedMatch) {
 	forEachVisibleWindow(t.s0, t.win, func(adBytes []byte, codec Codec) bool {
 		w, err := codec.Decompress((*dbuf)[:0], adBytes)
 		if err != nil {
 			return true
 		}
 		*dbuf = w
+		if mw.jm != nil {
+			mw.ms.slot = wire.Ad(w)
+			mw.ms.fellBack = false
+			v := mw.jm.EvalResolved(mw.ms.resolve)
+			if !mw.ms.fellBack && v.IsBool() {
+				if b, _ := v.BoolValue(); !b {
+					return true // job definitely rejects this slot: skip the decode
+				}
+			}
+		}
 		node, err := c.decodeWire(w)
 		if err != nil {
 			return true
 		}
 		ad := classad.FromAST(node)
-		if ok, r, hr := matchOne(m, ad); ok {
+		if ok, r, hr := matchOne(mw.mc, ad); ok {
 			*out = append(*out, rankedMatch{ad, r, hr})
 		}
 		return true
