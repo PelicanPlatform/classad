@@ -476,6 +476,32 @@ func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Valu
 				return e.evalAttrExpr(ad, norm, expr)
 			}
 		}
+		// Old-ClassAd matchmaking fallthrough: an unqualified reference not found
+		// in MY (this ad and its parent scope chain) resolves against the TARGET
+		// ad when one is set. This is what HTCondor relies on during matchmaking --
+		// a startd START expression names job attributes and a job's Requirements
+		// names machine attributes, both unqualified. Mirrors the C++ classad
+		// alternateScope mechanism (src/classad/attrrefs.cpp FindExpr):
+		//
+		//	rc = current->LookupInScope( attributeStr, tree, state );
+		//	if ( !expr && !absolute && rc == EVAL_UNDEF && current->alternateScope )
+		//		rc = current->alternateScope->LookupInScope( attributeStr, tree, state );
+		//
+		// where alternateScope is set to the peer ad by MatchClassAd under old
+		// semantics. Only bare references reach here (MY./TARGET./PARENT./absolute
+		// refs are handled in their own cases above), matching the C++ !expr &&
+		// !absolute guard. The attribute found in the target evaluates in the
+		// target's own context (evalAttrExpr rebinds the scope), so ITS unqualified
+		// refs resolve target-ad-first and then fall back through the target's own
+		// target -- the same ping-pong the C++ code allows, bounded by the shared
+		// per-(ad,attr) cyclic-reference guard in evalAttrExpr.
+		if e.classad != nil {
+			for ad := e.classad.target; ad != nil; ad = ad.parent {
+				if expr := ad.lookupNorm(norm); expr != nil {
+					return e.evalAttrExpr(ad, norm, expr)
+				}
+			}
+		}
 		return NewUndefinedValue()
 	}
 }
