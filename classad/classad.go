@@ -607,6 +607,39 @@ func (c *ClassAd) Lookup(name string) (*Expr, bool) {
 // Returns nil if the attribute doesn't exist.
 // This is the internal version that returns ast.Expr for backward compatibility.
 func (c *ClassAd) lookupInternal(name string) ast.Expr {
+	if c.ad == nil {
+		return nil
+	}
+	c.ensureIndex()
+	// Attribute names are ASCII identifiers, so case-fold into a stack buffer and
+	// index the map with string(buf): the compiler special-cases a string([]byte)
+	// map key to avoid a heap allocation, eliminating the strings.ToLower that
+	// normalizeName would make on every lookup. This is the matchmaking read hot
+	// path (EvaluateAttr per Symmetry / rank, once per candidate). A non-ASCII or
+	// over-long name falls back to the allocating normalize.
+	const maxStack = 128
+	if n := len(name); n > 0 && n <= maxStack {
+		var buf [maxStack]byte
+		b := buf[:n]
+		ascii := true
+		for i := 0; i < n; i++ {
+			ch := name[i]
+			if ch >= 0x80 {
+				ascii = false
+				break
+			}
+			if 'A' <= ch && ch <= 'Z' {
+				ch += 'a' - 'A'
+			}
+			b[i] = ch
+		}
+		if ascii {
+			if ptr, ok := c.index[string(b)]; ok {
+				return *ptr
+			}
+			return nil
+		}
+	}
 	return c.lookupNorm(normalizeName(name))
 }
 

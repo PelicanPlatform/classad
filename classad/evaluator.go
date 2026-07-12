@@ -447,11 +447,11 @@ func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Valu
 		// original-cased name and the reference's scope.
 		return e.resolver(ref.Name, ref.Scope)
 	}
-	// Normalize the reference name once. Attribute lookup and cyclic-reference
-	// tracking are both case-insensitive, and a reference is resolved through
-	// several of them (a scope-chain walk can probe multiple ads); normalizing
-	// here avoids a strings.ToLower allocation at each step.
-	norm := normalizeName(ref.Name)
+	// Resolve the reference name case-insensitively. The folded name is
+	// precomputed on the AST node at parse time (NewAttributeReference), so this
+	// hot path -- run once per candidate per reference during matchmaking -- does
+	// not allocate a fresh strings.ToLower result on every lookup.
+	norm := ref.NormalizedName()
 	switch ref.Scope {
 	case ast.MyScope:
 		// MY.attr - always the current ClassAd (no scope-chain fallthrough).
@@ -841,7 +841,7 @@ func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
 	// an unscoped reference so it chains (and participates in cycle detection).
 	ad.parent = e.classad
 	nested := e.child(ad)
-	return nested.evaluateAttributeReference(&ast.AttributeReference{Name: attr})
+	return nested.evaluateAttributeReference(ast.NewAttributeReference(attr, ast.NoScope))
 }
 
 func (e *Evaluator) evaluateSubscriptExpr(sub *ast.SubscriptExpr) Value {

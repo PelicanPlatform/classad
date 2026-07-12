@@ -336,6 +336,29 @@ const (
 type AttributeReference struct {
 	Name  string
 	Scope AttributeScope
+	// norm is the case-folded (lowercased) Name, precomputed at construction so
+	// evaluation -- which resolves a reference case-insensitively, once per
+	// candidate during matchmaking -- does not allocate a fresh strings.ToLower
+	// result on every lookup. Populated by NewAttributeReference (the parser and
+	// other in-package builders); nodes built with a struct literal leave it
+	// empty and NormalizedName falls back to lowercasing on demand.
+	norm string
+}
+
+// NewAttributeReference builds an attribute reference with its case-folded name
+// precomputed, so evaluation can resolve it without a per-lookup allocation.
+func NewAttributeReference(name string, scope AttributeScope) *AttributeReference {
+	return &AttributeReference{Name: name, Scope: scope, norm: strings.ToLower(name)}
+}
+
+// NormalizedName returns the case-folded attribute name used for lookup. It
+// returns the value precomputed by NewAttributeReference when present, else
+// lowercases Name on demand (for nodes built via a struct literal).
+func (a *AttributeReference) NormalizedName() string {
+	if a.norm != "" {
+		return a.norm
+	}
+	return strings.ToLower(a.Name)
 }
 
 func (a *AttributeReference) String() string {
