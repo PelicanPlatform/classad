@@ -225,7 +225,6 @@ func (c *ClassAd) dedupAttributes() {
 
 // rebuildIndex recreates the fast lookup map from the underlying attributes.
 func (c *ClassAd) rebuildIndex() {
-	c.dedupAttributes()
 	if c.ad == nil {
 		c.index = nil
 		return
@@ -233,13 +232,31 @@ func (c *ClassAd) rebuildIndex() {
 	if c.index == nil {
 		c.index = make(map[string]*ast.Expr, len(c.ad.Attributes))
 	} else {
-		for k := range c.index {
-			delete(c.index, k)
-		}
+		clear(c.index)
 	}
+	// Single pass: build the index and detect a duplicate normalized name inline.
+	// The overwhelmingly common case -- every ClassAd from a parse or wire decode,
+	// whose attributes are already unique -- folds each name once and allocates only
+	// the index map, avoiding dedupAttributes' two maps + order slice + a second fold
+	// per attribute. A genuine duplicate (rare: hand-built or malformed input) falls
+	// back to the full dedup, then reindexes the collapsed attributes.
+	dup := false
 	for i := range c.ad.Attributes {
 		attr := c.ad.Attributes[i]
-		c.index[normalizeName(attr.Name)] = &attr.Value
+		n := normalizeName(attr.Name)
+		if _, exists := c.index[n]; exists {
+			dup = true
+			break
+		}
+		c.index[n] = &attr.Value
+	}
+	if dup {
+		c.dedupAttributes()
+		clear(c.index)
+		for i := range c.ad.Attributes {
+			attr := c.ad.Attributes[i]
+			c.index[normalizeName(attr.Name)] = &attr.Value
+		}
 	}
 }
 

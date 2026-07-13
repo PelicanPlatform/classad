@@ -99,6 +99,21 @@ func BenchmarkMatchSelective(b *testing.B) {
 	b.ReportMetric(float64(matches), "matches")
 }
 
+// BenchmarkMatchSortedLimit1 is the negotiator's shape: pick the single best slot.
+// The job has no Rank, so all that is needed is any one survivor -- but MatchSorted
+// currently materializes every survivor (FromAST) before truncating to the limit.
+func BenchmarkMatchSortedLimit1(b *testing.B) {
+	c := buildMatchPool(b, 20000)
+	job := homogeneousJob(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got := c.MatchSorted(job, 1); len(got) != 1 {
+			b.Fatalf("want 1 match, got %d", len(got))
+		}
+	}
+}
+
 // BenchmarkMatchPlanOnly isolates just the per-job planning (compileJobSide +
 // matchIndexPlan) with no candidate scan, so the cacheable fraction is measured
 // directly against BenchmarkMatchHomogeneous.
