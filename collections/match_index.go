@@ -98,7 +98,7 @@ func valueToLiteral(v classad.Value) ast.Expr {
 // out across shards when the worker budget allows. Each candidate is fully matched
 // with MatchClassAd (plus the wire-native reject), so the index only narrows which
 // slots are visited -- correctness is unchanged from a full scan.
-func (c *Collection) indexedMatches(job *classad.ClassAd, usable []usableProbe, jobReq *vm.Query, jobVals map[string]classad.Value) []rankedMatch {
+func (c *Collection) indexedMatches(job *classad.ClassAd, usable []usableProbe, jp *jobPlan, deferMat bool) []rankedMatch {
 	shards := c.shards
 
 	W := 0
@@ -116,7 +116,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, usable []usableProbe, 
 		}
 		orig := job.GetTarget()
 		defer job.SetTarget(orig)
-		mw := newMatchWorker(job, c, jobReq, jobVals)
+		mw := newMatchWorker(job, c, jp, deferMat)
 		var out []rankedMatch
 		for _, sh := range shards {
 			c.scanShardCandidates(sh, usable, func(w []byte) bool {
@@ -140,7 +140,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, usable []usableProbe, 
 		go func(wi int) {
 			defer wg.Done()
 			jobCopy, _ := classad.Parse(jobText) // validated above
-			mw := newMatchWorker(jobCopy, c, jobReq, jobVals)
+			mw := newMatchWorker(jobCopy, c, jp, deferMat)
 			var local []rankedMatch
 			for {
 				idx := int(atomic.AddInt64(&next, 1)) - 1

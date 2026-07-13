@@ -82,6 +82,70 @@ func TestMatchSortedTopK(t *testing.T) {
 	}
 }
 
+// TestMatchSortedDeferredEqualsFull checks that MatchSorted with a limit (which
+// defers ClassAd materialization and ranks survivors wire-native) returns exactly
+// the same ranked top-N as ranking the full result and truncating. The corpus mixes
+// literal Requirements slots (the wire-native survivor path) with non-literal ones
+// (the full-decode fallback), and the job has a Rank, so both rank paths and the
+// deferred/fallback record mix are exercised.
+func TestMatchSortedDeferredEqualsFull(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4})
+	for i := 0; i < 200; i++ {
+		req := "true" // literal -> wire-native survivor path
+		if i%3 == 0 {
+			req = "TARGET.RequestMemory <= Memory" // non-literal -> fallback path
+		}
+		text := fmt.Sprintf(`[ Id=%d; Memory=%d; Arch="X86_64"; Cpus=%d; Requirements = %s ]`,
+			i, ((i%16)+1)*1024, (i%32)+1, req)
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := mustAd(t, `[ RequestMemory = 4096;
+		Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64";
+		Rank = TARGET.Cpus ]`)
+
+	full := matchIDs(t, c.MatchSorted(job, 0)) // limit 0: materialize all, no deferral
+	for _, k := range []int{1, 3, 10, 50} {
+		limited := matchIDs(t, c.MatchSorted(job, k)) // limit k: deferred + wire-native rank
+		want := full
+		if k < len(want) {
+			want = want[:k]
+		}
+		// Rank ties (equal Cpus) sort in an unspecified order, so compare the multiset
+		// of ranks at each position rather than exact ids: the k-th best rank must match.
+		if len(limited) != len(want) {
+			t.Fatalf("limit=%d: got %d matches, want %d", k, len(limited), len(want))
+		}
+		if !sameRanks(t, c, job, limited, want) {
+			t.Fatalf("limit=%d: deferred top-%d ranks differ from full top-%d\n got %v\nwant %v",
+				k, k, k, limited, want)
+		}
+	}
+}
+
+// sameRanks reports whether two id lists have the same Cpus (== Rank) at each
+// position -- a tie-tolerant equality for the ranked match results.
+func sameRanks(t *testing.T, c *Collection, job *classad.ClassAd, a, b []int) bool {
+	t.Helper()
+	cpus := map[int]int64{}
+	for ad := range c.Scan() {
+		id, _ := ad.EvaluateAttrInt("Id")
+		cp, _ := ad.EvaluateAttrInt("Cpus")
+		cpus[int(id)] = cp
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if cpus[a[i]] != cpus[b[i]] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestMatchDoesNotMutateJob checks the caller's job ad is left as it was found.
 func TestMatchDoesNotMutateJob(t *testing.T) {
 	t.Parallel()

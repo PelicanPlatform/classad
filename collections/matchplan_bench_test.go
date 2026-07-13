@@ -123,7 +123,7 @@ func BenchmarkMatchPlanOnly(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, jobVals := c.compileJobSide(job)
-		_ = c.matchIndexPlan(job, jobVals)
+		jp := c.compileJobSide(job)
+		_ = c.matchIndexPlan(job, jp.vals)
 	}
 }

@@ -28,9 +28,12 @@ import (
 // slots the job rejects) and index candidate pre-filtering. This still full-decodes
 // every visible ad; the API is stable across those additions.
 
-// rankedMatch is a matched ad and the job's Rank of it.
+// rankedMatch is a matched ad and the job's Rank of it. ad is nil for a
+// deferred-materialization record, whose slot bytes are held in wire until
+// materialize builds the ClassAd (only for records actually returned).
 type rankedMatch struct {
 	ad      *classad.ClassAd
+	wire    []byte // deferred: a copy of the slot's decompressed wire bytes (nil once ad is built)
 	rank    float64
 	hasRank bool
 }
@@ -76,7 +79,9 @@ func (c *Collection) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {
 		if job == nil {
 			return
 		}
-		for _, rm := range c.collectMatches(job) {
+		// Unlimited: every match is returned, so materialize inline (deferMat=false);
+		// records already carry their ad.
+		for _, rm := range c.collectMatches(job, false) {
 			if !yield(rm.ad) {
 				return
 			}
@@ -93,7 +98,9 @@ func (c *Collection) MatchSorted(job *classad.ClassAd, limit int) []*classad.Cla
 	if job == nil {
 		return nil
 	}
-	matches := c.collectMatches(job)
+	// Defer ClassAd materialization when a limit will discard most survivors: rank
+	// records wire-native, sort, truncate, then build only the returned ads.
+	matches := c.collectMatches(job, limit > 0)
 	sort.SliceStable(matches, func(i, j int) bool {
 		a, b := matches[i], matches[j]
 		if a.hasRank != b.hasRank {
@@ -107,9 +114,11 @@ func (c *Collection) MatchSorted(job *classad.ClassAd, limit int) []*classad.Cla
 	if limit > 0 && limit < len(matches) {
 		matches = matches[:limit]
 	}
-	out := make([]*classad.ClassAd, len(matches))
+	out := make([]*classad.ClassAd, 0, len(matches))
 	for i := range matches {
-		out[i] = matches[i].ad
+		if ad := c.materialize(&matches[i]); ad != nil {
+			out = append(out, ad)
+		}
 	}
 	return out
 }
@@ -117,15 +126,15 @@ func (c *Collection) MatchSorted(job *classad.ClassAd, limit int) []*classad.Cla
 // collectMatches gathers all symmetric matches, in parallel when possible. When the
 // job's Requirements yield an index-usable constraint on the slots, it visits only
 // candidate slots (A2); otherwise it scans every slot with the wire-native reject.
-func (c *Collection) collectMatches(job *classad.ClassAd) []rankedMatch {
+func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []rankedMatch {
 	if c.parentKeyFor != nil {
 		return c.serialScanMatches(job) // chained: need Scan's flatten/hide-structural view
 	}
-	jobReq, jobVals := c.compileJobSide(job)
-	if usable := c.matchIndexPlan(job, jobVals); len(usable) > 0 {
-		return c.indexedMatches(job, usable, jobReq, jobVals)
+	jp := c.compileJobSide(job)
+	if usable := c.matchIndexPlan(job, jp.vals); len(usable) > 0 {
+		return c.indexedMatches(job, usable, jp, deferMat)
 	}
-	return c.taskMatches(job, jobReq, jobVals)
+	return c.taskMatches(job, jp, deferMat)
 }
 
 // serialScanMatches matches over Scan (the chained/structural-aware read view).
@@ -136,7 +145,7 @@ func (c *Collection) serialScanMatches(job *classad.ClassAd) []rankedMatch {
 	var out []rankedMatch
 	for ad := range c.Scan() {
 		if ok, r, hr := matchOne(m, ad); ok {
-			out = append(out, rankedMatch{ad, r, hr})
+			out = append(out, rankedMatch{ad: ad, rank: r, hasRank: hr})
 		}
 	}
 	return out
@@ -249,41 +258,55 @@ func jobValues(job *classad.ClassAd) map[string]classad.Value {
 	return vals
 }
 
-// compileJobSide prepares the wire-native job-side reject: it compiles job.Requirements
-// and precomputes the job's own attribute values. jobReq is nil when the job has no
-// Requirements or it is not wire-native evaluable (then every candidate is fully
-// decoded); jobVals is always returned (the index pre-filter uses it too).
-func (c *Collection) compileJobSide(job *classad.ClassAd) (jobReq *vm.Query, jobVals map[string]classad.Value) {
-	jobVals = jobValues(job)
+// compileJobSide prepares the wire-native job side: it compiles job.Requirements and
+// job.Rank (each nil when absent or not wire-native evaluable) and precomputes the
+// job's own attribute values. jobPlan.vals is always populated (the index pre-filter
+// uses it too); rankPresent records a Rank attribute regardless of compilability, so
+// a non-wire-native Rank still forces a decode rather than being read as "unranked".
+func (c *Collection) compileJobSide(job *classad.ClassAd) *jobPlan {
+	jp := &jobPlan{vals: jobValues(job)}
 	if reqExpr := jobRequirementsExpr(job); reqExpr != nil {
 		if q := vm.Compile(reqExpr); q.Native() {
-			jobReq = q // ternary/list/func etc. leave jobReq nil (no wire-native path)
+			jp.req = q // ternary/list/func etc. leave req nil (no wire-native path)
 		}
 	}
-	return jobReq, jobVals
+	if rankExpr := jobRankExpr(job); rankExpr != nil {
+		jp.rankPresent = true
+		if q := vm.Compile(rankExpr); q.Native() {
+			jp.rank = q
+		}
+	}
+	return jp
 }
 
 // matchWorker is one goroutine's per-match state: a full bilateral matcher (its own
-// job copy, since MatchClassAd mutates targets) and, when available, a wire-native
-// job-side rejecter to skip decoding slots the job cannot accept.
+// job copy, since MatchClassAd mutates targets) and, when available, wire-native
+// job-side matchers to skip decoding slots the job rejects and to rank/decide
+// survivors without a ClassAd.
 type matchWorker struct {
-	mc *classad.MatchClassAd
-	jm *vm.Matcher // job.Requirements matcher, or nil (no wire-native reject)
-	ms *matchScope
+	mc          *classad.MatchClassAd
+	jm          *vm.Matcher // job.Requirements matcher, or nil (no wire-native reject)
+	rankM       *vm.Matcher // job.Rank matcher, or nil
+	rankPresent bool        // job has a Rank attribute
+	deferMat    bool        // defer ClassAd materialization (MatchSorted with a limit)
+	ms          *matchScope
 }
 
-func newMatchWorker(job *classad.ClassAd, c *Collection, jobReq *vm.Query, jobVals map[string]classad.Value) *matchWorker {
-	mw := &matchWorker{mc: classad.NewMatchClassAd(job, nil)}
-	if jobReq != nil {
-		mw.jm = jobReq.Matcher()
-		mw.ms = &matchScope{ctx: c, jobVals: jobVals, inline: c.inline, intern: c.intern}
+func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat bool) *matchWorker {
+	mw := &matchWorker{mc: classad.NewMatchClassAd(job, nil), rankPresent: jp.rankPresent, deferMat: deferMat}
+	if jp.rank != nil {
+		mw.rankM = jp.rank.Matcher()
+	}
+	if jp.req != nil {
+		mw.jm = jp.req.Matcher()
+		mw.ms = &matchScope{ctx: c, jobVals: jp.vals, inline: c.inline, intern: c.intern}
 	}
 	return mw
 }
 
 // taskMatches matches over the collection's segments directly (non-chained), fanning
 // out across workers when the scan is large enough and the worker budget allows.
-func (c *Collection) taskMatches(job *classad.ClassAd, jobReq *vm.Query, jobVals map[string]classad.Value) []rankedMatch {
+func (c *Collection) taskMatches(job *classad.ClassAd, jp *jobPlan, deferMat bool) []rankedMatch {
 	tasks, totalBytes, release := c.gatherTasks()
 	defer release()
 
@@ -305,7 +328,7 @@ func (c *Collection) taskMatches(job *classad.ClassAd, jobReq *vm.Query, jobVals
 		}
 		orig := job.GetTarget()
 		defer job.SetTarget(orig)
-		mw := newMatchWorker(job, c, jobReq, jobVals)
+		mw := newMatchWorker(job, c, jp, deferMat)
 		var dbuf []byte
 		var out []rankedMatch
 		for _, t := range tasks {
@@ -327,7 +350,7 @@ func (c *Collection) taskMatches(job *classad.ClassAd, jobReq *vm.Query, jobVals
 		go func(wi int) {
 			defer wg.Done()
 			jobCopy, _ := classad.Parse(jobText) // validated above
-			mw := newMatchWorker(jobCopy, c, jobReq, jobVals)
+			mw := newMatchWorker(jobCopy, c, jp, deferMat)
 			var dbuf []byte
 			var local []rankedMatch
 			for {
@@ -380,12 +403,26 @@ func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatc
 			leftKnownTrue = true // job definitely accepts: skip the left re-eval below
 		}
 	}
+	// Fully wire-native survivor: when materialization is deferred (MatchSorted with a
+	// limit), the job accepted this slot, and the slot's own Requirements + the job's
+	// Rank can be decided from wire alone, decide and rank it without building a
+	// ClassAd. Anything ambiguous returns ok=false and drops to the full decode below,
+	// so results are identical. Only worthwhile when deferring: an unlimited Match
+	// materializes every survivor regardless, so it stays on the plain decode path.
+	if leftKnownTrue && mw.deferMat {
+		if matched, rank, hasRank, ok := c.wireNativeSurvivor(mw); ok {
+			if matched {
+				c.appendSurvivor(mw, w, rank, hasRank, out)
+			}
+			return
+		}
+	}
 	node, err := c.decodeWire(w)
 	if err != nil {
 		return
 	}
 	ad := classad.FromAST(node)
 	if ok, r, hr := matchOneLeftKnown(mw.mc, ad, leftKnownTrue); ok {
-		*out = append(*out, rankedMatch{ad, r, hr})
+		*out = append(*out, rankedMatch{ad: ad, rank: r, hasRank: hr})
 	}
 }
