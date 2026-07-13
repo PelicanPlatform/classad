@@ -148,6 +148,33 @@ func BenchmarkOSPoolSlotDecode(b *testing.B) {
 			ad.SetTarget(nil)
 		}
 	})
+	b.Run("TwoPassDecode", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = c.twoPassClosureDecode(wire.Ad(wires[i%len(wires)]))
+		}
+	})
+	b.Run("TwoPassDecode+Eval", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			ad := c.twoPassClosureDecode(wire.Ad(wires[i%len(wires)]))
+			m.ReplaceRightAd(ad)
+			_ = m.EvaluateAttrRight("Requirements")
+			ad.SetTarget(nil)
+		}
+	})
+	// Worker-reused id->bytes map: the map backing is allocated once and cleared per
+	// candidate, removing the per-candidate map allocation while staying cache-free.
+	b.Run("TwoPassReuse+Eval", func(b *testing.B) {
+		b.ReportAllocs()
+		nodes := make(map[uint32][]byte, 600)
+		for i := 0; i < b.N; i++ {
+			ad := c.twoPassClosureDecodeReuse(wire.Ad(wires[i%len(wires)]), nodes)
+			m.ReplaceRightAd(ad)
+			_ = m.EvaluateAttrRight("Requirements")
+			ad.SetTarget(nil)
+		}
+	})
 }
 
 // TestOSPoolSinglePassMatchesFull is the correctness gate for the spike: for every
@@ -167,15 +194,20 @@ func TestOSPoolSinglePassMatchesFull(t *testing.T) {
 		part := c.singlePassClosureDecode(wire.Ad(w), want)
 		mFull.ReplaceRightAd(full)
 		mPart.ReplaceRightAd(part)
+		two := c.twoPassClosureDecode(wire.Ad(w)) // cache-free per-ad decode
+		mTwo := classad.NewMatchClassAd(job, nil)
+		mTwo.ReplaceRightAd(two)
 		vf := mFull.EvaluateAttrRight("Requirements")
 		vp := mPart.EvaluateAttrRight("Requirements")
+		vt := mTwo.EvaluateAttrRight("Requirements")
 		full.SetTarget(nil)
 		part.SetTarget(nil)
+		two.SetTarget(nil)
 		checked++
-		if vf.String() != vp.String() {
+		if vf.String() != vp.String() || vf.String() != vt.String() {
 			mismatch++
 			if mismatch <= 5 {
-				t.Errorf("ad requirements eval mismatch: full=%q partial=%q", vf.String(), vp.String())
+				t.Errorf("eval mismatch: full=%q single=%q two=%q", vf.String(), vp.String(), vt.String())
 			}
 		}
 	}
@@ -233,6 +265,92 @@ func (c *Collection) singlePassClosureDecode(a wire.Ad, want map[uint32]bool) *c
 		}
 		return true
 	})
+	return out
+}
+
+// twoPassClosureDecode is the correctness-safe design that needs no cross-ad cache:
+// pass 1 indexes id -> node bytes in one ForEach (no AST build), then a closure BFS
+// uses O(1) map lookups (not scattered O(N) Ad.Lookup) and AST-builds only the
+// closure. Correct per ad regardless of whether Start/WithinResourceLimits vary.
+func (c *Collection) twoPassClosureDecode(a wire.Ad) *classad.ClassAd {
+	nodes := make(map[uint32][]byte, 600)
+	a.ForEach(func(id uint32, node []byte) bool {
+		nodes[id] = node
+		return true
+	})
+	out := classad.New()
+	reqID, ok := c.intern.LookupID("Requirements")
+	if !ok {
+		return out
+	}
+	seen := map[uint32]bool{}
+	work := []uint32{reqID}
+	for len(work) > 0 {
+		id := work[len(work)-1]
+		work = work[:len(work)-1]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		node, ok := nodes[id]
+		if !ok {
+			continue
+		}
+		expr, err := c.decodeNode(node)
+		if err != nil {
+			continue
+		}
+		if name, ok := c.intern.Name(id); ok {
+			out.Insert(name, expr)
+		}
+		for _, ref := range vm.SelfRefs(expr) {
+			if rid, ok := c.intern.LookupID(ref); ok && !seen[rid] {
+				work = append(work, rid)
+			}
+		}
+	}
+	return out
+}
+
+// twoPassClosureDecodeReuse is twoPassClosureDecode with a caller-provided map that
+// is cleared and refilled, so the map backing is allocated once per worker.
+func (c *Collection) twoPassClosureDecodeReuse(a wire.Ad, nodes map[uint32][]byte) *classad.ClassAd {
+	clear(nodes)
+	a.ForEach(func(id uint32, node []byte) bool {
+		nodes[id] = node
+		return true
+	})
+	out := classad.New()
+	reqID, ok := c.intern.LookupID("Requirements")
+	if !ok {
+		return out
+	}
+	seen := map[uint32]bool{}
+	work := []uint32{reqID}
+	for len(work) > 0 {
+		id := work[len(work)-1]
+		work = work[:len(work)-1]
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		node, ok := nodes[id]
+		if !ok {
+			continue
+		}
+		expr, err := c.decodeNode(node)
+		if err != nil {
+			continue
+		}
+		if name, ok := c.intern.Name(id); ok {
+			out.Insert(name, expr)
+		}
+		for _, ref := range vm.SelfRefs(expr) {
+			if rid, ok := c.intern.LookupID(ref); ok && !seen[rid] {
+				work = append(work, rid)
+			}
+		}
+	}
 	return out
 }
 
