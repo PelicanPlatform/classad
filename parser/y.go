@@ -922,7 +922,7 @@ yydefault:
 //line classad.y:251
 		{
 			name, scope := ParseScopedIdentifier(yyDollar[1].str)
-			yyVAL.expr = &ast.AttributeReference{Name: name, Scope: scope}
+			yyVAL.expr = ast.NewAttributeReference(name, scope)
 		}
 	case 57:
 		yyDollar = yyS[yypt-2 : yypt+1]
@@ -931,7 +931,7 @@ yydefault:
 			// A leading-dot reference (".A") is a plain reference in the
 			// reference engine (".A" resolves identically to "A").
 			name, scope := ParseScopedIdentifier(yyDollar[2].str)
-			yyVAL.expr = &ast.AttributeReference{Name: name, Scope: scope}
+			yyVAL.expr = ast.NewAttributeReference(name, scope)
 		}
 	case 58:
 		yyDollar = yyS[yypt-3 : yypt+1]

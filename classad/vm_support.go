@@ -32,7 +32,7 @@ func (e *Evaluator) ApplyUnaryOp(op string, operand Value) Value {
 // scope-chain search for an unscoped name, MY/TARGET/PARENT handling, evaluation
 // of the referenced attribute's expression, and cyclic-reference detection.
 func (e *Evaluator) ResolveRef(name string, scope ast.AttributeScope) Value {
-	return e.evaluateAttributeReference(&ast.AttributeReference{Name: name, Scope: scope})
+	return e.evaluateAttributeReference(ast.NewAttributeReference(name, scope))
 }
 
 // SetScope rebinds the evaluator to a new scope ClassAd and resets its recursion
