@@ -146,16 +146,36 @@ func (c *Collection) serialScanMatches(job *classad.ClassAd) []rankedMatch {
 // TARGET.attr comes from the slot's wire bytes (wire-native, no decode), and unscoped
 // / MY.attr come from the job's precomputed attribute values. If a TARGET attribute is
 // a non-literal expression, it sets fellBack and the caller decodes the slot fully.
+//
+// The job's Requirements references a small, fixed set of attribute names, resolved
+// once per candidate slot across the whole match. Rather than re-fold and re-look-up
+// those names every candidate (a locked, allocating intern LookupID on the target
+// side; a ToLower on the job side), matchScope caches each name's resolution: the
+// interned id for a target ref (stable for the collection) and the constant value for
+// a job ref (stable for the job). One matchScope lives per worker for one match, so
+// the caches populate on the first candidate and are pure hits thereafter.
 type matchScope struct {
 	slot     wire.Ad
 	ctx      wireCtx
 	jobVals  map[string]classad.Value
 	fellBack bool
+
+	// resolution caches, keyed by the reference name as it appears in the expression.
+	inline   bool                // collection uses inline names (no intern table)
+	intern   *wire.InternTable   // interned-mode attribute id table (nil when inline)
+	idCache  map[string]cachedID // target ref name -> interned id (interned mode only)
+	jobCache map[string]classad.Value
+}
+
+// cachedID memoizes an interned-mode target-attribute name resolution.
+type cachedID struct {
+	id    uint32
+	found bool
 }
 
 func (ms *matchScope) resolve(name string, scope ast.AttributeScope) classad.Value {
 	if scope == ast.TargetScope {
-		node, ok := ms.ctx.wireLookup(ms.slot, name)
+		node, ok := ms.lookupTarget(name)
 		if !ok {
 			return classad.NewUndefinedValue()
 		}
@@ -166,10 +186,43 @@ func (ms *matchScope) resolve(name string, scope ast.AttributeScope) classad.Val
 		}
 		return litToValue(lit)
 	}
-	if v, ok := ms.jobVals[strings.ToLower(name)]; ok {
+	// Job side: the value is a constant for the whole match, so cache it by the
+	// reference's own casing and fold only on the first miss.
+	if v, ok := ms.jobCache[name]; ok {
 		return v
 	}
-	return classad.NewUndefinedValue()
+	v, ok := ms.jobVals[strings.ToLower(name)]
+	if !ok {
+		v = classad.NewUndefinedValue()
+	}
+	if ms.jobCache == nil {
+		ms.jobCache = make(map[string]classad.Value, 4)
+	}
+	ms.jobCache[name] = v
+	return v
+}
+
+// lookupTarget returns the slot's raw node bytes for a TARGET reference, caching the
+// name's interned id so repeated candidates skip the locked, folding intern lookup.
+// It mirrors Collection.wireLookup exactly (inline path unchanged: LookupByName
+// already compares case-insensitively without allocating).
+func (ms *matchScope) lookupTarget(name string) ([]byte, bool) {
+	if ms.inline {
+		return ms.slot.LookupByName(name)
+	}
+	e, ok := ms.idCache[name]
+	if !ok {
+		id, found := ms.intern.LookupID(name)
+		e = cachedID{id: id, found: found}
+		if ms.idCache == nil {
+			ms.idCache = make(map[string]cachedID, 4)
+		}
+		ms.idCache[name] = e
+	}
+	if !e.found {
+		return nil, false
+	}
+	return ms.slot.Lookup(e.id)
 }
 
 // jobRequirementsExpr returns the job's Requirements expression, or nil if absent.
@@ -223,7 +276,7 @@ func newMatchWorker(job *classad.ClassAd, c *Collection, jobReq *vm.Query, jobVa
 	mw := &matchWorker{mc: classad.NewMatchClassAd(job, nil)}
 	if jobReq != nil {
 		mw.jm = jobReq.Matcher()
-		mw.ms = &matchScope{ctx: c, jobVals: jobVals}
+		mw.ms = &matchScope{ctx: c, jobVals: jobVals, inline: c.inline, intern: c.intern}
 	}
 	return mw
 }
