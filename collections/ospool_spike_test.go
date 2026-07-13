@@ -175,6 +175,24 @@ func BenchmarkOSPoolSlotDecode(b *testing.B) {
 			ad.SetTarget(nil)
 		}
 	})
+	// Encode-time closure layout: hot set = the match closure, read via the hot
+	// header (O(closure), no scan, no BFS). The closure walk is paid once at encode.
+	hotWires := encodeHotClosure(b, c, ads, wires)
+	b.Run("HotClosureDecode", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			_ = c.hotClosureDecode(wire.Ad(hotWires[i%len(hotWires)]))
+		}
+	})
+	b.Run("HotClosureDecode+Eval", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			ad := c.hotClosureDecode(wire.Ad(hotWires[i%len(hotWires)]))
+			m.ReplaceRightAd(ad)
+			_ = m.EvaluateAttrRight("Requirements")
+			ad.SetTarget(nil)
+		}
+	})
 }
 
 // TestOSPoolSinglePassMatchesFull is the correctness gate for the spike: for every
@@ -197,17 +215,24 @@ func TestOSPoolSinglePassMatchesFull(t *testing.T) {
 		two := c.twoPassClosureDecode(wire.Ad(w)) // cache-free per-ad decode
 		mTwo := classad.NewMatchClassAd(job, nil)
 		mTwo.ReplaceRightAd(two)
+		// Hot-closure layout: re-encode with the closure as the hot set, read via header.
+		hw := wire.EncodeWithHot(nil, c.mustDecode(t, w).AST(), c.intern, idSet(want))
+		hot := c.hotClosureDecode(wire.Ad(hw))
+		mHot := classad.NewMatchClassAd(job, nil)
+		mHot.ReplaceRightAd(hot)
 		vf := mFull.EvaluateAttrRight("Requirements")
 		vp := mPart.EvaluateAttrRight("Requirements")
 		vt := mTwo.EvaluateAttrRight("Requirements")
+		vh := mHot.EvaluateAttrRight("Requirements")
 		full.SetTarget(nil)
 		part.SetTarget(nil)
 		two.SetTarget(nil)
+		hot.SetTarget(nil)
 		checked++
-		if vf.String() != vp.String() || vf.String() != vt.String() {
+		if vf.String() != vp.String() || vf.String() != vt.String() || vf.String() != vh.String() {
 			mismatch++
 			if mismatch <= 5 {
-				t.Errorf("eval mismatch: full=%q single=%q two=%q", vf.String(), vp.String(), vt.String())
+				t.Errorf("eval mismatch: full=%q single=%q two=%q hot=%q", vf.String(), vp.String(), vt.String(), vh.String())
 			}
 		}
 	}
@@ -352,6 +377,44 @@ func (c *Collection) twoPassClosureDecodeReuse(a wire.Ad, nodes map[uint32][]byt
 		}
 	}
 	return out
+}
+
+// hotClosureDecode reads a ClassAd from the hot header alone -- the design where the
+// encoder has already placed the match closure in the hot set, so the reader just
+// iterates the hot entries (O(hotCount)) with no scan and no BFS. The transitive
+// closure walk happened once at encode time.
+func (c *Collection) hotClosureDecode(a wire.Ad) *classad.ClassAd {
+	out := classad.New()
+	a.ForEachHot(func(id uint32, node []byte) bool {
+		if expr, err := c.decodeNode(node); err == nil {
+			if name, ok := c.intern.Name(id); ok {
+				out.Insert(name, expr)
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// encodeHotClosure re-encodes each ad with its Requirements closure as the hot set,
+// so hotClosureDecode reads exactly that closure. Mirrors what a closure-aware
+// encoder would do at write time.
+func encodeHotClosure(tb testing.TB, c *Collection, ads []*classad.ClassAd, wires [][]byte) [][]byte {
+	tb.Helper()
+	out := make([][]byte, len(ads))
+	for i := range ads {
+		want := c.closureIDs(wire.Ad(wires[i]))
+		out[i] = wire.EncodeWithHot(nil, ads[i].AST(), c.intern, idSet(want))
+	}
+	return out
+}
+
+func idSet(m map[uint32]bool) map[uint32]struct{} {
+	s := make(map[uint32]struct{}, len(m))
+	for id := range m {
+		s[id] = struct{}{}
+	}
+	return s
 }
 
 // mustDecode is a test helper: full-decode wire bytes to a ClassAd or fail.

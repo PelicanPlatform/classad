@@ -158,6 +158,44 @@ func (a Ad) ForEach(fn func(id uint32, node []byte) bool) bool {
 	return c.ok
 }
 
+// ForEachHot calls fn with the interned id and raw node bytes of each attribute
+// recorded in the hot header, in header order, resolving each via its stored
+// entries-relative offset (no scan). Returns false if fn stopped early or the ad is
+// malformed. Cost is O(hotCount), independent of the total attribute count -- so a
+// collection whose hot set is the match closure can read exactly the match-relevant
+// attributes of a very wide ad without touching the cold ones.
+func (a Ad) ForEachHot(fn func(id uint32, node []byte) bool) bool {
+	c, ok := a.bodyStart()
+	if !ok {
+		return false
+	}
+	hotCount := c.uvarint()
+	if hotCount == 0 {
+		return c.ok
+	}
+	ids := make([]uint32, hotCount)
+	offs := make([]uint32, hotCount)
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		ids[i] = uint32(c.uvarint())
+		offs[i] = uint32(c.uvarint())
+	}
+	c.uvarint() // attrCount
+	if !c.ok {
+		return false
+	}
+	entriesStart := c.pos
+	for i := range ids {
+		node, ok := nodeBytesAt(a, entriesStart+int(offs[i]))
+		if !ok {
+			return false
+		}
+		if !fn(ids[i], node) {
+			return true
+		}
+	}
+	return true
+}
+
 // nodeBytesAt returns the node bytes starting at absolute offset off.
 func nodeBytesAt(a Ad, off int) ([]byte, bool) {
 	if off < 0 || off > len(a) {
