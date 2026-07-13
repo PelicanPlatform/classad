@@ -245,7 +245,18 @@ func (v Value) ListValue() ([]Value, error) {
 // String), so the sentinel must not propagate there; a cyclic element becomes
 // that element's error value (the list survives), matching the reference engine.
 func evalRecoveringCyclic(ev *Evaluator, e ast.Expr) (result Value) {
+	// Save/restore depth around the recover: Evaluate skips its depth decrement
+	// when a cyclic panic unwinds (it has no per-node defer), and this is the one
+	// site that recovers and then keeps evaluating with the SAME evaluator (the
+	// next lazy-list element), so depth must be rewound or later elements would
+	// start artificially deep and spuriously trip maxEvalDepth.
+	//
+	// recoverCyclic must remain a DIRECT deferred call -- recover() only stops the
+	// panic when the deferred function itself calls it -- so the depth rewind is a
+	// separate defer (registered after, it runs first, before recoverCyclic).
+	saved := ev.depth
 	defer recoverCyclic(&result)
+	defer func() { ev.depth = saved }()
 	return ev.Evaluate(e)
 }
 
@@ -370,6 +381,18 @@ func (e *Evaluator) child(ad *ClassAd) *Evaluator {
 }
 
 // Evaluate evaluates an expression in the context of the ClassAd.
+//
+// Depth is tracked to bound recursion (a cyclic reference or a pathologically
+// deep expression panics with cyclicEvalError once maxEvalDepth is reached).
+// The increment/decrement is done inline rather than with `defer e.depth--`:
+// this function recurses once per AST node, and because a recover() sits in an
+// ancestor frame (the recoverCyclic at every evaluation entry point) the Go
+// compiler cannot open-code those defers, so a per-node defer put the whole
+// tree-walk on the slow stack-defer path -- ~25% of matchmaking CPU. On the
+// cyclic-panic path the decrement is skipped (depth is left inflated), which is
+// harmless: every terminal entry point recovers into a fresh or SetScope-reset
+// evaluator, and the one recover-and-continue caller (evalRecoveringCyclic, for
+// lazy-list elements) saves and restores depth around each element.
 func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 	if expr == nil {
 		return NewUndefinedValue()
@@ -379,8 +402,14 @@ func (e *Evaluator) Evaluate(expr ast.Expr) Value {
 		panic(cyclicEvalError{})
 	}
 	e.depth++
-	defer func() { e.depth-- }()
+	v := e.evalNode(expr)
+	e.depth--
+	return v
+}
 
+// evalNode dispatches one expression node. Callers go through Evaluate, which
+// manages the recursion-depth guard.
+func (e *Evaluator) evalNode(expr ast.Expr) Value {
 	switch v := expr.(type) {
 	case *ast.ParenExpr:
 		// Parentheses are transparent to evaluation (they only affect parsing
