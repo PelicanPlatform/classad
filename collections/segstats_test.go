@@ -279,6 +279,54 @@ func BenchmarkPlanPerSegmentSkip(b *testing.B) {
 	benchPlanPerSegment(b, `Cpus >= 1000`, nil, []string{"Cpus"})
 }
 
+// BenchmarkQueryPlanningOnce measures the ONCE-PER-QUERY planning cost that
+// precedes any per-segment work: compiling the query (vm.Parse -> Program +
+// probes) and matching those probes to the configured indexes (planIndex). This
+// is amortized across every segment a query touches -- but in matchmaking each job
+// is a fresh query, so it is paid per job and never amortized. Reported next to
+// the per-segment numbers so the two can be summed for a query over N segments.
+func BenchmarkQueryPlanningOnce(b *testing.B) {
+	c := New(Options{Shards: 8, CategoricalAttrs: []string{"Site"}, ValueAttrs: []string{"Cpus", "Memory"}})
+	for i := 0; i < 1000; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(&testing.T{}, fmt.Sprintf(`[Site="site%d"; Cpus=%d; Memory=%d]`, i%50, i%16, (i%32)*512))); err != nil {
+			b.Fatal(err)
+		}
+	}
+	c.Reindex()
+	const filter = `Site == "site3" && Cpus >= 8 && Memory < 8192`
+
+	b.Run("Parse+Compile", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			if _, err := vm.Parse(filter); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("Probes+planIndex", func(b *testing.B) {
+		q, err := vm.Parse(filter)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			_ = c.planIndex(q.Probes())
+		}
+	})
+	b.Run("Full(Parse+Probes+planIndex)", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			q, err := vm.Parse(filter)
+			if err != nil {
+				b.Fatal(err)
+			}
+			_ = c.planIndex(q.Probes())
+		}
+	})
+}
+
 // --- skip correctness ----------------------------------------------------------
 
 func TestCanSkipValueRanges(t *testing.T) {
