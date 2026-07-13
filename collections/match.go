@@ -39,8 +39,28 @@ type rankedMatch struct {
 // and (for a match) the job's Rank of it. It clears ad's match target afterward so the
 // result is not left pointing at the job.
 func matchOne(m *classad.MatchClassAd, ad *classad.ClassAd) (ok bool, rank float64, hasRank bool) {
+	return matchOneLeftKnown(m, ad, false)
+}
+
+// matchOneLeftKnown is matchOne with an escape hatch: when leftKnownTrue, the left
+// (job) Requirements has already been proven true wire-native by the candidate
+// pre-filter, so the bilateral match only needs the right (slot) Requirements --
+// skipping a redundant tree-walk of the job's Requirements per surviving candidate.
+// The wire-native pre-filter is authoritative exactly when it returned a definitive
+// bool (see matchCandidate), which is the only case that sets leftKnownTrue, so this
+// is result-identical to the full Symmetry.
+func matchOneLeftKnown(m *classad.MatchClassAd, ad *classad.ClassAd, leftKnownTrue bool) (ok bool, rank float64, hasRank bool) {
 	m.ReplaceRightAd(ad)
-	if !m.Match() {
+	var matched bool
+	if leftKnownTrue {
+		rightReq := m.EvaluateAttrRight("Requirements")
+		if b, err := rightReq.BoolValue(); err == nil && b {
+			matched = true
+		}
+	} else {
+		matched = m.Match()
+	}
+	if !matched {
 		ad.SetTarget(nil)
 		return false, 0, false
 	}
@@ -294,14 +314,17 @@ func (c *Collection) matchWindow(t scanTask, mw *matchWorker, dbuf *[]byte, out 
 // decode of a slot the job definitely rejects), then decodes and bilaterally matches
 // the survivor, appending a hit to out.
 func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatch) {
+	leftKnownTrue := false
 	if mw.jm != nil {
 		mw.ms.slot = wire.Ad(w)
 		mw.ms.fellBack = false
 		v := mw.jm.EvalResolved(mw.ms.resolve)
 		if !mw.ms.fellBack && v.IsBool() {
-			if b, _ := v.BoolValue(); !b {
+			b, _ := v.BoolValue()
+			if !b {
 				return // job definitely rejects this slot: skip the decode
 			}
+			leftKnownTrue = true // job definitely accepts: skip the left re-eval below
 		}
 	}
 	node, err := c.decodeWire(w)
@@ -309,7 +332,7 @@ func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatc
 		return
 	}
 	ad := classad.FromAST(node)
-	if ok, r, hr := matchOne(mw.mc, ad); ok {
+	if ok, r, hr := matchOneLeftKnown(mw.mc, ad, leftKnownTrue); ok {
 		*out = append(*out, rankedMatch{ad, r, hr})
 	}
 }
