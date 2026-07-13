@@ -175,9 +175,9 @@ func TestSegStatsExactFromPostings(t *testing.T) {
 // hits only a few segments; min/max stats let every other segment's indexed prefix
 // be skipped without touching its postings. width is the fraction of Seq queried.
 func benchRangeSkip(b *testing.B, width float64) {
-	codec, err := NewZSTDCodec(nil)
-	if err != nil {
-		b.Fatal(err)
+	codec, cerr := NewZSTDCodec(nil)
+	if cerr != nil {
+		b.Fatal(cerr)
 	}
 	c := New(Options{Shards: 8, Codec: codec, ValueAttrs: []string{"Seq"}})
 	const n = 200000
@@ -217,6 +217,67 @@ func benchRangeSkip(b *testing.B, width float64) {
 // segment overlaps, so no segment is skipped (the baseline this is measured against).
 func BenchmarkRangeSkipNarrow(b *testing.B) { benchRangeSkip(b, 0.02) }
 func BenchmarkRangeSkipWide(b *testing.B)   { benchRangeSkip(b, 1.0) }
+
+// benchPlanPerSegment isolates the per-segment planning cost: given one built
+// segment index, how long do the skip test + selectivity-ordered candidate build
+// take (the work repeated per covering segment per query). Compare against the
+// tens of microseconds a full shard query costs to see the planner's share.
+func benchPlanPerSegment(b *testing.B, filter string, cats, vals []string) {
+	ads := make([]string, 20000)
+	for i := range ads {
+		ads[i] = fmt.Sprintf(`[Site="site%d"; Cpus=%d; Memory=%d]`, i%50, i%16, (i%32)*512)
+	}
+	c := New(Options{Shards: 1, CategoricalAttrs: cats, ValueAttrs: vals})
+	for i, s := range ads {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(&testing.T{}, s)); err != nil {
+			b.Fatal(err)
+		}
+	}
+	c.Reindex()
+	var si *segIndex
+	for _, sh := range c.shards {
+		for _, seg := range sh.segs {
+			if seg != nil {
+				if idx := seg.idx.Load(); idx != nil {
+					si = idx
+				}
+			}
+		}
+	}
+	if si == nil {
+		b.Fatal("no segment index built")
+	}
+	usable := c.planIndex(mustQuery(b, filter).Probes())
+	if len(usable) == 0 {
+		b.Fatal("filter produced no usable probes")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if si.skipsPrefix(usable) {
+			continue
+		}
+		_ = si.candidateOffsets(usable)
+	}
+}
+
+// Single indexed probe (the common case: fast-pathed, no ordering) and a
+// three-probe conjunction (ordered by selectivity).
+func BenchmarkPlanPerSegmentOne(b *testing.B) {
+	benchPlanPerSegment(b, `Cpus >= 8`, nil, []string{"Cpus"})
+}
+func BenchmarkPlanPerSegmentThree(b *testing.B) {
+	benchPlanPerSegment(b, `Site == "site3" && Cpus >= 8 && Memory < 8192`,
+		[]string{"Site"}, []string{"Cpus", "Memory"})
+}
+
+// Skippable: the range is entirely above the segment's max Cpus, so skipsPrefix
+// returns true and candidateOffsets is never built. Measures the PURE added-cost
+// of the skip decision (min/max compare) — the whole point is that it is ~ns and
+// buys skipping all 20k records.
+func BenchmarkPlanPerSegmentSkip(b *testing.B) {
+	benchPlanPerSegment(b, `Cpus >= 1000`, nil, []string{"Cpus"})
+}
 
 // --- skip correctness ----------------------------------------------------------
 

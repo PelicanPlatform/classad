@@ -178,6 +178,14 @@ func (si *segIndex) covers(usable []usableProbe) bool {
 // fastest and the widest probes touch the smallest accumulator. nil means "no
 // candidates".
 func (si *segIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
+	// Fast path: 0/1 probe needs no ordering (and allocates no order/est slices),
+	// which is the common single-constraint query.
+	switch len(usable) {
+	case 0:
+		return nil
+	case 1:
+		return si.probeOffsets(usable[0])
+	}
 	order := si.selectivityOrder(usable)
 	var acc *roaring.Bitmap
 	for _, i := range order {
@@ -289,61 +297,52 @@ func (si *segIndex) estCandidates(up usableProbe) float64 {
 	switch up.op {
 	case "==", "in":
 		var sum float64
-		for _, up2 := range splitEqVals(up) {
-			sum += s.estEqual(up2)
+		if up.cat {
+			for _, v := range up.svals {
+				sum += s.estEqualStr(v)
+			}
+		} else {
+			for _, v := range up.fvals {
+				sum += s.estEqualFloat(v)
+			}
 		}
 		return sum + float64(s.exc)
 	case "!=":
 		// Everything except the single excluded value (plus absent/exc rows that the
 		// re-verify handles): close to the full prefix, so it sorts late.
 		if up.cat {
-			return indexable - s.estEqual(up.svals[0]) + float64(s.exc)
+			return indexable - s.estEqualStr(up.svals[0]) + float64(s.exc)
 		}
-		return indexable - s.estEqual(up.fvals[0]) + float64(s.exc)
+		return indexable - s.estEqualFloat(up.fvals[0]) + float64(s.exc)
 	case "<", "<=", ">", ">=":
 		return s.estRange(up.op, up.fvals[0])*indexable + float64(s.exc)
 	}
 	return indexable
 }
 
-// estEqual estimates the record count for one equality value: its exact top-N
-// count if it is a heavy hitter, else the average tail count. key is a string for
-// a categorical stat and a float64 for a value stat.
-func (s *segStats) estEqual(key any) float64 {
+// estEqualStr / estEqualFloat estimate the record count for one equality value:
+// its exact top-N count if it is a heavy hitter, else the average tail count (0 if
+// the bloom, for a categorical, proves the value absent). Kept as two typed
+// helpers so the hot ordering path boxes nothing.
+func (s *segStats) estEqualStr(v string) float64 {
 	for _, e := range s.top {
-		switch k := key.(type) {
-		case string:
-			if e.skey == k {
-				return float64(e.count)
-			}
-		case float64:
-			if e.fkey == k {
-				return float64(e.count)
-			}
+		if e.skey == v {
+			return float64(e.count)
 		}
 	}
-	// Not a heavy hitter: for a categorical value the bloom can prove absence (0).
-	if k, ok := key.(string); ok && s.bloom != nil && !s.bloom.mayContain(hashString(k)) {
+	if s.bloom != nil && !s.bloom.mayContain(hashString(v)) {
 		return 0
 	}
 	return s.avgTailCount()
 }
 
-// splitEqVals yields each equality value of an ==/in probe as an `any` (string for
-// categorical, float64 for value) so estEqual can look it up uniformly.
-func splitEqVals(up usableProbe) []any {
-	if up.cat {
-		out := make([]any, len(up.svals))
-		for i, v := range up.svals {
-			out[i] = v
+func (s *segStats) estEqualFloat(v float64) float64 {
+	for _, e := range s.top {
+		if e.fkey == v {
+			return float64(e.count)
 		}
-		return out
 	}
-	out := make([]any, len(up.fvals))
-	for i, v := range up.fvals {
-		out[i] = v
-	}
-	return out
+	return s.avgTailCount()
 }
 
 // estRange returns the estimated fraction of indexable records passing a range
