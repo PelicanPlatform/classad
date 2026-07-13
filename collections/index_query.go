@@ -1,6 +1,8 @@
 package collections
 
 import (
+	"math"
+	"sort"
 	"strings"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -171,28 +173,215 @@ func (si *segIndex) covers(usable []usableProbe) bool {
 }
 
 // candidateOffsets returns the segment-record offsets satisfying every usable
-// probe (a superset; the store re-verifies). Categorical probes are combined first
-// (a map lookup each), then value/range. nil means "no candidates".
+// probe (a superset; the store re-verifies). Probes are applied most-selective
+// first (by the per-attribute stats estimate) so the roaring intersection shrinks
+// fastest and the widest probes touch the smallest accumulator. nil means "no
+// candidates".
 func (si *segIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
+	order := si.selectivityOrder(usable)
 	var acc *roaring.Bitmap
-	for pass := 0; pass < 2; pass++ {
-		wantCat := pass == 0
-		for _, up := range usable {
-			if up.cat != wantCat {
-				continue
-			}
-			bm := si.probeOffsets(up)
-			if acc == nil {
-				acc = bm
-			} else {
-				acc.And(bm)
-			}
-			if acc.IsEmpty() {
-				return acc
-			}
+	for _, i := range order {
+		bm := si.probeOffsets(usable[i])
+		if acc == nil {
+			acc = bm
+		} else {
+			acc.And(bm)
+		}
+		if acc.IsEmpty() {
+			return acc
 		}
 	}
 	return acc
+}
+
+// selectivityOrder returns indices into usable ordered by ascending estimated
+// candidate count (most selective first). It is a pure ordering heuristic: the
+// AND is commutative, so this never changes the result, only the work. Ties and
+// missing stats fall back to input order for a deterministic plan.
+func (si *segIndex) selectivityOrder(usable []usableProbe) []int {
+	order := make([]int, len(usable))
+	est := make([]float64, len(usable))
+	for i, up := range usable {
+		order[i] = i
+		est[i] = si.estCandidates(up)
+	}
+	sort.SliceStable(order, func(a, b int) bool {
+		return est[order[a]] < est[order[b]]
+	})
+	return order
+}
+
+// statsFor returns the segStats for a probe's attribute, or nil if that segment
+// does not index it (covers() has already been checked in the query path, so this
+// is non-nil there; the guard keeps the estimators safe in isolation).
+func (si *segIndex) statsFor(up usableProbe) *segStats {
+	if up.cat {
+		if cp := si.cat[up.attrID]; cp != nil {
+			return &cp.stats
+		}
+		return nil
+	}
+	if vp := si.val[up.attrID]; vp != nil {
+		return &vp.stats
+	}
+	return nil
+}
+
+// canSkip reports whether the segment's indexed prefix provably holds no record
+// satisfying this probe — so a query whose conjunction includes it can skip the
+// whole prefix and only full-scan the un-indexed tail. It is correctness-critical:
+// it must return true only when certain. Exceptional records (value present but
+// not the indexed literal type) are re-verified candidates, so any exception
+// forbids a skip. Equality/range/membership can skip; `!=` never does.
+func (si *segIndex) canSkip(up usableProbe) bool {
+	s := si.statsFor(up)
+	if s == nil || s.exc > 0 {
+		return false
+	}
+	if up.cat {
+		if up.op != "==" && up.op != "in" {
+			return false
+		}
+		if s.bloom == nil {
+			return false
+		}
+		for _, v := range up.svals {
+			if s.bloom.mayContain(hashString(v)) {
+				return false // a value might be present: cannot skip
+			}
+		}
+		return true
+	}
+	if !s.hasRange {
+		// No numeric record in the prefix (and exc==0): nothing an equality/range
+		// probe could match. A `!=` still matches every non-exc record, so keep it.
+		return up.op != "!="
+	}
+	switch up.op {
+	case "==", "in":
+		for _, t := range up.fvals {
+			if t >= s.min && t <= s.max {
+				return false
+			}
+		}
+		return true
+	case "<":
+		return s.min >= up.fvals[0]
+	case "<=":
+		return s.min > up.fvals[0]
+	case ">":
+		return s.max <= up.fvals[0]
+	case ">=":
+		return s.max < up.fvals[0]
+	}
+	return false
+}
+
+// estCandidates estimates how many records in the indexed prefix this probe would
+// admit (its candidate-bitmap cardinality). Used only to order probes, so a rough
+// estimate is fine; it never affects correctness.
+func (si *segIndex) estCandidates(up usableProbe) float64 {
+	s := si.statsFor(up)
+	if s == nil {
+		return math.MaxFloat64 // unknown: apply last
+	}
+	indexable := float64(s.covered - s.exc)
+	switch up.op {
+	case "==", "in":
+		var sum float64
+		for _, up2 := range splitEqVals(up) {
+			sum += s.estEqual(up2)
+		}
+		return sum + float64(s.exc)
+	case "!=":
+		// Everything except the single excluded value (plus absent/exc rows that the
+		// re-verify handles): close to the full prefix, so it sorts late.
+		if up.cat {
+			return indexable - s.estEqual(up.svals[0]) + float64(s.exc)
+		}
+		return indexable - s.estEqual(up.fvals[0]) + float64(s.exc)
+	case "<", "<=", ">", ">=":
+		return s.estRange(up.op, up.fvals[0])*indexable + float64(s.exc)
+	}
+	return indexable
+}
+
+// estEqual estimates the record count for one equality value: its exact top-N
+// count if it is a heavy hitter, else the average tail count. key is a string for
+// a categorical stat and a float64 for a value stat.
+func (s *segStats) estEqual(key any) float64 {
+	for _, e := range s.top {
+		switch k := key.(type) {
+		case string:
+			if e.skey == k {
+				return float64(e.count)
+			}
+		case float64:
+			if e.fkey == k {
+				return float64(e.count)
+			}
+		}
+	}
+	// Not a heavy hitter: for a categorical value the bloom can prove absence (0).
+	if k, ok := key.(string); ok && s.bloom != nil && !s.bloom.mayContain(hashString(k)) {
+		return 0
+	}
+	return s.avgTailCount()
+}
+
+// splitEqVals yields each equality value of an ==/in probe as an `any` (string for
+// categorical, float64 for value) so estEqual can look it up uniformly.
+func splitEqVals(up usableProbe) []any {
+	if up.cat {
+		out := make([]any, len(up.svals))
+		for i, v := range up.svals {
+			out[i] = v
+		}
+		return out
+	}
+	out := make([]any, len(up.fvals))
+	for i, v := range up.fvals {
+		out[i] = v
+	}
+	return out
+}
+
+// estRange returns the estimated fraction of indexable records passing a range
+// comparison against threshold t, by linear interpolation over [min,max].
+func (s *segStats) estRange(op string, t float64) float64 {
+	if !s.hasRange || s.max <= s.min {
+		if cmpFloat(op, s.min, t) {
+			return 1
+		}
+		return 0
+	}
+	frac := (t - s.min) / (s.max - s.min)
+	if frac < 0 {
+		frac = 0
+	} else if frac > 1 {
+		frac = 1
+	}
+	switch op {
+	case "<", "<=":
+		return frac
+	case ">", ">=":
+		return 1 - frac
+	}
+	return 1
+}
+
+// skipsPrefix reports whether the whole indexed prefix can be skipped for this
+// query: the candidate set is the intersection of the per-probe candidate sets, so
+// if any single probe provably has no candidate (canSkip), the intersection is
+// empty. Cheaper than candidateOffsets for range probes (no key iteration) and the
+// only skip path once postings are dropped from an immutable segment.
+func (si *segIndex) skipsPrefix(usable []usableProbe) bool {
+	for _, up := range usable {
+		if si.canSkip(up) {
+			return true
+		}
+	}
+	return false
 }
 
 // probeOffsets returns a fresh, mutable offset bitmap for one probe.
@@ -322,6 +511,17 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand
 		if si == nil || !si.covers(usable) {
 			if !scanRange(w, 0, w.used) { // no usable index: full-scan the window
 				return false
+			}
+			continue
+		}
+		// Segment skip: if any probe provably has no candidate in the indexed prefix
+		// (min/max out of range, bloom miss), the conjunction is empty there — skip
+		// the prefix and only full-scan the tail written after the index was built.
+		if si.skipsPrefix(usable) {
+			if int(si.upto) < w.used {
+				if !scanRange(w, int(si.upto), w.used) {
+					return false
+				}
 			}
 			continue
 		}

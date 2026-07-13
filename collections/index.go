@@ -176,12 +176,14 @@ func (s *indexSpec) equalIDs(o *indexSpec) bool {
 // (within one segment) that hold it, plus an exceptions bitmap for records whose
 // value is present but not the expected literal type.
 type catPostings struct {
-	post map[string]*roaring.Bitmap
-	exc  *roaring.Bitmap
+	post  map[string]*roaring.Bitmap
+	exc   *roaring.Bitmap
+	stats segStats // filled by finishStats after all records are indexed
 }
 type valPostings struct {
-	post map[float64]*roaring.Bitmap
-	exc  *roaring.Bitmap
+	post  map[float64]*roaring.Bitmap
+	exc   *roaring.Bitmap
+	stats segStats // filled by finishStats after all records are indexed
 }
 
 // segIndex is one segment's immutable index. It covers records at offsets in
@@ -227,6 +229,14 @@ func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segInde
 			si.indexRecord(o, wire.Ad(w), spec)
 		}
 		off += int(total)
+	}
+	// Summarize each attribute's completed postings for segment-skip and
+	// selectivity ordering (see segstats.go). One pass over the distinct values.
+	for _, cp := range si.cat {
+		cp.finishStats()
+	}
+	for _, vp := range si.val {
+		vp.finishStats()
 	}
 	return si
 }
