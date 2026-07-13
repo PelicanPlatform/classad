@@ -1,7 +1,9 @@
 package collections
 
 import (
+	"encoding/binary"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 
@@ -377,6 +379,113 @@ func (c *Collection) twoPassClosureDecodeReuse(a wire.Ad, nodes map[uint32][]byt
 		}
 	}
 	return out
+}
+
+// TestOSPoolHotHeaderCost measures the storage cost of putting the match closure in
+// the hot header: compressed record size with the default (frequency) hot set vs the
+// closure hot set. If the delta is noise against the 26 KB ad, a columnar/delta hot
+// header is premature; if material, it motivates that layout.
+func TestOSPoolHotHeaderCost(t *testing.T) {
+	ads, _ := loadOSPoolAds(t)
+	c, wires := encodeOSPool(t, ads)
+	codec, err := NewZSTDCodec(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rawBase, rawHot, zBase, zHot int
+	for i, ad := range ads {
+		base := c.encodeAd(ad.AST()) // default hot set
+		hot := wire.EncodeWithHot(nil, ad.AST(), c.intern, idSet(c.closureIDs(wire.Ad(wires[i]))))
+		rawBase += len(base)
+		rawHot += len(hot)
+		zBase += len(codec.Compress(nil, base))
+		zHot += len(codec.Compress(nil, hot))
+	}
+	n := len(ads)
+	t.Logf("avg/ad  raw: base=%d closure-hot=%d (+%d B)  zstd: base=%d closure-hot=%d (+%d B, %.2f%%)",
+		rawBase/n, rawHot/n, (rawHot-rawBase)/n, zBase/n, zHot/n, (zHot-zBase)/n,
+		100*float64(zHot-zBase)/float64(zBase))
+}
+
+// TestOSPoolHotHeaderLayout compares hot-header encodings for the closure across all
+// ads: (A) interleaved (id, absOffset) pairs [current], (B) columnar [ids][absOffsets],
+// (C) columnar delta [ids][node-size skips] sorted by (skip,id). Compressed per-record
+// and as one dictionary-free concatenated stream (proxy for a shared-dictionary store),
+// to quantify how much delta+columnar+sort claws back the offset entropy.
+func TestOSPoolHotHeaderLayout(t *testing.T) {
+	ads, _ := loadOSPoolAds(t)
+	c, wires := encodeOSPool(t, ads)
+	codec, err := NewZSTDCodec(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type entry struct {
+		id   uint32
+		off  uint32 // synthetic contiguous offset (prefix sum of preceding sizes)
+		size uint32
+	}
+	var A, B, Cc [][]byte // per-ad header bytes in each layout
+	var catA, catB, catC []byte
+	uv := binary.AppendUvarint
+	for i := range ads {
+		a := wire.Ad(wires[i])
+		var es []entry
+		var off uint32
+		for id := range c.closureIDs(a) {
+			node, ok := a.Lookup(id)
+			if !ok {
+				continue
+			}
+			es = append(es, entry{id, off, uint32(len(node))})
+			off += uint32(len(node))
+		}
+		sort.Slice(es, func(i, j int) bool { return es[i].id < es[j].id })
+		var a1 []byte
+		for _, e := range es {
+			a1 = uv(uv(a1, uint64(e.id)), uint64(e.off))
+		}
+		var b1 []byte
+		for _, e := range es {
+			b1 = uv(b1, uint64(e.id))
+		}
+		for _, e := range es {
+			b1 = uv(b1, uint64(e.off))
+		}
+		sort.Slice(es, func(i, j int) bool {
+			if es[i].size != es[j].size {
+				return es[i].size < es[j].size
+			}
+			return es[i].id < es[j].id
+		})
+		var c1 []byte
+		for _, e := range es {
+			c1 = uv(c1, uint64(e.id))
+		}
+		for _, e := range es {
+			c1 = uv(c1, uint64(e.size)) // node-size skip; prefix-sum reconstructs offsets
+		}
+		A, B, Cc = append(A, a1), append(B, b1), append(Cc, c1)
+		catA, catB, catC = append(catA, a1...), append(catB, b1...), append(catC, c1...)
+	}
+	perRec := func(hs [][]byte) int {
+		n := 0
+		for _, h := range hs {
+			n += len(codec.Compress(nil, h))
+		}
+		return n
+	}
+	raw := func(hs [][]byte) int {
+		n := 0
+		for _, h := range hs {
+			n += len(h)
+		}
+		return n
+	}
+	n := len(ads)
+	t.Logf("per-record zstd avg/ad:  A(interleaved)=%d  B(columnar)=%d  C(columnar+delta+sort)=%d  (raw A=%d)",
+		perRec(A)/n, perRec(B)/n, perRec(Cc)/n, raw(A)/n)
+	t.Logf("concatenated zstd total: A=%d  B=%d  C=%d  (raw A=%d) -- proxy for shared-dictionary store",
+		len(codec.Compress(nil, catA)), len(codec.Compress(nil, catB)), len(codec.Compress(nil, catC)), len(catA))
 }
 
 // hotClosureDecode reads a ClassAd from the hot header alone -- the design where the
