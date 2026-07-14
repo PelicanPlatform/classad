@@ -13,6 +13,7 @@ package db
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
@@ -38,6 +39,23 @@ func Open(dir string) (*DB, error) {
 
 // Close releases the log's resources.
 func (db *DB) Close() error { return db.c.Close() }
+
+// StartMaintenance starts the background self-tuning goroutines (compression
+// dictionary retrain + hot-attribute refresh) on the given interval, returning a stop
+// function. A server owns this rather than the caller polling. See
+// collections.StartAutoRetrain.
+func (db *DB) StartMaintenance(interval time.Duration) (stop func()) {
+	return db.c.StartAutoRetrain(interval, 4096, 32)
+}
+
+// SuggestIndexes samples the store and returns attributes that queries filter on but
+// are not yet indexed (advisory; a server may log or auto-apply them).
+func (db *DB) SuggestIndexes(sampleMax int) []collections.IndexSuggestion {
+	return db.c.SuggestIndexes(sampleMax)
+}
+
+// Len returns the number of committed ads.
+func (db *DB) Len() int { return db.c.Len() }
 
 // LookupClassAd returns the committed ad for key (the hash table, outside any
 // transaction), or (nil, false).
