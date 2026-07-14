@@ -531,6 +531,152 @@ func TestOSPoolHotHeaderLayout(t *testing.T) {
 		len(codec.Compress(nil, catA)), len(codec.Compress(nil, catB)), len(codec.Compress(nil, catC)), len(catA))
 }
 
+// TestOSPoolPrefixLayoutStorage measures the storage effect of the flagHotClosure
+// prefix layout (Phase 1c): the closure as a sorted contiguous prefix with no offset
+// pairs, vs the plain layout. Compressed per-record and concatenated (a shared-
+// dictionary proxy), since the prefix layout's payoff -- dropping ad-specific offsets
+// and stabilizing the byte order across homogeneous ads -- shows up under a dictionary.
+// uvlen returns the encoded length of x as a uvarint.
+func uvlen(x uint64) int {
+	var b [binary.MaxVarintLen64]byte
+	return binary.PutUvarint(b[:], x)
+}
+
+// TestOSPoolHotHeaderVariants explores hot-header encodings WITHOUT touching the
+// entries region (so the node-byte alignment a trained dictionary exploits is
+// preserved). It compares several columnar/delta orderings, each header stream
+// compressed with a dictionary trained on that variant's streams -- the realistic
+// measure. The goal: an encoding whose columns REPEAT across homogeneous ads (so the
+// dictionary dedups them), since absolute byte offsets are unique and drift.
+func TestOSPoolHotHeaderVariants(t *testing.T) {
+	ads, _ := loadOSPoolAds(t)
+	c, wires := encodeOSPool(t, ads)
+
+	type hotEnt struct{ id, off, idx, size uint32 }
+	// Per ad, the hot (closure) entries with byte offset, attr index, and node size.
+	perAd := make([][]hotEnt, len(ads))
+	for i, w := range wires {
+		closure := c.closureIDs(wire.Ad(w))
+		var off, idx uint32
+		var hs []hotEnt
+		wire.Ad(w).ForEach(func(id uint32, node []byte) bool {
+			nodeOff := off + uint32(uvlen(uint64(id)))
+			if closure[id] {
+				hs = append(hs, hotEnt{id, nodeOff, idx, uint32(len(node))})
+			}
+			off += uint32(uvlen(uint64(id))) + uint32(len(node))
+			idx++
+			return true
+		})
+		perAd[i] = hs
+	}
+
+	uv := binary.AppendUvarint
+	// Each variant builds one ad's header bytes from its hot entries.
+	variants := []struct {
+		name  string
+		build func(hs []hotEnt) []byte
+	}{
+		{"V0 interleaved (id,off)", func(hs []hotEnt) []byte {
+			hs = sortBy(hs, func(a, b hotEnt) bool { return a.id < b.id })
+			var o []byte
+			for _, h := range hs {
+				o = uv(uv(o, uint64(h.id)), uint64(h.off))
+			}
+			return o
+		}},
+		{"V1 columnar [ids][offs] id-sort", func(hs []hotEnt) []byte {
+			hs = sortBy(hs, func(a, b hotEnt) bool { return a.id < b.id })
+			var o []byte
+			for _, h := range hs {
+				o = uv(o, uint64(h.id))
+			}
+			for _, h := range hs {
+				o = uv(o, uint64(h.off))
+			}
+			return o
+		}},
+		{"V2 columnar [ids][off-delta] off-sort", func(hs []hotEnt) []byte {
+			hs = sortBy(hs, func(a, b hotEnt) bool { return a.off < b.off })
+			var o []byte
+			for _, h := range hs {
+				o = uv(o, uint64(h.id))
+			}
+			var prev uint32
+			for _, h := range hs {
+				o = uv(o, uint64(h.off-prev))
+				prev = h.off
+			}
+			return o
+		}},
+		{"V3 columnar [ids][index] idx-sort", func(hs []hotEnt) []byte {
+			hs = sortBy(hs, func(a, b hotEnt) bool { return a.idx < b.idx })
+			var o []byte
+			for _, h := range hs {
+				o = uv(o, uint64(h.id))
+			}
+			for _, h := range hs {
+				o = uv(o, uint64(h.idx))
+			}
+			return o
+		}},
+		{"V4 columnar [ids][index-delta] idx-sort", func(hs []hotEnt) []byte {
+			hs = sortBy(hs, func(a, b hotEnt) bool { return a.idx < b.idx })
+			var o []byte
+			for _, h := range hs {
+				o = uv(o, uint64(h.id))
+			}
+			var prev uint32
+			for _, h := range hs {
+				o = uv(o, uint64(h.idx-prev))
+				prev = h.idx
+			}
+			return o
+		}},
+		{"V5 [id-delta][index-delta] id-sort", func(hs []hotEnt) []byte {
+			hs = sortBy(hs, func(a, b hotEnt) bool { return a.id < b.id })
+			var o []byte
+			var pid uint32
+			for _, h := range hs {
+				o = uv(o, uint64(h.id-pid))
+				pid = h.id
+			}
+			// index in id order (not sorted): store raw indices.
+			for _, h := range hs {
+				o = uv(o, uint64(h.idx))
+			}
+			return o
+		}},
+	}
+
+	for _, v := range variants {
+		streams := make([][]byte, len(perAd))
+		raw := 0
+		for i, hs := range perAd {
+			streams[i] = v.build(hs)
+			raw += len(streams[i])
+		}
+		dict, err := TrainDict(streams)
+		if err != nil {
+			t.Skipf("dict training unavailable: %v", err)
+		}
+		codec, _ := NewZSTDCodec(dict)
+		z := 0
+		for _, s := range streams {
+			z += len(codec.Compress(nil, s))
+		}
+		n := len(perAd)
+		t.Logf("%-40s raw=%5.1f B/ad  dict-zstd=%5.2f B/ad", v.name, float64(raw)/float64(n), float64(z)/float64(n))
+	}
+}
+
+// sortBy returns a copy of s sorted by less (small helper to keep variants terse).
+func sortBy[T any](s []T, less func(a, b T) bool) []T {
+	out := append([]T(nil), s...)
+	sort.Slice(out, func(i, j int) bool { return less(out[i], out[j]) })
+	return out
+}
+
 // hotClosureDecode reads a ClassAd from the hot header alone -- the design where the
 // encoder has already placed the match closure in the hot set, so the reader just
 // iterates the hot entries (O(hotCount)) with no scan and no BFS. The transitive
