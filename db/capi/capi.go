@@ -145,6 +145,53 @@ func cadb_lookup_attr(h C.uintptr_t, key, name *C.char, out **C.char) C.int {
 	return cadbOK
 }
 
+// Starts a watch that signals notify_fd (a pipe/eventfd the C side created and polls
+// in DaemonCore) whenever events are queued; drain them with cadb_watch_next. Returns
+// an opaque watch handle, or 0 on error. The fd is owned by the caller (never closed
+// here). Events start from now.
+//
+//export cadb_watch_start
+func cadb_watch_start(h C.uintptr_t, notify_fd C.int) C.uintptr_t {
+	d := cgo.Handle(h).Value().(*db.DB)
+	w, err := db.NewWatcher(d, int(notify_fd), nil)
+	if err != nil {
+		return 0
+	}
+	return C.uintptr_t(cgo.NewHandle(w))
+}
+
+// Dequeues the next watch event without blocking. Returns 1 and fills *out_type (0
+// upsert, 1 delete, 2 reset), *out_key, and *out_ad (a C string, or NULL for a
+// delete/reset) -- both freed with cadb_free; 0 when the queue is empty (drain until
+// then after a wakeup); the key is NULL when 0.
+//
+//export cadb_watch_next
+func cadb_watch_next(h C.uintptr_t, outType *C.int, outKey **C.char, outAd **C.char) C.int {
+	ev, ok := cgo.Handle(h).Value().(*db.Watcher).Next()
+	if !ok {
+		*outKey = nil
+		*outAd = nil
+		return 0
+	}
+	*outType = C.int(ev.Kind)
+	*outKey = C.CString(ev.Key)
+	if ev.Ad != nil {
+		*outAd = C.CString(ev.Ad.String())
+	} else {
+		*outAd = nil
+	}
+	return 1
+}
+
+// Stops and frees a watch handle. The notify fd is not closed.
+//
+//export cadb_watch_stop
+func cadb_watch_stop(h C.uintptr_t) {
+	hd := cgo.Handle(h)
+	hd.Value().(*db.Watcher).Stop()
+	hd.Delete()
+}
+
 // Frees a string returned by the library (e.g. cadb_lookup_attr).
 //
 //export cadb_free

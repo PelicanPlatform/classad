@@ -40,12 +40,13 @@ type DB struct {
 // servers exist they are effectively the same identity, but a follower/replica will
 // share the DB id while carrying its own instance id.
 func Open(dir string) (*DB, error) {
+	opts := collections.Options{Dir: dir, WatchHistory: 4096} // WatchHistory enables Watch
 	var c *collections.Collection
 	if dir == "" {
-		c = collections.New(collections.Options{})
+		c = collections.New(opts)
 	} else {
 		var err error
-		if c, err = collections.Open(collections.Options{Dir: dir}); err != nil {
+		if c, err = collections.Open(opts); err != nil {
 			return nil, err
 		}
 	}
