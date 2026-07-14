@@ -294,3 +294,46 @@ func (c *Client) MatchSorted(jobText string, limit int) ([]string, error) {
 		return putStr(putI32(req(id, opMatchSorted), int32(limit)), jobText)
 	})
 }
+
+// WatchEvent is one change delivered over a Watch. AdText is the ad's old-ClassAd text
+// (empty for a delete/reset). Cursor resumes the watch just after this event.
+type WatchEvent struct {
+	Kind   uint8 // 0 upsert, 1 delete, 2 reset (see db.WatchKind)
+	Key    string
+	AdText string
+	Cursor []byte
+}
+
+// Watch streams changes committed after cursor (nil = from now) on the channel, which
+// closes when the returned stop is called, the connection fails, or the server ends
+// the stream. A full replay leads with a reset event.
+func (c *Client) Watch(cursor []byte) (<-chan WatchEvent, func(), error) {
+	id, frames, err := c.callStream(func(rid uint64) []byte {
+		return putBytes(req(rid, opWatch), cursor)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	events := make(chan WatchEvent, 64)
+	go func() {
+		defer close(events)
+		for frame := range frames {
+			_, status, body, ok := respHeader(frame)
+			if !ok || status != stStream {
+				continue
+			}
+			ev := WatchEvent{Kind: body.u8()}
+			ev.Key = body.str()
+			ev.AdText = body.str()
+			ev.Cursor = append([]byte(nil), body.bytesRef()...)
+			events <- ev
+		}
+	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			_, _, _ = c.call(func(rid uint64) []byte { return putU64(req(rid, opWatchStop), id) })
+		})
+	}
+	return events, stop, nil
+}

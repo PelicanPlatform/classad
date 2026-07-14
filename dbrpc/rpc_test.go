@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 )
@@ -107,6 +108,39 @@ func TestRPCStreamQueryAndMatch(t *testing.T) {
 	// Best-ranked first (Cpus 16).
 	if !strings.Contains(got[0], "Cpus = 16") {
 		t.Fatalf("top match = %q, want the Cpus=16 ad", got[0])
+	}
+}
+
+func TestRPCWatch(t *testing.T) {
+	c, cleanup := testPair(t)
+	defer cleanup()
+	events, stop, err := c.Watch(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stop()
+	time.Sleep(30 * time.Millisecond) // let the server-side watch subscribe
+
+	// A commit over the SAME connection: its ops mux with the streaming watch.
+	tx, _ := c.Begin()
+	_ = tx.NewClassAd("k", "N = 1")
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case ev, ok := <-events:
+			if !ok {
+				t.Fatal("watch channel closed before the k upsert")
+			}
+			if ev.Kind == 0 && ev.Key == "k" && strings.Contains(ev.AdText, "N = 1") {
+				return
+			}
+		case <-deadline:
+			t.Fatal("did not receive the k upsert over the watch")
+		}
 	}
 }
 

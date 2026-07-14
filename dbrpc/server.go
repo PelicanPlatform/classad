@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,10 +48,14 @@ func (s *Server) Close() {
 }
 
 // ServeConn runs the request loop on one connection until it errors or the peer
-// closes. Blocking; run one per accepted connection.
+// closes. Blocking; run one per accepted connection. Watches started on the
+// connection are cancelled when it returns.
 func (s *Server) ServeConn(conn MsgConn) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // stop this connection's watches when it closes
+	sc := &serverConn{s: s, ctx: ctx, watches: make(map[uint64]context.CancelFunc)}
 	var wmu sync.Mutex
-	write := func(b []byte) {
+	sc.write = func(b []byte) {
 		wmu.Lock()
 		_ = conn.WriteMsg(b)
 		wmu.Unlock()
@@ -60,22 +65,83 @@ func (s *Server) ServeConn(conn MsgConn) error {
 		if err != nil {
 			return err
 		}
-		go s.dispatch(frame, write)
+		go sc.dispatch(frame)
 	}
 }
 
-func (s *Server) dispatch(frame []byte, write func([]byte)) {
+// serverConn is per-connection state: the serialized writer, a context cancelled when
+// the connection closes, and the live watches (by their request id) so opWatchStop
+// and connection close can cancel them.
+type serverConn struct {
+	s     *Server
+	ctx   context.Context
+	write func([]byte)
+
+	wmu     sync.Mutex
+	watches map[uint64]context.CancelFunc
+}
+
+func (sc *serverConn) dispatch(frame []byte) {
 	reqID, o, body, ok := reqHeader(frame)
 	if !ok {
 		return // unparseable header: cannot even address a response
 	}
 	switch o {
 	case opQuery:
-		s.streamQuery(reqID, body, write)
+		sc.s.streamQuery(reqID, body, sc.write)
 	case opMatchSorted:
-		s.streamMatchSorted(reqID, body, write)
+		sc.s.streamMatchSorted(reqID, body, sc.write)
+	case opWatch:
+		sc.streamWatch(reqID, body)
+	case opWatchStop:
+		sc.stopWatch(body.u64())
+		sc.write(resp(reqID, stOK))
 	default:
-		write(s.handle(reqID, o, body))
+		sc.write(sc.s.handle(reqID, o, body))
+	}
+}
+
+// streamWatch runs a watch, streaming each event as a frame [kind u8][key][adText]
+// [cursor] under reqID, until the client cancels it (opWatchStop) or the connection
+// closes. cursor empty starts from now.
+func (sc *serverConn) streamWatch(reqID uint64, r *reader) {
+	cursor := append([]byte(nil), r.bytesRef()...)
+	ctx, cancel := context.WithCancel(sc.ctx)
+	sc.wmu.Lock()
+	sc.watches[reqID] = cancel
+	sc.wmu.Unlock()
+	defer func() {
+		sc.wmu.Lock()
+		delete(sc.watches, reqID)
+		sc.wmu.Unlock()
+		cancel()
+	}()
+
+	seq, err := sc.s.db.Watch(ctx, cursor)
+	if err != nil {
+		sc.write(respErr(reqID, err.Error()))
+		return
+	}
+	for ev := range seq {
+		b := putU8(respHead(reqID, stStream), byte(ev.Kind))
+		b = putStr(b, ev.Key)
+		if ev.Ad != nil {
+			b = putStr(b, ev.Ad.String())
+		} else {
+			b = putStr(b, "")
+		}
+		b = putBytes(b, ev.Cursor)
+		sc.write(b)
+	}
+	sc.write(respHead(reqID, stStreamEnd))
+}
+
+func (sc *serverConn) stopWatch(watchReqID uint64) {
+	sc.wmu.Lock()
+	cancel := sc.watches[watchReqID]
+	sc.wmu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 
