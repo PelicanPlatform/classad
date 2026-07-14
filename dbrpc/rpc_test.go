@@ -111,6 +111,41 @@ func TestRPCStreamQueryAndMatch(t *testing.T) {
 	}
 }
 
+func TestRPCOrdered(t *testing.T) {
+	d, err := db.OpenConfig(db.Config{Ordered: []db.OrderSpec{{
+		Partition: "Owner",
+		Keys:      []db.SortKey{{Expr: "JobPrio", Desc: true}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(d)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConn(sconn) }()
+	c := NewClient(cconn)
+	defer func() { c.Close(); s.Close(); d.Close() }()
+
+	tx, _ := c.Begin()
+	_ = tx.NewClassAd("1", "Owner = \"alice\"\nJobPrio = 5")
+	_ = tx.NewClassAd("2", "Owner = \"alice\"\nJobPrio = 10")
+	_ = tx.NewClassAd("3", "Owner = \"bob\"\nJobPrio = 1")
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := c.Ordered(0, "alice")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("Ordered streamed %d rows, want 2", len(rows))
+	}
+	// JobPrio descending: the prio-10 ad first.
+	if !strings.Contains(rows[0].AdText, "JobPrio = 10") {
+		t.Fatalf("first ordered row = %q, want JobPrio 10", rows[0].AdText)
+	}
+}
+
 func TestRPCWatch(t *testing.T) {
 	c, cleanup := testPair(t)
 	defer cleanup()

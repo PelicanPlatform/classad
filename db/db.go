@@ -33,16 +33,53 @@ type DB struct {
 	instance string // this open's instance identity (fresh each Open)
 }
 
-// Open opens a ClassAd log. A non-empty dir makes it persistent (memory-mapped
-// arenas under dir, recovered on reopen); an empty dir is in-memory. Every DB is
-// stamped with a stable DB id (persisted alongside a persistent store, so it
-// survives reopen) and a fresh instance id for this open. Until high-availability DB
-// servers exist they are effectively the same identity, but a follower/replica will
-// share the DB id while carrying its own instance id.
-func Open(dir string) (*DB, error) {
-	opts := collections.Options{Dir: dir, WatchHistory: 4096} // WatchHistory enables Watch
+// OrderSpec, SortKey, OrderedAd, OrderCursor configure and drive maintained ordered
+// indexes (the schedd priority-queue / resource-request-list pattern). Re-exported
+// from collections so callers of db need not import it.
+type (
+	OrderSpec   = collections.OrderSpec
+	SortKey     = collections.SortKey
+	OrderedAd   = collections.OrderedAd
+	OrderCursor = collections.OrderCursor
+)
+
+// Config opens a DB with indexing and ordered-index configuration. Dir empty is
+// in-memory; a non-empty Dir is persistent.
+type Config struct {
+	Dir string
+	// Ordered configures maintained, filtered, sorted indexes -- e.g. the negotiator's
+	// resource-request lists (partition by Owner, sort by JobPrio then QDate), iterated
+	// in order via Ordered. Optional.
+	Ordered []OrderSpec
+	// HotAttrs / CategoricalAttrs / ValueAttrs / MatchClosureRoots tune storage and
+	// query/match push-down (see collections.Options). Optional.
+	HotAttrs                     []string
+	CategoricalAttrs, ValueAttrs []string
+	MatchClosureRoots            []string
+}
+
+// Open opens a ClassAd log with default configuration. A non-empty dir makes it
+// persistent (memory-mapped arenas under dir, recovered on reopen); an empty dir is
+// in-memory. See OpenConfig for indexing / ordered-index configuration.
+func Open(dir string) (*DB, error) { return OpenConfig(Config{Dir: dir}) }
+
+// OpenConfig opens a ClassAd log with the given configuration. Every DB is stamped
+// with a stable DB id (persisted alongside a persistent store, so it survives reopen)
+// and a fresh instance id for this open. Until high-availability DB servers exist they
+// are effectively the same identity, but a follower/replica shares the DB id while
+// carrying its own instance id.
+func OpenConfig(cfg Config) (*DB, error) {
+	opts := collections.Options{
+		Dir:               cfg.Dir,
+		WatchHistory:      4096, // enables Watch
+		Ordered:           cfg.Ordered,
+		HotAttrs:          cfg.HotAttrs,
+		CategoricalAttrs:  cfg.CategoricalAttrs,
+		ValueAttrs:        cfg.ValueAttrs,
+		MatchClosureRoots: cfg.MatchClosureRoots,
+	}
 	var c *collections.Collection
-	if dir == "" {
+	if cfg.Dir == "" {
 		c = collections.New(opts)
 	} else {
 		var err error
@@ -50,7 +87,7 @@ func Open(dir string) (*DB, error) {
 			return nil, err
 		}
 	}
-	return &DB{c: c, id: loadOrCreateDBID(dir), instance: randID()}, nil
+	return &DB{c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID()}, nil
 }
 
 // ID is the stable database identity (same across reopens of a persistent store).
@@ -143,6 +180,15 @@ func (db *DB) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {
 // materialization so only the returned top-N are built.
 func (db *DB) MatchSorted(job *classad.ClassAd, limit int) []*classad.ClassAd {
 	return db.c.MatchSorted(job, limit)
+}
+
+// Ordered iterates one partition of the index-th configured ordered index in sort
+// order (Config.Ordered), yielding each member ad with a resume cursor and its cluster
+// signature (for run-length folding into resource-request lists). partition selects the
+// run (e.g. an Owner); it is ignored for an index with no Partition. A zero resume
+// starts at the beginning. The snapshot is O(1) and stable under concurrent churn.
+func (db *DB) Ordered(index int, partition string, resume OrderCursor) iter.Seq[OrderedAd] {
+	return db.c.Ordered(index, classad.NewStringValue(partition), resume)
 }
 
 // ConflictError reports the keys whose writes lost an optimistic write-write race at

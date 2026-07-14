@@ -91,6 +91,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamQuery(reqID, body, sc.write)
 	case opMatchSorted:
 		sc.s.streamMatchSorted(reqID, body, sc.write)
+	case opOrdered:
+		sc.s.streamOrdered(reqID, body, sc.write)
 	case opWatch:
 		sc.streamWatch(reqID, body)
 	case opWatchStop:
@@ -180,6 +182,24 @@ func (s *Server) streamMatchSorted(reqID uint64, r *reader, write func([]byte)) 
 	}
 	for _, ad := range s.db.MatchSorted(job, int(limit)) {
 		write(putStr(respHead(reqID, stStream), ad.String()))
+	}
+	write(respHead(reqID, stStreamEnd))
+}
+
+// streamOrdered streams one partition of an ordered index in sort order, each ad with
+// its cluster signature (for resource-request-list folding). One-shot: the in-memory
+// resume cursor is not carried over the wire, so a full partition is streamed.
+func (s *Server) streamOrdered(reqID uint64, r *reader, write func([]byte)) {
+	index := r.i32()
+	partition := r.str()
+	if r.err != nil {
+		write(respBad(reqID))
+		return
+	}
+	for oa := range s.db.Ordered(int(index), partition, db.OrderCursor{}) {
+		b := putU64(respHead(reqID, stStream), oa.Signature)
+		b = putStr(b, oa.Ad.String())
+		write(b)
 	}
 	write(respHead(reqID, stStreamEnd))
 }

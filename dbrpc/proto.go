@@ -29,6 +29,7 @@ const (
 	opMatchSorted op = 11 // [limit i32][jobText] -> stream of [adText] (ranked)
 	opWatch       op = 12 // [cursor] -> stream of [eventType u8][key][adText]; long-lived
 	opWatchStop   op = 13 // [watchReqID u64] -> cancels a running opWatch
+	opOrdered     op = 14 // [index i32][partition] -> stream of [signature u64][adText]
 )
 
 // status codes returned in a response frame.

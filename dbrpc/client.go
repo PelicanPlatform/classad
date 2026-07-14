@@ -295,6 +295,41 @@ func (c *Client) MatchSorted(jobText string, limit int) ([]string, error) {
 	})
 }
 
+// OrderedRow is one ad from an ordered scan (old-ClassAd text) with its cluster
+// signature -- run-length-fold equal signatures into a resource-request list.
+type OrderedRow struct {
+	Signature uint64
+	AdText    string
+}
+
+// Ordered streams one partition of the index-th configured ordered index in sort
+// order (the negotiator resource-request path). One-shot: the whole partition is
+// returned (the server-side resume cursor is not carried over the wire).
+func (c *Client) Ordered(index int, partition string) ([]OrderedRow, error) {
+	_, frames, err := c.callStream(func(id uint64) []byte {
+		return putStr(putI32(req(id, opOrdered), int32(index)), partition)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var out []OrderedRow
+	for frame := range frames {
+		_, status, body, ok := respHeader(frame)
+		if !ok {
+			return out, errShort
+		}
+		switch status {
+		case stStream:
+			row := OrderedRow{Signature: body.u64()}
+			row.AdText = body.str()
+			out = append(out, row)
+		case stErr:
+			return out, statusErr(status, body)
+		}
+	}
+	return out, nil
+}
+
 // WatchEvent is one change delivered over a Watch. AdText is the ad's old-ClassAd text
 // (empty for a delete/reset). Cursor resumes the watch just after this event.
 type WatchEvent struct {

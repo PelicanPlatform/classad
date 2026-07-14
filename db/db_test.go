@@ -180,6 +180,42 @@ Rank = TARGET.Cpus`)
 	}
 }
 
+func TestOrdered(t *testing.T) {
+	d, err := OpenConfig(Config{Ordered: []OrderSpec{{
+		Partition: "Owner",
+		Keys:      []SortKey{{Expr: "JobPrio", Desc: true}, {Expr: "QDate"}},
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	tx := d.Begin()
+	tx.NewClassAd("1", mustAd(t, "Owner = \"alice\"\nJobPrio = 5\nQDate = 100"))
+	tx.NewClassAd("2", mustAd(t, "Owner = \"alice\"\nJobPrio = 10\nQDate = 200"))
+	tx.NewClassAd("3", mustAd(t, "Owner = \"bob\"\nJobPrio = 1\nQDate = 300"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// alice's partition, JobPrio descending: job 2 (prio 10) before job 1 (prio 5).
+	var prios []int64
+	for oa := range d.Ordered(0, "alice", OrderCursor{}) {
+		p, _ := oa.Ad.EvaluateAttrInt("JobPrio")
+		prios = append(prios, p)
+	}
+	if len(prios) != 2 || prios[0] != 10 || prios[1] != 5 {
+		t.Fatalf("alice ordered prios = %v, want [10 5]", prios)
+	}
+	// bob's partition has one member.
+	n := 0
+	for range d.Ordered(0, "bob", OrderCursor{}) {
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("bob partition size = %d, want 1", n)
+	}
+}
+
 func TestCommitNondurable(t *testing.T) {
 	d, _ := Open("") // in-memory: nondurable == durable, just exercise the path
 	defer d.Close()

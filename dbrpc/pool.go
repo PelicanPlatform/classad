@@ -55,6 +55,11 @@ func (p *Pool) Watch(cursor []byte) (<-chan WatchEvent, func(), error) {
 	return p.pick().Watch(cursor)
 }
 
+// Ordered streams a partition of an ordered index on a pool connection.
+func (p *Pool) Ordered(index int, partition string) ([]OrderedRow, error) {
+	return p.pick().Ordered(index, partition)
+}
+
 // Close closes every connection. The first close error is returned.
 func (p *Pool) Close() error {
 	var first error
