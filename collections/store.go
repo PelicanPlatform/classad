@@ -34,6 +34,12 @@ type Options struct {
 	// scanning the ad body. Typically the attributes common queries filter on
 	// (e.g. Cpus, Memory, Arch, OpSys, State). Optional.
 	HotAttrs []string
+	// MatchClosureRoots names attributes (typically "Requirements") whose transitive
+	// self-reference closure is front-loaded into each ad's hot header at encode time,
+	// so matching a wide ad reads only the match-relevant attributes (via the hot
+	// header) instead of decoding the whole ad. Optional; enables the hot-closure match
+	// fast path. The frequency/HotAttrs hot set is unioned in, so queries are unaffected.
+	MatchClosureRoots []string
 	// CommitSync, if set, is called once per committed (possibly group-coalesced)
 	// batch on a shard, after the writes are applied — the point at which a future
 	// durable collection would fsync/serialize the batch. Group commit amortizes
@@ -133,7 +139,11 @@ type Collection struct {
 	intern *wire.InternTable            // shared attribute-name interning across the store
 	hotSet atomic.Pointer[hotSetHolder] // interned ids to front-load; swapped by RefreshHotSet
 	spec   atomic.Pointer[indexSpec]    // configured indexes; swapped by AddIndex/DropIndex (never nil after New)
-	dir    string                       // persistence directory; "" ⇒ in-memory (see persist.go)
+
+	// matchRoots (case-folded) are the roots whose closure is front-loaded into the
+	// hot header for the match fast path (Options.MatchClosureRoots); nil if disabled.
+	matchRoots []string
+	dir        string // persistence directory; "" ⇒ in-memory (see persist.go)
 
 	// inline is set for a persistent collection: records store attribute names
 	// inline (no interning), so segment files are self-contained and recoverable.
@@ -272,6 +282,9 @@ func New(opts Options) *Collection {
 			set[c.intern.Intern(name)] = struct{}{}
 		}
 		c.hotSet.Store(&hotSetHolder{set})
+	}
+	for _, r := range opts.MatchClosureRoots {
+		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
 	if opts.WatchHistory > 0 {

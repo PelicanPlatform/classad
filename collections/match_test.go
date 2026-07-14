@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // matchCorpus builds a collection of four slots exercising every match outcome
@@ -196,6 +197,56 @@ func TestMatchClosureDecodeWideAds(t *testing.T) {
 			if _, ok := ad.EvaluateAttrInt("Pad0"); !ok {
 				t.Fatalf("limit=%d: returned ad missing padding attr (not fully materialized)", k)
 			}
+		}
+	}
+}
+
+// TestMatchHotClosure exercises the hot-header match fast path: with MatchClosureRoots
+// configured, wide slot ads are flagged closure-complete and matching reads the closure
+// from the hot header. Verifies the flag is set and MatchSorted results equal a plain
+// (unconfigured) collection's full-decode results.
+func TestMatchHotClosure(t *testing.T) {
+	t.Parallel()
+	build := func(roots []string) *Collection {
+		c := New(Options{Shards: 4, MatchClosureRoots: roots})
+		for i := 0; i < 300; i++ {
+			var b strings.Builder
+			fmt.Fprintf(&b, `Id=%d; Cpus=%d; Memory=%d; Arch="X86_64"; State="Unclaimed"; `,
+				i, (i%16)+1, ((i%16)+1)*1024)
+			fmt.Fprintf(&b, `Start = (Cpus > 0) && (TARGET.RequestMemory <= Memory); `)
+			fmt.Fprintf(&b, `Requirements = Start && (State == "Unclaimed"); `)
+			for k := 0; k < 80; k++ {
+				fmt.Fprintf(&b, `Pad%d = %d; `, k, i*100+k)
+			}
+			if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, "["+b.String()+"]")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return c
+	}
+	hot := build([]string{"Requirements"})
+	plain := build(nil)
+
+	// The encoder must flag a wide ad closure-complete when match roots are configured,
+	// and not otherwise.
+	sample := mustAd(t, `[ Cpus=8; Memory=8192; State="Unclaimed";
+		Start = (Cpus > 0) && (TARGET.RequestMemory <= Memory);
+		Requirements = Start && (State == "Unclaimed"); Pad=1 ]`)
+	if !wire.Ad(hot.encodeAd(sample.AST())).HotClosureComplete() {
+		t.Fatal("expected encoded ad flagged HotClosureComplete with MatchClosureRoots")
+	}
+	if wire.Ad(plain.encodeAd(sample.AST())).HotClosureComplete() {
+		t.Fatal("plain collection must not flag HotClosureComplete")
+	}
+
+	job := mustAd(t, `[ RequestMemory = 4096;
+		Requirements = TARGET.Arch == "X86_64" && TARGET.Cpus >= 2;
+		Rank = TARGET.Cpus + TARGET.Memory / 1024 ]`)
+	for _, k := range []int{1, 5, 20, 0} {
+		gotHot := matchIDs(t, hot.MatchSorted(job, k))
+		gotPlain := matchIDs(t, plain.MatchSorted(job, k))
+		if !sameRanks(t, plain, job, gotHot, gotPlain) {
+			t.Fatalf("limit=%d: hot-closure result differs from plain full-decode\n hot=%v\nplain=%v", k, gotHot, gotPlain)
 		}
 	}
 }

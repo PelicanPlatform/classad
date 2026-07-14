@@ -251,12 +251,17 @@ func TestOSPoolSinglePassMatchesFull(t *testing.T) {
 // forcing full FromAST per candidate).
 func BenchmarkOSPoolMatchSorted(b *testing.B) {
 	ads, _ := loadOSPoolAds(b)
-	c := New(Options{Shards: 8})
-	for i, ad := range ads {
-		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), ad); err != nil {
-			b.Fatal(err)
+	load := func(roots []string) *Collection {
+		c := New(Options{Shards: 8, MatchClosureRoots: roots})
+		for i, ad := range ads {
+			if err := c.Put([]byte(fmt.Sprintf("s%d", i)), ad); err != nil {
+				b.Fatal(err)
+			}
 		}
+		return c
 	}
+	plain := load(nil)                    // full decode / two-pass
+	hot := load([]string{"Requirements"}) // closure in the hot header
 	// A simple wire-native job Requirements (so the deferred survivor path engages) and
 	// a Rank, matching most slots.
 	job, err := classad.ParseOld(`ProjectName = "OSGSpike"
@@ -269,7 +274,7 @@ Rank = TARGET.Cpus`)
 	if err != nil {
 		b.Fatal(err)
 	}
-	run := func(b *testing.B) {
+	run := func(b *testing.B, c *Collection) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			c.MatchSorted(job, 1)
@@ -277,8 +282,9 @@ Rank = TARGET.Cpus`)
 	}
 	saved := closureDecodeMinAttrs
 	defer func() { closureDecodeMinAttrs = saved }()
-	b.Run("ClosureDecodeOff", func(b *testing.B) { closureDecodeMinAttrs = 1 << 30; run(b) })
-	b.Run("ClosureDecodeOn", func(b *testing.B) { closureDecodeMinAttrs = 64; run(b) })
+	b.Run("FullDecode", func(b *testing.B) { closureDecodeMinAttrs = 1 << 30; run(b, plain) })
+	b.Run("TwoPassClosure", func(b *testing.B) { closureDecodeMinAttrs = 64; run(b, plain) })
+	b.Run("HotClosure", func(b *testing.B) { closureDecodeMinAttrs = 64; run(b, hot) })
 }
 
 // closureIDs computes the transitive self-reference closure of "Requirements" as a

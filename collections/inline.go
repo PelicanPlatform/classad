@@ -16,7 +16,8 @@ func (c *Collection) encodeAd(ad *ast.ClassAd) []byte {
 	if c.inline {
 		return wire.EncodeInlineWithHot(nil, ad, c.hotNames)
 	}
-	return wire.EncodeWithHot(nil, ad, c.intern, c.currentHotSet())
+	hot, closureComplete := c.hotSetForEncode(ad)
+	return wire.EncodeWithHotClosure(nil, ad, c.intern, hot, closureComplete)
 }
 
 // decodeWire decodes stored wire bytes back to an ast.ClassAd.

@@ -158,6 +158,13 @@ func (a Ad) ForEach(fn func(id uint32, node []byte) bool) bool {
 	return c.ok
 }
 
+// HotClosureComplete reports whether the ad's hot header holds the complete match
+// closure (flagHotClosure): ForEachHot then yields every attribute the match reads,
+// so the matcher can trust it without scanning the ad body.
+func (a Ad) HotClosureComplete() bool {
+	return len(a) >= 3 && a[0] == magicByte && a[1] == formatVer && a[2]&flagHotClosure != 0
+}
+
 // AttrCount returns the number of attributes stored in the ad (0 if malformed). It
 // reads only the header (past the hot index), so it is cheap enough to gate width-
 // dependent decode strategies.

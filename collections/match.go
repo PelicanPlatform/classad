@@ -295,9 +295,11 @@ type matchWorker struct {
 	// Closure-decode scratch (deferred path, wide interned ads): a partial ClassAd of
 	// just the match closure instead of a full FromAST. Buffers are reused per worker.
 	closureSeeds []string          // Requirements + job Rank's slot refs
+	rankRefs     []string          // job Rank's slot refs (for hot-path top-up)
 	nodeIdx      map[uint32][]byte // id -> node bytes, refilled per candidate
 	seenIDs      map[uint32]bool   // BFS visited set, cleared per candidate
 	closureWork  []uint32          // BFS work stack, reused
+	hotPresent   map[string]bool   // hot-closure names present, cleared per candidate
 }
 
 func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat bool) *matchWorker {
@@ -309,6 +311,7 @@ func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat b
 		mw.jm = jp.req.Matcher()
 		mw.ms = &matchScope{ctx: c, jobVals: jp.vals, inline: c.inline, intern: c.intern}
 		mw.closureSeeds = buildClosureSeeds(jp.rankRefs)
+		mw.rankRefs = jp.rankRefs
 	}
 	return mw
 }
@@ -429,8 +432,14 @@ func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatc
 		// ClassAd of just the match closure, deferring full materialization to the
 		// returned top-N. matchOneLeftKnown on the closure ad is result-identical to
 		// the full ad (the closure holds every attribute Requirements/Rank reads).
+		// Prefer the hot-header read (O(closure), no body scan) when the ad is flagged
+		// closure-complete; else fall back to the cache-free full-ad two-pass.
 		if mw.wantsClosureDecode(w) {
-			if partial := c.closureDecode(w, mw); partial != nil {
+			partial := c.hotClosureMatch(w, mw)
+			if partial == nil {
+				partial = c.closureDecode(w, mw)
+			}
+			if partial != nil {
 				if ok, r, hr := matchOneLeftKnown(mw.mc, partial, true); ok {
 					c.appendSurvivor(mw, w, r, hr, out)
 				}
