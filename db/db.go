@@ -12,29 +12,74 @@
 package db
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"iter"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 // DB is an embedded ClassAd log. Safe for concurrent use.
 type DB struct {
-	c *collections.Collection
+	c        *collections.Collection
+	id       string // stable database identity (persisted; random for in-memory)
+	instance string // this open's instance identity (fresh each Open)
 }
 
 // Open opens a ClassAd log. A non-empty dir makes it persistent (memory-mapped
-// arenas under dir, recovered on reopen); an empty dir is in-memory.
+// arenas under dir, recovered on reopen); an empty dir is in-memory. Every DB is
+// stamped with a stable DB id (persisted alongside a persistent store, so it
+// survives reopen) and a fresh instance id for this open. Until high-availability DB
+// servers exist they are effectively the same identity, but a follower/replica will
+// share the DB id while carrying its own instance id.
 func Open(dir string) (*DB, error) {
+	var c *collections.Collection
 	if dir == "" {
-		return &DB{c: collections.New(collections.Options{})}, nil
+		c = collections.New(collections.Options{})
+	} else {
+		var err error
+		if c, err = collections.Open(collections.Options{Dir: dir}); err != nil {
+			return nil, err
+		}
 	}
-	c, err := collections.Open(collections.Options{Dir: dir})
-	if err != nil {
-		return nil, err
+	return &DB{c: c, id: loadOrCreateDBID(dir), instance: randID()}, nil
+}
+
+// ID is the stable database identity (same across reopens of a persistent store).
+func (db *DB) ID() string { return db.id }
+
+// InstanceID is this open's identity (fresh each Open). Equal in spirit to ID until
+// HA replicas exist, when replicas of one DB share ID but differ by InstanceID.
+func (db *DB) InstanceID() string { return db.instance }
+
+func randID() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+// loadOrCreateDBID reads dir/dbid, creating it with a fresh id on first open. An
+// in-memory DB (empty dir) gets a random, non-persistent id.
+func loadOrCreateDBID(dir string) string {
+	if dir == "" {
+		return randID()
 	}
-	return &DB{c: c}, nil
+	p := filepath.Join(dir, "dbid")
+	if data, err := os.ReadFile(p); err == nil {
+		if s := strings.TrimSpace(string(data)); s != "" {
+			return s
+		}
+	}
+	id := randID()
+	_ = os.WriteFile(p, []byte(id+"\n"), 0o644)
+	return id
 }
 
 // Close releases the log's resources.
@@ -73,6 +118,32 @@ func (db *DB) ForEach(fn func(ad *classad.ClassAd) bool) {
 	}
 }
 
+// Query returns the committed ads matching the constraint expression (an "old
+// ClassAd" boolean expression over each ad, e.g. `JobStatus == 2 && Owner == "alice"`).
+// The store pushes the filter down -- indexed constraints visit only candidates -- so
+// this is far cheaper than ForEach + client-side filtering. Errors only on a malformed
+// constraint.
+func (db *DB) Query(constraint string) (iter.Seq[*classad.ClassAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.Query(q), nil
+}
+
+// Match returns the ads that symmetrically match job (bilateral Requirements), pushed
+// down to the store. For the negotiator's pick-best pattern, prefer MatchSorted.
+func (db *DB) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {
+	return db.c.Match(job)
+}
+
+// MatchSorted returns job's matches ranked by the job's Rank, best first, at most
+// limit (<=0 = all) -- the negotiator resource-request path, with the store's deferred
+// materialization so only the returned top-N are built.
+func (db *DB) MatchSorted(job *classad.ClassAd, limit int) []*classad.ClassAd {
+	return db.c.MatchSorted(job, limit)
+}
+
 // ConflictError reports the keys whose writes lost an optimistic write-write race at
 // commit. The other writes in the transaction committed; the caller re-reads and
 // retries the conflicted keys.
@@ -108,6 +179,14 @@ func (t *Txn) Commit() error {
 		return &ConflictError{Keys: keys}
 	}
 	return nil
+}
+
+// CommitNondurable is Commit that defers the disk durability sync (classad_log.h
+// CommitNondurableTransaction): the writes are visible immediately but their flush is
+// batched to a later durable commit. On an in-memory DB it is identical to Commit.
+func (t *Txn) CommitNondurable() error {
+	t.tx.SetDurable(false)
+	return t.Commit()
 }
 
 // Abort discards the transaction's buffered operations. Nothing is written.

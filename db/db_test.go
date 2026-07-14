@@ -119,6 +119,80 @@ func TestMultipleIndependentTransactions(t *testing.T) {
 	}
 }
 
+func TestDBIDPersists(t *testing.T) {
+	dir := t.TempDir()
+	d1, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, inst := d1.ID(), d1.InstanceID()
+	if id == "" || inst == "" {
+		t.Fatal("empty id/instance")
+	}
+	d1.Close()
+
+	d2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	if d2.ID() != id {
+		t.Fatalf("DB id changed across reopen: %s != %s", d2.ID(), id)
+	}
+	if d2.InstanceID() == inst {
+		t.Fatal("instance id should be fresh each open")
+	}
+}
+
+func TestQueryAndMatchSorted(t *testing.T) {
+	d, _ := Open("")
+	defer d.Close()
+	tx := d.Begin()
+	tx.NewClassAd("s1", mustAd(t, "Cpus = 4\nMemory = 4096\nRequirements = true"))
+	tx.NewClassAd("s2", mustAd(t, "Cpus = 16\nMemory = 8192\nRequirements = true"))
+	tx.NewClassAd("s3", mustAd(t, "Cpus = 8\nMemory = 2048\nRequirements = true"))
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Constraint query (push-down).
+	q, err := d.Query("Cpus >= 8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for range q {
+		n++
+	}
+	if n != 2 {
+		t.Fatalf("Query Cpus>=8 matched %d, want 2", n)
+	}
+
+	// MatchSorted: job wanting >=4 cpus, ranked by Cpus -> s2(16), s3(8), s1(4).
+	job := mustAd(t, `Requirements = TARGET.Cpus >= 4
+Rank = TARGET.Cpus`)
+	got := d.MatchSorted(job, 2)
+	if len(got) != 2 {
+		t.Fatalf("MatchSorted top-2 got %d", len(got))
+	}
+	if c0, _ := got[0].EvaluateAttrInt("Cpus"); c0 != 16 {
+		t.Fatalf("top match Cpus = %d, want 16", c0)
+	}
+}
+
+func TestCommitNondurable(t *testing.T) {
+	d, _ := Open("") // in-memory: nondurable == durable, just exercise the path
+	defer d.Close()
+	tx := d.Begin()
+	tx.NewClassAd("k", mustAd(t, "N = 1"))
+	if err := tx.CommitNondurable(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := d.LookupClassAd("k"); !ok {
+		t.Fatal("nondurable commit not visible")
+	}
+}
+
 func TestForEach(t *testing.T) {
 	db, _ := Open("")
 	defer db.Close()

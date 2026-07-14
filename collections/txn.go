@@ -107,7 +107,7 @@ type txnWrite struct {
 // detection, all under one shard write lock so the check and apply are atomic with
 // respect to other committers (first-committer-wins). Conflicting writes are skipped
 // and flagged; the rest commit at one fresh sequence.
-func (sh *shard) commitTxn(ws []*txnWrite) {
+func (sh *shard) commitTxn(ws []*txnWrite, durable bool) {
 	sh.mu.Lock()
 	seq := sh.commitSeq + 1
 	// Single-writer fast path: all of a shard's buffered writes share one snapshot
@@ -140,7 +140,9 @@ func (sh *shard) commitTxn(ws []*txnWrite) {
 	}
 	sh.mu.Unlock()
 	if changed {
-		sh.sync()
+		if durable {
+			sh.sync()
+		}
 		if sh.hub != nil {
 			for _, w := range ws {
 				if !w.ok {
@@ -162,9 +164,10 @@ func (sh *shard) commitTxn(ws []*txnWrite) {
 // Txn is an optimistic, snapshot-isolation transaction over a Collection. Not safe
 // for concurrent use by multiple goroutines; each goroutine uses its own Txn.
 type Txn struct {
-	c      *Collection
-	snap   map[int]uint64     // shard index -> snapshot seq, captured lazily on first touch
-	writes map[string]*txnBuf // buffered writes by key (last write wins within the txn)
+	c       *Collection
+	snap    map[int]uint64     // shard index -> snapshot seq, captured lazily on first touch
+	writes  map[string]*txnBuf // buffered writes by key (last write wins within the txn)
+	durable bool               // Commit runs the durability sync (default true)
 }
 
 type txnBuf struct {
@@ -187,8 +190,15 @@ func (r CommitResult) Conflicted() bool { return len(r.Conflicts) > 0 }
 // Begin starts an optimistic transaction. Its snapshot for a shard is captured the
 // first time the transaction reads or writes a key in that shard.
 func (c *Collection) Begin() *Txn {
-	return &Txn{c: c, snap: map[int]uint64{}, writes: map[string]*txnBuf{}}
+	return &Txn{c: c, snap: map[int]uint64{}, writes: map[string]*txnBuf{}, durable: true}
 }
+
+// SetDurable controls whether Commit runs the durability sync (default true). A
+// nondurable commit is visible immediately (readers and watchers see it) but its
+// disk flush is deferred to a later durable commit or flush -- the classad_log.h
+// CommitNondurableTransaction batching. No effect on an in-memory collection, whose
+// sync is already a no-op.
+func (tx *Txn) SetDurable(d bool) { tx.durable = d }
 
 // snapOf returns the transaction's snapshot sequence for the shard holding a key,
 // capturing it (the shard's current commit sequence) on first touch.
@@ -278,7 +288,7 @@ func (tx *Txn) Commit() CommitResult {
 	}
 	var res CommitResult
 	for idx, ws := range byShard {
-		tx.c.shards[idx].commitTxn(ws)
+		tx.c.shards[idx].commitTxn(ws, tx.durable)
 		for _, w := range ws {
 			if !w.ok {
 				res.Conflicts = append(res.Conflicts, w.key)
