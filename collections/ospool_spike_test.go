@@ -536,6 +536,44 @@ func TestOSPoolHotHeaderLayout(t *testing.T) {
 // pairs, vs the plain layout. Compressed per-record and concatenated (a shared-
 // dictionary proxy), since the prefix layout's payoff -- dropping ad-specific offsets
 // and stabilizing the byte order across homogeneous ads -- shows up under a dictionary.
+// TestOSPoolClosureStorageCost measures the storage cost of Phase 1b: adding the
+// match closure (~13 attrs) to each ad's hot header, vs a plain ad with an empty hot
+// header. Each layout is compressed with a dictionary trained on its own records (the
+// realistic store). This is the storage paid for the 5.2x hot-header match read.
+func TestOSPoolClosureStorageCost(t *testing.T) {
+	ads, _ := loadOSPoolAds(t)
+	plain := New(Options{Shards: 1})
+	hot := New(Options{Shards: 1, MatchClosureRoots: []string{"Requirements"}})
+	encP := make([][]byte, len(ads))
+	encH := make([][]byte, len(ads))
+	var rawP, rawH, hotAttrs int
+	for i, ad := range ads {
+		encP[i] = plain.encodeAd(ad.AST())
+		encH[i] = hot.encodeAd(ad.AST())
+		rawP += len(encP[i])
+		rawH += len(encH[i])
+		hotAttrs += len(hot.closureIDs(wire.Ad(encH[i])))
+	}
+	measure := func(samples [][]byte) int {
+		dict, err := TrainDict(samples)
+		if err != nil {
+			t.Skipf("dict training unavailable: %v", err)
+		}
+		codec, _ := NewZSTDCodec(dict)
+		z := 0
+		for _, s := range samples {
+			z += len(codec.Compress(nil, s))
+		}
+		return z
+	}
+	n := len(ads)
+	zP, zH := measure(encP), measure(encH)
+	t.Logf("closure attrs/ad: %d", hotAttrs/n)
+	t.Logf("raw:       plain=%d  closure-hot=%d  (+%d B/ad)", rawP/n, rawH/n, (rawH-rawP)/n)
+	t.Logf("dict-zstd:  plain=%d  closure-hot=%d  (+%d B/ad, +%.1f%%)",
+		zP/n, zH/n, (zH-zP)/n, 100*float64(zH-zP)/float64(zP))
+}
+
 // uvlen returns the encoded length of x as a uvarint.
 func uvlen(x uint64) int {
 	var b [binary.MaxVarintLen64]byte
