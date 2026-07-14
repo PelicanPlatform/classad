@@ -32,6 +32,41 @@ const (
 	opOrdered     op = 14 // [index i32][partition] -> stream of [signature u64][adText]
 )
 
+// String names an opcode for diagnostics (e.g. the read-only rejection message).
+func (o op) String() string {
+	switch o {
+	case opBegin:
+		return "Begin"
+	case opCommit:
+		return "Commit"
+	case opAbort:
+		return "Abort"
+	case opNewAd:
+		return "NewClassAd"
+	case opDestroyAd:
+		return "DestroyClassAd"
+	case opSetAttr:
+		return "SetAttribute"
+	case opDeleteAttr:
+		return "DeleteAttribute"
+	case opLookupAd:
+		return "LookupClassAd"
+	case opLookupAttr:
+		return "LookupAttr"
+	case opQuery:
+		return "Query"
+	case opMatchSorted:
+		return "MatchSorted"
+	case opWatch:
+		return "Watch"
+	case opWatchStop:
+		return "WatchStop"
+	case opOrdered:
+		return "Ordered"
+	}
+	return "op(unknown)"
+}
+
 // status codes returned in a response frame.
 const (
 	stOK        int32 = 0

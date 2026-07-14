@@ -146,6 +146,11 @@ func (db *DB) LookupClassAd(key string) (*classad.ClassAd, bool) {
 	return db.c.Get([]byte(key))
 }
 
+// Keys returns every committed key at a consistent snapshot, in no particular
+// order. Useful for administrative enumeration and for a replica that must clear
+// its keyspace before a full re-sync (see the leader-follower replicator).
+func (db *DB) Keys() []string { return db.c.Keys() }
+
 // ForEach calls fn for every committed ad, in no particular order, until fn returns
 // false. It reads a consistent snapshot (concurrent writers do not block it).
 func (db *DB) ForEach(fn func(ad *classad.ClassAd) bool) {

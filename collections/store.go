@@ -487,6 +487,27 @@ func (c *Collection) Len() int {
 	return n
 }
 
+// Keys returns every visible key in the collection at a consistent per-shard
+// snapshot, in no particular order. Structural (parent-only) keys of a chained
+// collection are excluded, matching Scan's output. Each key is a fresh copy the
+// caller owns. Useful for administrative enumeration and for a replica that must
+// clear its keyspace before a full re-sync.
+func (c *Collection) Keys() []string {
+	var out []string
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		forEachVisibleKeyed(s0, wins, func(key, _ []byte, _ Codec) bool {
+			if c.isStructural != nil && c.isStructural(key) {
+				return true // parent-only ads are hidden, as in Scan
+			}
+			out = append(out, string(key))
+			return true
+		})
+		releaseWindows(wins)
+	}
+	return out
+}
+
 // Scan returns an iterator over every ad in the collection. It is scan-exactly-
 // once: each key present at the moment a shard's scan begins is yielded exactly
 // once (never duplicated, never skipped), even while concurrent updates and

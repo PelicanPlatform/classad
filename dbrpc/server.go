@@ -33,6 +33,34 @@ type serverTxn struct {
 // NewServer returns a server over d. The caller owns d's lifetime.
 func NewServer(d *db.DB) *Server { return &Server{db: d} }
 
+// ServeOptions scopes what a single served connection may do. The zero value is
+// full read/write access with private attributes excluded from returned ads
+// (the historical ServeConn behavior). A privilege-scoped front end (e.g. an
+// HTCondor daemon serving READ vs WRITE peers) sets these per connection.
+type ServeOptions struct {
+	// ReadOnly rejects the mutating operations (NewClassAd, DestroyClassAd,
+	// SetAttribute, DeleteAttribute) with an error; reads, snapshots (Begin),
+	// and queries still work. A read-only peer may still Begin/Abort a
+	// transaction to get a stable snapshot for reads.
+	ReadOnly bool
+
+	// IncludePrivate renders returned ads with their private (secret)
+	// attributes intact (classad.StringWithPrivate). When false (the default),
+	// private attributes are stripped from every ad this connection sees, so an
+	// under-privileged peer never learns claim ids and other secrets.
+	IncludePrivate bool
+}
+
+// isMutating reports whether o writes to a transaction (and so is refused on a
+// read-only connection).
+func (o op) isMutating() bool {
+	switch o {
+	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr:
+		return true
+	}
+	return false
+}
+
 // StartMaintenance starts the server-managed background maintenance (dictionary
 // retrain + hot-attribute refresh) on the given interval. Stopped by Close.
 func (s *Server) StartMaintenance(interval time.Duration) {
@@ -49,11 +77,19 @@ func (s *Server) Close() {
 
 // ServeConn runs the request loop on one connection until it errors or the peer
 // closes. Blocking; run one per accepted connection. Watches started on the
-// connection are cancelled when it returns.
+// connection are cancelled when it returns. Equivalent to ServeConnOpts with the
+// zero ServeOptions (full read/write, private attributes excluded).
 func (s *Server) ServeConn(conn MsgConn) error {
+	return s.ServeConnOpts(conn, ServeOptions{})
+}
+
+// ServeConnOpts is ServeConn scoped by opts: a read-only and/or
+// private-stripping view of the same DB. Use it to serve a privilege-scoped
+// peer (e.g. an HTCondor READ-level client) from the same Server.
+func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // stop this connection's watches when it closes
-	sc := &serverConn{s: s, ctx: ctx, watches: make(map[uint64]context.CancelFunc)}
+	sc := &serverConn{s: s, ctx: ctx, opts: opts, watches: make(map[uint64]context.CancelFunc)}
 	var wmu sync.Mutex
 	sc.write = func(b []byte) {
 		wmu.Lock()
@@ -75,6 +111,7 @@ func (s *Server) ServeConn(conn MsgConn) error {
 type serverConn struct {
 	s     *Server
 	ctx   context.Context
+	opts  ServeOptions
 	write func([]byte)
 
 	wmu     sync.Mutex
@@ -86,21 +123,35 @@ func (sc *serverConn) dispatch(frame []byte) {
 	if !ok {
 		return // unparseable header: cannot even address a response
 	}
+	if sc.opts.ReadOnly && o.isMutating() {
+		sc.write(respErr(reqID, "read-only connection: "+o.String()+" not permitted"))
+		return
+	}
+	priv := sc.opts.IncludePrivate
 	switch o {
 	case opQuery:
-		sc.s.streamQuery(reqID, body, sc.write)
+		sc.s.streamQuery(reqID, body, priv, sc.write)
 	case opMatchSorted:
-		sc.s.streamMatchSorted(reqID, body, sc.write)
+		sc.s.streamMatchSorted(reqID, body, priv, sc.write)
 	case opOrdered:
-		sc.s.streamOrdered(reqID, body, sc.write)
+		sc.s.streamOrdered(reqID, body, priv, sc.write)
 	case opWatch:
 		sc.streamWatch(reqID, body)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
 	default:
-		sc.write(sc.s.handle(reqID, o, body))
+		sc.write(sc.s.handle(reqID, o, body, priv))
 	}
+}
+
+// adString renders ad for the wire, including private attributes only when the
+// connection is privileged to see them.
+func adString(ad *classad.ClassAd, includePrivate bool) string {
+	if includePrivate {
+		return ad.StringWithPrivate()
+	}
+	return ad.String()
 }
 
 // streamWatch runs a watch, streaming each event as a frame [kind u8][key][adText]
@@ -128,7 +179,7 @@ func (sc *serverConn) streamWatch(reqID uint64, r *reader) {
 		b := putU8(respHead(reqID, stStream), byte(ev.Kind))
 		b = putStr(b, ev.Key)
 		if ev.Ad != nil {
-			b = putStr(b, ev.Ad.String())
+			b = putStr(b, adString(ev.Ad, sc.opts.IncludePrivate))
 		} else {
 			b = putStr(b, "")
 		}
@@ -150,7 +201,7 @@ func (sc *serverConn) stopWatch(watchReqID uint64) {
 // streamQuery streams the committed ads matching a constraint. Each result is its own
 // frame under reqID, so its frames interleave with other calls' -- no head-of-line
 // blocking -- and end with a terminator.
-func (s *Server) streamQuery(reqID uint64, r *reader, write func([]byte)) {
+func (s *Server) streamQuery(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	constraint := r.str()
 	if r.err != nil {
 		write(respBad(reqID))
@@ -162,13 +213,13 @@ func (s *Server) streamQuery(reqID uint64, r *reader, write func([]byte)) {
 		return
 	}
 	for ad := range seq {
-		write(putStr(respHead(reqID, stStream), ad.String()))
+		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
 	}
 	write(respHead(reqID, stStreamEnd))
 }
 
 // streamMatchSorted streams job's ranked matches (best first, up to limit).
-func (s *Server) streamMatchSorted(reqID uint64, r *reader, write func([]byte)) {
+func (s *Server) streamMatchSorted(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	limit := r.i32()
 	jobText := r.str()
 	if r.err != nil {
@@ -181,7 +232,7 @@ func (s *Server) streamMatchSorted(reqID uint64, r *reader, write func([]byte)) 
 		return
 	}
 	for _, ad := range s.db.MatchSorted(job, int(limit)) {
-		write(putStr(respHead(reqID, stStream), ad.String()))
+		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
 	}
 	write(respHead(reqID, stStreamEnd))
 }
@@ -189,7 +240,7 @@ func (s *Server) streamMatchSorted(reqID uint64, r *reader, write func([]byte)) 
 // streamOrdered streams one partition of an ordered index in sort order, each ad with
 // its cluster signature (for resource-request-list folding). One-shot: the in-memory
 // resume cursor is not carried over the wire, so a full partition is streamed.
-func (s *Server) streamOrdered(reqID uint64, r *reader, write func([]byte)) {
+func (s *Server) streamOrdered(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	index := r.i32()
 	partition := r.str()
 	if r.err != nil {
@@ -198,14 +249,15 @@ func (s *Server) streamOrdered(reqID uint64, r *reader, write func([]byte)) {
 	}
 	for oa := range s.db.Ordered(int(index), partition, db.OrderCursor{}) {
 		b := putU64(respHead(reqID, stStream), oa.Signature)
-		b = putStr(b, oa.Ad.String())
+		b = putStr(b, adString(oa.Ad, includePrivate))
 		write(b)
 	}
 	write(respHead(reqID, stStreamEnd))
 }
 
-// handle executes one request and returns its response frame.
-func (s *Server) handle(reqID uint64, o op, r *reader) []byte {
+// handle executes one request and returns its response frame. includePrivate
+// controls whether ads returned by lookups carry their private attributes.
+func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []byte {
 	switch o {
 	case opBegin:
 		id := s.nextID.Add(1)
@@ -297,7 +349,7 @@ func (s *Server) handle(reqID uint64, o op, r *reader) []byte {
 			if !ok {
 				return resp(reqID, stMissing)
 			}
-			return putStr(resp(reqID, stOK), ad.String())
+			return putStr(resp(reqID, stOK), adString(ad, includePrivate))
 		})
 	}
 	return respBad(reqID)
