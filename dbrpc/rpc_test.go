@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -74,6 +75,38 @@ func TestRPCConflict(t *testing.T) {
 	ce, ok := err.(*db.ConflictError)
 	if !ok || len(ce.Keys) != 1 || ce.Keys[0] != "j" {
 		t.Fatalf("second commit = %v, want ConflictError on j", err)
+	}
+}
+
+func TestRPCStreamQueryAndMatch(t *testing.T) {
+	c, cleanup := testPair(t)
+	defer cleanup()
+	tx, _ := c.Begin()
+	_ = tx.NewClassAd("s1", "Cpus = 4\nRequirements = true")
+	_ = tx.NewClassAd("s2", "Cpus = 16\nRequirements = true")
+	_ = tx.NewClassAd("s3", "Cpus = 8\nRequirements = true")
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := c.Query("Cpus >= 8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("Query streamed %d rows, want 2", len(rows))
+	}
+
+	got, err := c.MatchSorted("Requirements = TARGET.Cpus >= 4\nRank = TARGET.Cpus", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("MatchSorted streamed %d, want 2", len(got))
+	}
+	// Best-ranked first (Cpus 16).
+	if !strings.Contains(got[0], "Cpus = 16") {
+		t.Fatalf("top match = %q, want the Cpus=16 ad", got[0])
 	}
 }
 

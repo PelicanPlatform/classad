@@ -17,14 +17,21 @@ type Client struct {
 	nextReq atomic.Uint64
 
 	mu       sync.Mutex
-	pending  map[uint64]chan []byte
+	pending  map[uint64]*pending
 	closeErr error
+}
+
+// pending is a waiting call: a unary call's channel receives exactly one frame; a
+// stream's channel receives each result frame and is closed on the stream terminator.
+type pending struct {
+	ch     chan []byte
+	stream bool
 }
 
 // NewClient runs the mux over conn. Close (or a transport error) fails all in-flight
 // and future calls.
 func NewClient(conn MsgConn) *Client {
-	c := &Client{conn: conn, pending: make(map[uint64]chan []byte)}
+	c := &Client{conn: conn, pending: make(map[uint64]*pending)}
 	go c.readLoop()
 	return c
 }
@@ -41,12 +48,19 @@ func (c *Client) readLoop() {
 			continue
 		}
 		c.mu.Lock()
-		ch := c.pending[id]
-		delete(c.pending, id)
-		c.mu.Unlock()
-		if ch != nil {
-			ch <- frame
+		p := c.pending[id]
+		if p != nil && (!p.stream || frameStatus(frame) == stStreamEnd) {
+			delete(c.pending, id) // unary call, or the stream's terminator
 		}
+		c.mu.Unlock()
+		if p == nil {
+			continue
+		}
+		if p.stream && frameStatus(frame) == stStreamEnd {
+			close(p.ch)
+			continue
+		}
+		p.ch <- frame // buffered; a slow stream consumer is the only backpressure
 	}
 }
 
@@ -56,8 +70,8 @@ func (c *Client) failAll(err error) {
 	if c.closeErr == nil {
 		c.closeErr = err
 	}
-	for id, ch := range c.pending {
-		close(ch)
+	for id, p := range c.pending {
+		close(p.ch)
 		delete(c.pending, id)
 	}
 }
@@ -68,21 +82,8 @@ func (c *Client) Close() error { return c.conn.Close() }
 // call sends one request (built by build with the assigned id) and waits for its
 // response, returning the status and a reader positioned at the response payload.
 func (c *Client) call(build func(reqID uint64) []byte) (int32, *reader, error) {
-	id := c.nextReq.Add(1)
-	ch := make(chan []byte, 1)
-	c.mu.Lock()
-	if c.closeErr != nil {
-		err := c.closeErr
-		c.mu.Unlock()
-		return 0, nil, err
-	}
-	c.pending[id] = ch
-	c.mu.Unlock()
-
-	if err := c.conn.WriteMsg(build(id)); err != nil {
-		c.mu.Lock()
-		delete(c.pending, id)
-		c.mu.Unlock()
+	ch, err := c.send(build, false)
+	if err != nil {
 		return 0, nil, err
 	}
 	frame, ok := <-ch
@@ -94,6 +95,46 @@ func (c *Client) call(build func(reqID uint64) []byte) (int32, *reader, error) {
 		return 0, nil, errShort
 	}
 	return status, body, nil
+}
+
+// callStream issues a streaming request; the returned channel yields each result
+// frame and is closed at the stream's end (or on connection failure). The reqID is
+// returned so the caller can cancel a long-lived stream (opWatchStop).
+func (c *Client) callStream(build func(reqID uint64) []byte) (uint64, <-chan []byte, error) {
+	id := c.nextReq.Add(1)
+	ch, err := c.sendID(id, build, true)
+	if err != nil {
+		return 0, nil, err
+	}
+	return id, ch, nil
+}
+
+// send assigns a request id, registers the pending call, and writes the request.
+func (c *Client) send(build func(reqID uint64) []byte, stream bool) (chan []byte, error) {
+	return c.sendID(c.nextReq.Add(1), build, stream)
+}
+
+func (c *Client) sendID(id uint64, build func(reqID uint64) []byte, stream bool) (chan []byte, error) {
+	bufSize := 1
+	if stream {
+		bufSize = 256
+	}
+	ch := make(chan []byte, bufSize)
+	c.mu.Lock()
+	if c.closeErr != nil {
+		err := c.closeErr
+		c.mu.Unlock()
+		return nil, err
+	}
+	c.pending[id] = &pending{ch: ch, stream: stream}
+	c.mu.Unlock()
+	if err := c.conn.WriteMsg(build(id)); err != nil {
+		c.mu.Lock()
+		delete(c.pending, id)
+		c.mu.Unlock()
+		return nil, err
+	}
+	return ch, nil
 }
 
 func statusErr(status int32, body *reader) error {
@@ -214,4 +255,42 @@ func (t *Tx) LookupClassAd(key string) (string, bool, error) {
 	default:
 		return "", false, statusErr(status, body)
 	}
+}
+
+// --- streaming reads over the committed store (no transaction) ---
+
+// stream collects a finite streamed read into a slice of old-ClassAd texts.
+func (c *Client) stream(build func(id uint64) []byte) ([]string, error) {
+	_, ch, err := c.callStream(build)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for frame := range ch {
+		_, status, body, ok := respHeader(frame)
+		if !ok {
+			return out, errShort
+		}
+		switch status {
+		case stStream:
+			out = append(out, body.str())
+		case stErr:
+			return out, statusErr(status, body)
+		}
+	}
+	return out, nil
+}
+
+// Query returns the committed ads (old-ClassAd texts) matching a constraint
+// expression. The server streams results; a slow scan does not block other calls.
+func (c *Client) Query(constraint string) ([]string, error) {
+	return c.stream(func(id uint64) []byte { return putStr(req(id, opQuery), constraint) })
+}
+
+// MatchSorted returns job's matches (old-ClassAd texts) ranked best-first, at most
+// limit (<=0 = all).
+func (c *Client) MatchSorted(jobText string, limit int) ([]string, error) {
+	return c.stream(func(id uint64) []byte {
+		return putStr(putI32(req(id, opMatchSorted), int32(limit)), jobText)
+	})
 }

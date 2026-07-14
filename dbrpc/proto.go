@@ -22,16 +22,33 @@ const (
 	opDeleteAttr op = 7 // [txnID][key][name]
 	opLookupAd   op = 8 // [txnID][key] -> [adText]
 	opLookupAttr op = 9 // [txnID][key][name] -> [value]
+
+	// Streaming reads (no txnID: they read the committed store). Each streams zero or
+	// more result frames (stStream) then a terminator (stStreamEnd), all under one id.
+	opQuery       op = 10 // [constraint] -> stream of [adText]
+	opMatchSorted op = 11 // [limit i32][jobText] -> stream of [adText] (ranked)
+	opWatch       op = 12 // [cursor] -> stream of [eventType u8][key][adText]; long-lived
+	opWatchStop   op = 13 // [watchReqID u64] -> cancels a running opWatch
 )
 
 // status codes returned in a response frame.
 const (
-	stOK       int32 = 0
-	stErr      int32 = -1 // generic error; payload is a UTF-8 message
-	stMissing  int32 = -2 // key/attribute absent
-	stConflict int32 = -3 // commit had write-write conflicts; payload = conflicted keys
-	stBadReq   int32 = -4 // malformed request
+	stOK        int32 = 0
+	stErr       int32 = -1 // generic error; payload is a UTF-8 message
+	stMissing   int32 = -2 // key/attribute absent
+	stConflict  int32 = -3 // commit had write-write conflicts; payload = conflicted keys
+	stBadReq    int32 = -4 // malformed request
+	stStream    int32 = 1  // one streamed result frame; more may follow
+	stStreamEnd int32 = 2  // end of a stream (no payload)
 )
+
+// frameStatus reads the status field of a response frame (bytes 8..12).
+func frameStatus(frame []byte) int32 {
+	if len(frame) < 12 {
+		return stErr
+	}
+	return int32(binary.LittleEndian.Uint32(frame[8:]))
+}
 
 // A request frame is [reqID u64][op u8][fields...]; a response frame is
 // [reqID u64][status i32][payload...]. Every field written by putBytes is a u32

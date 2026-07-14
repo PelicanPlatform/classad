@@ -69,7 +69,53 @@ func (s *Server) dispatch(frame []byte, write func([]byte)) {
 	if !ok {
 		return // unparseable header: cannot even address a response
 	}
-	write(s.handle(reqID, o, body))
+	switch o {
+	case opQuery:
+		s.streamQuery(reqID, body, write)
+	case opMatchSorted:
+		s.streamMatchSorted(reqID, body, write)
+	default:
+		write(s.handle(reqID, o, body))
+	}
+}
+
+// streamQuery streams the committed ads matching a constraint. Each result is its own
+// frame under reqID, so its frames interleave with other calls' -- no head-of-line
+// blocking -- and end with a terminator.
+func (s *Server) streamQuery(reqID uint64, r *reader, write func([]byte)) {
+	constraint := r.str()
+	if r.err != nil {
+		write(respBad(reqID))
+		return
+	}
+	seq, err := s.db.Query(constraint)
+	if err != nil {
+		write(respErr(reqID, err.Error()))
+		return
+	}
+	for ad := range seq {
+		write(putStr(respHead(reqID, stStream), ad.String()))
+	}
+	write(respHead(reqID, stStreamEnd))
+}
+
+// streamMatchSorted streams job's ranked matches (best first, up to limit).
+func (s *Server) streamMatchSorted(reqID uint64, r *reader, write func([]byte)) {
+	limit := r.i32()
+	jobText := r.str()
+	if r.err != nil {
+		write(respBad(reqID))
+		return
+	}
+	job, err := classad.ParseOld(jobText)
+	if err != nil {
+		write(respErr(reqID, err.Error()))
+		return
+	}
+	for _, ad := range s.db.MatchSorted(job, int(limit)) {
+		write(putStr(respHead(reqID, stStream), ad.String()))
+	}
+	write(respHead(reqID, stStreamEnd))
 }
 
 // handle executes one request and returns its response frame.
