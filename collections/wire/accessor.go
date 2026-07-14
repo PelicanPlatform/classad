@@ -158,6 +158,26 @@ func (a Ad) ForEach(fn func(id uint32, node []byte) bool) bool {
 	return c.ok
 }
 
+// AttrCount returns the number of attributes stored in the ad (0 if malformed). It
+// reads only the header (past the hot index), so it is cheap enough to gate width-
+// dependent decode strategies.
+func (a Ad) AttrCount() int {
+	c, ok := a.bodyStart()
+	if !ok {
+		return 0
+	}
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	n := c.uvarint()
+	if !c.ok {
+		return 0
+	}
+	return int(n)
+}
+
 // ForEachHot calls fn with the interned id and raw node bytes of each attribute
 // recorded in the hot header, in header order, resolving each via its stored
 // entries-relative offset (no scan). Returns false if fn stopped early or the ad is

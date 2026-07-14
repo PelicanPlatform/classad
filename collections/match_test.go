@@ -3,6 +3,7 @@ package collections
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -144,6 +145,59 @@ func sameRanks(t *testing.T, c *Collection, job *classad.ClassAd, a, b []int) bo
 		}
 	}
 	return true
+}
+
+// TestMatchClosureDecodeWideAds drives the closure-decode path (wide ads, non-literal
+// slot Requirements, deferred MatchSorted): each slot carries >64 attributes but the
+// match reads a small closure. The deferred top-N (which decodes only the closure per
+// candidate) must equal the full ranked result, and the returned ads must be fully
+// materialized (all attributes present).
+func TestMatchClosureDecodeWideAds(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4})
+	for i := 0; i < 300; i++ {
+		var b strings.Builder
+		fmt.Fprintf(&b, `Id=%d; Cpus=%d; Memory=%d; Arch="X86_64"; State="Unclaimed"; `,
+			i, (i%16)+1, ((i%16)+1)*1024)
+		// Non-literal slot Requirements referencing a couple of its own attributes and
+		// the job (TARGET), plus a Start-like indirection.
+		fmt.Fprintf(&b, `Start = (Cpus > 0) && (TARGET.RequestMemory <= Memory); `)
+		fmt.Fprintf(&b, `Requirements = Start && (State == "Unclaimed"); `)
+		// Pad to a wide ad so AttrCount clears the closure-decode threshold.
+		for k := 0; k < 80; k++ {
+			fmt.Fprintf(&b, `Pad%d = %d; `, k, i*100+k)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, "["+b.String()+"]")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := mustAd(t, `[ RequestMemory = 4096;
+		Requirements = TARGET.Arch == "X86_64" && TARGET.Cpus >= 2;
+		Rank = TARGET.Cpus + TARGET.Memory / 1024 ]`)
+
+	full := matchIDs(t, c.MatchSorted(job, 0)) // limit 0: full decode, no deferral
+	if len(full) == 0 {
+		t.Fatal("expected matches")
+	}
+	for _, k := range []int{1, 5, 20} {
+		limited := c.MatchSorted(job, k) // deferred + closure decode
+		want := full
+		if k < len(want) {
+			want = want[:k]
+		}
+		if len(limited) != len(want) {
+			t.Fatalf("limit=%d: got %d, want %d", k, len(limited), len(want))
+		}
+		if !sameRanks(t, c, job, matchIDs(t, limited), want) {
+			t.Fatalf("limit=%d: deferred closure-decode ranks differ from full", k)
+		}
+		// Returned ads are fully materialized, not the partial closure ad.
+		for _, ad := range limited {
+			if _, ok := ad.EvaluateAttrInt("Pad0"); !ok {
+				t.Fatalf("limit=%d: returned ad missing padding attr (not fully materialized)", k)
+			}
+		}
+	}
 }
 
 // TestMatchDoesNotMutateJob checks the caller's job ad is left as it was found.

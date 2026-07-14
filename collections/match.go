@@ -275,6 +275,7 @@ func (c *Collection) compileJobSide(job *classad.ClassAd) *jobPlan {
 		if q := vm.Compile(rankExpr); q.Native() {
 			jp.rank = q
 		}
+		jp.rankRefs = rankSlotRefs(job, jp.vals)
 	}
 	return jp
 }
@@ -290,6 +291,13 @@ type matchWorker struct {
 	rankPresent bool        // job has a Rank attribute
 	deferMat    bool        // defer ClassAd materialization (MatchSorted with a limit)
 	ms          *matchScope
+
+	// Closure-decode scratch (deferred path, wide interned ads): a partial ClassAd of
+	// just the match closure instead of a full FromAST. Buffers are reused per worker.
+	closureSeeds []string          // Requirements + job Rank's slot refs
+	nodeIdx      map[uint32][]byte // id -> node bytes, refilled per candidate
+	seenIDs      map[uint32]bool   // BFS visited set, cleared per candidate
+	closureWork  []uint32          // BFS work stack, reused
 }
 
 func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat bool) *matchWorker {
@@ -300,6 +308,7 @@ func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat b
 	if jp.req != nil {
 		mw.jm = jp.req.Matcher()
 		mw.ms = &matchScope{ctx: c, jobVals: jp.vals, inline: c.inline, intern: c.intern}
+		mw.closureSeeds = buildClosureSeeds(jp.rankRefs)
 	}
 	return mw
 }
@@ -415,6 +424,18 @@ func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatc
 				c.appendSurvivor(mw, w, rank, hasRank, out)
 			}
 			return
+		}
+		// Non-literal slot Requirements on a wide ad: decide + rank on a partial
+		// ClassAd of just the match closure, deferring full materialization to the
+		// returned top-N. matchOneLeftKnown on the closure ad is result-identical to
+		// the full ad (the closure holds every attribute Requirements/Rank reads).
+		if mw.wantsClosureDecode(w) {
+			if partial := c.closureDecode(w, mw); partial != nil {
+				if ok, r, hr := matchOneLeftKnown(mw.mc, partial, true); ok {
+					c.appendSurvivor(mw, w, r, hr, out)
+				}
+				return
+			}
 		}
 	}
 	node, err := c.decodeWire(w)

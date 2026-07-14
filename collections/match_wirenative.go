@@ -33,6 +33,7 @@ type jobPlan struct {
 	req         *vm.Query // job.Requirements, or nil (no wire-native job-side reject)
 	rank        *vm.Query // job.Rank wire-native, or nil
 	rankPresent bool      // job has a Rank attribute (whether or not wire-native)
+	rankRefs    []string  // slot attributes the job Rank reads (for the closure seed)
 	vals        map[string]classad.Value
 }
 

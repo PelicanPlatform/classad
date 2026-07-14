@@ -2,6 +2,7 @@ package collections
 
 import (
 	"encoding/binary"
+	"fmt"
 	"os"
 	"sort"
 	"strings"
@@ -242,6 +243,42 @@ func TestOSPoolSinglePassMatchesFull(t *testing.T) {
 	if mismatch > 0 {
 		t.Fatalf("%d/%d ads: single-pass closure eval != full eval", mismatch, checked)
 	}
+}
+
+// BenchmarkOSPoolMatchSorted is the integrated end-to-end measurement: real OSPool
+// slot ads in a collection, MatchSorted(job, 1) -- the negotiator pick-best shape --
+// with closure decode on (threshold 64, wide ads trigger it) vs off (threshold huge,
+// forcing full FromAST per candidate).
+func BenchmarkOSPoolMatchSorted(b *testing.B) {
+	ads, _ := loadOSPoolAds(b)
+	c := New(Options{Shards: 8})
+	for i, ad := range ads {
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), ad); err != nil {
+			b.Fatal(err)
+		}
+	}
+	// A simple wire-native job Requirements (so the deferred survivor path engages) and
+	// a Rank, matching most slots.
+	job, err := classad.ParseOld(`ProjectName = "OSGSpike"
+RequestCpus = 1
+RequestMemory = 1024
+RequestDisk = 1048576
+RequestGPUs = 0
+Requirements = TARGET.Cpus >= 1
+Rank = TARGET.Cpus`)
+	if err != nil {
+		b.Fatal(err)
+	}
+	run := func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			c.MatchSorted(job, 1)
+		}
+	}
+	saved := closureDecodeMinAttrs
+	defer func() { closureDecodeMinAttrs = saved }()
+	b.Run("ClosureDecodeOff", func(b *testing.B) { closureDecodeMinAttrs = 1 << 30; run(b) })
+	b.Run("ClosureDecodeOn", func(b *testing.B) { closureDecodeMinAttrs = 64; run(b) })
 }
 
 // closureIDs computes the transitive self-reference closure of "Requirements" as a
