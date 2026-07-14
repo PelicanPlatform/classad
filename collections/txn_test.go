@@ -6,6 +6,31 @@ import (
 	"testing"
 )
 
+// TestTxnChainedGet: a transactional Get on a parent/child collection resolves
+// inherited attributes from the parent, at the transaction's snapshot.
+func TestTxnChainedGet(t *testing.T) {
+	c := New(Options{Shards: 4, ParentKeyFor: jobParentKey, IsStructural: jobStructural})
+	_ = c.Put([]byte("1.-1"), mustAd(t, `[ Owner = "alice"; Cmd = "sleep" ]`)) // cluster
+	_ = c.Put([]byte("1.0"), mustAd(t, `[ ProcId = 0 ]`))                      // proc
+
+	tx := c.Begin()
+	ad, ok := tx.Get([]byte("1.0"))
+	if !ok {
+		t.Fatal("txn Get(proc) missing")
+	}
+	owner, _ := ad.EvaluateAttrString("Owner")
+	proc, _ := ad.EvaluateAttrInt("ProcId")
+	if owner != "alice" || proc != 0 {
+		t.Fatalf("chained txn Get = Owner %q ProcId %d, want alice/0", owner, proc)
+	}
+	// Snapshot isolation across the chain: a concurrent parent update is not seen.
+	_ = c.Put([]byte("1.-1"), mustAd(t, `[ Owner = "bob"; Cmd = "sleep" ]`))
+	ad2, _ := tx.Get([]byte("1.0"))
+	if o, _ := ad2.EvaluateAttrString("Owner"); o != "alice" {
+		t.Fatalf("after concurrent parent write, chained snapshot Owner = %q, want alice", o)
+	}
+}
+
 func txnGetInt(t *testing.T, tx *Txn, key, attr string) int64 {
 	t.Helper()
 	ad, ok := tx.Get([]byte(key))
@@ -148,6 +173,54 @@ func TestTxnSingleWriterFastPath(t *testing.T) {
 	b.Commit() // b's shard advanced since its snapshot -> slow path
 	if ConflictChecks()-mid == 0 {
 		t.Fatal("contended commit should have performed a conflict check")
+	}
+}
+
+// TestTxnConflictAfterCompaction is the long-transaction correctness check: a key is
+// deleted after the transaction's snapshot and then compaction reclaims the delete
+// evidence. Walking the (now empty) bucket chain would find no conflict, so the
+// transaction must fall back on the gcFloor watermark and conservatively conflict.
+func TestTxnConflictAfterCompaction(t *testing.T) {
+	c := New(Options{Shards: 1})
+	_ = c.Put([]byte("keep"), mustAd(t, `[ N = 0 ]`)) // a live record for compaction to move
+	_ = c.Put([]byte("k"), mustAd(t, `[ N = 1 ]`))
+	tx := c.Begin()
+	_ = txnGetInt(t, tx, "k", "N") // snapshot before the delete
+	tx.Put([]byte("k"), mustAd(t, `[ N = 2 ]`))
+	// Concurrent delete of k after the snapshot, then compaction drops the tombstone.
+	c.Delete([]byte("k"))
+	c.compactShard(c.shards[0], c.currentCodec())
+	if sh := c.shards[0]; sh.gcFloor == 0 {
+		t.Fatal("compaction did not raise gcFloor")
+	}
+	res := tx.Commit()
+	if !res.Conflicted() {
+		t.Fatal("update of a key deleted-then-compacted after the snapshot must conflict")
+	}
+	if _, ok := c.Get([]byte("k")); ok {
+		t.Fatal("the conflicting update must not have resurrected the deleted key")
+	}
+}
+
+// TestTxnNoSpuriousConflictAfterCompaction: compaction must not turn ordinary
+// read-modify-write of LIVE keys into conflicts -- those are decided exactly by the
+// live record regardless of the gcFloor.
+func TestTxnNoSpuriousConflictAfterCompaction(t *testing.T) {
+	c := New(Options{Shards: 1})
+	for i := 0; i < 20; i++ {
+		_ = c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, `[ N = 0 ]`))
+		_ = c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, `[ N = 1 ]`)) // create dead bytes
+	}
+	c.compactShard(c.shards[0], c.currentCodec()) // raises gcFloor above 0
+	// A fresh transaction updates existing keys -- must all commit (they are live).
+	tx := c.Begin()
+	for i := 0; i < 20; i++ {
+		k := fmt.Sprintf("k%d", i)
+		v := txnGetInt(t, tx, k, "N")
+		tx.Put([]byte(k), mustAd(t, fmt.Sprintf(`[ N = %d ]`, v+1)))
+	}
+	if res := tx.Commit(); res.Conflicted() {
+		t.Fatalf("live-key updates after compaction should not conflict: %+v", res)
 	}
 }
 

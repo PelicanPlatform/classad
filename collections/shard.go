@@ -18,6 +18,13 @@ type shard struct {
 	commitSeq uint64 // bumped once per committed batch; scan snapshots capture it
 	count     int    // number of live keys
 
+	// gcFloor is the commit sequence at the most recent compaction: superseded/delete
+	// evidence at or below it may have been reclaimed. A transaction whose snapshot
+	// predates it cannot prove a currently-absent key was not deleted after its
+	// snapshot, so conflictSince conservatively treats such a write as a conflict.
+	// Guarded by mu.
+	gcFloor uint64
+
 	segSize int
 
 	// Group-commit state (see commit.go), guarded by cmu.

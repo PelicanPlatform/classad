@@ -64,6 +64,7 @@ func (sh *shard) getAt(h uint64, key []byte, s0 uint64) ([]byte, Codec, bool) {
 // after s0 (a later update or delete; delete leaves no new record, so the
 // supersede clause is what catches it). Caller holds at least the read lock.
 func (sh *shard) conflictSince(h uint64, key []byte, s0 uint64) bool {
+	hasLive := false
 	for l := sh.dirGet(h); l.valid(); {
 		seg := sh.segs[l.seg]
 		if bytes.Equal(recKey(seg.data, l.off), key) {
@@ -73,8 +74,18 @@ func (sh *shard) conflictSince(h uint64, key []byte, s0 uint64) bool {
 			if sup := recSuperseded(seg.data, l.off); sup != seqMax && sup > s0 {
 				return true
 			}
+			if recSuperseded(seg.data, l.off) == seqMax {
+				hasLive = true
+			}
 		}
 		l = recNext(seg.data, l.off)
+	}
+	// A currently-absent key whose snapshot predates the last compaction: its delete
+	// evidence may have been reclaimed, so we cannot prove it was not deleted after s0.
+	// Conservatively conflict (the caller retries with a fresh snapshot). A key with a
+	// live record is always decided exactly above, compaction notwithstanding.
+	if !hasLive && s0 < sh.gcFloor {
+		return true
 	}
 	return false
 }
@@ -194,8 +205,28 @@ func (tx *Txn) snapOf(idx int) uint64 {
 }
 
 // Get returns the ad for key as the transaction sees it: its own buffered write if
-// any (read-your-writes), else the version live at the transaction's snapshot.
+// any (read-your-writes), else the version live at the transaction's snapshot. On a
+// chained (parent/child) collection it resolves inherited attributes by merging the
+// parent as of the same snapshot -- mirroring Collection.Get, transactionally.
 func (tx *Txn) Get(key []byte) (*classad.ClassAd, bool) {
+	ad, ok := tx.getOwn(key)
+	if !ok {
+		return nil, false
+	}
+	if tx.c.parentKeyFor != nil {
+		if pk := tx.c.parentKeyFor(key); pk != nil {
+			if parent, ok := tx.getOwn(pk); ok {
+				tx.c.mergeParent(ad, parent)
+			}
+		}
+	}
+	return ad, true
+}
+
+// getOwn reads one key as the transaction sees it (its buffered write, else the
+// snapshot version), without parent chaining. Returns a fresh ad the caller may
+// mutate (buffered writes are returned as-is -- the caller owns the buffered ad).
+func (tx *Txn) getOwn(key []byte) (*classad.ClassAd, bool) {
 	if b, ok := tx.writes[string(key)]; ok {
 		if b.del {
 			return nil, false

@@ -104,21 +104,49 @@ snapshots three shards, not sixteen. Per-shard snapshots are independent and sou
 because ads are independent; there is no cross-shard consistency requirement under
 this workload.
 
+## Chained (parent/child) reads
+
+`Txn.Get` mirrors `Collection.Get` on a chained collection: it resolves the child at
+the snapshot, then merges the parent (as of the same snapshot, and honoring the
+transaction's own buffered parent write) so inherited attributes are visible —
+transactionally consistent. The family is co-located in one shard, so the parent is
+read at the same shard snapshot.
+
+## Long transactions vs compaction (the `gcFloor` watermark)
+
+`conflictSince` walks a key's bucket chain for evidence of a change after `S0`.
+Updates and inserts leave a live record whose `seq > S0` — always found, compaction
+notwithstanding — so a key **with a live record is decided exactly**. The only
+vulnerable case is a **delete**: it leaves no new record, only a supersede on the
+prior version, and compaction reclaims that evidence.
+
+Each shard therefore tracks `gcFloor`, the commit sequence at its most recent
+compaction (below which delete evidence may be gone). At commit, a write to a
+currently-**absent** key whose `S0 < gcFloor` is treated as a **conservative
+conflict** — we cannot prove the key was not deleted after `S0`, so the caller
+retries with a fresh snapshot. This is exact for the common case (short transactions
+never see a compaction, `S0 >= gcFloor`) and safe (it never *misses* a real
+conflict); it only forces a retry of *absent-key* writes on a transaction older than
+a compaction. The single-writer fast path is unaffected: compaction does not bump
+`commitSeq`, so `commitSeq == S0` still means "no write since the snapshot."
+
 ## Known limitations / follow-ups
 
-- **Long transactions vs compaction.** `conflictSince` relies on superseded
-  versions still being in the chain. Compaction reclaims versions below the minimum
-  active snapshot; a transaction must therefore register `S0` as an active snapshot
-  (as scans do) so its conflict evidence is not GC'd. v1 keeps transactions short
-  and documents this; registering txn snapshots with the compactor is the immediate
-  follow-up for long-running transactions.
+- **Evidence preservation (remove the conservative retry).** The `gcFloor` rule
+  conservatively fails absent-key writes on transactions that span a compaction.
+  Eliminating even that retry means compaction *preserving* delete evidence above
+  the oldest active snapshot: an active-snapshot registry (transactions register
+  `S0`, the compactor keeps superseded records with `supersededBySeq > minActiveSnap`
+  and chains them). That is surgery on the compaction rebuild and is the deliberate
+  next step; the conservative watermark ships first because it is correct and does
+  not touch the battle-tested reclaim path.
 - **Cross-shard atomicity.** Independent per-ad commit needs none. A future
   serializable mode spanning shards would need a global sequence or 2-phase commit;
   out of scope.
-- **Group-commit coalescing.** v1 commits a transaction under its own `sh.mu`
-  apply (serialized with `Put`), bypassing the `Put` group-commit coalescer. Since
-  the durability sync is currently a no-op, this is a wash; coalescing txn commits
-  is a later optimization.
+- **Group-commit coalescing.** A transaction commits under its own `sh.mu` apply
+  (serialized with `Put`), bypassing the `Put` group-commit coalescer. Since the
+  durability sync is currently a no-op, this is a wash; coalescing txn commits is a
+  later optimization.
 
 ## Phasing
 

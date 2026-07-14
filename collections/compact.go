@@ -256,6 +256,12 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	if len(dstSegs) > 0 {
 		sh.act = dstSegs[len(dstSegs)-1]
 	}
+	// Superseded records (delete evidence) at or below the current sequence were just
+	// dropped; raise the transaction GC floor so a snapshot older than this can no
+	// longer trust a bucket-chain walk for a currently-absent key (see conflictSince).
+	if sh.commitSeq > sh.gcFloor {
+		sh.gcFloor = sh.commitSeq
+	}
 	sh.mu.Unlock()
 
 	for _, seg := range toReap {
