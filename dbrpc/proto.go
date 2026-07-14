@@ -30,6 +30,14 @@ const (
 	opWatch       op = 12 // [cursor] -> stream of [eventType u8][key][adText]; long-lived
 	opWatchStop   op = 13 // [watchReqID u64] -> cancels a running opWatch
 	opOrdered     op = 14 // [index i32][partition] -> stream of [signature u64][adText]
+
+	// opAggregate is a server-side GROUP BY: the server scans the constraint
+	// match, buckets rows by the group-by column tuple in a hash map, and streams
+	// one row per group. Request: [constraint][nGroup i32]{[col]}[nAgg i32]
+	// {[func u8][arg]}. Response: stream of a frame per group, each carrying the
+	// nGroup group values then the nAgg aggregate values (all as strings, in
+	// order), then a terminator.
+	opAggregate op = 15
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -63,6 +71,8 @@ func (o op) String() string {
 		return "WatchStop"
 	case opOrdered:
 		return "Ordered"
+	case opAggregate:
+		return "Aggregate"
 	}
 	return "op(unknown)"
 }

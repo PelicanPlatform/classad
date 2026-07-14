@@ -135,6 +135,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamMatchSorted(reqID, body, priv, sc.write)
 	case opOrdered:
 		sc.s.streamOrdered(reqID, body, priv, sc.write)
+	case opAggregate:
+		sc.s.streamAggregate(reqID, body, priv, sc.write)
 	case opWatch:
 		sc.streamWatch(reqID, body)
 	case opWatchStop:

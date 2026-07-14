@@ -1094,6 +1094,25 @@ func quantizeScalar(arg Value, rval float64, base Value) Value {
 	return NewRealValue(math.Ceil(rval/rbase) * rbase)
 }
 
+// Sum, Avg, Min, and Max apply HTCondor's ClassAd list-aggregate coercion rules
+// (the sum()/avg()/min()/max() built-ins) to a slice of values: integers stay
+// exact int64 and coerce to real only when a real value is present, booleans
+// coerce to 0/1, undefined elements are skipped, and any error element makes the
+// result an error. min/max are numeric (a string element is an error). An empty
+// or all-undefined list sums/averages to integer 0; min/max of one is undefined.
+// These let callers outside the expression evaluator (e.g. a GROUP BY engine)
+// aggregate with identical semantics.
+func Sum(values []Value) Value { return builtinSum([]Value{NewListValue(values)}) }
+
+// Avg averages values under the ClassAd coercion rules (see Sum).
+func Avg(values []Value) Value { return builtinAvg([]Value{NewListValue(values)}) }
+
+// Min returns the numeric minimum under the ClassAd coercion rules (see Sum).
+func Min(values []Value) Value { return builtinMin([]Value{NewListValue(values)}) }
+
+// Max returns the numeric maximum under the ClassAd coercion rules (see Sum).
+func Max(values []Value) Value { return builtinMax([]Value{NewListValue(values)}) }
+
 // builtinSum sums numeric values in a list
 func builtinSum(args []Value) Value {
 	if len(args) > 1 {
