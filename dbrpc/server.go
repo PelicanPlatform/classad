@@ -205,6 +205,7 @@ func (sc *serverConn) stopWatch(watchReqID uint64) {
 // frame under reqID, so its frames interleave with other calls' -- no head-of-line
 // blocking -- and end with a terminator.
 func (s *Server) streamQuery(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	limit := int(r.i32())
 	constraint := r.str()
 	if r.err != nil {
 		write(respBad(reqID))
@@ -215,8 +216,15 @@ func (s *Server) streamQuery(reqID uint64, r *reader, includePrivate bool, write
 		write(respErr(reqID, err.Error()))
 		return
 	}
+	// Push LIMIT down: stopping the range stops the underlying scan, so a small
+	// LIMIT does proportionally less work instead of scanning everything.
+	n := 0
 	for ad := range seq {
 		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
+		n++
+		if limit > 0 && n >= limit {
+			break
+		}
 	}
 	write(respHead(reqID, stStreamEnd))
 }

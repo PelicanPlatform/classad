@@ -115,6 +115,46 @@ func BenchmarkQueryDecodeOnly(b *testing.B) {
 	}
 }
 
+// BenchmarkQueryLimit1 vs BenchmarkQueryAll: with matches present, a pushed-down
+// LIMIT 1 stops the scan at the first match instead of scanning every ad.
+func BenchmarkQueryLimit1(b *testing.B) {
+	d := benchDB(b, benchN)
+	defer d.Close()
+	s := NewServer(d)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConn(sconn) }()
+	c := NewClient(cconn)
+	defer func() { c.Close(); s.Close() }()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := c.QueryLimit("RequestCpus >= 1", 1) // matches every ad
+		if err != nil || len(rows) != 1 {
+			b.Fatalf("rows=%d err=%v, want 1", len(rows), err)
+		}
+	}
+}
+
+func BenchmarkQueryAll(b *testing.B) {
+	d := benchDB(b, benchN)
+	defer d.Close()
+	s := NewServer(d)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConn(sconn) }()
+	c := NewClient(cconn)
+	defer func() { c.Close(); s.Close() }()
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		rows, err := c.QueryLimit("RequestCpus >= 1", 0)
+		if err != nil || len(rows) != benchN {
+			b.Fatalf("rows=%d err=%v, want %d", len(rows), err, benchN)
+		}
+	}
+}
+
 // BenchmarkQueryScanNoDecode measures the constraint scan without the caller
 // touching the yielded ad, to separate the match/scan cost from the per-ad
 // decode the aggregate forces by yielding a *classad.ClassAd.

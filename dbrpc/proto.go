@@ -25,7 +25,7 @@ const (
 
 	// Streaming reads (no txnID: they read the committed store). Each streams zero or
 	// more result frames (stStream) then a terminator (stStreamEnd), all under one id.
-	opQuery       op = 10 // [constraint] -> stream of [adText]
+	opQuery       op = 10 // [limit i32][constraint] -> stream of [adText] (limit<=0 = all)
 	opMatchSorted op = 11 // [limit i32][jobText] -> stream of [adText] (ranked)
 	opWatch       op = 12 // [cursor] -> stream of [eventType u8][key][adText]; long-lived
 	opWatchStop   op = 13 // [watchReqID u64] -> cancels a running opWatch

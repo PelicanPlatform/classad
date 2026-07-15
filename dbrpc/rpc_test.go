@@ -54,6 +54,28 @@ func TestRPCRoundTrip(t *testing.T) {
 	_ = tx2.Abort()
 }
 
+func TestRPCQueryLimit(t *testing.T) {
+	c, cleanup := testPair(t)
+	defer cleanup()
+	tx, _ := c.Begin()
+	for i := 0; i < 100; i++ {
+		_ = tx.NewClassAd(fmt.Sprintf("k%d", i), "Cpus = 4")
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := c.QueryLimit("Cpus == 4", 5); err != nil || len(rows) != 5 {
+		t.Fatalf("QueryLimit(5) = %d rows, %v; want 5", len(rows), err)
+	}
+	if rows, err := c.QueryLimit("Cpus == 4", 0); err != nil || len(rows) != 100 {
+		t.Fatalf("QueryLimit(0) = %d rows, %v; want 100", len(rows), err)
+	}
+	// A limit larger than the match count returns all matches.
+	if rows, err := c.QueryLimit("Cpus == 4", 500); err != nil || len(rows) != 100 {
+		t.Fatalf("QueryLimit(500) = %d rows, %v; want 100", len(rows), err)
+	}
+}
+
 func TestRPCConflict(t *testing.T) {
 	c, cleanup := testPair(t)
 	defer cleanup()

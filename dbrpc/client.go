@@ -284,7 +284,16 @@ func (c *Client) stream(build func(id uint64) []byte) ([]string, error) {
 // Query returns the committed ads (old-ClassAd texts) matching a constraint
 // expression. The server streams results; a slow scan does not block other calls.
 func (c *Client) Query(constraint string) ([]string, error) {
-	return c.stream(func(id uint64) []byte { return putStr(req(id, opQuery), constraint) })
+	return c.QueryLimit(constraint, 0)
+}
+
+// QueryLimit is Query that stops after at most limit matching ads (limit <= 0 =
+// all). The limit is pushed to the server, which stops the scan early -- so
+// LIMIT does less work, not the same work truncated on the client.
+func (c *Client) QueryLimit(constraint string, limit int) ([]string, error) {
+	return c.stream(func(id uint64) []byte {
+		return putStr(putI32(req(id, opQuery), int32(limit)), constraint)
+	})
 }
 
 // MatchSorted returns job's matches (old-ClassAd texts) ranked best-first, at most
