@@ -119,6 +119,9 @@ func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader,
 			return
 		}
 		resFilter = f
+		// The WHERE TARGET filter is applied to matched candidates outside the scan
+		// path, so record its demand explicitly for SuggestIndexes on the resource table.
+		resDB.RecordDemand(targetWhere)
 	}
 
 	// candidatesFor returns a request's full ranked candidate list (best first),

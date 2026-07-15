@@ -151,6 +151,13 @@ const (
 	kindDominanceFrac = 0.8
 )
 
+// RecordDemand notes the attributes a constraint filters on (for SuggestIndexes)
+// without running a scan. Query records demand automatically; this is for callers that
+// filter outside the normal scan path -- e.g. cross-table MATCH applying a resource-side
+// (WHERE TARGET) constraint to already-matched candidates -- so those attributes still
+// surface as index suggestions.
+func (c *Collection) RecordDemand(probes []vm.Probe) { c.demand.record(probes) }
+
 // SuggestIndexes recommends value/categorical indexes from observed query demand
 // and a sample of up to sampleMax live ads. It is advisory: apply the returned
 // CategoricalAttrs/ValueAttrs via New (or a future dynamic Reindex). Attributes

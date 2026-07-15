@@ -156,8 +156,16 @@ func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []ranke
 		return c.serialScanMatches(job) // chained: need Scan's flatten/hide-structural view
 	}
 	jp := c.compileJobSide(job)
-	if usable := c.matchIndexPlan(job, jp.vals); len(usable) > 0 {
-		return c.indexedMatches(job, usable, jp, deferMat)
+	// Record the slot-side probes as resource-index demand -- even when nothing is
+	// indexed yet -- so SuggestIndexes/.suggest can recommend indexing the attributes
+	// the match filters slots on. When an index already covers them, use it to visit
+	// only candidate slots (the pushdown); otherwise scan.
+	probes := c.slotProbes(job, jp.vals)
+	c.demand.record(probes)
+	if c.spec.Load().any() {
+		if usable := c.planIndex(probes); len(usable) > 0 {
+			return c.indexedMatches(job, usable, jp, deferMat)
+		}
 	}
 	return c.taskMatches(job, jp, deferMat)
 }

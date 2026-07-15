@@ -25,12 +25,20 @@ func (c *Collection) matchIndexPlan(job *classad.ClassAd, jobVals map[string]cla
 	if !c.spec.Load().any() {
 		return nil // no indexes configured: nothing to plan against
 	}
+	return c.planIndex(c.slotProbes(job, jobVals))
+}
+
+// slotProbes rewrites the job's Requirements into a slot-side predicate and extracts
+// its index-satisfiable probes: the resource attributes the match filters slots on.
+// They drive the candidate pre-filter (matchIndexPlan) when covered by an index, and
+// -- recorded as demand even when nothing is indexed -- let SuggestIndexes recommend
+// indexing exactly those attributes to speed the match.
+func (c *Collection) slotProbes(job *classad.ClassAd, jobVals map[string]classad.Value) []vm.Probe {
 	reqExpr := jobRequirementsExpr(job)
 	if reqExpr == nil {
 		return nil
 	}
-	slotExpr := rewriteForSlot(reqExpr, jobVals)
-	return c.planIndex(vm.Compile(slotExpr).Probes())
+	return vm.Compile(rewriteForSlot(reqExpr, jobVals)).Probes()
 }
 
 // rewriteForSlot turns the job's Requirements into an equivalent predicate over a

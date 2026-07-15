@@ -537,3 +537,28 @@ func benchmarkMatchSelective(b *testing.B, indexed bool) {
 
 func BenchmarkMatchSelectiveFullScan(b *testing.B) { benchmarkMatchSelective(b, false) }
 func BenchmarkMatchSelectiveIndexed(b *testing.B)  { benchmarkMatchSelective(b, true) }
+
+// TestMatchRecordsResourceDemand verifies that matchmaking records the slot-side
+// probes (the attributes a job's Requirements constrain on the slot) as resource-side
+// index demand -- even with no index configured -- so SuggestIndexes can recommend
+// indexing exactly those attributes to speed the match.
+func TestMatchRecordsResourceDemand(t *testing.T) {
+	machines := New(Options{Shards: 2}) // no indexes configured
+	for i := 0; i < 40; i++ {
+		machines.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Name="m%d"; Arch="X86_64"; Memory=%d; Requirements=true ]`, i, (i%8+1)*1024)))
+	}
+	job := mustAd(t, `[ RequestMemory=2048; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Memory >= RequestMemory); Rank = TARGET.Memory ]`)
+	_ = machines.MatchSortedRanked(job, 4)
+
+	byAttr := map[string]IndexSuggestion{}
+	for _, s := range machines.SuggestIndexes(1000) {
+		byAttr[s.Attr] = s
+	}
+	if a, ok := byAttr["Arch"]; !ok || a.Kind != "categorical" || a.QueriesEq == 0 {
+		t.Errorf("want a categorical Arch suggestion from the match, got %+v", byAttr["Arch"])
+	}
+	if m, ok := byAttr["Memory"]; !ok || m.Kind != "value" || m.QueriesRange == 0 {
+		t.Errorf("want a value Memory suggestion from the match, got %+v", byAttr["Memory"])
+	}
+}

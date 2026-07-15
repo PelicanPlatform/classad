@@ -284,6 +284,19 @@ func (db *DB) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {
 	return db.c.Match(job)
 }
 
+// RecordDemand notes the attributes constraint filters on (for index suggestions)
+// without scanning. Use it for filters applied outside the normal Query path -- e.g. a
+// MATCH's resource-side WHERE TARGET constraint -- so those attributes still surface in
+// SuggestIndexes. A malformed constraint is ignored.
+func (db *DB) RecordDemand(constraint string) {
+	if constraint == "" {
+		return
+	}
+	if q, err := vm.Parse(constraint); err == nil {
+		db.c.RecordDemand(q.Probes())
+	}
+}
+
 // MatchSorted returns job's matches ranked by the job's Rank, best first, at most
 // limit (<=0 = all) -- the negotiator resource-request path, with the store's deferred
 // materialization so only the returned top-N are built.
