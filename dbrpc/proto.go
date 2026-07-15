@@ -39,10 +39,15 @@ const (
 	// order), then a terminator.
 	opAggregate op = 15
 
-	// Diagnostics and index/hot-set management.
-	opDiag    op = 16 // -> [json Diagnostics] (storage stats, hot attrs, indexes, suggestions)
-	opExplain op = 17 // [constraint] -> [json db.QueryExplain] (query access path)
-	opAdmin   op = 18 // [action][nArgs i32]{[arg]} -> [message]; mutating (refused read-only)
+	// Diagnostics and index/hot-set management. Each carries a leading [table].
+	opDiag    op = 16 // [table] -> [json Diagnostics] (storage stats, hot attrs, indexes, suggestions)
+	opExplain op = 17 // [table][constraint] -> [json db.QueryExplain] (query access path)
+	opAdmin   op = 18 // [table][action][nArgs i32]{[arg]} -> [message]; mutating (refused read-only)
+
+	// Table catalog management.
+	opCreateTable op = 19 // [table] -> status; mutating
+	opDropTable   op = 20 // [table] -> status; mutating
+	opListTables  op = 21 // -> [n i32]{[name]}
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -84,6 +89,12 @@ func (o op) String() string {
 		return "Explain"
 	case opAdmin:
 		return "Admin"
+	case opCreateTable:
+		return "CreateTable"
+	case opDropTable:
+		return "DropTable"
+	case opListTables:
+		return "ListTables"
 	}
 	return "op(unknown)"
 }

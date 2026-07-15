@@ -152,9 +152,12 @@ type Tx struct {
 	id uint64
 }
 
-// Begin starts a new independent transaction.
-func (c *Client) Begin() (*Tx, error) {
-	status, body, err := c.call(func(id uint64) []byte { return req(id, opBegin) })
+// Begin starts a new independent transaction on the default table ("ads").
+func (c *Client) Begin() (*Tx, error) { return c.BeginTable(DefaultTable) }
+
+// BeginTable starts a new independent transaction on the named table.
+func (c *Client) BeginTable(table string) (*Tx, error) {
+	status, body, err := c.call(func(id uint64) []byte { return putStr(req(id, opBegin), table) })
 	if err != nil {
 		return nil, err
 	}
@@ -281,26 +284,37 @@ func (c *Client) stream(build func(id uint64) []byte) ([]string, error) {
 	return out, nil
 }
 
-// Query returns the committed ads (old-ClassAd texts) matching a constraint
-// expression. The server streams results; a slow scan does not block other calls.
+// Query returns the committed ads (old-ClassAd texts) in the default table ("ads")
+// matching a constraint. The server streams results; a slow scan does not block
+// other calls.
 func (c *Client) Query(constraint string) ([]string, error) {
-	return c.QueryLimit(constraint, 0)
+	return c.QueryTable(DefaultTable, constraint, 0)
 }
 
-// QueryLimit is Query that stops after at most limit matching ads (limit <= 0 =
-// all). The limit is pushed to the server, which stops the scan early -- so
-// LIMIT does less work, not the same work truncated on the client.
+// QueryLimit is Query with a row cap (<= 0 = all) on the default table.
 func (c *Client) QueryLimit(constraint string, limit int) ([]string, error) {
+	return c.QueryTable(DefaultTable, constraint, limit)
+}
+
+// QueryTable returns the committed ads in the named table matching constraint,
+// stopping after at most limit matches (<= 0 = all). The limit is pushed to the
+// server, which stops the scan early.
+func (c *Client) QueryTable(table, constraint string, limit int) ([]string, error) {
 	return c.stream(func(id uint64) []byte {
-		return putStr(putI32(req(id, opQuery), int32(limit)), constraint)
+		return putStr(putI32(putStr(req(id, opQuery), table), int32(limit)), constraint)
 	})
 }
 
-// MatchSorted returns job's matches (old-ClassAd texts) ranked best-first, at most
-// limit (<=0 = all).
+// MatchSorted returns job's matches in the default table, ranked best-first, at
+// most limit (<=0 = all).
 func (c *Client) MatchSorted(jobText string, limit int) ([]string, error) {
+	return c.MatchSortedTable(DefaultTable, jobText, limit)
+}
+
+// MatchSortedTable returns job's ranked matches in the named table.
+func (c *Client) MatchSortedTable(table, jobText string, limit int) ([]string, error) {
 	return c.stream(func(id uint64) []byte {
-		return putStr(putI32(req(id, opMatchSorted), int32(limit)), jobText)
+		return putStr(putI32(putStr(req(id, opMatchSorted), table), int32(limit)), jobText)
 	})
 }
 
@@ -315,8 +329,13 @@ type OrderedRow struct {
 // order (the negotiator resource-request path). One-shot: the whole partition is
 // returned (the server-side resume cursor is not carried over the wire).
 func (c *Client) Ordered(index int, partition string) ([]OrderedRow, error) {
+	return c.OrderedTable(DefaultTable, index, partition)
+}
+
+// OrderedTable streams one partition of an ordered index in the named table.
+func (c *Client) OrderedTable(table string, index int, partition string) ([]OrderedRow, error) {
 	_, frames, err := c.callStream(func(id uint64) []byte {
-		return putStr(putI32(req(id, opOrdered), int32(index)), partition)
+		return putStr(putI32(putStr(req(id, opOrdered), table), int32(index)), partition)
 	})
 	if err != nil {
 		return nil, err
@@ -352,8 +371,13 @@ type WatchEvent struct {
 // closes when the returned stop is called, the connection fails, or the server ends
 // the stream. A full replay leads with a reset event.
 func (c *Client) Watch(cursor []byte) (<-chan WatchEvent, func(), error) {
+	return c.WatchTable(DefaultTable, cursor)
+}
+
+// WatchTable streams changes to the named table.
+func (c *Client) WatchTable(table string, cursor []byte) (<-chan WatchEvent, func(), error) {
 	id, frames, err := c.callStream(func(rid uint64) []byte {
-		return putBytes(req(rid, opWatch), cursor)
+		return putBytes(putStr(req(rid, opWatch), table), cursor)
 	})
 	if err != nil {
 		return nil, nil, err

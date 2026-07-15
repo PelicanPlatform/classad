@@ -23,16 +23,16 @@ type Diagnostics struct {
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
 const diagSampleMax = 2000
 
-// diagJSON gathers the server's diagnostics into JSON.
-func (s *Server) diagJSON() ([]byte, error) {
-	cat, val := s.db.IndexedAttrs()
+// diagJSON gathers a table's diagnostics into JSON.
+func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
+	cat, val := t.IndexedAttrs()
 	d := Diagnostics{
-		Stats:              s.db.Stats(),
-		Hot:                s.db.HotAttrs(),
+		Stats:              t.Stats(),
+		Hot:                t.HotAttrs(),
 		CategoricalIndexes: cat,
 		ValueIndexes:       val,
-		Suggestions:        s.db.SuggestIndexes(diagSampleMax),
-		DropSuggestions:    s.db.SuggestDrops(diagSampleMax),
+		Suggestions:        t.SuggestIndexes(diagSampleMax),
+		DropSuggestions:    t.SuggestDrops(diagSampleMax),
 	}
 	return json.Marshal(d)
 }
@@ -47,41 +47,41 @@ func (s *Server) diagJSON() ([]byte, error) {
 //	hot.refresh <sampleMax> <topN>    recompute the hot set from sampled frequency
 //	compact                           reclaim dead space in warranted shards
 //	rewrite                           re-encode all ads with the current hot set
-func (s *Server) admin(action string, args []string) (string, error) {
+func (s *Server) admin(t *db.DB, action string, args []string) (string, error) {
 	switch action {
 	case "index.add.categorical":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
 		}
-		return s.addIndex("categorical index on "+join(args), args, nil), nil
+		return addIndex(t, "categorical index on "+join(args), args, nil), nil
 	case "index.add.value":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.value needs at least one attribute")
 		}
-		return s.addIndex("value index on "+join(args), nil, args), nil
+		return addIndex(t, "value index on "+join(args), nil, args), nil
 	case "index.drop":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.drop needs at least one attribute")
 		}
-		changed := s.db.DropIndex(args...)
+		changed := t.DropIndex(args...)
 		if changed {
-			s.db.Reindex() // rebuild segment indexes so the dropped postings are reclaimed
+			t.Reindex() // rebuild segment indexes so the dropped postings are reclaimed
 		}
 		return changedMsg("dropped index on "+join(args), changed), nil
 	case "index.reindex":
-		s.db.Reindex()
+		t.Reindex()
 		return "reindexed", nil
 	case "compact":
-		n := s.db.Compact()
+		n := t.Compact()
 		return fmt.Sprintf("compacted %d shard(s)", n), nil
 	case "rewrite":
-		n := s.db.Rewrite()
+		n := t.Rewrite()
 		return fmt.Sprintf("rewrote %d ad(s) with the current hot set and compacted", n), nil
 	case "hot.add":
 		if len(args) == 0 {
 			return "", fmt.Errorf("hot.add needs at least one attribute")
 		}
-		hot := s.db.AddHotAttrs(args...)
+		hot := t.AddHotAttrs(args...)
 		return "hot attributes: " + join(hot), nil
 	case "hot.refresh":
 		if len(args) != 2 {
@@ -92,7 +92,7 @@ func (s *Server) admin(action string, args []string) (string, error) {
 		if e1 != nil || e2 != nil {
 			return "", fmt.Errorf("hot.refresh arguments must be integers")
 		}
-		n := s.db.RefreshHotSet(sampleMax, topN)
+		n := t.RefreshHotSet(sampleMax, topN)
 		return fmt.Sprintf("refreshed hot set: %d attribute(s)", n), nil
 	default:
 		return "", fmt.Errorf("unknown admin action %q", action)
@@ -103,12 +103,12 @@ func (s *Server) admin(action string, args []string) (string, error) {
 // is built over the existing ads (AddIndex updates only the spec; existing
 // segments' indexes are rebuilt by Reindex). Without this the index would apply
 // only to future writes and would not prune the current data.
-func (s *Server) addIndex(what string, categorical, value []string) string {
-	changed := s.db.AddIndex(categorical, value)
+func addIndex(t *db.DB, what string, categorical, value []string) string {
+	changed := t.AddIndex(categorical, value)
 	if !changed {
 		return what + " (no change)"
 	}
-	s.db.Reindex()
+	t.Reindex()
 	return what + " (changed; reindexed existing ads)"
 }
 
@@ -132,10 +132,13 @@ func join(ss []string) string {
 
 // --- client ---
 
-// Diagnostics fetches the store's storage stats, hot set, indexes, and tuning
-// suggestions.
-func (c *Client) Diagnostics() (*Diagnostics, error) {
-	status, body, err := c.call(func(id uint64) []byte { return req(id, opDiag) })
+// Diagnostics fetches the default table's storage stats, hot set, indexes, and
+// tuning suggestions.
+func (c *Client) Diagnostics() (*Diagnostics, error) { return c.DiagnosticsTable(DefaultTable) }
+
+// DiagnosticsTable fetches the named table's diagnostics.
+func (c *Client) DiagnosticsTable(table string) (*Diagnostics, error) {
+	status, body, err := c.call(func(id uint64) []byte { return putStr(req(id, opDiag), table) })
 	if err != nil {
 		return nil, err
 	}
@@ -149,9 +152,16 @@ func (c *Client) Diagnostics() (*Diagnostics, error) {
 	return &d, nil
 }
 
-// Explain reports how the store would execute a constraint query.
+// Explain reports how the default table would execute a constraint query.
 func (c *Client) Explain(constraint string) (*db.QueryExplain, error) {
-	status, body, err := c.call(func(id uint64) []byte { return putStr(req(id, opExplain), constraint) })
+	return c.ExplainTable(DefaultTable, constraint)
+}
+
+// ExplainTable reports how the named table would execute a constraint query.
+func (c *Client) ExplainTable(table, constraint string) (*db.QueryExplain, error) {
+	status, body, err := c.call(func(id uint64) []byte {
+		return putStr(putStr(req(id, opExplain), table), constraint)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -165,11 +175,16 @@ func (c *Client) Explain(constraint string) (*db.QueryExplain, error) {
 	return &ex, nil
 }
 
-// Admin runs a management action (index/hot-set); it returns the server's
-// human-readable result. Refused on a read-only connection.
+// Admin runs a management action (index/hot-set) on the default table.
 func (c *Client) Admin(action string, args ...string) (string, error) {
+	return c.AdminTable(DefaultTable, action, args...)
+}
+
+// AdminTable runs a management action on the named table; it returns the server's
+// human-readable result. Refused on a read-only connection.
+func (c *Client) AdminTable(table, action string, args ...string) (string, error) {
 	status, body, err := c.call(func(id uint64) []byte {
-		b := putStr(req(id, opAdmin), action)
+		b := putStr(putStr(req(id, opAdmin), table), action)
 		b = putI32(b, int32(len(args)))
 		for _, a := range args {
 			b = putStr(b, a)
@@ -183,4 +198,47 @@ func (c *Client) Admin(action string, args ...string) (string, error) {
 		return "", statusErr(status, body)
 	}
 	return body.str(), nil
+}
+
+// --- table catalog ---
+
+// CreateTable creates (or no-ops if present) the named table.
+func (c *Client) CreateTable(name string) error {
+	status, body, err := c.call(func(id uint64) []byte { return putStr(req(id, opCreateTable), name) })
+	if err != nil {
+		return err
+	}
+	if status != stOK {
+		return statusErr(status, body)
+	}
+	return nil
+}
+
+// DropTable removes the named table and its data.
+func (c *Client) DropTable(name string) error {
+	status, body, err := c.call(func(id uint64) []byte { return putStr(req(id, opDropTable), name) })
+	if err != nil {
+		return err
+	}
+	if status != stOK {
+		return statusErr(status, body)
+	}
+	return nil
+}
+
+// Tables lists the table names.
+func (c *Client) Tables() ([]string, error) {
+	status, body, err := c.call(func(id uint64) []byte { return req(id, opListTables) })
+	if err != nil {
+		return nil, err
+	}
+	if status != stOK {
+		return nil, statusErr(status, body)
+	}
+	n := int(body.i32())
+	names := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		names = append(names, body.str())
+	}
+	return names, nil
 }

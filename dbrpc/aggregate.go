@@ -40,8 +40,13 @@ type AggRow struct {
 // aggregation happens on the server, so only the (small) grouped result crosses
 // the wire, not every matched ad.
 func (c *Client) Aggregate(constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	return c.AggregateTable(DefaultTable, constraint, groupBy, aggs)
+}
+
+// AggregateTable is Aggregate on the named table.
+func (c *Client) AggregateTable(table, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
 	build := func(id uint64) []byte {
-		b := putStr(req(id, opAggregate), constraint)
+		b := putStr(putStr(req(id, opAggregate), table), constraint)
 		b = putI32(b, int32(len(groupBy)))
 		for _, g := range groupBy {
 			b = putStr(b, g)
@@ -83,6 +88,7 @@ func (c *Client) Aggregate(constraint string, groupBy []string, aggs []AggSpec) 
 // group. It refuses to group or aggregate on a private attribute for a
 // connection that may not see private data.
 func (s *Server) streamAggregate(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	table := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
 	if nGroup < 0 || nGroup > 1024 {
@@ -127,7 +133,11 @@ func (s *Server) streamAggregate(reqID uint64, r *reader, includePrivate bool, w
 	// fully decoding every matching ad. attrs is deduplicated; groupCol[i]/aggCol[i]
 	// index into the projected value slice.
 	attrs, groupCol, aggCol := projectionFor(groupBy, aggs)
-	seq, err := s.db.QueryProject(constraint, attrs)
+	d, ok := s.tableOr(reqID, table, write)
+	if !ok {
+		return
+	}
+	seq, err := d.QueryProject(constraint, attrs)
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return

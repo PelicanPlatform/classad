@@ -3,6 +3,7 @@ package dbrpc
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,11 +19,28 @@ import (
 // requests are dispatched as they arrive and responses carry the request id, so a
 // slow call never head-of-line-blocks others.
 type Server struct {
-	db     *db.DB
+	cat    Catalog
 	txns   sync.Map // txnID(uint64) -> *serverTxn
 	nextID atomic.Uint64
 	stopBG []func()
 }
+
+// Catalog is the set of named tables the server serves. *db.Catalog implements
+// it; a single-DB server wraps its DB as a one-table catalog.
+type Catalog interface {
+	// Table returns the named table's DB.
+	Table(name string) (*db.DB, bool)
+	// CreateTable creates (or returns the existing) named table.
+	CreateTable(name string) (*db.DB, error)
+	// DropTable removes the named table and its data.
+	DropTable(name string) error
+	// Tables lists the table names.
+	Tables() []string
+}
+
+// DefaultTable is the table name a single-DB server serves and the client
+// targets when a table is not named -- the historical, single-collection view.
+const DefaultTable = "ads"
 
 // serverTxn is a live server-side transaction. Its mutex serializes operations on the
 // (non-concurrent) *db.Txn even if a client pipelines them.
@@ -31,8 +49,35 @@ type serverTxn struct {
 	mu sync.Mutex
 }
 
-// NewServer returns a server over d. The caller owns d's lifetime.
-func NewServer(d *db.DB) *Server { return &Server{db: d} }
+// NewServer returns a single-table server over d, served as table "ads". The
+// caller owns d's lifetime. Table create/drop are unsupported on this server.
+func NewServer(d *db.DB) *Server { return &Server{cat: singleCatalog{name: DefaultTable, d: d}} }
+
+// NewServerCatalog returns a multi-table server over cat.
+func NewServerCatalog(cat Catalog) *Server { return &Server{cat: cat} }
+
+// singleCatalog adapts one *db.DB to the Catalog interface as table "ads".
+type singleCatalog struct {
+	name string
+	d    *db.DB
+}
+
+func (s singleCatalog) Table(name string) (*db.DB, bool) {
+	if name == s.name {
+		return s.d, true
+	}
+	return nil, false
+}
+func (s singleCatalog) CreateTable(name string) (*db.DB, error) {
+	if name == s.name {
+		return s.d, nil
+	}
+	return nil, fmt.Errorf("single-table server: cannot create table %q", name)
+}
+func (s singleCatalog) DropTable(name string) error {
+	return fmt.Errorf("single-table server: cannot drop tables")
+}
+func (s singleCatalog) Tables() []string { return []string{s.name} }
 
 // ServeOptions scopes what a single served connection may do. The zero value is
 // full read/write access with private attributes excluded from returned ads
@@ -56,16 +101,32 @@ type ServeOptions struct {
 // read-only connection).
 func (o op) isMutating() bool {
 	switch o {
-	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin:
+	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable:
 		return true
 	}
 	return false
 }
 
 // StartMaintenance starts the server-managed background maintenance (dictionary
-// retrain + hot-attribute refresh) on the given interval. Stopped by Close.
+// retrain + hot-attribute refresh) on the given interval for every table that
+// exists now. Stopped by Close. Tables created later are maintained after a
+// restart.
 func (s *Server) StartMaintenance(interval time.Duration) {
-	s.stopBG = append(s.stopBG, s.db.StartMaintenance(interval))
+	for _, name := range s.cat.Tables() {
+		if d, ok := s.cat.Table(name); ok {
+			s.stopBG = append(s.stopBG, d.StartMaintenance(interval))
+		}
+	}
+}
+
+// tableOr writes a "no such table" error under reqID and returns ok=false if the
+// named table does not exist.
+func (s *Server) tableOr(reqID uint64, name string, write func([]byte)) (*db.DB, bool) {
+	d, ok := s.cat.Table(name)
+	if !ok {
+		write(respErr(reqID, "no such table: "+name))
+	}
+	return d, ok
 }
 
 // Close stops the server's managed goroutines. It does not close the DB.
@@ -161,7 +222,12 @@ func adString(ad *classad.ClassAd, includePrivate bool) string {
 // [cursor] under reqID, until the client cancels it (opWatchStop) or the connection
 // closes. cursor empty starts from now.
 func (sc *serverConn) streamWatch(reqID uint64, r *reader) {
+	table := r.str()
 	cursor := append([]byte(nil), r.bytesRef()...)
+	d, ok := sc.s.tableOr(reqID, table, sc.write)
+	if !ok {
+		return
+	}
 	ctx, cancel := context.WithCancel(sc.ctx)
 	sc.wmu.Lock()
 	sc.watches[reqID] = cancel
@@ -173,7 +239,7 @@ func (sc *serverConn) streamWatch(reqID uint64, r *reader) {
 		cancel()
 	}()
 
-	seq, err := sc.s.db.Watch(ctx, cursor)
+	seq, err := d.Watch(ctx, cursor)
 	if err != nil {
 		sc.write(respErr(reqID, err.Error()))
 		return
@@ -205,13 +271,18 @@ func (sc *serverConn) stopWatch(watchReqID uint64) {
 // frame under reqID, so its frames interleave with other calls' -- no head-of-line
 // blocking -- and end with a terminator.
 func (s *Server) streamQuery(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	table := r.str()
 	limit := int(r.i32())
 	constraint := r.str()
 	if r.err != nil {
 		write(respBad(reqID))
 		return
 	}
-	seq, err := s.db.Query(constraint)
+	d, ok := s.tableOr(reqID, table, write)
+	if !ok {
+		return
+	}
+	seq, err := d.Query(constraint)
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
@@ -231,10 +302,15 @@ func (s *Server) streamQuery(reqID uint64, r *reader, includePrivate bool, write
 
 // streamMatchSorted streams job's ranked matches (best first, up to limit).
 func (s *Server) streamMatchSorted(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	table := r.str()
 	limit := r.i32()
 	jobText := r.str()
 	if r.err != nil {
 		write(respBad(reqID))
+		return
+	}
+	d, ok := s.tableOr(reqID, table, write)
+	if !ok {
 		return
 	}
 	job, err := classad.ParseOld(jobText)
@@ -242,7 +318,7 @@ func (s *Server) streamMatchSorted(reqID uint64, r *reader, includePrivate bool,
 		write(respErr(reqID, err.Error()))
 		return
 	}
-	for _, ad := range s.db.MatchSorted(job, int(limit)) {
+	for _, ad := range d.MatchSorted(job, int(limit)) {
 		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
 	}
 	write(respHead(reqID, stStreamEnd))
@@ -252,13 +328,18 @@ func (s *Server) streamMatchSorted(reqID uint64, r *reader, includePrivate bool,
 // its cluster signature (for resource-request-list folding). One-shot: the in-memory
 // resume cursor is not carried over the wire, so a full partition is streamed.
 func (s *Server) streamOrdered(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	table := r.str()
 	index := r.i32()
 	partition := r.str()
 	if r.err != nil {
 		write(respBad(reqID))
 		return
 	}
-	for oa := range s.db.Ordered(int(index), partition, db.OrderCursor{}) {
+	d, ok := s.tableOr(reqID, table, write)
+	if !ok {
+		return
+	}
+	for oa := range d.Ordered(int(index), partition, db.OrderCursor{}) {
 		b := putU64(respHead(reqID, stStream), oa.Signature)
 		b = putStr(b, adString(oa.Ad, includePrivate))
 		write(b)
@@ -271,9 +352,45 @@ func (s *Server) streamOrdered(reqID uint64, r *reader, includePrivate bool, wri
 func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []byte {
 	switch o {
 	case opBegin:
+		table := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		d, ok := s.cat.Table(table)
+		if !ok {
+			return respErr(reqID, "no such table: "+table)
+		}
 		id := s.nextID.Add(1)
-		s.txns.Store(id, &serverTxn{tx: s.db.Begin()})
+		s.txns.Store(id, &serverTxn{tx: d.Begin()})
 		return putU64(resp(reqID, stOK), id)
+
+	case opCreateTable:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		if _, err := s.cat.CreateTable(name); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opDropTable:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		if err := s.cat.DropTable(name); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opListTables:
+		names := s.cat.Tables()
+		b := putI32(resp(reqID, stOK), int32(len(names)))
+		for _, n := range names {
+			b = putStr(b, n)
+		}
+		return b
 
 	case opCommit:
 		st, ok := s.take(r.u64())
@@ -364,18 +481,31 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		})
 
 	case opDiag:
-		data, err := s.diagJSON()
+		table := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		d, ok := s.cat.Table(table)
+		if !ok {
+			return respErr(reqID, "no such table: "+table)
+		}
+		data, err := s.diagJSON(d)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
 		return putStr(resp(reqID, stOK), string(data))
 
 	case opExplain:
+		table := r.str()
 		constraint := r.str()
 		if r.err != nil {
 			return respBad(reqID)
 		}
-		ex, err := s.db.Explain(constraint)
+		d, ok := s.cat.Table(table)
+		if !ok {
+			return respErr(reqID, "no such table: "+table)
+		}
+		ex, err := d.Explain(constraint)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
@@ -386,6 +516,7 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		return putStr(resp(reqID, stOK), string(data))
 
 	case opAdmin:
+		table := r.str()
 		action := r.str()
 		n := int(r.i32())
 		if r.err != nil || n < 0 || n > 1024 {
@@ -398,7 +529,11 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		if r.err != nil {
 			return respBad(reqID)
 		}
-		msg, err := s.admin(action, args)
+		d, ok := s.cat.Table(table)
+		if !ok {
+			return respErr(reqID, "no such table: "+table)
+		}
+		msg, err := s.admin(d, action, args)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
