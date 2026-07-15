@@ -242,11 +242,6 @@ func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 	return out
 }
 
-// isPresenceOp reports whether an op is a presence probe (from is/isnt undefined or
-// isUndefined()). The archive's mmap index does not serve these yet, so its planner
-// drops them and re-verifies during the scan instead.
-func isPresenceOp(op string) bool { return op == "present" || op == "absent" }
-
 func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 	switch p.Op {
 	case "present", "absent":

@@ -26,20 +26,22 @@ import (
 //	         upto uint32; specGen uint64; allOff uint32
 //	         catN uint32; catN × { id uint32; attrOff uint32 }
 //	         valN uint32; valN × { id uint32; attrOff uint32 }
-//	  cat attr block @attrOff: excOff uint32; n uint32;
+//	  cat attr block @attrOff: excOff uint32; postedOff uint32; n uint32;
 //	         keyOff [n+1] uint32 (delimit sorted folded keys in keysBlob); bmOff [n] uint32;
 //	         keysBlob;
 //	         exactN uint32; exactKeyOff [exactN+1] uint32; exactBmOff [exactN] uint32;
 //	         exactKeysBlob   -- exact-case keys (sorted) for =?=/=!=; a case-uniform
 //	         bucket's exact key reuses its folded bmOff (no duplicate payload).
-//	  val attr block @attrOff: excOff uint32; n uint32;
+//	  val attr block @attrOff: excOff uint32; postedOff uint32; n uint32;
 //	         key [n] float64 (sorted asc); bmOff [n] uint32
 //
-// v3 added the exact-case run to the cat block; there is no v2->v3 migration (indexes
-// are rebuilt at seal), so an older sidecar is simply rejected and reindexed.
+// postedOff is the bitmap of records that posted a literal value, for the presence
+// probes: present (isnt undefined) = posted OR exc, absent (is undefined) = all AND-NOT
+// posted. v3 added the exact-case run; v4 added postedOff. There is no migration
+// (indexes are rebuilt at seal), so an older sidecar is simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 3
+	sidecarVersion = 4
 )
 
 // writeSidecarIndex serializes si to path (v2 sorted runs) and fsyncs it. si is
@@ -73,16 +75,16 @@ func writeSidecarIndex(path string, si *segIndex) error {
 	}
 
 	type catBlk struct {
-		id, excOff uint32
-		keys       []string // folded keys (sorted) -> bmOffs
-		bmOffs     []uint32
-		exKeys     []string // exact-case keys (sorted) -> exBmOffs (for =?=/=!=)
-		exBmOffs   []uint32
+		id, excOff, postedOff uint32
+		keys                  []string // folded keys (sorted) -> bmOffs
+		bmOffs                []uint32
+		exKeys                []string // exact-case keys (sorted) -> exBmOffs (for =?=/=!=)
+		exBmOffs              []uint32
 	}
 	type valBlk struct {
-		id, excOff uint32
-		keys       []float64
-		bmOffs     []uint32
+		id, excOff, postedOff uint32
+		keys                  []float64
+		bmOffs                []uint32
 	}
 	var catBlks []catBlk
 	for id, cp := range si.cat {
@@ -139,7 +141,11 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		if err != nil {
 			return err
 		}
-		catBlks = append(catBlks, catBlk{id, excOff, keys, bmOffs, exKeys, exBmOffs})
+		postedOff, err := emit(cp.posted)
+		if err != nil {
+			return err
+		}
+		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs})
 	}
 	sort.Slice(catBlks, func(i, j int) bool { return catBlks[i].id < catBlks[j].id })
 
@@ -160,7 +166,11 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		if err != nil {
 			return err
 		}
-		valBlks = append(valBlks, valBlk{id, excOff, keys, bmOffs})
+		postedOff, err := emit(vp.posted)
+		if err != nil {
+			return err
+		}
+		valBlks = append(valBlks, valBlk{id, excOff, postedOff, keys, bmOffs})
 	}
 	sort.Slice(valBlks, func(i, j int) bool { return valBlks[i].id < valBlks[j].id })
 
@@ -188,6 +198,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 	for i, cb := range catBlks {
 		binary.LittleEndian.PutUint32(b[catSlot[i]:], uint32(len(b)))
 		b = appendU32(b, cb.excOff)
+		b = appendU32(b, cb.postedOff) // presence: is/isnt undefined
 		b = appendU32(b, uint32(len(cb.keys)))
 		var blob []byte
 		keyOffs := make([]uint32, len(cb.keys)+1)
@@ -224,6 +235,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 	for i, vb := range valBlks {
 		binary.LittleEndian.PutUint32(b[valSlot[i]:], uint32(len(b)))
 		b = appendU32(b, vb.excOff)
+		b = appendU32(b, vb.postedOff) // presence: is/isnt undefined
 		b = appendU32(b, uint32(len(vb.keys)))
 		for _, k := range vb.keys {
 			b = appendU64(b, math.Float64bits(k))

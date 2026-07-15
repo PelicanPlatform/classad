@@ -145,6 +145,63 @@ func TestArchiveExactCaseMatch(t *testing.T) {
 	}
 }
 
+// TestArchivePresenceMatch exercises presence probes (is/isnt undefined,
+// isUndefined()) on the sealed archive: the corpus makes an indexed attribute
+// absent, expression-valued (an exception), or a plain literal, and results must
+// match a brute-force scan after reopen.
+func TestArchivePresenceMatch(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := CreateArchive(ArchiveOptions{Dir: dir, SegmentSize: 8 << 10,
+		CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 300; i++ {
+		var text string
+		switch i % 3 {
+		case 0:
+			text = fmt.Sprintf(`[ ID=%d; Owner="alice"; Memory=%d ]`, i, (i%8+1)*512) // present literal
+		case 1:
+			text = fmt.Sprintf(`[ ID=%d; Memory=%d ]`, i, (i%8+1)*512) // Owner absent
+		default:
+			text = fmt.Sprintf(`[ ID=%d; Owner=Base; Memory=%d ]`, i, (i%8+1)*512) // Owner expression -> undefined
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+		src[i] = ad
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := OpenArchive(ArchiveOptions{Dir: dir, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, qs := range []string{
+		`Owner is undefined`,     // absent + expression-valued(undefined)
+		`Owner isnt undefined`,   // present literal
+		`isUndefined(Owner)`,     // function form
+		`!isUndefined(Owner)`,    // negated function form
+		`Memory isnt undefined`,  // always present
+		`Owner is undefined && Memory > 1024`,
+	} {
+		q, _ := vm.Parse(qs)
+		got := archiveQueryIDs(t, b, qs)
+		want := bruteIDs(src, q)
+		if !equalInts(got, want) {
+			t.Errorf("archive %q: got %d, want %d", qs, len(got), len(want))
+		}
+	}
+}
+
 func TestArchiveRecovery(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
