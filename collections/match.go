@@ -95,6 +95,31 @@ func (c *Collection) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {
 // Rank are broken in an unspecified order (it depends on scan/fan-out order); a caller
 // needing a deterministic tiebreak should apply its own. job is not modified.
 func (c *Collection) MatchSorted(job *classad.ClassAd, limit int) []*classad.ClassAd {
+	ranked := c.MatchSortedRanked(job, limit)
+	if ranked == nil {
+		return nil
+	}
+	out := make([]*classad.ClassAd, len(ranked))
+	for i := range ranked {
+		out[i] = ranked[i].Ad
+	}
+	return out
+}
+
+// RankedMatch is a matched ad and the job's Rank of it (HasRank is false when the
+// job's Rank does not evaluate to a number for that ad).
+type RankedMatch struct {
+	Ad      *classad.ClassAd
+	Rank    float64
+	HasRank bool
+}
+
+// MatchSortedRanked is MatchSorted that also returns each match's Rank, best
+// (highest Rank) first, up to limit (<= 0 = all). Ads whose Rank is not numeric
+// sort after ranked ones. Like MatchSorted, the job's Requirements is used to
+// visit only index-candidate slots when an index covers it (the matchmaking
+// pushdown), rather than bilaterally evaluating every slot.
+func (c *Collection) MatchSortedRanked(job *classad.ClassAd, limit int) []RankedMatch {
 	if job == nil {
 		return nil
 	}
@@ -114,10 +139,10 @@ func (c *Collection) MatchSorted(job *classad.ClassAd, limit int) []*classad.Cla
 	if limit > 0 && limit < len(matches) {
 		matches = matches[:limit]
 	}
-	out := make([]*classad.ClassAd, 0, len(matches))
+	out := make([]RankedMatch, 0, len(matches))
 	for i := range matches {
 		if ad := c.materialize(&matches[i]); ad != nil {
-			out = append(out, ad)
+			out = append(out, RankedMatch{Ad: ad, Rank: matches[i].rank, HasRank: matches[i].hasRank})
 		}
 	}
 	return out

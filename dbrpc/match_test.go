@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -37,7 +38,7 @@ func TestMatchTables(t *testing.T) {
 	}
 
 	// Best single match: slot3 (Cpus 16, the highest Rank).
-	rows, err := c.MatchTables("jobs", "machines", "Key", "", "", 1)
+	rows, err := c.MatchTables("jobs", "machines", "Key", "", "", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +47,7 @@ func TestMatchTables(t *testing.T) {
 	}
 
 	// Top 3: ranked slot3(16), slot1(8), slot2(4).
-	rows, err = c.MatchTables("jobs", "machines", "Key", "", "", 3)
+	rows, err = c.MatchTables("jobs", "machines", "Key", "", "", 3, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,11 +60,51 @@ func TestMatchTables(t *testing.T) {
 	}
 
 	// Resource-side filter (pushed down): only Cpus <= 8 -> best is slot1.
-	rows, err = c.MatchTables("jobs", "machines", "Key", "", "Cpus <= 8", 1)
+	rows, err = c.MatchTables("jobs", "machines", "Key", "", "Cpus <= 8", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(rows) != 1 || rows[0].Resource != "slot1" {
 		t.Fatalf("filtered match = %+v, want slot1", rows)
+	}
+}
+
+// TestMatchAutocluster exercises the autocluster cache: identical requests (same
+// significant attributes) reuse one candidate computation and all get the right
+// result.
+func TestMatchAutocluster(t *testing.T) {
+	cat, _ := db.OpenCatalog("")
+	_, _ = cat.CreateTable("jobs")
+	_, _ = cat.CreateTable("machines")
+	s := NewServerCatalog(cat)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConn(sconn) }()
+	c := NewClient(cconn)
+	defer func() { c.Close(); s.Close(); cat.Close() }()
+
+	mtx, _ := c.BeginTable("machines")
+	_ = mtx.NewClassAd("slot1", "Key = \"slot1\"\nCpus = 8\nRequirements = true")
+	_ = mtx.NewClassAd("slot2", "Key = \"slot2\"\nCpus = 16\nRequirements = true")
+	_ = mtx.Commit()
+
+	jtx, _ := c.BeginTable("jobs")
+	req := "Key = %q\nRequestCpus = %d\nRequirements = (TARGET.Cpus >= RequestCpus)\nRank = TARGET.Cpus"
+	_ = jtx.NewClassAd("a", fmt.Sprintf(req, "a", 4))
+	_ = jtx.NewClassAd("b", fmt.Sprintf(req, "b", 4)) // identical to a in matchmaking terms
+	_ = jtx.NewClassAd("c", fmt.Sprintf(req, "c", 12))
+	_ = jtx.Commit()
+
+	sig := []string{"RequestCpus", "Requirements", "Rank"}
+	rows, err := c.MatchTables("jobs", "machines", "Key", "", "", 1, sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	best := map[string]string{}
+	for _, r := range rows {
+		best[r.Request] = r.Resource
+	}
+	// All prefer slot2 (Cpus 16, highest Rank); c (RequestCpus 12) still fits slot2.
+	if len(best) != 3 || best["a"] != "slot2" || best["b"] != "slot2" || best["c"] != "slot2" {
+		t.Fatalf("autocluster results = %v, want a,b,c -> slot2", best)
 	}
 }

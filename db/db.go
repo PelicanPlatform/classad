@@ -291,6 +291,41 @@ func (db *DB) MatchSorted(job *classad.ClassAd, limit int) []*classad.ClassAd {
 	return db.c.MatchSorted(job, limit)
 }
 
+// RankedMatch is a matched ad with the job's Rank of it.
+type RankedMatch = collections.RankedMatch
+
+// MatchSortedRanked is MatchSorted that also returns each match's Rank. The job's
+// Requirements prunes candidate slots via any covering index (the matchmaking
+// pushdown) rather than bilaterally evaluating every slot.
+func (db *DB) MatchSortedRanked(job *classad.ClassAd, limit int) []RankedMatch {
+	return db.c.MatchSortedRanked(job, limit)
+}
+
+// MatchSignature is HTCondor's autocluster key: a 64-bit checksum over the given
+// significant attributes' expression text in ad. Two ads with textually identical
+// significant attributes (same Requirements, same RequestCpus literal, ...) hash
+// equal, so a matchmaker can compute one candidate list per distinct signature
+// and reuse it for every identical request.
+func MatchSignature(ad *classad.ClassAd, significantAttrs []string) uint64 {
+	return collections.ProjectionChecksum(ad, significantAttrs)
+}
+
+// Constraint is a compiled ClassAd boolean expression, for evaluating the same
+// filter against many ads without re-parsing.
+type Constraint struct{ q *vm.Query }
+
+// ParseConstraint compiles a ClassAd boolean expression.
+func ParseConstraint(expr string) (*Constraint, error) {
+	q, err := vm.Parse(expr)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", expr, err)
+	}
+	return &Constraint{q: q}, nil
+}
+
+// Matches reports whether ad satisfies the constraint.
+func (c *Constraint) Matches(ad *classad.ClassAd) bool { return c.q.Matches(ad) }
+
 // Ordered iterates one partition of the index-th configured ordered index in sort
 // order (Config.Ordered), yielding each member ad with a resume cursor and its cluster
 // signature (for run-length folding into resource-request lists). partition selects the
