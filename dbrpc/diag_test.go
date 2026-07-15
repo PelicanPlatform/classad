@@ -73,6 +73,17 @@ func TestDiagnosticsAndAdmin(t *testing.T) {
 	if _, err := c.Admin("index.reindex"); err != nil {
 		t.Fatal(err)
 	}
+
+	// Rewrite (re-encode with the hot set) and compact succeed, preserving data.
+	if msg, err := c.Admin("rewrite"); err != nil || msg == "" {
+		t.Fatalf("Admin rewrite = %q,%v", msg, err)
+	}
+	if _, err := c.Admin("compact"); err != nil {
+		t.Fatal(err)
+	}
+	if rows, err := c.Query("Owner == \"alice\""); err != nil || len(rows) != 1 {
+		t.Fatalf("after rewrite/compact Query = %v,%v want 1 row", rows, err)
+	}
 }
 
 // TestAdminRefusedReadOnly confirms management is refused on a read-only conn.

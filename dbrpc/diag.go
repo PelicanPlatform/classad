@@ -45,6 +45,8 @@ func (s *Server) diagJSON() ([]byte, error) {
 //	index.reindex                     rebuild all indexes from live ads
 //	hot.add <attr>...                 pin attributes into the hot set
 //	hot.refresh <sampleMax> <topN>    recompute the hot set from sampled frequency
+//	compact                           reclaim dead space in warranted shards
+//	rewrite                           re-encode all ads with the current hot set
 func (s *Server) admin(action string, args []string) (string, error) {
 	switch action {
 	case "index.add.categorical":
@@ -68,6 +70,12 @@ func (s *Server) admin(action string, args []string) (string, error) {
 	case "index.reindex":
 		s.db.Reindex()
 		return "reindexed", nil
+	case "compact":
+		n := s.db.Compact()
+		return fmt.Sprintf("compacted %d shard(s)", n), nil
+	case "rewrite":
+		n := s.db.Rewrite()
+		return fmt.Sprintf("rewrote %d ad(s) with the current hot set and compacted", n), nil
 	case "hot.add":
 		if len(args) == 0 {
 			return "", fmt.Errorf("hot.add needs at least one attribute")

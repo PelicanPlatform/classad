@@ -205,6 +205,15 @@ func (db *DB) AddHotAttrs(names ...string) []string { return db.c.AddHotAttrs(na
 // a sample of up to sampleMax live ads, returning how many were chosen.
 func (db *DB) RefreshHotSet(sampleMax, topN int) int { return db.c.RefreshHotSet(sampleMax, topN) }
 
+// Compact reclaims dead space in shards whose dead-byte ratio warrants it,
+// returning the number of shards compacted.
+func (db *DB) Compact() int { return db.c.Compact() }
+
+// Rewrite re-encodes every live ad with the current hot set (so a changed hot
+// set applies to existing ads) and force-compacts, returning the number of ads
+// rewritten. A maintenance operation -- see collections.Collection.Rewrite.
+func (db *DB) Rewrite() int { return db.c.Rewrite() }
+
 // ForEach calls fn for every committed ad, in no particular order, until fn returns
 // false. It reads a consistent snapshot (concurrent writers do not block it).
 func (db *DB) ForEach(fn func(ad *classad.ClassAd) bool) {

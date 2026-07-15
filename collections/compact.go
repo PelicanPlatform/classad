@@ -50,6 +50,34 @@ func (c *Collection) Compact() int {
 	return n
 }
 
+// Rewrite re-encodes every live ad with the current hot set (and match closure)
+// so a changed hot set takes effect on existing ads, not just future writes,
+// then force-compacts every shard to reclaim the superseded pre-rewrite records.
+// Returns the number of ads rewritten.
+//
+// It re-Puts ads on the normal write path, so it is a maintenance operation: an
+// update to a key that races the rewrite may be overwritten by the pre-rewrite
+// value. Run it during low write activity (or, in an HA deployment, on the sole
+// writer).
+func (c *Collection) Rewrite() int {
+	n := 0
+	for _, k := range c.Keys() {
+		kb := []byte(k)
+		ad, ok := c.Get(kb)
+		if !ok {
+			continue
+		}
+		if c.Put(kb, ad) == nil {
+			n++
+		}
+	}
+	target := c.currentCodec()
+	for _, sh := range c.shards {
+		c.compactShard(sh, target)
+	}
+	return n
+}
+
 // RetrainDict samples the live ads, trains a fresh ZSTD dictionary from them,
 // switches new writes to a codec using that dictionary, and recompacts every
 // shard so existing records are recompressed under the new dictionary. In-flight
