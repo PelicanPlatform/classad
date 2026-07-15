@@ -264,6 +264,10 @@ func displayRewrite(e ast.Expr, jobVals map[string]classad.Value) ast.Expr {
 			args[i] = displayRewrite(n.Args[i], jobVals)
 		}
 		return &ast.FunctionCall{Name: n.Name, Args: args}
+	case *ast.SubscriptExpr:
+		return &ast.SubscriptExpr{Container: displayRewrite(n.Container, jobVals), Index: displayRewrite(n.Index, jobVals)}
+	case *ast.SelectExpr:
+		return &ast.SelectExpr{Record: displayRewrite(n.Record, jobVals), Attr: n.Attr}
 	default:
 		return e
 	}
