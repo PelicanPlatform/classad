@@ -176,14 +176,16 @@ func (s *indexSpec) equalIDs(o *indexSpec) bool {
 // (within one segment) that hold it, plus an exceptions bitmap for records whose
 // value is present but not the expected literal type.
 type catPostings struct {
-	post  map[string]*roaring.Bitmap
-	exc   *roaring.Bitmap
-	stats segStats // filled by finishStats after all records are indexed
+	post   map[string]*roaring.Bitmap
+	exc    *roaring.Bitmap
+	posted *roaring.Bitmap // records that posted a literal value (for presence probes)
+	stats  segStats        // filled by finishStats after all records are indexed
 }
 type valPostings struct {
-	post  map[float64]*roaring.Bitmap
-	exc   *roaring.Bitmap
-	stats segStats // filled by finishStats after all records are indexed
+	post   map[float64]*roaring.Bitmap
+	exc    *roaring.Bitmap
+	posted *roaring.Bitmap // records that posted a literal value (for presence probes)
+	stats  segStats        // filled by finishStats after all records are indexed
 }
 
 // segIndex is one segment's immutable index. It covers records at offsets in
@@ -211,10 +213,10 @@ func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segInde
 		val:     make(map[uint32]*valPostings, len(spec.valIDs)),
 	}
 	for _, id := range spec.catIDs {
-		si.cat[id] = &catPostings{post: map[string]*roaring.Bitmap{}, exc: roaring.New()}
+		si.cat[id] = &catPostings{post: map[string]*roaring.Bitmap{}, exc: roaring.New(), posted: roaring.New()}
 	}
 	for _, id := range spec.valIDs {
-		si.val[id] = &valPostings{post: map[float64]*roaring.Bitmap{}, exc: roaring.New()}
+		si.val[id] = &valPostings{post: map[float64]*roaring.Bitmap{}, exc: roaring.New(), posted: roaring.New()}
 	}
 	var buf []byte
 	for off := 0; off < upto; {
@@ -253,6 +255,7 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 		if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitString {
 			// ClassAd string == is case-insensitive; index under a folded key.
 			addOffset(cp.post, strings.ToLower(lit.Str), o)
+			cp.posted.Add(o)
 		} else {
 			cp.exc.Add(o)
 		}
@@ -267,14 +270,17 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 			switch lit.Kind {
 			case wire.LitInt:
 				addOffset(vp.post, float64(lit.Int), o)
+				vp.posted.Add(o)
 			case wire.LitReal:
 				addOffset(vp.post, lit.Real, o)
+				vp.posted.Add(o)
 			case wire.LitBool:
 				f := 0.0
 				if lit.Bool {
 					f = 1
 				}
 				addOffset(vp.post, f, o)
+				vp.posted.Add(o)
 			default: // string / undefined / error literal
 				vp.exc.Add(o)
 			}

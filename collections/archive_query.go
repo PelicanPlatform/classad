@@ -156,13 +156,13 @@ func (a *Archive) planIndex(probes []vm.Probe) []usableProbe {
 			continue
 		}
 		if _, isCat := a.spec.cat[id]; isCat {
-			if up, ok := catUsable(id, p); ok {
+			if up, ok := catUsable(id, p); ok && !isPresenceOp(up.op) {
 				out = append(out, up)
 			}
 			continue
 		}
 		if _, isVal := a.spec.val[id]; isVal {
-			if up, ok := valUsable(id, p); ok {
+			if up, ok := valUsable(id, p); ok && !isPresenceOp(up.op) {
 				out = append(out, up)
 			}
 		}

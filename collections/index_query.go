@@ -242,8 +242,15 @@ func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 	return out
 }
 
+// isPresenceOp reports whether an op is a presence probe (from is/isnt undefined or
+// isUndefined()). The archive's mmap index does not serve these yet, so its planner
+// drops them and re-verifies during the scan instead.
+func isPresenceOp(op string) bool { return op == "present" || op == "absent" }
+
 func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 	switch p.Op {
+	case "present", "absent":
+		return usableProbe{attrID: id, cat: true, op: p.Op}, true // presence needs no value
 	case "==", "!=", "in":
 	default:
 		return usableProbe{}, false // ranges are not indexed for categoricals
@@ -261,6 +268,8 @@ func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 
 func valUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 	switch p.Op {
+	case "present", "absent":
+		return usableProbe{attrID: id, cat: false, op: p.Op}, true // presence needs no value
 	case "==", "!=", "in", "<", "<=", ">", ">=":
 	default:
 		return usableProbe{}, false
@@ -377,6 +386,9 @@ func (si *segIndex) canSkip(up usableProbe) bool {
 	s := si.statsFor(up)
 	if s == nil || s.exc > 0 {
 		return false
+	}
+	if up.op == "present" || up.op == "absent" {
+		return false // presence spans posted + exc + absent; never provably empty here
 	}
 	if up.cat {
 		if up.op != "==" && up.op != "in" {
@@ -535,6 +547,14 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 				bm.AndNot(p)
 			}
 			return bm
+		case "present": // attr isnt undefined: posted a value, or present-but-exceptional
+			bm := cp.posted.Clone()
+			bm.Or(cp.exc)
+			return bm
+		case "absent": // attr is undefined: everything but the definitely-posted records
+			bm := si.all.Clone()
+			bm.AndNot(cp.posted)
+			return bm
 		}
 		return roaring.New()
 	}
@@ -554,6 +574,14 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		if p := vp.post[up.fvals[0]]; p != nil {
 			bm.AndNot(p)
 		}
+		return bm
+	case "present":
+		bm := vp.posted.Clone()
+		bm.Or(vp.exc)
+		return bm
+	case "absent":
+		bm := si.all.Clone()
+		bm.AndNot(vp.posted)
 		return bm
 	case "<", "<=", ">", ">=":
 		bm := roaring.New()

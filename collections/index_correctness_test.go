@@ -109,6 +109,13 @@ func TestIndexMatchesFullScan(t *testing.T) {
 		`Owner =?= "alice" || Owner =?= "bob"`,           // identity OR-chain -> membership
 		`Cpus =?= 3`,                                     // numeric identity
 		`Arch =!= "aarch64" && Cpus >= 2`,                // isnt (not indexed) alongside an indexed probe
+		`State =?= undefined`,                            // presence: absent categorical (i%41 drops State)
+		`State =!= undefined`,                            // presence: defined categorical
+		`Cpus =?= undefined`,                             // presence: value attr that evaluates undefined (exc)
+		`Cpus =!= undefined && Memory > 1024`,            // presence + value range
+		`isUndefined(State)`,                             // presence via function form
+		`!isUndefined(State) && Owner == "alice"`,        // negated function form + indexed eq
+		`Owner isnt undefined`,                           // presence: always-defined attr
 	}
 	for _, qs := range queries {
 		q, err := vm.Parse(qs)
@@ -134,10 +141,16 @@ func TestMetaEqualsUsesIndex(t *testing.T) {
 		query       string
 		wantIndexed bool
 	}{
-		{`Arch =?= "X86_64"`, true},  // identity on a categorical index
-		{`Cpus =?= 3`, true},         // identity on a value index
-		{`Arch == "X86_64"`, true},   // the == it is planned like
-		{`Arch =!= "aarch64"`, false}, // isnt: deliberately not indexed
+		{`Arch =?= "X86_64"`, true},   // identity on a categorical index
+		{`Cpus =?= 3`, true},          // identity on a value index
+		{`Arch == "X86_64"`, true},    // the == it is planned like
+		{`Arch =!= "aarch64"`, false}, // isnt vs literal: deliberately not indexed
+		{`State isnt undefined`, true},        // presence on a categorical index
+		{`State =?= undefined`, true},         // absence on a categorical index
+		{`Cpus =!= undefined`, true},          // presence on a value index
+		{`isUndefined(Owner)`, true},          // presence via function form
+		{`!isUndefined(Cpus)`, true},          // negated function form
+		{`Nonexistent isnt undefined`, false}, // presence on an unindexed attr -> scan
 	}
 	for _, tc := range cases {
 		q, err := vm.Parse(tc.query)

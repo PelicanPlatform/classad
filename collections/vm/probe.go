@@ -87,14 +87,31 @@ var operandFlip = map[string]string{
 // probeFrom classifies a single conjunct into a Probe.
 func probeFrom(c ast.Expr) (Probe, bool) {
 	c = unparen(c)
-	// !(comparison) -> flipped comparison (only a single comparison; no De Morgan).
+	// !X -> handle the negatable forms: a flipped comparison, a negated presence
+	// test (!(attr is undefined) is presence), or !isUndefined(attr) (presence).
 	if u, ok := c.(*ast.UnaryOp); ok && u.Op == "!" {
-		if b, ok := unparen(u.Expr).(*ast.BinaryOp); ok {
+		inner := unparen(u.Expr)
+		if fc, ok := inner.(*ast.FunctionCall); ok {
+			return undefinedFuncProbe(fc, true)
+		}
+		if b, ok := inner.(*ast.BinaryOp); ok {
 			if fl, ok := negFlip[b.Op]; ok {
 				return cmpProbe(fl, b.Left, b.Right)
 			}
+			if b.Op == "is" || b.Op == "isnt" {
+				if name, ok := refVsUndefined(b.Left, b.Right); ok {
+					if b.Op == "is" { // !(attr is undefined) -> present
+						return Probe{Attr: name, Op: "present"}, true
+					}
+					return Probe{Attr: name, Op: "absent"}, true // !(attr isnt undefined) -> absent
+				}
+			}
 		}
 		return Probe{}, false
+	}
+	// isUndefined(attr) is a presence probe (matches when attr is absent/undefined).
+	if fc, ok := c.(*ast.FunctionCall); ok {
+		return undefinedFuncProbe(fc, false)
 	}
 	b, ok := c.(*ast.BinaryOp)
 	if !ok {
@@ -104,16 +121,25 @@ func probeFrom(c ast.Expr) (Probe, bool) {
 	case "==", "!=", "<", "<=", ">", ">=":
 		return cmpProbe(b.Op, b.Left, b.Right)
 	case "is":
-		// =?= (identity) is index-satisfiable exactly like ==, so plan it as ==.
-		// The index yields a superset of =?='s matches — categorical postings are
-		// case-folded and value postings fold int/real, both admitting more than
-		// =?='s strict, case-sensitive, same-type identity — and the store
-		// re-verifies every candidate against the real expression, narrowing back to
-		// =?=. Absent attributes are never posted and `attr =?= literal` is false for
-		// them, so they are correctly excluded. (=!=/"isnt" is deliberately NOT added:
-		// it must match absent and case/type-differing records, which the case-folded
-		// != posting path would wrongly drop.)
+		// `attr =?= undefined` is a presence probe (matches when attr is absent /
+		// evaluates undefined); the index answers it from its posted set.
+		if name, ok := refVsUndefined(b.Left, b.Right); ok {
+			return Probe{Attr: name, Op: "absent"}, true
+		}
+		// Otherwise =?= (identity) is index-satisfiable exactly like ==, so plan it
+		// as ==. The index yields a superset of =?='s matches — categorical postings
+		// are case-folded and value postings fold int/real, both admitting more than
+		// =?='s strict, case-sensitive, same-type identity — and the store re-verifies
+		// every candidate against the real expression, narrowing back to =?=.
 		return cmpProbe("==", b.Left, b.Right)
+	case "isnt":
+		// `attr =!= undefined` is a presence probe (matches when attr is defined).
+		// Only the undefined form is indexable: `attr =!= literal` must match absent
+		// and case/type-differing records, which the folded != path would wrongly drop.
+		if name, ok := refVsUndefined(b.Left, b.Right); ok {
+			return Probe{Attr: name, Op: "present"}, true
+		}
+		return Probe{}, false
 	case "||":
 		return orEqProbe(b)
 	}
@@ -168,6 +194,41 @@ func indexableRef(e ast.Expr) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// refVsUndefined recognizes `attr is/isnt undefined` in either operand order,
+// returning the self-scoped attribute name.
+func refVsUndefined(left, right ast.Expr) (string, bool) {
+	if isUndefinedLit(right) {
+		return indexableRef(left)
+	}
+	if isUndefinedLit(left) {
+		return indexableRef(right)
+	}
+	return "", false
+}
+
+func isUndefinedLit(e ast.Expr) bool {
+	_, ok := unparen(e).(*ast.UndefinedLiteral)
+	return ok
+}
+
+// undefinedFuncProbe classifies isUndefined(attr) as a presence probe: bare it is
+// "absent" (true when attr is undefined); negated (!isUndefined(attr)) it is
+// "present". Any other function is not an index probe.
+func undefinedFuncProbe(fc *ast.FunctionCall, negated bool) (Probe, bool) {
+	if !strings.EqualFold(fc.Name, "isUndefined") || len(fc.Args) != 1 {
+		return Probe{}, false
+	}
+	name, ok := indexableRef(fc.Args[0])
+	if !ok {
+		return Probe{}, false
+	}
+	op := "absent"
+	if negated {
+		op = "present"
+	}
+	return Probe{Attr: name, Op: op}, true
 }
 
 // literalVal converts a literal AST node to a classad.Value. Undefined/error
