@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +40,82 @@ func (c *Collection) slotProbes(job *classad.ClassAd, jobVals map[string]classad
 		return nil
 	}
 	return vm.Compile(rewriteForSlot(reqExpr, jobVals)).Probes()
+}
+
+// MatchExplain describes how matchmaking a specific job against this (resource)
+// collection would execute: the job's Requirements rewritten over the slot (with the
+// job's attributes baked to constants), the index-satisfiable probes that rewrite
+// yields, and which of them prune candidates via a configured index.
+type MatchExplain struct {
+	// HasRequirements is false when the job has no Requirements (it then matches every
+	// slot -- a full scan with no pruning).
+	HasRequirements bool `json:"hasRequirements"`
+	// SlotPredicate is the job's Requirements rewritten over the slot: TARGET.attr
+	// becomes the slot's own attribute and every job reference is baked to its value,
+	// e.g. `Memory >= 4096 && Arch == "X86_64"`. This is the predicate whose probes
+	// drive candidate pruning (the bilateral match still re-verifies every candidate).
+	SlotPredicate string `json:"slotPredicate"`
+	// Probes are the rewritten predicate's index-satisfiable conjuncts and their index
+	// status on the resource collection.
+	Probes []ProbeExplain `json:"probes"`
+	// IndexUsable is how many probes prune via an index.
+	IndexUsable int `json:"indexUsable"`
+	// Plan is the access path over the resource slots: "indexed" (visit only candidate
+	// slots), "parallel-scan", or "serial-scan" (match every slot).
+	Plan        string `json:"plan"`
+	Parallelism int    `json:"parallelism"`
+	Shards      int    `json:"shards"`
+	// TotalResources is the resource (slot) count, the denominator for selectivity.
+	TotalResources int `json:"totalResources"`
+}
+
+// ExplainMatch reports how matchmaking job against this collection would execute:
+// it rewrites the job's Requirements over the slot (baking the job's attribute values
+// to constants), extracts the index-satisfiable probes, and reports which are covered
+// by a configured index and the resulting access path. No I/O beyond reading the spec.
+func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
+	total := c.Len()
+	ex := MatchExplain{Parallelism: c.queryPar, Shards: len(c.shards), TotalResources: total}
+	reqExpr := jobRequirementsExpr(job)
+	if reqExpr == nil {
+		ex.Plan = scanPlanName(c.queryPar) // no Requirements: every slot is a candidate
+		return ex
+	}
+	ex.HasRequirements = true
+	slotExpr := rewriteForSlot(reqExpr, jobValues(job))
+	ex.SlotPredicate = slotExpr.String()
+	probes := vm.Compile(slotExpr).Probes()
+	usable := c.planIndex(probes)
+	ex.IndexUsable = len(usable)
+	for _, p := range probes {
+		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
+		var up usableProbe
+		var isUsable bool
+		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
+		if isUsable {
+			if cand, covered := c.estimateCandidates(up); covered {
+				pe.HasSelectivity = true
+				pe.EstCandidates = int64(cand + 0.5)
+				if total > 0 {
+					pe.Selectivity = math.Min(1, cand/float64(total))
+				}
+			}
+		}
+		ex.Probes = append(ex.Probes, pe)
+	}
+	if len(usable) > 0 {
+		ex.Plan = "indexed"
+	} else {
+		ex.Plan = scanPlanName(c.queryPar)
+	}
+	return ex
+}
+
+func scanPlanName(queryPar int) string {
+	if queryPar > 1 {
+		return "parallel-scan"
+	}
+	return "serial-scan"
 }
 
 // rewriteForSlot turns the job's Requirements into an equivalent predicate over a

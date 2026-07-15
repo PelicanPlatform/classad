@@ -120,3 +120,46 @@ func TestMatchAutocluster(t *testing.T) {
 		t.Fatalf("autocluster assignment = %v, want a,b -> distinct {slot1,slot2}", got)
 	}
 }
+
+// TestMatchExplain checks the cross-table match-plan explanation over dbrpc.
+func TestMatchExplain(t *testing.T) {
+	cat, _ := db.OpenCatalog("")
+	_, _ = cat.CreateTable("jobs")
+	m, _ := cat.CreateTable("machines")
+	_ = m.AddIndex(nil, []string{"Memory"}) // value-index Memory on machines
+	s := NewServerCatalog(cat)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConn(sconn) }()
+	c := NewClient(cconn)
+	defer func() { c.Close(); s.Close(); cat.Close() }()
+
+	mtx, _ := c.BeginTable("machines")
+	_ = mtx.NewClassAd("slot1", "Key=\"slot1\"\nArch=\"X86_64\"\nMemory=8192\nRequirements=true")
+	_ = mtx.Commit()
+	jtx, _ := c.BeginTable("jobs")
+	_ = jtx.NewClassAd("1.0", "Key=\"1.0\"\nRequestMemory=2048\nRequirements=(TARGET.Arch==\"X86_64\") && (TARGET.Memory>=RequestMemory)")
+	_ = jtx.Commit()
+
+	ex, err := c.MatchExplain("jobs", "Key == \"1.0\"", "machines")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ex.HasRequirements {
+		t.Fatal("want HasRequirements")
+	}
+	if ex.Plan != "indexed" {
+		t.Errorf("plan = %q, want indexed", ex.Plan)
+	}
+	var mem, arch bool
+	for _, p := range ex.Probes {
+		if p.Attr == "Memory" && p.Indexed {
+			mem = true
+		}
+		if p.Attr == "Arch" && !p.Indexed {
+			arch = true
+		}
+	}
+	if !mem || !arch {
+		t.Errorf("probes = %+v, want indexed Memory + unindexed Arch", ex.Probes)
+	}
+}

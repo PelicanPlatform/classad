@@ -534,6 +534,39 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		}
 		return putStr(resp(reqID, stOK), string(data))
 
+	case opMatchExplain:
+		reqTable := r.str()
+		selector := r.str()
+		resTable := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		reqDB, ok := s.cat.Table(reqTable)
+		if !ok {
+			return respErr(reqID, "no such table: "+reqTable)
+		}
+		resDB, ok := s.cat.Table(resTable)
+		if !ok {
+			return respErr(reqID, "no such table: "+resTable)
+		}
+		seq, err := reqDB.Query(orTrue(selector))
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		var job *classad.ClassAd
+		for ad := range seq {
+			job = ad
+			break // explain plans one specific request
+		}
+		if job == nil {
+			return respErr(reqID, "no request ad matches "+selector)
+		}
+		data, err := json.Marshal(resDB.ExplainMatch(job))
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putStr(resp(reqID, stOK), string(data))
+
 	case opAdmin:
 		table := r.str()
 		action := r.str()

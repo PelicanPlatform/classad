@@ -175,6 +175,30 @@ func (c *Client) ExplainTable(table, constraint string) (*db.QueryExplain, error
 	return &ex, nil
 }
 
+// MatchExplain reports how matchmaking the first request in reqTable matching
+// jobSelector against resTable would execute: the job's Requirements rewritten over
+// the slot (job constants baked in) and which resulting probes prune via a resource
+// index. jobSelector is a constraint (e.g. `Key == "1.0"`) identifying the request.
+func (c *Client) MatchExplain(reqTable, jobSelector, resTable string) (*db.MatchExplain, error) {
+	status, body, err := c.call(func(id uint64) []byte {
+		b := putStr(req(id, opMatchExplain), reqTable)
+		b = putStr(b, jobSelector)
+		b = putStr(b, resTable)
+		return b
+	})
+	if err != nil {
+		return nil, err
+	}
+	if status != stOK {
+		return nil, statusErr(status, body)
+	}
+	var ex db.MatchExplain
+	if err := json.Unmarshal([]byte(body.str()), &ex); err != nil {
+		return nil, err
+	}
+	return &ex, nil
+}
+
 // Admin runs a management action (index/hot-set) on the default table.
 func (c *Client) Admin(action string, args ...string) (string, error) {
 	return c.AdminTable(DefaultTable, action, args...)

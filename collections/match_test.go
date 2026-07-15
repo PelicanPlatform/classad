@@ -562,3 +562,47 @@ func TestMatchRecordsResourceDemand(t *testing.T) {
 		t.Errorf("want a value Memory suggestion from the match, got %+v", byAttr["Memory"])
 	}
 }
+
+// TestExplainMatch verifies the match-plan explanation: the job's Requirements are
+// rewritten over the slot (job constants baked in) and each resulting probe reports
+// whether a resource index covers it.
+func TestExplainMatch(t *testing.T) {
+	machines := New(Options{Shards: 4, ValueAttrs: []string{"Memory"}}) // Memory indexed, Arch not
+	for i := 0; i < 100; i++ {
+		machines.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Name="m%d"; Arch="X86_64"; Memory=%d; Requirements=true ]`, i, (i%8+1)*1024)))
+	}
+	job := mustAd(t, `[ RequestMemory=2048; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Memory >= RequestMemory) ]`)
+	ex := machines.ExplainMatch(job)
+
+	if !ex.HasRequirements {
+		t.Fatal("expected HasRequirements")
+	}
+	// The rewrite bakes RequestMemory to 2048 and drops the TARGET scope.
+	if !strings.Contains(ex.SlotPredicate, "Memory >= 2048") || !strings.Contains(ex.SlotPredicate, `Arch == "X86_64"`) {
+		t.Errorf("slot predicate = %q, want it to contain the baked Memory/Arch constraints", ex.SlotPredicate)
+	}
+	if ex.Plan != "indexed" {
+		t.Errorf("plan = %q, want indexed (Memory is indexed)", ex.Plan)
+	}
+	byAttr := map[string]ProbeExplain{}
+	for _, p := range ex.Probes {
+		byAttr[p.Attr] = p
+	}
+	if p, ok := byAttr["Memory"]; !ok || !p.Indexed || p.Kind != "value" {
+		t.Errorf("Memory probe = %+v, want indexed value", p)
+	}
+	if p, ok := byAttr["Arch"]; !ok || p.Indexed {
+		t.Errorf("Arch probe = %+v, want present but not indexed", p)
+	}
+}
+
+// TestExplainMatchNoRequirements: a job without Requirements matches every slot.
+func TestExplainMatchNoRequirements(t *testing.T) {
+	machines := New(Options{Shards: 2})
+	machines.Put([]byte("m1"), mustAd(t, `[ Name="m1"; Requirements=true ]`))
+	ex := machines.ExplainMatch(mustAd(t, `[ Foo=1 ]`))
+	if ex.HasRequirements || ex.Plan == "indexed" {
+		t.Errorf("no-Requirements job: got HasRequirements=%v plan=%q, want false / a scan", ex.HasRequirements, ex.Plan)
+	}
+}

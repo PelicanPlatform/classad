@@ -163,7 +163,15 @@ type (
 	IndexSuggestion = collections.IndexSuggestion
 	DropSuggestion  = collections.DropSuggestion
 	QueryExplain    = collections.QueryExplain
+	MatchExplain    = collections.MatchExplain
 )
+
+// ExplainMatch reports how matchmaking job against this (resource) collection would
+// execute: the job's Requirements rewritten over the slot with the job's attributes
+// baked to constants, and which of the resulting probes prune via a configured index.
+func (db *DB) ExplainMatch(job *classad.ClassAd) MatchExplain {
+	return db.c.ExplainMatch(job)
+}
 
 // Stats returns a snapshot of the store's storage (ad count, segment/arena/dead
 // bytes) for observability.

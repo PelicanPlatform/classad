@@ -53,6 +53,12 @@ const (
 	// [reqTable][resTable][keyAttr][reqWhere][targetWhere][limit i32] -> stream of
 	// [requestKey][resourceKey][rank] (best-ranked first, up to limit per request).
 	opMatchTables op = 22
+
+	// opMatchExplain explains the match plan for one request against a resource table:
+	// [reqTable][jobSelector][resTable] -> [json db.MatchExplain]. The server takes the
+	// first request in reqTable matching jobSelector and reports how matchmaking it
+	// against resTable would execute (slot-side probe rewrite + index pushdown).
+	opMatchExplain op = 23
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -92,6 +98,8 @@ func (o op) String() string {
 		return "Diagnostics"
 	case opExplain:
 		return "Explain"
+	case opMatchExplain:
+		return "MatchExplain"
 	case opAdmin:
 		return "Admin"
 	case opCreateTable:
