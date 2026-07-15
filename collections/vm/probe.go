@@ -58,11 +58,11 @@ func (q *Query) ProbePlan() []ProbeGroup {
 	if q == nil || q.prog == nil || q.prog.expr == nil {
 		return nil
 	}
-	disjuncts := flattenOr(classad.FoldConstants(q.prog.expr), nil)
-	groups := make([]ProbeGroup, 0, len(disjuncts))
-	for _, d := range disjuncts {
+	exprGroups := distributeDNF(classad.FoldConstants(q.prog.expr))
+	groups := make([]ProbeGroup, 0, len(exprGroups))
+	for _, g := range exprGroups {
 		var probes []Probe
-		for _, c := range flattenAnd(d, nil) {
+		for _, c := range g {
 			if p, ok := probeFrom(c); ok {
 				probes = append(probes, p)
 			}
@@ -70,6 +70,68 @@ func (q *Query) ProbePlan() []ProbeGroup {
 		groups = append(groups, ProbeGroup{Probes: probes})
 	}
 	return groups
+}
+
+// maxDNFGroups bounds disjunctive-normal-form expansion so a predicate with many
+// nested ORs (whose full DNF is a cross-product) cannot explode. Above it, distributeDNF
+// falls back to top-level-only splitting (nested ORs then stay unprobed -- sound, just
+// less selective).
+const maxDNFGroups = 16
+
+// distributeDNF turns a boolean predicate into disjunctive normal form -- a slice of
+// conjunctive groups (each an AND-list of leaf expressions) whose union is the
+// predicate -- distributing nested ORs (`A && (B || C)` -> `(A && B) || (A && C)`) up
+// to maxDNFGroups. Beyond the bound it falls back to splitting only the top-level OR
+// spine, leaving nested ORs intact.
+func distributeDNF(e ast.Expr) [][]ast.Expr {
+	if groups, ok := tryDNF(e); ok {
+		return groups
+	}
+	var out [][]ast.Expr
+	for _, d := range flattenOr(e, nil) {
+		out = append(out, flattenAnd(d, nil))
+	}
+	return out
+}
+
+// tryDNF recursively builds the bounded DNF: OR concatenates disjunct groups, AND takes
+// the cross-product of its operands' groups. ok is false if the group count would
+// exceed maxDNFGroups.
+func tryDNF(e ast.Expr) ([][]ast.Expr, bool) {
+	e = unparen(e)
+	if b, ok := e.(*ast.BinaryOp); ok {
+		switch b.Op {
+		case "||":
+			// An OR-of-equalities on one attribute is a single `in` probe -- keep it as
+			// a leaf rather than splitting it into a group per value.
+			if _, ok := orEqProbe(b); ok {
+				return [][]ast.Expr{{e}}, true
+			}
+			l, ok1 := tryDNF(b.Left)
+			r, ok2 := tryDNF(b.Right)
+			if !ok1 || !ok2 || len(l)+len(r) > maxDNFGroups {
+				return nil, false
+			}
+			return append(l, r...), true
+		case "&&":
+			l, ok1 := tryDNF(b.Left)
+			r, ok2 := tryDNF(b.Right)
+			if !ok1 || !ok2 || len(l)*len(r) > maxDNFGroups {
+				return nil, false
+			}
+			out := make([][]ast.Expr, 0, len(l)*len(r))
+			for _, ga := range l {
+				for _, gb := range r {
+					g := make([]ast.Expr, 0, len(ga)+len(gb))
+					g = append(g, ga...)
+					g = append(g, gb...)
+					out = append(out, g)
+				}
+			}
+			return out, true
+		}
+	}
+	return [][]ast.Expr{{e}}, true
 }
 
 // flattenAnd collects the top-level `&&` conjuncts of e (unwrapping parentheses).
@@ -116,6 +178,12 @@ var operandFlip = map[string]string{
 	"==": "==", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<=",
 	"is": "is", "isnt": "isnt", // =?= / =!= are symmetric
 }
+
+// ProbeOf returns the index probe a single (already slot-rewritten) expression yields,
+// or ok=false if it is not a recognizable Attr-OP-literal / presence / OR-of-equalities.
+// Callers use it to tell an already-probeable leaf from an opaque one (e.g. before
+// finite-domain materialization).
+func ProbeOf(e ast.Expr) (Probe, bool) { return probeFrom(e) }
 
 // probeFrom classifies a single conjunct into a Probe.
 func probeFrom(c ast.Expr) (Probe, bool) {

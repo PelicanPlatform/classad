@@ -659,3 +659,53 @@ func TestMatchUndefinedGuardExceptionEqualsFullScan(t *testing.T) {
 		t.Fatal("expected some matches")
 	}
 }
+
+// TestMatchFiniteDomainMaterialization validates that an opaque pure function of a
+// low-cardinality categorical attribute (versionGE over CondorVersion) is materialized
+// into a membership probe, so `versionGE(...) || (Disk >= X)` becomes an indexable DNF
+// union -- and that the indexed match equals the full scan.
+func TestMatchFiniteDomainMaterialization(t *testing.T) {
+	t.Parallel()
+	versions := []string{
+		`$CondorVersion: 25.12.0 2026-06-25 $`, // passing (>= 25.12.0)
+		`$CondorVersion: 25.13.0 2026-07-01 $`, // passing
+		`$CondorVersion: 24.0.0 2025-01-01 $`,  // failing
+		`$CondorVersion: 23.5.0 2024-06-01 $`,  // failing
+	}
+	const n = 4000
+	build := func(indexed bool) *Collection {
+		opts := Options{Shards: 4}
+		if indexed {
+			opts.ValueAttrs = []string{"Disk"}
+			opts.CategoricalAttrs = []string{"CondorVersion"}
+		}
+		c := New(opts)
+		for i := 0; i < n; i++ {
+			disk := 400 + (i*2654435761)%1200
+			ad := mustAd(t, fmt.Sprintf(`[ Id=%d; Disk=%d; CondorVersion=%q; Arch="X86_64"; Requirements=true ]`,
+				i, disk, versions[i%len(versions)]))
+			c.Put([]byte(fmt.Sprintf("m%d", i)), ad)
+		}
+		if indexed {
+			c.Reindex()
+		}
+		return c
+	}
+	// A passing-version slot matches regardless of disk; a failing one needs Disk>=1000.
+	job := mustAd(t, `[ RequestDisk=1000;
+		Requirements = (versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)) && (TARGET.Arch == "X86_64");
+		Rank = 0 ]`)
+
+	plain, indexed := build(false), build(true)
+	groups, prunable := indexed.slotMatchPlan(job, jobValues(job))
+	if !prunable || len(groups) < 2 {
+		t.Fatalf("expected a prunable disjunctive plan from materialization, got prunable=%v groups=%d", prunable, len(groups))
+	}
+	p, i := matchIDSet(t, plain, job), matchIDSet(t, indexed, job)
+	if !equalInts(p, i) {
+		t.Fatalf("indexed match (%d) != full scan (%d) -- materialization unsound", len(i), len(p))
+	}
+	if len(p) == 0 || len(p) == n {
+		t.Fatalf("expected a partial match set, got %d of %d", len(p), n)
+	}
+}

@@ -121,3 +121,54 @@ func BenchmarkMatchUndefinedGuard(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMatchFiniteDomain benchmarks a job with `versionGE(CondorVersion) || (Disk>=X)`.
+// Materialization turns the opaque version function into a CondorVersion membership probe,
+// so the clause pushes down as (CondorVersion in {passing}) UNION (Disk >= X) instead of
+// forcing a bilateral match against every slot.
+func BenchmarkMatchFiniteDomain(b *testing.B) {
+	const n = 100_000
+	versions := []string{
+		`$CondorVersion: 25.12.0 x $`, // rare passing version
+		`$CondorVersion: 24.0.0 x $`, `$CondorVersion: 23.5.0 x $`, `$CondorVersion: 22.1.0 x $`,
+	}
+	build := func(indexed bool) *Collection {
+		opts := Options{Shards: 8}
+		if indexed {
+			opts.ValueAttrs = []string{"Disk"}
+			opts.CategoricalAttrs = []string{"CondorVersion"}
+		}
+		c := New(opts)
+		for i := 0; i < n; i++ {
+			disk := 1024 * (1 + (i*2654435761)%500)
+			v := versions[1+i%3] // failing by default
+			if i%50 == 0 {       // ~2% run the passing version
+				v = versions[0]
+			}
+			c.Put([]byte(fmt.Sprintf("m%d", i)),
+				mustAd(b, fmt.Sprintf(`[ Id=%d; Disk=%d; CondorVersion=%q; Requirements=true ]`, i, disk, v)))
+		}
+		if indexed {
+			c.Reindex()
+		}
+		return c
+	}
+	job := mustAd(b, `[ RequestDisk=507904;
+		Requirements = versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk);
+		Rank = 0 ]`)
+	for _, tc := range []struct {
+		name    string
+		indexed bool
+	}{
+		{"materialized-pushdown", true},
+		{"full-scan", false},
+	} {
+		c := build(tc.indexed)
+		m := len(c.MatchSortedRanked(job, 0))
+		b.Run(fmt.Sprintf("%s/matches=%d", tc.name, m), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				_ = c.MatchSortedRanked(job, 0)
+			}
+		})
+	}
+}

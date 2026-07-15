@@ -127,6 +127,8 @@ func TestIndexMatchesFullScan(t *testing.T) {
 		`Memory > 4096 || State is undefined`,                        // range OR presence
 		`Cpus >= 6 || Nonexistent == "x"`,                            // one disjunct unindexed -> full scan
 		`Arch =!= "X86_64" || Cpus == 3`,                             // exact-!= OR value-eq
+		`Arch == "X86_64" && (Cpus >= 6 || State == "Claimed")`,      // nested OR -> DNF distribution
+		`(Owner == "alice" || Cpus >= 6) && (Arch == "X86_64" || Memory > 4096)`, // two nested ORs (cross product)
 	}
 	for _, qs := range queries {
 		q, err := vm.Parse(qs)

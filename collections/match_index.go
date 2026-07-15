@@ -87,7 +87,7 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
 	// Display: honest, baked, de-duplicated (functions kept, not shown as undefined).
 	ex.SlotPredicate = slotDisplayExpr(reqExpr, jobVals)
 	// Probes: from the probe rewrite (opaque functions -> undefined, so they drop).
-	plan := vm.Compile(slotMatchExpr(reqExpr, jobVals)).ProbePlan()
+	plan := vm.Compile(c.slotMatchExpr(reqExpr, jobVals)).ProbePlan()
 	_, prunable := c.planIndexGroups(plan)
 	for _, g := range plan {
 		for _, p := range g.Probes {
@@ -176,14 +176,20 @@ func rewriteForSlot(e ast.Expr, jobVals map[string]classad.Value, assumed map[st
 			Right: rewriteForSlot(n.Right, jobVals, assumed, true),
 		}
 	case *ast.FunctionCall:
-		if strings.EqualFold(n.Name, "ifThenElse") && len(n.Args) == 3 {
-			args := make([]ast.Expr, 3)
-			for i := range n.Args {
-				args[i] = rewriteForSlot(n.Args[i], jobVals, assumed, true)
-			}
-			return &ast.FunctionCall{Name: n.Name, Args: args}
+		// Keep the function (arguments baked) rather than collapsing it to undefined:
+		// it yields no index probe on its own, but finite-domain materialization can
+		// turn a pure function of one low-cardinality indexed attribute into a
+		// membership probe. ifThenElse's arguments are in a control-flow context.
+		ctrl := inCtrl || strings.EqualFold(n.Name, "ifThenElse")
+		args := make([]ast.Expr, len(n.Args))
+		for i := range n.Args {
+			args[i] = rewriteForSlot(n.Args[i], jobVals, assumed, ctrl)
 		}
-		return &ast.UndefinedLiteral{}
+		return &ast.FunctionCall{Name: n.Name, Args: args}
+	case *ast.SubscriptExpr:
+		return &ast.SubscriptExpr{Container: rewriteForSlot(n.Container, jobVals, assumed, inCtrl), Index: rewriteForSlot(n.Index, jobVals, assumed, inCtrl)}
+	case *ast.SelectExpr:
+		return &ast.SelectExpr{Record: rewriteForSlot(n.Record, jobVals, assumed, inCtrl), Attr: n.Attr}
 	case *ast.IntegerLiteral, *ast.RealLiteral, *ast.StringLiteral, *ast.BooleanLiteral,
 		*ast.UndefinedLiteral, *ast.ErrorLiteral:
 		return e
@@ -198,9 +204,12 @@ func rewriteForSlot(e ast.Expr, jobVals map[string]classad.Value, assumed map[st
 // slot where an assumed attribute is actually present keeps the pushdown sound (there
 // the approximation may not hold, so the candidate is visited and re-verified); a slot
 // where it is absent is covered by the main predicate.
-func slotMatchExpr(reqExpr ast.Expr, jobVals map[string]classad.Value) ast.Expr {
+func (c *Collection) slotMatchExpr(reqExpr ast.Expr, jobVals map[string]classad.Value) ast.Expr {
 	assumed := map[string]bool{}
 	pred := rewriteForSlot(reqExpr, jobVals, assumed, false)
+	// Finite-domain materialization: turn opaque pure functions of a single
+	// low-cardinality categorical attribute into membership probes.
+	pred = c.materializeFinite(pred)
 	// Deterministic order for a stable plan/explain.
 	names := make([]string, 0, len(assumed))
 	for name := range assumed {
@@ -298,6 +307,202 @@ func dedupConjuncts(e ast.Expr) []ast.Expr {
 	return out
 }
 
+// impureFuncs are functions whose value is not a pure function of their arguments
+// (nondeterministic or context-dependent), so finite-domain materialization -- which
+// evaluates an expression over an attribute's known values -- must not touch them.
+var impureFuncs = map[string]bool{"random": true, "time": true, "eval": true, "unparse": true}
+
+// maxMaterializeCard bounds how many distinct values an attribute may have to be worth
+// materializing a predicate over (evaluate the predicate once per value).
+const maxMaterializeCard = 256
+
+// isPureExpr reports whether e uses only pure functions, so evaluating it over a finite
+// set of attribute values is deterministic and sound.
+func isPureExpr(e ast.Expr) bool {
+	pure := true
+	var walk func(ast.Expr)
+	walk = func(x ast.Expr) {
+		if !pure || x == nil {
+			return
+		}
+		switch n := x.(type) {
+		case *ast.FunctionCall:
+			if impureFuncs[strings.ToLower(n.Name)] {
+				pure = false
+				return
+			}
+			for _, a := range n.Args {
+				walk(a)
+			}
+		case *ast.BinaryOp:
+			walk(n.Left)
+			walk(n.Right)
+		case *ast.UnaryOp:
+			walk(n.Expr)
+		case *ast.ParenExpr:
+			walk(n.Inner)
+		case *ast.ConditionalExpr:
+			walk(n.Condition)
+			walk(n.TrueExpr)
+			walk(n.FalseExpr)
+		case *ast.ElvisExpr:
+			walk(n.Left)
+			walk(n.Right)
+		case *ast.SubscriptExpr:
+			walk(n.Container)
+			walk(n.Index)
+		case *ast.SelectExpr:
+			walk(n.Record)
+		}
+	}
+	walk(e)
+	return pure
+}
+
+// distinctCatValues returns up to max distinct exact-case values of a categorically
+// indexed attribute across the live segment indexes, or nil if the attribute is not
+// categorically indexed or has more than max distinct values (too many to materialize).
+func (c *Collection) distinctCatValues(attr string, max int) []string {
+	spec := c.spec.Load()
+	if spec == nil {
+		return nil
+	}
+	var id uint32
+	var ok bool
+	if spec.inline {
+		id, ok = spec.nameToID[strings.ToLower(attr)]
+	} else {
+		id, ok = c.intern.LookupID(attr)
+	}
+	if !ok {
+		return nil
+	}
+	if _, isCat := spec.cat[id]; !isCat {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	add := func(v string) bool {
+		if !seen[v] {
+			seen[v] = true
+			out = append(out, v)
+		}
+		return len(out) <= max
+	}
+	for _, sh := range c.shards {
+		_, wins := sh.snapshot()
+		for _, w := range wins {
+			si := w.seg.idx.Load()
+			if si == nil {
+				continue
+			}
+			cp := si.cat[id]
+			if cp == nil {
+				continue
+			}
+			for f := range cp.post { // case-uniform buckets: canonical spelling
+				if ec, has := cp.exactCase[f]; has {
+					v := f
+					if ec != "" {
+						v = ec
+					}
+					if !add(v) {
+						releaseWindows(wins)
+						return nil
+					}
+				}
+			}
+			for e := range cp.exact { // mixed-case buckets: each exact spelling
+				if !add(e) {
+					releaseWindows(wins)
+					return nil
+				}
+			}
+		}
+		releaseWindows(wins)
+	}
+	return out
+}
+
+// materializeFinite walks the boolean tree of a slot predicate and replaces each opaque
+// leaf that is a pure function of a single low-cardinality categorical attribute with an
+// equivalent membership disjunction (attr == v1 || ...), by evaluating the leaf over the
+// attribute's distinct values. This turns e.g. versionGE(split(CondorVersion)[1], "25.0")
+// into an indexable `CondorVersion in {passing versions}`. It is sound: the function is
+// pure, so evaluating over the complete indexed value set is an equivalence for the
+// indexed prefix, and the store re-verifies every candidate regardless.
+func (c *Collection) materializeFinite(e ast.Expr) ast.Expr {
+	switch n := e.(type) {
+	case *ast.ParenExpr:
+		return &ast.ParenExpr{Inner: c.materializeFinite(n.Inner)}
+	case *ast.BinaryOp:
+		if n.Op == "&&" || n.Op == "||" {
+			return &ast.BinaryOp{Op: n.Op, Left: c.materializeFinite(n.Left), Right: c.materializeFinite(n.Right)}
+		}
+		return c.tryMaterializeLeaf(e)
+	case *ast.UnaryOp:
+		if n.Op == "!" {
+			return &ast.UnaryOp{Op: "!", Expr: c.materializeFinite(n.Expr)}
+		}
+		return c.tryMaterializeLeaf(e)
+	default:
+		return c.tryMaterializeLeaf(e)
+	}
+}
+
+func (c *Collection) tryMaterializeLeaf(leaf ast.Expr) ast.Expr {
+	// Already a usable index probe (e.g. Arch == "X86_64", Disk >= 4096)? Leave it.
+	if p, ok := vm.ProbeOf(leaf); ok {
+		if len(c.planIndex([]vm.Probe{p})) > 0 {
+			return leaf
+		}
+	}
+	if !isPureExpr(leaf) {
+		return leaf
+	}
+	refs := vm.SelfRefs(leaf)
+	if len(refs) != 1 {
+		return leaf // needs exactly one slot attribute's domain
+	}
+	attr := refs[0]
+	values := c.distinctCatValues(attr, maxMaterializeCard)
+	if values == nil {
+		return leaf // not categorically indexed, or too many values
+	}
+	passingFolded := map[string]bool{}
+	var passing []string
+	for _, v := range values {
+		ad := classad.New()
+		ad.InsertAttrString(attr, v)
+		if b, err := ad.EvaluateExpr(leaf).BoolValue(); err == nil && b {
+			if f := strings.ToLower(v); !passingFolded[f] {
+				passingFolded[f] = true
+				passing = append(passing, f)
+			}
+		}
+	}
+	return membershipExpr(attr, passing)
+}
+
+// membershipExpr builds `attr == v1 || attr == v2 || ...` (folds to an `in` probe), or
+// the literal false when no value passes.
+func membershipExpr(attr string, values []string) ast.Expr {
+	if len(values) == 0 {
+		return &ast.BooleanLiteral{Value: false}
+	}
+	sort.Strings(values) // deterministic
+	var e ast.Expr
+	for _, v := range values {
+		eq := &ast.BinaryOp{Op: "==", Left: &ast.AttributeReference{Name: attr, Scope: ast.NoScope}, Right: &ast.StringLiteral{Value: v}}
+		if e == nil {
+			e = eq
+		} else {
+			e = &ast.BinaryOp{Op: "||", Left: e, Right: eq}
+		}
+	}
+	return e
+}
+
 // slotMatchPlan builds the DNF index plan for matching job against this collection: the
 // slot predicate (with undefined-guard exceptions) compiled to a probe plan and matched
 // to the configured indexes. prunable is false when some disjunct is unconstrained (the
@@ -307,7 +512,7 @@ func (c *Collection) slotMatchPlan(job *classad.ClassAd, jobVals map[string]clas
 	if reqExpr == nil {
 		return nil, false
 	}
-	plan := vm.Compile(slotMatchExpr(reqExpr, jobVals)).ProbePlan()
+	plan := vm.Compile(c.slotMatchExpr(reqExpr, jobVals)).ProbePlan()
 	return c.planIndexGroups(plan)
 }
 
