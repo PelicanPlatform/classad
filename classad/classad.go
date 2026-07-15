@@ -1200,6 +1200,19 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 			}
 		}
 
+		// `is`/`isnt` (=?=/=!=) are total: they compare undefined/error as values, so
+		// fold them whenever both operands are literals (including undefined/error) --
+		// the general path below bails when an operand is undefined. This lets
+		// `undefined is undefined` -> true, so a guard like
+		// `ifThenElse((X is undefined) || ..., 0, Y)` with X baked to undefined
+		// collapses to its taken branch.
+		if (v.Op == "is" || v.Op == "isnt") && isLiteralExpr(left) && isLiteralExpr(right) {
+			if result := c.evaluateBinaryOp(v.Op, leftVal, rightVal); result.IsBool() {
+				b, _ := result.BoolValue()
+				return &ast.BooleanLiteral{Value: b}
+			}
+		}
+
 		if !leftVal.IsUndefined() && !rightVal.IsUndefined() {
 			// Try to compute the operation
 			result := c.evaluateBinaryOp(v.Op, leftVal, rightVal)
