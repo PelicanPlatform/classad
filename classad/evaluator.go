@@ -1566,6 +1566,122 @@ func (e *Evaluator) evaluateIfThenElse(args []ast.Expr) Value {
 	}
 }
 
+// evaluateEvalInEach implements countMatches (wantList=false: the integer count of
+// nested ads for which the expression is boolean-true) and evalInEachContext
+// (wantList=true: the list of per-ad results). It mirrors evalInEachContext_func in
+// src/condor_utils/compat_classad.cpp: arg0 is an expression -- or, as generated for
+// GPU matching, an attribute reference resolved to its bound expression -- evaluated
+// in the scope of each nested ad in the arg1 list. countMatches never propagates
+// undefined/error (an undefined list is 0, a non-matching element is simply not
+// counted), which is what lets it drive matchmaking, e.g.
+//
+//	Requirements = ... && countMatches(MY.RequireGPUs, TARGET.AvailableGPUs) >= RequestGPUs
+//
+// where the slot advertises AvailableGPUs = { GPUs_tag1, ... } with each GPUs_tagN a
+// nested ad, and MY.RequireGPUs is a job expression like `Capability > 4` evaluated
+// against each GPU ad. Limitation vs. the reference engine: it does not perform the
+// MY/TARGET alternate-scope reversal, so an expression mixing a nested ad's own
+// attributes with MY/TARGET job/slot attributes is not fully supported; requirements
+// over the nested (GPU) ad's own attributes -- the common case -- work as expected.
+func (e *Evaluator) evaluateEvalInEach(args []ast.Expr, wantList bool) Value {
+	if len(args) != 2 {
+		return NewErrorValue()
+	}
+	// If arg0 is an attribute reference, resolve it to its bound expression in the
+	// current context so its unqualified refs re-resolve against each nested ad; a
+	// failed lookup falls back to evaluating the reference itself (projection).
+	evalExpr := args[0]
+	if ref, ok := unwrapParens(args[0]).(*ast.AttributeReference); ok {
+		if bound, ok := e.lookupBoundExpr(ref); ok {
+			evalExpr = bound
+		}
+	}
+	listV := e.Evaluate(args[1])
+	if listV.IsUndefined() {
+		if wantList {
+			return NewUndefinedValue()
+		}
+		return NewIntValue(0)
+	}
+	elems, err := listV.ListValue()
+	if err != nil {
+		return NewErrorValue()
+	}
+	if wantList {
+		out := make([]Value, len(elems))
+		for i, el := range elems {
+			out[i] = e.evalInNested(evalExpr, el)
+		}
+		return NewListValue(out)
+	}
+	var n int64
+	for _, el := range elems {
+		if b, ok := boolEquiv(e.evalInNested(evalExpr, el)); ok && b {
+			n++
+		}
+	}
+	return NewIntValue(n)
+}
+
+// evalInNested evaluates expr with the nested ad (elem, which must evaluate to a
+// ClassAd) as the innermost scope; a non-ClassAd element yields undefined/error,
+// which countMatches simply does not count.
+func (e *Evaluator) evalInNested(expr ast.Expr, elem Value) Value {
+	ad, err := elem.ClassAdValue()
+	if err != nil {
+		if elem.IsUndefined() {
+			return NewUndefinedValue()
+		}
+		return NewErrorValue()
+	}
+	return e.child(ad).Evaluate(expr)
+}
+
+// lookupBoundExpr returns the AST expression bound to an attribute reference in the
+// context this evaluator evaluates against (MY / unscoped -> this ad; TARGET -> its
+// target), or false if the attribute is unbound.
+func (e *Evaluator) lookupBoundExpr(ref *ast.AttributeReference) (ast.Expr, bool) {
+	ad := e.classad
+	if ref.Scope == ast.TargetScope {
+		if ad == nil {
+			return nil, false
+		}
+		ad = ad.target
+	}
+	if ad == nil {
+		return nil, false
+	}
+	ex, ok := ad.Lookup(ref.Name)
+	if !ok || ex == nil {
+		return nil, false
+	}
+	return ex.expr, true
+}
+
+// boolEquiv reports a value's boolean-equivalent truth (a boolean, or a nonzero
+// integer/real), matching the reference engine's IsBooleanValueEquiv; other types
+// are not boolean-equivalent.
+func boolEquiv(v Value) (val bool, ok bool) {
+	switch v.valueType {
+	case BooleanValue, IntegerValue:
+		return v.intVal != 0, true
+	case RealValue:
+		f, _ := v.RealValue()
+		return f != 0, true
+	}
+	return false, false
+}
+
+func unwrapParens(e ast.Expr) ast.Expr {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok || p.Inner == nil {
+			return e
+		}
+		e = p.Inner
+	}
+}
+
 // funcArity is the accepted argument-count range of a built-in: [min, max],
 // with max == -1 meaning unbounded (variadic).
 type funcArity struct {
@@ -1601,6 +1717,7 @@ var functionArity = map[string]funcArity{
 	"version_in_range": {3, 3},
 	"versionge":        {2, 2}, "versiongt": {2, 2}, "versionle": {2, 2},
 	"versionlt": {2, 2}, "versioneq": {2, 2},
+	"countmatches": {2, 2}, "evalineachcontext": {2, 2},
 	"formattime":       {0, 2}, "interval": {1, 1}, "identicalmember": {2, 2},
 	"anycompare": {3, 3}, "allcompare": {3, 3}, "stringlistsize": {1, 2},
 	"stringlistsum": {1, 2}, "stringlistavg": {1, 2}, "stringlistmin": {1, 2},
@@ -1669,6 +1786,16 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// is never reached: strcat(undefined, A2) with a cyclic A2 is undefined.
 	if funcName == "strcat" {
 		return e.evaluateStrcat(fc.Args)
+	}
+
+	// countMatches / evalInEachContext evaluate arg0 in the scope of each nested ad
+	// in the arg1 list, so they need the raw argument expressions and the current
+	// scope rather than pre-evaluated argument values.
+	switch funcName {
+	case "countmatches":
+		return e.evaluateEvalInEach(fc.Args, false)
+	case "evalineachcontext":
+		return e.evaluateEvalInEach(fc.Args, true)
 	}
 
 	// Evaluate all arguments. A cyclic argument propagates (the reference
