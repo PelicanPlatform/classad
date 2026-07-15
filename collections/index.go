@@ -191,10 +191,13 @@ type catPostings struct {
 	stats     segStats        // filled by finishStats after all records are indexed
 }
 type valPostings struct {
-	post   map[float64]*roaring.Bitmap
-	exc    *roaring.Bitmap
-	posted *roaring.Bitmap // records that posted a literal value (for presence probes)
-	stats  segStats        // filled by finishStats after all records are indexed
+	post map[float64]*roaring.Bitmap
+	// sortedKeys is post's keys in ascending order (filled by finishStats), so a range
+	// probe boundary-searches to the matching run instead of scanning every key.
+	sortedKeys []float64
+	exc        *roaring.Bitmap
+	posted     *roaring.Bitmap // records that posted a literal value (for presence probes)
+	stats      segStats        // filled by finishStats after all records are indexed
 }
 
 // segIndex is one segment's immutable index. It covers records at offsets in

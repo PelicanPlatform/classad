@@ -128,6 +128,12 @@ func (vp *valPostings) finishStats() {
 	}
 	s.covered = indexable + s.exc
 	s.top = topEntries(entries)
+	// Sorted keys for range boundary search (probeOffsets `<`,`<=`,`>`,`>=`).
+	vp.sortedKeys = make([]float64, 0, len(vp.post))
+	for k := range vp.post {
+		vp.sortedKeys = append(vp.sortedKeys, k)
+	}
+	sort.Float64s(vp.sortedKeys)
 }
 
 // finishStats fills the categorical top-N, NDV, bloom and HLL fields from a

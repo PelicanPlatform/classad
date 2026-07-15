@@ -657,9 +657,23 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		return bm
 	case "<", "<=", ">", ">=":
 		bm := roaring.New()
+		// Boundary-search the sorted keys to the matching run [from,to), then OR only
+		// those keys' bitmaps -- O(log n + matches) instead of scanning every key.
+		keys := vp.sortedKeys
 		t := up.fvals[0]
-		for k, p := range vp.post {
-			if cmpFloat(up.op, k, t) {
+		var from, to int
+		switch up.op {
+		case ">":
+			from, to = upperBoundF(keys, t), len(keys)
+		case ">=":
+			from, to = lowerBoundF(keys, t), len(keys)
+		case "<":
+			from, to = 0, lowerBoundF(keys, t)
+		case "<=":
+			from, to = 0, upperBoundF(keys, t)
+		}
+		for i := from; i < to; i++ {
+			if p := vp.post[keys[i]]; p != nil {
 				bm.Or(p)
 			}
 		}
@@ -667,6 +681,16 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		return bm
 	}
 	return roaring.New()
+}
+
+// lowerBoundF returns the first index i with keys[i] >= t (keys sorted ascending).
+func lowerBoundF(keys []float64, t float64) int {
+	return sort.Search(len(keys), func(i int) bool { return keys[i] >= t })
+}
+
+// upperBoundF returns the first index i with keys[i] > t.
+func upperBoundF(keys []float64, t float64) int {
+	return sort.Search(len(keys), func(i int) bool { return keys[i] > t })
 }
 
 func cmpFloat(op string, k, t float64) bool {
