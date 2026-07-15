@@ -122,30 +122,40 @@ func (s *Server) streamAggregate(reqID uint64, r *reader, includePrivate bool, w
 		}
 	}
 
-	seq, err := s.db.Query(constraint)
+	// Project only the attributes the aggregation reads (group columns + the
+	// non-"*" aggregate arguments), so the scan reads them wire-native instead of
+	// fully decoding every matching ad. attrs is deduplicated; groupCol[i]/aggCol[i]
+	// index into the projected value slice.
+	attrs, groupCol, aggCol := projectionFor(groupBy, aggs)
+	seq, err := s.db.QueryProject(constraint, attrs)
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
 	}
 
 	// Hash-map aggregation: bucket by the joined group-value tuple, preserving
-	// first-seen order for stable output.
+	// first-seen order for stable output. scratch builds each row's key without
+	// allocating a slice per ad; a group keeps its own copy only when created.
 	groups := map[string]*groupState{}
 	var order []string
-	for ad := range seq {
-		gvals := make([]string, nGroup)
-		for i, col := range groupBy {
-			gvals[i] = valueText(ad.EvaluateAttr(col))
+	scratch := make([]string, nGroup)
+	for vals := range seq {
+		for i := range groupBy {
+			scratch[i] = valueText(vals[groupCol[i]])
 		}
-		key := strings.Join(gvals, "\x00")
+		key := strings.Join(scratch, "\x00")
 		gs := groups[key]
 		if gs == nil {
-			gs = &groupState{gvals: gvals, accs: make([]aggAcc, nAgg)}
+			gs = &groupState{gvals: append([]string(nil), scratch...), accs: make([]aggAcc, nAgg)}
 			groups[key] = gs
 			order = append(order, key)
 		}
 		for i, a := range aggs {
-			gs.accs[i].update(a, ad)
+			var v classad.Value
+			if aggCol[i] >= 0 {
+				v = vals[aggCol[i]]
+			}
+			gs.accs[i].update(a, v)
 		}
 	}
 
@@ -194,18 +204,49 @@ type aggAcc struct {
 	vals []classad.Value // argument values for SUM/AVG/MIN/MAX
 }
 
-func (a *aggAcc) update(spec AggSpec, ad *classad.ClassAd) {
+// update folds one row's already-resolved argument value v into the accumulator.
+// For COUNT(*) (spec.Arg == "*") v is ignored.
+func (a *aggAcc) update(spec AggSpec, v classad.Value) {
 	a.rows++
 	if spec.Arg == "*" {
 		return
 	}
-	v := ad.EvaluateAttr(spec.Arg)
 	if !v.IsUndefined() && !v.IsError() {
 		a.defN++
 	}
 	if spec.Func != AggCount {
 		a.vals = append(a.vals, v) // the library aggregates skip undefined / coerce
 	}
+}
+
+// projectionFor builds the deduplicated list of attributes the aggregation reads
+// (group columns then non-"*" aggregate arguments) and the index of each group
+// column / aggregate argument within that list. An aggregate whose argument is
+// "*" (COUNT(*)) gets index -1.
+func projectionFor(groupBy []string, aggs []AggSpec) (attrs []string, groupCol, aggCol []int) {
+	idx := map[string]int{}
+	intern := func(name string) int {
+		if i, ok := idx[name]; ok {
+			return i
+		}
+		i := len(attrs)
+		idx[name] = i
+		attrs = append(attrs, name)
+		return i
+	}
+	groupCol = make([]int, len(groupBy))
+	for i, g := range groupBy {
+		groupCol[i] = intern(g)
+	}
+	aggCol = make([]int, len(aggs))
+	for i, a := range aggs {
+		if a.Arg == "*" {
+			aggCol[i] = -1
+			continue
+		}
+		aggCol[i] = intern(a.Arg)
+	}
+	return attrs, groupCol, aggCol
 }
 
 func (a *aggAcc) result(spec AggSpec) string {

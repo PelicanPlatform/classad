@@ -237,6 +237,19 @@ func (db *DB) Query(constraint string) (iter.Seq[*classad.ClassAd], error) {
 	return db.c.Query(q), nil
 }
 
+// QueryProject returns, for each ad matching the constraint, just the named
+// attributes' values (aligned with attrs), read wire-native where possible so an
+// aggregate or projection does not pay the full-ad decode Query costs. The
+// yielded slice is reused across iterations; copy any value to retain it past the
+// next step. Errors only on a malformed constraint.
+func (db *DB) QueryProject(constraint string, attrs []string) (iter.Seq[[]classad.Value], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryProject(q, attrs), nil
+}
+
 // Match returns the ads that symmetrically match job (bilateral Requirements), pushed
 // down to the store. For the negotiator's pick-best pattern, prefer MatchSorted.
 func (db *DB) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {

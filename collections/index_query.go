@@ -83,8 +83,18 @@ type usableProbe struct {
 type ProbeExplain struct {
 	Attr    string `json:"attr"`
 	Op      string `json:"op"`
-	Indexed bool   `json:"indexed"`         // this probe can use an index to prune
-	Kind    string `json:"kind,omitempty"`  // "categorical" | "value" | "" (attr not indexed)
+	Indexed bool   `json:"indexed"`        // this probe can use an index to prune
+	Kind    string `json:"kind,omitempty"` // "categorical" | "value" | "" (attr not indexed)
+
+	// Selectivity and EstCandidates are the planner's estimate of how much this
+	// probe prunes, present only when Indexed: EstCandidates is the estimated
+	// number of ads the index would visit for this probe (summed over the segment
+	// indexes' selectivity stats), and Selectivity is that as a fraction of the
+	// total (lower is more selective). HasSelectivity distinguishes a real 0 from
+	// "not estimated".
+	HasSelectivity bool    `json:"hasSelectivity"`
+	Selectivity    float64 `json:"selectivity,omitempty"`
+	EstCandidates  int64   `json:"estCandidates,omitempty"`
 }
 
 // QueryExplain is a description of how the store would execute a query, for the
@@ -104,6 +114,8 @@ type QueryExplain struct {
 	// Parallelism is the configured per-query worker cap; Shards is the shard count.
 	Parallelism int `json:"parallelism"`
 	Shards      int `json:"shards"`
+	// TotalAds is the live ad count, the denominator for probe selectivity.
+	TotalAds int `json:"totalAds"`
 }
 
 // ExplainQuery reports how the store would execute q: which of its conjuncts are
@@ -112,15 +124,28 @@ type QueryExplain struct {
 func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 	probes := q.Probes()
 	usable := c.planIndex(probes)
+	total := c.Len()
 	ex := QueryExplain{
 		Native:      q.Native(),
 		IndexUsable: len(usable),
 		Parallelism: c.queryPar,
 		Shards:      len(c.shards),
+		TotalAds:    total,
 	}
 	for _, p := range probes {
 		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
-		pe.Indexed, pe.Kind = c.probeIndexKind(p)
+		var up usableProbe
+		var isUsable bool
+		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
+		if isUsable {
+			if cand, covered := c.estimateCandidates(up); covered {
+				pe.HasSelectivity = true
+				pe.EstCandidates = int64(cand + 0.5)
+				if total > 0 {
+					pe.Selectivity = math.Min(1, cand/float64(total))
+				}
+			}
+		}
 		ex.Probes = append(ex.Probes, pe)
 	}
 	switch {
@@ -135,12 +160,12 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 }
 
 // probeIndexKind reports whether a probe's attribute is indexed and, if so, its
-// index kind and whether this probe's operator can use it (mirrors planIndex's
-// per-probe decision).
-func (c *Collection) probeIndexKind(p vm.Probe) (indexed bool, kind string) {
+// index kind, whether this probe's operator can use it (mirrors planIndex's
+// per-probe decision), and the resolved usableProbe when usable.
+func (c *Collection) probeIndexKind(p vm.Probe) (indexed bool, kind string, up usableProbe, usable bool) {
 	spec := c.spec.Load()
 	if !spec.any() {
-		return false, ""
+		return false, "", usableProbe{}, false
 	}
 	var id uint32
 	var ok bool
@@ -150,17 +175,39 @@ func (c *Collection) probeIndexKind(p vm.Probe) (indexed bool, kind string) {
 		id, ok = c.intern.LookupID(p.Attr)
 	}
 	if !ok {
-		return false, ""
+		return false, "", usableProbe{}, false
 	}
 	if _, isCat := spec.cat[id]; isCat {
-		_, usable := catUsable(id, p)
-		return usable, "categorical"
+		up, usable = catUsable(id, p)
+		return usable, "categorical", up, usable
 	}
 	if _, isVal := spec.val[id]; isVal {
-		_, usable := valUsable(id, p)
-		return usable, "value"
+		up, usable = valUsable(id, p)
+		return usable, "value", up, usable
 	}
-	return false, ""
+	return false, "", usableProbe{}, false
+}
+
+// estimateCandidates sums, over every segment index that covers up, the segment's
+// estimated candidate count for the probe -- the same selectivity estimate the
+// planner uses to order intersections. covered reports whether any built segment
+// index contributed (false when the matching records are only in an unsealed
+// segment with no stats yet, so no estimate is available). Approximate: it counts
+// the indexed prefix (not the un-indexed tail) and may include superseded records.
+func (c *Collection) estimateCandidates(up usableProbe) (cand float64, covered bool) {
+	single := []usableProbe{up}
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		for _, w := range wins {
+			if si := w.seg.idx.Load(); si != nil && si.covers(single) {
+				cand += si.estCandidates(up)
+				covered = true
+			}
+		}
+		releaseWindows(wins)
+		_ = s0
+	}
+	return cand, covered
 }
 
 func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {

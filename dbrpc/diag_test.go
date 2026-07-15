@@ -45,6 +45,11 @@ func TestDiagnosticsAndAdmin(t *testing.T) {
 		t.Fatalf("hot attrs = %v, want Owner and Cpus", d.Hot)
 	}
 
+	// Build the segment indexes over the existing ads so selectivity stats exist.
+	if _, err := c.Admin("index.reindex"); err != nil {
+		t.Fatal(err)
+	}
+
 	// Explain: a query on the indexed categorical attribute uses the index.
 	ex, err := c.Explain(`Owner == "alice"`)
 	if err != nil {
@@ -55,6 +60,11 @@ func TestDiagnosticsAndAdmin(t *testing.T) {
 	}
 	if ex.IndexUsable != 1 || len(ex.Probes) != 1 || !ex.Probes[0].Indexed {
 		t.Fatalf("Explain = %+v, want one indexed probe", ex)
+	}
+	// Owner == "alice" matches 1 of the 2 ads -> ~50% selectivity estimate.
+	p := ex.Probes[0]
+	if !p.HasSelectivity || p.EstCandidates != 1 || ex.TotalAds != 2 {
+		t.Fatalf("selectivity = %+v (total %d), want ~1 candidate of 2", p, ex.TotalAds)
 	}
 
 	// A query on an un-indexed attribute falls back to a scan.
