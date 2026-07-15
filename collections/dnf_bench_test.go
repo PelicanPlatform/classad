@@ -69,3 +69,55 @@ func BenchmarkDNFUnion(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMatchUndefinedGuard benchmarks matchmaking a job whose Requirements carry a
+// WithinResourceLimits-style disk term guarded by `catalogs is undefined`. With the
+// index (Disk value + catalogs presence) the DNF pushdown prunes to (Disk >= RequestDisk)
+// UNION (catalogs present) -- a small candidate set that is then bilaterally matched --
+// versus the full scan (bilateral match against every slot) the old planner required
+// (the guarded term was opaque, so no probe).
+func BenchmarkMatchUndefinedGuard(b *testing.B) {
+	const n = 100_000
+	build := func(indexed bool) *Collection {
+		opts := Options{Shards: 8}
+		if indexed {
+			opts.ValueAttrs = []string{"Disk"}
+			opts.CategoricalAttrs = []string{"catalogs"}
+		}
+		c := New(opts)
+		for i := 0; i < n; i++ {
+			disk := 1024 * (1 + (i*2654435761)%500) // 500 distinct
+			var text string
+			if i%100 == 0 { // ~1% advertise catalogs
+				text = fmt.Sprintf(`[ Id=%d; Disk=%d; catalogs="c%d"; Requirements=true ]`, i, disk, i)
+			} else {
+				text = fmt.Sprintf(`[ Id=%d; Disk=%d; Requirements=true ]`, i, disk)
+			}
+			if err := c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(b, text)); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if indexed {
+			c.Reindex()
+		}
+		return c
+	}
+	job := mustAd(b, `[ RequestDisk=507904;
+		Requirements = TARGET.Disk >= (RequestDisk - ifThenElse(catalogs is undefined, 0, 5120));
+		Rank = 0 ]`)
+	for _, tc := range []struct {
+		name    string
+		indexed bool
+	}{
+		{"indexed-dnf-pushdown", true},
+		{"full-scan", false},
+	} {
+		c := build(tc.indexed)
+		matches := len(c.MatchSortedRanked(job, 0))
+		b.Run(fmt.Sprintf("%s/matches=%d", tc.name, matches), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				_ = c.MatchSortedRanked(job, 0)
+			}
+		})
+	}
+}

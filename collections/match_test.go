@@ -606,3 +606,56 @@ func TestExplainMatchNoRequirements(t *testing.T) {
 		t.Errorf("no-Requirements job: got HasRequirements=%v plan=%q, want false / a scan", ex.HasRequirements, ex.Plan)
 	}
 }
+
+// TestMatchUndefinedGuardExceptionEqualsFullScan validates the DNF match pushdown for
+// a WithinResourceLimits-style disk term guarded by an undefined check. Slots without
+// `catalogs` need Disk >= RequestDisk; slots WITH `catalogs` have a looser bound
+// (RequestDisk - catalogSize). The rewrite bakes RequestDisk, assumes catalogs
+// undefined (folding the guard to the fast-path `Disk >= RequestDisk`), and adds the
+// `catalogs isnt undefined` exception -- so the looser-bound slots are still visited.
+// The indexed result must equal the full scan; without the exception it would miss
+// the catalog slots with Disk in [RequestDisk-catalogSize, RequestDisk).
+func TestMatchUndefinedGuardExceptionEqualsFullScan(t *testing.T) {
+	t.Parallel()
+	const n = 4000
+	build := func(indexed bool) *Collection {
+		opts := Options{Shards: 4}
+		if indexed {
+			opts.ValueAttrs = []string{"Disk"}
+			opts.CategoricalAttrs = []string{"catalogs"}
+		}
+		c := New(opts)
+		for i := 0; i < n; i++ {
+			disk := 400 + (i*2654435761)%1200 // 400..1599
+			var text string
+			if i%50 == 0 { // ~2% advertise catalogs (looser disk bound applies)
+				text = fmt.Sprintf(`[ Id=%d; Disk=%d; catalogs="c%d"; Requirements=true ]`, i, disk, i)
+			} else {
+				text = fmt.Sprintf(`[ Id=%d; Disk=%d; Requirements=true ]`, i, disk)
+			}
+			c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, text))
+		}
+		if indexed {
+			c.Reindex()
+		}
+		return c
+	}
+	// RequestDisk=1000, catalog reservation=500 (so catalog slots match at Disk>=500).
+	job := mustAd(t, `[ RequestDisk=1000;
+		Requirements = TARGET.Disk >= (RequestDisk - ifThenElse(catalogs is undefined, 0, 500));
+		Rank = 0 ]`)
+
+	plain, indexed := build(false), build(true)
+	// The plan must be prunable and disjunctive (fast path + catalogs exception).
+	groups, prunable := indexed.slotMatchPlan(job, jobValues(job))
+	if !prunable || len(groups) < 2 {
+		t.Fatalf("expected a prunable disjunctive plan (fast path + exception), got prunable=%v groups=%d", prunable, len(groups))
+	}
+	p, i := matchIDSet(t, plain, job), matchIDSet(t, indexed, job)
+	if !equalInts(p, i) {
+		t.Fatalf("indexed match (%d) != full scan (%d) -- exception disjunct unsound/missing", len(i), len(p))
+	}
+	if len(p) == 0 {
+		t.Fatal("expected some matches")
+	}
+}

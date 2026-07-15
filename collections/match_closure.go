@@ -99,7 +99,7 @@ func rankSlotRefs(job *classad.ClassAd, jobVals map[string]classad.Value) []stri
 	if rankExpr == nil {
 		return nil
 	}
-	return vm.SelfRefs(rewriteForSlot(rankExpr, jobVals))
+	return vm.SelfRefs(rewriteForSlot(rankExpr, jobVals, nil, false))
 }
 
 // hotClosureMatch reads a wide slot ad's match closure straight from its hot header

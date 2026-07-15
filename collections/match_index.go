@@ -2,6 +2,7 @@ package collections
 
 import (
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,7 +40,7 @@ func (c *Collection) slotProbes(job *classad.ClassAd, jobVals map[string]classad
 	if reqExpr == nil {
 		return nil
 	}
-	return vm.Compile(rewriteForSlot(reqExpr, jobVals)).Probes()
+	return vm.Compile(rewriteForSlot(reqExpr, jobVals, nil, false)).Probes()
 }
 
 // MatchExplain describes how matchmaking a specific job against this (resource)
@@ -82,28 +83,30 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
 		return ex
 	}
 	ex.HasRequirements = true
-	slotExpr := rewriteForSlot(reqExpr, jobValues(job))
+	slotExpr := slotMatchExpr(reqExpr, jobValues(job))
 	ex.SlotPredicate = slotExpr.String()
-	probes := vm.Compile(slotExpr).Probes()
-	usable := c.planIndex(probes)
-	ex.IndexUsable = len(usable)
-	for _, p := range probes {
-		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
-		var up usableProbe
-		var isUsable bool
-		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
-		if isUsable {
-			if cand, covered := c.estimateCandidates(up); covered {
-				pe.HasSelectivity = true
-				pe.EstCandidates = int64(cand + 0.5)
-				if total > 0 {
-					pe.Selectivity = math.Min(1, cand/float64(total))
+	plan := vm.Compile(slotExpr).ProbePlan()
+	_, prunable := c.planIndexGroups(plan)
+	for _, g := range plan {
+		for _, p := range g.Probes {
+			pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
+			var up usableProbe
+			var isUsable bool
+			pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
+			if isUsable {
+				ex.IndexUsable++
+				if cand, covered := c.estimateCandidates(up); covered {
+					pe.HasSelectivity = true
+					pe.EstCandidates = int64(cand + 0.5)
+					if total > 0 {
+						pe.Selectivity = math.Min(1, cand/float64(total))
+					}
 				}
 			}
+			ex.Probes = append(ex.Probes, pe)
 		}
-		ex.Probes = append(ex.Probes, pe)
 	}
-	if len(usable) > 0 {
+	if prunable {
 		ex.Plan = "indexed"
 	} else {
 		ex.Plan = scanPlanName(c.queryPar)
@@ -129,11 +132,16 @@ func scanPlanName(queryPar int) string {
 //   - literals pass through; arithmetic/negation over baked constants is left for the
 //     probe extractor's constant folding.
 //
-// Every other node (function call, list, record, ternary, elvis, select, subscript,
-// or anything unrecognized) is replaced by the undefined literal: it cannot form an
-// index probe, and collapsing it guarantees no job reference leaks through as a bare
-// self-scoped reference (which the extractor would wrongly read as a slot attribute).
-func rewriteForSlot(e ast.Expr, jobVals map[string]classad.Value) ast.Expr {
+// ifThenElse/ternary/elvis are recursed into (their arguments rewritten) so a guard
+// that becomes constant after baking can collapse under constant folding -- e.g. a
+// modern WithinResourceLimits' disk term guarded by `catalogs is undefined`. When such
+// a guard's reference is an UNSCOPED attribute absent from the job, substituting
+// undefined is an approximation (unscoped refs fall through to the slot at eval time);
+// rewriteForSlot records it in `assumed` (only inside a control-flow construct, where
+// it can actually enable a fold) so slotMatchPlan can add a sound `name isnt undefined`
+// exception disjunct. Other function calls / lists / records remain undefined (opaque
+// to the index).
+func rewriteForSlot(e ast.Expr, jobVals map[string]classad.Value, assumed map[string]bool, inCtrl bool) ast.Expr {
 	switch n := e.(type) {
 	case *ast.AttributeReference:
 		if n.Scope == ast.TargetScope {
@@ -144,19 +152,81 @@ func rewriteForSlot(e ast.Expr, jobVals map[string]classad.Value) ast.Expr {
 				return lit
 			}
 		}
+		if n.Scope == ast.NoScope && inCtrl && assumed != nil {
+			assumed[n.Name] = true // unscoped + absent inside a guard: assumed undefined
+		}
 		return &ast.UndefinedLiteral{}
 	case *ast.BinaryOp:
-		return &ast.BinaryOp{Op: n.Op, Left: rewriteForSlot(n.Left, jobVals), Right: rewriteForSlot(n.Right, jobVals)}
+		return &ast.BinaryOp{Op: n.Op, Left: rewriteForSlot(n.Left, jobVals, assumed, inCtrl), Right: rewriteForSlot(n.Right, jobVals, assumed, inCtrl)}
 	case *ast.UnaryOp:
-		return &ast.UnaryOp{Op: n.Op, Expr: rewriteForSlot(n.Expr, jobVals)}
+		return &ast.UnaryOp{Op: n.Op, Expr: rewriteForSlot(n.Expr, jobVals, assumed, inCtrl)}
 	case *ast.ParenExpr:
-		return &ast.ParenExpr{Inner: rewriteForSlot(n.Inner, jobVals)}
+		return &ast.ParenExpr{Inner: rewriteForSlot(n.Inner, jobVals, assumed, inCtrl)}
+	case *ast.ConditionalExpr:
+		return &ast.ConditionalExpr{
+			Condition: rewriteForSlot(n.Condition, jobVals, assumed, true),
+			TrueExpr:  rewriteForSlot(n.TrueExpr, jobVals, assumed, true),
+			FalseExpr: rewriteForSlot(n.FalseExpr, jobVals, assumed, true),
+		}
+	case *ast.ElvisExpr:
+		return &ast.ElvisExpr{
+			Left:  rewriteForSlot(n.Left, jobVals, assumed, true),
+			Right: rewriteForSlot(n.Right, jobVals, assumed, true),
+		}
+	case *ast.FunctionCall:
+		if strings.EqualFold(n.Name, "ifThenElse") && len(n.Args) == 3 {
+			args := make([]ast.Expr, 3)
+			for i := range n.Args {
+				args[i] = rewriteForSlot(n.Args[i], jobVals, assumed, true)
+			}
+			return &ast.FunctionCall{Name: n.Name, Args: args}
+		}
+		return &ast.UndefinedLiteral{}
 	case *ast.IntegerLiteral, *ast.RealLiteral, *ast.StringLiteral, *ast.BooleanLiteral,
 		*ast.UndefinedLiteral, *ast.ErrorLiteral:
 		return e
 	default:
 		return &ast.UndefinedLiteral{}
 	}
+}
+
+// slotMatchExpr rewrites the job's Requirements over the slot and returns the sound
+// pushdown predicate: the rewritten predicate OR one `name isnt undefined` disjunct per
+// unscoped attribute the rewrite had to assume undefined inside a guard. Including a
+// slot where an assumed attribute is actually present keeps the pushdown sound (there
+// the approximation may not hold, so the candidate is visited and re-verified); a slot
+// where it is absent is covered by the main predicate.
+func slotMatchExpr(reqExpr ast.Expr, jobVals map[string]classad.Value) ast.Expr {
+	assumed := map[string]bool{}
+	pred := rewriteForSlot(reqExpr, jobVals, assumed, false)
+	// Deterministic order for a stable plan/explain.
+	names := make([]string, 0, len(assumed))
+	for name := range assumed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		exc := &ast.BinaryOp{
+			Op:    "isnt",
+			Left:  &ast.AttributeReference{Name: name, Scope: ast.NoScope},
+			Right: &ast.UndefinedLiteral{},
+		}
+		pred = &ast.BinaryOp{Op: "||", Left: pred, Right: exc}
+	}
+	return pred
+}
+
+// slotMatchPlan builds the DNF index plan for matching job against this collection: the
+// slot predicate (with undefined-guard exceptions) compiled to a probe plan and matched
+// to the configured indexes. prunable is false when some disjunct is unconstrained (the
+// caller then full-scans / re-verifies every slot).
+func (c *Collection) slotMatchPlan(job *classad.ClassAd, jobVals map[string]classad.Value) (groups [][]usableProbe, prunable bool) {
+	reqExpr := jobRequirementsExpr(job)
+	if reqExpr == nil {
+		return nil, false
+	}
+	plan := vm.Compile(slotMatchExpr(reqExpr, jobVals)).ProbePlan()
+	return c.planIndexGroups(plan)
 }
 
 // valueToLiteral converts a scalar classad.Value to its literal AST node, or nil for
@@ -183,7 +253,7 @@ func valueToLiteral(v classad.Value) ast.Expr {
 // out across shards when the worker budget allows. Each candidate is fully matched
 // with MatchClassAd (plus the wire-native reject), so the index only narrows which
 // slots are visited -- correctness is unchanged from a full scan.
-func (c *Collection) indexedMatches(job *classad.ClassAd, usable []usableProbe, jp *jobPlan, deferMat bool) []rankedMatch {
+func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe, jp *jobPlan, deferMat bool) []rankedMatch {
 	shards := c.shards
 
 	W := 0
@@ -204,7 +274,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, usable []usableProbe, 
 		mw := newMatchWorker(job, c, jp, deferMat)
 		var out []rankedMatch
 		for _, sh := range shards {
-			c.scanShardCandidates(sh, usable, func(w []byte) bool {
+			c.scanShardCandidatesGroups(sh, groups, func(w []byte) bool {
 				c.matchCandidate(w, mw, &out)
 				return true
 			})
@@ -232,7 +302,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, usable []usableProbe, 
 				if idx >= len(shards) {
 					break
 				}
-				c.scanShardCandidates(shards[idx], usable, func(w []byte) bool {
+				c.scanShardCandidatesGroups(shards[idx], groups, func(w []byte) bool {
 					c.matchCandidate(w, mw, &local)
 					return true
 				})

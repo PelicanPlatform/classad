@@ -831,6 +831,17 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 			}
 			continue
 		}
+		// Single group (a conjunctive plan): reuse the segment-skip fast path -- if a
+		// probe provably has no candidate in the indexed prefix, only the tail needs a
+		// scan. A union of groups cannot skip this cheaply, so it visits candidates.
+		if len(groups) == 1 && si.skipsPrefix(groups[0]) {
+			if int(si.upto) < w.used {
+				if !scanRange(w, int(si.upto), w.used) {
+					return false
+				}
+			}
+			continue
+		}
 		if cand := si.candidateOffsetsGroups(groups); cand != nil {
 			it := cand.Iterator()
 			for it.HasNext() {

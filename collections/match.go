@@ -163,8 +163,12 @@ func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []ranke
 	probes := c.slotProbes(job, jp.vals)
 	c.demand.record(probes)
 	if c.spec.Load().any() {
-		if usable := c.planIndex(probes); len(usable) > 0 {
-			return c.indexedMatches(job, usable, jp, deferMat)
+		// A DNF plan: one group for a conjunctive predicate, or several when the slot
+		// predicate carries undefined-guard exceptions (`… || catalogs isnt undefined`).
+		// Visit the union of the groups' candidates; if any disjunct is unconstrained,
+		// slotMatchPlan reports not-prunable and we fall back to the full scan.
+		if groups, prunable := c.slotMatchPlan(job, jp.vals); prunable {
+			return c.indexedMatches(job, groups, jp, deferMat)
 		}
 	}
 	return c.taskMatches(job, jp, deferMat)
