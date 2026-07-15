@@ -1806,6 +1806,30 @@ func builtinVersionInRange(args []Value) Value {
 	return NewBoolValue(inRange)
 }
 
+// builtinVersionRelational implements the versionGE/GT/LE/LT/EQ family: it version-
+// compares the two arguments and applies `keep` to the sign of the comparison,
+// returning a boolean. Undefined/error handling mirrors versioncmp (undefined
+// dominates: an undefined argument is undefined; otherwise an error argument, or a
+// non-coercible one, is an error), so `versionGE(x, "25.0")` on a machine missing
+// the attribute is undefined (excluded from a WHERE), not a false match.
+func builtinVersionRelational(args []Value, keep func(cmp int) bool) Value {
+	if len(args) != 2 {
+		return NewErrorValue()
+	}
+	if args[0].IsUndefined() || args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
+	}
+	left, ok0 := classadString(args[0])
+	right, ok1 := classadString(args[1])
+	if !ok0 || !ok1 {
+		return NewErrorValue()
+	}
+	return NewBoolValue(keep(versionCompare(left, right)))
+}
+
 // builtinFormatTime formats a Unix timestamp
 func builtinFormatTime(args []Value) Value {
 	if len(args) > 2 {

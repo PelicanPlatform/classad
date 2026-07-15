@@ -1599,6 +1599,8 @@ var functionArity = map[string]funcArity{
 	"split": {1, 2}, "splitusername": {1, 1}, "splitslotname": {1, 1},
 	"strcmp": {2, 2}, "stricmp": {2, 2}, "versioncmp": {2, 2},
 	"version_in_range": {3, 3},
+	"versionge":        {2, 2}, "versiongt": {2, 2}, "versionle": {2, 2},
+	"versionlt": {2, 2}, "versioneq": {2, 2},
 	"formattime":       {0, 2}, "interval": {1, 1}, "identicalmember": {2, 2},
 	"anycompare": {3, 3}, "allcompare": {3, 3}, "stringlistsize": {1, 2},
 	"stringlistsum": {1, 2}, "stringlistavg": {1, 2}, "stringlistmin": {1, 2},
@@ -1778,15 +1780,26 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	case "stricmp":
 		return builtinStricmp(args)
 
-	// Version comparison functions. (The reference engine's per-operator helpers
-	// are spelled versionGT/GE/LT/LE/EQ -- camelCase and case-sensitive, see
-	// CPP_QUIRKS.md -- which Go's case-insensitive dispatch cannot represent, so
-	// they are intentionally not provided here. versioncmp and version_in_range
-	// are the lowercase-friendly ones.)
+	// Version comparison functions. The reference engine spells the per-operator
+	// helpers versionGT/GE/LT/LE/EQ (camelCase, case-sensitive); Go's dispatch is
+	// case-insensitive, so we accept any casing (versionGE, versionge, ...). Being
+	// more lenient about spelling never turns a valid query into an invalid one,
+	// and it lets real queries -- e.g. versionGE(split(CondorVersion)[1], "25.0")
+	// -- work instead of erroring on an unknown function.
 	case "versioncmp":
 		return builtinVersioncmp(args)
 	case "version_in_range":
 		return builtinVersionInRange(args)
+	case "versionge":
+		return builtinVersionRelational(args, func(c int) bool { return c >= 0 })
+	case "versiongt":
+		return builtinVersionRelational(args, func(c int) bool { return c > 0 })
+	case "versionle":
+		return builtinVersionRelational(args, func(c int) bool { return c <= 0 })
+	case "versionlt":
+		return builtinVersionRelational(args, func(c int) bool { return c < 0 })
+	case "versioneq":
+		return builtinVersionRelational(args, func(c int) bool { return c == 0 })
 
 	// Time formatting functions
 	case "formattime":
