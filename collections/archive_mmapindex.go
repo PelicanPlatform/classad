@@ -141,6 +141,17 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 				bm.AndNot(si.bitmapAt(off))
 			}
 			return bm
+		case "is": // =?= exact (case-sensitive) via the exact-case run
+			if off, ok := si.catFindExact(attrOff, up.svals[0]); ok {
+				return si.bitmapAt(off)
+			}
+			return roaring.New()
+		case "isnt": // =!= exact: everything but the exact-case matches
+			bm := si.allBitmap().Clone()
+			if off, ok := si.catFindExact(attrOff, up.svals[0]); ok {
+				bm.AndNot(si.bitmapAt(off))
+			}
+			return bm
 		}
 		return roaring.New()
 	}
@@ -190,6 +201,39 @@ func (si *mmapSegIndex) catFind(attrOff uint32, key string) (bmOff uint32, ok bo
 		switch cmpStrBytes(key, d[ks:ke]) {
 		case 0:
 			return le32(d, bmOffBase+uint32(mid)*4), true
+		case -1:
+			hi = mid
+		default:
+			lo = mid + 1
+		}
+	}
+	return 0, false
+}
+
+// catFindExact binary-searches the exact-case key run (=?=/=!=) for an exact spelling.
+// The run sits immediately after the folded keys blob: its offset is blobBase plus the
+// folded blob's length (the last folded keyOff).
+func (si *mmapSegIndex) catFindExact(attrOff uint32, key string) (bmOff uint32, ok bool) {
+	d := si.data
+	n := le32(d, attrOff+4)
+	keyOffBase := attrOff + 8
+	bmOffBase := keyOffBase + (n+1)*4
+	blobBase := bmOffBase + n*4
+	foldedBlobLen := le32(d, keyOffBase+n*4) // keyOff[n]
+	exOff := blobBase + foldedBlobLen
+
+	exN := le32(d, exOff)
+	exKeyOffBase := exOff + 4
+	exBmOffBase := exKeyOffBase + (exN+1)*4
+	exBlobBase := exBmOffBase + exN*4
+	lo, hi := 0, int(exN)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		ks := exBlobBase + le32(d, exKeyOffBase+uint32(mid)*4)
+		ke := exBlobBase + le32(d, exKeyOffBase+uint32(mid+1)*4)
+		switch cmpStrBytes(key, d[ks:ke]) {
+		case 0:
+			return le32(d, exBmOffBase+uint32(mid)*4), true
 		case -1:
 			hi = mid
 		default:

@@ -251,6 +251,13 @@ func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 	switch p.Op {
 	case "present", "absent":
 		return usableProbe{attrID: id, cat: true, op: p.Op}, true // presence needs no value
+	case "is", "isnt":
+		// =?= / =!= are case-sensitive: carry the exact (unfolded) spelling.
+		s, err := p.Vals[0].StringValue()
+		if err != nil {
+			return usableProbe{}, false
+		}
+		return usableProbe{attrID: id, cat: true, op: p.Op, svals: []string{s}}, true
 	case "==", "!=", "in":
 	default:
 		return usableProbe{}, false // ranges are not indexed for categoricals
@@ -267,9 +274,18 @@ func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 }
 
 func valUsable(id uint32, p vm.Probe) (usableProbe, bool) {
+	op := p.Op
 	switch p.Op {
 	case "present", "absent":
 		return usableProbe{attrID: id, cat: false, op: p.Op}, true // presence needs no value
+	case "is":
+		// numeric =?= plans as == (a superset: int/real fold into one float key; the
+		// store re-verifies). =!= ("isnt") is NOT indexed for values -- int/real
+		// type-strictness (5 =?= 5.0 is false) means the != posting path would drop the
+		// other-typed records =!= must keep -- so it falls through to a scan.
+		op = "=="
+	case "isnt":
+		return usableProbe{}, false
 	case "==", "!=", "in", "<", "<=", ">", ">=":
 	default:
 		return usableProbe{}, false
@@ -282,7 +298,7 @@ func valUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 		}
 		fvals = append(fvals, f)
 	}
-	return usableProbe{attrID: id, cat: false, op: p.Op, fvals: fvals}, true
+	return usableProbe{attrID: id, cat: false, op: op, fvals: fvals}, true
 }
 
 func numericFloat(v classad.Value) (float64, bool) {
@@ -554,6 +570,17 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		case "absent": // attr is undefined: everything but the definitely-posted records
 			bm := si.all.Clone()
 			bm.AndNot(cp.posted)
+			return bm
+		case "is": // =?= exact (case-sensitive)
+			if e := cp.exactBitmap(up.svals[0]); e != nil {
+				return e.Clone()
+			}
+			return roaring.New()
+		case "isnt": // =!= exact: everything but the exact-case matches
+			bm := si.all.Clone()
+			if e := cp.exactBitmap(up.svals[0]); e != nil {
+				bm.AndNot(e)
+			}
 			return bm
 		}
 		return roaring.New()

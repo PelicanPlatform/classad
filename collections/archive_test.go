@@ -80,6 +80,11 @@ func TestArchiveRoundTripAndQuery(t *testing.T) {
 		`Owner == "nobody"`, // no matches
 		`Owner != "alice"`,  // negation
 		`Memory > 1000000`,  // none
+		`Owner =?= "alice"`,            // exact identity
+		`Owner =!= "alice"`,            // exact !=
+		`JobStatus =?= "Completed"`,    // exact identity, matches the stored case
+		`JobStatus =?= "completed"`,    // exact identity, wrong case -> none (folded == would match)
+		`JobStatus =!= "Held"`,         // exact !=
 	}
 	for _, qs := range queries {
 		q, err := vm.Parse(qs)
@@ -90,6 +95,52 @@ func TestArchiveRoundTripAndQuery(t *testing.T) {
 		want := bruteIDs(src, q)
 		if !equalInts(got, want) {
 			t.Errorf("query %q: got %d, want %d\n got=%v\nwant=%v", qs, len(got), len(want), got, want)
+		}
+	}
+}
+
+// TestArchiveExactCaseMatch exercises the v3 exact-case run on disk with a folded
+// bucket that mixes case ("X86_64" and "x86_64"): =?= must distinguish them and =!=
+// must keep the other variant, matching a brute-force scan after seal+reopen.
+func TestArchiveExactCaseMatch(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := CreateArchive(ArchiveOptions{Dir: dir, SegmentSize: 8 << 10, CategoricalAttrs: []string{"Arch"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	arches := []string{"X86_64", "x86_64", "aarch64"}
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 300; i++ {
+		ad, err := classad.Parse(fmt.Sprintf(`[ ID=%d; Arch="%s" ]`, i, arches[i%len(arches)]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+		src[i] = ad
+	}
+	if err := a.Close(); err != nil { // seal + write v3 sidecars
+		t.Fatal(err)
+	}
+	b, err := OpenArchive(ArchiveOptions{Dir: dir, CategoricalAttrs: []string{"Arch"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, qs := range []string{
+		`Arch =?= "X86_64"`, // only the exact case
+		`Arch =?= "x86_64"`, // only the other exact case
+		`Arch == "x86_64"`,  // folded: both X86_64 and x86_64
+		`Arch =!= "X86_64"`, // everything but exact X86_64 (keeps x86_64)
+		`Arch =!= "aarch64"`,
+	} {
+		q, _ := vm.Parse(qs)
+		got := archiveQueryIDs(t, b, qs)
+		want := bruteIDs(src, q)
+		if !equalInts(got, want) {
+			t.Errorf("archive %q: got %d, want %d", qs, len(got), len(want))
 		}
 	}
 }

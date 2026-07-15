@@ -116,6 +116,10 @@ func TestIndexMatchesFullScan(t *testing.T) {
 		`isUndefined(State)`,                             // presence via function form
 		`!isUndefined(State) && Owner == "alice"`,        // negated function form + indexed eq
 		`Owner isnt undefined`,                           // presence: always-defined attr
+		`Arch =?= "X86_64"`,                              // exact identity: only the exact case
+		`Arch =!= "X86_64"`,                              // exact !=: MUST keep the "x86_64" variant
+		`Arch =!= "x86_64"`,                              // exact !=: MUST keep the "X86_64" variant
+		`Arch =!= "aarch64" && Owner =?= "bob"`,          // exact != and exact == together
 	}
 	for _, qs := range queries {
 		q, err := vm.Parse(qs)
@@ -141,10 +145,11 @@ func TestMetaEqualsUsesIndex(t *testing.T) {
 		query       string
 		wantIndexed bool
 	}{
-		{`Arch =?= "X86_64"`, true},   // identity on a categorical index
-		{`Cpus =?= 3`, true},          // identity on a value index
-		{`Arch == "X86_64"`, true},    // the == it is planned like
-		{`Arch =!= "aarch64"`, false}, // isnt vs literal: deliberately not indexed
+		{`Arch =?= "X86_64"`, true},   // exact identity on a categorical index
+		{`Cpus =?= 3`, true},          // identity on a value index (planned as ==)
+		{`Arch == "X86_64"`, true},    // folded categorical equality
+		{`Arch =!= "aarch64"`, true},  // isnt vs literal: indexed via exact-case postings
+		{`Cpus =!= 3`, false},         // numeric isnt: not indexed (int/real type-strictness)
 		{`State isnt undefined`, true},        // presence on a categorical index
 		{`State =?= undefined`, true},         // absence on a categorical index
 		{`Cpus =!= undefined`, true},          // presence on a value index

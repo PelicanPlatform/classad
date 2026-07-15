@@ -9,10 +9,9 @@ import (
 
 // Probe is an index-satisfiable constraint extracted from a query: a self-scoped
 // attribute Attr related by Op to one or more literal values. Op is one of
-// "==","!=","<","<=",">=",">" (a single Val) or "in" (a set of Vals, from an
-// OR-of-equalities); `=?=` (identity) is normalized to "==" since the index yields
-// a superset that the store's re-verify narrows. A store matches Probes against its
-// configured indexes to
+// "==","!=","<","<=",">=",">" (a single Val), "in" (a set of Vals, from an
+// OR-of-equalities), "is"/"isnt" (=?=/=!= exact identity), or "present"/"absent"
+// (is/isnt undefined). A store matches Probes against its configured indexes to
 // build a candidate set; because the store still re-verifies the full query, any
 // Probe the planner omits only costs selectivity, never correctness.
 type Probe struct {
@@ -82,6 +81,7 @@ var negFlip = map[string]string{
 // swapped (e.g. `5 < Memory` is `Memory > 5`).
 var operandFlip = map[string]string{
 	"==": "==", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<=",
+	"is": "is", "isnt": "isnt", // =?= / =!= are symmetric
 }
 
 // probeFrom classifies a single conjunct into a Probe.
@@ -126,20 +126,20 @@ func probeFrom(c ast.Expr) (Probe, bool) {
 		if name, ok := refVsUndefined(b.Left, b.Right); ok {
 			return Probe{Attr: name, Op: "absent"}, true
 		}
-		// Otherwise =?= (identity) is index-satisfiable exactly like ==, so plan it
-		// as ==. The index yields a superset of =?='s matches — categorical postings
-		// are case-folded and value postings fold int/real, both admitting more than
-		// =?='s strict, case-sensitive, same-type identity — and the store re-verifies
-		// every candidate against the real expression, narrowing back to =?=.
-		return cmpProbe("==", b.Left, b.Right)
+		// `attr =?= literal` is exact (case-sensitive) identity: the "is" op reads the
+		// index's exact-case postings (categorical) or the value posting (numeric, a
+		// superset the store re-verifies).
+		return cmpProbe("is", b.Left, b.Right)
 	case "isnt":
 		// `attr =!= undefined` is a presence probe (matches when attr is defined).
-		// Only the undefined form is indexable: `attr =!= literal` must match absent
-		// and case/type-differing records, which the folded != path would wrongly drop.
 		if name, ok := refVsUndefined(b.Left, b.Right); ok {
 			return Probe{Attr: name, Op: "present"}, true
 		}
-		return Probe{}, false
+		// `attr =!= literal` = everything but the exact-case matches. Indexable for
+		// categoricals via the exact-case postings (all-but-exact); for values it is
+		// dropped in valUsable (int/real type-strictness makes the folded != path drop
+		// records =!= should keep), falling back to a scan.
+		return cmpProbe("isnt", b.Left, b.Right)
 	case "||":
 		return orEqProbe(b)
 	}
