@@ -78,6 +78,91 @@ type usableProbe struct {
 
 // planIndex matches the query's probes against the configured indexes. Empty means
 // no index-usable constraint (the store full-scans).
+// ProbeExplain describes how one index-satisfiable conjunct of a query relates
+// to the configured indexes.
+type ProbeExplain struct {
+	Attr    string `json:"attr"`
+	Op      string `json:"op"`
+	Indexed bool   `json:"indexed"`         // this probe can use an index to prune
+	Kind    string `json:"kind,omitempty"`  // "categorical" | "value" | "" (attr not indexed)
+}
+
+// QueryExplain is a description of how the store would execute a query, for the
+// diagnostic ".explain" command -- what the planner sees and the access path it
+// would choose.
+type QueryExplain struct {
+	// Native reports wire-native evaluation: the query reads scalar-literal
+	// attributes directly from the encoded ads, building no ClassAd per ad.
+	Native bool `json:"native"`
+	// Probes are the query's index-satisfiable conjuncts and their index status.
+	Probes []ProbeExplain `json:"probes"`
+	// IndexUsable is how many probes can prune via an index.
+	IndexUsable int `json:"indexUsable"`
+	// Plan is the chosen access path: "indexed" (visit index candidates),
+	// "parallel-scan", or "serial-scan" (full scan).
+	Plan string `json:"plan"`
+	// Parallelism is the configured per-query worker cap; Shards is the shard count.
+	Parallelism int `json:"parallelism"`
+	Shards      int `json:"shards"`
+}
+
+// ExplainQuery reports how the store would execute q: which of its conjuncts are
+// index-usable, and the resulting access path (indexed / parallel scan / serial
+// scan). It performs no I/O beyond reading the current index spec.
+func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
+	probes := q.Probes()
+	usable := c.planIndex(probes)
+	ex := QueryExplain{
+		Native:      q.Native(),
+		IndexUsable: len(usable),
+		Parallelism: c.queryPar,
+		Shards:      len(c.shards),
+	}
+	for _, p := range probes {
+		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
+		pe.Indexed, pe.Kind = c.probeIndexKind(p)
+		ex.Probes = append(ex.Probes, pe)
+	}
+	switch {
+	case len(usable) > 0:
+		ex.Plan = "indexed"
+	case c.queryPar > 1:
+		ex.Plan = "parallel-scan"
+	default:
+		ex.Plan = "serial-scan"
+	}
+	return ex
+}
+
+// probeIndexKind reports whether a probe's attribute is indexed and, if so, its
+// index kind and whether this probe's operator can use it (mirrors planIndex's
+// per-probe decision).
+func (c *Collection) probeIndexKind(p vm.Probe) (indexed bool, kind string) {
+	spec := c.spec.Load()
+	if !spec.any() {
+		return false, ""
+	}
+	var id uint32
+	var ok bool
+	if spec.inline {
+		id, ok = spec.nameToID[strings.ToLower(p.Attr)]
+	} else {
+		id, ok = c.intern.LookupID(p.Attr)
+	}
+	if !ok {
+		return false, ""
+	}
+	if _, isCat := spec.cat[id]; isCat {
+		_, usable := catUsable(id, p)
+		return usable, "categorical"
+	}
+	if _, isVal := spec.val[id]; isVal {
+		_, usable := valUsable(id, p)
+		return usable, "value"
+	}
+	return false, ""
+}
+
 func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 	spec := c.spec.Load()
 	if !spec.any() {

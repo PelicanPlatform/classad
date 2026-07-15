@@ -38,6 +38,11 @@ const (
 	// nGroup group values then the nAgg aggregate values (all as strings, in
 	// order), then a terminator.
 	opAggregate op = 15
+
+	// Diagnostics and index/hot-set management.
+	opDiag    op = 16 // -> [json Diagnostics] (storage stats, hot attrs, indexes, suggestions)
+	opExplain op = 17 // [constraint] -> [json db.QueryExplain] (query access path)
+	opAdmin   op = 18 // [action][nArgs i32]{[arg]} -> [message]; mutating (refused read-only)
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -73,6 +78,12 @@ func (o op) String() string {
 		return "Ordered"
 	case opAggregate:
 		return "Aggregate"
+	case opDiag:
+		return "Diagnostics"
+	case opExplain:
+		return "Explain"
+	case opAdmin:
+		return "Admin"
 	}
 	return "op(unknown)"
 }

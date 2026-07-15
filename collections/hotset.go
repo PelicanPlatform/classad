@@ -51,6 +51,28 @@ func (c *Collection) RefreshHotSet(sampleMax, topN int) int {
 	return topN
 }
 
+// AddHotAttrs pins the named attributes into the hot set (front-loaded in future
+// writes' hot headers), merging them with the current set, and returns the
+// resulting hot attribute names. Unlike RefreshHotSet, which recomputes the set
+// from sampled frequency, this forces specific attributes in regardless of how
+// often they appear. Interned (RAM) collections only; a no-op with no intern
+// table (inline/persistent), where the hot set is fixed at open.
+func (c *Collection) AddHotAttrs(names ...string) []string {
+	if c.intern == nil {
+		return c.HotAttrNames()
+	}
+	cur := c.currentHotSet()
+	set := make(map[uint32]struct{}, len(cur)+len(names))
+	for id := range cur {
+		set[id] = struct{}{}
+	}
+	for _, n := range names {
+		set[c.intern.Intern(n)] = struct{}{}
+	}
+	c.hotSet.Store(&hotSetHolder{set})
+	return c.HotAttrNames()
+}
+
 // HotAttrNames returns the current hot attributes by name (for diagnostics).
 func (c *Collection) HotAttrNames() []string {
 	set := c.currentHotSet()

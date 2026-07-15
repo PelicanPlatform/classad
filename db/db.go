@@ -151,6 +151,60 @@ func (db *DB) LookupClassAd(key string) (*classad.ClassAd, bool) {
 // its keyspace before a full re-sync (see the leader-follower replicator).
 func (db *DB) Keys() []string { return db.c.Keys() }
 
+// Diagnostic and management types, re-exported from collections for callers that
+// only import db.
+type (
+	Stats           = collections.Stats
+	IndexSuggestion = collections.IndexSuggestion
+	DropSuggestion  = collections.DropSuggestion
+	QueryExplain    = collections.QueryExplain
+)
+
+// Stats returns a snapshot of the store's storage (ad count, segment/arena/dead
+// bytes) for observability.
+func (db *DB) Stats() Stats { return db.c.Stats() }
+
+// HotAttrs returns the current hot attributes (front-loaded in each ad's hot
+// header for cheap access).
+func (db *DB) HotAttrs() []string { return db.c.HotAttrNames() }
+
+// IndexedAttrs returns the currently-indexed attribute names, split into
+// categorical (string equality/membership) and value (numeric + range) indexes.
+func (db *DB) IndexedAttrs() (categorical, value []string) { return db.c.IndexedAttrs() }
+
+// SuggestDrops recommends indexes to drop (unused or low-cardinality) from
+// observed demand and a sample of up to sampleMax live ads.
+func (db *DB) SuggestDrops(sampleMax int) []DropSuggestion { return db.c.SuggestDrops(sampleMax) }
+
+// Explain reports how the store would execute a constraint query -- which
+// conjuncts are index-usable and the resulting access path.
+func (db *DB) Explain(constraint string) (QueryExplain, error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return QueryExplain{}, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.ExplainQuery(q), nil
+}
+
+// AddIndex adds categorical and/or value indexes at runtime, returning whether
+// the configuration changed. Newly-indexed attributes are backfilled.
+func (db *DB) AddIndex(categorical, value []string) bool { return db.c.AddIndex(categorical, value) }
+
+// DropIndex removes the named attributes from the configured indexes, returning
+// whether the configuration changed.
+func (db *DB) DropIndex(names ...string) bool { return db.c.DropIndex(names...) }
+
+// Reindex rebuilds all configured indexes from the live ads.
+func (db *DB) Reindex() { db.c.Reindex() }
+
+// AddHotAttrs pins the named attributes into the hot set and returns the
+// resulting hot attributes.
+func (db *DB) AddHotAttrs(names ...string) []string { return db.c.AddHotAttrs(names...) }
+
+// RefreshHotSet recomputes the hot set as the topN most frequent attributes from
+// a sample of up to sampleMax live ads, returning how many were chosen.
+func (db *DB) RefreshHotSet(sampleMax, topN int) int { return db.c.RefreshHotSet(sampleMax, topN) }
+
 // ForEach calls fn for every committed ad, in no particular order, until fn returns
 // false. It reads a consistent snapshot (concurrent writers do not block it).
 func (db *DB) ForEach(fn func(ad *classad.ClassAd) bool) {

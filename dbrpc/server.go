@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,7 +56,7 @@ type ServeOptions struct {
 // read-only connection).
 func (o op) isMutating() bool {
 	switch o {
-	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr:
+	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin:
 		return true
 	}
 	return false
@@ -353,6 +354,47 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 			}
 			return putStr(resp(reqID, stOK), adString(ad, includePrivate))
 		})
+
+	case opDiag:
+		data, err := s.diagJSON()
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putStr(resp(reqID, stOK), string(data))
+
+	case opExplain:
+		constraint := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		ex, err := s.db.Explain(constraint)
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		data, err := json.Marshal(ex)
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putStr(resp(reqID, stOK), string(data))
+
+	case opAdmin:
+		action := r.str()
+		n := int(r.i32())
+		if r.err != nil || n < 0 || n > 1024 {
+			return respBad(reqID)
+		}
+		args := make([]string, n)
+		for i := range args {
+			args[i] = r.str()
+		}
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		msg, err := s.admin(action, args)
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putStr(resp(reqID, stOK), msg)
 	}
 	return respBad(reqID)
 }
