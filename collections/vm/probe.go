@@ -10,7 +10,9 @@ import (
 // Probe is an index-satisfiable constraint extracted from a query: a self-scoped
 // attribute Attr related by Op to one or more literal values. Op is one of
 // "==","!=","<","<=",">=",">" (a single Val) or "in" (a set of Vals, from an
-// OR-of-equalities). A store matches Probes against its configured indexes to
+// OR-of-equalities); `=?=` (identity) is normalized to "==" since the index yields
+// a superset that the store's re-verify narrows. A store matches Probes against its
+// configured indexes to
 // build a candidate set; because the store still re-verifies the full query, any
 // Probe the planner omits only costs selectivity, never correctness.
 type Probe struct {
@@ -101,6 +103,17 @@ func probeFrom(c ast.Expr) (Probe, bool) {
 	switch b.Op {
 	case "==", "!=", "<", "<=", ">", ">=":
 		return cmpProbe(b.Op, b.Left, b.Right)
+	case "is":
+		// =?= (identity) is index-satisfiable exactly like ==, so plan it as ==.
+		// The index yields a superset of =?='s matches — categorical postings are
+		// case-folded and value postings fold int/real, both admitting more than
+		// =?='s strict, case-sensitive, same-type identity — and the store
+		// re-verifies every candidate against the real expression, narrowing back to
+		// =?=. Absent attributes are never posted and `attr =?= literal` is false for
+		// them, so they are correctly excluded. (=!=/"isnt" is deliberately NOT added:
+		// it must match absent and case/type-differing records, which the case-folded
+		// != posting path would wrongly drop.)
+		return cmpProbe("==", b.Left, b.Right)
 	case "||":
 		return orEqProbe(b)
 	}

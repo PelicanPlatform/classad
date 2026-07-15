@@ -104,6 +104,11 @@ func TestIndexMatchesFullScan(t *testing.T) {
 		`Rank > 5`,                                       // non-indexed attr -> full scan
 		`Cpus >= 2 && Nonexistent == "x"`,                // one indexed, one non-indexed
 		`Memory > 1024*3`,                                // constant folding
+		`Arch =?= "X86_64"`,                              // identity: case-sensitive, only the exact case
+		`Arch =?= "x86_64"`,                              // identity: the other case variant only
+		`Owner =?= "alice" || Owner =?= "bob"`,           // identity OR-chain -> membership
+		`Cpus =?= 3`,                                     // numeric identity
+		`Arch =!= "aarch64" && Cpus >= 2`,                // isnt (not indexed) alongside an indexed probe
 	}
 	for _, qs := range queries {
 		q, err := vm.Parse(qs)
@@ -115,6 +120,35 @@ func TestIndexMatchesFullScan(t *testing.T) {
 		if !equalInts(got, want) {
 			t.Errorf("query %q:\n  index got %d matches\n  brute   %d matches\n  got=%v\n  want=%v",
 				qs, len(got), len(want), got, want)
+		}
+	}
+}
+
+// TestMetaEqualsUsesIndex asserts the planner change directly: `=?=` (identity) is
+// planned as an indexed access path (like `==`), while `=!=` (isnt) is not indexed
+// and falls back to a scan. Correctness of both is covered by TestIndexMatchesFullScan.
+func TestMetaEqualsUsesIndex(t *testing.T) {
+	t.Parallel()
+	c, _ := buildIndexedCorpus(t)
+	cases := []struct {
+		query       string
+		wantIndexed bool
+	}{
+		{`Arch =?= "X86_64"`, true},  // identity on a categorical index
+		{`Cpus =?= 3`, true},         // identity on a value index
+		{`Arch == "X86_64"`, true},   // the == it is planned like
+		{`Arch =!= "aarch64"`, false}, // isnt: deliberately not indexed
+	}
+	for _, tc := range cases {
+		q, err := vm.Parse(tc.query)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.query, err)
+		}
+		ex := c.ExplainQuery(q)
+		gotIndexed := ex.Plan == "indexed"
+		if gotIndexed != tc.wantIndexed {
+			t.Errorf("query %q: plan=%q indexUsable=%d, want indexed=%v",
+				tc.query, ex.Plan, ex.IndexUsable, tc.wantIndexed)
 		}
 	}
 }
