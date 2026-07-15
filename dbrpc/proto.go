@@ -48,6 +48,11 @@ const (
 	opCreateTable op = 19 // [table] -> status; mutating
 	opDropTable   op = 20 // [table] -> status; mutating
 	opListTables  op = 21 // -> [n i32]{[name]}
+
+	// opMatchTables is cross-table matchmaking (bilateral Requirements/Rank):
+	// [reqTable][resTable][keyAttr][reqWhere][targetWhere][limit i32] -> stream of
+	// [requestKey][resourceKey][rank] (best-ranked first, up to limit per request).
+	opMatchTables op = 22
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -95,6 +100,8 @@ func (o op) String() string {
 		return "DropTable"
 	case opListTables:
 		return "ListTables"
+	case opMatchTables:
+		return "MatchTables"
 	}
 	return "op(unknown)"
 }
