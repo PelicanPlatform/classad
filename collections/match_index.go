@@ -83,9 +83,11 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
 		return ex
 	}
 	ex.HasRequirements = true
-	slotExpr := slotMatchExpr(reqExpr, jobValues(job))
-	ex.SlotPredicate = slotExpr.String()
-	plan := vm.Compile(slotExpr).ProbePlan()
+	jobVals := jobValues(job)
+	// Display: honest, baked, de-duplicated (functions kept, not shown as undefined).
+	ex.SlotPredicate = slotDisplayExpr(reqExpr, jobVals)
+	// Probes: from the probe rewrite (opaque functions -> undefined, so they drop).
+	plan := vm.Compile(slotMatchExpr(reqExpr, jobVals)).ProbePlan()
 	_, prunable := c.planIndexGroups(plan)
 	for _, g := range plan {
 		for _, p := range g.Probes {
@@ -214,6 +216,82 @@ func slotMatchExpr(reqExpr ast.Expr, jobVals map[string]classad.Value) ast.Expr 
 		pred = &ast.BinaryOp{Op: "||", Left: pred, Right: exc}
 	}
 	return pred
+}
+
+// slotDisplayExpr rewrites the job's Requirements over the slot for a HUMAN-READABLE
+// explanation: like rewriteForSlot it maps TARGET.attr to the slot's own attribute and
+// bakes the job's constant values, but it PRESERVES functions and control-flow (their
+// arguments baked) instead of collapsing them to undefined. So an opaque conjunct reads
+// as `HasFileTransfer && stringListIMember("osdf", HasFileTransferPluginMethods)` -- what
+// it really is -- rather than `HasFileTransfer && undefined`. It is display-only; probe
+// extraction uses slotMatchExpr. Top-level conjuncts are de-duplicated (a Requirements
+// that repeats `TARGET.HasSingularity` shows it once).
+func slotDisplayExpr(reqExpr ast.Expr, jobVals map[string]classad.Value) string {
+	folded := classad.FoldConstants(displayRewrite(reqExpr, jobVals))
+	conj := dedupConjuncts(folded)
+	parts := make([]string, len(conj))
+	for i, c := range conj {
+		parts[i] = c.String()
+	}
+	return strings.Join(parts, " && ")
+}
+
+func displayRewrite(e ast.Expr, jobVals map[string]classad.Value) ast.Expr {
+	switch n := e.(type) {
+	case *ast.AttributeReference:
+		if n.Scope == ast.TargetScope {
+			return &ast.AttributeReference{Name: n.Name, Scope: ast.NoScope}
+		}
+		if v, ok := jobVals[strings.ToLower(n.Name)]; ok {
+			if lit := valueToLiteral(v); lit != nil {
+				return lit
+			}
+		}
+		return &ast.UndefinedLiteral{}
+	case *ast.BinaryOp:
+		return &ast.BinaryOp{Op: n.Op, Left: displayRewrite(n.Left, jobVals), Right: displayRewrite(n.Right, jobVals)}
+	case *ast.UnaryOp:
+		return &ast.UnaryOp{Op: n.Op, Expr: displayRewrite(n.Expr, jobVals)}
+	case *ast.ParenExpr:
+		return &ast.ParenExpr{Inner: displayRewrite(n.Inner, jobVals)}
+	case *ast.ConditionalExpr:
+		return &ast.ConditionalExpr{Condition: displayRewrite(n.Condition, jobVals), TrueExpr: displayRewrite(n.TrueExpr, jobVals), FalseExpr: displayRewrite(n.FalseExpr, jobVals)}
+	case *ast.ElvisExpr:
+		return &ast.ElvisExpr{Left: displayRewrite(n.Left, jobVals), Right: displayRewrite(n.Right, jobVals)}
+	case *ast.FunctionCall:
+		args := make([]ast.Expr, len(n.Args))
+		for i := range n.Args {
+			args[i] = displayRewrite(n.Args[i], jobVals)
+		}
+		return &ast.FunctionCall{Name: n.Name, Args: args}
+	default:
+		return e
+	}
+}
+
+// dedupConjuncts flattens the top-level && spine and drops later conjuncts equal (by
+// unparsed text) to an earlier one, preserving first-seen order.
+func dedupConjuncts(e ast.Expr) []ast.Expr {
+	var out []ast.Expr
+	seen := map[string]bool{}
+	var walk func(ast.Expr)
+	walk = func(x ast.Expr) {
+		if p, ok := x.(*ast.ParenExpr); ok {
+			walk(p.Inner)
+			return
+		}
+		if b, ok := x.(*ast.BinaryOp); ok && b.Op == "&&" {
+			walk(b.Left)
+			walk(b.Right)
+			return
+		}
+		if s := x.String(); !seen[s] {
+			seen[s] = true
+			out = append(out, x)
+		}
+	}
+	walk(e)
+	return out
 }
 
 // slotMatchPlan builds the DNF index plan for matching job against this collection: the
