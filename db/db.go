@@ -31,6 +31,7 @@ type DB struct {
 	c        *collections.Collection
 	id       string // stable database identity (persisted; random for in-memory)
 	instance string // this open's instance identity (fresh each Open)
+	dir      string // on-disk directory ("" for in-memory); where index config persists
 }
 
 // OrderSpec, SortKey, OrderedAd, OrderCursor configure and drive maintained ordered
@@ -87,7 +88,11 @@ func OpenConfig(cfg Config) (*DB, error) {
 			return nil, err
 		}
 	}
-	return &DB{c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID()}, nil
+	db := &DB{c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID(), dir: cfg.Dir}
+	// Reapply any index/hot-set configuration persisted by a previous run's
+	// runtime changes (AddIndex/AddHotAttrs/...), so they survive a restart.
+	db.loadIndexConfig()
+	return db, nil
 }
 
 // ID is the stable database identity (same across reopens of a persistent store).
@@ -187,23 +192,46 @@ func (db *DB) Explain(constraint string) (QueryExplain, error) {
 }
 
 // AddIndex adds categorical and/or value indexes at runtime, returning whether
-// the configuration changed. Newly-indexed attributes are backfilled.
-func (db *DB) AddIndex(categorical, value []string) bool { return db.c.AddIndex(categorical, value) }
+// the configuration changed. The spec is updated immediately; call Reindex to
+// build the new index over existing ads. A change is persisted so it survives a
+// restart.
+func (db *DB) AddIndex(categorical, value []string) bool {
+	changed := db.c.AddIndex(categorical, value)
+	if changed {
+		db.saveIndexConfig()
+	}
+	return changed
+}
 
 // DropIndex removes the named attributes from the configured indexes, returning
-// whether the configuration changed.
-func (db *DB) DropIndex(names ...string) bool { return db.c.DropIndex(names...) }
+// whether the configuration changed. A change is persisted.
+func (db *DB) DropIndex(names ...string) bool {
+	changed := db.c.DropIndex(names...)
+	if changed {
+		db.saveIndexConfig()
+	}
+	return changed
+}
 
 // Reindex rebuilds all configured indexes from the live ads.
 func (db *DB) Reindex() { db.c.Reindex() }
 
 // AddHotAttrs pins the named attributes into the hot set and returns the
-// resulting hot attributes.
-func (db *DB) AddHotAttrs(names ...string) []string { return db.c.AddHotAttrs(names...) }
+// resulting hot attributes. The hot set is persisted.
+func (db *DB) AddHotAttrs(names ...string) []string {
+	hot := db.c.AddHotAttrs(names...)
+	db.saveIndexConfig()
+	return hot
+}
 
 // RefreshHotSet recomputes the hot set as the topN most frequent attributes from
-// a sample of up to sampleMax live ads, returning how many were chosen.
-func (db *DB) RefreshHotSet(sampleMax, topN int) int { return db.c.RefreshHotSet(sampleMax, topN) }
+// a sample of up to sampleMax live ads, returning how many were chosen. The
+// resulting hot set is persisted.
+func (db *DB) RefreshHotSet(sampleMax, topN int) int {
+	n := db.c.RefreshHotSet(sampleMax, topN)
+	db.saveIndexConfig()
+	return n
+}
 
 // Compact reclaims dead space in shards whose dead-byte ratio warrants it,
 // returning the number of shards compacted.

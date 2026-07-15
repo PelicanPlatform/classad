@@ -53,19 +53,20 @@ func (s *Server) admin(action string, args []string) (string, error) {
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
 		}
-		changed := s.db.AddIndex(args, nil)
-		return changedMsg("categorical index on "+join(args), changed), nil
+		return s.addIndex("categorical index on "+join(args), args, nil), nil
 	case "index.add.value":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.value needs at least one attribute")
 		}
-		changed := s.db.AddIndex(nil, args)
-		return changedMsg("value index on "+join(args), changed), nil
+		return s.addIndex("value index on "+join(args), nil, args), nil
 	case "index.drop":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.drop needs at least one attribute")
 		}
 		changed := s.db.DropIndex(args...)
+		if changed {
+			s.db.Reindex() // rebuild segment indexes so the dropped postings are reclaimed
+		}
 		return changedMsg("dropped index on "+join(args), changed), nil
 	case "index.reindex":
 		s.db.Reindex()
@@ -96,6 +97,19 @@ func (s *Server) admin(action string, args []string) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown admin action %q", action)
 	}
+}
+
+// addIndex adds an index and, when the spec changed, reindexes so the new index
+// is built over the existing ads (AddIndex updates only the spec; existing
+// segments' indexes are rebuilt by Reindex). Without this the index would apply
+// only to future writes and would not prune the current data.
+func (s *Server) addIndex(what string, categorical, value []string) string {
+	changed := s.db.AddIndex(categorical, value)
+	if !changed {
+		return what + " (no change)"
+	}
+	s.db.Reindex()
+	return what + " (changed; reindexed existing ads)"
 }
 
 func changedMsg(what string, changed bool) string {
