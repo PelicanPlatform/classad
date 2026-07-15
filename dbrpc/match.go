@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"strconv"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -72,7 +73,7 @@ type matchResult struct {
 // resource-side filter (targetWhere) is applied to the ranked matches. With
 // significant attributes supplied, identical requests (by signature) reuse a
 // single cached candidate computation.
-func (s *Server) streamMatchTables(reqID uint64, r *reader, write func([]byte)) {
+func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader, write func([]byte)) {
 	reqTable := r.str()
 	resTable := r.str()
 	keyAttr := r.str()
@@ -148,6 +149,9 @@ func (s *Server) streamMatchTables(reqID uint64, r *reader, write func([]byte)) 
 		return
 	}
 	for reqAd := range seq {
+		if cancelled(ctx) {
+			return // client gone: stop matchmaking the remaining requests
+		}
 		reqKey := attrKey(reqAd, keyAttr)
 		var rows []matchResult
 		if useCache {

@@ -192,15 +192,15 @@ func (sc *serverConn) dispatch(frame []byte) {
 	priv := sc.opts.IncludePrivate
 	switch o {
 	case opQuery:
-		sc.s.streamQuery(reqID, body, priv, sc.write)
+		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write)
 	case opMatchSorted:
-		sc.s.streamMatchSorted(reqID, body, priv, sc.write)
+		sc.s.streamMatchSorted(sc.ctx, reqID, body, priv, sc.write)
 	case opOrdered:
-		sc.s.streamOrdered(reqID, body, priv, sc.write)
+		sc.s.streamOrdered(sc.ctx, reqID, body, priv, sc.write)
 	case opAggregate:
-		sc.s.streamAggregate(reqID, body, priv, sc.write)
+		sc.s.streamAggregate(sc.ctx, reqID, body, priv, sc.write)
 	case opMatchTables:
-		sc.s.streamMatchTables(reqID, body, sc.write)
+		sc.s.streamMatchTables(sc.ctx, reqID, body, sc.write)
 	case opWatch:
 		sc.streamWatch(reqID, body)
 	case opWatchStop:
@@ -208,6 +208,18 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.write(resp(reqID, stOK))
 	default:
 		sc.write(sc.s.handle(reqID, o, body, priv))
+	}
+}
+
+// cancelled reports whether ctx is done -- checked in streaming loops so a long
+// scan/match stops promptly when the client disconnects (the connection's context
+// is cancelled when ServeConn returns).
+func cancelled(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return true
+	default:
+		return false
 	}
 }
 
@@ -272,7 +284,7 @@ func (sc *serverConn) stopWatch(watchReqID uint64) {
 // streamQuery streams the committed ads matching a constraint. Each result is its own
 // frame under reqID, so its frames interleave with other calls' -- no head-of-line
 // blocking -- and end with a terminator.
-func (s *Server) streamQuery(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	table := r.str()
 	limit := int(r.i32())
 	constraint := r.str()
@@ -293,6 +305,9 @@ func (s *Server) streamQuery(reqID uint64, r *reader, includePrivate bool, write
 	// LIMIT does proportionally less work instead of scanning everything.
 	n := 0
 	for ad := range seq {
+		if cancelled(ctx) {
+			return // client gone: stop the scan
+		}
 		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
 		n++
 		if limit > 0 && n >= limit {
@@ -303,7 +318,8 @@ func (s *Server) streamQuery(reqID uint64, r *reader, includePrivate bool, write
 }
 
 // streamMatchSorted streams job's ranked matches (best first, up to limit).
-func (s *Server) streamMatchSorted(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamMatchSorted(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	_ = ctx
 	table := r.str()
 	limit := r.i32()
 	jobText := r.str()
@@ -329,7 +345,8 @@ func (s *Server) streamMatchSorted(reqID uint64, r *reader, includePrivate bool,
 // streamOrdered streams one partition of an ordered index in sort order, each ad with
 // its cluster signature (for resource-request-list folding). One-shot: the in-memory
 // resume cursor is not carried over the wire, so a full partition is streamed.
-func (s *Server) streamOrdered(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamOrdered(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	_ = ctx
 	table := r.str()
 	index := r.i32()
 	partition := r.str()

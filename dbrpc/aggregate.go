@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"strconv"
 	"strings"
 
@@ -87,7 +88,7 @@ func (c *Client) AggregateTable(table, constraint string, groupBy []string, aggs
 // streamAggregate performs the server-side aggregation and streams one frame per
 // group. It refuses to group or aggregate on a private attribute for a
 // connection that may not see private data.
-func (s *Server) streamAggregate(reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	table := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -150,6 +151,9 @@ func (s *Server) streamAggregate(reqID uint64, r *reader, includePrivate bool, w
 	var order []string
 	scratch := make([]string, nGroup)
 	for vals := range seq {
+		if cancelled(ctx) {
+			return // client gone: stop the scan
+		}
 		for i := range groupBy {
 			scratch[i] = valueText(vals[groupCol[i]])
 		}
