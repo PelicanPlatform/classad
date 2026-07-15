@@ -17,17 +17,22 @@ type MatchRow struct {
 	Rank     string
 }
 
-// MatchTables performs cross-table matchmaking: for each ad in reqTable matching
-// reqWhere, it finds the top-limit bilaterally-matching resources in resTable
-// (ranked by the request's Rank), with the resource-side filter targetWhere
-// applied. keyAttr is the ad attribute holding each row's key.
+// MatchTables performs cross-table matchmaking as a greedy assignment: it walks
+// the requests in reqTable matching reqWhere (in table order) and gives each one
+// the single best-ranked resource in resTable — bilaterally matching, passing the
+// resource-side filter targetWhere, and not already assigned to an earlier
+// request — then removes that resource from the pool. limit bounds the number of
+// *requests* assigned (the first `limit` in order), not resources per request. The
+// result is one row per assigned request (Resource is "" when it could not be
+// placed). keyAttr is the ad attribute holding each row's key.
 //
 // significantAttrs, if non-empty, enables autoclustering: requests whose
-// significant attributes are textually identical share one candidate computation
-// (the matchmaking runs once per distinct signature and is reused), mirroring
-// HTCondor's significant-attribute autoclusters. It must list every attribute the
-// match depends on (the request's Requirements and Rank, and the request
-// attributes the resources' Requirements reference).
+// significant attributes are textually identical share one ranked-candidate
+// computation (the matchmaking runs once per distinct signature and is reused;
+// assignment still consumes resources per request), mirroring HTCondor's
+// significant-attribute autoclusters. It must list every attribute the match
+// depends on (the request's Requirements and Rank, and the request attributes the
+// resources' Requirements reference).
 func (c *Client) MatchTables(reqTable, resTable, keyAttr, reqWhere, targetWhere string, limit int, significantAttrs []string) ([]MatchRow, error) {
 	_, frames, err := c.callStream(func(id uint64) []byte {
 		b := putStr(req(id, opMatchTables), reqTable)
@@ -67,12 +72,14 @@ type matchResult struct {
 	rank        string
 }
 
-// streamMatchTables matchmakes each request ad against the resource table and
-// streams the ranked results. The request's Requirements prunes candidate slots
-// via any covering index (the matchmaking pushdown, in MatchSortedRanked); the
-// resource-side filter (targetWhere) is applied to the ranked matches. With
-// significant attributes supplied, identical requests (by signature) reuse a
-// single cached candidate computation.
+// streamMatchTables greedily assigns resources to requests and streams one row per
+// request (best-ranked unclaimed resource, or empty when unplaceable), consuming
+// each assigned resource so no two requests share one. The request's Requirements
+// prunes candidate slots via any covering index (the matchmaking pushdown, in
+// MatchSortedRanked); the resource-side filter (targetWhere) is applied to the
+// ranked candidates. limit caps the number of requests assigned. With significant
+// attributes supplied, identical requests (by signature) reuse a single cached
+// ranked-candidate list (assignment still consumes resources per request).
 func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader, write func([]byte)) {
 	reqTable := r.str()
 	resTable := r.str()
@@ -114,16 +121,13 @@ func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader,
 		resFilter = f
 	}
 
-	// compute matchmakes one request ad against the resource table, applying the
-	// resource filter, returning the top-limit ranked results.
-	compute := func(reqAd *classad.ClassAd) []matchResult {
-		// Without a resource filter, push the limit into the match (deferred
-		// materialization). With one, take all matches, filter, then cap.
-		matchLimit := limit
-		if resFilter != nil {
-			matchLimit = 0
-		}
-		matches := resDB.MatchSortedRanked(reqAd, matchLimit)
+	// candidatesFor returns a request's full ranked candidate list (best first),
+	// with the resource-side filter applied. It is NOT limited: assignment consumes
+	// machines, so a later job may need one ranked past every machine an earlier job
+	// claimed. Under autoclustering this list is computed once per signature and
+	// shared, so the full-list cost is paid once for a whole autocluster.
+	candidatesFor := func(reqAd *classad.ClassAd) []matchResult {
+		matches := resDB.MatchSortedRanked(reqAd, 0)
 		out := make([]matchResult, 0, len(matches))
 		for i := range matches {
 			m := matches[i]
@@ -131,46 +135,65 @@ func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader,
 				continue
 			}
 			out = append(out, matchResult{resourceKey: attrKey(m.Ad, keyAttr), rank: rankText(m)})
-			if limit > 0 && len(out) >= limit {
-				break
-			}
 		}
 		return out
 	}
 
 	// Autocluster cache: signature -> ranked candidate list (identical requests
-	// reuse it). Empty significant-attrs disables it (match each request).
+	// reuse it). Empty significant-attrs disables it (recompute each request).
 	cache := map[uint64][]matchResult{}
 	useCache := len(sigAttrs) > 0
+
+	// claimed holds machines already assigned to an earlier job; greedy assignment
+	// walks each job's ranked candidates and takes the best one not yet claimed,
+	// removing it from the pool. limit bounds the number of *jobs* assigned.
+	claimed := map[string]bool{}
 
 	seq, err := reqDB.Query(orTrue(reqWhere))
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
 	}
+	jobs := 0
 	for reqAd := range seq {
 		if cancelled(ctx) {
-			return // client gone: stop matchmaking the remaining requests
+			return // client gone: stop assigning the remaining jobs
 		}
+		if limit > 0 && jobs >= limit {
+			break // limit reached: only the first `limit` jobs are assigned
+		}
+		jobs++
 		reqKey := attrKey(reqAd, keyAttr)
-		var rows []matchResult
+
+		var candidates []matchResult
 		if useCache {
 			sig := db.MatchSignature(reqAd, sigAttrs)
 			cached, hit := cache[sig]
 			if !hit {
-				cached = compute(reqAd)
+				cached = candidatesFor(reqAd)
 				cache[sig] = cached
 			}
-			rows = cached
+			candidates = cached
 		} else {
-			rows = compute(reqAd)
+			candidates = candidatesFor(reqAd)
 		}
-		for _, row := range rows {
-			b := putStr(respHead(reqID, stStream), reqKey)
-			b = putStr(b, row.resourceKey)
-			b = putStr(b, row.rank)
-			write(b)
+
+		// Take this job's best-ranked machine that no earlier job has claimed. An
+		// empty resource means the job could not be placed (its candidates were all
+		// claimed, or it had none). One row per job either way.
+		var got matchResult
+		for _, cand := range candidates {
+			if claimed[cand.resourceKey] {
+				continue
+			}
+			claimed[cand.resourceKey] = true
+			got = cand
+			break
 		}
+		b := putStr(respHead(reqID, stStream), reqKey)
+		b = putStr(b, got.resourceKey)
+		b = putStr(b, got.rank)
+		write(b)
 	}
 	write(respHead(reqID, stStreamEnd))
 }
