@@ -73,6 +73,62 @@ func TestSuggestIndexes(t *testing.T) {
 	}
 }
 
+// TestSuggestIndexesPersistent covers the on-disk (inline-name) store, whose records
+// carry no intern ids: SuggestIndexes/profileAttrs must profile by name (ForEachNamed),
+// not by interned id, or a persistent collection would never suggest anything -- and
+// it must keep working after a reopen recovers the segments.
+func TestSuggestIndexesPersistent(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	populate := func(c *Collection) {
+		owners := []string{"alice", "bob", "carol"}
+		for i := 0; i < 200; i++ {
+			ad, err := classad.Parse(fmt.Sprintf(`[ Owner="%s"; JobStatus=%d ]`, owners[i%3], i%5))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	check := func(c *Collection, phase string) {
+		for i := 0; i < 4; i++ {
+			drainQuery(t, c, `JobStatus == 1`)
+			drainQuery(t, c, `Owner == "alice"`)
+		}
+		got := suggestionMap(c.SuggestIndexes(1000))
+		if s, ok := got["JobStatus"]; !ok || s.Kind != "value" || s.QueriesEq == 0 {
+			t.Errorf("%s: want a value suggestion for JobStatus, got %+v", phase, got["JobStatus"])
+		}
+		if s, ok := got["Owner"]; !ok || s.Kind != "categorical" || s.QueriesEq == 0 {
+			t.Errorf("%s: want a categorical suggestion for Owner, got %+v", phase, got["Owner"])
+		}
+	}
+
+	c, err := Open(Options{Dir: dir, Shards: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	populate(c)
+	check(c, "fresh persistent")
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen: records are recovered from the sealed segments (still inline, no intern
+	// ids); demand resets, so re-query, then suggestions must work again.
+	c2, err := Open(Options{Dir: dir, Shards: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	if c2.Len() != 200 {
+		t.Fatalf("recovered %d ads, want 200", c2.Len())
+	}
+	check(c2, "reopened persistent")
+}
+
 // TestSuggestIndexesExcludesConfigured verifies an already-indexed attribute is not
 // re-suggested.
 func TestSuggestIndexesExcludesConfigured(t *testing.T) {

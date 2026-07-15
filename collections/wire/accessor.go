@@ -158,6 +158,55 @@ func (a Ad) ForEach(fn func(id uint32, node []byte) bool) bool {
 	return c.ok
 }
 
+// ForEachNamed calls fn with each attribute's name and raw node bytes. Inline-name
+// ads (flagInlineNames, written by a persistent collection) yield their stored names
+// directly; interned ads resolve each id to a name via t (an id t cannot resolve is
+// skipped). Unlike ForEach -- which always reads the key as an interned id and so is
+// wrong for inline ads -- this works for both encodings. Returns false if fn stopped
+// early or the ad is malformed.
+func (a Ad) ForEachNamed(t *InternTable, fn func(name string, node []byte) bool) bool {
+	c, ok := a.bodyStart()
+	if !ok {
+		return false
+	}
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	attrCount := c.uvarint()
+	for i := uint64(0); i < attrCount && c.ok; i++ {
+		var name string
+		if c.inline {
+			nm := c.readNameBytes()
+			if !c.ok {
+				return false
+			}
+			name = string(nm)
+		} else {
+			aid := c.uvarint()
+			if !c.ok {
+				return false
+			}
+			n, ok := t.Name(uint32(aid))
+			if !ok {
+				skipNode(c, 0) // unresolved id: skip its node and continue
+				continue
+			}
+			name = n
+		}
+		nodeStart := c.pos
+		skipNode(c, 0)
+		if !c.ok {
+			return false
+		}
+		if !fn(name, a[nodeStart:c.pos]) {
+			return true
+		}
+	}
+	return c.ok
+}
+
 // HotClosureComplete reports whether the ad's hot header holds the complete match
 // closure (flagHotClosure): ForEachHot then yields every attribute the match reads,
 // so the matcher can trust it without scanning the ad body.

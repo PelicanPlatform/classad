@@ -59,6 +59,7 @@ const maxDistinctSample = 4096
 
 // attrProfile is one attribute's shape across the sampled ads.
 type attrProfile struct {
+	name     string // first-seen original-case spelling (for display)
 	present  int
 	strCount int
 	numCount int // int/real/bool literals (index-normalized to float64)
@@ -79,15 +80,19 @@ func (p *attrProfile) addDistinct(k string) {
 }
 
 // profileAttrs samples up to sampleMax live ads and profiles every attribute seen,
-// keyed by interned id.
-func (c *Collection) profileAttrs(sampleMax int) map[uint32]*attrProfile {
-	profiles := map[uint32]*attrProfile{}
+// keyed by folded (case-insensitive) name so it joins directly with the name-keyed
+// demand map. ForEachNamed reads both encodings -- interned ids (in-memory store) and
+// inline names (persistent store) -- so profiling works on a recovered collection,
+// which carries no intern ids (the id-based ForEach would have yielded nothing).
+func (c *Collection) profileAttrs(sampleMax int) map[string]*attrProfile {
+	profiles := map[string]*attrProfile{}
 	for _, w := range c.CollectSamples(sampleMax) {
-		wire.Ad(w).ForEach(func(id uint32, node []byte) bool {
-			p := profiles[id]
+		wire.Ad(w).ForEachNamed(c.intern, func(name string, node []byte) bool {
+			fold := strings.ToLower(name)
+			p := profiles[fold]
 			if p == nil {
-				p = &attrProfile{distinct: map[string]struct{}{}}
-				profiles[id] = p
+				p = &attrProfile{name: name, distinct: map[string]struct{}{}}
+				profiles[fold] = p
 			}
 			p.present++
 			lit, ok := wire.LiteralValue(node)
@@ -171,22 +176,18 @@ func (c *Collection) SuggestIndexes(sampleMax int) []IndexSuggestion {
 		if eq == 0 && rng == 0 {
 			return true
 		}
-		id, ok := c.intern.LookupID(k.(string))
-		if !ok {
-			return true // queried a name no ad ever had -> nothing to index
-		}
-		if c.alreadyIndexed(id) {
-			return true
-		}
-		p := profiles[id]
+		fold := k.(string) // demand keys are already folded
+		p := profiles[fold]
 		if p == nil || p.present == 0 {
+			return true // queried a name no sampled ad had -> nothing to index
+		}
+		if c.alreadyIndexedName(fold) {
 			return true
 		}
 		strFrac := float64(p.strCount) / float64(p.present)
 		numFrac := float64(p.numCount) / float64(p.present)
-		name, _ := c.intern.Name(id)
 		base := IndexSuggestion{
-			Attr: name, QueriesEq: eq, QueriesRange: rng,
+			Attr: p.name, QueriesEq: eq, QueriesRange: rng,
 			SampledPresent: p.present, StringFrac: strFrac, NumericFrac: numFrac,
 			DistinctValues: len(p.distinct), Capped: p.capped,
 		}
@@ -237,18 +238,39 @@ func (c *Collection) SuggestDrops(sampleMax int) []DropSuggestion {
 	}
 	profiles := c.profileAttrs(sampleMax)
 	var out []DropSuggestion
+	// A configured index's attribute name in either mode: inline specs key by folded
+	// name (reverse nameToID), interned specs by id (resolve via intern).
+	foldName := func(id uint32) (string, bool) {
+		if spec.inline {
+			for n, sid := range spec.nameToID {
+				if sid == id {
+					return n, true // n is folded
+				}
+			}
+			return "", false
+		}
+		if nm, ok := c.intern.Name(id); ok {
+			return strings.ToLower(nm), true
+		}
+		return "", false
+	}
 	consider := func(id uint32, kind string) {
-		name, ok := c.intern.Name(id)
+		fold, ok := foldName(id)
 		if !ok {
 			return
 		}
+		p := profiles[fold]
+		display := fold
+		if p != nil && p.name != "" {
+			display = p.name
+		}
 		var eq, rng int64
-		if v, ok := c.demand.m.Load(strings.ToLower(name)); ok {
+		if v, ok := c.demand.m.Load(fold); ok {
 			d := v.(*demandCounts)
 			eq, rng = d.eq.Load(), d.rng.Load()
 		}
-		ds := DropSuggestion{Attr: name, Kind: kind, QueriesEq: eq, QueriesRange: rng}
-		if p := profiles[id]; p != nil {
+		ds := DropSuggestion{Attr: display, Kind: kind, QueriesEq: eq, QueriesRange: rng}
+		if p != nil {
 			ds.SampledPresent, ds.DistinctValues, ds.Capped = p.present, len(p.distinct), p.capped
 		}
 		switch {
@@ -370,5 +392,30 @@ func (c *Collection) alreadyIndexed(id uint32) bool {
 		return true
 	}
 	_, ok := spec.val[id]
+	return ok
+}
+
+// alreadyIndexedName reports whether the folded attribute name is already indexed, in
+// either index mode: an inline spec (persistent store) keys indexes by folded name via
+// nameToID, an interned spec by id via the intern table.
+func (c *Collection) alreadyIndexedName(fold string) bool {
+	spec := c.spec.Load()
+	if spec == nil {
+		return false
+	}
+	var id uint32
+	var ok bool
+	if spec.inline {
+		id, ok = spec.nameToID[fold]
+	} else {
+		id, ok = c.intern.LookupID(fold)
+	}
+	if !ok {
+		return false
+	}
+	if _, ok := spec.cat[id]; ok {
+		return true
+	}
+	_, ok = spec.val[id]
 	return ok
 }
