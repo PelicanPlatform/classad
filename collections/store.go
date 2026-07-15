@@ -577,6 +577,25 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 			}
 			return
 		}
+		// Disjunctive queries: if the top-level OR spine yields more than one probe
+		// group and every group is index-usable, prune via the union of the groups'
+		// candidate sets (DNF: OR of AND-of-probes), re-verifying each candidate. A
+		// single group falls through to the conjunctive path below unchanged.
+		if plan := q.ProbePlan(); len(plan) > 1 {
+			for _, g := range plan {
+				c.demand.record(g.Probes)
+			}
+			if groups, prunable := c.planIndexGroups(plan); prunable {
+				emit := c.yieldAd(yield)
+				for _, sh := range c.shards {
+					if !c.scanShardIndexedGroups(sh, groups, qp, emit) {
+						return
+					}
+				}
+				return
+			}
+			// Not prunable (some disjunct is unconstrained): fall through to a full scan.
+		}
 		// Record which attributes the query filters on (for SuggestIndexes), then,
 		// if the query has an index-usable constraint, visit only candidate ads;
 		// otherwise fall back to a full scan. Both re-verify the full predicate.

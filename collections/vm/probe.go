@@ -39,6 +39,39 @@ func (q *Query) Probes() []Probe {
 	return out
 }
 
+// ProbeGroup is a conjunction of index probes -- a candidate matches the group when
+// it satisfies ALL of them. An empty Probes means the group is unconstrained (that
+// disjunct can match anything), so a plan containing one cannot prune.
+type ProbeGroup struct {
+	Probes []Probe
+}
+
+// ProbePlan describes the query's index-satisfiable structure as a disjunction of
+// conjunctive groups (DNF over the top-level `||` spine): a candidate satisfies the
+// plan when it satisfies every probe of ANY group. A purely conjunctive query is a
+// single group -- identical to Probes(). A disjunctive query like `(A && B) || C`
+// yields one group per disjunct, which the planner executes as a union of
+// intersections. Because each group is an over-approximation of its disjunct and the
+// store re-verifies, the union is a sound candidate superset; a group with no probes
+// makes the plan un-prunable (the caller then full-scans).
+func (q *Query) ProbePlan() []ProbeGroup {
+	if q == nil || q.prog == nil || q.prog.expr == nil {
+		return nil
+	}
+	disjuncts := flattenOr(classad.FoldConstants(q.prog.expr), nil)
+	groups := make([]ProbeGroup, 0, len(disjuncts))
+	for _, d := range disjuncts {
+		var probes []Probe
+		for _, c := range flattenAnd(d, nil) {
+			if p, ok := probeFrom(c); ok {
+				probes = append(probes, p)
+			}
+		}
+		groups = append(groups, ProbeGroup{Probes: probes})
+	}
+	return groups
+}
+
 // flattenAnd collects the top-level `&&` conjuncts of e (unwrapping parentheses).
 func flattenAnd(e ast.Expr, acc []ast.Expr) []ast.Expr {
 	e = unparen(e)

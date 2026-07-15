@@ -120,6 +120,13 @@ func TestIndexMatchesFullScan(t *testing.T) {
 		`Arch =!= "X86_64"`,                              // exact !=: MUST keep the "x86_64" variant
 		`Arch =!= "x86_64"`,                              // exact !=: MUST keep the "X86_64" variant
 		`Arch =!= "aarch64" && Owner =?= "bob"`,          // exact != and exact == together
+		// Disjunctive (DNF) queries: union of index candidate sets, re-verified.
+		`Cpus >= 6 || Owner == "alice"`,                              // value-range OR categorical-eq
+		`(Cpus >= 6 && Arch == "X86_64") || State == "Claimed"`,      // multi-probe group OR eq
+		`Owner == "alice" || Owner == "bob" || Memory > 6144`,        // three disjuncts
+		`Memory > 4096 || State is undefined`,                        // range OR presence
+		`Cpus >= 6 || Nonexistent == "x"`,                            // one disjunct unindexed -> full scan
+		`Arch =!= "X86_64" || Cpus == 3`,                             // exact-!= OR value-eq
 	}
 	for _, qs := range queries {
 		q, err := vm.Parse(qs)

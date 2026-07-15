@@ -210,6 +210,25 @@ func (c *Collection) estimateCandidates(up usableProbe) (cand float64, covered b
 	return cand, covered
 }
 
+// planIndexGroups plans a DNF probe plan (from vm.ProbePlan): each group's probes are
+// matched against the configured indexes. prunable is false if any group has no
+// index-usable probe -- an unconstrained disjunct means the union covers everything,
+// so the caller must full-scan instead. A single-group plan reduces to planIndex.
+func (c *Collection) planIndexGroups(plan []vm.ProbeGroup) (groups [][]usableProbe, prunable bool) {
+	if len(plan) == 0 {
+		return nil, false
+	}
+	groups = make([][]usableProbe, 0, len(plan))
+	for _, g := range plan {
+		u := c.planIndex(g.Probes)
+		if len(u) == 0 {
+			return nil, false // this disjunct is unconstrained: the union can't prune
+		}
+		groups = append(groups, u)
+	}
+	return groups, true
+}
+
 func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 	spec := c.spec.Load()
 	if !spec.any() {
@@ -307,6 +326,37 @@ func numericFloat(v classad.Value) (float64, bool) {
 		return 0, true
 	}
 	return 0, false
+}
+
+// coversGroups reports whether a segment index covers every probe of every group. If
+// it does not cover some group, that disjunct is unconstrained for this segment, so
+// the caller must full-scan the window rather than use the (incomplete) union.
+func (si *segIndex) coversGroups(groups [][]usableProbe) bool {
+	for _, g := range groups {
+		if !si.covers(g) {
+			return false
+		}
+	}
+	return true
+}
+
+// candidateOffsetsGroups returns the union over groups of each group's candidate
+// intersection -- the DNF `OR of (AND of probes)`. Callers pass only prunable plans
+// (every group has at least one usable probe), so no group widens to everything.
+func (si *segIndex) candidateOffsetsGroups(groups [][]usableProbe) *roaring.Bitmap {
+	var acc *roaring.Bitmap
+	for _, g := range groups {
+		gb := si.candidateOffsets(g)
+		if gb == nil {
+			gb = roaring.New()
+		}
+		if acc == nil {
+			acc = gb
+		} else {
+			acc.Or(gb)
+		}
+	}
+	return acc
 }
 
 // covers reports whether a segment index has postings for every usable probe's
@@ -716,6 +766,79 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand
 			}
 		}
 		// Tail [upto, used): written after the index was built — full-scan it.
+		if int(si.upto) < w.used {
+			if !scanRange(w, int(si.upto), w.used) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// scanShardIndexedGroups is scanShardIndexed for a DNF plan: it visits the union of
+// the groups' candidates and re-verifies each against the full query.
+func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, qp queryPlan, emit func(w []byte) bool) bool {
+	return c.scanShardCandidatesGroups(sh, groups, func(w []byte) bool {
+		if !matchWire(w, qp) {
+			return true
+		}
+		return emit(w)
+	})
+}
+
+// scanShardCandidatesGroups is scanShardCandidates for a DNF plan (vm.ProbePlan with
+// more than one group): per window it visits the union over groups of each group's
+// candidate intersection, so onCand sees a superset of the union's true matches (the
+// caller re-verifies). Segment skipping is not applied here -- a segment is skippable
+// only when EVERY disjunct is empty, and visiting a few extra candidates is cheaper
+// than proving that per group -- but a window whose index does not cover all groups,
+// and every covered window's un-indexed tail, are still full-scanned.
+func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, onCand func(w []byte) bool) bool {
+	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
+	var dbuf []byte
+	visit := func(w segWindow, o uint32) (stop bool) {
+		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+			return false
+		}
+		ww, err := w.codec.Decompress(dbuf[:0], recAd(w.data, o))
+		if err != nil {
+			return false
+		}
+		dbuf = ww
+		return !onCand(ww)
+	}
+	scanRange := func(w segWindow, from, to int) bool {
+		for off := from; off < to; {
+			o := uint32(off)
+			total := recTotalLen(w.data, o)
+			if total == 0 {
+				break
+			}
+			if visit(w, o) {
+				return false
+			}
+			off += int(total)
+		}
+		return true
+	}
+
+	for _, w := range wins {
+		si := w.seg.idx.Load()
+		if si == nil || !si.coversGroups(groups) {
+			if !scanRange(w, 0, w.used) { // index can't serve every disjunct: full-scan
+				return false
+			}
+			continue
+		}
+		if cand := si.candidateOffsetsGroups(groups); cand != nil {
+			it := cand.Iterator()
+			for it.HasNext() {
+				if visit(w, it.Next()) {
+					return false
+				}
+			}
+		}
 		if int(si.upto) < w.used {
 			if !scanRange(w, int(si.upto), w.used) {
 				return false
