@@ -78,6 +78,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		CategoricalAttrs:  cfg.CategoricalAttrs,
 		ValueAttrs:        cfg.ValueAttrs,
 		MatchClosureRoots: cfg.MatchClosureRoots,
+		Codec:             chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
 	}
 	var c *collections.Collection
 	if cfg.Dir == "" {

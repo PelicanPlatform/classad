@@ -49,6 +49,9 @@ func (c *Collection) Compact() int {
 			n++
 		}
 	}
+	if n > 0 {
+		c.reindexAfterCompaction()
+	}
 	return n
 }
 
@@ -77,6 +80,7 @@ func (c *Collection) Rewrite() int {
 	for _, sh := range c.shards {
 		c.compactShard(sh, target)
 	}
+	c.reindexAfterCompaction()
 	return n
 }
 
@@ -106,7 +110,17 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	}
 	c.lastDictBytes.Store(int64(len(dict)))
 	c.lastRetrainUnix.Store(time.Now().UnixNano())
+	c.reindexAfterCompaction() // rebuild indexes over the recompacted segments
 	return len(dict), nil
+}
+
+// reindexAfterCompaction rebuilds the segment indexes after compaction replaced the
+// segments (their fresh copies carry no index), so queries stay pruned and estimates
+// stay populated instead of silently falling back to a full scan until the next Reindex.
+func (c *Collection) reindexAfterCompaction() {
+	if c.spec.Load().any() {
+		c.Reindex()
+	}
 }
 
 // shouldCompact reports whether the shard's garbage ratio warrants compaction.
