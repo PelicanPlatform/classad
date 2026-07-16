@@ -148,10 +148,16 @@ func (d *deleteLog) horizonSeq() uint64 {
 // --- live subscription hub ---
 
 type rawEvent struct {
-	shard   int
-	seq     uint64
-	key     []byte
-	ad      []byte // compressed stored bytes; nil for a delete
+	shard int
+	seq   uint64
+	key   []byte
+	// ad is the raw stored bytes: codec-compressed and, for encrypted attributes,
+	// sealed with THIS node's data key. It is an internal, node-local representation.
+	// INVARIANT: it must be decoded via watchAd/decodeAd (which decompresses and
+	// decrypts) before it leaves the process. Never ship rawEvent.ad over the wire or
+	// to a replica -- a follower has a different data key and could not open it, and it
+	// would bypass the private-attribute stripping that adString applies to a decoded ad.
+	ad      []byte // nil for a delete
 	codec   Codec
 	deleted bool
 }

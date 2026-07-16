@@ -22,6 +22,11 @@ type persistedIndexConfig struct {
 	// keeps human-created indexes exempt across restarts.
 	Auto []string `json:"auto,omitempty"`
 	Hot  []string `json:"hot,omitempty"`
+	// Encrypted lists the explicitly encrypted attributes (the human-toggled set, not
+	// the always-on private attributes). Restoring it keeps a runtime encryption-policy
+	// change consistent across restarts -- and, in HA, lets a follower converge on the
+	// policy by reloading, since there is no op-stream replication of config.
+	Encrypted []string `json:"encrypted,omitempty"`
 }
 
 func (db *DB) indexConfigPath() string {
@@ -40,7 +45,10 @@ func (db *DB) saveIndexConfig() {
 		return
 	}
 	cat, val := db.c.IndexedAttrs()
-	cfg := persistedIndexConfig{Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(), Hot: db.c.HotAttrNames()}
+	cfg := persistedIndexConfig{
+		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(), Hot: db.c.HotAttrNames(),
+		Encrypted: db.c.EncryptedAttrNames(),
+	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return
@@ -133,5 +141,11 @@ func (db *DB) loadIndexConfig() {
 	}
 	if len(cfg.Hot) > 0 {
 		db.c.AddHotAttrs(cfg.Hot...)
+	}
+	// Restore the runtime encryption policy over the reconciled indexes. Best-effort:
+	// ignored if encryption is disabled on this open (no data key) or an attribute has
+	// since become indexed. Private attributes are always encrypted regardless.
+	if len(cfg.Encrypted) > 0 {
+		_ = db.c.SetEncryptedAttrs(cfg.Encrypted)
 	}
 }

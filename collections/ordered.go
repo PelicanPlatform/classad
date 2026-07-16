@@ -165,6 +165,16 @@ func newOrderedIndex(spec OrderSpec) *orderedIndex {
 	}
 }
 
+// clear empties the index in place (a DB Truncate), keeping its compiled expressions.
+// Readers take oi.mu, so they see either the full or the empty index, never a torn one.
+func (oi *orderedIndex) clear() {
+	oi.mu.Lock()
+	oi.tree = btree.NewBTreeG[orderEntry](entryLess(oi.spec))
+	oi.byKey = make(map[string]orderEntry)
+	oi.seq = 0
+	oi.mu.Unlock()
+}
+
 // compile parses the spec's Where, Partition, and Key expressions once. A malformed
 // expression is a static configuration error, reported to New.
 func (oi *orderedIndex) compile() error {

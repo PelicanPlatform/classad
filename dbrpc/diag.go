@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -20,6 +21,11 @@ type Diagnostics struct {
 	Codec              db.CodecStats        `json:"codec"`
 	Suggestions        []db.IndexSuggestion `json:"suggestions"`
 	DropSuggestions    []db.DropSuggestion  `json:"dropSuggestions"`
+	// EncryptionEnabled reports whether encryption at rest is active; EncryptedAttrs is
+	// the explicit encrypted-attribute set (private attributes are always encrypted and
+	// are not listed here).
+	EncryptionEnabled bool     `json:"encryptionEnabled"`
+	EncryptedAttrs    []string `json:"encryptedAttrs,omitempty"`
 }
 
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
@@ -37,6 +43,8 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		Codec:              t.CodecStats(diagSampleMax),
 		Suggestions:        t.SuggestIndexes(diagSampleMax),
 		DropSuggestions:    t.SuggestDrops(diagSampleMax),
+		EncryptionEnabled:  t.EncryptionEnabled(),
+		EncryptedAttrs:     t.EncryptedAttrNames(),
 	}
 	return json.Marshal(d)
 }
@@ -52,8 +60,43 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 //	compact                           reclaim dead space in warranted shards
 //	rewrite                           re-encode all ads with the current hot set
 //	codec.retrain [sampleMax]         train/refresh the ZSTD dictionary + recompress
-func (s *Server) admin(t *db.DB, action string, args []string) (string, error) {
+//	encrypt.set <attr>...             set the explicit encrypted-at-rest attributes
+//	                                  (DAEMON-only; private attrs always encrypted)
+//	truncate                          remove every ad (DAEMON-only, DB-wide locked)
+//	backup.key                        export the backup key, hex (DAEMON-only escrow key)
+func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) (string, error) {
 	switch action {
+	case "encrypt.set":
+		// Changing which attributes are encrypted at rest is a security-policy change,
+		// so it is DAEMON-level -- refused even to an ordinary writer. args is the new
+		// explicit set (private attributes are always encrypted regardless). An empty
+		// args clears the explicit set.
+		if !privileged {
+			return "", fmt.Errorf("encrypt.set requires DAEMON authorization")
+		}
+		if err := t.SetEncryptedAttrs(args); err != nil {
+			return "", err
+		}
+		return "encrypted attributes: " + join(t.EncryptedAttrNames()), nil
+	case "truncate":
+		// Removing every ad is a destructive, DB-wide-locked operation -- DAEMON-level.
+		if !privileged {
+			return "", fmt.Errorf("truncate requires DAEMON authorization")
+		}
+		t.Truncate()
+		return "database truncated", nil
+	case "backup.key":
+		// Export the backup key (hex) so an operator can escrow it and decrypt/restore
+		// encrypted snapshots without the pool keys. DAEMON-only: it is a secret that
+		// opens every backup. It is NOT the live-data key and cannot read the store.
+		if !privileged {
+			return "", fmt.Errorf("backup.key requires DAEMON authorization")
+		}
+		k := t.BackupKey()
+		if k == nil {
+			return "", fmt.Errorf("encryption at rest is not enabled")
+		}
+		return hex.EncodeToString(k), nil
 	case "index.add.categorical":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
@@ -240,6 +283,32 @@ func (c *Client) AdminTable(table, action string, args ...string) (string, error
 		return "", statusErr(status, body)
 	}
 	return body.str(), nil
+}
+
+// SetEncryptedAttrs sets the explicit attributes encrypted at rest on the named table
+// (private attributes are always encrypted). It is a DAEMON-level action: the server
+// refuses it unless the connection is privileged. Passing no attributes clears the
+// explicit set. Returns the server's human-readable result.
+func (c *Client) SetEncryptedAttrs(table string, attrs ...string) (string, error) {
+	return c.AdminTable(table, "encrypt.set", attrs...)
+}
+
+// BackupKeyTable retrieves the named table's backup key -- the escrow key that decrypts
+// its encrypted snapshots independently of the pool keys. DAEMON-level. Errors if
+// encryption is not enabled.
+func (c *Client) BackupKeyTable(table string) ([]byte, error) {
+	s, err := c.AdminTable(table, "backup.key")
+	if err != nil {
+		return nil, err
+	}
+	return hex.DecodeString(s)
+}
+
+// TruncateTable removes every ad from the named table. It is a DAEMON-level action
+// (destructive, DB-wide locked): the server refuses it unless the connection is
+// privileged. Returns the server's human-readable result.
+func (c *Client) TruncateTable(table string) (string, error) {
+	return c.AdminTable(table, "truncate")
 }
 
 // --- table catalog ---

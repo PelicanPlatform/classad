@@ -23,6 +23,12 @@ type Server struct {
 	txns   sync.Map // txnID(uint64) -> *serverTxn
 	nextID atomic.Uint64
 	stopBG []func()
+
+	// propose, when set, routes a committing transaction's writes through an external
+	// consensus layer (raft) instead of committing them to the local store: on opCommit
+	// the accumulated ops are handed to propose, which is the store's sole writer. Set by
+	// the consistent-HA daemon on the leader; nil for a standalone store. See propose.go.
+	propose ProposeFunc
 }
 
 // Catalog is the set of named tables the server serves. *db.Catalog implements
@@ -36,6 +42,11 @@ type Catalog interface {
 	DropTable(name string) error
 	// Tables lists the table names.
 	Tables() []string
+	// ArchiveTable / CreateArchiveTable / ArchiveTables manage append-only history
+	// tables. A single-table server does not support them.
+	ArchiveTable(name string) (*db.ArchiveTable, bool)
+	CreateArchiveTable(name string, cfg db.ArchiveConfig) (*db.ArchiveTable, error)
+	ArchiveTables() []string
 }
 
 // DefaultTable is the table name a single-DB server serves and the client
@@ -45,8 +56,10 @@ const DefaultTable = "ads"
 // serverTxn is a live server-side transaction. Its mutex serializes operations on the
 // (non-concurrent) *db.Txn even if a client pipelines them.
 type serverTxn struct {
-	tx *db.Txn
-	mu sync.Mutex
+	tx    *db.Txn
+	mu    sync.Mutex
+	table string    // the transaction's table (from opBegin), for the propose hook
+	batch []WriteOp // ops accumulated for the propose hook (nil unless propose is set)
 }
 
 // NewServer returns a single-table server over d, served as table "ads". The
@@ -79,6 +92,12 @@ func (s singleCatalog) DropTable(name string) error {
 }
 func (s singleCatalog) Tables() []string { return []string{s.name} }
 
+func (s singleCatalog) ArchiveTable(string) (*db.ArchiveTable, bool) { return nil, false }
+func (s singleCatalog) CreateArchiveTable(string, db.ArchiveConfig) (*db.ArchiveTable, error) {
+	return nil, fmt.Errorf("single-table server: archive tables unsupported")
+}
+func (s singleCatalog) ArchiveTables() []string { return nil }
+
 // ServeOptions scopes what a single served connection may do. The zero value is
 // full read/write access with private attributes excluded from returned ads
 // (the historical ServeConn behavior). A privilege-scoped front end (e.g. an
@@ -95,13 +114,20 @@ type ServeOptions struct {
 	// private attributes are stripped from every ad this connection sees, so an
 	// under-privileged peer never learns claim ids and other secrets.
 	IncludePrivate bool
+
+	// Privileged admits the DAEMON-level administrative actions -- those that change
+	// security or durability policy (e.g. the encryption toggle), as opposed to the
+	// ordinary WRITE-level admin actions (index/hot/compact) that any writer may run.
+	// When false, a privileged action is refused even on a read-write connection.
+	Privileged bool
 }
 
 // isMutating reports whether o writes to a transaction (and so is refused on a
 // read-only connection).
 func (o op) isMutating() bool {
 	switch o {
-	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable:
+	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
+		opArchiveCreate, opArchiveAppend, opArchiveRotate:
 		return true
 	}
 	return false
@@ -201,10 +227,21 @@ func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 	for {
 		frame, err := conn.ReadMsg()
 		if err != nil {
+			sc.abortRestore()
 			return err
+		}
+		// Restore-upload frames are handled inline (synchronously) so their chunks are
+		// spooled in receive order; every other op dispatches concurrently.
+		if reqID, o, body, ok := reqHeader(frame); ok && isRestoreOp(o) {
+			sc.handleRestore(reqID, o, body)
+			continue
 		}
 		go sc.dispatch(frame)
 	}
+}
+
+func isRestoreOp(o op) bool {
+	return o == opRestore || o == opRestoreChunk || o == opRestoreEnd
 }
 
 // serverConn is per-connection state: the serialized writer, a context cancelled when
@@ -218,6 +255,11 @@ type serverConn struct {
 
 	wmu     sync.Mutex
 	watches map[uint64]context.CancelFunc
+
+	// restore is the in-progress restore upload for this connection (at most one), spooled
+	// to a temp file. Only touched from the single read-loop goroutine (restore frames are
+	// handled inline), so it needs no lock. See snapshot.go.
+	restore *restoreUpload
 }
 
 func (sc *serverConn) dispatch(frame []byte) {
@@ -243,11 +285,15 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamMatchTables(sc.ctx, reqID, body, sc.write)
 	case opWatch:
 		sc.streamWatch(reqID, body)
+	case opSnapshot:
+		sc.streamSnapshot(reqID, body)
+	case opArchiveQuery:
+		sc.streamArchiveQuery(reqID, body)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
 	default:
-		sc.write(sc.s.handle(reqID, o, body, priv))
+		sc.write(sc.s.handle(reqID, o, body, priv, sc.opts.Privileged))
 	}
 }
 
@@ -408,7 +454,7 @@ func (s *Server) streamOrdered(ctx context.Context, reqID uint64, r *reader, inc
 
 // handle executes one request and returns its response frame. includePrivate
 // controls whether ads returned by lookups carry their private attributes.
-func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []byte {
+func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privileged bool) []byte {
 	switch o {
 	case opBegin:
 		table := r.str()
@@ -420,7 +466,7 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 			return respErr(reqID, "no such table: "+table)
 		}
 		id := s.nextID.Add(1)
-		s.txns.Store(id, &serverTxn{tx: d.Begin()})
+		s.txns.Store(id, &serverTxn{tx: d.Begin(), table: table})
 		return putU64(resp(reqID, stOK), id)
 
 	case opCreateTable:
@@ -471,6 +517,16 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		if !ok {
 			return respErr(reqID, "no such transaction")
 		}
+		// Consistent-HA routing: propose the accumulated writes through consensus (raft)
+		// instead of committing locally. The local transaction was only for read-your-
+		// writes during the session; the propose hook (via the FSM) is the real writer.
+		if s.propose != nil {
+			st.tx.Abort()
+			if err := s.propose(st.table, st.batch); err != nil {
+				return respErr(reqID, err.Error())
+			}
+			return resp(reqID, stOK)
+		}
 		err := st.tx.Commit()
 		if err == nil {
 			return resp(reqID, stOK)
@@ -491,7 +547,7 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		return resp(reqID, stOK)
 
 	case opNewAd:
-		return s.withTxn(reqID, r, func(tx *db.Txn) []byte {
+		return s.withTxn(reqID, r, func(st *serverTxn) []byte {
 			key, adText := r.str(), r.str()
 			if r.err != nil {
 				return respBad(reqID)
@@ -500,45 +556,50 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 			if err != nil {
 				return respErr(reqID, err.Error())
 			}
-			tx.NewClassAd(key, ad)
+			st.tx.NewClassAd(key, ad)
+			st.record(s, WriteOp{Kind: WriteNewClassAd, Key: key, Value: adText})
 			return resp(reqID, stOK)
 		})
 
 	case opDestroyAd:
-		return s.withTxn(reqID, r, func(tx *db.Txn) []byte {
-			tx.DestroyClassAd(r.str())
+		return s.withTxn(reqID, r, func(st *serverTxn) []byte {
+			key := r.str()
+			st.tx.DestroyClassAd(key)
+			st.record(s, WriteOp{Kind: WriteDestroyClassAd, Key: key})
 			return resp(reqID, stOK)
 		})
 
 	case opSetAttr:
-		return s.withTxn(reqID, r, func(tx *db.Txn) []byte {
+		return s.withTxn(reqID, r, func(st *serverTxn) []byte {
 			key, name, expr := r.str(), r.str(), r.str()
 			if r.err != nil {
 				return respBad(reqID)
 			}
-			if err := tx.SetAttribute(key, name, expr); err != nil {
+			if err := st.tx.SetAttribute(key, name, expr); err != nil {
 				return respErr(reqID, err.Error())
 			}
+			st.record(s, WriteOp{Kind: WriteSetAttribute, Key: key, Name: name, Value: expr})
 			return resp(reqID, stOK)
 		})
 
 	case opDeleteAttr:
-		return s.withTxn(reqID, r, func(tx *db.Txn) []byte {
+		return s.withTxn(reqID, r, func(st *serverTxn) []byte {
 			key, name := r.str(), r.str()
 			if r.err != nil {
 				return respBad(reqID)
 			}
-			tx.DeleteAttribute(key, name)
+			st.tx.DeleteAttribute(key, name)
+			st.record(s, WriteOp{Kind: WriteDeleteAttribute, Key: key, Name: name})
 			return resp(reqID, stOK)
 		})
 
 	case opLookupAttr:
-		return s.withTxn(reqID, r, func(tx *db.Txn) []byte {
+		return s.withTxn(reqID, r, func(st *serverTxn) []byte {
 			key, name := r.str(), r.str()
 			if r.err != nil {
 				return respBad(reqID)
 			}
-			v, ok := tx.LookupAttr(key, name)
+			v, ok := st.tx.LookupAttr(key, name)
 			if !ok {
 				return resp(reqID, stMissing)
 			}
@@ -546,8 +607,8 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		})
 
 	case opLookupAd:
-		return s.withTxn(reqID, r, func(tx *db.Txn) []byte {
-			ad, ok := tx.LookupClassAd(r.str())
+		return s.withTxn(reqID, r, func(st *serverTxn) []byte {
+			ad, ok := st.tx.LookupClassAd(r.str())
 			if !ok {
 				return resp(reqID, stMissing)
 			}
@@ -641,18 +702,73 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		if !ok {
 			return respErr(reqID, "no such table: "+table)
 		}
-		msg, err := s.admin(d, action, args)
+		msg, err := s.admin(d, action, args, privileged)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
 		return putStr(resp(reqID, stOK), msg)
+
+	case opArchiveCreate:
+		name := r.str()
+		cfgJSON := r.bytesRef()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		var cfg db.ArchiveConfig
+		if len(cfgJSON) > 0 {
+			if err := json.Unmarshal(cfgJSON, &cfg); err != nil {
+				return respErr(reqID, "archive config: "+err.Error())
+			}
+		}
+		if _, err := s.cat.CreateArchiveTable(name, cfg); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opArchiveAppend:
+		name := r.str()
+		adText := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		a, ok := s.cat.ArchiveTable(name)
+		if !ok {
+			return respErr(reqID, "no such archive: "+name)
+		}
+		if err := a.AppendOld(adText); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opArchiveList:
+		names := s.cat.ArchiveTables()
+		b := putI32(resp(reqID, stOK), int32(len(names)))
+		for _, n := range names {
+			b = putStr(b, n)
+		}
+		return b
+
+	case opArchiveRotate:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		a, ok := s.cat.ArchiveTable(name)
+		if !ok {
+			return respErr(reqID, "no such archive: "+name)
+		}
+		dropped, err := a.Rotate(float64(time.Now().Unix()))
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putI32(resp(reqID, stOK), int32(dropped))
 	}
 	return respBad(reqID)
 }
 
 // withTxn resolves the leading txnID field, locks the transaction (serializing
 // pipelined ops on it), and runs fn.
-func (s *Server) withTxn(reqID uint64, r *reader, fn func(*db.Txn) []byte) []byte {
+func (s *Server) withTxn(reqID uint64, r *reader, fn func(*serverTxn) []byte) []byte {
 	id := r.u64()
 	if r.err != nil {
 		return respBad(reqID)
@@ -664,7 +780,15 @@ func (s *Server) withTxn(reqID uint64, r *reader, fn func(*db.Txn) []byte) []byt
 	st := v.(*serverTxn)
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return fn(st.tx)
+	return fn(st)
+}
+
+// record appends a write op to the transaction's batch when the server routes commits
+// through consensus (propose set); a no-op otherwise.
+func (st *serverTxn) record(s *Server, op WriteOp) {
+	if s.propose != nil {
+		st.batch = append(st.batch, op)
+	}
 }
 
 // take removes and returns a transaction (for commit/abort).

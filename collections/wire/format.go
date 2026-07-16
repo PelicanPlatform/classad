@@ -68,6 +68,12 @@ const (
 	nAttrRefStr = 0x14 // + scope byte + uvarint(len) + name bytes
 	nFuncStr    = 0x15 // + uvarint(len) + name bytes + uvarint(argc) + node * argc
 	nSelectStr  = 0x16 // + node(record) + uvarint(len) + name bytes
+	// nEncrypted wraps an at-rest-encrypted attribute value: the value's normal node
+	// encoding is AES-GCM'd with the segment's data-encryption key, so any value type
+	// encrypts uniformly and decode just decrypts then decodes the inner node. Without a
+	// Sealer (the fast index/match path) it is opaque -- encrypted attributes are never
+	// indexed. Layout: + uvarint(len nonce) + nonce + uvarint(len ct) + ct.
+	nEncrypted = 0x17
 )
 
 // nameHash32 is a case-insensitive 32-bit hash of an attribute name, used in the

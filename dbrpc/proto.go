@@ -65,6 +65,23 @@ const (
 	// [table] -> [cursor]. A client uses it to start a Watch that streams only subsequent
 	// changes (no replay of current contents) -- the "tail from now" path.
 	opWatchHead op = 24
+
+	// Snapshot / restore, DAEMON-only (see db.Snapshot). Chunked so an arbitrarily large
+	// database never buffers whole in memory. Snapshot streams out (stStream frames, like
+	// a query); restore streams in as a sequence of chunk frames under one reqID, which
+	// the server spools to a temp file (in receive order -- handled inline in the read
+	// loop, not the concurrent dispatch path) and then restores from.
+	opSnapshot     op = 25 // [table] -> stream of [chunk] (stStream) then stStreamEnd
+	opRestore      op = 26 // [table] -> begins a chunked restore upload on this reqID
+	opRestoreChunk op = 27 // [chunk] appended to the active restore
+	opRestoreEnd   op = 28 // ends the upload; server restores from the spooled file, then replies
+
+	// Archive (history) tables: append-only, rotated, newest-first queries.
+	opArchiveCreate op = 29 // [name][json ArchiveConfig] -> status; mutating
+	opArchiveAppend op = 30 // [name][adText] -> status; mutating
+	opArchiveQuery  op = 31 // [name][limit i32][constraint] -> stream of [adText], newest first
+	opArchiveList   op = 32 // -> [n i32]{[name]}
+	opArchiveRotate op = 33 // [name] -> [dropped i32]; enforce retention (server clock); mutating
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).

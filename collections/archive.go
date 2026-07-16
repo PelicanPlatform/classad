@@ -421,6 +421,21 @@ func (a *Archive) shouldDropOldest(now float64) bool {
 
 // Close seals the active segment and unmaps every segment file. The Archive must not
 // be used afterward.
+// Count returns the number of records currently retained (sealed segments plus the
+// active one). Rotation reduces it in whole-segment steps.
+func (a *Archive) Count() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	n := 0
+	for _, s := range a.segs {
+		n += s.recN
+	}
+	if a.active != nil {
+		n += a.active.recN
+	}
+	return n
+}
+
 func (a *Archive) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()

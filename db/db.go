@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -32,6 +33,15 @@ type DB struct {
 	id       string // stable database identity (persisted; random for in-memory)
 	instance string // this open's instance identity (fresh each Open)
 	dir      string // on-disk directory ("" for in-memory); where index config persists
+
+	// enc is the derived encryption state (data key for the live store, backup key +
+	// master envelope for snapshots), or nil when encryption is disabled. See db/encrypt.go.
+	enc *dbCrypto
+
+	// snapMu is the DB-wide lock. Ordinary writes take it read-shared (many concurrent
+	// commits proceed); Truncate/Restore take it exclusively so a reload is atomic against
+	// all writers. See db/snapshot.go.
+	snapMu sync.RWMutex
 }
 
 // OrderSpec, SortKey, OrderedAd, OrderCursor configure and drive maintained ordered
@@ -57,6 +67,15 @@ type Config struct {
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
+
+	// PoolKeys enables encryption at rest: the DB master key is wrapped under each of
+	// these pool/signing keys (any one opens the DB; a rotated-in key is added on the
+	// next open). Empty ⇒ encryption disabled. See db/encrypt.go.
+	PoolKeys []KEK
+	// EncryptedAttrs names the attributes whose values are sealed at rest (case-
+	// insensitive). Only meaningful with PoolKeys set. An encrypted attribute may not
+	// also be indexed. See collections.Options.EncryptedAttrs.
+	EncryptedAttrs []string
 }
 
 // Open opens a ClassAd log with default configuration. A non-empty dir makes it
@@ -70,6 +89,10 @@ func Open(dir string) (*DB, error) { return OpenConfig(Config{Dir: dir}) }
 // are effectively the same identity, but a follower/replica shares the DB id while
 // carrying its own instance id.
 func OpenConfig(cfg Config) (*DB, error) {
+	enc, err := resolveCrypto(cfg.Dir, cfg.PoolKeys)
+	if err != nil {
+		return nil, err
+	}
 	opts := collections.Options{
 		Dir:               cfg.Dir,
 		WatchHistory:      4096, // enables Watch
@@ -79,6 +102,8 @@ func OpenConfig(cfg Config) (*DB, error) {
 		ValueAttrs:        cfg.ValueAttrs,
 		MatchClosureRoots: cfg.MatchClosureRoots,
 		Codec:             chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
+		DataKey:           enc.data(),
+		EncryptedAttrs:    cfg.EncryptedAttrs,
 	}
 	var c *collections.Collection
 	if cfg.Dir == "" {
@@ -89,7 +114,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 			return nil, err
 		}
 	}
-	db := &DB{c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID(), dir: cfg.Dir}
+	db := &DB{c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID(), dir: cfg.Dir, enc: enc}
 	// Reapply any index/hot-set configuration persisted by a previous run's
 	// runtime changes (AddIndex/AddHotAttrs/...), so they survive a restart.
 	db.loadIndexConfig()
@@ -321,6 +346,24 @@ func (db *DB) RefreshHotSet(sampleMax, topN int) int {
 	return n
 }
 
+// SetEncryptedAttrs replaces the explicit set of attributes encrypted at rest (the
+// human-toggled set; private attributes are always encrypted). It errors if encryption
+// is disabled or a named attribute is indexed. The policy is persisted so it survives a
+// restart and, in HA, lets a follower converge on reload. New writes seal the new set;
+// existing records re-seal when next rewritten (compaction/Rewrite).
+func (db *DB) SetEncryptedAttrs(attrs []string) error {
+	if err := db.c.SetEncryptedAttrs(attrs); err != nil {
+		return err
+	}
+	db.saveIndexConfig()
+	return nil
+}
+
+// EncryptedAttrNames returns the explicit encrypted-attribute set (not the always-on
+// private attributes). EncryptionEnabled reports whether encryption at rest is active.
+func (db *DB) EncryptedAttrNames() []string { return db.c.EncryptedAttrNames() }
+func (db *DB) EncryptionEnabled() bool      { return db.c.EncryptionEnabled() }
+
 // Compact reclaims dead space in shards whose dead-byte ratio warrants it,
 // returning the number of shards compacted.
 func (db *DB) Compact() int { return db.c.Compact() }
@@ -476,7 +519,13 @@ func (db *DB) Begin() *Txn { return &Txn{tx: db.c.Begin(), db: db} }
 // operations still committed), or nil on full success.
 func (t *Txn) Commit() error {
 	t.done = true
+	// The DB-wide lock, held shared: many commits proceed concurrently, but a Truncate
+	// or Restore (exclusive) is atomic against them. A transaction whose snapshot predates
+	// a Truncate additionally conflicts via the shard gcFloor, so a stale write cannot land
+	// on the restored state even if it commits just after the exclusive section releases.
+	t.db.snapMu.RLock()
 	res := t.tx.Commit()
+	t.db.snapMu.RUnlock()
 	if res.Conflicted() {
 		keys := make([]string, len(res.Conflicts))
 		for i, k := range res.Conflicts {

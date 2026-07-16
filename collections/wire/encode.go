@@ -15,6 +15,10 @@ type encoder struct {
 	buf    []byte
 	t      *InternTable
 	inline bool
+	// seal, when non-nil, is used by encNode to encrypt a value node into an nEncrypted
+	// node. Which attributes get encrypted is decided by the caller's predicate. Used
+	// only by the inline-names store path.
+	seal Sealer
 }
 
 // putKey writes an attribute key: an interned id, or an inline name in inline mode.
@@ -93,12 +97,27 @@ func EncodeInline(dst []byte, ad *ast.ClassAd) []byte {
 // offset-to-entry) pair, so Ad.LookupByName finds them without scanning. hot keys
 // must be lower-cased. hot may be nil.
 func EncodeInlineWithHot(dst []byte, ad *ast.ClassAd, hot map[string]struct{}) []byte {
-	e := encoder{inline: true}
+	return EncodeInlineWithHotEnc(dst, ad, hot, nil, nil)
+}
+
+// EncodeInlineWithHotEnc is EncodeInlineWithHot with at-rest encryption: the value of
+// any attribute for which encrypt(name) is true is sealed with seal and stored as an
+// nEncrypted node (decodable only with the matching Opener). A predicate (rather than a
+// set) lets the caller encrypt by rule -- e.g. HTCondor's private-attribute prefix --
+// not just an enumerable list. An encrypted attribute is never hot: it is opaque to the
+// index/match fast path, so it is excluded from the hot header even if listed in hot.
+// encrypt and seal must both be non-nil to encrypt anything.
+func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+	e := encoder{inline: true, seal: seal}
 	var hots []hotPair
 	if ad != nil {
 		for _, attr := range ad.Attributes {
 			entryOff := len(e.buf) // offset of the (name, node) entry within the region
 			e.putString(attr.Name)
+			if seal != nil && encrypt != nil && encrypt(attr.Name) {
+				e.encNode(attr.Value)
+				continue // encrypted attributes are never indexed / hot
+			}
 			e.node(attr.Value)
 			if _, ok := hot[foldASCII(attr.Name)]; ok {
 				hots = append(hots, hotPair{nameHash32(attr.Name), uint32(entryOff)})

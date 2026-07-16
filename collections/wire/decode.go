@@ -21,6 +21,7 @@ type decoder struct {
 	pos     int
 	resolve func(uint32) (string, bool) // id -> name (unused in inline mode)
 	inline  bool                        // attribute keys are inline names
+	open    Sealer                      // decrypts nEncrypted nodes; nil => they are errors
 }
 
 // Decode parses an ad encoded with Encode or EncodeInline. Interned ads resolve
@@ -369,6 +370,26 @@ func (d *decoder) node(depth int) (ast.Expr, error) {
 			return nil, err
 		}
 		return &ast.ParenExpr{Inner: inner}, nil
+	case nEncrypted:
+		nonce, err := d.readStringBytes()
+		if err != nil {
+			return nil, err
+		}
+		ct, err := d.readStringBytes()
+		if err != nil {
+			return nil, err
+		}
+		if d.open == nil {
+			return nil, fmt.Errorf("%w: encrypted attribute without a decryption key", ErrMalformed)
+		}
+		pt, err := d.open.Open(nonce, ct)
+		if err != nil {
+			return nil, fmt.Errorf("%w: decrypting attribute: %v", ErrMalformed, err)
+		}
+		// Decode the recovered node with a sub-decoder in the same mode (and with the
+		// same key, so nested encryption also opens).
+		sub := &decoder{b: pt, inline: d.inline, resolve: d.resolve, open: d.open}
+		return sub.node(depth + 1)
 	default:
 		return nil, fmt.Errorf("%w: unknown node tag 0x%02x", ErrMalformed, tag)
 	}
