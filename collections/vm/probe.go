@@ -208,11 +208,21 @@ func probeFrom(c ast.Expr) (Probe, bool) {
 				}
 			}
 		}
+		// !attr -> a falsy truthiness test on a bare attribute.
+		if name, ok := indexableRef(inner); ok {
+			return Probe{Attr: name, Op: "untruthy"}, true
+		}
 		return Probe{}, false
 	}
 	// isUndefined(attr) is a presence probe (matches when attr is absent/undefined).
 	if fc, ok := c.(*ast.FunctionCall); ok {
 		return undefinedFuncProbe(fc, false)
+	}
+	// A bare attribute reference (`HAS_CVMFS`) is a truthiness test. Only a categorical
+	// index can answer it soundly (its exception set catches non-boolean values, so the
+	// candidate set stays a superset the store re-verifies); catUsable maps it to == true.
+	if name, ok := indexableRef(c); ok {
+		return Probe{Attr: name, Op: "truthy"}, true
 	}
 	b, ok := c.(*ast.BinaryOp)
 	if !ok {

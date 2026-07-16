@@ -272,6 +272,13 @@ func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 			return usableProbe{}, false
 		}
 		return usableProbe{attrID: id, cat: true, op: p.Op, svals: []string{s}}, true
+	case "truthy":
+		// bare `attr`: matches boolean true. A categorical index posts booleans as
+		// "true"/"false" and routes non-booleans to the exception set, so `== true` (which
+		// unions the exceptions) is a sound superset the store re-verifies for truthiness.
+		return usableProbe{attrID: id, cat: true, op: "==", svals: []string{"true"}}, true
+	case "untruthy": // `!attr`: matches boolean false, same superset argument.
+		return usableProbe{attrID: id, cat: true, op: "==", svals: []string{"false"}}, true
 	case "==", "!=", "in":
 	default:
 		return usableProbe{}, false // ranges are not indexed for categoricals
@@ -326,6 +333,14 @@ func valUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 		op = "=="
 	case "isnt":
 		return usableProbe{}, false
+	case "truthy":
+		// bare `attr`: truthy iff the value is non-zero (a boolean false and a numeric 0
+		// both post at 0.0). `!= 0` unions the exception set, so it is a sound superset the
+		// store re-verifies -- and prunes, unlike categorical == true which would miss
+		// numeric-nonzero-other-than-1.
+		return usableProbe{attrID: id, cat: false, op: "!=", fvals: []float64{0}}, true
+	case "untruthy": // `!attr`: falsy iff the value is 0.
+		return usableProbe{attrID: id, cat: false, op: "==", fvals: []float64{0}}, true
 	case "==", "!=", "in", "<", "<=", ">", ">=":
 	default:
 		return usableProbe{}, false
