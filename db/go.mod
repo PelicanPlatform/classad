@@ -3,8 +3,8 @@ module github.com/PelicanPlatform/classad/db
 go 1.25.0
 
 require (
-	github.com/PelicanPlatform/classad v0.0.0
-	github.com/PelicanPlatform/classad/collections v0.0.0
+	github.com/PelicanPlatform/classad v0.7.0
+	github.com/PelicanPlatform/classad/collections v0.7.0
 	github.com/klauspost/compress v1.19.0
 )
 
