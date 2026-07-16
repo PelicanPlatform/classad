@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -140,7 +141,7 @@ func TestMatchExplain(t *testing.T) {
 	_ = jtx.NewClassAd("1.0", "Key=\"1.0\"\nRequestMemory=2048\nRequirements=(TARGET.Arch==\"X86_64\") && (TARGET.Memory>=RequestMemory)")
 	_ = jtx.Commit()
 
-	ex, err := c.MatchExplain("jobs", "Key == \"1.0\"", "machines")
+	ex, err := c.MatchExplain("jobs", "Key == \"1.0\"", "machines", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,5 +162,23 @@ func TestMatchExplain(t *testing.T) {
 	}
 	if !mem || !arch {
 		t.Errorf("probes = %+v, want indexed Memory + unindexed Arch", ex.Probes)
+	}
+
+	// A resource-side filter (WHERE TARGET / NOPREEMPT) is melded into the explanation.
+	exT, err := c.MatchExplain("jobs", "Key == \"1.0\"", "machines", `State =!= "Claimed"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(exT.SlotPredicate, `State`) {
+		t.Errorf("slot predicate = %q, want the resource-side State filter melded in", exT.SlotPredicate)
+	}
+	resSide := false
+	for _, ce := range exT.EvalOrder {
+		if ce.ResourceSide && strings.Contains(ce.Text, "State") {
+			resSide = true
+		}
+	}
+	if !resSide {
+		t.Errorf("eval order = %+v, want a resource-side State conjunct", exT.EvalOrder)
 	}
 }

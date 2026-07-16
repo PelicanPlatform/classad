@@ -181,11 +181,12 @@ func (c *Client) ExplainTable(table, constraint string) (*db.QueryExplain, error
 // jobSelector against resTable would execute: the job's Requirements rewritten over
 // the slot (job constants baked in) and which resulting probes prune via a resource
 // index. jobSelector is a constraint (e.g. `Key == "1.0"`) identifying the request.
-func (c *Client) MatchExplain(reqTable, jobSelector, resTable string) (*db.MatchExplain, error) {
+func (c *Client) MatchExplain(reqTable, jobSelector, resTable, targetWhere string) (*db.MatchExplain, error) {
 	status, body, err := c.call(func(id uint64) []byte {
 		b := putStr(req(id, opMatchExplain), reqTable)
 		b = putStr(b, jobSelector)
 		b = putStr(b, resTable)
+		b = putStr(b, targetWhere)
 		return b
 	})
 	if err != nil {

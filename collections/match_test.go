@@ -574,7 +574,7 @@ func TestExplainMatch(t *testing.T) {
 			mustAd(t, fmt.Sprintf(`[ Name="m%d"; Arch="X86_64"; Memory=%d; Requirements=true ]`, i, (i%8+1)*1024)))
 	}
 	job := mustAd(t, `[ RequestMemory=7168; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Memory >= RequestMemory) ]`)
-	ex := machines.ExplainMatch(job)
+	ex := machines.ExplainMatch(job, "")
 
 	if !ex.HasRequirements {
 		t.Fatal("expected HasRequirements")
@@ -602,7 +602,7 @@ func TestExplainMatch(t *testing.T) {
 func TestExplainMatchNoRequirements(t *testing.T) {
 	machines := New(Options{Shards: 2})
 	machines.Put([]byte("m1"), mustAd(t, `[ Name="m1"; Requirements=true ]`))
-	ex := machines.ExplainMatch(mustAd(t, `[ Foo=1 ]`))
+	ex := machines.ExplainMatch(mustAd(t, `[ Foo=1 ]`), "")
 	if ex.HasRequirements || ex.Plan == "indexed" {
 		t.Errorf("no-Requirements job: got HasRequirements=%v plan=%q, want false / a scan", ex.HasRequirements, ex.Plan)
 	}
@@ -771,7 +771,7 @@ func TestReorderShortCircuitOrder(t *testing.T) {
 	}
 	// ExplainMatch shows the same optimized order: the cheap Disk test appears before
 	// the expensive versionGE(split(...)) in the displayed slot predicate.
-	sp := c.ExplainMatch(job).SlotPredicate
+	sp := c.ExplainMatch(job, "").SlotPredicate
 	if di, vi := strings.Index(sp, "Disk >= 1000"), strings.Index(sp, "versionGE"); di < 0 || vi < 0 || di > vi {
 		t.Errorf("explain slot predicate = %q, want Disk shown before versionGE", sp)
 	}

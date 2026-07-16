@@ -91,6 +91,10 @@ type ConjunctExplain struct {
 	HasSelectivity bool `json:"hasSelectivity"`
 	// TrueFrac is the estimated fraction of slots for which the conjunct holds.
 	TrueFrac float64 `json:"trueFrac"`
+	// ResourceSide is true for a conjunct that came from the MATCH's resource-side filter
+	// (WHERE TARGET / NOPREEMPT) rather than the job's Requirements. It is applied to
+	// matched candidates as a post-filter, so it re-checks rather than prunes today.
+	ResourceSide bool `json:"resourceSide,omitempty"`
 }
 
 // conjunctExplains breaks reqExpr's top-level && spine into per-conjunct explanations in
@@ -122,16 +126,21 @@ func (c *Collection) conjunctExplains(reqExpr ast.Expr, jobVals map[string]class
 	return out
 }
 
-// ExplainMatch reports how matchmaking job against this collection would execute:
-// it rewrites the job's Requirements over the slot (baking the job's attribute values
-// to constants), extracts the index-satisfiable probes, and reports which are covered
-// by a configured index and the resulting access path. No I/O beyond reading the spec.
-func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
+// ExplainMatch reports how matchmaking job against this collection would execute: it
+// rewrites the job's Requirements over the slot (baking the job's attribute values to
+// constants), extracts the index-satisfiable probes, and reports which are covered by a
+// configured index and the resulting access path. targetConstraint, if non-empty, is the
+// MATCH's resource-side filter (WHERE TARGET, including NOPREEMPT's `State =!= "Claimed"`)
+// -- already slot-scoped -- which is melded into the shown predicate, probes, and
+// evaluation order so the explanation reflects the full effective slot filter. No I/O
+// beyond reading the spec.
+func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string) MatchExplain {
 	total := c.Len()
 	ex := MatchExplain{Parallelism: c.queryPar, Shards: len(c.shards), TotalResources: total}
 	reqExpr := jobRequirementsExpr(job)
 	if reqExpr == nil {
 		ex.Plan = scanPlanName(c.queryPar) // no Requirements: every slot is a candidate
+		c.meldTargetConstraint(&ex, targetConstraint)
 		return ex
 	}
 	ex.HasRequirements = true
@@ -175,7 +184,65 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
 	} else {
 		ex.Plan = scanPlanName(c.queryPar)
 	}
+	c.meldTargetConstraint(&ex, targetConstraint)
 	return ex
+}
+
+// meldTargetConstraint folds the MATCH resource-side filter (WHERE TARGET / NOPREEMPT)
+// into the explanation: it appends the constraint to the displayed slot predicate, adds
+// its index-satisfiable probes to the probe list, and appends its conjuncts to the
+// evaluation order tagged ResourceSide. The constraint is already slot-scoped (it filters
+// resource attributes directly), so no TARGET rewrite is needed. It is applied as a
+// post-filter on matched candidates today, so it never lowers the "indexed" plan.
+func (c *Collection) meldTargetConstraint(ex *MatchExplain, targetConstraint string) {
+	if strings.TrimSpace(targetConstraint) == "" {
+		return
+	}
+	q, err := vm.Parse(targetConstraint)
+	if err != nil {
+		return
+	}
+	expr := classad.FoldConstants(q.Expr())
+	disp := expr.String()
+	if ex.SlotPredicate == "" {
+		ex.SlotPredicate = disp
+	} else {
+		ex.SlotPredicate += " && " + disp
+	}
+	ex.HasRequirements = true
+	// The Probes list / IndexUsable count stay job-Requirements-only: they describe the
+	// candidate pushdown, and the resource filter is applied as a post-filter (it does not
+	// prune today). The filter still appears in the melded predicate and evaluation order,
+	// with its index coverage shown, so its pushdown potential is visible.
+	tot := float64(c.Len())
+	seen := map[string]bool{}
+	for _, ce := range ex.EvalOrder {
+		seen[ce.Text] = true
+	}
+	for _, cj := range flattenChain(expr, "&&") {
+		ce := ConjunctExplain{Text: classad.FoldConstants(cj).String(), ResourceSide: true}
+		if seen[ce.Text] {
+			continue
+		}
+		seen[ce.Text] = true
+		ups := c.planIndex(vm.Compile(cj).Probes())
+		if len(ups) > 0 {
+			ce.Probed = true
+			frac, any := 1.0, false
+			for _, up := range ups {
+				if cand, covered := c.estimateCandidates(up); covered {
+					any = true
+					frac *= math.Min(1, cand/tot)
+				}
+			}
+			if any && tot > 0 {
+				ce.Indexed = true
+				ce.HasSelectivity = true
+				ce.TrueFrac = frac
+			}
+		}
+		ex.EvalOrder = append(ex.EvalOrder, ce)
+	}
 }
 
 func scanPlanName(queryPar int) string {

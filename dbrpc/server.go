@@ -538,6 +538,7 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		reqTable := r.str()
 		selector := r.str()
 		resTable := r.str()
+		targetWhere := r.str()
 		if r.err != nil {
 			return respBad(reqID)
 		}
@@ -561,7 +562,7 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		if job == nil {
 			return respErr(reqID, "no request ad matches "+selector)
 		}
-		data, err := json.Marshal(resDB.ExplainMatch(job))
+		data, err := json.Marshal(resDB.ExplainMatch(job, targetWhere))
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}

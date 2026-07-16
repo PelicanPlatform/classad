@@ -27,6 +27,14 @@ func Parse(exprStr string) (*Query, error) {
 // Program returns the underlying compiled program.
 func (q *Query) Program() *Program { return q.prog }
 
+// Expr returns the source expression the query was compiled from (nil if empty).
+func (q *Query) Expr() ast.Expr {
+	if q == nil || q.prog == nil {
+		return nil
+	}
+	return q.prog.expr
+}
+
 // ReadAttrs returns the distinct unscoped attribute names the query may read.
 func (q *Query) ReadAttrs() []string { return q.prog.readAttrs }
 

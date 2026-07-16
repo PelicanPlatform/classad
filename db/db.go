@@ -175,8 +175,10 @@ func (db *DB) IndexSizes() IndexSizes { return db.c.IndexSizes() }
 // ExplainMatch reports how matchmaking job against this (resource) collection would
 // execute: the job's Requirements rewritten over the slot with the job's attributes
 // baked to constants, and which of the resulting probes prune via a configured index.
-func (db *DB) ExplainMatch(job *classad.ClassAd) MatchExplain {
-	return db.c.ExplainMatch(job)
+// targetConstraint, if non-empty, is the MATCH resource-side filter (WHERE TARGET /
+// NOPREEMPT) melded into the explanation.
+func (db *DB) ExplainMatch(job *classad.ClassAd, targetConstraint string) MatchExplain {
+	return db.c.ExplainMatch(job, targetConstraint)
 }
 
 // Stats returns a snapshot of the store's storage (ad count, segment/arena/dead

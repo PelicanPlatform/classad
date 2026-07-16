@@ -55,9 +55,10 @@ const (
 	opMatchTables op = 22
 
 	// opMatchExplain explains the match plan for one request against a resource table:
-	// [reqTable][jobSelector][resTable] -> [json db.MatchExplain]. The server takes the
-	// first request in reqTable matching jobSelector and reports how matchmaking it
-	// against resTable would execute (slot-side probe rewrite + index pushdown).
+	// [reqTable][jobSelector][resTable][targetWhere] -> [json db.MatchExplain]. The server
+	// takes the first request in reqTable matching jobSelector and reports how matchmaking
+	// it against resTable would execute (slot-side probe rewrite + index pushdown), with the
+	// resource-side filter targetWhere (WHERE TARGET / NOPREEMPT) melded into the plan.
 	opMatchExplain op = 23
 )
 
