@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -107,7 +108,7 @@ type ServeOptions struct {
 // read-only connection).
 func (o op) isMutating() bool {
 	switch o {
-	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable:
+	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable, opRestore:
 		return true
 	}
 	return false
@@ -637,6 +638,44 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 			return respErr(reqID, err.Error())
 		}
 		return putStr(resp(reqID, stOK), msg)
+
+	case opSnapshot:
+		// DAEMON-only: a snapshot carries every attribute, including private ones.
+		if !privileged {
+			return respErr(reqID, "snapshot requires DAEMON authorization")
+		}
+		table := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		d, ok := s.cat.Table(table)
+		if !ok {
+			return respErr(reqID, "no such table: "+table)
+		}
+		var buf bytes.Buffer
+		if err := d.Snapshot(&buf); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putBytes(resp(reqID, stOK), buf.Bytes())
+
+	case opRestore:
+		// DAEMON-only: destructive whole-DB replacement under the DB-wide lock.
+		if !privileged {
+			return respErr(reqID, "restore requires DAEMON authorization")
+		}
+		table := r.str()
+		snap := r.bytesRef()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		d, ok := s.cat.Table(table)
+		if !ok {
+			return respErr(reqID, "no such table: "+table)
+		}
+		if err := d.Restore(bytes.NewReader(snap)); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
 	}
 	return respBad(reqID)
 }

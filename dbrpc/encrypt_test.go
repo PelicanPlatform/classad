@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -79,6 +80,55 @@ func TestTruncateRequiresDaemon(t *testing.T) {
 	}
 	if d.Len() != 0 {
 		t.Fatalf("after truncate Len = %d, want 0", d.Len())
+	}
+}
+
+// TestSnapshotRestoreOverRPC round-trips a backup through the client API and confirms
+// both ops are DAEMON-gated.
+func TestSnapshotRestoreOverRPC(t *testing.T) {
+	// DAEMON connection: snapshot, wipe, restore.
+	c, d, cleanup := encServerPair(t, ServeOptions{Privileged: true})
+	defer cleanup()
+	tx := d.Begin()
+	tx.NewClassAd("a", mustAd(t, "Owner = \"x\"\nClaimId = \"top-secret-rpc\""))
+	tx.NewClassAd("b", mustAd(t, "Owner = \"y\""))
+	tx.Commit()
+
+	var snap bytes.Buffer
+	if err := c.Snapshot(&snap); err != nil {
+		t.Fatalf("Snapshot over RPC: %v", err)
+	}
+	if bytes.Contains(snap.Bytes(), []byte("top-secret-rpc")) {
+		t.Fatal("snapshot bytes leaked a private attribute over the wire")
+	}
+	if _, err := c.TruncateTable("ads"); err != nil {
+		t.Fatal(err)
+	}
+	if d.Len() != 0 {
+		t.Fatal("truncate did not empty the table")
+	}
+	if err := c.Restore(bytes.NewReader(snap.Bytes())); err != nil {
+		t.Fatalf("Restore over RPC: %v", err)
+	}
+	if d.Len() != 2 {
+		t.Fatalf("after restore Len = %d, want 2", d.Len())
+	}
+	ad, ok := d.LookupClassAd("a")
+	if !ok {
+		t.Fatal("a missing after restore")
+	}
+	if v, _ := ad.EvaluateAttrString("ClaimId"); v != "top-secret-rpc" {
+		t.Fatalf("restored ClaimId = %q", v)
+	}
+
+	// Unprivileged connection: both refused.
+	c2, _, cleanup2 := encServerPair(t, ServeOptions{})
+	defer cleanup2()
+	if err := c2.Snapshot(&bytes.Buffer{}); err == nil {
+		t.Error("snapshot should be refused without DAEMON privilege")
+	}
+	if err := c2.Restore(bytes.NewReader(snap.Bytes())); err == nil {
+		t.Error("restore should be refused without DAEMON privilege")
 	}
 }
 

@@ -72,8 +72,19 @@ func resolveCrypto(dir string, poolKeys []KEK) (*dbCrypto, error) {
 // its envelope rows for the given pool keys.
 func loadOrMintMaster(dir string, poolKeys []KEK) (master []byte, rows []crypt.MasterKeyRow, err error) {
 	if dir == "" {
-		master, err = crypt.NewMaster() // ephemeral; in-memory DB
-		return master, nil, err
+		// Ephemeral master for an in-memory DB. Still wrap it under the pool keys so a
+		// snapshot carries a pool-key-openable envelope (the rows just are not persisted).
+		if master, err = crypt.NewMaster(); err != nil {
+			return nil, nil, err
+		}
+		for _, k := range poolKeys {
+			row, werr := crypt.WrapMaster(master, k)
+			if werr != nil {
+				return nil, nil, fmt.Errorf("db: wrapping master under key %q: %w", k.ID, werr)
+			}
+			rows = append(rows, row)
+		}
+		return master, rows, nil
 	}
 	path := filepath.Join(dir, masterKeysFile)
 	if rows, err = loadMasterRows(path); err != nil {

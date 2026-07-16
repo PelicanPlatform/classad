@@ -60,6 +60,14 @@ const (
 	// it against resTable would execute (slot-side probe rewrite + index pushdown), with the
 	// resource-side filter targetWhere (WHERE TARGET / NOPREEMPT) melded into the plan.
 	opMatchExplain op = 23
+
+	// Snapshot / restore, DAEMON-only (see diag.go / db.Snapshot). Single-frame: the
+	// whole backup is one message payload, so a very large DB is buffered in memory
+	// during transfer -- acceptable for a rare administrative operation, and simpler than
+	// a chunked stream (inbound frames are dispatched concurrently, so an ordered upload
+	// stream would need extra sequencing).
+	opSnapshot op = 24 // [table] -> [snapshot bytes]
+	opRestore  op = 25 // [table][snapshot bytes] -> status; mutating
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
