@@ -7,6 +7,46 @@ import (
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
+// TestExplainMatchSelectiveProbeFirst: a highly selective pushed-down resource probe
+// (NOPREEMPT `State =!= "Claimed"` cutting ~90% of slots) must appear FIRST in the
+// evaluation order, not last -- probes prune at candidate generation, most-eliminating
+// first, ahead of the less-selective job probes.
+func TestExplainMatchSelectiveProbeFirst(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, ValueAttrs: []string{"Memory"}, CategoricalAttrs: []string{"State", "Arch"}})
+	for i := 0; i < 5000; i++ {
+		st := "Claimed"
+		if i%10 == 0 { // 10% Unclaimed -> State =!= "Claimed" cuts 90%
+			st = "Unclaimed"
+		}
+		c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, fmt.Sprintf(
+			`[ Id=%d; Memory=%d; State=%q; Arch="X86_64"; Requirements=true ]`, i, (i%8+1)*1024, st)))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestMemory=2048; Requirements = (TARGET.Memory >= RequestMemory) && (TARGET.Arch == "X86_64"); Rank=0 ]`)
+	ex := c.ExplainMatch(job, `State =!= "Claimed"`)
+	if len(ex.EvalOrder) == 0 {
+		t.Fatal("no eval order")
+	}
+	first := ex.EvalOrder[0]
+	if !first.Probed || !first.ResourceSide {
+		t.Errorf("most-selective pushed-down State filter should be the first (probed, resource-side) conjunct; got %+v", first)
+	}
+	// It must precede the less-selective Memory probe.
+	stateAt, memAt := -1, -1
+	for i, ce := range ex.EvalOrder {
+		if ce.ResourceSide {
+			stateAt = i
+		}
+		if ce.Text == "(Memory >= 2048)" {
+			memAt = i
+		}
+	}
+	if stateAt < 0 || memAt < 0 || stateAt > memAt {
+		t.Errorf("selective State (idx %d) should precede Memory (idx %d)", stateAt, memAt)
+	}
+}
+
 // TestMatchFilteredEqualsBrute: MatchSortedRankedFiltered (job + pushed-down resource
 // constraint) returns exactly the slots that a full match then a constraint filter would,
 // with the constraint's index narrowing the candidate scan.

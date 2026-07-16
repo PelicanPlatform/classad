@@ -141,6 +141,7 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 	if reqExpr == nil {
 		ex.Plan = scanPlanName(c.queryPar) // no Requirements: every slot is a candidate
 		c.meldTargetConstraint(&ex, targetConstraint)
+		sortEvalOrder(&ex)
 		return ex
 	}
 	ex.HasRequirements = true
@@ -185,7 +186,31 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 		ex.Plan = scanPlanName(c.queryPar)
 	}
 	c.meldTargetConstraint(&ex, targetConstraint)
+	sortEvalOrder(&ex)
 	return ex
+}
+
+// sortEvalOrder presents the effective slot filter in the order work happens: index
+// probes prune at candidate generation (shown first, most-eliminating first -- lowest
+// true-fraction), then the per-candidate re-checks in their short-circuit order. Without
+// this a highly selective pushed-down probe (a NOPREEMPT `State =!= "Claimed"` that cuts
+// 90% of slots) would appear last just because it was melded in after the job conjuncts.
+func sortEvalOrder(ex *MatchExplain) {
+	sort.SliceStable(ex.EvalOrder, func(i, j int) bool {
+		a, b := ex.EvalOrder[i], ex.EvalOrder[j]
+		if a.Probed != b.Probed {
+			return a.Probed // candidate-generation probes first (they prune upfront)
+		}
+		if a.Probed { // among probes, most-eliminating first; unknown selectivity last
+			if a.HasSelectivity != b.HasSelectivity {
+				return a.HasSelectivity
+			}
+			if a.HasSelectivity && a.TrueFrac != b.TrueFrac {
+				return a.TrueFrac < b.TrueFrac
+			}
+		}
+		return false // re-checks keep their short-circuit (reorder) order
+	})
 }
 
 // meldTargetConstraint folds the MATCH resource-side filter (WHERE TARGET / NOPREEMPT)
