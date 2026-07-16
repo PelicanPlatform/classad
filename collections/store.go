@@ -585,7 +585,7 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 			for _, g := range plan {
 				c.demand.record(g.Probes)
 			}
-			if groups, prunable := c.planIndexGroups(plan); prunable {
+			if groups, prunable := c.planIndexGroups(plan); prunable && !overSelectivityGate(c, groups) {
 				emit := c.yieldAd(yield)
 				for _, sh := range c.shards {
 					if !c.scanShardIndexedGroups(sh, groups, qp, emit) {

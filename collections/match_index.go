@@ -88,7 +88,10 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
 	ex.SlotPredicate = slotDisplayExpr(reqExpr, jobVals)
 	// Probes: from the probe rewrite (opaque functions -> undefined, so they drop).
 	plan := vm.Compile(c.slotMatchExpr(reqExpr, jobVals)).ProbePlan()
-	_, prunable := c.planIndexGroups(plan)
+	groups, prunable := c.planIndexGroups(plan)
+	if frac, ok := c.planFrac(groups); prunable && ok && frac > maxPushdownFrac {
+		prunable = false // estimated to barely prune -> a scan is cheaper
+	}
 	for _, g := range plan {
 		for _, p := range g.Probes {
 			pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
@@ -513,7 +516,43 @@ func (c *Collection) slotMatchPlan(job *classad.ClassAd, jobVals map[string]clas
 		return nil, false
 	}
 	plan := vm.Compile(c.slotMatchExpr(reqExpr, jobVals)).ProbePlan()
-	return c.planIndexGroups(plan)
+	groups, prunable = c.planIndexGroups(plan)
+	if frac, ok := c.planFrac(groups); prunable && ok && frac > maxPushdownFrac {
+		// The estimated candidate union is nearly the whole set -- the index would
+		// visit almost every slot, so the bilateral match saves little over a plain
+		// scan while paying the bitmap build. Scan instead.
+		return nil, false
+	}
+	return groups, prunable
+}
+
+// maxPushdownFrac is the estimated candidate-union fraction above which the pushdown is
+// not worth its overhead (the plan barely prunes), so the caller full-scans instead.
+const maxPushdownFrac = 0.95
+
+// planFrac estimates the fraction of records the DNF groups' candidate union visits,
+// under an independence assumption: a group's fraction is the product of its probes'
+// selectivities and the union is 1 - prod(1 - group_frac). estimable is false when any
+// probe lacks a selectivity estimate (e.g. the segment indexes aren't built yet) -- the
+// caller must then NOT gate, since it cannot tell whether the pushdown prunes.
+func (c *Collection) planFrac(groups [][]usableProbe) (frac float64, estimable bool) {
+	total := float64(c.Len())
+	if total <= 0 {
+		return 0, false
+	}
+	prodComplement := 1.0
+	for _, g := range groups {
+		gf := 1.0
+		for _, up := range g {
+			cand, covered := c.estimateCandidates(up)
+			if !covered {
+				return 0, false // no stats: don't gate (default to pushing down)
+			}
+			gf *= math.Min(1, cand/total)
+		}
+		prodComplement *= 1 - gf
+	}
+	return 1 - prodComplement, true
 }
 
 // valueToLiteral converts a scalar classad.Value to its literal AST node, or nil for
@@ -603,4 +642,10 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 		out = append(out, lw...)
 	}
 	return out
+}
+
+// overSelectivityGate reports whether an estimable plan is above the pushdown cost gate.
+func overSelectivityGate(c *Collection, groups [][]usableProbe) bool {
+	frac, ok := c.planFrac(groups)
+	return ok && frac > maxPushdownFrac
 }

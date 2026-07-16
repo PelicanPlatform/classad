@@ -572,14 +572,14 @@ func TestExplainMatch(t *testing.T) {
 		machines.Put([]byte(fmt.Sprintf("m%d", i)),
 			mustAd(t, fmt.Sprintf(`[ Name="m%d"; Arch="X86_64"; Memory=%d; Requirements=true ]`, i, (i%8+1)*1024)))
 	}
-	job := mustAd(t, `[ RequestMemory=2048; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Memory >= RequestMemory) ]`)
+	job := mustAd(t, `[ RequestMemory=7168; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Memory >= RequestMemory) ]`)
 	ex := machines.ExplainMatch(job)
 
 	if !ex.HasRequirements {
 		t.Fatal("expected HasRequirements")
 	}
 	// The rewrite bakes RequestMemory to 2048 and drops the TARGET scope.
-	if !strings.Contains(ex.SlotPredicate, "Memory >= 2048") || !strings.Contains(ex.SlotPredicate, `Arch == "X86_64"`) {
+	if !strings.Contains(ex.SlotPredicate, "Memory >= 7168") || !strings.Contains(ex.SlotPredicate, `Arch == "X86_64"`) {
 		t.Errorf("slot predicate = %q, want it to contain the baked Memory/Arch constraints", ex.SlotPredicate)
 	}
 	if ex.Plan != "indexed" {
@@ -707,5 +707,32 @@ func TestMatchFiniteDomainMaterialization(t *testing.T) {
 	}
 	if len(p) == 0 || len(p) == n {
 		t.Fatalf("expected a partial match set, got %d of %d", len(p), n)
+	}
+}
+
+// TestMatchPlanCostGate: when the slot probes are unselective (match nearly every
+// slot), the planner skips the pushdown (a scan is cheaper than visiting ~all
+// candidates), while still returning the correct matches.
+func TestMatchPlanCostGate(t *testing.T) {
+	t.Parallel()
+	const n = 4000
+	// Every slot is X86_64 with Cpus in {1,2} -- an Arch/Cpus probe barely prunes.
+	c := New(Options{Shards: 4, CategoricalAttrs: []string{"Arch"}, ValueAttrs: []string{"Cpus"}})
+	plain := New(Options{Shards: 4})
+	for i := 0; i < n; i++ {
+		ad := mustAd(t, fmt.Sprintf(`[ Id=%d; Arch="X86_64"; Cpus=%d; Requirements=true ]`, i, 1+i%2))
+		c.Put([]byte(fmt.Sprintf("m%d", i)), ad)
+		plain.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, fmt.Sprintf(`[ Id=%d; Arch="X86_64"; Cpus=%d; Requirements=true ]`, i, 1+i%2)))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestCpus=1; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Cpus >= RequestCpus); Rank = 0 ]`)
+
+	// Arch==X86_64 is 100% and Cpus>=1 is 100% -> the plan barely prunes -> gated off.
+	if _, prunable := c.slotMatchPlan(job, jobValues(job)); prunable {
+		t.Errorf("expected the unselective plan to be gated off (scan), but it was prunable")
+	}
+	// Result is still correct (all slots match).
+	if p, i := matchIDSet(t, plain, job), matchIDSet(t, c, job); !equalInts(p, i) || len(i) != n {
+		t.Fatalf("gated match wrong: indexed %d vs full %d (want %d)", len(i), len(p), n)
 	}
 }
