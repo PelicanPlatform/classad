@@ -45,10 +45,23 @@ func (db *DB) Snapshot(w io.Writer) error {
 // the finest-grained escrow key, which decrypts THIS backup only (unlike the backup key,
 // which decrypts all of them). Returns nil when encryption is disabled.
 func (db *DB) SnapshotWithKey(w io.Writer) ([]byte, error) {
+	bw := bufio.NewWriter(w)
+	snapKey, err := db.snapshotTo(bw)
+	if err != nil {
+		return nil, err
+	}
+	if err := bw.Flush(); err != nil {
+		return nil, err
+	}
+	return snapKey, nil
+}
+
+// snapshotTo writes one table's snapshot to bw WITHOUT flushing -- so a catalog snapshot
+// can stream several tables through one shared writer. It takes the DB-wide lock shared.
+func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 	db.snapMu.RLock()
 	defer db.snapMu.RUnlock()
 
-	bw := bufio.NewWriter(w)
 	if _, err := bw.Write(snapMagic); err != nil {
 		return nil, err
 	}
@@ -134,10 +147,7 @@ func (db *DB) SnapshotWithKey(w io.Writer) ([]byte, error) {
 	if err := writeUvarint(bw, 0); err != nil { // end-of-body marker
 		return nil, err
 	}
-	if err := bw.Flush(); err != nil {
-		return nil, err
-	}
-	return snapKey, nil
+	return snapKey, nil // caller flushes
 }
 
 // Truncate removes every ad from the DB, atomically against all writers (it takes the
@@ -193,10 +203,16 @@ func (db *DB) BackupKey() []byte {
 }
 
 func (db *DB) restore(r io.Reader, keys SnapshotKeys) error {
+	return db.restoreFrom(bufio.NewReader(r), keys)
+}
+
+// restoreFrom reads exactly one table's snapshot from br (never over-reading past its
+// end-of-body marker, since every read is byte-exact), so a catalog restore can read
+// several table sections from one shared reader. It takes the DB-wide lock exclusively.
+func (db *DB) restoreFrom(br *bufio.Reader, keys SnapshotKeys) error {
 	db.snapMu.Lock()
 	defer db.snapMu.Unlock()
 
-	br := bufio.NewReader(r)
 	magic := make([]byte, len(snapMagic))
 	if _, err := io.ReadFull(br, magic); err != nil {
 		return fmt.Errorf("db: reading snapshot header: %w", err)
