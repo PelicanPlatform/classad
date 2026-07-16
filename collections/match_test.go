@@ -814,6 +814,53 @@ func TestReorderIndexedFlagSinks(t *testing.T) {
 	}
 }
 
+// TestMatchCategoricalBoolEqualsFullScan: boolean capability flags indexed categorically
+// (HasFileTransfer, HasSingularity) must index correctly (posted as "true"/"false", not
+// dropped to the exception set) and the indexed match must equal the full scan -- both
+// when the flag is used as a bare truthiness conjunct and as `== true`.
+func TestMatchCategoricalBoolEqualsFullScan(t *testing.T) {
+	t.Parallel()
+	const n = 3000
+	build := func(indexed bool) *Collection {
+		opts := Options{Shards: 4}
+		if indexed {
+			opts.ValueAttrs = []string{"Memory"}
+			opts.CategoricalAttrs = []string{"HasFileTransfer", "GPUs", "Arch"}
+		}
+		c := New(opts)
+		for i := 0; i < n; i++ {
+			hft := i%5 != 0    // 80% true
+			gpu := i%4 == 0    // 25% true (selective)
+			c.Put([]byte(fmt.Sprintf("m%d", i)),
+				mustAd(t, fmt.Sprintf(`[ Id=%d; Memory=%d; HasFileTransfer=%t; GPUs=%t; Arch="X86_64" ]`,
+					i, (i%8+1)*1024, hft, gpu)))
+		}
+		if indexed {
+			c.Reindex()
+		}
+		return c
+	}
+	plain, indexed := build(false), build(true)
+	jobs := []string{
+		`[ Requirements = TARGET.HasFileTransfer && (TARGET.Memory >= 4096); Rank=0 ]`,
+		`[ Requirements = (TARGET.GPUs == true) && (TARGET.Arch == "X86_64"); Rank=0 ]`,
+		`[ Requirements = TARGET.GPUs && !TARGET.HasFileTransfer; Rank=0 ]`,
+		`[ Requirements = (TARGET.HasFileTransfer == false) || (TARGET.Memory >= 7168); Rank=0 ]`,
+	}
+	for _, js := range jobs {
+		job := mustAd(t, js)
+		p, i := matchIDSet(t, plain, job), matchIDSet(t, indexed, job)
+		if !equalInts(p, i) {
+			t.Errorf("job %s:\n  indexed %d != full scan %d", js, len(i), len(p))
+		}
+	}
+	// The selective GPUs==true flag should be estimable from its categorical index.
+	gpuRef := &ast.AttributeReference{Name: "GPUs", Scope: ast.TargetScope}
+	if frac, ok := indexed.operandTrueProb(gpuRef, map[string]classad.Value{}); !ok || frac > 0.4 {
+		t.Errorf("GPUs truthiness estimate = %.3f ok=%v, want ~0.25 from the categorical index", frac, ok)
+	}
+}
+
 // TestReorderPreservesMatches: reordering is a pure evaluation-order change -- the match
 // set is identical to a brute-force bilateral match over the ORIGINAL (un-reordered)
 // Requirements.

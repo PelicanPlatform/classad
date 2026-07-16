@@ -99,8 +99,13 @@ type ConjunctExplain struct {
 func (c *Collection) conjunctExplains(reqExpr ast.Expr, jobVals map[string]classad.Value) []ConjunctExplain {
 	conj := flattenChain(reqExpr, "&&")
 	out := make([]ConjunctExplain, 0, len(conj))
+	seen := map[string]bool{}
 	for _, cj := range conj {
 		ce := ConjunctExplain{Text: classad.FoldConstants(displayRewrite(cj, jobVals)).String()}
+		if seen[ce.Text] { // a Requirements that repeats a conjunct shows it once
+			continue
+		}
+		seen[ce.Text] = true
 		// Active pushdown probe? (real probeFrom coverage -- what the Probes block lists).
 		realPred := c.materializeFinite(rewriteForSlot(cj, jobVals, nil, false))
 		if len(c.planIndex(vm.Compile(realPred).Probes())) > 0 {
@@ -514,6 +519,14 @@ func (c *Collection) tryMaterializeLeaf(leaf ast.Expr) ast.Expr {
 			return leaf
 		}
 	}
+	// Materialization folds an OPAQUE function of a categorical into a membership probe;
+	// a leaf with no function call (a bare boolean flag, a plain comparison) has nothing
+	// to fold, and enumerating an attribute's domain over it would only risk a too-narrow
+	// probe (e.g. a bare bool over a boolean-posted categorical). Leave those alone -- the
+	// probe extractor / bare-boolean estimator handle them directly.
+	if !containsFunctionCall(leaf) {
+		return leaf
+	}
 	if !isPureExpr(leaf) {
 		return leaf
 	}
@@ -530,7 +543,7 @@ func (c *Collection) tryMaterializeLeaf(leaf ast.Expr) ast.Expr {
 	var passing []string
 	for _, v := range values {
 		ad := classad.New()
-		ad.InsertAttrString(attr, v)
+		insertCatValue(ad, attr, v) // typed insert so boolean "true"/"false" evaluate correctly
 		if b, err := ad.EvaluateExpr(leaf).BoolValue(); err == nil && b {
 			if f := strings.ToLower(v); !passingFolded[f] {
 				passingFolded[f] = true
@@ -539,6 +552,58 @@ func (c *Collection) tryMaterializeLeaf(leaf ast.Expr) ast.Expr {
 		}
 	}
 	return membershipExpr(attr, passing)
+}
+
+// insertCatValue inserts a categorical index value into ad for materialization,
+// preserving boolean type: a value posted as "true"/"false" (how indexRecord keys a
+// boolean attribute) is inserted as a bool so the folded function evaluates on the real
+// value; everything else is a string.
+func insertCatValue(ad *classad.ClassAd, attr, v string) {
+	switch v {
+	case "true":
+		ad.InsertAttrBool(attr, true)
+	case "false":
+		ad.InsertAttrBool(attr, false)
+	default:
+		ad.InsertAttrString(attr, v)
+	}
+}
+
+// containsFunctionCall reports whether e contains a function call anywhere -- the only
+// thing finite-domain materialization can fold (a bare ref or plain comparison has none).
+func containsFunctionCall(e ast.Expr) bool {
+	found := false
+	var walk func(ast.Expr)
+	walk = func(x ast.Expr) {
+		if found || x == nil {
+			return
+		}
+		switch n := x.(type) {
+		case *ast.FunctionCall:
+			found = true
+		case *ast.ParenExpr:
+			walk(n.Inner)
+		case *ast.UnaryOp:
+			walk(n.Expr)
+		case *ast.BinaryOp:
+			walk(n.Left)
+			walk(n.Right)
+		case *ast.SubscriptExpr:
+			walk(n.Container)
+			walk(n.Index)
+		case *ast.SelectExpr:
+			walk(n.Record)
+		case *ast.ConditionalExpr:
+			walk(n.Condition)
+			walk(n.TrueExpr)
+			walk(n.FalseExpr)
+		case *ast.ElvisExpr:
+			walk(n.Left)
+			walk(n.Right)
+		}
+	}
+	walk(e)
+	return found
 }
 
 // membershipExpr builds `attr == v1 || attr == v2 || ...` (folds to an `in` probe), or

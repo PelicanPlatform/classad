@@ -267,8 +267,8 @@ func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 		return usableProbe{attrID: id, cat: true, op: p.Op}, true // presence needs no value
 	case "is", "isnt":
 		// =?= / =!= are case-sensitive: carry the exact (unfolded) spelling.
-		s, err := p.Vals[0].StringValue()
-		if err != nil {
+		s, ok := catExact(p.Vals[0])
+		if !ok {
 			return usableProbe{}, false
 		}
 		return usableProbe{attrID: id, cat: true, op: p.Op, svals: []string{s}}, true
@@ -278,13 +278,39 @@ func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 	}
 	svals := make([]string, 0, len(p.Vals))
 	for _, v := range p.Vals {
-		s, err := v.StringValue()
-		if err != nil {
+		s, ok := catFold(v) // fold to match the index key
+		if !ok {
 			return usableProbe{}, false
 		}
-		svals = append(svals, strings.ToLower(s)) // fold to match the index key
+		svals = append(svals, s)
 	}
 	return usableProbe{attrID: id, cat: true, op: p.Op, svals: svals}, true
+}
+
+// catExact returns the categorical index key for a probe value in its exact spelling: a
+// string as-is, or a boolean as canonical "true"/"false" (matching how indexRecord posts
+// booleans). ok is false for values a categorical index cannot key on (numbers, lists).
+func catExact(v classad.Value) (string, bool) {
+	if s, err := v.StringValue(); err == nil {
+		return s, true
+	}
+	if b, err := v.BoolValue(); err == nil {
+		if b {
+			return "true", true
+		}
+		return "false", true
+	}
+	return "", false
+}
+
+// catFold is catExact folded to the case-insensitive bucket key ("true"/"false" are
+// already lowercase, so booleans are unaffected).
+func catFold(v classad.Value) (string, bool) {
+	s, ok := catExact(v)
+	if !ok {
+		return "", false
+	}
+	return strings.ToLower(s), true
 }
 
 func valUsable(id uint32, p vm.Probe) (usableProbe, bool) {

@@ -277,6 +277,18 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 			addOffset(cp.post, strings.ToLower(lit.Str), o)
 			addOffset(cp.exact, lit.Str, o)
 			cp.posted.Add(o)
+		} else if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitBool {
+			// Boolean capability flags (HasFileTransfer, HasSingularity, ...) are commonly
+			// indexed categorically; post them under their canonical "true"/"false" key so
+			// `attr == true` and truthiness-selectivity estimates resolve from the index
+			// instead of falling into the (unindexed) exception set.
+			s := "false"
+			if lit.Bool {
+				s = "true"
+			}
+			addOffset(cp.post, s, o)
+			addOffset(cp.exact, s, o)
+			cp.posted.Add(o)
 		} else {
 			cp.exc.Add(o)
 		}
