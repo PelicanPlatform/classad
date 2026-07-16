@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -32,6 +33,15 @@ type DB struct {
 	id       string // stable database identity (persisted; random for in-memory)
 	instance string // this open's instance identity (fresh each Open)
 	dir      string // on-disk directory ("" for in-memory); where index config persists
+
+	// enc is the derived encryption state (data key for the live store, backup key +
+	// master envelope for snapshots), or nil when encryption is disabled. See db/encrypt.go.
+	enc *dbCrypto
+
+	// snapMu is the DB-wide lock. Ordinary writes take it read-shared (many concurrent
+	// commits proceed); Truncate/Restore take it exclusively so a reload is atomic against
+	// all writers. See db/snapshot.go.
+	snapMu sync.RWMutex
 }
 
 // OrderSpec, SortKey, OrderedAd, OrderCursor configure and drive maintained ordered
@@ -79,7 +89,7 @@ func Open(dir string) (*DB, error) { return OpenConfig(Config{Dir: dir}) }
 // are effectively the same identity, but a follower/replica shares the DB id while
 // carrying its own instance id.
 func OpenConfig(cfg Config) (*DB, error) {
-	dataKey, err := resolveDataKey(cfg.Dir, cfg.PoolKeys)
+	enc, err := resolveCrypto(cfg.Dir, cfg.PoolKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -92,7 +102,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		ValueAttrs:        cfg.ValueAttrs,
 		MatchClosureRoots: cfg.MatchClosureRoots,
 		Codec:             chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
-		DataKey:           dataKey,
+		DataKey:           enc.data(),
 		EncryptedAttrs:    cfg.EncryptedAttrs,
 	}
 	var c *collections.Collection
@@ -104,7 +114,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 			return nil, err
 		}
 	}
-	db := &DB{c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID(), dir: cfg.Dir}
+	db := &DB{c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID(), dir: cfg.Dir, enc: enc}
 	// Reapply any index/hot-set configuration persisted by a previous run's
 	// runtime changes (AddIndex/AddHotAttrs/...), so they survive a restart.
 	db.loadIndexConfig()
@@ -509,7 +519,13 @@ func (db *DB) Begin() *Txn { return &Txn{tx: db.c.Begin(), db: db} }
 // operations still committed), or nil on full success.
 func (t *Txn) Commit() error {
 	t.done = true
+	// The DB-wide lock, held shared: many commits proceed concurrently, but a Truncate
+	// or Restore (exclusive) is atomic against them. A transaction whose snapshot predates
+	// a Truncate additionally conflicts via the shard gcFloor, so a stale write cannot land
+	// on the restored state even if it commits just after the exclusive section releases.
+	t.db.snapMu.RLock()
 	res := t.tx.Commit()
+	t.db.snapMu.RUnlock()
 	if res.Conflicted() {
 		keys := make([]string, len(res.Conflicts))
 		for i, k := range res.Conflicts {
