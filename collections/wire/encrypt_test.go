@@ -30,9 +30,9 @@ func TestEncryptedAttributeRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	sealer := dekSealer{dek}
-	enc := map[string]struct{}{"claimid": {}}
+	encrypt := func(name string) bool { return name == "ClaimId" }
 
-	b := EncodeInlineWithHotEnc(nil, mkAd(), nil, enc, sealer)
+	b := EncodeInlineWithHotEnc(nil, mkAd(), nil, encrypt, sealer)
 
 	// The plaintext of the secret must not appear anywhere in the encoded bytes.
 	if idx := indexOf(b, []byte("secret-capability-1234")); idx >= 0 {
@@ -70,9 +70,9 @@ func TestEncryptedAttributeNotHot(t *testing.T) {
 	dek, _ := crypt.NewDEK()
 	sealer := dekSealer{dek}
 	hot := map[string]struct{}{"owner": {}, "claimid": {}}
-	enc := map[string]struct{}{"claimid": {}}
+	encrypt := func(name string) bool { return name == "ClaimId" }
 
-	ad := Ad(EncodeInlineWithHotEnc(nil, mkAd(), hot, enc, sealer))
+	ad := Ad(EncodeInlineWithHotEnc(nil, mkAd(), hot, encrypt, sealer))
 	// Owner (plaintext, hot) is reachable; ClaimId (encrypted) is still present via a scan.
 	if _, ok := ad.LookupByName("Owner"); !ok {
 		t.Error("Owner should be found")

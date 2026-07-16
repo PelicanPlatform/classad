@@ -17,7 +17,7 @@ import (
 func (c *Collection) encodeAd(ad *ast.ClassAd) []byte {
 	if c.inline {
 		if c.sealer != nil {
-			return wire.EncodeInlineWithHotEnc(nil, ad, c.currentHotNames(), c.encryptedAttrs(), c.sealer)
+			return wire.EncodeInlineWithHotEnc(nil, ad, c.currentHotNames(), c.shouldEncrypt, c.sealer)
 		}
 		return wire.EncodeInlineWithHot(nil, ad, c.currentHotNames())
 	}

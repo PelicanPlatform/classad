@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -206,11 +207,13 @@ type Collection struct {
 	lastDictBytes   atomic.Int64
 
 	// Encryption at rest (see encrypt.go). sealer is the DB-wide data-key Sealer (nil
-	// disables encryption); encAttrs is the case-folded set of attributes whose values
-	// are sealed, swapped atomically by the toggle meta-command. Encrypted attributes
-	// are never indexed and never hot.
-	sealer   wire.Sealer
-	encAttrs atomic.Pointer[encSetHolder]
+	// disables encryption); encAttrs is the case-folded explicit set of attributes whose
+	// values are sealed, swapped atomically by the toggle meta-command (private attributes
+	// are always sealed regardless). privCache memoizes the immutable per-name private
+	// determination. Encrypted attributes are never indexed and never hot.
+	sealer    wire.Sealer
+	encAttrs  atomic.Pointer[encSetHolder]
+	privCache sync.Map // attribute name -> bool (classad.IsPrivateAttribute), memoized
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to
@@ -350,12 +353,14 @@ func New(opts Options) *Collection {
 		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
-	// Encryption at rest: build the DB-wide data-key sealer and the encrypted-attr set.
-	// An encrypted attribute must not also be indexed (its value is opaque at rest).
+	// Encryption at rest: build the DB-wide data-key sealer and the explicit encrypted-attr
+	// set. An encrypted attribute (explicit, or an always-encrypted private attribute) must
+	// not also be indexed -- its value is stored opaque, so it could never satisfy an index.
 	if c.sealer = newDataKeySealer(opts.DataKey); c.sealer != nil {
 		enc := foldedSet(opts.EncryptedAttrs)
 		for _, idxAttr := range append(append([]string{}, opts.CategoricalAttrs...), opts.ValueAttrs...) {
-			if _, clash := enc[strings.ToLower(idxAttr)]; clash {
+			_, explicit := enc[strings.ToLower(idxAttr)]
+			if explicit || classad.IsPrivateAttribute(idxAttr) {
 				panic("collections.New: attribute " + idxAttr + " cannot be both encrypted and indexed")
 			}
 		}

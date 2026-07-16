@@ -145,6 +145,74 @@ func TestEncryptAtRestPersist(t *testing.T) {
 	bad.Close()
 }
 
+// TestEncryptPrivateBaseline verifies private attributes are encrypted at rest even
+// when NOT named in EncryptedAttrs (the always-on secret baseline), while a non-private
+// attribute stays in the clear until the runtime toggle adds it.
+func TestEncryptPrivateBaseline(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	_, dataKey := deriveDataKey(t)
+	// No EncryptedAttrs configured -- rely on the private-attribute baseline.
+	c, err := Open(Options{Shards: 1, Dir: dir, DataKey: dataKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// ClaimId is a private attribute; Owner is not.
+	const secret = "capability-blob-private-baseline-5b2"
+	if err := c.Put([]byte("k0"), mustAd(t, fmt.Sprintf(`[Owner="pubvalue-in-clear"; ClaimId=%q]`, secret))); err != nil {
+		t.Fatal(err)
+	}
+	disk := segBytes(t, dir)
+	if bytes.Contains(disk, []byte(secret)) {
+		t.Fatal("private ClaimId not encrypted despite the baseline")
+	}
+	if !bytes.Contains(disk, []byte("pubvalue-in-clear")) {
+		t.Fatal("non-private Owner should be stored in the clear")
+	}
+	// It still decrypts on read.
+	ad, _ := c.Get([]byte("k0"))
+	if v, _ := ad.EvaluateAttrString("ClaimId"); v != secret {
+		t.Fatalf("ClaimId = %q, want decrypted secret", v)
+	}
+
+	// Runtime toggle: encrypt Owner too. New writes seal it.
+	if err := c.SetEncryptedAttrs([]string{"Owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Put([]byte("k1"), mustAd(t, `[Owner="now-a-secret-value-7c1"]`)); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(segBytes(t, dir), []byte("now-a-secret-value-7c1")) {
+		t.Fatal("Owner should be encrypted after the runtime toggle")
+	}
+	ad, _ = c.Get([]byte("k1"))
+	if v, _ := ad.EvaluateAttrString("Owner"); v != "now-a-secret-value-7c1" {
+		t.Fatalf("toggled Owner = %q, want decrypted", v)
+	}
+	c.Close()
+}
+
+// TestSetEncryptedAttrsRejectsIndexed verifies the runtime toggle refuses an indexed
+// attribute (opaque values cannot be indexed), and is a no-op error when encryption is off.
+func TestSetEncryptedAttrsRejectsIndexed(t *testing.T) {
+	_, dataKey := deriveDataKey(t)
+	c := New(Options{DataKey: dataKey, CategoricalAttrs: []string{"Arch"}})
+	if err := c.SetEncryptedAttrs([]string{"Arch"}); err == nil {
+		t.Fatal("SetEncryptedAttrs should reject an indexed attribute")
+	}
+	// A non-indexed attribute is accepted.
+	if err := c.SetEncryptedAttrs([]string{"Secret"}); err != nil {
+		t.Fatalf("SetEncryptedAttrs(non-indexed): %v", err)
+	}
+	// Encryption disabled -> error.
+	plain := New(Options{})
+	if err := plain.SetEncryptedAttrs([]string{"X"}); err == nil {
+		t.Fatal("SetEncryptedAttrs should error when encryption is disabled")
+	}
+}
+
 // TestEncryptedIndexedOverlapPanics locks the invariant that an encrypted attribute
 // cannot also be indexed (its value is opaque at rest).
 func TestEncryptedIndexedOverlapPanics(t *testing.T) {
