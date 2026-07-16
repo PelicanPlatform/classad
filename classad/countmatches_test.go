@@ -24,13 +24,13 @@ func TestCountMatches(t *testing.T) {
 		expr string
 		want int64
 	}{
-		{`countMatches(Capability > 4, AvailableGPUs)`, 2},         // 5.5, 8.0
-		{`countMatches(Capability >= 4.0, AvailableGPUs)`, 3},      // all
-		{`countMatches(GlobalMemoryMb >= 16000, AvailableGPUs)`, 2},// 16000, 40000
-		{`countMatches(Capability > 100, AvailableGPUs)`, 0},       // none
-		{`countMatches(MY.RequireGPUs, AvailableGPUs)`, 2},         // attr ref -> bound expr Capability > 4
-		{`countMatches(Undef, AvailableGPUs)`, 0},                  // unbound projection -> not counted
-		{`countMatches(Capability > 4, DoesNotExist)`, 0},         // undefined list -> 0, not error
+		{`countMatches(Capability > 4, AvailableGPUs)`, 2},          // 5.5, 8.0
+		{`countMatches(Capability >= 4.0, AvailableGPUs)`, 3},       // all
+		{`countMatches(GlobalMemoryMb >= 16000, AvailableGPUs)`, 2}, // 16000, 40000
+		{`countMatches(Capability > 100, AvailableGPUs)`, 0},        // none
+		{`countMatches(MY.RequireGPUs, AvailableGPUs)`, 2},          // attr ref -> bound expr Capability > 4
+		{`countMatches(Undef, AvailableGPUs)`, 0},                   // unbound projection -> not counted
+		{`countMatches(Capability > 4, DoesNotExist)`, 0},           // undefined list -> 0, not error
 		// The generated matchmaking shape: enough GPUs satisfy the requirement.
 		{`countMatches(MY.RequireGPUs, AvailableGPUs) >= RequestGPUs`, 1}, // true == 1 (bool-equiv)
 	}

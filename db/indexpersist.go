@@ -94,7 +94,7 @@ func (db *DB) loadIndexConfig() {
 
 	var drop []string
 	var addCatH, addCatA, addValH, addValA []string // human vs auto adds, to restore provenance
-	for n, k := range cur { // drop anything not wanted, or wanted as a different kind
+	for n, k := range cur {                         // drop anything not wanted, or wanted as a different kind
 		if want[n] != k {
 			drop = append(drop, n)
 		}

@@ -829,8 +829,8 @@ func TestMatchCategoricalBoolEqualsFullScan(t *testing.T) {
 		}
 		c := New(opts)
 		for i := 0; i < n; i++ {
-			hft := i%5 != 0    // 80% true
-			gpu := i%4 == 0    // 25% true (selective)
+			hft := i%5 != 0 // 80% true
+			gpu := i%4 == 0 // 25% true (selective)
 			c.Put([]byte(fmt.Sprintf("m%d", i)),
 				mustAd(t, fmt.Sprintf(`[ Id=%d; Memory=%d; HasFileTransfer=%t; GPUs=%t; Arch="X86_64" ]`,
 					i, (i%8+1)*1024, hft, gpu)))

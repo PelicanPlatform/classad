@@ -1661,7 +1661,7 @@ func (e *Evaluator) lookupBoundExpr(ref *ast.AttributeReference) (ast.Expr, bool
 // boolEquiv reports a value's boolean-equivalent truth (a boolean, or a nonzero
 // integer/real), matching the reference engine's IsBooleanValueEquiv; other types
 // are not boolean-equivalent.
-func boolEquiv(v Value) (val bool, ok bool) {
+func boolEquiv(v Value) (val, ok bool) {
 	switch v.valueType {
 	case BooleanValue, IntegerValue:
 		return v.intVal != 0, true
@@ -1718,7 +1718,7 @@ var functionArity = map[string]funcArity{
 	"versionge":        {2, 2}, "versiongt": {2, 2}, "versionle": {2, 2},
 	"versionlt": {2, 2}, "versioneq": {2, 2},
 	"countmatches": {2, 2}, "evalineachcontext": {2, 2},
-	"formattime":       {0, 2}, "interval": {1, 1}, "identicalmember": {2, 2},
+	"formattime": {0, 2}, "interval": {1, 1}, "identicalmember": {2, 2},
 	"anycompare": {3, 3}, "allcompare": {3, 3}, "stringlistsize": {1, 2},
 	"stringlistsum": {1, 2}, "stringlistavg": {1, 2}, "stringlistmin": {1, 2},
 	"stringlistmax": {1, 2}, "stringlistsintersect": {2, 3},

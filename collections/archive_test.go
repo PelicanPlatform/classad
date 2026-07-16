@@ -77,14 +77,14 @@ func TestArchiveRoundTripAndQuery(t *testing.T) {
 		`Owner == "bob" && Memory > 4096`,
 		`Memory > 4096`,
 		`ClusterId >= 10 && ClusterId < 20`,
-		`Owner == "nobody"`, // no matches
-		`Owner != "alice"`,  // negation
-		`Memory > 1000000`,  // none
-		`Owner =?= "alice"`,            // exact identity
-		`Owner =!= "alice"`,            // exact !=
-		`JobStatus =?= "Completed"`,    // exact identity, matches the stored case
-		`JobStatus =?= "completed"`,    // exact identity, wrong case -> none (folded == would match)
-		`JobStatus =!= "Held"`,         // exact !=
+		`Owner == "nobody"`,         // no matches
+		`Owner != "alice"`,          // negation
+		`Memory > 1000000`,          // none
+		`Owner =?= "alice"`,         // exact identity
+		`Owner =!= "alice"`,         // exact !=
+		`JobStatus =?= "Completed"`, // exact identity, matches the stored case
+		`JobStatus =?= "completed"`, // exact identity, wrong case -> none (folded == would match)
+		`JobStatus =!= "Held"`,      // exact !=
 	}
 	for _, qs := range queries {
 		q, err := vm.Parse(qs)
@@ -186,11 +186,11 @@ func TestArchivePresenceMatch(t *testing.T) {
 	}
 	defer b.Close()
 	for _, qs := range []string{
-		`Owner is undefined`,     // absent + expression-valued(undefined)
-		`Owner isnt undefined`,   // present literal
-		`isUndefined(Owner)`,     // function form
-		`!isUndefined(Owner)`,    // negated function form
-		`Memory isnt undefined`,  // always present
+		`Owner is undefined`,    // absent + expression-valued(undefined)
+		`Owner isnt undefined`,  // present literal
+		`isUndefined(Owner)`,    // function form
+		`!isUndefined(Owner)`,   // negated function form
+		`Memory isnt undefined`, // always present
 		`Owner is undefined && Memory > 1024`,
 	} {
 		q, _ := vm.Parse(qs)

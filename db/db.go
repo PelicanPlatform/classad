@@ -145,8 +145,8 @@ type MaintainOptions struct {
 	// IndexBudgetHighFrac / IndexBudgetLowFrac / IndexBudgetSlackBytes bound auto-created
 	// index memory as a fraction of the live data bytes (see collections.AutoTuneOptions);
 	// 0 high frac disables the budget (auto indexes grow unbounded).
-	IndexBudgetHighFrac  float64
-	IndexBudgetLowFrac   float64
+	IndexBudgetHighFrac   float64
+	IndexBudgetLowFrac    float64
 	IndexBudgetSlackBytes int64
 }
 

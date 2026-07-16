@@ -121,13 +121,13 @@ func TestIndexMatchesFullScan(t *testing.T) {
 		`Arch =!= "x86_64"`,                              // exact !=: MUST keep the "X86_64" variant
 		`Arch =!= "aarch64" && Owner =?= "bob"`,          // exact != and exact == together
 		// Disjunctive (DNF) queries: union of index candidate sets, re-verified.
-		`Cpus >= 6 || Owner == "alice"`,                              // value-range OR categorical-eq
-		`(Cpus >= 6 && Arch == "X86_64") || State == "Claimed"`,      // multi-probe group OR eq
-		`Owner == "alice" || Owner == "bob" || Memory > 6144`,        // three disjuncts
-		`Memory > 4096 || State is undefined`,                        // range OR presence
-		`Cpus >= 6 || Nonexistent == "x"`,                            // one disjunct unindexed -> full scan
-		`Arch =!= "X86_64" || Cpus == 3`,                             // exact-!= OR value-eq
-		`Arch == "X86_64" && (Cpus >= 6 || State == "Claimed")`,      // nested OR -> DNF distribution
+		`Cpus >= 6 || Owner == "alice"`,                                          // value-range OR categorical-eq
+		`(Cpus >= 6 && Arch == "X86_64") || State == "Claimed"`,                  // multi-probe group OR eq
+		`Owner == "alice" || Owner == "bob" || Memory > 6144`,                    // three disjuncts
+		`Memory > 4096 || State is undefined`,                                    // range OR presence
+		`Cpus >= 6 || Nonexistent == "x"`,                                        // one disjunct unindexed -> full scan
+		`Arch =!= "X86_64" || Cpus == 3`,                                         // exact-!= OR value-eq
+		`Arch == "X86_64" && (Cpus >= 6 || State == "Claimed")`,                  // nested OR -> DNF distribution
 		`(Owner == "alice" || Cpus >= 6) && (Arch == "X86_64" || Memory > 4096)`, // two nested ORs (cross product)
 	}
 	for _, qs := range queries {
@@ -154,11 +154,11 @@ func TestMetaEqualsUsesIndex(t *testing.T) {
 		query       string
 		wantIndexed bool
 	}{
-		{`Arch =?= "X86_64"`, true},   // exact identity on a categorical index
-		{`Cpus =?= 3`, true},          // identity on a value index (planned as ==)
-		{`Arch == "X86_64"`, true},    // folded categorical equality
-		{`Arch =!= "aarch64"`, true},  // isnt vs literal: indexed via exact-case postings
-		{`Cpus =!= 3`, false},         // numeric isnt: not indexed (int/real type-strictness)
+		{`Arch =?= "X86_64"`, true},           // exact identity on a categorical index
+		{`Cpus =?= 3`, true},                  // identity on a value index (planned as ==)
+		{`Arch == "X86_64"`, true},            // folded categorical equality
+		{`Arch =!= "aarch64"`, true},          // isnt vs literal: indexed via exact-case postings
+		{`Cpus =!= 3`, false},                 // numeric isnt: not indexed (int/real type-strictness)
 		{`State isnt undefined`, true},        // presence on a categorical index
 		{`State =?= undefined`, true},         // absence on a categorical index
 		{`Cpus =!= undefined`, true},          // presence on a value index

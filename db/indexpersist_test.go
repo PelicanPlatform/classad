@@ -87,7 +87,7 @@ func TestIndexProvenancePersistsAcrossReopen(t *testing.T) {
 	if err := tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
-	d.AddIndex([]string{"Owner"}, nil)     // human
+	d.AddIndex([]string{"Owner"}, nil)      // human
 	d.c.AddAutoIndex([]string{"GPUs"}, nil) // auto
 	d.saveIndexConfig()
 	d.Close()

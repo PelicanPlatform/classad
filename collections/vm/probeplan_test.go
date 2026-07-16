@@ -32,12 +32,12 @@ func TestProbePlanDNF(t *testing.T) {
 		return out
 	}
 	cases := []struct{ sql, want string }{
-		{`Cpus >= 4`, "Cpus>="},                                   // conjunctive: one group
-		{`Cpus >= 4 && Arch == "x"`, "Cpus>=,Arch=="},             // one group, two probes
-		{`Cpus >= 4 || Arch == "x"`, "Cpus>= | Arch=="},           // two groups
+		{`Cpus >= 4`, "Cpus>="},                         // conjunctive: one group
+		{`Cpus >= 4 && Arch == "x"`, "Cpus>=,Arch=="},   // one group, two probes
+		{`Cpus >= 4 || Arch == "x"`, "Cpus>= | Arch=="}, // two groups
 		{`(Cpus >= 4 && Memory > 8) || Owner == "a"`, "Cpus>=,Memory> | Owner=="},
-		{`Cpus >= 4 || SomeFlag`, "Cpus>= | SomeFlagtruthy"},      // a bare ref is a truthiness probe
-		{`Cpus >= 4 || (2 * Foo)`, "Cpus>= | <none>"},             // a non-ref expression yields no probe
+		{`Cpus >= 4 || SomeFlag`, "Cpus>= | SomeFlagtruthy"}, // a bare ref is a truthiness probe
+		{`Cpus >= 4 || (2 * Foo)`, "Cpus>= | <none>"},        // a non-ref expression yields no probe
 	}
 	for _, tc := range cases {
 		if got := render(tc.sql); got != tc.want {

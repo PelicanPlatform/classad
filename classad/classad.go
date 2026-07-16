@@ -1208,8 +1208,9 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		// collapses to its taken branch.
 		if (v.Op == "is" || v.Op == "isnt") && isLiteralExpr(left) && isLiteralExpr(right) {
 			if result := c.evaluateBinaryOp(v.Op, leftVal, rightVal); result.IsBool() {
-				b, _ := result.BoolValue()
-				return &ast.BooleanLiteral{Value: b}
+				if b, err := result.BoolValue(); err == nil {
+					return &ast.BooleanLiteral{Value: b}
+				}
 			}
 		}
 
