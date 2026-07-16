@@ -87,6 +87,52 @@ func TestEncryptedDBMasterKeyLifecycle(t *testing.T) {
 	}
 }
 
+// TestEncryptedAttrsPersistAcrossReopen verifies a runtime SetEncryptedAttrs toggle is
+// persisted (indexcfg.json) and reconciled on the next open, so the policy -- and thus
+// which attributes are sealed on disk -- is stable across restarts (the HA follower
+// convergence path, since config is not op-replicated).
+func TestEncryptedAttrsPersistAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	pool := KEK{ID: "POOL", Material: []byte("pool-key-material-for-persist-test-x")}
+	cfg := Config{Dir: dir, PoolKeys: []KEK{pool}} // no EncryptedAttrs initially
+
+	db, err := OpenConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetEncryptedAttrs([]string{"Region"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.EncryptedAttrNames(); len(got) != 1 || got[0] != "region" {
+		t.Fatalf("EncryptedAttrNames = %v, want [region]", got)
+	}
+	tx := db.Begin()
+	tx.NewClassAd("m", mustAd(t, "Region = \"secret-region-eu-west-42\""))
+	tx.Commit()
+	db.Close()
+
+	// Reopen: the policy is reconciled from indexcfg.json even though cfg has no
+	// EncryptedAttrs, and Region reads back decrypted while being sealed on disk.
+	db, err = OpenConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := db.EncryptedAttrNames(); len(got) != 1 || got[0] != "region" {
+		t.Fatalf("after reopen EncryptedAttrNames = %v, want [region]", got)
+	}
+	if bytes.Contains(readAll(t, dir), []byte("secret-region-eu-west-42")) {
+		t.Fatal("Region value present in plaintext on disk after reopen")
+	}
+	ad, ok := db.LookupClassAd("m")
+	if !ok {
+		t.Fatal("m missing")
+	}
+	if v, _ := ad.EvaluateAttrString("Region"); v != "secret-region-eu-west-42" {
+		t.Fatalf("Region = %q, want decrypted", v)
+	}
+	db.Close()
+}
+
 // TestEncryptedDBKeyRotation verifies a rotated-in pool key is added to the envelope on
 // the next open, so it can subsequently open the DB alone.
 func TestEncryptedDBKeyRotation(t *testing.T) {

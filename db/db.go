@@ -336,6 +336,24 @@ func (db *DB) RefreshHotSet(sampleMax, topN int) int {
 	return n
 }
 
+// SetEncryptedAttrs replaces the explicit set of attributes encrypted at rest (the
+// human-toggled set; private attributes are always encrypted). It errors if encryption
+// is disabled or a named attribute is indexed. The policy is persisted so it survives a
+// restart and, in HA, lets a follower converge on reload. New writes seal the new set;
+// existing records re-seal when next rewritten (compaction/Rewrite).
+func (db *DB) SetEncryptedAttrs(attrs []string) error {
+	if err := db.c.SetEncryptedAttrs(attrs); err != nil {
+		return err
+	}
+	db.saveIndexConfig()
+	return nil
+}
+
+// EncryptedAttrNames returns the explicit encrypted-attribute set (not the always-on
+// private attributes). EncryptionEnabled reports whether encryption at rest is active.
+func (db *DB) EncryptedAttrNames() []string { return db.c.EncryptedAttrNames() }
+func (db *DB) EncryptionEnabled() bool      { return db.c.EncryptionEnabled() }
+
 // Compact reclaims dead space in shards whose dead-byte ratio warrants it,
 // returning the number of shards compacted.
 func (db *DB) Compact() int { return db.c.Compact() }
