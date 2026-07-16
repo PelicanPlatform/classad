@@ -12,17 +12,26 @@ import (
 // these helpers so the rest of the store is oblivious to the mode.
 
 // encodeAd encodes an ad to wire bytes for storage, with the collection's hot set.
+// When encryption at rest is enabled, the designated attributes' values are sealed
+// with the DB data key (persistent/inline collections only).
 func (c *Collection) encodeAd(ad *ast.ClassAd) []byte {
 	if c.inline {
+		if c.sealer != nil {
+			return wire.EncodeInlineWithHotEnc(nil, ad, c.currentHotNames(), c.encryptedAttrs(), c.sealer)
+		}
 		return wire.EncodeInlineWithHot(nil, ad, c.currentHotNames())
 	}
 	hot, closureComplete := c.hotSetForEncode(ad)
 	return wire.EncodeWithHotClosure(nil, ad, c.intern, hot, closureComplete)
 }
 
-// decodeWire decodes stored wire bytes back to an ast.ClassAd.
+// decodeWire decodes stored wire bytes back to an ast.ClassAd, opening any encrypted
+// attributes with the DB data key.
 func (c *Collection) decodeWire(w []byte) (*ast.ClassAd, error) {
 	if c.inline {
+		if c.sealer != nil {
+			return wire.DecodeInlineEnc(w, c.sealer)
+		}
 		return wire.DecodeInline(w)
 	}
 	return wire.Decode(w, c.intern)
@@ -41,9 +50,14 @@ func (c *Collection) wireLookup(a wire.Ad, name string) ([]byte, bool) {
 	return a.Lookup(id)
 }
 
-// decodeNode decodes raw node bytes (from wireLookup) into an ast.Expr.
+// decodeNode decodes raw node bytes (from wireLookup) into an ast.Expr, opening an
+// encrypted node with the DB data key. The collection always holds the key; a higher
+// layer (the server) decides whether a given reader may see the decrypted value.
 func (c *Collection) decodeNode(node []byte) (ast.Expr, error) {
 	if c.inline {
+		if c.sealer != nil {
+			return wire.DecodeNodeInlineEnc(node, c.sealer)
+		}
 		return wire.DecodeNodeInline(node)
 	}
 	return wire.DecodeNode(node, c.intern)

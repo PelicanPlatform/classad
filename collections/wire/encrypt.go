@@ -37,6 +37,14 @@ func (e *encoder) encNode(v ast.Expr) {
 	e.buf = append(e.buf, ct...)
 }
 
+// DecodeNodeInlineEnc decodes raw node bytes from an inline-names ad (as returned by
+// LookupByName), opening an nEncrypted node with open. A nil open leaves an encrypted
+// node an error (the fast path treats that as absent).
+func DecodeNodeInlineEnc(node []byte, open Sealer) (ast.Expr, error) {
+	d := &decoder{b: node, inline: true, open: open}
+	return d.node(0)
+}
+
 // DecodeInlineEnc is DecodeInline for an ad that may contain nEncrypted attributes:
 // open supplies the segment's key so encrypted values decrypt to their real nodes.
 // A nil open leaves encrypted attributes opaque and DecodeInline errors on them --

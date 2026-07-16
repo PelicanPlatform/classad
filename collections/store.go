@@ -122,6 +122,19 @@ type Options struct {
 	// and from the parent-change diff, so high-frequency parent-internal churn does
 	// not fan out to every child. Case-insensitive. Only meaningful with ParentKeyFor.
 	ParentPrivateAttrs []string
+
+	// DataKey enables encryption at rest: the named attributes' values are sealed with
+	// AES-256-GCM under this key before being written to a segment. It must be the DB
+	// master key's DataInfo subkey (crypt.Subkey(master, crypt.DataInfo)) -- distinct
+	// from the master itself -- so a stolen database is useless without a pool key.
+	// Empty ⇒ encryption disabled (EncryptedAttrs is then inert). See encrypt.go.
+	DataKey []byte
+	// EncryptedAttrs names the attributes to encrypt at rest (case-insensitive). Only
+	// meaningful with DataKey set. An encrypted attribute may NOT also be indexed
+	// (CategoricalAttrs/ValueAttrs) -- New panics on overlap -- since its value is
+	// opaque at rest. The set can be changed at runtime via the toggle meta-command;
+	// existing records keep their prior form until rewritten.
+	EncryptedAttrs []string
 }
 
 // AdUpdate is one insert-or-update in a batch.
@@ -191,6 +204,13 @@ type Collection struct {
 	// dictionary's size in bytes.
 	lastRetrainUnix atomic.Int64
 	lastDictBytes   atomic.Int64
+
+	// Encryption at rest (see encrypt.go). sealer is the DB-wide data-key Sealer (nil
+	// disables encryption); encAttrs is the case-folded set of attributes whose values
+	// are sealed, swapped atomically by the toggle meta-command. Encrypted attributes
+	// are never indexed and never hot.
+	sealer   wire.Sealer
+	encAttrs atomic.Pointer[encSetHolder]
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to
@@ -330,6 +350,17 @@ func New(opts Options) *Collection {
 		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
+	// Encryption at rest: build the DB-wide data-key sealer and the encrypted-attr set.
+	// An encrypted attribute must not also be indexed (its value is opaque at rest).
+	if c.sealer = newDataKeySealer(opts.DataKey); c.sealer != nil {
+		enc := foldedSet(opts.EncryptedAttrs)
+		for _, idxAttr := range append(append([]string{}, opts.CategoricalAttrs...), opts.ValueAttrs...) {
+			if _, clash := enc[strings.ToLower(idxAttr)]; clash {
+				panic("collections.New: attribute " + idxAttr + " cannot be both encrypted and indexed")
+			}
+		}
+		c.encAttrs.Store(&encSetHolder{set: enc})
+	}
 	if opts.WatchHistory > 0 {
 		c.hub = newWatchHub()
 		c.watchBuf = opts.WatchBuffer
