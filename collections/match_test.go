@@ -769,6 +769,12 @@ func TestReorderShortCircuitOrder(t *testing.T) {
 	if in := firstChain(jobRequirementsExpr(job), "||"); !strings.Contains(in[0].String(), "versionGE") {
 		t.Errorf("input job was mutated: %s", jobRequirementsExpr(job))
 	}
+	// ExplainMatch shows the same optimized order: the cheap Disk test appears before
+	// the expensive versionGE(split(...)) in the displayed slot predicate.
+	sp := c.ExplainMatch(job).SlotPredicate
+	if di, vi := strings.Index(sp, "Disk >= 1000"), strings.Index(sp, "versionGE"); di < 0 || vi < 0 || di > vi {
+		t.Errorf("explain slot predicate = %q, want Disk shown before versionGE", sp)
+	}
 }
 
 // TestReorderPreservesMatches: reordering is a pure evaluation-order change -- the match

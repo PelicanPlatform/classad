@@ -84,6 +84,10 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
 	}
 	ex.HasRequirements = true
 	jobVals := jobValues(job)
+	// Show the same short-circuit-reordered predicate the match actually evaluates, so
+	// the explanation reflects real evaluation order (cheap, most-decisive operand first).
+	changed := false
+	reqExpr = c.reorderShortCircuit(reqExpr, jobVals, &changed)
 	// Display: honest, baked, de-duplicated (functions kept, not shown as undefined).
 	ex.SlotPredicate = slotDisplayExpr(reqExpr, jobVals)
 	// Probes: from the probe rewrite (opaque functions -> undefined, so they drop).
