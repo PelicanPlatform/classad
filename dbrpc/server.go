@@ -95,6 +95,12 @@ type ServeOptions struct {
 	// private attributes are stripped from every ad this connection sees, so an
 	// under-privileged peer never learns claim ids and other secrets.
 	IncludePrivate bool
+
+	// Privileged admits the DAEMON-level administrative actions -- those that change
+	// security or durability policy (e.g. the encryption toggle), as opposed to the
+	// ordinary WRITE-level admin actions (index/hot/compact) that any writer may run.
+	// When false, a privileged action is refused even on a read-write connection.
+	Privileged bool
 }
 
 // isMutating reports whether o writes to a transaction (and so is refused on a
@@ -247,7 +253,7 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
 	default:
-		sc.write(sc.s.handle(reqID, o, body, priv))
+		sc.write(sc.s.handle(reqID, o, body, priv, sc.opts.Privileged))
 	}
 }
 
@@ -408,7 +414,7 @@ func (s *Server) streamOrdered(ctx context.Context, reqID uint64, r *reader, inc
 
 // handle executes one request and returns its response frame. includePrivate
 // controls whether ads returned by lookups carry their private attributes.
-func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []byte {
+func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privileged bool) []byte {
 	switch o {
 	case opBegin:
 		table := r.str()
@@ -626,7 +632,7 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate bool) []by
 		if !ok {
 			return respErr(reqID, "no such table: "+table)
 		}
-		msg, err := s.admin(d, action, args)
+		msg, err := s.admin(d, action, args, privileged)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}

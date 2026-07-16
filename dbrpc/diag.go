@@ -20,6 +20,11 @@ type Diagnostics struct {
 	Codec              db.CodecStats        `json:"codec"`
 	Suggestions        []db.IndexSuggestion `json:"suggestions"`
 	DropSuggestions    []db.DropSuggestion  `json:"dropSuggestions"`
+	// EncryptionEnabled reports whether encryption at rest is active; EncryptedAttrs is
+	// the explicit encrypted-attribute set (private attributes are always encrypted and
+	// are not listed here).
+	EncryptionEnabled bool     `json:"encryptionEnabled"`
+	EncryptedAttrs    []string `json:"encryptedAttrs,omitempty"`
 }
 
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
@@ -37,6 +42,8 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		Codec:              t.CodecStats(diagSampleMax),
 		Suggestions:        t.SuggestIndexes(diagSampleMax),
 		DropSuggestions:    t.SuggestDrops(diagSampleMax),
+		EncryptionEnabled:  t.EncryptionEnabled(),
+		EncryptedAttrs:     t.EncryptedAttrNames(),
 	}
 	return json.Marshal(d)
 }
@@ -52,8 +59,22 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 //	compact                           reclaim dead space in warranted shards
 //	rewrite                           re-encode all ads with the current hot set
 //	codec.retrain [sampleMax]         train/refresh the ZSTD dictionary + recompress
-func (s *Server) admin(t *db.DB, action string, args []string) (string, error) {
+//	encrypt.set <attr>...             set the explicit encrypted-at-rest attributes
+//	                                  (DAEMON-only; private attrs always encrypted)
+func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) (string, error) {
 	switch action {
+	case "encrypt.set":
+		// Changing which attributes are encrypted at rest is a security-policy change,
+		// so it is DAEMON-level -- refused even to an ordinary writer. args is the new
+		// explicit set (private attributes are always encrypted regardless). An empty
+		// args clears the explicit set.
+		if !privileged {
+			return "", fmt.Errorf("encrypt.set requires DAEMON authorization")
+		}
+		if err := t.SetEncryptedAttrs(args); err != nil {
+			return "", err
+		}
+		return "encrypted attributes: " + join(t.EncryptedAttrNames()), nil
 	case "index.add.categorical":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
@@ -240,6 +261,14 @@ func (c *Client) AdminTable(table, action string, args ...string) (string, error
 		return "", statusErr(status, body)
 	}
 	return body.str(), nil
+}
+
+// SetEncryptedAttrs sets the explicit attributes encrypted at rest on the named table
+// (private attributes are always encrypted). It is a DAEMON-level action: the server
+// refuses it unless the connection is privileged. Passing no attributes clears the
+// explicit set. Returns the server's human-readable result.
+func (c *Client) SetEncryptedAttrs(table string, attrs ...string) (string, error) {
+	return c.AdminTable(table, "encrypt.set", attrs...)
 }
 
 // --- table catalog ---
