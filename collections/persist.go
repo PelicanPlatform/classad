@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -166,10 +165,7 @@ func Open(opts Options) (*Collection, error) {
 	c.spec.Store(newInlineIndexSpec(opts.CategoricalAttrs, opts.ValueAttrs))
 	// Inline mode keys the hot header by (folded) name; carry the folded HotAttrs.
 	if len(opts.HotAttrs) > 0 {
-		c.hotNames = make(map[string]struct{}, len(opts.HotAttrs))
-		for _, name := range opts.HotAttrs {
-			c.hotNames[strings.ToLower(name)] = struct{}{}
-		}
+		c.hotNames.Store(newHotNamesHolder(opts.HotAttrs))
 	}
 	// Load any dictionaries trained in a prior lifetime (before recovering segments,
 	// which are decoded with the codec they name) and point the registry at the dicts

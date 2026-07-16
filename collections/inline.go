@@ -14,7 +14,7 @@ import (
 // encodeAd encodes an ad to wire bytes for storage, with the collection's hot set.
 func (c *Collection) encodeAd(ad *ast.ClassAd) []byte {
 	if c.inline {
-		return wire.EncodeInlineWithHot(nil, ad, c.hotNames)
+		return wire.EncodeInlineWithHot(nil, ad, c.currentHotNames())
 	}
 	hot, closureComplete := c.hotSetForEncode(ad)
 	return wire.EncodeWithHotClosure(nil, ad, c.intern, hot, closureComplete)
@@ -53,7 +53,7 @@ func (c *Collection) decodeNode(node []byte) (ast.Expr, error) {
 // direct old-ClassAd ingest path (UpdateOld).
 func (c *Collection) newStreamEncoder() *wire.StreamEncoder {
 	if c.inline {
-		return wire.NewInlineStreamEncoder(c.hotNames)
+		return wire.NewInlineStreamEncoder(c.currentHotNames())
 	}
 	return wire.NewStreamEncoder(c.intern, c.currentHotSet())
 }

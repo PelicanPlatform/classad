@@ -3,6 +3,7 @@ package collections
 import (
 	"iter"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -147,9 +148,10 @@ type Collection struct {
 
 	// inline is set for a persistent collection: records store attribute names
 	// inline (no interning), so segment files are self-contained and recoverable.
-	// hotNames (case-folded) drives the hot header in inline mode. See inline.go.
+	// hotNames (case-folded) drives the hot header in inline mode; swapped atomically by
+	// RefreshHotSet/AddHotAttrs (the write path reads it). See inline.go.
 	inline   bool
-	hotNames map[string]struct{}
+	hotNames atomic.Pointer[hotNamesHolder]
 
 	// dicts tracks the ZSTD dictionaries trained over the collection's life so each
 	// persistent segment can be tagged (in its file name) with the dictionary it was
@@ -246,6 +248,45 @@ func (c *Collection) currentCodec() Codec { return c.codec.Load().c }
 func (c *Collection) currentHotSet() map[uint32]struct{} {
 	if h := c.hotSet.Load(); h != nil {
 		return h.set
+	}
+	return nil
+}
+
+// hotNamesHolder wraps the inline-mode hot-name set so it can be swapped atomically. It
+// keeps the folded set the encoder matches on and the original-case spellings for display.
+type hotNamesHolder struct {
+	folded  map[string]struct{} // foldASCII(name) -> {}, matched by the inline encoder
+	display []string            // original-case spellings, sorted (for HotAttrNames)
+}
+
+// newHotNamesHolder builds a holder from original-case names.
+func newHotNamesHolder(names []string) *hotNamesHolder {
+	folded := make(map[string]struct{}, len(names))
+	display := make([]string, 0, len(names))
+	for _, n := range names {
+		f := strings.ToLower(n)
+		if _, dup := folded[f]; dup {
+			continue
+		}
+		folded[f] = struct{}{}
+		display = append(display, n)
+	}
+	sort.Strings(display)
+	return &hotNamesHolder{folded: folded, display: display}
+}
+
+// currentHotNames returns the inline-mode hot attribute set (folded names), or nil.
+func (c *Collection) currentHotNames() map[string]struct{} {
+	if h := c.hotNames.Load(); h != nil {
+		return h.folded
+	}
+	return nil
+}
+
+// currentHotDisplay returns the inline-mode hot attributes in original case, sorted.
+func (c *Collection) currentHotDisplay() []string {
+	if h := c.hotNames.Load(); h != nil {
+		return h.display
 	}
 	return nil
 }
