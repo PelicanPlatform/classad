@@ -68,6 +68,53 @@ type MatchExplain struct {
 	Shards      int    `json:"shards"`
 	// TotalResources is the resource (slot) count, the denominator for selectivity.
 	TotalResources int `json:"totalResources"`
+	// EvalOrder is the top-level && conjuncts in the order the bilateral match evaluates
+	// them (after short-circuit reordering), each tagged with its role: an active pruning
+	// probe, or a re-check whose selectivity (from the index, when available) drove where
+	// it sorts. It makes the ordering transparent -- e.g. an always-true capability flag
+	// appears last as a ~99%-true re-check, not a candidate filter.
+	EvalOrder []ConjunctExplain `json:"evalOrder,omitempty"`
+}
+
+// ConjunctExplain is one top-level && conjunct in the match's evaluation order.
+type ConjunctExplain struct {
+	// Text is the conjunct rewritten over the slot (job refs baked, TARGET scope dropped).
+	Text string `json:"text"`
+	// Probed is true when the conjunct is covered by an active index probe -- it prunes
+	// the candidate set before the bilateral re-verify.
+	Probed bool `json:"probed"`
+	// Indexed is true when the conjunct's selectivity is estimable from an index (a
+	// superset of Probed: it also covers bare boolean flags, which are estimable via
+	// `attr == true` but are not extracted as pushdown probes).
+	Indexed bool `json:"indexed"`
+	// HasSelectivity reports whether TrueFrac is populated.
+	HasSelectivity bool `json:"hasSelectivity"`
+	// TrueFrac is the estimated fraction of slots for which the conjunct holds.
+	TrueFrac float64 `json:"trueFrac"`
+}
+
+// conjunctExplains breaks reqExpr's top-level && spine into per-conjunct explanations in
+// evaluation order, each tagged as an active pruning probe or a re-check with its
+// index-estimated selectivity. reqExpr is expected already short-circuit-reordered.
+func (c *Collection) conjunctExplains(reqExpr ast.Expr, jobVals map[string]classad.Value) []ConjunctExplain {
+	conj := flattenChain(reqExpr, "&&")
+	out := make([]ConjunctExplain, 0, len(conj))
+	for _, cj := range conj {
+		ce := ConjunctExplain{Text: classad.FoldConstants(displayRewrite(cj, jobVals)).String()}
+		// Active pushdown probe? (real probeFrom coverage -- what the Probes block lists).
+		realPred := c.materializeFinite(rewriteForSlot(cj, jobVals, nil, false))
+		if len(c.planIndex(vm.Compile(realPred).Probes())) > 0 {
+			ce.Probed = true
+		}
+		// Selectivity from the index, including bare-boolean flags (synthBoolProbe).
+		if frac, ok := c.operandTrueProb(cj, jobVals); ok {
+			ce.Indexed = true
+			ce.HasSelectivity = true
+			ce.TrueFrac = frac
+		}
+		out = append(out, ce)
+	}
+	return out
 }
 
 // ExplainMatch reports how matchmaking job against this collection would execute:
@@ -90,6 +137,9 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd) MatchExplain {
 	reqExpr = c.reorderShortCircuit(reqExpr, jobVals, &changed)
 	// Display: honest, baked, de-duplicated (functions kept, not shown as undefined).
 	ex.SlotPredicate = slotDisplayExpr(reqExpr, jobVals)
+	// Per-conjunct evaluation order (probe vs re-check + selectivity), so the reordering
+	// is transparent -- an always-true indexed flag reads as a late re-check, not a probe.
+	ex.EvalOrder = c.conjunctExplains(reqExpr, jobVals)
 	// Probes: from the probe rewrite (opaque functions -> undefined, so they drop).
 	plan := vm.Compile(c.slotMatchExpr(reqExpr, jobVals)).ProbePlan()
 	groups, prunable := c.planIndexGroups(plan)

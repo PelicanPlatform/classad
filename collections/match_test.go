@@ -777,6 +777,43 @@ func TestReorderShortCircuitOrder(t *testing.T) {
 	}
 }
 
+// TestReorderIndexedFlagSinks: a bare boolean capability flag that is indexed but
+// almost always true (HasFileTransfer, ~99%) must NOT lead the && chain just because it
+// is cheap -- the reorder reads its real selectivity via the index and sinks it behind
+// the genuinely selective conjunct (Memory>=X), which is the one that rejects candidates.
+func TestReorderIndexedFlagSinks(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, ValueAttrs: []string{"Memory", "HasFileTransfer"}})
+	for i := 0; i < 4000; i++ {
+		hft := "true"
+		if i%400 == 0 { // ~0.25% false -> the flag is ~99.75% true
+			hft = "false"
+		}
+		// Memory in {1024..8192}; >= 7168 is ~25% -> far more selective than the flag.
+		c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Memory=%d; HasFileTransfer=%s; Requirements=true ]`,
+				i, (i%8+1)*1024, hft)))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestMemory=7168;
+		Requirements = TARGET.HasFileTransfer && (TARGET.Memory >= RequestMemory);
+		Rank = 0 ]`)
+
+	rj := c.reorderJobRequirements(job)
+	if rj == job {
+		t.Fatal("expected reorder to move the always-true flag behind the selective Memory test")
+	}
+	ops := firstChain(jobRequirementsExpr(rj), "&&")
+	if len(ops) != 2 {
+		t.Fatalf("expected a 2-operand && chain, got %d: %s", len(ops), jobRequirementsExpr(rj))
+	}
+	// Memory (selective, ~25% true -> most likely to reject) must come first; the
+	// always-true HasFileTransfer flag must come last.
+	if !strings.Contains(ops[0].String(), "Memory") || !strings.Contains(ops[len(ops)-1].String(), "HasFileTransfer") {
+		t.Errorf("want selective Memory first, always-true flag last; got %s", jobRequirementsExpr(rj))
+	}
+}
+
 // TestReorderPreservesMatches: reordering is a pure evaluation-order change -- the match
 // set is identical to a brute-force bilateral match over the ORIGINAL (un-reordered)
 // Requirements.

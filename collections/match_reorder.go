@@ -116,6 +116,16 @@ func (c *Collection) operandTrueProb(operand ast.Expr, jobVals map[string]classa
 	pred := c.materializeFinite(rewriteForSlot(operand, jobVals, nil, false))
 	ups := c.planIndex(vm.Compile(pred).Probes())
 	if len(ups) == 0 {
+		// A bare boolean conjunct (`HasFileTransfer`, `!HasFileTransfer`) is a truthiness
+		// test, not a comparison, so probeFrom yields nothing -- but the attribute may be
+		// indexed. Synthesize `attr == true/false` to read its selectivity, so an indexed
+		// but near-always-true capability flag is ranked by its real ~99% rather than the
+		// neutral prior (which, being cheap, would otherwise float it to the chain front).
+		if p, ok := synthBoolProbe(pred); ok {
+			ups = c.planIndex([]vm.Probe{p})
+		}
+	}
+	if len(ups) == 0 {
 		return 0, false
 	}
 	// An operand that is itself a small conjunction yields several probes; treat them as
@@ -264,6 +274,33 @@ func rebuildChain(op string, operands []ast.Expr) ast.Expr {
 		acc = &ast.BinaryOp{Op: op, Left: acc, Right: o}
 	}
 	return acc
+}
+
+// synthBoolProbe turns a bare boolean truthiness conjunct into the equivalent equality
+// probe: `attr` -> `attr == true`, `!attr` -> `attr == false`. It lets operandTrueProb
+// read the selectivity of an indexed boolean flag that probeFrom (which only classifies
+// comparisons) does not recognize. Estimation only -- never affects match correctness.
+func synthBoolProbe(e ast.Expr) (vm.Probe, bool) {
+	e = unparenExpr(e)
+	neg := false
+	if u, ok := e.(*ast.UnaryOp); ok && u.Op == "!" {
+		neg = true
+		e = unparenExpr(u.Expr)
+	}
+	if r, ok := e.(*ast.AttributeReference); ok && (r.Scope == ast.NoScope || r.Scope == ast.MyScope) {
+		return vm.Probe{Attr: r.Name, Op: "==", Vals: []classad.Value{classad.NewBoolValue(!neg)}}, true
+	}
+	return vm.Probe{}, false
+}
+
+func unparenExpr(e ast.Expr) ast.Expr {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok {
+			return e
+		}
+		e = p.Inner
+	}
 }
 
 // allPure reports whether every operand is side-effect free, so the chain may be
