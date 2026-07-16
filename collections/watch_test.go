@@ -303,3 +303,34 @@ func TestWatchConcurrent(t *testing.T) {
 	cancel()
 	<-done
 }
+
+// TestWatchCursorSkipsExisting: a watch started from WatchCursor() (the current head)
+// replays none of the existing contents -- the "tail from now" path.
+func TestWatchCursorSkipsExisting(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, WatchHistory: 1024})
+	for i := 0; i < 200; i++ {
+		if err := c.Put(wkey(i), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	head, err := c.WatchCursor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, _ := collectCatchUp(t, c, head)
+	if len(events) != 0 {
+		t.Errorf("watch from the head cursor should replay nothing, got %d catch-up events", len(events))
+	}
+	// A nil cursor, by contrast, replays all 200.
+	full, _ := collectCatchUp(t, c, nil)
+	upserts := 0
+	for _, e := range full {
+		if e.Kind == WatchUpsert {
+			upserts++
+		}
+	}
+	if upserts != 200 {
+		t.Errorf("nil cursor should replay all 200 ads, got %d", upserts)
+	}
+}
