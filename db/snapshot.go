@@ -37,12 +37,20 @@ var (
 // Snapshot writes a consistent backup of every ad to w. It holds the DB-wide lock shared,
 // so it is consistent against writers without blocking other readers or snapshots.
 func (db *DB) Snapshot(w io.Writer) error {
+	_, err := db.SnapshotWithKey(w)
+	return err
+}
+
+// SnapshotWithKey is Snapshot that also returns the per-backup (snapshot) key it minted --
+// the finest-grained escrow key, which decrypts THIS backup only (unlike the backup key,
+// which decrypts all of them). Returns nil when encryption is disabled.
+func (db *DB) SnapshotWithKey(w io.Writer) ([]byte, error) {
 	db.snapMu.RLock()
 	defer db.snapMu.RUnlock()
 
 	bw := bufio.NewWriter(w)
 	if _, err := bw.Write(snapMagic); err != nil {
-		return err
+		return nil, err
 	}
 
 	enc := db.enc
@@ -51,7 +59,7 @@ func (db *DB) Snapshot(w io.Writer) error {
 		flags |= snapFlagEncrypted
 	}
 	if err := bw.WriteByte(flags); err != nil {
-		return err
+		return nil, err
 	}
 
 	var snapKey []byte
@@ -59,23 +67,23 @@ func (db *DB) Snapshot(w io.Writer) error {
 		// Embed the master envelope, then a fresh snapshot key wrapped by the backup key.
 		rowsJSON, err := json.Marshal(enc.rows)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := writeChunk(bw, rowsJSON); err != nil {
-			return err
+			return nil, err
 		}
 		if snapKey, err = crypt.NewDEK(); err != nil {
-			return err
+			return nil, err
 		}
 		nonce, wrapped, err := crypt.Seal(enc.backupKey, snapKey)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := writeChunk(bw, nonce); err != nil {
-			return err
+			return nil, err
 		}
 		if err := writeChunk(bw, wrapped); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -118,15 +126,18 @@ func (db *DB) Snapshot(w io.Writer) error {
 		return true
 	})
 	if ferr != nil {
-		return ferr
+		return nil, ferr
 	}
 	if err := flush(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := writeUvarint(bw, 0); err != nil { // end-of-body marker
-		return err
+		return nil, err
 	}
-	return bw.Flush()
+	if err := bw.Flush(); err != nil {
+		return nil, err
+	}
+	return snapKey, nil
 }
 
 // Truncate removes every ad from the DB, atomically against all writers (it takes the
@@ -139,11 +150,49 @@ func (db *DB) Truncate() {
 	db.c.Reindex()
 }
 
+// SnapshotKeys carries any ONE level of the key hierarchy sufficient to decrypt a
+// snapshot. A snapshot is decryptable with, in decreasing specificity: the per-backup
+// SnapshotKey (seals the body directly), the BackupKey (unwraps the snapshot key), the
+// MasterKey (derives the backup key), or PoolKeys (open the embedded master envelope).
+// Restore uses the most specific field provided; all are optional (plain Restore uses the
+// DB's own pool keys). This lets an operator escrow whichever level fits their recovery
+// model and decrypt a backup even without the original pool keys or a running daemon.
+type SnapshotKeys struct {
+	SnapshotKey []byte
+	BackupKey   []byte
+	MasterKey   []byte
+	PoolKeys    []KEK
+}
+
 // Restore replaces the entire DB with the contents of the snapshot in r. It holds the
 // DB-wide lock exclusively: all writers are blocked and the truncate+reload is atomic.
 // An encrypted snapshot is opened with this DB's pool keys against the snapshot's embedded
 // master envelope, so a snapshot taken by any DB sharing a pool key can be restored.
-func (db *DB) Restore(r io.Reader) error {
+func (db *DB) Restore(r io.Reader) error { return db.restore(r, SnapshotKeys{}) }
+
+// RestoreWithBackupKey is Restore using an explicitly-provided backup key (from BackupKey
+// / the backup.key command) to unwrap the snapshot key, instead of the DB's pool keys.
+// This recovers an encrypted backup independently of the pool keys -- the escrow path for
+// disaster recovery when the original pool keys are unavailable.
+func (db *DB) RestoreWithBackupKey(r io.Reader, backupKey []byte) error {
+	return db.restore(r, SnapshotKeys{BackupKey: backupKey})
+}
+
+// RestoreWith is Restore using any level of the key hierarchy (see SnapshotKeys).
+func (db *DB) RestoreWith(r io.Reader, keys SnapshotKeys) error { return db.restore(r, keys) }
+
+// BackupKey returns a copy of the backup key -- the key that unwraps a snapshot's
+// encryption, so an operator can escrow it and decrypt/restore backups without the pool
+// keys. It is DISTINCT from the live-data key (it cannot decrypt the running store) and
+// from the master. Returns nil when encryption is disabled.
+func (db *DB) BackupKey() []byte {
+	if db.enc == nil {
+		return nil
+	}
+	return append([]byte(nil), db.enc.backupKey...)
+}
+
+func (db *DB) restore(r io.Reader, keys SnapshotKeys) error {
 	db.snapMu.Lock()
 	defer db.snapMu.Unlock()
 
@@ -163,22 +212,9 @@ func (db *DB) Restore(r io.Reader) error {
 
 	var snapKey []byte
 	if encrypted {
+		// Read the whole key header (envelope rows, then the backup-key-wrapped snapshot
+		// key), then resolve the snapshot key from whichever key level was supplied.
 		rowsJSON, err := readChunk(br)
-		if err != nil {
-			return err
-		}
-		var rows []crypt.MasterKeyRow
-		if err := json.Unmarshal(rowsJSON, &rows); err != nil {
-			return fmt.Errorf("db: parsing snapshot key envelope: %w", err)
-		}
-		if db.enc == nil {
-			return fmt.Errorf("db: snapshot is encrypted but this database has no keys")
-		}
-		master, err := crypt.OpenMaster(rows, db.enc.poolKeys)
-		if err != nil {
-			return fmt.Errorf("db: cannot open snapshot: %w", err)
-		}
-		backupKey, err := crypt.Subkey(master, crypt.BackupInfo)
 		if err != nil {
 			return err
 		}
@@ -190,8 +226,8 @@ func (db *DB) Restore(r io.Reader) error {
 		if err != nil {
 			return err
 		}
-		if snapKey, err = crypt.Open(backupKey, nonce, wrapped); err != nil {
-			return fmt.Errorf("db: unwrapping snapshot key: %w", err)
+		if snapKey, err = db.deriveSnapKey(keys, rowsJSON, nonce, wrapped); err != nil {
+			return err
 		}
 	}
 
@@ -231,6 +267,51 @@ func (db *DB) Restore(r io.Reader) error {
 	}
 	db.c.Reindex() // rebuild indexes over the loaded ads
 	return nil
+}
+
+// deriveSnapKey resolves the snapshot (per-backup) key from the most specific key level
+// available in keys, falling back to this DB's own pool keys: SnapshotKey (used directly)
+// > BackupKey (unwraps it) > MasterKey (derives the backup key) > PoolKeys / the DB's pool
+// keys (open the embedded envelope for the master). rowsJSON is the embedded master
+// envelope; nonce+wrapped is the backup-key-wrapped snapshot key.
+func (db *DB) deriveSnapKey(keys SnapshotKeys, rowsJSON, nonce, wrapped []byte) ([]byte, error) {
+	if keys.SnapshotKey != nil {
+		return keys.SnapshotKey, nil // the per-backup key seals the body directly
+	}
+	backupKey := keys.BackupKey
+	if backupKey == nil && keys.MasterKey != nil {
+		bk, err := crypt.Subkey(keys.MasterKey, crypt.BackupInfo)
+		if err != nil {
+			return nil, err
+		}
+		backupKey = bk
+	}
+	if backupKey == nil {
+		// Open the embedded master envelope with the supplied pool keys, or the DB's own.
+		poolKeys := keys.PoolKeys
+		if poolKeys == nil && db.enc != nil {
+			poolKeys = db.enc.poolKeys
+		}
+		if poolKeys == nil {
+			return nil, fmt.Errorf("db: snapshot is encrypted but no key was provided and this database has none")
+		}
+		var rows []crypt.MasterKeyRow
+		if err := json.Unmarshal(rowsJSON, &rows); err != nil {
+			return nil, fmt.Errorf("db: parsing snapshot key envelope: %w", err)
+		}
+		master, err := crypt.OpenMaster(rows, poolKeys)
+		if err != nil {
+			return nil, fmt.Errorf("db: cannot open snapshot: %w", err)
+		}
+		if backupKey, err = crypt.Subkey(master, crypt.BackupInfo); err != nil {
+			return nil, err
+		}
+	}
+	snapKey, err := crypt.Open(backupKey, nonce, wrapped)
+	if err != nil {
+		return nil, fmt.Errorf("db: unwrapping snapshot key: %w", err)
+	}
+	return snapKey, nil
 }
 
 // loadFrame parses nAds (key, ad-text) pairs from a decompressed frame and inserts them.

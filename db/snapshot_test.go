@@ -139,6 +139,97 @@ func TestSnapshotCrossKeyPortable(t *testing.T) {
 	// the key is recovered).
 }
 
+// TestSnapshotBackupKeyEscrow verifies a snapshot can be restored with the escrowed
+// backup key alone -- no pool keys -- the disaster-recovery path when the pool keys are
+// gone. The backup key must NOT be the data key (it can't open the live store).
+func TestSnapshotBackupKeyEscrow(t *testing.T) {
+	src, err := OpenConfig(Config{Dir: t.TempDir(), PoolKeys: []KEK{poolKey("POOL")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fill(t, src, "e", 25)
+	backupKey := src.BackupKey()
+	if len(backupKey) == 0 {
+		t.Fatal("BackupKey returned nothing for an encrypted DB")
+	}
+	var snap bytes.Buffer
+	if err := src.Snapshot(&snap); err != nil {
+		t.Fatal(err)
+	}
+	src.Close()
+
+	// A DB with NO pool key in common cannot open the envelope...
+	dst, err := OpenConfig(Config{Dir: t.TempDir(), PoolKeys: []KEK{poolKey("UNRELATED")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	if err := dst.Restore(bytes.NewReader(snap.Bytes())); err == nil {
+		t.Fatal("restore without a matching pool key should fail")
+	}
+	// ...but the escrowed backup key restores it directly.
+	if err := dst.RestoreWithBackupKey(bytes.NewReader(snap.Bytes()), backupKey); err != nil {
+		t.Fatalf("escrow restore with the backup key: %v", err)
+	}
+	if dst.Len() != 25 {
+		t.Fatalf("restored Len = %d, want 25", dst.Len())
+	}
+	if ad, ok := dst.LookupClassAd("e0"); !ok {
+		t.Error("e0 missing after escrow restore")
+	} else if v, _ := ad.EvaluateAttrString("ClaimId"); v != "secret-e-0" {
+		t.Errorf("ClaimId = %q, want secret-e-0", v)
+	}
+}
+
+// TestSnapshotKeyLevels verifies the four decryption entry points: the per-backup
+// snapshot key, the backup key, and pool keys all restore the same backup (the master-key
+// path shares deriveSnapKey's Subkey step with the pool path).
+func TestSnapshotKeyLevels(t *testing.T) {
+	shared := poolKey("SHARED")
+	src, err := OpenConfig(Config{Dir: t.TempDir(), PoolKeys: []KEK{shared}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fill(t, src, "L", 15)
+	backupKey := src.BackupKey()
+
+	var snap bytes.Buffer
+	perBackupKey, err := src.SnapshotWithKey(&snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(perBackupKey) == 0 {
+		t.Fatal("SnapshotWithKey returned no per-backup key")
+	}
+	src.Close()
+
+	// The per-backup key decrypts THIS backup only; the backup key decrypts any; the
+	// pool key opens the embedded envelope. Each restores into a fresh DB.
+	cases := []struct {
+		name string
+		keys SnapshotKeys
+	}{
+		{"snapshot-key", SnapshotKeys{SnapshotKey: perBackupKey}},
+		{"backup-key", SnapshotKeys{BackupKey: backupKey}},
+		{"pool-keys", SnapshotKeys{PoolKeys: []KEK{shared}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d, err := OpenConfig(Config{Dir: t.TempDir(), PoolKeys: []KEK{poolKey("UNRELATED")}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer d.Close()
+			if err := d.RestoreWith(bytes.NewReader(snap.Bytes()), tc.keys); err != nil {
+				t.Fatalf("restore via %s: %v", tc.name, err)
+			}
+			if d.Len() != 15 {
+				t.Fatalf("%s: restored Len = %d, want 15", tc.name, d.Len())
+			}
+		})
+	}
+}
+
 // TestSnapshotPlaintext verifies snapshot/restore also work with encryption disabled.
 func TestSnapshotPlaintext(t *testing.T) {
 	db, err := Open(t.TempDir())
