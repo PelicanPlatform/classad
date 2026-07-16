@@ -463,6 +463,9 @@ func skipNode(c *cursor, depth int) {
 		c.skip(int(c.uvarint())) // inline name
 	case nParen:
 		skipNode(c, depth+1)
+	case nEncrypted:
+		c.skip(int(c.uvarint())) // nonce
+		c.skip(int(c.uvarint())) // ciphertext
 	default:
 		c.ok = false
 	}
