@@ -60,6 +60,11 @@ const (
 	// it against resTable would execute (slot-side probe rewrite + index pushdown), with the
 	// resource-side filter targetWhere (WHERE TARGET / NOPREEMPT) melded into the plan.
 	opMatchExplain op = 23
+
+	// opWatchHead returns an opaque cursor at the current head of a table's change log:
+	// [table] -> [cursor]. A client uses it to start a Watch that streams only subsequent
+	// changes (no replay of current contents) -- the "tail from now" path.
+	opWatchHead op = 24
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -91,6 +96,8 @@ func (o op) String() string {
 		return "Watch"
 	case opWatchStop:
 		return "WatchStop"
+	case opWatchHead:
+		return "WatchHead"
 	case opOrdered:
 		return "Ordered"
 	case opAggregate:

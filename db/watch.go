@@ -36,6 +36,11 @@ type WatchEvent struct {
 // Watch streams changes committed after the given cursor (nil = from now). Cancel via
 // ctx. Events arrive in commit order per key; see collections.Watch for the delivery
 // and coalescing guarantees.
+// WatchCursor returns an opaque cursor at the current head of the change log, so
+// Watch(ctx, cursor) then streams only subsequent changes (no replay of current
+// contents). Cheap; requires the store was opened with watch history.
+func (db *DB) WatchCursor() ([]byte, error) { return db.c.WatchCursor() }
+
 func (db *DB) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
 	seq, err := db.c.Watch(ctx, cursor)
 	if err != nil {

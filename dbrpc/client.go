@@ -374,6 +374,22 @@ func (c *Client) Watch(cursor []byte) (<-chan WatchEvent, func(), error) {
 	return c.WatchTable(DefaultTable, cursor)
 }
 
+// WatchHead returns an opaque cursor at the current head of table's change log, so a
+// following WatchTable(table, cursor) streams only subsequent changes (no replay of
+// current contents) -- the "tail from now" path.
+func (c *Client) WatchHead(table string) ([]byte, error) {
+	status, body, err := c.call(func(rid uint64) []byte {
+		return putStr(req(rid, opWatchHead), table)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if status != stOK {
+		return nil, statusErr(status, body)
+	}
+	return append([]byte(nil), body.bytesRef()...), nil
+}
+
 // WatchTable streams changes to the named table.
 func (c *Client) WatchTable(table string, cursor []byte) (<-chan WatchEvent, func(), error) {
 	id, frames, err := c.callStream(func(rid uint64) []byte {
