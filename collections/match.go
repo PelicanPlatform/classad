@@ -152,6 +152,10 @@ func (c *Collection) MatchSortedRanked(job *classad.ClassAd, limit int) []Ranked
 // job's Requirements yield an index-usable constraint on the slots, it visits only
 // candidate slots (A2); otherwise it scans every slot with the wire-native reject.
 func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []rankedMatch {
+	// Reorder the job's Requirements && / || operands so the evaluator short-circuits
+	// on the cheapest, most-decisive operand first (a copy; the caller's job is not
+	// modified). Purely an evaluation-order optimization -- the match set is unchanged.
+	job = c.reorderJobRequirements(job)
 	if c.parentKeyFor != nil {
 		return c.serialScanMatches(job) // chained: need Scan's flatten/hide-structural view
 	}

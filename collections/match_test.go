@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -707,6 +708,109 @@ func TestMatchFiniteDomainMaterialization(t *testing.T) {
 	}
 	if len(p) == 0 || len(p) == n {
 		t.Fatalf("expected a partial match set, got %d of %d", len(p), n)
+	}
+}
+
+// firstChain finds the first associative op-chain in e and returns its flattened
+// operands, so a test can assert the reordered evaluation order.
+func firstChain(e ast.Expr, op string) []ast.Expr {
+	var found []ast.Expr
+	var walk func(ast.Expr) bool
+	walk = func(x ast.Expr) bool {
+		switch n := x.(type) {
+		case *ast.ParenExpr:
+			return walk(n.Inner)
+		case *ast.UnaryOp:
+			return walk(n.Expr)
+		case *ast.BinaryOp:
+			if n.Op == op {
+				found = flattenChain(n, op)
+				return true
+			}
+			return walk(n.Left) || walk(n.Right)
+		}
+		return false
+	}
+	walk(e)
+	return found
+}
+
+// TestReorderShortCircuitOrder: the expensive opaque function
+// (versionGE(split(...)[1],...)) sorts AFTER the cheap comparison (Disk >= X) in the
+// `||`, so the evaluator tests the cheap operand first and skips the split/subscript on
+// the slots the cheap test already decides.
+func TestReorderShortCircuitOrder(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, ValueAttrs: []string{"Disk"}, CategoricalAttrs: []string{"CondorVersion"}})
+	versions := []string{`$CondorVersion: 25.12.0 2026-06-25 $`, `$CondorVersion: 24.0.0 2025-01-01 $`}
+	for i := 0; i < 2000; i++ {
+		c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Disk=%d; CondorVersion=%q; Arch="X86_64"; Requirements=true ]`,
+				i, 400+(i*2654435761)%1200, versions[i%2])))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestDisk=1000;
+		Requirements = (versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)) && (TARGET.Arch == "X86_64");
+		Rank = 0 ]`)
+
+	rj := c.reorderJobRequirements(job)
+	if rj == job {
+		t.Fatal("expected reorderJobRequirements to reorder the || (cheap Disk before versionGE)")
+	}
+	ops := firstChain(jobRequirementsExpr(rj), "||")
+	if len(ops) != 2 {
+		t.Fatalf("expected a 2-operand || chain, got %d: %s", len(ops), jobRequirementsExpr(rj))
+	}
+	first := ops[0].String()
+	if !strings.Contains(first, "Disk") || strings.Contains(first, "versionGE") {
+		t.Errorf("cheap Disk operand should sort first; got first=%q full=%s", first, jobRequirementsExpr(rj))
+	}
+	// The input job is never mutated.
+	if in := firstChain(jobRequirementsExpr(job), "||"); !strings.Contains(in[0].String(), "versionGE") {
+		t.Errorf("input job was mutated: %s", jobRequirementsExpr(job))
+	}
+}
+
+// TestReorderPreservesMatches: reordering is a pure evaluation-order change -- the match
+// set is identical to a brute-force bilateral match over the ORIGINAL (un-reordered)
+// Requirements.
+func TestReorderPreservesMatches(t *testing.T) {
+	t.Parallel()
+	const n = 1500
+	c := New(Options{Shards: 4, ValueAttrs: []string{"Disk"}, CategoricalAttrs: []string{"CondorVersion"}})
+	versions := []string{
+		`$CondorVersion: 25.12.0 2026-06-25 $`, `$CondorVersion: 25.13.0 2026-07-01 $`,
+		`$CondorVersion: 24.0.0 2025-01-01 $`, `$CondorVersion: 23.5.0 2024-06-01 $`,
+	}
+	for i := 0; i < n; i++ {
+		c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Disk=%d; CondorVersion=%q; Arch="X86_64"; Requirements=true ]`,
+				i, 400+(i*2654435761)%1200, versions[i%4])))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestDisk=1000;
+		Requirements = (versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)) && (TARGET.Arch == "X86_64");
+		Rank = 0 ]`)
+
+	// Brute force: bilateral match over the original job, no reorder path.
+	brute := map[int]bool{}
+	var bruteIDs []int
+	for ad := range c.Scan() {
+		m := classad.NewMatchClassAd(job, nil)
+		ok, _, _ := matchOne(m, ad)
+		if ok {
+			id, _ := ad.EvaluateAttrInt("Id")
+			brute[int(id)] = true
+			bruteIDs = append(bruteIDs, int(id))
+		}
+	}
+	sort.Ints(bruteIDs)
+	got := matchIDSet(t, c, job) // goes through reorderJobRequirements
+	if !equalInts(got, bruteIDs) {
+		t.Fatalf("reordered match (%d) != brute-force bilateral (%d)", len(got), len(bruteIDs))
+	}
+	if len(got) == 0 || len(got) == n {
+		t.Fatalf("expected a partial match set, got %d of %d", len(got), n)
 	}
 }
 

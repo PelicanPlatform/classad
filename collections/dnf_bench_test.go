@@ -172,3 +172,55 @@ func BenchmarkMatchFiniteDomain(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkMatchReorder isolates the short-circuit-reorder win on the full-scan path:
+// the same predicate written expensive-first (versionGE(split(...)) || Disk>=X) vs
+// cheap-first (Disk>=X || versionGE(split(...))), each bilaterally matched over every
+// slot WITHOUT the reorder path, so operand order is the only variable. Cheap-first runs
+// the split/subscript/version parse only on the slots the cheap Disk test does not
+// already decide -- exactly what reorderJobRequirements produces automatically.
+func BenchmarkMatchReorder(b *testing.B) {
+	const n = 100_000
+	versions := []string{`$CondorVersion: 25.12.0 x $`, `$CondorVersion: 24.0.0 x $`,
+		`$CondorVersion: 23.5.0 x $`, `$CondorVersion: 22.1.0 x $`}
+	c := New(Options{Shards: 8})
+	for i := 0; i < n; i++ {
+		disk := 1024 * (1 + (i*2654435761)%500)
+		v := versions[1+i%3]
+		if i%50 == 0 {
+			v = versions[0]
+		}
+		c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(b, fmt.Sprintf(`[ Id=%d; Disk=%d; CondorVersion=%q; Requirements=true ]`, i, disk, v)))
+	}
+	// RequestDisk chosen so the cheap Disk operand is true for ~70% of slots -- i.e. it
+	// short-circuits the || often, which is exactly when operand order pays.
+	expensiveFirst := mustAd(b, `[ RequestDisk=154624;
+		Requirements = versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk) ]`)
+	cheapFirst := mustAd(b, `[ RequestDisk=154624;
+		Requirements = (TARGET.Disk >= RequestDisk) || versionGE(split(TARGET.CondorVersion)[1], "25.12.0") ]`)
+	bruteCount := func(job *classad.ClassAd) int {
+		count := 0
+		for ad := range c.Scan() {
+			m := classad.NewMatchClassAd(job, nil)
+			if ok, _, _ := matchOne(m, ad); ok {
+				count++
+			}
+		}
+		return count
+	}
+	for _, tc := range []struct {
+		name string
+		job  *classad.ClassAd
+	}{
+		{"expensive-first", expensiveFirst},
+		{"cheap-first", cheapFirst},
+	} {
+		m := bruteCount(tc.job)
+		b.Run(fmt.Sprintf("%s/matches=%d", tc.name, m), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				_ = bruteCount(tc.job)
+			}
+		})
+	}
+}
