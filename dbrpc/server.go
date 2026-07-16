@@ -107,16 +107,36 @@ func (o op) isMutating() bool {
 	return false
 }
 
-// StartMaintenance starts the server-managed background maintenance (dictionary
-// retrain + hot-attribute refresh) on the given interval for every table that
-// exists now. Stopped by Close. Tables created later are maintained after a
-// restart.
-func (s *Server) StartMaintenance(interval time.Duration) {
-	for _, name := range s.cat.Tables() {
-		if d, ok := s.cat.Table(name); ok {
-			s.stopBG = append(s.stopBG, d.StartMaintenance(interval))
-		}
+// defaultMaintenanceInterval is used when StartMaintenance is given interval <= 0.
+const defaultMaintenanceInterval = 15 * time.Minute
+
+// StartMaintenance starts server-managed background maintenance on the given interval: a
+// single goroutine that, each tick, re-enumerates the catalog's tables and runs one
+// Maintain pass (index auto-tune, hot-set refresh, and -- if opts.Retrain -- dictionary
+// retrain) on each. Re-enumerating each tick means tables created after startup are
+// maintained too (the old per-table start missed them). Stopped by Close.
+func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOptions) {
+	if interval <= 0 {
+		interval = defaultMaintenanceInterval
 	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				for _, name := range s.cat.Tables() {
+					if d, ok := s.cat.Table(name); ok {
+						d.Maintain(opts)
+					}
+				}
+			}
+		}
+	}()
+	s.stopBG = append(s.stopBG, func() { close(done) })
 }
 
 // tableOr writes a "no such table" error under reqID and returns ok=false if the

@@ -129,12 +129,78 @@ func loadOrCreateDBID(dir string) string {
 // Close releases the log's resources.
 func (db *DB) Close() error { return db.c.Close() }
 
-// StartMaintenance starts the background self-tuning goroutines (compression
-// dictionary retrain + hot-attribute refresh) on the given interval, returning a stop
-// function. A server owns this rather than the caller polling. See
-// collections.StartAutoRetrain.
-func (db *DB) StartMaintenance(interval time.Duration) (stop func()) {
-	return db.c.StartAutoRetrain(interval, 4096, 32)
+// MaintainOptions configures one maintenance pass (DB.Maintain).
+type MaintainOptions struct {
+	// SampleMax caps the ads sampled for index tuning, hot-set frequency, and dictionary
+	// training. Default 4096.
+	SampleMax int
+	// HotTopN refreshes the hot set to the topN most common attributes; 0 disables it.
+	HotTopN int
+	// Retrain retrains the ZSTD dictionary (recompacting + reindexing). Expensive on a
+	// large store, so a server may run it on a longer cadence than the rest.
+	Retrain bool
+	// MinIndexDemand is the minimum observed query count for the auto-tuner to add an
+	// index; 0 leaves index auto-tune off (no demand-driven adds).
+	MinIndexDemand int64
+	// IndexBudgetHighFrac / IndexBudgetLowFrac / IndexBudgetSlackBytes bound auto-created
+	// index memory as a fraction of the live data bytes (see collections.AutoTuneOptions);
+	// 0 high frac disables the budget (auto indexes grow unbounded).
+	IndexBudgetHighFrac  float64
+	IndexBudgetLowFrac   float64
+	IndexBudgetSlackBytes int64
+}
+
+// Maintain runs one self-tuning pass: it auto-tunes indexes (adds demand-driven ones,
+// trims auto indexes over the memory budget, never touches human-created ones), refreshes
+// the hot-attribute set, and optionally retrains the compression dictionary. Index/hot
+// changes are persisted. Synchronous; a server drives it on a schedule (see
+// dbrpc.Server.StartMaintenance).
+func (db *DB) Maintain(opts MaintainOptions) {
+	if opts.SampleMax <= 0 {
+		opts.SampleMax = 4096
+	}
+	if opts.MinIndexDemand > 0 || opts.IndexBudgetHighFrac > 0 {
+		res := db.c.AutoTune(collections.AutoTuneOptions{
+			SampleMax:        opts.SampleMax,
+			MinDemand:        opts.MinIndexDemand,
+			BudgetHighFrac:   opts.IndexBudgetHighFrac,
+			BudgetLowFrac:    opts.IndexBudgetLowFrac,
+			BudgetSlackBytes: opts.IndexBudgetSlackBytes,
+			Reindex:          !opts.Retrain, // if retraining, its recompaction reindexes; else do it here
+		})
+		if res.Changed {
+			db.saveIndexConfig() // persist auto add/drop (with provenance)
+		}
+	}
+	if opts.HotTopN > 0 {
+		db.c.RefreshHotSet(opts.SampleMax, opts.HotTopN)
+	}
+	if opts.Retrain {
+		_, _ = db.c.RetrainDict(opts.SampleMax) // recompacts + reindexes
+	}
+}
+
+// StartMaintenance starts a background goroutine that runs Maintain with the given
+// options every interval, returning a stop function. Prefer the catalog-wide
+// dbrpc.Server.StartMaintenance, which also covers tables created later.
+func (db *DB) StartMaintenance(interval time.Duration, opts MaintainOptions) (stop func()) {
+	if interval <= 0 {
+		interval = collections.DefaultRetrainInterval
+	}
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				db.Maintain(opts)
+			}
+		}
+	}()
+	return func() { close(done) }
 }
 
 // SuggestIndexes samples the store and returns attributes that queries filter on but
