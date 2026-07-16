@@ -57,6 +57,15 @@ type Config struct {
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
+
+	// PoolKeys enables encryption at rest: the DB master key is wrapped under each of
+	// these pool/signing keys (any one opens the DB; a rotated-in key is added on the
+	// next open). Empty ⇒ encryption disabled. See db/encrypt.go.
+	PoolKeys []KEK
+	// EncryptedAttrs names the attributes whose values are sealed at rest (case-
+	// insensitive). Only meaningful with PoolKeys set. An encrypted attribute may not
+	// also be indexed. See collections.Options.EncryptedAttrs.
+	EncryptedAttrs []string
 }
 
 // Open opens a ClassAd log with default configuration. A non-empty dir makes it
@@ -70,6 +79,10 @@ func Open(dir string) (*DB, error) { return OpenConfig(Config{Dir: dir}) }
 // are effectively the same identity, but a follower/replica shares the DB id while
 // carrying its own instance id.
 func OpenConfig(cfg Config) (*DB, error) {
+	dataKey, err := resolveDataKey(cfg.Dir, cfg.PoolKeys)
+	if err != nil {
+		return nil, err
+	}
 	opts := collections.Options{
 		Dir:               cfg.Dir,
 		WatchHistory:      4096, // enables Watch
@@ -79,6 +92,8 @@ func OpenConfig(cfg Config) (*DB, error) {
 		ValueAttrs:        cfg.ValueAttrs,
 		MatchClosureRoots: cfg.MatchClosureRoots,
 		Codec:             chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
+		DataKey:           dataKey,
+		EncryptedAttrs:    cfg.EncryptedAttrs,
 	}
 	var c *collections.Collection
 	if cfg.Dir == "" {
