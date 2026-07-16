@@ -119,7 +119,7 @@ type ServeOptions struct {
 func (o op) isMutating() bool {
 	switch o {
 	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
-		opArchiveCreate, opArchiveAppend:
+		opArchiveCreate, opArchiveAppend, opArchiveRotate:
 		return true
 	}
 	return false
@@ -709,6 +709,21 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 			b = putStr(b, n)
 		}
 		return b
+
+	case opArchiveRotate:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		a, ok := s.cat.ArchiveTable(name)
+		if !ok {
+			return respErr(reqID, "no such archive: "+name)
+		}
+		dropped, err := a.Rotate(float64(time.Now().Unix()))
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putI32(resp(reqID, stOK), int32(dropped))
 	}
 	return respBad(reqID)
 }

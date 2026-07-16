@@ -76,6 +76,7 @@ const (
 	opArchiveAppend op = 29 // [name][adText] -> status; mutating
 	opArchiveQuery  op = 30 // [name][limit i32][constraint] -> stream of [adText], newest first
 	opArchiveList   op = 31 // -> [n i32]{[name]}
+	opArchiveRotate op = 32 // [name] -> [dropped i32]; enforce retention (server clock); mutating
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).

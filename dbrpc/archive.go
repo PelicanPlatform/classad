@@ -81,6 +81,21 @@ func (c *Client) ArchiveQuery(name, constraint string, limit int) ([]string, err
 	})
 }
 
+// ArchiveRotate enforces the named archive's retention policy now (using the server's
+// clock for age-based rules), returning how many sealed segments were dropped.
+func (c *Client) ArchiveRotate(name string) (int, error) {
+	status, body, err := c.call(func(id uint64) []byte {
+		return putStr(req(id, opArchiveRotate), name)
+	})
+	if err != nil {
+		return 0, err
+	}
+	if status != stOK {
+		return 0, statusErr(status, body)
+	}
+	return int(body.i32()), nil
+}
+
 // ArchiveTables lists the history table names.
 func (c *Client) ArchiveTables() ([]string, error) {
 	status, body, err := c.call(func(id uint64) []byte { return req(id, opArchiveList) })
