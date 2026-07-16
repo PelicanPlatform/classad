@@ -61,6 +61,7 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 //	codec.retrain [sampleMax]         train/refresh the ZSTD dictionary + recompress
 //	encrypt.set <attr>...             set the explicit encrypted-at-rest attributes
 //	                                  (DAEMON-only; private attrs always encrypted)
+//	truncate                          remove every ad (DAEMON-only, DB-wide locked)
 func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) (string, error) {
 	switch action {
 	case "encrypt.set":
@@ -75,6 +76,13 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 			return "", err
 		}
 		return "encrypted attributes: " + join(t.EncryptedAttrNames()), nil
+	case "truncate":
+		// Removing every ad is a destructive, DB-wide-locked operation -- DAEMON-level.
+		if !privileged {
+			return "", fmt.Errorf("truncate requires DAEMON authorization")
+		}
+		t.Truncate()
+		return "database truncated", nil
 	case "index.add.categorical":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
@@ -269,6 +277,13 @@ func (c *Client) AdminTable(table, action string, args ...string) (string, error
 // explicit set. Returns the server's human-readable result.
 func (c *Client) SetEncryptedAttrs(table string, attrs ...string) (string, error) {
 	return c.AdminTable(table, "encrypt.set", attrs...)
+}
+
+// TruncateTable removes every ad from the named table. It is a DAEMON-level action
+// (destructive, DB-wide locked): the server refuses it unless the connection is
+// privileged. Returns the server's human-readable result.
+func (c *Client) TruncateTable(table string) (string, error) {
+	return c.AdminTable(table, "truncate")
 }
 
 // --- table catalog ---

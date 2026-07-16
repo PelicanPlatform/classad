@@ -51,6 +51,37 @@ func TestEncryptSetRequiresDaemon(t *testing.T) {
 	}
 }
 
+// TestTruncateRequiresDaemon verifies truncate is DAEMON-only and, when authorized,
+// empties the table.
+func TestTruncateRequiresDaemon(t *testing.T) {
+	// Unprivileged -> refused, data intact.
+	c, d, cleanup := encServerPair(t, ServeOptions{})
+	tx := d.Begin()
+	tx.NewClassAd("a", mustAd(t, "N = 1"))
+	tx.Commit()
+	if _, err := c.TruncateTable("ads"); err == nil {
+		t.Fatal("truncate should be refused without DAEMON privilege")
+	}
+	if d.Len() != 1 {
+		t.Fatalf("unauthorized truncate changed the data: Len = %d", d.Len())
+	}
+	cleanup()
+
+	// Privileged -> empties the table.
+	c, d, cleanup = encServerPair(t, ServeOptions{Privileged: true})
+	defer cleanup()
+	tx = d.Begin()
+	tx.NewClassAd("a", mustAd(t, "N = 1"))
+	tx.NewClassAd("b", mustAd(t, "N = 2"))
+	tx.Commit()
+	if _, err := c.TruncateTable("ads"); err != nil {
+		t.Fatalf("privileged truncate: %v", err)
+	}
+	if d.Len() != 0 {
+		t.Fatalf("after truncate Len = %d, want 0", d.Len())
+	}
+}
+
 // TestEncryptSetReadOnlyRejected confirms the toggle is also refused on a read-only
 // connection (it is a mutating admin op), independent of the DAEMON check.
 func TestEncryptSetReadOnlyRejected(t *testing.T) {
