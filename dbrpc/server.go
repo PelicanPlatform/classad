@@ -36,6 +36,11 @@ type Catalog interface {
 	DropTable(name string) error
 	// Tables lists the table names.
 	Tables() []string
+	// ArchiveTable / CreateArchiveTable / ArchiveTables manage append-only history
+	// tables. A single-table server does not support them.
+	ArchiveTable(name string) (*db.ArchiveTable, bool)
+	CreateArchiveTable(name string, cfg db.ArchiveConfig) (*db.ArchiveTable, error)
+	ArchiveTables() []string
 }
 
 // DefaultTable is the table name a single-DB server serves and the client
@@ -79,6 +84,12 @@ func (s singleCatalog) DropTable(name string) error {
 }
 func (s singleCatalog) Tables() []string { return []string{s.name} }
 
+func (s singleCatalog) ArchiveTable(string) (*db.ArchiveTable, bool) { return nil, false }
+func (s singleCatalog) CreateArchiveTable(string, db.ArchiveConfig) (*db.ArchiveTable, error) {
+	return nil, fmt.Errorf("single-table server: archive tables unsupported")
+}
+func (s singleCatalog) ArchiveTables() []string { return nil }
+
 // ServeOptions scopes what a single served connection may do. The zero value is
 // full read/write access with private attributes excluded from returned ads
 // (the historical ServeConn behavior). A privilege-scoped front end (e.g. an
@@ -107,7 +118,8 @@ type ServeOptions struct {
 // read-only connection).
 func (o op) isMutating() bool {
 	switch o {
-	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable:
+	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
+		opArchiveCreate, opArchiveAppend:
 		return true
 	}
 	return false
@@ -267,6 +279,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.streamWatch(reqID, body)
 	case opSnapshot:
 		sc.streamSnapshot(reqID, body)
+	case opArchiveQuery:
+		sc.streamArchiveQuery(reqID, body)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
@@ -655,6 +669,46 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 			return respErr(reqID, err.Error())
 		}
 		return putStr(resp(reqID, stOK), msg)
+
+	case opArchiveCreate:
+		name := r.str()
+		cfgJSON := r.bytesRef()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		var cfg db.ArchiveConfig
+		if len(cfgJSON) > 0 {
+			if err := json.Unmarshal(cfgJSON, &cfg); err != nil {
+				return respErr(reqID, "archive config: "+err.Error())
+			}
+		}
+		if _, err := s.cat.CreateArchiveTable(name, cfg); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opArchiveAppend:
+		name := r.str()
+		adText := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		a, ok := s.cat.ArchiveTable(name)
+		if !ok {
+			return respErr(reqID, "no such archive: "+name)
+		}
+		if err := a.AppendOld(adText); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opArchiveList:
+		names := s.cat.ArchiveTables()
+		b := putI32(resp(reqID, stOK), int32(len(names)))
+		for _, n := range names {
+			b = putStr(b, n)
+		}
+		return b
 	}
 	return respBad(reqID)
 }

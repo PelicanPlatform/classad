@@ -70,6 +70,12 @@ const (
 	opRestore      op = 25 // [table] -> begins a chunked restore upload on this reqID
 	opRestoreChunk op = 26 // [chunk] appended to the active restore
 	opRestoreEnd   op = 27 // ends the upload; server restores from the spooled file, then replies
+
+	// Archive (history) tables: append-only, rotated, newest-first queries.
+	opArchiveCreate op = 28 // [name][json ArchiveConfig] -> status; mutating
+	opArchiveAppend op = 29 // [name][adText] -> status; mutating
+	opArchiveQuery  op = 30 // [name][limit i32][constraint] -> stream of [adText], newest first
+	opArchiveList   op = 31 // -> [n i32]{[name]}
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
