@@ -1,5 +1,7 @@
 package collections
 
+import "time"
+
 // Compaction reclaims space consumed by superseded/deleted records.
 //
 // It is driven by the per-shard dead-byte ratio (never by age: ClassAds are
@@ -102,6 +104,8 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	for _, sh := range c.shards {
 		c.compactShard(sh, codec) // recompress to the new codec
 	}
+	c.lastDictBytes.Store(int64(len(dict)))
+	c.lastRetrainUnix.Store(time.Now().UnixNano())
 	return len(dict), nil
 }
 

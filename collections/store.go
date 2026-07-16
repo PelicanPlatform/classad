@@ -183,6 +183,12 @@ type Collection struct {
 	// ordered holds the maintained ordered indexes (Options.Ordered), updated on the
 	// write path and read via Collection.Ordered. Empty unless configured.
 	ordered []*orderedIndex
+
+	// Codec retrain bookkeeping for diagnostics (CodecStats): the wall-clock time of the
+	// last successful RetrainDict in this process (unix nanos; 0 = never) and the trained
+	// dictionary's size in bytes.
+	lastRetrainUnix atomic.Int64
+	lastDictBytes   atomic.Int64
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to

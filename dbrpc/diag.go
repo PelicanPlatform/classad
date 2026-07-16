@@ -17,6 +17,7 @@ type Diagnostics struct {
 	CategoricalIndexes []string             `json:"categoricalIndexes"`
 	ValueIndexes       []string             `json:"valueIndexes"`
 	IndexSizes         db.IndexSizes        `json:"indexSizes"`
+	Codec              db.CodecStats        `json:"codec"`
 	Suggestions        []db.IndexSuggestion `json:"suggestions"`
 	DropSuggestions    []db.DropSuggestion  `json:"dropSuggestions"`
 }
@@ -33,6 +34,7 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		CategoricalIndexes: cat,
 		ValueIndexes:       val,
 		IndexSizes:         t.IndexSizes(),
+		Codec:              t.CodecStats(diagSampleMax),
 		Suggestions:        t.SuggestIndexes(diagSampleMax),
 		DropSuggestions:    t.SuggestDrops(diagSampleMax),
 	}
@@ -49,6 +51,7 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 //	hot.refresh <sampleMax> <topN>    recompute the hot set from sampled frequency
 //	compact                           reclaim dead space in warranted shards
 //	rewrite                           re-encode all ads with the current hot set
+//	codec.retrain [sampleMax]         train/refresh the ZSTD dictionary + recompress
 func (s *Server) admin(t *db.DB, action string, args []string) (string, error) {
 	switch action {
 	case "index.add.categorical":
@@ -79,6 +82,18 @@ func (s *Server) admin(t *db.DB, action string, args []string) (string, error) {
 	case "rewrite":
 		n := t.Rewrite()
 		return fmt.Sprintf("rewrote %d ad(s) with the current hot set and compacted", n), nil
+	case "codec.retrain":
+		sampleMax := diagSampleMax
+		if len(args) == 1 {
+			if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+				sampleMax = v
+			}
+		}
+		dictBytes, err := t.RetrainDict(sampleMax)
+		if err != nil {
+			return "", fmt.Errorf("retrain: %w", err)
+		}
+		return fmt.Sprintf("retrained ZSTD dictionary (%d bytes) and recompressed existing ads", dictBytes), nil
 	case "hot.add":
 		if len(args) == 0 {
 			return "", fmt.Errorf("hot.add needs at least one attribute")

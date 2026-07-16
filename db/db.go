@@ -164,9 +164,14 @@ type (
 	DropSuggestion  = collections.DropSuggestion
 	IndexSizes      = collections.IndexSizes
 	IndexSize       = collections.IndexSize
+	CodecStats      = collections.CodecStats
 	QueryExplain    = collections.QueryExplain
 	MatchExplain    = collections.MatchExplain
 )
+
+// CodecStats reports the storage codec's state and effectiveness (name, dictionary
+// size, last-retrain time, and a sampled compression ratio).
+func (db *DB) CodecStats(sampleMax int) CodecStats { return db.c.CodecStats(sampleMax) }
 
 // IndexSizes reports each configured index's resident bytes (with human/auto
 // provenance) against the live data bytes -- the memory cost of indexing.
@@ -257,6 +262,12 @@ func (db *DB) Compact() int { return db.c.Compact() }
 // set applies to existing ads) and force-compacts, returning the number of ads
 // rewritten. A maintenance operation -- see collections.Collection.Rewrite.
 func (db *DB) Rewrite() int { return db.c.Rewrite() }
+
+// RetrainDict trains a fresh ZSTD dictionary from a sample of up to sampleMax live ads,
+// switches new writes to it, and recompresses existing records under it. It returns the
+// new dictionary's size in bytes. This is what turns on (or refreshes) compression for a
+// collection that started with the identity codec. See collections.Collection.RetrainDict.
+func (db *DB) RetrainDict(sampleMax int) (int, error) { return db.c.RetrainDict(sampleMax) }
 
 // ForEach calls fn for every committed ad, in no particular order, until fn returns
 // false. It reads a consistent snapshot (concurrent writers do not block it).
