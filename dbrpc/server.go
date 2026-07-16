@@ -107,33 +107,53 @@ func (o op) isMutating() bool {
 	return false
 }
 
-// defaultMaintenanceInterval is used when StartMaintenance is given interval <= 0.
+// defaultMaintenanceInterval is the floor cadence when StartMaintenance is given
+// interval <= 0. The effective interval is raised above this whenever needed to keep the
+// duty cycle under maintenanceMaxDutyCycle.
 const defaultMaintenanceInterval = 15 * time.Minute
 
-// StartMaintenance starts server-managed background maintenance on the given interval: a
-// single goroutine that, each tick, re-enumerates the catalog's tables and runs one
-// Maintain pass (index auto-tune, hot-set refresh, and -- if opts.Retrain -- dictionary
-// retrain) on each. Re-enumerating each tick means tables created after startup are
-// maintained too (the old per-table start missed them). Stopped by Close.
+// maintenanceMaxDutyCycle caps the fraction of wall-clock time spent in maintenance: the
+// interval before the next pass is at least (pass duration / this), so a pass that takes
+// D never runs more often than every D/dutyCycle. At 1% a 30s pass paces to >=50 minutes.
+const maintenanceMaxDutyCycle = 0.01
+
+// StartMaintenance starts server-managed background maintenance: a single goroutine that,
+// each tick, re-enumerates the catalog's tables and runs one Maintain pass (index
+// auto-tune, hot-set refresh, and -- if opts.Retrain -- dictionary retrain) on each.
+// Re-enumerating each tick means tables created after startup are maintained too (the old
+// per-table start missed them).
+//
+// The cadence is adaptive: interval is a floor, but the wait before the next pass is
+// raised to keep maintenance under maintenanceMaxDutyCycle of wall-clock time -- so on a
+// large store where a pass (dominated by dictionary retrain's recompaction) takes minutes,
+// passes automatically space out rather than consuming the daemon. Stopped by Close.
 func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOptions) {
 	if interval <= 0 {
 		interval = defaultMaintenanceInterval
 	}
 	done := make(chan struct{})
 	go func() {
-		t := time.NewTicker(interval)
+		t := time.NewTimer(interval)
 		defer t.Stop()
 		for {
 			select {
 			case <-done:
 				return
 			case <-t.C:
-				for _, name := range s.cat.Tables() {
-					if d, ok := s.cat.Table(name); ok {
-						d.Maintain(opts)
-					}
+			}
+			start := time.Now()
+			for _, name := range s.cat.Tables() {
+				if d, ok := s.cat.Table(name); ok {
+					d.Maintain(opts)
 				}
 			}
+			// Keep the duty cycle under the cap: wait at least pass/dutyCycle before the
+			// next pass, never less than the configured floor.
+			next := interval
+			if paced := time.Duration(float64(time.Since(start)) / maintenanceMaxDutyCycle); paced > next {
+				next = paced
+			}
+			t.Reset(next)
 		}
 	}()
 	s.stopBG = append(s.stopBG, func() { close(done) })
