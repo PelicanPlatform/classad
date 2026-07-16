@@ -221,6 +221,23 @@ func (h *watchHub) publish(shard int, seq uint64, key, ad []byte, codec Codec, d
 
 // --- the Watch verb ---
 
+// WatchCursor returns an opaque cursor pointing at the current head of the change log,
+// so a subsequent Watch(ctx, cursor) streams only changes from now on -- no initial
+// replay of the current contents. Requires Options.WatchHistory > 0. It only snapshots
+// each shard's commit sequence (no registration, no replay), so it is cheap.
+func (c *Collection) WatchCursor() ([]byte, error) {
+	if c.hub == nil {
+		return nil, errors.New("collections: Watch requires Options.WatchHistory > 0")
+	}
+	seqs := make([]uint64, len(c.shards))
+	for i, sh := range c.shards {
+		sh.mu.RLock()
+		seqs[i] = sh.commitSeq
+		sh.mu.RUnlock()
+	}
+	return encodeCursor(c.hub.epoch, seqs), nil
+}
+
 // Watch replays everything that may have changed since cursor (nil ⇒ a full replay
 // from empty), then streams live changes until ctx is cancelled or the consumer
 // stops. Requires Options.WatchHistory > 0. See docs/WATCH.md and WatchEvent.

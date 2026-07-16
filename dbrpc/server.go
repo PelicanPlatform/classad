@@ -497,6 +497,21 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 		}
 		return b
 
+	case opWatchHead:
+		table := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		d, ok := s.cat.Table(table)
+		if !ok {
+			return respErr(reqID, "no such table: "+table)
+		}
+		cursor, err := d.WatchCursor()
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putBytes(resp(reqID, stOK), cursor)
+
 	case opCommit:
 		st, ok := s.take(r.u64())
 		if !ok {
