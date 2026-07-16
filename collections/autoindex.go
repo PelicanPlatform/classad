@@ -28,6 +28,11 @@ import (
 type demandCounts struct {
 	eq  atomic.Int64 // == / != / in
 	rng atomic.Int64 // < <= > >=
+	// reads counts how often a query or match READS this attribute (its Requirements /
+	// Rank / WHERE reference it), which drives the hot set -- an attribute the workload
+	// actually evaluates is worth front-loading, unlike one that is merely present in
+	// every ad (which would make all attributes look equally "hot").
+	reads atomic.Int64
 }
 
 // demandTracker records per-attribute query demand, keyed by folded (case-
@@ -49,6 +54,15 @@ func (d *demandTracker) record(probes []vm.Probe) {
 		default: // ==, !=, in
 			c.eq.Add(1)
 		}
+	}
+}
+
+// recordReads tallies one access to each named attribute (a query/match evaluated a
+// reference to it), for hot-set ranking.
+func (d *demandTracker) recordReads(names []string) {
+	for _, n := range names {
+		v, _ := d.m.LoadOrStore(strings.ToLower(n), &demandCounts{})
+		v.(*demandCounts).reads.Add(1)
 	}
 }
 

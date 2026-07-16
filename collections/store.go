@@ -648,6 +648,7 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 		// otherwise fall back to a full scan. Both re-verify the full predicate.
 		probes := q.Probes()
 		c.demand.record(probes)
+		c.demand.recordReads(q.ReadAttrs()) // hot-set signal: attributes the query evaluates
 		usable := c.planIndex(probes)
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.

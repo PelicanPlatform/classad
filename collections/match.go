@@ -166,6 +166,7 @@ func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []ranke
 	// only candidate slots (the pushdown); otherwise scan.
 	probes := c.slotProbes(job, jp.vals)
 	c.demand.record(probes)
+	c.recordMatchReads(job, jp)
 	if c.spec.Load().any() {
 		// A DNF plan: one group for a conjunctive predicate, or several when the slot
 		// predicate carries undefined-guard exceptions (`… || catalogs isnt undefined`).
@@ -176,6 +177,21 @@ func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []ranke
 		}
 	}
 	return c.taskMatches(job, jp, deferMat)
+}
+
+// recordMatchReads records the slot attributes a match evaluates -- the Requirements'
+// slot references plus the job Rank's -- as hot-set access demand, so the attributes
+// matching actually reads (and re-checks) are front-loaded, not every attribute an ad
+// happens to carry.
+func (c *Collection) recordMatchReads(job *classad.ClassAd, jp *jobPlan) {
+	var reads []string
+	if reqExpr := jobRequirementsExpr(job); reqExpr != nil {
+		reads = vm.SelfRefs(rewriteForSlot(reqExpr, jp.vals, nil, false))
+	}
+	reads = append(reads, jp.rankRefs...)
+	if len(reads) > 0 {
+		c.demand.recordReads(reads)
+	}
 }
 
 // serialScanMatches matches over Scan (the chained/structural-aware read view).

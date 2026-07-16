@@ -45,3 +45,38 @@ func TestRefreshHotSetInline(t *testing.T) {
 		t.Errorf("AddHotAttrs did not pin customattr in inline mode: %v", got)
 	}
 }
+
+// TestRefreshHotSetRanksByAccess: the hot set is the attributes the workload actually
+// reads (Requirements/Rank references), not every attribute present in the ads. Regression
+// for presence-ranking, which tied every attribute and truncated alphabetically.
+func TestRefreshHotSetRanksByAccess(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, ValueAttrs: []string{"Memory"}, CategoricalAttrs: []string{"Arch", "State"}})
+	for i := 0; i < 1500; i++ {
+		c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, fmt.Sprintf(
+			`[ Id=%d; Aardvark="x"; Beetle="y"; Cat="z"; Memory=%d; Arch="X86_64"; State="Unclaimed"; Requirements=true ]`,
+			i, (i%8+1)*1024)))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestMemory=2048;
+		Requirements = (TARGET.Memory >= RequestMemory) && (TARGET.Arch == "X86_64") && (TARGET.State == "Unclaimed");
+		Rank = TARGET.Memory ]`)
+	for i := 0; i < 30; i++ {
+		_, _ = c.MatchSortedRankedFiltered(job, "", 0)
+	}
+	n := c.RefreshHotSet(1500, 32) // topN 32 but only 3 attrs are read
+	if n != 3 {
+		t.Fatalf("chose %d hot attrs, want 3 (only Memory/Arch/State are read)", n)
+	}
+	hot := c.HotAttrNames()
+	for _, want := range []string{"Arch", "Memory", "State"} {
+		if !contains(hot, want) {
+			t.Errorf("hot set %v missing read attribute %s", hot, want)
+		}
+	}
+	for _, notWant := range []string{"Aardvark", "Beetle", "Cat"} {
+		if contains(hot, notWant) {
+			t.Errorf("hot set %v includes never-read attribute %s (presence padding)", hot, notWant)
+		}
+	}
+}

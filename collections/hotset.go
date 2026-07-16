@@ -20,44 +20,70 @@ func (c *Collection) RefreshHotSet(sampleMax, topN int) int {
 	if topN <= 0 {
 		return 0
 	}
-	// Count by NAME via ForEachNamed, which reads both encodings -- interned ids (RAM) and
-	// inline names (persistent). The old id-based ForEach counted nothing on a persistent
-	// collection (inline ads carry no ids), so RefreshHotSet was a silent no-op there.
-	counts := make(map[string]int)
+	// Rank attributes by ACCESS -- how often the workload's queries/matches read each one
+	// (c.demand.reads) -- not by mere presence in ads. Presence is near-uniform (every ad
+	// carries all its attributes), so ranking by it made all attributes tie and truncated
+	// alphabetically; front-loading an attribute nothing evaluates is wasted. Presence is
+	// kept only as a tiebreak, so an unqueried store still gets a stable set.
+	//
+	// Names come via ForEachNamed (both encodings: interned ids in RAM, inline names when
+	// persistent) -- the old id-based ForEach counted nothing on a persistent collection.
+	presence := make(map[string]int)
 	display := make(map[string]string) // folded -> first-seen spelling
 	for _, w := range c.CollectSamples(sampleMax) {
 		wire.Ad(w).ForEachNamed(c.intern, func(name string, _ []byte) bool {
 			fold := strings.ToLower(name)
-			counts[fold]++
+			presence[fold]++
 			if _, ok := display[fold]; !ok {
 				display[fold] = name
 			}
 			return true
 		})
 	}
-	if len(counts) == 0 {
+	if len(presence) == 0 {
 		return 0
 	}
-	folded := make([]string, 0, len(counts))
-	for n := range counts {
-		folded = append(folded, n)
+	reads := func(fold string) int64 {
+		if v, ok := c.demand.m.Load(fold); ok {
+			return v.(*demandCounts).reads.Load()
+		}
+		return 0
 	}
-	// Most frequent first; break ties by name for determinism.
+	folded := make([]string, 0, len(presence))
+	accessed := 0
+	for n := range presence {
+		folded = append(folded, n)
+		if reads(n) > 0 {
+			accessed++
+		}
+	}
+	// Most-accessed first; break ties by presence, then name for determinism.
 	sort.Slice(folded, func(i, j int) bool {
-		if counts[folded[i]] != counts[folded[j]] {
-			return counts[folded[i]] > counts[folded[j]]
+		ri, rj := reads(folded[i]), reads(folded[j])
+		if ri != rj {
+			return ri > rj
+		}
+		if presence[folded[i]] != presence[folded[j]] {
+			return presence[folded[i]] > presence[folded[j]]
 		}
 		return folded[i] < folded[j]
 	})
-	if topN > len(folded) {
-		topN = len(folded)
+	// When the workload has actually read attributes, front-load only those (capped at
+	// topN) -- don't pad the set with never-read attributes. Only a store with no query
+	// signal at all falls back to the presence-ranked top-N.
+	limit := topN
+	if accessed > 0 && accessed < limit {
+		limit = accessed
 	}
-	chosen := make([]string, topN)
-	for i, f := range folded[:topN] {
+	if limit > len(folded) {
+		limit = len(folded)
+	}
+	chosen := make([]string, limit)
+	for i, f := range folded[:limit] {
 		chosen[i] = display[f]
 	}
 	c.installHotNames(chosen)
-	return topN
+	return limit
 }
 
 // installHotNames sets the hot attribute set from names, in the form the collection's

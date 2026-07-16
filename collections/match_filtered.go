@@ -79,6 +79,7 @@ func (c *Collection) collectMatchesFiltered(job *classad.ClassAd, targetExpr ast
 	}
 	jp := c.compileJobSide(job)
 	c.demand.record(c.slotProbes(job, jp.vals))
+	c.recordMatchReads(job, jp)
 
 	var tGroups [][]usableProbe
 	tPrunable := false
