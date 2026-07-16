@@ -330,6 +330,14 @@ func (db *DB) MatchSortedRanked(job *classad.ClassAd, limit int) []RankedMatch {
 	return db.c.MatchSortedRanked(job, limit)
 }
 
+// MatchSortedRankedFiltered is MatchSortedRanked restricted to slots that also satisfy
+// targetConstraint (a MATCH's WHERE TARGET / NOPREEMPT filter over the resource ad). The
+// constraint's index probes narrow the candidate scan (pushdown) and it is re-checked on
+// each matched slot. An empty constraint is exactly MatchSortedRanked.
+func (db *DB) MatchSortedRankedFiltered(job *classad.ClassAd, targetConstraint string, limit int) ([]RankedMatch, error) {
+	return db.c.MatchSortedRankedFiltered(job, targetConstraint, limit)
+}
+
 // MatchSignature is HTCondor's autocluster key: a 64-bit checksum over the given
 // significant attributes' expression text in ad. Two ads with textually identical
 // significant attributes (same Requirements, same RequestCpus literal, ...) hash

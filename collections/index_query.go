@@ -545,6 +545,16 @@ func (si *segIndex) estCandidates(up usableProbe) float64 {
 			return indexable - s.estEqualStr(up.svals[0]) + float64(s.exc)
 		}
 		return indexable - s.estEqualFloat(up.fvals[0]) + float64(s.exc)
+	case "isnt":
+		// =!= (categorical): everything but the exact-case value. Estimate like != using
+		// the value's count (folded -- the top-N heavy hitters are folded keys); for a
+		// case-uniform bucket the exact and folded counts coincide. Without this branch
+		// the switch fell through to `return indexable` (~the whole prefix), so a selective
+		// `State =!= "Claimed"` looked ~100% and sorted last instead of first.
+		if up.cat {
+			return indexable - s.estEqualStr(strings.ToLower(up.svals[0])) + float64(s.exc)
+		}
+		return indexable
 	case "<", "<=", ">", ">=":
 		return s.estRange(up.op, up.fvals[0])*indexable + float64(s.exc)
 	}

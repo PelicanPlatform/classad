@@ -111,32 +111,29 @@ func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader,
 		write(respErr(reqID, "no such table: "+resTable))
 		return
 	}
-	var resFilter *db.Constraint
 	if targetWhere != "" {
-		f, err := db.ParseConstraint(targetWhere)
-		if err != nil {
+		// Validate the filter up front (the pushdown re-parses it, but a bad expression
+		// should be one clear error, not per-request).
+		if _, err := db.ParseConstraint(targetWhere); err != nil {
 			write(respErr(reqID, "resource filter: "+err.Error()))
 			return
 		}
-		resFilter = f
-		// The WHERE TARGET filter is applied to matched candidates outside the scan
-		// path, so record its demand explicitly for SuggestIndexes on the resource table.
-		resDB.RecordDemand(targetWhere)
 	}
 
-	// candidatesFor returns a request's full ranked candidate list (best first),
-	// with the resource-side filter applied. It is NOT limited: assignment consumes
-	// machines, so a later job may need one ranked past every machine an earlier job
-	// claimed. Under autoclustering this list is computed once per signature and
+	// candidatesFor returns a request's full ranked candidate list (best first), with the
+	// resource-side filter pushed into the candidate scan (its index probes narrow which
+	// slots are visited) and re-checked on each match. It is NOT limited: assignment
+	// consumes machines, so a later job may need one ranked past every machine an earlier
+	// job claimed. Under autoclustering this list is computed once per signature and
 	// shared, so the full-list cost is paid once for a whole autocluster.
 	candidatesFor := func(reqAd *classad.ClassAd) []matchResult {
-		matches := resDB.MatchSortedRanked(reqAd, 0)
+		matches, err := resDB.MatchSortedRankedFiltered(reqAd, targetWhere, 0)
+		if err != nil {
+			return nil // a bad filter was already reported above
+		}
 		out := make([]matchResult, 0, len(matches))
 		for i := range matches {
 			m := matches[i]
-			if resFilter != nil && !resFilter.Matches(m.Ad) {
-				continue
-			}
 			out = append(out, matchResult{resourceKey: attrKey(m.Ad, keyAttr), rank: rankText(m)})
 		}
 		return out

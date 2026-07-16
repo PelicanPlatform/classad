@@ -180,6 +180,44 @@ func TestMetaEqualsUsesIndex(t *testing.T) {
 	}
 }
 
+// TestIsntEstimateMatchesNotEqual: on an always-defined categorical, `attr =!= v`
+// (isnt) must estimate the same selectivity as `attr != v` -- both exclude one value.
+// Regression for the estimator falling through to ~100% for isnt, which made a
+// selective NOPREEMPT-style `State =!= "Claimed"` sort last instead of first.
+func TestIsntEstimateMatchesNotEqual(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, CategoricalAttrs: []string{"State"}})
+	for i := 0; i < 6000; i++ {
+		s := "Claimed"
+		if i%10 == 0 { // 10% Unclaimed
+			s = "Unclaimed"
+		}
+		if err := c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, fmt.Sprintf(`[ Id=%d; State=%q ]`, i, s))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+	est := func(qs string) float64 {
+		q, err := vm.Parse(qs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ex := c.ExplainQuery(q)
+		if len(ex.Probes) != 1 || !ex.Probes[0].HasSelectivity {
+			t.Fatalf("%s: want one probe with selectivity, got %+v", qs, ex.Probes)
+		}
+		return ex.Probes[0].Selectivity
+	}
+	ne := est(`State != "Claimed"`)
+	isnt := est(`State =!= "Claimed"`)
+	if isnt > ne*1.5+0.02 { // isnt must not be wildly larger (it was ~1.0 vs ~0.1)
+		t.Errorf("=!= estimate %.3f should be close to != estimate %.3f (both exclude one value)", isnt, ne)
+	}
+	if isnt > 0.3 {
+		t.Errorf("=!= \"Claimed\" should be selective (~10%%), estimated %.3f", isnt)
+	}
+}
+
 func equalInts(a, b []int) bool {
 	if len(a) != len(b) {
 		return false

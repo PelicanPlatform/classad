@@ -190,10 +190,10 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 
 // meldTargetConstraint folds the MATCH resource-side filter (WHERE TARGET / NOPREEMPT)
 // into the explanation: it appends the constraint to the displayed slot predicate, adds
-// its index-satisfiable probes to the probe list, and appends its conjuncts to the
-// evaluation order tagged ResourceSide. The constraint is already slot-scoped (it filters
-// resource attributes directly), so no TARGET rewrite is needed. It is applied as a
-// post-filter on matched candidates today, so it never lowers the "indexed" plan.
+// its index-satisfiable probes to the probe list (they now narrow the candidate scan --
+// the pushdown), and appends its conjuncts to the evaluation order tagged ResourceSide.
+// The constraint is already slot-scoped (it filters resource attributes directly), so no
+// TARGET rewrite is needed.
 func (c *Collection) meldTargetConstraint(ex *MatchExplain, targetConstraint string) {
 	if strings.TrimSpace(targetConstraint) == "" {
 		return
@@ -210,11 +210,27 @@ func (c *Collection) meldTargetConstraint(ex *MatchExplain, targetConstraint str
 		ex.SlotPredicate += " && " + disp
 	}
 	ex.HasRequirements = true
-	// The Probes list / IndexUsable count stay job-Requirements-only: they describe the
-	// candidate pushdown, and the resource filter is applied as a post-filter (it does not
-	// prune today). The filter still appears in the melded predicate and evaluation order,
-	// with its index coverage shown, so its pushdown potential is visible.
 	tot := float64(c.Len())
+	total := c.Len()
+	// The resource filter's index-satisfiable probes now narrow candidates (pushdown), so
+	// they join the probe list and index-usable count.
+	for _, p := range q.Probes() {
+		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
+		var up usableProbe
+		var isUsable bool
+		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
+		if isUsable {
+			ex.IndexUsable++
+			if cand, covered := c.estimateCandidates(up); covered {
+				pe.HasSelectivity = true
+				pe.EstCandidates = int64(cand + 0.5)
+				if total > 0 {
+					pe.Selectivity = math.Min(1, cand/float64(total))
+				}
+			}
+		}
+		ex.Probes = append(ex.Probes, pe)
+	}
 	seen := map[string]bool{}
 	for _, ce := range ex.EvalOrder {
 		seen[ce.Text] = true
