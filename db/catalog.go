@@ -24,12 +24,17 @@ type Catalog struct {
 	poolKeys []KEK
 	encAttrs []string
 
-	mu     sync.Mutex
-	tables map[string]*DB
+	mu       sync.Mutex
+	tables   map[string]*DB
+	archives map[string]*ArchiveTable
 }
 
-// tablesSubdir is where a persistent catalog keeps its per-table directories.
-const tablesSubdir = "tables"
+// tablesSubdir / archivesSubdir are where a persistent catalog keeps its per-table
+// directories, split by table type.
+const (
+	tablesSubdir   = "tables"
+	archivesSubdir = "archives"
+)
 
 // CatalogConfig configures a catalog, including encryption at rest applied to every
 // table. Dir empty is in-memory.
@@ -52,7 +57,10 @@ func OpenCatalog(dir string) (*Catalog, error) {
 // <dir>/tables/ and applying cfg's encryption at rest to each. Dir == "" makes an
 // in-memory catalog whose tables do not persist.
 func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
-	cat := &Catalog{dir: cfg.Dir, tables: map[string]*DB{}, poolKeys: cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs}
+	cat := &Catalog{
+		dir: cfg.Dir, tables: map[string]*DB{}, archives: map[string]*ArchiveTable{},
+		poolKeys: cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs,
+	}
 	if cfg.Dir == "" {
 		return cat, nil
 	}
@@ -78,6 +86,24 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 			return nil, fmt.Errorf("catalog: opening table %q: %w", name, err)
 		}
 		cat.tables[name] = d
+	}
+	// Recover archive (history) tables from <dir>/archives/.
+	aroot := filepath.Join(cfg.Dir, archivesSubdir)
+	aentries, err := os.ReadDir(aroot)
+	if err != nil && !os.IsNotExist(err) {
+		cat.closeAll()
+		return nil, fmt.Errorf("catalog: reading archives dir: %w", err)
+	}
+	for _, e := range aentries {
+		if !e.IsDir() || !ValidTableName(e.Name()) {
+			continue
+		}
+		at, err := openArchiveTable(filepath.Join(aroot, e.Name()), ArchiveConfig{})
+		if err != nil {
+			cat.closeAll()
+			return nil, fmt.Errorf("catalog: opening archive %q: %w", e.Name(), err)
+		}
+		cat.archives[e.Name()] = at
 	}
 	return cat, nil
 }
@@ -128,6 +154,9 @@ func (cat *Catalog) CreateTable(name string) (*DB, error) {
 	if d, ok := cat.tables[name]; ok {
 		return d, nil
 	}
+	if _, ok := cat.archives[name]; ok {
+		return nil, fmt.Errorf("catalog: %q already exists as an archive table", name)
+	}
 	cfgDir := ""
 	if cat.dir != "" {
 		cfgDir = filepath.Join(cat.dir, tablesSubdir, name)
@@ -158,7 +187,7 @@ func (cat *Catalog) DropTable(name string) error {
 	return nil
 }
 
-// Tables returns the table names, sorted.
+// Tables returns the mutable table names, sorted.
 func (cat *Catalog) Tables() []string {
 	cat.mu.Lock()
 	defer cat.mu.Unlock()
@@ -168,6 +197,70 @@ func (cat *Catalog) Tables() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// ArchiveTable returns the archive (history) table named name.
+func (cat *Catalog) ArchiveTable(name string) (*ArchiveTable, bool) {
+	cat.mu.Lock()
+	defer cat.mu.Unlock()
+	a, ok := cat.archives[name]
+	return a, ok
+}
+
+// ArchiveTables returns the archive table names, sorted.
+func (cat *Catalog) ArchiveTables() []string {
+	cat.mu.Lock()
+	defer cat.mu.Unlock()
+	names := make([]string, 0, len(cat.archives))
+	for n := range cat.archives {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// CreateArchiveTable creates (or returns the existing) append-only archive table named
+// name, persisted under <dir>/archives/<name>. cfg configures indexes / zone maps /
+// retention on first creation and is ignored for an existing archive.
+func (cat *Catalog) CreateArchiveTable(name string, cfg ArchiveConfig) (*ArchiveTable, error) {
+	if !ValidTableName(name) {
+		return nil, fmt.Errorf("catalog: invalid archive name %q", name)
+	}
+	cat.mu.Lock()
+	defer cat.mu.Unlock()
+	if a, ok := cat.archives[name]; ok {
+		return a, nil
+	}
+	if _, ok := cat.tables[name]; ok {
+		return nil, fmt.Errorf("catalog: %q already exists as a mutable table", name)
+	}
+	if cat.dir == "" {
+		return nil, fmt.Errorf("catalog: archive tables require a persistent catalog")
+	}
+	at, err := openArchiveTable(filepath.Join(cat.dir, archivesSubdir, name), cfg)
+	if err != nil {
+		return nil, fmt.Errorf("catalog: creating archive %q: %w", name, err)
+	}
+	cat.archives[name] = at
+	return at, nil
+}
+
+// DropArchiveTable closes and removes the archive named name, deleting its on-disk data.
+func (cat *Catalog) DropArchiveTable(name string) error {
+	cat.mu.Lock()
+	defer cat.mu.Unlock()
+	a, ok := cat.archives[name]
+	if !ok {
+		return fmt.Errorf("catalog: no such archive %q", name)
+	}
+	delete(cat.archives, name)
+	_ = a.Close()
+	if cat.dir != "" {
+		if err := os.RemoveAll(filepath.Join(cat.dir, archivesSubdir, name)); err != nil {
+			return fmt.Errorf("catalog: removing archive %q data: %w", name, err)
+		}
+	}
+	return nil
 }
 
 // EnsureTable creates the table if it does not exist, returning it.
@@ -187,6 +280,12 @@ func (cat *Catalog) closeAll() error {
 			first = err
 		}
 		delete(cat.tables, name)
+	}
+	for name, a := range cat.archives {
+		if err := a.Close(); err != nil && first == nil {
+			first = err
+		}
+		delete(cat.archives, name)
 	}
 	return first
 }
