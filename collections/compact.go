@@ -291,11 +291,37 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// unpinned, else the last unpin reaps. Defer the actual reap (syscalls) until
 	// after the lock is dropped.
 	var toReap []*segment
+	retired := make(map[*segment]struct{})
 	for i := 0; i < srcCount; i++ {
-		if seg := sh.segs[i]; seg != nil && seg.retire() {
-			toReap = append(toReap, seg)
+		if seg := sh.segs[i]; seg != nil {
+			retired[seg] = struct{}{}
+			if seg.retire() {
+				toReap = append(toReap, seg)
+			}
 		}
 		sh.segs[i] = nil
+	}
+	// Drop retired segments from the pending-sync lists: their live records were copied
+	// forward and the segments are being unlinked, so a later sync must not msync one (a
+	// segment concurrently being reaped). An in-flight sync that already captured one pins
+	// it (see shard.sync), which deferred that reap above.
+	if len(retired) > 0 {
+		if kept := sh.dirty[:0]; len(sh.dirty) > 0 {
+			for _, s := range sh.dirty {
+				if _, gone := retired[s]; !gone {
+					kept = append(kept, s)
+				}
+			}
+			sh.dirty = kept
+		}
+		if kept := sh.dirtySup[:0]; len(sh.dirtySup) > 0 {
+			for _, s := range sh.dirtySup {
+				if _, gone := retired[s.seg]; !gone {
+					kept = append(kept, s)
+				}
+			}
+			sh.dirtySup = kept
+		}
 	}
 	sh.dir = newDir
 	sh.count = count
