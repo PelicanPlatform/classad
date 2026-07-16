@@ -1052,6 +1052,45 @@ func TestVersionInRange(t *testing.T) {
 	}
 }
 
+// TestVersionRelational guards the versionGE/GT/LE/LT/EQ family: each does a
+// natural/version comparison of its two arguments and returns a boolean. Dispatch
+// is case-insensitive (versionGE == versionge), numeric arguments coerce to their
+// string form, and undefined/error propagate as in versioncmp (undefined dominates:
+// an undefined argument is undefined; an error argument is otherwise an error). The
+// underscore spellings remain unknown functions (see TestVersionInRange).
+func TestVersionRelational(t *testing.T) {
+	cases := []struct {
+		expr string
+		want string
+	}{
+		{`versionGE("25.12.0", "25.12.0")`, "B:true"},
+		{`versionGE("25.12.0", "25.13.0")`, "B:false"},
+		{`versionGT("25.12.0", "24.0.0")`, "B:true"},
+		{`versionGT("25.0.0", "25.0.0")`, "B:false"},
+		{`versionLE("24.0.0", "25.0.0")`, "B:true"},
+		{`versionLT("25.0.0", "25.0.0")`, "B:false"},
+		{`versionEQ("25.12.0", "25.12.0")`, "B:true"},
+		{`versionEQ("25.12.0", "25.12.1")`, "B:false"},
+		{`versionge("25.12.0", "25.12.0")`, "B:true"}, // case-insensitive dispatch
+		{`versionGE(2, 1)`, "B:true"},                 // numeric args coerce to strings
+		{`versionGE(undefined, "1.0")`, "U"},
+		{`versionGE("1.0", undefined)`, "U"},
+		{`versionGE(error, "1.0")`, "E"},
+		// The real-world shape: pull the version token out of a $CondorVersion string.
+		{`versionGE(split("$CondorVersion: 25.12.0 x $")[1], "25.12.0")`, "B:true"},
+		{`versionGE(split("$CondorVersion: 24.12.21 x $")[1], "25.12.0")`, "B:false"},
+	}
+	for _, tc := range cases {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
+	}
+}
+
 // TestSplitDelimiters guards split()'s tokenizer: the default delimiter set is
 // comma plus whitespace, where whitespace runs collapse without producing empty
 // fields but each maximal run of hard (non-whitespace) delimiters emits

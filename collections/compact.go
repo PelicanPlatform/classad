@@ -1,5 +1,7 @@
 package collections
 
+import "time"
+
 // Compaction reclaims space consumed by superseded/deleted records.
 //
 // It is driven by the per-shard dead-byte ratio (never by age: ClassAds are
@@ -47,6 +49,38 @@ func (c *Collection) Compact() int {
 			n++
 		}
 	}
+	if n > 0 {
+		c.reindexAfterCompaction()
+	}
+	return n
+}
+
+// Rewrite re-encodes every live ad with the current hot set (and match closure)
+// so a changed hot set takes effect on existing ads, not just future writes,
+// then force-compacts every shard to reclaim the superseded pre-rewrite records.
+// Returns the number of ads rewritten.
+//
+// It re-Puts ads on the normal write path, so it is a maintenance operation: an
+// update to a key that races the rewrite may be overwritten by the pre-rewrite
+// value. Run it during low write activity (or, in an HA deployment, on the sole
+// writer).
+func (c *Collection) Rewrite() int {
+	n := 0
+	for _, k := range c.Keys() {
+		kb := []byte(k)
+		ad, ok := c.Get(kb)
+		if !ok {
+			continue
+		}
+		if c.Put(kb, ad) == nil {
+			n++
+		}
+	}
+	target := c.currentCodec()
+	for _, sh := range c.shards {
+		c.compactShard(sh, target)
+	}
+	c.reindexAfterCompaction()
 	return n
 }
 
@@ -74,7 +108,19 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	for _, sh := range c.shards {
 		c.compactShard(sh, codec) // recompress to the new codec
 	}
+	c.lastDictBytes.Store(int64(len(dict)))
+	c.lastRetrainUnix.Store(time.Now().UnixNano())
+	c.reindexAfterCompaction() // rebuild indexes over the recompacted segments
 	return len(dict), nil
+}
+
+// reindexAfterCompaction rebuilds the segment indexes after compaction replaced the
+// segments (their fresh copies carry no index), so queries stay pruned and estimates
+// stay populated instead of silently falling back to a full scan until the next Reindex.
+func (c *Collection) reindexAfterCompaction() {
+	if c.spec.Load().any() {
+		c.Reindex()
+	}
 }
 
 // shouldCompact reports whether the shard's garbage ratio warrants compaction.
@@ -245,16 +291,48 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// unpinned, else the last unpin reaps. Defer the actual reap (syscalls) until
 	// after the lock is dropped.
 	var toReap []*segment
+	retired := make(map[*segment]struct{})
 	for i := 0; i < srcCount; i++ {
-		if seg := sh.segs[i]; seg != nil && seg.retire() {
-			toReap = append(toReap, seg)
+		if seg := sh.segs[i]; seg != nil {
+			retired[seg] = struct{}{}
+			if seg.retire() {
+				toReap = append(toReap, seg)
+			}
 		}
 		sh.segs[i] = nil
+	}
+	// Drop retired segments from the pending-sync lists: their live records were copied
+	// forward and the segments are being unlinked, so a later sync must not msync one (a
+	// segment concurrently being reaped). An in-flight sync that already captured one pins
+	// it (see shard.sync), which deferred that reap above.
+	if len(retired) > 0 {
+		if kept := sh.dirty[:0]; len(sh.dirty) > 0 {
+			for _, s := range sh.dirty {
+				if _, gone := retired[s]; !gone {
+					kept = append(kept, s)
+				}
+			}
+			sh.dirty = kept
+		}
+		if kept := sh.dirtySup[:0]; len(sh.dirtySup) > 0 {
+			for _, s := range sh.dirtySup {
+				if _, gone := retired[s.seg]; !gone {
+					kept = append(kept, s)
+				}
+			}
+			sh.dirtySup = kept
+		}
 	}
 	sh.dir = newDir
 	sh.count = count
 	if len(dstSegs) > 0 {
 		sh.act = dstSegs[len(dstSegs)-1]
+	}
+	// Superseded records (delete evidence) at or below the current sequence were just
+	// dropped; raise the transaction GC floor so a snapshot older than this can no
+	// longer trust a bucket-chain walk for a currently-absent key (see conflictSince).
+	if sh.commitSeq > sh.gcFloor {
+		sh.gcFloor = sh.commitSeq
 	}
 	sh.mu.Unlock()
 

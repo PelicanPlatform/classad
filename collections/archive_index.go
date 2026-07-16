@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"sort"
+	"strings"
 
 	"github.com/RoaringBitmap/roaring/v2"
 )
@@ -25,13 +26,22 @@ import (
 //	         upto uint32; specGen uint64; allOff uint32
 //	         catN uint32; catN × { id uint32; attrOff uint32 }
 //	         valN uint32; valN × { id uint32; attrOff uint32 }
-//	  cat attr block @attrOff: excOff uint32; n uint32;
-//	         keyOff [n+1] uint32 (delimit sorted keys in keysBlob); bmOff [n] uint32; keysBlob
-//	  val attr block @attrOff: excOff uint32; n uint32;
+//	  cat attr block @attrOff: excOff uint32; postedOff uint32; n uint32;
+//	         keyOff [n+1] uint32 (delimit sorted folded keys in keysBlob); bmOff [n] uint32;
+//	         keysBlob;
+//	         exactN uint32; exactKeyOff [exactN+1] uint32; exactBmOff [exactN] uint32;
+//	         exactKeysBlob   -- exact-case keys (sorted) for =?=/=!=; a case-uniform
+//	         bucket's exact key reuses its folded bmOff (no duplicate payload).
+//	  val attr block @attrOff: excOff uint32; postedOff uint32; n uint32;
 //	         key [n] float64 (sorted asc); bmOff [n] uint32
+//
+// postedOff is the bitmap of records that posted a literal value, for the presence
+// probes: present (isnt undefined) = posted OR exc, absent (is undefined) = all AND-NOT
+// posted. v3 added the exact-case run; v4 added postedOff. There is no migration
+// (indexes are rebuilt at seal), so an older sidecar is simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 2
+	sidecarVersion = 4
 )
 
 // writeSidecarIndex serializes si to path (v2 sorted runs) and fsyncs it. si is
@@ -65,14 +75,16 @@ func writeSidecarIndex(path string, si *segIndex) error {
 	}
 
 	type catBlk struct {
-		id, excOff uint32
-		keys       []string
-		bmOffs     []uint32
+		id, excOff, postedOff uint32
+		keys                  []string // folded keys (sorted) -> bmOffs
+		bmOffs                []uint32
+		exKeys                []string // exact-case keys (sorted) -> exBmOffs (for =?=/=!=)
+		exBmOffs              []uint32
 	}
 	type valBlk struct {
-		id, excOff uint32
-		keys       []float64
-		bmOffs     []uint32
+		id, excOff, postedOff uint32
+		keys                  []float64
+		bmOffs                []uint32
 	}
 	var catBlks []catBlk
 	for id, cp := range si.cat {
@@ -82,16 +94,58 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		}
 		sort.Strings(keys)
 		bmOffs := make([]uint32, len(keys))
+		foldedOff := make(map[string]uint32, len(keys))
 		for i, k := range keys {
 			if bmOffs[i], err = emit(cp.post[k]); err != nil {
 				return err
 			}
+			foldedOff[k] = bmOffs[i]
+		}
+		// Exact-case run for =?=/=!=. A case-uniform bucket (in exactCase) reuses its
+		// folded bitmap offset -- no duplicate payload on disk; a mixed-case bucket
+		// emits one bitmap per exact spelling. Group the retained exact spellings by
+		// their folded key so each folded bucket contributes its exact entries.
+		exByFold := map[string][]string{}
+		for e := range cp.exact {
+			exByFold[strings.ToLower(e)] = append(exByFold[strings.ToLower(e)], e)
+		}
+		type exPair struct {
+			key string
+			off uint32
+		}
+		var exPairs []exPair
+		for _, f := range keys {
+			if ec, ok := cp.exactCase[f]; ok {
+				spelling := f
+				if ec != "" {
+					spelling = ec
+				}
+				exPairs = append(exPairs, exPair{spelling, foldedOff[f]})
+				continue
+			}
+			for _, e := range exByFold[f] {
+				off, emitErr := emit(cp.exact[e])
+				if emitErr != nil {
+					return emitErr
+				}
+				exPairs = append(exPairs, exPair{e, off})
+			}
+		}
+		sort.Slice(exPairs, func(i, j int) bool { return exPairs[i].key < exPairs[j].key })
+		exKeys := make([]string, len(exPairs))
+		exBmOffs := make([]uint32, len(exPairs))
+		for i, p := range exPairs {
+			exKeys[i], exBmOffs[i] = p.key, p.off
 		}
 		excOff, err := emit(cp.exc)
 		if err != nil {
 			return err
 		}
-		catBlks = append(catBlks, catBlk{id, excOff, keys, bmOffs})
+		postedOff, err := emit(cp.posted)
+		if err != nil {
+			return err
+		}
+		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs})
 	}
 	sort.Slice(catBlks, func(i, j int) bool { return catBlks[i].id < catBlks[j].id })
 
@@ -112,7 +166,11 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		if err != nil {
 			return err
 		}
-		valBlks = append(valBlks, valBlk{id, excOff, keys, bmOffs})
+		postedOff, err := emit(vp.posted)
+		if err != nil {
+			return err
+		}
+		valBlks = append(valBlks, valBlk{id, excOff, postedOff, keys, bmOffs})
 	}
 	sort.Slice(valBlks, func(i, j int) bool { return valBlks[i].id < valBlks[j].id })
 
@@ -140,6 +198,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 	for i, cb := range catBlks {
 		binary.LittleEndian.PutUint32(b[catSlot[i]:], uint32(len(b)))
 		b = appendU32(b, cb.excOff)
+		b = appendU32(b, cb.postedOff) // presence: is/isnt undefined
 		b = appendU32(b, uint32(len(cb.keys)))
 		var blob []byte
 		keyOffs := make([]uint32, len(cb.keys)+1)
@@ -155,10 +214,28 @@ func writeSidecarIndex(path string, si *segIndex) error {
 			b = appendU32(b, o)
 		}
 		b = append(b, blob...)
+		// Exact-case run immediately after the folded keys blob: exactN;
+		// exactKeyOff[exactN+1]; exactBmOff[exactN]; exactKeysBlob.
+		b = appendU32(b, uint32(len(cb.exKeys)))
+		var exBlob []byte
+		exKeyOffs := make([]uint32, len(cb.exKeys)+1)
+		for j, k := range cb.exKeys {
+			exKeyOffs[j] = uint32(len(exBlob))
+			exBlob = append(exBlob, k...)
+		}
+		exKeyOffs[len(cb.exKeys)] = uint32(len(exBlob))
+		for _, o := range exKeyOffs {
+			b = appendU32(b, o)
+		}
+		for _, o := range cb.exBmOffs {
+			b = appendU32(b, o)
+		}
+		b = append(b, exBlob...)
 	}
 	for i, vb := range valBlks {
 		binary.LittleEndian.PutUint32(b[valSlot[i]:], uint32(len(b)))
 		b = appendU32(b, vb.excOff)
+		b = appendU32(b, vb.postedOff) // presence: is/isnt undefined
 		b = appendU32(b, uint32(len(vb.keys)))
 		for _, k := range vb.keys {
 			b = appendU64(b, math.Float64bits(k))

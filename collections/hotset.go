@@ -2,6 +2,7 @@ package collections
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -19,40 +20,182 @@ func (c *Collection) RefreshHotSet(sampleMax, topN int) int {
 	if topN <= 0 {
 		return 0
 	}
-	counts := make(map[uint32]int)
-	for _, w := range c.CollectSamples(sampleMax) {
-		wire.Ad(w).ForEach(func(id uint32, _ []byte) bool {
-			counts[id]++
+	// Rank attributes by ACCESS -- how often the workload's queries/matches read each one
+	// (c.demand.reads) -- not by mere presence in ads. Presence is near-uniform (every ad
+	// carries all its attributes), so ranking by it made all attributes tie and truncated
+	// alphabetically; front-loading an attribute nothing evaluates is wasted. Presence is
+	// kept only as a tiebreak, so an unqueried store still gets a stable set.
+	//
+	// Names come via ForEachNamed (both encodings: interned ids in RAM, inline names when
+	// persistent) -- the old id-based ForEach counted nothing on a persistent collection.
+	samples := c.CollectSamples(sampleMax)
+	presence := make(map[string]int)
+	display := make(map[string]string) // folded -> first-seen spelling
+	for _, w := range samples {
+		wire.Ad(w).ForEachNamed(c.intern, func(name string, _ []byte) bool {
+			fold := strings.ToLower(name)
+			presence[fold]++
+			if _, ok := display[fold]; !ok {
+				display[fold] = name
+			}
 			return true
 		})
 	}
-	if len(counts) == 0 {
+	if len(presence) == 0 {
 		return 0
 	}
-	ids := make([]uint32, 0, len(counts))
-	for id := range counts {
-		ids = append(ids, id)
-	}
-	// Most frequent first; break ties by id for determinism.
-	sort.Slice(ids, func(i, j int) bool {
-		if counts[ids[i]] != counts[ids[j]] {
-			return counts[ids[i]] > counts[ids[j]]
+	reads := func(fold string) int64 {
+		if v, ok := c.demand.m.Load(fold); ok {
+			return v.(*demandCounts).reads.Load()
 		}
-		return ids[i] < ids[j]
-	})
-	if topN > len(ids) {
-		topN = len(ids)
+		return 0
 	}
-	set := make(map[uint32]struct{}, topN)
-	for _, id := range ids[:topN] {
-		set[id] = struct{}{}
+	folded := make([]string, 0, len(presence))
+	accessed := 0
+	for n := range presence {
+		folded = append(folded, n)
+		if reads(n) > 0 {
+			accessed++
+		}
+	}
+	// Most-accessed first; break ties by presence, then name for determinism.
+	sort.Slice(folded, func(i, j int) bool {
+		ri, rj := reads(folded[i]), reads(folded[j])
+		if ri != rj {
+			return ri > rj
+		}
+		if presence[folded[i]] != presence[folded[j]] {
+			return presence[folded[i]] > presence[folded[j]]
+		}
+		return folded[i] < folded[j]
+	})
+	// When the workload has actually read attributes, front-load only those (capped at
+	// topN) -- don't pad the set with never-read attributes. Only a store with no query
+	// signal at all falls back to the presence-ranked top-N.
+	limit := topN
+	if accessed > 0 && accessed < limit {
+		limit = accessed
+	}
+	if limit > len(folded) {
+		limit = len(folded)
+	}
+	chosen := make([]string, limit)
+	for i, f := range folded[:limit] {
+		chosen[i] = display[f]
+	}
+	// Close the hot set under references: every attribute a hot attribute's expression
+	// reads (and the always-hot Requirements/Rank's) is front-loaded too, so a match/query
+	// that touches a hot attribute finds its whole dependency chain in the hot header.
+	roots := ensureHotDefaults(append([]string(nil), chosen...))
+	chosen = c.closeHotSet(samples, roots, display)
+	c.installHotNames(chosen)
+	return len(chosen)
+}
+
+// closeHotSet returns roots plus the transitive reference closure of roots computed over
+// a bounded sample of ads (their expressions' self-references), in original-case display
+// spelling. It lets the hot set carry not just the queried attributes but everything they
+// depend on.
+func (c *Collection) closeHotSet(samples [][]byte, roots []string, display map[string]string) []string {
+	const maxClosureAds = 256
+	folded := make(map[string]bool, len(roots))
+	spell := make(map[string]string, len(roots)) // folded -> preferred spelling (roots keep their own)
+	for _, r := range roots {
+		f := strings.ToLower(r)
+		folded[f] = true
+		spell[f] = r
+	}
+	for i, w := range samples {
+		if i >= maxClosureAds {
+			break
+		}
+		ad, err := c.decodeWire(w)
+		if err != nil {
+			continue
+		}
+		names, _ := astClosure(ad, roots)
+		for _, n := range names {
+			folded[n] = true
+		}
+	}
+	out := make([]string, 0, len(folded))
+	for f := range folded {
+		switch {
+		case spell[f] != "":
+			out = append(out, spell[f]) // a root: keep its canonical spelling
+		case display[f] != "":
+			out = append(out, display[f])
+		default:
+			out = append(out, f)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hotDefaults are attributes the match path always reads (a bilateral match evaluates
+// both ads' Requirements and Rank), so they are kept hot regardless of sampled frequency.
+var hotDefaults = []string{"Requirements", "Rank"}
+
+// ensureHotDefaults appends the always-hot attributes (Requirements, Rank) to names if
+// absent (case-insensitive), so every installed hot set front-loads them.
+func ensureHotDefaults(names []string) []string {
+	have := make(map[string]bool, len(names))
+	for _, n := range names {
+		have[strings.ToLower(n)] = true
+	}
+	for _, d := range hotDefaults {
+		if !have[strings.ToLower(d)] {
+			names = append(names, d)
+		}
+	}
+	return names
+}
+
+// installHotNames sets the hot attribute set from names (always including the hot
+// defaults), in the form the collection's encoder reads: folded name set (inline/
+// persistent) or interned id set (RAM).
+func (c *Collection) installHotNames(names []string) {
+	names = ensureHotDefaults(names)
+	if c.inline {
+		c.hotNames.Store(newHotNamesHolder(names))
+		return
+	}
+	set := make(map[uint32]struct{}, len(names))
+	for _, n := range names {
+		set[c.intern.Intern(n)] = struct{}{}
 	}
 	c.hotSet.Store(&hotSetHolder{set})
-	return topN
+}
+
+// AddHotAttrs pins the named attributes into the hot set (front-loaded in future writes'
+// hot headers), merging them with the current set, and returns the resulting hot
+// attribute names. Unlike RefreshHotSet, which recomputes the set from sampled frequency,
+// this forces specific attributes in regardless of how often they appear. Works in both
+// RAM (interned) and persistent (inline) modes.
+func (c *Collection) AddHotAttrs(names ...string) []string {
+	if c.inline {
+		c.installHotNames(append(c.currentHotDisplay(), names...))
+		return c.HotAttrNames()
+	}
+	if c.intern == nil {
+		return c.HotAttrNames()
+	}
+	cur := make([]string, 0, len(c.currentHotSet()))
+	for id := range c.currentHotSet() {
+		if n, ok := c.intern.Name(id); ok {
+			cur = append(cur, n)
+		}
+	}
+	c.installHotNames(append(cur, names...))
+	return c.HotAttrNames()
 }
 
 // HotAttrNames returns the current hot attributes by name (for diagnostics).
 func (c *Collection) HotAttrNames() []string {
+	if c.inline {
+		return c.currentHotDisplay()
+	}
 	set := c.currentHotSet()
 	names := make([]string, 0, len(set))
 	for id := range set {

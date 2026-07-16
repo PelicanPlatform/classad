@@ -3,6 +3,7 @@ package collections
 import (
 	"iter"
 	"runtime"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,12 @@ type Options struct {
 	// scanning the ad body. Typically the attributes common queries filter on
 	// (e.g. Cpus, Memory, Arch, OpSys, State). Optional.
 	HotAttrs []string
+	// MatchClosureRoots names attributes (typically "Requirements") whose transitive
+	// self-reference closure is front-loaded into each ad's hot header at encode time,
+	// so matching a wide ad reads only the match-relevant attributes (via the hot
+	// header) instead of decoding the whole ad. Optional; enables the hot-closure match
+	// fast path. The frequency/HotAttrs hot set is unioned in, so queries are unaffected.
+	MatchClosureRoots []string
 	// CommitSync, if set, is called once per committed (possibly group-coalesced)
 	// batch on a shard, after the writes are applied — the point at which a future
 	// durable collection would fsync/serialize the batch. Group commit amortizes
@@ -133,13 +140,18 @@ type Collection struct {
 	intern *wire.InternTable            // shared attribute-name interning across the store
 	hotSet atomic.Pointer[hotSetHolder] // interned ids to front-load; swapped by RefreshHotSet
 	spec   atomic.Pointer[indexSpec]    // configured indexes; swapped by AddIndex/DropIndex (never nil after New)
-	dir    string                       // persistence directory; "" ⇒ in-memory (see persist.go)
+
+	// matchRoots (case-folded) are the roots whose closure is front-loaded into the
+	// hot header for the match fast path (Options.MatchClosureRoots); nil if disabled.
+	matchRoots []string
+	dir        string // persistence directory; "" ⇒ in-memory (see persist.go)
 
 	// inline is set for a persistent collection: records store attribute names
 	// inline (no interning), so segment files are self-contained and recoverable.
-	// hotNames (case-folded) drives the hot header in inline mode. See inline.go.
+	// hotNames (case-folded) drives the hot header in inline mode; swapped atomically by
+	// RefreshHotSet/AddHotAttrs (the write path reads it). See inline.go.
 	inline   bool
-	hotNames map[string]struct{}
+	hotNames atomic.Pointer[hotNamesHolder]
 
 	// dicts tracks the ZSTD dictionaries trained over the collection's life so each
 	// persistent segment can be tagged (in its file name) with the dictionary it was
@@ -173,6 +185,12 @@ type Collection struct {
 	// ordered holds the maintained ordered indexes (Options.Ordered), updated on the
 	// write path and read via Collection.Ordered. Empty unless configured.
 	ordered []*orderedIndex
+
+	// Codec retrain bookkeeping for diagnostics (CodecStats): the wall-clock time of the
+	// last successful RetrainDict in this process (unix nanos; 0 = never) and the trained
+	// dictionary's size in bytes.
+	lastRetrainUnix atomic.Int64
+	lastDictBytes   atomic.Int64
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to
@@ -234,6 +252,45 @@ func (c *Collection) currentHotSet() map[uint32]struct{} {
 	return nil
 }
 
+// hotNamesHolder wraps the inline-mode hot-name set so it can be swapped atomically. It
+// keeps the folded set the encoder matches on and the original-case spellings for display.
+type hotNamesHolder struct {
+	folded  map[string]struct{} // foldASCII(name) -> {}, matched by the inline encoder
+	display []string            // original-case spellings, sorted (for HotAttrNames)
+}
+
+// newHotNamesHolder builds a holder from original-case names.
+func newHotNamesHolder(names []string) *hotNamesHolder {
+	folded := make(map[string]struct{}, len(names))
+	display := make([]string, 0, len(names))
+	for _, n := range names {
+		f := strings.ToLower(n)
+		if _, dup := folded[f]; dup {
+			continue
+		}
+		folded[f] = struct{}{}
+		display = append(display, n)
+	}
+	sort.Strings(display)
+	return &hotNamesHolder{folded: folded, display: display}
+}
+
+// currentHotNames returns the inline-mode hot attribute set (folded names), or nil.
+func (c *Collection) currentHotNames() map[string]struct{} {
+	if h := c.hotNames.Load(); h != nil {
+		return h.folded
+	}
+	return nil
+}
+
+// currentHotDisplay returns the inline-mode hot attributes in original case, sorted.
+func (c *Collection) currentHotDisplay() []string {
+	if h := c.hotNames.Load(); h != nil {
+		return h.display
+	}
+	return nil
+}
+
 // New creates an empty Collection.
 func New(opts Options) *Collection {
 	n := opts.Shards
@@ -266,12 +323,11 @@ func New(opts Options) *Collection {
 	}
 	c.codec.Store(&codecHolder{codec})
 	c.dicts = newDictReg(codec) // base codec is dictionary id 0
-	if len(opts.HotAttrs) > 0 {
-		set := make(map[uint32]struct{}, len(opts.HotAttrs))
-		for _, name := range opts.HotAttrs {
-			set[c.intern.Intern(name)] = struct{}{}
-		}
-		c.hotSet.Store(&hotSetHolder{set})
+	// Always front-load the configured hot attributes plus the match-critical defaults
+	// (Requirements, Rank). A persistent collection re-installs these inline in Open.
+	c.installHotNames(opts.HotAttrs)
+	for _, r := range opts.MatchClosureRoots {
+		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
 	if opts.WatchHistory > 0 {
@@ -474,6 +530,27 @@ func (c *Collection) Len() int {
 	return n
 }
 
+// Keys returns every visible key in the collection at a consistent per-shard
+// snapshot, in no particular order. Structural (parent-only) keys of a chained
+// collection are excluded, matching Scan's output. Each key is a fresh copy the
+// caller owns. Useful for administrative enumeration and for a replica that must
+// clear its keyspace before a full re-sync.
+func (c *Collection) Keys() []string {
+	var out []string
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		forEachVisibleKeyed(s0, wins, func(key, _ []byte, _ Codec) bool {
+			if c.isStructural != nil && c.isStructural(key) {
+				return true // parent-only ads are hidden, as in Scan
+			}
+			out = append(out, string(key))
+			return true
+		})
+		releaseWindows(wins)
+	}
+	return out
+}
+
 // Scan returns an iterator over every ad in the collection. It is scan-exactly-
 // once: each key present at the moment a shard's scan begins is yielded exactly
 // once (never duplicated, never skipped), even while concurrent updates and
@@ -543,11 +620,31 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 			}
 			return
 		}
+		// Disjunctive queries: if the top-level OR spine yields more than one probe
+		// group and every group is index-usable, prune via the union of the groups'
+		// candidate sets (DNF: OR of AND-of-probes), re-verifying each candidate. A
+		// single group falls through to the conjunctive path below unchanged.
+		if plan := q.ProbePlan(); len(plan) > 1 {
+			for _, g := range plan {
+				c.demand.record(g.Probes)
+			}
+			if groups, prunable := c.planIndexGroups(plan); prunable && !overSelectivityGate(c, groups) {
+				emit := c.yieldAd(yield)
+				for _, sh := range c.shards {
+					if !c.scanShardIndexedGroups(sh, groups, qp, emit) {
+						return
+					}
+				}
+				return
+			}
+			// Not prunable (some disjunct is unconstrained): fall through to a full scan.
+		}
 		// Record which attributes the query filters on (for SuggestIndexes), then,
 		// if the query has an index-usable constraint, visit only candidate ads;
 		// otherwise fall back to a full scan. Both re-verify the full predicate.
 		probes := q.Probes()
 		c.demand.record(probes)
+		c.demand.recordReads(q.ReadAttrs()) // hot-set signal: attributes the query evaluates
 		usable := c.planIndex(probes)
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.

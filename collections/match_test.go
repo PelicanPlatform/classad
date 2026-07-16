@@ -3,9 +3,12 @@ package collections
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // matchCorpus builds a collection of four slots exercising every match outcome
@@ -79,6 +82,173 @@ func TestMatchSortedTopK(t *testing.T) {
 	got := matchIDs(t, c.MatchSorted(job, 1))
 	if want := []int{4}; !equalInts(got, want) {
 		t.Fatalf("MatchSorted top-1 = %v, want %v", got, want)
+	}
+}
+
+// TestMatchSortedDeferredEqualsFull checks that MatchSorted with a limit (which
+// defers ClassAd materialization and ranks survivors wire-native) returns exactly
+// the same ranked top-N as ranking the full result and truncating. The corpus mixes
+// literal Requirements slots (the wire-native survivor path) with non-literal ones
+// (the full-decode fallback), and the job has a Rank, so both rank paths and the
+// deferred/fallback record mix are exercised.
+func TestMatchSortedDeferredEqualsFull(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4})
+	for i := 0; i < 200; i++ {
+		req := "true" // literal -> wire-native survivor path
+		if i%3 == 0 {
+			req = "TARGET.RequestMemory <= Memory" // non-literal -> fallback path
+		}
+		text := fmt.Sprintf(`[ Id=%d; Memory=%d; Arch="X86_64"; Cpus=%d; Requirements = %s ]`,
+			i, ((i%16)+1)*1024, (i%32)+1, req)
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, text)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := mustAd(t, `[ RequestMemory = 4096;
+		Requirements = TARGET.Memory >= RequestMemory && TARGET.Arch == "X86_64";
+		Rank = TARGET.Cpus ]`)
+
+	full := matchIDs(t, c.MatchSorted(job, 0)) // limit 0: materialize all, no deferral
+	for _, k := range []int{1, 3, 10, 50} {
+		limited := matchIDs(t, c.MatchSorted(job, k)) // limit k: deferred + wire-native rank
+		want := full
+		if k < len(want) {
+			want = want[:k]
+		}
+		// Rank ties (equal Cpus) sort in an unspecified order, so compare the multiset
+		// of ranks at each position rather than exact ids: the k-th best rank must match.
+		if len(limited) != len(want) {
+			t.Fatalf("limit=%d: got %d matches, want %d", k, len(limited), len(want))
+		}
+		if !sameRanks(t, c, job, limited, want) {
+			t.Fatalf("limit=%d: deferred top-%d ranks differ from full top-%d\n got %v\nwant %v",
+				k, k, k, limited, want)
+		}
+	}
+}
+
+// sameRanks reports whether two id lists have the same Cpus (== Rank) at each
+// position -- a tie-tolerant equality for the ranked match results.
+func sameRanks(t *testing.T, c *Collection, job *classad.ClassAd, a, b []int) bool {
+	t.Helper()
+	cpus := map[int]int64{}
+	for ad := range c.Scan() {
+		id, _ := ad.EvaluateAttrInt("Id")
+		cp, _ := ad.EvaluateAttrInt("Cpus")
+		cpus[int(id)] = cp
+	}
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if cpus[a[i]] != cpus[b[i]] {
+			return false
+		}
+	}
+	return true
+}
+
+// TestMatchClosureDecodeWideAds drives the closure-decode path (wide ads, non-literal
+// slot Requirements, deferred MatchSorted): each slot carries >64 attributes but the
+// match reads a small closure. The deferred top-N (which decodes only the closure per
+// candidate) must equal the full ranked result, and the returned ads must be fully
+// materialized (all attributes present).
+func TestMatchClosureDecodeWideAds(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4})
+	for i := 0; i < 300; i++ {
+		var b strings.Builder
+		fmt.Fprintf(&b, `Id=%d; Cpus=%d; Memory=%d; Arch="X86_64"; State="Unclaimed"; `,
+			i, (i%16)+1, ((i%16)+1)*1024)
+		// Non-literal slot Requirements referencing a couple of its own attributes and
+		// the job (TARGET), plus a Start-like indirection.
+		fmt.Fprintf(&b, `Start = (Cpus > 0) && (TARGET.RequestMemory <= Memory); `)
+		fmt.Fprintf(&b, `Requirements = Start && (State == "Unclaimed"); `)
+		// Pad to a wide ad so AttrCount clears the closure-decode threshold.
+		for k := 0; k < 80; k++ {
+			fmt.Fprintf(&b, `Pad%d = %d; `, k, i*100+k)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, "["+b.String()+"]")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	job := mustAd(t, `[ RequestMemory = 4096;
+		Requirements = TARGET.Arch == "X86_64" && TARGET.Cpus >= 2;
+		Rank = TARGET.Cpus + TARGET.Memory / 1024 ]`)
+
+	full := matchIDs(t, c.MatchSorted(job, 0)) // limit 0: full decode, no deferral
+	if len(full) == 0 {
+		t.Fatal("expected matches")
+	}
+	for _, k := range []int{1, 5, 20} {
+		limited := c.MatchSorted(job, k) // deferred + closure decode
+		want := full
+		if k < len(want) {
+			want = want[:k]
+		}
+		if len(limited) != len(want) {
+			t.Fatalf("limit=%d: got %d, want %d", k, len(limited), len(want))
+		}
+		if !sameRanks(t, c, job, matchIDs(t, limited), want) {
+			t.Fatalf("limit=%d: deferred closure-decode ranks differ from full", k)
+		}
+		// Returned ads are fully materialized, not the partial closure ad.
+		for _, ad := range limited {
+			if _, ok := ad.EvaluateAttrInt("Pad0"); !ok {
+				t.Fatalf("limit=%d: returned ad missing padding attr (not fully materialized)", k)
+			}
+		}
+	}
+}
+
+// TestMatchHotClosure exercises the hot-header match fast path: with MatchClosureRoots
+// configured, wide slot ads are flagged closure-complete and matching reads the closure
+// from the hot header. Verifies the flag is set and MatchSorted results equal a plain
+// (unconfigured) collection's full-decode results.
+func TestMatchHotClosure(t *testing.T) {
+	t.Parallel()
+	build := func(roots []string) *Collection {
+		c := New(Options{Shards: 4, MatchClosureRoots: roots})
+		for i := 0; i < 300; i++ {
+			var b strings.Builder
+			fmt.Fprintf(&b, `Id=%d; Cpus=%d; Memory=%d; Arch="X86_64"; State="Unclaimed"; `,
+				i, (i%16)+1, ((i%16)+1)*1024)
+			fmt.Fprintf(&b, `Start = (Cpus > 0) && (TARGET.RequestMemory <= Memory); `)
+			fmt.Fprintf(&b, `Requirements = Start && (State == "Unclaimed"); `)
+			for k := 0; k < 80; k++ {
+				fmt.Fprintf(&b, `Pad%d = %d; `, k, i*100+k)
+			}
+			if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, "["+b.String()+"]")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return c
+	}
+	hot := build([]string{"Requirements"})
+	plain := build(nil)
+
+	// The encoder must flag a wide ad closure-complete when match roots are configured,
+	// and not otherwise.
+	sample := mustAd(t, `[ Cpus=8; Memory=8192; State="Unclaimed";
+		Start = (Cpus > 0) && (TARGET.RequestMemory <= Memory);
+		Requirements = Start && (State == "Unclaimed"); Pad=1 ]`)
+	if !wire.Ad(hot.encodeAd(sample.AST())).HotClosureComplete() {
+		t.Fatal("expected encoded ad flagged HotClosureComplete with MatchClosureRoots")
+	}
+	if wire.Ad(plain.encodeAd(sample.AST())).HotClosureComplete() {
+		t.Fatal("plain collection must not flag HotClosureComplete")
+	}
+
+	job := mustAd(t, `[ RequestMemory = 4096;
+		Requirements = TARGET.Arch == "X86_64" && TARGET.Cpus >= 2;
+		Rank = TARGET.Cpus + TARGET.Memory / 1024 ]`)
+	for _, k := range []int{1, 5, 20, 0} {
+		gotHot := matchIDs(t, hot.MatchSorted(job, k))
+		gotPlain := matchIDs(t, plain.MatchSorted(job, k))
+		if !sameRanks(t, plain, job, gotHot, gotPlain) {
+			t.Fatalf("limit=%d: hot-closure result differs from plain full-decode\n hot=%v\nplain=%v", k, gotHot, gotPlain)
+		}
 	}
 }
 
@@ -368,3 +538,395 @@ func benchmarkMatchSelective(b *testing.B, indexed bool) {
 
 func BenchmarkMatchSelectiveFullScan(b *testing.B) { benchmarkMatchSelective(b, false) }
 func BenchmarkMatchSelectiveIndexed(b *testing.B)  { benchmarkMatchSelective(b, true) }
+
+// TestMatchRecordsResourceDemand verifies that matchmaking records the slot-side
+// probes (the attributes a job's Requirements constrain on the slot) as resource-side
+// index demand -- even with no index configured -- so SuggestIndexes can recommend
+// indexing exactly those attributes to speed the match.
+func TestMatchRecordsResourceDemand(t *testing.T) {
+	machines := New(Options{Shards: 2}) // no indexes configured
+	for i := 0; i < 40; i++ {
+		machines.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Name="m%d"; Arch="X86_64"; Memory=%d; Requirements=true ]`, i, (i%8+1)*1024)))
+	}
+	job := mustAd(t, `[ RequestMemory=2048; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Memory >= RequestMemory); Rank = TARGET.Memory ]`)
+	_ = machines.MatchSortedRanked(job, 4)
+
+	byAttr := map[string]IndexSuggestion{}
+	for _, s := range machines.SuggestIndexes(1000) {
+		byAttr[s.Attr] = s
+	}
+	if a, ok := byAttr["Arch"]; !ok || a.Kind != "categorical" || a.QueriesEq == 0 {
+		t.Errorf("want a categorical Arch suggestion from the match, got %+v", byAttr["Arch"])
+	}
+	if m, ok := byAttr["Memory"]; !ok || m.Kind != "value" || m.QueriesRange == 0 {
+		t.Errorf("want a value Memory suggestion from the match, got %+v", byAttr["Memory"])
+	}
+}
+
+// TestExplainMatch verifies the match-plan explanation: the job's Requirements are
+// rewritten over the slot (job constants baked in) and each resulting probe reports
+// whether a resource index covers it.
+func TestExplainMatch(t *testing.T) {
+	machines := New(Options{Shards: 4, ValueAttrs: []string{"Memory"}}) // Memory indexed, Arch not
+	for i := 0; i < 100; i++ {
+		machines.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Name="m%d"; Arch="X86_64"; Memory=%d; Requirements=true ]`, i, (i%8+1)*1024)))
+	}
+	job := mustAd(t, `[ RequestMemory=7168; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Memory >= RequestMemory) ]`)
+	ex := machines.ExplainMatch(job, "")
+
+	if !ex.HasRequirements {
+		t.Fatal("expected HasRequirements")
+	}
+	// The rewrite bakes RequestMemory to 2048 and drops the TARGET scope.
+	if !strings.Contains(ex.SlotPredicate, "Memory >= 7168") || !strings.Contains(ex.SlotPredicate, `Arch == "X86_64"`) {
+		t.Errorf("slot predicate = %q, want it to contain the baked Memory/Arch constraints", ex.SlotPredicate)
+	}
+	if ex.Plan != "indexed" {
+		t.Errorf("plan = %q, want indexed (Memory is indexed)", ex.Plan)
+	}
+	byAttr := map[string]ProbeExplain{}
+	for _, p := range ex.Probes {
+		byAttr[p.Attr] = p
+	}
+	if p, ok := byAttr["Memory"]; !ok || !p.Indexed || p.Kind != "value" {
+		t.Errorf("Memory probe = %+v, want indexed value", p)
+	}
+	if p, ok := byAttr["Arch"]; !ok || p.Indexed {
+		t.Errorf("Arch probe = %+v, want present but not indexed", p)
+	}
+}
+
+// TestExplainMatchNoRequirements: a job without Requirements matches every slot.
+func TestExplainMatchNoRequirements(t *testing.T) {
+	machines := New(Options{Shards: 2})
+	machines.Put([]byte("m1"), mustAd(t, `[ Name="m1"; Requirements=true ]`))
+	ex := machines.ExplainMatch(mustAd(t, `[ Foo=1 ]`), "")
+	if ex.HasRequirements || ex.Plan == "indexed" {
+		t.Errorf("no-Requirements job: got HasRequirements=%v plan=%q, want false / a scan", ex.HasRequirements, ex.Plan)
+	}
+}
+
+// TestMatchUndefinedGuardExceptionEqualsFullScan validates the DNF match pushdown for
+// a WithinResourceLimits-style disk term guarded by an undefined check. Slots without
+// `catalogs` need Disk >= RequestDisk; slots WITH `catalogs` have a looser bound
+// (RequestDisk - catalogSize). The rewrite bakes RequestDisk, assumes catalogs
+// undefined (folding the guard to the fast-path `Disk >= RequestDisk`), and adds the
+// `catalogs isnt undefined` exception -- so the looser-bound slots are still visited.
+// The indexed result must equal the full scan; without the exception it would miss
+// the catalog slots with Disk in [RequestDisk-catalogSize, RequestDisk).
+func TestMatchUndefinedGuardExceptionEqualsFullScan(t *testing.T) {
+	t.Parallel()
+	const n = 4000
+	build := func(indexed bool) *Collection {
+		opts := Options{Shards: 4}
+		if indexed {
+			opts.ValueAttrs = []string{"Disk"}
+			opts.CategoricalAttrs = []string{"catalogs"}
+		}
+		c := New(opts)
+		for i := 0; i < n; i++ {
+			disk := 400 + (i*2654435761)%1200 // 400..1599
+			var text string
+			if i%50 == 0 { // ~2% advertise catalogs (looser disk bound applies)
+				text = fmt.Sprintf(`[ Id=%d; Disk=%d; catalogs="c%d"; Requirements=true ]`, i, disk, i)
+			} else {
+				text = fmt.Sprintf(`[ Id=%d; Disk=%d; Requirements=true ]`, i, disk)
+			}
+			c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, text))
+		}
+		if indexed {
+			c.Reindex()
+		}
+		return c
+	}
+	// RequestDisk=1000, catalog reservation=500 (so catalog slots match at Disk>=500).
+	job := mustAd(t, `[ RequestDisk=1000;
+		Requirements = TARGET.Disk >= (RequestDisk - ifThenElse(catalogs is undefined, 0, 500));
+		Rank = 0 ]`)
+
+	plain, indexed := build(false), build(true)
+	// The plan must be prunable and disjunctive (fast path + catalogs exception).
+	groups, prunable := indexed.slotMatchPlan(job, jobValues(job))
+	if !prunable || len(groups) < 2 {
+		t.Fatalf("expected a prunable disjunctive plan (fast path + exception), got prunable=%v groups=%d", prunable, len(groups))
+	}
+	p, i := matchIDSet(t, plain, job), matchIDSet(t, indexed, job)
+	if !equalInts(p, i) {
+		t.Fatalf("indexed match (%d) != full scan (%d) -- exception disjunct unsound/missing", len(i), len(p))
+	}
+	if len(p) == 0 {
+		t.Fatal("expected some matches")
+	}
+}
+
+// TestMatchFiniteDomainMaterialization validates that an opaque pure function of a
+// low-cardinality categorical attribute (versionGE over CondorVersion) is materialized
+// into a membership probe, so `versionGE(...) || (Disk >= X)` becomes an indexable DNF
+// union -- and that the indexed match equals the full scan.
+func TestMatchFiniteDomainMaterialization(t *testing.T) {
+	t.Parallel()
+	versions := []string{
+		`$CondorVersion: 25.12.0 2026-06-25 $`, // passing (>= 25.12.0)
+		`$CondorVersion: 25.13.0 2026-07-01 $`, // passing
+		`$CondorVersion: 24.0.0 2025-01-01 $`,  // failing
+		`$CondorVersion: 23.5.0 2024-06-01 $`,  // failing
+	}
+	const n = 4000
+	build := func(indexed bool) *Collection {
+		opts := Options{Shards: 4}
+		if indexed {
+			opts.ValueAttrs = []string{"Disk"}
+			opts.CategoricalAttrs = []string{"CondorVersion"}
+		}
+		c := New(opts)
+		for i := 0; i < n; i++ {
+			disk := 400 + (i*2654435761)%1200
+			ad := mustAd(t, fmt.Sprintf(`[ Id=%d; Disk=%d; CondorVersion=%q; Arch="X86_64"; Requirements=true ]`,
+				i, disk, versions[i%len(versions)]))
+			c.Put([]byte(fmt.Sprintf("m%d", i)), ad)
+		}
+		if indexed {
+			c.Reindex()
+		}
+		return c
+	}
+	// A passing-version slot matches regardless of disk; a failing one needs Disk>=1000.
+	job := mustAd(t, `[ RequestDisk=1000;
+		Requirements = (versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)) && (TARGET.Arch == "X86_64");
+		Rank = 0 ]`)
+
+	plain, indexed := build(false), build(true)
+	groups, prunable := indexed.slotMatchPlan(job, jobValues(job))
+	if !prunable || len(groups) < 2 {
+		t.Fatalf("expected a prunable disjunctive plan from materialization, got prunable=%v groups=%d", prunable, len(groups))
+	}
+	p, i := matchIDSet(t, plain, job), matchIDSet(t, indexed, job)
+	if !equalInts(p, i) {
+		t.Fatalf("indexed match (%d) != full scan (%d) -- materialization unsound", len(i), len(p))
+	}
+	if len(p) == 0 || len(p) == n {
+		t.Fatalf("expected a partial match set, got %d of %d", len(p), n)
+	}
+}
+
+// firstChain finds the first associative op-chain in e and returns its flattened
+// operands, so a test can assert the reordered evaluation order.
+func firstChain(e ast.Expr, op string) []ast.Expr {
+	var found []ast.Expr
+	var walk func(ast.Expr) bool
+	walk = func(x ast.Expr) bool {
+		switch n := x.(type) {
+		case *ast.ParenExpr:
+			return walk(n.Inner)
+		case *ast.UnaryOp:
+			return walk(n.Expr)
+		case *ast.BinaryOp:
+			if n.Op == op {
+				found = flattenChain(n, op)
+				return true
+			}
+			return walk(n.Left) || walk(n.Right)
+		}
+		return false
+	}
+	walk(e)
+	return found
+}
+
+// TestReorderShortCircuitOrder: the expensive opaque function
+// (versionGE(split(...)[1],...)) sorts AFTER the cheap comparison (Disk >= X) in the
+// `||`, so the evaluator tests the cheap operand first and skips the split/subscript on
+// the slots the cheap test already decides.
+func TestReorderShortCircuitOrder(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, ValueAttrs: []string{"Disk"}, CategoricalAttrs: []string{"CondorVersion"}})
+	versions := []string{`$CondorVersion: 25.12.0 2026-06-25 $`, `$CondorVersion: 24.0.0 2025-01-01 $`}
+	for i := 0; i < 2000; i++ {
+		c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Disk=%d; CondorVersion=%q; Arch="X86_64"; Requirements=true ]`,
+				i, 400+(i*2654435761)%1200, versions[i%2])))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestDisk=1000;
+		Requirements = (versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)) && (TARGET.Arch == "X86_64");
+		Rank = 0 ]`)
+
+	rj := c.reorderJobRequirements(job)
+	if rj == job {
+		t.Fatal("expected reorderJobRequirements to reorder the || (cheap Disk before versionGE)")
+	}
+	ops := firstChain(jobRequirementsExpr(rj), "||")
+	if len(ops) != 2 {
+		t.Fatalf("expected a 2-operand || chain, got %d: %s", len(ops), jobRequirementsExpr(rj))
+	}
+	first := ops[0].String()
+	if !strings.Contains(first, "Disk") || strings.Contains(first, "versionGE") {
+		t.Errorf("cheap Disk operand should sort first; got first=%q full=%s", first, jobRequirementsExpr(rj))
+	}
+	// The input job is never mutated.
+	if in := firstChain(jobRequirementsExpr(job), "||"); !strings.Contains(in[0].String(), "versionGE") {
+		t.Errorf("input job was mutated: %s", jobRequirementsExpr(job))
+	}
+	// ExplainMatch shows the same optimized order: the cheap Disk test appears before
+	// the expensive versionGE(split(...)) in the displayed slot predicate.
+	sp := c.ExplainMatch(job, "").SlotPredicate
+	if di, vi := strings.Index(sp, "Disk >= 1000"), strings.Index(sp, "versionGE"); di < 0 || vi < 0 || di > vi {
+		t.Errorf("explain slot predicate = %q, want Disk shown before versionGE", sp)
+	}
+}
+
+// TestReorderIndexedFlagSinks: a bare boolean capability flag that is indexed but
+// almost always true (HasFileTransfer, ~99%) must NOT lead the && chain just because it
+// is cheap -- the reorder reads its real selectivity via the index and sinks it behind
+// the genuinely selective conjunct (Memory>=X), which is the one that rejects candidates.
+func TestReorderIndexedFlagSinks(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, ValueAttrs: []string{"Memory", "HasFileTransfer"}})
+	for i := 0; i < 4000; i++ {
+		hft := "true"
+		if i%400 == 0 { // ~0.25% false -> the flag is ~99.75% true
+			hft = "false"
+		}
+		// Memory in {1024..8192}; >= 7168 is ~25% -> far more selective than the flag.
+		c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Memory=%d; HasFileTransfer=%s; Requirements=true ]`,
+				i, (i%8+1)*1024, hft)))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestMemory=7168;
+		Requirements = TARGET.HasFileTransfer && (TARGET.Memory >= RequestMemory);
+		Rank = 0 ]`)
+
+	rj := c.reorderJobRequirements(job)
+	if rj == job {
+		t.Fatal("expected reorder to move the always-true flag behind the selective Memory test")
+	}
+	ops := firstChain(jobRequirementsExpr(rj), "&&")
+	if len(ops) != 2 {
+		t.Fatalf("expected a 2-operand && chain, got %d: %s", len(ops), jobRequirementsExpr(rj))
+	}
+	// Memory (selective, ~25% true -> most likely to reject) must come first; the
+	// always-true HasFileTransfer flag must come last.
+	if !strings.Contains(ops[0].String(), "Memory") || !strings.Contains(ops[len(ops)-1].String(), "HasFileTransfer") {
+		t.Errorf("want selective Memory first, always-true flag last; got %s", jobRequirementsExpr(rj))
+	}
+}
+
+// TestMatchCategoricalBoolEqualsFullScan: boolean capability flags indexed categorically
+// (HasFileTransfer, HasSingularity) must index correctly (posted as "true"/"false", not
+// dropped to the exception set) and the indexed match must equal the full scan -- both
+// when the flag is used as a bare truthiness conjunct and as `== true`.
+func TestMatchCategoricalBoolEqualsFullScan(t *testing.T) {
+	t.Parallel()
+	const n = 3000
+	build := func(indexed bool) *Collection {
+		opts := Options{Shards: 4}
+		if indexed {
+			opts.ValueAttrs = []string{"Memory"}
+			opts.CategoricalAttrs = []string{"HasFileTransfer", "GPUs", "Arch"}
+		}
+		c := New(opts)
+		for i := 0; i < n; i++ {
+			hft := i%5 != 0 // 80% true
+			gpu := i%4 == 0 // 25% true (selective)
+			c.Put([]byte(fmt.Sprintf("m%d", i)),
+				mustAd(t, fmt.Sprintf(`[ Id=%d; Memory=%d; HasFileTransfer=%t; GPUs=%t; Arch="X86_64" ]`,
+					i, (i%8+1)*1024, hft, gpu)))
+		}
+		if indexed {
+			c.Reindex()
+		}
+		return c
+	}
+	plain, indexed := build(false), build(true)
+	jobs := []string{
+		`[ Requirements = TARGET.HasFileTransfer && (TARGET.Memory >= 4096); Rank=0 ]`,
+		`[ Requirements = (TARGET.GPUs == true) && (TARGET.Arch == "X86_64"); Rank=0 ]`,
+		`[ Requirements = TARGET.GPUs && !TARGET.HasFileTransfer; Rank=0 ]`,
+		`[ Requirements = (TARGET.HasFileTransfer == false) || (TARGET.Memory >= 7168); Rank=0 ]`,
+	}
+	for _, js := range jobs {
+		job := mustAd(t, js)
+		p, i := matchIDSet(t, plain, job), matchIDSet(t, indexed, job)
+		if !equalInts(p, i) {
+			t.Errorf("job %s:\n  indexed %d != full scan %d", js, len(i), len(p))
+		}
+	}
+	// The selective GPUs==true flag should be estimable from its categorical index.
+	gpuRef := &ast.AttributeReference{Name: "GPUs", Scope: ast.TargetScope}
+	if frac, ok := indexed.operandTrueProb(gpuRef, map[string]classad.Value{}); !ok || frac > 0.4 {
+		t.Errorf("GPUs truthiness estimate = %.3f ok=%v, want ~0.25 from the categorical index", frac, ok)
+	}
+}
+
+// TestReorderPreservesMatches: reordering is a pure evaluation-order change -- the match
+// set is identical to a brute-force bilateral match over the ORIGINAL (un-reordered)
+// Requirements.
+func TestReorderPreservesMatches(t *testing.T) {
+	t.Parallel()
+	const n = 1500
+	c := New(Options{Shards: 4, ValueAttrs: []string{"Disk"}, CategoricalAttrs: []string{"CondorVersion"}})
+	versions := []string{
+		`$CondorVersion: 25.12.0 2026-06-25 $`, `$CondorVersion: 25.13.0 2026-07-01 $`,
+		`$CondorVersion: 24.0.0 2025-01-01 $`, `$CondorVersion: 23.5.0 2024-06-01 $`,
+	}
+	for i := 0; i < n; i++ {
+		c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Disk=%d; CondorVersion=%q; Arch="X86_64"; Requirements=true ]`,
+				i, 400+(i*2654435761)%1200, versions[i%4])))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestDisk=1000;
+		Requirements = (versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)) && (TARGET.Arch == "X86_64");
+		Rank = 0 ]`)
+
+	// Brute force: bilateral match over the original job, no reorder path.
+	brute := map[int]bool{}
+	var bruteIDs []int
+	for ad := range c.Scan() {
+		m := classad.NewMatchClassAd(job, nil)
+		ok, _, _ := matchOne(m, ad)
+		if ok {
+			id, _ := ad.EvaluateAttrInt("Id")
+			brute[int(id)] = true
+			bruteIDs = append(bruteIDs, int(id))
+		}
+	}
+	sort.Ints(bruteIDs)
+	got := matchIDSet(t, c, job) // goes through reorderJobRequirements
+	if !equalInts(got, bruteIDs) {
+		t.Fatalf("reordered match (%d) != brute-force bilateral (%d)", len(got), len(bruteIDs))
+	}
+	if len(got) == 0 || len(got) == n {
+		t.Fatalf("expected a partial match set, got %d of %d", len(got), n)
+	}
+}
+
+// TestMatchPlanCostGate: when the slot probes are unselective (match nearly every
+// slot), the planner skips the pushdown (a scan is cheaper than visiting ~all
+// candidates), while still returning the correct matches.
+func TestMatchPlanCostGate(t *testing.T) {
+	t.Parallel()
+	const n = 4000
+	// Every slot is X86_64 with Cpus in {1,2} -- an Arch/Cpus probe barely prunes.
+	c := New(Options{Shards: 4, CategoricalAttrs: []string{"Arch"}, ValueAttrs: []string{"Cpus"}})
+	plain := New(Options{Shards: 4})
+	for i := 0; i < n; i++ {
+		ad := mustAd(t, fmt.Sprintf(`[ Id=%d; Arch="X86_64"; Cpus=%d; Requirements=true ]`, i, 1+i%2))
+		c.Put([]byte(fmt.Sprintf("m%d", i)), ad)
+		plain.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, fmt.Sprintf(`[ Id=%d; Arch="X86_64"; Cpus=%d; Requirements=true ]`, i, 1+i%2)))
+	}
+	c.Reindex()
+	job := mustAd(t, `[ RequestCpus=1; Requirements = (TARGET.Arch == "X86_64") && (TARGET.Cpus >= RequestCpus); Rank = 0 ]`)
+
+	// Arch==X86_64 is 100% and Cpus>=1 is 100% -> the plan barely prunes -> gated off.
+	if _, prunable := c.slotMatchPlan(job, jobValues(job)); prunable {
+		t.Errorf("expected the unselective plan to be gated off (scan), but it was prunable")
+	}
+	// Result is still correct (all slots match).
+	if p, i := matchIDSet(t, plain, job), matchIDSet(t, c, job); !equalInts(p, i) || len(i) != n {
+		t.Fatalf("gated match wrong: indexed %d vs full %d (want %d)", len(i), len(p), n)
+	}
+}

@@ -125,6 +125,7 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 			return roaring.New()
 		}
 		excOff := le32(si.data, attrOff)
+		postedOff := le32(si.data, attrOff+4)
 		switch up.op {
 		case "==", "in":
 			bm := roaring.New()
@@ -141,6 +142,25 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 				bm.AndNot(si.bitmapAt(off))
 			}
 			return bm
+		case "present": // attr isnt undefined: posted a value, or present-but-exceptional
+			bm := si.bitmapAt(postedOff).Clone()
+			bm.Or(si.bitmapAt(excOff))
+			return bm
+		case "absent": // attr is undefined: everything but the definitely-posted records
+			bm := si.allBitmap().Clone()
+			bm.AndNot(si.bitmapAt(postedOff))
+			return bm
+		case "is": // =?= exact (case-sensitive) via the exact-case run
+			if off, ok := si.catFindExact(attrOff, up.svals[0]); ok {
+				return si.bitmapAt(off)
+			}
+			return roaring.New()
+		case "isnt": // =!= exact: everything but the exact-case matches
+			bm := si.allBitmap().Clone()
+			if off, ok := si.catFindExact(attrOff, up.svals[0]); ok {
+				bm.AndNot(si.bitmapAt(off))
+			}
+			return bm
 		}
 		return roaring.New()
 	}
@@ -150,6 +170,7 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		return roaring.New()
 	}
 	excOff := le32(si.data, attrOff)
+	postedOff := le32(si.data, attrOff+4)
 	switch up.op {
 	case "==", "in":
 		bm := roaring.New()
@@ -166,6 +187,14 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 			bm.AndNot(si.bitmapAt(off))
 		}
 		return bm
+	case "present":
+		bm := si.bitmapAt(postedOff).Clone()
+		bm.Or(si.bitmapAt(excOff))
+		return bm
+	case "absent":
+		bm := si.allBitmap().Clone()
+		bm.AndNot(si.bitmapAt(postedOff))
+		return bm
 	case "<", "<=", ">", ">=":
 		bm := si.valRange(attrOff, up.op, up.fvals[0])
 		bm.Or(si.bitmapAt(excOff))
@@ -174,12 +203,12 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 	return roaring.New()
 }
 
-// --- categorical attr block: excOff u32; n u32; keyOff[n+1] u32; bmOff[n] u32; keysBlob ---
+// --- categorical attr block: excOff u32; postedOff u32; n u32; keyOff[n+1] u32; bmOff[n] u32; keysBlob ---
 
 func (si *mmapSegIndex) catFind(attrOff uint32, key string) (bmOff uint32, ok bool) {
 	d := si.data
-	n := le32(d, attrOff+4)
-	keyOffBase := attrOff + 8
+	n := le32(d, attrOff+8)
+	keyOffBase := attrOff + 12
 	bmOffBase := keyOffBase + (n+1)*4
 	blobBase := bmOffBase + n*4
 	lo, hi := 0, int(n)
@@ -199,7 +228,40 @@ func (si *mmapSegIndex) catFind(attrOff uint32, key string) (bmOff uint32, ok bo
 	return 0, false
 }
 
-// --- value attr block: excOff u32; n u32; key[n] f64; bmOff[n] u32 ---
+// catFindExact binary-searches the exact-case key run (=?=/=!=) for an exact spelling.
+// The run sits immediately after the folded keys blob: its offset is blobBase plus the
+// folded blob's length (the last folded keyOff).
+func (si *mmapSegIndex) catFindExact(attrOff uint32, key string) (bmOff uint32, ok bool) {
+	d := si.data
+	n := le32(d, attrOff+8)
+	keyOffBase := attrOff + 12
+	bmOffBase := keyOffBase + (n+1)*4
+	blobBase := bmOffBase + n*4
+	foldedBlobLen := le32(d, keyOffBase+n*4) // keyOff[n]
+	exOff := blobBase + foldedBlobLen
+
+	exN := le32(d, exOff)
+	exKeyOffBase := exOff + 4
+	exBmOffBase := exKeyOffBase + (exN+1)*4
+	exBlobBase := exBmOffBase + exN*4
+	lo, hi := 0, int(exN)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		ks := exBlobBase + le32(d, exKeyOffBase+uint32(mid)*4)
+		ke := exBlobBase + le32(d, exKeyOffBase+uint32(mid+1)*4)
+		switch cmpStrBytes(key, d[ks:ke]) {
+		case 0:
+			return le32(d, exBmOffBase+uint32(mid)*4), true
+		case -1:
+			hi = mid
+		default:
+			lo = mid + 1
+		}
+	}
+	return 0, false
+}
+
+// --- value attr block: excOff u32; postedOff u32; n u32; key[n] f64; bmOff[n] u32 ---
 
 func (si *mmapSegIndex) valKeyAt(keyBase uint32, i int) float64 {
 	return math.Float64frombits(le64(si.data, keyBase+uint32(i)*8))
@@ -207,8 +269,8 @@ func (si *mmapSegIndex) valKeyAt(keyBase uint32, i int) float64 {
 
 func (si *mmapSegIndex) valFind(attrOff uint32, f float64) (bmOff uint32, ok bool) {
 	d := si.data
-	n := int(le32(d, attrOff+4))
-	keyBase := attrOff + 8
+	n := int(le32(d, attrOff+8))
+	keyBase := attrOff + 12
 	lo, hi := 0, n
 	for lo < hi {
 		mid := int(uint(lo+hi) >> 1)
@@ -231,8 +293,8 @@ func (si *mmapSegIndex) valFind(attrOff uint32, f float64) (bmOff uint32, ok boo
 // bitmaps are touched.
 func (si *mmapSegIndex) valRange(attrOff uint32, op string, t float64) *roaring.Bitmap {
 	d := si.data
-	n := int(le32(d, attrOff+4))
-	keyBase := attrOff + 8
+	n := int(le32(d, attrOff+8))
+	keyBase := attrOff + 12
 	bmOffBase := keyBase + uint32(n)*8
 	bm := roaring.New()
 	// [from, to) is the index range of matching keys.

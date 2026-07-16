@@ -35,3 +35,6 @@ y.output
 # Build output
 /bin/
 /dist/
+
+# large OSPool ad capture used by the match-perf spike (regenerate with condor_status -l)
+collections/testdata/ospool_slots.ldif

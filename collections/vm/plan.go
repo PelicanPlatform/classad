@@ -93,3 +93,14 @@ func SelfRefs(expr ast.Expr) []string {
 	walkPlan(expr, seen, &rp)
 	return rp.Seeds
 }
+
+// SelfRefsSafe is SelfRefs plus whether partial decode is sound for expr:
+// partialSafe is false when expr calls eval(), whose referenced attributes cannot be
+// determined statically, so a closure built from the static refs could miss one. A
+// caller building a partial ad must fall back to a full decode when this is false.
+func SelfRefsSafe(expr ast.Expr) (refs []string, partialSafe bool) {
+	seen := map[string]bool{}
+	rp := ReadPlan{PartialSafe: true}
+	walkPlan(expr, seen, &rp)
+	return rp.Seeds, rp.PartialSafe
+}

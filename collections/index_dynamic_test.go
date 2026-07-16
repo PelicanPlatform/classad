@@ -270,18 +270,26 @@ func TestAutoTuneAdds(t *testing.T) {
 
 func TestAutoTuneDropsUnused(t *testing.T) {
 	t.Parallel()
-	// Ghost is configured but no ad has it and no query uses it -> unused -> dropped.
-	c := New(Options{Shards: 4, CategoricalAttrs: []string{"Ghost"}})
+	// An AUTO index that no ad has and no query uses -> unused -> dropped.
+	c := New(Options{Shards: 4})
+	c.addIndexAuto([]string{"Ghost"}, nil)
 	putDynAds(t, c, 100)
 	res := c.AutoTune(AutoTuneOptions{DropUnused: true, Reindex: true})
 	if !res.Changed {
-		t.Fatal("AutoTune should have dropped the unused Ghost index")
+		t.Fatal("AutoTune should have dropped the unused auto Ghost index")
 	}
 	if cat, val := c.IndexedAttrs(); len(cat) != 0 || len(val) != 0 {
 		t.Errorf("Ghost not dropped: cat=%v val=%v", cat, val)
 	}
+	// A HUMAN-created unused index is never auto-dropped (user policy).
+	ch := New(Options{Shards: 4, CategoricalAttrs: []string{"Ghost"}})
+	putDynAds(t, ch, 100)
+	if res := ch.AutoTune(AutoTuneOptions{DropUnused: true, Reindex: true}); res.Changed {
+		t.Errorf("AutoTune must not drop a human-created index, even if unused: %+v", res.Changes)
+	}
 	// Without DropUnused, an unused index is left alone.
-	c2 := New(Options{Shards: 4, CategoricalAttrs: []string{"Ghost"}})
+	c2 := New(Options{Shards: 4})
+	c2.addIndexAuto([]string{"Ghost"}, nil)
 	putDynAds(t, c2, 100)
 	if res := c2.AutoTune(AutoTuneOptions{Reindex: true}); res.Changed {
 		t.Errorf("AutoTune without DropUnused should not drop: %+v", res.Changes)

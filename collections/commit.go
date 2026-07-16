@@ -196,6 +196,18 @@ func (sh *shard) sync() {
 			seg.synced = seg.used
 		}
 	}
+	// Pin the segments we are about to msync lock-free (still under the lock, so it is
+	// atomic with capturing them). A concurrent compaction that retires one of these
+	// segments then sees a non-zero pin and defers its reap (munmap+unlink) to our unpin,
+	// so msyncRange never reads a mapping torn down under it. compactShard also drops
+	// retired segments from sh.dirty/dirtySup under the lock, so a *later* sync cannot pick
+	// up a segment already being reaped.
+	for i := range ranges {
+		ranges[i].seg.pin()
+	}
+	for _, s := range sup {
+		s.seg.pin()
+	}
 	sh.mu.Unlock()
 	for _, r := range ranges {
 		_ = r.seg.msyncRange(r.from, r.to)
@@ -208,5 +220,11 @@ func (sh *shard) sync() {
 	for _, s := range sup {
 		off := int(s.off) + recSupOff
 		_ = s.seg.msyncRange(off, off+8)
+	}
+	for i := range ranges {
+		ranges[i].seg.unpin()
+	}
+	for _, s := range sup {
+		s.seg.unpin()
 	}
 }

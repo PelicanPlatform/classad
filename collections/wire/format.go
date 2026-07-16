@@ -27,6 +27,13 @@ const (
 	// store, where records must be recoverable without a shared table.
 	flagInlineNames = 1 << 1
 
+	// flagHotClosure: the hot header holds the COMPLETE transitive closure of the
+	// collection's match roots (e.g. Requirements) -- every attribute the match reads
+	// from this ad, present in the ad, is in the hot header. A matcher can then read
+	// the match-relevant attributes via ForEachHot and trust it is complete, without
+	// scanning the ad. Set only when that closure is statically determinable (no eval()).
+	flagHotClosure = 1 << 2
+
 	// A hot-header pair is (internID, offset) in interned ads and
 	// (nameHash32, offset) in inline-names ads; the offset points at the attribute
 	// ENTRY (name+node for inline, node for interned) — see accessor.go.

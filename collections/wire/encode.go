@@ -42,8 +42,20 @@ func Encode(dst []byte, ad *ast.ClassAd, t *InternTable) []byte {
 // is otherwise identical to Encode, so the result decodes with Decode and the hot
 // header is a pure read-time accelerator. hot may be nil (equivalent to Encode).
 func EncodeWithHot(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint32]struct{}) []byte {
+	return EncodeWithHotClosure(dst, ad, t, hot, false)
+}
+
+// EncodeWithHotClosure is EncodeWithHot that, when closureComplete, marks the ad with
+// flagHotClosure -- a promise that hot holds the complete match closure, so a matcher
+// can read it via ForEachHot without scanning. Set closureComplete only when hot truly
+// contains every attribute the match reads from ad (see collections' astClosure).
+func EncodeWithHotClosure(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint32]struct{}, closureComplete bool) []byte {
 	if ad == nil {
 		return Encode(dst, ad, t)
+	}
+	var extraFlags byte
+	if closureComplete {
+		extraFlags = flagHotClosure
 	}
 	// Write the entries (id, node)* into a scratch buffer, recording the
 	// entries-relative offset of each hot attribute's node.
@@ -58,7 +70,7 @@ func EncodeWithHot(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint32]s
 			hots = append(hots, hotPair{id, uint32(nodeOff)})
 		}
 	}
-	out := append(dst, magicByte, formatVer, 0 /* flags */)
+	out := append(dst, magicByte, formatVer, extraFlags)
 	out = binary.AppendUvarint(out, uint64(len(hots)))
 	for _, h := range hots {
 		out = binary.AppendUvarint(out, uint64(h.id))

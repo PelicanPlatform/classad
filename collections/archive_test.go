@@ -77,9 +77,14 @@ func TestArchiveRoundTripAndQuery(t *testing.T) {
 		`Owner == "bob" && Memory > 4096`,
 		`Memory > 4096`,
 		`ClusterId >= 10 && ClusterId < 20`,
-		`Owner == "nobody"`, // no matches
-		`Owner != "alice"`,  // negation
-		`Memory > 1000000`,  // none
+		`Owner == "nobody"`,         // no matches
+		`Owner != "alice"`,          // negation
+		`Memory > 1000000`,          // none
+		`Owner =?= "alice"`,         // exact identity
+		`Owner =!= "alice"`,         // exact !=
+		`JobStatus =?= "Completed"`, // exact identity, matches the stored case
+		`JobStatus =?= "completed"`, // exact identity, wrong case -> none (folded == would match)
+		`JobStatus =!= "Held"`,      // exact !=
 	}
 	for _, qs := range queries {
 		q, err := vm.Parse(qs)
@@ -90,6 +95,109 @@ func TestArchiveRoundTripAndQuery(t *testing.T) {
 		want := bruteIDs(src, q)
 		if !equalInts(got, want) {
 			t.Errorf("query %q: got %d, want %d\n got=%v\nwant=%v", qs, len(got), len(want), got, want)
+		}
+	}
+}
+
+// TestArchiveExactCaseMatch exercises the v3 exact-case run on disk with a folded
+// bucket that mixes case ("X86_64" and "x86_64"): =?= must distinguish them and =!=
+// must keep the other variant, matching a brute-force scan after seal+reopen.
+func TestArchiveExactCaseMatch(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := CreateArchive(ArchiveOptions{Dir: dir, SegmentSize: 8 << 10, CategoricalAttrs: []string{"Arch"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	arches := []string{"X86_64", "x86_64", "aarch64"}
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 300; i++ {
+		ad, err := classad.Parse(fmt.Sprintf(`[ ID=%d; Arch="%s" ]`, i, arches[i%len(arches)]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+		src[i] = ad
+	}
+	if err := a.Close(); err != nil { // seal + write v3 sidecars
+		t.Fatal(err)
+	}
+	b, err := OpenArchive(ArchiveOptions{Dir: dir, CategoricalAttrs: []string{"Arch"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, qs := range []string{
+		`Arch =?= "X86_64"`, // only the exact case
+		`Arch =?= "x86_64"`, // only the other exact case
+		`Arch == "x86_64"`,  // folded: both X86_64 and x86_64
+		`Arch =!= "X86_64"`, // everything but exact X86_64 (keeps x86_64)
+		`Arch =!= "aarch64"`,
+	} {
+		q, _ := vm.Parse(qs)
+		got := archiveQueryIDs(t, b, qs)
+		want := bruteIDs(src, q)
+		if !equalInts(got, want) {
+			t.Errorf("archive %q: got %d, want %d", qs, len(got), len(want))
+		}
+	}
+}
+
+// TestArchivePresenceMatch exercises presence probes (is/isnt undefined,
+// isUndefined()) on the sealed archive: the corpus makes an indexed attribute
+// absent, expression-valued (an exception), or a plain literal, and results must
+// match a brute-force scan after reopen.
+func TestArchivePresenceMatch(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := CreateArchive(ArchiveOptions{Dir: dir, SegmentSize: 8 << 10,
+		CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 300; i++ {
+		var text string
+		switch i % 3 {
+		case 0:
+			text = fmt.Sprintf(`[ ID=%d; Owner="alice"; Memory=%d ]`, i, (i%8+1)*512) // present literal
+		case 1:
+			text = fmt.Sprintf(`[ ID=%d; Memory=%d ]`, i, (i%8+1)*512) // Owner absent
+		default:
+			text = fmt.Sprintf(`[ ID=%d; Owner=Base; Memory=%d ]`, i, (i%8+1)*512) // Owner expression -> undefined
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+		src[i] = ad
+	}
+	if err := a.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := OpenArchive(ArchiveOptions{Dir: dir, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	for _, qs := range []string{
+		`Owner is undefined`,    // absent + expression-valued(undefined)
+		`Owner isnt undefined`,  // present literal
+		`isUndefined(Owner)`,    // function form
+		`!isUndefined(Owner)`,   // negated function form
+		`Memory isnt undefined`, // always present
+		`Owner is undefined && Memory > 1024`,
+	} {
+		q, _ := vm.Parse(qs)
+		got := archiveQueryIDs(t, b, qs)
+		want := bruteIDs(src, q)
+		if !equalInts(got, want) {
+			t.Errorf("archive %q: got %d, want %d", qs, len(got), len(want))
 		}
 	}
 }

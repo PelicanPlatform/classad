@@ -9,8 +9,9 @@ import (
 
 // Probe is an index-satisfiable constraint extracted from a query: a self-scoped
 // attribute Attr related by Op to one or more literal values. Op is one of
-// "==","!=","<","<=",">=",">" (a single Val) or "in" (a set of Vals, from an
-// OR-of-equalities). A store matches Probes against its configured indexes to
+// "==","!=","<","<=",">=",">" (a single Val), "in" (a set of Vals, from an
+// OR-of-equalities), "is"/"isnt" (=?=/=!= exact identity), or "present"/"absent"
+// (is/isnt undefined). A store matches Probes against its configured indexes to
 // build a candidate set; because the store still re-verifies the full query, any
 // Probe the planner omits only costs selectivity, never correctness.
 type Probe struct {
@@ -36,6 +37,101 @@ func (q *Query) Probes() []Probe {
 		}
 	}
 	return out
+}
+
+// ProbeGroup is a conjunction of index probes -- a candidate matches the group when
+// it satisfies ALL of them. An empty Probes means the group is unconstrained (that
+// disjunct can match anything), so a plan containing one cannot prune.
+type ProbeGroup struct {
+	Probes []Probe
+}
+
+// ProbePlan describes the query's index-satisfiable structure as a disjunction of
+// conjunctive groups (DNF over the top-level `||` spine): a candidate satisfies the
+// plan when it satisfies every probe of ANY group. A purely conjunctive query is a
+// single group -- identical to Probes(). A disjunctive query like `(A && B) || C`
+// yields one group per disjunct, which the planner executes as a union of
+// intersections. Because each group is an over-approximation of its disjunct and the
+// store re-verifies, the union is a sound candidate superset; a group with no probes
+// makes the plan un-prunable (the caller then full-scans).
+func (q *Query) ProbePlan() []ProbeGroup {
+	if q == nil || q.prog == nil || q.prog.expr == nil {
+		return nil
+	}
+	exprGroups := distributeDNF(classad.FoldConstants(q.prog.expr))
+	groups := make([]ProbeGroup, 0, len(exprGroups))
+	for _, g := range exprGroups {
+		var probes []Probe
+		for _, c := range g {
+			if p, ok := probeFrom(c); ok {
+				probes = append(probes, p)
+			}
+		}
+		groups = append(groups, ProbeGroup{Probes: probes})
+	}
+	return groups
+}
+
+// maxDNFGroups bounds disjunctive-normal-form expansion so a predicate with many
+// nested ORs (whose full DNF is a cross-product) cannot explode. Above it, distributeDNF
+// falls back to top-level-only splitting (nested ORs then stay unprobed -- sound, just
+// less selective).
+const maxDNFGroups = 16
+
+// distributeDNF turns a boolean predicate into disjunctive normal form -- a slice of
+// conjunctive groups (each an AND-list of leaf expressions) whose union is the
+// predicate -- distributing nested ORs (`A && (B || C)` -> `(A && B) || (A && C)`) up
+// to maxDNFGroups. Beyond the bound it falls back to splitting only the top-level OR
+// spine, leaving nested ORs intact.
+func distributeDNF(e ast.Expr) [][]ast.Expr {
+	if groups, ok := tryDNF(e); ok {
+		return groups
+	}
+	var out [][]ast.Expr
+	for _, d := range flattenOr(e, nil) {
+		out = append(out, flattenAnd(d, nil))
+	}
+	return out
+}
+
+// tryDNF recursively builds the bounded DNF: OR concatenates disjunct groups, AND takes
+// the cross-product of its operands' groups. ok is false if the group count would
+// exceed maxDNFGroups.
+func tryDNF(e ast.Expr) ([][]ast.Expr, bool) {
+	e = unparen(e)
+	if b, ok := e.(*ast.BinaryOp); ok {
+		switch b.Op {
+		case "||":
+			// An OR-of-equalities on one attribute is a single `in` probe -- keep it as
+			// a leaf rather than splitting it into a group per value.
+			if _, ok := orEqProbe(b); ok {
+				return [][]ast.Expr{{e}}, true
+			}
+			l, ok1 := tryDNF(b.Left)
+			r, ok2 := tryDNF(b.Right)
+			if !ok1 || !ok2 || len(l)+len(r) > maxDNFGroups {
+				return nil, false
+			}
+			return append(l, r...), true
+		case "&&":
+			l, ok1 := tryDNF(b.Left)
+			r, ok2 := tryDNF(b.Right)
+			if !ok1 || !ok2 || len(l)*len(r) > maxDNFGroups {
+				return nil, false
+			}
+			out := make([][]ast.Expr, 0, len(l)*len(r))
+			for _, ga := range l {
+				for _, gb := range r {
+					g := make([]ast.Expr, 0, len(ga)+len(gb))
+					g = append(g, ga...)
+					g = append(g, gb...)
+					out = append(out, g)
+				}
+			}
+			return out, true
+		}
+	}
+	return [][]ast.Expr{{e}}, true
 }
 
 // flattenAnd collects the top-level `&&` conjuncts of e (unwrapping parentheses).
@@ -80,19 +176,53 @@ var negFlip = map[string]string{
 // swapped (e.g. `5 < Memory` is `Memory > 5`).
 var operandFlip = map[string]string{
 	"==": "==", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<=",
+	"is": "is", "isnt": "isnt", // =?= / =!= are symmetric
 }
+
+// ProbeOf returns the index probe a single (already slot-rewritten) expression yields,
+// or ok=false if it is not a recognizable Attr-OP-literal / presence / OR-of-equalities.
+// Callers use it to tell an already-probeable leaf from an opaque one (e.g. before
+// finite-domain materialization).
+func ProbeOf(e ast.Expr) (Probe, bool) { return probeFrom(e) }
 
 // probeFrom classifies a single conjunct into a Probe.
 func probeFrom(c ast.Expr) (Probe, bool) {
 	c = unparen(c)
-	// !(comparison) -> flipped comparison (only a single comparison; no De Morgan).
+	// !X -> handle the negatable forms: a flipped comparison, a negated presence
+	// test (!(attr is undefined) is presence), or !isUndefined(attr) (presence).
 	if u, ok := c.(*ast.UnaryOp); ok && u.Op == "!" {
-		if b, ok := unparen(u.Expr).(*ast.BinaryOp); ok {
+		inner := unparen(u.Expr)
+		if fc, ok := inner.(*ast.FunctionCall); ok {
+			return undefinedFuncProbe(fc, true)
+		}
+		if b, ok := inner.(*ast.BinaryOp); ok {
 			if fl, ok := negFlip[b.Op]; ok {
 				return cmpProbe(fl, b.Left, b.Right)
 			}
+			if b.Op == "is" || b.Op == "isnt" {
+				if name, ok := refVsUndefined(b.Left, b.Right); ok {
+					if b.Op == "is" { // !(attr is undefined) -> present
+						return Probe{Attr: name, Op: "present"}, true
+					}
+					return Probe{Attr: name, Op: "absent"}, true // !(attr isnt undefined) -> absent
+				}
+			}
+		}
+		// !attr -> a falsy truthiness test on a bare attribute.
+		if name, ok := indexableRef(inner); ok {
+			return Probe{Attr: name, Op: "untruthy"}, true
 		}
 		return Probe{}, false
+	}
+	// isUndefined(attr) is a presence probe (matches when attr is absent/undefined).
+	if fc, ok := c.(*ast.FunctionCall); ok {
+		return undefinedFuncProbe(fc, false)
+	}
+	// A bare attribute reference (`HAS_CVMFS`) is a truthiness test. Only a categorical
+	// index can answer it soundly (its exception set catches non-boolean values, so the
+	// candidate set stays a superset the store re-verifies); catUsable maps it to == true.
+	if name, ok := indexableRef(c); ok {
+		return Probe{Attr: name, Op: "truthy"}, true
 	}
 	b, ok := c.(*ast.BinaryOp)
 	if !ok {
@@ -101,6 +231,26 @@ func probeFrom(c ast.Expr) (Probe, bool) {
 	switch b.Op {
 	case "==", "!=", "<", "<=", ">", ">=":
 		return cmpProbe(b.Op, b.Left, b.Right)
+	case "is":
+		// `attr =?= undefined` is a presence probe (matches when attr is absent /
+		// evaluates undefined); the index answers it from its posted set.
+		if name, ok := refVsUndefined(b.Left, b.Right); ok {
+			return Probe{Attr: name, Op: "absent"}, true
+		}
+		// `attr =?= literal` is exact (case-sensitive) identity: the "is" op reads the
+		// index's exact-case postings (categorical) or the value posting (numeric, a
+		// superset the store re-verifies).
+		return cmpProbe("is", b.Left, b.Right)
+	case "isnt":
+		// `attr =!= undefined` is a presence probe (matches when attr is defined).
+		if name, ok := refVsUndefined(b.Left, b.Right); ok {
+			return Probe{Attr: name, Op: "present"}, true
+		}
+		// `attr =!= literal` = everything but the exact-case matches. Indexable for
+		// categoricals via the exact-case postings (all-but-exact); for values it is
+		// dropped in valUsable (int/real type-strictness makes the folded != path drop
+		// records =!= should keep), falling back to a scan.
+		return cmpProbe("isnt", b.Left, b.Right)
 	case "||":
 		return orEqProbe(b)
 	}
@@ -155,6 +305,41 @@ func indexableRef(e ast.Expr) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// refVsUndefined recognizes `attr is/isnt undefined` in either operand order,
+// returning the self-scoped attribute name.
+func refVsUndefined(left, right ast.Expr) (string, bool) {
+	if isUndefinedLit(right) {
+		return indexableRef(left)
+	}
+	if isUndefinedLit(left) {
+		return indexableRef(right)
+	}
+	return "", false
+}
+
+func isUndefinedLit(e ast.Expr) bool {
+	_, ok := unparen(e).(*ast.UndefinedLiteral)
+	return ok
+}
+
+// undefinedFuncProbe classifies isUndefined(attr) as a presence probe: bare it is
+// "absent" (true when attr is undefined); negated (!isUndefined(attr)) it is
+// "present". Any other function is not an index probe.
+func undefinedFuncProbe(fc *ast.FunctionCall, negated bool) (Probe, bool) {
+	if !strings.EqualFold(fc.Name, "isUndefined") || len(fc.Args) != 1 {
+		return Probe{}, false
+	}
+	name, ok := indexableRef(fc.Args[0])
+	if !ok {
+		return Probe{}, false
+	}
+	op := "absent"
+	if negated {
+		op = "present"
+	}
+	return Probe{Attr: name, Op: op}, true
 }
 
 // literalVal converts a literal AST node to a classad.Value. Undefined/error

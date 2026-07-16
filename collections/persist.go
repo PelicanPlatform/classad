@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -164,13 +163,9 @@ func Open(opts Options) (*Collection, error) {
 	// below). Replace the interned spec New built with an inline one that extracts
 	// values by name (records carry no intern ids).
 	c.spec.Store(newInlineIndexSpec(opts.CategoricalAttrs, opts.ValueAttrs))
-	// Inline mode keys the hot header by (folded) name; carry the folded HotAttrs.
-	if len(opts.HotAttrs) > 0 {
-		c.hotNames = make(map[string]struct{}, len(opts.HotAttrs))
-		for _, name := range opts.HotAttrs {
-			c.hotNames[strings.ToLower(name)] = struct{}{}
-		}
-	}
+	// Inline mode keys the hot header by (folded) name; install the configured HotAttrs
+	// plus the always-hot defaults (Requirements, Rank) in inline form.
+	c.installHotNames(opts.HotAttrs)
 	// Load any dictionaries trained in a prior lifetime (before recovering segments,
 	// which are decoded with the codec they name) and point the registry at the dicts
 	// directory for future RetrainDict writes. New writes use the most recent

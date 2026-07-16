@@ -45,6 +45,51 @@ type indexSpec struct {
 	nextID   uint32            // next synthetic id to assign (inline only)
 	names    map[uint32]string // id -> attribute name (inline only)
 	nameToID map[string]uint32 // folded name -> id (inline only)
+
+	// auto marks indexes created by the auto-tuner (AutoTune) rather than by a human
+	// (Options at New, or an explicit AddIndex). The memory-budget trimmer only ever
+	// drops auto indexes, so a human-created index is never removed automatically.
+	auto map[uint32]struct{}
+}
+
+// isAuto reports whether the index on id was created by the auto-tuner.
+func (s *indexSpec) isAuto(id uint32) bool {
+	if s == nil || s.auto == nil {
+		return false
+	}
+	_, ok := s.auto[id]
+	return ok
+}
+
+func (s *indexSpec) catHas(id uint32) bool { _, ok := s.cat[id]; return ok }
+func (s *indexSpec) valHas(id uint32) bool { _, ok := s.val[id]; return ok }
+
+// isAutoName reports whether the index on the named attribute is auto-created, resolving
+// the name to an id in either index mode (inline by folded name, interned by id).
+func (s *indexSpec) isAutoName(c *Collection, name string) bool {
+	fold := strings.ToLower(name)
+	var id uint32
+	var ok bool
+	if s.inline {
+		id, ok = s.nameToID[fold]
+	} else {
+		id, ok = c.intern.LookupID(fold)
+	}
+	return ok && s.isAuto(id)
+}
+
+// equalAuto reports whether two specs mark the same ids auto, so an add/drop that only
+// touches provenance is still detected as a change.
+func (s *indexSpec) equalAuto(o *indexSpec) bool {
+	if len(s.auto) != len(o.auto) {
+		return false
+	}
+	for id := range s.auto {
+		if _, ok := o.auto[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // inlineID returns the synthetic id for name, assigning a fresh one on first use.
@@ -108,6 +153,12 @@ func (s *indexSpec) clone() *indexSpec {
 	}
 	for id := range s.val {
 		n.val[id] = struct{}{}
+	}
+	if s.auto != nil {
+		n.auto = make(map[uint32]struct{}, len(s.auto))
+		for id := range s.auto {
+			n.auto[id] = struct{}{}
+		}
 	}
 	if s.inline {
 		n.names = make(map[uint32]string, len(s.names))
@@ -176,12 +227,28 @@ func (s *indexSpec) equalIDs(o *indexSpec) bool {
 // (within one segment) that hold it, plus an exceptions bitmap for records whose
 // value is present but not the expected literal type.
 type catPostings struct {
-	post map[string]*roaring.Bitmap
-	exc  *roaring.Bitmap
+	post map[string]*roaring.Bitmap // folded (lower-cased) value -> offsets; serves ==/!=/in
+	// exact / exactCase together answer =?= and =!= (case-sensitive) without doubling
+	// memory in the common case. exactCase maps a folded key to its single exact-case
+	// spelling for a *case-uniform* bucket (all its records share one spelling); the
+	// empty string marks "spelling == folded key" (already lower-case), so post's bitmap
+	// is reused directly. A folded key absent from exactCase is a multi-variant bucket,
+	// and exact holds a per-exact-spelling bitmap for it. So exact is populated only for
+	// the rare buckets that mix case; case-uniform buckets store just a small string.
+	exact     map[string]*roaring.Bitmap
+	exactCase map[string]string
+	exc       *roaring.Bitmap
+	posted    *roaring.Bitmap // records that posted a literal value (for presence probes)
+	stats     segStats        // filled by finishStats after all records are indexed
 }
 type valPostings struct {
 	post map[float64]*roaring.Bitmap
-	exc  *roaring.Bitmap
+	// sortedKeys is post's keys in ascending order (filled by finishStats), so a range
+	// probe boundary-searches to the matching run instead of scanning every key.
+	sortedKeys []float64
+	exc        *roaring.Bitmap
+	posted     *roaring.Bitmap // records that posted a literal value (for presence probes)
+	stats      segStats        // filled by finishStats after all records are indexed
 }
 
 // segIndex is one segment's immutable index. It covers records at offsets in
@@ -209,10 +276,15 @@ func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segInde
 		val:     make(map[uint32]*valPostings, len(spec.valIDs)),
 	}
 	for _, id := range spec.catIDs {
-		si.cat[id] = &catPostings{post: map[string]*roaring.Bitmap{}, exc: roaring.New()}
+		si.cat[id] = &catPostings{
+			post:   map[string]*roaring.Bitmap{},
+			exact:  map[string]*roaring.Bitmap{},
+			exc:    roaring.New(),
+			posted: roaring.New(),
+		}
 	}
 	for _, id := range spec.valIDs {
-		si.val[id] = &valPostings{post: map[float64]*roaring.Bitmap{}, exc: roaring.New()}
+		si.val[id] = &valPostings{post: map[float64]*roaring.Bitmap{}, exc: roaring.New(), posted: roaring.New()}
 	}
 	var buf []byte
 	for off := 0; off < upto; {
@@ -228,6 +300,15 @@ func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segInde
 		}
 		off += int(total)
 	}
+	// Summarize each attribute's completed postings for segment-skip and
+	// selectivity ordering (see segstats.go). One pass over the distinct values.
+	for _, cp := range si.cat {
+		cp.finalizeExact()
+		cp.finishStats()
+	}
+	for _, vp := range si.val {
+		vp.finishStats()
+	}
 	return si
 }
 
@@ -241,8 +322,24 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 			continue // absent
 		}
 		if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitString {
-			// ClassAd string == is case-insensitive; index under a folded key.
+			// ClassAd string == is case-insensitive; index under a folded key for
+			// ==/!=/in, and also under the exact spelling for =?=/=!= (finalizeExact
+			// later drops the exact bitmap wherever a bucket turns out case-uniform).
 			addOffset(cp.post, strings.ToLower(lit.Str), o)
+			addOffset(cp.exact, lit.Str, o)
+			cp.posted.Add(o)
+		} else if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitBool {
+			// Boolean capability flags (HasFileTransfer, HasSingularity, ...) are commonly
+			// indexed categorically; post them under their canonical "true"/"false" key so
+			// `attr == true` and truthiness-selectivity estimates resolve from the index
+			// instead of falling into the (unindexed) exception set.
+			s := "false"
+			if lit.Bool {
+				s = "true"
+			}
+			addOffset(cp.post, s, o)
+			addOffset(cp.exact, s, o)
+			cp.posted.Add(o)
 		} else {
 			cp.exc.Add(o)
 		}
@@ -257,14 +354,17 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 			switch lit.Kind {
 			case wire.LitInt:
 				addOffset(vp.post, float64(lit.Int), o)
+				vp.posted.Add(o)
 			case wire.LitReal:
 				addOffset(vp.post, lit.Real, o)
+				vp.posted.Add(o)
 			case wire.LitBool:
 				f := 0.0
 				if lit.Bool {
 					f = 1
 				}
 				addOffset(vp.post, f, o)
+				vp.posted.Add(o)
 			default: // string / undefined / error literal
 				vp.exc.Add(o)
 			}
@@ -272,6 +372,54 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 			vp.exc.Add(o) // list / record / computed expression
 		}
 	}
+}
+
+// finalizeExact collapses case-uniform buckets: for every folded key whose records
+// all share one exact spelling, it records that spelling in exactCase (empty when it
+// equals the folded key) and drops the now-redundant exact bitmap, so exact retains
+// only genuinely mixed-case buckets. The common all-lower-case index ends with an
+// empty exact map and a small exactCase of empty strings.
+func (cp *catPostings) finalizeExact() {
+	cp.exactCase = make(map[string]string, len(cp.post))
+	byFold := make(map[string][]string, len(cp.exact))
+	for e := range cp.exact {
+		f := strings.ToLower(e)
+		byFold[f] = append(byFold[f], e)
+	}
+	for f, es := range byFold {
+		if len(es) != 1 {
+			continue // mixed case: keep per-spelling bitmaps in exact
+		}
+		e := es[0]
+		if e == f {
+			cp.exactCase[f] = "" // already lower-case: reuse post[f]
+		} else {
+			cp.exactCase[f] = e
+		}
+		delete(cp.exact, e)
+	}
+}
+
+// exactBitmap returns the offsets of records whose categorical value is exactly key
+// (case-sensitive), or nil if none. It reuses the folded bitmap for case-uniform
+// buckets and consults exact only for mixed-case ones.
+func (cp *catPostings) exactBitmap(key string) *roaring.Bitmap {
+	f := strings.ToLower(key)
+	fb := cp.post[f]
+	if fb == nil {
+		return nil // no record has this value under any casing
+	}
+	if ec, ok := cp.exactCase[f]; ok {
+		canon := f
+		if ec != "" {
+			canon = ec
+		}
+		if canon == key {
+			return fb
+		}
+		return nil // records exist, but spelled with a different case
+	}
+	return cp.exact[key] // mixed-case bucket; nil if this exact spelling is absent
 }
 
 func addOffset[K comparable](m map[K]*roaring.Bitmap, k K, o uint32) {

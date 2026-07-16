@@ -1094,6 +1094,25 @@ func quantizeScalar(arg Value, rval float64, base Value) Value {
 	return NewRealValue(math.Ceil(rval/rbase) * rbase)
 }
 
+// Sum, Avg, Min, and Max apply HTCondor's ClassAd list-aggregate coercion rules
+// (the sum()/avg()/min()/max() built-ins) to a slice of values: integers stay
+// exact int64 and coerce to real only when a real value is present, booleans
+// coerce to 0/1, undefined elements are skipped, and any error element makes the
+// result an error. min/max are numeric (a string element is an error). An empty
+// or all-undefined list sums/averages to integer 0; min/max of one is undefined.
+// These let callers outside the expression evaluator (e.g. a GROUP BY engine)
+// aggregate with identical semantics.
+func Sum(values []Value) Value { return builtinSum([]Value{NewListValue(values)}) }
+
+// Avg averages values under the ClassAd coercion rules (see Sum).
+func Avg(values []Value) Value { return builtinAvg([]Value{NewListValue(values)}) }
+
+// Min returns the numeric minimum under the ClassAd coercion rules (see Sum).
+func Min(values []Value) Value { return builtinMin([]Value{NewListValue(values)}) }
+
+// Max returns the numeric maximum under the ClassAd coercion rules (see Sum).
+func Max(values []Value) Value { return builtinMax([]Value{NewListValue(values)}) }
+
 // builtinSum sums numeric values in a list
 func builtinSum(args []Value) Value {
 	if len(args) > 1 {
@@ -1785,6 +1804,30 @@ func builtinVersionInRange(args []Value) Value {
 	}
 	inRange := versionCompare(minStr, version) <= 0 && versionCompare(version, maxStr) <= 0
 	return NewBoolValue(inRange)
+}
+
+// builtinVersionRelational implements the versionGE/GT/LE/LT/EQ family: it version-
+// compares the two arguments and applies `keep` to the sign of the comparison,
+// returning a boolean. Undefined/error handling mirrors versioncmp (undefined
+// dominates: an undefined argument is undefined; otherwise an error argument, or a
+// non-coercible one, is an error), so `versionGE(x, "25.0")` on a machine missing
+// the attribute is undefined (excluded from a WHERE), not a false match.
+func builtinVersionRelational(args []Value, keep func(cmp int) bool) Value {
+	if len(args) != 2 {
+		return NewErrorValue()
+	}
+	if args[0].IsUndefined() || args[1].IsUndefined() {
+		return NewUndefinedValue()
+	}
+	if args[0].IsError() || args[1].IsError() {
+		return NewErrorValue()
+	}
+	left, ok0 := classadString(args[0])
+	right, ok1 := classadString(args[1])
+	if !ok0 || !ok1 {
+		return NewErrorValue()
+	}
+	return NewBoolValue(keep(versionCompare(left, right)))
 }
 
 // builtinFormatTime formats a Unix timestamp

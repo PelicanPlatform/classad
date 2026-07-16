@@ -158,6 +158,120 @@ func (a Ad) ForEach(fn func(id uint32, node []byte) bool) bool {
 	return c.ok
 }
 
+// ForEachNamed calls fn with each attribute's name and raw node bytes. Inline-name
+// ads (flagInlineNames, written by a persistent collection) yield their stored names
+// directly; interned ads resolve each id to a name via t (an id t cannot resolve is
+// skipped). Unlike ForEach -- which always reads the key as an interned id and so is
+// wrong for inline ads -- this works for both encodings. Returns false if fn stopped
+// early or the ad is malformed.
+func (a Ad) ForEachNamed(t *InternTable, fn func(name string, node []byte) bool) bool {
+	c, ok := a.bodyStart()
+	if !ok {
+		return false
+	}
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	attrCount := c.uvarint()
+	for i := uint64(0); i < attrCount && c.ok; i++ {
+		var name string
+		if c.inline {
+			nm := c.readNameBytes()
+			if !c.ok {
+				return false
+			}
+			name = string(nm)
+		} else {
+			aid := c.uvarint()
+			if !c.ok {
+				return false
+			}
+			n, ok := t.Name(uint32(aid))
+			if !ok {
+				skipNode(c, 0) // unresolved id: skip its node and continue
+				continue
+			}
+			name = n
+		}
+		nodeStart := c.pos
+		skipNode(c, 0)
+		if !c.ok {
+			return false
+		}
+		if !fn(name, a[nodeStart:c.pos]) {
+			return true
+		}
+	}
+	return c.ok
+}
+
+// HotClosureComplete reports whether the ad's hot header holds the complete match
+// closure (flagHotClosure): ForEachHot then yields every attribute the match reads,
+// so the matcher can trust it without scanning the ad body.
+func (a Ad) HotClosureComplete() bool {
+	return len(a) >= 3 && a[0] == magicByte && a[1] == formatVer && a[2]&flagHotClosure != 0
+}
+
+// AttrCount returns the number of attributes stored in the ad (0 if malformed). It
+// reads only the header (past the hot index), so it is cheap enough to gate width-
+// dependent decode strategies.
+func (a Ad) AttrCount() int {
+	c, ok := a.bodyStart()
+	if !ok {
+		return 0
+	}
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	n := c.uvarint()
+	if !c.ok {
+		return 0
+	}
+	return int(n)
+}
+
+// ForEachHot calls fn with the interned id and raw node bytes of each attribute
+// recorded in the hot header, in header order, resolving each via its stored
+// entries-relative offset (no scan). Returns false if fn stopped early or the ad is
+// malformed. Cost is O(hotCount), independent of the total attribute count -- so a
+// collection whose hot set is the match closure can read exactly the match-relevant
+// attributes of a very wide ad without touching the cold ones.
+func (a Ad) ForEachHot(fn func(id uint32, node []byte) bool) bool {
+	c, ok := a.bodyStart()
+	if !ok {
+		return false
+	}
+	hotCount := c.uvarint()
+	if hotCount == 0 {
+		return c.ok
+	}
+	ids := make([]uint32, hotCount)
+	offs := make([]uint32, hotCount)
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		ids[i] = uint32(c.uvarint())
+		offs[i] = uint32(c.uvarint())
+	}
+	c.uvarint() // attrCount
+	if !c.ok {
+		return false
+	}
+	entriesStart := c.pos
+	for i := range ids {
+		node, ok := nodeBytesAt(a, entriesStart+int(offs[i]))
+		if !ok {
+			return false
+		}
+		if !fn(ids[i], node) {
+			return true
+		}
+	}
+	return true
+}
+
 // nodeBytesAt returns the node bytes starting at absolute offset off.
 func nodeBytesAt(a Ad, off int) ([]byte, bool) {
 	if off < 0 || off > len(a) {
