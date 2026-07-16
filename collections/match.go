@@ -184,14 +184,15 @@ func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []ranke
 // matching actually reads (and re-checks) are front-loaded, not every attribute an ad
 // happens to carry.
 func (c *Collection) recordMatchReads(job *classad.ClassAd, jp *jobPlan) {
-	var reads []string
+	// The bilateral match evaluates the slot's own Requirements (and Rank), so those
+	// attributes are read on every match -- along with the slot attributes the job's
+	// Requirements and Rank reference.
+	reads := []string{"Requirements", "Rank"}
 	if reqExpr := jobRequirementsExpr(job); reqExpr != nil {
-		reads = vm.SelfRefs(rewriteForSlot(reqExpr, jp.vals, nil, false))
+		reads = append(reads, vm.SelfRefs(rewriteForSlot(reqExpr, jp.vals, nil, false))...)
 	}
 	reads = append(reads, jp.rankRefs...)
-	if len(reads) > 0 {
-		c.demand.recordReads(reads)
-	}
+	c.demand.recordReads(reads)
 }
 
 // serialScanMatches matches over Scan (the chained/structural-aware read view).

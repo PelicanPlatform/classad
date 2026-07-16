@@ -28,9 +28,10 @@ func (c *Collection) RefreshHotSet(sampleMax, topN int) int {
 	//
 	// Names come via ForEachNamed (both encodings: interned ids in RAM, inline names when
 	// persistent) -- the old id-based ForEach counted nothing on a persistent collection.
+	samples := c.CollectSamples(sampleMax)
 	presence := make(map[string]int)
 	display := make(map[string]string) // folded -> first-seen spelling
-	for _, w := range c.CollectSamples(sampleMax) {
+	for _, w := range samples {
 		wire.Ad(w).ForEachNamed(c.intern, func(name string, _ []byte) bool {
 			fold := strings.ToLower(name)
 			presence[fold]++
@@ -82,13 +83,80 @@ func (c *Collection) RefreshHotSet(sampleMax, topN int) int {
 	for i, f := range folded[:limit] {
 		chosen[i] = display[f]
 	}
+	// Close the hot set under references: every attribute a hot attribute's expression
+	// reads (and the always-hot Requirements/Rank's) is front-loaded too, so a match/query
+	// that touches a hot attribute finds its whole dependency chain in the hot header.
+	roots := ensureHotDefaults(append([]string(nil), chosen...))
+	chosen = c.closeHotSet(samples, roots, display)
 	c.installHotNames(chosen)
-	return limit
+	return len(chosen)
 }
 
-// installHotNames sets the hot attribute set from names, in the form the collection's
-// encoder reads: folded name set (inline/persistent) or interned id set (RAM).
+// closeHotSet returns roots plus the transitive reference closure of roots computed over
+// a bounded sample of ads (their expressions' self-references), in original-case display
+// spelling. It lets the hot set carry not just the queried attributes but everything they
+// depend on.
+func (c *Collection) closeHotSet(samples [][]byte, roots []string, display map[string]string) []string {
+	const maxClosureAds = 256
+	folded := make(map[string]bool, len(roots))
+	spell := make(map[string]string, len(roots)) // folded -> preferred spelling (roots keep their own)
+	for _, r := range roots {
+		f := strings.ToLower(r)
+		folded[f] = true
+		spell[f] = r
+	}
+	for i, w := range samples {
+		if i >= maxClosureAds {
+			break
+		}
+		ad, err := c.decodeWire(w)
+		if err != nil {
+			continue
+		}
+		names, _ := astClosure(ad, roots)
+		for _, n := range names {
+			folded[n] = true
+		}
+	}
+	out := make([]string, 0, len(folded))
+	for f := range folded {
+		switch {
+		case spell[f] != "":
+			out = append(out, spell[f]) // a root: keep its canonical spelling
+		case display[f] != "":
+			out = append(out, display[f])
+		default:
+			out = append(out, f)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hotDefaults are attributes the match path always reads (a bilateral match evaluates
+// both ads' Requirements and Rank), so they are kept hot regardless of sampled frequency.
+var hotDefaults = []string{"Requirements", "Rank"}
+
+// ensureHotDefaults appends the always-hot attributes (Requirements, Rank) to names if
+// absent (case-insensitive), so every installed hot set front-loads them.
+func ensureHotDefaults(names []string) []string {
+	have := make(map[string]bool, len(names))
+	for _, n := range names {
+		have[strings.ToLower(n)] = true
+	}
+	for _, d := range hotDefaults {
+		if !have[strings.ToLower(d)] {
+			names = append(names, d)
+		}
+	}
+	return names
+}
+
+// installHotNames sets the hot attribute set from names (always including the hot
+// defaults), in the form the collection's encoder reads: folded name set (inline/
+// persistent) or interned id set (RAM).
 func (c *Collection) installHotNames(names []string) {
+	names = ensureHotDefaults(names)
 	if c.inline {
 		c.hotNames.Store(newHotNamesHolder(names))
 		return
@@ -107,22 +175,19 @@ func (c *Collection) installHotNames(names []string) {
 // RAM (interned) and persistent (inline) modes.
 func (c *Collection) AddHotAttrs(names ...string) []string {
 	if c.inline {
-		merged := append([]string(nil), c.currentHotDisplay()...)
-		merged = append(merged, names...)
-		c.hotNames.Store(newHotNamesHolder(merged))
+		c.installHotNames(append(c.currentHotDisplay(), names...))
 		return c.HotAttrNames()
 	}
 	if c.intern == nil {
 		return c.HotAttrNames()
 	}
-	set := make(map[uint32]struct{}, len(c.currentHotSet())+len(names))
+	cur := make([]string, 0, len(c.currentHotSet()))
 	for id := range c.currentHotSet() {
-		set[id] = struct{}{}
+		if n, ok := c.intern.Name(id); ok {
+			cur = append(cur, n)
+		}
 	}
-	for _, n := range names {
-		set[c.intern.Intern(n)] = struct{}{}
-	}
-	c.hotSet.Store(&hotSetHolder{set})
+	c.installHotNames(append(cur, names...))
 	return c.HotAttrNames()
 }
 

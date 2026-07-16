@@ -51,8 +51,9 @@ func TestRefreshHotSet(t *testing.T) {
 	t.Parallel()
 	sample := loadCorpus(t)
 	c := populate(t, sample, 5000)
-	if len(c.HotAttrNames()) != 0 {
-		t.Fatalf("expected empty hot set initially, got %v", c.HotAttrNames())
+	// The match-critical defaults (Requirements, Rank) are always hot, even initially.
+	if got := c.HotAttrNames(); len(got) != 2 {
+		t.Fatalf("expected the Requirements/Rank defaults initially, got %v", got)
 	}
 	n := c.RefreshHotSet(2000, 10)
 	if n == 0 {

@@ -29,15 +29,15 @@ func TestRefreshHotSetInline(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if got := c.HotAttrNames(); len(got) != 0 {
-		t.Fatalf("expected no hot attrs initially, got %v", got)
+	if got := c.HotAttrNames(); !contains(got, "Requirements") || !contains(got, "Rank") {
+		t.Fatalf("expected Requirements/Rank hot initially, got %v", got)
 	}
-	if n := c.RefreshHotSet(800, 3); n != 3 {
-		t.Fatalf("RefreshHotSet chose %d attrs, want 3 (it was a no-op on inline before the fix)", n)
+	if n := c.RefreshHotSet(800, 3); n == 0 {
+		t.Fatalf("RefreshHotSet was a no-op on inline (the bug); chose 0")
 	}
 	hot := c.HotAttrNames()
-	if len(hot) != 3 {
-		t.Fatalf("hot attrs = %v, want 3", hot)
+	if !contains(hot, "Requirements") || !contains(hot, "Rank") {
+		t.Fatalf("hot attrs must include the defaults, got %v", hot)
 	}
 	// AddHotAttrs also works in inline mode (merges).
 	c.AddHotAttrs("customattr")
@@ -64,16 +64,15 @@ func TestRefreshHotSetRanksByAccess(t *testing.T) {
 	for i := 0; i < 30; i++ {
 		_, _ = c.MatchSortedRankedFiltered(job, "", 0)
 	}
-	n := c.RefreshHotSet(1500, 32) // topN 32 but only 3 attrs are read
-	if n != 3 {
-		t.Fatalf("chose %d hot attrs, want 3 (only Memory/Arch/State are read)", n)
-	}
+	c.RefreshHotSet(1500, 32) // topN 32 but only Memory/Arch/State (+ the defaults) are read
 	hot := c.HotAttrNames()
-	for _, want := range []string{"Arch", "Memory", "State"} {
+	// The read attributes and the always-hot Requirements/Rank defaults are present...
+	for _, want := range []string{"Arch", "Memory", "State", "Requirements", "Rank"} {
 		if !contains(hot, want) {
-			t.Errorf("hot set %v missing read attribute %s", hot, want)
+			t.Errorf("hot set %v missing expected attribute %s", hot, want)
 		}
 	}
+	// ...but never-read, never-referenced attributes are not (no presence padding).
 	for _, notWant := range []string{"Aardvark", "Beetle", "Cat"} {
 		if contains(hot, notWant) {
 			t.Errorf("hot set %v includes never-read attribute %s (presence padding)", hot, notWant)

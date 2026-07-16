@@ -323,13 +323,9 @@ func New(opts Options) *Collection {
 	}
 	c.codec.Store(&codecHolder{codec})
 	c.dicts = newDictReg(codec) // base codec is dictionary id 0
-	if len(opts.HotAttrs) > 0 {
-		set := make(map[uint32]struct{}, len(opts.HotAttrs))
-		for _, name := range opts.HotAttrs {
-			set[c.intern.Intern(name)] = struct{}{}
-		}
-		c.hotSet.Store(&hotSetHolder{set})
-	}
+	// Always front-load the configured hot attributes plus the match-critical defaults
+	// (Requirements, Rank). A persistent collection re-installs these inline in Open.
+	c.installHotNames(opts.HotAttrs)
 	for _, r := range opts.MatchClosureRoots {
 		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
