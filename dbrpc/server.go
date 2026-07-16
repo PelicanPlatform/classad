@@ -1,7 +1,6 @@
 package dbrpc
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -108,7 +107,7 @@ type ServeOptions struct {
 // read-only connection).
 func (o op) isMutating() bool {
 	switch o {
-	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable, opRestore:
+	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable:
 		return true
 	}
 	return false
@@ -208,10 +207,21 @@ func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 	for {
 		frame, err := conn.ReadMsg()
 		if err != nil {
+			sc.abortRestore()
 			return err
+		}
+		// Restore-upload frames are handled inline (synchronously) so their chunks are
+		// spooled in receive order; every other op dispatches concurrently.
+		if reqID, o, body, ok := reqHeader(frame); ok && isRestoreOp(o) {
+			sc.handleRestore(reqID, o, body)
+			continue
 		}
 		go sc.dispatch(frame)
 	}
+}
+
+func isRestoreOp(o op) bool {
+	return o == opRestore || o == opRestoreChunk || o == opRestoreEnd
 }
 
 // serverConn is per-connection state: the serialized writer, a context cancelled when
@@ -225,6 +235,11 @@ type serverConn struct {
 
 	wmu     sync.Mutex
 	watches map[uint64]context.CancelFunc
+
+	// restore is the in-progress restore upload for this connection (at most one), spooled
+	// to a temp file. Only touched from the single read-loop goroutine (restore frames are
+	// handled inline), so it needs no lock. See snapshot.go.
+	restore *restoreUpload
 }
 
 func (sc *serverConn) dispatch(frame []byte) {
@@ -250,6 +265,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamMatchTables(sc.ctx, reqID, body, sc.write)
 	case opWatch:
 		sc.streamWatch(reqID, body)
+	case opSnapshot:
+		sc.streamSnapshot(reqID, body)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
@@ -638,44 +655,6 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 			return respErr(reqID, err.Error())
 		}
 		return putStr(resp(reqID, stOK), msg)
-
-	case opSnapshot:
-		// DAEMON-only: a snapshot carries every attribute, including private ones.
-		if !privileged {
-			return respErr(reqID, "snapshot requires DAEMON authorization")
-		}
-		table := r.str()
-		if r.err != nil {
-			return respBad(reqID)
-		}
-		d, ok := s.cat.Table(table)
-		if !ok {
-			return respErr(reqID, "no such table: "+table)
-		}
-		var buf bytes.Buffer
-		if err := d.Snapshot(&buf); err != nil {
-			return respErr(reqID, err.Error())
-		}
-		return putBytes(resp(reqID, stOK), buf.Bytes())
-
-	case opRestore:
-		// DAEMON-only: destructive whole-DB replacement under the DB-wide lock.
-		if !privileged {
-			return respErr(reqID, "restore requires DAEMON authorization")
-		}
-		table := r.str()
-		snap := r.bytesRef()
-		if r.err != nil {
-			return respBad(reqID)
-		}
-		d, ok := s.cat.Table(table)
-		if !ok {
-			return respErr(reqID, "no such table: "+table)
-		}
-		if err := d.Restore(bytes.NewReader(snap)); err != nil {
-			return respErr(reqID, err.Error())
-		}
-		return resp(reqID, stOK)
 	}
 	return respBad(reqID)
 }

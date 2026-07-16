@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strconv"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -311,46 +310,6 @@ func (c *Client) BackupKeyTable(table string) ([]byte, error) {
 func (c *Client) TruncateTable(table string) (string, error) {
 	return c.AdminTable(table, "truncate")
 }
-
-// SnapshotTable writes a consistent backup of the named table to w. DAEMON-level: a
-// snapshot carries every attribute, including private ones. The whole backup transfers
-// as one message, so it is buffered in memory on both ends.
-func (c *Client) SnapshotTable(table string, w io.Writer) error {
-	status, body, err := c.call(func(id uint64) []byte {
-		return putStr(req(id, opSnapshot), table)
-	})
-	if err != nil {
-		return err
-	}
-	if status != stOK {
-		return statusErr(status, body)
-	}
-	_, err = w.Write(body.bytesRef())
-	return err
-}
-
-// RestoreTable replaces the named table with the snapshot read from r. DAEMON-level and
-// destructive: it truncates then reloads under the DB-wide lock.
-func (c *Client) RestoreTable(table string, r io.Reader) error {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return err
-	}
-	status, body, err := c.call(func(id uint64) []byte {
-		return putBytes(putStr(req(id, opRestore), table), data)
-	})
-	if err != nil {
-		return err
-	}
-	if status != stOK {
-		return statusErr(status, body)
-	}
-	return nil
-}
-
-// Snapshot / Restore operate on the default table.
-func (c *Client) Snapshot(w io.Writer) error { return c.SnapshotTable(DefaultTable, w) }
-func (c *Client) Restore(r io.Reader) error  { return c.RestoreTable(DefaultTable, r) }
 
 // --- table catalog ---
 

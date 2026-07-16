@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"bytes"
+	"fmt"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -129,6 +130,48 @@ func TestSnapshotRestoreOverRPC(t *testing.T) {
 	}
 	if err := c2.Restore(bytes.NewReader(snap.Bytes())); err == nil {
 		t.Error("restore should be refused without DAEMON privilege")
+	}
+}
+
+// TestSnapshotRestoreStreamingLarge round-trips a dataset large enough to span many
+// 64 KiB stream chunks, exercising the chunked snapshot (out) and restore (in) paths.
+func TestSnapshotRestoreStreamingLarge(t *testing.T) {
+	c, d, cleanup := encServerPair(t, ServeOptions{Privileged: true})
+	defer cleanup()
+	const n = 8000
+	tx := d.Begin()
+	for i := 0; i < n; i++ {
+		tx.NewClassAd(fmt.Sprintf("k%d", i), mustAd(t, fmt.Sprintf("Owner = \"user%d\"\nCpus = %d\nClaimId = \"sekret-%d\"", i%16, i%64, i)))
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	var snap bytes.Buffer
+	if err := c.Snapshot(&snap); err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if snap.Len() < 64*1024 {
+		t.Fatalf("snapshot is %d bytes -- expected multiple chunks (>64 KiB)", snap.Len())
+	}
+	if _, err := c.TruncateTable("ads"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Restore(bytes.NewReader(snap.Bytes())); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if d.Len() != n {
+		t.Fatalf("after restore Len = %d, want %d", d.Len(), n)
+	}
+	// Spot-check a few ads survived intact, including the private attribute.
+	for _, i := range []int{0, 1234, n - 1} {
+		ad, ok := d.LookupClassAd(fmt.Sprintf("k%d", i))
+		if !ok {
+			t.Fatalf("k%d missing", i)
+		}
+		if v, _ := ad.EvaluateAttrString("ClaimId"); v != fmt.Sprintf("sekret-%d", i) {
+			t.Fatalf("k%d ClaimId = %q", i, v)
+		}
 	}
 }
 

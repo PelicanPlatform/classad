@@ -61,13 +61,15 @@ const (
 	// resource-side filter targetWhere (WHERE TARGET / NOPREEMPT) melded into the plan.
 	opMatchExplain op = 23
 
-	// Snapshot / restore, DAEMON-only (see diag.go / db.Snapshot). Single-frame: the
-	// whole backup is one message payload, so a very large DB is buffered in memory
-	// during transfer -- acceptable for a rare administrative operation, and simpler than
-	// a chunked stream (inbound frames are dispatched concurrently, so an ordered upload
-	// stream would need extra sequencing).
-	opSnapshot op = 24 // [table] -> [snapshot bytes]
-	opRestore  op = 25 // [table][snapshot bytes] -> status; mutating
+	// Snapshot / restore, DAEMON-only (see db.Snapshot). Chunked so an arbitrarily large
+	// database never buffers whole in memory. Snapshot streams out (stStream frames, like
+	// a query); restore streams in as a sequence of chunk frames under one reqID, which
+	// the server spools to a temp file (in receive order -- handled inline in the read
+	// loop, not the concurrent dispatch path) and then restores from.
+	opSnapshot     op = 24 // [table] -> stream of [chunk] (stStream) then stStreamEnd
+	opRestore      op = 25 // [table] -> begins a chunked restore upload on this reqID
+	opRestoreChunk op = 26 // [chunk] appended to the active restore
+	opRestoreEnd   op = 27 // ends the upload; server restores from the spooled file, then replies
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
