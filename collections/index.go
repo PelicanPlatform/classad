@@ -45,6 +45,51 @@ type indexSpec struct {
 	nextID   uint32            // next synthetic id to assign (inline only)
 	names    map[uint32]string // id -> attribute name (inline only)
 	nameToID map[string]uint32 // folded name -> id (inline only)
+
+	// auto marks indexes created by the auto-tuner (AutoTune) rather than by a human
+	// (Options at New, or an explicit AddIndex). The memory-budget trimmer only ever
+	// drops auto indexes, so a human-created index is never removed automatically.
+	auto map[uint32]struct{}
+}
+
+// isAuto reports whether the index on id was created by the auto-tuner.
+func (s *indexSpec) isAuto(id uint32) bool {
+	if s == nil || s.auto == nil {
+		return false
+	}
+	_, ok := s.auto[id]
+	return ok
+}
+
+func (s *indexSpec) catHas(id uint32) bool { _, ok := s.cat[id]; return ok }
+func (s *indexSpec) valHas(id uint32) bool { _, ok := s.val[id]; return ok }
+
+// isAutoName reports whether the index on the named attribute is auto-created, resolving
+// the name to an id in either index mode (inline by folded name, interned by id).
+func (s *indexSpec) isAutoName(c *Collection, name string) bool {
+	fold := strings.ToLower(name)
+	var id uint32
+	var ok bool
+	if s.inline {
+		id, ok = s.nameToID[fold]
+	} else {
+		id, ok = c.intern.LookupID(fold)
+	}
+	return ok && s.isAuto(id)
+}
+
+// equalAuto reports whether two specs mark the same ids auto, so an add/drop that only
+// touches provenance is still detected as a change.
+func (s *indexSpec) equalAuto(o *indexSpec) bool {
+	if len(s.auto) != len(o.auto) {
+		return false
+	}
+	for id := range s.auto {
+		if _, ok := o.auto[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // inlineID returns the synthetic id for name, assigning a fresh one on first use.
@@ -108,6 +153,12 @@ func (s *indexSpec) clone() *indexSpec {
 	}
 	for id := range s.val {
 		n.val[id] = struct{}{}
+	}
+	if s.auto != nil {
+		n.auto = make(map[uint32]struct{}, len(s.auto))
+		for id := range s.auto {
+			n.auto[id] = struct{}{}
+		}
 	}
 	if s.inline {
 		n.names = make(map[uint32]string, len(s.names))

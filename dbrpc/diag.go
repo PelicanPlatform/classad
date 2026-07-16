@@ -16,6 +16,7 @@ type Diagnostics struct {
 	Hot                []string             `json:"hot"`
 	CategoricalIndexes []string             `json:"categoricalIndexes"`
 	ValueIndexes       []string             `json:"valueIndexes"`
+	IndexSizes         db.IndexSizes        `json:"indexSizes"`
 	Suggestions        []db.IndexSuggestion `json:"suggestions"`
 	DropSuggestions    []db.DropSuggestion  `json:"dropSuggestions"`
 }
@@ -31,6 +32,7 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		Hot:                t.HotAttrs(),
 		CategoricalIndexes: cat,
 		ValueIndexes:       val,
+		IndexSizes:         t.IndexSizes(),
 		Suggestions:        t.SuggestIndexes(diagSampleMax),
 		DropSuggestions:    t.SuggestDrops(diagSampleMax),
 	}

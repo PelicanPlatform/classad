@@ -162,9 +162,15 @@ type (
 	Stats           = collections.Stats
 	IndexSuggestion = collections.IndexSuggestion
 	DropSuggestion  = collections.DropSuggestion
+	IndexSizes      = collections.IndexSizes
+	IndexSize       = collections.IndexSize
 	QueryExplain    = collections.QueryExplain
 	MatchExplain    = collections.MatchExplain
 )
+
+// IndexSizes reports each configured index's resident bytes (with human/auto
+// provenance) against the live data bytes -- the memory cost of indexing.
+func (db *DB) IndexSizes() IndexSizes { return db.c.IndexSizes() }
 
 // ExplainMatch reports how matchmaking job against this (resource) collection would
 // execute: the job's Requirements rewritten over the slot with the job's attributes

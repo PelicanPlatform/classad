@@ -17,7 +17,11 @@ const indexConfigFile = "indexcfg.json"
 type persistedIndexConfig struct {
 	Categorical []string `json:"categorical,omitempty"`
 	Value       []string `json:"value,omitempty"`
-	Hot         []string `json:"hot,omitempty"`
+	// Auto lists the indexes created by the auto-tuner (a subset of Categorical/Value);
+	// restoring this provenance keeps the memory-budget trimmer able to remove them and
+	// keeps human-created indexes exempt across restarts.
+	Auto []string `json:"auto,omitempty"`
+	Hot  []string `json:"hot,omitempty"`
 }
 
 func (db *DB) indexConfigPath() string {
@@ -36,7 +40,7 @@ func (db *DB) saveIndexConfig() {
 		return
 	}
 	cat, val := db.c.IndexedAttrs()
-	cfg := persistedIndexConfig{Categorical: cat, Value: val, Hot: db.c.HotAttrNames()}
+	cfg := persistedIndexConfig{Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(), Hot: db.c.HotAttrNames()}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return
@@ -83,7 +87,13 @@ func (db *DB) loadIndexConfig() {
 		cur[n] = "val"
 	}
 
-	var drop, addCat, addVal []string
+	autoSet := map[string]bool{}
+	for _, n := range cfg.Auto {
+		autoSet[n] = true
+	}
+
+	var drop []string
+	var addCatH, addCatA, addValH, addValA []string // human vs auto adds, to restore provenance
 	for n, k := range cur { // drop anything not wanted, or wanted as a different kind
 		if want[n] != k {
 			drop = append(drop, n)
@@ -93,10 +103,15 @@ func (db *DB) loadIndexConfig() {
 		if cur[n] == k {
 			continue
 		}
-		if k == "cat" {
-			addCat = append(addCat, n)
-		} else {
-			addVal = append(addVal, n)
+		switch {
+		case k == "cat" && autoSet[n]:
+			addCatA = append(addCatA, n)
+		case k == "cat":
+			addCatH = append(addCatH, n)
+		case autoSet[n]:
+			addValA = append(addValA, n)
+		default:
+			addValH = append(addValH, n)
 		}
 	}
 
@@ -105,8 +120,12 @@ func (db *DB) loadIndexConfig() {
 		db.c.DropIndex(drop...)
 		changed = true
 	}
-	if len(addCat) > 0 || len(addVal) > 0 {
-		db.c.AddIndex(addCat, addVal)
+	if len(addCatH) > 0 || len(addValH) > 0 {
+		db.c.AddIndex(addCatH, addValH)
+		changed = true
+	}
+	if len(addCatA) > 0 || len(addValA) > 0 {
+		db.c.AddAutoIndex(addCatA, addValA)
 		changed = true
 	}
 	if changed {

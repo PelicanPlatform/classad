@@ -70,6 +70,42 @@ func TestIndexConfigPersistsAcrossReopen(t *testing.T) {
 	}
 }
 
+// TestIndexProvenancePersistsAcrossReopen: human vs auto index provenance survives a
+// restart, so the memory-budget trimmer keeps treating auto indexes as trimmable and
+// human indexes as exempt.
+func TestIndexProvenancePersistsAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	d, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx := d.Begin()
+	for i := 0; i < 30; i++ {
+		ad, _ := classad.ParseOld("Owner = \"alice\"\nGPUs = true")
+		tx.NewClassAd(key(i), ad)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	d.AddIndex([]string{"Owner"}, nil)     // human
+	d.c.AddAutoIndex([]string{"GPUs"}, nil) // auto
+	d.saveIndexConfig()
+	d.Close()
+
+	d2, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	auto := d2.c.AutoIndexNames()
+	if !contains(auto, "GPUs") {
+		t.Errorf("GPUs should still be auto after reopen; auto=%v", auto)
+	}
+	if contains(auto, "Owner") {
+		t.Errorf("Owner is human and must not become auto after reopen; auto=%v", auto)
+	}
+}
+
 func key(i int) string {
 	return string(rune('a'+i%26)) + string(rune('0'+i%10)) + string(rune('0'+i/10%10))
 }

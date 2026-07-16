@@ -154,6 +154,11 @@ const (
 	// a value must be this dominant a literal kind for the attribute to be indexable
 	// as that kind; below it the attribute is too mixed / too many exceptions.
 	kindDominanceFrac = 0.8
+
+	// defaultBudgetSlackBytes is the absolute leeway over the index memory high
+	// watermark before AutoTune trims -- so a small overage does not cause churn. Used
+	// when AutoTuneOptions.BudgetSlackBytes is 0.
+	defaultBudgetSlackBytes = 10 << 20 // 10 MiB
 )
 
 // RecordDemand notes the attributes a constraint filters on (for SuggestIndexes)
@@ -306,11 +311,25 @@ type AutoTuneOptions struct {
 	// MinDemand is the minimum equality+range probe count for an attribute to be
 	// added as an index. Default 1 (any observed demand).
 	MinDemand int64
-	// DropUnused, if set, drops configured indexes that no query has filtered on
+	// DropUnused, if set, drops AUTO-created indexes that no query has filtered on
 	// ("unused"). Off by default so AutoTune never removes an index a workload has
-	// simply not exercised yet. Low-cardinality indexes are never auto-dropped
-	// (SuggestDrops reports them for manual review).
+	// simply not exercised yet. Human-created indexes and low-cardinality indexes are
+	// never auto-dropped (SuggestDrops reports them for manual review).
 	DropUnused bool
+	// BudgetHighFrac / BudgetLowFrac, when BudgetHighFrac > 0, bound index memory as a
+	// fraction of the live data bytes: AutoTune stops adding demand-driven indexes once
+	// index bytes reach the high mark, and trims the least-used AUTO indexes (never
+	// human-created ones) until index bytes fall below BudgetLowFrac. This is a high/low-
+	// watermark with hysteresis: grow until over the high mark, trim back to the low
+	// mark. 0 disables the budget (unbounded). BudgetLowFrac defaults to 0.7*BudgetHighFrac.
+	BudgetHighFrac float64
+	BudgetLowFrac  float64
+	// BudgetSlackBytes is absolute leeway on top of the high watermark: index bytes may
+	// exceed BudgetHighFrac by up to this many bytes before any trim triggers, so a small
+	// overage (or a small database, where the percentage is tiny in absolute terms) does
+	// not cause churn. 0 uses defaultBudgetSlackBytes (10 MiB); set a negative value for
+	// no slack (trim exactly at the fraction).
+	BudgetSlackBytes int64
 	// Reindex, if set, calls Reindex after applying changes so the new/removed
 	// indexes take effect immediately instead of at the caller's next Reindex.
 	Reindex bool
@@ -347,27 +366,47 @@ func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 		drops = c.SuggestDrops(opts.SampleMax)
 	}
 
-	var res AutoTuneResult
-	var cat, val []string
-	for _, s := range adds {
-		if s.QueriesEq+s.QueriesRange < minDemand {
-			continue
-		}
-		if s.Kind == "categorical" {
-			cat = append(cat, s.Attr)
-		} else {
-			val = append(val, s.Attr)
-		}
-		res.Changes = append(res.Changes, AutoTuneChange{s.Attr, s.Kind, "add", "demand"})
+	slack := opts.BudgetSlackBytes
+	if slack == 0 {
+		slack = defaultBudgetSlackBytes
+	} else if slack < 0 {
+		slack = 0
 	}
-	if len(cat) > 0 || len(val) > 0 {
-		res.Changed = c.AddIndex(cat, val) || res.Changed
+
+	var res AutoTuneResult
+	// Growth is gated by the memory budget: skip adds when index bytes already reach the
+	// high watermark (plus the absolute slack); the trim phase below brings us back to low.
+	underBudget := true
+	if opts.BudgetHighFrac > 0 {
+		sz := c.IndexSizes()
+		highBytes := int64(opts.BudgetHighFrac*float64(sz.DataBytes)) + slack
+		underBudget = sz.DataBytes <= 0 || sz.TotalBytes < highBytes
+	}
+	var cat, val []string
+	if underBudget {
+		for _, s := range adds {
+			if s.QueriesEq+s.QueriesRange < minDemand {
+				continue
+			}
+			if s.Kind == "categorical" {
+				cat = append(cat, s.Attr)
+			} else {
+				val = append(val, s.Attr)
+			}
+			res.Changes = append(res.Changes, AutoTuneChange{s.Attr, s.Kind, "add", "demand"})
+		}
+		if len(cat) > 0 || len(val) > 0 {
+			res.Changed = c.addIndexAuto(cat, val) || res.Changed
+		}
 	}
 
 	var dropNames []string
 	for _, d := range drops {
 		if d.Reason != "unused" {
 			continue // never auto-drop on low-cardinality alone
+		}
+		if !c.spec.Load().isAutoName(c, d.Attr) {
+			continue // never auto-drop a human-created index
 		}
 		dropNames = append(dropNames, d.Attr)
 		res.Changes = append(res.Changes, AutoTuneChange{d.Attr, d.Kind, "drop", d.Reason})
@@ -376,10 +415,70 @@ func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 		res.Changed = c.DropIndex(dropNames...) || res.Changed
 	}
 
+	// Budget trim: if over the high watermark (plus slack), drop the least-valuable AUTO
+	// indexes (fewest queries, then largest bytes) until under the low watermark.
+	if opts.BudgetHighFrac > 0 {
+		lowFrac := opts.BudgetLowFrac
+		if lowFrac <= 0 {
+			lowFrac = 0.7 * opts.BudgetHighFrac
+		}
+		for _, d := range c.budgetTrim(opts.BudgetHighFrac, lowFrac, slack) {
+			res.Changes = append(res.Changes, AutoTuneChange{d.Attr, d.Kind, "drop", "over-budget"})
+			res.Changed = c.DropIndex(d.Attr) || res.Changed
+		}
+	}
+
 	if opts.Reindex && res.Changed {
 		c.Reindex()
 	}
 	return res
+}
+
+// budgetTrim selects AUTO indexes to drop so total index bytes fall from above highFrac
+// to below lowFrac of the live data bytes. It never selects a human-created index, and
+// picks the least-valuable first: fewest observed queries, then largest bytes (free the
+// most memory soonest). It only selects; the caller applies the drops.
+func (c *Collection) budgetTrim(highFrac, lowFrac float64, slackBytes int64) []IndexSize {
+	sz := c.IndexSizes()
+	if sz.DataBytes <= 0 {
+		return nil
+	}
+	highBytes := int64(highFrac*float64(sz.DataBytes)) + slackBytes
+	if sz.TotalBytes <= highBytes {
+		return nil // within the high watermark plus slack: nothing to trim
+	}
+	target := int64(lowFrac * float64(sz.DataBytes))
+	// Auto indexes only, ranked least-valuable first.
+	var cand []IndexSize
+	for _, s := range sz.PerIndex {
+		if s.Auto {
+			cand = append(cand, s)
+		}
+	}
+	demandOf := func(attr string) int64 {
+		if v, ok := c.demand.m.Load(strings.ToLower(attr)); ok {
+			d := v.(*demandCounts)
+			return d.eq.Load() + d.rng.Load()
+		}
+		return 0
+	}
+	sort.Slice(cand, func(i, j int) bool {
+		di, dj := demandOf(cand[i].Attr), demandOf(cand[j].Attr)
+		if di != dj {
+			return di < dj // fewest queries first
+		}
+		return cand[i].Bytes > cand[j].Bytes // then free the most bytes
+	})
+	remaining := sz.TotalBytes
+	var drop []IndexSize
+	for _, s := range cand {
+		if remaining <= target {
+			break
+		}
+		drop = append(drop, s)
+		remaining -= s.Bytes
+	}
+	return drop
 }
 
 // alreadyIndexed reports whether attr id already has a configured index.
