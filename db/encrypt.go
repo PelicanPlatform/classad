@@ -86,6 +86,11 @@ func loadOrMintMaster(dir string, poolKeys []KEK) (master []byte, rows []crypt.M
 		}
 		return master, rows, nil
 	}
+	// Ensure the directory exists: resolveCrypto runs before the collection creates it,
+	// and (for a catalog) the per-table directory may not exist yet.
+	if err = os.MkdirAll(dir, 0o750); err != nil {
+		return nil, nil, fmt.Errorf("db: creating database directory: %w", err)
+	}
 	path := filepath.Join(dir, masterKeysFile)
 	if rows, err = loadMasterRows(path); err != nil {
 		return nil, nil, err
