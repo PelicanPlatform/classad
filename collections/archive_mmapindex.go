@@ -101,43 +101,44 @@ func (si *mmapSegIndex) bitmapAt(off uint32) *roaring.Bitmap {
 
 func (si *mmapSegIndex) allBitmap() *roaring.Bitmap { return si.bitmapAt(si.allOff) }
 
-// covers reports whether every usable probe's attribute is present in this index.
-func (si *mmapSegIndex) covers(usable []usableProbe) bool {
-	for _, up := range usable {
-		if up.cat {
-			if _, ok := si.catDir[up.attrID]; !ok {
-				return false
-			}
-		} else if _, ok := si.valDir[up.attrID]; !ok {
-			return false
-		}
+// The readIndex surface: thin delegates to the shared planner logic (readindex.go), so this
+// tier cannot diverge from the in-RAM segIndex.
+func (si *mmapSegIndex) covers(usable []usableProbe) bool { return indexCovers(si, usable) }
+func (si *mmapSegIndex) coversGroups(groups [][]usableProbe) bool {
+	return indexCoversGroups(si, groups)
+}
+func (si *mmapSegIndex) candidateOffsetsGroups(groups [][]usableProbe) *roaring.Bitmap {
+	return indexCandidateOffsetsGroups(si, groups)
+}
+func (si *mmapSegIndex) skipsPrefix(usable []usableProbe) bool { return indexSkipsPrefix(si, usable) }
+
+// coversProbe reports whether this segment indexes one probe's attribute.
+func (si *mmapSegIndex) coversProbe(up usableProbe) bool {
+	if up.cat {
+		_, ok := si.catDir[up.attrID]
+		return ok
 	}
-	return true
+	_, ok := si.valDir[up.attrID]
+	return ok
 }
 
-// candidateOffsets mirrors segIndex.candidateOffsets: intersect every usable probe's
-// offset set (categoricals first — cheaper), returning a superset the caller
-// re-verifies. nil means no usable probe.
-func (si *mmapSegIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
-	var acc *roaring.Bitmap
-	for pass := 0; pass < 2; pass++ {
-		wantCat := pass == 0
-		for _, up := range usable {
-			if up.cat != wantCat {
-				continue
-			}
-			bm := si.probeOffsets(up)
-			if acc == nil {
-				acc = bm
-			} else {
-				acc.And(bm)
-			}
-			if acc.IsEmpty() {
-				return acc
-			}
-		}
+// bloomAbsent consults the on-disk categorical bloom (v5) for a ==/in probe: true iff every
+// probe value is definitely absent.
+func (si *mmapSegIndex) bloomAbsent(up usableProbe) bool {
+	if !up.cat || (up.op != "==" && up.op != "in") {
+		return false
 	}
-	return acc
+	attrOff, ok := si.catDir[up.attrID]
+	if !ok {
+		return false
+	}
+	return si.catBloomAllAbsent(attrOff, up.svals)
+}
+
+// candidateOffsets returns the offsets satisfying every usable probe (a superset the caller
+// re-verifies), most-selective probe first via the shared planner logic. nil = no probe.
+func (si *mmapSegIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
+	return indexCandidateOffsets(si, usable)
 }
 
 // probeOffsets returns a fresh, mutable offset bitmap for one probe, reading only the

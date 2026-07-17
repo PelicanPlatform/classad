@@ -378,47 +378,25 @@ func numericFloat(v classad.Value) (float64, bool) {
 // coversGroups reports whether a segment index covers every probe of every group. If
 // it does not cover some group, that disjunct is unconstrained for this segment, so
 // the caller must full-scan the window rather than use the (incomplete) union.
-func (si *segIndex) coversGroups(groups [][]usableProbe) bool {
-	for _, g := range groups {
-		if !si.covers(g) {
-			return false
-		}
-	}
-	return true
-}
+func (si *segIndex) coversGroups(groups [][]usableProbe) bool { return indexCoversGroups(si, groups) }
 
 // candidateOffsetsGroups returns the union over groups of each group's candidate
 // intersection -- the DNF `OR of (AND of probes)`. Callers pass only prunable plans
 // (every group has at least one usable probe), so no group widens to everything.
 func (si *segIndex) candidateOffsetsGroups(groups [][]usableProbe) *roaring.Bitmap {
-	var acc *roaring.Bitmap
-	for _, g := range groups {
-		gb := si.candidateOffsets(g)
-		if gb == nil {
-			gb = roaring.New()
-		}
-		if acc == nil {
-			acc = gb
-		} else {
-			acc.Or(gb)
-		}
-	}
-	return acc
+	return indexCandidateOffsetsGroups(si, groups)
 }
 
 // covers reports whether a segment index has postings for every usable probe's
 // attribute (a segment indexed before an attribute was added would not).
-func (si *segIndex) covers(usable []usableProbe) bool {
-	for _, up := range usable {
-		if up.cat {
-			if si.cat[up.attrID] == nil {
-				return false
-			}
-		} else if si.val[up.attrID] == nil {
-			return false
-		}
+func (si *segIndex) covers(usable []usableProbe) bool { return indexCovers(si, usable) }
+
+// coversProbe reports whether this segment indexes one probe's attribute.
+func (si *segIndex) coversProbe(up usableProbe) bool {
+	if up.cat {
+		return si.cat[up.attrID] != nil
 	}
-	return true
+	return si.val[up.attrID] != nil
 }
 
 // candidateOffsets returns the segment-record offsets satisfying every usable
@@ -427,28 +405,7 @@ func (si *segIndex) covers(usable []usableProbe) bool {
 // fastest and the widest probes touch the smallest accumulator. nil means "no
 // candidates".
 func (si *segIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
-	// Fast path: 0/1 probe needs no ordering (and allocates no order/est slices),
-	// which is the common single-constraint query.
-	switch len(usable) {
-	case 0:
-		return nil
-	case 1:
-		return si.probeOffsets(usable[0])
-	}
-	order := si.selectivityOrder(usable)
-	var acc *roaring.Bitmap
-	for _, i := range order {
-		bm := si.probeOffsets(usable[i])
-		if acc == nil {
-			acc = bm
-		} else {
-			acc.And(bm)
-		}
-		if acc.IsEmpty() {
-			return acc
-		}
-	}
-	return acc
+	return indexCandidateOffsets(si, usable)
 }
 
 // selectivityOrder returns indices into usable ordered by ascending estimated
@@ -456,16 +413,7 @@ func (si *segIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
 // AND is commutative, so this never changes the result, only the work. Ties and
 // missing stats fall back to input order for a deterministic plan.
 func (si *segIndex) selectivityOrder(usable []usableProbe) []int {
-	order := make([]int, len(usable))
-	est := make([]float64, len(usable))
-	for i, up := range usable {
-		order[i] = i
-		est[i] = si.estCandidates(up)
-	}
-	sort.SliceStable(order, func(a, b int) bool {
-		return est[order[a]] < est[order[b]]
-	})
-	return order
+	return indexSelectivityOrder(si, usable)
 }
 
 // statsFor returns the segStats for a probe's attribute, or nil if that segment
@@ -490,97 +438,30 @@ func (si *segIndex) statsFor(up usableProbe) *segStats {
 // it must return true only when certain. Exceptional records (value present but
 // not the indexed literal type) are re-verified candidates, so any exception
 // forbids a skip. Equality/range/membership can skip; `!=` never does.
-func (si *segIndex) canSkip(up usableProbe) bool {
-	s := si.statsFor(up)
-	if s == nil || s.exc > 0 {
+func (si *segIndex) canSkip(up usableProbe) bool { return indexCanSkip(si, up) }
+
+// bloomAbsent reports whether a categorical ==/in probe's values are all provably absent
+// via the in-RAM per-segment bloom.
+func (si *segIndex) bloomAbsent(up usableProbe) bool {
+	if !up.cat || (up.op != "==" && up.op != "in") {
 		return false
 	}
-	if up.op == "present" || up.op == "absent" {
-		return false // presence spans posted + exc + absent; never provably empty here
+	s := si.statsFor(up)
+	if s == nil || s.bloom == nil {
+		return false
 	}
-	if up.cat {
-		if up.op != "==" && up.op != "in" {
-			return false
+	for _, v := range up.svals {
+		if s.bloom.mayContain(hashString(v)) {
+			return false // a value might be present: cannot prove absent
 		}
-		if s.bloom == nil {
-			return false
-		}
-		for _, v := range up.svals {
-			if s.bloom.mayContain(hashString(v)) {
-				return false // a value might be present: cannot skip
-			}
-		}
-		return true
 	}
-	if !s.hasRange {
-		// No numeric record in the prefix (and exc==0): nothing an equality/range
-		// probe could match. A `!=` still matches every non-exc record, so keep it.
-		return up.op != "!="
-	}
-	switch up.op {
-	case "==", "in":
-		for _, t := range up.fvals {
-			if t >= s.min && t <= s.max {
-				return false
-			}
-		}
-		return true
-	case "<":
-		return s.min >= up.fvals[0]
-	case "<=":
-		return s.min > up.fvals[0]
-	case ">":
-		return s.max <= up.fvals[0]
-	case ">=":
-		return s.max < up.fvals[0]
-	}
-	return false
+	return true
 }
 
 // estCandidates estimates how many records in the indexed prefix this probe would
 // admit (its candidate-bitmap cardinality). Used only to order probes, so a rough
 // estimate is fine; it never affects correctness.
-func (si *segIndex) estCandidates(up usableProbe) float64 {
-	s := si.statsFor(up)
-	if s == nil {
-		return math.MaxFloat64 // unknown: apply last
-	}
-	indexable := float64(s.covered - s.exc)
-	switch up.op {
-	case "==", "in":
-		var sum float64
-		if up.cat {
-			for _, v := range up.svals {
-				sum += s.estEqualStr(v)
-			}
-		} else {
-			for _, v := range up.fvals {
-				sum += s.estEqualFloat(v)
-			}
-		}
-		return sum + float64(s.exc)
-	case "!=":
-		// Everything except the single excluded value (plus absent/exc rows that the
-		// re-verify handles): close to the full prefix, so it sorts late.
-		if up.cat {
-			return indexable - s.estEqualStr(up.svals[0]) + float64(s.exc)
-		}
-		return indexable - s.estEqualFloat(up.fvals[0]) + float64(s.exc)
-	case "isnt":
-		// =!= (categorical): everything but the exact-case value. Estimate like != using
-		// the value's count (folded -- the top-N heavy hitters are folded keys); for a
-		// case-uniform bucket the exact and folded counts coincide. Without this branch
-		// the switch fell through to `return indexable` (~the whole prefix), so a selective
-		// `State =!= "Claimed"` looked ~100% and sorted last instead of first.
-		if up.cat {
-			return indexable - s.estEqualStr(strings.ToLower(up.svals[0])) + float64(s.exc)
-		}
-		return indexable
-	case "<", "<=", ">", ">=":
-		return s.estRange(up.op, up.fvals[0])*indexable + float64(s.exc)
-	}
-	return indexable
-}
+func (si *segIndex) estCandidates(up usableProbe) float64 { return indexEstCandidates(si, up) }
 
 // estEqualStr / estEqualFloat estimate the record count for one equality value:
 // its exact top-N count if it is a heavy hitter, else the average tail count (0 if
@@ -636,14 +517,7 @@ func (s *segStats) estRange(op string, t float64) float64 {
 // if any single probe provably has no candidate (canSkip), the intersection is
 // empty. Cheaper than candidateOffsets for range probes (no key iteration) and the
 // only skip path once postings are dropped from an immutable segment.
-func (si *segIndex) skipsPrefix(usable []usableProbe) bool {
-	for _, up := range usable {
-		if si.canSkip(up) {
-			return true
-		}
-	}
-	return false
-}
+func (si *segIndex) skipsPrefix(usable []usableProbe) bool { return indexSkipsPrefix(si, usable) }
 
 // probeOffsets returns a fresh, mutable offset bitmap for one probe.
 func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {

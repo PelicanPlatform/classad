@@ -1,0 +1,134 @@
+package collections
+
+import (
+	"fmt"
+	"path/filepath"
+	"testing"
+
+	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/RoaringBitmap/roaring/v2"
+)
+
+// TestReadIndexParity is the anchor for the shared planner logic: for every built segment,
+// its in-RAM *segIndex and the *mmapSegIndex parsed from the sidecar it writes must return
+// IDENTICAL covers / candidateOffsets / skipsPrefix / DNF-group results across a broad probe
+// battery. If the two representations ever diverged (a skip the mmap tier got wrong, a
+// candidate it missed), a sealed segment on the mmap tier would answer queries differently
+// from the same data in RAM.
+func TestReadIndexParity(t *testing.T) {
+	t.Parallel()
+	c := New(Options{
+		Shards:           1,
+		CategoricalAttrs: []string{"Owner", "State", "JobId"},
+		ValueAttrs:       []string{"Memory", "Cpus"},
+	})
+	owners := []string{"alice", "bob", "carol", "dave"}
+	states := []string{"Idle", "Running", "Held"}
+	for i := 0; i < 8000; i++ { // JobId is unique -> high NDV -> trips the MPH in sealed segments
+		ad := fmt.Sprintf(`[ Id=%d; Owner=%q; State=%q; JobId=%q; Memory=%d; Cpus=%d ]`,
+			i, owners[i%len(owners)], states[i%len(states)], fmt.Sprintf("job-%d", i), (i%16+1)*512, i%8)
+		if i%29 == 0 { // a Memory type exception
+			ad = fmt.Sprintf(`[ Id=%d; Owner=%q; State=%q; JobId=%q; Memory="x"; Cpus=%d ]`,
+				i, owners[i%len(owners)], states[i%len(states)], fmt.Sprintf("job-%d", i), i%8)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(t, ad)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	conj := []string{
+		`Owner == "alice"`,
+		`Owner != "bob"`,
+		`Owner == "alice" || Owner == "carol"`,
+		`Owner == "nobody"`, // bloom-absent -> skip
+		`State == "Running" && Memory >= 4096`,
+		`Memory > 2048 && Memory <= 6144`,
+		`Memory >= 999999`, // out of range -> skip
+		`Cpus == 4`,
+		`JobId == "job-100"`,    // MPH path (present)
+		`JobId == "job-999999"`, // MPH/absent
+		`Owner isnt undefined`,
+		`Owner is undefined`,
+		`State == "Held" && Owner == "dave" && Cpus < 4`,
+	}
+	dnf := []string{
+		`(Owner == "alice" && Memory >= 4096) || (State == "Held" && Cpus == 2)`,
+		`(JobId == "job-1") || (JobId == "job-2") || (State == "Idle" && Memory < 1024)`,
+	}
+
+	segs := 0
+	for _, sh := range c.shards {
+		for _, seg := range sh.segs {
+			if seg == nil {
+				continue
+			}
+			live := seg.idx.Load()
+			if live == nil {
+				continue
+			}
+			path := filepath.Join(t.TempDir(), fmt.Sprintf("seg-%d.idx", seg.id))
+			if err := writeSidecarIndex(path, live); err != nil {
+				t.Fatalf("write sidecar: %v", err)
+			}
+			data, closer, err := mapFile(path)
+			if err != nil {
+				t.Fatalf("map sidecar: %v", err)
+			}
+			mm, err := parseMmapSidecar(data)
+			if err != nil {
+				t.Fatalf("parse sidecar: %v", err)
+			}
+			segs++
+
+			for _, qs := range conj {
+				q, err := vm.Parse(qs)
+				if err != nil {
+					t.Fatalf("parse %q: %v", qs, err)
+				}
+				usable := c.planIndex(q.Probes())
+				if live.covers(usable) != mm.covers(usable) {
+					t.Errorf("seg %d %q: covers mismatch (live %v, mmap %v)", seg.id, qs, live.covers(usable), mm.covers(usable))
+				}
+				if live.skipsPrefix(usable) != mm.skipsPrefix(usable) {
+					t.Errorf("seg %d %q: skipsPrefix mismatch (live %v, mmap %v)", seg.id, qs, live.skipsPrefix(usable), mm.skipsPrefix(usable))
+				}
+				if !bmEqual(live.candidateOffsets(usable), mm.candidateOffsets(usable)) {
+					t.Errorf("seg %d %q: candidateOffsets mismatch", seg.id, qs)
+				}
+			}
+
+			for _, qs := range dnf {
+				q, err := vm.Parse(qs)
+				if err != nil {
+					t.Fatalf("parse %q: %v", qs, err)
+				}
+				plan := q.ProbePlan()
+				groups, prunable := c.planIndexGroups(plan)
+				if !prunable {
+					continue
+				}
+				if live.coversGroups(groups) != mm.coversGroups(groups) {
+					t.Errorf("seg %d %q: coversGroups mismatch", seg.id, qs)
+				}
+				if !bmEqual(live.candidateOffsetsGroups(groups), mm.candidateOffsetsGroups(groups)) {
+					t.Errorf("seg %d %q: candidateOffsetsGroups mismatch", seg.id, qs)
+				}
+			}
+			_ = closer()
+		}
+	}
+	if segs == 0 {
+		t.Fatal("no segments compared")
+	}
+}
+
+func bmEqual(a, b *roaring.Bitmap) bool {
+	if a == nil {
+		a = roaring.New()
+	}
+	if b == nil {
+		b = roaring.New()
+	}
+	return a.Equals(b)
+}
