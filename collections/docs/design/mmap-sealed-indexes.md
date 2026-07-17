@@ -92,21 +92,24 @@ their sidecar instead, the CLIX write/restore path is removed: `Open` maps sidec
 rather than deserializing. `writeSidecarIndex` (the archive format, now v7) is written at
 seal for live segments too.
 
-## Incremental steps
+## Incremental steps — all landed
 
-1. **Sidecar v7 — segStats block.** Serialize per-attr stats; add `mmapSegIndex` readers +
-   `statsFor`. Round-trip test: mmap stats == in-RAM `finishStats` stats. *(Self-contained.)*
-2. **mmapSegIndex full surface.** Implement `canSkip`, `skipsPrefix`, `estCandidates`,
-   `selectivityOrder`, DNF group variants on top of the v7 stats. Parity tests vs `segIndex`.
-3. **Read-index interface + dispatch.** Extract the interface; segment holds either; planner
-   dispatches. No behavior change yet (all segments still in-RAM).
-4. **Backing store.** `mapFile` (exists) + an anonymous `mmapAnon` variant; unmap/`MADV_FREE`
-   on reap (extend the archive's `onReap`).
-5. **Seal path.** On seal, write the sidecar, back it (file/anon by store kind), swap the
-   segment's index to the `mmapSegIndex`. Active stays in-RAM.
-6. **Open path + CLIX removal.** Map sidecars for sealed segments; drop CLIX.
-7. **Accounting + doc.** Extend `SidecarSizes` to the live store (mapped/evictable, per the
-   heap-vs-mapped split #26 introduced); update design README §8/§10.
+1. ✅ **Sidecar v7 — segStats block.** Serialize per-attr stats; `mmapSegIndex` readers +
+   `statsFor`. Round-trip test: mmap stats == in-RAM `finishStats` stats. *(Later: v8 CRC.)*
+2. ✅ **mmapSegIndex full surface.** `canSkip`, `skipsPrefix`, `estCandidates`,
+   `selectivityOrder`, DNF group variants on the v7 stats. Parity tests vs `segIndex`.
+3. ✅ **Read-index interface + dispatch.** `readIndex`/`indexPrimitives` extracted; segment
+   holds either (`idx` or `msidx`); planner dispatches via `readIdx()`. Shared planner logic
+   as free functions so the two tiers can't diverge.
+4. ✅ **Backing store.** `mapFile` + anonymous `mapAnon`; unmap on reap via `onReap`.
+5. ✅ **Seal path.** `sealSegmentIndex`: on seal write the sidecar, map it (file/anon by store
+   kind), publish `msidx` via CAS, register unmap with reap, drop the heap copy. Active
+   stays in-RAM. Option A: a converted segment's index config freezes.
+6. ✅ **Open path + CLIX removal.** `loadSealedIndex` maps sidecars for sealed segments (CRC +
+   spec-gen + extent checked); `index_snapshot.go` (CLIX) removed.
+7. ✅ **Accounting + doc.** `Collection.SidecarSizes()` reports the live store's sealed
+   sidecars (mapped/evictable, MPH+Bloom broken out); `IndexSizes` now measures only the
+   in-RAM active segments; design README §8/§10 updated.
 
 ## Follow-ups (not in this work)
 

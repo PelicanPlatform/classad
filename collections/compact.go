@@ -337,7 +337,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	sh.mu.Unlock()
 
 	for _, seg := range toReap {
-		_ = seg.reap()
+		// reapAndHook (not bare reap) so a sealed segment's mmap sidecar index is unmapped
+		// with its data (onReap); a no-op for segments without a sidecar. toReap holds only
+		// unpinned segments, so unmapping now is safe.
+		_ = seg.reapAndHook()
 	}
 }
 

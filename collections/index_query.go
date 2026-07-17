@@ -25,32 +25,44 @@ import (
 // the caller reindexes — no write-path or compaction coupling.
 func (c *Collection) Reindex() {
 	spec := c.spec.Load()
+	persistent := c.dir != ""
 	for _, sh := range c.shards {
-		// Snapshot segments + watermarks under the read lock, then build off-lock.
+		// Snapshot segments + the active append target under the read lock, then build
+		// off-lock. Every segment except sh.act is sealed (immutable until compacted), so
+		// safe to convert to the pageable mmap sidecar; the active segment stays in-RAM.
 		sh.mu.RLock()
+		act := sh.act
 		type target struct {
 			seg  *segment
 			used int
+			seal bool // convert to the mmap sidecar after (re)building
 		}
 		var tgts []target
 		for _, seg := range sh.segs {
 			if seg == nil {
 				continue
 			}
+			if seg.msidx.Load() != nil {
+				continue // already sealed to a mmap sidecar; its index config is frozen
+			}
 			cur := seg.idx.Load()
 			if !spec.any() {
 				if cur != nil {
-					tgts = append(tgts, target{seg, seg.used}) // clear a now-orphaned index
+					tgts = append(tgts, target{seg, seg.used, false}) // clear a now-orphaned index
 				}
 				continue
 			}
 			if seg.used == 0 {
 				continue
 			}
-			// Rebuild when the index is missing, behind the write watermark, or built
-			// under an older spec generation (an add/drop happened since).
+			sealable := persistent && seg != act
+			// Rebuild when the index is missing, behind the write watermark, or built under
+			// an older spec generation; otherwise a current-but-unsealed sealable segment
+			// still needs converting.
 			if cur == nil || int(cur.upto) < seg.used || cur.specGen != spec.gen {
-				tgts = append(tgts, target{seg, seg.used})
+				tgts = append(tgts, target{seg, seg.used, sealable})
+			} else if sealable {
+				tgts = append(tgts, target{seg, seg.used, true})
 			}
 		}
 		sh.mu.RUnlock()
@@ -59,12 +71,15 @@ func (c *Collection) Reindex() {
 				t.seg.idx.Store(nil)
 				continue
 			}
-			si := buildSegIndex(t.seg.data, t.used, t.seg.codec, spec)
-			t.seg.idx.Store(si)
-			// Persist the built index beside the segment (persistent collections only) so a
-			// reopen restores it instead of re-indexing every record. Best-effort.
-			if c.dir != "" {
-				c.writeIndexSnapshot(t.seg, si)
+			si := t.seg.idx.Load()
+			if si == nil || int(si.upto) < t.used || si.specGen != spec.gen {
+				si = buildSegIndex(t.seg.data, t.used, t.seg.codec, spec)
+				t.seg.idx.Store(si)
+			}
+			// Sealed persistent segment: move its index off the heap into the mmap sidecar
+			// (reclaimable, GC-invisible). Best-effort; on failure the in-RAM index stays.
+			if t.seal {
+				c.sealSegmentIndex(t.seg, si)
 			}
 		}
 	}

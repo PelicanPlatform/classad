@@ -287,15 +287,20 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		}
 		seg.used = used
 		seg.synced = used
-		// Restore this segment's index from its on-disk snapshot, if present and current,
-		// so the Reindex that follows Open rebuilds only the segments that lack a valid
-		// one (a grown/active segment or a spec change) instead of re-indexing everything.
-		if spec := c.spec.Load(); spec != nil && spec.any() {
-			c.loadIndexSnapshot(seg, spec)
-		}
 		sh.segs = append(sh.segs, seg)
 	}
-	c.rebuildDir(sh)
+	c.rebuildDir(sh) // sets sh.act to the last (active) segment
+	// Map each sealed segment's existing sidecar directly (skip the active append target,
+	// which stays in-RAM): the reopen restores the index by mmapping it instead of
+	// re-indexing every record. A missing/invalid/stale sidecar leaves msidx nil so the
+	// Reindex that follows Open rebuilds and re-seals that segment.
+	if spec := c.spec.Load(); spec != nil && spec.any() {
+		for _, seg := range sh.segs {
+			if seg != nil && seg != sh.act {
+				c.loadSealedIndex(seg, spec)
+			}
+		}
+	}
 	return maxNum, nil
 }
 
