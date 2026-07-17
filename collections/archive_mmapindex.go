@@ -129,9 +129,14 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		switch up.op {
 		case "==", "in":
 			bm := roaring.New()
-			for _, s := range up.svals {
-				if off, ok := si.catFind(attrOff, s); ok {
-					bm.Or(si.bitmapAt(off))
+			// Bloom fast path: if every probe value is definitely absent, skip the
+			// per-value binary search over the (paged) sorted key blob entirely; only
+			// the exceptional records can still match and are re-verified upstream.
+			if !si.catBloomAllAbsent(attrOff, up.svals) {
+				for _, s := range up.svals {
+					if off, ok := si.catFind(attrOff, s); ok {
+						bm.Or(si.bitmapAt(off))
+					}
 				}
 			}
 			bm.Or(si.bitmapAt(excOff))
@@ -259,6 +264,54 @@ func (si *mmapSegIndex) catFindExact(attrOff uint32, key string) (bmOff uint32, 
 		}
 	}
 	return 0, false
+}
+
+// catBloomOff returns the file offset of the categorical bloom block (bloomK) within a
+// cat attr block: it sits immediately after the exact-case run. Mirrors catFindExact's
+// walk to the exact run, then skips the exact blob.
+func (si *mmapSegIndex) catBloomOff(attrOff uint32) uint32 {
+	d := si.data
+	n := le32(d, attrOff+8)
+	keyOffBase := attrOff + 12
+	bmOffBase := keyOffBase + (n+1)*4
+	blobBase := bmOffBase + n*4
+	exOff := blobBase + le32(d, keyOffBase+n*4) // + folded blob length (keyOff[n])
+	exN := le32(d, exOff)
+	exKeyOffBase := exOff + 4
+	exBmOffBase := exKeyOffBase + (exN+1)*4
+	exBlobBase := exBmOffBase + exN*4
+	return exBlobBase + le32(d, exKeyOffBase+exN*4) // + exact blob length (exKeyOff[exN])
+}
+
+// catBloomAllAbsent reports whether the categorical bloom proves EVERY key definitely
+// absent (so a query can skip binary-searching the sorted key blob). Returns false when
+// there is no filter (bloomM==0), so the caller falls back to the exact lookup. Replays
+// the same double-hash probe as bloomFilter.mayContain directly over the mapped words.
+func (si *mmapSegIndex) catBloomAllAbsent(attrOff uint32, keys []string) bool {
+	d := si.data
+	bloomOff := si.catBloomOff(attrOff)
+	k := le32(d, bloomOff)
+	m := le32(d, bloomOff+4)
+	if m == 0 || k == 0 {
+		return false // no filter: cannot prove absence
+	}
+	wordsBase := bloomOff + 8
+	mayContain := func(h uint64) bool {
+		h1, h2 := uint32(h), uint32(h>>32)
+		for i := uint32(0); i < k; i++ {
+			p := (h1 + i*h2) & (m - 1)
+			if le64(d, wordsBase+(p>>6)*8)&(1<<(p&63)) == 0 {
+				return false
+			}
+		}
+		return true
+	}
+	for _, s := range keys {
+		if mayContain(hashString(s)) {
+			return false // a value might be present: cannot skip
+		}
+	}
+	return true
 }
 
 // --- value attr block: excOff u32; postedOff u32; n u32; key[n] f64; bmOff[n] u32 ---

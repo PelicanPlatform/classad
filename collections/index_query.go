@@ -59,7 +59,13 @@ func (c *Collection) Reindex() {
 				t.seg.idx.Store(nil)
 				continue
 			}
-			t.seg.idx.Store(buildSegIndex(t.seg.data, t.used, t.seg.codec, spec))
+			si := buildSegIndex(t.seg.data, t.used, t.seg.codec, spec)
+			t.seg.idx.Store(si)
+			// Persist the built index beside the segment (persistent collections only) so a
+			// reopen restores it instead of re-indexing every record. Best-effort.
+			if c.dir != "" {
+				c.writeIndexSnapshot(t.seg, si)
+			}
 		}
 	}
 }

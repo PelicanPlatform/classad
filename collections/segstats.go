@@ -176,6 +176,22 @@ func topEntries(entries []topEntry) []topEntry {
 	return entries
 }
 
+// sketchBytes is the resident memory of this attribute's per-segment sketches: the
+// categorical bloom filter (uint64 words) and the HyperLogLog register array (one byte
+// per register). These live alongside the postings but are NOT counted by the posting
+// sizeBytes; IndexSizes reports them as a separate SketchBytes column so the operator
+// sees the full index memory rather than only the roaring bitmaps.
+func (s *segStats) sketchBytes() int64 {
+	var n int64
+	if s.bloom != nil {
+		n += int64(len(s.bloom.bits)) * 8
+	}
+	if s.hll != nil {
+		n += int64(len(s.hll.reg))
+	}
+	return n
+}
+
 // --- bloom filter (categorical membership) -------------------------------------
 
 // bloomFilter is a compact Bloom filter over 64-bit value hashes. Built once from

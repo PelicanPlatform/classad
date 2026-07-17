@@ -31,17 +31,22 @@ import (
 //	         keysBlob;
 //	         exactN uint32; exactKeyOff [exactN+1] uint32; exactBmOff [exactN] uint32;
 //	         exactKeysBlob   -- exact-case keys (sorted) for =?=/=!=; a case-uniform
-//	         bucket's exact key reuses its folded bmOff (no duplicate payload).
+//	         bucket's exact key reuses its folded bmOff (no duplicate payload);
+//	         bloomK uint32; bloomM uint32; bloom [bloomM/64] uint64  (v5) -- categorical
+//	         membership filter over the folded keys. A miss on every probe value lets a
+//	         query skip binary-searching (and paging) the sorted key blob for that probe;
+//	         bloomM==0 means no filter (empty index).
 //	  val attr block @attrOff: excOff uint32; postedOff uint32; n uint32;
 //	         key [n] float64 (sorted asc); bmOff [n] uint32
 //
 // postedOff is the bitmap of records that posted a literal value, for the presence
 // probes: present (isnt undefined) = posted OR exc, absent (is undefined) = all AND-NOT
-// posted. v3 added the exact-case run; v4 added postedOff. There is no migration
-// (indexes are rebuilt at seal), so an older sidecar is simply rejected and reindexed.
+// posted. v3 added the exact-case run; v4 added postedOff; v5 added the categorical
+// bloom. There is no migration (indexes are rebuilt at seal), so an older sidecar is
+// simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 4
+	sidecarVersion = 5
 )
 
 // writeSidecarIndex serializes si to path (v2 sorted runs) and fsyncs it. si is
@@ -80,6 +85,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		bmOffs                []uint32
 		exKeys                []string // exact-case keys (sorted) -> exBmOffs (for =?=/=!=)
 		exBmOffs              []uint32
+		bloom                 *bloomFilter // categorical membership over folded keys (built at seal)
 	}
 	type valBlk struct {
 		id, excOff, postedOff uint32
@@ -145,7 +151,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		if err != nil {
 			return err
 		}
-		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs})
+		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs, cp.stats.bloom})
 	}
 	sort.Slice(catBlks, func(i, j int) bool { return catBlks[i].id < catBlks[j].id })
 
@@ -231,6 +237,18 @@ func writeSidecarIndex(path string, si *segIndex) error {
 			b = appendU32(b, o)
 		}
 		b = append(b, exBlob...)
+		// Categorical bloom (v5), immediately after the exact-case run: bloomK; bloomM;
+		// bloom words. bloomM==0 marks "no filter". Reuses the filter built at seal.
+		if cb.bloom != nil && cb.bloom.m > 0 {
+			b = appendU32(b, cb.bloom.k)
+			b = appendU32(b, cb.bloom.m)
+			for _, w := range cb.bloom.bits {
+				b = appendU64(b, w)
+			}
+		} else {
+			b = appendU32(b, 0) // bloomK
+			b = appendU32(b, 0) // bloomM == 0: no filter
+		}
 	}
 	for i, vb := range valBlks {
 		binary.LittleEndian.PutUint32(b[valSlot[i]:], uint32(len(b)))
