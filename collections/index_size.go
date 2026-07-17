@@ -88,12 +88,14 @@ func (a *Archive) SidecarSizes() SidecarSizes {
 }
 
 // SidecarSizes reports the live Collection's sealed-segment sidecar bytes: the mmap-backed
-// index each sealed segment holds after the flip from the in-RAM segIndex. These bytes are
-// page-cache resident and evictable, NOT Go-heap memory, so they are reported apart from
-// IndexSizes (which now measures only the active, still-in-RAM segments' postings). Together
-// the two give the operator the full picture: heap postings on the hot active segment plus
-// evictable sidecar bytes on the sealed tail. It reads each segment's already-mapped bytes
-// under the shard read lock -- no re-mapping -- so it is cheap enough for periodic sampling.
+// index each sealed segment holds after the flip from the in-RAM segIndex -- a file mapping
+// for a persistent collection (page-cache resident, evictable to disk) or an anonymous
+// mapping for an in-memory one (off-heap, MADV_FREE-able to swap). Either way these bytes are
+// NOT Go-heap memory, so they are reported apart from IndexSizes (which now measures only the
+// active, still-in-RAM segments' postings). Together the two give the operator the full
+// picture: heap postings on the hot active segment plus off-heap sidecar bytes on the sealed
+// tail. It reads each segment's already-mapped bytes under the shard read lock -- no
+// re-mapping -- so it is cheap enough for periodic sampling.
 func (c *Collection) SidecarSizes() SidecarSizes {
 	var out SidecarSizes
 	for _, sh := range c.shards {

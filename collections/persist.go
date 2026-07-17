@@ -402,9 +402,6 @@ func (c *Collection) rebuildDir(sh *shard) {
 // files. It is a no-op for an in-memory collection. The collection must not be used
 // after Close.
 func (c *Collection) Close() error {
-	if c.dir == "" {
-		return nil
-	}
 	var firstErr error
 	for _, sh := range c.shards {
 		sh.mu.Lock()
@@ -412,7 +409,13 @@ func (c *Collection) Close() error {
 			if seg == nil {
 				continue
 			}
-			if err := seg.unmap(); err != nil && firstErr == nil {
+			// closeUnmap unmaps a persistent segment's data file (without unlinking -- it
+			// persists for reopen) and, via the reap hook, its sidecar index; for an in-memory
+			// segment with an anon sidecar it unmaps that sidecar so a Close short of process
+			// exit does not leak the mapping. It is pin-aware (a live scan defers the unmap to
+			// its last unpin) and a no-op for a plain RAM segment, so this is safe and cheap
+			// for a pure key/value in-memory collection too.
+			if err := seg.closeUnmap(); err != nil && firstErr == nil {
 				firstErr = err
 			}
 		}

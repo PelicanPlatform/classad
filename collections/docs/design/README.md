@@ -590,7 +590,11 @@ generation checked); any that are missing, stale, or built under a different spe
 are rebuilt and re-sealed by the post-open `Reindex`. So an index configuration must still be
 supplied identically at reopen, but a large store reloads its sealed indexes by mmapping
 rather than re-indexing every record — and their bitmaps never occupy the Go heap. An
-in-memory collection keeps its active index in RAM. A demand tracker records which attributes
+in-memory collection (the collector's use case) does the same off-heap move with an
+**anonymous** mmap sidecar instead of a file: its sealed-segment indexes leave the Go heap
+too — out of GC mark cost and GOGC pacing — while only the active segment's index stays in
+RAM. (A RAM segment that carries such a sidecar joins the same scan-pin/reap discipline as a
+file-backed one, since an anonymous mapping is not GC-managed.) A demand tracker records which attributes
 queries filter on, so `SuggestIndexes` can recommend indexes a workload would benefit from,
 and the auto-tuner grows/trims indexes against a memory watermark. Because the sealed tail is
 off-heap, that watermark now splits across two reports: `IndexSizes` measures the heap-resident

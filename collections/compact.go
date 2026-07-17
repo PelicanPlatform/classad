@@ -183,6 +183,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			// compaction allocation failure durable/abortable).
 		}
 		cur = newSegment(0, size, codec)
+		cur.pinReap = sh.sealRAM // keep the compacted RAM segment pin/reap-eligible for anon sealing
 		dstSegs = append(dstSegs, cur)
 	}
 	var moved []movedRec

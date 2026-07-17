@@ -93,6 +93,29 @@ func (c *Collection) loadSealedIndex(seg *segment, spec *indexSpec) bool {
 	return true
 }
 
+// sealSegmentIndexAnon is the in-memory analogue of sealSegmentIndex: it converts a sealed
+// RAM segment's in-RAM index (si) to an anonymous mmap sidecar (off the Go heap, GC-invisible,
+// MADV_FREE-able), publishes it as msidx via CAS, registers its unmap with reap (onReap), and
+// drops the heap copy. Best-effort -- on any error the in-RAM index stays. No-op for a segment
+// already sealed. The mapping is process-lifetime (no file); it is released when the segment is
+// reaped (compaction) or on Close. The segment must be pin/reap-eligible (pinReap set at
+// creation) so a concurrent scan reading the mapping keeps it alive until the scan's unpin.
+func (c *Collection) sealSegmentIndexAnon(seg *segment, si *segIndex) {
+	if si == nil || seg.msidx.Load() != nil {
+		return
+	}
+	mm, closer, err := sealedIndexAnon(si)
+	if err != nil {
+		return
+	}
+	if !seg.msidx.CompareAndSwap(nil, mm) {
+		_ = closer() // lost the race to a concurrent conversion; unmap our own and bail
+		return
+	}
+	seg.setOnReap(func() { _ = closer() })
+	seg.idx.Store(nil)
+}
+
 // sealedIndexAnon builds si's sidecar bytes into an anonymous mapping and returns the view
 // plus an unmap closer (in-memory sealed segment).
 func sealedIndexAnon(si *segIndex) (*mmapSegIndex, func() error, error) {
