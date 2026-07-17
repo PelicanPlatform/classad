@@ -205,7 +205,7 @@ func (c *Collection) estimateCandidates(up usableProbe) (cand float64, covered b
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
-			if si := w.seg.idx.Load(); si != nil && si.covers(single) {
+			if si := w.seg.readIdx(); si != nil && si.covers(single) {
 				cand += si.estCandidates(up)
 				covered = true
 			}
@@ -518,6 +518,7 @@ func (s *segStats) estRange(op string, t float64) float64 {
 // empty. Cheaper than candidateOffsets for range probes (no key iteration) and the
 // only skip path once postings are dropped from an immutable segment.
 func (si *segIndex) skipsPrefix(usable []usableProbe) bool { return indexSkipsPrefix(si, usable) }
+func (si *segIndex) coveredUpto() uint32                   { return si.upto }
 
 // probeOffsets returns a fresh, mutable offset bitmap for one probe.
 func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
@@ -693,7 +694,7 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand
 	}
 
 	for _, w := range wins {
-		si := w.seg.idx.Load()
+		si := w.seg.readIdx()
 		if si == nil || !si.covers(usable) {
 			if !scanRange(w, 0, w.used) { // no usable index: full-scan the window
 				return false
@@ -704,8 +705,8 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand
 		// (min/max out of range, bloom miss), the conjunction is empty there — skip
 		// the prefix and only full-scan the tail written after the index was built.
 		if si.skipsPrefix(usable) {
-			if int(si.upto) < w.used {
-				if !scanRange(w, int(si.upto), w.used) {
+			if int(si.coveredUpto()) < w.used {
+				if !scanRange(w, int(si.coveredUpto()), w.used) {
 					return false
 				}
 			}
@@ -721,8 +722,8 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand
 			}
 		}
 		// Tail [upto, used): written after the index was built — full-scan it.
-		if int(si.upto) < w.used {
-			if !scanRange(w, int(si.upto), w.used) {
+		if int(si.coveredUpto()) < w.used {
+			if !scanRange(w, int(si.coveredUpto()), w.used) {
 				return false
 			}
 		}

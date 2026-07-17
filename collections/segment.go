@@ -81,6 +81,11 @@ type segment struct {
 	// segIndex is immutable once published, so query readers load it lock-free.
 	idx atomic.Pointer[segIndex]
 
+	// msidx is a sealed segment's index in its pageable mmap form (the sidecar). When set
+	// it supersedes idx (which is then cleared to free the heap copy): readIdx prefers it.
+	// Its backing mapping is released via onReap when the segment's scan pins drain.
+	msidx atomic.Pointer[mmapSegIndex]
+
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned
 	// at compaction install and on recovery), so no rename is needed when id changes.
@@ -102,6 +107,20 @@ type segment struct {
 	// segment's mmap'd sidecar index at the same pin-drained moment its data is
 	// reaped, so a query scanning a rotating segment never reads a torn index mapping.
 	onReap func()
+}
+
+// readIdx returns the segment's queryable index behind the readIndex interface: the mmap'd
+// sidecar (msidx) once the segment is sealed and converted, else the in-RAM segIndex, else
+// nil. A sealed segment's msidx supersedes its (cleared) in-RAM idx; both satisfy readIndex,
+// so the query planner dispatches through it without caring which representation it is.
+func (s *segment) readIdx() readIndex {
+	if m := s.msidx.Load(); m != nil {
+		return m
+	}
+	if i := s.idx.Load(); i != nil {
+		return i
+	}
+	return nil
 }
 
 // pin marks the start of a scan's use of a segment (mmap only; RAM segments rely on

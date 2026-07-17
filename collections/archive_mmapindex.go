@@ -79,9 +79,6 @@ func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
 	if m.err != nil {
 		return nil, fmt.Errorf("archive: corrupt sidecar directory: %w", m.err)
 	}
-	if m.err != nil {
-		return nil, fmt.Errorf("archive: corrupt sidecar meta: %w", m.err)
-	}
 	return si, nil
 }
 
@@ -111,6 +108,8 @@ func (si *mmapSegIndex) candidateOffsetsGroups(groups [][]usableProbe) *roaring.
 	return indexCandidateOffsetsGroups(si, groups)
 }
 func (si *mmapSegIndex) skipsPrefix(usable []usableProbe) bool { return indexSkipsPrefix(si, usable) }
+func (si *mmapSegIndex) estCandidates(up usableProbe) float64  { return indexEstCandidates(si, up) }
+func (si *mmapSegIndex) coveredUpto() uint32                   { return si.upto }
 
 // coversProbe reports whether this segment indexes one probe's attribute.
 func (si *mmapSegIndex) coversProbe(up usableProbe) bool {

@@ -18,6 +18,8 @@ type readIndex interface {
 	candidateOffsets(usable []usableProbe) *roaring.Bitmap
 	candidateOffsetsGroups(groups [][]usableProbe) *roaring.Bitmap
 	skipsPrefix(usable []usableProbe) bool
+	estCandidates(up usableProbe) float64 // selectivity estimate (ordering/tuning only)
+	coveredUpto() uint32                  // the index covers offsets [0, coveredUpto); the tail is scanned
 }
 
 // indexPrimitives are the per-tier operations the shared planner logic (below) is built on.
