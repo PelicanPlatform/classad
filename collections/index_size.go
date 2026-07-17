@@ -48,20 +48,29 @@ func (vp *valPostings) sizeBytes() int64 {
 
 // IndexSize is the measured memory footprint of one attribute's index.
 type IndexSize struct {
-	Attr  string  `json:"attr"`
-	Kind  string  `json:"kind"`  // "categorical" | "value"
-	Bytes int64   `json:"bytes"` // resident posting bytes across all live segments
-	Auto  bool    `json:"auto"`  // created by the auto-tuner (vs human/Options)
-	Frac  float64 `json:"frac"`  // Bytes as a fraction of the live data bytes
+	Attr  string `json:"attr"`
+	Kind  string `json:"kind"`  // "categorical" | "value"
+	Bytes int64  `json:"bytes"` // resident posting bytes (roaring bitmaps + keys) across all live segments
+	// SketchBytes is the resident memory of this attribute's per-segment sketches --
+	// the categorical bloom filter and the HyperLogLog distinct-count registers --
+	// reported apart from Bytes so it is visible rather than hidden in the posting total.
+	SketchBytes int64   `json:"sketchBytes"`
+	Auto        bool    `json:"auto"` // created by the auto-tuner (vs human/Options)
+	Frac        float64 `json:"frac"` // Bytes as a fraction of the live data bytes
 }
 
 // IndexSizes is the collection's index memory, per attribute and in total, against the
 // live data bytes -- the denominator for the "index is N% of data" watermark.
 type IndexSizes struct {
 	PerIndex   []IndexSize `json:"perIndex"`
-	TotalBytes int64       `json:"totalBytes"`
-	DataBytes  int64       `json:"dataBytes"` // live compressed record bytes
-	Frac       float64     `json:"frac"`      // TotalBytes / DataBytes
+	TotalBytes int64       `json:"totalBytes"` // posting bytes (the auto-tuner's budget denominator)
+	// TotalSketchBytes is the sum of every index's SketchBytes (bloom + HLL). It is
+	// reported separately and is NOT folded into TotalBytes/Frac, so the watermark and
+	// auto-tuner budget stay calibrated on posting bytes; sketch memory is bounded and
+	// small (<=8 KiB bloom + 1 KiB HLL per categorical attr per segment).
+	TotalSketchBytes int64   `json:"totalSketchBytes"`
+	DataBytes        int64   `json:"dataBytes"` // live compressed record bytes
+	Frac             float64 `json:"frac"`      // TotalBytes / DataBytes
 }
 
 // IndexSizes measures each configured index's resident bytes across all live segments,
@@ -70,6 +79,8 @@ type IndexSizes struct {
 func (c *Collection) IndexSizes() IndexSizes {
 	catBytes := map[uint32]int64{}
 	valBytes := map[uint32]int64{}
+	catSketch := map[uint32]int64{}
+	valSketch := map[uint32]int64{}
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		for _, seg := range sh.segs {
@@ -82,9 +93,11 @@ func (c *Collection) IndexSizes() IndexSizes {
 			}
 			for id, cp := range si.cat {
 				catBytes[id] += cp.sizeBytes()
+				catSketch[id] += cp.stats.sketchBytes()
 			}
 			for id, vp := range si.val {
 				valBytes[id] += vp.sizeBytes()
+				valSketch[id] += vp.stats.sketchBytes()
 			}
 		}
 		sh.mu.RUnlock()
@@ -100,22 +113,24 @@ func (c *Collection) IndexSizes() IndexSizes {
 	}
 	dataBytes := c.Stats().LiveBytes()
 	out := IndexSizes{DataBytes: dataBytes}
-	appendSizes := func(m map[uint32]int64, kind string) {
+	appendSizes := func(m, sketch map[uint32]int64, kind string) {
 		for id, b := range m {
 			nm, ok := name(id)
 			if !ok {
 				continue
 			}
-			sz := IndexSize{Attr: nm, Kind: kind, Bytes: b, Auto: spec.isAuto(id)}
+			sk := sketch[id]
+			sz := IndexSize{Attr: nm, Kind: kind, Bytes: b, SketchBytes: sk, Auto: spec.isAuto(id)}
 			if dataBytes > 0 {
 				sz.Frac = float64(b) / float64(dataBytes)
 			}
 			out.PerIndex = append(out.PerIndex, sz)
 			out.TotalBytes += b
+			out.TotalSketchBytes += sk
 		}
 	}
-	appendSizes(catBytes, "categorical")
-	appendSizes(valBytes, "value")
+	appendSizes(catBytes, catSketch, "categorical")
+	appendSizes(valBytes, valSketch, "value")
 	// Largest first: the indexes a memory budget would trim.
 	sort.Slice(out.PerIndex, func(i, j int) bool {
 		if out.PerIndex[i].Bytes != out.PerIndex[j].Bytes {

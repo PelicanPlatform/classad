@@ -37,6 +37,23 @@ func TestIndexSizesAndProvenance(t *testing.T) {
 	if s := byAttr["Memory"]; s.Auto {
 		t.Errorf("Memory (Options) should be human, got auto")
 	}
+
+	// Sketch accounting: categorical indexes carry a bloom + HLL, so their SketchBytes
+	// is positive and reported apart from the posting Bytes; the value index carries only
+	// an HLL (no bloom). TotalSketchBytes sums them and is not folded into TotalBytes.
+	if s := byAttr["Owner"]; s.SketchBytes <= 0 {
+		t.Errorf("Owner (categorical) should report sketch bytes (bloom+HLL); got %+v", s)
+	}
+	if s := byAttr["Memory"]; s.SketchBytes <= 0 {
+		t.Errorf("Memory (value) should report sketch bytes (HLL); got %+v", s)
+	}
+	var sumSketch int64
+	for _, s := range sz.PerIndex {
+		sumSketch += s.SketchBytes
+	}
+	if sz.TotalSketchBytes != sumSketch || sz.TotalSketchBytes <= 0 {
+		t.Errorf("TotalSketchBytes=%d should equal the per-index sum=%d and be > 0", sz.TotalSketchBytes, sumSketch)
+	}
 }
 
 // TestBudgetTrimNeverDropsHuman: with a tight memory budget, AutoTune trims auto indexes
