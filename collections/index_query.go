@@ -32,6 +32,7 @@ func (c *Collection) Reindex() {
 		// safe to convert to the pageable mmap sidecar; the active segment stays in-RAM.
 		sh.mu.RLock()
 		act := sh.act
+		sealRAM := sh.sealRAM
 		type target struct {
 			seg  *segment
 			used int
@@ -55,7 +56,7 @@ func (c *Collection) Reindex() {
 			if seg.used == 0 {
 				continue
 			}
-			sealable := persistent && seg != act
+			sealable := seg != act && (persistent || sealRAM)
 			// Rebuild when the index is missing, behind the write watermark, or built under
 			// an older spec generation; otherwise a current-but-unsealed sealable segment
 			// still needs converting.
@@ -76,10 +77,15 @@ func (c *Collection) Reindex() {
 				si = buildSegIndex(t.seg.data, t.used, t.seg.codec, spec)
 				t.seg.idx.Store(si)
 			}
-			// Sealed persistent segment: move its index off the heap into the mmap sidecar
-			// (reclaimable, GC-invisible). Best-effort; on failure the in-RAM index stays.
+			// Sealed segment: move its index off the heap into the mmap sidecar (reclaimable,
+			// GC-invisible) -- a file sidecar for a persistent segment, an anonymous mapping
+			// for a RAM one. Best-effort; on failure the in-RAM index stays.
 			if t.seal {
-				c.sealSegmentIndex(t.seg, si)
+				if persistent {
+					c.sealSegmentIndex(t.seg, si)
+				} else {
+					c.sealSegmentIndexAnon(t.seg, si)
+				}
 			}
 		}
 	}

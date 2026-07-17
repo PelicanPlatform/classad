@@ -110,9 +110,24 @@ seal for live segments too.
 7. ✅ **Accounting + doc.** `Collection.SidecarSizes()` reports the live store's sealed
    sidecars (mapped/evictable, MPH+Bloom broken out); `IndexSizes` now measures only the
    in-RAM active segments; design README §8/§10 updated.
+8. ✅ **In-memory anon flip (the collector's GC win).** Sealed RAM segments seal their index
+   into an **anonymous** mmap sidecar (`sealSegmentIndexAnon`, off the Go heap), gated on
+   in-memory + mmap-supported + indexes configured at construction (`shard.sealRAM`). The
+   crux was **pin/reap for RAM segments**: a plain RAM segment relies on the GC and skips
+   pin/reap, but an anon mapping is not GC-managed, so a scan reading it could race a
+   compaction that unmaps it. Fix: a RAM segment that carries an anon sidecar is made
+   pin/reap-eligible **from birth** (`segment.pinReap`, set in `allocSeg`/compaction for a
+   sealing shard), so `segment.mapped()` (`file != nil || pinReap`) drives pin/unpin/retire/
+   closeUnmap uniformly — the pin at scan start unconditionally brackets any later `msidx`
+   read, exactly as `file != nil` does for a persistent segment. `Collection.Close` now
+   routes through the pin-aware `closeUnmap` so the anon sidecars unmap (and, as a bonus, the
+   persistent path stops leaking its `.idx` mapping at Close). `TestSealedSegmentsGoAnonMmap`
+   covers it; full suite + race clean.
 
 ## Follow-ups (not in this work)
 
-- **Data arenas off-heap for the in-memory DB.** A separate, smaller GC win (the arenas are
-  pointer-free → pacing/RSS, not mark cost). Anonymous-mmap the RAM segment backing.
+- **Data arenas off-heap for the in-memory DB.** A separate, larger GC win (the arenas are
+  pointer-free → pacing/RSS/mark cost across the whole record body, not just the index).
+  Anonymous-mmap the RAM segment backing itself. The pin/reap-for-RAM machinery added in
+  step 8 is a prerequisite (a scan reading anon record bytes must pin them too).
 - **`mlock` knob** for latency-critical stores that want the sidecar pinned resident.

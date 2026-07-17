@@ -39,6 +39,12 @@ type shard struct {
 	// surfaced to the caller by Put/Update.
 	alloc    func(id uint32, size int, codec Codec) (*segment, error)
 	writeErr error
+	// sealRAM, when true, makes this (in-memory) shard's RAM segments seal their sealed
+	// index to an anonymous mmap sidecar rather than keep it on the Go heap. It also makes
+	// those RAM segments participate in pin/reap (see segment.mapped): the anon mapping is
+	// not GC-managed, so scans must pin it and compaction/Close must unmap it. Set once at
+	// construction (in-memory + mmap-supported + indexes configured); never mutated.
+	sealRAM bool
 	dirty    []*segment // segments with unsynced writes since the last sync (persistent)
 	// dirtySup lists supersededBySeq fields tombstoned by a delete since the last
 	// sync; their pages must be msync'd for the delete to be durable (unlike an
@@ -88,7 +94,9 @@ func newShard(segSize int, onSync func()) *shard {
 // lock.
 func (sh *shard) allocSeg(id uint32, size int, codec Codec) *segment {
 	if sh.alloc == nil {
-		return newSegment(id, size, codec)
+		s := newSegment(id, size, codec)
+		s.pinReap = sh.sealRAM // pin/reap-eligible so its anon sidecar tears down safely
+		return s
 	}
 	seg, err := sh.alloc(id, size, codec)
 	if err != nil {

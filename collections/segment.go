@@ -107,7 +107,18 @@ type segment struct {
 	// segment's mmap'd sidecar index at the same pin-drained moment its data is
 	// reaped, so a query scanning a rotating segment never reads a torn index mapping.
 	onReap func()
+
+	// pinReap makes a RAM segment (file==nil) participate in pin/reap anyway, because it
+	// carries an anonymous mmap sidecar index (in-memory sealing): the anon mapping is not
+	// GC-managed, so scans must pin it and compaction/Close must unmap it via onReap, exactly
+	// as for a file-backed segment. Set at creation for an in-memory sealing shard; immutable.
+	pinReap bool
 }
+
+// mapped reports whether the segment holds a non-GC mapping that scans must pin and reap
+// must tear down: a file-backed data mmap, or (RAM store) an anon-mmap sealed sidecar. A
+// plain RAM segment (neither) relies on the GC and skips pin/reap entirely.
+func (s *segment) mapped() bool { return s.file != nil || s.pinReap }
 
 // readIdx returns the segment's queryable index behind the readIndex interface: the mmap'd
 // sidecar (msidx) once the segment is sealed and converted, else the in-RAM segIndex, else
@@ -123,10 +134,11 @@ func (s *segment) readIdx() readIndex {
 	return nil
 }
 
-// pin marks the start of a scan's use of a segment (mmap only; RAM segments rely on
-// the GC). Balanced by unpin. Called under the shard read lock.
+// pin marks the start of a scan's use of a segment. Balanced by unpin. Skipped for a
+// plain RAM segment (GC-managed); engaged for a file-backed segment or a RAM segment with
+// an anon sidecar (see mapped). Called under the shard read lock.
 func (s *segment) pin() {
-	if s.file == nil {
+	if !s.mapped() {
 		return
 	}
 	s.reapMu.Lock()
@@ -137,7 +149,7 @@ func (s *segment) pin() {
 // unpin ends a scan's use of a segment; if the segment was retired while pinned and
 // this was the last pin, it is reaped now (munmap + unlink). Called with no lock.
 func (s *segment) unpin() {
-	if s.file == nil {
+	if !s.mapped() {
 		return
 	}
 	s.reapMu.Lock()
@@ -171,9 +183,10 @@ func (s *segment) unmapAndHook() error {
 // otherwise it defers the unmap to the last unpin (so a live watch never reads a
 // mapping torn down under it -- the bug the pin count exists to prevent). Unlike
 // retire/reap it does not unlink the backing file. Idempotent; caller holds the
-// Archive mutex, so no new pin can be taken concurrently. No-op for RAM segments.
+// Archive mutex, so no new pin can be taken concurrently. No-op for a plain RAM segment;
+// a RAM segment with an anon sidecar unmaps it (via the reap hook) when its pins drain.
 func (s *segment) closeUnmap() error {
-	if s.file == nil {
+	if !s.mapped() {
 		return nil
 	}
 	s.reapMu.Lock()
@@ -223,10 +236,11 @@ func (s *segment) reapAndHook() error {
 
 // retire removes a compaction source segment from the live set. It returns true if
 // the caller should reap() it now (no scan references it); otherwise the last unpin
-// reaps it. For a RAM segment it is a no-op (the caller nils the slot; the GC frees
-// it). Called under the shard write lock.
+// reaps it. For a plain RAM segment it is a no-op (the caller nils the slot; the GC frees
+// it); a RAM segment with an anon sidecar retires like an mmap one so its sidecar unmaps.
+// Called under the shard write lock.
 func (s *segment) retire() (reapNow bool) {
-	if s.file == nil {
+	if !s.mapped() {
 		return false
 	}
 	s.reapMu.Lock()

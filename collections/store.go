@@ -353,6 +353,17 @@ func New(opts Options) *Collection {
 		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
+	// In-memory sealing: when this collection is in-memory (no Dir), mmap is supported, and
+	// indexes are configured, seal each sealed RAM segment's index into an anonymous mmap
+	// sidecar (off the Go heap: no GC scan of the sealed majority's bitmaps, RSS reclaimable
+	// under pressure). The active segment stays in-RAM. A collection with no indexes at
+	// construction keeps heap indexes (the flag is fixed here; a later AddIndex does not flip
+	// already-born segments), so pure key/value in-memory stores pay no pin/reap cost.
+	if opts.Dir == "" && mmapSupported && c.spec.Load().any() {
+		for _, sh := range c.shards {
+			sh.sealRAM = true
+		}
+	}
 	// Encryption at rest: build the DB-wide data-key sealer and the explicit encrypted-attr
 	// set. An encrypted attribute (explicit, or an always-encrypted private attribute) must
 	// not also be indexed -- its value is stored opaque, so it could never satisfy an index.
