@@ -56,6 +56,52 @@ func archiveQueryIDs(t *testing.T, a *Archive, qs string) []int {
 	return ids
 }
 
+// TestArchiveCategoricalBloom checks the v5 categorical bloom: a query for a value that
+// is definitely absent returns nothing (the bloom fast path skips the key-blob search),
+// while a present value still returns exactly its records (the filter never drops a
+// match). Uses many small segments so several sidecar blooms are exercised.
+func TestArchiveCategoricalBloom(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, _ := buildArchive(t, dir, 500, ArchiveOptions{
+		CategoricalAttrs: []string{"Owner", "JobStatus"},
+		ValueAttrs:       []string{"Memory", "ClusterId"},
+	})
+	defer a.Close()
+	if err := a.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if len(a.segs) < 2 {
+		t.Fatalf("expected several segments, got %d", len(a.segs))
+	}
+
+	// Absent value: bloom proves it definitely absent across every segment -> empty.
+	if ids := archiveQueryIDs(t, a, `Owner == "nobody_zzz"`); len(ids) != 0 {
+		t.Errorf("absent value should match nothing, got %v", ids)
+	}
+	// Present value: every alice record (owners[i%5], alice at i%5==0) must still match.
+	var want []int
+	for i := 0; i < 500; i++ {
+		if i%5 == 0 {
+			want = append(want, i)
+		}
+	}
+	got := archiveQueryIDs(t, a, `Owner == "alice"`)
+	if len(got) != len(want) {
+		t.Fatalf("Owner==alice: got %d ids, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Owner==alice mismatch at %d: got %d want %d", i, got[i], want[i])
+		}
+	}
+
+	// The sidecar must be the bloom-carrying version.
+	if sidecarVersion != 5 {
+		t.Fatalf("expected sidecar v5, got %d", sidecarVersion)
+	}
+}
+
 func TestArchiveRoundTripAndQuery(t *testing.T) {
 	t.Parallel()
 	a, src := buildArchive(t, t.TempDir(), 500, ArchiveOptions{
