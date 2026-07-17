@@ -46,6 +46,67 @@ func (vp *valPostings) sizeBytes() int64 {
 	return n
 }
 
+// SidecarSizes reports the on-disk index bytes of an Archive's sealed sidecars, broken out
+// so the minimal-perfect-hash and bloom overhead is visible. These are distinct from the
+// live Collection's IndexSizes: those measure HEAP-resident postings + sketches, whereas
+// sidecar bytes live in the page cache -- demand-paged and evictable under memory pressure.
+// They are reported as a separate budget, never folded into a heap figure, so the
+// "index is N% of data" watermark stays an honest measure of resident memory.
+type SidecarSizes struct {
+	Segments    int   `json:"segments"`    // sealed segments with a sidecar
+	MappedBytes int64 `json:"mappedBytes"` // total sidecar bytes (mmap-backed, evictable)
+	MPHBytes    int64 `json:"mphBytes"`    // of MappedBytes, minimal-perfect-hash structures
+	BloomBytes  int64 `json:"bloomBytes"`  // of MappedBytes, bloom filters
+}
+
+// SidecarSizes sums each sealed segment's sidecar size and its MPH/bloom portions. It maps
+// each sidecar briefly and closes it immediately, so it is an operator diagnostic, not a
+// hot path. The active (unsealed) segment has no sidecar and is skipped.
+func (a *Archive) SidecarSizes() SidecarSizes {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	var out SidecarSizes
+	for _, as := range a.segs {
+		if !as.sealed {
+			continue
+		}
+		data, closer, err := mapFile(a.idxPath(as.seg.id))
+		if err != nil {
+			continue
+		}
+		out.Segments++
+		out.MappedBytes += int64(len(data))
+		mph, bloom := sidecarSketchBreakdown(data)
+		out.MPHBytes += mph
+		out.BloomBytes += bloom
+		_ = closer()
+	}
+	return out
+}
+
+// sidecarSketchBreakdown sums the MPH and bloom block bytes across a v6 sidecar's
+// categorical attributes. Returns (0,0) for a sidecar that does not parse (e.g. an older
+// version), since only a current sidecar carries these blocks.
+func sidecarSketchBreakdown(data []byte) (mph, bloom int64) {
+	si, err := parseMmapSidecar(data)
+	if err != nil {
+		return 0, 0
+	}
+	for _, attrOff := range si.catDir {
+		bloomOff := si.catBloomOff(attrOff)
+		bloomM := le32(data, bloomOff+4)
+		bloom += 8 + int64(bloomM/64)*8
+		mphOff := si.catMPHOff(attrOff)
+		if mphLen := le32(data, mphOff); mphLen > 0 {
+			nAssigned := le32(data, mphOff+4)
+			mph += 4 + int64(mphLen) + int64(nAssigned)*4
+		} else {
+			mph += 4 // just the mphBlockLen==0 marker
+		}
+	}
+	return mph, bloom
+}
+
 // IndexSize is the measured memory footprint of one attribute's index.
 type IndexSize struct {
 	Attr  string `json:"attr"`

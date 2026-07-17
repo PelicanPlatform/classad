@@ -35,7 +35,13 @@ import (
 //	         bloomK uint32; bloomM uint32; bloom [bloomM/64] uint64  (v5) -- categorical
 //	         membership filter over the folded keys. A miss on every probe value lets a
 //	         query skip binary-searching (and paging) the sorted key blob for that probe;
-//	         bloomM==0 means no filter (empty index).
+//	         bloomM==0 means no filter (empty index);
+//	         mphBlockLen uint32; [MPH bytes]; slotSortedIdx [nAssigned] uint32  (v6) --
+//	         a minimal perfect hash over the folded keys for O(1) equality on a
+//	         high-cardinality attr (built only when NDV >= mphNDVThreshold; mphBlockLen==0
+//	         means none). mphLookupBytes -> slot -> slotSortedIdx[slot] indexes the folded
+//	         keyOff/bmOff arrays; the caller verifies the key and falls back to binary
+//	         search, so the MPH is a fast path, never authoritative.
 //	  val attr block @attrOff: excOff uint32; postedOff uint32; n uint32;
 //	         key [n] float64 (sorted asc); bmOff [n] uint32
 //
@@ -46,7 +52,14 @@ import (
 // simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 5
+	sidecarVersion = 6
+
+	// mphNDVThreshold gates the categorical minimal-perfect-hash: only an attribute with
+	// at least this many distinct values in a segment gets one. Below it, the sorted key
+	// blob is small enough that binary search (two or three comparisons, one or two pages)
+	// plus the bloom already resolve equality cheaply, and the MPH's per-key overhead would
+	// not pay for itself.
+	mphNDVThreshold = 4096
 )
 
 // writeSidecarIndex serializes si to path (v2 sorted runs) and fsyncs it. si is
@@ -248,6 +261,27 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		} else {
 			b = appendU32(b, 0) // bloomK
 			b = appendU32(b, 0) // bloomM == 0: no filter
+		}
+		// Categorical MPH (v6), immediately after the bloom. Gated on NDV: a high-cardinality
+		// attribute gets O(1) equality; a small one keeps bloom + binary search. mphBlockLen==0
+		// marks "no MPH". slotSortedIdx maps an MPH slot to the sorted index, so the reader
+		// reuses the folded keyOff/bmOff arrays (no key or bitmap-offset duplication).
+		if len(cb.keys) >= mphNDVThreshold {
+			m, slots := buildMPH(cb.keys)
+			mphBytes := appendMPH(nil, m)
+			b = appendU32(b, uint32(len(mphBytes)))
+			b = append(b, mphBytes...)
+			slotIdx := make([]uint32, m.nAssigned)
+			for sortedIdx, s := range slots {
+				if s >= 0 {
+					slotIdx[s] = uint32(sortedIdx)
+				}
+			}
+			for _, idx := range slotIdx {
+				b = appendU32(b, idx)
+			}
+		} else {
+			b = appendU32(b, 0) // mphBlockLen == 0: no MPH
 		}
 	}
 	for i, vb := range valBlks {

@@ -766,8 +766,32 @@ The design that follows:
   entirely — the win for a large, mostly-categorical history table, where an equality lookup
   for a value not in a segment would otherwise page and binary-search that segment's whole
   sorted key run. (Zone maps already give the numeric analogue; the Bloom is the categorical
-  one.) The sidecar is versioned and rebuilt at seal, so a format bump needs no migration —
-  an older sidecar is rejected and the segment reindexed.
+  one.) A high-cardinality categorical block additionally carries a **minimal perfect hash**
+  (BBHash, sidecar v6, built only when the segment's NDV for that attribute clears a
+  threshold): equality then probes the MPH — a bit-test plus a popcount-rank, ~1 page — to a
+  slot, verifies the key, and reads the bitmap offset, replacing the O(log n) scattered-page
+  binary search for present values (the point-lookup case a bloom cannot help, e.g. find a
+  job by `GlobalJobId`). The MPH is a **pure fast path**: a member resolves to its own slot,
+  a non-member is caught by the key verify, and any miss falls back to the still-present
+  sorted-run binary search, which stays authoritative — so a build bug can only cost a
+  redundant search, never a wrong answer. The sidecar is versioned and rebuilt at seal, so a
+  format bump needs no migration — an older sidecar is rejected and the segment reindexed.
+- **Residency — what stays mapped vs. what is reconstructed.** The two persistent tiers make
+  opposite choices, and it is worth being explicit about what each holds resident:
+  - *Archive sidecar (this chapter):* **nothing is reconstructed into the heap.** `Open`/query
+    parse only the fixed header and the few-entry attribute directory (O(#indexed attributes))
+    and then read keys, offsets, bloom, MPH, and bitmaps **in place over the mmap** — bitmaps
+    materialize lazily via copy-on-write `FromBuffer` for only the postings a probe touches.
+    So the resident cost is the directory plus whatever pages a query faults in; everything
+    else is demand-paged and evictable. These bytes are reported by `SidecarSizes` (mapped
+    total, with the MPH and bloom portions broken out) **separately** from the live tier's
+    heap figure, so the memory watermark isn't inflated by evictable page-cache bytes.
+  - *Live persistent Collection (Chapter 8/10):* the opposite — it **restores the full in-RAM
+    `segIndex`** from a snapshot. Only the postings are serialized; on load the value index's
+    sorted keys and **all** per-segment sketches — min/max, the categorical bloom, the HLL,
+    and the top-N heavy hitters — are **recomputed by `finishStats`** from the restored
+    postings (a decode reproduces a byte-identical index). Nothing else is reconstructed: the
+    directory (key→location) still comes from the max-seq record replay, not the snapshot.
 - **Newest-first + LIMIT pushdown.** Segments (and records within the active tail) are
   visited in reverse chronological order, and a `Limit(K)` stops the scan once K matches are
   yielded — essential when the constraint is broad but the caller wants one page.
