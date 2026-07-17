@@ -356,6 +356,35 @@ func (si *mmapSegIndex) catFindEq(attrOff uint32, key string) (bmOff uint32, ok 
 	return si.catFind(attrOff, key)
 }
 
+// catCanonicalValues emits each distinct canonical spelling of categorical attribute id by
+// iterating the sidecar's exact-case run, which writeSidecarIndex populated with exactly the
+// canonical spellings (a case-uniform bucket contributes its spelling; a mixed-case bucket
+// contributes each exact spelling) -- the same set segIndex.catCanonicalValues produces.
+func (si *mmapSegIndex) catCanonicalValues(id uint32, add func(string) bool) bool {
+	d := si.data
+	attrOff, ok := si.catDir[id]
+	if !ok {
+		return true
+	}
+	n := le32(d, attrOff+8)
+	keyOffBase := attrOff + 12
+	bmOffBase := keyOffBase + (n+1)*4
+	blobBase := bmOffBase + n*4
+	exOff := blobBase + le32(d, keyOffBase+n*4) // + folded blob length
+	exN := le32(d, exOff)
+	exKeyOffBase := exOff + 4
+	exBmOffBase := exKeyOffBase + (exN+1)*4
+	exBlobBase := exBmOffBase + exN*4
+	for i := uint32(0); i < exN; i++ {
+		ks := exBlobBase + le32(d, exKeyOffBase+i*4)
+		ke := exBlobBase + le32(d, exKeyOffBase+(i+1)*4)
+		if !add(string(d[ks:ke])) {
+			return false
+		}
+	}
+	return true
+}
+
 // catFindMPH probes the categorical MPH (v6). It returns (bmOff, true) only for a key that
 // the MPH resolves AND whose folded spelling verifies at the resolved slot; any other case
 // -- no MPH, an unresolved key (unassigned member or non-member), or a verify mismatch (an

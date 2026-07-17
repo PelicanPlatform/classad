@@ -20,6 +20,10 @@ type readIndex interface {
 	skipsPrefix(usable []usableProbe) bool
 	estCandidates(up usableProbe) float64 // selectivity estimate (ordering/tuning only)
 	coveredUpto() uint32                  // the index covers offsets [0, coveredUpto); the tail is scanned
+	// catCanonicalValues emits each distinct canonical spelling of categorical attribute id
+	// (for MATCH's finite-value materialization). add returns false to stop early;
+	// catCanonicalValues then returns false too. Returns true when all values were emitted.
+	catCanonicalValues(id uint32, add func(string) bool) bool
 }
 
 // indexPrimitives are the per-tier operations the shared planner logic (below) is built on.

@@ -3,6 +3,7 @@ package collections
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -95,6 +96,30 @@ func TestReadIndexParity(t *testing.T) {
 				}
 				if !bmEqual(live.candidateOffsets(usable), mm.candidateOffsets(usable)) {
 					t.Errorf("seg %d %q: candidateOffsets mismatch", seg.id, qs)
+				}
+			}
+
+			// catCanonicalValues must emit the same set from both tiers (matchmaking relies
+			// on the complete distinct-value set per segment).
+			for _, attr := range []string{"Owner", "State", "JobId"} {
+				id, ok := c.intern.LookupID(attr)
+				if !ok {
+					continue
+				}
+				collect := func(ix readIndex) []string {
+					var vs []string
+					ix.catCanonicalValues(id, func(v string) bool { vs = append(vs, v); return true })
+					sort.Strings(vs)
+					return vs
+				}
+				lv, mv := collect(live), collect(mm)
+				if len(lv) != len(mv) {
+					t.Fatalf("seg %d %s: canonical count %d vs %d", seg.id, attr, len(lv), len(mv))
+				}
+				for i := range lv {
+					if lv[i] != mv[i] {
+						t.Errorf("seg %d %s: canonical[%d] %q vs %q", seg.id, attr, i, lv[i], mv[i])
+					}
 				}
 			}
 

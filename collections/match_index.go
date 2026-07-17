@@ -562,36 +562,45 @@ func (c *Collection) distinctCatValues(attr string, max int) []string {
 	for _, sh := range c.shards {
 		_, wins := sh.snapshot()
 		for _, w := range wins {
-			si := w.seg.idx.Load()
+			si := w.seg.readIdx()
 			if si == nil {
 				continue
 			}
-			cp := si.cat[id]
-			if cp == nil {
-				continue
-			}
-			for f := range cp.post { // case-uniform buckets: canonical spelling
-				if ec, has := cp.exactCase[f]; has {
-					v := f
-					if ec != "" {
-						v = ec
-					}
-					if !add(v) {
-						releaseWindows(wins)
-						return nil
-					}
-				}
-			}
-			for e := range cp.exact { // mixed-case buckets: each exact spelling
-				if !add(e) {
-					releaseWindows(wins)
-					return nil
-				}
+			if !si.catCanonicalValues(id, add) {
+				releaseWindows(wins)
+				return nil
 			}
 		}
 		releaseWindows(wins)
 	}
 	return out
+}
+
+// catCanonicalValues emits each distinct canonical spelling of categorical attribute id:
+// the canonical form of every case-uniform bucket (from post + exactCase) plus every
+// mixed-case exact spelling (from exact). Mirrors what the sidecar's exact-case run stores.
+func (si *segIndex) catCanonicalValues(id uint32, add func(string) bool) bool {
+	cp := si.cat[id]
+	if cp == nil {
+		return true
+	}
+	for f := range cp.post {
+		if ec, has := cp.exactCase[f]; has {
+			v := f
+			if ec != "" {
+				v = ec
+			}
+			if !add(v) {
+				return false
+			}
+		}
+	}
+	for e := range cp.exact {
+		if !add(e) {
+			return false
+		}
+	}
+	return true
 }
 
 // materializeFinite walks the boolean tree of a slot predicate and replaces each opaque
