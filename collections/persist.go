@@ -287,6 +287,12 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		}
 		seg.used = used
 		seg.synced = used
+		// Restore this segment's index from its on-disk snapshot, if present and current,
+		// so the Reindex that follows Open rebuilds only the segments that lack a valid
+		// one (a grown/active segment or a spec change) instead of re-indexing everything.
+		if spec := c.spec.Load(); spec != nil && spec.any() {
+			c.loadIndexSnapshot(seg, spec)
+		}
 		sh.segs = append(sh.segs, seg)
 	}
 	c.rebuildDir(sh)

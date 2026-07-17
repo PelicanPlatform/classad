@@ -92,6 +92,7 @@ func (s *segment) reap() error {
 		if e := os.Remove(s.path); err == nil {
 			err = e
 		}
+		os.Remove(s.path + ".idx") // best-effort: drop the index snapshot with the segment
 	}
 	s.file = nil
 	return err
