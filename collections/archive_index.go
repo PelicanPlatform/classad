@@ -3,6 +3,7 @@ package collections
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"os"
 	"sort"
@@ -52,7 +53,7 @@ import (
 // simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 7
+	sidecarVersion = 8          // v8 appended a CRC-32C footer over the whole sidecar
 
 	// mphNDVThreshold gates the categorical minimal-perfect-hash: only an attribute with
 	// at least this many distinct values in a segment gets one. Below it, the sorted key
@@ -326,7 +327,23 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 	}
 
 	binary.LittleEndian.PutUint32(b[metaOffPos:], metaOff)
+	// CRC-32C footer over all preceding bytes (v8). The sidecar is derived state, so a
+	// mismatch on load is a rebuild trigger, never fatal. parseMmapSidecar reads via metaOff
+	// and never touches this tail, so the footer is transparent to the lazy mmap reader.
+	b = appendU32(b, crc32.Checksum(b, crcTable))
 	return b, nil
+}
+
+// sidecarCRCValid recomputes the CRC-32C footer and reports whether it matches. A false
+// result means the sidecar is corrupt (bit-rot or a torn write) and must be rebuilt from the
+// data. The live tier checks this on load; the archive's lazy reader does not (a full verify
+// would page the whole sidecar and defeat its >RAM design).
+func sidecarCRCValid(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	want := binary.LittleEndian.Uint32(data[len(data)-4:])
+	return crc32.Checksum(data[:len(data)-4], crcTable) == want
 }
 
 // --- little-endian append helpers ---

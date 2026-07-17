@@ -66,6 +66,48 @@ func TestSidecarStatsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSidecarCRC checks the v8 footer: an intact sidecar validates, and any corruption
+// (a flipped byte, a truncation) is detected so the caller rebuilds from the data.
+func TestSidecarCRC(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 1, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	for i := 0; i < 1000; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Owner="u%d"; Memory=%d ]`, i, i%20, (i%8+1)*512))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+	var si *segIndex
+	for _, sh := range c.shards {
+		for _, seg := range sh.segs {
+			if seg != nil && seg.idx.Load() != nil {
+				si = seg.idx.Load()
+			}
+		}
+	}
+	if si == nil {
+		t.Fatal("no index built")
+	}
+	b, err := buildSidecarIndex(si)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sidecarCRCValid(b) {
+		t.Fatal("intact sidecar failed CRC")
+	}
+	// Flip a byte in the body.
+	bad := append([]byte(nil), b...)
+	bad[len(bad)/2] ^= 0x40
+	if sidecarCRCValid(bad) {
+		t.Error("corrupted sidecar passed CRC")
+	}
+	// Truncated tail.
+	if sidecarCRCValid(b[:len(b)-8]) {
+		t.Error("truncated sidecar passed CRC")
+	}
+}
+
 func assertStatsEqual(t *testing.T, kind string, want, got *segStats) {
 	t.Helper()
 	if got == nil {
