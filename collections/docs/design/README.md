@@ -547,12 +547,37 @@ The query planner is the reusable heart of the index path, and it embodies tenet
   covers only part of a segment, only costs selectivity — never a wrong answer. Dropping
   a constraint can only *widen* the candidate set.
 
-Because indexes are derived state, they are **not persisted** — a persistent collection
-rebuilds them on `Open` (the same `Reindex` over recovered segments), which is why an
-index configuration must be supplied identically at reopen. A demand tracker records
-which attributes queries filter on, so `SuggestIndexes` can recommend indexes a workload
-would benefit from; auto-maintenance can refresh the hot set and retrain dictionaries on
-a timer.
+Two refinements make the index path do less work per query:
+
+- **Boundary-searched value index.** A value index keeps its distinct keys in a sorted
+  companion slice (`sortedKeys`, filled at build), so a range probe binary-searches to the
+  matching `[from, to)` key run (`sort.Search`) and ORs only those bitmaps rather than
+  scanning every distinct value; equality stays an O(1) map lookup. The persisted archive
+  index (§14) does the same over its on-disk sorted runs.
+- **Per-segment skip + selectivity (`segstats.go`).** Each built segment index carries a
+  compact, postings-free summary per indexed attribute: the numeric **min/max** range, a
+  categorical **Bloom filter** over the value set, an exact distinct-value count plus a
+  mergeable **HyperLogLog** sketch, and the top-N heavy hitters. It earns its keep twice.
+  (1) *Segment skip* — before enumerating a segment's candidates, a required equality or
+  range conjunct the summary proves unsatisfiable (a value outside `[min,max]`; every probe
+  value a Bloom miss) lets the whole indexed prefix be skipped — *provided* no exceptional
+  (present-but-wrong-type) record could still match, since those are always re-verified.
+  (2) *Probe ordering* — the planner estimates each probe's candidate cardinality from the
+  top-N and HLL and intersects the most selective first. These sketches are bounded (≤8 KiB
+  Bloom + 1 KiB HLL per attribute per segment); a Bloom hit may be a false positive (only
+  forgoing a skip, never dropping a match), so soundness is preserved by construction.
+
+Because indexes are derived state, they are **not persisted** in the live/normal
+collection — a persistent collection rebuilds them on `Open` (the same `Reindex` over
+recovered segments), which is why an index configuration must be supplied identically at
+reopen. (The archive is the exception: its segments are immutable once sealed, so it
+persists a write-once sidecar index — §14.) A demand tracker records which attributes
+queries filter on, so `SuggestIndexes` can recommend indexes a workload would benefit
+from, and the auto-tuner grows/trims indexes against a memory watermark. That watermark is
+measured by `IndexSizes`, which reports each attribute's resident **posting** bytes (the
+roaring bitmaps + keys) and, separately, its **sketch** bytes (`SketchBytes`: the Bloom +
+HLL above) so the sketch overhead is visible rather than hidden — the budget itself is
+calibrated on posting bytes.
 
 ## 11. Parallel query
 
@@ -716,14 +741,20 @@ The design that follows:
   consistent version.
 - **Pageable indexes for > RAM.** A high-cardinality attribute's per-value lookup structure
   would blow the heap long before its bitmap payloads do, so the archive **materializes no
-  map**. The v2 sidecar stores each attribute's postings as a **sorted key run** (sorted
+  map**. The sidecar stores each attribute's postings as a **sorted key run** (sorted
   values + parallel bitmap-offset array) queried *directly over the mmap*: equality is a
   binary search, range a boundary scan, and roaring bitmaps are built lazily via zero-copy
   `FromBuffer` for only the postings a probe touches. Resident memory is therefore
   O(#indexed attributes), independent of value cardinality; keys, offsets, and payloads all
   stay demand-paged. Indexes load lazily, so a zone-pruned segment never pages its index in,
   and unmapping routes through the same `pin/reap` hook so a rotation never unmaps under a
-  live scan.
+  live scan. Each categorical block also carries the **Bloom filter** built at seal (sidecar
+  v5): a query for a value the filter proves absent skips the key-blob binary search
+  entirely — the win for a large, mostly-categorical history table, where an equality lookup
+  for a value not in a segment would otherwise page and binary-search that segment's whole
+  sorted key run. (Zone maps already give the numeric analogue; the Bloom is the categorical
+  one.) The sidecar is versioned and rebuilt at seal, so a format bump needs no migration —
+  an older sidecar is rejected and the segment reindexed.
 - **Newest-first + LIMIT pushdown.** Segments (and records within the active tail) are
   visited in reverse chronological order, and a `Limit(K)` stops the scan once K matches are
   yielded — essential when the constraint is broad but the caller wants one page.
