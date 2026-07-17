@@ -66,6 +66,18 @@ const (
 // built transiently at seal and discarded after — the archive never retains an
 // in-RAM index; queries mmap the sidecar (mmapSegIndex).
 func writeSidecarIndex(path string, si *segIndex) error {
+	b, err := buildSidecarIndex(si)
+	if err != nil {
+		return err
+	}
+	return writeFileSync(path, b)
+}
+
+// buildSidecarIndex serializes si to the sidecar byte layout (documented on
+// writeSidecarIndex). The bytes back either a file mmap (a persistent sealed segment) or an
+// anonymous region (an in-memory one), so the same immutable index representation serves
+// both tiers.
+func buildSidecarIndex(si *segIndex) ([]byte, error) {
 	b := make([]byte, 0, 256)
 	b = appendU32(b, sidecarMagic)
 	b = appendU16(b, sidecarVersion)
@@ -89,7 +101,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 
 	allOff, err := emit(si.all)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	type catBlk struct {
@@ -117,7 +129,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		foldedOff := make(map[string]uint32, len(keys))
 		for i, k := range keys {
 			if bmOffs[i], err = emit(cp.post[k]); err != nil {
-				return err
+				return nil, err
 			}
 			foldedOff[k] = bmOffs[i]
 		}
@@ -146,7 +158,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 			for _, e := range exByFold[f] {
 				off, emitErr := emit(cp.exact[e])
 				if emitErr != nil {
-					return emitErr
+					return nil, emitErr
 				}
 				exPairs = append(exPairs, exPair{e, off})
 			}
@@ -159,11 +171,11 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		}
 		excOff, err := emit(cp.exc)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		postedOff, err := emit(cp.posted)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs, &cp.stats})
 	}
@@ -179,16 +191,16 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		bmOffs := make([]uint32, len(keys))
 		for i, k := range keys {
 			if bmOffs[i], err = emit(vp.post[k]); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		excOff, err := emit(vp.exc)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		postedOff, err := emit(vp.posted)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		valBlks = append(valBlks, valBlk{id, excOff, postedOff, keys, bmOffs, &vp.stats})
 	}
@@ -314,7 +326,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 	}
 
 	binary.LittleEndian.PutUint32(b[metaOffPos:], metaOff)
-	return writeFileSync(path, b)
+	return b, nil
 }
 
 // --- little-endian append helpers ---

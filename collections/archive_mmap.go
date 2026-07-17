@@ -33,3 +33,21 @@ func mapFile(path string) ([]byte, func() error, error) {
 	}
 	return data, func() error { return unix.Munmap(data) }, nil
 }
+
+// mapAnon copies b into a fresh anonymous (file-less) mapping and returns it plus an unmap
+// closer. Used for an in-memory collection's sealed-segment sidecar: the index bytes live
+// OFF the Go heap, so they neither add to GC mark work (a mapping is not scanned) nor to the
+// GOGC-paced heap, and the kernel can MADV_FREE them under pressure -- while the query path
+// reads them exactly as a file-backed sidecar. On munmap the pages are gone (no writeback:
+// an in-memory index is never persisted).
+func mapAnon(b []byte) ([]byte, func() error, error) {
+	if len(b) == 0 {
+		return nil, func() error { return nil }, nil
+	}
+	data, err := unix.Mmap(-1, 0, len(b), unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANON|unix.MAP_PRIVATE)
+	if err != nil {
+		return nil, nil, err
+	}
+	copy(data, b)
+	return data, func() error { return unix.Munmap(data) }, nil
+}

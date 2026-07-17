@@ -123,6 +123,58 @@ func TestReadIndexParity(t *testing.T) {
 	}
 }
 
+// TestSealedIndexBackings checks that both sealed-segment backings -- a file mmap and an
+// anonymous mapping -- produce an index whose query results match the in-RAM segIndex. This
+// is the step-4 substrate for flipping sealed segments to the mmap representation.
+func TestSealedIndexBackings(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 1, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	for i := 0; i < 3000; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Owner="u%d"; Memory=%d ]`, i, i%40, (i%16+1)*512))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+	queries := []string{`Owner == "u3"`, `Owner != "u3"`, `Memory >= 4096`, `Owner == "nope"`, `Memory >= 999999`}
+
+	check := func(name string, mk func(si *segIndex) (*mmapSegIndex, func() error, error)) {
+		segs := 0
+		for _, sh := range c.shards {
+			for _, seg := range sh.segs {
+				if seg == nil {
+					continue
+				}
+				live := seg.idx.Load()
+				if live == nil {
+					continue
+				}
+				mm, closer, err := mk(live)
+				if err != nil {
+					t.Fatalf("%s: %v", name, err)
+				}
+				for _, qs := range queries {
+					q, _ := vm.Parse(qs)
+					u := c.planIndex(q.Probes())
+					if !bmEqual(live.candidateOffsets(u), mm.candidateOffsets(u)) {
+						t.Errorf("%s seg %d %q: candidate mismatch", name, seg.id, qs)
+					}
+				}
+				_ = closer()
+				segs++
+			}
+		}
+		if segs == 0 {
+			t.Fatalf("%s: no segments", name)
+		}
+	}
+
+	check("file", func(si *segIndex) (*mmapSegIndex, func() error, error) {
+		return sealedIndexFromFile(filepath.Join(t.TempDir(), "s.idx"), si)
+	})
+	check("anon", sealedIndexAnon)
+}
+
 func bmEqual(a, b *roaring.Bitmap) bool {
 	if a == nil {
 		a = roaring.New()

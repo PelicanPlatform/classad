@@ -15,3 +15,10 @@ func mapFile(path string) ([]byte, func() error, error) {
 	}
 	return b, func() error { return nil }, nil
 }
+
+// mapAnon falls back to the heap slice itself on platforms without mmap: the sidecar bytes
+// are then GC-cheap (a single pointer-free object, not a map of pointers) but heap-resident
+// rather than off-heap/evictable. Behavior is otherwise identical.
+func mapAnon(b []byte) ([]byte, func() error, error) {
+	return b, func() error { return nil }, nil
+}
