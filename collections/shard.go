@@ -45,7 +45,7 @@ type shard struct {
 	// not GC-managed, so scans must pin it and compaction/Close must unmap it. Set once at
 	// construction (in-memory + mmap-supported + indexes configured); never mutated.
 	sealRAM bool
-	dirty    []*segment // segments with unsynced writes since the last sync (persistent)
+	dirty   []*segment // segments with unsynced writes since the last sync (persistent)
 	// dirtySup lists supersededBySeq fields tombstoned by a delete since the last
 	// sync; their pages must be msync'd for the delete to be durable (unlike an
 	// overwrite, a delete writes no new record, so recovery's max-seq rule cannot
