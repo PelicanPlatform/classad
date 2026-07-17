@@ -134,7 +134,7 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 			// the exceptional records can still match and are re-verified upstream.
 			if !si.catBloomAllAbsent(attrOff, up.svals) {
 				for _, s := range up.svals {
-					if off, ok := si.catFind(attrOff, s); ok {
+					if off, ok := si.catFindEq(attrOff, s); ok {
 						bm.Or(si.bitmapAt(off))
 					}
 				}
@@ -143,7 +143,7 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 			return bm
 		case "!=":
 			bm := si.allBitmap().Clone()
-			if off, ok := si.catFind(attrOff, up.svals[0]); ok {
+			if off, ok := si.catFindEq(attrOff, up.svals[0]); ok {
 				bm.AndNot(si.bitmapAt(off))
 			}
 			return bm
@@ -312,6 +312,57 @@ func (si *mmapSegIndex) catBloomAllAbsent(attrOff uint32, keys []string) bool {
 		}
 	}
 	return true
+}
+
+// catMPHOff returns the file offset of the categorical MPH block (mphBlockLen), which sits
+// immediately after the bloom: bloomK u32; bloomM u32; bloom [bloomM/64] u64.
+func (si *mmapSegIndex) catMPHOff(attrOff uint32) uint32 {
+	bloomOff := si.catBloomOff(attrOff)
+	bloomM := le32(si.data, bloomOff+4)
+	return bloomOff + 8 + (bloomM/64)*8
+}
+
+// catFindEq resolves a categorical equality probe, using the MPH fast path when present and
+// falling back to the sorted-run binary search otherwise (or on an MPH miss / false hit).
+// The binary search is authoritative, so the MPH can only make a hit faster, never wrong.
+func (si *mmapSegIndex) catFindEq(attrOff uint32, key string) (bmOff uint32, ok bool) {
+	if off, hit := si.catFindMPH(attrOff, key); hit {
+		return off, true
+	}
+	return si.catFind(attrOff, key)
+}
+
+// catFindMPH probes the categorical MPH (v6). It returns (bmOff, true) only for a key that
+// the MPH resolves AND whose folded spelling verifies at the resolved slot; any other case
+// -- no MPH, an unresolved key (unassigned member or non-member), or a verify mismatch (an
+// MPH false hit) -- returns ok=false so catFindEq falls back to binary search.
+func (si *mmapSegIndex) catFindMPH(attrOff uint32, key string) (bmOff uint32, ok bool) {
+	d := si.data
+	mphOff := si.catMPHOff(attrOff)
+	mphLen := le32(d, mphOff)
+	if mphLen == 0 {
+		return 0, false
+	}
+	mphStart := mphOff + 4
+	nAssigned := le32(d, mphStart)
+	slot, resolved := mphLookupBytes(d, mphStart, key)
+	if !resolved || slot >= nAssigned {
+		return 0, false
+	}
+	j := le32(d, mphStart+mphLen+slot*4) // slotSortedIdx[slot]: index into the folded run
+	n := le32(d, attrOff+8)
+	if j >= n {
+		return 0, false // defensive: corrupt permutation -> binary search
+	}
+	keyOffBase := attrOff + 12
+	bmOffBase := keyOffBase + (n+1)*4
+	blobBase := bmOffBase + n*4
+	ks := blobBase + le32(d, keyOffBase+j*4)
+	ke := blobBase + le32(d, keyOffBase+(j+1)*4)
+	if cmpStrBytes(key, d[ks:ke]) != 0 {
+		return 0, false // MPH false hit: the slot holds a different key
+	}
+	return le32(d, bmOffBase+j*4), true
 }
 
 // --- value attr block: excOff u32; postedOff u32; n u32; key[n] f64; bmOff[n] u32 ---

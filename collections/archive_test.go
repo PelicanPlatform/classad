@@ -96,9 +96,102 @@ func TestArchiveCategoricalBloom(t *testing.T) {
 		}
 	}
 
-	// The sidecar must be the bloom-carrying version.
-	if sidecarVersion != 5 {
-		t.Fatalf("expected sidecar v5, got %d", sidecarVersion)
+	// The sidecar must be at least the bloom-carrying version.
+	if sidecarVersion < 5 {
+		t.Fatalf("expected sidecar >= v5, got %d", sidecarVersion)
+	}
+}
+
+// TestArchiveMPHEquality exercises the v6 categorical minimal-perfect-hash: a
+// high-cardinality attribute (NDV above the gate) gets an MPH, and equality probes -- both
+// present (exact one record) and absent (empty) -- return results identical to the
+// authoritative data. Uses a large segment so a single sealed segment's NDV trips the gate.
+func TestArchiveMPHEquality(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	a, err := CreateArchive(ArchiveOptions{
+		Dir:              dir,
+		SegmentSize:      8 << 20, // large: keep the high-NDV keys in one sealed segment
+		CategoricalAttrs: []string{"GlobalJobId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	const n = 6000 // > mphNDVThreshold (4096) so the sealed segment builds an MPH
+	for i := 0; i < n; i++ {
+		ad, err := classad.Parse(fmt.Sprintf(`[ Id=%d; GlobalJobId="sched.example.org#%d.0" ]`, i, i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := a.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Present values across the gate boundary resolve to exactly their one record.
+	for _, i := range []int{0, 1, 100, 4095, 4096, 4097, 5999} {
+		ids := archiveQueryIDs(t, a, fmt.Sprintf(`GlobalJobId == "sched.example.org#%d.0"`, i))
+		if len(ids) != 1 || ids[0] != i {
+			t.Fatalf(`GlobalJobId==#%d.0: got %v, want [%d]`, i, ids, i)
+		}
+	}
+	// Absent values (that could be MPH false hits) return nothing.
+	for _, s := range []string{"sched.example.org#999999.0", "nope", "sched.example.org#0.1"} {
+		if ids := archiveQueryIDs(t, a, fmt.Sprintf(`GlobalJobId == %q`, s)); len(ids) != 0 {
+			t.Fatalf("absent %q: got %v, want none", s, ids)
+		}
+	}
+}
+
+// TestArchiveSidecarSizes checks the evictable-bytes accounting: a high-cardinality
+// attribute builds an MPH so MPHBytes is a real fraction of the mapped sidecar bytes, while
+// a low-cardinality one builds none (only the per-attr marker), and neither is folded into
+// a heap figure.
+func TestArchiveSidecarSizes(t *testing.T) {
+	t.Parallel()
+
+	// High cardinality -> MPH built.
+	hi, err := CreateArchive(ArchiveOptions{Dir: t.TempDir(), SegmentSize: 8 << 20, CategoricalAttrs: []string{"GlobalJobId"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hi.Close()
+	for i := 0; i < 6000; i++ {
+		ad, _ := classad.Parse(fmt.Sprintf(`[ Id=%d; GlobalJobId="s#%d.0" ]`, i, i))
+		if err := hi.Append(ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := hi.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	sz := hi.SidecarSizes()
+	if sz.Segments == 0 || sz.MappedBytes == 0 {
+		t.Fatalf("expected sealed sidecars with mapped bytes, got %+v", sz)
+	}
+	if sz.MPHBytes < 6000*4 { // the slotSortedIdx array alone is ~4 bytes/key
+		t.Errorf("MPHBytes=%d too small for a 6000-key MPH", sz.MPHBytes)
+	}
+	if sz.MPHBytes >= sz.MappedBytes {
+		t.Errorf("MPHBytes (%d) should be a fraction of MappedBytes (%d)", sz.MPHBytes, sz.MappedBytes)
+	}
+
+	// Low cardinality -> no MPH, just the per-cat-attr marker (4 bytes each).
+	lo, _ := buildArchive(t, t.TempDir(), 500, ArchiveOptions{CategoricalAttrs: []string{"Owner"}})
+	defer lo.Close()
+	if err := lo.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	lsz := lo.SidecarSizes()
+	if lsz.MappedBytes == 0 {
+		t.Fatal("expected mapped sidecar bytes for the low-NDV archive")
+	}
+	if lsz.MPHBytes > int64(lsz.Segments*8) { // 1 cat attr -> ~4 bytes/segment of markers
+		t.Errorf("low-NDV archive should build no MPH; MPHBytes=%d over %d segments", lsz.MPHBytes, lsz.Segments)
 	}
 }
 
