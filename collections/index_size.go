@@ -6,8 +6,11 @@ import "sort"
 // index occupies across all live segments -- the roaring posting bitmaps plus their
 // keys -- and reports them against the live data bytes, so an operator (and the
 // watermark auto-tuner) can see how much memory indexing costs and decide whether it
-// is worth it. Only built segment indexes count; an unindexed (not-yet-Reindexed)
-// segment contributes nothing.
+// is worth it. Only built, still-in-RAM segment indexes count: after the flip a sealed
+// persistent segment's index moves to an mmap sidecar (idx==nil), so it contributes
+// nothing here and shows up under SidecarSizes instead (evictable page-cache bytes, not
+// heap). In steady state IndexSizes is dominated by the active append segment. An
+// unindexed (not-yet-Reindexed) segment also contributes nothing.
 
 // sizeBytes estimates the resident footprint of one attribute's categorical postings.
 func (cp *catPostings) sizeBytes() int64 {
@@ -80,6 +83,36 @@ func (a *Archive) SidecarSizes() SidecarSizes {
 		out.MPHBytes += mph
 		out.BloomBytes += bloom
 		_ = closer()
+	}
+	return out
+}
+
+// SidecarSizes reports the live Collection's sealed-segment sidecar bytes: the mmap-backed
+// index each sealed segment holds after the flip from the in-RAM segIndex. These bytes are
+// page-cache resident and evictable, NOT Go-heap memory, so they are reported apart from
+// IndexSizes (which now measures only the active, still-in-RAM segments' postings). Together
+// the two give the operator the full picture: heap postings on the hot active segment plus
+// evictable sidecar bytes on the sealed tail. It reads each segment's already-mapped bytes
+// under the shard read lock -- no re-mapping -- so it is cheap enough for periodic sampling.
+func (c *Collection) SidecarSizes() SidecarSizes {
+	var out SidecarSizes
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg == nil {
+				continue
+			}
+			mm := seg.msidx.Load()
+			if mm == nil {
+				continue
+			}
+			out.Segments++
+			out.MappedBytes += int64(len(mm.data))
+			mph, bloom := sidecarSketchBreakdown(mm.data)
+			out.MPHBytes += mph
+			out.BloomBytes += bloom
+		}
+		sh.mu.RUnlock()
 	}
 	return out
 }

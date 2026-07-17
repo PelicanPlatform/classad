@@ -59,6 +59,12 @@ func TestSealedSegmentsGoMmap(t *testing.T) {
 	if mmapped == 0 {
 		t.Fatal("no sealed segment was converted to the mmap sidecar")
 	}
+	// The sealed segments' index bytes are now evictable page-cache, reported by SidecarSizes
+	// (not IndexSizes, which after the flip sees only the active in-RAM segment's postings).
+	if ss := c.SidecarSizes(); ss.Segments != mmapped || ss.MappedBytes == 0 {
+		t.Fatalf("SidecarSizes: segments=%d mapped=%d, want segments=%d and >0 bytes",
+			ss.Segments, ss.MappedBytes, mmapped)
+	}
 
 	q := func() *vm.Query {
 		x, err := vm.Parse(`Owner == "u3" && Memory >= 4096`)
