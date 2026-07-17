@@ -23,6 +23,19 @@ type mmapSegIndex struct {
 	allOff  uint32
 	catDir  map[uint32]uint32 // attr id -> file offset of its cat attr block
 	valDir  map[uint32]uint32 // attr id -> file offset of its val attr block
+	// Per-attribute summaries, parsed eagerly (O(#attrs), resident) so the query planner's
+	// skip/selectivity paths can read them without paging the postings (v7).
+	catStats map[uint32]*segStats
+	valStats map[uint32]*segStats
+}
+
+// statsFor returns the parsed per-segment summary for a probe's attribute (nil if the
+// attribute is not indexed in this segment).
+func (si *mmapSegIndex) statsFor(up usableProbe) *segStats {
+	if up.cat {
+		return si.catStats[up.attrID]
+	}
+	return si.valStats[up.attrID]
 }
 
 // parseMmapSidecar reads a v2 sidecar's fixed header and meta directory (a few
@@ -41,7 +54,13 @@ func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
 		return nil, c.err
 	}
 	m := &cursor{b: data, i: int(metaOff)}
-	si := &mmapSegIndex{data: data, catDir: map[uint32]uint32{}, valDir: map[uint32]uint32{}}
+	si := &mmapSegIndex{
+		data:     data,
+		catDir:   map[uint32]uint32{},
+		valDir:   map[uint32]uint32{},
+		catStats: map[uint32]*segStats{},
+		valStats: map[uint32]*segStats{},
+	}
 	si.upto = m.u32()
 	si.specGen = m.u64()
 	si.allOff = m.u32()
@@ -49,11 +68,16 @@ func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
 	for i := uint32(0); i < catN; i++ {
 		id := m.u32()
 		si.catDir[id] = m.u32()
+		si.catStats[id] = readSegStats(data, m.u32())
 	}
 	valN := m.u32()
 	for i := uint32(0); i < valN; i++ {
 		id := m.u32()
 		si.valDir[id] = m.u32()
+		si.valStats[id] = readSegStats(data, m.u32())
+	}
+	if m.err != nil {
+		return nil, fmt.Errorf("archive: corrupt sidecar directory: %w", m.err)
 	}
 	if m.err != nil {
 		return nil, fmt.Errorf("archive: corrupt sidecar meta: %w", m.err)
