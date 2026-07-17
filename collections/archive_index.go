@@ -3,6 +3,7 @@ package collections
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"math"
 	"os"
 	"sort"
@@ -52,7 +53,7 @@ import (
 // simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 6
+	sidecarVersion = 8          // v8 appended a CRC-32C footer over the whole sidecar
 
 	// mphNDVThreshold gates the categorical minimal-perfect-hash: only an attribute with
 	// at least this many distinct values in a segment gets one. Below it, the sorted key
@@ -66,6 +67,18 @@ const (
 // built transiently at seal and discarded after — the archive never retains an
 // in-RAM index; queries mmap the sidecar (mmapSegIndex).
 func writeSidecarIndex(path string, si *segIndex) error {
+	b, err := buildSidecarIndex(si)
+	if err != nil {
+		return err
+	}
+	return writeFileSync(path, b)
+}
+
+// buildSidecarIndex serializes si to the sidecar byte layout (documented on
+// writeSidecarIndex). The bytes back either a file mmap (a persistent sealed segment) or an
+// anonymous region (an in-memory one), so the same immutable index representation serves
+// both tiers.
+func buildSidecarIndex(si *segIndex) ([]byte, error) {
 	b := make([]byte, 0, 256)
 	b = appendU32(b, sidecarMagic)
 	b = appendU16(b, sidecarVersion)
@@ -89,7 +102,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 
 	allOff, err := emit(si.all)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	type catBlk struct {
@@ -98,12 +111,13 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		bmOffs                []uint32
 		exKeys                []string // exact-case keys (sorted) -> exBmOffs (for =?=/=!=)
 		exBmOffs              []uint32
-		bloom                 *bloomFilter // categorical membership over folded keys (built at seal)
+		stats                 *segStats // full summary (bloom, min/max, top-N, ndv, HLL)
 	}
 	type valBlk struct {
 		id, excOff, postedOff uint32
 		keys                  []float64
 		bmOffs                []uint32
+		stats                 *segStats
 	}
 	var catBlks []catBlk
 	for id, cp := range si.cat {
@@ -116,7 +130,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		foldedOff := make(map[string]uint32, len(keys))
 		for i, k := range keys {
 			if bmOffs[i], err = emit(cp.post[k]); err != nil {
-				return err
+				return nil, err
 			}
 			foldedOff[k] = bmOffs[i]
 		}
@@ -145,7 +159,7 @@ func writeSidecarIndex(path string, si *segIndex) error {
 			for _, e := range exByFold[f] {
 				off, emitErr := emit(cp.exact[e])
 				if emitErr != nil {
-					return emitErr
+					return nil, emitErr
 				}
 				exPairs = append(exPairs, exPair{e, off})
 			}
@@ -158,13 +172,13 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		}
 		excOff, err := emit(cp.exc)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		postedOff, err := emit(cp.posted)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs, cp.stats.bloom})
+		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs, &cp.stats})
 	}
 	sort.Slice(catBlks, func(i, j int) bool { return catBlks[i].id < catBlks[j].id })
 
@@ -178,18 +192,18 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		bmOffs := make([]uint32, len(keys))
 		for i, k := range keys {
 			if bmOffs[i], err = emit(vp.post[k]); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		excOff, err := emit(vp.exc)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		postedOff, err := emit(vp.posted)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		valBlks = append(valBlks, valBlk{id, excOff, postedOff, keys, bmOffs})
+		valBlks = append(valBlks, valBlk{id, excOff, postedOff, keys, bmOffs, &vp.stats})
 	}
 	sort.Slice(valBlks, func(i, j int) bool { return valBlks[i].id < valBlks[j].id })
 
@@ -200,18 +214,26 @@ func writeSidecarIndex(path string, si *segIndex) error {
 	b = appendU64(b, si.specGen)
 	b = appendU32(b, allOff)
 
+	// Each directory entry is {id; attrOff; statsOff} (v7 added statsOff -> the per-attr
+	// segStats block), both offsets backpatched as the block is written.
 	b = appendU32(b, uint32(len(catBlks)))
 	catSlot := make([]int, len(catBlks))
+	catStatsSlot := make([]int, len(catBlks))
 	for i, cb := range catBlks {
 		b = appendU32(b, cb.id)
 		catSlot[i] = len(b)
 		b = appendU32(b, 0)
+		catStatsSlot[i] = len(b)
+		b = appendU32(b, 0)
 	}
 	b = appendU32(b, uint32(len(valBlks)))
 	valSlot := make([]int, len(valBlks))
+	valStatsSlot := make([]int, len(valBlks))
 	for i, vb := range valBlks {
 		b = appendU32(b, vb.id)
 		valSlot[i] = len(b)
+		b = appendU32(b, 0)
+		valStatsSlot[i] = len(b)
 		b = appendU32(b, 0)
 	}
 	for i, cb := range catBlks {
@@ -252,10 +274,10 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		b = append(b, exBlob...)
 		// Categorical bloom (v5), immediately after the exact-case run: bloomK; bloomM;
 		// bloom words. bloomM==0 marks "no filter". Reuses the filter built at seal.
-		if cb.bloom != nil && cb.bloom.m > 0 {
-			b = appendU32(b, cb.bloom.k)
-			b = appendU32(b, cb.bloom.m)
-			for _, w := range cb.bloom.bits {
+		if cb.stats.bloom != nil && cb.stats.bloom.m > 0 {
+			b = appendU32(b, cb.stats.bloom.k)
+			b = appendU32(b, cb.stats.bloom.m)
+			for _, w := range cb.stats.bloom.bits {
 				b = appendU64(b, w)
 			}
 		} else {
@@ -283,6 +305,11 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		} else {
 			b = appendU32(b, 0) // mphBlockLen == 0: no MPH
 		}
+		// Per-attribute stats block (v7): min/max, top-N, ndv, HLL — everything the query
+		// planner's skip/selectivity paths read (the mmap reader can't recompute it without
+		// paging every bitmap). Backpatch the directory's statsOff, then serialize.
+		binary.LittleEndian.PutUint32(b[catStatsSlot[i]:], uint32(len(b)))
+		b = appendSegStats(b, cb.stats)
 	}
 	for i, vb := range valBlks {
 		binary.LittleEndian.PutUint32(b[valSlot[i]:], uint32(len(b)))
@@ -295,10 +322,28 @@ func writeSidecarIndex(path string, si *segIndex) error {
 		for _, o := range vb.bmOffs {
 			b = appendU32(b, o)
 		}
+		binary.LittleEndian.PutUint32(b[valStatsSlot[i]:], uint32(len(b)))
+		b = appendSegStats(b, vb.stats)
 	}
 
 	binary.LittleEndian.PutUint32(b[metaOffPos:], metaOff)
-	return writeFileSync(path, b)
+	// CRC-32C footer over all preceding bytes (v8). The sidecar is derived state, so a
+	// mismatch on load is a rebuild trigger, never fatal. parseMmapSidecar reads via metaOff
+	// and never touches this tail, so the footer is transparent to the lazy mmap reader.
+	b = appendU32(b, crc32.Checksum(b, crcTable))
+	return b, nil
+}
+
+// sidecarCRCValid recomputes the CRC-32C footer and reports whether it matches. A false
+// result means the sidecar is corrupt (bit-rot or a torn write) and must be rebuilt from the
+// data. The live tier checks this on load; the archive's lazy reader does not (a full verify
+// would page the whole sidecar and defeat its >RAM design).
+func sidecarCRCValid(data []byte) bool {
+	if len(data) < 4 {
+		return false
+	}
+	want := binary.LittleEndian.Uint32(data[len(data)-4:])
+	return crc32.Checksum(data[:len(data)-4], crcTable) == want
 }
 
 // --- little-endian append helpers ---
@@ -310,6 +355,61 @@ func appendU64(b []byte, v uint64) []byte { return binary.LittleEndian.AppendUin
 func appendBytes(b, p []byte) []byte {
 	b = appendU32(b, uint32(len(p)))
 	return append(b, p...)
+}
+
+// appendSegStats serializes a segment's per-attribute summary (v7). The bloom is NOT here
+// (categorical blocks already carry it since v5, and the mmap reader consults it in place);
+// everything the query planner's skip/selectivity paths need that cannot be recomputed
+// without paging every bitmap is: covered/exc/ndv, the numeric range, the top-N heavy
+// hitters, and the HLL registers.
+func appendSegStats(b []byte, s *segStats) []byte {
+	b = appendU64(b, s.covered)
+	b = appendU64(b, s.exc)
+	b = appendU64(b, s.ndv)
+	var hasRange uint32
+	if s.hasRange {
+		hasRange = 1
+	}
+	b = appendU32(b, hasRange)
+	b = appendU64(b, math.Float64bits(s.min))
+	b = appendU64(b, math.Float64bits(s.max))
+	b = appendU32(b, uint32(len(s.top)))
+	for _, e := range s.top {
+		b = appendBytes(b, []byte(e.skey))
+		b = appendU64(b, math.Float64bits(e.fkey))
+		b = appendU32(b, e.count)
+	}
+	if s.hll != nil {
+		b = appendBytes(b, s.hll.reg)
+	} else {
+		b = appendBytes(b, nil)
+	}
+	return b
+}
+
+// readSegStats reconstructs a segStats from the block at off. The bloom stays nil (the mmap
+// reader consults the on-disk bloom directly); the rest is faithful to the build-time stats.
+func readSegStats(d []byte, off uint32) *segStats {
+	c := &cursor{b: d, i: int(off)}
+	s := &segStats{}
+	s.covered = c.u64()
+	s.exc = c.u64()
+	s.ndv = c.u64()
+	s.hasRange = c.u32() != 0
+	s.min = math.Float64frombits(c.u64())
+	s.max = math.Float64frombits(c.u64())
+	if n := c.u32(); n > 0 && n < 1<<20 {
+		s.top = make([]topEntry, n)
+		for i := range s.top {
+			s.top[i].skey = string(c.bytes())
+			s.top[i].fkey = math.Float64frombits(c.u64())
+			s.top[i].count = c.u32()
+		}
+	}
+	if reg := c.bytes(); len(reg) > 0 {
+		s.hll = &hyperLogLog{reg: append([]uint8(nil), reg...)}
+	}
+	return s
 }
 
 // cursor reads little-endian fields from a byte slice, latching the first error so

@@ -23,6 +23,19 @@ type mmapSegIndex struct {
 	allOff  uint32
 	catDir  map[uint32]uint32 // attr id -> file offset of its cat attr block
 	valDir  map[uint32]uint32 // attr id -> file offset of its val attr block
+	// Per-attribute summaries, parsed eagerly (O(#attrs), resident) so the query planner's
+	// skip/selectivity paths can read them without paging the postings (v7).
+	catStats map[uint32]*segStats
+	valStats map[uint32]*segStats
+}
+
+// statsFor returns the parsed per-segment summary for a probe's attribute (nil if the
+// attribute is not indexed in this segment).
+func (si *mmapSegIndex) statsFor(up usableProbe) *segStats {
+	if up.cat {
+		return si.catStats[up.attrID]
+	}
+	return si.valStats[up.attrID]
 }
 
 // parseMmapSidecar reads a v2 sidecar's fixed header and meta directory (a few
@@ -41,7 +54,13 @@ func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
 		return nil, c.err
 	}
 	m := &cursor{b: data, i: int(metaOff)}
-	si := &mmapSegIndex{data: data, catDir: map[uint32]uint32{}, valDir: map[uint32]uint32{}}
+	si := &mmapSegIndex{
+		data:     data,
+		catDir:   map[uint32]uint32{},
+		valDir:   map[uint32]uint32{},
+		catStats: map[uint32]*segStats{},
+		valStats: map[uint32]*segStats{},
+	}
 	si.upto = m.u32()
 	si.specGen = m.u64()
 	si.allOff = m.u32()
@@ -49,14 +68,16 @@ func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
 	for i := uint32(0); i < catN; i++ {
 		id := m.u32()
 		si.catDir[id] = m.u32()
+		si.catStats[id] = readSegStats(data, m.u32())
 	}
 	valN := m.u32()
 	for i := uint32(0); i < valN; i++ {
 		id := m.u32()
 		si.valDir[id] = m.u32()
+		si.valStats[id] = readSegStats(data, m.u32())
 	}
 	if m.err != nil {
-		return nil, fmt.Errorf("archive: corrupt sidecar meta: %w", m.err)
+		return nil, fmt.Errorf("archive: corrupt sidecar directory: %w", m.err)
 	}
 	return si, nil
 }
@@ -77,43 +98,46 @@ func (si *mmapSegIndex) bitmapAt(off uint32) *roaring.Bitmap {
 
 func (si *mmapSegIndex) allBitmap() *roaring.Bitmap { return si.bitmapAt(si.allOff) }
 
-// covers reports whether every usable probe's attribute is present in this index.
-func (si *mmapSegIndex) covers(usable []usableProbe) bool {
-	for _, up := range usable {
-		if up.cat {
-			if _, ok := si.catDir[up.attrID]; !ok {
-				return false
-			}
-		} else if _, ok := si.valDir[up.attrID]; !ok {
-			return false
-		}
+// The readIndex surface: thin delegates to the shared planner logic (readindex.go), so this
+// tier cannot diverge from the in-RAM segIndex.
+func (si *mmapSegIndex) covers(usable []usableProbe) bool { return indexCovers(si, usable) }
+func (si *mmapSegIndex) coversGroups(groups [][]usableProbe) bool {
+	return indexCoversGroups(si, groups)
+}
+func (si *mmapSegIndex) candidateOffsetsGroups(groups [][]usableProbe) *roaring.Bitmap {
+	return indexCandidateOffsetsGroups(si, groups)
+}
+func (si *mmapSegIndex) skipsPrefix(usable []usableProbe) bool { return indexSkipsPrefix(si, usable) }
+func (si *mmapSegIndex) estCandidates(up usableProbe) float64  { return indexEstCandidates(si, up) }
+func (si *mmapSegIndex) coveredUpto() uint32                   { return si.upto }
+
+// coversProbe reports whether this segment indexes one probe's attribute.
+func (si *mmapSegIndex) coversProbe(up usableProbe) bool {
+	if up.cat {
+		_, ok := si.catDir[up.attrID]
+		return ok
 	}
-	return true
+	_, ok := si.valDir[up.attrID]
+	return ok
 }
 
-// candidateOffsets mirrors segIndex.candidateOffsets: intersect every usable probe's
-// offset set (categoricals first — cheaper), returning a superset the caller
-// re-verifies. nil means no usable probe.
-func (si *mmapSegIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
-	var acc *roaring.Bitmap
-	for pass := 0; pass < 2; pass++ {
-		wantCat := pass == 0
-		for _, up := range usable {
-			if up.cat != wantCat {
-				continue
-			}
-			bm := si.probeOffsets(up)
-			if acc == nil {
-				acc = bm
-			} else {
-				acc.And(bm)
-			}
-			if acc.IsEmpty() {
-				return acc
-			}
-		}
+// bloomAbsent consults the on-disk categorical bloom (v5) for a ==/in probe: true iff every
+// probe value is definitely absent.
+func (si *mmapSegIndex) bloomAbsent(up usableProbe) bool {
+	if !up.cat || (up.op != "==" && up.op != "in") {
+		return false
 	}
-	return acc
+	attrOff, ok := si.catDir[up.attrID]
+	if !ok {
+		return false
+	}
+	return si.catBloomAllAbsent(attrOff, up.svals)
+}
+
+// candidateOffsets returns the offsets satisfying every usable probe (a superset the caller
+// re-verifies), most-selective probe first via the shared planner logic. nil = no probe.
+func (si *mmapSegIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
+	return indexCandidateOffsets(si, usable)
 }
 
 // probeOffsets returns a fresh, mutable offset bitmap for one probe, reading only the
@@ -330,6 +354,35 @@ func (si *mmapSegIndex) catFindEq(attrOff uint32, key string) (bmOff uint32, ok 
 		return off, true
 	}
 	return si.catFind(attrOff, key)
+}
+
+// catCanonicalValues emits each distinct canonical spelling of categorical attribute id by
+// iterating the sidecar's exact-case run, which writeSidecarIndex populated with exactly the
+// canonical spellings (a case-uniform bucket contributes its spelling; a mixed-case bucket
+// contributes each exact spelling) -- the same set segIndex.catCanonicalValues produces.
+func (si *mmapSegIndex) catCanonicalValues(id uint32, add func(string) bool) bool {
+	d := si.data
+	attrOff, ok := si.catDir[id]
+	if !ok {
+		return true
+	}
+	n := le32(d, attrOff+8)
+	keyOffBase := attrOff + 12
+	bmOffBase := keyOffBase + (n+1)*4
+	blobBase := bmOffBase + n*4
+	exOff := blobBase + le32(d, keyOffBase+n*4) // + folded blob length
+	exN := le32(d, exOff)
+	exKeyOffBase := exOff + 4
+	exBmOffBase := exKeyOffBase + (exN+1)*4
+	exBlobBase := exBmOffBase + exN*4
+	for i := uint32(0); i < exN; i++ {
+		ks := exBlobBase + le32(d, exKeyOffBase+i*4)
+		ke := exBlobBase + le32(d, exKeyOffBase+(i+1)*4)
+		if !add(string(d[ks:ke])) {
+			return false
+		}
+	}
+	return true
 }
 
 // catFindMPH probes the categorical MPH (v6). It returns (bmOff, true) only for a key that
