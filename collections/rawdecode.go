@@ -30,9 +30,6 @@ type RawAd struct {
 // nothing for them; callers that must support those should use Query.
 func (c *Collection) QueryRaw(q *vm.Query) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
-		if c.inline {
-			return
-		}
 		plan := q.ReadPlan()
 		ws := &wireScope{ctx: c}
 		qp := queryPlan{
@@ -64,9 +61,6 @@ func (c *Collection) QueryRaw(q *vm.Query) iter.Seq[RawAd] {
 // ScanRaw is Scan, yielding every ad as RawAd (AST-free).
 func (c *Collection) ScanRaw() iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
-		if c.inline {
-			return
-		}
 		q := queryPlan{}
 		emit := c.yieldRaw(yield)
 		for _, sh := range c.shards {
@@ -137,19 +131,14 @@ func (c *Collection) decodeAdRaw(stored []byte, codec Codec, dst []byte) (exprs 
 // reuses their backing, so a streaming scan allocates no per-ad expression strings.
 // Returns ok=false for inline-name ads (no intern table).
 func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int) (outBuf []byte, outOffs []int, myType, targetType string, ok bool) {
-	if c.inline {
-		return buf, offs, "", "", false
-	}
 	buf = buf[:0]
 	offs = append(offs[:0], 0)
-	ad := wire.Ad(wireBytes)
+	// ForEachNamed handles both encodings: an inline (persistent) ad yields its
+	// stored names and the intern table is ignored; an interned ad resolves ids
+	// through it. Values render with the matching decoder (inline nodes carry
+	// inline names too).
 	good := true
-	ad.ForEach(func(id uint32, node []byte) bool {
-		name, nok := c.intern.Name(id)
-		if !nok {
-			good = false
-			return false
-		}
+	wire.Ad(wireBytes).ForEachNamed(c.intern, func(name string, node []byte) bool {
 		if name == "MyType" || name == "TargetType" {
 			if lit, lok := wire.LiteralValue(node); lok && lit.Kind == wire.LitString {
 				if name == "MyType" {
@@ -163,7 +152,11 @@ func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int) (out
 		buf = append(buf, name...)
 		buf = append(buf, ' ', '=', ' ')
 		var aerr error
-		buf, aerr = appendWireValue(buf, node, c.intern)
+		if c.inline {
+			buf, aerr = wire.AppendNodeTextInline(buf, node)
+		} else {
+			buf, aerr = appendWireValue(buf, node, c.intern)
+		}
 		if aerr != nil {
 			good = false
 			return false
