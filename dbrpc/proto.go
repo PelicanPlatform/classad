@@ -82,6 +82,7 @@ const (
 	opArchiveQuery  op = 31 // [name][limit i32][constraint] -> stream of [adText], newest first
 	opArchiveList   op = 32 // -> [n i32]{[name]}
 	opArchiveRotate op = 33 // [name] -> [dropped i32]; enforce retention (server clock); mutating
+	opDeleteWhere   op = 34 // [table][constraint] -> [removed i32]; bulk delete-by-constraint, mutating
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -135,6 +136,8 @@ func (o op) String() string {
 		return "ListTables"
 	case opMatchTables:
 		return "MatchTables"
+	case opDeleteWhere:
+		return "DeleteWhere"
 	}
 	return "op(unknown)"
 }
