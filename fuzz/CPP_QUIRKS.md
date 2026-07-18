@@ -262,6 +262,39 @@ rejects the input. This is a libclassad leniency, not mirrored; the differential
 parser fuzzer allowlists parse disagreements whose input has a binary operator
 immediately before a ':' as CPP_QUIRKS #12.
 
+## 13. Old-ClassAd string literals do NO escape processing (backslashes are literal) — surprising
+
+The old-ClassAd wire format daemons advertise (newline-separated, unbracketed
+attributes) is lexed by `Lexer::tokenizeStringOld`, which — unlike the new-ClassAd
+string lexer (`tokenizeString` / `convert_escapes`) — performs **no** escape
+interpretation. Two consequences surprised us, and the *same bytes therefore mean
+different things to the old and new lexers*:
+
+- **Every backslash is literal.** In old-ClassAd, `OSIssue = "\S"` (the agetty
+  escapes `/etc/issue` carries: `\S \r \l \m`) is the two characters `\` and `S`.
+  The new-ClassAd parser instead *drops* an unknown-escape backslash — `[ A = "\S" ]`
+  evaluates `A` to `"S"` — and rejects yet others. `\n`, `\t`, and octal `\NNN`
+  are likewise kept literal in old-ClassAd, not interpreted.
+
+  ```
+  # new-ClassAd: unknown escape drops the backslash
+  classad_eval -quiet '[ A = "\S" ]' A          # "S"
+  # old-ClassAd (getOldClassAd / SetOldClassAd(true)): kept literal -> "\S"
+  ```
+
+- **A backslash immediately before the closing quote escapes it**, so a string
+  cannot end in a lone backslash: `"\\"` (backslash, backslash, quote) is
+  **unterminated** — the second `\` escapes the `"` and the scan runs off the end.
+  (`"a\"b"` is `a"b`; `"C:\"` is unterminated.) This is the one that caught us out.
+
+This is legacy behavior, not a bug — but a sharp edge. It bit a Go collector: its
+ingest lexed forwarded old-ClassAd string values with new-ClassAd escape rules,
+so `OSIssue = "\S"` was rejected (`invalid escape sequence \S`), the startd ad was
+dropped, and the forward connection reset (`condor_write(): Socket closed`). The
+Go engine's old-ClassAd path (`classad.ParseOld` and the `collections` ingest fast
+path) now matches `tokenizeStringOld` exactly, and `FuzzParseOldClassAdDifferential`
+guards it against regression.
+
 ## Observed (reasonable) semantics, recorded for completeness
 
 These are not bugs, but were non-obvious and are now matched by the Go engine:
