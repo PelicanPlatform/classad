@@ -24,6 +24,14 @@ extern "C" {
  */
 int classad_eval_ad(const char *adStr, char **out);
 
+/*
+ * Like classad_eval_ad, but parses adStr as an OLD-ClassAd (the newline-separated,
+ * unbracketed wire format daemons advertise), via ClassAdParser::SetOldClassAd(true).
+ * Old-ClassAd string literals get no escape processing (Lexer::tokenizeStringOld) -- the
+ * behavior the Go engine's ParseOld must match. Same return convention as classad_eval_ad.
+ */
+int classad_eval_ad_old(const char *adStr, char **out);
+
 /* Free a string previously returned via classad_eval_ad's out parameter. */
 void classad_free(char *p);
 
