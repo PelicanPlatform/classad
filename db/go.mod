@@ -13,7 +13,7 @@ require (
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/mschoch/smat v0.2.0 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
-	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/sys v0.46.0 // indirect
 )
 
 replace github.com/PelicanPlatform/classad => ../

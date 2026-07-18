@@ -8,7 +8,7 @@ require (
 	github.com/RoaringBitmap/roaring/v2 v2.19.0
 	github.com/klauspost/compress v1.19.0
 	github.com/tidwall/btree v1.8.1
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.46.0
 )
 
 require (

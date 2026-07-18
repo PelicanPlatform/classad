@@ -127,7 +127,7 @@ type ServeOptions struct {
 func (o op) isMutating() bool {
 	switch o {
 	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
-		opArchiveCreate, opArchiveAppend, opArchiveRotate:
+		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere:
 		return true
 	}
 	return false
@@ -275,6 +275,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 	switch o {
 	case opQuery:
 		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write)
+	case opQueryRaw:
+		sc.s.streamQueryRaw(sc.ctx, reqID, body, priv, sc.write)
 	case opMatchSorted:
 		sc.s.streamMatchSorted(sc.ctx, reqID, body, priv, sc.write)
 	case opOrdered:
@@ -629,6 +631,22 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 			return respErr(reqID, err.Error())
 		}
 		return putStr(resp(reqID, stOK), string(data))
+
+	case opDeleteWhere:
+		table := r.str()
+		constraint := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		d, ok := s.cat.Table(table)
+		if !ok {
+			return respErr(reqID, "no such table: "+table)
+		}
+		removed, err := d.DeleteWhere(constraint)
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putI32(resp(reqID, stOK), int32(removed))
 
 	case opExplain:
 		table := r.str()
