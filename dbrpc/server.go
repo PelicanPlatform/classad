@@ -275,6 +275,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 	switch o {
 	case opQuery:
 		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write)
+	case opQueryRaw:
+		sc.s.streamQueryRaw(sc.ctx, reqID, body, priv, sc.write)
 	case opMatchSorted:
 		sc.s.streamMatchSorted(sc.ctx, reqID, body, priv, sc.write)
 	case opOrdered:
