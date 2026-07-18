@@ -60,6 +60,26 @@ func EvalAd(src string) (encoded string, parsed bool) {
 	return C.GoString(out), true
 }
 
+// EvalAdOld is EvalAd for the OLD-ClassAd wire format (the newline-separated, unbracketed
+// syntax daemons advertise): it parses src via ClassAdParser::SetOldClassAd(true), whose
+// string literals get no escape processing, and returns the canonical encoding of the
+// evaluated ad. This is the reference the Go engine's ParseOld is compared against.
+func EvalAdOld(src string) (encoded string, parsed bool) {
+	cppMu.Lock()
+	defer cppMu.Unlock()
+
+	csrc := C.CString(src)
+	defer C.free(unsafe.Pointer(csrc))
+
+	var out *C.char
+	rc := C.classad_eval_ad_old(csrc, &out)
+	if rc == 0 {
+		return "", false
+	}
+	defer C.classad_free(out)
+	return C.GoString(out), true
+}
+
 // EvalAdTimeout is EvalAd with a wall-clock cap. libclassad can infinite-loop
 // on some cyclic self-references reached through lazy operands (e.g.
 // [A0 = 0 ? e : A0], where its cycle guard never fires) -- a libclassad bug.
@@ -80,6 +100,27 @@ func EvalAdTimeout(src string, timeout time.Duration) (encoded string, parsed, t
 	ch := make(chan result, 1) // buffered so the goroutine can exit if we time out
 	go func() {
 		enc, ok := EvalAd(src)
+		ch <- result{enc, ok}
+	}()
+	select {
+	case r := <-ch:
+		return r.enc, r.ok, false
+	case <-time.After(timeout):
+		return "", false, true
+	}
+}
+
+// EvalAdOldTimeout is EvalAdOld with the same wall-clock cap and leaked-goroutine handling
+// as EvalAdTimeout (evaluation can still infinite-loop on a cyclic self-reference regardless
+// of which syntax parsed the ad).
+func EvalAdOldTimeout(src string, timeout time.Duration) (encoded string, parsed, timedOut bool) {
+	type result struct {
+		enc string
+		ok  bool
+	}
+	ch := make(chan result, 1)
+	go func() {
+		enc, ok := EvalAdOld(src)
 		ch <- result{enc, ok}
 	}()
 	select {

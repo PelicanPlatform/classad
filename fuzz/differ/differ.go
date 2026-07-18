@@ -94,6 +94,11 @@ type Options struct {
 	// Useful when focusing purely on evaluation semantics, since the two
 	// parsers have known grammar differences that would otherwise dominate.
 	IgnoreParseDivergence bool
+	// OldClassAd compares the OLD-ClassAd parsers (classad.ParseOld vs libclassad's
+	// SetOldClassAd(true)) instead of the new-ClassAd ones -- the wire format daemons
+	// advertise, whose string literals keep escapes literal. This path was previously
+	// untested differentially, which is how the OSIssue = "\S" divergence shipped.
+	OldClassAd bool
 }
 
 // DefaultOptions is the standard comparison configuration.
@@ -101,9 +106,15 @@ func DefaultOptions() Options {
 	return Options{Tol: canon.DefaultTolerance}
 }
 
-// goEval parses and evaluates src with the native Go engine.
-func goEval(src string) (val canon.Value, raw string, parsed bool, err error) {
-	ad, perr := classad.Parse(src)
+// goEval parses and evaluates src with the native Go engine. When old is set it uses the
+// old-ClassAd parser (classad.ParseOld) instead of the new-ClassAd one, so the differ can
+// exercise the wire format daemons advertise -- whose string-escape semantics differ.
+func goEval(src string, old bool) (val canon.Value, raw string, parsed bool, err error) {
+	parse := classad.Parse
+	if old {
+		parse = classad.ParseOld
+	}
+	ad, perr := parse(src)
 	if perr != nil {
 		return canon.Value{}, "", false, perr
 	}
@@ -113,13 +124,13 @@ func goEval(src string) (val canon.Value, raw string, parsed bool, err error) {
 
 // goEvalSafe wraps goEval, converting a panic in the Go engine into a reported
 // finding rather than crashing the fuzzer.
-func goEvalSafe(src string) (val canon.Value, raw string, parsed bool, panicked string, err error) {
+func goEvalSafe(src string, old bool) (val canon.Value, raw string, parsed bool, panicked string, err error) {
 	defer func() {
 		if rec := recover(); rec != nil {
 			panicked = fmt.Sprintf("%v", rec)
 		}
 	}()
-	val, raw, parsed, err = goEval(src)
+	val, raw, parsed, err = goEval(src, old)
 	return
 }
 
@@ -127,7 +138,7 @@ func goEvalSafe(src string) (val canon.Value, raw string, parsed bool, panicked 
 func Compare(src string, opts Options) Result {
 	var r Result
 
-	goVal, goRaw, goParsed, goPanic, goErr := goEvalSafe(src)
+	goVal, goRaw, goParsed, goPanic, goErr := goEvalSafe(src, opts.OldClassAd)
 	r.GoParsed = goParsed
 	r.GoCanon = goVal
 	r.GoRaw = goRaw
@@ -138,7 +149,11 @@ func Compare(src string, opts Options) Result {
 		return r
 	}
 
-	cppRaw, cppParsed, cppTimedOut := cppengine.EvalAdTimeout(src, cppEvalTimeout)
+	cppEval := cppengine.EvalAdTimeout
+	if opts.OldClassAd {
+		cppEval = cppengine.EvalAdOldTimeout
+	}
+	cppRaw, cppParsed, cppTimedOut := cppEval(src, cppEvalTimeout)
 	if cppTimedOut {
 		// libclassad infinite-looped (a known C++ bug on some cyclic
 		// self-references the Go engine resolves to error). The result is

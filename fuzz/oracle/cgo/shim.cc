@@ -183,6 +183,74 @@ extern "C" int classad_eval_ad(const char *adStr, char **out) {
 	}
 }
 
+// oldToNewFormat mirrors the Go parser's convertOldToNewFormat (parser/old_classad_parser.go):
+// old ClassAds are newline-separated, unbracketed attributes; the classad library's parser
+// wants the bracketed "[ a=1; b=2 ]" syntax even in old-lex mode (parseClassAd requires
+// LEX_OPEN_BOX). Applying the identical structural conversion on both sides isolates the one
+// thing under test -- old-ClassAd string-escape lexing (tokenizeStringOld) -- so a structural
+// difference cannot masquerade as a divergence.
+static std::string oldToNewFormat(const char *src) {
+	std::string out = "[\n";
+	std::string s(src ? src : "");
+	size_t i = 0;
+	bool inBlockComment = false;
+	while (i <= s.size()) {
+		size_t nl = s.find('\n', i);
+		std::string line = s.substr(i, (nl == std::string::npos ? s.size() : nl) - i);
+		i = (nl == std::string::npos) ? s.size() + 1 : nl + 1;
+
+		if (line.find("/*") != std::string::npos) inBlockComment = true;
+		if (inBlockComment) {
+			out += line; out += "\n";
+			if (line.find("*/") != std::string::npos) inBlockComment = false;
+			continue;
+		}
+		// trim leading/trailing ASCII whitespace for the emptiness/comment/`;` checks
+		size_t b = line.find_first_not_of(" \t\r\f\v");
+		std::string trimmed = (b == std::string::npos) ? "" : line.substr(b);
+		size_t e = trimmed.find_last_not_of(" \t\r\f\v");
+		if (e != std::string::npos) trimmed = trimmed.substr(0, e + 1);
+
+		if (trimmed.empty()) continue;
+		if (trimmed.rfind("//", 0) == 0 || trimmed.rfind("#", 0) == 0) {
+			out += line; out += "\n";
+			continue;
+		}
+		if (trimmed.find('=') != std::string::npos) {
+			out += trimmed;
+			if (trimmed.back() != ';') out += ";";
+			out += "\n";
+		} else {
+			out += line; out += "\n";
+		}
+	}
+	out += "]";
+	return out;
+}
+
+extern "C" int classad_eval_ad_old(const char *adStr, char **out) {
+	static const bool reconfigured = [] { ClassAdReconfig(); return true; }();
+	(void)reconfigured;
+
+	*out = nullptr;
+	try {
+		ClassAdParser parser;
+		parser.SetOldClassAd(true); // tokenizeStringOld lexing (escapes kept literal)
+		ClassAd ad;
+		std::string bracketed = oldToNewFormat(adStr);
+		if (!parser.ParseClassAd(bracketed, ad, true)) {
+			return 0;
+		}
+		std::string encoded;
+		encodeClassAd(encoded, &ad, 0);
+		*out = strdup(encoded.c_str());
+		return 1;
+	} catch (...) {
+		if (*out) { free(*out); *out = nullptr; }
+		return 0;
+	}
+}
+
 extern "C" void classad_free(char *p) {
 	free(p);
 }

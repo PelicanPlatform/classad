@@ -17,6 +17,14 @@ import (
 // re-encoded via the full parser, which dedups exactly.
 var errDuplicate = errors.New("duplicate attribute")
 
+// errDeferOld signals that a value needs the reference old-ClassAd parser (classad.ParseOld)
+// to encode correctly -- specifically a non-scalar, non-lone-string value that contains a
+// backslash, whose embedded string literals the fast expression path (ByteLexer / ParseExpr)
+// would lex with new-ClassAd escape rules and thus diverge from ParseOld. Backslash-free
+// expressions lex identically in both, so they keep the fast path. Like errDuplicate, the
+// whole ad is re-encoded via ParseOld.
+var errDeferOld = errors.New("defer to old-ClassAd parser")
+
 // OldAdUpdate is one insert-or-update whose ad is supplied in "old ClassAd"
 // serialization (newline-separated `Name = Value` lines, as sent over a TCP
 // socket), rather than as a parsed *classad.ClassAd.
@@ -63,7 +71,7 @@ func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[ui
 	enc.Reset()
 	clear(seen)
 	err := encodeOldText(text, enc, seen, unesc)
-	if err == errDuplicate {
+	if err == errDuplicate || err == errDeferOld {
 		ad, e := classad.ParseOld(text)
 		if e != nil {
 			return nil, e
@@ -98,7 +106,12 @@ func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{
 		val := strings.TrimSpace(line[eq+1:])
 		if !isBareName(name) {
 			// Quoted/odd attribute names are rare in old-form ads; defer the whole
-			// assignment to the full parser, which unquotes the name correctly.
+			// assignment to the full parser, which unquotes the name correctly. But
+			// ParseClassAd is new-ClassAd (strict escapes), so if the line has a backslash
+			// its string lexing could diverge from ParseOld -- defer the whole ad instead.
+			if strings.IndexByte(line, '\\') >= 0 {
+				return errDeferOld
+			}
 			ad, err := parser.ParseClassAd("[" + line + "]")
 			if err != nil || ad == nil || len(ad.Attributes) != 1 {
 				return fmt.Errorf("malformed assignment %q", line)
@@ -117,6 +130,14 @@ func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{
 		}
 		if fastString(enc, name, val, unesc) {
 			continue
+		}
+		// Not a scalar or a lone string literal. If it contains a backslash, an embedded
+		// string literal could lex differently under old-ClassAd rules (literal escapes) than
+		// the fast expression path's new-ClassAd lexer, so defer the whole ad to ParseOld.
+		// Backslash-free values (the overwhelming majority -- Requirements, Rank, etc.) lex
+		// identically, so they keep the fast path.
+		if strings.IndexByte(val, '\\') >= 0 {
+			return errDeferOld
 		}
 		// Computed value: parse the expression straight to wire (no ast.Expr). On any
 		// error -- a construct the native parser does not handle, or malformed text --
@@ -174,83 +195,55 @@ func fastScalar(enc *wire.StreamEncoder, name, val string) bool {
 	return false
 }
 
-// fastString handles a value that is exactly one double-quoted string literal
-// (with escapes), unescaping it into *unesc byte-for-byte as the lexer's scanString
-// does and emitting a string node -- avoiding the full expression parser for what,
-// on real ads, is the largest and most common non-scalar value (AddressV1 and other
-// escaped strings). It returns false, deferring to the parser, for anything it does
-// not handle identically to the lexer: a value that is not a lone string literal,
-// any non-ASCII byte (to avoid second-guessing the lexer's rune decoding), a null
-// (\0) or unknown escape (which the lexer rejects), or an unterminated string. The
-// parser therefore stays the source of truth for every uncertain case.
+// fastString handles a value that is exactly one double-quoted OLD-ClassAd string
+// literal, copying its content into *unesc byte-for-byte as the reference old-ClassAd
+// tokenizer (C++ Lexer::tokenizeStringOld, mirrored by classad.ParseOld) does, and
+// emitting a string node -- avoiding the full expression parser for what, on real ads,
+// is the largest and most common non-scalar value (AddressV1, OSIssue, and other
+// strings). Old-ClassAd string lexing does NO escape interpretation: a backslash is
+// kept literal (so OSIssue = "\S", the agetty escapes /etc/issue carries, ingests
+// instead of being rejected), EXCEPT immediately before the closing quote where it
+// escapes it (\" -> a literal quote, the string continues). It returns false, deferring
+// to the parser, only for a value that is not a lone string literal or is unterminated;
+// non-ASCII bytes are decoded to runes exactly as the lexer's scanString does (an invalid
+// byte becomes U+FFFD), so a lone string literal is ALWAYS handled here and never reaches the
+// strict expression fallback (which would octal-interpret \1 and diverge from ParseOld).
+//
+// Keeping this byte-identical to ParseOld is the invariant TestUpdateOldMatchesParseOld
+// and FuzzIngestOld enforce; the escape handling here must therefore track the lexer's
+// lenientEscapes path exactly.
 //
 // Escape-free plain-ASCII strings are already handled by fastScalar (simpleStr)
-// without a copy; this covers the with-escape case.
+// without a copy; this covers the with-backslash and non-ASCII cases.
 func fastString(enc *wire.StreamEncoder, name, val string, unesc *[]byte) bool {
 	if len(val) < 2 || val[0] != '"' {
 		return false
 	}
 	buf := (*unesc)[:0]
 	for i := 1; i < len(val); {
-		c := val[i]
-		switch {
-		case c == '"':
+		r, size := utf8.DecodeRuneInString(val[i:])
+		switch r {
+		case '"':
 			if i != len(val)-1 {
 				return false // content after the closing quote: not a lone string literal
 			}
 			*unesc = buf
 			enc.StringBytes(name, buf)
 			return true
-		case c >= 0x80:
-			return false // non-ASCII: let the parser's rune decoding handle it
-		case c == '\\':
-			i++
-			if i >= len(val) {
-				return false // unterminated escape
-			}
-			switch e := val[i]; e {
-			case 'b':
-				buf = append(buf, '\b')
-			case 't':
-				buf = append(buf, '\t')
-			case 'n':
-				buf = append(buf, '\n')
-			case 'f':
-				buf = append(buf, '\f')
-			case 'r':
-				buf = append(buf, '\r')
-			case '\\':
-				buf = append(buf, '\\')
-			case '"':
+		case '\\':
+			// Literal backslash, unless it immediately precedes the closing quote, where
+			// it escapes it (a lone trailing backslash therefore leaves the string
+			// unterminated, exactly as in tokenizeStringOld).
+			if i+1 < len(val) && val[i+1] == '"' {
 				buf = append(buf, '"')
-			case '\'':
-				buf = append(buf, '\'')
-			case '0', '1', '2', '3', '4', '5', '6', '7':
-				// \NNN: up to 3 octal digits if the first is 0-3, else up to 2.
-				maxDigits := 2
-				if e <= '3' {
-					maxDigits = 3
-				}
-				oval := int(e - '0')
-				for d := 1; d < maxDigits && i+1 < len(val); d++ {
-					n := val[i+1]
-					if n < '0' || n > '7' {
-						break
-					}
-					oval = oval*8 + int(n-'0')
-					i++
-				}
-				if oval == 0 {
-					return false // \0 (null) -- the lexer rejects it; let it produce the error
-				}
-				buf = utf8.AppendRune(buf, rune(oval))
-			default:
-				return false // unknown escape -- the lexer rejects it
+				i += 2
+			} else {
+				buf = append(buf, '\\')
+				i++
 			}
-			i++
 		default:
-			buf = append(buf, c)
-			i++
+			buf = utf8.AppendRune(buf, r) // invalid byte -> U+FFFD, matching scanString
+			i += size
 		}
 	}
 	return false // no closing quote
