@@ -29,6 +29,12 @@ type StreamingLexer struct {
 	pendingSize      int
 	hasPending       bool
 	seen             []rune
+	// lenientEscapes keeps an unrecognized string escape sequence literally (the
+	// backslash and the following character both) instead of erroring. This matches the
+	// C++ old-ClassAd string tokenizer (Lexer::tokenizeStringOld), which does no escape
+	// processing at all -- so a value like OSIssue = "\S" (agetty escapes from /etc/issue)
+	// round-trips instead of failing the whole ad. Set only on the old-ClassAd parse path.
+	lenientEscapes bool
 }
 
 // NewStreamingLexer creates a lexer that consumes tokens directly from a reader.
@@ -515,6 +521,24 @@ func (l *StreamingLexer) scanString() string {
 		}
 
 		if ch == '\\' {
+			if l.lenientEscapes {
+				// Old-ClassAd string semantics (C++ Lexer::tokenizeStringOld): a backslash is
+				// literal EXCEPT immediately before the closing quote, where it escapes it --
+				// \" becomes a literal quote and the string continues. So no other escape is
+				// interpreted (\S \r \n \t stay literal, backslash and all), matching the C++
+				// collector byte-for-byte; and a string cannot end in a lone backslash ("\\"
+				// is unterminated), exactly as in C++. Process ONE backslash at a time (peek,
+				// don't consume the next rune) so \\" correctly reads as \ then an escaped ".
+				if next, perr := l.peekRune(); perr == nil && next == '"' {
+					if err := l.discardRune(); err != nil {
+						return result.String()
+					}
+					result.WriteRune('"')
+				} else {
+					result.WriteRune('\\')
+				}
+				continue
+			}
 			escaped, _, err := l.readRune()
 			if err != nil {
 				l.Error(fmt.Sprintf("unterminated escape sequence in string starting at position %d", startPos))
