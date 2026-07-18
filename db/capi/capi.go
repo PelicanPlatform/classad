@@ -21,6 +21,7 @@ package main
 import "C"
 
 import (
+	"iter"
 	"runtime/cgo"
 	"unsafe"
 
@@ -189,6 +190,58 @@ func cadb_watch_next(h C.uintptr_t, outType *C.int, outKey **C.char, outAd **C.c
 func cadb_watch_stop(h C.uintptr_t) {
 	hd := cgo.Handle(h)
 	hd.Value().(*db.Watcher).Stop()
+	hd.Delete()
+}
+
+// queryIter holds a pull-style cursor over a Query's push iterator, so the C side can drain
+// results one at a time (cadb_query_next) without materializing the whole result set. stop
+// releases the underlying scan (pins/snapshot); it must be called exactly once via
+// cadb_query_free.
+type queryIter struct {
+	next func() (*classad.ClassAd, bool)
+	stop func()
+}
+
+// Query starts a scan of the store for ads matching a ClassAd constraint expression (the
+// same text a query ad's Requirements holds, e.g. `Arch == "X86_64" && Memory >= 1024`).
+// Returns an opaque query handle to drain with cadb_query_next, or 0 on a malformed
+// constraint. The scan is a consistent snapshot taken at query time; the handle MUST be
+// released with cadb_query_free.
+//
+//export cadb_query
+func cadb_query(h C.uintptr_t, constraint *C.char) C.uintptr_t {
+	d := cgo.Handle(h).Value().(*db.DB)
+	seq, err := d.Query(C.GoString(constraint))
+	if err != nil {
+		return 0
+	}
+	next, stop := iter.Pull(seq)
+	return C.uintptr_t(cgo.NewHandle(&queryIter{next: next, stop: stop}))
+}
+
+// QueryNext writes the next matching ad's old-ClassAd text (the `Attr = expr` wire form,
+// symmetric with cadb_new_classad) to *out -- a C string the caller frees with cadb_free --
+// and returns cadbOK. Returns cadbMissing when the query is exhausted (*out left NULL).
+//
+//export cadb_query_next
+func cadb_query_next(qh C.uintptr_t, out **C.char) C.int {
+	qi := cgo.Handle(qh).Value().(*queryIter)
+	ad, ok := qi.next()
+	if !ok {
+		*out = nil
+		return cadbMissing
+	}
+	*out = C.CString(ad.MarshalOld())
+	return cadbOK
+}
+
+// Stops the scan behind a query handle and frees it. Safe to call before the query is
+// fully drained (it abandons the rest).
+//
+//export cadb_query_free
+func cadb_query_free(qh C.uintptr_t) {
+	hd := cgo.Handle(qh)
+	hd.Value().(*queryIter).stop()
 	hd.Delete()
 }
 
