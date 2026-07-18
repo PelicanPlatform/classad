@@ -28,16 +28,16 @@ import (
 // OSIssue = "\S" divergence lived -- rather than the shared expression grammar or the
 // top-level old-vs-new structure (whose recovery deltas are the sibling target's concern).
 var oldStringSeeds = []string{
-	`\S`,             // the field regression: agetty escape, unknown to C
-	`\S \r (\l) \m`,  // a realistic /etc/issue string, several escapes
-	`slot1@host`,     // plain content
+	`\S`,              // the field regression: agetty escape, unknown to C
+	`\S \r (\l) \m`,   // a realistic /etc/issue string, several escapes
+	`slot1@host`,      // plain content
 	`C:\Users\condor`, // literal backslashes
-	`a\"b`,           // escaped quote -> literal quote, string continues
-	`x\\y`,           // double backslash in the middle
-	`tab\there`,      // a recognized C escape, kept literal in old mode
-	``,               // empty string
-	`\`,              // a lone trailing backslash (escapes the closing quote in C++)
-	`\\`,             // backslash-backslash before the quote
+	`a\"b`,            // escaped quote -> literal quote, string continues
+	`x\\y`,            // double backslash in the middle
+	`tab\there`,       // a recognized C escape, kept literal in old mode
+	``,                // empty string
+	`\`,               // a lone trailing backslash (escapes the closing quote in C++)
+	`\\`,              // backslash-backslash before the quote
 }
 
 // knownOldParseDelta reports whether an old-ClassAd parse-level disagreement is an
