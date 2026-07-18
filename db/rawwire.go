@@ -35,6 +35,38 @@ func (db *DB) UpdateOld(key, text string) error {
 	return db.c.UpdateOld([]collections.OldAdUpdate{{Key: []byte(key), Text: text}})
 }
 
+// OldAdText is one keyed ad in old-ClassAd wire text, for UpdateOldBatch.
+type OldAdText struct {
+	Key  string
+	Text string
+}
+
+// UpdateOldBatch ingests many ads (key + old-ClassAd text) in one shard-commit
+// batch -- the wire-native bulk ingest, so a burst of upserts costs one commit
+// instead of one per ad. Bypasses the optimistic-concurrency layer
+// (last-writer-wins) like UpdateOld. Falls back to per-ad Put on an encrypted
+// store (the wire-native encoder does not seal).
+func (db *DB) UpdateOldBatch(items []OldAdText) error {
+	if len(items) == 0 {
+		return nil
+	}
+	if db.c.EncryptionEnabled() {
+		for _, it := range items {
+			if err := db.UpdateOld(it.Key, it.Text); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	batch := make([]collections.OldAdUpdate, len(items))
+	for i, it := range items {
+		batch[i] = collections.OldAdUpdate{Key: []byte(it.Key), Text: it.Text}
+	}
+	db.snapMu.RLock()
+	defer db.snapMu.RUnlock()
+	return db.c.UpdateOld(batch)
+}
+
 // QueryRaw yields each matching ad as a collections.RawAd -- the wire-form
 // attribute strings decoded straight from the stored representation with no AST,
 // for a persistent (inline) store as well as an in-memory one -- so a whole-ad
