@@ -60,9 +60,9 @@ func TestDeleteWhereExpiry(t *testing.T) {
 	defer func() { _ = d.Close() }()
 
 	const now = 1_000_000
-	putAd(t, d, "stale1", `Name = "stale1"`+"\n"+`LastHeardFrom = 900000`+"\n"+`ClassAdLifetime = 60`)  // 900060 < now
-	putAd(t, d, "stale2", `Name = "stale2"`+"\n"+`LastHeardFrom = 999000`)                              // no lifetime -> default 900 -> 999900 < now
-	putAd(t, d, "fresh", `Name = "fresh"`+"\n"+`LastHeardFrom = 999950`+"\n"+`ClassAdLifetime = 900`)   // 1000850 > now
+	putAd(t, d, "stale1", `Name = "stale1"`+"\n"+`LastHeardFrom = 900000`+"\n"+`ClassAdLifetime = 60`) // 900060 < now
+	putAd(t, d, "stale2", `Name = "stale2"`+"\n"+`LastHeardFrom = 999000`)                             // no lifetime -> default 900 -> 999900 < now
+	putAd(t, d, "fresh", `Name = "fresh"`+"\n"+`LastHeardFrom = 999950`+"\n"+`ClassAdLifetime = 900`)  // 1000850 > now
 
 	// The collector builds exactly this constraint each sweep.
 	constraint := fmt.Sprintf(`%d > LastHeardFrom + ifThenElse(ClassAdLifetime =!= undefined, ClassAdLifetime, 900)`, now)
