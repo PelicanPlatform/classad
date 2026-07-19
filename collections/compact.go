@@ -34,25 +34,117 @@ const (
 	compactMinBytes = 1 << 16
 )
 
-// Compact compacts every shard whose dead-byte ratio warrants it, recompressing
-// records into the collection's current codec. It is safe to call concurrently
-// with reads and writes. Returns the number of shards compacted.
+// Compact reclaims space from superseded/deleted records. For each shard it first
+// unlinks any fully-dead segment cheaply (no rewrite), then, if the shard's dead-byte
+// ratio still warrants it, recompresses the live records into fresh segments. It is
+// safe to call concurrently with reads and writes. Returns the number of shards where
+// space was reclaimed (by either mechanism).
 func (c *Collection) Compact() int {
 	target := c.currentCodec()
 	n := 0
 	for _, sh := range c.shards {
+		// First drop any fully-dead segment cheaply (unlink, no rewrite). This reclaims a
+		// segment whose records are all superseded without copying the shard's live data,
+		// and by removing those dead bytes it can pull the shard back under the compaction
+		// threshold -- so concentrated garbage (e.g. a batch of keys all deleted) costs an
+		// unlink, and only genuinely fragmented garbage triggers the full rewrite below.
+		reclaimed := c.reclaimDeadShard(sh) > 0
 		sh.mu.RLock()
 		do := sh.shouldCompact()
 		sh.mu.RUnlock()
 		if do {
 			c.compactShard(sh, target)
 			n++
+		} else if reclaimed {
+			n++ // space was freed by unlinking dead segments, though no rewrite was needed
 		}
 	}
 	if n > 0 {
 		c.reindexAfterCompaction()
 	}
 	return n
+}
+
+// reclaimDeadShard unlinks every sealed (non-active) segment whose records are all
+// superseded (seg.dead >= seg.used), reclaiming its file/mmap/VMA/sidecar without the
+// full-shard rewrite compactShard performs. Returns the number of segments reclaimed.
+//
+// A fully-dead segment holds no current record, so nothing in the directory or the sealed
+// probe points at it as live. But its superseded records may still sit MID-CHAIN in a
+// shared hash bucket -- recNext chains are per-bucket, not per-key (shard.put links a new
+// record to the previous bucket head), so a colliding key's live record can live deeper in
+// the chain. Each dead record is therefore spliced out of its bucket chain before the
+// segment is dropped, so no surviving recNext dangles into the reaped mapping. The pageable
+// probe (forEachSealedRecord) locates records by key index, never following recNext, so
+// evicted buckets (absent from the directory) have no chain to repair.
+//
+// As with compaction, dropping superseded records raises the GC floor so an older snapshot
+// that can no longer find a key conservatively conflicts (see conflictSince), and the reap
+// is pin-aware so an in-flight scan keeps the mapping mapped until it unpins.
+func (c *Collection) reclaimDeadShard(sh *shard) int {
+	sh.mu.Lock()
+	var dead []*segment
+	for _, seg := range sh.segs {
+		if seg == nil || seg == sh.act || seg.used == 0 {
+			continue
+		}
+		if seg.dead >= int64(seg.used) {
+			dead = append(dead, seg)
+		}
+	}
+	if len(dead) == 0 {
+		sh.mu.Unlock()
+		return 0
+	}
+	deadSet := make(map[uint32]struct{}, len(dead))
+	for _, seg := range dead {
+		deadSet[seg.id] = struct{}{}
+	}
+	// Splice every dead-segment record out of its (shared) hash-bucket chain. Only buckets
+	// present in the directory are ever walked by recNext, so repair just those, once each.
+	repaired := make(map[uint64]struct{})
+	for _, seg := range dead {
+		for off := 0; off < seg.used; {
+			o := uint32(off)
+			total := recTotalLen(seg.data, o)
+			if total == 0 {
+				break
+			}
+			h := c.h.Hash(recKey(seg.data, o))
+			if _, done := repaired[h]; !done {
+				repaired[h] = struct{}{}
+				if _, ok := sh.dir[h]; ok {
+					sh.spliceDeadFromChain(h, deadSet)
+				}
+			}
+			off += int(total)
+		}
+	}
+	// Remove the dead segments from the live set and the pending-sync lists.
+	var toReap []*segment
+	for i, seg := range sh.segs {
+		if seg == nil {
+			continue
+		}
+		if _, isDead := deadSet[seg.id]; isDead {
+			if seg.retire() {
+				toReap = append(toReap, seg)
+			}
+			sh.segs[i] = nil
+		}
+	}
+	sh.dropDirtySegs(deadSet)
+	// Superseded records were dropped: raise the GC floor so a snapshot older than now that
+	// cannot find a key conservatively conflicts rather than trusting a truncated chain.
+	if sh.commitSeq > sh.gcFloor {
+		sh.gcFloor = sh.commitSeq
+	}
+	sh.mu.Unlock()
+
+	for _, seg := range toReap {
+		_ = seg.reapAndHook()
+	}
+	return len(dead)
 }
 
 // Rewrite re-encodes every live ad with the current hot set (and match closure)
