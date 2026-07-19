@@ -184,10 +184,37 @@ recovery is per-segment, not whole-store.
 Each phase is independently shippable and testable; the RAM behavior only changes at
 phase 3.
 
+## Measured probe cost (`keyindex_probe_bench_test.go`)
+
+Benchmarked on an M2 Pro, 200k keys, resident vs evicted reading the *same* mmap sealed
+segments (so the delta is directory-hit vs probe, not RAM vs disk):
+
+| Path | Resident | Evicted (probe) | Ratio |
+| --- | --- | --- | --- |
+| `Get` | ~460 ns/op | ~690 ns/op | ~1.5× |
+| `Put` (update) | ~7.6 µs/op | ~10.9 µs/op | ~1.44× |
+
+Both are modest, and the design's premise holds: the cost falls only on *cold* keys —
+hot keys are rewritten into the active segment on update and stay directory-resident, so
+they never pay it. The evicted `Put` delta is the probe plus one extra msync of the
+superseded record's sealed region.
+
+The read fan-out sweep is the scaling watch-item: evicted `Get` is **~O(#sealed
+segments)** in cheap per-segment Bloom checks (660 ns at 16 segments → 820 ns at 200), not
+flat — a key lives in exactly one segment, so the probe consults Blooms until it finds
+that segment (~n/2 on average). Bounded and cheap at these sizes, but at extreme segment
+counts (100 GB / 8 MiB ≈ 12k segments) this per-Get Bloom scan would dominate, which is
+what motivates the partitioned/hierarchical-filter follow-up below. Bigger segments
+(fewer Blooms) are the immediate lever.
+
 ## Risks / open questions
 
-- **Probe cost under adversarial update patterns** (many cold-key updates). Needs a
-  benchmark; may motivate a small "recently-touched sealed keys" RAM cache.
+- **Probe read fan-out is O(#segments)** in Bloom checks (measured above). Fine to
+  thousands of segments; a partitioned/hierarchical filter (or a shard-level summary
+  Bloom that prunes whole segment groups) would flatten it for very large stores.
+- **Cold-key write amplification** (~1.44×, measured) — acceptable for the target
+  append-mostly workloads; a small "recently-touched sealed keys" RAM cache could absorb
+  a bursty cold-update pattern if one ever shows up.
 - **Bloom sizing / false-positive budget** vs probe cost — tune with real key
   cardinalities.
 - **Interaction with chaining** (`childParentHash`) and **ordered indexes**
