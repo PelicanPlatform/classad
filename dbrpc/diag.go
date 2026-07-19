@@ -66,33 +66,33 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 //	truncate                          remove every ad (DAEMON-only, DB-wide locked)
 //	backup.key                        export the backup key, hex (DAEMON-only escrow key)
 func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) (string, error) {
+	// Every admin action mutates storage policy or physical layout -- indexes, the hot
+	// set, the codec dictionary, compaction, encryption policy, truncation. These are
+	// administrative operations in HTCondor's model, so the whole table is DAEMON-gated:
+	// an ordinary WRITE-level session may read and write ads but must not retune or
+	// restructure the store. (dispatch already blocks opAdmin on READ-level connections;
+	// this additionally blocks WRITE-level ones. Read-only diagnostics use opDiag and are
+	// unaffected.) Authorize before touching args so action existence is not probed.
+	if !privileged {
+		return "", fmt.Errorf("admin action %q requires DAEMON authorization", action)
+	}
 	switch action {
 	case "encrypt.set":
-		// Changing which attributes are encrypted at rest is a security-policy change,
-		// so it is DAEMON-level -- refused even to an ordinary writer. args is the new
-		// explicit set (private attributes are always encrypted regardless). An empty
-		// args clears the explicit set.
-		if !privileged {
-			return "", fmt.Errorf("encrypt.set requires DAEMON authorization")
-		}
+		// Changing which attributes are encrypted at rest is a security-policy change.
+		// args is the new explicit set (private attributes are always encrypted
+		// regardless). An empty args clears the explicit set.
 		if err := t.SetEncryptedAttrs(args); err != nil {
 			return "", err
 		}
 		return "encrypted attributes: " + join(t.EncryptedAttrNames()), nil
 	case "truncate":
-		// Removing every ad is a destructive, DB-wide-locked operation -- DAEMON-level.
-		if !privileged {
-			return "", fmt.Errorf("truncate requires DAEMON authorization")
-		}
+		// Removing every ad is a destructive, DB-wide-locked operation.
 		t.Truncate()
 		return "database truncated", nil
 	case "backup.key":
 		// Export the backup key (hex) so an operator can escrow it and decrypt/restore
-		// encrypted snapshots without the pool keys. DAEMON-only: it is a secret that
-		// opens every backup. It is NOT the live-data key and cannot read the store.
-		if !privileged {
-			return "", fmt.Errorf("backup.key requires DAEMON authorization")
-		}
+		// encrypted snapshots without the pool keys: a secret that opens every backup. It
+		// is NOT the live-data key and cannot read the store.
 		k := t.BackupKey()
 		if k == nil {
 			return "", fmt.Errorf("encryption at rest is not enabled")
@@ -263,13 +263,16 @@ func (c *Client) MatchExplain(ctx context.Context, reqTable, jobSelector, resTab
 	return &ex, nil
 }
 
-// Admin runs a management action (index/hot-set) on the default table.
+// Admin runs a management action (index/hot-set) on the default table. Requires a
+// DAEMON-authorized connection (see AdminTable).
 func (c *Client) Admin(ctx context.Context, action string, args ...string) (string, error) {
 	return c.AdminTable(ctx, DefaultTable, action, args...)
 }
 
 // AdminTable runs a management action on the named table; it returns the server's
-// human-readable result. Refused on a read-only connection.
+// human-readable result. Every admin action retunes or restructures the store, so it
+// requires DAEMON authorization -- refused on read-only and ordinary read-write
+// connections alike.
 func (c *Client) AdminTable(ctx context.Context, table, action string, args ...string) (string, error) {
 	status, body, err := c.callCtx(ctx, func(id uint64) []byte {
 		b := putStr(putStr(req(id, opAdmin), table), action)

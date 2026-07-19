@@ -7,8 +7,22 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 )
 
+// adminPair returns a client on a DAEMON-privileged connection (admin actions require it).
+func adminPair(t *testing.T) (*Client, func()) {
+	t.Helper()
+	d, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(d)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConnOpts(sconn, ServeOptions{Privileged: true}) }()
+	c := NewClient(cconn)
+	return c, func() { c.Close(); s.Close(); d.Close() }
+}
+
 func TestDiagnosticsAndAdmin(t *testing.T) {
-	c, cleanup := testPair(t)
+	c, cleanup := adminPair(t)
 	defer cleanup()
 
 	tx, _ := c.Begin(context.Background())
@@ -94,6 +108,56 @@ func TestDiagnosticsAndAdmin(t *testing.T) {
 	}
 	if rows, err := c.Query(context.Background(), "Owner == \"alice\""); err != nil || len(rows) != 1 {
 		t.Fatalf("after rewrite/compact Query = %v,%v want 1 row", rows, err)
+	}
+}
+
+// TestAdminRefusedUnprivileged is the regression for the admin-authz gap: a WRITE-level
+// session (not read-only, but not DAEMON-privileged) can read and write ads but must NOT
+// be able to retune or restructure the store. Every maintenance/optimization action is
+// refused, while ordinary data writes and read-only diagnostics still work.
+func TestAdminRefusedUnprivileged(t *testing.T) {
+	c, cleanup := testPair(t) // ServeConn default: WRITE-level, not Privileged
+	defer cleanup()
+
+	// A normal data write succeeds on this connection.
+	tx, _ := c.Begin(context.Background())
+	if err := tx.NewClassAd(context.Background(), "1", "Owner = \"alice\""); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Every admin action is refused for a non-DAEMON writer.
+	for _, tc := range []struct {
+		action string
+		args   []string
+	}{
+		{"index.add.categorical", []string{"Owner"}},
+		{"index.add.value", []string{"Cpus"}},
+		{"index.drop", []string{"Owner"}},
+		{"index.reindex", nil},
+		{"compact", nil},
+		{"rewrite", nil},
+		{"codec.retrain", nil},
+		{"hot.add", []string{"Owner"}},
+		{"hot.refresh", []string{"100", "8"}},
+		{"encrypt.set", []string{"Owner"}},
+		{"truncate", nil},
+		{"backup.key", nil},
+	} {
+		if _, err := c.Admin(context.Background(), tc.action, tc.args...); err == nil {
+			t.Errorf("admin %q on a WRITE-level connection should be refused", tc.action)
+		}
+	}
+
+	// Read-only diagnostics remain available to a non-privileged session.
+	if _, err := c.Diagnostics(context.Background()); err != nil {
+		t.Fatalf("Diagnostics should work for a WRITE-level session: %v", err)
+	}
+	// And the data write actually landed (proving the connection is functional, not blanket-denied).
+	if rows, err := c.Query(context.Background(), `Owner == "alice"`); err != nil || len(rows) != 1 {
+		t.Fatalf("data write/read should work: rows=%v err=%v", rows, err)
 	}
 }
 
