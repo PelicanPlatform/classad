@@ -8,8 +8,8 @@ name: Fuzz
 # fuzz/README.md); the rest of CI (.github/workflows/test.yml) builds without it.
 
 on:
+  # Run on every PR regardless of its base branch, so a stacked PR still gets CI.
   pull_request:
-    branches: [ main, develop ]
   push:
     branches: [ main, develop ]
   workflow_dispatch:
