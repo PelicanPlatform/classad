@@ -177,7 +177,7 @@ func appendWireValue(dst, node []byte, table *wire.InternTable) ([]byte, error) 
 	// String literals are the most common non-numeric attribute value; quote their
 	// bytes straight from the wire (no string copy) before the general literal path.
 	if s, ok := wire.StringLiteralValue(node); ok {
-		return ast.AppendQuoteStringBytes(dst, s), nil
+		return ast.AppendQuoteStringOldBytes(dst, s), nil
 	}
 	if lit, ok := wire.LiteralValue(node); ok {
 		switch lit.Kind {
@@ -186,7 +186,7 @@ func appendWireValue(dst, node []byte, table *wire.InternTable) ([]byte, error) 
 		case wire.LitReal:
 			return strconv.AppendFloat(dst, lit.Real, 'g', -1, 64), nil
 		case wire.LitString:
-			return ast.AppendQuoteString(dst, lit.Str), nil
+			return ast.AppendQuoteStringOld(dst, lit.Str), nil
 		case wire.LitBool:
 			if lit.Bool {
 				return append(dst, "true"...), nil
