@@ -55,12 +55,26 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 		_ = closer()
 		return false
 	}
+	// Phase 2: a resident key Bloom over the segment's key-hashes, built from the key
+	// index, gates the sealed-segment probe. Published after keyIdx so a probe that
+	// observes the Bloom always finds the index behind it.
+	seg.keyBloom.Store(bloomFromKeyIndex(ki))
 	if mm != nil {
 		seg.msidx.Store(mm)
 		seg.idx.Store(nil) // free the heap attr index; readIdx now returns msidx
 	}
 	seg.setOnReapKey(func() { _ = closer() })
 	return true
+}
+
+// bloomFromKeyIndex builds a membership filter over a key index's hashes. It over-
+// counts multi-version keys (harmless; only slightly over-sizes the filter).
+func bloomFromKeyIndex(ki *mmapKeyIndex) *bloomFilter {
+	bf := newBloom(int(ki.count))
+	for i := uint32(0); i < ki.count; i++ {
+		bf.addHash(ki.hashAt(i))
+	}
+	return bf
 }
 
 // sealSegmentIndex writes a sealed persistent segment's combined sidecar container --
