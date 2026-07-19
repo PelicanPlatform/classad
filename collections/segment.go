@@ -89,9 +89,14 @@ type segment struct {
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned
 	// at compaction install and on recovery), so no rename is needed when id changes.
-	file   *os.File // backing file (non-nil ⇒ mmap-backed)
-	path   string   // backing file path (for unlink on retirement)
-	synced int      // bytes msync'd to disk (the durable length); guarded by shard lock
+	// persistent marks a file-backed (mmap) segment, independent of whether its fd is
+	// currently open. It is the durable-segment predicate (flush/msync, CRC, mapped,
+	// reap-unlink) so those keep working after the fd is released. Set once at
+	// creation; immutable.
+	persistent bool
+	file       *os.File // backing fd; released (nil) right after mmap -- see mmapseg.go
+	path       string   // backing file path (for unlink on retirement)
+	synced     int      // bytes msync'd to disk (the durable length); guarded by shard lock
 
 	// Reclamation of mmap segments (RAM segments are freed by the GC once scans drop
 	// their windows). A scan pins the segments it reads; a segment retired by
@@ -118,7 +123,7 @@ type segment struct {
 // mapped reports whether the segment holds a non-GC mapping that scans must pin and reap
 // must tear down: a file-backed data mmap, or (RAM store) an anon-mmap sealed sidecar. A
 // plain RAM segment (neither) relies on the GC and skips pin/reap entirely.
-func (s *segment) mapped() bool { return s.file != nil || s.pinReap }
+func (s *segment) mapped() bool { return s.persistent || s.pinReap }
 
 // readIdx returns the segment's queryable index behind the readIndex interface: the mmap'd
 // sidecar (msidx) once the segment is sealed and converted, else the in-RAM segIndex, else
@@ -308,7 +313,7 @@ func (s *segment) append(seq uint64, next loc, key, ad []byte) (uint32, bool) {
 	copy(b[adLenOff+4:], ad)
 	// Trailing CRC over the immutable bytes (persistent segments only; recovery
 	// uses it to detect a torn tail). RAM segments never recover, so skip the cost.
-	if s.file != nil {
+	if s.persistent {
 		crcOff := adLenOff + 4 + len(ad)
 		binary.LittleEndian.PutUint32(b[crcOff:], recCRC(b, crcOff))
 	}

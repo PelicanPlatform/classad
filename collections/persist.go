@@ -289,7 +289,17 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		seg.synced = used
 		sh.segs = append(sh.segs, seg)
 	}
-	c.rebuildDir(sh) // sets sh.act to the last (active) segment
+	// Fast reopen: a clean Close leaves a directory snapshot; restore from it instead
+	// of scanning every record (rebuildDir). It is validated against the loaded
+	// segment set and falls back to the full scan on any mismatch. Chained
+	// collections are excluded (their per-parent child counts would also need
+	// rebuilding); a stale snapshot in that case is discarded, not trusted.
+	if sh.childParentHash != nil {
+		os.Remove(filepath.Join(shardDir, dirSnapName))
+		c.rebuildDir(sh)
+	} else if !c.tryLoadDirSnapshot(sh, shardDir) {
+		c.rebuildDir(sh) // sets sh.act to the last (active) segment
+	}
 	// Map each sealed segment's existing sidecar directly (skip the active append target,
 	// which stays in-RAM): the reopen restores the index by mmapping it instead of
 	// re-indexing every record. A missing/invalid/stale sidecar leaves msidx nil so the
@@ -403,8 +413,23 @@ func (c *Collection) rebuildDir(sh *shard) {
 // after Close.
 func (c *Collection) Close() error {
 	var firstErr error
-	for _, sh := range c.shards {
+	for i, sh := range c.shards {
 		sh.mu.Lock()
+		// Flush every segment durable BEFORE writing the directory snapshot, so the
+		// snapshot never references bytes not yet on disk.
+		for _, seg := range sh.segs {
+			if seg != nil {
+				if err := seg.flush(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+		// Persist the directory for a scan-free reopen (best effort; skipped for a
+		// chained collection -- see tryLoadDirSnapshot). Only for a persistent store.
+		if c.dir != "" && sh.childParentHash == nil {
+			shardDir := filepath.Join(c.dir, fmt.Sprintf("%d", i))
+			_ = writeDirSnapshot(sh, shardDir)
+		}
 		for _, seg := range sh.segs {
 			if seg == nil {
 				continue
