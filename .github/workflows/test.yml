@@ -12,18 +12,25 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        go-version: ['1.21', '1.22', '1.23']
+        go-version: ['1.23', '1.24', '1.25']
 
     steps:
     - name: Check out code
-      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
     - name: Set up Go
-      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: ${{ matrix.go-version }}
 
     - name: Install goyacc
+      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
+      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
+      # the automatic toolchain switch. Override to auto for this build-tool install
+      # only -- the parser generator may build with a newer Go; the tests below still
+      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+      env:
+        GOTOOLCHAIN: auto
       run: go install golang.org/x/tools/cmd/goyacc@latest
 
     - name: Generate parser
@@ -42,9 +49,9 @@ jobs:
 
     - name: Upload coverage to Codecov
       if: matrix.go-version == '1.23'
-      uses: codecov/codecov-action@b9fd7d16f6d7d1b5d2bec1a2887e65ceed900238 # v4.6.0
+      uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
       with:
-        file: ./coverage.out
+        files: ./coverage.out
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false
@@ -60,14 +67,21 @@ jobs:
 
     steps:
     - name: Check out code
-      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
     - name: Set up Go
-      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.25'
 
     - name: Install goyacc
+      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
+      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
+      # the automatic toolchain switch. Override to auto for this build-tool install
+      # only -- the parser generator may build with a newer Go; the tests below still
+      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+      env:
+        GOTOOLCHAIN: auto
       run: go install golang.org/x/tools/cmd/goyacc@latest
 
     - name: Generate parser
@@ -95,14 +109,21 @@ jobs:
 
     steps:
     - name: Check out code
-      uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
     - name: Set up Go
-      uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.23'
 
     - name: Install goyacc
+      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
+      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
+      # the automatic toolchain switch. Override to auto for this build-tool install
+      # only -- the parser generator may build with a newer Go; the tests below still
+      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+      env:
+        GOTOOLCHAIN: auto
       run: go install golang.org/x/tools/cmd/goyacc@latest
 
     - name: Generate parser
@@ -122,7 +143,7 @@ jobs:
         fi
 
     - name: Run golangci-lint
-      uses: golangci/golangci-lint-action@9fae48acfc02a90574d7c304a1758ef9895495fa # v7.0.1
+      uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
       with:
         version: latest
         skip-cache: true
