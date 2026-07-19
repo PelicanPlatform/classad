@@ -85,6 +85,7 @@ const (
 	opDeleteWhere   op = 34 // [table][constraint] -> [removed i32]; bulk delete-by-constraint, mutating
 	opQueryRaw      op = 35 // [table][limit i32][constraint] -> stream of [oldClassAdText]; wire-form, AST-free relay
 	opCommitIdem    op = 36 // [txnID][idemKey] -> status (like opCommit) + durable idempotency marker; opt-in exactly-once, mutating
+	opQueryRawProj  op = 37 // [table][limit i32][constraint][nattrs i32]{[attr]} -> stream of [oldClassAdText] projected to attrs (+ MyType/TargetType); server-side projection so only requested attributes cross the wire
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).

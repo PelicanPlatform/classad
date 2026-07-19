@@ -130,6 +130,24 @@ type ServeOptions struct {
 	// only a DAEMON peer sets this true. Read-only diagnostics are a separate opcode and
 	// are not gated here.
 	Privileged bool
+
+	// QueryLog, if set, is called once per streamed query with a summary of what
+	// the client asked for and what it cost. It is an opt-in query log for
+	// operators: it makes visible, for example, a client that fetches every
+	// attribute of every ad instead of projecting server-side (a slow, chatty
+	// query pattern). Called from the connection's read-loop goroutine, so it must
+	// not block.
+	QueryLog func(QueryLog)
+}
+
+// QueryLog is one observed query, passed to ServeOptions.QueryLog.
+type QueryLog struct {
+	Op         string        // the query opcode: "Query", "QueryRaw", ...
+	Table      string        // the queried table
+	Constraint string        // the constraint expression ("" / "true" = match-all)
+	Limit      int           // the client's LIMIT (0 = unlimited)
+	Rows       int           // rows streamed back
+	Duration   time.Duration // wall-clock time to run + stream the query
 }
 
 // isMutating reports whether o writes to a transaction (and so is refused on a
@@ -293,9 +311,11 @@ func (sc *serverConn) dispatch(frame []byte) {
 	priv := sc.opts.IncludePrivate
 	switch o {
 	case opQuery:
-		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
 	case opQueryRaw:
-		sc.s.streamQueryRaw(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamQueryRaw(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+	case opQueryRawProj:
+		sc.s.streamQueryRawProject(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
 	case opMatchSorted:
 		sc.s.streamMatchSorted(sc.ctx, reqID, body, priv, sc.write)
 	case opOrdered:
@@ -391,10 +411,17 @@ func (sc *serverConn) stopWatch(watchReqID uint64) {
 // streamQuery streams the committed ads matching a constraint. Each result is its own
 // frame under reqID, so its frames interleave with other calls' -- no head-of-line
 // blocking -- and end with a terminator.
-func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
 	table := r.str()
 	limit := int(r.i32())
 	constraint := r.str()
+	n := 0
+	if qlog != nil {
+		defer func() {
+			qlog(QueryLog{Op: "Query", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+		}()
+	}
 	if r.err != nil {
 		write(respBad(reqID))
 		return
@@ -410,7 +437,6 @@ func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, inclu
 	}
 	// Push LIMIT down: stopping the range stops the underlying scan, so a small
 	// LIMIT does proportionally less work instead of scanning everything.
-	n := 0
 	for ad := range seq {
 		if cancelled(ctx) {
 			return // client gone: stop the scan

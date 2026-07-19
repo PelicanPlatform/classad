@@ -3,6 +3,7 @@ package dbrpc
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
@@ -24,12 +25,35 @@ func (c *Client) QueryRawTable(ctx context.Context, table, constraint string, li
 	})
 }
 
+// QueryRawProject is QueryRawTable with a server-side projection: each returned ad
+// carries only the attributes in attrs (matched case-insensitively) plus
+// MyType/TargetType, so a query for a few attributes does not pull every attribute
+// of every ad across the wire. An empty attrs behaves like QueryRawTable (all
+// attributes). Private attributes are stripped unless the connection is privileged.
+func (c *Client) QueryRawProject(ctx context.Context, table, constraint string, attrs []string, limit int) ([]string, error) {
+	return c.streamCtx(ctx, func(id uint64) []byte {
+		b := putStr(putI32(putStr(req(id, opQueryRawProj), table), int32(limit)), constraint)
+		b = putI32(b, int32(len(attrs)))
+		for _, a := range attrs {
+			b = putStr(b, a)
+		}
+		return b
+	})
+}
+
 // streamQueryRaw streams matching ads as old-ClassAd wire text, rendered from the
 // db QueryRaw pushdown (no AST decode), one frame per ad like streamQuery.
-func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
 	table := r.str()
 	limit := int(r.i32())
 	constraint := r.str()
+	n := 0
+	if qlog != nil {
+		defer func() {
+			qlog(QueryLog{Op: "QueryRaw", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+		}()
+	}
 	if r.err != nil {
 		write(respBad(reqID))
 		return
@@ -43,7 +67,6 @@ func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, in
 		write(respErr(reqID, err.Error()))
 		return
 	}
-	n := 0
 	for ra := range seq {
 		if cancelled(ctx) {
 			return
@@ -95,4 +118,84 @@ func rawExprName(expr []byte) string {
 		i++
 	}
 	return string(expr[start:i])
+}
+
+// streamQueryRawProject is streamQueryRaw with a projection: it streams each
+// matching ad rendered to only the requested attributes (plus MyType/TargetType),
+// so a client that needs a handful of attributes does not pull every attribute of
+// every ad across the wire. The projection is applied server-side; matching is
+// case-insensitive (ClassAd attribute names are).
+func (s *Server) streamQueryRawProject(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
+	table := r.str()
+	limit := int(r.i32())
+	constraint := r.str()
+	nattrs := int(r.i32())
+	attrs := make([]string, 0, nattrs)
+	for i := 0; i < nattrs; i++ {
+		attrs = append(attrs, r.str())
+	}
+	n := 0
+	if qlog != nil {
+		defer func() {
+			qlog(QueryLog{Op: "QueryRawProject", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+		}()
+	}
+	if r.err != nil {
+		write(respBad(reqID))
+		return
+	}
+	d, ok := s.tableOr(reqID, table, write)
+	if !ok {
+		return
+	}
+	proj := make(map[string]struct{}, len(attrs))
+	for _, a := range attrs {
+		proj[strings.ToLower(a)] = struct{}{}
+	}
+	seq, err := d.QueryRaw(constraint)
+	if err != nil {
+		write(respErr(reqID, err.Error()))
+		return
+	}
+	for ra := range seq {
+		if cancelled(ctx) {
+			return
+		}
+		write(putStr(respHead(reqID, stStream), rawAdToOldTextProjected(ra, proj, includePrivate)))
+		n++
+		if limit > 0 && n >= limit {
+			break
+		}
+	}
+	write(respHead(reqID, stStreamEnd))
+}
+
+// rawAdToOldTextProjected is rawAdToOldText restricted to the attributes in proj
+// (lowercased names) -- plus MyType/TargetType, always kept so the ad stays
+// identifiable. Private attributes are still dropped unless includePrivate.
+func rawAdToOldTextProjected(ra collections.RawAd, proj map[string]struct{}, includePrivate bool) string {
+	var b strings.Builder
+	if ra.MyType != "" {
+		b.WriteString(`MyType = "`)
+		b.WriteString(ra.MyType)
+		b.WriteString("\"\n")
+	}
+	if ra.TargetType != "" {
+		b.WriteString(`TargetType = "`)
+		b.WriteString(ra.TargetType)
+		b.WriteString("\"\n")
+	}
+	for _, e := range ra.Exprs {
+		name := rawExprName(e)
+		if _, ok := proj[strings.ToLower(name)]; !ok {
+			continue
+		}
+		if !includePrivate && classad.IsPrivateAttribute(name) {
+			continue
+		}
+		b.Write(e)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
