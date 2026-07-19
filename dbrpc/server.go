@@ -123,10 +123,12 @@ type ServeOptions struct {
 	// under-privileged peer never learns claim ids and other secrets.
 	IncludePrivate bool
 
-	// Privileged admits the DAEMON-level administrative actions -- those that change
-	// security or durability policy (e.g. the encryption toggle), as opposed to the
-	// ordinary WRITE-level admin actions (index/hot/compact) that any writer may run.
-	// When false, a privileged action is refused even on a read-write connection.
+	// Privileged admits the DAEMON-level administrative actions -- ALL of the admin
+	// table (index/hot/compact/rewrite/codec.retrain, plus the security/durability ones
+	// like the encryption toggle and truncate). These retune or restructure the store,
+	// so an ordinary WRITE-level session (which may read and write ads) is refused them;
+	// only a DAEMON peer sets this true. Read-only diagnostics are a separate opcode and
+	// are not gated here.
 	Privileged bool
 }
 
