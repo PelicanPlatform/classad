@@ -40,12 +40,12 @@ type AggRow struct {
 // With no group columns it returns a single row aggregating the whole match. The
 // aggregation happens on the server, so only the (small) grouped result crosses
 // the wire, not every matched ad.
-func (c *Client) Aggregate(constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
-	return c.AggregateTable(DefaultTable, constraint, groupBy, aggs)
+func (c *Client) Aggregate(ctx context.Context, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	return c.AggregateTable(ctx, DefaultTable, constraint, groupBy, aggs)
 }
 
 // AggregateTable is Aggregate on the named table.
-func (c *Client) AggregateTable(table, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+func (c *Client) AggregateTable(ctx context.Context, table, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
 	build := func(id uint64) []byte {
 		b := putStr(putStr(req(id, opAggregate), table), constraint)
 		b = putI32(b, int32(len(groupBy)))
@@ -63,26 +63,34 @@ func (c *Client) AggregateTable(table, constraint string, groupBy []string, aggs
 		return nil, err
 	}
 	var out []AggRow
-	for frame := range frames {
-		_, status, body, ok := respHeader(frame)
-		if !ok {
-			return out, errShort
-		}
-		switch status {
-		case stStream:
-			row := AggRow{Group: make([]string, len(groupBy)), Values: make([]string, len(aggs))}
-			for i := range row.Group {
-				row.Group[i] = body.str()
+	for {
+		select {
+		case <-ctx.Done():
+			drain(frames)
+			return out, ctx.Err()
+		case frame, ok := <-frames:
+			if !ok {
+				return out, nil
 			}
-			for i := range row.Values {
-				row.Values[i] = body.str()
+			_, status, body, ok := respHeader(frame)
+			if !ok {
+				return out, errShort
 			}
-			out = append(out, row)
-		case stErr:
-			return out, statusErr(status, body)
+			switch status {
+			case stStream:
+				row := AggRow{Group: make([]string, len(groupBy)), Values: make([]string, len(aggs))}
+				for i := range row.Group {
+					row.Group[i] = body.str()
+				}
+				for i := range row.Values {
+					row.Values[i] = body.str()
+				}
+				out = append(out, row)
+			case stErr:
+				return out, statusErr(status, body)
+			}
 		}
 	}
-	return out, nil
 }
 
 // streamAggregate performs the server-side aggregation and streams one frame per

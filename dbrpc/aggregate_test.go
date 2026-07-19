@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"sort"
 	"testing"
 
@@ -11,16 +12,16 @@ func TestAggregateGroupBy(t *testing.T) {
 	c, cleanup := testPair(t)
 	defer cleanup()
 
-	tx, _ := c.Begin()
-	_ = tx.NewClassAd("1", "Owner = \"alice\"\nCpus = 4")
-	_ = tx.NewClassAd("2", "Owner = \"alice\"\nCpus = 8")
-	_ = tx.NewClassAd("3", "Owner = \"bob\"\nCpus = 16")
-	if err := tx.Commit(); err != nil {
+	tx, _ := c.Begin(context.Background())
+	_ = tx.NewClassAd(context.Background(), "1", "Owner = \"alice\"\nCpus = 4")
+	_ = tx.NewClassAd(context.Background(), "2", "Owner = \"alice\"\nCpus = 8")
+	_ = tx.NewClassAd(context.Background(), "3", "Owner = \"bob\"\nCpus = 16")
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
 	// GROUP BY Owner: COUNT(*), SUM(Cpus), MAX(Cpus).
-	rows, err := c.Aggregate("true", []string{"Owner"}, []AggSpec{
+	rows, err := c.Aggregate(context.Background(), "true", []string{"Owner"}, []AggSpec{
 		{Func: AggCount, Arg: "*"},
 		{Func: AggSum, Arg: "Cpus"},
 		{Func: AggMax, Arg: "Cpus"},
@@ -46,14 +47,14 @@ func TestAggregateGroupBy(t *testing.T) {
 func TestAggregateMultiColumnGroup(t *testing.T) {
 	c, cleanup := testPair(t)
 	defer cleanup()
-	tx, _ := c.Begin()
-	_ = tx.NewClassAd("1", "Owner = \"alice\"\nState = \"Run\"\nCpus = 4")
-	_ = tx.NewClassAd("2", "Owner = \"alice\"\nState = \"Idle\"\nCpus = 8")
-	_ = tx.NewClassAd("3", "Owner = \"alice\"\nState = \"Run\"\nCpus = 2")
-	if err := tx.Commit(); err != nil {
+	tx, _ := c.Begin(context.Background())
+	_ = tx.NewClassAd(context.Background(), "1", "Owner = \"alice\"\nState = \"Run\"\nCpus = 4")
+	_ = tx.NewClassAd(context.Background(), "2", "Owner = \"alice\"\nState = \"Idle\"\nCpus = 8")
+	_ = tx.NewClassAd(context.Background(), "3", "Owner = \"alice\"\nState = \"Run\"\nCpus = 2")
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := c.Aggregate("true", []string{"Owner", "State"}, []AggSpec{{Func: AggCount, Arg: "*"}})
+	rows, err := c.Aggregate(context.Background(), "true", []string{"Owner", "State"}, []AggSpec{{Func: AggCount, Arg: "*"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,13 +71,13 @@ func TestAggregateMultiColumnGroup(t *testing.T) {
 func TestAggregateNoGroup(t *testing.T) {
 	c, cleanup := testPair(t)
 	defer cleanup()
-	tx, _ := c.Begin()
-	_ = tx.NewClassAd("1", "Cpus = 4")
-	_ = tx.NewClassAd("2", "Cpus = 8")
-	if err := tx.Commit(); err != nil {
+	tx, _ := c.Begin(context.Background())
+	_ = tx.NewClassAd(context.Background(), "1", "Cpus = 4")
+	_ = tx.NewClassAd(context.Background(), "2", "Cpus = 8")
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := c.Aggregate("true", nil, []AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggAvg, Arg: "Cpus"}})
+	rows, err := c.Aggregate(context.Background(), "true", nil, []AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggAvg, Arg: "Cpus"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -91,13 +92,13 @@ func TestAggregateNoGroup(t *testing.T) {
 func TestAggregateCoercion(t *testing.T) {
 	c, cleanup := testPair(t)
 	defer cleanup()
-	tx, _ := c.Begin()
-	_ = tx.NewClassAd("1", "N = 4\nX = 4\nName = \"alice\"")
-	_ = tx.NewClassAd("2", "N = 8\nX = 1.5\nName = \"bob\"")
-	if err := tx.Commit(); err != nil {
+	tx, _ := c.Begin(context.Background())
+	_ = tx.NewClassAd(context.Background(), "1", "N = 4\nX = 4\nName = \"alice\"")
+	_ = tx.NewClassAd(context.Background(), "2", "N = 8\nX = 1.5\nName = \"bob\"")
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	rows, err := c.Aggregate("true", nil, []AggSpec{
+	rows, err := c.Aggregate(context.Background(), "true", nil, []AggSpec{
 		{Func: AggSum, Arg: "N"},    // 4 + 8 -> integer 12
 		{Func: AggSum, Arg: "X"},    // 4 + 1.5 -> real 5.5
 		{Func: AggMin, Arg: "Name"}, // strings are not numeric -> error
@@ -130,7 +131,7 @@ func TestAggregatePrivateRefused(t *testing.T) {
 	c := NewClient(cconn)
 	defer func() { c.Close(); s.Close(); d.Close() }()
 
-	if _, err := c.Aggregate("true", []string{"Capability"}, []AggSpec{{Func: AggCount, Arg: "*"}}); err == nil {
+	if _, err := c.Aggregate(context.Background(), "true", []string{"Capability"}, []AggSpec{{Func: AggCount, Arg: "*"}}); err == nil {
 		t.Fatal("grouping by a private attribute on a stripped connection should be refused")
 	}
 }

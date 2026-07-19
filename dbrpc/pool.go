@@ -1,6 +1,9 @@
 package dbrpc
 
-import "sync/atomic"
+import (
+	"context"
+	"sync/atomic"
+)
 
 // Pool is a set of multiplexed connections to one Server, load-balanced round-robin.
 // It borrows the database/sql idea of a connection pool, but adapts it: an SQL driver
@@ -40,24 +43,26 @@ func (p *Pool) pick() *Client {
 
 // Begin starts a transaction on a pool connection; the returned Tx's operations all
 // run over that connection (server-side transaction state + op ordering).
-func (p *Pool) Begin() (*Tx, error) { return p.pick().Begin() }
+func (p *Pool) Begin(ctx context.Context) (*Tx, error) { return p.pick().Begin(ctx) }
 
 // Query runs a constraint query on a pool connection, streaming the results.
-func (p *Pool) Query(constraint string) ([]string, error) { return p.pick().Query(constraint) }
+func (p *Pool) Query(ctx context.Context, constraint string) ([]string, error) {
+	return p.pick().Query(ctx, constraint)
+}
 
 // MatchSorted runs a ranked match on a pool connection.
-func (p *Pool) MatchSorted(jobText string, limit int) ([]string, error) {
-	return p.pick().MatchSorted(jobText, limit)
+func (p *Pool) MatchSorted(ctx context.Context, jobText string, limit int) ([]string, error) {
+	return p.pick().MatchSorted(ctx, jobText, limit)
 }
 
 // Watch starts a watch on a pool connection.
-func (p *Pool) Watch(cursor []byte) (<-chan WatchEvent, func(), error) {
-	return p.pick().Watch(cursor)
+func (p *Pool) Watch(ctx context.Context, cursor []byte) (<-chan WatchEvent, func(), error) {
+	return p.pick().Watch(ctx, cursor)
 }
 
 // Ordered streams a partition of an ordered index on a pool connection.
-func (p *Pool) Ordered(index int, partition string) ([]OrderedRow, error) {
-	return p.pick().Ordered(index, partition)
+func (p *Pool) Ordered(ctx context.Context, index int, partition string) ([]OrderedRow, error) {
+	return p.pick().Ordered(ctx, index, partition)
 }
 
 // Close closes every connection. The first close error is returned.

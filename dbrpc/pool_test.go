@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -27,12 +28,12 @@ func TestPool(t *testing.T) {
 	}
 	defer p.Close()
 
-	tx, err := p.Begin()
+	tx, err := p.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = tx.NewClassAd("k", "N = 1")
-	if err := tx.Commit(); err != nil {
+	_ = tx.NewClassAd(context.Background(), "k", "N = 1")
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -45,7 +46,7 @@ func TestPool(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			rows, err := p.Query("N == 1")
+			rows, err := p.Query(context.Background(), "N == 1")
 			switch {
 			case err != nil:
 				errs[i] = err

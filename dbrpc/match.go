@@ -33,7 +33,7 @@ type MatchRow struct {
 // significant-attribute autoclusters. It must list every attribute the match
 // depends on (the request's Requirements and Rank, and the request attributes the
 // resources' Requirements reference).
-func (c *Client) MatchTables(reqTable, resTable, keyAttr, reqWhere, targetWhere string, limit int, significantAttrs []string) ([]MatchRow, error) {
+func (c *Client) MatchTables(ctx context.Context, reqTable, resTable, keyAttr, reqWhere, targetWhere string, limit int, significantAttrs []string) ([]MatchRow, error) {
 	_, frames, err := c.callStream(func(id uint64) []byte {
 		b := putStr(req(id, opMatchTables), reqTable)
 		b = putStr(b, resTable)
@@ -51,19 +51,27 @@ func (c *Client) MatchTables(reqTable, resTable, keyAttr, reqWhere, targetWhere 
 		return nil, err
 	}
 	var out []MatchRow
-	for frame := range frames {
-		_, status, body, ok := respHeader(frame)
-		if !ok {
-			return out, errShort
-		}
-		switch status {
-		case stStream:
-			out = append(out, MatchRow{Request: body.str(), Resource: body.str(), Rank: body.str()})
-		case stErr:
-			return out, statusErr(status, body)
+	for {
+		select {
+		case <-ctx.Done():
+			drain(frames)
+			return out, ctx.Err()
+		case frame, ok := <-frames:
+			if !ok {
+				return out, nil
+			}
+			_, status, body, ok := respHeader(frame)
+			if !ok {
+				return out, errShort
+			}
+			switch status {
+			case stStream:
+				out = append(out, MatchRow{Request: body.str(), Resource: body.str(), Rank: body.str()})
+			case stErr:
+				return out, statusErr(status, body)
+			}
 		}
 	}
-	return out, nil
 }
 
 // matchResult is one row of a request's (or autocluster's) ranked candidates.

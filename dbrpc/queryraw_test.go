@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -20,16 +21,16 @@ func TestRPCQueryRawPrivileged(t *testing.T) {
 	c := NewClient(cc)
 	defer func() { c.Close(); s.Close(); d.Close() }()
 
-	tx, err := c.Begin()
+	tx, err := c.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = tx.NewClassAd("a", "MyType = \"Machine\"\nState = \"Idle\"\nCapability = \"secret-claim\"")
-	if err := tx.Commit(); err != nil {
+	_ = tx.NewClassAd(context.Background(), "a", "MyType = \"Machine\"\nState = \"Idle\"\nCapability = \"secret-claim\"")
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	rows, err := c.QueryRaw("true")
+	rows, err := c.QueryRaw(context.Background(), "true")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,16 +52,16 @@ func TestRPCQueryRawStripsPrivate(t *testing.T) {
 	c, cleanup := testPair(t) // default ServeOptions: not privileged
 	defer cleanup()
 
-	tx, err := c.Begin()
+	tx, err := c.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = tx.NewClassAd("a", "MyType = \"Machine\"\nState = \"Idle\"\nCapability = \"secret-claim\"")
-	if err := tx.Commit(); err != nil {
+	_ = tx.NewClassAd(context.Background(), "a", "MyType = \"Machine\"\nState = \"Idle\"\nCapability = \"secret-claim\"")
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	rows, err := c.QueryRaw("true")
+	rows, err := c.QueryRaw(context.Background(), "true")
 	if err != nil {
 		t.Fatal(err)
 	}

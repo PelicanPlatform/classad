@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -54,19 +55,19 @@ func TestServeReadOnlyRejectsMutation(t *testing.T) {
 	c, cleanup := serveOptsPair(t, ServeOptions{ReadOnly: true})
 	defer cleanup()
 
-	tx, err := c.Begin()
+	tx, err := c.Begin(context.Background())
 	if err != nil {
 		t.Fatalf("Begin on a read-only conn should succeed (read snapshot): %v", err)
 	}
-	if err := tx.NewClassAd("x", "N = 1"); err == nil {
+	if err := tx.NewClassAd(context.Background(), "x", "N = 1"); err == nil {
 		t.Fatal("NewClassAd on a read-only connection should be rejected")
 	} else if !strings.Contains(err.Error(), "read-only") {
 		t.Fatalf("rejection error = %v, want a read-only message", err)
 	}
-	if err := tx.SetAttribute("x", "N", "2"); err == nil {
+	if err := tx.SetAttribute(context.Background(), "x", "N", "2"); err == nil {
 		t.Fatal("SetAttribute on a read-only connection should be rejected")
 	}
-	_ = tx.Abort()
+	_ = tx.Abort(context.Background())
 }
 
 // TestServeStripsPrivate confirms private attributes are stripped by default and
@@ -80,7 +81,7 @@ func TestServeStripsPrivate(t *testing.T) {
 	c := NewClient(cconn)
 	defer func() { c.Close(); s.Close(); d.Close() }()
 
-	rows, err := c.Query("Cpus == 4")
+	rows, err := c.Query(context.Background(), "Cpus == 4")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +97,7 @@ func TestServeStripsPrivate(t *testing.T) {
 	go func() { _ = s.ServeConnOpts(psconn, ServeOptions{IncludePrivate: true}) }()
 	pc := NewClient(pconn)
 	defer pc.Close()
-	prows, err := pc.Query("Cpus == 4")
+	prows, err := pc.Query(context.Background(), "Cpus == 4")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -10,26 +11,26 @@ func TestRPCDeleteWhere(t *testing.T) {
 	c, cleanup := testPair(t)
 	defer cleanup()
 
-	tx, err := c.Begin()
+	tx, err := c.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = tx.NewClassAd("a", `Name = "a"`+"\n"+`State = "Idle"`)
-	_ = tx.NewClassAd("b", `Name = "b"`+"\n"+`State = "Claimed"`)
-	_ = tx.NewClassAd("c", `Name = "c"`+"\n"+`State = "Idle"`)
-	if err := tx.Commit(); err != nil {
+	_ = tx.NewClassAd(context.Background(), "a", `Name = "a"`+"\n"+`State = "Idle"`)
+	_ = tx.NewClassAd(context.Background(), "b", `Name = "b"`+"\n"+`State = "Claimed"`)
+	_ = tx.NewClassAd(context.Background(), "c", `Name = "c"`+"\n"+`State = "Idle"`)
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
 	// Bulk delete-by-constraint in one server-side call.
-	n, err := c.DeleteWhere(`State == "Idle"`)
+	n, err := c.DeleteWhere(context.Background(), `State == "Idle"`)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 2 {
 		t.Fatalf("DeleteWhere removed %d, want 2", n)
 	}
-	rows, err := c.Query("true")
+	rows, err := c.Query(context.Background(), "true")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ func TestRPCDeleteWhereReadOnly(t *testing.T) {
 	c := NewClient(cconn)
 	defer func() { c.Close(); s.Close(); d.Close() }()
 
-	if _, err := c.DeleteWhere("true"); err == nil {
+	if _, err := c.DeleteWhere(context.Background(), "true"); err == nil {
 		t.Fatal("DeleteWhere on a read-only connection should be refused, got nil error")
 	}
 }

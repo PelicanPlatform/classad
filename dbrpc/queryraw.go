@@ -13,13 +13,13 @@ import (
 // representation via the db QueryRaw pushdown, and the caller can forward the
 // text without building a ClassAd. Private attributes are stripped unless the
 // connection is privileged.
-func (c *Client) QueryRaw(constraint string) ([]string, error) {
-	return c.QueryRawTable(DefaultTable, constraint, 0)
+func (c *Client) QueryRaw(ctx context.Context, constraint string) ([]string, error) {
+	return c.QueryRawTable(ctx, DefaultTable, constraint, 0)
 }
 
 // QueryRawTable is QueryRaw against a named table with an optional limit.
-func (c *Client) QueryRawTable(table, constraint string, limit int) ([]string, error) {
-	return c.stream(func(id uint64) []byte {
+func (c *Client) QueryRawTable(ctx context.Context, table, constraint string, limit int) ([]string, error) {
+	return c.streamCtx(ctx, func(id uint64) []byte {
 		return putStr(putI32(putStr(req(id, opQueryRaw), table), int32(limit)), constraint)
 	})
 }

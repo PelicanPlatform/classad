@@ -691,6 +691,12 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand
 		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 			return false
 		}
+		// Defensive: an internal system record carries no normal indexed attributes,
+		// so it can never appear as an index candidate; the tail full-scan could still
+		// reach one, and Match reuses this primitive, so skip it here too.
+		if isSystemKeyBytes(recKey(w.data, o)) {
+			return false
+		}
 		ww, err := w.codec.Decompress(dbuf[:0], recAd(w.data, o))
 		if err != nil {
 			return false
@@ -776,6 +782,11 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 	var dbuf []byte
 	visit := func(w segWindow, o uint32) (stop bool) {
 		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+			return false
+		}
+		// Defensive: internal system records carry no normal indexed attributes and
+		// are hidden from client results (see scanShardCandidates).
+		if isSystemKeyBytes(recKey(w.data, o)) {
 			return false
 		}
 		ww, err := w.codec.Decompress(dbuf[:0], recAd(w.data, o))
