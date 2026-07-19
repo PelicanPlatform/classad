@@ -143,9 +143,26 @@ func (cat *Catalog) Table(name string) (*DB, bool) {
 	return d, ok
 }
 
+// TableOptions tunes how a table is created. The zero value creates a normal
+// table (persistent when the catalog has a directory).
+type TableOptions struct {
+	// InMemory makes the table's data live only in RAM even in a persistent
+	// catalog: no <dir>/tables/<name> directory is created, so the table is not
+	// recovered across restarts (it reappears empty). Useful for high-churn,
+	// reconstructible data (e.g. frequently-replaced ads) that is not worth the
+	// disk I/O of persistence. In an already-in-memory catalog it is a no-op.
+	InMemory bool
+}
+
 // CreateTable creates (or returns the existing) table named name. Its data
 // persists under <dir>/tables/<name> for a persistent catalog.
 func (cat *Catalog) CreateTable(name string) (*DB, error) {
+	return cat.CreateTableOpts(name, TableOptions{})
+}
+
+// CreateTableOpts is CreateTable with options; see TableOptions. If the table
+// already exists it is returned as-is (options are not re-applied).
+func (cat *Catalog) CreateTableOpts(name string, opts TableOptions) (*DB, error) {
 	if !ValidTableName(name) {
 		return nil, fmt.Errorf("catalog: invalid table name %q", name)
 	}
@@ -158,7 +175,7 @@ func (cat *Catalog) CreateTable(name string) (*DB, error) {
 		return nil, fmt.Errorf("catalog: %q already exists as an archive table", name)
 	}
 	cfgDir := ""
-	if cat.dir != "" {
+	if cat.dir != "" && !opts.InMemory {
 		cfgDir = filepath.Join(cat.dir, tablesSubdir, name)
 	}
 	d, err := OpenConfig(cat.tableConfig(cfgDir))
