@@ -17,28 +17,28 @@ func openMmapSegment(id uint32, codec Codec, f *os.File, size int) (*segment, er
 }
 
 func (s *segment) flush() error {
-	if s.file == nil {
+	if !s.persistent {
 		return nil
 	}
 	return errNoMmap
 }
 
 func (s *segment) msyncRange(from, to int) error {
-	if s.file == nil {
+	if !s.persistent {
 		return nil
 	}
 	return errNoMmap
 }
 
 func (s *segment) reap() error {
-	if s.file == nil {
+	if !s.persistent {
 		return nil
 	}
 	return errNoMmap
 }
 
 func (s *segment) unmap() error {
-	if s.file == nil {
+	if !s.persistent {
 		return nil
 	}
 	return errNoMmap
