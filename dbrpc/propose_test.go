@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -49,21 +50,21 @@ func TestProposeHookRoutesWrites(t *testing.T) {
 	c := NewClient(cconn)
 	defer c.Close()
 
-	tx, err := c.Begin()
+	tx, err := c.Begin(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.NewClassAd("1.0", "Owner = \"alice\""); err != nil {
+	if err := tx.NewClassAd(context.Background(), "1.0", "Owner = \"alice\""); err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.SetAttribute("1.0", "JobStatus", "2"); err != nil {
+	if err := tx.SetAttribute(context.Background(), "1.0", "JobStatus", "2"); err != nil {
 		t.Fatal(err)
 	}
 	// Read-your-writes mid-transaction (served from the local txn buffer).
-	if v, ok, err := tx.LookupAttr("1.0", "JobStatus"); err != nil || !ok || v != "2" {
+	if v, ok, err := tx.LookupAttr(context.Background(), "1.0", "JobStatus"); err != nil || !ok || v != "2" {
 		t.Fatalf("read-your-writes JobStatus = %q,%v,%v want 2", v, ok, err)
 	}
-	if err := tx.Commit(); err != nil {
+	if err := tx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 

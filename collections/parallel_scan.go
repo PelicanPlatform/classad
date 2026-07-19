@@ -77,6 +77,25 @@ func forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []byte, codec Codec
 	}
 }
 
+// forEachVisibleWindowKeyed is forEachVisibleWindow that also passes each record's
+// key, so the parallel query workers can filter internal system records out of the
+// client-facing result (the serial scanShard path does the same).
+func forEachVisibleWindowKeyed(s0 uint64, w segWindow, fn func(key, ad []byte, codec Codec) bool) {
+	for off := 0; off < w.used; {
+		o := uint32(off)
+		total := recTotalLen(w.data, o)
+		if total == 0 {
+			break
+		}
+		if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+			if !fn(recKey(w.data, o), recAd(w.data, o), w.codec) {
+				return
+			}
+		}
+		off += int(total)
+	}
+}
+
 // tryAcquire takes up to n tokens from the worker budget without blocking, returning
 // how many it got (0..n). The taken tokens must be released by the caller. It is
 // greedy (grab whatever is free) rather than all-or-nothing: under concurrent-query
@@ -162,9 +181,12 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 					}
 					return
 				}
-				forEachVisibleWindow(tasks[idx].s0, tasks[idx].win, func(ad []byte, codec Codec) bool {
+				forEachVisibleWindowKeyed(tasks[idx].s0, tasks[idx].win, func(key, ad []byte, codec Codec) bool {
 					if stopped.Load() {
 						return false
+					}
+					if isSystemKeyBytes(key) {
+						return true // internal system record: hidden from client queries
 					}
 					w, err := codec.Decompress(dbuf[:0], ad)
 					if err != nil {
@@ -209,7 +231,10 @@ func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(
 	var dbuf []byte
 	for _, t := range tasks {
 		stop := false
-		forEachVisibleWindow(t.s0, t.win, func(ad []byte, codec Codec) bool {
+		forEachVisibleWindowKeyed(t.s0, t.win, func(key, ad []byte, codec Codec) bool {
+			if isSystemKeyBytes(key) {
+				return true // internal system record: hidden from client queries
+			}
 			w, err := codec.Decompress(dbuf[:0], ad)
 			if err != nil {
 				return true

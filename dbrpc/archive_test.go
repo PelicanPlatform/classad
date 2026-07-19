@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -27,17 +28,17 @@ func TestArchiveOverRPC(t *testing.T) {
 	c, cleanup := catServerPair(t, ServeOptions{})
 	defer cleanup()
 
-	if err := c.CreateArchiveTable("history", db.ArchiveConfig{ValueAttrs: []string{"ClusterId"}}); err != nil {
+	if err := c.CreateArchiveTable(context.Background(), "history", db.ArchiveConfig{ValueAttrs: []string{"ClusterId"}}); err != nil {
 		t.Fatalf("CreateArchiveTable: %v", err)
 	}
 	for i := 0; i < 100; i++ {
-		if err := c.ArchiveAppend("history", fmt.Sprintf("ClusterId = %d\nJobStatus = 4", i)); err != nil {
+		if err := c.ArchiveAppend(context.Background(), "history", fmt.Sprintf("ClusterId = %d\nJobStatus = 4", i)); err != nil {
 			t.Fatalf("ArchiveAppend: %v", err)
 		}
 	}
 
 	// Newest-first, last 3.
-	got, err := c.ArchiveQuery("history", "true", 3)
+	got, err := c.ArchiveQuery(context.Background(), "history", "true", 3)
 	if err != nil {
 		t.Fatalf("ArchiveQuery: %v", err)
 	}
@@ -45,7 +46,7 @@ func TestArchiveOverRPC(t *testing.T) {
 		t.Fatalf("ArchiveQuery(limit 3) returned %d, want 3", len(got))
 	}
 	// Constrained query.
-	one, err := c.ArchiveQuery("history", "ClusterId == 42", 0)
+	one, err := c.ArchiveQuery(context.Background(), "history", "ClusterId == 42", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,7 +54,7 @@ func TestArchiveOverRPC(t *testing.T) {
 		t.Fatalf("ClusterId==42 matched %d, want 1", len(one))
 	}
 
-	names, err := c.ArchiveTables()
+	names, err := c.ArchiveTables(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +65,7 @@ func TestArchiveOverRPC(t *testing.T) {
 	// Append is refused on a read-only connection.
 	rc, rcleanup := catServerPair(t, ServeOptions{ReadOnly: true})
 	defer rcleanup()
-	if err := rc.ArchiveAppend("history", "ClusterId = 1"); err == nil {
+	if err := rc.ArchiveAppend(context.Background(), "history", "ClusterId = 1"); err == nil {
 		t.Error("archive append should be refused on a read-only connection")
 	}
 }

@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"testing"
 
@@ -30,7 +31,7 @@ func encServerPair(t *testing.T, opts ServeOptions) (*Client, *db.DB, func()) {
 func TestEncryptSetRequiresDaemon(t *testing.T) {
 	// Unprivileged (WRITE-level: not read-only, but not Privileged) -> refused.
 	c, _, cleanup := encServerPair(t, ServeOptions{})
-	if _, err := c.SetEncryptedAttrs("ads", "Region"); err == nil {
+	if _, err := c.SetEncryptedAttrs(context.Background(), "ads", "Region"); err == nil {
 		t.Fatal("encrypt.set should be refused without DAEMON privilege")
 	}
 	cleanup()
@@ -38,10 +39,10 @@ func TestEncryptSetRequiresDaemon(t *testing.T) {
 	// Privileged -> accepted, and reflected in diagnostics.
 	c, _, cleanup = encServerPair(t, ServeOptions{Privileged: true})
 	defer cleanup()
-	if _, err := c.SetEncryptedAttrs("ads", "Region", "Zone"); err != nil {
+	if _, err := c.SetEncryptedAttrs(context.Background(), "ads", "Region", "Zone"); err != nil {
 		t.Fatalf("privileged encrypt.set: %v", err)
 	}
-	diag, err := c.Diagnostics()
+	diag, err := c.Diagnostics(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +62,7 @@ func TestTruncateRequiresDaemon(t *testing.T) {
 	tx := d.Begin()
 	tx.NewClassAd("a", mustAd(t, "N = 1"))
 	tx.Commit()
-	if _, err := c.TruncateTable("ads"); err == nil {
+	if _, err := c.TruncateTable(context.Background(), "ads"); err == nil {
 		t.Fatal("truncate should be refused without DAEMON privilege")
 	}
 	if d.Len() != 1 {
@@ -76,7 +77,7 @@ func TestTruncateRequiresDaemon(t *testing.T) {
 	tx.NewClassAd("a", mustAd(t, "N = 1"))
 	tx.NewClassAd("b", mustAd(t, "N = 2"))
 	tx.Commit()
-	if _, err := c.TruncateTable("ads"); err != nil {
+	if _, err := c.TruncateTable(context.Background(), "ads"); err != nil {
 		t.Fatalf("privileged truncate: %v", err)
 	}
 	if d.Len() != 0 {
@@ -96,19 +97,19 @@ func TestSnapshotRestoreOverRPC(t *testing.T) {
 	tx.Commit()
 
 	var snap bytes.Buffer
-	if err := c.Snapshot(&snap); err != nil {
+	if err := c.Snapshot(context.Background(), &snap); err != nil {
 		t.Fatalf("Snapshot over RPC: %v", err)
 	}
 	if bytes.Contains(snap.Bytes(), []byte("top-secret-rpc")) {
 		t.Fatal("snapshot bytes leaked a private attribute over the wire")
 	}
-	if _, err := c.TruncateTable("ads"); err != nil {
+	if _, err := c.TruncateTable(context.Background(), "ads"); err != nil {
 		t.Fatal(err)
 	}
 	if d.Len() != 0 {
 		t.Fatal("truncate did not empty the table")
 	}
-	if err := c.Restore(bytes.NewReader(snap.Bytes())); err != nil {
+	if err := c.Restore(context.Background(), bytes.NewReader(snap.Bytes())); err != nil {
 		t.Fatalf("Restore over RPC: %v", err)
 	}
 	if d.Len() != 2 {
@@ -125,10 +126,10 @@ func TestSnapshotRestoreOverRPC(t *testing.T) {
 	// Unprivileged connection: both refused.
 	c2, _, cleanup2 := encServerPair(t, ServeOptions{})
 	defer cleanup2()
-	if err := c2.Snapshot(&bytes.Buffer{}); err == nil {
+	if err := c2.Snapshot(context.Background(), &bytes.Buffer{}); err == nil {
 		t.Error("snapshot should be refused without DAEMON privilege")
 	}
-	if err := c2.Restore(bytes.NewReader(snap.Bytes())); err == nil {
+	if err := c2.Restore(context.Background(), bytes.NewReader(snap.Bytes())); err == nil {
 		t.Error("restore should be refused without DAEMON privilege")
 	}
 }
@@ -148,16 +149,16 @@ func TestSnapshotRestoreStreamingLarge(t *testing.T) {
 	}
 
 	var snap bytes.Buffer
-	if err := c.Snapshot(&snap); err != nil {
+	if err := c.Snapshot(context.Background(), &snap); err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	if snap.Len() < 64*1024 {
 		t.Fatalf("snapshot is %d bytes -- expected multiple chunks (>64 KiB)", snap.Len())
 	}
-	if _, err := c.TruncateTable("ads"); err != nil {
+	if _, err := c.TruncateTable(context.Background(), "ads"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.Restore(bytes.NewReader(snap.Bytes())); err != nil {
+	if err := c.Restore(context.Background(), bytes.NewReader(snap.Bytes())); err != nil {
 		t.Fatalf("Restore: %v", err)
 	}
 	if d.Len() != n {
@@ -180,7 +181,7 @@ func TestSnapshotRestoreStreamingLarge(t *testing.T) {
 func TestEncryptSetReadOnlyRejected(t *testing.T) {
 	c, _, cleanup := encServerPair(t, ServeOptions{ReadOnly: true, Privileged: true})
 	defer cleanup()
-	if _, err := c.SetEncryptedAttrs("ads", "Region"); err == nil {
+	if _, err := c.SetEncryptedAttrs(context.Background(), "ads", "Region"); err == nil {
 		t.Fatal("encrypt.set should be refused on a read-only connection")
 	}
 }

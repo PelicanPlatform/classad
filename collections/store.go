@@ -728,7 +728,10 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, emit func(w []byte) bool
 	defer releaseWindows(wins)
 	cont := true
 	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
-	forEachVisible(s0, wins, func(ad []byte, codec Codec) bool {
+	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		if isSystemKeyBytes(key) {
+			return true // internal system record: hidden from client scans/queries
+		}
 		w, err := codec.Decompress(dbuf[:0], ad)
 		if err != nil {
 			return true // skip a record we cannot decode rather than abort the scan
@@ -785,6 +788,9 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 	// are few (one per family), so this map stays small.
 	parents := map[string][]byte{}
 	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		if isSystemKeyBytes(key) {
+			return true // internal system record: never a family parent
+		}
 		if c.isStructural != nil && c.isStructural(key) {
 			if w, err := codec.Decompress(nil, ad); err == nil {
 				parents[string(key)] = w // owns its buffer (nil dst)
@@ -797,6 +803,9 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 	cont := true
 	var dbuf []byte
 	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		if isSystemKeyBytes(key) {
+			return true // internal system record: hidden from client scans/queries
+		}
 		if c.isStructural != nil && c.isStructural(key) {
 			return true // structural ads are hidden from results
 		}

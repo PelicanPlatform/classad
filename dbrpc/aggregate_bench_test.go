@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -79,7 +80,7 @@ func BenchmarkAggregateGroupBy(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := c.Aggregate("RequestCpus >= 1", []string{"RequestCpus"},
+		rows, err := c.Aggregate(context.Background(), "RequestCpus >= 1", []string{"RequestCpus"},
 			[]AggSpec{{Func: AggCount, Arg: "*"}})
 		if err != nil {
 			b.Fatal(err)
@@ -129,7 +130,7 @@ func BenchmarkQueryLimit1(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := c.QueryLimit("RequestCpus >= 1", 1) // matches every ad
+		rows, err := c.QueryLimit(context.Background(), "RequestCpus >= 1", 1) // matches every ad
 		if err != nil || len(rows) != 1 {
 			b.Fatalf("rows=%d err=%v, want 1", len(rows), err)
 		}
@@ -148,7 +149,7 @@ func BenchmarkQueryAll(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		rows, err := c.QueryLimit("RequestCpus >= 1", 0)
+		rows, err := c.QueryLimit(context.Background(), "RequestCpus >= 1", 0)
 		if err != nil || len(rows) != benchN {
 			b.Fatalf("rows=%d err=%v, want %d", len(rows), err, benchN)
 		}

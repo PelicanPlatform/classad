@@ -129,7 +129,7 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 	}
 
 	var ferr error
-	db.c.ForEachAd(func(key string, ad *classad.ClassAd) bool {
+	appendAd := func(key string, ad *classad.ClassAd) bool {
 		batch = appendChunk(batch, []byte(key))
 		batch = appendChunk(batch, []byte(ad.MarshalOldWithPrivate()))
 		if nInBatch++; nInBatch >= snapBatchAds {
@@ -137,7 +137,15 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 			return ferr == nil
 		}
 		return true
-	})
+	}
+	db.c.ForEachAd(appendAd)
+	if ferr != nil {
+		return nil, ferr
+	}
+	// Internal system records are hidden from client scans (ForEachAd), but the backup
+	// must still capture them so durable idempotency markers survive a snapshot/restore
+	// cycle. They Put back through the normal write path on restore and stay hidden.
+	db.c.ForEachSystemAd(appendAd)
 	if ferr != nil {
 		return nil, ferr
 	}

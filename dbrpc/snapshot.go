@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -180,36 +181,44 @@ func (sc *serverConn) abortRestore() {
 // SnapshotTable streams a consistent backup of the named table to w. DAEMON-level: a
 // snapshot carries every attribute, including private ones. The server streams it in
 // chunks, so neither side buffers the whole database.
-func (c *Client) SnapshotTable(table string, w io.Writer) error {
+func (c *Client) SnapshotTable(ctx context.Context, table string, w io.Writer) error {
 	_, ch, err := c.callStream(func(id uint64) []byte {
 		return putStr(req(id, opSnapshot), table)
 	})
 	if err != nil {
 		return err
 	}
-	for frame := range ch {
-		_, status, body, ok := respHeader(frame)
-		if !ok {
+	for {
+		select {
+		case <-ctx.Done():
 			drain(ch)
-			return errShort
-		}
-		switch status {
-		case stStream:
-			if _, err := w.Write(body.bytesRef()); err != nil {
-				drain(ch) // let the read loop finish delivering so the channel closes
-				return err
+			return ctx.Err()
+		case frame, ok := <-ch:
+			if !ok {
+				return nil
 			}
-		case stErr:
-			return statusErr(status, body)
+			_, status, body, ok := respHeader(frame)
+			if !ok {
+				drain(ch)
+				return errShort
+			}
+			switch status {
+			case stStream:
+				if _, err := w.Write(body.bytesRef()); err != nil {
+					drain(ch) // let the read loop finish delivering so the channel closes
+					return err
+				}
+			case stErr:
+				return statusErr(status, body)
+			}
 		}
 	}
-	return nil
 }
 
 // RestoreTable replaces the named table with the snapshot read from r. DAEMON-level and
 // destructive: the server spools the upload and restores under the DB-wide lock. The
 // upload streams in chunks, so the client does not buffer the whole snapshot.
-func (c *Client) RestoreTable(table string, r io.Reader) error {
+func (c *Client) RestoreTable(ctx context.Context, table string, r io.Reader) error {
 	id := c.nextReq.Add(1)
 	ch, err := c.sendID(id, func(reqID uint64) []byte {
 		return putStr(req(reqID, opRestore), table)
@@ -219,6 +228,10 @@ func (c *Client) RestoreTable(table string, r io.Reader) error {
 	}
 	buf := make([]byte, snapChunk)
 	for {
+		if err := ctx.Err(); err != nil {
+			c.cancelPending(id)
+			return err
+		}
 		n, rerr := r.Read(buf)
 		if n > 0 {
 			if werr := c.conn.WriteMsg(putBytes(req(id, opRestoreChunk), buf[:n])); werr != nil {
@@ -235,23 +248,32 @@ func (c *Client) RestoreTable(table string, r io.Reader) error {
 	if werr := c.conn.WriteMsg(req(id, opRestoreEnd)); werr != nil {
 		return werr
 	}
-	frame, ok := <-ch
-	if !ok {
-		return c.closeErr
+	select {
+	case <-ctx.Done():
+		c.cancelPending(id)
+		return ctx.Err()
+	case frame, ok := <-ch:
+		if !ok {
+			return c.closeErr
+		}
+		_, status, body, ok := respHeader(frame)
+		if !ok {
+			return errShort
+		}
+		if status != stOK {
+			return statusErr(status, body)
+		}
+		return nil
 	}
-	_, status, body, ok := respHeader(frame)
-	if !ok {
-		return errShort
-	}
-	if status != stOK {
-		return statusErr(status, body)
-	}
-	return nil
 }
 
 // Snapshot / Restore operate on the default table.
-func (c *Client) Snapshot(w io.Writer) error { return c.SnapshotTable(DefaultTable, w) }
-func (c *Client) Restore(r io.Reader) error  { return c.RestoreTable(DefaultTable, r) }
+func (c *Client) Snapshot(ctx context.Context, w io.Writer) error {
+	return c.SnapshotTable(ctx, DefaultTable, w)
+}
+func (c *Client) Restore(ctx context.Context, r io.Reader) error {
+	return c.RestoreTable(ctx, DefaultTable, r)
+}
 
 // drain discards any remaining frames until the stream channel closes, so the client's
 // read loop is never blocked writing to a channel no one is reading.

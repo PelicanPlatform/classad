@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"encoding/json"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -42,12 +43,12 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 
 // CreateArchiveTable creates (or no-ops if present) an append-only history table. cfg
 // configures indexes / zone maps / retention on first creation.
-func (c *Client) CreateArchiveTable(name string, cfg db.ArchiveConfig) error {
+func (c *Client) CreateArchiveTable(ctx context.Context, name string, cfg db.ArchiveConfig) error {
 	data, err := json.Marshal(cfg)
 	if err != nil {
 		return err
 	}
-	status, body, err := c.call(func(id uint64) []byte {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte {
 		return putBytes(putStr(req(id, opArchiveCreate), name), data)
 	})
 	if err != nil {
@@ -60,8 +61,8 @@ func (c *Client) CreateArchiveTable(name string, cfg db.ArchiveConfig) error {
 }
 
 // ArchiveAppend appends an ad (old-ClassAd text) to the named history table.
-func (c *Client) ArchiveAppend(name, adText string) error {
-	status, body, err := c.call(func(id uint64) []byte {
+func (c *Client) ArchiveAppend(ctx context.Context, name, adText string) error {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte {
 		return putStr(putStr(req(id, opArchiveAppend), name), adText)
 	})
 	if err != nil {
@@ -75,16 +76,16 @@ func (c *Client) ArchiveAppend(name, adText string) error {
 
 // ArchiveQuery returns up to limit (<= 0 = all) newest-first matches (old-ClassAd texts)
 // from the named history table -- the condor_history "last K" pattern.
-func (c *Client) ArchiveQuery(name, constraint string, limit int) ([]string, error) {
-	return c.stream(func(id uint64) []byte {
+func (c *Client) ArchiveQuery(ctx context.Context, name, constraint string, limit int) ([]string, error) {
+	return c.streamCtx(ctx, func(id uint64) []byte {
 		return putStr(putI32(putStr(req(id, opArchiveQuery), name), int32(limit)), constraint)
 	})
 }
 
 // ArchiveRotate enforces the named archive's retention policy now (using the server's
 // clock for age-based rules), returning how many sealed segments were dropped.
-func (c *Client) ArchiveRotate(name string) (int, error) {
-	status, body, err := c.call(func(id uint64) []byte {
+func (c *Client) ArchiveRotate(ctx context.Context, name string) (int, error) {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte {
 		return putStr(req(id, opArchiveRotate), name)
 	})
 	if err != nil {
@@ -97,8 +98,8 @@ func (c *Client) ArchiveRotate(name string) (int, error) {
 }
 
 // ArchiveTables lists the history table names.
-func (c *Client) ArchiveTables() ([]string, error) {
-	status, body, err := c.call(func(id uint64) []byte { return req(id, opArchiveList) })
+func (c *Client) ArchiveTables(ctx context.Context) ([]string, error) {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return req(id, opArchiveList) })
 	if err != nil {
 		return nil, err
 	}

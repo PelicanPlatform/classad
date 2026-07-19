@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -25,25 +26,25 @@ func TestMatchTables(t *testing.T) {
 	defer func() { c.Close(); s.Close(); cat.Close() }()
 
 	// Machines accept any job; the job prefers (ranks by) more Cpus.
-	mtx, _ := c.BeginTable("machines")
-	_ = mtx.NewClassAd("slot1", "Key = \"slot1\"\nCpus = 8\nRequirements = true")
-	_ = mtx.NewClassAd("slot2", "Key = \"slot2\"\nCpus = 4\nRequirements = true")
-	_ = mtx.NewClassAd("slot3", "Key = \"slot3\"\nCpus = 16\nRequirements = true")
-	if err := mtx.Commit(); err != nil {
+	mtx, _ := c.BeginTable(context.Background(), "machines")
+	_ = mtx.NewClassAd(context.Background(), "slot1", "Key = \"slot1\"\nCpus = 8\nRequirements = true")
+	_ = mtx.NewClassAd(context.Background(), "slot2", "Key = \"slot2\"\nCpus = 4\nRequirements = true")
+	_ = mtx.NewClassAd(context.Background(), "slot3", "Key = \"slot3\"\nCpus = 16\nRequirements = true")
+	if err := mtx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	// Two identical jobs: assignment consumes machines, so they can't both take
 	// slot3. Each ranks by Cpus.
-	jtx, _ := c.BeginTable("jobs")
+	jtx, _ := c.BeginTable(context.Background(), "jobs")
 	job := "Key = %q\nRequestCpus = 4\nRequirements = (TARGET.Cpus >= RequestCpus)\nRank = TARGET.Cpus"
-	_ = jtx.NewClassAd("1.0", fmt.Sprintf(job, "1.0"))
-	_ = jtx.NewClassAd("2.0", fmt.Sprintf(job, "2.0"))
-	if err := jtx.Commit(); err != nil {
+	_ = jtx.NewClassAd(context.Background(), "1.0", fmt.Sprintf(job, "1.0"))
+	_ = jtx.NewClassAd(context.Background(), "2.0", fmt.Sprintf(job, "2.0"))
+	if err := jtx.Commit(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
 	// LIMIT bounds jobs: one job assigned, taking the best machine (slot3, Cpus 16).
-	rows, err := c.MatchTables("jobs", "machines", "Key", "", "", 1, nil)
+	rows, err := c.MatchTables(context.Background(), "jobs", "machines", "Key", "", "", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +55,7 @@ func TestMatchTables(t *testing.T) {
 	// LIMIT 2: both jobs assigned distinct machines, the two best by Rank —
 	// slot3(16) and slot1(8). Order between the identical jobs is unspecified, so
 	// assert the set and each machine's rank.
-	rows, err = c.MatchTables("jobs", "machines", "Key", "", "", 2, nil)
+	rows, err = c.MatchTables(context.Background(), "jobs", "machines", "Key", "", "", 2, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +69,7 @@ func TestMatchTables(t *testing.T) {
 
 	// Resource-side filter (pushed down): with only Cpus <= 8 eligible, the first
 	// job's best available is slot1.
-	rows, err = c.MatchTables("jobs", "machines", "Key", "", "Cpus <= 8", 1, nil)
+	rows, err = c.MatchTables(context.Background(), "jobs", "machines", "Key", "", "Cpus <= 8", 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,20 +93,20 @@ func TestMatchAutocluster(t *testing.T) {
 
 	// Two top-ranked (Cpus 16) machines and a lesser one; identical jobs must be
 	// spread across the two 16s rather than both taking one.
-	mtx, _ := c.BeginTable("machines")
-	_ = mtx.NewClassAd("slot1", "Key = \"slot1\"\nCpus = 16\nRequirements = true")
-	_ = mtx.NewClassAd("slot2", "Key = \"slot2\"\nCpus = 16\nRequirements = true")
-	_ = mtx.NewClassAd("slot3", "Key = \"slot3\"\nCpus = 8\nRequirements = true")
-	_ = mtx.Commit()
+	mtx, _ := c.BeginTable(context.Background(), "machines")
+	_ = mtx.NewClassAd(context.Background(), "slot1", "Key = \"slot1\"\nCpus = 16\nRequirements = true")
+	_ = mtx.NewClassAd(context.Background(), "slot2", "Key = \"slot2\"\nCpus = 16\nRequirements = true")
+	_ = mtx.NewClassAd(context.Background(), "slot3", "Key = \"slot3\"\nCpus = 8\nRequirements = true")
+	_ = mtx.Commit(context.Background())
 
-	jtx, _ := c.BeginTable("jobs")
+	jtx, _ := c.BeginTable(context.Background(), "jobs")
 	req := "Key = %q\nRequestCpus = 4\nRequirements = (TARGET.Cpus >= RequestCpus)\nRank = TARGET.Cpus"
-	_ = jtx.NewClassAd("a", fmt.Sprintf(req, "a"))
-	_ = jtx.NewClassAd("b", fmt.Sprintf(req, "b")) // identical to a in matchmaking terms
-	_ = jtx.Commit()
+	_ = jtx.NewClassAd(context.Background(), "a", fmt.Sprintf(req, "a"))
+	_ = jtx.NewClassAd(context.Background(), "b", fmt.Sprintf(req, "b")) // identical to a in matchmaking terms
+	_ = jtx.Commit(context.Background())
 
 	sig := []string{"RequestCpus", "Requirements", "Rank"}
-	rows, err := c.MatchTables("jobs", "machines", "Key", "", "", 5, sig)
+	rows, err := c.MatchTables(context.Background(), "jobs", "machines", "Key", "", "", 5, sig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -134,14 +135,14 @@ func TestMatchExplain(t *testing.T) {
 	c := NewClient(cconn)
 	defer func() { c.Close(); s.Close(); cat.Close() }()
 
-	mtx, _ := c.BeginTable("machines")
-	_ = mtx.NewClassAd("slot1", "Key=\"slot1\"\nArch=\"X86_64\"\nMemory=8192\nRequirements=true")
-	_ = mtx.Commit()
-	jtx, _ := c.BeginTable("jobs")
-	_ = jtx.NewClassAd("1.0", "Key=\"1.0\"\nRequestMemory=2048\nRequirements=(TARGET.Arch==\"X86_64\") && (TARGET.Memory>=RequestMemory)")
-	_ = jtx.Commit()
+	mtx, _ := c.BeginTable(context.Background(), "machines")
+	_ = mtx.NewClassAd(context.Background(), "slot1", "Key=\"slot1\"\nArch=\"X86_64\"\nMemory=8192\nRequirements=true")
+	_ = mtx.Commit(context.Background())
+	jtx, _ := c.BeginTable(context.Background(), "jobs")
+	_ = jtx.NewClassAd(context.Background(), "1.0", "Key=\"1.0\"\nRequestMemory=2048\nRequirements=(TARGET.Arch==\"X86_64\") && (TARGET.Memory>=RequestMemory)")
+	_ = jtx.Commit(context.Background())
 
-	ex, err := c.MatchExplain("jobs", "Key == \"1.0\"", "machines", "")
+	ex, err := c.MatchExplain(context.Background(), "jobs", "Key == \"1.0\"", "machines", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +166,7 @@ func TestMatchExplain(t *testing.T) {
 	}
 
 	// A resource-side filter (WHERE TARGET / NOPREEMPT) is melded into the explanation.
-	exT, err := c.MatchExplain("jobs", "Key == \"1.0\"", "machines", `State =!= "Claimed"`)
+	exT, err := c.MatchExplain(context.Background(), "jobs", "Key == \"1.0\"", "machines", `State =!= "Claimed"`)
 	if err != nil {
 		t.Fatal(err)
 	}

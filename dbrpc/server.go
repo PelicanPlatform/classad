@@ -60,6 +60,14 @@ type serverTxn struct {
 	mu    sync.Mutex
 	table string    // the transaction's table (from opBegin), for the propose hook
 	batch []WriteOp // ops accumulated for the propose hook (nil unless propose is set)
+
+	// conn owns this transaction; when that connection closes, its still-open
+	// transactions are aborted (a client that drops mid-transaction -- e.g. a
+	// transient network reset -- must not leak the server-side txn + its write-set).
+	conn *serverConn
+	// lastTouch is the unix-nano time of the last op on this txn, read by the idle
+	// reaper to abort transactions abandoned on a still-open (half-open) connection.
+	lastTouch atomic.Int64
 }
 
 // NewServer returns a single-table server over d, served as table "ads". The
@@ -127,7 +135,7 @@ type ServeOptions struct {
 func (o op) isMutating() bool {
 	switch o {
 	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
-		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere:
+		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere, opCommitIdem:
 		return true
 	}
 	return false
@@ -217,7 +225,11 @@ func (s *Server) ServeConn(conn MsgConn) error {
 func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // stop this connection's watches when it closes
-	sc := &serverConn{s: s, ctx: ctx, opts: opts, watches: make(map[uint64]context.CancelFunc)}
+	sc := &serverConn{s: s, ctx: ctx, opts: opts, watches: make(map[uint64]context.CancelFunc), txns: make(map[uint64]struct{})}
+	// Abort any transactions still open when the connection ends, so a client that
+	// drops mid-transaction (a transient reset, a crash, a cancelled context) does
+	// not leak the server-side txn and its buffered write-set.
+	defer sc.abortTxns()
 	var wmu sync.Mutex
 	sc.write = func(b []byte) {
 		wmu.Lock()
@@ -255,6 +267,11 @@ type serverConn struct {
 
 	wmu     sync.Mutex
 	watches map[uint64]context.CancelFunc
+
+	// tmu guards txns: the ids of transactions this connection opened and has not yet
+	// committed or aborted, so they can be aborted when the connection closes.
+	tmu  sync.Mutex
+	txns map[uint64]struct{}
 
 	// restore is the in-progress restore upload for this connection (at most one), spooled
 	// to a temp file. Only touched from the single read-loop goroutine (restore frames are
@@ -295,7 +312,7 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
 	default:
-		sc.write(sc.s.handle(reqID, o, body, priv, sc.opts.Privileged))
+		sc.write(sc.s.handle(sc, reqID, o, body, priv, sc.opts.Privileged))
 	}
 }
 
@@ -456,7 +473,7 @@ func (s *Server) streamOrdered(ctx context.Context, reqID uint64, r *reader, inc
 
 // handle executes one request and returns its response frame. includePrivate
 // controls whether ads returned by lookups carry their private attributes.
-func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privileged bool) []byte {
+func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePrivate, privileged bool) []byte {
 	switch o {
 	case opBegin:
 		table := r.str()
@@ -468,7 +485,10 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 			return respErr(reqID, "no such table: "+table)
 		}
 		id := s.nextID.Add(1)
-		s.txns.Store(id, &serverTxn{tx: d.Begin(), table: table})
+		st := &serverTxn{tx: d.Begin(), table: table, conn: sc}
+		st.lastTouch.Store(nowNano())
+		s.txns.Store(id, st)
+		sc.addTxn(id)
 		return putU64(resp(reqID, stOK), id)
 
 	case opCreateTable:
@@ -515,10 +535,12 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 		return putBytes(resp(reqID, stOK), cursor)
 
 	case opCommit:
-		st, ok := s.take(r.u64())
+		id := r.u64()
+		st, ok := s.take(id)
 		if !ok {
 			return respErr(reqID, "no such transaction")
 		}
+		sc.removeTxn(id)
 		// Consistent-HA routing: propose the accumulated writes through consensus (raft)
 		// instead of committing locally. The local transaction was only for read-your-
 		// writes during the session; the propose hook (via the FSM) is the real writer.
@@ -542,8 +564,68 @@ func (s *Server) handle(reqID uint64, o op, r *reader, includePrivate, privilege
 		}
 		return respErr(reqID, err.Error())
 
+	case opCommitIdem:
+		id := r.u64()
+		idemKey := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		st, ok := s.take(id)
+		if !ok {
+			return respErr(reqID, "no such transaction")
+		}
+		sc.removeTxn(id)
+		// Consensus routing has its own write path (the local txn is not the writer),
+		// so the in-txn marker does not apply; fall back to a plain proposed commit.
+		if s.propose != nil {
+			st.tx.Abort()
+			if err := s.propose(st.table, st.batch); err != nil {
+				return respErr(reqID, err.Error())
+			}
+			return resp(reqID, stOK)
+		}
+		d, ok := s.cat.Table(st.table)
+		if !ok {
+			st.tx.Abort()
+			return respErr(reqID, "no such table: "+st.table)
+		}
+		markerKey := idemMarkerKey(idemKey)
+		// Replay of an already-committed unit of work: the marker is present, so the
+		// prior attempt landed. Do not re-apply; report success.
+		if _, exists := d.LookupClassAd(markerKey); exists {
+			st.tx.Abort()
+			return resp(reqID, stOK)
+		}
+		// Add the marker to this same transaction so it commits atomically with the
+		// data (durable, survives restart) and doubles as the OCC guard: a concurrent
+		// replay of the same unit of work conflicts on the marker key.
+		marker := classad.New()
+		marker.InsertAttr(idemMarkerAttr, time.Now().Unix())
+		st.tx.NewClassAd(markerKey, marker)
+		cerr := st.tx.Commit()
+		if cerr == nil {
+			return resp(reqID, stOK)
+		}
+		if ce, isConf := cerr.(*db.ConflictError); isConf {
+			// A conflict on the marker key means a concurrent replay of the same unit
+			// of work already committed -> exactly-once success, not a data conflict.
+			for _, k := range ce.Keys {
+				if k == markerKey {
+					return resp(reqID, stOK)
+				}
+			}
+			b := respHead(reqID, stConflict)
+			for _, k := range ce.Keys {
+				b = putStr(b, k)
+			}
+			return b
+		}
+		return respErr(reqID, cerr.Error())
+
 	case opAbort:
-		if st, ok := s.take(r.u64()); ok {
+		id := r.u64()
+		if st, ok := s.take(id); ok {
+			sc.removeTxn(id)
 			st.tx.Abort()
 		}
 		return resp(reqID, stOK)
@@ -796,9 +878,97 @@ func (s *Server) withTxn(reqID uint64, r *reader, fn func(*serverTxn) []byte) []
 		return respErr(reqID, "no such transaction")
 	}
 	st := v.(*serverTxn)
+	st.lastTouch.Store(nowNano())
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return fn(st)
+}
+
+// nowNano is the current time in unix nanoseconds, stamped on a transaction at each
+// op so the idle reaper can measure inactivity.
+func nowNano() int64 { return time.Now().UnixNano() }
+
+// addTxn / removeTxn track the transactions this connection has open so they can be
+// aborted if the connection closes with them still uncommitted.
+func (sc *serverConn) addTxn(id uint64) {
+	sc.tmu.Lock()
+	sc.txns[id] = struct{}{}
+	sc.tmu.Unlock()
+}
+
+func (sc *serverConn) removeTxn(id uint64) {
+	sc.tmu.Lock()
+	delete(sc.txns, id)
+	sc.tmu.Unlock()
+}
+
+// abortTxns aborts every transaction still open on this connection. Called from the
+// serve loop's defer, so a client that disconnects mid-transaction releases its
+// server-side txn and write-set instead of leaking it. take() deduplicates against a
+// concurrently-arriving commit/abort, so exactly one side wins.
+func (sc *serverConn) abortTxns() {
+	sc.tmu.Lock()
+	ids := make([]uint64, 0, len(sc.txns))
+	for id := range sc.txns {
+		ids = append(ids, id)
+	}
+	sc.txns = make(map[uint64]struct{})
+	sc.tmu.Unlock()
+	for _, id := range ids {
+		if st, ok := sc.s.take(id); ok {
+			st.mu.Lock()
+			st.tx.Abort()
+			st.mu.Unlock()
+		}
+	}
+}
+
+// reapIdleTxns aborts transactions with no activity for at least maxIdle -- a
+// backstop for a transaction abandoned on a connection that stays open (half-open
+// TCP, a wedged client). Disconnect handles the common case; this handles the rest.
+func (s *Server) reapIdleTxns(maxIdle time.Duration) int {
+	cutoff := nowNano() - int64(maxIdle)
+	reaped := 0
+	s.txns.Range(func(k, v any) bool {
+		st := v.(*serverTxn)
+		if st.lastTouch.Load() > cutoff {
+			return true
+		}
+		id := k.(uint64)
+		if taken, ok := s.take(id); ok {
+			taken.mu.Lock()
+			taken.tx.Abort()
+			taken.mu.Unlock()
+			if taken.conn != nil {
+				taken.conn.removeTxn(id)
+			}
+			reaped++
+		}
+		return true
+	})
+	return reaped
+}
+
+// StartTxnReaper runs reapIdleTxns every interval, aborting transactions idle longer
+// than maxIdle, until the returned stop is called. Optional: disconnect cleanup is
+// automatic; a server that wants to bound transactions abandoned on still-open
+// connections starts this.
+func (s *Server) StartTxnReaper(interval, maxIdle time.Duration) (stop func()) {
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+				s.reapIdleTxns(maxIdle)
+			}
+		}
+	}()
+	var once sync.Once
+	return func() { once.Do(func() { close(done) }) }
 }
 
 // record appends a write op to the transaction's batch when the server routes commits

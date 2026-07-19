@@ -1,6 +1,7 @@
 package dbrpc
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -194,11 +195,13 @@ func join(ss []string) string {
 
 // Diagnostics fetches the default table's storage stats, hot set, indexes, and
 // tuning suggestions.
-func (c *Client) Diagnostics() (*Diagnostics, error) { return c.DiagnosticsTable(DefaultTable) }
+func (c *Client) Diagnostics(ctx context.Context) (*Diagnostics, error) {
+	return c.DiagnosticsTable(ctx, DefaultTable)
+}
 
 // DiagnosticsTable fetches the named table's diagnostics.
-func (c *Client) DiagnosticsTable(table string) (*Diagnostics, error) {
-	status, body, err := c.call(func(id uint64) []byte { return putStr(req(id, opDiag), table) })
+func (c *Client) DiagnosticsTable(ctx context.Context, table string) (*Diagnostics, error) {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return putStr(req(id, opDiag), table) })
 	if err != nil {
 		return nil, err
 	}
@@ -213,13 +216,13 @@ func (c *Client) DiagnosticsTable(table string) (*Diagnostics, error) {
 }
 
 // Explain reports how the default table would execute a constraint query.
-func (c *Client) Explain(constraint string) (*db.QueryExplain, error) {
-	return c.ExplainTable(DefaultTable, constraint)
+func (c *Client) Explain(ctx context.Context, constraint string) (*db.QueryExplain, error) {
+	return c.ExplainTable(ctx, DefaultTable, constraint)
 }
 
 // ExplainTable reports how the named table would execute a constraint query.
-func (c *Client) ExplainTable(table, constraint string) (*db.QueryExplain, error) {
-	status, body, err := c.call(func(id uint64) []byte {
+func (c *Client) ExplainTable(ctx context.Context, table, constraint string) (*db.QueryExplain, error) {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte {
 		return putStr(putStr(req(id, opExplain), table), constraint)
 	})
 	if err != nil {
@@ -239,8 +242,8 @@ func (c *Client) ExplainTable(table, constraint string) (*db.QueryExplain, error
 // jobSelector against resTable would execute: the job's Requirements rewritten over
 // the slot (job constants baked in) and which resulting probes prune via a resource
 // index. jobSelector is a constraint (e.g. `Key == "1.0"`) identifying the request.
-func (c *Client) MatchExplain(reqTable, jobSelector, resTable, targetWhere string) (*db.MatchExplain, error) {
-	status, body, err := c.call(func(id uint64) []byte {
+func (c *Client) MatchExplain(ctx context.Context, reqTable, jobSelector, resTable, targetWhere string) (*db.MatchExplain, error) {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte {
 		b := putStr(req(id, opMatchExplain), reqTable)
 		b = putStr(b, jobSelector)
 		b = putStr(b, resTable)
@@ -261,14 +264,14 @@ func (c *Client) MatchExplain(reqTable, jobSelector, resTable, targetWhere strin
 }
 
 // Admin runs a management action (index/hot-set) on the default table.
-func (c *Client) Admin(action string, args ...string) (string, error) {
-	return c.AdminTable(DefaultTable, action, args...)
+func (c *Client) Admin(ctx context.Context, action string, args ...string) (string, error) {
+	return c.AdminTable(ctx, DefaultTable, action, args...)
 }
 
 // AdminTable runs a management action on the named table; it returns the server's
 // human-readable result. Refused on a read-only connection.
-func (c *Client) AdminTable(table, action string, args ...string) (string, error) {
-	status, body, err := c.call(func(id uint64) []byte {
+func (c *Client) AdminTable(ctx context.Context, table, action string, args ...string) (string, error) {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte {
 		b := putStr(putStr(req(id, opAdmin), table), action)
 		b = putI32(b, int32(len(args)))
 		for _, a := range args {
@@ -289,15 +292,15 @@ func (c *Client) AdminTable(table, action string, args ...string) (string, error
 // (private attributes are always encrypted). It is a DAEMON-level action: the server
 // refuses it unless the connection is privileged. Passing no attributes clears the
 // explicit set. Returns the server's human-readable result.
-func (c *Client) SetEncryptedAttrs(table string, attrs ...string) (string, error) {
-	return c.AdminTable(table, "encrypt.set", attrs...)
+func (c *Client) SetEncryptedAttrs(ctx context.Context, table string, attrs ...string) (string, error) {
+	return c.AdminTable(ctx, table, "encrypt.set", attrs...)
 }
 
 // BackupKeyTable retrieves the named table's backup key -- the escrow key that decrypts
 // its encrypted snapshots independently of the pool keys. DAEMON-level. Errors if
 // encryption is not enabled.
-func (c *Client) BackupKeyTable(table string) ([]byte, error) {
-	s, err := c.AdminTable(table, "backup.key")
+func (c *Client) BackupKeyTable(ctx context.Context, table string) ([]byte, error) {
+	s, err := c.AdminTable(ctx, table, "backup.key")
 	if err != nil {
 		return nil, err
 	}
@@ -307,15 +310,15 @@ func (c *Client) BackupKeyTable(table string) ([]byte, error) {
 // TruncateTable removes every ad from the named table. It is a DAEMON-level action
 // (destructive, DB-wide locked): the server refuses it unless the connection is
 // privileged. Returns the server's human-readable result.
-func (c *Client) TruncateTable(table string) (string, error) {
-	return c.AdminTable(table, "truncate")
+func (c *Client) TruncateTable(ctx context.Context, table string) (string, error) {
+	return c.AdminTable(ctx, table, "truncate")
 }
 
 // --- table catalog ---
 
 // CreateTable creates (or no-ops if present) the named table.
-func (c *Client) CreateTable(name string) error {
-	status, body, err := c.call(func(id uint64) []byte { return putStr(req(id, opCreateTable), name) })
+func (c *Client) CreateTable(ctx context.Context, name string) error {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return putStr(req(id, opCreateTable), name) })
 	if err != nil {
 		return err
 	}
@@ -326,8 +329,8 @@ func (c *Client) CreateTable(name string) error {
 }
 
 // DropTable removes the named table and its data.
-func (c *Client) DropTable(name string) error {
-	status, body, err := c.call(func(id uint64) []byte { return putStr(req(id, opDropTable), name) })
+func (c *Client) DropTable(ctx context.Context, name string) error {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return putStr(req(id, opDropTable), name) })
 	if err != nil {
 		return err
 	}
@@ -338,8 +341,8 @@ func (c *Client) DropTable(name string) error {
 }
 
 // Tables lists the table names.
-func (c *Client) Tables() ([]string, error) {
-	status, body, err := c.call(func(id uint64) []byte { return req(id, opListTables) })
+func (c *Client) Tables(ctx context.Context) ([]string, error) {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return req(id, opListTables) })
 	if err != nil {
 		return nil, err
 	}

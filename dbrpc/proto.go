@@ -84,6 +84,7 @@ const (
 	opArchiveRotate op = 33 // [name] -> [dropped i32]; enforce retention (server clock); mutating
 	opDeleteWhere   op = 34 // [table][constraint] -> [removed i32]; bulk delete-by-constraint, mutating
 	opQueryRaw      op = 35 // [table][limit i32][constraint] -> stream of [oldClassAdText]; wire-form, AST-free relay
+	opCommitIdem    op = 36 // [txnID][idemKey] -> status (like opCommit) + durable idempotency marker; opt-in exactly-once, mutating
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -141,6 +142,8 @@ func (o op) String() string {
 		return "DeleteWhere"
 	case opQueryRaw:
 		return "QueryRaw"
+	case opCommitIdem:
+		return "CommitIdempotent"
 	}
 	return "op(unknown)"
 }

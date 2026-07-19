@@ -389,6 +389,23 @@ func (db *DB) ForEach(fn func(ad *classad.ClassAd) bool) {
 	}
 }
 
+// ForEachSystemAd calls fn for every internal system-keyed ad and its key -- the reaper
+// enumeration path. System records are durable bookkeeping (e.g. idempotency markers)
+// stored in the same table as data but hidden from every client scan/query/DeleteWhere;
+// this is the only way to enumerate them. Reads a consistent snapshot. See SystemKey.
+func (db *DB) ForEachSystemAd(fn func(key string, ad *classad.ClassAd) bool) {
+	db.c.ForEachSystemAd(fn)
+}
+
+// IsSystemKey and SystemKey re-export the collections helpers so callers holding only a
+// *db.DB (e.g. dbrpc building marker keys) can classify or construct a reserved system
+// key without importing collections directly. A system key begins with a NUL byte and
+// names a record hidden from client reads but retrievable by explicit LookupClassAd.
+func IsSystemKey(key string) bool { return collections.IsSystemKey(key) }
+
+// SystemKey builds a reserved system key from name (prefixing the NUL sentinel).
+func SystemKey(name string) string { return collections.SystemKey(name) }
+
 // Query returns the committed ads matching the constraint expression (an "old
 // ClassAd" boolean expression over each ad, e.g. `JobStatus == 2 && Owner == "alice"`).
 // The store pushes the filter down -- indexed constraints visit only candidates -- so

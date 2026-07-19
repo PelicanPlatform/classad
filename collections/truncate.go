@@ -48,18 +48,53 @@ func (c *Collection) Truncate() {
 	}
 }
 
-// ForEachAd calls fn with every stored ad and its key, including structural (parent-only)
-// ads -- a complete image for a backup, unlike Scan/Keys which hide structural ads. Each
-// ad is fully decoded (decompressed and, for encrypted attributes, decrypted). Iteration
-// stops early if fn returns false. Per-shard consistent snapshot, like Scan.
+// ForEachAd calls fn with every stored (non-system) ad and its key, including structural
+// (parent-only) ads -- a client-facing image, unlike Scan/Keys which hide structural ads.
+// It is the driver for db.DeleteWhere's key matching, so it must NOT expose internal system
+// records (they are neither client-visible nor client-deletable); system records are
+// enumerated separately via ForEachSystemAd. Each ad is fully decoded (decompressed and,
+// for encrypted attributes, decrypted). Iteration stops early if fn returns false. Per-shard
+// consistent snapshot, like Scan.
 func (c *Collection) ForEachAd(fn func(key string, ad *classad.ClassAd) bool) {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		stop := false
 		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+			if isSystemKeyBytes(key) {
+				return true // internal system record: hidden from client iteration
+			}
 			decoded, err := c.decodeAd(ad, codec)
 			if err != nil {
 				return true // skip an undecodable record rather than abort the backup
+			}
+			if !fn(string(key), decoded) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		releaseWindows(wins)
+		if stop {
+			return
+		}
+	}
+}
+
+// ForEachSystemAd calls fn with every internal system-keyed ad and its key -- the mirror
+// image of ForEachAd, which hides them. It is the enumeration path a TTL reaper uses to
+// find and expire durable bookkeeping records. Each ad is fully decoded; iteration stops
+// early if fn returns false. Per-shard consistent snapshot, like Scan.
+func (c *Collection) ForEachSystemAd(fn func(key string, ad *classad.ClassAd) bool) {
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		stop := false
+		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+			if !isSystemKeyBytes(key) {
+				return true // only system records
+			}
+			decoded, err := c.decodeAd(ad, codec)
+			if err != nil {
+				return true // skip an undecodable record rather than abort the sweep
 			}
 			if !fn(string(key), decoded) {
 				stop = true
