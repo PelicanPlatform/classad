@@ -11,25 +11,7 @@ package collections
 // drops a segment tears down its index mapping at the same pin-drained moment (no scan reads
 // a torn mapping). The active segment keeps its mutable in-RAM segIndex.
 
-// sealedIndexFromFile writes si's sidecar to path, maps the file, and returns the read-only
-// mmap view plus an unmap closer (persistent sealed segment).
-func sealedIndexFromFile(path string, si *segIndex) (*mmapSegIndex, func() error, error) {
-	if err := writeSidecarIndex(path, si); err != nil {
-		return nil, nil, err
-	}
-	data, closer, err := mapFile(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	mm, err := parseMmapSidecar(data)
-	if err != nil {
-		_ = closer()
-		return nil, nil, err
-	}
-	return mm, closer, nil
-}
-
-// snapshotPath is where a persistent segment's sidecar index lives: beside the segment file,
+// snapshotPath is where a persistent segment's sidecar lives: beside the segment file,
 // sharing its name so compaction/rotation drops it with the segment (reap unlinks it). "" for
 // a RAM segment (in-memory collection), which has no on-disk sidecar.
 func snapshotPath(seg *segment) string {
@@ -39,58 +21,81 @@ func snapshotPath(seg *segment) string {
 	return seg.path + ".idx"
 }
 
-// sealSegmentIndex converts a sealed persistent segment's in-RAM index (si) to the pageable
-// mmap sidecar: write+map the sidecar file, publish it as msidx, register its unmap with reap
-// (onReap), and drop the heap copy. Best-effort -- on any error the in-RAM index stays and
-// the segment is simply not converted this pass. No-op for a RAM segment or one already
-// sealed. Once converted the segment's index config is frozen (a later index add/drop does
-// not rebuild it; the new attribute is full-scanned via covers()=false), which is correct --
-// only less selective for that attribute on already-sealed data.
-func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
-	path := snapshotPath(seg)
-	if path == "" || si == nil || seg.msidx.Load() != nil {
-		return
-	}
-	mm, closer, err := sealedIndexFromFile(path, si)
+// publishSidecar maps a just-written or existing container file at path and publishes
+// its sections into the segment: keyIdx always (the primary-key sidecar, phase 1 of
+// the pageable index), and msidx when a valid attribute-index section covering the
+// segment is present. One mapping backs both, released by a single reap hook. spec, if
+// non-nil, gates the attribute section on its generation (a reopen); a nil spec accepts
+// any (a fresh seal). Returns false (unmapping) on any mismatch; the sidecar is derived,
+// so any doubt is left unpublished and rebuilt later.
+func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) bool {
+	data, closer, err := mapFile(path)
 	if err != nil {
-		return
+		return false
 	}
-	// CAS so a concurrent conversion of the same segment can't leak a mapping: the loser
-	// unmaps its own and bails.
-	if !seg.msidx.CompareAndSwap(nil, mm) {
+	attr, key, ok := splitSegmentSidecar(data)
+	if !ok {
 		_ = closer()
-		return
+		return false
 	}
-	seg.setOnReap(func() { _ = closer() }) // unmap the sidecar when the segment's scan pins drain (reap)
-	seg.idx.Store(nil)                     // free the heap index; readIdx now returns msidx
+	ki, err := parseKeyIndex(key)
+	if err != nil || int(ki.upto) != seg.used {
+		_ = closer()
+		return false
+	}
+	var mm *mmapSegIndex
+	if len(attr) > 0 && sidecarCRCValid(attr) {
+		if m, e := parseMmapSidecar(attr); e == nil && m != nil && int(m.upto) == seg.used && (spec == nil || m.specGen == spec.gen) {
+			mm = m
+		}
+	}
+	// keyIdx is set exactly once per seal and is the "sealed" marker; CAS so a
+	// concurrent seal cannot leak a mapping.
+	if !seg.keyIdx.CompareAndSwap(nil, ki) {
+		_ = closer()
+		return false
+	}
+	if mm != nil {
+		seg.msidx.Store(mm)
+		seg.idx.Store(nil) // free the heap attr index; readIdx now returns msidx
+	}
+	seg.setOnReapKey(func() { _ = closer() })
+	return true
 }
 
-// loadSealedIndex maps an existing on-disk sidecar for a sealed persistent segment (on Open),
-// returning true if a valid, current sidecar was mapped into msidx. A miss -- no file,
-// unreadable, bad CRC, wrong version, a different spec generation, or coverage != the
-// segment's recovered extent -- leaves msidx nil so Reindex rebuilds and re-seals it. The
-// sidecar is derived, so any doubt is a rebuild, never a wrong index.
+// sealSegmentIndex writes a sealed persistent segment's combined sidecar container --
+// the key index (always) plus the attribute index (si, if any) -- maps it, and
+// publishes both. Best-effort and idempotent: a no-op for a RAM segment or one already
+// sealed (keyIdx set), and on any error the segment is left unsealed for a later pass.
+func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
+	path := snapshotPath(seg)
+	if path == "" || seg.keyIdx.Load() != nil {
+		return
+	}
+	var attrBlob []byte
+	if si != nil {
+		b, err := buildSidecarIndex(si)
+		if err != nil {
+			return
+		}
+		attrBlob = b
+	}
+	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h))
+	if err := writeFileAtomic(path, container); err != nil {
+		return
+	}
+	c.publishSidecar(seg, path, nil)
+}
+
+// loadSealedIndex maps a sealed persistent segment's sidecar container on Open,
+// publishing its key index (always) and, if valid and matching spec, its attribute
+// index. A miss leaves the segment unsealed so the reopen rebuilds it.
 func (c *Collection) loadSealedIndex(seg *segment, spec *indexSpec) bool {
 	path := snapshotPath(seg)
 	if path == "" {
 		return false
 	}
-	data, closer, err := mapFile(path)
-	if err != nil {
-		return false
-	}
-	if !sidecarCRCValid(data) {
-		_ = closer()
-		return false
-	}
-	mm, err := parseMmapSidecar(data)
-	if err != nil || mm == nil || mm.specGen != spec.gen || int(mm.upto) != seg.used {
-		_ = closer()
-		return false
-	}
-	seg.setOnReap(func() { _ = closer() })
-	seg.msidx.Store(mm)
-	return true
+	return c.publishSidecar(seg, path, spec)
 }
 
 // sealSegmentIndexAnon is the in-memory analogue of sealSegmentIndex: it converts a sealed

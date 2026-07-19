@@ -113,6 +113,13 @@ type segment struct {
 	// reaped, so a query scanning a rotating segment never reads a torn index mapping.
 	onReap func()
 
+	// keyIdx is a sealed segment's pageable key-index sidecar (key-hash -> record
+	// offset), or nil. Phase 1 of the pageable primary index: built at seal, mmapped
+	// on reopen, torn down with the segment (onReapKey, run alongside onReap). It does
+	// not yet replace the in-RAM directory -- it is populated and validated beside it.
+	keyIdx    atomic.Pointer[mmapKeyIndex]
+	onReapKey func() // key-sidecar unmap; run with onReap at reap/close
+
 	// pinReap makes a RAM segment (file==nil) participate in pin/reap anyway, because it
 	// carries an anonymous mmap sidecar index (in-memory sealing): the anon mapping is not
 	// GC-managed, so scans must pin it and compaction/Close must unmap it via onReap, exactly
@@ -222,12 +229,24 @@ func (s *segment) setOnReap(f func()) {
 // Close uses it to unmap a segment's sidecar index without unlinking its files.
 func (s *segment) runReapHook() {
 	s.reapMu.Lock()
-	h := s.onReap
-	s.onReap = nil
+	h, hk := s.onReap, s.onReapKey
+	s.onReap, s.onReapKey = nil, nil
 	s.reapMu.Unlock()
 	if h != nil {
 		h()
 	}
+	if hk != nil {
+		hk()
+	}
+}
+
+// setOnReapKey registers the key-sidecar unmap, run with onReap when the segment is
+// reaped or unmapped. Independent of onReap so a segment can carry both an attribute
+// sidecar and a key sidecar.
+func (s *segment) setOnReapKey(f func()) {
+	s.reapMu.Lock()
+	s.onReapKey = f
+	s.reapMu.Unlock()
 }
 
 // reapAndHook reaps the segment (munmap + unlink of its data) and then runs onReap

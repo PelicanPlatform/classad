@@ -195,7 +195,22 @@ func TestSealedIndexBackings(t *testing.T) {
 	}
 
 	check("file", func(si *segIndex) (*mmapSegIndex, func() error, error) {
-		return sealedIndexFromFile(filepath.Join(t.TempDir(), "s.idx"), si)
+		// Bare ARCX round-trip (the attribute-index format, unchanged by the sidecar
+		// container): write, map, parse.
+		path := filepath.Join(t.TempDir(), "s.idx")
+		if err := writeSidecarIndex(path, si); err != nil {
+			return nil, nil, err
+		}
+		data, closer, err := mapFile(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		mm, err := parseMmapSidecar(data)
+		if err != nil {
+			_ = closer()
+			return nil, nil, err
+		}
+		return mm, closer, nil
 	})
 	check("anon", sealedIndexAnon)
 }
