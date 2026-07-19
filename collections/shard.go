@@ -146,6 +146,16 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
 		seg := sh.segs[old.seg]
 		setRecSuperseded(seg.data, old.off, seq)
 		seg.dead += int64(recTotalLen(seg.data, old.off))
+	} else if old, ok := sh.lookupSealed(key, h); ok {
+		// The key's current version lives in a sealed segment (evicted from the
+		// directory). Supersede it there so it does not remain a second live record,
+		// and flush the supersession (it lands in an already-synced region).
+		seg := sh.segs[old.seg]
+		setRecSuperseded(seg.data, old.off, seq)
+		seg.dead += int64(recTotalLen(seg.data, old.off))
+		if sh.alloc != nil {
+			sh.dirtySup = append(sh.dirtySup, supRef{seg, old.off})
+		}
 	} else {
 		sh.count++
 		// A newly-inserted chained child bumps its parent's live-child count. Re-puts
@@ -170,7 +180,11 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
 func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied bool) {
 	old, ok := sh.findCurrent(sh.dirGet(h), key)
 	if !ok {
-		return false, false
+		// Not in the active directory; probe the sealed segments (evicted keys).
+		old, ok = sh.lookupSealed(key, h)
+		if !ok {
+			return false, false
+		}
 	}
 	seg := sh.segs[old.seg]
 	setRecSuperseded(seg.data, old.off, seq)
@@ -224,7 +238,9 @@ func (sh *shard) get(h uint64, key []byte) ([]byte, Codec, bool) {
 	defer sh.mu.RUnlock()
 	l, ok := sh.findCurrent(sh.dirGet(h), key)
 	if !ok {
-		return nil, nil, false
+		if l, ok = sh.lookupSealed(key, h); !ok {
+			return nil, nil, false
+		}
 	}
 	seg := sh.segs[l.seg]
 	ad := recAd(seg.data, l.off)
@@ -233,14 +249,14 @@ func (sh *shard) get(h uint64, key []byte) ([]byte, Codec, bool) {
 	return out, seg.codec, true
 }
 
-// lookupSealed probes this shard's SEALED segments for key's current record, gated by
-// each segment's key Bloom (phase 2 of the pageable primary index). It returns the
-// record's location or (noLoc, false). Phase 2 keeps the in-RAM directory
-// authoritative; this probe is validated against it (see the oracle test) and becomes
-// the lookup path for cold keys once they are evicted from the directory. A record is
-// current iff supersededBySeq == seqMax -- a local property -- so no cross-segment
-// version ordering is needed. Caller holds at least the shard read lock.
-func (sh *shard) lookupSealed(key []byte, h uint64) (loc, bool) {
+// forEachSealedRecord calls fn for every record in this shard's SEALED, indexed
+// segments whose key-hash is h and whose inline key equals key (Bloom-gated). It
+// stops early if fn returns false. This is the shared access path the by-key MVCC
+// operations use for keys that have been evicted from the directory: a key's versions
+// live one per segment, so dir-chain walking plus this cover every version (some
+// possibly twice, which is harmless -- every consumer here is find-first or an
+// idempotent predicate). Caller holds at least the shard read lock.
+func (sh *shard) forEachSealedRecord(key []byte, h uint64, fn func(seg *segment, off uint32) bool) {
 	for _, seg := range sh.segs {
 		if seg == nil || seg == sh.act {
 			continue
@@ -251,12 +267,117 @@ func (sh *shard) lookupSealed(key []byte, h uint64) (loc, bool) {
 			continue
 		}
 		for _, off := range ki.lookup(h) {
-			if recSuperseded(seg.data, off) == seqMax && bytes.Equal(recKey(seg.data, off), key) {
-				return loc{seg: seg.id, off: off}, true
+			if bytes.Equal(recKey(seg.data, off), key) {
+				if !fn(seg, off) {
+					return
+				}
 			}
 		}
 	}
-	return noLoc, false
+}
+
+// lookupSealed returns the location of key's current (non-superseded) record among
+// this shard's sealed segments, or (noLoc, false). Currency is a local property
+// (supersededBySeq == seqMax), so no cross-segment version ordering is needed.
+func (sh *shard) lookupSealed(key []byte, h uint64) (loc, bool) {
+	var found loc
+	ok := false
+	sh.forEachSealedRecord(key, h, func(seg *segment, off uint32) bool {
+		if recSuperseded(seg.data, off) == seqMax {
+			found, ok = loc{seg: seg.id, off: off}, true
+			return false
+		}
+		return true
+	})
+	return found, ok
+}
+
+// lookupSealedAt returns the location of key's record live at snapshot s0
+// (seq <= s0 < supersededBySeq) among this shard's sealed segments, or (noLoc, false).
+func (sh *shard) lookupSealedAt(key []byte, h uint64, s0 uint64) (loc, bool) {
+	var found loc
+	ok := false
+	sh.forEachSealedRecord(key, h, func(seg *segment, off uint32) bool {
+		if recSeq(seg.data, off) <= s0 && recSuperseded(seg.data, off) > s0 {
+			found, ok = loc{seg: seg.id, off: off}, true
+			return false
+		}
+		return true
+	})
+	return found, ok
+}
+
+// spliceDeadFromChain removes every record that lives in a reclaimed (dead) segment from
+// hash bucket h's recNext chain, so no surviving link dangles into the reaped mapping. The
+// bucket head is a current record and a fully-dead segment holds none, so the head is
+// normally not dead; the leading loop still advances (or clears) it defensively, since after
+// the reap the directory must not reference a removed segment. Caller holds the write lock.
+func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
+	isDead := func(l loc) bool { _, d := deadSet[l.seg]; return l.valid() && d }
+	head := sh.dir[h]
+	for isDead(head) {
+		head = recNext(sh.segs[head.seg].data, head.off)
+	}
+	if head != sh.dir[h] {
+		if head.valid() {
+			sh.dir[h] = head
+		} else {
+			delete(sh.dir, h)
+		}
+	}
+	for l := head; l.valid(); {
+		seg := sh.segs[l.seg]
+		nxt := recNext(seg.data, l.off)
+		orig := nxt
+		for isDead(nxt) {
+			nxt = recNext(sh.segs[nxt.seg].data, nxt.off)
+		}
+		if nxt != orig {
+			setRecNext(seg.data, l.off, nxt)
+		}
+		l = nxt
+	}
+}
+
+// dropDirtySegs removes the given segments from the pending-sync lists: their bytes are
+// being unlinked, so a later sync must not msync one. Mirrors compaction's list pruning.
+// Caller holds the write lock.
+func (sh *shard) dropDirtySegs(deadSet map[uint32]struct{}) {
+	if len(sh.dirty) > 0 {
+		kept := sh.dirty[:0]
+		for _, s := range sh.dirty {
+			if _, d := deadSet[s.id]; !d {
+				kept = append(kept, s)
+			}
+		}
+		sh.dirty = kept
+	}
+	if len(sh.dirtySup) > 0 {
+		kept := sh.dirtySup[:0]
+		for _, s := range sh.dirtySup {
+			if _, d := deadSet[s.seg.id]; !d {
+				kept = append(kept, s)
+			}
+		}
+		sh.dirtySup = kept
+	}
+}
+
+// evictSegKeys removes from the directory the entries whose current record lives in
+// seg (a just-indexed sealed segment): those keys are now reachable through the
+// sealed probe, so dropping them from the directory is the RAM win. Caller holds the
+// write lock. Safe only once seg carries a key index (the probe can find the keys).
+func (sh *shard) evictSegKeys(seg *segment) {
+	ki := seg.keyIdx.Load()
+	if ki == nil {
+		return
+	}
+	for i := uint32(0); i < ki.count; i++ {
+		h := ki.hashAt(i)
+		if l, ok := sh.dir[h]; ok && l.seg == seg.id {
+			delete(sh.dir, h)
+		}
+	}
 }
 
 // segWindow is a frozen view of one segment at scan start: its immutable backing,

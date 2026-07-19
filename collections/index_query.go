@@ -89,6 +89,15 @@ func (c *Collection) Reindex() {
 			}
 		}
 	}
+	// Realize the pageable-directory RAM win now (phase 3): seal any sealed segment that
+	// still lacks a key sidecar (a key-only collection never entered the loop above) and
+	// evict every sealed segment's keys from the resident directory. Idempotent, so a
+	// segment sealed just above is only evicted here, not re-written.
+	if persistent {
+		for _, sh := range c.shards {
+			c.sealAndEvictShard(sh)
+		}
+	}
 }
 
 // usableProbe is a query Probe matched to a configured index (interned attr id,

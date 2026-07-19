@@ -152,18 +152,69 @@ recovery is per-segment, not whole-store.
    validated against it by an oracle test (for every key: a sealed-resident record is
    reproduced by the probe at the same location, an active-resident one is correctly
    missed, a deleted one is not found).
-3. **Evict sealed keys from `shard.dir`** — the RAM win. Flip the lookup order to
-   dir-then-probe. Extensive fuzz/property tests: for every op sequence, dir+probe
-   must equal a full-scan oracle.
+3. **Evict sealed keys from `shard.dir`** — the RAM win. DONE (first cut). Every
+   by-key path is now dir-then-probe -- `get`, `put`/`del` (probe + supersede a
+   sealed old version), and the MVCC paths `getAt` (snapshot probe) and
+   `conflictSince` (the OCC guard also scans the sealed records, so a conflict on an
+   evicted key is still detected). Eviction happens at **reopen**, where every sealed
+   segment is indexed so no version escapes the probe (a version lives one per
+   segment; dir-chain + sealed-probe cover them all). Result: the resident directory
+   is O(active segment), not O(all keys) -- 3% of the keys in the test. Tests: the
+   probe/dir oracle, an **OCC torture test** (concurrent increments on *evicted*
+   counters converge with no lost updates), evicted write-write conflict, evicted
+   snapshot isolation; full race suite green.
+
+   **Operation-time and compaction eviction** — DONE. A shared `sealAndEvictShard`
+   pass seals every sealed (non-active) persistent segment's key sidecar (off-lock)
+   and evicts its keys from the resident directory (under the write lock). It runs at
+   the end of `Reindex` (so a long-running process that reindexes periodically
+   realizes the win without a reopen) and, via `reindexAfterCompaction`, after every
+   compaction (so compaction's freshly-rebuilt full directory is re-bounded to
+   O(active-segment) instead of leaking back). It is safe alongside concurrent writes:
+   a write that supersedes an evicted key's sealed record re-appends it to the active
+   segment, moving its directory entry off the segment being evicted, so the eviction
+   declines to drop it. The clean-shutdown `dir.snap` already stores the live count
+   independently of the resident entries, so a Close after eviction snapshots the
+   partial directory faithfully and the reopen restores the full store through the
+   probe. Tests: operation-time eviction (Reindex drops the directory to ~3% mid-run,
+   Len/Get intact, plus a Close→reopen roundtrip over the partial snapshot) and
+   compaction eviction (Compact re-bounds the directory to ~12%).
 4. **Retire `dir.snap`** (increment 2) in favor of per-segment sidecars.
 
 Each phase is independently shippable and testable; the RAM behavior only changes at
 phase 3.
 
+## Measured probe cost (`keyindex_probe_bench_test.go`)
+
+Benchmarked on an M2 Pro, 200k keys, resident vs evicted reading the *same* mmap sealed
+segments (so the delta is directory-hit vs probe, not RAM vs disk):
+
+| Path | Resident | Evicted (probe) | Ratio |
+| --- | --- | --- | --- |
+| `Get` | ~460 ns/op | ~690 ns/op | ~1.5× |
+| `Put` (update) | ~7.6 µs/op | ~10.9 µs/op | ~1.44× |
+
+Both are modest, and the design's premise holds: the cost falls only on *cold* keys —
+hot keys are rewritten into the active segment on update and stay directory-resident, so
+they never pay it. The evicted `Put` delta is the probe plus one extra msync of the
+superseded record's sealed region.
+
+The read fan-out sweep is the scaling watch-item: evicted `Get` is **~O(#sealed
+segments)** in cheap per-segment Bloom checks (660 ns at 16 segments → 820 ns at 200), not
+flat — a key lives in exactly one segment, so the probe consults Blooms until it finds
+that segment (~n/2 on average). Bounded and cheap at these sizes, but at extreme segment
+counts (100 GB / 8 MiB ≈ 12k segments) this per-Get Bloom scan would dominate, which is
+what motivates the partitioned/hierarchical-filter follow-up below. Bigger segments
+(fewer Blooms) are the immediate lever.
+
 ## Risks / open questions
 
-- **Probe cost under adversarial update patterns** (many cold-key updates). Needs a
-  benchmark; may motivate a small "recently-touched sealed keys" RAM cache.
+- **Probe read fan-out is O(#segments)** in Bloom checks (measured above). Fine to
+  thousands of segments; a partitioned/hierarchical filter (or a shard-level summary
+  Bloom that prunes whole segment groups) would flatten it for very large stores.
+- **Cold-key write amplification** (~1.44×, measured) — acceptable for the target
+  append-mostly workloads; a small "recently-touched sealed keys" RAM cache could absorb
+  a bursty cold-update pattern if one ever shows up.
 - **Bloom sizing / false-positive budget** vs probe cost — tune with real key
   cardinalities.
 - **Interaction with chaining** (`childParentHash`) and **ordered indexes**

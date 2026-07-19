@@ -51,44 +51,39 @@ func TestSealedProbeOracle(t *testing.T) {
 	c2 := open()
 	defer c2.Close()
 
-	sealedN, activeN, deletedN := 0, 0, 0
+	// After reopen the directory holds only active-segment keys; the rest were evicted
+	// and are served by the probe. For every key the union (directory OR probe) must
+	// equal ground truth (Get), and no key may be found in both (that would be two
+	// live records). Most keys are probe-resolved (they were sealed at reopen).
+	probeN, dirN, deletedN := 0, 0, 0
 	for i := 0; i < 600; i++ {
 		key := k(i)
 		h := c2.h.Hash(key)
 		sh := c2.shards[c2.shardOf(key, h)]
 
 		sh.mu.RLock()
-		dirLoc, dirFound := sh.findCurrent(sh.dirGet(h), key)
-		probeLoc, probeFound := sh.lookupSealed(key, h)
-		act := sh.act
-		var dirSeg *segment
-		if dirFound {
-			dirSeg = sh.segs[dirLoc.seg]
-		}
+		_, dirFound := sh.findCurrent(sh.dirGet(h), key)
+		_, probeFound := sh.lookupSealed(key, h)
 		sh.mu.RUnlock()
+		_, live := c2.Get(key)
 
+		if (dirFound || probeFound) != live {
+			t.Fatalf("key %q: Get live=%v but dir=%v probe=%v", key, live, dirFound, probeFound)
+		}
+		if dirFound && probeFound {
+			t.Fatalf("key %q found in BOTH the directory and a sealed segment (two live records)", key)
+		}
 		switch {
-		case !dirFound:
-			if probeFound {
-				t.Fatalf("key %q absent in directory but the probe found it at %v", key, probeLoc)
-			}
+		case !live:
 			deletedN++
-		case dirSeg == act:
-			// Current record is in the active segment; the sealed-only probe must miss.
-			if probeFound {
-				t.Fatalf("key %q current in the active segment but the probe found it at %v", key, probeLoc)
-			}
-			activeN++
+		case probeFound:
+			probeN++
 		default:
-			// Current record is in a sealed segment; the probe must find it there.
-			if !probeFound || probeLoc != dirLoc {
-				t.Fatalf("key %q current at sealed %v: probe found=%v loc=%v", key, dirLoc, probeFound, probeLoc)
-			}
-			sealedN++
+			dirN++
 		}
 	}
-	if sealedN == 0 {
-		t.Fatal("no sealed-resident keys were checked -- test is ineffective")
+	if probeN == 0 {
+		t.Fatal("no probe-resolved keys -- eviction/probe path not exercised")
 	}
-	t.Logf("oracle validated: %d sealed, %d active, %d deleted keys", sealedN, activeN, deletedN)
+	t.Logf("phase-3 oracle: %d probe-resolved, %d directory-resident, %d deleted", probeN, dirN, deletedN)
 }
