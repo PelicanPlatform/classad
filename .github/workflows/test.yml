@@ -24,6 +24,13 @@ jobs:
         go-version: ${{ matrix.go-version }}
 
     - name: Install goyacc
+      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
+      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
+      # the automatic toolchain switch. Override to auto for this build-tool install
+      # only -- the parser generator may build with a newer Go; the tests below still
+      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+      env:
+        GOTOOLCHAIN: auto
       run: go install golang.org/x/tools/cmd/goyacc@latest
 
     - name: Generate parser
@@ -68,6 +75,13 @@ jobs:
         go-version: '1.25'
 
     - name: Install goyacc
+      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
+      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
+      # the automatic toolchain switch. Override to auto for this build-tool install
+      # only -- the parser generator may build with a newer Go; the tests below still
+      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+      env:
+        GOTOOLCHAIN: auto
       run: go install golang.org/x/tools/cmd/goyacc@latest
 
     - name: Generate parser
@@ -103,6 +117,13 @@ jobs:
         go-version: '1.23'
 
     - name: Install goyacc
+      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
+      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
+      # the automatic toolchain switch. Override to auto for this build-tool install
+      # only -- the parser generator may build with a newer Go; the tests below still
+      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+      env:
+        GOTOOLCHAIN: auto
       run: go install golang.org/x/tools/cmd/goyacc@latest
 
     - name: Generate parser
