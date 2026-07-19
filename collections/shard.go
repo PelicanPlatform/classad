@@ -307,6 +307,62 @@ func (sh *shard) lookupSealedAt(key []byte, h uint64, s0 uint64) (loc, bool) {
 	return found, ok
 }
 
+// spliceDeadFromChain removes every record that lives in a reclaimed (dead) segment from
+// hash bucket h's recNext chain, so no surviving link dangles into the reaped mapping. The
+// bucket head is a current record and a fully-dead segment holds none, so the head is
+// normally not dead; the leading loop still advances (or clears) it defensively, since after
+// the reap the directory must not reference a removed segment. Caller holds the write lock.
+func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
+	isDead := func(l loc) bool { _, d := deadSet[l.seg]; return l.valid() && d }
+	head := sh.dir[h]
+	for isDead(head) {
+		head = recNext(sh.segs[head.seg].data, head.off)
+	}
+	if head != sh.dir[h] {
+		if head.valid() {
+			sh.dir[h] = head
+		} else {
+			delete(sh.dir, h)
+		}
+	}
+	for l := head; l.valid(); {
+		seg := sh.segs[l.seg]
+		nxt := recNext(seg.data, l.off)
+		orig := nxt
+		for isDead(nxt) {
+			nxt = recNext(sh.segs[nxt.seg].data, nxt.off)
+		}
+		if nxt != orig {
+			setRecNext(seg.data, l.off, nxt)
+		}
+		l = nxt
+	}
+}
+
+// dropDirtySegs removes the given segments from the pending-sync lists: their bytes are
+// being unlinked, so a later sync must not msync one. Mirrors compaction's list pruning.
+// Caller holds the write lock.
+func (sh *shard) dropDirtySegs(deadSet map[uint32]struct{}) {
+	if len(sh.dirty) > 0 {
+		kept := sh.dirty[:0]
+		for _, s := range sh.dirty {
+			if _, d := deadSet[s.id]; !d {
+				kept = append(kept, s)
+			}
+		}
+		sh.dirty = kept
+	}
+	if len(sh.dirtySup) > 0 {
+		kept := sh.dirtySup[:0]
+		for _, s := range sh.dirtySup {
+			if _, d := deadSet[s.seg.id]; !d {
+				kept = append(kept, s)
+			}
+		}
+		sh.dirtySup = kept
+	}
+}
+
 // evictSegKeys removes from the directory the entries whose current record lives in
 // seg (a just-indexed sealed segment): those keys are now reachable through the
 // sealed probe, so dropping them from the directory is the RAM win. Caller holds the

@@ -101,6 +101,55 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 	c.publishSidecar(seg, path, nil)
 }
 
+// sealAndEvictShard realizes the pageable-directory RAM win (phase 3) during operation,
+// not only at reopen: for every sealed (non-active) persistent segment it ensures a key
+// sidecar exists, then evicts that segment's keys from the resident directory so they are
+// served by the sealed probe instead. Without it, a long-running process keeps the full
+// directory resident until its next Close/reopen; with it, compaction and periodic Reindex
+// bring the directory back down to O(active-segment). A no-op for RAM collections, and
+// idempotent (an already-sealed/-evicted segment is skipped).
+//
+// Safe alongside concurrent writes: the active segment is never touched, and a write that
+// supersedes an evicted key's sealed record and re-appends it to the active segment moves
+// its directory entry off the segment being evicted, so the phase-C check declines to drop
+// it (dir[h].seg != seg.id). Reads/writes of an evicted key already go dir-then-probe.
+func (c *Collection) sealAndEvictShard(sh *shard) {
+	if c.dir == "" {
+		return // RAM collection: no file sidecars, the directory stays resident
+	}
+	// Phase A: snapshot the sealed persistent segments under the read lock. The active
+	// segment is skipped (still appended to); its keys stay resident.
+	sh.mu.RLock()
+	act := sh.act
+	var segs []*segment
+	for _, seg := range sh.segs {
+		if seg == nil || seg == act || seg.used == 0 {
+			continue
+		}
+		segs = append(segs, seg)
+	}
+	sh.mu.RUnlock()
+
+	// Phase B: build any missing key sidecars off-lock (file I/O). sealSegmentIndex is
+	// idempotent and folds in the attribute index if one is already built for the segment,
+	// so a segment Reindex already sealed is left untouched here.
+	for _, seg := range segs {
+		if seg.keyIdx.Load() == nil {
+			c.sealSegmentIndex(seg, seg.idx.Load())
+		}
+	}
+
+	// Phase C: evict, under the write lock, every segment now carrying a key index. A
+	// segment whose sidecar failed to build keeps its keys resident (still correct).
+	sh.mu.Lock()
+	for _, seg := range segs {
+		if seg.keyIdx.Load() != nil {
+			sh.evictSegKeys(seg)
+		}
+	}
+	sh.mu.Unlock()
+}
+
 // loadSealedIndex maps a sealed persistent segment's sidecar container on Open,
 // publishing its key index (always) and, if valid and matching spec, its attribute
 // index. A miss leaves the segment unsealed so the reopen rebuilds it.

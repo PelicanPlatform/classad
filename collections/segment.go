@@ -47,7 +47,7 @@ const (
 	noSeg  = ^uint32(0)
 	seqMax = ^uint64(0)
 
-	defaultSegmentSize = 1 << 20 // 1 MiB
+	defaultSegmentSize = 8 * (1 << 20) // 8 MiB
 )
 
 // loc identifies a record: its segment id and byte offset. It is all scalars so

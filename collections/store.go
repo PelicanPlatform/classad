@@ -25,7 +25,7 @@ type Options struct {
 	// Shards is the number of independently-locked shards; rounded up to a power
 	// of two. Default 16.
 	Shards int
-	// SegmentSize is the arena segment size in bytes. Default 1 MiB.
+	// SegmentSize is the arena segment size in bytes. Default 8 MiB.
 	SegmentSize int
 	// Hasher routes keys to shards / directory buckets. Default 64-bit FNV-1a.
 	Hasher Hasher

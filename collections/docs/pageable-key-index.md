@@ -162,10 +162,23 @@ recovery is per-segment, not whole-store.
    is O(active segment), not O(all keys) -- 3% of the keys in the test. Tests: the
    probe/dir oracle, an **OCC torture test** (concurrent increments on *evicted*
    counters converge with no lost updates), evicted write-write conflict, evicted
-   snapshot isolation; full race suite green. STILL TO DO within this phase:
-   operation-time eviction (a background seal+evict pass, so a long-running process
-   realizes the win before reopen) and **compaction** eviction (compaction currently
-   rebuilds the full directory -- correct, but re-populates it until the next reopen).
+   snapshot isolation; full race suite green.
+
+   **Operation-time and compaction eviction** — DONE. A shared `sealAndEvictShard`
+   pass seals every sealed (non-active) persistent segment's key sidecar (off-lock)
+   and evicts its keys from the resident directory (under the write lock). It runs at
+   the end of `Reindex` (so a long-running process that reindexes periodically
+   realizes the win without a reopen) and, via `reindexAfterCompaction`, after every
+   compaction (so compaction's freshly-rebuilt full directory is re-bounded to
+   O(active-segment) instead of leaking back). It is safe alongside concurrent writes:
+   a write that supersedes an evicted key's sealed record re-appends it to the active
+   segment, moving its directory entry off the segment being evicted, so the eviction
+   declines to drop it. The clean-shutdown `dir.snap` already stores the live count
+   independently of the resident entries, so a Close after eviction snapshots the
+   partial directory faithfully and the reopen restores the full store through the
+   probe. Tests: operation-time eviction (Reindex drops the directory to ~3% mid-run,
+   Len/Get intact, plus a Close→reopen roundtrip over the partial snapshot) and
+   compaction eviction (Compact re-bounds the directory to ~12%).
 4. **Retire `dir.snap`** (increment 2) in favor of per-segment sidecars.
 
 Each phase is independently shippable and testable; the RAM behavior only changes at
