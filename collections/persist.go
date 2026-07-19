@@ -319,7 +319,13 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	spec := c.spec.Load()
 	for _, seg := range sh.segs {
 		if seg != nil && seg != sh.act {
-			c.loadSealedIndex(seg, spec)
+			if c.loadSealedIndex(seg, spec) {
+				// Phase 3: the segment's keys are now reachable through the sealed
+				// probe, so evict them from the resident directory -- the RAM win. Safe
+				// here because loadShard runs single-threaded during Open and every
+				// sealed segment is indexed, so no version escapes the probe.
+				sh.evictSegKeys(seg)
+			}
 		}
 	}
 	return maxNum, nil

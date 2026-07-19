@@ -48,7 +48,9 @@ func (sh *shard) getAt(h uint64, key []byte, s0 uint64) ([]byte, Codec, bool) {
 	defer sh.mu.RUnlock()
 	l, ok := sh.findVisible(sh.dirGet(h), key, s0)
 	if !ok {
-		return nil, nil, false
+		if l, ok = sh.lookupSealedAt(key, h, s0); !ok {
+			return nil, nil, false
+		}
 	}
 	seg := sh.segs[l.seg]
 	ad := recAd(seg.data, l.off)
@@ -64,21 +66,35 @@ func (sh *shard) getAt(h uint64, key []byte, s0 uint64) ([]byte, Codec, bool) {
 // after s0 (a later update or delete; delete leaves no new record, so the
 // supersede clause is what catches it). Caller holds at least the read lock.
 func (sh *shard) conflictSince(h uint64, key []byte, s0 uint64) bool {
-	hasLive := false
+	hasLive, conflict := false, false
+	// check applies the conflict test to one record; returns false to stop the scan.
+	check := func(seg *segment, off uint32) bool {
+		if recSeq(seg.data, off) > s0 {
+			conflict = true
+			return false
+		}
+		if sup := recSuperseded(seg.data, off); sup != seqMax && sup > s0 {
+			conflict = true
+			return false
+		}
+		if recSuperseded(seg.data, off) == seqMax {
+			hasLive = true
+		}
+		return true
+	}
 	for l := sh.dirGet(h); l.valid(); {
 		seg := sh.segs[l.seg]
-		if bytes.Equal(recKey(seg.data, l.off), key) {
-			if recSeq(seg.data, l.off) > s0 {
-				return true
-			}
-			if sup := recSuperseded(seg.data, l.off); sup != seqMax && sup > s0 {
-				return true
-			}
-			if recSuperseded(seg.data, l.off) == seqMax {
-				hasLive = true
-			}
+		if bytes.Equal(recKey(seg.data, l.off), key) && !check(seg, l.off) {
+			return true
 		}
 		l = recNext(seg.data, l.off)
+	}
+	// Also scan versions evicted from the directory into the sealed segments. A key's
+	// versions live one per segment, so the chain walk above plus this cover them all
+	// (an overlap is harmless -- check is an idempotent predicate).
+	sh.forEachSealedRecord(key, h, check)
+	if conflict {
+		return true
 	}
 	// A currently-absent key whose snapshot predates the last compaction: its delete
 	// evidence may have been reclaimed, so we cannot prove it was not deleted after s0.

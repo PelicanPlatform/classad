@@ -152,9 +152,20 @@ recovery is per-segment, not whole-store.
    validated against it by an oracle test (for every key: a sealed-resident record is
    reproduced by the probe at the same location, an active-resident one is correctly
    missed, a deleted one is not found).
-3. **Evict sealed keys from `shard.dir`** — the RAM win. Flip the lookup order to
-   dir-then-probe. Extensive fuzz/property tests: for every op sequence, dir+probe
-   must equal a full-scan oracle.
+3. **Evict sealed keys from `shard.dir`** — the RAM win. DONE (first cut). Every
+   by-key path is now dir-then-probe -- `get`, `put`/`del` (probe + supersede a
+   sealed old version), and the MVCC paths `getAt` (snapshot probe) and
+   `conflictSince` (the OCC guard also scans the sealed records, so a conflict on an
+   evicted key is still detected). Eviction happens at **reopen**, where every sealed
+   segment is indexed so no version escapes the probe (a version lives one per
+   segment; dir-chain + sealed-probe cover them all). Result: the resident directory
+   is O(active segment), not O(all keys) -- 3% of the keys in the test. Tests: the
+   probe/dir oracle, an **OCC torture test** (concurrent increments on *evicted*
+   counters converge with no lost updates), evicted write-write conflict, evicted
+   snapshot isolation; full race suite green. STILL TO DO within this phase:
+   operation-time eviction (a background seal+evict pass, so a long-running process
+   realizes the win before reopen) and **compaction** eviction (compaction currently
+   rebuilds the full directory -- correct, but re-populates it until the next reopen).
 4. **Retire `dir.snap`** (increment 2) in favor of per-segment sidecars.
 
 Each phase is independently shippable and testable; the RAM behavior only changes at
