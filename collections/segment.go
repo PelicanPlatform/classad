@@ -120,6 +120,12 @@ type segment struct {
 	keyIdx    atomic.Pointer[mmapKeyIndex]
 	onReapKey func() // key-sidecar unmap; run with onReap at reap/close
 
+	// keyBloom is a resident membership filter over this sealed segment's key-hashes
+	// (phase 2), built from keyIdx at seal/load. It gates the sealed-segment probe so
+	// a Get miss in the active directory only touches segments that might hold the
+	// key. Nil until the segment is sealed with a key index.
+	keyBloom atomic.Pointer[bloomFilter]
+
 	// pinReap makes a RAM segment (file==nil) participate in pin/reap anyway, because it
 	// carries an anonymous mmap sidecar index (in-memory sealing): the anon mapping is not
 	// GC-managed, so scans must pin it and compaction/Close must unmap it via onReap, exactly

@@ -145,9 +145,13 @@ recovery is per-segment, not whole-store.
    honored). Also fixed a latent loader bug: `.idx`/`.kidx` sidecar names matched the
    segment-file `Sscanf` (trailing input ignored), so sidecars were loaded as phantom
    segments — now the loader requires an exact `.dat` suffix.
-2. **Bloom filters + sealed-segment probe** in `Get`/`Put`/`Delete`, behind the
-   existing RAM dir (dir still authoritative). Validates probe correctness against
-   the dir as an oracle.
+2. **Bloom filters + sealed-segment probe** — DONE. A resident per-segment key Bloom
+   (built from the key index at seal/load) gates a `shard.lookupSealed` probe that
+   locates a key's current record in the sealed segments (Bloom → key index →
+   `supersededBySeq == seqMax`). The directory is still authoritative; the probe is
+   validated against it by an oracle test (for every key: a sealed-resident record is
+   reproduced by the probe at the same location, an active-resident one is correctly
+   missed, a deleted one is not found).
 3. **Evict sealed keys from `shard.dir`** — the RAM win. Flip the lookup order to
    dir-then-probe. Extensive fuzz/property tests: for every op sequence, dir+probe
    must equal a full-scan oracle.

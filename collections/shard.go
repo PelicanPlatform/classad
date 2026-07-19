@@ -233,6 +233,32 @@ func (sh *shard) get(h uint64, key []byte) ([]byte, Codec, bool) {
 	return out, seg.codec, true
 }
 
+// lookupSealed probes this shard's SEALED segments for key's current record, gated by
+// each segment's key Bloom (phase 2 of the pageable primary index). It returns the
+// record's location or (noLoc, false). Phase 2 keeps the in-RAM directory
+// authoritative; this probe is validated against it (see the oracle test) and becomes
+// the lookup path for cold keys once they are evicted from the directory. A record is
+// current iff supersededBySeq == seqMax -- a local property -- so no cross-segment
+// version ordering is needed. Caller holds at least the shard read lock.
+func (sh *shard) lookupSealed(key []byte, h uint64) (loc, bool) {
+	for _, seg := range sh.segs {
+		if seg == nil || seg == sh.act {
+			continue
+		}
+		bf := seg.keyBloom.Load()
+		ki := seg.keyIdx.Load()
+		if bf == nil || ki == nil || !bf.mayContain(h) {
+			continue
+		}
+		for _, off := range ki.lookup(h) {
+			if recSuperseded(seg.data, off) == seqMax && bytes.Equal(recKey(seg.data, off), key) {
+				return loc{seg: seg.id, off: off}, true
+			}
+		}
+	}
+	return noLoc, false
+}
+
 // segWindow is a frozen view of one segment at scan start: its immutable backing,
 // the write watermark captured under the read lock, and the codec its records
 // were compressed with.
