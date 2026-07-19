@@ -118,7 +118,11 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 // segments (their fresh copies carry no index), so queries stay pruned and estimates
 // stay populated instead of silently falling back to a full scan until the next Reindex.
 func (c *Collection) reindexAfterCompaction() {
-	if c.spec.Load().any() {
+	// Reindex rebuilds the attribute indexes and, for a persistent collection, seals each
+	// compacted segment's key sidecar and evicts its keys from the directory (phase 3), so
+	// compaction re-bounds the resident directory to O(active-segment) instead of leaving
+	// the full directory it just rebuilt. Run it whenever either applies.
+	if c.spec.Load().any() || c.dir != "" {
 		c.Reindex()
 	}
 }
