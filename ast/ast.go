@@ -119,6 +119,64 @@ func AppendQuoteStringBytes(dst, s []byte) []byte {
 	return append(dst, '"')
 }
 
+// AppendQuoteStringOld quotes s as an OLD-ClassAd string literal: it wraps s in
+// double quotes and escapes ONLY an embedded double-quote (as \"). A backslash is
+// emitted literally, because old-ClassAd string lexing (C++
+// Lexer::tokenizeStringOld) does no escape processing and treats every backslash
+// as a literal character -- so this is the exact inverse of that lexer (and of
+// the collections old-ClassAd ingest fast path).
+//
+// This is the correct serialization for values sent over the wire in old-ClassAd
+// form, e.g. a collector forwarding a startd ad whose OSIssue is the two bytes
+// `\` `S`. Using the new-ClassAd quoter (AppendQuoteString) there would double
+// the backslash to `\\` on every hop, and for a value ending in a backslash would
+// emit an unterminated string the receiver rejects (a forwarding connection
+// reset). A value ending in a lone backslash, or containing a backslash
+// immediately before a quote, cannot be represented unambiguously in old-ClassAd
+// at all -- the same inherent limitation C++ has; such values do not occur in the
+// machine/job ads this serves.
+func AppendQuoteStringOld(dst []byte, s string) []byte {
+	dst = append(dst, '"')
+	if strings.IndexByte(s, '"') < 0 {
+		dst = append(dst, s...)
+		return append(dst, '"')
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			dst = append(dst, '\\', '"')
+		} else {
+			dst = append(dst, s[i])
+		}
+	}
+	return append(dst, '"')
+}
+
+// AppendQuoteStringOldBytes is AppendQuoteStringOld for a value already in a byte
+// slice (e.g. a string literal's bytes inside a wire buffer), quoting it without
+// first copying it into a Go string.
+func AppendQuoteStringOldBytes(dst, s []byte) []byte {
+	dst = append(dst, '"')
+	q := -1
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			q = i
+			break
+		}
+	}
+	if q < 0 {
+		dst = append(dst, s...)
+		return append(dst, '"')
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == '"' {
+			dst = append(dst, '\\', '"')
+		} else {
+			dst = append(dst, s[i])
+		}
+	}
+	return append(dst, '"')
+}
+
 // appendEscapedRune appends one rune of a string value using only the escapes the
 // lexer decodes (\b \f \n \r \t \\ \"), octal (\NNN) for other control characters,
 // and the rune verbatim otherwise. Shared by the string and []byte quoters.
