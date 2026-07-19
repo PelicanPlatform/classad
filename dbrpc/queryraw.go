@@ -3,6 +3,7 @@ package dbrpc
 import (
 	"context"
 	"strings"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
@@ -26,10 +27,17 @@ func (c *Client) QueryRawTable(ctx context.Context, table, constraint string, li
 
 // streamQueryRaw streams matching ads as old-ClassAd wire text, rendered from the
 // db QueryRaw pushdown (no AST decode), one frame per ad like streamQuery.
-func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
 	table := r.str()
 	limit := int(r.i32())
 	constraint := r.str()
+	n := 0
+	if qlog != nil {
+		defer func() {
+			qlog(QueryLog{Op: "QueryRaw", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+		}()
+	}
 	if r.err != nil {
 		write(respBad(reqID))
 		return
@@ -43,7 +51,6 @@ func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, in
 		write(respErr(reqID, err.Error()))
 		return
 	}
-	n := 0
 	for ra := range seq {
 		if cancelled(ctx) {
 			return
