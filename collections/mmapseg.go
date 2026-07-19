@@ -104,7 +104,7 @@ func (s *segment) reap() error {
 		if e := os.Remove(s.path); err == nil {
 			err = e
 		}
-		os.Remove(s.path + ".idx") // best-effort: drop the index snapshot with the segment
+		os.Remove(s.path + ".idx") // best-effort: drop the sidecar container with the segment
 	}
 	return err
 }

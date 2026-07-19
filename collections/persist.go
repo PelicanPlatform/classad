@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -240,6 +241,12 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		if e.IsDir() {
 			continue
 		}
+		// Match segment data files only. Sscanf ignores trailing input, so a sidecar
+		// (seg-N.dX.dat.idx / .kidx) would otherwise parse as a phantom segment; require
+		// the name to end exactly in ".dat".
+		if !strings.HasSuffix(e.Name(), ".dat") {
+			continue
+		}
 		var n uint64
 		var dictID uint32
 		if _, err := fmt.Sscanf(e.Name(), "seg-%d.d%d.dat", &n, &dictID); err == nil {
@@ -304,11 +311,15 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// which stays in-RAM): the reopen restores the index by mmapping it instead of
 	// re-indexing every record. A missing/invalid/stale sidecar leaves msidx nil so the
 	// Reindex that follows Open rebuilds and re-seals that segment.
-	if spec := c.spec.Load(); spec != nil && spec.any() {
-		for _, seg := range sh.segs {
-			if seg != nil && seg != sh.act {
-				c.loadSealedIndex(seg, spec)
-			}
+	// Map each sealed segment's sidecar container: its key index (phase 1 of the
+	// pageable primary index, always present on a persistent segment) and, when present
+	// and matching the current spec, its attribute index. Runs regardless of whether
+	// attribute indexes are configured. A missing/invalid sidecar is left unmapped and
+	// rebuilt later; the directory stays authoritative.
+	spec := c.spec.Load()
+	for _, seg := range sh.segs {
+		if seg != nil && seg != sh.act {
+			c.loadSealedIndex(seg, spec)
 		}
 	}
 	return maxNum, nil
@@ -421,6 +432,17 @@ func (c *Collection) Close() error {
 			if seg != nil {
 				if err := seg.flush(); err != nil && firstErr == nil {
 					firstErr = err
+				}
+			}
+		}
+		// Ensure each sealed (non-active) segment has its sidecar container on disk so a
+		// reopen can map it -- the key index (phase 1 of the pageable primary index) plus
+		// any in-RAM attribute index. sealSegmentIndex is a no-op for a segment already
+		// sealed (by the Reindex pass during operation). Best effort; data is still mapped.
+		if c.dir != "" {
+			for _, seg := range sh.segs {
+				if seg != nil && seg != sh.act {
+					c.sealSegmentIndex(seg, seg.idx.Load())
 				}
 			}
 		}
