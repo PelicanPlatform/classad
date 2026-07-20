@@ -85,12 +85,19 @@ func (c *Collection) Compact() int {
 // is pin-aware so an in-flight scan keeps the mapping mapped until it unpins.
 func (c *Collection) reclaimDeadShard(sh *shard) int {
 	sh.mu.Lock()
+	retain := sh.retainFloorLocked()
 	var dead []*segment
 	for _, seg := range sh.segs {
 		if seg == nil || seg == sh.act || seg.used == 0 {
 			continue
 		}
-		if seg.dead >= int64(seg.used) {
+		// A segment is fully reclaimable when it holds no current record and every
+		// version in it was superseded at or below the retain floor (so no AS OF query
+		// within the window needs it). This is marker-aware, unlike a dead>=used byte
+		// check: a history segment carrying checkpoint markers still reclaims once its
+		// data has aged out. With time travel off, retain == commitSeq, so any
+		// all-superseded segment qualifies -- exactly the previous behavior.
+		if seg.metaReady && seg.liveCount == 0 && seg.maxSup <= retain {
 			dead = append(dead, seg)
 		}
 	}
@@ -136,11 +143,13 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 		}
 	}
 	sh.dropDirtySegs(deadSet)
-	// Superseded records were dropped: raise the GC floor so a snapshot older than now that
-	// cannot find a key conservatively conflicts rather than trusting a truncated chain.
-	if sh.commitSeq > sh.gcFloor {
-		sh.gcFloor = sh.commitSeq
+	// Superseded records at or below the retain floor were dropped: raise the GC floor
+	// to it so a snapshot older than the floor conservatively conflicts rather than
+	// trusting a truncated chain. With time travel off, retain == commitSeq (as before).
+	if retain > sh.gcFloor {
+		sh.gcFloor = retain
 	}
+	sh.tseq.trim(retain)
 	sh.mu.Unlock()
 
 	for _, seg := range toReap {
@@ -231,6 +240,14 @@ func (sh *shard) shouldCompact() bool {
 		if seg == nil {
 			continue
 		}
+		// Exclude pure-history segments (no current record) from the trigger: their
+		// dead bytes are retained time-travel history, not reclaimable garbage, so they
+		// must not drive compaction of the live working set (which would recopy history
+		// every pass). With time travel off there are none (reclaimDeadShard drops them
+		// first), so this is a no-op and the ratio is over the whole shard, as before.
+		if seg.metaReady && seg.liveCount == 0 {
+			continue
+		}
 		used += int64(seg.used)
 		dead += seg.dead
 	}
@@ -251,72 +268,103 @@ type movedRec struct {
 
 // compactShard performs concurrent compaction of one shard (see the package
 // comment). target is the codec destination records are (re)compressed into.
+//
+// With time travel enabled, compaction is retention- and segregation-aware. It only
+// rewrites the working-set segments (those with a current record); pure-history
+// segments (all versions superseded, none current) are left untouched so they are not
+// recopied on every pass (they are dropped by reclaimDeadShard once they age past the
+// retain floor). From each working-set segment it splits records into two destination
+// streams: CURRENT versions go to fresh live segments (rebuilt into the directory), and
+// superseded versions still newer than the retain floor go to separate HISTORY segments
+// (no current record, so scans skip them at the current time but read them for an AS OF
+// query). Versions superseded at or below the retain floor -- and checkpoint markers
+// that old -- are dropped. With time travel off the retain floor is the current commit
+// sequence, so no version is retained and this behaves exactly as before.
 func (c *Collection) compactShard(sh *shard, target Codec) {
-	// Phase 1 (lock): snapshot the source segments and seal the active segment so
-	// concurrent writes land in fresh post-barrier segments.
+	// Phase 1 (lock): choose the working-set sources (segments with a current record),
+	// capture the retain floor, and seal the active segment so concurrent writes land
+	// in fresh post-barrier segments. Pure-history segments are not sources.
 	sh.mu.Lock()
-	srcSegs := make([]*segment, len(sh.segs))
-	copy(srcSegs, sh.segs)
-	srcCount := len(srcSegs)
+	retain := sh.retainFloorLocked()
+	origLen := len(sh.segs)
+	sources := make([]*segment, 0, origLen)
+	sourceSet := make(map[*segment]struct{}, origLen)
+	for _, seg := range sh.segs {
+		if seg == nil || seg.used == 0 {
+			continue
+		}
+		if seg.metaReady && seg.liveCount == 0 {
+			continue // pure-history (or fully-dead) segment: leave it in place
+		}
+		sources = append(sources, seg)
+		sourceSet[seg] = struct{}{}
+	}
 	sh.act = nil
 	sh.mu.Unlock()
 
-	// Phase 2 (lock-free): recompress current records into private destination
-	// segments. Reads of source records are safe: bytes are immutable and the
-	// superseded flag is read atomically.
-	var dstSegs []*segment
-	var cur *segment
-	alloc := func(minSize int, codec Codec) {
+	// Phase 2 (lock-free): copy into private destination segments -- current versions to
+	// the live stream, retained superseded versions to the history stream. Reads of
+	// source records are safe: bytes are immutable and the superseded flag is atomic.
+	var dstSegs, histSegs []*segment
+	var cur, hcur *segment
+	newDst := func(streamSegs *[]*segment, minSize int, codec Codec) *segment {
 		size := sh.segSize
 		if minSize > size {
 			size = minSize
 		}
-		// Persistent shards allocate mmap segments so compacted data is durable;
-		// real id is assigned at install (file name is id-independent).
 		if sh.alloc != nil {
 			if seg, err := sh.alloc(0, size, codec); err == nil {
-				cur = seg
-				dstSegs = append(dstSegs, cur)
-				return
+				*streamSegs = append(*streamSegs, seg)
+				return seg
 			}
-			// On allocation error, fall back to a RAM segment (best-effort; P4 makes
-			// compaction allocation failure durable/abortable).
+			// On allocation error, fall back to a RAM segment (best-effort).
 		}
-		cur = newSegment(0, size, codec)
-		cur.pinReap = sh.sealRAM // keep the compacted RAM segment pin/reap-eligible for anon sealing
-		dstSegs = append(dstSegs, cur)
+		s := newSegment(0, size, codec)
+		s.pinReap = sh.sealRAM
+		*streamSegs = append(*streamSegs, s)
+		return s
 	}
 	var moved []movedRec
-	// Scratch buffers reused across every record's decompress/recompress: append
-	// copies the record into the destination segment, so these are transient. This
-	// avoids two fresh allocations per record (heavy GC churn at recompaction).
+	// Scratch buffers reused across every record's decompress/recompress.
 	var decBuf, encBuf []byte
-	for _, seg := range srcSegs {
-		if seg == nil {
-			continue
+	recompress := func(seg *segment, ad []byte) ([]byte, Codec) {
+		if seg.codec == target {
+			return ad, seg.codec
 		}
+		if w, err := seg.codec.Decompress(decBuf[:0], ad); err == nil {
+			decBuf = w
+			out := target.Compress(encBuf[:0], w)
+			encBuf = out
+			return out, target
+		}
+		return ad, seg.codec
+	}
+	for _, seg := range sources {
 		for off := 0; off < seg.used; {
 			o := uint32(off)
 			total := recTotalLen(seg.data, o)
 			if total == 0 {
 				break
 			}
-			if recSuperseded(seg.data, o) == seqMax {
-				key := recKey(seg.data, o)
-				ad := recAd(seg.data, o)
-				seq := recSeq(seg.data, o)
-				outAd, outCodec := ad, seg.codec
-				if seg.codec != target {
-					if w, err := seg.codec.Decompress(decBuf[:0], ad); err == nil {
-						decBuf = w
-						outAd = target.Compress(encBuf[:0], w)
-						encBuf = outAd
-						outCodec = target
+			seq := recSeq(seg.data, o)
+			if recIsMarker(seg.data, o) {
+				if seq > retain { // carry an in-window checkpoint forward (to history)
+					if hcur == nil || hcur.used+recordLen(0, 8) > len(hcur.data) {
+						hcur = newDst(&histSegs, recordLen(0, 8), target)
 					}
+					hcur.appendMarker(seq, recMarkerMillis(seg.data, o))
 				}
+				off += int(total)
+				continue
+			}
+			sup := recSuperseded(seg.data, o)
+			if sup == seqMax {
+				// Current version -> live stream (rebuilt into the directory).
+				key := recKey(seg.data, o)
+				outAd, outCodec := recompress(seg, recAd(seg.data, o))
 				rl := recordLen(len(key), len(outAd))
 				if cur == nil || cur.codec != outCodec || cur.used+rl > len(cur.data) {
-					alloc(rl, outCodec)
+					cur = newDst(&dstSegs, rl, outCodec)
 				}
 				dstOff, _ := cur.append(seq, noLoc, key, outAd)
 				moved = append(moved, movedRec{
@@ -325,34 +373,48 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 					key:  append([]byte(nil), key...),
 					hash: c.h.Hash(key),
 				})
+			} else if sup > retain {
+				// Superseded but still within the travel window -> history stream,
+				// preserving its original supersededBySeq (supersedeRec keeps the
+				// segment's live/dead counters right: appended live, then retired).
+				key := recKey(seg.data, o)
+				outAd, outCodec := recompress(seg, recAd(seg.data, o))
+				rl := recordLen(len(key), len(outAd))
+				if hcur == nil || hcur.codec != outCodec || hcur.used+rl > len(hcur.data) {
+					hcur = newDst(&histSegs, rl, outCodec)
+				}
+				dstOff, _ := hcur.append(seq, noLoc, key, outAd)
+				hcur.supersedeRec(dstOff, sup)
 			}
+			// else: superseded at or below the retain floor -> reclaimed (dropped).
 			off += int(total)
 		}
 	}
 
-	// Make the compacted (destination) records durable BEFORE any source segment is
-	// retired/unlinked, so a crash cannot lose them (the source still holds a copy
-	// until it is reaped, and recovery dedups if both survive). No-op for RAM.
+	// Make destination records durable BEFORE any source is retired (crash safety).
 	for _, seg := range dstSegs {
+		_ = seg.flush()
+	}
+	for _, seg := range histSegs {
 		_ = seg.flush()
 	}
 
 	// Phase 3 (lock): finalize, rebuild the directory, and install.
 	sh.mu.Lock()
+	allDst := append(append([]*segment{}, dstSegs...), histSegs...)
 	baseID := uint32(len(sh.segs))
-	for i, s := range dstSegs {
+	for i, s := range allDst {
 		s.id = baseID + uint32(i)
 	}
-	// Transfer any supersession that happened during Phase 2 onto the destination
-	// copies, so a stale copy is not seen as current by a later scan.
+	// Transfer any supersession that happened during Phase 2 onto the destination live
+	// copies, so a stale copy is not seen as current (supersedeRec keeps counters right).
 	for i := range moved {
 		if sup := recSuperseded(moved[i].srcSeg.data, moved[i].srcOff); sup != seqMax {
-			setRecSuperseded(moved[i].dstSeg.data, moved[i].dstOff, sup)
+			moved[i].dstSeg.supersedeRec(moved[i].dstOff, sup)
 		}
 	}
-	// Rebuild the directory from every current record: destination copies still
-	// current, plus current records in post-barrier segments (written during the
-	// copy). Chains are rebuilt fresh, so no entry references a retired segment.
+	// Rebuild the directory from every current record: destination live copies still
+	// current, plus current records in post-barrier segments (written during the copy).
 	newDir := make(map[uint64]loc, sh.count)
 	count := 0
 	for i := range moved {
@@ -364,7 +426,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		newDir[m.hash] = loc{seg: m.dstSeg.id, off: m.dstOff}
 		count++
 	}
-	for id := srcCount; id < int(baseID); id++ { // post-barrier segments
+	for id := origLen; id < int(baseID); id++ { // post-barrier segments
 		seg := sh.segs[id]
 		if seg == nil {
 			continue
@@ -375,7 +437,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			if total == 0 {
 				break
 			}
-			if recSuperseded(seg.data, o) == seqMax {
+			if !recIsMarker(seg.data, o) && recSuperseded(seg.data, o) == seqMax {
 				h := c.h.Hash(recKey(seg.data, o))
 				setRecNext(seg.data, o, dirGetOr(newDir, h))
 				newDir[h] = loc{seg: seg.id, off: o}
@@ -385,20 +447,23 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 	}
 
-	sh.segs = append(sh.segs, dstSegs...)
-	// Retire the source segments. RAM segments are just dropped (the GC frees them
-	// once in-flight scans release their windows). mmap segments are munmap'd +
-	// unlinked, but only once no scan references them: retire() reaps immediately if
-	// unpinned, else the last unpin reaps. Defer the actual reap (syscalls) until
-	// after the lock is dropped.
+	sh.segs = append(sh.segs, allDst...)
+	// Retire only the source (working-set) segments; pure-history segments left in
+	// place above are kept. RAM segments are dropped (GC frees them once scans release
+	// their windows); mmap segments munmap+unlink once unpinned.
 	var toReap []*segment
 	retired := make(map[*segment]struct{})
-	for i := 0; i < srcCount; i++ {
-		if seg := sh.segs[i]; seg != nil {
-			retired[seg] = struct{}{}
-			if seg.retire() {
-				toReap = append(toReap, seg)
-			}
+	for i := 0; i < origLen; i++ {
+		seg := sh.segs[i]
+		if seg == nil {
+			continue
+		}
+		if _, isSrc := sourceSet[seg]; !isSrc {
+			continue // pure-history segment kept in place
+		}
+		retired[seg] = struct{}{}
+		if seg.retire() {
+			toReap = append(toReap, seg)
 		}
 		sh.segs[i] = nil
 	}
@@ -429,12 +494,15 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	if len(dstSegs) > 0 {
 		sh.act = dstSegs[len(dstSegs)-1]
 	}
-	// Superseded records (delete evidence) at or below the current sequence were just
-	// dropped; raise the transaction GC floor so a snapshot older than this can no
-	// longer trust a bucket-chain walk for a currently-absent key (see conflictSince).
-	if sh.commitSeq > sh.gcFloor {
-		sh.gcFloor = sh.commitSeq
+	// Superseded/delete evidence at or below the retain floor was just dropped; raise
+	// the transaction GC floor to it so a snapshot older than the floor can no longer
+	// trust a bucket-chain walk for a currently-absent key (see conflictSince). With
+	// time travel off the floor is the current commit sequence, exactly as before.
+	if retain > sh.gcFloor {
+		sh.gcFloor = retain
 	}
+	// Checkpoints for versions that just aged out of the window are no longer needed.
+	sh.tseq.trim(retain)
 	sh.mu.Unlock()
 
 	for _, seg := range toReap {

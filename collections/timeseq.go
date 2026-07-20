@@ -64,6 +64,22 @@ func (c *Collection) SetTimeTravel(o *TimeTravelOptions) {
 // timeTravel returns the collection's active time-travel config, or nil when disabled.
 func (c *Collection) timeTravel() *ttConfig { return c.ttCfg.Load() }
 
+// retainFloorLocked is the commit sequence below which superseded versions may be
+// reclaimed by compaction: the current commitSeq when time travel is off (reclaim
+// every superseded version, exactly as before), else the sequence that was current
+// MaxDistance ago (retain anything newer for AS OF queries). A version is kept iff its
+// supersededBySeq is strictly greater than this. Caller holds at least the read lock.
+func (sh *shard) retainFloorLocked() uint64 {
+	if sh.tt != nil {
+		if cfg := sh.tt.Load(); cfg != nil {
+			if f := sh.tseq.retainFloor(nowMillis(), cfg.maxDistance); f < sh.commitSeq {
+				return f
+			}
+		}
+	}
+	return sh.commitSeq
+}
+
 // timeSeqEntry is one checkpoint: seq was the shard's commit sequence at wall-clock
 // millis. Both fields are non-decreasing along the slice.
 type timeSeqEntry struct {
