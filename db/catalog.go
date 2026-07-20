@@ -28,6 +28,7 @@ type Catalog struct {
 	mu       sync.Mutex
 	tables   map[string]*DB
 	archives map[string]*ArchiveTable
+	views    map[string]*View
 }
 
 // tablesSubdir / archivesSubdir are where a persistent catalog keeps its per-table
@@ -35,6 +36,7 @@ type Catalog struct {
 const (
 	tablesSubdir   = "tables"
 	archivesSubdir = "archives"
+	viewsSubdir    = "views"
 )
 
 // CatalogConfig configures a catalog, including encryption at rest applied to every
@@ -60,6 +62,7 @@ func OpenCatalog(dir string) (*Catalog, error) {
 func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	cat := &Catalog{
 		dir: cfg.Dir, tables: map[string]*DB{}, archives: map[string]*ArchiveTable{},
+		views:    map[string]*View{},
 		poolKeys: cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs,
 	}
 	if cfg.Dir == "" {
@@ -105,6 +108,15 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 			return nil, fmt.Errorf("catalog: opening archive %q: %w", e.Name(), err)
 		}
 		cat.archives[e.Name()] = at
+	}
+	// Recover materialized views from <dir>/views/. A view's DATA is not persisted; only
+	// its definition is, so each view is rebuilt from its base table here. This runs after
+	// tables are loaded so a view's base table exists. A view whose rebuild fails (e.g.
+	// cardinality) or whose base table is absent does NOT fail catalog open -- it loads in
+	// the failed/stale state and can be fixed by the operator.
+	if err := cat.recoverViews(); err != nil {
+		cat.closeAll()
+		return nil, err
 	}
 	return cat, nil
 }
@@ -359,6 +371,10 @@ func (cat *Catalog) closeAll() error {
 			first = err
 		}
 		delete(cat.archives, name)
+	}
+	for name, v := range cat.views {
+		v.stop() // cancels the live updater and closes the in-memory backing
+		delete(cat.views, name)
 	}
 	return first
 }
