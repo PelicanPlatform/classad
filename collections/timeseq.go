@@ -79,6 +79,15 @@ func (c *Collection) SetTimeTravel(o *TimeTravelOptions) {
 // timeTravel returns the collection's active time-travel config, or nil when disabled.
 func (c *Collection) timeTravel() *ttConfig { return c.ttCfg.Load() }
 
+// TimeTravelConfig reports the collection's current time-travel settings and whether
+// it is enabled (for persisting the runtime toggle; see db.saveIndexConfig).
+func (c *Collection) TimeTravelConfig() (opts TimeTravelOptions, enabled bool) {
+	if cfg := c.ttCfg.Load(); cfg != nil {
+		return TimeTravelOptions{MaxDistance: cfg.maxDistance, CheckpointInterval: cfg.interval}, true
+	}
+	return TimeTravelOptions{}, false
+}
+
 // resolveAsOf maps wall-clock t to a per-shard commit-sequence vector for a
 // point-in-time scan: for each shard, the sequence that was current at t (the last
 // checkpoint at or before t). It errors if time travel is disabled or t is older than
