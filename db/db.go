@@ -164,6 +164,15 @@ type MaintainOptions struct {
 	// Retrain retrains the ZSTD dictionary (recompacting + reindexing). Expensive on a
 	// large store, so a server may run it on a longer cadence than the rest.
 	Retrain bool
+	// CompactInterval is the cadence of a lightweight, standalone compaction pass
+	// (dbrpc.Server.StartMaintenance) that reclaims dead space independently of the
+	// expensive retrain-dominated Maintain pass. Compaction is cheap and self-limiting
+	// (it unlinks fully-dead segments for free and only recompacts shards past the
+	// dead-byte threshold), so it runs far more often than Maintain -- essential for a
+	// high-churn table (e.g. a collector re-advertising every few minutes) where dead
+	// space would otherwise grow unbounded between the throttled retrain passes. 0 uses
+	// a default cadence; a negative value disables the standalone compaction pass.
+	CompactInterval time.Duration
 	// MinIndexDemand is the minimum observed query count for the auto-tuner to add an
 	// index; 0 leaves index auto-tune off (no demand-driven adds).
 	MinIndexDemand int64
