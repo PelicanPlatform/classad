@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -184,6 +185,61 @@ func (cat *Catalog) CreateTableOpts(name string, opts TableOptions) (*DB, error)
 	}
 	cat.tables[name] = d
 	return d, nil
+}
+
+// CreateTableInMemory creates (or returns the existing) table named name as RAM-only,
+// even in a persistent catalog -- shorthand for CreateTableOpts with InMemory set. If the
+// table already exists its backing is unchanged (options are not re-applied); use
+// ConvertTableToMemory to drop an existing persistent table's on-disk backing.
+func (cat *Catalog) CreateTableInMemory(name string) (*DB, error) {
+	return cat.CreateTableOpts(name, TableOptions{InMemory: true})
+}
+
+// ConvertTableToMemory drops the on-disk backing of an existing persistent table, keeping
+// its current contents live in RAM only. It copies the table through a consistent snapshot
+// into a fresh in-memory table (preserving ads, index configuration, hot set, codec, and
+// encryption policy), swaps that in, then closes and deletes the on-disk original.
+//
+// It is a no-op when the catalog itself is in-memory or the table is already RAM-only. Like
+// Rewrite, it takes a consistent snapshot but does not globally quiesce writers, so a write
+// that races the swap can be lost -- run it during low write activity. DAEMON-level: it
+// changes a table's durability, so callers gate it above ordinary WRITE.
+func (cat *Catalog) ConvertTableToMemory(name string) error {
+	cat.mu.Lock()
+	defer cat.mu.Unlock()
+	old, ok := cat.tables[name]
+	if !ok {
+		if _, isArch := cat.archives[name]; isArch {
+			return fmt.Errorf("catalog: %q is an archive table, not a mutable table", name)
+		}
+		return fmt.Errorf("catalog: no such table %q", name)
+	}
+	if cat.dir == "" || old.InMemory() {
+		return nil // whole catalog is in-memory, or this table is already RAM-only
+	}
+
+	// Build the RAM replacement with the same table configuration (crucially the same
+	// pool keys, so the encrypted snapshot round-trips), then copy the full contents in
+	// via a snapshot -- the same consistent mechanism backups/HA use.
+	mem, err := OpenConfig(cat.tableConfig(""))
+	if err != nil {
+		return fmt.Errorf("catalog: creating in-memory replacement for %q: %w", name, err)
+	}
+	pr, pw := io.Pipe()
+	go func() { pw.CloseWithError(old.Snapshot(pw)) }()
+	if err := mem.Restore(pr); err != nil {
+		_ = pr.CloseWithError(err)
+		_ = mem.Close()
+		return fmt.Errorf("catalog: copying %q into memory: %w", name, err)
+	}
+
+	// Swap in the RAM table and retire the on-disk original.
+	cat.tables[name] = mem
+	_ = old.Close()
+	if err := os.RemoveAll(filepath.Join(cat.dir, tablesSubdir, name)); err != nil {
+		return fmt.Errorf("catalog: removing on-disk data for %q: %w", name, err)
+	}
+	return nil
 }
 
 // DropTable closes and removes the table named name, deleting its on-disk data.

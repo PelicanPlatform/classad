@@ -128,6 +128,10 @@ func (db *DB) ID() string { return db.id }
 // HA replicas exist, when replicas of one DB share ID but differ by InstanceID.
 func (db *DB) InstanceID() string { return db.instance }
 
+// InMemory reports whether the table's data lives only in RAM (no on-disk backing),
+// i.e. it was opened with an empty Dir. Such a table is not recovered across restarts.
+func (db *DB) InMemory() bool { return db.dir == "" }
+
 func randID() string {
 	var b [16]byte
 	_, _ = rand.Read(b[:])

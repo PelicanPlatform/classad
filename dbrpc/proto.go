@@ -77,15 +77,17 @@ const (
 	opRestoreEnd   op = 28 // ends the upload; server restores from the spooled file, then replies
 
 	// Archive (history) tables: append-only, rotated, newest-first queries.
-	opArchiveCreate op = 29 // [name][json ArchiveConfig] -> status; mutating
-	opArchiveAppend op = 30 // [name][adText] -> status; mutating
-	opArchiveQuery  op = 31 // [name][limit i32][constraint] -> stream of [adText], newest first
-	opArchiveList   op = 32 // -> [n i32]{[name]}
-	opArchiveRotate op = 33 // [name] -> [dropped i32]; enforce retention (server clock); mutating
-	opDeleteWhere   op = 34 // [table][constraint] -> [removed i32]; bulk delete-by-constraint, mutating
-	opQueryRaw      op = 35 // [table][limit i32][constraint] -> stream of [oldClassAdText]; wire-form, AST-free relay
-	opCommitIdem    op = 36 // [txnID][idemKey] -> status (like opCommit) + durable idempotency marker; opt-in exactly-once, mutating
-	opQueryRawProj  op = 37 // [table][limit i32][constraint][nattrs i32]{[attr]} -> stream of [oldClassAdText] projected to attrs (+ MyType/TargetType); server-side projection so only requested attributes cross the wire
+	opArchiveCreate  op = 29 // [name][json ArchiveConfig] -> status; mutating
+	opArchiveAppend  op = 30 // [name][adText] -> status; mutating
+	opArchiveQuery   op = 31 // [name][limit i32][constraint] -> stream of [adText], newest first
+	opArchiveList    op = 32 // -> [n i32]{[name]}
+	opArchiveRotate  op = 33 // [name] -> [dropped i32]; enforce retention (server clock); mutating
+	opDeleteWhere    op = 34 // [table][constraint] -> [removed i32]; bulk delete-by-constraint, mutating
+	opQueryRaw       op = 35 // [table][limit i32][constraint] -> stream of [oldClassAdText]; wire-form, AST-free relay
+	opCommitIdem     op = 36 // [txnID][idemKey] -> status (like opCommit) + durable idempotency marker; opt-in exactly-once, mutating
+	opQueryRawProj   op = 37 // [table][limit i32][constraint][nattrs i32]{[attr]} -> stream of [oldClassAdText] projected to attrs (+ MyType/TargetType); server-side projection so only requested attributes cross the wire
+	opCreateTableMem op = 38 // [table] -> status; create a RAM-only (non-persistent) table; mutating
+	opTableToMemory  op = 39 // [table] -> status; drop an existing table's on-disk backing (DAEMON-only); mutating
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -133,6 +135,10 @@ func (o op) String() string {
 		return "Admin"
 	case opCreateTable:
 		return "CreateTable"
+	case opCreateTableMem:
+		return "CreateTableInMemory"
+	case opTableToMemory:
+		return "ConvertTableToMemory"
 	case opDropTable:
 		return "DropTable"
 	case opListTables:
