@@ -65,6 +65,6 @@ func TestRegisterRecreatesMissingDir(t *testing.T) {
 // countingCodec is a distinct Codec value for registry tests (identity behavior).
 type countingCodec struct{}
 
-func (countingCodec) Name() string                       { return "test-counting" }
-func (countingCodec) Compress(dst, src []byte) []byte    { return append(dst, src...) }
+func (countingCodec) Name() string                               { return "test-counting" }
+func (countingCodec) Compress(dst, src []byte) []byte            { return append(dst, src...) }
 func (countingCodec) Decompress(dst, src []byte) ([]byte, error) { return append(dst, src...), nil }
