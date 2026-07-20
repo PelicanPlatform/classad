@@ -187,6 +187,9 @@ func (cat *Catalog) CreateTableOpts(name string, opts TableOptions) (*DB, error)
 	if _, ok := cat.archives[name]; ok {
 		return nil, fmt.Errorf("catalog: %q already exists as an archive table", name)
 	}
+	if _, ok := cat.views[name]; ok {
+		return nil, fmt.Errorf("catalog: %q already exists as a materialized view", name)
+	}
 	cfgDir := ""
 	if cat.dir != "" && !opts.InMemory {
 		cfgDir = filepath.Join(cat.dir, tablesSubdir, name)
