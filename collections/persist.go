@@ -378,6 +378,25 @@ func (c *Collection) rebuildDir(sh *shard) {
 			if sup != seqMax && sup > maxSeq {
 				maxSeq = sup
 			}
+			// Rebuild the segment's scan-pruning metadata from disk (zeroed on reopen).
+			if seg.minSeq == 0 || seq < seg.minSeq {
+				seg.minSeq = seq
+			}
+			// A time-checkpoint marker feeds the shard time index; it is not a data
+			// record, so it does not enter the directory or the live/dead accounting.
+			if recIsMarker(seg.data, o) {
+				sh.tseq.record(seq, recMarkerMillis(seg.data, o))
+				off += int(total)
+				continue
+			}
+			if sup == seqMax {
+				seg.liveCount++
+			} else {
+				seg.dead += int64(total)
+				if sup > seg.maxSup {
+					seg.maxSup = sup
+				}
+			}
 			key := string(recKey(seg.data, o))
 			if b, ok := byKey[key]; !ok || seq >= b.seq {
 				byKey[key] = best{loc{seg.id, o}, seq, sup}
@@ -408,13 +427,16 @@ func (c *Collection) rebuildDir(sh *shard) {
 			if total == 0 {
 				break
 			}
+			if recIsMarker(seg.data, o) {
+				off += int(total) // marker, not a data record
+				continue
+			}
 			if recSuperseded(seg.data, o) == seqMax {
 				b := byKey[string(recKey(seg.data, o))]
 				if b.loc.seg != seg.id || b.loc.off != o {
 					// A stale still-current duplicate/older version: retire it at its
 					// own seq so seq <= S0 < sup is false for every scan.
-					setRecSuperseded(seg.data, o, recSeq(seg.data, o))
-					seg.dead += int64(total)
+					seg.supersedeRec(o, recSeq(seg.data, o))
 				}
 			}
 			off += int(total)
@@ -435,6 +457,13 @@ func (c *Collection) rebuildDir(sh *shard) {
 	sh.count = count
 	if len(sh.segs) > 0 {
 		sh.act = sh.segs[len(sh.segs)-1]
+	}
+	// Every record was walked above, so the per-segment scan-pruning counters
+	// (minSeq/liveCount/maxSup) are now known-good and the segments may be skipped.
+	for _, seg := range sh.segs {
+		if seg != nil {
+			seg.metaReady = true
+		}
 	}
 }
 

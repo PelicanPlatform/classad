@@ -3,6 +3,7 @@ package collections
 import (
 	"bytes"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -72,6 +73,13 @@ type shard struct {
 	// hashing to h has zero children, so this parent does too. Guarded by mu.
 	childParentHash func(key []byte) (uint64, bool)
 	childCount      map[uint64]int
+
+	// tseq is this shard's time->seq checkpoint index for point-in-time queries
+	// (see timeseq.go). Empty and unused unless the collection has TimeTravel enabled.
+	tseq shardTimeIndex
+	// tt points at the collection's time-travel config (shared, swappable at runtime);
+	// nil-config means disabled. Set once at construction.
+	tt *atomic.Pointer[ttConfig]
 
 	// metrics accumulates this shard's operational timings (write-lock wait/hold,
 	// segment allocation, durability sync). See opstats.go.
@@ -169,16 +177,13 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
 		return // sh.writeErr is set; surfaced to the caller
 	}
 	if old, ok := sh.findCurrent(head, key); ok {
-		seg := sh.segs[old.seg]
-		setRecSuperseded(seg.data, old.off, seq)
-		seg.dead += int64(recTotalLen(seg.data, old.off))
+		sh.segs[old.seg].supersedeRec(old.off, seq)
 	} else if old, ok := sh.lookupSealed(key, h); ok {
 		// The key's current version lives in a sealed segment (evicted from the
 		// directory). Supersede it there so it does not remain a second live record,
 		// and flush the supersession (it lands in an already-synced region).
 		seg := sh.segs[old.seg]
-		setRecSuperseded(seg.data, old.off, seq)
-		seg.dead += int64(recTotalLen(seg.data, old.off))
+		seg.supersedeRec(old.off, seq)
 		if sh.alloc != nil {
 			sh.dirtySup = append(sh.dirtySup, supRef{seg, old.off})
 		}
@@ -213,8 +218,7 @@ func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied b
 		}
 	}
 	seg := sh.segs[old.seg]
-	setRecSuperseded(seg.data, old.off, seq)
-	seg.dead += int64(recTotalLen(seg.data, old.off))
+	seg.supersedeRec(old.off, seq)
 	if sh.alloc != nil {
 		sh.dirtySup = append(sh.dirtySup, supRef{seg, old.off}) // flush the tombstone
 	}
@@ -255,6 +259,44 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) 
 		sh.dirty = append(sh.dirty, sh.act) // track for msync (persistent)
 	}
 	return loc{seg: sh.act.id, off: off}, true
+}
+
+// maybeCheckpoint records a time->seq checkpoint (see timeseq.go) if time travel is
+// enabled and the checkpoint interval has elapsed. Caller holds the write lock and
+// calls this after the batch's records are written and sh.commitSeq is bumped, so the
+// marker lands in the active segment and rides the batch's msync.
+func (sh *shard) maybeCheckpoint(seq uint64) {
+	if sh.tt == nil {
+		return
+	}
+	cfg := sh.tt.Load()
+	if cfg == nil {
+		return // time travel disabled
+	}
+	nowMs := nowMillis()
+	if !sh.tseq.due(nowMs, cfg.interval) {
+		return
+	}
+	if sh.writeMarker(seq, nowMs) {
+		sh.tseq.record(seq, nowMs)
+	}
+}
+
+// writeMarker appends a time-checkpoint marker to the active segment if there is room,
+// tracking it for msync like a record. It returns false (checkpoint skipped, retried
+// next commit) when the active segment is absent or full -- rather than allocating a
+// whole segment just for a 48-byte marker. Caller holds the write lock.
+func (sh *shard) writeMarker(seq, millis uint64) bool {
+	if sh.act == nil {
+		return false
+	}
+	if _, ok := sh.act.appendMarker(seq, millis); !ok {
+		return false
+	}
+	if sh.alloc != nil && (len(sh.dirty) == 0 || sh.dirty[len(sh.dirty)-1] != sh.act) {
+		sh.dirty = append(sh.dirty, sh.act)
+	}
+	return true
 }
 
 // get returns a private copy of the current ad bytes for key and the codec they
@@ -426,17 +468,36 @@ type segWindow struct {
 // when the scan is done.
 func (sh *shard) snapshot() (s0 uint64, wins []segWindow) {
 	sh.mu.RLock()
+	defer sh.mu.RUnlock()
 	s0 = sh.commitSeq
-	wins = make([]segWindow, 0, len(sh.segs))
+	return s0, sh.buildWindowsLocked(s0)
+}
+
+// snapshotAt is snapshot for a historical snapshot sequence s0 (point-in-time / AS OF
+// queries): it freezes the same window set but for an arbitrary caller-supplied s0
+// instead of the current commit sequence. The caller MUST releaseWindows(wins).
+func (sh *shard) snapshotAt(s0 uint64) []segWindow {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	return sh.buildWindowsLocked(s0)
+}
+
+// buildWindowsLocked pins and returns a frozen window over each segment that holds at
+// least one record visible at s0, skipping segments with nothing visible (all records
+// born after s0, or all superseded by s0 -- e.g. history-only segments a current-time
+// scan never needs). This keeps a scan's cost proportional to the versions actually
+// visible at s0, so retained time-travel history does not slow current-time scans.
+// Caller holds the read lock.
+func (sh *shard) buildWindowsLocked(s0 uint64) []segWindow {
+	wins := make([]segWindow, 0, len(sh.segs))
 	for _, seg := range sh.segs {
-		if seg == nil || seg.used == 0 {
+		if seg == nil || seg.used == 0 || !seg.visibleAt(s0) {
 			continue
 		}
 		seg.pin() // no-op for RAM segments
 		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg})
 	}
-	sh.mu.RUnlock()
-	return s0, wins
+	return wins
 }
 
 // releaseWindows drops the pins snapshot took, allowing any mmap segment retired
@@ -460,6 +521,10 @@ func forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec)
 			if total == 0 {
 				break // malformed guard; should not happen
 			}
+			if recIsMarker(w.data, o) {
+				off += int(total) // time-checkpoint marker, not a data record
+				continue
+			}
 			seq := recSeq(w.data, o)
 			sup := recSuperseded(w.data, o)
 			if seq <= s0 && sup > s0 {
@@ -482,6 +547,10 @@ func forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, co
 			total := recTotalLen(w.data, o)
 			if total == 0 {
 				break
+			}
+			if recIsMarker(w.data, o) {
+				off += int(total) // time-checkpoint marker, not a data record
+				continue
 			}
 			seq := recSeq(w.data, o)
 			sup := recSuperseded(w.data, o)

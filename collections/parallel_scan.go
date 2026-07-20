@@ -68,6 +68,10 @@ func forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []byte, codec Codec
 		if total == 0 {
 			break
 		}
+		if recIsMarker(w.data, o) {
+			off += int(total) // time-checkpoint marker, not a data record
+			continue
+		}
 		if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 			if !fn(recAd(w.data, o), w.codec) {
 				return
@@ -86,6 +90,10 @@ func forEachVisibleWindowKeyed(s0 uint64, w segWindow, fn func(key, ad []byte, c
 		total := recTotalLen(w.data, o)
 		if total == 0 {
 			break
+		}
+		if recIsMarker(w.data, o) {
+			off += int(total) // time-checkpoint marker, not a data record
+			continue
 		}
 		if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 			if !fn(recKey(w.data, o), recAd(w.data, o), w.codec) {

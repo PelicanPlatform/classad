@@ -136,6 +136,28 @@ type Options struct {
 	// opaque at rest. The set can be changed at runtime via the toggle meta-command;
 	// existing records keep their prior form until rewritten.
 	EncryptedAttrs []string
+
+	// TimeTravel, if non-nil, enables point-in-time ("AS OF") queries: superseded
+	// record versions committed within MaxDistance of now are retained (not reclaimed
+	// by compaction), and a sparse time->seq checkpoint is recorded so a wall-clock
+	// time resolves to the commit sequence that was current then. Nil (default)
+	// disables it with zero write-path cost -- retention collapses to the current seq,
+	// exactly as before. See timeseq.go. It can be toggled at runtime.
+	TimeTravel *TimeTravelOptions
+}
+
+// TimeTravelOptions configures point-in-time queries for a collection (see the
+// TimeTravel option and timeseq.go).
+type TimeTravelOptions struct {
+	// MaxDistance is how far back queries may travel: versions superseded more than
+	// this long ago are eligible for reclamation. Larger keeps more history (more
+	// retained dead bytes). Must be > 0.
+	MaxDistance time.Duration
+	// CheckpointInterval is the granularity of the time->seq map: a checkpoint is
+	// recorded at most once per interval, on the first commit that crosses the
+	// boundary, so an AS OF time resolves to within one interval. Default 1 minute;
+	// lower for finer resolution at proportionally more checkpoints.
+	CheckpointInterval time.Duration
 }
 
 // AdUpdate is one insert-or-update in a batch.
@@ -218,6 +240,10 @@ type Collection struct {
 	// opm accumulates the collection-wide maintenance timings (compact/retrain/reindex)
 	// for OpStats; per-shard write/segment/sync timings live on each shard. See opstats.go.
 	opm opMetrics
+
+	// ttCfg is the active time-travel configuration, or nil when disabled (the
+	// default). Swappable at runtime via SetTimeTravel. See timeseq.go.
+	ttCfg atomic.Pointer[ttConfig]
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to
@@ -349,6 +375,12 @@ func New(opts Options) *Collection {
 		demand: newDemandTracker(),
 	}
 	c.codec.Store(&codecHolder{codec})
+	if cfg := newTTConfig(opts.TimeTravel); cfg != nil {
+		c.ttCfg.Store(cfg)
+	}
+	for _, sh := range shards {
+		sh.tt = &c.ttCfg // share the collection's swappable time-travel config
+	}
 	c.dicts = newDictReg(codec) // base codec is dictionary id 0
 	// Always front-load the configured hot attributes plus the match-critical defaults
 	// (Requirements, Rank). A persistent collection re-installs these inline in Open.
