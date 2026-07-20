@@ -1,9 +1,19 @@
 package collections
 
 import (
+	"errors"
+	"fmt"
+	"iter"
 	"sync"
 	"time"
+
+	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
+
+// ErrTimeTravelDisabled is returned by the AS OF query paths when the collection has
+// no time-travel configuration.
+var ErrTimeTravelDisabled = errors.New("collections: time travel is not enabled on this collection")
 
 // Time travel: mapping wall-clock time to commit sequences for point-in-time
 // ("AS OF") queries.
@@ -50,8 +60,13 @@ func newTTConfig(o *TimeTravelOptions) *ttConfig {
 	return &ttConfig{maxDistance: o.MaxDistance, interval: iv}
 }
 
+// nowMillisFn supplies the current wall-clock time in unix milliseconds. It is a
+// package var so tests can install a deterministic clock; production uses the wall
+// clock. Set it only from a single-goroutine test setup.
+var nowMillisFn = func() uint64 { return uint64(time.Now().UnixMilli()) }
+
 // nowMillis is the current wall-clock time in unix milliseconds.
-func nowMillis() uint64 { return uint64(time.Now().UnixMilli()) }
+func nowMillis() uint64 { return nowMillisFn() }
 
 // SetTimeTravel enables, retunes, or (with a nil/zero option) disables point-in-time
 // queries at runtime. Enabling starts recording checkpoints and retaining superseded
@@ -63,6 +78,70 @@ func (c *Collection) SetTimeTravel(o *TimeTravelOptions) {
 
 // timeTravel returns the collection's active time-travel config, or nil when disabled.
 func (c *Collection) timeTravel() *ttConfig { return c.ttCfg.Load() }
+
+// resolveAsOf maps wall-clock t to a per-shard commit-sequence vector for a
+// point-in-time scan: for each shard, the sequence that was current at t (the last
+// checkpoint at or before t). It errors if time travel is disabled or t is older than
+// the retained window. A shard with no checkpoint at or before t resolves to seq 0 (it
+// held nothing that early). t in the future is clamped to now.
+func (c *Collection) resolveAsOf(t time.Time) ([]uint64, error) {
+	cfg := c.ttCfg.Load()
+	if cfg == nil {
+		return nil, ErrTimeTravelDisabled
+	}
+	now := nowMillis()
+	ms := now
+	if tm := t.UnixMilli(); tm >= 0 && uint64(tm) < now {
+		ms = uint64(tm)
+	}
+	d := uint64(cfg.maxDistance / time.Millisecond)
+	var horizon uint64
+	if now > d {
+		horizon = now - d
+	}
+	if ms < horizon {
+		return nil, fmt.Errorf("collections: AS OF %s is older than the %s time-travel window",
+			t.UTC().Format(time.RFC3339), cfg.maxDistance)
+	}
+	seqs := make([]uint64, len(c.shards))
+	for i, sh := range c.shards {
+		if s, ok := sh.tseq.seqAt(ms); ok {
+			seqs[i] = s
+		}
+	}
+	return seqs, nil
+}
+
+// QueryAsOf runs q against the point-in-time snapshot at time t: it resolves t to a
+// per-shard commit sequence and scans each shard at that sequence, so the result is
+// exactly the ads that were current at t. It errors if time travel is disabled or t
+// predates the retained window. v1 uses a serial full scan per shard (the index,
+// parallel, and chained fast paths are current-time only); the query constraint is
+// still applied to every candidate.
+func (c *Collection) QueryAsOf(q *vm.Query, t time.Time) (iter.Seq[*classad.ClassAd], error) {
+	seqs, err := c.resolveAsOf(t)
+	if err != nil {
+		return nil, err
+	}
+	return func(yield func(*classad.ClassAd) bool) {
+		plan := q.ReadPlan()
+		ws := &wireScope{ctx: c}
+		qp := queryPlan{
+			q:        q,
+			plan:     plan,
+			m:        q.Matcher(),
+			wireOK:   q.Native() && plan.PartialSafe,
+			ws:       ws,
+			resolver: ws.resolve,
+		}
+		emit := c.yieldAd(yield)
+		for i, sh := range c.shards {
+			if !c.scanShardAt(sh, seqs[i], qp, emit) {
+				return
+			}
+		}
+	}, nil
+}
 
 // retainFloorLocked is the commit sequence below which superseded versions may be
 // reclaimed by compaction: the current commitSeq when time travel is off (reclaim

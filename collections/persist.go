@@ -314,7 +314,10 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// segment set and falls back to the full scan on any mismatch. Chained
 	// collections are excluded (their per-parent child counts would also need
 	// rebuilding); a stale snapshot in that case is discarded, not trusted.
-	if sh.childParentHash != nil {
+	// Time travel also forces the full scan: rebuildDir is what rebuilds the per-shard
+	// time->seq checkpoint index (and the segment scan-pruning counters) from the
+	// segment markers, which the directory snapshot does not carry.
+	if sh.childParentHash != nil || c.timeTravel() != nil {
 		os.Remove(filepath.Join(shardDir, dirSnapName))
 		c.rebuildDir(sh)
 	} else if !c.tryLoadDirSnapshot(sh, shardDir) {
