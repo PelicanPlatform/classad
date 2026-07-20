@@ -124,7 +124,7 @@ type txnWrite struct {
 // respect to other committers (first-committer-wins). Conflicting writes are skipped
 // and flagged; the rest commit at one fresh sequence.
 func (sh *shard) commitTxn(ws []*txnWrite, durable bool) {
-	sh.mu.Lock()
+	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
 	// Single-writer fast path: all of a shard's buffered writes share one snapshot
 	// (ws[0].base). If no one has committed to this shard since -- commitSeq is still
@@ -154,7 +154,7 @@ func (sh *shard) commitTxn(ws []*txnWrite, durable bool) {
 	if changed {
 		sh.commitSeq = seq
 	}
-	sh.mu.Unlock()
+	sh.unlockWrite(acq, held)
 	if changed {
 		if durable {
 			sh.sync()

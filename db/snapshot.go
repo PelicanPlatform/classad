@@ -162,8 +162,7 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 // DB-wide lock exclusively). A DAEMON-level operation -- the first half of a restore, or
 // a deliberate wipe.
 func (db *DB) Truncate() {
-	db.snapMu.Lock()
-	defer db.snapMu.Unlock()
+	defer db.lockSnapExclusive()()
 	db.c.Truncate()
 	db.c.Reindex()
 }
@@ -218,8 +217,7 @@ func (db *DB) restore(r io.Reader, keys SnapshotKeys) error {
 // end-of-body marker, since every read is byte-exact), so a catalog restore can read
 // several table sections from one shared reader. It takes the DB-wide lock exclusively.
 func (db *DB) restoreFrom(br *bufio.Reader, keys SnapshotKeys) error {
-	db.snapMu.Lock()
-	defer db.snapMu.Unlock()
+	defer db.lockSnapExclusive()()
 
 	magic := make([]byte, len(snapMagic))
 	if _, err := io.ReadFull(br, magic); err != nil {

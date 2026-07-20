@@ -40,6 +40,8 @@ const (
 // safe to call concurrently with reads and writes. Returns the number of shards where
 // space was reclaimed (by either mechanism).
 func (c *Collection) Compact() int {
+	start := time.Now()
+	defer func() { c.opm.compact.observe(time.Since(start)) }()
 	target := c.currentCodec()
 	n := 0
 	for _, sh := range c.shards {
@@ -182,6 +184,8 @@ func (c *Collection) Rewrite() int {
 // scans are unaffected: they decode retired segments with the codec those
 // segments were written under (recorded per segment). Returns the dictionary size.
 func (c *Collection) RetrainDict(sampleMax int) (int, error) {
+	start := time.Now()
+	defer func() { c.opm.retrain.observe(time.Since(start)) }()
 	dict, err := TrainDict(c.CollectSamples(sampleMax))
 	if err != nil {
 		return 0, err
