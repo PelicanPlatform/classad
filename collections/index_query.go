@@ -4,6 +4,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -24,6 +25,8 @@ import (
 // span of segments therefore evolves toward the current spec at whatever cadence
 // the caller reindexes — no write-path or compaction coupling.
 func (c *Collection) Reindex() {
+	start := time.Now()
+	defer func() { c.opm.reindex.observe(time.Since(start)) }()
 	spec := c.spec.Load()
 	persistent := c.dir != ""
 	for _, sh := range c.shards {

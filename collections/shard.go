@@ -3,6 +3,7 @@ package collections
 import (
 	"bytes"
 	"sync"
+	"time"
 )
 
 // shard owns an independent slice of the keyspace: a directory mapping a key hash
@@ -71,6 +72,29 @@ type shard struct {
 	// hashing to h has zero children, so this parent does too. Guarded by mu.
 	childParentHash func(key []byte) (uint64, bool)
 	childCount      map[uint64]int
+
+	// metrics accumulates this shard's operational timings (write-lock wait/hold,
+	// segment allocation, durability sync). See opstats.go.
+	metrics shardMetrics
+}
+
+// lockWrite acquires the shard write lock, returning the timestamps unlockWrite needs
+// to attribute time to the writeWait (blocked acquiring) and writeHold (blocking the
+// world) counters. Every lockWrite must be paired with an unlockWrite.
+func (sh *shard) lockWrite() (acq, held time.Time) {
+	acq = time.Now()
+	sh.mu.Lock()
+	held = time.Now()
+	return
+}
+
+// unlockWrite releases the shard write lock and records the wait/hold timings. The
+// counter updates run after Unlock so they never extend the critical section.
+func (sh *shard) unlockWrite(acq, held time.Time) {
+	hold := time.Since(held)
+	sh.mu.Unlock()
+	sh.metrics.writeWait.observe(held.Sub(acq))
+	sh.metrics.writeHold.observe(hold)
 }
 
 // supRef identifies a supersededBySeq field (a record's tombstone) that must be
@@ -93,6 +117,8 @@ func newShard(segSize int, onSync func()) *shard {
 // returns nil; the caller must treat the write as failed. Caller holds the write
 // lock.
 func (sh *shard) allocSeg(id uint32, size int, codec Codec) *segment {
+	start := time.Now()
+	defer func() { sh.metrics.segAlloc.observe(time.Since(start)) }()
 	if sh.alloc == nil {
 		s := newSegment(id, size, codec)
 		s.pinReap = sh.sealRAM // pin/reap-eligible so its anon sidecar tears down safely

@@ -1,5 +1,7 @@
 package collections
 
+import "time"
+
 // Group commit. Concurrent writers to a shard are coalesced so that a batch of
 // writes is applied under a single commitSeq bump and a single durability sync.
 // Today the store is in-memory and the sync is a no-op, so coalescing is roughly
@@ -115,13 +117,13 @@ func (sh *shard) finishFlush() {
 // applyWrites commits a single writer's writes under the shard lock at a fresh
 // commit sequence, then runs the durability sync once.
 func (sh *shard) applyWrites(writes []pendingPut) {
-	sh.mu.Lock()
+	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
 	for i := range writes {
 		sh.put(writes[i].hash, writes[i].key, writes[i].ad, seq, writes[i].codec)
 	}
 	sh.commitSeq = seq
-	sh.mu.Unlock()
+	sh.unlockWrite(acq, held)
 	sh.sync()
 	if sh.hub != nil {
 		for i := range writes {
@@ -133,11 +135,11 @@ func (sh *shard) applyWrites(writes []pendingPut) {
 // applyOne commits a single write under the shard lock at a fresh commit
 // sequence, then runs the durability sync once.
 func (sh *shard) applyOne(p pendingPut) {
-	sh.mu.Lock()
+	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
 	sh.put(p.hash, p.key, p.ad, seq, p.codec)
 	sh.commitSeq = seq
-	sh.mu.Unlock()
+	sh.unlockWrite(acq, held)
 	sh.sync()
 	if sh.hub != nil {
 		sh.hub.publish(sh.idx, seq, p.key, p.ad, p.codec, false)
@@ -147,7 +149,7 @@ func (sh *shard) applyOne(p pendingPut) {
 // applyBatch commits a coalesced batch of requests under the shard lock at a
 // single fresh commit sequence, then runs the durability sync once for the batch.
 func (sh *shard) applyBatch(batch []*commitReq) {
-	sh.mu.Lock()
+	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
 	for _, r := range batch {
 		for i := range r.writes {
@@ -155,7 +157,7 @@ func (sh *shard) applyBatch(batch []*commitReq) {
 		}
 	}
 	sh.commitSeq = seq
-	sh.mu.Unlock()
+	sh.unlockWrite(acq, held)
 	sh.sync()
 	if sh.hub != nil {
 		for _, r := range batch {
@@ -209,6 +211,10 @@ func (sh *shard) sync() {
 		s.seg.pin()
 	}
 	sh.mu.Unlock()
+	// Time the actual durability flush -- the msync syscalls -- so an operator can see
+	// whether stalls are "just an fsync thing". The unpin bookkeeping below is cheap and
+	// excluded.
+	syncStart := time.Now()
 	for _, r := range ranges {
 		_ = r.seg.msyncRange(r.from, r.to)
 	}
@@ -221,6 +227,7 @@ func (sh *shard) sync() {
 		off := int(s.off) + recSupOff
 		_ = s.seg.msyncRange(off, off+8)
 	}
+	sh.metrics.sync.observe(time.Since(syncStart))
 	for i := range ranges {
 		ranges[i].seg.unpin()
 	}

@@ -214,6 +214,10 @@ type Collection struct {
 	sealer    wire.Sealer
 	encAttrs  atomic.Pointer[encSetHolder]
 	privCache sync.Map // attribute name -> bool (classad.IsPrivateAttribute), memoized
+
+	// opm accumulates the collection-wide maintenance timings (compact/retrain/reindex)
+	// for OpStats; per-shard write/segment/sync timings live on each shard. See opstats.go.
+	opm opMetrics
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to
@@ -500,13 +504,13 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 func (c *Collection) Delete(key []byte) bool {
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	sh.mu.Lock()
+	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
 	ok, parentEmptied := sh.del(h, key, seq)
 	if ok {
 		sh.commitSeq = seq
 	}
-	sh.mu.Unlock()
+	sh.unlockWrite(acq, held)
 	if ok {
 		c.removeOrdered(key)
 		sh.sync() // durability point for the tombstone (not coalesced)

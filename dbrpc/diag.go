@@ -15,6 +15,7 @@ import (
 // commands.
 type Diagnostics struct {
 	Stats              db.Stats             `json:"stats"`
+	OpStats            db.OpStats           `json:"opStats"`
 	Hot                []string             `json:"hot"`
 	CategoricalIndexes []string             `json:"categoricalIndexes"`
 	ValueIndexes       []string             `json:"valueIndexes"`
@@ -37,6 +38,7 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 	cat, val := t.IndexedAttrs()
 	d := Diagnostics{
 		Stats:              t.Stats(),
+		OpStats:            t.OpStats(),
 		Hot:                t.HotAttrs(),
 		CategoricalIndexes: cat,
 		ValueIndexes:       val,

@@ -44,3 +44,20 @@ func (c *Collection) Stats() Stats {
 	}
 	return s
 }
+
+// OpStats returns a snapshot of the collection's operational timing counters -- where
+// its callers spent time blocked in, or holding, each of the store's stall points
+// (shard write lock, segment allocation, durability sync, and the maintenance passes).
+// Per-shard counters are summed across all shards; every value is a monotonic
+// cumulative total, so a scraper derives rate and mean latency from deltas. It reads
+// atomics locklessly, so it never contends with readers or writers.
+func (c *Collection) OpStats() OpStats {
+	var s OpStats
+	for _, sh := range c.shards {
+		s.add(&sh.metrics)
+	}
+	s.Compact = c.opm.compact.snapshot()
+	s.Retrain = c.opm.retrain.snapshot()
+	s.Reindex = c.opm.reindex.snapshot()
+	return s
+}

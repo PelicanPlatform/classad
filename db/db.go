@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -42,6 +43,25 @@ type DB struct {
 	// commits proceed); Truncate/Restore take it exclusively so a reload is atomic against
 	// all writers. See db/snapshot.go.
 	snapMu sync.RWMutex
+
+	// snapLock{Count,Nanos} accumulate how long snapMu was held exclusively (a
+	// Truncate/Restore blocks every writer for the whole reload); surfaced via OpStats.
+	snapLockCount atomic.Int64
+	snapLockNanos atomic.Int64
+}
+
+// lockSnapExclusive takes the DB-wide snapshot lock exclusively and returns a release
+// func that records the exclusive-hold duration -- the wall time the whole store was
+// blocked. Use as: defer db.lockSnapExclusive()().
+func (db *DB) lockSnapExclusive() func() {
+	db.snapMu.Lock()
+	held := time.Now()
+	return func() {
+		hold := time.Since(held)
+		db.snapMu.Unlock()
+		db.snapLockCount.Add(1)
+		db.snapLockNanos.Add(int64(hold))
+	}
 }
 
 // OrderSpec, SortKey, OrderedAd, OrderCursor configure and drive maintained ordered
@@ -294,6 +314,26 @@ func (db *DB) ExplainMatch(job *classad.ClassAd, targetConstraint string) MatchE
 // Stats returns a snapshot of the store's storage (ad count, segment/arena/dead
 // bytes) for observability.
 func (db *DB) Stats() Stats { return db.c.Stats() }
+
+// OpStat is one operation's cumulative call count and total wall-nanoseconds.
+type OpStat = collections.OpStat
+
+// OpStats is a snapshot of the store's operational timing counters -- where callers
+// spent time blocked in, or holding, each stall point (see collections.OpStats) --
+// plus the DB-wide snapshot lock's exclusive-hold time (Truncate/Restore). Every value
+// is a monotonic cumulative total; a scraper derives rate and mean latency from deltas.
+type OpStats struct {
+	collections.OpStats
+	SnapshotLock OpStat `json:"snapshotLock"`
+}
+
+// OpStats returns the store's operational timing counters (see the OpStats type).
+func (db *DB) OpStats() OpStats {
+	return OpStats{
+		OpStats:      db.c.OpStats(),
+		SnapshotLock: OpStat{Count: db.snapLockCount.Load(), Nanos: db.snapLockNanos.Load()},
+	}
+}
 
 // HotAttrs returns the current hot attributes (front-loaded in each ad's hot
 // header for cheap access).
