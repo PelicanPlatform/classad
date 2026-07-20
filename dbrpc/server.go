@@ -183,6 +183,13 @@ const defaultMaintenanceInterval = 15 * time.Minute
 // D never runs more often than every D/dutyCycle. At 1% a 30s pass paces to >=50 minutes.
 const maintenanceMaxDutyCycle = 0.01
 
+// defaultCompactInterval is the cadence of the standalone compaction pass when
+// MaintainOptions.CompactInterval is 0. It is far shorter than the maintenance
+// (retrain) cadence on purpose: compaction is cheap and self-limiting, and a
+// high-churn table accumulates dead space continuously, so reclaiming it must not
+// wait on the throttled retrain-dominated Maintain pass.
+const defaultCompactInterval = 2 * time.Minute
+
 // StartMaintenance starts server-managed background maintenance: a single goroutine that,
 // each tick, re-enumerates the catalog's tables and runs one Maintain pass (index
 // auto-tune, hot-set refresh, and -- if opts.Retrain -- dictionary retrain) on each.
@@ -223,6 +230,38 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 		}
 	}()
 	s.stopBG = append(s.stopBG, func() { close(done) })
+
+	// Standalone compaction pass, decoupled from the retrain-dominated Maintain
+	// pass above. Compaction is cheap and self-limiting (Compact unlinks fully-dead
+	// segments for free and only recompacts shards past the dead-byte threshold), so
+	// it runs on a short fixed cadence -- a high-churn table reclaims dead space
+	// continuously instead of only when the throttled retrain happens to run. A
+	// negative CompactInterval disables it; 0 uses defaultCompactInterval.
+	if opts.CompactInterval >= 0 {
+		compactEvery := opts.CompactInterval
+		if compactEvery == 0 {
+			compactEvery = defaultCompactInterval
+		}
+		cdone := make(chan struct{})
+		go func() {
+			ct := time.NewTimer(compactEvery)
+			defer ct.Stop()
+			for {
+				select {
+				case <-cdone:
+					return
+				case <-ct.C:
+				}
+				for _, name := range s.cat.Tables() {
+					if d, ok := s.cat.Table(name); ok {
+						d.Compact()
+					}
+				}
+				ct.Reset(compactEvery) // reset after the pass so a slow pass never overlaps
+			}
+		}()
+		s.stopBG = append(s.stopBG, func() { close(cdone) })
+	}
 }
 
 // tableOr writes a "no such table" error under reqID and returns ok=false if the
