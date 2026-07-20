@@ -86,21 +86,16 @@ type segment struct {
 	// Time-travel scan pruning (guarded by the shard lock; recomputed on recovery).
 	// A scan at snapshot S0 can skip this segment entirely when no record in it is
 	// visible at S0 -- either every record was born after S0 (minSeq > S0) or every
-	// record was already superseded by S0 (effectiveMaxSup() <= S0). This keeps
-	// current-time scans O(live) even when time travel retains a large history in
-	// separate (history-only) segments. minSeq is the smallest seq written here (0 =
-	// none yet); liveCount is the number of current (non-superseded, non-marker)
-	// records; maxSup is the largest finite supersededBySeq stamped here.
-	minSeq    uint64
-	liveCount int
-	maxSup    uint64
-	// metaReady is true once minSeq/liveCount/maxSup are known-good: for a segment
-	// built by appends from empty (its counters are maintained from birth) or one
-	// whose records were walked by recovery (rebuildDir). A segment reopened via the
-	// fast directory-snapshot path has NOT been walked, so it stays false and is never
-	// skipped by a scan -- correctness over the optimization. Compaction produces fresh
-	// segments (metaReady true), so time travel's history-segment skipping still applies.
-	metaReady bool
+	// record was superseded by S0 with none current (dead >= used, so no live record,
+	// AND maxSup <= S0). This keeps current-time scans O(live) even when time travel
+	// retains a large history in separate (history-only) segments. minSeq is the
+	// smallest seq written here (0 = none yet, or a fast-reopened segment not walked --
+	// which is then never skipped, conservatively); maxSup is the largest finite
+	// supersededBySeq stamped here. "no current record" is read from the byte counters
+	// (dead >= used, markers counting as dead) rather than a separate live tally, so it
+	// cannot drift out of sync with the arena.
+	minSeq uint64
+	maxSup uint64
 
 	codec Codec // the codec that compressed this segment's records (immutable)
 
@@ -318,7 +313,7 @@ func newSegment(id uint32, size int, codec Codec) *segment {
 	}
 	raw := make([]uint64, size/8)
 	data := unsafe.Slice((*byte)(unsafe.Pointer(&raw[0])), size)
-	return &segment{id: id, raw: raw, data: data, codec: codec, metaReady: true}
+	return &segment{id: id, raw: raw, data: data, codec: codec}
 }
 
 func recAlign(n int) int { return (n + 7) &^ 7 }
@@ -373,7 +368,6 @@ func (s *segment) append(seq uint64, next loc, key, ad []byte) (uint32, bool) {
 	if s.minSeq == 0 || seq < s.minSeq {
 		s.minSeq = seq
 	}
-	s.liveCount++ // born current; drops in supersedeRec
 	return uint32(off), true
 }
 
@@ -409,42 +403,42 @@ func (s *segment) appendMarker(seq uint64, millis uint64) (uint32, bool) {
 	if s.minSeq == 0 || seq < s.minSeq {
 		s.minSeq = seq
 	}
-	// A marker is not a data record: it does NOT count toward liveCount, so a
-	// history-only segment that still carries checkpoints stays skippable.
+	// A marker is not live data: count its bytes as dead so a history-only segment that
+	// carries only superseded records plus checkpoints still reaches dead >= used (and
+	// is thus recognized as fully dead / skippable / reclaimable once aged out).
+	s.dead += int64(rl)
 	return uint32(off), true
 }
 
 // supersedeRec marks the record at off superseded at seq: it stamps the field, adds
-// its bytes to the dead total, drops the live count, and advances maxSup. Caller holds
-// the shard write lock. This is the one place a record leaves the "current" set, so the
-// scan-pruning metadata stays consistent.
+// its bytes to the dead total, and advances maxSup. Caller holds the shard write lock.
+// This is the one place a record leaves the "current" set, so the scan-pruning
+// metadata stays consistent with the arena.
 func (s *segment) supersedeRec(off uint32, seq uint64) {
 	setRecSuperseded(s.data, off, seq)
 	s.dead += int64(recTotalLen(s.data, off))
-	s.liveCount--
 	if seq > s.maxSup {
 		s.maxSup = seq
 	}
 }
 
-// effectiveMaxSup is the highest snapshot S0 at which some record here is still
-// visible: seqMax while any current record remains, else the largest finite
-// supersededBySeq. A scan at S0 >= this can skip the segment (nothing visible).
-func (s *segment) effectiveMaxSup() uint64 {
-	if s.liveCount > 0 {
-		return seqMax
-	}
-	return s.maxSup
-}
-
-// visibleAt reports whether any record in the segment is visible at snapshot s0
-// (seq <= s0 < sup for some record). It is a conservative skip test for scans: false
-// means definitely nothing visible; true means scan the segment.
+// visibleAt reports whether any record in the segment MIGHT be visible at snapshot s0
+// (some record with seq <= s0 < sup). It is a conservative skip test for scans: false
+// means definitely nothing visible; true means scan the segment. It reads only the
+// byte counters, so it cannot drift out of sync with the arena, and a fast-reopened
+// segment whose counters were not rebuilt (minSeq == 0, dead == 0) is never skipped.
+//
+//   - minSeq > s0: every record here was born after s0 -> nothing visible.
+//   - dead >= used (no current record, markers counted as dead) AND maxSup <= s0:
+//     every record was superseded at or before s0 -> nothing visible.
 func (s *segment) visibleAt(s0 uint64) bool {
-	if !s.metaReady {
-		return true // counters not computed (fast reopen); never skip
+	if s.minSeq > s0 {
+		return false
 	}
-	return s.minSeq <= s0 && s.effectiveMaxSup() > s0
+	if s.dead >= int64(s.used) && s.maxSup <= s0 {
+		return false
+	}
+	return true
 }
 
 // recVerifyCRC reports whether the record at off has a valid trailing CRC (i.e. it

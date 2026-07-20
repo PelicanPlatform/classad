@@ -97,7 +97,7 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 		// check: a history segment carrying checkpoint markers still reclaims once its
 		// data has aged out. With time travel off, retain == commitSeq, so any
 		// all-superseded segment qualifies -- exactly the previous behavior.
-		if seg.metaReady && seg.liveCount == 0 && seg.maxSup <= retain {
+		if seg.dead >= int64(seg.used) && seg.maxSup <= retain {
 			dead = append(dead, seg)
 		}
 	}
@@ -245,7 +245,7 @@ func (sh *shard) shouldCompact() bool {
 		// must not drive compaction of the live working set (which would recopy history
 		// every pass). With time travel off there are none (reclaimDeadShard drops them
 		// first), so this is a no-op and the ratio is over the whole shard, as before.
-		if seg.metaReady && seg.liveCount == 0 {
+		if seg.dead >= int64(seg.used) {
 			continue
 		}
 		used += int64(seg.used)
@@ -293,8 +293,8 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		if seg == nil || seg.used == 0 {
 			continue
 		}
-		if seg.metaReady && seg.liveCount == 0 {
-			continue // pure-history (or fully-dead) segment: leave it in place
+		if seg.dead >= int64(seg.used) && seg.maxSup > retain {
+			continue // in-window history segment: leave it in place, don't recopy
 		}
 		sources = append(sources, seg)
 		sourceSet[seg] = struct{}{}
