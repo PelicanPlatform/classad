@@ -63,25 +63,38 @@ func (r *dictReg) codecFor(id uint32) (Codec, bool) {
 // (for a persistent collection) writes the dictionary bytes durably to
 // <dir>/dicts/<id>.zst so recovery can reconstruct the codec. Returns the id.
 func (r *dictReg) register(codec Codec, dict []byte) (uint32, error) {
+	// Reserve the id under the lock (so concurrent registers never collide), but do
+	// NOT register the codec in byID/idOf yet: for a persistent collection we must
+	// persist the dictionary bytes FIRST, so a failed write never leaves a codec
+	// whose backing dict file is missing (a recovery hazard) -- segments would be
+	// tagged with a dictionary id whose .zst does not exist. A failed write leaves a
+	// hole in the id sequence, which is harmless (loadDicts resumes at max+1).
 	r.mu.Lock()
 	id := r.next
 	r.next++
-	r.byID[id] = codec
-	r.idOf[codec] = id
 	dir := r.dir
 	r.mu.Unlock()
-	if dir == "" {
-		return id, nil // in-memory: nothing to persist
+	if dir != "" {
+		if err := writeDictFile(filepath.Join(dir, fmt.Sprintf("%d.zst", id)), dict); err != nil {
+			return 0, err
+		}
 	}
-	if err := writeDictFile(filepath.Join(dir, fmt.Sprintf("%d.zst", id)), dict); err != nil {
-		return id, err
-	}
+	r.mu.Lock()
+	r.byID[id] = codec
+	r.idOf[codec] = id
+	r.mu.Unlock()
 	return id, nil
 }
 
 // writeDictFile writes a dictionary's bytes to path and fsyncs it (so a codec that
 // segments already reference cannot be lost across a crash).
 func writeDictFile(path string, dict []byte) error {
+	// Recreate the dicts directory if it went missing at runtime. It is created at
+	// Open, but a retrain must not fail with ENOENT (open ".../dicts/N.zst: no such
+	// file or directory") just because the directory disappeared underneath us.
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return err
