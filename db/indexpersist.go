@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"time"
+
+	"github.com/PelicanPlatform/classad/collections"
 )
 
 // Runtime index/hot-set configuration is persisted next to the ClassAd log so
@@ -27,6 +30,41 @@ type persistedIndexConfig struct {
 	// change consistent across restarts -- and, in HA, lets a follower converge on the
 	// policy by reloading, since there is no op-stream replication of config.
 	Encrypted []string `json:"encrypted,omitempty"`
+	// Time-travel (point-in-time / AS OF) settings, a runtime-toggled per-table policy
+	// persisted like Encrypted. TimeTravel off (default) leaves the others inert.
+	TimeTravel                bool `json:"timeTravel,omitempty"`
+	TimeTravelMaxSeconds      int  `json:"timeTravelMaxSeconds,omitempty"`
+	TimeTravelCheckpointSeced int  `json:"timeTravelCheckpointSeconds,omitempty"`
+}
+
+// timeTravelOptions converts the persisted seconds to a collections option set, or nil
+// when disabled. The checkpoint interval defaults inside collections if left zero.
+func (p persistedIndexConfig) timeTravelOptions() *collections.TimeTravelOptions {
+	if !p.TimeTravel || p.TimeTravelMaxSeconds <= 0 {
+		return nil
+	}
+	return &collections.TimeTravelOptions{
+		MaxDistance:        time.Duration(p.TimeTravelMaxSeconds) * time.Second,
+		CheckpointInterval: time.Duration(p.TimeTravelCheckpointSeced) * time.Second,
+	}
+}
+
+// readPersistedTimeTravel reads just the time-travel settings from dir's index-config
+// file, before the collection is opened, so recovery can rebuild the time index. Nil
+// when there is no dir, no file, or time travel is off.
+func readPersistedTimeTravel(dir string) *collections.TimeTravelOptions {
+	if dir == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(dir, indexConfigFile))
+	if err != nil {
+		return nil
+	}
+	var cfg persistedIndexConfig
+	if json.Unmarshal(data, &cfg) != nil {
+		return nil
+	}
+	return cfg.timeTravelOptions()
 }
 
 func (db *DB) indexConfigPath() string {
@@ -48,6 +86,11 @@ func (db *DB) saveIndexConfig() {
 	cfg := persistedIndexConfig{
 		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(), Hot: db.c.HotAttrNames(),
 		Encrypted: db.c.EncryptedAttrNames(),
+	}
+	if o, on := db.c.TimeTravelConfig(); on {
+		cfg.TimeTravel = true
+		cfg.TimeTravelMaxSeconds = int(o.MaxDistance / time.Second)
+		cfg.TimeTravelCheckpointSeced = int(o.CheckpointInterval / time.Second)
 	}
 	data, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {

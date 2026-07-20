@@ -314,7 +314,10 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// segment set and falls back to the full scan on any mismatch. Chained
 	// collections are excluded (their per-parent child counts would also need
 	// rebuilding); a stale snapshot in that case is discarded, not trusted.
-	if sh.childParentHash != nil {
+	// Time travel also forces the full scan: rebuildDir is what rebuilds the per-shard
+	// time->seq checkpoint index (and the segment scan-pruning counters) from the
+	// segment markers, which the directory snapshot does not carry.
+	if sh.childParentHash != nil || c.timeTravel() != nil {
 		os.Remove(filepath.Join(shardDir, dirSnapName))
 		c.rebuildDir(sh)
 	} else if !c.tryLoadDirSnapshot(sh, shardDir) {
@@ -378,6 +381,25 @@ func (c *Collection) rebuildDir(sh *shard) {
 			if sup != seqMax && sup > maxSeq {
 				maxSeq = sup
 			}
+			// Rebuild the segment's scan-pruning metadata from disk (zeroed on reopen).
+			if seg.minSeq == 0 || seq < seg.minSeq {
+				seg.minSeq = seq
+			}
+			// A time-checkpoint marker feeds the shard time index; it never enters the
+			// directory, and its bytes count as dead (as appendMarker does at runtime)
+			// so a history-only segment reaches dead >= used.
+			if recIsMarker(seg.data, o) {
+				sh.tseq.record(seq, recMarkerMillis(seg.data, o))
+				seg.dead += int64(total)
+				off += int(total)
+				continue
+			}
+			if sup != seqMax {
+				seg.dead += int64(total)
+				if sup > seg.maxSup {
+					seg.maxSup = sup
+				}
+			}
 			key := string(recKey(seg.data, o))
 			if b, ok := byKey[key]; !ok || seq >= b.seq {
 				byKey[key] = best{loc{seg.id, o}, seq, sup}
@@ -408,13 +430,16 @@ func (c *Collection) rebuildDir(sh *shard) {
 			if total == 0 {
 				break
 			}
+			if recIsMarker(seg.data, o) {
+				off += int(total) // marker, not a data record
+				continue
+			}
 			if recSuperseded(seg.data, o) == seqMax {
 				b := byKey[string(recKey(seg.data, o))]
 				if b.loc.seg != seg.id || b.loc.off != o {
 					// A stale still-current duplicate/older version: retire it at its
 					// own seq so seq <= S0 < sup is false for every scan.
-					setRecSuperseded(seg.data, o, recSeq(seg.data, o))
-					seg.dead += int64(total)
+					seg.supersedeRec(o, recSeq(seg.data, o))
 				}
 			}
 			off += int(total)

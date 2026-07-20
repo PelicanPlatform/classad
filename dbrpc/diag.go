@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 )
@@ -87,6 +88,28 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 			return "", err
 		}
 		return "encrypted attributes: " + join(t.EncryptedAttrNames()), nil
+	case "timetravel.enable":
+		// Enable/retune point-in-time queries: args = <maxDistanceSeconds>
+		// [checkpointSeconds]. Persisted so it survives a restart.
+		if len(args) < 1 {
+			return "", fmt.Errorf("timetravel.enable needs <maxDistanceSeconds> [checkpointSeconds]")
+		}
+		maxS, err := strconv.Atoi(args[0])
+		if err != nil || maxS <= 0 {
+			return "", fmt.Errorf("timetravel.enable: bad maxDistanceSeconds %q", args[0])
+		}
+		ckpt := 0
+		if len(args) > 1 {
+			if ckpt, err = strconv.Atoi(args[1]); err != nil || ckpt < 0 {
+				return "", fmt.Errorf("timetravel.enable: bad checkpointSeconds %q", args[1])
+			}
+		}
+		t.SetTimeTravel(time.Duration(maxS)*time.Second, time.Duration(ckpt)*time.Second)
+		md, cp, _ := t.TimeTravel()
+		return fmt.Sprintf("time travel enabled: window %s, checkpoint %s", md, cp), nil
+	case "timetravel.disable":
+		t.SetTimeTravel(0, 0)
+		return "time travel disabled", nil
 	case "truncate":
 		// Removing every ad is a destructive, DB-wide-locked operation.
 		t.Truncate()

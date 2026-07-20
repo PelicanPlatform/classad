@@ -124,6 +124,10 @@ func OpenConfig(cfg Config) (*DB, error) {
 		Codec:             chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
 		DataKey:           enc.data(),
 		EncryptedAttrs:    cfg.EncryptedAttrs,
+		// Time travel is a persisted runtime toggle: read it before opening so recovery
+		// rebuilds the time index (and scan-pruning counters) from the segment markers
+		// instead of the directory snapshot. loadIndexConfig below keeps it in sync.
+		TimeTravel: readPersistedTimeTravel(cfg.Dir),
 	}
 	var c *collections.Collection
 	if cfg.Dir == "" {
@@ -470,6 +474,36 @@ func (db *DB) Query(constraint string) (iter.Seq[*classad.ClassAd], error) {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
 	return db.c.Query(q), nil
+}
+
+// QueryAsOf runs a point-in-time ("AS OF") query: it returns the ads matching the
+// constraint as they were at time t. It errors on a malformed constraint, when time
+// travel is not enabled on this table, or when t is older than the retained window.
+func (db *DB) QueryAsOf(constraint string, t time.Time) (iter.Seq[*classad.ClassAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryAsOf(q, t)
+}
+
+// SetTimeTravel enables (with a positive maxDistance), retunes, or disables (maxDistance
+// <= 0) point-in-time queries for this table, and persists the setting so it survives a
+// restart. A zero checkpoint interval uses the collections default (1 minute). Enabling
+// is not retroactive -- only changes from now on are travelable.
+func (db *DB) SetTimeTravel(maxDistance, checkpoint time.Duration) {
+	if maxDistance <= 0 {
+		db.c.SetTimeTravel(nil)
+	} else {
+		db.c.SetTimeTravel(&collections.TimeTravelOptions{MaxDistance: maxDistance, CheckpointInterval: checkpoint})
+	}
+	db.saveIndexConfig()
+}
+
+// TimeTravel reports the table's current point-in-time settings and whether enabled.
+func (db *DB) TimeTravel() (maxDistance, checkpoint time.Duration, enabled bool) {
+	o, on := db.c.TimeTravelConfig()
+	return o.MaxDistance, o.CheckpointInterval, on
 }
 
 // QueryProject returns, for each ad matching the constraint, just the named

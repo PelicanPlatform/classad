@@ -153,6 +153,7 @@ func (sh *shard) commitTxn(ws []*txnWrite, durable bool) {
 	}
 	if changed {
 		sh.commitSeq = seq
+		sh.maybeCheckpoint(seq)
 	}
 	sh.unlockWrite(acq, held)
 	if changed {

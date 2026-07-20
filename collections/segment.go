@@ -44,6 +44,15 @@ const (
 	recKeyOff      = 32
 	recHeaderSize  = 32
 
+	// markerFlag is the high bit of the keyLen field, set on a "time checkpoint"
+	// marker entry (see timeseq.go): a non-keyed arena record whose 8-byte payload is
+	// a wall-clock unixMillis and whose seq is the shard commitSeq at that instant.
+	// Real keys are tiny, so the low 31 bits (keyLenMask) always hold the true key
+	// length and existing on-disk records (flag clear) read as ordinary records --
+	// the discriminator is backward compatible and needs no header growth.
+	markerFlag = uint32(1) << 31
+	keyLenMask = markerFlag - 1
+
 	noSeg  = ^uint32(0)
 	seqMax = ^uint64(0)
 
@@ -73,6 +82,20 @@ type segment struct {
 	data []byte   // immutable full backing; aliases raw (RAM) or the mmap region (persistent)
 	used int      // write cursor (guarded by shard lock)
 	dead int64    // bytes belonging to superseded/dead records (updated under shard lock)
+
+	// Time-travel scan pruning (guarded by the shard lock; recomputed on recovery).
+	// A scan at snapshot S0 can skip this segment entirely when no record in it is
+	// visible at S0 -- either every record was born after S0 (minSeq > S0) or every
+	// record was superseded by S0 with none current (dead >= used, so no live record,
+	// AND maxSup <= S0). This keeps current-time scans O(live) even when time travel
+	// retains a large history in separate (history-only) segments. minSeq is the
+	// smallest seq written here (0 = none yet, or a fast-reopened segment not walked --
+	// which is then never skipped, conservatively); maxSup is the largest finite
+	// supersededBySeq stamped here. "no current record" is read from the byte counters
+	// (dead >= used, markers counting as dead) rather than a separate live tally, so it
+	// cannot drift out of sync with the arena.
+	minSeq uint64
+	maxSup uint64
 
 	codec Codec // the codec that compressed this segment's records (immutable)
 
@@ -342,14 +365,87 @@ func (s *segment) append(seq uint64, next loc, key, ad []byte) (uint32, bool) {
 		crcOff := adLenOff + 4 + len(ad)
 		binary.LittleEndian.PutUint32(b[crcOff:], recCRC(b, crcOff))
 	}
+	if s.minSeq == 0 || seq < s.minSeq {
+		s.minSeq = seq
+	}
 	return uint32(off), true
+}
+
+// appendMarker writes a time-checkpoint marker (see timeseq.go) at the current end of
+// the segment: a non-keyed record whose keyLen field carries markerFlag and whose
+// 8-byte payload is unixMillis. Its seq is the shard commitSeq at the checkpoint. It
+// reuses the ordinary record framing (empty key, 8-byte "ad") so the linear arena
+// walk, CRC, and recovery treat it uniformly; only the flag bit distinguishes it. The
+// caller holds the shard lock.
+func (s *segment) appendMarker(seq uint64, millis uint64) (uint32, bool) {
+	var ad [8]byte
+	binary.LittleEndian.PutUint64(ad[:], millis)
+	rl := recordLen(0, len(ad))
+	off := s.used
+	if off+rl > len(s.data) {
+		return 0, false
+	}
+	b := s.data[off : off+rl]
+	s.used = off + rl
+	binary.LittleEndian.PutUint64(b[recSeqOff:], seq)
+	binary.LittleEndian.PutUint64(b[recSupOff:], seqMax)
+	binary.LittleEndian.PutUint32(b[recNextSegOff:], noSeg)
+	binary.LittleEndian.PutUint32(b[recNextOffOff:], 0)
+	binary.LittleEndian.PutUint32(b[recTotalLenOff:], uint32(rl))
+	binary.LittleEndian.PutUint32(b[recKeyLenOff:], markerFlag) // flag set, key length 0
+	adLenOff := recKeyOff
+	binary.LittleEndian.PutUint32(b[adLenOff:], uint32(len(ad)))
+	copy(b[adLenOff+4:], ad[:])
+	if s.persistent {
+		crcOff := adLenOff + 4 + len(ad)
+		binary.LittleEndian.PutUint32(b[crcOff:], recCRC(b, crcOff))
+	}
+	if s.minSeq == 0 || seq < s.minSeq {
+		s.minSeq = seq
+	}
+	// A marker is not live data: count its bytes as dead so a history-only segment that
+	// carries only superseded records plus checkpoints still reaches dead >= used (and
+	// is thus recognized as fully dead / skippable / reclaimable once aged out).
+	s.dead += int64(rl)
+	return uint32(off), true
+}
+
+// supersedeRec marks the record at off superseded at seq: it stamps the field, adds
+// its bytes to the dead total, and advances maxSup. Caller holds the shard write lock.
+// This is the one place a record leaves the "current" set, so the scan-pruning
+// metadata stays consistent with the arena.
+func (s *segment) supersedeRec(off uint32, seq uint64) {
+	setRecSuperseded(s.data, off, seq)
+	s.dead += int64(recTotalLen(s.data, off))
+	if seq > s.maxSup {
+		s.maxSup = seq
+	}
+}
+
+// visibleAt reports whether any record in the segment MIGHT be visible at snapshot s0
+// (some record with seq <= s0 < sup). It is a conservative skip test for scans: false
+// means definitely nothing visible; true means scan the segment. It reads only the
+// byte counters, so it cannot drift out of sync with the arena, and a fast-reopened
+// segment whose counters were not rebuilt (minSeq == 0, dead == 0) is never skipped.
+//
+//   - minSeq > s0: every record here was born after s0 -> nothing visible.
+//   - dead >= used (no current record, markers counted as dead) AND maxSup <= s0:
+//     every record was superseded at or before s0 -> nothing visible.
+func (s *segment) visibleAt(s0 uint64) bool {
+	if s.minSeq > s0 {
+		return false
+	}
+	if s.dead >= int64(s.used) && s.maxSup <= s0 {
+		return false
+	}
+	return true
 }
 
 // recVerifyCRC reports whether the record at off has a valid trailing CRC (i.e. it
 // was fully written). Used by recovery to stop at a torn tail. b is the segment's
 // data; the caller has already bounds-checked the record's totalLen.
 func recVerifyCRC(b []byte, off uint32) bool {
-	kl := binary.LittleEndian.Uint32(b[off+recKeyLenOff:])
+	kl := recKeyLen(b, off)
 	adLenOff := off + recKeyOff + kl
 	if int(adLenOff)+4 > len(b) {
 		return false
@@ -399,14 +495,32 @@ func recTotalLen(b []byte, off uint32) uint32 {
 	return binary.LittleEndian.Uint32(b[off+recTotalLenOff:])
 }
 
+// recKeyLen is the true key length: the low 31 bits of the keyLen field, masking off
+// the marker flag (markerFlag) so a marker (flag set, key length 0) reads as keyless.
+func recKeyLen(b []byte, off uint32) uint32 {
+	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:]) & keyLenMask
+}
+
+// recIsMarker reports whether the record at off is a time-checkpoint marker (see
+// timeseq.go) rather than a keyed data record.
+func recIsMarker(b []byte, off uint32) bool {
+	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&markerFlag != 0
+}
+
+// recMarkerMillis reads a marker's wall-clock payload (unixMillis). Only valid when
+// recIsMarker(b, off) is true.
+func recMarkerMillis(b []byte, off uint32) uint64 {
+	return binary.LittleEndian.Uint64(recAd(b, off))
+}
+
 func recKey(b []byte, off uint32) []byte {
-	kl := binary.LittleEndian.Uint32(b[off+recKeyLenOff:])
+	kl := recKeyLen(b, off)
 	start := off + recKeyOff
 	return b[start : start+kl]
 }
 
 func recAd(b []byte, off uint32) []byte {
-	kl := binary.LittleEndian.Uint32(b[off+recKeyLenOff:])
+	kl := recKeyLen(b, off)
 	adLenOff := off + recKeyOff + kl
 	adLen := binary.LittleEndian.Uint32(b[adLenOff:])
 	start := adLenOff + 4
