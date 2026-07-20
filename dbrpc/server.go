@@ -52,6 +52,12 @@ type Catalog interface {
 	ArchiveTable(name string) (*db.ArchiveTable, bool)
 	CreateArchiveTable(name string, cfg db.ArchiveConfig) (*db.ArchiveTable, error)
 	ArchiveTables() []string
+	// CreateView / DropView / Views manage materialized views; ViewBacking returns a view's
+	// in-memory backing so reads resolve a view name to its materialized rows.
+	CreateView(name string, spec db.ViewSpec) error
+	DropView(name string) error
+	Views() []string
+	ViewBacking(name string) (*db.DB, bool)
 }
 
 // DefaultTable is the table name a single-DB server serves and the client
@@ -109,7 +115,15 @@ func (s singleCatalog) ConvertTableToMemory(name string) error {
 func (s singleCatalog) DropTable(name string) error {
 	return fmt.Errorf("single-table server: cannot drop tables")
 }
-func (s singleCatalog) Tables() []string { return []string{s.name} }
+func (s singleCatalog) CreateView(name string, spec db.ViewSpec) error {
+	return fmt.Errorf("single-table server: materialized views unsupported")
+}
+func (s singleCatalog) DropView(name string) error {
+	return fmt.Errorf("single-table server: materialized views unsupported")
+}
+func (s singleCatalog) Views() []string                   { return nil }
+func (s singleCatalog) ViewBacking(string) (*db.DB, bool) { return nil, false }
+func (s singleCatalog) Tables() []string                  { return []string{s.name} }
 
 func (s singleCatalog) ArchiveTable(string) (*db.ArchiveTable, bool) { return nil, false }
 func (s singleCatalog) CreateArchiveTable(string, db.ArchiveConfig) (*db.ArchiveTable, error) {
@@ -166,7 +180,7 @@ type QueryLog struct {
 func (o op) isMutating() bool {
 	switch o {
 	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
-		opCreateTableMem, opTableToMemory,
+		opCreateTableMem, opTableToMemory, opCreateView, opDropView,
 		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere, opCommitIdem:
 		return true
 	}
@@ -269,6 +283,12 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 func (s *Server) tableOr(reqID uint64, name string, write func([]byte)) (*db.DB, bool) {
 	d, ok := s.cat.Table(name)
 	if !ok {
+		// A materialized view is queried like a table via its in-memory backing. Only reads
+		// reach tableOr; writes (opBegin) resolve through cat.Table only, so a view stays
+		// read-only.
+		if d, ok = s.cat.ViewBacking(name); ok {
+			return d, true
+		}
 		write(respErr(reqID, "no such table: "+name))
 	}
 	return d, ok
@@ -617,6 +637,39 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 
 	case opListTables:
 		names := s.cat.Tables()
+		b := putI32(resp(reqID, stOK), int32(len(names)))
+		for _, n := range names {
+			b = putStr(b, n)
+		}
+		return b
+
+	case opCreateView:
+		name := r.str()
+		specJSON := r.bytesRef()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		var spec db.ViewSpec
+		if err := json.Unmarshal(specJSON, &spec); err != nil {
+			return respErr(reqID, "view spec: "+err.Error())
+		}
+		if err := s.cat.CreateView(name, spec); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opDropView:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		if err := s.cat.DropView(name); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opListViews:
+		names := s.cat.Views()
 		b := putI32(resp(reqID, stOK), int32(len(names)))
 		for _, n := range names {
 			b = putStr(b, n)

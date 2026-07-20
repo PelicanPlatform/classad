@@ -88,6 +88,12 @@ const (
 	opQueryRawProj   op = 37 // [table][limit i32][constraint][nattrs i32]{[attr]} -> stream of [oldClassAdText] projected to attrs (+ MyType/TargetType); server-side projection so only requested attributes cross the wire
 	opCreateTableMem op = 38 // [table] -> status; create a RAM-only (non-persistent) table; mutating
 	opTableToMemory  op = 39 // [table] -> status; drop an existing table's on-disk backing (DAEMON-only); mutating
+
+	// Materialized views: cardinality-limited in-memory aggregates maintained from the base
+	// table's change stream. The definition rides as a JSON db.ViewSpec (like opArchiveCreate).
+	opCreateView op = 40 // [name][json db.ViewSpec] -> status; mutating
+	opDropView   op = 41 // [name] -> status; mutating
+	opListViews  op = 42 // -> [n i32]{[name]}
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -139,6 +145,12 @@ func (o op) String() string {
 		return "CreateTableInMemory"
 	case opTableToMemory:
 		return "ConvertTableToMemory"
+	case opCreateView:
+		return "CreateView"
+	case opDropView:
+		return "DropView"
+	case opListViews:
+		return "ListViews"
 	case opDropTable:
 		return "DropTable"
 	case opListTables:

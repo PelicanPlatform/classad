@@ -22,6 +22,13 @@ const (
 	// initial full replay, or a re-sync after the cursor fell out of retention). Key
 	// and Ad are empty.
 	WatchReset
+	// WatchSynced: end of the initial catch-up/replay; the watcher is now live. Cursor is
+	// a durable resume point (and, after a Reset, the point at which a shadow rebuild goes
+	// live). Key and Ad are empty.
+	WatchSynced
+	// WatchResync: the live stream fell behind; reconnect with the last persisted cursor
+	// (which re-enters catch-up). Key and Ad are empty; no state is implied.
+	WatchResync
 )
 
 // WatchEvent is one change to the log. Cursor resumes a watch just after this event
@@ -54,6 +61,10 @@ func (db *DB) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], e
 				we.Kind = WatchDelete
 			case collections.WatchReset:
 				we.Kind = WatchReset
+			case collections.WatchSynced:
+				we.Kind = WatchSynced
+			case collections.WatchResync:
+				we.Kind = WatchResync
 			}
 			if !yield(we) {
 				return
