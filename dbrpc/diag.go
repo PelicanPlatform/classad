@@ -331,6 +331,35 @@ func (c *Client) CreateTable(ctx context.Context, name string) error {
 	return nil
 }
 
+// CreateTableInMemory creates (or no-ops if present) the named table as RAM-only: its data
+// lives only in memory and is not recovered across a server restart. On a persistent server
+// this avoids the disk I/O of persistence for high-churn, reconstructible data.
+func (c *Client) CreateTableInMemory(ctx context.Context, name string) error {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return putStr(req(id, opCreateTableMem), name) })
+	if err != nil {
+		return err
+	}
+	if status != stOK {
+		return statusErr(status, body)
+	}
+	return nil
+}
+
+// ConvertTableToMemory drops an existing table's on-disk backing, keeping its current
+// contents in RAM only (they are gone after a server restart). Requires DAEMON
+// authorization. Best run during low write activity: a write that races the conversion can
+// be lost (the server takes a consistent snapshot but does not globally quiesce writers).
+func (c *Client) ConvertTableToMemory(ctx context.Context, name string) error {
+	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return putStr(req(id, opTableToMemory), name) })
+	if err != nil {
+		return err
+	}
+	if status != stOK {
+		return statusErr(status, body)
+	}
+	return nil
+}
+
 // DropTable removes the named table and its data.
 func (c *Client) DropTable(ctx context.Context, name string) error {
 	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return putStr(req(id, opDropTable), name) })

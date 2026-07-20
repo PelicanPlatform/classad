@@ -38,6 +38,11 @@ type Catalog interface {
 	Table(name string) (*db.DB, bool)
 	// CreateTable creates (or returns the existing) named table.
 	CreateTable(name string) (*db.DB, error)
+	// CreateTableInMemory creates (or returns the existing) named table as RAM-only.
+	CreateTableInMemory(name string) (*db.DB, error)
+	// ConvertTableToMemory drops an existing table's on-disk backing, keeping its data in
+	// RAM only. DAEMON-gated by the server (it changes a table's durability).
+	ConvertTableToMemory(name string) error
 	// DropTable removes the named table and its data.
 	DropTable(name string) error
 	// Tables lists the table names.
@@ -94,6 +99,12 @@ func (s singleCatalog) CreateTable(name string) (*db.DB, error) {
 		return s.d, nil
 	}
 	return nil, fmt.Errorf("single-table server: cannot create table %q", name)
+}
+func (s singleCatalog) CreateTableInMemory(name string) (*db.DB, error) {
+	return nil, fmt.Errorf("single-table server: cannot create in-memory tables")
+}
+func (s singleCatalog) ConvertTableToMemory(name string) error {
+	return fmt.Errorf("single-table server: cannot convert tables")
 }
 func (s singleCatalog) DropTable(name string) error {
 	return fmt.Errorf("single-table server: cannot drop tables")
@@ -155,6 +166,7 @@ type QueryLog struct {
 func (o op) isMutating() bool {
 	switch o {
 	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
+		opCreateTableMem, opTableToMemory,
 		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere, opCommitIdem:
 		return true
 	}
@@ -525,6 +537,31 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			return respBad(reqID)
 		}
 		if _, err := s.cat.CreateTable(name); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opCreateTableMem:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		if _, err := s.cat.CreateTableInMemory(name); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opTableToMemory:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		// Converting a table's durability is a DAEMON-level administrative action, like the
+		// admin() maintenance ops -- refused to an ordinary writer.
+		if !privileged {
+			return respErr(reqID, "ConvertTableToMemory requires DAEMON authorization")
+		}
+		if err := s.cat.ConvertTableToMemory(name); err != nil {
 			return respErr(reqID, err.Error())
 		}
 		return resp(reqID, stOK)
