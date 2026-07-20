@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/db"
 )
@@ -374,6 +375,17 @@ func (c *Client) QueryLimit(ctx context.Context, constraint string, limit int) (
 func (c *Client) QueryTable(ctx context.Context, table, constraint string, limit int) ([]string, error) {
 	return c.streamCtx(ctx, func(id uint64) []byte {
 		return putStr(putI32(putStr(req(id, opQuery), table), int32(limit)), constraint)
+	})
+}
+
+// QueryAsOfTable is QueryTable for a point-in-time ("AS OF") query: it returns the ads
+// in the named table matching constraint as they were at asOf. The server errors if
+// time travel is not enabled on the table or asOf is older than the retained window.
+func (c *Client) QueryAsOfTable(ctx context.Context, table, constraint string, limit int, asOf time.Time) ([]string, error) {
+	return c.streamCtx(ctx, func(id uint64) []byte {
+		b := putI32(putStr(req(id, opQueryAsOf), table), int32(limit))
+		b = putU64(b, uint64(asOf.UnixNano()))
+		return putStr(b, constraint)
 	})
 }
 

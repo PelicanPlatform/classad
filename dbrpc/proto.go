@@ -94,6 +94,10 @@ const (
 	opCreateView op = 40 // [name][json db.ViewSpec] -> status; mutating
 	opDropView   op = 41 // [name] -> status; mutating
 	opListViews  op = 42 // -> [n i32]{[name]}
+
+	// Point-in-time query: like opQuery but with a wall-clock instant; the server
+	// resolves it to the per-shard commit sequence current then (time travel).
+	opQueryAsOf op = 43 // [table][limit i32][asOfUnixNanos u64][constraint] -> stream of [adText]
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -119,6 +123,8 @@ func (o op) String() string {
 		return "LookupAttr"
 	case opQuery:
 		return "Query"
+	case opQueryAsOf:
+		return "QueryAsOf"
 	case opMatchSorted:
 		return "MatchSorted"
 	case opWatch:

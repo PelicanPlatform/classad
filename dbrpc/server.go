@@ -383,6 +383,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 	switch o {
 	case opQuery:
 		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+	case opQueryAsOf:
+		sc.s.streamQueryAsOf(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
 	case opQueryRaw:
 		sc.s.streamQueryRaw(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
 	case opQueryRawProj:
@@ -511,6 +513,48 @@ func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, inclu
 	for ad := range seq {
 		if cancelled(ctx) {
 			return // client gone: stop the scan
+		}
+		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
+		n++
+		if limit > 0 && n >= limit {
+			break
+		}
+	}
+	write(respHead(reqID, stStreamEnd))
+}
+
+// streamQueryAsOf is streamQuery for a point-in-time ("AS OF") query: it reads a
+// wall-clock instant (unix nanos) and streams the ads that matched the constraint as
+// they were then. It errors cleanly if time travel is disabled or the instant is
+// outside the retained window.
+func (s *Server) streamQueryAsOf(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
+	table := r.str()
+	limit := int(r.i32())
+	asOf := time.Unix(0, int64(r.u64()))
+	constraint := r.str()
+	n := 0
+	if qlog != nil {
+		defer func() {
+			qlog(QueryLog{Op: "QueryAsOf", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+		}()
+	}
+	if r.err != nil {
+		write(respBad(reqID))
+		return
+	}
+	d, ok := s.tableOr(reqID, table, write)
+	if !ok {
+		return
+	}
+	seq, err := d.QueryAsOf(constraint, asOf)
+	if err != nil {
+		write(respErr(reqID, err.Error()))
+		return
+	}
+	for ad := range seq {
+		if cancelled(ctx) {
+			return
 		}
 		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
 		n++
