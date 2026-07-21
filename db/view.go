@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -35,10 +36,15 @@ const (
 )
 
 // ViewGroupCol is one GROUP BY column: the base-table attribute and the alias it is stored
-// under in the materialized rows (e.g. attr "Owner", alias "label_owner").
+// under in the materialized rows (e.g. attr "Owner", alias "label_owner"). When BucketWidth
+// > 0, the column is time-bucketed: the (numeric, unix-seconds) attribute is floored to
+// epoch-aligned buckets of that width, turning the view into a time series -- each interval
+// is a distinct, permanent group rather than an overwritten gauge. This is the same shape as
+// dbrpc.GroupCol.
 type ViewGroupCol struct {
-	Attr  string `json:"attr"`
-	Alias string `json:"alias"`
+	Attr        string `json:"attr"`
+	Alias       string `json:"alias"`
+	BucketWidth int64  `json:"bucketWidth,omitempty"` // seconds; 0 = raw value
 }
 
 // ViewMetric is one aggregate output: the function, its argument attribute ("*" for
@@ -68,6 +74,11 @@ func (s ViewSpec) Validate() error {
 	}
 	if len(s.Groups) == 0 {
 		return fmt.Errorf("view: at least one GROUP BY column is required")
+	}
+	for _, g := range s.Groups {
+		if g.BucketWidth < 0 {
+			return fmt.Errorf("view: time_bucket width must be positive, got %d", g.BucketWidth)
+		}
 	}
 	if len(s.Metrics) == 0 {
 		return fmt.Errorf("view: at least one aggregate metric is required")
@@ -125,14 +136,23 @@ type metricInput struct {
 }
 
 // contribution is what one base-table key contributes to the view, remembered so the OLD
-// contribution can be subtracted on update/delete (the stream carries no before-image).
+// contribution can be subtracted on update/delete (the stream carries no before-image). A
+// contribution with valid == false belongs to no group (a time-bucketed column's attribute
+// was non-numeric); such an ad is dropped from the view entirely.
 type contribution struct {
+	valid    bool
 	groupKey string
 	labels   []string
 	inputs   []metricInput
 }
 
 func (c contribution) equal(o contribution) bool {
+	if c.valid != o.valid {
+		return false
+	}
+	if !c.valid {
+		return true
+	}
 	if c.groupKey != o.groupKey || len(c.inputs) != len(o.inputs) {
 		return false
 	}
@@ -213,6 +233,16 @@ func (v *View) SeriesCount() int {
 func (v *View) contributionOf(ad *classad.ClassAd) contribution {
 	labels := make([]string, len(v.spec.Groups))
 	for i, g := range v.spec.Groups {
+		if g.BucketWidth > 0 {
+			num, ok := ad.EvaluateAttrNumber(g.Attr)
+			if !ok {
+				// Non-numeric bucket attribute: this ad has no time bucket, so it
+				// contributes to no group (dropped from the series).
+				return contribution{valid: false}
+			}
+			labels[i] = bucketLabel(num, g.BucketWidth)
+			continue
+		}
 		labels[i] = renderLabel(ad.EvaluateAttr(g.Attr))
 	}
 	inputs := make([]metricInput, len(v.spec.Metrics))
@@ -233,7 +263,13 @@ func (v *View) contributionOf(ad *classad.ClassAd) contribution {
 		num, ok := ad.EvaluateAttrNumber(m.Arg)
 		inputs[i] = metricInput{defined: ok, val: num}
 	}
-	return contribution{groupKey: strings.Join(labels, "\x00"), labels: labels, inputs: inputs}
+	return contribution{valid: true, groupKey: strings.Join(labels, "\x00"), labels: labels, inputs: inputs}
+}
+
+// bucketLabel floors unix-epoch seconds to an epoch-aligned bucket of the given width
+// (seconds) and renders it as the bucket start in decimal seconds.
+func bucketLabel(sec float64, width int64) string {
+	return strconv.FormatInt(int64(math.Floor(sec/float64(width)))*width, 10)
 }
 
 // add folds a key's contribution into its group (+1 member, +metrics). Creates the group if
@@ -287,20 +323,26 @@ func (v *View) applyUpsert(key string, ad *classad.ClassAd) error {
 	}
 	if existed {
 		v.sub(old)
+		delete(v.contrib, key)
 	}
-	if err := v.add(newC); err != nil {
-		// Roll back the subtraction so the accumulators stay consistent, then fail.
-		if existed {
-			_ = v.add(old)
+	if newC.valid {
+		if err := v.add(newC); err != nil {
+			// Roll back the subtraction so the accumulators stay consistent, then fail.
+			if existed {
+				_ = v.add(old)
+				v.contrib[key] = old
+			}
+			return err
 		}
-		return err
+		v.contrib[key] = newC
 	}
-	v.contrib[key] = newC
 	// Re-render the affected groups.
 	if existed && old.groupKey != newC.groupKey {
 		v.renderGroup(old.groupKey)
 	}
-	v.renderGroup(newC.groupKey)
+	if newC.valid {
+		v.renderGroup(newC.groupKey)
+	}
 	return nil
 }
 
@@ -325,6 +367,14 @@ func (v *View) renderGroup(groupKey string) {
 	}
 	ad := classad.New()
 	for i, gc := range v.spec.Groups {
+		// A time-bucketed column is stored as a number (the unix-seconds bucket start)
+		// so downstream time-axis and archive zone-map handling see a number, not text.
+		if gc.BucketWidth > 0 {
+			if n, err := strconv.ParseInt(g.labels[i], 10, 64); err == nil {
+				ad.InsertAttr(gc.Alias, n)
+				continue
+			}
+		}
 		ad.InsertAttrString(gc.Alias, g.labels[i])
 	}
 	for i, m := range v.spec.Metrics {
