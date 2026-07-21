@@ -29,14 +29,23 @@ type Catalog struct {
 	tables   map[string]*DB
 	archives map[string]*ArchiveTable
 	views    map[string]*View
+
+	// exporters are external-sink definitions (e.g. a Kafka change-data exporter). The
+	// catalog only persists each one's opaque per-kind config and an opaque resume-state
+	// blob; it never runs an exporter or interprets its config/state. See db/exporter.go.
+	exporters map[string]ExporterDef
+	// memExporterState holds exporter resume-state blobs for an in-memory catalog
+	// (dir == ""), where there is no disk to persist to. Unused when dir is set.
+	memExporterState map[string][]byte
 }
 
 // tablesSubdir / archivesSubdir are where a persistent catalog keeps its per-table
 // directories, split by table type.
 const (
-	tablesSubdir   = "tables"
-	archivesSubdir = "archives"
-	viewsSubdir    = "views"
+	tablesSubdir    = "tables"
+	archivesSubdir  = "archives"
+	viewsSubdir     = "views"
+	exportersSubdir = "exporters"
 )
 
 // CatalogConfig configures a catalog, including encryption at rest applied to every
@@ -62,8 +71,10 @@ func OpenCatalog(dir string) (*Catalog, error) {
 func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	cat := &Catalog{
 		dir: cfg.Dir, tables: map[string]*DB{}, archives: map[string]*ArchiveTable{},
-		views:    map[string]*View{},
-		poolKeys: cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs,
+		views:            map[string]*View{},
+		exporters:        map[string]ExporterDef{},
+		memExporterState: map[string][]byte{},
+		poolKeys:         cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs,
 	}
 	if cfg.Dir == "" {
 		return cat, nil
@@ -115,6 +126,13 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	// cardinality) or whose base table is absent does NOT fail catalog open -- it loads in
 	// the failed/stale state and can be fixed by the operator.
 	if err := cat.recoverViews(); err != nil {
+		cat.closeAll()
+		return nil, err
+	}
+	// Recover external-sink exporter definitions from <dir>/exporters/. These are inert
+	// records: the catalog holds each definition (and, on disk, its opaque resume state)
+	// but never runs the exporter. A corrupt definition is skipped, not fatal.
+	if err := cat.recoverExporters(); err != nil {
 		cat.closeAll()
 		return nil, err
 	}
@@ -378,6 +396,11 @@ func (cat *Catalog) closeAll() error {
 	for name, v := range cat.views {
 		v.stop() // cancels the live updater and closes the in-memory backing
 		delete(cat.views, name)
+	}
+	// Exporter definitions hold no runtime resources (the catalog never runs them), so
+	// closing just drops the in-memory registry.
+	for name := range cat.exporters {
+		delete(cat.exporters, name)
 	}
 	return first
 }
