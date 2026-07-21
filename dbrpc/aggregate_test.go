@@ -135,3 +135,67 @@ func TestAggregatePrivateRefused(t *testing.T) {
 		t.Fatal("grouping by a private attribute on a stripped connection should be refused")
 	}
 }
+
+func TestAggregateBucketed(t *testing.T) {
+	c, cleanup := testPair(t)
+	defer cleanup()
+
+	tx, _ := c.Begin(context.Background())
+	// QDate (unix seconds) + Cpus; 1h buckets align at 3600 boundaries.
+	_ = tx.NewClassAd(context.Background(), "1", "QDate = 3600\nCpus = 1")
+	_ = tx.NewClassAd(context.Background(), "2", "QDate = 3700\nCpus = 2") // same bucket as 1
+	_ = tx.NewClassAd(context.Background(), "3", "QDate = 7200\nCpus = 4")
+	_ = tx.NewClassAd(context.Background(), "4", "QDate = 7300\nCpus = 8") // same bucket as 3
+	_ = tx.NewClassAd(context.Background(), "5", "Cpus = 5")               // no QDate: drops out
+	_ = tx.NewClassAd(context.Background(), "6", "QDate = \"soon\"\nCpus = 9")
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, err := c.AggregateBucketed(context.Background(), "true",
+		[]GroupCol{{Attr: "QDate", BucketWidth: 3600}},
+		[]AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggSum, Arg: "Cpus"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Group[0] < rows[j].Group[0] })
+	if len(rows) != 2 {
+		t.Fatalf("got %d buckets, want 2: %+v", len(rows), rows)
+	}
+	// bucket 3600: count 2, sum 3 ; bucket 7200: count 2, sum 12
+	if rows[0].Group[0] != "3600" || rows[0].Values[0] != "2" || rows[0].Values[1] != "3" {
+		t.Errorf("bucket 3600 = %+v", rows[0])
+	}
+	if rows[1].Group[0] != "7200" || rows[1].Values[0] != "2" || rows[1].Values[1] != "12" {
+		t.Errorf("bucket 7200 = %+v", rows[1])
+	}
+}
+
+func TestAggregateBucketedWithLabel(t *testing.T) {
+	c, cleanup := testPair(t)
+	defer cleanup()
+
+	tx, _ := c.Begin(context.Background())
+	_ = tx.NewClassAd(context.Background(), "1", "QDate = 3600\nOwner = \"alice\"")
+	_ = tx.NewClassAd(context.Background(), "2", "QDate = 3700\nOwner = \"alice\"")
+	_ = tx.NewClassAd(context.Background(), "3", "QDate = 3800\nOwner = \"bob\"")
+	_ = tx.NewClassAd(context.Background(), "4", "QDate = 7200\nOwner = \"alice\"")
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	// Bucket the time AND group by a raw label column.
+	rows, err := c.AggregateBucketed(context.Background(), "true",
+		[]GroupCol{{Attr: "QDate", BucketWidth: 3600}, {Attr: "Owner"}},
+		[]AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]string{}
+	for _, r := range rows {
+		got[r.Group[0]+"/"+r.Group[1]] = r.Values[0]
+	}
+	// bucket 3600: alice=2, bob=1 ; bucket 7200: alice=1
+	if got["3600/alice"] != "2" || got["3600/bob"] != "1" || got["7200/alice"] != "1" {
+		t.Fatalf("bucketed+label counts = %v", got)
+	}
+}
