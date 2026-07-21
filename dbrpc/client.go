@@ -373,6 +373,49 @@ func (c *Client) streamCtx(ctx context.Context, build func(id uint64) []byte) ([
 	}
 }
 
+// streamEach runs a streaming request and hands each result row's text to yield as it
+// arrives, instead of collecting them all into a slice first (streamCtx). It lets a
+// caller relay a large result set without materializing it -- the row it just received
+// can be forwarded before the next arrives. yield returns false to stop early.
+//
+// The error contract differs from streamCtx by necessity: an error (a server stErr, or a
+// transport failure) can arrive AFTER rows have already been yielded, since we no longer
+// buffer the whole result before returning. A caller that must not emit a partial result
+// should therefore not commit to its output until streamEach returns nil, or must treat a
+// non-nil error after the first yield as a partial-result failure. The one guarantee is
+// that a failure before the first row is reported before any yield -- so "surface an
+// outage instead of a silently empty result" still holds for the empty case.
+func (c *Client) streamEach(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool) error {
+	_, ch, err := c.callStream(build)
+	if err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			drain(ch)
+			return ctx.Err()
+		case frame, ok := <-ch:
+			if !ok {
+				return nil // stStreamEnd: the read loop closed the channel
+			}
+			_, status, body, ok := respHeader(frame)
+			if !ok {
+				return errShort
+			}
+			switch status {
+			case stStream:
+				if !yield(body.str()) {
+					drain(ch) // consumer stopped early; let the server-side stream finish
+					return nil
+				}
+			case stErr:
+				return statusErr(status, body)
+			}
+		}
+	}
+}
+
 // Query returns the committed ads (old-ClassAd texts) in the default table ("ads")
 // matching a constraint. The server streams results; a slow scan does not block
 // other calls.
@@ -392,6 +435,15 @@ func (c *Client) QueryTable(ctx context.Context, table, constraint string, limit
 	return c.streamCtx(ctx, func(id uint64) []byte {
 		return putStr(putI32(putStr(req(id, opQuery), table), int32(limit)), constraint)
 	})
+}
+
+// QueryTableStream is QueryTable that hands each matching ad's text to yield as it
+// arrives instead of collecting the whole result first (see streamEach). yield returns
+// false to stop early.
+func (c *Client) QueryTableStream(ctx context.Context, table, constraint string, limit int, yield func(row string) bool) error {
+	return c.streamEach(ctx, func(id uint64) []byte {
+		return putStr(putI32(putStr(req(id, opQuery), table), int32(limit)), constraint)
+	}, yield)
 }
 
 // QueryAsOfTable is QueryTable for a point-in-time ("AS OF") query: it returns the ads
