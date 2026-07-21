@@ -5,11 +5,17 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"time"
 
 	"github.com/PelicanPlatform/classad/collections"
 )
+
+// viewArchiveSegmentSize overrides the sealed-segment size of a continuous aggregate's
+// archive; 0 uses the archive default (8 MiB). Tests set it small to exercise segment
+// rotation with little data.
+var viewArchiveSegmentSize int
 
 // Continuous aggregates: a materialized view whose GROUP BY includes a time_bucket. Recent
 // buckets live in the in-memory backing (updated in place, so late data lands correctly);
@@ -42,7 +48,7 @@ func (v *View) initContinuous(stateDir string) error {
 	v.stateDir = stateDir
 
 	timeAlias := v.spec.Groups[v.bucketIdx].Alias
-	cfg := ArchiveConfig{ZoneAttrs: []string{timeAlias}}
+	cfg := ArchiveConfig{ZoneAttrs: []string{timeAlias}, SegmentSize: viewArchiveSegmentSize}
 	if v.spec.Retention > 0 {
 		cfg.Retention = collections.Retention{MaxAgeAttr: timeAlias, MaxAge: float64(v.spec.Retention)}
 	}
@@ -63,19 +69,32 @@ func (v *View) sealAged(now int64) {
 		return
 	}
 	sealAtOrBelow := now - v.bucketWidth - v.grace // seal buckets whose start <= this
-	advanced := false
+	// Collect the aged buckets and seal them in bucket-start order, so the archive stays
+	// time-ordered: each segment then carries a contiguous time range, which keeps zone-map
+	// pruning and age-based retention (drop a segment whose max time is old) precise.
+	type agedBucket struct {
+		key   string
+		start int64
+	}
+	var toSeal []agedBucket
 	for gk, g := range v.groups {
 		start, err := strconv.ParseInt(g.labels[v.bucketIdx], 10, 64)
 		if err != nil || start > sealAtOrBelow {
 			continue // unparsable, or the bucket window is still open
 		}
-		if err := v.archive.Append(v.renderGroupAd(g)); err != nil {
+		toSeal = append(toSeal, agedBucket{gk, start})
+	}
+	sort.Slice(toSeal, func(i, j int) bool { return toSeal[i].start < toSeal[j].start })
+
+	advanced := false
+	for _, a := range toSeal {
+		if err := v.archive.Append(v.renderGroupAd(v.groups[a.key])); err != nil {
 			continue // keep the bucket live and retry on the next tick
 		}
-		delete(v.groups, gk)
-		_, _ = v.backing.Delete(gk)
-		if start > v.watermark {
-			v.watermark = start
+		delete(v.groups, a.key)
+		_, _ = v.backing.Delete(a.key)
+		if a.start > v.watermark {
+			v.watermark = a.start
 			advanced = true
 		}
 	}

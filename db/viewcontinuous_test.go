@@ -148,3 +148,75 @@ func TestContinuousAggregateReloadNoDuplicate(t *testing.T) {
 		t.Fatalf("archive after reload = %d, want 2 (no duplicate append)", got)
 	}
 }
+
+// TestContinuousAggregateRetentionRotation checks that sealed history is age-rotated: with
+// a retention window, sealing buckets across a wide time span drops the oldest sealed
+// segments while keeping the recent ones. Tiny segments make a few buckets roll a segment;
+// the time-ordered seal keeps segments prunable by age.
+func TestContinuousAggregateRetentionRotation(t *testing.T) {
+	old := viewArchiveSegmentSize
+	viewArchiveSegmentSize = 512 // small segments so a handful of sealed buckets roll one
+	defer func() { viewArchiveSegmentSize = old }()
+
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	base, _ := cat.CreateTable("jobs")
+
+	const (
+		width = 3600
+		K     = 60
+		base0 = 300 * width // 1,080,000, bucket-aligned
+	)
+	for i := 0; i < K; i++ {
+		base.Put(fmt.Sprintf("j%d", i), jobTS(t, int64(base0+i*width)))
+	}
+	spec := ViewSpec{
+		BaseTable:   "jobs",
+		Groups:      []ViewGroupCol{{Attr: "QDate", Alias: "time", BucketWidth: width}},
+		Metrics:     []ViewMetric{{Func: ViewCount, Arg: "*", Alias: "metric_jobs"}},
+		Cardinality: 1000,
+		Retention:   100000, // keep ~100k seconds of sealed history
+	}
+	if err := cat.CreateView("jobs_ts", spec); err != nil {
+		t.Fatal(err)
+	}
+	waitSeries(t, cat, "jobs_ts", K)
+	v, _ := cat.View("jobs_ts")
+
+	oldest := int64(base0)               // 1,080,000
+	newest := int64(base0 + (K-1)*width) // 1,292,400
+	// now past the newest bucket's window; retention threshold = now-100000 = 1,196,000,
+	// so segments whose max time is older than that are dropped.
+	seal(v, newest+width+100000)
+
+	times := map[int64]int{}
+	var min, max int64 = 1 << 62, -1
+	for _, ad := range archiveAds(t, v) {
+		ts, _ := ad.EvaluateAttrInt("time")
+		times[ts]++
+		if ts < min {
+			min = ts
+		}
+		if ts > max {
+			max = ts
+		}
+	}
+	if len(times) >= K {
+		t.Fatalf("retention kept %d buckets, expected rotation to drop some (< %d)", len(times), K)
+	}
+	if times[oldest] != 0 {
+		t.Errorf("oldest bucket %d should have been rotated out", oldest)
+	}
+	if times[newest] != 1 {
+		t.Errorf("newest bucket %d should be retained (in the active segment)", newest)
+	}
+	if min <= oldest {
+		t.Errorf("min retained time = %d, want > oldest %d (old segment dropped)", min, oldest)
+	}
+	if max != newest {
+		t.Errorf("max retained time = %d, want newest %d", max, newest)
+	}
+}
