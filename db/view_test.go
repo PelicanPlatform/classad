@@ -244,3 +244,99 @@ func TestViewSpecValidate(t *testing.T) {
 		}
 	}
 }
+
+// viewJobTS is a base job ad with an Owner, RequestMemory, and a unix-epoch QDate.
+func viewJobTS(t *testing.T, owner string, mem int, qdate int64) *classad.ClassAd {
+	t.Helper()
+	ad, err := classad.ParseOld(fmt.Sprintf("Owner = %q\nRequestMemory = %d\nQDate = %d", owner, mem, qdate))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ad
+}
+
+// timeBucketSpec groups by time_bucket(QDate, 1h) AND Owner: a continuous-aggregate-shaped
+// view (each (bucket, owner) is its own series).
+func timeBucketSpec() ViewSpec {
+	return ViewSpec{
+		BaseTable: "jobs",
+		Groups: []ViewGroupCol{
+			{Attr: "QDate", Alias: "time", BucketWidth: 3600},
+			{Attr: "Owner", Alias: "label_owner"},
+		},
+		Metrics: []ViewMetric{
+			{Func: ViewCount, Arg: "*", Alias: "metric_jobs"},
+			{Func: ViewSum, Arg: "RequestMemory", Alias: "metric_mem"},
+		},
+		Cardinality: 100,
+	}
+}
+
+func TestViewTimeBucket(t *testing.T) {
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	base, err := cat.CreateTable("jobs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 1h buckets align at 3600. bucket 3600: alice x2 (100,300), bob x1 (200);
+	// bucket 7200: alice x1 (50). The no-QDate ad drops out of the series.
+	base.Put("1", viewJobTS(t, "alice", 100, 3600))
+	base.Put("2", viewJobTS(t, "alice", 300, 3700))
+	base.Put("3", viewJobTS(t, "bob", 200, 3800))
+	base.Put("4", viewJobTS(t, "alice", 50, 7200))
+	base.Put("5", viewJob(t, "carol", 10)) // no QDate -> dropped
+
+	if err := cat.CreateView("jobs_ts", timeBucketSpec()); err != nil {
+		t.Fatalf("CreateView: %v", err)
+	}
+	v, _ := cat.View("jobs_ts")
+	if got := v.SeriesCount(); got != 3 {
+		t.Fatalf("series = %d, want 3", got)
+	}
+
+	// (bucket 3600, alice): 2 jobs, mem 400, and time stored as a NUMBER = 3600.
+	g, ok := viewGroup(t, cat, "jobs_ts", "3600\x00alice")
+	if !ok {
+		t.Fatal("missing (3600, alice) group")
+	}
+	if ts, ok := g.EvaluateAttrInt("time"); !ok || ts != 3600 {
+		t.Errorf("time = %d (ok=%v), want numeric 3600", ts, ok)
+	}
+	if n, _ := g.EvaluateAttrInt("metric_jobs"); n != 2 {
+		t.Errorf("(3600,alice) jobs = %d, want 2", n)
+	}
+	if m, _ := g.EvaluateAttrReal("metric_mem"); m != 400 {
+		t.Errorf("(3600,alice) mem = %v, want 400", m)
+	}
+	if o, _ := g.EvaluateAttrString("label_owner"); o != "alice" {
+		t.Errorf("label_owner = %q", o)
+	}
+
+	// Live: a new alice job in bucket 7200 -> that series' count 1 -> 2. (The series
+	// count stays 3 -- same group -- so poll the group's metric, not the series count.)
+	base.Put("6", viewJobTS(t, "alice", 70, 7300))
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		g2, ok := viewGroup(t, cat, "jobs_ts", "7200\x00alice")
+		if ok {
+			if n, _ := g2.EvaluateAttrInt("metric_jobs"); n == 2 {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("(7200,alice) jobs did not reach 2 after live add")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Dropping a bucket attribute removes the ad from its series: give job "3" no QDate.
+	base.Put("3", viewJob(t, "bob", 200))
+	waitSeries(t, cat, "jobs_ts", 2) // (3600,bob) disappears
+	if _, ok := viewGroup(t, cat, "jobs_ts", "3600\x00bob"); ok {
+		t.Error("(3600,bob) should be gone after QDate removed")
+	}
+}
