@@ -41,6 +41,30 @@ func (c *Client) QueryRawProject(ctx context.Context, table, constraint string, 
 	})
 }
 
+// QueryRawTableStream is QueryRawTable that hands each matching ad's old-ClassAd wire
+// text to yield as it arrives, instead of collecting the whole result into a slice --
+// so a relay (e.g. the collector) can forward each ad to its own client without
+// buffering the entire result set. yield returns false to stop early. See streamEach for
+// the error contract (a failure can arrive after some rows have been yielded).
+func (c *Client) QueryRawTableStream(ctx context.Context, table, constraint string, limit int, yield func(row string) bool) error {
+	return c.streamEach(ctx, func(id uint64) []byte {
+		return putStr(putI32(putStr(req(id, opQueryRaw), table), int32(limit)), constraint)
+	}, yield)
+}
+
+// QueryRawProjectStream is QueryRawProject (server-side projection) with the streaming
+// delivery of QueryRawTableStream.
+func (c *Client) QueryRawProjectStream(ctx context.Context, table, constraint string, attrs []string, limit int, yield func(row string) bool) error {
+	return c.streamEach(ctx, func(id uint64) []byte {
+		b := putStr(putI32(putStr(req(id, opQueryRawProj), table), int32(limit)), constraint)
+		b = putI32(b, int32(len(attrs)))
+		for _, a := range attrs {
+			b = putStr(b, a)
+		}
+		return b
+	}, yield)
+}
+
 // streamQueryRaw streams matching ads as old-ClassAd wire text, rendered from the
 // db QueryRaw pushdown (no AST decode), one frame per ad like streamQuery.
 func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
