@@ -18,6 +18,16 @@ type Client struct {
 	conn    MsgConn
 	nextReq atomic.Uint64
 
+	// writeMu serializes conn.WriteMsg so concurrent callers (independent Tx / queries
+	// multiplexed over the one connection) never interleave frame bytes on the wire.
+	// The underlying CEDAR stream is a single-writer object -- it reuses one frame
+	// buffer and advances one AES-GCM nonce per message -- so two goroutines writing at
+	// once corrupt the encrypted stream and the peer drops it on an authentication
+	// failure. Distinct from mu: the read loop takes mu to deliver responses, so holding
+	// mu across a blocking network write would stall demux (and could deadlock). The
+	// server side serializes its writes the same way (serverConn.write).
+	writeMu sync.Mutex
+
 	mu       sync.Mutex
 	pending  map[uint64]*pending
 	closeErr error
@@ -151,7 +161,13 @@ func (c *Client) sendID(id uint64, build func(reqID uint64) []byte, stream bool)
 	}
 	c.pending[id] = &pending{ch: ch, stream: stream}
 	c.mu.Unlock()
-	if err := c.conn.WriteMsg(build(id)); err != nil {
+	// Serialize the actual send: the CEDAR stream is single-writer (shared frame buffer
+	// + AES-GCM nonce), so concurrent multiplexed calls must not interleave WriteMsg.
+	frame := build(id)
+	c.writeMu.Lock()
+	err := c.conn.WriteMsg(frame)
+	c.writeMu.Unlock()
+	if err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
