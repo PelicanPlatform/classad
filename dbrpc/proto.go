@@ -114,6 +114,16 @@ const (
 	// attribute is not numeric. Lets the server bucket a time series so only the grouped
 	// rows cross the wire.
 	opAggregateBucketed op = 45 // [table][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg]} -> stream of [group...][agg...]
+
+	// External-sink exporter registry (see db/exporter.go). Create/Drop/Get and the state
+	// ops are DAEMON-only (config/state may hold broker credentials); List returns only
+	// name+kind so it is safe for unprivileged visibility.
+	opCreateExporter   op = 46 // [json db.ExporterDef] -> status; DAEMON-only; mutating
+	opDropExporter     op = 47 // [name] -> status; DAEMON-only; mutating
+	opListExporters    op = 48 // -> [n i32]{[name][kind]}
+	opGetExporter      op = 49 // [name] -> [found u8]([json db.ExporterDef]); DAEMON-only
+	opPutExporterState op = 50 // [name][blob] -> status; DAEMON-only; mutating
+	opGetExporterState op = 51 // [name] -> [found u8]([blob]); DAEMON-only
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -177,6 +187,18 @@ func (o op) String() string {
 		return "DropView"
 	case opListViews:
 		return "ListViews"
+	case opCreateExporter:
+		return "CreateExporter"
+	case opDropExporter:
+		return "DropExporter"
+	case opListExporters:
+		return "ListExporters"
+	case opGetExporter:
+		return "GetExporter"
+	case opPutExporterState:
+		return "PutExporterState"
+	case opGetExporterState:
+		return "GetExporterState"
 	case opDropTable:
 		return "DropTable"
 	case opListTables:
