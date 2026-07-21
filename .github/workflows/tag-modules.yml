@@ -1,0 +1,92 @@
+# Mirror a release tag onto the per-module tags.
+#
+# This is a multi-module repo: consumers pin github.com/PelicanPlatform/classad
+# (root), .../collections, .../db and .../dbrpc, and every module must be tagged at the
+# SAME commit or a consumer ends up with an inconsistent set. Creating those tags by
+# hand is error-prone -- a busy human can tag one module off the wrong commit (a feature
+# branch tip instead of the merged main), which is exactly how dbrpc/v0.12.1 shipped
+# without a fix that was already on main.
+#
+# So: publish a GitHub release as usual (which creates the root vX.Y.Z tag), and this
+# workflow mirrors that one commit to collections/vX.Y.Z, db/vX.Y.Z and dbrpc/vX.Y.Z.
+# The human picks exactly one commit; the module tags are derived from it, never
+# hand-entered.
+
+name: Tag submodules on release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # push the module tags
+
+jobs:
+  tag-submodules:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the released commit
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0 # full history, so the default-branch ancestor check works
+
+      - name: Mirror the release tag to each module
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          # Only mirror semantic-version tags (v1.2.3, v1.2.3-rc1). A non-version tag
+          # (a doc snapshot, a one-off) is left alone.
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-.+)?$ ]]; then
+            echo "release tag '$TAG' is not vMAJOR.MINOR.PATCH; not mirroring to modules"
+            exit 0
+          fi
+
+          sha="$(git rev-parse HEAD)"
+          echo "release $TAG is at $sha"
+
+          # Refuse to tag modules off a commit that isn't on the default branch -- e.g. a
+          # release accidentally cut from a topic branch. (The GitHub UI defaults a
+          # release's target to the default branch, so this only trips on a deliberate
+          # off-branch target.)
+          git fetch --quiet origin "$DEFAULT_BRANCH"
+          if ! git merge-base --is-ancestor "$sha" FETCH_HEAD; then
+            echo "::error::release commit $sha is not on '$DEFAULT_BRANCH'; refusing to tag modules"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          failed=0
+          for mod in collections db dbrpc; do
+            mtag="$mod/$TAG"
+
+            # Never move an existing tag. If it is already published, leave it untouched
+            # (git push would reject a move anyway); flag a mismatch so a bad prior tag is
+            # visible rather than silently tolerated.
+            if git ls-remote --exit-code --tags origin "refs/tags/$mtag" >/dev/null 2>&1; then
+              existing="$(git ls-remote --tags origin "refs/tags/$mtag^{}" | awk 'NR==1{print $1}')"
+              [[ -z "$existing" ]] && existing="$(git ls-remote --tags origin "refs/tags/$mtag" | awk 'NR==1{print $1}')"
+              if [[ "$existing" == "$sha" ]]; then
+                echo "$mtag already at $sha; nothing to do"
+              else
+                echo "::error::$mtag already exists at $existing, not the release commit $sha (a tag was moved or hand-created wrong); not touching it"
+                failed=1
+              fi
+              continue
+            fi
+
+            git tag -a "$mtag" -m "$mod $TAG (mirrored from release $TAG)" "$sha"
+            git push origin "refs/tags/$mtag"
+            echo "created $mtag -> $sha"
+          done
+
+          if [[ "$failed" -ne 0 ]]; then
+            echo "::error::one or more module tags did not match the release commit; see above"
+            exit 1
+          fi
+          echo "All module tags mirror $TAG at $sha."
