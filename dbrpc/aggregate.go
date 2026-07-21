@@ -2,6 +2,9 @@ package dbrpc
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"math"
 	"strconv"
 	"strings"
 
@@ -93,9 +96,87 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 	}
 }
 
-// streamAggregate performs the server-side aggregation and streams one frame per
-// group. It refuses to group or aggregate on a private attribute for a
-// connection that may not see private data.
+// GroupCol is one GROUP BY column for a (possibly bucketed) aggregate: the
+// attribute Attr, optionally floored into fixed-width buckets. BucketWidth == 0
+// groups by the raw attribute value; BucketWidth > 0 (seconds) groups by the
+// epoch-aligned bucket floor(number(Attr)/BucketWidth)*BucketWidth, and a row whose
+// Attr is not a finite number drops out of the result. This is the shared shape a
+// bucketed aggregate (here) and a bucketed materialized view can both group by.
+type GroupCol struct {
+	Attr        string
+	BucketWidth int64
+}
+
+// ErrBucketedUnsupported is returned by AggregateBucketed against a server too old
+// to implement the opcode (it rejects the request), so a caller can fall back to
+// client-side bucketing.
+var ErrBucketedUnsupported = errors.New("dbrpc: server does not support bucketed aggregation")
+
+// AggregateBucketed is Aggregate with group columns that may be time-bucketed (see
+// GroupCol), pushing the bucketing to the server so only the grouped rows cross the
+// wire. Against a server that does not implement the opcode it returns an error that
+// wraps ErrBucketedUnsupported.
+func (c *Client) AggregateBucketed(ctx context.Context, constraint string, groups []GroupCol, aggs []AggSpec) ([]AggRow, error) {
+	return c.AggregateBucketedTable(ctx, DefaultTable, constraint, groups, aggs)
+}
+
+// AggregateBucketedTable is AggregateBucketed on the named table.
+func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint string, groups []GroupCol, aggs []AggSpec) ([]AggRow, error) {
+	build := func(id uint64) []byte {
+		b := putStr(putStr(req(id, opAggregateBucketed), table), constraint)
+		b = putI32(b, int32(len(groups)))
+		for _, g := range groups {
+			b = putU64(putStr(b, g.Attr), uint64(g.BucketWidth))
+		}
+		b = putI32(b, int32(len(aggs)))
+		for _, a := range aggs {
+			b = putStr(putU8(b, byte(a.Func)), a.Arg)
+		}
+		return b
+	}
+	_, frames, err := c.callStream(build)
+	if err != nil {
+		return nil, err
+	}
+	var out []AggRow
+	for {
+		select {
+		case <-ctx.Done():
+			drain(frames)
+			return out, ctx.Err()
+		case frame, ok := <-frames:
+			if !ok {
+				return out, nil
+			}
+			_, status, body, ok := respHeader(frame)
+			if !ok {
+				return out, errShort
+			}
+			switch status {
+			case stStream:
+				row := AggRow{Group: make([]string, len(groups)), Values: make([]string, len(aggs))}
+				for i := range row.Group {
+					row.Group[i] = body.str()
+				}
+				for i := range row.Values {
+					row.Values[i] = body.str()
+				}
+				out = append(out, row)
+			case stErr:
+				return out, statusErr(status, body)
+			case stBadReq:
+				// A server too old to know opAggregateBucketed rejects it as a bad
+				// request; signal the caller to fall back to client-side bucketing.
+				return nil, ErrBucketedUnsupported
+			default:
+				return out, fmt.Errorf("dbrpc: unexpected aggregate status %d", status)
+			}
+		}
+	}
+}
+
+// streamAggregate performs a server-side GROUP BY (raw group columns) and streams
+// one frame per group.
 func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	table := r.str()
 	constraint := r.str()
@@ -104,14 +185,46 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 		write(respBad(reqID))
 		return
 	}
-	groupBy := make([]string, nGroup)
-	for i := range groupBy {
-		groupBy[i] = r.str()
+	groups := make([]GroupCol, nGroup)
+	for i := range groups {
+		groups[i] = GroupCol{Attr: r.str()}
 	}
+	aggs, ok := readAggSpecs(r, reqID, write)
+	if !ok {
+		return
+	}
+	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write)
+}
+
+// streamAggregateBucketed is streamAggregate where each group column may carry a
+// bucket width (opAggregateBucketed).
+func (s *Server) streamAggregateBucketed(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	table := r.str()
+	constraint := r.str()
+	nGroup := int(r.i32())
+	if nGroup < 0 || nGroup > 1024 {
+		write(respBad(reqID))
+		return
+	}
+	groups := make([]GroupCol, nGroup)
+	for i := range groups {
+		attr := r.str()
+		groups[i] = GroupCol{Attr: attr, BucketWidth: int64(r.u64())}
+	}
+	aggs, ok := readAggSpecs(r, reqID, write)
+	if !ok {
+		return
+	}
+	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write)
+}
+
+// readAggSpecs reads the [nAgg]{[func u8][arg]} tail shared by both aggregate
+// opcodes, writing respBad and returning ok=false on a malformed frame.
+func readAggSpecs(r *reader, reqID uint64, write func([]byte)) ([]AggSpec, bool) {
 	nAgg := int(r.i32())
 	if nAgg < 0 || nAgg > 1024 {
 		write(respBad(reqID))
-		return
+		return nil, false
 	}
 	aggs := make([]AggSpec, nAgg)
 	for i := range aggs {
@@ -119,13 +232,20 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 	}
 	if r.err != nil {
 		write(respBad(reqID))
-		return
+		return nil, false
 	}
+	return aggs, true
+}
 
+// aggregate is the shared GROUP BY core for both aggregate opcodes: it refuses
+// private attributes for an unprivileged connection, scans the projected columns,
+// buckets by the (possibly time-bucketed) group tuple, and streams one frame per
+// group.
+func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint string, groupCols []GroupCol, aggs []AggSpec, includePrivate bool, write func([]byte)) {
 	if !includePrivate {
-		for _, name := range groupBy {
-			if classad.IsPrivateAttribute(name) {
-				write(respErr(reqID, "cannot group by private attribute "+name))
+		for _, g := range groupCols {
+			if classad.IsPrivateAttribute(g.Attr) {
+				write(respErr(reqID, "cannot group by private attribute "+g.Attr))
 				return
 			}
 		}
@@ -141,7 +261,8 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 	// non-"*" aggregate arguments), so the scan reads them wire-native instead of
 	// fully decoding every matching ad. attrs is deduplicated; groupCol[i]/aggCol[i]
 	// index into the projected value slice.
-	attrs, groupCol, aggCol := projectionFor(groupBy, aggs)
+	nGroup := len(groupCols)
+	attrs, groupCol, aggCol := projectionFor(groupCols, aggs)
 	d, ok := s.tableOr(reqID, table, write)
 	if !ok {
 		return
@@ -162,13 +283,26 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 		if cancelled(ctx) {
 			return // client gone: stop the scan
 		}
-		for i := range groupBy {
-			scratch[i] = valueText(vals[groupCol[i]])
+		drop := false
+		for i, g := range groupCols {
+			if g.BucketWidth > 0 {
+				kt, ok := bucketKeyText(vals[groupCol[i]], g.BucketWidth)
+				if !ok {
+					drop = true // non-numeric bucket attribute: row leaves the series
+					break
+				}
+				scratch[i] = kt
+			} else {
+				scratch[i] = valueText(vals[groupCol[i]])
+			}
+		}
+		if drop {
+			continue
 		}
 		key := strings.Join(scratch, "\x00")
 		gs := groups[key]
 		if gs == nil {
-			gs = &groupState{gvals: append([]string(nil), scratch...), accs: make([]aggAcc, nAgg)}
+			gs = &groupState{gvals: append([]string(nil), scratch...), accs: make([]aggAcc, len(aggs))}
 			groups[key] = gs
 			order = append(order, key)
 		}
@@ -184,7 +318,7 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 	// A group-less aggregate over an empty match still yields one row (SQL
 	// semantics: COUNT is 0, others undefined).
 	if nGroup == 0 && len(order) == 0 {
-		gs := &groupState{accs: make([]aggAcc, nAgg)}
+		gs := &groupState{accs: make([]aggAcc, len(aggs))}
 		frame := respHead(reqID, stStream)
 		for i, a := range aggs {
 			frame = putStr(frame, gs.accs[i].result(a))
@@ -245,7 +379,7 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value) {
 // (group columns then non-"*" aggregate arguments) and the index of each group
 // column / aggregate argument within that list. An aggregate whose argument is
 // "*" (COUNT(*)) gets index -1.
-func projectionFor(groupBy []string, aggs []AggSpec) (attrs []string, groupCol, aggCol []int) {
+func projectionFor(groupCols []GroupCol, aggs []AggSpec) (attrs []string, groupCol, aggCol []int) {
 	idx := map[string]int{}
 	intern := func(name string) int {
 		if i, ok := idx[name]; ok {
@@ -256,9 +390,9 @@ func projectionFor(groupBy []string, aggs []AggSpec) (attrs []string, groupCol, 
 		attrs = append(attrs, name)
 		return i
 	}
-	groupCol = make([]int, len(groupBy))
-	for i, g := range groupBy {
-		groupCol[i] = intern(g)
+	groupCol = make([]int, len(groupCols))
+	for i, g := range groupCols {
+		groupCol[i] = intern(g.Attr)
 	}
 	aggCol = make([]int, len(aggs))
 	for i, a := range aggs {
@@ -292,6 +426,32 @@ func (a *aggAcc) result(spec AggSpec) string {
 }
 
 // --- small value helpers (server-side, string-rendering) ---
+
+// bucketKeyText floors a numeric value into an epoch-aligned bucket of the given
+// width (seconds) and returns its integer-seconds text. ok is false when v is not a
+// finite number (undefined/error/non-numeric string), so the row drops out of the
+// series -- matching the client-side time_bucket semantics.
+func bucketKeyText(v classad.Value, width int64) (string, bool) {
+	f, ok := numberOf(v)
+	if !ok {
+		return "", false
+	}
+	b := int64(math.Floor(f/float64(width))) * width
+	return strconv.FormatInt(b, 10), true
+}
+
+// numberOf returns the numeric value of v (integer or real) and whether it is one.
+func numberOf(v classad.Value) (float64, bool) {
+	switch {
+	case v.IsInteger():
+		i, _ := v.IntValue()
+		return float64(i), true
+	case v.IsReal():
+		r, _ := v.RealValue()
+		return r, true
+	}
+	return 0, false
+}
 
 func trimFloat(f float64) string { return strconv.FormatFloat(f, 'g', -1, 64) }
 

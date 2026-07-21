@@ -107,6 +107,13 @@ const (
 	// The whole frame must fit MaxMessageSize, so a caller chunks a large batch across
 	// several of these ops on the same transaction (pipelining the chunks).
 	opNewAdBatch op = 44 // [txnID][n i32]{[key][adText]} -> [nReject i32]{[index i32][errMsg]}
+
+	// Server-side GROUP BY where a group column may be time-bucketed: like opAggregate
+	// but each group column carries a bucket width (seconds; 0 = raw value). A column
+	// with width > 0 groups by floor(number(attr)/width)*width, dropping rows whose
+	// attribute is not numeric. Lets the server bucket a time series so only the grouped
+	// rows cross the wire.
+	opAggregateBucketed op = 45 // [table][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg]} -> stream of [group...][agg...]
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -148,6 +155,8 @@ func (o op) String() string {
 		return "Ordered"
 	case opAggregate:
 		return "Aggregate"
+	case opAggregateBucketed:
+		return "AggregateBucketed"
 	case opDiag:
 		return "Diagnostics"
 	case opExplain:
