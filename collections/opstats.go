@@ -25,21 +25,71 @@ import (
 // (maintenance, snapshot lock) are infrequent and live on the Collection. All are
 // plain atomics, read locklessly by OpStats().
 
-// opCounter is one instrumented operation: a call count and cumulative nanoseconds.
+// latencyBucketBoundsNanos are the inclusive upper bounds of the latency histogram,
+// log-scale from 100µs to 30s. observe() files each occurrence into the first bucket it
+// fits; anything larger than the last bound lands in a final overflow bucket (so there
+// are len+1 buckets). The mean (Nanos/Count) hides tail stalls -- a slow msync or a
+// long retrain shows up here as a count in the 1s/10s/30s buckets and in MaxNanos.
+var latencyBucketBoundsNanos = [...]int64{
+	100_000,        // 100µs
+	1_000_000,      // 1ms
+	10_000_000,     // 10ms
+	100_000_000,    // 100ms
+	1_000_000_000,  // 1s
+	5_000_000_000,  // 5s
+	10_000_000_000, // 10s
+	30_000_000_000, // 30s
+}
+
+// LatencyBucketBoundsNanos returns a copy of the histogram's inclusive upper bounds (in
+// nanoseconds). An OpStat's Buckets slice has one more entry than this: buckets[i] counts
+// observations <= bound[i], and the final entry counts observations above the last bound.
+func LatencyBucketBoundsNanos() []int64 {
+	return append([]int64(nil), latencyBucketBoundsNanos[:]...)
+}
+
+// bucketIndex maps a duration (nanos) to its histogram bucket.
+func bucketIndex(n int64) int {
+	for i, b := range latencyBucketBoundsNanos {
+		if n <= b {
+			return i
+		}
+	}
+	return len(latencyBucketBoundsNanos) // overflow bucket
+}
+
+// opCounter is one instrumented operation: a call count, cumulative nanoseconds, the
+// max single duration seen, and a latency histogram -- so a caller can see the tail, not
+// just the mean. All fields are plain atomics, read locklessly by snapshot().
 type opCounter struct {
-	count atomic.Int64
-	nanos atomic.Int64
+	count   atomic.Int64
+	nanos   atomic.Int64
+	max     atomic.Int64
+	buckets [len(latencyBucketBoundsNanos) + 1]atomic.Int64
 }
 
 // observe records one occurrence lasting d.
 func (o *opCounter) observe(d time.Duration) {
+	n := int64(d)
 	o.count.Add(1)
-	o.nanos.Add(int64(d))
+	o.nanos.Add(n)
+	for { // lockless max
+		cur := o.max.Load()
+		if n <= cur || o.max.CompareAndSwap(cur, n) {
+			break
+		}
+	}
+	o.buckets[bucketIndex(n)].Add(1)
 }
 
 // snapshot reads the counter locklessly.
 func (o *opCounter) snapshot() OpStat {
-	return OpStat{Count: o.count.Load(), Nanos: o.nanos.Load()}
+	s := OpStat{Count: o.count.Load(), Nanos: o.nanos.Load(), MaxNanos: o.max.Load()}
+	s.Buckets = make([]int64, len(o.buckets))
+	for i := range o.buckets {
+		s.Buckets[i] = o.buckets[i].Load()
+	}
+	return s
 }
 
 // shardMetrics are the per-shard operational counters, kept on each shard to avoid
@@ -67,6 +117,13 @@ type opMetrics struct {
 type OpStat struct {
 	Count int64 `json:"count"`
 	Nanos int64 `json:"nanos"`
+	// MaxNanos is the longest single occurrence seen, and Buckets is the latency
+	// histogram (see LatencyBucketBoundsNanos: buckets[i] counts occurrences <= bound[i],
+	// the last entry counts the overflow above the final bound). Both surface the tail
+	// the mean (Nanos/Count) hides. Omitted from JSON when empty so an older peer that
+	// never populated them stays byte-compatible.
+	MaxNanos int64   `json:"maxNanos,omitempty"`
+	Buckets  []int64 `json:"buckets,omitempty"`
 }
 
 // OpStats is a snapshot of a collection's operational timing counters -- the wall
@@ -96,4 +153,17 @@ func (s *OpStats) add(m *shardMetrics) {
 func addStat(dst *OpStat, v OpStat) {
 	dst.Count += v.Count
 	dst.Nanos += v.Nanos
+	if v.MaxNanos > dst.MaxNanos {
+		dst.MaxNanos = v.MaxNanos
+	}
+	if len(v.Buckets) > 0 {
+		if dst.Buckets == nil {
+			dst.Buckets = make([]int64, len(v.Buckets))
+		}
+		for i := range v.Buckets {
+			if i < len(dst.Buckets) {
+				dst.Buckets[i] += v.Buckets[i]
+			}
+		}
+	}
 }
