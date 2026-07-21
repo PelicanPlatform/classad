@@ -179,7 +179,7 @@ type QueryLog struct {
 // read-only connection).
 func (o op) isMutating() bool {
 	switch o {
-	case opNewAd, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
+	case opNewAd, opNewAdBatch, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
 		opCreateTableMem, opTableToMemory, opCreateView, opDropView,
 		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere, opCommitIdem:
 		return true
@@ -844,6 +844,39 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			st.tx.NewClassAd(key, ad)
 			st.record(s, WriteOp{Kind: WriteNewClassAd, Key: key, Value: adText})
 			return resp(reqID, stOK)
+		})
+
+	case opNewAdBatch:
+		return s.withTxn(reqID, r, func(st *serverTxn) []byte {
+			n := r.i32()
+			if r.err != nil || n < 0 {
+				return respBad(reqID)
+			}
+			// Apply each ad under this one lock acquisition; an unparseable ad is recorded
+			// as a reject (by index) and skipped, exactly as opNewAd's per-ad ServerError
+			// is skipped by the caller, so one bad ad never loses the batch. A truncated
+			// frame is a bad request.
+			var rejIdx []int32
+			var rejMsg []string
+			for i := int32(0); i < n; i++ {
+				key, adText := r.str(), r.str()
+				if r.err != nil {
+					return respBad(reqID)
+				}
+				ad, err := classad.ParseOld(adText)
+				if err != nil {
+					rejIdx = append(rejIdx, i)
+					rejMsg = append(rejMsg, err.Error())
+					continue
+				}
+				st.tx.NewClassAd(key, ad)
+				st.record(s, WriteOp{Kind: WriteNewClassAd, Key: key, Value: adText})
+			}
+			b := putI32(resp(reqID, stOK), int32(len(rejIdx)))
+			for i := range rejIdx {
+				b = putStr(putI32(b, rejIdx[i]), rejMsg[i])
+			}
+			return b
 		})
 
 	case opDestroyAd:

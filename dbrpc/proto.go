@@ -98,6 +98,15 @@ const (
 	// Point-in-time query: like opQuery but with a wall-clock instant; the server
 	// resolves it to the per-shard commit sequence current then (time travel).
 	opQueryAsOf op = 43 // [table][limit i32][asOfUnixNanos u64][constraint] -> stream of [adText]
+
+	// Bulk ad write: apply many NewClassAd in one round-trip within a transaction,
+	// collapsing the per-ad request/ack chatter that makes a large batch a multi-second
+	// flush over the wire. Payload is a count then that many [key][adText] pairs; the
+	// reply lists the ads the server rejected (bad text) by index so the caller can log
+	// them and treat the rest as applied -- mirroring opNewAd's skip-the-bad-ad behavior.
+	// The whole frame must fit MaxMessageSize, so a caller chunks a large batch across
+	// several of these ops on the same transaction (pipelining the chunks).
+	opNewAdBatch op = 44 // [txnID][n i32]{[key][adText]} -> [nReject i32]{[index i32][errMsg]}
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -111,6 +120,8 @@ func (o op) String() string {
 		return "Abort"
 	case opNewAd:
 		return "NewClassAd"
+	case opNewAdBatch:
+		return "NewClassAdBatch"
 	case opDestroyAd:
 		return "DestroyClassAd"
 	case opSetAttr:

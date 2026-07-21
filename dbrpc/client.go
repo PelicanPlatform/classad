@@ -285,6 +285,155 @@ func (t *Tx) NewClassAd(ctx context.Context, key, adText string) error {
 	return t.simple(ctx, opNewAd, key, adText)
 }
 
+// AdKV is one keyed ad for the batch writers.
+type AdKV struct {
+	Key string
+	Ad  string // old-ClassAd text
+}
+
+// AdReject reports an ad a batch writer could not apply (unparseable text), by its index
+// in the items slice, with the server's error. The other ads were applied; the caller
+// typically logs the rejects and carries on.
+type AdReject struct {
+	Index int
+	Err   string
+}
+
+// newAdBatchFrame builds one opNewAdBatch request over items[base:end].
+func (t *Tx) newAdBatchFrame(id uint64, items []AdKV) []byte {
+	b := putI32(putU64(req(id, opNewAdBatch), t.id), int32(len(items)))
+	for _, it := range items {
+		b = putStr(putStr(b, it.Key), it.Ad)
+	}
+	return b
+}
+
+// parseAdBatchReply reads an opNewAdBatch reply, appending rejects (with indexOffset
+// added so indices point into the original items slice) to out.
+func parseAdBatchReply(body *reader, indexOffset int, out []AdReject) []AdReject {
+	n := body.i32()
+	for i := int32(0); i < n; i++ {
+		idx := body.i32()
+		msg := body.str()
+		out = append(out, AdReject{Index: indexOffset + int(idx), Err: msg})
+	}
+	return out
+}
+
+// NewClassAdBatch stores many ads under one transaction in a single round-trip, instead
+// of one request/ack per ad. It returns the ads the server rejected (bad text) so the
+// caller can log them; the rest are applied. The whole request must fit the stream's max
+// message size, so for a large batch prefer NewClassAdBatchPipelined, which chunks and
+// pipelines automatically.
+func (t *Tx) NewClassAdBatch(ctx context.Context, items []AdKV) ([]AdReject, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	status, body, err := t.c.callCtx(ctx, func(id uint64) []byte {
+		return t.newAdBatchFrame(id, items)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if status != stOK {
+		return nil, statusErr(status, body)
+	}
+	return parseAdBatchReply(body, 0, nil), nil
+}
+
+// NewClassAdBatchPipelined stores many ads under one transaction with the round-trips
+// pipelined: it splits items into chunks of chunkSize ads and sends EVERY chunk frame
+// back-to-back without waiting for any chunk's ack, then collects all the acks. So the
+// chunks flow independently of the acks and the wire cost is ~one round-trip regardless
+// of ad count -- not one per ad, nor one serialized round-trip per chunk -- while each
+// message stays small and the server applies a whole chunk under a single transaction-
+// lock acquisition (chunkSize goroutines/locks for the batch, not one per ad).
+//
+// It returns the ads the server rejected (unparseable), indexed into items. A whole-
+// chunk failure -- a dropped connection, or the transaction gone ("no such transaction")
+// -- is returned as an error so the caller aborts and replays the batch. chunkSize <= 0
+// defaults to 64.
+func (t *Tx) NewClassAdBatchPipelined(ctx context.Context, items []AdKV, chunkSize int) ([]AdReject, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	if chunkSize <= 0 {
+		chunkSize = 64
+	}
+
+	// Send phase: fire every chunk frame; do not wait for any ack here. The frame writes
+	// are ordered by the client's write lock but never block on a response, so all chunks
+	// are in flight before we read the first ack. The mux's reader goroutine drains acks
+	// into the (buffered) pending channels concurrently, so the sends never deadlock
+	// against unread acks.
+	type pending struct {
+		ch   chan []byte
+		id   uint64
+		base int
+	}
+	var pends []pending
+	for base := 0; base < len(items); base += chunkSize {
+		end := base + chunkSize
+		if end > len(items) {
+			end = len(items)
+		}
+		chunk := items[base:end]
+		id := t.c.nextReq.Add(1)
+		ch, err := t.c.sendID(id, func(id uint64) []byte {
+			return t.newAdBatchFrame(id, chunk)
+		}, false)
+		if err != nil {
+			for _, p := range pends {
+				t.c.cancelPending(p.id)
+			}
+			return nil, err
+		}
+		pends = append(pends, pending{ch: ch, id: id, base: base})
+	}
+
+	// Collect phase: await every chunk's ack. Drain all of them even after an error so no
+	// pending entry leaks; return the first hard error (the caller replays the batch).
+	var rejects []AdReject
+	var firstErr error
+	for i, p := range pends {
+		select {
+		case <-ctx.Done():
+			for _, q := range pends[i:] {
+				t.c.cancelPending(q.id)
+			}
+			if firstErr == nil {
+				firstErr = ctx.Err()
+			}
+			return rejects, firstErr
+		case frame, ok := <-p.ch:
+			if !ok {
+				if firstErr == nil {
+					firstErr = t.c.closeErr
+				}
+				continue
+			}
+			_, status, body, okHdr := respHeader(frame)
+			if !okHdr {
+				if firstErr == nil {
+					firstErr = errShort
+				}
+				continue
+			}
+			if status != stOK {
+				if firstErr == nil {
+					firstErr = statusErr(status, body)
+				}
+				continue
+			}
+			rejects = parseAdBatchReply(body, p.base, rejects)
+		}
+	}
+	if firstErr != nil {
+		return rejects, firstErr
+	}
+	return rejects, nil
+}
+
 // DestroyClassAd removes key.
 func (t *Tx) DestroyClassAd(ctx context.Context, key string) error {
 	return t.simple(ctx, opDestroyAd, key)
