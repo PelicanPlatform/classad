@@ -58,6 +58,15 @@ type Catalog interface {
 	DropView(name string) error
 	Views() []string
 	ViewBacking(name string) (*db.DB, bool)
+	// Exporter registry: passive storage of external-sink definitions and their opaque
+	// resume state. The server never runs exporters; it only persists these for the
+	// out-of-process exporter that reads them.
+	CreateExporter(def db.ExporterDef) error
+	DropExporter(name string) error
+	Exporters() []db.ExporterDef
+	Exporter(name string) (db.ExporterDef, bool)
+	SaveExporterState(name string, state []byte) error
+	LoadExporterState(name string) ([]byte, bool, error)
 }
 
 // DefaultTable is the table name a single-DB server serves and the client
@@ -131,6 +140,17 @@ func (s singleCatalog) CreateArchiveTable(string, db.ArchiveConfig) (*db.Archive
 }
 func (s singleCatalog) ArchiveTables() []string { return nil }
 
+func (s singleCatalog) CreateExporter(db.ExporterDef) error {
+	return fmt.Errorf("single-table server: exporters unsupported")
+}
+func (s singleCatalog) DropExporter(string) error              { return nil }
+func (s singleCatalog) Exporters() []db.ExporterDef            { return nil }
+func (s singleCatalog) Exporter(string) (db.ExporterDef, bool) { return db.ExporterDef{}, false }
+func (s singleCatalog) SaveExporterState(string, []byte) error {
+	return fmt.Errorf("single-table server: exporters unsupported")
+}
+func (s singleCatalog) LoadExporterState(string) ([]byte, bool, error) { return nil, false, nil }
+
 // ServeOptions scopes what a single served connection may do. The zero value is
 // full read/write access with private attributes excluded from returned ads
 // (the historical ServeConn behavior). A privilege-scoped front end (e.g. an
@@ -181,6 +201,7 @@ func (o op) isMutating() bool {
 	switch o {
 	case opNewAd, opNewAdBatch, opDestroyAd, opSetAttr, opDeleteAttr, opAdmin, opCreateTable, opDropTable,
 		opCreateTableMem, opTableToMemory, opCreateView, opDropView,
+		opCreateExporter, opDropExporter, opPutExporterState,
 		opArchiveCreate, opArchiveAppend, opArchiveRotate, opDeleteWhere, opCommitIdem:
 		return true
 	}
@@ -721,6 +742,97 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			b = putStr(b, n)
 		}
 		return b
+
+	case opCreateExporter:
+		defJSON := r.bytesRef()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		// Registering an exporter is a DAEMON-level administrative action: its config may
+		// carry broker credentials and it drives data off-box.
+		if !privileged {
+			return respErr(reqID, "CreateExporter requires DAEMON authorization")
+		}
+		var def db.ExporterDef
+		if err := json.Unmarshal(defJSON, &def); err != nil {
+			return respErr(reqID, "exporter def: "+err.Error())
+		}
+		if err := s.cat.CreateExporter(def); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opDropExporter:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		if !privileged {
+			return respErr(reqID, "DropExporter requires DAEMON authorization")
+		}
+		if err := s.cat.DropExporter(name); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opListExporters:
+		// Names and kinds only -- no config -- so listing is safe for an unprivileged peer.
+		defs := s.cat.Exporters()
+		b := putI32(resp(reqID, stOK), int32(len(defs)))
+		for _, d := range defs {
+			b = putStr(putStr(b, d.Name), d.Kind)
+		}
+		return b
+
+	case opGetExporter:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		// The full definition includes Config, which may hold credentials -> DAEMON-only.
+		if !privileged {
+			return respErr(reqID, "GetExporter requires DAEMON authorization")
+		}
+		def, ok := s.cat.Exporter(name)
+		if !ok {
+			return putU8(resp(reqID, stOK), 0)
+		}
+		data, err := json.Marshal(def)
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putBytes(putU8(resp(reqID, stOK), 1), data)
+
+	case opPutExporterState:
+		name := r.str()
+		state := r.bytesRef()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		if !privileged {
+			return respErr(reqID, "PutExporterState requires DAEMON authorization")
+		}
+		if err := s.cat.SaveExporterState(name, state); err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return resp(reqID, stOK)
+
+	case opGetExporterState:
+		name := r.str()
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		if !privileged {
+			return respErr(reqID, "GetExporterState requires DAEMON authorization")
+		}
+		state, ok, err := s.cat.LoadExporterState(name)
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		if !ok {
+			return putU8(resp(reqID, stOK), 0)
+		}
+		return putBytes(putU8(resp(reqID, stOK), 1), state)
 
 	case opWatchHead:
 		table := r.str()
