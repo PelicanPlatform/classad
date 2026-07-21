@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 )
@@ -65,6 +66,31 @@ type ViewSpec struct {
 	Cardinality int `json:"cardinality"`
 	// SelectText is the original SELECT for display (.views); not used for execution.
 	SelectText string `json:"selectText"`
+
+	// Grace is seconds to wait after a time bucket's window closes before sealing it
+	// (so late-arriving base rows still land). Only meaningful for a continuous aggregate
+	// (a spec with a time-bucketed group column). 0 seals as soon as the window closes.
+	Grace int64 `json:"grace,omitempty"`
+	// Retention is seconds of sealed history to keep in the continuous aggregate's archive;
+	// 0 keeps all.
+	Retention int64 `json:"retention,omitempty"`
+}
+
+// bucketCol returns the index and width of the (first) time-bucketed group column, and
+// whether the view has one -- i.e. whether it is a continuous aggregate.
+func (s ViewSpec) bucketCol() (idx int, width int64, ok bool) {
+	for i, g := range s.Groups {
+		if g.BucketWidth > 0 {
+			return i, g.BucketWidth, true
+		}
+	}
+	return 0, 0, false
+}
+
+// IsContinuous reports whether the view is a continuous aggregate (has a time bucket).
+func (s ViewSpec) IsContinuous() bool {
+	_, _, ok := s.bucketCol()
+	return ok
 }
 
 // Validate checks a spec is well-formed and delta-maintainable.
@@ -140,10 +166,11 @@ type metricInput struct {
 // contribution with valid == false belongs to no group (a time-bucketed column's attribute
 // was non-numeric); such an ad is dropped from the view entirely.
 type contribution struct {
-	valid    bool
-	groupKey string
-	labels   []string
-	inputs   []metricInput
+	valid       bool
+	groupKey    string
+	labels      []string
+	inputs      []metricInput
+	bucketStart int64 // floored start of this ad's time bucket (continuous aggregates)
 }
 
 func (c contribution) equal(o contribution) bool {
@@ -193,19 +220,52 @@ type View struct {
 	groups  map[string]*groupAcc    // groupKey -> accumulator
 	cursor  []byte                  // last durable watch cursor (for resume/persist)
 
+	// Continuous-aggregate (time-bucketed) state; zero/nil for a gauge view. A bucket whose
+	// start is <= watermark has been sealed (appended to archive, evicted from memory);
+	// buckets whose window has closed (now past start+width+grace) are sealed on each tick.
+	archive     *ArchiveTable // sealed buckets; nil for a gauge view or an in-memory catalog
+	bucketIdx   int           // index of the time-bucket group column
+	bucketWidth int64         // its width in seconds (0 => not a continuous aggregate)
+	grace       int64         // seconds after a bucket closes before sealing
+	watermark   int64         // highest sealed bucket start; -1 = nothing sealed yet
+	lateDrops   int64         // base rows dropped because their bucket was already sealed
+	stateDir    string        // <catalog>/views/<name>, for persisting the watermark; "" = in-memory
+	nowFn       func() int64  // wall clock (unix seconds); overridable in tests
+	tickEvery   time.Duration // seal cadence
+
 	cancel   context.CancelFunc // stops the live updater
 	stopOnce sync.Once
 }
 
 // newView constructs a view around a spec and an (empty, in-memory) backing DB.
 func newView(spec ViewSpec, backing *DB) *View {
-	return &View{
-		spec:    spec,
-		backing: backing,
-		state:   ViewBuilding,
-		contrib: make(map[string]contribution),
-		groups:  make(map[string]*groupAcc),
+	v := &View{
+		spec:      spec,
+		backing:   backing,
+		state:     ViewBuilding,
+		contrib:   make(map[string]contribution),
+		groups:    make(map[string]*groupAcc),
+		watermark: -1, // nothing sealed yet (bucket starts are >= 0)
+		nowFn:     func() int64 { return time.Now().Unix() },
 	}
+	if idx, width, ok := spec.bucketCol(); ok {
+		v.bucketIdx, v.bucketWidth, v.grace = idx, width, spec.Grace
+		v.tickEvery = sealTickInterval(width)
+	}
+	return v
+}
+
+// sealTickInterval picks how often a continuous aggregate checks for aged buckets: about
+// half the bucket width, clamped so it is neither busy nor sluggish.
+func sealTickInterval(width int64) time.Duration {
+	d := time.Duration(width/2) * time.Second
+	if d < time.Second {
+		d = time.Second
+	}
+	if d > 5*time.Minute {
+		d = 5 * time.Minute
+	}
+	return d
 }
 
 // Spec returns the view's definition.
@@ -232,6 +292,7 @@ func (v *View) SeriesCount() int {
 // inputs.
 func (v *View) contributionOf(ad *classad.ClassAd) contribution {
 	labels := make([]string, len(v.spec.Groups))
+	var bucketStart int64
 	for i, g := range v.spec.Groups {
 		if g.BucketWidth > 0 {
 			num, ok := ad.EvaluateAttrNumber(g.Attr)
@@ -240,7 +301,8 @@ func (v *View) contributionOf(ad *classad.ClassAd) contribution {
 				// contributes to no group (dropped from the series).
 				return contribution{valid: false}
 			}
-			labels[i] = bucketLabel(num, g.BucketWidth)
+			bucketStart = bucketFloorInt(num, g.BucketWidth)
+			labels[i] = strconv.FormatInt(bucketStart, 10)
 			continue
 		}
 		labels[i] = renderLabel(ad.EvaluateAttr(g.Attr))
@@ -263,13 +325,13 @@ func (v *View) contributionOf(ad *classad.ClassAd) contribution {
 		num, ok := ad.EvaluateAttrNumber(m.Arg)
 		inputs[i] = metricInput{defined: ok, val: num}
 	}
-	return contribution{valid: true, groupKey: strings.Join(labels, "\x00"), labels: labels, inputs: inputs}
+	return contribution{valid: true, groupKey: strings.Join(labels, "\x00"), labels: labels, inputs: inputs, bucketStart: bucketStart}
 }
 
-// bucketLabel floors unix-epoch seconds to an epoch-aligned bucket of the given width
-// (seconds) and renders it as the bucket start in decimal seconds.
-func bucketLabel(sec float64, width int64) string {
-	return strconv.FormatInt(int64(math.Floor(sec/float64(width)))*width, 10)
+// bucketFloorInt floors unix-epoch seconds to an epoch-aligned bucket of the given width
+// (seconds), returning the bucket start in seconds.
+func bucketFloorInt(sec float64, width int64) int64 {
+	return int64(math.Floor(sec/float64(width))) * width
 }
 
 // add folds a key's contribution into its group (+1 member, +metrics). Creates the group if
@@ -317,6 +379,12 @@ func (v *View) sub(c contribution) {
 // backing rows. Idempotent: a re-delivered identical ad is a no-op.
 func (v *View) applyUpsert(key string, ad *classad.ClassAd) error {
 	newC := v.contributionOf(ad)
+	// Late data for a continuous aggregate: if this row's bucket was already sealed
+	// (start <= watermark), drop it (and count it) rather than resurrecting the bucket.
+	if newC.valid && v.bucketWidth > 0 && newC.bucketStart <= v.watermark {
+		newC = contribution{valid: false}
+		v.lateDrops++
+	}
 	old, existed := v.contrib[key]
 	if existed && old.equal(newC) {
 		return nil // duplicate delivery
@@ -365,10 +433,16 @@ func (v *View) renderGroup(groupKey string) {
 		_, _ = v.backing.Delete(groupKey)
 		return
 	}
+	_ = v.backing.Put(groupKey, v.renderGroupAd(g))
+}
+
+// renderGroupAd builds the materialized ad for a group: each group column under its alias
+// (a time bucket as a number, so the time axis and archive zone maps see a number) and each
+// metric under its alias. Used both to write the backing row and to seal a bucket to the
+// archive.
+func (v *View) renderGroupAd(g *groupAcc) *classad.ClassAd {
 	ad := classad.New()
 	for i, gc := range v.spec.Groups {
-		// A time-bucketed column is stored as a number (the unix-seconds bucket start)
-		// so downstream time-axis and archive zone-map handling see a number, not text.
 		if gc.BucketWidth > 0 {
 			if n, err := strconv.ParseInt(g.labels[i], 10, 64); err == nil {
 				ad.InsertAttr(gc.Alias, n)
@@ -396,7 +470,7 @@ func (v *View) renderGroup(groupKey string) {
 			ad.InsertAttrFloat(m.Alias, avg)
 		}
 	}
-	_ = v.backing.Put(groupKey, ad)
+	return ad
 }
 
 // reset clears all view state and the backing (WatchReset: a full rebuild follows).
@@ -485,6 +559,9 @@ func (v *View) stop() {
 		if v.backing != nil {
 			_ = v.backing.Close()
 		}
+		if v.archive != nil {
+			_ = v.archive.Close()
+		}
 	})
 }
 
@@ -555,6 +632,17 @@ func (cat *Catalog) CreateView(name string, spec ViewSpec) error {
 	}
 	v := newView(spec, backing)
 
+	// Prepare a continuous aggregate (open its archive, load the watermark) BEFORE the build
+	// so the replay drops already-sealed buckets. A fresh view has an empty archive.
+	stateDir := ""
+	if cat.dir != "" {
+		stateDir = filepath.Join(cat.dir, viewsSubdir, name)
+	}
+	if err := v.initContinuous(stateDir); err != nil {
+		v.stop()
+		return fmt.Errorf("catalog: preparing continuous aggregate %q: %w", name, err)
+	}
+
 	// Start the single build+maintain goroutine and wait for the initial build to finish.
 	// A cardinality/aggregation error during the build fails the create and leaves nothing
 	// behind; on success the goroutine keeps maintaining the view live.
@@ -566,6 +654,7 @@ func (cat *Catalog) CreateView(name string, spec ViewSpec) error {
 		v.stop()
 		return fmt.Errorf("catalog: building view %q: %w", name, err)
 	}
+	go v.tickLoop(ctx) // seals aged buckets (no-op for a gauge view)
 
 	if cat.dir != "" {
 		if err := saveViewDef(cat.dir, name, spec); err != nil {
@@ -658,6 +747,15 @@ func (cat *Catalog) recoverViews() error {
 			cat.views[name] = v
 			continue
 		}
+		// Reopen the continuous aggregate's archive and load its watermark BEFORE the
+		// rebuild, so the replay drops already-sealed buckets (the archive is the durable
+		// sealed history; only the live window is rebuilt from the base).
+		if err := v.initContinuous(filepath.Join(cat.dir, viewsSubdir, name)); err != nil {
+			v.stop()
+			v.state, v.failErr = ViewFailed, err
+			cat.views[name] = v
+			continue
+		}
 		ctx, cancel := context.WithCancel(context.Background())
 		v.cancel = cancel
 		ready := make(chan error, 1)
@@ -668,6 +766,8 @@ func (cat *Catalog) recoverViews() error {
 			// close backing) and register the failed view so the operator can see it.
 			v.stop()
 			v.state, v.failErr = ViewFailed, berr
+		} else {
+			go v.tickLoop(ctx) // resume sealing aged buckets
 		}
 		cat.views[name] = v
 	}
