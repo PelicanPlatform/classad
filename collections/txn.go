@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 )
@@ -349,17 +350,24 @@ func (tx *Txn) Commit() CommitResult {
 				toSync = append(toSync, c.idx)
 			}
 		}
-		switch len(toSync) {
-		case 0:
-		case 1:
-			tx.c.shards[toSync[0]].sync()
-		default:
-			var wg sync.WaitGroup
-			wg.Add(len(toSync))
-			for _, idx := range toSync {
-				go func(sh *shard) { defer wg.Done(); sh.sync() }(tx.c.shards[idx])
+		if len(toSync) > 0 {
+			// Time the whole durability phase as ONE observation: with the shard syncs
+			// running in parallel this is the commit's critical path (≈ the slowest shard),
+			// the true commit durability latency. The per-shard Sync counter still records
+			// each msync, but its total is now fsync WORK, not this latency -- so measure
+			// the wall time here explicitly (commitSync).
+			syncStart := time.Now()
+			if len(toSync) == 1 {
+				tx.c.shards[toSync[0]].sync()
+			} else {
+				var wg sync.WaitGroup
+				wg.Add(len(toSync))
+				for _, idx := range toSync {
+					go func(sh *shard) { defer wg.Done(); sh.sync() }(tx.c.shards[idx])
+				}
+				wg.Wait()
 			}
-			wg.Wait()
+			tx.c.opm.commitSync.observe(time.Since(syncStart))
 		}
 	}
 
