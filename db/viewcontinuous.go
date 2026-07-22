@@ -3,12 +3,14 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"iter"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"time"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 )
 
@@ -116,6 +118,15 @@ func (v *View) sealAged(now int64) {
 	}
 }
 
+// Seal appends and evicts every bucket whose window has closed as of now (unix seconds)
+// into the archive, advancing the watermark. It is what the periodic tick invokes; exported
+// so an operator (or a test) can force sealing at a chosen instant.
+func (v *View) Seal(now int64) {
+	v.mu.Lock()
+	v.sealAged(now)
+	v.mu.Unlock()
+}
+
 // tickLoop periodically seals aged buckets until ctx is cancelled. Only continuous
 // aggregates with an archive start one.
 func (v *View) tickLoop(ctx context.Context) {
@@ -134,6 +145,20 @@ func (v *View) tickLoop(ctx context.Context) {
 			v.mu.Unlock()
 		}
 	}
+}
+
+// SealedQuery streams this continuous aggregate's sealed (archived) rows matching the
+// constraint. It returns an empty sequence for a gauge view or an in-memory continuous
+// aggregate (no archive). Reads union this with the live backing so a view read returns the
+// full series, not just the unsealed buckets.
+func (v *View) SealedQuery(constraint string) (iter.Seq[*classad.ClassAd], error) {
+	v.mu.Lock()
+	arch := v.archive // the archive is internally synchronized; don't hold v.mu during the scan
+	v.mu.Unlock()
+	if arch == nil {
+		return func(yield func(*classad.ClassAd) bool) {}, nil
+	}
+	return arch.Query(constraint)
 }
 
 // LateDrops reports how many base rows were dropped because their time bucket was already

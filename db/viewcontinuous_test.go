@@ -40,11 +40,7 @@ func archiveAds(t *testing.T, v *View) []*classad.ClassAd {
 	return out
 }
 
-func seal(v *View, now int64) {
-	v.mu.Lock()
-	v.sealAged(now)
-	v.mu.Unlock()
-}
+func seal(v *View, now int64) { v.Seal(now) }
 
 func waitLateDrops(t *testing.T, v *View, want int64) {
 	t.Helper()
