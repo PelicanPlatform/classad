@@ -56,6 +56,7 @@ func (c *Collection) OpStats() OpStats {
 	for _, sh := range c.shards {
 		s.add(&sh.metrics)
 	}
+	s.CommitSync = c.opm.commitSync.snapshot()
 	s.Compact = c.opm.compact.snapshot()
 	s.Retrain = c.opm.retrain.snapshot()
 	s.Reindex = c.opm.reindex.snapshot()

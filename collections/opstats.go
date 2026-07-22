@@ -107,9 +107,10 @@ type shardMetrics struct {
 // live on each shard's shardMetrics. (The collection-wide snapshot lock lives in the
 // db package, which keeps its own counter -- see db.OpStats.)
 type opMetrics struct {
-	compact opCounter // Compact() reclaiming dead space
-	retrain opCounter // dictionary retrain + rewrite
-	reindex opCounter // index rebuild
+	compact    opCounter // Compact() reclaiming dead space
+	retrain    opCounter // dictionary retrain + rewrite
+	reindex    opCounter // index rebuild
+	commitSync opCounter // per-commit durability wall time (the parallel shard-sync phase)
 }
 
 // OpStat is one operation's cumulative call count and total wall-nanoseconds. Both
@@ -137,9 +138,15 @@ type OpStats struct {
 	ShardWriteHold OpStat `json:"shardWriteHold"`
 	SegmentAlloc   OpStat `json:"segmentAlloc"`
 	Sync           OpStat `json:"sync"`
-	Compact        OpStat `json:"compact"`
-	Retrain        OpStat `json:"retrain"`
-	Reindex        OpStat `json:"reindex"`
+	// CommitSync is the per-commit durability wall time: how long a Txn.Commit blocked
+	// flushing all of its shards to disk. Since those shard flushes now run in parallel,
+	// this is the commit's critical path (≈ the slowest shard), which the per-shard Sync
+	// total -- now the summed fsync WORK, not the latency -- no longer reveals. Count is
+	// the number of durable commits; Nanos/Count is mean commit durability latency.
+	CommitSync OpStat `json:"commitSync,omitempty"`
+	Compact    OpStat `json:"compact"`
+	Retrain    OpStat `json:"retrain"`
+	Reindex    OpStat `json:"reindex"`
 }
 
 // add accumulates one shard's counters into the snapshot.
