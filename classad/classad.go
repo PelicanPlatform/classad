@@ -424,7 +424,11 @@ func (c *ClassAd) marshalOld(includePrivate bool) string {
 		// negotiator) read the same attribute; the new-format String() path still quotes.
 		b.WriteString(attr.Name)
 		b.WriteString(" = ")
-		b.WriteString(attr.Value.String())
+		// Render the value in OLD-ClassAd form: string literals escape only the delimiter
+		// (backslashes/control chars verbatim), matching the C++ old-format unparser and the
+		// lenient old-format lexer -- so a value like a path or regex round-trips instead of
+		// gaining a backslash each hop. attr.Value.String() would use new-format escaping.
+		b.WriteString(unparseExprStringOld(attr.Value))
 	}
 	return b.String()
 }
