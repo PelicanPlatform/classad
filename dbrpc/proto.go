@@ -259,6 +259,15 @@ func frameReqID(frame []byte) (uint64, bool) {
 	return binary.LittleEndian.Uint64(frame), true
 }
 
+// frameOp reads the op byte of a request frame ([reqID u64][op u8]) without allocating a
+// reader -- cheap enough for the per-call timing seam. Returns false if the frame is short.
+func frameOp(frame []byte) (op, bool) {
+	if len(frame) < 9 {
+		return 0, false
+	}
+	return op(frame[8]), true
+}
+
 func putBytes(b, v []byte) []byte {
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(v)))
 	return append(b, v...)
