@@ -2,6 +2,7 @@ package collections
 
 import (
 	"bytes"
+	"sync"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -124,15 +125,32 @@ type txnWrite struct {
 // respect to other committers (first-committer-wins). Conflicting writes are skipped
 // and flagged; the rest commit at one fresh sequence.
 func (sh *shard) commitTxn(ws []*txnWrite, durable bool) {
+	changed, seq := sh.applyTxn(ws)
+	if !changed {
+		return
+	}
+	if durable {
+		sh.sync()
+	}
+	sh.publishTxn(ws, seq)
+}
+
+// applyTxn applies a shard's buffered writes under the write lock, advancing the shard's
+// commit sequence, and sets each write's ok flag. It returns whether anything changed and
+// the sequence used. The durability sync (sh.sync) and the watch-hub publish (publishTxn)
+// are DELIBERATELY left to the caller so a multi-shard commit can sync its shards
+// concurrently -- the msync is a commit's slow part, and distinct shards sync independently
+// (disjoint locks and segments), so Txn.Commit overlaps them instead of paying them in
+// series. See Txn.Commit.
+func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 	acq, held := sh.lockWrite()
-	seq := sh.commitSeq + 1
+	seq = sh.commitSeq + 1
 	// Single-writer fast path: all of a shard's buffered writes share one snapshot
 	// (ws[0].base). If no one has committed to this shard since -- commitSeq is still
 	// that snapshot -- then no key can have changed, so every write succeeds without a
 	// per-key conflict check. This is the schedd's common single-writer case: zero
 	// conflict-detection cost. Under contention it falls to the per-write check.
 	fast := len(ws) > 0 && sh.commitSeq == ws[0].base
-	changed := false
 	for _, w := range ws {
 		if !fast {
 			conflictCheckCount.Add(1)
@@ -156,24 +174,27 @@ func (sh *shard) commitTxn(ws []*txnWrite, durable bool) {
 		sh.maybeCheckpoint(seq)
 	}
 	sh.unlockWrite(acq, held)
-	if changed {
-		if durable {
-			sh.sync()
+	return changed, seq
+}
+
+// publishTxn notifies the watch hub of a committed batch. It must run only after the batch
+// is durable (sh.sync has returned), so watchers never observe an event that a crash could
+// lose.
+func (sh *shard) publishTxn(ws []*txnWrite, seq uint64) {
+	if sh.hub == nil {
+		return
+	}
+	for _, w := range ws {
+		if !w.ok {
+			continue
 		}
-		if sh.hub != nil {
-			for _, w := range ws {
-				if !w.ok {
-					continue
-				}
-				if w.del {
-					if sh.delLog != nil {
-						sh.delLog.record(w.key, seq)
-						sh.hub.publish(sh.idx, seq, w.key, nil, nil, true)
-					}
-				} else {
-					sh.hub.publish(sh.idx, seq, w.key, w.ad, w.codec, false)
-				}
+		if w.del {
+			if sh.delLog != nil {
+				sh.delLog.record(w.key, seq)
+				sh.hub.publish(sh.idx, seq, w.key, nil, nil, true)
 			}
+		} else {
+			sh.hub.publish(sh.idx, seq, w.key, w.ad, w.codec, false)
 		}
 	}
 }
@@ -303,10 +324,53 @@ func (tx *Txn) Commit() CommitResult {
 		}
 		byShard[idx] = append(byShard[idx], w)
 	}
-	var res CommitResult
+	// Phase 1: apply each touched shard's writes under its own lock (fast; disjoint locks).
+	type shardCommit struct {
+		idx     int
+		ws      []*txnWrite
+		seq     uint64
+		changed bool
+	}
+	commits := make([]shardCommit, 0, len(byShard))
 	for idx, ws := range byShard {
-		tx.c.shards[idx].commitTxn(ws, tx.durable)
-		for _, w := range ws {
+		changed, seq := tx.c.shards[idx].applyTxn(ws)
+		commits = append(commits, shardCommit{idx, ws, seq, changed})
+	}
+
+	// Phase 2: sync the changed shards CONCURRENTLY. The durability msync is a commit's
+	// slow part; distinct shards sync independently, so a commit touching N shards pays
+	// ~one msync latency instead of N in series. The parallelism is inherently sized to
+	// the commit -- a small commit touches one shard and syncs inline with no goroutines;
+	// only a large, many-shard commit fans out.
+	if tx.durable {
+		var toSync []int
+		for _, c := range commits {
+			if c.changed {
+				toSync = append(toSync, c.idx)
+			}
+		}
+		switch len(toSync) {
+		case 0:
+		case 1:
+			tx.c.shards[toSync[0]].sync()
+		default:
+			var wg sync.WaitGroup
+			wg.Add(len(toSync))
+			for _, idx := range toSync {
+				go func(sh *shard) { defer wg.Done(); sh.sync() }(tx.c.shards[idx])
+			}
+			wg.Wait()
+		}
+	}
+
+	// Phase 3: publish (now durable) and aggregate the result + ordered-index maintenance.
+	// Kept sequential: publishing and the ordered index touch collection-shared state.
+	var res CommitResult
+	for _, c := range commits {
+		if c.changed {
+			tx.c.shards[c.idx].publishTxn(c.ws, c.seq)
+		}
+		for _, w := range c.ws {
 			if !w.ok {
 				res.Conflicts = append(res.Conflicts, w.key)
 				continue
