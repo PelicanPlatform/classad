@@ -192,6 +192,12 @@ func (c *Collection) Rewrite() int {
 // shard so existing records are recompressed under the new dictionary. In-flight
 // scans are unaffected: they decode retired segments with the codec those
 // segments were written under (recorded per segment). Returns the dictionary size.
+// retrainStallHook, when non-nil, is invoked once mid-retrain (after the codec swap,
+// before recompaction) while holding NO collection lock. It is an unexported test seam
+// (see retrain_stall_test.go) for observing how a long-running retrain affects concurrent
+// transactions; production leaves it nil.
+var retrainStallHook func()
+
 func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	start := time.Now()
 	defer func() { c.opm.retrain.observe(time.Since(start)) }()
@@ -210,6 +216,9 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 		return 0, err
 	}
 	c.codec.Store(&codecHolder{codec}) // new writes use the new codec
+	if retrainStallHook != nil {
+		retrainStallHook() // test seam: observe concurrent access during a long retrain
+	}
 	for _, sh := range c.shards {
 		c.compactShard(sh, codec) // recompress to the new codec
 	}

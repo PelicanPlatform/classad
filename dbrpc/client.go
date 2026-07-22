@@ -31,6 +31,26 @@ type Client struct {
 	mu       sync.Mutex
 	pending  map[uint64]*pending
 	closeErr error
+
+	// Observer, if set before use, receives a timing breakdown for each completed unary
+	// call. It lets an embedder (e.g. a collector's Prometheus metrics) localize where a
+	// round-trip spends its time -- client-side write-lock contention, the socket write
+	// (TCP backpressure when the server stops reading), or the server+return wait --
+	// without this package depending on any metrics library. Must not block.
+	Observer func(CallStats)
+}
+
+// CallStats is the per-call timing breakdown delivered to Client.Observer. The three
+// durations partition a unary round-trip and pinpoint a stall: a large WriteWait means
+// another sender held the single-writer lock; a large Send means conn.WriteMsg itself
+// blocked (the socket's send buffer filled because the peer was not reading -- comms/server
+// backpressure, not this client); a large Wait means the request left promptly but the
+// server (or return path) was slow.
+type CallStats struct {
+	Op        uint8         // request op byte (see OpName)
+	WriteWait time.Duration // blocked acquiring the write lock (another send ahead)
+	Send      time.Duration // in conn.WriteMsg -- getting the request onto the wire
+	Wait      time.Duration // from send complete to response received
 }
 
 // pending is a waiting call: a unary call's channel receives exactly one frame; a
@@ -46,6 +66,22 @@ func NewClient(conn MsgConn) *Client {
 	c := &Client{conn: conn, pending: make(map[uint64]*pending)}
 	go c.readLoop()
 	return c
+}
+
+// OpName maps a CallStats.Op byte to a short stable label for the write-path ops a
+// collector times (begin/commit/batch); anything else returns "op<N>". Used to label the
+// per-call timing metrics without exposing the op constants.
+func OpName(op uint8) string {
+	switch op {
+	case 1:
+		return "begin"
+	case 2:
+		return "commit"
+	case 44:
+		return "batch"
+	default:
+		return fmt.Sprintf("op%d", op)
+	}
 }
 
 func (c *Client) readLoop() {
@@ -101,15 +137,20 @@ func (c *Client) Close() error { return c.conn.Close() }
 // is no implicit timeout -- the deadline is exactly whatever ctx carries.
 func (c *Client) callCtx(ctx context.Context, build func(reqID uint64) []byte) (int32, *reader, error) {
 	id := c.nextReq.Add(1)
-	ch, err := c.sendID(id, build, false)
+	ch, st, err := c.sendIDTimed(id, build, false)
 	if err != nil {
 		return 0, nil, err
 	}
+	sentAt := time.Now()
 	select {
 	case <-ctx.Done():
 		c.cancelPending(id)
 		return 0, nil, ctx.Err()
 	case frame, ok := <-ch:
+		if obs := c.Observer; obs != nil {
+			st.Wait = time.Since(sentAt)
+			obs(st)
+		}
 		if !ok {
 			return 0, nil, c.closeErr
 		}
@@ -148,6 +189,15 @@ func (c *Client) send(build func(reqID uint64) []byte, stream bool) (chan []byte
 }
 
 func (c *Client) sendID(id uint64, build func(reqID uint64) []byte, stream bool) (chan []byte, error) {
+	ch, _, err := c.sendIDTimed(id, build, stream)
+	return ch, err
+}
+
+// sendIDTimed is sendID with a timing breakdown (write-lock wait + socket write) filled
+// into the returned CallStats. callCtx completes it with the response wait and hands it to
+// the Observer; other callers ignore it. The timing reads are unconditional but trivial
+// (two time.Now calls), so there is no fast path to branch on.
+func (c *Client) sendIDTimed(id uint64, build func(reqID uint64) []byte, stream bool) (chan []byte, CallStats, error) {
 	bufSize := 1
 	if stream {
 		bufSize = 256
@@ -157,23 +207,31 @@ func (c *Client) sendID(id uint64, build func(reqID uint64) []byte, stream bool)
 	if c.closeErr != nil {
 		err := c.closeErr
 		c.mu.Unlock()
-		return nil, err
+		return nil, CallStats{}, err
 	}
 	c.pending[id] = &pending{ch: ch, stream: stream}
 	c.mu.Unlock()
 	// Serialize the actual send: the CEDAR stream is single-writer (shared frame buffer
 	// + AES-GCM nonce), so concurrent multiplexed calls must not interleave WriteMsg.
 	frame := build(id)
+	var st CallStats
+	if o, ok := frameOp(frame); ok {
+		st.Op = uint8(o)
+	}
+	t0 := time.Now()
 	c.writeMu.Lock()
+	st.WriteWait = time.Since(t0)
+	t1 := time.Now()
 	err := c.conn.WriteMsg(frame)
+	st.Send = time.Since(t1)
 	c.writeMu.Unlock()
 	if err != nil {
 		c.mu.Lock()
 		delete(c.pending, id)
 		c.mu.Unlock()
-		return nil, err
+		return nil, st, err
 	}
-	return ch, nil
+	return ch, st, nil
 }
 
 func statusErr(status int32, body *reader) error {
