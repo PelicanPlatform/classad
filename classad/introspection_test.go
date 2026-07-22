@@ -161,9 +161,11 @@ func TestMarshalOld(t *testing.T) {
 			expected: "Name = \"worker-01\"",
 		},
 		{
-			name:     "with expressions",
+			name: "with expressions",
+			// The source has no parentheses, so the C++ old-format unparser adds none
+			// (it echoes only source parens); MarshalOld now matches that.
 			input:    "[x = 10; y = x * 2]",
-			expected: "x = 10\ny = (x * 2)",
+			expected: "x = 10\ny = x * 2",
 		},
 		{
 			name:     "empty classad",
