@@ -418,7 +418,11 @@ func (c *ClassAd) marshalOld(includePrivate bool) string {
 			b.WriteByte('\n')
 		}
 		first = false
-		b.WriteString(unparseAttrName(attr.Name))
+		// Old-ClassAd wire format takes the attribute name VERBATIM (name before '='), as
+		// the C++ serializer does -- do NOT quote non-bare names here. A name like
+		// "user:condor_tail_X" must round-trip as itself so C++ clients (condor_status, the
+		// negotiator) read the same attribute; the new-format String() path still quotes.
+		b.WriteString(attr.Name)
 		b.WriteString(" = ")
 		b.WriteString(attr.Value.String())
 	}
