@@ -299,6 +299,21 @@ type AdReject struct {
 	Err   string
 }
 
+const (
+	// maxBatchFrameBytes bounds one opNewAdBatch frame so it stays under the CEDAR stream's
+	// MaxMessageSize (1 MiB); the margin covers the frame header, per-message framing, and
+	// safety. A batch chunk is cut before a frame would exceed this, so a run of large ads
+	// can never build an over-size frame (which the stream rejects as "message too large",
+	// failing the whole write and -- after retries replay the same too-big frame -- dropping
+	// the ads).
+	maxBatchFrameBytes = (1 << 20) - 4096
+	// adBatchFrameOverhead is the fixed opNewAdBatch header: reqID(8) + op(1) + txnID(8) +
+	// count(4). adBatchItemOverhead is the two length prefixes putStr writes per item
+	// (key + ad), 4 bytes each.
+	adBatchFrameOverhead = 8 + 1 + 8 + 4
+	adBatchItemOverhead  = 4 + 4
+)
+
 // newAdBatchFrame builds one opNewAdBatch request over items[base:end].
 func (t *Tx) newAdBatchFrame(id uint64, items []AdKV) []byte {
 	b := putI32(putU64(req(id, opNewAdBatch), t.id), int32(len(items)))
@@ -372,12 +387,25 @@ func (t *Tx) NewClassAdBatchPipelined(ctx context.Context, items []AdKV, chunkSi
 		base int
 	}
 	var pends []pending
-	for base := 0; base < len(items); base += chunkSize {
-		end := base + chunkSize
-		if end > len(items) {
-			end = len(items)
+	for base := 0; base < len(items); {
+		// Cut a chunk at whichever comes first: chunkSize ads, or the byte budget that keeps
+		// the frame under the stream's max message size. Chunking by COUNT alone lets a run
+		// of large ads build an over-size frame that the stream rejects ("message too
+		// large"), failing the whole write; the byte guard prevents that. At least one ad
+		// always goes in a chunk (a single ad larger than the budget is sent alone -- the
+		// smallest possible frame -- rather than silently dropped).
+		end := base
+		frameBytes := adBatchFrameOverhead
+		for end < len(items) {
+			need := adBatchItemOverhead + len(items[end].Key) + len(items[end].Ad)
+			if end > base && (end-base >= chunkSize || frameBytes+need > maxBatchFrameBytes) {
+				break
+			}
+			frameBytes += need
+			end++
 		}
 		chunk := items[base:end]
+		chunkBase := base
 		id := t.c.nextReq.Add(1)
 		ch, err := t.c.sendID(id, func(id uint64) []byte {
 			return t.newAdBatchFrame(id, chunk)
@@ -388,7 +416,8 @@ func (t *Tx) NewClassAdBatchPipelined(ctx context.Context, items []AdKV, chunkSi
 			}
 			return nil, err
 		}
-		pends = append(pends, pending{ch: ch, id: id, base: base})
+		pends = append(pends, pending{ch: ch, id: id, base: chunkBase})
+		base = end
 	}
 
 	// Collect phase: await every chunk's ack. Drain all of them even after an error so no
