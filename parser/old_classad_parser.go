@@ -92,12 +92,24 @@ func convertOldToNewFormat(input string) string {
 		// Check if line has an assignment operator
 		// Old ClassAd lines should be: AttributeName = Expression
 		if strings.Contains(trimmed, "=") {
+			// The old format takes the attribute name verbatim (everything before the
+			// first '='), so it can contain characters -- ':', '.', etc. -- that are not
+			// valid BARE attribute names in the new-format grammar the lexer below uses.
+			// Real ads carry these: per-user schedd stats like "user:condor_tail_X".
+			// Quote such a name so it lexes as a quoted attribute name (matching the C++
+			// parser, which stores the literal name). A bare name is returned unchanged, so
+			// this is byte-identical for the common case.
+			stmt := trimmed
+			if eq := strings.IndexByte(trimmed, '='); eq > 0 {
+				name := strings.TrimSpace(trimmed[:eq])
+				stmt = ast.QuoteAttributeName(name) + " " + trimmed[eq:]
+			}
 			// Add the line with a semicolon if it doesn't already have one
-			if !strings.HasSuffix(trimmed, ";") {
-				result.WriteString(trimmed)
+			if !strings.HasSuffix(stmt, ";") {
+				result.WriteString(stmt)
 				result.WriteString(";\n")
 			} else {
-				result.WriteString(trimmed)
+				result.WriteString(stmt)
 				result.WriteString("\n")
 			}
 		} else {
