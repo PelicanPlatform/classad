@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"iter"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -504,6 +505,14 @@ func (sc *serverConn) stopWatch(watchReqID uint64) {
 	}
 }
 
+// viewSealer is the optional Catalog capability to read a continuous aggregate's sealed
+// (archived) history. A catalog that has it (the multi-table db.Catalog) lets a view read
+// union sealed buckets with the live backing; catalogs without it (single-table) simply
+// don't, so this is additive and non-breaking.
+type viewSealer interface {
+	ViewSealed(name, constraint string) (iter.Seq[*classad.ClassAd], bool, error)
+}
+
 // streamQuery streams the committed ads matching a constraint. Each result is its own
 // frame under reqID, so its frames interleave with other calls' -- no head-of-line
 // blocking -- and end with a terminator.
@@ -531,6 +540,22 @@ func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, inclu
 		write(respErr(reqID, err.Error()))
 		return
 	}
+	// A continuous aggregate's sealed history lives in its archive; resolve it up front
+	// (so a bad constraint errors before any frame) and union it after the live backing, so
+	// a read of the view returns the full series, not just the unsealed buckets.
+	var sealed iter.Seq[*classad.ClassAd]
+	if vs, ok := s.cat.(viewSealer); ok {
+		var serr error
+		if sq, has, e := vs.ViewSealed(table, constraint); e != nil {
+			serr = e
+		} else if has {
+			sealed = sq
+		}
+		if serr != nil {
+			write(respErr(reqID, serr.Error()))
+			return
+		}
+	}
 	// Push LIMIT down: stopping the range stops the underlying scan, so a small
 	// LIMIT does proportionally less work instead of scanning everything.
 	for ad := range seq {
@@ -541,6 +566,18 @@ func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, inclu
 		n++
 		if limit > 0 && n >= limit {
 			break
+		}
+	}
+	if sealed != nil && (limit <= 0 || n < limit) {
+		for ad := range sealed {
+			if cancelled(ctx) {
+				return
+			}
+			write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
+			n++
+			if limit > 0 && n >= limit {
+				break
+			}
 		}
 	}
 	write(respHead(reqID, stStreamEnd))

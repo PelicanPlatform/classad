@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"iter"
 	"math"
 	"os"
 	"path/filepath"
@@ -710,6 +711,21 @@ func (cat *Catalog) ViewBacking(name string) (*DB, bool) {
 		return nil, false
 	}
 	return v.backing, true
+}
+
+// ViewSealed streams a continuous aggregate's sealed (archived) rows matching the
+// constraint, so a view read can union sealed history with the live backing. ok is false for
+// a plain table or a gauge view (nothing sealed). The returned sequence is empty (not an
+// error) for a continuous aggregate with no archive (in-memory catalog).
+func (cat *Catalog) ViewSealed(name, constraint string) (seq iter.Seq[*classad.ClassAd], ok bool, err error) {
+	cat.mu.Lock()
+	v, found := cat.views[name]
+	cat.mu.Unlock()
+	if !found {
+		return nil, false, nil
+	}
+	seq, err = v.SealedQuery(constraint)
+	return seq, true, err
 }
 
 // recoverViews reconstructs views from <dir>/views on catalog open. Data is not persisted,
