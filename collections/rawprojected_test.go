@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 var projTestAdTexts = []string{
@@ -299,5 +300,62 @@ func TestScanRawProjectedInline(t *testing.T) {
 		if len(after[name]) != len(attrs) {
 			t.Errorf("%s: inline hot %v != walk %v", name, after[name], attrs)
 		}
+	}
+}
+
+// TestWholeAdQueriesRecordNoHotDemand locks in the "condor_status -l" rule: a
+// whole-ad query (no projection) -- text or wire-form, with or without a
+// constraint -- must record NO read demand, so requesting everything can never
+// drag every attribute into the demand-ranked hot set. A constraint's attrs may
+// gain filter (eq/rng) demand for index suggestions, but never reads; only a
+// real projection records reads, and only for its own attributes.
+func TestWholeAdQueriesRecordNoHotDemand(t *testing.T) {
+	t.Parallel()
+	c := projTestCollectionInline(t)
+
+	reads := func(name string) int64 {
+		if v, ok := c.demand.m.Load(strings.ToLower(name)); ok {
+			return v.(*demandCounts).reads.Load()
+		}
+		return 0
+	}
+
+	// Whole-ad, every flavor.
+	for range c.ScanRaw() {
+	}
+	for range c.ScanRawRedacted() {
+	}
+	for range c.ScanRawWire(nil, true) {
+	}
+	if q, err := vm.Parse(`Cpus == 8`); err == nil {
+		for range c.QueryRawWire(q, nil, true) {
+		}
+		for range c.QueryRaw(q) {
+		}
+	} else {
+		t.Fatal(err)
+	}
+	for _, attr := range []string{"Name", "State", "Cpus", "Memory", "OpSys", "MyType"} {
+		if n := reads(attr); n != 0 {
+			t.Errorf("whole-ad queries recorded read demand for %s (%d); -l must not shape the hot set", attr, n)
+		}
+	}
+	// The constraint attr gained only filter demand.
+	if v, ok := c.demand.m.Load("cpus"); ok {
+		if v.(*demandCounts).eq.Load() == 0 {
+			t.Error("constraint attr recorded no filter demand")
+		}
+	}
+
+	// A real projection records reads for exactly its attributes (+ type fields).
+	for range c.ScanRawProjected([]string{"Name", "State"}, false, false) {
+	}
+	for range c.ScanRawWire([]string{"Name", "State"}, false) {
+	}
+	if reads("Name") == 0 || reads("State") == 0 || reads("MyType") == 0 {
+		t.Error("projected queries failed to record read demand for their attributes")
+	}
+	if reads("Memory") != 0 {
+		t.Error("projected query leaked read demand for an unprojected attribute")
 	}
 }
