@@ -86,6 +86,35 @@ func (r *dictReg) register(codec Codec, dict []byte) (uint32, error) {
 	return id, nil
 }
 
+// prune removes every registered dictionary except id 0 (the base codec) and those
+// keep returns true for, unlinking each removed id's on-disk .zst. Without pruning the
+// registry grows by one codec per retrain FOREVER -- each an un-Closed zstd
+// encoder/decoder pair whose state pools inflated while it was the hot codec -- the
+// dominant live-heap leak in a long-running daemon. The removed codecs are only
+// dereferenced, never Closed: an in-flight scan may still be decompressing through one
+// (its pinned segment holds the codec reference), so the GC reclaims each codec when
+// its last user finishes.
+func (r *dictReg) prune(keep func(Codec) bool) []uint32 {
+	r.mu.Lock()
+	var removed []uint32
+	for id, c := range r.byID {
+		if id == 0 || keep(c) {
+			continue
+		}
+		delete(r.byID, id)
+		delete(r.idOf, c)
+		removed = append(removed, id)
+	}
+	dir := r.dir
+	r.mu.Unlock()
+	for _, id := range removed {
+		if dir != "" {
+			_ = os.Remove(filepath.Join(dir, fmt.Sprintf("%d.zst", id)))
+		}
+	}
+	return removed
+}
+
 // writeDictFile writes a dictionary's bytes to path and fsyncs it (so a codec that
 // segments already reference cannot be lost across a crash).
 func writeDictFile(path string, dict []byte) error {
@@ -224,6 +253,10 @@ func Open(opts Options) (*Collection, error) {
 			return newMmapSegment(id, size, codec, path)
 		}
 	}
+	// Recovery is complete: every live segment's codec is known, so dictionaries only
+	// history references (loadDicts loads the full on-disk set) can be dropped now
+	// instead of holding an inflatable codec each for the life of the process.
+	c.pruneDicts()
 	// Indexes are derived state, not persisted: build them over the recovered
 	// segments so a reopened collection's queries are immediately selective.
 	if c.spec.Load().any() {
