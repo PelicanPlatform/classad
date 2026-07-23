@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 
 	"github.com/klauspost/compress/zstd"
@@ -51,11 +52,21 @@ type zstdCodec struct {
 	spool   sync.Pool      // *streamDec, one per concurrent prefix read
 }
 
-// zstdEncoderConcurrency caps how many encoder states (each a resident multi-MB match
-// window) a shared zstd codec preallocates. The default is GOMAXPROCS, which on a
-// many-core host holds hundreds of MB per trained dictionary; 4 keeps ample parallelism
-// for concurrent same-table commits while bounding memory independent of core count.
-const zstdEncoderConcurrency = 4
+// maxEncoderConcurrency is the CEILING on how many encoder states (each a resident
+// multi-MB match window) a shared zstd codec preallocates. The effective value is
+// min(GOMAXPROCS, this): the library default is GOMAXPROCS, so this only ever LOWERS it
+// on a many-core host (where GOMAXPROCS slots hold hundreds of MB per trained dictionary)
+// and never RAISES it on a small host (<=4 cores keep their GOMAXPROCS default). 4 keeps
+// ample parallelism for concurrent same-table commits while bounding memory.
+const maxEncoderConcurrency = 4
+
+// encoderConcurrency returns the capped concurrency for a new codec's encoder.
+func encoderConcurrency() int {
+	if n := runtime.GOMAXPROCS(0); n < maxEncoderConcurrency {
+		return n
+	}
+	return maxEncoderConcurrency
+}
 
 // NewZSTDCodec returns a ZSTD codec. If dict is non-empty it is used as a shared
 // compression dictionary (see TrainDict). Pass nil for dictionary-less ZSTD.
@@ -68,12 +79,12 @@ func NewZSTDCodec(dict []byte) (Codec, error) {
 	// couple of slots earn their keep -- but GOMAXPROCS of them, each a multi-MB window
 	// that stays resident once a slot is ever used, is pure waste on a many-core host. A
 	// production heap profile showed the encoder path holding 310+ MB (>80% of live heap),
-	// still creeping upward as slots warmed. Capping at zstdEncoderConcurrency keeps enough
+	// still creeping upward as slots warmed. Capping at min(GOMAXPROCS, 4) keeps enough
 	// parallelism for the write path (compresses are microseconds, so a short burst drains
 	// immediately) while hard-bounding memory at N*window per codec regardless of load or
 	// core count. Decoders are left at the default: DecodeAll parallelism helps the
 	// read/query path and did not show up as resident in the profile.
-	eopts := []zstd.EOption{zstd.WithEncoderConcurrency(zstdEncoderConcurrency)}
+	eopts := []zstd.EOption{zstd.WithEncoderConcurrency(encoderConcurrency())}
 	var dopts []zstd.DOption
 	if len(dict) > 0 {
 		eopts = append(eopts, zstd.WithEncoderDict(dict))
