@@ -54,7 +54,19 @@ type zstdCodec struct {
 // NewZSTDCodec returns a ZSTD codec. If dict is non-empty it is used as a shared
 // compression dictionary (see TrainDict). Pass nil for dictionary-less ZSTD.
 func NewZSTDCodec(dict []byte) (Codec, error) {
-	var eopts []zstd.EOption
+	// Encoder concurrency 1 caps the encoder's memory. A zstd.Encoder preallocates one
+	// match-finder state -- including a large history buffer (fastBase.ensureHist) -- PER
+	// concurrency slot, and the default is GOMAXPROCS. This codec is shared and used
+	// almost entirely by single-shot EncodeAll on small ads (a few KB) that compress in
+	// microseconds and are already issued serially per commit/compaction, so the
+	// GOMAXPROCS slots buy nothing but sit resident forever. On a many-core host that is
+	// hundreds of MB of encoder history per trained dictionary; a heap profile of a
+	// production daemon showed ~310 MB (83% of live heap) in exactly this path. With a cap
+	// of 1 EncodeAll stays fully correct and concurrency-safe (concurrent callers serialize
+	// on the one state), at ~GOMAXPROCS-times less resident memory. Decoders are left at
+	// the default: DecodeAll parallelism helps the read/query path and did not show up as
+	// resident in the profile.
+	eopts := []zstd.EOption{zstd.WithEncoderConcurrency(1)}
 	var dopts []zstd.DOption
 	if len(dict) > 0 {
 		eopts = append(eopts, zstd.WithEncoderDict(dict))
