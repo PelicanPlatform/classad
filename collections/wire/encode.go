@@ -111,17 +111,37 @@ func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}
 	e := encoder{inline: true, seal: seal}
 	var hots []hotPair
 	if ad != nil {
+		// Hot entries are written FIRST, so the hot region occupies a physical
+		// prefix of the record: a compressed store can then decompress only that
+		// prefix to serve a hot-covered projection (see Codec.DecompressPrefix).
+		// The partition is stable within each class, so among same-named
+		// duplicates the first still comes first.
+		isHot := func(attr *ast.AttributeAssignment) bool {
+			if seal != nil && encrypt != nil && encrypt(attr.Name) {
+				return false // encrypted attributes are never indexed / hot
+			}
+			_, ok := hot[foldASCII(attr.Name)]
+			return ok
+		}
 		for _, attr := range ad.Attributes {
-			entryOff := len(e.buf) // offset of the (name, node) entry within the region
+			if !isHot(attr) {
+				continue
+			}
+			entryOff := len(e.buf)
+			e.putString(attr.Name)
+			e.node(attr.Value)
+			hots = append(hots, hotPair{nameHash32(attr.Name), uint32(entryOff)})
+		}
+		for _, attr := range ad.Attributes {
+			if isHot(attr) {
+				continue
+			}
 			e.putString(attr.Name)
 			if seal != nil && encrypt != nil && encrypt(attr.Name) {
 				e.encNode(attr.Value)
-				continue // encrypted attributes are never indexed / hot
+				continue
 			}
 			e.node(attr.Value)
-			if _, ok := hot[foldASCII(attr.Name)]; ok {
-				hots = append(hots, hotPair{nameHash32(attr.Name), uint32(entryOff)})
-			}
 		}
 	}
 	out := append(dst, magicByte, formatVer, flagInlineNames)

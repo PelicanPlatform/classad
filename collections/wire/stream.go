@@ -188,6 +188,13 @@ func (s *StreamEncoder) Bytes(dst []byte) []byte {
 	var flags byte
 	if s.inline {
 		flags = flagInlineNames
+		// Reorder the entries region hot-first so the hot region is a physical
+		// prefix of the record (prefix-decompressable; see EncodeInlineWithHotEnc).
+		// Entries were streamed in arrival order, so the hot entries' extents are
+		// parsed out and moved to the front here, with their header offsets
+		// recomputed. Order within each class is preserved (stable), keeping
+		// first-occurrence-wins duplicate semantics intact.
+		s.reorderHotFirstInline()
 	}
 	out := append(dst, magicByte, formatVer, flags)
 	out = binary.AppendUvarint(out, uint64(len(s.hots)))
@@ -198,4 +205,48 @@ func (s *StreamEncoder) Bytes(dst []byte) []byte {
 	out = binary.AppendUvarint(out, uint64(s.count))
 	out = append(out, s.entries...)
 	return out
+}
+
+// reorderHotFirstInline rewrites s.entries with the hot entries first and
+// updates s.hots' offsets. A no-op when nothing is hot or everything already
+// sits at the front. Hot pairs are recorded in write order, so their extents
+// are ascending and the cold remainder is the gaps between them, emitted in
+// order.
+func (s *StreamEncoder) reorderHotFirstInline() {
+	if len(s.hots) == 0 {
+		return
+	}
+	// Parse each hot entry's extent from its recorded start.
+	type extent struct{ start, end int }
+	exts := make([]extent, len(s.hots))
+	contiguousPrefix := true
+	prevEnd := 0
+	for i, h := range s.hots {
+		c := &cursor{b: s.entries, pos: int(h.off), ok: true, inline: true}
+		c.skip(int(c.uvarint())) // name
+		skipNode(c, 0)
+		if !c.ok {
+			return // malformed entry: leave the region untouched
+		}
+		exts[i] = extent{int(h.off), c.pos}
+		if int(h.off) != prevEnd {
+			contiguousPrefix = false
+		}
+		prevEnd = c.pos
+	}
+	if contiguousPrefix {
+		return // hot entries already occupy the front, in order
+	}
+	reordered := make([]byte, 0, len(s.entries))
+	for i := range exts {
+		s.hots[i].off = uint32(len(reordered))
+		reordered = append(reordered, s.entries[exts[i].start:exts[i].end]...)
+	}
+	prev := 0
+	for _, ex := range exts {
+		reordered = append(reordered, s.entries[prev:ex.start]...)
+		prev = ex.end
+	}
+	reordered = append(reordered, s.entries[prev:]...)
+	s.entries = reordered
 }

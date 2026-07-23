@@ -37,6 +37,39 @@ func (e *encoder) encNode(v ast.Expr) {
 	e.buf = append(e.buf, ct...)
 }
 
+// OpenEncryptedNode returns the plain node bytes sealed inside an nEncrypted
+// node -- the sealed payload IS the value's ordinary node encoding, so opening
+// it needs no re-encode. Returns (nil, false) if node is not an nEncrypted
+// node, open is nil, or authentication fails. A relay that ships wire-form
+// rows to a consumer without the data key uses this to emit the entry with its
+// value in the clear (the consumer cannot open it).
+func OpenEncryptedNode(node []byte, open Sealer) ([]byte, bool) {
+	if open == nil || len(node) == 0 || node[0] != nEncrypted {
+		return nil, false
+	}
+	c := &cursor{b: node, pos: 1, ok: true}
+	nl := int(c.uvarint())
+	if !c.ok || c.pos+nl > len(node) {
+		return nil, false
+	}
+	nonce := node[c.pos : c.pos+nl]
+	c.pos += nl
+	cl := int(c.uvarint())
+	if !c.ok || c.pos+cl > len(node) {
+		return nil, false
+	}
+	plain, err := open.Open(nonce, node[c.pos:c.pos+cl])
+	if err != nil {
+		return nil, false
+	}
+	return plain, true
+}
+
+// IsEncryptedNode reports whether node is an nEncrypted (at-rest sealed) node.
+func IsEncryptedNode(node []byte) bool {
+	return len(node) > 0 && node[0] == nEncrypted
+}
+
 // DecodeNodeInlineEnc decodes raw node bytes from an inline-names ad (as returned by
 // LookupByName), opening an nEncrypted node with open. A nil open leaves an encrypted
 // node an error (the fast path treats that as absent).

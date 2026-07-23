@@ -114,3 +114,22 @@ func (db *DB) QueryRawProjected(constraint string, projection []string, redact b
 	}
 	return db.c.QueryRawProjected(q, projection, false, redact), nil
 }
+
+// QueryRawWire yields each matching ad as a self-contained WIRE-FORM ROW (an
+// inline-names subset ad assembled by slice copies -- see
+// collections.ScanRawWire): the relay form for shipping ads to a remote
+// consumer with the old-ClassAd render deferred to that consumer's client edge.
+// projection restricts the entries (empty = whole ad); redact strips private
+// attributes at the source. At-rest-encrypted values are opened during assembly
+// (the consumer holds no data key). Only meaningful for persistent (inline)
+// stores; an in-memory table yields nothing.
+func (db *DB) QueryRawWire(constraint string, projection []string, redact bool) (iter.Seq[[]byte], error) {
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return db.c.ScanRawWire(projection, redact), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryRawWire(q, projection, redact), nil
+}
