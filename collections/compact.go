@@ -40,6 +40,8 @@ const (
 // safe to call concurrently with reads and writes. Returns the number of shards where
 // space was reclaimed (by either mechanism).
 func (c *Collection) Compact() int {
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
 	start := time.Now()
 	defer func() { c.opm.compact.observe(time.Since(start)) }()
 	target := c.currentCodec()
@@ -168,6 +170,8 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 // value. Run it during low write activity (or, in an HA deployment, on the sole
 // writer).
 func (c *Collection) Rewrite() int {
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
 	n := 0
 	for _, k := range c.Keys() {
 		kb := []byte(k)
@@ -199,6 +203,8 @@ func (c *Collection) Rewrite() int {
 var retrainStallHook func()
 
 func (c *Collection) RetrainDict(sampleMax int) (int, error) {
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
 	start := time.Now()
 	defer func() { c.opm.retrain.observe(time.Since(start)) }()
 	dict, err := TrainDict(c.CollectSamples(sampleMax))
@@ -225,7 +231,29 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	c.lastDictBytes.Store(int64(len(dict)))
 	c.lastRetrainUnix.Store(time.Now().UnixNano())
 	c.reindexAfterCompaction() // rebuild indexes over the recompacted segments
+	// The recompaction re-encoded (or left in place) every live segment; dictionaries no
+	// segment references anymore are dead weight -- drop them so the registry does not
+	// grow by one inflated codec per retrain for the life of the process.
+	c.pruneDicts()
 	return len(dict), nil
+}
+
+// pruneDicts drops registered dictionaries that no live segment references (keeping the
+// current write codec), unlinking their on-disk .zst files. Called after a retrain's
+// recompaction (which retires old-codec segments en masse) and at Open (loadDicts loads
+// the full on-disk history; recovery then references only the ids live segments carry).
+func (c *Collection) pruneDicts() {
+	live := map[Codec]bool{c.currentCodec(): true}
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg != nil {
+				live[seg.codec] = true
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	c.dicts.prune(func(cd Codec) bool { return live[cd] })
 }
 
 // reindexAfterCompaction rebuilds the segment indexes after compaction replaced the
