@@ -125,7 +125,7 @@ func (sh *shard) applyWrites(writes []pendingPut) {
 	sh.commitSeq = seq
 	sh.maybeCheckpoint(seq)
 	sh.unlockWrite(acq, held)
-	sh.sync()
+	sh.syncFor(seq)
 	if sh.hub != nil {
 		for i := range writes {
 			sh.hub.publish(sh.idx, seq, writes[i].key, writes[i].ad, writes[i].codec, false)
@@ -142,7 +142,7 @@ func (sh *shard) applyOne(p pendingPut) {
 	sh.commitSeq = seq
 	sh.maybeCheckpoint(seq)
 	sh.unlockWrite(acq, held)
-	sh.sync()
+	sh.syncFor(seq)
 	if sh.hub != nil {
 		sh.hub.publish(sh.idx, seq, p.key, p.ad, p.codec, false)
 	}
@@ -161,7 +161,7 @@ func (sh *shard) applyBatch(batch []*commitReq) {
 	sh.commitSeq = seq
 	sh.maybeCheckpoint(seq)
 	sh.unlockWrite(acq, held)
-	sh.sync()
+	sh.syncFor(seq)
 	if sh.hub != nil {
 		for _, r := range batch {
 			for i := range r.writes {
@@ -171,21 +171,62 @@ func (sh *shard) applyBatch(batch []*commitReq) {
 	}
 }
 
-// sync is the durability point: where a future durable collection would fsync or
-// serialize the just-committed batch. It runs once per (possibly coalesced)
-// batch. Today it is a no-op unless a CommitSync hook is configured.
+// sync is the durability point for callers that do not know their commit sequence:
+// it makes everything applied so far durable. Callers that do know (Txn.Commit,
+// applyBatch) use syncFor directly for precise coalescing.
 func (sh *shard) sync() {
+	sh.mu.RLock()
+	need := sh.commitSeq
+	sh.mu.RUnlock()
+	sh.syncFor(need)
+}
+
+// syncFor makes every write with commit sequence <= need durable before returning.
+// It group-commits: concurrent committers to one shard share msync passes instead of
+// each running (or worse, skipping) one. A caller whose need is already covered by a
+// COMPLETED pass returns immediately; if a pass is in flight it waits -- the pass may
+// cover it (its dirty capture may postdate this caller's apply), and if not the loop
+// elects a waiter to lead the next pass, which then covers every waiter at once. N
+// concurrent commits thus pay ~2 msync passes.
+//
+// This also closes a durability hole in the old code, which swapped the dirty list and
+// msync'd with no coordination: a racing sync() could observe an empty dirty list and
+// return -- acking its commit durable -- while the pass covering its pages was still in
+// flight. Here nobody returns before a pass whose capture postdates their writes has
+// COMPLETED.
+func (sh *shard) syncFor(need uint64) {
 	if sh.onSync != nil {
 		sh.onSync()
 	}
 	if sh.alloc == nil {
 		return // in-memory shard
 	}
-	// Persistent shard: msync the pages written since the last sync so the commit
-	// is durable before this returns. Capture the ranges and advance the durable
-	// mark under the lock (dirty is guarded by mu), then msync lock-free — only the
-	// current flusher runs sync() per shard, so no concurrent sync races here.
+	sh.smu.Lock()
+	for sh.syncedSeq < need {
+		if sh.syncing {
+			sh.scond.Wait() // an in-flight pass may cover us; re-check when it lands
+			continue
+		}
+		sh.syncing = true
+		sh.smu.Unlock()
+		covered := sh.syncPass()
+		sh.smu.Lock()
+		if covered > sh.syncedSeq {
+			sh.syncedSeq = covered
+		}
+		sh.syncing = false
+		sh.scond.Broadcast()
+	}
+	sh.smu.Unlock()
+}
+
+// syncPass runs one durability pass: msync the pages written since the last pass.
+// It returns the commit sequence the pass covers -- captured under the same lock
+// acquisition as the dirty list, so every write applied at or before that sequence
+// is either in the captured ranges or was covered by an earlier pass.
+func (sh *shard) syncPass() uint64 {
 	sh.mu.Lock()
+	covered := sh.commitSeq
 	dirty := sh.dirty
 	sh.dirty = nil
 	sup := sh.dirtySup
@@ -237,4 +278,5 @@ func (sh *shard) sync() {
 	for _, s := range sup {
 		s.seg.unpin()
 	}
+	return covered
 }

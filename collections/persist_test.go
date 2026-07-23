@@ -811,6 +811,10 @@ func TestDeleteTombstoneFlushPath(t *testing.T) {
 	sh.dirtySup = nil // clear any prior state
 	seq := sh.commitSeq + 1
 	ok, _ := sh.del(h, key, seq)
+	// Mirror the real Delete path: advance the commit sequence for the tombstone.
+	// sync() group-commits by sequence (syncFor), so dirty state queued WITHOUT a
+	// sequence bump -- which no production path does -- would look already-covered.
+	sh.commitSeq = seq
 	nQueued := len(sh.dirtySup)
 	sh.mu.Unlock()
 	if !ok {
