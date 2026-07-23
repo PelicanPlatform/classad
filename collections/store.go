@@ -549,7 +549,7 @@ func (c *Collection) Delete(key []byte) bool {
 	sh.unlockWrite(acq, held)
 	if ok {
 		c.removeOrdered(key)
-		sh.sync() // durability point for the tombstone (not coalesced)
+		sh.sync() // durability point for the tombstone (group-committed via syncFor)
 		if sh.delLog != nil {
 			sh.delLog.record(key, seq) // retain for resuming watchers
 			sh.hub.publish(sh.idx, seq, key, nil, nil, true)

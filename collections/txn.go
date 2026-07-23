@@ -344,10 +344,10 @@ func (tx *Txn) Commit() CommitResult {
 	// the commit -- a small commit touches one shard and syncs inline with no goroutines;
 	// only a large, many-shard commit fans out.
 	if tx.durable {
-		var toSync []int
+		var toSync []shardCommit
 		for _, c := range commits {
 			if c.changed {
-				toSync = append(toSync, c.idx)
+				toSync = append(toSync, c)
 			}
 		}
 		if len(toSync) > 0 {
@@ -356,14 +356,18 @@ func (tx *Txn) Commit() CommitResult {
 			// the true commit durability latency. The per-shard Sync counter still records
 			// each msync, but its total is now fsync WORK, not this latency -- so measure
 			// the wall time here explicitly (commitSync).
+			//
+			// syncFor(seq) group-commits: concurrent transactions hitting the same shard
+			// share msync passes (and none returns before the pass covering ITS writes
+			// completes), so under commit fan-out N transactions pay ~2 passes, not N.
 			syncStart := time.Now()
 			if len(toSync) == 1 {
-				tx.c.shards[toSync[0]].sync()
+				tx.c.shards[toSync[0].idx].syncFor(toSync[0].seq)
 			} else {
 				var wg sync.WaitGroup
 				wg.Add(len(toSync))
-				for _, idx := range toSync {
-					go func(sh *shard) { defer wg.Done(); sh.sync() }(tx.c.shards[idx])
+				for _, c := range toSync {
+					go func(sh *shard, seq uint64) { defer wg.Done(); sh.syncFor(seq) }(tx.c.shards[c.idx], c.seq)
 				}
 				wg.Wait()
 			}

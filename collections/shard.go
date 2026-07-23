@@ -35,6 +35,15 @@ type shard struct {
 	flushing bool
 	onSync   func() // durability sync run once per committed batch; nil = no-op
 
+	// Sync coalescing (group commit for the durability msync; see shard.syncFor).
+	// syncedSeq is the highest commitSeq a COMPLETED msync pass covers; syncing marks a
+	// pass in flight. A syncFor caller already covered rides free; others wait for or
+	// lead a pass whose dirty capture postdates their writes. Guarded by smu/scond.
+	smu       sync.Mutex
+	scond     *sync.Cond
+	syncing   bool
+	syncedSeq uint64
+
 	// Persistent segment allocation. alloc is nil for an in-memory shard (RAM
 	// segments); for a persistent shard it creates an mmap-backed segment file.
 	// writeErr is the first segment-allocation failure (sticky; guarded by mu),
@@ -113,11 +122,13 @@ type supRef struct {
 }
 
 func newShard(segSize int, onSync func()) *shard {
-	return &shard{
+	sh := &shard{
 		dir:     make(map[uint64]loc),
 		segSize: segSize,
 		onSync:  onSync,
 	}
+	sh.scond = sync.NewCond(&sh.smu)
+	return sh
 }
 
 // allocSeg creates a new segment via the persistent factory if configured, else a
