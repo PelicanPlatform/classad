@@ -31,24 +31,49 @@ type InternTable struct {
 	// exact names can map to one id (e.g. "Owner", "owner", "OWNER").
 	byExact map[string]uint32
 	byFold  map[string]uint32 // ToLower(name) -> id
-	// canon (id -> first-seen casing) is published as an immutable, append-only
-	// slice behind an atomic pointer so Name resolves an id with no lock. Name is
-	// called for every attribute of every ad during serialization; an RWMutex.RLock
-	// there -- though logically a read -- serializes on its atomic reader counter
-	// across cores, which alone was ~23% of CPU on concurrent large-ad scans.
-	// Writers (Intern, holding mu) copy-append and atomically publish; existing
-	// entries are never mutated, so a lock-free reader always sees a valid snapshot.
-	canon atomic.Pointer[[]string]
+	// canon (id -> entry: first-seen casing + private flag) is published as an
+	// immutable, append-only slice behind an atomic pointer so Name/IsPrivate
+	// resolve an id with no lock. Name is called for every attribute of every ad
+	// during serialization; an RWMutex.RLock there -- though logically a read --
+	// serializes on its atomic reader counter across cores, which alone was ~23%
+	// of CPU on concurrent large-ad scans. Writers (Intern, holding mu) copy-append
+	// and atomically publish; existing entries are never mutated, so a lock-free
+	// reader always sees a valid snapshot. The private flag lives INSIDE the entry
+	// (not a parallel slice under its own atomic) so a single load observes a
+	// consistent name+flag pair.
+	canon atomic.Pointer[[]internEntry]
+	// privacy classifies a name as private (secret) ONCE, when its id is first
+	// allocated; per-attribute consumers then read the precomputed flag by id.
+	// nil means nothing is private. Set at construction only -- flags computed for
+	// already-interned ids are never revisited.
+	privacy func(string) bool
+}
+
+// internEntry is one id's published state: its canonical (first-seen) casing and
+// whether the name is private (per the table's privacy predicate).
+type internEntry struct {
+	name    string
+	private bool
 }
 
 // NewInternTable returns an empty table. Id 0 is a valid id (the first name
 // interned); callers that need a sentinel should track presence separately.
 func NewInternTable() *InternTable {
+	return NewInternTableWithPrivacy(nil)
+}
+
+// NewInternTableWithPrivacy returns an empty table whose entries are flagged
+// private when privacy(name) is true, evaluated once per unique name at intern
+// time. Redacting iterators (Ad.ForEachNamedRedact) skip flagged ids, so a
+// serialization path can strip secrets in O(1) per attribute instead of
+// re-classifying every attribute name of every ad. A nil privacy flags nothing.
+func NewInternTableWithPrivacy(privacy func(string) bool) *InternTable {
 	t := &InternTable{
 		byExact: make(map[string]uint32),
 		byFold:  make(map[string]uint32),
+		privacy: privacy,
 	}
-	empty := []string{}
+	empty := []internEntry{}
 	t.canon.Store(&empty)
 	return t
 }
@@ -76,12 +101,16 @@ func (t *InternTable) Intern(name string) uint32 {
 	id, ok = t.byFold[fold]
 	if !ok {
 		// First time any casing of this name is seen: allocate an id and record
-		// this casing as canonical. Copy-append (cap==len forces a fresh backing
-		// array) so lock-free readers holding the old snapshot are unaffected, then
-		// publish atomically. New names are rare after warmup, so the copy is cheap.
+		// this casing as canonical (classifying it as private exactly once).
+		// Copy-append (cap==len forces a fresh backing array) so lock-free readers
+		// holding the old snapshot are unaffected, then publish atomically. New
+		// names are rare after warmup, so the copy is cheap.
 		old := *t.canon.Load()
 		id = uint32(len(old))
-		next := append(old[:len(old):len(old)], name)
+		next := append(old[:len(old):len(old)], internEntry{
+			name:    name,
+			private: t.privacy != nil && t.privacy(name),
+		})
 		t.canon.Store(&next)
 		t.byFold[fold] = id
 	}
@@ -110,7 +139,23 @@ func (t *InternTable) Name(id uint32) (string, bool) {
 	if int(id) >= len(canon) {
 		return "", false
 	}
-	return canon[id], true
+	return canon[id].name, true
+}
+
+// IsPrivate reports whether id's name was classified private by the table's
+// privacy predicate when it was interned. Lock-free; an unallocated id is not
+// private. O(1) -- this is the point of precomputing the flag: a redacting
+// serializer checks one bool per attribute instead of re-classifying its name.
+func (t *InternTable) IsPrivate(id uint32) bool {
+	canon := *t.canon.Load()
+	return int(id) < len(canon) && canon[id].private
+}
+
+// isPrivateName classifies a (non-interned) name with the table's privacy
+// predicate -- the redacting iterator uses it for inline-encoded ads, whose
+// attribute names are stored in the ad body rather than as interned ids.
+func (t *InternTable) isPrivateName(name string) bool {
+	return t.privacy != nil && t.privacy(name)
 }
 
 // Len returns the number of interned names (== the next id to be allocated).
@@ -123,6 +168,8 @@ func (t *InternTable) Len() int {
 func (t *InternTable) snapshotNames() []string {
 	canon := *t.canon.Load()
 	out := make([]string, len(canon))
-	copy(out, canon)
+	for i, e := range canon {
+		out[i] = e.name
+	}
 	return out
 }

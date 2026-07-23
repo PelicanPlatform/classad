@@ -29,6 +29,20 @@ type RawAd struct {
 // Inline-name (persistent) collections have no intern table, so QueryRaw yields
 // nothing for them; callers that must support those should use Query.
 func (c *Collection) QueryRaw(q *vm.Query) iter.Seq[RawAd] {
+	return c.queryRaw(q, false)
+}
+
+// QueryRawRedacted is QueryRaw with private (secret) attributes stripped from
+// every yielded ad, using the intern table's precomputed per-id private flags
+// (see wire.NewInternTableWithPrivacy): the redaction costs one bool check per
+// attribute and private nodes are never rendered at all. Use it to serve a
+// public query; QueryRaw preserves private attributes for trusted consumers
+// (e.g. the negotiator's private-ad query).
+func (c *Collection) QueryRawRedacted(q *vm.Query) iter.Seq[RawAd] {
+	return c.queryRaw(q, true)
+}
+
+func (c *Collection) queryRaw(q *vm.Query, redact bool) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
 		plan := q.ReadPlan()
 		ws := &wireScope{ctx: c}
@@ -43,7 +57,7 @@ func (c *Collection) QueryRaw(q *vm.Query) iter.Seq[RawAd] {
 		probes := q.Probes()
 		c.demand.record(probes)
 		usable := c.planIndex(probes)
-		emit := c.yieldRaw(yield)
+		emit := c.yieldRaw(yield, redact)
 		for _, sh := range c.shards {
 			var cont bool
 			if len(usable) > 0 {
@@ -60,9 +74,19 @@ func (c *Collection) QueryRaw(q *vm.Query) iter.Seq[RawAd] {
 
 // ScanRaw is Scan, yielding every ad as RawAd (AST-free).
 func (c *Collection) ScanRaw() iter.Seq[RawAd] {
+	return c.scanRaw(false)
+}
+
+// ScanRawRedacted is ScanRaw with private attributes stripped (see
+// QueryRawRedacted).
+func (c *Collection) ScanRawRedacted() iter.Seq[RawAd] {
+	return c.scanRaw(true)
+}
+
+func (c *Collection) scanRaw(redact bool) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
 		q := queryPlan{}
-		emit := c.yieldRaw(yield)
+		emit := c.yieldRaw(yield, redact)
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {
 				return
@@ -75,14 +99,14 @@ func (c *Collection) ScanRaw() iter.Seq[RawAd] {
 // wire bytes straight to old-ClassAd text and yield them. The buf/offs/exprs
 // scratch is reused across the whole scan (single-threaded), so no per-ad
 // expression bytes are allocated.
-func (c *Collection) yieldRaw(yield func(RawAd) bool) func(w []byte) bool {
+func (c *Collection) yieldRaw(yield func(RawAd) bool, redact bool) func(w []byte) bool {
 	var buf []byte
 	var offs []int
 	var exprs [][]byte
 	return func(w []byte) bool {
 		var mt, tt string
 		var ok bool
-		buf, offs, mt, tt, ok = c.appendWireAd(w, buf, offs)
+		buf, offs, mt, tt, ok = c.appendWireAd(w, buf, offs, redact)
 		if !ok {
 			return true // undecodable record: skip, keep scanning
 		}
@@ -112,7 +136,7 @@ func (c *Collection) decodeAdRaw(stored []byte, codec Codec, dst []byte) (exprs 
 	if err != nil {
 		return nil, "", "", false
 	}
-	buf, offs, mt, tt, ok := c.appendWireAd(wireBytes, nil, nil)
+	buf, offs, mt, tt, ok := c.appendWireAd(wireBytes, nil, nil, false)
 	if !ok {
 		return nil, "", "", false
 	}
@@ -130,15 +154,17 @@ func (c *Collection) decodeAdRaw(stored []byte, codec Codec, dst []byte) (exprs 
 // as trailing fields, not numbered expressions). Passing the previous ad's buf/offs
 // reuses their backing, so a streaming scan allocates no per-ad expression strings.
 // Returns ok=false for inline-name ads (no intern table).
-func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int) (outBuf []byte, outOffs []int, myType, targetType string, ok bool) {
+func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int, redact bool) (outBuf []byte, outOffs []int, myType, targetType string, ok bool) {
 	buf = buf[:0]
 	offs = append(offs[:0], 0)
 	// ForEachNamed handles both encodings: an inline (persistent) ad yields its
 	// stored names and the intern table is ignored; an interned ad resolves ids
 	// through it. Values render with the matching decoder (inline nodes carry
-	// inline names too).
+	// inline names too). The redacting variant strips private attributes as it
+	// de-interns -- a per-id flag check, so the redacted response costs no
+	// name re-classification and private values are never rendered.
 	good := true
-	wire.Ad(wireBytes).ForEachNamed(c.intern, func(name string, node []byte) bool {
+	emit := func(name string, node []byte) bool {
 		if name == "MyType" || name == "TargetType" {
 			if lit, lok := wire.LiteralValue(node); lok && lit.Kind == wire.LitString {
 				if name == "MyType" {
@@ -163,7 +189,12 @@ func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int) (out
 		}
 		offs = append(offs, len(buf))
 		return true
-	})
+	}
+	if redact {
+		wire.Ad(wireBytes).ForEachNamedRedact(c.intern, emit)
+	} else {
+		wire.Ad(wireBytes).ForEachNamed(c.intern, emit)
+	}
 	if !good {
 		return buf, offs, "", "", false
 	}

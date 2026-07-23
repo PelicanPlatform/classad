@@ -2,10 +2,10 @@ package dbrpc
 
 import (
 	"context"
+	"iter"
 	"strings"
 	"time"
 
-	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 )
 
@@ -86,7 +86,16 @@ func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, in
 	if !ok {
 		return
 	}
-	seq, err := d.QueryRaw(constraint)
+	// Redaction is pushed into the collection's decode walk: an unprivileged
+	// stream never renders a private value, and no per-attribute name
+	// re-classification happens here.
+	var seq iter.Seq[collections.RawAd]
+	var err error
+	if includePrivate {
+		seq, err = d.QueryRaw(constraint)
+	} else {
+		seq, err = d.QueryRawRedacted(constraint)
+	}
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
@@ -95,7 +104,7 @@ func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, in
 		if cancelled(ctx) {
 			return
 		}
-		write(putStr(respHead(reqID, stStream), rawAdToOldText(ra, includePrivate)))
+		write(putStr(respHead(reqID, stStream), rawAdText(ra)))
 		n++
 		if limit > 0 && n >= limit {
 			break
@@ -104,11 +113,11 @@ func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, in
 	write(respHead(reqID, stStreamEnd))
 }
 
-// rawAdToOldText renders a RawAd as old-ClassAd wire text: the type tags as their
-// own lines followed by the attribute expression lines, dropping private
-// attributes unless includePrivate. It touches no AST -- the expression bytes are
-// copied straight from the stored form.
-func rawAdToOldText(ra collections.RawAd, includePrivate bool) string {
+// rawAdText renders a RawAd as old-ClassAd wire text: the type tags as their own
+// lines followed by the attribute expression lines verbatim. Filtering -- both
+// projection and private-attribute redaction -- already happened inside the
+// collection's decode walk, so nothing is re-classified here.
+func rawAdText(ra collections.RawAd) string {
 	var b strings.Builder
 	if ra.MyType != "" {
 		b.WriteString("MyType = \"")
@@ -121,27 +130,10 @@ func rawAdToOldText(ra collections.RawAd, includePrivate bool) string {
 		b.WriteString("\"\n")
 	}
 	for _, e := range ra.Exprs {
-		if !includePrivate && classad.IsPrivateAttribute(rawExprName(e)) {
-			continue
-		}
 		b.Write(e)
 		b.WriteByte('\n')
 	}
 	return b.String()
-}
-
-// rawExprName returns the attribute name of a rendered "Name = value" expression
-// line (leading whitespace trimmed, up to the first '=' or space).
-func rawExprName(expr []byte) string {
-	i := 0
-	for i < len(expr) && (expr[i] == ' ' || expr[i] == '\t') {
-		i++
-	}
-	start := i
-	for i < len(expr) && expr[i] != '=' && expr[i] != ' ' && expr[i] != '\t' {
-		i++
-	}
-	return string(expr[start:i])
 }
 
 // streamQueryRawProject is streamQueryRaw with a projection: it streams each
@@ -173,11 +165,10 @@ func (s *Server) streamQueryRawProject(ctx context.Context, reqID uint64, r *rea
 	if !ok {
 		return
 	}
-	proj := make(map[string]struct{}, len(attrs))
-	for _, a := range attrs {
-		proj[strings.ToLower(a)] = struct{}{}
-	}
-	seq, err := d.QueryRaw(constraint)
+	// The projection (and, unprivileged, redaction) is applied inside the
+	// collection's decode walk: non-projected attributes are never rendered, and a
+	// hot-header-covered projection is served from the hot header alone.
+	seq, err := d.QueryRawProjected(constraint, attrs, !includePrivate)
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
@@ -186,40 +177,11 @@ func (s *Server) streamQueryRawProject(ctx context.Context, reqID uint64, r *rea
 		if cancelled(ctx) {
 			return
 		}
-		write(putStr(respHead(reqID, stStream), rawAdToOldTextProjected(ra, proj, includePrivate)))
+		write(putStr(respHead(reqID, stStream), rawAdText(ra)))
 		n++
 		if limit > 0 && n >= limit {
 			break
 		}
 	}
 	write(respHead(reqID, stStreamEnd))
-}
-
-// rawAdToOldTextProjected is rawAdToOldText restricted to the attributes in proj
-// (lowercased names) -- plus MyType/TargetType, always kept so the ad stays
-// identifiable. Private attributes are still dropped unless includePrivate.
-func rawAdToOldTextProjected(ra collections.RawAd, proj map[string]struct{}, includePrivate bool) string {
-	var b strings.Builder
-	if ra.MyType != "" {
-		b.WriteString(`MyType = "`)
-		b.WriteString(ra.MyType)
-		b.WriteString("\"\n")
-	}
-	if ra.TargetType != "" {
-		b.WriteString(`TargetType = "`)
-		b.WriteString(ra.TargetType)
-		b.WriteString("\"\n")
-	}
-	for _, e := range ra.Exprs {
-		name := rawExprName(e)
-		if _, ok := proj[strings.ToLower(name)]; !ok {
-			continue
-		}
-		if !includePrivate && classad.IsPrivateAttribute(name) {
-			continue
-		}
-		b.Write(e)
-		b.WriteByte('\n')
-	}
-	return b.String()
 }

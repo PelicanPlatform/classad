@@ -38,7 +38,30 @@ const privateV2Prefix = "_condor_priv"
 // IsPrivateAttributeV1 reports whether name is one of HTCondor's fixed private
 // attributes (a claim capability or transfer key).
 func IsPrivateAttributeV1(name string) bool {
-	_, ok := privateAttrsV1[strings.ToLower(name)]
+	// This predicate runs on every attribute of every ad a collector serves, so it
+	// avoids the strings.ToLower allocation (attribute names are usually mixed-case,
+	// so ToLower would allocate a fresh lower-case string each call). Every V1
+	// private name is 7-13 bytes and begins with c/C or t/T; the vast majority of
+	// attributes fail that gate and never reach the map lookup.
+	if len(name) < 7 || len(name) > 13 {
+		return false
+	}
+	switch name[0] {
+	case 'c', 'C', 't', 'T':
+	default:
+		return false
+	}
+	// Case-fold into a stack buffer; a map lookup keyed by string(buf[:n]) is
+	// special-cased by the compiler to avoid a heap allocation.
+	var buf [13]byte
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b >= 'A' && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		buf[i] = b
+	}
+	_, ok := privateAttrsV1[string(buf[:len(name)])]
 	return ok
 }
 

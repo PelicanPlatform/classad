@@ -160,7 +160,7 @@ func newArchiveShell(opts ArchiveOptions) (*Archive, error) {
 		dir:     opts.Dir,
 		segSize: recAlign(segSize),
 		codec:   codec,
-		intern:  wire.NewInternTable(),
+		intern:  wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
 		ret:     opts.Retention,
 		hub:     newArchiveWatchHub(),
 	}, nil

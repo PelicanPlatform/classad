@@ -82,3 +82,35 @@ func (db *DB) QueryRaw(constraint string) (iter.Seq[collections.RawAd], error) {
 	}
 	return db.c.QueryRaw(q), nil
 }
+
+// QueryRawRedacted is QueryRaw with private (secret) attributes stripped inside
+// the collection's decode walk -- an unprivileged consumer's whole-ad query pays
+// no per-attribute re-classification and never renders a private value (see
+// collections.ScanRawRedacted).
+func (db *DB) QueryRawRedacted(constraint string) (iter.Seq[collections.RawAd], error) {
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return db.c.ScanRawRedacted(), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryRawRedacted(q), nil
+}
+
+// QueryRawProjected is QueryRaw restricted to the projected attribute names,
+// applied inside the collection's decode walk: a non-projected attribute is
+// skipped before any name resolution or value rendering, and a hot-header-
+// covered projection is served from the hot header alone (see
+// collections.ScanRawProjected). redact additionally strips private attributes.
+// An empty projection means no attribute filter.
+func (db *DB) QueryRawProjected(constraint string, projection []string, redact bool) (iter.Seq[collections.RawAd], error) {
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return db.c.ScanRawProjected(projection, false, redact), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryRawProjected(q, projection, false, redact), nil
+}
