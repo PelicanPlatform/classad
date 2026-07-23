@@ -51,10 +51,29 @@ type zstdCodec struct {
 	spool   sync.Pool      // *streamDec, one per concurrent prefix read
 }
 
+// zstdEncoderConcurrency caps how many encoder states (each a resident multi-MB match
+// window) a shared zstd codec preallocates. The default is GOMAXPROCS, which on a
+// many-core host holds hundreds of MB per trained dictionary; 4 keeps ample parallelism
+// for concurrent same-table commits while bounding memory independent of core count.
+const zstdEncoderConcurrency = 4
+
 // NewZSTDCodec returns a ZSTD codec. If dict is non-empty it is used as a shared
 // compression dictionary (see TrainDict). Pass nil for dictionary-less ZSTD.
 func NewZSTDCodec(dict []byte) (Codec, error) {
-	var eopts []zstd.EOption
+	// Cap encoder concurrency to bound the encoder's resident memory. A zstd.Encoder
+	// preallocates one match-finder state -- including a large history buffer
+	// (fastBase.ensureHist) -- PER concurrency slot, and the default is GOMAXPROCS. This
+	// codec is shared; a commit compresses each ad with it, and concurrent same-table
+	// commits (collector fan-out + many advertisers) do run Compress in parallel, so a
+	// couple of slots earn their keep -- but GOMAXPROCS of them, each a multi-MB window
+	// that stays resident once a slot is ever used, is pure waste on a many-core host. A
+	// production heap profile showed the encoder path holding 310+ MB (>80% of live heap),
+	// still creeping upward as slots warmed. Capping at zstdEncoderConcurrency keeps enough
+	// parallelism for the write path (compresses are microseconds, so a short burst drains
+	// immediately) while hard-bounding memory at N*window per codec regardless of load or
+	// core count. Decoders are left at the default: DecodeAll parallelism helps the
+	// read/query path and did not show up as resident in the profile.
+	eopts := []zstd.EOption{zstd.WithEncoderConcurrency(zstdEncoderConcurrency)}
 	var dopts []zstd.DOption
 	if len(dict) > 0 {
 		eopts = append(eopts, zstd.WithEncoderDict(dict))
