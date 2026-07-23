@@ -165,6 +165,149 @@ func (a Ad) ForEach(fn func(id uint32, node []byte) bool) bool {
 // wrong for inline ads -- this works for both encodings. Returns false if fn stopped
 // early or the ad is malformed.
 func (a Ad) ForEachNamed(t *InternTable, fn func(name string, node []byte) bool) bool {
+	return a.forEachNamed(t, false, fn)
+}
+
+// ForEachNamedRedact is ForEachNamed except attributes whose name the table
+// classified as private (see NewInternTableWithPrivacy) are skipped -- their
+// nodes are never decoded and fn never sees them. Interned attributes are
+// filtered by their precomputed per-id flag (O(1), no name resolution); inline
+// attributes fall back to the table's privacy predicate on the stored name.
+func (a Ad) ForEachNamedRedact(t *InternTable, fn func(name string, node []byte) bool) bool {
+	return a.forEachNamed(t, true, fn)
+}
+
+// ForEachHotInlineBuf is ForEachHotBuf's inline-names counterpart: an inline
+// ad's hot pairs are (nameHash32, offset) where the offset points at the whole
+// attribute ENTRY (inline name, then node). It yields the folded name hash, the
+// raw name bytes and the node bytes; the caller must verify the name (hashes
+// can collide) with foldEqualBytes before trusting a match. scratch as in
+// ForEachHotBuf. Reports false for an interned ad.
+func (a Ad) ForEachHotInlineBuf(scratch []uint32, fn func(hash uint32, name, node []byte) bool) ([]uint32, bool) {
+	c, ok := a.bodyStart()
+	if !ok || !c.inline {
+		return scratch, false
+	}
+	hotCount := c.uvarint()
+	if hotCount == 0 {
+		return scratch, c.ok
+	}
+	scratch = scratch[:0]
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		scratch = append(scratch, uint32(c.uvarint()), uint32(c.uvarint()))
+	}
+	c.uvarint() // attrCount
+	if !c.ok {
+		return scratch, false
+	}
+	entriesStart := c.pos
+	for i := 0; i+1 < len(scratch); i += 2 {
+		ec := &cursor{b: a, pos: entriesStart + int(scratch[i+1]), ok: true, inline: true}
+		name := ec.readNameBytes()
+		if !ec.ok {
+			return scratch, false
+		}
+		nodeStart := ec.pos
+		skipNode(ec, 0)
+		if !ec.ok {
+			return scratch, false
+		}
+		if !fn(scratch[i], name, a[nodeStart:ec.pos]) {
+			return scratch, true
+		}
+	}
+	return scratch, c.ok
+}
+
+// ForEachNameNode iterates an inline-names ad's attribute entries as raw (name
+// bytes, node bytes) pairs, allocating nothing -- the projection walk for a
+// persistent collection filters on the name bytes before rendering anything.
+// Reports false (calling fn for nothing) for an interned ad.
+func (a Ad) ForEachNameNode(fn func(name, node []byte) bool) bool {
+	c, ok := a.bodyStart()
+	if !ok || !c.inline {
+		return false
+	}
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	attrCount := c.uvarint()
+	for i := uint64(0); i < attrCount && c.ok; i++ {
+		name := c.readNameBytes()
+		if !c.ok {
+			return false
+		}
+		nodeStart := c.pos
+		skipNode(c, 0)
+		if !c.ok {
+			return false
+		}
+		if !fn(name, a[nodeStart:c.pos]) {
+			return true
+		}
+	}
+	return c.ok
+}
+
+// NameHash32 exposes the case-insensitive 32-bit hash used by inline hot-header
+// pairs, so a projected reader can precompute its wanted-name hashes.
+func NameHash32(name string) uint32 { return nameHash32(name) }
+
+// NameHash32Bytes is NameHash32 over raw name bytes (no string conversion).
+func NameHash32Bytes(name []byte) uint32 {
+	const off, prime = 2166136261, 16777619
+	h := uint32(off)
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		h = (h ^ uint32(c)) * prime
+	}
+	return h
+}
+
+// FoldEqualBytes reports whether the raw attribute-name bytes equal name
+// case-insensitively (ASCII fold, matching ClassAd attribute-name semantics).
+func FoldEqualBytes(b []byte, name string) bool { return foldEqualBytes(b, name) }
+
+// ForEachIDNode iterates the ad's attribute entries as raw (interned id, node
+// bytes) pairs, resolving nothing: the caller filters by id -- a projection's
+// wanted-set test, a privacy flag -- before paying for name resolution or value
+// rendering. Skipped entries cost one uvarint plus a TLV length hop. Returns
+// false (calling fn for nothing) for an inline-names ad, whose entries carry no
+// interned ids; fn returning false stops the walk early.
+func (a Ad) ForEachIDNode(fn func(id uint32, node []byte) bool) bool {
+	c, ok := a.bodyStart()
+	if !ok || c.inline {
+		return false
+	}
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	attrCount := c.uvarint()
+	for i := uint64(0); i < attrCount && c.ok; i++ {
+		aid := c.uvarint()
+		if !c.ok {
+			return false
+		}
+		nodeStart := c.pos
+		skipNode(c, 0)
+		if !c.ok {
+			return false
+		}
+		if !fn(uint32(aid), a[nodeStart:c.pos]) {
+			return true
+		}
+	}
+	return c.ok
+}
+
+func (a Ad) forEachNamed(t *InternTable, redact bool, fn func(name string, node []byte) bool) bool {
 	c, ok := a.bodyStart()
 	if !ok {
 		return false
@@ -183,10 +326,24 @@ func (a Ad) ForEachNamed(t *InternTable, fn func(name string, node []byte) bool)
 				return false
 			}
 			name = string(nm)
+			if redact && t.isPrivateName(name) {
+				skipNode(c, 0) // private: never surface its node
+				if !c.ok {
+					return false
+				}
+				continue
+			}
 		} else {
 			aid := c.uvarint()
 			if !c.ok {
 				return false
+			}
+			if redact && t.IsPrivate(uint32(aid)) {
+				skipNode(c, 0) // private: skip before even resolving the name
+				if !c.ok {
+					return false
+				}
+				continue
 			}
 			n, ok := t.Name(uint32(aid))
 			if !ok {
@@ -240,6 +397,42 @@ func (a Ad) AttrCount() int {
 // malformed. Cost is O(hotCount), independent of the total attribute count -- so a
 // collection whose hot set is the match closure can read exactly the match-relevant
 // attributes of a very wide ad without touching the cold ones.
+// ForEachHotBuf is ForEachHot with caller-provided scratch for the header's
+// (id, offset) pairs, grown as needed and returned for reuse -- a scan calling
+// it once per ad performs no per-ad allocation (ForEachHot allocates two slices
+// per call). scratch holds the pairs interleaved: id, offset, id, offset, ...
+// Interned ads only: an inline ad's hot pairs are (nameHash32, offset-to-ENTRY)
+// -- see ForEachHotInlineBuf -- so it reports false rather than mis-parse.
+func (a Ad) ForEachHotBuf(scratch []uint32, fn func(id uint32, node []byte) bool) ([]uint32, bool) {
+	c, ok := a.bodyStart()
+	if !ok || c.inline {
+		return scratch, false
+	}
+	hotCount := c.uvarint()
+	if hotCount == 0 {
+		return scratch, c.ok
+	}
+	scratch = scratch[:0]
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		scratch = append(scratch, uint32(c.uvarint()), uint32(c.uvarint()))
+	}
+	c.uvarint() // attrCount
+	if !c.ok {
+		return scratch, false
+	}
+	entriesStart := c.pos
+	for i := 0; i+1 < len(scratch); i += 2 {
+		node, ok := nodeBytesAt(a, entriesStart+int(scratch[i+1]))
+		if !ok {
+			return scratch, false
+		}
+		if !fn(scratch[i], node) {
+			return scratch, true
+		}
+	}
+	return scratch, c.ok
+}
+
 func (a Ad) ForEachHot(fn func(id uint32, node []byte) bool) bool {
 	c, ok := a.bodyStart()
 	if !ok {

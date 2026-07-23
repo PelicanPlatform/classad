@@ -371,7 +371,10 @@ func New(opts Options) *Collection {
 		shards: shards,
 		mask:   uint64(n - 1),
 		h:      h,
-		intern: wire.NewInternTable(),
+		// Private attributes are flagged once per unique name at intern time, so a
+		// redacted query (ScanRawRedacted/QueryRawRedacted) strips them with a per-id
+		// bool check instead of re-classifying every attribute of every ad.
+		intern: wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
 		demand: newDemandTracker(),
 	}
 	c.codec.Store(&codecHolder{codec})
