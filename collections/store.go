@@ -195,6 +195,14 @@ type Collection struct {
 	// Non-nil after New; persists dictionary bytes only when the collection has a Dir.
 	dicts *dictReg
 
+	// maintMu serializes whole-collection maintenance passes -- Compact and RetrainDict
+	// -- which htcondordb drives from SEPARATE tickers. Unserialized they race twice
+	// over: two concurrent compactShard calls on one shard duplicate its working set,
+	// and Compact's captured currentCodec can be pruned mid-pass by a concurrent
+	// retrain (orphaning the new segments' dictionary, which recovery then cannot
+	// load). Commits and queries never take it.
+	maintMu sync.Mutex
+
 	demand *demandTracker // per-attribute query demand, for SuggestIndexes
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap

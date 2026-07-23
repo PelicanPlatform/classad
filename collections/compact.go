@@ -40,6 +40,8 @@ const (
 // safe to call concurrently with reads and writes. Returns the number of shards where
 // space was reclaimed (by either mechanism).
 func (c *Collection) Compact() int {
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
 	start := time.Now()
 	defer func() { c.opm.compact.observe(time.Since(start)) }()
 	target := c.currentCodec()
@@ -168,6 +170,8 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 // value. Run it during low write activity (or, in an HA deployment, on the sole
 // writer).
 func (c *Collection) Rewrite() int {
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
 	n := 0
 	for _, k := range c.Keys() {
 		kb := []byte(k)
@@ -199,6 +203,8 @@ func (c *Collection) Rewrite() int {
 var retrainStallHook func()
 
 func (c *Collection) RetrainDict(sampleMax int) (int, error) {
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
 	start := time.Now()
 	defer func() { c.opm.retrain.observe(time.Since(start)) }()
 	dict, err := TrainDict(c.CollectSamples(sampleMax))

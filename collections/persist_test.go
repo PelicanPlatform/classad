@@ -661,8 +661,9 @@ func TestPersistentRetrainDictReopen(t *testing.T) {
 }
 
 // TestPersistentMultiRetrainReopen exercises several dictionary generations and a
-// crash (no Close) after the last retrain: every generation's dictionary is on disk
-// and recovery reconstructs whichever the surviving segments reference.
+// crash (no Close) after the last retrain: each retrain's recompaction retires the
+// previous generation's segments, so its dictionary is PRUNED (registry and disk);
+// only the surviving (referenced) dictionary remains, and recovery reconstructs it.
 func TestPersistentMultiRetrainReopen(t *testing.T) {
 	t.Parallel()
 	if !mmapSupported {
@@ -684,10 +685,14 @@ func TestPersistentMultiRetrainReopen(t *testing.T) {
 			t.Fatalf("RetrainDict gen %d: %v", gen, err)
 		}
 	}
-	// Three dictionaries on disk.
-	for id := 1; id <= 3; id++ {
-		if _, err := os.Stat(filepath.Join(dir, "dicts", fmt.Sprintf("%d.zst", id))); err != nil {
-			t.Fatalf("dict %d not persisted: %v", id, err)
+	// Only the latest dictionary survives: each retrain recompacted every segment to
+	// its new codec, so the superseded generations were pruned from disk.
+	if _, err := os.Stat(filepath.Join(dir, "dicts", "3.zst")); err != nil {
+		t.Fatalf("current dict not persisted: %v", err)
+	}
+	for id := 1; id <= 2; id++ {
+		if _, err := os.Stat(filepath.Join(dir, "dicts", fmt.Sprintf("%d.zst", id))); err == nil {
+			t.Fatalf("superseded dict %d still on disk, want pruned", id)
 		}
 	}
 	// Crash: reopen WITHOUT Close.
