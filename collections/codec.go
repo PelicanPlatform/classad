@@ -1,8 +1,11 @@
 package collections
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -44,6 +47,8 @@ type zstdCodec struct {
 	enc     *zstd.Encoder
 	dec     *zstd.Decoder
 	hasDict bool
+	dopts   []zstd.DOption // decoder options, for pooled streaming (prefix) decoders
+	spool   sync.Pool      // *streamDec, one per concurrent prefix read
 }
 
 // NewZSTDCodec returns a ZSTD codec. If dict is non-empty it is used as a shared
@@ -63,7 +68,7 @@ func NewZSTDCodec(dict []byte) (Codec, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &zstdCodec{enc: enc, dec: dec, hasDict: len(dict) > 0}, nil
+	return &zstdCodec{enc: enc, dec: dec, hasDict: len(dict) > 0, dopts: dopts}, nil
 }
 
 func (z *zstdCodec) Compress(dst, src []byte) []byte { return z.enc.EncodeAll(src, dst) }
@@ -141,4 +146,56 @@ func TrainDictSize(samples [][]byte, dictSize int) (dict []byte, err error) {
 		// dictionary ("invalid offset in dictionary").
 		Offsets: [3]int{1, 4, 8},
 	})
+}
+
+// PrefixDecompressor is an optional Codec capability: decompress only
+// (approximately) the first want bytes of a record. With the hot region encoded
+// as a physical prefix (see wire.EncodeInlineWithHotEnc), a hot-covered
+// projected read decompresses a couple of KB instead of the whole record. The
+// result may be shorter than want (the record ends first -- then it is the
+// complete record) and is otherwise a TRUNCATED record: the caller must be
+// prepared for parses to run off the end and fall back to a full Decompress.
+type PrefixDecompressor interface {
+	DecompressPrefix(dst, src []byte, want int) ([]byte, error)
+}
+
+// streamDec is one pooled streaming decoder (Reset-per-record) plus its reader.
+// zstd's DecodeAll is concurrency-safe but streaming decode is not, so each
+// concurrent prefix read takes its own decoder from the pool.
+type streamDec struct {
+	dec *zstd.Decoder
+	br  *bytes.Reader
+}
+
+func (z *zstdCodec) DecompressPrefix(dst, src []byte, want int) ([]byte, error) {
+	v := z.spool.Get()
+	var sd *streamDec
+	if v == nil {
+		dopts := append([]zstd.DOption{zstd.WithDecoderConcurrency(1)}, z.dopts...)
+		dec, err := zstd.NewReader(nil, dopts...)
+		if err != nil {
+			return dst, err
+		}
+		sd = &streamDec{dec: dec, br: new(bytes.Reader)}
+	} else {
+		sd = v.(*streamDec)
+	}
+	sd.br.Reset(src)
+	if err := sd.dec.Reset(sd.br); err != nil {
+		z.spool.Put(sd)
+		return dst, err
+	}
+	off := len(dst)
+	if cap(dst)-off < want {
+		dst = append(dst, make([]byte, want)...)
+	} else {
+		dst = dst[:off+want]
+	}
+	n, err := io.ReadFull(sd.dec, dst[off:])
+	dst = dst[:off+n]
+	z.spool.Put(sd)
+	if err == io.EOF || err == io.ErrUnexpectedEOF {
+		err = nil // the whole record was shorter than want: dst holds all of it
+	}
+	return dst, err
 }

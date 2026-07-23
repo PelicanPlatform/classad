@@ -124,6 +124,17 @@ const (
 	opGetExporter      op = 49 // [name] -> [found u8]([json db.ExporterDef]); DAEMON-only
 	opPutExporterState op = 50 // [name][blob] -> status; DAEMON-only; mutating
 	opGetExporterState op = 51 // [name] -> [found u8]([blob]); DAEMON-only
+
+	// opQueryRawWire streams matching ads as WIRE-FORM ROWS -- self-contained
+	// inline-names subset ads assembled by slice copies at the store (see
+	// collections.ScanRawWire) -- batched many rows per frame, so a large result
+	// costs ~payload/WireBatchBudget frames instead of one frame per ad and the
+	// old-ClassAd render happens once, at the consumer's client edge.
+	// [table][limit i32][redact u8][constraint][nattrs i32]{[attr]}
+	//   -> stream of [nRows i32]{[len u32][row bytes]}, then stStreamEnd.
+	// redact requests source-side private-attribute stripping even on a
+	// privileged connection; an unprivileged connection is always redacted.
+	opQueryRawWire op = 52
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
