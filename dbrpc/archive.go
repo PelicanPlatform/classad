@@ -3,7 +3,10 @@ package dbrpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -35,6 +38,71 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 			return // client gone
 		}
 		sc.write(putStr(respHead(reqID, stStream), adString(ad, sc.opts.IncludePrivate)))
+	}
+	sc.write(respHead(reqID, stStreamEnd))
+}
+
+// streamArchiveAggregate runs a server-side GROUP BY over a history table and streams one
+// frame per group, mirroring streamAggregate but against an archive. It reads the raw group
+// columns and aggregate specs, resolves the archive, and reduces via db's shared aggregate
+// engine so the result is identical to the same aggregate over a mutable table. Private
+// attributes are refused for an unprivileged reader, as with the mutable aggregate.
+func (sc *serverConn) streamArchiveAggregate(reqID uint64, r *reader) {
+	name := r.str()
+	constraint := r.str()
+	nGroup := int(r.i32())
+	if nGroup < 0 || nGroup > 1024 {
+		sc.write(respBad(reqID))
+		return
+	}
+	groupCols := make([]GroupCol, nGroup)
+	for i := range groupCols {
+		groupCols[i] = GroupCol{Attr: r.str()}
+	}
+	aggs, ok := readAggSpecs(r, reqID, sc.write)
+	if !ok {
+		return
+	}
+	if !sc.opts.IncludePrivate {
+		for _, g := range groupCols {
+			if classad.IsPrivateAttribute(g.Attr) {
+				sc.write(respErr(reqID, "cannot group by private attribute "+g.Attr))
+				return
+			}
+		}
+		for _, a := range aggs {
+			if a.Arg != "*" && classad.IsPrivateAttribute(a.Arg) {
+				sc.write(respErr(reqID, "cannot aggregate private attribute "+a.Arg))
+				return
+			}
+		}
+	}
+	a, ok := sc.s.cat.ArchiveTable(name)
+	if !ok {
+		sc.write(respErr(reqID, "no such archive: "+name))
+		return
+	}
+	groupBy := make([]string, len(groupCols))
+	for i, g := range groupCols {
+		groupBy[i] = g.Attr
+	}
+	rows, err := a.Aggregate(constraint, groupBy, aggs)
+	if err != nil {
+		sc.write(respErr(reqID, err.Error()))
+		return
+	}
+	for _, row := range rows {
+		if cancelled(sc.ctx) {
+			return // client gone
+		}
+		frame := respHead(reqID, stStream)
+		for _, gv := range row.Group {
+			frame = putStr(frame, gv)
+		}
+		for _, v := range row.Values {
+			frame = putStr(frame, v)
+		}
+		sc.write(frame)
 	}
 	sc.write(respHead(reqID, stStreamEnd))
 }
@@ -80,6 +148,72 @@ func (c *Client) ArchiveQuery(ctx context.Context, name, constraint string, limi
 	return c.streamCtx(ctx, func(id uint64) []byte {
 		return putStr(putI32(putStr(req(id, opArchiveQuery), name), int32(limit)), constraint)
 	})
+}
+
+// ErrArchiveAggregateUnsupported is returned by ArchiveAggregate against a server too old
+// to implement the opcode (it rejects the request as a bad op), so a caller can fall back to
+// client-side aggregation (ArchiveQuery + reduce locally).
+var ErrArchiveAggregateUnsupported = errors.New("dbrpc: server does not support archive aggregation")
+
+// ArchiveAggregate runs a server-side GROUP BY over the named history table: the server
+// applies the constraint (with zone-map pruning), groups by groupBy, and reduces each group
+// with the COUNT/SUM/AVG/MIN/MAX aggs, returning one AggRow per group. With no group columns
+// it returns a single row over the whole match. Only the (small) grouped result crosses the
+// wire, not every matched ad -- the point of pushing a COUNT over ~200k history rows to the
+// server. Against a server that does not implement the opcode it returns an error wrapping
+// ErrArchiveAggregateUnsupported so the caller can fall back to client-side aggregation.
+func (c *Client) ArchiveAggregate(ctx context.Context, name, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	build := func(id uint64) []byte {
+		b := putStr(putStr(req(id, opArchiveAggregate), name), constraint)
+		b = putI32(b, int32(len(groupBy)))
+		for _, g := range groupBy {
+			b = putStr(b, g)
+		}
+		b = putI32(b, int32(len(aggs)))
+		for _, a := range aggs {
+			b = putStr(putU8(b, byte(a.Func)), a.Arg)
+		}
+		return b
+	}
+	_, frames, err := c.callStream(build)
+	if err != nil {
+		return nil, err
+	}
+	var out []AggRow
+	for {
+		select {
+		case <-ctx.Done():
+			drain(frames)
+			return out, ctx.Err()
+		case frame, ok := <-frames:
+			if !ok {
+				return out, nil
+			}
+			_, status, body, ok := respHeader(frame)
+			if !ok {
+				return out, errShort
+			}
+			switch status {
+			case stStream:
+				row := AggRow{Group: make([]string, len(groupBy)), Values: make([]string, len(aggs))}
+				for i := range row.Group {
+					row.Group[i] = body.str()
+				}
+				for i := range row.Values {
+					row.Values[i] = body.str()
+				}
+				out = append(out, row)
+			case stErr:
+				return out, statusErr(status, body)
+			case stBadReq:
+				// A server too old to know opArchiveAggregate rejects it as a bad
+				// request; signal the caller to fall back to client-side aggregation.
+				return nil, ErrArchiveAggregateUnsupported
+			default:
+				return out, fmt.Errorf("dbrpc: unexpected archive aggregate status %d", status)
+			}
+		}
+	}
 }
 
 // ArchiveRotate enforces the named archive's retention policy now (using the server's

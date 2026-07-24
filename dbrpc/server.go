@@ -429,6 +429,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.streamSnapshot(reqID, body)
 	case opArchiveQuery:
 		sc.streamArchiveQuery(reqID, body)
+	case opArchiveAggregate:
+		sc.streamArchiveAggregate(reqID, body)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))

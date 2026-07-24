@@ -69,3 +69,71 @@ func TestArchiveOverRPC(t *testing.T) {
 		t.Error("archive append should be refused on a read-only connection")
 	}
 }
+
+// TestArchiveAggregateOverRPC covers the server-side archive GROUP BY through the client
+// API: COUNT(*), COUNT with a WHERE constraint, and GROUP BY Owner. Each grouped result is
+// checked against a client-side count over the same rows fetched via ArchiveQuery, proving
+// the server aggregate agrees with counting locally.
+func TestArchiveAggregateOverRPC(t *testing.T) {
+	c, cleanup := catServerPair(t, ServeOptions{})
+	defer cleanup()
+
+	if err := c.CreateArchiveTable(context.Background(), "history", db.ArchiveConfig{
+		ValueAttrs: []string{"ClusterId"},
+		ZoneAttrs:  []string{"ClusterId"},
+	}); err != nil {
+		t.Fatalf("CreateArchiveTable: %v", err)
+	}
+	owners := []string{"alice", "bob", "alice", "carol", "bob", "alice"}
+	cpus := []int{4, 16, 8, 1, 4, 2}
+	for i, o := range owners {
+		if err := c.ArchiveAppend(context.Background(), "history",
+			fmt.Sprintf("ClusterId = %d\nOwner = %q\nCpus = %d", i, o, cpus[i])); err != nil {
+			t.Fatalf("ArchiveAppend: %v", err)
+		}
+	}
+
+	// COUNT(*) over the whole table, checked against ArchiveQuery's row count.
+	all, err := c.ArchiveQuery(context.Background(), "history", "true", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := c.ArchiveAggregate(context.Background(), "history", "true", nil, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatalf("ArchiveAggregate COUNT(*): %v", err)
+	}
+	if len(rows) != 1 || rows[0].Values[0] != fmt.Sprint(len(all)) {
+		t.Fatalf("COUNT(*) = %+v, want %d", rows, len(all))
+	}
+
+	// COUNT with a WHERE constraint, checked against the constrained ArchiveQuery.
+	matched, err := c.ArchiveQuery(context.Background(), "history", "ClusterId >= 3", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err = c.ArchiveAggregate(context.Background(), "history", "ClusterId >= 3", nil, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatalf("ArchiveAggregate constrained COUNT: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Values[0] != fmt.Sprint(len(matched)) {
+		t.Fatalf("COUNT(*) WHERE ClusterId>=3 = %+v, want %d", rows, len(matched))
+	}
+
+	// GROUP BY Owner COUNT(*): assert against a client-side count over every row.
+	wantCounts := map[string]int{}
+	for _, o := range owners {
+		wantCounts[o]++
+	}
+	rows, err = c.ArchiveAggregate(context.Background(), "history", "true", []string{"Owner"}, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatalf("ArchiveAggregate GROUP BY Owner: %v", err)
+	}
+	if len(rows) != len(wantCounts) {
+		t.Fatalf("GROUP BY Owner produced %d groups, want %d: %+v", len(rows), len(wantCounts), rows)
+	}
+	for _, r := range rows {
+		if got := r.Values[0]; got != fmt.Sprint(wantCounts[r.Group[0]]) {
+			t.Errorf("group %q count = %s, want %d", r.Group[0], got, wantCounts[r.Group[0]])
+		}
+	}
+}

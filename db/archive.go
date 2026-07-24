@@ -119,6 +119,41 @@ func (t *ArchiveTable) QueryLimit(constraint string, limit int) (iter.Seq[*class
 	return t.a.QueryLimit(q, limit), nil
 }
 
+// Aggregate runs a server-side GROUP BY over the archive's matches: it applies the
+// constraint (using the archive's zone-map pruning, so segments no matching record can
+// fall in are never scanned), groups by the raw group columns, and reduces each group
+// with COUNT/SUM/AVG/MIN/MAX. It shares the exact grouping/reduce engine (AggregateValues)
+// the mutable-table aggregate uses, so an archive aggregate behaves identically to the same
+// aggregate over a live table -- only the (small) grouped result is produced, not every
+// matched ad. With no group columns it returns a single row over the whole match.
+func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	groupCols := make([]GroupCol, len(groupBy))
+	for i, g := range groupBy {
+		groupCols[i] = GroupCol{Attr: g}
+	}
+	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
+
+	// limit <= 0: scan the whole (zone-pruned) match; the aggregate reduces it server-side.
+	seq, err := t.QueryLimit(constraint, 0)
+	if err != nil {
+		return nil, err
+	}
+	// Project each matched ad to just the attributes the aggregation reads. The scratch
+	// slice is reused across rows (AggregateValues copies a group's key only when created).
+	proj := func(yield func([]classad.Value) bool) {
+		scratch := make([]classad.Value, len(attrs))
+		for ad := range seq {
+			for i, n := range attrs {
+				scratch[i] = ad.EvaluateAttr(n)
+			}
+			if !yield(scratch) {
+				return
+			}
+		}
+	}
+	return AggregateValues(proj, groupCols, aggs, groupCol, aggCol, nil), nil
+}
+
 // Count is the number of records currently retained (reduced by rotation).
 func (t *ArchiveTable) Count() int { return t.a.Count() }
 
