@@ -23,8 +23,15 @@ type codecHolder struct{ c Codec }
 // Options configures a Collection.
 type Options struct {
 	// Shards is the number of independently-locked shards; rounded up to a power
-	// of two. Default 16.
+	// of two. Default 16. Forced to 1 when AppendOnly (an append log is a single
+	// ordered sequence: it needs one segment chain, not sharded key routing).
 	Shards int
+	// AppendOnly makes the collection a pure append log: every Put appends a new
+	// record (no per-key supersession, no directory, no compaction, no deletes) --
+	// the model a history archive needs. Records accumulate in commit order and are
+	// reclaimed only by whole-segment retention, not compaction. Scan/Query see every
+	// appended record; Get/Delete-by-key are not meaningful (there is no key index).
+	AppendOnly bool
 	// SegmentSize is the arena segment size in bytes. Default 8 MiB.
 	SegmentSize int
 	// Hasher routes keys to shards / directory buckets. Default 64-bit FNV-1a.
@@ -358,6 +365,9 @@ func New(opts Options) *Collection {
 	if n <= 0 {
 		n = 16
 	}
+	if opts.AppendOnly {
+		n = 1 // an append log is a single ordered sequence, not sharded
+	}
 	n = nextPow2(n)
 	segSize := opts.SegmentSize
 	if segSize <= 0 {
@@ -374,6 +384,7 @@ func New(opts Options) *Collection {
 	shards := make([]*shard, n)
 	for i := range shards {
 		shards[i] = newShard(segSize, opts.CommitSync)
+		shards[i].appendOnly = opts.AppendOnly
 	}
 	c := &Collection{
 		shards: shards,
@@ -530,6 +541,10 @@ func (c *Collection) Update(batch []AdUpdate) error {
 // Put inserts or updates a single ad. It is the hot path for the common
 // one-ad-at-a-time daemon pattern, so unlike Update it takes no per-call slice or
 // map allocations: it encodes, compresses, and commits directly to the one shard.
+// appendOnly reports whether this is an append-log collection (Options.AppendOnly). It is a
+// whole-collection property, set once at construction, so the first shard's flag speaks for all.
+func (c *Collection) appendOnly() bool { return len(c.shards) > 0 && c.shards[0].appendOnly }
+
 func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	codec := c.currentCodec()
 	stored := codec.Compress(nil, c.encodeAd(ad.AST()))

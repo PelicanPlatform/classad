@@ -17,6 +17,11 @@ type shard struct {
 	segs []*segment     // indexed by segment id (id == index)
 	act  *segment       // current append target
 
+	// appendOnly makes this a pure append log (see Options.AppendOnly): put appends
+	// without superseding or indexing by key, del is a no-op, and compaction is
+	// skipped. Set once at construction; never mutated.
+	appendOnly bool
+
 	commitSeq uint64 // bumped once per committed batch; scan snapshots capture it
 	count     int    // number of live keys
 
@@ -180,6 +185,15 @@ func (sh *shard) findCurrent(head loc, key []byte) (loc, bool) {
 // superseded at seq; the new record is prepended as the bucket head. Caller holds
 // the write lock.
 func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
+	if sh.appendOnly {
+		// Append log: write a new record with no bucket-chain link and never supersede
+		// or index it. Records accumulate in commit order; there is no per-key current
+		// version or directory (Get/Delete-by-key are inert), and Scan/Query see them all.
+		if _, ok := sh.writeRecord(seq, noLoc, key, ad, codec); ok {
+			sh.count++
+		}
+		return
+	}
 	head := sh.dirGet(h)
 	// Write the new record first: if segment allocation fails (persistent store,
 	// disk full), the key is left unchanged rather than superseded-with-no-successor.
@@ -220,6 +234,9 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
 // zero (parentEmptied) -- the signal Delete uses to auto-delete an orphaned
 // structural parent. Caller holds the write lock.
 func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied bool) {
+	if sh.appendOnly {
+		return false, false // an append log has no per-key delete
+	}
 	old, ok := sh.findCurrent(sh.dirGet(h), key)
 	if !ok {
 		// Not in the active directory; probe the sealed segments (evicted keys).
