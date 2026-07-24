@@ -160,13 +160,28 @@ func (sh *shard) dirGet(h uint64) loc {
 	return noLoc
 }
 
+// segAt returns the segment for a location's index, or nil if the index is out of range or
+// that slot has been reaped. A recNext chain link should only ever reference a live segment;
+// a link into a nonexistent one is corruption (e.g. a stale link left behind by a reaped
+// segment). Returning nil lets a chain walk terminate defensively rather than panic on an
+// out-of-range index. Caller holds at least the read lock.
+func (sh *shard) segAt(id uint32) *segment {
+	if int(id) >= len(sh.segs) {
+		return nil
+	}
+	return sh.segs[id]
+}
+
 // findCurrent walks the bucket chain from head and returns the location of the
 // current (non-superseded) record whose key matches, if any. Collisions and
 // superseded versions are skipped by comparing the inline key and the atomic
 // supersededBySeq field. Caller holds at least the read lock.
 func (sh *shard) findCurrent(head loc, key []byte) (loc, bool) {
 	for l := head; l.valid(); {
-		seg := sh.segs[l.seg]
+		seg := sh.segAt(l.seg)
+		if seg == nil {
+			break // dangling chain link into a nonexistent segment; treat as end-of-chain
+		}
 		if recSuperseded(seg.data, l.off) == seqMax && bytes.Equal(recKey(seg.data, l.off), key) {
 			return l, true
 		}
@@ -393,9 +408,17 @@ func (sh *shard) lookupSealedAt(key []byte, h uint64, s0 uint64) (loc, bool) {
 // the reap the directory must not reference a removed segment. Caller holds the write lock.
 func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
 	isDead := func(l loc) bool { _, d := deadSet[l.seg]; return l.valid() && d }
+	// segNext reads the next link from l, terminating the walk (returns noLoc) if l dangles
+	// into a nonexistent segment -- the same corruption findCurrent guards against.
+	segNext := func(l loc) loc {
+		if s := sh.segAt(l.seg); s != nil {
+			return recNext(s.data, l.off)
+		}
+		return noLoc
+	}
 	head := sh.dir[h]
 	for isDead(head) {
-		head = recNext(sh.segs[head.seg].data, head.off)
+		head = segNext(head)
 	}
 	if head != sh.dir[h] {
 		if head.valid() {
@@ -405,11 +428,14 @@ func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
 		}
 	}
 	for l := head; l.valid(); {
-		seg := sh.segs[l.seg]
+		seg := sh.segAt(l.seg)
+		if seg == nil {
+			break
+		}
 		nxt := recNext(seg.data, l.off)
 		orig := nxt
 		for isDead(nxt) {
-			nxt = recNext(sh.segs[nxt.seg].data, nxt.off)
+			nxt = segNext(nxt)
 		}
 		if nxt != orig {
 			setRecNext(seg.data, l.off, nxt)
