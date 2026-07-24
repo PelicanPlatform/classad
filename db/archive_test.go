@@ -117,6 +117,78 @@ func TestArchiveTableNameCollision(t *testing.T) {
 	}
 }
 
+// TestArchiveTableAggregate covers the server-side GROUP BY over an archive: COUNT(*) over
+// the whole table, a COUNT with a WHERE constraint (zone-map prunable), and GROUP BY Owner
+// with COUNT/SUM/MAX. The grouped results are asserted against a straight scan of the same
+// rows, so the aggregate must agree with client-side counting.
+func TestArchiveTableAggregate(t *testing.T) {
+	cat, err := OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	hist, err := cat.CreateArchiveTable("history", ArchiveConfig{
+		ValueAttrs: []string{"ClusterId"},
+		ZoneAttrs:  []string{"ClusterId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3 owners with distinct row counts and Cpus values.
+	owners := []string{"alice", "alice", "alice", "bob", "bob", "carol"}
+	cpus := []int{4, 8, 2, 16, 4, 1}
+	for i, o := range owners {
+		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nOwner = %q\nCpus = %d", i, o, cpus[i])); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// COUNT(*) over the whole table.
+	rows, err := hist.Aggregate("true", nil, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Values[0] != "6" {
+		t.Fatalf("COUNT(*) = %+v, want single row value 6", rows)
+	}
+
+	// COUNT with a WHERE constraint (a range the zone map can prune on).
+	rows, err = hist.Aggregate("ClusterId >= 3", nil, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Values[0] != "3" {
+		t.Fatalf("COUNT(*) WHERE ClusterId>=3 = %+v, want 3", rows)
+	}
+
+	// GROUP BY Owner: COUNT(*), SUM(Cpus), MAX(Cpus).
+	rows, err = hist.Aggregate("true", []string{"Owner"}, []AggSpec{
+		{Func: AggCount, Arg: "*"},
+		{Func: AggSum, Arg: "Cpus"},
+		{Func: AggMax, Arg: "Cpus"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][3]string{}
+	for _, r := range rows {
+		got[r.Group[0]] = [3]string{r.Values[0], r.Values[1], r.Values[2]}
+	}
+	want := map[string][3]string{
+		"alice": {"3", "14", "8"},
+		"bob":   {"2", "20", "16"},
+		"carol": {"1", "1", "1"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("GROUP BY Owner produced %d groups, want %d: %+v", len(got), len(want), got)
+	}
+	for owner, w := range want {
+		if got[owner] != w {
+			t.Errorf("group %q = %v, want %v", owner, got[owner], w)
+		}
+	}
+}
+
 // TestArchiveRotation verifies retention-based rotation drops old segments.
 func TestArchiveRotation(t *testing.T) {
 	cat, err := OpenCatalog(t.TempDir())

@@ -215,7 +215,7 @@ func orTrue(constraint string) string {
 
 // attrKey renders an ad's key attribute value as a string.
 func attrKey(ad *classad.ClassAd, keyAttr string) string {
-	return valueText(ad.EvaluateAttr(keyAttr))
+	return db.ValueText(ad.EvaluateAttr(keyAttr))
 }
 
 func rankText(m db.RankedMatch) string {

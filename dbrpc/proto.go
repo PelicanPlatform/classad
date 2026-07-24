@@ -135,6 +135,12 @@ const (
 	// redact requests source-side private-attribute stripping even on a
 	// privileged connection; an unprivileged connection is always redacted.
 	opQueryRawWire op = 52
+
+	// opArchiveAggregate is a server-side GROUP BY over a history table: like opAggregate
+	// but against an archive, so a COUNT/SUM/AVG/MIN/MAX over ~200k history rows reduces on
+	// the server (using the archive's zone-map pruning) and only the grouped rows cross the
+	// wire, instead of the client fetching and counting every matched ad.
+	opArchiveAggregate op = 53 // [name][constraint][nGroup]{[attr]}[nAgg]{[func u8][arg]} -> stream of [group...][agg...]
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -222,6 +228,8 @@ func (o op) String() string {
 		return "QueryRaw"
 	case opCommitIdem:
 		return "CommitIdempotent"
+	case opArchiveAggregate:
+		return "ArchiveAggregate"
 	}
 	return "op(unknown)"
 }
