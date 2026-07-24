@@ -385,6 +385,10 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 // current version, live iff it is not superseded (a key whose latest record was
 // tombstoned by a delete is absent). Chains are rebuilt fresh.
 func (c *Collection) rebuildDir(sh *shard) {
+	if sh.appendOnly {
+		c.rebuildAppendLog(sh)
+		return
+	}
 	type best struct {
 		loc        loc
 		seq        uint64
@@ -490,6 +494,44 @@ func (c *Collection) rebuildDir(sh *shard) {
 		sh.dir[h] = b.loc
 		count++
 	}
+	sh.count = count
+	if len(sh.segs) > 0 {
+		sh.act = sh.segs[len(sh.segs)-1]
+	}
+}
+
+// rebuildAppendLog restores an append-only shard on reopen. An append log has no per-key
+// supersession or directory, so the single-current-version dedup that rebuildDir performs for a
+// mutable shard must be skipped: every on-disk record stays live (duplicate keys are intentional
+// here). It only recovers the commit sequence, the per-segment min sequence, the live count, and
+// the active (last) segment for continued appends.
+func (c *Collection) rebuildAppendLog(sh *shard) {
+	var maxSeq uint64
+	count := 0
+	for _, seg := range sh.segs {
+		if seg == nil {
+			continue
+		}
+		for off := 0; off < seg.used; {
+			o := uint32(off)
+			total := recTotalLen(seg.data, o)
+			if total == 0 {
+				break
+			}
+			seq := recSeq(seg.data, o)
+			if seq > maxSeq {
+				maxSeq = seq
+			}
+			if seg.minSeq == 0 || seq < seg.minSeq {
+				seg.minSeq = seq
+			}
+			if !recIsMarker(seg.data, o) {
+				count++ // append-only records are never superseded, so all are live
+			}
+			off += int(total)
+		}
+	}
+	sh.commitSeq = maxSeq
 	sh.count = count
 	if len(sh.segs) > 0 {
 		sh.act = sh.segs[len(sh.segs)-1]
