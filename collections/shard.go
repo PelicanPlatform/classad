@@ -617,3 +617,40 @@ func forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, co
 		}
 	}
 }
+
+// forEachVisibleKeyedReverse is forEachVisibleKeyed in newest-first order: it
+// walks the windows from the last (newest) segment backward and, within each
+// segment, visits records back-to-front. Because records are variable-length and
+// self-describe only their forward length, each window's record offsets are
+// collected in a single forward pass, then replayed in reverse -- so the whole
+// walk is still O(records), just with a per-segment offset slice. A caller that
+// stops early after K records therefore receives the K most recently appended.
+func forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec) bool) {
+	var offs []uint32 // reused across windows
+	for wi := len(wins) - 1; wi >= 0; wi-- {
+		w := wins[wi]
+		offs = offs[:0]
+		for off := 0; off < w.used; {
+			o := uint32(off)
+			total := recTotalLen(w.data, o)
+			if total == 0 {
+				break
+			}
+			offs = append(offs, o)
+			off += int(total)
+		}
+		for i := len(offs) - 1; i >= 0; i-- {
+			o := offs[i]
+			if recIsMarker(w.data, o) {
+				continue // time-checkpoint marker, not a data record
+			}
+			seq := recSeq(w.data, o)
+			sup := recSuperseded(w.data, o)
+			if seq <= s0 && sup > s0 {
+				if !fn(recKey(w.data, o), recAd(w.data, o), w.codec) {
+					return
+				}
+			}
+		}
+	}
+}

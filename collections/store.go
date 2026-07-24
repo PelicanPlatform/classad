@@ -32,6 +32,15 @@ type Options struct {
 	// reclaimed only by whole-segment retention, not compaction. Scan/Query see every
 	// appended record; Get/Delete-by-key are not meaningful (there is no key index).
 	AppendOnly bool
+	// ReverseScan makes Scan/Query yield records newest-first (most recently
+	// appended first) instead of in stored order. It walks segments from the last
+	// (newest) backward and, within a segment, records back-to-front -- the natural
+	// "last K" order a history archive presents (condor_history shows the most
+	// recent jobs first). A consumer that stops early (yield/emit returns false)
+	// after K records therefore gets the K newest, a pushed-down LIMIT. Reverse
+	// scans always run serial (never fan out). Default false ⇒ stored order.
+	// Most meaningful with AppendOnly, where stored order is commit order.
+	ReverseScan bool
 	// SegmentSize is the arena segment size in bytes. Default 8 MiB.
 	SegmentSize int
 	// Hasher routes keys to shards / directory buckets. Default 64-bit FNV-1a.
@@ -219,6 +228,10 @@ type Collection struct {
 	queryPar         int
 	qsem             chan struct{}
 	parallelMinBytes int
+
+	// reverseScan yields records newest-first (see Options.ReverseScan). Forces
+	// serial scans (no fan-out), since fan-out has no cross-segment order.
+	reverseScan bool
 
 	// Watch (see watch.go / docs/WATCH.md). hub is nil unless WatchHistory > 0.
 	hub           *watchHub
@@ -471,6 +484,7 @@ func New(opts Options) *Collection {
 		}
 	}
 	c.parallelMinBytes = defaultParallelMinBytes
+	c.reverseScan = opts.ReverseScan
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
 	if c.queryPar >= 2 {
 		// Machine-wide worker budget: bounds total scan goroutines across all
@@ -758,7 +772,7 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 		usable := c.planIndex(probes)
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.
-		if c.queryPar > 1 && len(usable) == 0 {
+		if c.queryPar > 1 && len(usable) == 0 && !c.reverseScan {
 			c.runParallelQuery(q, yield)
 			return
 		}
@@ -806,7 +820,7 @@ func (c *Collection) scanShardAt(sh *shard, s0 uint64, qp queryPlan, emit func(w
 func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit func(w []byte) bool) bool {
 	cont := true
 	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
-	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+	visit := func(key, ad []byte, codec Codec) bool {
 		if isSystemKeyBytes(key) {
 			return true // internal system record: hidden from client scans/queries
 		}
@@ -823,7 +837,12 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 			return false
 		}
 		return true
-	})
+	}
+	if c.reverseScan {
+		forEachVisibleKeyedReverse(s0, wins, visit)
+	} else {
+		forEachVisibleKeyed(s0, wins, visit)
+	}
 	return cont
 }
 
