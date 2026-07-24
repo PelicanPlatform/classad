@@ -1,6 +1,9 @@
 package collections
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // Compaction reclaims space consumed by superseded/deleted records.
 //
@@ -40,6 +43,9 @@ const (
 // safe to call concurrently with reads and writes. Returns the number of shards where
 // space was reclaimed (by either mechanism).
 func (c *Collection) Compact() int {
+	if c.appendOnly() {
+		return 0 // an append log never supersedes, so there is nothing to compact
+	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
 	start := time.Now()
@@ -170,6 +176,9 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 // value. Run it during low write activity (or, in an HA deployment, on the sole
 // writer).
 func (c *Collection) Rewrite() int {
+	if c.appendOnly() {
+		return 0 // rewriting an append log would duplicate every record (no supersession)
+	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
 	n := 0
@@ -202,7 +211,17 @@ func (c *Collection) Rewrite() int {
 // transactions; production leaves it nil.
 var retrainStallHook func()
 
+// errAppendOnlyRetrain is returned by RetrainDict on an append-only collection, where the
+// compaction-based recompression path does not apply.
+var errAppendOnlyRetrain = errors.New("collections: RetrainDict is not supported on an append-only collection")
+
 func (c *Collection) RetrainDict(sampleMax int) (int, error) {
+	if c.appendOnly() {
+		// Retrain recompresses via compactShard, which renumbers segments and rebuilds the
+		// directory -- illegal for an append log. Append-only recompression (per-segment
+		// reseal preserving order) is a separate path (not yet implemented).
+		return 0, errAppendOnlyRetrain
+	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
 	start := time.Now()
