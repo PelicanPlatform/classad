@@ -41,6 +41,11 @@ type Options struct {
 	// scans always run serial (never fan out). Default false ⇒ stored order.
 	// Most meaningful with AppendOnly, where stored order is commit order.
 	ReverseScan bool
+	// Retention bounds how much an AppendOnly collection keeps: Rotate(now) drops
+	// whole oldest segments until the collection is back within these bounds (a
+	// history archive's aging-out). The zero value keeps everything (Rotate is
+	// then inert). Only meaningful with AppendOnly. See Rotate.
+	Retention Retention
 	// SegmentSize is the arena segment size in bytes. Default 8 MiB.
 	SegmentSize int
 	// Hasher routes keys to shards / directory buckets. Default 64-bit FNV-1a.
@@ -232,6 +237,10 @@ type Collection struct {
 	// reverseScan yields records newest-first (see Options.ReverseScan). Forces
 	// serial scans (no fan-out), since fan-out has no cross-segment order.
 	reverseScan bool
+
+	// ret bounds an append-only collection's retained segments (see Options.Retention
+	// and Rotate). Zero value ⇒ keep everything.
+	ret Retention
 
 	// Watch (see watch.go / docs/WATCH.md). hub is nil unless WatchHistory > 0.
 	hub           *watchHub
@@ -485,6 +494,7 @@ func New(opts Options) *Collection {
 	}
 	c.parallelMinBytes = defaultParallelMinBytes
 	c.reverseScan = opts.ReverseScan
+	c.ret = opts.Retention
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
 	if c.queryPar >= 2 {
 		// Machine-wide worker budget: bounds total scan goroutines across all
