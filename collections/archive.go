@@ -194,6 +194,13 @@ func (a *Archive) QueryLimit(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] 
 	}
 }
 
+// QueryProject scans the ads matching q and yields each one projected to just attrs'
+// values (aligned with attrs), read wire-native where possible -- so an aggregate does not
+// pay the full-ad decode QueryLimit costs. The yielded slice is reused; copy to retain.
+func (a *Archive) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classad.Value] {
+	return a.c.QueryProject(q, attrs)
+}
+
 // Watch streams the archive as change data: a full replay of retained records (oldest
 // first) then live appends, resumable from an opaque cursor. A cursor older than what
 // rotation still retains yields a WatchReset and resumes from the current floor. See
