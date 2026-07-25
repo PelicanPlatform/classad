@@ -838,7 +838,7 @@ func scanShardCandidatesReverse(wins []segWindow, usable []usableProbe, visit fu
 // scanShardIndexedGroups is scanShardIndexed for a DNF plan: it visits the union of
 // the groups' candidates and re-verifies each against the full query.
 func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, qp queryPlan, emit func(w []byte) bool) bool {
-	return c.scanShardCandidatesGroups(sh, groups, func(w []byte) bool {
+	return c.scanShardCandidatesGroups(sh, groups, c.reverseScan, func(w []byte) bool {
 		if !matchWire(w, qp) {
 			return true
 		}
@@ -853,7 +853,7 @@ func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, q
 // only when EVERY disjunct is empty, and visiting a few extra candidates is cheaper
 // than proving that per group -- but a window whose index does not cover all groups,
 // and every covered window's un-indexed tail, are still full-scanned.
-func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, onCand func(w []byte) bool) bool {
+func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, reverse bool, onCand func(w []byte) bool) bool {
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var dbuf []byte
@@ -888,6 +888,10 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 		return true
 	}
 
+	if reverse {
+		return scanShardCandidatesGroupsReverse(wins, groups, visit)
+	}
+
 	for _, w := range wins {
 		si := w.seg.idx.Load()
 		if si == nil || !si.coversGroups(groups) {
@@ -918,6 +922,64 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 		if int(si.upto) < w.used {
 			if !scanRange(w, int(si.upto), w.used) {
 				return false
+			}
+		}
+	}
+	return true
+}
+
+// scanShardCandidatesGroupsReverse is the newest-first traversal of a DNF (disjunctive)
+// candidate set: segments from the last backward, and within each the un-indexed tail
+// before the union of the groups' candidate offsets, both in descending offset order. It
+// reads the segment index via readIdx (so a sealed segment's mmap sidecar is used, not only
+// an in-RAM index), which the forward path does not yet do. visit returns true to stop.
+func scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, visit func(w segWindow, o uint32) bool) bool {
+	var offs []uint32
+	scanRangeReverse := func(w segWindow, from, to int) bool {
+		offs = offs[:0]
+		for off := from; off < to; {
+			o := uint32(off)
+			total := recTotalLen(w.data, o)
+			if total == 0 {
+				break
+			}
+			offs = append(offs, o)
+			off += int(total)
+		}
+		for i := len(offs) - 1; i >= 0; i-- {
+			if visit(w, offs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	for wi := len(wins) - 1; wi >= 0; wi-- {
+		w := wins[wi]
+		si := w.seg.readIdx()
+		if si == nil || !si.coversGroups(groups) {
+			if !scanRangeReverse(w, 0, w.used) { // index can't serve every disjunct: full-scan
+				return false
+			}
+			continue
+		}
+		// Tail (newest, written after the index) first, descending.
+		if int(si.coveredUpto()) < w.used {
+			if !scanRangeReverse(w, int(si.coveredUpto()), w.used) {
+				return false
+			}
+		}
+		// Single-group segment skip (a conjunctive plan routed here): if the prefix
+		// provably has no candidate, only the tail (already scanned) applied.
+		if len(groups) == 1 && si.skipsPrefix(groups[0]) {
+			continue
+		}
+		// Then the union of the groups' indexed-prefix candidates, descending.
+		if cand := si.candidateOffsetsGroups(groups); cand != nil {
+			it := cand.ReverseIterator()
+			for it.HasNext() {
+				if visit(w, it.Next()) {
+					return false
+				}
 			}
 		}
 	}
