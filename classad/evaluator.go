@@ -470,6 +470,17 @@ func (e *Evaluator) evalNode(expr ast.Expr) Value {
 }
 
 func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Value {
+	v := e.resolveAttributeReference(ref)
+	// CurrentTime is a magic attribute: an unscoped/MY reference that the ad does not
+	// otherwise define resolves to the current time (Unix seconds). An ad-defined
+	// CurrentTime wins, since resolveAttributeReference then returns a defined value.
+	if v.IsUndefined() && isCurrentTimeRef(ref) {
+		return currentTimeValue()
+	}
+	return v
+}
+
+func (e *Evaluator) resolveAttributeReference(ref *ast.AttributeReference) Value {
 	if e.resolver != nil {
 		// A custom resolver replaces ClassAd-scope resolution entirely (used for
 		// evaluating a native program against an encoded ad). It receives the

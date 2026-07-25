@@ -1,6 +1,8 @@
 package vm
 
 import (
+	"strings"
+
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/parser"
@@ -13,7 +15,30 @@ type Query struct {
 }
 
 // Compile compiles an already-parsed expression into a Query.
-func Compile(expr ast.Expr) *Query { return &Query{prog: CompileProgram(expr)} }
+//
+// When the expression references the magic CurrentTime attribute, its constants are folded
+// once here (FoldConstants resolves CurrentTime to the current time) so a single "now" is
+// baked into both the program and its index probes -- the constraint prunes correctly and
+// evaluates consistently, instead of the program re-reading the clock per ad. Expressions
+// that do not reference CurrentTime are compiled unchanged.
+func Compile(expr ast.Expr) *Query {
+	if referencesCurrentTime(expr) {
+		expr = classad.FoldConstants(expr)
+	}
+	return &Query{prog: CompileProgram(expr)}
+}
+
+// referencesCurrentTime reports whether expr reads the magic CurrentTime attribute (an
+// unscoped reference by that name). It reuses the read-collection walk, so it sees the same
+// unscoped references the planner does.
+func referencesCurrentTime(expr ast.Expr) bool {
+	for _, n := range collectReads(expr, map[string]bool{}, nil) {
+		if strings.EqualFold(n, "CurrentTime") {
+			return true
+		}
+	}
+	return false
+}
 
 // Parse parses a ClassAd expression string and compiles it into a Query.
 func Parse(exprStr string) (*Query, error) {
