@@ -216,6 +216,15 @@ func (a *Archive) QueryLimit(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] 
 // QueryProject scans the ads matching q and yields each one projected to just attrs'
 // values (aligned with attrs), read wire-native where possible -- so an aggregate does not
 // pay the full-ad decode QueryLimit costs. The yielded slice is reused; copy to retain.
+// QueryRawProjected yields each ad matching q as a raw projected subset (only the projection
+// attributes, rendered from the stored representation), newest first — the archive-side of the
+// server projection relay. It shares the backing Collection's projection walk, so the same
+// newest-first ordering and pushed-down LIMIT (via early stop by the caller) apply. chaseRefs
+// and redact are as in Collection.QueryRawProjected.
+func (a *Archive) QueryRawProjected(q *vm.Query, projection []string, chaseRefs, redact bool) iter.Seq[RawAd] {
+	return a.c.QueryRawProjected(q, projection, chaseRefs, redact)
+}
+
 func (a *Archive) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classad.Value] {
 	return a.c.QueryProject(q, attrs)
 }
