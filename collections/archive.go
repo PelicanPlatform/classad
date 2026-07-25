@@ -1,112 +1,71 @@
 package collections
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"iter"
 	"os"
-	"path/filepath"
-	"sort"
-	"sync"
-	"sync/atomic"
 
-	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // Archive is an append-only, larger-than-RAM, rotated store of ClassAds — the
-// "condor history file" use case. Ads are appended once and never updated; old data
-// is dropped in bulk by rotation. Unlike Collection it has no MVCC, no compaction,
-// no per-key delete, and no in-RAM key directory: a segment is sealed once, its
-// index persisted as an immutable sidecar, and dropped as a unit on rotation.
+// "condor history file" use case. Ads are appended once and never updated; old data is
+// dropped in bulk by rotation, with whole-segment pruning via zone maps and newest-first
+// + LIMIT queries.
 //
-// See docs/history-archive.md for the design (H1–H5): sealed segments with
-// persisted sidecar indexes, a segment catalog with zone maps for whole-segment
-// pruning, O(segments) recovery, newest-first + LIMIT queries, and age/size/count
-// rotation. Indexes are never held in RAM: each sealed segment's index is an
-// immutable v2 sidecar, mmap'd and queried in place (binary search / range scan over
-// sorted key runs), loaded lazily on first query and demand-paged (see mmapSegIndex).
+// It is a thin facade over a Collection configured as an append log (Options.AppendOnly)
+// with newest-first scans, retention rotation, and zone maps. All the archive-specific
+// machinery — sealed segments, per-segment sidecar indexes, zone pruning, O(segments)
+// recovery, retention, and the append-stream watch — now lives in the mainline
+// Collection, so the archive is "a persistent store with a few rules and no compaction"
+// rather than a fork. See docs/history-archive.md.
 type Archive struct {
-	dir     string
-	segSize int
-	codec   Codec
-	intern  *wire.InternTable
-	spec    *indexSpec          // categorical/value indexes (immutable for an Archive)
-	hot     map[uint32]struct{} // hot-header attr ids
-	zoneIDs []uint32            // attrs kept as per-segment min/max for pruning
-	ret     Retention
-
-	mu     sync.RWMutex
-	segs   []*archiveSeg // sealed segments, oldest first
-	active *archiveSeg   // current append target (unsealed), or nil
-	nextID uint32
-
-	// scanned, if set, is called with each segment id a query actually scans (i.e.
-	// not pruned by its zone map). Test seam for asserting pruning; nil in production.
-	scanned func(uint32)
-
-	// Watch (see archive_watch.go / docs/WATCH.md). hub fans appended records to live
-	// watchers; watchEpoch is a persisted per-archive identity for cursor validation.
-	hub            *archiveWatchHub
-	watchEpoch     uint64
-	watchEpochOnce sync.Once
+	c   *Collection
+	dir string
 }
 
-// archiveSeg is one segment of the log: a reused mmap-backed segment plus the
-// metadata the catalog persists. A sealed segment is immutable; idx holds its mmap'd
-// sidecar index view (lazily loaded) and zones holds its per-attribute min/max.
-type archiveSeg struct {
-	seg   *segment
-	recN  int
-	zones map[uint32]zoneRange // interned attr id -> [min,max]
-
-	// A sealed segment's index is its mmap'd sidecar, loaded lazily on first query
-	// access (idx) — a segment queries never touch (e.g. zone-pruned) never pages its
-	// index in. The archive never retains an in-RAM index: at seal the sidecar is
-	// written and the transient build discarded. The sidecar unmap is registered as
-	// seg.onReap, so it fires when the segment's pins drain (rotation) or at Close.
-	sealed bool                         // has a persisted sidecar (vs the active, unindexed segment)
-	idxMu  sync.Mutex                   // guards the lazy sidecar mmap load
-	idx    atomic.Pointer[mmapSegIndex] // the mmap'd sidecar view, or nil until first use
-}
-
-// zoneRange is one attribute's numeric span within a segment (a zone map entry).
-// Fields are exported so the catalog can serialize them.
+// zoneRange is one attribute's numeric span within a segment (a zone map entry). Shared
+// with the Collection's zone maps (see zonemap.go). Fields are exported for JSON.
 type zoneRange struct {
 	Min, Max float64
 }
 
-// Retention bounds how much history is kept. Rotation (Rotate, or automatically
-// after a seal) drops the oldest sealed segments until every set bound is met. A
-// zero field means "no bound on that axis".
+// Retention bounds how much history an append-only store keeps. Rotate drops the oldest
+// whole segments until every set bound is met. A zero field means "no bound on that
+// axis". Shared with Collection (Options.Retention / Collection.Rotate).
 type Retention struct {
 	MaxSegments int   // keep at most this many sealed segments
 	MaxBytes    int64 // keep at most this many bytes of sealed segment files
 	// MaxAgeAttr / MaxAge: drop a segment whose max value of the given numeric attr
 	// (e.g. "CompletionDate", unix seconds) is older than Now-MaxAge. Now is supplied
-	// per Rotate call so the store needs no clock of its own.
+	// per Rotate call so the store needs no clock of its own. MaxAgeAttr must be a
+	// ZoneAttr so its per-segment max is available.
 	MaxAgeAttr string
 	MaxAge     float64
 }
 
 // ArchiveOptions configures an Archive.
 type ArchiveOptions struct {
-	// Dir is the directory holding segment/index/catalog files. Required.
+	// Dir is the directory holding the archive's files. Required.
 	Dir string
-	// SegmentSize is the sealed-segment (mmap file) size in bytes; a segment rolls
-	// over when the next ad will not fit. Default 8 MiB.
+	// SegmentSize is the segment (mmap file) size in bytes; a segment rolls over when
+	// the next ad will not fit. Default 8 MiB.
 	SegmentSize int
-	// Codec compresses stored ad bytes. Default identity. For recovery the same codec
-	// must be supplied (the archive does not yet persist codec identity per segment).
+	// Codec compresses stored ad bytes. Default identity. For recovery the codec must
+	// match what a segment was written under (recorded per segment in its file).
 	Codec Codec
 	// HotAttrs front-loads these attributes in each ad's hot header (see Collection).
 	HotAttrs []string
 	// CategoricalAttrs / ValueAttrs configure the per-segment indexes (see Collection).
 	CategoricalAttrs []string
 	ValueAttrs       []string
-	// ZoneAttrs names numeric attributes to keep per-segment min/max on, so a query
-	// with a range/equality constraint on one can skip whole segments without opening
-	// them. ValueAttrs are automatically included.
+	// ZoneAttrs names numeric attributes to keep per-segment min/max on, so a query with
+	// a range/equality constraint on one can skip whole segments. ValueAttrs are
+	// automatically included.
 	ZoneAttrs []string
 	// Retention bounds what rotation keeps. Zero ⇒ keep everything.
 	Retention Retention
@@ -114,220 +73,145 @@ type ArchiveOptions struct {
 
 const defaultArchiveSegmentSize = 8 << 20 // 8 MiB
 
-// archiveSeq is the constant commit sequence stamped on every archive record: the
-// framing is shared with Collection, but the archive has no MVCC, so every record
-// is permanently current (supersededBySeq stays seqMax).
-const archiveSeq = 1
+// archiveWatchCap enables the append-stream watch hub on an archive's Collection (see
+// Collection.Watch). An append log keeps no delete journal, so the value only sizes the
+// live event machinery; the archive always supports Watch.
+const archiveWatchCap = 1 << 10
 
-// CreateArchive creates a new, empty Archive. The directory must not already hold a
-// catalog (use OpenArchive to reopen one).
-func CreateArchive(opts ArchiveOptions) (*Archive, error) {
-	if opts.Dir == "" {
-		return nil, errors.New("archive: Dir is required")
-	}
-	if _, err := os.Stat(filepath.Join(opts.Dir, catalogName)); err == nil {
-		return nil, fmt.Errorf("archive: %s already exists (use OpenArchive)", catalogName)
-	}
-	a, err := newArchiveShell(opts)
-	if err != nil {
-		return nil, err
-	}
-	a.configure(opts)
-	if err := a.writeCatalog(); err != nil {
-		return nil, err
-	}
-	return a, nil
-}
-
-// newArchiveShell builds the Archive with an empty intern table and no interned
-// options; call configure (after any intern-table restore) to resolve options.
-func newArchiveShell(opts ArchiveOptions) (*Archive, error) {
-	if opts.Dir == "" {
-		return nil, errors.New("archive: Dir is required")
-	}
-	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
-		return nil, err
-	}
+// archiveCollectionOptions maps ArchiveOptions onto the append-log Collection configuration.
+//
+// The archive contract is newest-first Query (condor_history order), which the Collection
+// guarantees only on the full-scan (ReverseScan) path -- its indexed scan visits candidates
+// in index order. So the archive does not yet configure per-segment categorical/value
+// indexes: every query full-scans newest-first, pruned by zone maps, and re-verifies the
+// predicate. Correctness and newest-first LIMIT hold; categorical/value index acceleration
+// awaits a newest-first indexed scan (a follow-up). ValueAttrs are numeric, so they are
+// folded into the zone maps to keep range/equality pruning on them.
+func archiveCollectionOptions(opts ArchiveOptions) Options {
 	segSize := opts.SegmentSize
 	if segSize <= 0 {
 		segSize = defaultArchiveSegmentSize
 	}
-	var codec Codec = opts.Codec
-	if codec == nil {
-		codec = identityCodec{}
-	}
-	return &Archive{
-		dir:     opts.Dir,
-		segSize: recAlign(segSize),
-		codec:   codec,
-		intern:  wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
-		ret:     opts.Retention,
-		hub:     newArchiveWatchHub(),
-	}, nil
-}
-
-// configure resolves the option attribute names to interned ids (spec, hot header,
-// zone maps). On recovery it runs after the persisted intern table is restored, so
-// the same names map to the same ids.
-func (a *Archive) configure(opts ArchiveOptions) {
-	a.spec = newIndexSpec(a.intern, opts.CategoricalAttrs, opts.ValueAttrs)
-	if len(opts.HotAttrs) > 0 {
-		a.hot = make(map[uint32]struct{}, len(opts.HotAttrs))
-		for _, n := range opts.HotAttrs {
-			a.hot[a.intern.Intern(n)] = struct{}{}
-		}
-	}
-	// Zone maps cover the explicit ZoneAttrs plus every value-indexed attr.
-	a.zoneIDs = nil
-	seen := map[uint32]struct{}{}
-	addZone := func(id uint32) {
-		if _, ok := seen[id]; !ok {
-			seen[id] = struct{}{}
-			a.zoneIDs = append(a.zoneIDs, id)
-		}
-	}
-	for _, n := range opts.ZoneAttrs {
-		addZone(a.intern.Intern(n))
-	}
-	for _, id := range a.spec.valIDs {
-		addZone(id)
+	zones := append(append([]string(nil), opts.ZoneAttrs...), opts.ValueAttrs...)
+	return Options{
+		AppendOnly:   true, // pure append log: no supersession, no compaction, no key dir
+		ReverseScan:  true, // newest-first Query, matching condor_history order
+		Dir:          opts.Dir,
+		SegmentSize:  segSize,
+		Codec:        opts.Codec,
+		HotAttrs:     opts.HotAttrs,
+		ZoneAttrs:    zones,
+		Retention:    opts.Retention,
+		WatchHistory: archiveWatchCap, // enable the append-stream watch
 	}
 }
 
-// Append adds one ad to the archive. It is appended to the active segment; when the
-// ad will not fit, the active segment is sealed (its index + zone maps built and
-// persisted) and a new one started. Safe for use by a single writer concurrently
-// with queries.
-func (a *Archive) Append(ad *classad.ClassAd) error {
-	wireBytes := wire.EncodeWithHot(nil, ad.AST(), a.intern, a.hot)
-	stored := a.codec.Compress(nil, wireBytes)
-
-	a.mu.Lock()
-	seg, off, err := a.appendLocked(stored)
-	if err == nil {
-		// Publish under the lock so live events reach watchers in log-position order
-		// (concurrent Appends are otherwise unordered once the lock is dropped). The
-		// fan-out is non-blocking, so it does not stall other writers. stored is not
-		// reused, so it is safe to hand to the (read-only) watchers.
-		a.hub.publish(seg, off, stored, a.codec)
+// CreateArchive creates a new, empty Archive. The directory must not already hold one
+// (use OpenArchive to reopen).
+func CreateArchive(opts ArchiveOptions) (*Archive, error) {
+	if opts.Dir == "" {
+		return nil, errors.New("archive: Dir is required")
 	}
-	a.mu.Unlock()
-	return err
-}
-
-// appendLocked appends stored to the active segment (rolling to a fresh one when it
-// does not fit) and returns the record's segment id and offset. Caller holds a.mu.
-func (a *Archive) appendLocked(stored []byte) (seg, off uint32, err error) {
-	if a.active == nil {
-		if err := a.openActiveLocked(); err != nil {
-			return 0, 0, err
-		}
+	if dirHasEntries(opts.Dir) {
+		return nil, fmt.Errorf("archive: %s already initialized (use OpenArchive)", opts.Dir)
 	}
-	o, ok := a.active.seg.append(archiveSeq, noLoc, nil, stored)
-	if !ok {
-		// Doesn't fit: seal the active segment and start a fresh one.
-		if err := a.sealActiveLocked(); err != nil {
-			return 0, 0, err
-		}
-		if err := a.openActiveLocked(); err != nil {
-			return 0, 0, err
-		}
-		if o, ok = a.active.seg.append(archiveSeq, noLoc, nil, stored); !ok {
-			return 0, 0, fmt.Errorf("archive: ad of %d bytes exceeds segment size %d", len(stored), a.segSize)
-		}
-	}
-	a.active.recN++
-	return a.active.seg.id, o, nil
-}
-
-// openActiveLocked starts a fresh mmap-backed active segment. Caller holds mu.
-func (a *Archive) openActiveLocked() error {
-	id := a.nextID
-	a.nextID++
-	seg, err := newMmapSegment(id, a.segSize, a.codec, a.segPath(id))
+	c, err := Open(archiveCollectionOptions(opts))
 	if err != nil {
-		return err
+		return nil, err
 	}
-	a.active = &archiveSeg{seg: seg}
-	return nil
+	return &Archive{c: c, dir: opts.Dir}, nil
 }
 
-// sealActiveLocked finalizes the active segment: flush its bytes, build + persist its
-// sidecar index and zone maps, move it into the sealed set, and clear active. Caller
-// holds mu.
-func (a *Archive) sealActiveLocked() error {
-	as := a.active
-	if as == nil || as.seg.used == 0 {
-		return nil
+// OpenArchive reopens an existing Archive (or creates one if the directory is empty),
+// recovering its segments. The same options must be supplied as at creation (the
+// Collection recovers each segment with the codec it names).
+func OpenArchive(opts ArchiveOptions) (*Archive, error) {
+	if opts.Dir == "" {
+		return nil, errors.New("archive: Dir is required")
 	}
-	if err := as.seg.flush(); err != nil {
-		return err
+	c, err := Open(archiveCollectionOptions(opts))
+	if err != nil {
+		return nil, err
 	}
-	as.zones = a.computeZones(as.seg.data, as.seg.used)
-	as.sealed = true
-	// Build the index transiently, serialize it to the sidecar, and discard it — the
-	// archive holds no in-RAM index; queries mmap the sidecar (see ensureIndex).
-	if a.spec.any() {
-		idx := buildSegIndex(as.seg.data, as.seg.used, a.codec, a.spec)
-		if err := writeSidecarIndex(a.idxPath(as.seg.id), idx); err != nil {
-			return err
-		}
-	}
-	a.segs = append(a.segs, as)
-	a.active = nil
-	if err := a.writeCatalog(); err != nil {
-		return err
-	}
-	return nil
+	return &Archive{c: c, dir: opts.Dir}, nil
 }
 
-// computeZones scans a segment's records and returns the per-attribute numeric
-// min/max for the configured zone attributes (absent/non-numeric values ignored).
-func (a *Archive) computeZones(data []byte, upto int) map[uint32]zoneRange {
-	if len(a.zoneIDs) == 0 {
-		return nil
+// dirHasEntries reports whether dir exists and is non-empty — the "already initialized"
+// test for CreateArchive.
+func dirHasEntries(dir string) bool {
+	f, err := os.Open(dir)
+	if err != nil {
+		return false // does not exist (or unreadable): treat as fresh
 	}
-	zones := make(map[uint32]zoneRange, len(a.zoneIDs))
-	var buf []byte
-	for off := 0; off < upto; {
-		o := uint32(off)
-		total := recTotalLen(data, o)
-		if total == 0 {
-			break
-		}
-		if w, err := a.codec.Decompress(buf[:0], recAd(data, o)); err == nil {
-			buf = w
-			ad := wire.Ad(w)
-			for _, id := range a.zoneIDs {
-				node, ok := ad.Lookup(id)
-				if !ok {
-					continue
-				}
-				f, ok := literalFloat(node)
-				if !ok {
-					continue
-				}
-				z, seen := zones[id]
-				if !seen {
-					zones[id] = zoneRange{Min: f, Max: f}
-				} else {
-					if f < z.Min {
-						z.Min = f
-					}
-					if f > z.Max {
-						z.Max = f
-					}
-					zones[id] = z
+	defer f.Close()
+	names, _ := f.Readdirnames(1)
+	return len(names) > 0
+}
+
+// Append adds one ad to the archive: it is appended to the log (never superseding any
+// prior record) and, when the active segment fills, a new one is started and the old one
+// sealed with its index and zone maps. Safe for one writer concurrent with queries.
+func (a *Archive) Append(ad *classad.ClassAd) error {
+	// An append log has no key; a nil key routes to the single append-only shard and
+	// stores a zero-length key. Duplicate appends are all retained.
+	return a.c.Put(nil, ad)
+}
+
+// Flush makes prior appends durable and queryable. The Collection keeps appended records
+// queryable in place and mmap-durable across a process crash without an explicit seal, so
+// this is a no-op retained for API compatibility.
+func (a *Archive) Flush() error { return nil }
+
+// Rotate drops whole oldest segments until the archive is back within its Retention
+// bounds, returning the number dropped. now is the caller's wall clock (unix seconds) for
+// age-based retention.
+func (a *Archive) Rotate(now float64) (int, error) { return a.c.Rotate(now) }
+
+// Count returns the number of records currently retained. Rotation reduces it in
+// whole-segment steps.
+func (a *Archive) Count() int { return a.c.Len() }
+
+// Close flushes and unmaps the archive. It must not be used afterward.
+func (a *Archive) Close() error { return a.c.Close() }
+
+// Query returns an iterator over the ads matching q, newest first.
+func (a *Archive) Query(q *vm.Query) iter.Seq[*classad.ClassAd] { return a.QueryLimit(q, 0) }
+
+// QueryLimit returns an iterator over the ads matching q, newest first, stopping after
+// limit results (limit <= 0 ⇒ unlimited). Because the backing Collection scans
+// newest-first, stopping early yields the most recent limit matches — a pushed-down LIMIT.
+func (a *Archive) QueryLimit(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] {
+	return func(yield func(*classad.ClassAd) bool) {
+		n := 0
+		for ad := range a.c.Query(q) {
+			if !yield(ad) {
+				return
+			}
+			if limit > 0 {
+				if n++; n >= limit {
+					return
 				}
 			}
 		}
-		off += int(total)
 	}
-	return zones
 }
 
-// literalFloat extracts the index-normalized float64 from a literal node (int/real/
-// bool), matching how the value index and zone maps key numbers.
+// Watch streams the archive as change data: a full replay of retained records (oldest
+// first) then live appends, resumable from an opaque cursor. A cursor older than what
+// rotation still retains yields a WatchReset and resumes from the current floor. See
+// Collection.Watch and docs/WATCH.md.
+func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
+	return a.c.Watch(ctx, cursor)
+}
+
+// SidecarSizes reports the archive's sealed-segment sidecar index bytes (mmap-backed,
+// evictable page cache), broken out by structure. An operator diagnostic.
+func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }
+
+// --- zone-map helpers (shared with the Collection's per-segment zone maps) ---
+
+// literalFloat extracts a numeric value from a wire literal node (int/real/bool), for
+// building and testing zone maps.
 func literalFloat(node []byte) (float64, bool) {
 	lit, ok := wire.LiteralValue(node)
 	if !ok {
@@ -347,173 +231,68 @@ func literalFloat(node []byte) (float64, bool) {
 	return 0, false
 }
 
-// Flush seals the active segment (if any), making all appended ads durable and
-// indexed. Useful to make recent ads queryable-by-index and recoverable without
-// closing.
-func (a *Archive) Flush() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	return a.sealActiveLocked()
-}
-
-// Rotate drops the oldest sealed segments until every configured Retention bound is
-// met, and returns the number dropped. now (e.g. the current time as unix seconds)
-// is used only to evaluate an age bound, so the Archive needs no clock of its own. A
-// dropped segment's data file and sidecar index are unmapped and unlinked; a query
-// currently scanning a dropped segment holds a pin, so the data file's unlink is
-// deferred until that query finishes (no read-through-a-torn-mapping).
-func (a *Archive) Rotate(now float64) (int, error) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var err error
-	dropped := 0
-	for a.shouldDropOldest(now) {
-		as := a.segs[0]
-		a.segs = a.segs[1:]
-		// The sidecar index only exists when the archive is indexed; ignore its
-		// absence so an index-less archive can still rotate.
-		if e := os.Remove(a.idxPath(as.seg.id)); e != nil && !os.IsNotExist(e) && err == nil {
-			err = e
-		}
-		if as.seg.retire() { // unpinned now ⇒ reap immediately; else last unpin reaps
-			if e := as.seg.reapAndHook(); e != nil && err == nil { // reap data + unmap sidecar
-				err = e
-			}
-		}
-		dropped++
-	}
-	if dropped > 0 {
-		if e := a.writeCatalog(); e != nil && err == nil {
-			err = e
-		}
-	}
-	return dropped, err
-}
-
-// shouldDropOldest reports whether the oldest sealed segment exceeds a retention
-// bound. It is evaluated one segment at a time so count/byte bounds converge.
-func (a *Archive) shouldDropOldest(now float64) bool {
-	if len(a.segs) == 0 {
+// zonePrune reports whether a segment can be skipped entirely: some required conjunct (a
+// top-level AND probe) on a zone-mapped attribute cannot be satisfied by any record whose
+// value lies in the segment's [min,max] for that attribute.
+func zonePrune(zones map[uint32]zoneRange, probes []vm.Probe, intern *wire.InternTable) bool {
+	if len(zones) == 0 {
 		return false
 	}
-	r := a.ret
-	if r.MaxSegments > 0 && len(a.segs) > r.MaxSegments {
-		return true
-	}
-	if r.MaxBytes > 0 {
-		var total int64
-		for _, as := range a.segs {
-			total += int64(as.seg.used)
+	for _, p := range probes {
+		id, ok := intern.LookupID(p.Attr)
+		if !ok {
+			continue
 		}
-		if total > r.MaxBytes {
+		z, ok := zones[id]
+		if !ok {
+			continue
+		}
+		vals := probeFloats(p)
+		if len(vals) == 0 {
+			continue // non-numeric constraint: zone map can't rule it out
+		}
+		if !zoneMayMatch(z, p.Op, vals) {
 			return true
-		}
-	}
-	if r.MaxAgeAttr != "" && r.MaxAge > 0 {
-		if id, ok := a.intern.LookupID(r.MaxAgeAttr); ok {
-			if z, ok := a.segs[0].zones[id]; ok && z.Max < now-r.MaxAge {
-				return true
-			}
 		}
 	}
 	return false
 }
 
-// Close seals the active segment and unmaps every segment file. The Archive must not
-// be used afterward.
-// Count returns the number of records currently retained (sealed segments plus the
-// active one). Rotation reduces it in whole-segment steps.
-func (a *Archive) Count() int {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	n := 0
-	for _, s := range a.segs {
-		n += s.recN
-	}
-	if a.active != nil {
-		n += a.active.recN
-	}
-	return n
-}
-
-func (a *Archive) Close() error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	var err error
-	if e := a.sealActiveLocked(); e != nil {
-		err = e
-	}
-	for _, as := range a.segs {
-		// Unmap data + sidecar index, but only once no live watch/query still pins the
-		// segment; a pinned segment's unmap is deferred to its last unpin. Unmapping a
-		// mapping a watcher is still reading is a use-after-free that -race flagged.
-		if e := as.seg.closeUnmap(); e != nil && err == nil {
-			err = e
+// zoneMayMatch reports whether a segment with the given [min,max] for an attribute could
+// contain a record satisfying (op, vals). A false result means the segment is prunable for
+// this required conjunct.
+func zoneMayMatch(z zoneRange, op string, vals []float64) bool {
+	switch op {
+	case "==", "in":
+		for _, v := range vals {
+			if v >= z.Min && v <= z.Max {
+				return true
+			}
 		}
+		return false
+	case "<":
+		return z.Min < vals[0]
+	case "<=":
+		return z.Min <= vals[0]
+	case ">":
+		return z.Max > vals[0]
+	case ">=":
+		return z.Max >= vals[0]
+	default:
+		return true // != and anything else: not prunable
 	}
-	a.segs = nil
-	return err
 }
 
-func (a *Archive) segPath(id uint32) string {
-	return filepath.Join(a.dir, fmt.Sprintf("seg-%06d.dat", id))
-}
-
-func (a *Archive) idxPath(id uint32) string {
-	return filepath.Join(a.dir, fmt.Sprintf("seg-%06d.idx", id))
-}
-
-// sortSegsByID keeps the sealed set ordered oldest-first (ascending id).
-func (a *Archive) sortSegsByID() {
-	sort.Slice(a.segs, func(i, j int) bool { return a.segs[i].seg.id < a.segs[j].seg.id })
-}
-
-// --- wireCtx: mode-aware wire touchpoints for wire-native matching (interned) ---
-
-func (a *Archive) decodeWire(w []byte) (*ast.ClassAd, error) {
-	return wire.Decode(w, a.intern)
-}
-
-func (a *Archive) wireLookup(ad wire.Ad, name string) ([]byte, bool) {
-	id, ok := a.intern.LookupID(name)
-	if !ok {
-		return nil, false
+// probeFloats returns the numeric values of a probe, or nil if any value is non-numeric
+// (in which case the zone map cannot reason about it).
+func probeFloats(p vm.Probe) []float64 {
+	out := make([]float64, 0, len(p.Vals))
+	for _, v := range p.Vals {
+		f, ok := numericFloat(v)
+		if !ok {
+			return nil
+		}
+		out = append(out, f)
 	}
-	return ad.Lookup(id)
-}
-
-func (a *Archive) decodeNode(node []byte) (ast.Expr, error) {
-	return wire.DecodeNode(node, a.intern)
-}
-
-// ensureIndex returns as's segment index, lazily mmap-loading its sidecar the first
-// time a query needs it. A segment queries never reach (e.g. zone-pruned) never
-// pages its index in; the active (unsealed) segment and a missing/corrupt sidecar
-// yield nil, and the caller full-scans. The sidecar unmap is registered as the
-// segment's reap hook so it fires when the segment's pins drain (rotation) or at
-// Close — never under an in-flight scan.
-func (a *Archive) ensureIndex(as *archiveSeg) *mmapSegIndex {
-	if si := as.idx.Load(); si != nil {
-		return si
-	}
-	if !as.sealed {
-		return nil // active segment: no persisted index
-	}
-	as.idxMu.Lock()
-	defer as.idxMu.Unlock()
-	if si := as.idx.Load(); si != nil {
-		return si
-	}
-	data, closer, err := mapFile(a.idxPath(as.seg.id))
-	if err != nil {
-		return nil // no sidecar (e.g. no indexes configured) ⇒ full scan
-	}
-	si, err := parseMmapSidecar(data)
-	if err != nil {
-		_ = closer()
-		return nil
-	}
-	as.seg.setOnReap(func() { _ = closer() })
-	as.idx.Store(si)
-	return si
+	return out
 }
