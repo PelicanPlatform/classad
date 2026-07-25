@@ -46,6 +46,12 @@ type Options struct {
 	// history archive's aging-out). The zero value keeps everything (Rotate is
 	// then inert). Only meaningful with AppendOnly. See Rotate.
 	Retention Retention
+	// ZoneAttrs names numeric attributes to keep a per-segment [min,max] zone map on,
+	// so a range/equality query on one (e.g. CompletionDate > T) skips whole sealed
+	// segments whose span cannot match, and age-based Retention (MaxAgeAttr) can drop
+	// a segment by its newest timestamp. Value-indexed attributes (ValueAttrs) are
+	// zoned automatically. Only meaningful with AppendOnly. Optional. See zonemap.go.
+	ZoneAttrs []string
 	// SegmentSize is the arena segment size in bytes. Default 8 MiB.
 	SegmentSize int
 	// Hasher routes keys to shards / directory buckets. Default 64-bit FNV-1a.
@@ -242,6 +248,11 @@ type Collection struct {
 	// and Rotate). Zero value ⇒ keep everything.
 	ret Retention
 
+	// hasZones caches whether any per-segment zone maps are configured (see
+	// Options.ZoneAttrs / zonemap.go), so the query hot path skips probe extraction
+	// when zone pruning is off. Append-only only.
+	hasZones bool
+
 	// Watch (see watch.go / docs/WATCH.md). hub is nil unless WatchHistory > 0.
 	hub           *watchHub
 	watchBuf      int
@@ -433,6 +444,34 @@ func New(opts Options) *Collection {
 		c.matchRoots = append(c.matchRoots, strings.ToLower(r))
 	}
 	c.spec.Store(newIndexSpec(c.intern, opts.CategoricalAttrs, opts.ValueAttrs))
+	// Zone maps (append-only only): cover the explicit ZoneAttrs plus every value-indexed
+	// attribute (a range query on an indexed attr should prune whole segments too), matching
+	// the archive. Each attribute carries both its folded name and its interned id so the
+	// per-segment scan can read the value whether records are inline- or id-encoded; the
+	// zone map is keyed by id, which zonePrune/age-retention resolve names to via c.intern.
+	// zoneInline is finalized in Open (a persistent collection stores inline names).
+	if opts.AppendOnly && (len(opts.ZoneAttrs) > 0 || len(opts.ValueAttrs) > 0) {
+		var zattrs []zoneAttr
+		seen := map[uint32]struct{}{}
+		addZone := func(name string) {
+			id := c.intern.Intern(name)
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				// LookupByName folds case internally, so the raw name is fine for inline lookup.
+				zattrs = append(zattrs, zoneAttr{name: name, id: id})
+			}
+		}
+		for _, n := range opts.ZoneAttrs {
+			addZone(n)
+		}
+		for _, n := range opts.ValueAttrs { // value-indexed attrs are zoned automatically
+			addZone(n)
+		}
+		c.hasZones = len(zattrs) > 0
+		for _, sh := range shards {
+			sh.zoneAttrs = zattrs
+		}
+	}
 	// In-memory sealing: when this collection is in-memory (no Dir), mmap is supported, and
 	// indexes are configured, seal each sealed RAM segment's index into an anonymous mmap
 	// sidecar (off the Go heap: no GC scan of the sealed majority's bitmaps, RSS reclaimable
@@ -720,6 +759,10 @@ type queryPlan struct {
 	wireOK   bool // native + partial-safe: try wire-native evaluation
 	ws       *wireScope
 	resolver func(name string, scope ast.AttributeScope) classad.Value
+	// zoneProbes are the query's top-level AND probes, used to skip whole sealed
+	// segments whose zone map cannot contain a match (append-only zone pruning). Set
+	// only when the collection has zone attributes; nil otherwise (no pruning cost).
+	zoneProbes []vm.Probe
 }
 
 // Query returns an iterator over the ads matching q, with the same
@@ -742,6 +785,9 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 			wireOK:   q.Native() && plan.PartialSafe,
 			ws:       ws,
 			resolver: ws.resolve, // bound once to avoid a per-ad closure allocation
+		}
+		if c.hasZones {
+			qp.zoneProbes = q.Probes() // enable sealed-segment zone pruning
 		}
 		// Chained collection: a serial two-pass scan per shard resolves each ad's
 		// inherited (parent) attributes. Indexes and query fan-out are bypassed here
@@ -848,10 +894,25 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		}
 		return true
 	}
+	// Zone pruning: drop sealed segments whose [min,max] zone map cannot contain a
+	// record satisfying a required conjunct (e.g. CompletionDate > T skips every
+	// older segment). A nil-zones window (the active segment, or any collection
+	// without ZoneAttrs) is never prunable. The caller still releases every original
+	// window; this only narrows what is walked.
+	walk := wins
+	if len(qp.zoneProbes) > 0 {
+		walk = make([]segWindow, 0, len(wins))
+		for _, w := range wins {
+			if w.zones != nil && zonePrune(w.zones, qp.zoneProbes, c.intern) {
+				continue
+			}
+			walk = append(walk, w)
+		}
+	}
 	if c.reverseScan {
-		forEachVisibleKeyedReverse(s0, wins, visit)
+		forEachVisibleKeyedReverse(s0, walk, visit)
 	} else {
-		forEachVisibleKeyed(s0, wins, visit)
+		forEachVisibleKeyed(s0, walk, visit)
 	}
 	return cont
 }

@@ -17,9 +17,9 @@ package collections
 // once no in-flight scan still pins it (a scan that started earlier keeps reading a
 // consistent snapshot until it finishes; the reclaim is deferred to its last unpin).
 //
-// NOTE: MaxAgeAttr/MaxAge (drop by a segment's max value of a time attribute) needs the
-// per-segment zone map, which the append-only Collection does not yet maintain; until
-// then Rotate honors MaxSegments and MaxBytes only. Both suffice to bound disk use.
+// Retention honors MaxSegments, MaxBytes, and MaxAgeAttr/MaxAge (drop a segment whose
+// newest value of the age attribute is older than now-MaxAge); MaxAge requires the age
+// attribute to be a configured ZoneAttr so its per-segment max is available.
 func (c *Collection) Rotate(now float64) (int, error) {
 	if !c.appendOnly() || (c.ret == Retention{}) {
 		return 0, nil
@@ -30,6 +30,12 @@ func (c *Collection) Rotate(now float64) (int, error) {
 	defer c.maintMu.Unlock()
 
 	sh := c.shards[0] // AppendOnly forces a single shard
+	// Resolve the age attribute once (needs the shared intern table on the Collection).
+	var ageID uint32
+	var ageOK bool
+	if c.ret.MaxAgeAttr != "" && c.ret.MaxAge > 0 {
+		ageID, ageOK = c.intern.LookupID(c.ret.MaxAgeAttr)
+	}
 	var toReap []*segment
 	dropped := 0
 
@@ -39,7 +45,7 @@ func (c *Collection) Rotate(now float64) (int, error) {
 		if idx < 0 || sh.segs[idx] == sh.act {
 			break // nothing left, or only the active (still-appended) segment remains
 		}
-		if !sh.overRetention(c.ret, idx) {
+		if !sh.overRetention(c.ret, idx, now, ageID, ageOK) {
 			break
 		}
 		seg := sh.segs[idx]
@@ -79,8 +85,9 @@ func oldestLiveSeg(sh *shard) int {
 
 // overRetention reports whether the segment at idx (the oldest live one) should be
 // dropped under r. Evaluated one segment at a time so count/byte bounds converge as
-// segments are reclaimed. Caller holds sh.mu.
-func (sh *shard) overRetention(r Retention, idx int) bool {
+// segments are reclaimed. ageID/ageOK carry the interned age attribute (resolved by the
+// caller) for MaxAge. Caller holds sh.mu.
+func (sh *shard) overRetention(r Retention, idx int, now float64, ageID uint32, ageOK bool) bool {
 	if r.MaxSegments > 0 {
 		live := 0
 		for _, seg := range sh.segs {
@@ -103,7 +110,16 @@ func (sh *shard) overRetention(r Retention, idx int) bool {
 			return true
 		}
 	}
-	// MaxAgeAttr/MaxAge: needs per-segment zone maps (a follow-up); ignored for now.
+	// MaxAgeAttr/MaxAge: drop the oldest segment when its newest value of the age
+	// attribute (its zone max, e.g. the latest CompletionDate in the segment) is older
+	// than now-MaxAge. Reuses the per-segment zone map; ageID is the interned id
+	// resolved by the caller (0/false when the age attr is not zone-mapped). The active
+	// segment has nil zones and is never dropped here.
+	if r.MaxAge > 0 && ageOK {
+		if z, ok := sh.segs[idx].zones[ageID]; ok && z.Max < now-r.MaxAge {
+			return true
+		}
+	}
 	return false
 }
 
