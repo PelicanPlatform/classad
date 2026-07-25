@@ -678,7 +678,7 @@ func cmpFloat(op string, k, t float64) bool {
 // visited record is MVCC-visibility filtered and full-query re-verified, so the
 // result is identical to a full scan. Returns false if the consumer stopped.
 func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryPlan, emit func(w []byte) bool) bool {
-	return c.scanShardCandidates(sh, usable, func(w []byte) bool {
+	return c.scanShardCandidates(sh, usable, c.reverseScan, func(w []byte) bool {
 		if !matchWire(w, qp) {
 			return true // not a match: keep scanning
 		}
@@ -691,9 +691,14 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 // stop the whole scan). Windows whose per-segment index does not cover the probes,
 // and the un-indexed tail of those that do, are full-scanned -- so onCand sees a
 // superset of the true candidates and the caller must re-verify. Returns false if
-// onCand asked to stop. This is the shared candidate-enumeration used by both the
-// indexed Query path (scanShardIndexed) and index-pre-filtered Match.
-func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand func(w []byte) bool) bool {
+// onCand asked to stop. This is the shared candidate-enumeration used by the indexed
+// Query path (scanShardIndexed).
+//
+// When reverse is set (an append-only, newest-first collection), candidates are visited
+// newest-first: segments from the last backward, and within a segment the un-indexed tail
+// (written last) before the indexed prefix, each in descending offset order. A consumer
+// that stops early then gets the newest matches -- a pushed-down LIMIT through the index.
+func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, reverse bool, onCand func(w []byte) bool) bool {
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var dbuf []byte
@@ -732,6 +737,10 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand
 		return true
 	}
 
+	if reverse {
+		return scanShardCandidatesReverse(wins, usable, visit)
+	}
+
 	for _, w := range wins {
 		si := w.seg.readIdx()
 		if si == nil || !si.covers(usable) {
@@ -764,6 +773,62 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, onCand
 		if int(si.coveredUpto()) < w.used {
 			if !scanRange(w, int(si.coveredUpto()), w.used) {
 				return false
+			}
+		}
+	}
+	return true
+}
+
+// scanShardCandidatesReverse is scanShardCandidates' newest-first traversal: segments from
+// the last backward, and within each the tail (newest records, written after the index)
+// before the indexed prefix, both in descending offset order. visit returns true to stop.
+// Records are variable-length (forward-length only), so a range walked in reverse is
+// collected forward into a reused slice, then replayed backward.
+func scanShardCandidatesReverse(wins []segWindow, usable []usableProbe, visit func(w segWindow, o uint32) bool) bool {
+	var offs []uint32 // reused across ranges
+	scanRangeReverse := func(w segWindow, from, to int) bool {
+		offs = offs[:0]
+		for off := from; off < to; {
+			o := uint32(off)
+			total := recTotalLen(w.data, o)
+			if total == 0 {
+				break
+			}
+			offs = append(offs, o)
+			off += int(total)
+		}
+		for i := len(offs) - 1; i >= 0; i-- {
+			if visit(w, offs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	for wi := len(wins) - 1; wi >= 0; wi-- {
+		w := wins[wi]
+		si := w.seg.readIdx()
+		if si == nil || !si.covers(usable) {
+			if !scanRangeReverse(w, 0, w.used) {
+				return false
+			}
+			continue
+		}
+		// Tail (newest, written after the index) first, descending.
+		if int(si.coveredUpto()) < w.used {
+			if !scanRangeReverse(w, int(si.coveredUpto()), w.used) {
+				return false
+			}
+		}
+		if si.skipsPrefix(usable) {
+			continue // prefix provably has no candidate
+		}
+		// Then the indexed prefix candidates, descending (newest of the prefix first).
+		if cand := si.candidateOffsets(usable); cand != nil {
+			it := cand.ReverseIterator()
+			for it.HasNext() {
+				if visit(w, it.Next()) {
+					return false
+				}
 			}
 		}
 	}

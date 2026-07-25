@@ -804,7 +804,11 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 		// group and every group is index-usable, prune via the union of the groups'
 		// candidate sets (DNF: OR of AND-of-probes), re-verifying each candidate. A
 		// single group falls through to the conjunctive path below unchanged.
-		if plan := q.ProbePlan(); len(plan) > 1 {
+		// The disjunctive index path visits candidates in index order, which a
+		// newest-first (reverse) collection cannot honor; it falls through to a
+		// reverse full scan instead, keeping ORs newest-first (the conjunctive path
+		// is made reverse-aware in scanShardCandidates).
+		if plan := q.ProbePlan(); len(plan) > 1 && !c.reverseScan {
 			for _, g := range plan {
 				c.demand.record(g.Probes)
 			}

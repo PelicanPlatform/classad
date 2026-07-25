@@ -80,29 +80,27 @@ const archiveWatchCap = 1 << 10
 
 // archiveCollectionOptions maps ArchiveOptions onto the append-log Collection configuration.
 //
-// The archive contract is newest-first Query (condor_history order), which the Collection
-// guarantees only on the full-scan (ReverseScan) path -- its indexed scan visits candidates
-// in index order. So the archive does not yet configure per-segment categorical/value
-// indexes: every query full-scans newest-first, pruned by zone maps, and re-verifies the
-// predicate. Correctness and newest-first LIMIT hold; categorical/value index acceleration
-// awaits a newest-first indexed scan (a follow-up). ValueAttrs are numeric, so they are
-// folded into the zone maps to keep range/equality pruning on them.
+// The archive contract is newest-first Query (condor_history order). The Collection honors
+// that on both the full-scan and the conjunctive indexed path (ReverseScan is reverse-aware
+// there); disjunctive (OR) index queries fall back to a reverse full scan. So per-segment
+// categorical/value indexes are configured for acceleration while newest-first is preserved.
 func archiveCollectionOptions(opts ArchiveOptions) Options {
 	segSize := opts.SegmentSize
 	if segSize <= 0 {
 		segSize = defaultArchiveSegmentSize
 	}
-	zones := append(append([]string(nil), opts.ZoneAttrs...), opts.ValueAttrs...)
 	return Options{
-		AppendOnly:   true, // pure append log: no supersession, no compaction, no key dir
-		ReverseScan:  true, // newest-first Query, matching condor_history order
-		Dir:          opts.Dir,
-		SegmentSize:  segSize,
-		Codec:        opts.Codec,
-		HotAttrs:     opts.HotAttrs,
-		ZoneAttrs:    zones,
-		Retention:    opts.Retention,
-		WatchHistory: archiveWatchCap, // enable the append-stream watch
+		AppendOnly:       true, // pure append log: no supersession, no compaction, no key dir
+		ReverseScan:      true, // newest-first Query, matching condor_history order
+		Dir:              opts.Dir,
+		SegmentSize:      segSize,
+		Codec:            opts.Codec,
+		HotAttrs:         opts.HotAttrs,
+		CategoricalAttrs: opts.CategoricalAttrs,
+		ValueAttrs:       opts.ValueAttrs, // numeric ValueAttrs are auto-added to the zone maps
+		ZoneAttrs:        opts.ZoneAttrs,
+		Retention:        opts.Retention,
+		WatchHistory:     archiveWatchCap, // enable the append-stream watch
 	}
 }
 
