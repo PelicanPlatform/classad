@@ -22,6 +22,15 @@ type shard struct {
 	// skipped. Set once at construction; never mutated.
 	appendOnly bool
 
+	// zoneAttrs are the attributes kept as per-segment numeric [min,max] zone maps
+	// (see Options.ZoneAttrs). Only meaningful with appendOnly. A sealed segment's
+	// zones let a range/equality query skip it wholesale (see zonemap.go). zoneInline
+	// selects name- vs id-based attribute lookup, matching the record encoding (set
+	// true for a persistent/inline collection in Open). Set at construction; the
+	// inline flag is finalized in Open. Never mutated after.
+	zoneAttrs  []zoneAttr
+	zoneInline bool
+
 	commitSeq uint64 // bumped once per committed batch; scan snapshots capture it
 	count     int    // number of live keys
 
@@ -286,6 +295,10 @@ func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied b
 func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) (loc, bool) {
 	rl := recordLen(len(key), len(ad))
 	if sh.act == nil || sh.act.codec != codec || sh.act.used+rl > len(sh.act.data) {
+		// The segment we're leaving is now sealed (an append log never rewrites it):
+		// compute its zone map so later range queries can prune it. No-op unless
+		// append-only with ZoneAttrs configured.
+		sh.sealZones(sh.act)
 		size := sh.segSize
 		if rl > size {
 			size = rl
@@ -509,7 +522,8 @@ type segWindow struct {
 	data  []byte
 	used  int
 	codec Codec
-	seg   *segment // for reindex-on-demand and the per-segment index (idx)
+	seg   *segment             // for reindex-on-demand and the per-segment index (idx)
+	zones map[uint32]zoneRange // sealed segment's zone map (nil ⇒ never prunable)
 }
 
 // snapshot captures the shard's scan state under the read lock: the commit
@@ -549,7 +563,7 @@ func (sh *shard) buildWindowsLocked(s0 uint64) []segWindow {
 			continue
 		}
 		seg.pin() // no-op for RAM segments
-		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg})
+		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg, zones: seg.zones})
 	}
 	return wins
 }

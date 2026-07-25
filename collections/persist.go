@@ -202,6 +202,12 @@ func Open(opts Options) (*Collection, error) {
 	c := New(opts)
 	c.dir = opts.Dir
 	c.inline = true
+	// Records are inline-encoded (names, not interned ids); zone-map value extraction
+	// must look up by name. New defaulted the shards to id-based lookup for the in-memory
+	// case; flip them here now that inline encoding is confirmed.
+	for _, sh := range c.shards {
+		sh.zoneInline = true
+	}
 	// Indexes on a persistent collection are in-memory only (rebuilt on recovery, see
 	// below). Replace the interned spec New built with an inline one that extracts
 	// values by name (records carry no intern ids).
@@ -368,6 +374,11 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	spec := c.spec.Load()
 	for _, seg := range sh.segs {
 		if seg != nil && seg != sh.act {
+			// Recompute the sealed segment's zone map (not persisted separately; cheap to
+			// rebuild from the segment's own records). No-op unless append-only + ZoneAttrs.
+			if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {
+				seg.zones = computeSegZones(seg.data, seg.used, sh.zoneAttrs, sh.zoneInline, seg.codec)
+			}
 			if c.loadSealedIndex(seg, spec) {
 				// Phase 3: the segment's keys are now reachable through the sealed
 				// probe, so evict them from the resident directory -- the RAM win. Safe

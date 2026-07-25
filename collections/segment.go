@@ -97,6 +97,14 @@ type segment struct {
 	minSeq uint64
 	maxSup uint64
 
+	// zones is this sealed segment's per-attribute numeric [min,max] zone map (see
+	// zonemap.go / Options.ZoneAttrs), keyed by interned attr id. Nil for the active
+	// (still-appended) segment and for any collection without ZoneAttrs -- a nil map
+	// is never prunable, so those segments are always scanned. Guarded by the shard
+	// lock; set once when the segment is sealed, then immutable (a query reads it from
+	// the frozen window snapshot).
+	zones map[uint32]zoneRange
+
 	codec Codec // the codec that compressed this segment's records (immutable)
 
 	// idx is this segment's value/categorical index, or nil if not yet built. It is
