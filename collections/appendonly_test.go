@@ -46,20 +46,22 @@ func TestAppendOnlyMode(t *testing.T) {
 		t.Fatalf("scan returned %d records, want 3 (all appends, no dedup)", got)
 	}
 
-	// Maintenance that would rewrite/renumber the log is inert.
+	// Compaction and per-key delete are inert on an append log (no supersession to
+	// reclaim, no key directory to delete from).
 	if n := c.Compact(); n != 0 {
 		t.Errorf("Compact on append-only did work (%d); want no-op", n)
-	}
-	if n := c.Rewrite(); n != 0 {
-		t.Errorf("Rewrite on append-only did work (%d); want no-op", n)
-	}
-	if _, err := c.RetrainDict(1000); err == nil {
-		t.Error("RetrainDict on append-only should error (recompression path is not append-safe)")
 	}
 	if c.Delete([]byte("1.0")) {
 		t.Error("Delete on append-only should be a no-op")
 	}
+	// Rewrite DOES work on an append log -- it reseals each segment in place preserving
+	// order (see retrain_appendonly.go), rather than the compaction live-copy, and must
+	// leave the record count unchanged. (RetrainDict, which also reseals, is exercised in
+	// TestAppendOnlyRetrain, where the corpus is large enough to train a dictionary.)
+	if n := c.Rewrite(); n != 3 {
+		t.Errorf("Rewrite on append-only rewrote %d, want 3 (all records resealed)", n)
+	}
 	if got := count(); got != 3 {
-		t.Errorf("after inert maintenance scan = %d, want 3 (log unchanged)", got)
+		t.Errorf("after maintenance scan = %d, want 3 (log unchanged)", got)
 	}
 }

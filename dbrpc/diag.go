@@ -189,6 +189,53 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 // is built over the existing ads (AddIndex updates only the spec; existing
 // segments' indexes are rebuilt by Reindex). Without this the index would apply
 // only to future writes and would not prune the current data.
+// archiveAdmin runs a management action on an append-only archive (history) table: the
+// layout-tuning subset of table admin -- retrain the ZSTD dictionary, add/drop/rebuild
+// per-segment indexes, and rewrite. Encryption/time-travel/truncate/hot-set actions do not
+// apply to an archive. DAEMON-gated by the caller, like the mutable-table admin.
+func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, error) {
+	switch action {
+	case "index.add.categorical":
+		if len(args) == 0 {
+			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
+		}
+		return changedMsg("categorical index on "+join(args), a.AddIndex(args, nil)), nil
+	case "index.add.value":
+		if len(args) == 0 {
+			return "", fmt.Errorf("index.add.value needs at least one attribute")
+		}
+		return changedMsg("value index on "+join(args), a.AddIndex(nil, args)), nil
+	case "index.drop":
+		if len(args) == 0 {
+			return "", fmt.Errorf("index.drop needs at least one attribute")
+		}
+		changed := a.DropIndex(args...)
+		if changed {
+			a.Reindex()
+		}
+		return changedMsg("dropped index on "+join(args), changed), nil
+	case "index.reindex":
+		a.Reindex()
+		return "reindexed", nil
+	case "rewrite":
+		return fmt.Sprintf("rewrote %d record(s) with the current hot set", a.Rewrite()), nil
+	case "codec.retrain":
+		sampleMax := diagSampleMax
+		if len(args) == 1 {
+			if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+				sampleMax = v
+			}
+		}
+		dictBytes, err := a.RetrainDict(sampleMax)
+		if err != nil {
+			return "", fmt.Errorf("retrain: %w", err)
+		}
+		return fmt.Sprintf("retrained ZSTD dictionary (%d bytes) and recompressed the archive", dictBytes), nil
+	default:
+		return "", fmt.Errorf("unknown archive admin action %q", action)
+	}
+}
+
 func addIndex(t *db.DB, what string, categorical, value []string) string {
 	changed := t.AddIndex(categorical, value)
 	if !changed {

@@ -70,6 +70,75 @@ func TestArchiveOverRPC(t *testing.T) {
 	}
 }
 
+// TestArchiveAdminOverRPC covers archive maintenance through the admin RPC path: retrain
+// the dictionary, add a value index, and reindex a history table, verifying data stays
+// correct and that the actions are DAEMON-gated.
+func TestArchiveAdminOverRPC(t *testing.T) {
+	ctx := context.Background()
+	c, cleanup := catServerPair(t, ServeOptions{Privileged: true})
+	defer cleanup()
+	if err := c.CreateArchiveTable(ctx, "history", db.ArchiveConfig{ValueAttrs: []string{"ClusterId"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Dictionary-friendly, repetitive records so retrain can train.
+	for i := 0; i < 400; i++ {
+		ad := fmt.Sprintf("ClusterId = %d\nOwner = \"user_%d\"\nCmd = \"/usr/bin/long_repeated_command_path\"\nJobStatus = 4", i, i%20)
+		if err := c.ArchiveAppend(ctx, "history", ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	countMatches := func(constraint string) int {
+		rows, err := c.ArchiveQuery(ctx, "history", constraint, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(rows)
+	}
+	before := countMatches("ClusterId >= 200")
+
+	// Retrain the dictionary (recompresses the archive in place).
+	msg, err := c.AdminTable(ctx, "history", "codec.retrain", "1000")
+	if err != nil {
+		t.Fatalf("archive codec.retrain: %v", err)
+	}
+	if msg == "" {
+		t.Error("retrain returned an empty message")
+	}
+	if after := countMatches("ClusterId >= 200"); after != before {
+		t.Errorf("retrain changed result count: before %d, after %d", before, after)
+	}
+
+	// Add a value index on Owner-adjacent attribute, then reindex.
+	if _, err := c.AdminTable(ctx, "history", "index.add.value", "ClusterId"); err != nil {
+		t.Fatalf("archive index.add.value: %v", err)
+	}
+	if _, err := c.AdminTable(ctx, "history", "index.reindex"); err != nil {
+		t.Fatalf("archive index.reindex: %v", err)
+	}
+	if after := countMatches("ClusterId >= 200"); after != before {
+		t.Errorf("reindex changed result count: before %d, after %d", before, after)
+	}
+	// A specific record is still findable.
+	if n := countMatches("ClusterId == 321"); n != 1 {
+		t.Errorf("ClusterId==321 matched %d after maintenance, want 1", n)
+	}
+
+	// Unknown archive admin action errors.
+	if _, err := c.AdminTable(ctx, "history", "encrypt.set", "X"); err == nil {
+		t.Error("encrypt.set should be rejected for an archive table")
+	}
+
+	// Admin is DAEMON-gated: a non-privileged connection is refused.
+	rc, rcleanup := catServerPair(t, ServeOptions{})
+	defer rcleanup()
+	if err := rc.CreateArchiveTable(ctx, "history", db.ArchiveConfig{}); err != nil {
+		// created on its own catalog; ignore
+	}
+	if _, err := rc.AdminTable(ctx, "history", "codec.retrain"); err == nil {
+		t.Error("archive admin should require DAEMON authorization")
+	}
+}
+
 // TestArchiveAggregateOverRPC covers the server-side archive GROUP BY through the client
 // API: COUNT(*), COUNT with a WHERE constraint, and GROUP BY Owner. Each grouped result is
 // checked against a client-side count over the same rows fetched via ArchiveQuery, proving

@@ -161,3 +161,23 @@ func (t *ArchiveTable) Rotate(now float64) (int, error) { return t.a.Rotate(now)
 
 // Close flushes and closes the archive.
 func (t *ArchiveTable) Close() error { return t.a.Close() }
+
+// RetrainDict trains a fresh ZSTD dictionary from up to sampleMax records and recompresses
+// every segment in place under it, returning the new dictionary's size in bytes.
+func (t *ArchiveTable) RetrainDict(sampleMax int) (int, error) { return t.a.RetrainDict(sampleMax) }
+
+// Rewrite recompresses and re-encodes every segment in place under the current codec and
+// hot set, returning the number of records rewritten.
+func (t *ArchiveTable) Rewrite() int { return t.a.Rewrite() }
+
+// AddIndex adds per-segment indexes on the named categorical and/or value attributes and
+// rebuilds them over existing segments. Returns false if the index set was unchanged.
+func (t *ArchiveTable) AddIndex(categorical, value []string) bool {
+	return t.a.AddIndex(categorical, value)
+}
+
+// DropIndex removes the named per-segment indexes. Returns false if none matched.
+func (t *ArchiveTable) DropIndex(names ...string) bool { return t.a.DropIndex(names...) }
+
+// Reindex rebuilds the per-segment indexes over all segments.
+func (t *ArchiveTable) Reindex() { t.a.Reindex() }
