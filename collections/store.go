@@ -230,6 +230,13 @@ type Collection struct {
 	// load). Commits and queries never take it.
 	maintMu sync.Mutex
 
+	// reindexMu serializes Reindex so concurrent callers (the archive's eager per-seal
+	// reindex, the periodic maintenance reindex, and compaction's reindexAfterCompaction)
+	// cannot both build and install the same segment's sidecar at once. Distinct from
+	// maintMu, which retrain/rotate/rewrite hold across their whole pass (and which those
+	// ops' internal reindexAfterCompaction must not re-take).
+	reindexMu sync.Mutex
+
 	demand *demandTracker // per-attribute query demand, for SuggestIndexes
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
@@ -607,6 +614,19 @@ func (c *Collection) Update(batch []AdUpdate) error {
 // appendOnly reports whether this is an append-log collection (Options.AppendOnly). It is a
 // whole-collection property, set once at construction, so the first shard's flag speaks for all.
 func (c *Collection) appendOnly() bool { return len(c.shards) > 0 && c.shards[0].appendOnly }
+
+// appendSealSeq returns the append-only shard's segment-seal counter (0 if not append-only),
+// so a caller can detect when a segment has sealed and index it eagerly. See shard.sealSeq.
+func (c *Collection) appendSealSeq() uint64 {
+	if len(c.shards) == 0 {
+		return 0
+	}
+	return c.shards[0].sealSeq.Load()
+}
+
+// hasSegmentIndexes reports whether any per-segment categorical/value index is configured,
+// so eager reindexing is skipped when there is nothing to build.
+func (c *Collection) hasSegmentIndexes() bool { return c.spec.Load().any() }
 
 func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	codec := c.currentCodec()
