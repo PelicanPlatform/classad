@@ -210,6 +210,12 @@ func (t *ArchiveTable) Count() int { return t.a.Count() }
 // time (unix seconds, for age-based retention). Returns how many segments were dropped.
 func (t *ArchiveTable) Rotate(now float64) (int, error) { return t.a.Rotate(now) }
 
+// Truncate drops every record, resetting the archive to empty in place (see
+// collections.Archive.Truncate). It is the destructive reset behind a from-scratch history
+// re-sync: empty the table, then re-ingest from the source. The persisted config (indexes,
+// zone maps, retention) is retained, so the archive keeps its shape.
+func (t *ArchiveTable) Truncate() { t.a.Truncate() }
+
 // Close flushes and closes the archive.
 func (t *ArchiveTable) Close() error { return t.a.Close() }
 
