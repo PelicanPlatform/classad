@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"iter"
@@ -209,6 +210,35 @@ func (t *ArchiveTable) Count() int { return t.a.Count() }
 // Rotate drops sealed segments that fall outside the retention policy, given the current
 // time (unix seconds, for age-based retention). Returns how many segments were dropped.
 func (t *ArchiveTable) Rotate(now float64) (int, error) { return t.a.Rotate(now) }
+
+// Watch streams the archive's change events (append-only: upserts and the catch-up/live
+// markers, no deletes), converting collections.WatchEvent to the db WatchEvent used by the
+// mutable-table watch so the two are wire-identical. An empty cursor replays the retained
+// history, then goes live. See collections.Archive.Watch.
+func (t *ArchiveTable) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
+	seq, err := t.a.Watch(ctx, cursor)
+	if err != nil {
+		return nil, err
+	}
+	return func(yield func(WatchEvent) bool) {
+		for ev := range seq {
+			we := WatchEvent{Key: string(ev.Key), Ad: ev.Ad, Cursor: ev.Cursor}
+			switch ev.Kind {
+			case collections.WatchDelete:
+				we.Kind = WatchDelete
+			case collections.WatchReset:
+				we.Kind = WatchReset
+			case collections.WatchSynced:
+				we.Kind = WatchSynced
+			case collections.WatchResync:
+				we.Kind = WatchResync
+			}
+			if !yield(we) {
+				return
+			}
+		}
+	}, nil
+}
 
 // Truncate drops every record, resetting the archive to empty in place (see
 // collections.Archive.Truncate). It is the destructive reset behind a from-scratch history

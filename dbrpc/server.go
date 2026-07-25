@@ -466,10 +466,6 @@ func adString(ad *classad.ClassAd, includePrivate bool) string {
 func (sc *serverConn) streamWatch(reqID uint64, r *reader) {
 	table := r.str()
 	cursor := append([]byte(nil), r.bytesRef()...)
-	d, ok := sc.s.tableOr(reqID, table, sc.write)
-	if !ok {
-		return
-	}
 	ctx, cancel := context.WithCancel(sc.ctx)
 	sc.wmu.Lock()
 	sc.watches[reqID] = cancel
@@ -481,7 +477,20 @@ func (sc *serverConn) streamWatch(reqID uint64, r *reader) {
 		cancel()
 	}()
 
-	seq, err := d.Watch(ctx, cursor)
+	// Resolve the watch source uniformly across a mutable table, a materialized-view backing,
+	// and an append-only archive (history) table, so one watch op serves them all.
+	var seq iter.Seq[db.WatchEvent]
+	var err error
+	if d, ok := sc.s.cat.Table(table); ok {
+		seq, err = d.Watch(ctx, cursor)
+	} else if d, ok := sc.s.cat.ViewBacking(table); ok {
+		seq, err = d.Watch(ctx, cursor)
+	} else if a, ok := sc.s.cat.ArchiveTable(table); ok {
+		seq, err = a.Watch(ctx, cursor)
+	} else {
+		sc.write(respErr(reqID, "no such table: "+table))
+		return
+	}
 	if err != nil {
 		sc.write(respErr(reqID, err.Error()))
 		return
