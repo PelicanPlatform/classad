@@ -293,6 +293,8 @@ type (
 	DropSuggestion  = collections.DropSuggestion
 	IndexSizes      = collections.IndexSizes
 	IndexSize       = collections.IndexSize
+	SidecarSizes    = collections.SidecarSizes
+	Retention       = collections.Retention
 	CodecStats      = collections.CodecStats
 	QueryExplain    = collections.QueryExplain
 	MatchExplain    = collections.MatchExplain

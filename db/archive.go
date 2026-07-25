@@ -20,6 +20,7 @@ import (
 type ArchiveTable struct {
 	a   *collections.Archive
 	dir string
+	cfg ArchiveConfig // the persisted config (archiveconfig.json); its Retention is mutable at runtime
 }
 
 // ArchiveConfig configures an archive table. Dir is set by the catalog.
@@ -81,13 +82,33 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 	if err != nil {
 		return nil, err
 	}
+	t := &ArchiveTable{a: a, dir: dir, cfg: cfg}
 	if create {
 		// Persist the config so a later reopen rebuilds the same indexes/retention.
-		if data, merr := json.MarshalIndent(cfg, "", "  "); merr == nil {
-			_ = os.WriteFile(filepath.Join(dir, archiveConfigFile), data, 0o644)
+		if err := t.saveConfig(); err != nil {
+			return nil, err
 		}
 	}
-	return &ArchiveTable{a: a, dir: dir}, nil
+	return t, nil
+}
+
+// saveConfig persists the archive's config (indexes, zone maps, retention) to
+// archiveconfig.json atomically (tmp + rename), so a runtime change survives a restart and
+// a reader never sees a torn file. A no-op for an in-memory archive (dir == "").
+func (t *ArchiveTable) saveConfig() error {
+	if t.dir == "" {
+		return nil
+	}
+	data, err := json.MarshalIndent(t.cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(t.dir, archiveConfigFile)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }
 
 // Append adds one ad to the archive (append-only; there is no update or per-key delete).
@@ -181,3 +202,35 @@ func (t *ArchiveTable) DropIndex(names ...string) bool { return t.a.DropIndex(na
 
 // Reindex rebuilds the per-segment indexes over all segments.
 func (t *ArchiveTable) Reindex() { t.a.Reindex() }
+
+// --- diagnostics (mirrors the mutable-table stat surface for symmetry) ---
+
+// Stats reports storage accounting (records, segments, arena/used/dead bytes).
+func (t *ArchiveTable) Stats() Stats { return t.a.Stats() }
+
+// OpStats reports cumulative operational timings. An archive has no DB-level snapshot lock,
+// so SnapshotLock is zero.
+func (t *ArchiveTable) OpStats() OpStats { return OpStats{OpStats: t.a.OpStats()} }
+
+// CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).
+func (t *ArchiveTable) CodecStats(sampleMax int) CodecStats { return t.a.CodecStats(sampleMax) }
+
+// IndexSizes reports the per-attribute index byte footprint.
+func (t *ArchiveTable) IndexSizes() IndexSizes { return t.a.IndexSizes() }
+
+// SidecarSizes reports the sealed-segment sidecar index bytes (mmap-backed, evictable).
+func (t *ArchiveTable) SidecarSizes() SidecarSizes { return t.a.SidecarSizes() }
+
+// IndexedAttrs returns the archive's categorical and value index attributes.
+func (t *ArchiveTable) IndexedAttrs() (categorical, value []string) { return t.a.IndexedAttrs() }
+
+// Retention returns the archive's current retention bounds.
+func (t *ArchiveTable) Retention() collections.Retention { return t.a.Retention() }
+
+// SetRetention updates the retention bounds and persists them (archiveconfig.json), so they
+// take effect on the next Rotate and survive a restart.
+func (t *ArchiveTable) SetRetention(r collections.Retention) error {
+	t.a.SetRetention(r)
+	t.cfg.Retention = r
+	return t.saveConfig()
+}

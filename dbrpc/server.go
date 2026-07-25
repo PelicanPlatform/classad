@@ -1095,6 +1095,15 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		}
 		d, ok := s.cat.Table(table)
 		if !ok {
+			// Not a mutable table: it may be an append-only archive (history) table, whose
+			// diagnostics mirror the mutable stat surface plus retention.
+			if a, aok := s.cat.ArchiveTable(table); aok {
+				data, err := s.archiveDiagJSON(a)
+				if err != nil {
+					return respErr(reqID, err.Error())
+				}
+				return putStr(resp(reqID, stOK), string(data))
+			}
 			return respErr(reqID, "no such table: "+table)
 		}
 		data, err := s.diagJSON(d)

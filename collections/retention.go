@@ -21,13 +21,17 @@ package collections
 // newest value of the age attribute is older than now-MaxAge); MaxAge requires the age
 // attribute to be a configured ZoneAttr so its per-segment max is available.
 func (c *Collection) Rotate(now float64) (int, error) {
-	if !c.appendOnly() || (c.ret == Retention{}) {
+	if !c.appendOnly() {
 		return 0, nil
 	}
-	// Serialize against other whole-collection maintenance (retrain/rewrite), matching
-	// Compact. Commits and queries never take maintMu.
+	// Serialize against other whole-collection maintenance (retrain/rewrite) and against
+	// SetRetention, matching Compact. Commits and queries never take maintMu. c.ret is read
+	// only under maintMu, so the retention check moves inside the lock.
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
+	if c.ret == (Retention{}) {
+		return 0, nil // no bounds configured: keep everything
+	}
 
 	sh := c.shards[0] // AppendOnly forces a single shard
 	// Resolve the age attribute once (needs the shared intern table on the Collection).
@@ -69,6 +73,22 @@ func (c *Collection) Rotate(now float64) (int, error) {
 		}
 	}
 	return dropped, err
+}
+
+// SetRetention updates the retention bounds at runtime (an append-only collection). The
+// next Rotate enforces them. Serialized against Rotate/maintenance via maintMu, so c.ret is
+// only ever read or written under that lock.
+func (c *Collection) SetRetention(r Retention) {
+	c.maintMu.Lock()
+	c.ret = r
+	c.maintMu.Unlock()
+}
+
+// Retention returns the current retention bounds.
+func (c *Collection) Retention() Retention {
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
+	return c.ret
 }
 
 // oldestLiveSeg returns the index of the oldest non-nil segment, or -1 if the shard

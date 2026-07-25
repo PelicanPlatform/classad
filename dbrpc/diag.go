@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -29,6 +30,13 @@ type Diagnostics struct {
 	// are not listed here).
 	EncryptionEnabled bool     `json:"encryptionEnabled"`
 	EncryptedAttrs    []string `json:"encryptedAttrs,omitempty"`
+
+	// Archive marks an append-only history table (vs. a mutable one), and Retention carries
+	// its rotation bounds. Both are omitted for a mutable table. SidecarSizes reports the
+	// archive's sealed-segment sidecar index bytes.
+	Archive      bool            `json:"archive,omitempty"`
+	Retention    *db.Retention   `json:"retention,omitempty"`
+	SidecarSizes db.SidecarSizes `json:"sidecarSizes"`
 }
 
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
@@ -49,6 +57,27 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		DropSuggestions:    t.SuggestDrops(diagSampleMax),
 		EncryptionEnabled:  t.EncryptionEnabled(),
 		EncryptedAttrs:     t.EncryptedAttrNames(),
+	}
+	return json.Marshal(d)
+}
+
+// archiveDiagJSON assembles the diagnostics for an append-only archive (history) table, from
+// the same stat surface as a mutable table plus the retention bounds -- so `.stats history`
+// reads like `.stats <table>` (storage bytes, segments, codec, op timings) instead of just a
+// row count.
+func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
+	cat, val := a.IndexedAttrs()
+	ret := a.Retention()
+	d := Diagnostics{
+		Stats:              a.Stats(),
+		OpStats:            a.OpStats(),
+		CategoricalIndexes: cat,
+		ValueIndexes:       val,
+		IndexSizes:         a.IndexSizes(),
+		Codec:              a.CodecStats(diagSampleMax),
+		Archive:            true,
+		Retention:          &ret,
+		SidecarSizes:       a.SidecarSizes(),
 	}
 	return json.Marshal(d)
 }
@@ -231,9 +260,99 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 			return "", fmt.Errorf("retrain: %w", err)
 		}
 		return fmt.Sprintf("retrained ZSTD dictionary (%d bytes) and recompressed the archive", dictBytes), nil
+	case "retention.set":
+		r, err := parseRetentionArgs(args)
+		if err != nil {
+			return "", err
+		}
+		if err := a.SetRetention(r); err != nil {
+			return "", fmt.Errorf("retention.set: %w", err)
+		}
+		return "retention: " + retentionSummary(r), nil
+	case "rotate":
+		n, err := a.Rotate(float64(time.Now().Unix()))
+		if err != nil {
+			return "", fmt.Errorf("rotate: %w", err)
+		}
+		return fmt.Sprintf("rotated: dropped %d segment(s)", n), nil
 	default:
 		return "", fmt.Errorf("unknown archive admin action %q", action)
 	}
+}
+
+// parseRetentionArgs parses `<maxSegments> <maxBytes> [maxAgeAttr maxAgeSeconds]` into a
+// Retention. maxSegments is a count (0 = no bound); maxBytes accepts a byte count or a size
+// suffix (KiB/MiB/GiB/TiB, or KB/MB/GB/TB; 0 = no bound); maxAgeAttr/maxAgeSeconds set the
+// age bound (both must be given). All-zero clears retention (keep everything).
+func parseRetentionArgs(args []string) (db.Retention, error) {
+	var r db.Retention
+	if len(args) < 2 {
+		return r, fmt.Errorf("retention.set needs <maxSegments> <maxBytes> [maxAgeAttr maxAgeSeconds]")
+	}
+	seg, err := strconv.Atoi(args[0])
+	if err != nil || seg < 0 {
+		return r, fmt.Errorf("maxSegments must be a non-negative integer, got %q", args[0])
+	}
+	r.MaxSegments = seg
+	b, err := parseByteSize(args[1])
+	if err != nil {
+		return r, fmt.Errorf("maxBytes: %w", err)
+	}
+	r.MaxBytes = b
+	if len(args) >= 4 {
+		r.MaxAgeAttr = args[2]
+		age, err := strconv.ParseFloat(args[3], 64)
+		if err != nil || age < 0 {
+			return r, fmt.Errorf("maxAgeSeconds must be a non-negative number, got %q", args[3])
+		}
+		r.MaxAge = age
+	} else if len(args) == 3 {
+		return r, fmt.Errorf("maxAgeAttr given without maxAgeSeconds")
+	}
+	return r, nil
+}
+
+// parseByteSize parses a byte count with an optional binary (KiB/MiB/GiB/TiB) or decimal
+// (KB/MB/GB/TB) suffix; a bare number is bytes.
+func parseByteSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	mult := int64(1)
+	for _, u := range []struct {
+		suf string
+		m   int64
+	}{
+		{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}, {"TiB", 1 << 40},
+		{"KB", 1000}, {"MB", 1000 * 1000}, {"GB", 1000 * 1000 * 1000}, {"TB", 1000 * 1000 * 1000 * 1000},
+	} {
+		if len(s) > len(u.suf) && strings.EqualFold(s[len(s)-len(u.suf):], u.suf) {
+			mult = u.m
+			s = strings.TrimSpace(s[:len(s)-len(u.suf)])
+			break
+		}
+	}
+	n, err := strconv.ParseFloat(s, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	return int64(n * float64(mult)), nil
+}
+
+// retentionSummary renders a Retention for an admin acknowledgement.
+func retentionSummary(r db.Retention) string {
+	if (r == db.Retention{}) {
+		return "unbounded (keep everything)"
+	}
+	parts := make([]string, 0, 3)
+	if r.MaxSegments > 0 {
+		parts = append(parts, fmt.Sprintf("maxSegments=%d", r.MaxSegments))
+	}
+	if r.MaxBytes > 0 {
+		parts = append(parts, fmt.Sprintf("maxBytes=%d", r.MaxBytes))
+	}
+	if r.MaxAgeAttr != "" && r.MaxAge > 0 {
+		parts = append(parts, fmt.Sprintf("maxAge=%gs on %s", r.MaxAge, r.MaxAgeAttr))
+	}
+	return join(parts)
 }
 
 func addIndex(t *db.DB, what string, categorical, value []string) string {

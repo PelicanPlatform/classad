@@ -235,6 +235,31 @@ func (a *Archive) DropIndex(names ...string) bool { return a.c.DropIndex(names..
 // sealed since the last build).
 func (a *Archive) Reindex() { a.c.Reindex() }
 
+// SetRetention updates the retention bounds at runtime; the next Rotate enforces them.
+func (a *Archive) SetRetention(r Retention) { a.c.SetRetention(r) }
+
+// Retention returns the archive's current retention bounds.
+func (a *Archive) Retention() Retention { return a.c.Retention() }
+
+// Stats reports storage accounting: record count, segment count, and arena/used/dead bytes
+// (dead is ~0 for an append log, which never supersedes). The same struct the mutable store
+// reports, so an archive's storage is visible on the same terms.
+func (a *Archive) Stats() Stats { return a.c.Stats() }
+
+// OpStats reports cumulative operational timing counters (write wait/hold, sync, retrain,
+// reindex, ...) for the archive's writes and maintenance.
+func (a *Archive) OpStats() OpStats { return a.c.OpStats() }
+
+// CodecStats reports the archive's compression: codec, dictionary size, last retrain time,
+// and the sampled compression ratio (up to sampleMax records).
+func (a *Archive) CodecStats(sampleMax int) CodecStats { return a.c.CodecStats(sampleMax) }
+
+// IndexSizes reports the per-attribute index byte footprint (heap postings) versus data.
+func (a *Archive) IndexSizes() IndexSizes { return a.c.IndexSizes() }
+
+// IndexedAttrs returns the categorical and value attributes the archive indexes.
+func (a *Archive) IndexedAttrs() (categorical, value []string) { return a.c.IndexedAttrs() }
+
 // --- zone-map helpers (shared with the Collection's per-segment zone maps) ---
 
 // literalFloat extracts a numeric value from a wire literal node (int/real/bool), for
