@@ -62,31 +62,6 @@ type SidecarSizes struct {
 	BloomBytes  int64 `json:"bloomBytes"`  // of MappedBytes, bloom filters
 }
 
-// SidecarSizes sums each sealed segment's sidecar size and its MPH/bloom portions. It maps
-// each sidecar briefly and closes it immediately, so it is an operator diagnostic, not a
-// hot path. The active (unsealed) segment has no sidecar and is skipped.
-func (a *Archive) SidecarSizes() SidecarSizes {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	var out SidecarSizes
-	for _, as := range a.segs {
-		if !as.sealed {
-			continue
-		}
-		data, closer, err := mapFile(a.idxPath(as.seg.id))
-		if err != nil {
-			continue
-		}
-		out.Segments++
-		out.MappedBytes += int64(len(data))
-		mph, bloom := sidecarSketchBreakdown(data)
-		out.MPHBytes += mph
-		out.BloomBytes += bloom
-		_ = closer()
-	}
-	return out
-}
-
 // SidecarSizes reports the live Collection's sealed-segment sidecar bytes: the mmap-backed
 // index each sealed segment holds after the flip from the in-RAM segIndex -- a file mapping
 // for a persistent collection (page-cache resident, evictable to disk) or an anonymous

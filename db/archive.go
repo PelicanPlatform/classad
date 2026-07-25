@@ -36,27 +36,25 @@ type ArchiveConfig struct {
 	Retention collections.Retention
 }
 
-// archiveCatalogFile marks an archive directory (collections writes it as catalog.json);
-// its presence distinguishes "open" from "create". archiveConfigFile persists the
-// ArchiveConfig so a reopen rebuilds the same indexes/zone maps/retention (the archive
-// needs its option names re-supplied to re-derive interned ids on recovery).
-const (
-	archiveCatalogFile = "catalog.json"
-	archiveConfigFile  = "archiveconfig.json"
-)
+// archiveConfigFile persists the ArchiveConfig so a reopen rebuilds the same
+// indexes/zone maps/retention (the archive needs its option names re-supplied to
+// re-derive interned ids on recovery). Its presence also marks the directory as an
+// already-created archive, distinguishing "open" from "create".
+const archiveConfigFile = "archiveconfig.json"
 
 // openArchiveTable creates or reopens an archive under dir. On reopen the persisted
 // config is authoritative (cfg is ignored). Archives always use a dictless ZSTD codec
 // (deterministic, so recovery needs no persisted codec identity).
 func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
+	// archiveconfig.json is written on create and is authoritative on reopen, so its
+	// presence distinguishes "open" from "create" (the backing store keeps no separate
+	// catalog file of its own).
 	create := true
-	if _, err := os.Stat(filepath.Join(dir, archiveCatalogFile)); err == nil {
+	if data, rerr := os.ReadFile(filepath.Join(dir, archiveConfigFile)); rerr == nil {
 		create = false
-		if data, rerr := os.ReadFile(filepath.Join(dir, archiveConfigFile)); rerr == nil {
-			var saved ArchiveConfig
-			if json.Unmarshal(data, &saved) == nil {
-				cfg = saved // reopen with the config the archive was created with
-			}
+		var saved ArchiveConfig
+		if json.Unmarshal(data, &saved) == nil {
+			cfg = saved // reopen with the config the archive was created with
 		}
 	}
 
