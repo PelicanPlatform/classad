@@ -170,3 +170,54 @@ func mustQ(t *testing.T, s string) *vm.Query {
 	}
 	return q
 }
+
+// TestReverseIndexedDisjunction verifies a disjunctive (OR) query on an indexed, newest-first
+// collection returns the union newest-first through the indexed groups path (after a reopen
+// builds the sidecars), matches an unindexed reverse full scan exactly, and honors an early
+// stop as a pushed-down LIMIT.
+func TestReverseIndexedDisjunction(t *testing.T) {
+	build := func(withIndex bool) []int64 {
+		dir := t.TempDir()
+		opts := Options{AppendOnly: true, ReverseScan: true, Dir: dir, SegmentSize: 1 << 12}
+		if withIndex {
+			opts.ValueAttrs = []string{"G"}
+		}
+		c, err := Open(opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 500; i++ {
+			ad, _ := classad.Parse(fmt.Sprintf(`[ N=%d; G=%d ]`, i, i%5))
+			c.Put([]byte("k"), ad)
+		}
+		c.Close()
+		c, _ = Open(opts) // reopen: Reindex builds the sidecars, so OR takes the groups path
+		defer c.Close()
+		var out []int64
+		var prev int64 = 1 << 30
+		for ad := range c.Query(mustQ(t, `G == 1 || G == 3`)) {
+			v, _ := ad.EvaluateAttrInt("N")
+			g, _ := ad.EvaluateAttrInt("G")
+			if g != 1 && g != 3 {
+				t.Fatalf("OR query returned G=%d", g)
+			}
+			if v >= prev {
+				t.Fatalf("OR query not newest-first: %d after %d", v, prev)
+			}
+			prev = v
+			out = append(out, v)
+		}
+		return out
+	}
+	indexed := build(true)
+	full := build(false)
+	if fmt.Sprint(indexed) != fmt.Sprint(full) {
+		t.Fatalf("indexed OR result != full-scan OR result\nindexed=%v\nfull=%v", indexed, full)
+	}
+	if len(indexed) != 200 { // G in {1,3}: 2 of every 5 of 500
+		t.Fatalf("OR result count = %d, want 200", len(indexed))
+	}
+	if indexed[0] != 498 { // newest with G in {1,3}: 498 (G=3)
+		t.Errorf("newest OR match = %d, want 498", indexed[0])
+	}
+}
