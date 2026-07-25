@@ -6,6 +6,8 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
@@ -138,6 +140,17 @@ func (t *ArchiveTable) QueryLimit(constraint string, limit int) (iter.Seq[*class
 	return t.a.QueryLimit(q, limit), nil
 }
 
+// QueryProject scans the matching ads and yields each projected to just attrs' values, read
+// wire-native where possible -- so an aggregate reads only the attributes it needs instead
+// of fully decoding every record. Errors only on a malformed constraint.
+func (t *ArchiveTable) QueryProject(constraint string, attrs []string) (iter.Seq[[]classad.Value], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return t.a.QueryProject(q, attrs), nil
+}
+
 // Aggregate runs a server-side GROUP BY over the archive's matches: it applies the
 // constraint (using the archive's zone-map pruning, so segments no matching record can
 // fall in are never scanned), groups by the raw group columns, and reduces each group
@@ -146,31 +159,35 @@ func (t *ArchiveTable) QueryLimit(constraint string, limit int) (iter.Seq[*class
 // aggregate over a live table -- only the (small) grouped result is produced, not every
 // matched ad. With no group columns it returns a single row over the whole match.
 func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	// Fast path: an unconstrained COUNT(*) with no grouping is the retained record count,
+	// which the archive tracks in O(1). This is the common `SELECT COUNT(*) FROM history`;
+	// scanning tens of thousands of records to count them would be needlessly slow.
+	if len(groupBy) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
+		isMatchAll(constraint) {
+		return []AggRow{{Values: []string{strconv.Itoa(t.a.Count())}}}, nil
+	}
+
 	groupCols := make([]GroupCol, len(groupBy))
 	for i, g := range groupBy {
 		groupCols[i] = GroupCol{Attr: g}
 	}
 	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
 
-	// limit <= 0: scan the whole (zone-pruned) match; the aggregate reduces it server-side.
-	seq, err := t.QueryLimit(constraint, 0)
+	// Scan wire-native, reading only the attributes the aggregation projects (empty for a
+	// pure COUNT), so it does not fully decode every matched record -- mirroring the mutable
+	// table's aggregate. Zone maps still prune segments no matching record can fall in.
+	seq, err := t.QueryProject(constraint, attrs)
 	if err != nil {
 		return nil, err
 	}
-	// Project each matched ad to just the attributes the aggregation reads. The scratch
-	// slice is reused across rows (AggregateValues copies a group's key only when created).
-	proj := func(yield func([]classad.Value) bool) {
-		scratch := make([]classad.Value, len(attrs))
-		for ad := range seq {
-			for i, n := range attrs {
-				scratch[i] = ad.EvaluateAttr(n)
-			}
-			if !yield(scratch) {
-				return
-			}
-		}
-	}
-	return AggregateValues(proj, groupCols, aggs, groupCol, aggCol, nil), nil
+	return AggregateValues(seq, groupCols, aggs, groupCol, aggCol, nil), nil
+}
+
+// isMatchAll reports whether a constraint imposes no filter (an empty string or a literal
+// "true"), so an aggregate over it covers every retained record.
+func isMatchAll(constraint string) bool {
+	c := strings.TrimSpace(constraint)
+	return c == "" || strings.EqualFold(c, "true")
 }
 
 // Count is the number of records currently retained (reduced by rotation).
