@@ -188,6 +188,15 @@ func (a *Archive) Rotate(now float64) (int, error) { return a.c.Rotate(now) }
 // whole-segment steps.
 func (a *Archive) Count() int { return a.c.Len() }
 
+// Truncate drops every record, resetting the archive to empty in place: all segments are
+// unmapped and their data + sidecar-index files unlinked (via the backing Collection's
+// Truncate). Segment counters keep advancing, so a fresh Append starts a new segment. This
+// is the destructive reset a from-scratch history re-sync uses -- empty the store, then
+// re-ingest from the source. Retention/index/zone-map configuration is preserved. Safe
+// against concurrent queries (a scan holding a pin reads its old data until it finishes);
+// callers must serialize Truncate against the single Append writer.
+func (a *Archive) Truncate() { a.c.Truncate() }
+
 // Close flushes and unmaps the archive. It must not be used afterward.
 func (a *Archive) Close() error { return a.c.Close() }
 

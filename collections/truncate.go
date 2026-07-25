@@ -38,9 +38,12 @@ func (c *Collection) Truncate() {
 		sh.writeErr = nil
 		sh.mu.Unlock()
 		// Reap (munmap + unlink) outside the lock; retire() already deferred any still-
-		// pinned segment to its last unpin.
+		// pinned segment to its last unpin. reapAndHook (not bare reap) so a sealed
+		// segment's mmap sidecar index is unmapped with its data (the onReap hook) --
+		// otherwise the sidecar mapping leaks. Every other drop path (compact/retention/
+		// retrain) already routes through reapAndHook; Truncate must too.
 		for _, seg := range toReap {
-			_ = seg.reap()
+			_ = seg.reapAndHook()
 		}
 	}
 	for _, oi := range c.ordered {

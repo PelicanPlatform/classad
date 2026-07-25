@@ -220,10 +220,16 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 // only to future writes and would not prune the current data.
 // archiveAdmin runs a management action on an append-only archive (history) table: the
 // layout-tuning subset of table admin -- retrain the ZSTD dictionary, add/drop/rebuild
-// per-segment indexes, and rewrite. Encryption/time-travel/truncate/hot-set actions do not
-// apply to an archive. DAEMON-gated by the caller, like the mutable-table admin.
+// per-segment indexes, rewrite, set retention, rotate -- plus truncate (empty the archive).
+// Encryption/time-travel/hot-set actions do not apply to an archive. DAEMON-gated by the
+// caller, like the mutable-table admin.
 func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, error) {
 	switch action {
+	case "truncate":
+		// Destructive reset: drop every record (a from-scratch re-sync empties the archive,
+		// then re-ingests from the source). Retention/index config is preserved.
+		a.Truncate()
+		return "archive truncated", nil
 	case "index.add.categorical":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
