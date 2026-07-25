@@ -271,6 +271,17 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 				}
 			}
 		}
+		// Append-only rotation gap: a cursor pointing below the oldest still-retained
+		// record (its segment was rotated out) has missed history -> full replay from the
+		// current floor. Append logs keep no delete journal, so this is their reset trigger.
+		if !full && c.appendOnly() {
+			for i, sh := range c.shards {
+				if seqs[i] < sh.appendFloor() {
+					full = true
+					break
+				}
+			}
+		}
 
 		if full {
 			if !yield(WatchEvent{Kind: WatchReset}) {

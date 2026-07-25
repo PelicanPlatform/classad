@@ -174,6 +174,34 @@ func (sh *shard) dirGet(h uint64) loc {
 	return noLoc
 }
 
+// appendFloor returns the smallest commit sequence still retained on this (append-only)
+// shard: the seq of the first record in the oldest live segment. After retention drops
+// old segments this rises, so a watch cursor below it has missed rotated-out history and
+// must full-replay. Returns 0 when the shard holds no records (a fresh cursor is handled
+// separately). Reads the record directly rather than trusting seg.minSeq so it is correct
+// whether or not the time-travel pruning counters are maintained on the write path.
+func (sh *shard) appendFloor() uint64 {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	for _, seg := range sh.segs {
+		if seg == nil || seg.used == 0 {
+			continue
+		}
+		for off := 0; off < seg.used; {
+			o := uint32(off)
+			total := recTotalLen(seg.data, o)
+			if total == 0 {
+				break
+			}
+			if !recIsMarker(seg.data, o) {
+				return recSeq(seg.data, o)
+			}
+			off += int(total)
+		}
+	}
+	return 0
+}
+
 // segAt returns the segment for a location's index, or nil if the index is out of range or
 // that slot has been reaped. A recNext chain link should only ever reference a live segment;
 // a link into a nonexistent one is corruption (e.g. a stale link left behind by a reaped
