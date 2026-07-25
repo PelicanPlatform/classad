@@ -1189,6 +1189,18 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		}
 		d, ok := s.cat.Table(table)
 		if !ok {
+			// Not a mutable table: it may be an append-only archive (history) table, which
+			// supports the layout-tuning subset of admin actions (retrain/reindex/rewrite).
+			if a, aok := s.cat.ArchiveTable(table); aok {
+				if !privileged {
+					return respErr(reqID, fmt.Sprintf("admin action %q requires DAEMON authorization", action))
+				}
+				msg, err := archiveAdmin(a, action, args)
+				if err != nil {
+					return respErr(reqID, err.Error())
+				}
+				return putStr(resp(reqID, stOK), msg)
+			}
 			return respErr(reqID, "no such table: "+table)
 		}
 		msg, err := s.admin(d, action, args, privileged)

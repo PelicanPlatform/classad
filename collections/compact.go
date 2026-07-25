@@ -1,7 +1,6 @@
 package collections
 
 import (
-	"errors"
 	"time"
 )
 
@@ -177,7 +176,13 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 // writer).
 func (c *Collection) Rewrite() int {
 	if c.appendOnly() {
-		return 0 // rewriting an append log would duplicate every record (no supersession)
+		// Append-only rewrite recompresses/re-encodes each segment in place (current
+		// codec + current hot set), preserving order -- no supersession, no duplication.
+		c.maintMu.Lock()
+		n := c.Len()
+		c.resealAppendOnly(c.currentCodec())
+		c.maintMu.Unlock()
+		return n
 	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
@@ -211,17 +216,7 @@ func (c *Collection) Rewrite() int {
 // transactions; production leaves it nil.
 var retrainStallHook func()
 
-// errAppendOnlyRetrain is returned by RetrainDict on an append-only collection, where the
-// compaction-based recompression path does not apply.
-var errAppendOnlyRetrain = errors.New("collections: RetrainDict is not supported on an append-only collection")
-
 func (c *Collection) RetrainDict(sampleMax int) (int, error) {
-	if c.appendOnly() {
-		// Retrain recompresses via compactShard, which renumbers segments and rebuilds the
-		// directory -- illegal for an append log. Append-only recompression (per-segment
-		// reseal preserving order) is a separate path (not yet implemented).
-		return 0, errAppendOnlyRetrain
-	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
 	start := time.Now()
@@ -244,16 +239,19 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	if retrainStallHook != nil {
 		retrainStallHook() // test seam: observe concurrent access during a long retrain
 	}
-	for _, sh := range c.shards {
-		c.compactShard(sh, codec) // recompress to the new codec
+	if c.appendOnly() {
+		// Append log: recompress each segment in place (reseal preserving order) instead
+		// of the compaction live-copy, which would supersede/renumber -- illegal here.
+		c.resealAppendOnly(codec)
+	} else {
+		for _, sh := range c.shards {
+			c.compactShard(sh, codec) // recompress to the new codec
+		}
+		c.reindexAfterCompaction() // rebuild indexes over the recompacted segments
+		c.pruneDicts()
 	}
 	c.lastDictBytes.Store(int64(len(dict)))
 	c.lastRetrainUnix.Store(time.Now().UnixNano())
-	c.reindexAfterCompaction() // rebuild indexes over the recompacted segments
-	// The recompaction re-encoded (or left in place) every live segment; dictionaries no
-	// segment references anymore are dead weight -- drop them so the registry does not
-	// grow by one inflated codec per retrain for the life of the process.
-	c.pruneDicts()
 	return len(dict), nil
 }
 

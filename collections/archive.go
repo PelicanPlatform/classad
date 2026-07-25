@@ -206,6 +206,35 @@ func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent
 // evictable page cache), broken out by structure. An operator diagnostic.
 func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }
 
+// RetrainDict trains a fresh ZSTD dictionary from up to sampleMax records and recompresses
+// every segment in place under it (an append-only reseal that preserves order), returning
+// the new dictionary's size in bytes. This is how an archive's compression adapts to the
+// data it has accumulated.
+func (a *Archive) RetrainDict(sampleMax int) (int, error) { return a.c.RetrainDict(sampleMax) }
+
+// Rewrite recompresses and re-encodes every segment in place under the current codec and
+// hot set (e.g. after a hot-set change), preserving order, and returns the number of
+// records rewritten.
+func (a *Archive) Rewrite() int { return a.c.Rewrite() }
+
+// AddIndex adds per-segment indexes on the named categorical and/or value attributes and
+// rebuilds them over the existing segments, so subsequent queries on those attributes are
+// accelerated. Returns false if the index set was unchanged.
+func (a *Archive) AddIndex(categorical, value []string) bool {
+	if !a.c.AddIndex(categorical, value) {
+		return false
+	}
+	a.c.Reindex()
+	return true
+}
+
+// DropIndex removes the named per-segment indexes. Returns false if none matched.
+func (a *Archive) DropIndex(names ...string) bool { return a.c.DropIndex(names...) }
+
+// Reindex rebuilds the per-segment indexes over all segments (e.g. to pick up segments
+// sealed since the last build).
+func (a *Archive) Reindex() { a.c.Reindex() }
+
 // --- zone-map helpers (shared with the Collection's per-segment zone maps) ---
 
 // literalFloat extracts a numeric value from a wire literal node (int/real/bool), for
