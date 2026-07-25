@@ -25,6 +25,11 @@ import (
 // span of segments therefore evolves toward the current spec at whatever cadence
 // the caller reindexes — no write-path or compaction coupling.
 func (c *Collection) Reindex() {
+	// Serialize concurrent reindexers so two do not build and install the same segment's
+	// sidecar at once (the eager per-seal reindex vs. the periodic one). Idempotent and
+	// cheap when there is nothing new to build.
+	c.reindexMu.Lock()
+	defer c.reindexMu.Unlock()
 	start := time.Now()
 	defer func() { c.opm.reindex.observe(time.Since(start)) }()
 	spec := c.spec.Load()

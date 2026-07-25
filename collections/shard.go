@@ -17,6 +17,12 @@ type shard struct {
 	segs []*segment     // indexed by segment id (id == index)
 	act  *segment       // current append target
 
+	// sealSeq counts append-only segment seals (a rollover to a new active segment). An
+	// archive watches it to build the just-sealed segment's sidecar index eagerly, off the
+	// write lock, instead of waiting for the next periodic reindex. Bumped under the write
+	// lock; read lock-free.
+	sealSeq atomic.Uint64
+
 	// appendOnly makes this a pure append log (see Options.AppendOnly): put appends
 	// without superseding or indexing by key, del is a no-op, and compaction is
 	// skipped. Set once at construction; never mutated.
@@ -327,6 +333,9 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) 
 		// compute its zone map so later range queries can prune it. No-op unless
 		// append-only with ZoneAttrs configured.
 		sh.sealZones(sh.act)
+		if sh.appendOnly && sh.act != nil {
+			sh.sealSeq.Add(1) // a segment just sealed: signal eager sidecar indexing
+		}
 		size := sh.segSize
 		if rl > size {
 			size = rl

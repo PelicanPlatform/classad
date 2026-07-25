@@ -26,6 +26,11 @@ import (
 type Archive struct {
 	c   *Collection
 	dir string
+	// lastSeal is the shard seal count at the last eager reindex. When Append observes a new
+	// seal it reindexes the just-sealed segment, so a categorical/value query on freshly
+	// appended history is index-accelerated immediately rather than scanning until the next
+	// periodic reindex. Touched only by the single-writer Append.
+	lastSeal uint64
 }
 
 // zoneRange is one attribute's numeric span within a segment (a zone map entry). Shared
@@ -152,7 +157,21 @@ func dirHasEntries(dir string) bool {
 func (a *Archive) Append(ad *classad.ClassAd) error {
 	// An append log has no key; a nil key routes to the single append-only shard and
 	// stores a zero-length key. Duplicate appends are all retained.
-	return a.c.Put(nil, ad)
+	if err := a.c.Put(nil, ad); err != nil {
+		return err
+	}
+	// If this append sealed a segment, build its sidecar index now (off the write lock),
+	// so categorical/value queries on just-appended history are accelerated immediately
+	// instead of scanning until the next periodic reindex. Reindex builds only the missing
+	// sidecar (all older segments are already sealed) and is serialized against the periodic
+	// reindex. Skipped when no per-segment indexes are configured (nothing to build).
+	if a.c.hasSegmentIndexes() {
+		if seal := a.c.appendSealSeq(); seal != a.lastSeal {
+			a.lastSeal = seal
+			a.c.Reindex()
+		}
+	}
+	return nil
 }
 
 // Flush makes prior appends durable and queryable. The Collection keeps appended records
