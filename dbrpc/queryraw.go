@@ -162,14 +162,24 @@ func (s *Server) streamQueryRawProject(ctx context.Context, reqID uint64, r *rea
 		write(respBad(reqID))
 		return
 	}
-	d, ok := s.tableOr(reqID, table, write)
-	if !ok {
-		return
-	}
 	// The projection (and, unprivileged, redaction) is applied inside the
 	// collection's decode walk: non-projected attributes are never rendered, and a
-	// hot-header-covered projection is served from the hot header alone.
-	seq, err := d.QueryRawProjected(constraint, attrs, !includePrivate)
+	// hot-header-covered projection is served from the hot header alone. Resolve the
+	// source uniformly across a mutable table, a materialized view's backing, and an
+	// append-only archive (history) table -- so the one projection op serves them all
+	// (an archive streams newest-first, like its plain query).
+	var seq iter.Seq[collections.RawAd]
+	var err error
+	if d, ok := s.cat.Table(table); ok {
+		seq, err = d.QueryRawProjected(constraint, attrs, !includePrivate)
+	} else if d, ok := s.cat.ViewBacking(table); ok {
+		seq, err = d.QueryRawProjected(constraint, attrs, !includePrivate)
+	} else if a, ok := s.cat.ArchiveTable(table); ok {
+		seq, err = a.QueryRawProjected(constraint, attrs, !includePrivate)
+	} else {
+		write(respErr(reqID, "no such table: "+table))
+		return
+	}
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return

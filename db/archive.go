@@ -151,6 +151,19 @@ func (t *ArchiveTable) QueryProject(constraint string, attrs []string) (iter.Seq
 	return t.a.QueryProject(q, attrs), nil
 }
 
+// QueryRawProjected yields each matching ad as a raw projected subset (only the projection
+// attributes, rendered from the stored representation), newest first — the archive-side of the
+// server-side projection op. redact strips private attributes. It mirrors db.DB.QueryRawProjected
+// so the same wire op serves archives and mutable tables uniformly. chaseRefs is false, matching
+// HTCondor's projection protocol (exactly the requested attributes).
+func (t *ArchiveTable) QueryRawProjected(constraint string, projection []string, redact bool) (iter.Seq[collections.RawAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return t.a.QueryRawProjected(q, projection, false, redact), nil
+}
+
 // Aggregate runs a server-side GROUP BY over the archive's matches: it applies the
 // constraint (using the archive's zone-map pruning, so segments no matching record can
 // fall in are never scanned), groups by the raw group columns, and reduces each group
