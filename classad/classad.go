@@ -895,6 +895,11 @@ func (c *ClassAd) GetTarget() *ClassAd {
 func (c *ClassAd) EvaluateAttr(name string) (result Value) {
 	expr := c.lookupInternal(name)
 	if expr == nil {
+		// CurrentTime is a magic attribute: when the ad does not define it, it resolves to
+		// the current time (matching how an expression referencing it evaluates).
+		if strings.EqualFold(name, currentTimeAttr) {
+			return currentTimeValue()
+		}
 		return NewUndefinedValue()
 	}
 
@@ -1189,6 +1194,15 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 				// Evaluate the attribute
 				val := c.EvaluateAttr(v.Name)
 				return c.valueToExpr(val)
+			}
+		}
+		// The magic CurrentTime attribute folds to the current time (a constant) when the
+		// ad does not define it, so the query optimizer sees an indexable literal (e.g.
+		// `CompletionDate > CurrentTime - 86400` becomes a range probe). Mirrors the
+		// evaluation-time magic in evaluateAttributeReference.
+		if isCurrentTimeRef(v) {
+			if _, ok := c.Lookup(v.Name); !ok {
+				return c.valueToExpr(currentTimeValue())
 			}
 		}
 		// Keep the reference if undefined or scoped
