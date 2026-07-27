@@ -51,6 +51,9 @@ func (c *Collection) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classa
 			resolver: ws.resolve,
 		}
 		probes := q.Probes()
+		if c.hasZones {
+			qp.zoneProbes = probes // enable sealed-segment zone pruning (mirrors Query)
+		}
 		c.demand.record(probes)
 		usable := c.planIndex(probes)
 
