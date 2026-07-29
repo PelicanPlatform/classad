@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"iter"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -107,6 +108,26 @@ func (db *DB) DeleteWhere(constraint string) (int, error) {
 		total += deleted
 	}
 	return total, fmt.Errorf("classad-db: DeleteWhere did not converge in %d rounds for %q (removed %d)", maxDeleteRounds, constraint, total)
+}
+
+// KeysWhere returns an iterator over the storage keys of every row whose ad matches constraint.
+// Unlike a query, it yields the DB keys themselves, so a caller can address matched rows for
+// UPDATE/DELETE without depending on any self-reported key attribute in the ad. The constraint is
+// parsed eagerly (a parse error returns before any scan); the scan is lazy and stops early if the
+// caller's yield returns false. It matches against decoded ads (a full scan, like DeleteWhere).
+func (db *DB) KeysWhere(constraint string) (iter.Seq[string], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return func(yield func(string) bool) {
+		db.c.ForEachAd(func(key string, ad *classad.ClassAd) bool {
+			if q.Matches(ad) {
+				return yield(key)
+			}
+			return true
+		})
+	}, nil
 }
 
 // matchingKeys collects up to limit keys whose ads currently match q.

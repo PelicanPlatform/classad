@@ -53,6 +53,34 @@ func (c *Client) QueryRawTableStream(ctx context.Context, table, constraint stri
 	}, yield)
 }
 
+// QueryKeys streams the storage keys of the rows matching constraint on the default table.
+func (c *Client) QueryKeys(ctx context.Context, constraint string, yield func(key string) bool) error {
+	return c.QueryKeysTableStream(ctx, DefaultTable, constraint, yield)
+}
+
+// QueryKeysTableStream streams the storage KEYS of the rows matching constraint on the named
+// table (not their ads), so a caller can address matched rows for UPDATE/DELETE by their real db
+// key regardless of whether the ad carries a self-reported key attribute. Read-only.
+func (c *Client) QueryKeysTableStream(ctx context.Context, table, constraint string, yield func(key string) bool) error {
+	return c.streamEach(ctx, func(id uint64) []byte {
+		return putStr(putStr(req(id, opQueryKeys), table), constraint)
+	}, yield)
+}
+
+// QueryKeysTable collects all matching storage keys into a slice (streamed under the hood, so the
+// server never buffers the whole set). Suitable for the bounded match sets of an UPDATE/DELETE.
+func (c *Client) QueryKeysTable(ctx context.Context, table, constraint string) ([]string, error) {
+	var keys []string
+	err := c.QueryKeysTableStream(ctx, table, constraint, func(key string) bool {
+		keys = append(keys, key)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
 // QueryRawProjectStream is QueryRawProject (server-side projection) with the streaming
 // delivery of QueryRawTableStream.
 func (c *Client) QueryRawProjectStream(ctx context.Context, table, constraint string, attrs []string, limit int, yield func(row string) bool) error {
