@@ -141,6 +141,11 @@ const (
 	// the server (using the archive's zone-map pruning) and only the grouped rows cross the
 	// wire, instead of the client fetching and counting every matched ad.
 	opArchiveAggregate op = 53 // [name][constraint][nGroup]{[attr]}[nAgg]{[func u8][arg]} -> stream of [group...][agg...]
+
+	// opQueryKeys streams the storage KEYS of the rows matching a constraint (not their ads), so a
+	// caller can address matched rows for UPDATE/DELETE by their real db key regardless of whether
+	// the ad carries a self-reported key attribute. Read-only.
+	opQueryKeys op = 54 // [table][constraint] -> stream of [key]
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -230,6 +235,8 @@ func (o op) String() string {
 		return "CommitIdempotent"
 	case opArchiveAggregate:
 		return "ArchiveAggregate"
+	case opQueryKeys:
+		return "QueryKeys"
 	}
 	return "op(unknown)"
 }

@@ -431,6 +431,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.streamArchiveQuery(reqID, body)
 	case opArchiveAggregate:
 		sc.streamArchiveAggregate(reqID, body)
+	case opQueryKeys:
+		sc.s.streamQueryKeys(sc.ctx, reqID, body, sc.write)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
@@ -529,6 +531,35 @@ type viewSealer interface {
 // streamQuery streams the committed ads matching a constraint. Each result is its own
 // frame under reqID, so its frames interleave with other calls' -- no head-of-line
 // blocking -- and end with a terminator.
+// streamQueryKeys streams the storage keys of the rows matching a constraint (not their ads), so a
+// caller can address matched rows for UPDATE/DELETE by their real db key regardless of any
+// self-reported key attribute. Read-only; no private-attribute exposure (keys are returned, not ad
+// bodies). The constraint is still evaluated server-side, so it may reference any attribute.
+func (s *Server) streamQueryKeys(ctx context.Context, reqID uint64, r *reader, write func([]byte)) {
+	table := r.str()
+	constraint := r.str()
+	if r.err != nil {
+		write(respBad(reqID))
+		return
+	}
+	d, ok := s.tableOr(reqID, table, write)
+	if !ok {
+		return
+	}
+	seq, err := d.KeysWhere(constraint)
+	if err != nil {
+		write(respErr(reqID, err.Error()))
+		return
+	}
+	for key := range seq {
+		if cancelled(ctx) {
+			return // client gone: stop the scan
+		}
+		write(putStr(respHead(reqID, stStream), key))
+	}
+	write(respHead(reqID, stStreamEnd))
+}
+
 func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
 	start := time.Now()
 	table := r.str()
