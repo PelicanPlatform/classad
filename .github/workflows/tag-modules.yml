@@ -1,16 +1,18 @@
 # Mirror a release tag onto the per-module tags.
 #
-# This is a multi-module repo: consumers pin github.com/PelicanPlatform/classad
-# (root), .../collections, .../db and .../dbrpc, and every module must be tagged at the
-# SAME commit or a consumer ends up with an inconsistent set. Creating those tags by
-# hand is error-prone -- a busy human can tag one module off the wrong commit (a feature
-# branch tip instead of the merged main), which is exactly how dbrpc/v0.12.1 shipped
-# without a fix that was already on main.
+# This is a multi-module repo: consumers pin github.com/PelicanPlatform/classad (root)
+# and its submodules (.../collections, .../db, .../dbrpc, .../changefeed, ...), and every
+# module must be tagged at the SAME commit or a consumer ends up with an inconsistent set.
+# Creating those tags by hand is error-prone -- a busy human can tag one module off the
+# wrong commit (a feature branch tip instead of the merged main), which is exactly how
+# dbrpc/v0.12.1 shipped without a fix that was already on main.
 #
 # So: publish a GitHub release as usual (which creates the root vX.Y.Z tag), and this
-# workflow mirrors that one commit to collections/vX.Y.Z, db/vX.Y.Z and dbrpc/vX.Y.Z.
-# The human picks exactly one commit; the module tags are derived from it, never
-# hand-entered.
+# workflow mirrors that one commit to <module>/vX.Y.Z for EVERY submodule. The submodule
+# set is DISCOVERED from the tree (every go.mod under the root whose module path matches
+# its directory), not hardcoded -- so a newly added module (e.g. changefeed) is tagged
+# automatically, with no edit to this workflow. The human picks exactly one commit; the
+# module tags are derived from it, never hand-entered.
 
 name: Tag submodules on release
 
@@ -61,8 +63,25 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Discover every submodule: a go.mod below the root whose declared module path is
+          # exactly "<root module>/<dir>" (the Go multi-module convention). This tags any new
+          # module automatically; a stray/fixture go.mod whose path does not match its dir is
+          # skipped rather than mis-tagged.
+          root_mod="$(sed -n 's/^module //p' go.mod | head -1 | tr -d '[:space:]')"
+          mods=""
+          while IFS= read -r gm; do
+            dir="${gm#./}"; dir="${dir%/go.mod}"
+            mp="$(sed -n 's/^module //p' "$gm" | head -1 | tr -d '[:space:]')"
+            if [[ "$mp" == "$root_mod/$dir" ]]; then
+              mods="$mods $dir"
+            else
+              echo "skipping $gm: module path '$mp' != '$root_mod/$dir' (not a mirror-tagged submodule)"
+            fi
+          done < <(find . -mindepth 2 -name go.mod -not -path './.git/*' | sort)
+          echo "submodules to mirror:$mods"
+
           failed=0
-          for mod in collections db dbrpc; do
+          for mod in $mods; do
             mtag="$mod/$TAG"
 
             # Never move an existing tag. If it is already published, leave it untouched
