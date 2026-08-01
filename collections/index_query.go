@@ -303,33 +303,45 @@ func rangeHigh(up usableProbe) (op string, val float64, ok bool) {
 	return "", 0, false
 }
 
-// rangeBands maps a value attribute to the two-sided probe the planner coalesced its range
-// conjuncts into. nil when the conjunction has no band.
-func rangeBands(usable []usableProbe) map[uint32]usableProbe {
-	var bands map[uint32]usableProbe
+// rangeMerges maps a value attribute to the single range probe the planner coalesced its
+// range conjuncts into. coalesceRanges leaves at most one range probe per attribute, so
+// the mapping is well defined. nil when the conjunction has no range probe.
+func rangeMerges(usable []usableProbe) map[uint32]usableProbe {
+	var merges map[uint32]usableProbe
 	for _, up := range usable {
-		if up.twoSided() {
-			if bands == nil {
-				bands = make(map[uint32]usableProbe, 1)
+		if !up.cat && isRangeOp(up.op) {
+			if merges == nil {
+				merges = make(map[uint32]usableProbe, 1)
 			}
-			bands[up.attrID] = up
+			merges[up.attrID] = up
 		}
 	}
-	return bands
+	return merges
 }
 
-// applyBand redirects an explain's selectivity estimate for one half of a coalesced range
-// to the whole band (and marks it), since the band is what the planner actually probes.
-// Non-range and un-coalesced probes pass through unchanged.
-func applyBand(bands map[uint32]usableProbe, up usableProbe, pe *ProbeExplain) usableProbe {
-	if bands == nil || up.cat || !isRangeOp(up.op) {
+// applyMerge redirects an explain's selectivity estimate for a range conjunct to the probe
+// the planner actually runs for that attribute. A conjunct that IS that probe passes through
+// unmarked; one that was folded into it -- the other half of a band, or a looser same-side
+// bound the tighter one subsumed -- is marked, because the numbers beside it then describe
+// the merged probe rather than the conjunct's own reach.
+func applyMerge(merges map[uint32]usableProbe, up usableProbe, pe *ProbeExplain) usableProbe {
+	if merges == nil || up.cat || !isRangeOp(up.op) {
 		return up
 	}
-	if b, ok := bands[up.attrID]; ok {
-		pe.Banded = true
-		return b
+	m, ok := merges[up.attrID]
+	if !ok || sameRange(m, up) {
+		return up
 	}
-	return up
+	pe.Coalesced = true
+	return m
+}
+
+// sameRange reports whether two range probes express the identical bound(s).
+func sameRange(a, b usableProbe) bool {
+	if a.op != b.op || a.hiOp != b.hiOp || a.hiVal != b.hiVal || len(a.fvals) != len(b.fvals) {
+		return false
+	}
+	return len(a.fvals) == 0 || a.fvals[0] == b.fvals[0]
 }
 
 // rangeSpan returns the [from,to) index window of a sorted ascending key run that a range
@@ -379,10 +391,13 @@ type ProbeExplain struct {
 	Selectivity    float64 `json:"selectivity,omitempty"`
 	EstCandidates  int64   `json:"estCandidates,omitempty"`
 
-	// Banded marks a range conjunct the planner merged with the opposite bound on the
-	// same attribute (`Memory > 1024 && Memory < 4096`) into a single two-sided index
-	// probe. Selectivity/EstCandidates then describe the band, not this half of it.
-	Banded bool `json:"banded,omitempty"`
+	// Coalesced marks a range conjunct the planner folded into another range probe on the
+	// same attribute -- the opposite bound (`Memory > 1024 && Memory < 4096` becomes one
+	// two-sided probe) or a tighter same-side bound that subsumes it (`Memory > 1024 &&
+	// Memory > 512` probes only `> 1024`). Selectivity/EstCandidates then describe the
+	// merged probe, not this conjunct's own reach; the conjunct that IS the probe is left
+	// unmarked.
+	Coalesced bool `json:"coalesced,omitempty"`
 }
 
 // QueryExplain is a description of how the store would execute a query, for the
@@ -421,13 +436,13 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		Shards:      len(c.shards),
 		TotalAds:    total,
 	}
-	bands := rangeBands(usable)
+	merges := rangeMerges(usable)
 	for _, p := range probes {
 		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
 		var up usableProbe
 		var isUsable bool
 		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
-		up = applyBand(bands, up, &pe)
+		up = applyMerge(merges, up, &pe)
 		if isUsable {
 			if cand, covered := c.estimateCandidates(up); covered {
 				pe.HasSelectivity = true

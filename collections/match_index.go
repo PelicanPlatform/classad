@@ -163,15 +163,15 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 		prunable = false // estimated to barely prune -> a scan is cheaper
 	}
 	for _, g := range plan {
-		// Report the coalesced band's selectivity for each half of a two-sided range,
+		// Report the merged probe's selectivity for every range conjunct folded into it,
 		// matching what the planner probes (see ExplainQuery).
-		bands := rangeBands(c.planIndex(g.Probes))
+		merges := rangeMerges(c.planIndex(g.Probes))
 		for _, p := range g.Probes {
 			pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
 			var up usableProbe
 			var isUsable bool
 			pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
-			up = applyBand(bands, up, &pe)
+			up = applyMerge(merges, up, &pe)
 			if isUsable {
 				ex.IndexUsable++
 				if cand, covered := c.estimateCandidates(up); covered {

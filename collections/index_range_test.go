@@ -47,6 +47,28 @@ func TestCoalesceRanges(t *testing.T) {
 		in:   []usableProbe{val(">=", 1024), val(">", 1024), val("<=", 4096), val("<", 4096)},
 		want: []usableProbe{{attrID: 1, op: ">", fvals: []float64{1024}, hiOp: "<", hiVal: 4096}},
 	}, {
+		// Same-side bounds subsume: the tighter one is the whole constraint, and the
+		// result stays one-sided (no upper bound was ever given).
+		name: "same side tightens to the stricter bound",
+		in:   []usableProbe{val(">", 1024), val(">", 512)},
+		want: []usableProbe{val(">", 1024)},
+	}, {
+		name: "same side tightens regardless of order",
+		in:   []usableProbe{val(">", 512), val(">", 1024)},
+		want: []usableProbe{val(">", 1024)},
+	}, {
+		name: "same side upper bounds tighten",
+		in:   []usableProbe{val("<", 4096), val("<", 8192)},
+		want: []usableProbe{val("<", 4096)},
+	}, {
+		name: "same side equal value prefers exclusive",
+		in:   []usableProbe{val(">=", 1024), val(">", 1024)},
+		want: []usableProbe{val(">", 1024)},
+	}, {
+		name: "three same-side bounds collapse to one",
+		in:   []usableProbe{val(">", 512), val(">", 2048), val(">", 1024)},
+		want: []usableProbe{val(">", 2048)},
+	}, {
 		name: "one sided untouched",
 		in:   []usableProbe{val(">", 1024)},
 		want: []usableProbe{val(">", 1024)},
@@ -195,7 +217,7 @@ func TestRangeBandPrunesKeyRun(t *testing.T) {
 	}
 }
 
-// TestRangeBandBandsExplain checks that .explain attributes the band's selectivity to each
+// TestRangeBandExplain checks that .explain attributes the band's selectivity to each
 // half rather than reporting two barely-selective one-sided probes.
 func TestRangeBandExplain(t *testing.T) {
 	t.Parallel()
@@ -220,8 +242,8 @@ func TestRangeBandExplain(t *testing.T) {
 		t.Fatalf("want both conjuncts explained, got %+v", ex.Probes)
 	}
 	for _, pe := range ex.Probes {
-		if !pe.Banded {
-			t.Errorf("%s %s: want Banded", pe.Attr, pe.Op)
+		if !pe.Coalesced {
+			t.Errorf("%s %s: want Coalesced", pe.Attr, pe.Op)
 		}
 		// ~200 of 2000 values fall in the band; each half alone would be ~half the set.
 		if !pe.HasSelectivity || pe.Selectivity > 0.25 {
@@ -539,5 +561,90 @@ func TestEmptyBandDisjunctionKept(t *testing.T) {
 	indexedVsBrute(t, c, src, dead)
 	if groups, prunable := c.planIndexGroups(mustQuery(t, dead).ProbePlan()); !prunable || !unsatisfiableGroups(groups) {
 		t.Errorf("both disjuncts impossible: prunable=%v unsatisfiable=%v", prunable, unsatisfiableGroups(groups))
+	}
+}
+
+// TestSameSideMergeQuery is the behavioural half of same-side coalescing: redundant bounds
+// on one attribute collapse to the tightest, the query still answers exactly, and .explain
+// attributes the merged probe's selectivity to the conjunct that was folded away rather
+// than advertising a reach that is never probed.
+func TestSameSideMergeQuery(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 3000; i++ {
+		text := fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory=%d ]`, i, i%10, (i%64+1)*128)
+		if i%89 == 0 {
+			text = fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory="lots" ]`, i, i%10)
+		}
+		ad := mustAd(t, text)
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	// Each of these must plan as ONE range probe carrying the tightest bound(s), and the
+	// looser conjunct must not add a probe of its own.
+	for _, tc := range []struct {
+		q      string
+		op     string
+		val    float64
+		hiOp   string
+		hiVal  float64
+		probes int // total probes, including any non-range conjunct
+	}{
+		{q: `Memory > 1024 && Memory > 512`, op: ">", val: 1024, probes: 1},
+		{q: `Memory > 512 && Memory > 1024`, op: ">", val: 1024, probes: 1},
+		{q: `Memory < 4096 && Memory < 8192`, op: "<", val: 4096, probes: 1},
+		{q: `Memory >= 1024 && Memory > 1024`, op: ">", val: 1024, probes: 1},
+		// A non-range conjunct in between must not stop the merge.
+		{q: `Memory > 1024 && Owner == "u3" && Memory > 512`, op: ">", val: 1024, probes: 2},
+		// Both sides tightened, then coalesced into a band.
+		{q: `Memory > 512 && Memory > 1024 && Memory < 8192 && Memory < 4096`,
+			op: ">", val: 1024, hiOp: "<", hiVal: 4096, probes: 1},
+	} {
+		u := planOf(t, c, tc.q)
+		if len(u) != tc.probes {
+			t.Errorf("%s: %d probes, want %d (%+v)", tc.q, len(u), tc.probes, u)
+			continue
+		}
+		var rng *usableProbe
+		for i := range u {
+			if !u[i].cat && isRangeOp(u[i].op) {
+				rng = &u[i]
+			}
+		}
+		if rng == nil {
+			t.Errorf("%s: no range probe planned", tc.q)
+			continue
+		}
+		if rng.op != tc.op || rng.fvals[0] != tc.val || rng.hiOp != tc.hiOp || rng.hiVal != tc.hiVal {
+			t.Errorf("%s: planned %s %g / %s %g, want %s %g / %s %g", tc.q,
+				rng.op, rng.fvals[0], rng.hiOp, rng.hiVal, tc.op, tc.val, tc.hiOp, tc.hiVal)
+		}
+		indexedVsBrute(t, c, src, tc.q)
+	}
+
+	// .explain: the conjunct that survives as the probe is unmarked and carries its own
+	// number; the subsumed one is marked and reports the merged probe's number, not the
+	// much weaker reach of `> 512`.
+	ex := c.ExplainQuery(mustQuery(t, `Memory > 1024 && Memory > 512`))
+	if ex.IndexUsable != 1 {
+		t.Errorf("IndexUsable = %d, want 1", ex.IndexUsable)
+	}
+	if len(ex.Probes) != 2 {
+		t.Fatalf("want both conjuncts explained, got %+v", ex.Probes)
+	}
+	if ex.Probes[0].Coalesced {
+		t.Errorf("`> 1024` is the probe itself: want unmarked, got %+v", ex.Probes[0])
+	}
+	if !ex.Probes[1].Coalesced {
+		t.Errorf("`> 512` was folded away: want marked, got %+v", ex.Probes[1])
+	}
+	if ex.Probes[0].EstCandidates != ex.Probes[1].EstCandidates {
+		t.Errorf("both conjuncts should report the merged probe's estimate, got %d and %d",
+			ex.Probes[0].EstCandidates, ex.Probes[1].EstCandidates)
 	}
 }
