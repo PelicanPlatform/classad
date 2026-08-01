@@ -78,6 +78,12 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 		}
 		next.gen = cur.gen + 1
 		if c.spec.CompareAndSwap(cur, next) {
+			// An append-only collection zones every value-indexed attribute (New wires
+			// ZoneAttrs and ValueAttrs together), so a value index added at runtime must
+			// extend the zone set too -- otherwise a range query on it would prune
+			// postings but never whole segments, unlike an identical index configured at
+			// creation. No-op for a mutable collection.
+			c.addZoneAttrs(value)
 			return true
 		}
 	}
@@ -115,6 +121,36 @@ func (c *Collection) DropIndex(names ...string) bool {
 			return true
 		}
 	}
+}
+
+// StaleIndexSegments counts sealed segments whose index sidecar was built under an older
+// index configuration than the current one, and the total number of sealed segments.
+//
+// A sealed segment's sidecar is immutable, but it is also derived: Reindex rebuilds a stale
+// one in place (a new mapping beside the live one, swapped atomically) without touching the
+// segment data, so this is normally zero. A non-zero count means some segment's rebuild did
+// not complete -- resealing is best-effort per segment -- and a Reindex will retry it.
+func (c *Collection) StaleIndexSegments() (stale, sealed int) {
+	gen := c.spec.Load().gen
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		segs := append([]*segment(nil), sh.segs...)
+		sh.mu.RUnlock()
+		for _, seg := range segs {
+			if seg == nil {
+				continue
+			}
+			mm := seg.msidx.Load()
+			if mm == nil {
+				continue // not sealed to a sidecar: Reindex still rebuilds it in place
+			}
+			sealed++
+			if mm.specGen != gen {
+				stale++
+			}
+		}
+	}
+	return stale, sealed
 }
 
 // IndexedAttrs returns the currently-indexed attribute names, split by kind, in the

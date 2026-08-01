@@ -144,6 +144,12 @@ type segment struct {
 	// reaped, so a query scanning a rotating segment never reads a torn index mapping.
 	onReap func()
 
+	// staleUnmaps hold sidecar mappings displaced by an in-place re-index (the segment
+	// data is untouched; only its index was rebuilt). Each is released once the pin
+	// count drains, since a scan that loaded the old index may still be reading it.
+	// Guarded by reapMu.
+	staleUnmaps []func()
+
 	// keyIdx is a sealed segment's pageable key-index sidecar (key-hash -> record
 	// offset), or nil. Phase 1 of the pageable primary index: built at seal, mmapped
 	// on reopen, torn down with the segment (onReapKey, run alongside onReap). It does
@@ -214,9 +220,15 @@ func (s *segment) unpin() {
 	s.reapMu.Unlock()
 	if doReap {
 		s.reapAndHook()
-	} else if doUnmap {
-		_ = s.unmapAndHook()
+		return
 	}
+	if doUnmap {
+		_ = s.unmapAndHook()
+		return
+	}
+	// Not retiring: a sidecar displaced by an in-place re-index becomes unreachable as
+	// soon as the last scan that could have loaded it drops its pin.
+	s.releaseStale()
 }
 
 // unmapAndHook unmaps the segment's data (munmap + close file, WITHOUT unlinking
@@ -268,12 +280,17 @@ func (s *segment) runReapHook() {
 	s.reapMu.Lock()
 	h, hk := s.onReap, s.onReapKey
 	s.onReap, s.onReapKey = nil, nil
+	stale := s.staleUnmaps // sidecars displaced by an in-place re-index, not yet released
+	s.staleUnmaps = nil
 	s.reapMu.Unlock()
 	if h != nil {
 		h()
 	}
 	if hk != nil {
 		hk()
+	}
+	for _, f := range stale {
+		f()
 	}
 }
 
@@ -284,6 +301,49 @@ func (s *segment) setOnReapKey(f func()) {
 	s.reapMu.Lock()
 	s.onReapKey = f
 	s.reapMu.Unlock()
+}
+
+// swapSidecarHook installs the unmap closer for a freshly published sidecar mapping and
+// queues the one it displaced for release. Used by an in-place sealed-segment re-index
+// (see Collection.reindexSealed*), which builds a NEW mapping beside the live one rather
+// than mutating it -- a sealed sidecar is immutable, and a scan may be reading it.
+//
+// key selects which hook the closer belongs to: the combined attribute+key sidecar of a
+// persistent segment (onReapKey) or the attribute-only anonymous mapping of a RAM one
+// (onReap). The caller must have already published the new mmapSegIndex/mmapKeyIndex, so
+// nothing can newly reach the displaced mapping by the time it is queued.
+func (s *segment) swapSidecarHook(closer func(), key bool) {
+	s.reapMu.Lock()
+	var old func()
+	if key {
+		old, s.onReapKey = s.onReapKey, closer
+	} else {
+		old, s.onReap = s.onReap, closer
+	}
+	if old != nil {
+		s.staleUnmaps = append(s.staleUnmaps, old)
+	}
+	s.reapMu.Unlock()
+}
+
+// releaseStale unmaps every sidecar mapping displaced by an in-place re-index, once no
+// scan pins the segment. A scan holds its pin for its whole life (see shard.snapshot),
+// and candidate bitmaps are zero-copy views into the sidecar, so a displaced mapping is
+// unreachable exactly when the pin count reaches zero -- the same moment a retired
+// segment's data becomes reapable. Called after each swap and at every unpin, so the
+// mapping is freed at the first instant it is provably safe.
+func (s *segment) releaseStale() {
+	s.reapMu.Lock()
+	if s.refs != 0 || len(s.staleUnmaps) == 0 {
+		s.reapMu.Unlock()
+		return
+	}
+	stale := s.staleUnmaps
+	s.staleUnmaps = nil
+	s.reapMu.Unlock()
+	for _, f := range stale {
+		f()
+	}
 }
 
 // reapAndHook reaps the segment (munmap + unlink of its data) and then runs onReap

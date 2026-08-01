@@ -37,6 +37,16 @@ type Diagnostics struct {
 	Archive      bool            `json:"archive,omitempty"`
 	Retention    *db.Retention   `json:"retention,omitempty"`
 	SidecarSizes db.SidecarSizes `json:"sidecarSizes"`
+
+	// ZoneAttrs are the archive attributes carrying per-segment [min,max] zone maps: a
+	// range query on one of these prunes whole segments, not just postings.
+	ZoneAttrs []string `json:"zoneAttrs,omitempty"`
+	// SealedSegments is how many of the archive's segments are sealed to an immutable
+	// index sidecar, and StaleIndexSegments how many of those were sealed under an older
+	// index configuration -- i.e. how much of the archive a runtime .addindex/.dropindex
+	// has NOT reached yet (only a rewrite reaches them).
+	SealedSegments     int `json:"sealedSegments,omitempty"`
+	StaleIndexSegments int `json:"staleIndexSegments,omitempty"`
 }
 
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
@@ -68,6 +78,7 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 	cat, val := a.IndexedAttrs()
 	ret := a.Retention()
+	stale, sealed := a.StaleIndexSegments()
 	d := Diagnostics{
 		Stats:              a.Stats(),
 		OpStats:            a.OpStats(),
@@ -78,6 +89,9 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 		Archive:            true,
 		Retention:          &ret,
 		SidecarSizes:       a.SidecarSizes(),
+		ZoneAttrs:          a.ZoneAttrs(),
+		SealedSegments:     sealed,
+		StaleIndexSegments: stale,
 	}
 	return json.Marshal(d)
 }
@@ -87,7 +101,8 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 //	index.add.categorical <attr>...   add categorical (string eq/membership) indexes
 //	index.add.value <attr>...         add value (numeric + range) indexes
 //	index.drop <attr>...              drop indexes on the given attributes
-//	index.reindex                     rebuild all indexes from live ads
+//	index.reindex                     rebuild all indexes from live ads (archives: rebuild
+//	                                  stale segment sidecars in place, no data rewrite)
 //	hot.add <attr>...                 pin attributes into the hot set
 //	hot.refresh <sampleMax> <topN>    recompute the hot set from sampled frequency
 //	compact                           reclaim dead space in warranted shards
@@ -234,12 +249,12 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
 		}
-		return changedMsg("categorical index on "+join(args), a.AddIndex(args, nil)), nil
+		return archiveIndexMsg(a, changedMsg("categorical index on "+join(args), a.AddIndex(args, nil))), nil
 	case "index.add.value":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.value needs at least one attribute")
 		}
-		return changedMsg("value index on "+join(args), a.AddIndex(nil, args)), nil
+		return archiveIndexMsg(a, changedMsg("value index on "+join(args), a.AddIndex(nil, args))), nil
 	case "index.drop":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.drop needs at least one attribute")
@@ -248,7 +263,7 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 		if changed {
 			a.Reindex()
 		}
-		return changedMsg("dropped index on "+join(args), changed), nil
+		return archiveIndexMsg(a, changedMsg("dropped index on "+join(args), changed)), nil
 	case "index.reindex":
 		a.Reindex()
 		return "reindexed", nil
@@ -284,6 +299,18 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 	default:
 		return "", fmt.Errorf("unknown archive admin action %q", action)
 	}
+}
+
+// archiveIndexMsg appends the sealed-segment reach to an index-change acknowledgement. The
+// change rebuilds every segment's index sidecar in place, so normally there is nothing to
+// add; a non-zero stale count means some segment's rebuild did not complete (it is
+// best-effort per segment) and index.reindex should be retried.
+func archiveIndexMsg(a *db.ArchiveTable, msg string) string {
+	stale, _ := a.StaleIndexSegments()
+	if stale == 0 {
+		return msg
+	}
+	return fmt.Sprintf("%s; %d segment(s) failed to rebuild and keep the previous index set -- retry with index.reindex", msg, stale)
 }
 
 // parseRetentionArgs parses `<maxSegments> <maxBytes> [maxAgeAttr maxAgeSeconds]` into a

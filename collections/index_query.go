@@ -42,22 +42,30 @@ func (c *Collection) Reindex() {
 		act := sh.act
 		sealRAM := sh.sealRAM
 		type target struct {
-			seg  *segment
-			used int
-			seal bool // convert to the mmap sidecar after (re)building
+			seg    *segment
+			used   int
+			seal   bool // convert to the mmap sidecar after (re)building
+			reseal bool // already sidecar-sealed under an older spec: rebuild the sidecar in place
 		}
 		var tgts []target
 		for _, seg := range sh.segs {
 			if seg == nil {
 				continue
 			}
-			if seg.msidx.Load() != nil {
-				continue // already sealed to a mmap sidecar; its index config is frozen
+			if mm := seg.msidx.Load(); mm != nil {
+				// Already sealed to an immutable mmap sidecar. Its DATA is final, but the
+				// index derived from it is not: rebuild the sidecar in place when the index
+				// configuration has moved on, so .addindex/.dropindex reach existing
+				// segments without the whole-store re-encode a rewrite would cost.
+				if spec.any() && seg.used > 0 && mm.specGen != spec.gen {
+					tgts = append(tgts, target{seg: seg, used: seg.used, reseal: true})
+				}
+				continue
 			}
 			cur := seg.idx.Load()
 			if !spec.any() {
 				if cur != nil {
-					tgts = append(tgts, target{seg, seg.used, false}) // clear a now-orphaned index
+					tgts = append(tgts, target{seg: seg, used: seg.used}) // clear a now-orphaned index
 				}
 				continue
 			}
@@ -69,13 +77,17 @@ func (c *Collection) Reindex() {
 			// an older spec generation; otherwise a current-but-unsealed sealable segment
 			// still needs converting.
 			if cur == nil || int(cur.upto) < seg.used || cur.specGen != spec.gen {
-				tgts = append(tgts, target{seg, seg.used, sealable})
+				tgts = append(tgts, target{seg: seg, used: seg.used, seal: sealable})
 			} else if sealable {
-				tgts = append(tgts, target{seg, seg.used, true})
+				tgts = append(tgts, target{seg: seg, used: seg.used, seal: true})
 			}
 		}
 		sh.mu.RUnlock()
 		for _, t := range tgts {
+			if t.reseal {
+				c.reindexSealed(sh, t.seg, spec)
+				continue
+			}
 			if !spec.any() {
 				t.seg.idx.Store(nil)
 				continue
@@ -118,6 +130,181 @@ type usableProbe struct {
 	op     string
 	svals  []string
 	fvals  []float64
+
+	// hiOp/hiVal bound a numeric range probe from above, so a conjunction like
+	// `Memory > 1024 && Memory < 4096` plans as ONE two-sided band rather than two
+	// half-open probes that each union half the key space before intersecting. Set
+	// only when op is ">" or ">=" (coalesceRanges normalizes to lower-bound-first);
+	// empty hiOp means the probe is one-sided.
+	//
+	// The fields are an optimization, never a correctness requirement: a code path
+	// that reads only op/fvals still produces a correct candidate superset -- just a
+	// wider one -- because dropping the upper bound only widens the range.
+	hiOp  string
+	hiVal float64
+}
+
+// twoSided reports whether up carries both bounds of a numeric band.
+func (up usableProbe) twoSided() bool { return up.hiOp != "" }
+
+// isRangeOp reports whether op is an indexable numeric range comparison.
+func isRangeOp(op string) bool {
+	switch op {
+	case "<", "<=", ">", ">=":
+		return true
+	}
+	return false
+}
+
+// coalesceRanges merges the range probes of a conjunction that constrain the same value
+// attribute from both sides into a single two-sided band probe. `Memory > 1024 && Memory
+// < 4096` otherwise plans as two probes, each of which unions the postings of half the
+// attribute's key space (potentially every record in the segment) only for the
+// intersection to throw most of it away; a band scans just the keys inside it.
+//
+// Repeated bounds on one side tighten (`Memory > 1024 && Memory > 2048` keeps > 2048).
+// Probes on other attributes, categorical probes, and non-range operators pass through
+// untouched and keep their input order, so the plan stays deterministic.
+func coalesceRanges(out []usableProbe) []usableProbe {
+	// Fast path: nothing to merge unless two range probes share an attribute.
+	if !hasMergeableRanges(out) {
+		return out
+	}
+	// lo/hi hold the tightest bound seen per attribute, at the slot of its first range
+	// probe; later range probes on that attribute are folded in and dropped.
+	slot := make(map[uint32]int, len(out))
+	merged := out[:0]
+	for _, up := range out {
+		if up.cat || !isRangeOp(up.op) {
+			merged = append(merged, up)
+			continue
+		}
+		i, seen := slot[up.attrID]
+		if !seen {
+			slot[up.attrID] = len(merged)
+			merged = append(merged, up)
+			continue
+		}
+		merged[i] = mergeRange(merged[i], up)
+	}
+	return merged
+}
+
+// hasMergeableRanges reports whether two range probes in the conjunction target the same
+// value attribute (the only case coalesceRanges changes anything).
+func hasMergeableRanges(out []usableProbe) bool {
+	for i, a := range out {
+		if a.cat || !isRangeOp(a.op) {
+			continue
+		}
+		for _, b := range out[i+1:] {
+			if !b.cat && isRangeOp(b.op) && b.attrID == a.attrID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// mergeRange folds range probe b into a (same attribute), keeping the tightest bound on
+// each side and normalizing to lower-bound-first. A probe that ends up with only an upper
+// bound stays one-sided in "<"/"<=" form.
+func mergeRange(a, b usableProbe) usableProbe {
+	loOp, loVal, hasLo := rangeLow(a)
+	hiOp, hiVal, hasHi := rangeHigh(a)
+	if op, v, ok := rangeLow(b); ok {
+		// Tighter lower bound wins; at equal values the exclusive ">" wins.
+		if !hasLo || v > loVal || (v == loVal && op == ">") {
+			loOp, loVal, hasLo = op, v, true
+		}
+	}
+	if op, v, ok := rangeHigh(b); ok {
+		if !hasHi || v < hiVal || (v == hiVal && op == "<") {
+			hiOp, hiVal, hasHi = op, v, true
+		}
+	}
+	switch {
+	case hasLo && hasHi:
+		return usableProbe{attrID: a.attrID, op: loOp, fvals: []float64{loVal}, hiOp: hiOp, hiVal: hiVal}
+	case hasLo:
+		return usableProbe{attrID: a.attrID, op: loOp, fvals: []float64{loVal}}
+	default:
+		return usableProbe{attrID: a.attrID, op: hiOp, fvals: []float64{hiVal}}
+	}
+}
+
+// rangeLow / rangeHigh decompose a (possibly two-sided) range probe into its bounds.
+func rangeLow(up usableProbe) (op string, val float64, ok bool) {
+	if up.op == ">" || up.op == ">=" {
+		return up.op, up.fvals[0], true
+	}
+	return "", 0, false
+}
+
+func rangeHigh(up usableProbe) (op string, val float64, ok bool) {
+	if up.hiOp != "" {
+		return up.hiOp, up.hiVal, true
+	}
+	if up.op == "<" || up.op == "<=" {
+		return up.op, up.fvals[0], true
+	}
+	return "", 0, false
+}
+
+// rangeBands maps a value attribute to the two-sided probe the planner coalesced its range
+// conjuncts into. nil when the conjunction has no band.
+func rangeBands(usable []usableProbe) map[uint32]usableProbe {
+	var bands map[uint32]usableProbe
+	for _, up := range usable {
+		if up.twoSided() {
+			if bands == nil {
+				bands = make(map[uint32]usableProbe, 1)
+			}
+			bands[up.attrID] = up
+		}
+	}
+	return bands
+}
+
+// applyBand redirects an explain's selectivity estimate for one half of a coalesced range
+// to the whole band (and marks it), since the band is what the planner actually probes.
+// Non-range and un-coalesced probes pass through unchanged.
+func applyBand(bands map[uint32]usableProbe, up usableProbe, pe *ProbeExplain) usableProbe {
+	if bands == nil || up.cat || !isRangeOp(up.op) {
+		return up
+	}
+	if b, ok := bands[up.attrID]; ok {
+		pe.Banded = true
+		return b
+	}
+	return up
+}
+
+// rangeSpan returns the [from,to) index window of a sorted ascending key run that a range
+// probe admits. Both bounds are applied, so a two-sided probe touches only the keys inside
+// its band.
+func rangeSpan(up usableProbe, n int, lowerBound, upperBound func(t float64) int) (from, to int) {
+	from, to = 0, n
+	switch up.op {
+	case ">":
+		from = upperBound(up.fvals[0])
+	case ">=":
+		from = lowerBound(up.fvals[0])
+	case "<":
+		to = lowerBound(up.fvals[0])
+	case "<=":
+		to = upperBound(up.fvals[0])
+	}
+	switch up.hiOp {
+	case "<":
+		to = lowerBound(up.hiVal)
+	case "<=":
+		to = upperBound(up.hiVal)
+	}
+	if to < from {
+		to = from // an empty band (lo above hi): no keys match
+	}
+	return from, to
 }
 
 // planIndex matches the query's probes against the configured indexes. Empty means
@@ -139,6 +326,11 @@ type ProbeExplain struct {
 	HasSelectivity bool    `json:"hasSelectivity"`
 	Selectivity    float64 `json:"selectivity,omitempty"`
 	EstCandidates  int64   `json:"estCandidates,omitempty"`
+
+	// Banded marks a range conjunct the planner merged with the opposite bound on the
+	// same attribute (`Memory > 1024 && Memory < 4096`) into a single two-sided index
+	// probe. Selectivity/EstCandidates then describe the band, not this half of it.
+	Banded bool `json:"banded,omitempty"`
 }
 
 // QueryExplain is a description of how the store would execute a query, for the
@@ -176,11 +368,13 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		Shards:      len(c.shards),
 		TotalAds:    total,
 	}
+	bands := rangeBands(usable)
 	for _, p := range probes {
 		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
 		var up usableProbe
 		var isUsable bool
 		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
+		up = applyBand(bands, up, &pe)
 		if isUsable {
 			if cand, covered := c.estimateCandidates(up); covered {
 				pe.HasSelectivity = true
@@ -302,7 +496,7 @@ func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 			}
 		}
 	}
-	return out
+	return coalesceRanges(out)
 }
 
 func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {
@@ -564,12 +758,7 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		cp := si.cat[up.attrID]
 		switch up.op {
 		case "==", "in":
-			bm := roaring.New()
-			for _, s := range up.svals {
-				if p := cp.post[s]; p != nil {
-					bm.Or(p)
-				}
-			}
+			bm := unionPostings(len(up.svals), func(i int) *roaring.Bitmap { return cp.post[up.svals[i]] })
 			bm.Or(cp.exc)
 			return bm
 		case "!=":
@@ -603,12 +792,7 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 	vp := si.val[up.attrID]
 	switch up.op {
 	case "==", "in":
-		bm := roaring.New()
-		for _, f := range up.fvals {
-			if p := vp.post[f]; p != nil {
-				bm.Or(p)
-			}
-		}
+		bm := unionPostings(len(up.fvals), func(i int) *roaring.Bitmap { return vp.post[up.fvals[i]] })
 		bm.Or(vp.exc)
 		return bm
 	case "!=":
@@ -626,27 +810,15 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		bm.AndNot(vp.posted)
 		return bm
 	case "<", "<=", ">", ">=":
-		bm := roaring.New()
-		// Boundary-search the sorted keys to the matching run [from,to), then OR only
-		// those keys' bitmaps -- O(log n + matches) instead of scanning every key.
+		// Boundary-search the sorted keys to the matching run [from,to), then union only
+		// those keys' bitmaps -- O(log n + matches) instead of scanning every key. A
+		// two-sided probe bounds the run on both ends, so a narrow band touches few keys
+		// however wide either half-open side would have been.
 		keys := vp.sortedKeys
-		t := up.fvals[0]
-		var from, to int
-		switch up.op {
-		case ">":
-			from, to = upperBoundF(keys, t), len(keys)
-		case ">=":
-			from, to = lowerBoundF(keys, t), len(keys)
-		case "<":
-			from, to = 0, lowerBoundF(keys, t)
-		case "<=":
-			from, to = 0, upperBoundF(keys, t)
-		}
-		for i := from; i < to; i++ {
-			if p := vp.post[keys[i]]; p != nil {
-				bm.Or(p)
-			}
-		}
+		from, to := rangeSpan(up, len(keys),
+			func(t float64) int { return lowerBoundF(keys, t) },
+			func(t float64) int { return upperBoundF(keys, t) })
+		bm := unionPostings(to-from, func(i int) *roaring.Bitmap { return vp.post[keys[from+i]] })
 		bm.Or(vp.exc)
 		return bm
 	}

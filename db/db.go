@@ -297,6 +297,7 @@ type (
 	Retention       = collections.Retention
 	CodecStats      = collections.CodecStats
 	QueryExplain    = collections.QueryExplain
+	ProbeExplain    = collections.ProbeExplain
 	MatchExplain    = collections.MatchExplain
 )
 

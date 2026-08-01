@@ -152,17 +152,20 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		postedOff := le32(si.data, attrOff+4)
 		switch up.op {
 		case "==", "in":
-			bm := roaring.New()
 			// Bloom fast path: if every probe value is definitely absent, skip the
 			// per-value binary search over the (paged) sorted key blob entirely; only
 			// the exceptional records can still match and are re-verified upstream.
-			if !si.catBloomAllAbsent(attrOff, up.svals) {
-				for _, s := range up.svals {
-					if off, ok := si.catFindEq(attrOff, s); ok {
-						bm.Or(si.bitmapAt(off))
-					}
-				}
+			n := len(up.svals)
+			if si.catBloomAllAbsent(attrOff, up.svals) {
+				n = 0
 			}
+			bm := unionPostings(n, func(i int) *roaring.Bitmap {
+				off, ok := si.catFindEq(attrOff, up.svals[i])
+				if !ok {
+					return nil
+				}
+				return si.bitmapAt(off)
+			})
 			bm.Or(si.bitmapAt(excOff))
 			return bm
 		case "!=":
@@ -202,12 +205,13 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 	postedOff := le32(si.data, attrOff+4)
 	switch up.op {
 	case "==", "in":
-		bm := roaring.New()
-		for _, f := range up.fvals {
-			if off, ok := si.valFind(attrOff, f); ok {
-				bm.Or(si.bitmapAt(off))
+		bm := unionPostings(len(up.fvals), func(i int) *roaring.Bitmap {
+			off, ok := si.valFind(attrOff, up.fvals[i])
+			if !ok {
+				return nil
 			}
-		}
+			return si.bitmapAt(off)
+		})
 		bm.Or(si.bitmapAt(excOff))
 		return bm
 	case "!=":
@@ -225,7 +229,7 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 		bm.AndNot(si.bitmapAt(postedOff))
 		return bm
 	case "<", "<=", ">", ">=":
-		bm := si.valRange(attrOff, up.op, up.fvals[0])
+		bm := si.valRange(attrOff, up)
 		bm.Or(si.bitmapAt(excOff))
 		return bm
 	}
@@ -445,31 +449,22 @@ func (si *mmapSegIndex) valFind(attrOff uint32, f float64) (bmOff uint32, ok boo
 	return 0, false
 }
 
-// valRange ORs the bitmaps of every key satisfying (op, t). Keys are sorted, so a
-// boundary search bounds the scan to the matching run — only those keys' pages and
-// bitmaps are touched.
-func (si *mmapSegIndex) valRange(attrOff uint32, op string, t float64) *roaring.Bitmap {
+// valRange unions the bitmaps of every key satisfying up's range bound(s). Keys are
+// sorted, so a boundary search bounds the scan to the matching run — only those keys'
+// pages and bitmaps are touched — and a two-sided probe bounds it at both ends, paging
+// in just the band rather than everything above (or below) one threshold.
+func (si *mmapSegIndex) valRange(attrOff uint32, up usableProbe) *roaring.Bitmap {
 	d := si.data
 	n := int(le32(d, attrOff+8))
 	keyBase := attrOff + 12
 	bmOffBase := keyBase + uint32(n)*8
-	bm := roaring.New()
 	// [from, to) is the index range of matching keys.
-	var from, to int
-	switch op {
-	case ">":
-		from, to = si.upperBound(keyBase, n, t), n
-	case ">=":
-		from, to = si.lowerBound(keyBase, n, t), n
-	case "<":
-		from, to = 0, si.lowerBound(keyBase, n, t)
-	case "<=":
-		from, to = 0, si.upperBound(keyBase, n, t)
-	}
-	for i := from; i < to; i++ {
-		bm.Or(si.bitmapAt(le32(d, bmOffBase+uint32(i)*4)))
-	}
-	return bm
+	from, to := rangeSpan(up, n,
+		func(t float64) int { return si.lowerBound(keyBase, n, t) },
+		func(t float64) int { return si.upperBound(keyBase, n, t) })
+	return unionPostings(to-from, func(i int) *roaring.Bitmap {
+		return si.bitmapAt(le32(d, bmOffBase+uint32(from+i)*4))
+	})
 }
 
 // lowerBound returns the first index i with key[i] >= t (or n).

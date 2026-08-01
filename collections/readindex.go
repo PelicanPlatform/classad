@@ -44,6 +44,61 @@ type indexPrimitives interface {
 	bloomAbsent(up usableProbe) bool
 }
 
+// bulkOrMin is the posting count at which unionPostings switches from a running in-place
+// Or to roaring's batched union. The batch trades transient memory (it promotes each
+// accumulating container to a dense bitmap container) for linear rather than quadratic
+// merge cost, so it only pays once there are enough postings for the quadratic term to
+// dominate -- measured crossover is around 100 on an 8 MiB segment's offset space.
+const bulkOrMin = 128
+
+// unionOrWorkers is the worker count handed to roaring's batched union. One is deliberate:
+// almost all of the batch's win is algorithmic (see unionPostings), extra workers add well
+// under 2x on top, and a query is often already fanned out across shards and segments --
+// so spending a whole machine's cores inside one probe would oversubscribe it.
+const unionOrWorkers = 1
+
+// unionPostings ORs n posting bitmaps -- at(i) returns the i'th, or nil for "no posting" --
+// into one fresh, mutable bitmap.
+//
+// A range probe over a high-cardinality attribute (say `CompletionDate > t`) unions one
+// posting per distinct key in the matching run, which can be thousands, and each posting is
+// a handful of record offsets scattered across the segment. Folding those with a running
+// acc.Or is quadratic: the accumulator's containers stay ARRAY containers, so every one of
+// the n merges re-runs a two-pointer merge over everything accumulated so far. roaring's
+// batched union instead promotes each accumulating container to a bitmap container and
+// unions lazily into it (cardinality repaired once at the end), which makes each posting
+// cost its own size rather than the accumulator's -- ~15x by itself on a 10k-posting range
+// over an 8 MiB segment's offset space. FastOr does NOT do this promotion, so it is not the
+// right batch here despite the name; ParOr is.
+func unionPostings(n int, at func(i int) *roaring.Bitmap) *roaring.Bitmap {
+	if n < bulkOrMin {
+		return runningOr(n, at)
+	}
+	bms := make([]*roaring.Bitmap, 0, n)
+	for i := 0; i < n; i++ {
+		if p := at(i); p != nil {
+			bms = append(bms, p)
+		}
+	}
+	if len(bms) < bulkOrMin { // mostly holes: not enough left to repay the batch
+		return runningOr(len(bms), func(i int) *roaring.Bitmap { return bms[i] })
+	}
+	// ParOr returns a fresh bitmap that shares containers copy-on-write with its inputs
+	// (exactly as a running Or's appendCopy already would), so the result is safe to
+	// mutate. It also compacts bms in place, which is why bms is not reused after.
+	return roaring.ParOr(unionOrWorkers, bms...)
+}
+
+func runningOr(n int, at func(i int) *roaring.Bitmap) *roaring.Bitmap {
+	bm := roaring.New()
+	for i := 0; i < n; i++ {
+		if p := at(i); p != nil {
+			bm.Or(p)
+		}
+	}
+	return bm
+}
+
 func indexCovers(ix indexPrimitives, usable []usableProbe) bool {
 	for _, up := range usable {
 		if !ix.coversProbe(up) {
@@ -92,14 +147,27 @@ func indexCanSkip(ix indexPrimitives, up usableProbe) bool {
 			}
 		}
 		return true
+	case "<", "<=", ">", ">=":
+		// A two-sided probe skips if EITHER bound puts the segment's whole [min,max]
+		// outside the band, so a band narrower than the segment's span prunes segments
+		// that neither half-open side would have.
+		return rangeBoundSkips(s, up.op, up.fvals[0]) ||
+			(up.twoSided() && rangeBoundSkips(s, up.hiOp, up.hiVal))
+	}
+	return false
+}
+
+// rangeBoundSkips reports whether no value in [s.min, s.max] satisfies one range bound.
+func rangeBoundSkips(s *segStats, op string, t float64) bool {
+	switch op {
 	case "<":
-		return s.min >= up.fvals[0]
+		return s.min >= t
 	case "<=":
-		return s.min > up.fvals[0]
+		return s.min > t
 	case ">":
-		return s.max <= up.fvals[0]
+		return s.max <= t
 	case ">=":
-		return s.max < up.fvals[0]
+		return s.max < t
 	}
 	return false
 }
@@ -151,9 +219,30 @@ func estCandidatesFromStats(s *segStats, up usableProbe) float64 {
 		}
 		return indexable
 	case "<", "<=", ">", ">=":
-		return s.estRange(up.op, up.fvals[0])*indexable + float64(s.exc)
+		frac := s.estRange(up.op, up.fvals[0])
+		if up.twoSided() {
+			frac = s.estBand(up)
+		}
+		return frac*indexable + float64(s.exc)
 	}
 	return indexable
+}
+
+// estBand estimates the fraction of indexable records inside a two-sided range probe's
+// band. Over a uniform [min,max] the two one-sided fractions overlap by
+// lowFrac + highFrac - 1, so a narrow band scores far more selective than either side
+// alone -- which is the point of coalescing them: the planner now applies the band first.
+func (s *segStats) estBand(up usableProbe) float64 {
+	lo := s.estRange(up.op, up.fvals[0])
+	hi := s.estRange(up.hiOp, up.hiVal)
+	if !s.hasRange || s.max <= s.min {
+		// A degenerate span makes each side a 0/1 verdict; the band is their AND.
+		return math.Min(lo, hi)
+	}
+	if f := lo + hi - 1; f > 0 {
+		return f
+	}
+	return 0
 }
 
 // indexSelectivityOrder returns indices into usable ordered by ascending estimated candidate
@@ -199,17 +288,16 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 // indexCandidateOffsetsGroups returns the DNF union over groups of each group's candidate
 // intersection. Callers pass only prunable plans (every group has a usable probe).
 func indexCandidateOffsetsGroups(ix indexPrimitives, groups [][]usableProbe) *roaring.Bitmap {
-	var acc *roaring.Bitmap
-	for _, g := range groups {
-		gb := indexCandidateOffsets(ix, g)
-		if gb == nil {
-			gb = roaring.New()
-		}
-		if acc == nil {
-			acc = gb
-		} else {
-			acc.Or(gb)
+	if len(groups) == 0 {
+		return nil
+	}
+	// Each group's intersection is computed first, then the disjuncts are unioned in one
+	// batch (see unionPostings) rather than folded pairwise.
+	per := make([]*roaring.Bitmap, len(groups))
+	for i, g := range groups {
+		if per[i] = indexCandidateOffsets(ix, g); per[i] == nil {
+			per[i] = roaring.New()
 		}
 	}
-	return acc
+	return unionPostings(len(per), func(i int) *roaring.Bitmap { return per[i] })
 }
