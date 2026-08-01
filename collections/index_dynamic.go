@@ -126,11 +126,10 @@ func (c *Collection) DropIndex(names ...string) bool {
 // StaleIndexSegments counts sealed segments whose index sidecar was built under an older
 // index configuration than the current one, and the total number of sealed segments.
 //
-// A sealed segment's sidecar is immutable: Reindex deliberately skips it, so AddIndex /
-// DropIndex only reach segments sealed afterwards. Rewrite rebuilds every segment and
-// therefore every sidecar, which is how an existing archive picks up a new index -- at the
-// cost of re-encoding the whole store. Reporting the count lets `.indexes` say plainly that
-// an added index is not live everywhere yet instead of leaving the operator to wonder.
+// A sealed segment's sidecar is immutable, but it is also derived: Reindex rebuilds a stale
+// one in place (a new mapping beside the live one, swapped atomically) without touching the
+// segment data, so this is normally zero. A non-zero count means some segment's rebuild did
+// not complete -- resealing is best-effort per segment -- and a Reindex will retry it.
 func (c *Collection) StaleIndexSegments() (stale, sealed int) {
 	gen := c.spec.Load().gen
 	for _, sh := range c.shards {

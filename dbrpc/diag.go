@@ -101,7 +101,8 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 //	index.add.categorical <attr>...   add categorical (string eq/membership) indexes
 //	index.add.value <attr>...         add value (numeric + range) indexes
 //	index.drop <attr>...              drop indexes on the given attributes
-//	index.reindex                     rebuild all indexes from live ads
+//	index.reindex                     rebuild all indexes from live ads (archives: rebuild
+//	                                  stale segment sidecars in place, no data rewrite)
 //	hot.add <attr>...                 pin attributes into the hot set
 //	hot.refresh <sampleMax> <topN>    recompute the hot set from sampled frequency
 //	compact                           reclaim dead space in warranted shards
@@ -300,17 +301,16 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 	}
 }
 
-// archiveIndexMsg appends the sealed-segment reach to an index-change acknowledgement. A
-// sealed segment's index sidecar is immutable, so an index added or dropped now applies to
-// segments sealed from here on; the already-sealed ones keep what they were sealed with
-// until a rewrite re-encodes them. Saying so is the difference between an operator seeing
-// "no change in query time" and understanding why.
+// archiveIndexMsg appends the sealed-segment reach to an index-change acknowledgement. The
+// change rebuilds every segment's index sidecar in place, so normally there is nothing to
+// add; a non-zero stale count means some segment's rebuild did not complete (it is
+// best-effort per segment) and index.reindex should be retried.
 func archiveIndexMsg(a *db.ArchiveTable, msg string) string {
 	stale, _ := a.StaleIndexSegments()
 	if stale == 0 {
 		return msg
 	}
-	return fmt.Sprintf("%s; %d already-sealed segment(s) keep the previous index set -- run a rewrite to apply it to them", msg, stale)
+	return fmt.Sprintf("%s; %d segment(s) failed to rebuild and keep the previous index set -- retry with index.reindex", msg, stale)
 }
 
 // parseRetentionArgs parses `<maxSegments> <maxBytes> [maxAgeAttr maxAgeSeconds]` into a

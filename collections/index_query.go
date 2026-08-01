@@ -42,22 +42,30 @@ func (c *Collection) Reindex() {
 		act := sh.act
 		sealRAM := sh.sealRAM
 		type target struct {
-			seg  *segment
-			used int
-			seal bool // convert to the mmap sidecar after (re)building
+			seg    *segment
+			used   int
+			seal   bool // convert to the mmap sidecar after (re)building
+			reseal bool // already sidecar-sealed under an older spec: rebuild the sidecar in place
 		}
 		var tgts []target
 		for _, seg := range sh.segs {
 			if seg == nil {
 				continue
 			}
-			if seg.msidx.Load() != nil {
-				continue // already sealed to a mmap sidecar; its index config is frozen
+			if mm := seg.msidx.Load(); mm != nil {
+				// Already sealed to an immutable mmap sidecar. Its DATA is final, but the
+				// index derived from it is not: rebuild the sidecar in place when the index
+				// configuration has moved on, so .addindex/.dropindex reach existing
+				// segments without the whole-store re-encode a rewrite would cost.
+				if spec.any() && seg.used > 0 && mm.specGen != spec.gen {
+					tgts = append(tgts, target{seg: seg, used: seg.used, reseal: true})
+				}
+				continue
 			}
 			cur := seg.idx.Load()
 			if !spec.any() {
 				if cur != nil {
-					tgts = append(tgts, target{seg, seg.used, false}) // clear a now-orphaned index
+					tgts = append(tgts, target{seg: seg, used: seg.used}) // clear a now-orphaned index
 				}
 				continue
 			}
@@ -69,13 +77,17 @@ func (c *Collection) Reindex() {
 			// an older spec generation; otherwise a current-but-unsealed sealable segment
 			// still needs converting.
 			if cur == nil || int(cur.upto) < seg.used || cur.specGen != spec.gen {
-				tgts = append(tgts, target{seg, seg.used, sealable})
+				tgts = append(tgts, target{seg: seg, used: seg.used, seal: sealable})
 			} else if sealable {
-				tgts = append(tgts, target{seg, seg.used, true})
+				tgts = append(tgts, target{seg: seg, used: seg.used, seal: true})
 			}
 		}
 		sh.mu.RUnlock()
 		for _, t := range tgts {
+			if t.reseal {
+				c.reindexSealed(sh, t.seg, spec)
+				continue
+			}
 			if !spec.any() {
 				t.seg.idx.Store(nil)
 				continue

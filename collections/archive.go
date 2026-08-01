@@ -261,14 +261,14 @@ func (a *Archive) RetrainDict(sampleMax int) (int, error) { return a.c.RetrainDi
 // records rewritten.
 func (a *Archive) Rewrite() int { return a.c.Rewrite() }
 
-// AddIndex adds per-segment indexes on the named categorical and/or value attributes.
+// AddIndex adds per-segment indexes on the named categorical and/or value attributes and
+// rebuilds every segment's index under the new set, so existing records are covered too.
 // Returns false if the index set was unchanged.
 //
-// Reach: it takes effect immediately for segments not yet sealed to an immutable sidecar,
-// and for every segment sealed from now on. Segments ALREADY sealed keep the index they
-// were sealed with -- Reindex cannot rewrite an immutable sidecar -- so an existing archive
-// only picks the new index up everywhere after a Rewrite, which re-encodes the whole store.
-// StaleIndexSegments reports how many segments are still on the old configuration.
+// Cost: the rebuild decompresses every record in the archive once. It does NOT rewrite any
+// segment data -- a sealed segment's bytes are already correct and are left untouched; only
+// the derived index sidecar beside them is rebuilt (see Collection.reindexSealed). That is
+// the difference from Rewrite, which re-encodes and rewrites the whole store.
 func (a *Archive) AddIndex(categorical, value []string) bool {
 	if !a.c.AddIndex(categorical, value) {
 		return false
@@ -280,8 +280,9 @@ func (a *Archive) AddIndex(categorical, value []string) bool {
 // DropIndex removes the named per-segment indexes. Returns false if none matched.
 func (a *Archive) DropIndex(names ...string) bool { return a.c.DropIndex(names...) }
 
-// Reindex rebuilds the per-segment indexes over all segments (e.g. to pick up segments
-// sealed since the last build).
+// Reindex rebuilds the per-segment indexes over all segments: those sealed since the last
+// build, and those whose sidecar was built under a superseded index configuration. Segment
+// data is never touched.
 func (a *Archive) Reindex() { a.c.Reindex() }
 
 // SetRetention updates the retention bounds at runtime; the next Rotate enforces them.
@@ -314,7 +315,9 @@ func (a *Archive) IndexedAttrs() (categorical, value []string) { return a.c.Inde
 func (a *Archive) ZoneAttrs() []string { return a.c.ZoneAttrs() }
 
 // StaleIndexSegments reports how many of the archive's sealed segments still carry an index
-// built under an older configuration, and how many are sealed in total. See AddIndex.
+// built under an older configuration, and how many are sealed in total. Normally zero:
+// AddIndex/DropIndex rebuild as they go. A non-zero count means a rebuild was interrupted or
+// failed (it is best-effort per segment); a Reindex retries those segments.
 func (a *Archive) StaleIndexSegments() (stale, sealed int) { return a.c.StaleIndexSegments() }
 
 // --- zone-map helpers (shared with the Collection's per-segment zone maps) ---

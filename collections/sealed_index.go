@@ -101,6 +101,125 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 	c.publishSidecar(seg, path, nil)
 }
 
+// reindexSealed rebuilds a sealed segment's index sidecar in place, under the current
+// index spec, WITHOUT touching the segment's data. This is what separates a re-index from
+// a rewrite: the arena bytes are immutable and already correct, so only the derived index
+// needs rebuilding -- an added or dropped index reaches an existing archive for the cost of
+// decompressing its records once, not re-encoding and rewriting every segment.
+//
+// A sealed sidecar is itself immutable and may be mapped under a live scan, so it is never
+// edited: a whole new mapping is built beside it, published atomically, and the displaced
+// one is released once the segment's scan pins drain (segment.releaseStale) -- the same
+// safety rule compaction's retire/reap already follows.
+//
+// Returns true if the segment now carries an index built under spec. Best-effort: on any
+// error the existing sidecar is left in place and false is returned, so the segment keeps
+// serving queries under its older (still correct, just less selective) index.
+func (c *Collection) reindexSealed(sh *shard, seg *segment, spec *indexSpec) bool {
+	si := buildSegIndex(seg.data, seg.used, seg.codec, spec)
+	if si == nil {
+		return false
+	}
+	c.rezoneSealed(sh, seg)
+	if seg.persistent {
+		return c.reindexSealedFile(sh, seg, si)
+	}
+	return c.reindexSealedAnon(sh, seg, si)
+}
+
+// rezoneSealed recomputes a sealed segment's zone map against the shard's CURRENT zone
+// attributes, so an attribute zoned after the segment was sealed (a runtime value index --
+// see Collection.addZoneAttrs) gains whole-segment pruning on the same pass that rebuilds
+// its postings. The records are being decompressed for the index anyway, so this costs
+// little beyond the extra lookups.
+//
+// The new map REPLACES the old rather than mutating it: a scan window captured the old map
+// by reference under the read lock and reads it without further synchronization.
+func (c *Collection) rezoneSealed(sh *shard, seg *segment) {
+	sh.mu.RLock()
+	attrs, inline, appendOnly := sh.zoneAttrs, sh.zoneInline, sh.appendOnly
+	sh.mu.RUnlock()
+	if !appendOnly || len(attrs) == 0 {
+		return
+	}
+	zones := computeSegZones(seg.data, seg.used, attrs, inline, seg.codec)
+	sh.mu.Lock()
+	seg.zones = zones
+	sh.mu.Unlock()
+}
+
+// reindexSealedFile rebuilds a persistent segment's combined sidecar (attribute index +
+// key index) and swaps the whole mapping. The key index is rebuilt from the same immutable
+// bytes, so it is byte-identical to the one being replaced -- it is regenerated rather than
+// copied out of the live mapping so the new container is self-contained.
+func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bool {
+	path := snapshotPath(seg)
+	if path == "" {
+		return false
+	}
+	attrBlob, err := buildSidecarIndex(si)
+	if err != nil {
+		return false
+	}
+	// Rename over the live file: the existing mapping is unaffected (it holds the old
+	// inode), so readers keep working until they are swapped over below.
+	if err := writeFileAtomic(path, buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h))); err != nil {
+		return false
+	}
+	data, closer, err := mapFile(path)
+	if err != nil {
+		return false
+	}
+	attr, key, ok := splitSegmentSidecar(data)
+	if !ok {
+		_ = closer()
+		return false
+	}
+	ki, err := parseKeyIndex(key)
+	if err != nil || int(ki.upto) != seg.used {
+		_ = closer()
+		return false
+	}
+	if !sidecarCRCValid(attr) {
+		_ = closer()
+		return false
+	}
+	mm, err := parseMmapSidecar(attr)
+	if err != nil || mm == nil || int(mm.upto) != seg.used {
+		_ = closer()
+		return false
+	}
+	// Publish under the shard write lock: the readers that touch a sidecar without a scan
+	// pin (SidecarSizes, IndexSizes) hold the read lock while they do, so the lock is what
+	// bounds them. Pinned scan readers are handled by the pin drain instead.
+	sh.mu.Lock()
+	seg.msidx.Store(mm)
+	seg.keyIdx.Store(ki)
+	seg.keyBloom.Store(bloomFromKeyIndex(ki))
+	seg.idx.Store(nil) // the heap copy stays dropped; msidx serves queries
+	seg.swapSidecarHook(func() { _ = closer() }, true)
+	sh.mu.Unlock()
+	seg.releaseStale() // free the displaced mapping now if no scan is reading it
+	return true
+}
+
+// reindexSealedAnon is reindexSealedFile for an in-memory collection's sealed RAM segment,
+// whose sidecar is an anonymous mapping holding only the attribute index (there is no key
+// sidecar to rebuild).
+func (c *Collection) reindexSealedAnon(sh *shard, seg *segment, si *segIndex) bool {
+	mm, closer, err := sealedIndexAnon(si)
+	if err != nil {
+		return false
+	}
+	sh.mu.Lock()
+	seg.msidx.Store(mm)
+	seg.idx.Store(nil)
+	seg.swapSidecarHook(func() { _ = closer() }, false)
+	sh.mu.Unlock()
+	seg.releaseStale()
+	return true
+}
+
 // sealAndEvictShard realizes the pageable-directory RAM win (phase 3) during operation,
 // not only at reopen: for every sealed (non-active) persistent segment it ensures a key
 // sidecar exists, then evicts that segment's keys from the resident directory so they are
