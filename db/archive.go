@@ -311,3 +311,15 @@ func (t *ArchiveTable) SetRetention(r collections.Retention) error {
 	t.cfg.Retention = r
 	return t.saveConfig()
 }
+
+// SetGCFloor installs a runtime GC watermark (in the archive's MinAgeAttr units) so the next
+// Rotate may reclaim already-consumed records early: a change-feed source passes the feed's
+// GC floor (min ack over live subscribers) here to drain records every subscriber has read.
+// It only shortens retention -- it never keeps data past the configured Retention ceilings,
+// and never drops anything younger than Retention.MinAge. Unlike SetRetention this is NOT
+// persisted -- the caller re-asserts it from the current live floor each pass, so a stale
+// value can never GC data across a restart. Passing floor <= 0 clears it.
+func (t *ArchiveTable) SetGCFloor(floor float64) { t.a.SetGCFloor(floor) }
+
+// GCFloor returns the current runtime GC watermark (0 when unset).
+func (t *ArchiveTable) GCFloor() float64 { return t.a.GCFloor() }

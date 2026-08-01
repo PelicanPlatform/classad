@@ -34,11 +34,17 @@ func (c *Collection) Rotate(now float64) (int, error) {
 	}
 
 	sh := c.shards[0] // AppendOnly forces a single shard
-	// Resolve the age attribute once (needs the shared intern table on the Collection).
-	var ageID uint32
-	var ageOK bool
+	// Resolve the two independent age attributes (via the shared intern table): MaxAgeAttr for
+	// the MaxAge ceiling, MinAgeAttr for the MinAge floor and the GC-floor drain. Each is
+	// resolved only when its bound is active.
+	gcFloor := c.gcFloor
+	var maxAgeID, minAgeID uint32
+	var maxAgeOK, minAgeOK bool
 	if c.ret.MaxAgeAttr != "" && c.ret.MaxAge > 0 {
-		ageID, ageOK = c.intern.LookupID(c.ret.MaxAgeAttr)
+		maxAgeID, maxAgeOK = c.intern.LookupID(c.ret.MaxAgeAttr)
+	}
+	if c.ret.MinAgeAttr != "" && gcFloor > 0 {
+		minAgeID, minAgeOK = c.intern.LookupID(c.ret.MinAgeAttr)
 	}
 	var toReap []*segment
 	dropped := 0
@@ -49,7 +55,7 @@ func (c *Collection) Rotate(now float64) (int, error) {
 		if idx < 0 || sh.segs[idx] == sh.act {
 			break // nothing left, or only the active (still-appended) segment remains
 		}
-		if !sh.overRetention(c.ret, idx, now, ageID, ageOK) {
+		if !sh.overRetention(c.ret, idx, now, maxAgeID, maxAgeOK, minAgeID, minAgeOK, gcFloor) {
 			break
 		}
 		seg := sh.segs[idx]
@@ -84,6 +90,32 @@ func (c *Collection) SetRetention(r Retention) {
 	c.maintMu.Unlock()
 }
 
+// SetGCFloor installs a runtime GC watermark, in Retention.MinAgeAttr units, that lets Rotate
+// reclaim already-consumed records EARLY: a segment whose newest MinAgeAttr value is below
+// floor may be dropped before it reaches MaxAge. It is how a change-feed source drains records
+// every live subscriber has acknowledged (floor is the feed's GC floor, i.e. the min ack over
+// live subscribers). It only ever shortens retention -- it can never keep data past the
+// configured ceilings (a slow or absent subscriber holds a low floor, so its data simply ages
+// out under MaxAge), and it never drops anything younger than Retention.MinAge. Requires
+// MinAgeAttr set (and zone-mapped). Passing floor <= 0 clears it. Not persisted -- callers
+// re-assert it each pass from the current live floor; a stale saved value must never GC data
+// across a restart.
+func (c *Collection) SetGCFloor(floor float64) {
+	c.maintMu.Lock()
+	if floor < 0 {
+		floor = 0
+	}
+	c.gcFloor = floor
+	c.maintMu.Unlock()
+}
+
+// GCFloor returns the current runtime GC watermark (0 when unset).
+func (c *Collection) GCFloor() float64 {
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
+	return c.gcFloor
+}
+
 // Retention returns the current retention bounds.
 func (c *Collection) Retention() Retention {
 	c.maintMu.Lock()
@@ -103,11 +135,20 @@ func oldestLiveSeg(sh *shard) int {
 	return -1
 }
 
-// overRetention reports whether the segment at idx (the oldest live one) should be
-// dropped under r. Evaluated one segment at a time so count/byte bounds converge as
-// segments are reclaimed. ageID/ageOK carry the interned age attribute (resolved by the
-// caller) for MaxAge. Caller holds sh.mu.
-func (sh *shard) overRetention(r Retention, idx int, now float64, ageID uint32, ageOK bool) bool {
+// overRetention reports whether the segment at idx (the oldest live one) should be dropped
+// under r. Evaluated one segment at a time so count/byte bounds converge as segments are
+// reclaimed. maxAgeID/maxAgeOK carry the interned MaxAgeAttr (for MaxAge); minAgeID/minAgeOK
+// carry the interned MinAgeAttr (for MinAge and gcFloor, the runtime GC watermark from
+// SetGCFloor). Caller holds sh.mu.
+//
+// Two independent reasons drop a segment: (1) it exceeds a hard ceiling -- MaxSegments,
+// MaxBytes, or MaxAge -- enforced unconditionally, so neither a slow/absent consumer nor the
+// MinAge floor can keep data past the configured policy (in particular MaxBytes always wins
+// over MinAge); or (2) it has been fully consumed (its newest MinAgeAttr value is below
+// gcFloor) AND is older than the MinAge floor, letting a short-lived queue drain consumed
+// records early without ever dropping anything younger than MinAge.
+func (sh *shard) overRetention(r Retention, idx int, now float64, maxAgeID uint32, maxAgeOK bool, minAgeID uint32, minAgeOK bool, gcFloor float64) bool {
+	// Hard ceilings first: size/count/age caps that bound resource use unconditionally.
 	if r.MaxSegments > 0 {
 		live := 0
 		for _, seg := range sh.segs {
@@ -130,13 +171,18 @@ func (sh *shard) overRetention(r Retention, idx int, now float64, ageID uint32, 
 			return true
 		}
 	}
-	// MaxAgeAttr/MaxAge: drop the oldest segment when its newest value of the age
-	// attribute (its zone max, e.g. the latest CompletionDate in the segment) is older
-	// than now-MaxAge. Reuses the per-segment zone map; ageID is the interned id
-	// resolved by the caller (0/false when the age attr is not zone-mapped). The active
-	// segment has nil zones and is never dropped here.
-	if r.MaxAge > 0 && ageOK {
-		if z, ok := sh.segs[idx].zones[ageID]; ok && z.Max < now-r.MaxAge {
+	// MaxAge ceiling: newest MaxAgeAttr value older than now-MaxAge ⇒ drop, unconditionally.
+	// (A segment with no zone for the attribute carries no such value and is left to the
+	// size ceilings above; the active segment has nil zones and is never dropped here.)
+	if r.MaxAge > 0 && maxAgeOK {
+		if z, ok := sh.segs[idx].zones[maxAgeID]; ok && z.Max < now-r.MaxAge {
+			return true
+		}
+	}
+	// Early GC of consumed data: newest MinAgeAttr value below the feed's GC floor, but never
+	// younger than the MinAge minimum-retention floor.
+	if gcFloor > 0 && minAgeOK {
+		if z, ok := sh.segs[idx].zones[minAgeID]; ok && z.Max < gcFloor && (r.MinAge <= 0 || z.Max < now-r.MinAge) {
 			return true
 		}
 	}
