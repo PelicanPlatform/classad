@@ -177,7 +177,7 @@ func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []Agg
 	// which the archive tracks in O(1). This is the common `SELECT COUNT(*) FROM history`;
 	// scanning tens of thousands of records to count them would be needlessly slow.
 	if len(groupBy) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		isMatchAll(constraint) {
+		IsMatchAll(constraint) {
 		return []AggRow{{Values: []string{strconv.Itoa(t.a.Count())}}}, nil
 	}
 
@@ -197,9 +197,10 @@ func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []Agg
 	return AggregateValues(seq, groupCols, aggs, groupCol, aggCol, nil), nil
 }
 
-// isMatchAll reports whether a constraint imposes no filter (an empty string or a literal
-// "true"), so an aggregate over it covers every retained record.
-func isMatchAll(constraint string) bool {
+// IsMatchAll reports whether a constraint imposes no filter (an empty string or a literal
+// "true"), so an aggregate over it covers every record. Shared with the mutable-table
+// COUNT(*) fast path in dbrpc.
+func IsMatchAll(constraint string) bool {
 	c := strings.TrimSpace(constraint)
 	return c == "" || strings.EqualFold(c, "true")
 }

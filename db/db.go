@@ -271,8 +271,13 @@ func (db *DB) SuggestIndexes(sampleMax int) []collections.IndexSuggestion {
 	return db.c.SuggestIndexes(sampleMax)
 }
 
-// Len returns the number of committed ads.
+// Len returns the number of committed ads (including structural parent-only ads of a chained
+// collection, which Query hides -- see Collection.Len / Chained).
 func (db *DB) Len() int { return db.c.Len() }
+
+// Chained reports whether the table has structural (parent-only) ads that Query hides, so a
+// caller knows when Len equals the match-all row count (the COUNT(*) fast path).
+func (db *DB) Chained() bool { return db.c.Chained() }
 
 // LookupClassAd returns the committed ad for key (the hash table, outside any
 // transaction), or (nil, false).

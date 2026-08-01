@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
@@ -243,6 +244,21 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	if !ok {
 		return
 	}
+
+	// Fast path: an unconstrained COUNT(*) with no grouping is the collection's live row
+	// count, which it tracks in O(shards) via Len() -- no scan of every ad. This is the common
+	// `SELECT COUNT(*) FROM <table>`. Only when the collection has no hidden structural
+	// (parent-only) ads, which a match-all scan excludes but Len() counts (a chained job_queue
+	// has them; a flat table like Startd does not). Mirrors ArchiveTable.Aggregate.
+	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
+		db.IsMatchAll(constraint) && !d.Chained() {
+		frame := respHead(reqID, stStream)
+		frame = putStr(frame, strconv.Itoa(d.Len()))
+		write(frame)
+		write(respHead(reqID, stStreamEnd))
+		return
+	}
+
 	seq, err := d.QueryProject(constraint, attrs)
 	if err != nil {
 		write(respErr(reqID, err.Error()))
