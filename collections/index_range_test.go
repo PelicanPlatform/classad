@@ -859,3 +859,47 @@ func TestEqualityFoldExplain(t *testing.T) {
 			ex.Probes[1].Selectivity)
 	}
 }
+
+// TestDeadDisjunctSharedPlanConcurrent is the regression for compacting the DNF plan in
+// place. scanShardCandidatesGroups drops disjuncts it proved impossible, and the match path
+// fans that function out one goroutine per shard over a SINGLE shared plan -- so filtering
+// the slice in place both raced and let one worker's compaction change what another was
+// iterating, silently dropping live disjuncts (and with them, real matches).
+//
+// The job's Requirements below yield a DNF plan whose first disjunct is impossible and whose
+// second is not, over enough shards to keep several workers busy. Run under -race it catches
+// the write; run at all it catches the dropped matches.
+func TestDeadDisjunctSharedPlanConcurrent(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 8, CategoricalAttrs: []string{"Arch"}, ValueAttrs: []string{"Memory", "Cpus"}})
+	want := 0
+	for i := 0; i < 4000; i++ {
+		mem, cpus := (i%16+1)*512, i%8
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, fmt.Sprintf(
+			`[ Id=%d; Memory=%d; Cpus=%d; Arch="X86_64"; Requirements = true ]`, i, mem, cpus))); err != nil {
+			t.Fatal(err)
+		}
+		if cpus >= 2 && cpus <= 4 {
+			want++
+		}
+	}
+	c.Reindex()
+
+	// Disjunct 1 is impossible (`Memory > 8192 && Memory < 1024`); disjunct 2 is the real
+	// filter. If the dead disjunct's removal corrupts the shared slice, the live one goes
+	// with it and matches vanish.
+	job := mustAd(t, `[ Requirements = (TARGET.Memory > 8192 && TARGET.Memory < 1024) ||
+		(TARGET.Cpus >= 2 && TARGET.Cpus <= 4) ]`)
+	for i := 0; i < 20; i++ { // repeat: the interleaving that corrupts is scheduling-dependent
+		if got := len(c.MatchSortedRanked(job, 0)); got != want {
+			t.Fatalf("iteration %d: matched %d slots, want %d", i, got, want)
+		}
+	}
+
+	// Both disjuncts impossible: the union is empty, and no slot matches.
+	dead := mustAd(t, `[ Requirements = (TARGET.Memory > 8192 && TARGET.Memory < 1024) ||
+		(TARGET.Cpus > 4 && TARGET.Cpus < 2) ]`)
+	if got := len(c.MatchSortedRanked(dead, 0)); got != 0 {
+		t.Errorf("every disjunct impossible: matched %d slots, want 0", got)
+	}
+}

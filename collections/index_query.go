@@ -214,6 +214,17 @@ func unsatisfiableGroups(groups [][]usableProbe) bool {
 	return true
 }
 
+// anyUnsatisfiableGroup reports whether SOME disjunct is impossible, i.e. whether dropping
+// the dead ones would change the plan at all.
+func anyUnsatisfiableGroup(groups [][]usableProbe) bool {
+	for _, g := range groups {
+		if unsatisfiable(g) {
+			return true
+		}
+	}
+	return false
+}
+
 // isRangeOp reports whether op is an indexable numeric range comparison.
 func isRangeOp(op string) bool {
 	switch op {
@@ -232,6 +243,10 @@ func isRangeOp(op string) bool {
 // Repeated bounds on one side tighten (`Memory > 1024 && Memory > 2048` keeps > 2048).
 // Probes on other attributes, categorical probes, and non-range operators pass through
 // untouched and keep their input order, so the plan stays deterministic.
+// coalesceRanges and foldEqualities compact and rewrite `out` IN PLACE. That is safe only
+// because both run inside planIndex, on a slice it built for this call and has not yet
+// returned -- a plan becomes shared (one goroutine per shard, see indexedMatches) only once
+// planning is done. Do not call either on a slice a caller already holds.
 func coalesceRanges(out []usableProbe) []usableProbe {
 	// Fast path: nothing to merge unless two range probes share an attribute.
 	if !hasMergeableRanges(out) {
@@ -1260,8 +1275,12 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 		return true // every disjunct is impossible: the union is empty (see scanShardCandidates)
 	}
 	// An impossible disjunct contributes nothing to the union, so drop it rather than
-	// building its (empty) candidate set per window.
-	if kept := groups[:0]; true {
+	// building its (empty) candidate set per window. groups is SHARED -- the match path
+	// fans this function out one goroutine per shard over a single plan -- so the filtered
+	// slice must be freshly allocated, never a compaction in place. The guard keeps the
+	// common case allocation-free.
+	if anyUnsatisfiableGroup(groups) {
+		kept := make([][]usableProbe, 0, len(groups))
 		for _, g := range groups {
 			if !unsatisfiable(g) {
 				kept = append(kept, g)
