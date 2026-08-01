@@ -61,8 +61,9 @@ type MatchExplain struct {
 	Probes []ProbeExplain `json:"probes"`
 	// IndexUsable is how many probes prune via an index.
 	IndexUsable int `json:"indexUsable"`
-	// Plan is the access path over the resource slots: "indexed" (visit only candidate
-	// slots), "parallel-scan", or "serial-scan" (match every slot).
+	// Plan is the access path over the resource slots: "empty" (the request contradicts
+	// itself, so no slot can match), "indexed" (visit only candidate slots),
+	// "parallel-scan", or "serial-scan" (match every slot).
 	Plan        string `json:"plan"`
 	Parallelism int    `json:"parallelism"`
 	Shards      int    `json:"shards"`
@@ -184,9 +185,14 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 			ex.Probes = append(ex.Probes, pe)
 		}
 	}
-	if prunable {
+	switch {
+	case unsatisfiableGroups(groups):
+		// The job's Requirements, with its constants baked in, contradict themselves: no
+		// slot can ever match, and the negotiator visits none.
+		ex.Plan = "empty"
+	case prunable:
 		ex.Plan = "indexed"
-	} else {
+	default:
 		ex.Plan = scanPlanName(c.queryPar)
 	}
 	c.meldTargetConstraint(&ex, targetConstraint)

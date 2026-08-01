@@ -2,6 +2,7 @@ package collections
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -380,5 +381,163 @@ func indexedVsBrute(t *testing.T, c *Collection, src map[int]*classad.ClassAd, c
 			t.Errorf("%s: id mismatch at %d (%d vs %d)", constraint, i, got[i], want[i])
 			return
 		}
+	}
+}
+
+// TestEmptyBandSemantics is the safety proof for eliminating an impossible band ahead of
+// the exception set. Every other planner skip must re-verify exceptional records because
+// the INDEX cannot classify them; this one claims no ClassAd value of ANY shape can satisfy
+// both bounds. If that ever stops holding, the elimination becomes a wrong-answer bug, so
+// it is pinned here across the whole value space rather than argued from three-valued logic.
+func TestEmptyBandSemantics(t *testing.T) {
+	t.Parallel()
+	values := []string{
+		`512`, `1023`, `2049`, `4096`, `0`, `-1`, // numbers either side of both bounds
+		`1024.5`, `2048.0`, // reals
+		`"lots"`, `"1500"`, `""`, // strings, including one that looks numeric
+		`true`, `false`, // booleans
+		`{1000, 3000}`, // list spanning both bounds
+		`[ a = 1 ]`,    // nested ad
+		`Other + 1`,    // expression over a missing attr -> undefined
+		`1/0`,          // error
+		`undefined`, `error`,
+	}
+	for _, qs := range []string{
+		`Memory < 1024 && Memory > 2048`,
+		`Memory > 2048 && Memory < 1024`,
+		`Memory >= 1024 && Memory <= 512`,
+		`Memory > 700 && Memory <= 700`, // single point, low bound exclusive
+		`Memory >= 700 && Memory < 700`, // single point, high bound exclusive
+	} {
+		q := mustQuery(t, qs)
+		for _, v := range values {
+			if q.Matches(mustAd(t, fmt.Sprintf(`[ Memory = %s ]`, v))) {
+				t.Errorf("%s matched an ad with Memory = %s: the band is not empty after all", qs, v)
+			}
+		}
+		if q.Matches(mustAd(t, `[ Other = 5 ]`)) {
+			t.Errorf("%s matched an ad with no Memory at all", qs)
+		}
+	}
+	// Controls, so the test can only pass for the right reason.
+	if !mustQuery(t, `Memory > 1024 && Memory < 2048`).Matches(mustAd(t, `[ Memory = 1500 ]`)) {
+		t.Error("control: 1500 should match the band (1024, 2048)")
+	}
+	if !mustQuery(t, `Memory >= 700 && Memory <= 700`).Matches(mustAd(t, `[ Memory = 700 ]`)) {
+		t.Error("control: a single-point band with both bounds inclusive should match")
+	}
+}
+
+// TestEmptyBandDetection pins which coalesced bands are recognized as impossible.
+func TestEmptyBandDetection(t *testing.T) {
+	t.Parallel()
+	band := func(loOp string, lo float64, hiOp string, hi float64) usableProbe {
+		return usableProbe{attrID: 1, op: loOp, fvals: []float64{lo}, hiOp: hiOp, hiVal: hi}
+	}
+	tests := []struct {
+		name string
+		up   usableProbe
+		want bool
+	}{
+		{"inverted", band(">", 2048, "<", 1024), true},
+		{"inverted inclusive", band(">=", 1024, "<=", 512), true},
+		{"point, low exclusive", band(">", 700, "<=", 700), true},
+		{"point, high exclusive", band(">=", 700, "<", 700), true},
+		{"point, both exclusive", band(">", 700, "<", 700), true},
+		{"point, both inclusive", band(">=", 700, "<=", 700), false},
+		{"ordinary band", band(">", 1024, "<", 4096), false},
+		{"one-sided", usableProbe{attrID: 1, op: ">", fvals: []float64{1024}}, false},
+		{"NaN low", band(">", math.NaN(), "<", 1024), false},
+		{"NaN high", band(">", 1024, "<", math.NaN()), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.up.emptyBand(); got != tc.want {
+				t.Errorf("emptyBand() = %v, want %v", got, tc.want)
+			}
+			if got := unsatisfiable([]usableProbe{tc.up}); got != tc.want {
+				t.Errorf("unsatisfiable() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEmptyBandEliminated is the behavioural half: an impossible constraint must be planned
+// as "empty", admit no candidates at all (not even the exception set), and touch no record.
+func TestEmptyBandEliminated(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 3000; i++ {
+		text := fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory=%d ]`, i, i%10, (i%16+1)*512)
+		if i%97 == 0 { // exceptions: the index cannot classify these
+			text = fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory="lots" ]`, i, i%10)
+		}
+		ad := mustAd(t, text)
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	for _, qs := range []string{
+		`Memory < 1024 && Memory > 2048`,
+		`Memory > 2048 && Memory < 1024 && Owner == "u3"`,
+		`Memory >= 1024 && Memory <= 512`,
+	} {
+		u := planOf(t, c, qs)
+		if !unsatisfiable(u) {
+			t.Errorf("%s: plan should be unsatisfiable, got %+v", qs, u)
+		}
+		si := firstSegIndex(t, c)
+		if !si.skipsPrefix(u) {
+			t.Errorf("%s: the indexed prefix should be skippable despite the exception set", qs)
+		}
+		if cand := si.candidateOffsets(u); !cand.IsEmpty() {
+			t.Errorf("%s: %d candidates, want 0 (the exception set must not survive)", qs, cand.GetCardinality())
+		}
+		if ex := c.ExplainQuery(mustQuery(t, qs)); ex.Plan != "empty" {
+			t.Errorf("%s: plan = %q, want \"empty\"", qs, ex.Plan)
+		}
+		indexedVsBrute(t, c, src, qs) // and it still returns exactly nothing
+	}
+
+	// A satisfiable band on the same attribute must be unaffected.
+	ok := planOf(t, c, `Memory > 1024 && Memory < 4096`)
+	if unsatisfiable(ok) {
+		t.Error("a satisfiable band must not be eliminated")
+	}
+	if ex := c.ExplainQuery(mustQuery(t, `Memory > 1024 && Memory < 4096`)); ex.Plan != "indexed" {
+		t.Errorf("satisfiable band plan = %q, want \"indexed\"", ex.Plan)
+	}
+}
+
+// TestEmptyBandDisjunctionKept checks the DNF rule: an impossible disjunct contributes
+// nothing to a union, but one satisfiable disjunct keeps the query alive.
+func TestEmptyBandDisjunctionKept(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 1, ValueAttrs: []string{"Memory", "Cpus"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 2000; i++ {
+		ad := mustAd(t, fmt.Sprintf(`[ ID=%d; Memory=%d; Cpus=%d ]`, i, (i%16+1)*512, i%8))
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	// One dead disjunct, one live: results must equal the live one alone.
+	live := `(Memory < 1024 && Memory > 2048) || (Cpus >= 2 && Cpus <= 4)`
+	indexedVsBrute(t, c, src, live)
+	if len(queryIDs(t, c, mustQuery(t, live))) == 0 {
+		t.Error("the satisfiable disjunct should still return ads")
+	}
+	// Both disjuncts dead: nothing, and every group is recognized as impossible.
+	dead := `(Memory < 1024 && Memory > 2048) || (Cpus > 4 && Cpus < 2)`
+	indexedVsBrute(t, c, src, dead)
+	if groups, prunable := c.planIndexGroups(mustQuery(t, dead).ProbePlan()); !prunable || !unsatisfiableGroups(groups) {
+		t.Errorf("both disjuncts impossible: prunable=%v unsatisfiable=%v", prunable, unsatisfiableGroups(groups))
 	}
 }

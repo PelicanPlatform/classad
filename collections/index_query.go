@@ -147,6 +147,58 @@ type usableProbe struct {
 // twoSided reports whether up carries both bounds of a numeric band.
 func (up usableProbe) twoSided() bool { return up.hiOp != "" }
 
+// emptyBand reports whether a coalesced range admits no value whatsoever -- the query said
+// `Memory < 1024 && Memory > 2048`, or `Memory > 700 && Memory <= 700`.
+//
+// This is a property of the PREDICATE, not of any segment's data, which makes it stronger
+// than every other skip in the planner: those must re-verify the exception set (records
+// whose value is present but not an indexed literal), because the index cannot classify
+// them. Here there is nothing to classify. A conjunct must be TRUE for an ad to match, and
+// no ClassAd value -- number, string, list, boolean, undefined, or error -- can be both
+// below the low bound and above the high one at the same time (three-valued logic makes
+// the non-numeric cases ERROR/UNDEFINED, which are not TRUE either). See
+// TestEmptyBandSemantics, which pins that across every value shape.
+//
+// A NaN bound compares false everywhere, so it reports not-empty and the query proceeds
+// normally rather than eliminating anything on the strength of a NaN.
+func (up usableProbe) emptyBand() bool {
+	if !up.twoSided() || len(up.fvals) == 0 {
+		return false
+	}
+	lo, hi := up.fvals[0], up.hiVal
+	if lo > hi {
+		return true
+	}
+	// A single-point band is satisfiable only when BOTH bounds include the point.
+	return lo == hi && (up.op == ">" || up.hiOp == "<")
+}
+
+// unsatisfiable reports whether a conjunction can never be satisfied, because one of its
+// probes is an empty band. Every probe in a group must hold, so one impossible conjunct
+// empties the group -- no segment need be opened at all.
+func unsatisfiable(usable []usableProbe) bool {
+	for _, up := range usable {
+		if up.emptyBand() {
+			return true
+		}
+	}
+	return false
+}
+
+// unsatisfiableGroups reports whether a DNF plan can never be satisfied. A union is empty
+// only when EVERY disjunct is, so one satisfiable group keeps the whole plan alive.
+func unsatisfiableGroups(groups [][]usableProbe) bool {
+	if len(groups) == 0 {
+		return false
+	}
+	for _, g := range groups {
+		if !unsatisfiable(g) {
+			return false
+		}
+	}
+	return true
+}
+
 // isRangeOp reports whether op is an indexable numeric range comparison.
 func isRangeOp(op string) bool {
 	switch op {
@@ -345,7 +397,8 @@ type QueryExplain struct {
 	// IndexUsable is how many probes can prune via an index.
 	IndexUsable int `json:"indexUsable"`
 	// Plan is the chosen access path: "indexed" (visit index candidates),
-	// "parallel-scan", or "serial-scan" (full scan).
+	// "parallel-scan", "serial-scan" (full scan), or "empty" (a contradictory conjunct
+	// makes the query unsatisfiable, so no records are visited at all).
 	Plan string `json:"plan"`
 	// Parallelism is the configured per-query worker cap; Shards is the shard count.
 	Parallelism int `json:"parallelism"`
@@ -387,6 +440,11 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		ex.Probes = append(ex.Probes, pe)
 	}
 	switch {
+	case unsatisfiable(usable):
+		// A contradictory conjunct (`Memory < 1024 && Memory > 2048`) makes the whole
+		// query impossible, so no shard is even opened. Naming it is the point: this is
+		// the answer to "why does my constraint return nothing".
+		ex.Plan = "empty"
 	case len(usable) > 0:
 		ex.Plan = "indexed"
 	case c.queryPar > 1:
@@ -876,6 +934,12 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 // (written last) before the indexed prefix, each in descending offset order. A consumer
 // that stops early then gets the newest matches -- a pushed-down LIMIT through the index.
 func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, reverse bool, onCand func(w []byte) bool) bool {
+	if unsatisfiable(usable) {
+		// The conjunction is impossible on its face; nothing in this shard -- indexed
+		// prefix, un-indexed tail, or exception set -- can match. Skip the snapshot too,
+		// so an impossible query costs no pins, no page faults, and no decompression.
+		return true
+	}
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var dbuf []byte
@@ -1031,6 +1095,19 @@ func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, q
 // than proving that per group -- but a window whose index does not cover all groups,
 // and every covered window's un-indexed tail, are still full-scanned.
 func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, reverse bool, onCand func(w []byte) bool) bool {
+	if unsatisfiableGroups(groups) {
+		return true // every disjunct is impossible: the union is empty (see scanShardCandidates)
+	}
+	// An impossible disjunct contributes nothing to the union, so drop it rather than
+	// building its (empty) candidate set per window.
+	if kept := groups[:0]; true {
+		for _, g := range groups {
+			if !unsatisfiable(g) {
+				kept = append(kept, g)
+			}
+		}
+		groups = kept
+	}
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var dbuf []byte
