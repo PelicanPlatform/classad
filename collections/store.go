@@ -714,7 +714,9 @@ func (c *Collection) Flatten(key []byte) (*classad.ClassAd, bool) {
 	return c.Get(key)
 }
 
-// Len returns the number of live keys across all shards.
+// Len returns the number of live keys across all shards. Note this includes structural
+// (parent-only) ads of a chained collection, which Scan/Query hide -- so Len equals the
+// number of rows a match-all query returns only when the collection is not Chained.
 func (c *Collection) Len() int {
 	n := 0
 	for _, sh := range c.shards {
@@ -724,6 +726,11 @@ func (c *Collection) Len() int {
 	}
 	return n
 }
+
+// Chained reports whether the collection has structural (parent-only) ads that Scan/Query
+// hide (HTCondor cluster/proc chaining). When false, Len is exactly the match-all row count,
+// which the COUNT(*) fast path relies on.
+func (c *Collection) Chained() bool { return c.isStructural != nil }
 
 // Keys returns every visible key in the collection at a consistent per-shard
 // snapshot, in no particular order. Structural (parent-only) keys of a chained
