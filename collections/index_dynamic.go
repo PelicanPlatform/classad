@@ -78,6 +78,12 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 		}
 		next.gen = cur.gen + 1
 		if c.spec.CompareAndSwap(cur, next) {
+			// An append-only collection zones every value-indexed attribute (New wires
+			// ZoneAttrs and ValueAttrs together), so a value index added at runtime must
+			// extend the zone set too -- otherwise a range query on it would prune
+			// postings but never whole segments, unlike an identical index configured at
+			// creation. No-op for a mutable collection.
+			c.addZoneAttrs(value)
 			return true
 		}
 	}
@@ -115,6 +121,37 @@ func (c *Collection) DropIndex(names ...string) bool {
 			return true
 		}
 	}
+}
+
+// StaleIndexSegments counts sealed segments whose index sidecar was built under an older
+// index configuration than the current one, and the total number of sealed segments.
+//
+// A sealed segment's sidecar is immutable: Reindex deliberately skips it, so AddIndex /
+// DropIndex only reach segments sealed afterwards. Rewrite rebuilds every segment and
+// therefore every sidecar, which is how an existing archive picks up a new index -- at the
+// cost of re-encoding the whole store. Reporting the count lets `.indexes` say plainly that
+// an added index is not live everywhere yet instead of leaving the operator to wonder.
+func (c *Collection) StaleIndexSegments() (stale, sealed int) {
+	gen := c.spec.Load().gen
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		segs := append([]*segment(nil), sh.segs...)
+		sh.mu.RUnlock()
+		for _, seg := range segs {
+			if seg == nil {
+				continue
+			}
+			mm := seg.msidx.Load()
+			if mm == nil {
+				continue // not sealed to a sidecar: Reindex still rebuilds it in place
+			}
+			sealed++
+			if mm.specGen != gen {
+				stale++
+			}
+		}
+	}
+	return stale, sealed
 }
 
 // IndexedAttrs returns the currently-indexed attribute names, split by kind, in the

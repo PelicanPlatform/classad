@@ -82,6 +82,54 @@ func computeSegZones(data []byte, upto int, attrs []zoneAttr, inline bool, codec
 	return zones
 }
 
+// ZoneAttrs returns the attributes this collection keeps per-segment [min,max] zone maps
+// on, in configuration order (explicit ZoneAttrs first, then the value-indexed attributes
+// that are zoned automatically). Empty for a mutable collection, which has no zone maps.
+// Diagnostic only -- it is how `.indexes` on an archive can show which range queries prune
+// whole segments rather than only postings.
+func (c *Collection) ZoneAttrs() []string {
+	if !c.hasZones.Load() || len(c.shards) == 0 {
+		return nil
+	}
+	sh := c.shards[0] // every shard carries the same zone-attribute list
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	names := make([]string, 0, len(sh.zoneAttrs))
+	for _, za := range sh.zoneAttrs {
+		names = append(names, za.name)
+	}
+	return names
+}
+
+// addZoneAttrs extends the zone-mapped attribute set of an append-only collection with
+// names not already covered, so a value index added at RUNTIME gets whole-segment pruning
+// too (construction wires ZoneAttrs + ValueAttrs together; see New). Segments already
+// sealed keep the zone map they were sealed with -- a nil entry simply never prunes -- so
+// the new attribute starts pruning from the next segment sealed, or across the whole
+// archive after a Rewrite. No-op unless the collection is append-only.
+func (c *Collection) addZoneAttrs(names []string) {
+	if !c.appendOnly() || len(names) == 0 {
+		return
+	}
+	for _, sh := range c.shards {
+		sh.mu.Lock()
+		seen := make(map[uint32]struct{}, len(sh.zoneAttrs))
+		for _, za := range sh.zoneAttrs {
+			seen[za.id] = struct{}{}
+		}
+		for _, n := range names {
+			id := c.intern.Intern(n)
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			sh.zoneAttrs = append(sh.zoneAttrs, zoneAttr{name: n, id: id})
+		}
+		sh.mu.Unlock()
+	}
+	c.hasZones.Store(true)
+}
+
 // sealZones computes and installs zones for a segment that has just stopped being the
 // active append target. No-op unless the shard is append-only with zone attributes
 // configured. Caller holds the shard write lock.

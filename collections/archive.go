@@ -261,9 +261,14 @@ func (a *Archive) RetrainDict(sampleMax int) (int, error) { return a.c.RetrainDi
 // records rewritten.
 func (a *Archive) Rewrite() int { return a.c.Rewrite() }
 
-// AddIndex adds per-segment indexes on the named categorical and/or value attributes and
-// rebuilds them over the existing segments, so subsequent queries on those attributes are
-// accelerated. Returns false if the index set was unchanged.
+// AddIndex adds per-segment indexes on the named categorical and/or value attributes.
+// Returns false if the index set was unchanged.
+//
+// Reach: it takes effect immediately for segments not yet sealed to an immutable sidecar,
+// and for every segment sealed from now on. Segments ALREADY sealed keep the index they
+// were sealed with -- Reindex cannot rewrite an immutable sidecar -- so an existing archive
+// only picks the new index up everywhere after a Rewrite, which re-encodes the whole store.
+// StaleIndexSegments reports how many segments are still on the old configuration.
 func (a *Archive) AddIndex(categorical, value []string) bool {
 	if !a.c.AddIndex(categorical, value) {
 		return false
@@ -303,6 +308,14 @@ func (a *Archive) IndexSizes() IndexSizes { return a.c.IndexSizes() }
 
 // IndexedAttrs returns the categorical and value attributes the archive indexes.
 func (a *Archive) IndexedAttrs() (categorical, value []string) { return a.c.IndexedAttrs() }
+
+// ZoneAttrs returns the attributes carrying per-segment [min,max] zone maps -- the ones a
+// range query prunes whole segments on, not just postings.
+func (a *Archive) ZoneAttrs() []string { return a.c.ZoneAttrs() }
+
+// StaleIndexSegments reports how many of the archive's sealed segments still carry an index
+// built under an older configuration, and how many are sealed in total. See AddIndex.
+func (a *Archive) StaleIndexSegments() (stale, sealed int) { return a.c.StaleIndexSegments() }
 
 // --- zone-map helpers (shared with the Collection's per-segment zone maps) ---
 

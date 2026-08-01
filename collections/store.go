@@ -257,8 +257,10 @@ type Collection struct {
 
 	// hasZones caches whether any per-segment zone maps are configured (see
 	// Options.ZoneAttrs / zonemap.go), so the query hot path skips probe extraction
-	// when zone pruning is off. Append-only only.
-	hasZones bool
+	// when zone pruning is off. Append-only only. Atomic because a runtime AddIndex on
+	// an append-only collection can turn zone maps on (see addZoneAttrs) while queries
+	// are reading it.
+	hasZones atomic.Bool
 
 	// Watch (see watch.go / docs/WATCH.md). hub is nil unless WatchHistory > 0.
 	hub           *watchHub
@@ -474,7 +476,7 @@ func New(opts Options) *Collection {
 		for _, n := range opts.ValueAttrs { // value-indexed attrs are zoned automatically
 			addZone(n)
 		}
-		c.hasZones = len(zattrs) > 0
+		c.hasZones.Store(len(zattrs) > 0)
 		for _, sh := range shards {
 			sh.zoneAttrs = zattrs
 		}
@@ -806,7 +808,7 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 			ws:       ws,
 			resolver: ws.resolve, // bound once to avoid a per-ad closure allocation
 		}
-		if c.hasZones {
+		if c.hasZones.Load() {
 			qp.zoneProbes = q.Probes() // enable sealed-segment zone pruning
 		}
 		// Chained collection: a serial two-pass scan per shard resolves each ad's

@@ -37,6 +37,16 @@ type Diagnostics struct {
 	Archive      bool            `json:"archive,omitempty"`
 	Retention    *db.Retention   `json:"retention,omitempty"`
 	SidecarSizes db.SidecarSizes `json:"sidecarSizes"`
+
+	// ZoneAttrs are the archive attributes carrying per-segment [min,max] zone maps: a
+	// range query on one of these prunes whole segments, not just postings.
+	ZoneAttrs []string `json:"zoneAttrs,omitempty"`
+	// SealedSegments is how many of the archive's segments are sealed to an immutable
+	// index sidecar, and StaleIndexSegments how many of those were sealed under an older
+	// index configuration -- i.e. how much of the archive a runtime .addindex/.dropindex
+	// has NOT reached yet (only a rewrite reaches them).
+	SealedSegments     int `json:"sealedSegments,omitempty"`
+	StaleIndexSegments int `json:"staleIndexSegments,omitempty"`
 }
 
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
@@ -68,6 +78,7 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 	cat, val := a.IndexedAttrs()
 	ret := a.Retention()
+	stale, sealed := a.StaleIndexSegments()
 	d := Diagnostics{
 		Stats:              a.Stats(),
 		OpStats:            a.OpStats(),
@@ -78,6 +89,9 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 		Archive:            true,
 		Retention:          &ret,
 		SidecarSizes:       a.SidecarSizes(),
+		ZoneAttrs:          a.ZoneAttrs(),
+		SealedSegments:     sealed,
+		StaleIndexSegments: stale,
 	}
 	return json.Marshal(d)
 }
@@ -234,12 +248,12 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.categorical needs at least one attribute")
 		}
-		return changedMsg("categorical index on "+join(args), a.AddIndex(args, nil)), nil
+		return archiveIndexMsg(a, changedMsg("categorical index on "+join(args), a.AddIndex(args, nil))), nil
 	case "index.add.value":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.add.value needs at least one attribute")
 		}
-		return changedMsg("value index on "+join(args), a.AddIndex(nil, args)), nil
+		return archiveIndexMsg(a, changedMsg("value index on "+join(args), a.AddIndex(nil, args))), nil
 	case "index.drop":
 		if len(args) == 0 {
 			return "", fmt.Errorf("index.drop needs at least one attribute")
@@ -248,7 +262,7 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 		if changed {
 			a.Reindex()
 		}
-		return changedMsg("dropped index on "+join(args), changed), nil
+		return archiveIndexMsg(a, changedMsg("dropped index on "+join(args), changed)), nil
 	case "index.reindex":
 		a.Reindex()
 		return "reindexed", nil
@@ -284,6 +298,19 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 	default:
 		return "", fmt.Errorf("unknown archive admin action %q", action)
 	}
+}
+
+// archiveIndexMsg appends the sealed-segment reach to an index-change acknowledgement. A
+// sealed segment's index sidecar is immutable, so an index added or dropped now applies to
+// segments sealed from here on; the already-sealed ones keep what they were sealed with
+// until a rewrite re-encodes them. Saying so is the difference between an operator seeing
+// "no change in query time" and understanding why.
+func archiveIndexMsg(a *db.ArchiveTable, msg string) string {
+	stale, _ := a.StaleIndexSegments()
+	if stale == 0 {
+		return msg
+	}
+	return fmt.Sprintf("%s; %d already-sealed segment(s) keep the previous index set -- run a rewrite to apply it to them", msg, stale)
 }
 
 // parseRetentionArgs parses `<maxSegments> <maxBytes> [maxAgeAttr maxAgeSeconds]` into a

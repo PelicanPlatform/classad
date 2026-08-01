@@ -290,6 +290,16 @@ func (t *ArchiveTable) SidecarSizes() SidecarSizes { return t.a.SidecarSizes() }
 // IndexedAttrs returns the archive's categorical and value index attributes.
 func (t *ArchiveTable) IndexedAttrs() (categorical, value []string) { return t.a.IndexedAttrs() }
 
+// ZoneAttrs returns the attributes carrying per-segment [min,max] zone maps, on which a
+// range query prunes whole segments rather than only postings.
+func (t *ArchiveTable) ZoneAttrs() []string { return t.a.ZoneAttrs() }
+
+// StaleIndexSegments reports how many sealed segments still carry an index built under an
+// older configuration, and how many are sealed in total (see collections.Archive.AddIndex:
+// a sealed sidecar is immutable, so a runtime index change reaches old segments only via
+// a Rewrite).
+func (t *ArchiveTable) StaleIndexSegments() (stale, sealed int) { return t.a.StaleIndexSegments() }
+
 // Retention returns the archive's current retention bounds.
 func (t *ArchiveTable) Retention() collections.Retention { return t.a.Retention() }
 

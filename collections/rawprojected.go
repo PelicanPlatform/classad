@@ -56,7 +56,7 @@ func (c *Collection) QueryRawProjected(q *vm.Query, projection []string, chaseRe
 			resolver: ws.resolve,
 		}
 		probes := q.Probes()
-		if c.hasZones {
+		if c.hasZones.Load() {
 			qp.zoneProbes = probes // enable sealed-segment zone pruning (mirrors Query)
 		}
 		c.demand.record(probes)
