@@ -121,6 +121,15 @@ func indexCoversGroups(ix indexPrimitives, groups [][]usableProbe) bool {
 // probe, so the query can skip it (and full-scan only the un-indexed tail). Correctness-
 // critical: true only when certain. An exceptional record forbids a skip; `!=` never skips.
 func indexCanSkip(ix indexPrimitives, up usableProbe) bool {
+	// A probe the planner proved impossible -- an inverted band (`Memory < 1024 && Memory
+	// > 2048`), or an equality whose values a range on the same attribute excluded -- is
+	// unsatisfiable for every value, so it skips ahead of and independently of the
+	// per-segment stats. Unlike the data-driven skips below it need not spare the exception
+	// set: those records are re-verified because the INDEX cannot classify them, but no
+	// value of any type can satisfy the constraint. See usableProbe.neverMatches.
+	if up.neverMatches() {
+		return true
+	}
 	s := ix.statsFor(up)
 	if s == nil || s.exc > 0 {
 		return false
@@ -233,6 +242,9 @@ func estCandidatesFromStats(s *segStats, up usableProbe) float64 {
 // lowFrac + highFrac - 1, so a narrow band scores far more selective than either side
 // alone -- which is the point of coalescing them: the planner now applies the band first.
 func (s *segStats) estBand(up usableProbe) float64 {
+	if up.emptyBand() {
+		return 0 // admits nothing: the most selective probe there is, so apply it first
+	}
 	lo := s.estRange(up.op, up.fvals[0])
 	hi := s.estRange(up.hiOp, up.hiVal)
 	if !s.hasRange || s.max <= s.min {
@@ -263,6 +275,13 @@ func indexSelectivityOrder(ix indexPrimitives, usable []usableProbe) []int {
 // store re-verifies), applying the most-selective probe first so the roaring intersection
 // shrinks fastest. nil means "no candidates".
 func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bitmap {
+	// An impossible band admits nothing at all -- not even the exception set a range
+	// probe otherwise unions in, since no value of any type can satisfy both bounds
+	// (see usableProbe.emptyBand). Answering here keeps both index tiers consistent
+	// without either probeOffsets having to special-case it.
+	if unsatisfiable(usable) {
+		return roaring.New()
+	}
 	switch len(usable) {
 	case 0:
 		return nil
@@ -290,6 +309,11 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 func indexCandidateOffsetsGroups(ix indexPrimitives, groups [][]usableProbe) *roaring.Bitmap {
 	if len(groups) == 0 {
 		return nil
+	}
+	// An impossible disjunct contributes nothing to the union; if every one is impossible
+	// the union is empty.
+	if unsatisfiableGroups(groups) {
+		return roaring.New()
 	}
 	// Each group's intersection is computed first, then the disjuncts are unioned in one
 	// batch (see unionPostings) rather than folded pairwise.

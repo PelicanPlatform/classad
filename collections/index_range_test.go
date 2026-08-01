@@ -2,6 +2,7 @@ package collections
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"testing"
 
@@ -45,6 +46,28 @@ func TestCoalesceRanges(t *testing.T) {
 		name: "equal bound prefers exclusive",
 		in:   []usableProbe{val(">=", 1024), val(">", 1024), val("<=", 4096), val("<", 4096)},
 		want: []usableProbe{{attrID: 1, op: ">", fvals: []float64{1024}, hiOp: "<", hiVal: 4096}},
+	}, {
+		// Same-side bounds subsume: the tighter one is the whole constraint, and the
+		// result stays one-sided (no upper bound was ever given).
+		name: "same side tightens to the stricter bound",
+		in:   []usableProbe{val(">", 1024), val(">", 512)},
+		want: []usableProbe{val(">", 1024)},
+	}, {
+		name: "same side tightens regardless of order",
+		in:   []usableProbe{val(">", 512), val(">", 1024)},
+		want: []usableProbe{val(">", 1024)},
+	}, {
+		name: "same side upper bounds tighten",
+		in:   []usableProbe{val("<", 4096), val("<", 8192)},
+		want: []usableProbe{val("<", 4096)},
+	}, {
+		name: "same side equal value prefers exclusive",
+		in:   []usableProbe{val(">=", 1024), val(">", 1024)},
+		want: []usableProbe{val(">", 1024)},
+	}, {
+		name: "three same-side bounds collapse to one",
+		in:   []usableProbe{val(">", 512), val(">", 2048), val(">", 1024)},
+		want: []usableProbe{val(">", 2048)},
 	}, {
 		name: "one sided untouched",
 		in:   []usableProbe{val(">", 1024)},
@@ -194,7 +217,7 @@ func TestRangeBandPrunesKeyRun(t *testing.T) {
 	}
 }
 
-// TestRangeBandBandsExplain checks that .explain attributes the band's selectivity to each
+// TestRangeBandExplain checks that .explain attributes the band's selectivity to each
 // half rather than reporting two barely-selective one-sided probes.
 func TestRangeBandExplain(t *testing.T) {
 	t.Parallel()
@@ -219,8 +242,8 @@ func TestRangeBandExplain(t *testing.T) {
 		t.Fatalf("want both conjuncts explained, got %+v", ex.Probes)
 	}
 	for _, pe := range ex.Probes {
-		if !pe.Banded {
-			t.Errorf("%s %s: want Banded", pe.Attr, pe.Op)
+		if !pe.Coalesced {
+			t.Errorf("%s %s: want Coalesced", pe.Attr, pe.Op)
 		}
 		// ~200 of 2000 values fall in the band; each half alone would be ~half the set.
 		if !pe.HasSelectivity || pe.Selectivity > 0.25 {
@@ -380,5 +403,503 @@ func indexedVsBrute(t *testing.T, c *Collection, src map[int]*classad.ClassAd, c
 			t.Errorf("%s: id mismatch at %d (%d vs %d)", constraint, i, got[i], want[i])
 			return
 		}
+	}
+}
+
+// TestEmptyBandSemantics is the safety proof for eliminating an impossible band ahead of
+// the exception set. Every other planner skip must re-verify exceptional records because
+// the INDEX cannot classify them; this one claims no ClassAd value of ANY shape can satisfy
+// both bounds. If that ever stops holding, the elimination becomes a wrong-answer bug, so
+// it is pinned here across the whole value space rather than argued from three-valued logic.
+func TestEmptyBandSemantics(t *testing.T) {
+	t.Parallel()
+	values := []string{
+		`512`, `1023`, `2049`, `4096`, `0`, `-1`, // numbers either side of both bounds
+		`1024.5`, `2048.0`, // reals
+		`"lots"`, `"1500"`, `""`, // strings, including one that looks numeric
+		`true`, `false`, // booleans
+		`{1000, 3000}`, // list spanning both bounds
+		`[ a = 1 ]`,    // nested ad
+		`Other + 1`,    // expression over a missing attr -> undefined
+		`1/0`,          // error
+		`undefined`, `error`,
+	}
+	for _, qs := range []string{
+		`Memory < 1024 && Memory > 2048`,
+		`Memory > 2048 && Memory < 1024`,
+		`Memory >= 1024 && Memory <= 512`,
+		`Memory > 700 && Memory <= 700`, // single point, low bound exclusive
+		`Memory >= 700 && Memory < 700`, // single point, high bound exclusive
+	} {
+		q := mustQuery(t, qs)
+		for _, v := range values {
+			if q.Matches(mustAd(t, fmt.Sprintf(`[ Memory = %s ]`, v))) {
+				t.Errorf("%s matched an ad with Memory = %s: the band is not empty after all", qs, v)
+			}
+		}
+		if q.Matches(mustAd(t, `[ Other = 5 ]`)) {
+			t.Errorf("%s matched an ad with no Memory at all", qs)
+		}
+	}
+	// Controls, so the test can only pass for the right reason.
+	if !mustQuery(t, `Memory > 1024 && Memory < 2048`).Matches(mustAd(t, `[ Memory = 1500 ]`)) {
+		t.Error("control: 1500 should match the band (1024, 2048)")
+	}
+	if !mustQuery(t, `Memory >= 700 && Memory <= 700`).Matches(mustAd(t, `[ Memory = 700 ]`)) {
+		t.Error("control: a single-point band with both bounds inclusive should match")
+	}
+}
+
+// TestEmptyBandDetection pins which coalesced bands are recognized as impossible.
+func TestEmptyBandDetection(t *testing.T) {
+	t.Parallel()
+	band := func(loOp string, lo float64, hiOp string, hi float64) usableProbe {
+		return usableProbe{attrID: 1, op: loOp, fvals: []float64{lo}, hiOp: hiOp, hiVal: hi}
+	}
+	tests := []struct {
+		name string
+		up   usableProbe
+		want bool
+	}{
+		{"inverted", band(">", 2048, "<", 1024), true},
+		{"inverted inclusive", band(">=", 1024, "<=", 512), true},
+		{"point, low exclusive", band(">", 700, "<=", 700), true},
+		{"point, high exclusive", band(">=", 700, "<", 700), true},
+		{"point, both exclusive", band(">", 700, "<", 700), true},
+		{"point, both inclusive", band(">=", 700, "<=", 700), false},
+		{"ordinary band", band(">", 1024, "<", 4096), false},
+		{"one-sided", usableProbe{attrID: 1, op: ">", fvals: []float64{1024}}, false},
+		{"NaN low", band(">", math.NaN(), "<", 1024), false},
+		{"NaN high", band(">", 1024, "<", math.NaN()), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.up.emptyBand(); got != tc.want {
+				t.Errorf("emptyBand() = %v, want %v", got, tc.want)
+			}
+			if got := unsatisfiable([]usableProbe{tc.up}); got != tc.want {
+				t.Errorf("unsatisfiable() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestEmptyBandEliminated is the behavioural half: an impossible constraint must be planned
+// as "empty", admit no candidates at all (not even the exception set), and touch no record.
+func TestEmptyBandEliminated(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 3000; i++ {
+		text := fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory=%d ]`, i, i%10, (i%16+1)*512)
+		if i%97 == 0 { // exceptions: the index cannot classify these
+			text = fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory="lots" ]`, i, i%10)
+		}
+		ad := mustAd(t, text)
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	for _, qs := range []string{
+		`Memory < 1024 && Memory > 2048`,
+		`Memory > 2048 && Memory < 1024 && Owner == "u3"`,
+		`Memory >= 1024 && Memory <= 512`,
+	} {
+		u := planOf(t, c, qs)
+		if !unsatisfiable(u) {
+			t.Errorf("%s: plan should be unsatisfiable, got %+v", qs, u)
+		}
+		si := firstSegIndex(t, c)
+		if !si.skipsPrefix(u) {
+			t.Errorf("%s: the indexed prefix should be skippable despite the exception set", qs)
+		}
+		if cand := si.candidateOffsets(u); !cand.IsEmpty() {
+			t.Errorf("%s: %d candidates, want 0 (the exception set must not survive)", qs, cand.GetCardinality())
+		}
+		if ex := c.ExplainQuery(mustQuery(t, qs)); ex.Plan != "empty" {
+			t.Errorf("%s: plan = %q, want \"empty\"", qs, ex.Plan)
+		}
+		indexedVsBrute(t, c, src, qs) // and it still returns exactly nothing
+	}
+
+	// A satisfiable band on the same attribute must be unaffected.
+	ok := planOf(t, c, `Memory > 1024 && Memory < 4096`)
+	if unsatisfiable(ok) {
+		t.Error("a satisfiable band must not be eliminated")
+	}
+	if ex := c.ExplainQuery(mustQuery(t, `Memory > 1024 && Memory < 4096`)); ex.Plan != "indexed" {
+		t.Errorf("satisfiable band plan = %q, want \"indexed\"", ex.Plan)
+	}
+}
+
+// TestEmptyBandDisjunctionKept checks the DNF rule: an impossible disjunct contributes
+// nothing to a union, but one satisfiable disjunct keeps the query alive.
+func TestEmptyBandDisjunctionKept(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 1, ValueAttrs: []string{"Memory", "Cpus"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 2000; i++ {
+		ad := mustAd(t, fmt.Sprintf(`[ ID=%d; Memory=%d; Cpus=%d ]`, i, (i%16+1)*512, i%8))
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	// One dead disjunct, one live: results must equal the live one alone.
+	live := `(Memory < 1024 && Memory > 2048) || (Cpus >= 2 && Cpus <= 4)`
+	indexedVsBrute(t, c, src, live)
+	if len(queryIDs(t, c, mustQuery(t, live))) == 0 {
+		t.Error("the satisfiable disjunct should still return ads")
+	}
+	// Both disjuncts dead: nothing, and every group is recognized as impossible.
+	dead := `(Memory < 1024 && Memory > 2048) || (Cpus > 4 && Cpus < 2)`
+	indexedVsBrute(t, c, src, dead)
+	if groups, prunable := c.planIndexGroups(mustQuery(t, dead).ProbePlan()); !prunable || !unsatisfiableGroups(groups) {
+		t.Errorf("both disjuncts impossible: prunable=%v unsatisfiable=%v", prunable, unsatisfiableGroups(groups))
+	}
+}
+
+// TestSameSideMergeQuery is the behavioural half of same-side coalescing: redundant bounds
+// on one attribute collapse to the tightest, the query still answers exactly, and .explain
+// attributes the merged probe's selectivity to the conjunct that was folded away rather
+// than advertising a reach that is never probed.
+func TestSameSideMergeQuery(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 3000; i++ {
+		text := fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory=%d ]`, i, i%10, (i%64+1)*128)
+		if i%89 == 0 {
+			text = fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory="lots" ]`, i, i%10)
+		}
+		ad := mustAd(t, text)
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	// Each of these must plan as ONE range probe carrying the tightest bound(s), and the
+	// looser conjunct must not add a probe of its own.
+	for _, tc := range []struct {
+		q      string
+		op     string
+		val    float64
+		hiOp   string
+		hiVal  float64
+		probes int // total probes, including any non-range conjunct
+	}{
+		{q: `Memory > 1024 && Memory > 512`, op: ">", val: 1024, probes: 1},
+		{q: `Memory > 512 && Memory > 1024`, op: ">", val: 1024, probes: 1},
+		{q: `Memory < 4096 && Memory < 8192`, op: "<", val: 4096, probes: 1},
+		{q: `Memory >= 1024 && Memory > 1024`, op: ">", val: 1024, probes: 1},
+		// A non-range conjunct in between must not stop the merge.
+		{q: `Memory > 1024 && Owner == "u3" && Memory > 512`, op: ">", val: 1024, probes: 2},
+		// Both sides tightened, then coalesced into a band.
+		{q: `Memory > 512 && Memory > 1024 && Memory < 8192 && Memory < 4096`,
+			op: ">", val: 1024, hiOp: "<", hiVal: 4096, probes: 1},
+	} {
+		u := planOf(t, c, tc.q)
+		if len(u) != tc.probes {
+			t.Errorf("%s: %d probes, want %d (%+v)", tc.q, len(u), tc.probes, u)
+			continue
+		}
+		var rng *usableProbe
+		for i := range u {
+			if !u[i].cat && isRangeOp(u[i].op) {
+				rng = &u[i]
+			}
+		}
+		if rng == nil {
+			t.Errorf("%s: no range probe planned", tc.q)
+			continue
+		}
+		if rng.op != tc.op || rng.fvals[0] != tc.val || rng.hiOp != tc.hiOp || rng.hiVal != tc.hiVal {
+			t.Errorf("%s: planned %s %g / %s %g, want %s %g / %s %g", tc.q,
+				rng.op, rng.fvals[0], rng.hiOp, rng.hiVal, tc.op, tc.val, tc.hiOp, tc.hiVal)
+		}
+		indexedVsBrute(t, c, src, tc.q)
+	}
+
+	// .explain: the conjunct that survives as the probe is unmarked and carries its own
+	// number; the subsumed one is marked and reports the merged probe's number, not the
+	// much weaker reach of `> 512`.
+	ex := c.ExplainQuery(mustQuery(t, `Memory > 1024 && Memory > 512`))
+	if ex.IndexUsable != 1 {
+		t.Errorf("IndexUsable = %d, want 1", ex.IndexUsable)
+	}
+	if len(ex.Probes) != 2 {
+		t.Fatalf("want both conjuncts explained, got %+v", ex.Probes)
+	}
+	if ex.Probes[0].Coalesced {
+		t.Errorf("`> 1024` is the probe itself: want unmarked, got %+v", ex.Probes[0])
+	}
+	if !ex.Probes[1].Coalesced {
+		t.Errorf("`> 512` was folded away: want marked, got %+v", ex.Probes[1])
+	}
+	if ex.Probes[0].EstCandidates != ex.Probes[1].EstCandidates {
+		t.Errorf("both conjuncts should report the merged probe's estimate, got %d and %d",
+			ex.Probes[0].EstCandidates, ex.Probes[1].EstCandidates)
+	}
+}
+
+// TestEqualityFoldSemantics is the safety proof for eliminating an equality whose values a
+// range (or another equality) on the same attribute excludes. Like TestEmptyBandSemantics it
+// pins the claim empirically across the whole value space, because the elimination skips the
+// exception set that every data-driven skip must re-verify.
+func TestEqualityFoldSemantics(t *testing.T) {
+	t.Parallel()
+	values := []string{
+		`2048`, `2048.0`, `1024`, `4096`, `8192`, `0`, `-1`,
+		`"2048"`, `"lots"`, `""`,
+		`true`, `false`,
+		`{1024, 2048}`,
+		`[ a = 1 ]`,
+		`Other + 1`, `1/0`, `undefined`, `error`,
+	}
+	for _, qs := range []string{
+		`Memory == 2048 && Memory > 4096`,
+		`Memory == 2048 && Memory < 1024`,
+		`Memory == 2048 && Memory >= 2049`,
+		`Memory == 2048 && Memory > 1024 && Memory < 2000`,
+		`(Memory == 1024 || Memory == 2048) && Memory > 4096`,
+		`Memory == 1024 && Memory == 2048`,
+		`!Memory && Memory > 1024`,
+	} {
+		q := mustQuery(t, qs)
+		for _, v := range values {
+			if q.Matches(mustAd(t, fmt.Sprintf(`[ Memory = %s ]`, v))) {
+				t.Errorf("%s matched an ad with Memory = %s: the fold is not sound", qs, v)
+			}
+		}
+		if q.Matches(mustAd(t, `[ Other = 5 ]`)) {
+			t.Errorf("%s matched an ad with no Memory at all", qs)
+		}
+	}
+	// Controls: folds that leave a value standing must still match it.
+	for _, tc := range []struct{ q, ad string }{
+		{`Memory == 2048 && Memory > 1024`, `[ Memory = 2048 ]`},
+		{`(Memory == 1024 || Memory == 2048) && Memory > 1500`, `[ Memory = 2048 ]`},
+		{`Memory == 2048 && Memory > 1024 && Memory < 4096`, `[ Memory = 2048 ]`},
+	} {
+		if !mustQuery(t, tc.q).Matches(mustAd(t, tc.ad)) {
+			t.Errorf("control: %s should match %s", tc.q, tc.ad)
+		}
+	}
+}
+
+// TestEqualityFoldsRange checks the plan: an equality absorbs the range probe on its
+// attribute, so the wide posting union the range would have built never happens, and the
+// answer is unchanged.
+func TestEqualityFoldsRange(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory", "Cpus"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 3000; i++ {
+		text := fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory=%d; Cpus=%d ]`, i, i%10, (i%64+1)*128, i%16)
+		if i%89 == 0 {
+			text = fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory="lots"; Cpus=%d ]`, i, i%10, i%16)
+		}
+		ad := mustAd(t, text)
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	for _, tc := range []struct {
+		q      string
+		probes int
+		fvals  []float64 // the surviving equality's value set
+	}{
+		{q: `Memory == 2048 && Memory > 1024`, probes: 1, fvals: []float64{2048}},
+		{q: `Memory > 1024 && Memory == 2048`, probes: 1, fvals: []float64{2048}},
+		{q: `Memory == 2048 && Memory > 1024 && Memory < 4096`, probes: 1, fvals: []float64{2048}},
+		// Membership narrows to the members the band admits.
+		{q: `(Memory == 1024 || Memory == 2048 || Memory == 8192) && Memory > 1500 && Memory < 4096`,
+			probes: 1, fvals: []float64{2048}},
+		// Two equalities intersect.
+		{q: `Memory == 2048 && (Memory == 1024 || Memory == 2048)`, probes: 1, fvals: []float64{2048}},
+		// A range on a DIFFERENT attribute is untouched.
+		{q: `Memory == 2048 && Cpus > 4`, probes: 2, fvals: []float64{2048}},
+		// A categorical conjunct is untouched.
+		{q: `Memory == 2048 && Memory > 1024 && Owner == "u3"`, probes: 2, fvals: []float64{2048}},
+	} {
+		u := planOf(t, c, tc.q)
+		if len(u) != tc.probes {
+			t.Errorf("%s: %d probes, want %d (%+v)", tc.q, len(u), tc.probes, u)
+			continue
+		}
+		var eq *usableProbe
+		for i := range u {
+			if !u[i].cat && isEqOp(u[i].op) && u[i].attrID == u[0].attrID {
+				eq = &u[i]
+				break
+			}
+		}
+		if eq == nil {
+			t.Errorf("%s: no equality probe survived", tc.q)
+			continue
+		}
+		if len(eq.fvals) != len(tc.fvals) {
+			t.Errorf("%s: equality values %v, want %v", tc.q, eq.fvals, tc.fvals)
+		} else {
+			for i := range eq.fvals {
+				if eq.fvals[i] != tc.fvals[i] {
+					t.Errorf("%s: equality values %v, want %v", tc.q, eq.fvals, tc.fvals)
+					break
+				}
+			}
+		}
+		indexedVsBrute(t, c, src, tc.q)
+	}
+
+	// The folded plan must admit no more than the equality alone ever did.
+	si := firstSegIndex(t, c)
+	eqOnly := si.candidateOffsets(planOf(t, c, `Memory == 2048`))
+	folded := si.candidateOffsets(planOf(t, c, `Memory == 2048 && Memory > 1024`))
+	if !bmEqual(eqOnly, folded) {
+		t.Errorf("folded candidates (%d) should equal the equality's own (%d)",
+			folded.GetCardinality(), eqOnly.GetCardinality())
+	}
+}
+
+// TestEqualityFoldUnsatisfiable checks the elimination half: an equality a range excludes
+// leaves nothing to scan at all, exception set included.
+func TestEqualityFoldUnsatisfiable(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, ValueAttrs: []string{"Memory", "Cpus"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 3000; i++ {
+		text := fmt.Sprintf(`[ ID=%d; Memory=%d; Cpus=%d ]`, i, (i%64+1)*128, i%16)
+		if i%89 == 0 {
+			text = fmt.Sprintf(`[ ID=%d; Memory="lots"; Cpus=%d ]`, i, i%16)
+		}
+		ad := mustAd(t, text)
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	si := firstSegIndex(t, c)
+	for _, qs := range []string{
+		`Memory == 2048 && Memory > 4096`,
+		`Memory == 2048 && Memory < 1024`,
+		`Memory == 2048 && Memory > 1024 && Memory < 2000`,
+		`(Memory == 1024 || Memory == 2048) && Memory > 4096`,
+		`Memory == 1024 && Memory == 2048`,
+	} {
+		u := planOf(t, c, qs)
+		if !unsatisfiable(u) {
+			t.Errorf("%s: plan should be unsatisfiable, got %+v", qs, u)
+		}
+		if !si.skipsPrefix(u) {
+			t.Errorf("%s: the indexed prefix should be skippable", qs)
+		}
+		if cand := si.candidateOffsets(u); !cand.IsEmpty() {
+			t.Errorf("%s: %d candidates, want 0", qs, cand.GetCardinality())
+		}
+		if ex := c.ExplainQuery(mustQuery(t, qs)); ex.Plan != "empty" {
+			t.Errorf("%s: plan = %q, want \"empty\"", qs, ex.Plan)
+		}
+		indexedVsBrute(t, c, src, qs)
+	}
+
+	// A satisfiable fold, and a contradiction split across attributes, must survive.
+	if unsatisfiable(planOf(t, c, `Memory == 2048 && Memory > 1024`)) {
+		t.Error("a satisfiable fold must not be eliminated")
+	}
+	if unsatisfiable(planOf(t, c, `Memory == 2048 && Cpus > 99`)) {
+		t.Error("bounds on different attributes must not fold together")
+	}
+}
+
+// TestEqualityFoldExplain checks that the absorbed range conjunct reports the equality's
+// selectivity rather than the sweeping reach it would have had on its own.
+func TestEqualityFoldExplain(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 1, ValueAttrs: []string{"Memory"}})
+	for i := 0; i < 2000; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[ ID=%d; Memory=%d ]`, i, (i%64+1)*128))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	ex := c.ExplainQuery(mustQuery(t, `Memory == 2048 && Memory > 1024`))
+	if ex.IndexUsable != 1 {
+		t.Errorf("IndexUsable = %d, want 1 (the range is absorbed)", ex.IndexUsable)
+	}
+	if len(ex.Probes) != 2 {
+		t.Fatalf("want both conjuncts explained, got %+v", ex.Probes)
+	}
+	if ex.Probes[0].Coalesced {
+		t.Errorf("`== 2048` is the probe itself: want unmarked, got %+v", ex.Probes[0])
+	}
+	if !ex.Probes[1].Coalesced {
+		t.Errorf("`> 1024` was absorbed: want marked, got %+v", ex.Probes[1])
+	}
+	if ex.Probes[0].EstCandidates != ex.Probes[1].EstCandidates {
+		t.Errorf("the absorbed conjunct should report the equality's estimate, got %d and %d",
+			ex.Probes[0].EstCandidates, ex.Probes[1].EstCandidates)
+	}
+	// ~1/64 of the values are 2048; the `> 1024` line must not advertise ~87%.
+	if ex.Probes[1].Selectivity > 0.1 {
+		t.Errorf("absorbed conjunct selectivity %.3f should be the equality's, not the range's",
+			ex.Probes[1].Selectivity)
+	}
+}
+
+// TestDeadDisjunctSharedPlanConcurrent is the regression for compacting the DNF plan in
+// place. scanShardCandidatesGroups drops disjuncts it proved impossible, and the match path
+// fans that function out one goroutine per shard over a SINGLE shared plan -- so filtering
+// the slice in place both raced and let one worker's compaction change what another was
+// iterating, silently dropping live disjuncts (and with them, real matches).
+//
+// The job's Requirements below yield a DNF plan whose first disjunct is impossible and whose
+// second is not, over enough shards to keep several workers busy. Run under -race it catches
+// the write; run at all it catches the dropped matches.
+func TestDeadDisjunctSharedPlanConcurrent(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 8, CategoricalAttrs: []string{"Arch"}, ValueAttrs: []string{"Memory", "Cpus"}})
+	want := 0
+	for i := 0; i < 4000; i++ {
+		mem, cpus := (i%16+1)*512, i%8
+		if err := c.Put([]byte(fmt.Sprintf("s%d", i)), mustAd(t, fmt.Sprintf(
+			`[ Id=%d; Memory=%d; Cpus=%d; Arch="X86_64"; Requirements = true ]`, i, mem, cpus))); err != nil {
+			t.Fatal(err)
+		}
+		if cpus >= 2 && cpus <= 4 {
+			want++
+		}
+	}
+	c.Reindex()
+
+	// Disjunct 1 is impossible (`Memory > 8192 && Memory < 1024`); disjunct 2 is the real
+	// filter. If the dead disjunct's removal corrupts the shared slice, the live one goes
+	// with it and matches vanish.
+	job := mustAd(t, `[ Requirements = (TARGET.Memory > 8192 && TARGET.Memory < 1024) ||
+		(TARGET.Cpus >= 2 && TARGET.Cpus <= 4) ]`)
+	for i := 0; i < 20; i++ { // repeat: the interleaving that corrupts is scheduling-dependent
+		if got := len(c.MatchSortedRanked(job, 0)); got != want {
+			t.Fatalf("iteration %d: matched %d slots, want %d", i, got, want)
+		}
+	}
+
+	// Both disjuncts impossible: the union is empty, and no slot matches.
+	dead := mustAd(t, `[ Requirements = (TARGET.Memory > 8192 && TARGET.Memory < 1024) ||
+		(TARGET.Cpus > 4 && TARGET.Cpus < 2) ]`)
+	if got := len(c.MatchSortedRanked(dead, 0)); got != 0 {
+		t.Errorf("every disjunct impossible: matched %d slots, want 0", got)
 	}
 }

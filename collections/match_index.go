@@ -61,8 +61,9 @@ type MatchExplain struct {
 	Probes []ProbeExplain `json:"probes"`
 	// IndexUsable is how many probes prune via an index.
 	IndexUsable int `json:"indexUsable"`
-	// Plan is the access path over the resource slots: "indexed" (visit only candidate
-	// slots), "parallel-scan", or "serial-scan" (match every slot).
+	// Plan is the access path over the resource slots: "empty" (the request contradicts
+	// itself, so no slot can match), "indexed" (visit only candidate slots),
+	// "parallel-scan", or "serial-scan" (match every slot).
 	Plan        string `json:"plan"`
 	Parallelism int    `json:"parallelism"`
 	Shards      int    `json:"shards"`
@@ -162,15 +163,15 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 		prunable = false // estimated to barely prune -> a scan is cheaper
 	}
 	for _, g := range plan {
-		// Report the coalesced band's selectivity for each half of a two-sided range,
+		// Report the merged probe's selectivity for every range conjunct folded into it,
 		// matching what the planner probes (see ExplainQuery).
-		bands := rangeBands(c.planIndex(g.Probes))
+		merges := rangeMerges(c.planIndex(g.Probes))
 		for _, p := range g.Probes {
 			pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
 			var up usableProbe
 			var isUsable bool
 			pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
-			up = applyBand(bands, up, &pe)
+			up = applyMerge(merges, up, &pe)
 			if isUsable {
 				ex.IndexUsable++
 				if cand, covered := c.estimateCandidates(up); covered {
@@ -184,9 +185,14 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 			ex.Probes = append(ex.Probes, pe)
 		}
 	}
-	if prunable {
+	switch {
+	case unsatisfiableGroups(groups):
+		// The job's Requirements, with its constants baked in, contradict themselves: no
+		// slot can ever match, and the negotiator visits none.
+		ex.Plan = "empty"
+	case prunable:
 		ex.Plan = "indexed"
-	} else {
+	default:
 		ex.Plan = scanPlanName(c.queryPar)
 	}
 	c.meldTargetConstraint(&ex, targetConstraint)
