@@ -255,6 +255,16 @@ type Collection struct {
 	// and Rotate). Zero value ⇒ keep everything.
 	ret Retention
 
+	// gcFloor is a runtime-only GC watermark in Retention.MinAgeAttr units: Rotate may
+	// reclaim a fully-consumed segment (its newest age value < gcFloor) EARLY -- before it
+	// hits MaxAge -- so a change-feed source drains records every live subscriber has already
+	// acknowledged (see changefeed's GC floor). It only ever shortens retention: it never
+	// keeps data past the configured ceilings, and never drops anything younger than
+	// Retention.MinAge. Read/written only under maintMu, alongside ret. Deliberately NOT
+	// persisted: it is recomputed from live subscribers each pass, and a stale saved value
+	// must never silently GC data across a restart. Zero ⇒ no early GC.
+	gcFloor float64
+
 	// hasZones caches whether any per-segment zone maps are configured (see
 	// Options.ZoneAttrs / zonemap.go), so the query hot path skips probe extraction
 	// when zone pruning is off. Append-only only. Atomic because a runtime AddIndex on

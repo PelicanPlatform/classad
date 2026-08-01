@@ -45,12 +45,26 @@ type zoneRange struct {
 type Retention struct {
 	MaxSegments int   // keep at most this many sealed segments
 	MaxBytes    int64 // keep at most this many bytes of sealed segment files
-	// MaxAgeAttr / MaxAge: drop a segment whose max value of the given numeric attr
-	// (e.g. "CompletionDate", unix seconds) is older than Now-MaxAge. Now is supplied
-	// per Rotate call so the store needs no clock of its own. MaxAgeAttr must be a
-	// ZoneAttr so its per-segment max is available.
+	// MaxAgeAttr names the numeric attribute (e.g. "CompletionDate", unix seconds) that
+	// MaxAge is measured against. It must be a ZoneAttr so its per-segment max is available.
+	// Now is supplied per Rotate call so the store needs no clock of its own.
 	MaxAgeAttr string
-	MaxAge     float64
+	// MaxAge is a hard ceiling: drop a segment whose newest MaxAgeAttr value is older than
+	// Now-MaxAge, regardless of anything else (a slow or absent consumer never keeps data
+	// past it). Zero ⇒ no age ceiling.
+	MaxAge float64
+	// MinAgeAttr names the numeric attribute the minimum-retention floor and the GC floor are
+	// measured against (a ZoneAttr). It is independent of MaxAgeAttr -- MinAge works with no
+	// MaxAge configured -- though a change-feed queue typically points both at the same
+	// entry-time attribute.
+	MinAgeAttr string
+	// MinAge is the minimum-retention floor, for using the store as a short-lived queue. The
+	// GC floor (SetGCFloor) may reclaim already-consumed records early, but never any younger
+	// than Now-MinAge -- so a consumer always has at least MinAge to drain a record. MinAge
+	// only bounds the GC floor; it never overrides the hard ceilings, so MaxBytes / MaxSegments
+	// / MaxAge still evict even younger-than-MinAge data under pressure. Zero ⇒ consumed
+	// records may be GC'd as soon as the floor passes them.
+	MinAge float64
 }
 
 // ArchiveOptions configures an Archive.
@@ -290,6 +304,15 @@ func (a *Archive) SetRetention(r Retention) { a.c.SetRetention(r) }
 
 // Retention returns the archive's current retention bounds.
 func (a *Archive) Retention() Retention { return a.c.Retention() }
+
+// SetGCFloor installs a runtime GC watermark (in Retention.MinAgeAttr units) so Rotate may
+// reclaim consumed records early -- above MinAge, below the configured ceilings (see
+// Collection.SetGCFloor). Not persisted; re-assert it each maintenance pass. floor <= 0
+// clears it.
+func (a *Archive) SetGCFloor(floor float64) { a.c.SetGCFloor(floor) }
+
+// GCFloor returns the current runtime GC watermark (0 when unset).
+func (a *Archive) GCFloor() float64 { return a.c.GCFloor() }
 
 // Stats reports storage accounting: record count, segment count, and arena/used/dead bytes
 // (dead is ~0 for an append log, which never supersedes). The same struct the mutable store
