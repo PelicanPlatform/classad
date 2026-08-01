@@ -142,6 +142,11 @@ type usableProbe struct {
 	// wider one -- because dropping the upper bound only widens the range.
 	hiOp  string
 	hiVal float64
+
+	// unsat marks a probe the planner proved can never hold: an equality whose value list
+	// was emptied by a range, or by another equality, on the same attribute (see
+	// foldEqualities). An inverted band is proved structurally instead, by emptyBand.
+	unsat bool
 }
 
 // twoSided reports whether up carries both bounds of a numeric band.
@@ -173,12 +178,22 @@ func (up usableProbe) emptyBand() bool {
 	return lo == hi && (up.op == ">" || up.hiOp == "<")
 }
 
+// neverMatches reports whether the planner has proved this probe cannot hold for any
+// record -- structurally (an inverted band) or by folding (an equality left with no
+// admissible value).
+func (up usableProbe) neverMatches() bool { return up.unsat || up.emptyBand() }
+
+// isEqOp reports whether op pins the value to the probe's listed set, so fvals enumerates
+// every value a matching record can hold for the attribute. `!=` is deliberately excluded:
+// it excludes one value rather than pinning the rest.
+func isEqOp(op string) bool { return op == "==" || op == "in" }
+
 // unsatisfiable reports whether a conjunction can never be satisfied, because one of its
-// probes is an empty band. Every probe in a group must hold, so one impossible conjunct
-// empties the group -- no segment need be opened at all.
+// probes was proved impossible. Every probe in a group must hold, so one impossible
+// conjunct empties the group -- no segment need be opened at all.
 func unsatisfiable(usable []usableProbe) bool {
 	for _, up := range usable {
-		if up.emptyBand() {
+		if up.neverMatches() {
 			return true
 		}
 	}
@@ -309,39 +324,170 @@ func rangeHigh(up usableProbe) (op string, val float64, ok bool) {
 func rangeMerges(usable []usableProbe) map[uint32]usableProbe {
 	var merges map[uint32]usableProbe
 	for _, up := range usable {
-		if !up.cat && isRangeOp(up.op) {
-			if merges == nil {
-				merges = make(map[uint32]usableProbe, 1)
-			}
-			merges[up.attrID] = up
+		if up.cat || !foldable(up.op) {
+			continue
 		}
+		if merges == nil {
+			merges = make(map[uint32]usableProbe, 1)
+		}
+		merges[up.attrID] = up
 	}
 	return merges
 }
 
-// applyMerge redirects an explain's selectivity estimate for a range conjunct to the probe
-// the planner actually runs for that attribute. A conjunct that IS that probe passes through
-// unmarked; one that was folded into it -- the other half of a band, or a looser same-side
-// bound the tighter one subsumed -- is marked, because the numbers beside it then describe
-// the merged probe rather than the conjunct's own reach.
+// foldable reports whether an op participates in the per-attribute value folding, and so
+// whether an explain should attribute its conjunct to the folded probe.
+func foldable(op string) bool { return isRangeOp(op) || isEqOp(op) }
+
+// applyMerge redirects an explain's selectivity estimate for a range or equality conjunct to
+// the probe the planner actually runs for that attribute. A conjunct that IS that probe
+// passes through unmarked; one that was folded into it -- the other half of a band, a looser
+// same-side bound the tighter one subsumed, or a range an equality absorbed -- is marked,
+// because the numbers beside it then describe the folded probe rather than the conjunct's
+// own reach.
 func applyMerge(merges map[uint32]usableProbe, up usableProbe, pe *ProbeExplain) usableProbe {
-	if merges == nil || up.cat || !isRangeOp(up.op) {
+	if merges == nil || up.cat || !foldable(up.op) {
 		return up
 	}
 	m, ok := merges[up.attrID]
-	if !ok || sameRange(m, up) {
+	if !ok || sameProbe(m, up) {
 		return up
 	}
 	pe.Coalesced = true
 	return m
 }
 
-// sameRange reports whether two range probes express the identical bound(s).
-func sameRange(a, b usableProbe) bool {
+// sameProbe reports whether two value probes express the identical constraint.
+func sameProbe(a, b usableProbe) bool {
 	if a.op != b.op || a.hiOp != b.hiOp || a.hiVal != b.hiVal || len(a.fvals) != len(b.fvals) {
 		return false
 	}
-	return len(a.fvals) == 0 || a.fvals[0] == b.fvals[0]
+	for i := range a.fvals {
+		if a.fvals[i] != b.fvals[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// foldEqualities folds the value constraints on one attribute together: an equality (or
+// membership) probe absorbs the attribute's range probe, and several equalities intersect
+// into one. `Memory == 2048 && Memory > 1024` otherwise runs two probes, the second unioning
+// the postings of every key above 1024 -- most of the segment -- only for the intersection
+// to reduce it to the one key the equality already named.
+//
+// Absorbing is exact, not merely a sound superset. A record holds ONE value for the
+// attribute, so its posting list post[v] lies wholly inside the range's key union when v
+// satisfies the range and wholly outside it otherwise; and both probes union in the same
+// exception set. So intersecting the two probes yields exactly the equality probe narrowed
+// to the values the range admits, which is what this leaves behind.
+//
+// When nothing survives the narrowing, the conjunction cannot hold for any record -- an ad's
+// attribute has a single value, and it cannot both be one of the named values and outside
+// them. That is recorded as unsat and eliminated by the same machinery as an inverted band
+// (see unsatisfiable); TestEqualityFoldSemantics pins it across the value space.
+//
+// Runs after coalesceRanges, so each attribute has at most one range probe left to absorb.
+func foldEqualities(out []usableProbe) []usableProbe {
+	if !hasFoldableEqualities(out) {
+		return out
+	}
+	eqAt := make(map[uint32]int, 2) // attr -> index of the surviving equality probe
+	drop := make([]bool, len(out))
+	for i := range out {
+		if out[i].cat || !isEqOp(out[i].op) {
+			continue
+		}
+		if j, seen := eqAt[out[i].attrID]; seen {
+			out[j] = keepValues(out[j], func(v float64) bool { return containsFloat(out[i].fvals, v) })
+			drop[i] = true
+			continue
+		}
+		eqAt[out[i].attrID] = i
+	}
+	for i := range out {
+		if out[i].cat || !isRangeOp(out[i].op) {
+			continue
+		}
+		j, ok := eqAt[out[i].attrID]
+		if !ok {
+			continue // no equality on this attribute: the range probe stands on its own
+		}
+		rng := out[i]
+		out[j] = keepValues(out[j], func(v float64) bool { return rangeAdmits(rng, v) })
+		drop[i] = true
+	}
+	kept := out[:0]
+	for i := range out {
+		if !drop[i] {
+			kept = append(kept, out[i])
+		}
+	}
+	return kept
+}
+
+// hasFoldableEqualities reports whether some value attribute carries an equality probe
+// alongside another equality or a range probe -- the only case foldEqualities changes.
+func hasFoldableEqualities(out []usableProbe) bool {
+	var eq, other map[uint32]struct{}
+	for _, up := range out {
+		if up.cat {
+			continue
+		}
+		switch {
+		case isEqOp(up.op):
+			if _, dup := eq[up.attrID]; dup {
+				return true
+			}
+			if _, ok := other[up.attrID]; ok {
+				return true
+			}
+			if eq == nil {
+				eq = map[uint32]struct{}{}
+			}
+			eq[up.attrID] = struct{}{}
+		case isRangeOp(up.op):
+			if _, ok := eq[up.attrID]; ok {
+				return true
+			}
+			if other == nil {
+				other = map[uint32]struct{}{}
+			}
+			other[up.attrID] = struct{}{}
+		}
+	}
+	return false
+}
+
+// keepValues narrows an equality probe to the values satisfying admits, marking it unsat
+// when none do. The retained slice is fresh, so no other probe's values are disturbed.
+func keepValues(up usableProbe, admits func(float64) bool) usableProbe {
+	keep := make([]float64, 0, len(up.fvals))
+	for _, v := range up.fvals {
+		if admits(v) {
+			keep = append(keep, v)
+		}
+	}
+	up.fvals = keep
+	up.unsat = len(keep) == 0
+	return up
+}
+
+// rangeAdmits reports whether v satisfies a (possibly two-sided) range probe's bounds.
+func rangeAdmits(rng usableProbe, v float64) bool {
+	if len(rng.fvals) == 0 || !cmpFloat(rng.op, v, rng.fvals[0]) {
+		return false
+	}
+	return rng.hiOp == "" || cmpFloat(rng.hiOp, v, rng.hiVal)
+}
+
+func containsFloat(vals []float64, v float64) bool {
+	for _, w := range vals {
+		if w == v {
+			return true
+		}
+	}
+	return false
 }
 
 // rangeSpan returns the [from,to) index window of a sorted ascending key run that a range
@@ -391,12 +537,12 @@ type ProbeExplain struct {
 	Selectivity    float64 `json:"selectivity,omitempty"`
 	EstCandidates  int64   `json:"estCandidates,omitempty"`
 
-	// Coalesced marks a range conjunct the planner folded into another range probe on the
-	// same attribute -- the opposite bound (`Memory > 1024 && Memory < 4096` becomes one
-	// two-sided probe) or a tighter same-side bound that subsumes it (`Memory > 1024 &&
-	// Memory > 512` probes only `> 1024`). Selectivity/EstCandidates then describe the
-	// merged probe, not this conjunct's own reach; the conjunct that IS the probe is left
-	// unmarked.
+	// Coalesced marks a conjunct the planner folded into another probe on the same value
+	// attribute: the opposite bound (`Memory > 1024 && Memory < 4096` becomes one two-sided
+	// probe), a tighter same-side bound that subsumes it (`Memory > 1024 && Memory > 512`
+	// probes only `> 1024`), or a range an equality absorbed (`Memory == 2048 && Memory >
+	// 1024` probes only the equality). Selectivity/EstCandidates then describe the folded
+	// probe, not this conjunct's own reach; the conjunct that IS the probe is left unmarked.
 	Coalesced bool `json:"coalesced,omitempty"`
 }
 
@@ -569,7 +715,7 @@ func (c *Collection) planIndex(probes []vm.Probe) []usableProbe {
 			}
 		}
 	}
-	return coalesceRanges(out)
+	return foldEqualities(coalesceRanges(out))
 }
 
 func catUsable(id uint32, p vm.Probe) (usableProbe, bool) {

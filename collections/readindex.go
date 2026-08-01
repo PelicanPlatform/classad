@@ -121,12 +121,13 @@ func indexCoversGroups(ix indexPrimitives, groups [][]usableProbe) bool {
 // probe, so the query can skip it (and full-scan only the un-indexed tail). Correctness-
 // critical: true only when certain. An exceptional record forbids a skip; `!=` never skips.
 func indexCanSkip(ix indexPrimitives, up usableProbe) bool {
-	// An impossible band (`Memory < 1024 && Memory > 2048`) is unsatisfiable for every
-	// value, so it skips ahead of -- and independently of -- the per-segment stats. Unlike
-	// the data-driven skips below it need not spare the exception set: those records are
-	// re-verified because the INDEX cannot classify them, but no value of any type can
-	// satisfy both bounds. See usableProbe.emptyBand.
-	if up.emptyBand() {
+	// A probe the planner proved impossible -- an inverted band (`Memory < 1024 && Memory
+	// > 2048`), or an equality whose values a range on the same attribute excluded -- is
+	// unsatisfiable for every value, so it skips ahead of and independently of the
+	// per-segment stats. Unlike the data-driven skips below it need not spare the exception
+	// set: those records are re-verified because the INDEX cannot classify them, but no
+	// value of any type can satisfy the constraint. See usableProbe.neverMatches.
+	if up.neverMatches() {
 		return true
 	}
 	s := ix.statsFor(up)

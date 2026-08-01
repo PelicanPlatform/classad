@@ -648,3 +648,214 @@ func TestSameSideMergeQuery(t *testing.T) {
 			ex.Probes[0].EstCandidates, ex.Probes[1].EstCandidates)
 	}
 }
+
+// TestEqualityFoldSemantics is the safety proof for eliminating an equality whose values a
+// range (or another equality) on the same attribute excludes. Like TestEmptyBandSemantics it
+// pins the claim empirically across the whole value space, because the elimination skips the
+// exception set that every data-driven skip must re-verify.
+func TestEqualityFoldSemantics(t *testing.T) {
+	t.Parallel()
+	values := []string{
+		`2048`, `2048.0`, `1024`, `4096`, `8192`, `0`, `-1`,
+		`"2048"`, `"lots"`, `""`,
+		`true`, `false`,
+		`{1024, 2048}`,
+		`[ a = 1 ]`,
+		`Other + 1`, `1/0`, `undefined`, `error`,
+	}
+	for _, qs := range []string{
+		`Memory == 2048 && Memory > 4096`,
+		`Memory == 2048 && Memory < 1024`,
+		`Memory == 2048 && Memory >= 2049`,
+		`Memory == 2048 && Memory > 1024 && Memory < 2000`,
+		`(Memory == 1024 || Memory == 2048) && Memory > 4096`,
+		`Memory == 1024 && Memory == 2048`,
+		`!Memory && Memory > 1024`,
+	} {
+		q := mustQuery(t, qs)
+		for _, v := range values {
+			if q.Matches(mustAd(t, fmt.Sprintf(`[ Memory = %s ]`, v))) {
+				t.Errorf("%s matched an ad with Memory = %s: the fold is not sound", qs, v)
+			}
+		}
+		if q.Matches(mustAd(t, `[ Other = 5 ]`)) {
+			t.Errorf("%s matched an ad with no Memory at all", qs)
+		}
+	}
+	// Controls: folds that leave a value standing must still match it.
+	for _, tc := range []struct{ q, ad string }{
+		{`Memory == 2048 && Memory > 1024`, `[ Memory = 2048 ]`},
+		{`(Memory == 1024 || Memory == 2048) && Memory > 1500`, `[ Memory = 2048 ]`},
+		{`Memory == 2048 && Memory > 1024 && Memory < 4096`, `[ Memory = 2048 ]`},
+	} {
+		if !mustQuery(t, tc.q).Matches(mustAd(t, tc.ad)) {
+			t.Errorf("control: %s should match %s", tc.q, tc.ad)
+		}
+	}
+}
+
+// TestEqualityFoldsRange checks the plan: an equality absorbs the range probe on its
+// attribute, so the wide posting union the range would have built never happens, and the
+// answer is unchanged.
+func TestEqualityFoldsRange(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory", "Cpus"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 3000; i++ {
+		text := fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory=%d; Cpus=%d ]`, i, i%10, (i%64+1)*128, i%16)
+		if i%89 == 0 {
+			text = fmt.Sprintf(`[ ID=%d; Owner="u%d"; Memory="lots"; Cpus=%d ]`, i, i%10, i%16)
+		}
+		ad := mustAd(t, text)
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	for _, tc := range []struct {
+		q      string
+		probes int
+		fvals  []float64 // the surviving equality's value set
+	}{
+		{q: `Memory == 2048 && Memory > 1024`, probes: 1, fvals: []float64{2048}},
+		{q: `Memory > 1024 && Memory == 2048`, probes: 1, fvals: []float64{2048}},
+		{q: `Memory == 2048 && Memory > 1024 && Memory < 4096`, probes: 1, fvals: []float64{2048}},
+		// Membership narrows to the members the band admits.
+		{q: `(Memory == 1024 || Memory == 2048 || Memory == 8192) && Memory > 1500 && Memory < 4096`,
+			probes: 1, fvals: []float64{2048}},
+		// Two equalities intersect.
+		{q: `Memory == 2048 && (Memory == 1024 || Memory == 2048)`, probes: 1, fvals: []float64{2048}},
+		// A range on a DIFFERENT attribute is untouched.
+		{q: `Memory == 2048 && Cpus > 4`, probes: 2, fvals: []float64{2048}},
+		// A categorical conjunct is untouched.
+		{q: `Memory == 2048 && Memory > 1024 && Owner == "u3"`, probes: 2, fvals: []float64{2048}},
+	} {
+		u := planOf(t, c, tc.q)
+		if len(u) != tc.probes {
+			t.Errorf("%s: %d probes, want %d (%+v)", tc.q, len(u), tc.probes, u)
+			continue
+		}
+		var eq *usableProbe
+		for i := range u {
+			if !u[i].cat && isEqOp(u[i].op) && u[i].attrID == u[0].attrID {
+				eq = &u[i]
+				break
+			}
+		}
+		if eq == nil {
+			t.Errorf("%s: no equality probe survived", tc.q)
+			continue
+		}
+		if len(eq.fvals) != len(tc.fvals) {
+			t.Errorf("%s: equality values %v, want %v", tc.q, eq.fvals, tc.fvals)
+		} else {
+			for i := range eq.fvals {
+				if eq.fvals[i] != tc.fvals[i] {
+					t.Errorf("%s: equality values %v, want %v", tc.q, eq.fvals, tc.fvals)
+					break
+				}
+			}
+		}
+		indexedVsBrute(t, c, src, tc.q)
+	}
+
+	// The folded plan must admit no more than the equality alone ever did.
+	si := firstSegIndex(t, c)
+	eqOnly := si.candidateOffsets(planOf(t, c, `Memory == 2048`))
+	folded := si.candidateOffsets(planOf(t, c, `Memory == 2048 && Memory > 1024`))
+	if !bmEqual(eqOnly, folded) {
+		t.Errorf("folded candidates (%d) should equal the equality's own (%d)",
+			folded.GetCardinality(), eqOnly.GetCardinality())
+	}
+}
+
+// TestEqualityFoldUnsatisfiable checks the elimination half: an equality a range excludes
+// leaves nothing to scan at all, exception set included.
+func TestEqualityFoldUnsatisfiable(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, ValueAttrs: []string{"Memory", "Cpus"}})
+	src := map[int]*classad.ClassAd{}
+	for i := 0; i < 3000; i++ {
+		text := fmt.Sprintf(`[ ID=%d; Memory=%d; Cpus=%d ]`, i, (i%64+1)*128, i%16)
+		if i%89 == 0 {
+			text = fmt.Sprintf(`[ ID=%d; Memory="lots"; Cpus=%d ]`, i, i%16)
+		}
+		ad := mustAd(t, text)
+		src[i] = ad
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	si := firstSegIndex(t, c)
+	for _, qs := range []string{
+		`Memory == 2048 && Memory > 4096`,
+		`Memory == 2048 && Memory < 1024`,
+		`Memory == 2048 && Memory > 1024 && Memory < 2000`,
+		`(Memory == 1024 || Memory == 2048) && Memory > 4096`,
+		`Memory == 1024 && Memory == 2048`,
+	} {
+		u := planOf(t, c, qs)
+		if !unsatisfiable(u) {
+			t.Errorf("%s: plan should be unsatisfiable, got %+v", qs, u)
+		}
+		if !si.skipsPrefix(u) {
+			t.Errorf("%s: the indexed prefix should be skippable", qs)
+		}
+		if cand := si.candidateOffsets(u); !cand.IsEmpty() {
+			t.Errorf("%s: %d candidates, want 0", qs, cand.GetCardinality())
+		}
+		if ex := c.ExplainQuery(mustQuery(t, qs)); ex.Plan != "empty" {
+			t.Errorf("%s: plan = %q, want \"empty\"", qs, ex.Plan)
+		}
+		indexedVsBrute(t, c, src, qs)
+	}
+
+	// A satisfiable fold, and a contradiction split across attributes, must survive.
+	if unsatisfiable(planOf(t, c, `Memory == 2048 && Memory > 1024`)) {
+		t.Error("a satisfiable fold must not be eliminated")
+	}
+	if unsatisfiable(planOf(t, c, `Memory == 2048 && Cpus > 99`)) {
+		t.Error("bounds on different attributes must not fold together")
+	}
+}
+
+// TestEqualityFoldExplain checks that the absorbed range conjunct reports the equality's
+// selectivity rather than the sweeping reach it would have had on its own.
+func TestEqualityFoldExplain(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 1, ValueAttrs: []string{"Memory"}})
+	for i := 0; i < 2000; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[ ID=%d; Memory=%d ]`, i, (i%64+1)*128))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+
+	ex := c.ExplainQuery(mustQuery(t, `Memory == 2048 && Memory > 1024`))
+	if ex.IndexUsable != 1 {
+		t.Errorf("IndexUsable = %d, want 1 (the range is absorbed)", ex.IndexUsable)
+	}
+	if len(ex.Probes) != 2 {
+		t.Fatalf("want both conjuncts explained, got %+v", ex.Probes)
+	}
+	if ex.Probes[0].Coalesced {
+		t.Errorf("`== 2048` is the probe itself: want unmarked, got %+v", ex.Probes[0])
+	}
+	if !ex.Probes[1].Coalesced {
+		t.Errorf("`> 1024` was absorbed: want marked, got %+v", ex.Probes[1])
+	}
+	if ex.Probes[0].EstCandidates != ex.Probes[1].EstCandidates {
+		t.Errorf("the absorbed conjunct should report the equality's estimate, got %d and %d",
+			ex.Probes[0].EstCandidates, ex.Probes[1].EstCandidates)
+	}
+	// ~1/64 of the values are 2048; the `> 1024` line must not advertise ~87%.
+	if ex.Probes[1].Selectivity > 0.1 {
+		t.Errorf("absorbed conjunct selectivity %.3f should be the equality's, not the range's",
+			ex.Probes[1].Selectivity)
+	}
+}
