@@ -1,6 +1,9 @@
 package collections
 
-import "github.com/PelicanPlatform/classad/collections/wire"
+import (
+	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/collections/wire"
+)
 
 // colSegment is a sealed segment's columnar accelerator: the PAX block plus offs, mapping each
 // block record k to its arena offset so a scan can read the record's live MVCC seq/sup.
@@ -9,15 +12,27 @@ type colSegment struct {
 	offs  []uint32
 }
 
+// schemaScanState is a collection's resolved adschema columnar scan configuration.
+type schemaScanState struct {
+	schema *adSchema
+	hot    []int
+	cache  *blockCache
+}
+
 // EnableSchemaScan builds a columnar block over every currently-sealed segment (skipping the
-// active append target) for the given schema and hot field set, and publishes it on each
-// segment. Additive and opt-in: with no block a scan falls back to the row path, so a
-// collection that never calls this is unaffected. Reads immutable sealed bytes only.
+// active append target) for the given schema and hot field set, publishes it on each segment,
+// and records the state so CountQuery can auto-route matching queries. Additive and opt-in:
+// with no state/block a query takes the normal row path, so a collection that never calls this
+// is unaffected. Reads immutable sealed bytes only.
 func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
-	if c.schemaCache.Load() == nil {
-		if bc, err := newBlockCache(256 << 20); err == nil { // ~256 MiB of decompressed blocks
-			c.schemaCache.Store(bc)
+	st := c.schemaScan.Load()
+	if st == nil || st.schema != s {
+		bc, err := newBlockCache(256 << 20) // ~256 MiB of decompressed blocks
+		if err != nil {
+			return
 		}
+		st = &schemaScanState{schema: s, hot: hot, cache: bc}
+		c.schemaScan.Store(st)
 	}
 	for _, sh := range c.shards {
 		sh.mu.RLock()
@@ -36,15 +51,84 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 	}
 }
 
-// schemaScanIntCount counts records whose numeric field (s.fields[fieldIdx]) is present, live,
-// and satisfies match -- using each sealed segment's columnar block (hot column: no decode;
-// cold column: one decode) and each window's live MVCC visibility. A window with no block
-// (the active segment, or one built before EnableSchemaScan) falls back to the row scan. A
-// record whose value is escaped out of the hot column is reconstructed and re-checked (its
-// value may live in the cold tail, e.g. an out-of-width int).
-func (c *Collection) schemaScanIntCount(s *adSchema, fieldIdx int, match func(int64) bool) int {
-	fieldID := s.fields[fieldIdx].id
-	bc := c.schemaCache.Load()
+// CountQuery counts the records matching q using the columnar scan, when q is exactly (Native)
+// one or more numeric comparisons on a single INT schema field -- the common count-where. It
+// returns (count, true) on that fast path, or (0, false) to signal the caller to use the normal
+// scan (schema-scan not enabled, or the predicate is not columnar-eligible). Correctness: the
+// per-record numeric comparison matches the store's evaluation of `field OP number`; a value
+// escaped out of the hot column is read from the cold tail, and Native() rules out any residual
+// program the columnar path would miss.
+func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
+	st := c.schemaScan.Load()
+	if st == nil {
+		return 0, false
+	}
+	s := st.schema
+	probes := q.Probes()
+	if !q.Native() || len(probes) == 0 {
+		return 0, false
+	}
+	fieldIdx := -1
+	var fieldID uint32
+	var cmps []func(float64) bool
+	for _, p := range probes {
+		id, ok := c.intern.LookupID(p.Attr)
+		if !ok {
+			return 0, false
+		}
+		idx, ok := s.byID[id]
+		if !ok || s.fields[idx].kind != akInt {
+			return 0, false // only single-field int comparisons route
+		}
+		if fieldIdx == -1 {
+			fieldIdx, fieldID = idx, id
+		} else if idx != fieldIdx {
+			return 0, false // more than one field: not this fast path
+		}
+		up, ok := valUsable(id, p)
+		if !ok || len(up.fvals) != 1 {
+			return 0, false // present/absent/in/isnt or non-numeric: not a scalar comparison
+		}
+		cmp, ok := numCmp(up.op, up.fvals[0])
+		if !ok {
+			return 0, false
+		}
+		cmps = append(cmps, cmp)
+	}
+	eval := func(v float64) bool {
+		for _, cmp := range cmps {
+			if !cmp(v) {
+				return false
+			}
+		}
+		return true
+	}
+	return c.schemaScanCount(s, fieldIdx, fieldID, st.cache, eval), true
+}
+
+func numCmp(op string, t float64) (func(float64) bool, bool) {
+	switch op {
+	case "<":
+		return func(v float64) bool { return v < t }, true
+	case "<=":
+		return func(v float64) bool { return v <= t }, true
+	case ">":
+		return func(v float64) bool { return v > t }, true
+	case ">=":
+		return func(v float64) bool { return v >= t }, true
+	case "==":
+		return func(v float64) bool { return v == t }, true
+	case "!=":
+		return func(v float64) bool { return v != t }, true
+	}
+	return nil, false
+}
+
+// schemaScanCount counts records whose numeric field (s.fields[fieldIdx]) is present, live, and
+// satisfies eval -- using each sealed segment's columnar block (hot column: no decode; cold
+// column: one cached decode) and each window's live MVCC visibility. A window with no block
+// (active segment) falls back to the row scan; an escaped value is read from the cold tail.
+func (c *Collection) schemaScanCount(s *adSchema, fieldIdx int, fieldID uint32, bc *blockCache, eval func(float64) bool) int {
 	count := 0
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
@@ -57,29 +141,38 @@ func (c *Collection) schemaScanIntCount(s *adSchema, fieldIdx int, match func(in
 						return // not visible at this snapshot
 					}
 					if present {
-						if match(v) {
+						if eval(float64(v)) {
 							count++
 						}
 						return
 					}
-					if rec, err := cs.block.reconstruct(k, bc); err == nil { // escaped: check the cold tail
-						if v2, ok := intFieldOf(s, rec, fieldID); ok && match(v2) {
+					if rec, err := cs.block.reconstruct(k, bc); err == nil { // escaped: cold tail
+						if f, ok := numFieldOf(s, rec, fieldID); ok && eval(f) {
 							count++
 						}
 					}
 				})
 				continue
 			}
-			count += bruteIntCount(w, s0, fieldID, match)
+			count += bruteNumCount(w, s0, fieldID, eval)
 		}
 		releaseWindows(wins)
 	}
 	return count
 }
 
-// bruteIntCount is the row-scan fallback: walk a window's visible records, read the field
-// from the wire ad, and count int matches.
-func bruteIntCount(w segWindow, s0 uint64, fieldID uint32, match func(int64) bool) int {
+// schemaScanIntCount is the int-typed convenience wrapper (used by tests/benchmarks).
+func (c *Collection) schemaScanIntCount(s *adSchema, fieldIdx int, match func(int64) bool) int {
+	bc := (*blockCache)(nil)
+	if st := c.schemaScan.Load(); st != nil {
+		bc = st.cache
+	}
+	return c.schemaScanCount(s, fieldIdx, s.fields[fieldIdx].id, bc, func(f float64) bool { return match(int64(f)) })
+}
+
+// bruteNumCount is the row-scan fallback: walk a window's visible records, read the numeric
+// field from the wire ad, and count matches.
+func bruteNumCount(w segWindow, s0 uint64, fieldID uint32, eval func(float64) bool) int {
 	count := 0
 	var buf []byte
 	for off := 0; off < w.used; {
@@ -92,7 +185,7 @@ func bruteIntCount(w segWindow, s0 uint64, fieldID uint32, match func(int64) boo
 			if ww, err := w.codec.Decompress(buf[:0], recAd(w.data, o)); err == nil {
 				buf = ww
 				if node, ok := wire.Ad(ww).Lookup(fieldID); ok {
-					if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitInt && match(lit.Int) {
+					if f, ok := literalFloat(node); ok && eval(f) {
 						count++
 					}
 				}
@@ -103,18 +196,16 @@ func bruteIntCount(w segWindow, s0 uint64, fieldID uint32, match func(int64) boo
 	return count
 }
 
-// intFieldOf returns the int value of fieldID in a reconstructed schema record, if present as
-// an integer (missing or non-integer ⇒ false).
-func intFieldOf(s *adSchema, rec []byte, fieldID uint32) (int64, bool) {
-	var out int64
+// numFieldOf returns the numeric value (int or real) of fieldID in a reconstructed schema
+// record, if present as a number (missing or non-numeric ⇒ false).
+func numFieldOf(s *adSchema, rec []byte, fieldID uint32) (float64, bool) {
+	var out float64
 	var found bool
 	s.forEach(rec, func(id uint32, node []byte) bool {
 		if id != fieldID {
 			return true
 		}
-		if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitInt {
-			out, found = lit.Int, true
-		}
+		out, found = literalFloat(node)
 		return false
 	})
 	return out, found

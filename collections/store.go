@@ -255,9 +255,9 @@ type Collection struct {
 	// and Rotate). Zero value ⇒ keep everything.
 	ret Retention
 
-	// schemaCache caches decompressed columnar-block streams for the adschema scan path (see
-	// EnableSchemaScan / colscan.go). Nil until schema-scan is enabled.
-	schemaCache atomic.Pointer[blockCache]
+	// schemaScan holds the adschema columnar scan state (resolved schema, hot fields, and the
+	// decompressed-block cache) once EnableSchemaScan is called; nil otherwise. See colscan.go.
+	schemaScan atomic.Pointer[schemaScanState]
 
 	// gcFloor is a runtime-only GC watermark in Retention.MinAgeAttr units: Rotate may
 	// reclaim a fully-consumed segment (its newest age value < gcFloor) EARLY -- before it
