@@ -15,21 +15,25 @@ import (
 //
 // Record layout:
 //
-//		[escape bitmap][fixed blob][uvarint strTableLen][string table][cold tail]
+//		[escape bitmap][numeric blob] [string region][cold tail]
+//		<------ fixed hot prefix ----> <----- compressible tail ----->
 //
 //	  - escape bitmap: one bit per schema field, set when this record's value is missing or
 //	    exceptional (wrong kind, or an int outside the field's chosen width) -- then it is not
 //	    in the fixed slot; an exceptional value is carried in the cold tail, a missing one is
 //	    simply absent.
-//	  - fixed blob: bools bit-packed in a leading bitset, then ints (grouped by ascending width),
-//	    reals, and string slots -- each schema field at a fixed offset.
-//	  - string table: bytes for tabled (>7 byte) strings; an 8-byte string slot is inline for
-//	    <=7 bytes else an (offset,length) into this table.
+//	  - numeric blob: bools bit-packed in a leading bitset, then ints (grouped by ascending
+//	    width) and reals -- each numeric field at a fixed offset. This is the scan/eval fast
+//	    path; kept uncompressed so a field reads at a known offset with no decode.
+//	  - string region: the schema's string fields, in schema order, as uvarint(len)+bytes for
+//	    each non-escaped one (position implied by the escape bitmap -- no per-string offset
+//	    slot). Compressible; a string read walks it rather than O(1), the deliberate trade.
 //	  - cold tail: every non-schema attribute, and every escaped schema field, as the same
 //	    uvarint(id)+node the wire form uses (self-delimiting via wire.NodeLen).
 //
-// This is the internal record encoding only; ads decode back to the wire/ClassAd form on the
-// way out. Numeric fields are the fast path; strings/cold are correctness, not speed.
+// The numeric blob is the fixed hot prefix (uncompressed, fast); the string region + cold tail
+// are the compressible remainder. This is the internal record encoding only; ads decode back
+// to the wire/ClassAd form on the way out.
 type adKind uint8
 
 const (
@@ -186,9 +190,9 @@ func buildAdSchema(sample [][]byte, opts adSchemaOpts) *adSchema {
 		switch domK {
 		case akInt:
 			f.width, f.unsigned = chooseIntWidth(st.intVals, opts.Fit)
-		case akReal, akString:
+		case akReal:
 			f.width = 8
-		}
+		} // akString has no fixed width -- it is positional in the string region
 		fields = append(fields, f)
 	}
 
@@ -213,10 +217,13 @@ func buildAdSchema(sample [][]byte, opts adSchemaOpts) *adSchema {
 	s := &adSchema{byID: make(map[uint32]int, len(fields)), boolBytes: (nBool + 7) / 8}
 	off, bit := s.boolBytes, 0
 	for i := range fields {
-		if fields[i].kind == akBool {
+		switch fields[i].kind {
+		case akBool:
 			fields[i].boolBit = bit
 			bit++
-		} else {
+		case akString:
+			// positional in the string region; no fixed offset
+		default: // int, real
 			fields[i].off = off
 			off += fields[i].width
 		}
@@ -250,37 +257,13 @@ func readIntLE(src []byte, w int, unsigned bool) int64 {
 	return int64(u<<shift) >> shift
 }
 
-// writeStrSlot encodes an 8-byte string slot: high byte 0..7 = inline length (bytes in
-// slot[0:len]); high byte 0xFF = tabled (offset uint32 in slot[0:4], length uint24 in
-// slot[4:7], appended to the per-record table).
-func writeStrSlot(slot []byte, table *[]byte, s string) {
-	if len(s) <= 7 {
-		copy(slot[:7], s)
-		slot[7] = byte(len(s))
-		return
-	}
-	off := len(*table)
-	*table = append(*table, s...)
-	binary.LittleEndian.PutUint32(slot[0:4], uint32(off))
-	slot[4], slot[5], slot[6] = byte(len(s)), byte(len(s)>>8), byte(len(s)>>16)
-	slot[7] = 0xFF
-}
-
-func readStrSlot(slot, table []byte) string {
-	if slot[7] != 0xFF {
-		return string(slot[:slot[7]])
-	}
-	off := binary.LittleEndian.Uint32(slot[0:4])
-	l := int(slot[4]) | int(slot[5])<<8 | int(slot[6])<<16
-	return string(table[off : off+uint32(l)])
-}
-
 // encode lays one wire ad out in the schema record format.
 func (s *adSchema) encode(w wire.Ad) []byte {
 	esc := make([]byte, s.escBytes)
 	fixed := make([]byte, s.fixedLen)
-	var strTable, cold []byte
+	var cold []byte
 	filled := make([]bool, len(s.fields))
+	strVals := make([]string, len(s.fields)) // schema string values, kept for the ordered region
 
 	w.ForEach(func(id uint32, node []byte) bool {
 		idx, ok := s.byID[id]
@@ -304,7 +287,7 @@ func (s *adSchema) encode(w wire.Ad) []byte {
 		case akReal:
 			binary.LittleEndian.PutUint64(fixed[f.off:], math.Float64bits(lit.Real))
 		case akString:
-			writeStrSlot(fixed[f.off:f.off+8], &strTable, lit.Str)
+			strVals[idx] = lit.Str
 		}
 		filled[idx] = true
 		return true
@@ -314,35 +297,30 @@ func (s *adSchema) encode(w wire.Ad) []byte {
 			setBit(esc, i) // missing or exceptional: not in the fixed slot
 		}
 	}
-	rec := make([]byte, 0, s.escBytes+s.fixedLen+len(strTable)+len(cold)+4)
+	rec := make([]byte, 0, s.escBytes+s.fixedLen+len(cold)+16)
 	rec = append(rec, esc...)
 	rec = append(rec, fixed...)
-	rec = binary.AppendUvarint(rec, uint64(len(strTable)))
-	rec = append(rec, strTable...)
+	// String region: schema string fields in order, each present one as uvarint(len)+bytes.
+	for i := range s.fields {
+		if s.fields[i].kind == akString && filled[i] {
+			rec = binary.AppendUvarint(rec, uint64(len(strVals[i])))
+			rec = append(rec, strVals[i]...)
+		}
+	}
 	rec = append(rec, cold...)
 	return rec
 }
 
 // forEach yields every attribute of a schema record as (id, wire node), reconstructing a node
-// for each non-escaped fixed field and replaying the cold tail. Returns false if the record is
-// malformed or fn stopped early. scratch, if non-nil, is reused to build synthesized nodes.
+// for each non-escaped field and replaying the cold tail. Returns false if the record is
+// malformed or fn stopped early.
 func (s *adSchema) forEach(rec []byte, fn func(id uint32, node []byte) bool) bool {
 	if len(rec) < s.escBytes+s.fixedLen {
 		return false
 	}
 	esc := rec[:s.escBytes]
 	fixed := rec[s.escBytes : s.escBytes+s.fixedLen]
-	p := s.escBytes + s.fixedLen
-	strLen, m := binary.Uvarint(rec[p:])
-	if m <= 0 {
-		return false
-	}
-	p += m
-	if p+int(strLen) > len(rec) {
-		return false
-	}
-	strTable := rec[p : p+int(strLen)]
-	cold := rec[p+int(strLen):]
+	p := s.escBytes + s.fixedLen // cursor into the string region, then the cold tail
 
 	var scratch []byte
 	for i := range s.fields {
@@ -359,12 +337,19 @@ func (s *adSchema) forEach(rec []byte, fn func(id uint32, node []byte) bool) boo
 		case akReal:
 			scratch = wire.AppendRealNode(scratch, math.Float64frombits(binary.LittleEndian.Uint64(fixed[f.off:])))
 		case akString:
-			scratch = wire.AppendStringNode(scratch, readStrSlot(fixed[f.off:f.off+8], strTable))
+			l, m := binary.Uvarint(rec[p:])
+			if m <= 0 || p+m+int(l) > len(rec) {
+				return false
+			}
+			p += m
+			scratch = wire.AppendStringNode(scratch, string(rec[p:p+int(l)]))
+			p += int(l)
 		}
 		if !fn(f.id, scratch) {
 			return true
 		}
 	}
+	cold := rec[p:]
 	for len(cold) > 0 {
 		id, m := binary.Uvarint(cold)
 		if m <= 0 {

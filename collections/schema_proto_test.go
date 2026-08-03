@@ -57,14 +57,18 @@ func TestSchemaSizeReport(t *testing.T) {
 
 	report := func(label string, opts adSchemaOpts) {
 		s := buildAdSchema(wires, opts)
-		var raw int
-		var cat []byte
+		var raw, hotBytes int
+		var cat, tailCat []byte
+		split := s.escBytes + s.fixedLen // numeric hot prefix | compressible tail
 		for _, w := range wires {
 			r := s.encode(wire.Ad(w))
 			raw += len(r)
 			cat = append(cat, r...)
+			hotBytes += split
+			tailCat = append(tailCat, r[split:]...)
 		}
-		z := zstdLen(cat)
+		zAll := zstdLen(cat)                  // whole record compressed
+		zSplit := hotBytes + zstdLen(tailCat) // hot prefix uncompressed + tail compressed
 		var nb, ni, nr, ns int
 		for _, f := range s.fields {
 			switch f.kind {
@@ -78,15 +82,17 @@ func TestSchemaSizeReport(t *testing.T) {
 				ns++
 			}
 		}
-		t.Logf("%-24s schema=%d (%db/%di/%dr/%ds) fixed=%dB | raw=%d (%.1f/ad, %+.1f%%) zstd=%d (%+.1f%%)",
-			label, len(s.fields), nb, ni, nr, ns, s.fixedLen,
-			raw, float64(raw)/float64(len(wires)), 100*float64(raw-baseRaw)/float64(baseRaw),
-			z, 100*float64(z-baseZ)/float64(baseZ))
+		t.Logf("%-22s schema=%d (%db/%di/%dr/%ds) hot=%dB | raw %+.1f%% | zstd-all %+.1f%% | zstd hot+tail %+.1f%%",
+			label, len(s.fields), nb, ni, nr, ns, split,
+			100*float64(raw-baseRaw)/float64(baseRaw),
+			100*float64(zAll-baseZ)/float64(baseZ),
+			100*float64(zSplit-baseZ)/float64(baseZ))
 	}
 	report("numeric p90/f95", adSchemaOpts{Presence: 0.90, Fit: 0.95})
 	report("numeric p95/f95", adSchemaOpts{Presence: 0.95, Fit: 0.95})
 	report("numeric+str p90/f95", adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
 	report("numeric+str p95/f95", adSchemaOpts{Presence: 0.95, Fit: 0.95, Strings: true})
+	report("numeric+str p80/f95", adSchemaOpts{Presence: 0.80, Fit: 0.95, Strings: true})
 }
 
 // memoryField resolves Memory as an int schema field for the scan benchmarks.
