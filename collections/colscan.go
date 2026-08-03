@@ -14,6 +14,11 @@ type colSegment struct {
 // segment. Additive and opt-in: with no block a scan falls back to the row path, so a
 // collection that never calls this is unaffected. Reads immutable sealed bytes only.
 func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
+	if c.schemaCache.Load() == nil {
+		if bc, err := newBlockCache(256 << 20); err == nil { // ~256 MiB of decompressed blocks
+			c.schemaCache.Store(bc)
+		}
+	}
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		act := sh.act
@@ -39,13 +44,14 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 // value may live in the cold tail, e.g. an out-of-width int).
 func (c *Collection) schemaScanIntCount(s *adSchema, fieldIdx int, match func(int64) bool) int {
 	fieldID := s.fields[fieldIdx].id
+	bc := c.schemaCache.Load()
 	count := 0
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
 			cs := w.seg.colblk.Load()
 			if cs != nil && cs.block.schema == s {
-				cs.block.scanInt(fieldIdx, func(k int, present bool, v int64) {
+				cs.block.scanInt(fieldIdx, bc, func(k int, present bool, v int64) {
 					o := cs.offs[k]
 					if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 						return // not visible at this snapshot
@@ -56,7 +62,7 @@ func (c *Collection) schemaScanIntCount(s *adSchema, fieldIdx int, match func(in
 						}
 						return
 					}
-					if rec, err := cs.block.reconstruct(k); err == nil { // escaped: check the cold tail
+					if rec, err := cs.block.reconstruct(k, bc); err == nil { // escaped: check the cold tail
 						if v2, ok := intFieldOf(s, rec, fieldID); ok && match(v2) {
 							count++
 						}

@@ -68,13 +68,13 @@ func TestBuildColumnarFromSegment(t *testing.T) {
 	// One column-scan pass: block value per record.
 	scanned := make([]int64, n)
 	scannedPresent := make([]bool, n)
-	if err := blk.scanInt(memIdx, func(k int, p bool, v int64) { scannedPresent[k], scanned[k] = p, v }); err != nil {
+	if err := blk.scanInt(memIdx, nil, func(k int, p bool, v int64) { scannedPresent[k], scanned[k] = p, v }); err != nil {
 		t.Fatal(err)
 	}
 
 	for k := 0; k < n; k++ {
 		// (1) reconstruct == the ad at offs[k].
-		rec, err := blk.reconstruct(k)
+		rec, err := blk.reconstruct(k, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

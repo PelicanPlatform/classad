@@ -2,11 +2,15 @@ package collections
 
 import (
 	"errors"
+	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 var errNotNumericField = errors.New("adschema: scanInt on a non-numeric field")
+
+// colBlockSeq assigns each built block a process-unique id, used as the block-cache key.
+var colBlockSeq atomic.Uint64
 
 // columnarBlock is the PAX layout for a row-group of adSchema records (see adschema.go): the
 // schema's popular ("hot") numeric fields plus the escape and bool bitsets stay uncompressed
@@ -21,6 +25,7 @@ var errNotNumericField = errors.New("adschema: scanInt on a non-numeric field")
 // packed]. Cold numeric buffer is columnar: each cold field's values contiguous across the
 // block. String/cold streams are per-record regions concatenated, addressed by strOff/coldOff.
 type columnarBlock struct {
+	id     uint64 // process-unique, the block-cache key
 	schema *adSchema
 	codec  Codec
 	n      int
@@ -47,7 +52,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec C
 	for _, i := range hotNumFields {
 		hotSet[i] = true
 	}
-	b := &columnarBlock{schema: s, codec: codec, n: len(recs), hotFieldOff: map[int]int{}, coldFieldStart: map[int]int{}}
+	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: len(recs), hotFieldOff: map[int]int{}, coldFieldStart: map[int]int{}}
 	for i := range s.fields {
 		if k := s.fields[i].kind; k == akInt || k == akReal {
 			if hotSet[i] {
@@ -127,9 +132,10 @@ func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, h
 }
 
 // scanInt calls fn for each record's value of a numeric (int/real read as int bits) field: a
-// hot field reads the uncompressed region directly; a cold field decompresses its column group
-// once. present is false for a missing/exceptional record (its value is in the cold tail).
-func (b *columnarBlock) scanInt(fieldIdx int, fn func(rec int, present bool, v int64)) error {
+// hot field reads the uncompressed region directly (no decode); a cold field decompresses its
+// column group once (via bc, nil for no cache). present is false for a missing/exceptional
+// record (its value is in the cold tail).
+func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, present bool, v int64)) error {
 	f := b.schema.fields[fieldIdx]
 	if _, hot := b.hotFieldOff[fieldIdx]; hot {
 		off := b.hotFieldOff[fieldIdx]
@@ -147,17 +153,16 @@ func (b *columnarBlock) scanInt(fieldIdx int, fn func(rec int, present bool, v i
 	if !ok {
 		return errNotNumericField
 	}
-	coldRaw, err := b.codec.Decompress(nil, b.coldNumComp) // one decode for the whole column group
+	ds, err := bc.streams(b)
 	if err != nil {
 		return err
 	}
-	esc := b.escapeAt
 	for k := 0; k < b.n; k++ {
-		if testBit(esc(k), fieldIdx) {
+		if testBit(b.escapeAt(k), fieldIdx) {
 			fn(k, false, 0)
 			continue
 		}
-		fn(k, true, readIntLE(coldRaw[start+k*f.width:], f.width, f.unsigned))
+		fn(k, true, readIntLE(ds.coldNum[start+k*f.width:], f.width, f.unsigned))
 	}
 	return nil
 }
@@ -170,21 +175,14 @@ func (b *columnarBlock) escapeAt(k int) []byte {
 
 // reconstruct rebuilds record k's row form (identical to the adSchema.encode input), so
 // schema.forEach reconstructs the full ad. Decompresses the cold-numeric, string, and cold
-// streams -- the full-ad-read cost.
-func (b *columnarBlock) reconstruct(k int) ([]byte, error) {
+// streams (via bc, nil for no cache) -- the full-ad-read cost, amortized by the cache.
+func (b *columnarBlock) reconstruct(k int, bc *blockCache) ([]byte, error) {
 	s := b.schema
-	coldRaw, err := b.codec.Decompress(nil, b.coldNumComp)
+	ds, err := bc.streams(b)
 	if err != nil {
 		return nil, err
 	}
-	strRaw, err := b.codec.Decompress(nil, b.strComp)
-	if err != nil {
-		return nil, err
-	}
-	tailRaw, err := b.codec.Decompress(nil, b.coldComp)
-	if err != nil {
-		return nil, err
-	}
+	coldRaw, strRaw, tailRaw := ds.coldNum, ds.str, ds.cold
 	rec := make([]byte, s.escBytes+s.fixedLen, s.escBytes+s.fixedLen+(b.strOff[k+1]-b.strOff[k])+(b.coldOff[k+1]-b.coldOff[k]))
 	base := k * b.hotStride
 	copy(rec[:s.escBytes], b.hot[base:base+s.escBytes])                                              // escape
