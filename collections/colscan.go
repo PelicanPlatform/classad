@@ -1,6 +1,9 @@
 package collections
 
 import (
+	"sort"
+	"strings"
+
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -49,6 +52,61 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 			seg.colblk.Store(&colSegment{block: blk, offs: offs})
 		}
 	}
+}
+
+// BuildAndEnableSchemaScan samples the collection, builds an adschema, chooses the hot numeric
+// tier as the top-hotTopN int/real fields by accumulated read demand (c.demand -- the same
+// signal RefreshHotSet uses; the schema's hot tier IS the hot set), and enables the columnar
+// scan over the sealed segments. Returns false if there is nothing to sample. Re-callable to
+// pick up newly-sealed segments (existing blocks are kept).
+func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
+	samples := c.CollectSamples(sampleMax)
+	if len(samples) == 0 {
+		return false
+	}
+	s := buildAdSchema(samples, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
+	if len(s.fields) == 0 {
+		return false
+	}
+	type fieldDemand struct {
+		idx   int
+		reads int64
+	}
+	var nums []fieldDemand
+	for i := range s.fields {
+		if k := s.fields[i].kind; k != akInt && k != akReal {
+			continue
+		}
+		var reads int64
+		if name, ok := c.intern.Name(s.fields[i].id); ok {
+			if v, ok := c.demand.m.Load(strings.ToLower(name)); ok {
+				reads = v.(*demandCounts).reads.Load()
+			}
+		}
+		nums = append(nums, fieldDemand{i, reads})
+	}
+	sort.Slice(nums, func(a, b int) bool {
+		if nums[a].reads != nums[b].reads {
+			return nums[a].reads > nums[b].reads
+		}
+		return nums[a].idx < nums[b].idx
+	})
+	hot := make([]int, 0, hotTopN)
+	for i := 0; i < len(nums) && i < hotTopN; i++ {
+		hot = append(hot, nums[i].idx)
+	}
+	c.EnableSchemaScan(s, hot)
+	return true
+}
+
+// CountConstraint parses a constraint string and, if it is columnar-eligible, counts via the
+// columnar scan (see CountQuery). ok=false ⇒ use the normal count path.
+func (c *Collection) CountConstraint(constraint string) (int, bool) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return 0, false
+	}
+	return c.CountQuery(q)
 }
 
 // CountQuery counts the records matching q using the columnar scan, when q is exactly (Native)
