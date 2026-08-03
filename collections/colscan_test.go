@@ -32,7 +32,7 @@ func (c *Collection) allBruteCount(fieldID uint32, match func(int64) bool) int {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
-			count += bruteIntCount(w, s0, fieldID, match)
+			count += bruteNumCount(w, s0, fieldID, func(f float64) bool { return match(int64(f)) })
 		}
 		releaseWindows(wins)
 	}
