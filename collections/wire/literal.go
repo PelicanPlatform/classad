@@ -46,6 +46,31 @@ func StringLiteralValue(node []byte) ([]byte, bool) {
 	return node[start : start+int(l)], true
 }
 
+// AppendBoolNode, AppendIntNode, AppendRealNode, and AppendStringNode append a scalar literal
+// wire node to dst and return the extended slice -- the inverse of LiteralValue. They let a
+// caller reconstruct a wire node from a typed value (e.g. the per-segment schema decoder
+// rebuilding a node from a fixed-layout field), producing bytes LiteralValue reads back
+// exactly.
+func AppendBoolNode(dst []byte, b bool) []byte {
+	if b {
+		return append(dst, nBoolTrue)
+	}
+	return append(dst, nBoolFalse)
+}
+
+func AppendIntNode(dst []byte, v int64) []byte {
+	return binary.AppendVarint(append(dst, nInt), v)
+}
+
+func AppendRealNode(dst []byte, f float64) []byte {
+	return binary.LittleEndian.AppendUint64(append(dst, nReal), math.Float64bits(f))
+}
+
+func AppendStringNode(dst []byte, s string) []byte {
+	dst = binary.AppendUvarint(append(dst, nString), uint64(len(s)))
+	return append(dst, s...)
+}
+
 // LiteralValue decodes node as a scalar literal, returning (lit, true) if node is
 // one, or (_, false) if it is a list, record, or computed expression (which must
 // be decoded via DecodeNode and evaluated). It is allocation-free except for the

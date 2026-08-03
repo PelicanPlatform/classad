@@ -579,6 +579,20 @@ func foldEqualBytes(b []byte, s string) bool {
 }
 
 // skipNode advances c past exactly one node without allocating.
+// NodeLen returns the byte length of the single wire node at the start of b -- a scalar
+// literal (int/real/bool/string/undefined/error) or a computed expression (op/ref/list/
+// record/func). It lets a caller that stores concatenated uvarint(id)+node entries (e.g. the
+// per-segment schema's cold tail) split them without a separate length prefix. ok is false if
+// b does not begin with a well-formed node.
+func NodeLen(b []byte) (int, bool) {
+	c := &cursor{b: b, ok: true}
+	skipNode(c, 0)
+	if !c.ok {
+		return 0, false
+	}
+	return c.pos, true
+}
+
 func skipNode(c *cursor, depth int) {
 	if !c.ok {
 		return
