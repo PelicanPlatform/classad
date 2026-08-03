@@ -954,9 +954,13 @@ func (s *segStats) estEqualFloat(v float64) float64 {
 	return s.avgTailCount()
 }
 
-// estRange returns the estimated fraction of indexable records passing a range
-// comparison against threshold t, by linear interpolation over [min,max].
+// estRange returns the estimated fraction of indexable records passing a range comparison
+// against threshold t. It uses the equi-depth histogram when present (skew-aware), falling
+// back to linear interpolation over [min,max] for a pre-v9 sidecar or a degenerate span.
 func (s *segStats) estRange(op string, t float64) float64 {
+	if s.hist != nil {
+		return s.hist.estRange(op, t)
+	}
 	if !s.hasRange || s.max <= s.min {
 		if cmpFloat(op, s.min, t) {
 			return 1

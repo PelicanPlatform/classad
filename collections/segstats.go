@@ -78,6 +78,101 @@ type segStats struct {
 	top   []topEntry   // up to topNMax heavy hitters, descending by count
 	bloom *bloomFilter // categorical membership; nil for a value index
 	hll   *hyperLogLog // mergeable distinct-count sketch
+
+	// hist is the equi-depth histogram for a value index's numeric distribution, giving
+	// skew-aware range selectivity instead of uniform [min,max] interpolation. nil for a
+	// categorical attribute, an empty value index, or a pre-v9 sidecar (falls back to the
+	// [min,max] model).
+	hist *valHistogram
+}
+
+// histMaxBuckets bounds the equi-depth histogram kept per value-index attribute per segment:
+// at most this many (value-quantile, cumulative-count) points. 64 gives skew-accurate range
+// selectivity at ~1 KiB/attr/segment, on the order of the HLL's footprint.
+const histMaxBuckets = 64
+
+// valHistogram is an equi-depth (equi-height) histogram over a value index's numeric
+// distribution, built exactly from the segment's postings. It replaces the uniform [min,max]
+// assumption for range selectivity: linear interpolation badly mis-estimates skewed data
+// (e.g. a few huge-Memory nodes stretch max, so `Memory > 4096` estimates ~99% when the truth
+// is ~40%), while the histogram's buckets concentrate where the data is dense. lo is the
+// smallest value (bucket 0's lower edge); bound[i] is the largest value in bucket i
+// (ascending); cum[i] is the count of indexable records with value <= bound[i] (ascending;
+// cum[last] == total indexable).
+type valHistogram struct {
+	lo    float64
+	bound []float64
+	cum   []uint64
+}
+
+// buildValHistogram builds an equi-depth histogram from a value index's ascending distinct
+// keys and their exact per-key record counts. Returns nil for an empty distribution. With
+// fewer distinct values than buckets it degenerates to one bucket per value -- an exact CDF.
+// A single key whose count exceeds the per-bucket target simply forms one heavy bucket (a
+// value cannot be split), and buckets resume at ~target records after it.
+func buildValHistogram(sortedKeys []float64, counts []uint64, indexable uint64) *valHistogram {
+	if len(sortedKeys) == 0 || indexable == 0 {
+		return nil
+	}
+	target := float64(indexable) / float64(histMaxBuckets)
+	if target < 1 {
+		target = 1
+	}
+	h := &valHistogram{lo: sortedKeys[0], bound: make([]float64, 0, histMaxBuckets), cum: make([]uint64, 0, histMaxBuckets)}
+	var running uint64
+	edge := target
+	last := len(sortedKeys) - 1
+	for i, k := range sortedKeys {
+		running += counts[i]
+		if float64(running) >= edge || i == last {
+			h.bound = append(h.bound, k)
+			h.cum = append(h.cum, running)
+			edge = float64(running) + target
+		}
+	}
+	return h
+}
+
+// cdf estimates the fraction of indexable records with value <= t, by piecewise-linear
+// interpolation of the cumulative counts across the bucket the threshold falls in.
+func (h *valHistogram) cdf(t float64) float64 {
+	n := len(h.bound)
+	total := float64(h.cum[n-1])
+	if total <= 0 {
+		return 0
+	}
+	if t < h.lo {
+		return 0
+	}
+	if t >= h.bound[n-1] {
+		return 1
+	}
+	i := sort.Search(n, func(j int) bool { return h.bound[j] >= t }) // first bucket top >= t
+	loB, cumPrev := h.lo, 0.0
+	if i > 0 {
+		loB, cumPrev = h.bound[i-1], float64(h.cum[i-1])
+	}
+	// Interpolate within the bucket. A zero-span bucket only occurs at bucket 0 when the low
+	// value equals the first boundary; leaving frac at 0 keeps cdf(min)=0, so `>= min` reads
+	// ~100% (matching the previous uniform model) rather than treating the min as a point mass
+	// -- estRange conflates `>`/`>=`, so a point mass at t would mis-score the inclusive side.
+	frac := 0.0
+	if span := h.bound[i] - loB; span > 0 {
+		frac = (t - loB) / span
+	}
+	return (cumPrev + frac*(float64(h.cum[i])-cumPrev)) / total
+}
+
+// estRange returns the estimated fraction of indexable records passing op against t.
+func (h *valHistogram) estRange(op string, t float64) float64 {
+	f := h.cdf(t)
+	switch op {
+	case "<", "<=":
+		return math.Max(0, math.Min(1, f))
+	case ">", ">=":
+		return math.Max(0, math.Min(1, 1-f))
+	}
+	return 1
 }
 
 // avgTailCount estimates the record count of a value that is NOT one of the kept
@@ -134,6 +229,13 @@ func (vp *valPostings) finishStats() {
 		vp.sortedKeys = append(vp.sortedKeys, k)
 	}
 	sort.Float64s(vp.sortedKeys)
+	// Equi-depth histogram over the exact (value, count) distribution, for skew-aware range
+	// selectivity (replaces uniform [min,max] interpolation in estRange).
+	counts := make([]uint64, len(vp.sortedKeys))
+	for i, k := range vp.sortedKeys {
+		counts[i] = vp.post[k].GetCardinality()
+	}
+	s.hist = buildValHistogram(vp.sortedKeys, counts, indexable)
 }
 
 // finishStats fills the categorical top-N, NDV, bloom and HLL fields from a

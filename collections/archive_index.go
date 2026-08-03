@@ -53,7 +53,7 @@ import (
 // simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 8          // v8 appended a CRC-32C footer over the whole sidecar
+	sidecarVersion = 9          // v9 appended a per-value-attr equi-depth histogram to each stats block
 
 	// mphNDVThreshold gates the categorical minimal-perfect-hash: only an attribute with
 	// at least this many distinct values in a segment gets one. Below it, the sorted key
@@ -384,6 +384,18 @@ func appendSegStats(b []byte, s *segStats) []byte {
 	} else {
 		b = appendBytes(b, nil)
 	}
+	// Equi-depth histogram (v9): bucket count, low edge, then (upper-bound, cumulative-count)
+	// per bucket. Zero buckets for a categorical attribute or an empty value index.
+	if s.hist != nil {
+		b = appendU32(b, uint32(len(s.hist.bound)))
+		b = appendU64(b, math.Float64bits(s.hist.lo))
+		for i := range s.hist.bound {
+			b = appendU64(b, math.Float64bits(s.hist.bound[i]))
+			b = appendU64(b, s.hist.cum[i])
+		}
+	} else {
+		b = appendU32(b, 0)
+	}
 	return b
 }
 
@@ -408,6 +420,14 @@ func readSegStats(d []byte, off uint32) *segStats {
 	}
 	if reg := c.bytes(); len(reg) > 0 {
 		s.hll = &hyperLogLog{reg: append([]uint8(nil), reg...)}
+	}
+	if n := c.u32(); n > 0 && n < 1<<20 {
+		h := &valHistogram{lo: math.Float64frombits(c.u64()), bound: make([]float64, n), cum: make([]uint64, n)}
+		for i := uint32(0); i < n; i++ {
+			h.bound[i] = math.Float64frombits(c.u64())
+			h.cum[i] = c.u64()
+		}
+		s.hist = h
 	}
 	return s
 }
