@@ -25,6 +25,13 @@ type Server struct {
 	nextID atomic.Uint64
 	stopBG []func()
 
+	// maintainOpts is the self-tuning configuration StartMaintenance was given; the on-demand
+	// "analyze" admin action reuses it so a manual optimize matches the scheduled pass.
+	// maintainMu serializes any Maintain pass (scheduled or on-demand) on this server so two
+	// do not retune the same table at once.
+	maintainOpts db.MaintainOptions
+	maintainMu   sync.Mutex
+
 	// propose, when set, routes a committing transaction's writes through an external
 	// consensus layer (raft) instead of committing them to the local store: on opCommit
 	// the accumulated ops are handed to propose, which is the store's sole writer. Set by
@@ -240,6 +247,7 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 	if interval <= 0 {
 		interval = defaultMaintenanceInterval
 	}
+	s.maintainOpts = opts // reused by the on-demand "analyze" admin action
 	done := make(chan struct{})
 	go func() {
 		t := time.NewTimer(interval)
@@ -253,7 +261,9 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 			start := time.Now()
 			for _, name := range s.cat.Tables() {
 				if d, ok := s.cat.Table(name); ok {
+					s.maintainMu.Lock()
 					d.Maintain(opts)
+					s.maintainMu.Unlock()
 				}
 			}
 			// Keep the duty cycle under the cap: wait at least pass/dutyCycle before the

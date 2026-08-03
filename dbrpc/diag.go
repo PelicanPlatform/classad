@@ -52,6 +52,11 @@ type Diagnostics struct {
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
 const diagSampleMax = 2000
 
+// defaultAnalyzeHotTopN is the hot-set size an on-demand "analyze" uses when the server was
+// started without a maintenance hot-set target (HotTopN == 0), so analyze still refreshes the
+// hot set from read demand.
+const defaultAnalyzeHotTopN = 32
+
 // diagJSON gathers a table's diagnostics into JSON.
 func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 	cat, val := t.IndexedAttrs()
@@ -224,6 +229,31 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 		}
 		n := t.RefreshHotSet(sampleMax, topN)
 		return fmt.Sprintf("refreshed hot set: %d attribute(s)", n), nil
+	case "analyze":
+		// On-demand self-tuning pass ("optimize now"), the manual counterpart to the scheduled
+		// StartMaintenance. Reuses the server's configured maintenance options so it matches the
+		// scheduled pass, but never does the heavy dictionary retrain (that recompacts -- it is
+		// rewrite/codec.retrain's job). Refreshes the hot set from accumulated read demand and,
+		// when auto-index is configured, retunes indexes; then reindexes unconditionally so value
+		// histograms and any index/hot changes take effect even when auto-index is off.
+		opts := s.maintainOpts
+		opts.Retrain = false
+		if opts.SampleMax <= 0 {
+			opts.SampleMax = diagSampleMax
+		}
+		if opts.HotTopN <= 0 {
+			opts.HotTopN = defaultAnalyzeHotTopN
+		}
+		if len(args) == 1 { // optional hot-set size override: analyze <topN>
+			if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+				opts.HotTopN = v
+			}
+		}
+		s.maintainMu.Lock()
+		t.Maintain(opts)
+		t.Reindex()
+		s.maintainMu.Unlock()
+		return fmt.Sprintf("analyzed: hot set = %d attribute(s)", len(t.HotAttrs())), nil
 	default:
 		return "", fmt.Errorf("unknown admin action %q", action)
 	}
@@ -267,6 +297,12 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 	case "index.reindex":
 		a.Reindex()
 		return "reindexed", nil
+	case "analyze":
+		// An append-only archive has no demand-driven index/hot auto-tune (its layout is fixed
+		// at creation), so "redo statistics" is a reindex: it rebuilds each segment's per-value
+		// histogram and other selectivity stats. Superseded-version drift does not apply.
+		a.Reindex()
+		return "analyzed (reindexed selectivity statistics)", nil
 	case "rewrite":
 		return fmt.Sprintf("rewrote %d record(s) with the current hot set", a.Rewrite()), nil
 	case "codec.retrain":
