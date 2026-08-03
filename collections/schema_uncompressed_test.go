@@ -1,26 +1,10 @@
 package collections
 
 import (
-	"encoding/binary"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
-
-// splitRecord divides a schema record into its numeric prefix, string region, and cold tail
-// by walking the string region (uvarint(len)+bytes for each non-escaped string field).
-func (s *adSchema) splitRecord(r []byte) (prefix, strs, cold []byte) {
-	prefixLen := s.escBytes + s.fixedLen
-	p := prefixLen
-	esc := r[:s.escBytes]
-	for i := range s.fields {
-		if s.fields[i].kind == akString && !testBit(esc, i) {
-			l, m := binary.Uvarint(r[p:])
-			p += m + int(l)
-		}
-	}
-	return r[:prefixLen], r[prefixLen:p], r[p:]
-}
 
 // TestSchemaUncompressedNumericSize characterizes the target design: numeric prefix left
 // UNCOMPRESSED (for the no-decode scan), string column and cold tail each compressed as their

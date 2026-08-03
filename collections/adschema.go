@@ -257,6 +257,22 @@ func readIntLE(src []byte, w int, unsigned bool) int64 {
 	return int64(u<<shift) >> shift
 }
 
+// splitRecord divides a schema record into its fixed numeric prefix ([escape][numeric blob]),
+// its string region, and its cold tail, by walking the positional string region (uvarint(len)+
+// bytes per non-escaped string field). Used by the columnar (sealed) encoder.
+func (s *adSchema) splitRecord(r []byte) (prefix, strs, cold []byte) {
+	prefixLen := s.escBytes + s.fixedLen
+	p := prefixLen
+	esc := r[:s.escBytes]
+	for i := range s.fields {
+		if s.fields[i].kind == akString && !testBit(esc, i) {
+			l, m := binary.Uvarint(r[p:])
+			p += m + int(l)
+		}
+	}
+	return r[:prefixLen], r[prefixLen:p], r[p:]
+}
+
 // encode lays one wire ad out in the schema record format.
 func (s *adSchema) encode(w wire.Ad) []byte {
 	esc := make([]byte, s.escBytes)
