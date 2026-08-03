@@ -2,10 +2,12 @@ package collections
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"sort"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/klauspost/compress/zstd"
 )
@@ -447,5 +449,72 @@ func BenchmarkSchemaScanMemory(b *testing.B) {
 			}
 		}
 		b.Logf("matched=%d/%d", matched, len(wires))
+	})
+}
+
+// BenchmarkSchemaScanEndToEnd compares the schema fixed-offset scan against the REAL store
+// scan paths for `Memory > 4096` over the same corpus: Query (decode+eval each match) and
+// QueryProject (the wire-native count-where path the aggregate uses). This is the honest
+// end-to-end number -- the store baselines include predicate eval and visibility.
+func BenchmarkSchemaScanEndToEnd(b *testing.B) {
+	ads, _ := loadOSPoolAds(b)
+	c, wires := encodeOSPool(b, ads)
+	memID, ok := c.intern.LookupID("Memory")
+	if !ok {
+		b.Skip("no Memory")
+	}
+	// Real, queryable store (no index -> full scan, the unselective-predicate case).
+	store := New(Options{Shards: 1})
+	for i, ad := range ads {
+		if err := store.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			b.Fatal(err)
+		}
+	}
+	q, err := vm.Parse("Memory > 4096")
+	if err != nil {
+		b.Fatal(err)
+	}
+	s := buildSchema(wires, 0.90, 0.95, false)
+	ma := s.attrs[s.byID[memID]]
+	recs := make([][]byte, len(wires))
+	for i, w := range wires {
+		recs[i] = s.encodeRecord(w)
+	}
+	const threshold = 4096
+
+	b.Run("StoreQuery", func(b *testing.B) {
+		b.ReportAllocs()
+		for n := 0; n < b.N; n++ {
+			cnt := 0
+			for range store.Query(q) {
+				cnt++
+			}
+			_ = cnt
+		}
+	})
+	b.Run("StoreQueryProject", func(b *testing.B) {
+		b.ReportAllocs()
+		for n := 0; n < b.N; n++ {
+			cnt := 0
+			for range store.QueryProject(q, []string{"Memory"}) {
+				cnt++
+			}
+			_ = cnt
+		}
+	})
+	b.Run("SchemaFixedScan", func(b *testing.B) {
+		b.ReportAllocs()
+		for n := 0; n < b.N; n++ {
+			cnt := 0
+			for _, r := range recs {
+				if testBit(r[:s.escBytes], ma.escIdx) {
+					continue
+				}
+				if readIntLE(r[s.escBytes+ma.off:], ma.width, ma.unsigned) > threshold {
+					cnt++
+				}
+			}
+			_ = cnt
+		}
 	})
 }
