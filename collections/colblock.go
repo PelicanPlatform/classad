@@ -47,12 +47,17 @@ type columnarBlock struct {
 // adSchema.encode). hotNumFields lists the schema field indices (int/real) to keep uncompressed
 // -- the popular ones, by query demand. Bools and the escape bitmap are always in the hot
 // region (tiny, and bools may be scanned).
-func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec Codec) *columnarBlock {
+// layoutColumnar fills b's hot/cold field partition and their offsets from the schema and hot
+// set: hot numerics packed after the escape+bool bitsets (stride hotStride), cold numerics
+// columnar (each field's n values contiguous). Deterministic in (schema, hotSet, n), so the
+// persisted-block decoder reproduces the exact layout.
+func layoutColumnar(b *columnarBlock, s *adSchema, hotNumFields []int, n int) {
 	hotSet := make(map[int]bool, len(hotNumFields))
 	for _, i := range hotNumFields {
 		hotSet[i] = true
 	}
-	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: len(recs), hotFieldOff: map[int]int{}, coldFieldStart: map[int]int{}}
+	b.hotNum, b.coldNum = b.hotNum[:0], b.coldNum[:0]
+	b.hotFieldOff, b.coldFieldStart = map[int]int{}, map[int]int{}
 	for i := range s.fields {
 		if k := s.fields[i].kind; k == akInt || k == akReal {
 			if hotSet[i] {
@@ -62,7 +67,6 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec C
 			}
 		}
 	}
-	// Hot region layout and cold columnar offsets.
 	hp := s.escBytes + s.boolBytes
 	for _, i := range b.hotNum {
 		b.hotFieldOff[i] = hp
@@ -72,9 +76,17 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec C
 	cp := 0
 	for _, i := range b.coldNum {
 		b.coldFieldStart[i] = cp
+		cp += s.fields[i].width * n
+	}
+}
+
+func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec Codec) *columnarBlock {
+	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: len(recs)}
+	layoutColumnar(b, s, hotNumFields, len(recs))
+	cp := 0
+	for _, i := range b.coldNum {
 		cp += s.fields[i].width * len(recs)
 	}
-
 	b.hot = make([]byte, 0, b.hotStride*len(recs))
 	coldRaw := make([]byte, cp)
 	var strCat, coldCat []byte

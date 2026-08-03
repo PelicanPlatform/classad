@@ -196,8 +196,15 @@ func buildAdSchema(sample [][]byte, opts adSchemaOpts) *adSchema {
 		fields = append(fields, f)
 	}
 
-	// Layout: bool, int (width asc), real, string; ties by id for determinism. Grouping bools
-	// first lets them bit-pack; grouping ints by width keeps the blob dense.
+	return layoutSchema(fields)
+}
+
+// layoutSchema orders the fields (bool, int by ascending width, real, string; ties by id) and
+// assigns each its fixed-blob offset / bit index, deriving boolBytes/fixedLen/escBytes/byID. It
+// is deterministic in the field set, so both buildAdSchema and the persisted-schema decoder
+// produce an identical layout. Grouping bools first lets them bit-pack; grouping ints by width
+// keeps the blob dense.
+func layoutSchema(fields []adField) *adSchema {
 	sort.Slice(fields, func(i, j int) bool {
 		if fields[i].kind != fields[j].kind {
 			return fields[i].kind < fields[j].kind
@@ -207,7 +214,6 @@ func buildAdSchema(sample [][]byte, opts adSchemaOpts) *adSchema {
 		}
 		return fields[i].id < fields[j].id
 	})
-
 	nBool := 0
 	for _, f := range fields {
 		if f.kind == akBool {
