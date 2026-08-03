@@ -1,6 +1,10 @@
 package collections
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/PelicanPlatform/classad/collections/wire"
+)
 
 var errNotNumericField = errors.New("adschema: scanInt on a non-numeric field")
 
@@ -92,6 +96,34 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec C
 	b.strComp = codec.Compress(nil, strCat)
 	b.coldComp = codec.Compress(nil, coldCat)
 	return b
+}
+
+// buildColumnarFromSegment transcodes a segment's live-arena records in [0, upto) into a
+// columnar block, mirroring buildSegIndex: it walks the records, decompresses each (skipping
+// time-travel markers), re-encodes it in the adSchema row form, and builds the block. It
+// returns the block and offs, where offs[k] is the segment offset of block record k -- the map
+// a scan uses to recover each record's MVCC seq/sup (for visibility) and its key. Reads
+// immutable segment bytes only.
+func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, hot []int) (*columnarBlock, []uint32) {
+	var recs [][]byte
+	var offs []uint32
+	var buf []byte
+	for off := 0; off < upto; {
+		o := uint32(off)
+		total := recTotalLen(data, o)
+		if total == 0 {
+			break
+		}
+		if !recIsMarker(data, o) {
+			if w, err := codec.Decompress(buf[:0], recAd(data, o)); err == nil {
+				buf = w
+				recs = append(recs, s.encode(wire.Ad(w)))
+				offs = append(offs, o)
+			}
+		}
+		off += int(total)
+	}
+	return encodeColumnarBlock(s, recs, hot, codec), offs
 }
 
 // scanInt calls fn for each record's value of a numeric (int/real read as int bits) field: a
