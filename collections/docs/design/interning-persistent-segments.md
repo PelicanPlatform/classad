@@ -1,5 +1,13 @@
 # Design: interning persistent segments (per-segment dictionaries)
 
+> **Status (phase 1: implemented & live).** Persistent, plaintext collections now write
+> interned segments at compaction, with per-segment dictionaries; recovery restores them; every
+> read path (scan, point lookup, index build, adschema) resolves segment-local ids. On by
+> default; validated by the full collections suite plus `TestInterningEndToEnd` /
+> `TestInterningSchemaScan`. Follow-ups: hot-header on the interned encode, corrupt-dict
+> auto-rebuild, tighter dict reserve, then phase 2 (encryption) / phase 3 (migrate + retire
+> inline).
+
 ## Motivation
 
 Persistent collections today store records **inline-name encoded** (`flagInlineNames`):
