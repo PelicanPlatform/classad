@@ -1082,21 +1082,21 @@ func matchWire(w []byte, qp queryPlan) bool {
 		// A queried attribute was a non-literal expression; fall back.
 	}
 	if qp.plan.PartialSafe {
-		child := partialDecodeWire(qp.ws.ctx, w, qp.plan.Seeds)
+		child := partialDecodeWire(qp.ws.ctx, qp.ws.dict, w, qp.plan.Seeds)
 		if qp.ws.parent != nil {
 			// The child inherits any seed it lacks from the parent, so decode the
 			// same seeds from the parent and chain.
-			child.SetParent(partialDecodeWire(qp.ws.ctx, []byte(qp.ws.parent), qp.plan.Seeds))
+			child.SetParent(partialDecodeWire(qp.ws.ctx, qp.ws.parentDict, []byte(qp.ws.parent), qp.plan.Seeds))
 		}
 		return qp.m.Matches(child)
 	}
-	a, err := qp.ws.ctx.decodeWire(w)
+	a, err := decodeWireDictCtx(qp.ws.ctx, qp.ws.dict, w)
 	if err != nil {
 		return false
 	}
 	child := classad.FromAST(a)
 	if qp.ws.parent != nil {
-		if pa, err := qp.ws.ctx.decodeWire([]byte(qp.ws.parent)); err == nil {
+		if pa, err := decodeWireDictCtx(qp.ws.ctx, qp.ws.parentDict, []byte(qp.ws.parent)); err == nil {
 			child.SetParent(classad.FromAST(pa))
 		}
 	}
@@ -1108,7 +1108,7 @@ func matchWire(w []byte, qp queryPlan) bool {
 // bytes without materializing its other (potentially many) attributes. An
 // attribute the ad lacks is simply omitted, so a reference to it evaluates to
 // undefined — exactly as it would against a full decode.
-func partialDecodeWire(ctx wireCtx, w []byte, seeds []string) *classad.ClassAd {
+func partialDecodeWire(ctx wireCtx, dict *segDictHandle, w []byte, seeds []string) *classad.ClassAd {
 	a := wire.Ad(w)
 	out := classad.New()
 	done := make(map[string]bool, len(seeds))
@@ -1121,11 +1121,11 @@ func partialDecodeWire(ctx wireCtx, w []byte, seeds []string) *classad.ClassAd {
 			continue
 		}
 		done[fold] = true
-		node, ok := ctx.wireLookup(a, name)
+		node, ok := wireLookupDictCtx(ctx, dict, a, name)
 		if !ok {
 			continue // this ad lacks it -> undefined
 		}
-		expr, err := ctx.decodeNode(node)
+		expr, err := decodeNodeDictCtx(ctx, dict, node)
 		if err != nil {
 			continue
 		}

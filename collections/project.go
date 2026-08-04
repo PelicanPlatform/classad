@@ -92,7 +92,7 @@ func (c *Collection) projectInto(rs *wireScope, w []byte, attrs []string, out []
 	rs.fellBack = false
 	needDecode := false
 	for i, name := range attrs {
-		v, found := rs.tryResolve(ad, name)
+		v, found := rs.tryResolve(ad, rs.dict, name)
 		if rs.fellBack {
 			needDecode = true
 			break
