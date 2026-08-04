@@ -48,7 +48,7 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 		}
 		sh.mu.RUnlock()
 		for _, seg := range segs {
-			blk, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, hot)
+			blk, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, hot, c.recordToInterned)
 			seg.colblk.Store(&colSegment{block: blk, offs: offs})
 		}
 	}
@@ -60,9 +60,34 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 // scan over the sealed segments. Returns false if there is nothing to sample. Re-callable to
 // pick up newly-sealed segments (existing blocks are kept).
 func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
+	// Already enabled: keep the stable schema and hot set chosen at first enable, and just
+	// extend coverage to any segments sealed since (their blocks are built against this same
+	// schema, so nothing is orphaned). Rebuilding a fresh schema here would give every new
+	// block a different schema pointer, leaving earlier segments' blocks unmatched and
+	// silently demoting them to the brute-scan fallback. Re-schema-ing (with a full block
+	// rebuild) is a separate, heavier operation, not part of a routine maintenance refresh.
+	if st := c.schemaScan.Load(); st != nil {
+		c.EnableSchemaScan(st.schema, st.hot)
+		return true
+	}
 	samples := c.CollectSamples(sampleMax)
 	if len(samples) == 0 {
 		return false
+	}
+	// buildAdSchema reads the id-keyed wire form; a persistent (inline) collection's records
+	// store names, so canonicalize them to interned wire first (else the schema is empty and
+	// the accelerator silently never enables).
+	if c.inline {
+		interned := make([][]byte, 0, len(samples))
+		for _, w := range samples {
+			if iw, ok := c.recordToInterned(nil, w); ok {
+				interned = append(interned, iw)
+			}
+		}
+		samples = interned
+		if len(samples) == 0 {
+			return false
+		}
 	}
 	s := buildAdSchema(samples, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
 	if len(s.fields) == 0 {
@@ -187,6 +212,15 @@ func numCmp(op string, t float64) (func(float64) bool, bool) {
 // column: one cached decode) and each window's live MVCC visibility. A window with no block
 // (active segment) falls back to the row scan; an escaped value is read from the cold tail.
 func (c *Collection) schemaScanCount(s *adSchema, fieldIdx int, fieldID uint32, bc *blockCache, eval func(float64) bool) int {
+	// The brute fallback (segments without a matching columnar block -- e.g. the active
+	// segment) reads records straight from the arena, so it must honor the collection's wire
+	// mode: look the field up by inline name on a persistent store, by interned id in memory.
+	lookup := func(a wire.Ad) ([]byte, bool) { return a.Lookup(fieldID) }
+	if c.inline {
+		if name, ok := c.intern.Name(fieldID); ok {
+			lookup = func(a wire.Ad) ([]byte, bool) { return a.LookupByName(name) }
+		}
+	}
 	count := 0
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
@@ -212,7 +246,7 @@ func (c *Collection) schemaScanCount(s *adSchema, fieldIdx int, fieldID uint32, 
 				})
 				continue
 			}
-			count += bruteNumCount(w, s0, fieldID, eval)
+			count += bruteNumCount(w, s0, lookup, eval)
 		}
 		releaseWindows(wins)
 	}
@@ -230,7 +264,7 @@ func (c *Collection) schemaScanIntCount(s *adSchema, fieldIdx int, match func(in
 
 // bruteNumCount is the row-scan fallback: walk a window's visible records, read the numeric
 // field from the wire ad, and count matches.
-func bruteNumCount(w segWindow, s0 uint64, fieldID uint32, eval func(float64) bool) int {
+func bruteNumCount(w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), eval func(float64) bool) int {
 	count := 0
 	var buf []byte
 	for off := 0; off < w.used; {
@@ -242,7 +276,7 @@ func bruteNumCount(w segWindow, s0 uint64, fieldID uint32, eval func(float64) bo
 		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 			if ww, err := w.codec.Decompress(buf[:0], recAd(w.data, o)); err == nil {
 				buf = ww
-				if node, ok := wire.Ad(ww).Lookup(fieldID); ok {
+				if node, ok := lookup(wire.Ad(ww)); ok {
 					if f, ok := literalFloat(node); ok && eval(f) {
 						count++
 					}
