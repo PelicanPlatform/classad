@@ -134,49 +134,79 @@ func (m *mmapKeyIndex) lookup(hash uint64) []uint32 {
 	return offs
 }
 
-// A segment sidecar container packs the (optional) attribute-index blob and the
-// key-index blob into ONE file (<seg>.idx), so a persistent segment carries a single
-// sidecar rather than two. The attribute blob is written first so it keeps offset 0 --
-// its roaring bitmaps stay aligned and the existing ARCX writer/parser (shared with
-// the archive table type) handle it unchanged; the offset-insensitive key blob
-// follows; a fixed trailer records the two lengths:
+// A segment sidecar container packs the (optional) attribute-index blob, the key-index blob, and
+// the (optional) columnar-accelerator blob into ONE file (<seg>.idx), so a persistent segment
+// carries a single sidecar rather than three. The attribute blob is written first so it keeps
+// offset 0 -- its roaring bitmaps stay aligned and the existing ARCX writer/parser (shared with
+// the archive table type) handle it unchanged; the offset-insensitive key blob follows; the
+// columnar blob (if any) follows that. A fixed trailer records the section lengths. Two versions:
 //
-//	[attr blob (attrLen bytes; ARCX; empty when no attr index)]
-//	[key  blob (keyLen bytes; KIDX)]
-//	[attrLen u32 | keyLen u32 | containerMagic u32]   (12-byte trailer)
+//	v1 (no columnar block): [attr][key][attrLen u32 | keyLen u32 | magic("SCNT") u32]   (12-byte)
+//	v2 (with columnar):     [attr][key][col][attrLen u32 | keyLen u32 | colLen u32 | magic("SCN2") u32]  (16-byte)
+//
+// An empty columnar blob writes v1 byte-for-byte as before, so a collection without the columnar
+// accelerator produces identical sidecars. The container magic is always the last 4 bytes, and the
+// two magics differ, so the reader distinguishes the versions unambiguously; a v1 sidecar (or a
+// pre-columnar file) reads with col == nil.
 const (
-	sidecarContainerMagic = 0x53434e54 // "SCNT"
-	sidecarTrailerLen     = 12
+	sidecarContainerMagic   = 0x53434e54 // "SCNT" (v1, 2-section)
+	sidecarContainerMagicV2 = 0x53434e32 // "SCN2" (v2, 3-section, adds the columnar blob)
+	sidecarTrailerLen       = 12
+	sidecarTrailerLenV2     = 16
 )
 
-// buildSegmentSidecar packs an attribute-index blob (may be empty) and a key-index
-// blob into the container byte layout.
-func buildSegmentSidecar(attrBlob, keyBlob []byte) []byte {
-	b := make([]byte, 0, len(attrBlob)+len(keyBlob)+sidecarTrailerLen)
+// buildSegmentSidecar packs the attribute-index blob (may be empty), the key-index blob, and the
+// columnar blob (may be empty) into the container byte layout. An empty colBlob yields the v1
+// (2-section) layout, identical to a pre-columnar sidecar.
+func buildSegmentSidecar(attrBlob, keyBlob, colBlob []byte) []byte {
+	if len(colBlob) == 0 {
+		b := make([]byte, 0, len(attrBlob)+len(keyBlob)+sidecarTrailerLen)
+		b = append(b, attrBlob...)
+		b = append(b, keyBlob...)
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(attrBlob)))
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(keyBlob)))
+		b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagic)
+		return b
+	}
+	b := make([]byte, 0, len(attrBlob)+len(keyBlob)+len(colBlob)+sidecarTrailerLenV2)
 	b = append(b, attrBlob...)
 	b = append(b, keyBlob...)
+	b = append(b, colBlob...)
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(attrBlob)))
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(keyBlob)))
-	b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagic)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(colBlob)))
+	b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagicV2)
 	return b
 }
 
-// splitSegmentSidecar returns the attribute and key sub-slices of a container, or
-// ok=false if data is not a well-formed container (bare/old sidecar, or corruption).
-func splitSegmentSidecar(data []byte) (attr, key []byte, ok bool) {
-	if len(data) < sidecarTrailerLen {
-		return nil, nil, false
+// splitSegmentSidecar returns the attribute, key, and columnar sub-slices of a container. col is
+// nil for a v1 (2-section) container -- a pre-columnar sidecar, read unchanged. ok=false if data
+// is not a well-formed container (bare/old sidecar, or corruption).
+func splitSegmentSidecar(data []byte) (attr, key, col []byte, ok bool) {
+	if len(data) >= sidecarTrailerLenV2 {
+		t := data[len(data)-sidecarTrailerLenV2:]
+		if binary.LittleEndian.Uint32(t[12:]) == sidecarContainerMagicV2 {
+			attrLen := int(binary.LittleEndian.Uint32(t[0:]))
+			keyLen := int(binary.LittleEndian.Uint32(t[4:]))
+			colLen := int(binary.LittleEndian.Uint32(t[8:]))
+			if attrLen < 0 || keyLen < 0 || colLen < 0 || attrLen+keyLen+colLen+sidecarTrailerLenV2 != len(data) {
+				return nil, nil, nil, false
+			}
+			return data[:attrLen], data[attrLen : attrLen+keyLen], data[attrLen+keyLen : attrLen+keyLen+colLen], true
+		}
 	}
-	t := data[len(data)-sidecarTrailerLen:]
-	if binary.LittleEndian.Uint32(t[8:]) != sidecarContainerMagic {
-		return nil, nil, false
+	if len(data) >= sidecarTrailerLen {
+		t := data[len(data)-sidecarTrailerLen:]
+		if binary.LittleEndian.Uint32(t[8:]) == sidecarContainerMagic {
+			attrLen := int(binary.LittleEndian.Uint32(t[0:]))
+			keyLen := int(binary.LittleEndian.Uint32(t[4:]))
+			if attrLen < 0 || keyLen < 0 || attrLen+keyLen+sidecarTrailerLen != len(data) {
+				return nil, nil, nil, false
+			}
+			return data[:attrLen], data[attrLen : attrLen+keyLen], nil, true
+		}
 	}
-	attrLen := int(binary.LittleEndian.Uint32(t[0:]))
-	keyLen := int(binary.LittleEndian.Uint32(t[4:]))
-	if attrLen < 0 || keyLen < 0 || attrLen+keyLen+sidecarTrailerLen != len(data) {
-		return nil, nil, false
-	}
-	return data[:attrLen], data[attrLen : attrLen+keyLen], true
+	return nil, nil, nil, false
 }
 
 // writeFileAtomic writes b to path via a temp file + fsync + rename, so a crash never

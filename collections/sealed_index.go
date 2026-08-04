@@ -33,7 +33,7 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	if err != nil {
 		return false
 	}
-	attr, key, ok := splitSegmentSidecar(data)
+	attr, key, _, ok := splitSegmentSidecar(data)
 	if !ok {
 		_ = closer()
 		return false
@@ -94,7 +94,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 		}
 		attrBlob = b
 	}
-	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h))
+	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), nil)
 	if err := writeFileAtomic(path, container); err != nil {
 		return
 	}
@@ -163,14 +163,14 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 	}
 	// Rename over the live file: the existing mapping is unaffected (it holds the old
 	// inode), so readers keep working until they are swapped over below.
-	if err := writeFileAtomic(path, buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h))); err != nil {
+	if err := writeFileAtomic(path, buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), nil)); err != nil {
 		return false
 	}
 	data, closer, err := mapFile(path)
 	if err != nil {
 		return false
 	}
-	attr, key, ok := splitSegmentSidecar(data)
+	attr, key, _, ok := splitSegmentSidecar(data)
 	if !ok {
 		_ = closer()
 		return false
