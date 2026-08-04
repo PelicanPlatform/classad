@@ -165,6 +165,11 @@ func (t *InternTable) Len() int {
 
 // snapshotNames returns a copy of the id->name slice, for embedding a standalone
 // intern table into a self-contained ad.
+// Names returns the canonical (first-seen casing) names in id order, so Names()[id]
+// is the name for id. Re-interning these in order into an empty table reproduces the
+// exact id assignment -- the basis for serializing/reloading the table.
+func (t *InternTable) Names() []string { return t.snapshotNames() }
+
 func (t *InternTable) snapshotNames() []string {
 	canon := *t.canon.Load()
 	out := make([]string, len(canon))

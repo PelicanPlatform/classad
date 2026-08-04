@@ -28,6 +28,42 @@ type wireScope struct {
 	parent   wire.Ad // the chained parent ad's wire bytes, or nil (no parent)
 	ctx      wireCtx // for mode-aware attribute lookup (interned id vs inline name)
 	fellBack bool
+	// dict / parentDict are the segment dictionaries of ad / parent when those come from an
+	// INTERNED segment (records carry segment-local ids); nil => inline/global via ctx. ad and
+	// its chained parent may live in different segments, hence two handles. Set per record by
+	// the scan alongside ad/parent; the dict-aware touchpoints (wireLookupDictCtx etc.) resolve
+	// through them so an interned segment filters/decodes correctly.
+	dict       *segDictHandle
+	parentDict *segDictHandle
+}
+
+// wireLookupDictCtx / decodeNodeDictCtx / decodeWireDictCtx are the dict-aware wire touchpoints
+// used across the wire-native match path. When dict != nil the ad is interned with
+// segment-local ids (resolve name->id via the dict, then Lookup(id); decode via the resolver);
+// else they fall to the mode-aware ctx (inline/global) -- byte-for-byte the prior behavior.
+func wireLookupDictCtx(ctx wireCtx, dict *segDictHandle, a wire.Ad, name string) ([]byte, bool) {
+	if dict != nil {
+		id, ok := dict.lookup(name)
+		if !ok {
+			return nil, false
+		}
+		return a.Lookup(id)
+	}
+	return ctx.wireLookup(a, name)
+}
+
+func decodeNodeDictCtx(ctx wireCtx, dict *segDictHandle, node []byte) (ast.Expr, error) {
+	if dict != nil {
+		return wire.DecodeNodeResolve(node, dict.resolve)
+	}
+	return ctx.decodeNode(node)
+}
+
+func decodeWireDictCtx(ctx wireCtx, dict *segDictHandle, w []byte) (*ast.ClassAd, error) {
+	if dict != nil {
+		return wire.DecodeResolve(w, dict.resolve)
+	}
+	return ctx.decodeWire(w)
 }
 
 // resolve is the attribute resolver handed to vm.Matcher.EvalResolved.
@@ -41,16 +77,16 @@ func (ws *wireScope) resolve(name string, scope ast.AttributeScope) classad.Valu
 		if ws.parent == nil {
 			return classad.NewUndefinedValue()
 		}
-		v, _ := ws.tryResolve(ws.parent, name)
+		v, _ := ws.tryResolve(ws.parent, ws.parentDict, name)
 		return v
 	default:
 		// Unscoped: this ad, then fall through to its parent (chaining), matching
 		// the ClassAd evaluator's parent walk.
-		if v, found := ws.tryResolve(ws.ad, name); found {
+		if v, found := ws.tryResolve(ws.ad, ws.dict, name); found {
 			return v
 		}
 		if ws.parent != nil {
-			if v, found := ws.tryResolve(ws.parent, name); found {
+			if v, found := ws.tryResolve(ws.parent, ws.parentDict, name); found {
 				return v
 			}
 		}
@@ -63,8 +99,8 @@ func (ws *wireScope) resolve(name string, scope ast.AttributeScope) classad.Valu
 // non-literal value sets fellBack (the caller retries with a full decode) and
 // still counts as found -- the ad has the attribute, it just can't be read from
 // wire alone.
-func (ws *wireScope) tryResolve(ad wire.Ad, name string) (classad.Value, bool) {
-	node, ok := ws.ctx.wireLookup(ad, name)
+func (ws *wireScope) tryResolve(ad wire.Ad, dict *segDictHandle, name string) (classad.Value, bool) {
+	node, ok := wireLookupDictCtx(ws.ctx, dict, ad, name)
 	if !ok {
 		return classad.NewUndefinedValue(), false
 	}

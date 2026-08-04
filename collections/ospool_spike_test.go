@@ -88,7 +88,7 @@ func BenchmarkOSPoolSlotDecode(b *testing.B) {
 
 	// Report the closure size vs the full ad, once, so the ratio is on the record.
 	full0 := c.mustDecode(b, wires[0])
-	part0 := partialDecodeWire(c, wires[0], seeds)
+	part0 := partialDecodeWire(c, nil, wires[0], seeds)
 	b.Logf("ad[0]: full=%d attrs, Requirements closure=%d attrs",
 		len(full0.AST().Attributes), len(part0.AST().Attributes))
 
@@ -106,7 +106,7 @@ func BenchmarkOSPoolSlotDecode(b *testing.B) {
 	b.Run("PartialDecode", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			_ = partialDecodeWire(c, wires[i%len(wires)], seeds)
+			_ = partialDecodeWire(c, nil, wires[i%len(wires)], seeds)
 		}
 	})
 	b.Run("FullDecode+Eval", func(b *testing.B) {
@@ -125,7 +125,7 @@ func BenchmarkOSPoolSlotDecode(b *testing.B) {
 	b.Run("PartialDecode+Eval", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			ad := partialDecodeWire(c, wires[i%len(wires)], seeds)
+			ad := partialDecodeWire(c, nil, wires[i%len(wires)], seeds)
 			m.ReplaceRightAd(ad)
 			_ = m.EvaluateAttrRight("Requirements")
 			ad.SetTarget(nil)

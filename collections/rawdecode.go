@@ -99,11 +99,12 @@ func (c *Collection) scanRaw(redact bool) iter.Seq[RawAd] {
 // wire bytes straight to old-ClassAd text and yield them. The buf/offs/exprs
 // scratch is reused across the whole scan (single-threaded), so no per-ad
 // expression bytes are allocated.
-func (c *Collection) yieldRaw(yield func(RawAd) bool, redact bool) func(w []byte) bool {
+func (c *Collection) yieldRaw(yield func(RawAd) bool, redact bool) scanEmit {
 	var buf []byte
 	var offs []int
 	var exprs [][]byte
-	return func(w []byte) bool {
+	return func(w []byte, dict *segDictHandle) bool {
+		w = c.wireToInline(dict, w) // interned segment -> inline for the mode-aware renderer
 		var mt, tt string
 		var ok bool
 		buf, offs, mt, tt, ok = c.appendWireAd(w, buf, offs, redact)

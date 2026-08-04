@@ -147,7 +147,7 @@ func TestHotPrefixDecodable(t *testing.T) {
 	checked := 0
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		forEachVisible(s0, wins, func(rec []byte, codec Codec) bool {
+		forEachVisible(s0, wins, func(rec []byte, codec Codec, _ *segDictHandle) bool {
 			full, ferr := codec.Decompress(nil, rec)
 			if ferr != nil {
 				t.Fatal(ferr)

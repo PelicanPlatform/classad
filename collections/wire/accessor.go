@@ -485,6 +485,14 @@ func DecodeNode(node []byte, t *InternTable) (ast.Expr, error) {
 	return d.node(0)
 }
 
+// DecodeNodeResolve decodes raw node bytes from an interned ad (as returned by Lookup),
+// resolving interned ids via `resolve` instead of an *InternTable -- e.g. backed by a sealed
+// segment's mmap dictionary. Counterpart to DecodeNode for the per-segment interned path.
+func DecodeNodeResolve(node []byte, resolve func(uint32) (string, bool)) (ast.Expr, error) {
+	d := &decoder{b: node, resolve: resolve}
+	return d.node(0)
+}
+
 // DecodeNodeInline decodes raw node bytes from an inline-names ad (as returned by
 // LookupByName), which need no intern table.
 func DecodeNodeInline(node []byte) (ast.Expr, error) {

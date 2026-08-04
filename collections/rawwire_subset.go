@@ -90,11 +90,12 @@ func (sel *wireSubsetSelector) neededCount() int {
 	return len(sel.names) + 2
 }
 
-func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelector) func(w []byte) bool {
+func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelector) scanEmit {
 	var scratch []byte
 	var sc wire.SubsetScratch
 	needed := sel.neededCount()
-	return func(w []byte) bool {
+	return func(w []byte, dict *segDictHandle) bool {
+		w = c.wireToInline(dict, w) // AppendAdSubsetInlineHotFirst needs inline-name wire
 		out, ok := wire.AppendAdSubsetInlineHotFirst(scratch[:0], wire.Ad(w), sel.keep, needed, c.sealer, &sc)
 		scratch = out
 		if !ok {

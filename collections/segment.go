@@ -51,7 +51,14 @@ const (
 	// length and existing on-disk records (flag clear) read as ordinary records --
 	// the discriminator is backward compatible and needs no header growth.
 	markerFlag = uint32(1) << 31
-	keyLenMask = markerFlag - 1
+	// dictFlag (the next bit down) marks the per-segment attribute DICTIONARY record of an
+	// interned segment (see segdict.go / interning): a keyless record whose body is the
+	// serialized segDict. It also sets markerFlag, so every marker-skipping walk skips it
+	// uniformly; dictFlag lets recovery recognize it (vs a time checkpoint) and publish the
+	// segment's dict. Real keys are tiny, so masking the low 30 bits still yields the true
+	// key length for ordinary records.
+	dictFlag   = uint32(1) << 30
+	keyLenMask = dictFlag - 1
 
 	noSeg  = ^uint32(0)
 	seqMax = ^uint64(0)
@@ -122,6 +129,13 @@ type segment struct {
 	// atomically (like idx); a scan reads it lock-free and uses colSegment.offs to map a
 	// block record back to its arena offset for the MVCC visibility check.
 	colblk atomic.Pointer[colSegment]
+
+	// dict is this segment's per-segment attribute dictionary when the segment is INTERNED
+	// (interning: records carry segment-local ids, resolved to names via this dict). nil means
+	// the segment is inline-name encoded (the legacy/default form). Published once -- at the
+	// compaction transcode that produced the interned segment, or at load from the segment's
+	// dictFlag record -- and read lock-free to dispatch decode (segDictHandle over the mmap).
+	dict atomic.Pointer[segDictHandle]
 
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned
@@ -484,6 +498,38 @@ func (s *segment) appendMarker(seq uint64, millis uint64) (uint32, bool) {
 	return uint32(off), true
 }
 
+// appendDict writes an interned segment's dictionary record: a keyless record whose body is
+// the serialized segDict `dict`. Its keyLen field carries markerFlag|dictFlag so every
+// marker-skipping walk ignores it while recovery (recIsDict) can find it and publish the
+// segment's dict. seq is irrelevant to reads (a marker is never visible) -- 0 is used. The
+// caller holds the shard lock; returns the record offset (where the dict body's probe base is
+// recAd(off)) and false if it does not fit.
+func (s *segment) appendDict(dict []byte) (uint32, bool) {
+	rl := recordLen(0, len(dict))
+	off := s.used
+	if off+rl > len(s.data) {
+		return 0, false
+	}
+	b := s.data[off : off+rl]
+	s.used = off + rl
+	binary.LittleEndian.PutUint64(b[recSeqOff:], 0)
+	binary.LittleEndian.PutUint64(b[recSupOff:], seqMax)
+	binary.LittleEndian.PutUint32(b[recNextSegOff:], noSeg)
+	binary.LittleEndian.PutUint32(b[recNextOffOff:], 0)
+	binary.LittleEndian.PutUint32(b[recTotalLenOff:], uint32(rl))
+	binary.LittleEndian.PutUint32(b[recKeyLenOff:], markerFlag|dictFlag) // keyless; skipped like a marker
+	adLenOff := recKeyOff
+	binary.LittleEndian.PutUint32(b[adLenOff:], uint32(len(dict)))
+	copy(b[adLenOff+4:], dict)
+	if s.persistent {
+		crcOff := adLenOff + 4 + len(dict)
+		binary.LittleEndian.PutUint32(b[crcOff:], recCRC(b, crcOff))
+	}
+	// Not live data: count as dead so dead>=used accounting is unaffected by the dict.
+	s.dead += int64(rl)
+	return uint32(off), true
+}
+
 // supersedeRec marks the record at off superseded at seq: it stamps the field, adds
 // its bytes to the dead total, and advances maxSup. Caller holds the shard write lock.
 // This is the one place a record leaves the "current" set, so the scan-pruning
@@ -582,9 +628,17 @@ func recIsMarker(b []byte, off uint32) bool {
 }
 
 // recMarkerMillis reads a marker's wall-clock payload (unixMillis). Only valid when
-// recIsMarker(b, off) is true.
+// recIsMarker(b, off) is true AND recIsDict(b, off) is false (a dict record also sets
+// markerFlag but carries a serialized dict, not a millis payload).
 func recMarkerMillis(b []byte, off uint32) uint64 {
 	return binary.LittleEndian.Uint64(recAd(b, off))
+}
+
+// recIsDict reports whether the record at off is an interned segment's dictionary record
+// (its body is the serialized segDict). Such a record also sets markerFlag, so ordinary
+// record walks skip it; recovery uses recIsDict to publish the segment's dict instead.
+func recIsDict(b []byte, off uint32) bool {
+	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&dictFlag != 0
 }
 
 func recKey(b []byte, off uint32) []byte {

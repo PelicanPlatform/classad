@@ -189,6 +189,7 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 					}
 					return
 				}
+				dict := tasks[idx].win.dict() // one window per task: constant for this walk
 				forEachVisibleWindowKeyed(tasks[idx].s0, tasks[idx].win, func(key, ad []byte, codec Codec) bool {
 					if stopped.Load() {
 						return false
@@ -201,10 +202,11 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 						return true
 					}
 					dbuf = w
+					qp.ws.dict = dict
 					if !matchWire(w, qp) {
 						return true
 					}
-					a, err := c.decodeWire(w)
+					a, err := c.decodeWireDict(dict, w)
 					if err != nil {
 						return true
 					}
@@ -239,6 +241,7 @@ func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(
 	var dbuf []byte
 	for _, t := range tasks {
 		stop := false
+		dict := t.win.dict()
 		forEachVisibleWindowKeyed(t.s0, t.win, func(key, ad []byte, codec Codec) bool {
 			if isSystemKeyBytes(key) {
 				return true // internal system record: hidden from client queries
@@ -248,10 +251,11 @@ func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(
 				return true
 			}
 			dbuf = w
+			qp.ws.dict = dict
 			if !matchWire(w, qp) {
 				return true
 			}
-			a, err := c.decodeWire(w)
+			a, err := c.decodeWireDict(dict, w)
 			if err != nil {
 				return true
 			}

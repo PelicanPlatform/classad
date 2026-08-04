@@ -444,13 +444,14 @@ func (c *Collection) taskMatches(job *classad.ClassAd, jp *jobPlan, deferMat boo
 // matchWindow visits each visible record in one window, matching each via
 // matchCandidate.
 func (c *Collection) matchWindow(t scanTask, mw *matchWorker, dbuf *[]byte, out *[]rankedMatch) {
+	dict := t.win.dict()
 	forEachVisibleWindow(t.s0, t.win, func(adBytes []byte, codec Codec) bool {
 		w, err := codec.Decompress((*dbuf)[:0], adBytes)
 		if err != nil {
 			return true
 		}
 		*dbuf = w
-		c.matchCandidate(w, mw, out)
+		c.matchCandidate(c.wireToInline(dict, w), mw, out)
 		return true
 	})
 }

@@ -2,6 +2,7 @@ package collections
 
 import (
 	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
@@ -72,14 +73,116 @@ func (c *Collection) decodeNode(node []byte) (ast.Expr, error) {
 // accelerator build time (schema sampling and per-segment block transcode), not on the scan
 // hot path.
 func (c *Collection) recordToInterned(dst, w []byte) ([]byte, bool) {
-	if !c.inline {
-		return w, true
+	return c.recordToInternedDict(nil, dst, w)
+}
+
+// recordToInternedDict is recordToInterned honoring a per-segment interned record: dict!=nil
+// resolves segment-local ids (via decodeWireDict) before re-encoding to the collection's
+// GLOBAL intern table. dict==nil is the legacy path (in-memory already global-interned -> as
+// is; inline -> decode + re-encode). Used by the adschema block build over sealed segments,
+// which may now be interned.
+func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([]byte, bool) {
+	if dict == nil && !c.inline {
+		return w, true // in-memory: already global-interned
 	}
-	ad, err := c.decodeWire(w)
+	ad, err := c.decodeWireDict(dict, w)
 	if err != nil {
 		return nil, false
 	}
 	return wire.Encode(dst[:0], ad, c.intern), true
+}
+
+// --- per-segment interned dispatch (interning) ---
+//
+// A sealed segment may be INTERNED with its own attribute dictionary (segment.dict != nil):
+// its records carry segment-local ids resolved to names via that dict, not inline names and
+// not the collection's global table. These wrappers take the segment's dict handle and, when
+// it is non-nil, resolve through it (zero-copy over the mmap); a nil handle means the segment
+// is inline/global -- the legacy path, byte-for-byte unchanged. Scan/read call sites thread
+// the segment's dict (segment.dict.Load()) from the visibility window. An interned segment is
+// never encrypted (encrypted collections keep sealing inline), so the resolver path needs no
+// sealer.
+
+func (c *Collection) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error) {
+	if dict != nil {
+		return wire.DecodeResolve(w, dict.resolve)
+	}
+	return c.decodeWire(w)
+}
+
+func (c *Collection) wireLookupDict(dict *segDictHandle, a wire.Ad, name string) ([]byte, bool) {
+	if dict != nil {
+		id, ok := dict.lookup(name)
+		if !ok {
+			return nil, false
+		}
+		return a.Lookup(id)
+	}
+	return c.wireLookup(a, name)
+}
+
+func (c *Collection) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr, error) {
+	if dict != nil {
+		return wire.DecodeNodeResolve(node, dict.resolve)
+	}
+	return c.decodeNode(node)
+}
+
+// decodeAdDict is decodeAd (decompress + decode to a ClassAd) that resolves an interned
+// segment's ids via its dict. dict==nil => the existing decodeAd path (inline/global).
+func (c *Collection) decodeAdDict(dict *segDictHandle, stored []byte, codec Codec) (*classad.ClassAd, error) {
+	if dict == nil {
+		return c.decodeAd(stored, codec)
+	}
+	dec, err := codec.Decompress(nil, stored)
+	if err != nil {
+		return nil, err
+	}
+	a, err := wire.DecodeResolve(dec, dict.resolve)
+	if err != nil {
+		return nil, err
+	}
+	return classad.FromAST(a), nil
+}
+
+// wireToInline is toSelfContained for already-DECOMPRESSED wire (no codec): an interned
+// segment's decompressed record becomes inline wire so a downstream consumer that reads it by
+// name -- CollectSamples -> buildAdSchema / ForEachNamed(c.intern) -- works without the dict.
+// nil dict (inline segment / in-memory global) returns w unchanged.
+func (c *Collection) wireToInline(dict *segDictHandle, w []byte) []byte {
+	if dict == nil {
+		return w
+	}
+	a, err := wire.DecodeResolve(w, dict.resolve)
+	if err != nil {
+		return w
+	}
+	return wire.EncodeInline(nil, a)
+}
+
+// toSelfContained converts a stored record's (compressed) ad bytes into a form that decodes
+// WITHOUT the source segment's dict, for DEFERRED/cold paths (e.g. a watch event) that copy ad
+// bytes out of the scan and decode them later, when the segment and its dict are no longer in
+// scope. For an inline segment or an in-memory (global-interned) collection -- dict==nil -- the
+// bytes already self-decode, so they are returned unchanged. For an interned segment the record
+// is decoded via the dict, re-encoded inline, and recompressed under the SAME codec, so a later
+// decodeAd(bytes, codec) yields the identical ad. Best-effort: returns the input unchanged on
+// any decode/encode error (a later decode then fails exactly as it would have anyway). The hot
+// scan paths do NOT use this -- they thread the dict and dispatch -- so its decode+re-encode
+// cost lands only on cold event capture.
+func (c *Collection) toSelfContained(dict *segDictHandle, ad []byte, codec Codec) []byte {
+	if dict == nil {
+		return ad
+	}
+	dec, err := codec.Decompress(nil, ad)
+	if err != nil {
+		return ad
+	}
+	a, err := wire.DecodeResolve(dec, dict.resolve)
+	if err != nil {
+		return ad
+	}
+	return codec.Compress(nil, wire.EncodeInline(nil, a))
 }
 
 // newStreamEncoder returns a StreamEncoder matching the collection's mode, for the

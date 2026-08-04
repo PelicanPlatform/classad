@@ -542,8 +542,8 @@ func (c *Collection) watchAd(key, rawAd []byte, codec Codec) (*classad.ClassAd, 
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
 			sh := c.shards[c.shardOf(pk, ph)]
-			if pad, pcodec, ok := sh.get(ph, pk); ok {
-				if parent, err := c.decodeAd(pad, pcodec); err == nil {
+			if pad, pcodec, pdict, ok := sh.get(ph, pk); ok {
+				if parent, err := c.decodeAdDict(pdict, pad, pcodec); err == nil {
 					c.mergeParent(ad, parent)
 				}
 			}
@@ -600,9 +600,9 @@ func (c *Collection) seedParentSig() map[string]map[string]string {
 	}
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if c.isStructural(key) {
-				if pad, err := c.decodeAd(ad, codec); err == nil {
+				if pad, err := c.decodeAdDict(dict, ad, codec); err == nil {
 					sig[string(key)] = c.nonPrivateSig(pad)
 				}
 			}
@@ -638,16 +638,19 @@ func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]s
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var out []rawEvent
-	forEachVisibleKeyed(s0, wins, func(k, ad []byte, codec Codec) bool {
+	forEachVisibleKeyed(s0, wins, func(k, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if c.isStructural != nil && c.isStructural(k) {
 			return true
 		}
 		if pk := c.parentKeyFor(k); pk != nil && bytes.Equal(pk, parent.key) {
+			// This event's ad bytes outlive the scan (decoded later by watchAd, when the
+			// segment/dict is gone), so make an interned record self-contained now.
+			sc := c.toSelfContained(dict, ad, codec)
 			out = append(out, rawEvent{
 				shard: parent.shard,
 				seq:   parent.seq,
 				key:   append([]byte(nil), k...),
-				ad:    append([]byte(nil), ad...),
+				ad:    append([]byte(nil), sc...),
 				codec: codec,
 			})
 		}

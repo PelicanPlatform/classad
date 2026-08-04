@@ -43,7 +43,7 @@ func (c *Collection) CodecStats(sampleMax int) CodecStats {
 			break
 		}
 		s0, wins := sh.snapshot()
-		forEachVisible(s0, wins, func(ad []byte, codec Codec) bool {
+		forEachVisible(s0, wins, func(ad []byte, codec Codec, _ *segDictHandle) bool {
 			w, err := codec.Decompress(buf[:0], ad)
 			if err != nil {
 				return true

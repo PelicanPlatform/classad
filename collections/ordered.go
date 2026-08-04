@@ -411,13 +411,13 @@ func (c *Collection) rebuildOrdered() {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		var dbuf []byte
-		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			w, err := codec.Decompress(dbuf[:0], ad)
 			if err != nil {
 				return true
 			}
 			dbuf = w
-			node, err := c.decodeWire(w)
+			node, err := c.decodeWireDict(dict, w)
 			if err != nil {
 				return true
 			}
