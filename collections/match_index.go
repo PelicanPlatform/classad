@@ -776,30 +776,74 @@ func (c *Collection) slotMatchPlan(job *classad.ClassAd, jobVals map[string]clas
 // not worth its overhead (the plan barely prunes), so the caller full-scans instead.
 const maxPushdownFrac = 0.95
 
-// planFrac estimates the fraction of records the DNF groups' candidate union visits,
-// under an independence assumption: a group's fraction is the product of its probes'
-// selectivities and the union is 1 - prod(1 - group_frac). estimable is false when any
-// probe lacks a selectivity estimate (e.g. the segment indexes aren't built yet) -- the
-// caller must then NOT gate, since it cannot tell whether the pushdown prunes.
+// planFrac estimates the fraction of records the DNF groups' candidate union visits: a
+// group's fraction is its probes' selectivities combined by conjunctSelectivity, and the
+// union is 1 - prod(1 - group_frac). estimable is false when any probe lacks a selectivity
+// estimate (e.g. the segment indexes aren't built yet) -- the caller must then NOT gate,
+// since it cannot tell whether the pushdown prunes.
 func (c *Collection) planFrac(groups [][]usableProbe) (frac float64, estimable bool) {
 	total := float64(c.Len())
 	if total <= 0 {
 		return 0, false
 	}
 	prodComplement := 1.0
+	sel := make([]float64, 0, 8)
 	for _, g := range groups {
-		gf := 1.0
+		sel = sel[:0]
 		for _, up := range g {
 			cand, covered := c.estimateCandidates(up)
 			if !covered {
 				return 0, false // no stats: don't gate (default to pushing down)
 			}
-			gf *= math.Min(1, cand/total)
+			sel = append(sel, math.Min(1, cand/total))
 		}
-		prodComplement *= 1 - gf
+		prodComplement *= 1 - conjunctSelectivity(sel)
 	}
 	return 1 - prodComplement, true
 }
+
+// conjunctSelectivity combines per-probe selectivities into one for the conjunction,
+// damping the independence assumption rather than taking the raw product.
+//
+// Multiplying is right only if the attributes are independent, and in the ads this store
+// holds they emphatically are not: a slot's Memory, Cpus, and Disk scale together with the
+// machine, Arch and OpSys are near-constant within a pool, and a job's RequestMemory and
+// RequestCpus move together. The raw product therefore compounds an error once per extra
+// conjunct -- `Memory >= 4096 && Cpus >= 8 && Disk >= 100000` reads as 0.1% selective when
+// the three conditions largely pick out the same big machines and the truth is nearer 5%.
+// Underestimating that badly is what makes the pushdown gate (maxPushdownFrac) believe an
+// index will prune when it will not.
+//
+// So: sort ascending and damp each successive term by a square root -- s1 * s2^(1/2) *
+// s3^(1/4) * s4^(1/8), the most selective probe counting in full. It interpolates between
+// full independence and full correlation (where the answer would be s1 alone), needs no
+// multi-column statistics, and is monotone: adding a conjunct never raises the estimate.
+// The same exponential-backoff form SQL Server adopted in 2014 for the same reason.
+//
+// This is an estimate used only to ORDER work and to decide scan-vs-pushdown; it never
+// changes a result. sel is reordered in place.
+func conjunctSelectivity(sel []float64) float64 {
+	switch len(sel) {
+	case 0:
+		return 1
+	case 1:
+		return sel[0]
+	}
+	sort.Float64s(sel)
+	frac, exp := 1.0, 1.0
+	for _, s := range sel {
+		frac *= math.Pow(s, exp)
+		exp /= 2
+		if exp < minDampExp {
+			break // the remaining terms cannot move the estimate materially
+		}
+	}
+	return frac
+}
+
+// minDampExp stops the backoff once a conjunct's exponent makes it a no-op: at 1/64 even a
+// selectivity of 0.001 contributes a factor of 0.9. Bounds the loop on a wide conjunction.
+const minDampExp = 1.0 / 64
 
 // valueToLiteral converts a scalar classad.Value to its literal AST node, or nil for
 // undefined/error/list/nested-ad values (which cannot serve as an index constant).
