@@ -33,7 +33,7 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	if err != nil {
 		return false
 	}
-	attr, key, _, ok := splitSegmentSidecar(data)
+	attr, key, col, ok := splitSegmentSidecar(data)
 	if !ok {
 		_ = closer()
 		return false
@@ -49,11 +49,22 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 			mm = m
 		}
 	}
+	// Columnar accelerator block (v2 container). Derived like the attribute index: any
+	// doubt (unparseable / wrong record count) leaves it unpublished, so the segment simply
+	// row-scans until the block is rebuilt. The unmarshal COPIES its streams, so the block is
+	// independent of this mapping.
+	var cs *colSegment
+	if len(col) > 0 {
+		cs = unmarshalColSegment(col, seg.codec, c.intern.Intern) // nil on malformed -> row-scan
+	}
 	// keyIdx is set exactly once per seal and is the "sealed" marker; CAS so a
 	// concurrent seal cannot leak a mapping.
 	if !seg.keyIdx.CompareAndSwap(nil, ki) {
 		_ = closer()
 		return false
+	}
+	if cs != nil {
+		seg.colblk.Store(cs)
 	}
 	// Phase 2: a resident key Bloom over the segment's key-hashes, built from the key
 	// index, gates the sealed-segment probe. Published after keyIdx so a probe that
@@ -94,7 +105,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 		}
 		attrBlob = b
 	}
-	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), nil)
+	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobForSeg(seg))
 	if err := writeFileAtomic(path, container); err != nil {
 		return
 	}
@@ -163,7 +174,7 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 	}
 	// Rename over the live file: the existing mapping is unaffected (it holds the old
 	// inode), so readers keep working until they are swapped over below.
-	if err := writeFileAtomic(path, buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), nil)); err != nil {
+	if err := writeFileAtomic(path, buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobForSeg(seg))); err != nil {
 		return false
 	}
 	data, closer, err := mapFile(path)
