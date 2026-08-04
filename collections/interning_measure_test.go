@@ -52,11 +52,11 @@ func TestInterningSizeTradeoff(t *testing.T) {
 	// All three measured at several segment sizes K.
 	for _, K := range []int{128, 256, 512, 2048, N} {
 		inlineRaw, inlineZ = 0, 0
-		gRaw, gZ := 0, 0     // global-interned records (zstd per seg) -- dict added once below
-		psRaw, psZ := 0, 0   // per-segment interned incl. dict, zstd per seg
-		var gDistinct int    // recomputed identically each K (cheap); dict size added once
-		psDictRaw := 0       // total per-segment dict bytes (raw)
-		perSegNames := 0     // sum of distinct-names-per-segment (for reporting)
+		gRaw, gZ := 0, 0   // global-interned records (zstd per seg) -- dict added once below
+		psRaw, psZ := 0, 0 // per-segment interned incl. dict, zstd per seg
+		var gDistinct int  // recomputed identically each K (cheap); dict size added once
+		psDictRaw := 0     // total per-segment dict bytes (raw)
+		perSegNames := 0   // sum of distinct-names-per-segment (for reporting)
 
 		for lo := 0; lo < N; lo += K {
 			hi := lo + K

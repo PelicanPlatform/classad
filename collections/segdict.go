@@ -97,9 +97,11 @@ type segDictHandle struct {
 	base uint32 // offset of the dict's first byte within data
 }
 
-func (h *segDictHandle) lookup(name string) (uint32, bool) { return segDictLookup(h.data, h.base, name) }
-func (h *segDictHandle) name(id uint32) []byte             { return segDictName(h.data, h.base, id) }
-func (h *segDictHandle) count() uint32                     { return segDictCount(h.data, h.base) }
+func (h *segDictHandle) lookup(name string) (uint32, bool) {
+	return segDictLookup(h.data, h.base, name)
+}
+func (h *segDictHandle) name(id uint32) []byte { return segDictName(h.data, h.base, id) }
+func (h *segDictHandle) count() uint32         { return segDictCount(h.data, h.base) }
 
 // resolve is the id->name function form for wire.DecodeResolve, so an interned record decodes
 // straight over the mmap with no in-memory table.
