@@ -1,5 +1,7 @@
 package collections
 
+import "github.com/PelicanPlatform/classad/collections/wire"
+
 // Append-only recompression. The mutable store recompresses (RetrainDict) and repacks
 // (Rewrite) via compaction -- a live-copy that supersedes old versions, renumbers
 // segments, and rebuilds the key directory. None of that is legal for an append log,
@@ -80,10 +82,35 @@ func (c *Collection) resealOneSegment(sh *shard, src *segment, targetCodec Codec
 	if src == nil || src.used == 0 {
 		return nil
 	}
+	// A persistent, plaintext collection reseals INTERNED: records carry segment-local ids
+	// against a per-segment table + a hot header, and the segment gets a dictionary appended at
+	// the end (see segdict.go / the interning design). In-memory (already global-interned) and
+	// encrypted (only inline has a sealing encoder) reseal via c.encodeAd as before. The two-pass
+	// build means the table is fully populated before the dict is sized, so the segment is sized
+	// EXACTLY -- no dict reserve/waste (unlike the streaming compaction transcode).
+	intern := c.inline && c.sealer == nil
+	var table *wire.InternTable
+	hot := map[uint32]struct{}{}
+	lastLen := 0
+	refreshHot := func() { // add local ids of hot attr names now in the table (case-preserving)
+		if table.Len() == lastLen {
+			return
+		}
+		for name := range c.currentHotNames() {
+			if id, ok := table.LookupID(name); ok {
+				hot[id] = struct{}{}
+			}
+		}
+		lastLen = table.Len()
+	}
+	if intern {
+		table = wire.NewInternTable()
+	}
 	// Pass 1: decode + re-encode + recompress every record, computing the exact size the
 	// new segment needs so it fits in a single segment (append order is 1:1).
 	var entries []resealEntry
 	total := 0
+	var wireBuf []byte
 	for off := 0; off < src.used; {
 		o := uint32(off)
 		rl := recTotalLen(src.data, o)
@@ -104,17 +131,30 @@ func (c *Collection) resealOneSegment(sh *shard, src *segment, targetCodec Codec
 		if err != nil {
 			return nil
 		}
-		ad, err := c.decodeWire(wireBytes)
+		ad, err := c.decodeWireDict(src.dict.Load(), wireBytes) // honor the source's own encoding
 		if err != nil {
 			return nil
 		}
-		stored := targetCodec.Compress(nil, c.encodeAd(ad))
+		var stored []byte
+		if intern {
+			wireBuf = wire.EncodeWithHot(wireBuf[:0], ad, table, hot)
+			refreshHot()
+			stored = targetCodec.Compress(nil, wireBuf)
+		} else {
+			stored = targetCodec.Compress(nil, c.encodeAd(ad))
+		}
 		entries = append(entries, resealEntry{seq: seq, key: key, stored: stored})
 		total += recordLen(len(key), len(stored))
 		off += int(rl)
 	}
 	if total == 0 {
 		return nil
+	}
+	// The dict (interned only) is a trailing record; size the segment to include it exactly.
+	var dictBytes []byte
+	if intern {
+		dictBytes = appendSegDict(nil, table.Names())
+		total += recordLen(0, len(dictBytes))
 	}
 
 	// Allocate a new same-id segment sized to the recompressed data (rounded up by the
@@ -144,6 +184,15 @@ func (c *Collection) resealOneSegment(sh *shard, src *segment, targetCodec Codec
 		if _, ok := newseg.append(e.seq, noLoc, e.key, e.stored); !ok {
 			return nil
 		}
+	}
+	// Interned: append the dictionary as a trailing record and publish the segment's dict so its
+	// records resolve their segment-local ids.
+	if intern {
+		doff, ok := newseg.appendDict(dictBytes)
+		if !ok {
+			return nil
+		}
+		newseg.dict.Store(&segDictHandle{data: newseg.data, base: doff + recKeyOff + 4})
 	}
 	// Persistent segments: flush the written extent so recovery sees a complete segment.
 	if newseg.persistent {

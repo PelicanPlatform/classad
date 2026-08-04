@@ -142,7 +142,7 @@ func (c *Collection) rezoneSealed(sh *shard, seg *segment) {
 	if !appendOnly || len(attrs) == 0 {
 		return
 	}
-	zones := computeSegZones(seg.data, seg.used, attrs, inline, seg.codec)
+	zones := computeSegZones(seg.data, seg.used, attrs, inline, seg.dict.Load(), seg.codec)
 	sh.mu.Lock()
 	seg.zones = zones
 	sh.mu.Unlock()

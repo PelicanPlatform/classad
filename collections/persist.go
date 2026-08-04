@@ -390,7 +390,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			// Recompute the sealed segment's zone map (not persisted separately; cheap to
 			// rebuild from the segment's own records). No-op unless append-only + ZoneAttrs.
 			if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {
-				seg.zones = computeSegZones(seg.data, seg.used, sh.zoneAttrs, sh.zoneInline, seg.codec)
+				seg.zones = computeSegZones(seg.data, seg.used, sh.zoneAttrs, sh.zoneInline, seg.dict.Load(), seg.codec)
 			}
 			if c.loadSealedIndex(seg, spec) {
 				// Phase 3: the segment's keys are now reachable through the sealed
