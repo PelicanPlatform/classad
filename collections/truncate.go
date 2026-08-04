@@ -62,11 +62,11 @@ func (c *Collection) ForEachAd(fn func(key string, ad *classad.ClassAd) bool) {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		stop := false
-		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if isSystemKeyBytes(key) {
 				return true // internal system record: hidden from client iteration
 			}
-			decoded, err := c.decodeAd(ad, codec)
+			decoded, err := c.decodeAdDict(dict, ad, codec)
 			if err != nil {
 				return true // skip an undecodable record rather than abort the backup
 			}
@@ -91,11 +91,11 @@ func (c *Collection) ForEachSystemAd(fn func(key string, ad *classad.ClassAd) bo
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		stop := false
-		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if !isSystemKeyBytes(key) {
 				return true // only system records
 			}
-			decoded, err := c.decodeAd(ad, codec)
+			decoded, err := c.decodeAdDict(dict, ad, codec)
 			if err != nil {
 				return true // skip an undecodable record rather than abort the sweep
 			}

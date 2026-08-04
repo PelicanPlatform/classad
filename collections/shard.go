@@ -563,6 +563,16 @@ type segWindow struct {
 	zones map[uint32]zoneRange // sealed segment's zone map (nil ⇒ never prunable)
 }
 
+// dict is the window's segment attribute dictionary when the segment is interned, else nil
+// (inline/global -- decode via the legacy path). Loaded lock-free; callers pass it to the
+// dict-aware decode/eval touchpoints. Nil-safe for a window with no backing segment.
+func (w segWindow) dict() *segDictHandle {
+	if w.seg == nil {
+		return nil
+	}
+	return w.seg.dict.Load()
+}
+
 // snapshot captures the shard's scan state under the read lock: the commit
 // sequence S0 and a frozen window over each live segment. The windows hold the
 // segments' immutable backing arrays directly. A RAM segment retired by a later
@@ -618,8 +628,9 @@ func releaseWindows(wins []segWindow) {
 // codec they were compressed with) of each record visible at S0
 // (seq <= S0 < supersededBySeq) — exactly one version per key that existed at S0.
 // fn returns false to stop early.
-func forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec) bool) {
+func forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec, dict *segDictHandle) bool) {
 	for _, w := range wins {
+		d := w.dict()
 		for off := 0; off < w.used; {
 			o := uint32(off)
 			total := recTotalLen(w.data, o)
@@ -633,7 +644,7 @@ func forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec)
 			seq := recSeq(w.data, o)
 			sup := recSuperseded(w.data, o)
 			if seq <= s0 && sup > s0 {
-				if !fn(recAd(w.data, o), w.codec) {
+				if !fn(recAd(w.data, o), w.codec, d) {
 					return
 				}
 			}
@@ -645,8 +656,9 @@ func forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec)
 // forEachVisibleKeyed is forEachVisible that also passes each record's key (a
 // view into the frozen window; the callback must not retain it). Used by the
 // chained scan, which needs a record's key to find its parent.
-func forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec) bool) {
+func forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
 	for _, w := range wins {
+		d := w.dict()
 		for off := 0; off < w.used; {
 			o := uint32(off)
 			total := recTotalLen(w.data, o)
@@ -660,7 +672,7 @@ func forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, co
 			seq := recSeq(w.data, o)
 			sup := recSuperseded(w.data, o)
 			if seq <= s0 && sup > s0 {
-				if !fn(recKey(w.data, o), recAd(w.data, o), w.codec) {
+				if !fn(recKey(w.data, o), recAd(w.data, o), w.codec, d) {
 					return
 				}
 			}
@@ -676,10 +688,11 @@ func forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, co
 // collected in a single forward pass, then replayed in reverse -- so the whole
 // walk is still O(records), just with a per-segment offset slice. A caller that
 // stops early after K records therefore receives the K most recently appended.
-func forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec) bool) {
+func forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var offs []uint32 // reused across windows
 	for wi := len(wins) - 1; wi >= 0; wi-- {
 		w := wins[wi]
+		d := w.dict()
 		offs = offs[:0]
 		for off := 0; off < w.used; {
 			o := uint32(off)
@@ -698,7 +711,7 @@ func forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []b
 			seq := recSeq(w.data, o)
 			sup := recSuperseded(w.data, o)
 			if seq <= s0 && sup > s0 {
-				if !fn(recKey(w.data, o), recAd(w.data, o), w.codec) {
+				if !fn(recKey(w.data, o), recAd(w.data, o), w.codec, d) {
 					return
 				}
 			}

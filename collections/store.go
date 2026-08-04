@@ -755,7 +755,7 @@ func (c *Collection) Keys() []string {
 	var out []string
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		forEachVisibleKeyed(s0, wins, func(key, _ []byte, _ Codec) bool {
+		forEachVisibleKeyed(s0, wins, func(key, _ []byte, _ Codec, _ *segDictHandle) bool {
 			if c.isStructural != nil && c.isStructural(key) {
 				return true // parent-only ads are hidden, as in Scan
 			}
@@ -921,7 +921,7 @@ func (c *Collection) scanShardAt(sh *shard, s0 uint64, qp queryPlan, emit func(w
 func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit func(w []byte) bool) bool {
 	cont := true
 	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
-	visit := func(key, ad []byte, codec Codec) bool {
+	visit := func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if isSystemKeyBytes(key) {
 			return true // internal system record: hidden from client scans/queries
 		}
@@ -930,6 +930,12 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 			return true // skip a record we cannot decode rather than abort the scan
 		}
 		dbuf = w // retain the (possibly grown) backing for the next ad
+		// Publish the record's segment dict on the wireScope so the match eval resolves an
+		// interned segment's ids (nil for inline; ws is nil on a plain no-query scan). The
+		// emit consumer gets the dict via a separate channel (emit-widening; TODO make-live).
+		if qp.ws != nil {
+			qp.ws.dict = dict
+		}
 		if qp.q != nil && !matchWire(w, qp) {
 			return true
 		}
@@ -999,14 +1005,18 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 
 	// Pass 1: collect structural (parent) ads' decompressed wire bytes. Parents
 	// are few (one per family), so this map stays small.
-	parents := map[string][]byte{}
-	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+	parents := map[string]parentWire{}
+	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if isSystemKeyBytes(key) {
 			return true // internal system record: never a family parent
 		}
 		if c.isStructural != nil && c.isStructural(key) {
 			if w, err := codec.Decompress(nil, ad); err == nil {
-				parents[string(key)] = w // owns its buffer (nil dst)
+				// Capture the parent's segment dict too: the parent may live in an interned
+				// segment while the child is inline (or a different interned segment), and
+				// pass 2 resolves the parent's wire through THIS dict. Same snapshot pins the
+				// segment, so the handle stays valid across both passes.
+				parents[string(key)] = parentWire{w: w, dict: dict} // owns its buffer (nil dst)
 			}
 		}
 		return true
@@ -1015,7 +1025,7 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 	// Pass 2: evaluate children (and standalone ads); skip structural ads.
 	cont := true
 	var dbuf []byte
-	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec) bool {
+	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if isSystemKeyBytes(key) {
 			return true // internal system record: hidden from client scans/queries
 		}
@@ -1028,20 +1038,24 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 		}
 		dbuf = w
 		var parentW []byte
+		var parentDict *segDictHandle
 		if pk := c.parentKeyFor(key); pk != nil {
-			parentW = parents[string(pk)]
+			if pe, ok := parents[string(pk)]; ok {
+				parentW, parentDict = pe.w, pe.dict
+			}
 		}
 		qp.ws.parent = wire.Ad(parentW) // nil ⇒ no parent
+		qp.ws.dict, qp.ws.parentDict = dict, parentDict
 		if qp.q != nil && !matchWire(w, qp) {
 			return true
 		}
-		a, err := c.decodeWire(w)
+		a, err := c.decodeWireDict(dict, w)
 		if err != nil {
 			return true
 		}
 		child := classad.FromAST(a)
 		if parentW != nil {
-			if pa, err := c.decodeWire(parentW); err == nil {
+			if pa, err := c.decodeWireDict(parentDict, parentW); err == nil {
 				c.mergeParent(child, classad.FromAST(pa))
 			}
 		}
@@ -1051,8 +1065,16 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 		}
 		return true
 	})
-	qp.ws.parent = nil
+	qp.ws.parent, qp.ws.dict, qp.ws.parentDict = nil, nil, nil
 	return cont
+}
+
+// parentWire is a captured chained-parent ad's decompressed wire bytes plus the segment
+// dictionary needed to resolve them (nil for an inline/global parent). Held only for the
+// lifetime of one scanShardChained snapshot, which pins the parent's segment.
+type parentWire struct {
+	w    []byte
+	dict *segDictHandle
 }
 
 // yieldAd is the emit callback for the classic Query/Scan path: decode w to a
@@ -1158,14 +1180,17 @@ func (c *Collection) CollectSamples(max int) [][]byte {
 			break
 		}
 		s0, wins := sh.snapshot()
-		forEachVisible(s0, wins, func(ad []byte, codec Codec) bool {
+		forEachVisible(s0, wins, func(ad []byte, codec Codec, dict *segDictHandle) bool {
 			w, err := codec.Decompress(buf[:0], ad)
 			if err != nil {
 				return true
 			}
 			buf = w
-			cp := make([]byte, len(w))
-			copy(cp, w)
+			// Samples are consumed later (schema build / ForEachNamed) with no segment in
+			// scope, so an interned record must be flattened to inline wire now.
+			iw := c.wireToInline(dict, w)
+			cp := make([]byte, len(iw))
+			copy(cp, iw)
 			out = append(out, cp)
 			return len(out) < max
 		})

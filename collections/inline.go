@@ -136,6 +136,21 @@ func (c *Collection) decodeAdDict(dict *segDictHandle, stored []byte, codec Code
 	return classad.FromAST(a), nil
 }
 
+// wireToInline is toSelfContained for already-DECOMPRESSED wire (no codec): an interned
+// segment's decompressed record becomes inline wire so a downstream consumer that reads it by
+// name -- CollectSamples -> buildAdSchema / ForEachNamed(c.intern) -- works without the dict.
+// nil dict (inline segment / in-memory global) returns w unchanged.
+func (c *Collection) wireToInline(dict *segDictHandle, w []byte) []byte {
+	if dict == nil {
+		return w
+	}
+	a, err := wire.DecodeResolve(w, dict.resolve)
+	if err != nil {
+		return w
+	}
+	return wire.EncodeInline(nil, a)
+}
+
 // toSelfContained converts a stored record's (compressed) ad bytes into a form that decodes
 // WITHOUT the source segment's dict, for DEFERRED/cold paths (e.g. a watch event) that copy ad
 // bytes out of the scan and decode them later, when the segment and its dict are no longer in
