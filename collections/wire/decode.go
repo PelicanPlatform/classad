@@ -53,10 +53,18 @@ func Decode(b []byte, t *InternTable) (*ast.ClassAd, error) {
 // must be interned (not inline -- those are self-contained, use DecodeInline; not standalone).
 // The resolver is inherited by nested ad decoders, so it covers sub-ads too.
 func DecodeResolve(b []byte, resolve func(uint32) (string, bool)) (*ast.ClassAd, error) {
+	return DecodeResolveEnc(b, resolve, nil)
+}
+
+// DecodeResolveEnc is DecodeResolve for an interned ad that may contain nEncrypted attributes:
+// open supplies the segment's key so sealed values decrypt to their real (interned) nodes,
+// which then resolve their ids via resolve. A nil open leaves encrypted attributes opaque and
+// decode errors on them -- so pass the sealer only on the daemon read path that holds the key.
+func DecodeResolveEnc(b []byte, resolve func(uint32) (string, bool), open Sealer) (*ast.ClassAd, error) {
 	if resolve == nil {
 		return nil, fmt.Errorf("%w: interned ad requires a resolver", ErrMalformed)
 	}
-	d := &decoder{b: b, resolve: resolve}
+	d := &decoder{b: b, resolve: resolve, open: open}
 	flags, err := d.headerFlags()
 	if err != nil {
 		return nil, err

@@ -28,6 +28,12 @@ type schemaScanState struct {
 // with no state/block a query takes the normal row path, so a collection that never calls this
 // is unaffected. Reads immutable sealed bytes only.
 func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
+	if c.sealer != nil {
+		// A columnar block stores attribute values in the clear; over an encryption-at-rest
+		// collection it would materialize sealed values as plaintext on disk. The two are
+		// mutually exclusive -- an encrypted collection always takes the row path.
+		return
+	}
 	st := c.schemaScan.Load()
 	if st == nil || st.schema != s {
 		bc, err := newBlockCache(256 << 20) // ~256 MiB of decompressed blocks
@@ -62,6 +68,9 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 // scan over the sealed segments. Returns false if there is nothing to sample. Re-callable to
 // pick up newly-sealed segments (existing blocks are kept).
 func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
+	if c.sealer != nil {
+		return false // see EnableSchemaScan: incompatible with encryption at rest
+	}
 	// Already enabled: keep the stable schema and hot set chosen at first enable, and just
 	// extend coverage to any segments sealed since (their blocks are built against this same
 	// schema, so nothing is orphaned). Rebuilding a fresh schema here would give every new

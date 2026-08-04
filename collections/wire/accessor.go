@@ -489,7 +489,14 @@ func DecodeNode(node []byte, t *InternTable) (ast.Expr, error) {
 // resolving interned ids via `resolve` instead of an *InternTable -- e.g. backed by a sealed
 // segment's mmap dictionary. Counterpart to DecodeNode for the per-segment interned path.
 func DecodeNodeResolve(node []byte, resolve func(uint32) (string, bool)) (ast.Expr, error) {
-	d := &decoder{b: node, resolve: resolve}
+	return DecodeNodeResolveEnc(node, resolve, nil)
+}
+
+// DecodeNodeResolveEnc is DecodeNodeResolve that opens an nEncrypted node with open (the
+// per-segment interned analog of DecodeNodeInlineEnc). A nil open leaves an encrypted node an
+// error.
+func DecodeNodeResolveEnc(node []byte, resolve func(uint32) (string, bool), open Sealer) (ast.Expr, error) {
+	d := &decoder{b: node, resolve: resolve, open: open}
 	return d.node(0)
 }
 
