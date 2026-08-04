@@ -82,6 +82,42 @@ func (c *Collection) recordToInterned(dst, w []byte) ([]byte, bool) {
 	return wire.Encode(dst[:0], ad, c.intern), true
 }
 
+// --- per-segment interned dispatch (interning) ---
+//
+// A sealed segment may be INTERNED with its own attribute dictionary (segment.dict != nil):
+// its records carry segment-local ids resolved to names via that dict, not inline names and
+// not the collection's global table. These wrappers take the segment's dict handle and, when
+// it is non-nil, resolve through it (zero-copy over the mmap); a nil handle means the segment
+// is inline/global -- the legacy path, byte-for-byte unchanged. Scan/read call sites thread
+// the segment's dict (segment.dict.Load()) from the visibility window. An interned segment is
+// never encrypted (encrypted collections keep sealing inline), so the resolver path needs no
+// sealer.
+
+func (c *Collection) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error) {
+	if dict != nil {
+		return wire.DecodeResolve(w, dict.resolve)
+	}
+	return c.decodeWire(w)
+}
+
+func (c *Collection) wireLookupDict(dict *segDictHandle, a wire.Ad, name string) ([]byte, bool) {
+	if dict != nil {
+		id, ok := dict.lookup(name)
+		if !ok {
+			return nil, false
+		}
+		return a.Lookup(id)
+	}
+	return c.wireLookup(a, name)
+}
+
+func (c *Collection) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr, error) {
+	if dict != nil {
+		return wire.DecodeNodeResolve(node, dict.resolve)
+	}
+	return c.decodeNode(node)
+}
+
 // newStreamEncoder returns a StreamEncoder matching the collection's mode, for the
 // direct old-ClassAd ingest path (UpdateOld).
 func (c *Collection) newStreamEncoder() *wire.StreamEncoder {
