@@ -88,6 +88,11 @@ type Config struct {
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
 
+	// SegmentSize overrides the arena segment size in bytes (see collections.Options).
+	// 0 uses the default (8 MiB). A smaller value seals segments sooner -- useful for
+	// tests and for tuning the sealed-segment accelerators (columnar scan, sealed indexes).
+	SegmentSize int
+
 	// PoolKeys enables encryption at rest: the DB master key is wrapped under each of
 	// these pool/signing keys (any one opens the DB; a rotated-in key is added on the
 	// next open). Empty ⇒ encryption disabled. See db/encrypt.go.
@@ -124,6 +129,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		Codec:             chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
 		DataKey:           enc.data(),
 		EncryptedAttrs:    cfg.EncryptedAttrs,
+		SegmentSize:       cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
 		// Time travel is a persisted runtime toggle: read it before opening so recovery
 		// rebuilds the time index (and scan-pruning counters) from the segment markers
 		// instead of the directory snapshot. loadIndexConfig below keeps it in sync.
@@ -210,6 +216,13 @@ type MaintainOptions struct {
 	IndexBudgetHighFrac   float64
 	IndexBudgetLowFrac    float64
 	IndexBudgetSlackBytes int64
+	// SchemaScanHotTopN, when > 0, builds/refreshes the per-segment adschema columnar
+	// accelerator (used by CountConstraint's fast path) keeping the topN most query-read
+	// numeric fields uncompressed. The first pass chooses a stable schema and hot set from
+	// the current sample and demand; later passes only extend coverage to newly-sealed
+	// segments, so a table opts into the columnar count path once maintenance runs and stays
+	// covered as it grows. 0 leaves it off.
+	SchemaScanHotTopN int
 }
 
 // Maintain runs one self-tuning pass: it auto-tunes indexes (adds demand-driven ones,
@@ -239,6 +252,11 @@ func (db *DB) Maintain(opts MaintainOptions) {
 	}
 	if opts.Retrain {
 		_, _ = db.c.RetrainDict(opts.SampleMax) // recompacts + reindexes
+	}
+	if opts.SchemaScanHotTopN > 0 {
+		// Build the columnar accelerator on first run, extend it to newly-sealed segments
+		// after (idempotent + refresh-safe -- keeps the stable schema/hot set).
+		db.c.BuildAndEnableSchemaScan(opts.SampleMax, opts.SchemaScanHotTopN)
 	}
 }
 
