@@ -412,7 +412,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// inline or already-interned (re-compaction) -- each record is decoded via its own segment
 	// mode. abort stops the round on a decode failure or dict-reserve overflow so a shard is
 	// never left with an unreadable segment.
-	intern := c.inline && c.sealer == nil
+	intern := c.inline && c.sealer == nil && !sh.appendOnly
 	// reserve is the arena held back for the dict, capped to a quarter of the segment so a
 	// segment always fits many records plus its dict (compactDictReserve alone could exceed a
 	// small SegmentSize and force one record per segment). A dict larger than the reserve
