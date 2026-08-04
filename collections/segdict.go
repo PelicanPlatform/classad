@@ -110,6 +110,30 @@ func (h *segDictHandle) resolve(id uint32) (string, bool) {
 	return "", false
 }
 
+// publishSegDict scans a recovered segment for its dictionary record (an interned segment
+// carries one, appended at compaction/seal via appendDict) and, if found, publishes the
+// segment's dict handle so its records resolve segment-local ids. A segment with no dict record
+// is inline -- seg.dict stays nil. Called during Open before any body decode. The dict record
+// is a trailer, so this walks to it; the walk reads only record headers (no decompress).
+func publishSegDict(seg *segment) {
+	if seg == nil || seg.dict.Load() != nil {
+		return
+	}
+	for off := 0; off < seg.used; {
+		o := uint32(off)
+		total := recTotalLen(seg.data, o)
+		if total == 0 {
+			break
+		}
+		if recIsDict(seg.data, o) {
+			// The keyless dict record's body (the serialized dict) starts after the header + adLen.
+			seg.dict.Store(&segDictHandle{data: seg.data, base: o + recKeyOff + 4})
+			return
+		}
+		off += int(total)
+	}
+}
+
 // segDictCount returns the number of names in the dict at base.
 func segDictCount(data []byte, base uint32) uint32 { return le32(data, base) }
 

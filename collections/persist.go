@@ -371,6 +371,19 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// and matching the current spec, its attribute index. Runs regardless of whether
 	// attribute indexes are configured. A missing/invalid sidecar is left unmapped and
 	// rebuilt later; the directory stays authoritative.
+	// Restore each segment's attribute dictionary (interned segments only) BEFORE any body
+	// decode below, so zone/index rebuilds and scans resolve segment-local ids. Done across
+	// ALL segments, including whichever one recovery picked as active. An interned segment is
+	// sealed and cannot take new inline writes, so if recovery made one the active target,
+	// demote it -- the next write then allocates a fresh inline active segment.
+	for _, seg := range sh.segs {
+		if seg != nil {
+			publishSegDict(seg)
+		}
+	}
+	if sh.act != nil && sh.act.dict.Load() != nil {
+		sh.act = nil
+	}
 	spec := c.spec.Load()
 	for _, seg := range sh.segs {
 		if seg != nil && seg != sh.act {

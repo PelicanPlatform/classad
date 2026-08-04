@@ -694,11 +694,11 @@ func (c *Collection) Delete(key []byte) bool {
 func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	stored, codec, ok := sh.get(h, key)
+	stored, codec, dict, ok := sh.get(h, key)
 	if !ok {
 		return nil, false
 	}
-	ad, err := c.decodeAd(stored, codec)
+	ad, err := c.decodeAdDict(dict, stored, codec)
 	if err != nil {
 		return nil, false
 	}
@@ -707,8 +707,8 @@ func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	if c.parentKeyFor != nil {
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
-			if pad, pcodec, ok := sh.get(ph, pk); ok {
-				if parent, err := c.decodeAd(pad, pcodec); err == nil {
+			if pad, pcodec, pdict, ok := sh.get(ph, pk); ok {
+				if parent, err := c.decodeAdDict(pdict, pad, pcodec); err == nil {
 					c.mergeParent(ad, parent)
 				}
 			}

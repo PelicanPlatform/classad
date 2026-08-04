@@ -2,7 +2,26 @@ package collections
 
 import (
 	"time"
+
+	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
+
+// compactDictReserve is the arena space held back at the end of an interned destination
+// segment for its attribute dictionary (appended at finalize). Generous: a typical dict is
+// ~30-60KB (hundreds of names); this covers a few thousand distinct names. If a dict ever
+// exceeds it (pathological attribute cardinality), the interned compaction round aborts and
+// the shard is left uncompacted rather than publishing an unreadable segment.
+const compactDictReserve = 256 * 1024
+
+// internReserve is the dict reserve when interning, else 0 (used inline in the marker-roll fit
+// check so a history segment carrying only checkpoints still leaves room for its dict).
+func internReserve(intern bool) int {
+	if intern {
+		return compactDictReserve
+	}
+	return 0
+}
 
 // Compaction reclaims space consumed by superseded/deleted records.
 //
@@ -393,6 +412,73 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 		return ad, seg.codec
 	}
+
+	// Interning: on a persistent, plaintext collection each destination segment is written
+	// INTERNED -- its records carry segment-local attribute ids and it carries a per-segment
+	// dictionary appended at finalize (see segdict.go / the interning design). In-memory
+	// (already global-interned) and encrypted (only inline has a sealing encoder) collections
+	// keep the recompress-only path. A destination becomes uniformly interned; a source may be
+	// inline or already-interned (re-compaction) -- each record is decoded via its own segment
+	// mode. abort stops the round on a decode failure or dict-reserve overflow so a shard is
+	// never left with an unreadable segment.
+	intern := c.inline && c.sealer == nil
+	var curTable, hcurTable *wire.InternTable
+	var wireBuf []byte
+	abort := false
+	// finalizeInterned appends seg's dictionary (from table) and publishes seg.dict, sealing it
+	// as a readable interned segment. Called on roll and at the end of the copy.
+	finalizeInterned := func(seg *segment, table *wire.InternTable) {
+		if seg == nil || table == nil {
+			return
+		}
+		off, ok := seg.appendDict(appendSegDict(nil, table.Names()))
+		if !ok {
+			abort = true // dict outgrew the reserve; do not publish an unresolvable segment
+			return
+		}
+		// A keyless dict record's body (the serialized dict) starts after the 32-byte header
+		// and the adLen u32 -- the base a segDictHandle probes.
+		seg.dict.Store(&segDictHandle{data: seg.data, base: off + recKeyOff + 4})
+	}
+	// decodeSrc decodes a source record to an ast, honoring the source segment's own encoding
+	// (inline or interned). Returns nil on any decompress/decode failure.
+	decodeSrc := func(seg *segment, o uint32) *ast.ClassAd {
+		w, err := seg.codec.Decompress(decBuf[:0], recAd(seg.data, o))
+		if err != nil {
+			return nil
+		}
+		decBuf = w
+		ad, err := c.decodeWireDict(seg.dict.Load(), w)
+		if err != nil {
+			return nil
+		}
+		return ad
+	}
+	// appendInterned encodes ad interned against *tablep and appends it to stream *curp,
+	// rolling to a fresh segment+table (finalizing the old one's dict) when it would not fit
+	// with the dict reserve. Returns the destination segment and record offset.
+	appendInterned := func(streamSegs *[]*segment, curp **segment, tablep **wire.InternTable, seq uint64, key []byte, ad *ast.ClassAd) (*segment, uint32) {
+		if *curp == nil {
+			*curp = newDst(streamSegs, compactDictReserve, target)
+			*tablep = wire.NewInternTable()
+		}
+		wireBuf = wire.Encode(wireBuf[:0], ad, *tablep)
+		body := target.Compress(encBuf[:0], wireBuf)
+		encBuf = body
+		rl := recordLen(len(key), len(body))
+		if (*curp).used+rl+compactDictReserve > len((*curp).data) {
+			finalizeInterned(*curp, *tablep)
+			*curp = newDst(streamSegs, rl+compactDictReserve, target)
+			*tablep = wire.NewInternTable()
+			wireBuf = wire.Encode(wireBuf[:0], ad, *tablep)
+			body = target.Compress(encBuf[:0], wireBuf)
+			encBuf = body
+			rl = recordLen(len(key), len(body))
+		}
+		off, _ := (*curp).append(seq, noLoc, key, body)
+		return *curp, off
+	}
+
 	for _, seg := range sources {
 		for off := 0; off < seg.used; {
 			o := uint32(off)
@@ -403,8 +489,12 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			seq := recSeq(seg.data, o)
 			if recIsMarker(seg.data, o) {
 				if seq > retain { // carry an in-window checkpoint forward (to history)
-					if hcur == nil || hcur.used+recordLen(0, 8) > len(hcur.data) {
-						hcur = newDst(&histSegs, recordLen(0, 8), target)
+					if hcur == nil || hcur.used+recordLen(0, 8)+internReserve(intern) > len(hcur.data) {
+						finalizeInterned(hcur, hcurTable) // no-op unless interning
+						hcur = newDst(&histSegs, recordLen(0, 8)+internReserve(intern), target)
+						if intern {
+							hcurTable = wire.NewInternTable()
+						}
 					}
 					hcur.appendMarker(seq, recMarkerMillis(seg.data, o))
 				}
@@ -415,15 +505,30 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			if sup == seqMax {
 				// Current version -> live stream (rebuilt into the directory).
 				key := recKey(seg.data, o)
-				outAd, outCodec := recompress(seg, recAd(seg.data, o))
-				rl := recordLen(len(key), len(outAd))
-				if cur == nil || cur.codec != outCodec || cur.used+rl > len(cur.data) {
-					cur = newDst(&dstSegs, rl, outCodec)
+				var dstSeg *segment
+				var dstOff uint32
+				if intern {
+					ad := decodeSrc(seg, o)
+					if ad == nil {
+						abort = true
+						break
+					}
+					dstSeg, dstOff = appendInterned(&dstSegs, &cur, &curTable, seq, key, ad)
+					if abort {
+						break
+					}
+				} else {
+					outAd, outCodec := recompress(seg, recAd(seg.data, o))
+					rl := recordLen(len(key), len(outAd))
+					if cur == nil || cur.codec != outCodec || cur.used+rl > len(cur.data) {
+						cur = newDst(&dstSegs, rl, outCodec)
+					}
+					dstOff, _ = cur.append(seq, noLoc, key, outAd)
+					dstSeg = cur
 				}
-				dstOff, _ := cur.append(seq, noLoc, key, outAd)
 				moved = append(moved, movedRec{
 					srcSeg: seg, srcOff: o,
-					dstSeg: cur, dstOff: dstOff,
+					dstSeg: dstSeg, dstOff: dstOff,
 					key:  append([]byte(nil), key...),
 					hash: c.h.Hash(key),
 				})
@@ -432,17 +537,48 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 				// preserving its original supersededBySeq (supersedeRec keeps the
 				// segment's live/dead counters right: appended live, then retired).
 				key := recKey(seg.data, o)
-				outAd, outCodec := recompress(seg, recAd(seg.data, o))
-				rl := recordLen(len(key), len(outAd))
-				if hcur == nil || hcur.codec != outCodec || hcur.used+rl > len(hcur.data) {
-					hcur = newDst(&histSegs, rl, outCodec)
+				if intern {
+					ad := decodeSrc(seg, o)
+					if ad == nil {
+						abort = true
+						break
+					}
+					hseg, hoff := appendInterned(&histSegs, &hcur, &hcurTable, seq, key, ad)
+					if abort {
+						break
+					}
+					hseg.supersedeRec(hoff, sup)
+				} else {
+					outAd, outCodec := recompress(seg, recAd(seg.data, o))
+					rl := recordLen(len(key), len(outAd))
+					if hcur == nil || hcur.codec != outCodec || hcur.used+rl > len(hcur.data) {
+						hcur = newDst(&histSegs, rl, outCodec)
+					}
+					dstOff, _ := hcur.append(seq, noLoc, key, outAd)
+					hcur.supersedeRec(dstOff, sup)
 				}
-				dstOff, _ := hcur.append(seq, noLoc, key, outAd)
-				hcur.supersedeRec(dstOff, sup)
 			}
 			// else: superseded at or below the retain floor -> reclaimed (dropped).
 			off += int(total)
 		}
+		if abort {
+			break
+		}
+	}
+	if intern && !abort {
+		finalizeInterned(cur, curTable)
+		finalizeInterned(hcur, hcurTable)
+	}
+	if abort {
+		// Unpublished destinations: unmap + unlink them and leave the shard uncompacted (its
+		// sources remain in place; sh.act stays as Phase 1 / concurrent writes left it).
+		for _, s := range dstSegs {
+			_ = s.reap()
+		}
+		for _, s := range histSegs {
+			_ = s.reap()
+		}
+		return
 	}
 
 	// Make destination records durable BEFORE any source is retired (crash safety).
@@ -545,7 +681,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	}
 	sh.dir = newDir
 	sh.count = count
-	if len(dstSegs) > 0 {
+	// Reuse the last live destination as the new append target -- but NOT when interning: an
+	// interned destination is sealed with a dictionary and cannot take new inline writes.
+	// Leaving sh.act nil makes the next write allocate a fresh inline active segment.
+	if !intern && len(dstSegs) > 0 {
 		sh.act = dstSegs[len(dstSegs)-1]
 	}
 	// Superseded/delete evidence at or below the retain floor was just dropped; raise

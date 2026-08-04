@@ -542,8 +542,8 @@ func (c *Collection) watchAd(key, rawAd []byte, codec Codec) (*classad.ClassAd, 
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
 			sh := c.shards[c.shardOf(pk, ph)]
-			if pad, pcodec, ok := sh.get(ph, pk); ok {
-				if parent, err := c.decodeAd(pad, pcodec); err == nil {
+			if pad, pcodec, pdict, ok := sh.get(ph, pk); ok {
+				if parent, err := c.decodeAdDict(pdict, pad, pcodec); err == nil {
 					c.mergeParent(ad, parent)
 				}
 			}
