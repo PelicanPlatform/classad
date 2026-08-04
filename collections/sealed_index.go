@@ -116,7 +116,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 // error the existing sidecar is left in place and false is returned, so the segment keeps
 // serving queries under its older (still correct, just less selective) index.
 func (c *Collection) reindexSealed(sh *shard, seg *segment, spec *indexSpec) bool {
-	si := buildSegIndex(seg.data, seg.used, seg.codec, spec)
+	si := buildSegIndex(seg.data, seg.used, seg.codec, spec, seg.dict.Load())
 	if si == nil {
 		return false
 	}

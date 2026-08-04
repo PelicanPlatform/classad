@@ -94,7 +94,7 @@ func (c *Collection) Reindex() {
 			}
 			si := t.seg.idx.Load()
 			if si == nil || int(si.upto) < t.used || si.specGen != spec.gen {
-				si = buildSegIndex(t.seg.data, t.used, t.seg.codec, spec)
+				si = buildSegIndex(t.seg.data, t.used, t.seg.codec, spec, t.seg.dict.Load())
 				t.seg.idx.Store(si)
 			}
 			// Sealed segment: move its index off the heap into the mmap sidecar (reclaimable,

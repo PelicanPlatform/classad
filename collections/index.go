@@ -108,7 +108,16 @@ func (s *indexSpec) inlineID(name string) uint32 {
 
 // attrNode returns the value node for the attribute with id id in ad, reading it by
 // name for an inline record or by interned id otherwise.
-func (s *indexSpec) attrNode(ad wire.Ad, id uint32) ([]byte, bool) {
+func (s *indexSpec) attrNode(ad wire.Ad, id uint32, dict *segDictHandle) ([]byte, bool) {
+	if dict != nil {
+		// Interned segment: the record carries segment-local ids. Resolve the indexed
+		// attribute's name (always available -- a persistent collection uses an inline spec)
+		// to this segment's local id, then read it.
+		if localid, ok := dict.lookup(s.names[id]); ok {
+			return ad.Lookup(localid)
+		}
+		return nil, false
+	}
 	if s.inline {
 		return ad.LookupByName(s.names[id])
 	}
@@ -267,7 +276,7 @@ type segIndex struct {
 // the given spec. Reads immutable segment bytes only (no lock needed); decompresses
 // each record to read the indexed attributes. It has no Collection dependency, so
 // both the live store (Reindex) and the Archive build indexes with it.
-func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segIndex {
+func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec, dict *segDictHandle) *segIndex {
 	si := &segIndex{
 		upto:    uint32(upto),
 		specGen: spec.gen,
@@ -296,7 +305,7 @@ func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segInde
 		si.all.Add(o)
 		if w, err := codec.Decompress(buf[:0], recAd(data, o)); err == nil {
 			buf = w
-			si.indexRecord(o, wire.Ad(w), spec)
+			si.indexRecord(o, wire.Ad(w), spec, dict)
 		}
 		off += int(total)
 	}
@@ -314,10 +323,10 @@ func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec) *segInde
 
 // indexRecord adds record offset o to the postings for each configured attribute,
 // classifying the attribute value as indexable, exceptional, or absent.
-func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
+func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *segDictHandle) {
 	for _, id := range spec.catIDs {
 		cp := si.cat[id]
-		node, ok := spec.attrNode(ad, id)
+		node, ok := spec.attrNode(ad, id, dict)
 		if !ok {
 			continue // absent
 		}
@@ -346,7 +355,7 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec) {
 	}
 	for _, id := range spec.valIDs {
 		vp := si.val[id]
-		node, ok := spec.attrNode(ad, id)
+		node, ok := spec.attrNode(ad, id, dict)
 		if !ok {
 			continue
 		}
