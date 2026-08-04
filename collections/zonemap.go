@@ -29,7 +29,7 @@ type zoneAttr struct {
 // encodes records (persistent collections store inline names; in-memory ones store
 // interned ids). Returns nil when no zone attributes are configured. Caller holds the
 // shard write lock (seal) or runs single-threaded during Open (reopen).
-func computeSegZones(data []byte, upto int, attrs []zoneAttr, inline bool, codec Codec) map[uint32]zoneRange {
+func computeSegZones(data []byte, upto int, attrs []zoneAttr, inline bool, dict *segDictHandle, codec Codec) map[uint32]zoneRange {
 	if len(attrs) == 0 {
 		return nil
 	}
@@ -51,9 +51,14 @@ func computeSegZones(data []byte, upto int, attrs []zoneAttr, inline bool, codec
 			for _, za := range attrs {
 				var node []byte
 				var ok bool
-				if inline {
+				switch {
+				case dict != nil: // interned segment: resolve the zone attr's segment-local id
+					if id, has := dict.lookup(za.name); has {
+						node, ok = ad.Lookup(id)
+					}
+				case inline:
 					node, ok = ad.LookupByName(za.name)
-				} else {
+				default:
 					node, ok = ad.Lookup(za.id)
 				}
 				if !ok {
@@ -137,5 +142,5 @@ func (sh *shard) sealZones(seg *segment) {
 	if seg == nil || !sh.appendOnly || len(sh.zoneAttrs) == 0 || seg.zones != nil {
 		return
 	}
-	seg.zones = computeSegZones(seg.data, seg.used, sh.zoneAttrs, sh.zoneInline, seg.codec)
+	seg.zones = computeSegZones(seg.data, seg.used, sh.zoneAttrs, sh.zoneInline, seg.dict.Load(), seg.codec)
 }
