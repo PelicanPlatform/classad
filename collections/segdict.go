@@ -3,6 +3,7 @@ package collections
 import (
 	"sort"
 	"strings"
+	"sync/atomic"
 )
 
 // segDict is a sealed segment's per-segment attribute-name dictionary in its serialized,
@@ -93,8 +94,9 @@ func appendSegDict(dst []byte, names []string) []byte {
 // one via an atomic pointer (nil => the segment is inline-encoded). All methods are safe for
 // concurrent readers.
 type segDictHandle struct {
-	data []byte // the segment arena (or any buffer) the dict is embedded in
-	base uint32 // offset of the dict's first byte within data
+	data  []byte                   // the segment arena (or any buffer) the dict is embedded in
+	base  uint32                   // offset of the dict's first byte within data
+	names atomic.Pointer[[]string] // lazily-built id->name cache for the decode hot path (see resolve)
 }
 
 func (h *segDictHandle) lookup(name string) (uint32, bool) {
@@ -103,13 +105,31 @@ func (h *segDictHandle) lookup(name string) (uint32, bool) {
 func (h *segDictHandle) name(id uint32) []byte { return segDictName(h.data, h.base, id) }
 func (h *segDictHandle) count() uint32         { return segDictCount(h.data, h.base) }
 
-// resolve is the id->name function form for wire.DecodeResolve, so an interned record decodes
-// straight over the mmap with no in-memory table.
+// resolve is the id->name function form for wire.DecodeResolve. It returns a SHARED, cached
+// string so a full-ad decode allocates no per-attribute name copy. Copying id->name off the
+// mmap on every call (string(segDictName(...))) measured as ~the entire decode-speed win of
+// interning (one alloc per attribute per record). The cache is built once per segment on first
+// use, so only segments that get full-ad reads pay it -- match/query planning resolve name->id
+// via the MPH (segDictLookup) and never touch this. Concurrent builds are harmless (idempotent).
 func (h *segDictHandle) resolve(id uint32) (string, bool) {
-	if b := h.name(id); b != nil {
-		return string(b), true
+	names := h.names.Load()
+	if names == nil {
+		names = h.buildNameCache()
 	}
-	return "", false
+	if int(id) >= len(*names) {
+		return "", false
+	}
+	return (*names)[id], true
+}
+
+func (h *segDictHandle) buildNameCache() *[]string {
+	n := int(segDictCount(h.data, h.base))
+	s := make([]string, n)
+	for id := 0; id < n; id++ {
+		s[id] = string(segDictName(h.data, h.base, uint32(id)))
+	}
+	h.names.Store(&s)
+	return &s
 }
 
 // publishSegDict scans a recovered segment for its dictionary record (an interned segment
