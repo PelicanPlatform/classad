@@ -14,15 +14,6 @@ import (
 // the shard is left uncompacted rather than publishing an unreadable segment.
 const compactDictReserve = 256 * 1024
 
-// internReserve is the dict reserve when interning, else 0 (used inline in the marker-roll fit
-// check so a history segment carrying only checkpoints still leaves room for its dict).
-func internReserve(intern bool) int {
-	if intern {
-		return compactDictReserve
-	}
-	return 0
-}
-
 // Compaction reclaims space consumed by superseded/deleted records.
 //
 // It is driven by the per-shard dead-byte ratio (never by age: ClassAds are
@@ -422,6 +413,14 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// mode. abort stops the round on a decode failure or dict-reserve overflow so a shard is
 	// never left with an unreadable segment.
 	intern := c.inline && c.sealer == nil
+	// reserve is the arena held back for the dict, capped to a quarter of the segment so a
+	// segment always fits many records plus its dict (compactDictReserve alone could exceed a
+	// small SegmentSize and force one record per segment). A dict larger than the reserve
+	// aborts the round (see finalizeInterned).
+	reserve := compactDictReserve
+	if q := sh.segSize / 4; q < reserve {
+		reserve = q
+	}
 	var curTable, hcurTable *wire.InternTable
 	var wireBuf []byte
 	abort := false
@@ -459,16 +458,16 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// with the dict reserve. Returns the destination segment and record offset.
 	appendInterned := func(streamSegs *[]*segment, curp **segment, tablep **wire.InternTable, seq uint64, key []byte, ad *ast.ClassAd) (*segment, uint32) {
 		if *curp == nil {
-			*curp = newDst(streamSegs, compactDictReserve, target)
+			*curp = newDst(streamSegs, 0, target)
 			*tablep = wire.NewInternTable()
 		}
 		wireBuf = wire.Encode(wireBuf[:0], ad, *tablep)
 		body := target.Compress(encBuf[:0], wireBuf)
 		encBuf = body
 		rl := recordLen(len(key), len(body))
-		if (*curp).used+rl+compactDictReserve > len((*curp).data) {
+		if (*curp).used+rl+reserve > len((*curp).data) {
 			finalizeInterned(*curp, *tablep)
-			*curp = newDst(streamSegs, rl+compactDictReserve, target)
+			*curp = newDst(streamSegs, rl+reserve, target)
 			*tablep = wire.NewInternTable()
 			wireBuf = wire.Encode(wireBuf[:0], ad, *tablep)
 			body = target.Compress(encBuf[:0], wireBuf)
@@ -489,9 +488,13 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			seq := recSeq(seg.data, o)
 			if recIsMarker(seg.data, o) {
 				if seq > retain { // carry an in-window checkpoint forward (to history)
-					if hcur == nil || hcur.used+recordLen(0, 8)+internReserve(intern) > len(hcur.data) {
+					markerReserve := 0
+					if intern {
+						markerReserve = reserve
+					}
+					if hcur == nil || hcur.used+recordLen(0, 8)+markerReserve > len(hcur.data) {
 						finalizeInterned(hcur, hcurTable) // no-op unless interning
-						hcur = newDst(&histSegs, recordLen(0, 8)+internReserve(intern), target)
+						hcur = newDst(&histSegs, recordLen(0, 8)+markerReserve, target)
 						if intern {
 							hcurTable = wire.NewInternTable()
 						}
