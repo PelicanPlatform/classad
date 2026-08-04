@@ -795,6 +795,13 @@ func (c *Collection) Scan() iter.Seq[*classad.ClassAd] {
 
 // queryPlan bundles a compiled query with everything a scan needs to evaluate it,
 // including reusable per-scan state.
+// scanEmit consumes each visible record's decompressed wire bytes w and its segment dict
+// (nil for an inline/global segment; non-nil resolves segment-local interned ids). The
+// consumer decodes/renders w -- via dict when set -- so one scan path serves Query, QueryRaw,
+// projection, and aggregates over both inline and interned segments. w aliases a reused
+// buffer; the consumer must not retain it.
+type scanEmit = func(w []byte, dict *segDictHandle) bool
+
 type queryPlan struct {
 	q        *vm.Query
 	plan     vm.ReadPlan
@@ -901,7 +908,7 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 // Decoding w (to a *classad.ClassAd, or straight to wire text for QueryRaw) is the
 // caller's job, so one scan path serves both Query and QueryRaw. w aliases a
 // reused buffer -- emit must not retain it.
-func (c *Collection) scanShard(sh *shard, qp queryPlan, emit func(w []byte) bool) bool {
+func (c *Collection) scanShard(sh *shard, qp queryPlan, emit scanEmit) bool {
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	return c.scanWindows(s0, wins, qp, emit)
@@ -910,7 +917,7 @@ func (c *Collection) scanShard(sh *shard, qp queryPlan, emit func(w []byte) bool
 // scanShardAt is scanShard for a historical snapshot sequence s0 (point-in-time / AS
 // OF queries): it scans the versions visible at s0 rather than the current commit
 // sequence.
-func (c *Collection) scanShardAt(sh *shard, s0 uint64, qp queryPlan, emit func(w []byte) bool) bool {
+func (c *Collection) scanShardAt(sh *shard, s0 uint64, qp queryPlan, emit scanEmit) bool {
 	wins := sh.snapshotAt(s0)
 	defer releaseWindows(wins)
 	return c.scanWindows(s0, wins, qp, emit)
@@ -918,7 +925,7 @@ func (c *Collection) scanShardAt(sh *shard, s0 uint64, qp queryPlan, emit func(w
 
 // scanWindows match-tests and emits the visible records of a frozen window set at
 // snapshot s0. Shared by the current-time and AS OF scan paths.
-func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit func(w []byte) bool) bool {
+func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit scanEmit) bool {
 	cont := true
 	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
 	visit := func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
@@ -939,7 +946,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		if qp.q != nil && !matchWire(w, qp) {
 			return true
 		}
-		if !emit(w) {
+		if !emit(w, dict) {
 			cont = false
 			return false
 		}
@@ -1079,9 +1086,9 @@ type parentWire struct {
 
 // yieldAd is the emit callback for the classic Query/Scan path: decode w to a
 // *classad.ClassAd (skipping malformed records) and yield it.
-func (c *Collection) yieldAd(yield func(*classad.ClassAd) bool) func(w []byte) bool {
-	return func(w []byte) bool {
-		a, err := c.decodeWire(w)
+func (c *Collection) yieldAd(yield func(*classad.ClassAd) bool) scanEmit {
+	return func(w []byte, dict *segDictHandle) bool {
+		a, err := c.decodeWireDict(dict, w)
 		if err != nil {
 			return true // skip malformed record, keep scanning
 		}

@@ -60,7 +60,8 @@ func (c *Collection) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classa
 		scratch := make([]classad.Value, len(attrs))
 		rs := &wireScope{ctx: c} // projection resolver, distinct from the match ws
 		stopped := false
-		emit := func(w []byte) bool {
+		emit := func(w []byte, dict *segDictHandle) bool {
+			rs.dict = dict
 			c.projectInto(rs, w, attrs, scratch)
 			if !yield(scratch) {
 				stopped = true

@@ -178,8 +178,9 @@ func (c *Collection) newRawProjector(projection []string, chaseRefs, redact bool
 	return p
 }
 
-func (c *Collection) yieldRawProjected(yield func(RawAd) bool, p *rawProjector) func(w []byte) bool {
-	return func(w []byte) bool {
+func (c *Collection) yieldRawProjected(yield func(RawAd) bool, p *rawProjector) scanEmit {
+	return func(w []byte, dict *segDictHandle) bool {
+		w = c.wireToInline(dict, w) // interned segment -> inline for the mode-aware projector
 		ra, ok := p.render(w)
 		if !ok {
 			return true // inline-name or undecodable record: skip, keep scanning

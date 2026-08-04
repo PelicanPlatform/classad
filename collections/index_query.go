@@ -1092,12 +1092,15 @@ func cmpFloat(op string, k, t float64) bool {
 // cover (a segment with no index, or the tail beyond its build watermark). Every
 // visited record is MVCC-visibility filtered and full-query re-verified, so the
 // result is identical to a full scan. Returns false if the consumer stopped.
-func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryPlan, emit func(w []byte) bool) bool {
-	return c.scanShardCandidates(sh, usable, c.reverseScan, func(w []byte) bool {
+func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryPlan, emit scanEmit) bool {
+	return c.scanShardCandidates(sh, usable, c.reverseScan, func(w []byte, dict *segDictHandle) bool {
+		if qp.ws != nil {
+			qp.ws.dict = dict
+		}
 		if !matchWire(w, qp) {
 			return true // not a match: keep scanning
 		}
-		return emit(w)
+		return emit(w, dict)
 	})
 }
 
@@ -1113,7 +1116,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 // newest-first: segments from the last backward, and within a segment the un-indexed tail
 // (written last) before the indexed prefix, each in descending offset order. A consumer
 // that stops early then gets the newest matches -- a pushed-down LIMIT through the index.
-func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, reverse bool, onCand func(w []byte) bool) bool {
+func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, reverse bool, onCand scanEmit) bool {
 	if unsatisfiable(usable) {
 		// The conjunction is impossible on its face; nothing in this shard -- indexed
 		// prefix, un-indexed tail, or exception set -- can match. Skip the snapshot too,
@@ -1140,7 +1143,7 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, revers
 			return false
 		}
 		dbuf = ww
-		return !onCand(ww)
+		return !onCand(ww, w.dict())
 	}
 	// scanRange full-scans records in [from, to).
 	scanRange := func(w segWindow, from, to int) bool {
@@ -1258,12 +1261,15 @@ func scanShardCandidatesReverse(wins []segWindow, usable []usableProbe, visit fu
 
 // scanShardIndexedGroups is scanShardIndexed for a DNF plan: it visits the union of
 // the groups' candidates and re-verifies each against the full query.
-func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, qp queryPlan, emit func(w []byte) bool) bool {
-	return c.scanShardCandidatesGroups(sh, groups, c.reverseScan, func(w []byte) bool {
+func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, qp queryPlan, emit scanEmit) bool {
+	return c.scanShardCandidatesGroups(sh, groups, c.reverseScan, func(w []byte, dict *segDictHandle) bool {
+		if qp.ws != nil {
+			qp.ws.dict = dict
+		}
 		if !matchWire(w, qp) {
 			return true
 		}
-		return emit(w)
+		return emit(w, dict)
 	})
 }
 
@@ -1274,7 +1280,7 @@ func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, q
 // only when EVERY disjunct is empty, and visiting a few extra candidates is cheaper
 // than proving that per group -- but a window whose index does not cover all groups,
 // and every covered window's un-indexed tail, are still full-scanned.
-func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, reverse bool, onCand func(w []byte) bool) bool {
+func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, reverse bool, onCand scanEmit) bool {
 	if unsatisfiableGroups(groups) {
 		return true // every disjunct is impossible: the union is empty (see scanShardCandidates)
 	}
@@ -1309,7 +1315,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 			return false
 		}
 		dbuf = ww
-		return !onCand(ww)
+		return !onCand(ww, w.dict())
 	}
 	scanRange := func(w segWindow, from, to int) bool {
 		for off := from; off < to; {
