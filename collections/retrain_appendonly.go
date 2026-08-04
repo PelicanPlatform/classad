@@ -64,6 +64,66 @@ func (c *Collection) resealAppendOnly(targetCodec Codec) {
 	c.pruneDicts()
 }
 
+// InternSealed transcodes every sealed, still-inline segment of a persistent append-only
+// collection to interned form under the current codec, swapping each in and rebuilding its
+// indexes. It is the eager complement to interning-at-compaction (resealAppendOnly): an archive
+// that never retrains still gets the density/decode win as soon as segments seal. Idempotent --
+// already-interned segments and the active write target are skipped, so re-calling is cheap and
+// it composes with a later RetrainDict. Append-only only: a mutable segment's records can be
+// superseded in place after seal, which this off-lock transcode would race (there interning rides
+// compaction, which reconciles supersedes in a final critical section). Holds maintMu, so it
+// serializes against Compact/RetrainDict/Rotate/Rewrite. Called opt-in from the Archive.Append
+// eager-seal hook (Options.InternAtSeal) and available as a manual maintenance pass.
+func (c *Collection) InternSealed() {
+	if !c.inline || !c.appendOnly() {
+		return // interning-at-seal is an append-only, persistent-collection operation
+	}
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
+	codec := c.currentCodec()
+	swapped := false
+	for _, sh := range c.shards {
+		sh.mu.Lock()
+		act := sh.act
+		var srcs []*segment
+		for _, s := range sh.segs {
+			if s != nil && s != act && s.used > 0 && s.dict.Load() == nil {
+				srcs = append(srcs, s) // sealed + still inline: a transcode candidate
+			}
+		}
+		sh.mu.Unlock()
+
+		var toReap []*segment
+		for _, src := range srcs {
+			newseg := c.resealOneSegment(sh, src, codec) // interns (c.inline); reads src off-lock
+			if newseg == nil {
+				continue // transcode failed: leave the inline original in place (best-effort)
+			}
+			sh.mu.Lock()
+			// Swap only if the source still occupies its slot and is not the (new) active
+			// target -- defensive against a concurrent reseal/rotate.
+			if int(src.id) < len(sh.segs) && sh.segs[src.id] == src && sh.act != src {
+				sh.segs[src.id] = newseg
+				swapped = true
+				if src.retire() {
+					toReap = append(toReap, src)
+				}
+			} else {
+				newseg.retire()
+				newseg.reapAndHook() // slot moved under us: drop the fresh file, don't leak it
+			}
+			sh.mu.Unlock()
+		}
+		for _, seg := range toReap {
+			seg.reapAndHook() // munmap + unlink the old inline file, off-lock
+		}
+	}
+	if swapped {
+		c.reindexAfterCompaction() // rebuild sidecars over the interned segments (takes reindexMu)
+		c.pruneDicts()
+	}
+}
+
 // resealEntry is one record staged for reseal: a data record (its re-encoded, recompressed
 // stored bytes and key) or a time-checkpoint marker (marker=true, millis set).
 type resealEntry struct {

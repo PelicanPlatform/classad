@@ -46,6 +46,16 @@ type Options struct {
 	// history archive's aging-out). The zero value keeps everything (Rotate is
 	// then inert). Only meaningful with AppendOnly. See Rotate.
 	Retention Retention
+	// InternAtSeal makes an AppendOnly collection intern each segment as soon as it
+	// seals (when the active segment fills), rather than only when RetrainDict/Rewrite
+	// later reseal it. Interning stores segment-local ids + a per-segment name dictionary
+	// instead of inline names, halving raw mmap bytes and speeding decode (see the
+	// interning design). This trades a per-seal transcode (off the write lock) for the
+	// density/decode win landing immediately on an archive that never retrains. Only
+	// meaningful with AppendOnly (a mutable segment's records can be superseded in place,
+	// which an off-lock transcode would race -- there interning rides compaction instead).
+	// Optional; default off preserves exactly today's behavior. See InternSealed.
+	InternAtSeal bool
 	// ZoneAttrs names numeric attributes to keep a per-segment [min,max] zone map on,
 	// so a range/equality query on one (e.g. CompletionDate > T) skips whole sealed
 	// segments whose span cannot match, and age-based Retention (MaxAgeAttr) can drop
@@ -246,6 +256,10 @@ type Collection struct {
 	queryPar         int
 	qsem             chan struct{}
 	parallelMinBytes int
+
+	// internAtSeal interns each append-only segment as soon as it seals (see
+	// Options.InternAtSeal), via InternSealed from the Archive.Append eager-seal hook.
+	internAtSeal bool
 
 	// reverseScan yields records newest-first (see Options.ReverseScan). Forces
 	// serial scans (no fan-out), since fan-out has no cross-segment order.
@@ -556,6 +570,9 @@ func New(opts Options) *Collection {
 	}
 	c.parallelMinBytes = defaultParallelMinBytes
 	c.reverseScan = opts.ReverseScan
+	// Persistent (Dir set) append-only only: c.inline (set later in persist setup) is exactly
+	// Dir != "", and InternSealed is a no-op otherwise, so gate on the option's preconditions here.
+	c.internAtSeal = opts.InternAtSeal && opts.AppendOnly && opts.Dir != ""
 	c.ret = opts.Retention
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
 	if c.queryPar >= 2 {
