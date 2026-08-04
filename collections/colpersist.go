@@ -7,12 +7,17 @@ package collections
 // layoutColumnar -- the same helpers the encoder uses -- so a decoded block is identical to a
 // freshly built one. Only the payloads and offsets are stored.
 
-// marshalAdSchema writes a schema's fields as (id, kind, width, unsigned); the layout is
-// re-derived on read, not stored.
-func marshalAdSchema(dst []byte, s *adSchema) []byte {
+// marshalAdSchema writes a schema's fields as (name, kind, width, unsigned); the layout is
+// re-derived on read, not stored. Fields are keyed by NAME, not by their runtime intern id: a
+// persistent collection's global intern ids are assigned in first-seen order and differ across
+// reopen, so a stored id would resolve to the wrong attribute on the next Open. nameOf resolves a
+// field's current id to its name (c.intern.Name); readAdSchema re-resolves the name to whatever id
+// the reopened table assigns.
+func marshalAdSchema(dst []byte, s *adSchema, nameOf func(uint32) (string, bool)) []byte {
 	dst = appendU32(dst, uint32(len(s.fields)))
 	for _, f := range s.fields {
-		dst = appendU32(dst, f.id)
+		name, _ := nameOf(f.id) // "" only if the id is unknown, which cannot happen for a schema field
+		dst = appendBytes(dst, []byte(name))
 		dst = appendU16(dst, uint16(f.kind))
 		dst = appendU16(dst, uint16(f.width))
 		u := uint16(0)
@@ -24,31 +29,40 @@ func marshalAdSchema(dst []byte, s *adSchema) []byte {
 	return dst
 }
 
-func readAdSchema(c *cursor) *adSchema {
+// readAdSchema reads a name-keyed schema and re-binds each field to the current intern id via
+// internName (c.intern.Intern). Names are collected before any interning so a torn/corrupt read
+// (c.err) is rejected without polluting the intern table with junk names.
+func readAdSchema(c *cursor, internName func(string) uint32) *adSchema {
 	n := int(c.u32())
 	if n < 0 || n > 1<<20 || !c.need(0) {
 		return nil
 	}
-	fields := make([]adField, 0, n)
+	type raw struct {
+		name     string
+		kind     adKind
+		width    int
+		unsigned bool
+	}
+	raws := make([]raw, 0, n)
 	for i := 0; i < n; i++ {
-		fields = append(fields, adField{
-			id:       c.u32(),
-			kind:     adKind(c.u16()),
-			width:    int(c.u16()),
-			unsigned: c.u16() != 0,
-		})
+		name := string(c.bytes())
+		raws = append(raws, raw{name, adKind(c.u16()), int(c.u16()), c.u16() != 0})
 	}
 	if c.err != nil {
 		return nil
+	}
+	fields := make([]adField, n)
+	for i, r := range raws {
+		fields[i] = adField{id: internName(r.name), kind: r.kind, width: r.width, unsigned: r.unsigned}
 	}
 	return layoutSchema(fields)
 }
 
 // marshalColSegment serializes cs (its block's schema, hot set, record count, byte streams, and
 // per-record offsets, plus offs -- the block->arena map for MVCC visibility).
-func marshalColSegment(cs *colSegment) []byte {
+func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byte {
 	b := cs.block
-	dst := marshalAdSchema(nil, b.schema)
+	dst := marshalAdSchema(nil, b.schema, nameOf)
 	dst = appendU32(dst, uint32(len(b.hotNum)))
 	for _, i := range b.hotNum {
 		dst = appendU32(dst, uint32(i))
@@ -75,9 +89,9 @@ func marshalColSegment(cs *colSegment) []byte {
 
 // unmarshalColSegment reconstructs a colSegment from marshalColSegment's output, attaching the
 // segment's codec (for later decompression). Returns nil on malformed data.
-func unmarshalColSegment(data []byte, codec Codec) *colSegment {
+func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint32) *colSegment {
 	c := &cursor{b: data}
-	s := readAdSchema(c)
+	s := readAdSchema(c, internName)
 	if s == nil {
 		return nil
 	}
