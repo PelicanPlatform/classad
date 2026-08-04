@@ -60,7 +60,7 @@ func TestBuildColumnarFromSegment(t *testing.T) {
 		t.Skip("Memory not an int schema field")
 	}
 
-	blk, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, []int{memIdx})
+	blk, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, []int{memIdx}, store.recordToInterned)
 	if blk.n != n || len(offs) != n {
 		t.Fatalf("block n=%d offs=%d, want %d", blk.n, len(offs), n)
 	}

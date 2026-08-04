@@ -63,6 +63,25 @@ func (c *Collection) decodeNode(node []byte) (ast.Expr, error) {
 	return wire.DecodeNode(node, c.intern)
 }
 
+// recordToInterned re-encodes a decompressed stored record `w` into interned wire that the
+// id-keyed columnar accelerator (buildAdSchema / adSchema.encode / bruteNumCount) can read.
+// An interned (in-memory) collection's records are already interned and returned as-is. An
+// inline (persistent) collection's records store names, not ids -- and may carry encrypted
+// attribute values -- so the record is decoded (opening encryption) and re-encoded against the
+// shared intern table. Returns (nil,false) on a record that fails to decode. Used only at
+// accelerator build time (schema sampling and per-segment block transcode), not on the scan
+// hot path.
+func (c *Collection) recordToInterned(dst, w []byte) ([]byte, bool) {
+	if !c.inline {
+		return w, true
+	}
+	ad, err := c.decodeWire(w)
+	if err != nil {
+		return nil, false
+	}
+	return wire.Encode(dst[:0], ad, c.intern), true
+}
+
 // newStreamEncoder returns a StreamEncoder matching the collection's mode, for the
 // direct old-ClassAd ingest path (UpdateOld).
 func (c *Collection) newStreamEncoder() *wire.StreamEncoder {

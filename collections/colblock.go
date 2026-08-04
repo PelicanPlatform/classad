@@ -121,7 +121,10 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec C
 // returns the block and offs, where offs[k] is the segment offset of block record k -- the map
 // a scan uses to recover each record's MVCC seq/sup (for visibility) and its key. Reads
 // immutable segment bytes only.
-func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, hot []int) (*columnarBlock, []uint32) {
+// toInterned canonicalizes a decompressed record into interned wire (identity for an already-
+// interned collection; a decode/re-encode for an inline/persistent one). encode reads the
+// id-keyed form, so a non-interned record must be converted first or the block would be empty.
+func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, hot []int, toInterned func(dst, w []byte) ([]byte, bool)) (*columnarBlock, []uint32) {
 	var recs [][]byte
 	var offs []uint32
 	var buf []byte
@@ -134,8 +137,10 @@ func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, h
 		if !recIsMarker(data, o) {
 			if w, err := codec.Decompress(buf[:0], recAd(data, o)); err == nil {
 				buf = w
-				recs = append(recs, s.encode(wire.Ad(w)))
-				offs = append(offs, o)
+				if iw, ok := toInterned(nil, w); ok {
+					recs = append(recs, s.encode(wire.Ad(iw)))
+					offs = append(offs, o)
+				}
 			}
 		}
 		off += int(total)

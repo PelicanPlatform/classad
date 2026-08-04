@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // allSegmentWires gathers every shard/segment's live-arena wire ads (for building the schema).
@@ -32,7 +33,7 @@ func (c *Collection) allBruteCount(fieldID uint32, match func(int64) bool) int {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
-			count += bruteNumCount(w, s0, fieldID, func(f float64) bool { return match(int64(f)) })
+			count += bruteNumCount(w, s0, func(a wire.Ad) ([]byte, bool) { return a.Lookup(fieldID) }, func(f float64) bool { return match(int64(f)) })
 		}
 		releaseWindows(wins)
 	}
