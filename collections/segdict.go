@@ -88,6 +88,28 @@ func appendSegDict(dst []byte, names []string) []byte {
 	return dst
 }
 
+// segDictHandle binds a serialized dict to the bytes it lives in (a segment's mmap arena) at
+// offset base, so reads probe it zero-copy. It is immutable once published; a segment holds
+// one via an atomic pointer (nil => the segment is inline-encoded). All methods are safe for
+// concurrent readers.
+type segDictHandle struct {
+	data []byte // the segment arena (or any buffer) the dict is embedded in
+	base uint32 // offset of the dict's first byte within data
+}
+
+func (h *segDictHandle) lookup(name string) (uint32, bool) { return segDictLookup(h.data, h.base, name) }
+func (h *segDictHandle) name(id uint32) []byte             { return segDictName(h.data, h.base, id) }
+func (h *segDictHandle) count() uint32                     { return segDictCount(h.data, h.base) }
+
+// resolve is the id->name function form for wire.DecodeResolve, so an interned record decodes
+// straight over the mmap with no in-memory table.
+func (h *segDictHandle) resolve(id uint32) (string, bool) {
+	if b := h.name(id); b != nil {
+		return string(b), true
+	}
+	return "", false
+}
+
 // segDictCount returns the number of names in the dict at base.
 func segDictCount(data []byte, base uint32) uint32 { return le32(data, base) }
 
