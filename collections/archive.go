@@ -88,6 +88,11 @@ type ArchiveOptions struct {
 	ZoneAttrs []string
 	// Retention bounds what rotation keeps. Zero ⇒ keep everything.
 	Retention Retention
+	// InternAtSeal interns each segment as soon as it seals (see Options.InternAtSeal), so an
+	// archive gets the interning density/decode win immediately instead of only after a later
+	// RetrainDict/Rewrite. Optional; default off. Trades a per-seal transcode (off the write
+	// lock) for the win landing eagerly.
+	InternAtSeal bool
 }
 
 const defaultArchiveSegmentSize = 8 << 20 // 8 MiB
@@ -119,7 +124,8 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		ValueAttrs:       opts.ValueAttrs, // numeric ValueAttrs are auto-added to the zone maps
 		ZoneAttrs:        opts.ZoneAttrs,
 		Retention:        opts.Retention,
-		WatchHistory:     archiveWatchCap, // enable the append-stream watch
+		InternAtSeal:     opts.InternAtSeal, // intern each segment eagerly at seal
+		WatchHistory:     archiveWatchCap,   // enable the append-stream watch
 	}
 }
 
@@ -174,15 +180,22 @@ func (a *Archive) Append(ad *classad.ClassAd) error {
 	if err := a.c.Put(nil, ad); err != nil {
 		return err
 	}
-	// If this append sealed a segment, build its sidecar index now (off the write lock),
-	// so categorical/value queries on just-appended history are accelerated immediately
-	// instead of scanning until the next periodic reindex. Reindex builds only the missing
-	// sidecar (all older segments are already sealed) and is serialized against the periodic
-	// reindex. Skipped when no per-segment indexes are configured (nothing to build).
-	if a.c.hasSegmentIndexes() {
+	// If this append sealed a segment, do the eager per-seal work now (off the write lock):
+	// intern the just-sealed segment (Options.InternAtSeal) so its density/decode win lands
+	// immediately, then build its sidecar index so categorical/value queries on just-appended
+	// history are accelerated instead of scanning until the next periodic reindex. Interning
+	// runs first so the sidecar is built over the interned segment. Both are idempotent, build
+	// only what is missing (all older segments are already sealed/interned), and are serialized
+	// against the periodic passes. Skipped when neither is configured (nothing to do).
+	if a.c.internAtSeal || a.c.hasSegmentIndexes() {
 		if seal := a.c.appendSealSeq(); seal != a.lastSeal {
 			a.lastSeal = seal
-			a.c.Reindex()
+			if a.c.internAtSeal {
+				a.c.InternSealed()
+			}
+			if a.c.hasSegmentIndexes() {
+				a.c.Reindex()
+			}
 		}
 	}
 	return nil
