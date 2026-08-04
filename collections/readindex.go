@@ -260,7 +260,7 @@ func (s *segStats) estBand(up usableProbe) float64 {
 // indexSelectivityOrder returns indices into usable ordered by ascending estimated candidate
 // count (most selective first). Pure ordering heuristic: the AND is commutative, so it never
 // changes the result, only the work. Deterministic (stable, ties keep input order).
-func indexSelectivityOrder(ix indexPrimitives, usable []usableProbe) []int {
+func indexSelectivityOrder(ix indexPrimitives, usable []usableProbe) ([]int, []float64) {
 	order := make([]int, len(usable))
 	est := make([]float64, len(usable))
 	for i, up := range usable {
@@ -268,7 +268,7 @@ func indexSelectivityOrder(ix indexPrimitives, usable []usableProbe) []int {
 		est[i] = indexEstCandidates(ix, up)
 	}
 	sort.SliceStable(order, func(a, b int) bool { return est[order[a]] < est[order[b]] })
-	return order
+	return order, est
 }
 
 // indexCandidateOffsets returns the offsets satisfying every usable probe (a superset the
@@ -288,9 +288,12 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 	case 1:
 		return ix.probeOffsets(usable[0])
 	}
-	order := indexSelectivityOrder(ix, usable)
+	order, est := indexSelectivityOrder(ix, usable)
 	var acc *roaring.Bitmap
 	for _, i := range order {
+		if acc != nil && !worthProbing(est[i], acc.GetCardinality()) {
+			continue
+		}
 		bm := ix.probeOffsets(usable[i])
 		if acc == nil {
 			acc = bm
@@ -302,6 +305,33 @@ func indexCandidateOffsets(ix indexPrimitives, usable []usableProbe) *roaring.Bi
 		}
 	}
 	return acc
+}
+
+// offsetsPerVerify is how many record offsets can be merged into a candidate bitmap in the
+// time it takes to re-verify one candidate record. A roaring merge runs at a few nanoseconds
+// per offset; a verify costs a decompress plus a wire-native match, on the order of a
+// microsecond. 200 is that ratio, rounded to the conservative side -- it over-claims what a
+// probe is worth, so a probe is dropped only when it is clearly not worth building.
+const offsetsPerVerify = 200
+
+// worthProbing reports whether intersecting a probe that would merge about `est` record
+// offsets can pay for itself against an accumulator already down to `card` candidates.
+//
+// This is a bound, not a guess. The candidate set is a superset the store re-verifies record
+// by record, so dropping a probe is always correct -- it only widens the superset. The MOST
+// a probe can save is the entire remaining verify cost, `card` verifies, and only if it
+// eliminates every candidate. So once building its bitmap costs more than that, applying it
+// cannot pay off even in the best case. `Owner == "alice" && CompletionDate > <t>` is the
+// shape that matters: the equality leaves a few hundred candidates, and the range would
+// merge most of the segment to remove a handful of them.
+//
+// est is the planner's estimated candidate count for the probe -- already computed to order
+// the probes -- which tracks merge cost better than a posting-list count would: a
+// low-cardinality attribute reaches 200k offsets in 60 postings, a unique one in 200k.
+//
+// The first (most selective) probe always runs; there is no accumulator to price against.
+func worthProbing(est float64, card uint64) bool {
+	return est < float64(card)*offsetsPerVerify
 }
 
 // indexCandidateOffsetsGroups returns the DNF union over groups of each group's candidate

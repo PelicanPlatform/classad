@@ -879,7 +879,8 @@ func (si *segIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
 // AND is commutative, so this never changes the result, only the work. Ties and
 // missing stats fall back to input order for a deterministic plan.
 func (si *segIndex) selectivityOrder(usable []usableProbe) []int {
-	return indexSelectivityOrder(si, usable)
+	order, _ := indexSelectivityOrder(si, usable)
+	return order
 }
 
 // statsFor returns the segStats for a probe's attribute, or nil if that segment
@@ -990,7 +991,6 @@ func (s *segStats) estRange(op string, t float64) float64 {
 func (si *segIndex) skipsPrefix(usable []usableProbe) bool { return indexSkipsPrefix(si, usable) }
 func (si *segIndex) coveredUpto() uint32                   { return si.upto }
 
-// probeOffsets returns a fresh, mutable offset bitmap for one probe.
 func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 	if up.cat {
 		cp := si.cat[up.attrID]
