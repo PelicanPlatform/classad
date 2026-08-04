@@ -197,6 +197,23 @@ Each phase: branch → PR → tag; db/dbrpc bump as usual.
 
 ## 8. Risks & mitigations
 
+> **Implementation notes (phase 1, as built).**
+> - **Dict corruption is a per-segment single point of failure.** An interned segment's records
+>   are id-keyed, so a lost/corrupt dict record makes the whole segment unreadable (an inline
+>   segment loses only its trailing torn records). The dict rides as a CRC-protected record, so
+>   bit-rot/torn writes are *detected*; but there is no auto-rebuild yet (you cannot re-derive a
+>   dict from records that need it to decode). This is the honest cost of interning; inline
+>   segments remain the fallback during the transition. Future hardening: double-write the dict
+>   (start + end) or protect it more strongly. Corruption of a data record behaves as today.
+> - **The dict reserve tail is sparse, not wasted disk.** A destination segment reserves
+>   `min(256KB, segSize/4)` for its dict, so records fill to `segSize − reserve` and leave a
+>   zero tail. The segment file is created at `segSize` via `Truncate` and never written in that
+>   tail, so on a sparse-file filesystem it consumes no real blocks — the reserve costs address
+>   space, not disk. (So tightening the reserve to the actual dict size buys ~nothing; skipped.)
+> - **Hot header on the interned encode.** Compaction encodes interned records *with* a hot
+>   header (`EncodeWithHot`, segment-local hot ids), so match lookups stay O(1) as they were on
+>   the inline records — no read regression.
+
 - **Per-segment dict adds a small on-disk cost (~1% at realistic segment size, up to ~6% at
   tiny K).** Mitigation: dicts only exist on sealed segments (K large); don't seal-interned
   tiny segments if it ever matters.
