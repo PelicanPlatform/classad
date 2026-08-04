@@ -423,7 +423,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// inline or already-interned (re-compaction) -- each record is decoded via its own segment
 	// mode. abort stops the round on a decode failure or dict-reserve overflow so a shard is
 	// never left with an unreadable segment.
-	intern := c.inline && c.sealer == nil && !sh.appendOnly
+	intern := c.inline && !sh.appendOnly
 	// reserve is the arena held back for the dict, capped to a quarter of the segment so a
 	// segment always fits many records plus its dict (compactDictReserve alone could exceed a
 	// small SegmentSize and force one record per segment). A dict larger than the reserve
@@ -490,7 +490,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			*curp = newDst(streamSegs, 0, target)
 			*st = newStream()
 		}
-		wireBuf = wire.EncodeWithHot(wireBuf[:0], ad, st.table, st.hot)
+		wireBuf = c.encodeInterned(wireBuf[:0], ad, st.table, st.hot)
 		refreshHot(st) // pick up any hot names this ad interned, for later records
 		body := target.Compress(encBuf[:0], wireBuf)
 		encBuf = body
@@ -499,7 +499,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			finalizeInterned(*curp, st)
 			*curp = newDst(streamSegs, rl+reserve, target)
 			*st = newStream()
-			wireBuf = wire.EncodeWithHot(wireBuf[:0], ad, st.table, st.hot)
+			wireBuf = c.encodeInterned(wireBuf[:0], ad, st.table, st.hot)
 			refreshHot(st)
 			body = target.Compress(encBuf[:0], wireBuf)
 			encBuf = body

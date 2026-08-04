@@ -141,6 +141,80 @@ func human(n int) string {
 	return fmt.Sprintf("%dB", n)
 }
 
+// TestInterningSizeTradeoffEncrypted answers whether per-segment interning still pays off for an
+// ENCRYPTION-AT-REST collection, where the designated attributes' values are sealed (AEAD nonce +
+// ciphertext, incompressible) instead of stored in the clear. It seals the realistic HTCondor
+// secrets (claim ids / glidein token / capability) -- a small fraction of value bytes -- and
+// compares inline+enc vs per-segment interned+enc, both zstd'd per segment. The plaintext
+// majority still interns, so the win should track (a bit below) the plaintext-only result.
+func TestInterningSizeTradeoffEncrypted(t *testing.T) {
+	ads, _ := loadOSPoolAds(t)
+	if len(ads) == 0 {
+		t.Skip("no ads")
+	}
+	asts := make([]*ast.ClassAd, len(ads))
+	for i, a := range ads {
+		asts[i] = a.AST()
+	}
+	N := len(asts)
+
+	secret := map[string]struct{}{
+		"PublicClaimId": {}, "ClaimId": {}, "ClaimIds": {}, "Capability": {},
+		"GLIDEIN_CONDOR_TOKEN": {}, "ChildClaimIds": {},
+	}
+	encrypt := func(name string) bool { _, ok := secret[name]; return ok }
+	_, dataKey := deriveDataKey(t)
+	seal := newDataKeySealer(dataKey)
+
+	// Measure how much of the value payload is sealed (context for the win).
+	sealedAds := 0
+	for _, a := range asts {
+		for _, at := range a.Attributes {
+			if encrypt(at.Name) {
+				sealedAds++
+				break
+			}
+		}
+	}
+
+	for _, K := range []int{512, N} {
+		inlRaw, psRaw := 0, 0
+		inlZ, psZ := 0, 0
+		psDictRaw, sealedNodes := 0, 0
+		for lo := 0; lo < N; lo += K {
+			hi := lo + K
+			if hi > N {
+				hi = N
+			}
+			var inlSeg, psRecs []byte
+			pt := wire.NewInternTable()
+			for _, a := range asts[lo:hi] {
+				inlSeg = wire.EncodeInlineWithHotEnc(inlSeg, a, nil, encrypt, seal)
+				psRecs = appendRec(psRecs, wire.EncodeWithHotEnc(nil, a, pt, nil, encrypt, seal))
+				for _, at := range a.Attributes {
+					if encrypt(at.Name) {
+						sealedNodes++
+					}
+				}
+			}
+			pnames := pt.Names()
+			psDictRaw += dictBytes(pnames)
+			psSeg := append(marshalDict(pnames), psRecs...)
+			inlRaw += len(inlSeg)
+			psRaw += len(psSeg)
+			inlZ += len(zstdAll(inlSeg))
+			psZ += len(zstdAll(psSeg))
+		}
+		fmt.Printf("\n===== ENCRYPTED segment size K=%d (%d segments) =====\n", K, (N+K-1)/K)
+		fmt.Printf("  ads with >=1 sealed attr=%d/%d, sealed nodes=%d, per-seg dict total=%s(raw)\n",
+			sealedAds, N, sealedNodes, human(psDictRaw))
+		fmt.Printf("  %-24s raw=%-10s zstd=%-10s\n", "INLINE+enc (names/rec)", human(inlRaw), human(inlZ))
+		fmt.Printf("  %-24s raw=%-10s zstd=%-10s\n", "PER-SEG interned+enc", human(psRaw), human(psZ))
+		fmt.Printf("  --> interning win vs inline+enc:  raw %.1f%% (mmap density / decode)   zstd %.1f%% (on-disk)\n",
+			100*(1-float64(psRaw)/float64(inlRaw)), 100*(1-float64(psZ)/float64(inlZ)))
+	}
+}
+
 // BenchmarkDecodeInlineVsInterned compares full-ad decode cost of an inline record vs an
 // interned one (global table), the read-side speed axis of the tradeoff.
 func BenchmarkDecodeEncodings(b *testing.B) {

@@ -96,6 +96,41 @@ func EncodeInline(dst []byte, ad *ast.ClassAd) []byte {
 // (case-folded) name is in hot are indexed by a (nameHash32, entries-relative
 // offset-to-entry) pair, so Ad.LookupByName finds them without scanning. hot keys
 // must be lower-cased. hot may be nil.
+// EncodeWithHotEnc is EncodeWithHot for at-rest encryption: any attribute for which
+// encrypt(name) is true is sealed with seal and stored as an nEncrypted node (its value's
+// interned node encoding, sealed), exactly as EncodeInlineWithHotEnc does for inline ads.
+// Encrypted attributes are never hot (never indexed), so they never enter the hot header.
+// encrypt and seal must both be non-nil to encrypt anything; with seal nil this is EncodeWithHot.
+func EncodeWithHotEnc(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint32]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+	if ad == nil {
+		return Encode(dst, ad, t)
+	}
+	e := encoder{t: t, seal: seal}
+	var hots []hotPair
+	for _, attr := range ad.Attributes {
+		id := t.Intern(attr.Name)
+		e.buf = binary.AppendUvarint(e.buf, uint64(id))
+		nodeOff := len(e.buf)
+		if seal != nil && encrypt != nil && encrypt(attr.Name) {
+			e.encNode(attr.Value) // sealed; never hot
+			continue
+		}
+		e.node(attr.Value)
+		if _, ok := hot[id]; ok {
+			hots = append(hots, hotPair{id, uint32(nodeOff)})
+		}
+	}
+	out := append(dst, magicByte, formatVer, 0 /* flags */)
+	out = binary.AppendUvarint(out, uint64(len(hots)))
+	for _, h := range hots {
+		out = binary.AppendUvarint(out, uint64(h.id))
+		out = binary.AppendUvarint(out, uint64(h.off))
+	}
+	out = binary.AppendUvarint(out, uint64(len(ad.Attributes))) // attrCount
+	out = append(out, e.buf...)                                 // entries region
+	return out
+}
+
 func EncodeInlineWithHot(dst []byte, ad *ast.ClassAd, hot map[string]struct{}) []byte {
 	return EncodeInlineWithHotEnc(dst, ad, hot, nil, nil)
 }

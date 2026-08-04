@@ -99,15 +99,28 @@ func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([
 // not the collection's global table. These wrappers take the segment's dict handle and, when
 // it is non-nil, resolve through it (zero-copy over the mmap); a nil handle means the segment
 // is inline/global -- the legacy path, byte-for-byte unchanged. Scan/read call sites thread
-// the segment's dict (segment.dict.Load()) from the visibility window. An interned segment is
-// never encrypted (encrypted collections keep sealing inline), so the resolver path needs no
-// sealer.
+// the segment's dict (segment.dict.Load()) from the visibility window. An interned segment of
+// an encryption-at-rest collection carries SEALED value nodes, so the resolver paths pass the
+// collection's sealer to open them (nil for a plaintext collection -- opens nothing).
 
 func (c *Collection) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error) {
 	if dict != nil {
-		return wire.DecodeResolve(w, dict.resolve)
+		// c.sealer is nil for a plaintext collection (opens nothing) and set for an
+		// encrypted one (opens the sealed value nodes an interned+encrypted segment carries).
+		return wire.DecodeResolveEnc(w, dict.resolve, c.sealer)
 	}
 	return c.decodeWire(w)
+}
+
+// encodeInterned encodes ad in the form the compaction/reseal transcode writes an interned
+// segment: segment-local ids against `table` with a hot header, sealing designated attribute
+// values when the collection encrypts at rest. Mirrors encodeAd's persistent branch, but
+// interned rather than inline.
+func (c *Collection) encodeInterned(dst []byte, ad *ast.ClassAd, table *wire.InternTable, hot map[uint32]struct{}) []byte {
+	if c.sealer != nil {
+		return wire.EncodeWithHotEnc(dst, ad, table, hot, c.shouldEncrypt, c.sealer)
+	}
+	return wire.EncodeWithHot(dst, ad, table, hot)
 }
 
 func (c *Collection) wireLookupDict(dict *segDictHandle, a wire.Ad, name string) ([]byte, bool) {
@@ -123,7 +136,7 @@ func (c *Collection) wireLookupDict(dict *segDictHandle, a wire.Ad, name string)
 
 func (c *Collection) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr, error) {
 	if dict != nil {
-		return wire.DecodeNodeResolve(node, dict.resolve)
+		return wire.DecodeNodeResolveEnc(node, dict.resolve, c.sealer)
 	}
 	return c.decodeNode(node)
 }
@@ -138,7 +151,7 @@ func (c *Collection) decodeAdDict(dict *segDictHandle, stored []byte, codec Code
 	if err != nil {
 		return nil, err
 	}
-	a, err := wire.DecodeResolve(dec, dict.resolve)
+	a, err := wire.DecodeResolveEnc(dec, dict.resolve, c.sealer)
 	if err != nil {
 		return nil, err
 	}
@@ -153,9 +166,14 @@ func (c *Collection) wireToInline(dict *segDictHandle, w []byte) []byte {
 	if dict == nil {
 		return w
 	}
-	a, err := wire.DecodeResolve(w, dict.resolve)
+	a, err := c.decodeWireDict(dict, w) // sealer-aware: opens sealed values for an encrypted segment
 	if err != nil {
 		return w
+	}
+	if c.sealer != nil {
+		// Re-seal on the way to inline so the sample never carries plaintext values (which would
+		// leak into a retrained dict or a columnar block); matches the active segment's form.
+		return wire.EncodeInlineWithHotEnc(nil, a, nil, c.shouldEncrypt, c.sealer)
 	}
 	return wire.EncodeInline(nil, a)
 }
@@ -178,9 +196,13 @@ func (c *Collection) toSelfContained(dict *segDictHandle, ad []byte, codec Codec
 	if err != nil {
 		return ad
 	}
-	a, err := wire.DecodeResolve(dec, dict.resolve)
+	a, err := c.decodeWireDict(dict, dec) // sealer-aware: opens sealed values for an encrypted segment
 	if err != nil {
 		return ad
+	}
+	if c.sealer != nil {
+		// Re-seal so a deferred event's copied bytes stay sealed at rest, matching the source.
+		return codec.Compress(nil, wire.EncodeInlineWithHotEnc(nil, a, nil, c.shouldEncrypt, c.sealer))
 	}
 	return codec.Compress(nil, wire.EncodeInline(nil, a))
 }

@@ -82,13 +82,14 @@ func (c *Collection) resealOneSegment(sh *shard, src *segment, targetCodec Codec
 	if src == nil || src.used == 0 {
 		return nil
 	}
-	// A persistent, plaintext collection reseals INTERNED: records carry segment-local ids
-	// against a per-segment table + a hot header, and the segment gets a dictionary appended at
-	// the end (see segdict.go / the interning design). In-memory (already global-interned) and
-	// encrypted (only inline has a sealing encoder) reseal via c.encodeAd as before. The two-pass
-	// build means the table is fully populated before the dict is sized, so the segment is sized
-	// EXACTLY -- no dict reserve/waste (unlike the streaming compaction transcode).
-	intern := c.inline && c.sealer == nil
+	// A persistent collection reseals INTERNED: records carry segment-local ids against a
+	// per-segment table + a hot header, and the segment gets a dictionary appended at the end
+	// (see segdict.go / the interning design). Encryption at rest composes -- encodeInterned seals
+	// the designated values while interning the rest. Only an in-memory collection (already
+	// global-interned, c.inline false) reseals via c.encodeAd. The two-pass build means the table
+	// is fully populated before the dict is sized, so the segment is sized EXACTLY -- no dict
+	// reserve/waste (unlike the streaming compaction transcode).
+	intern := c.inline
 	var table *wire.InternTable
 	hot := map[uint32]struct{}{}
 	lastLen := 0
@@ -137,7 +138,7 @@ func (c *Collection) resealOneSegment(sh *shard, src *segment, targetCodec Codec
 		}
 		var stored []byte
 		if intern {
-			wireBuf = wire.EncodeWithHot(wireBuf[:0], ad, table, hot)
+			wireBuf = c.encodeInterned(wireBuf[:0], ad, table, hot)
 			refreshHot()
 			stored = targetCodec.Compress(nil, wireBuf)
 		} else {
