@@ -117,6 +117,12 @@ type segment struct {
 	// Its backing mapping is released via onReap when the segment's scan pins drain.
 	msidx atomic.Pointer[mmapSegIndex]
 
+	// colblk is this segment's columnar (adschema PAX) accelerator: nil unless schema-scan
+	// is enabled on the collection. Built from the immutable record bytes and swapped in
+	// atomically (like idx); a scan reads it lock-free and uses colSegment.offs to map a
+	// block record back to its arena offset for the MVCC visibility check.
+	colblk atomic.Pointer[colSegment]
+
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned
 	// at compaction install and on recovery), so no rename is needed when id changes.
