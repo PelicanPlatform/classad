@@ -47,6 +47,29 @@ func Decode(b []byte, t *InternTable) (*ast.ClassAd, error) {
 	return d.adBody(0)
 }
 
+// DecodeResolve parses an interned ad (Encode/EncodeWithHot), resolving attribute ids to
+// names via `resolve` instead of an *InternTable -- e.g. backed by a sealed segment's mmap
+// dictionary (id -> name), so no in-memory table is materialized to read the segment. The ad
+// must be interned (not inline -- those are self-contained, use DecodeInline; not standalone).
+// The resolver is inherited by nested ad decoders, so it covers sub-ads too.
+func DecodeResolve(b []byte, resolve func(uint32) (string, bool)) (*ast.ClassAd, error) {
+	if resolve == nil {
+		return nil, fmt.Errorf("%w: interned ad requires a resolver", ErrMalformed)
+	}
+	d := &decoder{b: b, resolve: resolve}
+	flags, err := d.headerFlags()
+	if err != nil {
+		return nil, err
+	}
+	if flags&flagStandalone != 0 {
+		return nil, fmt.Errorf("%w: standalone ad; use DecodeStandalone", ErrMalformed)
+	}
+	if flags&flagInlineNames != 0 {
+		return nil, fmt.Errorf("%w: inline ad; use DecodeInline", ErrMalformed)
+	}
+	return d.adBody(0)
+}
+
 // DecodeInline parses a self-contained inline-names ad (EncodeInline), requiring no
 // intern table.
 func DecodeInline(b []byte) (*ast.ClassAd, error) {
