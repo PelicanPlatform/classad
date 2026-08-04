@@ -1,7 +1,10 @@
 package collections
 
 import (
+	"encoding/binary"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -107,6 +110,104 @@ func TestSchemaScanReloadZeroRebuild(t *testing.T) {
 		}
 		if got != want[e] || got != truth(c2, e) {
 			t.Fatalf("post-reopen %q: got=%d want=%d truth=%d", e, got, want[e], truth(c2, e))
+		}
+	}
+}
+
+// TestSchemaScanReloadCorruptSection verifies the reload's "any doubt rebuilds" contract: a
+// bit-flipped columnar section fails its CRC and is ignored, so that segment row-scans while the
+// rest stay columnar -- and CountConstraint still returns the correct answer.
+func TestSchemaScanReloadCorruptSection(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	exprs := []string{"Memory > 4096", "Memory <= 4096"}
+
+	open := func() *Collection {
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 12})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := open()
+	for i := 0; i < 600; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d\nDisk=%d", 1+i%8, 1024+(i%64)*256, i*4096))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mq, _ := vm.Parse("true")
+	for i := 0; i < 20; i++ {
+		for range c.QueryProject(mq, []string{"Memory"}) {
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(2000, 4) {
+		t.Fatal("BuildAndEnableSchemaScan false")
+	}
+	for i := 600; i < 2400; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d\nDisk=%d", 1+i%8, 1024+(i%64)*256, i*4096))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := map[string]int{}
+	for _, e := range exprs {
+		want[e], _ = c.CountConstraint(e)
+	}
+	c.Close()
+
+	// Corrupt the columnar body of exactly one v2 sidecar (flip a byte just before the 16-byte
+	// container trailer, inside the col section; the trailer stays intact so the container still
+	// parses and yields the section, but its CRC now fails).
+	corrupted := ""
+	filepath.WalkDir(dir, func(p string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || filepath.Ext(p) != ".idx" || corrupted != "" {
+			return nil
+		}
+		b, e := os.ReadFile(p)
+		if e != nil || len(b) < sidecarTrailerLenV2+colSectionHdr+1 {
+			return nil
+		}
+		if binary.LittleEndian.Uint32(b[len(b)-4:]) != sidecarContainerMagicV2 {
+			return nil // v1 (no columnar section)
+		}
+		b[len(b)-sidecarTrailerLenV2-1] ^= 0xFF // last byte of the col body
+		if e := os.WriteFile(p, b, 0o644); e != nil {
+			t.Fatal(e)
+		}
+		corrupted = p
+		return nil
+	})
+	if corrupted == "" {
+		t.Fatal("no v2 (columnar) sidecar found to corrupt")
+	}
+
+	before := colSegmentBuilds.Load()
+	c2 := open()
+	defer c2.Close()
+	if built := colSegmentBuilds.Load() - before; built != 0 {
+		t.Fatalf("reopen rebuilt %d blocks (want 0; a corrupt section should just row-scan)", built)
+	}
+	// Exactly one sealed segment should now lack a block (the corrupted one), and reads are correct.
+	missing := 0
+	for _, sh := range c2.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg != nil && seg != sh.act && seg.used > 0 && seg.colblk.Load() == nil {
+				missing++
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	if missing == 0 {
+		t.Fatal("corrupt section was not rejected (segment still has a block)")
+	}
+	for _, e := range exprs {
+		got, ok := c2.CountConstraint(e)
+		if !ok || got != want[e] {
+			t.Fatalf("%q after corruption: ok=%v got=%d want=%d", e, ok, got, want[e])
 		}
 	}
 }

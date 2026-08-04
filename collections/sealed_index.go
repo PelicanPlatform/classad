@@ -54,8 +54,8 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	// row-scans until the block is rebuilt. The unmarshal COPIES its streams, so the block is
 	// independent of this mapping.
 	var cs *colSegment
-	if len(col) > 0 {
-		cs = unmarshalColSegment(col, seg.codec, c.intern.Intern) // nil on malformed -> row-scan
+	if body := readColSection(col, seg.used); body != nil { // rejects truncated/corrupt/stale -> row-scan
+		cs = unmarshalColSegment(body, seg.codec, c.intern.Intern)
 	}
 	// keyIdx is set exactly once per seal and is the "sealed" marker; CAS so a
 	// concurrent seal cannot leak a mapping.

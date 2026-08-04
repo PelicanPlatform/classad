@@ -95,7 +95,7 @@ func (c *Collection) colBlobForSeg(seg *segment) []byte {
 	if cs == nil {
 		return nil
 	}
-	return marshalColSegment(cs, c.intern.Name)
+	return wrapColSection(marshalColSegment(cs, c.intern.Name), seg.used)
 }
 
 // adoptPersistedSchemaScan enables schema-scan on reopen from persisted columnar blocks: if any
