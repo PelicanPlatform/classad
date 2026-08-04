@@ -2,6 +2,7 @@ package collections
 
 import (
 	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
@@ -116,6 +117,48 @@ func (c *Collection) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr,
 		return wire.DecodeNodeResolve(node, dict.resolve)
 	}
 	return c.decodeNode(node)
+}
+
+// decodeAdDict is decodeAd (decompress + decode to a ClassAd) that resolves an interned
+// segment's ids via its dict. dict==nil => the existing decodeAd path (inline/global).
+func (c *Collection) decodeAdDict(dict *segDictHandle, stored []byte, codec Codec) (*classad.ClassAd, error) {
+	if dict == nil {
+		return c.decodeAd(stored, codec)
+	}
+	dec, err := codec.Decompress(nil, stored)
+	if err != nil {
+		return nil, err
+	}
+	a, err := wire.DecodeResolve(dec, dict.resolve)
+	if err != nil {
+		return nil, err
+	}
+	return classad.FromAST(a), nil
+}
+
+// toSelfContained converts a stored record's (compressed) ad bytes into a form that decodes
+// WITHOUT the source segment's dict, for DEFERRED/cold paths (e.g. a watch event) that copy ad
+// bytes out of the scan and decode them later, when the segment and its dict are no longer in
+// scope. For an inline segment or an in-memory (global-interned) collection -- dict==nil -- the
+// bytes already self-decode, so they are returned unchanged. For an interned segment the record
+// is decoded via the dict, re-encoded inline, and recompressed under the SAME codec, so a later
+// decodeAd(bytes, codec) yields the identical ad. Best-effort: returns the input unchanged on
+// any decode/encode error (a later decode then fails exactly as it would have anyway). The hot
+// scan paths do NOT use this -- they thread the dict and dispatch -- so its decode+re-encode
+// cost lands only on cold event capture.
+func (c *Collection) toSelfContained(dict *segDictHandle, ad []byte, codec Codec) []byte {
+	if dict == nil {
+		return ad
+	}
+	dec, err := codec.Decompress(nil, ad)
+	if err != nil {
+		return ad
+	}
+	a, err := wire.DecodeResolve(dec, dict.resolve)
+	if err != nil {
+		return ad
+	}
+	return codec.Compress(nil, wire.EncodeInline(nil, a))
 }
 
 // newStreamEncoder returns a StreamEncoder matching the collection's mode, for the
