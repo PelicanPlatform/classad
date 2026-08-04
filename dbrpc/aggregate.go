@@ -259,6 +259,21 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		return
 	}
 
+	// Fast path: a constrained COUNT(*) WHERE <numeric comparison on one int schema field> runs
+	// as the adschema columnar scan when the table has schema-scan enabled and the predicate is
+	// eligible. CountConstraint returns ok=false otherwise (schema-scan off, or a predicate the
+	// columnar path can't handle), and we fall through to the projected scan.
+	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
+		!db.IsMatchAll(constraint) {
+		if n, ok := d.CountConstraint(constraint); ok {
+			frame := respHead(reqID, stStream)
+			frame = putStr(frame, strconv.Itoa(n))
+			write(frame)
+			write(respHead(reqID, stStreamEnd))
+			return
+		}
+	}
+
 	seq, err := d.QueryProject(constraint, attrs)
 	if err != nil {
 		write(respErr(reqID, err.Error()))

@@ -279,6 +279,20 @@ func (db *DB) Len() int { return db.c.Len() }
 // caller knows when Len equals the match-all row count (the COUNT(*) fast path).
 func (db *DB) Chained() bool { return db.c.Chained() }
 
+// EnableSchemaScan builds the per-segment adschema columnar accelerator over the table's sealed
+// segments and enables it, choosing the uncompressed hot numeric tier as the top-hotTopN
+// int/real fields by query demand (see collections.Collection.BuildAndEnableSchemaScan).
+// sampleMax bounds the ad sample. Opt-in; a table that never calls this is unaffected.
+func (db *DB) EnableSchemaScan(sampleMax, hotTopN int) bool {
+	return db.c.BuildAndEnableSchemaScan(sampleMax, hotTopN)
+}
+
+// CountConstraint counts the rows matching constraint via the columnar schema scan when the
+// constraint is columnar-eligible (Native, numeric comparisons on one int schema field) and
+// schema-scan is enabled; ok=false ⇒ the caller should use the normal count path. See
+// collections.Collection.CountConstraint.
+func (db *DB) CountConstraint(constraint string) (int, bool) { return db.c.CountConstraint(constraint) }
+
 // LookupClassAd returns the committed ad for key (the hash table, outside any
 // transaction), or (nil, false).
 func (db *DB) LookupClassAd(key string) (*classad.ClassAd, bool) {
