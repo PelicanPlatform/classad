@@ -14,6 +14,17 @@ import (
 // the shard is left uncompacted rather than publishing an unreadable segment.
 const compactDictReserve = 256 * 1024
 
+// internStream is one compaction destination stream's interning state: the InternTable the
+// current destination segment is written against, the segment-local ids of the collection's hot
+// attributes present in it (so the interned records carry a hot header for O(1) match lookups,
+// as the inline records they replace did), and the table length at the last hot refresh (hot
+// ids change only when a new name is interned).
+type internStream struct {
+	table   *wire.InternTable
+	hot     map[uint32]struct{}
+	lastLen int
+}
+
 // Compaction reclaims space consumed by superseded/deleted records.
 //
 // It is driven by the per-shard dead-byte ratio (never by age: ClassAds are
@@ -421,16 +432,34 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	if q := sh.segSize / 4; q < reserve {
 		reserve = q
 	}
-	var curTable, hcurTable *wire.InternTable
+	var curStream, hcurStream internStream // zero value: table nil until first use
 	var wireBuf []byte
 	abort := false
-	// finalizeInterned appends seg's dictionary (from table) and publishes seg.dict, sealing it
-	// as a readable interned segment. Called on roll and at the end of the copy.
-	finalizeInterned := func(seg *segment, table *wire.InternTable) {
-		if seg == nil || table == nil {
+	newStream := func() internStream {
+		return internStream{table: wire.NewInternTable(), hot: map[uint32]struct{}{}}
+	}
+	// refreshHot adds the local ids of the collection's hot attribute names that are now present
+	// in st.table (canonical casing preserved -- records intern their own attrs). Cheap: a no-op
+	// unless the table grew since the last refresh. The first record to introduce a hot attr name
+	// misses its own hot header; every later record with it gets it.
+	refreshHot := func(st *internStream) {
+		if st.table.Len() == st.lastLen {
 			return
 		}
-		off, ok := seg.appendDict(appendSegDict(nil, table.Names()))
+		for name := range c.currentHotNames() { // folded; LookupID folds again to find the id
+			if id, ok := st.table.LookupID(name); ok {
+				st.hot[id] = struct{}{}
+			}
+		}
+		st.lastLen = st.table.Len()
+	}
+	// finalizeInterned appends seg's dictionary (from st.table) and publishes seg.dict, sealing it
+	// as a readable interned segment. Called on roll and at the end of the copy.
+	finalizeInterned := func(seg *segment, st *internStream) {
+		if seg == nil || st.table == nil {
+			return
+		}
+		off, ok := seg.appendDict(appendSegDict(nil, st.table.Names()))
 		if !ok {
 			abort = true // dict outgrew the reserve; do not publish an unresolvable segment
 			return
@@ -453,23 +482,25 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 		return ad
 	}
-	// appendInterned encodes ad interned against *tablep and appends it to stream *curp,
-	// rolling to a fresh segment+table (finalizing the old one's dict) when it would not fit
-	// with the dict reserve. Returns the destination segment and record offset.
-	appendInterned := func(streamSegs *[]*segment, curp **segment, tablep **wire.InternTable, seq uint64, key []byte, ad *ast.ClassAd) (*segment, uint32) {
+	// appendInterned encodes ad interned (with a hot header) against st and appends it to stream
+	// *curp, rolling to a fresh segment+stream (finalizing the old one's dict) when it would not
+	// fit with the dict reserve. Returns the destination segment and record offset.
+	appendInterned := func(streamSegs *[]*segment, curp **segment, st *internStream, seq uint64, key []byte, ad *ast.ClassAd) (*segment, uint32) {
 		if *curp == nil {
 			*curp = newDst(streamSegs, 0, target)
-			*tablep = wire.NewInternTable()
+			*st = newStream()
 		}
-		wireBuf = wire.Encode(wireBuf[:0], ad, *tablep)
+		wireBuf = wire.EncodeWithHot(wireBuf[:0], ad, st.table, st.hot)
+		refreshHot(st) // pick up any hot names this ad interned, for later records
 		body := target.Compress(encBuf[:0], wireBuf)
 		encBuf = body
 		rl := recordLen(len(key), len(body))
 		if (*curp).used+rl+reserve > len((*curp).data) {
-			finalizeInterned(*curp, *tablep)
+			finalizeInterned(*curp, st)
 			*curp = newDst(streamSegs, rl+reserve, target)
-			*tablep = wire.NewInternTable()
-			wireBuf = wire.Encode(wireBuf[:0], ad, *tablep)
+			*st = newStream()
+			wireBuf = wire.EncodeWithHot(wireBuf[:0], ad, st.table, st.hot)
+			refreshHot(st)
 			body = target.Compress(encBuf[:0], wireBuf)
 			encBuf = body
 			rl = recordLen(len(key), len(body))
@@ -493,10 +524,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 						markerReserve = reserve
 					}
 					if hcur == nil || hcur.used+recordLen(0, 8)+markerReserve > len(hcur.data) {
-						finalizeInterned(hcur, hcurTable) // no-op unless interning
+						finalizeInterned(hcur, &hcurStream) // no-op unless interning
 						hcur = newDst(&histSegs, recordLen(0, 8)+markerReserve, target)
 						if intern {
-							hcurTable = wire.NewInternTable()
+							hcurStream = newStream()
 						}
 					}
 					hcur.appendMarker(seq, recMarkerMillis(seg.data, o))
@@ -516,7 +547,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 						abort = true
 						break
 					}
-					dstSeg, dstOff = appendInterned(&dstSegs, &cur, &curTable, seq, key, ad)
+					dstSeg, dstOff = appendInterned(&dstSegs, &cur, &curStream, seq, key, ad)
 					if abort {
 						break
 					}
@@ -546,7 +577,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 						abort = true
 						break
 					}
-					hseg, hoff := appendInterned(&histSegs, &hcur, &hcurTable, seq, key, ad)
+					hseg, hoff := appendInterned(&histSegs, &hcur, &hcurStream, seq, key, ad)
 					if abort {
 						break
 					}
@@ -569,8 +600,8 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 	}
 	if intern && !abort {
-		finalizeInterned(cur, curTable)
-		finalizeInterned(hcur, hcurTable)
+		finalizeInterned(cur, &curStream)
+		finalizeInterned(hcur, &hcurStream)
 	}
 	if abort {
 		// Unpublished destinations: unmap + unlink them and leave the shard uncompacted (its
