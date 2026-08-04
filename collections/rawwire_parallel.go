@@ -115,6 +115,7 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 					flush()
 					return
 				}
+				dict := tasks[idx].win.dict()
 				forEachVisibleWindowKeyed(tasks[idx].s0, tasks[idx].win, func(key, ad []byte, codec Codec) bool {
 					if stopped.Load() {
 						return false
@@ -123,6 +124,26 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 						return true
 					}
 					start := len(batch.buf)
+					if dict != nil {
+						// Interned segment: the prefix/hot-first inline renderer needs inline
+						// wire, so fully decompress and flatten via the dict, then subset.
+						w, err := codec.Decompress(dbuf[:0], ad)
+						dbuf = w
+						if err != nil {
+							return true
+						}
+						out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(c.wireToInline(dict, w)), sel.keep, needed, nil, &sc)
+						if !ok {
+							batch.buf = out[:start]
+							return true
+						}
+						batch.buf = out
+						batch.offs = append(batch.offs, len(out))
+						if len(batch.buf) >= wireBatchArena {
+							flush()
+						}
+						return true
+					}
 					// Projected reads try a PREFIX decompress first: the hot region is
 					// a physical prefix of the record, so a hot-covered projection
 					// never decompresses the rest. A truncated parse (or an unmet
