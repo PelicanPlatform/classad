@@ -90,16 +90,25 @@ see §4.
 
 ## 3. Interned write at seal + read-both (phase 1 core)
 
-- **Seal transcode:** add an interned-persistent seal path that emits `[dict][interned
-  records]`. Gate per collection (opt-in) initially; the active segment and all existing
-  segments are untouched.
-- **Encoding tag per segment:** a segment is uniform in encoding (one seal produced it). Tag
-  it (a byte in the segment header / dir entry) so index/zone/adschema/decoder dispatch
-  per-segment. Old segments read as inline; new sealed segments read as interned-with-dict.
-- **Reads:** route decode through the per-segment encoding: inline → `DecodeInline`;
-  interned → decode against the segment's dict. `decodeWire`/`wireLookup`/`ForEachNamed`
-  stop consulting `c.inline` and consult the segment's tag (or the per-ad flag) + the
-  segment's dict.
+- **Seal transcode = a segment rewrite.** The active segment is written inline as records
+  arrive; at seal it is rewritten into `[segment header][dict][records with interned bodies]`,
+  mirroring the compaction rewrite (build a new arena, copy each record preserving its
+  seq/superseded/key header while swapping the body inline→interned, write + msync + swap in).
+  The active segment and all existing sealed segments are untouched; only the sealing pass
+  changes. Folds into the existing seal walk (buildSegIndex reads every record already).
+- **Encoding tag = a byte in the segment header** (DECIDED). A segment is uniform in encoding
+  (one seal produced it); a version/flags byte at the start of the segment makes it fully
+  **self-describing** — recovery reads the encoding (and, if interned, the dict) from the
+  segment alone, no directory/external state. Old segments (no/inline tag) read as inline; new
+  sealed segments read as interned-with-dict.
+- **Rollout = on by default for persistent collections** (DECIDED). Every new seal on a
+  persistent collection is interned; existing inline segments stay inline and are read via the
+  per-segment dispatch (read-both), converting naturally as segments seal/compact. No opt-in
+  flag — so phase 1 correctness must be airtight before it lands (heavy mixed-segment tests).
+- **Reads:** route decode through the per-segment encoding tag: inline → `DecodeInline`;
+  interned → `DecodeResolve` against the segment's dict (`segDictName`). `decodeWire`/
+  `wireLookup`/`ForEachNamed` stop consulting the collection-level `c.inline` and consult the
+  **segment's** tag + dict (threaded to each call site).
 
 ## 4. Dictionary lookup structures & query-side name↔id (phase 1 care)
 
@@ -208,9 +217,11 @@ Each phase: branch → PR → tag; db/dbrpc bump as usual.
    from the mmap, zero per-segment heap; `id→name` via an id-ordered name blob + offset table
    (also mmap). Active/global table stays a Go map. (Supersedes the earlier local→global-id
    array; adschema schema binds by name.)
-2. **Encoding tag location:** segment header byte vs directory-entry field — wherever the
-   seal/recovery path most cheaply carries it per segment.
-3. **Opt-in surface:** a collection Option (`InternSealedSegments bool`) for phase 1, later
-   defaulted on for persistent collections once proven.
+2. **Encoding tag location: RESOLVED** — a byte in the segment header; the segment is
+   self-describing (recovery reads encoding + dict from the segment alone).
+3. **Rollout: RESOLVED** — on by default for persistent collections (no opt-in flag); existing
+   inline segments read via per-segment dispatch and convert as they seal/compact. Correctness
+   must be airtight before landing.
 4. **Encrypted-interned priority:** phase 2 soon, or encrypted collections stay inline
-   indefinitely (acceptable; just no RAM/decode win there)?
+   indefinitely (acceptable; just no RAM/decode win there)? (Encrypted collections keep sealing
+   inline until phase 2 regardless, since only inline has a sealing encoder today.)
