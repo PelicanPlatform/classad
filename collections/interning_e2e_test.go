@@ -142,3 +142,65 @@ func TestInterningEndToEnd(t *testing.T) {
 	assertInterned("post-reopen", c2)
 	verify("post-reopen", c2)
 }
+
+// TestInterningSchemaScan checks the adschema columnar accelerator over INTERNED segments: the
+// per-segment block build must resolve segment-local ids (recordToInternedDict), so a
+// CountConstraint routed through the columnar scan matches the query engine.
+func TestInterningSchemaScan(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	const n = 4000
+	c, err := Open(Options{Shards: 2, Dir: dir, SegmentSize: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for i := 0; i < n; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%05d", i)), mustAd(t, fmt.Sprintf("[Id=%d; Val=%d]", i, i%100))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Read demand on Val so the schema build ranks it into the hot tier.
+	tq := mustQuery(t, "true")
+	for r := 0; r < 20; r++ {
+		for range c.QueryProject(tq, []string{"Val"}) {
+		}
+	}
+	// Force compaction -> interned segments, then enable the columnar scan over them.
+	for _, sh := range c.shards {
+		c.compactShard(sh, c.currentCodec())
+	}
+	c.reindexAfterCompaction()
+	interned := 0
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg != nil && seg != sh.act && seg.used > 0 && seg.dict.Load() != nil {
+				interned++
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	if interned == 0 {
+		t.Fatal("no interned segments to scan")
+	}
+	if !c.BuildAndEnableSchemaScan(n, 4) {
+		t.Fatal("BuildAndEnableSchemaScan returned false over interned segments")
+	}
+	for _, expr := range []string{"Val >= 50", "Val < 25", "Val >= 10 && Val < 90"} {
+		got, ok := c.CountConstraint(expr)
+		if !ok {
+			t.Errorf("%q: CountConstraint declined over interned segments", expr)
+			continue
+		}
+		want := 0
+		for range c.Query(mustQuery(t, expr)) {
+			want++
+		}
+		if got != want {
+			t.Errorf("%q: columnar %d != query %d over interned segments", expr, got, want)
+		}
+	}
+}

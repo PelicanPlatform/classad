@@ -73,10 +73,19 @@ func (c *Collection) decodeNode(node []byte) (ast.Expr, error) {
 // accelerator build time (schema sampling and per-segment block transcode), not on the scan
 // hot path.
 func (c *Collection) recordToInterned(dst, w []byte) ([]byte, bool) {
-	if !c.inline {
-		return w, true
+	return c.recordToInternedDict(nil, dst, w)
+}
+
+// recordToInternedDict is recordToInterned honoring a per-segment interned record: dict!=nil
+// resolves segment-local ids (via decodeWireDict) before re-encoding to the collection's
+// GLOBAL intern table. dict==nil is the legacy path (in-memory already global-interned -> as
+// is; inline -> decode + re-encode). Used by the adschema block build over sealed segments,
+// which may now be interned.
+func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([]byte, bool) {
+	if dict == nil && !c.inline {
+		return w, true // in-memory: already global-interned
 	}
-	ad, err := c.decodeWire(w)
+	ad, err := c.decodeWireDict(dict, w)
 	if err != nil {
 		return nil, false
 	}

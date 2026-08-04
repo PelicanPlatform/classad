@@ -48,7 +48,9 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 		}
 		sh.mu.RUnlock()
 		for _, seg := range segs {
-			blk, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, hot, c.recordToInterned)
+			d := seg.dict.Load() // interned segment -> resolve its local ids during transcode
+			blk, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, hot,
+				func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
 			seg.colblk.Store(&colSegment{block: blk, offs: offs})
 		}
 	}
