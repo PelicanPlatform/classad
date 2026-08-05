@@ -175,9 +175,11 @@ func (t *ArchiveTable) QueryRawProjected(constraint string, projection []string,
 func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
 	// Fast path: an unconstrained COUNT(*) with no grouping is the retained record count,
 	// which the archive tracks in O(1). This is the common `SELECT COUNT(*) FROM history`;
-	// scanning tens of thousands of records to count them would be needlessly slow.
+	// scanning tens of thousands of records to count them would be needlessly slow. A
+	// FILTERED count cannot take this path -- the stored total knows nothing about the
+	// filter, so it would silently answer with every row.
 	if len(groupBy) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		IsMatchAll(constraint) {
+		aggs[0].Filter == "" && IsMatchAll(constraint) {
 		return []AggRow{{Values: []string{strconv.Itoa(t.a.Count())}}}, nil
 	}
 
@@ -194,7 +196,7 @@ func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []Agg
 	if err != nil {
 		return nil, err
 	}
-	return AggregateValues(seq, groupCols, aggs, groupCol, aggCol, nil), nil
+	return AggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, nil)
 }
 
 // IsMatchAll reports whether a constraint imposes no filter (an empty string or a literal

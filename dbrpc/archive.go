@@ -48,6 +48,16 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 // engine so the result is identical to the same aggregate over a mutable table. Private
 // attributes are refused for an unprivileged reader, as with the mutable aggregate.
 func (sc *serverConn) streamArchiveAggregate(reqID uint64, r *reader) {
+	sc.archiveAggregate(reqID, r, false)
+}
+
+// streamArchiveAggregateFiltered is streamArchiveAggregate whose specs carry a per-aggregate
+// filter (opArchiveAggregateFiltered). Only the spec encoding differs.
+func (sc *serverConn) streamArchiveAggregateFiltered(reqID uint64, r *reader) {
+	sc.archiveAggregate(reqID, r, true)
+}
+
+func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, filtered bool) {
 	name := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -59,7 +69,7 @@ func (sc *serverConn) streamArchiveAggregate(reqID uint64, r *reader) {
 	for i := range groupCols {
 		groupCols[i] = GroupCol{Attr: r.str()}
 	}
-	aggs, ok := readAggSpecs(r, reqID, sc.write)
+	aggs, ok := readAggSpecs(r, reqID, sc.write, filtered)
 	if !ok {
 		return
 	}
@@ -74,6 +84,12 @@ func (sc *serverConn) streamArchiveAggregate(reqID uint64, r *reader) {
 			if a.Arg != "*" && classad.IsPrivateAttribute(a.Arg) {
 				sc.write(respErr(reqID, "cannot aggregate private attribute "+a.Arg))
 				return
+			}
+			for _, ref := range db.AggFilterAttrs(a.Filter) {
+				if classad.IsPrivateAttribute(ref) {
+					sc.write(respErr(reqID, "cannot filter on private attribute "+ref))
+					return
+				}
 			}
 		}
 	}
@@ -163,17 +179,18 @@ var ErrArchiveAggregateUnsupported = errors.New("dbrpc: server does not support 
 // server. Against a server that does not implement the opcode it returns an error wrapping
 // ErrArchiveAggregateUnsupported so the caller can fall back to client-side aggregation.
 func (c *Client) ArchiveAggregate(ctx context.Context, name, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	filtered := anyFiltered(aggs)
 	build := func(id uint64) []byte {
-		b := putStr(putStr(req(id, opArchiveAggregate), name), constraint)
+		o := opArchiveAggregate
+		if filtered {
+			o = opArchiveAggregateFiltered
+		}
+		b := putStr(putStr(req(id, o), name), constraint)
 		b = putI32(b, int32(len(groupBy)))
 		for _, g := range groupBy {
 			b = putStr(b, g)
 		}
-		b = putI32(b, int32(len(aggs)))
-		for _, a := range aggs {
-			b = putStr(putU8(b, byte(a.Func)), a.Arg)
-		}
-		return b
+		return putAggSpecs(b, aggs, filtered)
 	}
 	_, frames, err := c.callStream(build)
 	if err != nil {
@@ -206,8 +223,12 @@ func (c *Client) ArchiveAggregate(ctx context.Context, name, constraint string, 
 			case stErr:
 				return out, statusErr(status, body)
 			case stBadReq:
-				// A server too old to know opArchiveAggregate rejects it as a bad
-				// request; signal the caller to fall back to client-side aggregation.
+				// A server too old to know the opcode rejects it as a bad request. A plain
+				// archive aggregate can fall back to a client-side scan; a FILTERED one
+				// must not be retried without its filters.
+				if filtered {
+					return nil, ErrFilteredAggregateUnsupported
+				}
 				return nil, ErrArchiveAggregateUnsupported
 			default:
 				return out, fmt.Errorf("dbrpc: unexpected archive aggregate status %d", status)
