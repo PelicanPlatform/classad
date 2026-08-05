@@ -217,3 +217,53 @@ func TestAggregateFilterPrivateAttr(t *testing.T) {
 		t.Error("a filter over a private attribute should be refused")
 	}
 }
+
+// TestCountDistinctOverRPC checks the distinct count end to end, including that it composes
+// with a filter.
+func TestCountDistinctOverRPC(t *testing.T) {
+	c, cleanup := testPair(t)
+	defer cleanup()
+	seedStatusMix(t, c) // alice 4 rows / statuses {4,2,5}; bob 3 rows / statuses {4,2}
+
+	rows, err := c.Aggregate(context.Background(), "true", []string{"Owner"}, []AggSpec{
+		{Func: AggCount, Arg: "*"},
+		{Func: AggCountDistinct, Arg: "JobStatus"},
+		{Func: AggCountDistinct, Arg: "JobStatus", Filter: "Cpus > 1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]string{}
+	for _, r := range rows {
+		got[r.Group[0]] = r.Values
+	}
+	// alice: 4 rows, statuses {4,2,5}; with Cpus>1 her rows are cpus 2(st 4),4(st 2),8(st 5).
+	if g := got["alice"]; len(g) != 3 || g[0] != "4" || g[1] != "3" || g[2] != "3" {
+		t.Errorf("alice = %v, want [4 3 3]", g)
+	}
+	// bob: 3 rows, statuses {4,2}; with Cpus>1 his rows are cpus 2(st 2),16(st 2) -> {2}.
+	if g := got["bob"]; len(g) != 3 || g[0] != "3" || g[1] != "2" || g[2] != "1" {
+		t.Errorf("bob = %v, want [3 2 1]", g)
+	}
+}
+
+// TestCountDistinctUnsupportedServer checks that COUNT DISTINCT is gated like a filter: an
+// older server would decode the frame and return "undefined" for the column, so the client
+// refuses the opcode instead.
+func TestCountDistinctUnsupportedServer(t *testing.T) {
+	c, cleanup := testPairOps(t, func(o op) bool {
+		return o != opAggregateFiltered && o != opArchiveAggregateFiltered
+	})
+	defer cleanup()
+	seedStatusMix(t, c)
+
+	_, err := c.Aggregate(context.Background(), "true", nil,
+		[]AggSpec{{Func: AggCountDistinct, Arg: "JobStatus"}})
+	if !errors.Is(err, ErrExtendedAggregateUnsupported) {
+		t.Errorf("err = %v, want ErrExtendedAggregateUnsupported", err)
+	}
+	// The former name is the same value, so existing callers keep matching.
+	if !errors.Is(err, ErrFilteredAggregateUnsupported) {
+		t.Errorf("the deprecated alias should still match")
+	}
+}
