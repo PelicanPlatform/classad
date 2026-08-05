@@ -1,11 +1,54 @@
 package collections
 
+import (
+	"encoding/binary"
+	"hash/crc32"
+)
+
 // Serialization of a sealed segment's columnar accelerator (schema + block streams + the
 // arena-offset map), so it can be persisted beside the segment's index sidecar and rebuilt on
 // reopen instead of re-transcoding the whole segment. The layout (field offsets, hot/cold
 // partition) is recomputed from the persisted (schema, hot set, n) via layoutSchema /
 // layoutColumnar -- the same helpers the encoder uses -- so a decoded block is identical to a
 // freshly built one. Only the payloads and offsets are stored.
+//
+// The marshaled block is framed with a magic/version/upto/CRC header before it goes into the
+// sidecar's columnar section, so a reload rejects a truncated, bit-rotted, or stale section (one
+// built from a different segment byte length) and rebuilds instead of trusting corrupt bytes --
+// the same "derived state, any doubt rebuilds" contract the attribute-index sidecar follows.
+const (
+	colSectionMagic   = 0x434f4c58 // "COLX"
+	colSectionVersion = 1
+	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
+)
+
+// wrapColSection frames a marshaled columnar block for the sidecar. upto is the segment byte
+// length the block was built from.
+func wrapColSection(body []byte, upto int) []byte {
+	b := make([]byte, 0, colSectionHdr+len(body))
+	b = appendU32(b, colSectionMagic)
+	b = appendU16(b, colSectionVersion)
+	b = appendU32(b, uint32(upto))
+	b = appendU32(b, crc32.ChecksumIEEE(body))
+	return append(b, body...)
+}
+
+// readColSection validates a framed columnar section against the segment's current byte length and
+// the body CRC, returning the inner marshaled block bytes, or nil if the section is
+// absent/short/wrong-version/stale/corrupt (the caller then row-scans and rebuilds).
+func readColSection(data []byte, upto int) []byte {
+	if len(data) < colSectionHdr ||
+		binary.LittleEndian.Uint32(data[0:]) != colSectionMagic ||
+		binary.LittleEndian.Uint16(data[4:]) != colSectionVersion ||
+		int(binary.LittleEndian.Uint32(data[6:])) != upto {
+		return nil
+	}
+	body := data[colSectionHdr:]
+	if binary.LittleEndian.Uint32(data[10:]) != crc32.ChecksumIEEE(body) {
+		return nil
+	}
+	return body
+}
 
 // marshalAdSchema writes a schema's fields as (name, kind, width, unsigned); the layout is
 // re-derived on read, not stored. Fields are keyed by NAME, not by their runtime intern id: a
@@ -89,6 +132,14 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 
 // unmarshalColSegment reconstructs a colSegment from marshalColSegment's output, attaching the
 // segment's codec (for later decompression). Returns nil on malformed data.
+//
+// ZERO-COPY: the block's byte streams (hot + the three compressed cold streams) ALIAS data rather
+// than being copied -- the hot column is then scanned strided directly over the mmap, and the cold
+// streams decompress lazily into the bounded block cache only when touched, so a reloaded block
+// adds no per-segment stream heap. This is the same lifetime contract as the mmap'd attribute
+// index (mmapSegIndex): both alias the segment's <seg>.idx mapping, which is released together on
+// reap and re-published together when reindex swaps the sidecar. Callers must therefore keep data
+// (the mapping, or a heap buffer in tests) alive for the block's lifetime.
 func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint32) *colSegment {
 	c := &cursor{b: data}
 	s := readAdSchema(c, internName)
@@ -105,10 +156,10 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	}
 	n := int(c.u32())
 	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n}
-	b.hot = append([]byte(nil), c.bytes()...)
-	b.coldNumComp = append([]byte(nil), c.bytes()...)
-	b.strComp = append([]byte(nil), c.bytes()...)
-	b.coldComp = append([]byte(nil), c.bytes()...)
+	b.hot = c.bytes() // aliases data (the mmap); read-only, scanned in place
+	b.coldNumComp = c.bytes()
+	b.strComp = c.bytes()
+	b.coldComp = c.bytes()
 	b.strOff = readInts(c)
 	b.coldOff = readInts(c)
 	offs := readU32s(c)

@@ -271,6 +271,9 @@ func Open(opts Options) (*Collection, error) {
 	// The maintained ordered indexes are likewise derived: rebuild them from the
 	// recovered ads so a reopened collection's Ordered() is immediately correct.
 	c.rebuildOrdered()
+	// If sealed segments recovered persisted columnar blocks, re-enable schema-scan from them
+	// (adopt-from-sidecar) so the accelerator is live immediately -- no re-sample, no rebuild.
+	c.adoptPersistedSchemaScan()
 	return c, nil
 }
 
