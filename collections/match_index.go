@@ -613,6 +613,21 @@ func (si *segIndex) catCanonicalValues(id uint32, add func(string) bool) bool {
 	return true
 }
 
+// catValueCount returns the number of records spelling categorical attribute id exactly
+// key. It reuses exactBitmap's case-uniform/mixed-case resolution, so it agrees with an
+// equality probe on the same spelling by construction.
+func (si *segIndex) catValueCount(id uint32, key string) (uint64, bool) {
+	cp := si.cat[id]
+	if cp == nil {
+		return 0, false
+	}
+	bm := cp.exactBitmap(key)
+	if bm == nil {
+		return 0, false
+	}
+	return bm.GetCardinality(), true
+}
+
 // materializeFinite walks the boolean tree of a slot predicate and replaces each opaque
 // leaf that is a pure function of a single low-cardinality categorical attribute with an
 // equivalent membership disjunction (attr == v1 || ...), by evaluating the leaf over the

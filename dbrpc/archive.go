@@ -51,13 +51,16 @@ func (sc *serverConn) streamArchiveAggregate(reqID uint64, r *reader) {
 	sc.archiveAggregate(reqID, r, false)
 }
 
-// streamArchiveAggregateFiltered is streamArchiveAggregate whose specs carry a per-aggregate
-// filter (opArchiveAggregateFiltered). Only the spec encoding differs.
+// streamArchiveAggregateFiltered is streamArchiveAggregate's extended form: each group
+// column carries a bucket width and each spec a filter (opArchiveAggregateFiltered).
 func (sc *serverConn) streamArchiveAggregateFiltered(reqID uint64, r *reader) {
 	sc.archiveAggregate(reqID, r, true)
 }
 
-func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, filtered bool) {
+// archiveAggregate is the body shared by both archive aggregate opcodes. extended says
+// whether the frame is the wide form -- each group column followed by a bucket width, each
+// aggregate spec by a filter expression -- rather than the base opcode's narrow one.
+func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended bool) {
 	name := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -68,8 +71,11 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, filtered bool) {
 	groupCols := make([]GroupCol, nGroup)
 	for i := range groupCols {
 		groupCols[i] = GroupCol{Attr: r.str()}
+		if extended {
+			groupCols[i].BucketWidth = int64(r.u64())
+		}
 	}
-	aggs, ok := readAggSpecs(r, reqID, sc.write, filtered)
+	aggs, ok := readAggSpecs(r, reqID, sc.write, extended)
 	if !ok {
 		return
 	}
@@ -98,11 +104,7 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, filtered bool) {
 		sc.write(respErr(reqID, "no such archive: "+name))
 		return
 	}
-	groupBy := make([]string, len(groupCols))
-	for i, g := range groupCols {
-		groupBy[i] = g.Attr
-	}
-	rows, err := a.Aggregate(constraint, groupBy, aggs)
+	rows, err := a.AggregateCols(constraint, groupCols, aggs)
 	if err != nil {
 		sc.write(respErr(reqID, err.Error()))
 		return
@@ -179,19 +181,55 @@ var ErrArchiveAggregateUnsupported = errors.New("dbrpc: server does not support 
 // server. Against a server that does not implement the opcode it returns an error wrapping
 // ErrArchiveAggregateUnsupported so the caller can fall back to client-side aggregation.
 func (c *Client) ArchiveAggregate(ctx context.Context, name, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	groups := make([]GroupCol, len(groupBy))
+	for i, g := range groupBy {
+		groups[i] = GroupCol{Attr: g}
+	}
+	return c.ArchiveAggregateBucketed(ctx, name, constraint, groups, aggs)
+}
+
+// ArchiveAggregateBucketed is ArchiveAggregate where a group column may carry a bucket
+// width, flooring a numeric dimension into fixed-width buckets on the server -- "jobs per
+// group per day" without the matched rows crossing the wire. Bucket widths and per-aggregate
+// filters compose: both ride the same extended opcode.
+//
+// Against a server that does not implement that opcode it returns an error wrapping
+// ErrFilteredAggregateUnsupported when a filter was requested (which must not be retried
+// without its filters) and ErrArchiveAggregateUnsupported otherwise, so the caller can fall
+// back to client-side reduction.
+func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint string, groups []GroupCol, aggs []AggSpec) ([]AggRow, error) {
+	// The base opcode's frame has room for neither bucket widths nor filters, so anything
+	// carrying either must use the extended one. Sending the narrow frame instead would
+	// drop them silently and return the wrong numbers as success.
 	filtered := anyFiltered(aggs)
+	extended := filtered
+	for _, g := range groups {
+		if g.BucketWidth != 0 {
+			extended = true
+			break
+		}
+	}
 	build := func(id uint64) []byte {
 		o := opArchiveAggregate
-		if filtered {
+		if extended {
 			o = opArchiveAggregateFiltered
 		}
 		b := putStr(putStr(req(id, o), name), constraint)
-		b = putI32(b, int32(len(groupBy)))
-		for _, g := range groupBy {
-			b = putStr(b, g)
+		b = putI32(b, int32(len(groups)))
+		for _, g := range groups {
+			b = putStr(b, g.Attr)
+			if extended {
+				b = putU64(b, uint64(g.BucketWidth))
+			}
 		}
-		return putAggSpecs(b, aggs, filtered)
+		return putAggSpecs(b, aggs, extended)
 	}
+	return c.archiveAggregate(ctx, build, len(groups), len(aggs), filtered)
+}
+
+// archiveAggregate runs a built archive-aggregate request and collects its streamed rows.
+// filtered selects which "unsupported" error an old server's refusal maps to.
+func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, filtered bool) ([]AggRow, error) {
 	_, frames, err := c.callStream(build)
 	if err != nil {
 		return nil, err
@@ -212,7 +250,7 @@ func (c *Client) ArchiveAggregate(ctx context.Context, name, constraint string, 
 			}
 			switch status {
 			case stStream:
-				row := AggRow{Group: make([]string, len(groupBy)), Values: make([]string, len(aggs))}
+				row := AggRow{Group: make([]string, nGroup), Values: make([]string, nAgg)}
 				for i := range row.Group {
 					row.Group[i] = body.str()
 				}
