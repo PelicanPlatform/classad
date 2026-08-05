@@ -115,6 +115,30 @@ func (db *DB) QueryRawProjected(constraint string, projection []string, redact b
 	return db.c.QueryRawProjected(q, projection, false, redact), nil
 }
 
+// QueryRawProjectedRefs is QueryRawProjected that also carries the attributes the
+// projected expressions reference, transitively, so each yielded ad EVALUATES
+// self-contained (collections chaseRefs).
+//
+// The distinction matters whenever a projected attribute holds an expression rather than
+// a literal, which is the norm for HTCondor data -- Requirements, Rank and friends are
+// expressions over sibling attributes. Projecting to exactly the requested names drops
+// those siblings, so the expression evaluates to undefined at the far end: asking for
+// Requirements alone answers undefined where asking for the whole ad answers true.
+//
+// QueryRawProjected remains the right call for a relay that must reproduce HTCondor's
+// query protocol, which specifies exactly the requested attributes and nothing more. Use
+// this one when the recipient is going to EVALUATE what it receives.
+func (db *DB) QueryRawProjectedRefs(constraint string, projection []string, redact bool) (iter.Seq[collections.RawAd], error) {
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return db.c.ScanRawProjected(projection, true, redact), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryRawProjected(q, projection, true, redact), nil
+}
+
 // QueryRawWire yields each matching ad as a self-contained WIRE-FORM ROW (an
 // inline-names subset ad assembled by slice copies -- see
 // collections.ScanRawWire): the relay form for shipping ads to a remote
