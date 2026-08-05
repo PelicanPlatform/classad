@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"encoding/binary"
 	"errors"
 	"sync/atomic"
 
@@ -215,4 +216,37 @@ func (b *columnarBlock) reconstruct(k int, bc *blockCache) ([]byte, error) {
 	rec = append(rec, strRaw[b.strOff[k]:b.strOff[k+1]]...)
 	rec = append(rec, tailRaw[b.coldOff[k]:b.coldOff[k+1]]...)
 	return rec, nil
+}
+
+// escapedNumField reads the numeric value of an ESCAPED schema field (fieldID) for record k
+// straight from its cold-tail slice, skipping the whole-record reconstruct. A field is escaped
+// when it is missing or exceptional (out of the fitted width, or a type exception); an exceptional
+// value lives in the cold tail as a uvarint(id)+node entry alongside the record's non-schema
+// attributes. Returns (value, true) if fieldID has a numeric value here, or (0, false) if it is
+// missing or non-numeric. bc caches the decompressed cold stream, so a scan's many escaped reads
+// on one block share a single decompression. Callers use this only for records the scan has
+// already found escaped for fieldID; a hot/cold-column value never reaches here.
+func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (float64, bool, error) {
+	ds, err := bc.streams(b)
+	if err != nil {
+		return 0, false, err
+	}
+	cold := ds.cold[b.coldOff[k]:b.coldOff[k+1]]
+	for len(cold) > 0 {
+		id, m := binary.Uvarint(cold)
+		if m <= 0 {
+			return 0, false, nil // malformed tail: treat fieldID as absent
+		}
+		cold = cold[m:]
+		nl, ok := wire.NodeLen(cold)
+		if !ok || nl > len(cold) {
+			return 0, false, nil
+		}
+		if uint32(id) == fieldID {
+			f, found := literalFloat(cold[:nl])
+			return f, found, nil
+		}
+		cold = cold[nl:]
+	}
+	return 0, false, nil
 }
