@@ -23,6 +23,9 @@ import (
 // ad evaluates self-contained. HTCondor's query protocol sends exactly the
 // requested attributes, so a protocol-compatible server passes false.
 //
+// It applies to both representations: an interned collection resolves references
+// by id, a persistent (inline-name) one by name.
+//
 // redact strips private attributes exactly as ScanRawRedacted does. An empty
 // projection means no attribute filter (the whole ad, matching QueryRawProject
 // semantics upstream). Inline-name collections yield nothing, as with ScanRaw.
@@ -101,6 +104,14 @@ type rawProjector struct {
 	inNames  []string
 	inHashes []uint32
 	inDone   []uint32 // gen-marked per projected name (see gen)
+	// Reference-closure additions for the CURRENT inline ad, the name-based twin of
+	// wantGen: names surfaced by chaseRefs that were not in the projection. Reset per ad
+	// (see renderInline) rather than gen-marked, because the set is keyed by name rather
+	// than by a dense id that could index a slot.
+	inRefNames  []string
+	inRefHashes []uint32
+	inRefDone   []bool
+	refNames    [][]byte // per-node reference-name scratch
 
 	haveMyType, haveTargetType bool
 	myTypeID, targetTypeID     uint32
@@ -327,23 +338,54 @@ func boolInt(b bool) int {
 	return 0
 }
 
+// noteInlineRef adds a referenced name to the current ad's wanted set, reporting whether
+// it was new. A name already in the projection is not added: it is either emitted or will
+// be reached by the walk on its own.
+func (p *rawProjector) noteInlineRef(name []byte, gen uint32) bool {
+	h := wire.NameHash32Bytes(name)
+	for i, wh := range p.inHashes {
+		if wh == h && wire.FoldEqualBytes(name, p.inNames[i]) {
+			return false // in the projection already
+		}
+	}
+	for i, rh := range p.inRefHashes {
+		if rh == h && wire.FoldEqualBytes(name, p.inRefNames[i]) {
+			return false // already noted for this ad
+		}
+	}
+	if p.redact && isPrivateNameBytes(name) {
+		return false // a private attribute never leaves a redacted response, reference or not
+	}
+	p.inRefNames = append(p.inRefNames, string(name))
+	p.inRefHashes = append(p.inRefHashes, h)
+	p.inRefDone = append(p.inRefDone, false)
+	return true
+}
+
 // renderInline is render for a persistent (inline-names) collection: entries
 // carry their names in the ad body, so the wanted test is hash-first (the same
 // folded hash the inline hot header uses) verified by a case-insensitive byte
 // compare. The hot fast path resolves (hash, entry-offset) pairs and early-exits
-// when the whole projection plus both type fields were found hot. chaseRefs is
-// not supported for inline ads (their expressions reference attributes by
-// inline name, not id); the projection is served exactly.
+// when the whole projection plus both type fields were found hot.
+//
+// chaseRefs resolves references by inline NAME here, mirroring the id-based closure in
+// render: an emitted expression's unscoped/MY. references are added to a per-ad wanted
+// set and the walk repeats while new ones surface. The hot fast path cannot early-exit
+// once a reference is pending, since the referenced attribute may be cold.
 func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 	p.gen++
 	gen := p.gen
 	p.buf = p.buf[:0]
 	p.offs = append(p.offs[:0], 0)
+	p.inRefNames = p.inRefNames[:0]
+	p.inRefHashes = p.inRefHashes[:0]
+	p.inRefDone = p.inRefDone[:0]
 	var myType, targetType string
 	var mtDone, ttDone bool
 	ad := wire.Ad(w)
 
 	good := true
+	again := false
 	handle := func(name, node []byte) bool {
 		if !mtDone && wire.FoldEqualBytes(name, "MyType") {
 			if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitString {
@@ -373,6 +415,18 @@ func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 					break
 				}
 			}
+			// Not in the projection: it may still be wanted as a reference an already
+			// emitted expression made, which is what keeps a projected expression
+			// evaluable at the far end.
+			if !hit {
+				for i, rh := range p.inRefHashes {
+					if rh == h && !p.inRefDone[i] && wire.FoldEqualBytes(name, p.inRefNames[i]) {
+						p.inRefDone[i] = true
+						hit = true
+						break
+					}
+				}
+			}
 			if !hit {
 				return true
 			}
@@ -386,6 +440,14 @@ func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 			return false
 		}
 		p.offs = append(p.offs, len(p.buf))
+		if p.chaseRefs && !p.wantAll {
+			p.refNames = wire.AppendNodeRefNames(node, p.refNames[:0])
+			for _, rn := range p.refNames {
+				if p.noteInlineRef(rn, gen) {
+					again = true
+				}
+			}
+		}
 		return true
 	}
 
@@ -401,7 +463,7 @@ func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 			return RawAd{}, false
 		}
 		satisfied := (len(p.offs) - 1) + boolInt(mtDone) + boolInt(ttDone)
-		if hotOK && satisfied == needed {
+		if hotOK && satisfied == needed && !again {
 			p.exprs = p.exprs[:0]
 			for i := 0; i+1 < len(p.offs); i++ {
 				p.exprs = append(p.exprs, p.buf[p.offs[i]:p.offs[i+1]])
@@ -410,8 +472,17 @@ func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 		}
 	}
 
-	if !ad.ForEachNameNode(handle) || !good {
-		return RawAd{}, false
+	// Repeat while chaseRefs surfaced names not yet emitted: an earlier entry in the walk
+	// may hold one. Bounded -- each pass strictly grows the wanted set, capped by the ad's
+	// own attribute count -- exactly as the id-based closure is.
+	for {
+		again = false
+		if !ad.ForEachNameNode(handle) || !good {
+			return RawAd{}, false
+		}
+		if !again {
+			break
+		}
 	}
 	p.exprs = p.exprs[:0]
 	for i := 0; i+1 < len(p.offs); i++ {
