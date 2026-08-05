@@ -83,6 +83,42 @@ func (c *Collection) ForEachAd(fn func(key string, ad *classad.ClassAd) bool) {
 	}
 }
 
+// ForEachAdAt is ForEachAd over the versions visible at a caller-chosen snapshot
+// sequence per shard, instead of each shard's current commit sequence.
+//
+// snapOf is called once per shard, with the shard's index, and returns the sequence to
+// read that shard at. It is a callback rather than a map so a transaction can capture a
+// shard's sequence lazily on first touch -- and, having captured it, stay pinned to it
+// for every later read of that shard.
+//
+// This is what lets a transaction scan the committed store at its own snapshot: the same
+// versions its point lookups see, rather than whatever has committed since.
+func (c *Collection) ForEachAdAt(snapOf func(shardIdx int) uint64, fn func(key string, ad *classad.ClassAd) bool) {
+	for i, sh := range c.shards {
+		s0 := snapOf(i)
+		wins := sh.snapshotAt(s0)
+		stop := false
+		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+			if isSystemKeyBytes(key) {
+				return true // internal system record: hidden from client iteration
+			}
+			decoded, err := c.decodeAdDict(dict, ad, codec)
+			if err != nil {
+				return true // skip an undecodable record, as ForEachAd does
+			}
+			if !fn(string(key), decoded) {
+				stop = true
+				return false
+			}
+			return true
+		})
+		releaseWindows(wins)
+		if stop {
+			return
+		}
+	}
+}
+
 // ForEachSystemAd calls fn with every internal system-keyed ad and its key -- the mirror
 // image of ForEachAd, which hides them. It is the enumeration path a TTL reaper uses to
 // find and expire durable bookkeeping records. Each ad is fully decoded; iteration stops
