@@ -146,6 +146,19 @@ const (
 	// caller can address matched rows for UPDATE/DELETE by their real db key regardless of whether
 	// the ad carries a self-reported key attribute. Read-only.
 	opQueryKeys op = 54 // [table][constraint] -> stream of [key]
+
+	// opAggregateFiltered and opArchiveAggregateFiltered are opAggregateBucketed and
+	// opArchiveAggregate with a per-aggregate FILTER expression appended to each spec
+	// (SQL's `COUNT(*) FILTER (WHERE ...)`; see db.AggSpec.Filter).
+	//
+	// They are separate opcodes rather than an extra field on the existing ones because a
+	// server too old to know about filters would read the existing frame, ignore the
+	// trailing filter strings, and answer with UNFILTERED counts -- wrong data reported as
+	// success. An unknown opcode is refused as a bad request instead, which the client
+	// surfaces as ErrFilteredAggregateUnsupported. A client only sends these when some spec
+	// actually carries a filter, so every existing query is byte-identical on the wire.
+	opAggregateFiltered        op = 55 // [table][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter]}
+	opArchiveAggregateFiltered op = 56 // [name][constraint][nGroup]{[attr]}[nAgg]{[func u8][arg][filter]}
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).

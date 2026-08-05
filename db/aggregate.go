@@ -1,12 +1,15 @@
 package db
 
 import (
+	"fmt"
 	"iter"
 	"math"
 	"strconv"
 	"strings"
 
+	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 // This file holds the shared server-side GROUP BY / reduce engine. Both the mutable-table
@@ -30,9 +33,21 @@ const (
 // AggSpec is one aggregate in a query: a function over an argument attribute.
 // Arg "*" (only meaningful for COUNT) counts every row in the group; otherwise
 // Arg is an attribute name evaluated per ad.
+//
+// Filter, when non-empty, is a ClassAd expression restricting this aggregate -- and only
+// this one -- to the rows of its group where the expression is true (SQL's
+// `COUNT(*) FILTER (WHERE ...)`). It is what lets one pass over the data answer several
+// differently-conditioned questions at once:
+//
+//	SELECT Owner, COUNT(*), COUNT(*) FILTER (WHERE JobStatus == 2) FROM jobs GROUP BY Owner
+//
+// Without it that is one scan per condition. The filter narrows an aggregate, never the
+// group: a group whose rows all fail every filter still appears, with COUNT 0 and the other
+// functions undefined, exactly as SQL has it.
 type AggSpec struct {
-	Func AggFunc
-	Arg  string
+	Func   AggFunc
+	Arg    string
+	Filter string
 }
 
 // AggRow is one group's result: the group-by column values followed by the
@@ -78,11 +93,127 @@ func AggProjection(groupCols []GroupCol, aggs []AggSpec) (attrs []string, groupC
 	for i, a := range aggs {
 		if a.Arg == "*" {
 			aggCol[i] = -1
-			continue
+		} else {
+			aggCol[i] = intern(a.Arg)
 		}
-		aggCol[i] = intern(a.Arg)
+		// A filtered aggregate also reads whatever its filter tests, so those attributes
+		// have to be projected too or the filter would see them all undefined.
+		for _, ref := range filterAttrs(a.Filter) {
+			intern(ref)
+		}
 	}
 	return attrs, groupCol, aggCol
+}
+
+// AggFilterAttrs returns the attributes a per-aggregate filter reads. Callers use it to hold
+// a filter to the same rules as the rest of the request -- notably the RPC layer's refusal to
+// let an unprivileged reader touch a private attribute, which a filter could otherwise turn
+// into an oracle (`COUNT(*) FILTER (WHERE Secret == "guess")` leaks by its count).
+func AggFilterAttrs(filter string) []string { return filterAttrs(filter) }
+
+// filterAttrs returns the attributes a per-aggregate filter reads, or nil for no filter (or
+// one that does not compile -- compileFilters reports that as an error later, where it can
+// be returned rather than silently dropped).
+func filterAttrs(filter string) []string {
+	if filter == "" {
+		return nil
+	}
+	q, err := vm.Parse(filter)
+	if err != nil {
+		return nil
+	}
+	return q.ReadAttrs()
+}
+
+// aggFilter is one compiled per-aggregate filter, bound to the projected value row: expr is
+// evaluated against a scope holding just the attributes it reads, at the positions the
+// projection put them.
+type aggFilter struct {
+	expr  *classad.Expr
+	names []string // attribute names the filter reads
+	cols  []int    // their indices in the projected value row, aligned with names
+}
+
+// compileFilters compiles each spec's filter against the projected attribute list. It
+// returns one entry per spec (nil where the spec is unfiltered) and whether any spec has
+// one, so the reduction can skip the whole mechanism for the common unfiltered query.
+func compileFilters(attrs []string, aggs []AggSpec) ([]*aggFilter, bool, error) {
+	out := make([]*aggFilter, len(aggs))
+	col := make(map[string]int, len(attrs))
+	for i, a := range attrs {
+		col[strings.ToLower(a)] = i
+	}
+	any := false
+	for i, a := range aggs {
+		if a.Filter == "" {
+			continue
+		}
+		q, err := vm.Parse(a.Filter)
+		if err != nil {
+			return nil, false, fmt.Errorf("aggregate filter %q: %w", a.Filter, err)
+		}
+		ex, err := classad.ParseExpr(a.Filter)
+		if err != nil {
+			return nil, false, fmt.Errorf("aggregate filter %q: %w", a.Filter, err)
+		}
+		f := &aggFilter{expr: ex}
+		for _, ref := range q.ReadAttrs() {
+			if c, ok := col[strings.ToLower(ref)]; ok {
+				f.names = append(f.names, ref)
+				f.cols = append(f.cols, c)
+			}
+		}
+		out[i] = f
+		any = true
+	}
+	return out, any, nil
+}
+
+// keeps reports whether a row passes this filter. The scope ad is reused across rows and
+// filters, so a filtered aggregate costs one rebind plus one evaluation per row rather than
+// an allocation. A filter that does not evaluate to true excludes the row, so undefined and
+// error behave as they do everywhere else in ClassAd.
+func (f *aggFilter) keeps(scope *classad.ClassAd, vals []classad.Value) bool {
+	for k, c := range f.cols {
+		bindValue(scope, f.names[k], vals[c])
+	}
+	b, err := f.expr.Eval(scope).BoolValue()
+	return err == nil && b
+}
+
+// bindValue binds one projected value into the reused filter scope. Every attribute the
+// filter reads is rebound on every row -- including as undefined -- so nothing carries over
+// from the previous row.
+//
+// Scalars bind natively. A list or nested ad binds as undefined: the projected scan hands
+// back evaluated values, and there is no exported way to turn one back into an expression,
+// so a filter over a list-valued attribute cannot be answered on this path. Filters in
+// practice test scalars (JobStatus, ExitCode, Owner), and undefined excludes the row rather
+// than miscounting it.
+func bindValue(ad *classad.ClassAd, name string, v classad.Value) {
+	switch {
+	case v.IsInteger():
+		if i, err := v.IntValue(); err == nil {
+			ad.InsertAttr(name, i)
+			return
+		}
+	case v.IsReal():
+		if f, err := v.RealValue(); err == nil {
+			ad.InsertAttrFloat(name, f)
+			return
+		}
+	case v.IsBool():
+		if b, err := v.BoolValue(); err == nil {
+			ad.InsertAttrBool(name, b)
+			return
+		}
+	case v.IsString():
+		if s, err := v.StringValue(); err == nil {
+			ad.InsertAttrString(name, s)
+			return
+		}
+	}
+	ad.Insert(name, &ast.UndefinedLiteral{})
 }
 
 // AggregateValues is the shared GROUP BY core: it buckets a sequence of projected
@@ -95,8 +226,18 @@ func AggProjection(groupCols []GroupCol, aggs []AggSpec) (attrs []string, groupC
 // undefined). If stop is non-nil it is polled per row and, when it returns true,
 // the scan halts early with the groups accumulated so far -- used to abandon a
 // scan whose client has gone away.
-func AggregateValues(seq iter.Seq[[]classad.Value], groupCols []GroupCol, aggs []AggSpec, groupCol, aggCol []int, stop func() bool) []AggRow {
+func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []GroupCol, aggs []AggSpec, groupCol, aggCol []int, stop func() bool) ([]AggRow, error) {
 	nGroup := len(groupCols)
+	filters, anyFilter, err := compileFilters(attrs, aggs)
+	if err != nil {
+		return nil, err
+	}
+	// One reused scope for every filter on every row; only touched when a filter exists, so
+	// an unfiltered aggregate keeps its allocation-free reduction.
+	var scope *classad.ClassAd
+	if anyFilter {
+		scope = classad.New()
+	}
 
 	// Hash-map aggregation: bucket by the joined group-value tuple, preserving
 	// first-seen order for stable output. scratch builds each row's key without
@@ -132,6 +273,9 @@ func AggregateValues(seq iter.Seq[[]classad.Value], groupCols []GroupCol, aggs [
 			order = append(order, key)
 		}
 		for i, a := range aggs {
+			if filters[i] != nil && !filters[i].keeps(scope, vals) {
+				continue // this row is outside THIS aggregate's filter, not the group
+			}
 			var v classad.Value
 			if aggCol[i] >= 0 {
 				v = vals[aggCol[i]]
@@ -147,7 +291,7 @@ func AggregateValues(seq iter.Seq[[]classad.Value], groupCols []GroupCol, aggs [
 		for i, a := range aggs {
 			row.Values[i] = gs.accs[i].result(a)
 		}
-		return []AggRow{row}
+		return []AggRow{row}, nil
 	}
 
 	out := make([]AggRow, 0, len(order))
@@ -159,7 +303,7 @@ func AggregateValues(seq iter.Seq[[]classad.Value], groupCols []GroupCol, aggs [
 		}
 		out = append(out, row)
 	}
-	return out
+	return out, nil
 }
 
 // groupState holds one group's key values and per-aggregate accumulators.

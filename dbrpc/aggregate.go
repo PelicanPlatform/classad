@@ -39,17 +39,24 @@ func (c *Client) Aggregate(ctx context.Context, constraint string, groupBy []str
 
 // AggregateTable is Aggregate on the named table.
 func (c *Client) AggregateTable(ctx context.Context, table, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	filtered := anyFiltered(aggs)
 	build := func(id uint64) []byte {
+		// A filtered request goes out on the newer opcode, whose group tuple carries a
+		// bucket width; an unfiltered one keeps the original frame byte for byte.
+		if filtered {
+			b := putStr(putStr(req(id, opAggregateFiltered), table), constraint)
+			b = putI32(b, int32(len(groupBy)))
+			for _, g := range groupBy {
+				b = putU64(putStr(b, g), 0)
+			}
+			return putAggSpecs(b, aggs, true)
+		}
 		b := putStr(putStr(req(id, opAggregate), table), constraint)
 		b = putI32(b, int32(len(groupBy)))
 		for _, g := range groupBy {
 			b = putStr(b, g)
 		}
-		b = putI32(b, int32(len(aggs)))
-		for _, a := range aggs {
-			b = putStr(putU8(b, byte(a.Func)), a.Arg)
-		}
-		return b
+		return putAggSpecs(b, aggs, false)
 	}
 	_, frames, err := c.callStream(build)
 	if err != nil {
@@ -81,6 +88,15 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 				out = append(out, row)
 			case stErr:
 				return out, statusErr(status, body)
+			case stBadReq:
+				// Only reachable for a filtered request: a server too old to know
+				// opAggregateFiltered refuses the opcode. There is deliberately no
+				// fallback -- retrying without the filters would answer a different
+				// question and report it as success.
+				if filtered {
+					return nil, ErrFilteredAggregateUnsupported
+				}
+				return out, fmt.Errorf("dbrpc: aggregate rejected as a bad request")
 			}
 		}
 	}
@@ -101,17 +117,18 @@ func (c *Client) AggregateBucketed(ctx context.Context, constraint string, group
 
 // AggregateBucketedTable is AggregateBucketed on the named table.
 func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint string, groups []GroupCol, aggs []AggSpec) ([]AggRow, error) {
+	filtered := anyFiltered(aggs)
 	build := func(id uint64) []byte {
-		b := putStr(putStr(req(id, opAggregateBucketed), table), constraint)
+		o := opAggregateBucketed
+		if filtered {
+			o = opAggregateFiltered // same request shape, specs carry a filter
+		}
+		b := putStr(putStr(req(id, o), table), constraint)
 		b = putI32(b, int32(len(groups)))
 		for _, g := range groups {
 			b = putU64(putStr(b, g.Attr), uint64(g.BucketWidth))
 		}
-		b = putI32(b, int32(len(aggs)))
-		for _, a := range aggs {
-			b = putStr(putU8(b, byte(a.Func)), a.Arg)
-		}
-		return b
+		return putAggSpecs(b, aggs, filtered)
 	}
 	_, frames, err := c.callStream(build)
 	if err != nil {
@@ -144,8 +161,12 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 			case stErr:
 				return out, statusErr(status, body)
 			case stBadReq:
-				// A server too old to know opAggregateBucketed rejects it as a bad
-				// request; signal the caller to fall back to client-side bucketing.
+				// A server too old to know the opcode rejects it as a bad request. The
+				// caller can fall back to client-side bucketing -- but NOT for a filtered
+				// request, where dropping the filters would change the answer.
+				if filtered {
+					return nil, ErrFilteredAggregateUnsupported
+				}
 				return nil, ErrBucketedUnsupported
 			default:
 				return out, fmt.Errorf("dbrpc: unexpected aggregate status %d", status)
@@ -168,7 +189,7 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 	for i := range groups {
 		groups[i] = GroupCol{Attr: r.str()}
 	}
-	aggs, ok := readAggSpecs(r, reqID, write)
+	aggs, ok := readAggSpecs(r, reqID, write, false)
 	if !ok {
 		return
 	}
@@ -178,6 +199,17 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 // streamAggregateBucketed is streamAggregate where each group column may carry a
 // bucket width (opAggregateBucketed).
 func (s *Server) streamAggregateBucketed(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, false, write)
+}
+
+// streamAggregateFiltered is streamAggregateBucketed whose specs carry a per-aggregate
+// filter (opAggregateFiltered). The request shape is otherwise identical, so a filtered
+// plain aggregate rides the bucketed frame with every width zero.
+func (s *Server) streamAggregateFiltered(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, true, write)
+}
+
+func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *reader, includePrivate, filtered bool, write func([]byte)) {
 	table := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -190,16 +222,17 @@ func (s *Server) streamAggregateBucketed(ctx context.Context, reqID uint64, r *r
 		attr := r.str()
 		groups[i] = GroupCol{Attr: attr, BucketWidth: int64(r.u64())}
 	}
-	aggs, ok := readAggSpecs(r, reqID, write)
+	aggs, ok := readAggSpecs(r, reqID, write, filtered)
 	if !ok {
 		return
 	}
 	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write)
 }
 
-// readAggSpecs reads the [nAgg]{[func u8][arg]} tail shared by both aggregate
-// opcodes, writing respBad and returning ok=false on a malformed frame.
-func readAggSpecs(r *reader, reqID uint64, write func([]byte)) ([]AggSpec, bool) {
+// readAggSpecs reads the [nAgg]{[func u8][arg]} tail shared by the aggregate opcodes,
+// writing respBad and returning ok=false on a malformed frame. filtered selects the
+// [func u8][arg][filter] form the *Filtered opcodes carry.
+func readAggSpecs(r *reader, reqID uint64, write func([]byte), filtered bool) ([]AggSpec, bool) {
 	nAgg := int(r.i32())
 	if nAgg < 0 || nAgg > 1024 {
 		write(respBad(reqID))
@@ -208,6 +241,9 @@ func readAggSpecs(r *reader, reqID uint64, write func([]byte)) ([]AggSpec, bool)
 	aggs := make([]AggSpec, nAgg)
 	for i := range aggs {
 		aggs[i] = AggSpec{Func: AggFunc(r.u8()), Arg: r.str()}
+		if filtered {
+			aggs[i].Filter = r.str()
+		}
 	}
 	if r.err != nil {
 		write(respBad(reqID))
@@ -215,6 +251,36 @@ func readAggSpecs(r *reader, reqID uint64, write func([]byte)) ([]AggSpec, bool)
 	}
 	return aggs, true
 }
+
+// anyFiltered reports whether some spec carries a per-aggregate filter, which is what makes
+// a client reach for the newer opcode. Without one the request goes out on the original
+// opcode, so an older server keeps serving it.
+func anyFiltered(aggs []AggSpec) bool {
+	for _, a := range aggs {
+		if a.Filter != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// putAggSpecs writes the [nAgg]{[func u8][arg]([filter])} tail.
+func putAggSpecs(b []byte, aggs []AggSpec, filtered bool) []byte {
+	b = putI32(b, int32(len(aggs)))
+	for _, a := range aggs {
+		b = putStr(putU8(b, byte(a.Func)), a.Arg)
+		if filtered {
+			b = putStr(b, a.Filter)
+		}
+	}
+	return b
+}
+
+// ErrFilteredAggregateUnsupported is returned when the server is too old to know the
+// filtered-aggregate opcodes. The caller must NOT retry without the filters: the answer
+// would be an unfiltered aggregate, which is wrong rather than merely slower.
+var ErrFilteredAggregateUnsupported = errors.New(
+	"dbrpc: server does not support per-aggregate FILTER")
 
 // aggregate is the shared GROUP BY core for both aggregate opcodes: it refuses
 // private attributes for an unprivileged connection, projects only the attributes
@@ -232,6 +298,13 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 			if a.Arg != "*" && classad.IsPrivateAttribute(a.Arg) {
 				write(respErr(reqID, "cannot aggregate private attribute "+a.Arg))
 				return
+			}
+			// A filter reads attributes too, and its count would leak them.
+			for _, ref := range db.AggFilterAttrs(a.Filter) {
+				if classad.IsPrivateAttribute(ref) {
+					write(respErr(reqID, "cannot filter on private attribute "+ref))
+					return
+				}
 			}
 		}
 	}
@@ -251,7 +324,7 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	// (parent-only) ads, which a match-all scan excludes but Len() counts (a chained job_queue
 	// has them; a flat table like Startd does not). Mirrors ArchiveTable.Aggregate.
 	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		db.IsMatchAll(constraint) && !d.Chained() {
+		aggs[0].Filter == "" && db.IsMatchAll(constraint) && !d.Chained() {
 		frame := respHead(reqID, stStream)
 		frame = putStr(frame, strconv.Itoa(d.Len()))
 		write(frame)
@@ -264,7 +337,7 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	// eligible. CountConstraint returns ok=false otherwise (schema-scan off, or a predicate the
 	// columnar path can't handle), and we fall through to the projected scan.
 	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		!db.IsMatchAll(constraint) {
+		aggs[0].Filter == "" && !db.IsMatchAll(constraint) {
 		if n, ok := d.CountConstraint(constraint); ok {
 			frame := respHead(reqID, stStream)
 			frame = putStr(frame, strconv.Itoa(n))
@@ -279,7 +352,11 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		write(respErr(reqID, err.Error()))
 		return
 	}
-	rows := db.AggregateValues(seq, groupCols, aggs, groupCol, aggCol, func() bool { return cancelled(ctx) })
+	rows, err := db.AggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, func() bool { return cancelled(ctx) })
+	if err != nil {
+		write(respErr(reqID, err.Error()))
+		return
+	}
 	if cancelled(ctx) {
 		return // client gone mid-scan: nothing left to stream
 	}
