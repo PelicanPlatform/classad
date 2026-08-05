@@ -165,6 +165,17 @@ const (
 	// byte-identical on the wire.
 	opAggregateFiltered        op = 55 // [table][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter]}
 	opArchiveAggregateFiltered op = 56 // [name][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter]}
+
+	// Transaction-scoped reads. Unlike opQuery and opQueryKeys -- which carry no
+	// transaction id and read the committed store -- these run through an open
+	// transaction, so they see its uncommitted writes (read-your-writes). Neither
+	// carries a [table]: the transaction is already bound to one by opBegin.
+	//
+	// Separate opcodes rather than an extra field on the existing ops, so a client
+	// that speaks them fails cleanly (stBadReq -> ErrTxnReadUnsupported) against a
+	// server that does not, instead of the server misparsing a longer frame.
+	opTxnQuery     op = 57 // [txnID u64][limit i32][constraint] -> stream of [adText]
+	opTxnQueryKeys op = 58 // [txnID u64][constraint] -> stream of [key]
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -256,6 +267,10 @@ func (o op) String() string {
 		return "ArchiveAggregate"
 	case opQueryKeys:
 		return "QueryKeys"
+	case opTxnQuery:
+		return "TxnQuery"
+	case opTxnQueryKeys:
+		return "TxnQueryKeys"
 	}
 	return "op(unknown)"
 }

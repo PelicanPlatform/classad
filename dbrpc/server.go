@@ -447,6 +447,10 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.streamArchiveAggregateFiltered(reqID, body)
 	case opQueryKeys:
 		sc.s.streamQueryKeys(sc.ctx, reqID, body, sc.write)
+	case opTxnQuery:
+		sc.s.streamTxnQuery(sc.ctx, reqID, body, priv, sc.write)
+	case opTxnQueryKeys:
+		sc.s.streamTxnQueryKeys(sc.ctx, reqID, body, sc.write)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
