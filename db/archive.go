@@ -345,6 +345,18 @@ func (t *ArchiveTable) CategoricalGroupCountsWhere(attr, constraint string) (map
 	return t.a.CategoricalGroupCountsWhere(attr, constraint)
 }
 
+// MergeOptions tunes a merge pass over an archive; see collections.MergeOptions. The zero
+// value is usable and fills in defaults.
+type MergeOptions = collections.MergeOptions
+
+// MergePass merges cold segment runs when the archive has reached its trigger watermark,
+// down to its target. Returns the number of merges performed.
+//
+// An append-only table never compacts, so its segment count only grows, and every sealed
+// segment costs a memory mapping at open. This is what bounds that; without it running, the
+// count climbs until the daemon cannot start.
+func (t *ArchiveTable) MergePass(opts MergeOptions) int { return t.a.MergePass(opts) }
+
 // Count is the number of records currently retained (reduced by rotation).
 func (t *ArchiveTable) Count() int { return t.a.Count() }
 

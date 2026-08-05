@@ -266,6 +266,7 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 					s.maintainMu.Unlock()
 				}
 			}
+			s.maintainArchives(opts)
 			// Keep the duty cycle under the cap: wait at least pass/dutyCycle before the
 			// next pass, never less than the configured floor.
 			next := interval
@@ -1462,3 +1463,38 @@ func respErr(reqID uint64, msg string) []byte {
 	return putStr(respHead(reqID, stErr), msg)
 }
 func respBad(reqID uint64) []byte { return resp(reqID, stBadReq) }
+
+// maintainArchives runs the append-only side of a maintenance pass. Archive tables are a
+// separate catalog namespace, so the loop over cat.Tables() above does not reach them -- and
+// until it did, nothing ever ran on an archive: no merge, no reindex, no tuning.
+//
+// That omission matters more for an archive than it would for a mutable table. An
+// append-only table never compacts, so its segment count only grows, and every sealed
+// segment costs a memory mapping at open plus a second for its sidecar. Exhausting
+// vm.max_map_count stops the daemon STARTING, and the condition is not self-correcting: with
+// nothing merging, the count only rises, and the symptom does not appear until a restart.
+//
+// The work is deliberately narrow -- merge cold runs, and rebuild indexes left stale by an
+// interrupted pass. Retraining and rewriting are excluded: both re-encode the whole archive,
+// which is not something to do on a timer.
+func (s *Server) maintainArchives(opts db.MaintainOptions) {
+	if opts.ArchiveMergeDisabled {
+		return
+	}
+	for _, name := range s.cat.ArchiveTables() {
+		a, ok := s.cat.ArchiveTable(name)
+		if !ok {
+			continue
+		}
+		s.maintainMu.Lock()
+		// Below its trigger watermark this is a segment count and a comparison, so the
+		// common case costs nothing.
+		a.MergePass(opts.ArchiveMerge)
+		// A merge leaves its output without a sidecar, and an interrupted reindex leaves
+		// segments stale; either way queries fall back to scanning until it is rebuilt.
+		if stale, _ := a.StaleIndexSegments(); stale > 0 {
+			a.Reindex()
+		}
+		s.maintainMu.Unlock()
+	}
+}
