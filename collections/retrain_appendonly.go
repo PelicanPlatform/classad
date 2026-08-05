@@ -139,7 +139,37 @@ type resealEntry struct {
 // (with the same logical id as src) or nil on any error. The source is immutable (sealed
 // or retired from the write path), so it is read without the shard lock.
 func (c *Collection) resealOneSegment(sh *shard, src *segment, targetCodec Codec) *segment {
-	if src == nil || src.used == 0 {
+	return c.resealSegments(sh, []*segment{src}, targetCodec)
+}
+
+// resealSegments builds ONE new segment holding every record of srcs, in order, re-encoded
+// under targetCodec and the current hot set. With a single source it is a reseal in place;
+// with several adjacent ones it is a merge, which is how an archive keeps its segment count
+// (and therefore its mmap count) bounded as it grows.
+//
+// The new segment takes srcs[0]'s id, so it keeps the lowest source's position: segment order
+// is append order, and on reopen ids are re-derived from file order, so the merged file must
+// sort where its oldest input did. Record seq, key, and time markers are carried across
+// unchanged, which is what keeps watch cursors (a commit-sequence vector, not a physical
+// position) valid over a merge.
+//
+// Returns nil on any failure, leaving the caller to keep the originals -- merging is
+// best-effort maintenance, never a correctness dependency.
+func (c *Collection) resealSegments(sh *shard, srcs []*segment, targetCodec Codec) *segment {
+	return c.resealSegmentsAs(sh, srcs, targetCodec, "seg")
+}
+
+// resealSegmentsAs is resealSegments writing its output under an explicit file-name prefix,
+// so a merge can stage the result where recovery will not see it until it is renamed.
+func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Codec, prefix string) *segment {
+	live := srcs[:0:0]
+	for _, s := range srcs {
+		if s != nil && s.used > 0 {
+			live = append(live, s)
+		}
+	}
+	srcs = live
+	if len(srcs) == 0 {
 		return nil
 	}
 	// A persistent collection reseals INTERNED: records carry segment-local ids against a
@@ -172,41 +202,43 @@ func (c *Collection) resealOneSegment(sh *shard, src *segment, targetCodec Codec
 	var entries []resealEntry
 	total := 0
 	var wireBuf []byte
-	for off := 0; off < src.used; {
-		o := uint32(off)
-		rl := recTotalLen(src.data, o)
-		if rl == 0 {
-			break
-		}
-		if recIsMarker(src.data, o) {
+	for _, src := range srcs {
+		for off := 0; off < src.used; {
+			o := uint32(off)
+			rl := recTotalLen(src.data, o)
+			if rl == 0 {
+				break
+			}
+			if recIsMarker(src.data, o) {
+				seq := recSeq(src.data, o)
+				millis := recMarkerMillis(src.data, o)
+				entries = append(entries, resealEntry{seq: seq, marker: true, millis: millis})
+				total += recordLen(0, 8)
+				off += int(rl)
+				continue
+			}
 			seq := recSeq(src.data, o)
-			millis := recMarkerMillis(src.data, o)
-			entries = append(entries, resealEntry{seq: seq, marker: true, millis: millis})
-			total += recordLen(0, 8)
+			key := append([]byte(nil), recKey(src.data, o)...)
+			wireBytes, err := src.codec.Decompress(nil, recAd(src.data, o))
+			if err != nil {
+				return nil
+			}
+			ad, err := c.decodeWireDict(src.dict.Load(), wireBytes) // honor the source's own encoding
+			if err != nil {
+				return nil
+			}
+			var stored []byte
+			if intern {
+				wireBuf = c.encodeInterned(wireBuf[:0], ad, table, hot)
+				refreshHot()
+				stored = targetCodec.Compress(nil, wireBuf)
+			} else {
+				stored = targetCodec.Compress(nil, c.encodeAd(ad))
+			}
+			entries = append(entries, resealEntry{seq: seq, key: key, stored: stored})
+			total += recordLen(len(key), len(stored))
 			off += int(rl)
-			continue
 		}
-		seq := recSeq(src.data, o)
-		key := append([]byte(nil), recKey(src.data, o)...)
-		wireBytes, err := src.codec.Decompress(nil, recAd(src.data, o))
-		if err != nil {
-			return nil
-		}
-		ad, err := c.decodeWireDict(src.dict.Load(), wireBytes) // honor the source's own encoding
-		if err != nil {
-			return nil
-		}
-		var stored []byte
-		if intern {
-			wireBuf = c.encodeInterned(wireBuf[:0], ad, table, hot)
-			refreshHot()
-			stored = targetCodec.Compress(nil, wireBuf)
-		} else {
-			stored = targetCodec.Compress(nil, c.encodeAd(ad))
-		}
-		entries = append(entries, resealEntry{seq: seq, key: key, stored: stored})
-		total += recordLen(len(key), len(stored))
-		off += int(rl)
 	}
 	if total == 0 {
 		return nil
@@ -224,10 +256,10 @@ func (c *Collection) resealOneSegment(sh *shard, src *segment, targetCodec Codec
 	size := recAlign(total)
 	var newseg *segment
 	if sh.alloc == nil {
-		newseg = newSegment(src.id, size, targetCodec)
+		newseg = newSegment(srcs[0].id, size, targetCodec)
 		newseg.pinReap = sh.sealRAM
 	} else {
-		s, err := sh.alloc(src.id, size, targetCodec)
+		s, err := sh.allocNamed(srcs[0].id, size, targetCodec, prefix)
 		if err != nil {
 			return nil
 		}

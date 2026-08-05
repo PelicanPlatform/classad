@@ -247,7 +247,10 @@ func Open(opts Options) (*Collection, error) {
 			return nil, fmt.Errorf("recover shard %d: %w", i, err)
 		}
 		counter := maxNum
-		sh.alloc = func(id uint32, size int, codec Codec) (*segment, error) {
+		// allocNamed builds a segment file under prefix. "seg" is the live form recovery
+		// loads; any other prefix is invisible to it (loadShard only parses "seg-N.dX.dat"),
+		// which is what lets a merge stage its output durably before anything can see it.
+		sh.allocNamed = func(id uint32, size int, codec Codec, prefix string) (*segment, error) {
 			n := atomic.AddUint64(&counter, 1)
 			dictID, ok := c.dicts.idFor(codec)
 			if !ok {
@@ -255,8 +258,12 @@ func Open(opts Options) (*Collection, error) {
 				// RetrainDict, both registered; fall back to the base codec's id.
 				dictID = 0
 			}
-			path := filepath.Join(shardDir, fmt.Sprintf("seg-%d.d%d.dat", n, dictID))
+			path := filepath.Join(shardDir, fmt.Sprintf("%s-%d.d%d.dat", prefix, n, dictID))
 			return newMmapSegment(id, size, codec, path)
+		}
+		sh.segDir = shardDir
+		sh.alloc = func(id uint32, size int, codec Codec) (*segment, error) {
+			return sh.allocNamed(id, size, codec, "seg")
 		}
 	}
 	// Recovery is complete: every live segment's codec is known, so dictionaries only
@@ -281,6 +288,9 @@ func Open(opts Options) (*Collection, error) {
 // which is commit order), scans each for its written extent, and rebuilds the
 // shard's directory. Returns the highest segment file number seen.
 func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
+	// Complete any merge a crash interrupted, so the directory below is never a half-merged
+	// mixture of a merged segment and the sources it replaced.
+	finishPendingMerges(shardDir)
 	entries, err := os.ReadDir(shardDir)
 	if err != nil {
 		return 0, err

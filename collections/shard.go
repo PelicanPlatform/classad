@@ -68,8 +68,13 @@ type shard struct {
 	// segments); for a persistent shard it creates an mmap-backed segment file.
 	// writeErr is the first segment-allocation failure (sticky; guarded by mu),
 	// surfaced to the caller by Put/Update.
-	alloc    func(id uint32, size int, codec Codec) (*segment, error)
-	writeErr error
+	alloc func(id uint32, size int, codec Codec) (*segment, error)
+	// allocNamed is alloc with an explicit file-name prefix, so a merge can stage its
+	// output under a name recovery ignores. segDir is the shard's directory (for the
+	// merge intent marker). Both nil/empty for an in-memory shard.
+	allocNamed func(id uint32, size int, codec Codec, prefix string) (*segment, error)
+	segDir     string
+	writeErr   error
 	// sealRAM, when true, makes this (in-memory) shard's RAM segments seal their sealed
 	// index to an anonymous mmap sidecar rather than keep it on the Go heap. It also makes
 	// those RAM segments participate in pin/reap (see segment.mapped): the anon mapping is
