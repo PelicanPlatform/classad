@@ -15,32 +15,32 @@ func TestSegmentSidecarContainer(t *testing.T) {
 	col := []byte("COLX-columnar-block-payload-bytes")
 
 	// v2: all three sections round-trip.
-	c2 := buildSegmentSidecar(attr, key, col)
+	c2 := buildSegmentSidecar(attr, key, col, nil, 0)
 	if binary.LittleEndian.Uint32(c2[len(c2)-4:]) != sidecarContainerMagicV2 {
 		t.Fatal("v2 container: wrong trailing magic")
 	}
-	a, k, cc, ok := splitSegmentSidecar(c2)
+	a, k, cc, _, ok := splitSegmentSidecar(c2)
 	if !ok || !bytes.Equal(a, attr) || !bytes.Equal(k, key) || !bytes.Equal(cc, col) {
 		t.Fatalf("v2 split: ok=%v attr=%q key=%q col=%q", ok, a, k, cc)
 	}
 
 	// Empty col writes the v1 layout byte-for-byte (identical to a pre-columnar sidecar): trailing
 	// magic is SCNT, length is attr+key+12, and split returns col == nil.
-	c1 := buildSegmentSidecar(attr, key, nil)
+	c1 := buildSegmentSidecar(attr, key, nil, nil, 0)
 	if binary.LittleEndian.Uint32(c1[len(c1)-4:]) != sidecarContainerMagic {
 		t.Fatal("empty col should write the v1 magic")
 	}
 	if len(c1) != len(attr)+len(key)+sidecarTrailerLen {
 		t.Fatalf("v1 length = %d, want %d", len(c1), len(attr)+len(key)+sidecarTrailerLen)
 	}
-	a, k, cc, ok = splitSegmentSidecar(c1)
+	a, k, cc, _, ok = splitSegmentSidecar(c1)
 	if !ok || !bytes.Equal(a, attr) || !bytes.Equal(k, key) || cc != nil {
 		t.Fatalf("v1 split: ok=%v attr=%q key=%q col=%v (want col nil)", ok, a, k, cc)
 	}
 
 	// Empty attr (no attribute index) still frames correctly alongside a columnar block.
-	c3 := buildSegmentSidecar(nil, key, col)
-	a, k, cc, ok = splitSegmentSidecar(c3)
+	c3 := buildSegmentSidecar(nil, key, col, nil, 0)
+	a, k, cc, _, ok = splitSegmentSidecar(c3)
 	if !ok || len(a) != 0 || !bytes.Equal(k, key) || !bytes.Equal(cc, col) {
 		t.Fatalf("empty-attr split: ok=%v attr=%q key=%q col=%q", ok, a, k, cc)
 	}
@@ -57,8 +57,58 @@ func TestSegmentSidecarContainer(t *testing.T) {
 			return b
 		}(),
 	} {
-		if _, _, _, ok := splitSegmentSidecar(bad); ok {
+		if _, _, _, _, ok := splitSegmentSidecar(bad); ok {
 			t.Errorf("malformed container parsed as ok: %q", bad)
 		}
+	}
+}
+
+// TestSidecarContainerZones covers the v3 section: a zone map round-trips, and the three
+// older container shapes still parse (a sidecar written before v3 must keep working, since
+// the whole point is that a missing zone section falls back to recomputation rather than
+// failing).
+func TestSidecarContainerZones(t *testing.T) {
+	attr := []byte("ATTRBLOB")
+	key := []byte("KEYBLOB!")
+	col := []byte("COLBLOB!")
+	zones := map[uint32]zoneRange{7: {Min: -1.5, Max: 100}, 3: {Min: 0, Max: 0}}
+
+	c4 := buildSegmentSidecar(attr, key, col, buildZoneBlob(zones), 4096)
+	a, k, cc, z, ok := splitSegmentSidecar(c4)
+	if !ok {
+		t.Fatal("v3 container did not parse")
+	}
+	if string(a) != string(attr) || string(k) != string(key) || string(cc) != string(col) {
+		t.Fatalf("sections mangled: attr=%q key=%q col=%q", a, k, cc)
+	}
+	got, ok := parseZoneBlob(z)
+	if !ok {
+		t.Fatal("zone section did not parse")
+	}
+	if len(got) != len(zones) {
+		t.Fatalf("zones = %v, want %v", got, zones)
+	}
+	for id, want := range zones {
+		if got[id] != want {
+			t.Errorf("zone %d = %v, want %v", id, got[id], want)
+		}
+	}
+
+	// No zones: stays at the older shape, and yields a nil zone section.
+	if _, _, _, z2, ok := splitSegmentSidecar(buildSegmentSidecar(attr, key, col, nil, 0)); !ok || z2 != nil {
+		t.Errorf("container without zones: ok=%v zone=%v, want ok and nil", ok, z2)
+	}
+
+	// A malformed zone section must be rejected, not half-decoded: a wrong [min,max] would
+	// silently prune segments that hold matches.
+	for _, bad := range [][]byte{{}, {1, 0, 0, 0}, append([]byte{1, 0, 0, 0}, make([]byte, 19)...)} {
+		if _, ok := parseZoneBlob(bad); ok {
+			t.Errorf("parseZoneBlob(%v) accepted a malformed section", bad)
+		}
+	}
+	// min > max is impossible for a real zone map and must be refused.
+	bad := buildZoneBlob(map[uint32]zoneRange{1: {Min: 5, Max: 1}})
+	if _, ok := parseZoneBlob(bad); ok {
+		t.Error("parseZoneBlob accepted min > max")
 	}
 }

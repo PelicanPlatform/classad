@@ -134,12 +134,13 @@ func (c *Collection) persistColSeg(sh *shard, seg *segment) {
 	if err != nil {
 		return
 	}
-	attr, key, _, ok := splitSegmentSidecar(data)
+	attr, key, _, zone, ok := splitSegmentSidecar(data)
 	if !ok {
 		_ = closer()
 		return
 	}
-	container := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...), colBlob)
+	container := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...), colBlob,
+		append([]byte(nil), zone...), seg.used)
 	_ = closer()
 	c.installSidecar(sh, seg, path, container)
 }

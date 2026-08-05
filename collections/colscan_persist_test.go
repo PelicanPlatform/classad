@@ -170,10 +170,28 @@ func TestSchemaScanReloadCorruptSection(t *testing.T) {
 		if e != nil || len(b) < sidecarTrailerLenV2+colSectionHdr+1 {
 			return nil
 		}
-		if binary.LittleEndian.Uint32(b[len(b)-4:]) != sidecarContainerMagicV2 {
+		// Locate the columnar section by its recorded length rather than by position: a v3
+		// container appends a zone section after it, so "just before the trailer" is no
+		// longer the col body.
+		var attrLen, keyLen, colLen int
+		switch binary.LittleEndian.Uint32(b[len(b)-4:]) {
+		case sidecarContainerMagicV3:
+			t := b[len(b)-sidecarTrailerLenV3:]
+			attrLen = int(binary.LittleEndian.Uint32(t[0:]))
+			keyLen = int(binary.LittleEndian.Uint32(t[4:]))
+			colLen = int(binary.LittleEndian.Uint32(t[8:]))
+		case sidecarContainerMagicV2:
+			t := b[len(b)-sidecarTrailerLenV2:]
+			attrLen = int(binary.LittleEndian.Uint32(t[0:]))
+			keyLen = int(binary.LittleEndian.Uint32(t[4:]))
+			colLen = int(binary.LittleEndian.Uint32(t[8:]))
+		default:
 			return nil // v1 (no columnar section)
 		}
-		b[len(b)-sidecarTrailerLenV2-1] ^= 0xFF // last byte of the col body
+		if colLen == 0 {
+			return nil
+		}
+		b[attrLen+keyLen+colLen-1] ^= 0xFF // last byte of the col body
 		if e := os.WriteFile(p, b, 0o644); e != nil {
 			t.Fatal(e)
 		}
@@ -181,7 +199,7 @@ func TestSchemaScanReloadCorruptSection(t *testing.T) {
 		return nil
 	})
 	if corrupted == "" {
-		t.Fatal("no v2 (columnar) sidecar found to corrupt")
+		t.Fatal("no sidecar with a columnar section found to corrupt")
 	}
 
 	before := colSegmentBuilds.Load()
