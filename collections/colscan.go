@@ -324,11 +324,10 @@ func (c *Collection) schemaScanCount(fieldID uint32, bc *blockCache, eval func(f
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
 			cs := w.seg.colblk.Load()
-			bs := (*adSchema)(nil)
 			bidx := -1
 			if cs != nil {
 				if idx, ok := cs.block.schema.byID[fieldID]; ok && cs.block.schema.fields[idx].kind == akInt {
-					bs, bidx = cs.block.schema, idx
+					bidx = idx
 				}
 			}
 			if bidx < 0 {
@@ -346,10 +345,10 @@ func (c *Collection) schemaScanCount(fieldID uint32, bc *blockCache, eval func(f
 					}
 					return
 				}
-				if rec, err := cs.block.reconstruct(k, bc); err == nil { // escaped: cold tail
-					if f, ok := numFieldOf(bs, rec, fieldID); ok && eval(f) {
-						count++
-					}
+				// Escaped: read only fieldID from the cold tail, not the whole record. (numFieldOf
+				// via a full reconstruct dominated the scan when a numeric attr has a value tail.)
+				if f, ok, err := cs.block.escapedNumField(k, fieldID, bc); err == nil && ok && eval(f) {
+					count++
 				}
 			})
 		}
@@ -391,19 +390,4 @@ func bruteNumCount(w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), 
 		off += int(total)
 	}
 	return count
-}
-
-// numFieldOf returns the numeric value (int or real) of fieldID in a reconstructed schema
-// record, if present as a number (missing or non-numeric ⇒ false).
-func numFieldOf(s *adSchema, rec []byte, fieldID uint32) (float64, bool) {
-	var out float64
-	var found bool
-	s.forEach(rec, func(id uint32, node []byte) bool {
-		if id != fieldID {
-			return true
-		}
-		out, found = literalFloat(node)
-		return false
-	})
-	return out, found
 }
