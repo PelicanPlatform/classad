@@ -213,8 +213,66 @@ func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 	for i := 0; i < len(nums) && i < hotTopN; i++ {
 		hot = append(hot, nums[i].idx)
 	}
+	// Re-fit the hot int columns to (near-)zero escapes: an escaped value on a queried column
+	// forces the block's cold-stream decompression + a cold-tail walk, so a hot field wants a
+	// width that covers essentially all its values. Cold fields keep the tight base width. See
+	// refitHotIntWidths.
+	s, hot = refitHotIntWidths(s, samples, hot, hotIntFit)
 	c.EnableSchemaScan(s, hot)
 	return true
+}
+
+// hotIntFit is the width fit percentile for HOT (demand-queried) int columns: high enough to
+// eliminate escapes on real data, but below 1.0 so a single sampled outlier does not widen the
+// column for every record (0.999 and 1.0 pick identical widths on the OSPool corpus, but 0.999
+// caps an outlier's blast radius at 0.1%). Cold columns keep the base Fit (0.95).
+const hotIntFit = 0.999
+
+// refitHotIntWidths widens each hot INT field to cover ~all its sampled values (hotFit), so a
+// queried column rarely escapes to the cold path. It re-collects the hot fields' sampled int
+// values (buildAdSchema discards them), re-chooses their widths at hotFit, and re-lays-out the
+// schema; cold fields and non-int hot fields are untouched. Returns the re-fitted schema and the
+// hot field indices remapped into its (re-sorted) layout. A no-op when no hot int field exists.
+func refitHotIntWidths(s *adSchema, samples [][]byte, hot []int, hotFit float64) (*adSchema, []int) {
+	hotByID := make(map[uint32]bool, len(hot)) // all hot fields (int+real), for index remap
+	hotIntIDs := map[uint32]bool{}             // hot int fields, for width re-fit
+	for _, i := range hot {
+		hotByID[s.fields[i].id] = true
+		if s.fields[i].kind == akInt {
+			hotIntIDs[s.fields[i].id] = true
+		}
+	}
+	if len(hotIntIDs) == 0 {
+		return s, hot
+	}
+	vals := map[uint32][]int64{}
+	for _, w := range samples {
+		wire.Ad(w).ForEach(func(id uint32, node []byte) bool {
+			if hotIntIDs[id] {
+				if k, lit := nodeKind(node); k == akInt {
+					vals[id] = append(vals[id], lit.Int)
+				}
+			}
+			return true
+		})
+	}
+	fs := make([]adField, len(s.fields))
+	copy(fs, s.fields)
+	for i := range fs {
+		if hotIntIDs[fs[i].id] {
+			if vs := vals[fs[i].id]; len(vs) > 0 {
+				fs[i].width, fs[i].unsigned = chooseIntWidth(vs, hotFit)
+			}
+		}
+	}
+	s2 := layoutSchema(fs)
+	var hot2 []int
+	for i := range s2.fields {
+		if hotByID[s2.fields[i].id] {
+			hot2 = append(hot2, i)
+		}
+	}
+	return s2, hot2
 }
 
 // CountConstraint parses a constraint string and, if it is columnar-eligible, counts via the
