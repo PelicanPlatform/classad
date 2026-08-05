@@ -22,6 +22,9 @@ type decoder struct {
 	resolve func(uint32) (string, bool) // id -> name (unused in inline mode)
 	inline  bool                        // attribute keys are inline names
 	open    Sealer                      // decrypts nEncrypted nodes; nil => they are errors
+	// oldStrings renders string literals for old-ClassAd text rather than mirroring
+	// ast.Expr.String(). Set by the AppendNodeText*Old renderers; see AppendNodeTextOld.
+	oldStrings bool
 }
 
 // Decode parses an ad encoded with Encode or EncodeInline. Interned ads resolve

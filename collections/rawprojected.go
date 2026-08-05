@@ -380,7 +380,7 @@ func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 		p.buf = append(p.buf, name...)
 		p.buf = append(p.buf, ' ', '=', ' ')
 		var aerr error
-		p.buf, aerr = wire.AppendNodeTextInline(p.buf, node)
+		p.buf, aerr = wire.AppendNodeTextInlineOld(p.buf, node)
 		if aerr != nil {
 			good = false
 			return false

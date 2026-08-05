@@ -25,6 +25,26 @@ func AppendNodeTextInline(dst, node []byte) ([]byte, error) {
 	return d.appendNode(dst, 0)
 }
 
+// AppendNodeTextOld is AppendNodeText rendering string literals for OLD-ClassAd text,
+// whose tokenizer does no escape processing (C++ Lexer::tokenizeStringOld: only a
+// backslash before the closing quote is a sequence).
+//
+// The distinction is not cosmetic. AppendNodeText mirrors ast.Expr.String(), which escapes
+// backslashes, tabs and newlines for the new-ClassAd reader that unescapes them. Feeding
+// that text to an old-ClassAd reader, as every raw-projection consumer does, doubles a
+// backslash on each round trip -- so a caller emitting old text must use this.
+func AppendNodeTextOld(dst, node []byte, t *InternTable) ([]byte, error) {
+	d := &decoder{b: node, resolve: t.Name, oldStrings: true}
+	return d.appendNode(dst, 0)
+}
+
+// AppendNodeTextInlineOld is AppendNodeTextInline with old-ClassAd string quoting; see
+// AppendNodeTextOld for why the dialect has to be chosen explicitly.
+func AppendNodeTextInlineOld(dst, node []byte) ([]byte, error) {
+	d := &decoder{b: node, inline: true, oldStrings: true}
+	return d.appendNode(dst, 0)
+}
+
 // appendNode appends one expression node's text to dst, mirroring decoder.node
 // (which builds an ast.Expr) and the ast String() methods it would call. Keeping
 // the two walks structurally identical is deliberate: any node shape decode.go
@@ -62,6 +82,9 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 		s, err := d.readStringBytes()
 		if err != nil {
 			return dst, err
+		}
+		if d.oldStrings {
+			return ast.AppendQuoteStringOldBytes(dst, s), nil
 		}
 		return ast.AppendQuoteStringBytes(dst, s), nil
 	case nAttrRef, nAttrRefStr:
