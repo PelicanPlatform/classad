@@ -51,6 +51,19 @@ type MergeOptions struct {
 	// MaxMerges bounds one pass, so maintenance stays interruptible and a large backlog is
 	// worked down over several passes instead of one long stall.
 	MaxMerges int
+	// MaxBytesPerPass bounds the SOURCE bytes one pass rewrites. MaxMerges alone does not
+	// bound the work, because a merge's cost is its inputs' size, not its count -- one pass
+	// of large runs can move orders of magnitude more than another of the same length.
+	//
+	// This exists for the catch-up case: an archive that grew while merging was off has a
+	// backlog measured in the size of the archive, and without a byte bound the first pass
+	// would try to rewrite all of it at once. Steady state does not need it -- a pass stops
+	// at the low watermark long before this -- so the default is sized to cap one pass at a
+	// tolerable stall (~25s at the ~160 MB/s merging sustains) rather than to throttle.
+	//
+	// Sustained RATE is the scheduler's job, not this: pace passes so the long-run average
+	// stays within the byte budget the deployment allows.
+	MaxBytesPerPass int64
 }
 
 const (
@@ -63,6 +76,7 @@ const (
 	defaultMaxRun          = 64
 	defaultKeepRecent      = 16
 	defaultMaxMerges       = 64
+	defaultMaxBytesPerPass = 4 << 30 // ~25s of merging at the measured throughput
 )
 
 func (o MergeOptions) withDefaults() MergeOptions {
@@ -86,6 +100,9 @@ func (o MergeOptions) withDefaults() MergeOptions {
 	}
 	if o.MaxMerges <= 0 {
 		o.MaxMerges = defaultMaxMerges
+	}
+	if o.MaxBytesPerPass <= 0 {
+		o.MaxBytesPerPass = defaultMaxBytesPerPass
 	}
 	return o
 }
@@ -117,15 +134,21 @@ func (c *Collection) mergePass(opts MergeOptions) int {
 		return 0 // below the high watermark: leave it alone
 	}
 	merges := 0
-	for merges < opts.MaxMerges {
-		run, ok := c.nextMergeRun(opts)
+	var moved int64
+	for merges < opts.MaxMerges && moved < opts.MaxBytesPerPass {
+		run, ok := c.nextMergeRun(opts, opts.MaxBytesPerPass-moved)
 		if !ok {
 			break
+		}
+		var runBytes int64
+		for _, s := range run {
+			runBytes += int64(s.used)
 		}
 		if !c.mergeSegments(c.shards[0], run) {
 			break // a failed merge leaves its sources in place; do not spin on them
 		}
 		merges++
+		moved += runBytes
 	}
 	if merges > 0 {
 		// The merged segments have no sidecar yet; build them so queries do not fall back
@@ -141,7 +164,10 @@ func (c *Collection) mergePass(opts MergeOptions) int {
 // Oldest-first is deliberate: the oldest data is the coldest, so merging it disturbs the
 // fewest queries and the page cache least, and it produces the size gradient the two
 // competing constraints want -- large at the tail of the archive, small at its head.
-func (c *Collection) nextMergeRun(opts MergeOptions) ([]*segment, bool) {
+// remaining is what is left of the pass's byte budget; a run is capped by it as well as by
+// MaxSegmentBytes, so a pass overshoots its budget by at most the last segment it adds rather
+// than by a whole run -- which, with a large target, can be the entire archive.
+func (c *Collection) nextMergeRun(opts MergeOptions, remaining int64) ([]*segment, bool) {
 	sh := c.shards[0]
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
@@ -181,6 +207,14 @@ func (c *Collection) nextMergeRun(opts MergeOptions) ([]*segment, bool) {
 		want = opts.MaxSegmentBytes
 	}
 
+	sizeCap := opts.MaxSegmentBytes
+	if remaining > 0 && remaining < sizeCap {
+		sizeCap = remaining
+	}
+	if want > sizeCap {
+		want = sizeCap
+	}
+
 	var run []*segment
 	var bytes int64
 	for _, s := range eligible {
@@ -192,7 +226,7 @@ func (c *Collection) nextMergeRun(opts MergeOptions) ([]*segment, bool) {
 		if len(run) == 0 && sz >= want {
 			continue
 		}
-		if len(run) > 0 && (bytes+sz > opts.MaxSegmentBytes || len(run) >= opts.MaxRun) {
+		if len(run) > 0 && (bytes+sz > sizeCap || len(run) >= opts.MaxRun) {
 			break // this run is as large as it may get
 		}
 		run = append(run, s)

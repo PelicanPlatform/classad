@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
 // Segment merging for append-only (archive) collections.
@@ -33,6 +34,14 @@ import (
 // is removed, so no window can lose records. The cost of that choice is that a crash can
 // leave the target and its sources briefly coexisting, which recovery resolves by completing
 // the merge rather than by trying to detect duplicates after the fact.
+
+// mergedBytes accumulates the source bytes every completed merge has rewritten. Merging is
+// the only maintenance that rewrites archive data, so this is what a byte budget for it has
+// to be sized against.
+var mergedBytes atomic.Int64
+
+// MergedBytes reports the total source bytes rewritten by merges since this process started.
+func MergedBytes() int64 { return mergedBytes.Load() }
 
 const (
 	mergeTmpPrefix    = "tmp-merge"
@@ -105,6 +114,11 @@ func (c *Collection) mergeSegments(sh *shard, run []*segment) bool {
 		}
 	}
 	sh.mu.Unlock()
+	var moved int64
+	for _, s := range run {
+		moved += int64(s.used)
+	}
+	mergedBytes.Add(moved)
 	for _, s := range toReap {
 		s.reapAndHook() // munmap + unlink, off-lock
 	}

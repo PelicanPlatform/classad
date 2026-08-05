@@ -166,3 +166,36 @@ func newestSealedSegments(t *testing.T, a *Archive, k int) []*segment {
 	}
 	return sealed[len(sealed)-k:]
 }
+
+// TestMergePassByteBudget pins that a pass stops on bytes rewritten, not just on merge count.
+// A merge costs its inputs' size, so bounding the count alone lets one pass of large runs
+// move arbitrarily more than another of the same length -- which is exactly the catch-up case
+// this guards, where the backlog is the size of the archive.
+func TestMergePassByteBudget(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	a := buildMergeArchive(t, dir, 4000)
+	defer a.Close()
+
+	before := MergedBytes()
+	const budget = 40 << 10
+	a.MergePass(MergeOptions{
+		TargetSegments: 1, TriggerSegments: 2, MinMergeBytes: 1,
+		KeepRecent: 0, MaxBytesPerPass: budget,
+	})
+	moved := MergedBytes() - before
+	if moved == 0 {
+		t.Fatal("no merges ran")
+	}
+	// The bound is checked between merges, so one run may overshoot it; what must not happen
+	// is the pass ignoring it and running to the target.
+	if moved > budget*4 {
+		t.Errorf("pass rewrote %d bytes against a %d budget -- the byte bound is not stopping it",
+			moved, budget)
+	}
+	if a.c.Stats().Segments <= 2 {
+		t.Error("pass reached the target despite the byte budget")
+	}
+}
