@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -234,9 +235,17 @@ func (c *Client) sendIDTimed(id uint64, build func(reqID uint64) []byte, stream 
 	return ch, st, nil
 }
 
+// ErrBadRequest is the server's stBadReq: the request was malformed -- which is also how
+// it answers an opcode it does not implement, so a newer client can tell "this server is
+// too old for this op" from a genuine failure without matching on message text.
+var ErrBadRequest = errors.New("dbrpc: bad request")
+
 func statusErr(status int32, body *reader) error {
-	if status == stErr {
+	switch status {
+	case stErr:
 		return &ServerError{Msg: body.str()}
+	case stBadReq:
+		return ErrBadRequest
 	}
 	return fmt.Errorf("dbrpc: status %d", status)
 }

@@ -744,6 +744,37 @@ func (t *Txn) LookupClassAd(key string) (*classad.ClassAd, bool) {
 	return t.tx.Get([]byte(key))
 }
 
+// Query returns the ads matching the constraint as the transaction sees them: the
+// committed rows with the transaction's own buffered writes overlaid, so a query inside
+// a transaction observes work the transaction has not committed yet. DB.Query cannot --
+// it reads the committed store -- which is why a caller that has staged writes and then
+// wants to read them back must go through the transaction.
+//
+// See collections.Txn.Query for the two properties worth knowing: the committed half is
+// read live rather than at the transaction's snapshot (read-committed plus
+// read-your-writes, not full snapshot isolation), and it degrades from an indexed query
+// to a full scan once the transaction has buffered a write. Errors only on a malformed
+// constraint.
+func (t *Txn) Query(constraint string) (iter.Seq[*classad.ClassAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return t.tx.Query(q), nil
+}
+
+// KeysWhere returns the storage keys of the rows matching the constraint as the
+// transaction sees them (DB.KeysWhere with the transaction's writes overlaid). It is
+// what lets an UPDATE or DELETE inside a transaction address a row the transaction
+// itself created. Errors only on a malformed constraint.
+func (t *Txn) KeysWhere(constraint string) (iter.Seq[string], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return t.tx.KeysWhere(q), nil
+}
+
 // LookupAttr returns the unparsed expression of one attribute as the transaction
 // sees it (classad_log.h LookupInTransaction), or ("", false).
 func (t *Txn) LookupAttr(key, name string) (string, bool) {
