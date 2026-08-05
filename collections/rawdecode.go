@@ -180,7 +180,7 @@ func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int, reda
 		buf = append(buf, ' ', '=', ' ')
 		var aerr error
 		if c.inline {
-			buf, aerr = wire.AppendNodeTextInline(buf, node)
+			buf, aerr = wire.AppendNodeTextInlineOld(buf, node)
 		} else {
 			buf, aerr = appendWireValue(buf, node, c.intern)
 		}
@@ -232,5 +232,5 @@ func appendWireValue(dst, node []byte, table *wire.InternTable) ([]byte, error) 
 	}
 	// Non-scalar: a list, record, or computed expression. Render it straight from
 	// the wire (AST-free) instead of decoding an ast.Expr and calling String().
-	return wire.AppendNodeText(dst, node, table)
+	return wire.AppendNodeTextOld(dst, node, table)
 }

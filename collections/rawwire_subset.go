@@ -183,7 +183,7 @@ func RenderRawAdInline(w []byte, buf []byte, offs []int) (outBuf []byte, outOffs
 		buf = append(buf, name...)
 		buf = append(buf, ' ', '=', ' ')
 		var aerr error
-		buf, aerr = wire.AppendNodeTextInline(buf, node)
+		buf, aerr = wire.AppendNodeTextInlineOld(buf, node)
 		if aerr != nil {
 			good = false
 			return false
