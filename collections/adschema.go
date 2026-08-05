@@ -48,7 +48,7 @@ const (
 type adField struct {
 	id       uint32
 	kind     adKind
-	width    int  // int: 1/2/4/8; real/string: 8; bool: 0 (bit-packed)
+	width    int  // int: 1/2/4/6/8; real/string: 8; bool: 0 (bit-packed)
 	unsigned bool // int only
 	boolBit  int  // bool: bit index in the fixed blob's leading bitset
 	off      int  // non-bool: byte offset in the fixed blob
@@ -90,6 +90,8 @@ func intFits(v int64, w int, unsigned bool) bool {
 			return v <= 0xFFFF
 		case 4:
 			return v <= 0xFFFFFFFF
+		case 6:
+			return v <= 0xFFFFFFFFFFFF
 		}
 		return true
 	}
@@ -100,6 +102,8 @@ func intFits(v int64, w int, unsigned bool) bool {
 		return v >= -32768 && v <= 32767
 	case 4:
 		return v >= math.MinInt32 && v <= math.MaxInt32
+	case 6:
+		return v >= -(1<<47) && v <= (1<<47)-1
 	}
 	return true
 }
@@ -114,7 +118,10 @@ func chooseIntWidth(vals []int64, fit float64) (int, bool) {
 			break
 		}
 	}
-	for _, w := range []int{1, 2, 4} {
+	// 6 fills the coarse 4->8 gap: the 4 GB..256 TB range (disk in KB, image sizes) needs more
+	// than 4 bytes but nowhere near 8. putIntLE/readIntLE are width-generic, so a 6-byte column
+	// costs nothing extra to write or scan -- only two bytes less than an 8-byte one.
+	for _, w := range []int{1, 2, 4, 6} {
 		ok := 0
 		for _, v := range vals {
 			if intFits(v, w, unsigned) {
