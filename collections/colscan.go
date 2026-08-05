@@ -98,6 +98,19 @@ func (c *Collection) colBlobForSeg(seg *segment) []byte {
 	return wrapColSection(marshalColSegment(cs, c.intern.Name), seg.used)
 }
 
+// colBlobPreserve returns the sidecar columnar section for seg on a REINDEX (sidecar rewrite),
+// preserving the segment's existing block by re-marshaling it -- a reindex changes the attribute
+// index spec, not the schema the block was built under, so there is no need to re-transcode the
+// records. Falls back to building the block when the segment has none yet but schema-scan is
+// enabled (an index added just after enabling schema-scan). nil when there is nothing to persist.
+func (c *Collection) colBlobPreserve(seg *segment) []byte {
+	cs := seg.colblk.Load()
+	if cs == nil {
+		return c.colBlobForSeg(seg)
+	}
+	return wrapColSection(marshalColSegment(cs, c.intern.Name), seg.used)
+}
+
 // adoptPersistedSchemaScan enables schema-scan on reopen from persisted columnar blocks: if any
 // sealed segment recovered a block (publishSidecar unmarshaled it from the sidecar's col section),
 // the collection adopts one block's schema + hot tier as the current schema-scan state, so

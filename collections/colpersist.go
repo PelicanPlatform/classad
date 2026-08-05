@@ -132,6 +132,14 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 
 // unmarshalColSegment reconstructs a colSegment from marshalColSegment's output, attaching the
 // segment's codec (for later decompression). Returns nil on malformed data.
+//
+// ZERO-COPY: the block's byte streams (hot + the three compressed cold streams) ALIAS data rather
+// than being copied -- the hot column is then scanned strided directly over the mmap, and the cold
+// streams decompress lazily into the bounded block cache only when touched, so a reloaded block
+// adds no per-segment stream heap. This is the same lifetime contract as the mmap'd attribute
+// index (mmapSegIndex): both alias the segment's <seg>.idx mapping, which is released together on
+// reap and re-published together when reindex swaps the sidecar. Callers must therefore keep data
+// (the mapping, or a heap buffer in tests) alive for the block's lifetime.
 func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint32) *colSegment {
 	c := &cursor{b: data}
 	s := readAdSchema(c, internName)
@@ -148,10 +156,10 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	}
 	n := int(c.u32())
 	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n}
-	b.hot = append([]byte(nil), c.bytes()...)
-	b.coldNumComp = append([]byte(nil), c.bytes()...)
-	b.strComp = append([]byte(nil), c.bytes()...)
-	b.coldComp = append([]byte(nil), c.bytes()...)
+	b.hot = c.bytes() // aliases data (the mmap); read-only, scanned in place
+	b.coldNumComp = c.bytes()
+	b.strComp = c.bytes()
+	b.coldComp = c.bytes()
 	b.strOff = readInts(c)
 	b.coldOff = readInts(c)
 	offs := readU32s(c)

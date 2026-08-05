@@ -211,3 +211,69 @@ func TestSchemaScanReloadCorruptSection(t *testing.T) {
 		}
 	}
 }
+
+// TestSchemaScanReindexKeepsBlock exercises the zero-copy block's mapping-swap path: a reindex
+// (AddIndex) rewrites and remaps each sealed segment's sidecar. The columnar block aliases that
+// mapping, so it must be re-published from the new mapping on the swap (like msidx) -- otherwise it
+// would read a released mapping. Query correctness must survive the reindex, and it must NOT
+// re-transcode the block from records (colBlobPreserve re-marshals the existing one).
+func TestSchemaScanReindexKeepsBlock(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 12})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for i := 0; i < 300; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d\nOwner=\"u%d\"", 1+i%8, 1024+(i%64)*256, i%5))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mq, _ := vm.Parse("true")
+	for i := 0; i < 20; i++ {
+		for range c.QueryProject(mq, []string{"Memory"}) {
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(2000, 4) {
+		t.Fatal("BuildAndEnableSchemaScan false")
+	}
+	for i := 300; i < 1500; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d\nOwner=\"u%d\"", 1+i%8, 1024+(i%64)*256, i%5))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	expr := "Memory > 4096"
+	want, ok := c.CountConstraint(expr)
+	if !ok {
+		t.Fatal("CountConstraint declined pre-reindex")
+	}
+
+	// Reindex every sealed segment by adding a categorical index -> reindexSealedFile rewrites and
+	// remaps each sidecar, re-publishing the aliased block from the new mapping.
+	before := colSegmentBuilds.Load()
+	if !c.AddIndex([]string{"Owner"}, nil) {
+		t.Fatal("AddIndex returned false")
+	}
+	if built := colSegmentBuilds.Load() - before; built != 0 {
+		t.Fatalf("reindex re-transcoded %d blocks (want 0; colBlobPreserve should re-marshal)", built)
+	}
+	// The block still answers correctly after the mapping swap (a use-after-free would corrupt this).
+	got, ok := c.CountConstraint(expr)
+	if !ok || got != want {
+		t.Fatalf("post-reindex %q: ok=%v got=%d want=%d", expr, ok, got, want)
+	}
+	// And the categorical query the reindex enabled also works (the reindex genuinely happened).
+	q, _ := vm.Parse(`Owner == "u3"`)
+	n := 0
+	for range c.Query(q) {
+		n++
+	}
+	if n == 0 {
+		t.Fatal("Owner index query returned nothing after AddIndex")
+	}
+}
