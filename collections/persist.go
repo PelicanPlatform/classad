@@ -313,6 +313,14 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].num < files[j].num })
 
+	// Segments are collected first and ordered afterwards by CONTENT (see below), so the
+	// id assigned here is provisional.
+	type loadedSeg struct {
+		seg *segment
+		num uint64
+	}
+	var loaded []loadedSeg
+
 	for _, sf := range files {
 		// Decode this segment with the codec it was written under (the dictionary named
 		// in its file). Loaded before this by Open via loadDicts.
@@ -329,7 +337,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			f.Close()
 			return 0, err
 		}
-		seg, err := openMmapSegment(uint32(len(sh.segs)), codec, f, int(st.Size()))
+		seg, err := openMmapSegment(uint32(len(loaded)), codec, f, int(st.Size()))
 		if err != nil {
 			f.Close()
 			return 0, err
@@ -337,19 +345,60 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		// The write extent is the run of records from offset 0 until an unwritten
 		// (zero totalLen) or out-of-bounds record — the file is zero-initialized.
 		used := 0
-		for used+recHeaderSize <= len(seg.data) {
-			total := int(recTotalLen(seg.data, uint32(used)))
-			if total <= 0 || used+total > len(seg.data) {
-				break // unwritten (zero) tail or an impossible length
+		// A sealed segment records its extent in its sidecar, so recovery can take it
+		// instead of walking and CRC-verifying every record to re-derive it. That walk is a
+		// full integrity scan of the entire archive on every start -- correct, but it makes
+		// startup scale with total records rather than with segment count. The recorded
+		// extent is still checked: it must fit the mapping and the record ending exactly
+		// there must verify, so a truncated file or a sidecar left over from a different
+		// segment falls back to the scan rather than being trusted.
+		if rec := readSidecarExtent(seg.path + ".idx"); rec > 0 && rec <= len(seg.data) &&
+			recExtentEndsCleanly(seg.data, rec) {
+			used = rec
+		} else {
+			for used+recHeaderSize <= len(seg.data) {
+				total := int(recTotalLen(seg.data, uint32(used)))
+				if total <= 0 || used+total > len(seg.data) {
+					break // unwritten (zero) tail or an impossible length
+				}
+				if !recVerifyCRC(seg.data, uint32(used)) {
+					break // torn/partial record: the durable data ends here
+				}
+				used += total
 			}
-			if !recVerifyCRC(seg.data, uint32(used)) {
-				break // torn/partial record: the durable data ends here
-			}
-			used += total
 		}
 		seg.used = used
 		seg.synced = used
-		sh.segs = append(sh.segs, seg)
+		loaded = append(loaded, loadedSeg{seg, sf.num})
+	}
+	// Order segments by their CONTENT -- the commit sequence of their first record -- rather
+	// than by the number in their file name.
+	//
+	// Segment order is append order, and much depends on it: scans walk newest-first, and
+	// QueryLimit stops early on the premise that a later segment holds newer records. The
+	// file name only happens to encode that today because files are created in append order;
+	// anything that writes a segment out of turn breaks it. Merging several old segments into
+	// one is exactly that: the merged file is allocated last, gets the highest number, and
+	// would come back as the NEWEST segment while holding the OLDEST records -- "last K jobs"
+	// returning ancient ads, silently.
+	//
+	// The first record's seq is the first 8 bytes of the segment, so this costs one read per
+	// segment: no scan, no decompression, and no ordering metadata to keep in the file name
+	// or anywhere else that could disagree with the data.
+	sort.SliceStable(loaded, func(i, j int) bool {
+		si, iok := segFirstSeq(loaded[i].seg)
+		sj, jok := segFirstSeq(loaded[j].seg)
+		if iok != jok {
+			return iok // an empty segment carries no position; sort it last
+		}
+		if iok && si != sj {
+			return si < sj
+		}
+		return loaded[i].num < loaded[j].num // deterministic tiebreak
+	})
+	for i := range loaded {
+		loaded[i].seg.id = uint32(i)
+		sh.segs = append(sh.segs, loaded[i].seg)
 	}
 	// Fast reopen: a clean Close leaves a directory snapshot; restore from it instead
 	// of scanning every record (rebuildDir). It is validated against the loaded
@@ -390,12 +439,17 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	spec := c.spec.Load()
 	for _, seg := range sh.segs {
 		if seg != nil && seg != sh.act {
-			// Recompute the sealed segment's zone map (not persisted separately; cheap to
-			// rebuild from the segment's own records). No-op unless append-only + ZoneAttrs.
+			// Map the sidecar FIRST: a v3 container carries the segment's zone map, which
+			// loadSealedIndex adopts. Rebuilding one instead means decoding every record --
+			// measured at ~95% of reopen time, i.e. recovery scaling with the size of the
+			// archive rather than its segment count.
+			loaded := c.loadSealedIndex(seg, spec)
+			// Fall back to rebuilding only when the sidecar carried no zone map (written
+			// before v3, or none configured at the time).
 			if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {
 				seg.zones = computeSegZones(seg.data, seg.used, sh.zoneAttrs, sh.zoneInline, seg.dict.Load(), seg.codec)
 			}
-			if c.loadSealedIndex(seg, spec) {
+			if loaded {
 				// Phase 3: the segment's keys are now reachable through the sealed
 				// probe, so evict them from the resident directory -- the RAM win. Safe
 				// here because loadShard runs single-threaded during Open and every
@@ -615,4 +669,37 @@ func (c *Collection) Close() error {
 		sh.mu.Unlock()
 	}
 	return firstErr
+}
+
+// recExtentEndsCleanly sanity-checks a recorded extent in O(1): it must be record-aligned,
+// fit the mapping, and point at the end of written data -- either the end of the arena, or a
+// zeroed header where the next record would begin.
+//
+// Records are forward-linked (no back-pointer), so the final record cannot be located from
+// the extent without walking; this therefore does NOT re-verify record CRCs. It does not need
+// to: the extent is written only at seal, after the segment is complete and flushed, and the
+// checks here catch the failures that matter -- a truncated file (extent past the mapping) and
+// a sidecar belonging to a different segment (extent landing mid-record). Anything suspicious
+// falls back to the full scan, which does verify every record.
+func recExtentEndsCleanly(data []byte, used int) bool {
+	if used <= 0 || used > len(data) || used%8 != 0 {
+		return false
+	}
+	if used == len(data) {
+		return true
+	}
+	if used+recHeaderSize > len(data) {
+		return false // no room for another header: treat as suspicious, rescan
+	}
+	// Unwritten arena tail reads as a zero-length record.
+	return recTotalLen(data, uint32(used)) == 0
+}
+
+// segFirstSeq returns the commit sequence of a segment's first record, which is its position
+// in append order. ok is false for an empty segment.
+func segFirstSeq(seg *segment) (uint64, bool) {
+	if seg == nil || seg.used < recHeaderSize {
+		return 0, false
+	}
+	return recSeq(seg.data, 0), true
 }

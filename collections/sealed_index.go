@@ -33,11 +33,12 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	if err != nil {
 		return false
 	}
-	attr, key, col, ok := splitSegmentSidecar(data)
+	attr, key, col, zone, ok := splitSegmentSidecar(data)
 	if !ok {
 		_ = closer()
 		return false
 	}
+	adoptPersistedZones(seg, zone)
 	ki, err := parseKeyIndex(key)
 	if err != nil || int(ki.upto) != seg.used {
 		_ = closer()
@@ -105,7 +106,8 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 		}
 		attrBlob = b
 	}
-	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobForSeg(seg))
+	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobForSeg(seg),
+		buildZoneBlob(seg.zones), seg.used)
 	if err := writeFileAtomic(path, container); err != nil {
 		return
 	}
@@ -172,7 +174,8 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 	if err != nil {
 		return false
 	}
-	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobPreserve(seg))
+	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobPreserve(seg),
+		buildZoneBlob(c.zonesForSeg(sh, seg)), seg.used)
 	return c.installSidecar(sh, seg, path, container)
 }
 
@@ -194,11 +197,12 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 	if err != nil {
 		return false
 	}
-	attr, key, col, ok := splitSegmentSidecar(data)
+	attr, key, col, zone, ok := splitSegmentSidecar(data)
 	if !ok {
 		_ = closer()
 		return false
 	}
+	adoptPersistedZones(seg, zone)
 	ki, err := parseKeyIndex(key)
 	if err != nil || int(ki.upto) != seg.used {
 		_ = closer()
@@ -357,4 +361,36 @@ func sealedIndexAnon(si *segIndex) (*mmapSegIndex, func() error, error) {
 		return nil, nil, err
 	}
 	return mm, closer, nil
+}
+
+// zonesForSeg returns the zone map to persist alongside a sealed segment's index: the one it
+// already carries, or a freshly computed one if it has none yet. Computing here is not extra
+// work overall -- it is the same computation reopen would otherwise redo on every start.
+func (c *Collection) zonesForSeg(sh *shard, seg *segment) map[uint32]zoneRange {
+	if seg.zones != nil {
+		return seg.zones
+	}
+	sh.mu.RLock()
+	attrs, inline, appendOnly := sh.zoneAttrs, sh.zoneInline, sh.appendOnly
+	sh.mu.RUnlock()
+	if !appendOnly || len(attrs) == 0 {
+		return nil
+	}
+	return computeSegZones(seg.data, seg.used, attrs, inline, seg.dict.Load(), seg.codec)
+}
+
+// adoptPersistedZones restores a sealed segment's zone map from its sidecar, so recovery does
+// not have to rebuild it by decoding every record -- which was ~95% of reopen time and made
+// startup scale with the archive rather than with its segment count.
+//
+// A segment that already has zones keeps them, and an absent or malformed section is simply
+// ignored: the caller's existing recompute path then fills it in. Being wrong here is worse
+// than being slow, since a too-narrow range would prune segments that hold matches.
+func adoptPersistedZones(seg *segment, zone []byte) {
+	if seg == nil || seg.zones != nil || len(zone) == 0 {
+		return
+	}
+	if z, ok := parseZoneBlob(zone); ok {
+		seg.zones = z
+	}
 }

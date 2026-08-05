@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"os"
 	"sort"
 )
@@ -151,14 +152,34 @@ func (m *mmapKeyIndex) lookup(hash uint64) []uint32 {
 const (
 	sidecarContainerMagic   = 0x53434e54 // "SCNT" (v1, 2-section)
 	sidecarContainerMagicV2 = 0x53434e32 // "SCN2" (v2, 3-section, adds the columnar blob)
+	sidecarContainerMagicV3 = 0x53434e33 // "SCN3" (v3, adds the zone map + the sealed extent)
 	sidecarTrailerLen       = 12
 	sidecarTrailerLenV2     = 16
+	sidecarTrailerLenV3     = 28 // 4 lengths (u32) + segUsed (u64) + magic (u32)
 )
 
 // buildSegmentSidecar packs the attribute-index blob (may be empty), the key-index blob, and the
 // columnar blob (may be empty) into the container byte layout. An empty colBlob yields the v1
 // (2-section) layout, identical to a pre-columnar sidecar.
-func buildSegmentSidecar(attrBlob, keyBlob, colBlob []byte) []byte {
+// segUsed is the sealed segment's written extent. Recording it lets recovery skip walking and
+// CRC-verifying every record just to find where durable data ends -- a sealed segment's extent
+// is final, so re-deriving it on every open is a full integrity scan of the whole archive
+// masquerading as recovery. Zero means "not recorded" and the reader falls back to scanning.
+func buildSegmentSidecar(attrBlob, keyBlob, colBlob, zoneBlob []byte, segUsed int) []byte {
+	if len(zoneBlob) > 0 || segUsed > 0 {
+		b := make([]byte, 0, len(attrBlob)+len(keyBlob)+len(colBlob)+len(zoneBlob)+sidecarTrailerLenV3)
+		b = append(b, attrBlob...)
+		b = append(b, keyBlob...)
+		b = append(b, colBlob...)
+		b = append(b, zoneBlob...)
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(attrBlob)))
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(keyBlob)))
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(colBlob)))
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(zoneBlob)))
+		b = binary.LittleEndian.AppendUint64(b, uint64(segUsed))
+		b = binary.LittleEndian.AppendUint32(b, sidecarContainerMagicV3)
+		return b
+	}
 	if len(colBlob) == 0 {
 		b := make([]byte, 0, len(attrBlob)+len(keyBlob)+sidecarTrailerLen)
 		b = append(b, attrBlob...)
@@ -182,7 +203,31 @@ func buildSegmentSidecar(attrBlob, keyBlob, colBlob []byte) []byte {
 // splitSegmentSidecar returns the attribute, key, and columnar sub-slices of a container. col is
 // nil for a v1 (2-section) container -- a pre-columnar sidecar, read unchanged. ok=false if data
 // is not a well-formed container (bare/old sidecar, or corruption).
-func splitSegmentSidecar(data []byte) (attr, key, col []byte, ok bool) {
+func splitSegmentSidecar(data []byte) (attr, key, col, zone []byte, ok bool) {
+	a, k, c, z, _, o := splitSegmentSidecarFull(data)
+	return a, k, c, z, o
+}
+
+// splitSegmentSidecarFull also returns the recorded sealed extent (0 when absent).
+func splitSegmentSidecarFull(data []byte) (attr, key, col, zone []byte, segUsed int, ok bool) {
+	if len(data) >= sidecarTrailerLenV3 {
+		t := data[len(data)-sidecarTrailerLenV3:]
+		if binary.LittleEndian.Uint32(t[24:]) == sidecarContainerMagicV3 {
+			attrLen := int(binary.LittleEndian.Uint32(t[0:]))
+			keyLen := int(binary.LittleEndian.Uint32(t[4:]))
+			colLen := int(binary.LittleEndian.Uint32(t[8:]))
+			zoneLen := int(binary.LittleEndian.Uint32(t[12:]))
+			used := int(binary.LittleEndian.Uint64(t[16:]))
+			body := len(data) - sidecarTrailerLenV3
+			if attrLen >= 0 && keyLen >= 0 && colLen >= 0 && zoneLen >= 0 &&
+				attrLen+keyLen+colLen+zoneLen == body {
+				return data[:attrLen], data[attrLen : attrLen+keyLen],
+					data[attrLen+keyLen : attrLen+keyLen+colLen],
+					data[attrLen+keyLen+colLen : body], used, true
+			}
+			return nil, nil, nil, nil, 0, false
+		}
+	}
 	if len(data) >= sidecarTrailerLenV2 {
 		t := data[len(data)-sidecarTrailerLenV2:]
 		if binary.LittleEndian.Uint32(t[12:]) == sidecarContainerMagicV2 {
@@ -190,9 +235,9 @@ func splitSegmentSidecar(data []byte) (attr, key, col []byte, ok bool) {
 			keyLen := int(binary.LittleEndian.Uint32(t[4:]))
 			colLen := int(binary.LittleEndian.Uint32(t[8:]))
 			if attrLen < 0 || keyLen < 0 || colLen < 0 || attrLen+keyLen+colLen+sidecarTrailerLenV2 != len(data) {
-				return nil, nil, nil, false
+				return nil, nil, nil, nil, 0, false
 			}
-			return data[:attrLen], data[attrLen : attrLen+keyLen], data[attrLen+keyLen : attrLen+keyLen+colLen], true
+			return data[:attrLen], data[attrLen : attrLen+keyLen], data[attrLen+keyLen : attrLen+keyLen+colLen], nil, 0, true
 		}
 	}
 	if len(data) >= sidecarTrailerLen {
@@ -201,12 +246,12 @@ func splitSegmentSidecar(data []byte) (attr, key, col []byte, ok bool) {
 			attrLen := int(binary.LittleEndian.Uint32(t[0:]))
 			keyLen := int(binary.LittleEndian.Uint32(t[4:]))
 			if attrLen < 0 || keyLen < 0 || attrLen+keyLen+sidecarTrailerLen != len(data) {
-				return nil, nil, nil, false
+				return nil, nil, nil, nil, 0, false
 			}
-			return data[:attrLen], data[attrLen : attrLen+keyLen], nil, true
+			return data[:attrLen], data[attrLen : attrLen+keyLen], nil, nil, 0, true
 		}
 	}
-	return nil, nil, nil, false
+	return nil, nil, nil, nil, 0, false
 }
 
 // writeFileAtomic writes b to path via a temp file + fsync + rename, so a crash never
@@ -232,4 +277,87 @@ func writeFileAtomic(path string, b []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// --- persisted zone maps (sidecar v3) ---
+//
+// A sealed segment's zone map is derived state: [min,max] per zoned attribute, computed by
+// decoding every record. It was recomputed on every open, which made recovery O(records) --
+// measured at ~95% of reopen time, and hours for an archive of any size. It is computed once
+// at seal anyway, so persist it beside the index it lives with.
+//
+// Format: [n u32] then n x { attrID u32, min f64, max f64 }. Empty when the segment has no
+// zone map, in which case the container stays at v2 and readers fall back to recomputing.
+
+func buildZoneBlob(zones map[uint32]zoneRange) []byte {
+	if len(zones) == 0 {
+		return nil
+	}
+	ids := make([]uint32, 0, len(zones))
+	for id := range zones {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	b := make([]byte, 0, 4+len(ids)*20)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(ids)))
+	for _, id := range ids {
+		z := zones[id]
+		b = binary.LittleEndian.AppendUint32(b, id)
+		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(z.Min))
+		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(z.Max))
+	}
+	return b
+}
+
+// parseZoneBlob decodes a zone section. ok=false on any malformation, which the caller
+// treats as "not persisted" and recomputes -- a corrupt sidecar must never yield a WRONG
+// zone map, since a too-narrow range would silently prune segments that hold matches.
+func parseZoneBlob(b []byte) (map[uint32]zoneRange, bool) {
+	if len(b) < 4 {
+		return nil, false
+	}
+	n := int(binary.LittleEndian.Uint32(b))
+	if n < 0 || 4+n*20 != len(b) {
+		return nil, false
+	}
+	out := make(map[uint32]zoneRange, n)
+	for i := 0; i < n; i++ {
+		off := 4 + i*20
+		id := binary.LittleEndian.Uint32(b[off:])
+		mn := math.Float64frombits(binary.LittleEndian.Uint64(b[off+4:]))
+		mx := math.Float64frombits(binary.LittleEndian.Uint64(b[off+12:]))
+		if mn > mx {
+			return nil, false
+		}
+		out[id] = zoneRange{Min: mn, Max: mx}
+	}
+	return out, true
+}
+
+// readSidecarExtent reads just the trailer of a sealed segment's sidecar to recover the
+// segment's written extent, without mapping the sidecar (mapping every sidecar at open is
+// itself a cost worth avoiding). Returns 0 when the file is absent, too short, or not a v3
+// container -- the caller then falls back to scanning.
+func readSidecarExtent(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() < int64(sidecarTrailerLenV3) {
+		return 0
+	}
+	var t [sidecarTrailerLenV3]byte
+	if _, err := f.ReadAt(t[:], st.Size()-int64(sidecarTrailerLenV3)); err != nil {
+		return 0
+	}
+	if binary.LittleEndian.Uint32(t[24:]) != sidecarContainerMagicV3 {
+		return 0
+	}
+	used := int(binary.LittleEndian.Uint64(t[16:]))
+	if used < 0 {
+		return 0
+	}
+	return used
 }
