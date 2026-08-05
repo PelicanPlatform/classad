@@ -172,9 +172,22 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 	if err != nil {
 		return false
 	}
-	// Rename over the live file: the existing mapping is unaffected (it holds the old
-	// inode), so readers keep working until they are swapped over below.
-	if err := writeFileAtomic(path, buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobPreserve(seg))); err != nil {
+	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobPreserve(seg))
+	return c.installSidecar(sh, seg, path, container)
+}
+
+// installSidecar atomically rewrites seg's sidecar to container, remaps it, and publishes the key
+// index (always), the attribute index (when the container carries a valid one), and the columnar
+// block (when present) -- all aliasing the ONE new mapping, swapped in under the shard lock and
+// reaped together with the displaced mapping once scan pins drain. Shared by the reindex rewrite
+// and the enable-time columnar persist. Best-effort: on any malformed remap it drops the new
+// mapping and leaves the old sidecar in place. It never reaps the old mapping while leaving the
+// segment's live attribute index dangling: if the segment has an msidx but the new container has
+// no valid one, it aborts.
+func (c *Collection) installSidecar(sh *shard, seg *segment, path string, container []byte) bool {
+	// Rename over the live file: the existing mapping is unaffected (it holds the old inode), so
+	// readers keep working until they are swapped over below.
+	if err := writeFileAtomic(path, container); err != nil {
 		return false
 	}
 	data, closer, err := mapFile(path)
@@ -191,30 +204,33 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 		_ = closer()
 		return false
 	}
-	if !sidecarCRCValid(attr) {
-		_ = closer()
+	var mm *mmapSegIndex
+	if len(attr) > 0 && sidecarCRCValid(attr) {
+		if m, e := parseMmapSidecar(attr); e == nil && m != nil && int(m.upto) == seg.used {
+			mm = m
+		}
+	}
+	if mm == nil && seg.msidx.Load() != nil {
+		_ = closer() // would drop the segment's live attribute index: abort, keep the old sidecar
 		return false
 	}
-	mm, err := parseMmapSidecar(attr)
-	if err != nil || mm == nil || int(mm.upto) != seg.used {
-		_ = closer()
-		return false
-	}
-	// Publish under the shard write lock: the readers that touch a sidecar without a scan
-	// pin (SidecarSizes, IndexSizes) hold the read lock while they do, so the lock is what
-	// bounds them. Pinned scan readers are handled by the pin drain instead.
-	// The columnar block, if present, ALIASES this new mapping (zero-copy) just like msidx, so it
-	// is re-published on the same swap: the displaced mapping (which backed the old block) is
-	// reaped together by swapSidecarHook + releaseStale once scan pins drain.
+	// The columnar block, if present, ALIASES this new mapping (zero-copy) like msidx, so it is
+	// published on the same swap; the displaced mapping (which backed the old block) is reaped
+	// together by swapSidecarHook + releaseStale once scan pins drain.
 	var cs *colSegment
 	if body := readColSection(col, seg.used); body != nil {
 		cs = unmarshalColSegment(body, seg.codec, c.intern.Intern)
 	}
+	// Publish under the shard write lock: the readers that touch a sidecar without a scan pin
+	// (SidecarSizes, IndexSizes) hold the read lock while they do; pinned scan readers are handled
+	// by the pin drain instead.
 	sh.mu.Lock()
-	seg.msidx.Store(mm)
 	seg.keyIdx.Store(ki)
 	seg.keyBloom.Store(bloomFromKeyIndex(ki))
-	seg.idx.Store(nil) // the heap copy stays dropped; msidx serves queries
+	if mm != nil {
+		seg.msidx.Store(mm)
+		seg.idx.Store(nil) // the heap copy stays dropped; msidx serves queries
+	}
 	if cs != nil {
 		seg.colblk.Store(cs)
 	}
