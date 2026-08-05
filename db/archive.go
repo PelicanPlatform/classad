@@ -260,12 +260,39 @@ func (t *ArchiveTable) Rewrite() int { return t.a.Rewrite() }
 
 // AddIndex adds per-segment indexes on the named categorical and/or value attributes and
 // rebuilds them over existing segments. Returns false if the index set was unchanged.
+// A change is persisted (see saveIndexConfig).
 func (t *ArchiveTable) AddIndex(categorical, value []string) bool {
-	return t.a.AddIndex(categorical, value)
+	changed := t.a.AddIndex(categorical, value)
+	if changed {
+		t.saveIndexConfig()
+	}
+	return changed
 }
 
 // DropIndex removes the named per-segment indexes. Returns false if none matched.
-func (t *ArchiveTable) DropIndex(names ...string) bool { return t.a.DropIndex(names...) }
+// A change is persisted (see saveIndexConfig).
+func (t *ArchiveTable) DropIndex(names ...string) bool {
+	changed := t.a.DropIndex(names...)
+	if changed {
+		t.saveIndexConfig()
+	}
+	return changed
+}
+
+// saveIndexConfig folds the archive's live index set back into the saved config, so a
+// runtime AddIndex/DropIndex survives a restart. Without it the reopen path (which treats
+// archiveconfig.json as authoritative) would resurrect the creation-time index set, and the
+// rebuild AddIndex just paid for -- a full decompress of the archive -- would be discarded
+// and the sidecars rebuilt back down to the older, narrower spec.
+//
+// The live set is read back from the archive rather than merged from the caller's names,
+// because AddIndex normalizes them (a name given as both kinds, or already indexed as the
+// other kind, lands as categorical). Mirrors DB.saveIndexConfig, including its best-effort
+// contract: a write failure is ignored, leaving the change live for this run but unpersisted.
+func (t *ArchiveTable) saveIndexConfig() {
+	t.cfg.CategoricalAttrs, t.cfg.ValueAttrs = t.a.IndexedAttrs()
+	_ = t.saveConfig()
+}
 
 // Reindex rebuilds the per-segment indexes over all segments.
 func (t *ArchiveTable) Reindex() { t.a.Reindex() }
