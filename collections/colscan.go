@@ -28,6 +28,49 @@ type schemaScanState struct {
 	cache  *blockCache
 }
 
+// SchemaScanInfo reports the state of the per-segment columnar (adschema) accelerator, for
+// diagnostics. Enabled means a numeric COUNT(*) WHERE can take the columnar fast path; HotFields
+// are the demand-hot numeric columns kept uncompressed for O(1) scan; SchemaFields is the schema's
+// field count; and CoveredSegments of SealedSegments carry a columnar block (the rest row-fall-back
+// until a rewrite/reindex reaches them).
+type SchemaScanInfo struct {
+	Enabled         bool     `json:"enabled"`
+	HotFields       []string `json:"hotFields,omitempty"`
+	SchemaFields    int      `json:"schemaFields,omitempty"`
+	SealedSegments  int      `json:"sealedSegments,omitempty"`
+	CoveredSegments int      `json:"coveredSegments,omitempty"`
+}
+
+// SchemaScanInfo returns the columnar accelerator's current state (see SchemaScanInfo).
+func (c *Collection) SchemaScanInfo() SchemaScanInfo {
+	var info SchemaScanInfo
+	if st := c.schemaScan.Load(); st != nil {
+		info.Enabled = true
+		info.SchemaFields = len(st.schema.fields)
+		for _, idx := range st.hot {
+			if idx >= 0 && idx < len(st.schema.fields) {
+				if name, ok := c.intern.Name(st.schema.fields[idx].id); ok {
+					info.HotFields = append(info.HotFields, name)
+				}
+			}
+		}
+	}
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		act := sh.act
+		for _, seg := range sh.segs {
+			if seg != nil && seg != act && seg.used > 0 {
+				info.SealedSegments++
+				if seg.colblk.Load() != nil {
+					info.CoveredSegments++
+				}
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return info
+}
+
 // EnableSchemaScan builds a columnar block over every currently-sealed segment (skipping the
 // active append target) for the given schema and hot field set, publishes it on each segment,
 // and records the state so CountQuery can auto-route matching queries. Additive and opt-in:

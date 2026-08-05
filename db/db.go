@@ -333,6 +333,7 @@ type (
 	SidecarSizes    = collections.SidecarSizes
 	Retention       = collections.Retention
 	CodecStats      = collections.CodecStats
+	SchemaScanInfo  = collections.SchemaScanInfo
 	QueryExplain    = collections.QueryExplain
 	ProbeExplain    = collections.ProbeExplain
 	MatchExplain    = collections.MatchExplain
@@ -382,6 +383,10 @@ func (db *DB) OpStats() OpStats {
 // HotAttrs returns the current hot attributes (front-loaded in each ad's hot
 // header for cheap access).
 func (db *DB) HotAttrs() []string { return db.c.HotAttrNames() }
+
+// SchemaScanInfo reports the columnar (adschema) accelerator's state: whether it is enabled (so a
+// numeric COUNT(*) WHERE routes to the columnar fast path), its hot columns, and segment coverage.
+func (db *DB) SchemaScanInfo() SchemaScanInfo { return db.c.SchemaScanInfo() }
 
 // IndexedAttrs returns the currently-indexed attribute names, split into
 // categorical (string equality/membership) and value (numeric + range) indexes.

@@ -31,6 +31,11 @@ type Diagnostics struct {
 	EncryptionEnabled bool     `json:"encryptionEnabled"`
 	EncryptedAttrs    []string `json:"encryptedAttrs,omitempty"`
 
+	// SchemaScan reports the per-segment columnar (adschema) accelerator's state: whether it is
+	// enabled (a numeric COUNT(*) WHERE takes the columnar fast path), its uncompressed hot
+	// columns, and how many sealed segments carry a block. Mutable tables only.
+	SchemaScan db.SchemaScanInfo `json:"schemaScan"`
+
 	// Archive marks an append-only history table (vs. a mutable one), and Retention carries
 	// its rotation bounds. Both are omitted for a mutable table. SidecarSizes reports the
 	// archive's sealed-segment sidecar index bytes.
@@ -72,6 +77,7 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		DropSuggestions:    t.SuggestDrops(diagSampleMax),
 		EncryptionEnabled:  t.EncryptionEnabled(),
 		EncryptedAttrs:     t.EncryptedAttrNames(),
+		SchemaScan:         t.SchemaScanInfo(),
 	}
 	return json.Marshal(d)
 }
