@@ -176,6 +176,15 @@ const (
 	// server that does not, instead of the server misparsing a longer frame.
 	opTxnQuery     op = 57 // [txnID u64][limit i32][constraint] -> stream of [adText]
 	opTxnQueryKeys op = 58 // [txnID u64][constraint] -> stream of [key]
+
+	// opQueryRawProjRefs is opQueryRawProj whose projection also carries the attributes
+	// the projected expressions reference, so each returned ad EVALUATES self-contained.
+	// Same request shape; a separate opcode because the two have genuinely different
+	// contracts -- opQueryRawProj reproduces HTCondor's projection protocol (exactly the
+	// requested attributes), which a relay depends on, while a client that evaluates what
+	// it receives needs the references. Separate rather than a flag so an older server
+	// rejects it cleanly instead of misparsing a longer frame.
+	opQueryRawProjRefs op = 59 // [table][limit i32][constraint][nattrs i32]{[attr]} -> stream of [oldClassAdText]
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -271,6 +280,8 @@ func (o op) String() string {
 		return "TxnQuery"
 	case opTxnQueryKeys:
 		return "TxnQueryKeys"
+	case opQueryRawProjRefs:
+		return "QueryRawProjectRefs"
 	}
 	return "op(unknown)"
 }

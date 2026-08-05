@@ -166,6 +166,17 @@ func (t *ArchiveTable) QueryRawProjected(constraint string, projection []string,
 	return t.a.QueryRawProjected(q, projection, false, redact), nil
 }
 
+// QueryRawProjectedRefs is QueryRawProjected with the projected expressions' attribute
+// references resolved too, so each yielded ad evaluates self-contained. See
+// db.DB.QueryRawProjectedRefs for why that is a separate call rather than the default.
+func (t *ArchiveTable) QueryRawProjectedRefs(constraint string, projection []string, redact bool) (iter.Seq[collections.RawAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return t.a.QueryRawProjected(q, projection, true, redact), nil
+}
+
 // Aggregate runs a server-side GROUP BY over the archive's matches: it applies the
 // constraint (using the archive's zone-map pruning, so segments no matching record can
 // fall in are never scanned), groups by the raw group columns, and reduces each group

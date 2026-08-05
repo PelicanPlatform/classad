@@ -3,6 +3,7 @@ package dbrpc
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"iter"
 	"strings"
 	"time"
@@ -40,6 +41,56 @@ func (c *Client) QueryRawProject(ctx context.Context, table, constraint string, 
 		}
 		return b
 	})
+}
+
+// ErrProjectRefsUnsupported is returned by the refs-chasing projection calls against a
+// server too old to implement the opcode. A caller falls back to QueryRawProject, whose
+// results are correct for literal-valued attributes and undefined for expression-valued
+// ones whose references were projected away.
+var ErrProjectRefsUnsupported = errors.New("dbrpc: server does not support reference-chasing projection")
+
+// QueryRawProjectRefs is QueryRawProject whose projection also carries the attributes the
+// projected expressions reference, transitively, so each returned ad EVALUATES
+// self-contained.
+//
+// Use this whenever the caller is going to evaluate what it receives. QueryRawProject
+// returns exactly the requested attributes -- correct for a relay reproducing HTCondor's
+// query protocol, and wrong for an evaluator, because an attribute holding an expression
+// over its siblings (Requirements, Rank, ...) loses those siblings and evaluates to
+// undefined.
+//
+// Against a server without the opcode it returns ErrProjectRefsUnsupported.
+func (c *Client) QueryRawProjectRefs(ctx context.Context, table, constraint string, attrs []string, limit int) ([]string, error) {
+	rows, err := c.streamCtx(ctx, projectRefsFrame(table, constraint, attrs, limit))
+	return rows, projectRefsErr(err)
+}
+
+// QueryRawProjectRefsStream is QueryRawProjectRefs with the streaming delivery of
+// QueryRawTableStream.
+func (c *Client) QueryRawProjectRefsStream(ctx context.Context, table, constraint string, attrs []string, limit int, yield func(row string) bool) error {
+	return projectRefsErr(c.streamEach(ctx, projectRefsFrame(table, constraint, attrs, limit), yield))
+}
+
+// projectRefsFrame builds the opQueryRawProjRefs request frame (same shape as
+// opQueryRawProj).
+func projectRefsFrame(table, constraint string, attrs []string, limit int) func(uint64) []byte {
+	return func(id uint64) []byte {
+		b := putStr(putI32(putStr(req(id, opQueryRawProjRefs), table), int32(limit)), constraint)
+		b = putI32(b, int32(len(attrs)))
+		for _, a := range attrs {
+			b = putStr(b, a)
+		}
+		return b
+	}
+}
+
+// projectRefsErr maps the server's rejection of an unknown opcode to a sentinel the
+// caller can fall back on, without matching message text.
+func projectRefsErr(err error) error {
+	if errors.Is(err, ErrBadRequest) {
+		return ErrProjectRefsUnsupported
+	}
+	return err
 }
 
 // QueryRawTableStream is QueryRawTable that hands each matching ad's old-ClassAd wire
@@ -171,6 +222,19 @@ func rawAdText(ra collections.RawAd) string {
 // every ad across the wire. The projection is applied server-side; matching is
 // case-insensitive (ClassAd attribute names are).
 func (s *Server) streamQueryRawProject(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamQueryRawProjectOpt(ctx, reqID, r, includePrivate, write, qlog, false)
+}
+
+// streamQueryRawProjectRefs is streamQueryRawProject whose projection also carries the
+// attributes the projected expressions reference, so each streamed ad evaluates
+// self-contained at the far end. See db.DB.QueryRawProjectedRefs.
+func (s *Server) streamQueryRawProjectRefs(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamQueryRawProjectOpt(ctx, reqID, r, includePrivate, write, qlog, true)
+}
+
+// streamQueryRawProjectOpt is the shared body of the two projection ops; chaseRefs picks
+// which db projection they use.
+func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog), chaseRefs bool) {
 	start := time.Now()
 	table := r.str()
 	limit := int(r.i32())
@@ -183,7 +247,7 @@ func (s *Server) streamQueryRawProject(ctx context.Context, reqID uint64, r *rea
 	n := 0
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: "QueryRawProject", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+			qlog(QueryLog{Op: projectOpName(chaseRefs), Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
 		}()
 	}
 	if r.err != nil {
@@ -198,12 +262,25 @@ func (s *Server) streamQueryRawProject(ctx context.Context, reqID uint64, r *rea
 	// (an archive streams newest-first, like its plain query).
 	var seq iter.Seq[collections.RawAd]
 	var err error
+	redact := !includePrivate
 	if d, ok := s.cat.Table(table); ok {
-		seq, err = d.QueryRawProjected(constraint, attrs, !includePrivate)
+		if chaseRefs {
+			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
+		} else {
+			seq, err = d.QueryRawProjected(constraint, attrs, redact)
+		}
 	} else if d, ok := s.cat.ViewBacking(table); ok {
-		seq, err = d.QueryRawProjected(constraint, attrs, !includePrivate)
+		if chaseRefs {
+			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
+		} else {
+			seq, err = d.QueryRawProjected(constraint, attrs, redact)
+		}
 	} else if a, ok := s.cat.ArchiveTable(table); ok {
-		seq, err = a.QueryRawProjected(constraint, attrs, !includePrivate)
+		if chaseRefs {
+			seq, err = a.QueryRawProjectedRefs(constraint, attrs, redact)
+		} else {
+			seq, err = a.QueryRawProjected(constraint, attrs, redact)
+		}
 	} else {
 		write(respErr(reqID, "no such table: "+table))
 		return
@@ -373,4 +450,12 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 	}
 	flush()
 	write(respHead(reqID, stStreamEnd))
+}
+
+// projectOpName labels a projection query in the query log by which contract it ran under.
+func projectOpName(chaseRefs bool) string {
+	if chaseRefs {
+		return "QueryRawProjectRefs"
+	}
+	return "QueryRawProject"
 }
