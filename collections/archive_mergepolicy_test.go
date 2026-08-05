@@ -18,9 +18,10 @@ func TestMergePassReachesTarget(t *testing.T) {
 	}
 
 	opts := MergeOptions{
-		TargetSegments: 8,
-		MinMergeBytes:  1, // the corpus is tiny; let run size come from the target
-		KeepRecent:     2,
+		TargetSegments:  8,
+		TriggerSegments: 16, // well below the current count, so this pass runs
+		MinMergeBytes:   1,  // the corpus is tiny; let run size come from the target
+		KeepRecent:      2,
 	}
 	n := a.MergePass(opts)
 	if n == 0 {
@@ -72,7 +73,7 @@ func TestMergePassRespectsLimits(t *testing.T) {
 		a := buildMergeArchive(t, dir, 4000)
 		defer a.Close()
 		newest := newestSealedSegments(t, a, 3)
-		a.MergePass(MergeOptions{TargetSegments: 4, MinMergeBytes: 1, KeepRecent: 3})
+		a.MergePass(MergeOptions{TargetSegments: 4, TriggerSegments: 8, MinMergeBytes: 1, KeepRecent: 3})
 		live := map[*segment]bool{}
 		for _, s := range policySegments(t, a) {
 			live[s] = true
@@ -89,13 +90,50 @@ func TestMergePassRespectsLimits(t *testing.T) {
 		a := buildMergeArchive(t, dir, 4000)
 		defer a.Close()
 		const cap = 24 << 10
-		a.MergePass(MergeOptions{TargetSegments: 1, MinMergeBytes: 1, MaxSegmentBytes: cap, KeepRecent: 0})
+		a.MergePass(MergeOptions{TargetSegments: 1, TriggerSegments: 2, MinMergeBytes: 1, MaxSegmentBytes: cap, KeepRecent: 0})
 		for _, s := range policySegments(t, a) {
 			if int64(s.used) > cap*2 {
 				t.Errorf("segment holds %d bytes, well past the %d cap", s.used, cap)
 			}
 		}
 	})
+}
+
+// TestMergePassHysteresis pins the two watermarks: a pass between the target and the trigger
+// does nothing, and once the trigger is reached it merges all the way down to the target.
+// Without the gap the policy would merge a run on every pass forever while sitting just over
+// the target, rewriting data continuously to hold a line that does not need holding.
+func TestMergePassHysteresis(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	a := buildMergeArchive(t, dir, 4000)
+	defer a.Close()
+	segs := a.c.Stats().Segments
+
+	// Between the watermarks: over target, under trigger -> nothing happens.
+	if n := a.MergePass(MergeOptions{
+		TargetSegments: segs - 10, TriggerSegments: segs + 50, MinMergeBytes: 1, KeepRecent: 0,
+	}); n != 0 {
+		t.Errorf("merged %d runs while below the trigger", n)
+	}
+	if got := a.c.Stats().Segments; got != segs {
+		t.Errorf("segments changed to %d while below the trigger", got)
+	}
+
+	// Past the trigger: merge down to the target, not merely under the trigger. (The
+	// trigger counts SEALED segments; the open one is not mergeable, hence a value clearly
+	// below the total rather than exactly it.)
+	target := 8
+	if n := a.MergePass(MergeOptions{
+		TargetSegments: target, TriggerSegments: 20, MinMergeBytes: 1, KeepRecent: 0,
+	}); n == 0 {
+		t.Fatal("no merges though the trigger was reached")
+	}
+	if got := a.c.Stats().Segments; got > target+1 {
+		t.Errorf("segments = %d, want <= %d: a pass must run to the LOW watermark", got, target+1)
+	}
 }
 
 func policySegments(t *testing.T, a *Archive) []*segment {

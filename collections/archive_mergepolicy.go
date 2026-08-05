@@ -26,9 +26,14 @@ package collections
 
 // MergeOptions tunes a merge pass. The zero value is usable: it fills in the defaults below.
 type MergeOptions struct {
-	// TargetSegments is the segment count to get at or below. Merging stops once the
-	// archive is under it. Default defaultTargetSegments.
+	// TargetSegments is the LOW watermark: once a pass starts it merges until the archive
+	// is at or below this. Default defaultTargetSegments.
 	TargetSegments int
+	// TriggerSegments is the HIGH watermark: a pass does nothing until the archive reaches
+	// it. The gap between the two is what stops the policy from merging a run on every pass
+	// forever once it is sitting on the target -- rewriting data continuously to hold a line
+	// that does not need holding to the segment. Default: TargetSegments plus a quarter.
+	TriggerSegments int
 	// MaxSegmentBytes caps a merged segment. Segment offsets are uint32 throughout the
 	// record and sidecar formats, so 4 GiB is a hard structural ceiling; the default stays
 	// well under it. A run stops before exceeding this.
@@ -64,6 +69,9 @@ func (o MergeOptions) withDefaults() MergeOptions {
 	if o.TargetSegments <= 0 {
 		o.TargetSegments = defaultTargetSegments
 	}
+	if o.TriggerSegments <= o.TargetSegments {
+		o.TriggerSegments = o.TargetSegments + o.TargetSegments/4
+	}
 	if o.MaxSegmentBytes <= 0 {
 		o.MaxSegmentBytes = defaultMaxSegmentBytes
 	}
@@ -82,9 +90,14 @@ func (o MergeOptions) withDefaults() MergeOptions {
 	return o
 }
 
-// MergePass merges cold segment runs until the archive is at or below opts.TargetSegments,
-// or until no eligible run remains, or until opts.MaxMerges merges have been done. It
-// returns the number of merges performed.
+// MergePass merges cold segment runs when the archive has reached opts.TriggerSegments,
+// continuing until it is at or below opts.TargetSegments, no eligible run remains, or
+// opts.MaxMerges merges have been done. It returns the number of merges performed.
+//
+// The two watermarks are the point: merging is rewriting, so it should happen in occasional
+// batches with headroom either side, not continuously to pin the count at one value. Below
+// the trigger a pass is a cheap no-op (a segment count and a comparison), so it is safe to
+// call often.
 //
 // Safe to call on a live archive: merges take the maintenance lock (so they never overlap a
 // reseal or another pass), the writer's open segment is never a candidate, and an in-flight
@@ -100,6 +113,9 @@ func (c *Collection) mergePass(opts MergeOptions) int {
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
 
+	if c.sealedSegmentCount() < opts.TriggerSegments {
+		return 0 // below the high watermark: leave it alone
+	}
 	merges := 0
 	for merges < opts.MaxMerges {
 		run, ok := c.nextMergeRun(opts)
@@ -189,4 +205,19 @@ func (c *Collection) nextMergeRun(opts MergeOptions) ([]*segment, bool) {
 		return nil, false // a single segment already at the size cap: nothing to do here
 	}
 	return run, true
+}
+
+// sealedSegmentCount counts the segments a merge pass could act on: sealed, non-empty, and
+// not the open append target.
+func (c *Collection) sealedSegmentCount() int {
+	sh := c.shards[0]
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	n := 0
+	for _, s := range sh.segs {
+		if s != nil && s != sh.act && s.used > 0 {
+			n++
+		}
+	}
+	return n
 }
