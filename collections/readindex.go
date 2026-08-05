@@ -24,6 +24,12 @@ type readIndex interface {
 	// (for MATCH's finite-value materialization). add returns false to stop early;
 	// catCanonicalValues then returns false too. Returns true when all values were emitted.
 	catCanonicalValues(id uint32, add func(string) bool) bool
+	// catValueCount returns how many records in the indexed prefix carry exactly key
+	// (case-sensitive) for categorical attribute id -- the cardinality of that value's
+	// posting, without materializing the posting itself. ok is false when the attribute is
+	// not categorically indexed here or no record spells the value that way. Paired with
+	// catCanonicalValues it answers a GROUP BY count from the index alone.
+	catValueCount(id uint32, key string) (count uint64, ok bool)
 }
 
 // indexPrimitives are the per-tier operations the shared planner logic (below) is built on.

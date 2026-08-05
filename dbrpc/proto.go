@@ -157,8 +157,14 @@ const (
 	// success. An unknown opcode is refused as a bad request instead, which the client
 	// surfaces as ErrFilteredAggregateUnsupported. A client only sends these when some spec
 	// actually carries a filter, so every existing query is byte-identical on the wire.
+	// Both carry BOTH extensions the base opcodes lack: a per-group bucket width and a
+	// per-aggregate filter. They are the "everything" form of their respective aggregate, so
+	// bucketing and filtering compose in one request rather than needing an opcode per
+	// combination. A client sends one only when some group column carries a width or some
+	// spec carries a filter, so every query expressible on the base opcode stays
+	// byte-identical on the wire.
 	opAggregateFiltered        op = 55 // [table][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter]}
-	opArchiveAggregateFiltered op = 56 // [name][constraint][nGroup]{[attr]}[nAgg]{[func u8][arg][filter]}
+	opArchiveAggregateFiltered op = 56 // [name][constraint][nGroup]{[attr][width u64]}[nAgg]{[func u8][arg][filter]}
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).

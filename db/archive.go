@@ -7,6 +7,7 @@ import (
 	"iter"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -173,20 +174,20 @@ func (t *ArchiveTable) QueryRawProjected(constraint string, projection []string,
 // aggregate over a live table -- only the (small) grouped result is produced, not every
 // matched ad. With no group columns it returns a single row over the whole match.
 func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
-	// Fast path: an unconstrained COUNT(*) with no grouping is the retained record count,
-	// which the archive tracks in O(1). This is the common `SELECT COUNT(*) FROM history`;
-	// scanning tens of thousands of records to count them would be needlessly slow. A
-	// FILTERED count cannot take this path -- the stored total knows nothing about the
-	// filter, so it would silently answer with every row.
-	if len(groupBy) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		aggs[0].Filter == "" && IsMatchAll(constraint) {
-		return []AggRow{{Values: []string{strconv.Itoa(t.a.Count())}}}, nil
-	}
-
 	groupCols := make([]GroupCol, len(groupBy))
 	for i, g := range groupBy {
 		groupCols[i] = GroupCol{Attr: g}
 	}
+	return t.AggregateCols(constraint, groupCols, aggs)
+}
+
+// AggregateCols is Aggregate where a group column may carry a bucket width, so a numeric
+// attribute can be grouped into fixed-width buckets (the "per day" dimension) server-side.
+func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, error) {
+	if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
+		return rows, nil
+	}
+
 	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
 
 	// Scan wire-native, reading only the attributes the aggregation projects (empty for a
@@ -199,12 +200,149 @@ func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []Agg
 	return AggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, nil)
 }
 
+// aggregateFromIndex answers the aggregate without reading records where the per-segment
+// indexes already contain the answer, returning ok=false when they do not so the caller
+// scans. Every path here is restricted to an unconstrained COUNT(*): a WHERE clause would
+// have to be proven to hold for a whole segment before its counts could be attributed, and
+// the probe set a constraint decomposes into is a conservative under-approximation, not a
+// proof.
+//
+// Row order differs from the scan path's first-seen order: rows come back sorted by group
+// value (then bucket). GROUP BY without ORDER BY has no defined order either way, and
+// sorted is at least deterministic.
+func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
+	if len(aggs) != 1 || aggs[0].Func != AggCount || aggs[0].Arg != "*" {
+		return nil, false
+	}
+	// A per-aggregate FILTER rules out every path here: postings and the stored record
+	// count know nothing about the filter, so answering from them would silently report
+	// unfiltered totals as if they were filtered.
+	if aggs[0].Filter != "" {
+		return nil, false
+	}
+	matchAll := IsMatchAll(constraint)
+	switch len(groupCols) {
+	case 0:
+		if !matchAll {
+			return nil, false
+		}
+		// The retained record count, which the archive tracks in O(1).
+		return []AggRow{{Values: []string{strconv.Itoa(t.a.Count())}}}, true
+
+	case 1:
+		if groupCols[0].BucketWidth != 0 {
+			return nil, false // a lone bucketed column: nothing to read counts from
+		}
+		// A constrained count is only index-answerable when the constraint's shape can be
+		// verified as a conjunction of zone-decidable range conditions; otherwise
+		// CategoricalGroupCountsWhere declines and we scan.
+		var counts map[string]int64
+		var ok bool
+		if matchAll {
+			counts, ok = t.a.CategoricalGroupCounts(groupCols[0].Attr)
+		} else {
+			counts, ok = t.a.CategoricalGroupCountsWhere(groupCols[0].Attr, constraint)
+		}
+		if !ok {
+			return nil, false
+		}
+		vals := make([]string, 0, len(counts))
+		for v := range counts {
+			vals = append(vals, v)
+		}
+		sort.Strings(vals)
+		rows := make([]AggRow, 0, len(vals))
+		for _, v := range vals {
+			rows = append(rows, AggRow{
+				Group:  []string{v},
+				Values: []string{strconv.FormatInt(counts[v], 10)},
+			})
+		}
+		return rows, true
+
+	case 2:
+		// One raw categorical column and one bucketed numeric column, in either order --
+		// "jobs per owner per day". The bucket dimension comes from segment zone maps, so
+		// whole segments are attributed without being read.
+		//
+		// Unconstrained only: the bucketed helper takes no constraint, so answering a
+		// WHERE-bearing query from it would silently ignore the filter.
+		if !matchAll {
+			return nil, false
+		}
+		cat, bucket := 0, 1
+		if groupCols[0].BucketWidth != 0 {
+			cat, bucket = 1, 0
+		}
+		if groupCols[cat].BucketWidth != 0 || groupCols[bucket].BucketWidth <= 0 {
+			return nil, false
+		}
+		byBucket, ok := t.a.CategoricalGroupCountsBucketed(
+			groupCols[cat].Attr, groupCols[bucket].Attr, groupCols[bucket].BucketWidth)
+		if !ok {
+			return nil, false
+		}
+		buckets := make([]int64, 0, len(byBucket))
+		for b := range byBucket {
+			buckets = append(buckets, b)
+		}
+		sort.Slice(buckets, func(i, j int) bool { return buckets[i] < buckets[j] })
+		var rows []AggRow
+		for _, b := range buckets {
+			counts := byBucket[b]
+			vals := make([]string, 0, len(counts))
+			for v := range counts {
+				vals = append(vals, v)
+			}
+			sort.Strings(vals)
+			for _, v := range vals {
+				group := make([]string, 2)
+				group[cat] = v
+				group[bucket] = strconv.FormatInt(b, 10)
+				rows = append(rows, AggRow{
+					Group:  group,
+					Values: []string{strconv.FormatInt(counts[v], 10)},
+				})
+			}
+		}
+		return rows, true
+	}
+	return nil, false
+}
+
 // IsMatchAll reports whether a constraint imposes no filter (an empty string or a literal
 // "true"), so an aggregate over it covers every record. Shared with the mutable-table
 // COUNT(*) fast path in dbrpc.
 func IsMatchAll(constraint string) bool {
 	c := strings.TrimSpace(constraint)
 	return c == "" || strings.EqualFold(c, "true")
+}
+
+// CategoricalGroupCounts returns the exact per-value record counts for a categorically
+// indexed attribute, read from the per-segment indexes without scanning any record. ok is
+// false when the indexes cannot fully account for every record (see the collections-level
+// doc), in which case the caller must scan. Aggregate uses this for GROUP BY COUNT(*);
+// it is exported so a planner can ask whether the cheap path is available.
+func (t *ArchiveTable) CategoricalGroupCounts(attr string) (map[string]int64, bool) {
+	return t.a.CategoricalGroupCounts(attr)
+}
+
+// CategoricalGroupCountsBucketed is CategoricalGroupCounts split by a numeric bucket
+// (floor(bucketAttr/width)*width) -- the "per group per day" shape. bucketAttr must be
+// zone-mapped; ok is false when the counts cannot be established from the indexes.
+//
+// Not yet reachable from SQL: the archive aggregate crosses dbrpc as a []string group list,
+// which has no room for a bucket width, so a bucketed GROUP BY over an archive still falls
+// back to client-side reduction. Wiring it through is a protocol change.
+func (t *ArchiveTable) CategoricalGroupCountsBucketed(attr, bucketAttr string, width int64) (map[int64]map[string]int64, bool) {
+	return t.a.CategoricalGroupCountsBucketed(attr, bucketAttr, width)
+}
+
+// CategoricalGroupCountsWhere is CategoricalGroupCounts restricted to records matching
+// constraint. ok is false unless the constraint is a pure conjunction of numeric
+// comparisons on zone-mapped attributes and the indexes account for every record.
+func (t *ArchiveTable) CategoricalGroupCountsWhere(attr, constraint string) (map[string]int64, bool) {
+	return t.a.CategoricalGroupCountsWhere(attr, constraint)
 }
 
 // Count is the number of records currently retained (reduced by rotation).

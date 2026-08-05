@@ -389,6 +389,22 @@ func (si *mmapSegIndex) catCanonicalValues(id uint32, add func(string) bool) boo
 	return true
 }
 
+// catValueCount returns the number of records spelling categorical attribute id exactly
+// key, read as the cardinality of that value's posting. roaring keeps per-container
+// cardinalities in the serialized descriptive header, so this pages in the head of the
+// bitmap rather than its containers.
+func (si *mmapSegIndex) catValueCount(id uint32, key string) (uint64, bool) {
+	attrOff, ok := si.catDir[id]
+	if !ok {
+		return 0, false
+	}
+	bmOff, ok := si.catFindExact(attrOff, key)
+	if !ok {
+		return 0, false
+	}
+	return si.bitmapAt(bmOff).GetCardinality(), true
+}
+
 // catFindMPH probes the categorical MPH (v6). It returns (bmOff, true) only for a key that
 // the MPH resolves AND whose folded spelling verifies at the resolved slot; any other case
 // -- no MPH, an unresolved key (unassigned member or non-member), or a verify mismatch (an
