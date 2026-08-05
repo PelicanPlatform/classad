@@ -62,9 +62,43 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 		for _, seg := range segs {
 			if cs := c.buildColSegment(seg, s, hot); cs != nil {
 				seg.colblk.Store(cs)
+				c.persistColSeg(sh, seg) // write it to the sidecar so a reopen reloads it (no-op for RAM)
 			}
 		}
 	}
+}
+
+// persistColSeg writes seg's freshly-built columnar block into its sidecar container (preserving
+// the existing attribute + key sections) and remaps it, so a block built at EnableSchemaScan time
+// over an ALREADY-sealed segment survives a reopen instead of being re-transcoded. Without it a
+// segment sealed BEFORE schema-scan was enabled would keep an in-RAM-only block and row-fall-back
+// after reopen until a reindex touched it. No-op for an in-memory (RAM) segment or one whose
+// sidecar cannot be read. Holds reindexMu to serialize the sidecar rewrite against a concurrent
+// Reindex, which rewrites the same container.
+func (c *Collection) persistColSeg(sh *shard, seg *segment) {
+	path := snapshotPath(seg)
+	if path == "" {
+		return // in-memory segment: the block stays in RAM, nothing to persist
+	}
+	colBlob := c.colBlobPreserve(seg)
+	if colBlob == nil {
+		return
+	}
+	c.reindexMu.Lock()
+	defer c.reindexMu.Unlock()
+	// Copy the current attribute + key sections out of the live mapping before the rewrite.
+	data, closer, err := mapFile(path)
+	if err != nil {
+		return
+	}
+	attr, key, _, ok := splitSegmentSidecar(data)
+	if !ok {
+		_ = closer()
+		return
+	}
+	container := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...), colBlob)
+	_ = closer()
+	c.installSidecar(sh, seg, path, container)
 }
 
 // buildColSegment transcodes a sealed segment into its columnar accelerator block under schema s
