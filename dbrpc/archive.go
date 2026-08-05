@@ -265,7 +265,7 @@ func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte
 				// archive aggregate can fall back to a client-side scan; a FILTERED one
 				// must not be retried without its filters.
 				if filtered {
-					return nil, ErrFilteredAggregateUnsupported
+					return nil, ErrExtendedAggregateUnsupported
 				}
 				return nil, ErrArchiveAggregateUnsupported
 			default:

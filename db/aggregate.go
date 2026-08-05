@@ -28,10 +28,18 @@ const (
 	AggAvg
 	AggMin
 	AggMax
+	// AggCountDistinct is COUNT(DISTINCT col): the number of distinct defined values of
+	// the argument in the group. It is EXACT, and therefore keeps one entry per distinct
+	// value per group while the scan runs -- fine for the attributes people group and
+	// count by (Owner, JobStatus, a host name), but not something to point at a
+	// unique-per-row attribute over a large history. There is deliberately no silent
+	// switch to a sketch: a query written COUNT(DISTINCT ...) gets a true count, and an
+	// approximate one would have to be asked for by name.
+	AggCountDistinct
 )
 
 // AggSpec is one aggregate in a query: a function over an argument attribute.
-// Arg "*" (only meaningful for COUNT) counts every row in the group; otherwise
+// Arg "*" (only meaningful for plain COUNT) counts every row in the group; otherwise
 // Arg is an attribute name evaluated per ad.
 //
 // Filter, when non-empty, is a ClassAd expression restricting this aggregate -- and only
@@ -228,6 +236,11 @@ func bindValue(ad *classad.ClassAd, name string, v classad.Value) {
 // scan whose client has gone away.
 func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []GroupCol, aggs []AggSpec, groupCol, aggCol []int, stop func() bool) ([]AggRow, error) {
 	nGroup := len(groupCols)
+	for _, a := range aggs {
+		if a.Func == AggCountDistinct && a.Arg == "*" {
+			return nil, fmt.Errorf("COUNT(DISTINCT *) is not meaningful; name an attribute")
+		}
+	}
 	filters, anyFilter, err := compileFilters(attrs, aggs)
 	if err != nil {
 		return nil, err
@@ -319,9 +332,10 @@ type groupState struct {
 // propagation, numeric-only min/max) matches HTCondor's sum()/avg()/min()/max()
 // exactly rather than a re-implementation.
 type aggAcc struct {
-	rows int             // all rows in the group (COUNT(*))
-	defN int             // rows where the argument is defined (COUNT(col))
-	vals []classad.Value // argument values for SUM/AVG/MIN/MAX
+	rows int                 // all rows in the group (COUNT(*))
+	defN int                 // rows where the argument is defined (COUNT(col))
+	vals []classad.Value     // argument values for SUM/AVG/MIN/MAX
+	seen map[string]struct{} // distinct defined argument values (COUNT DISTINCT)
 }
 
 // update folds one row's already-resolved argument value v into the accumulator.
@@ -331,10 +345,22 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value) {
 	if spec.Arg == "*" {
 		return
 	}
-	if !v.IsUndefined() && !v.IsError() {
+	defined := !v.IsUndefined() && !v.IsError()
+	if defined {
 		a.defN++
 	}
-	if spec.Func != AggCount {
+	switch spec.Func {
+	case AggCount:
+	case AggCountDistinct:
+		// Keyed on the same rendering the group tuple uses, so two rows count as one
+		// value exactly when they would group together.
+		if defined {
+			if a.seen == nil {
+				a.seen = map[string]struct{}{}
+			}
+			a.seen[ValueText(v)] = struct{}{}
+		}
+	default:
 		a.vals = append(a.vals, v) // the library aggregates skip undefined / coerce
 	}
 }
@@ -347,6 +373,8 @@ func (a *aggAcc) result(spec AggSpec) string {
 			return strconv.Itoa(a.rows)
 		}
 		return strconv.Itoa(a.defN)
+	case AggCountDistinct:
+		return strconv.Itoa(len(a.seen))
 	case AggSum:
 		return ValueText(classad.Sum(a.vals))
 	case AggAvg:

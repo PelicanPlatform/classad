@@ -26,6 +26,9 @@ const (
 	AggAvg   = db.AggAvg
 	AggMin   = db.AggMin
 	AggMax   = db.AggMax
+	// AggCountDistinct is COUNT(DISTINCT col). It rides the extended opcodes (see
+	// anyFiltered), since an older server would not recognize the function.
+	AggCountDistinct = db.AggCountDistinct
 )
 
 // Aggregate runs a server-side GROUP BY: the server buckets the constraint match
@@ -94,7 +97,7 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 				// fallback -- retrying without the filters would answer a different
 				// question and report it as success.
 				if filtered {
-					return nil, ErrFilteredAggregateUnsupported
+					return nil, ErrExtendedAggregateUnsupported
 				}
 				return out, fmt.Errorf("dbrpc: aggregate rejected as a bad request")
 			}
@@ -165,7 +168,7 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 				// caller can fall back to client-side bucketing -- but NOT for a filtered
 				// request, where dropping the filters would change the answer.
 				if filtered {
-					return nil, ErrFilteredAggregateUnsupported
+					return nil, ErrExtendedAggregateUnsupported
 				}
 				return nil, ErrBucketedUnsupported
 			default:
@@ -252,12 +255,17 @@ func readAggSpecs(r *reader, reqID uint64, write func([]byte), filtered bool) ([
 	return aggs, true
 }
 
-// anyFiltered reports whether some spec carries a per-aggregate filter, which is what makes
-// a client reach for the newer opcode. Without one the request goes out on the original
-// opcode, so an older server keeps serving it.
+// anyFiltered reports whether some spec needs the extended opcodes: a per-aggregate filter,
+// or a function an older server would not recognize. Without one the request goes out on the
+// original opcode, so an older server keeps serving it.
+//
+// COUNT DISTINCT is gated for the same reason a filter is. The function selector is a u8, so
+// an old server would decode the frame happily, fail to match the unknown function, and
+// return "undefined" for that column -- visibly odd rather than plausibly wrong, but still
+// not an error. Refusing the opcode says what actually happened.
 func anyFiltered(aggs []AggSpec) bool {
 	for _, a := range aggs {
-		if a.Filter != "" {
+		if a.Filter != "" || a.Func > AggMax {
 			return true
 		}
 	}
@@ -276,11 +284,17 @@ func putAggSpecs(b []byte, aggs []AggSpec, filtered bool) []byte {
 	return b
 }
 
-// ErrFilteredAggregateUnsupported is returned when the server is too old to know the
-// filtered-aggregate opcodes. The caller must NOT retry without the filters: the answer
-// would be an unfiltered aggregate, which is wrong rather than merely slower.
-var ErrFilteredAggregateUnsupported = errors.New(
-	"dbrpc: server does not support per-aggregate FILTER")
+// ErrExtendedAggregateUnsupported is returned when the server is too old to know the
+// extended-aggregate opcodes -- the ones carrying a per-aggregate FILTER or a function it
+// would not recognize, such as COUNT DISTINCT. The caller must NOT retry without them: the
+// answer would be a different aggregate, which is wrong rather than merely slower.
+var ErrExtendedAggregateUnsupported = errors.New(
+	"dbrpc: server does not support per-aggregate FILTER or COUNT DISTINCT")
+
+// ErrFilteredAggregateUnsupported is the former name of ErrExtendedAggregateUnsupported,
+// from when a filter was the only thing the extended opcodes carried. It is the same error
+// value, so errors.Is against either still matches.
+var ErrFilteredAggregateUnsupported = ErrExtendedAggregateUnsupported
 
 // aggregate is the shared GROUP BY core for both aggregate opcodes: it refuses
 // private attributes for an unprivileged connection, projects only the attributes
