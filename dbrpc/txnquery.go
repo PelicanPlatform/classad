@@ -16,6 +16,9 @@ var ErrTxnReadUnsupported = errors.New("dbrpc: server does not support transacti
 // reads the committed store and cannot see them, which is the whole reason this exists --
 // a caller that has staged writes and wants to read them back must come through here.
 //
+// Reads are snapshot-isolated: the committed rows are read at the transaction's own
+// snapshot, so a concurrent commit is invisible for the transaction's lifetime.
+//
 // The transaction's table is implied (opBegin bound it), so unlike QueryTable there is no
 // table argument. A limit <= 0 returns every match. Against a server without the opcode it
 // returns ErrTxnReadUnsupported.

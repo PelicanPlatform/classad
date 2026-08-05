@@ -14,24 +14,19 @@ import (
 // rewritten form, and a row it created is included if it matches -- so a query inside a
 // transaction observes the transaction's own work, which Collection.Query cannot.
 //
-// Consistency: the committed half is read live, not at the transaction's snapshot, so
-// this is read-committed plus read-your-writes rather than full snapshot isolation. Get
-// does read at the snapshot, so a point lookup and a scan in the same transaction can
-// disagree about a row a *different* transaction committed in between. Making the scan
-// snapshot-consistent needs a scan-at-sequence path the store does not have; the
-// transaction's own writes -- the thing callers actually reach for a transactional query
-// to see -- are exact either way.
+// Consistency: snapshot isolation plus read-your-writes. The committed half is read at
+// the transaction's own snapshot sequence per shard -- the same sequence Get reads at --
+// so a scan and a point lookup in one transaction agree, and a row another transaction
+// commits mid-scan is invisible to both. Scanning a shard captures its snapshot if the
+// transaction has not touched it yet, which pins every later read of that shard too.
 //
-// Cost: with no buffered writes this is exactly Collection.Query, index pushdown and
-// all. Once the transaction has staged a write the committed half becomes a full scan,
-// because the overlay has to know each row's key to tell whether the transaction
-// superseded it, and the indexed query path yields ads without keys. Transactions exist
-// to batch writes, so that trade -- pay only after you have written -- keeps the common
-// BEGIN/SELECT/COMMIT shape at full speed.
+// Cost: a full scan of the committed half, because reading at a past sequence and
+// overlaying by key both need the per-record walk that the indexed query path (which
+// yields ads without keys, at the current sequence) does not do. A transaction that has
+// bought nothing from either -- no buffered writes, and content to read the live store --
+// is better served by Collection.Query, which is what Txn with an untouched write buffer
+// used to fall back to; that fast path is gone now that the snapshot is the point.
 func (tx *Txn) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
-	if len(tx.writes) == 0 {
-		return tx.c.Query(q)
-	}
 	return func(yield func(*classad.ClassAd) bool) {
 		if !tx.scanCommitted(q, func(_ string, ad *classad.ClassAd) bool { return yield(ad) }) {
 			return
@@ -52,12 +47,13 @@ func (tx *Txn) KeysWhere(q *vm.Query) iter.Seq[string] {
 	}
 }
 
-// scanCommitted visits every committed row matching q whose key the transaction has NOT
-// buffered -- those are represented by the buffered version, which forEachBufferedMatch
-// yields instead. Returns false if the caller stopped early.
+// scanCommitted visits every row matching q that was committed as of the transaction's
+// snapshot and whose key the transaction has NOT buffered -- those are represented by the
+// buffered version, which forEachBufferedMatch yields instead. Returns false if the
+// caller stopped early.
 func (tx *Txn) scanCommitted(q *vm.Query, visit func(key string, ad *classad.ClassAd) bool) bool {
 	ok := true
-	tx.c.ForEachAd(func(key string, ad *classad.ClassAd) bool {
+	tx.c.ForEachAdAt(tx.snapOf, func(key string, ad *classad.ClassAd) bool {
 		if _, superseded := tx.writes[key]; superseded {
 			return true
 		}

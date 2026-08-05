@@ -750,11 +750,12 @@ func (t *Txn) LookupClassAd(key string) (*classad.ClassAd, bool) {
 // it reads the committed store -- which is why a caller that has staged writes and then
 // wants to read them back must go through the transaction.
 //
-// See collections.Txn.Query for the two properties worth knowing: the committed half is
-// read live rather than at the transaction's snapshot (read-committed plus
-// read-your-writes, not full snapshot isolation), and it degrades from an indexed query
-// to a full scan once the transaction has buffered a write. Errors only on a malformed
-// constraint.
+// Isolation is snapshot plus read-your-writes: the committed half is read at the
+// transaction's own snapshot sequence, the same one Get reads at, so a scan and a point
+// lookup in one transaction agree and a concurrent commit is invisible to both. The cost
+// is a full scan -- reading at a past sequence and overlaying by key both need the
+// per-record walk the indexed query path skips. See collections.Txn.Query. Errors only on
+// a malformed constraint.
 func (t *Txn) Query(constraint string) (iter.Seq[*classad.ClassAd], error) {
 	q, err := vm.Parse(constraint)
 	if err != nil {

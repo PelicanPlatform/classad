@@ -239,3 +239,101 @@ func TestTxnQueryBufferedRowsAreOrdered(t *testing.T) {
 		t.Errorf("got %v, want %v", first, want)
 	}
 }
+
+// A row another transaction commits after this one captured its snapshot is invisible to
+// this transaction's scan -- the property that makes a scan and a point lookup agree.
+// Before ForEachAdAt the scan read the live store and would have seen it.
+func TestTxnQueryIsSnapshotIsolated(t *testing.T) {
+	c := newTxnColl(t)
+	txnCommit(t, c, map[string]*classad.ClassAd{"a": txnAd("alice", 8)})
+
+	tx := c.Begin()
+	// Capture the snapshot: a buffered write touches (and pins) its shard, and the first
+	// scan pins the rest.
+	tx.Put([]byte("staged"), txnAd("staged", 8))
+	if got, want := owners(tx.Query(mustQuery(t, "Cpus >= 4"))), []string{"alice", "staged"}; !slices.Equal(got, want) {
+		t.Fatalf("before the concurrent commit: got %v, want %v", got, want)
+	}
+
+	// Another writer lands a row after this transaction's snapshot.
+	txnCommit(t, c, map[string]*classad.ClassAd{"b": txnAd("bob", 8)})
+
+	if got, want := owners(tx.Query(mustQuery(t, "Cpus >= 4"))), []string{"alice", "staged"}; !slices.Equal(got, want) {
+		t.Errorf("after the concurrent commit: got %v, want %v (bob leaked into the snapshot)", got, want)
+	}
+	// A fresh transaction does see it, so the row really did commit.
+	fresh := c.Begin()
+	if got, want := owners(fresh.Query(mustQuery(t, "Cpus >= 4"))), []string{"alice", "bob"}; !slices.Equal(got, want) {
+		t.Errorf("fresh transaction got %v, want %v", got, want)
+	}
+}
+
+// The scan and a point lookup in one transaction must agree about a row a concurrent
+// writer changed: both read at the transaction's snapshot.
+func TestTxnQueryAgreesWithGet(t *testing.T) {
+	c := newTxnColl(t)
+	txnCommit(t, c, map[string]*classad.ClassAd{"a": txnAd("alice", 8)})
+
+	tx := c.Begin()
+	tx.Put([]byte("staged"), txnAd("staged", 8)) // force the overlay path
+	// Read "a" first, so its shard's snapshot is captured BEFORE the concurrent write.
+	// Without that the transaction would capture the snapshot after the fact and the two
+	// reads would agree trivially, proving nothing.
+	if _, ok := tx.Get([]byte("a")); !ok {
+		t.Fatal("seed row missing")
+	}
+
+	// A concurrent writer moves "a" out of the match set.
+	txnCommit(t, c, map[string]*classad.ClassAd{"a": txnAd("alice", 1)})
+
+	scanned := owners(tx.Query(mustQuery(t, "Cpus >= 4")))
+	ad, ok := tx.Get([]byte("a"))
+	if !ok {
+		t.Fatal("Get lost the row entirely")
+	}
+	cpus, _ := ad.EvaluateAttr("Cpus").IntValue()
+	inScan := slices.Contains(scanned, "alice")
+	if inScan != (cpus >= 4) {
+		t.Errorf("scan says alice matches=%v but Get reports Cpus=%d: the two disagree", inScan, cpus)
+	}
+}
+
+// A transaction that never writes still reads at its snapshot, so repeated scans are
+// stable even while other writers commit.
+func TestTxnQueryRepeatableWithoutWrites(t *testing.T) {
+	c := newTxnColl(t)
+	txnCommit(t, c, map[string]*classad.ClassAd{"a": txnAd("alice", 8)})
+
+	tx := c.Begin()
+	first := owners(tx.Query(mustQuery(t, "Cpus >= 4")))
+
+	txnCommit(t, c, map[string]*classad.ClassAd{"b": txnAd("bob", 8)})
+
+	if second := owners(tx.Query(mustQuery(t, "Cpus >= 4"))); !slices.Equal(first, second) {
+		t.Errorf("repeated scan changed under a concurrent commit: %v then %v", first, second)
+	}
+}
+
+// KeysWhere reads at the snapshot too -- an UPDATE or DELETE inside a transaction must
+// not pick up rows that appeared after it started.
+func TestTxnKeysWhereIsSnapshotIsolated(t *testing.T) {
+	c := newTxnColl(t)
+	txnCommit(t, c, map[string]*classad.ClassAd{"a": txnAd("alice", 8)})
+
+	tx := c.Begin()
+	var before []string
+	for k := range tx.KeysWhere(mustQuery(t, "Cpus >= 4")) {
+		before = append(before, k)
+	}
+	txnCommit(t, c, map[string]*classad.ClassAd{"b": txnAd("bob", 8)})
+
+	var after []string
+	for k := range tx.KeysWhere(mustQuery(t, "Cpus >= 4")) {
+		after = append(after, k)
+	}
+	slices.Sort(before)
+	slices.Sort(after)
+	if !slices.Equal(before, after) {
+		t.Errorf("key set changed under a concurrent commit: %v then %v", before, after)
+	}
+}
