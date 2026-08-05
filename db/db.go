@@ -216,6 +216,11 @@ type MaintainOptions struct {
 	IndexBudgetHighFrac   float64
 	IndexBudgetLowFrac    float64
 	IndexBudgetSlackBytes int64
+	// ArchiveMerge tunes the merge pass run over each archive table. The zero value uses
+	// the policy defaults, which target a segment count well clear of the process's mapping
+	// budget. ArchiveMergeDisabled turns the archive side of maintenance off entirely.
+	ArchiveMerge         MergeOptions
+	ArchiveMergeDisabled bool
 	// SchemaScanHotTopN, when > 0, builds/refreshes the per-segment adschema columnar
 	// accelerator (used by CountConstraint's fast path) keeping the topN most query-read
 	// numeric fields uncompressed. The first pass chooses a stable schema and hot set from
