@@ -36,11 +36,13 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 	for {
 		cur := c.spec.Load()
 		next := cur.clone()
-		intern := func(name string) uint32 {
+		// ok is false only when an inline id collides with a different attribute; that
+		// attribute is then left unindexed rather than aliased onto another's postings.
+		intern := func(name string) (uint32, bool) {
 			if next.inline {
 				return next.inlineID(name)
 			}
-			return c.intern.Intern(name)
+			return c.intern.Intern(name), true
 		}
 		// mark records id's provenance, judged against the PRE-EXISTING spec (cur): an
 		// auto add marks it auto unless it was already a human index (no downgrade); a
@@ -60,13 +62,19 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 			}
 		}
 		for _, name := range categorical {
-			id := intern(name)
+			id, ok := intern(name)
+			if !ok {
+				continue
+			}
 			removeID(&next.valIDs, next.val, id) // categorical wins if it was a value index
 			addID(&next.catIDs, next.cat, id)
 			mark(id)
 		}
 		for _, name := range value {
-			id := intern(name)
+			id, ok := intern(name)
+			if !ok {
+				continue
+			}
 			if _, isCat := next.cat[id]; isCat {
 				continue // already categorical; do not double-index
 			}
