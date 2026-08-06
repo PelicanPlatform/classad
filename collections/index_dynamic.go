@@ -84,7 +84,7 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 		if next.equalIDs(cur) && next.equalAuto(cur) {
 			return false
 		}
-		next.gen = cur.gen + 1
+		next.gen = next.signature()
 		if c.spec.CompareAndSwap(cur, next) {
 			// An append-only collection zones every value-indexed attribute (New wires
 			// ZoneAttrs and ValueAttrs together), so a value index added at runtime must
@@ -124,7 +124,7 @@ func (c *Collection) DropIndex(names ...string) bool {
 		if next.equalIDs(cur) {
 			return false
 		}
-		next.gen = cur.gen + 1
+		next.gen = next.signature()
 		if c.spec.CompareAndSwap(cur, next) {
 			return true
 		}
