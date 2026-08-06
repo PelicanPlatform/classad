@@ -42,7 +42,6 @@ type indexSpec struct {
 	// interned mode these are zero/nil and id == the global intern id. Indexes on a
 	// persistent collection are in-memory only and rebuilt on recovery.
 	inline   bool
-	nextID   uint32            // next synthetic id to assign (inline only)
 	names    map[uint32]string // id -> attribute name (inline only)
 	nameToID map[string]uint32 // folded name -> id (inline only)
 
@@ -92,18 +91,51 @@ func (s *indexSpec) equalAuto(o *indexSpec) bool {
 	return true
 }
 
-// inlineID returns the synthetic id for name, assigning a fresh one on first use.
-// Only valid on a freshly built or cloned (unpublished) inline spec.
-func (s *indexSpec) inlineID(name string) uint32 {
+// inlineID returns the id for name, derived from the name itself. ok is false when the id
+// collides with a different attribute already in this spec, in which case the caller must
+// leave that attribute unindexed.
+//
+// Deriving the id from the name rather than assigning a sequence number is a correctness
+// requirement, not tidiness. Ids were positional -- 0,1,2 in the order of the persisted name
+// list -- so DROPPING an index shifted every later attribute's id on the next restart, while
+// spec.gen (which is not persisted) reset to 0 and made stale sidecars look current again. A
+// sidecar written before the drop would then be read with its id 0 meaning one attribute and
+// the spec's id 0 meaning another. Candidates are re-verified against the real predicate, so
+// that surfaced not as wrong rows but as MISSING ones.
+//
+// With the id following the name, an old sidecar's ids either mean the same attributes they
+// always did or match nothing in the current spec -- in which case the attribute reads as
+// uncovered and that segment is scanned. Wrong is not among the outcomes.
+func (s *indexSpec) inlineID(name string) (uint32, bool) {
 	fold := strings.ToLower(name)
 	if id, ok := s.nameToID[fold]; ok {
-		return id
+		return id, true
 	}
-	id := s.nextID
-	s.nextID++
+	id := inlineAttrID(fold)
+	if have, taken := s.names[id]; taken && !strings.EqualFold(have, fold) {
+		// Two attribute names hashing together. Astronomically unlikely, and silently
+		// aliasing them would mean one attribute's index answering for the other, so
+		// refuse: the attribute stays unindexed and its queries scan.
+		return 0, false
+	}
 	s.nameToID[fold] = id
 	s.names[id] = name
-	return id
+	return id, true
+}
+
+// inlineAttrID hashes a folded attribute name to its id (FNV-1a, 32-bit -- the width the
+// sidecar stores attribute ids in).
+func inlineAttrID(fold string) uint32 {
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	h := uint32(offset32)
+	for i := 0; i < len(fold); i++ {
+		h ^= uint32(fold[i])
+		h *= prime32
+	}
+	return h
 }
 
 // attrNode returns the value node for the attribute with id id in ad, reading it by
@@ -155,7 +187,6 @@ func (s *indexSpec) clone() *indexSpec {
 		cat:    make(map[uint32]struct{}, len(s.cat)),
 		val:    make(map[uint32]struct{}, len(s.val)),
 		inline: s.inline,
-		nextID: s.nextID,
 	}
 	for id := range s.cat {
 		n.cat[id] = struct{}{}
@@ -194,14 +225,20 @@ func newInlineIndexSpec(catNames, valNames []string) *indexSpec {
 		nameToID: map[string]uint32{},
 	}
 	for _, name := range catNames {
-		id := s.inlineID(name)
+		id, ok := s.inlineID(name)
+		if !ok {
+			continue
+		}
 		if _, dup := s.cat[id]; !dup {
 			s.cat[id] = struct{}{}
 			s.catIDs = append(s.catIDs, id)
 		}
 	}
 	for _, name := range valNames {
-		id := s.inlineID(name)
+		id, ok := s.inlineID(name)
+		if !ok {
+			continue
+		}
 		if _, isCat := s.cat[id]; isCat {
 			continue // an attr indexed as both: categorical wins (matches AddIndex)
 		}
