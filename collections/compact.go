@@ -261,9 +261,22 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 		retrainStallHook() // test seam: observe concurrent access during a long retrain
 	}
 	if c.appendOnly() {
-		// Append log: recompress each segment in place (reseal preserving order) instead
-		// of the compaction live-copy, which would supersede/renumber -- illegal here.
-		c.resealAppendOnly(codec)
+		// An append log stops here. Every segment records the dictionary it was written
+		// under and recovery reconstructs all of them, so old segments remain readable on
+		// their old dictionary indefinitely -- re-encoding them is an optimization, not a
+		// correctness requirement.
+		//
+		// Treating it as one made a retrain reseal the entire archive: at history scale
+		// that is hours of I/O and a flushed page cache, for a compression gain that is
+		// usually small and occasionally NEGATIVE (a dictionary trained on recent ads can
+		// compress older ones worse once the distribution has moved). Re-encoding is now a
+		// separate, budgeted, per-segment-measured decision -- see UpgradeCodecPass -- and
+		// Rewrite is still the explicit "re-encode everything now" escape hatch.
+		//
+		// Interning still runs: turning a sealed segment from inline to interned form is a
+		// one-way transition each segment undergoes ONCE, so it does not accumulate the way
+		// re-compression would.
+		c.internSealedLocked()
 	} else {
 		for _, sh := range c.shards {
 			c.compactShard(sh, codec) // recompress to the new codec

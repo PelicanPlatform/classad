@@ -80,6 +80,17 @@ func (c *Collection) InternSealed() {
 	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
+	c.internSealedLocked()
+}
+
+// internSealedLocked is InternSealed's body, for callers already holding maintMu (RetrainDict
+// runs it so a retrain still interns whatever has sealed since the last one -- a one-way,
+// once-per-segment transition, unlike recompression, which would otherwise repeat over the
+// whole archive on every retrain).
+func (c *Collection) internSealedLocked() {
+	if !c.inline || !c.appendOnly() {
+		return
+	}
 	codec := c.currentCodec()
 	swapped := false
 	for _, sh := range c.shards {
