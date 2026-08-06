@@ -46,7 +46,18 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	}
 	var mm *mmapSegIndex
 	if len(attr) > 0 && sidecarCRCValid(attr) {
-		if m, e := parseMmapSidecar(attr); e == nil && m != nil && int(m.upto) == seg.used && (spec == nil || m.specGen == spec.gen) {
+		// Publish the sidecar whatever configuration it was built under, provided it covers
+		// the whole segment. Which probes it can actually answer is decided per probe by
+		// coversProbe, which looks the attribute up in the categorical or value directory
+		// according to the probe's kind -- so an attribute the sidecar does not hold, or
+		// holds under the other kind, simply reads as uncovered and that segment is scanned.
+		//
+		// Requiring the configuration to MATCH instead threw away a whole segment's index
+		// over a single unrelated attribute being added elsewhere, and made it impossible for
+		// segments to sit on different index configurations at once -- which is what bounding
+		// index backfill to recent data needs. The upto check stays: an index that stops
+		// short of the segment's records would silently hide the ones past it.
+		if m, e := parseMmapSidecar(attr); e == nil && m != nil && int(m.upto) == seg.used {
 			mm = m
 		}
 	}

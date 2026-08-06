@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"sort"
 	"strings"
 
 	"github.com/RoaringBitmap/roaring/v2"
@@ -31,7 +32,13 @@ import (
 // built under, so Reindex can tell a stale index (built before an add/drop) from a
 // current one. Shared read-only across shards and segments.
 type indexSpec struct {
-	gen    uint64 // bumped on every add/drop, so segIndexes can detect staleness
+	// gen identifies the index CONFIGURATION, so a segment's stored index can be told apart
+	// from one built under a different one. It is a signature over the indexed (id, kind)
+	// set rather than a counter: a counter lives only in memory and restarts at zero, which
+	// made a segment indexed under one configuration look current under an unrelated one --
+	// and made every restart after a configuration change re-index the whole store, because
+	// the reset counter matched nothing on disk.
+	gen    uint64
 	catIDs []uint32
 	valIDs []uint32
 	cat    map[uint32]struct{}
@@ -175,10 +182,40 @@ func newIndexSpec(intern *wire.InternTable, catNames, valNames []string) *indexS
 			s.valIDs = append(s.valIDs, id)
 		}
 	}
+	s.gen = s.signature()
 	return s
 }
 
 // clone returns a deep copy carrying the same gen (callers bump it after mutating).
+// signature derives gen from the indexed set. Stable across processes because attribute ids
+// are derived from their names (see inlineAttrID), so the same configuration always yields
+// the same value and a different one essentially never does.
+func (s *indexSpec) signature() uint64 {
+	cat := append([]uint32(nil), s.catIDs...)
+	val := append([]uint32(nil), s.valIDs...)
+	sort.Slice(cat, func(i, j int) bool { return cat[i] < cat[j] })
+	sort.Slice(val, func(i, j int) bool { return val[i] < val[j] })
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	h := uint64(offset64)
+	mix := func(v uint64) {
+		for i := 0; i < 8; i++ {
+			h ^= (v >> (8 * i)) & 0xff
+			h *= prime64
+		}
+	}
+	for _, id := range cat {
+		mix(uint64(id))
+	}
+	mix(^uint64(0)) // separator, so {cat:[1],val:[]} and {cat:[],val:[1]} differ
+	for _, id := range val {
+		mix(uint64(id))
+	}
+	return h
+}
+
 func (s *indexSpec) clone() *indexSpec {
 	n := &indexSpec{
 		gen:    s.gen,
@@ -247,6 +284,7 @@ func newInlineIndexSpec(catNames, valNames []string) *indexSpec {
 			s.valIDs = append(s.valIDs, id)
 		}
 	}
+	s.gen = s.signature()
 	return s
 }
 
