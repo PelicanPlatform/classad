@@ -41,6 +41,7 @@ func (c *Collection) Reindex() {
 		sh.mu.RLock()
 		act := sh.act
 		sealRAM := sh.sealRAM
+		window := c.backfillWindow(sh)
 		type target struct {
 			seg    *segment
 			used   int
@@ -57,7 +58,13 @@ func (c *Collection) Reindex() {
 				// index derived from it is not: rebuild the sidecar in place when the index
 				// configuration has moved on, so .addindex/.dropindex reach existing
 				// segments without the whole-store re-encode a rewrite would cost.
-				if spec.any() && seg.used > 0 && mm.specGen != spec.gen {
+				// Rebuilding an already-sealed segment's sidecar is BACKFILL -- carrying a
+				// configuration change to data that already has a working index. That is
+				// the one part of a reindex worth bounding: it decompresses every record it
+				// covers, while the index it replaces still answers for the attributes it
+				// holds. Everything else here is a missing or incomplete index, which is
+				// not optional.
+				if spec.any() && seg.used > 0 && mm.specGen != spec.gen && (window == nil || window[seg]) {
 					tgts = append(tgts, target{seg: seg, used: seg.used, reseal: true})
 				}
 				continue
@@ -1428,4 +1435,30 @@ func scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, 
 		}
 	}
 	return true
+}
+
+// backfillWindow returns the segments within the newest Options.IndexBackfillBytes of a
+// shard, or nil when no bound is configured (carry a configuration change everywhere).
+//
+// Newest-first, because that is the end that gets queried: an archive is read newest-first
+// with a limit, so the oldest segments may never be reached, and re-indexing them costs the
+// whole archive to speed up reads that do not happen. Caller holds sh.mu.
+func (c *Collection) backfillWindow(sh *shard) map[*segment]bool {
+	if c.indexBackfillBytes <= 0 {
+		return nil
+	}
+	window := map[*segment]bool{}
+	var acc int64
+	for i := len(sh.segs) - 1; i >= 0; i-- {
+		seg := sh.segs[i]
+		if seg == nil || seg.used == 0 {
+			continue
+		}
+		window[seg] = true
+		acc += int64(seg.used)
+		if acc >= c.indexBackfillBytes {
+			break
+		}
+	}
+	return window
 }
