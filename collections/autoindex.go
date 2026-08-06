@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -40,11 +41,38 @@ type demandCounts struct {
 // queries.
 type demandTracker struct {
 	m sync.Map // foldedName(string) -> *demandCounts
+
+	// total and startedUnix answer a question the per-attribute counters cannot: whether a
+	// zero means "queried by nobody" or "we have not been watching long enough to say".
+	//
+	// The counters are process-local and never decay, so immediately after a restart EVERY
+	// attribute reads zero. Acting on that drops the whole auto-index set on every restart
+	// and rebuilds it as traffic returns -- which on a large table is an expensive way to
+	// arrive back where it started.
+	total       atomic.Int64
+	startedUnix atomic.Int64
 }
 
-func newDemandTracker() *demandTracker { return &demandTracker{} }
+// hasDropEvidence reports whether the tracker has watched long enough, and seen enough
+// queries, for an attribute's zero to mean anything.
+func (d *demandTracker) hasDropEvidence(minQueries int64, minWindow time.Duration) bool {
+	if d.total.Load() < minQueries {
+		return false // an idle daemon has learned nothing about which indexes matter
+	}
+	st := d.startedUnix.Load()
+	return st != 0 && time.Since(time.Unix(0, st)) >= minWindow
+}
+
+func newDemandTracker() *demandTracker {
+	d := &demandTracker{}
+	d.startedUnix.Store(time.Now().UnixNano())
+	return d
+}
 
 func (d *demandTracker) record(probes []vm.Probe) {
+	if len(probes) > 0 {
+		d.total.Add(int64(len(probes)))
+	}
 	for _, p := range probes {
 		v, _ := d.m.LoadOrStore(strings.ToLower(p.Attr), &demandCounts{})
 		c := v.(*demandCounts)
@@ -173,6 +201,12 @@ const (
 	// watermark before AutoTune trims -- so a small overage does not cause churn. Used
 	// when AutoTuneOptions.BudgetSlackBytes is 0.
 	defaultBudgetSlackBytes = 10 << 20 // 10 MiB
+	// defaultDropWindow and defaultDropMinQueries are the evidence an unused-drop needs.
+	// The window outlasts a restart plus the first maintenance ticks, so a daemon that has
+	// just come up never concludes its indexes are unwanted; the query floor stops an idle
+	// daemon concluding anything at all.
+	defaultDropWindow     = time.Hour
+	defaultDropMinQueries = 100
 )
 
 // RecordDemand notes the attributes a constraint filters on (for SuggestIndexes)
@@ -329,7 +363,26 @@ type AutoTuneOptions struct {
 	// ("unused"). Off by default so AutoTune never removes an index a workload has
 	// simply not exercised yet. Human-created indexes and low-cardinality indexes are
 	// never auto-dropped (SuggestDrops reports them for manual review).
+	//
+	// Two guards keep this from thrashing, because rebuilding a dropped index is far more
+	// expensive than carrying an idle one:
+	//
+	//   - It requires EVIDENCE. Demand counters are process-local and never decay, so
+	//     right after a restart every attribute reads zero; dropping on that would discard
+	//     the whole auto set on every restart and rebuild it as traffic returns. Nothing is
+	//     dropped until the tracker has watched for DropUnusedMinWindow and seen at least
+	//     DropUnusedMinQueries probes.
+	//   - When a memory budget is configured it defers to it entirely. An unused index
+	//     that fits costs little, and budgetTrim already evicts least-demanded first when
+	//     space is actually short -- with hysteresis, which dropping on "unused" alone has
+	//     none of. Reclaim when you need the room, not merely because you could.
 	DropUnused bool
+	// DropUnusedMinWindow and DropUnusedMinQueries are how much observation makes a zero
+	// meaningful. Defaults: defaultDropWindow and defaultDropMinQueries. Negative values
+	// waive the requirement (as with BudgetSlackBytes), which is for tests and for a caller
+	// who has its own evidence that an index is unwanted.
+	DropUnusedMinWindow  time.Duration
+	DropUnusedMinQueries int64
 	// BudgetHighFrac / BudgetLowFrac, when BudgetHighFrac > 0, bound index memory as a
 	// fraction of the live data bytes: AutoTune stops adding demand-driven indexes once
 	// index bytes reach the high mark, and trims the least-used AUTO indexes (never
@@ -375,9 +428,27 @@ func (c *Collection) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 		minDemand = 1
 	}
 	adds := c.SuggestIndexes(opts.SampleMax)
+	// Unused-drops are the churn-prone path: they run on demand counters alone, with no
+	// hysteresis. Gate them on evidence, and stand down entirely when a memory budget is
+	// configured -- the budget trim below reclaims the same indexes when space is actually
+	// short, and only then.
 	var drops []DropSuggestion
-	if opts.DropUnused {
-		drops = c.SuggestDrops(opts.SampleMax)
+	if opts.DropUnused && opts.BudgetHighFrac <= 0 {
+		window := opts.DropUnusedMinWindow
+		if window == 0 {
+			window = defaultDropWindow
+		} else if window < 0 {
+			window = 0
+		}
+		minQ := opts.DropUnusedMinQueries
+		if minQ == 0 {
+			minQ = defaultDropMinQueries
+		} else if minQ < 0 {
+			minQ = 0
+		}
+		if c.demand.hasDropEvidence(minQ, window) {
+			drops = c.SuggestDrops(opts.SampleMax)
+		}
 	}
 
 	slack := opts.BudgetSlackBytes

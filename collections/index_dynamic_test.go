@@ -274,7 +274,13 @@ func TestAutoTuneDropsUnused(t *testing.T) {
 	c := New(Options{Shards: 4})
 	c.addIndexAuto([]string{"Ghost"}, nil)
 	putDynAds(t, c, 100)
-	res := c.AutoTune(AutoTuneOptions{DropUnused: true, Reindex: true})
+	// Waive the observation requirement: an unused-drop now needs evidence that the tracker
+	// has watched long enough for a zero to mean something, which a unit test cannot wait
+	// for. See TestAutoTuneDropUnusedNeedsEvidence for the guard itself.
+	res := c.AutoTune(AutoTuneOptions{
+		DropUnused: true, Reindex: true,
+		DropUnusedMinWindow: -1, DropUnusedMinQueries: -1,
+	})
 	if !res.Changed {
 		t.Fatal("AutoTune should have dropped the unused auto Ghost index")
 	}
@@ -364,4 +370,51 @@ func contains(s []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// TestAutoTuneDropUnusedNeedsEvidence covers the guard that stops the auto-index set being
+// discarded on every restart. Demand counters are process-local and never decay, so a
+// freshly started collection reports every attribute as unused -- acting on that drops the
+// whole set and then rebuilds it as traffic returns, which on a large table is an expensive
+// way to end up where it started.
+func TestAutoTuneDropUnusedNeedsEvidence(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4})
+	c.addIndexAuto([]string{"Ghost"}, nil)
+	putDynAds(t, c, 100)
+
+	// A tracker that has just started has watched nothing: the index must survive.
+	res := c.AutoTune(AutoTuneOptions{DropUnused: true, Reindex: true})
+	if cat, _ := c.IndexedAttrs(); len(cat) == 0 {
+		t.Fatalf("Ghost dropped with no observation behind it (changed=%v)", res.Changed)
+	}
+
+	// Waiving the window but not the query floor must still hold, since an idle daemon has
+	// learned nothing about which indexes matter.
+	c.AutoTune(AutoTuneOptions{DropUnused: true, Reindex: true, DropUnusedMinWindow: -1})
+	if cat, _ := c.IndexedAttrs(); len(cat) == 0 {
+		t.Error("Ghost dropped though no queries had been observed")
+	}
+}
+
+// TestAutoTuneDropUnusedDefersToBudget covers the second guard: with a memory budget
+// configured, unused-drops stand down entirely. The budget trim reclaims the same indexes
+// when space is actually short, and only then -- and unlike dropping on "unused" alone, it
+// has hysteresis, so it cannot oscillate around the threshold.
+func TestAutoTuneDropUnusedDefersToBudget(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4})
+	c.addIndexAuto([]string{"Ghost"}, nil)
+	putDynAds(t, c, 100)
+
+	// Evidence fully waived, so only the budget gate can be keeping Ghost alive. A high
+	// watermark far above actual usage means there is no space pressure.
+	c.AutoTune(AutoTuneOptions{
+		DropUnused: true, Reindex: true,
+		DropUnusedMinWindow: -1, DropUnusedMinQueries: -1,
+		BudgetHighFrac: 1000,
+	})
+	if cat, _ := c.IndexedAttrs(); len(cat) == 0 {
+		t.Error("Ghost dropped as unused while well under the memory budget")
+	}
 }
