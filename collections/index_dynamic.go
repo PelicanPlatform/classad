@@ -131,17 +131,35 @@ func (c *Collection) DropIndex(names ...string) bool {
 	}
 }
 
-// StaleIndexSegments counts sealed segments whose index sidecar was built under an older
-// index configuration than the current one, and the total number of sealed segments.
+// StaleIndexSegments reports sealed segments whose index was built under a superseded
+// configuration and is still due a rebuild, out of the sealed segments total.
 //
-// A sealed segment's sidecar is immutable, but it is also derived: Reindex rebuilds a stale
-// one in place (a new mapping beside the live one, swapped atomically) without touching the
-// segment data, so this is normally zero. A non-zero count means some segment's rebuild did
-// not complete -- resealing is best-effort per segment -- and a Reindex will retry it.
+// "Due a rebuild" is the operative part. With Options.IndexBackfillBytes set, a
+// configuration change is deliberately carried only to recent segments; older ones keep the
+// index they have, permanently and by design. Counting those would leave the number
+// permanently non-zero and say nothing about whether anything is wrong -- so they are
+// excluded here and reported separately by StaleIndexSegmentsByPolicy.
+//
+// A persistent non-zero value from this therefore still means what it always meant: a
+// reindex is failing, or never running.
 func (c *Collection) StaleIndexSegments() (stale, sealed int) {
+	stale, _, sealed = c.staleIndexCounts()
+	return stale, sealed
+}
+
+// StaleIndexSegmentsByPolicy reports sealed segments left on a superseded index
+// configuration because they fall outside the backfill horizon. Expected, not actionable:
+// it is the size of the deliberate mixture, and it grows as the store does.
+func (c *Collection) StaleIndexSegmentsByPolicy() int {
+	_, byPolicy, _ := c.staleIndexCounts()
+	return byPolicy
+}
+
+func (c *Collection) staleIndexCounts() (pending, byPolicy, sealed int) {
 	gen := c.spec.Load().gen
 	for _, sh := range c.shards {
 		sh.mu.RLock()
+		window := c.backfillWindow(sh)
 		segs := append([]*segment(nil), sh.segs...)
 		sh.mu.RUnlock()
 		for _, seg := range segs {
@@ -153,12 +171,17 @@ func (c *Collection) StaleIndexSegments() (stale, sealed int) {
 				continue // not sealed to a sidecar: Reindex still rebuilds it in place
 			}
 			sealed++
-			if mm.specGen != gen {
-				stale++
+			if mm.specGen == gen {
+				continue
 			}
+			if window != nil && !window[seg] {
+				byPolicy++ // outside the horizon: never going to be rebuilt, and that is fine
+				continue
+			}
+			pending++
 		}
 	}
-	return stale, sealed
+	return pending, byPolicy, sealed
 }
 
 // IndexedAttrs returns the currently-indexed attribute names, split by kind, in the

@@ -491,6 +491,12 @@ func (t *ArchiveTable) ZoneAttrs() []string { return t.a.ZoneAttrs() }
 // a Rewrite).
 func (t *ArchiveTable) StaleIndexSegments() (stale, sealed int) { return t.a.StaleIndexSegments() }
 
+// StaleIndexSegmentsByPolicy reports segments deliberately left on an older index
+// configuration because they fall outside the backfill horizon -- expected, and not a sign of
+// anything failing. Reported apart from StaleIndexSegments so an alert on the latter stays
+// meaningful once a horizon is configured.
+func (t *ArchiveTable) StaleIndexSegmentsByPolicy() int { return t.a.StaleIndexSegmentsByPolicy() }
+
 // Retention returns the archive's current retention bounds.
 func (t *ArchiveTable) Retention() collections.Retention { return t.a.Retention() }
 

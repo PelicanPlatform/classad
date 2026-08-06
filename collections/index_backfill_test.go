@@ -102,3 +102,46 @@ func TestIndexBackfillHorizonLeavesOlderSegments(t *testing.T) {
 		}
 	}
 }
+
+// TestStaleCountsSeparatePolicyFromFailure pins the distinction an alert depends on. With a
+// backfill horizon, segments outside it stay on an older index configuration forever by
+// design; counting them as "stale" would leave the number permanently non-zero and make it
+// useless as a signal that a reindex is stuck.
+func TestStaleCountsSeparatePolicyFromFailure(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	c, err := Open(Options{
+		Dir: dir, Shards: 1, SegmentSize: 1 << 13,
+		CategoricalAttrs: []string{"Owner"}, IndexBackfillBytes: 24 << 10,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for i := 0; i < 2400; i++ {
+		ad := mustAdOld(t, fmt.Sprintf("Owner = %q\nGroup = %q\nPad = %q",
+			fmt.Sprintf("u%d", i%4), fmt.Sprintf("g%d", (i/4)%8), strings.Repeat("s", 60)))
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Reindex()
+	c.AddIndex([]string{"Group"}, nil)
+	c.Reindex() // carries the change as far as the horizon allows, and no further
+
+	pending, sealed := c.StaleIndexSegments()
+	byPolicy := c.StaleIndexSegmentsByPolicy()
+	if sealed == 0 {
+		t.Fatal("no sealed segments")
+	}
+	if pending != 0 {
+		t.Errorf("%d segments still pending a rebuild after a completed reindex -- an alert "+
+			"on this would fire forever", pending)
+	}
+	if byPolicy == 0 {
+		t.Errorf("no segments reported as left behind by policy, though the horizon is far "+
+			"smaller than the store (%d sealed)", sealed)
+	}
+}

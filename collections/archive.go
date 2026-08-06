@@ -361,6 +361,10 @@ func (a *Archive) ZoneAttrs() []string { return a.c.ZoneAttrs() }
 // failed (it is best-effort per segment); a Reindex retries those segments.
 func (a *Archive) StaleIndexSegments() (stale, sealed int) { return a.c.StaleIndexSegments() }
 
+// StaleIndexSegmentsByPolicy reports segments left on an older index configuration because
+// they fall outside the backfill horizon: expected, and not actionable.
+func (a *Archive) StaleIndexSegmentsByPolicy() int { return a.c.StaleIndexSegmentsByPolicy() }
+
 // --- zone-map helpers (shared with the Collection's per-segment zone maps) ---
 
 // literalFloat extracts a numeric value from a wire literal node (int/real/bool), for
