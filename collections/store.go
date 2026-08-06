@@ -46,6 +46,19 @@ type Options struct {
 	// history archive's aging-out). The zero value keeps everything (Rotate is
 	// then inert). Only meaningful with AppendOnly. See Rotate.
 	Retention Retention
+	// IndexBackfillBytes bounds how far back an index configuration change is carried. When
+	// set, only segments within the newest IndexBackfillBytes have their existing index
+	// rebuilt under a new configuration; older ones keep the index they already have.
+	//
+	// The point is that rebuilding is not free -- it decompresses every record it covers --
+	// while an out-of-date index is still perfectly usable for the attributes it does hold
+	// (recovery uses whatever a segment's index covers, deciding per probe). On an archive
+	// queried newest-first with a limit, the oldest segments may never be reached at all, so
+	// re-indexing them buys little and costs the whole archive.
+	//
+	// 0 carries a change across every segment, which is the historical behaviour.
+	IndexBackfillBytes int64
+
 	// InternAtSeal makes an AppendOnly collection intern each segment as soon as it
 	// seals (when the active segment fills), rather than only when RetrainDict/Rewrite
 	// later reseal it. Interning stores segment-local ids + a per-segment name dictionary
@@ -310,6 +323,8 @@ type Collection struct {
 	// Codec retrain bookkeeping for diagnostics (CodecStats): the wall-clock time of the
 	// last successful RetrainDict in this process (unix nanos; 0 = never) and the trained
 	// dictionary's size in bytes.
+	indexBackfillBytes int64 // see Options.IndexBackfillBytes; 0 = carry changes everywhere
+
 	lastRetrainUnix atomic.Int64
 	lastDictBytes   atomic.Int64
 
@@ -573,6 +588,7 @@ func New(opts Options) *Collection {
 	// Persistent (Dir set) append-only only: c.inline (set later in persist setup) is exactly
 	// Dir != "", and InternSealed is a no-op otherwise, so gate on the option's preconditions here.
 	c.internAtSeal = opts.InternAtSeal && opts.AppendOnly && opts.Dir != ""
+	c.indexBackfillBytes = opts.IndexBackfillBytes
 	c.ret = opts.Retention
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
 	if c.queryPar >= 2 {
