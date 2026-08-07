@@ -14,9 +14,7 @@ import (
 // returns its AST. It does not accept a bare expression; to parse a standalone
 // expression such as "a + 1" or "{1, 2}", use ParseExpr.
 func Parse(input string) (ast.Node, error) {
-	lex := NewLexer(input)
-	yyParse(lex)
-	return lex.Result()
+	return parsePooled(input, false)
 }
 
 // ParseClassAd parses a ClassAd and returns a ClassAd AST node. It returns an
@@ -66,6 +64,9 @@ func ParseExpr(input string) (ast.Expr, error) {
 // for efficiency.
 type ReaderParser struct {
 	lex *StreamingLexer
+	// p is reused across ads: yyParse() allocates a fresh parser (with an inline parse
+	// stack) per call, which on a multi-ad stream is per-ad garbage for no reason.
+	p yyParserImpl
 }
 
 // NewReaderParser creates a reusable parser that pulls consecutive ClassAds
@@ -87,7 +88,7 @@ func (p *ReaderParser) ParseClassAd() (*ast.ClassAd, error) {
 		return nil, err
 	}
 
-	yyParse(p.lex)
+	p.p.Parse(p.lex)
 	node, err := p.lex.Result()
 	if err != nil {
 		return nil, err
