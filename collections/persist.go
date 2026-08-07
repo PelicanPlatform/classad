@@ -294,6 +294,9 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// Complete any merge a crash interrupted, so the directory below is never a half-merged
 	// mixture of a merged segment and the sources it replaced.
 	finishPendingMerges(shardDir)
+	// Each sealed segment's sidecar trailer names the offset of its dictionary record; the
+	// hints are collected while mapping and consumed once every segment is in place.
+	segDictHint := map[*segment]uint32{}
 	entries, err := os.ReadDir(shardDir)
 	if err != nil {
 		return 0, err
@@ -365,7 +368,11 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		// extent is still checked: it must fit the mapping and the record ending exactly
 		// there must verify, so a truncated file or a sidecar left over from a different
 		// segment falls back to the scan rather than being trusted.
-		if rec := readSidecarExtent(seg.path + ".idx"); rec > 0 && rec <= len(seg.data) &&
+		// The same trailer read also yields the offset of the segment's dictionary record,
+		// used below so publishSegDict need not search for it.
+		extent, dictRec := readSidecarTrailer(seg.path + ".idx")
+		segDictHint[seg] = dictRec
+		if rec := extent; rec > 0 && rec <= len(seg.data) &&
 			recExtentEndsCleanly(seg.data, rec) {
 			used = rec
 		} else {
@@ -443,7 +450,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// demote it -- the next write then allocates a fresh inline active segment.
 	for _, seg := range sh.segs {
 		if seg != nil {
-			publishSegDict(seg)
+			publishSegDictAt(seg, segDictHint[seg])
 		}
 	}
 	if sh.act != nil && sh.act.dict.Load() != nil {

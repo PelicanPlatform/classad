@@ -175,6 +175,11 @@ func TestSchemaScanReloadCorruptSection(t *testing.T) {
 		// longer the col body.
 		var attrLen, keyLen, colLen int
 		switch binary.LittleEndian.Uint32(b[len(b)-4:]) {
+		case sidecarContainerMagicV4:
+			t := b[len(b)-sidecarTrailerLenV4:]
+			attrLen = int(binary.LittleEndian.Uint32(t[0:]))
+			keyLen = int(binary.LittleEndian.Uint32(t[4:]))
+			colLen = int(binary.LittleEndian.Uint32(t[8:]))
 		case sidecarContainerMagicV3:
 			t := b[len(b)-sidecarTrailerLenV3:]
 			attrLen = int(binary.LittleEndian.Uint32(t[0:]))

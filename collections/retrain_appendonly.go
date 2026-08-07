@@ -296,7 +296,7 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 		if !ok {
 			return nil
 		}
-		newseg.dict.Store(&segDictHandle{data: newseg.data, base: doff + recKeyOff + 4})
+		newseg.dict.Store(&segDictHandle{data: newseg.data, base: doff + recKeyOff + 4, rec: doff})
 	}
 	// Persistent segments: flush the written extent so recovery sees a complete segment.
 	if newseg.persistent {
