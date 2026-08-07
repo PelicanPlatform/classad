@@ -185,6 +185,13 @@ const (
 	// it receives needs the references. Separate rather than a flag so an older server
 	// rejects it cleanly instead of misparsing a longer frame.
 	opQueryRawProjRefs op = 59 // [table][limit i32][constraint][nattrs i32]{[attr]} -> stream of [oldClassAdText]
+
+	// opWatchWire is opWatch with each event's ad in WIRE FORM instead of ClassAd text,
+	// so a change feed's consumers decode rather than parse (see watchwire.go). Private
+	// attributes are dropped for an unprivileged connection exactly as the text watch
+	// drops them.
+	// [table][cursor] -> stream of [kind u8][key][wire ad][cursor]; opWatchStop ends it.
+	opWatchWire op = 60
 )
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
@@ -218,6 +225,8 @@ func (o op) String() string {
 		return "MatchSorted"
 	case opWatch:
 		return "Watch"
+	case opWatchWire:
+		return "WatchWire"
 	case opWatchStop:
 		return "WatchStop"
 	case opWatchHead:
