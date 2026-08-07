@@ -118,7 +118,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 		attrBlob = b
 	}
 	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobForSeg(seg),
-		buildZoneBlob(seg.zones), seg.used)
+		buildZoneBlob(seg.zones), seg.used, seg.dictRecOff())
 	if err := writeFileAtomic(path, container); err != nil {
 		return
 	}
@@ -186,7 +186,7 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 		return false
 	}
 	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobPreserve(seg),
-		buildZoneBlob(c.zonesForSeg(sh, seg)), seg.used)
+		buildZoneBlob(c.zonesForSeg(sh, seg)), seg.used, seg.dictRecOff())
 	return c.installSidecar(sh, seg, path, container)
 }
 

@@ -479,7 +479,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 		// A keyless dict record's body (the serialized dict) starts after the 32-byte header
 		// and the adLen u32 -- the base a segDictHandle probes.
-		seg.dict.Store(&segDictHandle{data: seg.data, base: off + recKeyOff + 4})
+		seg.dict.Store(&segDictHandle{data: seg.data, base: off + recKeyOff + 4, rec: off})
 	}
 	// decodeSrc decodes a source record to an ast, honoring the source segment's own encoding
 	// (inline or interned). Returns nil on any decompress/decode failure.
