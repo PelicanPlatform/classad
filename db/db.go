@@ -263,6 +263,10 @@ func (db *DB) Maintain(opts MaintainOptions) {
 		// after (idempotent + refresh-safe -- keeps the stable schema/hot set).
 		db.c.BuildAndEnableSchemaScan(opts.SampleMax, opts.SchemaScanHotTopN)
 	}
+	// Checkpoint the query demand these decisions are made from, and age it. Unconditional:
+	// it is a small write, and the signal is worth as much to the next process as to this
+	// one -- more, since that one starts with nothing else.
+	db.c.SaveDemand()
 }
 
 // StartMaintenance starts a background goroutine that runs Maintain with the given
