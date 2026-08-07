@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/collections"
+	"github.com/PelicanPlatform/classad/db"
 )
 
 // QueryRaw is Query but returns each ad as old-ClassAd wire text (the AST-free
@@ -313,14 +314,27 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 // batches deeply).
 var WireBatchBudget = 64 << 10
 
+// ErrRawWireUnsupported reports that the wire-form row stream is not available for
+// this request, and the caller should fall back to a text row stream (which every
+// server and every table can serve). Two causes, one response: a server too old to
+// know opQueryRawWire, and a table that cannot produce self-contained rows (an
+// in-memory table -- see db.ErrRawWireUnsupported).
+//
+// It is always delivered BEFORE the first row, so a caller that has already relayed
+// rows can treat it as a hard failure rather than retrying.
+var ErrRawWireUnsupported = errors.New("dbrpc: wire-form rows unavailable for this request")
+
 // QueryRawWireStream streams matching ads as wire-form rows (self-contained
-// inline-names subset ads -- render them with collections.RenderRawAdInline),
-// batched many rows per frame (WireBatchBudget on the server side). The row
-// slice passed to yield aliases the frame buffer and is valid only until yield
-// returns; redact requests source-side private-attribute stripping even on a
-// privileged connection. Requires a server with opQueryRawWire; an older server
-// answers respBad and the error surfaces here (callers fall back to the text
-// row stream).
+// inline-names subset ads -- render them with collections.RenderRawAdInline, or
+// decode them with wire.DecodeInline), batched many rows per frame
+// (WireBatchBudget on the server side). The row slice passed to yield aliases the
+// frame buffer and is valid only until yield returns; redact requests source-side
+// private-attribute stripping even on a privileged connection.
+//
+// It returns ErrRawWireUnsupported, before any row, when the stream is unavailable
+// -- an older server, or a table that cannot serve wire rows. Callers fall back to
+// the text row stream. An empty stream means the query matched nothing; it never
+// means the table could not answer.
 func (c *Client) QueryRawWireStream(ctx context.Context, table, constraint string, attrs []string, limit int, redact bool, yield func(row []byte) bool) error {
 	build := func(id uint64) []byte {
 		b := putStr(req(id, opQueryRawWire), table)
@@ -367,6 +381,10 @@ func (c *Client) QueryRawWireStream(ctx context.Context, table, constraint strin
 						return nil
 					}
 				}
+			case stBadReq:
+				// A server too old to know the opcode rejects the request this way,
+				// and so does a table that cannot serve wire rows: same fallback.
+				return ErrRawWireUnsupported
 			case stErr:
 				return statusErr(status, body)
 			default:
@@ -406,6 +424,14 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 		return
 	}
 	seq, err := d.QueryRawWire(constraint, attrs, redact)
+	if errors.Is(err, db.ErrRawWireUnsupported) {
+		// Not a failure: this table cannot produce self-contained rows (it is in
+		// memory). Reject the request the same way an older server rejects the
+		// opcode, so the client takes the same text fallback rather than seeing an
+		// empty stream and believing the query matched nothing.
+		write(respBad(reqID))
+		return
+	}
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return

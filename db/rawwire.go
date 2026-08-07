@@ -1,6 +1,7 @@
 package db
 
 import (
+	"errors"
 	"fmt"
 	"iter"
 	"strings"
@@ -9,6 +10,11 @@ import (
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
+
+// ErrRawWireUnsupported reports that a table cannot serve the wire-form relay scan --
+// today, that it is in-memory rather than persistent. Callers fall back to a text row
+// stream, which every table can serve.
+var ErrRawWireUnsupported = errors.New("classad-db: table does not support wire-form rows")
 
 // UpdateOld ingests an ad from old-ClassAd wire text under key, skipping the AST
 // build -- the wire-native ingest path (as collections.UpdateOld). It writes
@@ -145,9 +151,16 @@ func (db *DB) QueryRawProjectedRefs(constraint string, projection []string, reda
 // consumer with the old-ClassAd render deferred to that consumer's client edge.
 // projection restricts the entries (empty = whole ad); redact strips private
 // attributes at the source. At-rest-encrypted values are opened during assembly
-// (the consumer holds no data key). Only meaningful for persistent (inline)
-// stores; an in-memory table yields nothing.
+// (the consumer holds no data key).
+//
+// Only a persistent (inline) store can serve wire rows. An in-memory table returns
+// ErrRawWireUnsupported rather than an empty sequence: a relay scan that yields
+// nothing is indistinguishable from a query that matched nothing, so returning one
+// would turn every RAM-table query into a silent empty result at the consumer.
 func (db *DB) QueryRawWire(constraint string, projection []string, redact bool) (iter.Seq[[]byte], error) {
+	if !db.c.SupportsRawWire() {
+		return nil, ErrRawWireUnsupported
+	}
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
 		return db.c.ScanRawWire(projection, redact), nil
 	}

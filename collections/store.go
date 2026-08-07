@@ -779,6 +779,12 @@ func (c *Collection) Len() int {
 // which the COUNT(*) fast path relies on.
 func (c *Collection) Chained() bool { return c.isStructural != nil }
 
+// SupportsRawWire reports whether ScanRawWire/QueryRawWire can serve this collection.
+// Only an inline (persistent) collection can: a RAM collection's ads are not
+// self-contained, so the relay scans yield nothing for one. A caller MUST check this
+// rather than treat an empty relay scan as an empty result -- they look identical.
+func (c *Collection) SupportsRawWire() bool { return c.inline }
+
 // Keys returns every visible key in the collection at a consistent per-shard
 // snapshot, in no particular order. Structural (parent-only) keys of a chained
 // collection are excluded, matching Scan's output. Each key is a fresh copy the
