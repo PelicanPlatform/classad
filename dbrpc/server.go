@@ -439,7 +439,9 @@ func (sc *serverConn) dispatch(frame []byte) {
 	case opMatchTables:
 		sc.s.streamMatchTables(sc.ctx, reqID, body, sc.write)
 	case opWatch:
-		sc.streamWatch(reqID, body)
+		sc.streamWatch(reqID, body, false)
+	case opWatchWire:
+		sc.streamWatch(reqID, body, true)
 	case opSnapshot:
 		sc.streamSnapshot(reqID, body)
 	case opArchiveQuery:
@@ -483,10 +485,10 @@ func adString(ad *classad.ClassAd, includePrivate bool) string {
 	return ad.String()
 }
 
-// streamWatch runs a watch, streaming each event as a frame [kind u8][key][adText]
-// [cursor] under reqID, until the client cancels it (opWatchStop) or the connection
+// streamWatch runs a watch, streaming each event as a frame [kind u8][key][ad][cursor]
+// under reqID -- the ad as ClassAd text, or as wire bytes when wireForm is set (opWatchWire), until the client cancels it (opWatchStop) or the connection
 // closes. cursor empty starts from now.
-func (sc *serverConn) streamWatch(reqID uint64, r *reader) {
+func (sc *serverConn) streamWatch(reqID uint64, r *reader, wireForm bool) {
 	table := r.str()
 	cursor := append([]byte(nil), r.bytesRef()...)
 	ctx, cancel := context.WithCancel(sc.ctx)
@@ -521,7 +523,9 @@ func (sc *serverConn) streamWatch(reqID uint64, r *reader) {
 	for ev := range seq {
 		b := putU8(respHead(reqID, stStream), byte(ev.Kind))
 		b = putStr(b, ev.Key)
-		if ev.Ad != nil {
+		if wireForm {
+			b = putBytes(b, watchAdWire(ev.Ad, sc.opts.IncludePrivate))
+		} else if ev.Ad != nil {
 			b = putStr(b, adString(ev.Ad, sc.opts.IncludePrivate))
 		} else {
 			b = putStr(b, "")
