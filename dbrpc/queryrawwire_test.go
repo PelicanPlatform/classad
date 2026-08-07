@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -134,5 +135,76 @@ func TestQueryRawWireUnprivilegedAlwaysRedacts(t *testing.T) {
 		if _, leak := m["ClaimId"]; leak {
 			t.Fatalf("%s: unprivileged wire row leaked ClaimId", name)
 		}
+	}
+}
+
+// TestQueryRawWireRefusesMemoryTable is the guard on the trap this relay sets: a table
+// that cannot produce self-contained rows yields NO rows, which on the wire is
+// indistinguishable from a query that matched nothing. A consumer that switched to this
+// stream would silently return an empty result for every RAM table. It must refuse
+// instead, before any row, so the caller falls back to the text stream.
+func TestQueryRawWireRefusesMemoryTable(t *testing.T) {
+	c, cleanup := catServerPair(t, ServeOptions{Privileged: true})
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := c.CreateTableInMemory(ctx, "scratch"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := c.BeginTable(ctx, "scratch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.NewClassAd(ctx, "k1", "Name = \"one\"\nCpus = 4"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The row is really there over the text stream.
+	texts, err := c.QueryRawTable(ctx, "scratch", "true", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(texts) != 1 {
+		t.Fatalf("text stream returned %d rows, want the one that was inserted", len(texts))
+	}
+
+	rows := 0
+	err = c.QueryRawWireStream(ctx, "scratch", "true", nil, 0, false, func([]byte) bool {
+		rows++
+		return true
+	})
+	if !errors.Is(err, ErrRawWireUnsupported) {
+		t.Errorf("err = %v, want ErrRawWireUnsupported", err)
+	}
+	if rows != 0 {
+		t.Errorf("delivered %d rows before refusing; the refusal must precede any row", rows)
+	}
+
+	// A persistent table on the same server still serves wire rows.
+	if err := c.CreateTable(ctx, "durable"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = c.BeginTable(ctx, "durable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.NewClassAd(ctx, "k1", "Name = \"two\"\nCpus = 8"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rows = 0
+	if err := c.QueryRawWireStream(ctx, "durable", "true", nil, 0, false, func([]byte) bool {
+		rows++
+		return true
+	}); err != nil {
+		t.Fatalf("persistent table: %v", err)
+	}
+	if rows != 1 {
+		t.Errorf("persistent table returned %d wire rows, want 1", rows)
 	}
 }
