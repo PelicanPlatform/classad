@@ -25,10 +25,7 @@ func ParseOldClassAd(input string) (*ast.ClassAd, error) {
 	// "\S", the agetty escapes /etc/issue carries) is kept literally rather than rejected,
 	// matching the C++ old-ClassAd tokenizer. Otherwise one such attribute would fail the
 	// whole ad -- which silently drops every startd ad a collector forwards.
-	lex := NewLexer(newFormat)
-	lex.lex.lenientEscapes = true
-	yyParse(lex)
-	result, err := lex.Result()
+	result, err := parsePooled(newFormat, true)
 	if err != nil {
 		return nil, fmt.Errorf("error parsing old ClassAd format: %w", err)
 	}
