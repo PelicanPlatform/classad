@@ -1501,6 +1501,16 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 		if stale, _ := a.StaleIndexSegments(); stale > 0 {
 			a.Reindex()
 		}
+		// Add the indexes observed demand justifies. Off unless a threshold is configured:
+		// an archive index is paid for by reading history back, so it is not something to
+		// start doing to an existing deployment on an upgrade.
+		if opts.ArchiveIndexMinDemand > 0 {
+			a.AutoTune(db.AutoTuneOptions{
+				SampleMax: opts.SampleMax,
+				MinDemand: opts.ArchiveIndexMinDemand,
+				Reindex:   true,
+			})
+		}
 		// Age and checkpoint the recorded query demand. An archive needs this more than a
 		// mutable table does: indexing one is paid for by decompressing history, so the
 		// decision wants evidence gathered over days, which is longer than a daemon can be

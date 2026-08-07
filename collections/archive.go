@@ -322,6 +322,17 @@ func (a *Archive) Reindex() { a.c.Reindex() }
 // the process is. See Collection.SaveDemand.
 func (a *Archive) SaveDemand() { a.c.SaveDemand() }
 
+// AutoTune applies demand-driven index changes to the archive. See Collection.AutoTune.
+func (a *Archive) AutoTune(opts AutoTuneOptions) AutoTuneResult { return a.c.AutoTune(opts) }
+
+// MarkAutoIndexes records existing indexes as auto-created, restoring the provenance a
+// saved config carries without rebuilding anything. See Collection.MarkAutoIndexes.
+func (a *Archive) MarkAutoIndexes(names []string) { a.c.MarkAutoIndexes(names) }
+
+// AutoIndexNames returns the names of the archive's auto-created indexes, for persisting
+// provenance alongside the index set itself.
+func (a *Archive) AutoIndexNames() []string { return a.c.AutoIndexNames() }
+
 // SetRetention updates the retention bounds at runtime; the next Rotate enforces them.
 func (a *Archive) SetRetention(r Retention) { a.c.SetRetention(r) }
 

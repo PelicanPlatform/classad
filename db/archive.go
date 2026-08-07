@@ -37,16 +37,43 @@ type ArchiveConfig struct {
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
 	ZoneAttrs                    []string
+	// AutoAttrs names the subset of the above created by the auto-tuner rather than by a
+	// human. Provenance has to be persisted with the index set, or an auto index returns
+	// from a restart indistinguishable from one someone asked for -- exempt from trimming
+	// and from any future auto-drop, permanently, on the strength of nothing.
+	AutoAttrs []string
 	// IndexBackfillBytes bounds how far back an index configuration change is carried: only
 	// segments within the newest N bytes have their existing index rebuilt, older ones keep
 	// the one they have (see collections.Options.IndexBackfillBytes).
 	//
-	// Zero carries a change across the whole archive, which for history means decompressing
-	// every record to add one index -- hours at scale, to speed up reads of the oldest data
-	// that a newest-first query with a limit may never reach.
+	// Zero takes defaultIndexBackfillBytes. A NEGATIVE value means no bound: the change is
+	// carried across the whole archive, which for history means decompressing every record
+	// to add one index -- hours at scale, to speed up reads of the oldest data that a
+	// newest-first query with a limit may never reach. That is a reasonable thing to ask
+	// for deliberately and a bad thing to get by leaving a field unset, which is why it is
+	// not what zero means.
 	IndexBackfillBytes int64
 	// Retention bounds what rotation keeps (max segments / bytes / age). Zero keeps all.
 	Retention collections.Retention
+}
+
+// defaultIndexBackfillBytes is how far back an index change is carried when the config does
+// not say. At the 8 MiB default segment size this is ~128 segments, a few seconds of
+// decompression -- small enough to be unremarkable on a maintenance pass, and large enough
+// to cover the recent history where newest-first queries actually land.
+const defaultIndexBackfillBytes = 1 << 30
+
+// backfillHorizon resolves IndexBackfillBytes: 0 takes the default, negative means
+// explicitly unbounded (which the storage layer spells as 0).
+func (cfg ArchiveConfig) backfillHorizon() int64 {
+	switch {
+	case cfg.IndexBackfillBytes < 0:
+		return 0
+	case cfg.IndexBackfillBytes == 0:
+		return defaultIndexBackfillBytes
+	default:
+		return cfg.IndexBackfillBytes
+	}
 }
 
 // archiveConfigFile persists the ArchiveConfig so a reopen rebuilds the same
@@ -83,7 +110,7 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		CategoricalAttrs:   cfg.CategoricalAttrs,
 		ValueAttrs:         cfg.ValueAttrs,
 		ZoneAttrs:          cfg.ZoneAttrs,
-		IndexBackfillBytes: cfg.IndexBackfillBytes,
+		IndexBackfillBytes: cfg.backfillHorizon(),
 		Retention:          cfg.Retention,
 	}
 	var a *collections.Archive
@@ -96,6 +123,12 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		return nil, err
 	}
 	t := &ArchiveTable{a: a, dir: dir, cfg: cfg}
+	// The index set above was rebuilt from the config as human-created; re-mark the ones
+	// the tuner made. This adds no index (they are already present) -- it only restores
+	// provenance.
+	if len(cfg.AutoAttrs) > 0 {
+		a.MarkAutoIndexes(cfg.AutoAttrs)
+	}
 	if create {
 		// Persist the config so a later reopen rebuilds the same indexes/retention.
 		if err := t.saveConfig(); err != nil {
@@ -369,6 +402,11 @@ func (t *ArchiveTable) CategoricalGroupCountsWhere(attr, constraint string) (map
 // value is usable and fills in defaults.
 type MergeOptions = collections.MergeOptions
 
+// AutoTuneOptions and AutoTuneResult are re-exported so a caller can tune an archive's
+// indexes without importing collections directly.
+type AutoTuneOptions = collections.AutoTuneOptions
+type AutoTuneResult = collections.AutoTuneResult
+
 // MergePass merges cold segment runs when the archive has reached its trigger watermark,
 // down to its target. Returns the number of merges performed.
 //
@@ -463,6 +501,7 @@ func (t *ArchiveTable) DropIndex(names ...string) bool {
 // contract: a write failure is ignored, leaving the change live for this run but unpersisted.
 func (t *ArchiveTable) saveIndexConfig() {
 	t.cfg.CategoricalAttrs, t.cfg.ValueAttrs = t.a.IndexedAttrs()
+	t.cfg.AutoAttrs = t.a.AutoIndexNames()
 	_ = t.saveConfig()
 }
 
@@ -532,3 +571,35 @@ func (t *ArchiveTable) GCFloor() float64 { return t.a.GCFloor() }
 // SaveDemand checkpoints the archive's recorded query demand so index decisions survive a
 // restart, ageing it by the time since the last checkpoint. See collections.SaveDemand.
 func (t *ArchiveTable) SaveDemand() { t.a.SaveDemand() }
+
+// AutoTune adds indexes the observed query demand justifies, persisting the result so the
+// backfill it just paid for is not thrown away and re-paid on the next restart.
+//
+// Adds only: opts.DropUnused is forced off. On a mutable table an auto-drop is reversible at
+// roughly the cost of the index; on an archive, re-adding means reading history back through
+// the decompressor, so the cheap direction and the expensive direction are the wrong way
+// round for acting on an absence of evidence.
+func (t *ArchiveTable) AutoTune(opts AutoTuneOptions) AutoTuneResult {
+	opts.DropUnused = false
+	// Refuse to tune an archive whose backfill is explicitly unbounded. Adding an index
+	// rebuilds every segment within the horizon, so with no horizon the tuner's first
+	// decision would decompress the entire archive. A human AddIndex may ask for that,
+	// having asked; a background pass nobody watched decide may not.
+	//
+	// Declining is the conservative direction: the cost of not indexing is slower queries,
+	// the cost of indexing unbounded is hours of I/O on a schedule.
+	if t.cfg.backfillHorizon() <= 0 {
+		return AutoTuneResult{}
+	}
+	res := t.a.AutoTune(opts)
+	if res.Changed {
+		// Without this the archive reopens on its creation-time index set: the added index
+		// disappears, the backfill is discarded, and the tuner adds it again as soon as
+		// demand re-accumulates -- paying the same backfill once per restart, forever.
+		t.saveIndexConfig()
+	}
+	return res
+}
+
+// AutoIndexNames returns the names of the archive's auto-created indexes.
+func (t *ArchiveTable) AutoIndexNames() []string { return t.a.AutoIndexNames() }

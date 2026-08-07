@@ -215,6 +215,54 @@ func (c *Collection) AddAutoIndex(categorical, value []string) bool {
 	return c.addIndexAuto(categorical, value)
 }
 
+// MarkAutoIndexes records the named EXISTING indexes as auto-created. It changes only
+// provenance: no index is added, dropped, or rebuilt, and a name that is not currently
+// indexed is ignored.
+//
+// This is the restore side of AutoIndexNames for a store that rebuilds its whole index set
+// at open (an archive does). Going through AddAutoIndex there would not work: the indexes
+// already exist as human-created by then, and an auto add deliberately refuses to downgrade
+// a human index. Adding them separately instead would restore provenance correctly but
+// rebuild them, which for an archive means reading history back through the decompressor on
+// every start.
+func (c *Collection) MarkAutoIndexes(names []string) {
+	if len(names) == 0 {
+		return
+	}
+	for {
+		cur := c.spec.Load()
+		next := cur.clone()
+		changed := false
+		for _, n := range names {
+			fold := strings.ToLower(n)
+			var id uint32
+			var ok bool
+			if next.inline {
+				id, ok = next.nameToID[fold]
+			} else {
+				id, ok = c.intern.LookupID(fold)
+			}
+			if !ok || (!next.catHas(id) && !next.valHas(id)) {
+				continue // not indexed: nothing to attribute
+			}
+			if next.isAuto(id) {
+				continue
+			}
+			if next.auto == nil {
+				next.auto = make(map[uint32]struct{})
+			}
+			next.auto[id] = struct{}{}
+			changed = true
+		}
+		if !changed {
+			return
+		}
+		if c.spec.CompareAndSwap(cur, next) {
+			return
+		}
+	}
+}
+
 // AutoIndexNames returns the names of auto-created indexes (provenance auto), so the
 // human/auto distinction can be persisted and survive a restart.
 func (c *Collection) AutoIndexNames() []string {
