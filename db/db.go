@@ -724,6 +724,19 @@ func (t *Txn) NewClassAd(key string, ad *classad.ClassAd) {
 	t.tx.Put([]byte(key), ad)
 }
 
+// NewClassAdOld stores an ad supplied as old-ClassAd text under key, encoding it
+// straight to the stored wire form instead of parsing it into a ClassAd for the commit
+// to re-encode. The transaction is unaffected: the write is buffered, conflict-checked
+// and committed exactly as NewClassAd's is.
+//
+// It reports whether the wire-native path was taken. False means the caller must parse
+// the text and use NewClassAd -- an encrypted store seals its values and the streaming
+// encoder does not seal, and a few ad shapes (a repeated attribute name, an escape the
+// fast lexer would read differently) defer to the reference parser by design.
+func (t *Txn) NewClassAdOld(key, text string) bool {
+	return t.tx.PutOld([]byte(key), text)
+}
+
 // DestroyClassAd removes key (classad_log.h LogDestroyClassAd).
 func (t *Txn) DestroyClassAd(key string) {
 	t.tx.Delete([]byte(key))
