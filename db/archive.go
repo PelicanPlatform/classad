@@ -37,6 +37,14 @@ type ArchiveConfig struct {
 	HotAttrs                     []string
 	CategoricalAttrs, ValueAttrs []string
 	ZoneAttrs                    []string
+	// IndexBackfillBytes bounds how far back an index configuration change is carried: only
+	// segments within the newest N bytes have their existing index rebuilt, older ones keep
+	// the one they have (see collections.Options.IndexBackfillBytes).
+	//
+	// Zero carries a change across the whole archive, which for history means decompressing
+	// every record to add one index -- hours at scale, to speed up reads of the oldest data
+	// that a newest-first query with a limit may never reach.
+	IndexBackfillBytes int64
 	// Retention bounds what rotation keeps (max segments / bytes / age). Zero keeps all.
 	Retention collections.Retention
 }
@@ -68,14 +76,15 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		return nil, err
 	}
 	opts := collections.ArchiveOptions{
-		Dir:              dir,
-		SegmentSize:      cfg.SegmentSize,
-		Codec:            codec,
-		HotAttrs:         cfg.HotAttrs,
-		CategoricalAttrs: cfg.CategoricalAttrs,
-		ValueAttrs:       cfg.ValueAttrs,
-		ZoneAttrs:        cfg.ZoneAttrs,
-		Retention:        cfg.Retention,
+		Dir:                dir,
+		SegmentSize:        cfg.SegmentSize,
+		Codec:              codec,
+		HotAttrs:           cfg.HotAttrs,
+		CategoricalAttrs:   cfg.CategoricalAttrs,
+		ValueAttrs:         cfg.ValueAttrs,
+		ZoneAttrs:          cfg.ZoneAttrs,
+		IndexBackfillBytes: cfg.IndexBackfillBytes,
+		Retention:          cfg.Retention,
 	}
 	var a *collections.Archive
 	if create {
