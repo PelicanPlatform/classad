@@ -221,6 +221,19 @@ type MaintainOptions struct {
 	// budget. ArchiveMergeDisabled turns the archive side of maintenance off entirely.
 	ArchiveMerge         MergeOptions
 	ArchiveMergeDisabled bool
+	// ArchiveIndexMinDemand is the minimum observed query demand for the auto-tuner to add
+	// an index to an ARCHIVE table; 0 leaves archive index auto-tune off.
+	//
+	// It is separate from MinIndexDemand, and off by default, because the two costs are not
+	// comparable. Indexing a mutable table is bounded by its live size; indexing an archive
+	// is paid for by decompressing history, so the threshold wants to be set against
+	// ArchiveConfig.IndexBackfillBytes -- how far back a new index is actually carried --
+	// rather than inherited from the mutable side.
+	//
+	// Auto-DROP is deliberately not offered for archives at any setting. Dropping an index
+	// is nearly free and re-adding it costs a backfill, so a wrong drop is expensive and
+	// asymmetric in the direction that punishes acting on a weak signal.
+	ArchiveIndexMinDemand int64
 	// SchemaScanHotTopN, when > 0, builds/refreshes the per-segment adschema columnar
 	// accelerator (used by CountConstraint's fast path) keeping the topN most query-read
 	// numeric fields uncompressed. The first pass chooses a stable schema and hot set from
