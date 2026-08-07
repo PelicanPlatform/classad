@@ -281,6 +281,9 @@ func Open(opts Options) (*Collection, error) {
 	// If sealed segments recovered persisted columnar blocks, re-enable schema-scan from them
 	// (adopt-from-sidecar) so the accelerator is live immediately -- no re-sample, no rebuild.
 	c.adoptPersistedSchemaScan()
+	// Recorded query demand is checkpointed alongside the data, so index decisions do not
+	// restart from zero every time the process does.
+	c.loadDemand()
 	return c, nil
 }
 

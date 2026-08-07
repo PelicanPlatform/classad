@@ -42,15 +42,20 @@ type demandCounts struct {
 type demandTracker struct {
 	m sync.Map // foldedName(string) -> *demandCounts
 
-	// total and startedUnix answer a question the per-attribute counters cannot: whether a
-	// zero means "queried by nobody" or "we have not been watching long enough to say".
-	//
-	// The counters are process-local and never decay, so immediately after a restart EVERY
-	// attribute reads zero. Acting on that drops the whole auto-index set on every restart
-	// and rebuilds it as traffic returns -- which on a large table is an expensive way to
-	// arrive back where it started.
-	total       atomic.Int64
-	startedUnix atomic.Int64
+	// total and observedNanos answer a question the per-attribute counters cannot: whether
+	// a zero means "queried by nobody" or "we have not been watching long enough to say".
+	// Acting on the second as if it were the first drops the whole auto-index set and
+	// rebuilds it as traffic returns -- on a large table, an expensive way to arrive back
+	// where it started.
+	total atomic.Int64
+	// startedUnix marks the current session; observedNanos accumulates the sessions before
+	// it, so observation survives a restart (see demand_persist.go) while the downtime
+	// between sessions is not counted as time spent watching.
+	startedUnix   atomic.Int64
+	observedNanos atomic.Int64
+	// lastDecayUnix is when the counters were last scaled down, so decay is charged for
+	// elapsed time rather than per call.
+	lastDecayUnix atomic.Int64
 }
 
 // hasDropEvidence reports whether the tracker has watched long enough, and seen enough
@@ -59,13 +64,14 @@ func (d *demandTracker) hasDropEvidence(minQueries int64, minWindow time.Duratio
 	if d.total.Load() < minQueries {
 		return false // an idle daemon has learned nothing about which indexes matter
 	}
-	st := d.startedUnix.Load()
-	return st != 0 && time.Since(time.Unix(0, st)) >= minWindow
+	return d.observedFor() >= minWindow
 }
 
 func newDemandTracker() *demandTracker {
 	d := &demandTracker{}
-	d.startedUnix.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	d.startedUnix.Store(now)
+	d.lastDecayUnix.Store(now)
 	return d
 }
 

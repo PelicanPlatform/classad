@@ -92,6 +92,11 @@ type Options struct {
 	// header) instead of decoding the whole ad. Optional; enables the hot-closure match
 	// fast path. The frequency/HotAttrs hot set is unioned in, so queries are unaffected.
 	MatchClosureRoots []string
+	// DemandHalfLife is how quickly recorded query demand fades, so index decisions
+	// track the current workload rather than everything the process has ever seen. 0
+	// uses defaultDemandHalfLife; negative disables decay (counters accumulate for the
+	// lifetime of the data, as they did before decay existed).
+	DemandHalfLife time.Duration
 	// CommitSync, if set, is called once per committed (possibly group-coalesced)
 	// batch on a shard, after the writes are applied — the point at which a future
 	// durable collection would fsync/serialize the batch. Group commit amortizes
@@ -260,7 +265,8 @@ type Collection struct {
 	// ops' internal reindexAfterCompaction must not re-take).
 	reindexMu sync.Mutex
 
-	demand *demandTracker // per-attribute query demand, for SuggestIndexes
+	demand     *demandTracker // per-attribute query demand, for SuggestIndexes
+	demandHalf time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
 	// (0/1 ⇒ serial). qsem is a collection-wide token pool bounding total scan
@@ -478,8 +484,9 @@ func New(opts Options) *Collection {
 		// Private attributes are flagged once per unique name at intern time, so a
 		// redacted query (ScanRawRedacted/QueryRawRedacted) strips them with a per-id
 		// bool check instead of re-classifying every attribute of every ad.
-		intern: wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
-		demand: newDemandTracker(),
+		intern:     wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
+		demand:     newDemandTracker(),
+		demandHalf: opts.DemandHalfLife,
 	}
 	c.codec.Store(&codecHolder{codec})
 	if cfg := newTTConfig(opts.TimeTravel); cfg != nil {

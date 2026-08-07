@@ -317,6 +317,11 @@ func (a *Archive) DropIndex(names ...string) bool { return a.c.DropIndex(names..
 // data is never touched.
 func (a *Archive) Reindex() { a.c.Reindex() }
 
+// SaveDemand checkpoints recorded query demand to the archive's directory, ageing it by the
+// time since the last checkpoint, so index decisions are not restarted from zero every time
+// the process is. See Collection.SaveDemand.
+func (a *Archive) SaveDemand() { a.c.SaveDemand() }
+
 // SetRetention updates the retention bounds at runtime; the next Rotate enforces them.
 func (a *Archive) SetRetention(r Retention) { a.c.SetRetention(r) }
 

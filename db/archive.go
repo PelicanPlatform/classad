@@ -519,3 +519,7 @@ func (t *ArchiveTable) SetGCFloor(floor float64) { t.a.SetGCFloor(floor) }
 
 // GCFloor returns the current runtime GC watermark (0 when unset).
 func (t *ArchiveTable) GCFloor() float64 { return t.a.GCFloor() }
+
+// SaveDemand checkpoints the archive's recorded query demand so index decisions survive a
+// restart, ageing it by the time since the last checkpoint. See collections.SaveDemand.
+func (t *ArchiveTable) SaveDemand() { t.a.SaveDemand() }
