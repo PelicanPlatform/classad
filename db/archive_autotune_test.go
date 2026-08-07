@@ -208,17 +208,17 @@ func TestArchiveAutoTuneNeverDrops(t *testing.T) {
 	}
 }
 
-// TestArchiveAutoTuneNeedsBackfillHorizon: the two knobs interact, and their defaults
-// combine badly. IndexBackfillBytes defaults to unbounded, so enabling the tuner without
-// setting it would make its first decision decompress the whole archive. The tuner declines
-// instead -- a background pass must not be able to start unbounded work.
+// TestArchiveAutoTuneNeedsBackfillHorizon: the tuner acts on the default config (zero takes
+// the 1 GiB default) but declines when backfill is explicitly unbounded. A background pass
+// nobody watched decide must not be able to start work bounded only by the archive's size.
 func TestArchiveAutoTuneNeedsBackfillHorizon(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		horizon  int64
 		wantTune bool
 	}{
-		{"unbounded default declines", 0, false},
+		{"zero takes the default and tunes", 0, true},
+		{"explicitly unbounded declines", -1, false},
 		{"bounded horizon tunes", 1 << 20, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -245,5 +245,75 @@ func TestArchiveAutoTuneNeedsBackfillHorizon(t *testing.T) {
 				t.Errorf("Owner indexed = %v, want %v; indexes = %v", got, tc.wantTune, catAttrs)
 			}
 		})
+	}
+}
+
+// TestArchiveBackfillHorizonDefault pins the resolution rule, since all three cases are
+// reachable from a config file and only one of them is what an unset field means.
+func TestArchiveBackfillHorizonDefault(t *testing.T) {
+	for _, tc := range []struct {
+		set, want int64
+	}{
+		{0, defaultIndexBackfillBytes}, // unset: bounded, not unbounded
+		{-1, 0},                        // explicitly unbounded, spelled 0 for the storage layer
+		{4 << 20, 4 << 20},             // honoured verbatim
+	} {
+		if got := (ArchiveConfig{IndexBackfillBytes: tc.set}).backfillHorizon(); got != tc.want {
+			t.Errorf("backfillHorizon(%d) = %d, want %d", tc.set, got, tc.want)
+		}
+	}
+}
+
+// TestArchiveHorizonDoesNotStarveMergedSegments: the backfill horizon bounds rebuilding an
+// EXISTING sidecar under a newer spec. It must not stop a MERGED segment -- which has no
+// sidecar at all -- from getting one, however old the data in it is. If it did, merging
+// would silently convert indexed old segments into unindexed ones, and the horizon would
+// make the archive slower the more maintenance ran on it.
+func TestArchiveHorizonDoesNotStarveMergedSegments(t *testing.T) {
+	dir := t.TempDir()
+	cat, err := OpenCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{
+		SegmentSize:        1 << 14, // small, so the fixture produces many segments
+		IndexBackfillBytes: 1,       // horizon smaller than a single segment
+		CategoricalAttrs:   []string{"Owner"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fillArchive(t, a, 4000)
+
+	before := a.Stats().Segments
+	if before < 4 {
+		t.Fatalf("fixture made %d segments, need several to merge", before)
+	}
+	merges := a.MergePass(MergeOptions{
+		TargetSegments: 2, TriggerSegments: 3,
+		MinMergeBytes: 1, KeepRecent: 1, MaxRun: 64,
+	})
+	if merges == 0 {
+		t.Fatalf("no merge happened (%d segments); the test would prove nothing", before)
+	}
+
+	// The merged output covers the OLDEST data, well outside a 1-byte horizon.
+	if stale, sealed := a.StaleIndexSegments(); stale != 0 {
+		t.Errorf("%d of %d sealed segments left without a current index after merging", stale, sealed)
+	}
+	// And the index answers over the merged data: every user must still be findable.
+	for u := range 7 {
+		seq, err := a.Query(fmt.Sprintf(`Owner == "user%d"`, u))
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for range seq {
+			n++
+		}
+		if want := 4000 / 7; n < want-1 || n > want+1 {
+			t.Errorf("user%d: %d rows after merge, want ~%d", u, n, want)
+		}
 	}
 }

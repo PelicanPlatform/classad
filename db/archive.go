@@ -46,13 +46,34 @@ type ArchiveConfig struct {
 	// segments within the newest N bytes have their existing index rebuilt, older ones keep
 	// the one they have (see collections.Options.IndexBackfillBytes).
 	//
-	// Zero carries a change across the whole archive, which for history means decompressing
-	// every record to add one index -- hours at scale, to speed up reads of the oldest data
-	// that a newest-first query with a limit may never reach. A HUMAN AddIndex is allowed to
-	// ask for that; the auto-tuner is not (see ArchiveTable.AutoTune).
+	// Zero takes defaultIndexBackfillBytes. A NEGATIVE value means no bound: the change is
+	// carried across the whole archive, which for history means decompressing every record
+	// to add one index -- hours at scale, to speed up reads of the oldest data that a
+	// newest-first query with a limit may never reach. That is a reasonable thing to ask
+	// for deliberately and a bad thing to get by leaving a field unset, which is why it is
+	// not what zero means.
 	IndexBackfillBytes int64
 	// Retention bounds what rotation keeps (max segments / bytes / age). Zero keeps all.
 	Retention collections.Retention
+}
+
+// defaultIndexBackfillBytes is how far back an index change is carried when the config does
+// not say. At the 8 MiB default segment size this is ~128 segments, a few seconds of
+// decompression -- small enough to be unremarkable on a maintenance pass, and large enough
+// to cover the recent history where newest-first queries actually land.
+const defaultIndexBackfillBytes = 1 << 30
+
+// backfillHorizon resolves IndexBackfillBytes: 0 takes the default, negative means
+// explicitly unbounded (which the storage layer spells as 0).
+func (cfg ArchiveConfig) backfillHorizon() int64 {
+	switch {
+	case cfg.IndexBackfillBytes < 0:
+		return 0
+	case cfg.IndexBackfillBytes == 0:
+		return defaultIndexBackfillBytes
+	default:
+		return cfg.IndexBackfillBytes
+	}
 }
 
 // archiveConfigFile persists the ArchiveConfig so a reopen rebuilds the same
@@ -89,7 +110,7 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		CategoricalAttrs:   cfg.CategoricalAttrs,
 		ValueAttrs:         cfg.ValueAttrs,
 		ZoneAttrs:          cfg.ZoneAttrs,
-		IndexBackfillBytes: cfg.IndexBackfillBytes,
+		IndexBackfillBytes: cfg.backfillHorizon(),
 		Retention:          cfg.Retention,
 	}
 	var a *collections.Archive
@@ -560,15 +581,14 @@ func (t *ArchiveTable) SaveDemand() { t.a.SaveDemand() }
 // round for acting on an absence of evidence.
 func (t *ArchiveTable) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 	opts.DropUnused = false
-	// Refuse to tune an archive with no backfill horizon. Adding an index rebuilds the
-	// index of every segment within the horizon, and the horizon's default is unbounded --
-	// so on the default config the tuner's first decision would decompress the entire
-	// archive. A human AddIndex may ask for that, having asked; a background pass that
-	// nobody watched decide must not be able to.
+	// Refuse to tune an archive whose backfill is explicitly unbounded. Adding an index
+	// rebuilds every segment within the horizon, so with no horizon the tuner's first
+	// decision would decompress the entire archive. A human AddIndex may ask for that,
+	// having asked; a background pass nobody watched decide may not.
 	//
 	// Declining is the conservative direction: the cost of not indexing is slower queries,
 	// the cost of indexing unbounded is hours of I/O on a schedule.
-	if t.cfg.IndexBackfillBytes <= 0 {
+	if t.cfg.backfillHorizon() <= 0 {
 		return AutoTuneResult{}
 	}
 	res := t.a.AutoTune(opts)
