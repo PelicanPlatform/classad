@@ -1053,11 +1053,17 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			if r.err != nil {
 				return respBad(reqID)
 			}
-			ad, err := classad.ParseOld(adText)
-			if err != nil {
-				return respErr(reqID, err.Error())
+			// Wire-native ingest: the ad arrived as text and is stored as wire bytes, so
+			// building an ast.ClassAd in between is pure overhead. NewClassAdOld declines
+			// where it cannot be faithful (an encrypted store, an ad shape that defers to
+			// the reference parser) and the parse path below answers those.
+			if !st.tx.NewClassAdOld(key, adText) {
+				ad, err := classad.ParseOld(adText)
+				if err != nil {
+					return respErr(reqID, err.Error())
+				}
+				st.tx.NewClassAd(key, ad)
 			}
-			st.tx.NewClassAd(key, ad)
 			st.record(s, WriteOp{Kind: WriteNewClassAd, Key: key, Value: adText})
 			return resp(reqID, stOK)
 		})
@@ -1079,13 +1085,17 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 				if r.err != nil {
 					return respBad(reqID)
 				}
-				ad, err := classad.ParseOld(adText)
-				if err != nil {
-					rejIdx = append(rejIdx, i)
-					rejMsg = append(rejMsg, err.Error())
-					continue
+				// As opNewAd: wire-native first, parse only where that declines -- which is
+				// also where a malformed ad is rejected, by index, without losing the batch.
+				if !st.tx.NewClassAdOld(key, adText) {
+					ad, err := classad.ParseOld(adText)
+					if err != nil {
+						rejIdx = append(rejIdx, i)
+						rejMsg = append(rejMsg, err.Error())
+						continue
+					}
+					st.tx.NewClassAd(key, ad)
 				}
-				st.tx.NewClassAd(key, ad)
 				st.record(s, WriteOp{Kind: WriteNewClassAd, Key: key, Value: adText})
 			}
 			b := putI32(resp(reqID, stOK), int32(len(rejIdx)))

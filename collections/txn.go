@@ -118,7 +118,10 @@ type txnWrite struct {
 	del   bool
 	base  uint64 // snapshot S0: conflict if the key changed after this
 	adObj *classad.ClassAd
-	ok    bool // committed (true) or conflicted (false)
+	// buf is the originating buffered write, so ordered-index maintenance can materialize
+	// a wire-ingested ad on demand -- a collection with no ordered index never does.
+	buf *txnBuf
+	ok  bool // committed (true) or conflicted (false)
 }
 
 // commitTxn applies a shard's buffered transactional writes with per-write conflict
@@ -211,8 +214,37 @@ type Txn struct {
 
 type txnBuf struct {
 	key []byte
-	ad  *classad.ClassAd // nil for a delete
-	del bool
+	ad  *classad.ClassAd // nil for a delete, and for a wire-encoded put until materialized
+	// wire holds the uncompressed wire form of an ad ingested by PutOld, encoded from
+	// old-ClassAd text at Put time with no intermediate ast.ClassAd. Commit stores these
+	// bytes directly; ad stays nil unless something needs the object (see materialize).
+	wire []byte
+	// text is retained beside wire only so materialize can rebuild the object faithfully
+	// through the reference parser rather than round-tripping the encoding.
+	text string
+	del  bool
+}
+
+// live reports whether this buffer holds an ad -- as an object OR as wire bytes not yet
+// materialized. Anything scanning the buffered writes must ask this rather than testing
+// ad != nil, which silently skips every wire-ingested write.
+func (b *txnBuf) live() bool { return !b.del && (b.ad != nil || b.wire != nil) }
+
+// materialize returns the buffered ad as an object, decoding a wire-ingested one on
+// first use. Only two things need it -- a read-your-writes Get and ordered-index
+// maintenance -- so the common insert path never pays for it.
+func (b *txnBuf) materialize() (*classad.ClassAd, bool) {
+	if b.del {
+		return nil, false
+	}
+	if b.ad == nil && b.wire != nil {
+		ad, err := classad.ParseOld(b.text)
+		if err != nil {
+			return nil, false
+		}
+		b.ad = ad
+	}
+	return b.ad, b.ad != nil
 }
 
 // CommitResult reports a transaction's outcome. Conflicts holds the keys whose
@@ -277,10 +309,7 @@ func (tx *Txn) Get(key []byte) (*classad.ClassAd, bool) {
 // mutate (buffered writes are returned as-is -- the caller owns the buffered ad).
 func (tx *Txn) getOwn(key []byte) (*classad.ClassAd, bool) {
 	if b, ok := tx.writes[string(key)]; ok {
-		if b.del {
-			return nil, false
-		}
-		return b.ad, true
+		return b.materialize()
 	}
 	h := tx.c.h.Hash(key)
 	idx := tx.c.shardOf(key, h)
@@ -302,6 +331,31 @@ func (tx *Txn) Put(key []byte, ad *classad.ClassAd) {
 	tx.writes[string(key)] = &txnBuf{key: append([]byte(nil), key...), ad: ad}
 }
 
+// PutOld buffers an insert or update of key whose ad arrives as old-ClassAd text,
+// encoding it straight to the stored wire form here rather than building an
+// ast.ClassAd for Commit to encode. Every transactional guarantee is unchanged --
+// the write is buffered, conflict-checked against the same snapshot, and committed
+// identically; only the encoding path differs.
+//
+// It reports whether the fast path was taken. False means the caller should parse the
+// text and use Put: an encrypted collection stores sealed values, and the streaming
+// encoder does not seal.
+func (tx *Txn) PutOld(key []byte, text string) bool {
+	if tx.c.EncryptionEnabled() {
+		return false
+	}
+	enc := tx.c.newStreamEncoder()
+	seen := make(map[uint32]struct{}, 64)
+	var unesc []byte
+	w, err := tx.c.encodeOld(text, enc, seen, &unesc)
+	if err != nil {
+		return false // malformed, or a shape the streaming encoder defers: let the caller parse
+	}
+	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
+	tx.writes[string(key)] = &txnBuf{key: append([]byte(nil), key...), wire: w, text: text}
+	return true
+}
+
 // Delete buffers a delete of key. Nothing is written until Commit.
 func (tx *Txn) Delete(key []byte) {
 	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
@@ -318,10 +372,15 @@ func (tx *Txn) Commit() CommitResult {
 	for _, b := range tx.writes {
 		h := tx.c.h.Hash(b.key)
 		idx := tx.c.shardOf(b.key, h)
-		w := &txnWrite{hash: h, key: b.key, del: b.del, base: tx.snap[idx], adObj: b.ad}
+		w := &txnWrite{hash: h, key: b.key, del: b.del, base: tx.snap[idx], adObj: b.ad, buf: b}
 		if !b.del {
 			w.codec = tx.c.currentCodec()
-			w.ad = w.codec.Compress(nil, tx.c.encodeAd(b.ad.AST()))
+			// A wire-ingested put is already encoded; only an object put encodes here.
+			raw := b.wire
+			if raw == nil {
+				raw = tx.c.encodeAd(b.ad.AST())
+			}
+			w.ad = w.codec.Compress(nil, raw)
 		}
 		byShard[idx] = append(byShard[idx], w)
 	}
@@ -391,7 +450,11 @@ func (tx *Txn) Commit() CommitResult {
 			if w.del {
 				tx.c.removeOrdered(w.key)
 			} else {
-				tx.c.maintainOrdered(w.key, w.adObj)
+				ad := w.adObj
+				if ad == nil && w.buf != nil {
+					ad, _ = w.buf.materialize()
+				}
+				tx.c.maintainOrdered(w.key, ad)
 			}
 		}
 	}

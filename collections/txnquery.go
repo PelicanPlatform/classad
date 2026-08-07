@@ -76,7 +76,7 @@ func (tx *Txn) scanCommitted(q *vm.Query, visit func(key string, ad *classad.Cla
 func (tx *Txn) forEachBufferedMatch(q *vm.Query, visit func(key string, ad *classad.ClassAd) bool) {
 	keys := make([]string, 0, len(tx.writes))
 	for key, buf := range tx.writes {
-		if buf.del || buf.ad == nil {
+		if !buf.live() {
 			continue
 		}
 		if IsSystemKey(key) {
