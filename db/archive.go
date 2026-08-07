@@ -42,6 +42,15 @@ type ArchiveConfig struct {
 	// from a restart indistinguishable from one someone asked for -- exempt from trimming
 	// and from any future auto-drop, permanently, on the strength of nothing.
 	AutoAttrs []string
+	// IndexBackfillBytes bounds how far back an index configuration change is carried: only
+	// segments within the newest N bytes have their existing index rebuilt, older ones keep
+	// the one they have (see collections.Options.IndexBackfillBytes).
+	//
+	// Zero carries a change across the whole archive, which for history means decompressing
+	// every record to add one index -- hours at scale, to speed up reads of the oldest data
+	// that a newest-first query with a limit may never reach. A HUMAN AddIndex is allowed to
+	// ask for that; the auto-tuner is not (see ArchiveTable.AutoTune).
+	IndexBackfillBytes int64
 	// Retention bounds what rotation keeps (max segments / bytes / age). Zero keeps all.
 	Retention collections.Retention
 }
@@ -73,14 +82,15 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		return nil, err
 	}
 	opts := collections.ArchiveOptions{
-		Dir:              dir,
-		SegmentSize:      cfg.SegmentSize,
-		Codec:            codec,
-		HotAttrs:         cfg.HotAttrs,
-		CategoricalAttrs: cfg.CategoricalAttrs,
-		ValueAttrs:       cfg.ValueAttrs,
-		ZoneAttrs:        cfg.ZoneAttrs,
-		Retention:        cfg.Retention,
+		Dir:                dir,
+		SegmentSize:        cfg.SegmentSize,
+		Codec:              codec,
+		HotAttrs:           cfg.HotAttrs,
+		CategoricalAttrs:   cfg.CategoricalAttrs,
+		ValueAttrs:         cfg.ValueAttrs,
+		ZoneAttrs:          cfg.ZoneAttrs,
+		IndexBackfillBytes: cfg.IndexBackfillBytes,
+		Retention:          cfg.Retention,
 	}
 	var a *collections.Archive
 	if create {
@@ -550,6 +560,17 @@ func (t *ArchiveTable) SaveDemand() { t.a.SaveDemand() }
 // round for acting on an absence of evidence.
 func (t *ArchiveTable) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 	opts.DropUnused = false
+	// Refuse to tune an archive with no backfill horizon. Adding an index rebuilds the
+	// index of every segment within the horizon, and the horizon's default is unbounded --
+	// so on the default config the tuner's first decision would decompress the entire
+	// archive. A human AddIndex may ask for that, having asked; a background pass that
+	// nobody watched decide must not be able to.
+	//
+	// Declining is the conservative direction: the cost of not indexing is slower queries,
+	// the cost of indexing unbounded is hours of I/O on a schedule.
+	if t.cfg.IndexBackfillBytes <= 0 {
+		return AutoTuneResult{}
+	}
 	res := t.a.AutoTune(opts)
 	if res.Changed {
 		// Without this the archive reopens on its creation-time index set: the added index

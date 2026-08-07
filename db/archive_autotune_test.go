@@ -8,6 +8,11 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 )
 
+// archiveTestHorizon is a backfill horizon large enough to cover these small fixtures.
+// The tuner declines to act on an archive with no horizon at all, so every tuning test has
+// to set one -- see TestArchiveAutoTuneNeedsBackfillHorizon.
+const archiveTestHorizon = 1 << 30
+
 func fillArchive(t *testing.T, a *ArchiveTable, n int) {
 	t.Helper()
 	for i := range n {
@@ -39,7 +44,7 @@ func TestArchiveAutoTuneAddsFromDemand(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cat.Close()
-	a, err := cat.CreateArchiveTable("history", ArchiveConfig{})
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{IndexBackfillBytes: archiveTestHorizon})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +76,7 @@ func TestArchiveAutoTuneBelowThreshold(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer cat.Close()
-	a, err := cat.CreateArchiveTable("history", ArchiveConfig{})
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{IndexBackfillBytes: archiveTestHorizon})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +102,7 @@ func TestArchiveAutoTunePersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := cat.CreateArchiveTable("history", ArchiveConfig{})
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{IndexBackfillBytes: archiveTestHorizon})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +153,7 @@ func autoIndexedArchive(t *testing.T, dir string) *ArchiveTable {
 	if err != nil {
 		t.Fatal(err)
 	}
-	a, err := cat.CreateArchiveTable("history", ArchiveConfig{})
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{IndexBackfillBytes: archiveTestHorizon})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,5 +205,45 @@ func TestArchiveAutoTuneNeverDrops(t *testing.T) {
 	})
 	if catAttrs, _ := a.IndexedAttrs(); !slices.Contains(catAttrs, "Owner") {
 		t.Errorf("Owner index dropped: indexes = %v", catAttrs)
+	}
+}
+
+// TestArchiveAutoTuneNeedsBackfillHorizon: the two knobs interact, and their defaults
+// combine badly. IndexBackfillBytes defaults to unbounded, so enabling the tuner without
+// setting it would make its first decision decompress the whole archive. The tuner declines
+// instead -- a background pass must not be able to start unbounded work.
+func TestArchiveAutoTuneNeedsBackfillHorizon(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		horizon  int64
+		wantTune bool
+	}{
+		{"unbounded default declines", 0, false},
+		{"bounded horizon tunes", 1 << 20, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cat, err := OpenCatalog(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cat.Close()
+			a, err := cat.CreateArchiveTable("history", ArchiveConfig{IndexBackfillBytes: tc.horizon})
+			if err != nil {
+				t.Fatal(err)
+			}
+			fillArchive(t, a, 500)
+			for range 10 {
+				drainArchive(t, a, `Owner == "user3"`)
+			}
+			res := a.AutoTune(AutoTuneOptions{MinDemand: 5, Reindex: true})
+			if res.Changed != tc.wantTune {
+				t.Errorf("AutoTune changed = %v, want %v (horizon %d)", res.Changed, tc.wantTune, tc.horizon)
+			}
+			catAttrs, _ := a.IndexedAttrs()
+			if got := slices.Contains(catAttrs, "Owner"); got != tc.wantTune {
+				t.Errorf("Owner indexed = %v, want %v; indexes = %v", got, tc.wantTune, catAttrs)
+			}
+		})
 	}
 }

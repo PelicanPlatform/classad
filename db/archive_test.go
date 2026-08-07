@@ -1,7 +1,10 @@
 package db
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/collections"
@@ -219,5 +222,47 @@ func TestArchiveRotation(t *testing.T) {
 	}
 	if hist.Count() >= before {
 		t.Fatalf("Count did not shrink after rotation: before=%d after=%d", before, hist.Count())
+	}
+}
+
+// TestArchiveBackfillHorizonReachable pins that the index backfill horizon can actually be
+// configured through the catalog. It existed on the storage layer but not on ArchiveConfig,
+// so a daemon could not set it -- the bound was built and unreachable, which is the same as
+// not having it. The config is persisted, so it must also survive a reopen.
+func TestArchiveBackfillHorizonReachable(t *testing.T) {
+	dir := t.TempDir()
+	cat, err := OpenCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const horizon = 32 << 20
+	if _, err := cat.CreateArchiveTable("history", ArchiveConfig{
+		SegmentSize:        1 << 20,
+		CategoricalAttrs:   []string{"Owner"},
+		IndexBackfillBytes: horizon,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cat.Close()
+
+	cat2, err := OpenCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat2.Close()
+	if _, ok := cat2.ArchiveTable("history"); !ok {
+		t.Fatal("archive not recovered")
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "archives", "history", archiveConfigFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var saved ArchiveConfig
+	if err := json.Unmarshal(data, &saved); err != nil {
+		t.Fatal(err)
+	}
+	if saved.IndexBackfillBytes != horizon {
+		t.Errorf("persisted IndexBackfillBytes = %d, want %d -- the horizon would silently "+
+			"revert to unbounded on restart", saved.IndexBackfillBytes, horizon)
 	}
 }
