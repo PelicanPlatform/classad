@@ -250,3 +250,31 @@ func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (
 	}
 	return 0, false, nil
 }
+
+// escapedNumVal is escapedNumField returning the value WITH its ClassAd kind. A caller that
+// renders or sums the value needs the kind, and the cold tail carries the wire node, so it is read
+// from the node rather than assumed from the segment's schema (an escaped value is by definition
+// one the schema field did not fit).
+func (b *columnarBlock) escapedNumVal(k int, fieldID uint32, bc *blockCache) (colVal, bool) {
+	ds, err := bc.streams(b)
+	if err != nil {
+		return colVal{}, false
+	}
+	cold := ds.cold[b.coldOff[k]:b.coldOff[k+1]]
+	for len(cold) > 0 {
+		id, m := binary.Uvarint(cold)
+		if m <= 0 {
+			return colVal{}, false // malformed tail: treat fieldID as absent
+		}
+		cold = cold[m:]
+		nl, ok := wire.NodeLen(cold)
+		if !ok || nl > len(cold) {
+			return colVal{}, false
+		}
+		if uint32(id) == fieldID {
+			return nodeColVal(cold[:nl])
+		}
+		cold = cold[nl:]
+	}
+	return colVal{}, false
+}

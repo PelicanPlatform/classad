@@ -240,6 +240,14 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 	if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
 		return rows, nil
 	}
+	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
+	// per-segment columnar blocks instead of decoding every record. Declines (and falls through
+	// to the scan) unless the archive carries an accelerator and the aggregate is in scope.
+	if rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
+		return t.NumStats(constraint, attr)
+	}, groupCols, aggs); ok {
+		return rows, nil
+	}
 
 	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
 

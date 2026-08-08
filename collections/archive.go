@@ -304,6 +304,13 @@ func (a *Archive) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 // SchemaScanInfo reports the columnar accelerator's state for the archive.
 func (a *Archive) SchemaScanInfo() SchemaScanInfo { return a.c.SchemaScanInfo() }
 
+// NumStatsQuery computes numeric aggregate inputs for attr over the archive's matching records
+// via the columnar scan (see Collection.NumStatsQuery). Only meaningful once the archive carries
+// a columnar accelerator; ok=false otherwise, and the caller scans.
+func (a *Archive) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
+	return a.c.NumStatsQuery(q, attr)
+}
+
 // SidecarSizes reports the archive's sealed-segment sidecar index bytes (mmap-backed,
 // evictable page cache), broken out by structure. An operator diagnostic.
 func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }
