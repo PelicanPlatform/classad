@@ -356,6 +356,8 @@ type (
 	Retention       = collections.Retention
 	CodecStats      = collections.CodecStats
 	SchemaScanInfo  = collections.SchemaScanInfo
+	SchemaScanField = collections.SchemaScanField
+	SchemaFieldFit  = collections.SchemaFieldFit
 	QueryExplain    = collections.QueryExplain
 	ProbeExplain    = collections.ProbeExplain
 	MatchExplain    = collections.MatchExplain
@@ -409,6 +411,19 @@ func (db *DB) HotAttrs() []string { return db.c.HotAttrNames() }
 // SchemaScanInfo reports the columnar (adschema) accelerator's state: whether it is enabled (so a
 // numeric COUNT(*) WHERE routes to the columnar fast path), its hot columns, and segment coverage.
 func (db *DB) SchemaScanInfo() SchemaScanInfo { return db.c.SchemaScanInfo() }
+
+// SchemaFit measures the current derived schema against a fresh sample, reporting each field's
+// escape rate -- how often its value is not in the fixed slot, and how much of that is the
+// attribute simply being absent. This is how you tell whether the schema still matches the data
+// (see collections.Collection.SchemaFit). Returns nil when the accelerator is not enabled.
+func (db *DB) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) { return db.c.SchemaFit(sampleMax) }
+
+// ReschemaScan derives a new schema from a fresh sample and rebuilds every sealed segment's
+// columnar block against it, replacing the one pinned at first enable. Heavy -- a block per
+// sealed segment is re-encoded and re-persisted -- and never done by routine maintenance, which
+// deliberately keeps the schema stable. Returns false if there was nothing to sample or the
+// accelerator cannot run here.
+func (db *DB) ReschemaScan(sampleMax, hotTopN int) bool { return db.c.ReschemaScan(sampleMax, hotTopN) }
 
 // IndexedAttrs returns the currently-indexed attribute names, split into
 // categorical (string equality/membership) and value (numeric + range) indexes.
