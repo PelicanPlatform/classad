@@ -448,48 +448,16 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 	if st == nil {
 		return 0, false
 	}
-	s := st.schema
-	probes := q.Probes()
-	if !q.Native() || len(probes) == 0 {
+	if c.intern == nil {
 		return 0, false
 	}
-	fieldIdx := -1
-	var fieldID uint32
-	var cmps []func(float64) bool
-	for _, p := range probes {
-		id, ok := c.intern.LookupID(p.Attr)
-		if !ok {
-			return 0, false
-		}
-		idx, ok := s.byID[id]
-		if !ok || s.fields[idx].kind != akInt {
-			return 0, false // only single-field int comparisons route
-		}
-		if fieldIdx == -1 {
-			fieldIdx, fieldID = idx, id
-		} else if idx != fieldIdx {
-			return 0, false // more than one field: not this fast path
-		}
-		up, ok := valUsable(id, p)
-		if !ok || len(up.fvals) != 1 {
-			return 0, false // present/absent/in/isnt or non-numeric: not a scalar comparison
-		}
-		cmp, ok := numCmp(up.op, up.fvals[0])
-		if !ok {
-			return 0, false
-		}
-		cmps = append(cmps, cmp)
+	// The predicate analysis is shared with NumStatsQuery (see numPredOnField). fieldID is only
+	// the routing decision -- the attr is a numeric field in the CURRENT schema; the scan
+	// resolves the field per block against each block's own schema.
+	fieldID, eval, ok := c.numPredOnField(q, st.schema)
+	if !ok {
+		return 0, false
 	}
-	eval := func(v float64) bool {
-		for _, cmp := range cmps {
-			if !cmp(v) {
-				return false
-			}
-		}
-		return true
-	}
-	// fieldIdx above is only the routing decision (the attr is an int field in the current
-	// schema); the scan resolves the field per block against each block's own schema.
 	return c.schemaScanCount(fieldID, st.cache, eval), true
 }
 
@@ -511,58 +479,16 @@ func numCmp(op string, t float64) (func(float64) bool, bool) {
 	return nil, false
 }
 
-// schemaScanCount counts records whose numeric attribute fieldID is present, live, and satisfies
-// eval -- using each sealed segment's columnar block (hot column: no decode; cold column: one
-// cached decode) and each window's live MVCC visibility. The field is resolved PER BLOCK against
-// that block's OWN schema (byID over the shared intern id): a segment sealed under a schema that
-// includes fieldID as an int is columnar-scanned; one whose schema lacks it (or types it
-// differently) -- including the active segment, which has no block -- row-scans instead. This is
-// what lets a heterogeneous set of per-segment schemas coexist: a schema change never forces
-// rewriting existing segments; they simply row-fall-back for attributes absent from their schema.
+// schemaScanCount counts the records whose numeric attribute fieldID satisfies eval, over the
+// shared columnar value scan -- see scanNumValues for the per-block schema resolution, the MVCC
+// visibility rule and the row fallback. A record whose value is absent is skipped, not counted.
 func (c *Collection) schemaScanCount(fieldID uint32, bc *blockCache, eval func(float64) bool) int {
-	// The brute fallback reads records straight from the arena, so it must honor the collection's
-	// wire mode: look the field up by inline name on a persistent store, by interned id in memory.
-	lookup := func(a wire.Ad) ([]byte, bool) { return a.Lookup(fieldID) }
-	if c.inline {
-		if name, ok := c.intern.Name(fieldID); ok {
-			lookup = func(a wire.Ad) ([]byte, bool) { return a.LookupByName(name) }
-		}
-	}
 	count := 0
-	for _, sh := range c.shards {
-		s0, wins := sh.snapshot()
-		for _, w := range wins {
-			cs := w.seg.colblk.Load()
-			bidx := -1
-			if cs != nil {
-				if idx, ok := cs.block.schema.byID[fieldID]; ok && cs.block.schema.fields[idx].kind == akInt {
-					bidx = idx
-				}
-			}
-			if bidx < 0 {
-				count += bruteNumCount(w, s0, lookup, eval) // no block, or field absent/non-int in this segment's schema
-				continue
-			}
-			cs.block.scanInt(bidx, bc, func(k int, present bool, v int64) {
-				o := cs.offs[k]
-				if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
-					return // not visible at this snapshot
-				}
-				if present {
-					if eval(float64(v)) {
-						count++
-					}
-					return
-				}
-				// Escaped: read only fieldID from the cold tail, not the whole record. (numFieldOf
-				// via a full reconstruct dominated the scan when a numeric attr has a value tail.)
-				if f, ok, err := cs.block.escapedNumField(k, fieldID, bc); err == nil && ok && eval(f) {
-					count++
-				}
-			})
+	c.scanNumValues(fieldID, bc, func(nv colVal) {
+		if eval(nv.f) {
+			count++
 		}
-		releaseWindows(wins)
-	}
+	})
 	return count
 }
 
@@ -575,28 +501,4 @@ func (c *Collection) schemaScanIntCount(s *adSchema, fieldIdx int, match func(in
 	return c.schemaScanCount(s.fields[fieldIdx].id, bc, func(f float64) bool { return match(int64(f)) })
 }
 
-// bruteNumCount is the row-scan fallback: walk a window's visible records, read the numeric
-// field from the wire ad, and count matches.
-func bruteNumCount(w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), eval func(float64) bool) int {
-	count := 0
-	var buf []byte
-	for off := 0; off < w.used; {
-		o := uint32(off)
-		total := recTotalLen(w.data, o)
-		if total == 0 {
-			break
-		}
-		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
-			if ww, err := w.codec.Decompress(buf[:0], recAd(w.data, o)); err == nil {
-				buf = ww
-				if node, ok := lookup(wire.Ad(ww)); ok {
-					if f, ok := literalFloat(node); ok && eval(f) {
-						count++
-					}
-				}
-			}
-		}
-		off += int(total)
-	}
-	return count
-}
+// The row-scan fallback now lives with the shared value scan, as bruteNumValues in colagg.go.

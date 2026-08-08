@@ -361,6 +361,17 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		}
 	}
 
+	// Fast path: a single MIN/MAX/COUNT(attr) over a numeric column, read from the columnar
+	// blocks rather than by decoding every record. Only counting was routed here before, so an
+	// unconstrained MAX over a large table scanned row-wise. Declines unless the table has
+	// schema-scan enabled and the aggregate is in scope (see db.ColumnarAggregate).
+	if rows, ok := db.ColumnarAggregate(func(attr string) (db.NumStats, bool) {
+		return d.NumStats(constraint, attr)
+	}, groupCols, aggs); ok {
+		writeAggRows(reqID, rows, write)
+		return
+	}
+
 	seq, err := d.QueryProject(constraint, attrs)
 	if err != nil {
 		write(respErr(reqID, err.Error()))
@@ -374,6 +385,12 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	if cancelled(ctx) {
 		return // client gone mid-scan: nothing left to stream
 	}
+	writeAggRows(reqID, rows, write)
+}
+
+// writeAggRows streams aggregate rows and the stream terminator. Shared so a fast path that
+// computed its rows without scanning emits exactly what the scanning path does.
+func writeAggRows(reqID uint64, rows []db.AggRow, write func([]byte)) {
 	for _, row := range rows {
 		frame := respHead(reqID, stStream)
 		for _, gv := range row.Group {
