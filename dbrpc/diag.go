@@ -57,6 +57,10 @@ type Diagnostics struct {
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
 const diagSampleMax = 2000
 
+// defaultSchemaHotTopN is the hot-column count schema.rebuild uses when the server carries no
+// configured HotTopN, matching the size a default maintenance pass would choose.
+const defaultSchemaHotTopN = 32
+
 // defaultAnalyzeHotTopN is the hot-set size an on-demand "analyze" uses when the server was
 // started without a maintenance hot-set target (HotTopN == 0), so analyze still refreshes the
 // hot set from read demand.
@@ -116,6 +120,8 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 //	                                  stale segment sidecars in place, no data rewrite)
 //	hot.add <attr>...                 pin attributes into the hot set
 //	hot.refresh <sampleMax> <topN>    recompute the hot set from sampled frequency
+//	schema.fit [sampleMax]            report how well the derived schema still fits the data
+//	schema.rebuild [sampleMax topN]   re-derive the schema and rebuild every columnar block
 //	compact                           reclaim dead space in warranted shards
 //	rewrite                           re-encode all ads with the current hot set
 //	codec.retrain [sampleMax]         train/refresh the ZSTD dictionary + recompress
@@ -235,6 +241,58 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 		}
 		n := t.RefreshHotSet(sampleMax, topN)
 		return fmt.Sprintf("refreshed hot set: %d attribute(s)", n), nil
+	case "schema.fit":
+		// Report, do not change: how well the derived schema still matches the data. The
+		// operator's input to deciding whether schema.rebuild is worth its cost.
+		sampleMax := diagSampleMax
+		if len(args) == 1 {
+			n, err := strconv.Atoi(args[0])
+			if err != nil {
+				return "", fmt.Errorf("schema.fit <sampleMax> must be an integer")
+			}
+			sampleMax = n
+		} else if len(args) > 1 {
+			return "", fmt.Errorf("schema.fit takes at most <sampleMax>")
+		}
+		fit, sampled := t.SchemaFit(sampleMax)
+		if len(fit) == 0 {
+			return "columnar accelerator not enabled: no schema to measure", nil
+		}
+		b, err := json.Marshal(struct {
+			Sampled int                 `json:"sampled"`
+			Fields  []db.SchemaFieldFit `json:"fields"`
+		}{sampled, fit})
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	case "schema.rebuild":
+		// The deliberate re-schema: routine maintenance keeps the schema pinned forever, so
+		// this is the only way to re-derive it as the workload drifts. Rebuilds a columnar
+		// block per sealed segment.
+		sampleMax, topN := diagSampleMax, s.maintainOpts.HotTopN
+		if topN <= 0 {
+			topN = defaultSchemaHotTopN
+		}
+		switch len(args) {
+		case 0:
+		case 2:
+			n, e1 := strconv.Atoi(args[0])
+			k, e2 := strconv.Atoi(args[1])
+			if e1 != nil || e2 != nil {
+				return "", fmt.Errorf("schema.rebuild arguments must be integers")
+			}
+			sampleMax, topN = n, k
+		default:
+			return "", fmt.Errorf("schema.rebuild takes no arguments or <sampleMax> <topN>")
+		}
+		if !t.ReschemaScan(sampleMax, topN) {
+			return "", fmt.Errorf("schema rebuild did not run: nothing to sample, or the " +
+				"accelerator is unavailable here (encryption at rest)")
+		}
+		info := t.SchemaScanInfo()
+		return fmt.Sprintf("schema rebuilt: %d field(s), %d hot, %d/%d sealed segments covered",
+			info.SchemaFields, len(info.HotFields), info.CoveredSegments, info.SealedSegments), nil
 	case "analyze":
 		// On-demand self-tuning pass ("optimize now"), the manual counterpart to the scheduled
 		// StartMaintenance. Reuses the server's configured maintenance options so it matches the

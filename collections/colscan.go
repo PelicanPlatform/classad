@@ -39,6 +39,40 @@ type SchemaScanInfo struct {
 	SchemaFields    int      `json:"schemaFields,omitempty"`
 	SealedSegments  int      `json:"sealedSegments,omitempty"`
 	CoveredSegments int      `json:"coveredSegments,omitempty"`
+	// Schema is the derived schema itself, field by field, in layout order. The counts above
+	// say how much of the table the accelerator covers; this says what it decided the ads
+	// look like -- which is what you need to judge whether the sampling recovered the shape
+	// you expected, or picked up something odd.
+	Schema []SchemaScanField `json:"schema,omitempty"`
+}
+
+// SchemaScanField is one attribute in the derived schema: the name it was recovered under, the
+// storable kind chosen for it, and the fixed width its slot occupies. Hot marks the numeric
+// columns kept uncompressed for O(1) scan.
+//
+// Width is bytes for an int (1/2/4/6/8, the narrowest that fits the sampled values), 8 for a
+// real or a string slot, and 0 for a bool (bit-packed).
+type SchemaScanField struct {
+	Name     string `json:"name"`
+	Kind     string `json:"kind"` // bool, int, real, string
+	Width    int    `json:"width,omitempty"`
+	Unsigned bool   `json:"unsigned,omitempty"`
+	Hot      bool   `json:"hot,omitempty"`
+}
+
+// String names a schema field's kind for display.
+func (k adKind) String() string {
+	switch k {
+	case akBool:
+		return "bool"
+	case akInt:
+		return "int"
+	case akReal:
+		return "real"
+	case akString:
+		return "string"
+	}
+	return "none"
 }
 
 // SchemaScanInfo returns the columnar accelerator's current state (see SchemaScanInfo).
@@ -47,12 +81,29 @@ func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 	if st := c.schemaScan.Load(); st != nil {
 		info.Enabled = true
 		info.SchemaFields = len(st.schema.fields)
+		hot := make(map[int]bool, len(st.hot))
 		for _, idx := range st.hot {
 			if idx >= 0 && idx < len(st.schema.fields) {
-				if name, ok := c.intern.Name(st.schema.fields[idx].id); ok {
+				hot[idx] = true
+				if name, ok := c.schemaFieldName(st.schema.fields[idx].id); ok {
 					info.HotFields = append(info.HotFields, name)
 				}
 			}
+		}
+		for i, f := range st.schema.fields {
+			name, ok := c.schemaFieldName(f.id)
+			if !ok {
+				// An id with no name in the intern table cannot be reported usefully; say so
+				// rather than drop the field, so the count still lines up with SchemaFields.
+				name = "?"
+			}
+			info.Schema = append(info.Schema, SchemaScanField{
+				Name:     name,
+				Kind:     f.kind.String(),
+				Width:    f.width,
+				Unsigned: f.unsigned,
+				Hot:      hot[i],
+			})
 		}
 	}
 	for _, sh := range c.shards {
@@ -69,6 +120,16 @@ func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 		sh.mu.RUnlock()
 	}
 	return info
+}
+
+// schemaFieldName resolves a schema field's interned id to its attribute name. A collection
+// with no intern table cannot have a schema (buildAdSchema reads the id-keyed form), but guard
+// it rather than depend on that.
+func (c *Collection) schemaFieldName(id uint32) (string, bool) {
+	if c.intern == nil {
+		return "", false
+	}
+	return c.intern.Name(id)
 }
 
 // EnableSchemaScan builds a columnar block over every currently-sealed segment (skipping the
@@ -241,9 +302,22 @@ func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 		c.EnableSchemaScan(st.schema, st.hot)
 		return true
 	}
+	s, hot, ok := c.deriveSchema(sampleMax, hotTopN)
+	if !ok {
+		return false
+	}
+	c.EnableSchemaScan(s, hot)
+	return true
+}
+
+// deriveSchema samples the collection and derives a schema plus its hot numeric tier, without
+// touching the current state. Shared by BuildAndEnableSchemaScan (first enable) and
+// ReschemaScan (a deliberate rebuild). Returns false if there is nothing to sample or no field
+// survived the presence threshold.
+func (c *Collection) deriveSchema(sampleMax, hotTopN int) (*adSchema, []int, bool) {
 	samples := c.CollectSamples(sampleMax)
 	if len(samples) == 0 {
-		return false
+		return nil, nil, false
 	}
 	// buildAdSchema reads the id-keyed wire form; a persistent (inline) collection's records
 	// store names, so canonicalize them to interned wire first (else the schema is empty and
@@ -257,12 +331,12 @@ func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 		}
 		samples = interned
 		if len(samples) == 0 {
-			return false
+			return nil, nil, false
 		}
 	}
 	s := buildAdSchema(samples, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
 	if len(s.fields) == 0 {
-		return false
+		return nil, nil, false
 	}
 	type fieldDemand struct {
 		idx   int
@@ -296,8 +370,7 @@ func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 	// width that covers essentially all its values. Cold fields keep the tight base width. See
 	// refitHotIntWidths.
 	s, hot = refitHotIntWidths(s, samples, hot, hotIntFit)
-	c.EnableSchemaScan(s, hot)
-	return true
+	return s, hot, true
 }
 
 // hotIntFit is the width fit percentile for HOT (demand-queried) int columns: high enough to
