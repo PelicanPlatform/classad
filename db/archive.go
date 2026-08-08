@@ -413,6 +413,17 @@ type AutoTuneResult = collections.AutoTuneResult
 // An append-only table never compacts, so its segment count only grows, and every sealed
 // segment costs a memory mapping at open. This is what bounds that; without it running, the
 // count climbs until the daemon cannot start.
+// Explain reports how a query against the archive would be executed (see
+// collections.Archive.ExplainQuery), so `.explain` works on a history table rather than
+// reporting it as a nonexistent table.
+func (t *ArchiveTable) Explain(constraint string) (QueryExplain, error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return QueryExplain{}, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return t.a.ExplainQuery(q), nil
+}
+
 func (t *ArchiveTable) MergePass(opts MergeOptions) int { return t.a.MergePass(opts) }
 
 // Count is the number of records currently retained (reduced by rotation).

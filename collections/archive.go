@@ -278,6 +278,16 @@ func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent
 	return a.c.Watch(ctx, cursor)
 }
 
+// ExplainQuery reports how the archive would execute q -- which conjuncts are index-usable
+// and the resulting access path -- as Collection.ExplainQuery does for a mutable table.
+//
+// Two archive-specific notes on reading the result. An archive's scan is newest-first over
+// sealed segments, and whole segments are additionally skipped by zone map (see ZoneAttrs),
+// which the plan string does not name: a "serial-scan" over an archive may still visit far
+// fewer records than TotalAds. And TotalAds counts everything retained, so probe selectivity
+// is against the whole history rather than a working set.
+func (a *Archive) ExplainQuery(q *vm.Query) QueryExplain { return a.c.ExplainQuery(q) }
+
 // SidecarSizes reports the archive's sealed-segment sidecar index bytes (mmap-backed,
 // evictable page cache), broken out by structure. An operator diagnostic.
 func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }

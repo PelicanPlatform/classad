@@ -1209,11 +1209,21 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		if r.err != nil {
 			return respBad(reqID)
 		}
-		d, ok := s.cat.Table(table)
-		if !ok {
-			return respErr(reqID, "no such table: "+table)
+		// An archive (history) table is not a mutable table, so resolving only the mutable
+		// catalog reported `.explain` on a history table as a nonexistent table -- while
+		// queries against it worked. Both types can explain.
+		var ex db.QueryExplain
+		var err error
+		switch d, ok := s.cat.Table(table); {
+		case ok:
+			ex, err = d.Explain(constraint)
+		default:
+			a, aok := s.cat.ArchiveTable(table)
+			if !aok {
+				return respErr(reqID, "no such table: "+table)
+			}
+			ex, err = a.Explain(constraint)
 		}
-		ex, err := d.Explain(constraint)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
