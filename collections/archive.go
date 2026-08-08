@@ -288,6 +288,22 @@ func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent
 // is against the whole history rather than a working set.
 func (a *Archive) ExplainQuery(q *vm.Query) QueryExplain { return a.c.ExplainQuery(q) }
 
+// BuildAndEnableSchemaScan builds (or extends coverage of) the per-segment columnar
+// accelerator over the archive's sealed segments, as Collection.BuildAndEnableSchemaScan does
+// for a mutable table. An archive is the natural target for it -- the segments are immutable
+// once sealed, so a block never needs invalidating -- and the payoff is large: a numeric
+// COUNT over 50k history records drops from ~50ms of row scan to ~1ms.
+//
+// The first call reads every sealed record once to sample and to build a block per segment,
+// which over a long history is the same "paid for by reading history back" cost an archive
+// index backfill has. Later calls only cover segments sealed since.
+func (a *Archive) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
+	return a.c.BuildAndEnableSchemaScan(sampleMax, hotTopN)
+}
+
+// SchemaScanInfo reports the columnar accelerator's state for the archive.
+func (a *Archive) SchemaScanInfo() SchemaScanInfo { return a.c.SchemaScanInfo() }
+
 // SidecarSizes reports the archive's sealed-segment sidecar index bytes (mmap-backed,
 // evictable page cache), broken out by structure. An operator diagnostic.
 func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }
