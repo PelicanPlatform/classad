@@ -424,6 +424,15 @@ func (t *ArchiveTable) Explain(constraint string) (QueryExplain, error) {
 	return t.a.ExplainQuery(q), nil
 }
 
+// BuildAndEnableSchemaScan builds or extends the archive's columnar accelerator (see
+// collections.Archive.BuildAndEnableSchemaScan).
+func (t *ArchiveTable) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
+	return t.a.BuildAndEnableSchemaScan(sampleMax, hotTopN)
+}
+
+// SchemaScanInfo reports the archive's columnar accelerator state.
+func (t *ArchiveTable) SchemaScanInfo() SchemaScanInfo { return t.a.SchemaScanInfo() }
+
 func (t *ArchiveTable) MergePass(opts MergeOptions) int { return t.a.MergePass(opts) }
 
 // Count is the number of records currently retained (reduced by rotation).

@@ -234,6 +234,20 @@ type MaintainOptions struct {
 	// is nearly free and re-adding it costs a backfill, so a wrong drop is expensive and
 	// asymmetric in the direction that punishes acting on a weak signal.
 	ArchiveIndexMinDemand int64
+	// ArchiveSchemaScanHotTopN, when > 0, builds the per-segment columnar accelerator on
+	// ARCHIVE tables too, keeping the topN most query-read numeric fields uncompressed.
+	//
+	// Separate from SchemaScanHotTopN, and off by default, for the same reason
+	// ArchiveIndexMinDemand is: the first build reads every sealed record of the whole
+	// history once, so turning it on is a deliberate decision about an existing deployment
+	// rather than something an upgrade should start doing. Once built it is cheap -- an
+	// archive's segments are immutable, so a block is never invalidated, and later passes
+	// only cover newly-sealed segments.
+	//
+	// The payoff is confined to what the accelerator serves: single-int-field COUNT
+	// comparisons (25-65x on a 50k-record archive). Other aggregates -- MAX, SUM, GROUP BY
+	// -- take their existing paths and are unaffected.
+	ArchiveSchemaScanHotTopN int
 	// SchemaScanHotTopN, when > 0, builds/refreshes the per-segment adschema columnar
 	// accelerator (used by CountConstraint's fast path) keeping the topN most query-read
 	// numeric fields uncompressed. The first pass chooses a stable schema and hot set from

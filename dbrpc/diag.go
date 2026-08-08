@@ -107,6 +107,7 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 		ZoneAttrs:          a.ZoneAttrs(),
 		SealedSegments:     sealed,
 		StaleIndexSegments: stale,
+		SchemaScan:         a.SchemaScanInfo(),
 	}
 	return json.Marshal(d)
 }

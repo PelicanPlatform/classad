@@ -1525,6 +1525,17 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 		if stale, _ := a.StaleIndexSegments(); stale > 0 {
 			a.Reindex()
 		}
+		// The per-segment columnar accelerator, off unless configured (see
+		// ArchiveSchemaScanHotTopN): the first build reads the whole history once. After that
+		// this only extends coverage to segments sealed since, including those a merge just
+		// produced.
+		if opts.ArchiveSchemaScanHotTopN > 0 {
+			sampleMax := opts.SampleMax
+			if sampleMax <= 0 {
+				sampleMax = diagSampleMax
+			}
+			a.BuildAndEnableSchemaScan(sampleMax, opts.ArchiveSchemaScanHotTopN)
+		}
 		// Add the indexes observed demand justifies. Off unless a threshold is configured:
 		// an archive index is paid for by reading history back, so it is not something to
 		// start doing to an existing deployment on an upgrade.
