@@ -438,6 +438,17 @@ func (t *ArchiveTable) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 	return t.a.BuildAndEnableSchemaScan(sampleMax, hotTopN)
 }
 
+// SchemaFit measures the archive's derived schema against a fresh sample (see DB.SchemaFit).
+func (t *ArchiveTable) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) {
+	return t.a.SchemaFit(sampleMax)
+}
+
+// ReschemaScan re-derives the archive's schema and rebuilds every sealed segment's columnar
+// block (see DB.ReschemaScan).
+func (t *ArchiveTable) ReschemaScan(sampleMax, hotTopN int) bool {
+	return t.a.ReschemaScan(sampleMax, hotTopN)
+}
+
 // SchemaScanInfo reports the archive's columnar accelerator state.
 func (t *ArchiveTable) SchemaScanInfo() SchemaScanInfo { return t.a.SchemaScanInfo() }
 

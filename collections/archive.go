@@ -301,6 +301,16 @@ func (a *Archive) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 	return a.c.BuildAndEnableSchemaScan(sampleMax, hotTopN)
 }
 
+// SchemaFit measures the archive's derived schema against a fresh sample, reporting per-field
+// escape rates (see Collection.SchemaFit).
+func (a *Archive) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) { return a.c.SchemaFit(sampleMax) }
+
+// ReschemaScan re-derives the archive's schema and rebuilds every sealed segment's columnar
+// block against it (see Collection.ReschemaScan).
+func (a *Archive) ReschemaScan(sampleMax, hotTopN int) bool {
+	return a.c.ReschemaScan(sampleMax, hotTopN)
+}
+
 // SchemaScanInfo reports the columnar accelerator's state for the archive.
 func (a *Archive) SchemaScanInfo() SchemaScanInfo { return a.c.SchemaScanInfo() }
 
