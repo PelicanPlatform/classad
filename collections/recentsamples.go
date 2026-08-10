@@ -33,6 +33,17 @@ import (
 // dictionary size supplies both without collecting an unbounded multiple of what is used.
 const defaultSampleBytes = 4 * DefaultDictSize
 
+// statSampleBytes is the byte ceiling for a STATISTICAL sample (schema derivation, hot set, fit
+// report, index profiling) rather than a dictionary-training one.
+//
+// Those callers need sample COUNT, not sample bytes: buildAdSchema decides field presence against a
+// 0.90 threshold and chooseIntWidth picks a width at a fit percentile, and both get noisy on a few
+// dozen records. The dictionary budget (defaultSampleBytes) is sized for what TrainDictSize consumes
+// -- a few hundred KB, which on fat slot ads is only a few dozen records -- so reusing it here would
+// trade a biased sample for an underpowered one. This ceiling is set high enough that the record
+// count is what binds in practice, and exists only so a pathological table cannot read unboundedly.
+const statSampleBytes = 64 << 20
+
 // defaultLookBackBytes is how far back a training pass reaches, in segment bytes from the newest.
 // Large enough that the window holds many segments' worth of diversity rather than only the newest
 // one, and bounded so a table with years of history does not read all of it to build a 112 KB
@@ -56,6 +67,13 @@ const defaultLookBackBytes = 64 << 20
 // Returns nil when the collection holds no visible records.
 func (c *Collection) CollectSamplesRecent(maxRecords, maxBytes, lookBackBytes int) [][]byte {
 	return c.collectSamplesRecent(maxRecords, maxBytes, lookBackBytes, rand.Uint64)
+}
+
+// CollectSamplesRecentN returns up to maxRecords records drawn at random from the recent window,
+// with no meaningful byte bound -- the sampler for decisions that need a representative COUNT of
+// records rather than a fixed volume of bytes. See statSampleBytes.
+func (c *Collection) CollectSamplesRecentN(maxRecords int) [][]byte {
+	return c.CollectSamplesRecent(maxRecords, statSampleBytes, 0)
 }
 
 // collectSamplesRecent is CollectSamplesRecent with an injectable random source, so a test can pin

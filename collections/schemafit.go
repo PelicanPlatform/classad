@@ -47,7 +47,7 @@ func (c *Collection) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) {
 	if st == nil {
 		return nil, 0
 	}
-	samples := c.CollectSamples(sampleMax)
+	samples := c.CollectSamplesRecentN(sampleMax)
 	if c.inline {
 		interned := make([][]byte, 0, len(samples))
 		for _, w := range samples {

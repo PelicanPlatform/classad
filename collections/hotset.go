@@ -28,7 +28,7 @@ func (c *Collection) RefreshHotSet(sampleMax, topN int) int {
 	//
 	// Names come via ForEachNamed (both encodings: interned ids in RAM, inline names when
 	// persistent) -- the old id-based ForEach counted nothing on a persistent collection.
-	samples := c.CollectSamples(sampleMax)
+	samples := c.CollectSamplesRecentN(sampleMax)
 	presence := make(map[string]int)
 	display := make(map[string]string) // folded -> first-seen spelling
 	for _, w := range samples {

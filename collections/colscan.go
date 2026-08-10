@@ -344,7 +344,7 @@ func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 // ReschemaScan (a deliberate rebuild). Returns false if there is nothing to sample or no field
 // survived the presence threshold.
 func (c *Collection) deriveSchema(sampleMax, hotTopN int) (*adSchema, []int, bool) {
-	samples := c.CollectSamples(sampleMax)
+	samples := c.CollectSamplesRecentN(sampleMax)
 	if len(samples) == 0 {
 		return nil, nil, false
 	}
