@@ -134,7 +134,7 @@ func (p *attrProfile) addDistinct(k string) {
 // which carries no intern ids (the id-based ForEach would have yielded nothing).
 func (c *Collection) profileAttrs(sampleMax int) map[string]*attrProfile {
 	profiles := map[string]*attrProfile{}
-	for _, w := range c.CollectSamples(sampleMax) {
+	for _, w := range c.CollectSamplesRecentN(sampleMax) {
 		wire.Ad(w).ForEachNamed(c.intern, func(name string, node []byte) bool {
 			fold := strings.ToLower(name)
 			p := profiles[fold]
