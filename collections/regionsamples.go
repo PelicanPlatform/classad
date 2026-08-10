@@ -2,18 +2,46 @@ package collections
 
 // Dictionary training samples drawn from columnar block REGIONS rather than whole ads.
 //
-// The dictionary is trained from CollectSamples: whole ClassAd records. That content is a good
-// match for compressing a record -- small, independent, and full of the attribute names and values
-// the dictionary carries. It is a poor match for a block's three regions, which are aggregates over
-// a whole segment: column-major fixed-width integers, concatenated string values, and the
-// record-shaped cold tail. Measured on a 4000-record fixture, an ad-trained dictionary gained
-// -0.1% on the cold numeric region, -14.7% on the strings, and -3.7% on the cold tail -- it helped
-// none of them.
+// NOT WIRED INTO RETRAINING, DELIBERATELY -- see the measurement below. Retraining trains on whole
+// records (CollectSamples, via compact.go), and that is the right choice. This exists because it is
+// the right choice for a regime that is reachable but not the default, and because the reasoning is
+// worth keeping next to the code rather than in a pull request.
 //
-// Sampling the regions themselves gives training content drawn from what is actually being
-// compressed. The interesting case is a SMALL block, which has little internal redundancy of its
-// own to exploit and is therefore where a dictionary can still earn something; a large block
-// compresses well unaided either way.
+// The premise is sound: a dictionary trained on whole ClassAd records is matched to compressing a
+// record and mismatched to a block's three regions, which are a different shape entirely
+// (column-major fixed-width integers, concatenated string values, and the record-shaped cold tail).
+// Sampling the regions themselves gives training content drawn from what is actually compressed, and
+// it does win per region. MEASURED HELD-OUT on the real OSPool corpus, oldest half of segments
+// training and newest half measured (TestDictStrategyByGroupSize), at the production ~1 MiB row
+// group: strings -4.5% vs the ad dictionary's -3.5%, cold tail -7.0% vs -5.3%.
+//
+// It still loses, because ONE codec serves the whole collection. The same dictionary compresses
+// every record written to the arena, the arena is several times the bytes of the block regions, and
+// records are exactly what an ad-trained dictionary is good at. Net stored bytes over the same
+// held-out data (TestDictStrategyNetBytes):
+//
+//	strategy         arena      regions     total
+//	none           3514376      481643    3996019
+//	ad-trained     1640224      464535    2104759   <- production
+//	region-trained 1853546      459125    2312671   (+9.9%)
+//
+// Region training saves 5.4 KB on the regions and gives back 213 KB on the arena. Per-region
+// percentages alone point the other way, which is the trap this comment exists to close.
+//
+// WHEN IT WOULD PAY. Dictionary value on a region falls off fast as the block grows, because a
+// dictionary supplies redundancy the payload cannot supply itself. Same measurement, by block size,
+// strings / cold tail with a region dictionary: 8 records -26.1%/-32.4%, 27 records -12.6%/-16.2%,
+// 53 records -7.3%/-10.3%, 107 records (the ~1 MiB default) -4.5%/-7.0%. So a deployment that
+// configured much smaller row groups than colGroupTargetBytes, or one that stopped storing the row
+// arena, could reach the regime where this wins -- and should re-run both tests rather than trust
+// these numbers, which are for one corpus.
+//
+// Two things that are NOT worth building, measured: a per-region-kind dictionary adds nothing over
+// one mixed region dictionary (-4.2% vs -4.5% on strings) and fails to train at all on the cold tail
+// at every group size at or above 32 records (zstd BuildDict divides by zero on that sample
+// distribution). And the cold-numeric region gains nothing from any dictionary -- between 0.0% and
+// +0.7%, i.e. slightly worse -- so a dictionary-less codec for that one stream would buy about 100
+// bytes per 2.7 MB, which does not pay for a second zstd encoder's resident memory.
 
 // regionKinds is the number of region kinds sampled, and the number of equal shares the byte budget
 // is split into.
