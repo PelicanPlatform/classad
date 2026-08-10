@@ -118,7 +118,7 @@ func BenchmarkIntWidth6vs8(b *testing.B) {
 	blk6 := encodeColumnarBlock(s, encodeRows(s, wires), []int{s.byID[bigID]}, codec)
 	blk8 := encodeColumnarBlock(s8, encodeRows(s8, wires), []int{s8.byID[bigID]}, codec)
 	sz := func(blk *columnarBlock) int {
-		return len(marshalColSegment(&colSegment{block: blk, offs: make([]uint32, blk.n)}, c.intern.Name))
+		return len(marshalColSegment(oneBlockColSeg(blk, make([]uint32, blk.n)), c.intern.Name))
 	}
 	b.Logf("persisted block: 6B=%d bytes  8B=%d bytes (%+d)", sz(blk6), sz(blk8), sz(blk6)-sz(blk8))
 	bc, _ := newBlockCache(64 << 20)
