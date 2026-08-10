@@ -73,6 +73,14 @@ func (c *Collection) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 		}
 		keep = pred
 	}
+	// Record the read so the hot tier learns about it. The tier holds the top-N numeric fields by
+	// query read demand, uncompressed; a cold field's column group has to be decompressed. But the
+	// accelerated paths recorded NO demand, so a column that is only ever aggregated -- never
+	// filtered on through a path that does record -- could not earn a slot, and serving the query
+	// faster made it invisible to the mechanism meant to make it faster still. The feedback loop
+	// was open.
+	c.demand.recordReads([]string{attr})
+
 	out := NumStats{Min: math.Inf(1), Max: math.Inf(-1)}
 	c.scanNumValues(id, st.cache, func(nv colVal) {
 		if keep != nil && !keep(nv.f) {

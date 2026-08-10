@@ -458,6 +458,11 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 	if !ok {
 		return 0, false
 	}
+	// As NumStatsQuery: record the predicate's attribute so the hot tier keeps tracking the
+	// columns queries actually read, instead of freezing once the accelerator starts serving them.
+	if name, ok := c.schemaFieldName(fieldID); ok {
+		c.demand.recordReads([]string{name})
+	}
 	return c.schemaScanCount(fieldID, st.cache, eval), true
 }
 
