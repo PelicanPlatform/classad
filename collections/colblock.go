@@ -171,7 +171,7 @@ func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, p
 	if !ok {
 		return errNotNumericField
 	}
-	ds, err := bc.streams(b)
+	coldNum, err := bc.stream(b, kindColdNum)
 	if err != nil {
 		return err
 	}
@@ -180,7 +180,7 @@ func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, p
 			fn(k, false, 0)
 			continue
 		}
-		fn(k, true, readIntLE(ds.coldNum[start+k*f.width:], f.width, f.unsigned))
+		fn(k, true, readIntLE(coldNum[start+k*f.width:], f.width, f.unsigned))
 	}
 	return nil
 }
@@ -227,11 +227,11 @@ func (b *columnarBlock) reconstruct(k int, bc *blockCache) ([]byte, error) {
 // on one block share a single decompression. Callers use this only for records the scan has
 // already found escaped for fieldID; a hot/cold-column value never reaches here.
 func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (float64, bool, error) {
-	ds, err := bc.streams(b)
+	tail, err := bc.stream(b, kindCold)
 	if err != nil {
 		return 0, false, err
 	}
-	cold := ds.cold[b.coldOff[k]:b.coldOff[k+1]]
+	cold := tail[b.coldOff[k]:b.coldOff[k+1]]
 	for len(cold) > 0 {
 		id, m := binary.Uvarint(cold)
 		if m <= 0 {
@@ -256,11 +256,11 @@ func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (
 // from the node rather than assumed from the segment's schema (an escaped value is by definition
 // one the schema field did not fit).
 func (b *columnarBlock) escapedNumVal(k int, fieldID uint32, bc *blockCache) (colVal, bool) {
-	ds, err := bc.streams(b)
+	tail, err := bc.stream(b, kindCold)
 	if err != nil {
 		return colVal{}, false
 	}
-	cold := ds.cold[b.coldOff[k]:b.coldOff[k+1]]
+	cold := tail[b.coldOff[k]:b.coldOff[k+1]]
 	for len(cold) > 0 {
 		id, m := binary.Uvarint(cold)
 		if m <= 0 {
