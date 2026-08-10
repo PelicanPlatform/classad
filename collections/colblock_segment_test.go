@@ -78,7 +78,7 @@ func TestBuildColumnarFromSegmentRowGroups(t *testing.T) {
 	// shape). All must produce identical per-record answers.
 	for _, groupRows := range []int{colGroupRows, 100, 1, n + 7} {
 		t.Run(fmt.Sprintf("group%d", groupRows), func(t *testing.T) {
-			blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, []int{memIdx}, byRows(groupRows), store.recordToInterned)
+			blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, store.regionCodec(), s, []int{memIdx}, byRows(groupRows), store.recordToInterned)
 			if len(offs) != n {
 				t.Fatalf("offs=%d, want %d", len(offs), n)
 			}

@@ -359,7 +359,7 @@ func TestColSegmentRejectsGroupOffsMismatch(t *testing.T) {
 		t.Fatal("no sealed segment")
 	}
 	d := seg.dict.Load()
-	blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, st.schema, st.hot, byRows(64),
+	blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, store.regionCodec(), st.schema, st.hot, byRows(64),
 		func(dst, w []byte) ([]byte, bool) { return store.recordToInternedDict(d, dst, w) })
 	if len(blocks) < 2 {
 		t.Fatal("fixture produced a single row group; the mismatch guard would not be exercised")

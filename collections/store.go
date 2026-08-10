@@ -227,10 +227,14 @@ type Collection struct {
 	shards []*shard
 	mask   uint64
 	h      Hasher
-	codec  atomic.Pointer[codecHolder]  // current codec for new writes; swapped by RetrainDict
-	intern *wire.InternTable            // shared attribute-name interning across the store
-	hotSet atomic.Pointer[hotSetHolder] // interned ids to front-load; swapped by RefreshHotSet
-	spec   atomic.Pointer[indexSpec]    // configured indexes; swapped by AddIndex/DropIndex (never nil after New)
+	codec  atomic.Pointer[codecHolder] // current codec for new writes; swapped by RetrainDict
+	// regionCodecCache holds the dictionary-less codec a columnar block's regions are compressed
+	// with (see regionCodec). Created on first use and never swapped, so a block built at any point
+	// in this collection's life decodes with the same codec.
+	regionCodecCache atomic.Pointer[codecHolder]
+	intern           *wire.InternTable            // shared attribute-name interning across the store
+	hotSet           atomic.Pointer[hotSetHolder] // interned ids to front-load; swapped by RefreshHotSet
+	spec             atomic.Pointer[indexSpec]    // configured indexes; swapped by AddIndex/DropIndex (never nil after New)
 
 	// matchRoots (case-folded) are the roots whose closure is front-loaded into the
 	// hot header for the match fast path (Options.MatchClosureRoots); nil if disabled.

@@ -103,7 +103,7 @@ func blocksAt(t *testing.T, c *Collection, segs []*segment, g colGrouping) []*co
 	var out []*columnarBlock
 	for _, seg := range segs {
 		d := seg.dict.Load()
-		bl, _ := buildColumnarFromSegment(seg.data, seg.used, identityCodec{}, st.schema, st.hot, g,
+		bl, _ := buildColumnarFromSegment(seg.data, seg.used, seg.codec, identityCodec{}, st.schema, st.hot, g,
 			func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
 		out = append(out, bl...)
 	}

@@ -129,7 +129,7 @@ func (g colGrouping) full(rows, bytes int) bool {
 type columnarBlock struct {
 	id     uint64 // process-unique, the block-cache key
 	schema *adSchema
-	codec  Codec
+	codec  Codec // the REGION codec (dictionary id 0), not the segment's record codec
 	n      int
 
 	hot         []byte // uncompressed region, hotStride bytes per record
@@ -182,8 +182,8 @@ func layoutColumnar(b *columnarBlock, s *adSchema, hotNumFields []int, n int) {
 	}
 }
 
-func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec Codec) *columnarBlock {
-	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: len(recs)}
+func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionCodec Codec) *columnarBlock {
+	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: regionCodec, n: len(recs)}
 	layoutColumnar(b, s, hotNumFields, len(recs))
 	cp := 0
 	for _, i := range b.coldNum {
@@ -211,9 +211,9 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec C
 		b.strOff = append(b.strOff, len(strCat))
 		b.coldOff = append(b.coldOff, len(coldCat))
 	}
-	b.coldNumComp = codec.Compress(nil, coldRaw)
-	b.strComp = codec.Compress(nil, strCat)
-	b.coldComp = codec.Compress(nil, coldCat)
+	b.coldNumComp = regionCodec.Compress(nil, coldRaw)
+	b.strComp = regionCodec.Compress(nil, strCat)
+	b.coldComp = regionCodec.Compress(nil, coldCat)
 	return b
 }
 
@@ -229,10 +229,14 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, codec C
 // records instead of the whole segment's, which for a 1 GiB segment was the same order as the
 // segment itself.
 //
+// The two codecs are deliberately different. arenaCodec decompresses the stored records and must be
+// the segment's own codec (whatever dictionary they were written under); regionCodec compresses the
+// block's regions and is the dictionary-less base codec (see Collection.regionCodec).
+//
 // toInterned canonicalizes a decompressed record into interned wire (identity for an already-
 // interned collection; a decode/re-encode for an inline/persistent one). encode reads the
 // id-keyed form, so a non-interned record must be converted first or the block would be empty.
-func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, hot []int, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool)) ([]*columnarBlock, []uint32) {
+func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool)) ([]*columnarBlock, []uint32) {
 	var blocks []*columnarBlock
 	var recs [][]byte
 	var offs []uint32
@@ -245,7 +249,7 @@ func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, h
 			break
 		}
 		if !recIsMarker(data, o) {
-			if w, err := codec.Decompress(buf[:0], recAd(data, o)); err == nil {
+			if w, err := arenaCodec.Decompress(buf[:0], recAd(data, o)); err == nil {
 				buf = w
 				if iw, ok := toInterned(nil, w); ok {
 					rec := s.encode(wire.Ad(iw))
@@ -253,7 +257,7 @@ func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, h
 					offs = append(offs, o)
 					groupBytes += len(rec)
 					if g.full(len(recs), groupBytes) {
-						blocks = append(blocks, encodeColumnarBlock(s, recs, hot, codec))
+						blocks = append(blocks, encodeColumnarBlock(s, recs, hot, regionCodec))
 						recs, groupBytes = recs[:0], 0
 					}
 				}
@@ -262,13 +266,13 @@ func buildColumnarFromSegment(data []byte, upto int, codec Codec, s *adSchema, h
 		off += int(total)
 	}
 	if len(recs) > 0 {
-		blocks = append(blocks, encodeColumnarBlock(s, recs, hot, codec)) // short final group
+		blocks = append(blocks, encodeColumnarBlock(s, recs, hot, regionCodec)) // short final group
 	}
 	if len(blocks) == 0 {
 		// A segment with no encodable records still gets one empty block, so a colSegment always
 		// carries the schema it was built under (which persistence and the scan's field resolution
 		// both read from the first block).
-		blocks = append(blocks, encodeColumnarBlock(s, nil, hot, codec))
+		blocks = append(blocks, encodeColumnarBlock(s, nil, hot, regionCodec))
 	}
 	return blocks, offs
 }
