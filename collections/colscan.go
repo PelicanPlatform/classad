@@ -227,13 +227,54 @@ func (c *Collection) persistColSeg(sh *shard, seg *segment) {
 	c.installSidecar(sh, seg, path, container)
 }
 
+// regionCodec is the codec a columnar block's REGIONS are compressed with: ZSTD with NO trained
+// dictionary, created once per collection and cached.
+//
+// WHY NO DICTIONARY. The trained dictionary is an ARENA optimization and does not pay for itself on
+// the block regions. Measured on real OSPool slot ads (dictcpu_test.go, decompression throughput):
+// the dictionary costs 20% on the cold-numeric region for ZERO size benefit (it compresses that
+// region 0.0% to +0.7% WORSE), 24% on the strings region for -3.5%, and 25% on the cold tail for
+// -5.3%. Since row groups bounded the blocks, regions are only about a fifth of stored bytes, so
+// dropping the dictionary across all three costs under 1% of total stored size and returns roughly a
+// quarter of the decompression throughput on a path taken by every cold-column scan, escaped-value
+// read and full-ad reconstruct.
+//
+// WHY NOT the segment's codec (what it used to be), and why not dictionary id 0 either. A block's
+// region codec has to be recoverable at reload time without being recorded per block, so it must
+// depend only on state that never changes for the life of the collection. The segment's codec fails
+// that -- it is whatever dictionary generation the segment was written under, and a reseal changes
+// it. currentCodec fails it too, since a retrain swaps identity for ZSTD mid-life, which would leave
+// blocks written earlier in the process undecodable. Dictionary id 0 is stable, but on a store whose
+// base codec is identity (the historical default that db.chooseBaseCodec preserves for existing
+// stores) it would leave the regions UNCOMPRESSED, which for such a store is a real size regression
+// against today, where a retrain gives them dictionary compression.
+//
+// A dictionary-less ZSTD codec satisfies all of it: identical for every collection, never affected by
+// a retrain or a reseal, and compressing. Note that on an identity-base store this means the block
+// regions are compressed while the records are not. That is fine -- a block is derived state with its
+// own version stamp, and nothing assumes it shares the record encoding.
+func (c *Collection) regionCodec() Codec {
+	if h := c.regionCodecCache.Load(); h != nil {
+		return h.c
+	}
+	cd, err := NewZSTDCodec(nil)
+	if err != nil {
+		// Cannot happen for a nil dictionary; degrade to the base codec rather than fail a seal.
+		// Cached so the choice is still stable for this process.
+		cd = c.currentCodec()
+	}
+	c.regionCodecCache.CompareAndSwap(nil, &codecHolder{cd})
+	return c.regionCodecCache.Load().c
+}
+
 // buildColSegment transcodes a sealed segment into its columnar accelerator block under schema s
 // and hot tier hot (resolving an interned segment's local ids on the way). Returns nil if the
 // block cannot be built. Off the write lock (reads immutable sealed bytes).
 func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colSegment {
 	colSegmentBuilds.Add(1)
 	d := seg.dict.Load() // interned segment -> resolve its local ids during transcode
-	blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, hot, defaultColGrouping(),
+	blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, c.regionCodec(), s, hot,
+		defaultColGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
 	if len(blocks) == 0 {
 		return nil

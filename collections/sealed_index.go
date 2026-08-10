@@ -67,7 +67,7 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	// independent of this mapping.
 	var cs *colSegment
 	if body := readColSection(col, seg.used); body != nil { // rejects truncated/corrupt/stale -> row-scan
-		cs = unmarshalColSegment(body, seg.codec, c.intern.Intern)
+		cs = unmarshalColSegment(body, c.regionCodec(), c.intern.Intern)
 	}
 	// keyIdx is set exactly once per seal and is the "sealed" marker; CAS so a
 	// concurrent seal cannot leak a mapping.
@@ -234,7 +234,7 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 	// together by swapSidecarHook + releaseStale once scan pins drain.
 	var cs *colSegment
 	if body := readColSection(col, seg.used); body != nil {
-		cs = unmarshalColSegment(body, seg.codec, c.intern.Intern)
+		cs = unmarshalColSegment(body, c.regionCodec(), c.intern.Intern)
 	}
 	// Publish under the shard write lock: the readers that touch a sidecar without a scan pin
 	// (SidecarSizes, IndexSizes) hold the read lock while they do; pinned scan readers are handled

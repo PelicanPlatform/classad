@@ -18,11 +18,16 @@ import (
 // the same "derived state, any doubt rebuilds" contract the attribute-index sidecar follows.
 const (
 	colSectionMagic = 0x434f4c58 // "COLX"
-	// colSectionVersion 2 stores a LIST of row-group blocks per segment (see colGroupRows); v1
-	// stored exactly one block covering the whole segment. A v1 section is rejected by
-	// readColSection like any other section that cannot be trusted, so the segment simply rebuilds
-	// its accelerator under the current layout -- derived state, so no migration is needed.
-	colSectionVersion = 2
+	// colSectionVersion history. v1 stored exactly one block covering the whole segment; v2 stores a
+	// LIST of row-group blocks (see colGroupRows); v3 compresses the block's regions with the
+	// dictionary-less base codec instead of the segment's dictionary codec (see
+	// Collection.regionCodec). An older section is rejected by readColSection like any other section
+	// that cannot be trusted, so the segment rebuilds its accelerator under the current rules --
+	// derived state, so no migration is needed. v3 in particular MUST be a version bump rather than
+	// a silent change: a v2 section's regions were compressed with a trained dictionary, so decoding
+	// them with the base codec would fail or, worse, be attempted against whatever dictionary the
+	// segment currently carries.
+	colSectionVersion = 3
 	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
 )
 

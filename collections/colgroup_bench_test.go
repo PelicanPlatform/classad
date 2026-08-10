@@ -83,7 +83,7 @@ func regroup(tb testing.TB, c *Collection, g colGrouping) (blocks, recs int) {
 				continue
 			}
 			d := seg.dict.Load()
-			bl, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, st.schema, st.hot, g,
+			bl, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, c.regionCodec(), st.schema, st.hot, g,
 				func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
 			seg.colblk.Store(&colSegment{blocks: bl, offs: offs})
 			blocks += len(bl)
@@ -198,7 +198,7 @@ func BenchmarkRowGroupBuild(b *testing.B) {
 		b.Run(p.name, func(b *testing.B) {
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				blocks, _ := buildColumnarFromSegment(seg.data, seg.used, seg.codec, st.schema, st.hot, p.g,
+				blocks, _ := buildColumnarFromSegment(seg.data, seg.used, seg.codec, store.regionCodec(), st.schema, st.hot, p.g,
 					func(dst, w []byte) ([]byte, bool) { return store.recordToInternedDict(d, dst, w) })
 				if len(blocks) == 0 {
 					b.Fatal("no blocks")
