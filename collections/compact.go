@@ -242,7 +242,12 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	defer c.maintMu.Unlock()
 	start := time.Now()
 	defer func() { c.opm.retrain.observe(time.Since(start)) }()
-	dict, err := TrainDict(c.CollectSamples(sampleMax))
+	// Recent random records, not the oldest sampleMax of them: for an append-only table
+	// CollectSamples returns the first records ever stored, which is the least representative
+	// sample of what is arriving next (see CollectSamplesRecent). sampleMax keeps its meaning as a
+	// record count; the sampler additionally applies its own byte budget, so a table of very fat
+	// ads no longer decompresses tens of megabytes to build a 112 KB dictionary.
+	dict, err := TrainDict(c.CollectSamplesRecent(sampleMax, 0, 0))
 	if err != nil {
 		return 0, err
 	}

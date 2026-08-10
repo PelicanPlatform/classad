@@ -89,13 +89,20 @@ func TestRegionSamplesLookBack(t *testing.T) {
 	}
 }
 
-// TestDictStrategies is the decision: for each of the three regions AND for whole records, compare
+// NOT HELD OUT: this harness trains and measures on the same bytes, so its savings are optimistic
+// -- a dictionary scored against its own training samples is partly measuring memorization. It
+// survives as a synthetic smoke test that the strategies are wired up and comparable. For numbers to
+// reason about, use TestDictStrategyByGroupSize / TestDictStrategyNetBytes (dictgroup_test.go), which
+// train on the oldest half of the segments and measure on the newest, sweep the row-group size, and
+// net the arena against the regions.
+//
+// TestDictStrategies compares, for each of the three regions AND for whole records, compare
 // no dictionary, the ad-trained dictionary (status quo), and a region-trained one.
 //
 // The two uses pull in opposite directions. A record is small and independent, which is exactly what
-// a dictionary is for. A block region is a large aggregate with its own redundancy, where a
-// dictionary has little to add. Since ONE codec compresses both, the numbers below decide whether
-// training on regions is an improvement or a trade.
+// a dictionary is for. A block region is a larger aggregate with its own redundancy, where a
+// dictionary has less to add. Since ONE codec compresses both, the trade has to be netted -- see
+// TestDictStrategyNetBytes, which does that on held-out data and finds ad training ahead.
 func TestDictStrategies(t *testing.T) {
 	c := dictFixture(t, 4000)
 	defer c.Close()

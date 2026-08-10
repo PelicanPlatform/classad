@@ -40,6 +40,11 @@ func realOSPoolAds(tb testing.TB, max int) []*classad.ClassAd {
 // TestDictStrategiesRealOSPool repeats the dictionary comparison on REAL OSPool ads rather than a
 // synthetic fixture whose numeric columns were regular enough to flatter a region-trained
 // dictionary. These ads carry ~568 attributes apiece, so all three regions are populated naturally.
+//
+// NOT HELD OUT, and the "records" row is measured on the training samples themselves, so every
+// figure it logs is optimistic. Superseded for decision-making by TestDictStrategyByGroupSize and
+// TestDictStrategyNetBytes (dictgroup_test.go); kept because it exercises the strategies over the
+// real corpus at one segment size with no group-size machinery.
 func TestDictStrategiesRealOSPool(t *testing.T) {
 	ads := realOSPoolAds(t, 20000)
 	t.Logf("corpus: %d real OSPool ads, %d attributes in the first",
