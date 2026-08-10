@@ -29,11 +29,24 @@ func segmentWires(t *testing.T, seg *segment) [][]byte {
 	return ws
 }
 
-// TestBuildColumnarFromSegment transcodes a real segment's records into a columnar block and
-// checks: (1) reconstruct(k) reproduces the exact ad stored at offs[k]; (2) a hot-field column
-// scan matches reading that field from the segment record; (3) offs[k] indexes a real record
-// header whose MVCC seq is readable (the map a scan uses for visibility).
-func TestBuildColumnarFromSegment(t *testing.T) {
+// oneBlockColSeg wraps a single block as a segment accelerator, for tests that build a block
+// directly rather than from a segment.
+func oneBlockColSeg(blk *columnarBlock, offs []uint32) *colSegment {
+	return &colSegment{blocks: []*columnarBlock{blk}, offs: offs}
+}
+
+// TestBuildColumnarFromSegment transcodes a real segment's records into columnar ROW-GROUP blocks
+// and checks, for several group sizes: (1) reconstruct(k) reproduces the exact ad stored at
+// offs[k]; (2) a hot-field column scan matches reading that field from the segment record; (3)
+// offs[k] indexes a real record header whose MVCC seq is readable (the map a scan uses for
+// visibility); (4) the records split into the expected groups, and every record is covered
+// exactly once.
+//
+// Sweeping the group size is the point: the group size must be transparent to every reader. A
+// bug that indexes a group-local record with a segment-wide index (or the reverse) reads another
+// record's value or another record's MVCC header, which is a wrong answer rather than a slow one,
+// and a single-group fixture cannot see it.
+func TestBuildColumnarFromSegmentRowGroups(t *testing.T) {
 	store := New(Options{Shards: 1})
 	const n = 500
 	for i := 0; i < n; i++ {
@@ -60,45 +73,82 @@ func TestBuildColumnarFromSegment(t *testing.T) {
 		t.Skip("Memory not an int schema field")
 	}
 
-	blk, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, []int{memIdx}, store.recordToInterned)
-	if blk.n != n || len(offs) != n {
-		t.Fatalf("block n=%d offs=%d, want %d", blk.n, len(offs), n)
-	}
-
-	// One column-scan pass: block value per record.
-	scanned := make([]int64, n)
-	scannedPresent := make([]bool, n)
-	if err := blk.scanInt(memIdx, nil, func(k int, p bool, v int64) { scannedPresent[k], scanned[k] = p, v }); err != nil {
-		t.Fatal(err)
-	}
-
-	for k := 0; k < n; k++ {
-		// (1) reconstruct == the ad at offs[k].
-		rec, err := blk.reconstruct(k, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		w, _ := seg.codec.Decompress(nil, recAd(seg.data, offs[k]))
-		orig := adAttrs(w)
-		dec := map[uint32][]byte{}
-		s.forEach(rec, func(id uint32, node []byte) bool { dec[id] = append([]byte(nil), node...); return true })
-		if len(dec) != len(orig) {
-			t.Fatalf("rec[%d] reconstructed %d attrs, want %d", k, len(dec), len(orig))
-		}
-		for id, on := range orig {
-			if dn, ok := dec[id]; !ok || !sameValue(on, dn) {
-				t.Errorf("rec[%d] attr %d mismatch after columnar round-trip", k, id)
+	// Group sizes: the production default, one that divides n exactly, an extreme of one record
+	// per group, and one larger than the segment (a single short group -- the old whole-segment
+	// shape). All must produce identical per-record answers.
+	for _, groupRows := range []int{colGroupRows, 100, 1, n + 7} {
+		t.Run(fmt.Sprintf("group%d", groupRows), func(t *testing.T) {
+			blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, []int{memIdx}, byRows(groupRows), store.recordToInterned)
+			if len(offs) != n {
+				t.Fatalf("offs=%d, want %d", len(offs), n)
 			}
-		}
-		// (2) hot column scan == the segment's Memory value.
-		mv, _ := wire.Ad(w).Lookup(memID)
-		lit, _ := wire.LiteralValue(mv)
-		if !scannedPresent[k] || scanned[k] != lit.Int {
-			t.Errorf("rec[%d] scanInt Memory=(%v,%d), segment=%d", k, scannedPresent[k], scanned[k], lit.Int)
-		}
-		// (3) offs[k] is a real record header.
-		if recSeq(seg.data, offs[k]) == 0 {
-			t.Errorf("rec[%d] at offs %d has zero seq", k, offs[k])
-		}
+			// (4) expected group split, and the counts sum to every record exactly once.
+			wantBlocks := (n + groupRows - 1) / groupRows
+			if len(blocks) != wantBlocks {
+				t.Fatalf("got %d row groups, want %d at groupRows=%d", len(blocks), wantBlocks, groupRows)
+			}
+			total := 0
+			for i, b := range blocks {
+				if b.n > groupRows {
+					t.Errorf("group %d holds %d records, over the %d limit", i, b.n, groupRows)
+				}
+				if i < len(blocks)-1 && b.n != groupRows {
+					t.Errorf("group %d holds %d records; only the last group may be short", i, b.n)
+				}
+				total += b.n
+			}
+			if total != n {
+				t.Fatalf("row groups cover %d records, want %d", total, n)
+			}
+
+			// One column-scan pass per group, gathered into segment-wide order.
+			scanned := make([]int64, n)
+			scannedPresent := make([]bool, n)
+			base := 0
+			for _, b := range blocks {
+				bb := base
+				if err := b.scanInt(memIdx, nil, func(k int, p bool, v int64) {
+					scannedPresent[bb+k], scanned[bb+k] = p, v
+				}); err != nil {
+					t.Fatal(err)
+				}
+				base += b.n
+			}
+
+			base = 0
+			for bi, b := range blocks {
+				for k := 0; k < b.n; k++ {
+					gk := base + k
+					// (1) reconstruct == the ad at offs[gk].
+					rec, err := b.reconstruct(k, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					w, _ := seg.codec.Decompress(nil, recAd(seg.data, offs[gk]))
+					orig := adAttrs(w)
+					dec := map[uint32][]byte{}
+					s.forEach(rec, func(id uint32, node []byte) bool { dec[id] = append([]byte(nil), node...); return true })
+					if len(dec) != len(orig) {
+						t.Fatalf("group %d rec[%d] reconstructed %d attrs, want %d", bi, k, len(dec), len(orig))
+					}
+					for id, on := range orig {
+						if dn, ok := dec[id]; !ok || !sameValue(on, dn) {
+							t.Errorf("group %d rec[%d] attr %d mismatch after columnar round-trip", bi, k, id)
+						}
+					}
+					// (2) hot column scan == the segment's Memory value.
+					mv, _ := wire.Ad(w).Lookup(memID)
+					lit, _ := wire.LiteralValue(mv)
+					if !scannedPresent[gk] || scanned[gk] != lit.Int {
+						t.Errorf("rec[%d] scanInt Memory=(%v,%d), segment=%d", gk, scannedPresent[gk], scanned[gk], lit.Int)
+					}
+					// (3) offs[gk] is a real record header.
+					if recSeq(seg.data, offs[gk]) == 0 {
+						t.Errorf("rec[%d] at offs %d has zero seq", gk, offs[gk])
+					}
+				}
+				base += b.n
+			}
+		})
 	}
 }

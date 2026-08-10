@@ -8,7 +8,7 @@ import (
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
-func mustAdOld(t *testing.T, src string) *classad.ClassAd {
+func mustAdOld(t testing.TB, src string) *classad.ClassAd {
 	t.Helper()
 	ad, err := classad.ParseOld(src)
 	if err != nil {

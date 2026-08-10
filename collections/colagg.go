@@ -193,10 +193,12 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
 			cs := w.seg.colblk.Load()
+			// Every row group in a segment is built under the same schema, so the field resolves
+			// once per segment rather than once per group.
 			bidx, isReal := -1, false
-			if cs != nil {
-				if idx, ok := cs.block.schema.byID[fieldID]; ok {
-					switch cs.block.schema.fields[idx].kind {
+			if sch := cs.schema(); sch != nil {
+				if idx, ok := sch.byID[fieldID]; ok {
+					switch sch.fields[idx].kind {
 					case akInt:
 						bidx = idx
 					case akReal:
@@ -208,28 +210,39 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 				bruteNumValues(w, s0, lookup, fn)
 				continue
 			}
-			cs.block.scanInt(bidx, bc, func(k int, present bool, v int64) {
-				o := cs.offs[k]
-				if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
-					return // not visible at this snapshot
-				}
-				if present {
-					if isReal {
-						f := math.Float64frombits(uint64(v))
-						fn(colVal{f: f, kind: akReal})
-					} else {
-						fn(colVal{f: float64(v), i: v, kind: akInt})
+			// Walk the segment's row groups in record order, tracking each group's base so a
+			// group-local record index maps back into the segment-wide offs array.
+			base := 0
+			for _, blk := range cs.blocks {
+				blk.scanInt(bidx, bc, func(k int, present bool, v int64) {
+					gk := base + k
+					if gk >= len(cs.offs) {
+						return // truncated offs: cannot establish visibility, so do not count it
 					}
-					return
-				}
-				// Escaped: read only fieldID from the cold tail, not the whole record. (A full
-				// reconstruct dominated the scan when a numeric attr has a value tail.)
-				// The cold tail carries the wire node, so its kind is read from the node
-				// itself rather than assumed from this block's schema field.
-				if nv, ok := cs.block.escapedNumVal(k, fieldID, bc); ok {
-					fn(nv)
-				}
-			})
+					o := cs.offs[gk]
+					if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+						return // not visible at this snapshot
+					}
+					if present {
+						if isReal {
+							f := math.Float64frombits(uint64(v))
+							fn(colVal{f: f, kind: akReal})
+						} else {
+							fn(colVal{f: float64(v), i: v, kind: akInt})
+						}
+						return
+					}
+					// Escaped: read only fieldID from the cold tail, not the whole record. (A full
+					// reconstruct dominated the scan when a numeric attr has a value tail.)
+					// The cold tail carries the wire node, so its kind is read from the node
+					// itself rather than assumed from this block's schema field. With row groups
+					// this decompresses only the escaped record's OWN group's tail.
+					if nv, ok := blk.escapedNumVal(k, fieldID, bc); ok {
+						fn(nv)
+					}
+				})
+				base += blk.n
+			}
 		}
 		releaseWindows(wins)
 	}

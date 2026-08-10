@@ -75,7 +75,7 @@ func TestStreamDictionaryFit(t *testing.T) {
 			if cs == nil {
 				continue
 			}
-			b := cs.block
+			b := cs.blocks[0]
 			found = true
 			for _, s := range []struct {
 				name string

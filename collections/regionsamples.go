@@ -52,11 +52,13 @@ func (c *Collection) CollectRegionSamples(maxBytes, lookBackBytes int) [][]byte 
 	return out
 }
 
-// sampleableBlocks returns the blocks to draw from, newest first, honoring the look-back budget.
+// sampleableBlocks returns the row-group blocks to draw from, newest segment first, honoring the
+// look-back budget. A segment contributes ALL of its row groups, and is charged its segment bytes
+// once -- the budget bounds how far back in history the draw reaches, not how many blocks it sees.
 func (c *Collection) sampleableBlocks(lookBackBytes int) []*columnarBlock {
 	type seg struct {
-		b    *columnarBlock
-		used int
+		blocks []*columnarBlock
+		used   int
 	}
 	var segs []seg
 	for _, sh := range c.shards {
@@ -68,16 +70,16 @@ func (c *Collection) sampleableBlocks(lookBackBytes int) []*columnarBlock {
 			if s == nil || s == act || s.used == 0 {
 				continue
 			}
-			if cs := s.colblk.Load(); cs != nil {
-				segs = append(segs, seg{cs.block, s.used})
+			if cs := s.colblk.Load(); cs != nil && len(cs.blocks) > 0 {
+				segs = append(segs, seg{cs.blocks, s.used})
 			}
 		}
 		sh.mu.RUnlock()
 	}
-	out := make([]*columnarBlock, 0, len(segs))
+	var out []*columnarBlock
 	bytes := 0
 	for _, s := range segs {
-		out = append(out, s.b)
+		out = append(out, s.blocks...)
 		bytes += s.used
 		if lookBackBytes > 0 && bytes >= lookBackBytes {
 			break // far enough back: older segments predate what future writes will look like

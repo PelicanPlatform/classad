@@ -14,11 +14,32 @@ import (
 // Open -- proving the accelerator came off disk rather than being re-transcoded.
 var colSegmentBuilds atomic.Int64
 
-// colSegment is a sealed segment's columnar accelerator: the PAX block plus offs, mapping each
-// block record k to its arena offset so a scan can read the record's live MVCC seq/sup.
+// colSegment is a sealed segment's columnar accelerator: the segment's PAX row-group blocks (see
+// colGroupRows) in record order, plus offs, mapping each record to its arena offset so a scan can
+// read the record's live MVCC seq/sup.
+//
+// offs is FLAT across the blocks: block j's local record k is offs[base_j+k], where base_j is the
+// sum of the preceding blocks' record counts. Every block in a segment is built under the same
+// schema and hot set, so those are read from the first block.
 type colSegment struct {
-	block *columnarBlock
-	offs  []uint32
+	blocks []*columnarBlock
+	offs   []uint32
+}
+
+// schema returns the schema all of cs's blocks were built under, or nil if it carries none.
+func (cs *colSegment) schema() *adSchema {
+	if cs == nil || len(cs.blocks) == 0 {
+		return nil
+	}
+	return cs.blocks[0].schema
+}
+
+// hotNum returns the hot numeric field set all of cs's blocks were built under.
+func (cs *colSegment) hotNum() []int {
+	if cs == nil || len(cs.blocks) == 0 {
+		return nil
+	}
+	return cs.blocks[0].hotNum
 }
 
 // schemaScanState is a collection's resolved adschema columnar scan configuration.
@@ -212,12 +233,12 @@ func (c *Collection) persistColSeg(sh *shard, seg *segment) {
 func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colSegment {
 	colSegmentBuilds.Add(1)
 	d := seg.dict.Load() // interned segment -> resolve its local ids during transcode
-	blk, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, hot,
+	blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, s, hot, defaultColGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
-	if blk == nil {
+	if len(blocks) == 0 {
 		return nil
 	}
-	return &colSegment{block: blk, offs: offs}
+	return &colSegment{blocks: blocks, offs: offs}
 }
 
 // colBlobForSeg builds and marshals seg's columnar block under the collection's CURRENT schema-scan
@@ -234,7 +255,11 @@ func (c *Collection) colBlobForSeg(seg *segment) []byte {
 	if cs == nil {
 		return nil
 	}
-	return wrapColSection(marshalColSegment(cs, c.intern.Name), seg.used)
+	body := marshalColSegment(cs, c.intern.Name)
+	if body == nil {
+		return nil
+	}
+	return wrapColSection(body, seg.used)
 }
 
 // colBlobPreserve returns the sidecar columnar section for seg on a REINDEX (sidecar rewrite),
@@ -247,7 +272,11 @@ func (c *Collection) colBlobPreserve(seg *segment) []byte {
 	if cs == nil {
 		return c.colBlobForSeg(seg)
 	}
-	return wrapColSection(marshalColSegment(cs, c.intern.Name), seg.used)
+	body := marshalColSegment(cs, c.intern.Name)
+	if body == nil {
+		return nil
+	}
+	return wrapColSection(body, seg.used)
 }
 
 // adoptPersistedSchemaScan enables schema-scan on reopen from persisted columnar blocks: if any
@@ -266,8 +295,8 @@ func (c *Collection) adoptPersistedSchemaScan() {
 		sh.mu.RLock()
 		for _, seg := range sh.segs {
 			if seg != nil {
-				if cs := seg.colblk.Load(); cs != nil {
-					adopt = cs // last recovered block wins; any block's schema is a valid seed
+				if cs := seg.colblk.Load(); cs != nil && cs.schema() != nil {
+					adopt = cs // last recovered segment wins; any segment's schema is a valid seed
 				}
 			}
 		}
@@ -280,7 +309,7 @@ func (c *Collection) adoptPersistedSchemaScan() {
 	if err != nil {
 		return
 	}
-	c.schemaScan.Store(&schemaScanState{schema: adopt.block.schema, hot: adopt.block.hotNum, cache: bc})
+	c.schemaScan.Store(&schemaScanState{schema: adopt.schema(), hot: adopt.hotNum(), cache: bc})
 }
 
 // BuildAndEnableSchemaScan samples the collection, builds an adschema, chooses the hot numeric

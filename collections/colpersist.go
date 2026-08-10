@@ -17,8 +17,12 @@ import (
 // built from a different segment byte length) and rebuilds instead of trusting corrupt bytes --
 // the same "derived state, any doubt rebuilds" contract the attribute-index sidecar follows.
 const (
-	colSectionMagic   = 0x434f4c58 // "COLX"
-	colSectionVersion = 1
+	colSectionMagic = 0x434f4c58 // "COLX"
+	// colSectionVersion 2 stores a LIST of row-group blocks per segment (see colGroupRows); v1
+	// stored exactly one block covering the whole segment. A v1 section is rejected by
+	// readColSection like any other section that cannot be trusted, so the segment simply rebuilds
+	// its accelerator under the current layout -- derived state, so no migration is needed.
+	colSectionVersion = 2
 	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
 )
 
@@ -101,27 +105,36 @@ func readAdSchema(c *cursor, internName func(string) uint32) *adSchema {
 	return layoutSchema(fields)
 }
 
-// marshalColSegment serializes cs (its block's schema, hot set, record count, byte streams, and
-// per-record offsets, plus offs -- the block->arena map for MVCC visibility).
+// marshalColSegment serializes cs: the schema and hot set ONCE (every row group in a segment shares
+// them, so storing them per group would multiply a ~kB blob by the group count), then each block's
+// record count, byte streams and per-record offsets, then offs -- the segment-wide record->arena map
+// for MVCC visibility. Returns nil for a colSegment carrying no schema, which cannot be reloaded.
 func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byte {
-	b := cs.block
-	dst := marshalAdSchema(nil, b.schema, nameOf)
-	dst = appendU32(dst, uint32(len(b.hotNum)))
-	for _, i := range b.hotNum {
+	sch := cs.schema()
+	if sch == nil {
+		return nil
+	}
+	hotNum := cs.hotNum()
+	dst := marshalAdSchema(nil, sch, nameOf)
+	dst = appendU32(dst, uint32(len(hotNum)))
+	for _, i := range hotNum {
 		dst = appendU32(dst, uint32(i))
 	}
-	dst = appendU32(dst, uint32(b.n))
-	dst = appendBytes(dst, b.hot)
-	dst = appendBytes(dst, b.coldNumComp)
-	dst = appendBytes(dst, b.strComp)
-	dst = appendBytes(dst, b.coldComp)
-	dst = appendU32(dst, uint32(len(b.strOff)))
-	for _, v := range b.strOff {
-		dst = appendU32(dst, uint32(v))
-	}
-	dst = appendU32(dst, uint32(len(b.coldOff)))
-	for _, v := range b.coldOff {
-		dst = appendU32(dst, uint32(v))
+	dst = appendU32(dst, uint32(len(cs.blocks)))
+	for _, b := range cs.blocks {
+		dst = appendU32(dst, uint32(b.n))
+		dst = appendBytes(dst, b.hot)
+		dst = appendBytes(dst, b.coldNumComp)
+		dst = appendBytes(dst, b.strComp)
+		dst = appendBytes(dst, b.coldComp)
+		dst = appendU32(dst, uint32(len(b.strOff)))
+		for _, v := range b.strOff {
+			dst = appendU32(dst, uint32(v))
+		}
+		dst = appendU32(dst, uint32(len(b.coldOff)))
+		for _, v := range b.coldOff {
+			dst = appendU32(dst, uint32(v))
+		}
 	}
 	dst = appendU32(dst, uint32(len(cs.offs)))
 	for _, o := range cs.offs {
@@ -154,20 +167,42 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	for i := range hotNum {
 		hotNum[i] = int(c.u32())
 	}
-	n := int(c.u32())
-	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n}
-	b.hot = c.bytes() // aliases data (the mmap); read-only, scanned in place
-	b.coldNumComp = c.bytes()
-	b.strComp = c.bytes()
-	b.coldComp = c.bytes()
-	b.strOff = readInts(c)
-	b.coldOff = readInts(c)
-	offs := readU32s(c)
-	if c.err != nil || n < 0 {
+	nb := int(c.u32())
+	if nb < 0 || !c.need(0) {
 		return nil
 	}
-	layoutColumnar(b, s, hotNum, n)
-	return &colSegment{block: b, offs: offs}
+	blocks := make([]*columnarBlock, 0, nb)
+	total := 0
+	for i := 0; i < nb; i++ {
+		n := int(c.u32())
+		if n < 0 || c.err != nil {
+			return nil
+		}
+		b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n}
+		b.hot = c.bytes() // aliases data (the mmap); read-only, scanned in place
+		b.coldNumComp = c.bytes()
+		b.strComp = c.bytes()
+		b.coldComp = c.bytes()
+		b.strOff = readInts(c)
+		b.coldOff = readInts(c)
+		if c.err != nil {
+			return nil
+		}
+		layoutColumnar(b, s, hotNum, n)
+		blocks = append(blocks, b)
+		total += n
+	}
+	offs := readU32s(c)
+	if c.err != nil {
+		return nil
+	}
+	// The blocks' record counts must sum to the offs length, or a scan would map a record to the
+	// wrong arena offset and read another record's MVCC seq -- a wrong answer rather than a slow
+	// one. Reject instead, and let the segment rebuild.
+	if total != len(offs) {
+		return nil
+	}
+	return &colSegment{blocks: blocks, offs: offs}
 }
 
 func readInts(c *cursor) []int {

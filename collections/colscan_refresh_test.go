@@ -107,7 +107,7 @@ func TestBuildAndEnableSchemaScanRefreshSafe(t *testing.T) {
 			}
 			sealed++
 			cs := seg.colblk.Load()
-			if cs == nil || cs.block.schema != second.schema {
+			if cs == nil || cs.schema() != second.schema {
 				orphaned++
 			}
 		}
