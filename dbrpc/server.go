@@ -1289,7 +1289,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 				if !privileged {
 					return respErr(reqID, fmt.Sprintf("admin action %q requires DAEMON authorization", action))
 				}
-				msg, err := archiveAdmin(a, action, args)
+				msg, err := archiveAdmin(a, action, args, s.maintainOpts.HotTopN)
 				if err != nil {
 					return respErr(reqID, err.Error())
 				}

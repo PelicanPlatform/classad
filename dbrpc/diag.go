@@ -123,6 +123,7 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 //	hot.refresh <sampleMax> <topN>    recompute the hot set from sampled frequency
 //	schema.fit [sampleMax]            report how well the derived schema still fits the data
 //	schema.rebuild [sampleMax topN]   re-derive the schema and rebuild every columnar block
+//	                                  (both also available on an archive table)
 //	compact                           reclaim dead space in warranted shards
 //	rewrite                           re-encode all ads with the current hot set
 //	codec.retrain [sampleMax]         train/refresh the ZSTD dictionary + recompress
@@ -243,57 +244,9 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 		n := t.RefreshHotSet(sampleMax, topN)
 		return fmt.Sprintf("refreshed hot set: %d attribute(s)", n), nil
 	case "schema.fit":
-		// Report, do not change: how well the derived schema still matches the data. The
-		// operator's input to deciding whether schema.rebuild is worth its cost.
-		sampleMax := diagSampleMax
-		if len(args) == 1 {
-			n, err := strconv.Atoi(args[0])
-			if err != nil {
-				return "", fmt.Errorf("schema.fit <sampleMax> must be an integer")
-			}
-			sampleMax = n
-		} else if len(args) > 1 {
-			return "", fmt.Errorf("schema.fit takes at most <sampleMax>")
-		}
-		fit, sampled := t.SchemaFit(sampleMax)
-		if len(fit) == 0 {
-			return "columnar accelerator not enabled: no schema to measure", nil
-		}
-		b, err := json.Marshal(struct {
-			Sampled int                 `json:"sampled"`
-			Fields  []db.SchemaFieldFit `json:"fields"`
-		}{sampled, fit})
-		if err != nil {
-			return "", err
-		}
-		return string(b), nil
+		return schemaFitAction(t, args)
 	case "schema.rebuild":
-		// The deliberate re-schema: routine maintenance keeps the schema pinned forever, so
-		// this is the only way to re-derive it as the workload drifts. Rebuilds a columnar
-		// block per sealed segment.
-		sampleMax, topN := diagSampleMax, s.maintainOpts.HotTopN
-		if topN <= 0 {
-			topN = defaultSchemaHotTopN
-		}
-		switch len(args) {
-		case 0:
-		case 2:
-			n, e1 := strconv.Atoi(args[0])
-			k, e2 := strconv.Atoi(args[1])
-			if e1 != nil || e2 != nil {
-				return "", fmt.Errorf("schema.rebuild arguments must be integers")
-			}
-			sampleMax, topN = n, k
-		default:
-			return "", fmt.Errorf("schema.rebuild takes no arguments or <sampleMax> <topN>")
-		}
-		if !t.ReschemaScan(sampleMax, topN) {
-			return "", fmt.Errorf("schema rebuild did not run: nothing to sample, or the " +
-				"accelerator is unavailable here (encryption at rest)")
-		}
-		info := t.SchemaScanInfo()
-		return fmt.Sprintf("schema rebuilt: %d field(s), %d hot, %d/%d sealed segments covered",
-			info.SchemaFields, len(info.HotFields), info.CoveredSegments, info.SealedSegments), nil
+		return schemaRebuildAction(t, args, s.maintainOpts.HotTopN)
 	case "analyze":
 		// On-demand self-tuning pass ("optimize now"), the manual counterpart to the scheduled
 		// StartMaintenance. Reuses the server's configured maintenance options so it matches the
@@ -333,7 +286,10 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 // per-segment indexes, rewrite, set retention, rotate -- plus truncate (empty the archive).
 // Encryption/time-travel/hot-set actions do not apply to an archive. DAEMON-gated by the
 // caller, like the mutable-table admin.
-func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, error) {
+//
+// schema.fit / schema.rebuild run the same shared implementations the mutable path uses, so the
+// two table types cannot drift apart in behaviour or output.
+func archiveAdmin(a *db.ArchiveTable, action string, args []string, hotTopN int) (string, error) {
 	switch action {
 	case "truncate":
 		// Destructive reset: drop every record (a from-scratch re-sync empties the archive,
@@ -391,6 +347,10 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string) (string, err
 			return "", fmt.Errorf("retention.set: %w", err)
 		}
 		return "retention: " + retentionSummary(r), nil
+	case "schema.fit":
+		return schemaFitAction(a, args)
+	case "schema.rebuild":
+		return schemaRebuildAction(a, args, hotTopN)
 	case "rotate":
 		n, err := a.Rotate(float64(time.Now().Unix()))
 		if err != nil {
@@ -712,4 +672,70 @@ func (c *Client) Tables(ctx context.Context) ([]string, error) {
 		names = append(names, body.str())
 	}
 	return names, nil
+}
+
+// schemaScanTable is the schema-accelerator surface shared by a mutable table and an archive, so
+// schema.fit / schema.rebuild are ONE implementation for both. They were a mutable-table-only
+// action first, which meant `.schema rebuild` on a history table failed as an unknown action --
+// the tables that most want a rebuild being exactly the ones that could not have one.
+type schemaScanTable interface {
+	SchemaFit(sampleMax int) ([]db.SchemaFieldFit, int)
+	ReschemaScan(sampleMax, hotTopN int) bool
+	SchemaScanInfo() db.SchemaScanInfo
+}
+
+// schemaFitAction reports how well the derived schema still matches the data. Report only: the
+// operator's input to deciding whether schema.rebuild is worth its cost.
+func schemaFitAction(t schemaScanTable, args []string) (string, error) {
+	sampleMax := diagSampleMax
+	if len(args) == 1 {
+		n, err := strconv.Atoi(args[0])
+		if err != nil {
+			return "", fmt.Errorf("schema.fit <sampleMax> must be an integer")
+		}
+		sampleMax = n
+	} else if len(args) > 1 {
+		return "", fmt.Errorf("schema.fit takes at most <sampleMax>")
+	}
+	fit, sampled := t.SchemaFit(sampleMax)
+	if len(fit) == 0 {
+		return "columnar accelerator not enabled: no schema to measure", nil
+	}
+	b, err := json.Marshal(struct {
+		Sampled int                 `json:"sampled"`
+		Fields  []db.SchemaFieldFit `json:"fields"`
+	}{sampled, fit})
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// schemaRebuildAction re-derives the schema and rebuilds every sealed segment's columnar block.
+// Routine maintenance keeps the schema pinned forever, so this is the only way to re-derive it as
+// the workload drifts. hotTopN is the server's configured hot-column count, or 0 for the default.
+func schemaRebuildAction(t schemaScanTable, args []string, hotTopN int) (string, error) {
+	sampleMax, topN := diagSampleMax, hotTopN
+	if topN <= 0 {
+		topN = defaultSchemaHotTopN
+	}
+	switch len(args) {
+	case 0:
+	case 2:
+		n, e1 := strconv.Atoi(args[0])
+		k, e2 := strconv.Atoi(args[1])
+		if e1 != nil || e2 != nil {
+			return "", fmt.Errorf("schema.rebuild arguments must be integers")
+		}
+		sampleMax, topN = n, k
+	default:
+		return "", fmt.Errorf("schema.rebuild takes no arguments or <sampleMax> <topN>")
+	}
+	if !t.ReschemaScan(sampleMax, topN) {
+		return "", fmt.Errorf("schema rebuild did not run: nothing to sample, or the " +
+			"accelerator is unavailable here (encryption at rest)")
+	}
+	info := t.SchemaScanInfo()
+	return fmt.Sprintf("schema rebuilt: %d field(s), %d hot, %d/%d sealed segments covered",
+		info.SchemaFields, len(info.HotFields), info.CoveredSegments, info.SealedSegments), nil
 }

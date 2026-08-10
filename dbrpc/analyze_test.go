@@ -95,7 +95,7 @@ func TestArchiveAdminAnalyze(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	msg, err := archiveAdmin(a, "analyze", nil)
+	msg, err := archiveAdmin(a, "analyze", nil, 0)
 	if err != nil {
 		t.Fatalf("archive analyze: %v", err)
 	}

@@ -133,3 +133,47 @@ func TestArchiveSchemaScanCountsAgree(t *testing.T) {
 		}
 	}
 }
+
+// TestArchiveSchemaScanOnWhenConfigured is the other half of TestArchiveSchemaScanOffByDefault:
+// with ArchiveSchemaScanHotTopN set, a maintenance pass must actually BUILD the accelerator on an
+// archive. Without this, the option could be plumbed as far as the struct and silently do nothing
+// -- which is how the mutable side's SchemaScanHotTopN sat at 0 and left the accelerator dark.
+func TestArchiveSchemaScanOnWhenConfigured(t *testing.T) {
+	cat, err := db.OpenCatalog(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServerCatalog(cat)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConnOpts(sconn, ServeOptions{Privileged: true}) }()
+	c := NewClient(cconn)
+	defer func() { c.Close(); s.Close(); cat.Close() }()
+
+	ctx := context.Background()
+	if err := c.CreateArchiveTable(ctx, "history", db.ArchiveConfig{SegmentSize: 1 << 16}); err != nil {
+		t.Fatal(err)
+	}
+	seedHistory(t, c, "history", 3000)
+
+	a, ok := cat.ArchiveTable("history")
+	if !ok {
+		t.Fatal("archive table missing")
+	}
+	if a.SchemaScanInfo().Enabled {
+		t.Fatal("accelerator already enabled before any maintenance pass")
+	}
+
+	// The same call the scheduled pass makes, with the option set.
+	s.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8, SampleMax: 2000})
+
+	info := a.SchemaScanInfo()
+	if !info.Enabled {
+		t.Fatal("a maintenance pass with ArchiveSchemaScanHotTopN set did NOT enable the accelerator")
+	}
+	if info.SchemaFields == 0 {
+		t.Error("no schema fields after the maintenance build")
+	}
+	if info.SealedSegments == 0 || info.CoveredSegments != info.SealedSegments {
+		t.Errorf("coverage %d/%d after the maintenance build", info.CoveredSegments, info.SealedSegments)
+	}
+}
