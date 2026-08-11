@@ -40,10 +40,12 @@ import (
 // exactly like a correct vectorized scan that is mysteriously no faster -- which is how three earlier
 // measurements in this package produced plausible and wrong conclusions.
 type vecSplit struct {
-	vecBlocks   int
-	scopeBlocks int // the executor declined: a string column, an expression in the cold tail, Elvis
-	churnBlocks int // mostly-superseded: colScope is cheaper than evaluating records nobody can see
-	rowWindows  int
+	vecBlocks    int
+	scopeBlocks  int // the executor declined: a string column, an expression in the cold tail, Elvis
+	churnBlocks  int // mostly-superseded: colScope is cheaper than evaluating records nobody can see
+	prunedBlocks int // a zone ruled the block out; no records were examined at all
+	emptyBlocks  int // nothing in the block was visible to this snapshot
+	rowWindows   int
 }
 
 // vecScratchPool reuses the vector stack across queries. Without it each call allocated its own stack
@@ -75,7 +77,7 @@ type blockVecSource struct {
 // ok=false declines the block. An attribute the schema does not carry lives in the cold tail, which is
 // a per-record read with a decompression behind it -- exactly what a vector load is meant to avoid --
 // so it declines rather than pretending to be fast.
-func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst vm.Vec) bool {
+func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst *vm.Vec) bool {
 	if scope != ast.NoScope && scope != ast.MyScope {
 		return false
 	}
@@ -109,8 +111,9 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst v
 // Copying is what a string predicate cannot afford: one allocation per record made a string comparison
 // slower in the columnar path than in the row path, which is why this aliases and why Vec's elements are
 // released back to the pool (see VecScratch.Release).
-func (s *blockVecSource) loadStr(idx int, id uint32, dst vm.Vec) bool {
+func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 	b := s.blk
+	dst.Mask = false
 	region, err := s.bc.stream(b, kindStr)
 	if err != nil {
 		return false
@@ -154,7 +157,8 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst vm.Vec) bool {
 }
 
 // loadNum loads a numeric column, then repairs the escaped elements from the cold tail.
-func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst vm.Vec) bool {
+func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst *vm.Vec) bool {
+	dst.Mask = false
 	if !s.blk.loadIntBatch(idx, s.bc, dst.I) {
 		return false
 	}
@@ -171,16 +175,40 @@ func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst vm.Vec) bool
 	return s.fixEscapes(idx, id, dst)
 }
 
-// loadBool loads a bit-packed boolean column. The bool bitset sits immediately after the escape bitmap
-// in each record's hot region, so this is a strided read of uncompressed memory.
-func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst vm.Vec) bool {
+// loadBool loads a bit-packed boolean column. The bool bitset sits immediately after the escape bitmap in
+// each record's hot region, so this is a strided read of uncompressed memory.
+//
+// Where the column has no escape it is delivered as a MASK, built a word at a time: a stored bit becomes a
+// result bit with no per-element state byte in between, which is the shortest path storage-to-kernel in the
+// whole executor. A column WITH escapes goes to the data form instead, because an escaped value need not be
+// a boolean at all -- the attribute may hold a number or a string on some records -- and a mask cannot
+// represent that. Converting later, if a logical operator wants one, then applies the operand truthiness
+// the reference applies.
+func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst *vm.Vec) bool {
 	b := s.blk
+	if b.escapeFree(idx) {
+		for w := range dst.Hi {
+			start := w * 64
+			end := start + 64
+			if end > b.n {
+				end = b.n
+			}
+			var lo uint64
+			for k := start; k < end; k++ {
+				base := k*b.hotStride + b.schema.escBytes
+				if testBit(b.hot[base:base+b.schema.boolBytes], f.boolBit) {
+					lo |= 1 << uint(k-start)
+				}
+			}
+			dst.Hi[w], dst.Lo[w] = 0, lo
+		}
+		dst.Mask = true
+		return true
+	}
+	dst.Mask = false
 	for k := 0; k < b.n; k++ {
 		base := k*b.hotStride + b.schema.escBytes
 		dst.SetBool(k, testBit(b.hot[base:base+b.schema.boolBytes], f.boolBit))
-	}
-	if b.escapeFree(idx) {
-		return true
 	}
 	return s.fixEscapes(idx, id, dst)
 }
@@ -194,7 +222,7 @@ func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst vm.Vec) boo
 // Reading the value as whatever type it actually is, rather than insisting it match the column, is what
 // keeps a handful of odd records from declining a whole block: the kernels route a mismatched type
 // through the parity hook and get the reference's answer for it.
-func (s *blockVecSource) fixEscapes(idx int, id uint32, dst vm.Vec) bool {
+func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 	for k := 0; k < s.blk.n; k++ {
 		if !testBit(s.blk.escapeAt(k), idx) {
 			continue
@@ -248,7 +276,7 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 		scratch.Release()
 		vecScratchPool.Put(scratch)
 	}()
-	var live []bool
+	var live []uint64
 	var split vecSplit
 	defer func() { lastVecSplit.Store(&split) }()
 	count := 0
@@ -265,30 +293,38 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 			base := 0
 			for _, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {
+					split.prunedBlocks++
 					base += blk.n
 					continue
 				}
 				// Visibility first, once. The vectorized path needs the mask anyway to count, and
 				// knowing how much of the block is live is what decides whether vectorizing it is
 				// worth doing at all.
-				if cap(live) < blk.n {
-					live = make([]bool, blk.n)
+				// Visibility as a BITMAP, so counting the survivors is a popcount per 64 records
+				// rather than a branch per record, and so the result mask can be ANDed with it
+				// directly instead of consulted element by element.
+				words := vm.MaskWords(blk.n)
+				if cap(live) < words {
+					live = make([]uint64, words)
 				}
-				live = live[:blk.n]
+				live = live[:words]
+				for i := range live {
+					live[i] = 0
+				}
 				nLive := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					vis := gk < len(seg.offs)
-					if vis {
-						o := seg.offs[gk]
-						vis = recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
+					if gk >= len(seg.offs) {
+						break
 					}
-					live[k] = vis
-					if vis {
+					o := seg.offs[gk]
+					if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+						live[k/64] |= 1 << uint(k%64)
 						nLive++
 					}
 				}
 				if nLive == 0 {
+					split.emptyBlocks++
 					base += blk.n
 					continue
 				}
@@ -310,11 +346,7 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 					continue
 				}
 				split.vecBlocks++
-				for k := 0; k < blk.n; k++ {
-					if live[k] && vec.IsTrue(k) {
-						count++
-					}
-				}
+				count += vec.CountTrue(live)
 				base += blk.n
 			}
 		}

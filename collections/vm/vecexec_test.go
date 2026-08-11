@@ -46,7 +46,7 @@ func newTestSource(recs []map[string]string) *testSource {
 	return s
 }
 
-func (s *testSource) LoadColumn(name string, scope ast.AttributeScope, dst Vec) bool {
+func (s *testSource) LoadColumn(name string, scope ast.AttributeScope, dst *Vec) bool {
 	if scope != ast.NoScope && scope != ast.MyScope {
 		return false
 	}
@@ -56,7 +56,7 @@ func (s *testSource) LoadColumn(name string, scope ast.AttributeScope, dst Vec) 
 			dst.St[i] = VsUndef
 			continue
 		}
-		if !dst.setValue(i, v) {
+		if !dst.setValueData(i, v) {
 			return false // a string column: decline, exactly as a real source would
 		}
 	}

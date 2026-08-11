@@ -40,9 +40,8 @@ func (c *Collection) vecScanPhase(q *vm.Query, phase int) int {
 	src := &blockVecSource{c: c, bc: st.cache}
 	scratch := &vm.VecScratch{}
 	attrs := q.ReadAttrs()
-	var probe vm.Vec
+	var probe *vm.Vec
 	touched := 0
-	var live []bool
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
@@ -52,20 +51,14 @@ func (c *Collection) vecScanPhase(q *vm.Query, phase int) int {
 			}
 			base := 0
 			for _, blk := range seg.blocks {
-				if cap(live) < blk.n {
-					live = make([]bool, blk.n)
-				}
-				live = live[:blk.n]
 				nLive := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					vis := gk < len(seg.offs)
-					if vis {
-						o := seg.offs[gk]
-						vis = recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
+					if gk >= len(seg.offs) {
+						break
 					}
-					live[k] = vis
-					if vis {
+					o := seg.offs[gk]
+					if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 						nLive++
 					}
 				}
@@ -75,10 +68,12 @@ func (c *Collection) vecScanPhase(q *vm.Query, phase int) int {
 					continue
 				}
 				src.blk = blk
-				if cap(probe.I) < blk.n {
-					probe = vm.Vec{I: make([]int64, blk.n), S: make([]string, blk.n), St: make([]uint8, blk.n)}
+				if probe == nil || cap(probe.I) < blk.n {
+					probe = &vm.Vec{
+						I: make([]int64, blk.n), S: make([]string, blk.n), St: make([]uint8, blk.n),
+						Hi: make([]uint64, vm.MaskWords(blk.n)), Lo: make([]uint64, vm.MaskWords(blk.n)),
+					}
 				}
-				probe.I, probe.S, probe.St = probe.I[:blk.n], probe.S[:blk.n], probe.St[:blk.n]
 				if phase == phaseLoads {
 					for _, a := range attrs {
 						src.LoadColumn(a, ast.NoScope, probe)
