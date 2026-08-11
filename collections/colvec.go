@@ -71,9 +71,16 @@ type blockVecSource struct {
 	blk *columnarBlock
 	bc  *blockCache
 
-	// dictBuf is the parsed dictionary-entry list, reused across blocks. Allocating it per block turned a
-	// 512-entry dictionary into ~12 KB of garbage per block, which across a segment's blocks is more
-	// garbage than the walk it replaces ever cost.
+	// dicts holds one resolver PER FIELD, reused across blocks, each owning its own parsed entry list.
+	//
+	// One shared resolver is wrong and was: two dictionary-encoded columns in the same expression both
+	// pointed at it, so loading the second overwrote the first's entries while the first's vector still
+	// referenced them, and `Owner =?= Iwd` resolved both sides through Iwd's dictionary -- 19842 matches
+	// instead of 0. Per-field is also what keeps the parse amortized: allocating an entry list per block
+	// turned a 512-entry dictionary into ~12 KB of garbage per block.
+	dicts map[int]*blockDict
+
+	// dictBuf is the parse buffer for PRUNING, which reads a dictionary and does not retain it.
 	dictBuf [][]byte
 }
 
@@ -86,6 +93,7 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst *
 	if scope != ast.NoScope && scope != ast.MyScope {
 		return false
 	}
+	dst.Dict = nil // a slot reused from the stack must not carry a previous block's dictionary
 	id, ok := s.c.intern.LookupID(name)
 	if !ok {
 		return false
@@ -118,12 +126,30 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 	b := s.blk
 	dst.Mask = false
 	// The dictionary path, when this field has one: the parse and the code column are read ONCE for the
-	// block, then each record is a fixed-width code and an index -- no walk at all.
-	if entries, ok := b.dictEntries(idx, s.bc, &s.dictBuf); ok {
+	// block, then each record is a fixed-width code.
+	if entries, ok := b.dictEntries(idx, s.bc, s.dictBufFor(idx)); ok {
 		if codes, w, ok := b.dictCodes(idx, s.bc); ok {
-			escFree := b.escapeFree(idx)
+			info := b.strDict[idx]
+			// CODES, not strings, when every record has one. Then a comparison against a literal is an
+			// integer range test in the executor and no string is materialized at all. With escapes present
+			// the column is mixed -- an escaped value comes from the cold tail as a real string, and a code
+			// cannot represent it -- so those blocks deliver strings, which is also exactly the condition
+			// noEscape already records for pruning.
+			if info.noEscape {
+				d := s.dictFor(idx)
+				d.entries = entries
+				dst.Dict = d
+				for k := 0; k < b.n; k++ {
+					c := dictCodeAt(codes, w, k)
+					if c >= len(entries) {
+						return false
+					}
+					dst.St[k], dst.I[k] = vm.VsDictCode, int64(c)
+				}
+				return true
+			}
 			for k := 0; k < b.n; k++ {
-				if !escFree && testBit(b.escapeAt(k), idx) {
+				if testBit(b.escapeAt(k), idx) {
 					dst.St[k] = vm.VsUndef // repaired from the cold tail below
 					continue
 				}
@@ -132,9 +158,6 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 					return false
 				}
 				dst.SetString(k, bytesToStr(entries[c]))
-			}
-			if escFree {
-				return true
 			}
 			return s.fixEscapes(idx, id, dst)
 		}
@@ -180,6 +203,24 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 	}
 	return s.fixEscapes(idx, id, dst)
 }
+
+// dictFor returns the reusable resolver for one field, so two dictionary-encoded columns in the same
+// expression never share one.
+func (s *blockVecSource) dictFor(idx int) *blockDict {
+	if s.dicts == nil {
+		s.dicts = map[int]*blockDict{}
+	}
+	d := s.dicts[idx]
+	if d == nil {
+		d = &blockDict{}
+		s.dicts[idx] = d
+	}
+	return d
+}
+
+// dictBufFor returns the per-field parse buffer, which is the resolver's own entry list: parsing into it
+// refreshes exactly the resolver that will be asked about this field.
+func (s *blockVecSource) dictBufFor(idx int) *[][]byte { return &s.dictFor(idx).entries }
 
 // loadNum loads a numeric column, then repairs the escaped elements from the cold tail.
 func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst *vm.Vec) bool {

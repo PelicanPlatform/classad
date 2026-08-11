@@ -375,3 +375,33 @@ func (b *columnarBlock) probePrunes(p strProbe, info strDictField, bc *blockCach
 	}
 	return true
 }
+
+// blockDict resolves one block's dictionary for the vector executor, so a comparison against a literal
+// becomes an integer range test rather than a per-record string comparison.
+//
+// It holds the parsed entries for exactly one (block, field) and is reused across blocks by the scan, so the
+// per-block parse is paid once whether the executor asks for a range, a string, or both.
+type blockDict struct {
+	entries [][]byte
+}
+
+func (d *blockDict) Len() int { return len(d.entries) }
+
+// Range returns the codes whose entries compare fold-EQUAL to lit, as [lo, hi). Contiguous because the
+// dictionary is sorted fold-first; see dictLess.
+func (d *blockDict) Range(lit string) (int, int, bool) {
+	lo := sort.Search(len(d.entries), func(j int) bool {
+		return classad.CompareStringsFold(bytesToStr(d.entries[j]), lit) >= 0
+	})
+	hi := lo + sort.Search(len(d.entries)-lo, func(j int) bool {
+		return classad.CompareStringsFold(bytesToStr(d.entries[lo+j]), lit) > 0
+	})
+	return lo, hi, true
+}
+
+func (d *blockDict) At(code int) (string, bool) {
+	if code < 0 || code >= len(d.entries) {
+		return "", false
+	}
+	return bytesToStr(d.entries[code]), true
+}

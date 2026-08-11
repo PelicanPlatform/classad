@@ -44,12 +44,13 @@ import (
 // Element states. A vector carries one per element, which is how three-valued logic and ERROR survive
 // vectorization, and how int and real stay distinguishable -- 7/2 is not 7.0/2.0.
 const (
-	VsInt    uint8 = iota // I[i] is the integer
-	VsReal                // I[i] is math.Float64bits of the real
-	VsBool                // I[i] is 0 or 1
-	VsUndef               // UNDEFINED
-	VsError               // ERROR
-	VsString              // S[i] is the string
+	VsInt      uint8 = iota // I[i] is the integer
+	VsReal                  // I[i] is math.Float64bits of the real
+	VsBool                  // I[i] is 0 or 1
+	VsUndef                 // UNDEFINED
+	VsError                 // ERROR
+	VsString                // S[i] is the string
+	VsDictCode              // I[i] is a code into Vec.Dict: a dictionary-encoded STRING
 )
 
 // Vec is one batch of values. The payload is a single int64 slice because that is how both
@@ -65,6 +66,15 @@ type Vec struct {
 
 	// MASK form: three-valued logic as two bitplanes, two bits per record. See vecmask.go.
 	Hi, Lo []uint64
+
+	// Dict, when non-nil, resolves VsDictCode elements: the column is a dictionary-encoded string, so I[i]
+	// holds a code rather than a value and S[i] is not populated.
+	//
+	// A comparison against a string LITERAL specializes on this and becomes an integer range test, which is
+	// the whole point -- the dictionary is fold-ordered, so the entries matching a literal are contiguous.
+	// Everything else stays correct without knowing about it, because valueData resolves a code to its
+	// string and the parity hook takes it from there.
+	Dict DictResolver
 
 	// Const marks a vector every record of which holds the SAME value, kept once in element 0 with the
 	// rest left as garbage. A literal in an expression is the dominant case, and materializing one across
@@ -150,6 +160,13 @@ func (v *Vec) valueData(i int) classad.Value {
 		return classad.NewBoolValue(v.I[i] != 0)
 	case VsString:
 		return classad.NewStringValue(v.S[i])
+	case VsDictCode:
+		if v.Dict != nil {
+			if str, ok := v.Dict.At(int(v.I[i])); ok {
+				return classad.NewStringValue(str)
+			}
+		}
+		return classad.NewErrorValue()
 	case VsUndef:
 		return classad.NewUndefinedValue()
 	default:
@@ -193,6 +210,18 @@ func (v *Vec) setValueData(i int, val classad.Value) bool {
 		return false
 	}
 	return true
+}
+
+// DictResolver resolves a dictionary-encoded string column for one block.
+//
+// Range is what makes a comparison an integer test: because the dictionary is sorted by the evaluator's fold
+// comparison, the entries that compare EQUAL to a literal are contiguous, so a match is `lo <= code < hi`
+// and an ordering comparison is a test against one boundary. lo == hi means the literal is absent, and the
+// caller can conclude that no record matches without reading a code.
+type DictResolver interface {
+	Range(lit string) (lo, hi int, ok bool)
+	At(code int) (string, bool)
+	Len() int
 }
 
 // ColumnSource supplies a batch of values for an attribute reference. The collections package
@@ -737,6 +766,12 @@ func compareVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	r.toData()
 	l.materialize()
 	if r.Const {
+		// A dictionary-encoded column against a literal: an integer range test, no string comparison at all.
+		if l.Dict != nil && r.St[0] == VsString {
+			if ok := compareVecDict(c, l, r.S[0]); ok {
+				return true
+			}
+		}
 		return compareVecConst(ev, op, c, l, r)
 	}
 	for w := range l.Hi {
@@ -823,6 +858,85 @@ func compareVecConst(ev *classad.Evaluator, op string, c cmpOp, l, r *Vec) bool 
 	return true
 }
 
+// compareVecDict compares a dictionary-encoded string column against a literal as an integer test.
+//
+// The dictionary is sorted by the evaluator's fold comparison, so the entries equal to lit are the contiguous
+// range [lo, hi) and every operator falls out of where a code sits relative to it:
+//
+//	== lo <= c < hi     != !(lo <= c < hi)     < c < lo     <= c < hi     > c >= hi     >= c >= lo
+//
+// ok=false leaves the caller to take the ordinary path -- which happens when the resolver cannot answer, and
+// for any element that is not a code (an escaped record's value comes from the cold tail as a real string).
+func compareVecDict(c cmpOp, l *Vec, lit string) bool {
+	lo, hi, ok := l.Dict.Range(lit)
+	if !ok {
+		return false
+	}
+	for _, st := range l.St {
+		if st != VsDictCode {
+			return false // a mixed column: let the string path handle all of it rather than half of it
+		}
+	}
+	for w := range l.Hi {
+		base := w * 64
+		end := base + 64
+		if end > l.n {
+			end = l.n
+		}
+		var lob uint64
+		for i := base; i < end; i++ {
+			code := int(l.I[i])
+			var res bool
+			switch c {
+			case cmpEQ:
+				res = code >= lo && code < hi
+			case cmpNE:
+				res = code < lo || code >= hi
+			case cmpLT:
+				res = code < lo
+			case cmpLE:
+				res = code < hi
+			case cmpGT:
+				res = code >= hi
+			default: // cmpGE
+				res = code >= lo
+			}
+			if res {
+				lob |= 1 << uint(i-base)
+			}
+		}
+		l.Hi[w], l.Lo[w] = 0, lob
+	}
+	l.Mask = true
+	return true
+}
+
+// identKind maps a state to the ClassAd TYPE identity compares on, collapsing the two representations of a
+// string into one.
+//
+// VsDictCode and VsString are both strings; only the encoding differs. Comparing raw states instead treats a
+// dictionary-encoded column and a plain one as different types -- and worse, made two dictionary-encoded
+// columns compare EQUAL for every record, because the state bytes matched and neither payload case ran.
+// `Owner =?= Iwd` returned 19842 instead of 0.
+func identKind(st uint8) uint8 {
+	if st == VsDictCode {
+		return VsString
+	}
+	return st
+}
+
+// str returns element i as a string, from whichever representation holds it. Codes from two different
+// columns index two different dictionaries, so they can only be compared once resolved.
+func (v *Vec) str(i int) (string, bool) {
+	if v.St[i] == VsDictCode {
+		if v.Dict == nil {
+			return "", false
+		}
+		return v.Dict.At(int(v.I[i]))
+	}
+	return v.S[i], true
+}
+
 // identicalVec is =?= / =!=: total, never undefined, and case SENSITIVE for strings. Two elements are
 // identical when their ClassAd TYPES match and their payloads match -- so 1 =?= 1.0 is false, which is why
 // int and real are distinct states rather than one numeric state.
@@ -844,13 +958,15 @@ func identicalVec(op string, l, r *Vec) bool {
 		}
 		var lo uint64
 		for i := base; i < end; i++ {
-			same := l.St[i] == r.St[i]
+			same := identKind(l.St[i]) == identKind(r.St[i])
 			if same {
-				switch l.St[i] {
+				switch identKind(l.St[i]) {
 				case VsInt, VsReal, VsBool:
 					same = l.I[i] == r.I[i]
 				case VsString:
-					same = l.S[i] == r.S[i]
+					ls, lok := l.str(i)
+					rs, rok := r.str(i)
+					same = lok && rok && ls == rs
 				}
 			}
 			if same != negate {
