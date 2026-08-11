@@ -149,9 +149,11 @@ func simdCountPortable(src []int16, lit int16, buf []int16) int {
 
 // --- arch-specific SIMD, producing bitplanes ---------------------------------
 
-// weights16 turns a NEON mask into a byte: zero the weights where the mask is false, reduce-sum. The
+// spikeWeights16 turns a NEON mask into a byte: zero the weights where the mask is false, reduce-sum. The
 // emulation amd64 does not need.
-var weights16 = archsimd.LoadInt16x8([]int16{1, 2, 4, 8, 16, 32, 64, 128})
+// Named apart from the engine's own weight vector in simdengine_arm64.go: the spike measured whether this
+// extraction was worth building, and the engine is the answer.
+var spikeWeights16 = archsimd.LoadInt16x8([]int16{1, 2, 4, 8, 16, 32, 64, 128})
 
 func simdBitplaneInt16Arch(src []int16, lit int16, plane []uint64) {
 	v := archsimd.BroadcastInt16x8(lit)
@@ -160,7 +162,7 @@ func simdBitplaneInt16Arch(src []int16, lit int16, plane []uint64) {
 		base := w * 64
 		for g := 0; g < 8; g++ {
 			m := archsimd.LoadInt16x8(src[base+g*8:]).Greater(v)
-			word |= uint64(uint8(weights16.Masked(m).ReduceSum())) << uint(g*8)
+			word |= uint64(uint8(spikeWeights16.Masked(m).ReduceSum())) << uint(g*8)
 		}
 		plane[w] = word
 	}
@@ -342,7 +344,7 @@ func BenchmarkSIMDKernels(b *testing.B) {
 // extractWeights: zero a weight vector where the mask is false, then reduce-sum. Two ops, but ReduceSum is
 // a cross-lane reduction, which is the expensive kind on NEON.
 func extractWeights(m archsimd.Mask16x8) uint64 {
-	return uint64(uint8(weights16.Masked(m).ReduceSum()))
+	return uint64(uint8(spikeWeights16.Masked(m).ReduceSum()))
 }
 
 // extractReshapeMul avoids the cross-lane reduction. A true lane is 0xFFFF, so shifting right by 15 leaves
@@ -443,7 +445,7 @@ func inlWeights(src []int16, lit int16, plane []uint64) {
 		base := w * 64
 		for g := 0; g < 8; g++ {
 			m := archsimd.LoadInt16x8(src[base+g*8:]).Greater(v)
-			word |= uint64(uint8(weights16.Masked(m).ReduceSum())) << uint(g*8)
+			word |= uint64(uint8(spikeWeights16.Masked(m).ReduceSum())) << uint(g*8)
 		}
 		plane[w] = word
 	}

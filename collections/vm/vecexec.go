@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"encoding/binary"
 	"math"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -66,6 +67,19 @@ type Vec struct {
 
 	// MASK form: three-valued logic as two bitplanes, two bits per record. See vecmask.go.
 	Hi, Lo []uint64
+
+	// Raw, when non-nil, is the column in its STORED form: n values of RawWidth bytes, contiguous, as the
+	// block holds them. I is NOT populated while it is set.
+	//
+	// It exists for one reason: lanes come from width. A column fitted to two bytes is 8 lanes of a 128-bit
+	// vector against 2 as int64, and widening it at load throws that away before any kernel sees it. So a
+	// comparison against a literal can run width-native (see simdCompareRaw) and everything else calls
+	// ensureInts, which widens exactly as loadIntBatch used to and clears Raw. A transient optimization that
+	// collapses to the ordinary representation on first non-specialized use.
+	Raw         []byte
+	RawWidth    int
+	RawUnsigned bool
+	RawReal     bool // a real's slot holds math.Float64bits, so widening it yields VsReal rather than VsInt
 
 	// Dict, when non-nil, resolves VsDictCode elements: the column is a dictionary-encoded string, so I[i]
 	// holds a code rather than a value and S[i] is not populated.
@@ -150,6 +164,13 @@ func (v *Vec) value(i int) classad.Value {
 func (v *Vec) valueData(i int) classad.Value {
 	if v.Const {
 		i = 0
+	}
+	if rawSupported && v.Raw != nil {
+		raw := readIntLE(v.Raw[i*v.RawWidth:], v.RawWidth, v.RawUnsigned)
+		if v.RawReal {
+			return classad.NewRealValue(math.Float64frombits(uint64(raw)))
+		}
+		return classad.NewIntValue(raw)
 	}
 	switch v.St[i] {
 	case VsInt:
@@ -339,7 +360,7 @@ func (s *VecScratch) push() *Vec {
 	v.n = s.n
 	v.I, v.S, v.St = v.I[:s.n], v.S[:s.n], v.St[:s.n]
 	v.Hi, v.Lo = v.Hi[:maskWords(s.n)], v.Lo[:maskWords(s.n)]
-	v.Mask, v.Const = false, false
+	v.Mask, v.Const, v.Raw = false, false, nil
 	s.depth++
 	return v
 }
@@ -419,6 +440,8 @@ func binopVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	}
 }
 func arithVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
+	l.ensureInts()
+	r.ensureInts()
 	l.toData()
 	r.toData()
 	l.materialize()
@@ -471,6 +494,7 @@ func arithVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 }
 
 func unopVec(ev *classad.Evaluator, op string, v *Vec) bool {
+	v.ensureInts()
 	if op == "!" {
 		// Truthiness first -- !42 is FALSE and !"x" is an ERROR -- then TRUE and FALSE swap while
 		// UNDEFINED and ERROR pass through, which is two operations per 64 records.
@@ -512,6 +536,8 @@ func hookOneUn(ev *classad.Evaluator, op string, v *Vec, i int) bool {
 // modulo and the identity operators land here, so adding a fast path for one later is an optimization
 // rather than a semantics change.
 func hookAll(ev *classad.Evaluator, op string, l, r *Vec) bool {
+	l.ensureInts()
+	r.ensureInts()
 	l.toData()
 	r.toData()
 	l.materialize()
@@ -536,6 +562,11 @@ func (v *Vec) IsTrue(i int) bool {
 	if v.Mask {
 		return maskStateAt(v.Hi, v.Lo, i) == mTrue
 	}
+	// A raw numeric column is never a match: the store takes a boolean or nothing (see isTrueValue). Answering
+	// from Raw rather than widening first is also what lets loadNum skip filling the state array at all.
+	if v.Raw != nil {
+		return false
+	}
 	if v.Const {
 		i = 0
 	}
@@ -551,6 +582,9 @@ func (v *Vec) CountTrue(live []uint64) int {
 	if v.Mask {
 		return planeCountTrue(v.Hi, v.Lo, live)
 	}
+	if rawSupported && v.Raw != nil {
+		return 0 // a constraint whose value is a number never matches; no need to widen to say so
+	}
 	n := 0
 	for i := 0; i < v.n; i++ {
 		if live[i/64]&(1<<uint(i%64)) != 0 && v.IsTrue(i) {
@@ -560,12 +594,88 @@ func (v *Vec) CountTrue(live []uint64) int {
 	return n
 }
 
+// ensureInts widens a raw column into I, so a kernel that was not written for the stored form can read it.
+// A no-op when Raw is nil, which is the common case.
+func (v *Vec) ensureInts() {
+	if !rawSupported || v.Raw == nil {
+		return
+	}
+	st := uint8(VsInt)
+	if v.RawReal {
+		st = VsReal
+	}
+	widenTyped(v.I, v.Raw, v.RawWidth, v.RawUnsigned, v.n)
+	for k := 0; k < v.n; k++ {
+		v.St[k] = st
+	}
+	v.Raw = nil
+}
+
+// widenTyped widens a stored column into int64, with the width decision hoisted OUT of the loop so each case
+// is a single machine load rather than a byte loop plus a branch.
+//
+// A column is one width for the whole block by construction, and doing this per element instead is what the
+// batch-load work removed: reading a value a byte at a time cost 0.69x to 0.84x of a scan when this function
+// was first written the obvious way.
+func widenTyped(dst []int64, src []byte, width int, unsigned bool, n int) {
+	switch {
+	case width == 1 && unsigned:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(src[k])
+		}
+	case width == 1:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(int8(src[k]))
+		}
+	case width == 2 && unsigned:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(binary.LittleEndian.Uint16(src[k*2:]))
+		}
+	case width == 2:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(int16(binary.LittleEndian.Uint16(src[k*2:])))
+		}
+	case width == 4 && unsigned:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(binary.LittleEndian.Uint32(src[k*4:]))
+		}
+	case width == 4:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(int32(binary.LittleEndian.Uint32(src[k*4:])))
+		}
+	case width == 8:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(binary.LittleEndian.Uint64(src[k*8:]))
+		}
+	default: // a 6-byte or otherwise unusual fitted width
+		for k := 0; k < n; k++ {
+			dst[k] = readIntLE(src[k*width:], width, unsigned)
+		}
+	}
+}
+
+// readIntLE reads a little-endian integer of the given width, sign-extending unless unsigned. The same
+// decode the store does; kept here so ensureInts does not need to call back into it.
+func readIntLE(b []byte, width int, unsigned bool) int64 {
+	var u uint64
+	for i := 0; i < width; i++ {
+		u |= uint64(b[i]) << (8 * uint(i))
+	}
+	if !unsigned && width < 8 {
+		if shift := uint(64 - 8*width); u&(1<<(8*uint(width)-1)) != 0 {
+			return int64(u<<shift) >> shift
+		}
+	}
+	return int64(u)
+}
+
 // materialize expands a Const vector so every element carries the value, for a kernel that does not
 // specialize on it.
 func (v *Vec) materialize() {
 	if !v.Const {
 		return
 	}
+	v.Raw = nil // a Const vector's value is in element 0, not in a column
 	v.Const = false
 	st, i0, s0 := v.St[0], v.I[0], v.S[0]
 	for k := 1; k < v.n; k++ {
@@ -579,6 +689,7 @@ func (v *Vec) toMask() {
 	if v.Mask {
 		return
 	}
+	v.ensureInts()
 	if v.Const {
 		// One state repeated: the planes are all-ones or all-zeros words, so there is nothing to walk.
 		st := dataStateToMask(v.St[0], v.I[0])
@@ -627,6 +738,7 @@ func (v *Vec) toData() {
 	if !v.Mask {
 		return
 	}
+	v.Raw = nil
 	for i := 0; i < v.n; i++ {
 		switch maskStateAt(v.Hi, v.Lo, i) {
 		case mTrue:
@@ -765,7 +877,19 @@ func compareVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	l.toData()
 	r.toData()
 	l.materialize()
+	if !r.Const {
+		l.ensureInts()
+		r.ensureInts()
+	}
 	if r.Const {
+		// WIDTH-NATIVE first: a raw column against an integer literal is the shape SIMD widens, and it is the
+		// shape most constraints are. Declining here just widens and falls through.
+		if rawSupported && l.Raw != nil && !l.RawReal && r.St[0] == VsInt {
+			if simdCompareRaw(c, l, r.I[0]) {
+				return true
+			}
+		}
+		l.ensureInts()
 		// A dictionary-encoded column against a literal: an integer range test, no string comparison at all.
 		if l.Dict != nil && r.St[0] == VsString {
 			if ok := compareVecDict(c, l, r.S[0]); ok {
@@ -946,6 +1070,8 @@ func (v *Vec) str(i int) (string, bool) {
 // reference treats as an error.
 func identicalVec(op string, l, r *Vec) bool {
 	negate := op == "=!="
+	l.ensureInts()
+	r.ensureInts()
 	l.toData()
 	r.toData()
 	l.materialize()

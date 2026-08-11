@@ -93,7 +93,7 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst *
 	if scope != ast.NoScope && scope != ast.MyScope {
 		return false
 	}
-	dst.Dict = nil // a slot reused from the stack must not carry a previous block's dictionary
+	dst.Dict, dst.Raw = nil, nil // a slot reused from the stack must not carry a previous block's column
 	id, ok := s.c.intern.LookupID(name)
 	if !ok {
 		return false
@@ -227,6 +227,25 @@ func (s *blockVecSource) dictBufFor(idx int) *[][]byte { return &s.dictFor(idx).
 // loadNum loads a numeric column, then repairs the escaped elements from the cold tail.
 func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst *vm.Vec) bool {
 	dst.Mask = false
+	// RAW, at the stored width, when every record has a value here. The executor compares it without widening
+	// -- lanes come from width, and widening to int64 before the kernel sees it throws three quarters of them
+	// away at a 2-byte column. A column WITH escapes cannot be represented this way, since an escaped value
+	// comes from the cold tail, so it takes the widening path below.
+	//
+	// Gated on an engine existing for this width: without one the raw form only costs widening later, so the
+	// production build takes the ordinary path below and is unchanged.
+	//
+	// The state array is deliberately NOT filled. A raw vector leaves both I and St to ensureInts, and filling
+	// St here as well made every widening path write it twice -- which cost 0.81x on the arithmetic shapes,
+	// where both operands widen. Vec.IsTrue and CountTrue answer from Raw directly, which is what removes the
+	// stale-state hazard that filling it was guarding against.
+	if vm.RawColumnUseful(f.width, f.unsigned) && s.blk.escapeFree(idx) {
+		if raw, ok := s.blk.rawColumn(idx, s.bc); ok {
+			dst.Raw, dst.RawWidth = raw, f.width
+			dst.RawUnsigned, dst.RawReal = f.unsigned, f.kind == akReal
+			return true
+		}
+	}
 	if !s.blk.loadIntBatch(idx, s.bc, dst.I) {
 		return false
 	}

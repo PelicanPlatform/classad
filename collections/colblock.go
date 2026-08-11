@@ -551,6 +551,34 @@ func loadIntsTyped(dst []int64, src []byte, stride, off, width int, unsigned boo
 	}
 }
 
+// rawColumn returns a numeric field's values as the contiguous bytes the block stores, at their stored width.
+//
+// Both numeric regions are columnar, so this is a subslice either way -- for a hot field, a span of the
+// uncompressed region and therefore of the mmap. Handing that to a comparison kernel is what makes a
+// width-native compare possible: 8 lanes of a 128-bit vector at a 2-byte width where int64 gives 2.
+func (b *columnarBlock) rawColumn(fieldIdx int, bc *blockCache) ([]byte, bool) {
+	f := b.schema.fields[fieldIdx]
+	if !numericKind(f.kind) {
+		return nil, false
+	}
+	need := b.n * f.width
+	if start, hot := b.hotColStart[fieldIdx]; hot {
+		if start+need > len(b.hotCol) {
+			return nil, false
+		}
+		return b.hotCol[start : start+need], true
+	}
+	start, ok := b.coldFieldStart[fieldIdx]
+	if !ok {
+		return nil, false
+	}
+	coldNum, err := bc.stream(b, kindColdNum)
+	if err != nil || start+need > len(coldNum) {
+		return nil, false
+	}
+	return coldNum[start : start+need], true
+}
+
 // scanInt calls fn for each record's value of a numeric (int/real read as int bits) field: a
 // hot field reads the uncompressed region directly (no decode); a cold field decompresses its
 // column group once (via bc, nil for no cache). present is false for a missing/exceptional
