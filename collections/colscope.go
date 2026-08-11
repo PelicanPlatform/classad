@@ -56,7 +56,14 @@ type colScope struct {
 	bind    map[string]int
 	bindFor *adSchema
 
-	strScratch []byte // decompressed string region, cached per block by the block cache
+	strScratch []byte
+
+	// dictEnt caches parsed dictionary entries PER FIELD for the current block, dropped by setBlock.
+	//
+	// colScope evaluates per record, so parsing a dictionary inside slotString would parse it once per
+	// RECORD -- cardinality uvarint reads each time, which is worse than the positional walk it replaced.
+	// The parse belongs once per block, which is what this makes it.
+	dictEnt map[int][][]byte // decompressed string region, cached per block by the block cache
 }
 
 const (
@@ -195,6 +202,22 @@ func (cs *colScope) slotBool(f adField) bool {
 // A comparison never needed the copy.
 func (cs *colScope) slotString(idx int) (string, bool) {
 	b := cs.blk
+	// The dictionary is authoritative for the fields it owns, and resolving a code is O(1) against a walk.
+	if b.dictOwns(idx) {
+		entries, ok := cs.dictEntriesCached(idx)
+		if !ok {
+			return "", false
+		}
+		codes, w, ok := b.dictCodes(idx, cs.bc)
+		if !ok {
+			return "", false
+		}
+		c := dictCodeAt(codes, w, cs.k)
+		if c >= len(entries) {
+			return "", false
+		}
+		return bytesToStr(entries[c]), true
+	}
 	if cs.strScratch == nil {
 		raw, err := cs.bc.stream(b, kindStr)
 		if err != nil {
@@ -205,7 +228,9 @@ func (cs *colScope) slotString(idx int) (string, bool) {
 	region := cs.strScratch[b.strOff[cs.k]:b.strOff[cs.k+1]]
 	esc := b.escapeAt(cs.k)
 	for i := range b.schema.fields {
-		if b.schema.fields[i].kind != akString || testBit(esc, i) {
+		// A field the dictionary owns is NOT in this region; see appendNonDictStrings. Skipping it keeps the
+		// walk aligned for the fields that ARE here.
+		if b.schema.fields[i].kind != akString || testBit(esc, i) || b.dictOwns(i) {
 			continue
 		}
 		l, n := binary.Uvarint(region)
@@ -230,10 +255,32 @@ func (cs *colScope) slotString(idx int) (string, bool) {
 	return "", false
 }
 
+// dictEntriesCached parses a field's dictionary at most once per block.
+func (cs *colScope) dictEntriesCached(idx int) ([][]byte, bool) {
+	if e, ok := cs.dictEnt[idx]; ok {
+		return e, e != nil
+	}
+	var buf [][]byte
+	e, ok := cs.blk.dictEntries(idx, cs.bc, &buf)
+	if cs.dictEnt == nil {
+		cs.dictEnt = map[int][][]byte{}
+	}
+	if !ok {
+		cs.dictEnt[idx] = nil
+		return nil, false
+	}
+	cs.dictEnt[idx] = e
+	return e, true
+}
+
 // setBlock rebinds the scope to a new block, dropping per-block caches.
 func (cs *colScope) setBlock(blk *columnarBlock) {
 	cs.blk = blk
 	cs.strScratch = nil
+	// The parsed entries alias the previous block's region, so they must not survive the rebind.
+	for k := range cs.dictEnt {
+		delete(cs.dictEnt, k)
+	}
 }
 
 // prunePlan caches the zone-prunable probe analysis, which depends only on the query and the SCHEMA.

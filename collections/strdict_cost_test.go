@@ -10,16 +10,16 @@ import (
 //
 // Measured, 827 accelerator-covered records in 8 blocks:
 //
-//	accelerator without dictionaries   571.4 B/record   2.2% of a 25.7 KB ad
-//	accelerator with dictionaries      649.4 B/record   2.5%
-//	the dictionaries themselves         78.0 B/record   0.30% of an ad, +13.6% of the accelerator
-//	seal-time build                    1.85s -> 1.74s   no measurable cost
+//	accelerator without dictionaries   571.4 B/record
+//	accelerator with dictionaries      551.7 B/record   -3.4%
+//	  the dictionaries themselves       78.0 B/record   (dict 58.6 KB + codes 5.9 KB)
+//	  the string region                138.0 KB -> 57.3 KB, -58%
+//	seal-time build                    1.65s -> 1.63s   no measurable cost
 //
-// Most of that 78 B is the DICTIONARY (58 KB) rather than the codes (5.9 KB), and it is the price of the
-// additive design: a dictionary-encoded field's values are also still in the positional region, so the
-// duplication is ~42% of the string region. Making the dictionary authoritative -- dropping those fields
-// from the positional region and having reconstruct splice them back in positional order -- would turn this
-// cost into a saving. That is the follow-up, and this test is how to tell whether it worked.
+// A NET SAVING, because the dictionary is AUTHORITATIVE: a field it owns is not written to the positional
+// region at all. While the encoding was additive the same dictionaries cost +13.6% instead, storing every
+// encoded value twice -- so authoritative is what turns the feature from a tradeoff into a free one, and this
+// test is what says which side of the line it is on.
 //
 // Note the accelerator is only ~2% of a raw ad because it is a PROJECTION: the full ad lives compressed in
 // the segment arena, and the accelerator holds the schema'd scalar fields plus a cold tail.
@@ -72,10 +72,10 @@ func TestStrDictCost(t *testing.T) {
 	t.Logf("OSPool corpus: %d records in %d blocks", on.records, on.blocks)
 	t.Logf("  accelerator bytes without dictionaries: %d (%.1f B/record)",
 		tot(off), float64(tot(off))/float64(off.records))
-	t.Logf("  accelerator bytes with dictionaries:    %d (%.1f B/record)  +%.1f%%",
+	t.Logf("  accelerator bytes with dictionaries:    %d (%.1f B/record)  %+.1f%%",
 		tot(on), float64(tot(on))/float64(on.records),
 		100*float64(tot(on)-tot(off))/float64(tot(off)))
-	t.Logf("  added: dict=%d code=%d over %d dictionary-encoded fields (%.1f B/record)",
+	t.Logf("  dictionaries: dict=%d code=%d over %d encoded fields (%.1f B/record added)",
 		on.dict, on.code, on.dictFields, float64(on.dict+on.code)/float64(on.records))
 	t.Logf("  region breakdown with dict: bits=%d hotCol=%d coldNum=%d str=%d coldTail=%d",
 		on.bits, on.hotCol, on.coldNum, on.str, on.cold)

@@ -11,6 +11,10 @@ import (
 
 var errNotNumericField = errors.New("adschema: scanInt on a non-numeric field")
 
+// errBadColBlock reports a block whose regions do not agree with its metadata -- a truncated string region,
+// a code past the end of its dictionary. Derived state, so a caller can rebuild rather than fail the query.
+var errBadColBlock = errors.New("adschema: columnar block region inconsistent with its schema")
+
 // colBlockSeq assigns each built block a process-unique id, used as the block-cache key.
 var colBlockSeq atomic.Uint64
 
@@ -284,6 +288,9 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 	b.bits = make([]byte, 0, b.bitsStride*len(recs))
 	b.hotCol = make([]byte, hp)
 	coldRaw := make([]byte, cp)
+	// Decided BEFORE the record loop, because the positional region omits whatever the dictionary owns and
+	// the loop is what writes that region.
+	dicts, dictRaw, codeRaw := buildStrDicts(s, recs, len(recs))
 	var strCat, coldCat []byte
 	b.strOff = []int{0}
 	b.coldOff = []int{0}
@@ -298,13 +305,20 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 			copy(coldRaw[b.coldFieldStart[i]+k*s.fields[i].width:], r[off:off+s.fields[i].width])
 		}
 		_, str, cold := s.splitRecord(r)
-		strCat = append(strCat, str...)
+		if len(dicts) == 0 {
+			strCat = append(strCat, str...)
+		} else {
+			var ok bool
+			if strCat, ok = appendNonDictStrings(s, r, dicts, strCat); !ok {
+				strCat = append(strCat, str...) // malformed record: keep it whole rather than lose it
+			}
+		}
 		coldCat = append(coldCat, cold...)
 		b.strOff = append(b.strOff, len(strCat))
 		b.coldOff = append(b.coldOff, len(coldCat))
 	}
 	b.zones = numericZones(s, b, recs)
-	if dicts, dictRaw, codeRaw := buildStrDicts(s, recs, len(recs)); dicts != nil {
+	if dicts != nil {
 		b.strDict = dicts
 		b.strDictComp = regionCodec.Compress(nil, dictRaw)
 		b.strCodeComp = regionCodec.Compress(nil, codeRaw)
@@ -571,6 +585,44 @@ func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, p
 	return nil
 }
 
+// appendStrings rebuilds record k's full positional string region, interleaving the fields the dictionary
+// owns with the ones still stored positionally -- in schema order, which is the order a reader expects.
+func (b *columnarBlock) appendStrings(rec []byte, k int, strRaw []byte, bc *blockCache) ([]byte, error) {
+	s := b.schema
+	esc := b.escapeAt(k)
+	pos := strRaw[b.strOff[k]:b.strOff[k+1]]
+	for i := range s.fields {
+		if s.fields[i].kind != akString || testBit(esc, i) {
+			continue
+		}
+		if !b.dictOwns(i) {
+			l, m := binary.Uvarint(pos)
+			if m <= 0 || m+int(l) > len(pos) {
+				return nil, errBadColBlock
+			}
+			rec = append(rec, pos[:m+int(l)]...)
+			pos = pos[m+int(l):]
+			continue
+		}
+		var buf [][]byte
+		entries, ok := b.dictEntries(i, bc, &buf)
+		if !ok {
+			return nil, errBadColBlock
+		}
+		codes, w, ok := b.dictCodes(i, bc)
+		if !ok {
+			return nil, errBadColBlock
+		}
+		c := dictCodeAt(codes, w, k)
+		if c >= len(entries) {
+			return nil, errBadColBlock
+		}
+		rec = binary.AppendUvarint(rec, uint64(len(entries[c])))
+		rec = append(rec, entries[c]...)
+	}
+	return rec, nil
+}
+
 // escapeAt returns record k's escape bitmap, from the per-record bitsets region.
 func (b *columnarBlock) escapeAt(k int) []byte {
 	base := k * b.bitsStride
@@ -601,7 +653,16 @@ func (b *columnarBlock) reconstruct(k int, bc *blockCache) ([]byte, error) {
 		w := s.fields[i].width
 		copy(rec[s.escBytes+s.fields[i].off:], coldRaw[b.coldFieldStart[i]+k*w:b.coldFieldStart[i]+k*w+w])
 	}
-	rec = append(rec, strRaw[b.strOff[k]:b.strOff[k+1]]...)
+	// The positional region omits whatever a dictionary owns, so rebuilding the canonical record form means
+	// walking the schema's string fields in order and taking each from whichever side holds it.
+	if len(b.strDict) == 0 {
+		rec = append(rec, strRaw[b.strOff[k]:b.strOff[k+1]]...)
+	} else {
+		var err error
+		if rec, err = b.appendStrings(rec, k, strRaw, bc); err != nil {
+			return nil, err
+		}
+	}
 	rec = append(rec, tailRaw[b.coldOff[k]:b.coldOff[k+1]]...)
 	return rec, nil
 }

@@ -176,7 +176,9 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 		rec := region[b.strOff[k]:b.strOff[k+1]]
 		found := false
 		for i := range b.schema.fields {
-			if b.schema.fields[i].kind != akString || testBit(esc, i) {
+			// A field the dictionary owns is NOT in this region, so walking past it would misalign every
+			// field after it.
+			if b.schema.fields[i].kind != akString || testBit(esc, i) || b.dictOwns(i) {
 				continue
 			}
 			l, n := binary.Uvarint(rec)

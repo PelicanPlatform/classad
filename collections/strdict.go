@@ -32,13 +32,14 @@ import (
 // under =?=, so they must keep separate codes while both matching an == against either. Hence a code SET
 // for equality rather than a single code, and exact-byte matching for =?=.
 //
-// ADDITIVE, NOT REPLACING. The positional region is still written for every string field, including
-// dictionary-encoded ones, so reconstruct and every existing reader keep working untouched. The cost is
-// that a dictionary-encoded field's values are stored twice before compression -- which is why a field is
-// only dictionary-encoded when its values actually repeat (see dictWorthwhile), and why the codes and
-// dictionary are compressed. Making the dictionary authoritative and dropping those fields from the
-// positional region is a later, larger change: reconstruct would have to splice strings back into
-// positional order.
+// AUTHORITATIVE. A dictionary-encoded field is NOT written to the positional region: the dictionary is where
+// its values live. That is what turns the encoding from a cost into a saving -- storing a field's values
+// twice was ~42% of the string region and 0.30% of an OSPool ad.
+//
+// The price is that the positional region is no longer self-describing. Anything walking it must skip the
+// fields the dictionary owns, or every offset after the first omission is wrong, and reconstruct has to
+// splice dictionary values back into positional order to rebuild the canonical record form. Those are the
+// three readers that changed with it: reconstruct, colScope.slotString and blockVecSource.loadStr.
 
 const (
 	// dictMaxCardinality caps a dictionary at what a 2-byte code addresses.
@@ -272,6 +273,36 @@ func (b *columnarBlock) dictCodes(fieldIdx int, bc *blockCache) ([]byte, int, bo
 		return nil, 0, false
 	}
 	return region[info.codeStart:end], info.codeWidth, true
+}
+
+// appendNonDictStrings appends record r's positional string region, OMITTING the fields a dictionary owns.
+//
+// The dictionary is authoritative for those, so writing them here too would store every value twice. The
+// omission is why every reader of this region has to consult strDict as it walks: the region holds a subset
+// of the schema's string fields, in schema order, and nothing in the bytes says which.
+func appendNonDictStrings(s *adSchema, r []byte, dicts map[int]strDictField, dst []byte) ([]byte, bool) {
+	esc := r[:s.escBytes]
+	p := s.escBytes + s.fixedLen
+	for i := range s.fields {
+		if s.fields[i].kind != akString || testBit(esc, i) {
+			continue
+		}
+		l, m := binary.Uvarint(r[p:])
+		if m <= 0 || p+m+int(l) > len(r) {
+			return dst, false
+		}
+		if _, owned := dicts[i]; !owned {
+			dst = append(dst, r[p:p+m+int(l)]...)
+		}
+		p += m + int(l)
+	}
+	return dst, true
+}
+
+// dictOwns reports whether the dictionary is authoritative for this field, so a positional walk must skip it.
+func (b *columnarBlock) dictOwns(fieldIdx int) bool {
+	_, ok := b.strDict[fieldIdx]
+	return ok
 }
 
 // dictCodeAt reads record k's code from a code column of the given width.

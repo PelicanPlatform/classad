@@ -465,7 +465,11 @@ func TestRowGroupsNoRunts(t *testing.T) {
 // blockRegionBytes reports a block's compressed region bytes, as a stand-in for its record content size.
 // Only meaningful for incompressible content; see incompressible.
 func blockRegionBytes(b *columnarBlock) (int, bool) {
-	return len(b.coldNumComp) + len(b.strComp) + len(b.coldComp), true
+	// The string DICTIONARY counts. Leaving it out made this report runts that were not: a fixture whose huge
+	// blob repeats across a block's records now stores that blob ONCE in the dictionary instead of once per
+	// record, so the positional region collapsed to 54 bytes while the block still held the same data.
+	return len(b.coldNumComp) + len(b.strComp) + len(b.coldComp) +
+		len(b.strDictComp) + len(b.strCodeComp), true
 }
 
 // incompressible builds a deterministic n-byte string a compressor cannot shrink, from a simple LCG so
