@@ -94,15 +94,25 @@ func TestArchiveConstrainedCountMatchesScan(t *testing.T) {
 	}
 }
 
-// TestArchiveCountConstraintDeclinesGracefully pins that a declined constraint still produces the
-// right answer through the scan, since the whole design rests on falling back rather than guessing.
-func TestArchiveCountConstraintDeclinesGracefully(t *testing.T) {
+// TestArchiveCountConstraintFallsBackGracefully pins the property the design actually rests on: however
+// a constraint is served -- from the stored count, the hand-written column scan, the general columnar
+// evaluator, or a full row scan -- the answer matches the scan.
+//
+// It used to assert that `Owner == "user3"` and `RequestMemory > RequestCpus` DECLINE. That was true when
+// the columnar count served only numeric comparisons against a literal, and stopped being true when the
+// general columnar evaluator landed and made both servable. Asserting which TIER answers a query pins an
+// implementation detail that improvements are supposed to change; asserting the ANSWER pins the contract.
+// So the tier is logged, not checked, and the decline path is exercised by a constraint that cannot be
+// lowered at all rather than by one that merely could not be lowered yet.
+func TestArchiveCountConstraintFallsBackGracefully(t *testing.T) {
 	cat, a := archiveCountFixture(t, 2000)
 	defer cat.Close()
-	for _, constraint := range []string{`Owner == "user3"`, "RequestMemory > RequestCpus"} {
-		if _, served := a.CountConstraint(constraint); served {
-			t.Errorf("%s: expected the columnar count to decline", constraint)
-		}
+	for _, constraint := range []string{
+		`Owner == "user3"`,            // a string field
+		"RequestMemory > RequestCpus", // attribute to attribute, no literal
+		`regexp("user3", Owner)`,      // a function call: not lowerable, so this must decline
+		`size(Owner) > 4`,             // likewise
+	} {
 		rows, err := a.AggregateCols(constraint, nil, []AggSpec{{Func: AggCount, Arg: "*"}})
 		if err != nil {
 			t.Fatal(err)
@@ -110,8 +120,15 @@ func TestArchiveCountConstraintDeclinesGracefully(t *testing.T) {
 		var got int
 		fmt.Sscanf(rows[0].Values[0], "%d", &got)
 		if want := scanCount(t, a, constraint); got != want {
-			t.Errorf("%s: fell back to the scan and got %d, want %d", constraint, got, want)
+			t.Errorf("%s: COUNT(*) = %d, scan = %d", constraint, got, want)
 		}
+		_, served := a.CountConstraint(constraint)
+		t.Logf("%-30s count=%-6d columnar=%v", constraint, got, served)
+	}
+	// The fallback must still be reachable, or this test would pass by serving everything columnar and
+	// would no longer be testing a fallback at all.
+	if _, served := a.CountConstraint(`regexp("user3", Owner)`); served {
+		t.Error(`regexp(...) was served columnar; it cannot be lowered, so something is answering it wrongly`)
 	}
 }
 
