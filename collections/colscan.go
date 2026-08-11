@@ -558,17 +558,22 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 		if n, served := c.PresenceCountQuery(q); served {
 			return n, true
 		}
-		// Last tier: evaluate the query itself against the columns (see ColumnarEvalCount). It serves
-		// any NATIVE query -- string comparisons, attribute-to-attribute, arithmetic, disjunctions --
-		// at roughly an order of magnitude less than the hand-written scans but several times better
-		// than decoding ads.
+		// Last tier: evaluate the query itself against the columns, a COLUMN at a time where the
+		// expression allows it (VectorEvalCount) and per record where it does not. It serves any
+		// NATIVE query -- string comparisons, attribute-to-attribute, arithmetic, disjunctions.
+		//
+		// VectorEvalCount rather than ColumnarEvalCount because it cannot be worse: a block it cannot
+		// vectorize is served by exactly the per-record path ColumnarEvalCount would have used, and a
+		// block that is mostly superseded is too. Where it does vectorize -- the arithmetic,
+		// disjunction and boolean shapes the hand-written scans above refuse -- it is ~10x, which is
+		// the hand-written scans' speed generalized to expressions nobody hand-wrote.
 		//
 		// Skipped when an index could prune the row path instead: this evaluates EVERY visible record,
 		// so against a selective indexed constraint the scan wins, and a routing that ignored that was
 		// measured 2.9x slower on exactly such a query.
 		// Skipped only when an index could prune the row path instead.
 		if !c.indexCanPrune(q) {
-			return c.ColumnarEvalCount(q)
+			return c.VectorEvalCount(q)
 		}
 		return 0, false
 	}
