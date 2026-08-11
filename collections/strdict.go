@@ -310,50 +310,68 @@ func (b *columnarBlock) dictRange(fieldIdx int, lit string, bc *blockCache, buf 
 	return lo, hi, true
 }
 
-// dictPrunes reports whether this block can be ruled out by any of the string-equality conjuncts: one whose
-// field has a complete dictionary containing NONE of the values a match would require.
+// dictPrunes reports whether this block can be ruled out by any of the string comparison conjuncts.
 //
-// Completeness is what noEscape records, and it is the whole soundness condition: an escaped record's value
-// lives in the cold tail where the dictionary cannot see it, so pruning on a partial dictionary would drop
-// real matches.
-func (b *columnarBlock) dictPrunes(probes []strEqProbe, bc *blockCache, buf *[][]byte) bool {
+// Completeness is the whole soundness condition, and noEscape records it: an escaped record's value lives in
+// the cold tail where the dictionary cannot see it, so a partial dictionary must not prune.
+func (b *columnarBlock) dictPrunes(probes []strProbe, bc *blockCache, buf *[][]byte) bool {
 	for _, p := range probes {
 		info, ok := b.strDict[p.fieldIdx]
 		if !ok || !info.noEscape {
 			continue
 		}
-		entries, ok := b.dictEntries(p.fieldIdx, bc, buf)
-		if !ok {
-			continue
-		}
-		any := false
-		for _, lit := range p.lits {
-			lo, hi, ok := b.dictRange(p.fieldIdx, lit, bc, buf)
-			if !ok {
-				any = true // cannot tell: do not prune on this probe
-				break
-			}
-			if lo == hi {
-				continue // no entry folds equal to this value
-			}
-			if !p.exact {
-				any = true
-				break
-			}
-			// =?= is byte-exact, and fold-equal entries are contiguous, so only the fold range can hold it.
-			for j := lo; j < hi && j < len(entries); j++ {
-				if bytesToStr(entries[j]) == lit {
-					any = true
-					break
-				}
-			}
-			if any {
-				break
-			}
-		}
-		if !any {
+		if b.probePrunes(p, info, bc, buf) {
 			return true
 		}
 	}
 	return false
+}
+
+// probePrunes reports whether one conjunct rules the block out.
+//
+// Equality asks whether ANY of its values is present. Ordering asks where the literal falls in the
+// fold-ordered dictionary: everything below the literal occupies codes [0, lo) and everything above occupies
+// [hi, count), so an empty side means no record in the block can satisfy that direction.
+func (b *columnarBlock) probePrunes(p strProbe, info strDictField, bc *blockCache, buf *[][]byte) bool {
+	entries, ok := b.dictEntries(p.fieldIdx, bc, buf)
+	if !ok {
+		return false
+	}
+	switch p.op {
+	case "<", "<=", ">", ">=":
+		lo, hi, ok := b.dictRange(p.fieldIdx, p.lits[0], bc, buf)
+		if !ok {
+			return false
+		}
+		switch p.op {
+		case "<":
+			return lo == 0 // no entry folds below the literal
+		case "<=":
+			return hi == 0
+		case ">":
+			return hi == info.count // no entry folds above it
+		default: // ">="
+			return lo == info.count
+		}
+	}
+	// Equality-shaped: prune only when NONE of the values could be present.
+	for _, lit := range p.lits {
+		lo, hi, ok := b.dictRange(p.fieldIdx, lit, bc, buf)
+		if !ok {
+			return false
+		}
+		if lo == hi {
+			continue // nothing folds equal to this value
+		}
+		if p.op != "is" {
+			return false // a fold-equal entry exists, so the block may match
+		}
+		// =?= is byte-exact, and fold-equal entries are contiguous, so only the fold range can hold it.
+		for j := lo; j < hi && j < len(entries); j++ {
+			if bytesToStr(entries[j]) == lit {
+				return false
+			}
+		}
+	}
+	return true
 }

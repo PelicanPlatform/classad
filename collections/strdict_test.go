@@ -198,6 +198,7 @@ func BenchmarkStrDict(b *testing.B) {
 		`Owner == "user3"`,
 		`Owner == "nobody"`, // absent from every dictionary: should prune
 		`Owner < "user5"`,
+		`Owner > "user7"`, // above the maximum: prunes every block
 		`Owner == "user3" && RequestCpus > 2`,
 		`Cmd == "/home/user3/run1.sh"`,
 	} {
@@ -241,8 +242,13 @@ func TestStrDictPrunes(t *testing.T) {
 		{`Owner =?= "user3"`, true},                    // identity: exact match within the fold range
 		{`Owner == "user3" || Owner == "user5"`, true}, // folded to an "in" probe
 		{`Owner != "user3"`, false},                    // a missing literal makes every record MATCH, so never prune
-		{`Owner > "user3"`, false},                     // ordering: the range could serve it, but it is not wired
 		{`RequestMemory > 4096`, false},                // no string probe at all
+		// Ordering, through the same fold-ordered range: a block prunes when the boundary sits at an end.
+		{`Owner > "user3"`, true},   // blocks holding only user0..user3 have nothing above
+		{`Owner < "user5"`, true},   // blocks holding only user5..user7 have nothing below
+		{`Owner < "user0"`, true},   // user0 is the minimum, so nothing anywhere is below it
+		{`Owner > "user7"`, true},   // user7 is the maximum
+		{`Owner >= "user0"`, false}, // everything satisfies it, so no block can be ruled out
 	} {
 		q, err := vm.Parse(tc.expr)
 		if err != nil {
@@ -261,9 +267,9 @@ func TestStrDictPrunes(t *testing.T) {
 		if tc.wantPruning && !pruned {
 			t.Errorf("%q: expected some block to be pruned by the dictionary", tc.expr)
 		}
-		if !tc.wantPruning && pruned && tc.expr == `Owner != "user3"` {
-			t.Errorf("%q: pruned a block, but a literal absent from a block makes every record there match",
-				tc.expr)
+		if !tc.wantPruning && pruned {
+			t.Errorf("%q: pruned %d blocks, but nothing about this constraint can rule a block out",
+				tc.expr, split.prunedBlocks)
 		}
 	}
 }

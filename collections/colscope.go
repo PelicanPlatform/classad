@@ -252,21 +252,28 @@ type prunePlan struct {
 	schema *adSchema
 	idxs   []int
 	preds  []fieldPred
-	strEq  []strEqProbe
+	strEq  []strProbe
 	valid  bool
 }
 
-// strEqProbe is an equality conjunct on a STRING field, resolved against a schema: the values any matching
-// record must hold for that field. A block whose dictionary contains none of them cannot match.
+// strProbe is a comparison conjunct on a STRING field, resolved against a schema. A block whose dictionary
+// cannot contain a value satisfying it cannot match, so the block is skipped.
 //
-// Op "in" is included because Probes folds an OR-of-equalities on ONE attribute into it, so
-// `Owner == "a" || Owner == "b"` still prunes -- only when neither value is present. Op "!=" is
-// deliberately NOT here: a literal being absent from a block makes every record in it MATCH a !=, not fail
-// it. Nor are the ordering operators, which the range could serve but which prune far less often.
-type strEqProbe struct {
+// Which operators are here, and why:
+//
+//	==       a matching record holds one of lits
+//	in       Probes folds an OR-of-equalities on ONE attribute into this, so `Owner == "a" || Owner == "b"`
+//	         still prunes -- only when NEITHER value is present
+//	is       =?= identity, so the match must be byte-exact rather than fold-equal
+//	< <= > >= the fold-ordered dictionary makes these code range checks, so a block prunes when the range
+//	         boundary sits at an end: nothing in the block is below (or above) the literal
+//
+// "!=" and "isnt" are deliberately absent. A literal missing from a block makes every record there MATCH an
+// inequality, not fail it, so pruning on one would zero out the answer.
+type strProbe struct {
 	fieldIdx int
+	op       string
 	lits     []string
-	exact    bool // =?= : identity, so the match must be byte-exact rather than fold-equal
 }
 
 func (p *prunePlan) tests(c *Collection, q *vm.Query, s *adSchema) ([]int, []fieldPred) {
@@ -274,8 +281,8 @@ func (p *prunePlan) tests(c *Collection, q *vm.Query, s *adSchema) ([]int, []fie
 	return p.idxs, p.preds
 }
 
-// stringEq returns the string-equality conjuncts, resolved against s.
-func (p *prunePlan) stringEq(c *Collection, q *vm.Query, s *adSchema) []strEqProbe {
+// stringEq returns the string comparison conjuncts, resolved against s.
+func (p *prunePlan) stringEq(c *Collection, q *vm.Query, s *adSchema) []strProbe {
 	p.resolve(c, q, s)
 	return p.strEq
 }
@@ -289,22 +296,19 @@ func (p *prunePlan) resolve(c *Collection, q *vm.Query, s *adSchema) {
 	p.schema, p.valid = s, true
 }
 
-// strEqProbes extracts the equality conjuncts on string fields of this schema.
+// strEqProbes extracts the comparison conjuncts on string fields of this schema.
 //
 // Probes returns index-satisfiable CONJUNCTS -- it flattens the top-level && spine and omits anything that
 // is not a recognizable `Attr OP literal` -- so every probe here is a necessary condition and ruling a block
 // out on one is sound. A bare disjunction yields no probes at all, which is why this cannot wrongly prune
 // `Owner == "a" || RequestMemory > 8192`.
-func (c *Collection) strEqProbes(q *vm.Query, s *adSchema) []strEqProbe {
-	var out []strEqProbe
+func (c *Collection) strEqProbes(q *vm.Query, s *adSchema) []strProbe {
+	var out []strProbe
 	for _, p := range q.Probes() {
-		exact := false
 		switch p.Op {
-		case "==", "in":
-		case "is":
-			exact = true
+		case "==", "in", "is", "<", "<=", ">", ">=":
 		default:
-			continue
+			continue // "!=" and "isnt" can never rule a block out; see strProbe
 		}
 		id, ok := c.intern.LookupID(p.Attr)
 		if !ok {
@@ -326,7 +330,10 @@ func (c *Collection) strEqProbes(q *vm.Query, s *adSchema) []strEqProbe {
 		if len(lits) == 0 {
 			continue
 		}
-		out = append(out, strEqProbe{fieldIdx: idx, lits: lits, exact: exact})
+		if p.Op != "==" && p.Op != "in" && p.Op != "is" && len(lits) != 1 {
+			continue // an ordering probe has exactly one literal
+		}
+		out = append(out, strProbe{fieldIdx: idx, op: p.Op, lits: lits})
 	}
 	return out
 }
