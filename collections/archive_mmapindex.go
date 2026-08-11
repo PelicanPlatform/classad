@@ -534,3 +534,10 @@ func cmpStrBytes(s string, b []byte) int {
 	}
 	return 0
 }
+
+// recordCount is the number of records this segment's index covers. Unlike the per-attribute
+// summaries -- parsed eagerly so the planner never pages the postings -- this reads the
+// all-records bitmap out of the mapping, which is why indexEstCandidates calls it only for the
+// presence probes. An `absent` probe's execution clones the same bitmap, so a probe that is
+// estimated and then run pays for it once either way.
+func (si *mmapSegIndex) recordCount() uint64 { return si.allBitmap().GetCardinality() }
