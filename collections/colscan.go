@@ -555,7 +555,22 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 	if !ok {
 		// Not a scalar comparison. A lone presence probe (`attr is undefined`) is still
 		// columnar-servable straight from the escape bitmap -- see PresenceCountQuery.
-		return c.PresenceCountQuery(q)
+		if n, served := c.PresenceCountQuery(q); served {
+			return n, true
+		}
+		// Last tier: evaluate the query itself against the columns (see ColumnarEvalCount). It serves
+		// any NATIVE query -- string comparisons, attribute-to-attribute, arithmetic, disjunctions --
+		// at roughly an order of magnitude less than the hand-written scans but several times better
+		// than decoding ads.
+		//
+		// Skipped when an index could prune the row path instead: this evaluates EVERY visible record,
+		// so against a selective indexed constraint the scan wins, and a routing that ignored that was
+		// measured 2.9x slower on exactly such a query.
+		// Skipped only when an index could prune the row path instead.
+		if !c.indexCanPrune(q) {
+			return c.ColumnarEvalCount(q)
+		}
+		return 0, false
 	}
 	// As NumStatsQuery: record the predicate's attribute so the hot tier keeps tracking the
 	// columns queries actually read, instead of freezing once the accelerator starts serving them.

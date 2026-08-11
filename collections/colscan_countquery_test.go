@@ -93,7 +93,10 @@ func TestCountQueryAutoRoute(t *testing.T) {
 		}
 	}
 
-	// Not columnar-eligible: must decline (ok=false) so the caller uses the normal scan.
+	// These reach no HAND-WRITTEN column scan. The columnar evaluator may still serve them (it
+	// evaluates the query itself), so the requirement is that whatever answers is correct -- which is
+	// the property that actually matters, and the one that keeps holding as more shapes become
+	// servable.
 	for _, expr := range []string{
 		`Machine == "m0001"`,                    // string field, not a numeric schema field
 		"Memory > 4096 || Cpus > 2",             // disjunction: the probes do not cover it
@@ -102,12 +105,8 @@ func TestCountQueryAutoRoute(t *testing.T) {
 	} {
 		q, _ := vm.Parse(expr)
 		if got, ok := store.CountQuery(q); ok {
-			// Serving is only a bug if the answer differs; assert the stronger property.
 			if want := storeCount(expr); got != want {
-				t.Errorf("%q: CountQuery accepted an ineligible predicate AND answered %d (want %d)",
-					expr, got, want)
-			} else {
-				t.Errorf("%q: CountQuery accepted a predicate expected to be ineligible", expr)
+				t.Errorf("%q: CountQuery answered %d, store.Query = %d", expr, got, want)
 			}
 		}
 	}

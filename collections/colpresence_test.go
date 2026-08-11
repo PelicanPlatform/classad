@@ -123,10 +123,15 @@ func TestPresenceCountDeclinesOnExpression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, served := c.CountQuery(q)
-	if served {
-		t.Errorf("columnar path served a query over an expression-valued attribute (returned %d); "+
-			"only evaluation can decide whether that record is undefined", got)
+	// The BITMAP path must decline -- only evaluation can judge an expression.
+	if _, served := c.PresenceCountQuery(q); served {
+		t.Error("the escape-bitmap presence path served a query over an expression-valued attribute; " +
+			"only evaluation can decide whether that record is undefined")
+	}
+	// CountQuery as a whole may still serve it, via the columnar EVALUATOR, which re-evaluates that
+	// one record the ordinary way -- so the requirement is a correct answer, not a refusal.
+	if got, served := c.CountQuery(q); served && got != rowTruth(t, c, "ProcId is undefined") {
+		t.Errorf("CountQuery answered %d, row path says %d", got, rowTruth(t, c, "ProcId is undefined"))
 	}
 	// And the ordinary path still answers correctly: the expression evaluates to undefined.
 	if want := rowTruth(t, c, "ProcId is undefined"); want != 1 {
@@ -186,7 +191,14 @@ func TestPresenceCountUnknownAttrDeclines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, served := c.CountQuery(q); served {
-		t.Errorf("served a presence query on an attribute with no schema field (returned %d)", got)
+	// The bitmap path has no bit for an attribute the schema does not carry, so it must decline.
+	if _, served := c.PresenceCountQuery(q); served {
+		t.Error("the escape-bitmap path served a presence query on an attribute with no schema field")
+	}
+	// The columnar evaluator can answer it (an un-interned name is undefined in every record), so
+	// CountQuery may serve it -- correctly.
+	if got, served := c.CountQuery(q); served && got != rowTruth(t, c, "NotAnAttribute is undefined") {
+		t.Errorf("CountQuery answered %d, row path says %d",
+			got, rowTruth(t, c, "NotAnAttribute is undefined"))
 	}
 }
