@@ -2,8 +2,10 @@ package collections
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
@@ -151,4 +153,71 @@ func TestBuildColumnarFromSegmentRowGroups(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestColGroupsAlignedToEight checks the byte-driven sealing policy produces row groups whose row counts
+// are multiples of colGroupAlign, so a column kernel can run whole vectors and handle a tail once per
+// segment rather than once per block.
+//
+// A segment's FINAL group is exempt and must be: it holds whatever records remain.
+func TestColGroupsAlignedToEight(t *testing.T) {
+	// Ads fat enough that the BYTE rule binds, which is the rule alignment applies to. If the row cap
+	// bound instead, every block would be colGroupMaxRows and the test would pass without testing
+	// anything.
+	c := New(Options{Shards: 1, SegmentSize: 1 << 22})
+	defer c.Close()
+	pad := strings.Repeat("x", 4096)
+	for i := 0; i < 4000; i++ {
+		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nRequestMemory = %d\nOwner = \"user%d\"\nBlob = \"%s\"",
+			i, i%10, 1024+(i%32)*512, i%512, pad)
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(t, src)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, e := range []string{"ProcId >= 0", "RequestMemory >= 0"} {
+		q, err := vm.Parse(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 20; i++ {
+			for range c.Query(q) {
+			}
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(4000, 8) {
+		t.Fatal("no sealed segments")
+	}
+	st := c.schemaScan.Load()
+	if st == nil {
+		t.Fatal("no schema scan state")
+	}
+	checked, multi := 0, 0
+	for _, sh := range c.shards {
+		_, wins := sh.snapshot()
+		for _, w := range wins {
+			seg := w.seg.colblk.Load()
+			if seg == nil || len(seg.blocks) == 0 {
+				continue
+			}
+			if len(seg.blocks) > 1 {
+				multi++
+			}
+			for i, blk := range seg.blocks {
+				if i == len(seg.blocks)-1 {
+					continue // the short final group
+				}
+				checked++
+				if blk.n%colGroupAlign != 0 {
+					t.Errorf("block %d of %d holds %d rows, not a multiple of %d",
+						i, len(seg.blocks), blk.n, colGroupAlign)
+				}
+			}
+		}
+		releaseWindows(wins)
+	}
+	if multi == 0 || checked == 0 {
+		t.Fatalf("no segment held more than one row group (%d multi-block segments, %d non-final blocks); "+
+			"the fixture never exercised the byte rule, so alignment was not tested", multi, checked)
+	}
+	t.Logf("%d non-final row groups across %d multi-block segments, all %d-aligned", checked, multi, colGroupAlign)
 }

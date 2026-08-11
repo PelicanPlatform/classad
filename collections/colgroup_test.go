@@ -3,6 +3,8 @@ package collections
 import (
 	"fmt"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 // Row groups (see colGroupRows): a segment's columnar accelerator is a SERIES of blocks, not one
@@ -376,4 +378,107 @@ func TestColSegmentRejectsGroupOffsMismatch(t *testing.T) {
 		t.Error("a blob whose block counts do not sum to its offs length was accepted; a scan " +
 			"would read the wrong record's MVCC header")
 	}
+}
+
+// TestRowGroupsNoRunts covers the pathological mix the aligned-prefix back-off invites: several small
+// records followed by one enormous one, so the byte budget trips a record or two past an alignment
+// boundary and the prefix holds almost nothing.
+//
+// Sealing that prefix would emit a runt block while the ad that actually filled the budget carries into
+// the next group. Below the floor the back-off is skipped, so blocks stay reasonably sized even where
+// that costs alignment.
+func TestRowGroupsNoRunts(t *testing.T) {
+	c := New(Options{Shards: 1, SegmentSize: 1 << 23})
+	defer c.Close()
+	// Incompressible, deterministically. The block's size is only observable through its compressed
+	// regions, so a repetitive blob would shrink to a few hundred bytes and every block would look like a
+	// runt whether or not it was one -- measuring the codec instead of the grouping.
+	small := incompressible(64, 1)
+	huge := incompressible(colGroupTargetBytes+128*1024, 2) // crosses the byte budget on its own
+	n := 0
+	for round := 0; round < 16; round++ {
+		// Exactly colGroupAlign small ads -- so the last alignment boundary holds almost nothing -- then
+		// one ad that crosses the whole budget by itself. That is the shape that makes the aligned-prefix
+		// back-off emit a runt, and the only shape that exercises the floor.
+		for i := 0; i < colGroupAlign; i++ {
+			src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nBlob = \"%s\"", n, n%10, small)
+			if err := c.Put([]byte(fmt.Sprintf("k%d", n)), mustAdOld(t, src)); err != nil {
+				t.Fatal(err)
+			}
+			n++
+		}
+		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nBlob = \"%s\"", n, n%10, huge)
+		if err := c.Put([]byte(fmt.Sprintf("k%d", n)), mustAdOld(t, src)); err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+	for _, e := range []string{"ProcId >= 0", "ClusterId >= 0"} {
+		q, err := vm.Parse(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 20; i++ {
+			for range c.Query(q) {
+			}
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(4000, 8) {
+		t.Fatal("no sealed segments; the fixture did not seal, so nothing was tested")
+	}
+	floor := colGroupTargetBytes / 2
+	blocks, runts := 0, 0
+	for _, sh := range c.shards {
+		_, wins := sh.snapshot()
+		for _, w := range wins {
+			seg := w.seg.colblk.Load()
+			if seg == nil {
+				continue
+			}
+			for i, blk := range seg.blocks {
+				if i == len(seg.blocks)-1 || blk.n == 0 {
+					continue // the short final group is exempt by construction
+				}
+				blocks++
+				// A non-final block should either be alignment-driven and substantial, or contain one of
+				// the enormous records. Either way it must not be a runt.
+				bytes := blk.n * blk.hotStride
+				if r, ok := blockRegionBytes(blk); ok {
+					bytes += r
+				}
+				if bytes < floor/8 {
+					runts++
+					t.Errorf("non-final block %d/%d holds %d records / ~%d B, far below the %d B floor",
+						i, len(seg.blocks), blk.n, bytes, floor)
+				}
+			}
+		}
+		releaseWindows(wins)
+	}
+	if blocks == 0 {
+		t.Fatal("no segment held more than one row group, so the aligned-prefix back-off never ran " +
+			"and this test asserted nothing")
+	}
+	t.Logf("%d non-final blocks, %d runts", blocks, runts)
+}
+
+// blockRegionBytes reports a block's compressed region bytes, as a stand-in for its record content size.
+// Only meaningful for incompressible content; see incompressible.
+func blockRegionBytes(b *columnarBlock) (int, bool) {
+	return len(b.coldNumComp) + len(b.strComp) + len(b.coldComp), true
+}
+
+// incompressible builds a deterministic n-byte string a compressor cannot shrink, from a simple LCG so
+// no test depends on a seeded RNG or on Math.random.
+func incompressible(n int, seed uint32) string {
+	const alpha = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, n)
+	x := seed*2654435761 + 1
+	for i := range b {
+		x = x*1664525 + 1013904223
+		// Alphanumeric only: a quote or a backslash would have to be escaped, and the point is the
+		// bytes' entropy, which 62 symbols carry plenty of for a compressor to make no progress.
+		b[i] = alpha[(x>>16)%uint32(len(alpha))]
+	}
+	return string(b)
 }
