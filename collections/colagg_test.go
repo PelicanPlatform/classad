@@ -172,13 +172,40 @@ func TestNumStatsDeclines(t *testing.T) {
 	c := aggStore(t, 2000)
 	defer c.Close()
 
-	// A predicate on a DIFFERENT field than the aggregate: out of scope for a single-column pass.
+	// A predicate on a DIFFERENT field than the aggregate is now SERVED (see
+	// schemaScanStatsMulti): the predicate columns narrow the candidates and the aggregated column
+	// is read for the survivors. It was declined when the pass could read only one column, which was
+	// a limit of the implementation rather than a property of the question -- so the check is now
+	// that it answers, and answers correctly.
 	q, err := vm.Parse("Cpus > 2")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := c.NumStatsQuery(q, "Memory"); ok {
-		t.Error("aggregating Memory under a predicate on Cpus must decline, not answer")
+	got, ok := c.NumStatsQuery(q, "Memory")
+	if !ok {
+		t.Error("aggregating Memory under a predicate on Cpus should be served")
+	} else {
+		var want NumStats
+		want.Min, want.Max = math.Inf(1), math.Inf(-1)
+		for ad := range c.Query(q) {
+			v := ad.EvaluateAttr("Memory")
+			iv, err := v.IntValue()
+			if err != nil {
+				continue
+			}
+			want.N++
+			want.IntSum += iv
+			if f := float64(iv); f < want.Min {
+				want.Min = f
+			}
+			if f := float64(iv); f > want.Max {
+				want.Max = f
+			}
+		}
+		if got.N != want.N || got.IntSum != want.IntSum || got.Max != want.Max {
+			t.Errorf("cross-column aggregate = (n %d, sum %d, max %v), want (n %d, sum %d, max %v)",
+				got.N, got.IntSum, got.Max, want.N, want.IntSum, want.Max)
+		}
 	}
 	// A non-numeric attribute.
 	if _, ok := c.NumStatsQuery(nil, "Owner"); ok {

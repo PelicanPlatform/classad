@@ -65,13 +65,16 @@ func (c *Collection) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 	if !ok || !numericKind(st.schema.fields[idx].kind) {
 		return NumStats{}, false
 	}
-	var keep func(float64) bool
+	// The predicate may constrain ANY numeric fields, not just the aggregated one. Requiring it to
+	// constrain the aggregated attribute meant `max(ProcId) where JobStatus == 4` -- the shape a
+	// dashboard asks -- fell to a record scan while `max(ProcId) where ProcId >= 5` did not.
+	var preds []fieldPred
 	if q != nil {
-		predID, pred, ok := c.numPredOnField(q, st.schema)
-		if !ok || predID != id {
-			return NumStats{}, false // no predicate shape, or it constrains a different field
+		var ok bool
+		preds, ok = c.numPredsOnFields(q, st.schema)
+		if !ok {
+			return NumStats{}, false // not a conjunction of scalar comparisons on numeric fields
 		}
-		keep = pred
 	}
 	// Record the read so the hot tier learns about it. The tier holds the top-N numeric fields by
 	// query read demand, uncompressed; a cold field's column group has to be decompressed. But the
@@ -79,35 +82,16 @@ func (c *Collection) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 	// filtered on through a path that does record -- could not earn a slot, and serving the query
 	// faster made it invisible to the mechanism meant to make it faster still. The feedback loop
 	// was open.
-	c.demand.recordReads([]string{attr})
-
-	out := NumStats{Min: math.Inf(1), Max: math.Inf(-1)}
-	c.scanNumValues(id, st.cache, func(nv colVal) {
-		if keep != nil && !keep(nv.f) {
-			return
+	reads := make([]string, 0, len(preds)+1)
+	reads = append(reads, attr)
+	for _, p := range preds {
+		if name, ok := c.schemaFieldName(p.fieldID); ok && name != attr {
+			reads = append(reads, name)
 		}
-		out.N++
-		out.Sum += nv.f
-		switch nv.kind {
-		case akInt:
-			out.IntSum += nv.i
-		case akReal:
-			out.AnyReal = true
-		case akBool:
-			out.IntSum += nv.i
-			out.AnyBool = true
-		}
-		if nv.f < out.Min {
-			out.Min = nv.f
-		}
-		if nv.f > out.Max {
-			out.Max = nv.f
-		}
-	})
-	if out.N == 0 {
-		out.Min, out.Max = 0, 0
 	}
-	return out, true
+	c.demand.recordReads(reads)
+
+	return c.schemaScanStatsMulti(id, preds, st.cache), true
 }
 
 // numericKind reports whether a schema field's kind is one the numeric column scan can read.
