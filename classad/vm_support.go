@@ -145,3 +145,12 @@ func FoldConstants(e ast.Expr) ast.Expr {
 func RecoverCyclic(result *Value) {
 	recoverCyclic(result)
 }
+
+// CompareStringsFold compares two strings the way every ClassAd string comparison operator does:
+// case-insensitively. All six of <, <=, >, >=, == and != route through it, while the identity
+// operators =?= and =!= deliberately do not -- they are case SENSITIVE.
+//
+// Exported for the vectorized executor, which compares a whole column at a time and so cannot afford
+// to box each element and re-dispatch on the operator, but must still produce exactly what the
+// tree-walking evaluator produces. Sharing the function is what makes that a fact rather than a hope.
+func CompareStringsFold(a, b string) int { return compareStringsFold(a, b) }
