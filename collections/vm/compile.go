@@ -109,7 +109,7 @@ func (c *compiler) addOp(op string) int32 {
 }
 
 func (c *compiler) addRef(name string, scope ast.AttributeScope) int32 {
-	c.p.refs = append(c.p.refs, refInfo{name: name, scope: scope})
+	c.p.refs = append(c.p.refs, refInfo{name: name, scope: scope, node: ast.NewAttributeReference(name, scope)})
 	return int32(len(c.p.refs) - 1)
 }
 

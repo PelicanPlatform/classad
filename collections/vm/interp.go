@@ -47,7 +47,7 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value) (classad.Val
 			ip++
 		case OpLoadRef:
 			r := p.refs[in.A]
-			stack = append(stack, ev.ResolveRef(r.name, r.scope))
+			stack = append(stack, ev.ResolveRefNode(r.node))
 			ip++
 		case OpBinop:
 			n := len(stack)

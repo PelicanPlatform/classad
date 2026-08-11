@@ -35,6 +35,21 @@ func (e *Evaluator) ResolveRef(name string, scope ast.AttributeScope) Value {
 	return e.evaluateAttributeReference(ast.NewAttributeReference(name, scope))
 }
 
+// ResolveRefNode is ResolveRef for a reference node the caller already has, so a compiled program
+// can hold one per reference instead of building a fresh node per evaluation.
+//
+// NewAttributeReference heap-allocates and calls strings.ToLower, and ResolveRef does both on EVERY
+// resolution -- once per reference per record during a scan. That defeats the precomputed-fold
+// optimization resolveAttributeReference documents (the folded name is meant to be computed at parse
+// time), and for a custom resolver the fold is pure waste, since the resolver is handed the
+// original-cased name and never sees the folded one.
+//
+// ref must not be mutated by the caller after this returns; evaluation treats it as read-only, which
+// is what lets one node be shared by every evaluation of a program, including concurrent ones.
+func (e *Evaluator) ResolveRefNode(ref *ast.AttributeReference) Value {
+	return e.evaluateAttributeReference(ref)
+}
+
 // SetScope rebinds the evaluator to a new scope ClassAd and resets its recursion
 // depth, so one Evaluator can be reused across many evaluations (e.g. a bytecode
 // Matcher scanning a collection) instead of allocating a fresh one per ad.
