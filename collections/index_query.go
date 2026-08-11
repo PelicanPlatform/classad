@@ -1475,3 +1475,7 @@ func (c *Collection) backfillWindow(sh *shard) map[*segment]bool {
 	}
 	return window
 }
+
+// recordCount is the number of records this segment's index covers. The all-records bitmap is
+// already materialized for this tier, so it is a cardinality read.
+func (si *segIndex) recordCount() uint64 { return si.all.GetCardinality() }

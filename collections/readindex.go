@@ -42,6 +42,11 @@ type indexPrimitives interface {
 	probeOffsets(up usableProbe) *roaring.Bitmap
 	// coversProbe reports whether this segment indexes the probe's attribute.
 	coversProbe(up usableProbe) bool
+	// recordCount is how many records this segment's index covers -- the size of the set an
+	// `absent` probe subtracts from. Called ONLY for present/absent estimates: on the mmap
+	// tier it reads the all-records bitmap, which the planner otherwise deliberately avoids
+	// paging in, and which an absent probe's execution clones anyway.
+	recordCount() uint64
 	// bloomAbsent reports whether a categorical ==/in probe's values are ALL provably absent
 	// (via the per-segment bloom). false when undeterminable: no bloom, a value might be
 	// present, or the probe is not a categorical equality. The tiers differ only here (the
@@ -202,10 +207,17 @@ func indexSkipsPrefix(ix indexPrimitives, usable []usableProbe) bool {
 // indexEstCandidates estimates how many records a probe admits, for ordering only (never
 // correctness). estCandidatesFromStats holds the logic so it is testable on a bare segStats.
 func indexEstCandidates(ix indexPrimitives, up usableProbe) float64 {
-	return estCandidatesFromStats(ix.statsFor(up), up)
+	var total float64
+	// Only the presence probes need the segment's record count, and only they pay for it.
+	if up.op == "present" || up.op == "absent" {
+		total = float64(ix.recordCount())
+	}
+	return estCandidatesFromStats(ix.statsFor(up), total, up)
 }
 
-func estCandidatesFromStats(s *segStats, up usableProbe) float64 {
+// estCandidatesFromStats estimates the candidates one probe admits. total is the segment's
+// covered record count, needed only by the presence probes (0 otherwise).
+func estCandidatesFromStats(s *segStats, total float64, up usableProbe) float64 {
 	if s == nil {
 		return math.MaxFloat64 // unknown: apply last
 	}
@@ -233,6 +245,25 @@ func estCandidatesFromStats(s *segStats, up usableProbe) float64 {
 			return indexable - s.estEqualStr(strings.ToLower(up.svals[0])) + float64(s.exc)
 		}
 		return indexable
+	case "present":
+		// Executes as posted|exc, so every record carrying the attribute in any form is a
+		// candidate -- that is exactly `covered`.
+		return float64(s.covered)
+	case "absent":
+		// Executes as all AND NOT posted: the records with no indexed value, which includes
+		// the exceptional ones (present but not the indexed literal type) because those are
+		// re-verified rather than trusted.
+		//
+		// Without this case both presence probes fell through to the default below and were
+		// estimated at `indexable` -- so `attr is undefined` was estimated at the count of
+		// records that HAVE the attribute, and the two complementary probes scored
+		// identically instead of summing to the segment. On a table where every ad carries
+		// the attribute that is the difference between "matches nothing" and "matches
+		// everything", which is the whole of what selectivity decides.
+		if e := total - indexable; e > 0 {
+			return e
+		}
+		return 0
 	case "<", "<=", ">", ">=":
 		frac := s.estRange(up.op, up.fvals[0])
 		if up.twoSided() {

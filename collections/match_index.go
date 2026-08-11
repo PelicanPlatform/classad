@@ -176,7 +176,7 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 				ex.IndexUsable++
 				if cand, covered := c.estimateCandidates(up); covered {
 					pe.HasSelectivity = true
-					pe.EstCandidates = int64(cand + 0.5)
+					pe.EstCandidates = clampEst(cand, total)
 					if total > 0 {
 						pe.Selectivity = math.Min(1, cand/float64(total))
 					}
@@ -258,7 +258,7 @@ func (c *Collection) meldTargetConstraint(ex *MatchExplain, targetConstraint str
 			ex.IndexUsable++
 			if cand, covered := c.estimateCandidates(up); covered {
 				pe.HasSelectivity = true
-				pe.EstCandidates = int64(cand + 0.5)
+				pe.EstCandidates = clampEst(cand, total)
 				if total > 0 {
 					pe.Selectivity = math.Min(1, cand/float64(total))
 				}
@@ -953,4 +953,20 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 func overSelectivityGate(c *Collection, groups [][]usableProbe) bool {
 	frac, ok := c.planFrac(groups)
 	return ok && frac > maxPushdownFrac
+}
+
+// clampEst caps a reported candidate estimate at the collection's live count.
+//
+// The estimate is summed over segment indexes, which cover every record the index visits --
+// including versions later superseded and not yet compacted away. That is the right quantity
+// for ORDERING probes, since the index really does visit them, but it is not a number of ads:
+// on a table with churn it exceeds the live count, and reporting "~157455 of 135814" reads as
+// impossible rather than as "expect no pruning". Selectivity is already clamped the same way,
+// so this only stops the two halves of one line disagreeing.
+func clampEst(cand float64, total int) int64 {
+	n := int64(cand + 0.5)
+	if total > 0 && n > int64(total) {
+		return int64(total)
+	}
+	return n
 }
