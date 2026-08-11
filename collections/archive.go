@@ -220,6 +220,17 @@ func (a *Archive) Rotate(now float64) (int, error) { return a.c.Rotate(now) }
 // whole-segment steps.
 func (a *Archive) Count() int { return a.c.Len() }
 
+// CountConstraint counts the records matching constraint via the columnar accelerator, returning
+// ok=false when the columnar path cannot serve it (see Collection.CountConstraint) so the caller
+// scans instead.
+//
+// An archive is the big append-only scan target, and it is exactly where this was missing: a mutable
+// table's COUNT(*) WHERE reaches the columnar count through DB.CountConstraint, while an archive's
+// went to a wire-native scan of every record, even with an accelerator built over its segments.
+func (a *Archive) CountConstraint(constraint string) (int, bool) {
+	return a.c.CountConstraint(constraint)
+}
+
 // Truncate drops every record, resetting the archive to empty in place: all segments are
 // unmapped and their data + sidecar-index files unlinked (via the backing Collection's
 // Truncate). Segment counters keep advancing, so a fresh Append starts a new segment. This

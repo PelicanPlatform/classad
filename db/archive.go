@@ -240,6 +240,18 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 	if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
 		return rows, nil
 	}
+	// A CONSTRAINED COUNT(*) with no grouping: read the predicated columns out of the columnar
+	// blocks instead of scanning records. aggregateFromIndex above only answers the UNCONSTRAINED
+	// case (a constraint cannot be attributed to a whole segment's stored count), and
+	// ColumnarAggregate below declines a COUNT(*) because it has no attribute to aggregate -- so
+	// this shape reached neither, and fell to the scan even on an archive that carries an
+	// accelerator. It is the shape a history table is asked most.
+	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
+		aggs[0].Filter == "" {
+		if n, ok := t.a.CountConstraint(constraint); ok {
+			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, nil
+		}
+	}
 	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
 	// per-segment columnar blocks instead of decoding every record. Declines (and falls through
 	// to the scan) unless the archive carries an accelerator and the aggregate is in scope.
@@ -573,6 +585,12 @@ func (t *ArchiveTable) Stats() Stats { return t.a.Stats() }
 // OpStats reports cumulative operational timings. An archive has no DB-level snapshot lock,
 // so SnapshotLock is zero.
 func (t *ArchiveTable) OpStats() OpStats { return OpStats{OpStats: t.a.OpStats()} }
+
+// CountConstraint counts the rows matching constraint via the columnar accelerator, or reports
+// ok=false so the caller scans. See collections.Archive.CountConstraint.
+func (t *ArchiveTable) CountConstraint(constraint string) (int, bool) {
+	return t.a.CountConstraint(constraint)
+}
 
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).
 func (t *ArchiveTable) CodecStats(sampleMax int) CodecStats { return t.a.CodecStats(sampleMax) }
