@@ -188,6 +188,11 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 			dst = appendU32(dst, uint32(info.codeWidth))
 			dst = appendU32(dst, uint32(info.dictStart))
 			dst = appendU32(dst, uint32(info.count))
+			ne := uint32(0)
+			if info.noEscape {
+				ne = 1
+			}
+			dst = appendU32(dst, ne)
 		}
 	}
 	dst = appendU32(dst, uint32(len(cs.offs)))
@@ -275,6 +280,7 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 					dictStart: int(c.u32()),
 					count:     int(c.u32()),
 				}
+				info.noEscape = c.u32() != 0
 				if idx < 0 || idx >= len(s.fields) || (info.codeWidth != 1 && info.codeWidth != 2) {
 					return nil
 				}

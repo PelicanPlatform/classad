@@ -222,3 +222,48 @@ func BenchmarkStrDict(b *testing.B) {
 		})
 	}
 }
+
+// TestStrDictPrunes checks the dictionary prunes blocks, and prunes the RIGHT ones.
+//
+// The counts are the real assertion: pruning that dropped a matching block would show up as a count below
+// the row path's. The split is the second assertion, because a prune that never fires is invisible -- the
+// answer stays right and the query stays slow.
+func TestStrDictPrunes(t *testing.T) {
+	c := strDictFixture(t, 20000, 200)
+	defer c.Close()
+	for _, tc := range []struct {
+		expr        string
+		wantPruning bool
+	}{
+		// user0..user7 exist; each block holds a few clusters, so most blocks lack any given owner.
+		{`Owner == "user3"`, true},
+		{`Owner == "nobody"`, true},                    // in no block at all
+		{`Owner =?= "user3"`, true},                    // identity: exact match within the fold range
+		{`Owner == "user3" || Owner == "user5"`, true}, // folded to an "in" probe
+		{`Owner != "user3"`, false},                    // a missing literal makes every record MATCH, so never prune
+		{`Owner > "user3"`, false},                     // ordering: the range could serve it, but it is not wired
+		{`RequestMemory > 4096`, false},                // no string probe at all
+	} {
+		q, err := vm.Parse(tc.expr)
+		if err != nil {
+			t.Fatalf("parse %q: %v", tc.expr, err)
+		}
+		got, ok := c.VectorEvalCount(q)
+		if !ok {
+			t.Fatalf("%q: declined", tc.expr)
+		}
+		if want := rowCount(t, c, tc.expr); got != want {
+			t.Errorf("%q: %d != row path %d -- pruning dropped matching records", tc.expr, got, want)
+		}
+		split := lastVecSplit.Load()
+		pruned := split.prunedBlocks > 0
+		t.Logf("%-40s count=%-6d pruned=%d vectorized=%d", tc.expr, got, split.prunedBlocks, split.vecBlocks)
+		if tc.wantPruning && !pruned {
+			t.Errorf("%q: expected some block to be pruned by the dictionary", tc.expr)
+		}
+		if !tc.wantPruning && pruned && tc.expr == `Owner != "user3"` {
+			t.Errorf("%q: pruned a block, but a literal absent from a block makes every record there match",
+				tc.expr)
+		}
+	}
+}

@@ -2,6 +2,7 @@ package collections
 
 import (
 	"encoding/binary"
+	"sort"
 	"unsafe"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -63,6 +64,15 @@ type strDictField struct {
 	codeWidth int // 1 or 2
 	dictStart int // byte offset of this field's entries in the decompressed dictionary region
 	count     int // number of entries
+
+	// noEscape is true when EVERY record in the block has a stored value for this field, so the dictionary
+	// is the complete set of values present. Only then can a block be pruned for a literal the dictionary
+	// lacks: an escaped record's value lives in the cold tail, where the dictionary cannot see it, and
+	// pruning on an incomplete dictionary would drop real matches.
+	//
+	// The numeric zones carry the same flag for the same reason, but escapeFree reads zones and zones are
+	// built for numeric fields only, so a string field needs its own.
+	noEscape bool
 }
 
 // buildStrDicts decides which string fields of this block to dictionary-encode and builds them.
@@ -119,6 +129,13 @@ func buildStrDicts(s *adSchema, recs [][]byte, n int) (map[int]strDictField, []b
 			codeWidth: 1,
 			dictStart: len(dictRaw),
 			count:     len(uniq),
+			noEscape:  true,
+		}
+		for k := 0; k < n; k++ {
+			if !present[i][k] {
+				info.noEscape = false
+				break
+			}
 		}
 		if len(uniq) > 1<<8 {
 			info.codeWidth = 2
@@ -263,4 +280,80 @@ func dictCodeAt(codes []byte, width, k int) int {
 		return int(codes[k])
 	}
 	return int(codes[2*k]) | int(codes[2*k+1])<<8
+}
+
+// dictRange finds the codes whose entries compare fold-EQUAL to lit, as the half-open range [lo, hi).
+//
+// The range exists because dictLess sorts fold-first with an exact-byte tiebreak, so entries that fold
+// equal are contiguous. Two binary searches find it in O(log cardinality) fold comparisons, against O(n)
+// for comparing every record's string -- and the result is a RANGE rather than a set, which is what makes
+// every comparison operator an integer test on the code:
+//
+//	== lit   lo <= c < hi        < lit   c < lo         > lit   c >= hi
+//	!= lit   !(lo <= c < hi)     <= lit  c < hi         >= lit  c >= lo
+//
+// A hash of the folded value would also turn the probe into integer work, but it would give set membership
+// instead of a range, would need a collision check behind every hit, and would still cost O(cardinality) --
+// the sorted order gives strictly more for less. lo == hi means no entry matches at all.
+func (b *columnarBlock) dictRange(fieldIdx int, lit string, bc *blockCache, buf *[][]byte) (lo, hi int, ok bool) {
+	entries, ok := b.dictEntries(fieldIdx, bc, buf)
+	if !ok {
+		return 0, 0, false
+	}
+	// lo: the first entry that is not fold-less than lit. hi: the first that is fold-greater.
+	lo = sort.Search(len(entries), func(j int) bool {
+		return classad.CompareStringsFold(bytesToStr(entries[j]), lit) >= 0
+	})
+	hi = lo + sort.Search(len(entries)-lo, func(j int) bool {
+		return classad.CompareStringsFold(bytesToStr(entries[lo+j]), lit) > 0
+	})
+	return lo, hi, true
+}
+
+// dictPrunes reports whether this block can be ruled out by any of the string-equality conjuncts: one whose
+// field has a complete dictionary containing NONE of the values a match would require.
+//
+// Completeness is what noEscape records, and it is the whole soundness condition: an escaped record's value
+// lives in the cold tail where the dictionary cannot see it, so pruning on a partial dictionary would drop
+// real matches.
+func (b *columnarBlock) dictPrunes(probes []strEqProbe, bc *blockCache, buf *[][]byte) bool {
+	for _, p := range probes {
+		info, ok := b.strDict[p.fieldIdx]
+		if !ok || !info.noEscape {
+			continue
+		}
+		entries, ok := b.dictEntries(p.fieldIdx, bc, buf)
+		if !ok {
+			continue
+		}
+		any := false
+		for _, lit := range p.lits {
+			lo, hi, ok := b.dictRange(p.fieldIdx, lit, bc, buf)
+			if !ok {
+				any = true // cannot tell: do not prune on this probe
+				break
+			}
+			if lo == hi {
+				continue // no entry folds equal to this value
+			}
+			if !p.exact {
+				any = true
+				break
+			}
+			// =?= is byte-exact, and fold-equal entries are contiguous, so only the fold range can hold it.
+			for j := lo; j < hi && j < len(entries); j++ {
+				if bytesToStr(entries[j]) == lit {
+					any = true
+					break
+				}
+			}
+			if any {
+				break
+			}
+		}
+		if !any {
+			return true
+		}
+	}
+	return false
 }

@@ -252,15 +252,83 @@ type prunePlan struct {
 	schema *adSchema
 	idxs   []int
 	preds  []fieldPred
+	strEq  []strEqProbe
 	valid  bool
 }
 
+// strEqProbe is an equality conjunct on a STRING field, resolved against a schema: the values any matching
+// record must hold for that field. A block whose dictionary contains none of them cannot match.
+//
+// Op "in" is included because Probes folds an OR-of-equalities on ONE attribute into it, so
+// `Owner == "a" || Owner == "b"` still prunes -- only when neither value is present. Op "!=" is
+// deliberately NOT here: a literal being absent from a block makes every record in it MATCH a !=, not fail
+// it. Nor are the ordering operators, which the range could serve but which prune far less often.
+type strEqProbe struct {
+	fieldIdx int
+	lits     []string
+	exact    bool // =?= : identity, so the match must be byte-exact rather than fold-equal
+}
+
 func (p *prunePlan) tests(c *Collection, q *vm.Query, s *adSchema) ([]int, []fieldPred) {
-	if !p.valid || s != p.schema {
-		p.idxs, p.preds = c.zonePrunableTests(q, s)
-		p.schema, p.valid = s, true
-	}
+	p.resolve(c, q, s)
 	return p.idxs, p.preds
+}
+
+// stringEq returns the string-equality conjuncts, resolved against s.
+func (p *prunePlan) stringEq(c *Collection, q *vm.Query, s *adSchema) []strEqProbe {
+	p.resolve(c, q, s)
+	return p.strEq
+}
+
+func (p *prunePlan) resolve(c *Collection, q *vm.Query, s *adSchema) {
+	if p.valid && s == p.schema {
+		return
+	}
+	p.idxs, p.preds = c.zonePrunableTests(q, s)
+	p.strEq = c.strEqProbes(q, s)
+	p.schema, p.valid = s, true
+}
+
+// strEqProbes extracts the equality conjuncts on string fields of this schema.
+//
+// Probes returns index-satisfiable CONJUNCTS -- it flattens the top-level && spine and omits anything that
+// is not a recognizable `Attr OP literal` -- so every probe here is a necessary condition and ruling a block
+// out on one is sound. A bare disjunction yields no probes at all, which is why this cannot wrongly prune
+// `Owner == "a" || RequestMemory > 8192`.
+func (c *Collection) strEqProbes(q *vm.Query, s *adSchema) []strEqProbe {
+	var out []strEqProbe
+	for _, p := range q.Probes() {
+		exact := false
+		switch p.Op {
+		case "==", "in":
+		case "is":
+			exact = true
+		default:
+			continue
+		}
+		id, ok := c.intern.LookupID(p.Attr)
+		if !ok {
+			continue
+		}
+		idx, ok := s.byID[id]
+		if !ok || s.fields[idx].kind != akString {
+			continue
+		}
+		lits := make([]string, 0, len(p.Vals))
+		for _, v := range p.Vals {
+			str, err := v.StringValue()
+			if err != nil {
+				lits = nil
+				break // a non-string operand: not something a string dictionary can rule out
+			}
+			lits = append(lits, str)
+		}
+		if len(lits) == 0 {
+			continue
+		}
+		out = append(out, strEqProbe{fieldIdx: idx, lits: lits, exact: exact})
+	}
+	return out
 }
 
 // zonePrunableTests extracts the query's probes that a block zone can reason about: scalar numeric

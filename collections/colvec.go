@@ -316,9 +316,17 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 				continue
 			}
 			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
+			strEq := plan.stringEq(c, q, seg.schema())
 			base := 0
 			for _, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {
+					split.prunedBlocks++
+					base += blk.n
+					continue
+				}
+				// The string analogue of a zone: a value no dictionary entry folds equal to cannot be in
+				// this block, so skip it without reading a single code.
+				if len(strEq) > 0 && blk.dictPrunes(strEq, st.cache, &src.dictBuf) {
 					split.prunedBlocks++
 					base += blk.n
 					continue
