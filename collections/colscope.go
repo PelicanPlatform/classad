@@ -328,34 +328,44 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 					continue
 				}
 				cs.setBlock(blk)
-				for k := 0; k < blk.n; k++ {
-					gk := base + k
-					if gk >= len(seg.offs) {
-						break
-					}
-					o := seg.offs[gk]
-					if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
-						continue
-					}
-					cs.k, cs.fellBack = k, false
-					v := m.EvalResolved(resolver)
-					if cs.fellBack {
-						// One record needs the ordinary evaluator; the rest of the scan is unaffected.
-						if c.evalOneRecord(w, o, fallbackM) {
-							count++
-						}
-						continue
-					}
-					if isTrueValue(v) {
-						count++
-					}
-				}
+				count += c.countBlockScoped(cs, resolver, m, fallbackM, w, seg, blk, base, s0)
 				base += blk.n
 			}
 		}
 		releaseWindows(wins)
 	}
 	return count, true
+}
+
+// countBlockScoped counts one block's visible matching records with the per-record resolver. Extracted
+// so the vectorized scan can fall back to it for a single block it cannot serve, rather than abandoning
+// the whole query.
+func (c *Collection) countBlockScoped(cs *colScope, resolver func(name string, scope ast.AttributeScope) classad.Value,
+	m, fallbackM *vm.Matcher, w segWindow, seg *colSegment, blk *columnarBlock, base int, s0 uint64) int {
+	count := 0
+	for k := 0; k < blk.n; k++ {
+		gk := base + k
+		if gk >= len(seg.offs) {
+			break
+		}
+		o := seg.offs[gk]
+		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+			continue
+		}
+		cs.k, cs.fellBack = k, false
+		v := m.EvalResolved(resolver)
+		if cs.fellBack {
+			// One record needs the ordinary evaluator; the rest of the scan is unaffected.
+			if c.evalOneRecord(w, o, fallbackM) {
+				count++
+			}
+			continue
+		}
+		if isTrueValue(v) {
+			count++
+		}
+	}
+	return count
 }
 
 // evalOneRecord decodes a single arena record and evaluates the query against it the ordinary way.
