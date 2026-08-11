@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"hash/crc32"
 	"math"
+	"sort"
 )
 
 // Serialization of a sealed segment's columnar accelerator (schema + block streams + the
@@ -34,7 +35,17 @@ const (
 	// block pruning until something rebuilt its blocks. A missing zone is SAFE (mayMatch never rules
 	// a block out without one), so this is a performance property, which is precisely the kind that
 	// disappears quietly.
-	colSectionVersion = 4
+	//
+	// v5 is one layout bump carrying two changes, because a sidecar bump forces every deployed table to
+	// rebuild its accelerator and doing that twice for two halves of the same idea is wasteful. First, the
+	// single uncompressed region splits in two: the per-record escape/bool bitsets, and the hot numerics
+	// COLUMNAR rather than row-major. Second, a low-cardinality string field is stored as a dictionary
+	// plus a columnar code column instead of a positional per-record region.
+	//
+	// Neither can be read as v4 and both would produce plausible values rather than an error if
+	// misinterpreted, so this must be a version bump. As with every bump here the section is derived
+	// state: an old one is rejected and the segment rebuilds under the current rules.
+	colSectionVersion = 5
 	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
 )
 
@@ -135,7 +146,8 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 	dst = appendU32(dst, uint32(len(cs.blocks)))
 	for _, b := range cs.blocks {
 		dst = appendU32(dst, uint32(b.n))
-		dst = appendBytes(dst, b.hot)
+		dst = appendBytes(dst, b.bits)
+		dst = appendBytes(dst, b.hotCol)
 		dst = appendBytes(dst, b.coldNumComp)
 		dst = appendBytes(dst, b.strComp)
 		dst = appendBytes(dst, b.coldComp)
@@ -158,6 +170,30 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 			}
 			dst = appendU32(dst, esc)
 		}
+		// String dictionaries: the two compressed regions, then where each field lives in them. Written in
+		// sorted field order so the sidecar is reproducible; a map's iteration order would make the same
+		// segment serialize to different bytes on different runs.
+		dst = appendBytes(dst, b.strDictComp)
+		dst = appendBytes(dst, b.strCodeComp)
+		dst = appendU32(dst, uint32(len(b.strDict)))
+		dictIdxs := make([]int, 0, len(b.strDict))
+		for idx := range b.strDict {
+			dictIdxs = append(dictIdxs, idx)
+		}
+		sort.Ints(dictIdxs)
+		for _, idx := range dictIdxs {
+			info := b.strDict[idx]
+			dst = appendU32(dst, uint32(idx))
+			dst = appendU32(dst, uint32(info.codeStart))
+			dst = appendU32(dst, uint32(info.codeWidth))
+			dst = appendU32(dst, uint32(info.dictStart))
+			dst = appendU32(dst, uint32(info.count))
+			ne := uint32(0)
+			if info.noEscape {
+				ne = 1
+			}
+			dst = appendU32(dst, ne)
+		}
 	}
 	dst = appendU32(dst, uint32(len(cs.offs)))
 	for _, o := range cs.offs {
@@ -169,8 +205,8 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 // unmarshalColSegment reconstructs a colSegment from marshalColSegment's output, attaching the
 // segment's codec (for later decompression). Returns nil on malformed data.
 //
-// ZERO-COPY: the block's byte streams (hot + the three compressed cold streams) ALIAS data rather
-// than being copied -- the hot column is then scanned strided directly over the mmap, and the cold
+// ZERO-COPY: the block's byte streams (the two uncompressed regions + the three compressed cold streams)
+// ALIAS data rather than being copied -- a hot column is then one contiguous span of the mmap, and the cold
 // streams decompress lazily into the bounded block cache only when touched, so a reloaded block
 // adds no per-segment stream heap. This is the same lifetime contract as the mmap'd attribute
 // index (mmapSegIndex): both alias the segment's <seg>.idx mapping, which is released together on
@@ -202,7 +238,10 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 			return nil
 		}
 		b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n}
-		b.hot = c.bytes() // aliases data (the mmap); read-only, scanned in place
+		// Both alias data (the mmap): read-only, scanned in place. The hot numerics being columnar means a
+		// whole column is one contiguous span OF THE MMAP, which is what a vector load needs.
+		b.bits = c.bytes()
+		b.hotCol = c.bytes()
 		b.coldNumComp = c.bytes()
 		b.strComp = c.bytes()
 		b.coldComp = c.bytes()
@@ -224,6 +263,28 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 					return nil
 				}
 				b.zones[idx] = z
+			}
+		}
+		b.strDictComp = c.bytes()
+		b.strCodeComp = c.bytes()
+		if nd := int(c.u32()); nd > 0 {
+			if nd > len(s.fields) || !c.need(0) {
+				return nil
+			}
+			b.strDict = make(map[int]strDictField, nd)
+			for j := 0; j < nd; j++ {
+				idx := int(c.u32())
+				info := strDictField{
+					codeStart: int(c.u32()),
+					codeWidth: int(c.u32()),
+					dictStart: int(c.u32()),
+					count:     int(c.u32()),
+				}
+				info.noEscape = c.u32() != 0
+				if idx < 0 || idx >= len(s.fields) || (info.codeWidth != 1 && info.codeWidth != 2) {
+					return nil
+				}
+				b.strDict[idx] = info
 			}
 		}
 		if c.err != nil {

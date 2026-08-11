@@ -240,7 +240,7 @@ func BenchmarkRowGroupBlockBytes(b *testing.B) {
 						continue
 					}
 					for _, blk := range cs.blocks {
-						bytes += len(blk.hot) + len(blk.coldNumComp) + len(blk.strComp) + len(blk.coldComp)
+						bytes += len(blk.bits) + len(blk.hotCol) + len(blk.coldNumComp) + len(blk.strComp) + len(blk.coldComp)
 						blocks++
 						recs += blk.n
 					}

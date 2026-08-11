@@ -3,6 +3,7 @@ package collections
 import (
 	"encoding/binary"
 	"math"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -55,7 +56,14 @@ type colScope struct {
 	bind    map[string]int
 	bindFor *adSchema
 
-	strScratch []byte // decompressed string region, cached per block by the block cache
+	strScratch []byte
+
+	// dictEnt caches parsed dictionary entries PER FIELD for the current block, dropped by setBlock.
+	//
+	// colScope evaluates per record, so parsing a dictionary inside slotString would parse it once per
+	// RECORD -- cardinality uvarint reads each time, which is worse than the positional walk it replaced.
+	// The parse belongs once per block, which is what this makes it.
+	dictEnt map[int][][]byte // decompressed string region, cached per block by the block cache
 }
 
 const (
@@ -159,9 +167,8 @@ func (cs *colScope) fromColdTail(id uint32) classad.Value {
 // slotInt reads a numeric field's raw slot value (a real's slot holds math.Float64bits).
 func (cs *colScope) slotInt(idx int, f adField) (int64, bool) {
 	b := cs.blk
-	base := cs.k * b.hotStride
-	if off, hot := b.hotFieldOff[idx]; hot {
-		return readIntLE(b.hot[base+off:], f.width, f.unsigned), true
+	if start, hot := b.hotColStart[idx]; hot {
+		return readIntLE(b.hotCol[start+cs.k*f.width:], f.width, f.unsigned), true
 	}
 	start, ok := b.coldFieldStart[idx]
 	if !ok {
@@ -178,8 +185,8 @@ func (cs *colScope) slotInt(idx int, f adField) (int64, bool) {
 // each record's hot region, so it is an uncompressed strided read like a hot numeric.
 func (cs *colScope) slotBool(f adField) bool {
 	b := cs.blk
-	base := cs.k*b.hotStride + b.schema.escBytes
-	return testBit(b.hot[base:base+b.schema.boolBytes], f.boolBit)
+	base := cs.k*b.bitsStride + b.schema.escBytes
+	return testBit(b.bits[base:base+b.schema.boolBytes], f.boolBit)
 }
 
 // slotString reads a string field from the record's string region.
@@ -195,6 +202,22 @@ func (cs *colScope) slotBool(f adField) bool {
 // A comparison never needed the copy.
 func (cs *colScope) slotString(idx int) (string, bool) {
 	b := cs.blk
+	// The dictionary is authoritative for the fields it owns, and resolving a code is O(1) against a walk.
+	if b.dictOwns(idx) {
+		entries, ok := cs.dictEntriesCached(idx)
+		if !ok {
+			return "", false
+		}
+		codes, w, ok := b.dictCodes(idx, cs.bc)
+		if !ok {
+			return "", false
+		}
+		c := dictCodeAt(codes, w, cs.k)
+		if c >= len(entries) {
+			return "", false
+		}
+		return bytesToStr(entries[c]), true
+	}
 	if cs.strScratch == nil {
 		raw, err := cs.bc.stream(b, kindStr)
 		if err != nil {
@@ -205,7 +228,9 @@ func (cs *colScope) slotString(idx int) (string, bool) {
 	region := cs.strScratch[b.strOff[cs.k]:b.strOff[cs.k+1]]
 	esc := b.escapeAt(cs.k)
 	for i := range b.schema.fields {
-		if b.schema.fields[i].kind != akString || testBit(esc, i) {
+		// A field the dictionary owns is NOT in this region; see appendNonDictStrings. Skipping it keeps the
+		// walk aligned for the fields that ARE here.
+		if b.schema.fields[i].kind != akString || testBit(esc, i) || b.dictOwns(i) {
 			continue
 		}
 		l, n := binary.Uvarint(region)
@@ -230,10 +255,134 @@ func (cs *colScope) slotString(idx int) (string, bool) {
 	return "", false
 }
 
+// dictEntriesCached parses a field's dictionary at most once per block.
+func (cs *colScope) dictEntriesCached(idx int) ([][]byte, bool) {
+	if e, ok := cs.dictEnt[idx]; ok {
+		return e, e != nil
+	}
+	var buf [][]byte
+	e, ok := cs.blk.dictEntries(idx, cs.bc, &buf)
+	if cs.dictEnt == nil {
+		cs.dictEnt = map[int][][]byte{}
+	}
+	if !ok {
+		cs.dictEnt[idx] = nil
+		return nil, false
+	}
+	cs.dictEnt[idx] = e
+	return e, true
+}
+
 // setBlock rebinds the scope to a new block, dropping per-block caches.
 func (cs *colScope) setBlock(blk *columnarBlock) {
 	cs.blk = blk
 	cs.strScratch = nil
+	// The parsed entries alias the previous block's region, so they must not survive the rebind.
+	for k := range cs.dictEnt {
+		delete(cs.dictEnt, k)
+	}
+}
+
+// prunePlan caches the zone-prunable probe analysis, which depends only on the query and the SCHEMA.
+//
+// A scan visits one window per segment -- 162 of them on a 60k-record table -- and they almost always
+// share a single schema OBJECT, so recomputing the analysis per window repeated identical work 161 times:
+// measured at 11% of a scan's time and 44% of its allocations, for an answer that never changed. Keyed on
+// pointer identity, so two equal-but-distinct schemas merely recompute rather than answer wrongly.
+// zonePruneAnalyses counts how many times the probe analysis actually ran, so a test can hold the line
+// that it runs once per query rather than once per segment. One atomic add per query is free; the
+// alternative is a regression that only shows up as a query being mysteriously slower on a table with
+// many segments, which is how this cost went unnoticed in the first place.
+var zonePruneAnalyses atomic.Int64
+
+type prunePlan struct {
+	schema *adSchema
+	idxs   []int
+	preds  []fieldPred
+	strEq  []strProbe
+	valid  bool
+}
+
+// strProbe is a comparison conjunct on a STRING field, resolved against a schema. A block whose dictionary
+// cannot contain a value satisfying it cannot match, so the block is skipped.
+//
+// Which operators are here, and why:
+//
+//	==       a matching record holds one of lits
+//	in       Probes folds an OR-of-equalities on ONE attribute into this, so `Owner == "a" || Owner == "b"`
+//	         still prunes -- only when NEITHER value is present
+//	is       =?= identity, so the match must be byte-exact rather than fold-equal
+//	< <= > >= the fold-ordered dictionary makes these code range checks, so a block prunes when the range
+//	         boundary sits at an end: nothing in the block is below (or above) the literal
+//
+// "!=" and "isnt" are deliberately absent. A literal missing from a block makes every record there MATCH an
+// inequality, not fail it, so pruning on one would zero out the answer.
+type strProbe struct {
+	fieldIdx int
+	op       string
+	lits     []string
+}
+
+func (p *prunePlan) tests(c *Collection, q *vm.Query, s *adSchema) ([]int, []fieldPred) {
+	p.resolve(c, q, s)
+	return p.idxs, p.preds
+}
+
+// stringEq returns the string comparison conjuncts, resolved against s.
+func (p *prunePlan) stringEq(c *Collection, q *vm.Query, s *adSchema) []strProbe {
+	p.resolve(c, q, s)
+	return p.strEq
+}
+
+func (p *prunePlan) resolve(c *Collection, q *vm.Query, s *adSchema) {
+	if p.valid && s == p.schema {
+		return
+	}
+	p.idxs, p.preds = c.zonePrunableTests(q, s)
+	p.strEq = c.strEqProbes(q, s)
+	p.schema, p.valid = s, true
+}
+
+// strEqProbes extracts the comparison conjuncts on string fields of this schema.
+//
+// Probes returns index-satisfiable CONJUNCTS -- it flattens the top-level && spine and omits anything that
+// is not a recognizable `Attr OP literal` -- so every probe here is a necessary condition and ruling a block
+// out on one is sound. A bare disjunction yields no probes at all, which is why this cannot wrongly prune
+// `Owner == "a" || RequestMemory > 8192`.
+func (c *Collection) strEqProbes(q *vm.Query, s *adSchema) []strProbe {
+	var out []strProbe
+	for _, p := range q.Probes() {
+		switch p.Op {
+		case "==", "in", "is", "<", "<=", ">", ">=":
+		default:
+			continue // "!=" and "isnt" can never rule a block out; see strProbe
+		}
+		id, ok := c.intern.LookupID(p.Attr)
+		if !ok {
+			continue
+		}
+		idx, ok := s.byID[id]
+		if !ok || s.fields[idx].kind != akString {
+			continue
+		}
+		lits := make([]string, 0, len(p.Vals))
+		for _, v := range p.Vals {
+			str, err := v.StringValue()
+			if err != nil {
+				lits = nil
+				break // a non-string operand: not something a string dictionary can rule out
+			}
+			lits = append(lits, str)
+		}
+		if len(lits) == 0 {
+			continue
+		}
+		if p.Op != "==" && p.Op != "in" && p.Op != "is" && len(lits) != 1 {
+			continue // an ordering probe has exactly one literal
+		}
+		out = append(out, strProbe{fieldIdx: idx, op: p.Op, lits: lits})
+	}
+	return out
 }
 
 // zonePrunableTests extracts the query's probes that a block zone can reason about: scalar numeric
@@ -244,6 +393,7 @@ func (cs *colScope) setBlock(blk *columnarBlock) {
 // correctness. That is the opposite of answering from probes, which needs them to cover the query --
 // colScope answers by evaluating the query itself, so it is exact regardless.
 func (c *Collection) zonePrunableTests(q *vm.Query, s *adSchema) ([]int, []fieldPred) {
+	zonePruneAnalyses.Add(1)
 	var idxs []int
 	var preds []fieldPred
 	for _, p := range q.Probes() {
@@ -312,6 +462,7 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 	resolver := cs.resolve // hoisted: a method value expression allocates
 	fallbackM := q.Matcher()
 	count := 0
+	var plan prunePlan
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
@@ -320,7 +471,7 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 				count += c.rowEvalWindow(w, s0, fallbackM)
 				continue
 			}
-			pruneIdxs, prunePreds := c.zonePrunableTests(q, seg.schema())
+			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
 			base := 0
 			for _, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {

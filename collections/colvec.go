@@ -1,11 +1,14 @@
 package collections
 
 import (
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // Vectorized evaluation of an arbitrary constraint over columnar blocks.
@@ -37,10 +40,12 @@ import (
 // exactly like a correct vectorized scan that is mysteriously no faster -- which is how three earlier
 // measurements in this package produced plausible and wrong conclusions.
 type vecSplit struct {
-	vecBlocks   int
-	scopeBlocks int // the executor declined: a string column, an expression in the cold tail, Elvis
-	churnBlocks int // mostly-superseded: colScope is cheaper than evaluating records nobody can see
-	rowWindows  int
+	vecBlocks    int
+	scopeBlocks  int // the executor declined: a string column, an expression in the cold tail, Elvis
+	churnBlocks  int // mostly-superseded: colScope is cheaper than evaluating records nobody can see
+	prunedBlocks int // a zone ruled the block out; no records were examined at all
+	emptyBlocks  int // nothing in the block was visible to this snapshot
+	rowWindows   int
 }
 
 // vecScratchPool reuses the vector stack across queries. Without it each call allocated its own stack
@@ -65,6 +70,18 @@ type blockVecSource struct {
 	c   *Collection
 	blk *columnarBlock
 	bc  *blockCache
+
+	// dicts holds one resolver PER FIELD, reused across blocks, each owning its own parsed entry list.
+	//
+	// One shared resolver is wrong and was: two dictionary-encoded columns in the same expression both
+	// pointed at it, so loading the second overwrote the first's entries while the first's vector still
+	// referenced them, and `Owner =?= Iwd` resolved both sides through Iwd's dictionary -- 19842 matches
+	// instead of 0. Per-field is also what keeps the parse amortized: allocating an entry list per block
+	// turned a 512-entry dictionary into ~12 KB of garbage per block.
+	dicts map[int]*blockDict
+
+	// dictBuf is the parse buffer for PRUNING, which reads a dictionary and does not retain it.
+	dictBuf [][]byte
 }
 
 // LoadColumn resolves an attribute to a field of this block's schema and loads it as a vector.
@@ -72,10 +89,11 @@ type blockVecSource struct {
 // ok=false declines the block. An attribute the schema does not carry lives in the cold tail, which is
 // a per-record read with a decompression behind it -- exactly what a vector load is meant to avoid --
 // so it declines rather than pretending to be fast.
-func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst vm.Vec) bool {
+func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst *vm.Vec) bool {
 	if scope != ast.NoScope && scope != ast.MyScope {
 		return false
 	}
+	dst.Dict, dst.Raw = nil, nil // a slot reused from the stack must not carry a previous block's column
 	id, ok := s.c.intern.LookupID(name)
 	if !ok {
 		return false
@@ -88,14 +106,146 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst v
 	switch {
 	case f.kind == akBool:
 		return s.loadBool(idx, f, id, dst)
+	case f.kind == akString:
+		return s.loadStr(idx, id, dst)
 	case numericKind(f.kind):
 		return s.loadNum(idx, f, id, dst)
 	}
-	return false // akString: colScope reads these zero-copy; a vector has no string payload yet
+	return false
 }
 
+// loadStr loads a string column, aliasing rather than copying -- copying is what a string predicate cannot
+// afford, since one allocation per record made a string comparison slower here than in the row path.
+//
+// Two paths. With a DICTIONARY the column is a fixed-width code column plus a shared entry list, so a
+// record's value is one indexed read; the dictionary parse and the code region are paid once per block.
+// Without one the string region is POSITIONAL -- uvarint(len)+bytes per non-escaped string field in schema
+// order -- so reaching a field means walking the fields before it, once per record. That walk measured 55%
+// of a string scan and is why the dictionary exists.
+func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
+	b := s.blk
+	dst.Mask = false
+	// The dictionary path, when this field has one: the parse and the code column are read ONCE for the
+	// block, then each record is a fixed-width code.
+	if entries, ok := b.dictEntries(idx, s.bc, s.dictBufFor(idx)); ok {
+		if codes, w, ok := b.dictCodes(idx, s.bc); ok {
+			info := b.strDict[idx]
+			// CODES, not strings, when every record has one. Then a comparison against a literal is an
+			// integer range test in the executor and no string is materialized at all. With escapes present
+			// the column is mixed -- an escaped value comes from the cold tail as a real string, and a code
+			// cannot represent it -- so those blocks deliver strings, which is also exactly the condition
+			// noEscape already records for pruning.
+			if info.noEscape {
+				d := s.dictFor(idx)
+				d.entries = entries
+				dst.Dict = d
+				for k := 0; k < b.n; k++ {
+					c := dictCodeAt(codes, w, k)
+					if c >= len(entries) {
+						return false
+					}
+					dst.St[k], dst.I[k] = vm.VsDictCode, int64(c)
+				}
+				return true
+			}
+			for k := 0; k < b.n; k++ {
+				if testBit(b.escapeAt(k), idx) {
+					dst.St[k] = vm.VsUndef // repaired from the cold tail below
+					continue
+				}
+				c := dictCodeAt(codes, w, k)
+				if c >= len(entries) {
+					return false
+				}
+				dst.SetString(k, bytesToStr(entries[c]))
+			}
+			return s.fixEscapes(idx, id, dst)
+		}
+	}
+	region, err := s.bc.stream(b, kindStr)
+	if err != nil {
+		return false
+	}
+	escFree := b.escapeFree(idx)
+	for k := 0; k < b.n; k++ {
+		esc := b.escapeAt(k)
+		if !escFree && testBit(esc, idx) {
+			dst.St[k] = vm.VsUndef // repaired from the cold tail below
+			continue
+		}
+		rec := region[b.strOff[k]:b.strOff[k+1]]
+		found := false
+		for i := range b.schema.fields {
+			// A field the dictionary owns is NOT in this region, so walking past it would misalign every
+			// field after it.
+			if b.schema.fields[i].kind != akString || testBit(esc, i) || b.dictOwns(i) {
+				continue
+			}
+			l, n := binary.Uvarint(rec)
+			if n <= 0 || int(l)+n > len(rec) {
+				return false
+			}
+			if i == idx {
+				if l == 0 {
+					dst.SetString(k, "")
+				} else {
+					dst.SetString(k, unsafe.String(&rec[n], int(l)))
+				}
+				found = true
+				break
+			}
+			rec = rec[n+int(l):]
+		}
+		if !found {
+			return false
+		}
+	}
+	if escFree {
+		return true
+	}
+	return s.fixEscapes(idx, id, dst)
+}
+
+// dictFor returns the reusable resolver for one field, so two dictionary-encoded columns in the same
+// expression never share one.
+func (s *blockVecSource) dictFor(idx int) *blockDict {
+	if s.dicts == nil {
+		s.dicts = map[int]*blockDict{}
+	}
+	d := s.dicts[idx]
+	if d == nil {
+		d = &blockDict{}
+		s.dicts[idx] = d
+	}
+	return d
+}
+
+// dictBufFor returns the per-field parse buffer, which is the resolver's own entry list: parsing into it
+// refreshes exactly the resolver that will be asked about this field.
+func (s *blockVecSource) dictBufFor(idx int) *[][]byte { return &s.dictFor(idx).entries }
+
 // loadNum loads a numeric column, then repairs the escaped elements from the cold tail.
-func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst vm.Vec) bool {
+func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst *vm.Vec) bool {
+	dst.Mask = false
+	// RAW, at the stored width, when every record has a value here. The executor compares it without widening
+	// -- lanes come from width, and widening to int64 before the kernel sees it throws three quarters of them
+	// away at a 2-byte column. A column WITH escapes cannot be represented this way, since an escaped value
+	// comes from the cold tail, so it takes the widening path below.
+	//
+	// Gated on an engine existing for this width: without one the raw form only costs widening later, so the
+	// production build takes the ordinary path below and is unchanged.
+	//
+	// The state array is deliberately NOT filled. A raw vector leaves both I and St to ensureInts, and filling
+	// St here as well made every widening path write it twice -- which cost 0.81x on the arithmetic shapes,
+	// where both operands widen. Vec.IsTrue and CountTrue answer from Raw directly, which is what removes the
+	// stale-state hazard that filling it was guarding against.
+	if vm.RawColumnUseful(f.width, f.unsigned) && s.blk.escapeFree(idx) {
+		if raw, ok := s.blk.rawColumn(idx, s.bc); ok {
+			dst.Raw, dst.RawWidth = raw, f.width
+			dst.RawUnsigned, dst.RawReal = f.unsigned, f.kind == akReal
+			return true
+		}
+	}
 	if !s.blk.loadIntBatch(idx, s.bc, dst.I) {
 		return false
 	}
@@ -112,25 +262,54 @@ func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst vm.Vec) bool
 	return s.fixEscapes(idx, id, dst)
 }
 
-// loadBool loads a bit-packed boolean column. The bool bitset sits immediately after the escape bitmap
-// in each record's hot region, so this is a strided read of uncompressed memory.
-func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst vm.Vec) bool {
+// loadBool loads a bit-packed boolean column. The bool bitset sits immediately after the escape bitmap in
+// each record's hot region, so this is a strided read of uncompressed memory.
+//
+// Where the column has no escape it is delivered as a MASK, built a word at a time: a stored bit becomes a
+// result bit with no per-element state byte in between, which is the shortest path storage-to-kernel in the
+// whole executor. A column WITH escapes goes to the data form instead, because an escaped value need not be
+// a boolean at all -- the attribute may hold a number or a string on some records -- and a mask cannot
+// represent that. Converting later, if a logical operator wants one, then applies the operand truthiness
+// the reference applies.
+func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst *vm.Vec) bool {
 	b := s.blk
-	for k := 0; k < b.n; k++ {
-		base := k*b.hotStride + b.schema.escBytes
-		dst.SetBool(k, testBit(b.hot[base:base+b.schema.boolBytes], f.boolBit))
-	}
 	if b.escapeFree(idx) {
+		for w := range dst.Hi {
+			start := w * 64
+			end := start + 64
+			if end > b.n {
+				end = b.n
+			}
+			var lo uint64
+			for k := start; k < end; k++ {
+				base := k*b.bitsStride + b.schema.escBytes
+				if testBit(b.bits[base:base+b.schema.boolBytes], f.boolBit) {
+					lo |= 1 << uint(k-start)
+				}
+			}
+			dst.Hi[w], dst.Lo[w] = 0, lo
+		}
+		dst.Mask = true
 		return true
+	}
+	dst.Mask = false
+	for k := 0; k < b.n; k++ {
+		base := k*b.bitsStride + b.schema.escBytes
+		dst.SetBool(k, testBit(b.bits[base:base+b.schema.boolBytes], f.boolBit))
 	}
 	return s.fixEscapes(idx, id, dst)
 }
 
 // fixEscapes overwrites the elements whose value did not fit its slot. An escape means the value is
-// MISSING or UNSTORABLE: missing is UNDEFINED, a scalar is read from the cold tail, and anything else
-// -- a string, a computed expression -- declines the block, because only the ordinary evaluator can
-// give the right answer for it.
-func (s *blockVecSource) fixEscapes(idx int, id uint32, dst vm.Vec) bool {
+// MISSING or UNSTORABLE: missing is UNDEFINED, and any scalar literal is read from the cold tail --
+// including one of the wrong type for the column, since a number where the schema expects a string is
+// exactly what escaping is for. Only a computed expression declines, because only the ordinary
+// evaluator can resolve one against the rest of the ad.
+//
+// Reading the value as whatever type it actually is, rather than insisting it match the column, is what
+// keeps a handful of odd records from declining a whole block: the kernels route a mismatched type
+// through the parity hook and get the reference's answer for it.
+func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 	for k := 0; k < s.blk.n; k++ {
 		if !testBit(s.blk.escapeAt(k), idx) {
 			continue
@@ -143,17 +322,23 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst vm.Vec) bool {
 			dst.St[k] = vm.VsUndef
 			continue
 		}
-		nv, ok := nodeColVal(node)
+		lit, ok := wire.LiteralValue(node)
 		if !ok {
-			return false
+			return false // a computed expression
 		}
-		switch nv.kind {
-		case akReal:
-			dst.SetReal(k, nv.f)
-		case akBool:
-			dst.SetBool(k, nv.i != 0)
+		switch lit.Kind {
+		case wire.LitInt:
+			dst.SetInt(k, lit.Int)
+		case wire.LitReal:
+			dst.SetReal(k, lit.Real)
+		case wire.LitBool:
+			dst.SetBool(k, lit.Bool)
+		case wire.LitString:
+			dst.SetString(k, lit.Str)
+		case wire.LitUndef:
+			dst.St[k] = vm.VsUndef
 		default:
-			dst.SetInt(k, nv.i)
+			dst.St[k] = vm.VsError
 		}
 	}
 	return true
@@ -174,8 +359,12 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 	resolver := cs.resolve
 	src := &blockVecSource{c: c, bc: st.cache}
 	scratch := vecScratchPool.Get().(*vm.VecScratch)
-	defer vecScratchPool.Put(scratch)
-	var live []bool
+	defer func() {
+		scratch.Release()
+		vecScratchPool.Put(scratch)
+	}()
+	var live []uint64
+	var plan prunePlan
 	var split vecSplit
 	defer func() { lastVecSplit.Store(&split) }()
 	count := 0
@@ -188,34 +377,50 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 				count += c.rowEvalWindow(w, s0, fallbackM)
 				continue
 			}
-			pruneIdxs, prunePreds := c.zonePrunableTests(q, seg.schema())
+			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
+			strEq := plan.stringEq(c, q, seg.schema())
 			base := 0
 			for _, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {
+					split.prunedBlocks++
+					base += blk.n
+					continue
+				}
+				// The string analogue of a zone: a value no dictionary entry folds equal to cannot be in
+				// this block, so skip it without reading a single code.
+				if len(strEq) > 0 && blk.dictPrunes(strEq, st.cache, &src.dictBuf) {
+					split.prunedBlocks++
 					base += blk.n
 					continue
 				}
 				// Visibility first, once. The vectorized path needs the mask anyway to count, and
 				// knowing how much of the block is live is what decides whether vectorizing it is
 				// worth doing at all.
-				if cap(live) < blk.n {
-					live = make([]bool, blk.n)
+				// Visibility as a BITMAP, so counting the survivors is a popcount per 64 records
+				// rather than a branch per record, and so the result mask can be ANDed with it
+				// directly instead of consulted element by element.
+				words := vm.MaskWords(blk.n)
+				if cap(live) < words {
+					live = make([]uint64, words)
 				}
-				live = live[:blk.n]
+				live = live[:words]
+				for i := range live {
+					live[i] = 0
+				}
 				nLive := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					vis := gk < len(seg.offs)
-					if vis {
-						o := seg.offs[gk]
-						vis = recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
+					if gk >= len(seg.offs) {
+						break
 					}
-					live[k] = vis
-					if vis {
+					o := seg.offs[gk]
+					if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+						live[k/64] |= 1 << uint(k%64)
 						nLive++
 					}
 				}
 				if nLive == 0 {
+					split.emptyBlocks++
 					base += blk.n
 					continue
 				}
@@ -237,11 +442,7 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 					continue
 				}
 				split.vecBlocks++
-				for k := 0; k < blk.n; k++ {
-					if live[k] && vec.IsTrue(k) {
-						count++
-					}
-				}
+				count += vec.CountTrue(live)
 				base += blk.n
 			}
 		}

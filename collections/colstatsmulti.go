@@ -62,16 +62,16 @@ func (a *statsAccum) result() NumStats {
 // exactly this out of its loop, and not doing so left an aggregate 1.4x slower than the single-pass
 // path it replaced, even after the predicate fusion.
 type numCol struct {
-	blk       *columnarBlock
-	fieldIdx  int
-	fieldID   uint32
-	escBytes  int
-	hotOff    int // byte offset within a record's hot region; -1 when the column is cold
-	coldStart int
-	width     int
-	unsigned  bool
-	isReal    bool
-	coldNum   []byte // decompressed cold-numeric region, nil for a hot column
+	blk      *columnarBlock
+	fieldIdx int
+	fieldID  uint32
+	escBytes int
+	region   []byte // the buffer this column lives in: uncompressed hot columns, or the decompressed
+	//        cold-numeric region. Both columnar, so one reader serves both.
+	start    int // this field's offset within region
+	width    int
+	unsigned bool
+	isReal   bool
 }
 
 // newNumCol resolves a column for repeated reads. ok=false when the field is not numeric here, or its
@@ -80,10 +80,12 @@ func newNumCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCache)
 	f := blk.schema.fields[fieldIdx]
 	c := numCol{
 		blk: blk, fieldIdx: fieldIdx, fieldID: fieldID, escBytes: blk.schema.escBytes,
-		hotOff: -1, width: f.width, unsigned: f.unsigned, isReal: f.kind == akReal,
+		width: f.width, unsigned: f.unsigned, isReal: f.kind == akReal,
 	}
-	if off, hot := blk.hotFieldOff[fieldIdx]; hot {
-		c.hotOff = off
+	// Hot and cold numerics are both columnar, so resolving a column is picking a buffer and an offset;
+	// the per-record read below no longer branches on which it was.
+	if start, hot := blk.hotColStart[fieldIdx]; hot {
+		c.region, c.start = blk.hotCol, start
 		return c, true
 	}
 	start, ok := blk.coldFieldStart[fieldIdx]
@@ -94,23 +96,18 @@ func newNumCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCache)
 	if err != nil {
 		return numCol{}, false
 	}
-	c.coldStart, c.coldNum = start, coldNum
+	c.region, c.start = coldNum, start
 	return c, true
 }
 
 // at reads record k's value with its ClassAd kind, taking the cold-tail path only when the value
 // escaped its slot.
 func (c *numCol) at(k int, bc *blockCache) (colVal, bool) {
-	base := k * c.blk.hotStride
-	if testBit(c.blk.hot[base:base+c.escBytes], c.fieldIdx) {
+	base := k * c.blk.bitsStride
+	if testBit(c.blk.bits[base:base+c.escBytes], c.fieldIdx) {
 		return c.blk.escapedNumVal(k, c.fieldID, bc)
 	}
-	var raw int64
-	if c.hotOff >= 0 {
-		raw = readIntLE(c.blk.hot[base+c.hotOff:], c.width, c.unsigned)
-	} else {
-		raw = readIntLE(c.coldNum[c.coldStart+k*c.width:], c.width, c.unsigned)
-	}
+	raw := readIntLE(c.region[c.start+k*c.width:], c.width, c.unsigned)
 	if c.isReal {
 		return colVal{f: math.Float64frombits(uint64(raw)), kind: akReal}, true
 	}
@@ -124,8 +121,8 @@ func (c *numCol) at(k int, bc *blockCache) (colVal, bool) {
 // which is the whole point of narrowing first.
 func (b *columnarBlock) fieldIntAt(k, fieldIdx int, bc *blockCache) (int64, bool) {
 	f := b.schema.fields[fieldIdx]
-	if off, hot := b.hotFieldOff[fieldIdx]; hot {
-		return readIntLE(b.hot[k*b.hotStride+off:], f.width, f.unsigned), true
+	if start, hot := b.hotColStart[fieldIdx]; hot {
+		return readIntLE(b.hotCol[start+k*f.width:], f.width, f.unsigned), true
 	}
 	start, ok := b.coldFieldStart[fieldIdx]
 	if !ok {
