@@ -128,8 +128,12 @@ type colVal struct {
 // schema does not carry as a numeric field, probes spanning two fields, or a probe that is not a
 // scalar comparison (present/absent/in/isnt, or a non-numeric operand).
 func (c *Collection) numPredOnField(q *vm.Query, s *adSchema) (uint32, func(float64) bool, bool) {
-	probes := q.Probes()
-	if !q.Native() || len(probes) == 0 {
+	// ExactProbes, not Probes: this path answers from the probes and never re-verifies a record
+	// against the query, so an over-approximation would silently over-count. Probes omits any
+	// conjunct that is not `Attr OP literal`, and such a conjunct can still be NATIVE -- e.g.
+	// `ProcId >= 5 && ClusterId != ProcId` -- so Native() alone is not the guarantee it looks like.
+	probes, exact := q.ExactProbes()
+	if !q.Native() || !exact {
 		return 0, nil, false
 	}
 	fieldIdx := -1
