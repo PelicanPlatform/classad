@@ -284,3 +284,189 @@ func BenchmarkSIMDKernels(b *testing.B) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------------------------------
+// EXPERIMENT 2: how much of the SIMD kernel is mask EXTRACTION rather than comparison?
+//
+// It decides whether the hot-column figure above generalizes off this laptop. arm64 has no mask register,
+// so a comparison yields a vector of all-ones lanes and bits must be emulated; amd64's AVX-512 mask
+// register already IS a bitmask, and ToBits exists only in types_amd64.go. If extraction dominated on
+// arm64, this machine would understate an amd64 fleet badly.
+//
+//	scalar bitplane int64 (today)       6921 ns   0.845 ns/rec   1.00x
+//	SIMD + weights/ReduceSum extract    1189 ns   0.145          5.82x
+//	SIMD + reshape/multiply extract     1829 ns   0.223          3.78x
+//	SIMD compare only (free extract)     832 ns   0.102          8.32x
+//
+// Extraction is 357 ns, 30% of the best arm64 kernel -- so amd64 with a free ToBits reaches about 8.3x
+// against arm64's 5.8x. Worth having, and it does NOT change the conclusion: folding the better kernel
+// into the hot-column pipeline moves it from 1.94x to 2.09x, because the GATHER is the binding constraint
+// at ~40% of the pipeline, not the extraction. Layout still decides this, not the instruction set.
+//
+// A NEGATIVE RESULT WORTH KEEPING: reshape/multiply is SLOWER than the cross-lane reduction it was meant
+// to avoid, 3.78x against 5.82x. GetElem moves a vector lane to a scalar register twice per group, and two
+// of those transfers cost more than one ReduceSum. The obvious-looking optimization lost.
+//
+// It also nearly measured 55% instead of 30%: the first harness passed the extractor as a FUNCTION VALUE,
+// which blocks inlining, while the compare-only loop inlined -- comparing harnesses rather than kernels.
+// Both forms are kept below so the difference stays visible.
+// EXPERIMENT 2: how much of the SIMD kernel is the mask EXTRACTION rather than the comparison?
+//
+// It decides whether the 1.98x hot-column figure generalizes. arm64 has no mask register, so a comparison
+// yields a vector of all-ones lanes and turning that into bits must be emulated. amd64's AVX-512 mask
+// register already IS a bitmask, so ToBits is free there -- and ToBits exists only in types_amd64.go.
+//
+// If extraction dominates on arm64, then this machine understates what an amd64 fleet would get, and the
+// compare-only number is the better estimate of the amd64 ceiling.
+
+// extractWeights: zero a weight vector where the mask is false, then reduce-sum. Two ops, but ReduceSum is
+// a cross-lane reduction, which is the expensive kind on NEON.
+func extractWeights(m archsimd.Mask16x8) uint64 {
+	return uint64(uint8(weights16.Masked(m).ReduceSum()))
+}
+
+// extractReshapeMul avoids the cross-lane reduction. A true lane is 0xFFFF, so shifting right by 15 leaves
+// 1 per lane; reinterpreting the eight lanes as two uint64s puts four of those bits at positions 0, 16, 32
+// and 48 of each, and one multiply gathers them into the top nibble -- bit-gather-by-multiply, in scalar
+// ops the CPU can overlap with the next vector compare.
+//
+// The multiplier must give each bit its OWN destination. 0x0001000100010001 is the obvious choice and is
+// wrong: it shifts every bit to position 48, so the product SUMS them and yields a popcount instead of a
+// bitmask -- which is what the agreement test caught. Mapping bit 16j to bit 48+j needs shifts of 48-15j,
+// hence 2^3 + 2^18 + 2^33 + 2^48.
+const gatherMagic = 1<<3 | 1<<18 | 1<<33 | 1<<48
+
+func extractReshapeMul(m archsimd.Mask16x8) uint64 {
+	ones := m.ToInt16x8().ToBits().ShiftAllRight(15) // Uint16x8 of 0 or 1
+	pair := ones.ReshapeToUint64s()
+	lo := (pair.GetElem(0) * gatherMagic) >> 48 & 0xF
+	hi := (pair.GetElem(1) * gatherMagic) >> 48 & 0xF
+	return lo | hi<<4
+}
+
+// simdBitplaneExtract runs the kernel with a chosen extraction, so the two are compared on identical work.
+func simdBitplaneExtract(src []int16, lit int16, plane []uint64, extract func(archsimd.Mask16x8) uint64) {
+	v := archsimd.BroadcastInt16x8(lit)
+	for w := range plane {
+		var word uint64
+		base := w * 64
+		for g := 0; g < 8; g++ {
+			word |= extract(archsimd.LoadInt16x8(src[base+g*8:]).Greater(v)) << uint(g*8)
+		}
+		plane[w] = word
+	}
+}
+
+// simdCompareOnly does every comparison but extracts ONCE for the whole block instead of once per eight
+// records, which is the closest honest proxy for a kernel whose extraction is free -- what amd64 gets.
+func simdCompareOnly(src []int16, lit int16) uint64 {
+	v := archsimd.BroadcastInt16x8(lit)
+	acc := archsimd.LoadInt16x8(src[:8]).Greater(v)
+	for i := 8; i+8 <= len(src); i += 8 {
+		acc = acc.Or(archsimd.LoadInt16x8(src[i:]).Greater(v))
+	}
+	return extractWeights(acc)
+}
+
+func TestSIMDExtractionAgrees(t *testing.T) {
+	_, i16, _, _, _ := fixtures()
+	const lit = 8192
+	words := simdSpikeN / 64
+	want := make([]uint64, words)
+	simdBitplaneExtract(i16, lit, want, extractWeights)
+	got := make([]uint64, words)
+	simdBitplaneExtract(i16, lit, got, extractReshapeMul)
+	for w := range want {
+		if got[w] != want[w] {
+			t.Fatalf("word %d: reshape/mul %#016x != weights %#016x", w, got[w], want[w])
+		}
+	}
+	t.Log("both extractions agree")
+}
+
+func BenchmarkSIMDExtraction(b *testing.B) {
+	_, i16, _, _, _ := fixtures()
+	const lit = 8192
+	plane := make([]uint64, simdSpikeN/64)
+
+	b.Run("1_extract_weights_reducesum", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			simdBitplaneExtract(i16, lit, plane, extractWeights)
+		}
+	})
+	b.Run("2_extract_reshape_mul", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			simdBitplaneExtract(i16, lit, plane, extractReshapeMul)
+		}
+	})
+	b.Run("3_compare_only_one_extract", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			_ = simdCompareOnly(i16, lit)
+		}
+	})
+	b.Run("4_scalar_bitplane_int64", func(b *testing.B) {
+		i64, _, _, _, _ := fixtures()
+		for i := 0; i < b.N; i++ {
+			scalarBitplaneInt64(i64, lit, plane)
+		}
+	})
+}
+
+// The variants above take extract as a FUNCTION VALUE, which blocks inlining and inflates the extraction
+// share -- comparing them against a compare-only loop that inlines is comparing harnesses, not kernels.
+// These are the same three kernels with everything inlined, which is what a real one would be.
+
+func inlWeights(src []int16, lit int16, plane []uint64) {
+	v := archsimd.BroadcastInt16x8(lit)
+	for w := range plane {
+		var word uint64
+		base := w * 64
+		for g := 0; g < 8; g++ {
+			m := archsimd.LoadInt16x8(src[base+g*8:]).Greater(v)
+			word |= uint64(uint8(weights16.Masked(m).ReduceSum())) << uint(g*8)
+		}
+		plane[w] = word
+	}
+}
+
+func inlReshapeMul(src []int16, lit int16, plane []uint64) {
+	v := archsimd.BroadcastInt16x8(lit)
+	for w := range plane {
+		var word uint64
+		base := w * 64
+		for g := 0; g < 8; g++ {
+			m := archsimd.LoadInt16x8(src[base+g*8:]).Greater(v)
+			pair := m.ToInt16x8().ToBits().ShiftAllRight(15).ReshapeToUint64s()
+			lo := (pair.GetElem(0) * gatherMagic) >> 48 & 0xF
+			hi := (pair.GetElem(1) * gatherMagic) >> 48 & 0xF
+			word |= (lo | hi<<4) << uint(g*8)
+		}
+		plane[w] = word
+	}
+}
+
+func BenchmarkSIMDExtractionInlined(b *testing.B) {
+	i64, i16, _, _, _ := fixtures()
+	const lit = 8192
+	plane := make([]uint64, simdSpikeN/64)
+	b.Run("1_scalar_int64", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			scalarBitplaneInt64(i64, lit, plane)
+		}
+	})
+	b.Run("2_simd_weights", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			inlWeights(i16, lit, plane)
+		}
+	})
+	b.Run("3_simd_reshapemul", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			inlReshapeMul(i16, lit, plane)
+		}
+	})
+	b.Run("4_simd_compare_only", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			_ = simdCompareOnly(i16, lit)
+		}
+	})
+}
