@@ -175,20 +175,22 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 		c.schemaScan.Store(st)
 	}
 	for _, sh := range c.shards {
-		sh.mu.RLock()
-		act := sh.act
-		segs := make([]*segment, 0, len(sh.segs))
-		for _, seg := range sh.segs {
-			if seg != nil && seg != act && seg.used > 0 && seg.colblk.Load() == nil {
-				segs = append(segs, seg) // sealed ⇒ data/used immutable, safe to read off-lock
-			}
-		}
-		sh.mu.RUnlock()
-		for _, seg := range segs {
+		// PINNED: transcoding reads the segment's bytes off the shard lock, and a concurrent
+		// Compact/merge/rotation would otherwise munmap them mid-read. The pin defers the reap.
+		segs := sh.pinSealed(func(seg *segment) bool { return seg.colblk.Load() == nil })
+		// Unpin each segment as soon as its block is built, rather than holding every pin until this
+		// returns: a pin DEFERS a concurrent compaction's reap, and a whole-archive transcode takes
+		// long enough that holding them all would keep every replaced segment's file on disk for the
+		// duration. The deferred sweep is a safety net for a panic mid-loop.
+		done := 0
+		defer func() { unpinAll(segs[done:]) }()
+		for i, seg := range segs {
 			if cs := c.buildColSegment(seg, s, hot); cs != nil {
 				seg.colblk.Store(cs)
 				c.persistColSeg(sh, seg) // write it to the sidecar so a reopen reloads it (no-op for RAM)
 			}
+			seg.unpin()
+			done = i + 1
 		}
 	}
 }
@@ -267,11 +269,21 @@ func (c *Collection) regionCodec() Codec {
 	return c.regionCodecCache.Load().c
 }
 
+// colBuildStallHook is a test seam: called at the start of each segment's transcode, while the
+// caller holds that segment pinned. It lets a test force a compaction (which retires and reaps
+// sealed segments) at exactly the moment a build is reading one, which is the production race that
+// crashed -- an admin Maintain transcoding segments while the background maintenance goroutine
+// compacted them. Production leaves it nil.
+var colBuildStallHook func()
+
 // buildColSegment transcodes a sealed segment into its columnar accelerator block under schema s
 // and hot tier hot (resolving an interned segment's local ids on the way). Returns nil if the
 // block cannot be built. Off the write lock (reads immutable sealed bytes).
 func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colSegment {
 	colSegmentBuilds.Add(1)
+	if colBuildStallHook != nil {
+		colBuildStallHook()
+	}
 	d := seg.dict.Load() // interned segment -> resolve its local ids during transcode
 	blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, c.regionCodec(), s, hot,
 		defaultColGrouping(),

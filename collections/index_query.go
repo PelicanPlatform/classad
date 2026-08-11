@@ -41,6 +41,10 @@ func (c *Collection) Reindex() {
 		sh.mu.RLock()
 		act := sh.act
 		sealRAM := sh.sealRAM
+		// Pinned below, once the target list is known: reindexing decompresses every record it
+		// covers, off the shard lock, and holds only reindexMu -- which does not exclude Compact,
+		// a merge or a rotation, any of which reaps (munmaps) a sealed segment.
+		var pinned []*segment
 		window := c.backfillWindow(sh)
 		type target struct {
 			seg    *segment
@@ -89,7 +93,16 @@ func (c *Collection) Reindex() {
 				tgts = append(tgts, target{seg: seg, used: seg.used, seal: true})
 			}
 		}
+		for _, t := range tgts {
+			t.seg.pin()
+			pinned = append(pinned, t.seg)
+		}
 		sh.mu.RUnlock()
+		// Held until Reindex returns rather than released per target. A pin only DEFERS a concurrent
+		// compaction's reap, so the cost is that replaced segment files linger for the rest of this
+		// reindex; releasing them earlier would mean restructuring a loop whose body branches with
+		// continue, which is not worth doing in a correctness fix.
+		defer unpinAll(pinned)
 		for _, t := range tgts {
 			if t.reseal {
 				c.reindexSealed(sh, t.seg, spec)

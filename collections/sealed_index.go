@@ -288,18 +288,13 @@ func (c *Collection) sealAndEvictShard(sh *shard) {
 	if c.dir == "" {
 		return // RAM collection: no file sidecars, the directory stays resident
 	}
-	// Phase A: snapshot the sealed persistent segments under the read lock. The active
-	// segment is skipped (still appended to); its keys stay resident.
-	sh.mu.RLock()
-	act := sh.act
-	var segs []*segment
-	for _, seg := range sh.segs {
-		if seg == nil || seg == act || seg.used == 0 {
-			continue
-		}
-		segs = append(segs, seg)
-	}
-	sh.mu.RUnlock()
+	// Phase A: snapshot the sealed persistent segments, PINNED. The active segment is skipped
+	// (still appended to); its keys stay resident. The pin matters because Phase B reads each
+	// segment's bytes off the shard lock to build its key index, and a concurrent compaction would
+	// otherwise munmap them mid-build; it is released only after Phase C, since unpin is what
+	// performs a deferred reap and Phase C still touches the segments.
+	segs := sh.pinSealed(nil)
+	defer unpinAll(segs)
 
 	// Phase B: build any missing key sidecars off-lock (file I/O). sealSegmentIndex is
 	// idempotent and folds in the attribute index if one is already built for the segment,
