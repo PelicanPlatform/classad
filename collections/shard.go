@@ -623,6 +623,46 @@ func (sh *shard) buildWindowsLocked(s0 uint64) []segWindow {
 // releaseWindows drops the pins snapshot took, allowing any mmap segment retired
 // during the scan to be reaped. Balances snapshot; call it exactly once per
 // snapshot (typically deferred). No-op for RAM segments.
+// pinSealed snapshots sh's sealed segments -- every segment except the active append target --
+// that keep accepts, PINNED, and the caller must unpinAll the result.
+//
+// It exists because "sealed" guarantees the CONTENT will not change; it says nothing about how long
+// the MAPPING lives. Compact, a merge, a rotation and a reseal all retire a sealed segment and reap
+// it (munmap + unlink) as soon as its pin count reaches zero, and they hold maintMu rather than the
+// shard lock, so nothing stops them from doing it to a segment a reader captured and then released
+// the shard lock over.
+//
+// The failure mode is why this helper is worth having rather than open-coding the loop: reading a
+// reaped segment faults at an address INSIDE a slice whose bounds are still perfectly valid, so it
+// looks nothing like an out-of-range bug, and the code that does it reads as obviously correct --
+// three separate call sites had a comment asserting that sealed segments are safe to read off-lock.
+// A pin makes it true, by deferring the reap to unpin.
+func (sh *shard) pinSealed(keep func(seg *segment) bool) []*segment {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	act := sh.act
+	var out []*segment
+	for _, seg := range sh.segs {
+		if seg == nil || seg == act || seg.used == 0 {
+			continue
+		}
+		if keep != nil && !keep(seg) {
+			continue
+		}
+		seg.pin() // documented as "called under the shard read lock"
+		out = append(out, seg)
+	}
+	return out
+}
+
+// unpinAll releases pins taken by pinSealed. Must be called with no shard lock held: the last pin
+// drop is what performs a deferred reap.
+func unpinAll(segs []*segment) {
+	for _, seg := range segs {
+		seg.unpin()
+	}
+}
+
 func releaseWindows(wins []segWindow) {
 	for i := range wins {
 		wins[i].seg.unpin()
