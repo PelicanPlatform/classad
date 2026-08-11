@@ -17,6 +17,8 @@ func (d *decodedStreams) cost() int64 { return int64(len(d.coldNum) + len(d.str)
 //	kindColdNum  the cold numeric column groups -- a cold column scan
 //	kindStr      the string region              -- only a full-ad read
 //	kindCold     the cold tail (row-wise)       -- an escaped value's node
+//	kindStrDict  per-field string dictionaries -- a string predicate or read
+//	kindStrCode  per-field string code columns -- a string predicate or read
 //
 // Decompressing all three together meant reading one escaped integer also inflated the string
 // region, which on wide ads (a history record carries dozens of string attributes) is the largest
@@ -28,11 +30,14 @@ const (
 	kindColdNum streamKind = iota
 	kindStr
 	kindCold
+	kindStrDict
+	kindStrCode
+	numStreamKinds
 )
 
 // streamKey derives a per-stream cache key. Block ids come from a monotonic counter
 // (colBlockSeq), so id*3+kind is unique per (block, stream).
-func streamKey(id uint64, k streamKind) uint64 { return id*3 + uint64(k) }
+func streamKey(id uint64, k streamKind) uint64 { return id*uint64(numStreamKinds) + uint64(k) }
 
 // blockCache caches columnar blocks' decompressed regions, one entry PER REGION, so repeated
 // full-ad reads and escaped-record lookups within a row-group decompress once, not per record.
@@ -79,6 +84,10 @@ func (bc *blockCache) stream(b *columnarBlock, k streamKind) ([]byte, error) {
 		comp = b.strComp
 	case kindCold:
 		comp = b.coldComp
+	case kindStrDict:
+		comp = b.strDictComp
+	case kindStrCode:
+		comp = b.strCodeComp
 	}
 	raw, err := b.codec.Decompress(nil, comp)
 	if err != nil {

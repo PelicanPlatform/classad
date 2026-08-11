@@ -70,6 +70,11 @@ type blockVecSource struct {
 	c   *Collection
 	blk *columnarBlock
 	bc  *blockCache
+
+	// dictBuf is the parsed dictionary-entry list, reused across blocks. Allocating it per block turned a
+	// 512-entry dictionary into ~12 KB of garbage per block, which across a segment's blocks is more
+	// garbage than the walk it replaces ever cost.
+	dictBuf [][]byte
 }
 
 // LoadColumn resolves an attribute to a field of this block's schema and loads it as a vector.
@@ -101,19 +106,39 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst *
 	return false
 }
 
-// loadStr loads a string column, aliasing the block's decompressed string region rather than copying.
+// loadStr loads a string column, aliasing rather than copying -- copying is what a string predicate cannot
+// afford, since one allocation per record made a string comparison slower here than in the row path.
 //
-// The region is POSITIONAL -- uvarint(len)+bytes per non-escaped string field in schema order -- so
-// reaching a field means walking the string fields before it, per record. That walk is the same one
-// colScope does; what the vector path removes is the per-operator resolver call and the boxed value
-// around it, not the walk.
-//
-// Copying is what a string predicate cannot afford: one allocation per record made a string comparison
-// slower in the columnar path than in the row path, which is why this aliases and why Vec's elements are
-// released back to the pool (see VecScratch.Release).
+// Two paths. With a DICTIONARY the column is a fixed-width code column plus a shared entry list, so a
+// record's value is one indexed read; the dictionary parse and the code region are paid once per block.
+// Without one the string region is POSITIONAL -- uvarint(len)+bytes per non-escaped string field in schema
+// order -- so reaching a field means walking the fields before it, once per record. That walk measured 55%
+// of a string scan and is why the dictionary exists.
 func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 	b := s.blk
 	dst.Mask = false
+	// The dictionary path, when this field has one: the parse and the code column are read ONCE for the
+	// block, then each record is a fixed-width code and an index -- no walk at all.
+	if entries, ok := b.dictEntries(idx, s.bc, &s.dictBuf); ok {
+		if codes, w, ok := b.dictCodes(idx, s.bc); ok {
+			escFree := b.escapeFree(idx)
+			for k := 0; k < b.n; k++ {
+				if !escFree && testBit(b.escapeAt(k), idx) {
+					dst.St[k] = vm.VsUndef // repaired from the cold tail below
+					continue
+				}
+				c := dictCodeAt(codes, w, k)
+				if c >= len(entries) {
+					return false
+				}
+				dst.SetString(k, bytesToStr(entries[c]))
+			}
+			if escFree {
+				return true
+			}
+			return s.fixEscapes(idx, id, dst)
+		}
+	}
 	region, err := s.bc.stream(b, kindStr)
 	if err != nil {
 		return false
@@ -195,8 +220,8 @@ func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst *vm.Vec) bo
 			}
 			var lo uint64
 			for k := start; k < end; k++ {
-				base := k*b.hotStride + b.schema.escBytes
-				if testBit(b.hot[base:base+b.schema.boolBytes], f.boolBit) {
+				base := k*b.bitsStride + b.schema.escBytes
+				if testBit(b.bits[base:base+b.schema.boolBytes], f.boolBit) {
 					lo |= 1 << uint(k-start)
 				}
 			}
@@ -207,8 +232,8 @@ func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst *vm.Vec) bo
 	}
 	dst.Mask = false
 	for k := 0; k < b.n; k++ {
-		base := k*b.hotStride + b.schema.escBytes
-		dst.SetBool(k, testBit(b.hot[base:base+b.schema.boolBytes], f.boolBit))
+		base := k*b.bitsStride + b.schema.escBytes
+		dst.SetBool(k, testBit(b.bits[base:base+b.schema.boolBytes], f.boolBit))
 	}
 	return s.fixEscapes(idx, id, dst)
 }

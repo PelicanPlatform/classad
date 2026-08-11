@@ -35,9 +35,9 @@ func TestColSegmentMarshalRoundTrip(t *testing.T) {
 			t.Fatalf("%s: unmarshal returned nil", codec.Name())
 		}
 		gb := got.blocks[0]
-		if gb.n != blk.n || gb.hotStride != blk.hotStride || len(gb.hotNum) != len(blk.hotNum) || len(gb.coldNum) != len(blk.coldNum) {
+		if gb.n != blk.n || gb.bitsStride != blk.bitsStride || len(gb.hotNum) != len(blk.hotNum) || len(gb.coldNum) != len(blk.coldNum) {
 			t.Fatalf("%s: layout mismatch: n=%d/%d stride=%d/%d hot=%d/%d cold=%d/%d",
-				codec.Name(), gb.n, blk.n, gb.hotStride, blk.hotStride, len(gb.hotNum), len(blk.hotNum), len(gb.coldNum), len(blk.coldNum))
+				codec.Name(), gb.n, blk.n, gb.bitsStride, blk.bitsStride, len(gb.hotNum), len(blk.hotNum), len(gb.coldNum), len(blk.coldNum))
 		}
 		for i := range offs {
 			if got.offs[i] != offs[i] {

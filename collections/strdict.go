@@ -1,0 +1,266 @@
+package collections
+
+import (
+	"encoding/binary"
+	"unsafe"
+
+	"github.com/PelicanPlatform/classad/classad"
+)
+
+// A per-block, per-field STRING DICTIONARY, so a string predicate compares integers.
+//
+// The string region is POSITIONAL -- uvarint(len)+bytes for each non-escaped string field in schema order
+// -- so reaching field j means walking the string fields before it, once per record. That walk measured 55%
+// of a string scan, and it is irreducible in that layout: there is no offset to jump to.
+//
+// A dictionary replaces it with two things a scan can use directly. Distinct values are stored once, and
+// each record holds a fixed-width CODE into them, columnar like every other column here. Then:
+//
+//   - `Owner == "user3"` becomes: find the codes whose entry folds equal to "user3" (one linear pass over
+//     the dictionary, per block, not per record), then compare a code column against them -- integers.
+//   - If NO entry matches, no record in the block can, so the whole block is skipped without reading a
+//     single code. A selective string equality prunes like a zone map.
+//   - Reading a string is dict[code], O(1), instead of a walk.
+//
+// ORDERING WORKS TOO, because the dictionary is sorted with the evaluator's own fold comparison. Codes are
+// then monotone in fold order, so `s < lit` is `code < boundary` for a boundary found by one pass over the
+// dictionary. That is why sortDictFold uses classad.CompareStringsFold rather than plain byte order:
+// getting this wrong would make ordering comparisons silently disagree with the reference.
+//
+// FOLD-EQUAL DISTINCT VALUES are the subtlety. "user3" and "USER3" are equal under == and NOT identical
+// under =?=, so they must keep separate codes while both matching an == against either. Hence a code SET
+// for equality rather than a single code, and exact-byte matching for =?=.
+//
+// ADDITIVE, NOT REPLACING. The positional region is still written for every string field, including
+// dictionary-encoded ones, so reconstruct and every existing reader keep working untouched. The cost is
+// that a dictionary-encoded field's values are stored twice before compression -- which is why a field is
+// only dictionary-encoded when its values actually repeat (see dictWorthwhile), and why the codes and
+// dictionary are compressed. Making the dictionary authoritative and dropping those fields from the
+// positional region is a later, larger change: reconstruct would have to splice strings back into
+// positional order.
+
+const (
+	// dictMaxCardinality caps a dictionary at what a 2-byte code addresses.
+	dictMaxCardinality = 1 << 16
+
+	// dictMinRepeat is the average repeats per distinct value below which a field is left positional.
+	// Equality would still be faster with a dictionary at cardinality 1.0 -- comparing a code beats
+	// walking to a string -- but with the positional region still being written, a dictionary that
+	// deduplicates nothing stores every value twice for it. Two repeats is the point where the dictionary
+	// is no bigger than what it accelerates.
+	dictMinRepeat = 2
+)
+
+// strDictEnabled gates the encoding. It exists so a benchmark can measure the dictionary against the
+// positional walk over IDENTICAL data -- the two paths differ by which encoding a block chose, and without
+// a switch the only way to compare them is to compare different fixtures, which compares cardinality
+// rather than code. Never set false outside a test.
+var strDictEnabled = true
+
+// strDictField locates one field's dictionary and code column within the block's two regions.
+type strDictField struct {
+	codeStart int // byte offset of this field's code column in the decompressed code region
+	codeWidth int // 1 or 2
+	dictStart int // byte offset of this field's entries in the decompressed dictionary region
+	count     int // number of entries
+}
+
+// buildStrDicts decides which string fields of this block to dictionary-encode and builds them.
+//
+// Returns the per-field locations plus the two raw regions, uncompressed; the caller compresses them with
+// the region codec like every other stream.
+func buildStrDicts(s *adSchema, recs [][]byte, n int) (map[int]strDictField, []byte, []byte) {
+	if !strDictEnabled {
+		return nil, nil, nil
+	}
+	var fields []int
+	for i := range s.fields {
+		if s.fields[i].kind == akString {
+			fields = append(fields, i)
+		}
+	}
+	if len(fields) == 0 {
+		return nil, nil, nil
+	}
+	// One pass over the records collecting each string field's values, so the walk happens once here
+	// rather than once per query.
+	vals := make(map[int][][]byte, len(fields))
+	present := make(map[int][]bool, len(fields))
+	for _, i := range fields {
+		vals[i] = make([][]byte, n)
+		present[i] = make([]bool, n)
+	}
+	for k, r := range recs {
+		esc := r[:s.escBytes]
+		p := s.escBytes + s.fixedLen
+		for i := range s.fields {
+			if s.fields[i].kind != akString || testBit(esc, i) {
+				continue
+			}
+			l, m := binary.Uvarint(r[p:])
+			if m <= 0 || p+m+int(l) > len(r) {
+				return nil, nil, nil // malformed; leave every field positional
+			}
+			vals[i][k] = r[p+m : p+m+int(l)]
+			present[i][k] = true
+			p += m + int(l)
+		}
+	}
+
+	out := map[int]strDictField{}
+	var dictRaw, codeRaw []byte
+	for _, i := range fields {
+		uniq := distinctFold(vals[i], present[i])
+		if !dictWorthwhile(len(uniq), n) {
+			continue
+		}
+		info := strDictField{
+			codeStart: len(codeRaw),
+			codeWidth: 1,
+			dictStart: len(dictRaw),
+			count:     len(uniq),
+		}
+		if len(uniq) > 1<<8 {
+			info.codeWidth = 2
+		}
+		// The dictionary: uvarint length then bytes, in fold-sorted order so codes are monotone.
+		index := make(map[string]int, len(uniq))
+		for c, v := range uniq {
+			index[string(v)] = c
+			dictRaw = binary.AppendUvarint(dictRaw, uint64(len(v)))
+			dictRaw = append(dictRaw, v...)
+		}
+		// The code column, columnar. An escaped or absent value gets code 0; nothing reads it, because the
+		// escape bitmap is consulted first, exactly as for a numeric column.
+		codeRaw = append(codeRaw, make([]byte, info.codeWidth*n)...)
+		for k := 0; k < n; k++ {
+			if !present[i][k] {
+				continue
+			}
+			c := index[string(vals[i][k])]
+			off := info.codeStart + k*info.codeWidth
+			codeRaw[off] = byte(c)
+			if info.codeWidth == 2 {
+				codeRaw[off+1] = byte(c >> 8)
+			}
+		}
+		out[i] = info
+	}
+	if len(out) == 0 {
+		return nil, nil, nil
+	}
+	return out, dictRaw, codeRaw
+}
+
+// dictWorthwhile reports whether a field with this cardinality is worth a dictionary. See dictMinRepeat.
+func dictWorthwhile(distinct, n int) bool {
+	return distinct > 0 && distinct < dictMaxCardinality && distinct*dictMinRepeat <= n
+}
+
+// distinctFold returns the field's distinct values, sorted by the evaluator's fold comparison with an
+// exact-byte tiebreak.
+//
+// The fold sort is what lets ordering comparisons become code range checks; the tiebreak keeps the order
+// total, so two values that fold equal still get distinct, adjacent codes -- which is what =?= needs.
+func distinctFold(vals [][]byte, present []bool) [][]byte {
+	seen := make(map[string]struct{}, 16)
+	var uniq [][]byte
+	for k, v := range vals {
+		if !present[k] {
+			continue
+		}
+		if _, ok := seen[string(v)]; ok {
+			continue
+		}
+		seen[string(v)] = struct{}{}
+		uniq = append(uniq, v)
+	}
+	sortDictFold(uniq)
+	return uniq
+}
+
+func sortDictFold(uniq [][]byte) {
+	// Insertion sort: a block's cardinality is bounded by dictMaxCardinality and in practice small, and
+	// this runs once per block at seal time rather than per query.
+	for i := 1; i < len(uniq); i++ {
+		for j := i; j > 0 && dictLess(uniq[j], uniq[j-1]); j-- {
+			uniq[j], uniq[j-1] = uniq[j-1], uniq[j]
+		}
+	}
+}
+
+func dictLess(a, b []byte) bool {
+	if c := classad.CompareStringsFold(bytesToStr(a), bytesToStr(b)); c != 0 {
+		return c < 0
+	}
+	return string(a) < string(b) // total order for fold-equal values, so =?= keeps distinct codes
+}
+
+// bytesToStr aliases b as a string without copying. Safe here: every caller passes a subslice of an
+// immutable decompressed region or record buffer, and never retains the string past the comparison.
+func bytesToStr(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return unsafe.String(&b[0], len(b))
+}
+
+// dictEntries returns field fieldIdx's dictionary entries, aliasing the decompressed region and reusing
+// the caller's buffer.
+//
+// Parsed per call rather than cached on the block: the parse is a uvarint walk over a small dictionary and
+// happens once per BLOCK per query, against once per RECORD for the positional walk it replaces. Caching
+// the parsed slices on the block instead would pin a region the block cache is entitled to evict.
+//
+// buf is the caller's scratch, reused across blocks. Allocating it here made a 512-entry dictionary ~12 KB
+// of garbage per block -- across a segment, more garbage than the walk it replaces ever cost.
+func (b *columnarBlock) dictEntries(fieldIdx int, bc *blockCache, buf *[][]byte) ([][]byte, bool) {
+	info, ok := b.strDict[fieldIdx]
+	if !ok {
+		return nil, false
+	}
+	region, err := bc.stream(b, kindStrDict)
+	if err != nil || info.dictStart > len(region) {
+		return nil, false
+	}
+	p := region[info.dictStart:]
+	out := (*buf)[:0]
+	if cap(out) < info.count {
+		out = make([][]byte, 0, info.count)
+	}
+	for j := 0; j < info.count; j++ {
+		l, m := binary.Uvarint(p)
+		if m <= 0 || m+int(l) > len(p) {
+			return nil, false
+		}
+		out = append(out, p[m:m+int(l)])
+		p = p[m+int(l):]
+	}
+	*buf = out
+	return out, true
+}
+
+// dictCodes returns field fieldIdx's code column, its width, and the decompressed code region.
+func (b *columnarBlock) dictCodes(fieldIdx int, bc *blockCache) ([]byte, int, bool) {
+	info, ok := b.strDict[fieldIdx]
+	if !ok {
+		return nil, 0, false
+	}
+	region, err := bc.stream(b, kindStrCode)
+	if err != nil {
+		return nil, 0, false
+	}
+	end := info.codeStart + info.codeWidth*b.n
+	if end > len(region) {
+		return nil, 0, false
+	}
+	return region[info.codeStart:end], info.codeWidth, true
+}
+
+// dictCodeAt reads record k's code from a code column of the given width.
+func dictCodeAt(codes []byte, width, k int) int {
+	if width == 1 {
+		return int(codes[k])
+	}
+	return int(codes[2*k]) | int(codes[2*k+1])<<8
+}

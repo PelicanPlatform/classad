@@ -89,7 +89,7 @@ func fatFixture(tb testing.TB, n int) (*Collection, uint32) {
 // quantity the group policy has to bound.
 func blockRecordBytes(tb testing.TB, b *columnarBlock) int {
 	tb.Helper()
-	total := len(b.hot)
+	total := len(b.bits) + len(b.hotCol)
 	for _, kind := range []streamKind{kindColdNum, kindStr, kindCold} {
 		raw, err := b.regionRaw(kind)
 		if err != nil {
@@ -300,10 +300,10 @@ func TestColSegmentPersistMultiGroup(t *testing.T) {
 	}
 	for i := range cs.blocks {
 		a, b := cs.blocks[i], got.blocks[i]
-		if a.n != b.n || a.hotStride != b.hotStride {
-			t.Errorf("group %d: n/stride = %d/%d, want %d/%d", i, b.n, b.hotStride, a.n, a.hotStride)
+		if a.n != b.n || a.bitsStride != b.bitsStride {
+			t.Errorf("group %d: n/stride = %d/%d, want %d/%d", i, b.n, b.bitsStride, a.n, a.bitsStride)
 		}
-		if string(a.hot) != string(b.hot) {
+		if string(a.bits) != string(b.bits) || string(a.hotCol) != string(b.hotCol) {
 			t.Errorf("group %d: hot region differs after round-trip", i)
 		}
 		if string(a.strComp) != string(b.strComp) || string(a.coldComp) != string(b.coldComp) ||
@@ -442,7 +442,7 @@ func TestRowGroupsNoRunts(t *testing.T) {
 				blocks++
 				// A non-final block should either be alignment-driven and substantial, or contain one of
 				// the enormous records. Either way it must not be a runt.
-				bytes := blk.n * blk.hotStride
+				bytes := blk.n*blk.bitsStride + len(blk.hotCol)
 				if r, ok := blockRegionBytes(blk); ok {
 					bytes += r
 				}

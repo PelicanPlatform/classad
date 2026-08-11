@@ -160,9 +160,8 @@ func (cs *colScope) fromColdTail(id uint32) classad.Value {
 // slotInt reads a numeric field's raw slot value (a real's slot holds math.Float64bits).
 func (cs *colScope) slotInt(idx int, f adField) (int64, bool) {
 	b := cs.blk
-	base := cs.k * b.hotStride
-	if off, hot := b.hotFieldOff[idx]; hot {
-		return readIntLE(b.hot[base+off:], f.width, f.unsigned), true
+	if start, hot := b.hotColStart[idx]; hot {
+		return readIntLE(b.hotCol[start+cs.k*f.width:], f.width, f.unsigned), true
 	}
 	start, ok := b.coldFieldStart[idx]
 	if !ok {
@@ -179,8 +178,8 @@ func (cs *colScope) slotInt(idx int, f adField) (int64, bool) {
 // each record's hot region, so it is an uncompressed strided read like a hot numeric.
 func (cs *colScope) slotBool(f adField) bool {
 	b := cs.blk
-	base := cs.k*b.hotStride + b.schema.escBytes
-	return testBit(b.hot[base:base+b.schema.boolBytes], f.boolBit)
+	base := cs.k*b.bitsStride + b.schema.escBytes
+	return testBit(b.bits[base:base+b.schema.boolBytes], f.boolBit)
 }
 
 // slotString reads a string field from the record's string region.
