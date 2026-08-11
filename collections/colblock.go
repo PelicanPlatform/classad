@@ -3,6 +3,7 @@ package collections
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -143,6 +144,26 @@ type columnarBlock struct {
 
 	strComp, coldComp []byte // per-record string regions / cold tails, concatenated + compressed
 	strOff, coldOff   []int  // per-record cumulative offsets into the decompressed streams
+
+	// zones is the per-field [min,max] of this block's NUMERIC columns, keyed by schema field index,
+	// so a scan can skip the whole block when no value in it could satisfy a predicate. It is the
+	// row-group equivalent of the per-segment zone map, and row groups are what make it worth having:
+	// a segment-wide range over a 1 GiB segment rules out almost nothing, while a ~1 MiB group's does.
+	//
+	// Computed while encoding, where the values are already in hand -- a separate pass would cost the
+	// scan it is meant to save.
+	zones map[int]blockZone
+}
+
+// blockZone is one numeric column's range within a block.
+//
+// escaped matters for correctness, not for speed: min/max cover only values stored in the column, so
+// if any record in the block has this field ESCAPED (missing, wrong type, or too wide) its value is
+// not represented here and the range cannot rule the block out. A too-wide value in particular is by
+// definition outside the column's range, so pruning on an inexact zone would drop records that match.
+type blockZone struct {
+	zoneRange
+	escaped bool
 }
 
 // encodeColumnarBlock builds a columnar block from row-form records (each the output of
@@ -211,6 +232,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 		b.strOff = append(b.strOff, len(strCat))
 		b.coldOff = append(b.coldOff, len(coldCat))
 	}
+	b.zones = numericZones(s, b, recs)
 	b.coldNumComp = regionCodec.Compress(nil, coldRaw)
 	b.strComp = regionCodec.Compress(nil, strCat)
 	b.coldComp = regionCodec.Compress(nil, coldCat)
@@ -275,6 +297,60 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 		blocks = append(blocks, encodeColumnarBlock(s, nil, hot, regionCodec))
 	}
 	return blocks, offs
+}
+
+// numericZones computes each numeric field's [min,max] over the records being encoded, and whether
+// any record escaped that field. Reads the row-form records directly, since encodeColumnarBlock has
+// them in hand.
+func numericZones(s *adSchema, b *columnarBlock, recs [][]byte) map[int]blockZone {
+	if len(recs) == 0 {
+		return nil
+	}
+	out := make(map[int]blockZone, len(b.hotNum)+len(b.coldNum))
+	for _, idx := range append(append([]int(nil), b.hotNum...), b.coldNum...) {
+		f := s.fields[idx]
+		z := blockZone{zoneRange: zoneRange{Min: math.Inf(1), Max: math.Inf(-1)}}
+		n := 0
+		for _, r := range recs {
+			if testBit(r[:s.escBytes], idx) {
+				z.escaped = true
+				continue
+			}
+			raw := readIntLE(r[s.escBytes+f.off:], f.width, f.unsigned)
+			v := float64(raw)
+			if f.kind == akReal {
+				v = math.Float64frombits(uint64(raw))
+			}
+			if v < z.Min {
+				z.Min = v
+			}
+			if v > z.Max {
+				z.Max = v
+			}
+			n++
+		}
+		if n == 0 {
+			// Every record escaped: there is no range, and the block can never be pruned on it.
+			z.Min, z.Max, z.escaped = math.Inf(-1), math.Inf(1), true
+		}
+		out[idx] = z
+	}
+	return out
+}
+
+// mayMatch reports whether this block could hold a record satisfying every test on field idx. A block
+// with no zone for the field, or an inexact one (some record escaped), is never ruled out.
+func (b *columnarBlock) mayMatch(idx int, tests []zoneTest) bool {
+	z, ok := b.zones[idx]
+	if !ok || z.escaped {
+		return true
+	}
+	for _, t := range tests {
+		if !zoneMayMatch(z.zoneRange, t.op, t.vals) {
+			return false
+		}
+	}
+	return true
 }
 
 // scanInt calls fn for each record's value of a numeric (int/real read as int bits) field: a
