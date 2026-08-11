@@ -101,12 +101,12 @@ func sameValue(a, b classad.Value) bool {
 // position, and a boolean.
 func vecCorpus() *testSource {
 	return newTestSource([]map[string]string{
-		{"A": "10", "B": "3", "F": "true"},
-		{"A": "0", "B": "0", "F": "false"},
-		{"A": "2.5", "B": "2", "F": "true"},
-		{"A": "-7", "B": "0.5", "F": "false"},
-		{"B": "4", "F": "true"}, // A missing
-		{"A": "5"},              // B and F missing
+		{"A": "10", "B": "3", "F": "true", "S": `"user3"`},
+		{"A": "0", "B": "0", "F": "false", "S": `"USER3"`}, // same string, different case
+		{"A": "2.5", "B": "2", "F": "true", "S": `"user10"`},
+		{"A": "-7", "B": "0.5", "F": "false", "S": `""`}, // empty string
+		{"B": "4", "F": "true"},                          // A and S missing
+		{"A": "5"},                                       // B and F missing
 		{"A": "undefined", "B": "1"},
 		{"A": "9223372036854775807", "B": "2"}, // MaxInt64: + and * must overflow-check
 		{"A": "-9223372036854775808", "B": "-1"},
@@ -140,6 +140,15 @@ var vecExprs = []string{
 	"(A + B) * 2 > A", "(A > B) == (B < A)", "A > 4 && (B == 3 || B == 4)",
 	// constants
 	"true", "false", "1 > 0", "A > 4 && true",
+	// strings: every comparison operator folds case, the identity operators do not
+	`S == "user3"`, `S == "USER3"`, `S != "user3"`, `S < "user5"`, `S > "user5"`,
+	`S <= "user3"`, `S >= "USER3"`,
+	`S =?= "user3"`, `S =!= "user3"`, `S =?= "USER3"`, `S =!= "USER3"`,
+	`S == ""`, `S =?= undefined`,
+	`S == "user3" || S == "user10"`, `S == "user3" && A > 4`,
+	`S == A`,    // string against a number: the hook's problem
+	`S < A`,     // likewise, ordered
+	`S && true`, // a string as a logical operand
 }
 
 // TestVecMatchesScalarPerRecord is the executor's core test: same Program, per-record equality.
@@ -167,7 +176,7 @@ func TestVecMatchesScalarPerRecord(t *testing.T) {
 			}
 		}
 	}
-	if declined > 3 {
+	if declined > 0 {
 		t.Errorf("%d/%d expressions declined; the corpus is meant to be mostly servable",
 			declined, len(vecExprs))
 	}
@@ -182,8 +191,6 @@ func TestVecDeclinesUnsupported(t *testing.T) {
 		{"A": "1", "S": `"x"`},
 	})
 	for _, expr := range []string{
-		`S == "x"`,        // string column
-		`A == "x"`,        // string constant
 		`A ?: 5`,          // Elvis: a per-record select, no combine opcode
 		`size({1,2,3})`,   // delegated subtree (OpEvalNode)
 		`strcat("a","b")`, // function returning a string

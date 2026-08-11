@@ -35,6 +35,17 @@ var vecExprs = []string{
 	"RequestMemory > 4096 && WantCheckpoint",
 	"true",
 	"ProcId >= 0 && ProcId < 10",
+	// strings: the shape colScope already served zero-copy, now a column at a time
+	`Owner == "user3"`,
+	`Owner == "USER3"`, // == folds case
+	`Owner != "user3"`,
+	`Owner =?= "user3"`,
+	`Owner =!= "USER3"`, // =?= / =!= do not fold
+	`Owner < "user5"`,
+	`Owner == "user3" || Owner == "user10"`,
+	`Owner == "user3" && RequestCpus > 2`,
+	`Cmd == "/home/user3/run.sh"`,
+	`Owner == "user3" || RequestMemory > 8192`,
 }
 
 // rowCount is the independent reference: the ordinary row path, which decodes ads and evaluates the
@@ -92,8 +103,6 @@ func TestVectorEvalDeclinesGracefully(t *testing.T) {
 	defer c.Close()
 
 	for _, expr := range []string{
-		`Owner == "user3"`, // string column
-		`Owner == "user3" || ProcId == 1`,
 		`RequestMemory > 4096 ?: false`, // Elvis
 		`size(Args) > 0`,                // delegated subtree
 	} {
@@ -162,6 +171,8 @@ func BenchmarkVectorEval(b *testing.B) {
 		"RequestMemory > 4096 && (JobStatus == 1 || JobStatus == 4)",
 		"WantCheckpoint && RequestCpus > 2",
 		"ProcId + ClusterId > 100",
+		`Owner == "user3"`,
+		`Owner == "user3" || Owner == "user10"`,
 	} {
 		q, err := vm.Parse(expr)
 		if err != nil {

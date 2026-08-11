@@ -1,11 +1,14 @@
 package collections
 
 import (
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // Vectorized evaluation of an arbitrary constraint over columnar blocks.
@@ -88,10 +91,66 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst v
 	switch {
 	case f.kind == akBool:
 		return s.loadBool(idx, f, id, dst)
+	case f.kind == akString:
+		return s.loadStr(idx, id, dst)
 	case numericKind(f.kind):
 		return s.loadNum(idx, f, id, dst)
 	}
-	return false // akString: colScope reads these zero-copy; a vector has no string payload yet
+	return false
+}
+
+// loadStr loads a string column, aliasing the block's decompressed string region rather than copying.
+//
+// The region is POSITIONAL -- uvarint(len)+bytes per non-escaped string field in schema order -- so
+// reaching a field means walking the string fields before it, per record. That walk is the same one
+// colScope does; what the vector path removes is the per-operator resolver call and the boxed value
+// around it, not the walk.
+//
+// Copying is what a string predicate cannot afford: one allocation per record made a string comparison
+// slower in the columnar path than in the row path, which is why this aliases and why Vec's elements are
+// released back to the pool (see VecScratch.Release).
+func (s *blockVecSource) loadStr(idx int, id uint32, dst vm.Vec) bool {
+	b := s.blk
+	region, err := s.bc.stream(b, kindStr)
+	if err != nil {
+		return false
+	}
+	escFree := b.escapeFree(idx)
+	for k := 0; k < b.n; k++ {
+		esc := b.escapeAt(k)
+		if !escFree && testBit(esc, idx) {
+			dst.St[k] = vm.VsUndef // repaired from the cold tail below
+			continue
+		}
+		rec := region[b.strOff[k]:b.strOff[k+1]]
+		found := false
+		for i := range b.schema.fields {
+			if b.schema.fields[i].kind != akString || testBit(esc, i) {
+				continue
+			}
+			l, n := binary.Uvarint(rec)
+			if n <= 0 || int(l)+n > len(rec) {
+				return false
+			}
+			if i == idx {
+				if l == 0 {
+					dst.SetString(k, "")
+				} else {
+					dst.SetString(k, unsafe.String(&rec[n], int(l)))
+				}
+				found = true
+				break
+			}
+			rec = rec[n+int(l):]
+		}
+		if !found {
+			return false
+		}
+	}
+	if escFree {
+		return true
+	}
+	return s.fixEscapes(idx, id, dst)
 }
 
 // loadNum loads a numeric column, then repairs the escaped elements from the cold tail.
@@ -127,9 +186,14 @@ func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst vm.Vec) boo
 }
 
 // fixEscapes overwrites the elements whose value did not fit its slot. An escape means the value is
-// MISSING or UNSTORABLE: missing is UNDEFINED, a scalar is read from the cold tail, and anything else
-// -- a string, a computed expression -- declines the block, because only the ordinary evaluator can
-// give the right answer for it.
+// MISSING or UNSTORABLE: missing is UNDEFINED, and any scalar literal is read from the cold tail --
+// including one of the wrong type for the column, since a number where the schema expects a string is
+// exactly what escaping is for. Only a computed expression declines, because only the ordinary
+// evaluator can resolve one against the rest of the ad.
+//
+// Reading the value as whatever type it actually is, rather than insisting it match the column, is what
+// keeps a handful of odd records from declining a whole block: the kernels route a mismatched type
+// through the parity hook and get the reference's answer for it.
 func (s *blockVecSource) fixEscapes(idx int, id uint32, dst vm.Vec) bool {
 	for k := 0; k < s.blk.n; k++ {
 		if !testBit(s.blk.escapeAt(k), idx) {
@@ -143,17 +207,23 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst vm.Vec) bool {
 			dst.St[k] = vm.VsUndef
 			continue
 		}
-		nv, ok := nodeColVal(node)
+		lit, ok := wire.LiteralValue(node)
 		if !ok {
-			return false
+			return false // a computed expression
 		}
-		switch nv.kind {
-		case akReal:
-			dst.SetReal(k, nv.f)
-		case akBool:
-			dst.SetBool(k, nv.i != 0)
+		switch lit.Kind {
+		case wire.LitInt:
+			dst.SetInt(k, lit.Int)
+		case wire.LitReal:
+			dst.SetReal(k, lit.Real)
+		case wire.LitBool:
+			dst.SetBool(k, lit.Bool)
+		case wire.LitString:
+			dst.SetString(k, lit.Str)
+		case wire.LitUndef:
+			dst.St[k] = vm.VsUndef
 		default:
-			dst.SetInt(k, nv.i)
+			dst.St[k] = vm.VsError
 		}
 	}
 	return true
@@ -174,7 +244,10 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 	resolver := cs.resolve
 	src := &blockVecSource{c: c, bc: st.cache}
 	scratch := vecScratchPool.Get().(*vm.VecScratch)
-	defer vecScratchPool.Put(scratch)
+	defer func() {
+		scratch.Release()
+		vecScratchPool.Put(scratch)
+	}()
 	var live []bool
 	var split vecSplit
 	defer func() { lastVecSplit.Store(&split) }()

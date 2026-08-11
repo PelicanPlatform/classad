@@ -44,11 +44,12 @@ import (
 // Element states. A vector carries one per element, which is how three-valued logic and ERROR survive
 // vectorization, and how int and real stay distinguishable -- 7/2 is not 7.0/2.0.
 const (
-	VsInt   uint8 = iota // I[i] is the integer
-	VsReal               // I[i] is math.Float64bits of the real
-	VsBool               // I[i] is 0 or 1
-	VsUndef              // UNDEFINED
-	VsError              // ERROR
+	VsInt    uint8 = iota // I[i] is the integer
+	VsReal                // I[i] is math.Float64bits of the real
+	VsBool                // I[i] is 0 or 1
+	VsUndef               // UNDEFINED
+	VsError               // ERROR
+	VsString              // S[i] is the string
 )
 
 // Vec is one batch of values. The payload is a single int64 slice because that is how both
@@ -56,10 +57,17 @@ const (
 // into a vector is a copy rather than a conversion, and no precision is lost for integers above 2^53.
 type Vec struct {
 	I  []int64
+	S  []string
 	St []uint8
 }
 
-func newVec(n int) Vec { return Vec{I: make([]int64, n), St: make([]uint8, n)} }
+// newVec allocates the string payload unconditionally rather than on first use. A numeric-only program
+// pays 16 bytes per element for a slice it never reads, which is worth not having a Vec whose payload
+// can be missing: LoadColumn receives a Vec by value and could not allocate into its caller's.
+// The stacks are pooled across queries, so this is paid once, not per query.
+func newVec(n int) Vec {
+	return Vec{I: make([]int64, n), S: make([]string, n), St: make([]uint8, n)}
+}
 
 // Float returns element i as a float64 whatever its numeric state.
 func (v Vec) Float(i int) float64 {
@@ -70,8 +78,10 @@ func (v Vec) Float(i int) float64 {
 }
 
 // SetReal/SetInt/SetBool write one element.
-func (v Vec) SetReal(i int, f float64) { v.St[i], v.I[i] = VsReal, int64(math.Float64bits(f)) }
-func (v Vec) SetInt(i int, x int64)    { v.St[i], v.I[i] = VsInt, x }
+func (v Vec) SetReal(i int, f float64)  { v.St[i], v.I[i] = VsReal, int64(math.Float64bits(f)) }
+func (v Vec) SetInt(i int, x int64)     { v.St[i], v.I[i] = VsInt, x }
+func (v Vec) SetString(i int, s string) { v.St[i], v.S[i] = VsString, s }
+
 func (v Vec) SetBool(i int, b bool) {
 	v.St[i] = VsBool
 	if b {
@@ -90,6 +100,8 @@ func (v Vec) value(i int) classad.Value {
 		return classad.NewRealValue(math.Float64frombits(uint64(v.I[i])))
 	case VsBool:
 		return classad.NewBoolValue(v.I[i] != 0)
+	case VsString:
+		return classad.NewStringValue(v.S[i])
 	case VsUndef:
 		return classad.NewUndefinedValue()
 	default:
@@ -119,6 +131,12 @@ func (v Vec) setValue(i int, val classad.Value) bool {
 			return false
 		}
 		v.SetBool(i, b)
+	case classad.StringValue:
+		str, err := val.StringValue()
+		if err != nil {
+			return false
+		}
+		v.SetString(i, str)
 	case classad.UndefinedValue:
 		v.St[i] = VsUndef
 	case classad.ErrorValue:
@@ -293,6 +311,14 @@ func broadcast(v Vec, c classad.Value) bool {
 			return false
 		}
 		fillBool(v, b)
+	case classad.StringValue:
+		str, err := c.StringValue()
+		if err != nil {
+			return false
+		}
+		for i := range v.St {
+			v.St[i], v.S[i] = VsString, str
+		}
 	case classad.UndefinedValue:
 		fillState(v, VsUndef)
 	case classad.ErrorValue:
@@ -317,6 +343,8 @@ func binopVec(ev *classad.Evaluator, op string, l, r Vec) bool {
 		return compareVec(ev, op, l, r)
 	case "+", "-", "*":
 		return arithVec(ev, op, l, r)
+	case "=?=", "=!=":
+		return identicalVec(op, l, r)
 	default:
 		return hookAll(ev, op, l, r)
 	}
@@ -327,6 +355,13 @@ func binopVec(ev *classad.Evaluator, op string, l, r Vec) bool {
 func compareVec(ev *classad.Evaluator, op string, l, r Vec) bool {
 	for i := range l.St {
 		ls, rs := l.St[i], r.St[i]
+		if ls == VsString && rs == VsString {
+			// Case-INSENSITIVE, via the evaluator's own comparison function. Every ClassAd comparison
+			// operator folds case; only the identity operators =?= and =!= do not. Sharing the function
+			// is what makes matching the reference a fact rather than a hope.
+			l.SetBool(i, cmpResult(op, classad.CompareStringsFold(l.S[i], r.S[i])))
+			continue
+		}
 		if !numeric(ls) || !numeric(rs) {
 			if !hookOne(ev, op, l, r, i) {
 				return false
@@ -493,3 +528,63 @@ func hookAll(ev *classad.Evaluator, op string, l, r Vec) bool {
 // IsTrue reports whether element i is TRUE, which is what counting matches needs. UNDEFINED and ERROR
 // are not matches.
 func (v Vec) IsTrue(i int) bool { return v.St[i] == VsBool && v.I[i] == 1 }
+
+// cmpResult turns a three-way comparison into the operator's boolean.
+func cmpResult(op string, c int) bool {
+	switch op {
+	case "<":
+		return c < 0
+	case "<=":
+		return c <= 0
+	case ">":
+		return c > 0
+	case ">=":
+		return c >= 0
+	case "==":
+		return c == 0
+	case "!=":
+		return c != 0
+	}
+	return false
+}
+
+// identicalVec is =?= / =!=: total, never undefined, and case SENSITIVE for strings. Two elements are
+// identical when their ClassAd TYPES match and their payloads match -- so 1 =?= 1.0 is false, which is
+// why int and real are distinct states rather than one numeric state.
+//
+// Hand-written rather than hooked because the rule is a type check plus a payload compare, with no
+// coercion to get wrong, and because a Vec cannot hold the values (lists, nested ads) whose identity
+// the reference treats as an error.
+func identicalVec(op string, l, r Vec) bool {
+	negate := op == "=!="
+	for i := range l.St {
+		same := l.St[i] == r.St[i]
+		if same {
+			switch l.St[i] {
+			case VsInt, VsReal, VsBool:
+				same = l.I[i] == r.I[i]
+			case VsString:
+				same = l.S[i] == r.S[i]
+			}
+		}
+		if negate {
+			same = !same
+		}
+		l.SetBool(i, same)
+	}
+	return true
+}
+
+// Release drops the vector stack's references to string payloads and returns the scratch to a state
+// safe to keep in a pool.
+//
+// A string element aliases a block's decompressed string region rather than copying it, so a pooled
+// stack would otherwise pin whichever region it last read -- for as long as the pool holds it, and even
+// if the table it came from has since been dropped. The regions are heap buffers, so this is a retention
+// question rather than the use-after-munmap hazard aliasing mmap'd memory would create, but a few
+// thousand pointer writes per query is a cheap way not to have the question at all.
+func (s *VecScratch) Release() {
+	for i := range s.stack {
+		clear(s.stack[i].S)
+	}
+}
