@@ -79,6 +79,20 @@ const (
 	// default. Well above the byte budget's reach for any ad fat enough for the byte rule to bind.
 	colGroupMaxRows = 8192
 
+	// colGroupAlign is the row-count multiple a byte-sealed row group is rounded UP to.
+	//
+	// Eight int64s are one cache line and one AVX-512 vector, and eight booleans are one byte of the
+	// bool bitset, so an aligned block lets a column kernel run whole vectors with no tail. The value of
+	// aligning is not the handful of records it shifts between blocks -- it is that a kernel's tail
+	// handling then runs once per SEGMENT rather than once per block, because only a segment's FINAL
+	// group is short. That last group cannot be aligned: it holds whatever records remain, and padding it
+	// would mean storing records that do not exist.
+	//
+	// Applied to the byte rule only. An explicit maxRows policy seals exactly, so a test sweeping group
+	// sizes still gets the size it asked for, and neither does an ad so large that the budget trips
+	// within the first colGroupAlign records.
+	colGroupAlign = 8
+
 	// colGroupRows is the reference point the measurements above were taken at: what
 	// colGroupTargetBytes works out to for OSPool slot ads (~8867 B/ad of regions). Kept as the
 	// documented equivalence, and used by tests that need an exact row-count grouping.
@@ -86,7 +100,8 @@ const (
 )
 
 // colGrouping is the row-group sealing policy: seal a group once its records reach targetBytes of
-// uncompressed row form, or maxRows records, whichever comes first.
+// uncompressed row form, or maxRows records, whichever comes first. Where the byte rule trips, the block
+// is sealed at the last colGroupAlign boundary that still fits the budget (see sealAt).
 //
 // A zero targetBytes means "no byte rule" -- group purely by row count, which is what a test
 // sweeping exact group sizes wants. A zero maxRows means colGroupMaxRows.
@@ -114,6 +129,41 @@ func (g colGrouping) full(rows, bytes int) bool {
 	}
 	return g.targetBytes > 0 && bytes >= g.targetBytes
 }
+
+// sealAt returns how many of the group's rows to seal into a block now, given the row count and bytes
+// that tripped full(), plus the row count and bytes as of the last colGroupAlign boundary.
+//
+// Alignment is a choice of SEAL POINT, not of when to notice the budget. Rounding UP to the next
+// boundary would be simpler and is wrong: it puts the block OVER the byte budget by up to
+// colGroupAlign-1 records, which for a 1 MiB budget and ordinary ads is a couple of percent but for a
+// single pathological half-megabyte ad is several times over -- and the budget exists precisely so that
+// no block is too big to cache. Sealing the last aligned PREFIX and carrying the remainder into the next
+// group keeps both properties.
+//
+// Returns len(rows) when there is no aligned prefix to fall back to: an explicit maxRows policy (which
+// seals exactly, so a test gets the group size it asked for), and ads so large that the budget trips
+// within the first colGroupAlign records.
+func (g colGrouping) sealAt(rows, bytes, alignedRows, alignedBytes int) (seal, sealBytes int) {
+	if g.targetBytes <= 0 || bytes <= g.targetBytes {
+		return rows, bytes // the row cap tripped, or the byte rule tripped exactly on budget
+	}
+	if alignedRows <= 0 || alignedRows >= rows {
+		return rows, bytes
+	}
+	// Backing off to the aligned prefix must not produce a runt. Record sizes vary by orders of
+	// magnitude -- a few small ads followed by one enormous one will trip the budget a record or two past
+	// a boundary, and sealing the prefix would then emit a block holding almost nothing while the ad that
+	// actually filled the budget carries forward. Below the floor, take the aligned-but-over block
+	// instead: the overshoot is one record's worth and is caused by that record, which no split avoids.
+	if alignedBytes < g.minGroupBytes() {
+		return rows, bytes
+	}
+	return alignedRows, alignedBytes
+}
+
+// minGroupBytes is the smallest block the aligned-prefix back-off may produce, as a fraction of the byte
+// budget rather than an absolute, so a test configuring a small budget still gets a proportionate floor.
+func (g colGrouping) minGroupBytes() int { return g.targetBytes / 2 }
 
 // columnarBlock is the PAX layout for a row-group of adSchema records (see adschema.go): the
 // schema's popular ("hot") numeric fields plus the escape and bool bitsets stay uncompressed
@@ -264,6 +314,9 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 	var offs []uint32
 	var buf []byte
 	groupBytes := 0
+	// The group's extent as of the last colGroupAlign boundary, so an over-budget group can be sealed
+	// there rather than past it. See sealAt.
+	alignedRows, alignedBytes := 0, 0
 	for off := 0; off < upto; {
 		o := uint32(off)
 		total := recTotalLen(data, o)
@@ -278,9 +331,21 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 					recs = append(recs, rec)
 					offs = append(offs, o)
 					groupBytes += len(rec)
+					if len(recs)%colGroupAlign == 0 {
+						alignedRows, alignedBytes = len(recs), groupBytes
+					}
 					if g.full(len(recs), groupBytes) {
-						blocks = append(blocks, encodeColumnarBlock(s, recs, hot, regionCodec))
-						recs, groupBytes = recs[:0], 0
+						seal, sealBytes := g.sealAt(len(recs), groupBytes, alignedRows, alignedBytes)
+						blocks = append(blocks, encodeColumnarBlock(s, recs[:seal], hot, regionCodec))
+						// Carry the records past the seal point into the next group. encodeColumnarBlock
+						// has already copied what it needs out of the record slices, so moving their
+						// headers down is safe; offs is per SEGMENT and is not reset.
+						n := copy(recs, recs[seal:])
+						recs, groupBytes = recs[:n], groupBytes-sealBytes
+						alignedRows, alignedBytes = 0, 0
+						if n > 0 && n%colGroupAlign == 0 {
+							alignedRows, alignedBytes = n, groupBytes
+						}
 					}
 				}
 			}
