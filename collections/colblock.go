@@ -353,6 +353,98 @@ func (b *columnarBlock) mayMatch(idx int, tests []zoneTest) bool {
 	return true
 }
 
+// escapeFree reports whether NO record in this block escaped fieldIdx, so a reader can skip the
+// per-record escape test entirely.
+//
+// The answer is already recorded: numericZones sets blockZone.escaped while encoding, for the zone
+// pruning that came with row groups. Spending it here costs nothing and removes a slice construction
+// plus a bit test from every value read. Only numeric fields carry a zone, which is where the hot
+// scans are.
+func (b *columnarBlock) escapeFree(fieldIdx int) bool {
+	z, ok := b.zones[fieldIdx]
+	return ok && !z.escaped
+}
+
+// loadIntBatch fills dst[0:b.n] with a column's raw slot values, or reports false when the field is
+// not a numeric column here.
+//
+// It does NOT require the block to be escape-free, and that is deliberate. An earlier version bailed
+// when any record had escaped, which sounds cheap and is not: with ~1000-record row groups, even a
+// 0.1% escape rate leaves only about a third of blocks eligible, and 1% leaves almost none -- so the
+// fast path would essentially never fire on real data. Instead the load runs unconditionally and the
+// CALLER checks the escape bit as it walks, reading those few records from the cold tail. Escaped
+// slots hold undefined bytes, so a caller must not use dst[k] without that check (see escapeFree,
+// which lets it skip the check entirely when the block has none).
+//
+// This is the batch form of scanInt, and it is where the measured cost actually was. Removing the
+// per-record escape test and readIntLE's byte-at-a-time read left the callback itself as the
+// bottleneck: a closure call per record. Separating "load the column" from "apply the predicate" lets
+// both be tight loops over contiguous memory, which is what the vectorization spike measured as the
+// win -- applied to the paths that already exist rather than to a new engine.
+func (b *columnarBlock) loadIntBatch(fieldIdx int, bc *blockCache, dst []int64) bool {
+	f := b.schema.fields[fieldIdx]
+	if !numericKind(f.kind) {
+		return false
+	}
+	if off, hot := b.hotFieldOff[fieldIdx]; hot {
+		loadIntsTyped(dst, b.hot, b.hotStride, off, f.width, f.unsigned, b.n)
+		return true
+	}
+	start, ok := b.coldFieldStart[fieldIdx]
+	if !ok {
+		return false
+	}
+	coldNum, err := bc.stream(b, kindColdNum)
+	if err != nil {
+		return false
+	}
+	loadIntsTyped(dst, coldNum[start:], f.width, 0, f.width, f.unsigned, b.n)
+	return true
+}
+
+// loadIntsTyped fills dst from a strided column with the width decision hoisted OUT of the loop.
+//
+// readIntLE reads a value byte at a time and then branches to sign-extend, so a generic loop pays a
+// loop and a branch per VALUE. A column has one width for the whole block by construction -- widths
+// are per-field and fitted by chooseIntWidth -- so the switch belongs outside, and each case is a
+// single machine load.
+func loadIntsTyped(dst []int64, src []byte, stride, off, width int, unsigned bool, n int) {
+	switch {
+	case width == 1 && unsigned:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(src[k*stride+off])
+		}
+	case width == 1:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(int8(src[k*stride+off]))
+		}
+	case width == 2 && unsigned:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(binary.LittleEndian.Uint16(src[k*stride+off:]))
+		}
+	case width == 2:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(int16(binary.LittleEndian.Uint16(src[k*stride+off:])))
+		}
+	case width == 4 && unsigned:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(binary.LittleEndian.Uint32(src[k*stride+off:]))
+		}
+	case width == 4:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(int32(binary.LittleEndian.Uint32(src[k*stride+off:])))
+		}
+	case width == 8:
+		for k := 0; k < n; k++ {
+			dst[k] = int64(binary.LittleEndian.Uint64(src[k*stride+off:]))
+		}
+	default: // a 6-byte or otherwise unusual fitted width
+		for k := 0; k < n; k++ {
+			dst[k] = readIntLE(src[k*stride+off:], width, unsigned)
+		}
+	}
+}
+
 // scanInt calls fn for each record's value of a numeric (int/real read as int bits) field: a
 // hot field reads the uncompressed region directly (no decode); a cold field decompresses its
 // column group once (via bc, nil for no cache). present is false for a missing/exceptional
