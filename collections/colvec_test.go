@@ -46,6 +46,16 @@ var vecExprs = []string{
 	`Owner == "user3" && RequestCpus > 2`,
 	`Cmd == "/home/user3/run.sh"`,
 	`Owner == "user3" || RequestMemory > 8192`,
+	// Results that are NOT boolean. A constraint whose value is a number never matches -- the store takes a
+	// boolean or nothing -- which is a different rule from the truthiness a logical OPERAND gets, and the
+	// two live in different places now (Vec.IsTrue vs dataStateToMask). These pin both.
+	"RequestMemory",  // data-form result: no match, ever
+	"ProcId + 1",     // likewise
+	"!RequestMemory", // truthy operand, boolean result: 42 is true, so this is false
+	"!ProcId",        // ProcId is 0 for a tenth of records, where !0 is TRUE
+	"WantCheckpoint", // a bool column, delivered as a mask with no data form in between
+	"!WantCheckpoint && RequestCpus > 1",
+	"RequestMemory > 0 && WantCheckpoint",
 }
 
 // rowCount is the independent reference: the ordinary row path, which decodes ads and evaluates the
@@ -84,10 +94,15 @@ func TestVectorEvalCountAgrees(t *testing.T) {
 		if want := rowCount(t, c, expr); got != want {
 			t.Errorf("%q: vectorized %d != row %d", expr, got, want)
 		}
+		// Every block must be accounted for, and at least one must have been vectorized OR pruned. A
+		// fully pruned query is a legitimate outcome -- `!RequestMemory` is prunable because the fixture
+		// never stores a zero there -- but "nothing was vectorized and nothing was pruned" means the
+		// comparison ran entirely on the fallback and proves nothing about this executor.
 		split := lastVecSplit.Load()
-		if split.vecBlocks == 0 {
-			t.Errorf("%q: no block was vectorized (%d declined to colScope); the comparison is vacuous",
-				expr, split.scopeBlocks)
+		if split.vecBlocks == 0 && split.prunedBlocks == 0 {
+			t.Errorf("%q: nothing vectorized and nothing pruned (%d declined, %d churn, %d empty, %d row "+
+				"windows); the comparison is vacuous", expr, split.scopeBlocks, split.churnBlocks,
+				split.emptyBlocks, split.rowWindows)
 		}
 		if split.scopeBlocks != 0 {
 			t.Logf("%q: %d/%d blocks vectorized, %d declined",
