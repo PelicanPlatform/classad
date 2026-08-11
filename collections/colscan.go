@@ -538,7 +538,9 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 	// resolves the field per block against each block's own schema.
 	fieldID, eval, ok := c.numPredOnField(q, st.schema)
 	if !ok {
-		return 0, false
+		// Not a scalar comparison. A lone presence probe (`attr is undefined`) is still
+		// columnar-servable straight from the escape bitmap -- see PresenceCountQuery.
+		return c.PresenceCountQuery(q)
 	}
 	// As NumStatsQuery: record the predicate's attribute so the hot tier keeps tracking the
 	// columns queries actually read, instead of freezing once the accelerator starts serving them.
