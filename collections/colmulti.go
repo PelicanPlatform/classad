@@ -27,9 +27,19 @@ import (
 // is what lets each pass simply narrow the candidate set.
 
 // fieldPred is one field's combined test: the conjunction of every probe on that field.
+//
+// tests keeps each probe's (op, values) alongside the compiled eval, because a block's zone can rule
+// the block out from the operator and bound alone -- and an eval closure cannot be reasoned about.
 type fieldPred struct {
 	fieldID uint32
 	eval    func(float64) bool
+	tests   []zoneTest
+}
+
+// zoneTest is one comparison in the form the zone map reasons about (see zoneMayMatch).
+type zoneTest struct {
+	op   string
+	vals []float64
 }
 
 // numPredsOnFields analyzes q as a conjunction of scalar numeric comparisons over ANY number of
@@ -45,6 +55,7 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 	}
 	order := make([]uint32, 0, len(probes))
 	cmps := make(map[uint32][]func(float64) bool, len(probes))
+	tests := make(map[uint32][]zoneTest, len(probes))
 	for _, p := range probes {
 		id, ok := c.intern.LookupID(p.Attr)
 		if !ok {
@@ -66,6 +77,7 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 			order = append(order, id)
 		}
 		cmps[id] = append(cmps[id], cmp)
+		tests[id] = append(tests[id], zoneTest{op: up.op, vals: up.fvals})
 	}
 	if len(order) == 0 {
 		return nil, false
@@ -74,7 +86,7 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 	for _, id := range order {
 		list := cmps[id]
 		if len(list) == 1 {
-			preds = append(preds, fieldPred{fieldID: id, eval: list[0]})
+			preds = append(preds, fieldPred{fieldID: id, eval: list[0], tests: tests[id]})
 			continue
 		}
 		preds = append(preds, fieldPred{fieldID: id, eval: func(v float64) bool {
@@ -84,7 +96,7 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 				}
 			}
 			return true
-		}})
+		}, tests: tests[id]})
 	}
 	return preds, true
 }
@@ -118,6 +130,13 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 			}
 			base := 0
 			for _, blk := range cs.blocks {
+				// Skip the whole block when its own column ranges rule it out -- no visibility
+				// walk, no column reads, no cold-tail decompression. This is where row groups pay
+				// off a second time: the finer the block, the more a selective predicate can skip.
+				if !blockMayMatch(blk, idxs, preds) {
+					base += blk.n
+					continue
+				}
 				if cap(keep) < blk.n {
 					keep = make([]bool, blk.n)
 				}
@@ -150,6 +169,16 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 		releaseWindows(wins)
 	}
 	return count
+}
+
+// blockMayMatch reports whether blk could hold a record satisfying every predicate.
+func blockMayMatch(blk *columnarBlock, idxs []int, preds []fieldPred) bool {
+	for i := range preds {
+		if !blk.mayMatch(idxs[i], preds[i].tests) {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveFields maps each predicate's field to its index in this SEGMENT's schema. Segments sealed

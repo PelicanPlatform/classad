@@ -3,6 +3,7 @@ package collections
 import (
 	"encoding/binary"
 	"hash/crc32"
+	"math"
 )
 
 // Serialization of a sealed segment's columnar accelerator (schema + block streams + the
@@ -26,8 +27,14 @@ const (
 	// derived state, so no migration is needed. v3 in particular MUST be a version bump rather than
 	// a silent change: a v2 section's regions were compressed with a trained dictionary, so decoding
 	// them with the base codec would fail or, worse, be attempted against whatever dictionary the
-	// segment currently carries.
-	colSectionVersion = 3
+	// segment currently carries. v4 adds each block's per-field numeric zones.
+	//
+	// The zones are persisted rather than recomputed on reload because computing them costs a full
+	// pass over every column -- exactly the work they exist to skip -- so a reopened table would lose
+	// block pruning until something rebuilt its blocks. A missing zone is SAFE (mayMatch never rules
+	// a block out without one), so this is a performance property, which is precisely the kind that
+	// disappears quietly.
+	colSectionVersion = 4
 	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
 )
 
@@ -140,6 +147,17 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 		for _, v := range b.coldOff {
 			dst = appendU32(dst, uint32(v))
 		}
+		dst = appendU32(dst, uint32(len(b.zones)))
+		for idx, z := range b.zones {
+			dst = appendU32(dst, uint32(idx))
+			dst = appendU64(dst, math.Float64bits(z.Min))
+			dst = appendU64(dst, math.Float64bits(z.Max))
+			esc := uint32(0)
+			if z.escaped {
+				esc = 1
+			}
+			dst = appendU32(dst, esc)
+		}
 	}
 	dst = appendU32(dst, uint32(len(cs.offs)))
 	for _, o := range cs.offs {
@@ -190,6 +208,24 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 		b.coldComp = c.bytes()
 		b.strOff = readInts(c)
 		b.coldOff = readInts(c)
+		if nz := int(c.u32()); nz > 0 {
+			if nz > len(s.fields) || !c.need(0) {
+				return nil
+			}
+			b.zones = make(map[int]blockZone, nz)
+			for j := 0; j < nz; j++ {
+				idx := int(c.u32())
+				z := blockZone{zoneRange: zoneRange{
+					Min: math.Float64frombits(c.u64()),
+					Max: math.Float64frombits(c.u64()),
+				}}
+				z.escaped = c.u32() != 0
+				if idx < 0 || idx >= len(s.fields) {
+					return nil
+				}
+				b.zones[idx] = z
+			}
+		}
 		if c.err != nil {
 			return nil
 		}
