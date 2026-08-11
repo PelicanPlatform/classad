@@ -379,6 +379,37 @@ func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (
 	return 0, false, nil
 }
 
+// escapedNode returns the raw wire node an ESCAPED field holds in record k's cold tail, without
+// interpreting it. found=false means the attribute is not in the tail at all, i.e. genuinely absent
+// from the record.
+//
+// Presence needs the node rather than a value: whether an attribute is UNDEFINED depends on which
+// literal it is (or on evaluating it, if it is an expression), and a value-returning accessor throws
+// exactly that away. Reads only this field, not the whole record.
+func (b *columnarBlock) escapedNode(k int, fieldID uint32, bc *blockCache) (node []byte, found bool, err error) {
+	tail, err := bc.stream(b, kindCold)
+	if err != nil {
+		return nil, false, err
+	}
+	cold := tail[b.coldOff[k]:b.coldOff[k+1]]
+	for len(cold) > 0 {
+		id, m := binary.Uvarint(cold)
+		if m <= 0 {
+			return nil, false, nil // malformed tail: treat fieldID as absent
+		}
+		cold = cold[m:]
+		nl, ok := wire.NodeLen(cold)
+		if !ok || nl > len(cold) {
+			return nil, false, nil
+		}
+		if uint32(id) == fieldID {
+			return cold[:nl], true, nil
+		}
+		cold = cold[nl:]
+	}
+	return nil, false, nil
+}
+
 // escapedNumVal is escapedNumField returning the value WITH its ClassAd kind. A caller that
 // renders or sums the value needs the kind, and the cold tail carries the wire node, so it is read
 // from the node rather than assumed from the segment's schema (an escaped value is by definition
