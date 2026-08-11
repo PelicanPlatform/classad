@@ -74,19 +74,40 @@ func TestCountQueryAutoRoute(t *testing.T) {
 		}
 	}
 
-	// Not columnar-eligible: must decline (ok=false) so the caller uses the normal scan.
+	// A conjunction across SEVERAL numeric fields is columnar-eligible too (see numPredsOnFields):
+	// the shape is still `Attr OP literal`, just repeated, so it is served by one narrowing pass per
+	// column rather than by a full row scan.
 	for _, expr := range []string{
-		`Machine == "m0001"`,        // string field, not int schema
-		"Cpus > 2 && Memory > 4096", // two fields
-		"Memory > 4096 || Cpus > 2", // disjunction across fields
-		"Cpus > 2",                  // int field but not the hot/scanned one? still int -> eligible IF Cpus is an int schema field
+		"Cpus > 2",
+		"Cpus > 2 && Memory > 4096",
+		"Cpus > 2 && Memory > 4096 && Memory < 9000",
 	} {
 		q, _ := vm.Parse(expr)
-		if _, ok := store.CountQuery(q); ok {
-			// Cpus is a valid int schema field, so "Cpus > 2" legitimately routes; only assert
-			// the genuinely-ineligible ones decline.
-			if expr != "Cpus > 2" {
-				t.Errorf("%q: CountQuery accepted an ineligible predicate", expr)
+		got, ok := store.CountQuery(q)
+		if !ok {
+			t.Errorf("%q: CountQuery declined a multi-field conjunction of scalar comparisons", expr)
+			continue
+		}
+		if want := storeCount(expr); got != want {
+			t.Errorf("%q: CountQuery = %d, store.Query = %d", expr, got, want)
+		}
+	}
+
+	// Not columnar-eligible: must decline (ok=false) so the caller uses the normal scan.
+	for _, expr := range []string{
+		`Machine == "m0001"`,                    // string field, not a numeric schema field
+		"Memory > 4096 || Cpus > 2",             // disjunction: the probes do not cover it
+		"Memory > Cpus",                         // no literal to compare against
+		"Memory > 4096 && Machine == \"m0001\"", // one conjunct on a string field
+	} {
+		q, _ := vm.Parse(expr)
+		if got, ok := store.CountQuery(q); ok {
+			// Serving is only a bug if the answer differs; assert the stronger property.
+			if want := storeCount(expr); got != want {
+				t.Errorf("%q: CountQuery accepted an ineligible predicate AND answered %d (want %d)",
+					expr, got, want)
+			} else {
+				t.Errorf("%q: CountQuery accepted a predicate expected to be ineligible", expr)
 			}
 		}
 	}

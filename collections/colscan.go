@@ -536,6 +536,21 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 	// The predicate analysis is shared with NumStatsQuery (see numPredOnField). fieldID is only
 	// the routing decision -- the attr is a numeric field in the CURRENT schema; the scan
 	// resolves the field per block against each block's own schema.
+	// Multi-field first: it subsumes the single-field case (one combined predicate) and additionally
+	// serves conjunctions across several columns, which used to fall off the cliff into a full row
+	// scan even though the shape is still `Attr OP literal`, just repeated.
+	if preds, ok := c.numPredsOnFields(q, st.schema); ok {
+		names := make([]string, 0, len(preds))
+		for _, p := range preds {
+			if name, ok := c.schemaFieldName(p.fieldID); ok {
+				names = append(names, name)
+			}
+		}
+		if len(names) > 0 {
+			c.demand.recordReads(names)
+		}
+		return c.schemaScanCountMulti(preds, st.cache), true
+	}
 	fieldID, eval, ok := c.numPredOnField(q, st.schema)
 	if !ok {
 		// Not a scalar comparison. A lone presence probe (`attr is undefined`) is still
