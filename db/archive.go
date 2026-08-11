@@ -237,6 +237,14 @@ func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []Agg
 // AggregateCols is Aggregate where a group column may carry a bucket width, so a numeric
 // attribute can be grouped into fixed-width buckets (the "per day" dimension) server-side.
 func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, error) {
+	// A constraint that can never match needs no data read at all. Answered by running the ordinary
+	// aggregation over an EMPTY sequence rather than by constructing a result here, so the shape is whatever
+	// a scan that matched nothing would have produced -- 0 for a count, undefined for MIN -- by construction
+	// rather than by a second implementation that could disagree.
+	if IsMatchNone(constraint) {
+		attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
+		return AggregateValues(func(func([]classad.Value) bool) {}, attrs, groupCols, aggs, groupCol, aggCol, nil)
+	}
 	if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
 		return rows, nil
 	}
@@ -407,6 +415,35 @@ func IsMatchAll(constraint string) bool {
 	}
 	b, err := expr.Eval(empty).BoolValue()
 	return err == nil && b
+}
+
+// IsMatchNone reports whether a constraint can never match: it references no attribute, so its value is
+// the same for every record, and that value is not TRUE.
+//
+// The dual of IsMatchAll, and missing until `select min(ProcId) from history where false` was measured at
+// 3.5s -- a full scan to establish that nothing matches. FALSE, UNDEFINED and ERROR all match nothing,
+// since a record matches only when the constraint is boolean TRUE, so this folds `where false`,
+// `where 1 == 2`, `where undefined` and `where error` alike.
+//
+// The no-reference check is the same load-bearing one IsMatchAll documents, in the other direction: a
+// record-dependent expression must never fold even when it evaluates non-TRUE against an empty ad.
+// `JobStatus == 2` is UNDEFINED with JobStatus absent and matches nothing HERE, but matches plenty of
+// records, so anything referencing an attribute is left to the scan.
+func IsMatchNone(constraint string) bool {
+	c := strings.TrimSpace(constraint)
+	if c == "" {
+		return false // no filter at all is match-ALL
+	}
+	expr, err := classad.ParseExpr(c)
+	if err != nil {
+		return false
+	}
+	empty := classad.New()
+	if len(empty.ExternalRefs(expr)) != 0 {
+		return false
+	}
+	b, err := expr.Eval(empty).BoolValue()
+	return err != nil || !b
 }
 
 // CategoricalGroupCounts returns the exact per-value record counts for a categorically
