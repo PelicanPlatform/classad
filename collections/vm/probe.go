@@ -39,6 +39,33 @@ func (q *Query) Probes() []Probe {
 	return out
 }
 
+// ExactProbes returns the query's probes together with whether they are EXACTLY equivalent to the
+// query: the top-level expression is a conjunction and EVERY conjunct was recognized as a probe.
+//
+// Probes and ProbePlan are deliberate OVER-APPROXIMATIONS, built for index pruning where the store
+// re-verifies every candidate, so an omitted conjunct only costs selectivity. A consumer that answers
+// from the probes ALONE -- a columnar COUNT/MIN/MAX that never re-verifies -- needs the opposite
+// guarantee, and using Probes for that silently over-counts: `ProcId >= 5 && ClusterId != ProcId`
+// compiles natively and yields ONE probe, because an attribute-to-attribute comparison is not
+// `Attr OP literal`, so counting from that probe alone answers `ProcId >= 5` instead of the query.
+//
+// exact=false means "do not answer from these probes"; they remain a sound candidate filter.
+func (q *Query) ExactProbes() (probes []Probe, exact bool) {
+	if q == nil || q.prog == nil || q.prog.expr == nil {
+		return nil, false
+	}
+	conj := flattenAnd(classad.FoldConstants(q.prog.expr), nil)
+	out := make([]Probe, 0, len(conj))
+	for _, c := range conj {
+		p, ok := probeFrom(c)
+		if !ok {
+			return out, false // an unrecognized conjunct: the probe set does not cover the query
+		}
+		out = append(out, p)
+	}
+	return out, len(out) > 0
+}
+
 // ProbeGroup is a conjunction of index probes -- a candidate matches the group when
 // it satisfies ALL of them. An empty Probes means the group is unconstrained (that
 // disjunct can match anything), so a plan containing one cannot prune.
