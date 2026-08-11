@@ -45,9 +45,29 @@
 // With the comparison kernel at roughly a third of a scan, ~2x on it is ~1.2x end to end for the columns
 // queries actually hit. That is not worth two architecture-specific kernels behind an experiment flag.
 //
-// REVISIT WHEN either the portable API grows mask-to-bits or a horizontal reduction, or the hot region
-// becomes columnar per field within a block. The latter is the larger lever and is a storage change that
-// trades against the reason hot is row-major at all: a whole-record read is one contiguous span.
+// REVISIT WHEN the portable API grows mask-to-bits or a horizontal reduction. The other half is making the
+// hot region columnar per field -- and that was PROTOTYPED AND REVERTED, because on its own it is worth
+// nothing:
+//
+//	loadIntBatch, one hot column, row-major -> columnar
+//	  372-record block    323.1 ns -> 322.8 ns   1.00x
+//	  6702-record block  5674.0 ns -> 5657.0 ns   1.00x
+//
+// Neutral at both sizes, which killed two plausible predictions in a row. The first was that removing the
+// stride would remove a "gather" the SIMD spike had priced at ~40% of the pipeline: it does not, because
+// loadIntBatch IS that gather and it costs the same either way. The second was that the first result was
+// only a cache artifact of small blocks -- 372 records of hot region is ~7 KB and L1-resident -- so it was
+// re-measured at 6702 records, where the region is past L1. Still 1.00x.
+//
+// The reason both were wrong: a CONSTANT-STRIDE walk is exactly what a hardware prefetcher handles, so
+// strided and contiguous reads cost the same, and the dominant memory traffic is not the read at all -- it
+// is the eight-byte STORE per record into the int64 destination, which is identical under either layout.
+// The column stores two bytes and the executor wants int64, so the widening store is required regardless.
+//
+// So strided-vs-contiguous is a CAPABILITY difference, not a performance one: SIMD cannot address a stride
+// at all. The layout change is necessary for width-native kernels and worth nothing without them, and it
+// costs a sidecar version bump that makes every deployed table rebuild its accelerator. Land it WITH the
+// kernels, so one bump buys the whole win, rather than now for 1.00x.
 
 package vm
 
