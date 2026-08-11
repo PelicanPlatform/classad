@@ -376,7 +376,25 @@ func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCo
 // COUNT(*) fast path in dbrpc.
 func IsMatchAll(constraint string) bool {
 	c := strings.TrimSpace(constraint)
-	return c == "" || strings.EqualFold(c, "true")
+	if c == "" || strings.EqualFold(c, "true") {
+		return true
+	}
+	// Fold a constant tautology (e.g. "1 == 1", "true && true") to the same match-all
+	// fast paths as "true": a constraint that references no attribute and evaluates to
+	// TRUE matches every record. The no-reference check is essential -- a record-
+	// dependent expression must never fold even if it happens to evaluate true against
+	// an empty ad (e.g. "JobStatus =!= 2" is TRUE when JobStatus is absent but is not
+	// match-all), so anything referencing an attribute is left to the normal scan.
+	expr, err := classad.ParseExpr(c)
+	if err != nil {
+		return false
+	}
+	empty := classad.New()
+	if len(empty.ExternalRefs(expr)) != 0 {
+		return false
+	}
+	b, err := expr.Eval(empty).BoolValue()
+	return err == nil && b
 }
 
 // CategoricalGroupCounts returns the exact per-value record counts for a categorically

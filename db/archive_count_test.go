@@ -50,6 +50,12 @@ func TestArchiveCountFastPath(t *testing.T) {
 	if rows[0].Values[0] != strconv.Itoa(n) {
 		t.Errorf(`COUNT(*) WHERE true = %s, want %d`, rows[0].Values[0], n)
 	}
+	// A constant tautology folds to the SAME match-all fast path as "true", so
+	// "1 == 1" and "true" agree with COUNT() -- they must never diverge.
+	rows, _ = hist.Aggregate("1 == 1", nil, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if rows[0].Values[0] != strconv.Itoa(n) {
+		t.Errorf(`COUNT(*) WHERE 1 == 1 = %s, want %d (must equal WHERE true)`, rows[0].Values[0], n)
+	}
 
 	// Constrained COUNT(*) goes through the projected scan (not the fast path).
 	rows, err = hist.Aggregate("ClusterId >= 300", nil, []AggSpec{{Func: AggCount, Arg: "*"}})
