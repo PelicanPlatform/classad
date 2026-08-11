@@ -66,6 +66,16 @@ type Vec struct {
 	// MASK form: three-valued logic as two bitplanes, two bits per record. See vecmask.go.
 	Hi, Lo []uint64
 
+	// Const marks a vector every record of which holds the SAME value, kept once in element 0 with the
+	// rest left as garbage. A literal in an expression is the dominant case, and materializing one across
+	// a block cost 9.8% of a scan in the profile -- nine bytes per record written per block, to say the
+	// same thing 1000 times.
+	//
+	// Every consumer must either specialize on it (compareVec does, which also tightens its loop by
+	// reading a scalar instead of a second array) or call materialize first. valueData and IsTrue read
+	// element 0 when it is set, so the parity-hook path and the counters are safe without either.
+	Const bool
+
 	// Mask selects which form holds this vector's value. A comparison consumes data and produces a
 	// mask; a logical operator consumes and produces masks; arithmetic consumes and produces data.
 	// Conversion in either direction is available (toMask/toData) but only happens where an operator
@@ -128,6 +138,9 @@ func (v *Vec) value(i int) classad.Value {
 // mask form of the same vector: the two forms occupy different arrays, so a comparison can read its left
 // operand's values while filling its planes.
 func (v *Vec) valueData(i int) classad.Value {
+	if v.Const {
+		i = 0
+	}
 	switch v.St[i] {
 	case VsInt:
 		return classad.NewIntValue(v.I[i])
@@ -297,7 +310,7 @@ func (s *VecScratch) push() *Vec {
 	v.n = s.n
 	v.I, v.S, v.St = v.I[:s.n], v.S[:s.n], v.St[:s.n]
 	v.Hi, v.Lo = v.Hi[:maskWords(s.n)], v.Lo[:maskWords(s.n)]
-	v.Mask = false
+	v.Mask, v.Const = false, false
 	s.depth++
 	return v
 }
@@ -310,38 +323,30 @@ func fillBool(v *Vec, b bool) {
 	if b {
 		x = 1
 	}
-	for i := range v.St {
-		v.St[i], v.I[i] = VsBool, x
-	}
+	v.St[0], v.I[0], v.Const, v.Mask = VsBool, x, true, false
 }
 
 func fillState(v *Vec, st uint8) {
-	for i := range v.St {
-		v.St[i] = st
-	}
+	v.St[0], v.Const, v.Mask = st, true, false
 }
 
 // broadcast fills a vector with one constant. A string constant declines: `Name == "x"` is a real
 // query shape, just not one this executor serves yet.
 func broadcast(v *Vec, c classad.Value) bool {
+	v.Const, v.Mask = true, false
 	switch c.Type() {
 	case classad.IntegerValue:
 		x, err := c.IntValue()
 		if err != nil {
 			return false
 		}
-		for i := range v.St {
-			v.St[i], v.I[i] = VsInt, x
-		}
+		v.St[0], v.I[0] = VsInt, x
 	case classad.RealValue:
 		f, err := c.RealValue()
 		if err != nil {
 			return false
 		}
-		bits := int64(math.Float64bits(f))
-		for i := range v.St {
-			v.St[i], v.I[i] = VsReal, bits
-		}
+		v.St[0], v.I[0] = VsReal, int64(math.Float64bits(f))
 	case classad.BooleanValue:
 		b, err := c.BoolValue()
 		if err != nil {
@@ -353,9 +358,7 @@ func broadcast(v *Vec, c classad.Value) bool {
 		if err != nil {
 			return false
 		}
-		for i := range v.St {
-			v.St[i], v.S[i] = VsString, str
-		}
+		v.St[0], v.S[0] = VsString, str
 	case classad.UndefinedValue:
 		fillState(v, VsUndef)
 	case classad.ErrorValue:
@@ -389,6 +392,8 @@ func binopVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 func arithVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	l.toData()
 	r.toData()
+	l.materialize()
+	r.materialize()
 	for i := range l.St {
 		ls, rs := l.St[i], r.St[i]
 		if !numeric(ls) || !numeric(rs) {
@@ -445,6 +450,7 @@ func unopVec(ev *classad.Evaluator, op string, v *Vec) bool {
 		return true
 	}
 	v.toData()
+	v.materialize()
 	for i := 0; i < v.n; i++ {
 		switch {
 		case op == "-" && v.St[i] == VsInt:
@@ -479,6 +485,8 @@ func hookOneUn(ev *classad.Evaluator, op string, v *Vec, i int) bool {
 func hookAll(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	l.toData()
 	r.toData()
+	l.materialize()
+	r.materialize()
 	for i := range l.St {
 		if !hookOne(ev, op, l, r, i) {
 			return false
@@ -498,6 +506,9 @@ func hookAll(ev *classad.Evaluator, op string, l, r *Vec) bool {
 func (v *Vec) IsTrue(i int) bool {
 	if v.Mask {
 		return maskStateAt(v.Hi, v.Lo, i) == mTrue
+	}
+	if v.Const {
+		i = 0
 	}
 	return v.St[i] == VsBool && v.I[i] == 1
 }
@@ -520,10 +531,45 @@ func (v *Vec) CountTrue(live []uint64) int {
 	return n
 }
 
+// materialize expands a Const vector so every element carries the value, for a kernel that does not
+// specialize on it.
+func (v *Vec) materialize() {
+	if !v.Const {
+		return
+	}
+	v.Const = false
+	st, i0, s0 := v.St[0], v.I[0], v.S[0]
+	for k := 1; k < v.n; k++ {
+		v.St[k], v.I[k], v.S[k] = st, i0, s0
+	}
+}
+
 // toMask converts the vector in place to mask form, applying ClassAd's logical-operand truthiness. A
 // no-op when it is already a mask.
 func (v *Vec) toMask() {
 	if v.Mask {
+		return
+	}
+	if v.Const {
+		// One state repeated: the planes are all-ones or all-zeros words, so there is nothing to walk.
+		st := dataStateToMask(v.St[0], v.I[0])
+		hi, lo := uint64(0), uint64(0)
+		if st&2 != 0 {
+			hi = ^uint64(0)
+		}
+		if st&1 != 0 {
+			lo = ^uint64(0)
+		}
+		for w := range v.Hi {
+			v.Hi[w], v.Lo[w] = hi, lo
+		}
+		// Bits past n must be clear, or a popcount over the tail counts records that do not exist.
+		if tail := uint(v.n % 64); tail != 0 && len(v.Hi) > 0 {
+			m := (uint64(1) << tail) - 1
+			v.Hi[len(v.Hi)-1] &= m
+			v.Lo[len(v.Lo)-1] &= m
+		}
+		v.Const, v.Mask = false, true
 		return
 	}
 	for w := range v.Hi {
@@ -544,8 +590,10 @@ func (v *Vec) toMask() {
 	v.Mask = true
 }
 
-// toData converts the vector in place to data form, so an arithmetic or comparison kernel can consume a
-// boolean produced upstream. A no-op when it is already data.
+// toData converts the vector in place to data form. It deliberately does NOT materialize a Const vector:
+// compareVec calls this and then specializes on Const, so materializing here would silently disable that
+// specialization -- which it did, and cost the whole optimization until the benchmark showed no gain.
+// Kernels that index elements call materialize themselves.
 func (v *Vec) toData() {
 	if !v.Mask {
 		return
@@ -562,7 +610,7 @@ func (v *Vec) toData() {
 			v.St[i] = VsError
 		}
 	}
-	v.Mask = false
+	v.Mask, v.Const = false, false
 }
 
 // Comparison opcodes, resolved from the operator string ONCE per batch rather than per element. The
@@ -687,6 +735,10 @@ func compareVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	}
 	l.toData()
 	r.toData()
+	l.materialize()
+	if r.Const {
+		return compareVecConst(ev, op, c, l, r)
+	}
 	for w := range l.Hi {
 		base := w * 64
 		end := base + 64
@@ -723,6 +775,54 @@ func compareVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	return true
 }
 
+// compareVecConst compares a column against a LITERAL -- `Attr OP constant`, the shape most constraints
+// are made of.
+//
+// Two things it avoids. The literal is never materialized across the block, which the profile put at 9.8%
+// of a scan: nine bytes per record written per block to repeat one value. And the loop reads a scalar held
+// in registers rather than a second array, so the comparison touches one column's memory instead of two.
+// Both are also what a SIMD version wants -- a literal becomes one broadcast into a vector register, not a
+// memory fill.
+func compareVecConst(ev *classad.Evaluator, op string, c cmpOp, l, r *Vec) bool {
+	rst := r.St[0]
+	rInt, rFloat, rStr := r.I[0], r.Float(0), r.S[0]
+	rIsInt := rst == VsInt
+	rIsNum := numeric(rst)
+	rIsStr := rst == VsString
+	for w := range l.Hi {
+		base := w * 64
+		end := base + 64
+		if end > l.n {
+			end = l.n
+		}
+		var hi, lo uint64
+		for i := base; i < end; i++ {
+			ls := l.St[i]
+			var st int
+			switch {
+			case rIsInt && ls == VsInt:
+				st = boolMask(cmpInt(c, l.I[i], rInt))
+			case rIsStr && ls == VsString:
+				st = boolMask(cmpOrder(c, classad.CompareStringsFold(l.S[i], rStr)))
+			case rIsNum && numeric(ls):
+				st = boolMask(cmpFloat(c, l.Float(i), rFloat))
+			default:
+				var ok bool
+				st, ok = valueToMaskState(ev.ApplyBinaryOp(op, l.valueData(i), r.valueData(i)))
+				if !ok {
+					return false
+				}
+			}
+			b := uint(i - base)
+			hi |= uint64(st>>1) << b
+			lo |= uint64(st&1) << b
+		}
+		l.Hi[w], l.Lo[w] = hi, lo
+	}
+	l.Mask = true
+	return true
+}
+
 // identicalVec is =?= / =!=: total, never undefined, and case SENSITIVE for strings. Two elements are
 // identical when their ClassAd TYPES match and their payloads match -- so 1 =?= 1.0 is false, which is why
 // int and real are distinct states rather than one numeric state.
@@ -734,6 +834,8 @@ func identicalVec(op string, l, r *Vec) bool {
 	negate := op == "=!="
 	l.toData()
 	r.toData()
+	l.materialize()
+	r.materialize()
 	for w := range l.Hi {
 		base := w * 64
 		end := base + 64
@@ -774,33 +876,6 @@ func logicalVec(op string, l, r *Vec) bool {
 		planeAnd(l.Hi, l.Lo, r.Hi, r.Lo, l.Hi, l.Lo)
 	} else {
 		planeOr(l.Hi, l.Lo, r.Hi, r.Lo, l.Hi, l.Lo)
-	}
-	return true
-}
-
-// identicalVec is =?= / =!=: total, never undefined, and case SENSITIVE for strings. Two elements are
-// identical when their ClassAd TYPES match and their payloads match -- so 1 =?= 1.0 is false, which is
-// why int and real are distinct states rather than one numeric state.
-//
-// Hand-written rather than hooked because the rule is a type check plus a payload compare, with no
-// coercion to get wrong, and because a Vec cannot hold the values (lists, nested ads) whose identity
-// the reference treats as an error.
-func identicalVecOLD(op string, l, r *Vec) bool {
-	negate := op == "=!="
-	for i := range l.St {
-		same := l.St[i] == r.St[i]
-		if same {
-			switch l.St[i] {
-			case VsInt, VsReal, VsBool:
-				same = l.I[i] == r.I[i]
-			case VsString:
-				same = l.S[i] == r.S[i]
-			}
-		}
-		if negate {
-			same = !same
-		}
-		l.SetBool(i, same)
 	}
 	return true
 }
