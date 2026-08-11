@@ -209,3 +209,74 @@ func BenchmarkColScopeShapes(b *testing.B) {
 		})
 	}
 }
+
+// scopeFixtureCodec is scopeFixture2 with a real codec, which is what a db-created store uses
+// (db.chooseBaseCodec gives new stores plain ZSTD). It matters for the comparison: with compression
+// OFF the row path decompresses nothing per record, so it is far cheaper than in production and the
+// columnar advantage is understated.
+func scopeFixtureCodec(tb testing.TB, n int) *Collection {
+	tb.Helper()
+	cd, err := NewZSTDCodec(nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	c := New(Options{Shards: 1, SegmentSize: 1 << 16, Codec: cd})
+	for i := 0; i < n; i++ {
+		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nJobStatus = %d\nRequestMemory = %d\n"+
+			"RequestCpus = %d\nOwner = \"user%d\"\nCmd = \"/home/user%d/run.sh\"\nWantCheckpoint = %t\n"+
+			"Args = \"--input in%d.dat --output out%d.dat\"\nIwd = \"/scratch/user%d/run%d\"",
+			i, i%10, 1+i%5, 1024+(i%32)*512, 1+i%8, i%512, i%512, i%3 == 0, i, i, i%512, i)
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(tb, src)); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	for _, e := range []string{"ProcId >= 0", "JobStatus >= 0", "RequestMemory >= 0", "RequestCpus >= 0"} {
+		q, err := vm.Parse(e)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		for i := 0; i < 20; i++ {
+			for range c.Query(q) {
+			}
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(4000, 8) {
+		tb.Skip("no sealed segments")
+	}
+	return c
+}
+
+// BenchmarkColScopeCompressed is the production-shaped comparison: records ZSTD-compressed, so the
+// row path pays a decompress PER RECORD while colScope pays one per block region.
+func BenchmarkColScopeCompressed(b *testing.B) {
+	c := scopeFixtureCodec(b, 60000)
+	defer c.Close()
+	for _, expr := range []string{
+		`Owner == "user3"`,
+		"RequestMemory > RequestCpus * 512",
+		"WantCheckpoint",
+	} {
+		q, err := vm.Parse(expr)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if _, ok := c.ColumnarEvalCount(q); !ok {
+			b.Fatalf("%s declined", expr)
+		}
+		b.Run("colScope/"+expr, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				c.ColumnarEvalCount(q)
+			}
+		})
+		b.Run("rowScan/"+expr, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				n := 0
+				for range c.Query(q) {
+					n++
+				}
+			}
+		})
+	}
+}
