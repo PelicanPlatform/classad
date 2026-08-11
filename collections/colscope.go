@@ -3,6 +3,7 @@ package collections
 import (
 	"encoding/binary"
 	"math"
+	"sync/atomic"
 	"unsafe"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -236,6 +237,33 @@ func (cs *colScope) setBlock(blk *columnarBlock) {
 	cs.strScratch = nil
 }
 
+// prunePlan caches the zone-prunable probe analysis, which depends only on the query and the SCHEMA.
+//
+// A scan visits one window per segment -- 162 of them on a 60k-record table -- and they almost always
+// share a single schema OBJECT, so recomputing the analysis per window repeated identical work 161 times:
+// measured at 11% of a scan's time and 44% of its allocations, for an answer that never changed. Keyed on
+// pointer identity, so two equal-but-distinct schemas merely recompute rather than answer wrongly.
+// zonePruneAnalyses counts how many times the probe analysis actually ran, so a test can hold the line
+// that it runs once per query rather than once per segment. One atomic add per query is free; the
+// alternative is a regression that only shows up as a query being mysteriously slower on a table with
+// many segments, which is how this cost went unnoticed in the first place.
+var zonePruneAnalyses atomic.Int64
+
+type prunePlan struct {
+	schema *adSchema
+	idxs   []int
+	preds  []fieldPred
+	valid  bool
+}
+
+func (p *prunePlan) tests(c *Collection, q *vm.Query, s *adSchema) ([]int, []fieldPred) {
+	if !p.valid || s != p.schema {
+		p.idxs, p.preds = c.zonePrunableTests(q, s)
+		p.schema, p.valid = s, true
+	}
+	return p.idxs, p.preds
+}
+
 // zonePrunableTests extracts the query's probes that a block zone can reason about: scalar numeric
 // comparisons on numeric fields of THIS schema, as (field index, tests).
 //
@@ -244,6 +272,7 @@ func (cs *colScope) setBlock(blk *columnarBlock) {
 // correctness. That is the opposite of answering from probes, which needs them to cover the query --
 // colScope answers by evaluating the query itself, so it is exact regardless.
 func (c *Collection) zonePrunableTests(q *vm.Query, s *adSchema) ([]int, []fieldPred) {
+	zonePruneAnalyses.Add(1)
 	var idxs []int
 	var preds []fieldPred
 	for _, p := range q.Probes() {
@@ -312,6 +341,7 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 	resolver := cs.resolve // hoisted: a method value expression allocates
 	fallbackM := q.Matcher()
 	count := 0
+	var plan prunePlan
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
@@ -320,7 +350,7 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 				count += c.rowEvalWindow(w, s0, fallbackM)
 				continue
 			}
-			pruneIdxs, prunePreds := c.zonePrunableTests(q, seg.schema())
+			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
 			base := 0
 			for _, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {

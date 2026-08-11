@@ -277,6 +277,7 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 		vecScratchPool.Put(scratch)
 	}()
 	var live []uint64
+	var plan prunePlan
 	var split vecSplit
 	defer func() { lastVecSplit.Store(&split) }()
 	count := 0
@@ -289,7 +290,7 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 				count += c.rowEvalWindow(w, s0, fallbackM)
 				continue
 			}
-			pruneIdxs, prunePreds := c.zonePrunableTests(q, seg.schema())
+			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
 			base := 0
 			for _, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {
