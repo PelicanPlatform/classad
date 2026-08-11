@@ -7,7 +7,12 @@ import (
 
 // refInfo is a pooled attribute reference (name + scope) targeted by OpLoadRef.
 type refInfo struct {
-	name  string
+	name string
+	// node is the reference as an AST node, built once at compile time. The interpreter hands it
+	// straight to the evaluator, which would otherwise construct one -- heap-allocating and folding
+	// the name -- on every resolution of every record. Read-only after compilation, so one program
+	// can be evaluated concurrently by several Matchers.
+	node  *ast.AttributeReference
 	scope ast.AttributeScope
 }
 
