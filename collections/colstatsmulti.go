@@ -172,6 +172,7 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 	aggLookup := c.attrLookup(aggID)
 
 	var keep []bool
+	var scratch []int64
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
@@ -222,8 +223,9 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 				}
 				if cap(keep) < blk.n {
 					keep = make([]bool, blk.n)
+					scratch = make([]int64, blk.n)
 				}
-				keep = keep[:blk.n]
+				keep, scratch = keep[:blk.n], scratch[:blk.n]
 				live := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
@@ -241,7 +243,7 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 					if live == 0 {
 						break
 					}
-					live = narrowByField(blk, otherIdxs[i], otherPreds[i], bc, keep)
+					live = narrowByField(blk, otherIdxs[i], otherPreds[i], bc, keep, scratch)
 				}
 				if live > 0 {
 					for k := 0; k < blk.n; k++ {

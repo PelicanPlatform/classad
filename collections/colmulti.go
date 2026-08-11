@@ -119,6 +119,7 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 	}
 	count := 0
 	var keep []bool
+	var scratch []int64
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
@@ -139,8 +140,9 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 				}
 				if cap(keep) < blk.n {
 					keep = make([]bool, blk.n)
+					scratch = make([]int64, blk.n)
 				}
-				keep = keep[:blk.n]
+				keep, scratch = keep[:blk.n], scratch[:blk.n]
 				// Pass 0 establishes visibility, so later passes never touch a record no
 				// snapshot can see.
 				live := 0
@@ -160,7 +162,7 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 					if live == 0 {
 						break // nothing left in this block; later columns would be read for nothing
 					}
-					live = narrowByField(blk, idxs[i], preds[i], bc, keep)
+					live = narrowByField(blk, idxs[i], preds[i], bc, keep, scratch)
 				}
 				count += live
 				base += blk.n
@@ -202,9 +204,40 @@ func resolveFields(cs *colSegment, preds []fieldPred) ([]int, bool) {
 // narrowByField clears keep[k] for every still-candidate record failing this field's predicate, and
 // returns how many survive. A real field's slot holds math.Float64bits, so the raw value is
 // converted by kind -- reading a real as an integer would silently produce astronomical values.
-func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, keep []bool) int {
+func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, keep []bool, scratch []int64) int {
 	isReal := blk.schema.fields[idx].kind == akReal
 	live := 0
+	// Batch form: one tight typed load of the whole column, then one predicate loop. Escaped records
+	// are read from the cold tail as they come up, so the batch load is unconditional -- gating it on
+	// an escape-free block made it fire almost never (see loadIntBatch).
+	if len(scratch) >= blk.n && blk.loadIntBatch(idx, bc, scratch) {
+		escFree := blk.escapeFree(idx)
+		for k := 0; k < blk.n; k++ {
+			if !keep[k] {
+				continue
+			}
+			var v float64
+			if !escFree && testBit(blk.escapeAt(k), idx) {
+				// The value is not in the column: missing, wrong kind, or too wide for the slot.
+				nv, ok := blk.escapedNumVal(k, p.fieldID, bc)
+				if !ok {
+					keep[k] = false
+					continue
+				}
+				v = nv.f
+			} else if isReal {
+				v = math.Float64frombits(uint64(scratch[k]))
+			} else {
+				v = float64(scratch[k])
+			}
+			if !p.eval(v) {
+				keep[k] = false
+				continue
+			}
+			live++
+		}
+		return live
+	}
 	_ = blk.scanInt(idx, bc, func(k int, present bool, v int64) {
 		if !keep[k] {
 			return
