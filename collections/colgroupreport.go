@@ -313,3 +313,57 @@ func (c *Collection) normalizeSamples(samples [][]byte) [][]byte {
 	}
 	return out
 }
+
+// stableGroupKeys returns the member sets that appear in EVERY one of the last runs retained
+// derivations, keyed as GroupSchemaDrift keys them. Fewer than runs derivations retained yields
+// nothing: a group nobody has watched twice is not established, and the safe answer is to build
+// none.
+//
+// This is the gate on committing storage to a group, and it has to be over TIME rather than over a
+// holdout of one sample. Measured on two snapshots of a production AP: a random split of one
+// snapshot showed 0.000% partial for every group -- an in-sample holdout would have passed the
+// group that later frayed -- while the same groups measured against a snapshot hours later showed
+// one at 0.167%, because a member merely happened to accompany the others in the first sample.
+// Only elapsed time distinguishes co-occurrence from coincidence.
+func (c *Collection) stableGroupKeys(runs int) map[string]bool {
+	if runs <= 1 {
+		return nil // no gate
+	}
+	if c.dir == "" {
+		return map[string]bool{} // nothing checkpointed: nothing established
+	}
+	data, err := os.ReadFile(filepath.Join(c.dir, groupSchemaFile))
+	if err != nil {
+		return map[string]bool{}
+	}
+	var rec persistedGroupSchemas
+	if json.Unmarshal(data, &rec) != nil || rec.Version != groupSchemaVersion || len(rec.History) < runs {
+		return map[string]bool{}
+	}
+	key := func(attrs []string) string {
+		s := ""
+		for _, a := range attrs {
+			s += a + "\x00"
+		}
+		return s
+	}
+	counts := map[string]int{}
+	for _, d := range rec.History[len(rec.History)-runs:] {
+		seen := map[string]bool{}
+		for _, g := range d.Groups {
+			k := key(g.Attrs)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			counts[k]++
+		}
+	}
+	out := map[string]bool{}
+	for k, n := range counts {
+		if n == runs {
+			out[k] = true
+		}
+	}
+	return out
+}

@@ -106,6 +106,9 @@ type Options struct {
 	// whether a group's members keep co-occurring is a property of the table's data that
 	// `.schema groups` is there to establish first.
 	GroupSchemaCount int
+	// GroupStabilityRuns is how many consecutive derivations a group's members must have
+	// co-occurred in before its blocks are built. 0 uses the default; 1 disables the gate.
+	GroupStabilityRuns int
 	// DemandHalfLife is how quickly recorded query demand fades, so index decisions
 	// track the current workload rather than everything the process has ever seen. 0
 	// uses defaultDemandHalfLife; negative disables decay (counters accumulate for the
@@ -286,6 +289,7 @@ type Collection struct {
 	demand           *demandTracker // per-attribute query demand, for SuggestIndexes
 	demandHalf       time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
 	groupSchemaCount int            // Options.GroupSchemaCount
+	groupStability   int            // Options.GroupStabilityRuns
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
 	// (0/1 ⇒ serial). qsem is a collection-wide token pool bounding total scan
@@ -512,6 +516,7 @@ func New(opts Options) *Collection {
 		demand:           newDemandTracker(),
 		demandHalf:       opts.DemandHalfLife,
 		groupSchemaCount: opts.GroupSchemaCount,
+		groupStability:   opts.GroupStabilityRuns,
 	}
 	c.codec.Store(&codecHolder{codec})
 	if cfg := newTTConfig(opts.TimeTravel); cfg != nil {

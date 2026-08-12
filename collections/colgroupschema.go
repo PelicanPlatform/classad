@@ -304,12 +304,48 @@ func (c *Collection) groupSchemasFor(s *adSchema) []*colGroup {
 	if len(samples) == 0 {
 		return nil
 	}
+	// Only groups whose members have kept co-occurring across successive derivations. A group
+	// derived once is a property of one sample; storage should follow evidence that it is a
+	// property of the data. See stableGroupKeys for why the gate is over time rather than over a
+	// holdout of the current sample.
+	stable := c.stableGroupKeys(c.groupStabilityRuns())
 	var out []*colGroup
 	for _, g := range c.deriveGroupSchemas(samples, s, k) {
 		if g.schema == nil || len(g.schema.fields) == 0 {
 			continue
 		}
+		if stable != nil {
+			var names []string
+			for _, id := range g.ids {
+				if n, ok := c.schemaFieldName(id); ok {
+					names = append(names, n)
+				}
+			}
+			sort.Strings(names)
+			key := ""
+			for _, n := range names {
+				key += n + "\x00"
+			}
+			if !stable[key] {
+				continue
+			}
+		}
 		out = append(out, &colGroup{schema: g.schema, ids: g.ids})
 	}
 	return out
 }
+
+// groupStabilityRuns is how many consecutive derivations a group must appear in before its blocks
+// are built. Default defaultGroupStabilityRuns; a value of 1 disables the gate (for a caller that
+// has its own evidence, and for tests).
+func (c *Collection) groupStabilityRuns() int {
+	if c.groupStability != 0 {
+		return c.groupStability
+	}
+	return defaultGroupStabilityRuns
+}
+
+// defaultGroupStabilityRuns is deliberately small. The cost of waiting is that a good group is not
+// built for a few maintenance passes; the cost of not waiting is storage committed to a set that
+// stops co-occurring, which then shows up as a partial rate and a slow path.
+const defaultGroupStabilityRuns = 3

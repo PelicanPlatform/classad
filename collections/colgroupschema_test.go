@@ -279,3 +279,68 @@ func TestGroupSchemasRankByCellsNotSize(t *testing.T) {
 		t.Errorf("wide cells %d <= narrow cells %d; ranking premise broken", wide.Cells, narrow.Cells)
 	}
 }
+
+// TestGroupStabilityGate: blocks are built only for groups whose members have kept co-occurring
+// across successive derivations.
+//
+// The gate is over TIME, not over a holdout of the current sample, and the difference is measured
+// rather than assumed: a random split of one production snapshot showed 0.000% partial for every
+// group -- an in-sample holdout would have passed the group that later frayed -- while the same
+// groups against a snapshot hours later showed one at 0.167%.
+func TestGroupStabilityGate(t *testing.T) {
+	newColl := func(t *testing.T, dir string) *Collection {
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14, GroupSchemaCount: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		loadGroupCorpus(t, c, groupCorpus(2000, 40, 30))
+		return c
+	}
+
+	t.Run("no history builds nothing", func(t *testing.T) {
+		c := newColl(t, t.TempDir())
+		defer c.Close()
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Fatal("schema scan did not enable")
+		}
+		st := c.schemaScan.Load()
+		if st == nil {
+			t.Fatal("no scan state")
+		}
+		if len(st.groups) != 0 {
+			t.Errorf("built %d group(s) with no derivation history; storage must follow evidence", len(st.groups))
+		}
+	})
+
+	t.Run("stable groups are built", func(t *testing.T) {
+		c := newColl(t, t.TempDir())
+		defer c.Close()
+		for range 3 {
+			c.GroupSchemas(4096, 4)
+		}
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Fatal("schema scan did not enable")
+		}
+		st := c.schemaScan.Load()
+		if st == nil || len(st.groups) == 0 {
+			t.Fatal("no groups built after three consistent derivations")
+		}
+	})
+
+	t.Run("gate disabled builds immediately", func(t *testing.T) {
+		dir := t.TempDir()
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14,
+			GroupSchemaCount: 4, GroupStabilityRuns: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		loadGroupCorpus(t, c, groupCorpus(2000, 40, 30))
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Fatal("schema scan did not enable")
+		}
+		if st := c.schemaScan.Load(); st == nil || len(st.groups) == 0 {
+			t.Error("GroupStabilityRuns=1 must waive the gate")
+		}
+	})
+}

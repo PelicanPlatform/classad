@@ -181,6 +181,11 @@ func TestGroupQueryMatchesRowPath(t *testing.T) {
 			want[q]++
 		}
 	}
+	// Establish that the groups keep co-occurring: blocks are not built for a group seen once
+	// (see stableGroupKeys). Three derivations is the default gate.
+	for range 3 {
+		c.GroupSchemas(4096, 4)
+	}
 	// Enable the accelerator and re-ask. The answers must not move.
 	if !c.BuildAndEnableSchemaScan(4096, 8) {
 		t.Skip("schema scan did not enable")
