@@ -98,6 +98,14 @@ type Options struct {
 	// header) instead of decoding the whole ad. Optional; enables the hot-closure match
 	// fast path. The frequency/HotAttrs hot set is unioned in, so queries are unaffected.
 	MatchClosureRoots []string
+	// GroupSchemaCount is how many SECONDARY columnar schemas to derive and build alongside the
+	// base one, for attributes the base schema does not carry which are present or absent
+	// together. 0 (the default) builds none.
+	//
+	// Off by default on purpose: a group costs a schema pointer and a block per base block, and
+	// whether a group's members keep co-occurring is a property of the table's data that
+	// `.schema groups` is there to establish first.
+	GroupSchemaCount int
 	// DemandHalfLife is how quickly recorded query demand fades, so index decisions
 	// track the current workload rather than everything the process has ever seen. 0
 	// uses defaultDemandHalfLife; negative disables decay (counters accumulate for the
@@ -275,8 +283,9 @@ type Collection struct {
 	// ops' internal reindexAfterCompaction must not re-take).
 	reindexMu sync.Mutex
 
-	demand     *demandTracker // per-attribute query demand, for SuggestIndexes
-	demandHalf time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
+	demand           *demandTracker // per-attribute query demand, for SuggestIndexes
+	demandHalf       time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
+	groupSchemaCount int            // Options.GroupSchemaCount
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
 	// (0/1 ⇒ serial). qsem is a collection-wide token pool bounding total scan
@@ -499,9 +508,10 @@ func New(opts Options) *Collection {
 		// Private attributes are flagged once per unique name at intern time, so a
 		// redacted query (ScanRawRedacted/QueryRawRedacted) strips them with a per-id
 		// bool check instead of re-classifying every attribute of every ad.
-		intern:     wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
-		demand:     newDemandTracker(),
-		demandHalf: opts.DemandHalfLife,
+		intern:           wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
+		demand:           newDemandTracker(),
+		demandHalf:       opts.DemandHalfLife,
+		groupSchemaCount: opts.GroupSchemaCount,
 	}
 	c.codec.Store(&codecHolder{codec})
 	if cfg := newTTConfig(opts.TimeTravel); cfg != nil {

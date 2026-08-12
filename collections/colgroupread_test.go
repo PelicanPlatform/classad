@@ -130,11 +130,19 @@ func TestGroupVecColumnMatchesScalar(t *testing.T) {
 	}
 }
 
-// TestGroupQueryMatchesRowPath is the end-to-end guard: a query touching a group attribute must
-// return exactly what a brute row scan returns, whichever internal path serves it.
+// TestGroupQueryMatchesRowPath: building group blocks must not change any answer.
+//
+// It is a REGRESSION guard, not a proof that group columns are read. Verified by instrumenting
+// resolveGroup: for these queries it is called zero times, because CountQuery resolves the
+// attribute against the BASE schema, does not find it, and falls to the index or row path before
+// colScope is consulted. Routing a query to a group column is planner work that does not exist
+// yet; until it does, what this holds is that groups are built, persisted, and inert -- which is
+// worth holding, since a group block that corrupted a base answer would be silent.
 func TestGroupQueryMatchesRowPath(t *testing.T) {
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20})
+	// Small segments so several SEAL: an unsealed segment carries no columnar block at all, and the
+	// comparison below would then be the row path against itself.
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14, GroupSchemaCount: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +165,8 @@ func TestGroupQueryMatchesRowPath(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for _, q := range []string{`GA > 1000`, `GA is undefined`, `GA isnt undefined`, `GB > 100 && ClusterId < 2000`} {
+	queries := []string{`GA > 1000`, `GA is undefined`, `GA isnt undefined`, `GB > 100 && ClusterId < 2000`}
+	for _, q := range queries {
 		want[q] = 0
 		qq, err := vm.Parse(q)
 		if err != nil {
@@ -171,17 +180,44 @@ func TestGroupQueryMatchesRowPath(t *testing.T) {
 	if !c.BuildAndEnableSchemaScan(4096, 8) {
 		t.Skip("schema scan did not enable")
 	}
-	for q, exp := range want {
+	// The comparison is only worth anything if groups were actually built: without them both
+	// sides take the same path and the test proves nothing.
+	st := c.schemaScan.Load()
+	if st == nil || len(st.groups) == 0 {
+		t.Fatal("no group schemas derived; this test would compare a path against itself")
+	}
+	var carriesGA bool
+	gaID := c.intern.Intern("GA")
+	for _, g := range st.groups {
+		if _, ok := g.schema.byID[gaID]; ok {
+			carriesGA = true
+		}
+	}
+	if !carriesGA {
+		t.Fatalf("no group carries GA; the queries below would not exercise a group column")
+	}
+	for _, q := range queries {
+		exp := want[q]
 		qq, err := vm.Parse(q)
 		if err != nil {
 			t.Fatal(err)
 		}
+		// The row scan must still agree...
 		got := 0
 		for range c.Query(qq) {
 			got++
 		}
 		if got != exp {
 			t.Errorf("%q: %d rows with the accelerator, %d without", q, got, exp)
+		}
+		// ...and so must the COLUMNAR count, which is the path that reads group columns. A
+		// query answered by the row scan on both sides would compare a path against itself.
+		cnt, ok := c.CountQuery(qq)
+		if !ok {
+			continue // declined: the row comparison above is what this test holds
+		}
+		if cnt != exp {
+			t.Errorf("%q: columnar count %d, row scan %d", q, cnt, exp)
 		}
 	}
 }

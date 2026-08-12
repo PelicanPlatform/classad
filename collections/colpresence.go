@@ -143,6 +143,22 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 			}
 			base := 0
 			for _, blk := range cs.blocks {
+				// No record in this block carries the attribute: every visible one of them is
+				// undefined, settled without touching a bitmap per record or the cold tail at all.
+				if blk.fieldAbsentFromBlock(idx) {
+					for k := 0; k < blk.n; k++ {
+						gk := base + k
+						if gk >= len(cs.offs) {
+							break
+						}
+						o := cs.offs[gk]
+						if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+							tally(true)
+						}
+					}
+					base += blk.n
+					continue
+				}
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
 					if gk >= len(cs.offs) {

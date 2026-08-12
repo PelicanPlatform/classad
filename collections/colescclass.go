@@ -78,12 +78,13 @@ func (b *columnarBlock) escapeIsMissing(idx, k int) (missing, ok bool) {
 // field whose id appears there was present but out of slot; a field whose escape bit is set and
 // whose id does not appear was absent. That is the same fact the encoder had when it set the bit,
 // recovered without re-encoding.
-func classifyEscapes(s *adSchema, recs [][]byte) ([]uint8, map[int][]uint32) {
+func classifyEscapes(s *adSchema, recs [][]byte) ([]uint8, map[int][]uint32, []byte) {
 	if len(s.fields) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	sawMissing := make([]bool, len(s.fields))
 	sawExcept := make([]bool, len(s.fields))
+	sawInSlot := make([]bool, len(s.fields))
 	excRecs := map[int][]uint32{}
 	for k, r := range recs {
 		if len(r) < s.escBytes {
@@ -110,6 +111,7 @@ func classifyEscapes(s *adSchema, recs [][]byte) ([]uint8, map[int][]uint32) {
 		}
 		for i := range s.fields {
 			if !testBit(esc, i) {
+				sawInSlot[i] = true
 				continue
 			}
 			if inCold[i] {
@@ -138,5 +140,33 @@ func classifyEscapes(s *adSchema, recs [][]byte) ([]uint8, map[int][]uint32) {
 	if len(out) == 0 {
 		out = nil
 	}
-	return class, out
+	// A field NO record of this block carries: every record escaped it and every escape was a
+	// missing attribute. That is an exact proof for the whole block -- `attr is undefined` is true
+	// of all of it, and any predicate needing the attribute defined can skip it -- and it costs one
+	// bit per field, computed here because the loop above already knows.
+	var absent []byte
+	if len(recs) > 0 {
+		absent = make([]byte, (len(s.fields)+7)/8)
+		any := false
+		for i := range s.fields {
+			if !sawInSlot[i] && !sawExcept[i] && sawMissing[i] {
+				setBit(absent, i)
+				any = true
+			}
+		}
+		if !any {
+			absent = nil
+		}
+	}
+	return class, out, absent
+}
+
+// fieldAbsentFromBlock reports whether NO record in this block carries the schema field -- an exact
+// proof, not a heuristic. A block that predates the classification always answers false, which is
+// the safe direction: the caller then does the work it would have done anyway.
+func (b *columnarBlock) fieldAbsentFromBlock(idx int) bool {
+	if idx < 0 || len(b.escAbsent) == 0 || idx>>3 >= len(b.escAbsent) {
+		return false
+	}
+	return b.escAbsent[idx>>3]&(1<<uint(idx&7)) != 0
 }

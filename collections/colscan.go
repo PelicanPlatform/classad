@@ -50,6 +50,10 @@ type schemaScanState struct {
 	schema *adSchema
 	hot    []int
 	cache  *blockCache
+	// groups are the secondary schemas a block is also built against, pinned at enable time with
+	// the base schema. Pinned for the same reason: every block of a segment is built against ONE
+	// set, and re-deriving between segments would leave earlier ones unmatched.
+	groups []*colGroup
 }
 
 // SchemaScanInfo reports the state of the per-segment columnar (adschema) accelerator, for
@@ -174,7 +178,7 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 		if err != nil {
 			return
 		}
-		st = &schemaScanState{schema: s, hot: hot, cache: bc}
+		st = &schemaScanState{schema: s, hot: hot, cache: bc, groups: c.groupSchemasFor(s)}
 		c.schemaScan.Store(st)
 	}
 	for _, sh := range c.shards {
@@ -288,13 +292,31 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 		colBuildStallHook()
 	}
 	d := seg.dict.Load() // interned segment -> resolve its local ids during transcode
-	blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, c.regionCodec(), s, hot,
-		defaultColGrouping(),
+	var groups []*colGroup
+	if st := c.schemaScan.Load(); st != nil {
+		groups = st.groups
+	}
+	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.codec,
+		c.regionCodec(), s, hot, groups, defaultColGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
 	if len(blocks) == 0 {
 		return nil
 	}
-	return &colSegment{blocks: blocks, offs: offs}
+	cs := &colSegment{blocks: blocks, offs: offs}
+	// Re-key the pinned groups onto this segment's selections: the schema and members are shared,
+	// the per-block bitmaps are not.
+	for gi, g := range groups {
+		sel := &colGroup{schema: g.schema, ids: g.ids}
+		for bi := range blocks {
+			if gi < len(gblocks[bi]) {
+				sel.blocks = append(sel.blocks, gblocks[bi][gi])
+			}
+		}
+		if len(sel.blocks) == len(blocks) {
+			cs.groups = append(cs.groups, sel)
+		}
+	}
+	return cs
 }
 
 // colBlobForSeg builds and marshals seg's columnar block under the collection's CURRENT schema-scan

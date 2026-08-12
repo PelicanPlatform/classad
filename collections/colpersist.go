@@ -265,6 +265,7 @@ func appendColBlock(dst []byte, b *columnarBlock) []byte {
 	// Per-field escape classes, then the exceptional-record lists of whatever fields are mixed.
 	// Sorted field order so the sidecar is reproducible.
 	dst = appendBytes(dst, b.escClass)
+	dst = appendBytes(dst, b.escAbsent)
 	dst = appendU32(dst, uint32(len(b.escExcRecs)))
 	excIdxs := make([]int, 0, len(b.escExcRecs))
 	for idx := range b.escExcRecs {
@@ -341,6 +342,10 @@ func readColBlock(c *cursor, s *adSchema, hotNum []int, codec Codec) *columnarBl
 	b.escClass = c.bytes()
 	if len(b.escClass) != 0 && len(b.escClass) != len(s.fields) {
 		return nil // a class per field, or none at all
+	}
+	b.escAbsent = c.bytes()
+	if len(b.escAbsent) != 0 && len(b.escAbsent) != (len(s.fields)+7)/8 {
+		return nil
 	}
 	if nx := int(c.u32()); nx > 0 {
 		if nx > len(s.fields) || !c.need(0) {

@@ -232,6 +232,9 @@ type columnarBlock struct {
 	// per-record bitmap.
 	escClass   []uint8
 	escExcRecs map[int][]uint32
+	// escAbsent has a bit per schema field, set when NO record in this block carries it -- an exact
+	// whole-block proof that the attribute is undefined here.
+	escAbsent []byte
 }
 
 // blockZone is one numeric column's range within a block.
@@ -326,7 +329,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 		b.coldOff = append(b.coldOff, len(coldCat))
 	}
 	b.zones = numericZones(s, b, recs)
-	b.escClass, b.escExcRecs = classifyEscapes(s, recs)
+	b.escClass, b.escExcRecs, b.escAbsent = classifyEscapes(s, recs)
 	if dicts != nil {
 		b.strDict = dicts
 		b.strDictComp = regionCodec.Compress(nil, dictRaw)

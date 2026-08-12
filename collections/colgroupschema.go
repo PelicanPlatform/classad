@@ -285,3 +285,31 @@ func (s *adSchema) hasField(id uint32) bool {
 	_, ok := s.byID[id]
 	return ok
 }
+
+// groupSchemasFor derives the group schemas to build alongside base schema s.
+//
+// Pinned with the base schema at enable time, for the same reason the base schema is: every block
+// of a segment is built against ONE set, so re-deriving between segments would leave earlier
+// segments' selections unmatched. A change of groups is therefore a re-schema, not a refresh.
+//
+// Off by default. A group costs a schema pointer and a block per base block, and phase 1 exists to
+// establish -- per table, on real data -- that a group's members keep co-occurring before anything
+// commits storage to them. GroupSchemaCount is that opt-in.
+func (c *Collection) groupSchemasFor(s *adSchema) []*colGroup {
+	k := c.groupSchemaCount
+	if k <= 0 {
+		return nil
+	}
+	samples := c.normalizeSamples(c.CollectSamplesRecentN(maxDistinctSample))
+	if len(samples) == 0 {
+		return nil
+	}
+	var out []*colGroup
+	for _, g := range c.deriveGroupSchemas(samples, s, k) {
+		if g.schema == nil || len(g.schema.fields) == 0 {
+			continue
+		}
+		out = append(out, &colGroup{schema: g.schema, ids: g.ids})
+	}
+	return out
+}

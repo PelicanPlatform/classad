@@ -169,3 +169,61 @@ func TestEscapeClassSurvivesPersistence(t *testing.T) {
 		}
 	}
 }
+
+// TestBlockAbsenceProofIsExact: the whole-block absence bit must be set only when NO record carries
+// the field, and must be set whenever that holds. Too eager is a wrong `is undefined` answer for the
+// whole block; too shy only costs the work it was meant to skip.
+func TestBlockAbsenceProofIsExact(t *testing.T) {
+	c := New(Options{Shards: 1})
+	defer c.Close()
+	const n = 200
+	// Ghost is in the schema (present in the sample used to build it) but absent from every record
+	// of the block we encode -- the shape a group's non-members produce, and the shape a table gets
+	// after a workload stops writing an attribute.
+	var sample [][]byte
+	for i := range n {
+		ad, err := classad.Parse(fmt.Sprintf(`[ Keep=%d; Ghost=%d ]`, i, i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		sample = append(sample, wire.Encode(nil, ad.AST(), c.intern))
+	}
+	s := buildAdSchema(sample, adSchemaOpts{Presence: 0.50, Fit: 0.95, Strings: false})
+	ghostID := c.intern.Intern("Ghost")
+	gi, ok := s.byID[ghostID]
+	if !ok {
+		t.Fatal("Ghost not in the schema; the fixture proves nothing")
+	}
+
+	var rows [][]byte
+	for i := range n {
+		ad, err := classad.Parse(fmt.Sprintf(`[ Keep=%d ]`, i)) // no Ghost at all
+		if err != nil {
+			t.Fatal(err)
+		}
+		rows = append(rows, s.encode(wire.Ad(wire.Encode(nil, ad.AST(), c.intern))))
+	}
+	blk := encodeColumnarBlock(s, rows, nil, c.regionCodec())
+	if !blk.fieldAbsentFromBlock(gi) {
+		t.Error("Ghost is absent from every record but the block does not prove it")
+	}
+	for fi := range s.fields {
+		if fi == gi && blk.fieldAbsentFromBlock(fi) {
+			continue
+		}
+		if blk.fieldAbsentFromBlock(fi) {
+			t.Errorf("field %d claimed absent from the whole block, but records carry it", fi)
+		}
+	}
+
+	// One record carrying Ghost must retract the proof entirely.
+	adG, err := classad.Parse(fmt.Sprintf(`[ Keep=%d; Ghost=%d ]`, 0, 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows[0] = s.encode(wire.Ad(wire.Encode(nil, adG.AST(), c.intern)))
+	blk2 := encodeColumnarBlock(s, rows, nil, c.regionCodec())
+	if blk2.fieldAbsentFromBlock(gi) {
+		t.Error("one record carries Ghost, but the block still claims it absent from all of them")
+	}
+}
