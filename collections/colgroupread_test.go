@@ -130,14 +130,14 @@ func TestGroupVecColumnMatchesScalar(t *testing.T) {
 	}
 }
 
-// TestGroupQueryMatchesRowPath: building group blocks must not change any answer.
+// TestGroupQueryMatchesRowPath: a query over a grouped attribute must return exactly what the row
+// scan returns, from the columnar path that actually reads the group column.
 //
-// It is a REGRESSION guard, not a proof that group columns are read. Verified by instrumenting
-// resolveGroup: for these queries it is called zero times, because CountQuery resolves the
-// attribute against the BASE schema, does not find it, and falls to the index or row path before
-// colScope is consulted. Routing a query to a group column is planner work that does not exist
-// yet; until it does, what this holds is that groups are built, persisted, and inert -- which is
-// worth holding, since a group block that corrupted a base answer would be silent.
+// CountQuery reaches it by its LAST tier: the attribute is not in the base schema, so the
+// hand-written numeric and presence scans decline, and VectorEvalCount evaluates the query against
+// the columns -- where LoadColumn finds the attribute in a group schema and presents it at full
+// block length. Verified by instrumenting loadGroupColumn: 15 calls per query here, one per sealed
+// block, and 30 for a two-column expression.
 func TestGroupQueryMatchesRowPath(t *testing.T) {
 	dir := t.TempDir()
 	// Small segments so several SEAL: an unsealed segment carries no columnar block at all, and the
@@ -165,7 +165,12 @@ func TestGroupQueryMatchesRowPath(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	queries := []string{`GA > 1000`, `GA is undefined`, `GA isnt undefined`, `GB > 100 && ClusterId < 2000`}
+	queries := []string{
+		`GA > 1000`, `GA is undefined`, `GA isnt undefined`,
+		`GB > 100 && ClusterId < 2000`, // a group column and a base column together
+		`GA + GB > 10`,                 // two group columns in one expression
+		`GA > GC`,                      // group column against group column
+	}
 	for _, q := range queries {
 		want[q] = 0
 		qq, err := vm.Parse(q)
@@ -214,7 +219,8 @@ func TestGroupQueryMatchesRowPath(t *testing.T) {
 		// query answered by the row scan on both sides would compare a path against itself.
 		cnt, ok := c.CountQuery(qq)
 		if !ok {
-			continue // declined: the row comparison above is what this test holds
+			t.Errorf("%q: columnar count declined; the group column is not being exercised", q)
+			continue
 		}
 		if cnt != exp {
 			t.Errorf("%q: columnar count %d, row scan %d", q, cnt, exp)
