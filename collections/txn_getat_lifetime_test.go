@@ -47,7 +47,7 @@ func internedPersistent(t *testing.T, shards, n int) (*Collection, func(i int) [
 	return c, key
 }
 
-func TestGetAtDoesNotLeakAMappingDependentDict(t *testing.T) {
+func TestReadersDoNotLeakAMappingDependentDict(t *testing.T) {
 	const n = 3000
 	c, key := internedPersistent(t, 2, n)
 	defer c.Close()
@@ -69,8 +69,58 @@ func TestGetAtDoesNotLeakAMappingDependentDict(t *testing.T) {
 	}
 	t.Logf("%d dict-bearing segments", dicts)
 
-	// Drop every name cache, so the assertion below is about what getAt does rather than about a cache
-	// some earlier read happened to build.
+	// BOTH readers that hand a handle out of the lock, not just one. get() is Collection.Get (the
+	// non-transactional point read) and getAt() is the snapshot read behind Txn.Get. The first version
+	// of this test covered only getAt -- and the stress test below uses Collection.Get, so between them
+	// they left get() unfixed and untested while both appeared to pass.
+	readers := []struct {
+		name string
+		read func(sh *shard, h uint64, k []byte) (*segDictHandle, bool)
+	}{
+		{"shard.get", func(sh *shard, h uint64, k []byte) (*segDictHandle, bool) {
+			_, _, d, ok := sh.get(h, k)
+			return d, ok
+		}},
+		{"shard.getAt", func(sh *shard, h uint64, k []byte) (*segDictHandle, bool) {
+			sh.mu.RLock()
+			s0 := sh.commitSeq
+			sh.mu.RUnlock()
+			_, _, d, ok := sh.getAt(h, k, s0)
+			return d, ok
+		}},
+	}
+	for _, r := range readers {
+		dropNameCaches(c)
+		checked := 0
+		for i := 0; i < n; i++ {
+			k := key(i)
+			h := c.h.Hash(k)
+			sh := c.shards[c.shardOf(k, h)]
+			dict, ok := r.read(sh, h, k)
+			if !ok {
+				t.Fatalf("%s: key %s not found", r.name, k)
+			}
+			if dict == nil {
+				continue // an inline segment: nothing points into the arena
+			}
+			// The invariant: by the time the read lock is gone, the handle no longer needs the mapping.
+			if dict.names.Load() == nil {
+				t.Fatalf("%s returned a dict handle whose name cache is not built, for key %s: resolving "+
+					"through it after the lock is released reads the segment arena, which compaction may "+
+					"have unmapped", r.name, k)
+			}
+			checked++
+		}
+		if checked == 0 {
+			t.Fatalf("%s: no key resolved through a dict handle: the invariant was never exercised", r.name)
+		}
+		t.Logf("%s: checked %d keys resolved through a dict handle", r.name, checked)
+	}
+}
+
+// dropNameCaches clears every segment's id->name cache, so an assertion about what a reader builds is not
+// satisfied by a cache some earlier read happened to leave behind.
+func dropNameCaches(c *Collection) {
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		for _, seg := range sh.segs {
@@ -83,35 +133,6 @@ func TestGetAtDoesNotLeakAMappingDependentDict(t *testing.T) {
 		}
 		sh.mu.RUnlock()
 	}
-
-	checked := 0
-	for i := 0; i < n; i++ {
-		k := key(i)
-		h := c.h.Hash(k)
-		idx := c.shardOf(k, h)
-		sh := c.shards[idx]
-		sh.mu.RLock()
-		s0 := sh.commitSeq
-		sh.mu.RUnlock()
-		_, _, dict, ok := sh.getAt(h, k, s0)
-		if !ok {
-			t.Fatalf("key %s not found", k)
-		}
-		if dict == nil {
-			continue // an inline segment: nothing points into the arena
-		}
-		// The invariant: by the time the read lock is gone, the handle no longer needs the mapping.
-		if dict.names.Load() == nil {
-			t.Fatalf("getAt returned a dict handle whose name cache is not built, for key %s: resolving "+
-				"through it after the lock is released reads the segment arena, which compaction may "+
-				"have unmapped", k)
-		}
-		checked++
-	}
-	if checked == 0 {
-		t.Fatal("no key resolved through a dict handle: the invariant was never exercised")
-	}
-	t.Logf("checked %d keys resolved through a dict handle", checked)
 }
 
 // TestGetDuringCompactionReapDecodesCorrectly drives the interleaving that made this a crash rather than
@@ -122,7 +143,7 @@ func TestGetAtDoesNotLeakAMappingDependentDict(t *testing.T) {
 // What this does and does not prove: it is a stress test, not a proof. Whether a read of an unmapped page
 // faults, returns zeros, or returns whatever the kernel later put at that address is timing- and
 // allocator-dependent, which is exactly why the production symptom appeared twice in two different forms.
-// TestGetAtDoesNotLeakAMappingDependentDict is the deterministic half; this one exists to catch the
+// TestReadersDoNotLeakAMappingDependentDict is the deterministic half; this one exists to catch the
 // failure in the shape a user would see it, and it does force real reaping (asserted below).
 func TestGetDuringCompactionReapDecodesCorrectly(t *testing.T) {
 	const n = 1500

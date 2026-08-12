@@ -412,11 +412,22 @@ func (sh *shard) get(h uint64, key []byte) ([]byte, Codec, *segDictHandle, bool)
 			return nil, nil, nil, false
 		}
 	}
-	seg := sh.segs[l.seg]
+	seg := sh.segAt(l.seg)
+	if seg == nil {
+		return nil, nil, nil, false
+	}
 	ad := recAd(seg.data, l.off)
 	out := make([]byte, len(ad))
 	copy(out, ad)
-	return out, seg.codec, seg.dict.Load(), true
+	// The dict handle must not outlive the mapping it points into: it holds seg.data, and the caller
+	// decodes with it after this lock is gone, by which time compaction may have unmapped the segment.
+	// Building the name cache here severs that dependency -- see shard.getAt, which does the same for
+	// the snapshot-reading path, for why this rather than a pin.
+	dict := seg.dict.Load()
+	if dict != nil {
+		dict.ensureNames()
+	}
+	return out, seg.codec, dict, true
 }
 
 // forEachSealedRecord calls fn for every record in this shard's SEALED, indexed
