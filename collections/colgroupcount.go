@@ -69,13 +69,42 @@ func (c *Collection) GroupCountQuery(q *vm.Query, groupAttr string) ([]GroupCoun
 		return nil, false
 	}
 	// The predicate has to be one the column scan can apply -- the same analysis the ungrouped count uses, so
-	// the two paths serve exactly the same shapes. An UNCONSTRAINED group-by declines here (there are no
-	// probes to analyze) and is left to the index path that already answers it.
+	// the two paths serve exactly the same shapes.
 	preds, ok := c.numPredsOnFields(q, st.schema)
 	if !ok {
 		return nil, false
 	}
-	counts, ok := c.schemaScanGroupCount(groupID, preds, st.cache)
+	return c.groupCount(groupID, preds, st.cache)
+}
+
+// GroupCountAll is GroupCountQuery with no constraint: the histogram of the whole column. The caller is
+// asserting the query matches every record, which only it can know (see db.IsMatchAll) -- there is no
+// predicate here to check that against.
+//
+// This is not reachable through GroupCountQuery: an unconstrained query has no probes to analyze, so the
+// predicate analysis declines it. And the index path that answers other unconstrained grouped counts only
+// covers CATEGORICALLY indexed attributes, so `GROUP BY <numeric>` with no WHERE fell to a record scan the
+// same way the constrained form did.
+func (c *Collection) GroupCountAll(groupAttr string) ([]GroupCount, bool) {
+	st := c.schemaScan.Load()
+	if st == nil || c.intern == nil {
+		return nil, false
+	}
+	groupID, ok := c.intern.LookupID(groupAttr)
+	if !ok {
+		return nil, false
+	}
+	idx, ok := st.schema.byID[groupID]
+	if !ok || !numericKind(st.schema.fields[idx].kind) {
+		return nil, false
+	}
+	return c.groupCount(groupID, nil, st.cache)
+}
+
+// groupCount runs the scan and shapes its result: the part GroupCountQuery and GroupCountAll share once
+// the group column and the predicate set are resolved. A nil preds means every visible record survives.
+func (c *Collection) groupCount(groupID uint32, preds []fieldPred, bc *blockCache) ([]GroupCount, bool) {
+	counts, ok := c.schemaScanGroupCount(groupID, preds, bc)
 	if !ok {
 		return nil, false
 	}

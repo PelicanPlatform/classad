@@ -230,3 +230,43 @@ func TestGroupCountQueryDeclinesUnrepresentableGroups(t *testing.T) {
 		})
 	}
 }
+
+// TestGroupCountAllMatchesRowPath covers the no-constraint form, which GroupCountQuery cannot serve
+// (there is no predicate to analyze) and so is a separate entry point.
+func TestGroupCountAllMatchesRowPath(t *testing.T) {
+	c := scopeFixtureCodec(t, 20000)
+	defer c.Close()
+	for _, attr := range []string{"ProcId", "JobStatus", "RequestCpus"} {
+		got, ok := c.GroupCountAll(attr)
+		if !ok {
+			t.Fatalf("GROUP BY %s over every record: declined", attr)
+		}
+		want, nonInt := rowGroupTruth(t, c, "true", attr)
+		if nonInt != 0 {
+			t.Fatalf("fixture has %d records whose %s is not an integer", nonInt, attr)
+		}
+		if len(got) != len(want) {
+			t.Errorf("GROUP BY %s: %d groups, row path found %d", attr, len(got), len(want))
+		}
+		total := 0
+		for _, g := range got {
+			n, err := g.Value.IntValue()
+			if err != nil {
+				t.Errorf("group value %v is not an integer", g.Value)
+				continue
+			}
+			if want[n] != g.Count {
+				t.Errorf("GROUP BY %s: group %d counted %d, row path %d", attr, n, g.Count, want[n])
+			}
+			total += g.Count
+		}
+		// Unconstrained, the groups must account for every record.
+		if total != c.Len() {
+			t.Errorf("GROUP BY %s: groups sum to %d but the collection holds %d records", attr, total, c.Len())
+		}
+	}
+	// A string column has no numeric column to read, so it declines rather than answering wrongly.
+	if _, ok := c.GroupCountAll("Owner"); ok {
+		t.Error("GROUP BY Owner (a string) was served as a numeric histogram")
+	}
+}

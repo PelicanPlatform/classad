@@ -260,14 +260,21 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, nil
 		}
 	}
-	// A CONSTRAINED COUNT(*) GROUPED BY one numeric schema column: a histogram of that column,
-	// computed in the same columnar pass the ungrouped count above makes. aggregateFromIndex
-	// answers the grouped count only from the CATEGORICAL index, so a group column that is a
-	// hot numeric (`GROUP BY NumJobStarts`) reached neither it nor the ungrouped fast path and
-	// fell to a full row scan -- the same predicate costing ~200x its ungrouped count.
+	// A COUNT(*) GROUPED BY one numeric schema column: a histogram of that column, computed in the
+	// same columnar pass the ungrouped count above makes. aggregateFromIndex answers a grouped
+	// count only from the CATEGORICAL index, so a group column that is a hot numeric (`GROUP BY
+	// NumJobStarts`) reached neither it nor the ungrouped fast path and fell to a full row scan --
+	// the same predicate costing ~200x its ungrouped count, constrained or not.
 	if len(groupCols) == 1 && groupCols[0].BucketWidth == 0 && len(aggs) == 1 &&
 		aggs[0].Func == AggCount && aggs[0].Arg == "*" && aggs[0].Filter == "" {
-		if counts, ok := t.a.GroupCountConstraint(constraint, groupCols[0].Attr); ok {
+		// An unconstrained grouped count reaches here only when aggregateFromIndex above declined it,
+		// which it does for a group column that is not categorically indexed. Match-all cannot be
+		// recognized from the predicate (there is none), so it is asked for explicitly.
+		counts, ok := t.a.GroupCountConstraint(constraint, groupCols[0].Attr)
+		if !ok && IsMatchAll(constraint) {
+			counts, ok = t.a.GroupCountAll(groupCols[0].Attr)
+		}
+		if ok {
 			// Groups arrive ascending by value, matching aggregateFromIndex's sorted order, and are
 			// rendered with the same ValueText the scan path groups by -- but the storage layer keys
 			// a group by (bits, type) while the scan path keys it by that rendered text, and the two
@@ -667,6 +674,14 @@ func (t *ArchiveTable) CountConstraint(constraint string) (int, bool) {
 // tier answered. See collections.Archive.GroupCountConstraint.
 func (t *ArchiveTable) GroupCountConstraint(constraint, groupAttr string) ([]collections.GroupCount, bool) {
 	return t.a.GroupCountConstraint(constraint, groupAttr)
+}
+
+// GroupCountAll is GroupCountConstraint over every row: the whole column's histogram. AggregateCols
+// uses it for a grouped COUNT(*) whose constraint is match-all, which the predicate analysis behind
+// GroupCountConstraint cannot serve because there is no predicate to analyze. See
+// collections.Archive.GroupCountAll.
+func (t *ArchiveTable) GroupCountAll(groupAttr string) ([]collections.GroupCount, bool) {
+	return t.a.GroupCountAll(groupAttr)
 }
 
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).

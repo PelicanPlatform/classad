@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -18,6 +19,12 @@ import (
 func scanAggregate(tb testing.TB, a *ArchiveTable, constraint string, groupCols []GroupCol, aggs []AggSpec) []AggRow {
 	tb.Helper()
 	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
+	// The scan path parses the constraint, and an EMPTY one is not parsable even though the aggregate
+	// treats it as match-all (IsMatchAll). Spell it as the literal the parser accepts so the reference
+	// covers the same records the caller meant.
+	if constraint == "" {
+		constraint = "true"
+	}
 	seq, err := a.QueryProject(constraint, attrs)
 	if err != nil {
 		tb.Fatal(err)
@@ -126,6 +133,48 @@ func TestArchiveGroupedCountServesTheReportedShape(t *testing.T) {
 	for _, r := range rows {
 		if len(r.Values) != 2 {
 			t.Fatalf("grouped COUNT(*), MAX(RequestCpus) returned %d values per row: %+v", len(r.Values), r)
+		}
+	}
+}
+
+// TestArchiveUnconstrainedGroupedCount covers the shape with no WHERE at all. The index path answers
+// that shape only for a CATEGORICALLY indexed group column, so `GROUP BY <numeric>` with no constraint
+// fell to a record scan exactly like the constrained form -- and it cannot come through the predicate
+// analysis, which has no probes to work with, so it is a separate entry point.
+func TestArchiveUnconstrainedGroupedCount(t *testing.T) {
+	cat, a := archiveCountFixture(t, 5000)
+	defer cat.Close()
+	countStar := []AggSpec{{Func: AggCount, Arg: "*"}}
+	groupCols := []GroupCol{{Attr: "ProcId"}}
+	if _, ok := a.GroupCountAll("ProcId"); !ok {
+		t.Fatal("the whole-column histogram is not served, so this test exercises nothing")
+	}
+	// ProcId is not categorically indexed here, so the index path must be the one declining -- otherwise
+	// this passes on a query that was already fast and says nothing about the new path.
+	if _, ok := a.CategoricalGroupCounts("ProcId"); ok {
+		t.Fatal("ProcId is index-answerable in this fixture, so it never reached the columnar path")
+	}
+	for _, constraint := range []string{"", "true", "1 == 1"} {
+		got, err := a.AggregateCols(constraint, groupCols, countStar)
+		if err != nil {
+			t.Fatalf("%q: %v", constraint, err)
+		}
+		want := scanAggregate(t, a, constraint, groupCols, countStar)
+		gotM, wantM := rowMap(t, got), rowMap(t, want)
+		if len(gotM) != len(wantM) {
+			t.Errorf("%q: %d groups, scan found %d", constraint, len(gotM), len(wantM))
+		}
+		total := 0
+		for g, v := range wantM {
+			if gotM[g] != v {
+				t.Errorf("%q: group %q count %q, scan %q", constraint, g, gotM[g], v)
+			}
+			n, _ := strconv.Atoi(gotM[g])
+			total += n
+		}
+		// With no constraint the groups have to account for every record in the archive.
+		if total != a.Count() {
+			t.Errorf("%q: groups sum to %d but the archive holds %d records", constraint, total, a.Count())
 		}
 	}
 }
