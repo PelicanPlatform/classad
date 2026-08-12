@@ -5,8 +5,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
+	"time"
 )
 
 // A Catalog is a set of named tables, each an independent ClassAd store (its own
@@ -51,7 +53,17 @@ const (
 // CatalogConfig configures a catalog, including encryption at rest applied to every
 // table. Dir empty is in-memory.
 type CatalogConfig struct {
-	Dir string
+	// OnOpenStep, when set, is called once per table and archive opened by OpenCatalogConfig, with how long
+	// that one took. Catalog open is a loop over directories, so without it the whole thing is a single
+	// number -- which is how a 15s startup stayed unattributed: every other phase reported 0s and this one
+	// reported all of it, with nothing inside.
+	//
+	// kind is "table" or "archive". MAY BE CALLED CONCURRENTLY, from whichever goroutine opened that table --
+	// opens run in parallel -- so a handler must be safe for concurrent use and must not block. It is still
+	// called once per open, which is what keeps per-table attribution intact under parallelism: only the SUM
+	// stops matching the wall clock.
+	OnOpenStep func(kind, name string, d time.Duration)
+	Dir        string
 	// PoolKeys enables encryption at rest for every table (each table's master key is
 	// wrapped under these keys). EncryptedAttrs is the default explicit encrypted-attr
 	// set for each table (private attributes are always encrypted). See db/encrypt.go.
@@ -68,6 +80,60 @@ func OpenCatalog(dir string) (*Catalog, error) {
 // OpenCatalogConfig opens the catalog rooted at cfg.Dir, recovering any tables from
 // <dir>/tables/ and applying cfg's encryption at rest to each. Dir == "" makes an
 // in-memory catalog whose tables do not persist.
+// openConcurrently opens each name with open, bounded, and returns the results in input order.
+//
+// Catalog open used to be a serial loop, and it was the whole of one deployment's 15s startup. Nothing in the
+// loop depends on the previous iteration, and each open is I/O plus mmap plus a key-directory load -- latency
+// that overlaps rather than CPU that contends -- so the wall clock is the slowest table instead of the sum.
+//
+// Bounded rather than one goroutine per table: a few hundred tables opening at once would storm the page cache
+// and the file-descriptor table for no gain, since past a handful the work is queued at the device anyway.
+//
+// On failure it closes whatever it already opened, because those handles are not in the catalog's maps yet and
+// closeAll cannot reach them, and it returns the error from the LOWEST index so the message a caller sees does
+// not depend on which goroutine lost the race.
+func openConcurrently[T any](names []string, kind string, onStep func(kind, name string, d time.Duration),
+	open func(name string) (T, error), closeOne func(T)) ([]T, error) {
+	out := make([]T, len(names))
+	errs := make([]error, len(names))
+	limit := runtime.GOMAXPROCS(0)
+	if limit > 8 {
+		limit = 8
+	}
+	if limit < 1 {
+		limit = 1
+	}
+	sem := make(chan struct{}, limit)
+	var wg sync.WaitGroup
+	for i, name := range names {
+		wg.Add(1)
+		go func(i int, name string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			start := time.Now()
+			v, err := open(name)
+			if onStep != nil {
+				onStep(kind, name, time.Since(start))
+			}
+			out[i], errs[i] = v, err
+		}(i, name)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err == nil {
+			continue
+		}
+		for j, v := range out {
+			if errs[j] == nil {
+				closeOne(v)
+			}
+		}
+		return nil, fmt.Errorf("%s %q: %w", kind, names[i], err)
+	}
+	return out, nil
+}
+
 func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	cat := &Catalog{
 		dir: cfg.Dir, tables: map[string]*DB{}, archives: map[string]*ArchiveTable{},
@@ -87,20 +153,22 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	if err != nil {
 		return nil, fmt.Errorf("catalog: reading tables dir: %w", err)
 	}
+	var tableNames []string
 	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !ValidTableName(name) {
+		if !e.IsDir() || !ValidTableName(e.Name()) {
 			continue // ignore stray directories
 		}
-		d, err := OpenConfig(cat.tableConfig(filepath.Join(root, name)))
-		if err != nil {
-			cat.closeAll()
-			return nil, fmt.Errorf("catalog: opening table %q: %w", name, err)
-		}
-		cat.tables[name] = d
+		tableNames = append(tableNames, e.Name())
+	}
+	openedTables, err := openConcurrently(tableNames, "table", cfg.OnOpenStep,
+		func(name string) (*DB, error) { return OpenConfig(cat.tableConfig(filepath.Join(root, name))) },
+		func(d *DB) { _ = d.Close() })
+	if err != nil {
+		cat.closeAll()
+		return nil, fmt.Errorf("catalog: opening %w", err)
+	}
+	for i, name := range tableNames {
+		cat.tables[name] = openedTables[i]
 	}
 	// Recover archive (history) tables from <dir>/archives/.
 	aroot := filepath.Join(cfg.Dir, archivesSubdir)
@@ -109,16 +177,24 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		cat.closeAll()
 		return nil, fmt.Errorf("catalog: reading archives dir: %w", err)
 	}
+	var archiveNames []string
 	for _, e := range aentries {
 		if !e.IsDir() || !ValidTableName(e.Name()) {
 			continue
 		}
-		at, err := openArchiveTable(filepath.Join(aroot, e.Name()), ArchiveConfig{})
-		if err != nil {
-			cat.closeAll()
-			return nil, fmt.Errorf("catalog: opening archive %q: %w", e.Name(), err)
-		}
-		cat.archives[e.Name()] = at
+		archiveNames = append(archiveNames, e.Name())
+	}
+	openedArchives, err := openConcurrently(archiveNames, "archive", cfg.OnOpenStep,
+		func(name string) (*ArchiveTable, error) {
+			return openArchiveTable(filepath.Join(aroot, name), ArchiveConfig{})
+		},
+		func(a *ArchiveTable) { _ = a.Close() })
+	if err != nil {
+		cat.closeAll()
+		return nil, fmt.Errorf("catalog: opening %w", err)
+	}
+	for i, name := range archiveNames {
+		cat.archives[name] = openedArchives[i]
 	}
 	// Recover materialized views from <dir>/views/. A view's DATA is not persisted; only
 	// its definition is, so each view is rebuilt from its base table here. This runs after
