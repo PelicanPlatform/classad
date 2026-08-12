@@ -260,6 +260,38 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, nil
 		}
 	}
+	// A CONSTRAINED COUNT(*) GROUPED BY one numeric schema column: a histogram of that column,
+	// computed in the same columnar pass the ungrouped count above makes. aggregateFromIndex
+	// answers the grouped count only from the CATEGORICAL index, so a group column that is a
+	// hot numeric (`GROUP BY NumJobStarts`) reached neither it nor the ungrouped fast path and
+	// fell to a full row scan -- the same predicate costing ~200x its ungrouped count.
+	if len(groupCols) == 1 && groupCols[0].BucketWidth == 0 && len(aggs) == 1 &&
+		aggs[0].Func == AggCount && aggs[0].Arg == "*" && aggs[0].Filter == "" {
+		if counts, ok := t.a.GroupCountConstraint(constraint, groupCols[0].Attr); ok {
+			// Groups arrive ascending by value, matching aggregateFromIndex's sorted order, and are
+			// rendered with the same ValueText the scan path groups by -- but the storage layer keys
+			// a group by (bits, type) while the scan path keys it by that rendered text, and the two
+			// are not the same partition: an integer 3 and a real 3.0 are distinct keys there and
+			// both render "3". Merging on the text makes this path's grouping identical to the scan's
+			// instead of splitting one group into two adjacent rows with the same label.
+			rows := make([]AggRow, 0, len(counts))
+			at := make(map[string]int, len(counts))
+			for _, g := range counts {
+				text := ValueText(g.Value)
+				if i, dup := at[text]; dup {
+					n, _ := strconv.Atoi(rows[i].Values[0])
+					rows[i].Values[0] = strconv.Itoa(n + g.Count)
+					continue
+				}
+				at[text] = len(rows)
+				rows = append(rows, AggRow{
+					Group:  []string{text},
+					Values: []string{strconv.Itoa(g.Count)},
+				})
+			}
+			return rows, nil
+		}
+	}
 	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
 	// per-segment columnar blocks instead of decoding every record. Declines (and falls through
 	// to the scan) unless the archive carries an accelerator and the aggregate is in scope.
@@ -627,6 +659,14 @@ func (t *ArchiveTable) OpStats() OpStats { return OpStats{OpStats: t.a.OpStats()
 // ok=false so the caller scans. See collections.Archive.CountConstraint.
 func (t *ArchiveTable) CountConstraint(constraint string) (int, bool) {
 	return t.a.CountConstraint(constraint)
+}
+
+// GroupCountConstraint answers a per-value COUNT(*) of groupAttr over the rows matching constraint
+// via the columnar accelerator, or reports ok=false so the caller scans. AggregateCols uses it for
+// the single-numeric-column GROUP BY shape; it is exported so a caller (and a test) can tell which
+// tier answered. See collections.Archive.GroupCountConstraint.
+func (t *ArchiveTable) GroupCountConstraint(constraint, groupAttr string) ([]collections.GroupCount, bool) {
+	return t.a.GroupCountConstraint(constraint, groupAttr)
 }
 
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).

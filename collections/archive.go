@@ -231,6 +231,13 @@ func (a *Archive) CountConstraint(constraint string) (int, bool) {
 	return a.c.CountConstraint(constraint)
 }
 
+// GroupCountConstraint returns the per-value record counts of groupAttr over the records
+// matching constraint, read out of the columnar blocks. ok=false ⇒ the shape is not
+// columnar-eligible and the caller must group by scanning records.
+func (a *Archive) GroupCountConstraint(constraint, groupAttr string) ([]GroupCount, bool) {
+	return a.c.GroupCountConstraint(constraint, groupAttr)
+}
+
 // Truncate drops every record, resetting the archive to empty in place: all segments are
 // unmapped and their data + sidecar-index files unlinked (via the backing Collection's
 // Truncate). Segment counters keep advancing, so a fresh Append starts a new segment. This
