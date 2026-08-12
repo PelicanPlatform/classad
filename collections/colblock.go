@@ -224,6 +224,14 @@ type columnarBlock struct {
 	// Computed while encoding, where the values are already in hand -- a separate pass would cost the
 	// scan it is meant to save.
 	zones map[int]blockZone
+
+	// escClass says, per schema field, whether this block's escapes of it are all MISSING (the
+	// attribute is absent, so the escape bit proves it undefined), all EXCEPTIONAL (present but
+	// out of slot, so always in the cold tail), or mixed. escExcRecs lists the exceptional records
+	// of the mixed fields only. See colescclass.go for why this is per field rather than a second
+	// per-record bitmap.
+	escClass   []uint8
+	escExcRecs map[int][]uint32
 }
 
 // blockZone is one numeric column's range within a block.
@@ -318,6 +326,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 		b.coldOff = append(b.coldOff, len(coldCat))
 	}
 	b.zones = numericZones(s, b, recs)
+	b.escClass, b.escExcRecs = classifyEscapes(s, recs)
 	if dicts != nil {
 		b.strDict = dicts
 		b.strDictComp = regionCodec.Compress(nil, dictRaw)

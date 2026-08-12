@@ -48,7 +48,11 @@ const (
 	//
 	// v6 appends the GROUP SCHEMAS and their per-block selections. A v5 reader would stop at the
 	// arena-offset map and silently produce a segment with no groups -- correct answers, but every
-	// group column read the slow way -- so this is a bump rather than an optional trailer.
+	// group column read the slow way -- so this is a bump rather than an optional trailer. It also
+	// adds each block's per-field escape classes, which tell a MISSING escape from an EXCEPTIONAL
+	// one without a cold-tail lookup (see colescclass.go). Both ride the same bump deliberately: a
+	// section bump forces every deployed table to rebuild its accelerator, and doing that twice for
+	// two changes that land together is waste.
 	colSectionVersion = 6
 	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
 )
@@ -258,6 +262,22 @@ func appendColBlock(dst []byte, b *columnarBlock) []byte {
 	// String dictionaries: the two compressed regions, then where each field lives in them. Written in
 	// sorted field order so the sidecar is reproducible; a map's iteration order would make the same
 	// segment serialize to different bytes on different runs.
+	// Per-field escape classes, then the exceptional-record lists of whatever fields are mixed.
+	// Sorted field order so the sidecar is reproducible.
+	dst = appendBytes(dst, b.escClass)
+	dst = appendU32(dst, uint32(len(b.escExcRecs)))
+	excIdxs := make([]int, 0, len(b.escExcRecs))
+	for idx := range b.escExcRecs {
+		excIdxs = append(excIdxs, idx)
+	}
+	sort.Ints(excIdxs)
+	for _, idx := range excIdxs {
+		dst = appendU32(dst, uint32(idx))
+		dst = appendU32(dst, uint32(len(b.escExcRecs[idx])))
+		for _, k := range b.escExcRecs[idx] {
+			dst = appendU32(dst, k)
+		}
+	}
 	dst = appendBytes(dst, b.strDictComp)
 	dst = appendBytes(dst, b.strCodeComp)
 	dst = appendU32(dst, uint32(len(b.strDict)))
@@ -316,6 +336,32 @@ func readColBlock(c *cursor, s *adSchema, hotNum []int, codec Codec) *columnarBl
 				return nil
 			}
 			b.zones[idx] = z
+		}
+	}
+	b.escClass = c.bytes()
+	if len(b.escClass) != 0 && len(b.escClass) != len(s.fields) {
+		return nil // a class per field, or none at all
+	}
+	if nx := int(c.u32()); nx > 0 {
+		if nx > len(s.fields) || !c.need(0) {
+			return nil
+		}
+		b.escExcRecs = make(map[int][]uint32, nx)
+		for j := 0; j < nx; j++ {
+			idx := int(c.u32())
+			cnt := int(c.u32())
+			if idx < 0 || idx >= len(s.fields) || cnt < 0 || !c.need(0) {
+				return nil
+			}
+			recs := make([]uint32, 0, cnt)
+			for r := 0; r < cnt; r++ {
+				k := c.u32()
+				if int(k) >= n {
+					return nil // an exceptional record outside the block
+				}
+				recs = append(recs, k)
+			}
+			b.escExcRecs[idx] = recs
 		}
 	}
 	b.strDictComp = c.bytes()
