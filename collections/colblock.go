@@ -349,8 +349,21 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 // interned collection; a decode/re-encode for an inline/persistent one). encode reads the
 // id-keyed form, so a non-interned record must be converted first or the block would be empty.
 func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool)) ([]*columnarBlock, []uint32) {
+	blocks, _, offs := buildColumnarFromSegmentGrouped(data, upto, arenaCodec, regionCodec, s, hot, nil, g, toInterned)
+	return blocks, offs
+}
+
+// buildColumnarFromSegmentGrouped is buildColumnarFromSegment plus the group schemas' selections.
+// groups may be nil, which reproduces the ungrouped build exactly.
+//
+// It keeps each pending record's INTERNED WIRE alongside its base row, because group membership is
+// a question the base row can no longer answer (see buildGroupBlocks). The retained wire is bounded
+// by the same group budget that bounds the pending rows.
+func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	var blocks []*columnarBlock
+	var groupBlocks [][]*colGroupBlock
 	var recs [][]byte
+	var iws [][]byte
 	var offs []uint32
 	var buf []byte
 	groupBytes := 0
@@ -369,6 +382,9 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 				if iw, ok := toInterned(nil, w); ok {
 					rec := s.encode(wire.Ad(iw))
 					recs = append(recs, rec)
+					if len(groups) > 0 {
+						iws = append(iws, append([]byte(nil), iw...))
+					}
 					offs = append(offs, o)
 					groupBytes += len(rec)
 					if len(recs)%colGroupAlign == 0 {
@@ -377,6 +393,13 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 					if g.full(len(recs), groupBytes) {
 						seal, sealBytes := g.sealAt(len(recs), groupBytes, alignedRows, alignedBytes)
 						blocks = append(blocks, encodeColumnarBlock(s, recs[:seal], hot, regionCodec))
+						if len(groups) > 0 {
+							// Slice the retained wire at the SAME point, so a group's membership
+							// bitmap is indexed by the base block's own record numbering.
+							groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws[:seal], regionCodec))
+							m := copy(iws, iws[seal:])
+							iws = iws[:m]
+						}
 						// Carry the records past the seal point into the next group. encodeColumnarBlock
 						// has already copied what it needs out of the record slices, so moving their
 						// headers down is safe; offs is per SEGMENT and is not reset.
@@ -394,6 +417,9 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 	}
 	if len(recs) > 0 {
 		blocks = append(blocks, encodeColumnarBlock(s, recs, hot, regionCodec)) // short final group
+		if len(groups) > 0 {
+			groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws, regionCodec))
+		}
 	}
 	if len(blocks) == 0 {
 		// A segment with no encodable records still gets one empty block, so a colSegment always
@@ -401,7 +427,7 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 		// both read from the first block).
 		blocks = append(blocks, encodeColumnarBlock(s, nil, hot, regionCodec))
 	}
-	return blocks, offs
+	return blocks, groupBlocks, offs
 }
 
 // numericZones computes each numeric field's [min,max] over the records being encoded, and whether
