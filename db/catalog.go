@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"time"
 )
 
 // A Catalog is a set of named tables, each an independent ClassAd store (its own
@@ -51,7 +52,14 @@ const (
 // CatalogConfig configures a catalog, including encryption at rest applied to every
 // table. Dir empty is in-memory.
 type CatalogConfig struct {
-	Dir string
+	// OnOpenStep, when set, is called once per table and archive opened by OpenCatalogConfig, with how long
+	// that one took. Catalog open is a loop over directories, so without it the whole thing is a single
+	// number -- which is how a 15s startup stayed unattributed: every other phase reported 0s and this one
+	// reported all of it, with nothing inside.
+	//
+	// kind is "table" or "archive". Called synchronously, in open order, so a handler must not block.
+	OnOpenStep func(kind, name string, d time.Duration)
+	Dir        string
 	// PoolKeys enables encryption at rest for every table (each table's master key is
 	// wrapped under these keys). EncryptedAttrs is the default explicit encrypted-attr
 	// set for each table (private attributes are always encrypted). See db/encrypt.go.
@@ -95,7 +103,11 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		if !ValidTableName(name) {
 			continue // ignore stray directories
 		}
+		tStart := time.Now()
 		d, err := OpenConfig(cat.tableConfig(filepath.Join(root, name)))
+		if cfg.OnOpenStep != nil {
+			cfg.OnOpenStep("table", name, time.Since(tStart))
+		}
 		if err != nil {
 			cat.closeAll()
 			return nil, fmt.Errorf("catalog: opening table %q: %w", name, err)
@@ -113,7 +125,11 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		if !e.IsDir() || !ValidTableName(e.Name()) {
 			continue
 		}
+		aStart := time.Now()
 		at, err := openArchiveTable(filepath.Join(aroot, e.Name()), ArchiveConfig{})
+		if cfg.OnOpenStep != nil {
+			cfg.OnOpenStep("archive", e.Name(), time.Since(aStart))
+		}
 		if err != nil {
 			cat.closeAll()
 			return nil, fmt.Errorf("catalog: opening archive %q: %w", e.Name(), err)
