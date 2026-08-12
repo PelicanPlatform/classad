@@ -162,15 +162,28 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 
 	out := make([]groupSchema, 0, len(cands))
 	for _, cd := range cands {
-		g := groupSchema{ids: cd.ids}
+		// Build the schema FIRST and take the membership ids from it. An attribute with no
+		// dominant storable kind is dropped from the schema, and if it stayed in the membership
+		// test a record could be "in" the group while one of its attributes was stored nowhere --
+		// so the two must be the same set by construction, not by agreement.
+		sch := buildAdSchemaFor(samples, cd.ids)
+		if sch == nil || len(sch.fields) == 0 {
+			continue
+		}
+		ids := make([]uint32, 0, len(sch.fields))
+		for _, f := range sch.fields {
+			ids = append(ids, f.id)
+		}
+		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		g := groupSchema{ids: ids, schema: sch}
 		// Count the three states explicitly rather than trusting the grouping. They are
 		// equal by construction here (identical presence => in or none, never partial), and
 		// the point of measuring anyway is that the same counts, recomputed on a later
 		// sample, are the drift signal -- so the code that produces them must be the code
 		// that would show a nonzero partial.
-		want := len(cd.ids)
+		want := len(ids)
 		idset := make(map[uint32]struct{}, want)
-		for _, id := range cd.ids {
+		for _, id := range ids {
 			idset[id] = struct{}{}
 		}
 		for _, w := range samples {
@@ -191,7 +204,6 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 			}
 		}
 		g.cells = g.in * want
-		g.schema = buildAdSchemaFor(samples, cd.ids)
 		out = append(out, g)
 	}
 	return out

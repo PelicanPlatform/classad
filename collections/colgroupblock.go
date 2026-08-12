@@ -108,6 +108,17 @@ func (gb *colGroupBlock) isException(k int) bool {
 	return false
 }
 
+// population is how many membership bits are set. Not rank's last entry: that counts members
+// before the last 64-record boundary, which equals the total only when the record count happens to
+// be a multiple of 64.
+func (gb *colGroupBlock) population() int {
+	n := 0
+	for _, b := range gb.members {
+		n += bits.OnesCount8(b)
+	}
+	return n
+}
+
 // buildRank fills the prefix-popcount table from members.
 func (gb *colGroupBlock) buildRank(n int) {
 	groups := n>>6 + 1

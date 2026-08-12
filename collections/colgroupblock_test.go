@@ -253,3 +253,148 @@ func TestGroupBlocksFollowBaseBlockBoundaries(t *testing.T) {
 		}
 	}
 }
+
+// TestGroupBlocksRoundTripThroughPersistence: the group selections must survive marshal/unmarshal
+// byte-exactly, including the membership bitmap and the exception list. A group column that reloads
+// short or misaligned reads another record's values, which is a wrong answer rather than an error.
+func TestGroupBlocksRoundTripThroughPersistence(t *testing.T) {
+	c := New(Options{Shards: 1})
+	defer c.Close()
+	const n = 400
+	iws, ids, state := groupBlockFixture(t, c, n)
+	g := mkGroup(t, c, iws, ids)
+	base := buildAdSchema(iws, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
+
+	var rows [][]byte
+	for _, iw := range iws {
+		rows = append(rows, base.encode(wire.Ad(iw)))
+	}
+	blk := encodeColumnarBlock(base, rows, nil, identityCodec{})
+	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, identityCodec{})
+	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
+
+	blob := marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
+	if blob == nil {
+		t.Fatal("marshal returned nil")
+	}
+	got := unmarshalColSegment(blob, identityCodec{}, func(name string) uint32 { return c.intern.Intern(name) })
+	if got == nil {
+		t.Fatal("unmarshal returned nil for a well-formed grouped segment")
+	}
+	if len(got.groups) != 1 {
+		t.Fatalf("reloaded %d groups, want 1", len(got.groups))
+	}
+	rg := got.groups[0]
+	if len(rg.ids) != len(g.ids) {
+		t.Fatalf("reloaded %d member ids, want %d", len(rg.ids), len(g.ids))
+	}
+	if len(rg.blocks) != 1 {
+		t.Fatalf("reloaded %d selections, want 1", len(rg.blocks))
+	}
+	rgb := rg.blocks[0]
+	if rgb.memberCount() != g.blocks[0].memberCount() {
+		t.Errorf("reloaded member count %d, want %d", rgb.memberCount(), g.blocks[0].memberCount())
+	}
+	if len(rgb.exceptions) != len(g.blocks[0].exceptions) {
+		t.Errorf("reloaded %d exceptions, want %d", len(rgb.exceptions), len(g.blocks[0].exceptions))
+	}
+	// Values, through the ordinary resolver, at the reloaded rank.
+	bc, err := newBlockCache(1 << 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := &colScope{bc: bc, c: c}
+	sc.setBlock(rgb.blk)
+	for k := range n {
+		idx, ok := rgb.index(k)
+		if state[k] == "in" != ok {
+			t.Fatalf("record %d: reloaded membership = %v, want %v", k, ok, state[k] == "in")
+		}
+		if state[k] == "partial" && !rgb.isException(k) {
+			t.Fatalf("record %d: exception lost across reload", k)
+		}
+		if !ok {
+			continue
+		}
+		sc.k = idx
+		sc.fellBack = false
+		v := sc.resolve("GB", ast.NoScope)
+		iv, _ := v.IntValue()
+		if !v.IsInteger() || iv != int64(k)*2 {
+			t.Fatalf("record %d (group index %d): GB = %v, want %d", k, idx, v, k*2)
+		}
+	}
+}
+
+// TestGroupSectionRejectsInconsistentSelection: a membership bitmap whose population disagrees with
+// its group block's record count would make rank address the wrong row. It must be refused, not
+// read -- the columnar section is derived state, so rejecting means rebuilding.
+func TestGroupSectionRejectsInconsistentSelection(t *testing.T) {
+	c := New(Options{Shards: 1})
+	defer c.Close()
+	const n = 128
+	iws, ids, _ := groupBlockFixture(t, c, n)
+	g := mkGroup(t, c, iws, ids)
+	base := buildAdSchema(iws, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
+	var rows [][]byte
+	for _, iw := range iws {
+		rows = append(rows, base.encode(wire.Ad(iw)))
+	}
+	blk := encodeColumnarBlock(base, rows, nil, identityCodec{})
+	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, identityCodec{})
+	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
+	nameOf := func(id uint32) (string, bool) { return c.intern.Name(id) }
+	internName := func(s string) uint32 { return c.intern.Intern(s) }
+
+	if unmarshalColSegment(marshalColSegment(cs, nameOf), identityCodec{}, internName) == nil {
+		t.Fatal("the well-formed blob must reload; the corruption test below would prove nothing")
+	}
+	// Set one more membership bit than the block has records.
+	for i := range g.blocks[0].members {
+		if g.blocks[0].members[i] != 0xFF {
+			g.blocks[0].members[i] = 0xFF
+			break
+		}
+	}
+	if got := unmarshalColSegment(marshalColSegment(cs, nameOf), identityCodec{}, internName); got != nil {
+		t.Error("a selection whose bitmap population exceeds its block's record count was accepted")
+	}
+}
+
+// TestGroupBlockPopulationPastRankBoundary guards the trap that found this: rank's last entry
+// counts members before the last 64-record boundary, which equals the total population only when
+// the record count is a multiple of 64. A fixture sized to a multiple of 64 hides the difference,
+// so this checks both sides of a boundary.
+func TestGroupBlockPopulationPastRankBoundary(t *testing.T) {
+	c := New(Options{Shards: 1})
+	defer c.Close()
+	for _, n := range []int{64, 65, 128, 129, 191, 192, 400} {
+		iws, ids, state := groupBlockFixture(t, c, n)
+		g := mkGroup(t, c, iws, ids)
+		gb := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec())[0]
+		want := 0
+		for _, st := range state {
+			if st == "in" {
+				want++
+			}
+		}
+		if got := gb.population(); got != want {
+			t.Errorf("n=%d: population = %d, want %d", n, got, want)
+		}
+		if got := gb.memberCount(); got != want {
+			t.Errorf("n=%d: member count = %d, want %d", n, got, want)
+		}
+		// And the last member's rank must be the last index in the block.
+		last := -1
+		for k := range n {
+			if _, ok := gb.index(k); ok {
+				last = k
+			}
+		}
+		if last >= 0 {
+			if idx, _ := gb.index(last); idx != want-1 {
+				t.Errorf("n=%d: last member at record %d has group index %d, want %d", n, last, idx, want-1)
+			}
+		}
+	}
+}

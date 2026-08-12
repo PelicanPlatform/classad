@@ -24,6 +24,9 @@ var colSegmentBuilds atomic.Int64
 type colSegment struct {
 	blocks []*columnarBlock
 	offs   []uint32
+	// groups are the group schemas' selections, one colGroupBlock per group per base block. Empty
+	// when the collection carries no group schemas.
+	groups []*colGroup
 }
 
 // schema returns the schema all of cs's blocks were built under, or nil if it carries none.

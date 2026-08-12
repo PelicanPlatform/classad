@@ -45,7 +45,11 @@ const (
 	// Neither can be read as v4 and both would produce plausible values rather than an error if
 	// misinterpreted, so this must be a version bump. As with every bump here the section is derived
 	// state: an old one is rejected and the segment rebuilds under the current rules.
-	colSectionVersion = 5
+	//
+	// v6 appends the GROUP SCHEMAS and their per-block selections. A v5 reader would stop at the
+	// arena-offset map and silently produce a segment with no groups -- correct answers, but every
+	// group column read the slow way -- so this is a bump rather than an optional trailer.
+	colSectionVersion = 6
 	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
 )
 
@@ -189,61 +193,158 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 	}
 	dst = appendU32(dst, uint32(len(cs.blocks)))
 	for _, b := range cs.blocks {
-		dst = appendU32(dst, uint32(b.n))
-		dst = appendBytes(dst, b.bits)
-		dst = appendBytes(dst, b.hotCol)
-		dst = appendBytes(dst, b.coldNumComp)
-		dst = appendBytes(dst, b.strComp)
-		dst = appendBytes(dst, b.coldComp)
-		dst = appendU32(dst, uint32(len(b.strOff)))
-		for _, v := range b.strOff {
-			dst = appendU32(dst, uint32(v))
-		}
-		dst = appendU32(dst, uint32(len(b.coldOff)))
-		for _, v := range b.coldOff {
-			dst = appendU32(dst, uint32(v))
-		}
-		dst = appendU32(dst, uint32(len(b.zones)))
-		for idx, z := range b.zones {
-			dst = appendU32(dst, uint32(idx))
-			dst = appendU64(dst, math.Float64bits(z.Min))
-			dst = appendU64(dst, math.Float64bits(z.Max))
-			esc := uint32(0)
-			if z.escaped {
-				esc = 1
-			}
-			dst = appendU32(dst, esc)
-		}
-		// String dictionaries: the two compressed regions, then where each field lives in them. Written in
-		// sorted field order so the sidecar is reproducible; a map's iteration order would make the same
-		// segment serialize to different bytes on different runs.
-		dst = appendBytes(dst, b.strDictComp)
-		dst = appendBytes(dst, b.strCodeComp)
-		dst = appendU32(dst, uint32(len(b.strDict)))
-		dictIdxs := make([]int, 0, len(b.strDict))
-		for idx := range b.strDict {
-			dictIdxs = append(dictIdxs, idx)
-		}
-		sort.Ints(dictIdxs)
-		for _, idx := range dictIdxs {
-			info := b.strDict[idx]
-			dst = appendU32(dst, uint32(idx))
-			dst = appendU32(dst, uint32(info.codeStart))
-			dst = appendU32(dst, uint32(info.codeWidth))
-			dst = appendU32(dst, uint32(info.dictStart))
-			dst = appendU32(dst, uint32(info.count))
-			ne := uint32(0)
-			if info.noEscape {
-				ne = 1
-			}
-			dst = appendU32(dst, ne)
-		}
+		dst = appendColBlock(dst, b)
 	}
 	dst = appendU32(dst, uint32(len(cs.offs)))
 	for _, o := range cs.offs {
 		dst = appendU32(dst, o)
 	}
+	// Group schemas and their selections, after the base blocks so a reader that has already
+	// validated the base segment can reject a bad group section on its own.
+	dst = appendU32(dst, uint32(len(cs.groups)))
+	for _, g := range cs.groups {
+		// The schema alone: a group's membership ids ARE its schema's field ids (see
+		// deriveGroupSchemas), so storing them twice could only introduce a disagreement.
+		dst = marshalAdSchema(dst, g.schema, nameOf)
+		dst = appendU32(dst, uint32(len(g.blocks)))
+		for _, gb := range g.blocks {
+			dst = appendBytes(dst, gb.members)
+			dst = appendU32(dst, uint32(len(gb.exceptions)))
+			for _, e := range gb.exceptions {
+				dst = appendU32(dst, e)
+			}
+			// rank is derived from members, so recomputing it on load is cheaper than storing
+			// it and cannot disagree with the bitmap it indexes.
+			if gb.blk == nil {
+				dst = appendU32(dst, 0)
+				continue
+			}
+			dst = appendU32(dst, 1)
+			dst = appendColBlock(dst, gb.blk)
+		}
+	}
 	return dst
+}
+
+// appendColBlock serializes one block's payload. Shared by the base blocks and the group blocks so
+// the two cannot drift apart -- a group block is a columnarBlock, and any field added here has to
+// reach both or a reloaded group column would be silently short.
+func appendColBlock(dst []byte, b *columnarBlock) []byte {
+	dst = appendU32(dst, uint32(b.n))
+	dst = appendBytes(dst, b.bits)
+	dst = appendBytes(dst, b.hotCol)
+	dst = appendBytes(dst, b.coldNumComp)
+	dst = appendBytes(dst, b.strComp)
+	dst = appendBytes(dst, b.coldComp)
+	dst = appendU32(dst, uint32(len(b.strOff)))
+	for _, v := range b.strOff {
+		dst = appendU32(dst, uint32(v))
+	}
+	dst = appendU32(dst, uint32(len(b.coldOff)))
+	for _, v := range b.coldOff {
+		dst = appendU32(dst, uint32(v))
+	}
+	dst = appendU32(dst, uint32(len(b.zones)))
+	for idx, z := range b.zones {
+		dst = appendU32(dst, uint32(idx))
+		dst = appendU64(dst, math.Float64bits(z.Min))
+		dst = appendU64(dst, math.Float64bits(z.Max))
+		esc := uint32(0)
+		if z.escaped {
+			esc = 1
+		}
+		dst = appendU32(dst, esc)
+	}
+	// String dictionaries: the two compressed regions, then where each field lives in them. Written in
+	// sorted field order so the sidecar is reproducible; a map's iteration order would make the same
+	// segment serialize to different bytes on different runs.
+	dst = appendBytes(dst, b.strDictComp)
+	dst = appendBytes(dst, b.strCodeComp)
+	dst = appendU32(dst, uint32(len(b.strDict)))
+	dictIdxs := make([]int, 0, len(b.strDict))
+	for idx := range b.strDict {
+		dictIdxs = append(dictIdxs, idx)
+	}
+	sort.Ints(dictIdxs)
+	for _, idx := range dictIdxs {
+		info := b.strDict[idx]
+		dst = appendU32(dst, uint32(idx))
+		dst = appendU32(dst, uint32(info.codeStart))
+		dst = appendU32(dst, uint32(info.codeWidth))
+		dst = appendU32(dst, uint32(info.dictStart))
+		dst = appendU32(dst, uint32(info.count))
+		ne := uint32(0)
+		if info.noEscape {
+			ne = 1
+		}
+		dst = appendU32(dst, ne)
+	}
+
+	return dst
+}
+
+// readColBlock reads one block payload written by appendColBlock, returning nil on malformed data.
+// The byte streams ALIAS the cursor's buffer (see unmarshalColSegment's lifetime contract).
+func readColBlock(c *cursor, s *adSchema, hotNum []int, codec Codec) *columnarBlock {
+	n := int(c.u32())
+	if n < 0 || c.err != nil {
+		return nil
+	}
+	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n}
+	// Both alias data (the mmap): read-only, scanned in place. The hot numerics being columnar means a
+	// whole column is one contiguous span OF THE MMAP, which is what a vector load needs.
+	b.bits = c.bytes()
+	b.hotCol = c.bytes()
+	b.coldNumComp = c.bytes()
+	b.strComp = c.bytes()
+	b.coldComp = c.bytes()
+	b.strOff = readInts(c)
+	b.coldOff = readInts(c)
+	if nz := int(c.u32()); nz > 0 {
+		if nz > len(s.fields) || !c.need(0) {
+			return nil
+		}
+		b.zones = make(map[int]blockZone, nz)
+		for j := 0; j < nz; j++ {
+			idx := int(c.u32())
+			z := blockZone{zoneRange: zoneRange{
+				Min: math.Float64frombits(c.u64()),
+				Max: math.Float64frombits(c.u64()),
+			}}
+			z.escaped = c.u32() != 0
+			if idx < 0 || idx >= len(s.fields) {
+				return nil
+			}
+			b.zones[idx] = z
+		}
+	}
+	b.strDictComp = c.bytes()
+	b.strCodeComp = c.bytes()
+	if nd := int(c.u32()); nd > 0 {
+		if nd > len(s.fields) || !c.need(0) {
+			return nil
+		}
+		b.strDict = make(map[int]strDictField, nd)
+		for j := 0; j < nd; j++ {
+			idx := int(c.u32())
+			info := strDictField{
+				codeStart: int(c.u32()),
+				codeWidth: int(c.u32()),
+				dictStart: int(c.u32()),
+				count:     int(c.u32()),
+			}
+			info.noEscape = c.u32() != 0
+			if idx < 0 || idx >= len(s.fields) || (info.codeWidth != 1 && info.codeWidth != 2) {
+				return nil
+			}
+			b.strDict[idx] = info
+		}
+	}
+	if c.err != nil {
+		return nil
+	}
+	layoutColumnar(b, s, hotNum, n)
+	return b
 }
 
 // unmarshalColSegment reconstructs a colSegment from marshalColSegment's output, attaching the
@@ -277,66 +378,12 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	blocks := make([]*columnarBlock, 0, nb)
 	total := 0
 	for i := 0; i < nb; i++ {
-		n := int(c.u32())
-		if n < 0 || c.err != nil {
+		b := readColBlock(c, s, hotNum, codec)
+		if b == nil {
 			return nil
 		}
-		b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n}
-		// Both alias data (the mmap): read-only, scanned in place. The hot numerics being columnar means a
-		// whole column is one contiguous span OF THE MMAP, which is what a vector load needs.
-		b.bits = c.bytes()
-		b.hotCol = c.bytes()
-		b.coldNumComp = c.bytes()
-		b.strComp = c.bytes()
-		b.coldComp = c.bytes()
-		b.strOff = readInts(c)
-		b.coldOff = readInts(c)
-		if nz := int(c.u32()); nz > 0 {
-			if nz > len(s.fields) || !c.need(0) {
-				return nil
-			}
-			b.zones = make(map[int]blockZone, nz)
-			for j := 0; j < nz; j++ {
-				idx := int(c.u32())
-				z := blockZone{zoneRange: zoneRange{
-					Min: math.Float64frombits(c.u64()),
-					Max: math.Float64frombits(c.u64()),
-				}}
-				z.escaped = c.u32() != 0
-				if idx < 0 || idx >= len(s.fields) {
-					return nil
-				}
-				b.zones[idx] = z
-			}
-		}
-		b.strDictComp = c.bytes()
-		b.strCodeComp = c.bytes()
-		if nd := int(c.u32()); nd > 0 {
-			if nd > len(s.fields) || !c.need(0) {
-				return nil
-			}
-			b.strDict = make(map[int]strDictField, nd)
-			for j := 0; j < nd; j++ {
-				idx := int(c.u32())
-				info := strDictField{
-					codeStart: int(c.u32()),
-					codeWidth: int(c.u32()),
-					dictStart: int(c.u32()),
-					count:     int(c.u32()),
-				}
-				info.noEscape = c.u32() != 0
-				if idx < 0 || idx >= len(s.fields) || (info.codeWidth != 1 && info.codeWidth != 2) {
-					return nil
-				}
-				b.strDict[idx] = info
-			}
-		}
-		if c.err != nil {
-			return nil
-		}
-		layoutColumnar(b, s, hotNum, n)
 		blocks = append(blocks, b)
-		total += n
+		total += b.n
 	}
 	offs := readU32s(c)
 	if c.err != nil {
@@ -348,7 +395,62 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	if total != len(offs) {
 		return nil
 	}
-	return &colSegment{blocks: blocks, offs: offs}
+	cs := &colSegment{blocks: blocks, offs: offs}
+	ng := int(c.u32())
+	if c.err != nil || ng < 0 {
+		return nil
+	}
+	for i := 0; i < ng; i++ {
+		g := &colGroup{}
+		if g.schema = readAdSchema(c, internName); g.schema == nil {
+			return nil
+		}
+		for _, f := range g.schema.fields {
+			g.ids = append(g.ids, f.id)
+		}
+		sort.Slice(g.ids, func(a, b int) bool { return g.ids[a] < g.ids[b] })
+		nbl := int(c.u32())
+		if nbl != len(blocks) {
+			// One selection per base block, or a membership bitmap would be indexed against
+			// the wrong records. Reject and rebuild rather than read the wrong values.
+			return nil
+		}
+		for j := 0; j < nbl; j++ {
+			gb := &colGroupBlock{members: c.bytes()}
+			ne := int(c.u32())
+			if ne < 0 || !c.need(0) {
+				return nil
+			}
+			for e := 0; e < ne; e++ {
+				idx := c.u32()
+				if int(idx) >= blocks[j].n {
+					return nil
+				}
+				gb.exceptions = append(gb.exceptions, idx)
+			}
+			if len(gb.members) != (blocks[j].n+7)/8 {
+				return nil
+			}
+			if c.u32() != 0 {
+				if gb.blk = readColBlock(c, g.schema, nil, codec); gb.blk == nil {
+					return nil
+				}
+			}
+			gb.buildRank(blocks[j].n)
+			// The bitmap's population must equal the group block's record count, or a rank
+			// would address past the block's end (or short of it) and read another record's
+			// values -- silently, since both are well-formed columns.
+			if pop := gb.population(); pop != gb.memberCount() {
+				return nil
+			}
+			g.blocks = append(g.blocks, gb)
+		}
+		cs.groups = append(cs.groups, g)
+	}
+	if c.err != nil {
+		return nil
+	}
+	return cs
 }
 
 func readInts(c *cursor) []int {
