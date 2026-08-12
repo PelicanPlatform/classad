@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"testing"
@@ -347,8 +348,9 @@ func TestArchiveGroupedValueAggregatesMatchScan(t *testing.T) {
 			[]AggSpec{{Func: AggSum, Arg: "Runtime"}, {Func: AggAvg, Arg: "Runtime"}}, true,
 			"Runtime is an integer column, so its sum is exact in int64 and order cannot change it"},
 		{"RequestMemory > 2048", "ProcId",
-			[]AggSpec{{Func: AggSum, Arg: "Score"}, {Func: AggAvg, Arg: "Score"}}, false,
-			"adding REALS in column order can round differently than the reference adding them in scan order"},
+			[]AggSpec{{Func: AggSum, Arg: "Score"}, {Func: AggAvg, Arg: "Score"}}, true,
+			"adding reals in a different order can round differently, which is permitted: no aggregate " +
+				"promises an addition order"},
 		{"RequestMemory > 2048", "RequestCpus",
 			[]AggSpec{{Func: AggMin, Arg: "Score"}, {Func: AggMax, Arg: "Score"}}, true,
 			"MIN/MAX over a real column is order-independent, so it stays served"},
@@ -371,15 +373,28 @@ func TestArchiveGroupedValueAggregatesMatchScan(t *testing.T) {
 		}
 		want := scanAggregate(t, a, tc.constraint, groupCols, tc.aggs)
 		// Compare the whole row, aggregate values included: a formatting difference (int vs real, an
-		// empty MIN) is as wrong as a numeric one and much easier to ship unnoticed.
+		// empty MIN) is as wrong as a numeric one and much easier to ship unnoticed. Only float
+		// summation rounding is allowed to differ -- see sameAggValues.
 		gotM, wantM := rowsByGroup(t, got), rowsByGroup(t, want)
 		if len(gotM) != len(wantM) {
 			t.Errorf("%s GROUP BY %s: %d groups, scan found %d", tc.constraint, tc.group, len(gotM), len(wantM))
 		}
+		rounding := 0
 		for g, v := range wantM {
-			if fmt.Sprint(gotM[g]) != fmt.Sprint(v) {
+			if !sameAggValues(gotM[g], v) {
 				t.Errorf("%s GROUP BY %s: group %q = %v, scan = %v", tc.constraint, tc.group, g, gotM[g], v)
+				continue
 			}
+			if fmt.Sprint(gotM[g]) != fmt.Sprint(v) {
+				rounding++
+			}
+		}
+		if rounding > 0 {
+			// Logged, not asserted: which groups round differently depends on the data and on the order
+			// each path happens to walk, and nothing promises either. Visible here so a reader can see
+			// the tolerance being used rather than wonder whether it is dead.
+			t.Logf("%s GROUP BY %s: %d of %d groups differ only in float summation rounding",
+				tc.constraint, tc.group, rounding, len(wantM))
 		}
 		if _, served := a.groupedFromColumns(tc.constraint, groupCols, tc.aggs); served != tc.wantServed {
 			t.Errorf("%s GROUP BY %s %v: served columnar = %v, want %v (%s)",
@@ -407,6 +422,34 @@ func TestArchiveGroupedValueAggregatesMatchScan(t *testing.T) {
 		t.Errorf("%d groups have an undefined MIN(Runtime), want exactly 1 -- the fixture no longer "+
 			"covers a group whose records all lack the aggregated attribute", undef)
 	}
+}
+
+// sameAggValues compares two rows' aggregate values. Text must match exactly, EXCEPT that two texts
+// which parse as floats agreeing to within a few ULP are accepted: adding a group's reals in column
+// order rather than scan order can change the last digit, and no aggregate promises an addition order.
+// Everything else -- an integer sum, a count, "undefined" for an empty MIN, int-vs-real rendering --
+// still has to match character for character, which is where a real bug would show up.
+func sameAggValues(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] == want[i] {
+			continue
+		}
+		g, gerr := strconv.ParseFloat(got[i], 64)
+		w, werr := strconv.ParseFloat(want[i], 64)
+		if gerr != nil || werr != nil {
+			return false
+		}
+		// Both are finite floats that render differently: accept a relative difference at the scale
+		// float64 accumulation can introduce, and nothing larger.
+		scale := math.Max(math.Abs(g), math.Abs(w))
+		if math.Abs(g-w) > 1e-12*scale {
+			return false
+		}
+	}
+	return true
 }
 
 // rowsByGroup keys whole rows (all aggregate values) by group label.

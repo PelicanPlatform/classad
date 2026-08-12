@@ -24,6 +24,12 @@ import (
 //     columnar aggregate uses, so SUM's int64 accumulation, AVG's always-real, MIN/MAX keeping their
 //     element's type, and the empty cases all match the reference by construction rather than by a second
 //     implementation that could drift.
+//
+// One thing deliberately NOT reproduced: the exact float rounding of a real-valued SUM or AVG. Float
+// addition is not associative, this pass adds a group's values in column order, and the reference adds
+// them in scan order, so the two can differ in the last ULP (13084.50000000002 against
+// 13084.500000000018). No ordering guarantee is made for an aggregate, so that is a permitted difference
+// rather than a wrong answer, and these are served. Integer sums are exact in int64 either way.
 
 // groupedFromColumns answers a single-numeric-column GROUP BY from the columns, or ok=false to scan.
 //
@@ -40,7 +46,6 @@ func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCo
 	var attrs []string
 	slot := make([]int, len(aggs)) // -1 for COUNT(*), which needs no column
 	at := map[string]int{}
-	var summed []bool // per column: some aggregate over it ADDS its values
 	for i, a := range aggs {
 		if a.Filter != "" {
 			return nil, false
@@ -63,12 +68,8 @@ func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCo
 			j = len(attrs)
 			at[a.Arg] = j
 			attrs = append(attrs, a.Arg)
-			summed = append(summed, false)
 		}
 		slot[i] = j
-		if a.Func == AggSum || a.Func == AggAvg {
-			summed[j] = true
-		}
 	}
 
 	groups, ok := t.a.GroupStatsConstraint(constraint, groupCols[0].Attr, attrs)
@@ -89,21 +90,11 @@ func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCo
 	merged := make([]*collections.GroupStats, 0, len(groups))
 	for i := range groups {
 		g := &groups[i]
-		for j, ns := range g.Stats {
-			// A boolean in an aggregated column declines, exactly as the ungrouped path does: the
-			// reference coerces booleans to 1/0 and has a further quirk for a lone boolean element, and
-			// the scan gives the exact answer for data that pathological.
+		// A boolean in an aggregated column declines, exactly as the ungrouped path does: the reference
+		// coerces booleans to 1/0 and has a further quirk for a lone boolean element, and the scan gives
+		// the exact answer for data that pathological.
+		for _, ns := range g.Stats {
 			if ns.AnyBool {
-				return nil, false
-			}
-			// Adding REALS declines. Float addition is not associative, and this pass visits a group's
-			// records in column order while the reference (classad.Sum over the group's collected
-			// values) adds them in scan order, so the two can differ in the last ULP -- observed as
-			// 13084.50000000002 against 13084.500000000018 for the same group. A last-digit difference
-			// that depends on whether the accelerator is on is a wrong answer, so a real-valued SUM or
-			// AVG goes to the scan. Integer sums are exact in int64 and MIN/MAX/COUNT do not add at all,
-			// so those stay served.
-			if ns.AnyReal && summed[j] {
 				return nil, false
 			}
 		}
