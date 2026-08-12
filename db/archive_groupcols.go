@@ -72,17 +72,19 @@ func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCo
 		slot[i] = j
 	}
 
-	groups, ok := t.a.GroupStatsConstraint(constraint, groupCols[0].Attr, attrs)
+	// Match-all first, using the knowledge only this layer has. The storage layer would also serve
+	// `WHERE true` -- its second tier evaluates the query against the columns, and a literal true matches
+	// every live record -- but that pays to evaluate an expression per block to learn what this layer
+	// already knows, and it cannot serve an EMPTY constraint at all (the parser rejects it).
+	var groups []collections.GroupStats
+	var ok bool
+	if IsMatchAll(constraint) {
+		groups, ok = t.a.GroupStatsAll(groupCols[0].Attr, attrs)
+	} else {
+		groups, ok = t.a.GroupStatsConstraint(constraint, groupCols[0].Attr, attrs)
+	}
 	if !ok {
-		// An unconstrained grouped aggregate cannot come through the predicate analysis -- there is no
-		// predicate to analyze -- so match-all is asked for explicitly, using the knowledge only this
-		// layer has.
-		if !IsMatchAll(constraint) {
-			return nil, false
-		}
-		if groups, ok = t.a.GroupStatsAll(groupCols[0].Attr, attrs); !ok {
-			return nil, false
-		}
+		return nil, false
 	}
 
 	rows := make([]AggRow, 0, len(groups))

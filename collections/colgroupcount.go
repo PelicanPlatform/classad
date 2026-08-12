@@ -109,13 +109,26 @@ func (c *Collection) GroupStatsQuery(q *vm.Query, groupAttr string, aggAttrs []s
 	if !ok {
 		return nil, false
 	}
-	// The predicate has to be one the column scan can apply -- the same analysis the ungrouped count uses,
-	// so the two paths serve exactly the same shapes.
-	preds, ok := c.numPredsOnFields(q, st.schema)
+	// First tier: a conjunction of numeric comparisons against literals, narrowed column by column with
+	// zone-map pruning. Fastest, and the shape a history dashboard asks most.
+	if preds, ok := c.numPredsOnFields(q, st.schema); ok {
+		return c.groupStats(groupID, aggIDs, preds, st)
+	}
+	// Second tier: evaluate the query itself against the columns -- a column at a time where the
+	// expression allows it, per record where it does not. This serves any NATIVE query, so a string
+	// comparison, an attribute-to-attribute comparison, arithmetic or a disjunction groups from the
+	// columns instead of falling to a record scan, matching what the ungrouped count already served.
+	//
+	// Skipped when an index could prune the row path instead, for the reason CountQuery skips it: this
+	// evaluates EVERY visible record, so against a selective indexed constraint the scan wins.
+	if c.indexCanPrune(q) {
+		return nil, false
+	}
+	acc, ok := c.vecGroupStats(q, groupID, aggIDs, st)
 	if !ok {
 		return nil, false
 	}
-	return c.groupStats(groupID, aggIDs, preds, st)
+	return c.shapeGroupStats(acc, groupID, aggIDs)
 }
 
 // GroupStatsAll is GroupStatsQuery with no constraint: the whole column's histogram plus aggregates. The
@@ -175,6 +188,12 @@ func (c *Collection) groupStats(groupID uint32, aggIDs []uint32, preds []fieldPr
 	if !ok {
 		return nil, false
 	}
+	return c.shapeGroupStats(acc, groupID, aggIDs)
+}
+
+// shapeGroupStats turns an accumulator map into the sorted result and records the read demand. Shared by
+// every tier, so the shape and order of the answer cannot depend on which one produced it.
+func (c *Collection) shapeGroupStats(acc map[groupKey]*groupAcc, groupID uint32, aggIDs []uint32) ([]GroupStats, bool) {
 	out := make([]GroupStats, 0, len(acc))
 	for raw, a := range acc {
 		g := GroupStats{Value: raw.value(), Count: a.n}

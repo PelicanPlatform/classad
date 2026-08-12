@@ -89,17 +89,22 @@ func TestGroupCountQueryMatchesRowPath(t *testing.T) {
 	}
 }
 
-// TestGroupCountQueryDeclinesUnservable pins what falls back, so a later change that starts serving one of
-// these has to say so rather than answering it wrongly.
+// TestGroupCountQueryDeclinesUnservable pins the declines that are about the GROUP COLUMN: this path
+// answers by reading that column as numbers, so a column it cannot read that way is out of scope by
+// construction, not merely unimplemented.
+//
+// It used to also assert that `Owner == "user3"`, `RequestMemory > RequestCpus` and `true` decline. Those
+// were true of the predicate ANALYSIS and stopped being true when the second tier evaluated the query
+// against the columns instead -- so the assertions failed on a change that made those queries 9-22x
+// faster. Asserting which tier answers pins an implementation detail that improvements are supposed to
+// change; the answers for those shapes are checked against the row path in TestGroupCountGeneralPredicates
+// instead, which is the contract.
 func TestGroupCountQueryDeclinesUnservable(t *testing.T) {
 	c := scopeFixtureCodec(t, 20000)
 	defer c.Close()
 	for _, tc := range []struct{ constraint, attr, why string }{
-		{"RequestMemory > 4096", "Owner", "string column"},
+		{"RequestMemory > 4096", "Owner", "a string column is not a numeric histogram"},
 		{"RequestMemory > 4096", "NoSuchAttr", "attribute absent from the schema"},
-		{`Owner == "user3"`, "ProcId", "predicate is not a numeric comparison"},
-		{"true", "ProcId", "no predicate to analyze: the unconstrained case is served elsewhere"},
-		{"RequestMemory > RequestCpus", "ProcId", "predicate has no literal"},
 	} {
 		q, err := vm.Parse(tc.constraint)
 		if err != nil {
@@ -108,6 +113,11 @@ func TestGroupCountQueryDeclinesUnservable(t *testing.T) {
 		if _, ok := c.GroupCountQuery(q, tc.attr); ok {
 			t.Errorf("%q GROUP BY %s: expected a decline (%s)", tc.constraint, tc.attr, tc.why)
 		}
+	}
+	// A query that cannot be lowered at all still declines, so the fallback stays reachable -- without
+	// this the test would pass on an implementation that claimed to serve everything.
+	if _, ok := c.GroupCountQuery(mustParseQuery(t, `size(Args) > 0`), "ProcId"); ok {
+		t.Error("served a non-native query; nothing can evaluate that against columns")
 	}
 }
 

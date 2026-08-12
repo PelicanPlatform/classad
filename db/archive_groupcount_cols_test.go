@@ -536,3 +536,89 @@ func BenchmarkArchiveGroupedValueAggregates(b *testing.B) {
 		}
 	})
 }
+
+// TestArchiveGroupedGeneralPredicates covers the predicates the grouped path used to decline while the
+// UNGROUPED count on the same predicate was already columnar: a string comparison, an attribute-to-
+// attribute comparison, arithmetic, a disjunction. The gap was in the routing, not in the data.
+func TestArchiveGroupedGeneralPredicates(t *testing.T) {
+	cat, a := archiveCountFixture(t, 5000)
+	defer cat.Close()
+	countStar := []AggSpec{{Func: AggCount, Arg: "*"}}
+	for _, tc := range []struct {
+		constraint string
+		group      string
+		wantServed bool
+		why        string
+	}{
+		{`Owner == "user3"`, "ProcId", true, "a string comparison"},
+		{"RequestMemory > RequestCpus", "ProcId", true, "attribute to attribute"},
+		{"RequestMemory > RequestCpus * 512", "ProcId", true, "arithmetic"},
+		{"RequestMemory >= 2048 || RequestCpus >= 4", "ProcId", true, "a disjunction"},
+		{`Owner == "user3" || JobStatus == 4`, "JobStatus", true, "string OR numeric"},
+		{`regexp("user3", Owner)`, "ProcId", false, "not native: cannot be lowered at all"},
+		{"RequestMemory > 4096", "Owner", false, "a STRING group column is still out of scope"},
+	} {
+		groupCols := []GroupCol{{Attr: tc.group}}
+		got, err := a.AggregateCols(tc.constraint, groupCols, countStar)
+		if err != nil {
+			t.Fatalf("%s GROUP BY %s: %v", tc.constraint, tc.group, err)
+		}
+		want := scanAggregate(t, a, tc.constraint, groupCols, countStar)
+		gotM, wantM := rowMap(t, got), rowMap(t, want)
+		if len(gotM) != len(wantM) {
+			t.Errorf("%s GROUP BY %s: %d groups, scan found %d",
+				tc.constraint, tc.group, len(gotM), len(wantM))
+		}
+		for g, v := range wantM {
+			if gotM[g] != v {
+				t.Errorf("%s GROUP BY %s: group %q count %q, scan %q", tc.constraint, tc.group, g, gotM[g], v)
+			}
+		}
+		if _, served := a.groupedFromColumns(tc.constraint, groupCols, countStar); served != tc.wantServed {
+			t.Errorf("%s GROUP BY %s: served columnar = %v, want %v (%s)",
+				tc.constraint, tc.group, served, tc.wantServed, tc.why)
+		}
+		// The ungrouped count already served every constraint here that the grouped one now does; if it
+		// ever stops, the comparison above stops meaning what this test says it means.
+		if _, ungrouped := a.CountConstraint(tc.constraint); tc.wantServed && !ungrouped {
+			t.Errorf("%s: the UNGROUPED count no longer serves this, so the premise of this test changed",
+				tc.constraint)
+		}
+	}
+}
+
+// BenchmarkArchiveGroupedGeneralPredicate is the gap this closes: the same predicate grouped.
+func BenchmarkArchiveGroupedGeneralPredicate(b *testing.B) {
+	cat, a := archiveCountFixture(b, 60000)
+	defer cat.Close()
+	groupCols := []GroupCol{{Attr: "ProcId"}}
+	countStar := []AggSpec{{Func: AggCount, Arg: "*"}}
+	for _, constraint := range []string{
+		`Owner == "user3"`,
+		"RequestMemory > RequestCpus * 512",
+		"RequestMemory >= 2048 || RequestCpus >= 4",
+	} {
+		if _, ok := a.groupedFromColumns(constraint, groupCols, countStar); !ok {
+			b.Fatalf("%q not served columnar", constraint)
+		}
+		b.Run("columnar/"+constraint, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				if _, err := a.AggregateCols(constraint, groupCols, countStar); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+		b.Run("scan/"+constraint, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				attrs, groupCol, aggCol := AggProjection(groupCols, countStar)
+				seq, err := a.QueryProject(constraint, attrs)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if _, err := AggregateValues(seq, attrs, groupCols, countStar, groupCol, aggCol, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
