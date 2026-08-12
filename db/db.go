@@ -853,3 +853,25 @@ func (t *Txn) LookupAttr(key, name string) (string, bool) {
 	}
 	return e.String(), true
 }
+
+// GroupSchemaInfo, GroupSchemaEntry, GroupSchemaDrift and GroupSchemaAgreement are re-exported so
+// a caller can read the group-schema reports without importing collections.
+type GroupSchemaInfo = collections.GroupSchemaInfo
+type GroupSchemaEntry = collections.GroupSchemaEntry
+type GroupSchemaDrift = collections.GroupSchemaDrift
+type GroupSchemaAgreement = collections.GroupSchemaAgreement
+
+// GroupSchemas derives and reports candidate group schemas: sets of attributes the base schema
+// does not carry which are present or absent together, and could therefore be stored columnar for
+// the ads that have them without costing a slot in the ads that do not. Report-only.
+func (db *DB) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
+	return db.c.GroupSchemas(sampleMax, k)
+}
+
+// GroupSchemaDrift reports how the derived groups have moved across retained derivations.
+func (db *DB) GroupSchemaDrift() GroupSchemaDrift { return db.c.GroupSchemaDrift() }
+
+// GroupSchemaAgreement reports how well per-segment derivations agree with the table-wide one.
+func (db *DB) GroupSchemaAgreement(sampleMax, k int) GroupSchemaAgreement {
+	return db.c.GroupSchemaAgreement(sampleMax, k)
+}

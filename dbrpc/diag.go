@@ -245,6 +245,10 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 		return fmt.Sprintf("refreshed hot set: %d attribute(s)", n), nil
 	case "schema.fit":
 		return schemaFitAction(t, args)
+	case "schema.groups":
+		return schemaGroupsAction(t, args)
+	case "schema.groups.agree":
+		return schemaGroupsAgreeAction(t, args)
 	case "schema.rebuild":
 		return schemaRebuildAction(t, args, s.maintainOpts.HotTopN)
 	case "analyze":
@@ -349,6 +353,10 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string, hotTopN int)
 		return "retention: " + retentionSummary(r), nil
 	case "schema.fit":
 		return schemaFitAction(a, args)
+	case "schema.groups":
+		return schemaGroupsAction(a, args)
+	case "schema.groups.agree":
+		return schemaGroupsAgreeAction(a, args)
 	case "schema.rebuild":
 		return schemaRebuildAction(a, args, hotTopN)
 	case "rotate":
@@ -682,6 +690,9 @@ type schemaScanTable interface {
 	SchemaFit(sampleMax int) ([]db.SchemaFieldFit, int)
 	ReschemaScan(sampleMax, hotTopN int) bool
 	SchemaScanInfo() db.SchemaScanInfo
+	GroupSchemas(sampleMax, k int) db.GroupSchemaInfo
+	GroupSchemaDrift() db.GroupSchemaDrift
+	GroupSchemaAgreement(sampleMax, k int) db.GroupSchemaAgreement
 }
 
 // schemaFitAction reports how well the derived schema still matches the data. Report only: the
@@ -738,4 +749,109 @@ func schemaRebuildAction(t schemaScanTable, args []string, hotTopN int) (string,
 	info := t.SchemaScanInfo()
 	return fmt.Sprintf("schema rebuilt: %d field(s), %d hot, %d/%d sealed segments covered",
 		info.SchemaFields, len(info.HotFields), info.CoveredSegments, info.SealedSegments), nil
+}
+
+// schemaGroupsAction reports the candidate group schemas: attribute sets the base schema does not
+// carry which are present or absent TOGETHER, so they could be stored columnar for the ads holding
+// them without spending a slot in the ads that do not.
+//
+// Report only, and deliberately so. A group is only worth a schema pointer if the same attributes
+// keep co-occurring, which one sample cannot establish -- so this exists to be run repeatedly, and
+// it prints the drift across retained derivations alongside the current one.
+func schemaGroupsAction(t schemaScanTable, args []string) (string, error) {
+	sampleMax, k := diagSampleMax, 0
+	if len(args) >= 1 {
+		n, err := strconv.Atoi(args[0])
+		if err != nil {
+			return "", fmt.Errorf("schema.groups <sampleMax> must be an integer")
+		}
+		sampleMax = n
+	}
+	if len(args) >= 2 {
+		n, err := strconv.Atoi(args[1])
+		if err != nil {
+			return "", fmt.Errorf("schema.groups <sampleMax> <k>: k must be an integer")
+		}
+		k = n
+	}
+	if len(args) > 2 {
+		return "", fmt.Errorf("schema.groups takes at most <sampleMax> <k>")
+	}
+	info := t.GroupSchemas(sampleMax, k)
+	if info.Sampled == 0 {
+		return "no ads sampled; nothing to derive", nil
+	}
+	var b strings.Builder
+	baseFrac := 0.0
+	if info.TotalCells > 0 {
+		baseFrac = float64(info.BaseCells) / float64(info.TotalCells)
+	}
+	fmt.Fprintf(&b, "sampled %d ad(s); base schema %d field(s) covering %.1f%% of attribute occurrences\n",
+		info.Sampled, info.BaseFields, baseFrac*100)
+	if len(info.Groups) == 0 {
+		fmt.Fprintf(&b, "no candidate groups: every attribute outside the base schema is either\n")
+		fmt.Fprintf(&b, "unique to one ad or shares no presence pattern with another\n")
+		return b.String(), nil
+	}
+	cum := baseFrac
+	fmt.Fprintf(&b, "  %-4s %6s %7s %7s %8s %9s  %s\n", "grp", "attrs", "in", "none", "partial", "coverage", "members")
+	for i, g := range info.Groups {
+		cum += g.CellsFrac
+		fmt.Fprintf(&b, "  %-4d %6d %6.1f%% %6.1f%% %7.2f%% %8.1f%%  %s\n",
+			i+1, len(g.Attrs), g.InFrac*100, g.NoneFrac*100, g.PartialFrac*100,
+			g.CellsFrac*100, strings.Join(g.Attrs, ", "))
+	}
+	fmt.Fprintf(&b, "base + %d group(s) would cover %.1f%% of attribute occurrences\n", len(info.Groups), cum*100)
+	fmt.Fprintln(&b, "  in = holds every member (storable columnar); none = holds no member (its columns are")
+	fmt.Fprintln(&b, "  provably undefined, so a query confined to them can skip the ad); partial = holds some,")
+	fmt.Fprintln(&b, "  which needs a row decode. partial is 0 at derivation, so any growth is drift.")
+	if d := t.GroupSchemaDrift(); d.Derivations > 1 {
+		fmt.Fprintf(&b, "drift: %d derivations over %s; %d of the first %d group(s) still present; worst partial %.2f%%\n",
+			d.Derivations, time.Duration(d.LastUnix-d.FirstUnix)*time.Second,
+			d.Retained, d.OfFirst, d.MaxPartialFrac*100)
+	} else {
+		fmt.Fprintln(&b, "drift: only one derivation retained; run this again later to see whether the groups hold")
+	}
+	return b.String(), nil
+}
+
+// schemaGroupsAgreeAction re-derives per segment and reports how often each table-level group
+// reappears -- the other half of whether a group is a property of the data or of the sample.
+// O(segments x sample), so it is an operator action rather than part of a maintenance pass.
+func schemaGroupsAgreeAction(t schemaScanTable, args []string) (string, error) {
+	sampleMax, k := diagSampleMax, 0
+	if len(args) >= 1 {
+		n, err := strconv.Atoi(args[0])
+		if err != nil {
+			return "", fmt.Errorf("schema.groups.agree <sampleMax> must be an integer")
+		}
+		sampleMax = n
+	}
+	if len(args) >= 2 {
+		n, err := strconv.Atoi(args[1])
+		if err != nil {
+			return "", fmt.Errorf("schema.groups.agree <sampleMax> <k>: k must be an integer")
+		}
+		k = n
+	}
+	if len(args) > 2 {
+		return "", fmt.Errorf("schema.groups.agree takes at most <sampleMax> <k>")
+	}
+	info := t.GroupSchemas(sampleMax, k)
+	ag := t.GroupSchemaAgreement(sampleMax, k)
+	if ag.Segments == 0 {
+		return "no sealed segments to compare against", nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "re-derived over %d sealed segment(s):\n", ag.Segments)
+	for i, frac := range ag.PerGroup {
+		var members string
+		if i < len(info.Groups) {
+			members = strings.Join(info.Groups[i].Attrs, ", ")
+		}
+		fmt.Fprintf(&b, "  group %d: reproduced in %5.1f%% of segments  %s\n", i+1, frac*100, members)
+	}
+	fmt.Fprintln(&b, "  a group reproduced in few segments is a sampling artifact, not a property of the")
+	fmt.Fprintln(&b, "  data, and a schema pointer spent on it would buy coverage in some segments only")
+	return b.String(), nil
 }

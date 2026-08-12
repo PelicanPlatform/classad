@@ -554,3 +554,19 @@ func probeFloats(p vm.Probe) []float64 {
 	}
 	return out
 }
+
+// GroupSchemas derives and reports candidate group schemas for the archive (see
+// Collection.GroupSchemas). Report-only: nothing about storage or reads changes.
+func (a *Archive) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
+	return a.c.GroupSchemas(sampleMax, k)
+}
+
+// GroupSchemaDrift reports how the archive's derived groups have moved (see
+// Collection.GroupSchemaDrift).
+func (a *Archive) GroupSchemaDrift() GroupSchemaDrift { return a.c.GroupSchemaDrift() }
+
+// GroupSchemaAgreement reports how well per-segment derivations agree with the archive-wide one
+// (see Collection.GroupSchemaAgreement).
+func (a *Archive) GroupSchemaAgreement(sampleMax, k int) GroupSchemaAgreement {
+	return a.c.GroupSchemaAgreement(sampleMax, k)
+}
