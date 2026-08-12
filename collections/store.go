@@ -21,6 +21,12 @@ import (
 type codecHolder struct{ c Codec }
 
 // Options configures a Collection.
+// schemaSeedState is a schema and hot set recovered without their blocks.
+type schemaSeedState struct {
+	schema *adSchema
+	hot    []int
+}
+
 type Options struct {
 	// Shards is the number of independently-locked shards; rounded up to a power
 	// of two. Default 16. Forced to 1 when AppendOnly (an append log is a single
@@ -295,6 +301,11 @@ type Collection struct {
 	// schemaScan holds the adschema columnar scan state (resolved schema, hot fields, and the
 	// decompressed-block cache) once EnableSchemaScan is called; nil otherwise. See colscan.go.
 	schemaScan atomic.Pointer[schemaScanState]
+
+	// schemaSeed holds a schema recovered from a sidecar whose BLOCK format this build cannot read, so a
+	// format bump keeps the accelerator's schema instead of switching the accelerator off. Only ever read by
+	// adoptPersistedSchemaScan, and only when no block loaded. See readColSectionSchemaOnly.
+	schemaSeed atomic.Pointer[schemaSeedState]
 
 	// gcFloor is a runtime-only GC watermark in Retention.MinAgeAttr units: Rotate may
 	// reclaim a fully-consumed segment (its newest age value < gcFloor) EARLY -- before it

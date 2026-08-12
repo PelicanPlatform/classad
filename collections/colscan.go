@@ -355,14 +355,27 @@ func (c *Collection) adoptPersistedSchemaScan() {
 		}
 		sh.mu.RUnlock()
 	}
-	if adopt == nil {
+	schema, hot := (*adSchema)(nil), []int(nil)
+	if adopt != nil {
+		schema, hot = adopt.schema(), adopt.hotNum()
+	} else if seed := c.schemaSeed.Load(); seed != nil {
+		// No block loaded, but a sidecar's SCHEMA was still readable -- its block format was from an older
+		// version. Seeding from it keeps the accelerator enabled so the blocks rebuild under the schema the
+		// table already had, instead of the accelerator switching off until something re-derives one.
+		//
+		// Only the schema is adopted. Nothing is attached to the segment: a colSegment carrying a schema and
+		// no blocks would read as "accelerator present" and then iterate zero blocks, silently skipping every
+		// record in the segment. Absent blocks must look absent.
+		schema, hot = seed.schema, seed.hot
+	}
+	if schema == nil {
 		return
 	}
 	bc, err := newBlockCache(256 << 20)
 	if err != nil {
 		return
 	}
-	c.schemaScan.Store(&schemaScanState{schema: adopt.schema(), hot: adopt.hotNum(), cache: bc})
+	c.schemaScan.Store(&schemaScanState{schema: schema, hot: hot, cache: bc})
 }
 
 // BuildAndEnableSchemaScan samples the collection, builds an adschema, chooses the hot numeric

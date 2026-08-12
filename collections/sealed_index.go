@@ -68,6 +68,8 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	var cs *colSegment
 	if body := readColSection(col, seg.used); body != nil { // rejects truncated/corrupt/stale -> row-scan
 		cs = unmarshalColSegment(body, c.regionCodec(), c.intern.Intern)
+	} else {
+		c.seedSchemaFromSection(col, seg.used)
 	}
 	// keyIdx is set exactly once per seal and is the "sealed" marker; CAS so a
 	// concurrent seal cannot leak a mapping.
@@ -235,6 +237,8 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 	var cs *colSegment
 	if body := readColSection(col, seg.used); body != nil {
 		cs = unmarshalColSegment(body, c.regionCodec(), c.intern.Intern)
+	} else {
+		c.seedSchemaFromSection(col, seg.used)
 	}
 	// Publish under the shard write lock: the readers that touch a sidecar without a scan pin
 	// (SidecarSizes, IndexSizes) hold the read lock while they do; pinned scan readers are handled
@@ -399,4 +403,25 @@ func adoptPersistedZones(seg *segment, zone []byte) {
 	if z, ok := parseZoneBlob(zone); ok {
 		seg.zones = z
 	}
+}
+
+// seedSchemaFromSection recovers just the schema from a section this build cannot read as blocks, so a
+// columnar-format bump costs a block rebuild rather than the accelerator itself.
+//
+// A rejected section used to mean no schema at all, because the schema is only recovered from a section that
+// loaded -- so v5 turned `.schema` into "off, no derived schema" on every table until something re-derived
+// one. First seed wins; any segment's schema is a valid seed, which is the same rule adopt uses.
+func (c *Collection) seedSchemaFromSection(col []byte, upto int) {
+	if c.schemaSeed.Load() != nil {
+		return
+	}
+	body := readColSectionSchemaOnly(col, upto)
+	if body == nil {
+		return
+	}
+	schema, hot := unmarshalColSchemaOnly(body, c.intern.Intern)
+	if schema == nil {
+		return
+	}
+	c.schemaSeed.CompareAndSwap(nil, &schemaSeedState{schema: schema, hot: hot})
 }
