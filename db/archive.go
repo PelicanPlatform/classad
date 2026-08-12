@@ -715,3 +715,16 @@ func (t *ArchiveTable) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 
 // AutoIndexNames returns the names of the archive's auto-created indexes.
 func (t *ArchiveTable) AutoIndexNames() []string { return t.a.AutoIndexNames() }
+
+// GroupSchemas derives and reports candidate group schemas for the archive (see DB.GroupSchemas).
+func (t *ArchiveTable) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
+	return t.a.GroupSchemas(sampleMax, k)
+}
+
+// GroupSchemaDrift reports how the archive's derived groups have moved.
+func (t *ArchiveTable) GroupSchemaDrift() GroupSchemaDrift { return t.a.GroupSchemaDrift() }
+
+// GroupSchemaAgreement reports how well per-segment derivations agree with the archive-wide one.
+func (t *ArchiveTable) GroupSchemaAgreement(sampleMax, k int) GroupSchemaAgreement {
+	return t.a.GroupSchemaAgreement(sampleMax, k)
+}
