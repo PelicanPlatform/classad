@@ -77,6 +77,50 @@ func readColSection(data []byte, upto int) []byte {
 	return body
 }
 
+// readColSectionSchemaOnly validates a framed section WITHOUT checking its version, returning the body so a
+// caller can recover just the leading schema from a section whose BLOCK format it cannot read.
+//
+// The version check exists because block payloads change; the schema prefix has not. Rejecting the whole
+// section on a version bump therefore threw away a schema that was still perfectly readable -- and since the
+// derived schema is only recovered from a loaded section, that turned every format bump into "the columnar
+// accelerator is off" rather than "the blocks rebuild". Magic, extent and CRC are still checked, so this
+// never decodes bytes that are not a section this store wrote.
+func readColSectionSchemaOnly(data []byte, upto int) []byte {
+	if len(data) < colSectionHdr ||
+		binary.LittleEndian.Uint32(data[0:]) != colSectionMagic ||
+		int(binary.LittleEndian.Uint32(data[6:])) != upto {
+		return nil
+	}
+	body := data[colSectionHdr:]
+	if binary.LittleEndian.Uint32(data[10:]) != crc32.ChecksumIEEE(body) {
+		return nil
+	}
+	return body
+}
+
+// unmarshalColSchemaOnly decodes just the schema and hot set from a section body, ignoring everything after.
+// Returns nil on anything unexpected, so an older layout that happens to differ recovers nothing rather than
+// something wrong.
+func unmarshalColSchemaOnly(data []byte, internName func(string) uint32) (*adSchema, []int) {
+	c := &cursor{b: data}
+	s := readAdSchema(c, internName)
+	if s == nil {
+		return nil, nil
+	}
+	hn := int(c.u32())
+	if hn < 0 || hn > len(s.fields) || c.err != nil {
+		return nil, nil
+	}
+	hot := make([]int, hn)
+	for i := range hot {
+		hot[i] = int(c.u32())
+	}
+	if c.err != nil {
+		return nil, nil
+	}
+	return s, hot
+}
+
 // marshalAdSchema writes a schema's fields as (name, kind, width, unsigned); the layout is
 // re-derived on read, not stored. Fields are keyed by NAME, not by their runtime intern id: a
 // persistent collection's global intern ids are assigned in first-seen order and differ across
