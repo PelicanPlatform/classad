@@ -238,6 +238,23 @@ func (a *Archive) GroupCountConstraint(constraint, groupAttr string) ([]GroupCou
 	return a.c.GroupCountConstraint(constraint, groupAttr)
 }
 
+// GroupStatsConstraint returns the per-group record count plus a NumStats per aggAttr over the records
+// matching constraint, read out of the columnar blocks. ok=false ⇒ not columnar-eligible; group by
+// scanning records. See Collection.GroupStatsQuery.
+func (a *Archive) GroupStatsConstraint(constraint, groupAttr string, aggAttrs []string) ([]GroupStats, bool) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, false
+	}
+	return a.c.GroupStatsQuery(q, groupAttr, aggAttrs)
+}
+
+// GroupStatsAll is GroupStatsConstraint over EVERY record. The caller must have established that its
+// query matches all records.
+func (a *Archive) GroupStatsAll(groupAttr string, aggAttrs []string) ([]GroupStats, bool) {
+	return a.c.GroupStatsAll(groupAttr, aggAttrs)
+}
+
 // GroupCountAll returns the per-value record counts of groupAttr over EVERY record, read out of the
 // columnar blocks. The caller must have established that its query matches all records.
 // ok=false ⇒ not columnar-eligible; group by scanning records.

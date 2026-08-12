@@ -286,3 +286,210 @@ func BenchmarkArchiveGroupedCount(b *testing.B) {
 		}
 	})
 }
+
+// groupAggFixture has what archiveCountFixture lacks for value aggregates: a REAL column, so SUM/AVG
+// type promotion is exercised, and a column ABSENT from some records, so a group can exist (its group
+// value is present) while its MIN/MAX over that column is undefined.
+func groupAggFixture(tb testing.TB, n int) (*Catalog, *ArchiveTable) {
+	tb.Helper()
+	cat, err := OpenCatalogConfig(CatalogConfig{Dir: tb.TempDir()})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{SegmentSize: 1 << 16})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nRequestMemory = %d\nRequestCpus = %d\n"+
+			"Score = %d.%d\n", i, i%20, 1024+(i%32)*512, 1+i%8, i%50, i%7)
+		// Runtime is missing from one whole group's records, so that group exists (its GROUP value is
+		// present) while MIN/MAX over Runtime is undefined for it. It stays above the schema's 0.90
+		// presence threshold -- below that the field is not in the schema at all and every case here
+		// declines for a reason that has nothing to do with what is being tested.
+		if i%20 != 4 {
+			src += fmt.Sprintf("Runtime = %d\n", 60+i%900)
+		}
+		ad, err := classad.ParseOld(src)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		if err := a.Append(ad); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	if !a.BuildAndEnableSchemaScan(4000, 8) {
+		tb.Skip("no sealed segments to accelerate")
+	}
+	return cat, a
+}
+
+func TestArchiveGroupedValueAggregatesMatchScan(t *testing.T) {
+	cat, a := groupAggFixture(t, 6000)
+	defer cat.Close()
+
+	for _, tc := range []struct {
+		constraint string
+		group      string
+		aggs       []AggSpec
+		// wantServed says whether the COLUMNS must answer this shape. Asserting it per case is what
+		// keeps the comparison from passing by quietly falling through to the scan for all of them --
+		// and, for the cases that must decline, from passing because the decline is right for some
+		// other reason than the one under test.
+		wantServed bool
+		why        string
+	}{
+		{"RequestMemory > 4096", "ProcId",
+			[]AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggMax, Arg: "RequestCpus"}}, true, ""},
+		{"RequestMemory > 4096", "ProcId",
+			[]AggSpec{{Func: AggMin, Arg: "Runtime"}, {Func: AggMax, Arg: "Runtime"}}, true, ""},
+		{"RequestMemory > 2048", "ProcId",
+			[]AggSpec{{Func: AggSum, Arg: "Runtime"}, {Func: AggAvg, Arg: "Runtime"}}, true,
+			"Runtime is an integer column, so its sum is exact in int64 and order cannot change it"},
+		{"RequestMemory > 2048", "ProcId",
+			[]AggSpec{{Func: AggSum, Arg: "Score"}, {Func: AggAvg, Arg: "Score"}}, false,
+			"adding REALS in column order can round differently than the reference adding them in scan order"},
+		{"RequestMemory > 2048", "RequestCpus",
+			[]AggSpec{{Func: AggMin, Arg: "Score"}, {Func: AggMax, Arg: "Score"}}, true,
+			"MIN/MAX over a real column is order-independent, so it stays served"},
+		{"RequestMemory > 2048", "ProcId",
+			[]AggSpec{{Func: AggCount, Arg: "Runtime"}, {Func: AggCount, Arg: "*"}}, true, ""},
+		// Every served function at once, plus a repeated attribute.
+		{"RequestCpus >= 4", "ProcId", []AggSpec{
+			{Func: AggCount, Arg: "*"}, {Func: AggCount, Arg: "Runtime"},
+			{Func: AggMin, Arg: "Runtime"}, {Func: AggMax, Arg: "Runtime"},
+			{Func: AggSum, Arg: "Runtime"}, {Func: AggAvg, Arg: "Runtime"},
+		}, true, ""},
+		// Unconstrained, where the predicate analysis cannot serve it and match-all is asked for
+		// explicitly instead.
+		{"true", "ProcId", []AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggAvg, Arg: "Runtime"}}, true, ""},
+	} {
+		groupCols := []GroupCol{{Attr: tc.group}}
+		got, err := a.AggregateCols(tc.constraint, groupCols, tc.aggs)
+		if err != nil {
+			t.Fatalf("%s GROUP BY %s: %v", tc.constraint, tc.group, err)
+		}
+		want := scanAggregate(t, a, tc.constraint, groupCols, tc.aggs)
+		// Compare the whole row, aggregate values included: a formatting difference (int vs real, an
+		// empty MIN) is as wrong as a numeric one and much easier to ship unnoticed.
+		gotM, wantM := rowsByGroup(t, got), rowsByGroup(t, want)
+		if len(gotM) != len(wantM) {
+			t.Errorf("%s GROUP BY %s: %d groups, scan found %d", tc.constraint, tc.group, len(gotM), len(wantM))
+		}
+		for g, v := range wantM {
+			if fmt.Sprint(gotM[g]) != fmt.Sprint(v) {
+				t.Errorf("%s GROUP BY %s: group %q = %v, scan = %v", tc.constraint, tc.group, g, gotM[g], v)
+			}
+		}
+		if _, served := a.groupedFromColumns(tc.constraint, groupCols, tc.aggs); served != tc.wantServed {
+			t.Errorf("%s GROUP BY %s %v: served columnar = %v, want %v (%s)",
+				tc.constraint, tc.group, tc.aggs, served, tc.wantServed, tc.why)
+		}
+	}
+	// One group's records all lack Runtime, so its MIN/MAX must come back undefined -- the case that
+	// distinguishes "the group does not exist" from "the group exists with nothing to aggregate".
+	rows, err := a.AggregateCols("RequestMemory > 2048", []GroupCol{{Attr: "ProcId"}},
+		[]AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggMin, Arg: "Runtime"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	undef := 0
+	for _, r := range rows {
+		if r.Values[1] == "undefined" {
+			undef++
+			if r.Values[0] == "0" {
+				t.Errorf("group %q has an undefined MIN and a zero count: it should not be a row at all",
+					r.Group[0])
+			}
+		}
+	}
+	if undef != 1 {
+		t.Errorf("%d groups have an undefined MIN(Runtime), want exactly 1 -- the fixture no longer "+
+			"covers a group whose records all lack the aggregated attribute", undef)
+	}
+}
+
+// rowsByGroup keys whole rows (all aggregate values) by group label.
+func rowsByGroup(tb testing.TB, rows []AggRow) map[string][]string {
+	tb.Helper()
+	out := make(map[string][]string, len(rows))
+	for _, r := range rows {
+		if len(r.Group) != 1 {
+			tb.Fatalf("unexpected row shape %+v", r)
+		}
+		if _, dup := out[r.Group[0]]; dup {
+			tb.Errorf("group %q appears twice: one group was split into two rows", r.Group[0])
+		}
+		out[r.Group[0]] = r.Values
+	}
+	return out
+}
+
+// TestArchiveGroupedAggregateRefusals pins what must NOT be served from the columns, each for a reason
+// that would make the answer wrong rather than merely slow.
+func TestArchiveGroupedAggregateRefusals(t *testing.T) {
+	cat, a := groupAggFixture(t, 3000)
+	defer cat.Close()
+	for _, tc := range []struct {
+		why        string
+		constraint string
+		groupCols  []GroupCol
+		aggs       []AggSpec
+	}{
+		{"a FILTER is invisible to the columnar pass", "RequestMemory > 2048",
+			[]GroupCol{{Attr: "ProcId"}}, []AggSpec{{Func: AggCount, Arg: "*", Filter: "RequestCpus >= 4"}}},
+		{"COUNT(DISTINCT) needs the values, not their aggregate", "RequestMemory > 2048",
+			[]GroupCol{{Attr: "ProcId"}}, []AggSpec{{Func: AggCountDistinct, Arg: "RequestCpus"}}},
+		{"a bucketed group column is not this shape", "RequestMemory > 2048",
+			[]GroupCol{{Attr: "ClusterId", BucketWidth: 100}}, []AggSpec{{Func: AggCount, Arg: "*"}}},
+		{"two group columns", "RequestMemory > 2048",
+			[]GroupCol{{Attr: "ProcId"}, {Attr: "RequestCpus"}}, []AggSpec{{Func: AggCount, Arg: "*"}}},
+		{"aggregating a string column", "RequestMemory > 2048",
+			[]GroupCol{{Attr: "ProcId"}}, []AggSpec{{Func: AggMax, Arg: "Owner"}}},
+	} {
+		if _, ok := a.groupedFromColumns(tc.constraint, tc.groupCols, tc.aggs); ok {
+			t.Errorf("served a shape it must decline: %s", tc.why)
+		}
+		// Declining is only acceptable because the fallback is right: check the answer too.
+		got, err := a.AggregateCols(tc.constraint, tc.groupCols, tc.aggs)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.why, err)
+		}
+		want := scanAggregate(t, a, tc.constraint, tc.groupCols, tc.aggs)
+		if len(got) != len(want) {
+			t.Errorf("%s: %d rows, scan %d", tc.why, len(got), len(want))
+		}
+	}
+}
+
+// BenchmarkArchiveGroupedValueAggregates measures the shape a dashboard asks: a per-group count with a
+// value aggregate beside it.
+func BenchmarkArchiveGroupedValueAggregates(b *testing.B) {
+	cat, a := groupAggFixture(b, 60000)
+	defer cat.Close()
+	groupCols := []GroupCol{{Attr: "ProcId"}}
+	aggs := []AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggMin, Arg: "Runtime"},
+		{Func: AggMax, Arg: "Runtime"}, {Func: AggAvg, Arg: "Runtime"}}
+	if _, ok := a.groupedFromColumns("RequestMemory > 4096", groupCols, aggs); !ok {
+		b.Fatal("not served columnar")
+	}
+	b.Run("columnar", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			if _, err := a.AggregateCols("RequestMemory > 4096", groupCols, aggs); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("scan", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
+			seq, err := a.QueryProject("RequestMemory > 4096", attrs)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := AggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, nil); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}

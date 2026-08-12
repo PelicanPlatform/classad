@@ -9,7 +9,7 @@ import (
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
-// GROUP BY one numeric column with COUNT(*), answered from the columns.
+// GROUP BY one numeric column, answered from the columns.
 //
 // The ungrouped count already reads a column and never decodes a record:
 //
@@ -17,18 +17,31 @@ import (
 //	NumJobStarts, count(*) where NumJobStarts < 10 GROUP BY NumJobStarts   8112ms
 //
 // 210x apart on the same predicate over the same 631,983 matching records, with the group column HOT. The
-// grouped form declined every columnar path -- an index answers only the unconstrained case, the count fast
-// path is gated on there being no grouping, and the general columnar aggregate has no attribute to aggregate
-// for COUNT(*) -- and fell through to projecting every matching record one at a time.
+// grouped form declined every columnar path -- an index answers only the unconstrained case and only for a
+// categorically indexed column, the count fast path is gated on there being no grouping, and the general
+// columnar aggregate has no attribute to aggregate for COUNT(*) -- and fell through to projecting every
+// matching record one at a time.
 //
-// But a GROUP BY on one numeric column whose only aggregate is COUNT(*) IS a histogram of that column, and the
-// count scan is already walking it. This does the same narrowing passes and then buckets the group column's
-// values for the survivors instead of only counting them.
+// But a GROUP BY on one numeric column IS a histogram of that column, and the count scan is already walking
+// it. This does the same narrowing passes and then reads the group column for the survivors, bucketing them
+// instead of only counting them. MIN/MAX/SUM/AVG/COUNT(attr) per group come from reading their columns in
+// the same pass, since the records have already been narrowed.
+//
+// Memory is one entry per distinct group value, which is what the scanning aggregator this replaces also
+// builds -- so a high-cardinality group column is no worse here, just faster.
 
 // GroupCount is one group of a GROUP BY: the group column's value and how many records held it.
 type GroupCount struct {
 	Value classad.Value
 	Count int
+}
+
+// GroupStats is one group of a GROUP BY with value aggregates: the group column's value, how many records
+// fell in the group, and one NumStats per requested aggregate attribute, in the order requested.
+type GroupStats struct {
+	Value classad.Value
+	Count int
+	Stats []NumStats
 }
 
 // GroupCountConstraint parses a constraint string and, if the shape is columnar-eligible, answers
@@ -43,79 +56,145 @@ func (c *Collection) GroupCountConstraint(constraint, groupAttr string) ([]Group
 }
 
 // GroupCountQuery answers `SELECT groupAttr, COUNT(*) ... WHERE q GROUP BY groupAttr` from the columnar
-// blocks, returning the groups sorted by value.
+// blocks, returning the groups sorted by value. See GroupStatsQuery, of which this is the no-value-
+// aggregate case.
+func (c *Collection) GroupCountQuery(q *vm.Query, groupAttr string) ([]GroupCount, bool) {
+	return countsOf(c.GroupStatsQuery(q, groupAttr, nil))
+}
+
+// GroupCountAll is GroupCountQuery with no constraint: the histogram of the whole column.
+func (c *Collection) GroupCountAll(groupAttr string) ([]GroupCount, bool) {
+	return countsOf(c.GroupStatsAll(groupAttr, nil))
+}
+
+// countsOf drops the (absent) aggregate columns from a grouped-stats result, so the count API is the
+// no-aggregate case of the one scan rather than a second scan that could drift from it.
+func countsOf(gs []GroupStats, ok bool) ([]GroupCount, bool) {
+	if !ok {
+		return nil, false
+	}
+	out := make([]GroupCount, len(gs))
+	for i, g := range gs {
+		out[i] = GroupCount{Value: g.Value, Count: g.Count}
+	}
+	return out, true
+}
+
+// GroupStatsQuery answers `SELECT groupAttr, COUNT(*), <aggregates over aggAttrs> ... WHERE q GROUP BY
+// groupAttr` from the columnar blocks, returning the groups sorted by value. Each group carries a
+// NumStats per aggAttr, from which the caller renders MIN/MAX/SUM/AVG/COUNT(attr) -- the same inputs
+// NumStatsQuery returns for the ungrouped case, so the rendering is shared and cannot diverge.
 //
 // ok=false when the shape is not columnar-servable -- no accelerator, a non-native constraint, a predicate
-// that is not a conjunction of scalar numeric comparisons, or a group attribute the schema does not carry as
-// a numeric field -- and the caller then scans as before. It also declines mid-flight if a matching record's
-// group value is not a scalar number, because such a record still forms a GROUP: the row path emits a group
-// per distinct rendered value (`undefined` for an absent attribute, the text for a string), and a column read
-// cannot tell absent from present-but-non-numeric, let alone render one. Dropping those records instead would
-// return a result that is silently missing groups, so the query goes back to the scan that can render them.
+// that is not a conjunction of scalar numeric comparisons, or a group/aggregate attribute the schema does
+// not carry as a numeric field -- and the caller then scans as before. It also declines mid-flight if a
+// matching record's GROUP value is not a scalar number, because such a record still forms a group: the row
+// path emits a group per distinct rendered value (`undefined` for an absent attribute, the text for a
+// string), and a column read cannot tell absent from present-but-non-numeric, let alone render one.
+// Dropping those records instead would return a result silently missing groups, so the query goes back to
+// the scan that can render them.
 //
-// Segments whose own schema lacks a field fall back to a row walk that reads only the attributes involved, so
-// a schema change costs those segments and not the query.
-func (c *Collection) GroupCountQuery(q *vm.Query, groupAttr string) ([]GroupCount, bool) {
+// An absent AGGREGATE value is different and is simply skipped: MIN/SUM/COUNT(attr) over a set that does
+// not include the record is what the reference computes for a record whose attribute is undefined. Only
+// the group column decides which rows exist.
+//
+// Segments whose own schema lacks a field fall back to a row walk that reads only the attributes involved,
+// so a schema change costs those segments and not the query.
+func (c *Collection) GroupStatsQuery(q *vm.Query, groupAttr string, aggAttrs []string) ([]GroupStats, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil {
 		return nil, false
 	}
-	groupID, ok := c.intern.LookupID(groupAttr)
+	groupID, aggIDs, ok := c.resolveGroupAttrs(st, groupAttr, aggAttrs)
 	if !ok {
 		return nil, false
 	}
-	idx, ok := st.schema.byID[groupID]
-	if !ok || !numericKind(st.schema.fields[idx].kind) {
-		return nil, false
-	}
-	// The predicate has to be one the column scan can apply -- the same analysis the ungrouped count uses, so
-	// the two paths serve exactly the same shapes.
+	// The predicate has to be one the column scan can apply -- the same analysis the ungrouped count uses,
+	// so the two paths serve exactly the same shapes.
 	preds, ok := c.numPredsOnFields(q, st.schema)
 	if !ok {
 		return nil, false
 	}
-	return c.groupCount(groupID, preds, st.cache)
+	return c.groupStats(groupID, aggIDs, preds, st)
 }
 
-// GroupCountAll is GroupCountQuery with no constraint: the histogram of the whole column. The caller is
-// asserting the query matches every record, which only it can know (see db.IsMatchAll) -- there is no
-// predicate here to check that against.
+// GroupStatsAll is GroupStatsQuery with no constraint: the whole column's histogram plus aggregates. The
+// caller is asserting the query matches every record, which only it can know (see db.IsMatchAll) -- there
+// is no predicate here to check that against.
 //
-// This is not reachable through GroupCountQuery: an unconstrained query has no probes to analyze, so the
+// This is not reachable through GroupStatsQuery: an unconstrained query has no probes to analyze, so the
 // predicate analysis declines it. And the index path that answers other unconstrained grouped counts only
 // covers CATEGORICALLY indexed attributes, so `GROUP BY <numeric>` with no WHERE fell to a record scan the
 // same way the constrained form did.
-func (c *Collection) GroupCountAll(groupAttr string) ([]GroupCount, bool) {
+func (c *Collection) GroupStatsAll(groupAttr string, aggAttrs []string) ([]GroupStats, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil {
 		return nil, false
 	}
-	groupID, ok := c.intern.LookupID(groupAttr)
+	groupID, aggIDs, ok := c.resolveGroupAttrs(st, groupAttr, aggAttrs)
 	if !ok {
 		return nil, false
 	}
-	idx, ok := st.schema.byID[groupID]
-	if !ok || !numericKind(st.schema.fields[idx].kind) {
-		return nil, false
-	}
-	return c.groupCount(groupID, nil, st.cache)
+	return c.groupStats(groupID, aggIDs, nil, st)
 }
 
-// groupCount runs the scan and shapes its result: the part GroupCountQuery and GroupCountAll share once
-// the group column and the predicate set are resolved. A nil preds means every visible record survives.
-func (c *Collection) groupCount(groupID uint32, preds []fieldPred, bc *blockCache) ([]GroupCount, bool) {
-	counts, ok := c.schemaScanGroupCount(groupID, preds, bc)
+// resolveGroupAttrs interns the group and aggregate attribute names and checks each is carried by the
+// collection-wide schema as a numeric field. A name repeated in aggAttrs resolves to the same id, which
+// costs one extra read per record and keeps the result positional -- callers ask for MIN(x) and MAX(x).
+func (c *Collection) resolveGroupAttrs(st *schemaScanState, groupAttr string, aggAttrs []string) (uint32, []uint32, bool) {
+	numericField := func(name string) (uint32, bool) {
+		id, ok := c.intern.LookupID(name)
+		if !ok {
+			return 0, false
+		}
+		idx, ok := st.schema.byID[id]
+		if !ok || !numericKind(st.schema.fields[idx].kind) {
+			return 0, false
+		}
+		return id, true
+	}
+	groupID, ok := numericField(groupAttr)
+	if !ok {
+		return 0, nil, false
+	}
+	var aggIDs []uint32
+	for _, a := range aggAttrs {
+		id, ok := numericField(a)
+		if !ok {
+			return 0, nil, false
+		}
+		aggIDs = append(aggIDs, id)
+	}
+	return groupID, aggIDs, true
+}
+
+// groupStats runs the scan and shapes its result: the part GroupStatsQuery and GroupStatsAll share once
+// the columns and the predicate set are resolved. A nil preds means every visible record survives.
+func (c *Collection) groupStats(groupID uint32, aggIDs []uint32, preds []fieldPred, st *schemaScanState) ([]GroupStats, bool) {
+	acc, ok := c.schemaScanGroupStats(groupID, aggIDs, preds, st.cache)
 	if !ok {
 		return nil, false
 	}
-	out := make([]GroupCount, 0, len(counts))
-	for raw, n := range counts {
-		out = append(out, GroupCount{Value: raw.value(), Count: n})
+	out := make([]GroupStats, 0, len(acc))
+	for raw, a := range acc {
+		g := GroupStats{Value: raw.value(), Count: a.n}
+		if len(aggIDs) > 0 {
+			g.Stats = make([]NumStats, len(aggIDs))
+			for i := range a.stats {
+				g.Stats[i] = a.stats[i].result()
+			}
+		}
+		out = append(out, g)
 	}
 	sort.Slice(out, func(i, j int) bool { return groupLess(out[i].Value, out[j].Value) })
-	if name, ok := c.schemaFieldName(groupID); ok {
-		c.demand.recordReads([]string{name})
+	// Reading a column is demand for it, the same as any other query that touches one.
+	read := make([]string, 0, 1+len(aggIDs))
+	for _, id := range append([]uint32{groupID}, aggIDs...) {
+		if name, ok := c.schemaFieldName(id); ok {
+			read = append(read, name)
+		}
 	}
+	c.demand.recordReads(read)
 	return out, true
 }
 
@@ -158,28 +237,52 @@ func groupLess(a, b classad.Value) bool {
 	return a.String() < b.String()
 }
 
-// schemaScanGroupCount buckets the group column for every record satisfying preds, one narrowing pass per
-// predicate column and then one read of the group column for the survivors.
+// groupAcc is one group's accumulation: the record count plus one aggregate accumulator per requested
+// aggregate column.
+type groupAcc struct {
+	n     int
+	stats []statsAccum
+}
+
+func newGroupAcc(nAgg int) *groupAcc {
+	g := &groupAcc{}
+	if nAgg > 0 {
+		g.stats = make([]statsAccum, nAgg)
+		for i := range g.stats {
+			g.stats[i] = newStatsAccum()
+		}
+	}
+	return g
+}
+
+// schemaScanGroupStats buckets the group column for every record satisfying preds -- one narrowing pass
+// per predicate column, then one read of the group column and of each aggregate column for the survivors.
 //
-// ok=false means a surviving record's group value was not a scalar number, which this cannot turn into a
-// group (see GroupCountQuery); the partial counts are then discarded and the caller scans.
-func (c *Collection) schemaScanGroupCount(groupID uint32, preds []fieldPred, bc *blockCache) (map[groupKey]int, bool) {
-	counts := map[groupKey]int{}
+// ok=false means a surviving record's GROUP value was not a scalar number, which this cannot turn into a
+// group (see GroupStatsQuery); the partial result is then discarded and the caller scans.
+func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, preds []fieldPred,
+	bc *blockCache) (map[groupKey]*groupAcc, bool) {
+	acc := map[groupKey]*groupAcc{}
 	lookups := make([]func(wire.Ad) ([]byte, bool), len(preds))
 	for i, p := range preds {
 		lookups[i] = c.attrLookup(p.fieldID)
 	}
 	groupLookup := c.attrLookup(groupID)
+	aggLookups := make([]func(wire.Ad) ([]byte, bool), len(aggIDs))
+	for i, id := range aggIDs {
+		aggLookups[i] = c.attrLookup(id)
+	}
 
 	var keep []bool
 	var scratch []int64
+	aggCols := make([]numCol, len(aggIDs))
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
 			cs := w.seg.colblk.Load()
-			groupIdx, predIdxs, ok := resolveStatsFields(cs, groupID, preds)
+			groupIdx, aggIdxs, predIdxs, ok := resolveGroupFields(cs, groupID, aggIDs, preds)
 			if !ok {
-				if !bruteGroupCount(w, s0, groupLookup, preds, lookups, counts) {
+				if !bruteGroupStats(w, s0, groupLookup, aggLookups, preds, lookups, acc) {
 					releaseWindows(wins)
 					return nil, false
 				}
@@ -187,7 +290,8 @@ func (c *Collection) schemaScanGroupCount(groupID uint32, preds []fieldPred, bc 
 			}
 			base := 0
 			for _, blk := range cs.blocks {
-				// Only the PREDICATE columns can rule a block out; the group column's values are the answer.
+				// Only the PREDICATE columns can rule a block out; the group and aggregate columns'
+				// values are the answer.
 				if !blockMayMatch(blk, predIdxs, preds) {
 					base += blk.n
 					continue
@@ -199,6 +303,13 @@ func (c *Collection) schemaScanGroupCount(groupID uint32, preds []fieldPred, bc 
 					// their groups without saying so, so the query goes back to the scan.
 					releaseWindows(wins)
 					return nil, false
+				}
+				for i := range aggIDs {
+					aggCols[i], colOK = newNumCol(blk, aggIdxs[i], aggIDs[i], bc)
+					if !colOK {
+						releaseWindows(wins)
+						return nil, false
+					}
 				}
 				if cap(keep) < blk.n {
 					keep = make([]bool, blk.n)
@@ -232,12 +343,26 @@ func (c *Collection) schemaScanGroupCount(groupID uint32, preds []fieldPred, bc 
 						nv, ok := col.at(k, bc)
 						if !ok || !numericKind(nv.kind) {
 							// This record matches and forms a group the caller can render but this
-							// cannot; see GroupCountQuery. Give the whole query back rather than
+							// cannot; see GroupStatsQuery. Give the whole query back rather than
 							// return a result with groups missing.
 							releaseWindows(wins)
 							return nil, false
 						}
-						counts[groupKeyOf(nv)]++
+						key := groupKeyOf(nv)
+						g := acc[key]
+						if g == nil {
+							g = newGroupAcc(len(aggIDs))
+							acc[key] = g
+						}
+						g.n++
+						for i := range aggCols {
+							// An absent or non-numeric aggregate value contributes nothing, which is
+							// what the reference computes for it -- unlike the group value above,
+							// which decides whether the row exists at all.
+							if av, ok := aggCols[i].at(k, bc); ok {
+								g.stats[i].add(av)
+							}
+						}
 					}
 				}
 				base += blk.n
@@ -245,16 +370,37 @@ func (c *Collection) schemaScanGroupCount(groupID uint32, preds []fieldPred, bc 
 		}
 		releaseWindows(wins)
 	}
-	return counts, true
+	return acc, true
 }
 
-// bruteGroupCount is the row fallback for a segment whose schema lacks a field involved: walk the visible
+// resolveGroupFields maps the group column, every aggregate column and every predicated field into this
+// SEGMENT's schema. ok=false when any is absent, since segments sealed under different schemas coexist.
+func resolveGroupFields(cs *colSegment, groupID uint32, aggIDs []uint32,
+	preds []fieldPred) (int, []int, []int, bool) {
+	groupIdx, predIdxs, ok := resolveStatsFields(cs, groupID, preds)
+	if !ok {
+		return 0, nil, nil, false
+	}
+	sch := cs.schema()
+	aggIdxs := make([]int, len(aggIDs))
+	for i, id := range aggIDs {
+		idx, ok := sch.byID[id]
+		if !ok || !numericKind(sch.fields[idx].kind) {
+			return 0, nil, nil, false
+		}
+		aggIdxs[i] = idx
+	}
+	return groupIdx, aggIdxs, predIdxs, true
+}
+
+// bruteGroupStats is the row fallback for a segment whose schema lacks a field involved: walk the visible
 // records and read only those attributes, never decoding the whole ad.
 //
 // It returns false if a matching record's group attribute is missing or not a scalar number -- the same
 // give-up condition as the column path, for the same reason.
-func bruteGroupCount(w segWindow, s0 uint64, groupLookup func(wire.Ad) ([]byte, bool),
-	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), counts map[groupKey]int) bool {
+func bruteGroupStats(w segWindow, s0 uint64, groupLookup func(wire.Ad) ([]byte, bool),
+	aggLookups []func(wire.Ad) ([]byte, bool), preds []fieldPred,
+	lookups []func(wire.Ad) ([]byte, bool), acc map[groupKey]*groupAcc) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -288,7 +434,20 @@ func bruteGroupCount(w segWindow, s0 uint64, groupLookup func(wire.Ad) ([]byte, 
 					if !isNum || !numericKind(nv.kind) {
 						return false
 					}
-					counts[groupKeyOf(nv)]++
+					key := groupKeyOf(nv)
+					g := acc[key]
+					if g == nil {
+						g = newGroupAcc(len(aggLookups))
+						acc[key] = g
+					}
+					g.n++
+					for i := range aggLookups {
+						if an, found := aggLookups[i](ad); found {
+							if av, isNum := nodeColVal(an); isNum {
+								g.stats[i].add(av)
+							}
+						}
+					}
 				}
 			}
 		}

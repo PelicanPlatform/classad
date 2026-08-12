@@ -265,39 +265,8 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 	// count only from the CATEGORICAL index, so a group column that is a hot numeric (`GROUP BY
 	// NumJobStarts`) reached neither it nor the ungrouped fast path and fell to a full row scan --
 	// the same predicate costing ~200x its ungrouped count, constrained or not.
-	if len(groupCols) == 1 && groupCols[0].BucketWidth == 0 && len(aggs) == 1 &&
-		aggs[0].Func == AggCount && aggs[0].Arg == "*" && aggs[0].Filter == "" {
-		// An unconstrained grouped count reaches here only when aggregateFromIndex above declined it,
-		// which it does for a group column that is not categorically indexed. Match-all cannot be
-		// recognized from the predicate (there is none), so it is asked for explicitly.
-		counts, ok := t.a.GroupCountConstraint(constraint, groupCols[0].Attr)
-		if !ok && IsMatchAll(constraint) {
-			counts, ok = t.a.GroupCountAll(groupCols[0].Attr)
-		}
-		if ok {
-			// Groups arrive ascending by value, matching aggregateFromIndex's sorted order, and are
-			// rendered with the same ValueText the scan path groups by -- but the storage layer keys
-			// a group by (bits, type) while the scan path keys it by that rendered text, and the two
-			// are not the same partition: an integer 3 and a real 3.0 are distinct keys there and
-			// both render "3". Merging on the text makes this path's grouping identical to the scan's
-			// instead of splitting one group into two adjacent rows with the same label.
-			rows := make([]AggRow, 0, len(counts))
-			at := make(map[string]int, len(counts))
-			for _, g := range counts {
-				text := ValueText(g.Value)
-				if i, dup := at[text]; dup {
-					n, _ := strconv.Atoi(rows[i].Values[0])
-					rows[i].Values[0] = strconv.Itoa(n + g.Count)
-					continue
-				}
-				at[text] = len(rows)
-				rows = append(rows, AggRow{
-					Group:  []string{text},
-					Values: []string{strconv.Itoa(g.Count)},
-				})
-			}
-			return rows, nil
-		}
+	if rows, ok := t.groupedFromColumns(constraint, groupCols, aggs); ok {
+		return rows, nil
 	}
 	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
 	// per-segment columnar blocks instead of decoding every record. Declines (and falls through
@@ -682,6 +651,20 @@ func (t *ArchiveTable) GroupCountConstraint(constraint, groupAttr string) ([]col
 // collections.Archive.GroupCountAll.
 func (t *ArchiveTable) GroupCountAll(groupAttr string) ([]collections.GroupCount, bool) {
 	return t.a.GroupCountAll(groupAttr)
+}
+
+// GroupStatsConstraint answers a per-group record count plus the aggregate inputs for each aggAttr over
+// the rows matching constraint, via the columnar accelerator, or reports ok=false so the caller scans.
+// AggregateCols uses it for the single-numeric-column GROUP BY shape; it is exported so a caller (and a
+// test) can tell which tier answered. See collections.Archive.GroupStatsConstraint.
+func (t *ArchiveTable) GroupStatsConstraint(constraint, groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsConstraint(constraint, groupAttr, aggAttrs)
+}
+
+// GroupStatsAll is GroupStatsConstraint over every row, for a constraint this layer has established is
+// match-all (the predicate analysis behind GroupStatsConstraint has no predicate to work with there).
+func (t *ArchiveTable) GroupStatsAll(groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsAll(groupAttr, aggAttrs)
 }
 
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).
