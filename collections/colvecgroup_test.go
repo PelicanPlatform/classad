@@ -64,8 +64,7 @@ func checkGroupsMatchRows(t *testing.T, c *Collection, expr, attr string) []Grou
 // ungrouped count has served these since the vector executor landed; grouping declined them and fell to a
 // record scan.
 func TestGroupCountGeneralPredicates(t *testing.T) {
-	c := scopeFixtureCodec(t, 20000)
-	defer c.Close()
+	c := groupReadFixture(t)
 	for _, expr := range []string{
 		`Owner == "user3"`,                     // a string comparison
 		"RequestMemory > RequestCpus",          // attribute to attribute
@@ -86,8 +85,7 @@ func TestGroupCountGeneralPredicates(t *testing.T) {
 // TestGroupCountScopedBlocks covers the tier where the vector executor declines a block and the grouping
 // falls to per-record evaluation WITHIN the block -- it must still contribute its groups.
 func TestGroupCountScopedBlocks(t *testing.T) {
-	c := scopeFixtureCodec(t, 20000)
-	defer c.Close()
+	c := groupReadFixture(t)
 	// An Elvis operator is not lowered by the vector executor, so every block goes to the scoped path.
 	// The exact form matters: `(Missing ?: RequestMemory) > 4096` DOES vectorize, so a test written with
 	// that one asserts the scoped tier while never reaching it.
@@ -105,10 +103,11 @@ func TestGroupCountScopedBlocks(t *testing.T) {
 // TestGroupCountRowWindows covers the tier with no columnar block at all: the active segment, which no
 // accelerator covers. A tier that silently contributed no groups would under-report every group.
 func TestGroupCountRowWindows(t *testing.T) {
-	c := scopeFixtureCodec(t, 20000)
+	// Its own fixture: this test APPENDS, and the shared one is read-only by contract.
+	c := scopeFixtureCodec(t, groupFixtureRecords)
 	defer c.Close()
 	// Records appended after the accelerator was built live in the active segment, uncovered.
-	for i := 20000; i < 20500; i++ {
+	for i := groupFixtureRecords; i < groupFixtureRecords+500; i++ {
 		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nJobStatus = %d\nRequestMemory = %d\n"+
 			"RequestCpus = %d\nOwner = \"user%d\"\nCmd = \"/x\"\nWantCheckpoint = %t\n"+
 			"Args = \"--a\"\nIwd = \"/y\"", i, i%10, 1+i%5, 1024+(i%32)*512, 1+i%8, i%512, i%3 == 0)
@@ -128,13 +127,23 @@ func TestGroupCountRowWindows(t *testing.T) {
 }
 
 // TestGroupCountSupersededRecords covers the churn tier -- a block whose records are mostly superseded
-// goes to per-record evaluation -- and the visibility rule itself: a superseded record must not be
-// counted in any group.
+// goes to per-record evaluation, because the vector executor evaluates every record in a block including
+// ones nobody can see -- and the visibility rule itself: a superseded record must not be counted in any
+// group.
+//
+// Overwriting a FRACTION of every old segment is what makes this deterministic. Overwriting all of them
+// leaves each old segment fully superseded, and a fully superseded segment is reaped -- so there is no
+// covered block left to be churn, and the tier is silently not reached. That is what the first version of
+// this test did: at 20000 records it reached the tier with exactly one straggler block, and at 6000 with
+// none at all.
 func TestGroupCountSupersededRecords(t *testing.T) {
-	c := scopeFixtureCodec(t, 20000)
+	// Its own fixture: this test OVERWRITES most of it, and the shared one is read-only by contract.
+	c := scopeFixtureCodec(t, groupFixtureRecords)
 	defer c.Close()
-	// Overwrite most of the collection, so the sealed blocks holding the old versions are mostly dead.
-	for i := 0; i < 19000; i++ {
+	for i := 0; i < groupFixtureRecords; i++ {
+		if i%5 == 0 {
+			continue // leave a fifth of every old segment visible: mostly dead, not dead
+		}
 		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nJobStatus = %d\nRequestMemory = %d\n"+
 			"RequestCpus = %d\nOwner = \"user%d\"\nCmd = \"/x\"\nWantCheckpoint = %t\n"+
 			"Args = \"--a\"\nIwd = \"/y\"", i, 7, 1+i%5, 8192, 1+i%8, i%512, false)
@@ -144,8 +153,9 @@ func TestGroupCountSupersededRecords(t *testing.T) {
 	}
 	const expr = "RequestMemory >= 2048 || ProcId >= 5"
 	checkGroupsMatchRows(t, c, expr, "ProcId")
-	if split := lastGroupSplit.Load(); split == nil || split.churnBlocks == 0 {
-		t.Logf("no block hit the churn tier (%+v); the visibility check above still ran", split)
+	split := lastGroupSplit.Load()
+	if split == nil || split.churnBlocks == 0 {
+		t.Fatalf("no block hit the churn tier (%+v), so that tier is untested here", split)
 	}
 }
 
@@ -153,8 +163,7 @@ func TestGroupCountSupersededRecords(t *testing.T) {
 // just the counts -- the aggregate columns are read in the same pass, so a tier that got the matching set
 // right could still read the wrong record's value.
 func TestGroupStatsGeneralPredicateAggregates(t *testing.T) {
-	c := scopeFixtureCodec(t, 20000)
-	defer c.Close()
+	c := groupReadFixture(t)
 	const expr = `Owner == "user3" || ProcId >= 8`
 	q, err := vm.Parse(expr)
 	if err != nil {
@@ -226,7 +235,7 @@ func TestGroupCountIndexedConstraintStillDeclines(t *testing.T) {
 	// Same fixture, but with Owner categorically indexed, so a query on Owner has a pruning index.
 	c := New(Options{Shards: 1, SegmentSize: 1 << 16, Codec: cd, CategoricalAttrs: []string{"Owner"}})
 	defer c.Close()
-	for i := 0; i < 20000; i++ {
+	for i := 0; i < groupFixtureRecords; i++ {
 		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nJobStatus = %d\nRequestMemory = %d\n"+
 			"RequestCpus = %d\nOwner = \"user%d\"\nCmd = \"/x\"", i, i%10, 1+i%5,
 			1024+(i%32)*512, 1+i%8, i%512)

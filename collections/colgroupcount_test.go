@@ -2,10 +2,39 @@ package collections
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
+
+// groupReadFixture is the ONE fixture the read-only grouping tests share.
+//
+// Each of them used to build its own, and building one costs ~15s under the race detector (20k puts plus
+// 80 full scans of demand training). Eleven of those pushed the collections race job past its 25-minute
+// CI budget -- it timed out inside unrelated tests, which is how a cheap-looking `20000` in a fixture call
+// turns into a red build nobody can attribute. One shared build is ~15s for all of them.
+//
+// It is never closed: the tests only read, and the process exit reclaims it. A test that MUTATES the
+// collection must build its own, or it changes what every later test sees.
+var (
+	groupFixtureOnce sync.Once
+	groupFixtureColl *Collection
+)
+
+func groupReadFixture(tb testing.TB) *Collection {
+	tb.Helper()
+	groupFixtureOnce.Do(func() { groupFixtureColl = scopeFixtureCodec(tb, groupFixtureRecords) })
+	if groupFixtureColl == nil {
+		tb.Skip("shared grouping fixture unavailable (no sealed segments)")
+	}
+	return groupFixtureColl
+}
+
+// groupFixtureRecords is sized to what these tests actually need -- several sealed segments, so there are
+// multiple columnar blocks and more than one window -- and no larger. 20000 records bought nothing a
+// quarter of that does not.
+const groupFixtureRecords = 3000
 
 // rowGroupTruth computes the same GROUP BY by decoding records the ordinary way, which is what the columnar
 // path has to agree with.
@@ -34,8 +63,7 @@ func rowGroupTruth(t *testing.T, c *Collection, constraint, attr string) (map[in
 }
 
 func TestGroupCountQueryMatchesRowPath(t *testing.T) {
-	c := scopeFixtureCodec(t, 20000)
-	defer c.Close()
+	c := groupReadFixture(t)
 
 	for _, tc := range []struct{ constraint, attr string }{
 		{"RequestMemory > 4096", "ProcId"},
@@ -100,8 +128,7 @@ func TestGroupCountQueryMatchesRowPath(t *testing.T) {
 // change; the answers for those shapes are checked against the row path in TestGroupCountGeneralPredicates
 // instead, which is the contract.
 func TestGroupCountQueryDeclinesUnservable(t *testing.T) {
-	c := scopeFixtureCodec(t, 20000)
-	defer c.Close()
+	c := groupReadFixture(t)
 	for _, tc := range []struct{ constraint, attr, why string }{
 		{"RequestMemory > 4096", "Owner", "a string column is not a numeric histogram"},
 		{"RequestMemory > 4096", "NoSuchAttr", "attribute absent from the schema"},
@@ -208,7 +235,7 @@ func TestGroupCountQueryDeclinesUnrepresentableGroups(t *testing.T) {
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			c := heteroGroupFixture(t, 20000, tc.shape)
+			c := heteroGroupFixture(t, groupFixtureRecords, tc.shape)
 			defer c.Close()
 			q, err := vm.Parse("RequestMemory > 4096")
 			if err != nil {
@@ -231,7 +258,7 @@ func TestGroupCountQueryDeclinesUnrepresentableGroups(t *testing.T) {
 			}
 			// And the shape is otherwise servable, so the decline is about the values -- not about the
 			// query being outside the fast path to begin with.
-			c2 := heteroGroupFixture(t, 20000, func(i int) string { return fmt.Sprintf("Tally = %d", i%10) })
+			c2 := heteroGroupFixture(t, groupFixtureRecords, func(i int) string { return fmt.Sprintf("Tally = %d", i%10) })
 			defer c2.Close()
 			if _, ok := c2.GroupCountQuery(q, "Tally"); !ok {
 				t.Error("declined the same query on a uniform fixture, so the decline above was not about " +
@@ -244,8 +271,7 @@ func TestGroupCountQueryDeclinesUnrepresentableGroups(t *testing.T) {
 // TestGroupCountAllMatchesRowPath covers the no-constraint form, which GroupCountQuery cannot serve
 // (there is no predicate to analyze) and so is a separate entry point.
 func TestGroupCountAllMatchesRowPath(t *testing.T) {
-	c := scopeFixtureCodec(t, 20000)
-	defer c.Close()
+	c := groupReadFixture(t)
 	for _, attr := range []string{"ProcId", "JobStatus", "RequestCpus"} {
 		got, ok := c.GroupCountAll(attr)
 		if !ok {
