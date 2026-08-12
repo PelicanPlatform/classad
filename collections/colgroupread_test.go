@@ -1,0 +1,187 @@
+package collections
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/collections/wire"
+)
+
+// groupReadFixture attaches a group to one block of records and returns everything a read test
+// needs: the scope with the group bound, the base block, and the expected per-record state.
+func groupReadFixture(t *testing.T, c *Collection, n int) (*colScope, *colSegment, []string) {
+	t.Helper()
+	iws, ids, state := groupBlockFixture(t, c, n)
+	base := buildAdSchema(iws, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
+	var rows [][]byte
+	for _, iw := range iws {
+		rows = append(rows, base.encode(wire.Ad(iw)))
+	}
+	blk := encodeColumnarBlock(base, rows, nil, c.regionCodec())
+	g := &colGroup{ids: nil, schema: buildAdSchemaFor(iws, ids)}
+	for _, f := range g.schema.fields {
+		g.ids = append(g.ids, f.id)
+	}
+	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec())
+	seg := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
+
+	bc, err := newBlockCache(1 << 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cs := &colScope{bc: bc, c: c}
+	cs.setBlock(blk)
+	cs.setGroups(seg, 0)
+	return cs, seg, state
+}
+
+// TestGroupResolveThreeStates is the read contract. A member's value comes from the group block; a
+// record holding none of the group reads UNDEFINED with no fallback (the case the whole design
+// exists for); an exception reads its value from the BASE block's cold tail, since a group
+// attribute is not a base field and the base encoder left it there.
+func TestGroupResolveThreeStates(t *testing.T) {
+	c := New(Options{Shards: 1})
+	defer c.Close()
+	const n = 240
+	cs, _, state := groupReadFixture(t, c, n)
+
+	for k := range n {
+		cs.k = k
+		cs.fellBack = false
+		v := cs.resolve("GA", ast.NoScope)
+		switch state[k] {
+		case "in":
+			iv, _ := v.IntValue()
+			if !v.IsInteger() || iv != int64(k) {
+				t.Fatalf("record %d (member): GA = %v, want %d", k, v, k)
+			}
+			if cs.fellBack {
+				t.Errorf("record %d: a member must not fall back", k)
+			}
+		case "partial":
+			// GA is the attribute the partial records DO carry.
+			iv, _ := v.IntValue()
+			if !v.IsInteger() || iv != int64(k) {
+				t.Fatalf("record %d (exception): GA = %v, want %d from the cold tail", k, v, k)
+			}
+		default:
+			if !v.IsUndefined() {
+				t.Fatalf("record %d (holds none of the group): GA = %v, want undefined", k, v)
+			}
+			if cs.fellBack {
+				t.Errorf("record %d: proving the group absent must not require a fallback", k)
+			}
+		}
+	}
+	// GB is NOT carried by the partial records, so it must read undefined for them too.
+	for k := range n {
+		if state[k] != "partial" {
+			continue
+		}
+		cs.k = k
+		cs.fellBack = false
+		if v := cs.resolve("GB", ast.NoScope); !v.IsUndefined() {
+			t.Fatalf("record %d: GB = %v, want undefined (the exception does not carry it)", k, v)
+		}
+	}
+}
+
+// TestGroupVecColumnMatchesScalar: the vectorized load must agree with the per-record resolver
+// element for element. A disagreement here is a wrong query answer that only appears on the
+// vectorized path, which is the hardest kind to notice.
+func TestGroupVecColumnMatchesScalar(t *testing.T) {
+	c := New(Options{Shards: 1})
+	defer c.Close()
+	const n = 300
+	cs, seg, state := groupReadFixture(t, c, n)
+	blk := seg.blocks[0]
+
+	src := &blockVecSource{c: c, bc: cs.bc, dicts: map[int]*blockDict{}}
+	src.blk = blk
+	src.setGroups(seg, 0)
+	dst := &vm.Vec{I: make([]int64, n), St: make([]uint8, n), S: make([]string, n)}
+	loaded, handled := src.loadGroupColumn("GA", dst)
+	if !handled {
+		t.Fatal("loadGroupColumn did not handle a group attribute")
+	}
+	if !loaded {
+		t.Fatal("loadGroupColumn declined a column it should serve")
+	}
+	for k := range n {
+		cs.k = k
+		cs.fellBack = false
+		want := cs.resolve("GA", ast.NoScope)
+		switch {
+		case want.IsUndefined():
+			if dst.St[k] != vm.VsUndef {
+				t.Fatalf("record %d (%s): vector state %d, scalar says undefined", k, state[k], dst.St[k])
+			}
+		case want.IsInteger():
+			iv, _ := want.IntValue()
+			if dst.St[k] != vm.VsInt || dst.I[k] != iv {
+				t.Fatalf("record %d (%s): vector (%d,%d), scalar says int %d", k, state[k], dst.St[k], dst.I[k], iv)
+			}
+		default:
+			t.Fatalf("record %d: unexpected scalar kind %v", k, want)
+		}
+	}
+}
+
+// TestGroupQueryMatchesRowPath is the end-to-end guard: a query touching a group attribute must
+// return exactly what a brute row scan returns, whichever internal path serves it.
+func TestGroupQueryMatchesRowPath(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const n = 3000
+	want := map[string]int{}
+	for i := range n {
+		text := fmt.Sprintf(`[ ClusterId=%d; Owner="u%d" ]`, i, i%5)
+		switch i % 4 {
+		case 0:
+			text = fmt.Sprintf(`[ ClusterId=%d; Owner="u%d"; GA=%d; GB=%d; GC=%d ]`, i, i%5, i, i*2, i*3)
+		case 1:
+			text = fmt.Sprintf(`[ ClusterId=%d; Owner="u%d"; GA=%d ]`, i, i%5, i)
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, q := range []string{`GA > 1000`, `GA is undefined`, `GA isnt undefined`, `GB > 100 && ClusterId < 2000`} {
+		want[q] = 0
+		qq, err := vm.Parse(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range c.Query(qq) {
+			want[q]++
+		}
+	}
+	// Enable the accelerator and re-ask. The answers must not move.
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	for q, exp := range want {
+		qq, err := vm.Parse(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := 0
+		for range c.Query(qq) {
+			got++
+		}
+		if got != exp {
+			t.Errorf("%q: %d rows with the accelerator, %d without", q, got, exp)
+		}
+	}
+}
