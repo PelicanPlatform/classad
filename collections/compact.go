@@ -373,6 +373,13 @@ type movedRec struct {
 // query). Versions superseded at or below the retain floor -- and checkpoint markers
 // that old -- are dropped. With time travel off the retain floor is the current commit
 // sequence, so no version is retained and this behaves exactly as before.
+// compactPhase2Hook runs once per shard between capturing the sources and reading them, so a test can assert
+// they are PINNED at the moment it matters. Nil in production.
+//
+// It exists because the obvious test -- that no pin is held after Compact returns -- passes whether or not
+// the pin was ever taken, so it guards a leak and says nothing about the bug this fixes.
+var compactPhase2Hook func(sources []*segment)
+
 func (c *Collection) compactShard(sh *shard, target Codec) {
 	// Phase 1 (lock): choose the working-set sources (segments with a current record),
 	// capture the retain floor, and seal the active segment so concurrent writes land
@@ -391,13 +398,29 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 		sources = append(sources, seg)
 		sourceSet[seg] = struct{}{}
+		seg.pin() // documented as "called under the shard read lock"; this is the write lock, which is stronger
 	}
 	sh.act = nil
 	sh.mu.Unlock()
+	// PINNED for the rest of the function. Phase 2 reads these segments' bytes off the shard lock, and
+	// compaction itself retires them at the end, so without a pin a concurrent reap -- or its own -- can
+	// munmap a mapping this function is still reading. retire defers the reap while a pin is held, and
+	// unpin is what performs it, so releasing here is also what makes the retirement take effect.
+	//
+	// This was a live SIGSEGV: zstd faulting at an mmap address 0x27e bytes INSIDE a source slice whose
+	// bounds were perfectly valid, from decodeSrc below. The pin work that fixed three other readers did not
+	// reach this one, because the comment beneath said the reads were already safe -- and the bytes ARE
+	// immutable, which is true and beside the point. Immutability is about content; a munmap is about
+	// lifetime.
+	defer unpinAll(sources)
 
+	if compactPhase2Hook != nil {
+		compactPhase2Hook(sources)
+	}
 	// Phase 2 (lock-free): copy into private destination segments -- current versions to
-	// the live stream, retained superseded versions to the history stream. Reads of
-	// source records are safe: bytes are immutable and the superseded flag is atomic.
+	// the live stream, retained superseded versions to the history stream. Reads of source records are safe
+	// because the sources are PINNED above: their bytes are immutable, their superseded flag is atomic, and
+	// the pin is what keeps the mapping alive to be read at all.
 	var dstSegs, histSegs []*segment
 	var cur, hcur *segment
 	newDst := func(streamSegs *[]*segment, minSize int, codec Codec) *segment {
