@@ -29,11 +29,40 @@ func ConflictChecks() int64 { return conflictCheckCount.Load() }
 // Put/Delete/Update on the Collection remain the unconditional (last-write-wins)
 // API; Txn is the opt-in OCC path.
 
+// corruptChainLinks counts bucket-chain links that named a segment the shard does not have. Always zero on a
+// healthy store; see findVisible for why a nonzero value is a lifetime bug and not a data bug.
+var corruptChainLinks atomic.Int64
+
+// CorruptChainLinks reports how many times a bucket-chain walk found a link naming a segment that does not
+// exist, across every collection in this process.
+//
+// It is exported so an operator can see it without a debugger. Nonzero means some reader walked a segment
+// whose mapping it did not hold alive, and the walk read whatever replaced it; the records themselves are
+// not corrupt on disk.
+func CorruptChainLinks() int64 { return corruptChainLinks.Load() }
+
 // findVisible returns the record for key that was live at snapshot s0 (seq <= s0 <
 // supersededBySeq), walking the bucket chain. Caller holds at least the read lock.
 func (sh *shard) findVisible(head loc, key []byte, s0 uint64) (loc, bool) {
 	for l := head; l.valid(); {
-		seg := sh.segs[l.seg]
+		// BOUNDS-CHECKED because a chain link can be garbage rather than merely stale, and the difference
+		// matters: this crashed production with
+		//
+		//	panic: runtime error: index out of range [1765] with length 2
+		//
+		// A shard never held 1766 segments, so that loc was not a once-valid index into a slice that shrank --
+		// it was decoded by recNext out of bytes that are no longer a record header. A mapping whose address
+		// space was reused parses as whatever now lives there.
+		//
+		// Treating it as end-of-chain rather than panicking is deliberately NOT presented as a fix. The caller
+		// falls through to the sealed index, so a lookup degrades to "not found here" instead of taking the
+		// daemon down, and corruptChainLinks counts it so the anomaly is visible rather than silent. A count
+		// that climbs says a reader is walking a segment whose lifetime it does not hold -- getAt takes the
+		// shard read lock but no PIN, which is the next thing to look at if this fires.
+		seg := sh.segAt(l.seg)
+		if seg == nil {
+			return noLoc, false
+		}
 		if bytes.Equal(recKey(seg.data, l.off), key) &&
 			recSeq(seg.data, l.off) <= s0 && recSuperseded(seg.data, l.off) > s0 {
 			return l, true
@@ -85,7 +114,10 @@ func (sh *shard) conflictSince(h uint64, key []byte, s0 uint64) bool {
 		return true
 	}
 	for l := sh.dirGet(h); l.valid(); {
-		seg := sh.segs[l.seg]
+		seg := sh.segAt(l.seg) // same guard as findVisible: this walk follows the same links
+		if seg == nil {
+			break
+		}
 		if bytes.Equal(recKey(seg.data, l.off), key) && !check(seg, l.off) {
 			return true
 		}

@@ -220,7 +220,11 @@ func (sh *shard) appendFloor() uint64 {
 // out-of-range index. Caller holds at least the read lock.
 func (sh *shard) segAt(id uint32) *segment {
 	if int(id) >= len(sh.segs) {
+		corruptChainLinks.Add(1)
 		return nil
+	}
+	if sh.segs[id] == nil {
+		corruptChainLinks.Add(1)
 	}
 	return sh.segs[id]
 }
