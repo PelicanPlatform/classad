@@ -63,9 +63,22 @@ jobs:
   # ClassAd store + query engine, the persistent/archive variants, and their tests.
   # The root module's `go test ./...` does not descend into a nested module, so it
   # gets its own job (and a newer toolchain than the root matrix).
+  #
+  # The suite is SHARDED by test name across parallel jobs. Every test here is `package
+  # collections`, so there is one test binary and `go test -p` (which parallelizes across
+  # packages) has nothing to work with; the tests do use t.Parallel(), so the suite is
+  # core-bound -- ~7min on a 12-core box, ~20min on a 4-vCPU runner, two minutes under the
+  # 25m timeout. It went red on one merge commit and green on the next with the same code.
+  # Four shards give it the cores one runner does not have, with no test skipped and the
+  # race detector still on everywhere. See collections/shard-test.sh.
   collections:
-    name: Collections module
+    name: Collections shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
+    strategy:
+      # Every shard reports: one shard failing must not hide a second failure elsewhere.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
 
     steps:
     - name: Check out code
@@ -98,12 +111,34 @@ jobs:
         go build ./...
         go vet ./...
 
-    # Tests parallelize via t.Parallel(), so the suite scales across the runner's
-    # cores; the race detector's ~5-10x memory is bounded because the few heaviest
-    # tests are sized to a few thousand ads. ~7min on a 12-core box.
+    # Tests parallelize via t.Parallel(), so each shard also scales across its own runner's
+    # cores; the race detector's ~5-10x memory is bounded because the few heaviest tests are
+    # sized to a few thousand ads. The script prints its shard sizes and refuses to run a
+    # partition that would drop or duplicate a test.
     - name: Test (race detector)
       working-directory: collections
-      run: go test -race -count=1 -timeout 25m ./...
+      env:
+        SHARD: ${{ matrix.shard }}
+        SHARDS: 4
+      run: ./shard-test.sh
+
+  # A single check that stays green/red for the whole sharded suite, so a required status
+  # check (and anyone reading the PR) has one "Collections module" result to look at rather
+  # than four. Without it, adding or removing a shard silently changes which checks exist.
+  collections-result:
+    name: Collections module
+    needs: collections
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check shard results
+      env:
+        RESULT: ${{ needs.collections.result }}
+      run: |
+        echo "shards: $RESULT"
+        # 'success' only when every matrix job succeeded; skipped/cancelled count as failure
+        # here, because a suite that did not run is not a suite that passed.
+        [ "$RESULT" = "success" ] || exit 1
 
   lint:
     name: Lint

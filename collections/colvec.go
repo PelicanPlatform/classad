@@ -65,6 +65,10 @@ const (
 
 var lastVecSplit atomic.Pointer[vecSplit]
 
+// lastGroupSplit is lastVecSplit for the GROUPED scan. Separate so a grouped query does not overwrite
+// the accounting a count test is about to read, and so a grouped test can assert its own tiers.
+var lastGroupSplit atomic.Pointer[vecSplit]
+
 // blockVecSource feeds one columnar block's columns to the vector executor.
 type blockVecSource struct {
 	c   *Collection

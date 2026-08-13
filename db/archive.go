@@ -260,6 +260,14 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, nil
 		}
 	}
+	// A COUNT(*) GROUPED BY one numeric schema column: a histogram of that column, computed in the
+	// same columnar pass the ungrouped count above makes. aggregateFromIndex answers a grouped
+	// count only from the CATEGORICAL index, so a group column that is a hot numeric (`GROUP BY
+	// NumJobStarts`) reached neither it nor the ungrouped fast path and fell to a full row scan --
+	// the same predicate costing ~200x its ungrouped count, constrained or not.
+	if rows, ok := t.groupedFromColumns(constraint, groupCols, aggs); ok {
+		return rows, nil
+	}
 	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
 	// per-segment columnar blocks instead of decoding every record. Declines (and falls through
 	// to the scan) unless the archive carries an accelerator and the aggregate is in scope.
@@ -627,6 +635,36 @@ func (t *ArchiveTable) OpStats() OpStats { return OpStats{OpStats: t.a.OpStats()
 // ok=false so the caller scans. See collections.Archive.CountConstraint.
 func (t *ArchiveTable) CountConstraint(constraint string) (int, bool) {
 	return t.a.CountConstraint(constraint)
+}
+
+// GroupCountConstraint answers a per-value COUNT(*) of groupAttr over the rows matching constraint
+// via the columnar accelerator, or reports ok=false so the caller scans. AggregateCols uses it for
+// the single-numeric-column GROUP BY shape; it is exported so a caller (and a test) can tell which
+// tier answered. See collections.Archive.GroupCountConstraint.
+func (t *ArchiveTable) GroupCountConstraint(constraint, groupAttr string) ([]collections.GroupCount, bool) {
+	return t.a.GroupCountConstraint(constraint, groupAttr)
+}
+
+// GroupCountAll is GroupCountConstraint over every row: the whole column's histogram. AggregateCols
+// uses it for a grouped COUNT(*) whose constraint is match-all, which the predicate analysis behind
+// GroupCountConstraint cannot serve because there is no predicate to analyze. See
+// collections.Archive.GroupCountAll.
+func (t *ArchiveTable) GroupCountAll(groupAttr string) ([]collections.GroupCount, bool) {
+	return t.a.GroupCountAll(groupAttr)
+}
+
+// GroupStatsConstraint answers a per-group record count plus the aggregate inputs for each aggAttr over
+// the rows matching constraint, via the columnar accelerator, or reports ok=false so the caller scans.
+// AggregateCols uses it for the single-numeric-column GROUP BY shape; it is exported so a caller (and a
+// test) can tell which tier answered. See collections.Archive.GroupStatsConstraint.
+func (t *ArchiveTable) GroupStatsConstraint(constraint, groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsConstraint(constraint, groupAttr, aggAttrs)
+}
+
+// GroupStatsAll is GroupStatsConstraint over every row, for a constraint this layer has established is
+// match-all (the predicate analysis behind GroupStatsConstraint has no predicate to work with there).
+func (t *ArchiveTable) GroupStatsAll(groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsAll(groupAttr, aggAttrs)
 }
 
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).

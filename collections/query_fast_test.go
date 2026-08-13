@@ -5,6 +5,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
@@ -33,13 +34,32 @@ func refMatches(c *Collection, q *vm.Query) []string {
 
 func assertSameMatches(t *testing.T, c *Collection, exprs []string) {
 	t.Helper()
+	// The reference decodes every ad and renders each match. Doing that per expression means N full
+	// decodes and N renders of the same collection, and on the real corpus (8000 ads, 6 expressions,
+	// most of them matching nearly everything) that made this the slowest test in the module by 2.5x --
+	// 188s under -race, 10% of the suite. Decoding and rendering ONCE and re-filtering per expression
+	// asserts exactly the same thing: same ads, same texts, same sort, same comparison.
+	type refAd struct {
+		ad   *classad.ClassAd
+		text string
+	}
+	var all []refAd
+	for ad := range c.Scan() {
+		all = append(all, refAd{ad, ad.String()})
+	}
 	for _, e := range exprs {
 		q, err := vm.Parse(e)
 		if err != nil {
 			t.Fatalf("parse %q: %v", e, err)
 		}
 		fast := fastMatches(c, q)
-		ref := refMatches(c, q)
+		var ref []string
+		for _, a := range all {
+			if q.Matches(a.ad) {
+				ref = append(ref, a.text)
+			}
+		}
+		sort.Strings(ref)
 		if len(fast) != len(ref) {
 			t.Errorf("query %q: fast matched %d, reference %d", e, len(fast), len(ref))
 			continue
