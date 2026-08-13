@@ -21,7 +21,20 @@ type decoder struct {
 	pos     int
 	resolve func(uint32) (string, bool) // id -> name (unused in inline mode)
 	inline  bool                        // attribute keys are inline names
-	open    Sealer                      // decrypts nEncrypted nodes; nil => they are errors
+	open    Sealer                      // decrypts nEncrypted nodes; nil => see redactSealed
+	// redactSealed decides what happens to a sealed value this decoder cannot open (no key, or
+	// Open fails): substitute `undefined` (true) or fail the whole ad (false, the default).
+	//
+	// Failing the ad is right for a WRITE path -- compaction and dict retraining decode an ad and
+	// re-encode it, so silently substituting undefined there would DESTROY the secret. It is wrong
+	// for a read path serving a client that is not entitled to the value: the ad is perfectly
+	// readable, one attribute of it is not, and an unreadable attribute is indistinguishable from
+	// an absent one.
+	//
+	// undefined rather than error, deliberately. `ClaimId =!= undefined` against an ERROR value
+	// evaluates TRUE and so reports the secret's EXISTENCE; against undefined it is FALSE, which is
+	// what an absent attribute yields.
+	redactSealed bool
 	// oldStrings renders string literals for old-ClassAd text rather than mirroring
 	// ast.Expr.String(). Set by the AppendNodeText*Old renderers; see AppendNodeTextOld.
 	oldStrings bool
@@ -59,15 +72,36 @@ func DecodeResolve(b []byte, resolve func(uint32) (string, bool)) (*ast.ClassAd,
 	return DecodeResolveEnc(b, resolve, nil)
 }
 
+// ErrSealed reports that an attribute is sealed and this decoder has no key for it. It wraps into the
+// error DecodeResolveEnc returns, so a caller distinguishes "not entitled to this value" from "this ad is
+// corrupt" with errors.Is -- the two used to be the same ErrMalformed.
+var ErrSealed = errors.New("attribute is sealed and no decryption key is available")
+
+// DecodeResolveEncRedact is DecodeResolveEnc that SUBSTITUTES undefined for any attribute it cannot
+// open, instead of failing the ad. For a read path serving a client not entitled to a value: the ad is
+// readable, one attribute of it is not, and undefined is what an absent attribute yields.
+//
+// It must never be used where the decoded ad is re-encoded (compaction, dict retraining): substituting
+// undefined there would write the substitution back and destroy the secret.
+func DecodeResolveEncRedact(b []byte, resolve func(uint32) (string, bool), open Sealer) (*ast.ClassAd, error) {
+	return decodeResolveEnc(b, resolve, open, true)
+}
+
 // DecodeResolveEnc is DecodeResolve for an interned ad that may contain nEncrypted attributes:
 // open supplies the segment's key so sealed values decrypt to their real (interned) nodes,
 // which then resolve their ids via resolve. A nil open leaves encrypted attributes opaque and
 // decode errors on them -- so pass the sealer only on the daemon read path that holds the key.
 func DecodeResolveEnc(b []byte, resolve func(uint32) (string, bool), open Sealer) (*ast.ClassAd, error) {
+	return decodeResolveEnc(b, resolve, open, false)
+}
+
+// decodeResolveEnc is the shared body: redactSealed picks what happens to an attribute this decoder
+// cannot open (see decoder.redactSealed).
+func decodeResolveEnc(b []byte, resolve func(uint32) (string, bool), open Sealer, redactSealed bool) (*ast.ClassAd, error) {
 	if resolve == nil {
 		return nil, fmt.Errorf("%w: interned ad requires a resolver", ErrMalformed)
 	}
-	d := &decoder{b: b, resolve: resolve, open: open}
+	d := &decoder{b: b, resolve: resolve, open: open, redactSealed: redactSealed}
 	flags, err := d.headerFlags()
 	if err != nil {
 		return nil, err
@@ -414,15 +448,22 @@ func (d *decoder) node(depth int) (ast.Expr, error) {
 			return nil, err
 		}
 		if d.open == nil {
-			return nil, fmt.Errorf("%w: encrypted attribute without a decryption key", ErrMalformed)
+			if d.redactSealed {
+				return &ast.UndefinedLiteral{}, nil
+			}
+			return nil, fmt.Errorf("%w: %w", ErrMalformed, ErrSealed)
 		}
 		pt, err := d.open.Open(nonce, ct)
 		if err != nil {
-			return nil, fmt.Errorf("%w: decrypting attribute: %v", ErrMalformed, err)
+			if d.redactSealed {
+				return &ast.UndefinedLiteral{}, nil
+			}
+			return nil, fmt.Errorf("%w: decrypting attribute: %w", ErrMalformed, err)
 		}
 		// Decode the recovered node with a sub-decoder in the same mode (and with the
 		// same key, so nested encryption also opens).
-		sub := &decoder{b: pt, inline: d.inline, resolve: d.resolve, open: d.open}
+		sub := &decoder{b: pt, inline: d.inline, resolve: d.resolve, open: d.open,
+			redactSealed: d.redactSealed}
 		return sub.node(depth + 1)
 	default:
 		return nil, fmt.Errorf("%w: unknown node tag 0x%02x", ErrMalformed, tag)
