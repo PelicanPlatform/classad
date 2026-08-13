@@ -74,7 +74,7 @@ func (c *Collection) mergeSegments(sh *shard, run []*segment) bool {
 		moved += int64(s.used)
 	}
 	mergedBytes.Add(moved)
-	return c.commitSegmentRewrite(sh, run, merged)
+	return c.commitSegmentRewrite(sh, run, merged, nil)
 }
 
 // commitSegmentRewrite makes a rewritten segment durable and swaps it in for its sources.
@@ -91,7 +91,12 @@ func (c *Collection) mergeSegments(sh *shard, run []*segment) bool {
 //
 // Reports whether the swap happened; on any failure the sources stay in place, since every caller
 // is maintenance rather than a correctness dependency.
-func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segment) bool {
+// reconcile, when non-nil, runs under the shard lock immediately before the swap is published, with
+// the sources still in place. It exists for a rewrite whose sources can change AFTER the build read
+// them: a sealed segment in a MUTABLE table can still be superseded in place, and the output was
+// built off-lock, so a delete that landed mid-build would otherwise be dropped and the record would
+// come back to life. Nil for a rewrite whose sources are immutable.
+func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segment, reconcile func()) bool {
 	abort := func() bool {
 		out.retire()
 		out.reapAndHook()
@@ -124,6 +129,9 @@ func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segme
 	if int(srcs[0].id) >= len(sh.segs) || sh.segs[srcs[0].id] != srcs[0] {
 		sh.mu.Unlock() // slot moved under us; leave the marker for recovery to finish
 		return false
+	}
+	if reconcile != nil {
+		reconcile()
 	}
 	out.id = srcs[0].id
 	sh.segs[srcs[0].id] = out

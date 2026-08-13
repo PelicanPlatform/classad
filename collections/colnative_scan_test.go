@@ -208,7 +208,6 @@ func TestColumnarizedShardServesIndexedQueries(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	c.colNativeEnabled = true
 	for i := range 3000 {
 		ad, err := classad.Parse(fmt.Sprintf(
 			`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep" ]`,
@@ -221,7 +220,10 @@ func TestColumnarizedShardServesIndexedQueries(t *testing.T) {
 		}
 	}
 	c.RetrainDict(0)
-	if !c.BuildAndEnableSchemaScan(4096, 8) {
+	// deriveSchema + installSchemaScan rather than BuildAndEnableSchemaScan: the latter is a full
+	// schema-review pass, which columnarizes, so it would leave nothing to compare against.
+	sch, hot, ok := c.deriveSchema(4096, 8)
+	if !ok || !c.installSchemaScan(sch, hot) {
 		t.Skip("schema scan did not enable")
 	}
 	exprs := []string{
@@ -329,7 +331,6 @@ func TestColumnarizedShardServesTimeTravel(t *testing.T) {
 		t.Skipf("time travel unavailable: %v", err)
 	}
 	defer c.Close()
-	c.colNativeEnabled = true
 	put := func(i int, owner string, status int) {
 		ad, err := classad.Parse(fmt.Sprintf(
 			`[ ClusterId=%d; ProcId=%d; Owner="%s"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep" ]`,
@@ -345,7 +346,10 @@ func TestColumnarizedShardServesTimeTravel(t *testing.T) {
 		put(i, fmt.Sprintf("user%d", i%7), i%6)
 	}
 	c.RetrainDict(0)
-	if !c.BuildAndEnableSchemaScan(4096, 8) {
+	// deriveSchema + installSchemaScan rather than BuildAndEnableSchemaScan: the latter is a full
+	// schema-review pass, which columnarizes, so it would leave nothing to compare against.
+	sch, hot, ok := c.deriveSchema(4096, 8)
+	if !ok || !c.installSchemaScan(sch, hot) {
 		t.Skip("schema scan did not enable")
 	}
 	time.Sleep(5 * time.Millisecond)
@@ -382,4 +386,236 @@ func TestColumnarizedShardServesTimeTravel(t *testing.T) {
 		t.Errorf("AS OF: %d rows after columnarizing, want %d", after, before)
 	}
 	t.Logf("point-in-time reads agree across the transform (%d historical rows)", before)
+}
+
+// TestSchemaReviewColumnarizesByDefault goes through the production entry point: a routine schema
+// review both publishes the schema and moves each sealed segment's schema'd attributes into the
+// segment, with no option set.
+func TestSchemaReviewColumnarizesByDefault(t *testing.T) {
+	dir := t.TempDir()
+	c, _, _ := columnarFixtureIn(t, dir, 3000)
+	defer c.Close()
+	before := readAll(t, c, "true")
+
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	got := 0
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			got++
+		}
+	}
+	if got == 0 {
+		t.Fatal("a schema review left every segment whole-record; the default is not on")
+	}
+	after := readAll(t, c, "true")
+	if len(after) != len(before) {
+		t.Fatalf("%d rows after the schema review, want %d", len(after), len(before))
+	}
+	// And the sidecar is not asked for a second copy of what the segments now hold.
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			if blob := c.colBlobForSeg(seg); blob != nil {
+				t.Errorf("segment %d: sidecar would still store %d columnar bytes", seg.id, len(blob))
+			}
+		}
+	}
+	segs, saved := ColumnarizedSegments()
+	t.Logf("schema review columnarized %d segments by default (%d total, %d bytes saved)", got, segs, saved)
+}
+
+// TestColumnarSegmentBudgetDisables checks the off switch, which matters because it is the only way
+// back to the whole-record shape for a caller who does not want the rewrite.
+func TestColumnarSegmentBudgetDisables(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1,
+		ColumnarSegmentBudget: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for i := range 3000 {
+		ad, err := classad.Parse(fmt.Sprintf(
+			`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d ]`,
+			i, i%10, i%7, i%6, (i%16)*1024))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RetrainDict(0)
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			t.Fatalf("segment %d was columnarized despite ColumnarSegmentBudget < 0", seg.id)
+		}
+	}
+	if n := c.ColumnarizeSealed(); n != 0 {
+		t.Errorf("ColumnarizeSealed rewrote %d segments while disabled", n)
+	}
+	// And the old shape still works: a sidecar block was built instead.
+	blocks := 0
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg.colblk.Load() != nil {
+			blocks++
+		}
+	}
+	if blocks == 0 {
+		t.Error("disabling the rewrite also lost the sidecar columnar accelerator")
+	}
+	t.Logf("rewrite disabled; %d sidecar blocks built instead", blocks)
+}
+
+// TestColumnarSegmentBudgetBounds checks that one pass rewrites at most the budget, so enabling this
+// over a large existing archive converges over several maintenance intervals instead of stalling on
+// a single pass that rewrites the whole history.
+func TestColumnarSegmentBudgetBounds(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1,
+		ColumnarSegmentBudget: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for i := range 4000 {
+		ad, err := classad.Parse(fmt.Sprintf(
+			`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d ]`,
+			i, i%10, i%7, i%6, (i%16)*1024))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RetrainDict(0)
+	sch, hot, ok := c.deriveSchema(4096, 8)
+	if !ok || !c.installSchemaScan(sch, hot) {
+		t.Skip("schema scan did not enable")
+	}
+	sealed := 0
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg != c.shards[0].act && seg.used > 0 {
+			sealed++
+		}
+	}
+	if sealed <= 2 {
+		t.Skip("not enough sealed segments to exercise a budget")
+	}
+	first := c.ColumnarizeSealed()
+	if first > 2 {
+		t.Errorf("first pass rewrote %d segments, budget was 2", first)
+	}
+	// Successive passes pick up where the last stopped, and stop once there is nothing left.
+	total := first
+	for range 20 {
+		n := c.ColumnarizeSealed()
+		if n == 0 {
+			break
+		}
+		if n > 2 {
+			t.Errorf("a pass rewrote %d segments, budget was 2", n)
+		}
+		total += n
+	}
+	if total < sealed {
+		t.Errorf("converged at %d of %d sealed segments", total, sealed)
+	}
+	t.Logf("%d sealed segments converged in passes of at most 2", total)
+}
+
+// TestColumnarizeKeepsMidBuildDeletes covers the one race the rewrite genuinely has, and the reason
+// it is safe on a MUTABLE table at all.
+//
+// A sealed segment stops taking appends, but in a mutable table its records can still be superseded
+// in place -- and the rewrite reads the source OFF the shard lock. A delete that lands between the
+// read and the swap is recorded on the source and absent from the output, so publishing without
+// reconciling would bring the deleted record back to life. Interning refuses mutable tables for
+// exactly this reason; this one reconciles instead, so the reconcile has to be tested.
+//
+// colCommitStallHook makes the window deterministic: the delete happens after the build and before
+// the commit, which is precisely where a real one would have to land to be lost.
+func TestColumnarizeKeepsMidBuildDeletes(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const n = 3000
+	for i := range n {
+		ad, err := classad.Parse(fmt.Sprintf(
+			`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d ]`,
+			i, i%10, i%7, i%6, (i%16)*1024))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RetrainDict(0)
+	sch, hot, ok := c.deriveSchema(4096, 8)
+	if !ok || !c.installSchemaScan(sch, hot) {
+		t.Skip("schema scan did not enable")
+	}
+
+	// Delete one record per segment rewrite, from the sealed range, inside the commit window.
+	deleted := map[string]bool{}
+	next := 0
+	colCommitStallHook = func() {
+		for next < n {
+			k := fmt.Sprintf("%d.0", next)
+			next++
+			if _, ok := c.Get([]byte(k)); !ok {
+				continue
+			}
+			if !c.Delete([]byte(k)) {
+				continue
+			}
+			deleted[k] = true
+			return
+		}
+	}
+	defer func() { colCommitStallHook = nil }()
+
+	if got := c.ColumnarizeSealed(); got == 0 {
+		t.Skip("no sealed segment was columnarized")
+	}
+	colCommitStallHook = nil
+	if len(deleted) == 0 {
+		t.Skip("no delete landed in the commit window")
+	}
+
+	// Every record deleted in the window must still be gone -- through Get and through the scan,
+	// since they resolve visibility by different routes.
+	for k := range deleted {
+		if _, ok := c.Get([]byte(k)); ok {
+			t.Errorf("Get(%s): a record deleted mid-rewrite came back", k)
+		}
+	}
+	live := map[string]bool{}
+	q, err := vm.Parse("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for ad := range c.Query(q) {
+		if v, ok := ad.EvaluateAttrInt("ClusterId"); ok {
+			live[fmt.Sprintf("%d.0", v)] = true
+		}
+	}
+	for k := range deleted {
+		if live[k] {
+			t.Errorf("scan: a record deleted mid-rewrite came back (%s)", k)
+		}
+	}
+	if want := n - len(deleted); len(live) != want {
+		t.Errorf("scan sees %d records, want %d", len(live), want)
+	}
+	t.Logf("%d deletes landed in the commit window and all stayed dead", len(deleted))
 }

@@ -22,8 +22,14 @@ var colSegmentBuilds atomic.Int64
 // sum of the preceding blocks' record counts. Every block in a segment is built under the same
 // schema and hot set, so those are read from the first block.
 type colSegment struct {
-	blocks []*columnarBlock
-	offs   []uint32
+	// schemaOnly means this payload carries ONLY the attributes its schema covers, because the
+	// records were rewritten to drop them (columnar-native, see colnative.go). Everything else
+	// lives in the records, so the blocks' COLD TAIL is no longer the whole remainder of an ad:
+	// an attribute missing from it is missing from the BLOCK, not from the record. Derived from
+	// the segment at publish rather than stored, so the on-disk format is unchanged.
+	schemaOnly bool
+	blocks     []*columnarBlock
+	offs       []uint32
 	// groups are the group schemas' selections, one colGroupBlock per group per base block. Empty
 	// when the collection carries no group schemas.
 	groups []*colGroup
@@ -177,21 +183,41 @@ func (c *Collection) schemaFieldName(id uint32) (string, bool) {
 // with no state/block a query takes the normal row path, so a collection that never calls this
 // is unaffected. Reads immutable sealed bytes only.
 func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
+	if !c.installSchemaScan(s, hot) {
+		return
+	}
+	c.coverSealedSegments(s, hot)
+}
+
+// installSchemaScan publishes the schema state without covering any segment, so a caller can
+// columnarize first and let coverSealedSegments skip whatever no longer needs a sidecar block.
+// Reports false if the collection cannot take a columnar accelerator at all.
+func (c *Collection) installSchemaScan(s *adSchema, hot []int) bool {
 	if c.sealer != nil {
 		// A columnar block stores attribute values in the clear; over an encryption-at-rest
 		// collection it would materialize sealed values as plaintext on disk. The two are
 		// mutually exclusive -- an encrypted collection always takes the row path.
-		return
+		return false
 	}
 	st := c.schemaScan.Load()
 	if st == nil || st.schema != s {
 		bc, err := newBlockCache(256 << 20) // ~256 MiB of decompressed blocks
 		if err != nil {
-			return
+			return false
 		}
 		st = &schemaScanState{schema: s, hot: hot, cache: bc, groups: c.groupSchemasFor(s)}
 		c.schemaScan.Store(st)
 	}
+	return true
+}
+
+// coverSealedSegments builds a sidecar columnar block for each sealed segment that has none.
+//
+// A columnarized segment already publishes its own block from inside the segment, so pinSealed's
+// filter skips it and colBlobForSeg would decline anyway -- which is why columnarizing runs BEFORE
+// this rather than after. Covering first would build, compress and write a sidecar block only for
+// the rewrite to make it redundant.
+func (c *Collection) coverSealedSegments(s *adSchema, hot []int) {
 	for _, sh := range c.shards {
 		// PINNED: transcoding reads the segment's bytes off the shard lock, and a concurrent
 		// Compact/merge/rotation would otherwise munmap them mid-read. The pin defers the reap.
@@ -442,15 +468,31 @@ func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 	// silently demoting them to the brute-scan fallback. Re-schema-ing (with a full block
 	// rebuild) is a separate, heavier operation, not part of a routine maintenance refresh.
 	if st := c.schemaScan.Load(); st != nil {
-		c.EnableSchemaScan(st.schema, st.hot)
+		c.schemaScanPass(st.schema, st.hot)
 		return true
 	}
 	s, hot, ok := c.deriveSchema(sampleMax, hotTopN)
 	if !ok {
 		return false
 	}
-	c.EnableSchemaScan(s, hot)
+	c.schemaScanPass(s, hot)
 	return true
+}
+
+// schemaScanPass is what a routine schema review does: publish the schema, move each sealed
+// segment's schema'd attributes INTO the segment (columnar-native, bounded by
+// ColumnarSegmentBudget), then build sidecar blocks for whatever the rewrite did not take.
+//
+// The order is the point. Columnarizing makes a sidecar block redundant, so covering first
+// would compress and write one only to strand it; and columnarizing needs the schema, so it
+// cannot go before the state is published. A collection with the rewrite disabled sees exactly
+// the old behaviour, because the middle step returns 0 and covering does all the work.
+func (c *Collection) schemaScanPass(s *adSchema, hot []int) {
+	if !c.installSchemaScan(s, hot) {
+		return
+	}
+	c.ColumnarizeSealed()
+	c.coverSealedSegments(s, hot)
 }
 
 // deriveSchema samples the collection and derives a schema plus its hot numeric tier, without

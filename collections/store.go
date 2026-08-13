@@ -109,6 +109,22 @@ type Options struct {
 	// default still commits no storage on the strength of one sample -- nothing is built until a
 	// group's members have kept recurring across GroupStabilityRuns maintenance passes.
 	GroupSchemaCount int
+	// ColumnarSegmentBudget is how many sealed segments one maintenance pass may rewrite into
+	// COLUMNAR-NATIVE form -- each attribute the schema carries stored once, in the segment's own
+	// columnar payload, and removed from the records (see colnative.go). 0 uses
+	// defaultColumnarBudget; a NEGATIVE value disables the rewrite and keeps every segment
+	// whole-record with a columnar copy beside it in the sidecar.
+	//
+	// On by default because the duplication is pure cost: without it every value the schema
+	// carries is stored twice, row-form in the arena and again in the sidecar block. Measured on
+	// 1500 real OSPool machine ads, moving them removed 43% of the table (4104 -> 2327 bytes per
+	// record), and the sidecar megabyte it reclaimed was entirely the duplicate copy.
+	//
+	// Budgeted rather than unbounded because turning it on over an existing archive rewrites every
+	// sealed segment once, and at history scale doing that in a single pass is hours of I/O and a
+	// flushed page cache -- the same failure a retrain caused when it resealed a whole archive.
+	// Each segment is rewritten at most once, so a bounded budget still converges.
+	ColumnarSegmentBudget int
 	// GroupStabilityRuns is how many consecutive derivations a group's members must have
 	// co-occurred in before its blocks are built. 0 uses the default; 1 disables the gate.
 	GroupStabilityRuns int
@@ -307,11 +323,8 @@ type Collection struct {
 	groupSchemaCount int            // Options.GroupSchemaCount
 	groupStability   int            // Options.GroupStabilityRuns
 	groupJac         float64        // Options.GroupMergeJaccard
-	// colNativeEnabled opts a collection into columnarizing sealed segments. Unexported and set
-	// only by tests: the read paths that would see half an ad have not been migrated yet, so
-	// there is deliberately no way for a caller to turn this on.
-	colNativeEnabled bool
-	groupMaxPart     float64 // Options.GroupMaxPartialFrac
+	colBudget        int            // Options.ColumnarSegmentBudget
+	groupMaxPart     float64        // Options.GroupMaxPartialFrac
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
 	// (0/1 ⇒ serial). qsem is a collection-wide token pool bounding total scan
@@ -540,6 +553,7 @@ func New(opts Options) *Collection {
 		groupSchemaCount: opts.GroupSchemaCount,
 		groupStability:   opts.GroupStabilityRuns,
 		groupJac:         opts.GroupMergeJaccard,
+		colBudget:        opts.ColumnarSegmentBudget,
 		groupMaxPart:     opts.GroupMaxPartialFrac,
 	}
 	c.codec.Store(&codecHolder{codec})

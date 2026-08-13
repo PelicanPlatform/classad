@@ -87,6 +87,9 @@ func publishColNative(c *Collection, seg *segment) {
 			cs := unmarshalColSegment(blob, c.regionCodec(), func(name string) uint32 {
 				return c.intern.Intern(name)
 			})
+			if cs != nil {
+				cs.schemaOnly = true
+			}
 			if cs == nil {
 				colNativeCRCFailures.Add(1)
 				seg.colDamaged.Store(true)

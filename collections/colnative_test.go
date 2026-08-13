@@ -46,7 +46,6 @@ func columnarFixtureIn(t *testing.T, dir string, n int) (*Collection, *adSchema,
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.colNativeEnabled = true // tests only; see columnarizeSegment
 	for i := range n {
 		// A mix of shapes: schema'd numerics and strings, an attribute only some ads carry (so
 		// the schema escapes it), and one that no schema will cover.
@@ -71,14 +70,19 @@ func columnarFixtureIn(t *testing.T, dir string, n int) (*Collection, *adSchema,
 			t.Fatal(err)
 		}
 	}
-	if !c.BuildAndEnableSchemaScan(4096, 8) {
+	// Derive and PUBLISH the schema without running a full schema-review pass, because that pass
+	// now columnarizes: a fixture that used it would hand every test a table already in the
+	// target shape, with nothing left to compare against. Tests that want the production entry
+	// point call BuildAndEnableSchemaScan themselves -- see
+	// TestSchemaReviewColumnarizesByDefault.
+	s, hot, ok := c.deriveSchema(4096, 8)
+	if !ok {
+		t.Skip("no schema could be derived")
+	}
+	if !c.installSchemaScan(s, hot) {
 		t.Skip("schema scan did not enable")
 	}
-	st := c.schemaScan.Load()
-	if st == nil {
-		t.Fatal("no schema")
-	}
-	return c, st.schema, st.hot
+	return c, s, hot
 }
 
 // TestColumnarizeRoundTrip is the contract this whole format rests on: after a segment's schema'd
@@ -129,7 +133,7 @@ func TestColumnarizeRoundTrip(t *testing.T) {
 	}
 
 	sh.mu.Lock()
-	dst := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
 	sh.mu.Unlock()
 	if dst == nil {
 		t.Fatal("columnarizeSegment returned nil")
@@ -189,7 +193,7 @@ func TestColumnarizeRemovesTheRowCopy(t *testing.T) {
 			break
 		}
 	}
-	dst := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
 	sh.mu.Unlock()
 	if src == nil || dst == nil {
 		t.Skip("nothing to columnarize")
@@ -291,7 +295,7 @@ func TestColumnarizeShrinksTheSegment(t *testing.T) {
 	if src != nil {
 		beforeUsed = src.used
 	}
-	dst := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
 	sh.mu.Unlock()
 	if src == nil || dst == nil {
 		t.Skip("nothing to columnarize")
@@ -328,7 +332,7 @@ func TestColumnarPayloadCorruptionFailsLoudly(t *testing.T) {
 			break
 		}
 	}
-	dst := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
 	sh.mu.Unlock()
 	if src == nil || dst == nil {
 		t.Skip("nothing to columnarize")
@@ -409,7 +413,7 @@ func TestColumnarizedSegmentPublishesItsOwnBlock(t *testing.T) {
 			break
 		}
 	}
-	dst := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
 	sh.mu.Unlock()
 	if src == nil || dst == nil {
 		t.Skip("nothing to columnarize")
