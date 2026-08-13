@@ -83,7 +83,18 @@ func DecodeNodeInlineEnc(node []byte, open Sealer) (ast.Expr, error) {
 // A nil open leaves encrypted attributes opaque and DecodeInline errors on them --
 // use DecodeInlineEnc only on the DAEMON read path that holds the key.
 func DecodeInlineEnc(b []byte, open Sealer) (*ast.ClassAd, error) {
-	d := &decoder{b: b, open: open}
+	return decodeInlineEnc(b, open, false)
+}
+
+// DecodeInlineRedact is DecodeInlineEnc with no key that substitutes undefined for a sealed attribute
+// instead of failing the ad -- the inline-names counterpart of DecodeResolveEncRedact, for a reader that
+// is not entitled to sealed values.
+func DecodeInlineRedact(b []byte) (*ast.ClassAd, error) {
+	return decodeInlineEnc(b, nil, true)
+}
+
+func decodeInlineEnc(b []byte, open Sealer, redactSealed bool) (*ast.ClassAd, error) {
+	d := &decoder{b: b, open: open, redactSealed: redactSealed}
 	flags, err := d.headerFlags()
 	if err != nil {
 		return nil, err

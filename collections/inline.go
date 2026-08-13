@@ -103,6 +103,20 @@ func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([
 // an encryption-at-rest collection carries SEALED value nodes, so the resolver paths pass the
 // collection's sealer to open them (nil for a plaintext collection -- opens nothing).
 
+// decodeWireDictAs is decodeWireDict for a read that may not be entitled to sealed values: with
+// redact=true it decodes with NO key, so a sealed attribute becomes undefined instead of being opened.
+// See QueryRedacted for why an unentitled read must not be able to obtain the value at all.
+func (c *Collection) decodeWireDictAs(dict *segDictHandle, w []byte, redact bool) (*ast.ClassAd, error) {
+	if !redact {
+		return c.decodeWireDict(dict, w)
+	}
+	if dict != nil {
+		return wire.DecodeResolveEncRedact(w, dict.resolve, nil)
+	}
+	// Inline (persistent) wire: same policy, no intern table.
+	return wire.DecodeInlineRedact(w)
+}
+
 func (c *Collection) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error) {
 	if dict != nil {
 		// c.sealer is nil for a plaintext collection (opens nothing) and set for an
@@ -143,6 +157,23 @@ func (c *Collection) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr,
 
 // decodeAdDict is decodeAd (decompress + decode to a ClassAd) that resolves an interned
 // segment's ids via its dict. dict==nil => the existing decodeAd path (inline/global).
+// decodeAdDictAs is decodeAdDict for a read that may not be entitled to sealed values; see
+// decodeWireDictAs.
+func (c *Collection) decodeAdDictAs(dict *segDictHandle, stored []byte, codec Codec, redact bool) (*classad.ClassAd, error) {
+	if !redact {
+		return c.decodeAdDict(dict, stored, codec)
+	}
+	dec, err := codec.Decompress(nil, stored)
+	if err != nil {
+		return nil, err
+	}
+	a, err := c.decodeWireDictAs(dict, dec, true)
+	if err != nil {
+		return nil, err
+	}
+	return classad.FromAST(a), nil
+}
+
 func (c *Collection) decodeAdDict(dict *segDictHandle, stored []byte, codec Codec) (*classad.ClassAd, error) {
 	if dict == nil {
 		return c.decodeAd(stored, codec)

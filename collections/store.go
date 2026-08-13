@@ -800,13 +800,23 @@ func (c *Collection) Delete(key []byte) bool {
 
 // Get returns the current ad for key, decoded, or (nil, false).
 func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
+	return c.getAs(key, false)
+}
+
+// GetRedacted is Get for a reader NOT entitled to sealed values: the decode holds no key, so a sealed
+// attribute comes back undefined rather than opened. See QueryRedacted.
+func (c *Collection) GetRedacted(key []byte) (*classad.ClassAd, bool) {
+	return c.getAs(key, true)
+}
+
+func (c *Collection) getAs(key []byte, redact bool) (*classad.ClassAd, bool) {
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
 	stored, codec, dict, ok := sh.get(c, h, key)
 	if !ok {
 		return nil, false
 	}
-	ad, err := c.decodeAdDict(dict, stored, codec)
+	ad, err := c.decodeAdDictAs(dict, stored, codec, redact)
 	if err != nil {
 		return nil, false
 	}
@@ -816,7 +826,7 @@ func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
 			if pad, pcodec, pdict, ok := sh.get(c, ph, pk); ok {
-				if parent, err := c.decodeAdDict(pdict, pad, pcodec); err == nil {
+				if parent, err := c.decodeAdDictAs(pdict, pad, pcodec, redact); err == nil {
 					c.mergeParent(ad, parent)
 				}
 			}
@@ -891,7 +901,7 @@ func (c *Collection) Scan() iter.Seq[*classad.ClassAd] {
 		if c.parentKeyFor != nil {
 			qp := queryPlan{ws: &wireScope{ctx: c}} // q nil ⇒ no filter, just chain + hide structural
 			for _, sh := range c.shards {
-				if !c.scanShardChained(sh, qp, yield) {
+				if !c.scanShardChained(sh, qp, yield, false) {
 					return
 				}
 			}
@@ -942,6 +952,21 @@ type queryPlan struct {
 // reads, transitively) when an attribute is a non-literal expression; or full
 // decode for queries that read attributes by a runtime-computed name (eval()).
 func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
+	return c.queryAs(q, false)
+}
+
+// QueryRedacted is Query for a reader NOT entitled to sealed values: the decode holds no key, so a sealed
+// attribute comes back undefined rather than opened (see wire.DecodeResolveEncRedact).
+//
+// This is the full-decode counterpart of QueryRawRedacted. Query decodes with the collection's key and
+// leaves it to the SERIALIZER to drop private attributes -- so the secret was decrypted in this process
+// for every unentitled read and then filtered on the way out. A caller that is not entitled to a value
+// should not be able to obtain it, rather than obtain it and be trusted to drop it.
+func (c *Collection) QueryRedacted(q *vm.Query) iter.Seq[*classad.ClassAd] {
+	return c.queryAs(q, true)
+}
+
+func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
 		plan := q.ReadPlan()
 		ws := &wireScope{ctx: c}
@@ -961,7 +986,7 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 		// (they don't yet understand chaining); correctness first.
 		if c.parentKeyFor != nil {
 			for _, sh := range c.shards {
-				if !c.scanShardChained(sh, qp, yield) {
+				if !c.scanShardChained(sh, qp, yield, redact) {
 					return
 				}
 			}
@@ -978,7 +1003,7 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 				c.demand.record(g.Probes)
 			}
 			if groups, prunable := c.planIndexGroups(plan); prunable && !overSelectivityGate(c, groups) {
-				emit := c.yieldAd(yield)
+				emit := c.yieldAdAs(yield, redact)
 				for _, sh := range c.shards {
 					if !c.scanShardIndexedGroups(sh, groups, qp, emit) {
 						return
@@ -998,10 +1023,10 @@ func (c *Collection) Query(q *vm.Query) iter.Seq[*classad.ClassAd] {
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.
 		if c.queryPar > 1 && len(usable) == 0 && !c.reverseScan {
-			c.runParallelQuery(q, yield)
+			c.runParallelQuery(q, yield, redact)
 			return
 		}
-		emit := c.yieldAd(yield)
+		emit := c.yieldAdAs(yield, redact)
 		for _, sh := range c.shards {
 			var cont bool
 			if len(usable) > 0 {
@@ -1175,7 +1200,7 @@ func (c *Collection) mergeParent(child, parent *classad.ClassAd) {
 // too. Structural (parent-only) ads are hidden from the output. The whole family
 // is co-located in this shard, so both passes read one consistent snapshot with
 // no cross-shard fetch.
-func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*classad.ClassAd) bool) bool {
+func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*classad.ClassAd) bool, redact bool) bool {
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 
@@ -1225,13 +1250,13 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 		if qp.q != nil && !matchWire(w, qp) {
 			return true
 		}
-		a, err := c.decodeWireDict(dict, w)
+		a, err := c.decodeWireDictAs(dict, w, redact)
 		if err != nil {
 			return true
 		}
 		child := classad.FromAST(a)
 		if parentW != nil {
-			if pa, err := c.decodeWireDict(parentDict, parentW); err == nil {
+			if pa, err := c.decodeWireDictAs(parentDict, parentW, redact); err == nil {
 				c.mergeParent(child, classad.FromAST(pa))
 			}
 		}
@@ -1256,8 +1281,13 @@ type parentWire struct {
 // yieldAd is the emit callback for the classic Query/Scan path: decode w to a
 // *classad.ClassAd (skipping malformed records) and yield it.
 func (c *Collection) yieldAd(yield func(*classad.ClassAd) bool) scanEmit {
+	return c.yieldAdAs(yield, false)
+}
+
+// yieldAdAs is yieldAd for a read that may not be entitled to sealed values (see QueryRedacted).
+func (c *Collection) yieldAdAs(yield func(*classad.ClassAd) bool, redact bool) scanEmit {
 	return func(w []byte, dict *segDictHandle) bool {
-		a, err := c.decodeWireDict(dict, w)
+		a, err := c.decodeWireDictAs(dict, w, redact)
 		if err != nil {
 			return true // skip malformed record, keep scanning
 		}

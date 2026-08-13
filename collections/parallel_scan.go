@@ -124,7 +124,10 @@ func (c *Collection) makeWorkerPlan(q *vm.Query) queryPlan {
 // scan is large enough and the collection-wide worker budget has capacity; otherwise
 // it runs serially over the same snapshotted tasks. It yields each matching ad and
 // returns when the consumer stops or the scan completes.
-func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) bool) {
+// runParallelQuery fans a full scan across workers. redact is the read's entitlement to sealed values,
+// threaded because this path decodes ads ITSELF rather than through the caller's emit -- which is exactly
+// how a redacted Query kept returning opened secrets while every emit-based path was fixed.
+func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) bool, redact bool) {
 	tasks, totalBytes, release := c.gatherTasks()
 	defer release()
 
@@ -140,7 +143,7 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 		for i := 0; i < W; i++ {
 			<-c.qsem // release the lone token; not enough to parallelize
 		}
-		c.scanTasksSerial(tasks, c.makeWorkerPlan(q), yield)
+		c.scanTasksSerial(tasks, c.makeWorkerPlan(q), yield, redact)
 		return
 	}
 	defer func() {
@@ -188,7 +191,7 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 					if !matchWire(w, qp) {
 						return true
 					}
-					a, err := c.decodeWireDict(dict, w)
+					a, err := c.decodeWireDictAs(dict, w, redact)
 					if err != nil {
 						return true
 					}
@@ -219,7 +222,9 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 
 // scanTasksSerial runs the query over the gathered tasks on the calling goroutine --
 // the fallback when a scan is too small to parallelize or the worker budget is busy.
-func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(*classad.ClassAd) bool) {
+// scanTasksSerial is runParallelQuery's fallback when it cannot get enough workers; redact carries the
+// same entitlement (see runParallelQuery).
+func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(*classad.ClassAd) bool, redact bool) {
 	var dbuf []byte
 	for _, t := range tasks {
 		stop := false
@@ -237,7 +242,7 @@ func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(
 			if !matchWire(w, qp) {
 				return true
 			}
-			a, err := c.decodeWireDict(dict, w)
+			a, err := c.decodeWireDictAs(dict, w, redact)
 			if err != nil {
 				return true
 			}
