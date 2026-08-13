@@ -125,6 +125,15 @@ func (h *segDictHandle) resolve(id uint32) (string, bool) {
 	return (*names)[id], true
 }
 
+// ensureNames builds the id->name cache if it is not built yet, so every later resolve reads Go-heap
+// strings instead of the segment arena. A reader that will use this handle after releasing the lock that
+// keeps the segment mapped must call this first -- see shard.getAt.
+func (h *segDictHandle) ensureNames() {
+	if h.names.Load() == nil {
+		h.buildNameCache()
+	}
+}
+
 func (h *segDictHandle) buildNameCache() *[]string {
 	n := int(segDictCount(h.data, h.base))
 	s := make([]string, n)

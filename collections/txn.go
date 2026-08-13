@@ -83,11 +83,31 @@ func (sh *shard) getAt(h uint64, key []byte, s0 uint64) ([]byte, Codec, *segDict
 			return nil, nil, nil, false
 		}
 	}
-	seg := sh.segs[l.seg]
+	seg := sh.segAt(l.seg)
+	if seg == nil {
+		return nil, nil, nil, false
+	}
 	ad := recAd(seg.data, l.off)
 	out := make([]byte, len(ad))
 	copy(out, ad)
-	return out, seg.codec, seg.dict.Load(), true
+	// The record bytes are COPIED above and seg.codec's dictionary is Go-heap (TrainDict /
+	// os.ReadFile), so neither outlives this lock. The dict HANDLE does not have that property: it
+	// holds `data: seg.data`, the segment arena, which for a persistent segment is an mmap that
+	// compaction unmaps -- and it unmaps AFTER dropping the shard write lock, while this reader holds
+	// no pin. So the caller decoding with the handle after this function returns could resolve
+	// attribute names out of unmapped memory: a SIGSEGV, or garbage that parses, which is what the two
+	// production crashes looked like.
+	//
+	// Rather than hand the caller a pin to release, make the handle stop depending on the mapping:
+	// building the id->name cache copies every name to the Go heap, and resolve -- the only thing a
+	// decode calls -- reads only that cache once it exists. Built here, while the read lock still
+	// guarantees the segment is alive. It costs one atomic load per Get after the first touch of a
+	// segment, and it is exactly the cache the decode path would have built anyway.
+	dict := seg.dict.Load()
+	if dict != nil {
+		dict.ensureNames()
+	}
+	return out, seg.codec, dict, true
 }
 
 // conflictSince reports whether key was modified after snapshot s0 -- the write-
