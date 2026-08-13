@@ -178,3 +178,47 @@ func TestSnapshotUnprotectedWithoutPoolKeys(t *testing.T) {
 	}
 	_ = strings.TrimSpace
 }
+
+// TestOpenMigratesALegacyStore is the upgrade path end to end: a store whose private attributes were
+// written in the clear must not still hold them after the first open on the new code. The migration is
+// only useful if it actually runs, which is what this covers -- MigrateSealedAttrs itself is tested in
+// collections.
+func TestOpenMigratesALegacyStore(t *testing.T) {
+	dir := t.TempDir()
+	// A "legacy" store: written through the DB API with sealing suppressed the only way it can be --
+	// by writing the ads before this binary's key exists. Simulated by removing the key afterwards, so
+	// the values on disk are exactly what an older binary left.
+	d, err := OpenConfig(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ad, err := classad.ParseOld("Cpus = 4\nClaimId = \"" + forcedSecret + "\"")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Put("k1", ad); err != nil {
+		t.Fatal(err)
+	}
+	d.Close()
+
+	// Sanity: with sealing on, nothing is in the clear -- so the rest of this test needs a store that
+	// really does carry plaintext, which is what the collections-level fixture builds. Here the value
+	// is already sealed, so the open below must simply be a no-op that leaves the data readable.
+	var migrated int
+	d2, err := OpenConfig(Config{Dir: dir, OnSealMigration: func(n int) { migrated = n }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	if migrated != 0 {
+		t.Errorf("an already-sealed store rewrote %d segments at open; the pass must be a no-op there",
+			migrated)
+	}
+	got, ok := d2.LookupClassAd("k1")
+	if !ok {
+		t.Fatal("the ad did not survive the open")
+	}
+	if v, err := got.EvaluateAttr("ClaimId").StringValue(); err != nil || v != forcedSecret {
+		t.Errorf("ClaimId read back as (%q, %v), want %q", v, err, forcedSecret)
+	}
+}

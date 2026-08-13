@@ -101,6 +101,16 @@ type Config struct {
 	GroupMergeJaccard   float64
 	GroupMaxPartialFrac float64
 
+	// SealMigrationWorkers bounds the concurrent segment rewrites when an existing store is migrated
+	// to sealed private attributes at open (see collections.MigrateSealedAttrs). 0 takes a default
+	// derived from GOMAXPROCS.
+	SealMigrationWorkers int
+
+	// OnSealMigration, if set, is called with the number of segments rewritten when the open migrated a
+	// store to sealed private attributes. It exists so a daemon can log a one-off startup cost rather
+	// than leaving an operator to wonder why the first open after an upgrade took longer.
+	OnSealMigration func(segments int)
+
 	// SegmentSize overrides the arena segment size in bytes (see collections.Options).
 	// 0 uses the default (8 MiB). A smaller value seals segments sooner -- useful for
 	// tests and for tuning the sealed-segment accelerators (columnar scan, sealed indexes).
@@ -165,6 +175,16 @@ func OpenConfig(cfg Config) (*DB, error) {
 	// Reapply any index/hot-set configuration persisted by a previous run's
 	// runtime changes (AddIndex/AddHotAttrs/...), so they survive a restart.
 	db.loadIndexConfig()
+	// A store written before private attributes were sealed still holds them in the clear, and nothing
+	// would ever report it: sealing applies at encode time, so it protects new writes and leaves the
+	// existing ones exactly as they were. Rewrite them now.
+	//
+	// It runs at open rather than in the background because a half-protected store is not a state to
+	// serve reads from for an unbounded time. On a store that needs nothing it is one scan of the sealed
+	// segments, and after the first clean pass a marker skips even that (see MigrateSealedAttrs).
+	if n := db.c.MigrateSealedAttrs(cfg.SealMigrationWorkers); n > 0 && cfg.OnSealMigration != nil {
+		cfg.OnSealMigration(n)
+	}
 	return db, nil
 }
 
