@@ -379,3 +379,37 @@ func TestGroupGateMatchesByOverlap(t *testing.T) {
 		t.Error("an empty history must not reject; that is the gate being disabled")
 	}
 }
+
+// TestGroupSchemaDefaults pins the defaults and the disable path. Zero means "caller did not say",
+// which for these is the configuration worth having, so OFF has to be spelled negative.
+func TestGroupSchemaDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		count       int
+		jac         float64
+		wantCount   int
+		wantJaccard float64
+	}{
+		{"unset takes the defaults", 0, 0, defaultGroupSchemas, defaultGroupJaccard},
+		{"explicit values honoured", 6, 0.95, 6, 0.95},
+		{"negative disables groups", -1, 0, 0, defaultGroupJaccard},
+		{"negative keeps exact grouping", 0, -1, defaultGroupSchemas, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(Options{Shards: 1, GroupSchemaCount: tc.count, GroupMergeJaccard: tc.jac})
+			defer c.Close()
+			if got := c.groupSchemaCountOrDefault(); got != tc.wantCount {
+				t.Errorf("group count = %d, want %d", got, tc.wantCount)
+			}
+			if got := c.groupJaccard(); got != tc.wantJaccard {
+				t.Errorf("jaccard = %v, want %v", got, tc.wantJaccard)
+			}
+		})
+	}
+	if defaultGroupSchemas != 4 {
+		t.Errorf("defaultGroupSchemas = %d, want 4", defaultGroupSchemas)
+	}
+	if defaultGroupJaccard != 0.99 {
+		t.Errorf("defaultGroupJaccard = %v, want 0.99", defaultGroupJaccard)
+	}
+}

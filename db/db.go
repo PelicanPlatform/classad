@@ -88,13 +88,14 @@ type Config struct {
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
 
-	// GroupSchemaCount enables SECONDARY columnar schemas: sets of attributes the base schema
-	// does not carry which are present or absent together, stored columnar for the ads that hold
-	// them without costing a slot in the ads that do not. 0 (the default) builds none.
+	// GroupSchemaCount is how many SECONDARY columnar schemas to derive: sets of attributes the
+	// base schema does not carry which are present or absent together, stored columnar for the
+	// ads that hold them without costing a slot in the ads that do not. 0 takes the default (4);
+	// a NEGATIVE value builds none.
 	//
 	// A group's blocks are built only once its members have kept showing up together across
-	// GroupStabilityRuns maintenance passes, so enabling this does nothing immediately -- see
-	// collections.Options.
+	// GroupStabilityRuns maintenance passes, so a freshly opened table builds none for a while --
+	// SchemaScanInfo.GroupSchemas reports how many actually exist. See collections.Options.
 	GroupSchemaCount    int
 	GroupStabilityRuns  int
 	GroupMergeJaccard   float64

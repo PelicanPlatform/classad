@@ -83,3 +83,41 @@ func TestGroupSchemaConfigIsReachable(t *testing.T) {
 		}
 	})
 }
+
+// TestGroupSchemasOnByDefault: a caller that says nothing about groups gets them. Zero means "did
+// not say", and for this option the configuration worth having is on -- so a table opened with a
+// bare Config builds group schemas once the recurrence gate is satisfied.
+//
+// The gate is waived here only to avoid running several maintenance passes in a unit test; what is
+// being checked is that GroupSchemaCount need not be set at all.
+func TestGroupSchemasOnByDefault(t *testing.T) {
+	db, err := OpenConfig(Config{Dir: t.TempDir(), GroupStabilityRuns: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := range 800 {
+		text := fmt.Sprintf(`[ ClusterId=%d; Owner="u%d" ]`, i, i%5)
+		if i%4 == 0 {
+			text = fmt.Sprintf(`[ ClusterId=%d; Owner="u%d"; GA=%d; GB=%d; GC=%d ]`, i, i%5, i, i*2, i*3)
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Put(fmt.Sprintf("%d.0", i), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !db.EnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	info := db.SchemaScanInfo()
+	if info.GroupSchemas == 0 {
+		t.Error("a bare Config built no group schemas; the default is meant to be on")
+	}
+	if info.GroupSchemaFields == 0 {
+		t.Error("group schemas built but carrying no fields")
+	}
+	t.Logf("default config built %d group schema(s), %d fields", info.GroupSchemas, info.GroupSchemaFields)
+}

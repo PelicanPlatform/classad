@@ -53,10 +53,11 @@ type ArchiveConfig struct {
 	// for deliberately and a bad thing to get by leaving a field unset, which is why it is
 	// not what zero means.
 	IndexBackfillBytes int64
-	// GroupSchemaCount enables secondary columnar schemas for attributes the base schema does not
-	// carry (see db.Config). 0 builds none. An archive's maintenance cadence is long, so the
-	// stability gate's several derivations span days rather than minutes -- which is the intended
-	// shape for a table whose structure changes on that scale.
+	// GroupSchemaCount is how many secondary columnar schemas to derive for attributes the base
+	// schema does not carry (see db.Config). 0 takes the default; a NEGATIVE value builds none.
+	// An archive's maintenance cadence is long, so the stability gate's several derivations span
+	// days rather than minutes -- the intended shape for a table whose structure changes on that
+	// scale, and the reason an archive builds none for its first few days.
 	GroupSchemaCount    int
 	GroupStabilityRuns  int
 	GroupMergeJaccard   float64

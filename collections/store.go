@@ -100,19 +100,22 @@ type Options struct {
 	MatchClosureRoots []string
 	// GroupSchemaCount is how many SECONDARY columnar schemas to derive and build alongside the
 	// base one, for attributes the base schema does not carry which are present or absent
-	// together. 0 (the default) builds none.
+	// together. 0 uses defaultGroupSchemas; a NEGATIVE value builds none.
 	//
-	// Off by default on purpose: a group costs a schema pointer and a block per base block, and
-	// whether a group's members keep co-occurring is a property of the table's data that
-	// `.schema groups` is there to establish first.
+	// On by default because the base schema's coverage is otherwise hostage to the mix of ads in
+	// the table: measured on a production AP, a history table's base schema covers 90.3% of
+	// attribute occurrences until jobs removed before ever running are mixed in, at which point
+	// it falls to 51.3%, while base plus four groups holds 87-94% across the range. Enabling by
+	// default still commits no storage on the strength of one sample -- nothing is built until a
+	// group's members have kept recurring across GroupStabilityRuns maintenance passes.
 	GroupSchemaCount int
 	// GroupStabilityRuns is how many consecutive derivations a group's members must have
 	// co-occurred in before its blocks are built. 0 uses the default; 1 disables the gate.
 	GroupStabilityRuns int
 	// GroupMergeJaccard widens a group by absorbing attributes whose presence pattern is at least
-	// this similar; 0 (the default) keeps exact co-occurrence only. GroupMaxPartialFrac bounds the
-	// fraction of ads that may then hold only PART of a group and take the slow path for it; 0
-	// uses defaultGroupMaxPartial.
+	// this similar. 0 uses defaultGroupJaccard; a NEGATIVE value keeps exact co-occurrence only.
+	// GroupMaxPartialFrac bounds the fraction of ads that may then hold only PART of a group and
+	// take the slow path for it; 0 uses defaultGroupMaxPartial.
 	//
 	// Measured against a later snapshot of the same table, widening still recovered more than
 	// exact grouping (25.14% of attribute occurrences against 23.53%), because a partial ad reads
