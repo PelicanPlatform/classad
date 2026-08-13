@@ -391,6 +391,23 @@ type cand struct {
 //
 // Greedy from the highest-ranked candidate down, so a widened group grows around the pattern that
 // already recovers the most, and each absorbed pattern leaves the pool.
+//
+// MEASURED AND NOT RECOMMENDED. Widening looks good in-sample and does not survive contact with
+// later data. Deriving on one production snapshot and scoring against another taken hours later:
+//
+//	exact          every group   partial 0.000% -> 0.000%
+//	jaccard >= 0.99  worst group  partial 0.075% -> 45.792%
+//
+// One widened group's members stopped co-occurring almost entirely, so nearly half its ads take the
+// slow path for its attributes -- and the in-sample partial ceiling gave no warning, because a
+// merge is fitted to the sample that suggested it. Worse, widened member sets are sample-dependent
+// by construction: across three snapshots, 3 of 4 EXACT groups reproduced their member set exactly
+// while 0 of 4 widened ones did.
+//
+// That last fact is also the protection. The stability gate builds blocks only for a member set
+// seen in several consecutive derivations, so widened groups never qualify and nothing is built
+// from them. GroupMergeJaccard therefore defaults to 0, and turning it on is expected to yield
+// nothing rather than to yield the in-sample gain.
 func mergeNearPatterns(cands []cand, nSamples int, minJaccard, maxPartial float64) []cand {
 	used := make([]bool, len(cands))
 	out := make([]cand, 0, len(cands))

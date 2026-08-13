@@ -113,6 +113,11 @@ type Options struct {
 	// this similar; 0 (the default) keeps exact co-occurrence only. GroupMaxPartialFrac bounds the
 	// fraction of ads that may then hold only PART of a group and take the slow path for it; 0
 	// uses defaultGroupMaxPartial.
+	//
+	// Measured against a later snapshot of the same table, widening did not hold: a group whose
+	// in-sample partial rate was 0.075% read 45.8% on the holdout, and no widened member set
+	// reproduced across snapshots. See mergeNearPatterns. Left configurable because the machinery
+	// and the measurement are worth keeping, not because turning it on is advisable.
 	GroupMergeJaccard   float64
 	GroupMaxPartialFrac float64
 	// DemandHalfLife is how quickly recorded query demand fades, so index decisions
