@@ -564,7 +564,12 @@ func (db *DB) SetEncryptedAttrs(attrs []string) error {
 // EncryptedAttrNames returns the explicit encrypted-attribute set (not the always-on
 // private attributes). EncryptionEnabled reports whether encryption at rest is active.
 func (db *DB) EncryptedAttrNames() []string { return db.c.EncryptedAttrNames() }
-func (db *DB) EncryptionEnabled() bool      { return db.c.EncryptionEnabled() }
+
+// EncryptionEnabled reports ENCRYPTION AT REST: the master key is wrapped under pool keys, so the data
+// is protected from someone holding the disk. It is not "are values sealed" -- private attributes are
+// always sealed, and without pool keys the master sits beside the data in the clear, which protects
+// nothing and is reported here as false.
+func (db *DB) EncryptionEnabled() bool { return db.enc.protected() }
 
 // Compact reclaims dead space in shards whose dead-byte ratio warrants it,
 // returning the number of shards compacted.

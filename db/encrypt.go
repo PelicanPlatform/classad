@@ -1,16 +1,22 @@
 package db
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/PelicanPlatform/classad/collections/crypt"
 )
 
-// Encryption-at-rest master-key lifecycle. A persistent DB roots its encryption in a
-// random master key that is never stored in the clear: it is wrapped once per available
+// Master-key lifecycle. Every database has a master key, because sealing private attributes is not
+// optional -- a ClaimId must not sit on disk in the clear whatever the deployment configured.
+//
+// POOL KEYS decide whether that master is PROTECTED. With them the master is wrapped once per available
 // pool key (a KEK) into masterkeys.json, so any one pool key opens the DB and a rotated-in
 // key can be added without re-encrypting. On open we recover the master and derive the
 // DB data key (the DataInfo subkey -- distinct from the master, which only wraps keys);
@@ -33,7 +39,20 @@ type dbCrypto struct {
 	backupKey []byte
 	rows      []crypt.MasterKeyRow
 	poolKeys  []KEK // retained so Restore can open a snapshot's embedded master envelope
+	// atRest reports whether the master is PROTECTED -- wrapped under pool keys. Without them the
+	// database still seals private attributes (that is not optional), but its master sits beside the
+	// data in the clear, so nothing here may claim encryption at rest.
+	//
+	// Every "is this encrypted" decision has to pick one of these two meanings deliberately. Sealing is
+	// now always on, so a check that means "values are sealed" is a constant; a check that means
+	// "protected from someone holding the disk" is this field.
+	atRest bool
 }
+
+// protected reports whether the master is wrapped under pool keys. Snapshot protection follows THIS,
+// not the presence of a data key: a snapshot sealed under a key whose envelope no pool key can open
+// would be unrestorable, and an unprotected database has nothing to gain by pretending otherwise.
+func (e *dbCrypto) protected() bool { return e != nil && e.atRest }
 
 func (e *dbCrypto) data() []byte {
 	if e == nil {
@@ -49,14 +68,30 @@ func (e *dbCrypto) data() []byte {
 // For an in-memory store it mints an ephemeral master (encryption works but is not
 // persisted). It errors if a persisted master exists but no available pool key can open
 // it -- refusing to silently run unencrypted or lose access to sealed data.
+// resolveCrypto always produces a data key, because sealing private attributes is not optional: a
+// ClaimId must never sit on disk in the clear, whatever the deployment configured.
+//
+// Pool keys decide only whether the MASTER is protected. With them, it is wrapped under each key
+// (masterkeys.json) as before. Without them it is stored beside the data in the clear -- which is not
+// encryption at rest, is not claimed to be, and is reported as false by DB.EncryptionEnabled.
 func resolveCrypto(dir string, poolKeys []KEK) (*dbCrypto, error) {
 	if len(poolKeys) == 0 {
-		return nil, nil // encryption disabled
+		master, err := loadOrMintUnprotectedMaster(dir)
+		if err != nil {
+			return nil, err
+		}
+		return newDBCrypto(master, nil, nil, false)
 	}
 	master, rows, err := loadOrMintMaster(dir, poolKeys)
 	if err != nil {
 		return nil, err
 	}
+	return newDBCrypto(master, rows, poolKeys, true)
+}
+
+// newDBCrypto derives the data and backup subkeys from a master. atRest records whether that master is
+// protected (see dbCrypto.atRest).
+func newDBCrypto(master []byte, rows []crypt.MasterKeyRow, poolKeys []KEK, atRest bool) (*dbCrypto, error) {
 	dataKey, err := crypt.Subkey(master, crypt.DataInfo)
 	if err != nil {
 		return nil, err
@@ -65,7 +100,49 @@ func resolveCrypto(dir string, poolKeys []KEK) (*dbCrypto, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &dbCrypto{dataKey: dataKey, backupKey: backupKey, rows: rows, poolKeys: poolKeys}, nil
+	return &dbCrypto{dataKey: dataKey, backupKey: backupKey, rows: rows, poolKeys: poolKeys, atRest: atRest}, nil
+}
+
+// unprotectedMasterFile holds the master key IN THE CLEAR for a database with no pool keys. Named so
+// that finding it on disk tells the reader exactly what it is.
+const unprotectedMasterFile = "masterkey.unprotected"
+
+// loadOrMintUnprotectedMaster recovers, or on first use mints and persists, the master for a database
+// with no pool keys. An in-memory database keeps it in memory only.
+//
+// The file is 0600 and carries no wrapping: with no pool key there is nothing to wrap it with. It exists
+// so that sealed values survive a restart -- without it a reopen could not read its own data.
+func loadOrMintUnprotectedMaster(dir string) ([]byte, error) {
+	if dir == "" {
+		return crypt.NewMaster() // in-memory: nothing to persist, nothing to reload
+	}
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return nil, fmt.Errorf("db: creating database directory: %w", err)
+	}
+	path := filepath.Join(dir, unprotectedMasterFile)
+	switch b, err := os.ReadFile(path); {
+	case err == nil:
+		master, derr := base64.StdEncoding.DecodeString(strings.TrimSpace(string(b)))
+		if derr != nil || len(master) == 0 {
+			return nil, fmt.Errorf("db: %s is unreadable: %v", unprotectedMasterFile, derr)
+		}
+		return master, nil
+	case !errors.Is(err, fs.ErrNotExist):
+		return nil, fmt.Errorf("db: reading %s: %w", unprotectedMasterFile, err)
+	}
+	master, err := crypt.NewMaster()
+	if err != nil {
+		return nil, err
+	}
+	enc := base64.StdEncoding.EncodeToString(master)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(enc+"\n"), 0o600); err != nil {
+		return nil, fmt.Errorf("db: writing %s: %w", unprotectedMasterFile, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return nil, fmt.Errorf("db: installing %s: %w", unprotectedMasterFile, err)
+	}
+	return master, nil
 }
 
 // loadOrMintMaster recovers (or, on first use, mints and persists) the master key and

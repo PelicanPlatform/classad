@@ -66,9 +66,13 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 		return nil, err
 	}
 
+	// Snapshot protection follows POOL KEYS, not the presence of a data key. Every database now has a
+	// key (private attributes are always sealed), but without pool keys there is no envelope any key
+	// could open -- a snapshot sealed under one would be unrestorable. An unprotected database's
+	// snapshot is unprotected too, which is the same claim the database itself makes.
 	enc := db.enc
 	var flags byte
-	if enc != nil {
+	if enc.protected() {
 		flags |= snapFlagEncrypted
 	}
 	if err := bw.WriteByte(flags); err != nil {
@@ -76,7 +80,7 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 	}
 
 	var snapKey []byte
-	if enc != nil {
+	if enc.protected() {
 		// Embed the master envelope, then a fresh snapshot key wrapped by the backup key.
 		rowsJSON, err := json.Marshal(enc.rows)
 		if err != nil {
@@ -203,8 +207,8 @@ func (db *DB) RestoreWith(r io.Reader, keys SnapshotKeys) error { return db.rest
 // keys. It is DISTINCT from the live-data key (it cannot decrypt the running store) and
 // from the master. Returns nil when encryption is disabled.
 func (db *DB) BackupKey() []byte {
-	if db.enc == nil {
-		return nil
+	if !db.enc.protected() {
+		return nil // no pool keys: nothing here is protected, so there is no backup key to hand out
 	}
 	return append([]byte(nil), db.enc.backupKey...)
 }
@@ -311,7 +315,7 @@ func (db *DB) deriveSnapKey(keys SnapshotKeys, rowsJSON, nonce, wrapped []byte) 
 	if backupKey == nil {
 		// Open the embedded master envelope with the supplied pool keys, or the DB's own.
 		poolKeys := keys.PoolKeys
-		if poolKeys == nil && db.enc != nil {
+		if poolKeys == nil && db.enc.protected() {
 			poolKeys = db.enc.poolKeys
 		}
 		if poolKeys == nil {
