@@ -621,6 +621,28 @@ func (db *DB) Query(constraint string) (iter.Seq[*classad.ClassAd], error) {
 	return db.c.Query(q), nil
 }
 
+// QueryRedacted is Query for a caller NOT entitled to sealed values: the ads are decoded with no key, so
+// a sealed attribute arrives undefined rather than opened. See collections.Collection.QueryRedacted.
+//
+// Query decodes with the table's key and leaves it to the serializer to drop private attributes, which
+// means an unprivileged reader's secret is decrypted in this process and then filtered on the way out.
+func (db *DB) QueryRedacted(constraint string) (iter.Seq[*classad.ClassAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryRedacted(q), nil
+}
+
+// LookupClassAdRedacted is LookupClassAd for a caller not entitled to sealed values; see QueryRedacted.
+func (db *DB) LookupClassAdRedacted(key string) (*classad.ClassAd, bool) {
+	return db.c.GetRedacted([]byte(key))
+}
+
+// BeginRedacted is Begin for a caller not entitled to sealed values: reads through the transaction decode
+// with no key. Writes are unaffected. See collections.Collection.BeginRedacted.
+func (db *DB) BeginRedacted() *Txn { return &Txn{tx: db.c.BeginRedacted(), db: db} }
+
 // QueryAsOf runs a point-in-time ("AS OF") query: it returns the ads matching the
 // constraint as they were at time t. It errors on a malformed constraint, when time
 // travel is not enabled on this table, or when t is older than the retained window.
@@ -740,6 +762,11 @@ func (c *Constraint) Matches(ad *classad.ClassAd) bool { return c.q.Matches(ad) 
 // starts at the beginning. The snapshot is O(1) and stable under concurrent churn.
 func (db *DB) Ordered(index int, partition string, resume OrderCursor) iter.Seq[OrderedAd] {
 	return db.c.Ordered(index, classad.NewStringValue(partition), resume)
+}
+
+// OrderedRedacted is Ordered for a caller NOT entitled to sealed values; see QueryRedacted.
+func (db *DB) OrderedRedacted(index int, partition string, resume OrderCursor) iter.Seq[OrderedAd] {
+	return db.c.OrderedRedacted(index, classad.NewStringValue(partition), resume)
 }
 
 // ConflictError reports the keys whose writes lost an optimistic write-write race at

@@ -464,6 +464,19 @@ type OrderedAd struct {
 // argument is ignored (there is a single global run). resume's zero value starts at
 // the beginning.
 func (c *Collection) Ordered(index int, partition classad.Value, resume OrderCursor) iter.Seq[OrderedAd] {
+	return c.orderedAs(index, partition, resume, false)
+}
+
+// OrderedRedacted is Ordered for a caller NOT entitled to sealed values: each ad is materialized with no
+// key, so a sealed attribute arrives undefined. See Collection.QueryRedacted.
+//
+// This is served over the RPC to unprivileged sessions (dbrpc's ordered op), so it needs the entitlement
+// like any other client-facing read -- it is not only the negotiator's internal list.
+func (c *Collection) OrderedRedacted(index int, partition classad.Value, resume OrderCursor) iter.Seq[OrderedAd] {
+	return c.orderedAs(index, partition, resume, true)
+}
+
+func (c *Collection) orderedAs(index int, partition classad.Value, resume OrderCursor, redact bool) iter.Seq[OrderedAd] {
 	return func(yield func(OrderedAd) bool) {
 		if index < 0 || index >= len(c.ordered) {
 			return
@@ -475,7 +488,7 @@ func (c *Collection) Ordered(index int, partition classad.Value, resume OrderCur
 		}
 		snap := oi.snapshot()
 		oi.ascendPartition(snap, part, resume.entry, func(e orderEntry) bool {
-			ad, ok := c.Get([]byte(e.key))
+			ad, ok := c.getAs([]byte(e.key), redact)
 			if !ok {
 				return true // concurrently deleted since the snapshot: skip
 			}

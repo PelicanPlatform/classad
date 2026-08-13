@@ -113,8 +113,13 @@ func (c *Collection) decodeWireDictAs(dict *segDictHandle, w []byte, redact bool
 	if dict != nil {
 		return wire.DecodeResolveEncRedact(w, dict.resolve, nil)
 	}
-	// Inline (persistent) wire: same policy, no intern table.
-	return wire.DecodeInlineRedact(w)
+	// dict == nil means one of two encodings, and getting this wrong breaks every read rather than
+	// leaking: an INLINE (persistent) ad carries its own names, while an in-memory collection's ad is
+	// interned against the collection-wide table. Mirror decodeWire's split.
+	if c.inline {
+		return wire.DecodeInlineRedact(w)
+	}
+	return wire.DecodeResolveEncRedact(w, c.intern.Name, nil)
 }
 
 func (c *Collection) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error) {

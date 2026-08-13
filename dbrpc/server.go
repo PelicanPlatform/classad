@@ -506,10 +506,19 @@ func (sc *serverConn) streamWatch(reqID uint64, r *reader, wireForm bool) {
 	// and an append-only archive (history) table, so one watch op serves them all.
 	var seq iter.Seq[db.WatchEvent]
 	var err error
+	priv := sc.opts.IncludePrivate
 	if d, ok := sc.s.cat.Table(table); ok {
-		seq, err = d.Watch(ctx, cursor)
+		if priv {
+			seq, err = d.Watch(ctx, cursor)
+		} else {
+			seq, err = d.WatchRedacted(ctx, cursor)
+		}
 	} else if d, ok := sc.s.cat.ViewBacking(table); ok {
-		seq, err = d.Watch(ctx, cursor)
+		if priv {
+			seq, err = d.Watch(ctx, cursor)
+		} else {
+			seq, err = d.WatchRedacted(ctx, cursor)
+		}
 	} else if a, ok := sc.s.cat.ArchiveTable(table); ok {
 		seq, err = a.Watch(ctx, cursor)
 	} else {
@@ -611,7 +620,15 @@ func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, inclu
 	if !ok {
 		return
 	}
-	seq, err := d.Query(constraint)
+	// An unprivileged session reads with NO key, so a sealed attribute arrives undefined instead of
+	// being decrypted here and dropped by the serializer afterwards (see db.QueryRedacted).
+	var seq iter.Seq[*classad.ClassAd]
+	var err error
+	if includePrivate {
+		seq, err = d.Query(constraint)
+	} else {
+		seq, err = d.QueryRedacted(constraint)
+	}
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
@@ -745,7 +762,11 @@ func (s *Server) streamOrdered(ctx context.Context, reqID uint64, r *reader, inc
 	if !ok {
 		return
 	}
-	for oa := range d.Ordered(int(index), partition, db.OrderCursor{}) {
+	ordered := d.Ordered
+	if !includePrivate {
+		ordered = d.OrderedRedacted // read with no key rather than decrypt-then-filter
+	}
+	for oa := range ordered(int(index), partition, db.OrderCursor{}) {
 		b := putU64(respHead(reqID, stStream), oa.Signature)
 		b = putStr(b, adString(oa.Ad, includePrivate))
 		write(b)
@@ -767,7 +788,13 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			return respErr(reqID, "no such table: "+table)
 		}
 		id := s.nextID.Add(1)
-		st := &serverTxn{tx: d.Begin(), table: table, conn: sc}
+		// The transaction carries the session's entitlement, so every read through it -- opLookupAd,
+		// opTxnQuery -- reads with no key for an unprivileged session. Writes are unaffected.
+		begin := d.Begin
+		if !sc.opts.IncludePrivate {
+			begin = d.BeginRedacted
+		}
+		st := &serverTxn{tx: begin(), table: table, conn: sc}
 		st.lastTouch.Store(nowNano())
 		s.txns.Store(id, st)
 		sc.addTxn(id)
