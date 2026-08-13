@@ -77,7 +77,12 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 		_ = closer()
 		return false
 	}
-	if cs != nil {
+	if cs != nil && !seg.columnarized() {
+		// Never over a COLUMNARIZED segment's own block. Its payload lives in the segment and is
+		// where its schema'd attributes are STORED, so a sidecar section -- which by construction it
+		// should not have, since colBlobForSeg declines to write one -- must not be able to replace
+		// it with an older view of the same records. The guard states the invariant rather than
+		// leaving it to hold by a chain of reasoning about which sidecars can exist.
 		seg.colblk.Store(cs)
 	}
 	// Phase 2: a resident key Bloom over the segment's key-hashes, built from the key
@@ -250,7 +255,12 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 		seg.msidx.Store(mm)
 		seg.idx.Store(nil) // the heap copy stays dropped; msidx serves queries
 	}
-	if cs != nil {
+	if cs != nil && !seg.columnarized() {
+		// Never over a COLUMNARIZED segment's own block. Its payload lives in the segment and is
+		// where its schema'd attributes are STORED, so a sidecar section -- which by construction it
+		// should not have, since colBlobForSeg declines to write one -- must not be able to replace
+		// it with an older view of the same records. The guard states the invariant rather than
+		// leaving it to hold by a chain of reasoning about which sidecars can exist.
 		seg.colblk.Store(cs)
 	}
 	seg.swapSidecarHook(func() { _ = closer() }, true)
