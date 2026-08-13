@@ -451,11 +451,11 @@ func (sc *serverConn) dispatch(frame []byte) {
 	case opArchiveAggregateFiltered:
 		sc.streamArchiveAggregateFiltered(reqID, body)
 	case opQueryKeys:
-		sc.s.streamQueryKeys(sc.ctx, reqID, body, sc.write)
+		sc.s.streamQueryKeys(sc.ctx, reqID, body, priv, sc.write)
 	case opTxnQuery:
 		sc.s.streamTxnQuery(sc.ctx, reqID, body, priv, sc.write)
 	case opTxnQueryKeys:
-		sc.s.streamTxnQueryKeys(sc.ctx, reqID, body, sc.write)
+		sc.s.streamTxnQueryKeys(sc.ctx, reqID, body, priv, sc.write)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
@@ -560,11 +560,15 @@ type viewSealer interface {
 // caller can address matched rows for UPDATE/DELETE by their real db key regardless of any
 // self-reported key attribute. Read-only; no private-attribute exposure (keys are returned, not ad
 // bodies). The constraint is still evaluated server-side, so it may reference any attribute.
-func (s *Server) streamQueryKeys(ctx context.Context, reqID uint64, r *reader, write func([]byte)) {
+func (s *Server) streamQueryKeys(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	table := r.str()
 	constraint := r.str()
 	if r.err != nil {
 		write(respBad(reqID))
+		return
+	}
+	// Which KEYS match a private-attribute predicate leaks it exactly as the ads would.
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
 	d, ok := s.tableOr(reqID, table, write)
@@ -598,6 +602,9 @@ func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, inclu
 	}
 	if r.err != nil {
 		write(respBad(reqID))
+		return
+	}
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
 	d, ok := s.tableOr(reqID, table, write)
@@ -670,6 +677,9 @@ func (s *Server) streamQueryAsOf(ctx context.Context, reqID uint64, r *reader, i
 	}
 	if r.err != nil {
 		write(respBad(reqID))
+		return
+	}
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
 	d, ok := s.tableOr(reqID, table, write)
@@ -1193,6 +1203,14 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		if r.err != nil {
 			return respBad(reqID)
 		}
+		// The COUNT of rows a delete removed leaks the predicate as surely as a query would.
+		if !includePrivate {
+			if attr, dynamic := db.PrivateConstraintRef(constraint); attr != "" {
+				return respErr(reqID, "cannot reference private attribute "+attr+" in a constraint")
+			} else if dynamic {
+				return respErr(reqID, "cannot use a dynamic attribute reference in a constraint")
+			}
+		}
 		d, ok := s.cat.Table(table)
 		if !ok {
 			return respErr(reqID, "no such table: "+table)
@@ -1208,6 +1226,14 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		constraint := r.str()
 		if r.err != nil {
 			return respBad(reqID)
+		}
+		// A plan describes which indexes and columns the predicate touches, naming them back.
+		if !includePrivate {
+			if attr, dynamic := db.PrivateConstraintRef(constraint); attr != "" {
+				return respErr(reqID, "cannot reference private attribute "+attr+" in a constraint")
+			} else if dynamic {
+				return respErr(reqID, "cannot use a dynamic attribute reference in a constraint")
+			}
 		}
 		// An archive (history) table is not a mutable table, so resolving only the mutable
 		// catalog reported `.explain` on a history table as a nonexistent table -- while

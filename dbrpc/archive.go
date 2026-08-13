@@ -23,6 +23,9 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 		sc.write(respBad(reqID))
 		return
 	}
+	if refusePrivateConstraint(reqID, constraint, sc.opts.IncludePrivate, sc.write) {
+		return
+	}
 	a, ok := sc.s.cat.ArchiveTable(name)
 	if !ok {
 		sc.write(respErr(reqID, "no such archive: "+name))
@@ -80,6 +83,9 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended bool) {
 		return
 	}
 	if !sc.opts.IncludePrivate {
+		if refusePrivateConstraint(reqID, constraint, sc.opts.IncludePrivate, sc.write) {
+			return
+		}
 		for _, g := range groupCols {
 			if classad.IsPrivateAttribute(g.Attr) {
 				sc.write(respErr(reqID, "cannot group by private attribute "+g.Attr))
@@ -91,11 +97,14 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended bool) {
 				sc.write(respErr(reqID, "cannot aggregate private attribute "+a.Arg))
 				return
 			}
-			for _, ref := range db.AggFilterAttrs(a.Filter) {
-				if classad.IsPrivateAttribute(ref) {
-					sc.write(respErr(reqID, "cannot filter on private attribute "+ref))
-					return
-				}
+			// The authorization walker, not AggFilterAttrs: that one is ReadAttrs-based and reports
+			// nothing for a SCOPED reference, so a filter of `MY.ClaimId == "x"` passed the gate.
+			if ref, dynamic := db.PrivateConstraintRef(a.Filter); ref != "" {
+				sc.write(respErr(reqID, "cannot filter on private attribute "+ref))
+				return
+			} else if dynamic {
+				sc.write(respErr(reqID, "cannot use a dynamic attribute reference in a filter"))
+				return
 			}
 		}
 	}
