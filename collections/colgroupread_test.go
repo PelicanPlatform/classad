@@ -10,9 +10,9 @@ import (
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
-// groupReadFixture attaches a group to one block of records and returns everything a read test
+// groupSchemaReadFixture attaches a group to one block of records and returns everything a read test
 // needs: the scope with the group bound, the base block, and the expected per-record state.
-func groupReadFixture(t *testing.T, c *Collection, n int) (*colScope, *colSegment, []string) {
+func groupSchemaReadFixture(t *testing.T, c *Collection, n int) (*colScope, *colSegment, []string) {
 	t.Helper()
 	iws, ids, state := groupBlockFixture(t, c, n)
 	base := buildAdSchema(iws, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
@@ -46,7 +46,7 @@ func TestGroupResolveThreeStates(t *testing.T) {
 	c := New(Options{Shards: 1})
 	defer c.Close()
 	const n = 240
-	cs, _, state := groupReadFixture(t, c, n)
+	cs, _, state := groupSchemaReadFixture(t, c, n)
 
 	for k := range n {
 		cs.k = k
@@ -96,7 +96,7 @@ func TestGroupVecColumnMatchesScalar(t *testing.T) {
 	c := New(Options{Shards: 1})
 	defer c.Close()
 	const n = 300
-	cs, seg, state := groupReadFixture(t, c, n)
+	cs, seg, state := groupSchemaReadFixture(t, c, n)
 	blk := seg.blocks[0]
 
 	src := &blockVecSource{c: c, bc: cs.bc, dicts: map[int]*blockDict{}}
