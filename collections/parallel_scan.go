@@ -61,47 +61,29 @@ func (c *Collection) gatherTasks() (tasks []scanTask, totalBytes int, release fu
 
 // forEachVisibleWindow walks one window's records visible at S0 (the single-window
 // form of forEachVisible), used by the per-segment workers.
-func forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []byte, codec Codec) bool) {
-	for off := 0; off < w.used; {
-		o := uint32(off)
-		total := recTotalLen(w.data, o)
-		if total == 0 {
-			break
+func (c *Collection) forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []byte, codec Codec) bool) {
+	var rbuf []byte
+	forEachVisibleWindowRef(s0, w, func(r recRef) bool {
+		ad, codec, ok := c.adBytes(r, &rbuf)
+		if !ok {
+			return true
 		}
-		if recIsMarker(w.data, o) {
-			off += int(total) // time-checkpoint marker, not a data record
-			continue
-		}
-		if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
-			if !fn(recAd(w.data, o), w.codec) {
-				return
-			}
-		}
-		off += int(total)
-	}
+		return fn(ad, codec)
+	})
 }
 
 // forEachVisibleWindowKeyed is forEachVisibleWindow that also passes each record's
 // key, so the parallel query workers can filter internal system records out of the
 // client-facing result (the serial scanShard path does the same).
-func forEachVisibleWindowKeyed(s0 uint64, w segWindow, fn func(key, ad []byte, codec Codec) bool) {
-	for off := 0; off < w.used; {
-		o := uint32(off)
-		total := recTotalLen(w.data, o)
-		if total == 0 {
-			break
+func (c *Collection) forEachVisibleWindowKeyed(s0 uint64, w segWindow, fn func(key, ad []byte, codec Codec) bool) {
+	var rbuf []byte
+	forEachVisibleWindowRef(s0, w, func(r recRef) bool {
+		ad, codec, ok := c.adBytes(r, &rbuf)
+		if !ok {
+			return true
 		}
-		if recIsMarker(w.data, o) {
-			off += int(total) // time-checkpoint marker, not a data record
-			continue
-		}
-		if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
-			if !fn(recKey(w.data, o), recAd(w.data, o), w.codec) {
-				return
-			}
-		}
-		off += int(total)
-	}
+		return fn(r.key(), ad, codec)
+	})
 }
 
 // tryAcquire takes up to n tokens from the worker budget without blocking, returning
@@ -190,7 +172,7 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 					return
 				}
 				dict := tasks[idx].win.dict() // one window per task: constant for this walk
-				forEachVisibleWindowKeyed(tasks[idx].s0, tasks[idx].win, func(key, ad []byte, codec Codec) bool {
+				c.forEachVisibleWindowKeyed(tasks[idx].s0, tasks[idx].win, func(key, ad []byte, codec Codec) bool {
 					if stopped.Load() {
 						return false
 					}
@@ -242,7 +224,7 @@ func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(
 	for _, t := range tasks {
 		stop := false
 		dict := t.win.dict()
-		forEachVisibleWindowKeyed(t.s0, t.win, func(key, ad []byte, codec Codec) bool {
+		c.forEachVisibleWindowKeyed(t.s0, t.win, func(key, ad []byte, codec Codec) bool {
 			if isSystemKeyBytes(key) {
 				return true // internal system record: hidden from client queries
 			}

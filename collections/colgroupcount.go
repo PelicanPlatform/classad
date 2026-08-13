@@ -312,7 +312,7 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, preds
 			cs := w.seg.colblk.Load()
 			groupIdx, aggIdxs, predIdxs, ok := resolveGroupFields(cs, groupID, aggIDs, preds)
 			if !ok {
-				if !bruteGroupStats(w, s0, groupLookup, aggLookups, preds, lookups, acc) {
+				if !bruteGroupStats(c, w, s0, groupLookup, aggLookups, preds, lookups, acc) {
 					releaseWindows(wins)
 					return nil, false
 				}
@@ -428,7 +428,7 @@ func resolveGroupFields(cs *colSegment, groupID uint32, aggIDs []uint32,
 //
 // It returns false if a matching record's group attribute is missing or not a scalar number -- the same
 // give-up condition as the column path, for the same reason.
-func bruteGroupStats(w segWindow, s0 uint64, groupLookup func(wire.Ad) ([]byte, bool),
+func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookup func(wire.Ad) ([]byte, bool),
 	aggLookups []func(wire.Ad) ([]byte, bool), preds []fieldPred,
 	lookups []func(wire.Ad) ([]byte, bool), acc map[groupKey]*groupAcc) bool {
 	var buf []byte
@@ -439,7 +439,7 @@ func bruteGroupStats(w segWindow, s0 uint64, groupLookup func(wire.Ad) ([]byte, 
 			break
 		}
 		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
-			if ww, err := w.codec.Decompress(buf[:0], recAd(w.data, o)); err == nil {
+			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
 				ad := wire.Ad(ww)
 				match := true

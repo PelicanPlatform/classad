@@ -48,7 +48,7 @@ func benchmarkConcurrentShardGet(b *testing.B, shards int) {
 		i := 0
 		for pb.Next() {
 			j := i & (readBenchKeys - 1)
-			c.shards[shardOf[j]].get(hashes[j], keys[j])
+			c.shards[shardOf[j]].get(c, hashes[j], keys[j])
 			i++
 		}
 	})
@@ -79,7 +79,7 @@ func benchmarkConcurrentShardGetOneShard(b *testing.B, shards int) {
 		i := 0
 		for pb.Next() {
 			j := i % len(keys)
-			sh.get(hashes[j], keys[j])
+			sh.get(c, hashes[j], keys[j])
 			i++
 		}
 	})

@@ -443,17 +443,36 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	var moved []movedRec
 	// Scratch buffers reused across every record's decompress/recompress.
 	var decBuf, encBuf []byte
-	recompress := func(seg *segment, ad []byte) ([]byte, Codec) {
+	// recompress returns a source record's stored bytes under the target codec, and reports false
+	// if the record could not be read at all (the caller aborts the round rather than write a
+	// segment missing records).
+	//
+	// It takes an OFFSET rather than the bytes because a columnarized record's stored bytes are only
+	// part of its ad: the rest is in the segment's columnar payload, which the output does not carry.
+	// Such a record is reassembled and written whole, so compaction de-columnarizes -- a later
+	// maintenance pass can columnarize the output again.
+	recompress := func(seg *segment, o uint32) ([]byte, Codec, bool) {
+		if seg.columnarized() || seg.colDamaged.Load() {
+			full, err := c.recordWireIn(seg, seg.data, o, decBuf[:0])
+			if err != nil {
+				return nil, nil, false
+			}
+			decBuf = full
+			out := target.Compress(encBuf[:0], full)
+			encBuf = out
+			return out, target, true
+		}
+		ad := recAd(seg.data, o)
 		if seg.codec == target {
-			return ad, seg.codec
+			return ad, seg.codec, true
 		}
 		if w, err := seg.codec.Decompress(decBuf[:0], ad); err == nil {
 			decBuf = w
 			out := target.Compress(encBuf[:0], w)
 			encBuf = out
-			return out, target
+			return out, target, true
 		}
-		return ad, seg.codec
+		return ad, seg.codec, true
 	}
 
 	// Interning: on a persistent, plaintext collection each destination segment is written
@@ -512,7 +531,8 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// decodeSrc decodes a source record to an ast, honoring the source segment's own encoding
 	// (inline or interned). Returns nil on any decompress/decode failure.
 	decodeSrc := func(seg *segment, o uint32) *ast.ClassAd {
-		w, err := seg.codec.Decompress(decBuf[:0], recAd(seg.data, o))
+		// The FULL ad: a columnarized source stores only what its schema does not cover.
+		w, err := c.recordWireIn(seg, seg.data, o, decBuf[:0])
 		if err != nil {
 			return nil
 		}
@@ -593,7 +613,11 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 						break
 					}
 				} else {
-					outAd, outCodec := recompress(seg, recAd(seg.data, o))
+					outAd, outCodec, rok := recompress(seg, o)
+					if !rok {
+						abort = true
+						break
+					}
 					rl := recordLen(len(key), len(outAd))
 					if cur == nil || cur.codec != outCodec || cur.used+rl > len(cur.data) {
 						cur = newDst(&dstSegs, rl, outCodec)
@@ -624,7 +648,11 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 					}
 					hseg.supersedeRec(hoff, sup)
 				} else {
-					outAd, outCodec := recompress(seg, recAd(seg.data, o))
+					outAd, outCodec, rok := recompress(seg, o)
+					if !rok {
+						abort = true
+						break
+					}
 					rl := recordLen(len(key), len(outAd))
 					if hcur == nil || hcur.codec != outCodec || hcur.used+rl > len(hcur.data) {
 						hcur = newDst(&histSegs, rl, outCodec)

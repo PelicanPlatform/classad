@@ -328,7 +328,7 @@ func countAttrWhere(c *Collection, w segWindow, attr string, conds []rangeCond, 
 		if isSystemKeyBytes(recKey(w.data, o)) {
 			continue
 		}
-		raw, err := w.codec.Decompress((*dbuf)[:0], recAd(w.data, o))
+		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
 		if err != nil {
 			return 0, false
 		}

@@ -29,7 +29,19 @@ type zoneAttr struct {
 // encodes records (persistent collections store inline names; in-memory ones store
 // interned ids). Returns nil when no zone attributes are configured. Caller holds the
 // shard write lock (seal) or runs single-threaded during Open (reopen).
-func computeSegZones(data []byte, upto int, attrs []zoneAttr, inline bool, dict *segDictHandle, codec Codec) map[uint32]zoneRange {
+// computeSegZones takes the SEGMENT rather than its bytes for the same reason buildSegIndex does: a
+// zone map built from a columnarized segment's stored bytes would cover only the attributes its
+// schema does not cover, and a zone map that under-reports a range makes the scan SKIP segments that
+// contain matches. That is the worst shape of wrong answer here -- silent, and faster than the
+// correct one.
+func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, inline bool) map[uint32]zoneRange {
+	data, dict := seg.data, seg.dict.Load()
+	// c is nil only from the seal path, whose subject is the ACTIVE segment -- never columnarized,
+	// since only a sealed segment is rewritten. Refuse rather than assume if that ever changes: no
+	// zone map means no pruning, which is slow, while a partial one means wrong answers.
+	if c == nil && seg.columnarized() {
+		return nil
+	}
 	if len(attrs) == 0 {
 		return nil
 	}
@@ -45,7 +57,7 @@ func computeSegZones(data []byte, upto int, attrs []zoneAttr, inline bool, dict 
 			off += int(total)
 			continue
 		}
-		if w, err := codec.Decompress(buf[:0], recAd(data, o)); err == nil {
+		if w, err := c.recordWireIn(seg, data, o, buf); err == nil {
 			buf = w
 			ad := wire.Ad(w)
 			for _, za := range attrs {
@@ -142,5 +154,7 @@ func (sh *shard) sealZones(seg *segment) {
 	if seg == nil || !sh.appendOnly || len(sh.zoneAttrs) == 0 || seg.zones != nil {
 		return
 	}
-	seg.zones = computeSegZones(seg.data, seg.used, sh.zoneAttrs, sh.zoneInline, seg.dict.Load(), seg.codec)
+	// nil collection: the segment being sealed is the active append target, which is whole-record by
+	// construction (only sealed segments are columnarized), so no reassembly can be needed here.
+	seg.zones = computeSegZones(nil, seg, seg.used, sh.zoneAttrs, sh.zoneInline)
 }

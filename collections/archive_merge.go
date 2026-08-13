@@ -69,43 +69,74 @@ func (c *Collection) mergeSegments(sh *shard, run []*segment) bool {
 	if merged == nil {
 		return false
 	}
+	var moved int64
+	for _, s := range run {
+		moved += int64(s.used)
+	}
+	mergedBytes.Add(moved)
+	return c.commitSegmentRewrite(sh, run, merged, nil)
+}
+
+// commitSegmentRewrite makes a rewritten segment durable and swaps it in for its sources.
+//
+// Shared by every operation that replaces sealed segments with one new file -- merging a run, and
+// columnarizing one in place -- because the hard part is not the rewrite, it is being crash-safe
+// about the swap. out must already have been staged under mergeTmpPrefix (so recovery ignores it
+// until it is named) and srcs must be in append order with srcs[0] donating the id and slot.
+//
+// The sequence is: fsync the output, record the intent in a marker naming every source, rename the
+// output into place, publish it, then unlink the sources. A crash at any point leaves a state
+// finishPendingMerges can complete or discard, and it needs to know nothing about which rewrite
+// produced the file.
+//
+// Reports whether the swap happened; on any failure the sources stay in place, since every caller
+// is maintenance rather than a correctness dependency.
+// reconcile, when non-nil, runs under the shard lock immediately before the swap is published, with
+// the sources still in place. It exists for a rewrite whose sources can change AFTER the build read
+// them: a sealed segment in a MUTABLE table can still be superseded in place, and the output was
+// built off-lock, so a delete that landed mid-build would otherwise be dropped and the record would
+// come back to life. Nil for a rewrite whose sources are immutable.
+func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segment, reconcile func()) bool {
 	abort := func() bool {
-		merged.retire()
-		merged.reapAndHook()
+		out.retire()
+		out.reapAndHook()
 		return false
 	}
-	if err := merged.flush(); err != nil {
+	if err := out.flush(); err != nil {
 		return abort()
 	}
 
 	// Record the intent before removing anything, so a crash from here on is finishable.
-	marker := filepath.Join(sh.segDir, filepath.Base(merged.path)+mergeMarkerSuffix)
-	srcNames := make([]string, len(run))
-	for i, s := range run {
+	marker := filepath.Join(sh.segDir, filepath.Base(out.path)+mergeMarkerSuffix)
+	srcNames := make([]string, len(srcs))
+	for i, s := range srcs {
 		srcNames[i] = filepath.Base(s.path)
 	}
 	if err := writeFileSync(marker, []byte(strings.Join(srcNames, "\n"))); err != nil {
 		return abort()
 	}
 
-	final := filepath.Join(sh.segDir, mergedFinalName(filepath.Base(merged.path)))
-	if err := os.Rename(merged.path, final); err != nil {
+	final := filepath.Join(sh.segDir, mergedFinalName(filepath.Base(out.path)))
+	if err := os.Rename(out.path, final); err != nil {
 		_ = os.Remove(marker)
 		return abort()
 	}
-	merged.path = final
+	out.path = final
 
 	// Publish before unlinking: a reader that already holds a source keeps its mapping alive
 	// through the pin/reap path, so retiring the sources here is safe even mid-scan.
 	sh.mu.Lock()
-	if int(run[0].id) >= len(sh.segs) || sh.segs[run[0].id] != run[0] {
+	if int(srcs[0].id) >= len(sh.segs) || sh.segs[srcs[0].id] != srcs[0] {
 		sh.mu.Unlock() // slot moved under us; leave the marker for recovery to finish
 		return false
 	}
-	merged.id = run[0].id
-	sh.segs[run[0].id] = merged
+	if reconcile != nil {
+		reconcile()
+	}
+	out.id = srcs[0].id
+	sh.segs[srcs[0].id] = out
 	var toReap []*segment
-	for i, s := range run {
+	for i, s := range srcs {
 		if i > 0 {
 			sh.segs[s.id] = nil
 		}
@@ -114,16 +145,11 @@ func (c *Collection) mergeSegments(sh *shard, run []*segment) bool {
 		}
 	}
 	sh.mu.Unlock()
-	var moved int64
-	for _, s := range run {
-		moved += int64(s.used)
-	}
-	mergedBytes.Add(moved)
 	for _, s := range toReap {
 		s.reapAndHook() // munmap + unlink, off-lock
 	}
 	// Any source still pinned by an in-flight scan is unlinked when its pins drain; the
-	// marker is removed regardless, because the merged file is in place and named, and a
+	// marker is removed regardless, because the output file is in place and named, and a
 	// replayed unlink of an already-gone file is a no-op.
 	_ = os.Remove(marker)
 	return true

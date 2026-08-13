@@ -48,6 +48,10 @@ type colScope struct {
 	// EXPRESSION, whose value depends on the rest of the ad. The caller re-evaluates that one record
 	// rather than abandoning the query.
 	fellBack bool
+	// schemaOnly mirrors colSegment.schemaOnly for the segment being scanned: the cold tail holds
+	// only escaped SCHEMA fields, so a miss there means the attribute is in the record rather than
+	// absent, and the record has to be read.
+	schemaOnly bool
 
 	// bind caches name -> schema field index for the schema in bindFor: -1 means "not a schema field"
 	// (it lives in the cold tail), -2 means the table has never seen the name. A query's references
@@ -174,6 +178,13 @@ func (cs *colScope) fromColdTail(id uint32) classad.Value {
 		return classad.NewUndefinedValue()
 	}
 	if !found {
+		if cs.schemaOnly {
+			// The cold tail carries only escaped SCHEMA fields here; every other attribute stayed
+			// in the record. Absent from the block is therefore not absent from the ad, and
+			// answering "undefined" would be a wrong answer with a fast path in front of it.
+			cs.fellBack = true
+			return classad.NewUndefinedValue()
+		}
 		return classad.NewUndefinedValue() // genuinely absent from this record
 	}
 	lit, ok := wire.LiteralValue(node)
@@ -542,7 +553,7 @@ func (c *Collection) countBlockScoped(cs *colScope, resolver func(name string, s
 
 // evalOneRecord decodes a single arena record and evaluates the query against it the ordinary way.
 func (c *Collection) evalOneRecord(w segWindow, off uint32, m *vm.Matcher) bool {
-	ww, err := w.codec.Decompress(nil, recAd(w.data, off))
+	ww, err := c.wire(recRef{w: w, off: off, dict: w.dict()}, nil)
 	if err != nil {
 		return false
 	}

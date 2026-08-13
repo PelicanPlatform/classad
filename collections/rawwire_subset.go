@@ -63,6 +63,7 @@ func (c *Collection) QueryRawWire(q *vm.Query, projection []string, redact bool)
 			wireOK:   q.Native() && plan.PartialSafe,
 			ws:       ws,
 			resolver: ws.resolve,
+			proj:     c.newProjPlan(projection),
 		}
 		probes := q.Probes()
 		c.demand.record(probes)
@@ -94,7 +95,25 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 	var scratch []byte
 	var sc wire.SubsetScratch
 	needed := sel.neededCount()
+	var narrow narrowScratch
 	return func(w []byte, dict *segDictHandle) bool {
+		// Narrow in ID SPACE first. wireToInline decodes the whole ad and re-encodes every
+		// attribute with inline names, so handing it the full record means paying for hundreds of
+		// attributes to emit a handful. Skipped when the record is already inline (nothing to
+		// convert) or the collection is encrypted (values are opened during the conversion, which
+		// this shortcut does not do).
+		if !sel.wantAll && dict != nil && c.sealer == nil {
+			want := sel.localWanted(dict)
+			if nw, ok := narrowAd(&narrow, w, func(id uint32, name string) bool {
+				if name != "" {
+					return true // inline entry in an interned record: keep, the real test is below
+				}
+				_, ok := want[id]
+				return ok
+			}); ok {
+				w = nw
+			}
+		}
 		w = c.wireToInline(dict, w) // AppendAdSubsetInlineHotFirst needs inline-name wire
 		out, ok := wire.AppendAdSubsetInlineHotFirst(scratch[:0], wire.Ad(w), sel.keep, needed, c.sealer, &sc)
 		scratch = out
@@ -114,6 +133,10 @@ type wireSubsetSelector struct {
 	redact  bool
 	names   []string
 	hashes  []uint32
+	// projDict/localIDs cache the projection resolved into one segment's local id space, so a
+	// projected read can narrow a record before converting it to inline names. See localWanted.
+	projDict *segDictHandle
+	localIDs map[uint32]struct{}
 }
 
 func (c *Collection) newWireSubsetSelector(projection []string, redact bool) *wireSubsetSelector {

@@ -226,7 +226,7 @@ func countAttrRange(c *Collection, w segWindow, attr string, from, to int, dbuf 
 		if isSystemKeyBytes(recKey(w.data, o)) {
 			continue // internal record, not part of the user's data (nor of Len)
 		}
-		raw, err := w.codec.Decompress((*dbuf)[:0], recAd(w.data, o))
+		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
 		if err != nil {
 			return 0, false
 		}
@@ -268,7 +268,7 @@ func countAttrBucketRange(c *Collection, w segWindow, attr, bucketAttr string, w
 		if isSystemKeyBytes(recKey(w.data, o)) {
 			continue
 		}
-		raw, err := w.codec.Decompress((*dbuf)[:0], recAd(w.data, o))
+		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
 		if err != nil {
 			return 0, false
 		}

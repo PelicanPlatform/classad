@@ -230,7 +230,11 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 			}
 			seq := recSeq(src.data, o)
 			key := append([]byte(nil), recKey(src.data, o)...)
-			wireBytes, err := src.codec.Decompress(nil, recAd(src.data, o))
+			// The FULL ad: a columnarized source holds only part of each record, and the rest
+			// lives in a columnar payload that is not carried across. Reading it whole here
+			// de-columnarizes into the rebuilt segment, which a later maintenance pass can
+			// columnarize again -- losing an accelerator is fine, losing attributes is not.
+			wireBytes, err := c.recordWireIn(src, src.data, o, nil)
 			if err != nil {
 				return nil
 			}

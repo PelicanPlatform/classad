@@ -114,7 +114,7 @@ func (c *Collection) Reindex() {
 			}
 			si := t.seg.idx.Load()
 			if si == nil || int(si.upto) < t.used || si.specGen != spec.gen {
-				si = buildSegIndex(t.seg.data, t.used, t.seg.codec, spec, t.seg.dict.Load())
+				si = buildSegIndex(c, t.seg, t.used, spec)
 				t.seg.idx.Store(si)
 			}
 			// Sealed segment: move its index off the heap into the mmap sidecar (reclaimable,
@@ -1158,7 +1158,10 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, revers
 		if isSystemKeyBytes(recKey(w.data, o)) {
 			return false
 		}
-		ww, err := w.codec.Decompress(dbuf[:0], recAd(w.data, o))
+		// The record's FULL ad. In a columnarized segment the record itself holds only the
+		// attributes the schema does not cover, so decompressing it here would hand the consumer
+		// a partial ad that looks complete.
+		ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, dbuf)
 		if err != nil {
 			return false
 		}
@@ -1330,7 +1333,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 		if isSystemKeyBytes(recKey(w.data, o)) {
 			return false
 		}
-		ww, err := w.codec.Decompress(dbuf[:0], recAd(w.data, o))
+		ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, dbuf)
 		if err != nil {
 			return false
 		}

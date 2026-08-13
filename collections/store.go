@@ -109,6 +109,22 @@ type Options struct {
 	// default still commits no storage on the strength of one sample -- nothing is built until a
 	// group's members have kept recurring across GroupStabilityRuns maintenance passes.
 	GroupSchemaCount int
+	// ColumnarSegmentBudget is how many sealed segments one maintenance pass may rewrite into
+	// COLUMNAR-NATIVE form -- each attribute the schema carries stored once, in the segment's own
+	// columnar payload, and removed from the records (see colnative.go). 0 uses
+	// defaultColumnarBudget; a NEGATIVE value disables the rewrite and keeps every segment
+	// whole-record with a columnar copy beside it in the sidecar.
+	//
+	// On by default because the duplication is pure cost: without it every value the schema
+	// carries is stored twice, row-form in the arena and again in the sidecar block. Measured on
+	// 1500 real OSPool machine ads, moving them removed 43% of the table (4104 -> 2327 bytes per
+	// record), and the sidecar megabyte it reclaimed was entirely the duplicate copy.
+	//
+	// Budgeted rather than unbounded because turning it on over an existing archive rewrites every
+	// sealed segment once, and at history scale doing that in a single pass is hours of I/O and a
+	// flushed page cache -- the same failure a retrain caused when it resealed a whole archive.
+	// Each segment is rewritten at most once, so a bounded budget still converges.
+	ColumnarSegmentBudget int
 	// GroupStabilityRuns is how many consecutive derivations a group's members must have
 	// co-occurred in before its blocks are built. 0 uses the default; 1 disables the gate.
 	GroupStabilityRuns int
@@ -307,6 +323,7 @@ type Collection struct {
 	groupSchemaCount int            // Options.GroupSchemaCount
 	groupStability   int            // Options.GroupStabilityRuns
 	groupJac         float64        // Options.GroupMergeJaccard
+	colBudget        int            // Options.ColumnarSegmentBudget
 	groupMaxPart     float64        // Options.GroupMaxPartialFrac
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
@@ -536,6 +553,7 @@ func New(opts Options) *Collection {
 		groupSchemaCount: opts.GroupSchemaCount,
 		groupStability:   opts.GroupStabilityRuns,
 		groupJac:         opts.GroupMergeJaccard,
+		colBudget:        opts.ColumnarSegmentBudget,
 		groupMaxPart:     opts.GroupMaxPartialFrac,
 	}
 	c.codec.Store(&codecHolder{codec})
@@ -784,7 +802,7 @@ func (c *Collection) Delete(key []byte) bool {
 func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	stored, codec, dict, ok := sh.get(h, key)
+	stored, codec, dict, ok := sh.get(c, h, key)
 	if !ok {
 		return nil, false
 	}
@@ -797,7 +815,7 @@ func (c *Collection) Get(key []byte) (*classad.ClassAd, bool) {
 	if c.parentKeyFor != nil {
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
-			if pad, pcodec, pdict, ok := sh.get(ph, pk); ok {
+			if pad, pcodec, pdict, ok := sh.get(c, ph, pk); ok {
 				if parent, err := c.decodeAdDict(pdict, pad, pcodec); err == nil {
 					c.mergeParent(ad, parent)
 				}
@@ -851,7 +869,7 @@ func (c *Collection) Keys() []string {
 	var out []string
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		forEachVisibleKeyed(s0, wins, func(key, _ []byte, _ Codec, _ *segDictHandle) bool {
+		c.forEachVisibleKeyed(s0, wins, func(key, _ []byte, _ Codec, _ *segDictHandle) bool {
 			if c.isStructural != nil && c.isStructural(key) {
 				return true // parent-only ads are hidden, as in Scan
 			}
@@ -905,6 +923,9 @@ type queryPlan struct {
 	wireOK   bool // native + partial-safe: try wire-native evaluation
 	ws       *wireScope
 	resolver func(name string, scope ast.AttributeScope) classad.Value
+	// proj, when non-nil, is the projection the consumer will keep, so the scan can build a narrower
+	// ad directly from a columnarized segment's columns instead of reassembling a whole record.
+	proj *projPlan
 	// zoneProbes are the query's top-level AND probes, used to skip whole sealed
 	// segments whose zone map cannot contain a match (append-only zone pruning). Set
 	// only when the collection has zone attributes; nil otherwise (no pruning cost).
@@ -1024,11 +1045,63 @@ func (c *Collection) scanShardAt(sh *shard, s0 uint64, qp queryPlan, emit scanEm
 func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit scanEmit) bool {
 	cont := true
 	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
-	visit := func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
-		if isSystemKeyBytes(key) {
+	// Ask the columns before rebuilding a record: over a columnarized segment a rejected record
+	// would otherwise be reassembled in full and then thrown away. nil when the columns cannot
+	// usefully decide this query, which leaves the scan exactly as it was.
+	pre := c.newColPrefilter(qp.q)
+	// A projected read can be built from the named columns instead of reassembling the record and then
+	// discarding most of it -- but only when the match did not need the ad. See colproject.go.
+	var (
+		projCS      *colScope
+		projScratch projectScratch
+	)
+	if qp.proj != nil {
+		if st := c.schemaScan.Load(); st != nil {
+			projCS = &colScope{bc: st.cache, c: c}
+		}
+	}
+	constQuery := qp.q == nil || (qp.plan.PartialSafe && len(qp.plan.Seeds) == 0)
+	visit := func(r recRef) bool {
+		if isSystemKeyBytes(r.key()) {
 			return true // internal system record: hidden from client scans/queries
 		}
-		w, err := codec.Decompress(dbuf[:0], ad)
+		dict := r.dict
+		cn := r.w.seg.colNative.Load()
+		colDecided := false
+		if pre != nil && cn != nil {
+			if k, ok := cn.byOff[r.off]; ok {
+				matches, decided := pre.test(cn, k)
+				if decided {
+					if !matches {
+						return true // decided from columns alone: never reassembled
+					}
+					colDecided = true
+				}
+			}
+		}
+		// Project straight from the columns when nothing still needs the whole ad: either the query
+		// reads no attribute (so it is constant and the ad cannot change its answer) or the match was
+		// just decided FROM the columns. Anything less certain reassembles, because a narrowed ad
+		// cannot be handed to the matcher -- its seed set is not closed.
+		if projCS != nil && cn != nil && (constQuery || colDecided) {
+			if k, ok := cn.byOff[r.off]; ok {
+				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &projScratch); ok {
+					if qp.ws != nil {
+						qp.ws.dict = dict
+					}
+					if !emit(out, dict) {
+						cont = false
+						return false
+					}
+					return true
+				}
+			}
+		}
+		// The record's FULL ad, which in a columnarized segment means its own bytes spliced with
+		// the attributes held in the segment's columnar payload. Asking the ref rather than
+		// decompressing here is what lets a columnarized segment be scanned at all: its records
+		// carry only what the schema does not cover.
+		w, err := c.wire(r, dbuf)
 		if err != nil {
 			return true // skip a record we cannot decode rather than abort the scan
 		}
@@ -1064,9 +1137,9 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		}
 	}
 	if c.reverseScan {
-		forEachVisibleKeyedReverse(s0, walk, visit)
+		forEachVisibleRefReverse(s0, walk, visit)
 	} else {
-		forEachVisibleKeyed(s0, walk, visit)
+		forEachVisibleRef(s0, walk, visit)
 	}
 	return cont
 }
@@ -1109,7 +1182,7 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 	// Pass 1: collect structural (parent) ads' decompressed wire bytes. Parents
 	// are few (one per family), so this map stays small.
 	parents := map[string]parentWire{}
-	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+	c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if isSystemKeyBytes(key) {
 			return true // internal system record: never a family parent
 		}
@@ -1128,7 +1201,7 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 	// Pass 2: evaluate children (and standalone ads); skip structural ads.
 	cont := true
 	var dbuf []byte
-	forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+	c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if isSystemKeyBytes(key) {
 			return true // internal system record: hidden from client scans/queries
 		}
@@ -1283,7 +1356,7 @@ func (c *Collection) CollectSamples(max int) [][]byte {
 			break
 		}
 		s0, wins := sh.snapshot()
-		forEachVisible(s0, wins, func(ad []byte, codec Codec, dict *segDictHandle) bool {
+		c.forEachVisible(s0, wins, func(ad []byte, codec Codec, dict *segDictHandle) bool {
 			w, err := codec.Decompress(buf[:0], ad)
 			if err != nil {
 				return true

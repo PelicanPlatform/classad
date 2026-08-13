@@ -542,7 +542,7 @@ func (c *Collection) watchAd(key, rawAd []byte, codec Codec) (*classad.ClassAd, 
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
 			sh := c.shards[c.shardOf(pk, ph)]
-			if pad, pcodec, pdict, ok := sh.get(ph, pk); ok {
+			if pad, pcodec, pdict, ok := sh.get(c, ph, pk); ok {
 				if parent, err := c.decodeAdDict(pdict, pad, pcodec); err == nil {
 					c.mergeParent(ad, parent)
 				}
@@ -600,7 +600,7 @@ func (c *Collection) seedParentSig() map[string]map[string]string {
 	}
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+		c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if c.isStructural(key) {
 				if pad, err := c.decodeAdDict(dict, ad, codec); err == nil {
 					sig[string(key)] = c.nonPrivateSig(pad)
@@ -638,7 +638,7 @@ func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]s
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var out []rawEvent
-	forEachVisibleKeyed(s0, wins, func(k, ad []byte, codec Codec, dict *segDictHandle) bool {
+	c.forEachVisibleKeyed(s0, wins, func(k, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if c.isStructural != nil && c.isStructural(k) {
 			return true
 		}
@@ -665,6 +665,7 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 	sh := c.shards[i]
 	_, wins := sh.snapshot()
 	defer releaseWindows(wins)
+	var wbuf []byte
 	for _, wn := range wins {
 		for off := 0; off < wn.used; {
 			o := uint32(off)
@@ -675,7 +676,15 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 			seq := recSeq(wn.data, o)
 			if seq > cursor && seq <= sReg && recSuperseded(wn.data, o) > sReg {
 				key := recKey(wn.data, o)
-				if ad, ok := c.watchAd(key, recAd(wn.data, o), wn.codec); ok {
+				// The FULL ad: a columnarized record carries only what its schema does not
+				// cover, and a watch event holding half an ad is indistinguishable from an ad
+				// whose attributes really were removed.
+				adBytes, adCodec, aok := c.adBytes(recRef{w: wn, off: o, dict: wn.dict()}, &wbuf)
+				if !aok {
+					off += int(total)
+					continue
+				}
+				if ad, ok := c.watchAd(key, adBytes, adCodec); ok {
 					if !yield(WatchEvent{Kind: WatchUpsert, Key: append([]byte(nil), key...), Ad: ad}) {
 						return false
 					}

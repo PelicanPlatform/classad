@@ -246,7 +246,7 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *vm.Matcher,
 			// Matched, so this record forms a group: read its values from the wire form, the same
 			// lookups the predicate-analysis path's row fallback uses, so group identity does not
 			// depend on which tier answered.
-			ww, err := w.codec.Decompress(nil, recAd(w.data, o))
+			ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, nil)
 			if err != nil {
 				return false
 			}

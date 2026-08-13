@@ -38,6 +38,7 @@ type groupBind struct{ gi, fi int }
 func (cs *colScope) setGroups(seg *colSegment, bi int) {
 	cs.gblocks = cs.gblocks[:0]
 	cs.groups = nil
+	cs.schemaOnly = seg != nil && seg.schemaOnly
 	if seg == nil || len(seg.groups) == 0 {
 		return
 	}

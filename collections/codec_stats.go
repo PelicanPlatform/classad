@@ -43,13 +43,18 @@ func (c *Collection) CodecStats(sampleMax int) CodecStats {
 			break
 		}
 		s0, wins := sh.snapshot()
-		forEachVisible(s0, wins, func(ad []byte, codec Codec, _ *segDictHandle) bool {
-			w, err := codec.Decompress(buf[:0], ad)
+		// The ref form, not the ad-bytes form: this measures what the RECORDS cost, so it wants
+		// each record exactly as stored. The byte-passing iterator would reassemble a columnarized
+		// record and report the reassembled size as the compressed size, inverting the ratio it
+		// exists to report. A columnarized segment's columns are accounted for separately.
+		forEachVisibleRef(s0, wins, func(r recRef) bool {
+			stored := r.stored()
+			w, err := r.codec().Decompress(buf[:0], stored)
 			if err != nil {
 				return true
 			}
 			buf = w
-			cs.CompressedBytes += int64(len(ad))
+			cs.CompressedBytes += int64(len(stored))
 			cs.UncompressedBytes += int64(len(w))
 			n++
 			return n < sampleMax

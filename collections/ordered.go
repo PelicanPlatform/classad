@@ -411,7 +411,7 @@ func (c *Collection) rebuildOrdered() {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		var dbuf []byte
-		forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+		c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			w, err := codec.Decompress(dbuf[:0], ad)
 			if err != nil {
 				return true
