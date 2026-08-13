@@ -205,3 +205,74 @@ func TestPrivilegedRawReadRendersSealedValues(t *testing.T) {
 	}
 	t.Logf("privileged raw read: %d ads, %d carrying the opened sealed value", ads, withSecret)
 }
+
+// TestRedactedReadWithholdsNonPrivateSealedAttr closes the edge that name-based redaction structurally
+// cannot: EncryptedAttrs may name an attribute that is NOT in HTCondor's private set. Redaction skips by
+// private name, so it never skipped such a node -- the renderer met a sealed value it could not render and
+// dropped the whole ad, and had it rendered anything it would have been the secret.
+//
+// Redacting by NODE covers it: no key, no value, whatever the attribute is called.
+func TestRedactedReadWithholdsNonPrivateSealedAttr(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	_, dataKey := deriveDataKey(t)
+	const secret = "payroll-9f83a-not-a-private-name"
+	openC := func() *Collection {
+		c, err := Open(Options{
+			Shards: 1, Dir: dir, SegmentSize: 1 << 16,
+			DataKey: dataKey, EncryptedAttrs: []string{"Salary"}, // not an HTCondor private attribute
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := openC()
+	for i := 0; i < 400; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; Salary=%q]`, i, secret))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Compact()
+	c.Close()
+	c = openC()
+	defer c.Close()
+
+	q, err := vm.Parse("Cpus >= 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Privileged: the value is there (the premise -- otherwise withholding proves nothing).
+	priv, sawSecret := 0, false
+	for ra := range c.QueryRaw(q) {
+		priv++
+		for _, e := range ra.Exprs {
+			if strings.Contains(string(e), secret) {
+				sawSecret = true
+			}
+		}
+	}
+	if priv == 0 || !sawSecret {
+		t.Fatalf("privileged raw read: %d ads, secret seen = %v; both must hold for this test to mean "+
+			"anything", priv, sawSecret)
+	}
+	// Redacted: same ads, no value, even though "Salary" is not a private NAME.
+	red := 0
+	for ra := range c.QueryRawRedacted(q) {
+		red++
+		for _, e := range ra.Exprs {
+			if strings.Contains(string(e), secret) {
+				t.Fatalf("a redacted read rendered a non-private sealed attribute: %q", string(e))
+			}
+		}
+	}
+	if red != priv {
+		t.Errorf("redacted read returned %d ads, privileged %d: the ad must survive, only the value goes",
+			red, priv)
+	}
+	t.Logf("non-private sealed attr: %d ads privileged (value visible), %d redacted (value withheld)",
+		priv, red)
+}
