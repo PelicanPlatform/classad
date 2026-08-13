@@ -11,19 +11,19 @@ import (
 func columnarizeShard(t *testing.T, c *Collection, sh *shard, s *adSchema, hot []int) int {
 	t.Helper()
 	sh.mu.Lock()
-	defer sh.mu.Unlock()
+	act := sh.act
+	var srcs []*segment
+	for _, seg := range sh.segs {
+		if seg != nil && seg != act && seg.used > 0 && !seg.columnarized() {
+			srcs = append(srcs, seg)
+		}
+	}
+	sh.mu.Unlock()
 	n := 0
-	for i, seg := range sh.segs {
-		if seg == nil || seg == sh.act || seg.used == 0 || seg.columnarized() {
-			continue
+	for _, src := range srcs {
+		if c.columnarizeSealedSegment(sh, src, s, hot) {
+			n++
 		}
-		dst := c.columnarizeSegment(sh, seg, s, hot)
-		if dst == nil {
-			continue
-		}
-		sh.segs[i] = dst
-		seg.retire()
-		n++
 	}
 	return n
 }
@@ -136,4 +136,64 @@ func TestColumnarizedShardServesReverseScan(t *testing.T) {
 			t.Fatalf("reverse scan diverges at %d: order or content changed", i)
 		}
 	}
+}
+
+// TestColumnarizedSegmentSurvivesReopen is the test the format is least able to do without: a
+// columnarized segment's columnar payload is DURABLE data, not a cache, because the records were
+// written without the attributes it holds.
+//
+// The failure mode it guards is silent. If a reopen does not publish the payload, the segment looks
+// like an ordinary one whose records are whole, and every ad it serves is missing every schema'd
+// attribute -- with nothing in the result, and no error, to say so. That is worse than a read
+// failure, so the read paths treat an unreadable payload as an error and this test requires a
+// readable one to be found.
+func TestColumnarizedSegmentSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	c, s, hot := columnarFixtureIn(t, dir, 3000)
+	before := readAll(t, c, "true")
+	n := columnarizeShard(t, c, c.shards[0], s, hot)
+	if n == 0 {
+		c.Close()
+		t.Skip("no sealed segment was columnarized")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c2, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	got := 0
+	for _, seg := range c2.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			got++
+		}
+		if seg != nil && seg.colDamaged.Load() {
+			t.Errorf("segment %d: columnar payload did not survive the reopen", seg.id)
+		}
+	}
+	if got != n {
+		t.Fatalf("%d columnarized segments after reopen, want %d", got, n)
+	}
+	after := readAll(t, c2, "true")
+	if len(after) != len(before) {
+		t.Fatalf("after reopen: %d rows, want %d", len(after), len(before))
+	}
+	want := map[string]int{}
+	for _, k := range before {
+		want[k]++
+	}
+	bad := 0
+	for _, k := range after {
+		want[k]--
+		if want[k] < 0 {
+			bad++
+		}
+	}
+	if bad != 0 {
+		t.Fatalf("%d ads differ after reopen", bad)
+	}
+	t.Logf("%d columnarized segments reopened; all %d ads intact", got, len(after))
 }

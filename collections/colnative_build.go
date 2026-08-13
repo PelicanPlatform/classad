@@ -23,7 +23,8 @@ import (
 // nil if it cannot be built (in which case the caller keeps the original -- this is an optimization,
 // never a correctness dependency).
 //
-// Caller holds the shard lock.
+// The source must be sealed (immutable), so it is read without the shard lock; the returned segment
+// is staged on disk and not yet part of the shard -- see columnarizeSealedSegment.
 func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, hot []int) *segment {
 	if src == nil || src.used == 0 || src.columnarized() || s == nil || len(s.fields) == 0 {
 		return nil
@@ -141,7 +142,9 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		total += recordLen(0, len(b))
 	}
 
-	dst, err := sh.allocNamed(src.id, total, src.codec, "colx")
+	// Staged under the prefix recovery ignores: until commitSegmentRewrite renames it, a crash
+	// must leave the original segment as the one the directory names.
+	dst, err := sh.allocNamed(src.id, total, src.codec, mergeTmpPrefix)
 	if err != nil {
 		return nil
 	}
@@ -262,4 +265,31 @@ func segDictBlob(s *segment) []byte {
 		off += int(rl)
 	}
 	return nil
+}
+
+// columnarizeSealedSegment rewrites one sealed segment into columnar form and makes the replacement
+// durable, returning whether it happened.
+//
+// Split from columnarizeSegment because the two halves have different failure meanings: building can
+// fail freely and leaves nothing behind, while committing is the point where the new file becomes
+// the one recovery names and the old one goes away. The commit is the same crash-safe protocol an
+// archive merge uses -- stage, marker, rename, publish, unlink -- so a crash mid-transform is
+// finished or discarded by finishPendingMerges without it needing to know a columnar rewrite
+// happened at all.
+//
+// The caller must hold maintMu, as merging and reseal do, so segment rewrites never overlap.
+func (c *Collection) columnarizeSealedSegment(sh *shard, src *segment, s *adSchema, hot []int) bool {
+	if sh.allocNamed == nil || sh.segDir == "" {
+		return false // in-memory collection: nothing to make durable, and no file to stage
+	}
+	dst := c.columnarizeSegment(sh, src, s, hot)
+	if dst == nil {
+		return false
+	}
+	if !c.commitSegmentRewrite(sh, []*segment{src}, dst) {
+		return false // commitSegmentRewrite already discarded the staged file
+	}
+	columnarizedSegments.Add(1)
+	columnarizedBytesSaved.Add(int64(src.used) - int64(dst.used))
+	return true
 }

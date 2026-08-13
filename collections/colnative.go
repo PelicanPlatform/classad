@@ -94,6 +94,11 @@ func publishColNative(c *Collection, seg *segment) {
 			}
 			bc, err := newBlockCache(64 << 20)
 			if err != nil {
+				// Reached the payload and could not make it readable. Returning quietly would
+				// leave the segment looking like an ordinary one, whose records are whole -- and
+				// these are not. Mark it damaged so reads fail instead.
+				colNativeCRCFailures.Add(1)
+				seg.colDamaged.Store(true)
 				return
 			}
 			cn := &colNative{seg: cs, byOff: make(map[uint32]int, len(cs.offs)), cache: bc}
@@ -251,3 +256,17 @@ var colNativeCRCFailures atomic.Int64
 // ColNativeCRCFailures reports how many columnar payloads have been refused for a bad checksum
 // since the process started.
 func ColNativeCRCFailures() int64 { return colNativeCRCFailures.Load() }
+
+// columnarizedSegments counts segments successfully rewritten into columnar form, and
+// columnarizedBytesSaved the arena bytes the rewrites removed (negative if a rewrite grew a
+// segment, which is worth seeing rather than clamping).
+var (
+	columnarizedSegments   atomic.Int64
+	columnarizedBytesSaved atomic.Int64
+)
+
+// ColumnarizedSegments reports how many segments have been rewritten into columnar form, and how
+// many arena bytes that removed, since the process started.
+func ColumnarizedSegments() (segments, bytesSaved int64) {
+	return columnarizedSegments.Load(), columnarizedBytesSaved.Load()
+}

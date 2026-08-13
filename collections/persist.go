@@ -453,6 +453,17 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			publishSegDictAt(seg, segDictHint[seg])
 		}
 	}
+	// Then each columnarized segment's columnar payload, which is DURABLE data rather than a cache:
+	// its records were written without the attributes it holds, so a segment whose payload is not
+	// published reads as an ad missing half its attributes and nothing about the result says so.
+	// Publication must follow the dictionary loop above -- an interned segment's payload is
+	// translated through its dictionary -- and must cover every segment, because a reader cannot ask
+	// whether the format was recognised, only for the ad.
+	for _, seg := range sh.segs {
+		if seg != nil {
+			publishColNative(c, seg)
+		}
+	}
 	if sh.act != nil && sh.act.dict.Load() != nil {
 		sh.act = nil
 	}

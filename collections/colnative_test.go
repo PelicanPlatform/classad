@@ -32,7 +32,13 @@ func adSummary(t *testing.T, c *Collection, w []byte) string {
 // derived schema.
 func columnarFixture(t *testing.T, n int) (*Collection, *adSchema, []int) {
 	t.Helper()
-	dir := t.TempDir()
+	return columnarFixtureIn(t, t.TempDir(), n)
+}
+
+// columnarFixtureIn is columnarFixture in a caller-chosen directory, so a test can close the
+// collection and reopen the same files.
+func columnarFixtureIn(t *testing.T, dir string, n int) (*Collection, *adSchema, []int) {
+	t.Helper()
 	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1})
 	if err != nil {
 		t.Fatal(err)
