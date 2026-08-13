@@ -287,7 +287,20 @@ func (s *adSchema) splitRecord(r []byte) (prefix, strs, cold []byte) {
 }
 
 // encode lays one wire ad out in the schema record format.
-func (s *adSchema) encode(w wire.Ad) []byte {
+func (s *adSchema) encode(w wire.Ad) []byte { return s.encodeExcept(w, nil) }
+
+// encodeExcept is encode, omitting the named attributes entirely -- not to a slot, not to the cold
+// tail, nowhere.
+//
+// It exists so a group column does not have to be a second copy. An attribute the base schema does
+// not carry lands in the cold tail, and a group block then stores it again for the records that
+// hold the whole group -- measured at +35% of a table's bytes for four groups. Skipping those
+// records' copies makes the group column a MOVE rather than a duplicate.
+//
+// Safe because the arena is untouched: the columnar section is derived state rebuilt from the
+// records, so dropping a value from it loses nothing that cannot be recomputed. It is only the
+// SIDECAR's two copies being reduced to one.
+func (s *adSchema) encodeExcept(w wire.Ad, skip map[uint32]struct{}) []byte {
 	esc := make([]byte, s.escBytes)
 	fixed := make([]byte, s.fixedLen)
 	var cold []byte
@@ -295,6 +308,9 @@ func (s *adSchema) encode(w wire.Ad) []byte {
 	strVals := make([]string, len(s.fields)) // schema string values, kept for the ordered region
 
 	w.ForEach(func(id uint32, node []byte) bool {
+		if _, drop := skip[id]; drop {
+			return true // stored by a group column instead
+		}
 		idx, ok := s.byID[id]
 		if !ok {
 			cold = append(binary.AppendUvarint(cold, uint64(id)), node...)

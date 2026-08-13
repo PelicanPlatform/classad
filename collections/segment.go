@@ -57,8 +57,19 @@ const (
 	// uniformly; dictFlag lets recovery recognize it (vs a time checkpoint) and publish the
 	// segment's dict. Real keys are tiny, so masking the low 30 bits still yields the true
 	// key length for ordinary records.
-	dictFlag   = uint32(1) << 30
-	keyLenMask = dictFlag - 1
+	dictFlag = uint32(1) << 30
+	// colFlag (the next bit down) marks the per-segment COLUMNAR record: a marker whose payload
+	// is the segment's columnar regions, holding the values of every schema'd attribute for every
+	// record in the segment. Like dictFlag it also sets markerFlag, so every marker-skipping walk
+	// skips it, and it is found on recovery the same way the dictionary is.
+	//
+	// This is the one region of a segment that is NOT derived: a columnarized record's own bytes
+	// carry only the attributes the schema does not cover, so the columnar record holds the rest.
+	// Putting it inside the segment rather than beside it is deliberate -- it shares the segment's
+	// framing, its per-record CRC, its fsync, and its lifetime, so there is no way to have one
+	// without the other.
+	colFlag    = uint32(1) << 29
+	keyLenMask = colFlag - 1
 
 	noSeg  = ^uint32(0)
 	seqMax = ^uint64(0)
@@ -136,6 +147,9 @@ type segment struct {
 	// compaction transcode that produced the interned segment, or at load from the segment's
 	// dictFlag record -- and read lock-free to dispatch decode (segDictHandle over the mmap).
 	dict atomic.Pointer[segDictHandle]
+	// colNative is this segment's authoritative columnar payload when it has been columnarized
+	// (see colnative.go); nil for a whole-record segment.
+	colNative atomic.Pointer[colNative]
 
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned
@@ -530,6 +544,39 @@ func (s *segment) appendDict(dict []byte) (uint32, bool) {
 	return uint32(off), true
 }
 
+// appendCol writes the segment's COLUMNAR record: a keyless marker whose payload holds the values
+// of every schema'd attribute for every record in the segment. Same framing as appendDict, and for
+// the same reason -- it rides the segment's own CRC, fsync and lifetime, so a segment can never be
+// present without the data its records had removed.
+//
+// Caller holds the shard lock; returns the record offset (the payload's probe base is
+// off+recKeyOff+4, as for a dict).
+func (s *segment) appendCol(blob []byte) (uint32, bool) {
+	rl := recordLen(0, len(blob))
+	off := s.used
+	if off+rl > len(s.data) {
+		return 0, false
+	}
+	b := s.data[off : off+rl]
+	s.used = off + rl
+	binary.LittleEndian.PutUint64(b[recSeqOff:], 0)
+	binary.LittleEndian.PutUint64(b[recSupOff:], seqMax)
+	binary.LittleEndian.PutUint32(b[recNextSegOff:], noSeg)
+	binary.LittleEndian.PutUint32(b[recNextOffOff:], 0)
+	binary.LittleEndian.PutUint32(b[recTotalLenOff:], uint32(rl))
+	binary.LittleEndian.PutUint32(b[recKeyLenOff:], markerFlag|colFlag) // keyless; skipped like a marker
+	adLenOff := recKeyOff
+	binary.LittleEndian.PutUint32(b[adLenOff:], uint32(len(blob)))
+	copy(b[adLenOff+4:], blob)
+	if s.persistent {
+		crcOff := adLenOff + 4 + len(blob)
+		binary.LittleEndian.PutUint32(b[crcOff:], recCRC(b, crcOff))
+	}
+	// Not live data: count as dead so dead>=used accounting is unaffected by the dict.
+	s.dead += int64(rl)
+	return uint32(off), true
+}
+
 // supersedeRec marks the record at off superseded at seq: it stamps the field, adds
 // its bytes to the dead total, and advances maxSup. Caller holds the shard write lock.
 // This is the one place a record leaves the "current" set, so the scan-pruning
@@ -641,6 +688,11 @@ func recIsDict(b []byte, off uint32) bool {
 	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&dictFlag != 0
 }
 
+// recIsCol reports whether the record is the segment's columnar payload.
+func recIsCol(b []byte, off uint32) bool {
+	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&colFlag != 0
+}
+
 func recKey(b []byte, off uint32) []byte {
 	kl := recKeyLen(b, off)
 	start := off + recKeyOff
@@ -654,3 +706,30 @@ func recAd(b []byte, off uint32) []byte {
 	start := adLenOff + 4
 	return b[start : start+adLen]
 }
+
+// appendRawRecord copies a record's identity from src -- its commit seq, its supersession seq, its
+// key -- while replacing the ad payload. Used by the columnarizing rewrite, where a record keeps
+// everything that decides visibility and ordering and loses only the attributes a column now holds.
+//
+// Preserving the supersession seq matters as much as the commit seq: a record superseded before the
+// rewrite must stay superseded after it, or a scan would resurrect an old version.
+func (s *segment) appendRawRecord(srcData []byte, srcOff uint32, ad []byte) (uint32, bool) {
+	key := recKey(srcData, srcOff)
+	off, ok := s.append(recSeq(srcData, srcOff), loc{seg: noSeg}, key, ad)
+	if !ok {
+		return 0, false
+	}
+	binary.LittleEndian.PutUint64(s.data[off+recSupOff:], recSuperseded(srcData, srcOff))
+	if s.persistent {
+		// The supersession seq is inside the CRC's range, so it has to be recomputed after the
+		// overwrite or recovery would reject every rewritten record as torn.
+		adLenOff := int(off) + recKeyOff + len(key)
+		crcOff := adLenOff + 4 + len(ad)
+		binary.LittleEndian.PutUint32(s.data[crcOff:], recCRC(s.data[off:], crcOff-int(off)))
+	}
+	return off, true
+}
+
+// syncAll flushes the whole written extent, so a columnarized segment is durable before anything
+// points at it.
+func (s *segment) syncAll() error { return s.msyncRange(0, s.used) }

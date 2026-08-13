@@ -184,3 +184,28 @@ func buildGroupBlocks(groups []*colGroup, iws [][]byte, regionCodec Codec) []*co
 	}
 	return out
 }
+
+// groupSkipSet is the attributes a record's base row can omit: the members of every group the
+// record belongs to WHOLLY, since those are stored by that group's column.
+//
+// Only whole membership qualifies. A record holding part of a group is not in the column, so its
+// values must stay in the base cold tail -- which is exactly where the exception path reads them.
+func groupSkipSet(groups []*colGroup, iw []byte) map[uint32]struct{} {
+	var skip map[uint32]struct{}
+	for _, g := range groups {
+		idset := make(map[uint32]struct{}, len(g.ids))
+		for _, id := range g.ids {
+			idset[id] = struct{}{}
+		}
+		if groupHave(iw, idset) != len(g.ids) {
+			continue
+		}
+		if skip == nil {
+			skip = make(map[uint32]struct{}, len(g.ids))
+		}
+		for _, id := range g.ids {
+			skip[id] = struct{}{}
+		}
+	}
+	return skip
+}

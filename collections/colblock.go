@@ -392,7 +392,14 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 			if w, err := arenaCodec.Decompress(buf[:0], recAd(data, o)); err == nil {
 				buf = w
 				if iw, ok := toInterned(nil, w); ok {
-					rec := s.encode(wire.Ad(iw))
+					// A record that holds a whole group has those attributes stored by the
+					// group's column, so they are left out of the base row entirely rather
+					// than written to its cold tail as a second copy.
+					var skip map[uint32]struct{}
+					if len(groups) > 0 {
+						skip = groupSkipSet(groups, iw)
+					}
+					rec := s.encodeExcept(wire.Ad(iw), skip)
 					recs = append(recs, rec)
 					if len(groups) > 0 {
 						iws = append(iws, append([]byte(nil), iw...))

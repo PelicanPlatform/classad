@@ -710,3 +710,94 @@ func skipAdBody(c *cursor, depth int) {
 		skipNode(c, depth+1)
 	}
 }
+
+// SplitBody returns an ad's attribute-entry region and how many entries it holds, plus the header
+// bytes that precede the body (magic, version, flags, and a standalone name table if present).
+//
+// For a caller that needs to REBUILD an ad from parts rather than read one. The hot header is not
+// returned: it is an index of (id, offset) pairs into the entry region, so any change to that
+// region invalidates it, and it is a pure read accelerator that the store repopulates.
+func (a Ad) SplitBody() (header, entries []byte, n int, inline, ok bool) {
+	c, o := a.bodyStart()
+	if !o {
+		return nil, nil, 0, false, false
+	}
+	hdrEnd := c.pos
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	attrCount := c.uvarint()
+	if !c.ok {
+		return nil, nil, 0, false, false
+	}
+	return a[:hdrEnd], a[c.pos:], int(attrCount), c.inline, true
+}
+
+// BuildAd assembles an ad from a header (as SplitBody returns) and a sequence of already-encoded
+// attribute entries, writing an empty hot header. entries must be key+node pairs in the same key
+// encoding the header's flags declare.
+//
+// The hot header is left empty deliberately: it indexes offsets into the entry region, and a
+// rebuilt region invalidates them. Nothing is lost -- it is regenerated where it matters.
+func BuildAd(dst, header []byte, n int, entries []byte) []byte {
+	dst = append(dst, header...)
+	dst = binary.AppendUvarint(dst, 0) // hot header: empty
+	dst = binary.AppendUvarint(dst, uint64(n))
+	return append(dst, entries...)
+}
+
+// AppendKey writes an attribute key in the encoding the ad's flags declare: the interned id, or the
+// name inline.
+func AppendKey(dst []byte, inline bool, id uint32, name string) []byte {
+	if inline {
+		dst = binary.AppendUvarint(dst, uint64(len(name)))
+		return append(dst, name...)
+	}
+	return binary.AppendUvarint(dst, uint64(id))
+}
+
+// ForEachRaw calls fn with each attribute's interned id (0 for an inline ad), its name (empty for
+// an interned ad), and its raw node bytes.
+//
+// The two encodings key attributes differently, and a caller REWRITING an ad has to preserve
+// whichever it was given -- ForEach reads the key as an id and is wrong for inline ads, while
+// ForEachNamed resolves names through a table the rewriter may not want to touch.
+func (a Ad) ForEachRaw(fn func(id uint32, name string, node []byte) bool) bool {
+	c, ok := a.bodyStart()
+	if !ok {
+		return false
+	}
+	inline := c.inline
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	attrCount := c.uvarint()
+	for i := uint64(0); i < attrCount && c.ok; i++ {
+		var id uint64
+		var name string
+		if inline {
+			n := c.uvarint()
+			start := c.pos
+			c.skip(int(n))
+			if !c.ok {
+				return false
+			}
+			name = string(a[start:c.pos])
+		} else {
+			id = c.uvarint()
+		}
+		start := c.pos
+		skipNode(c, 0)
+		if !c.ok {
+			return false
+		}
+		if !fn(uint32(id), name, a[start:c.pos]) {
+			return true
+		}
+	}
+	return c.ok
+}
