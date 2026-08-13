@@ -1042,11 +1042,24 @@ func (c *Collection) scanShardAt(sh *shard, s0 uint64, qp queryPlan, emit scanEm
 func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit scanEmit) bool {
 	cont := true
 	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
+	// Ask the columns before rebuilding a record: over a columnarized segment a rejected record
+	// would otherwise be reassembled in full and then thrown away. nil when the columns cannot
+	// usefully decide this query, which leaves the scan exactly as it was.
+	pre := c.newColPrefilter(qp.q)
 	visit := func(r recRef) bool {
 		if isSystemKeyBytes(r.key()) {
 			return true // internal system record: hidden from client scans/queries
 		}
 		dict := r.dict
+		if pre != nil {
+			if cn := r.w.seg.colNative.Load(); cn != nil {
+				if k, ok := cn.byOff[r.off]; ok {
+					if matches, decided := pre.test(cn, k); decided && !matches {
+						return true // decided from columns alone: never reassembled
+					}
+				}
+			}
+		}
 		// The record's FULL ad, which in a columnarized segment means its own bytes spliced with
 		// the attributes held in the segment's columnar payload. Asking the ref rather than
 		// decompressing here is what lets a columnarized segment be scanned at all: its records

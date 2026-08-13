@@ -54,7 +54,10 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 			}
 		}
 	}
-	covered := func(id uint32, name string) bool {
+	covered := func(id uint32, name string, node []byte) bool {
+		if !storableInColumn(node) {
+			return false
+		}
 		if name == "" {
 			if d != nil {
 				_, ok := localCovered[id]
@@ -68,7 +71,10 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	}
 	// The columnar builder sees records AFTER recordToInternedDict, which resolves local ids to
 	// global ones, so its half is tested in the global space.
-	coveredGlobal := func(id uint32, name string) bool {
+	coveredGlobal := func(id uint32, name string, node []byte) bool {
+		if !storableInColumn(node) {
+			return false
+		}
 		if name == "" {
 			_, ok := s.byID[id]
 			return ok
@@ -201,7 +207,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 //
 // Removed entirely, not moved to a cold tail: the columnar record holds them now, and the whole
 // point is that each value is stored once.
-func stripSchemaAttrs(w []byte, covered func(id uint32, name string) bool) ([]byte, bool) {
+func stripSchemaAttrs(w []byte, covered func(id uint32, name string, node []byte) bool) ([]byte, bool) {
 	hdr, _, _, inline, ok := wire.Ad(w).SplitBody()
 	if !ok {
 		return nil, false
@@ -210,7 +216,7 @@ func stripSchemaAttrs(w []byte, covered func(id uint32, name string) bool) ([]by
 	kept := 0
 	bad := false
 	wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
-		if covered(id, name) {
+		if covered(id, name, node) {
 			return true // the column holds it now
 		}
 		entries = wire.AppendKey(entries, inline, id, name)
@@ -226,7 +232,7 @@ func stripSchemaAttrs(w []byte, covered func(id uint32, name string) bool) ([]by
 
 // keepAttrs is stripSchemaAttrs inverted: it returns the ad with ONLY the attributes the predicate
 // accepts. Used to feed the columnar builder the schema's half of each record.
-func keepAttrs(w []byte, keep func(id uint32, name string) bool) ([]byte, bool) {
+func keepAttrs(w []byte, keep func(id uint32, name string, node []byte) bool) ([]byte, bool) {
 	hdr, _, _, inline, ok := wire.Ad(w).SplitBody()
 	if !ok {
 		return nil, false
@@ -234,7 +240,7 @@ func keepAttrs(w []byte, keep func(id uint32, name string) bool) ([]byte, bool) 
 	var entries []byte
 	n := 0
 	wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
-		if !keep(id, name) {
+		if !keep(id, name, node) {
 			return true
 		}
 		entries = wire.AppendKey(entries, inline, id, name)
@@ -409,4 +415,26 @@ func (c *Collection) ColumnarizeSealed() int {
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
 	return c.columnarizeSealed()
+}
+
+// storableInColumn reports whether a value may be moved out of its record into a column.
+//
+// Only LITERALS may. An expression node contains attribute references, and those references are ids
+// in the same space as the record that holds them -- a segment-local dictionary id for an interned
+// segment. The columnar payload is built from records whose ids have been resolved to the GLOBAL
+// intern space, so moving an expression into it and splicing it back writes a global id into a
+// locally-keyed record, where it resolves to whatever attribute happens to hold that local id.
+//
+// It is not a hypothetical. `RequestMemory = ProcId * 512 + 7` came back as `Slack * 512 + 7`: the
+// reassembled ad was structurally perfect, every literal correct, and queries reading that attribute
+// returned the wrong rows. Nothing errored, and a test comparing ads while rendering expressions as
+// "<expr>" called the two forms equal.
+//
+// Keeping expressions in the record costs almost nothing -- they are a small minority of values, and
+// a schema field holding one already ESCAPES, so the block marks it absent and reconstruct skips it
+// rather than carrying a second copy. Translating ids inside arbitrary expression nodes would be the
+// alternative, and it would have to be exactly right for every node shape forever.
+func storableInColumn(node []byte) bool {
+	_, ok := wire.LiteralValue(node)
+	return ok
 }

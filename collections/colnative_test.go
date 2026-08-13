@@ -18,7 +18,11 @@ func adSummary(t *testing.T, c *Collection, w []byte) string {
 	wire.Ad(w).ForEachNamed(c.intern, func(name string, node []byte) bool {
 		lit, ok := wire.LiteralValue(node)
 		if !ok {
-			parts = append(parts, strings.ToLower(name)+"=<expr>")
+			// The NODE BYTES, not a placeholder. Rendering every expression as "<expr>" made two ads
+			// holding DIFFERENT expressions compare equal, which is exactly the difference that
+			// mattered: a reassembly bug in the escape path was invisible here while queries over
+			// those records returned the wrong rows.
+			parts = append(parts, fmt.Sprintf("%s=expr:%x", strings.ToLower(name), node))
 			return true
 		}
 		parts = append(parts, fmt.Sprintf("%s=%v", strings.ToLower(name), lit))
@@ -61,6 +65,15 @@ func columnarFixtureIn(t *testing.T, dir string, n int) (*Collection, *adSchema,
 			text = fmt.Sprintf(
 				`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Wide=%d ]`,
 				i, i%10, i%7, i%6, (i%16)*1024, i*1000000)
+		}
+		// A stored EXPRESSION in a field the schema carries, rare enough that the field still makes
+		// the schema and the record ESCAPES instead. Every fixture here held only literals until a
+		// prefilter test happened to include one, and the escape path turned out to reassemble
+		// misaligned values -- so the round trip has to cover it.
+		if i%211 == 1 {
+			text = fmt.Sprintf(
+				`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=ProcId*512+7; Cmd="/bin/sleep" ]`,
+				i, i%10, i%7, i%6)
 		}
 		ad, err := classad.Parse(text)
 		if err != nil {

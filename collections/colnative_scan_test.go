@@ -619,3 +619,217 @@ func TestColumnarizeKeepsMidBuildDeletes(t *testing.T) {
 	}
 	t.Logf("%d deletes landed in the commit window and all stayed dead", len(deleted))
 }
+
+// TestColumnarPrefilterAgreesWithRowPath is the safety net for deciding a match from columns instead
+// of from the record.
+//
+// The prefilter's failure mode is asymmetric and that asymmetry is the whole design: claiming a match
+// that is not one costs a reassembly the ordinary match then rejects, while claiming a NON-match that
+// is one silently drops a row from a query result. So this compares identical data stored both ways
+// across the shapes most likely to disagree -- undefined attributes, attribute-to-attribute
+// comparisons, strings, negation, arithmetic, and attributes the schema does not carry -- and requires
+// the answers to be equal, not merely close.
+// bothStorageForms builds the SAME data twice, once whole-record and once columnarized, so a test can
+// require the two forms to answer identically.
+func bothStorageForms(t *testing.T) (rows, cols *Collection) {
+	build := func(columnarize bool) *Collection {
+		budget := 0
+		if !columnarize {
+			budget = -1
+		}
+		c, err := Open(Options{Dir: t.TempDir(), Shards: 1, SegmentSize: 1 << 16,
+			GroupSchemaCount: -1, ColumnarSegmentBudget: budget})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range 3000 {
+			// Deliberately uneven: an attribute only some ads carry, one whose value is an
+			// EXPRESSION (which the columns cannot evaluate and must defer on), a string, and a
+			// negative number.
+			text := fmt.Sprintf(
+				`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Slack=%d ]`,
+				i, i%10, i%7, i%6, (i%16)*1024, i%11-5)
+			switch i % 7 {
+			case 0:
+				text = fmt.Sprintf(
+					`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Slack=%d; Sometimes=%d ]`,
+					i, i%10, i%7, i%6, (i%16)*1024, i%11-5, i)
+			}
+			// A stored EXPRESSION in a field the schema DOES carry, so the columnar path has to
+			// defer these records to the ordinary evaluator. Deliberately rare: at one in seven the
+			// field's fit was poor enough that the schema dropped it altogether, the prefilter then
+			// declined every query naming it, and the deferral path this is here to cover never ran
+			// once -- 18000 records decided and not a single fallback.
+			if i%211 == 1 {
+				text = fmt.Sprintf(
+					`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=ProcId*512+7; Cmd="/bin/sleep"; Slack=%d ]`,
+					i, i%10, i%7, i%6, i%11-5)
+			}
+			ad, err := classad.Parse(text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.RetrainDict(0)
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Skip("schema scan did not enable")
+		}
+		return c
+	}
+	return build(false), build(true)
+}
+
+func TestColumnarPrefilterAgreesWithRowPath(t *testing.T) {
+	build := func(columnarize bool) *Collection {
+		budget := 0
+		if !columnarize {
+			budget = -1
+		}
+		c, err := Open(Options{Dir: t.TempDir(), Shards: 1, SegmentSize: 1 << 16,
+			GroupSchemaCount: -1, ColumnarSegmentBudget: budget})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range 3000 {
+			// Deliberately uneven: an attribute only some ads carry, one whose value is an
+			// EXPRESSION (which the columns cannot evaluate and must defer on), a string, and a
+			// negative number.
+			text := fmt.Sprintf(
+				`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Slack=%d ]`,
+				i, i%10, i%7, i%6, (i%16)*1024, i%11-5)
+			switch i % 7 {
+			case 0:
+				text = fmt.Sprintf(
+					`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Slack=%d; Sometimes=%d ]`,
+					i, i%10, i%7, i%6, (i%16)*1024, i%11-5, i)
+			}
+			// A stored EXPRESSION in a field the schema DOES carry, so the columnar path has to
+			// defer these records to the ordinary evaluator. Deliberately rare: at one in seven the
+			// field's fit was poor enough that the schema dropped it altogether, the prefilter then
+			// declined every query naming it, and the deferral path this is here to cover never ran
+			// once -- 18000 records decided and not a single fallback.
+			if i%211 == 1 {
+				text = fmt.Sprintf(
+					`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=ProcId*512+7; Cmd="/bin/sleep"; Slack=%d ]`,
+					i, i%10, i%7, i%6, i%11-5)
+			}
+			ad, err := classad.Parse(text)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.RetrainDict(0)
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Skip("schema scan did not enable")
+		}
+		return c
+	}
+	rows := build(false)
+	defer rows.Close()
+	cols := build(true)
+	defer cols.Close()
+
+	columnarized := 0
+	for _, seg := range cols.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			columnarized++
+		}
+	}
+	if columnarized == 0 {
+		t.Skip("no sealed segment was columnarized")
+	}
+
+	for _, expr := range []string{
+		"true",
+		"RequestMemory > 4096",
+		"RequestMemory >= 0 && ProcId < 5",
+		"ProcId >= 5 || RequestMemory < 2048",
+		"!(ProcId >= 5)",
+		"Slack < 0",                     // negative numbers
+		"Slack + ProcId > 3",            // arithmetic across two columns
+		"ProcId != JobStatus",           // attribute to attribute
+		"Owner == \"user3\"",            // string equality
+		"Owner > \"user1\"",             // string ordering
+		"Sometimes is undefined",        // an attribute only some ads carry
+		"Sometimes isnt undefined",      // and its complement
+		"Sometimes > 100",               // comparing a frequently-absent attribute
+		"RequestMemory > ProcId * 100",  // an attribute whose stored value is sometimes an expression
+		"JobStatus == 4 && Slack == -5", // conjunction over two columns
+		"Cmd == \"/bin/sleep\"",         // matches every record
+		"Cmd == \"/bin/nonexistent\"",   // matches none
+	} {
+		want := readAll(t, rows, expr)
+		got := readAll(t, cols, expr)
+		if len(got) != len(want) {
+			t.Errorf("%-36s columnar %d rows, row path %d", expr, len(got), len(want))
+			continue
+		}
+		bag := map[string]int{}
+		for _, k := range want {
+			bag[k]++
+		}
+		bad := 0
+		for _, k := range got {
+			bag[k]--
+			if bag[k] < 0 {
+				bad++
+			}
+		}
+		if bad != 0 {
+			t.Errorf("%-36s %d ads differ from the row path", expr, bad)
+		}
+	}
+}
+
+// TestColumnarizedAdsAreByteEqualIncludingExpressions compares every ad in a columnarized table
+// against the same data stored whole-record, and is sensitive to what an expression CONTAINS.
+//
+// That sensitivity is the point. An earlier version of this comparison rendered every non-literal as
+// "<expr>", which made two ads holding different expressions compare equal -- and that is precisely
+// what went wrong: moving an expression into a column rewrote the attribute it referenced, so
+// `RequestMemory = ProcId * 512 + 7` came back as `Slack * 512 + 7`. Structurally perfect ad, every
+// literal correct, wrong query results, nothing logged. See storableInColumn.
+func TestColumnarizedAdsAreByteEqualIncludingExpressions(t *testing.T) {
+	rows, cols := bothStorageForms(t)
+	defer rows.Close()
+	defer cols.Close()
+	q, _ := vm.Parse("true")
+	want := map[string]string{}
+	for w := range rows.QueryRawWire(q, nil, false) {
+		a, _ := rows.decodeAd(w, identityCodec{})
+		if a != nil {
+			if v, ok := a.EvaluateAttrInt("ClusterId"); ok {
+				want[fmt.Sprintf("%d", v)] = adSummary(t, rows, w)
+			}
+		}
+	}
+	bad := 0
+	for w := range cols.QueryRawWire(q, nil, false) {
+		a, _ := cols.decodeAd(w, identityCodec{})
+		if a == nil {
+			continue
+		}
+		v, ok := a.EvaluateAttrInt("ClusterId")
+		if !ok {
+			continue
+		}
+		k := fmt.Sprintf("%d", v)
+		got := adSummary(t, cols, w)
+		if wa, ok := want[k]; ok && wa != got {
+			bad++
+			if bad <= 3 {
+				t.Logf("ClusterId=%s\n  row: %s\n  col: %s", k, wa, got)
+			}
+		}
+	}
+	if bad != 0 {
+		t.Errorf("%d of %d ads differ between the columnar and whole-record forms", bad, len(want))
+	}
+	t.Logf("%d ads identical across both storage forms, expression content included", len(want))
+}
