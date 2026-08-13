@@ -87,8 +87,6 @@ type blockVecSource struct {
 	// gsrc holds one reusable sub-source per group, bound to that group's block, so a group column
 	// is loaded by exactly the same code that loads a base column.
 	gsrc []*blockVecSource
-	// gscope holds one per-record scope per group, for reading a group column's members.
-	gscope []*colScope
 
 	// dictBuf is the parse buffer for PRUNING, which reads a dictionary and does not retain it.
 	dictBuf [][]byte

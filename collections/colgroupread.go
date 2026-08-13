@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -195,70 +196,29 @@ func (s *blockVecSource) loadGroupColumn(name string, dst *vm.Vec) (bool, bool) 
 		// No member in this block; only the exceptions carry a value.
 		return s.fillGroupExceptions(gb, id, dst), true
 	}
-	// Members, read at their rank through the ordinary per-record readers.
+	// Members: load the group's own column DENSELY through the same loaders a base column uses,
+	// then scatter it to the members' base indices.
 	//
-	// NOT a dense column load plus a scatter, which is what a fully vectorized version would be:
-	// vm.Vec's dense loaders and its element copy are unexported, so building one here would mean a
-	// parallel implementation of them. The KERNELS still see a dense, full-length vector -- which is
-	// where the executor's speedup is -- so this leaves only the load scalar. Exporting a scatter
-	// from vm would close that gap and is the obvious follow-up.
-	sub := s.groupScope(b.gi, gb)
+	// Dense-then-scatter rather than a read per record: the dense load is the vectorized one (raw
+	// widths, dictionary codes, the batch int path), and vm.CopyElem moves an element without
+	// boxing it through classad.Value -- which for a dictionary-encoded string is a code copy
+	// rather than materializing the string per record.
+	sub := s.groupSource(b.gi, gb)
+	tmp := vm.NewVec(gb.blk.n)
+	if !sub.LoadColumn(name, ast.NoScope, tmp) {
+		return false, true // the group's own loaders declined: so does this column
+	}
+	dst.Dict = tmp.Dict
 	for k := 0; k < s.blk.n; k++ {
 		gi, member := gb.index(k)
 		if !member {
 			continue
 		}
-		sub.k = gi
-		sub.fellBack = false
-		v := sub.resolveField(b.fi)
-		if sub.fellBack || !setVecValue(dst, k, v) {
-			return false, true // decline the column rather than return a partial one
+		if !dst.CopyElem(k, tmp, gi) {
+			return false, true
 		}
 	}
 	return s.fillGroupExceptions(gb, id, dst), true
-}
-
-// groupScope returns the reusable per-record scope for group gi, bound to gb's block. The vector
-// source keeps one so a group column's members are read by exactly the code the scalar path uses.
-func (s *blockVecSource) groupScope(gi int, gb *colGroupBlock) *colScope {
-	for len(s.gscope) <= gi {
-		s.gscope = append(s.gscope, nil)
-	}
-	sub := s.gscope[gi]
-	if sub == nil {
-		sub = &colScope{bc: s.bc, c: s.c}
-		s.gscope[gi] = sub
-	}
-	if sub.blk != gb.blk {
-		sub.setBlock(gb.blk)
-	}
-	return sub
-}
-
-// setVecValue writes a classad.Value into element i, reporting false for a value a vector cannot
-// hold -- a list or a nested ad -- so the caller declines the column instead of misrepresenting it.
-func setVecValue(dst *vm.Vec, i int, v classad.Value) bool {
-	switch {
-	case v.IsUndefined():
-		dst.St[i] = vm.VsUndef
-	case v.IsError():
-		dst.St[i] = vm.VsError
-	case v.IsInteger():
-		n, _ := v.IntValue()
-		dst.SetInt(i, n)
-	case v.IsReal():
-		f, _ := v.RealValue()
-		dst.SetReal(i, f)
-	case v.IsBool():
-		bv, _ := v.BoolValue()
-		dst.SetBool(i, bv)
-	case v.IsString():
-		sv, _ := v.StringValue()
-		dst.SetString(i, sv)
-	default:
-		return false
-	}
-	return true
 }
 
 // fillGroupExceptions fills the partial records' elements from the base block's cold tail. They are

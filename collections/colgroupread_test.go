@@ -232,3 +232,70 @@ func TestGroupQueryMatchesRowPath(t *testing.T) {
 		}
 	}
 }
+
+// TestGroupStringColumnMatchesRowPath: a group column of STRINGS, which is the case the dense
+// scatter exists for -- a low-cardinality string field is stored as a dictionary plus a code
+// column, and copying elements through classad.Value would materialize the string per record
+// instead of moving the code.
+func TestGroupStringColumnMatchesRowPath(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14,
+		GroupSchemaCount: 4, GroupStabilityRuns: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const n = 3000
+	for i := range n {
+		text := fmt.Sprintf(`[ ClusterId=%d; Owner="u%d" ]`, i, i%5)
+		if i%4 == 0 {
+			// A handful of distinct values, so the field earns a dictionary.
+			text = fmt.Sprintf(`[ ClusterId=%d; Owner="u%d"; GHost="slot%d@site"; GSite="site%d" ]`,
+				i, i%5, i%7, i%3)
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	queries := []string{
+		`GHost == "slot3@site"`,
+		`GHost is undefined`,
+		`GSite == "site1" && ClusterId < 1500`,
+		`GHost > GSite`, // string against string, both group columns
+	}
+	want := map[string]int{}
+	for _, q := range queries {
+		qq, err := vm.Parse(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for range c.Query(qq) {
+			want[q]++
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	st := c.schemaScan.Load()
+	if st == nil || len(st.groups) == 0 {
+		t.Fatal("no groups built; this would compare a path against itself")
+	}
+	for _, q := range queries {
+		qq, err := vm.Parse(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cnt, ok := c.CountQuery(qq)
+		if !ok {
+			t.Errorf("%q: columnar count declined", q)
+			continue
+		}
+		if cnt != want[q] {
+			t.Errorf("%q: columnar count %d, row scan %d", q, cnt, want[q])
+		}
+	}
+}
