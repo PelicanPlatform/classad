@@ -191,7 +191,13 @@ func (c *Collection) newRawProjector(projection []string, chaseRefs, redact bool
 
 func (c *Collection) yieldRawProjected(yield func(RawAd) bool, p *rawProjector) scanEmit {
 	return func(w []byte, dict *segDictHandle) bool {
-		w = c.wireToInline(dict, w) // interned segment -> inline for the mode-aware projector
+		// Same split as the raw renderer: a redacted projection holds no key, a privileged one opens
+		// the sealed values so the projector can render them rather than dropping the ad.
+		if p.redact {
+			w = c.wireToInlineNoKey(dict, w)
+		} else {
+			w = c.wireToInlinePlain(dict, w)
+		}
 		ra, ok := p.render(w)
 		if !ok {
 			return true // inline-name or undecodable record: skip, keep scanning

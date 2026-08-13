@@ -55,12 +55,8 @@ func TestRedactedRawReadHoldsNoKey(t *testing.T) {
 	}
 
 	// The premise: WITH the key the secret is recoverable, so the redacted read withholding it is the
-	// change rather than the fixture never having had a secret.
-	//
-	// Established through Query (full decode) rather than QueryRaw. QueryRaw yields NOTHING for an
-	// encrypted collection: its renderer cannot render a sealed node, so every ad comes back
-	// "undecodable" and is skipped silently. That is a pre-existing wart, not something this changed --
-	// and it is why the privileged comparison here uses the decode path instead.
+	// change rather than the fixture never having had a secret. Established through Query (full decode);
+	// TestPrivilegedRawReadRendersSealedValues covers the raw renderer separately.
 	privileged, redacted := 0, 0
 	sawSecret := false
 	for ad := range c.Query(q) {
@@ -150,4 +146,62 @@ func TestRedactedRawReadSurvivesWithoutTheCollectionKey(t *testing.T) {
 			"must still be readable")
 	}
 	t.Logf("keyless reader read %d ads with the secret withheld", n)
+}
+
+// TestPrivilegedRawReadRendersSealedValues covers the other half of the split. A privileged raw read of an
+// encrypted collection used to return NOTHING: wireToInline opened each sealed value and re-sealed it, the
+// renderer cannot render a sealed node, so appendWireAd reported every ad undecodable and the scan skipped
+// it -- an empty result rather than an error, for the trusted consumer the API exists to serve. It matters
+// more once every DB has sealed attributes.
+func TestPrivilegedRawReadRendersSealedValues(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	_, dataKey := deriveDataKey(t)
+	const secret = "ClaimId-super-secret-capability-9f83a"
+	openC := func() *Collection {
+		c, err := Open(Options{
+			Shards: 1, Dir: dir, SegmentSize: 1 << 16,
+			DataKey: dataKey, EncryptedAttrs: []string{"ClaimId"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := openC()
+	for i := 0; i < 400; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Compact()
+	c.Close()
+	c = openC()
+	defer c.Close()
+
+	q, err := vm.Parse("Cpus >= 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ads, withSecret := 0, 0
+	for ra := range c.QueryRaw(q) {
+		ads++
+		for _, e := range ra.Exprs {
+			if strings.Contains(string(e), secret) {
+				withSecret++
+				break
+			}
+		}
+	}
+	if ads == 0 {
+		t.Fatal("privileged raw read of an encrypted collection returned no ads at all")
+	}
+	if withSecret != ads {
+		t.Errorf("%d of %d ads carried the sealed value; a privileged raw read exists to serve it",
+			withSecret, ads)
+	}
+	t.Logf("privileged raw read: %d ads, %d carrying the opened sealed value", ads, withSecret)
 }

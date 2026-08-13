@@ -109,7 +109,9 @@ func (c *Collection) yieldRaw(yield func(RawAd) bool, redact bool) scanEmit {
 		if redact {
 			w = c.wireToInlineNoKey(dict, w)
 		} else {
-			w = c.wireToInline(dict, w) // interned segment -> inline for the mode-aware renderer
+			// Privileged: open the sealed values so the renderer can render them (see
+			// wireToInlinePlain -- re-sealing here made every ad "undecodable" and skipped).
+			w = c.wireToInlinePlain(dict, w)
 		}
 		var mt, tt string
 		var ok bool

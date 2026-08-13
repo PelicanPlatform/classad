@@ -178,6 +178,36 @@ func (c *Collection) wireToInline(dict *segDictHandle, w []byte) []byte {
 	return wire.EncodeInline(nil, a)
 }
 
+// wireToInlinePlain is wireToInline for a RENDER path holding the key: sealed values are opened and the
+// inline form carries them in the clear, because the renderer cannot render a sealed node -- it reports
+// the ad undecodable and the scan skips it, so a privileged raw read of an encrypted collection returned
+// NOTHING rather than the secrets it exists to serve.
+//
+// The plaintext lives only in the transient buffer the renderer writes from. wireToInline re-seals
+// instead, which is right where the result is PERSISTED or sampled (retrained dictionaries, columnar
+// blocks) and wrong here.
+func (c *Collection) wireToInlinePlain(dict *segDictHandle, w []byte) []byte {
+	if c.sealer == nil {
+		return c.wireToInline(dict, w) // nothing sealed to open
+	}
+	if dict == nil {
+		// Already inline-name, but its sealed nodes are still sealed and the inline renderer takes no
+		// sealer -- which is the whole bug: AppendNodeTextInlineOld fails on a sealed node, the ad is
+		// reported undecodable, and the scan drops it. Open and re-encode plain so the renderer has
+		// something it can render.
+		a, err := wire.DecodeInlineEnc(w, c.sealer)
+		if err != nil {
+			return w
+		}
+		return wire.EncodeInline(nil, a)
+	}
+	a, err := c.decodeWireDict(dict, w)
+	if err != nil {
+		return w
+	}
+	return wire.EncodeInline(nil, a)
+}
+
 // wireToInlineNoKey is wireToInline for a read that is NOT entitled to sealed values: it decodes with no
 // key at all, so a sealed value becomes undefined (see wire.DecodeResolveEncRedact) and no plaintext
 // secret is ever materialized.
