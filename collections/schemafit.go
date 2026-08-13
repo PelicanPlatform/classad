@@ -128,7 +128,10 @@ func (c *Collection) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) {
 // schema in place.
 //
 // Existing blocks are dropped first: EnableSchemaScan builds only where a segment has none, so
-// without that it would keep every old block and the new schema would match none of them.
+// without that it would keep every old block and the new schema would match none of them. A
+// COLUMNARIZED segment is exempt -- its block holds attributes its records no longer carry, so it
+// keeps both the block and the schema it was written with; adopting a new schema there means
+// rewriting the segment.
 // Queries during the rebuild take the row path, which is correct but slower.
 func (c *Collection) ReschemaScan(sampleMax, hotTopN int) bool {
 	if c.sealer != nil {
@@ -152,6 +155,20 @@ func (c *Collection) ReschemaScan(sampleMax, hotTopN int) bool {
 		}
 		sh.mu.RUnlock()
 		for _, seg := range segs {
+			if seg.columnarized() {
+				// A COLUMNARIZED segment's block is not a rebuildable accelerator -- it is where the
+				// segment's schema'd attributes are STORED, and its records no longer carry them. So
+				// it is not dropped: dropping it cannot be undone here, because the rebuild below
+				// deliberately refuses to build a block from records that are missing the very values
+				// it would need, leaving the segment with no columnar path at all until a reopen
+				// republished it.
+				//
+				// Keeping it is also the right answer rather than merely the safe one. The payload
+				// carries its own schema, so the segment stays readable and queryable against the
+				// schema it was written with, which is the per-segment-schema property the format is
+				// built on. Re-schema-ing such a segment means REWRITING it, not rebuilding a sidecar.
+				continue
+			}
 			// A scan that already loaded the old block keeps reading it safely; only new
 			// lookups see nil and fall back until the rebuild republishes.
 			seg.colblk.Store(nil)
