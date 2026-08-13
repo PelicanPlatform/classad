@@ -28,6 +28,19 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	if src == nil || src.used == 0 || src.columnarized() || s == nil || len(s.fields) == 0 {
 		return nil
 	}
+	// NOT SAFE TO SWAP INTO A LIVE SHARD YET, and the guard is here rather than in a comment
+	// because the failure is silent. A columnarized segment's records carry only the attributes the
+	// schema does not cover, so any reader that decompresses a record and reads it directly sees
+	// half an ad. The scan family does exactly that: measured on a 3000-ad fixture, a row scan over
+	// swapped-in columnarized segments returned 90 rows where 1500 matched.
+	//
+	// recordWire reassembles correctly, but the scan paths do not go through it -- they receive
+	// already-decompressed bytes from the visible-record iterators, which would have to widen to
+	// pass the segment and offset. Until that migration lands, this builds a segment for tests and
+	// measurement and nothing installs one.
+	if !c.colNativeEnabled {
+		return nil
+	}
 	d := src.dict.Load()
 	// Whether the schema carries an attribute, by whichever key the record uses. Built once:
 	// resolving a name through the intern table per attribute per record would dominate.

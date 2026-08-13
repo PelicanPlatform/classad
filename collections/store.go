@@ -307,7 +307,11 @@ type Collection struct {
 	groupSchemaCount int            // Options.GroupSchemaCount
 	groupStability   int            // Options.GroupStabilityRuns
 	groupJac         float64        // Options.GroupMergeJaccard
-	groupMaxPart     float64        // Options.GroupMaxPartialFrac
+	// colNativeEnabled opts a collection into columnarizing sealed segments. Unexported and set
+	// only by tests: the read paths that would see half an ad have not been migrated yet, so
+	// there is deliberately no way for a caller to turn this on.
+	colNativeEnabled bool
+	groupMaxPart     float64 // Options.GroupMaxPartialFrac
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
 	// (0/1 ⇒ serial). qsem is a collection-wide token pool bounding total scan

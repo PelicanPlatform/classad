@@ -102,6 +102,13 @@ func publishColNative(c *Collection, seg *segment) {
 			}
 			cn.dict = seg.dict.Load()
 			seg.colNative.Store(cn)
+			// Publish it as the segment's read-path columnar block too. It IS a colSegment, so
+			// every existing columnar reader -- the aggregate scans, the presence count, the
+			// per-record resolver, the vectorized evaluator -- works against the in-segment copy
+			// unchanged. That is what makes the sidecar's copy redundant rather than merely
+			// duplicated: the builder skips a segment that already has one (see enableSchemaScan),
+			// so nothing rebuilds it and nothing writes it.
+			seg.colblk.Store(cs)
 			return
 		}
 		off += int(total)
@@ -114,6 +121,11 @@ func publishColNative(c *Collection, seg *segment) {
 // This is the one place the two shapes are reconciled. Every reader that wants a whole ad goes
 // through it; readers that want a single attribute should ask the columns directly, which is the
 // entire point of storing them that way.
+// colNativeBlob returns a columnarized segment's payload for the sidecar writer, which must NOT
+// duplicate it: the segment already holds the authoritative copy, and writing it again is the exact
+// waste this format removes.
+func colNativeBlobRedundant(seg *segment) bool { return seg != nil && seg.colNative.Load() != nil }
+
 func (c *Collection) recordWire(seg *segment, off uint32, buf []byte) ([]byte, error) {
 	raw, err := seg.codec.Decompress(buf[:0], recAd(seg.data, off))
 	if err != nil {

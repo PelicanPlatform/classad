@@ -37,6 +37,7 @@ func columnarFixture(t *testing.T, n int) (*Collection, *adSchema, []int) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	c.colNativeEnabled = true // tests only; see columnarizeSegment
 	for i := range n {
 		// A mix of shapes: schema'd numerics and strings, an attribute only some ads carry (so
 		// the schema escapes it), and one that no schema will cover.
@@ -375,4 +376,71 @@ func TestColumnarPayloadCorruptionFailsLoudly(t *testing.T) {
 	if err == nil {
 		t.Fatalf("read succeeded on a damaged segment, returning %d bytes -- a short ad", len(got))
 	}
+}
+
+// TestColumnarizedSegmentPublishesItsOwnBlock closes the duplication loop: a columnarized segment
+// publishes its own payload as the read-path columnar block, so the existing columnar readers work
+// against the in-segment copy and the sidecar is not asked to carry a second one.
+//
+// It deliberately does NOT install the segment in the shard. The scan family reads decompressed
+// records directly rather than through recordWire, so a columnarized segment in a live shard would
+// serve half-ads -- see columnarizeSegment, which refuses to build one outside a test for that
+// reason. Asserting that limitation here would only have to be deleted when the reader migration
+// lands; what is asserted is what should stay true either way.
+func TestColumnarizedSegmentPublishesItsOwnBlock(t *testing.T) {
+	c, s, hot := columnarFixture(t, 3000)
+	defer c.Close()
+	sh := c.shards[0]
+	sh.mu.Lock()
+	act := sh.act
+	var src *segment
+	for _, seg := range sh.segs {
+		if seg != nil && seg != act && seg.used > 0 && !seg.columnarized() {
+			src = seg
+			break
+		}
+	}
+	dst := c.columnarizeSegment(sh, src, s, hot)
+	sh.mu.Unlock()
+	if src == nil || dst == nil {
+		t.Skip("nothing to columnarize")
+	}
+	defer func() {
+		dst.retire()
+		dst.reapAndHook()
+	}()
+
+	// The read-path block comes from the segment itself.
+	cs := dst.colblk.Load()
+	if cs == nil {
+		t.Fatal("a columnarized segment publishes no read-path columnar block")
+	}
+	if cs.schema() == nil || len(cs.blocks) == 0 {
+		t.Fatal("the published block carries no schema or no blocks")
+	}
+	// And the sidecar is not asked for a duplicate.
+	if blob := c.colBlobForSeg(dst); blob != nil {
+		t.Errorf("the sidecar would still store %d bytes for a columnarized segment", len(blob))
+	}
+	// Every record still reassembles.
+	checked := 0
+	for off := 0; off < dst.used; {
+		o := uint32(off)
+		rl := recTotalLen(dst.data, o)
+		if rl == 0 {
+			break
+		}
+		off += int(rl)
+		if recIsMarker(dst.data, o) {
+			continue
+		}
+		if _, err := c.recordWire(dst, o, nil); err != nil {
+			t.Fatalf("record %d: %v", o, err)
+		}
+		checked++
+	}
+	if checked == 0 {
+		t.Fatal("no records checked")
+	}
+	t.Logf("%d records reassemble; block published from the segment, sidecar copy suppressed", checked)
 }

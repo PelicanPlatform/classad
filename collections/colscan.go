@@ -336,6 +336,11 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 // collection, since EnableSchemaScan refuses those (a columnar block would store values in the
 // clear). Written at seal (sealSegmentIndex) and rebuilt on reindex (reindexSealedFile).
 func (c *Collection) colBlobForSeg(seg *segment) []byte {
+	if colNativeBlobRedundant(seg) {
+		// The segment carries the authoritative copy; a sidecar copy would be the duplication
+		// this format exists to remove.
+		return nil
+	}
 	st := c.schemaScan.Load()
 	if st == nil {
 		return nil
