@@ -89,6 +89,16 @@ func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([
 	if err != nil {
 		return nil, false
 	}
+	if c.sealer != nil {
+		// Re-seal. This decodes with the collection's key, so without sealing on the way back out the
+		// canonicalized record carries the secret IN THE CLEAR -- and this function feeds both the
+		// adschema sample set and the columnar block build, so the plaintext ended up in the derived
+		// schema (a sealed ClaimId reappeared as a string FIELD) and in the .idx sidecar on disk.
+		//
+		// encodeInterned, ten lines below, is the same re-encode done correctly; this one simply did not
+		// pass the sealer.
+		return wire.EncodeWithHotEnc(dst[:0], ad, c.intern, nil, c.shouldEncrypt, c.sealer), true
+	}
 	return wire.Encode(dst[:0], ad, c.intern), true
 }
 

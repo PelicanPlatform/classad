@@ -409,13 +409,12 @@ func (tx *Txn) Put(key []byte, ad *classad.ClassAd) {
 // the write is buffered, conflict-checked against the same snapshot, and committed
 // identically; only the encoding path differs.
 //
-// It reports whether the fast path was taken. False means the caller should parse the
-// text and use Put: an encrypted collection stores sealed values, and the streaming
-// encoder does not seal.
+// It reports whether the fast path was taken. False means the caller should parse the text and use Put.
+//
+// An encrypted collection no longer refuses this path wholesale. The streaming encoder cannot seal, so
+// encodeOld defers to the sealing path for an ad that HAS something to seal, and streams the rest -- which
+// for job and history ads is nearly all of them. Refusing wholesale made encryption cost every ingest.
 func (tx *Txn) PutOld(key []byte, text string) bool {
-	if tx.c.EncryptionEnabled() {
-		return false
-	}
 	enc := tx.c.newStreamEncoder()
 	seen := make(map[uint32]struct{}, 64)
 	var unesc []byte

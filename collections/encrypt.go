@@ -91,6 +91,24 @@ func (c *Collection) shouldEncrypt(name string) bool {
 	return false
 }
 
+// anySealedAttr reports whether any of the interned attribute ids this collection just streamed names an
+// attribute it would seal. Used to defer a streaming ingest to the sealing path for that ad only (see
+// encodeOld); the id set is one ad's worth, and shouldEncrypt memoizes per name.
+func (c *Collection) anySealedAttr(seen map[uint32]struct{}) bool {
+	for id := range seen {
+		name, ok := c.intern.Name(id)
+		if !ok {
+			// An id whose name will not resolve cannot be checked, so it is treated as sealable: a
+			// wrong guess here stores a secret in the clear.
+			return true
+		}
+		if c.shouldEncrypt(name) {
+			return true
+		}
+	}
+	return false
+}
+
 // attrIsPrivate reports whether name is an HTCondor private attribute, memoizing the
 // (immutable) answer so classad.IsPrivateAttribute is called once per distinct name.
 func (c *Collection) attrIsPrivate(name string) bool {
