@@ -80,6 +80,17 @@ func countsOf(gs []GroupStats, ok bool) ([]GroupCount, bool) {
 	return out, true
 }
 
+// GroupStatsConstraint parses a constraint string and, if the shape is columnar-eligible, answers the
+// per-group record count plus a NumStats per aggAttr over the matching records (see GroupStatsQuery).
+// ok=false ⇒ use the normal grouping path.
+func (c *Collection) GroupStatsConstraint(constraint, groupAttr string, aggAttrs []string) ([]GroupStats, bool) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, false
+	}
+	return c.GroupStatsQuery(q, groupAttr, aggAttrs)
+}
+
 // GroupStatsQuery answers `SELECT groupAttr, COUNT(*), <aggregates over aggAttrs> ... WHERE q GROUP BY
 // groupAttr` from the columnar blocks, returning the groups sorted by value. Each group carries a
 // NumStats per aggAttr, from which the caller renders MIN/MAX/SUM/AVG/COUNT(attr) -- the same inputs
