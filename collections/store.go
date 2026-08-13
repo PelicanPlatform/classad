@@ -125,6 +125,17 @@ type Options struct {
 	// flushed page cache -- the same failure a retrain caused when it resealed a whole archive.
 	// Each segment is rewritten at most once, so a bounded budget still converges.
 	ColumnarSegmentBudget int
+	// RowGroupBytes is the uncompressed record-bytes budget for one columnar row group. 0 uses
+	// colGroupTargetBytes (128 KiB).
+	//
+	// This is the knob that decides how much of a segment has to be decompressed to read a single
+	// record, against how far compression can see across records -- larger groups compress better and
+	// cost more per point lookup. The default is measured (see colGroupTargetBytes); it is exposed
+	// because the right point depends on the read mix and on how much of the working set fits the
+	// block cache, which a large production table is the only honest place to find out.
+	//
+	// The row cap and the 8-row group alignment are deliberately not configurable.
+	RowGroupBytes int
 	// GroupStabilityRuns is how many consecutive derivations a group's members must have
 	// co-occurred in before its blocks are built. 0 uses the default; 1 disables the gate.
 	GroupStabilityRuns int
@@ -324,6 +335,7 @@ type Collection struct {
 	groupStability   int            // Options.GroupStabilityRuns
 	groupJac         float64        // Options.GroupMergeJaccard
 	colBudget        int            // Options.ColumnarSegmentBudget
+	rowGroupBytes    int            // Options.RowGroupBytes
 	groupMaxPart     float64        // Options.GroupMaxPartialFrac
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
@@ -554,6 +566,7 @@ func New(opts Options) *Collection {
 		groupStability:   opts.GroupStabilityRuns,
 		groupJac:         opts.GroupMergeJaccard,
 		colBudget:        opts.ColumnarSegmentBudget,
+		rowGroupBytes:    opts.RowGroupBytes,
 		groupMaxPart:     opts.GroupMaxPartialFrac,
 	}
 	c.codec.Store(&codecHolder{codec})

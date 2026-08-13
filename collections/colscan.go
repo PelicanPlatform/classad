@@ -341,7 +341,7 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 		groups = st.groups
 	}
 	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.codec,
-		c.regionCodec(), s, hot, groups, defaultColGrouping(),
+		c.regionCodec(), s, hot, groups, c.colGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
 	if len(blocks) == 0 {
 		return nil

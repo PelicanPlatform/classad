@@ -72,11 +72,24 @@ var colBlockSeq atomic.Uint64
 // scan, and compressing groups independently gives up cross-group redundancy. Both measured small --
 // the warm column above is flat, and stored size moved 0.8 points on the corpus sweep.
 const (
-	// colGroupTargetBytes is the uncompressed record-bytes budget for one row group. ~1 MiB keeps a
-	// block's decompressed regions two orders of magnitude under the 256 MiB cache budget (so
-	// hundreds cache at once and nothing is uncacheable) while staying large enough to compress
-	// well and to amortize a decompress call.
-	colGroupTargetBytes = 1 << 20
+	// colGroupTargetBytes is the DEFAULT uncompressed record-bytes budget for one row group, when
+	// Options.RowGroupBytes does not say otherwise.
+	//
+	// 128 KiB. The budget decides how much has to be decompressed to read ONE record, so it trades
+	// point-lookup cost against how far compression can see across records. Measured on real OSPool
+	// ads, storing the same leftover bytes at a range of budgets (share of what per-record
+	// compression needs, and what a cold single-record read must decompress):
+	//
+	//	 16 KiB  33.2%   20 KB / 13 us
+	//	 32 KiB  24.9%   36 KB / 22 us
+	//	128 KiB  17.7%  134 KB / 61 us
+	//	  1 MiB  14.9%    1 MB / 456 us
+	//
+	// Past 128 KiB the curve is flat -- the last 2.8 points cost seven times the lookup latency --
+	// and below it the compression loss climbs steeply. A budget rather than a row count because the
+	// same row count means wildly different region sizes on tables of different record width, which
+	// is why this stopped being colGroupRows in the first place.
+	colGroupTargetBytes = 128 << 10
 
 	// colGroupMaxRows caps rows per group regardless of size, so a table of very small ads still
 	// gets bounded blocks -- and bounded point reads -- rather than one block per segment by
@@ -114,9 +127,21 @@ type colGrouping struct {
 	maxRows     int
 }
 
-// defaultColGrouping is the production policy.
+// defaultColGrouping is the production policy when a collection has no explicit budget.
 func defaultColGrouping() colGrouping {
 	return colGrouping{targetBytes: colGroupTargetBytes, maxRows: colGroupMaxRows}
+}
+
+// colGrouping resolves the collection's row-group policy: Options.RowGroupBytes if set, else the
+// default. The row cap and the 8-row alignment are not configurable -- the cap exists so a table of
+// tiny ads still gets bounded blocks, and the alignment is what lets a column kernel run whole
+// vectors with no tail, neither of which is a tuning decision.
+func (c *Collection) colGrouping() colGrouping {
+	g := defaultColGrouping()
+	if c.rowGroupBytes > 0 {
+		g.targetBytes = c.rowGroupBytes
+	}
+	return g
 }
 
 // byRows is a pure row-count policy, for tests and benchmarks sweeping the group size.
