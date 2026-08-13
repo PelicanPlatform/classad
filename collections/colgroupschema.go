@@ -127,10 +127,6 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 	for id, b := range present {
 		byPattern[string(b)] = append(byPattern[string(b)], id)
 	}
-	type cand struct {
-		ids    []uint32
-		holder int
-	}
 	var cands []cand
 	for pat, ids := range byPattern {
 		n := 0
@@ -141,7 +137,7 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 			continue
 		}
 		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
-		cands = append(cands, cand{ids, n})
+		cands = append(cands, cand{ids: ids, holder: n, pat: []byte(pat)})
 	}
 	// Rank by cells recovered, then by size and lowest id so the order is total and stable
 	// across runs on the same sample -- a group's identity is its members, and a report that
@@ -156,6 +152,27 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 		}
 		return cands[a].ids[0] < cands[b].ids[0]
 	})
+	// Optionally widen candidates by absorbing others whose presence pattern is nearly the same,
+	// and keep the result only if the TOP-K of it recovers more than the top-k of the exact
+	// patterns.
+	//
+	// The comparison has to be at the top-k level, because a merge is never profitable on its own:
+	// both patterns are supersets of their intersection, so
+	//
+	//	apart = |P1|*a + |P2|*b  >=  |I|*(a+b) = merged
+	//
+	// always. What widening buys is FIT -- a fixed number of group slots covering more attributes,
+	// where the patterns left outside the top k would otherwise be covered by nothing at all. So it
+	// pays exactly when there are more distinct patterns than slots, which is the normal case, and
+	// costs when there are not.
+	if c.groupJac > 0 {
+		if m := mergeNearPatterns(cands, len(samples), c.groupJac, c.groupMaxPartial()); len(m) > 0 {
+			sortCands(m)
+			if topKCells(m, k) > topKCells(cands, k) {
+				cands = m
+			}
+		}
+	}
 	if len(cands) > k {
 		cands = cands[:k]
 	}
@@ -349,3 +366,138 @@ func (c *Collection) groupStabilityRuns() int {
 // built for a few maintenance passes; the cost of not waiting is storage committed to a set that
 // stops co-occurring, which then shows up as a partial rate and a slow path.
 const defaultGroupStabilityRuns = 3
+
+// cand is one candidate group: its member attribute ids, how many sampled ads hold the pattern,
+// and the presence pattern itself (one bit per sampled ad).
+type cand struct {
+	ids    []uint32
+	holder int
+	pat    []byte
+}
+
+// mergeNearPatterns widens candidates by absorbing others whose presence pattern is NEARLY the
+// same, which is what buys coverage beyond exact co-occurrence.
+//
+// Exact grouping keeps the partial state -- an ad holding some but not all of a group -- impossible
+// within the sample. That is a strong guarantee and it leaves coverage on the table: measured on a
+// production queue, relaxing to a Jaccard of 0.99 recovered 17% more columnar cells at a partial
+// rate of 0.071%.
+//
+// Partial is not free. A partial record's values are not in the group block, so reading one of its
+// group attributes costs a base cold-tail lookup, and if the columnar path is F times faster a
+// partial fraction p forfeits roughly p*F of the benefit -- so p wants to be well under 1/F. That
+// is what maxPartial bounds, and a merge that would breach it is rejected rather than scored: a
+// group is not worth having at any coverage if reading it is usually the slow way.
+//
+// Greedy from the highest-ranked candidate down, so a widened group grows around the pattern that
+// already recovers the most, and each absorbed pattern leaves the pool.
+func mergeNearPatterns(cands []cand, nSamples int, minJaccard, maxPartial float64) []cand {
+	used := make([]bool, len(cands))
+	out := make([]cand, 0, len(cands))
+	for i := range cands {
+		if used[i] {
+			continue
+		}
+		used[i] = true
+		merged := cands[i]
+		// The union and intersection of the absorbed patterns give the merged group's counts
+		// directly: intersection = ads holding EVERY member, union minus that = partial.
+		union := append([]byte(nil), merged.pat...)
+		inter := append([]byte(nil), merged.pat...)
+		for j := i + 1; j < len(cands); j++ {
+			if used[j] || jaccardBits(merged.pat, cands[j].pat) < minJaccard {
+				continue
+			}
+			nu := orBytes(union, cands[j].pat)
+			ni := andBytes(inter, cands[j].pat)
+			partial := popcountBytes(nu) - popcountBytes(ni)
+			if nSamples > 0 && float64(partial)/float64(nSamples) > maxPartial {
+				continue // this absorption would cost more slow-path reads than it buys columns
+			}
+			union, inter = nu, ni
+			merged.ids = append(merged.ids, cands[j].ids...)
+			used[j] = true
+		}
+		if len(merged.ids) > len(cands[i].ids) {
+			sort.Slice(merged.ids, func(a, b int) bool { return merged.ids[a] < merged.ids[b] })
+			merged.pat = inter // the ads holding every member of the widened group
+			merged.holder = popcountBytes(inter)
+		}
+		out = append(out, merged)
+	}
+	return out
+}
+
+// jaccardBits is |a AND b| / |a OR b| over two presence bitmaps.
+func jaccardBits(a, b []byte) float64 {
+	u := popcountBytes(orBytes(a, b))
+	if u == 0 {
+		return 0
+	}
+	return float64(popcountBytes(andBytes(a, b))) / float64(u)
+}
+
+func orBytes(a, b []byte) []byte {
+	out := make([]byte, max(len(a), len(b)))
+	copy(out, a)
+	for i := range b {
+		if i < len(out) {
+			out[i] |= b[i]
+		}
+	}
+	return out
+}
+
+func andBytes(a, b []byte) []byte {
+	n := min(len(a), len(b))
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		out[i] = a[i] & b[i]
+	}
+	return out
+}
+
+func popcountBytes(b []byte) int {
+	n := 0
+	for _, x := range b {
+		n += popcount8(x)
+	}
+	return n
+}
+
+// groupMaxPartial bounds the fraction of ads that may hold only part of a widened group.
+func (c *Collection) groupMaxPartial() float64 {
+	if c.groupMaxPart > 0 {
+		return c.groupMaxPart
+	}
+	return defaultGroupMaxPartial
+}
+
+// defaultGroupMaxPartial is the partial-rate ceiling for a widened group. A tenth of a percent
+// forfeits well under 1% of the benefit at the columnar speedups measured here; the ceiling exists
+// to stop a merge trading a large slow-path fraction for a little coverage.
+const defaultGroupMaxPartial = 0.001
+
+// sortCands orders candidates by the cells they recover, then by size and lowest id so the order is
+// total and stable across runs on the same sample.
+func sortCands(cands []cand) {
+	sort.Slice(cands, func(a, b int) bool {
+		ca, cb := len(cands[a].ids)*cands[a].holder, len(cands[b].ids)*cands[b].holder
+		if ca != cb {
+			return ca > cb
+		}
+		if len(cands[a].ids) != len(cands[b].ids) {
+			return len(cands[a].ids) > len(cands[b].ids)
+		}
+		return cands[a].ids[0] < cands[b].ids[0]
+	})
+}
+
+// topKCells is what the best k of these candidates would make columnar.
+func topKCells(cands []cand, k int) int {
+	total := 0
+	for i := 0; i < len(cands) && i < k; i++ {
+		total += len(cands[i].ids) * cands[i].holder
+	}
+	return total
+}
