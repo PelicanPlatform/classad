@@ -245,11 +245,30 @@ func TestPutOldDeclinesWhereItCannotBeFaithful(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer enc.Close()
+	// This used to assert that PutOld DECLINES on an encrypted collection, because the streaming encoder
+	// cannot seal. That was a statement about the implementation, and it stopped being true: encodeOld
+	// now defers to the sealing path for an ad that has something to seal, and streams the rest. Refusing
+	// wholesale made encryption cost every ingest.
+	//
+	// What matters is the contract, so that is what is asserted: however the ad is encoded, the value
+	// round-trips and nothing is stored in the clear. TestStreamingIngestSealsPerAd covers the on-disk
+	// half; here it is faithfulness.
 	etx := enc.Begin()
-	if etx.PutOld([]byte("k1"), "ClaimId = \"secret\"\nOwner = \"alice\"") {
-		t.Error("PutOld accepted an encrypted collection; the streaming encoder cannot seal")
+	const secret = "secret-capability-value"
+	if !etx.PutOld([]byte("k1"), "ClaimId = \""+secret+"\"\nOwner = \"alice\"") {
+		t.Error("PutOld declined an ad it can store by deferring to the sealing path")
 	}
 	etx.Commit()
+	got, ok := enc.Get([]byte("k1"))
+	if !ok {
+		t.Fatal("the ad was not stored")
+	}
+	if v, err := got.EvaluateAttr("ClaimId").StringValue(); err != nil || v != secret {
+		t.Errorf("ClaimId round-tripped as (%q, %v), want %q", v, err, secret)
+	}
+	if v, err := got.EvaluateAttr("Owner").StringValue(); err != nil || v != "alice" {
+		t.Errorf("Owner round-tripped as (%q, %v), want alice", v, err)
+	}
 }
 
 // TestPutOldDuplicateAttributeDefers covers the shape the streaming encoder hands back to

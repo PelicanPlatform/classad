@@ -192,13 +192,16 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 // installSchemaScan publishes the schema state without covering any segment, so a caller can
 // columnarize first and let coverSealedSegments skip whatever no longer needs a sidecar block.
 // Reports false if the collection cannot take a columnar accelerator at all.
+//
+// Encryption is not a reason to refuse. A SEALED value is not a literal, so it is never a schema field
+// and never becomes a column -- it stays in the record in its sealed form. That holds only because
+// recordToInternedDict re-seals when canonicalizing; while it did not, a sealed attribute reappeared as a
+// plaintext string field and its value was written to disk. See
+// TestAcceleratorOverEncryptedStoresNoPlaintext, which scans every file rather than trusting the argument.
+//
+// The cost is per ATTRIBUTE, which is the intended trade: a private attribute is excluded from the
+// columns and so is slow, while every other attribute keeps the accelerator.
 func (c *Collection) installSchemaScan(s *adSchema, hot []int) bool {
-	if c.sealer != nil {
-		// A columnar block stores attribute values in the clear; over an encryption-at-rest
-		// collection it would materialize sealed values as plaintext on disk. The two are
-		// mutually exclusive -- an encrypted collection always takes the row path.
-		return false
-	}
 	st := c.schemaScan.Load()
 	if st == nil || st.schema != s {
 		bc, err := newBlockCache(256 << 20) // ~256 MiB of decompressed blocks
@@ -458,9 +461,7 @@ func (c *Collection) adoptPersistedSchemaScan() {
 // scan over the sealed segments. Returns false if there is nothing to sample. Re-callable to
 // pick up newly-sealed segments (existing blocks are kept).
 func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
-	if c.sealer != nil {
-		return false // see EnableSchemaScan: incompatible with encryption at rest
-	}
+	// Encryption is no longer exclusive with the accelerator; see EnableSchemaScan.
 	// Already enabled: keep the stable schema and hot set chosen at first enable, and just
 	// extend coverage to any segments sealed since (their blocks are built against this same
 	// schema, so nothing is orphaned). Rebuilding a fresh schema here would give every new

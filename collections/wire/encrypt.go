@@ -12,6 +12,9 @@ import (
 // data-encryption key; the wire layer stays crypto-agnostic. Seal returns a fresh
 // nonce and ciphertext; Open reverses it and authenticates (errors on tampering or a
 // wrong key). It is used from a single goroutine per encode/decode pass.
+// Implementations must be safe for concurrent use: both the parallel query scan and the parallel wire
+// scan open sealed values from several goroutines at once, and nothing serializes them. The built-in
+// dataKeySealer satisfies this by holding only an immutable key and building a fresh GCM per call.
 type Sealer interface {
 	Seal(plaintext []byte) (nonce, ciphertext []byte, err error)
 	Open(nonce, ciphertext []byte) (plaintext []byte, err error)
@@ -83,7 +86,18 @@ func DecodeNodeInlineEnc(node []byte, open Sealer) (ast.Expr, error) {
 // A nil open leaves encrypted attributes opaque and DecodeInline errors on them --
 // use DecodeInlineEnc only on the DAEMON read path that holds the key.
 func DecodeInlineEnc(b []byte, open Sealer) (*ast.ClassAd, error) {
-	d := &decoder{b: b, open: open}
+	return decodeInlineEnc(b, open, false)
+}
+
+// DecodeInlineRedact is DecodeInlineEnc with no key that substitutes undefined for a sealed attribute
+// instead of failing the ad -- the inline-names counterpart of DecodeResolveEncRedact, for a reader that
+// is not entitled to sealed values.
+func DecodeInlineRedact(b []byte) (*ast.ClassAd, error) {
+	return decodeInlineEnc(b, nil, true)
+}
+
+func decodeInlineEnc(b []byte, open Sealer, redactSealed bool) (*ast.ClassAd, error) {
+	d := &decoder{b: b, open: open, redactSealed: redactSealed}
 	flags, err := d.headerFlags()
 	if err != nil {
 		return nil, err

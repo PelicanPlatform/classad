@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"fmt"
 	"math"
 	"strconv"
 
@@ -42,6 +43,24 @@ func AppendNodeTextOld(dst, node []byte, t *InternTable) ([]byte, error) {
 // AppendNodeTextOld for why the dialect has to be chosen explicitly.
 func AppendNodeTextInlineOld(dst, node []byte) ([]byte, error) {
 	d := &decoder{b: node, inline: true, oldStrings: true}
+	return d.appendNode(dst, 0)
+}
+
+// AppendNodeTextInlineOldEnc is AppendNodeTextInlineOld for wire that may carry SEALED values.
+//
+// open renders the real value; a nil open with redactSealed renders `undefined` instead -- by node, so it
+// covers any sealed attribute rather than only the ones a private-name list knows about. A nil open
+// without redactSealed keeps the old behaviour and errors, which a caller must want deliberately: every
+// raw caller treats a render error as "skip this ad".
+func AppendNodeTextInlineOldEnc(dst, node []byte, open Sealer, redactSealed bool) ([]byte, error) {
+	d := &decoder{b: node, inline: true, oldStrings: true, open: open, redactSealed: redactSealed}
+	return d.appendNode(dst, 0)
+}
+
+// AppendNodeTextOldEnc is AppendNodeTextOld for wire that may carry sealed values; see
+// AppendNodeTextInlineOldEnc.
+func AppendNodeTextOldEnc(dst, node []byte, t *InternTable, open Sealer, redactSealed bool) ([]byte, error) {
+	d := &decoder{b: node, resolve: t.Name, oldStrings: true, open: open, redactSealed: redactSealed}
 	return d.appendNode(dst, 0)
 }
 
@@ -233,6 +252,36 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 		// ast.ParenExpr.String is transparent (the debug unparser re-parenthesizes
 		// operators itself), so render only the inner node.
 		return d.appendNode(dst, depth+1)
+	case nEncrypted:
+		// A sealed value. The renderers used to have no arm for this at all, so it fell to
+		// ErrMalformed below -- and every caller treats a render error as "undecodable ad, skip it".
+		// A privileged raw read of an encrypted collection therefore returned NOTHING, silently.
+		nonce, err := d.readStringBytes()
+		if err != nil {
+			return dst, err
+		}
+		ct, err := d.readStringBytes()
+		if err != nil {
+			return dst, err
+		}
+		if d.open == nil {
+			if d.redactSealed {
+				// Not entitled to this value: render it as an absent one. By NODE, so it holds for
+				// any sealed attribute -- not only the ones a private-NAME list happens to know.
+				return append(dst, "undefined"...), nil
+			}
+			return dst, fmt.Errorf("%w: %w", ErrMalformed, ErrSealed)
+		}
+		pt, err := d.open.Open(nonce, ct)
+		if err != nil {
+			if d.redactSealed {
+				return append(dst, "undefined"...), nil
+			}
+			return dst, fmt.Errorf("%w: opening sealed value: %w", ErrMalformed, err)
+		}
+		sub := &decoder{b: pt, inline: d.inline, resolve: d.resolve, open: d.open,
+			redactSealed: d.redactSealed, oldStrings: d.oldStrings}
+		return sub.appendNode(dst, depth+1)
 	default:
 		return dst, ErrMalformed
 	}

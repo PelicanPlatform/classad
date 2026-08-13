@@ -191,7 +191,14 @@ func (c *Collection) newRawProjector(projection []string, chaseRefs, redact bool
 
 func (c *Collection) yieldRawProjected(yield func(RawAd) bool, p *rawProjector) scanEmit {
 	return func(w []byte, dict *segDictHandle) bool {
-		w = c.wireToInline(dict, w) // interned segment -> inline for the mode-aware projector
+		// A redacted projection holds no key, so an interned segment's sealed values become undefined
+		// as it is de-interned; a privileged one keeps them sealed here and the renderer below opens
+		// them with the key.
+		if p.redact {
+			w = c.wireToInlineNoKey(dict, w)
+		} else {
+			w = c.wireToInline(dict, w)
+		}
 		ra, ok := p.render(w)
 		if !ok {
 			return true // inline-name or undecodable record: skip, keep scanning
@@ -262,7 +269,7 @@ func (p *rawProjector) render(w []byte) (RawAd, bool) {
 		p.buf = append(p.buf, name...)
 		p.buf = append(p.buf, ' ', '=', ' ')
 		var aerr error
-		p.buf, aerr = appendWireValue(p.buf, node, intern)
+		p.buf, aerr = appendWireValueEnc(p.buf, node, intern, p.c.renderKey(p.redact), p.redact)
 		if aerr != nil {
 			good = false
 			return false
@@ -434,7 +441,7 @@ func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 		p.buf = append(p.buf, name...)
 		p.buf = append(p.buf, ' ', '=', ' ')
 		var aerr error
-		p.buf, aerr = wire.AppendNodeTextInlineOld(p.buf, node)
+		p.buf, aerr = wire.AppendNodeTextInlineOldEnc(p.buf, node, p.c.renderKey(p.redact), p.redact)
 		if aerr != nil {
 			good = false
 			return false

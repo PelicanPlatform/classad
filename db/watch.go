@@ -49,7 +49,22 @@ type WatchEvent struct {
 func (db *DB) WatchCursor() ([]byte, error) { return db.c.WatchCursor() }
 
 func (db *DB) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
-	seq, err := db.c.Watch(ctx, cursor)
+	return db.watchAs(ctx, cursor, false)
+}
+
+// WatchRedacted is Watch for a watcher NOT entitled to sealed values: each event's ad is decoded with no
+// key, so a sealed attribute arrives undefined. A watch has the longest exposure of any read path -- it
+// streams ads continuously. See collections.Collection.WatchRedacted.
+func (db *DB) WatchRedacted(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
+	return db.watchAs(ctx, cursor, true)
+}
+
+func (db *DB) watchAs(ctx context.Context, cursor []byte, redact bool) (iter.Seq[WatchEvent], error) {
+	watch := db.c.Watch
+	if redact {
+		watch = db.c.WatchRedacted
+	}
+	seq, err := watch(ctx, cursor)
 	if err != nil {
 		return nil, err
 	}

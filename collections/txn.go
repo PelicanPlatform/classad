@@ -265,6 +265,11 @@ type Txn struct {
 	snap    map[int]uint64     // shard index -> snapshot seq, captured lazily on first touch
 	writes  map[string]*txnBuf // buffered writes by key (last write wins within the txn)
 	durable bool               // Commit runs the durability sync (default true)
+	// redact is this transaction's entitlement to sealed values: a redacted transaction reads with no
+	// key, so a sealed attribute comes back undefined (see Collection.QueryRedacted). Set once at Begin
+	// and never changed, so every read through the transaction inherits it -- a per-read flag would let
+	// one call site forget.
+	redact bool
 }
 
 type txnBuf struct {
@@ -317,6 +322,18 @@ func (r CommitResult) Conflicted() bool { return len(r.Conflicts) > 0 }
 // first time the transaction reads or writes a key in that shard.
 func (c *Collection) Begin() *Txn {
 	return &Txn{c: c, snap: map[int]uint64{}, writes: map[string]*txnBuf{}, durable: true}
+}
+
+// BeginRedacted is Begin for a caller NOT entitled to sealed values: reads through the transaction decode
+// with no key, so a sealed attribute comes back undefined. Writes are unaffected -- a redacted transaction
+// can still store an ad, and encodeAd seals what the collection's policy says to seal.
+//
+// The entitlement lives on the transaction rather than on each read, so a new read method inherits it
+// instead of having to remember it.
+func (c *Collection) BeginRedacted() *Txn {
+	t := c.Begin()
+	t.redact = true
+	return t
 }
 
 // SetDurable controls whether Commit runs the durability sync (default true). A
@@ -373,7 +390,7 @@ func (tx *Txn) getOwn(key []byte) (*classad.ClassAd, bool) {
 	if !ok {
 		return nil, false
 	}
-	ad, err := tx.c.decodeAdDict(dict, stored, codec)
+	ad, err := tx.c.decodeAdDictAs(dict, stored, codec, tx.redact)
 	if err != nil {
 		return nil, false
 	}
@@ -392,13 +409,12 @@ func (tx *Txn) Put(key []byte, ad *classad.ClassAd) {
 // the write is buffered, conflict-checked against the same snapshot, and committed
 // identically; only the encoding path differs.
 //
-// It reports whether the fast path was taken. False means the caller should parse the
-// text and use Put: an encrypted collection stores sealed values, and the streaming
-// encoder does not seal.
+// It reports whether the fast path was taken. False means the caller should parse the text and use Put.
+//
+// An encrypted collection no longer refuses this path wholesale. The streaming encoder cannot seal, so
+// encodeOld defers to the sealing path for an ad that HAS something to seal, and streams the rest -- which
+// for job and history ads is nearly all of them. Refusing wholesale made encryption cost every ingest.
 func (tx *Txn) PutOld(key []byte, text string) bool {
-	if tx.c.EncryptionEnabled() {
-		return false
-	}
 	enc := tx.c.newStreamEncoder()
 	seen := make(map[uint32]struct{}, 64)
 	var unesc []byte

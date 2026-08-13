@@ -89,6 +89,16 @@ func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([
 	if err != nil {
 		return nil, false
 	}
+	if c.sealer != nil {
+		// Re-seal. This decodes with the collection's key, so without sealing on the way back out the
+		// canonicalized record carries the secret IN THE CLEAR -- and this function feeds both the
+		// adschema sample set and the columnar block build, so the plaintext ended up in the derived
+		// schema (a sealed ClaimId reappeared as a string FIELD) and in the .idx sidecar on disk.
+		//
+		// encodeInterned, ten lines below, is the same re-encode done correctly; this one simply did not
+		// pass the sealer.
+		return wire.EncodeWithHotEnc(dst[:0], ad, c.intern, nil, c.shouldEncrypt, c.sealer), true
+	}
 	return wire.Encode(dst[:0], ad, c.intern), true
 }
 
@@ -102,6 +112,25 @@ func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([
 // the segment's dict (segment.dict.Load()) from the visibility window. An interned segment of
 // an encryption-at-rest collection carries SEALED value nodes, so the resolver paths pass the
 // collection's sealer to open them (nil for a plaintext collection -- opens nothing).
+
+// decodeWireDictAs is decodeWireDict for a read that may not be entitled to sealed values: with
+// redact=true it decodes with NO key, so a sealed attribute becomes undefined instead of being opened.
+// See QueryRedacted for why an unentitled read must not be able to obtain the value at all.
+func (c *Collection) decodeWireDictAs(dict *segDictHandle, w []byte, redact bool) (*ast.ClassAd, error) {
+	if !redact {
+		return c.decodeWireDict(dict, w)
+	}
+	if dict != nil {
+		return wire.DecodeResolveEncRedact(w, dict.resolve, nil)
+	}
+	// dict == nil means one of two encodings, and getting this wrong breaks every read rather than
+	// leaking: an INLINE (persistent) ad carries its own names, while an in-memory collection's ad is
+	// interned against the collection-wide table. Mirror decodeWire's split.
+	if c.inline {
+		return wire.DecodeInlineRedact(w)
+	}
+	return wire.DecodeResolveEncRedact(w, c.intern.Name, nil)
+}
 
 func (c *Collection) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error) {
 	if dict != nil {
@@ -143,6 +172,31 @@ func (c *Collection) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr,
 
 // decodeAdDict is decodeAd (decompress + decode to a ClassAd) that resolves an interned
 // segment's ids via its dict. dict==nil => the existing decodeAd path (inline/global).
+// decodeAdAs is decodeAd for a read that may not be entitled to sealed values; see decodeWireDictAs.
+func (c *Collection) decodeAdAs(stored []byte, codec Codec, redact bool) (*classad.ClassAd, error) {
+	if !redact {
+		return c.decodeAd(stored, codec)
+	}
+	return c.decodeAdDictAs(nil, stored, codec, true)
+}
+
+// decodeAdDictAs is decodeAdDict for a read that may not be entitled to sealed values; see
+// decodeWireDictAs.
+func (c *Collection) decodeAdDictAs(dict *segDictHandle, stored []byte, codec Codec, redact bool) (*classad.ClassAd, error) {
+	if !redact {
+		return c.decodeAdDict(dict, stored, codec)
+	}
+	dec, err := codec.Decompress(nil, stored)
+	if err != nil {
+		return nil, err
+	}
+	a, err := c.decodeWireDictAs(dict, dec, true)
+	if err != nil {
+		return nil, err
+	}
+	return classad.FromAST(a), nil
+}
+
 func (c *Collection) decodeAdDict(dict *segDictHandle, stored []byte, codec Codec) (*classad.ClassAd, error) {
 	if dict == nil {
 		return c.decodeAd(stored, codec)
@@ -174,6 +228,37 @@ func (c *Collection) wireToInline(dict *segDictHandle, w []byte) []byte {
 		// Re-seal on the way to inline so the sample never carries plaintext values (which would
 		// leak into a retrained dict or a columnar block); matches the active segment's form.
 		return wire.EncodeInlineWithHotEnc(nil, a, nil, c.shouldEncrypt, c.sealer)
+	}
+	return wire.EncodeInline(nil, a)
+}
+
+// renderKey is the key a render path is entitled to: none for a redacted read, the collection's for a
+// privileged one. Passing it to the renderer -- rather than opening the whole ad first -- is what makes an
+// unentitled read unable to produce a secret at all, instead of producing one and filtering it by name.
+func (c *Collection) renderKey(redact bool) wire.Sealer {
+	if redact {
+		return nil
+	}
+	return c.sealer
+}
+
+// wireToInlineNoKey is wireToInline for a read that is NOT entitled to sealed values: it decodes with no
+// key at all, so a sealed value becomes undefined (see wire.DecodeResolveEncRedact) and no plaintext
+// secret is ever materialized.
+//
+// wireToInline opens every sealed value with the collection's key and immediately re-seals it, which is
+// right for a rewrite but wrong for serving an unentitled reader: the secret was decrypted in process and
+// then filtered out by NAME afterwards. Filtering is a deny-list; not holding the key is not.
+//
+// Nothing is re-sealed here because nothing sealed survives the decode, so the inline form carries
+// undefined where the secret was.
+func (c *Collection) wireToInlineNoKey(dict *segDictHandle, w []byte) []byte {
+	if dict == nil {
+		return w
+	}
+	a, err := wire.DecodeResolveEncRedact(w, dict.resolve, nil)
+	if err != nil {
+		return w
 	}
 	return wire.EncodeInline(nil, a)
 }

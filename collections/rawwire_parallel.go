@@ -35,14 +35,16 @@ const wirePrefixBytes = 3 << 10
 // the scan's dominant cost and is embarrassingly parallel across segments.
 // Rows arrive at yield in arbitrary order (queries do not order rows).
 //
-// Returns false without consuming the yield when parallelism is not engaged --
-// too little work, no budget, or an at-rest-encrypted collection (the Sealer
-// contract is single-goroutine per pass, so encrypted stores stay serial) --
-// and the caller runs the serial path.
+// Returns false without consuming the yield when parallelism is not engaged -- too little work or no
+// budget -- and the caller runs the serial path.
+//
+// An encrypted collection used to be excluded here too, on the grounds that the Sealer contract is
+// single-goroutine per pass. That is not the contract wire.Sealer states, and it is not what the code
+// does: the parallel QUERY path already opens sealed values from its workers (parallel_scan.go), and the
+// only implementation, dataKeySealer, builds a fresh GCM per call over an immutable key with a
+// crypto/rand nonce -- no shared mutable state. Excluding encrypted stores cost them parallel wire scans
+// for a constraint that was never true.
 func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yield func([]byte) bool) bool {
-	if c.sealer != nil {
-		return false
-	}
 	tasks, totalBytes, release := c.gatherTasks()
 	W := 0
 	if c.qsem != nil && len(tasks) >= 2 && totalBytes >= c.parallelMinBytes {

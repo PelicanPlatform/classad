@@ -131,9 +131,7 @@ func (c *Collection) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) {
 // without that it would keep every old block and the new schema would match none of them.
 // Queries during the rebuild take the row path, which is correct but slower.
 func (c *Collection) ReschemaScan(sampleMax, hotTopN int) bool {
-	if c.sealer != nil {
-		return false // see EnableSchemaScan: incompatible with encryption at rest
-	}
+	// Encryption is no longer exclusive with the accelerator; see EnableSchemaScan.
 	s, hot, ok := c.deriveSchema(sampleMax, hotTopN)
 	if !ok {
 		return false

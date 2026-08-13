@@ -104,6 +104,8 @@ func (c *Collection) yieldRaw(yield func(RawAd) bool, redact bool) scanEmit {
 	var offs []int
 	var exprs [][]byte
 	return func(w []byte, dict *segDictHandle) bool {
+		// A redacted read holds no key: sealed values decode to undefined rather than being opened
+		// and re-sealed, so the secret is never materialized in this process at all.
 		w = c.wireToInline(dict, w) // interned segment -> inline for the mode-aware renderer
 		var mt, tt string
 		var ok bool
@@ -179,10 +181,14 @@ func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int, reda
 		buf = append(buf, name...)
 		buf = append(buf, ' ', '=', ' ')
 		var aerr error
+		// A sealed node is rendered by the RENDERER now, from the key it is handed: the privileged
+		// read passes the collection's sealer and gets the value, a redacted read passes none and gets
+		// `undefined`. Redacting by node rather than by private NAME is what makes this cover every
+		// sealed attribute instead of only the names a list knows.
 		if c.inline {
-			buf, aerr = wire.AppendNodeTextInlineOld(buf, node)
+			buf, aerr = wire.AppendNodeTextInlineOldEnc(buf, node, c.renderKey(redact), redact)
 		} else {
-			buf, aerr = appendWireValue(buf, node, c.intern)
+			buf, aerr = appendWireValueEnc(buf, node, c.intern, c.renderKey(redact), redact)
 		}
 		if aerr != nil {
 			good = false
@@ -205,6 +211,12 @@ func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int, reda
 // appendWireValue appends a wire node's canonical ClassAd value text to dst,
 // matching ast.Expr.String(). Literals are appended directly (no intermediate
 // string allocation); computed expressions decode to an ast.Expr and render.
+// appendWireValueEnc is appendWireValue for wire that may carry sealed values; see
+// wire.AppendNodeTextInlineOldEnc for what open/redactSealed mean.
+func appendWireValueEnc(dst, node []byte, table *wire.InternTable, open wire.Sealer, redactSealed bool) ([]byte, error) {
+	return wire.AppendNodeTextOldEnc(dst, node, table, open, redactSealed)
+}
+
 func appendWireValue(dst, node []byte, table *wire.InternTable) ([]byte, error) {
 	// String literals are the most common non-numeric attribute value; quote their
 	// bytes straight from the wire (no string copy) before the general literal path.

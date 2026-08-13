@@ -71,6 +71,13 @@ func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[ui
 	enc.Reset()
 	clear(seen)
 	err := encodeOldText(text, enc, seen, unesc)
+	// An ad with an attribute this collection seals takes the same fallback: the streaming encoder does
+	// not seal, so its output would store the value in the clear. Deferring PER AD rather than refusing
+	// the whole path keeps the fast path for every ad that has nothing to seal -- which for job and
+	// history ads is nearly all of them -- instead of making encryption cost every ingest.
+	if err == nil && c.sealer != nil && c.anySealedAttr(seen) {
+		err = errDeferOld
+	}
 	if err == errDuplicate || err == errDeferOld {
 		ad, e := classad.ParseOld(text)
 		if e != nil {
