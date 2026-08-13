@@ -150,6 +150,10 @@ type segment struct {
 	// colNative is this segment's authoritative columnar payload when it has been columnarized
 	// (see colnative.go); nil for a whole-record segment.
 	colNative atomic.Pointer[colNative]
+	// colDamaged is set when this segment carries a columnar record that failed verification. Its
+	// records are then missing the attributes that payload held, so reads must fail rather than
+	// return short ads.
+	colDamaged atomic.Bool
 
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned

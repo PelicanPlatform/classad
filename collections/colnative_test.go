@@ -296,3 +296,83 @@ func TestColumnarizeShrinksTheSegment(t *testing.T) {
 		t.Errorf("columnarized segment is not smaller: %d -> %d", beforeUsed, dst.used)
 	}
 }
+
+// TestColumnarPayloadCorruptionFailsLoudly is the integrity contract, and it exists because this is
+// the first region of a segment that is NOT replaceable.
+//
+// Elsewhere a bad checksum is survivable: a torn record ends the durable extent, and a corrupt
+// sidecar is rebuilt from the records. Here the payload is the only copy of every schema'd
+// attribute in the segment, and the records were written without them -- so reading past a bad
+// payload would return ads missing half their content, which a caller cannot tell from ads that
+// never had it. A read error is recoverable attention; a silently short ad is not.
+func TestColumnarPayloadCorruptionFailsLoudly(t *testing.T) {
+	c, s, hot := columnarFixture(t, 2000)
+	defer c.Close()
+	sh := c.shards[0]
+	sh.mu.Lock()
+	act := sh.act
+	var src *segment
+	for _, seg := range sh.segs {
+		if seg != nil && seg != act && seg.used > 0 {
+			src = seg
+			break
+		}
+	}
+	dst := c.columnarizeSegment(sh, src, s, hot)
+	sh.mu.Unlock()
+	if src == nil || dst == nil {
+		t.Skip("nothing to columnarize")
+	}
+	defer func() {
+		dst.retire()
+		dst.reapAndHook()
+	}()
+	if !dst.columnarized() {
+		t.Fatal("not columnarized")
+	}
+	rec := firstDataRecord(dst)
+	if _, err := c.recordWire(dst, rec, nil); err != nil {
+		t.Fatalf("a healthy segment must read: %v", err)
+	}
+
+	// Flip a byte inside the columnar payload, then re-publish as a reopen would.
+	var colOff uint32
+	found := false
+	for off := 0; off < dst.used; {
+		o := uint32(off)
+		rl := recTotalLen(dst.data, o)
+		if rl == 0 {
+			break
+		}
+		if recIsCol(dst.data, o) {
+			colOff, found = o, true
+			break
+		}
+		off += int(rl)
+	}
+	if !found {
+		t.Fatal("no columnar record")
+	}
+	payload := recAd(dst.data, colOff)
+	if len(payload) == 0 {
+		t.Fatal("empty payload")
+	}
+	payload[len(payload)/2] ^= 0xFF
+
+	before := ColNativeCRCFailures()
+	dst.colNative.Store(nil)
+	dst.colDamaged.Store(false)
+	publishColNative(c, dst)
+
+	if dst.columnarized() {
+		t.Error("a payload with a broken checksum was accepted")
+	}
+	if ColNativeCRCFailures() == before {
+		t.Error("the refusal was not counted")
+	}
+	// And the crucial half: reads must ERROR, not quietly return the remnant.
+	got, err := c.recordWire(dst, rec, nil)
+	if err == nil {
+		t.Fatalf("read succeeded on a damaged segment, returning %d bytes -- a short ad", len(got))
+	}
+}

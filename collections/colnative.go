@@ -2,6 +2,7 @@ package collections
 
 import (
 	"errors"
+	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -65,6 +66,20 @@ func publishColNative(c *Collection, seg *segment) {
 			break
 		}
 		if recIsCol(seg.data, o) {
+			// VERIFY the payload before trusting it. Every other region of a segment is either
+			// replaceable (the sidecar rebuilds) or one record's worth of damage; these bytes are
+			// the only copy of every schema'd attribute in the segment, so a flipped bit here is a
+			// silently wrong value with nothing to fall back on.
+			//
+			// The record CRC is otherwise checked in exactly one place -- recovery's extent scan,
+			// which the recorded-extent shortcut normally skips -- so it functions as a torn-tail
+			// detector rather than an integrity check. That is fine for a row record and not fine
+			// for this one, which is why it is checked here explicitly rather than relied upon.
+			if seg.persistent && !recVerifyCRC(seg.data, o) {
+				colNativeCRCFailures.Add(1)
+				seg.colDamaged.Store(true)
+				return
+			}
 			blob := recAd(seg.data, o)
 			// The REGION codec, not the segment's record codec: a block's regions are
 			// compressed dictionary-less (see Collection.regionCodec), and decoding them with
@@ -73,7 +88,9 @@ func publishColNative(c *Collection, seg *segment) {
 				return c.intern.Intern(name)
 			})
 			if cs == nil {
-				return // unreadable: leave it unpublished, and the segment reads as whole-record
+				colNativeCRCFailures.Add(1)
+				seg.colDamaged.Store(true)
+				return
 			}
 			bc, err := newBlockCache(64 << 20)
 			if err != nil {
@@ -104,6 +121,13 @@ func (c *Collection) recordWire(seg *segment, off uint32, buf []byte) ([]byte, e
 	}
 	cn := seg.colNative.Load()
 	if cn == nil {
+		// A segment holding a columnar record whose payload could not be trusted. Its records were
+		// written WITHOUT the attributes that payload holds, so serving them would return ads
+		// missing half their content -- indistinguishable, to a caller, from ads that never had it.
+		// Fail instead: a read error is recoverable attention, a silently short ad is not.
+		if seg.colDamaged.Load() {
+			return nil, errColDamaged
+		}
 		return raw, nil
 	}
 	k, ok := cn.byOff[off]
@@ -179,6 +203,10 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 // correct fallback -- the caller must surface it.
 var errBadRemnant = errors.New("collections: columnarized record cannot be reassembled")
 
+// errColDamaged marks a segment whose columnar payload failed verification. Its records are short
+// of every attribute the payload held, so there is no partial answer worth giving.
+var errColDamaged = errors.New("collections: segment columnar payload failed verification")
+
 // blockFor maps a segment-wide record index to its block and the index within it.
 func (cn *colNative) blockFor(k int) (*columnarBlock, int) {
 	for _, b := range cn.seg.blocks {
@@ -192,3 +220,13 @@ func (cn *colNative) blockFor(k int) (*columnarBlock, int) {
 
 // columnarized reports whether the segment stores its schema'd attributes columnar.
 func (s *segment) columnarized() bool { return s != nil && s.colNative.Load() != nil }
+
+// colNativeCRCFailures counts columnar payloads refused for a bad checksum. A nonzero value means a
+// segment is missing the attributes its records no longer carry, which is data loss rather than a
+// slow path -- so it is counted rather than merely logged, and a test can hold the line that a
+// corrupt payload is refused instead of read.
+var colNativeCRCFailures atomic.Int64
+
+// ColNativeCRCFailures reports how many columnar payloads have been refused for a bad checksum
+// since the process started.
+func ColNativeCRCFailures() int64 { return colNativeCRCFailures.Load() }
