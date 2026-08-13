@@ -298,6 +298,13 @@ var colBuildStallHook func()
 // and hot tier hot (resolving an interned segment's local ids on the way). Returns nil if the
 // block cannot be built. Off the write lock (reads immutable sealed bytes).
 func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colSegment {
+	if seg.columnarized() || seg.colDamaged.Load() {
+		// The segment already holds its own columnar payload, and its records are remnants -- so
+		// building a block from them would produce a block covering only the attributes the schema
+		// does NOT carry, which is the opposite of a schema block. publishColNative installs the
+		// in-segment copy as the read-path block instead.
+		return nil
+	}
 	colSegmentBuilds.Add(1)
 	if colBuildStallHook != nil {
 		colBuildStallHook()

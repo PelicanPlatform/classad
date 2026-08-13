@@ -33,7 +33,7 @@ func (c *Collection) allBruteCount(fieldID uint32, match func(int64) bool) int {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
-			bruteNumValues(w, s0, func(a wire.Ad) ([]byte, bool) { return a.Lookup(fieldID) }, func(nv colVal) {
+			bruteNumValues(c, w, s0, func(a wire.Ad) ([]byte, bool) { return a.Lookup(fieldID) }, func(nv colVal) {
 				if match(int64(nv.f)) {
 					count++
 				}

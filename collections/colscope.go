@@ -542,7 +542,7 @@ func (c *Collection) countBlockScoped(cs *colScope, resolver func(name string, s
 
 // evalOneRecord decodes a single arena record and evaluates the query against it the ordinary way.
 func (c *Collection) evalOneRecord(w segWindow, off uint32, m *vm.Matcher) bool {
-	ww, err := w.codec.Decompress(nil, recAd(w.data, off))
+	ww, err := c.wire(recRef{w: w, off: off, dict: w.dict()}, nil)
 	if err != nil {
 		return false
 	}

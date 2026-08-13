@@ -39,7 +39,10 @@ func columnarFixture(t *testing.T, n int) (*Collection, *adSchema, []int) {
 // collection and reopen the same files.
 func columnarFixtureIn(t *testing.T, dir string, n int) (*Collection, *adSchema, []int) {
 	t.Helper()
-	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1})
+	// WatchHistory is on so the watch catch-up path is exercisable; it does not affect the
+	// storage shapes the other tests measure.
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1,
+		WatchHistory: 8192})
 	if err != nil {
 		t.Fatal(err)
 	}

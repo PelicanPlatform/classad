@@ -665,6 +665,7 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 	sh := c.shards[i]
 	_, wins := sh.snapshot()
 	defer releaseWindows(wins)
+	var wbuf []byte
 	for _, wn := range wins {
 		for off := 0; off < wn.used; {
 			o := uint32(off)
@@ -675,7 +676,15 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 			seq := recSeq(wn.data, o)
 			if seq > cursor && seq <= sReg && recSuperseded(wn.data, o) > sReg {
 				key := recKey(wn.data, o)
-				if ad, ok := c.watchAd(key, recAd(wn.data, o), wn.codec); ok {
+				// The FULL ad: a columnarized record carries only what its schema does not
+				// cover, and a watch event holding half an ad is indistinguishable from an ad
+				// whose attributes really were removed.
+				adBytes, adCodec, aok := c.adBytes(recRef{w: wn, off: o, dict: wn.dict()}, &wbuf)
+				if !aok {
+					off += int(total)
+					continue
+				}
+				if ad, ok := c.watchAd(key, adBytes, adCodec); ok {
 					if !yield(WatchEvent{Kind: WatchUpsert, Key: append([]byte(nil), key...), Ad: ad}) {
 						return false
 					}

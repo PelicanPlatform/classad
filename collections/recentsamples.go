@@ -158,7 +158,7 @@ func (sh *shard) recentRecordSamples(c *Collection, maxRecords, maxBytes, lookBa
 		sites[j], sites[n-1] = sites[n-1], sites[j]
 		s := sites[n-1]
 		w := wins[s.win]
-		ww, err := w.codec.Decompress(buf[:0], recAd(w.data, s.off))
+		ww, err := c.wire(recRef{w: w, off: s.off, dict: w.dict()}, buf)
 		if err != nil {
 			continue
 		}

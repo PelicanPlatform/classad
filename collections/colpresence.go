@@ -135,7 +135,7 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 				}
 			}
 			if idx < 0 {
-				if !brutePresence(w, s0, lookup, tally) {
+				if !brutePresence(c, w, s0, lookup, tally) {
 					releaseWindows(wins)
 					return 0, false
 				}
@@ -210,7 +210,7 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 // brutePresence is the row fallback: walk a window's visible records and classify the attribute from
 // its wire node. It reads ONE attribute per record rather than decoding the ad. Returns false if a
 // value is an expression, which the caller must answer by evaluation.
-func brutePresence(w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), tally func(bool)) bool {
+func brutePresence(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), tally func(bool)) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -219,7 +219,7 @@ func brutePresence(w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), 
 			break
 		}
 		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
-			ww, err := w.codec.Decompress(buf[:0], recAd(w.data, o))
+			ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf)
 			if err != nil {
 				return false
 			}

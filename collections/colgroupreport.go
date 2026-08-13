@@ -288,7 +288,7 @@ func (c *Collection) windowSamples(w segWindow, max int) [][]byte {
 		if recIsMarker(w.data, o) {
 			continue
 		}
-		raw, err := w.codec.Decompress(buf[:0], recAd(w.data, o))
+		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf)
 		if err != nil {
 			continue
 		}

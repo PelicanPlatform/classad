@@ -1333,7 +1333,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 		if isSystemKeyBytes(recKey(w.data, o)) {
 			return false
 		}
-		ww, err := w.codec.Decompress(dbuf[:0], recAd(w.data, o))
+		ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, dbuf)
 		if err != nil {
 			return false
 		}

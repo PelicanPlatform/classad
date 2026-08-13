@@ -156,6 +156,9 @@ func (c *Collection) upgradeCodecPass(opts UpgradeOptions) int {
 // in time and therefore similar in shape, which is the property that makes a small sample
 // informative here and would not hold across an archive.
 func (c *Collection) projectRecodeGain(src *segment, target Codec, sample int) (float64, bool) {
+	if src.columnarized() || src.colDamaged.Load() {
+		return 0, false
+	}
 	var oldBytes, newBytes int64
 	n := 0
 	var dbuf []byte
@@ -169,6 +172,9 @@ func (c *Collection) projectRecodeGain(src *segment, target Codec, sample int) (
 		if recIsMarker(src.data, o) {
 			continue
 		}
+		// Stored bytes on purpose: this estimates what RECODING the segment's records would gain,
+		// so it must weigh them as they are stored. A columnarized segment is not a recode
+		// candidate -- its records are remnants, and re-encoding them would measure the wrong thing.
 		stored := recAd(src.data, o)
 		raw, err := src.codec.Decompress(dbuf[:0], stored)
 		if err != nil {

@@ -195,7 +195,7 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 				}
 			}
 			if bidx < 0 {
-				bruteNumValues(w, s0, lookup, fn)
+				bruteNumValues(c, w, s0, lookup, fn)
 				continue
 			}
 			// Walk the segment's row groups in record order, tracking each group's base so a
@@ -238,7 +238,7 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 
 // bruteNumValues is the row-scan fallback: walk a window's visible records, read the numeric
 // field from the wire ad, and hand over each value found.
-func bruteNumValues(w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), fn func(colVal)) {
+func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), fn func(colVal)) {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -247,7 +247,7 @@ func bruteNumValues(w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool),
 			break
 		}
 		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
-			if ww, err := w.codec.Decompress(buf[:0], recAd(w.data, o)); err == nil {
+			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
 				if node, ok := lookup(wire.Ad(ww)); ok {
 					if nv, ok := nodeColVal(node); ok {

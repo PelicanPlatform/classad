@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -260,4 +261,56 @@ func TestColumnarizedShardServesIndexedQueries(t *testing.T) {
 		}
 	}
 	t.Logf("columnarized %d segments; indexes, zone pruning and Get all agree", n)
+}
+
+// TestColumnarizedShardServesWatch covers the watch catch-up path, which walks segments directly to
+// replay records a consumer has not seen. An event carrying half an ad is the worst case for a
+// consumer: a watch reports what CHANGED, so an ad missing its schema'd attributes reads as those
+// attributes having been removed -- a change that never happened, indistinguishable from one that
+// did.
+func TestColumnarizedShardServesWatch(t *testing.T) {
+	c, _, _ := columnarFixture(t, 3000)
+	defer c.Close()
+
+	catchUp := func() map[string]int {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		seq, err := c.Watch(ctx, nil) // nil cursor: replay everything the collection still holds
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]int{}
+		for ev := range seq {
+			if ev.Kind == WatchUpsert && ev.Ad != nil {
+				out[string(ev.Key)] = len(ev.Ad.AST().Attributes)
+			}
+			if len(out) >= 3000 {
+				break
+			}
+		}
+		return out
+	}
+
+	before := catchUp()
+	if len(before) == 0 {
+		t.Skip("watch catch-up produced no events")
+	}
+	if got := c.columnarizeSealed(); got == 0 {
+		t.Skip("no sealed segment was columnarized")
+	}
+	after := catchUp()
+	missing, shrunk := 0, 0
+	for k, n := range before {
+		m, ok := after[k]
+		if !ok {
+			missing++
+		} else if m != n {
+			shrunk++
+		}
+	}
+	if missing != 0 || shrunk != 0 {
+		t.Errorf("after columnarizing: %d of %d watch events missing, %d lost attributes",
+			missing, len(before), shrunk)
+	}
+	t.Logf("%d watch catch-up events carry their full ads across the transform", len(before))
 }

@@ -126,7 +126,7 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 			cs := w.seg.colblk.Load()
 			idxs, resolved := resolveFields(cs, preds)
 			if !resolved {
-				count += bruteCountMulti(w, s0, preds, lookups)
+				count += bruteCountMulti(c, w, s0, preds, lookups)
 				continue
 			}
 			base := 0
@@ -268,7 +268,7 @@ func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, kee
 
 // bruteCountMulti is the row fallback: walk a window's visible records and test the predicated
 // attributes from their wire nodes, reading only those attributes rather than decoding the ad.
-func bruteCountMulti(w segWindow, s0 uint64, preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool)) int {
+func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool)) int {
 	count := 0
 	var buf []byte
 	for off := 0; off < w.used; {
@@ -278,7 +278,7 @@ func bruteCountMulti(w segWindow, s0 uint64, preds []fieldPred, lookups []func(w
 			break
 		}
 		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
-			if ww, err := w.codec.Decompress(buf[:0], recAd(w.data, o)); err == nil {
+			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
 				ok := true
 				for i := range preds {

@@ -176,7 +176,7 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)
 			if !ok {
-				bruteStatsMulti(w, s0, aggLookup, otherPreds, lookups, selfOK, &acc)
+				bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, &acc)
 				continue
 			}
 			// Narrowing uses only the OTHER fields; pruning may use them all, since ruling a block
@@ -291,7 +291,7 @@ func resolveStatsFields(cs *colSegment, aggID uint32, preds []fieldPred) (int, [
 
 // bruteStatsMulti is the row fallback: walk a window's visible records, test the predicated
 // attributes, and accumulate the aggregated one -- reading only those attributes from the wire ad.
-func bruteStatsMulti(w segWindow, s0 uint64, aggLookup func(wire.Ad) ([]byte, bool),
+func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.Ad) ([]byte, bool),
 	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, acc *statsAccum) {
 	var buf []byte
 	for off := 0; off < w.used; {
@@ -301,7 +301,7 @@ func bruteStatsMulti(w segWindow, s0 uint64, aggLookup func(wire.Ad) ([]byte, bo
 			break
 		}
 		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
-			if ww, err := w.codec.Decompress(buf[:0], recAd(w.data, o)); err == nil {
+			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
 				ad := wire.Ad(ww)
 				match := true
