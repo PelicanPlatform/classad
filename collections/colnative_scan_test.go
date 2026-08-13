@@ -1125,3 +1125,69 @@ func TestColumnarizedGroupAttributesRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+// TestReschemaKeepsColumnarizedSegmentsReadable covers re-deriving the schema over a table whose
+// segments are columnar-native.
+//
+// ReschemaScan drops every sealed segment's columnar block so the rebuild can replace it under the new
+// schema. For a columnarized segment that block is not a rebuildable accelerator -- it is where the
+// schema'd attributes are STORED, and the records no longer carry them -- so dropping it cannot be
+// undone: the rebuild correctly refuses to build a block out of records missing the values it needs,
+// which would leave the segment with no columnar path until a reopen republished it.
+//
+// What this requires is that the ads keep reading back, and that the segments keep their columnar path
+// rather than silently degrading to reassembly for the rest of the process.
+func TestReschemaKeepsColumnarizedSegmentsReadable(t *testing.T) {
+	c := bundledGroupFixture(t, true)
+	defer c.Close()
+
+	before := readAll(t, c, "true")
+	withBlocks, columnarized := 0, 0
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			columnarized++
+			if seg.colblk.Load() != nil {
+				withBlocks++
+			}
+		}
+	}
+	if columnarized == 0 {
+		t.Skip("no sealed segment was columnarized")
+	}
+	if withBlocks != columnarized {
+		t.Fatalf("%d of %d columnarized segments had a columnar block before the reschema", withBlocks, columnarized)
+	}
+
+	if !c.ReschemaScan(4096, 8) {
+		t.Skip("reschema declined")
+	}
+
+	kept := 0
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg.columnarized() && seg.colblk.Load() != nil {
+			kept++
+		}
+	}
+	if kept != columnarized {
+		t.Errorf("after reschema %d of %d columnarized segments still have a columnar block", kept, columnarized)
+	}
+	after := readAll(t, c, "true")
+	if len(after) != len(before) {
+		t.Fatalf("after reschema: %d rows, want %d", len(after), len(before))
+	}
+	bag := map[string]int{}
+	for _, k := range before {
+		bag[k]++
+	}
+	bad := 0
+	for _, k := range after {
+		bag[k]--
+		if bag[k] < 0 {
+			bad++
+		}
+	}
+	if bad != 0 {
+		t.Errorf("%d ads differ after re-deriving the schema", bad)
+	}
+	t.Logf("%d columnarized segments kept their payload across a reschema; all %d ads intact", kept, len(after))
+}
