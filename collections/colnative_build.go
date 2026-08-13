@@ -82,6 +82,20 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		_, ok := byName[strings.ToLower(name)]
 		return ok
 	}
+	// The GROUP schemas take part too, and they have to: they are built into the same payload, and a
+	// rewrite that left them out silently retired the group accelerator for every segment it touched
+	// (measured: 0 of 9). Their attributes are not base schema fields, so without them the group
+	// columns simply do not exist and every group attribute stays in the record.
+	var groups []*colGroup
+	if st := c.schemaScan.Load(); st != nil {
+		groups = st.groups
+	}
+	// A record's group-owned attributes, captured while the block builder walks the records so the
+	// remnant pass strips exactly what the columns took. groupSkipSet admits only WHOLE membership --
+	// a record holding part of a group is not in that group's column, so its values must stay in the
+	// record, which is where the exception path already looks for them.
+	skips := make([]map[uint32]struct{}, 0, 512)
+
 	// The block sees only what the schema carries, and the remnant only what it does not. Without
 	// that split the block's COLD TAIL would hold the non-schema attributes -- which is precisely
 	// what the remnant holds -- and every such attribute would be stored twice again, which is the
@@ -92,18 +106,51 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		if !ok {
 			return nil, false
 		}
-		only, ok := keepAttrs(iw, coveredGlobal)
+		skip := groupSkipSet(groups, iw)
+		skips = append(skips, skip)
+		only, ok := keepAttrs(iw, func(id uint32, name string, node []byte) bool {
+			if coveredGlobal(id, name, node) {
+				return true
+			}
+			// A group-owned attribute, kept so the builder can put it in that group's column. It does
+			// NOT also land in the base block's cold tail: the builder skips whatever the groups own
+			// (see groupSkipSet), which is what keeps this from storing the value twice.
+			if skip == nil || !storableInColumn(node) {
+				return false
+			}
+			_, in := skip[id]
+			return in
+		})
 		return only, ok
 	}
 
 	// Pass 1: build the columnar blocks over the segment's records, exactly as the accelerator
 	// does today. This also yields the per-record arena offsets the reader maps back through.
-	blocks, _, offs := buildColumnarFromSegmentGrouped(src.data, src.used, src.codec,
-		c.regionCodec(), s, hot, nil, defaultColGrouping(), toInterned)
+	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(src.data, src.used, src.codec,
+		c.regionCodec(), s, hot, groups, defaultColGrouping(), toInterned)
 	if len(blocks) == 0 || len(offs) == 0 {
 		return nil, nil, nil
 	}
+	if len(skips) != len(offs) {
+		// The remnant pass indexes skips by record position, so the two passes must have seen the
+		// same records in the same order. Refuse rather than strip by a misaligned index, which
+		// would remove one record's attributes on the strength of another's membership.
+		return nil, nil, nil
+	}
 	cs := &colSegment{blocks: blocks, offs: offs}
+	// Re-key the pinned groups onto this segment's selections: the schema and members are shared, the
+	// per-block bitmaps are not.
+	for gi, g := range groups {
+		sel := &colGroup{schema: g.schema, ids: g.ids}
+		for bi := range blocks {
+			if gi < len(gblocks[bi]) {
+				sel.blocks = append(sel.blocks, gblocks[bi][gi])
+			}
+		}
+		if len(sel.blocks) == len(blocks) {
+			cs.groups = append(cs.groups, sel)
+		}
+	}
 	blob := marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
 	if blob == nil {
 		return nil, nil, nil
@@ -117,13 +164,31 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	rems := make([]remnant, 0, len(offs))
 	var buf []byte
 	total := 0
-	for _, o := range offs {
+	for ri, o := range offs {
 		raw, err := src.codec.Decompress(buf[:0], recAd(src.data, o))
 		if err != nil {
 			return nil, nil, nil
 		}
 		buf = raw
-		body, ok := stripSchemaAttrs(raw, covered)
+		skip := skips[ri]
+		recCovered := covered
+		if len(skip) > 0 {
+			recCovered = func(id uint32, name string, node []byte) bool {
+				if covered(id, name, node) {
+					return true
+				}
+				if !storableInColumn(node) {
+					return false
+				}
+				gid, ok := c.globalIDOf(d, id, name)
+				if !ok {
+					return false
+				}
+				_, in := skip[gid]
+				return in
+			}
+		}
+		body, ok := stripSchemaAttrs(raw, recCovered)
 		if !ok {
 			return nil, nil, nil
 		}
@@ -437,4 +502,20 @@ func (c *Collection) ColumnarizeSealed() int {
 func storableInColumn(node []byte) bool {
 	_, ok := wire.LiteralValue(node)
 	return ok
+}
+
+// globalIDOf resolves a record attribute key -- a segment-local dictionary id, or an inline name --
+// into the global intern id the schema and group schemas are keyed by.
+func (c *Collection) globalIDOf(d *segDictHandle, id uint32, name string) (uint32, bool) {
+	if name == "" {
+		if d == nil {
+			return id, true // not interned: the record already carries global ids
+		}
+		nm := d.name(id)
+		if nm == nil {
+			return 0, false
+		}
+		name = string(nm)
+	}
+	return c.intern.LookupID(name)
 }

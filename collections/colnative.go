@@ -52,6 +52,7 @@ type colNative struct {
 	// dict is the segment's attribute dictionary when its records are interned, for translating
 	// the schema's global ids into this segment's local ones.
 	dict *segDictHandle
+
 	// localOf translates the payload schema's GLOBAL intern ids into this segment's local
 	// dictionary ids, resolved once when the payload is published.
 	//
@@ -121,11 +122,21 @@ func publishColNative(c *Collection, seg *segment) {
 			cn.dict = seg.dict.Load()
 			if cn.dict != nil {
 				cn.localOf = make(map[uint32]uint32, 256)
+				schemas := make([]*adSchema, 0, len(cs.blocks)+len(cs.groups))
 				for _, b := range cs.blocks {
-					if b.schema == nil {
+					schemas = append(schemas, b.schema)
+				}
+				for _, g := range cs.groups {
+					// The group schemas too: reassembly translates their fields into the record's id
+					// space exactly as it does base fields, and doing that with a dictionary probe per
+					// field per record is the cost this cache exists to remove.
+					schemas = append(schemas, g.schema)
+				}
+				for _, sch := range schemas {
+					if sch == nil {
 						continue
 					}
-					for _, f := range b.schema.fields {
+					for _, f := range sch.fields {
 						if _, done := cn.localOf[f.id]; done {
 							continue
 						}
@@ -254,6 +265,21 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 	if bad {
 		return nil, errBadRemnant
 	}
+	// The GROUP columns. A group's attributes are not base schema fields, so the loop above does not
+	// see them, and for a record that belongs to a group WHOLLY they are not in the record either --
+	// the rewrite took them into that group's column. Without this they would be missing from the
+	// reassembled ad entirely.
+	//
+	// Only whole members. A record holding part of a group was never put in the column and kept its
+	// values in the record, so it needs nothing here; adding it would duplicate what the remnant
+	// already supplied.
+	if len(cn.seg.groups) > 0 {
+		var gerr error
+		extra, added, gerr = cn.appendGroupValues(c, extra, added, k, inline, sd, nil)
+		if gerr != nil {
+			return nil, gerr
+		}
+	}
 	out := wire.BuildAd(nil, hdr, n+added, entries)
 	return append(out, extra...), nil
 }
@@ -329,4 +355,131 @@ func putRecBuf(b []byte) {
 	}
 	b = b[:0]
 	recBufPool.Put(&b)
+}
+
+// appendGroupValues appends the group-column values of record k, for every group the record belongs
+// to wholly, in the key encoding the remnant uses.
+// want, when non-nil, restricts the output to those global intern ids, so a projected read appends
+// only the group attributes it was asked for.
+func (cn *colNative) appendGroupValues(c *Collection, dst []byte, added, k int, inline bool, sd *segDictHandle, want map[uint32]struct{}) ([]byte, int, error) {
+	gs := getGroupScopes()
+	defer putGroupScopes(gs)
+	bi, local := cn.blockIndexAndLocal(k)
+	if bi < 0 {
+		return dst, added, errBadRemnant
+	}
+	for gi, g := range cn.seg.groups {
+		if bi >= len(g.blocks) {
+			continue
+		}
+		gb := g.blocks[bi]
+		if gb == nil {
+			continue
+		}
+		idx, member := gb.index(local)
+		if !member {
+			continue // not in the column: either holds none of the group, or is an exception whose
+			// values stayed in the record
+		}
+		sub := gs.scopeFor(c, cn, gi, gb)
+		sub.k, sub.fellBack = idx, false
+		for fi := range gb.blk.schema.fields {
+			f := &gb.blk.schema.fields[fi]
+			if want != nil {
+				if _, in := want[f.id]; !in {
+					continue
+				}
+			}
+			out := f.id
+			name := ""
+			if inline {
+				nm, ok := c.intern.Name(f.id)
+				if !ok {
+					return dst, added, errBadRemnant
+				}
+				name = nm
+			}
+			if sd != nil {
+				lid, ok := cn.localOf[f.id]
+				if !ok {
+					return dst, added, errBadRemnant
+				}
+				out = lid
+			}
+			if testBit(gb.blk.escapeAt(idx), fi) {
+				node, found, err := gb.blk.escapedNode(idx, f.id, sub.bc)
+				if err != nil {
+					return dst, added, err
+				}
+				if !found {
+					continue
+				}
+				dst = wire.AppendKey(dst, inline, out, name)
+				dst = append(dst, node...)
+				added++
+				continue
+			}
+			var ok bool
+			dst = wire.AppendKey(dst, inline, out, name)
+			dst, ok = sub.appendSlotNode(dst, fi, f)
+			if !ok || sub.fellBack {
+				return dst, added, errBadRemnant
+			}
+			added++
+		}
+	}
+	return dst, added, nil
+}
+
+// groupScopes is a reusable set of per-group sub-scopes for reading group columns.
+//
+// Pooled rather than kept on the colNative, for the same reason the record buffer is: a colNative is
+// shared by every reader of its segment and the parallel scan runs several at once, so a scope hanging
+// off it would be two readers writing each other's block binding and record index -- values from the
+// wrong record, silently.
+type groupScopes struct {
+	scopes []*colScope
+}
+
+var groupScopePool = sync.Pool{New: func() any { return &groupScopes{} }}
+
+func getGroupScopes() *groupScopes { return groupScopePool.Get().(*groupScopes) }
+
+func putGroupScopes(gs *groupScopes) {
+	for _, sub := range gs.scopes {
+		if sub != nil {
+			sub.blk = nil // drop the reference so a retired block is not pinned by the pool
+		}
+	}
+	groupScopePool.Put(gs)
+}
+
+// scopeFor returns the sub-scope for group gi bound to gb's block, mirroring colScope.groupScope: a
+// group column is read through exactly the same readers as a base column rather than a parallel copy
+// that could diverge from them.
+func (gs *groupScopes) scopeFor(c *Collection, cn *colNative, gi int, gb *colGroupBlock) *colScope {
+	for len(gs.scopes) <= gi {
+		gs.scopes = append(gs.scopes, nil)
+	}
+	sub := gs.scopes[gi]
+	if sub == nil {
+		sub = &colScope{bc: cn.cache, c: c}
+		gs.scopes[gi] = sub
+	}
+	sub.bc = cn.cache
+	if sub.blk != gb.blk {
+		sub.setBlock(gb.blk)
+	}
+	return sub
+}
+
+// blockIndexAndLocal maps a segment-wide record index to its block position and index within it.
+func (cn *colNative) blockIndexAndLocal(k int) (int, int) {
+	for i, b := range cn.seg.blocks {
+		if k < b.n {
+			return i, k
+		}
+		k -= b.n
+	}
+	return -1, 0
 }

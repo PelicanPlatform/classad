@@ -3,6 +3,7 @@ package collections
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -902,6 +903,225 @@ func TestColumnarProjectedReadsMatchRowPath(t *testing.T) {
 			if bad != 0 {
 				t.Errorf("%v / %s: %d projected ads differ from the row path", proj, expr, bad)
 			}
+		}
+	}
+}
+
+// TestColumnarizedSegmentKeepsGroupColumns guards a FEATURE INTERACTION, not a format detail.
+//
+// Group schemas (secondary columnar schemas for attributes only some ads carry) and columnar-native
+// segments are both on by default, and they meet in the same place: the segment's columnar payload. If
+// the rewrite builds that payload without the group schemas, and the sidecar then declines to build a
+// block for a segment that already has one, the group accelerator silently disappears for every
+// columnarized segment -- correct answers, quietly slower, and nothing anywhere says so.
+func TestColumnarizedSegmentKeepsGroupColumns(t *testing.T) {
+	dir := t.TempDir()
+	// GroupStabilityRuns: 1 so one derivation promotes a group -- the default waits for members to
+	// keep recurring across passes, which a single-shot test cannot produce.
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16,
+		GroupSchemaCount: 4, GroupStabilityRuns: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// Two attribute bundles that travel together, which is what a group schema is for: one set on
+	// records that "ran", another on records with container metadata.
+	for i := range 4000 {
+		text := fmt.Sprintf(`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d ]`,
+			i, i%10, i%7, i%6, (i%16)*1024)
+		switch i % 3 {
+		case 0:
+			text = fmt.Sprintf(`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; RanStart=%d; RanEnd=%d; RanHost="h%d"; RanExit=%d ]`,
+				i, i%10, i%7, i%6, (i%16)*1024, i, i+10, i%50, i%3)
+		case 1:
+			text = fmt.Sprintf(`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; CtrImage="img%d"; CtrTag="t%d"; CtrDigest="d%d" ]`,
+				i, i%10, i%7, i%6, (i%16)*1024, i%20, i%5, i%100)
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RetrainDict(0)
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	st := c.schemaScan.Load()
+	if st == nil || len(st.groups) == 0 {
+		t.Skip("no group schema was derived")
+	}
+	t.Logf("%d group schemas derived", len(st.groups))
+
+	withGroups, columnarized := 0, 0
+	for _, seg := range c.shards[0].segs {
+		if seg == nil || seg == c.shards[0].act {
+			continue
+		}
+		if !seg.columnarized() {
+			continue
+		}
+		columnarized++
+		if cs := seg.colblk.Load(); cs != nil && len(cs.groups) > 0 {
+			withGroups++
+		}
+	}
+	if columnarized == 0 {
+		t.Skip("no sealed segment was columnarized")
+	}
+	if withGroups != columnarized {
+		t.Errorf("%d of %d columnarized segments carry group columns: the rewrite drops the group accelerator",
+			withGroups, columnarized)
+	}
+}
+
+// bundledGroupFixture builds ads with two attribute bundles that travel together, which is the shape a
+// group schema exists for, storing them whole-record or columnarized.
+//
+// The order is deliberate: the groups are derived from a CLEAN sample, and only then are records added
+// that carry part of a bundle. That is how partial membership actually arises -- a group is a property
+// of the sample it was derived from, and the data drifts afterwards -- and it is the case the design
+// turns on, because a partial member is not in the group's column and must keep its values in its own
+// record. Adding the deviating records up front instead gives them their own presence vector, so they
+// form a separate clean group and the partial path never runs at all (measured: zero exceptions).
+func bundledGroupFixture(t *testing.T, columnarize bool) *Collection {
+	t.Helper()
+	budget := 0
+	if !columnarize {
+		budget = -1
+	}
+	c, err := Open(Options{Dir: t.TempDir(), Shards: 1, SegmentSize: 1 << 16,
+		GroupSchemaCount: 4, GroupStabilityRuns: 1, ColumnarSegmentBudget: budget})
+	if err != nil {
+		t.Fatal(err)
+	}
+	put := func(key string, text string) {
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(key), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := func(i int) string {
+		return fmt.Sprintf(`ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d`,
+			i, i%10, i%7, i%6, (i%16)*1024)
+	}
+	for i := range 3000 {
+		switch i % 3 {
+		case 0:
+			// Every so often a group value too wide for the slot its column sizes, so the group's
+			// ESCAPE path runs -- the value goes to the block's cold tail rather than the column, and
+			// reassembly has to read it from there. Without one of these that branch never executes.
+			ranEnd := fmt.Sprintf("%d", i+10)
+			if i%303 == 0 {
+				ranEnd = "9223372036854775807"
+			}
+			host := fmt.Sprintf("h%d", i%50)
+			if i%501 == 0 {
+				host = strings.Repeat("wide-host-name-", 20)
+			}
+			put(fmt.Sprintf("%d.0", i), fmt.Sprintf(`[ %s; RanStart=%d; RanEnd=%s; RanHost=%q; RanExit=%d ]`,
+				base(i), i, ranEnd, host, i%3))
+		case 1:
+			put(fmt.Sprintf("%d.0", i), fmt.Sprintf(`[ %s; CtrImage="img%d"; CtrTag="t%d"; CtrDigest="d%d" ]`,
+				base(i), i%20, i%5, i%100))
+		default:
+			put(fmt.Sprintf("%d.0", i), fmt.Sprintf(`[ %s ]`, base(i)))
+		}
+	}
+	c.RetrainDict(0)
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	// Now the drift: records holding PART of each bundle, against groups already fixed.
+	for i := 3000; i < 4200; i++ {
+		switch i % 3 {
+		case 0:
+			put(fmt.Sprintf("%d.0", i), fmt.Sprintf(`[ %s; RanStart=%d; RanHost="h%d" ]`, base(i), i, i%50))
+		case 1:
+			put(fmt.Sprintf("%d.0", i), fmt.Sprintf(`[ %s; CtrImage="img%d" ]`, base(i), i%20))
+		default:
+			put(fmt.Sprintf("%d.0", i), fmt.Sprintf(`[ %s; RanEnd=%d; RanExit=%d ]`, base(i), i+10, i%3))
+		}
+	}
+	// A second pass covers the segments that sealed since, using the SAME schema and groups.
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	return c
+}
+
+// TestColumnarizedGroupAttributesRoundTrip is the equivalence test for group columns inside the
+// segment, and it is the one that matters most: a group's attributes are REMOVED from the records of
+// every ad that belongs to the group wholly, so if reassembly does not put them back they are gone --
+// from a table whose other attributes all look right.
+//
+// The comparison is byte-sensitive and covers both whole-ad and projected reads, and the fixture
+// deliberately includes PARTIAL members, whose values stay in the record and must therefore appear
+// exactly once rather than twice or not at all.
+func TestColumnarizedGroupAttributesRoundTrip(t *testing.T) {
+	rows := bundledGroupFixture(t, false)
+	defer rows.Close()
+	cols := bundledGroupFixture(t, true)
+	defer cols.Close()
+
+	withGroups := 0
+	for _, seg := range cols.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			if cs := seg.colblk.Load(); cs != nil && len(cs.groups) > 0 {
+				withGroups++
+			}
+		}
+	}
+	if withGroups == 0 {
+		t.Skip("no columnarized segment carries group columns")
+	}
+	t.Logf("%d columnarized segments carry group columns", withGroups)
+
+	compare := func(what string, want, got []string) {
+		if len(got) != len(want) {
+			t.Errorf("%s: %d rows, want %d", what, len(got), len(want))
+			return
+		}
+		bag := map[string]int{}
+		for _, k := range want {
+			bag[k]++
+		}
+		bad := 0
+		for _, k := range got {
+			bag[k]--
+			if bag[k] < 0 {
+				bad++
+			}
+		}
+		if bad != 0 {
+			t.Errorf("%s: %d ads differ from the whole-record form", what, bad)
+		}
+	}
+	for _, expr := range []string{
+		"true",
+		"RanExit == 0",          // a group attribute in the predicate
+		"RanHost == \"h7\"",     // a group string attribute
+		"CtrTag == \"t3\"",      // the other group
+		"RanStart is undefined", // records with none of the group
+		"RanEnd is undefined",   // partial members lack this one specifically
+		"ProcId < 5",            // a base field, so group values come back via reassembly
+	} {
+		compare("full/"+expr, readAll(t, rows, expr), readAll(t, cols, expr))
+	}
+	for _, proj := range [][]string{
+		{"RanStart", "RanEnd"},
+		{"RanHost", "CtrImage"},
+		{"ClusterId", "RanExit"},
+		{"CtrImage", "CtrTag", "CtrDigest"},
+	} {
+		for _, expr := range []string{"true", "ProcId < 5"} {
+			compare(fmt.Sprintf("proj%v/%s", proj, expr),
+				readProjected(t, rows, expr, proj), readProjected(t, cols, expr, proj))
 		}
 	}
 }

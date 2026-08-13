@@ -183,6 +183,17 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 		}
 		added++
 	}
+	// The GROUP columns, restricted to the projection. A group attribute is not a base schema field,
+	// so the loop above does not reach it, and for a record belonging to its group wholly it is not in
+	// the record either -- the rewrite moved it into the group's column. Without this a projection
+	// naming a group attribute would come back empty for exactly the records that have one.
+	if len(cn.seg.groups) > 0 {
+		var gerr error
+		sc.entries, added, gerr = cn.appendGroupValues(c, sc.entries, added, k, inline, sd, p.ids)
+		if gerr != nil {
+			return nil, false
+		}
+	}
 	sc.out = wire.BuildAd(sc.out[:0], hdr, n+added, sc.entries)
 	return sc.out, true
 }
