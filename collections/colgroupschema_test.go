@@ -344,3 +344,38 @@ func TestGroupStabilityGate(t *testing.T) {
 		}
 	})
 }
+
+// TestGroupGateMatchesByOverlap: the gate accepts a group whose members keep showing up together
+// even when the exact list shifts, and rejects one that stops recurring.
+//
+// Identity matching was too strict and measurably so: across three production snapshots, 0 of 4
+// widened groups reproduced their member set exactly, so an identity gate rejected every one --
+// including a group holding 16.7% of the table's attribute occurrences.
+func TestGroupGateMatchesByOverlap(t *testing.T) {
+	hist := [][][]string{
+		{{"A", "B", "C", "D"}, {"X", "Y"}},
+		{{"A", "B", "C", "E"}, {"X", "Y"}}, // same structure, one member swapped
+	}
+	for _, tc := range []struct {
+		name string
+		cand []string
+		want bool
+	}{
+		{"identical", []string{"A", "B", "C", "D"}, true},
+		{"one member differs", []string{"A", "B", "C", "F"}, true},
+		{"half shared", []string{"A", "B", "P", "Q"}, false},
+		{"case differs", []string{"a", "b", "c", "d"}, true},
+		{"unrelated", []string{"P", "Q", "R"}, false},
+		{"present in one derivation only", []string{"X", "Y", "Z", "W", "V"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := groupRecurs(tc.cand, hist, defaultGroupRecurOverlap); got != tc.want {
+				t.Errorf("groupRecurs(%v) = %v, want %v", tc.cand, got, tc.want)
+			}
+		})
+	}
+	// No history at all means the gate is off, not that everything fails.
+	if !groupRecurs([]string{"A"}, nil, defaultGroupRecurOverlap) {
+		t.Error("an empty history must not reject; that is the gate being disabled")
+	}
+}

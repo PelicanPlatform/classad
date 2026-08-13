@@ -321,31 +321,26 @@ func (c *Collection) groupSchemasFor(s *adSchema) []*colGroup {
 	if len(samples) == 0 {
 		return nil
 	}
-	// Only groups whose members have kept co-occurring across successive derivations. A group
+	// Only groups whose members keep showing up together across successive derivations. A group
 	// derived once is a property of one sample; storage should follow evidence that it is a
-	// property of the data. See stableGroupKeys for why the gate is over time rather than over a
-	// holdout of the current sample.
-	stable := c.stableGroupKeys(c.groupStabilityRuns())
+	// property of the data. Matched by overlap rather than identity -- see groupRecurs.
+	hist, haveHistory := c.retainedGroupSets(c.groupStabilityRuns())
+	if !haveHistory {
+		return nil // not watched long enough to commit storage to anything
+	}
 	var out []*colGroup
 	for _, g := range c.deriveGroupSchemas(samples, s, k) {
 		if g.schema == nil || len(g.schema.fields) == 0 {
 			continue
 		}
-		if stable != nil {
-			var names []string
-			for _, id := range g.ids {
-				if n, ok := c.schemaFieldName(id); ok {
-					names = append(names, n)
-				}
+		var names []string
+		for _, id := range g.ids {
+			if n, ok := c.schemaFieldName(id); ok {
+				names = append(names, n)
 			}
-			sort.Strings(names)
-			key := ""
-			for _, n := range names {
-				key += n + "\x00"
-			}
-			if !stable[key] {
-				continue
-			}
+		}
+		if !groupRecurs(names, hist, defaultGroupRecurOverlap) {
+			continue
 		}
 		out = append(out, &colGroup{schema: g.schema, ids: g.ids})
 	}
@@ -361,6 +356,12 @@ func (c *Collection) groupStabilityRuns() int {
 	}
 	return defaultGroupStabilityRuns
 }
+
+// defaultGroupRecurOverlap is how much of a candidate's member set must be shared with a group in
+// each retained derivation for it to count as the same structure. Measured: the widened groups that
+// kept paying matched at 0.94 and 0.87 across snapshots, and the one whose members stopped
+// co-occurring matched nothing -- so a half-shared set separates them with room either side.
+const defaultGroupRecurOverlap = 0.5
 
 // defaultGroupStabilityRuns is deliberately small. The cost of waiting is that a good group is not
 // built for a few maintenance passes; the cost of not waiting is storage committed to a set that

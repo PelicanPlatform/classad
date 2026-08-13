@@ -286,6 +286,12 @@ func (db *DB) Maintain(opts MaintainOptions) {
 		_, _ = db.c.RetrainDict(opts.SampleMax) // recompacts + reindexes
 	}
 	if opts.SchemaScanHotTopN > 0 {
+		// Derive and checkpoint the candidate group schemas BEFORE enabling, so the history the
+		// stability gate reads accumulates on this cadence and no faster. A group is committed to
+		// storage only once its members have kept showing up together across several of these
+		// passes, so the review interval sets how long that takes -- minutes for a mutable table,
+		// a day for an archive.
+		db.c.GroupSchemas(opts.SampleMax, 0)
 		// Build the columnar accelerator on first run, extend it to newly-sealed segments
 		// after (idempotent + refresh-safe -- keeps the stable schema/hot set).
 		db.c.BuildAndEnableSchemaScan(opts.SampleMax, opts.SchemaScanHotTopN)

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -314,56 +315,78 @@ func (c *Collection) normalizeSamples(samples [][]byte) [][]byte {
 	return out
 }
 
-// stableGroupKeys returns the member sets that appear in EVERY one of the last runs retained
-// derivations, keyed as GroupSchemaDrift keys them. Fewer than runs derivations retained yields
-// nothing: a group nobody has watched twice is not established, and the safe answer is to build
-// none.
-//
-// This is the gate on committing storage to a group, and it has to be over TIME rather than over a
-// holdout of one sample. Measured on two snapshots of a production AP: a random split of one
-// snapshot showed 0.000% partial for every group -- an in-sample holdout would have passed the
-// group that later frayed -- while the same groups measured against a snapshot hours later showed
-// one at 0.167%, because a member merely happened to accompany the others in the first sample.
-// Only elapsed time distinguishes co-occurrence from coincidence.
-func (c *Collection) stableGroupKeys(runs int) map[string]bool {
+// retainedGroupSets returns the member sets of each of the last `runs` retained derivations, or
+// ok=false when fewer than that many are retained -- a group nobody has watched twice is not
+// established, and the safe answer is to build none.
+func (c *Collection) retainedGroupSets(runs int) (hist [][][]string, ok bool) {
 	if runs <= 1 {
-		return nil // no gate
+		return nil, true // gate off
 	}
 	if c.dir == "" {
-		return map[string]bool{} // nothing checkpointed: nothing established
+		return nil, false
 	}
 	data, err := os.ReadFile(filepath.Join(c.dir, groupSchemaFile))
 	if err != nil {
-		return map[string]bool{}
+		return nil, false
 	}
 	var rec persistedGroupSchemas
 	if json.Unmarshal(data, &rec) != nil || rec.Version != groupSchemaVersion || len(rec.History) < runs {
-		return map[string]bool{}
+		return nil, false
 	}
-	key := func(attrs []string) string {
-		s := ""
-		for _, a := range attrs {
-			s += a + "\x00"
-		}
-		return s
-	}
-	counts := map[string]int{}
 	for _, d := range rec.History[len(rec.History)-runs:] {
-		seen := map[string]bool{}
+		var sets [][]string
 		for _, g := range d.Groups {
-			k := key(g.Attrs)
-			if seen[k] {
-				continue
+			sets = append(sets, g.Attrs)
+		}
+		hist = append(hist, sets)
+	}
+	return hist, true
+}
+
+// groupRecurs reports whether a candidate's members keep showing up together across the retained
+// derivations -- the gate on committing storage to a group.
+//
+// Matched by OVERLAP, not by an identical member list. Identity is too strict, and measurably so:
+// across three snapshots of a production queue, 3 of 4 exactly-derived groups reproduced their
+// member set but 0 of 4 widened ones did, because widening perturbs membership with the sample. An
+// identity gate therefore rejected every widened group -- including one holding 16.7% of the
+// table's attribute occurrences at a 0.1% partial rate -- to avoid a drifted one holding 0.68%.
+//
+// What matters is that the same STRUCTURE keeps appearing, so a half-shared member set counts. At
+// that threshold the measured groups sort correctly: the two that kept paying matched at 0.94 and
+// 0.87, and the one whose members stopped co-occurring matched nothing at all.
+func groupRecurs(cand []string, hist [][][]string, minOverlap float64) bool {
+	if len(hist) == 0 {
+		return true // gate off
+	}
+	want := make(map[string]bool, len(cand))
+	for _, a := range cand {
+		want[strings.ToLower(a)] = true
+	}
+	for _, deriv := range hist {
+		found := false
+		for _, set := range deriv {
+			inter := 0
+			seen := make(map[string]bool, len(set))
+			for _, a := range set {
+				la := strings.ToLower(a)
+				if seen[la] {
+					continue
+				}
+				seen[la] = true
+				if want[la] {
+					inter++
+				}
 			}
-			seen[k] = true
-			counts[k]++
+			union := len(want) + len(seen) - inter
+			if union > 0 && float64(inter)/float64(union) >= minOverlap {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
 		}
 	}
-	out := map[string]bool{}
-	for k, n := range counts {
-		if n == runs {
-			out[k] = true
-		}
-	}
-	return out
+	return true
 }
