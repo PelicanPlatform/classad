@@ -114,10 +114,12 @@ type Options struct {
 	// fraction of ads that may then hold only PART of a group and take the slow path for it; 0
 	// uses defaultGroupMaxPartial.
 	//
-	// Measured against a later snapshot of the same table, widening did not hold: a group whose
-	// in-sample partial rate was 0.075% read 45.8% on the holdout, and no widened member set
-	// reproduced across snapshots. See mergeNearPatterns. Left configurable because the machinery
-	// and the measurement are worth keeping, not because turning it on is advisable.
+	// Measured against a later snapshot of the same table, widening still recovered more than
+	// exact grouping (25.14% of attribute occurrences against 23.53%), because a partial ad reads
+	// from the cold tail -- where it would have read anyway -- rather than paying a penalty. The
+	// in-sample partial rate does NOT predict the later one, though, and no widened member set
+	// reproduced across snapshots, so the stability gate refuses to build one. See
+	// mergeNearPatterns.
 	GroupMergeJaccard   float64
 	GroupMaxPartialFrac float64
 	// DemandHalfLife is how quickly recorded query demand fades, so index decisions

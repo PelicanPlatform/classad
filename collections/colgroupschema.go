@@ -392,22 +392,25 @@ type cand struct {
 // Greedy from the highest-ranked candidate down, so a widened group grows around the pattern that
 // already recovers the most, and each absorbed pattern leaves the pool.
 //
-// MEASURED AND NOT RECOMMENDED. Widening looks good in-sample and does not survive contact with
-// later data. Deriving on one production snapshot and scoring against another taken hours later:
+// MEASURED ACROSS SNAPSHOTS. Widening holds up, but not in the way the in-sample numbers suggest.
+// Deriving on one production snapshot and scoring against another taken hours later:
 //
-//	exact          every group   partial 0.000% -> 0.000%
-//	jaccard >= 0.99  worst group  partial 0.075% -> 45.792%
+//	coverage   exact 16.46% -> 23.53%      widened 18.86% -> 25.14%
+//	partial    exact  0.000% -> 0.000%     widened worst group 0.075% -> 45.792%
 //
-// One widened group's members stopped co-occurring almost entirely, so nearly half its ads take the
-// slow path for its attributes -- and the in-sample partial ceiling gave no warning, because a
-// merge is fitted to the sample that suggested it. Worse, widened member sets are sample-dependent
-// by construction: across three snapshots, 3 of 4 EXACT groups reproduced their member set exactly
-// while 0 of 4 widened ones did.
+// Widening still recovers MORE than exact on the holdout. The partial rate is not a penalty
+// against that: a partial ad reads its group attributes from the base block's cold tail, which is
+// exactly where they would be if the group did not exist -- so partial is benefit not realized,
+// never harm. What the holdout does say is that an in-sample partial ceiling predicts nothing,
+// because a merge is fitted to the sample that suggested it: the group that read 0.075% when
+// derived read 45.8% later, when one member's presence moved the opposite way from the rest
+// (ReqPeriodicRelease rose 56.5% -> 72.0% while the other three fell to 26.3%).
 //
-// That last fact is also the protection. The stability gate builds blocks only for a member set
-// seen in several consecutive derivations, so widened groups never qualify and nothing is built
-// from them. GroupMergeJaccard therefore defaults to 0, and turning it on is expected to yield
-// nothing rather than to yield the in-sample gain.
+// Two consequences worth keeping. The exception lookup must not assume a small list -- it binary
+// searches for this reason. And widened member sets are sample-dependent: across three snapshots
+// 3 of 4 EXACT groups reproduced their member set and 0 of 4 widened ones did, so the stability
+// gate refuses to build any widened group. That gate is currently the binding constraint on this
+// feature, not the partial rate.
 func mergeNearPatterns(cands []cand, nSamples int, minJaccard, maxPartial float64) []cand {
 	used := make([]bool, len(cands))
 	out := make([]cand, 0, len(cands))

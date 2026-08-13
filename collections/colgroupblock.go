@@ -2,6 +2,7 @@ package collections
 
 import (
 	"math/bits"
+	"sort"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -95,17 +96,16 @@ func (gb *colGroupBlock) isException(k int) bool {
 	if gb == nil {
 		return false
 	}
-	// Ascending and expected to be tiny (0.2% of records at worst measured), so a linear scan
-	// beats a map's allocation and hashing.
-	for _, e := range gb.exceptions {
-		if int(e) == k {
-			return true
-		}
-		if int(e) > k {
-			return false
-		}
-	}
-	return false
+	// Binary search, not a linear scan. The first version scanned, justified by exceptions being
+	// "tiny (0.2% at worst measured)" -- an assumption a temporal holdout then falsified: a group
+	// whose partial rate was 0.075% when derived read 45.8% on a snapshot hours later, because one
+	// member's presence moved the opposite way from the rest. At that rate a 4096-record block
+	// carries ~1876 exceptions and the scan is per record per query.
+	//
+	// The list is ascending by construction (built in record order), so this costs nothing when the
+	// assumption holds and does not collapse when it does not.
+	i := sort.Search(len(gb.exceptions), func(i int) bool { return int(gb.exceptions[i]) >= k })
+	return i < len(gb.exceptions) && int(gb.exceptions[i]) == k
 }
 
 // population is how many membership bits are set. Not rank's last entry: that counts members
