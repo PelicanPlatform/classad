@@ -178,6 +178,27 @@ func (c *Collection) wireToInline(dict *segDictHandle, w []byte) []byte {
 	return wire.EncodeInline(nil, a)
 }
 
+// wireToInlineNoKey is wireToInline for a read that is NOT entitled to sealed values: it decodes with no
+// key at all, so a sealed value becomes undefined (see wire.DecodeResolveEncRedact) and no plaintext
+// secret is ever materialized.
+//
+// wireToInline opens every sealed value with the collection's key and immediately re-seals it, which is
+// right for a rewrite but wrong for serving an unentitled reader: the secret was decrypted in process and
+// then filtered out by NAME afterwards. Filtering is a deny-list; not holding the key is not.
+//
+// Nothing is re-sealed here because nothing sealed survives the decode, so the inline form carries
+// undefined where the secret was.
+func (c *Collection) wireToInlineNoKey(dict *segDictHandle, w []byte) []byte {
+	if dict == nil {
+		return w
+	}
+	a, err := wire.DecodeResolveEncRedact(w, dict.resolve, nil)
+	if err != nil {
+		return w
+	}
+	return wire.EncodeInline(nil, a)
+}
+
 // toSelfContained converts a stored record's (compressed) ad bytes into a form that decodes
 // WITHOUT the source segment's dict, for DEFERRED/cold paths (e.g. a watch event) that copy ad
 // bytes out of the scan and decode them later, when the segment and its dict are no longer in

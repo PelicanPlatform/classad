@@ -1,0 +1,153 @@
+package collections
+
+import (
+	"fmt"
+	"strings"
+	"testing"
+
+	"github.com/PelicanPlatform/classad/collections/vm"
+)
+
+// A redacted read must not hold the key. Before this, QueryRawRedacted stripped private attributes by
+// NAME -- but wireToInline had already opened every sealed value with the collection's key and re-sealed
+// it, so the secret was decrypted in this process and then filtered out afterwards. Filtering is a
+// deny-list; not holding the key is not. These pin the difference.
+func TestRedactedRawReadHoldsNoKey(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	_, dataKey := deriveDataKey(t)
+	const secret = "ClaimId-super-secret-capability-9f83a"
+
+	openC := func() *Collection {
+		c, err := Open(Options{
+			Shards:         1,
+			Dir:            dir,
+			SegmentSize:    1 << 16,
+			DataKey:        dataKey,
+			EncryptedAttrs: []string{"ClaimId"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := openC()
+	const n = 400
+	for i := 0; i < n; i++ {
+		ad := mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Compact so the records live in INTERNED segments (that dict path is where the open-and-reseal
+	// was), then reopen: a persistent collection's own active segments are inline-name, and the raw
+	// reads yield nothing for those.
+	c.Compact()
+	c.Close()
+	c = openC()
+	defer c.Close()
+
+	q, err := vm.Parse("Cpus >= 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The premise: WITH the key the secret is recoverable, so the redacted read withholding it is the
+	// change rather than the fixture never having had a secret.
+	//
+	// Established through Query (full decode) rather than QueryRaw. QueryRaw yields NOTHING for an
+	// encrypted collection: its renderer cannot render a sealed node, so every ad comes back
+	// "undecodable" and is skipped silently. That is a pre-existing wart, not something this changed --
+	// and it is why the privileged comparison here uses the decode path instead.
+	privileged, redacted := 0, 0
+	sawSecret := false
+	for ad := range c.Query(q) {
+		privileged++
+		if strings.Contains(ad.StringWithPrivate(), secret) {
+			sawSecret = true
+		}
+	}
+	if privileged == 0 {
+		t.Fatal("privileged query returned nothing")
+	}
+	if !sawSecret {
+		t.Fatal("the privileged read did not see the secret, so this test cannot show it being " +
+			"withheld from the redacted one")
+	}
+
+	for ra := range c.QueryRawRedacted(q) {
+		redacted++
+		for _, e := range ra.Exprs {
+			s := string(e)
+			if strings.Contains(s, secret) {
+				t.Fatalf("the secret leaked into a redacted raw read: %q", s)
+			}
+			// The ATTRIBUTE may appear (redaction is by name, and an unopened value is undefined);
+			// what must never appear is the plaintext.
+			if strings.HasPrefix(s, "ClaimId") && strings.Contains(s, "capability") {
+				t.Fatalf("a redacted read rendered a ClaimId value: %q", s)
+			}
+		}
+	}
+	if redacted != privileged {
+		t.Errorf("redacted raw read returned %d ads, privileged %d: redaction must not drop ADS, only "+
+			"attribute values", redacted, privileged)
+	}
+	t.Logf("privileged=%d ads (secret visible), redacted=%d ads (secret withheld, no key held)",
+		privileged, redacted)
+}
+
+// TestRedactedRawReadSurvivesWithoutTheCollectionKey is the property that matters for a session key: the
+// decode path used by a redacted read works with no key at all, so a keyless session is a readable
+// session rather than a broken one.
+func TestRedactedRawReadSurvivesWithoutTheCollectionKey(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	_, dataKey := deriveDataKey(t)
+	const secret = "ClaimId-super-secret-capability-9f83a"
+	c, err := Open(Options{
+		Shards: 1, Dir: dir, SegmentSize: 1 << 16,
+		DataKey: dataKey, EncryptedAttrs: []string{"ClaimId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 400; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Compact()
+	c.Close()
+
+	// Reopen with NO key: this is what a session that holds none sees. The public attributes must
+	// still read; before the redacting decode this failed every ad outright.
+	c2, err := Open(Options{Shards: 1, Dir: dir, SegmentSize: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	q, err := vm.Parse("Cpus >= 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for ra := range c2.QueryRawRedacted(q) {
+		n++
+		for _, e := range ra.Exprs {
+			if strings.Contains(string(e), secret) {
+				t.Fatalf("a keyless reader rendered the secret: %q", string(e))
+			}
+		}
+	}
+	if n == 0 {
+		t.Error("a keyless reader saw NO ads; the public attributes of an ad with a sealed attribute " +
+			"must still be readable")
+	}
+	t.Logf("keyless reader read %d ads with the secret withheld", n)
+}
