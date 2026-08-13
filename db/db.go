@@ -88,6 +88,18 @@ type Config struct {
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
 
+	// GroupSchemaCount enables SECONDARY columnar schemas: sets of attributes the base schema
+	// does not carry which are present or absent together, stored columnar for the ads that hold
+	// them without costing a slot in the ads that do not. 0 (the default) builds none.
+	//
+	// A group's blocks are built only once its members have kept showing up together across
+	// GroupStabilityRuns maintenance passes, so enabling this does nothing immediately -- see
+	// collections.Options.
+	GroupSchemaCount    int
+	GroupStabilityRuns  int
+	GroupMergeJaccard   float64
+	GroupMaxPartialFrac float64
+
 	// SegmentSize overrides the arena segment size in bytes (see collections.Options).
 	// 0 uses the default (8 MiB). A smaller value seals segments sooner -- useful for
 	// tests and for tuning the sealed-segment accelerators (columnar scan, sealed indexes).
@@ -119,17 +131,21 @@ func OpenConfig(cfg Config) (*DB, error) {
 		return nil, err
 	}
 	opts := collections.Options{
-		Dir:               cfg.Dir,
-		WatchHistory:      4096, // enables Watch
-		Ordered:           cfg.Ordered,
-		HotAttrs:          cfg.HotAttrs,
-		CategoricalAttrs:  cfg.CategoricalAttrs,
-		ValueAttrs:        cfg.ValueAttrs,
-		MatchClosureRoots: cfg.MatchClosureRoots,
-		Codec:             chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
-		DataKey:           enc.data(),
-		EncryptedAttrs:    cfg.EncryptedAttrs,
-		SegmentSize:       cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
+		Dir:                 cfg.Dir,
+		WatchHistory:        4096, // enables Watch
+		Ordered:             cfg.Ordered,
+		HotAttrs:            cfg.HotAttrs,
+		CategoricalAttrs:    cfg.CategoricalAttrs,
+		ValueAttrs:          cfg.ValueAttrs,
+		MatchClosureRoots:   cfg.MatchClosureRoots,
+		GroupSchemaCount:    cfg.GroupSchemaCount,
+		GroupStabilityRuns:  cfg.GroupStabilityRuns,
+		GroupMergeJaccard:   cfg.GroupMergeJaccard,
+		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
+		Codec:               chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
+		DataKey:             enc.data(),
+		EncryptedAttrs:      cfg.EncryptedAttrs,
+		SegmentSize:         cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
 		// Time travel is a persisted runtime toggle: read it before opening so recovery
 		// rebuilds the time index (and scan-pruning counters) from the segment markers
 		// instead of the directory snapshot. loadIndexConfig below keeps it in sync.

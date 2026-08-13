@@ -92,6 +92,12 @@ type ArchiveOptions struct {
 	// Options.IndexBackfillBytes). 0 carries it across the whole archive.
 	IndexBackfillBytes int64
 
+	// GroupSchemaCount and its companions enable secondary columnar schemas (see Options).
+	GroupSchemaCount    int
+	GroupStabilityRuns  int
+	GroupMergeJaccard   float64
+	GroupMaxPartialFrac float64
+
 	// InternAtSeal interns each segment as soon as it seals (see Options.InternAtSeal), so an
 	// archive gets the interning density/decode win immediately instead of only after a later
 	// RetrainDict/Rewrite. Optional; default off. Trades a per-seal transcode (off the write
@@ -118,19 +124,23 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		segSize = defaultArchiveSegmentSize
 	}
 	return Options{
-		AppendOnly:         true, // pure append log: no supersession, no compaction, no key dir
-		ReverseScan:        true, // newest-first Query, matching condor_history order
-		Dir:                opts.Dir,
-		SegmentSize:        segSize,
-		Codec:              opts.Codec,
-		HotAttrs:           opts.HotAttrs,
-		CategoricalAttrs:   opts.CategoricalAttrs,
-		ValueAttrs:         opts.ValueAttrs, // numeric ValueAttrs are auto-added to the zone maps
-		ZoneAttrs:          opts.ZoneAttrs,
-		Retention:          opts.Retention,
-		InternAtSeal:       opts.InternAtSeal, // intern each segment eagerly at seal
-		IndexBackfillBytes: opts.IndexBackfillBytes,
-		WatchHistory:       archiveWatchCap, // enable the append-stream watch
+		AppendOnly:          true, // pure append log: no supersession, no compaction, no key dir
+		ReverseScan:         true, // newest-first Query, matching condor_history order
+		Dir:                 opts.Dir,
+		SegmentSize:         segSize,
+		Codec:               opts.Codec,
+		HotAttrs:            opts.HotAttrs,
+		CategoricalAttrs:    opts.CategoricalAttrs,
+		ValueAttrs:          opts.ValueAttrs, // numeric ValueAttrs are auto-added to the zone maps
+		ZoneAttrs:           opts.ZoneAttrs,
+		Retention:           opts.Retention,
+		InternAtSeal:        opts.InternAtSeal, // intern each segment eagerly at seal
+		IndexBackfillBytes:  opts.IndexBackfillBytes,
+		GroupSchemaCount:    opts.GroupSchemaCount,
+		GroupStabilityRuns:  opts.GroupStabilityRuns,
+		GroupMergeJaccard:   opts.GroupMergeJaccard,
+		GroupMaxPartialFrac: opts.GroupMaxPartialFrac,
+		WatchHistory:        archiveWatchCap, // enable the append-stream watch
 	}
 }
 

@@ -53,6 +53,14 @@ type ArchiveConfig struct {
 	// for deliberately and a bad thing to get by leaving a field unset, which is why it is
 	// not what zero means.
 	IndexBackfillBytes int64
+	// GroupSchemaCount enables secondary columnar schemas for attributes the base schema does not
+	// carry (see db.Config). 0 builds none. An archive's maintenance cadence is long, so the
+	// stability gate's several derivations span days rather than minutes -- which is the intended
+	// shape for a table whose structure changes on that scale.
+	GroupSchemaCount    int
+	GroupStabilityRuns  int
+	GroupMergeJaccard   float64
+	GroupMaxPartialFrac float64
 	// Retention bounds what rotation keeps (max segments / bytes / age). Zero keeps all.
 	Retention collections.Retention
 }
@@ -103,15 +111,19 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		return nil, err
 	}
 	opts := collections.ArchiveOptions{
-		Dir:                dir,
-		SegmentSize:        cfg.SegmentSize,
-		Codec:              codec,
-		HotAttrs:           cfg.HotAttrs,
-		CategoricalAttrs:   cfg.CategoricalAttrs,
-		ValueAttrs:         cfg.ValueAttrs,
-		ZoneAttrs:          cfg.ZoneAttrs,
-		IndexBackfillBytes: cfg.backfillHorizon(),
-		Retention:          cfg.Retention,
+		Dir:                 dir,
+		SegmentSize:         cfg.SegmentSize,
+		Codec:               codec,
+		HotAttrs:            cfg.HotAttrs,
+		GroupSchemaCount:    cfg.GroupSchemaCount,
+		GroupStabilityRuns:  cfg.GroupStabilityRuns,
+		GroupMergeJaccard:   cfg.GroupMergeJaccard,
+		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
+		CategoricalAttrs:    cfg.CategoricalAttrs,
+		ValueAttrs:          cfg.ValueAttrs,
+		ZoneAttrs:           cfg.ZoneAttrs,
+		IndexBackfillBytes:  cfg.backfillHorizon(),
+		Retention:           cfg.Retention,
 	}
 	var a *collections.Archive
 	if create {
