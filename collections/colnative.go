@@ -2,6 +2,7 @@ package collections
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -209,7 +210,7 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 	if !ok {
 		return nil, errBadRemnant
 	}
-	rec, err := blk.reconstruct(local, cn.cache)
+	rec, err := blk.reconstructInto(getRecBuf(), local, cn.cache)
 	if err != nil {
 		return nil, err
 	}
@@ -249,6 +250,7 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 		added++
 		return true
 	})
+	putRecBuf(rec) // rec's nodes were copied into extra above; done with it
 	if bad {
 		return nil, errBadRemnant
 	}
@@ -301,4 +303,30 @@ var (
 // many arena bytes that removed, since the process started.
 func ColumnarizedSegments() (segments, bytesSaved int64) {
 	return columnarizedSegments.Load(), columnarizedBytesSaved.Load()
+}
+
+// Record-form scratch for reassembly.
+//
+// A pool rather than a buffer on the colNative, because a colNative is shared by every reader of its
+// segment and the parallel scan runs several at once -- one buffer there would be a data race that
+// shows up as two records' values interleaved. A pool rather than a per-call allocation, because
+// this is once per record on every columnar full-ad read, which is exactly the allocation rate that
+// made the garbage collector the largest single cost in a columnar scan's profile.
+var recBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return &b }}
+
+// getRecBuf takes a buffer OUT of the pool and does not return it: putRecBuf does that, once the
+// caller is finished. Returning it here would hand the same backing array to the next concurrent
+// reader while this one still held it, which is the data race a pool is supposed to prevent.
+func getRecBuf() []byte {
+	return (*recBufPool.Get().(*[]byte))[:0]
+}
+
+// putRecBuf returns a buffer to the pool, keeping whatever capacity it grew to so the next record
+// reuses it.
+func putRecBuf(b []byte) {
+	if cap(b) == 0 {
+		return
+	}
+	b = b[:0]
+	recBufPool.Put(&b)
 }

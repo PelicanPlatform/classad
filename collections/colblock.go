@@ -705,14 +705,31 @@ func (b *columnarBlock) escapeAt(k int) []byte {
 // reconstruct rebuilds record k's row form (identical to the adSchema.encode input), so
 // schema.forEach reconstructs the full ad. Decompresses the cold-numeric, string, and cold
 // streams (via bc, nil for no cache) -- the full-ad-read cost, amortized by the cache.
+// reconstruct is reconstructInto with a fresh buffer, for callers not on a hot path.
 func (b *columnarBlock) reconstruct(k int, bc *blockCache) ([]byte, error) {
+	return b.reconstructInto(nil, k, bc)
+}
+
+// reconstructInto rebuilds record k's canonical record form into dst's backing array where it
+// fits, returning the result.
+//
+// dst exists because this is called once per record on every columnar full-ad read, and a fresh
+// allocation per record puts the whole scan's working set through the garbage collector -- the
+// profile of a columnar scan was dominated by page management rather than by any of the work
+// here. The caller retains the returned slice for the next record.
+func (b *columnarBlock) reconstructInto(dst []byte, k int, bc *blockCache) ([]byte, error) {
 	s := b.schema
 	ds, err := bc.streams(b)
 	if err != nil {
 		return nil, err
 	}
 	coldRaw, strRaw, tailRaw := ds.coldNum, ds.str, ds.cold
-	rec := make([]byte, s.escBytes+s.fixedLen, s.escBytes+s.fixedLen+(b.strOff[k+1]-b.strOff[k])+(b.coldOff[k+1]-b.coldOff[k]))
+	need := s.escBytes + s.fixedLen + (b.strOff[k+1] - b.strOff[k]) + (b.coldOff[k+1] - b.coldOff[k])
+	if cap(dst) < need {
+		dst = make([]byte, 0, need)
+	}
+	rec := dst[:s.escBytes+s.fixedLen]
+	clear(rec)
 	base := k * b.bitsStride
 	copy(rec[:s.escBytes+s.boolBytes], b.bits[base:base+s.escBytes+s.boolBytes]) // escape then bools
 	// The cost of a columnar hot region: one gather per field rather than one span. Identical in shape to
