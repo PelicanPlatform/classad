@@ -70,6 +70,9 @@ func (s *Server) streamTxnQuery(ctx context.Context, reqID uint64, r *reader, in
 		write(respBad(reqID))
 		return
 	}
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
+		return
+	}
 	s.withTxnStream(reqID, id, write, func(st *serverTxn) {
 		seq, err := st.tx.Query(constraint)
 		if err != nil {
@@ -92,11 +95,14 @@ func (s *Server) streamTxnQuery(ctx context.Context, reqID uint64, r *reader, in
 }
 
 // streamTxnQueryKeys is the server side of opTxnQueryKeys.
-func (s *Server) streamTxnQueryKeys(ctx context.Context, reqID uint64, r *reader, write func([]byte)) {
+func (s *Server) streamTxnQueryKeys(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	id := r.u64()
 	constraint := r.str()
 	if r.err != nil {
 		write(respBad(reqID))
+		return
+	}
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
 	s.withTxnStream(reqID, id, write, func(st *serverTxn) {
