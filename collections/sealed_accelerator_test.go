@@ -205,3 +205,47 @@ func TestStreamingIngestSealsPerAd(t *testing.T) {
 		t.Errorf("a streaming ingest stored the secret in the clear, in: %v", hits)
 	}
 }
+
+// TestParallelWireScanOverEncrypted covers the guard that excluded encrypted collections from parallel
+// wire scans, on the grounds that "the Sealer contract is single-goroutine per pass". That is not the
+// stated contract and not what the code does -- the parallel QUERY path already opens sealed values from
+// its workers. Run under -race in CI, this is also the check that the claim was wrong.
+func TestParallelWireScanOverEncrypted(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	_, dataKey := deriveDataKey(t)
+	const secret = "ClaimId-super-secret-capability-9f83a"
+	c, err := Open(Options{
+		Shards: 4, Dir: dir, SegmentSize: 1 << 16,
+		DataKey: dataKey, EncryptedAttrs: []string{"ClaimId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const n = 4000
+	for i := 0; i < n; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !c.SupportsRawWire() {
+		t.Skip("raw wire unsupported here")
+	}
+	// Every ad must arrive exactly once, whichever path ran, and no row may carry the secret in the
+	// clear -- a parallel worker opening a sealed value must not write plaintext into the shared buffer.
+	rows := 0
+	for w := range c.ScanRawWire([]string{"Owner", "Cpus"}, false) {
+		rows++
+		if bytes.Contains(w, []byte(secret)) {
+			t.Fatalf("a raw-wire row carried the secret: %q", w)
+		}
+	}
+	if rows != n {
+		t.Errorf("raw wire scan yielded %d rows, want %d", rows, n)
+	}
+	t.Logf("raw wire scan over an encrypted collection: %d rows", rows)
+}

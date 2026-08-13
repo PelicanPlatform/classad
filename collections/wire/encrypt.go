@@ -12,6 +12,9 @@ import (
 // data-encryption key; the wire layer stays crypto-agnostic. Seal returns a fresh
 // nonce and ciphertext; Open reverses it and authenticates (errors on tampering or a
 // wrong key). It is used from a single goroutine per encode/decode pass.
+// Implementations must be safe for concurrent use: both the parallel query scan and the parallel wire
+// scan open sealed values from several goroutines at once, and nothing serializes them. The built-in
+// dataKeySealer satisfies this by holding only an immutable key and building a fresh GCM per call.
 type Sealer interface {
 	Seal(plaintext []byte) (nonce, ciphertext []byte, err error)
 	Open(nonce, ciphertext []byte) (plaintext []byte, err error)
