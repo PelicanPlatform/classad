@@ -351,7 +351,14 @@ type segIndex struct {
 // the given spec. Reads immutable segment bytes only (no lock needed); decompresses
 // each record to read the indexed attributes. It has no Collection dependency, so
 // both the live store (Reindex) and the Archive build indexes with it.
-func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec, dict *segDictHandle) *segIndex {
+// buildSegIndex indexes one segment's records up to upto.
+//
+// It takes the SEGMENT rather than its bytes because a record's stored bytes are its whole ad only
+// when the segment is not columnarized; indexing the stored bytes of a columnarized segment would
+// post only the attributes its schema does not cover, and an indexed query would then miss records
+// that plainly match -- a wrong answer with a fast path in front of it.
+func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segIndex {
+	data, dict := seg.data, seg.dict.Load()
 	si := &segIndex{
 		upto:    uint32(upto),
 		specGen: spec.gen,
@@ -378,7 +385,7 @@ func buildSegIndex(data []byte, upto int, codec Codec, spec *indexSpec, dict *se
 			break
 		}
 		si.all.Add(o)
-		if w, err := codec.Decompress(buf[:0], recAd(data, o)); err == nil {
+		if w, err := c.recordWireIn(seg, data, o, buf); err == nil {
 			buf = w
 			si.indexRecord(o, wire.Ad(w), spec, dict)
 		}

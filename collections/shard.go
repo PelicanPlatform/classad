@@ -403,7 +403,7 @@ func (sh *shard) writeMarker(seq, millis uint64) bool {
 
 // get returns a private copy of the current ad bytes for key and the codec they
 // were compressed with, or (nil, nil, false).
-func (sh *shard) get(h uint64, key []byte) ([]byte, Codec, *segDictHandle, bool) {
+func (sh *shard) get(c *Collection, h uint64, key []byte) ([]byte, Codec, *segDictHandle, bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	l, ok := sh.findCurrent(sh.dirGet(h), key)
@@ -416,7 +416,10 @@ func (sh *shard) get(h uint64, key []byte) ([]byte, Codec, *segDictHandle, bool)
 	if seg == nil {
 		return nil, nil, nil, false
 	}
-	ad := recAd(seg.data, l.off)
+	ad, adCodec, ok2 := segStoredOrReassembled(c, seg, l.off)
+	if !ok2 {
+		return nil, nil, nil, false
+	}
 	out := make([]byte, len(ad))
 	copy(out, ad)
 	// The dict handle must not outlive the mapping it points into: it holds seg.data, and the caller
@@ -427,7 +430,7 @@ func (sh *shard) get(h uint64, key []byte) ([]byte, Codec, *segDictHandle, bool)
 	if dict != nil {
 		dict.ensureNames()
 	}
-	return out, seg.codec, dict, true
+	return out, adCodec, dict, true
 }
 
 // forEachSealedRecord calls fn for every record in this shard's SEALED, indexed

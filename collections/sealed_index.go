@@ -142,7 +142,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 // error the existing sidecar is left in place and false is returned, so the segment keeps
 // serving queries under its older (still correct, just less selective) index.
 func (c *Collection) reindexSealed(sh *shard, seg *segment, spec *indexSpec) bool {
-	si := buildSegIndex(seg.data, seg.used, seg.codec, spec, seg.dict.Load())
+	si := buildSegIndex(c, seg, seg.used, spec)
 	if si == nil {
 		return false
 	}
@@ -168,7 +168,7 @@ func (c *Collection) rezoneSealed(sh *shard, seg *segment) {
 	if !appendOnly || len(attrs) == 0 {
 		return
 	}
-	zones := computeSegZones(seg.data, seg.used, attrs, inline, seg.dict.Load(), seg.codec)
+	zones := computeSegZones(c, seg, seg.used, attrs, inline)
 	sh.mu.Lock()
 	seg.zones = zones
 	sh.mu.Unlock()
@@ -386,7 +386,7 @@ func (c *Collection) zonesForSeg(sh *shard, seg *segment) map[uint32]zoneRange {
 	if !appendOnly || len(attrs) == 0 {
 		return nil
 	}
-	return computeSegZones(seg.data, seg.used, attrs, inline, seg.dict.Load(), seg.codec)
+	return computeSegZones(c, seg, seg.used, attrs, inline)
 }
 
 // adoptPersistedZones restores a sealed segment's zone map from its sidecar, so recovery does

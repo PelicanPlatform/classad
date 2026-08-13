@@ -194,6 +194,10 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		dst.reapAndHook()
 		return nil
 	}
+	// The zone map is derived from the records, and the rewritten segment holds the same records
+	// with the same values -- so it is carried over rather than recomputed. Dropping it would cost
+	// the archive its segment pruning until the next reindex.
+	dst.zones = src.zones
 	publishColNative(c, dst)
 	if !dst.columnarized() {
 		dst.retire()
@@ -292,4 +296,48 @@ func (c *Collection) columnarizeSealedSegment(sh *shard, src *segment, s *adSche
 	columnarizedSegments.Add(1)
 	columnarizedBytesSaved.Add(int64(src.used) - int64(dst.used))
 	return true
+}
+
+// columnarizeSealed rewrites every eligible sealed segment into columnar form and returns how many
+// were replaced.
+//
+// Modelled on internSealedLocked, which does the same thing for interning: gather candidates under
+// the shard lock, build each one off-lock (the sources are sealed and immutable), commit each swap
+// individually, then reindex ONCE at the end rather than per segment.
+//
+// The reindex is not optional. A rewritten segment arrives with no sidecar, and the sidecar carries
+// the key index, the attribute indexes and the zone map -- so skipping it would trade the row copy
+// for a lost index, which is a worse deal than it looks. What the rebuilt sidecar does NOT carry is
+// another copy of the columns: colBlobForSeg declines for a segment that already holds its own.
+//
+// The caller must hold maintMu, as compaction and reseal do, so segment rewrites never overlap.
+func (c *Collection) columnarizeSealed() int {
+	st := c.schemaScan.Load()
+	if st == nil || st.schema == nil || len(st.schema.fields) == 0 {
+		return 0 // no schema derived yet: nothing to move into columns
+	}
+	total := 0
+	for _, sh := range c.shards {
+		if sh.allocNamed == nil || sh.segDir == "" {
+			continue // in-memory shard: the format has nowhere durable to live
+		}
+		sh.mu.Lock()
+		act := sh.act
+		var srcs []*segment
+		for _, seg := range sh.segs {
+			if seg != nil && seg != act && seg.used > 0 && !seg.columnarized() {
+				srcs = append(srcs, seg)
+			}
+		}
+		sh.mu.Unlock()
+		for _, src := range srcs {
+			if c.columnarizeSealedSegment(sh, src, st.schema, st.hot) {
+				total++
+			}
+		}
+	}
+	if total > 0 {
+		c.reindexAfterCompaction()
+	}
+	return total
 }

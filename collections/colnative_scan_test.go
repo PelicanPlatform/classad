@@ -1,7 +1,10 @@
 package collections
 
 import (
+	"fmt"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
@@ -10,22 +13,7 @@ import (
 // replaced, so a test can exercise the read paths against a live shard holding the columnar shape.
 func columnarizeShard(t *testing.T, c *Collection, sh *shard, s *adSchema, hot []int) int {
 	t.Helper()
-	sh.mu.Lock()
-	act := sh.act
-	var srcs []*segment
-	for _, seg := range sh.segs {
-		if seg != nil && seg != act && seg.used > 0 && !seg.columnarized() {
-			srcs = append(srcs, seg)
-		}
-	}
-	sh.mu.Unlock()
-	n := 0
-	for _, src := range srcs {
-		if c.columnarizeSealedSegment(sh, src, s, hot) {
-			n++
-		}
-	}
-	return n
+	return c.columnarizeSealed()
 }
 
 // readAll returns every ad the collection yields for expr, summarized order-insensitively.
@@ -196,4 +184,80 @@ func TestColumnarizedSegmentSurvivesReopen(t *testing.T) {
 		t.Fatalf("%d ads differ after reopen", bad)
 	}
 	t.Logf("%d columnarized segments reopened; all %d ads intact", got, len(after))
+}
+
+// TestColumnarizedShardServesIndexedQueries covers the paths where a wrong answer would be FAST.
+//
+// An attribute index and a zone map are both DERIVED from the records, so both are built by walking
+// a segment. If either walk reads stored bytes rather than whole ads, it sees a columnarized
+// segment's remnants: the index posts only the attributes the schema does not cover, and the zone
+// map reports a range narrower than the segment really holds. An indexed query then misses matching
+// records, and zone pruning SKIPS segments that contain matches -- both silently, and faster than
+// the correct answer, which is why they are worth their own test rather than trusting the scan.
+func TestColumnarizedShardServesIndexedQueries(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{
+		Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1,
+		CategoricalAttrs: []string{"Owner", "Cmd"},
+		ValueAttrs:       []string{"RequestMemory", "JobStatus"},
+		ZoneAttrs:        []string{"RequestMemory"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.colNativeEnabled = true
+	for i := range 3000 {
+		ad, err := classad.Parse(fmt.Sprintf(
+			`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep" ]`,
+			i, i%10, i%7, i%6, (i%16)*1024))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RetrainDict(0)
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	exprs := []string{
+		"true",
+		"RequestMemory > 4096",             // value index + zone pruning
+		"RequestMemory > 4096 && ProcId<3", // indexed conjunct plus a scan conjunct
+		"Owner == \"user3\"",               // categorical index
+		"JobStatus == 4",                   // value index on an equality
+		"Cmd == \"/bin/sleep\"",            // categorical matching every record
+	}
+	before := make([]int, len(exprs))
+	for i, e := range exprs {
+		before[i] = len(readAll(t, c, e))
+	}
+	n := c.columnarizeSealed()
+	if n == 0 {
+		t.Skip("no sealed segment was columnarized")
+	}
+	for i, e := range exprs {
+		if got := len(readAll(t, c, e)); got != before[i] {
+			t.Errorf("%s: %d rows after columnarizing, want %d", e, got, before[i])
+		}
+	}
+	// Get is a different path again: it resolves a key to a segment and offset through the
+	// directory, with no scan and no window.
+	for _, k := range []string{"7.0", "1500.0", "2999.0"} {
+		ad, ok := c.Get([]byte(k))
+		if !ok {
+			t.Fatalf("Get(%s) after columnarizing: not found", k)
+		}
+		// RequestMemory is a schema field, so a columnarized record does not physically carry it:
+		// Get has to reach the columns to answer at all.
+		if _, ok := ad.EvaluateAttrInt("RequestMemory"); !ok {
+			t.Errorf("Get(%s): RequestMemory did not survive columnarizing", k)
+		}
+		if _, ok := ad.EvaluateAttrString("Cmd"); !ok {
+			t.Errorf("Get(%s): Cmd did not survive columnarizing", k)
+		}
+	}
+	t.Logf("columnarized %d segments; indexes, zone pruning and Get all agree", n)
 }

@@ -74,7 +74,7 @@ func (sh *shard) findVisible(head loc, key []byte, s0 uint64) (loc, bool) {
 
 // getAt returns a private copy of key's ad bytes as of snapshot s0, or (nil, nil,
 // false) if the key had no version live at s0.
-func (sh *shard) getAt(h uint64, key []byte, s0 uint64) ([]byte, Codec, *segDictHandle, bool) {
+func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64) ([]byte, Codec, *segDictHandle, bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	l, ok := sh.findVisible(sh.dirGet(h), key, s0)
@@ -87,7 +87,10 @@ func (sh *shard) getAt(h uint64, key []byte, s0 uint64) ([]byte, Codec, *segDict
 	if seg == nil {
 		return nil, nil, nil, false
 	}
-	ad := recAd(seg.data, l.off)
+	ad, adCodec, ok2 := segStoredOrReassembled(c, seg, l.off)
+	if !ok2 {
+		return nil, nil, nil, false
+	}
 	out := make([]byte, len(ad))
 	copy(out, ad)
 	// The record bytes are COPIED above and seg.codec's dictionary is Go-heap (TrainDict /
@@ -107,7 +110,7 @@ func (sh *shard) getAt(h uint64, key []byte, s0 uint64) ([]byte, Codec, *segDict
 	if dict != nil {
 		dict.ensureNames()
 	}
-	return out, seg.codec, dict, true
+	return out, adCodec, dict, true
 }
 
 // conflictSince reports whether key was modified after snapshot s0 -- the write-
@@ -366,7 +369,7 @@ func (tx *Txn) getOwn(key []byte) (*classad.ClassAd, bool) {
 	h := tx.c.h.Hash(key)
 	idx := tx.c.shardOf(key, h)
 	s0 := tx.snapOf(idx)
-	stored, codec, dict, ok := tx.c.shards[idx].getAt(h, key, s0)
+	stored, codec, dict, ok := tx.c.shards[idx].getAt(tx.c, h, key, s0)
 	if !ok {
 		return nil, false
 	}

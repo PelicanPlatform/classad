@@ -143,3 +143,25 @@ func (c *Collection) adBytes(r recRef, scratch *[]byte) ([]byte, Codec, bool) {
 	*scratch = full
 	return full, identityCodec{}, true
 }
+
+// segStoredOrReassembled returns a record's bytes and the codec that decodes them, for the
+// point-lookup paths that hold a segment and an offset rather than a window.
+//
+// The returned codec is the segment's for an ordinary record and the identity codec for a
+// reassembled one, so a caller decodes the same way in both cases. The bytes do not alias the
+// segment arena in the reassembled case, but the caller copies regardless -- it is holding a lock
+// it is about to drop.
+//
+// A damaged payload reports "not found" rather than an ad, because the signature carries no error.
+// That is a lie, but the alternative is an ad missing every schema'd attribute, which a caller
+// cannot detect at all; ColNativeCRCFailures counts these so the cause is visible.
+func segStoredOrReassembled(c *Collection, seg *segment, off uint32) ([]byte, Codec, bool) {
+	if !(seg.columnarized() || seg.colDamaged.Load()) {
+		return recAd(seg.data, off), seg.codec, true
+	}
+	full, err := c.recordWireIn(seg, seg.data, off, nil)
+	if err != nil {
+		return nil, nil, false
+	}
+	return full, identityCodec{}, true
+}
