@@ -31,13 +31,29 @@ import (
 // 13084.500000000018). No ordering guarantee is made for an aggregate, so that is a permitted difference
 // rather than a wrong answer, and these are served. Integer sums are exact in int64 either way.
 
-// groupedFromColumns answers a single-numeric-column GROUP BY from the columns, or ok=false to scan.
+// GroupStatsSource is a table that can answer a grouped columnar aggregate: an archive or a mutable
+// table. Both back onto the same collections primitive, so both get the same fast path and the same
+// row-shaping rather than a copy per table type that could drift.
+type GroupStatsSource interface {
+	// GroupStatsConstraint answers the grouped stats for rows matching constraint.
+	GroupStatsConstraint(constraint, groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool)
+	// GroupStatsAll answers them over every row, for a constraint the caller has established is
+	// match-all (the predicate analysis has no predicate to work with there).
+	GroupStatsAll(groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool)
+}
+
+// groupedFromColumns answers a single-numeric-column GROUP BY from the archive's columns.
+func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
+	return GroupedFromColumns(t, constraint, groupCols, aggs)
+}
+
+// GroupedFromColumns answers a single-numeric-column GROUP BY from src's columns, or ok=false to scan.
 //
 // Served: one group column with no bucket width, and aggregates drawn from COUNT(*), COUNT(attr), MIN,
 // MAX, SUM and AVG over numeric attributes the schema carries. A per-aggregate FILTER declines -- the
 // columnar pass knows nothing about it, so answering would report an unfiltered aggregate as a filtered
 // one. COUNT(DISTINCT) declines: it needs the values, not their aggregate.
-func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
+func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
 	if len(groupCols) != 1 || groupCols[0].BucketWidth != 0 || len(aggs) == 0 {
 		return nil, false
 	}
@@ -79,9 +95,9 @@ func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCo
 	var groups []collections.GroupStats
 	var ok bool
 	if IsMatchAll(constraint) {
-		groups, ok = t.a.GroupStatsAll(groupCols[0].Attr, attrs)
+		groups, ok = src.GroupStatsAll(groupCols[0].Attr, attrs)
 	} else {
-		groups, ok = t.a.GroupStatsConstraint(constraint, groupCols[0].Attr, attrs)
+		groups, ok = src.GroupStatsConstraint(constraint, groupCols[0].Attr, attrs)
 	}
 	if !ok {
 		return nil, false

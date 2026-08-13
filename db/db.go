@@ -347,6 +347,32 @@ func (db *DB) EnableSchemaScan(sampleMax, hotTopN int) bool {
 // collections.Collection.CountConstraint.
 func (db *DB) CountConstraint(constraint string) (int, bool) { return db.c.CountConstraint(constraint) }
 
+// GroupStatsConstraint answers a per-group record count plus the aggregate inputs for each aggAttr over
+// the rows matching constraint, via the columnar accelerator, or ok=false so the caller scans. This is
+// the mutable-table half of what ArchiveTable already exposes; dbrpc's aggregate routes a grouped
+// COUNT(*)/MIN/MAX/SUM/AVG through GroupedFromColumns for both.
+//
+// A CHAINED table declines. The columnar paths read a record's own columns and know nothing about
+// parentKeyFor/mergeParent, so on a chained table a group or aggregate attribute inherited from the
+// parent would be missing from the column and the answer would differ from the scan's. (The same is true
+// of the existing CountConstraint fast path, which does not guard it; chaining has no production consumer
+// today -- only classad's own tests set IsStructural -- so that is a latent gap rather than a live bug.)
+func (db *DB) GroupStatsConstraint(constraint, groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool) {
+	if db.c.Chained() {
+		return nil, false
+	}
+	return db.c.GroupStatsConstraint(constraint, groupAttr, aggAttrs)
+}
+
+// GroupStatsAll is GroupStatsConstraint over every row, for a constraint the caller has established is
+// match-all. Declines on a chained table for the reason above.
+func (db *DB) GroupStatsAll(groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool) {
+	if db.c.Chained() {
+		return nil, false
+	}
+	return db.c.GroupStatsAll(groupAttr, aggAttrs)
+}
+
 // LookupClassAd returns the committed ad for key (the hash table, outside any
 // transaction), or (nil, false).
 func (db *DB) LookupClassAd(key string) (*classad.ClassAd, bool) {
