@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 
@@ -313,4 +314,72 @@ func TestColumnarizedShardServesWatch(t *testing.T) {
 			missing, len(before), shrunk)
 	}
 	t.Logf("%d watch catch-up events carry their full ads across the transform", len(before))
+}
+
+// TestColumnarizedShardServesTimeTravel covers the point-in-time path, which resolves records
+// through a different visibility test than the current-time one and reaches history versions that
+// the current-time scan skips entirely.
+func TestColumnarizedShardServesTimeTravel(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{
+		Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1,
+		TimeTravel: &TimeTravelOptions{MaxDistance: time.Hour, CheckpointInterval: time.Millisecond},
+	})
+	if err != nil {
+		t.Skipf("time travel unavailable: %v", err)
+	}
+	defer c.Close()
+	c.colNativeEnabled = true
+	put := func(i int, owner string, status int) {
+		ad, err := classad.Parse(fmt.Sprintf(
+			`[ ClusterId=%d; ProcId=%d; Owner="%s"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep" ]`,
+			i, i%10, owner, status, (i%16)*1024))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := range 2000 {
+		put(i, fmt.Sprintf("user%d", i%7), i%6)
+	}
+	c.RetrainDict(0)
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	time.Sleep(5 * time.Millisecond)
+	asOf := time.Now()
+	time.Sleep(5 * time.Millisecond)
+	// Supersede every record, so the versions the AS OF query must find are history.
+	for i := range 2000 {
+		put(i, "changed", 9)
+	}
+
+	q, err := vm.Parse(`Owner != "changed"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	countAsOf := func() int {
+		seq, err := c.QueryAsOf(q, asOf)
+		if err != nil {
+			t.Skipf("AS OF unavailable: %v", err)
+		}
+		n := 0
+		for range seq {
+			n++
+		}
+		return n
+	}
+	before := countAsOf()
+	if before == 0 {
+		t.Skip("no history visible at the chosen instant")
+	}
+	if got := c.columnarizeSealed(); got == 0 {
+		t.Skip("no sealed segment was columnarized")
+	}
+	if after := countAsOf(); after != before {
+		t.Errorf("AS OF: %d rows after columnarizing, want %d", after, before)
+	}
+	t.Logf("point-in-time reads agree across the transform (%d historical rows)", before)
 }

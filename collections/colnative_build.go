@@ -312,6 +312,13 @@ func (c *Collection) columnarizeSealedSegment(sh *shard, src *segment, s *adSche
 //
 // The caller must hold maintMu, as compaction and reseal do, so segment rewrites never overlap.
 func (c *Collection) columnarizeSealed() int {
+	// A columnar payload stores attribute values in the clear, so it must never be written for an
+	// encryption-at-rest collection. Schema scan already refuses to enable for one, which is what
+	// makes the check below unreachable -- it is here anyway because the cost of that chain being
+	// broken later is private attributes on disk in plaintext, not a slow path.
+	if c.sealer != nil {
+		return 0
+	}
 	st := c.schemaScan.Load()
 	if st == nil || st.schema == nil || len(st.schema.fields) == 0 {
 		return 0 // no schema derived yet: nothing to move into columns
