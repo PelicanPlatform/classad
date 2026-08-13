@@ -163,6 +163,9 @@ func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, in
 		write(respBad(reqID))
 		return
 	}
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
+		return
+	}
 	d, ok := s.tableOr(reqID, table, write)
 	if !ok {
 		return
@@ -264,6 +267,9 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 	var seq iter.Seq[collections.RawAd]
 	var err error
 	redact := !includePrivate
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
+		return
+	}
 	if d, ok := s.cat.Table(table); ok {
 		if chaseRefs {
 			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
@@ -417,6 +423,9 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 	}
 	if r.err != nil {
 		write(respBad(reqID))
+		return
+	}
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
 	d, ok := s.tableOr(reqID, table, write)

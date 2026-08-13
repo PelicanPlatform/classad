@@ -302,6 +302,10 @@ var ErrFilteredAggregateUnsupported = ErrExtendedAggregateUnsupported
 // shared aggregate engine, and streams one frame per group.
 func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint string, groupCols []GroupCol, aggs []AggSpec, includePrivate bool, write func([]byte)) {
 	if !includePrivate {
+		// The WHERE clause reads attributes too, and whether a row matches is itself the answer.
+		if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
+			return
+		}
 		for _, g := range groupCols {
 			if classad.IsPrivateAttribute(g.Attr) {
 				write(respErr(reqID, "cannot group by private attribute "+g.Attr))
@@ -313,12 +317,15 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 				write(respErr(reqID, "cannot aggregate private attribute "+a.Arg))
 				return
 			}
-			// A filter reads attributes too, and its count would leak them.
-			for _, ref := range db.AggFilterAttrs(a.Filter) {
-				if classad.IsPrivateAttribute(ref) {
-					write(respErr(reqID, "cannot filter on private attribute "+ref))
-					return
-				}
+			// A filter reads attributes too, and its count would leak them. Checked with the
+			// authorization walker, not AggFilterAttrs: that is ReadAttrs-based and reports nothing
+			// for a SCOPED reference, so `FILTER "MY.ClaimId == \"x\""` walked straight through.
+			if ref, dynamic := db.PrivateConstraintRef(a.Filter); ref != "" {
+				write(respErr(reqID, "cannot filter on private attribute "+ref))
+				return
+			} else if dynamic {
+				write(respErr(reqID, "cannot use a dynamic attribute reference in a filter"))
+				return
 			}
 		}
 	}
