@@ -63,6 +63,7 @@ func (c *Collection) QueryRawWire(q *vm.Query, projection []string, redact bool)
 			wireOK:   q.Native() && plan.PartialSafe,
 			ws:       ws,
 			resolver: ws.resolve,
+			proj:     c.newProjPlan(projection),
 		}
 		probes := q.Probes()
 		c.demand.record(probes)

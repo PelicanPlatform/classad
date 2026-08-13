@@ -923,6 +923,9 @@ type queryPlan struct {
 	wireOK   bool // native + partial-safe: try wire-native evaluation
 	ws       *wireScope
 	resolver func(name string, scope ast.AttributeScope) classad.Value
+	// proj, when non-nil, is the projection the consumer will keep, so the scan can build a narrower
+	// ad directly from a columnarized segment's columns instead of reassembling a whole record.
+	proj *projPlan
 	// zoneProbes are the query's top-level AND probes, used to skip whole sealed
 	// segments whose zone map cannot contain a match (append-only zone pruning). Set
 	// only when the collection has zone attributes; nil otherwise (no pruning cost).
@@ -1046,17 +1049,51 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 	// would otherwise be reassembled in full and then thrown away. nil when the columns cannot
 	// usefully decide this query, which leaves the scan exactly as it was.
 	pre := c.newColPrefilter(qp.q)
+	// A projected read can be built from the named columns instead of reassembling the record and then
+	// discarding most of it -- but only when the match did not need the ad. See colproject.go.
+	var (
+		projCS      *colScope
+		projScratch projectScratch
+	)
+	if qp.proj != nil {
+		if st := c.schemaScan.Load(); st != nil {
+			projCS = &colScope{bc: st.cache, c: c}
+		}
+	}
+	constQuery := qp.q == nil || (qp.plan.PartialSafe && len(qp.plan.Seeds) == 0)
 	visit := func(r recRef) bool {
 		if isSystemKeyBytes(r.key()) {
 			return true // internal system record: hidden from client scans/queries
 		}
 		dict := r.dict
-		if pre != nil {
-			if cn := r.w.seg.colNative.Load(); cn != nil {
-				if k, ok := cn.byOff[r.off]; ok {
-					if matches, decided := pre.test(cn, k); decided && !matches {
+		cn := r.w.seg.colNative.Load()
+		colDecided := false
+		if pre != nil && cn != nil {
+			if k, ok := cn.byOff[r.off]; ok {
+				matches, decided := pre.test(cn, k)
+				if decided {
+					if !matches {
 						return true // decided from columns alone: never reassembled
 					}
+					colDecided = true
+				}
+			}
+		}
+		// Project straight from the columns when nothing still needs the whole ad: either the query
+		// reads no attribute (so it is constant and the ad cannot change its answer) or the match was
+		// just decided FROM the columns. Anything less certain reassembles, because a narrowed ad
+		// cannot be handed to the matcher -- its seed set is not closed.
+		if projCS != nil && cn != nil && (constQuery || colDecided) {
+			if k, ok := cn.byOff[r.off]; ok {
+				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &projScratch); ok {
+					if qp.ws != nil {
+						qp.ws.dict = dict
+					}
+					if !emit(out, dict) {
+						cont = false
+						return false
+					}
+					return true
 				}
 			}
 		}

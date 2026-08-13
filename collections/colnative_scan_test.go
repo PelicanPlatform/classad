@@ -833,3 +833,75 @@ func TestColumnarizedAdsAreByteEqualIncludingExpressions(t *testing.T) {
 	}
 	t.Logf("%d ads identical across both storage forms, expression content included", len(want))
 }
+
+// readProjected returns every ad the collection yields for expr, restricted to proj.
+func readProjected(t *testing.T, c *Collection, expr string, proj []string) []string {
+	t.Helper()
+	q, err := vm.Parse(expr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for w := range c.QueryRawWire(q, proj, false) {
+		out = append(out, adSummary(t, c, w))
+	}
+	return out
+}
+
+// TestColumnarProjectedReadsMatchRowPath covers building a projected ad from columns instead of
+// reassembling the record and discarding most of it.
+//
+// The comparison is against the same data stored whole-record, and it is byte-sensitive (adSummary
+// renders node bytes), because the two paths have to be interchangeable rather than merely agree on
+// values: a projected read that encoded the same number differently would be a silent format change
+// for every consumer decoding the result.
+//
+// The projections are chosen to cover where the attributes come FROM: schema fields read out of their
+// columns, an attribute the schema does not carry (which stays in the record), a field whose value is
+// sometimes an expression (never moved into a column), one that only some records define, and a
+// projection naming something absent everywhere.
+func TestColumnarProjectedReadsMatchRowPath(t *testing.T) {
+	rows, cols := bothStorageForms(t)
+	defer rows.Close()
+	defer cols.Close()
+
+	for _, proj := range [][]string{
+		{"ClusterId"},
+		{"ClusterId", "ProcId"},
+		{"Owner"},                     // a string column
+		{"Owner", "Cmd", "JobStatus"}, // strings and a numeric together
+		{"RequestMemory"},             // sometimes an expression, so sometimes in the record
+		{"Sometimes"},                 // only some records define it
+		{"Slack", "Sometimes", "ClusterId"},
+		{"NoSuchAttribute"}, // absent everywhere
+		{"ClusterId", "NoSuchAttribute"},
+	} {
+		for _, expr := range []string{
+			"true",                 // constant: projected straight from columns
+			"ProcId < 5",           // decided from columns, then projected from them
+			"Sometimes > 100",      // not a schema field: the match reassembles
+			"RequestMemory > 4096", // sometimes an expression: some records reassemble
+		} {
+			want := readProjected(t, rows, expr, proj)
+			got := readProjected(t, cols, expr, proj)
+			if len(got) != len(want) {
+				t.Errorf("%v / %s: %d rows, want %d", proj, expr, len(got), len(want))
+				continue
+			}
+			bag := map[string]int{}
+			for _, k := range want {
+				bag[k]++
+			}
+			bad := 0
+			for _, k := range got {
+				bag[k]--
+				if bag[k] < 0 {
+					bad++
+				}
+			}
+			if bad != 0 {
+				t.Errorf("%v / %s: %d projected ads differ from the row path", proj, expr, bad)
+			}
+		}
+	}
+}
