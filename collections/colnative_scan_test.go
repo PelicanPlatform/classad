@@ -1191,3 +1191,90 @@ func TestReschemaKeepsColumnarizedSegmentsReadable(t *testing.T) {
 	}
 	t.Logf("%d columnarized segments kept their payload across a reschema; all %d ads intact", kept, len(after))
 }
+
+// TestColumnarizedGroupColumnsSurviveReopen is the durability check for group columns specifically.
+//
+// Group attributes are removed from the records of ads that belong to a group wholly, so the group
+// columns are the only copy. If a reopen does not bring them back the ads come back short of exactly
+// those attributes, with everything else looking correct -- which is the failure mode this format has
+// produced twice before and neither time announced itself.
+func TestColumnarizedGroupColumnsSurviveReopen(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16,
+		GroupSchemaCount: 4, GroupStabilityRuns: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 4000 {
+		text := fmt.Sprintf(`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d ]`,
+			i, i%10, i%7, i%6, (i%16)*1024)
+		if i%3 == 0 {
+			text = fmt.Sprintf(`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; RanStart=%d; RanEnd=%d; RanHost="h%d"; RanExit=%d ]`,
+				i, i%10, i%7, i%6, (i%16)*1024, i, i+10, i%50, i%3)
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RetrainDict(0)
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		c.Close()
+		t.Skip("schema scan did not enable")
+	}
+	withGroups := 0
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			if cs := seg.colblk.Load(); cs != nil && len(cs.groups) > 0 {
+				withGroups++
+			}
+		}
+	}
+	before := readAll(t, c, "true")
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if withGroups == 0 {
+		t.Skip("no columnarized segment carried group columns")
+	}
+
+	c2, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16,
+		GroupSchemaCount: 4, GroupStabilityRuns: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	kept := 0
+	for _, seg := range c2.shards[0].segs {
+		if seg != nil && seg.columnarized() {
+			if cs := seg.colblk.Load(); cs != nil && len(cs.groups) > 0 {
+				kept++
+			}
+		}
+	}
+	if kept != withGroups {
+		t.Errorf("%d of %d segments carry group columns after the reopen", kept, withGroups)
+	}
+	after := readAll(t, c2, "true")
+	if len(after) != len(before) {
+		t.Fatalf("after reopen: %d rows, want %d", len(after), len(before))
+	}
+	bag := map[string]int{}
+	for _, k := range before {
+		bag[k]++
+	}
+	bad := 0
+	for _, k := range after {
+		bag[k]--
+		if bag[k] < 0 {
+			bad++
+		}
+	}
+	if bad != 0 {
+		t.Errorf("%d ads differ after the reopen", bad)
+	}
+	t.Logf("%d segments kept group columns across a reopen; all %d ads intact", kept, len(after))
+}
