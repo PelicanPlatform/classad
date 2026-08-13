@@ -249,3 +249,87 @@ func TestParallelWireScanOverEncrypted(t *testing.T) {
 	}
 	t.Logf("raw wire scan over an encrypted collection: %d rows", rows)
 }
+
+// TestColumnarNativeOverEncryptedStoresNoPlaintext covers the columnar-NATIVE format (values in the
+// segment's own payload rather than a sidecar) over an encrypted collection.
+//
+// That combination used to be refused outright, on the reasoning that a columnar payload stores values in
+// the clear. True of a column -- and a sealed value never becomes one: storableInColumn admits only
+// literals, so a sealed cell is already an exception and stays in the record, exactly as a too-wide or
+// wrong-typed value does. Refusing per COLLECTION also stops making sense once private attributes are
+// always sealed: every collection is then "encrypted" and none would get the format.
+//
+// Three things have to hold together, which is why they are one test: the segments really are
+// columnarized (else it proves nothing), every ad still reads back with its sealed value (the exception
+// survived the rewrite), and no file on disk carries the plaintext.
+func TestColumnarNativeOverEncryptedStoresNoPlaintext(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	_, dataKey := deriveDataKey(t)
+	const secret = "ClaimId-super-secret-capability-9f83a"
+	c, err := Open(Options{
+		Shards: 1, Dir: dir, SegmentSize: 1 << 16,
+		DataKey: dataKey, EncryptedAttrs: []string{"ClaimId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 3000
+	for i := 0; i < n; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; JobStatus=%d; ClaimId=%q]`,
+				i, 1+i%5, secret))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(4000, 8) {
+		t.Fatal("the accelerator did not enable over an encrypted collection")
+	}
+
+	// Enabling runs the columnarize pass (schemaScanPass), so the segments must already be converted --
+	// if none are, everything below passes without exercising the format.
+	sh := c.shards[0]
+	sh.mu.Lock()
+	sealed, columnarized := 0, 0
+	for _, seg := range sh.segs {
+		if seg != nil && seg != sh.act && seg.used > 0 {
+			sealed++
+			if seg.columnarized() {
+				columnarized++
+			}
+		}
+	}
+	sh.mu.Unlock()
+	if sealed == 0 || columnarized != sealed {
+		t.Fatalf("%d of %d sealed segments columnarized; the format under test was not exercised",
+			columnarized, sealed)
+	}
+
+	// Every ad reads back whole, sealed cell included: it had to survive as an exception while the
+	// other attributes moved into the payload.
+	q, err := vm.Parse("Cpus >= 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, withValue := 0, 0
+	for ad := range c.Query(q) {
+		rows++
+		if v, err := ad.EvaluateAttr("ClaimId").StringValue(); err == nil && v == secret {
+			withValue++
+		}
+	}
+	if rows != n || withValue != n {
+		t.Errorf("read %d ads (%d carrying the sealed value), want %d of each", rows, withValue, n)
+	}
+	// And the accelerator answers over the columnarized segments.
+	if got, served := c.CountQuery(q); !served || got != n {
+		t.Errorf("columnar count served=%v n=%d, want true/%d", served, got, n)
+	}
+	c.Close()
+
+	if hits := diskBytesContaining(t, dir, secret); len(hits) != 0 {
+		t.Errorf("the columnar payload put the secret on disk in the clear, in: %v", hits)
+	}
+}

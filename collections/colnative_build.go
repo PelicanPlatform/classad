@@ -397,13 +397,19 @@ func (c *Collection) columnarizeSealedSegment(sh *shard, src *segment, s *adSche
 //
 // The caller must hold maintMu, as compaction and reseal do, so segment rewrites never overlap.
 func (c *Collection) columnarizeSealed() int {
-	// A columnar payload stores attribute values in the clear, so it must never be written for an
-	// encryption-at-rest collection. Schema scan already refuses to enable for one, which is what
-	// makes the check below unreachable -- it is here anyway because the cost of that chain being
-	// broken later is private attributes on disk in plaintext, not a slow path.
-	if c.sealer != nil {
-		return 0
-	}
+	// An encrypted collection is columnarized like any other. A sealed value is not a literal, so
+	// storableInColumn already treats that CELL as an exception and leaves it in the record -- the same
+	// mechanism that handles a too-wide or wrong-typed value. Nothing about a sealed cell has to change
+	// the layout.
+	//
+	// This used to refuse the whole segment, on the reasoning that a columnar payload stores values in
+	// the clear. That is true of a column, and a sealed value never becomes one. Refusing per COLLECTION
+	// also stops making sense once private attributes are always sealed: every collection would then be
+	// "encrypted" and none would get the format.
+	//
+	// Verified rather than argued -- TestColumnarNativeOverEncryptedStoresNoPlaintext columnarizes an
+	// encrypted collection, reads every ad back with its sealed value intact, and scans every file on
+	// disk for the plaintext.
 	st := c.schemaScan.Load()
 	if st == nil || st.schema == nil || len(st.schema.fields) == 0 {
 		return 0 // no schema derived yet: nothing to move into columns
