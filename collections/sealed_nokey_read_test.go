@@ -1,9 +1,11 @@
 package collections
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
@@ -351,4 +353,101 @@ func TestFullDecodeRedactedReadHoldsNoKey(t *testing.T) {
 		t.Error("GetRedacted lost a public attribute")
 	}
 	t.Logf("full-decode: %d ads entitled (secret visible), %d redacted (secret withheld)", priv, red)
+}
+
+// TestWatchAndTxnRedactedHoldNoKey covers the last two client-facing read paths. A watch has the longest
+// exposure of any of them -- it streams ads continuously, so decoding with the collection's key and
+// trusting the serializer means the secret is opened for every event of every unentitled watcher.
+func TestWatchAndTxnRedactedHoldNoKey(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	_, dataKey := deriveDataKey(t)
+	const secret = "ClaimId-super-secret-capability-9f83a"
+	c, err := Open(Options{
+		Shards: 1, Dir: dir, SegmentSize: 1 << 16, WatchHistory: 4096,
+		DataKey: dataKey, EncryptedAttrs: []string{"ClaimId"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	cursor, err := c.WatchCursor()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ {
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; ClaimId=%q]`, i, secret))); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Entitled watch sees the value; the premise for the redacted one meaning anything.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	seq, err := c.Watch(ctx, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen, sawSecret := 0, false
+	for ev := range seq {
+		if ev.Ad != nil {
+			seen++
+			if strings.Contains(ev.Ad.StringWithPrivate(), secret) {
+				sawSecret = true
+			}
+		}
+		if seen >= 20 {
+			break
+		}
+	}
+	if seen == 0 || !sawSecret {
+		t.Fatalf("entitled watch: %d events, secret seen %v -- both must hold", seen, sawSecret)
+	}
+
+	// Redacted watch: same events, no value.
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel2()
+	rseq, err := c.WatchRedacted(ctx2, cursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rseen := 0
+	for ev := range rseq {
+		if ev.Ad != nil {
+			rseen++
+			if s := ev.Ad.StringWithPrivate(); strings.Contains(s, secret) {
+				t.Fatalf("WatchRedacted delivered the secret: %q", s)
+			}
+		}
+		if rseen >= 20 {
+			break
+		}
+	}
+	if rseen != seen {
+		t.Errorf("redacted watch saw %d events, entitled %d: redaction drops values, not events",
+			rseen, seen)
+	}
+
+	// Transactional reads, same property, entitlement fixed at Begin.
+	tx := c.Begin()
+	ad, ok := tx.Get([]byte("k3"))
+	if !ok || !strings.Contains(ad.StringWithPrivate(), secret) {
+		t.Fatalf("entitled Txn.Get: ok=%v, secret present=%v", ok, ok && strings.Contains(ad.StringWithPrivate(), secret))
+	}
+	rtx := c.BeginRedacted()
+	rad, ok := rtx.Get([]byte("k3"))
+	if !ok {
+		t.Fatal("redacted Txn.Get lost the ad; only the value should go")
+	}
+	if s := rad.StringWithPrivate(); strings.Contains(s, secret) {
+		t.Fatalf("redacted Txn.Get returned the secret: %q", s)
+	}
+	if rad.EvaluateAttr("Cpus").IsUndefined() {
+		t.Error("redacted Txn.Get lost a public attribute")
+	}
+	t.Logf("watch: %d events entitled / %d redacted; txn reads verified", seen, rseen)
 }

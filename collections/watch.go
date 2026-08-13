@@ -242,6 +242,20 @@ func (c *Collection) WatchCursor() ([]byte, error) {
 // from empty), then streams live changes until ctx is cancelled or the consumer
 // stops. Requires Options.WatchHistory > 0. See docs/WATCH.md and WatchEvent.
 func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
+	return c.watchAs(ctx, cursor, false)
+}
+
+// WatchRedacted is Watch for a watcher NOT entitled to sealed values: every event's ad is decoded with no
+// key, so a sealed attribute arrives undefined rather than opened. See Collection.QueryRedacted.
+//
+// A watch streams ads continuously, so it is the read path with the longest exposure: decoding with the
+// collection's key and trusting the serializer to drop private attributes means the secret is opened for
+// every event of every unentitled watcher.
+func (c *Collection) WatchRedacted(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
+	return c.watchAs(ctx, cursor, true)
+}
+
+func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (iter.Seq[WatchEvent], error) {
 	if c.hub == nil {
 		return nil, errors.New("collections: Watch requires Options.WatchHistory > 0")
 	}
@@ -288,7 +302,7 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 				return
 			}
 			for i := range c.shards {
-				if !c.catchupUpserts(i, 0, sReg[i], yield) {
+				if !c.catchupUpserts(i, 0, sReg[i], yield, redact) {
 					return
 				}
 			}
@@ -299,7 +313,7 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 				if !c.catchupDeletes(i, seqs[i], yield) {
 					return
 				}
-				if !c.catchupUpserts(i, seqs[i], sReg[i], yield) {
+				if !c.catchupUpserts(i, seqs[i], sReg[i], yield, redact) {
 					return
 				}
 			}
@@ -311,7 +325,7 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 		// Live phase: stream buffered + new events, advancing a running cursor vector.
 		vec := append([]uint64(nil), sReg...)
 		if c.watchCoalesce > 0 {
-			c.liveCoalesced(ctx, w, sReg, vec, yield)
+			c.liveCoalesced(ctx, w, sReg, vec, yield, redact)
 			return
 		}
 		parentSig := c.seedParentSig() // parent -> non-private signature (fan-out diff baseline)
@@ -332,7 +346,7 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 					// A structural (parent) change: fan out to its children if an
 					// inherited attribute changed; the parent itself is not emitted.
 					for _, ce := range c.fanoutChildren(raw, parentSig) {
-						ad, ok := c.watchAd(ce.key, ce.ad, ce.codec)
+						ad, ok := c.watchAdAs(ce.key, ce.ad, ce.codec, redact)
 						if !ok {
 							continue
 						}
@@ -349,7 +363,7 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 					}
 					ev.Kind = WatchDelete
 				} else {
-					ad, ok := c.watchAd(raw.key, raw.ad, raw.codec)
+					ad, ok := c.watchAdAs(raw.key, raw.ad, raw.codec, redact)
 					if !ok {
 						continue // undecodable or a hidden structural ad
 					}
@@ -438,7 +452,9 @@ func WatchFilter(seq iter.Seq[WatchEvent], match func(*classad.ClassAd) bool) it
 // the last event of a flushed window carries a cursor, so a consumer that crashes
 // mid-window resumes from the prior window and re-delivers -- at-least-once is
 // preserved. The running cursor vector still advances on every event received.
-func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []uint64, yield func(WatchEvent) bool) {
+// liveCoalesced streams coalesced live events; redact is the watcher's entitlement to sealed values (see
+// WatchRedacted), threaded because this decodes ads itself.
+func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []uint64, yield func(WatchEvent) bool, redact bool) {
 	pending := map[string]rawEvent{}
 	order := make([]string, 0, 16) // first-seen order; keys are unique per window
 	parentSig := c.seedParentSig()
@@ -461,7 +477,7 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 				}
 				ev.Kind = WatchDelete
 			} else {
-				ad, ok := c.watchAd(raw.key, raw.ad, raw.codec)
+				ad, ok := c.watchAdAs(raw.key, raw.ad, raw.codec, redact)
 				if !ok {
 					continue // undecodable or a hidden structural ad
 				}
@@ -531,10 +547,15 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 // (parent-only) ad, which is hidden from watches. For a plain collection it just
 // decodes. ok=false also means "skip this event" (undecodable or hidden).
 func (c *Collection) watchAd(key, rawAd []byte, codec Codec) (*classad.ClassAd, bool) {
+	return c.watchAdAs(key, rawAd, codec, false)
+}
+
+// watchAdAs is watchAd for a watcher that may not be entitled to sealed values (see WatchRedacted).
+func (c *Collection) watchAdAs(key, rawAd []byte, codec Codec, redact bool) (*classad.ClassAd, bool) {
 	if c.isStructural != nil && c.isStructural(key) {
 		return nil, false // structural ads are hidden from watches
 	}
-	ad, err := c.decodeAd(rawAd, codec)
+	ad, err := c.decodeAdAs(rawAd, codec, redact)
 	if err != nil {
 		return nil, false
 	}
@@ -543,7 +564,7 @@ func (c *Collection) watchAd(key, rawAd []byte, codec Codec) (*classad.ClassAd, 
 			ph := c.h.Hash(pk)
 			sh := c.shards[c.shardOf(pk, ph)]
 			if pad, pcodec, pdict, ok := sh.get(c, ph, pk); ok {
-				if parent, err := c.decodeAdDict(pdict, pad, pcodec); err == nil {
+				if parent, err := c.decodeAdDictAs(pdict, pad, pcodec, redact); err == nil {
 					c.mergeParent(ad, parent)
 				}
 			}
@@ -661,7 +682,9 @@ func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]s
 
 // catchupUpserts emits an Upsert for every record visible at sReg whose seq is in
 // (cursor, sReg] -- the keys whose current version changed since the cursor.
-func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(WatchEvent) bool) bool {
+// catchupUpserts replays a shard's missed upserts; redact is the watcher's entitlement (see
+// WatchRedacted), threaded because this decodes ads itself.
+func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(WatchEvent) bool, redact bool) bool {
 	sh := c.shards[i]
 	_, wins := sh.snapshot()
 	defer releaseWindows(wins)
@@ -684,7 +707,7 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 					off += int(total)
 					continue
 				}
-				if ad, ok := c.watchAd(key, adBytes, adCodec); ok {
+				if ad, ok := c.watchAdAs(key, adBytes, adCodec, redact); ok {
 					if !yield(WatchEvent{Kind: WatchUpsert, Key: append([]byte(nil), key...), Ad: ad}) {
 						return false
 					}

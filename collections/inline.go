@@ -157,6 +157,14 @@ func (c *Collection) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr,
 
 // decodeAdDict is decodeAd (decompress + decode to a ClassAd) that resolves an interned
 // segment's ids via its dict. dict==nil => the existing decodeAd path (inline/global).
+// decodeAdAs is decodeAd for a read that may not be entitled to sealed values; see decodeWireDictAs.
+func (c *Collection) decodeAdAs(stored []byte, codec Codec, redact bool) (*classad.ClassAd, error) {
+	if !redact {
+		return c.decodeAd(stored, codec)
+	}
+	return c.decodeAdDictAs(nil, stored, codec, true)
+}
+
 // decodeAdDictAs is decodeAdDict for a read that may not be entitled to sealed values; see
 // decodeWireDictAs.
 func (c *Collection) decodeAdDictAs(dict *segDictHandle, stored []byte, codec Codec, redact bool) (*classad.ClassAd, error) {
