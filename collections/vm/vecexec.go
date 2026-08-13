@@ -1135,3 +1135,48 @@ func (s *VecScratch) Release() {
 		clear(s.stack[i].S)
 	}
 }
+
+// NewVec allocates a data-form vector of n elements, every one UNDEFINED.
+//
+// For a caller outside this package that materializes a column the loaders cannot produce -- one
+// that exists for only SOME records, so it has to be presented at full length with the rest
+// undefined. Undefined rather than zero is the safe start: an element nothing writes then reads as
+// "no value here" instead of as the integer 0.
+func NewVec(n int) *Vec {
+	v := &Vec{n: n, I: make([]int64, n), S: make([]string, n), St: make([]uint8, n)}
+	for i := range v.St {
+		v.St[i] = VsUndef
+	}
+	return v
+}
+
+// CopyElem copies element j of src into element i of v, preserving its state -- int stays int, real
+// stays real, a dictionary code stays a code. Returns false if either index is out of range.
+//
+// This is the scatter primitive. Boxing through classad.Value would work and is what a caller
+// without it must do, but it allocates for strings and loses the dictionary encoding, turning a
+// code copy into a string materialization per record.
+//
+// A src in RAW form is widened first: raw is a stored-width column, and an element of it means
+// nothing once separated from its width and signedness.
+func (v *Vec) CopyElem(i int, src *Vec, j int) bool {
+	if i < 0 || i >= len(v.St) || src == nil || j < 0 {
+		return false
+	}
+	src.ensureInts()
+	if src.Const {
+		j = 0
+	}
+	if j >= len(src.St) {
+		return false
+	}
+	v.St[i] = src.St[j]
+	v.I[i] = src.I[j]
+	if src.St[j] == VsString {
+		v.S[i] = src.S[j]
+	}
+	return true
+}
+
+// Len is the vector's element count.
+func (v *Vec) Len() int { return v.n }

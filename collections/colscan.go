@@ -24,6 +24,9 @@ var colSegmentBuilds atomic.Int64
 type colSegment struct {
 	blocks []*columnarBlock
 	offs   []uint32
+	// groups are the group schemas' selections, one colGroupBlock per group per base block. Empty
+	// when the collection carries no group schemas.
+	groups []*colGroup
 }
 
 // schema returns the schema all of cs's blocks were built under, or nil if it carries none.
@@ -47,6 +50,10 @@ type schemaScanState struct {
 	schema *adSchema
 	hot    []int
 	cache  *blockCache
+	// groups are the secondary schemas a block is also built against, pinned at enable time with
+	// the base schema. Pinned for the same reason: every block of a segment is built against ONE
+	// set, and re-deriving between segments would leave earlier ones unmatched.
+	groups []*colGroup
 }
 
 // SchemaScanInfo reports the state of the per-segment columnar (adschema) accelerator, for
@@ -60,6 +67,13 @@ type SchemaScanInfo struct {
 	SchemaFields    int      `json:"schemaFields,omitempty"`
 	SealedSegments  int      `json:"sealedSegments,omitempty"`
 	CoveredSegments int      `json:"coveredSegments,omitempty"`
+	// GroupSchemas is how many SECONDARY schemas are built alongside the base one, and
+	// GroupSchemaFields their total field count. Zero when the feature is off, and also when it
+	// is on but no group has yet kept its members together long enough to be committed to
+	// storage -- which is the normal state for the first few maintenance passes, and the one
+	// worth being able to tell apart from "not configured".
+	GroupSchemas      int `json:"groupSchemas,omitempty"`
+	GroupSchemaFields int `json:"groupSchemaFields,omitempty"`
 	// Schema is the derived schema itself, field by field, in layout order. The counts above
 	// say how much of the table the accelerator covers; this says what it decided the ads
 	// look like -- which is what you need to judge whether the sampling recovered the shape
@@ -102,6 +116,10 @@ func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 	if st := c.schemaScan.Load(); st != nil {
 		info.Enabled = true
 		info.SchemaFields = len(st.schema.fields)
+		info.GroupSchemas = len(st.groups)
+		for _, g := range st.groups {
+			info.GroupSchemaFields += len(g.schema.fields)
+		}
 		hot := make(map[int]bool, len(st.hot))
 		for _, idx := range st.hot {
 			if idx >= 0 && idx < len(st.schema.fields) {
@@ -171,7 +189,7 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 		if err != nil {
 			return
 		}
-		st = &schemaScanState{schema: s, hot: hot, cache: bc}
+		st = &schemaScanState{schema: s, hot: hot, cache: bc, groups: c.groupSchemasFor(s)}
 		c.schemaScan.Store(st)
 	}
 	for _, sh := range c.shards {
@@ -285,13 +303,31 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 		colBuildStallHook()
 	}
 	d := seg.dict.Load() // interned segment -> resolve its local ids during transcode
-	blocks, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, c.regionCodec(), s, hot,
-		defaultColGrouping(),
+	var groups []*colGroup
+	if st := c.schemaScan.Load(); st != nil {
+		groups = st.groups
+	}
+	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.codec,
+		c.regionCodec(), s, hot, groups, defaultColGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
 	if len(blocks) == 0 {
 		return nil
 	}
-	return &colSegment{blocks: blocks, offs: offs}
+	cs := &colSegment{blocks: blocks, offs: offs}
+	// Re-key the pinned groups onto this segment's selections: the schema and members are shared,
+	// the per-block bitmaps are not.
+	for gi, g := range groups {
+		sel := &colGroup{schema: g.schema, ids: g.ids}
+		for bi := range blocks {
+			if gi < len(gblocks[bi]) {
+				sel.blocks = append(sel.blocks, gblocks[bi][gi])
+			}
+		}
+		if len(sel.blocks) == len(blocks) {
+			cs.groups = append(cs.groups, sel)
+		}
+	}
+	return cs
 }
 
 // colBlobForSeg builds and marshals seg's columnar block under the collection's CURRENT schema-scan

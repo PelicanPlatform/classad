@@ -98,6 +98,33 @@ type Options struct {
 	// header) instead of decoding the whole ad. Optional; enables the hot-closure match
 	// fast path. The frequency/HotAttrs hot set is unioned in, so queries are unaffected.
 	MatchClosureRoots []string
+	// GroupSchemaCount is how many SECONDARY columnar schemas to derive and build alongside the
+	// base one, for attributes the base schema does not carry which are present or absent
+	// together. 0 uses defaultGroupSchemas; a NEGATIVE value builds none.
+	//
+	// On by default because the base schema's coverage is otherwise hostage to the mix of ads in
+	// the table: measured on a production AP, a history table's base schema covers 90.3% of
+	// attribute occurrences until jobs removed before ever running are mixed in, at which point
+	// it falls to 51.3%, while base plus four groups holds 87-94% across the range. Enabling by
+	// default still commits no storage on the strength of one sample -- nothing is built until a
+	// group's members have kept recurring across GroupStabilityRuns maintenance passes.
+	GroupSchemaCount int
+	// GroupStabilityRuns is how many consecutive derivations a group's members must have
+	// co-occurred in before its blocks are built. 0 uses the default; 1 disables the gate.
+	GroupStabilityRuns int
+	// GroupMergeJaccard widens a group by absorbing attributes whose presence pattern is at least
+	// this similar. 0 uses defaultGroupJaccard; a NEGATIVE value keeps exact co-occurrence only.
+	// GroupMaxPartialFrac bounds the fraction of ads that may then hold only PART of a group and
+	// take the slow path for it; 0 uses defaultGroupMaxPartial.
+	//
+	// Measured against a later snapshot of the same table, widening still recovered more than
+	// exact grouping (25.14% of attribute occurrences against 23.53%), because a partial ad reads
+	// from the cold tail -- where it would have read anyway -- rather than paying a penalty. The
+	// in-sample partial rate does NOT predict the later one, though, and no widened member set
+	// reproduced across snapshots, so the stability gate refuses to build one. See
+	// mergeNearPatterns.
+	GroupMergeJaccard   float64
+	GroupMaxPartialFrac float64
 	// DemandHalfLife is how quickly recorded query demand fades, so index decisions
 	// track the current workload rather than everything the process has ever seen. 0
 	// uses defaultDemandHalfLife; negative disables decay (counters accumulate for the
@@ -275,8 +302,12 @@ type Collection struct {
 	// ops' internal reindexAfterCompaction must not re-take).
 	reindexMu sync.Mutex
 
-	demand     *demandTracker // per-attribute query demand, for SuggestIndexes
-	demandHalf time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
+	demand           *demandTracker // per-attribute query demand, for SuggestIndexes
+	demandHalf       time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
+	groupSchemaCount int            // Options.GroupSchemaCount
+	groupStability   int            // Options.GroupStabilityRuns
+	groupJac         float64        // Options.GroupMergeJaccard
+	groupMaxPart     float64        // Options.GroupMaxPartialFrac
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
 	// (0/1 ⇒ serial). qsem is a collection-wide token pool bounding total scan
@@ -499,9 +530,13 @@ func New(opts Options) *Collection {
 		// Private attributes are flagged once per unique name at intern time, so a
 		// redacted query (ScanRawRedacted/QueryRawRedacted) strips them with a per-id
 		// bool check instead of re-classifying every attribute of every ad.
-		intern:     wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
-		demand:     newDemandTracker(),
-		demandHalf: opts.DemandHalfLife,
+		intern:           wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
+		demand:           newDemandTracker(),
+		demandHalf:       opts.DemandHalfLife,
+		groupSchemaCount: opts.GroupSchemaCount,
+		groupStability:   opts.GroupStabilityRuns,
+		groupJac:         opts.GroupMergeJaccard,
+		groupMaxPart:     opts.GroupMaxPartialFrac,
 	}
 	c.codec.Store(&codecHolder{codec})
 	if cfg := newTTConfig(opts.TimeTravel); cfg != nil {

@@ -1546,6 +1546,13 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 				Reindex:   true,
 			})
 		}
+		// Derive and checkpoint the candidate group schemas on the ARCHIVE's cadence, which is
+		// far longer than a mutable table's -- so the stability gate's several derivations span
+		// days rather than minutes. That is the intended shape: an archive's structure should be
+		// established over the period it actually changes on.
+		if opts.ArchiveSchemaScanHotTopN > 0 {
+			a.GroupSchemas(opts.SampleMax, 0)
+		}
 		// Age and checkpoint the recorded query demand. An archive needs this more than a
 		// mutable table does: indexing one is paid for by decompressing history, so the
 		// decision wants evidence gathered over days, which is longer than a daemon can be

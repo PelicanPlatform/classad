@@ -127,10 +127,6 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 	for id, b := range present {
 		byPattern[string(b)] = append(byPattern[string(b)], id)
 	}
-	type cand struct {
-		ids    []uint32
-		holder int
-	}
 	var cands []cand
 	for pat, ids := range byPattern {
 		n := 0
@@ -141,7 +137,7 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 			continue
 		}
 		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
-		cands = append(cands, cand{ids, n})
+		cands = append(cands, cand{ids: ids, holder: n, pat: []byte(pat)})
 	}
 	// Rank by cells recovered, then by size and lowest id so the order is total and stable
 	// across runs on the same sample -- a group's identity is its members, and a report that
@@ -156,21 +152,55 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 		}
 		return cands[a].ids[0] < cands[b].ids[0]
 	})
+	// Optionally widen candidates by absorbing others whose presence pattern is nearly the same,
+	// and keep the result only if the TOP-K of it recovers more than the top-k of the exact
+	// patterns.
+	//
+	// The comparison has to be at the top-k level, because a merge is never profitable on its own:
+	// both patterns are supersets of their intersection, so
+	//
+	//	apart = |P1|*a + |P2|*b  >=  |I|*(a+b) = merged
+	//
+	// always. What widening buys is FIT -- a fixed number of group slots covering more attributes,
+	// where the patterns left outside the top k would otherwise be covered by nothing at all. So it
+	// pays exactly when there are more distinct patterns than slots, which is the normal case, and
+	// costs when there are not.
+	if c.groupJaccard() > 0 {
+		if m := mergeNearPatterns(cands, len(samples), c.groupJaccard(), c.groupMaxPartial()); len(m) > 0 {
+			sortCands(m)
+			if topKCells(m, k) > topKCells(cands, k) {
+				cands = m
+			}
+		}
+	}
 	if len(cands) > k {
 		cands = cands[:k]
 	}
 
 	out := make([]groupSchema, 0, len(cands))
 	for _, cd := range cands {
-		g := groupSchema{ids: cd.ids}
+		// Build the schema FIRST and take the membership ids from it. An attribute with no
+		// dominant storable kind is dropped from the schema, and if it stayed in the membership
+		// test a record could be "in" the group while one of its attributes was stored nowhere --
+		// so the two must be the same set by construction, not by agreement.
+		sch := buildAdSchemaFor(samples, cd.ids)
+		if sch == nil || len(sch.fields) == 0 {
+			continue
+		}
+		ids := make([]uint32, 0, len(sch.fields))
+		for _, f := range sch.fields {
+			ids = append(ids, f.id)
+		}
+		sort.Slice(ids, func(a, b int) bool { return ids[a] < ids[b] })
+		g := groupSchema{ids: ids, schema: sch}
 		// Count the three states explicitly rather than trusting the grouping. They are
 		// equal by construction here (identical presence => in or none, never partial), and
 		// the point of measuring anyway is that the same counts, recomputed on a later
 		// sample, are the drift signal -- so the code that produces them must be the code
 		// that would show a nonzero partial.
-		want := len(cd.ids)
+		want := len(ids)
 		idset := make(map[uint32]struct{}, want)
-		for _, id := range cd.ids {
+		for _, id := range ids {
 			idset[id] = struct{}{}
 		}
 		for _, w := range samples {
@@ -191,7 +221,6 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 			}
 		}
 		g.cells = g.in * want
-		g.schema = buildAdSchemaFor(samples, cd.ids)
 		out = append(out, g)
 	}
 	return out
@@ -273,3 +302,257 @@ func (s *adSchema) hasField(id uint32) bool {
 	_, ok := s.byID[id]
 	return ok
 }
+
+// groupSchemasFor derives the group schemas to build alongside base schema s.
+//
+// Pinned with the base schema at enable time, for the same reason the base schema is: every block
+// of a segment is built against ONE set, so re-deriving between segments would leave earlier
+// segments' selections unmatched. A change of groups is therefore a re-schema, not a refresh.
+//
+// Off by default. A group costs a schema pointer and a block per base block, and phase 1 exists to
+// establish -- per table, on real data -- that a group's members keep co-occurring before anything
+// commits storage to them. GroupSchemaCount is that opt-in.
+func (c *Collection) groupSchemasFor(s *adSchema) []*colGroup {
+	k := c.groupSchemaCountOrDefault()
+	if k <= 0 {
+		return nil
+	}
+	samples := c.normalizeSamples(c.CollectSamplesRecentN(maxDistinctSample))
+	if len(samples) == 0 {
+		return nil
+	}
+	// Only groups whose members keep showing up together across successive derivations. A group
+	// derived once is a property of one sample; storage should follow evidence that it is a
+	// property of the data. Matched by overlap rather than identity -- see groupRecurs.
+	hist, haveHistory := c.retainedGroupSets(c.groupStabilityRuns())
+	if !haveHistory {
+		return nil // not watched long enough to commit storage to anything
+	}
+	var out []*colGroup
+	for _, g := range c.deriveGroupSchemas(samples, s, k) {
+		if g.schema == nil || len(g.schema.fields) == 0 {
+			continue
+		}
+		var names []string
+		for _, id := range g.ids {
+			if n, ok := c.schemaFieldName(id); ok {
+				names = append(names, n)
+			}
+		}
+		if !groupRecurs(names, hist, defaultGroupRecurOverlap) {
+			continue
+		}
+		out = append(out, &colGroup{schema: g.schema, ids: g.ids})
+	}
+	return out
+}
+
+// groupStabilityRuns is how many consecutive derivations a group must appear in before its blocks
+// are built. Default defaultGroupStabilityRuns; a value of 1 disables the gate (for a caller that
+// has its own evidence, and for tests).
+func (c *Collection) groupStabilityRuns() int {
+	if c.groupStability != 0 {
+		return c.groupStability
+	}
+	return defaultGroupStabilityRuns
+}
+
+// defaultGroupRecurOverlap is how much of a candidate's member set must be shared with a group in
+// each retained derivation for it to count as the same structure. Measured: the widened groups that
+// kept paying matched at 0.94 and 0.87 across snapshots, and the one whose members stopped
+// co-occurring matched nothing -- so a half-shared set separates them with room either side.
+const defaultGroupRecurOverlap = 0.5
+
+// defaultGroupStabilityRuns is deliberately small. The cost of waiting is that a good group is not
+// built for a few maintenance passes; the cost of not waiting is storage committed to a set that
+// stops co-occurring, which then shows up as a partial rate and a slow path.
+const defaultGroupStabilityRuns = 3
+
+// cand is one candidate group: its member attribute ids, how many sampled ads hold the pattern,
+// and the presence pattern itself (one bit per sampled ad).
+type cand struct {
+	ids    []uint32
+	holder int
+	pat    []byte
+}
+
+// mergeNearPatterns widens candidates by absorbing others whose presence pattern is NEARLY the
+// same, which is what buys coverage beyond exact co-occurrence.
+//
+// Exact grouping keeps the partial state -- an ad holding some but not all of a group -- impossible
+// within the sample. That is a strong guarantee and it leaves coverage on the table: measured on a
+// production queue, relaxing to a Jaccard of 0.99 recovered 17% more columnar cells at a partial
+// rate of 0.071%.
+//
+// Partial is not free. A partial record's values are not in the group block, so reading one of its
+// group attributes costs a base cold-tail lookup, and if the columnar path is F times faster a
+// partial fraction p forfeits roughly p*F of the benefit -- so p wants to be well under 1/F. That
+// is what maxPartial bounds, and a merge that would breach it is rejected rather than scored: a
+// group is not worth having at any coverage if reading it is usually the slow way.
+//
+// Greedy from the highest-ranked candidate down, so a widened group grows around the pattern that
+// already recovers the most, and each absorbed pattern leaves the pool.
+//
+// MEASURED ACROSS SNAPSHOTS. Widening holds up, but not in the way the in-sample numbers suggest.
+// Deriving on one production snapshot and scoring against another taken hours later:
+//
+//	coverage   exact 16.46% -> 23.53%      widened 18.86% -> 25.14%
+//	partial    exact  0.000% -> 0.000%     widened worst group 0.075% -> 45.792%
+//
+// Widening still recovers MORE than exact on the holdout. The partial rate is not a penalty
+// against that: a partial ad reads its group attributes from the base block's cold tail, which is
+// exactly where they would be if the group did not exist -- so partial is benefit not realized,
+// never harm. What the holdout does say is that an in-sample partial ceiling predicts nothing,
+// because a merge is fitted to the sample that suggested it: the group that read 0.075% when
+// derived read 45.8% later, when one member's presence moved the opposite way from the rest
+// (ReqPeriodicRelease rose 56.5% -> 72.0% while the other three fell to 26.3%).
+//
+// Two consequences worth keeping. The exception lookup must not assume a small list -- it binary
+// searches for this reason. And widened member sets are sample-dependent: across three snapshots
+// 3 of 4 EXACT groups reproduced their member set and 0 of 4 widened ones did, so the stability
+// gate refuses to build any widened group. That gate is currently the binding constraint on this
+// feature, not the partial rate.
+func mergeNearPatterns(cands []cand, nSamples int, minJaccard, maxPartial float64) []cand {
+	used := make([]bool, len(cands))
+	out := make([]cand, 0, len(cands))
+	for i := range cands {
+		if used[i] {
+			continue
+		}
+		used[i] = true
+		merged := cands[i]
+		// The union and intersection of the absorbed patterns give the merged group's counts
+		// directly: intersection = ads holding EVERY member, union minus that = partial.
+		union := append([]byte(nil), merged.pat...)
+		inter := append([]byte(nil), merged.pat...)
+		for j := i + 1; j < len(cands); j++ {
+			if used[j] || jaccardBits(merged.pat, cands[j].pat) < minJaccard {
+				continue
+			}
+			nu := orBytes(union, cands[j].pat)
+			ni := andBytes(inter, cands[j].pat)
+			partial := popcountBytes(nu) - popcountBytes(ni)
+			if nSamples > 0 && float64(partial)/float64(nSamples) > maxPartial {
+				continue // this absorption would cost more slow-path reads than it buys columns
+			}
+			union, inter = nu, ni
+			merged.ids = append(merged.ids, cands[j].ids...)
+			used[j] = true
+		}
+		if len(merged.ids) > len(cands[i].ids) {
+			sort.Slice(merged.ids, func(a, b int) bool { return merged.ids[a] < merged.ids[b] })
+			merged.pat = inter // the ads holding every member of the widened group
+			merged.holder = popcountBytes(inter)
+		}
+		out = append(out, merged)
+	}
+	return out
+}
+
+// jaccardBits is |a AND b| / |a OR b| over two presence bitmaps.
+func jaccardBits(a, b []byte) float64 {
+	u := popcountBytes(orBytes(a, b))
+	if u == 0 {
+		return 0
+	}
+	return float64(popcountBytes(andBytes(a, b))) / float64(u)
+}
+
+func orBytes(a, b []byte) []byte {
+	out := make([]byte, max(len(a), len(b)))
+	copy(out, a)
+	for i := range b {
+		if i < len(out) {
+			out[i] |= b[i]
+		}
+	}
+	return out
+}
+
+func andBytes(a, b []byte) []byte {
+	n := min(len(a), len(b))
+	out := make([]byte, n)
+	for i := 0; i < n; i++ {
+		out[i] = a[i] & b[i]
+	}
+	return out
+}
+
+func popcountBytes(b []byte) int {
+	n := 0
+	for _, x := range b {
+		n += popcount8(x)
+	}
+	return n
+}
+
+// groupMaxPartial bounds the fraction of ads that may hold only part of a widened group.
+func (c *Collection) groupMaxPartial() float64 {
+	if c.groupMaxPart > 0 {
+		return c.groupMaxPart
+	}
+	return defaultGroupMaxPartial
+}
+
+// defaultGroupMaxPartial is the partial-rate ceiling for a widened group. A tenth of a percent
+// forfeits well under 1% of the benefit at the columnar speedups measured here; the ceiling exists
+// to stop a merge trading a large slow-path fraction for a little coverage.
+const defaultGroupMaxPartial = 0.001
+
+// sortCands orders candidates by the cells they recover, then by size and lowest id so the order is
+// total and stable across runs on the same sample.
+func sortCands(cands []cand) {
+	sort.Slice(cands, func(a, b int) bool {
+		ca, cb := len(cands[a].ids)*cands[a].holder, len(cands[b].ids)*cands[b].holder
+		if ca != cb {
+			return ca > cb
+		}
+		if len(cands[a].ids) != len(cands[b].ids) {
+			return len(cands[a].ids) > len(cands[b].ids)
+		}
+		return cands[a].ids[0] < cands[b].ids[0]
+	})
+}
+
+// topKCells is what the best k of these candidates would make columnar.
+func topKCells(cands []cand, k int) int {
+	total := 0
+	for i := 0; i < len(cands) && i < k; i++ {
+		total += len(cands[i].ids) * cands[i].holder
+	}
+	return total
+}
+
+// groupSchemaCountOrDefault resolves Options.GroupSchemaCount: 0 takes the default, negative
+// disables. Negative rather than 0 for "off" because 0 is what a caller who never heard of the
+// option passes, and the option is worth having on for them.
+func (c *Collection) groupSchemaCountOrDefault() int {
+	if c.groupSchemaCount < 0 {
+		return 0
+	}
+	if c.groupSchemaCount == 0 {
+		return defaultGroupSchemas
+	}
+	return c.groupSchemaCount
+}
+
+// groupJaccard resolves Options.GroupMergeJaccard the same way: 0 takes the default, negative keeps
+// exact co-occurrence only.
+func (c *Collection) groupJaccard() float64 {
+	if c.groupJac < 0 {
+		return 0
+	}
+	if c.groupJac == 0 {
+		return defaultGroupJaccard
+	}
+	return c.groupJac
+}
+
+// defaultGroupJaccard widens a group to attributes whose presence pattern is at least this similar.
+//
+// Measured across production snapshots: widening recovered 18.86% of attribute occurrences against
+// exact grouping's 16.46%, and held that lead on a later snapshot (25.14% against 23.53%) even
+// after one widened group's members stopped co-occurring. The partial rate that drift produces is
+// not a penalty -- a partial ad reads from the base cold tail, exactly where it would have read
+// without the group -- and the drifted group's whole cost against the table was under 1%.
+const defaultGroupJaccard = 0.99

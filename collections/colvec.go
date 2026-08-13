@@ -84,6 +84,14 @@ type blockVecSource struct {
 	// turned a 512-entry dictionary into ~12 KB of garbage per block.
 	dicts map[int]*blockDict
 
+	// Group schemas for the current segment and their selections for the current block, so a group
+	// column can be loaded (see loadGroupColumn).
+	groups  []*colGroup
+	gblocks []*colGroupBlock
+	// gsrc holds one reusable sub-source per group, bound to that group's block, so a group column
+	// is loaded by exactly the same code that loads a base column.
+	gsrc []*blockVecSource
+
 	// dictBuf is the parse buffer for PRUNING, which reads a dictionary and does not retain it.
 	dictBuf [][]byte
 }
@@ -104,6 +112,11 @@ func (s *blockVecSource) LoadColumn(name string, scope ast.AttributeScope, dst *
 	}
 	idx, ok := s.blk.schema.byID[id]
 	if !ok {
+		// Not a base field. A group schema may carry it, in which case the column is presented at
+		// full length with non-members undefined (see loadGroupColumn).
+		if loaded, handled := s.loadGroupColumn(name, dst); handled {
+			return loaded
+		}
 		return false
 	}
 	f := s.blk.schema.fields[idx]
@@ -384,7 +397,7 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
 			strEq := plan.stringEq(c, q, seg.schema())
 			base := 0
-			for _, blk := range seg.blocks {
+			for bi, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {
 					split.prunedBlocks++
 					base += blk.n
@@ -431,16 +444,19 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 				if nLive*minLiveDen < blk.n*minLiveNum {
 					split.churnBlocks++
 					cs.setBlock(blk)
+					cs.setGroups(seg, bi)
 					count += c.countBlockScoped(cs, resolver, m, fallbackM, w, seg, blk, base, s0)
 					base += blk.n
 					continue
 				}
 				src.blk = blk
+				src.setGroups(seg, bi)
 				vec, ok := q.VecEval(src, blk.n, scratch)
 				if !ok {
 					// This block only. Every other block still vectorizes.
 					split.scopeBlocks++
 					cs.setBlock(blk)
+					cs.setGroups(seg, bi)
 					count += c.countBlockScoped(cs, resolver, m, fallbackM, w, seg, blk, base, s0)
 					base += blk.n
 					continue

@@ -58,6 +58,14 @@ type colScope struct {
 
 	strScratch []byte
 
+	// Group schemas for the current segment, and their selections for the current base block
+	// (index-aligned with groups). bindG caches name -> (group, field) as bind does for the base
+	// schema; gscope holds one reusable sub-scope per group, bound to that group's block.
+	groups  []*colGroup
+	gblocks []*colGroupBlock
+	bindG   map[string]groupBind
+	gscope  []*colScope
+
 	// dictEnt caches parsed dictionary entries PER FIELD for the current block, dropped by setBlock.
 	//
 	// colScope evaluates per record, so parsing a dictionary inside slotString would parse it once per
@@ -104,6 +112,11 @@ func (cs *colScope) resolve(name string, scope ast.AttributeScope) classad.Value
 		return classad.NewUndefinedValue()
 	}
 	if idx == bindColdTail {
+		// Not a base-schema field. A group schema may carry it, in which case the membership bit
+		// answers -- often without reading anything at all.
+		if v, handled := cs.resolveGroup(name); handled {
+			return v
+		}
 		id, ok := cs.c.intern.LookupID(name)
 		if !ok {
 			return classad.NewUndefinedValue()
@@ -114,6 +127,13 @@ func (cs *colScope) resolve(name string, scope ast.AttributeScope) classad.Value
 		// Escaped: missing, or present but not storable in its slot. Both live in the cold tail.
 		return cs.fromColdTail(cs.blk.schema.fields[idx].id)
 	}
+	return cs.slotValue(idx)
+}
+
+// slotValue reads the in-slot value of schema field idx for the current record. Split out of
+// resolve so the group path (colgroupread.go) reads a group column through exactly the same
+// readers, rather than a parallel copy that could diverge.
+func (cs *colScope) slotValue(idx int) classad.Value {
 	f := cs.blk.schema.fields[idx]
 	switch f.kind {
 	case akInt:
@@ -473,12 +493,13 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 			}
 			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
 			base := 0
-			for _, blk := range seg.blocks {
+			for bi, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {
 					base += blk.n
 					continue
 				}
 				cs.setBlock(blk)
+				cs.setGroups(seg, bi)
 				count += c.countBlockScoped(cs, resolver, m, fallbackM, w, seg, blk, base, s0)
 				base += blk.n
 			}

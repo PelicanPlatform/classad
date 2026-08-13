@@ -279,3 +279,137 @@ func TestGroupSchemasRankByCellsNotSize(t *testing.T) {
 		t.Errorf("wide cells %d <= narrow cells %d; ranking premise broken", wide.Cells, narrow.Cells)
 	}
 }
+
+// TestGroupStabilityGate: blocks are built only for groups whose members have kept co-occurring
+// across successive derivations.
+//
+// The gate is over TIME, not over a holdout of the current sample, and the difference is measured
+// rather than assumed: a random split of one production snapshot showed 0.000% partial for every
+// group -- an in-sample holdout would have passed the group that later frayed -- while the same
+// groups against a snapshot hours later showed one at 0.167%.
+func TestGroupStabilityGate(t *testing.T) {
+	newColl := func(t *testing.T, dir string) *Collection {
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14, GroupSchemaCount: 4})
+		if err != nil {
+			t.Fatal(err)
+		}
+		loadGroupCorpus(t, c, groupCorpus(2000, 40, 30))
+		return c
+	}
+
+	t.Run("no history builds nothing", func(t *testing.T) {
+		c := newColl(t, t.TempDir())
+		defer c.Close()
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Fatal("schema scan did not enable")
+		}
+		st := c.schemaScan.Load()
+		if st == nil {
+			t.Fatal("no scan state")
+		}
+		if len(st.groups) != 0 {
+			t.Errorf("built %d group(s) with no derivation history; storage must follow evidence", len(st.groups))
+		}
+	})
+
+	t.Run("stable groups are built", func(t *testing.T) {
+		c := newColl(t, t.TempDir())
+		defer c.Close()
+		for range 3 {
+			c.GroupSchemas(4096, 4)
+		}
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Fatal("schema scan did not enable")
+		}
+		st := c.schemaScan.Load()
+		if st == nil || len(st.groups) == 0 {
+			t.Fatal("no groups built after three consistent derivations")
+		}
+	})
+
+	t.Run("gate disabled builds immediately", func(t *testing.T) {
+		dir := t.TempDir()
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14,
+			GroupSchemaCount: 4, GroupStabilityRuns: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		loadGroupCorpus(t, c, groupCorpus(2000, 40, 30))
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Fatal("schema scan did not enable")
+		}
+		if st := c.schemaScan.Load(); st == nil || len(st.groups) == 0 {
+			t.Error("GroupStabilityRuns=1 must waive the gate")
+		}
+	})
+}
+
+// TestGroupGateMatchesByOverlap: the gate accepts a group whose members keep showing up together
+// even when the exact list shifts, and rejects one that stops recurring.
+//
+// Identity matching was too strict and measurably so: across three production snapshots, 0 of 4
+// widened groups reproduced their member set exactly, so an identity gate rejected every one --
+// including a group holding 16.7% of the table's attribute occurrences.
+func TestGroupGateMatchesByOverlap(t *testing.T) {
+	hist := [][][]string{
+		{{"A", "B", "C", "D"}, {"X", "Y"}},
+		{{"A", "B", "C", "E"}, {"X", "Y"}}, // same structure, one member swapped
+	}
+	for _, tc := range []struct {
+		name string
+		cand []string
+		want bool
+	}{
+		{"identical", []string{"A", "B", "C", "D"}, true},
+		{"one member differs", []string{"A", "B", "C", "F"}, true},
+		{"half shared", []string{"A", "B", "P", "Q"}, false},
+		{"case differs", []string{"a", "b", "c", "d"}, true},
+		{"unrelated", []string{"P", "Q", "R"}, false},
+		{"present in one derivation only", []string{"X", "Y", "Z", "W", "V"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := groupRecurs(tc.cand, hist, defaultGroupRecurOverlap); got != tc.want {
+				t.Errorf("groupRecurs(%v) = %v, want %v", tc.cand, got, tc.want)
+			}
+		})
+	}
+	// No history at all means the gate is off, not that everything fails.
+	if !groupRecurs([]string{"A"}, nil, defaultGroupRecurOverlap) {
+		t.Error("an empty history must not reject; that is the gate being disabled")
+	}
+}
+
+// TestGroupSchemaDefaults pins the defaults and the disable path. Zero means "caller did not say",
+// which for these is the configuration worth having, so OFF has to be spelled negative.
+func TestGroupSchemaDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		count       int
+		jac         float64
+		wantCount   int
+		wantJaccard float64
+	}{
+		{"unset takes the defaults", 0, 0, defaultGroupSchemas, defaultGroupJaccard},
+		{"explicit values honoured", 6, 0.95, 6, 0.95},
+		{"negative disables groups", -1, 0, 0, defaultGroupJaccard},
+		{"negative keeps exact grouping", 0, -1, defaultGroupSchemas, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(Options{Shards: 1, GroupSchemaCount: tc.count, GroupMergeJaccard: tc.jac})
+			defer c.Close()
+			if got := c.groupSchemaCountOrDefault(); got != tc.wantCount {
+				t.Errorf("group count = %d, want %d", got, tc.wantCount)
+			}
+			if got := c.groupJaccard(); got != tc.wantJaccard {
+				t.Errorf("jaccard = %v, want %v", got, tc.wantJaccard)
+			}
+		})
+	}
+	if defaultGroupSchemas != 4 {
+		t.Errorf("defaultGroupSchemas = %d, want 4", defaultGroupSchemas)
+	}
+	if defaultGroupJaccard != 0.99 {
+		t.Errorf("defaultGroupJaccard = %v, want 0.99", defaultGroupJaccard)
+	}
+}
