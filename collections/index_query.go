@@ -1158,7 +1158,10 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, revers
 		if isSystemKeyBytes(recKey(w.data, o)) {
 			return false
 		}
-		ww, err := w.codec.Decompress(dbuf[:0], recAd(w.data, o))
+		// The record's FULL ad. In a columnarized segment the record itself holds only the
+		// attributes the schema does not cover, so decompressing it here would hand the consumer
+		// a partial ad that looks complete.
+		ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, dbuf)
 		if err != nil {
 			return false
 		}

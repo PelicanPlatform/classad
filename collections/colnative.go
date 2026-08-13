@@ -127,7 +127,16 @@ func publishColNative(c *Collection, seg *segment) {
 func colNativeBlobRedundant(seg *segment) bool { return seg != nil && seg.colNative.Load() != nil }
 
 func (c *Collection) recordWire(seg *segment, off uint32, buf []byte) ([]byte, error) {
-	raw, err := seg.codec.Decompress(buf[:0], recAd(seg.data, off))
+	return c.recordWireIn(seg, seg.data, off, buf)
+}
+
+// recordWireIn is recordWire reading through a caller-supplied view of the segment's bytes.
+//
+// A scan holds a frozen WINDOW over the segment, and that window is what keeps the mapping alive: a
+// sealed segment can be retired and unmapped while a scan still walks it, so reading seg.data
+// directly would be a use-after-munmap. The window's slice is passed in instead.
+func (c *Collection) recordWireIn(seg *segment, data []byte, off uint32, buf []byte) ([]byte, error) {
+	raw, err := seg.codec.Decompress(buf[:0], recAd(data, off))
 	if err != nil {
 		return nil, err
 	}

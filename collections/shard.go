@@ -688,93 +688,53 @@ func releaseWindows(wins []segWindow) {
 // codec they were compressed with) of each record visible at S0
 // (seq <= S0 < supersededBySeq) — exactly one version per key that existed at S0.
 // fn returns false to stop early.
-func forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec, dict *segDictHandle) bool) {
-	for _, w := range wins {
-		d := w.dict()
-		for off := 0; off < w.used; {
-			o := uint32(off)
-			total := recTotalLen(w.data, o)
-			if total == 0 {
-				break // malformed guard; should not happen
-			}
-			if recIsMarker(w.data, o) {
-				off += int(total) // time-checkpoint marker, not a data record
-				continue
-			}
-			seq := recSeq(w.data, o)
-			sup := recSuperseded(w.data, o)
-			if seq <= s0 && sup > s0 {
-				if !fn(recAd(w.data, o), w.codec, d) {
-					return
-				}
-			}
-			off += int(total)
+// The byte-passing iterators below hand a callback the record's ad bytes and the codec to decode
+// them with. That is the older shape, and it is kept because most callers genuinely want a whole ad
+// and nothing else. It is safe over a COLUMNARIZED segment (colnative.go), whose records store only
+// the attributes the schema does not cover, because these wrappers reassemble the full ad first and
+// then hand it over with an identity codec -- so a callback decodes plain wire bytes and sees a
+// complete ad without knowing which shape the segment used.
+//
+// The reassembly happens only for a columnarized segment, and the scratch buffer is reused across
+// records, so an ordinary segment pays nothing. A caller on a hot path that wants to read single
+// attributes rather than whole ads should use the recRef forms directly and ask the columns.
+
+// forEachVisible walks the frozen windows and calls fn with each visible record's full ad bytes and
+// the codec to decode them with.
+func (c *Collection) forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec, dict *segDictHandle) bool) {
+	var rbuf []byte
+	forEachVisibleRef(s0, wins, func(r recRef) bool {
+		ad, codec, ok := c.adBytes(r, &rbuf)
+		if !ok {
+			return true
 		}
-	}
+		return fn(ad, codec, r.dict)
+	})
 }
 
-// forEachVisibleKeyed is forEachVisible that also passes each record's key (a
-// view into the frozen window; the callback must not retain it). Used by the
-// chained scan, which needs a record's key to find its parent.
-func forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
-	for _, w := range wins {
-		d := w.dict()
-		for off := 0; off < w.used; {
-			o := uint32(off)
-			total := recTotalLen(w.data, o)
-			if total == 0 {
-				break
-			}
-			if recIsMarker(w.data, o) {
-				off += int(total) // time-checkpoint marker, not a data record
-				continue
-			}
-			seq := recSeq(w.data, o)
-			sup := recSuperseded(w.data, o)
-			if seq <= s0 && sup > s0 {
-				if !fn(recKey(w.data, o), recAd(w.data, o), w.codec, d) {
-					return
-				}
-			}
-			off += int(total)
+// forEachVisibleKeyed is forEachVisible that also passes each record's key (a view into the frozen
+// window; the callback must not retain it). Used by the chained scan, which needs a record's key to
+// find its parent.
+func (c *Collection) forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
+	var rbuf []byte
+	forEachVisibleRef(s0, wins, func(r recRef) bool {
+		ad, codec, ok := c.adBytes(r, &rbuf)
+		if !ok {
+			return true
 		}
-	}
+		return fn(r.key(), ad, codec, r.dict)
+	})
 }
 
-// forEachVisibleKeyedReverse is forEachVisibleKeyed in newest-first order: it
-// walks the windows from the last (newest) segment backward and, within each
-// segment, visits records back-to-front. Because records are variable-length and
-// self-describe only their forward length, each window's record offsets are
-// collected in a single forward pass, then replayed in reverse -- so the whole
-// walk is still O(records), just with a per-segment offset slice. A caller that
-// stops early after K records therefore receives the K most recently appended.
-func forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
-	var offs []uint32 // reused across windows
-	for wi := len(wins) - 1; wi >= 0; wi-- {
-		w := wins[wi]
-		d := w.dict()
-		offs = offs[:0]
-		for off := 0; off < w.used; {
-			o := uint32(off)
-			total := recTotalLen(w.data, o)
-			if total == 0 {
-				break
-			}
-			offs = append(offs, o)
-			off += int(total)
+// forEachVisibleKeyedReverse is forEachVisibleKeyed in newest-first order, so a caller that stops
+// early after K records receives the K most recently appended.
+func (c *Collection) forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
+	var rbuf []byte
+	forEachVisibleRefReverse(s0, wins, func(r recRef) bool {
+		ad, codec, ok := c.adBytes(r, &rbuf)
+		if !ok {
+			return true
 		}
-		for i := len(offs) - 1; i >= 0; i-- {
-			o := offs[i]
-			if recIsMarker(w.data, o) {
-				continue // time-checkpoint marker, not a data record
-			}
-			seq := recSeq(w.data, o)
-			sup := recSuperseded(w.data, o)
-			if seq <= s0 && sup > s0 {
-				if !fn(recKey(w.data, o), recAd(w.data, o), w.codec, d) {
-					return
-				}
-			}
-		}
-	}
+		return fn(r.key(), ad, codec, r.dict)
+	})
 }

@@ -18,7 +18,7 @@ func TestDecodeRawMatchesFull(t *testing.T) {
 	checked := 0
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		forEachVisible(s0, wins, func(ad []byte, codec Codec, _ *segDictHandle) bool {
+		c.forEachVisible(s0, wins, func(ad []byte, codec Codec, _ *segDictHandle) bool {
 			full, err := c.decodeAd(ad, codec)
 			if err != nil {
 				t.Fatalf("decodeAd: %v", err)
@@ -81,7 +81,7 @@ func BenchmarkDecodeSend(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			for _, sh := range c.shards {
 				s0, wins := sh.snapshot()
-				forEachVisible(s0, wins, func(ad []byte, codec Codec, _ *segDictHandle) bool {
+				c.forEachVisible(s0, wins, func(ad []byte, codec Codec, _ *segDictHandle) bool {
 					a, err := c.decodeAd(ad, codec)
 					if err != nil {
 						b.Fatal(err)
@@ -105,7 +105,7 @@ func BenchmarkDecodeSend(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			for _, sh := range c.shards {
 				s0, wins := sh.snapshot()
-				forEachVisible(s0, wins, func(ad []byte, codec Codec, _ *segDictHandle) bool {
+				c.forEachVisible(s0, wins, func(ad []byte, codec Codec, _ *segDictHandle) bool {
 					exprs, _, _, ok := c.decodeAdRaw(ad, codec, buf[:0])
 					if !ok {
 						b.Fatal("decodeAdRaw ok=false")
