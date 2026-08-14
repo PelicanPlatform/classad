@@ -126,6 +126,9 @@ func publishColNative(c *Collection, seg *segment) {
 				for _, b := range cs.blocks {
 					b.remap = rm
 				}
+				for _, g := range cs.groups {
+					setGroupRemap(g.blocks, rm)
+				}
 			}
 			if cn.dict != nil {
 				cn.localOf = make(map[uint32]uint32, 256)

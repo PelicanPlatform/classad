@@ -461,7 +461,8 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 						if len(groups) > 0 {
 							// Slice the retained wire at the SAME point, so a group's membership
 							// bitmap is indexed by the base block's own record numbering.
-							groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws[:seal], regionCodec))
+							groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws[:seal], regionCodec, toLocal))
+							setGroupRemap(groupBlocks[len(groupBlocks)-1], rm)
 							m := copy(iws, iws[seal:])
 							iws = iws[:m]
 						}
@@ -485,7 +486,8 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 		fb.remap = rm
 		blocks = append(blocks, fb)
 		if len(groups) > 0 {
-			groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws, regionCodec))
+			groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws, regionCodec, toLocal))
+			setGroupRemap(groupBlocks[len(groupBlocks)-1], rm)
 		}
 	}
 	if len(blocks) == 0 {
@@ -915,4 +917,14 @@ func (r *idRemap) stored(id uint32) uint32 {
 		return v
 	}
 	return id
+}
+
+// setGroupRemap hands a row group's selections the same id translation the base block carries, so a
+// group column's cold tail is read in the space it was written in.
+func setGroupRemap(gbs []*colGroupBlock, rm *idRemap) {
+	for _, gb := range gbs {
+		if gb != nil && gb.blk != nil {
+			gb.blk.remap = rm
+		}
+	}
 }

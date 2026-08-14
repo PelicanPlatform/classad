@@ -151,7 +151,10 @@ func groupHave(w []byte, ids map[uint32]struct{}) int {
 // a record carries, which the base schema's row form has already flattened away (an attribute it
 // does not carry is indistinguishable from one it stores as escaped). Each member record is then
 // re-encoded under the GROUP's schema, which is the row form its own block needs.
-func buildGroupBlocks(groups []*colGroup, iws [][]byte, regionCodec Codec) []*colGroupBlock {
+// toLocal keys these blocks' cold tails by the SEGMENT's dictionary, for the same reason the base
+// block's are: an id written from the global intern table means nothing after a restart. nil keeps
+// them globally keyed, which is self-consistent but does not survive one.
+func buildGroupBlocks(groups []*colGroup, iws [][]byte, regionCodec Codec, toLocal func(uint32) (uint32, bool)) []*colGroupBlock {
 	if len(groups) == 0 || len(iws) == 0 {
 		return nil
 	}
@@ -169,7 +172,7 @@ func buildGroupBlocks(groups []*colGroup, iws [][]byte, regionCodec Codec) []*co
 				// none: every member attribute is undefined for this record, provably
 			case len(g.ids):
 				gb.members[k>>3] |= 1 << uint(k&7)
-				members = append(members, g.schema.encode(wire.Ad(iw)))
+				members = append(members, g.schema.encodeExceptLocal(wire.Ad(iw), nil, toLocal))
 			default:
 				gb.exceptions = append(gb.exceptions, uint32(k))
 			}
@@ -178,11 +181,7 @@ func buildGroupBlocks(groups []*colGroup, iws [][]byte, regionCodec Codec) []*co
 		if len(members) > 0 {
 			// No hot tier for a group column yet: the groups are derived from presence, so
 			// nothing here says which of their columns queries read.
-			// nil: a group block's records are encoded against the group's own (global) schema, so its
-			// cold tail is keyed globally and its escape classification must be too. Self-consistent,
-			// and therefore unchanged -- but see encodeExceptLocal: it is not durable across a restart,
-			// which is a gap these blocks still share.
-			gb.blk = encodeColumnarBlock(g.schema, members, nil, regionCodec, nil)
+			gb.blk = encodeColumnarBlock(g.schema, members, nil, regionCodec, groupColdToField(g.schema, toLocal))
 		}
 		out[gi] = gb
 	}
@@ -212,4 +211,19 @@ func groupSkipSet(groups []*colGroup, iw []byte) map[uint32]struct{} {
 		}
 	}
 	return skip
+}
+
+// groupColdToField maps a group block's cold-tail ids to its schema's field indexes, in whichever id
+// space the tail was written in. See classifyEscapes for what goes wrong when the two disagree.
+func groupColdToField(s *adSchema, toLocal func(uint32) (uint32, bool)) map[uint32]int {
+	if toLocal == nil {
+		return nil
+	}
+	m := make(map[uint32]int, len(s.fields))
+	for idx, f := range s.fields {
+		if lid, ok := toLocal(f.id); ok {
+			m[lid] = idx
+		}
+	}
+	return m
 }
