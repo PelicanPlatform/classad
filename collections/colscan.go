@@ -28,8 +28,12 @@ type colSegment struct {
 	// an attribute missing from it is missing from the BLOCK, not from the record. Derived from
 	// the segment at publish rather than stored, so the on-disk format is unchanged.
 	schemaOnly bool
-	blocks     []*columnarBlock
-	offs       []uint32
+	// dictKeyed records that the cold tails are keyed by the SEGMENT's dictionary, which is durable.
+	// When false the payload was built for a segment with no dictionary and its tails carry global
+	// intern ids, which are renumbered at every Open -- so the section names them instead.
+	dictKeyed bool
+	blocks    []*columnarBlock
+	offs      []uint32
 	// groups are the group schemas' selections, one colGroupBlock per group per base block. Empty
 	// when the collection carries no group schemas.
 	groups []*colGroup
@@ -345,11 +349,12 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 	}
 	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.codec,
 		c.regionCodec(), s, hot, groups, c.colGrouping(),
-		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
+		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) },
+		c.segIDMapper(d))
 	if len(blocks) == 0 {
 		return nil
 	}
-	cs := &colSegment{blocks: blocks, offs: offs}
+	cs := &colSegment{blocks: blocks, offs: offs, dictKeyed: d != nil}
 	// Re-key the pinned groups onto this segment's selections: the schema and members are shared,
 	// the per-block bitmaps are not.
 	for gi, g := range groups {

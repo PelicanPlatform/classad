@@ -260,6 +260,12 @@ type columnarBlock struct {
 	// escAbsent has a bit per schema field, set when NO record in this block carries it -- an exact
 	// whole-block proof that the attribute is undefined here.
 	escAbsent []byte
+	// remap translates between the ids this block's cold tail was written with and the current
+	// process's. nil when the two coincide.
+	remap *idRemap
+	// coldIDs are the attribute ids this block's cold tail holds. A segment with no dictionary has
+	// no durable id space of its own, so the section names these instead; see marshalColSegment.
+	coldIDs map[uint32]struct{}
 }
 
 // blockZone is one numeric column's range within a block.
@@ -310,7 +316,7 @@ func layoutColumnar(b *columnarBlock, s *adSchema, hotNumFields []int, n int) {
 	}
 }
 
-func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionCodec Codec) *columnarBlock {
+func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionCodec Codec, coldToField map[uint32]int) *columnarBlock {
 	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: regionCodec, n: len(recs)}
 	layoutColumnar(b, s, hotNumFields, len(recs))
 	cp := 0
@@ -328,6 +334,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 	// the loop is what writes that region.
 	dicts, dictRaw, codeRaw := buildStrDicts(s, recs, len(recs))
 	var strCat, coldCat []byte
+	coldIDs := map[uint32]struct{}{}
 	b.strOff = []int{0}
 	b.coldOff = []int{0}
 	for k, r := range recs {
@@ -350,11 +357,13 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 			}
 		}
 		coldCat = append(coldCat, cold...)
+		collectColdIDs(cold, coldIDs)
 		b.strOff = append(b.strOff, len(strCat))
 		b.coldOff = append(b.coldOff, len(coldCat))
 	}
+	b.coldIDs = coldIDs
 	b.zones = numericZones(s, b, recs)
-	b.escClass, b.escExcRecs, b.escAbsent = classifyEscapes(s, recs)
+	b.escClass, b.escExcRecs, b.escAbsent = classifyEscapes(s, recs, coldToField)
 	if dicts != nil {
 		b.strDict = dicts
 		b.strDictComp = regionCodec.Compress(nil, dictRaw)
@@ -386,7 +395,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 // interned collection; a decode/re-encode for an inline/persistent one). encode reads the
 // id-keyed form, so a non-interned record must be converted first or the block would be empty.
 func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool)) ([]*columnarBlock, []uint32) {
-	blocks, _, offs := buildColumnarFromSegmentGrouped(data, upto, arenaCodec, regionCodec, s, hot, nil, g, toInterned)
+	blocks, _, offs := buildColumnarFromSegmentGrouped(data, upto, arenaCodec, regionCodec, s, hot, nil, g, toInterned, nil)
 	return blocks, offs
 }
 
@@ -396,7 +405,23 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 // It keeps each pending record's INTERNED WIRE alongside its base row, because group membership is
 // a question the base row can no longer answer (see buildGroupBlocks). The retained wire is bounded
 // by the same group budget that bounds the pending rows.
-func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+	// The cold tail is keyed by the segment's dictionary when there is one, so the classifier and the
+	// readers have to speak the same id space. Both maps are derived from the schema once, rather than
+	// per record.
+	var coldToField map[uint32]int
+	var rm *idRemap
+	if toLocal != nil {
+		coldToField = make(map[uint32]int, len(s.fields))
+		rm = &idRemap{toStored: make(map[uint32]uint32, len(s.fields)), toCurrent: make(map[uint32]uint32, len(s.fields))}
+		for idx, f := range s.fields {
+			if lid, ok := toLocal(f.id); ok {
+				coldToField[lid] = idx
+				rm.toStored[f.id] = lid
+				rm.toCurrent[lid] = f.id
+			}
+		}
+	}
 	var blocks []*columnarBlock
 	var groupBlocks [][]*colGroupBlock
 	var recs [][]byte
@@ -424,7 +449,7 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 					if len(groups) > 0 {
 						skip = groupSkipSet(groups, iw)
 					}
-					rec := s.encodeExcept(wire.Ad(iw), skip)
+					rec := s.encodeExceptLocal(wire.Ad(iw), skip, toLocal)
 					recs = append(recs, rec)
 					if len(groups) > 0 {
 						iws = append(iws, append([]byte(nil), iw...))
@@ -436,11 +461,14 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 					}
 					if g.full(len(recs), groupBytes) {
 						seal, sealBytes := g.sealAt(len(recs), groupBytes, alignedRows, alignedBytes)
-						blocks = append(blocks, encodeColumnarBlock(s, recs[:seal], hot, regionCodec))
+						nb := encodeColumnarBlock(s, recs[:seal], hot, regionCodec, coldToField)
+						nb.remap = rm
+						blocks = append(blocks, nb)
 						if len(groups) > 0 {
 							// Slice the retained wire at the SAME point, so a group's membership
 							// bitmap is indexed by the base block's own record numbering.
-							groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws[:seal], regionCodec))
+							groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws[:seal], regionCodec, toLocal))
+							setGroupRemap(groupBlocks[len(groupBlocks)-1], rm)
 							m := copy(iws, iws[seal:])
 							iws = iws[:m]
 						}
@@ -460,16 +488,19 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 		off += int(total)
 	}
 	if len(recs) > 0 {
-		blocks = append(blocks, encodeColumnarBlock(s, recs, hot, regionCodec)) // short final group
+		fb := encodeColumnarBlock(s, recs, hot, regionCodec, coldToField) // short final group
+		fb.remap = rm
+		blocks = append(blocks, fb)
 		if len(groups) > 0 {
-			groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws, regionCodec))
+			groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws, regionCodec, toLocal))
+			setGroupRemap(groupBlocks[len(groupBlocks)-1], rm)
 		}
 	}
 	if len(blocks) == 0 {
 		// A segment with no encodable records still gets one empty block, so a colSegment always
 		// carries the schema it was built under (which persistence and the scan's field resolution
 		// both read from the first block).
-		blocks = append(blocks, encodeColumnarBlock(s, nil, hot, regionCodec))
+		blocks = append(blocks, encodeColumnarBlock(s, nil, hot, regionCodec, coldToField))
 	}
 	return blocks, groupBlocks, offs
 }
@@ -791,6 +822,7 @@ func (b *columnarBlock) reconstructInto(dst []byte, k int, bc *blockCache) ([]by
 // on one block share a single decompression. Callers use this only for records the scan has
 // already found escaped for fieldID; a hot/cold-column value never reaches here.
 func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (float64, bool, error) {
+	fieldID = b.remap.stored(fieldID)
 	tail, err := bc.stream(b, kindCold)
 	if err != nil {
 		return 0, false, err
@@ -823,6 +855,7 @@ func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (
 // literal it is (or on evaluating it, if it is an expression), and a value-returning accessor throws
 // exactly that away. Reads only this field, not the whole record.
 func (b *columnarBlock) escapedNode(k int, fieldID uint32, bc *blockCache) (node []byte, found bool, err error) {
+	fieldID = b.remap.stored(fieldID)
 	tail, err := bc.stream(b, kindCold)
 	if err != nil {
 		return nil, false, err
@@ -872,4 +905,49 @@ func (b *columnarBlock) escapedNumVal(k int, fieldID uint32, bc *blockCache) (co
 		cold = cold[nl:]
 	}
 	return colVal{}, false
+}
+
+// idRemap translates between the attribute ids a payload was WRITTEN with and the ids the current
+// process assigns to the same names. nil means the two spaces coincide.
+type idRemap struct {
+	toStored  map[uint32]uint32
+	toCurrent map[uint32]uint32
+}
+
+// stored maps a current intern id to the id this payload used for the same attribute.
+func (r *idRemap) stored(id uint32) uint32 {
+	if r == nil {
+		return id
+	}
+	if v, ok := r.toStored[id]; ok {
+		return v
+	}
+	return id
+}
+
+// setGroupRemap hands a row group's selections the same id translation the base block carries, so a
+// group column's cold tail is read in the space it was written in.
+func setGroupRemap(gbs []*colGroupBlock, rm *idRemap) {
+	for _, gb := range gbs {
+		if gb != nil && gb.blk != nil {
+			gb.blk.remap = rm
+		}
+	}
+}
+
+// collectColdIDs records the attribute ids a record's cold tail stores.
+func collectColdIDs(cold []byte, into map[uint32]struct{}) {
+	for len(cold) > 0 {
+		id, m := binary.Uvarint(cold)
+		if m <= 0 {
+			return
+		}
+		cold = cold[m:]
+		nl, ok := wire.NodeLen(cold)
+		if !ok || nl > len(cold) {
+			return
+		}
+		into[uint32(id)] = struct{}{}
+		cold = cold[nl:]
+	}
 }

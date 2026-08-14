@@ -67,7 +67,7 @@ func TestColumnarBlockRoundTrip(t *testing.T) {
 
 	for _, codec := range []Codec{identityCodec{}, mustZSTD(t)} {
 		for _, hot := range [][]int{nil, hotHalf(s)} { // all-cold and half-hot
-			blk := encodeColumnarBlock(s, recs, hot, codec)
+			blk := encodeColumnarBlock(s, recs, hot, codec, nil)
 			for k := range recs {
 				got, err := blk.reconstruct(k, nil)
 				if err != nil {
@@ -113,7 +113,7 @@ func TestColumnarBlockScanInt(t *testing.T) {
 
 	// Once with Memory HOT, once COLD.
 	for _, hot := range [][]int{{fidx}, nil} {
-		blk := encodeColumnarBlock(s, recs, hot, mustZSTD(t))
+		blk := encodeColumnarBlock(s, recs, hot, mustZSTD(t), nil)
 		seen := 0
 		err := blk.scanInt(fidx, nil, func(k int, p bool, v int64) {
 			seen++

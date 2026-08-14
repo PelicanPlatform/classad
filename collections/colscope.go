@@ -134,6 +134,19 @@ func (cs *colScope) resolve(name string, scope ast.AttributeScope) classad.Value
 	return cs.slotValue(idx)
 }
 
+// fallBack marks that this record needs the ordinary evaluator, and counts it.
+//
+// The counter is the point. A fallback is CORRECT -- the record is read the ordinary way and the
+// answer is right -- so a columnar path that has quietly stopped working looks exactly like one that
+// works, only slower. That is not hypothetical: the columnar block embeds attribute ids from the
+// global intern table, which is rebuilt from scratch at every Open and numbers names in first-seen
+// order, so a block read after a restart can be addressing ids that no longer mean what they meant
+// when it was written. Every such miss lands here and is invisible without a count.
+func (cs *colScope) fallBack() {
+	cs.fellBack = true
+	columnarFallbacks.Add(1)
+}
+
 // slotValue reads the in-slot value of schema field idx for the current record. Split out of
 // resolve so the group path (colgroupread.go) reads a group column through exactly the same
 // readers, rather than a parallel copy that could diverge.
@@ -143,14 +156,14 @@ func (cs *colScope) slotValue(idx int) classad.Value {
 	case akInt:
 		v, ok := cs.slotInt(idx, f)
 		if !ok {
-			cs.fellBack = true
+			cs.fallBack()
 			return classad.NewUndefinedValue()
 		}
 		return classad.NewIntValue(v)
 	case akReal:
 		v, ok := cs.slotInt(idx, f)
 		if !ok {
-			cs.fellBack = true
+			cs.fallBack()
 			return classad.NewUndefinedValue()
 		}
 		return classad.NewRealValue(math.Float64frombits(uint64(v)))
@@ -159,12 +172,12 @@ func (cs *colScope) slotValue(idx int) classad.Value {
 	case akString:
 		s, ok := cs.slotString(idx)
 		if !ok {
-			cs.fellBack = true
+			cs.fallBack()
 			return classad.NewUndefinedValue()
 		}
 		return classad.NewStringValue(s)
 	}
-	cs.fellBack = true
+	cs.fallBack()
 	return classad.NewUndefinedValue()
 }
 
@@ -174,7 +187,7 @@ func (cs *colScope) slotValue(idx int) classad.Value {
 func (cs *colScope) fromColdTail(id uint32) classad.Value {
 	node, found, err := cs.blk.escapedNode(cs.k, id, cs.bc)
 	if err != nil {
-		cs.fellBack = true
+		cs.fallBack()
 		return classad.NewUndefinedValue()
 	}
 	if !found {
@@ -182,14 +195,14 @@ func (cs *colScope) fromColdTail(id uint32) classad.Value {
 			// The cold tail carries only escaped SCHEMA fields here; every other attribute stayed
 			// in the record. Absent from the block is therefore not absent from the ad, and
 			// answering "undefined" would be a wrong answer with a fast path in front of it.
-			cs.fellBack = true
+			cs.fallBack()
 			return classad.NewUndefinedValue()
 		}
 		return classad.NewUndefinedValue() // genuinely absent from this record
 	}
 	lit, ok := wire.LiteralValue(node)
 	if !ok {
-		cs.fellBack = true
+		cs.fallBack()
 		return classad.NewUndefinedValue()
 	}
 	return litToValue(lit)
@@ -583,3 +596,16 @@ func (c *Collection) rowEvalWindow(w segWindow, s0 uint64, m *vm.Matcher) int {
 	}
 	return count
 }
+
+// columnarFallbacks counts records the columnar path handed to the ordinary evaluator.
+var columnarFallbacks atomic.Int64
+
+// ColumnarFallbacks reports how many records the columnar accelerator has deferred to the row path
+// since the process started.
+//
+// It is a correctness-adjacent metric rather than a performance one. Deferring is always right, so a
+// rising count is the only outward sign that the accelerator is being bypassed -- for instance
+// because a block is addressing attribute ids from a previous process's intern table. A durability
+// test that asserts this does not grow across a restart catches that; one that only compares query
+// answers cannot, because the answers stay correct.
+func ColumnarFallbacks() int64 { return columnarFallbacks.Load() }

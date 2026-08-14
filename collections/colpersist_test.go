@@ -23,7 +23,7 @@ func TestColSegmentMarshalRoundTrip(t *testing.T) {
 	recs := encodeRows(s, wires)
 
 	for _, codec := range []Codec{identityCodec{}, mustZSTD(t)} {
-		blk := encodeColumnarBlock(s, recs, hotHalf(s), codec)
+		blk := encodeColumnarBlock(s, recs, hotHalf(s), codec, nil)
 		offs := make([]uint32, blk.n)
 		for i := range offs {
 			offs[i] = uint32(i * 7) // arbitrary stand-in arena offsets
@@ -87,7 +87,7 @@ func TestUnmarshalColSegmentTruncated(t *testing.T) {
 		wires = append(wires, c.encodeAd(mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d", 1+i, 1024+i)).AST()))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.5, Fit: 0.95})
-	blk := encodeColumnarBlock(s, encodeRows(s, wires), nil, identityCodec{})
+	blk := encodeColumnarBlock(s, encodeRows(s, wires), nil, identityCodec{}, nil)
 	full := marshalColSegment(oneBlockColSeg(blk, make([]uint32, blk.n)), c.intern.Name)
 	for _, cut := range []int{0, 1, len(full) / 2, len(full) - 1} {
 		if got := unmarshalColSegment(full[:cut], identityCodec{}, c.intern.Intern); got != nil {
@@ -109,7 +109,7 @@ func TestColSegmentSchemaNameAnchored(t *testing.T) {
 			fmt.Sprintf("Cpus=%d\nMemory=%d\nDisk=%d", 1+i%8, 1024+i*64, i*4096)).AST()))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.8, Fit: 0.95})
-	blk := encodeColumnarBlock(s, encodeRows(s, wires), hotHalf(s), identityCodec{})
+	blk := encodeColumnarBlock(s, encodeRows(s, wires), hotHalf(s), identityCodec{}, nil)
 	data := marshalColSegment(oneBlockColSeg(blk, make([]uint32, blk.n)), c.intern.Name)
 
 	// Simulate a reopen: a fresh intern table that assigns DIFFERENT ids to the same names

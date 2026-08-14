@@ -31,6 +31,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	}
 
 	d := src.dict.Load()
+
 	// Whether the schema carries an attribute, by whichever key the record uses. Built once:
 	// resolving a name through the intern table per attribute per record would dominate.
 	byName := make(map[string]struct{}, len(s.fields))
@@ -39,42 +40,14 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 			byName[strings.ToLower(n)] = struct{}{}
 		}
 	}
-	// An INTERNED segment keys its records by SEGMENT-LOCAL dictionary ids, not by the global
-	// intern ids the schema uses, so the schema's fields have to be translated into this segment's
-	// id space before a record's keys can be tested against them. Getting this wrong is silent:
-	// every id looks unknown, nothing is stripped, and the rewritten segment duplicates instead of
-	// moving -- which is exactly what it did until a real (interned) corpus caught it.
-	localCovered := map[uint32]struct{}{}
-	if d != nil {
-		for _, f := range s.fields {
-			if n, ok := c.intern.Name(f.id); ok {
-				if lid, ok := d.lookup(n); ok {
-					localCovered[lid] = struct{}{}
-				}
-			}
-		}
-	}
-	covered := func(id uint32, name string, node []byte) bool {
-		if !storableInColumn(node) {
-			return false
-		}
-		if name == "" {
-			if d != nil {
-				_, ok := localCovered[id]
-				return ok
-			}
-			_, ok := s.byID[id]
-			return ok
-		}
-		_, ok := byName[strings.ToLower(name)]
-		return ok
-	}
-	// The columnar builder sees records AFTER recordToInternedDict, which resolves local ids to
-	// global ones, so its half is tested in the global space.
-	coveredGlobal := func(id uint32, name string, node []byte) bool {
-		if !storableInColumn(node) {
-			return false
-		}
+	// Moving the non-schema attributes into the block's cold tail is only safe for an INTERNED
+	// segment. The cold tail keys its entries by the segment's dictionary, which is durable; without a
+	// dictionary it falls back to global intern ids, which are rebuilt in first-seen order at every
+	// Open and therefore name different attributes on the way back in. Measured: doing it anyway lost
+	// 1125 of 3000 records after a restart. So a segment with no dictionary keeps the older split,
+	// where the record stays authoritative for what the schema does not carry.
+	moveAll := d != nil
+	inSchema := func(id uint32, name string) bool {
 		if name == "" {
 			_, ok := s.byID[id]
 			return ok
@@ -108,18 +81,26 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		}
 		skip := groupSkipSet(groups, iw)
 		skips = append(skips, skip)
+		// EVERYTHING the block can store, not just the schema's fields. An attribute the schema does
+		// not carry lands in the block's COLD TAIL, which is one compressed region per ROW GROUP -- and
+		// that is the whole point of moving it: those attributes are the majority of a segment, and a
+		// record's own bytes cannot see the record before them. Measured on real OSPool ads, the same
+		// leftover bytes cost 17.7% of what per-record compression needs at a 128 KiB row group.
+		//
+		// Group-owned attributes come along too, so the builder can put them in their group's column;
+		// it leaves those out of the base cold tail itself (groupSkipSet), so nothing is stored twice.
 		only, ok := keepAttrs(iw, func(id uint32, name string, node []byte) bool {
-			if coveredGlobal(id, name, node) {
-				return true
-			}
-			// A group-owned attribute, kept so the builder can put it in that group's column. It does
-			// NOT also land in the base block's cold tail: the builder skips whatever the groups own
-			// (see groupSkipSet), which is what keeps this from storing the value twice.
-			if skip == nil || !storableInColumn(node) {
+			if !storableInColumn(node) {
 				return false
 			}
-			_, in := skip[id]
-			return in
+			if moveAll {
+				return true
+			}
+			if inSchema(id, name) {
+				return true
+			}
+			_, owned := skip[id]
+			return owned
 		})
 		return only, ok
 	}
@@ -127,7 +108,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// Pass 1: build the columnar blocks over the segment's records, exactly as the accelerator
 	// does today. This also yields the per-record arena offsets the reader maps back through.
 	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(src.data, src.used, src.codec,
-		c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned)
+		c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
 	if len(blocks) == 0 || len(offs) == 0 {
 		return nil, nil, nil
 	}
@@ -137,7 +118,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		// would remove one record's attributes on the strength of another's membership.
 		return nil, nil, nil
 	}
-	cs := &colSegment{blocks: blocks, offs: offs}
+	cs := &colSegment{blocks: blocks, offs: offs, dictKeyed: d != nil}
 	// Re-key the pinned groups onto this segment's selections: the schema and members are shared, the
 	// per-block bitmaps are not.
 	for gi, g := range groups {
@@ -164,31 +145,23 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	rems := make([]remnant, 0, len(offs))
 	var buf []byte
 	total := 0
-	for ri, o := range offs {
+	for _, o := range offs {
 		raw, err := src.codec.Decompress(buf[:0], recAd(src.data, o))
 		if err != nil {
 			return nil, nil, nil
 		}
 		buf = raw
-		skip := skips[ri]
-		recCovered := covered
-		if len(skip) > 0 {
-			recCovered = func(id uint32, name string, node []byte) bool {
-				if covered(id, name, node) {
-					return true
-				}
-				if !storableInColumn(node) {
-					return false
-				}
-				gid, ok := c.globalIDOf(d, id, name)
-				if !ok {
-					return false
-				}
-				_, in := skip[gid]
-				return in
+		// What the columns could not take: expressions, and nothing else. An expression node carries
+		// attribute references as ids in the RECORD's space, and the block's nodes are re-encoded into
+		// the global one, so moving an expression rewrites which attribute it points at -- measured,
+		// `RequestMemory = ProcId * 512 + 7` came back as `Slack * 512 + 7`. So a record is now usually
+		// just a header and a key.
+		body, ok := stripSchemaAttrs(raw, func(id uint32, name string, node []byte) bool {
+			if !storableInColumn(node) {
+				return false
 			}
-		}
-		body, ok := stripSchemaAttrs(raw, recCovered)
+			return moveAll || inSchema(id, name)
+		})
 		if !ok {
 			return nil, nil, nil
 		}
