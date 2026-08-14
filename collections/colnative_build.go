@@ -40,21 +40,14 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 			byName[strings.ToLower(n)] = struct{}{}
 		}
 	}
-	// Moving the non-schema attributes into the block's cold tail is only safe for an INTERNED
-	// segment. The cold tail keys its entries by the segment's dictionary, which is durable; without a
-	// dictionary it falls back to global intern ids, which are rebuilt in first-seen order at every
-	// Open and therefore name different attributes on the way back in. Measured: doing it anyway lost
-	// 1125 of 3000 records after a restart. So a segment with no dictionary keeps the older split,
-	// where the record stays authoritative for what the schema does not carry.
-	moveAll := d != nil
-	inSchema := func(id uint32, name string) bool {
-		if name == "" {
-			_, ok := s.byID[id]
-			return ok
-		}
-		_, ok := byName[strings.ToLower(name)]
-		return ok
-	}
+	// Everything the block can store moves into it, whether or not the segment is interned.
+	//
+	// This was restricted to interned segments while a cold tail could only be keyed durably by a
+	// segment dictionary -- doing it without one lost 1125 of 3000 records after a restart, because
+	// global intern ids are renumbered at every Open. A payload with no dictionary now carries a NAME
+	// for each cold-tail id in its section, so both shapes survive a restart and the restriction is
+	// gone. Removing that naming fails five tests, which is what keeps this honest.
+
 	// The GROUP schemas take part too, and they have to: they are built into the same payload, and a
 	// rewrite that left them out silently retired the group accelerator for every segment it touched
 	// (measured: 0 of 9). Their attributes are not base schema fields, so without them the group
@@ -93,14 +86,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 			if !storableInColumn(node) {
 				return false
 			}
-			if moveAll {
-				return true
-			}
-			if inSchema(id, name) {
-				return true
-			}
-			_, owned := skip[id]
-			return owned
+			return true
 		})
 		return only, ok
 	}
@@ -160,7 +146,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 			if !storableInColumn(node) {
 				return false
 			}
-			return moveAll || inSchema(id, name)
+			return true
 		})
 		if !ok {
 			return nil, nil, nil
