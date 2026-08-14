@@ -253,6 +253,17 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 	blk.schema.forEachKeyed(rec, func(id uint32, node []byte, fromCold bool) bool {
 		name := ""
 		out := id
+		if fromCold && sd == nil {
+			// A cold-tail id in a segment with NO dictionary is the id the WRITING process assigned,
+			// and this process numbers names differently -- so it has to be mapped back before the
+			// name is resolved. Skipping this emitted an attribute under whatever name now holds that
+			// number: an ad came back with `owner` twice, once correctly and once carrying another
+			// field's integer.
+			//
+			// An interned segment needs no such step: its cold-tail ids are the segment dictionary's,
+			// which is the record's own key space, so they are emitted exactly as stored.
+			id = blk.remap.current(id)
+		}
 		if sd != nil && !fromCold {
 			// A SCHEMA field's id belongs to this process and has to be translated into the record's.
 			// A COLD TAIL entry is already keyed by the segment dictionary -- translating it too looks

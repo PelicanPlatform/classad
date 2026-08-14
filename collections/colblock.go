@@ -951,3 +951,15 @@ func collectColdIDs(cold []byte, into map[uint32]struct{}) {
 		cold = cold[nl:]
 	}
 }
+
+// current maps an id as stored in this payload back to the id the current process assigns that
+// attribute. The inverse of stored; used where a stored id has to be resolved to a NAME.
+func (r *idRemap) current(id uint32) uint32 {
+	if r == nil {
+		return id
+	}
+	if v, ok := r.toCurrent[id]; ok {
+		return v
+	}
+	return id
+}
