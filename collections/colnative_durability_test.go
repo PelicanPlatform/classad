@@ -144,13 +144,11 @@ func TestColumnarPathSurvivesRestartWithoutFallingBack(t *testing.T) {
 // TestGroupColumnsSurviveRestart checks that group columns answer the same before and after a
 // restart, and do not start deferring to the record.
 //
-// It reaches the shape it is aimed at -- the fixture produces 27 escaped group cells, so RanExit's
-// exceptional values do land in the group block's cold tail. What it does NOT do is discriminate the
-// id-space bug: keying those tails globally again leaves this test passing, most likely because the
-// columnar path declines the query and the row path answers, which this does not distinguish. So it
-// guards the property, not the mechanism -- unlike
-// TestColumnarPathSurvivesRestartWithoutFallingBack, which fails if either half of the base-block fix
-// is removed.
+// The fixture produces 27 escaped group cells, so RanExit's exceptional values do land in the group
+// block's cold tail. The assertion that makes this discriminate is on SERVED, not just on the counts:
+// a payload that has stopped being readable does not usually answer wrongly -- the columnar path
+// declines and the row path answers, correctly and silently -- so a query that was served before the
+// restart and is not after is the thing to catch.
 func TestGroupColumnsSurviveRestart(t *testing.T) {
 	dir := t.TempDir()
 	open := func() *Collection {
@@ -204,32 +202,42 @@ func TestGroupColumnsSurviveRestart(t *testing.T) {
 		"RanStart is undefined",
 		"ProcId < 5",
 	}
-	measure := func(c *Collection) (counts []int, fallbacks int64) {
+	// served is recorded alongside the counts, because a payload that has stopped being readable does
+	// not usually produce a wrong number -- the columnar path DECLINES and the row path answers, which
+	// is correct and silent. A query that was served before a restart and is not after is the symptom
+	// to catch.
+	measure := func(c *Collection) (counts []int, served []bool, fallbacks int64) {
 		before := ColumnarFallbacks()
 		for _, e := range exprs {
 			q, err := vm.Parse(e)
 			if err != nil {
 				t.Fatal(err)
 			}
-			n, served := c.CountQuery(q)
-			if want := len(readAll(t, c, e)); served && n != want {
+			n, ok := c.CountQuery(q)
+			if want := len(readAll(t, c, e)); ok && n != want {
 				t.Errorf("%s: columnar says %d, the row path says %d", e, n, want)
 			}
 			counts = append(counts, n)
+			served = append(served, ok)
 		}
-		return counts, ColumnarFallbacks() - before
+		return counts, served, ColumnarFallbacks() - before
 	}
-	want, wantFB := measure(c)
+	want, wantServed, wantFB := measure(c)
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
 	}
 
 	c2 := open()
 	defer c2.Close()
-	got, gotFB := measure(c2)
+	got, gotServed, gotFB := measure(c2)
 	for i, e := range exprs {
 		if got[i] != want[i] {
 			t.Errorf("%s: %d after restart, want %d", e, got[i], want[i])
+		}
+		if wantServed[i] && !gotServed[i] {
+			t.Errorf("%s: the columnar path served this before the restart and declines after it, "+
+				"which returns the right answer from the row path and hides that the group columns "+
+				"became unreadable", e)
 		}
 	}
 	if gotFB > wantFB {
