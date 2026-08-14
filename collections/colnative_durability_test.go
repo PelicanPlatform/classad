@@ -140,3 +140,100 @@ func TestColumnarPathSurvivesRestartWithoutFallingBack(t *testing.T) {
 	}
 	t.Logf("counts %v; fallbacks before=%d after=%d", gotCounts, wantFallbacks, gotFallbacks)
 }
+
+// TestGroupColumnsSurviveRestart checks that group columns answer the same before and after a
+// restart, and do not start deferring to the record.
+//
+// It reaches the shape it is aimed at -- the fixture produces 27 escaped group cells, so RanExit's
+// exceptional values do land in the group block's cold tail. What it does NOT do is discriminate the
+// id-space bug: keying those tails globally again leaves this test passing, most likely because the
+// columnar path declines the query and the row path answers, which this does not distinguish. So it
+// guards the property, not the mechanism -- unlike
+// TestColumnarPathSurvivesRestartWithoutFallingBack, which fails if either half of the base-block fix
+// is removed.
+func TestGroupColumnsSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *Collection {
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16,
+			GroupSchemaCount: 4, GroupStabilityRuns: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := open()
+	for i := range 4000 {
+		// A below-floor attribute first, so the global id space shifts across the restart.
+		lead := ""
+		if i < 3 {
+			lead = fmt.Sprintf("Aardvark=%d; ", i)
+		}
+		text := fmt.Sprintf(`[ %sClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d ]`,
+			lead, i, i%10, i%7, i%6)
+		if i%3 == 0 {
+			// The bundle that becomes a group schema. RanExit is usually an integer and occasionally
+			// a string, so those records escape into the GROUP block's cold tail.
+			exit := fmt.Sprintf("%d", i%3)
+			if i%150 == 0 {
+				exit = `"aborted"`
+			}
+			text = fmt.Sprintf(`[ %sClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RanStart=%d; RanEnd=%d; RanHost="h%d"; RanExit=%s ]`,
+				lead, i, i%10, i%7, i%6, i, i+10, i%50, exit)
+		}
+		ad, err := classad.Parse(text)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.RetrainDict(0)
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		c.Close()
+		t.Skip("schema scan did not enable")
+	}
+	if st := c.schemaScan.Load(); st == nil || len(st.groups) == 0 {
+		c.Close()
+		t.Skip("no group schema was derived")
+	}
+	exprs := []string{
+		`RanExit == "aborted"`, // the escaped group value
+		"RanExit == 0",         // an in-column group value
+		"RanHost == \"h7\"",    // a group string column
+		"RanStart is undefined",
+		"ProcId < 5",
+	}
+	measure := func(c *Collection) (counts []int, fallbacks int64) {
+		before := ColumnarFallbacks()
+		for _, e := range exprs {
+			q, err := vm.Parse(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n, served := c.CountQuery(q)
+			if want := len(readAll(t, c, e)); served && n != want {
+				t.Errorf("%s: columnar says %d, the row path says %d", e, n, want)
+			}
+			counts = append(counts, n)
+		}
+		return counts, ColumnarFallbacks() - before
+	}
+	want, wantFB := measure(c)
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	c2 := open()
+	defer c2.Close()
+	got, gotFB := measure(c2)
+	for i, e := range exprs {
+		if got[i] != want[i] {
+			t.Errorf("%s: %d after restart, want %d", e, got[i], want[i])
+		}
+	}
+	if gotFB > wantFB {
+		t.Errorf("group columns deferred to the record %d times after a restart and %d before", gotFB, wantFB)
+	}
+	t.Logf("counts %v; fallbacks before=%d after=%d", got, wantFB, gotFB)
+}

@@ -61,7 +61,7 @@ func TestGroupBlockMembershipAndExceptions(t *testing.T) {
 	iws, ids, state := groupBlockFixture(t, c, n)
 	g := mkGroup(t, c, iws, ids)
 
-	gbs := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec())
+	gbs := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec(), nil)
 	if len(gbs) != 1 {
 		t.Fatalf("built %d group blocks, want 1", len(gbs))
 	}
@@ -118,7 +118,7 @@ func TestGroupBlockIndexIsRank(t *testing.T) {
 	const n = 500 // several 64-record ranks
 	iws, ids, state := groupBlockFixture(t, c, n)
 	g := mkGroup(t, c, iws, ids)
-	gb := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec())[0]
+	gb := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec(), nil)[0]
 
 	seen := 0
 	for k := range n {
@@ -148,7 +148,7 @@ func TestGroupBlockValuesMatch(t *testing.T) {
 	const n = 300
 	iws, ids, state := groupBlockFixture(t, c, n)
 	g := mkGroup(t, c, iws, ids)
-	gb := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec())[0]
+	gb := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec(), nil)[0]
 	if gb.blk == nil {
 		t.Fatal("no group block built")
 	}
@@ -270,7 +270,7 @@ func TestGroupBlocksRoundTripThroughPersistence(t *testing.T) {
 		rows = append(rows, base.encode(wire.Ad(iw)))
 	}
 	blk := encodeColumnarBlock(base, rows, nil, identityCodec{}, nil)
-	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, identityCodec{})
+	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, identityCodec{}, nil)
 	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
 
 	blob := marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
@@ -341,7 +341,7 @@ func TestGroupSectionRejectsInconsistentSelection(t *testing.T) {
 		rows = append(rows, base.encode(wire.Ad(iw)))
 	}
 	blk := encodeColumnarBlock(base, rows, nil, identityCodec{}, nil)
-	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, identityCodec{})
+	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, identityCodec{}, nil)
 	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
 	nameOf := func(id uint32) (string, bool) { return c.intern.Name(id) }
 	internName := func(s string) uint32 { return c.intern.Intern(s) }
@@ -371,7 +371,7 @@ func TestGroupBlockPopulationPastRankBoundary(t *testing.T) {
 	for _, n := range []int{64, 65, 128, 129, 191, 192, 400} {
 		iws, ids, state := groupBlockFixture(t, c, n)
 		g := mkGroup(t, c, iws, ids)
-		gb := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec())[0]
+		gb := buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec(), nil)[0]
 		want := 0
 		for _, st := range state {
 			if st == "in" {

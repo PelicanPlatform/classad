@@ -25,7 +25,7 @@ func groupSchemaReadFixture(t *testing.T, c *Collection, n int) (*colScope, *col
 	for _, f := range g.schema.fields {
 		g.ids = append(g.ids, f.id)
 	}
-	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec())
+	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec(), nil)
 	seg := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
 
 	bc, err := newBlockCache(1 << 20)
