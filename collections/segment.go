@@ -697,6 +697,24 @@ func recIsCol(b []byte, off uint32) bool {
 	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&colFlag != 0
 }
 
+// recFits reports whether a record at off lies wholly within b: its fixed header, its key, and the ad
+// payload its own length field claims. It is the guard a reader needs before trusting any of those length
+// fields, because a length read from outside the record is not a length.
+//
+// Every arithmetic step is in int, not uint32, so a garbage length that would wrap cannot come back inside
+// the slice and pass.
+func recFits(b []byte, off uint32) bool {
+	base := int(off)
+	if base < 0 || base+recKeyOff > len(b) {
+		return false // not even the fixed header, so recKeyLen itself would panic
+	}
+	adLenAt := base + recKeyOff + int(recKeyLen(b, off))
+	if adLenAt+4 > len(b) {
+		return false
+	}
+	return adLenAt+4+int(binary.LittleEndian.Uint32(b[adLenAt:])) <= len(b)
+}
+
 func recKey(b []byte, off uint32) []byte {
 	kl := recKeyLen(b, off)
 	start := off + recKeyOff

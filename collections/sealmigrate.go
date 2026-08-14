@@ -135,6 +135,26 @@ func (c *Collection) MigrateSealedAttrs(workers int) int {
 			seg.reapAndHook() // munmap + unlink the superseded file, off-lock
 		}
 	}
+	if migrated > 0 {
+		// EVERY STRUCTURE THAT NAMES A (segment, offset) IS NOW STALE. A reseal re-encodes each record
+		// and sizes the new segment exactly, so the same key sits at a different offset -- and the old
+		// offset may be past the end of the new, smaller file.
+		//
+		// Leaving them stale did not read as corruption. A SCAN walks segments directly and was
+		// perfectly fine, which is what the first version of this pass verified. A GET goes through the
+		// directory and the bucket chain, so it read a header where there was none: usually a key
+		// mismatch that ends the chain and reports the key MISSING (1998 of 2000, in the test below),
+		// occasionally an offset past the mapping, which is a panic in a running daemon:
+		//
+		//	panic: runtime error: slice bounds out of range [:67269717] with capacity 148816
+		//
+		// Reindex rebuilds each segment's key sidecar from its actual contents and evicts that
+		// segment's directory entries, so both lookup paths point at the new layout. This is the same
+		// reconciliation the other two swap-a-rewritten-segment paths do (compaction, InternSealed);
+		// this pass simply did not, which is the whole defect.
+		c.reindexAfterCompaction()
+		c.pruneDicts()
+	}
 	c.markSealMigrationDone()
 	return migrated
 }
