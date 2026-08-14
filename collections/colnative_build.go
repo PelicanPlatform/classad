@@ -127,7 +127,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// Pass 1: build the columnar blocks over the segment's records, exactly as the accelerator
 	// does today. This also yields the per-record arena offsets the reader maps back through.
 	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(src.data, src.used, src.codec,
-		c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned)
+		c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
 	if len(blocks) == 0 || len(offs) == 0 {
 		return nil, nil, nil
 	}

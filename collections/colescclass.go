@@ -78,7 +78,13 @@ func (b *columnarBlock) escapeIsMissing(idx, k int) (missing, ok bool) {
 // field whose id appears there was present but out of slot; a field whose escape bit is set and
 // whose id does not appear was absent. That is the same fact the encoder had when it set the bit,
 // recovered without re-encoding.
-func classifyEscapes(s *adSchema, recs [][]byte) ([]uint8, map[int][]uint32, []byte) {
+// coldToField maps a COLD-TAIL id to a schema field index. It exists because the cold tail may be
+// keyed by the segment's dictionary rather than by the global intern table, and classifying an escape
+// means asking "is this field present in the tail?" -- a question that silently answers "no" if it is
+// asked in the wrong id space. Getting it wrong classifies a present-but-exceptional value as MISSING,
+// and the presence path then reports the attribute undefined without ever reading it. nil uses the
+// schema's own map, which is right for a payload keyed globally.
+func classifyEscapes(s *adSchema, recs [][]byte, coldToField map[uint32]int) ([]uint8, map[int][]uint32, []byte) {
 	if len(s.fields) == 0 {
 		return nil, nil, nil
 	}
@@ -104,7 +110,7 @@ func classifyEscapes(s *adSchema, recs [][]byte) ([]uint8, map[int][]uint32, []b
 			if !ok || nl > len(cold) {
 				break
 			}
-			if idx, ok := s.byID[uint32(id)]; ok {
+			if idx, ok := coldFieldIndex(s, coldToField, uint32(id)); ok {
 				inCold[idx] = true
 			}
 			cold = cold[nl:]
@@ -169,4 +175,15 @@ func (b *columnarBlock) fieldAbsentFromBlock(idx int) bool {
 		return false
 	}
 	return b.escAbsent[idx>>3]&(1<<uint(idx&7)) != 0
+}
+
+// coldFieldIndex resolves a cold-tail id to its schema field index in whichever id space the tail was
+// written in.
+func coldFieldIndex(s *adSchema, coldToField map[uint32]int, id uint32) (int, bool) {
+	if coldToField != nil {
+		idx, ok := coldToField[id]
+		return idx, ok
+	}
+	idx, ok := s.byID[id]
+	return idx, ok
 }

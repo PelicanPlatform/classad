@@ -120,6 +120,13 @@ func publishColNative(c *Collection, seg *segment) {
 				cn.byOff[ro] = i
 			}
 			cn.dict = seg.dict.Load()
+			// The payload's cold tails are keyed by the SEGMENT's dictionary, so readers translate
+			// through that dictionary rather than trusting this process's intern numbering.
+			if rm := segIDRemap(c, cn.dict); rm != nil {
+				for _, b := range cs.blocks {
+					b.remap = rm
+				}
+			}
 			if cn.dict != nil {
 				cn.localOf = make(map[uint32]uint32, 256)
 				schemas := make([]*adSchema, 0, len(cs.blocks)+len(cs.groups))
@@ -237,11 +244,13 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 	added := 0
 	bad := false
 	sd := cn.dict
-	blk.schema.forEach(rec, func(id uint32, node []byte) bool {
+	blk.schema.forEachKeyed(rec, func(id uint32, node []byte, fromCold bool) bool {
 		name := ""
 		out := id
-		if sd != nil {
-			// The cached translation, not a dictionary probe: this runs once per field per record.
+		if sd != nil && !fromCold {
+			// A SCHEMA field's id belongs to this process and has to be translated into the record's.
+			// A COLD TAIL entry is already keyed by the segment dictionary -- translating it too looks
+			// up a local id in a global table, misses, and silently drops the whole record.
 			lid, ok := cn.localOf[id]
 			if !ok {
 				bad = true
@@ -482,4 +491,43 @@ func (cn *colNative) blockIndexAndLocal(k int) (int, int) {
 		k -= b.n
 	}
 	return -1, 0
+}
+
+// segIDMapper returns a global-intern-id -> segment-dictionary-id function, or nil when the segment
+// has no dictionary and therefore no durable id space of its own.
+//
+// This is what lets a columnar payload survive a restart without storing a name table beside it: the
+// segment already carries a dictionary naming every attribute its records use, so keying the payload
+// by that dictionary makes both sides of a restart agree by construction rather than by luck.
+func (c *Collection) segIDMapper(d *segDictHandle) func(uint32) (uint32, bool) {
+	if d == nil {
+		return nil
+	}
+	return func(id uint32) (uint32, bool) {
+		name, ok := c.intern.Name(id)
+		if !ok {
+			return 0, false
+		}
+		return d.lookup(name)
+	}
+}
+
+// segIDRemap rebuilds a reader's translation between this process's intern ids and the segment
+// dictionary's, from the dictionary alone.
+func segIDRemap(c *Collection, d *segDictHandle) *idRemap {
+	if d == nil {
+		return nil
+	}
+	n := d.count()
+	r := &idRemap{toStored: make(map[uint32]uint32, n), toCurrent: make(map[uint32]uint32, n)}
+	for lid := uint32(0); lid < n; lid++ {
+		nm := d.name(lid)
+		if nm == nil {
+			continue
+		}
+		gid := c.intern.Intern(string(nm))
+		r.toStored[gid] = lid
+		r.toCurrent[lid] = gid
+	}
+	return r
 }

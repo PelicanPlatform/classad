@@ -178,7 +178,11 @@ func buildGroupBlocks(groups []*colGroup, iws [][]byte, regionCodec Codec) []*co
 		if len(members) > 0 {
 			// No hot tier for a group column yet: the groups are derived from presence, so
 			// nothing here says which of their columns queries read.
-			gb.blk = encodeColumnarBlock(g.schema, members, nil, regionCodec)
+			// nil: a group block's records are encoded against the group's own (global) schema, so its
+			// cold tail is keyed globally and its escape classification must be too. Self-consistent,
+			// and therefore unchanged -- but see encodeExceptLocal: it is not durable across a restart,
+			// which is a gap these blocks still share.
+			gb.blk = encodeColumnarBlock(g.schema, members, nil, regionCodec, nil)
 		}
 		out[gi] = gb
 	}

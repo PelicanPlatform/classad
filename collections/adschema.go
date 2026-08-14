@@ -301,6 +301,19 @@ func (s *adSchema) encode(w wire.Ad) []byte { return s.encodeExcept(w, nil) }
 // records, so dropping a value from it loses nothing that cannot be recomputed. It is only the
 // SIDECAR's two copies being reduced to one.
 func (s *adSchema) encodeExcept(w wire.Ad, skip map[uint32]struct{}) []byte {
+	return s.encodeExceptLocal(w, skip, nil)
+}
+
+// encodeExceptLocal is encodeExcept writing cold-tail keys in the SEGMENT's id space.
+//
+// A cold-tail entry is the only place a columnar payload stores an attribute id inline, and a GLOBAL
+// intern id means nothing outside the process that assigned it: that table is rebuilt at every Open
+// and numbers names in first-seen order, so an attribute not re-interned on the way back in shifts
+// every id after it. Keyed that way, an escaped value that read correctly before a restart read as
+// UNDEFINED after one -- silently, with no fallback. The segment's dictionary is durable and travels
+// with the records, so toLocal keys these entries by it. nil keeps the global id, which is only safe
+// for a payload that will not outlive the process.
+func (s *adSchema) encodeExceptLocal(w wire.Ad, skip map[uint32]struct{}, toLocal func(uint32) (uint32, bool)) []byte {
 	esc := make([]byte, s.escBytes)
 	fixed := make([]byte, s.fixedLen)
 	var cold []byte
@@ -313,14 +326,14 @@ func (s *adSchema) encodeExcept(w wire.Ad, skip map[uint32]struct{}) []byte {
 		}
 		idx, ok := s.byID[id]
 		if !ok {
-			cold = append(binary.AppendUvarint(cold, uint64(id)), node...)
+			cold = appendColdEntry(cold, id, node, toLocal)
 			return true
 		}
 		f := &s.fields[idx]
 		k, lit := nodeKind(node)
 		if k != f.kind || (f.kind == akInt && !intFits(lit.Int, f.width, f.unsigned)) {
-			cold = append(binary.AppendUvarint(cold, uint64(id)), node...) // escaped -> cold tail
-			return true                                                    // filled stays false
+			cold = appendColdEntry(cold, id, node, toLocal) // escaped -> cold tail
+			return true                                     // filled stays false
 		}
 		switch f.kind {
 		case akBool:
@@ -360,6 +373,16 @@ func (s *adSchema) encodeExcept(w wire.Ad, skip map[uint32]struct{}) []byte {
 // for each non-escaped field and replaying the cold tail. Returns false if the record is
 // malformed or fn stopped early.
 func (s *adSchema) forEach(rec []byte, fn func(id uint32, node []byte) bool) bool {
+	return s.forEachKeyed(rec, func(id uint32, node []byte, _ bool) bool { return fn(id, node) })
+}
+
+// forEachKeyed is forEach, reporting for each attribute whether it came from the COLD TAIL.
+//
+// The distinction is load-bearing once a payload is written for durability: a schema field's id comes
+// from the schema, which the section stores by NAME and re-interns, so it is in the reading process's
+// space; a cold-tail id is in the SEGMENT's. Treating them alike translates one of them twice, which
+// silently drops the record.
+func (s *adSchema) forEachKeyed(rec []byte, fn func(id uint32, node []byte, fromCold bool) bool) bool {
 	if len(rec) < s.escBytes+s.fixedLen {
 		return false
 	}
@@ -390,7 +413,7 @@ func (s *adSchema) forEach(rec []byte, fn func(id uint32, node []byte) bool) boo
 			scratch = wire.AppendStringNode(scratch, string(rec[p:p+int(l)]))
 			p += int(l)
 		}
-		if !fn(f.id, scratch) {
+		if !fn(f.id, scratch, false) {
 			return true
 		}
 	}
@@ -405,10 +428,21 @@ func (s *adSchema) forEach(rec []byte, fn func(id uint32, node []byte) bool) boo
 		if !ok || nl > len(cold) {
 			return false
 		}
-		if !fn(uint32(id), cold[:nl]) {
+		if !fn(uint32(id), cold[:nl], true) {
 			return true
 		}
 		cold = cold[nl:]
 	}
 	return true
+}
+
+// appendColdEntry writes one cold-tail entry, keyed by the segment's own id for the attribute when
+// one is available. See encodeExceptLocal for why the key matters.
+func appendColdEntry(cold []byte, id uint32, node []byte, toLocal func(uint32) (uint32, bool)) []byte {
+	if toLocal != nil {
+		if lid, ok := toLocal(id); ok {
+			id = lid
+		}
+	}
+	return append(binary.AppendUvarint(cold, uint64(id)), node...)
 }

@@ -62,7 +62,7 @@ func TestIntWidth6Byte(t *testing.T) {
 	if f := s.fields[s.byID[bigID]]; f.width != 6 || !f.unsigned {
 		t.Fatalf("Big width=%d unsigned=%v, want 6/true", f.width, f.unsigned)
 	}
-	blk := encodeColumnarBlock(s, encodeRows(s, wires), []int{s.byID[bigID]}, identityCodec{})
+	blk := encodeColumnarBlock(s, encodeRows(s, wires), []int{s.byID[bigID]}, identityCodec{}, nil)
 	bc, _ := newBlockCache(64 << 20)
 	blk.scanInt(s.byID[bigID], bc, func(k int, present bool, v int64) {
 		if !present || v != big(k) {
@@ -115,8 +115,8 @@ func BenchmarkIntWidth6vs8(b *testing.B) {
 	}
 	s8 := layoutSchema(fs)
 
-	blk6 := encodeColumnarBlock(s, encodeRows(s, wires), []int{s.byID[bigID]}, codec)
-	blk8 := encodeColumnarBlock(s8, encodeRows(s8, wires), []int{s8.byID[bigID]}, codec)
+	blk6 := encodeColumnarBlock(s, encodeRows(s, wires), []int{s.byID[bigID]}, codec, nil)
+	blk8 := encodeColumnarBlock(s8, encodeRows(s8, wires), []int{s8.byID[bigID]}, codec, nil)
 	sz := func(blk *columnarBlock) int {
 		return len(marshalColSegment(oneBlockColSeg(blk, make([]uint32, blk.n)), c.intern.Name))
 	}

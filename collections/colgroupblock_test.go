@@ -226,7 +226,7 @@ func TestGroupBlocksFollowBaseBlockBoundaries(t *testing.T) {
 	blocks, gblocks, _ := buildColumnarFromSegmentGrouped(w.data, w.used, w.codec, c.regionCodec(),
 		bs, nil, []*colGroup{g}, byRows(256), func(dst, x []byte) ([]byte, bool) {
 			return c.recordToInterned(dst, x)
-		})
+		}, nil)
 	if len(blocks) < 2 {
 		t.Skipf("only %d base block(s); need several to test boundaries", len(blocks))
 	}
@@ -269,7 +269,7 @@ func TestGroupBlocksRoundTripThroughPersistence(t *testing.T) {
 	for _, iw := range iws {
 		rows = append(rows, base.encode(wire.Ad(iw)))
 	}
-	blk := encodeColumnarBlock(base, rows, nil, identityCodec{})
+	blk := encodeColumnarBlock(base, rows, nil, identityCodec{}, nil)
 	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, identityCodec{})
 	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
 
@@ -340,7 +340,7 @@ func TestGroupSectionRejectsInconsistentSelection(t *testing.T) {
 	for _, iw := range iws {
 		rows = append(rows, base.encode(wire.Ad(iw)))
 	}
-	blk := encodeColumnarBlock(base, rows, nil, identityCodec{})
+	blk := encodeColumnarBlock(base, rows, nil, identityCodec{}, nil)
 	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, identityCodec{})
 	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
 	nameOf := func(id uint32) (string, bool) { return c.intern.Name(id) }
