@@ -92,6 +92,13 @@ type ArchiveOptions struct {
 	// Options.IndexBackfillBytes). 0 carries it across the whole archive.
 	IndexBackfillBytes int64
 
+	// RowGroupBytes is the uncompressed record-bytes budget for one columnar row group (see
+	// Options.RowGroupBytes). 0 takes the default. It decides how much of a segment has to be
+	// decompressed to read a single record, against how far compression can see across records, and
+	// an archive is where that trade is worth tuning: its segments are immutable, so the choice is
+	// made once per segment and lived with.
+	RowGroupBytes int
+
 	// GroupSchemaCount and its companions enable secondary columnar schemas (see Options).
 	GroupSchemaCount    int
 	GroupStabilityRuns  int
@@ -136,6 +143,7 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		Retention:           opts.Retention,
 		InternAtSeal:        opts.InternAtSeal, // intern each segment eagerly at seal
 		IndexBackfillBytes:  opts.IndexBackfillBytes,
+		RowGroupBytes:       opts.RowGroupBytes,
 		GroupSchemaCount:    opts.GroupSchemaCount,
 		GroupStabilityRuns:  opts.GroupStabilityRuns,
 		GroupMergeJaccard:   opts.GroupMergeJaccard,
@@ -498,6 +506,14 @@ func literalFloat(node []byte) (float64, bool) {
 	}
 	return 0, false
 }
+
+// SetRowGroupBytes changes the archive's columnar row-group budget at runtime (see
+// Collection.SetRowGroupBytes). It governs segments sealed from now on; nothing already written is
+// rewritten or needs to be.
+func (a *Archive) SetRowGroupBytes(n int) { a.c.SetRowGroupBytes(n) }
+
+// RowGroupBytes reports the budget currently in effect (0 meaning the default).
+func (a *Archive) RowGroupBytes() int { return a.c.RowGroupBytes() }
 
 // zonePrune reports whether a segment can be skipped entirely: some required conjunct (a
 // top-level AND probe) on a zone-mapped attribute cannot be satisfied by any record whose
