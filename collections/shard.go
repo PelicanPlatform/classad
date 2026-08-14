@@ -229,15 +229,44 @@ func (sh *shard) segAt(id uint32) *segment {
 	return sh.segs[id]
 }
 
+// segForLoc returns the segment a chain link points into, or nil if the link cannot be a record: the
+// segment is gone, OR the offset does not lie wholly inside it. Every bucket-chain walk goes through this,
+// so a walk added later cannot forget half the check.
+//
+// The offset half was the second production crash here:
+//
+//	panic: runtime error: slice bounds out of range [:67269717] with capacity 148816
+//
+// The index check catches a loc decoded out of bytes that are no longer a record header. This catches the
+// other case: a loc that was perfectly valid for a segment which has since been REWRITTEN to a different
+// size. A reseal re-encodes every record and sizes its segment exactly, so old offsets move and may land
+// past the end of the new file -- which is what the open-time seal migration left behind by swapping
+// segments in without reconciling the directory (fixed in MigrateSealedAttrs; this is the backstop, not
+// the fix). Reading a length field from outside a record yields a length, not an error, which is why the
+// symptom was a wild slice bound rather than anything naming the cause.
+//
+// Caller holds at least the read lock.
+func (sh *shard) segForLoc(l loc) *segment {
+	seg := sh.segAt(l.seg)
+	if seg == nil {
+		return nil
+	}
+	if !recFits(seg.data, l.off) {
+		corruptChainLinks.Add(1)
+		return nil
+	}
+	return seg
+}
+
 // findCurrent walks the bucket chain from head and returns the location of the
 // current (non-superseded) record whose key matches, if any. Collisions and
 // superseded versions are skipped by comparing the inline key and the atomic
 // supersededBySeq field. Caller holds at least the read lock.
 func (sh *shard) findCurrent(head loc, key []byte) (loc, bool) {
 	for l := head; l.valid(); {
-		seg := sh.segAt(l.seg)
+		seg := sh.segForLoc(l)
 		if seg == nil {
-			break // dangling chain link into a nonexistent segment; treat as end-of-chain
+			break // link into a nonexistent segment, or an offset that cannot be a record: end of chain
 		}
 		if recSuperseded(seg.data, l.off) == seqMax && bytes.Equal(recKey(seg.data, l.off), key) {
 			return l, true
@@ -412,7 +441,9 @@ func (sh *shard) get(c *Collection, h uint64, key []byte) ([]byte, Codec, *segDi
 			return nil, nil, nil, false
 		}
 	}
-	seg := sh.segAt(l.seg)
+	// segForLoc, not segAt: l can come from the sealed KEY INDEX as well as the chain, and a sidecar
+	// describing a segment that has since been rewritten names offsets that no longer hold records.
+	seg := sh.segForLoc(l)
 	if seg == nil {
 		return nil, nil, nil, false
 	}
@@ -501,7 +532,7 @@ func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
 	// segNext reads the next link from l, terminating the walk (returns noLoc) if l dangles
 	// into a nonexistent segment -- the same corruption findCurrent guards against.
 	segNext := func(l loc) loc {
-		if s := sh.segAt(l.seg); s != nil {
+		if s := sh.segForLoc(l); s != nil {
 			return recNext(s.data, l.off)
 		}
 		return noLoc
@@ -518,7 +549,7 @@ func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
 		}
 	}
 	for l := head; l.valid(); {
-		seg := sh.segAt(l.seg)
+		seg := sh.segForLoc(l)
 		if seg == nil {
 			break
 		}

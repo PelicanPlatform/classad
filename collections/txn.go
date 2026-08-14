@@ -59,7 +59,7 @@ func (sh *shard) findVisible(head loc, key []byte, s0 uint64) (loc, bool) {
 		// daemon down, and corruptChainLinks counts it so the anomaly is visible rather than silent. A count
 		// that climbs says a reader is walking a segment whose lifetime it does not hold -- getAt takes the
 		// shard read lock but no PIN, which is the next thing to look at if this fires.
-		seg := sh.segAt(l.seg)
+		seg := sh.segForLoc(l)
 		if seg == nil {
 			return noLoc, false
 		}
@@ -83,7 +83,9 @@ func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64) ([]byte, 
 			return nil, nil, nil, false
 		}
 	}
-	seg := sh.segAt(l.seg)
+	// segForLoc, not segAt: l can come from the sealed KEY INDEX as well as the chain, and a sidecar
+	// describing a segment that has since been rewritten names offsets that no longer hold records.
+	seg := sh.segForLoc(l)
 	if seg == nil {
 		return nil, nil, nil, false
 	}
@@ -137,7 +139,7 @@ func (sh *shard) conflictSince(h uint64, key []byte, s0 uint64) bool {
 		return true
 	}
 	for l := sh.dirGet(h); l.valid(); {
-		seg := sh.segAt(l.seg) // same guard as findVisible: this walk follows the same links
+		seg := sh.segForLoc(l) // same guard as findVisible: this walk follows the same links
 		if seg == nil {
 			break
 		}
