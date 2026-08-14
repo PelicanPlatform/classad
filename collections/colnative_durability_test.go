@@ -237,3 +237,86 @@ func TestGroupColumnsSurviveRestart(t *testing.T) {
 	}
 	t.Logf("counts %v; fallbacks before=%d after=%d", got, wantFB, gotFB)
 }
+
+// TestNonInternedColumnarSurvivesRestart covers the segments the dictionary fix does NOT reach.
+//
+// A segment with no dictionary has no durable id space of its own, so its cold tail carries global
+// intern ids -- the ones renumbered at every Open. The section names them instead, and this is the
+// test that the naming works: without it, a type-exception value on an attribute whose id moves reads
+// as undefined after a restart, exactly as it did for interned segments.
+func TestNonInternedColumnarSurvivesRestart(t *testing.T) {
+	dir := t.TempDir()
+	open := func() *Collection {
+		// Not append-only and no interning at seal, so the sealed segments stay inline.
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := open()
+	for i := range 4000 {
+		lead := ""
+		if i < 3 {
+			lead = fmt.Sprintf("Aardvark=%d; ", i) // below the presence floor: shifts the id space
+		}
+		cid := fmt.Sprintf("%d", i)
+		if i%50 == 1 {
+			cid = `"cluster-as-text"` // a type exception, so it lands in the cold tail
+		}
+		ad, err := classad.Parse(fmt.Sprintf(
+			`[ %sClusterId=%s; ProcId=%d; Owner="user%d"; JobStatus=%d ]`, lead, cid, i%10, i%7, i%6))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// No RetrainDict: interning rides that pass, so the sealed segments stay INLINE, which is the
+	// state a table is in before its first retrain.
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		c.Close()
+		t.Skip("schema scan did not enable")
+	}
+	inline := 0
+	for _, seg := range c.shards[0].segs {
+		if seg != nil && seg.used > 0 && seg.dict.Load() == nil {
+			inline++
+		}
+	}
+	if inline == 0 {
+		c.Close()
+		t.Skip("every sealed segment was interned; this test is about the ones that are not")
+	}
+
+	exprs := []string{"ClusterId is undefined", "ClusterId < 100", "ProcId < 5"}
+	measure := func(c *Collection) []int {
+		var out []int
+		for _, e := range exprs {
+			q, err := vm.Parse(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n, served := c.CountQuery(q)
+			if want := len(readAll(t, c, e)); served && n != want {
+				t.Errorf("%s: columnar says %d, the row path says %d", e, n, want)
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+	want := measure(c)
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c2 := open()
+	defer c2.Close()
+	got := measure(c2)
+	for i, e := range exprs {
+		if got[i] != want[i] {
+			t.Errorf("%s: %d after restart, want %d", e, got[i], want[i])
+		}
+	}
+	t.Logf("%d inline sealed segments; counts %v across the restart", inline, got)
+}

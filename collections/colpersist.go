@@ -53,7 +53,7 @@ const (
 	// one without a cold-tail lookup (see colescclass.go). Both ride the same bump deliberately: a
 	// section bump forces every deployed table to rebuild its accelerator, and doing that twice for
 	// two changes that land together is waste.
-	colSectionVersion = 6
+	colSectionVersion = 7
 	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
 )
 
@@ -113,6 +113,18 @@ func unmarshalColSchemaOnly(data []byte, internName func(string) uint32) (*adSch
 	c := &cursor{b: data}
 	s := readAdSchema(c, internName)
 	if s == nil {
+		return nil, nil
+	}
+	if nc := int(c.u32()); nc > 0 {
+		if nc > 1<<20 {
+			return nil, nil
+		}
+		for i := 0; i < nc; i++ {
+			c.u32()
+			c.bytes()
+		}
+	}
+	if c.err != nil {
 		return nil, nil
 	}
 	hn := int(c.u32())
@@ -191,6 +203,39 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 	}
 	hotNum := cs.hotNum()
 	dst := marshalAdSchema(nil, sch, nameOf)
+	// Cold-tail keys. A dictionary-keyed payload needs nothing here: the dictionary travels with the
+	// segment and names them. A globally-keyed one does -- its ids are this process's and mean nothing
+	// after a restart, which read as UNDEFINED for values that were present.
+	if cs.dictKeyed {
+		dst = appendU32(dst, 0)
+	} else {
+		cold := map[uint32]struct{}{}
+		for _, b := range cs.blocks {
+			for id := range b.coldIDs {
+				cold[id] = struct{}{}
+			}
+		}
+		for _, g := range cs.groups {
+			for _, gb := range g.blocks {
+				if gb != nil && gb.blk != nil {
+					for id := range gb.blk.coldIDs {
+						cold[id] = struct{}{}
+					}
+				}
+			}
+		}
+		ids := make([]uint32, 0, len(cold))
+		for id := range cold {
+			ids = append(ids, id)
+		}
+		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		dst = appendU32(dst, uint32(len(ids)))
+		for _, id := range ids {
+			name, _ := nameOf(id)
+			dst = appendU32(dst, id)
+			dst = appendBytes(dst, []byte(name))
+		}
+	}
 	dst = appendU32(dst, uint32(len(hotNum)))
 	for _, i := range hotNum {
 		dst = appendU32(dst, uint32(i))
@@ -414,6 +459,28 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	if s == nil {
 		return nil
 	}
+	// The cold-tail names, present only for a payload that is not dictionary-keyed.
+	var remap *idRemap
+	nc := int(c.u32())
+	if nc < 0 || nc > 1<<20 || c.err != nil {
+		return nil
+	}
+	if nc > 0 {
+		r := &idRemap{toStored: make(map[uint32]uint32, nc), toCurrent: make(map[uint32]uint32, nc)}
+		for i := 0; i < nc; i++ {
+			stored := c.u32()
+			name := string(c.bytes())
+			if c.err != nil {
+				return nil
+			}
+			if name != "" {
+				cur := internName(name)
+				r.toStored[cur] = stored
+				r.toCurrent[stored] = cur
+			}
+		}
+		remap = r
+	}
 	hn := int(c.u32())
 	if hn < 0 || hn > len(s.fields) {
 		return nil
@@ -446,7 +513,13 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	if total != len(offs) {
 		return nil
 	}
-	cs := &colSegment{blocks: blocks, offs: offs}
+	if remap != nil {
+		// A globally-keyed payload: hand every block the translation the section's names describe.
+		for _, b := range blocks {
+			b.remap = remap
+		}
+	}
+	cs := &colSegment{blocks: blocks, offs: offs, dictKeyed: remap == nil}
 	ng := int(c.u32())
 	if c.err != nil || ng < 0 {
 		return nil
