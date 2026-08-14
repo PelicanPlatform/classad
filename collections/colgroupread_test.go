@@ -20,7 +20,7 @@ func groupSchemaReadFixture(t *testing.T, c *Collection, n int) (*colScope, *col
 	for _, iw := range iws {
 		rows = append(rows, base.encode(wire.Ad(iw)))
 	}
-	blk := encodeColumnarBlock(base, rows, nil, c.regionCodec())
+	blk := encodeColumnarBlock(base, rows, nil, c.regionCodec(), nil)
 	g := &colGroup{ids: nil, schema: buildAdSchemaFor(iws, ids)}
 	for _, f := range g.schema.fields {
 		g.ids = append(g.ids, f.id)
