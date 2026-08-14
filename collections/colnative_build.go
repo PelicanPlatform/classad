@@ -118,7 +118,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		// would remove one record's attributes on the strength of another's membership.
 		return nil, nil, nil
 	}
-	cs := &colSegment{blocks: blocks, offs: offs}
+	cs := &colSegment{blocks: blocks, offs: offs, dictKeyed: d != nil}
 	// Re-key the pinned groups onto this segment's selections: the schema and members are shared, the
 	// per-block bitmaps are not.
 	for gi, g := range groups {

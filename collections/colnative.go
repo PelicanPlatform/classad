@@ -122,7 +122,10 @@ func publishColNative(c *Collection, seg *segment) {
 			cn.dict = seg.dict.Load()
 			// The payload's cold tails are keyed by the SEGMENT's dictionary, so readers translate
 			// through that dictionary rather than trusting this process's intern numbering.
-			if rm := segIDRemap(c, cn.dict); rm != nil {
+			// Only for a dictionary-keyed payload. A globally-keyed one already carries its own
+			// translation, built from the names the section stores, and overwriting it with a
+			// dictionary-derived map would point every cold-tail lookup at the wrong attribute.
+			if rm := segIDRemap(c, cn.dict); rm != nil && cs.dictKeyed {
 				for _, b := range cs.blocks {
 					b.remap = rm
 				}

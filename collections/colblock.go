@@ -263,6 +263,9 @@ type columnarBlock struct {
 	// remap translates between the ids this block's cold tail was written with and the current
 	// process's. nil when the two coincide.
 	remap *idRemap
+	// coldIDs are the attribute ids this block's cold tail holds. A segment with no dictionary has
+	// no durable id space of its own, so the section names these instead; see marshalColSegment.
+	coldIDs map[uint32]struct{}
 }
 
 // blockZone is one numeric column's range within a block.
@@ -331,6 +334,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 	// the loop is what writes that region.
 	dicts, dictRaw, codeRaw := buildStrDicts(s, recs, len(recs))
 	var strCat, coldCat []byte
+	coldIDs := map[uint32]struct{}{}
 	b.strOff = []int{0}
 	b.coldOff = []int{0}
 	for k, r := range recs {
@@ -353,9 +357,11 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 			}
 		}
 		coldCat = append(coldCat, cold...)
+		collectColdIDs(cold, coldIDs)
 		b.strOff = append(b.strOff, len(strCat))
 		b.coldOff = append(b.coldOff, len(coldCat))
 	}
+	b.coldIDs = coldIDs
 	b.zones = numericZones(s, b, recs)
 	b.escClass, b.escExcRecs, b.escAbsent = classifyEscapes(s, recs, coldToField)
 	if dicts != nil {
@@ -926,5 +932,22 @@ func setGroupRemap(gbs []*colGroupBlock, rm *idRemap) {
 		if gb != nil && gb.blk != nil {
 			gb.blk.remap = rm
 		}
+	}
+}
+
+// collectColdIDs records the attribute ids a record's cold tail stores.
+func collectColdIDs(cold []byte, into map[uint32]struct{}) {
+	for len(cold) > 0 {
+		id, m := binary.Uvarint(cold)
+		if m <= 0 {
+			return
+		}
+		cold = cold[m:]
+		nl, ok := wire.NodeLen(cold)
+		if !ok || nl > len(cold) {
+			return
+		}
+		into[uint32(id)] = struct{}{}
+		cold = cold[nl:]
 	}
 }
