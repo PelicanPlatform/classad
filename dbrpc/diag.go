@@ -33,12 +33,14 @@ type Diagnostics struct {
 
 	// SchemaScan reports the per-segment columnar (adschema) accelerator's state: whether it is
 	// enabled (a numeric COUNT(*) WHERE takes the columnar fast path), its uncompressed hot
-	// columns, and how many sealed segments carry a block. Mutable tables only.
+	// columns, and how many sealed segments carry a block. Reported for BOTH table kinds --
+	// archives carry columnar blocks too, and reporting it for only one made an archive look
+	// like it had no accelerator at all.
 	SchemaScan db.SchemaScanInfo `json:"schemaScan"`
 
 	// Archive marks an append-only history table (vs. a mutable one), and Retention carries
-	// its rotation bounds. Both are omitted for a mutable table. SidecarSizes reports the
-	// archive's sealed-segment sidecar index bytes.
+	// its rotation bounds -- the one genuinely kind-specific pair, since a mutable table has no
+	// rotation. SidecarSizes reports sealed-segment sidecar index bytes, for both kinds.
 	Archive      bool            `json:"archive,omitempty"`
 	Retention    *db.Retention   `json:"retention,omitempty"`
 	SidecarSizes db.SidecarSizes `json:"sidecarSizes"`
@@ -46,10 +48,10 @@ type Diagnostics struct {
 	// ZoneAttrs are the archive attributes carrying per-segment [min,max] zone maps: a
 	// range query on one of these prunes whole segments, not just postings.
 	ZoneAttrs []string `json:"zoneAttrs,omitempty"`
-	// SealedSegments is how many of the archive's segments are sealed to an immutable
-	// index sidecar, and StaleIndexSegments how many of those were sealed under an older
-	// index configuration -- i.e. how much of the archive a runtime .addindex/.dropindex
-	// has NOT reached yet (only a rewrite reaches them).
+	// SealedSegments is how many segments are sealed to an immutable index sidecar, and
+	// StaleIndexSegments how many of those were sealed under an older index configuration --
+	// i.e. how much of the table a runtime .addindex/.dropindex has NOT reached yet (only a
+	// rewrite reaches them). Both kinds.
 	SealedSegments     int `json:"sealedSegments,omitempty"`
 	StaleIndexSegments int `json:"staleIndexSegments,omitempty"`
 }
@@ -82,7 +84,11 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		EncryptionEnabled:  t.EncryptionEnabled(),
 		EncryptedAttrs:     t.EncryptedAttrNames(),
 		SchemaScan:         t.SchemaScanInfo(),
+		// Reported for a mutable table as well as an archive: it has sidecars too, and without them
+		// its .stats could not account for its on-disk footprint the way an archive's could.
+		SidecarSizes: t.SidecarSizes(),
 	}
+	d.StaleIndexSegments, d.SealedSegments = t.StaleIndexSegments()
 	return json.Marshal(d)
 }
 
@@ -108,6 +114,12 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 		SealedSegments:     sealed,
 		StaleIndexSegments: stale,
 		SchemaScan:         a.SchemaScanInfo(),
+		// The same three a mutable table reports. Encryption in particular is reported rather than
+		// left zero: an archive is NOT sealed today (its open path passes no data key), and a missing
+		// line reads as "not applicable" when the truth is "not protected".
+		Hot:               a.HotAttrs(),
+		EncryptionEnabled: a.EncryptionEnabled(),
+		EncryptedAttrs:    a.EncryptedAttrNames(),
 	}
 	return json.Marshal(d)
 }

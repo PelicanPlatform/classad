@@ -710,6 +710,18 @@ func (t *ArchiveTable) IndexedAttrs() (categorical, value []string) { return t.a
 // range query prunes whole segments rather than only postings.
 func (t *ArchiveTable) ZoneAttrs() []string { return t.a.ZoneAttrs() }
 
+// HotAttrs reports the archive's hot-header attributes, matching DB.HotAttrs for a mutable table.
+func (t *ArchiveTable) HotAttrs() []string { return t.a.HotAttrNames() }
+
+// EncryptionEnabled reports whether this archive's values are sealed. See
+// collections.Archive.EncryptionEnabled: today this is false for every archive, because the archive
+// open path passes no data key. It is reported rather than omitted so the difference from a mutable
+// table is visible in .stats instead of implied by a missing line.
+func (t *ArchiveTable) EncryptionEnabled() bool { return t.a.EncryptionEnabled() }
+
+// EncryptedAttrNames reports the attributes this archive seals, matching DB.EncryptedAttrNames.
+func (t *ArchiveTable) EncryptedAttrNames() []string { return t.a.EncryptedAttrNames() }
+
 // StaleIndexSegments reports how many sealed segments still carry an index built under an
 // older configuration, and how many are sealed in total (see collections.Archive.AddIndex:
 // a sealed sidecar is immutable, so a runtime index change reaches old segments only via

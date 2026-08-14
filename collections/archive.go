@@ -385,6 +385,22 @@ func (a *Archive) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 // evictable page cache), broken out by structure. An operator diagnostic.
 func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }
 
+// HotAttrNames reports the attributes stored in the hot header, mirroring Collection.HotAttrNames. An
+// archive has a hot set exactly as a mutable collection does; only the accessor was missing, which made
+// an archive look like it had none.
+func (a *Archive) HotAttrNames() []string { return a.c.HotAttrNames() }
+
+// EncryptionEnabled reports whether this archive's values are sealed (mirroring
+// Collection.EncryptionEnabled). It is currently FALSE for every archive a catalog opens: the archive
+// open path passes no data key, so an archive stores private attributes in the clear where a mutable
+// table always seals them. Exposing it is what makes that asymmetry visible instead of absent from
+// the diagnostics -- an operator reading "encryption at rest: on" for a table should not have to guess
+// what its history table does.
+func (a *Archive) EncryptionEnabled() bool { return a.c.EncryptionEnabled() }
+
+// EncryptedAttrNames reports the attributes this archive seals, mirroring Collection.EncryptedAttrNames.
+func (a *Archive) EncryptedAttrNames() []string { return a.c.EncryptedAttrNames() }
+
 // RetrainDict trains a fresh ZSTD dictionary from up to sampleMax records and recompresses
 // every segment in place under it (an append-only reseal that preserves order), returning
 // the new dictionary's size in bytes. This is how an archive's compression adapts to the
