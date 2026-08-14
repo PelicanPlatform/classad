@@ -388,13 +388,18 @@ func TestColSegmentRejectsGroupOffsMismatch(t *testing.T) {
 // the next group. Below the floor the back-off is skipped, so blocks stay reasonably sized even where
 // that costs alignment.
 func TestRowGroupsNoRunts(t *testing.T) {
-	c := New(Options{Shards: 1, SegmentSize: 1 << 23})
+	// The budget is pinned rather than inherited from the default. The fixture sizes its enormous
+	// record FROM the budget, so tracking a default that later moved made its data shrink with it --
+	// at which point nothing sealed and the test asserted nothing rather than failing. What is being
+	// tested is the back-off's shape, not whatever budget production currently runs.
+	const budget = 1 << 20
+	c := New(Options{Shards: 1, SegmentSize: 1 << 23, RowGroupBytes: budget})
 	defer c.Close()
 	// Incompressible, deterministically. The block's size is only observable through its compressed
 	// regions, so a repetitive blob would shrink to a few hundred bytes and every block would look like a
 	// runt whether or not it was one -- measuring the codec instead of the grouping.
 	small := incompressible(64, 1)
-	huge := incompressible(colGroupTargetBytes+128*1024, 2) // crosses the byte budget on its own
+	huge := incompressible(budget+128*1024, 2) // crosses the byte budget on its own
 	n := 0
 	for round := 0; round < 16; round++ {
 		// Exactly colGroupAlign small ads -- so the last alignment boundary holds almost nothing -- then
@@ -426,7 +431,7 @@ func TestRowGroupsNoRunts(t *testing.T) {
 	if !c.BuildAndEnableSchemaScan(4000, 8) {
 		t.Fatal("no sealed segments; the fixture did not seal, so nothing was tested")
 	}
-	floor := colGroupTargetBytes / 2
+	floor := budget / 2
 	blocks, runts := 0, 0
 	for _, sh := range c.shards {
 		_, wins := sh.snapshot()
