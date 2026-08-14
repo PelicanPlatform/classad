@@ -183,6 +183,38 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 		}
 		added++
 	}
+	// Attributes the base schema does not carry. They used to be in the record; on an interned
+	// segment the rewrite moves them into the block's COLD TAIL, so a projection naming one has to
+	// look there or it comes back empty for every record that has it.
+	for id := range p.ids {
+		if _, isField := blk.schema.byID[id]; isField {
+			continue // already emitted from its column above
+		}
+		node, found, err := blk.escapedNode(local, id, cs.bc)
+		if err != nil {
+			return nil, false
+		}
+		if !found {
+			continue // not in the tail either: genuinely absent, or still in the record
+		}
+		outID := id
+		name := ""
+		if sd != nil {
+			// A cold-tail entry is already keyed by the segment dictionary, which is the record's own
+			// key space -- so it is emitted as it was stored, with no translation.
+			outID = blk.remap.stored(id)
+		} else if inline {
+			nm, ok := c.intern.Name(id)
+			if !ok {
+				return nil, false
+			}
+			name = nm
+		}
+		sc.entries = wire.AppendKey(sc.entries, inline, outID, name)
+		sc.entries = append(sc.entries, node...)
+		added++
+	}
+
 	// The GROUP columns, restricted to the projection. A group attribute is not a base schema field,
 	// so the loop above does not reach it, and for a record belonging to its group wholly it is not in
 	// the record either -- the rewrite moved it into the group's column. Without this a projection
