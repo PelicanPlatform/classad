@@ -31,6 +31,19 @@ type ArchiveTable struct {
 type ArchiveConfig struct {
 	// SegmentSize is the sealed-segment file size in bytes (default 8 MiB).
 	SegmentSize int
+	// RowGroupBytes is the uncompressed record-bytes budget for one columnar row group. 0 takes the
+	// default (see collections.Options.RowGroupBytes).
+	//
+	// Like the rest of this config it is read at CREATE time only -- a reopened archive uses the
+	// persisted value. Use SetRowGroupBytes to change it on a live archive: unlike the index set, this
+	// needs no reconciliation, because each block records its own layout, so a new budget governs
+	// segments sealed from then on and older ones keep theirs.
+	//
+	// It trades point-lookup cost against how far compression can see across records: a larger group
+	// stores the same data in fewer bytes and makes reading one record decompress more of it. The
+	// default is measured on real ads, but the right point depends on the read mix and on how much of
+	// the working set fits the block cache, which only a production-sized archive can answer.
+	RowGroupBytes int
 	// HotAttrs / CategoricalAttrs / ValueAttrs tune the per-segment hot header and
 	// indexes; ZoneAttrs names numeric attributes to keep per-segment min/max on for
 	// whole-segment query pruning (value-indexed attributes are included automatically).
@@ -114,6 +127,7 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 	opts := collections.ArchiveOptions{
 		Dir:                 dir,
 		SegmentSize:         cfg.SegmentSize,
+		RowGroupBytes:       cfg.RowGroupBytes,
 		Codec:               codec,
 		HotAttrs:            cfg.HotAttrs,
 		GroupSchemaCount:    cfg.GroupSchemaCount,
@@ -718,6 +732,23 @@ func (t *ArchiveTable) SetRetention(r collections.Retention) error {
 	t.cfg.Retention = r
 	return t.saveConfig()
 }
+
+// SetRowGroupBytes changes the columnar row-group budget and persists it (archiveconfig.json), so a
+// value tried on a live archive survives a restart. 0 restores the default.
+//
+// Unlike the index set this needs no reconciliation pass: every block records the layout it was
+// written with, so the new budget governs segments sealed from now on while everything already on disk
+// keeps reading as before. That is what makes it worth exposing -- the right value depends on the read
+// mix and on how much of the working set fits the block cache, which only a production-sized archive
+// can answer, and finding it must not mean rebuilding the archive.
+func (t *ArchiveTable) SetRowGroupBytes(n int) error {
+	t.a.SetRowGroupBytes(n)
+	t.cfg.RowGroupBytes = n
+	return t.saveConfig()
+}
+
+// RowGroupBytes reports the budget currently in effect (0 meaning the default).
+func (t *ArchiveTable) RowGroupBytes() int { return t.a.RowGroupBytes() }
 
 // SetGCFloor installs a runtime GC watermark (in the archive's MinAgeAttr units) so the next
 // Rotate may reclaim already-consumed records early: a change-feed source passes the feed's

@@ -335,8 +335,11 @@ type Collection struct {
 	groupStability   int            // Options.GroupStabilityRuns
 	groupJac         float64        // Options.GroupMergeJaccard
 	colBudget        int            // Options.ColumnarSegmentBudget
-	rowGroupBytes    int            // Options.RowGroupBytes
-	groupMaxPart     float64        // Options.GroupMaxPartialFrac
+	// rowGroupBytes is Options.RowGroupBytes, settable at runtime (SetRowGroupBytes) because it only
+	// governs row groups sealed from now on -- blocks already written record their own layout. Atomic
+	// because every scan that seals a segment reads it.
+	rowGroupBytes atomic.Int64
+	groupMaxPart  float64 // Options.GroupMaxPartialFrac
 
 	// Query fan-out (see parallel_scan.go). queryPar is the per-query worker cap
 	// (0/1 ⇒ serial). qsem is a collection-wide token pool bounding total scan
@@ -566,9 +569,9 @@ func New(opts Options) *Collection {
 		groupStability:   opts.GroupStabilityRuns,
 		groupJac:         opts.GroupMergeJaccard,
 		colBudget:        opts.ColumnarSegmentBudget,
-		rowGroupBytes:    opts.RowGroupBytes,
 		groupMaxPart:     opts.GroupMaxPartialFrac,
 	}
+	c.rowGroupBytes.Store(int64(opts.RowGroupBytes))
 	c.codec.Store(&codecHolder{codec})
 	if cfg := newTTConfig(opts.TimeTravel); cfg != nil {
 		c.ttCfg.Store(cfg)
@@ -1425,3 +1428,15 @@ func nextPow2(n int) int {
 	}
 	return p
 }
+
+// SetRowGroupBytes changes the uncompressed record-bytes budget for a columnar row group. 0 restores
+// the default.
+//
+// Safe on a live collection, and it needs no reconciliation pass: every block records the layout it
+// was written with, so a new budget governs row groups sealed from now on while everything already on
+// disk keeps reading exactly as before. That is what makes this tunable against a real archive rather
+// than only at creation.
+func (c *Collection) SetRowGroupBytes(n int) { c.rowGroupBytes.Store(int64(n)) }
+
+// RowGroupBytes reports the budget currently in effect (0 meaning the default).
+func (c *Collection) RowGroupBytes() int { return int(c.rowGroupBytes.Load()) }

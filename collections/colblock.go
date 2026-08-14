@@ -138,8 +138,8 @@ func defaultColGrouping() colGrouping {
 // vectors with no tail, neither of which is a tuning decision.
 func (c *Collection) colGrouping() colGrouping {
 	g := defaultColGrouping()
-	if c.rowGroupBytes > 0 {
-		g.targetBytes = c.rowGroupBytes
+	if n := c.rowGroupBytes.Load(); n > 0 {
+		g.targetBytes = int(n)
 	}
 	return g
 }
