@@ -139,6 +139,17 @@ func TestColumnarizedShardServesReverseScan(t *testing.T) {
 // failure, so the read paths treat an unreadable payload as an error and this test requires a
 // readable one to be found.
 func TestColumnarizedSegmentSurvivesReopen(t *testing.T) {
+	// Repeated, because what this guards is not deterministic across a single build: the derived
+	// schema depends on sampling, and only some schemas put an attribute in the cold tail whose id
+	// moves across the restart. A single round passed for a whole session while reassembly was
+	// emitting one field under another's name -- it took roughly one build in ten to show, and CI
+	// found it before this loop existed.
+	for round := range 8 {
+		t.Run(fmt.Sprintf("round-%d", round), func(t *testing.T) { columnarReopenRound(t) })
+	}
+}
+
+func columnarReopenRound(t *testing.T) {
 	dir := t.TempDir()
 	c, s, hot := columnarFixtureIn(t, dir, 3000)
 	before := readAll(t, c, "true")
