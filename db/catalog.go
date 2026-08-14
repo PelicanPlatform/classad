@@ -22,10 +22,15 @@ type Catalog struct {
 
 	// Encryption at rest applied uniformly to every table: each table is an independent
 	// encrypted store whose own master key is wrapped by these pool keys, and whose
-	// default explicitly-encrypted attributes are encAttrs. Empty poolKeys ⇒ no
-	// encryption. Private attributes are always encrypted when poolKeys is set.
+	// default explicitly-encrypted attributes are encAttrs. Empty poolKeys ⇒ no encryption AT REST;
+	// private attributes are sealed either way.
 	poolKeys []KEK
 	encAttrs []string
+
+	// onSealMigration and sealWorkers are carried from CatalogConfig so every table opened through this
+	// catalog reports its one-off migration, named (see CatalogConfig.OnSealMigration).
+	onSealMigration func(table string, segments int)
+	sealWorkers     int
 
 	mu       sync.Mutex
 	tables   map[string]*DB
@@ -69,6 +74,23 @@ type CatalogConfig struct {
 	// set for each table (private attributes are always encrypted). See db/encrypt.go.
 	PoolKeys       []KEK
 	EncryptedAttrs []string
+
+	// OnSealMigration, when set, is called for each table whose open rewrote segments to seal private
+	// attributes that predate sealing, with how many segments it rewrote. It carries the TABLE NAME
+	// because a catalog opens many, and "some table rewrote 400 segments" does not tell an operator
+	// which one to expect the cost from.
+	//
+	// The per-table Config hook exists too, but a catalog builds those configs itself, so without this
+	// the hook was unreachable for every table a daemon actually opens -- the only place the one-off
+	// startup cost needs explaining.
+	//
+	// Called from the goroutine that opened that table, so it may run concurrently (see OnOpenStep).
+	OnSealMigration func(table string, segments int)
+
+	// SealMigrationWorkers bounds the concurrent segment rewrites within one table's migration (see
+	// collections.MigrateSealedAttrs). 0 takes a per-table default. Tables are already opened in
+	// parallel, so this multiplies with that.
+	SealMigrationWorkers int
 }
 
 // OpenCatalog opens the catalog rooted at dir with no encryption. See OpenCatalogConfig
@@ -141,6 +163,8 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		exporters:        map[string]ExporterDef{},
 		memExporterState: map[string][]byte{},
 		poolKeys:         cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs,
+		onSealMigration: cfg.OnSealMigration,
+		sealWorkers:     cfg.SealMigrationWorkers,
 	}
 	if cfg.Dir == "" {
 		return cat, nil
@@ -217,7 +241,21 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 
 // tableConfig builds a per-table Config carrying the catalog-wide encryption settings.
 func (cat *Catalog) tableConfig(dir string) Config {
-	return Config{Dir: dir, PoolKeys: cat.poolKeys, EncryptedAttrs: cat.encAttrs}
+	cfg := Config{
+		Dir:                  dir,
+		PoolKeys:             cat.poolKeys,
+		EncryptedAttrs:       cat.encAttrs,
+		SealMigrationWorkers: cat.sealWorkers,
+	}
+	if cat.onSealMigration != nil {
+		// Name the table the count belongs to: the per-table hook cannot know it, and the catalog can.
+		name := filepath.Base(dir)
+		if dir == "" {
+			name = "(in-memory)"
+		}
+		cfg.OnSealMigration = func(segments int) { cat.onSealMigration(name, segments) }
+	}
+	return cfg
 }
 
 // ValidTableName reports whether name is usable as a table (and a directory):
