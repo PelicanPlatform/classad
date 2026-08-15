@@ -491,6 +491,15 @@ func (db *DB) OpStats() OpStats {
 // header for cheap access).
 func (db *DB) HotAttrs() []string { return db.c.HotAttrNames() }
 
+// SidecarSizes reports the sealed-segment sidecar index bytes (mmap-backed, evictable), matching
+// ArchiveTable.SidecarSizes. A mutable table has these sidecars too -- only the accessor was missing,
+// so its .stats could not report the on-disk footprint an archive's could.
+func (db *DB) SidecarSizes() SidecarSizes { return db.c.SidecarSizes() }
+
+// StaleIndexSegments reports how many sealed segments still carry an index built under an older
+// configuration, and how many are sealed in total, matching ArchiveTable.StaleIndexSegments.
+func (db *DB) StaleIndexSegments() (stale, sealed int) { return db.c.StaleIndexSegments() }
+
 // SchemaScanInfo reports the columnar (adschema) accelerator's state: whether it is enabled (so a
 // numeric COUNT(*) WHERE routes to the columnar fast path), its hot columns, and segment coverage.
 func (db *DB) SchemaScanInfo() SchemaScanInfo { return db.c.SchemaScanInfo() }
