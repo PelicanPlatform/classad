@@ -20,12 +20,12 @@ func groupSchemaReadFixture(t *testing.T, c *Collection, n int) (*colScope, *col
 	for _, iw := range iws {
 		rows = append(rows, base.encode(wire.Ad(iw)))
 	}
-	blk := encodeColumnarBlock(base, rows, nil, c.regionCodec(), nil)
+	blk := encodeColumnarBlock(base, rows, resolveColLayout(base, nil), c.regionCodec(), nil)
 	g := &colGroup{ids: nil, schema: buildAdSchemaFor(iws, ids)}
 	for _, f := range g.schema.fields {
 		g.ids = append(g.ids, f.id)
 	}
-	g.blocks = buildGroupBlocks([]*colGroup{g}, iws, c.regionCodec(), nil)
+	g.blocks = buildGroupBlocks([]*colGroup{g}, []*colLayout{resolveColLayout(g.schema, nil)}, iws, c.regionCodec(), nil)
 	seg := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
 
 	bc, err := newBlockCache(1 << 20)

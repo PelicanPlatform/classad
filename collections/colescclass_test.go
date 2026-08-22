@@ -50,7 +50,7 @@ func TestEscapeClassMatchesColdTail(t *testing.T) {
 	for _, iw := range iws {
 		rows = append(rows, s.encode(wire.Ad(iw)))
 	}
-	blk := encodeColumnarBlock(s, rows, nil, c.regionCodec(), nil)
+	blk := encodeColumnarBlock(s, rows, resolveColLayout(s, nil), c.regionCodec(), nil)
 	bc, err := newBlockCache(1 << 20)
 	if err != nil {
 		t.Fatal(err)
@@ -100,7 +100,7 @@ func TestEscapeClassCoversAllShapes(t *testing.T) {
 	for _, iw := range iws {
 		rows = append(rows, s.encode(wire.Ad(iw)))
 	}
-	blk := encodeColumnarBlock(s, rows, nil, c.regionCodec(), nil)
+	blk := encodeColumnarBlock(s, rows, resolveColLayout(s, nil), c.regionCodec(), nil)
 	seen := map[uint8]string{}
 	for fi, f := range s.fields {
 		name, _ := c.intern.Name(f.id)
@@ -138,7 +138,7 @@ func TestEscapeClassSurvivesPersistence(t *testing.T) {
 	for _, iw := range iws {
 		rows = append(rows, s.encode(wire.Ad(iw)))
 	}
-	blk := encodeColumnarBlock(s, rows, nil, identityCodec{}, nil)
+	blk := encodeColumnarBlock(s, rows, resolveColLayout(s, nil), identityCodec{}, nil)
 	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n)}
 	blob := marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
 	got := unmarshalColSegment(blob, identityCodec{}, func(name string) uint32 { return c.intern.Intern(name) })
@@ -203,7 +203,7 @@ func TestBlockAbsenceProofIsExact(t *testing.T) {
 		}
 		rows = append(rows, s.encode(wire.Ad(wire.Encode(nil, ad.AST(), c.intern))))
 	}
-	blk := encodeColumnarBlock(s, rows, nil, c.regionCodec(), nil)
+	blk := encodeColumnarBlock(s, rows, resolveColLayout(s, nil), c.regionCodec(), nil)
 	if !blk.fieldAbsentFromBlock(gi) {
 		t.Error("Ghost is absent from every record but the block does not prove it")
 	}
@@ -222,7 +222,7 @@ func TestBlockAbsenceProofIsExact(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows[0] = s.encode(wire.Ad(wire.Encode(nil, adG.AST(), c.intern)))
-	blk2 := encodeColumnarBlock(s, rows, nil, c.regionCodec(), nil)
+	blk2 := encodeColumnarBlock(s, rows, resolveColLayout(s, nil), c.regionCodec(), nil)
 	if blk2.fieldAbsentFromBlock(gi) {
 		t.Error("one record carries Ghost, but the block still claims it absent from all of them")
 	}

@@ -154,7 +154,7 @@ func groupHave(w []byte, ids map[uint32]struct{}) int {
 // toLocal keys these blocks' cold tails by the SEGMENT's dictionary, for the same reason the base
 // block's are: an id written from the global intern table means nothing after a restart. nil keeps
 // them globally keyed, which is self-consistent but does not survive one.
-func buildGroupBlocks(groups []*colGroup, iws [][]byte, regionCodec Codec, toLocal func(uint32) (uint32, bool)) []*colGroupBlock {
+func buildGroupBlocks(groups []*colGroup, groupLayouts []*colLayout, iws [][]byte, regionCodec Codec, toLocal func(uint32) (uint32, bool)) []*colGroupBlock {
 	if len(groups) == 0 || len(iws) == 0 {
 		return nil
 	}
@@ -181,7 +181,7 @@ func buildGroupBlocks(groups []*colGroup, iws [][]byte, regionCodec Codec, toLoc
 		if len(members) > 0 {
 			// No hot tier for a group column yet: the groups are derived from presence, so
 			// nothing here says which of their columns queries read.
-			gb.blk = encodeColumnarBlock(g.schema, members, nil, regionCodec, groupColdToField(g.schema, toLocal))
+			gb.blk = encodeColumnarBlock(g.schema, members, groupLayouts[gi], regionCodec, groupColdToField(g.schema, toLocal))
 		}
 		out[gi] = gb
 	}

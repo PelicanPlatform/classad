@@ -84,11 +84,11 @@ func newNumCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCache)
 	}
 	// Hot and cold numerics are both columnar, so resolving a column is picking a buffer and an offset;
 	// the per-record read below no longer branches on which it was.
-	if start, hot := blk.hotColStart[fieldIdx]; hot {
+	if start, hot := blk.hotColStart(fieldIdx); hot {
 		c.region, c.start = blk.hotCol, start
 		return c, true
 	}
-	start, ok := blk.coldFieldStart[fieldIdx]
+	start, ok := blk.coldFieldStart(fieldIdx)
 	if !ok {
 		return numCol{}, false
 	}
@@ -121,10 +121,10 @@ func (c *numCol) at(k int, bc *blockCache) (colVal, bool) {
 // which is the whole point of narrowing first.
 func (b *columnarBlock) fieldIntAt(k, fieldIdx int, bc *blockCache) (int64, bool) {
 	f := b.schema.fields[fieldIdx]
-	if start, hot := b.hotColStart[fieldIdx]; hot {
+	if start, hot := b.hotColStart(fieldIdx); hot {
 		return readIntLE(b.hotCol[start+k*f.width:], f.width, f.unsigned), true
 	}
-	start, ok := b.coldFieldStart[fieldIdx]
+	start, ok := b.coldFieldStart(fieldIdx)
 	if !ok {
 		return 0, false
 	}

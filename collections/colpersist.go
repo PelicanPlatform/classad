@@ -285,14 +285,12 @@ func appendColBlock(dst []byte, b *columnarBlock) []byte {
 	dst = appendBytes(dst, b.coldNumComp)
 	dst = appendBytes(dst, b.strComp)
 	dst = appendBytes(dst, b.coldComp)
-	dst = appendU32(dst, uint32(len(b.strOff)))
-	for _, v := range b.strOff {
-		dst = appendU32(dst, uint32(v))
-	}
-	dst = appendU32(dst, uint32(len(b.coldOff)))
-	for _, v := range b.coldOff {
-		dst = appendU32(dst, uint32(v))
-	}
+	// The offsets are already packed little-endian u32 (b.strOffB/coldOffB): write the count then the
+	// bytes verbatim, byte-identical to the old int-by-int encoding.
+	dst = appendU32(dst, uint32(len(b.strOffB)/4))
+	dst = append(dst, b.strOffB...)
+	dst = appendU32(dst, uint32(len(b.coldOffB)/4))
+	dst = append(dst, b.coldOffB...)
 	dst = appendU32(dst, uint32(len(b.zones)))
 	for idx, z := range b.zones {
 		dst = appendU32(dst, uint32(idx))
@@ -351,12 +349,12 @@ func appendColBlock(dst []byte, b *columnarBlock) []byte {
 
 // readColBlock reads one block payload written by appendColBlock, returning nil on malformed data.
 // The byte streams ALIAS the cursor's buffer (see unmarshalColSegment's lifetime contract).
-func readColBlock(c *cursor, s *adSchema, hotNum []int, codec Codec) *columnarBlock {
+func readColBlock(c *cursor, s *adSchema, layout *colLayout, codec Codec) *columnarBlock {
 	n := int(c.u32())
 	if n < 0 || c.err != nil {
 		return nil
 	}
-	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n}
+	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: codec, n: n, layout: layout, bitsStride: layout.bitsStride}
 	// Both alias data (the mmap): read-only, scanned in place. The hot numerics being columnar means a
 	// whole column is one contiguous span OF THE MMAP, which is what a vector load needs.
 	b.bits = c.bytes()
@@ -364,8 +362,8 @@ func readColBlock(c *cursor, s *adSchema, hotNum []int, codec Codec) *columnarBl
 	b.coldNumComp = c.bytes()
 	b.strComp = c.bytes()
 	b.coldComp = c.bytes()
-	b.strOff = readInts(c)
-	b.coldOff = readInts(c)
+	b.strOffB = c.u32SliceBytes()
+	b.coldOffB = c.u32SliceBytes()
 	if nz := int(c.u32()); nz > 0 {
 		if nz > len(s.fields) || !c.need(0) {
 			return nil
@@ -439,7 +437,6 @@ func readColBlock(c *cursor, s *adSchema, hotNum []int, codec Codec) *columnarBl
 	if c.err != nil {
 		return nil
 	}
-	layoutColumnar(b, s, hotNum, n)
 	return b
 }
 
@@ -493,10 +490,12 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	if nb < 0 || !c.need(0) {
 		return nil
 	}
+	// One layout shared by every base block of this segment (all share s and hotNum).
+	baseLayout := resolveColLayout(s, hotNum)
 	blocks := make([]*columnarBlock, 0, nb)
 	total := 0
 	for i := 0; i < nb; i++ {
-		b := readColBlock(c, s, hotNum, codec)
+		b := readColBlock(c, s, baseLayout, codec)
 		if b == nil {
 			return nil
 		}
@@ -533,6 +532,8 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 			g.ids = append(g.ids, f.id)
 		}
 		sort.Slice(g.ids, func(a, b int) bool { return g.ids[a] < g.ids[b] })
+		// One layout shared by all of this group's blocks (groups have no hot tier).
+		glayout := resolveColLayout(g.schema, nil)
 		nbl := int(c.u32())
 		if nbl != len(blocks) {
 			// One selection per base block, or a membership bitmap would be indexed against
@@ -556,7 +557,7 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 				return nil
 			}
 			if c.u32() != 0 {
-				if gb.blk = readColBlock(c, g.schema, nil, codec); gb.blk == nil {
+				if gb.blk = readColBlock(c, g.schema, glayout, codec); gb.blk == nil {
 					return nil
 				}
 			}
@@ -575,18 +576,6 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 		return nil
 	}
 	return cs
-}
-
-func readInts(c *cursor) []int {
-	n := int(c.u32())
-	if n < 0 || !c.need(0) {
-		return nil
-	}
-	out := make([]int, n)
-	for i := range out {
-		out[i] = int(c.u32())
-	}
-	return out
 }
 
 func readU32s(c *cursor) []uint32 {

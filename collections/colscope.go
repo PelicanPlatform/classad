@@ -211,10 +211,10 @@ func (cs *colScope) fromColdTail(id uint32) classad.Value {
 // slotInt reads a numeric field's raw slot value (a real's slot holds math.Float64bits).
 func (cs *colScope) slotInt(idx int, f adField) (int64, bool) {
 	b := cs.blk
-	if start, hot := b.hotColStart[idx]; hot {
+	if start, hot := b.hotColStart(idx); hot {
 		return readIntLE(b.hotCol[start+cs.k*f.width:], f.width, f.unsigned), true
 	}
-	start, ok := b.coldFieldStart[idx]
+	start, ok := b.coldFieldStart(idx)
 	if !ok {
 		return 0, false
 	}
@@ -269,7 +269,7 @@ func (cs *colScope) slotString(idx int) (string, bool) {
 		}
 		cs.strScratch = raw
 	}
-	region := cs.strScratch[b.strOff[cs.k]:b.strOff[cs.k+1]]
+	region := cs.strScratch[b.strOffAt(cs.k):b.strOffAt(cs.k+1)]
 	esc := b.escapeAt(cs.k)
 	for i := range b.schema.fields {
 		// A field the dictionary owns is NOT in this region; see appendNonDictStrings. Skipping it keeps the
