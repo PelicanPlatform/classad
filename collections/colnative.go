@@ -106,16 +106,11 @@ func publishColNative(c *Collection, seg *segment) {
 				seg.colDamaged.Store(true)
 				return
 			}
-			bc, err := newBlockCache(64 << 20)
-			if err != nil {
-				// Reached the payload and could not make it readable. Returning quietly would
-				// leave the segment looking like an ordinary one, whose records are whole -- and
-				// these are not. Mark it damaged so reads fail instead.
-				colNativeCRCFailures.Add(1)
-				seg.colDamaged.Store(true)
-				return
-			}
-			cn := &colNative{seg: cs, byOff: make(map[uint32]int, len(cs.offs)), cache: bc}
+			// The collection's ONE shared block cache, not a fresh per-segment cache: a cache
+			// per segment made ristretto's fixed admission metadata scale with segment count (a
+			// multi-GB reopen leak on a large archive). A nil cache (creation failed) is valid --
+			// blockCache methods then decompress every time -- so it never damages the segment.
+			cn := &colNative{seg: cs, byOff: make(map[uint32]int, len(cs.offs)), cache: c.sharedColCache()}
 			for i, ro := range cs.offs {
 				cn.byOff[ro] = i
 			}
