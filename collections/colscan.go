@@ -208,11 +208,11 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 func (c *Collection) installSchemaScan(s *adSchema, hot []int) bool {
 	st := c.schemaScan.Load()
 	if st == nil || st.schema != s {
-		bc, err := newBlockCache(256 << 20) // ~256 MiB of decompressed blocks
-		if err != nil {
-			return false
-		}
-		st = &schemaScanState{schema: s, hot: hot, cache: bc, groups: c.groupSchemasFor(s)}
+		// The collection's ONE shared columnar-block cache, not a second 256MiB cache: the schema
+		// scan and the colNative reconstruct read the SAME columnar blocks (keyed by process-unique
+		// block id), so two caches held largely the same decompressed blocks twice -- a needless
+		// ~256MiB on top of the per-collection cache. Sharing dedups them.
+		st = &schemaScanState{schema: s, hot: hot, cache: c.sharedColCache(), groups: c.groupSchemasFor(s)}
 		c.schemaScan.Store(st)
 	}
 	return true
@@ -453,11 +453,8 @@ func (c *Collection) adoptPersistedSchemaScan() {
 	if schema == nil {
 		return
 	}
-	bc, err := newBlockCache(256 << 20)
-	if err != nil {
-		return
-	}
-	c.schemaScan.Store(&schemaScanState{schema: schema, hot: hot, cache: bc})
+	// Share the collection's one columnar-block cache (see installSchemaScan) rather than a second.
+	c.schemaScan.Store(&schemaScanState{schema: schema, hot: hot, cache: c.sharedColCache()})
 }
 
 // BuildAndEnableSchemaScan samples the collection, builds an adschema, chooses the hot numeric
