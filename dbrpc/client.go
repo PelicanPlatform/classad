@@ -631,6 +631,13 @@ func (c *Client) streamCtx(ctx context.Context, build func(id uint64) []byte) ([
 // that a failure before the first row is reported before any yield -- so "surface an
 // outage instead of a silently empty result" still holds for the empty case.
 func (c *Client) streamEach(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool) error {
+	return c.streamEachStats(ctx, build, yield, nil)
+}
+
+// streamEachStats is streamEach that also delivers a scan-stats trailer (stStreamStats) to
+// onStats when the op sends one (the *Stats projection op). onStats is nil for every ordinary
+// stream, which then ignores such a frame if one ever arrives.
+func (c *Client) streamEachStats(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool, onStats func(*reader)) error {
 	_, ch, err := c.callStream(build)
 	if err != nil {
 		return err
@@ -653,6 +660,10 @@ func (c *Client) streamEach(ctx context.Context, build func(id uint64) []byte, y
 				if !yield(body.str()) {
 					drain(ch) // consumer stopped early; let the server-side stream finish
 					return nil
+				}
+			case stStreamStats:
+				if onStats != nil {
+					onStats(body)
 				}
 			case stErr:
 				return statusErr(status, body)

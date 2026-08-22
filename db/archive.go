@@ -257,6 +257,16 @@ func (t *ArchiveTable) QueryRawProjectedRefs(constraint string, projection []str
 	return t.a.QueryRawProjected(q, projection, true, redact), nil
 }
 
+// QueryRawProjectedRefsStats is QueryRawProjectedRefs that also fills stats (may be nil) with the
+// per-scan work breakdown for EXPLAIN ANALYZE.
+func (t *ArchiveTable) QueryRawProjectedRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[collections.RawAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return t.a.QueryRawProjectedStats(q, projection, true, redact, stats), nil
+}
+
 // Aggregate runs a server-side GROUP BY over the archive's matches: it applies the
 // constraint (using the archive's zone-map pruning, so segments no matching record can
 // fall in are never scanned), groups by the raw group columns, and reduces each group

@@ -94,6 +94,31 @@ func projectRefsErr(err error) error {
 	return err
 }
 
+// QueryRawProjectRefsStreamStats is QueryRawProjectRefsStream that also fills stats (may be nil)
+// with the server's per-scan work breakdown, for EXPLAIN ANALYZE. Against a server too old to
+// implement the opcode it returns ErrProjectRefsUnsupported with stats untouched, so the caller
+// falls back to the plain stream and simply reports no server-side breakdown.
+func (c *Client) QueryRawProjectRefsStreamStats(ctx context.Context, table, constraint string, attrs []string, limit int, yield func(row string) bool, stats *collections.ScanStats) error {
+	onStats := func(r *reader) {
+		if stats != nil {
+			*stats = readScanStats(r)
+		}
+	}
+	return projectRefsErr(c.streamEachStats(ctx, statsFrame(table, constraint, attrs, limit), yield, onStats))
+}
+
+// statsFrame builds the opQueryRawProjRefsStats request frame (same shape as opQueryRawProjRefs).
+func statsFrame(table, constraint string, attrs []string, limit int) func(uint64) []byte {
+	return func(id uint64) []byte {
+		b := putStr(putI32(putStr(req(id, opQueryRawProjRefsStats), table), int32(limit)), constraint)
+		b = putI32(b, int32(len(attrs)))
+		for _, a := range attrs {
+			b = putStr(b, a)
+		}
+		return b
+	}
+}
+
 // QueryRawTableStream is QueryRawTable that hands each matching ad's old-ClassAd wire
 // text to yield as it arrives, instead of collecting the whole result into a slice --
 // so a relay (e.g. the collector) can forward each ad to its own client without
@@ -226,19 +251,25 @@ func rawAdText(ra collections.RawAd) string {
 // every ad across the wire. The projection is applied server-side; matching is
 // case-insensitive (ClassAd attribute names are).
 func (s *Server) streamQueryRawProject(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
-	s.streamQueryRawProjectOpt(ctx, reqID, r, includePrivate, write, qlog, false)
+	s.streamQueryRawProjectOpt(ctx, reqID, r, includePrivate, write, qlog, false, false)
 }
 
 // streamQueryRawProjectRefs is streamQueryRawProject whose projection also carries the
 // attributes the projected expressions reference, so each streamed ad evaluates
 // self-contained at the far end. See db.DB.QueryRawProjectedRefs.
 func (s *Server) streamQueryRawProjectRefs(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
-	s.streamQueryRawProjectOpt(ctx, reqID, r, includePrivate, write, qlog, true)
+	s.streamQueryRawProjectOpt(ctx, reqID, r, includePrivate, write, qlog, true, false)
 }
 
-// streamQueryRawProjectOpt is the shared body of the two projection ops; chaseRefs picks
-// which db projection they use.
-func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog), chaseRefs bool) {
+// streamQueryRawProjectRefsStats is streamQueryRawProjectRefs that also streams a ScanStats
+// trailer (stStreamStats) before the terminator, for EXPLAIN ANALYZE.
+func (s *Server) streamQueryRawProjectRefsStats(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamQueryRawProjectOpt(ctx, reqID, r, includePrivate, write, qlog, true, true)
+}
+
+// streamQueryRawProjectOpt is the shared body of the projection ops; chaseRefs picks which db
+// projection they use, and wantStats (chaseRefs only) appends a scan-stats trailer.
+func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog), chaseRefs, wantStats bool) {
 	start := time.Now()
 	table := r.str()
 	limit := int(r.i32())
@@ -270,20 +301,33 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
+	// stats is filled by the *RefsStats db methods during iteration when wantStats (which the
+	// caller only sets on the chaseRefs path). nil pointer otherwise, so the normal ops pay
+	// nothing.
+	var stats *collections.ScanStats
+	if wantStats {
+		stats = &collections.ScanStats{}
+	}
 	if d, ok := s.cat.Table(table); ok {
-		if chaseRefs {
+		if wantStats {
+			seq, err = d.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
+		} else if chaseRefs {
 			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
 		} else {
 			seq, err = d.QueryRawProjected(constraint, attrs, redact)
 		}
 	} else if d, ok := s.cat.ViewBacking(table); ok {
-		if chaseRefs {
+		if wantStats {
+			seq, err = d.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
+		} else if chaseRefs {
 			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
 		} else {
 			seq, err = d.QueryRawProjected(constraint, attrs, redact)
 		}
 	} else if a, ok := s.cat.ArchiveTable(table); ok {
-		if chaseRefs {
+		if wantStats {
+			seq, err = a.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
+		} else if chaseRefs {
 			seq, err = a.QueryRawProjectedRefs(constraint, attrs, redact)
 		} else {
 			seq, err = a.QueryRawProjected(constraint, attrs, redact)
@@ -305,6 +349,9 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 		if limit > 0 && n >= limit {
 			break
 		}
+	}
+	if wantStats {
+		write(putScanStats(respHead(reqID, stStreamStats), *stats))
 	}
 	write(respHead(reqID, stStreamEnd))
 }

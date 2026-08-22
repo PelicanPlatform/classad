@@ -129,6 +129,20 @@ func (db *DB) QueryRawProjectedRefs(constraint string, projection []string, reda
 	return db.c.QueryRawProjected(q, projection, true, redact), nil
 }
 
+// QueryRawProjectedRefsStats is QueryRawProjectedRefs that also fills stats (may be nil) with the
+// per-scan work breakdown, for EXPLAIN ANALYZE. An empty/true constraint takes the no-WHERE scan
+// path and leaves stats zero.
+func (db *DB) QueryRawProjectedRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[collections.RawAd], error) {
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return db.c.ScanRawProjected(projection, true, redact), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryRawProjectedStats(q, projection, true, redact, stats), nil
+}
+
 // QueryRawWire yields each matching ad as a self-contained WIRE-FORM ROW (an
 // inline-names subset ad assembled by slice copies -- see
 // collections.ScanRawWire): the relay form for shipping ads to a remote
