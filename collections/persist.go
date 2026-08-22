@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // errNoMmap is returned when a persistent collection is requested on a platform
@@ -223,10 +224,12 @@ func Open(opts Options) (*Collection, error) {
 	if err := os.MkdirAll(dictsDir, 0o755); err != nil {
 		return nil, err
 	}
+	dictStart := time.Now()
 	latest, err := c.loadDicts(dictsDir)
 	if err != nil {
 		return nil, fmt.Errorf("load dictionaries: %w", err)
 	}
+	c.openIdxDiag.Timing.LoadDicts = time.Since(dictStart)
 	if latest != 0 {
 		if codec, ok := c.dicts.codecFor(latest); ok {
 			c.codec.Store(&codecHolder{codec})
@@ -273,17 +276,25 @@ func Open(opts Options) (*Collection, error) {
 	// Indexes are derived state, not persisted: build them over the recovered
 	// segments so a reopened collection's queries are immediately selective.
 	if c.spec.Load().any() {
+		reindexStart := time.Now()
 		c.Reindex()
+		c.openIdxDiag.Timing.Reindex = time.Since(reindexStart)
 	}
 	// The maintained ordered indexes are likewise derived: rebuild them from the
 	// recovered ads so a reopened collection's Ordered() is immediately correct.
+	orderedStart := time.Now()
 	c.rebuildOrdered()
+	c.openIdxDiag.Timing.RebuildOrdered = time.Since(orderedStart)
 	// If sealed segments recovered persisted columnar blocks, re-enable schema-scan from them
 	// (adopt-from-sidecar) so the accelerator is live immediately -- no re-sample, no rebuild.
+	adoptStart := time.Now()
 	c.adoptPersistedSchemaScan()
+	c.openIdxDiag.Timing.AdoptSchema = time.Since(adoptStart)
 	// Recorded query demand is checkpointed alongside the data, so index decisions do not
 	// restart from zero every time the process does.
+	demandStart := time.Now()
 	c.loadDemand()
+	c.openIdxDiag.Timing.LoadDemand = time.Since(demandStart)
 	// Emit the sidecar-adoption summary gathered during recovery (before the Reindex above
 	// rebuilds whatever was not adopted), so a slow reopen can be traced to its cause.
 	if OpenIndexDiagHook != nil {
@@ -313,6 +324,11 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// Complete any merge a crash interrupted, so the directory below is never a half-merged
 	// mixture of a merged segment and the sources it replaced.
 	finishPendingMerges(shardDir)
+	// Per-shard phase timing, folded into the collection's open diagnostic when the shard finishes,
+	// so a slow reopen names the phase (map segments / rebuild directory / recompute zones / ...).
+	var tm OpenTiming
+	defer func() { c.openIdxDiag.Timing.add(tm) }()
+	mapStart := time.Now()
 	// Each sealed segment's sidecar trailer names the offset of its dictionary record; the
 	// hints are collected while mapping and consumed once every segment is in place.
 	segDictHint := map[*segment]uint32{}
@@ -439,6 +455,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		loaded[i].seg.id = uint32(i)
 		sh.segs = append(sh.segs, loaded[i].seg)
 	}
+	tm.MapSegments = time.Since(mapStart)
 	// Fast reopen: a clean Close leaves a directory snapshot; restore from it instead
 	// of scanning every record (rebuildDir). It is validated against the loaded
 	// segment set and falls back to the full scan on any mismatch. Chained
@@ -447,12 +464,16 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// Time travel also forces the full scan: rebuildDir is what rebuilds the per-shard
 	// time->seq checkpoint index (and the segment scan-pruning counters) from the
 	// segment markers, which the directory snapshot does not carry.
+	dirStart := time.Now()
 	if sh.childParentHash != nil || c.timeTravel() != nil {
 		os.Remove(filepath.Join(shardDir, dirSnapName))
 		c.rebuildDir(sh)
+		tm.DirRebuilt = true
 	} else if !c.tryLoadDirSnapshot(sh, shardDir) {
 		c.rebuildDir(sh) // sets sh.act to the last (active) segment
+		tm.DirRebuilt = true
 	}
+	tm.DirRestore = time.Since(dirStart)
 	// Map each sealed segment's existing sidecar directly (skip the active append target,
 	// which stays in-RAM): the reopen restores the index by mmapping it instead of
 	// re-indexing every record. A missing/invalid/stale sidecar leaves msidx nil so the
@@ -467,26 +488,31 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// ALL segments, including whichever one recovery picked as active. An interned segment is
 	// sealed and cannot take new inline writes, so if recovery made one the active target,
 	// demote it -- the next write then allocates a fresh inline active segment.
+	dictStart := time.Now()
 	for _, seg := range sh.segs {
 		if seg != nil {
 			publishSegDictAt(seg, segDictHint[seg])
 		}
 	}
+	tm.PublishDict = time.Since(dictStart)
 	// Then each columnarized segment's columnar payload, which is DURABLE data rather than a cache:
 	// its records were written without the attributes it holds, so a segment whose payload is not
 	// published reads as an ad missing half its attributes and nothing about the result says so.
 	// Publication must follow the dictionary loop above -- an interned segment's payload is
 	// translated through its dictionary -- and must cover every segment, because a reader cannot ask
 	// whether the format was recognised, only for the ad.
+	colStart := time.Now()
 	for _, seg := range sh.segs {
 		if seg != nil {
 			publishColNative(c, seg)
 		}
 	}
+	tm.PublishColumns = time.Since(colStart)
 	if sh.act != nil && sh.act.dict.Load() != nil {
 		sh.act = nil
 	}
 	spec := c.spec.Load()
+	sidecarStart := time.Now()
 	for _, seg := range sh.segs {
 		if seg != nil && seg != sh.act {
 			// Map the sidecar FIRST: a v3 container carries the segment's zone map, which
@@ -518,9 +544,13 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 				}
 			}
 			// Fall back to rebuilding only when the sidecar carried no zone map (written
-			// before v3, or none configured at the time).
+			// before v3, or none configured at the time). This decodes every record of the
+			// segment, so it is the phase that turns a segment-count reopen into a record-count
+			// one -- timed separately (ZoneRecompute) so the log can pin it.
 			if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {
+				zoneStart := time.Now()
 				seg.zones = computeSegZones(c, seg, seg.used, sh.zoneAttrs, sh.zoneInline)
+				tm.ZoneRecompute += time.Since(zoneStart)
 			}
 			if loaded {
 				// Phase 3: the segment's keys are now reachable through the sealed
@@ -531,6 +561,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			}
 		}
 	}
+	tm.LoadSidecars = time.Since(sidecarStart)
 	return maxNum, nil
 }
 
