@@ -7,6 +7,8 @@ package dbrpc
 import (
 	"encoding/binary"
 	"errors"
+
+	"github.com/PelicanPlatform/classad/collections"
 )
 
 // op is the request opcode (first byte of a request frame's body).
@@ -192,7 +194,38 @@ const (
 	// drops them.
 	// [table][cursor] -> stream of [kind u8][key][wire ad][cursor]; opWatchStop ends it.
 	opWatchWire op = 60
+
+	// opQueryRawProjRefsStats is opQueryRawProjRefs that also streams a scan-stats trailer
+	// (stStreamStats) just before stStreamEnd, for EXPLAIN ANALYZE. Separate opcode rather than a
+	// flag so an older server rejects it cleanly (the client falls back to opQueryRawProjRefs and
+	// simply reports no server-side breakdown). Same request frame as opQueryRawProjRefs.
+	opQueryRawProjRefsStats op = 61
 )
+
+// putScanStats appends a ScanStats trailer: seven counts as int32 (each well under 2^31 for any
+// real scan). readScanStats reverses it.
+func putScanStats(b []byte, s collections.ScanStats) []byte {
+	for _, v := range [...]int{
+		s.SegmentsTotal, s.SegmentsPruned, s.SegmentsScanned,
+		s.RecordsVisited, s.RecordsColumnDecided, s.RecordsReassembled, s.RowsMatched,
+	} {
+		b = putI32(b, int32(v))
+	}
+	return b
+}
+
+// readScanStats decodes a ScanStats trailer written by putScanStats.
+func readScanStats(r *reader) collections.ScanStats {
+	return collections.ScanStats{
+		SegmentsTotal:        int(r.i32()),
+		SegmentsPruned:       int(r.i32()),
+		SegmentsScanned:      int(r.i32()),
+		RecordsVisited:       int(r.i32()),
+		RecordsColumnDecided: int(r.i32()),
+		RecordsReassembled:   int(r.i32()),
+		RowsMatched:          int(r.i32()),
+	}
+}
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
 func (o op) String() string {
@@ -297,13 +330,14 @@ func (o op) String() string {
 
 // status codes returned in a response frame.
 const (
-	stOK        int32 = 0
-	stErr       int32 = -1 // generic error; payload is a UTF-8 message
-	stMissing   int32 = -2 // key/attribute absent
-	stConflict  int32 = -3 // commit had write-write conflicts; payload = conflicted keys
-	stBadReq    int32 = -4 // malformed request
-	stStream    int32 = 1  // one streamed result frame; more may follow
-	stStreamEnd int32 = 2  // end of a stream (no payload)
+	stOK          int32 = 0
+	stErr         int32 = -1 // generic error; payload is a UTF-8 message
+	stMissing     int32 = -2 // key/attribute absent
+	stConflict    int32 = -3 // commit had write-write conflicts; payload = conflicted keys
+	stBadReq      int32 = -4 // malformed request
+	stStream      int32 = 1  // one streamed result frame; more may follow
+	stStreamEnd   int32 = 2  // end of a stream (no payload)
+	stStreamStats int32 = 3  // a scan-stats trailer (ScanStats), sent just before stStreamEnd by a *Stats op
 )
 
 // frameStatus reads the status field of a response frame (bytes 8..12).
