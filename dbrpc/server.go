@@ -426,6 +426,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamQueryRawProjectRefs(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
 	case opQueryRawProjRefsStats:
 		sc.s.streamQueryRawProjectRefsStats(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+	case opTopK:
+		sc.s.streamTopK(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
 	case opQueryRawWire:
 		sc.s.streamQueryRawWire(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
 	case opMatchSorted:
