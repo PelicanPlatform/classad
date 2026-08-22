@@ -68,12 +68,40 @@ func TestColBlockLayoutSharedAcrossBlocks(t *testing.T) {
 	if got.blocks[0].layout != got.blocks[1].layout {
 		t.Error("reopened base blocks do not share one colLayout -- per-block layout has regressed")
 	}
+	// The fixture has numeric fields (zones) and a low-cardinality Owner (strDict), so the slice
+	// checks below are not vacuous.
+	if len(got.blocks[0].zones) == 0 || len(got.blocks[0].strDict) == 0 {
+		t.Fatalf("fixture produced no zones (%d) or strDict (%d); the slice checks would be vacuous",
+			len(got.blocks[0].zones), len(got.blocks[0].strDict))
+	}
 	// Offsets aliased as packed u32: every record must reconstruct identically to the source block.
 	for bi, b := range []*columnarBlock{b1, b2} {
 		gb := got.blocks[bi]
 		if len(gb.strOffB) != (gb.n+1)*4 || len(gb.coldOffB) != (gb.n+1)*4 {
 			t.Fatalf("block %d offset arrays not packed u32: strOffB=%d coldOffB=%d (n=%d)",
 				bi, len(gb.strOffB), len(gb.coldOffB), gb.n)
+		}
+		// zones and strDict are sorted-by-idx slices (not maps): the accessors binary-search, so the
+		// slices must be ordered, and every entry must be findable.
+		for i := 1; i < len(gb.zones); i++ {
+			if gb.zones[i-1].idx >= gb.zones[i].idx {
+				t.Fatalf("block %d zones not sorted by idx: %v", bi, gb.zones)
+			}
+		}
+		for _, e := range gb.zones {
+			if z, ok := gb.zone(e.idx); !ok || z != e.blockZone {
+				t.Errorf("block %d zone(%d) not found or mismatched", bi, e.idx)
+			}
+		}
+		for i := 1; i < len(gb.strDict); i++ {
+			if gb.strDict[i-1].idx >= gb.strDict[i].idx {
+				t.Fatalf("block %d strDict not sorted by idx: %v", bi, gb.strDict)
+			}
+		}
+		for _, e := range gb.strDict {
+			if info, ok := gb.strDictOf(e.idx); !ok || info != e.strDictField {
+				t.Errorf("block %d strDictOf(%d) not found or mismatched", bi, e.idx)
+			}
 		}
 		for k := 0; k < b.n; k++ {
 			a, err := b.reconstruct(k, nil)
