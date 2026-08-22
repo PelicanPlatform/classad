@@ -68,7 +68,7 @@ func dictStats(t *testing.T, c *Collection, attr string) (withDict, blocks int) 
 			}
 			for _, blk := range seg.blocks {
 				blocks++
-				if _, ok := blk.strDict[idx]; ok {
+				if _, ok := blk.strDictOf(idx); ok {
 					withDict++
 				}
 			}
@@ -176,7 +176,7 @@ func BenchmarkStrDict(b *testing.B) {
 				}
 				if idx, ok := seg.schema().byID[id]; ok {
 					for _, blk := range seg.blocks {
-						if _, ok := blk.strDict[idx]; ok {
+						if _, ok := blk.strDictOf(idx); ok {
 							n++
 						}
 					}
