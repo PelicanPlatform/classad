@@ -235,6 +235,17 @@ func (t *ArchiveTable) QueryRawProjected(constraint string, projection []string,
 	return t.a.QueryRawProjected(q, projection, false, redact), nil
 }
 
+// QueryRawProjectedStats is QueryRawProjected that also fills stats (may be nil) with the
+// per-scan work breakdown for EXPLAIN ANALYZE (segments scanned/pruned, records decided from
+// columns vs reassembled, rows matched).
+func (t *ArchiveTable) QueryRawProjectedStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[collections.RawAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return t.a.QueryRawProjectedStats(q, projection, false, redact, stats), nil
+}
+
 // QueryRawProjectedRefs is QueryRawProjected with the projected expressions' attribute
 // references resolved too, so each yielded ad evaluates self-contained. See
 // db.DB.QueryRawProjectedRefs for why that is a separate call rather than the default.

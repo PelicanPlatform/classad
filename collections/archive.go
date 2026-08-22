@@ -326,6 +326,12 @@ func (a *Archive) QueryRawProjected(q *vm.Query, projection []string, chaseRefs,
 	return a.c.QueryRawProjected(q, projection, chaseRefs, redact)
 }
 
+// QueryRawProjectedStats is QueryRawProjected that also fills stats (may be nil) with the
+// per-scan work breakdown for EXPLAIN ANALYZE.
+func (a *Archive) QueryRawProjectedStats(q *vm.Query, projection []string, chaseRefs, redact bool, stats *ScanStats) iter.Seq[RawAd] {
+	return a.c.QueryRawProjectedStats(q, projection, chaseRefs, redact, stats)
+}
+
 func (a *Archive) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classad.Value] {
 	return a.c.QueryProject(q, attrs)
 }

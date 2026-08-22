@@ -45,6 +45,13 @@ func (c *Collection) ScanRawProjected(projection []string, chaseRefs, redact boo
 // QueryRawProjected is QueryRaw with the same in-walk projection as
 // ScanRawProjected (see there for chaseRefs/redact).
 func (c *Collection) QueryRawProjected(q *vm.Query, projection []string, chaseRefs, redact bool) iter.Seq[RawAd] {
+	return c.QueryRawProjectedStats(q, projection, chaseRefs, redact, nil)
+}
+
+// QueryRawProjectedStats is QueryRawProjected that also fills stats (may be nil) with the
+// per-scan work breakdown, for EXPLAIN ANALYZE. Iterate the returned sequence to completion (or
+// stop early) before reading stats; a partial iteration leaves partial counts.
+func (c *Collection) QueryRawProjectedStats(q *vm.Query, projection []string, chaseRefs, redact bool, stats *ScanStats) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
 		p := c.newRawProjector(projection, chaseRefs, redact)
 		emit := c.yieldRawProjected(yield, p)
@@ -57,6 +64,7 @@ func (c *Collection) QueryRawProjected(q *vm.Query, projection []string, chaseRe
 			wireOK:   q.Native() && plan.PartialSafe,
 			ws:       ws,
 			resolver: ws.resolve,
+			stats:    stats,
 		}
 		probes := q.Probes()
 		if c.hasZones.Load() {
