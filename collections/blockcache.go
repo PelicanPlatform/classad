@@ -63,6 +63,25 @@ func newBlockCache(maxBytes int64) (*blockCache, error) {
 	return &blockCache{c: c}, nil
 }
 
+// colCacheBytes is the byte budget of the per-collection shared columnar-block cache. One cache
+// covers every columnarized segment, so this is a whole-collection working set of decompressed
+// blocks, not a per-segment one.
+const colCacheBytes = 256 << 20
+
+// sharedColCache returns the collection's single columnar-block cache, creating it once. A per-
+// segment cache made ristretto's fixed admission metadata scale with segment count (the reopen
+// heap leak); one shared cache keyed by process-unique block ids bounds that overhead to a single
+// cache. A creation failure yields nil, which blockCache's methods treat as "no cache" (decompress
+// every time) -- correct, just slower -- so a columnarized segment never becomes unreadable over it.
+func (c *Collection) sharedColCache() *blockCache {
+	c.colCacheOnce.Do(func() {
+		if bc, err := newBlockCache(colCacheBytes); err == nil {
+			c.colCache = bc
+		}
+	})
+	return c.colCache
+}
+
 // streams returns b's decompressed cold streams, from the cache when present. On a miss it
 // decompresses all three and inserts them (cost = decompressed bytes). Safe for concurrent use;
 // ristretto's Set is asynchronous, so a get-immediately-after-set may miss -- harmless here (an

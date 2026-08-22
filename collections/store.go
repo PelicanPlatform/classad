@@ -369,6 +369,16 @@ type Collection struct {
 	// decompressed-block cache) once EnableSchemaScan is called; nil otherwise. See colscan.go.
 	schemaScan atomic.Pointer[schemaScanState]
 
+	// colCache is the ONE decompressed-columnar-block cache shared by ALL of this collection's
+	// columnarized segments (see sharedColCache). It is deliberately not per-segment: ristretto
+	// sizes its admission metadata (count-min sketch + bloom) to NumCounters regardless of how
+	// much is cached, so a cache per segment made that fixed ~5MB overhead scale with segment
+	// count -- hundreds of segments = gigabytes of live heap that grew as the archive sealed more.
+	// Block ids are process-unique (colBlockSeq), so one cache keyed by (blockID,stream) never
+	// collides across segments. Created lazily on the first columnarized segment.
+	colCache     *blockCache
+	colCacheOnce sync.Once
+
 	// schemaSeed holds a schema recovered from a sidecar whose BLOCK format this build cannot read, so a
 	// format bump keeps the accelerator's schema instead of switching the accelerator off. Only ever read by
 	// adoptPersistedSchemaScan, and only when no block loaded. See readColSectionSchemaOnly.
