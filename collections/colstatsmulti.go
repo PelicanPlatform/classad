@@ -204,10 +204,10 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 					// One fused pass: visibility, value, and the aggregated column's own predicate.
 					for k := 0; k < blk.n; k++ {
 						gk := base + k
-						if gk >= len(cs.offs) {
+						if gk >= cs.offsLen() {
 							break
 						}
-						o := cs.offs[gk]
+						o := cs.offAt(gk)
 						if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 							continue
 						}
@@ -226,9 +226,9 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 				live := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					vis := gk < len(cs.offs)
+					vis := gk < cs.offsLen()
 					if vis {
-						o := cs.offs[gk]
+						o := cs.offAt(gk)
 						vis = recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
 					}
 					keep[k] = vis

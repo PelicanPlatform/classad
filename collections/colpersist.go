@@ -244,10 +244,10 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 	for _, b := range cs.blocks {
 		dst = appendColBlock(dst, b)
 	}
-	dst = appendU32(dst, uint32(len(cs.offs)))
-	for _, o := range cs.offs {
-		dst = appendU32(dst, o)
-	}
+	// offsB is already packed little-endian u32: write the count then the bytes verbatim,
+	// byte-identical to the old element-by-element encoding.
+	dst = appendU32(dst, uint32(len(cs.offsB)/4))
+	dst = append(dst, cs.offsB...)
 	// Group schemas and their selections, after the base blocks so a reader that has already
 	// validated the base segment can reject a bad group section on its own.
 	dst = appendU32(dst, uint32(len(cs.groups)))
@@ -502,14 +502,14 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 		blocks = append(blocks, b)
 		total += b.n
 	}
-	offs := readU32s(c)
+	offsB := c.u32SliceBytes()
 	if c.err != nil {
 		return nil
 	}
 	// The blocks' record counts must sum to the offs length, or a scan would map a record to the
 	// wrong arena offset and read another record's MVCC seq -- a wrong answer rather than a slow
 	// one. Reject instead, and let the segment rebuild.
-	if total != len(offs) {
+	if total != len(offsB)/4 {
 		return nil
 	}
 	if remap != nil {
@@ -518,7 +518,7 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 			b.remap = remap
 		}
 	}
-	cs := &colSegment{blocks: blocks, offs: offs, dictKeyed: remap == nil}
+	cs := &colSegment{blocks: blocks, offsB: offsB, dictKeyed: remap == nil}
 	ng := int(c.u32())
 	if c.err != nil || ng < 0 {
 		return nil
@@ -578,14 +578,12 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	return cs
 }
 
-func readU32s(c *cursor) []uint32 {
-	n := int(c.u32())
-	if n < 0 || !c.need(0) {
-		return nil
+// packU32s encodes a uint32 slice as packed little-endian bytes -- the form colSegment.offsB and a
+// columnar block's offset arrays hold, so a reopen can alias the mmap instead of materializing ints.
+func packU32s(vs []uint32) []byte {
+	b := make([]byte, 0, len(vs)*4)
+	for _, v := range vs {
+		b = binary.LittleEndian.AppendUint32(b, v)
 	}
-	out := make([]uint32, n)
-	for i := range out {
-		out[i] = c.u32()
-	}
-	return out
+	return b
 }

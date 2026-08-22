@@ -144,8 +144,8 @@ func TestRowGroupsBoundedByBytes(t *testing.T) {
 				}
 				total += b.n
 			}
-			if total != len(cs.offs) {
-				t.Errorf("blocks cover %d records but offs has %d", total, len(cs.offs))
+			if total != cs.offsLen() {
+				t.Errorf("blocks cover %d records but offs has %d", total, cs.offsLen())
 			}
 		}
 	}
@@ -198,8 +198,8 @@ func TestRowGroupsBoundedByRows(t *testing.T) {
 				multi++
 			}
 			// Every record in the segment is covered exactly once by the groups.
-			if total != len(cs.offs) {
-				t.Errorf("blocks cover %d records but offs has %d", total, len(cs.offs))
+			if total != cs.offsLen() {
+				t.Errorf("blocks cover %d records but offs has %d", total, cs.offsLen())
 			}
 		}
 	}
@@ -295,8 +295,8 @@ func TestColSegmentPersistMultiGroup(t *testing.T) {
 	if len(got.blocks) != len(cs.blocks) {
 		t.Fatalf("reloaded %d row groups, want %d", len(got.blocks), len(cs.blocks))
 	}
-	if len(got.offs) != len(cs.offs) {
-		t.Fatalf("reloaded %d offs, want %d", len(got.offs), len(cs.offs))
+	if got.offsLen() != cs.offsLen() {
+		t.Fatalf("reloaded %d offs, want %d", got.offsLen(), cs.offsLen())
 	}
 	for i := range cs.blocks {
 		a, b := cs.blocks[i], got.blocks[i]
@@ -367,12 +367,12 @@ func TestColSegmentRejectsGroupOffsMismatch(t *testing.T) {
 		t.Fatal("fixture produced a single row group; the mismatch guard would not be exercised")
 	}
 	// A truthful blob reloads.
-	if unmarshalColSegment(marshalColSegment(&colSegment{blocks: blocks, offs: offs}, store.intern.Name),
+	if unmarshalColSegment(marshalColSegment(&colSegment{blocks: blocks, offsB: packU32s(offs)}, store.intern.Name),
 		identityCodec{}, store.intern.Intern) == nil {
 		t.Fatal("a well-formed multi-group blob failed to reload")
 	}
 	// Drop one record from offs: the counts no longer sum, and the reload must refuse.
-	short := &colSegment{blocks: blocks, offs: offs[:len(offs)-1]}
+	short := &colSegment{blocks: blocks, offsB: packU32s(offs[:len(offs)-1])}
 	if got := unmarshalColSegment(marshalColSegment(short, store.intern.Name),
 		identityCodec{}, store.intern.Intern); got != nil {
 		t.Error("a blob whose block counts do not sum to its offs length was accepted; a scan " +

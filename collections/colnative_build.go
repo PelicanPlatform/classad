@@ -104,7 +104,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		// would remove one record's attributes on the strength of another's membership.
 		return nil, nil, nil
 	}
-	cs := &colSegment{blocks: blocks, offs: offs, dictKeyed: d != nil}
+	cs := &colSegment{blocks: blocks, offsB: packU32s(offs), dictKeyed: d != nil}
 	// Re-key the pinned groups onto this segment's selections: the schema and members are shared, the
 	// per-block bitmaps are not.
 	for gi, g := range groups {
@@ -197,7 +197,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	}
 	// The offsets moved, so the columnar payload must describe the NEW ones or a reader would map
 	// a record to another record's columns.
-	cs.offs = newOffs
+	cs.offsB = packU32s(newOffs)
 	blob = marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
 	if blob == nil || len(blob) == 0 {
 		dst.retire()
