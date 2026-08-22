@@ -84,7 +84,18 @@ func NewZSTDCodec(dict []byte) (Codec, error) {
 	// immediately) while hard-bounding memory at N*window per codec regardless of load or
 	// core count. Decoders are left at the default: DecodeAll parallelism helps the
 	// read/query path and did not show up as resident in the profile.
-	eopts := []zstd.EOption{zstd.WithEncoderConcurrency(encoderConcurrency())}
+	//
+	// WithLowerEncoderMem halves each concurrency slot's resident match-finder history: at the
+	// default 8MB window fastBase.ensureHist allocates window+window (~16MB) per slot with it off,
+	// but window+maxCompressedBlockSize (~8MB) with it on. It changes neither the window nor the
+	// compression ratio (only makes encoding marginally slower), so it is pure savings for a
+	// database that compresses in bursts. A production heap profile showed the encoder history
+	// (ensureHist) holding ~580MB across the codecs warmed during an archive-maintenance pass;
+	// this cuts that in half at no ratio cost, on top of the concurrency cap above.
+	eopts := []zstd.EOption{
+		zstd.WithEncoderConcurrency(encoderConcurrency()),
+		zstd.WithLowerEncoderMem(true),
+	}
 	var dopts []zstd.DOption
 	if len(dict) > 0 {
 		eopts = append(eopts, zstd.WithEncoderDict(dict))
