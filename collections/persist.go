@@ -778,12 +778,10 @@ func (c *Collection) Close() error {
 		}
 		sh.mu.Unlock()
 	}
-	// Release the shared columnar-block cache once (its segments shared it, so it is not closed
-	// per-segment above). Also closes the schema-scan cache if one was built.
+	// Release the shared columnar-block cache once. Every columnarized segment AND the schema scan
+	// share this one cache, so it is closed here rather than per-segment or per-schemaScan (closing
+	// st.cache too would double-close the same ristretto cache).
 	c.colCache.close()
-	if st := c.schemaScan.Load(); st != nil {
-		st.cache.close()
-	}
 	return firstErr
 }
 
