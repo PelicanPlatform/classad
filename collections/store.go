@@ -960,6 +960,9 @@ type queryPlan struct {
 	// segments whose zone map cannot contain a match (append-only zone pruning). Set
 	// only when the collection has zone attributes; nil otherwise (no pruning cost).
 	zoneProbes []vm.Probe
+	// stats, when non-nil, accumulates per-scan work counts for EXPLAIN ANALYZE. nil on the
+	// normal path (no overhead beyond nil checks).
+	stats *ScanStats
 }
 
 // Query returns an iterator over the ads matching q, with the same
@@ -1110,6 +1113,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		if isSystemKeyBytes(r.key()) {
 			return true // internal system record: hidden from client scans/queries
 		}
+		qp.stats.visit()
 		dict := r.dict
 		cn := r.w.seg.colNative.Load()
 		colDecided := false
@@ -1117,6 +1121,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 			if k, ok := cn.byOff[r.off]; ok {
 				matches, decided := pre.test(cn, k)
 				if decided {
+					qp.stats.columnDecided()
 					if !matches {
 						return true // decided from columns alone: never reassembled
 					}
@@ -1131,6 +1136,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		if projCS != nil && cn != nil && (constQuery || colDecided) {
 			if k, ok := cn.byOff[r.off]; ok {
 				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &projScratch); ok {
+					qp.stats.matched() // projected straight from columns; no reassembly
 					if qp.ws != nil {
 						qp.ws.dict = dict
 					}
@@ -1150,7 +1156,8 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		if err != nil {
 			return true // skip a record we cannot decode rather than abort the scan
 		}
-		dbuf = w // retain the (possibly grown) backing for the next ad
+		qp.stats.reassembled() // the record was rebuilt from the arena (~O(ad width))
+		dbuf = w               // retain the (possibly grown) backing for the next ad
 		// Publish the record's segment dict on the wireScope so the match eval resolves an
 		// interned segment's ids (nil for inline; ws is nil on a plain no-query scan). The
 		// emit consumer gets the dict via a separate channel (emit-widening; TODO make-live).
@@ -1160,6 +1167,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		if qp.q != nil && !matchWire(w, qp) {
 			return true
 		}
+		qp.stats.matched()
 		if !emit(w, dict) {
 			cont = false
 			return false
@@ -1181,6 +1189,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 			walk = append(walk, w)
 		}
 	}
+	qp.stats.segments(len(wins), len(wins)-len(walk))
 	if c.reverseScan {
 		forEachVisibleRefReverse(s0, walk, visit)
 	} else {
