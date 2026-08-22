@@ -287,7 +287,11 @@ type Collection struct {
 	shards []*shard
 	mask   uint64
 	h      Hasher
-	codec  atomic.Pointer[codecHolder] // current codec for new writes; swapped by RetrainDict
+	// openIdxDiag accumulates, during Open's loadShard passes, how each sealed segment's
+	// persisted index sidecar was handled (adopted vs. to-be-rebuilt). Emitted once at the end
+	// of Open via OpenIndexDiagHook. Written only on the single-threaded Open path.
+	openIdxDiag OpenIndexDiag
+	codec       atomic.Pointer[codecHolder] // current codec for new writes; swapped by RetrainDict
 	// regionCodecCache holds the dictionary-less codec a columnar block's regions are compressed
 	// with (see regionCodec). Created on first use and never swapped, so a block built at any point
 	// in this collection's life decodes with the same codec.

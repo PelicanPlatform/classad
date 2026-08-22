@@ -284,12 +284,31 @@ func Open(opts Options) (*Collection, error) {
 	// Recorded query demand is checkpointed alongside the data, so index decisions do not
 	// restart from zero every time the process does.
 	c.loadDemand()
+	// Emit the sidecar-adoption summary gathered during recovery (before the Reindex above
+	// rebuilds whatever was not adopted), so a slow reopen can be traced to its cause.
+	if OpenIndexDiagHook != nil {
+		d := c.openIdxDiag
+		d.Dir = c.dir
+		OpenIndexDiagHook(d)
+	}
 	return c, nil
 }
 
 // loadShard mmaps the existing segment files under shardDir (in file-number order,
 // which is commit order), scans each for its written extent, and rebuilds the
 // shard's directory. Returns the highest segment file number seen.
+// sidecarFileExists reports whether a sealed segment has its .idx sidecar file on disk, to
+// distinguish (in OpenIndexDiag) a segment that predates sidecar persistence from one whose
+// present sidecar was rejected.
+func sidecarFileExists(seg *segment) bool {
+	p := snapshotPath(seg)
+	if p == "" {
+		return false
+	}
+	_, err := os.Stat(p)
+	return err == nil
+}
+
 func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// Complete any merge a crash interrupted, so the directory below is never a half-merged
 	// mixture of a merged segment and the sources it replaced.
@@ -474,7 +493,30 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			// loadSealedIndex adopts. Rebuilding one instead means decoding every record --
 			// measured at ~95% of reopen time, i.e. recovery scaling with the size of the
 			// archive rather than its segment count.
+			c.openIdxDiag.SealedSegments++
+			hasSidecar := sidecarFileExists(seg)
+			if hasSidecar {
+				c.openIdxDiag.SidecarFiles++
+			}
 			loaded := c.loadSealedIndex(seg, spec)
+			// Record how this segment's index was handled: an adopted attribute index needs no
+			// rebuild; anything else the post-Open Reindex rebuilds by decoding every record,
+			// which is the slow-startup path this diagnostic exists to explain.
+			if seg.keyIdx.Load() != nil {
+				c.openIdxDiag.KeyIndexAdopted++
+			}
+			if seg.msidx.Load() != nil {
+				c.openIdxDiag.AttrIndexAdopted++
+			} else {
+				switch {
+				case !hasSidecar:
+					c.openIdxDiag.note("no-sidecar-file")
+				case !loaded:
+					c.openIdxDiag.note("sidecar-rejected")
+				default:
+					c.openIdxDiag.note("attr-section-missing-or-stale")
+				}
+			}
 			// Fall back to rebuilding only when the sidecar carried no zone map (written
 			// before v3, or none configured at the time).
 			if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {
