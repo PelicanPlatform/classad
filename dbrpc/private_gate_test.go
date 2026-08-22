@@ -94,6 +94,10 @@ func TestPrivateConstraintRefusedEveryReadOp(t *testing.T) {
 			return err
 		}, true},
 		{"Explain", func(q string) error { _, err := c.Explain(ctx, q); return err }, true},
+		{"TopK", func(q string) error {
+			_, err := c.TopK(ctx, DefaultTable, q, []string{"Cpus"}, "Cpus", true, 5)
+			return err
+		}, true},
 	}
 	for _, op := range ops {
 		for _, cst := range privateConstraints {

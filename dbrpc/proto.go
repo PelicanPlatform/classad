@@ -200,6 +200,16 @@ const (
 	// flag so an older server rejects it cleanly (the client falls back to opQueryRawProjRefs and
 	// simply reports no server-side breakdown). Same request frame as opQueryRawProjRefs.
 	opQueryRawProjRefsStats op = 61
+
+	// opTopK returns the k rows matching constraint ordered by orderAttr -- the largest k when
+	// desc, the smallest k otherwise -- each projected to the requested attributes, rendered to
+	// old-ClassAd text and streamed best-first. It is the wire form of db.DB/ArchiveTable.TopK:
+	// ORDER BY <orderAttr> {DESC|ASC} LIMIT k done server-side, so only k rows cross the wire
+	// instead of the whole match set sorted at the far end. Separate opcode (not a flag on a
+	// projection op) so an older server rejects it as a bad request and the client falls back to
+	// fetch-and-sort.
+	// [table][constraint][orderAttr][desc u8][k i32][nattrs i32]{[attr]} -> stream of [oldClassAdText]
+	opTopK op = 62
 )
 
 // putScanStats appends a ScanStats trailer: seven counts as int32 (each well under 2^31 for any
