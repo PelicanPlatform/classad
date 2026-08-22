@@ -271,7 +271,7 @@ func TestGroupBlocksRoundTripThroughPersistence(t *testing.T) {
 	}
 	blk := encodeColumnarBlock(base, rows, resolveColLayout(base, nil), identityCodec{}, nil)
 	g.blocks = buildGroupBlocks([]*colGroup{g}, []*colLayout{resolveColLayout(g.schema, nil)}, iws, identityCodec{}, nil)
-	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
+	cs := &colSegment{blocks: []*columnarBlock{blk}, offsB: make([]byte, n*4), groups: []*colGroup{g}}
 
 	blob := marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
 	if blob == nil {
@@ -342,7 +342,7 @@ func TestGroupSectionRejectsInconsistentSelection(t *testing.T) {
 	}
 	blk := encodeColumnarBlock(base, rows, resolveColLayout(base, nil), identityCodec{}, nil)
 	g.blocks = buildGroupBlocks([]*colGroup{g}, []*colLayout{resolveColLayout(g.schema, nil)}, iws, identityCodec{}, nil)
-	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n), groups: []*colGroup{g}}
+	cs := &colSegment{blocks: []*columnarBlock{blk}, offsB: make([]byte, n*4), groups: []*colGroup{g}}
 	nameOf := func(id uint32) (string, bool) { return c.intern.Name(id) }
 	internName := func(s string) uint32 { return c.intern.Intern(s) }
 

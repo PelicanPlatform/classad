@@ -427,10 +427,10 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 				nLive := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					if gk >= len(seg.offs) {
+					if gk >= seg.offsLen() {
 						break
 					}
-					o := seg.offs[gk]
+					o := seg.offAt(gk)
 					if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 						live[k/64] |= 1 << uint(k%64)
 						nLive++

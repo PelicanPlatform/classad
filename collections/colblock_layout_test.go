@@ -5,6 +5,33 @@ import (
 	"testing"
 )
 
+// TestColSegOffsAliasAndIndexOf checks the arena-offset map reads back correctly from its packed-u32
+// aliased form, and that indexOf (the binary search replacing the per-segment byOff map) maps an
+// arena offset to its record index -- returning not-found for offsets no record holds.
+func TestColSegOffsAliasAndIndexOf(t *testing.T) {
+	offs := []uint32{5, 12, 30, 31, 100} // strictly ascending, as a real segment's are
+	cs := &colSegment{offsB: packU32s(offs)}
+	if cs.offsLen() != len(offs) {
+		t.Fatalf("offsLen=%d, want %d", cs.offsLen(), len(offs))
+	}
+	for i, o := range offs {
+		if cs.offAt(i) != o {
+			t.Errorf("offAt(%d)=%d, want %d", i, cs.offAt(i), o)
+		}
+	}
+	cn := &colNative{seg: cs}
+	for i, o := range offs {
+		if k, ok := cn.indexOf(o); !ok || k != i {
+			t.Errorf("indexOf(%d)=(%d,%v), want (%d,true)", o, k, ok, i)
+		}
+	}
+	for _, absent := range []uint32{0, 6, 29, 50, 101} { // below, between, and above real offsets
+		if k, ok := cn.indexOf(absent); ok {
+			t.Errorf("indexOf(%d) found index %d, want not-found", absent, k)
+		}
+	}
+}
+
 // TestColBlockLayoutSharedAcrossBlocks is the regression for the per-block metadata heap: every base
 // block of a segment must reference ONE shared *colLayout (not a per-block copy of the hot/cold
 // partition + column offsets), and the per-record offsets must round-trip through the packed-u32
@@ -31,7 +58,7 @@ func TestColBlockLayoutSharedAcrossBlocks(t *testing.T) {
 	for i := range offs {
 		offs[i] = uint32(i * 7)
 	}
-	orig := &colSegment{blocks: []*columnarBlock{b1, b2}, offs: offs}
+	orig := &colSegment{blocks: []*columnarBlock{b1, b2}, offsB: packU32s(offs)}
 
 	got := unmarshalColSegment(marshalColSegment(orig, c.intern.Name), identityCodec{}, c.intern.Intern)
 	if got == nil || len(got.blocks) != 2 {

@@ -114,10 +114,10 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 				nLive := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					if gk >= len(seg.offs) {
+					if gk >= seg.offsLen() {
 						break
 					}
-					o := seg.offs[gk]
+					o := seg.offAt(gk)
 					if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 						live[k/64] |= 1 << uint(k%64)
 						nLive++
@@ -203,10 +203,10 @@ func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, s
 	col numCol, aggCols []numCol, bc *blockCache, acc map[groupKey]*groupAcc) bool {
 	for k := 0; k < blk.n; k++ {
 		gk := base + k
-		if gk >= len(seg.offs) {
+		if gk >= seg.offsLen() {
 			break
 		}
-		o := seg.offs[gk]
+		o := seg.offAt(gk)
 		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 			continue
 		}

@@ -2,11 +2,25 @@ package collections
 
 import (
 	"errors"
+	"sort"
 	"sync"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
+
+// indexOf returns the record index for arena offset off, and whether the segment holds a
+// columnarized record there. The segment's offset map is strictly ascending (records are appended
+// in order), so this is a binary search -- replacing a resident arena-offset -> index map that cost
+// per-segment heap proportional to the record count.
+func (cn *colNative) indexOf(off uint32) (int, bool) {
+	n := cn.seg.offsLen()
+	i := sort.Search(n, func(i int) bool { return cn.seg.offAt(i) >= off })
+	if i < n && cn.seg.offAt(i) == off {
+		return i, true
+	}
+	return 0, false
+}
 
 // COLUMNAR-NATIVE SEALED SEGMENTS.
 //
@@ -43,10 +57,10 @@ import (
 // segment dictionary is.
 type colNative struct {
 	seg *colSegment // schema + blocks + per-record arena offsets
-	// byOff maps an arena record offset to its index among the segment's data records, so a
-	// reader holding an offset (from the key index, say) can find its columns. Built once when
-	// the payload is published; the alternative is a binary search over seg.offs on every read.
-	byOff map[uint32]int
+	// A reader holding an arena record offset finds its record index by BINARY SEARCH over the
+	// segment's ascending offset map (indexOf), not a resident map: an arena-offset -> index map
+	// was ~5 bytes per record of live heap for every columnarized segment (hundreds of MB on a
+	// large archive), for an O(1) lookup that O(log n) over the offsets already in hand replaces.
 	// cache decompresses the columnar regions once per block rather than per record read.
 	cache *blockCache
 	// dict is the segment's attribute dictionary when its records are interned, for translating
@@ -110,10 +124,7 @@ func publishColNative(c *Collection, seg *segment) {
 			// per segment made ristretto's fixed admission metadata scale with segment count (a
 			// multi-GB reopen leak on a large archive). A nil cache (creation failed) is valid --
 			// blockCache methods then decompress every time -- so it never damages the segment.
-			cn := &colNative{seg: cs, byOff: make(map[uint32]int, len(cs.offs)), cache: c.sharedColCache()}
-			for i, ro := range cs.offs {
-				cn.byOff[ro] = i
-			}
+			cn := &colNative{seg: cs, cache: c.sharedColCache()}
 			cn.dict = seg.dict.Load()
 			// The payload's cold tails are keyed by the SEGMENT's dictionary, so readers translate
 			// through that dictionary rather than trusting this process's intern numbering.
@@ -208,7 +219,7 @@ func (c *Collection) recordWireIn(seg *segment, data []byte, off uint32, buf []b
 		}
 		return raw, nil
 	}
-	k, ok := cn.byOff[off]
+	k, ok := cn.indexOf(off)
 	if !ok {
 		return raw, nil // not a columnarized record (a marker, or written after the transform)
 	}
