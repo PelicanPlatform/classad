@@ -132,6 +132,43 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 	c.publishSidecar(seg, path, nil)
 }
 
+// persistSegZonesUpgrade rewrites an already-sealed persistent segment's sidecar to ADD a zone-map
+// section it was written without (a legacy sidecar predating zone persistence), reusing the
+// existing attribute and columnar sections. It exists because sealSegmentIndex is a no-op for a
+// sealed segment (keyIdx set), so such a segment is never revisited: its zone map is absent from
+// disk, recomputed by decoding EVERY record on every open (measured at ~95% of a slow reopen), and
+// the recomputed map -- held only in RAM -- is discarded at close. Called once, at open, right
+// after the fallback computeSegZones fills seg.zones, so the NEXT open adopts the map instead of
+// rebuilding it.
+//
+// The write is atomic (temp + rename to a fresh inode); this process's existing mapping, which
+// lacks the section, stays valid for the current run because seg.zones is already set in RAM. Best
+// effort: any error (or a sidecar that already carries zones) leaves the file untouched and simply
+// recomputes again next time.
+func (c *Collection) persistSegZonesUpgrade(seg *segment) {
+	path := snapshotPath(seg)
+	if path == "" || !seg.persistent || seg.zones == nil {
+		return
+	}
+	data, closer, err := mapFile(path)
+	if err != nil {
+		return
+	}
+	attr, _, col, zone, ok := splitSegmentSidecar(data)
+	if !ok || len(zone) > 0 {
+		_ = closer() // unreadable, or already has a zone section: nothing to upgrade
+		return
+	}
+	// The sections alias the mapping; copy them before unmapping so the rebuilt container is
+	// independent of the file we are about to replace.
+	attrCopy := append([]byte(nil), attr...)
+	colCopy := append([]byte(nil), col...)
+	_ = closer()
+	container := buildSegmentSidecar(attrCopy, buildKeyIndex(seg.data, seg.used, c.h), colCopy,
+		buildZoneBlob(seg.zones), seg.used, seg.dictRecOff())
+	_ = writeFileAtomic(path, container)
+}
+
 // reindexSealed rebuilds a sealed segment's index sidecar in place, under the current
 // index spec, WITHOUT touching the segment's data. This is what separates a re-index from
 // a rewrite: the arena bytes are immutable and already correct, so only the derived index
