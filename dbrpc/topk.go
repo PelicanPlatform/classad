@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 )
 
 // ErrTopKUnsupported is returned by TopK against a server too old to implement the opcode, so the
@@ -23,14 +24,30 @@ var ErrTopKUnsupported = errors.New("dbrpc: server does not support server-side 
 // orderAttr is not among attrs it is used only for the ordering and is not included in the returned
 // rows. Against a server without the opcode it returns ErrTopKUnsupported.
 func (c *Client) TopK(ctx context.Context, table, constraint string, attrs []string, orderAttr string, desc bool, k int) ([]string, error) {
-	rows, err := c.streamCtx(ctx, topKFrame(table, constraint, attrs, orderAttr, desc, k))
+	rows, err := c.streamCtx(ctx, topKFrame(opTopK, table, constraint, attrs, orderAttr, desc, k))
 	return rows, topKErr(err)
 }
 
-// topKFrame builds the opTopK request frame.
-func topKFrame(table, constraint string, attrs []string, orderAttr string, desc bool, k int) func(uint64) []byte {
+// TopKStats is TopK that also fills stats (may be nil) with the cutoff scan's work breakdown, for
+// EXPLAIN ANALYZE. Against a server too old for the opcode it returns ErrTopKUnsupported with stats
+// untouched, so the caller falls back to TopK and reports no breakdown.
+func (c *Client) TopKStats(ctx context.Context, table, constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats) ([]string, error) {
+	var rows []string
+	onStats := func(r *reader) {
+		if stats != nil {
+			*stats = readScanStats(r)
+		}
+	}
+	err := c.streamEachStats(ctx, topKFrame(opTopKStats, table, constraint, attrs, orderAttr, desc, k),
+		func(row string) bool { rows = append(rows, row); return true }, onStats)
+	return rows, topKErr(err)
+}
+
+// topKFrame builds an opTopK / opTopKStats request frame (same shape; the opcode selects the
+// stats trailer).
+func topKFrame(o op, table, constraint string, attrs []string, orderAttr string, desc bool, k int) func(uint64) []byte {
 	return func(id uint64) []byte {
-		b := putStr(putStr(req(id, opTopK), table), constraint)
+		b := putStr(putStr(req(id, o), table), constraint)
 		b = putStr(b, orderAttr)
 		var d byte
 		if desc {
@@ -58,6 +75,16 @@ func topKErr(err error) error {
 // streamTopK serves opTopK: it resolves the table (mutable, view backing, or archive), runs the
 // server-side top-K, and streams the k projected rows as old-ClassAd text, best-first.
 func (s *Server) streamTopK(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamTopKOpt(ctx, reqID, r, includePrivate, write, qlog, false)
+}
+
+// streamTopKStats is streamTopK that also streams the cutoff scan's ScanStats trailer, for EXPLAIN
+// ANALYZE.
+func (s *Server) streamTopKStats(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamTopKOpt(ctx, reqID, r, includePrivate, write, qlog, true)
+}
+
+func (s *Server) streamTopKOpt(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog), wantStats bool) {
 	start := time.Now()
 	table := r.str()
 	constraint := r.str()
@@ -92,13 +119,26 @@ func (s *Server) streamTopK(ctx context.Context, reqID uint64, r *reader, includ
 		}
 	}
 	var rows [][]classad.Value
+	var stats collections.ScanStats
 	var err error
 	if d, ok := s.cat.Table(table); ok {
-		rows, err = d.TopK(constraint, attrs, orderAttr, desc, k)
+		if wantStats {
+			rows, stats, err = d.TopKStats(constraint, attrs, orderAttr, desc, k)
+		} else {
+			rows, err = d.TopK(constraint, attrs, orderAttr, desc, k)
+		}
 	} else if d, ok := s.cat.ViewBacking(table); ok {
-		rows, err = d.TopK(constraint, attrs, orderAttr, desc, k)
+		if wantStats {
+			rows, stats, err = d.TopKStats(constraint, attrs, orderAttr, desc, k)
+		} else {
+			rows, err = d.TopK(constraint, attrs, orderAttr, desc, k)
+		}
 	} else if a, ok := s.cat.ArchiveTable(table); ok {
-		rows, err = a.TopK(constraint, attrs, orderAttr, desc, k)
+		if wantStats {
+			rows, stats, err = a.TopKStats(constraint, attrs, orderAttr, desc, k)
+		} else {
+			rows, err = a.TopK(constraint, attrs, orderAttr, desc, k)
+		}
 	} else {
 		write(respErr(reqID, "no such table: "+table))
 		return
@@ -113,6 +153,9 @@ func (s *Server) streamTopK(ctx context.Context, reqID uint64, r *reader, includ
 		}
 		write(putStr(respHead(reqID, stStream), oldClassAdRow(attrs, row)))
 		n++
+	}
+	if wantStats {
+		write(putScanStats(respHead(reqID, stStreamStats), stats))
 	}
 	write(respHead(reqID, stStreamEnd))
 }

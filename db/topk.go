@@ -3,10 +3,18 @@ package db
 import (
 	"container/heap"
 	"iter"
+	"math"
+	"strconv"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
+
+// topKMaxColumnar caps k for the columnar cutoff pass: beyond this "top k" is close to a full sort
+// and the extra columnar scan would not pay for itself, so the plain row path is used instead.
+const topKMaxColumnar = 1 << 16
 
 // TopK returns the k rows matching constraint ordered by orderAttr -- the largest k when desc,
 // the smallest k otherwise -- each projected to attrs, in sorted order. It is the server-side
@@ -18,8 +26,29 @@ import (
 // value is not numeric has no place in the ordering and is skipped. If orderAttr is not among
 // attrs it is fetched for the comparison and trimmed from the returned rows.
 func (t *ArchiveTable) TopK(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, error) {
+	rows, err := t.topKRun(constraint, attrs, orderAttr, desc, k, nil)
+	return rows, err
+}
+
+// TopKStats is TopK that also returns the cutoff scan's ScanStats, for EXPLAIN ANALYZE.
+func (t *ArchiveTable) TopKStats(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, collections.ScanStats, error) {
+	var stats collections.ScanStats
+	rows, err := t.topKRun(constraint, attrs, orderAttr, desc, k, &stats)
+	return rows, stats, err
+}
+
+// topKRun is the shared two-pass body: a columnar cutoff scan finds the k-th order value (filling
+// stats when non-nil), then the projection runs with `orderAttr {>=|<=} cutoff` appended -- which
+// the columns and zone maps narrow to ~k rows -- instead of projecting every matching row and
+// heaping the lot. Falls back to the plain path (unaugmented) when the columnar cutoff is unavailable.
+func (t *ArchiveTable) topKRun(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats) ([][]classad.Value, error) {
 	proj, orderIdx, added := withOrderAttr(attrs, orderAttr)
-	seq, err := t.QueryProject(constraint, proj)
+	c2, err := topKAugment(constraint, orderAttr, desc, k,
+		func(q *vm.Query) (float64, int, bool) { return t.a.TopKOrderThreshold(q, orderAttr, desc, k, stats) })
+	if err != nil {
+		return nil, err
+	}
+	seq, err := t.QueryProject(c2, proj)
 	if err != nil {
 		return nil, err
 	}
@@ -28,12 +57,67 @@ func (t *ArchiveTable) TopK(constraint string, attrs []string, orderAttr string,
 
 // TopK is ArchiveTable.TopK for a mutable table.
 func (db *DB) TopK(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, error) {
+	rows, err := db.topKRun(constraint, attrs, orderAttr, desc, k, nil)
+	return rows, err
+}
+
+// TopKStats is DB.TopK that also returns the cutoff scan's ScanStats, for EXPLAIN ANALYZE.
+func (db *DB) TopKStats(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, collections.ScanStats, error) {
+	var stats collections.ScanStats
+	rows, err := db.topKRun(constraint, attrs, orderAttr, desc, k, &stats)
+	return rows, stats, err
+}
+
+func (db *DB) topKRun(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats) ([][]classad.Value, error) {
 	proj, orderIdx, added := withOrderAttr(attrs, orderAttr)
-	seq, err := db.QueryProject(constraint, proj)
+	c2, err := topKAugment(constraint, orderAttr, desc, k,
+		func(q *vm.Query) (float64, int, bool) { return db.c.TopKOrderThreshold(q, orderAttr, desc, k, stats) })
+	if err != nil {
+		return nil, err
+	}
+	seq, err := db.QueryProject(c2, proj)
 	if err != nil {
 		return nil, err
 	}
 	return topKResult(seq, orderIdx, desc, k, added), nil
+}
+
+// topKAugment returns the constraint the projection pass should use: the original with
+// `orderAttr {>=|<=} cutoff` appended when a columnar cutoff scan (threshold) yields a usable one
+// (available, and more than k matching rows so the cutoff is the true k-th value). Otherwise it
+// returns the original unchanged -- the plain full-scan path -- so behavior is never worse than
+// before. A blank constraint is treated as `true`.
+func topKAugment(constraint, orderAttr string, desc bool, k int, threshold func(*vm.Query) (float64, int, bool)) (string, error) {
+	base := constraint
+	if strings.TrimSpace(base) == "" {
+		base = "true"
+	}
+	if k <= 0 || k > topKMaxColumnar {
+		return base, nil
+	}
+	q, err := vm.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	cut, seen, ok := threshold(q)
+	if !ok || seen <= k {
+		return base, nil // columnar cutoff unavailable, or <=k rows: nothing to narrow
+	}
+	op := ">="
+	if !desc {
+		op = "<="
+	}
+	return "(" + base + ") && (" + orderAttr + " " + op + " " + fmtNum(cut) + ")", nil
+}
+
+// fmtNum renders a cutoff value as a ClassAd numeric literal: an integer when the value is integral
+// (the common case -- ClusterId, QDate), else a round-tripping real. The literal is compared against
+// the order column, so it must parse back to exactly this value.
+func fmtNum(v float64) string {
+	if v == math.Trunc(v) && v >= -9.007199254740992e15 && v <= 9.007199254740992e15 {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return strconv.FormatFloat(v, 'g', -1, 64)
 }
 
 // withOrderAttr returns the projection to fetch (attrs, plus orderAttr if it was not already
