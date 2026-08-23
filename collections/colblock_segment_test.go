@@ -34,7 +34,7 @@ func segmentWires(t *testing.T, seg *segment) [][]byte {
 // oneBlockColSeg wraps a single block as a segment accelerator, for tests that build a block
 // directly rather than from a segment.
 func oneBlockColSeg(blk *columnarBlock, offs []uint32) *colSegment {
-	return &colSegment{blocks: []*columnarBlock{blk}, offs: offs}
+	return &colSegment{blocks: []*columnarBlock{blk}, offsB: packU32s(offs)}
 }
 
 // TestBuildColumnarFromSegment transcodes a real segment's records into columnar ROW-GROUP blocks

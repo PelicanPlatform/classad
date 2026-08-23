@@ -139,7 +139,7 @@ func TestEscapeClassSurvivesPersistence(t *testing.T) {
 		rows = append(rows, s.encode(wire.Ad(iw)))
 	}
 	blk := encodeColumnarBlock(s, rows, resolveColLayout(s, nil), identityCodec{}, nil)
-	cs := &colSegment{blocks: []*columnarBlock{blk}, offs: make([]uint32, n)}
+	cs := &colSegment{blocks: []*columnarBlock{blk}, offsB: make([]byte, n*4)}
 	blob := marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
 	got := unmarshalColSegment(blob, identityCodec{}, func(name string) uint32 { return c.intern.Intern(name) })
 	if got == nil {

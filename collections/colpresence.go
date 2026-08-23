@@ -148,10 +148,10 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 				if blk.fieldAbsentFromBlock(idx) {
 					for k := 0; k < blk.n; k++ {
 						gk := base + k
-						if gk >= len(cs.offs) {
+						if gk >= cs.offsLen() {
 							break
 						}
-						o := cs.offs[gk]
+						o := cs.offAt(gk)
 						if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 							tally(true)
 						}
@@ -161,10 +161,10 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 				}
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					if gk >= len(cs.offs) {
+					if gk >= cs.offsLen() {
 						break
 					}
-					o := cs.offs[gk]
+					o := cs.offAt(gk)
 					if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 						continue // not visible at this snapshot
 					}

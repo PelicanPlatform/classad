@@ -146,7 +146,7 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 	// block, then each record is a fixed-width code.
 	if entries, ok := b.dictEntries(idx, s.bc, s.dictBufFor(idx)); ok {
 		if codes, w, ok := b.dictCodes(idx, s.bc); ok {
-			info := b.strDict[idx]
+			info, _ := b.strDictOf(idx)
 			// CODES, not strings, when every record has one. Then a comparison against a literal is an
 			// integer range test in the executor and no string is materialized at all. With escapes present
 			// the column is mixed -- an escaped value comes from the cold tail as a real string, and a code
@@ -427,10 +427,10 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 				nLive := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					if gk >= len(seg.offs) {
+					if gk >= seg.offsLen() {
 						break
 					}
-					o := seg.offs[gk]
+					o := seg.offAt(gk)
 					if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 						live[k/64] |= 1 << uint(k%64)
 						nLive++

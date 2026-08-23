@@ -204,10 +204,10 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 			for _, blk := range cs.blocks {
 				blk.scanInt(bidx, bc, func(k int, present bool, v int64) {
 					gk := base + k
-					if gk >= len(cs.offs) {
+					if gk >= cs.offsLen() {
 						return // truncated offs: cannot establish visibility, so do not count it
 					}
-					o := cs.offs[gk]
+					o := cs.offAt(gk)
 					if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 						return // not visible at this snapshot
 					}

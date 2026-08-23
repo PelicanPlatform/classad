@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"math"
+	"sort"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -243,7 +244,10 @@ type columnarBlock struct {
 	// Per-field string dictionaries and their code columns (see strdict.go): a string predicate compares
 	// codes instead of walking the positional string region. Empty when no string field in this block had
 	// values repetitive enough to be worth one.
-	strDict     map[int]strDictField
+	// strDict is a sorted slice keyed by field index (binary search via strDictOf), not a map, for
+	// the same reason as zones: it removed hundreds of MB of per-block Go-map overhead. On-disk form
+	// unchanged (already written idx-sorted).
+	strDict     []strDictEntry
 	strDictComp []byte // the distinct values, fold-sorted, compressed
 	strCodeComp []byte // the code columns, columnar, compressed
 
@@ -254,7 +258,11 @@ type columnarBlock struct {
 	//
 	// Computed while encoding, where the values are already in hand -- a separate pass would cost the
 	// scan it is meant to save.
-	zones map[int]blockZone
+	//
+	// A sorted slice keyed by field index (binary search via zone()), not a map: the map's bucket
+	// overhead was ~2x the entries and, at one map per block over ~100K blocks, hundreds of MB of
+	// live heap. The on-disk form is unchanged -- the entries are just parsed into a slice.
+	zones []blockZoneEntry
 
 	// escClass says, per schema field, whether this block's escapes of it are all MISSING (the
 	// attribute is absent, so the escape bit proves it undefined), all EXCEPTIONAL (present but
@@ -283,6 +291,39 @@ type columnarBlock struct {
 type blockZone struct {
 	zoneRange
 	escaped bool
+}
+
+// blockZoneEntry is one numeric field's zone in a block's zone slice, which is sorted by idx so a
+// lookup binary-searches (see zone) instead of hashing -- the slice replaced a per-block map whose
+// bucket overhead dominated columnar metadata heap.
+type blockZoneEntry struct {
+	idx int
+	blockZone
+}
+
+// zone returns field idx's numeric zone and whether the block carries one.
+func (b *columnarBlock) zone(idx int) (blockZone, bool) {
+	i := sort.Search(len(b.zones), func(i int) bool { return b.zones[i].idx >= idx })
+	if i < len(b.zones) && b.zones[i].idx == idx {
+		return b.zones[i].blockZone, true
+	}
+	return blockZone{}, false
+}
+
+// strDictEntry is one string field's dictionary metadata in a block's strDict slice, sorted by idx
+// (see strDictOf). Replaced a per-block map for the same heap reason as zones.
+type strDictEntry struct {
+	idx int
+	strDictField
+}
+
+// strDictOf returns field idx's string-dictionary metadata and whether the block has one.
+func (b *columnarBlock) strDictOf(idx int) (strDictField, bool) {
+	i := sort.Search(len(b.strDict), func(i int) bool { return b.strDict[i].idx >= idx })
+	if i < len(b.strDict) && b.strDict[i].idx == idx {
+		return b.strDict[i].strDictField, true
+	}
+	return strDictField{}, false
 }
 
 // encodeColumnarBlock builds a columnar block from row-form records (each the output of
@@ -417,7 +458,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, layout *colLayout, regionCo
 	b.zones = numericZones(s, b, recs)
 	b.escClass, b.escExcRecs, b.escAbsent = classifyEscapes(s, recs, coldToField)
 	if dicts != nil {
-		b.strDict = dicts
+		b.strDict = sortStrDict(dicts)
 		b.strDictComp = regionCodec.Compress(nil, dictRaw)
 		b.strCodeComp = regionCodec.Compress(nil, codeRaw)
 	}
@@ -567,11 +608,11 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 // numericZones computes each numeric field's [min,max] over the records being encoded, and whether
 // any record escaped that field. Reads the row-form records directly, since encodeColumnarBlock has
 // them in hand.
-func numericZones(s *adSchema, b *columnarBlock, recs [][]byte) map[int]blockZone {
+func numericZones(s *adSchema, b *columnarBlock, recs [][]byte) []blockZoneEntry {
 	if len(recs) == 0 {
 		return nil
 	}
-	out := make(map[int]blockZone, len(b.hotFields())+len(b.coldFields()))
+	out := make([]blockZoneEntry, 0, len(b.hotFields())+len(b.coldFields()))
 	for _, idx := range append(append([]int(nil), b.hotFields()...), b.coldFields()...) {
 		f := s.fields[idx]
 		z := blockZone{zoneRange: zoneRange{Min: math.Inf(1), Max: math.Inf(-1)}}
@@ -598,15 +639,16 @@ func numericZones(s *adSchema, b *columnarBlock, recs [][]byte) map[int]blockZon
 			// Every record escaped: there is no range, and the block can never be pruned on it.
 			z.Min, z.Max, z.escaped = math.Inf(-1), math.Inf(1), true
 		}
-		out[idx] = z
+		out = append(out, blockZoneEntry{idx: idx, blockZone: z})
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].idx < out[j].idx })
 	return out
 }
 
 // mayMatch reports whether this block could hold a record satisfying every test on field idx. A block
 // with no zone for the field, or an inexact one (some record escaped), is never ruled out.
 func (b *columnarBlock) mayMatch(idx int, tests []zoneTest) bool {
-	z, ok := b.zones[idx]
+	z, ok := b.zone(idx)
 	if !ok || z.escaped {
 		return true
 	}
@@ -626,7 +668,7 @@ func (b *columnarBlock) mayMatch(idx int, tests []zoneTest) bool {
 // plus a bit test from every value read. Only numeric fields carry a zone, which is where the hot
 // scans are.
 func (b *columnarBlock) escapeFree(fieldIdx int) bool {
-	z, ok := b.zones[fieldIdx]
+	z, ok := b.zone(fieldIdx)
 	return ok && !z.escaped
 }
 

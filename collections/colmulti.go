@@ -148,9 +148,9 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 				live := 0
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
-					vis := gk < len(cs.offs)
+					vis := gk < cs.offsLen()
 					if vis {
-						o := cs.offs[gk]
+						o := cs.offAt(gk)
 						vis = recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
 					}
 					keep[k] = vis

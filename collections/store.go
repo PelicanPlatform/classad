@@ -1128,7 +1128,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		cn := r.w.seg.colNative.Load()
 		colDecided := false
 		if pre != nil && cn != nil {
-			if k, ok := cn.byOff[r.off]; ok {
+			if k, ok := cn.indexOf(r.off); ok {
 				matches, decided := pre.test(cn, k)
 				if decided {
 					qp.stats.columnDecided()
@@ -1144,7 +1144,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		// just decided FROM the columns. Anything less certain reassembles, because a narrowed ad
 		// cannot be handed to the matcher -- its seed set is not closed.
 		if projCS != nil && cn != nil && (constQuery || colDecided) {
-			if k, ok := cn.byOff[r.off]; ok {
+			if k, ok := cn.indexOf(r.off); ok {
 				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &projScratch); ok {
 					qp.stats.matched() // projected straight from columns; no reassembly
 					if qp.ws != nil {

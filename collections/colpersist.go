@@ -244,10 +244,10 @@ func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byt
 	for _, b := range cs.blocks {
 		dst = appendColBlock(dst, b)
 	}
-	dst = appendU32(dst, uint32(len(cs.offs)))
-	for _, o := range cs.offs {
-		dst = appendU32(dst, o)
-	}
+	// offsB is already packed little-endian u32: write the count then the bytes verbatim,
+	// byte-identical to the old element-by-element encoding.
+	dst = appendU32(dst, uint32(len(cs.offsB)/4))
+	dst = append(dst, cs.offsB...)
 	// Group schemas and their selections, after the base blocks so a reader that has already
 	// validated the base segment can reject a bad group section on its own.
 	dst = appendU32(dst, uint32(len(cs.groups)))
@@ -292,12 +292,12 @@ func appendColBlock(dst []byte, b *columnarBlock) []byte {
 	dst = appendU32(dst, uint32(len(b.coldOffB)/4))
 	dst = append(dst, b.coldOffB...)
 	dst = appendU32(dst, uint32(len(b.zones)))
-	for idx, z := range b.zones {
-		dst = appendU32(dst, uint32(idx))
-		dst = appendU64(dst, math.Float64bits(z.Min))
-		dst = appendU64(dst, math.Float64bits(z.Max))
+	for _, e := range b.zones { // b.zones is sorted by idx
+		dst = appendU32(dst, uint32(e.idx))
+		dst = appendU64(dst, math.Float64bits(e.Min))
+		dst = appendU64(dst, math.Float64bits(e.Max))
 		esc := uint32(0)
-		if z.escaped {
+		if e.escaped {
 			esc = 1
 		}
 		dst = appendU32(dst, esc)
@@ -325,20 +325,14 @@ func appendColBlock(dst []byte, b *columnarBlock) []byte {
 	dst = appendBytes(dst, b.strDictComp)
 	dst = appendBytes(dst, b.strCodeComp)
 	dst = appendU32(dst, uint32(len(b.strDict)))
-	dictIdxs := make([]int, 0, len(b.strDict))
-	for idx := range b.strDict {
-		dictIdxs = append(dictIdxs, idx)
-	}
-	sort.Ints(dictIdxs)
-	for _, idx := range dictIdxs {
-		info := b.strDict[idx]
-		dst = appendU32(dst, uint32(idx))
-		dst = appendU32(dst, uint32(info.codeStart))
-		dst = appendU32(dst, uint32(info.codeWidth))
-		dst = appendU32(dst, uint32(info.dictStart))
-		dst = appendU32(dst, uint32(info.count))
+	for _, e := range b.strDict { // b.strDict is sorted by idx
+		dst = appendU32(dst, uint32(e.idx))
+		dst = appendU32(dst, uint32(e.codeStart))
+		dst = appendU32(dst, uint32(e.codeWidth))
+		dst = appendU32(dst, uint32(e.dictStart))
+		dst = appendU32(dst, uint32(e.count))
 		ne := uint32(0)
-		if info.noEscape {
+		if e.noEscape {
 			ne = 1
 		}
 		dst = appendU32(dst, ne)
@@ -368,7 +362,7 @@ func readColBlock(c *cursor, s *adSchema, layout *colLayout, codec Codec) *colum
 		if nz > len(s.fields) || !c.need(0) {
 			return nil
 		}
-		b.zones = make(map[int]blockZone, nz)
+		b.zones = make([]blockZoneEntry, 0, nz)
 		for j := 0; j < nz; j++ {
 			idx := int(c.u32())
 			z := blockZone{zoneRange: zoneRange{
@@ -379,8 +373,11 @@ func readColBlock(c *cursor, s *adSchema, layout *colLayout, codec Codec) *colum
 			if idx < 0 || idx >= len(s.fields) {
 				return nil
 			}
-			b.zones[idx] = z
+			b.zones = append(b.zones, blockZoneEntry{idx: idx, blockZone: z})
 		}
+		// zone() binary-searches, so keep the slice ordered even if an older writer stored the
+		// entries in map-iteration order.
+		sort.Slice(b.zones, func(i, j int) bool { return b.zones[i].idx < b.zones[j].idx })
 	}
 	b.escClass = c.bytes()
 	if len(b.escClass) != 0 && len(b.escClass) != len(s.fields) {
@@ -418,7 +415,7 @@ func readColBlock(c *cursor, s *adSchema, layout *colLayout, codec Codec) *colum
 		if nd > len(s.fields) || !c.need(0) {
 			return nil
 		}
-		b.strDict = make(map[int]strDictField, nd)
+		b.strDict = make([]strDictEntry, 0, nd)
 		for j := 0; j < nd; j++ {
 			idx := int(c.u32())
 			info := strDictField{
@@ -431,8 +428,10 @@ func readColBlock(c *cursor, s *adSchema, layout *colLayout, codec Codec) *colum
 			if idx < 0 || idx >= len(s.fields) || (info.codeWidth != 1 && info.codeWidth != 2) {
 				return nil
 			}
-			b.strDict[idx] = info
+			b.strDict = append(b.strDict, strDictEntry{idx: idx, strDictField: info})
 		}
+		// strDictOf binary-searches; the on-disk entries are already idx-sorted, but sort defensively.
+		sort.Slice(b.strDict, func(i, j int) bool { return b.strDict[i].idx < b.strDict[j].idx })
 	}
 	if c.err != nil {
 		return nil
@@ -502,14 +501,14 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 		blocks = append(blocks, b)
 		total += b.n
 	}
-	offs := readU32s(c)
+	offsB := c.u32SliceBytes()
 	if c.err != nil {
 		return nil
 	}
 	// The blocks' record counts must sum to the offs length, or a scan would map a record to the
 	// wrong arena offset and read another record's MVCC seq -- a wrong answer rather than a slow
 	// one. Reject instead, and let the segment rebuild.
-	if total != len(offs) {
+	if total != len(offsB)/4 {
 		return nil
 	}
 	if remap != nil {
@@ -518,7 +517,7 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 			b.remap = remap
 		}
 	}
-	cs := &colSegment{blocks: blocks, offs: offs, dictKeyed: remap == nil}
+	cs := &colSegment{blocks: blocks, offsB: offsB, dictKeyed: remap == nil}
 	ng := int(c.u32())
 	if c.err != nil || ng < 0 {
 		return nil
@@ -578,14 +577,12 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	return cs
 }
 
-func readU32s(c *cursor) []uint32 {
-	n := int(c.u32())
-	if n < 0 || !c.need(0) {
-		return nil
+// packU32s encodes a uint32 slice as packed little-endian bytes -- the form colSegment.offsB and a
+// columnar block's offset arrays hold, so a reopen can alias the mmap instead of materializing ints.
+func packU32s(vs []uint32) []byte {
+	b := make([]byte, 0, len(vs)*4)
+	for _, v := range vs {
+		b = binary.LittleEndian.AppendUint32(b, v)
 	}
-	out := make([]uint32, n)
-	for i := range out {
-		out[i] = c.u32()
-	}
-	return out
+	return b
 }

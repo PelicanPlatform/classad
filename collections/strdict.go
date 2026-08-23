@@ -8,6 +8,21 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 )
 
+// sortStrDict converts the encoder's per-field string-dictionary map into the sorted-by-idx slice a
+// block holds, which strDictOf binary-searches -- the slice replaced a per-block map whose bucket
+// overhead was a large share of columnar metadata heap.
+func sortStrDict(m map[int]strDictField) []strDictEntry {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]strDictEntry, 0, len(m))
+	for idx, f := range m {
+		out = append(out, strDictEntry{idx: idx, strDictField: f})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].idx < out[j].idx })
+	return out
+}
+
 // A per-block, per-field STRING DICTIONARY, so a string predicate compares integers.
 //
 // The string region is POSITIONAL -- uvarint(len)+bytes for each non-escaped string field in schema order
@@ -233,7 +248,7 @@ func bytesToStr(b []byte) string {
 // buf is the caller's scratch, reused across blocks. Allocating it here made a 512-entry dictionary ~12 KB
 // of garbage per block -- across a segment, more garbage than the walk it replaces ever cost.
 func (b *columnarBlock) dictEntries(fieldIdx int, bc *blockCache, buf *[][]byte) ([][]byte, bool) {
-	info, ok := b.strDict[fieldIdx]
+	info, ok := b.strDictOf(fieldIdx)
 	if !ok {
 		return nil, false
 	}
@@ -260,7 +275,7 @@ func (b *columnarBlock) dictEntries(fieldIdx int, bc *blockCache, buf *[][]byte)
 
 // dictCodes returns field fieldIdx's code column, its width, and the decompressed code region.
 func (b *columnarBlock) dictCodes(fieldIdx int, bc *blockCache) ([]byte, int, bool) {
-	info, ok := b.strDict[fieldIdx]
+	info, ok := b.strDictOf(fieldIdx)
 	if !ok {
 		return nil, 0, false
 	}
@@ -301,7 +316,7 @@ func appendNonDictStrings(s *adSchema, r []byte, dicts map[int]strDictField, dst
 
 // dictOwns reports whether the dictionary is authoritative for this field, so a positional walk must skip it.
 func (b *columnarBlock) dictOwns(fieldIdx int) bool {
-	_, ok := b.strDict[fieldIdx]
+	_, ok := b.strDictOf(fieldIdx)
 	return ok
 }
 
@@ -347,7 +362,7 @@ func (b *columnarBlock) dictRange(fieldIdx int, lit string, bc *blockCache, buf 
 // the cold tail where the dictionary cannot see it, so a partial dictionary must not prune.
 func (b *columnarBlock) dictPrunes(probes []strProbe, bc *blockCache, buf *[][]byte) bool {
 	for _, p := range probes {
-		info, ok := b.strDict[p.fieldIdx]
+		info, ok := b.strDictOf(p.fieldIdx)
 		if !ok || !info.noEscape {
 			continue
 		}
