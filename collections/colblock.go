@@ -221,18 +221,24 @@ type columnarBlock struct {
 	// a scalar read -- a constant stride is what a prefetcher is for, and the dominant traffic is the
 	// widening store into the caller's int64 buffer either way, both measured at 1.00x -- but a SIMD load
 	// cannot address a stride AT ALL. This is a capability change, not a speed one on its own.
-	bits        []byte // escape bitmap + bool bitset, bitsStride bytes per record
-	bitsStride  int
-	hotNum      []int       // hot int/real field indices (into schema.fields), layout order
-	hotCol      []byte      // hot int/real fields, COLUMNAR: field i's values contiguous
-	hotColStart map[int]int // field idx -> start offset in hotCol
+	bits       []byte // escape bitmap + bool bitset, bitsStride bytes per record
+	bitsStride int
+	// layout is the hot/cold field partition and per-field column offsets, DERIVED from (schema, hot
+	// set) and SHARED by every block built under them (all base blocks of a segment; each group's
+	// blocks). It replaces per-block hotNum/coldNum/hotColStart/coldFieldStart -- ~100K blocks each
+	// carried those maps, gigabytes of live heap for state that is one value per (schema, hot set).
+	layout *colLayout
+	hotCol []byte // hot int/real fields, COLUMNAR: field i's values contiguous
 
-	coldNum        []int       // cold int/real field indices, layout order
-	coldFieldStart map[int]int // field idx -> start offset in the decompressed cold-numeric buffer
-	coldNumComp    []byte      // cold numeric fields, columnar, Codec-compressed
+	coldNumComp []byte // cold numeric fields, columnar, Codec-compressed
 
 	strComp, coldComp []byte // per-record string regions / cold tails, concatenated + compressed
-	strOff, coldOff   []int  // per-record cumulative offsets into the decompressed streams
+	// strOffB/coldOffB are the per-record cumulative offsets (n+1 entries) into the decompressed
+	// streams, packed as little-endian uint32 -- the exact on-disk form. A reopened block ALIASES the
+	// mmap here (zero heap); a freshly built one holds a compact heap buffer. Read via strOffAt/
+	// coldOffAt. They were []int (8 bytes/entry, materialized on read); the packed bytes halve that
+	// and let the reopen alias instead of copy.
+	strOffB, coldOffB []byte
 
 	// Per-field string dictionaries and their code columns (see strdict.go): a string predicate compares
 	// codes instead of walking the positional string region. Empty when no string field in this block had
@@ -283,48 +289,92 @@ type blockZone struct {
 // adSchema.encode). hotNumFields lists the schema field indices (int/real) to keep uncompressed
 // -- the popular ones, by query demand. Bools and the escape bitmap are always in the hot
 // region (tiny, and bools may be scanned).
-// layoutColumnar fills b's hot/cold field partition and their offsets from the schema and hot
-// set: hot numerics columnar and uncompressed, cold numerics
-// columnar (each field's n values contiguous). Deterministic in (schema, hotSet, n), so the
-// persisted-block decoder reproduces the exact layout.
-func layoutColumnar(b *columnarBlock, s *adSchema, hotNumFields []int, n int) {
+// colLayout is the columnar field layout derived from a (schema, hot-field set): which numeric
+// fields are hot vs cold, in layout order, and each one's per-record column WIDTH-prefix. It holds
+// no per-record or per-block state, so it is computed once and SHARED by every block built under the
+// same schema and hot set -- all base blocks of a segment, and (separately) each group's blocks.
+// Deterministic in (schema, hotSet), so the persisted-block decoder reproduces the exact layout.
+type colLayout struct {
+	hotFields  []int   // hot int/real field indices (into schema.fields), layout order
+	coldFields []int   // cold int/real field indices, layout order
+	hotStartW  []int32 // per field idx: width-prefix into hotCol (multiply by the block's n), or -1 if not hot
+	coldStartW []int32 // per field idx: width-prefix into the cold-numeric buffer, or -1 if not cold
+	bitsStride int     // escBytes + boolBytes: the per-record row-major bits stride
+}
+
+// resolveColLayout computes the shared layout for a schema and hot-field set. The prefixes are sums
+// of field WIDTHS (not multiplied by record count); a block scales by its own n via the accessors.
+func resolveColLayout(s *adSchema, hotNumFields []int) *colLayout {
 	hotSet := make(map[int]bool, len(hotNumFields))
 	for _, i := range hotNumFields {
 		hotSet[i] = true
 	}
-	b.hotNum, b.coldNum = b.hotNum[:0], b.coldNum[:0]
-	b.hotColStart, b.coldFieldStart = map[int]int{}, map[int]int{}
+	l := &colLayout{
+		hotStartW:  make([]int32, len(s.fields)),
+		coldStartW: make([]int32, len(s.fields)),
+		bitsStride: s.escBytes + s.boolBytes,
+	}
 	for i := range s.fields {
+		l.hotStartW[i], l.coldStartW[i] = -1, -1
 		if k := s.fields[i].kind; k == akInt || k == akReal {
 			if hotSet[i] {
-				b.hotNum = append(b.hotNum, i)
+				l.hotFields = append(l.hotFields, i)
 			} else {
-				b.coldNum = append(b.coldNum, i)
+				l.coldFields = append(l.coldFields, i)
 			}
 		}
 	}
-	b.bitsStride = s.escBytes + s.boolBytes
-	hp := 0
-	for _, i := range b.hotNum {
-		b.hotColStart[i] = hp
-		hp += s.fields[i].width * n
+	var hp int32
+	for _, i := range l.hotFields {
+		l.hotStartW[i] = hp
+		hp += int32(s.fields[i].width)
 	}
-	cp := 0
-	for _, i := range b.coldNum {
-		b.coldFieldStart[i] = cp
-		cp += s.fields[i].width * n
+	var cp int32
+	for _, i := range l.coldFields {
+		l.coldStartW[i] = cp
+		cp += int32(s.fields[i].width)
 	}
+	return l
 }
 
-func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionCodec Codec, coldToField map[uint32]int) *columnarBlock {
-	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: regionCodec, n: len(recs)}
-	layoutColumnar(b, s, hotNumFields, len(recs))
+// hotFields / coldFields are the block's hot/cold numeric field indices (from its shared layout).
+func (b *columnarBlock) hotFields() []int  { return b.layout.hotFields }
+func (b *columnarBlock) coldFields() []int { return b.layout.coldFields }
+
+// hotColStart returns field i's start offset in hotCol and whether i is a hot numeric field. The
+// offset is the shared width-prefix scaled by this block's record count.
+func (b *columnarBlock) hotColStart(i int) (int, bool) {
+	if w := b.layout.hotStartW[i]; w >= 0 {
+		return int(w) * b.n, true
+	}
+	return 0, false
+}
+
+// coldFieldStart returns field i's start offset in the decompressed cold-numeric buffer and whether
+// i is a cold numeric field.
+func (b *columnarBlock) coldFieldStart(i int) (int, bool) {
+	if w := b.layout.coldStartW[i]; w >= 0 {
+		return int(w) * b.n, true
+	}
+	return 0, false
+}
+
+// strOffAt / coldOffAt read record k's cumulative offset from the packed little-endian u32 arrays
+// (which alias the mmap on a reopened block).
+func (b *columnarBlock) strOffAt(k int) int { return int(binary.LittleEndian.Uint32(b.strOffB[k*4:])) }
+func (b *columnarBlock) coldOffAt(k int) int {
+	return int(binary.LittleEndian.Uint32(b.coldOffB[k*4:]))
+}
+
+func encodeColumnarBlock(s *adSchema, recs [][]byte, layout *colLayout, regionCodec Codec, coldToField map[uint32]int) *columnarBlock {
+	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: regionCodec, n: len(recs), layout: layout}
+	b.bitsStride = layout.bitsStride
 	cp := 0
-	for _, i := range b.coldNum {
+	for _, i := range b.coldFields() {
 		cp += s.fields[i].width * len(recs)
 	}
 	hp := 0
-	for _, i := range b.hotNum {
+	for _, i := range b.hotFields() {
 		hp += s.fields[i].width * len(recs)
 	}
 	b.bits = make([]byte, 0, b.bitsStride*len(recs))
@@ -335,17 +385,19 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 	dicts, dictRaw, codeRaw := buildStrDicts(s, recs, len(recs))
 	var strCat, coldCat []byte
 	coldIDs := map[uint32]struct{}{}
-	b.strOff = []int{0}
-	b.coldOff = []int{0}
+	b.strOffB = binary.LittleEndian.AppendUint32(b.strOffB[:0], 0)
+	b.coldOffB = binary.LittleEndian.AppendUint32(b.coldOffB[:0], 0)
 	for k, r := range recs {
 		b.bits = append(b.bits, r[:s.escBytes+s.boolBytes]...) // escape bitmap then bool bitset
-		for _, i := range b.hotNum {
+		for _, i := range b.hotFields() {
 			off := s.escBytes + s.fields[i].off
-			copy(b.hotCol[b.hotColStart[i]+k*s.fields[i].width:], r[off:off+s.fields[i].width])
+			start, _ := b.hotColStart(i)
+			copy(b.hotCol[start+k*s.fields[i].width:], r[off:off+s.fields[i].width])
 		}
-		for _, i := range b.coldNum {
+		for _, i := range b.coldFields() {
 			off := s.escBytes + s.fields[i].off
-			copy(coldRaw[b.coldFieldStart[i]+k*s.fields[i].width:], r[off:off+s.fields[i].width])
+			start, _ := b.coldFieldStart(i)
+			copy(coldRaw[start+k*s.fields[i].width:], r[off:off+s.fields[i].width])
 		}
 		_, str, cold := s.splitRecord(r)
 		if len(dicts) == 0 {
@@ -358,8 +410,8 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, hotNumFields []int, regionC
 		}
 		coldCat = append(coldCat, cold...)
 		collectColdIDs(cold, coldIDs)
-		b.strOff = append(b.strOff, len(strCat))
-		b.coldOff = append(b.coldOff, len(coldCat))
+		b.strOffB = binary.LittleEndian.AppendUint32(b.strOffB, uint32(len(strCat)))
+		b.coldOffB = binary.LittleEndian.AppendUint32(b.coldOffB, uint32(len(coldCat)))
 	}
 	b.coldIDs = coldIDs
 	b.zones = numericZones(s, b, recs)
@@ -422,6 +474,13 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 			}
 		}
 	}
+	// One layout for every base block of this segment (they all share s and hot), and one per group
+	// schema shared by all of that group's blocks -- computed once here rather than per block.
+	baseLayout := resolveColLayout(s, hot)
+	groupLayouts := make([]*colLayout, len(groups))
+	for gi, g := range groups {
+		groupLayouts[gi] = resolveColLayout(g.schema, nil)
+	}
 	var blocks []*columnarBlock
 	var groupBlocks [][]*colGroupBlock
 	var recs [][]byte
@@ -461,13 +520,13 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 					}
 					if g.full(len(recs), groupBytes) {
 						seal, sealBytes := g.sealAt(len(recs), groupBytes, alignedRows, alignedBytes)
-						nb := encodeColumnarBlock(s, recs[:seal], hot, regionCodec, coldToField)
+						nb := encodeColumnarBlock(s, recs[:seal], baseLayout, regionCodec, coldToField)
 						nb.remap = rm
 						blocks = append(blocks, nb)
 						if len(groups) > 0 {
 							// Slice the retained wire at the SAME point, so a group's membership
 							// bitmap is indexed by the base block's own record numbering.
-							groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws[:seal], regionCodec, toLocal))
+							groupBlocks = append(groupBlocks, buildGroupBlocks(groups, groupLayouts, iws[:seal], regionCodec, toLocal))
 							setGroupRemap(groupBlocks[len(groupBlocks)-1], rm)
 							m := copy(iws, iws[seal:])
 							iws = iws[:m]
@@ -488,11 +547,11 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 		off += int(total)
 	}
 	if len(recs) > 0 {
-		fb := encodeColumnarBlock(s, recs, hot, regionCodec, coldToField) // short final group
+		fb := encodeColumnarBlock(s, recs, baseLayout, regionCodec, coldToField) // short final group
 		fb.remap = rm
 		blocks = append(blocks, fb)
 		if len(groups) > 0 {
-			groupBlocks = append(groupBlocks, buildGroupBlocks(groups, iws, regionCodec, toLocal))
+			groupBlocks = append(groupBlocks, buildGroupBlocks(groups, groupLayouts, iws, regionCodec, toLocal))
 			setGroupRemap(groupBlocks[len(groupBlocks)-1], rm)
 		}
 	}
@@ -500,7 +559,7 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 		// A segment with no encodable records still gets one empty block, so a colSegment always
 		// carries the schema it was built under (which persistence and the scan's field resolution
 		// both read from the first block).
-		blocks = append(blocks, encodeColumnarBlock(s, nil, hot, regionCodec, coldToField))
+		blocks = append(blocks, encodeColumnarBlock(s, nil, baseLayout, regionCodec, coldToField))
 	}
 	return blocks, groupBlocks, offs
 }
@@ -512,8 +571,8 @@ func numericZones(s *adSchema, b *columnarBlock, recs [][]byte) map[int]blockZon
 	if len(recs) == 0 {
 		return nil
 	}
-	out := make(map[int]blockZone, len(b.hotNum)+len(b.coldNum))
-	for _, idx := range append(append([]int(nil), b.hotNum...), b.coldNum...) {
+	out := make(map[int]blockZone, len(b.hotFields())+len(b.coldFields()))
+	for _, idx := range append(append([]int(nil), b.hotFields()...), b.coldFields()...) {
 		f := s.fields[idx]
 		z := blockZone{zoneRange: zoneRange{Min: math.Inf(1), Max: math.Inf(-1)}}
 		n := 0
@@ -592,12 +651,12 @@ func (b *columnarBlock) loadIntBatch(fieldIdx int, bc *blockCache, dst []int64) 
 	if !numericKind(f.kind) {
 		return false
 	}
-	if start, hot := b.hotColStart[fieldIdx]; hot {
+	if start, hot := b.hotColStart(fieldIdx); hot {
 		// Contiguous, so the stride is the field width -- the same call the cold path makes.
 		loadIntsTyped(dst, b.hotCol[start:], f.width, 0, f.width, f.unsigned, b.n)
 		return true
 	}
-	start, ok := b.coldFieldStart[fieldIdx]
+	start, ok := b.coldFieldStart(fieldIdx)
 	if !ok {
 		return false
 	}
@@ -663,13 +722,13 @@ func (b *columnarBlock) rawColumn(fieldIdx int, bc *blockCache) ([]byte, bool) {
 		return nil, false
 	}
 	need := b.n * f.width
-	if start, hot := b.hotColStart[fieldIdx]; hot {
+	if start, hot := b.hotColStart(fieldIdx); hot {
 		if start+need > len(b.hotCol) {
 			return nil, false
 		}
 		return b.hotCol[start : start+need], true
 	}
-	start, ok := b.coldFieldStart[fieldIdx]
+	start, ok := b.coldFieldStart(fieldIdx)
 	if !ok {
 		return nil, false
 	}
@@ -686,7 +745,7 @@ func (b *columnarBlock) rawColumn(fieldIdx int, bc *blockCache) ([]byte, bool) {
 // record (its value is in the cold tail).
 func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, present bool, v int64)) error {
 	f := b.schema.fields[fieldIdx]
-	if start, hot := b.hotColStart[fieldIdx]; hot {
+	if start, hot := b.hotColStart(fieldIdx); hot {
 		for k := 0; k < b.n; k++ {
 			if testBit(b.escapeAt(k), fieldIdx) {
 				fn(k, false, 0)
@@ -696,7 +755,7 @@ func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, p
 		}
 		return nil
 	}
-	start, ok := b.coldFieldStart[fieldIdx]
+	start, ok := b.coldFieldStart(fieldIdx)
 	if !ok {
 		return errNotNumericField
 	}
@@ -719,7 +778,7 @@ func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, p
 func (b *columnarBlock) appendStrings(rec []byte, k int, strRaw []byte, bc *blockCache) ([]byte, error) {
 	s := b.schema
 	esc := b.escapeAt(k)
-	pos := strRaw[b.strOff[k]:b.strOff[k+1]]
+	pos := strRaw[b.strOffAt(k):b.strOffAt(k+1)]
 	for i := range s.fields {
 		if s.fields[i].kind != akString || testBit(esc, i) {
 			continue
@@ -780,7 +839,7 @@ func (b *columnarBlock) reconstructInto(dst []byte, k int, bc *blockCache) ([]by
 		return nil, err
 	}
 	coldRaw, strRaw, tailRaw := ds.coldNum, ds.str, ds.cold
-	need := s.escBytes + s.fixedLen + (b.strOff[k+1] - b.strOff[k]) + (b.coldOff[k+1] - b.coldOff[k])
+	need := s.escBytes + s.fixedLen + (b.strOffAt(k+1) - b.strOffAt(k)) + (b.coldOffAt(k+1) - b.coldOffAt(k))
 	if cap(dst) < need {
 		dst = make([]byte, 0, need)
 	}
@@ -790,26 +849,28 @@ func (b *columnarBlock) reconstructInto(dst []byte, k int, bc *blockCache) ([]by
 	copy(rec[:s.escBytes+s.boolBytes], b.bits[base:base+s.escBytes+s.boolBytes]) // escape then bools
 	// The cost of a columnar hot region: one gather per field rather than one span. Identical in shape to
 	// the cold loop below, which has always done this.
-	for _, i := range b.hotNum {
+	for _, i := range b.hotFields() {
 		w := s.fields[i].width
-		st := b.hotColStart[i] + k*w
+		cs, _ := b.hotColStart(i)
+		st := cs + k*w
 		copy(rec[s.escBytes+s.fields[i].off:], b.hotCol[st:st+w])
 	}
-	for _, i := range b.coldNum {
+	for _, i := range b.coldFields() {
 		w := s.fields[i].width
-		copy(rec[s.escBytes+s.fields[i].off:], coldRaw[b.coldFieldStart[i]+k*w:b.coldFieldStart[i]+k*w+w])
+		cs, _ := b.coldFieldStart(i)
+		copy(rec[s.escBytes+s.fields[i].off:], coldRaw[cs+k*w:cs+k*w+w])
 	}
 	// The positional region omits whatever a dictionary owns, so rebuilding the canonical record form means
 	// walking the schema's string fields in order and taking each from whichever side holds it.
 	if len(b.strDict) == 0 {
-		rec = append(rec, strRaw[b.strOff[k]:b.strOff[k+1]]...)
+		rec = append(rec, strRaw[b.strOffAt(k):b.strOffAt(k+1)]...)
 	} else {
 		var err error
 		if rec, err = b.appendStrings(rec, k, strRaw, bc); err != nil {
 			return nil, err
 		}
 	}
-	rec = append(rec, tailRaw[b.coldOff[k]:b.coldOff[k+1]]...)
+	rec = append(rec, tailRaw[b.coldOffAt(k):b.coldOffAt(k+1)]...)
 	return rec, nil
 }
 
@@ -827,7 +888,7 @@ func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (
 	if err != nil {
 		return 0, false, err
 	}
-	cold := tail[b.coldOff[k]:b.coldOff[k+1]]
+	cold := tail[b.coldOffAt(k):b.coldOffAt(k+1)]
 	for len(cold) > 0 {
 		id, m := binary.Uvarint(cold)
 		if m <= 0 {
@@ -860,7 +921,7 @@ func (b *columnarBlock) escapedNode(k int, fieldID uint32, bc *blockCache) (node
 	if err != nil {
 		return nil, false, err
 	}
-	cold := tail[b.coldOff[k]:b.coldOff[k+1]]
+	cold := tail[b.coldOffAt(k):b.coldOffAt(k+1)]
 	for len(cold) > 0 {
 		id, m := binary.Uvarint(cold)
 		if m <= 0 {
@@ -888,7 +949,7 @@ func (b *columnarBlock) escapedNumVal(k int, fieldID uint32, bc *blockCache) (co
 	if err != nil {
 		return colVal{}, false
 	}
-	cold := tail[b.coldOff[k]:b.coldOff[k+1]]
+	cold := tail[b.coldOffAt(k):b.coldOffAt(k+1)]
 	for len(cold) > 0 {
 		id, m := binary.Uvarint(cold)
 		if m <= 0 {

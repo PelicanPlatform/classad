@@ -52,7 +52,7 @@ func (cs *colSegment) hotNum() []int {
 	if cs == nil || len(cs.blocks) == 0 {
 		return nil
 	}
-	return cs.blocks[0].hotNum
+	return cs.blocks[0].hotFields()
 }
 
 // schemaScanState is a collection's resolved adschema columnar scan configuration.

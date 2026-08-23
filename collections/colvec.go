@@ -190,7 +190,7 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 			dst.St[k] = vm.VsUndef // repaired from the cold tail below
 			continue
 		}
-		rec := region[b.strOff[k]:b.strOff[k+1]]
+		rec := region[b.strOffAt(k):b.strOffAt(k+1)]
 		found := false
 		for i := range b.schema.fields {
 			// A field the dictionary owns is NOT in this region, so walking past it would misalign every

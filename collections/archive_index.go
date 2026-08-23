@@ -491,6 +491,20 @@ func (c *cursor) bytes() []byte {
 	return p
 }
 
+// u32SliceBytes reads a u32 COUNT then aliases the following count*4 bytes -- a packed
+// little-endian uint32 array read in place (no per-element copy). The returned slice aliases c.b,
+// so it is valid only while c.b is (the mmap, for a reopened segment). Mirrors bytes()'s error
+// handling: a short read sets c.err and returns nil.
+func (c *cursor) u32SliceBytes() []byte {
+	n := int(c.u32())
+	if n < 0 || !c.need(n*4) {
+		return nil
+	}
+	p := c.b[c.i : c.i+n*4]
+	c.i += n * 4
+	return p
+}
+
 func (c *cursor) bitmap() (*roaring.Bitmap, error) {
 	p := c.bytes()
 	if c.err != nil {
