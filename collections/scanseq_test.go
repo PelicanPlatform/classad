@@ -30,6 +30,11 @@ func rawIDOf(t *testing.T, raw RawAd) int {
 // pageAll walks every page of a sequence cursor and returns the ids in the order
 // they were yielded, plus how many pages it took.
 func pageAll(t *testing.T, c *Collection, q *vm.Query, limit int, mutate func(page int)) ([]int, int) {
+	return pageAllProjected(t, c, q, nil, limit, mutate)
+}
+
+// pageAllProjected is pageAll with a projection applied to every page.
+func pageAllProjected(t *testing.T, c *Collection, q *vm.Query, projection []string, limit int, mutate func(page int)) ([]int, int) {
 	t.Helper()
 	var (
 		ids    []int
@@ -37,7 +42,7 @@ func pageAll(t *testing.T, c *Collection, q *vm.Query, limit int, mutate func(pa
 		pages  int
 	)
 	for {
-		seq, page := c.QueryRawFromSeq(q, cursor, limit)
+		seq, page := c.QueryRawFromSeq(q, projection, cursor, limit)
 		for raw := range seq {
 			ids = append(ids, rawIDOf(t, raw))
 		}
@@ -379,4 +384,115 @@ func segMaxSeqsForTest(c *Collection) []uint64 {
 		sh.mu.RUnlock()
 	}
 	return out
+}
+
+// TestSeqCursorProjects checks the projection is applied in the walk, like
+// QueryRawProjected: a caller asking for two attributes gets two, not a whole
+// ad it then has to trim.
+func TestSeqCursorProjects(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 2, SegmentSize: 4096})
+	const n = 120
+	for i := 0; i < n; i++ {
+		src := fmt.Sprintf(`[Id=%d; Owner="alice"; Cmd="/bin/true"; Args="-x"]`, i)
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, src)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	seq, page := c.QueryRawFromSeq(nil, []string{"Id", "Owner"}, SeqCursor{}, 10)
+	rows := 0
+	for raw := range seq {
+		rows++
+		names := map[string]bool{}
+		for _, e := range raw.Exprs {
+			name, _, _ := strings.Cut(string(e), " = ")
+			names[name] = true
+		}
+		if !names["Id"] || !names["Owner"] {
+			t.Fatalf("projection dropped a requested attribute: %v", raw.Exprs)
+		}
+		if names["Cmd"] || names["Args"] {
+			t.Fatalf("projection kept an attribute that was not asked for: %v", raw.Exprs)
+		}
+	}
+	if rows != 10 {
+		t.Fatalf("got %d rows, want the page limit of 10", rows)
+	}
+	if !page.More {
+		t.Error("expected more pages after the first 10 of 120")
+	}
+
+	// And the projected walk still paginates over everything.
+	ids, _ := pageAllProjected(t, c, nil, []string{"Id"}, 16, nil)
+	if len(ids) != n {
+		t.Fatalf("projected pagination covered %d records, want %d", len(ids), n)
+	}
+}
+
+// TestSeqCursorEqualSequences is the case the single-writer tests miss.
+// Records committed TOGETHER share a sequence, and the arena holds them in
+// insertion order, not key order — so within one commit a record belonging
+// after the cursor can sit physically before one belonging before it. A merge
+// that assumed each segment was sorted by (seq, key) skipped records at every
+// page boundary landing inside a commit.
+//
+// A transaction gives that shape deterministically. Concurrent Puts also
+// coalesce into shared commits, but only when they happen to queue up together,
+// which under load they stop doing — a test built on that passes or fails with
+// the machine's scheduling rather than with the code.
+func TestSeqCursorEqualSequences(t *testing.T) {
+	t.Parallel()
+	c := New(Options{Shards: 4, SegmentSize: 4096})
+	const n = 200
+
+	tx := c.Begin()
+	for i := 0; i < n; i++ {
+		tx.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i)))
+	}
+	if res := tx.Commit(); res.Conflicted() || res.Committed != n {
+		t.Fatalf("commit wrote %d of %d records (conflicts: %d)", res.Committed, n, len(res.Conflicts))
+	}
+	if !hasSharedSequenceForTest(c) {
+		t.Fatal("no two records share a sequence, so this test would not exercise the group path")
+	}
+
+	ids, _ := pageAll(t, c, nil, 15, nil)
+	if len(ids) != n {
+		t.Fatalf("paged %d records, want %d", len(ids), n)
+	}
+	seen := make([]int, n)
+	for _, id := range ids {
+		if id < 0 || id >= n {
+			t.Fatalf("id %d out of range", id)
+		}
+		seen[id]++
+	}
+	for id, count := range seen {
+		if count != 1 {
+			t.Errorf("id %d seen %d times, want 1", id, count)
+		}
+	}
+}
+
+// hasSharedSequenceForTest reports whether any two live records share a
+// sequence, so a test can assert it is exercising the commit-group path.
+func hasSharedSequenceForTest(c *Collection) bool {
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		counts := map[uint64]int{}
+		for _, w := range wins {
+			forEachVisibleWindowRef(s0, w, func(r recRef) bool {
+				counts[recSeq(r.w.data, r.off)]++
+				return true
+			})
+		}
+		releaseWindows(wins)
+		for _, n := range counts {
+			if n > 1 {
+				return true
+			}
+		}
+	}
+	return false
 }

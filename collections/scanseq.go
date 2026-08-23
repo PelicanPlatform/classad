@@ -3,6 +3,7 @@ package collections
 import (
 	"bytes"
 	"iter"
+	"sort"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
@@ -53,14 +54,6 @@ type SeqCursor struct {
 	Key      string
 }
 
-// after reports whether a record at (seq, key) sorts strictly after the cursor.
-func (c SeqCursor) after(seq uint64, key []byte) bool {
-	if seq != c.Seq {
-		return seq > c.Seq
-	}
-	return bytes.Compare(key, []byte(c.Key)) > 0
-}
-
 // SeqPage is one page of a sequence-ordered scan.
 type SeqPage struct {
 	// Next is where a following page resumes: hand it back unchanged. It
@@ -86,9 +79,15 @@ type seqRun struct {
 	ok  bool
 }
 
-// advance moves the run to its next record visible at s0 and strictly after the
-// cursor, leaving ok false when the run is exhausted.
-func (r *seqRun) advance(s0 uint64, after SeqCursor) {
+// advance moves the run to its next record visible at s0 whose sequence is at
+// least minSeq, leaving ok false when the run is exhausted.
+//
+// It deliberately does NOT filter on the cursor's key. Records committed
+// together share a sequence and sit in the arena in insertion order, not key
+// order, so a record belonging after the cursor can sit before one belonging
+// before it. The key comparison happens once a sequence's whole group has been
+// collected and sorted.
+func (r *seqRun) advance(s0, minSeq uint64) {
 	for int(r.off) < r.w.used {
 		o := r.off
 		total := recTotalLen(r.w.data, o)
@@ -103,19 +102,19 @@ func (r *seqRun) advance(s0 uint64, after SeqCursor) {
 		if seq > s0 || recSuperseded(r.w.data, o) <= s0 {
 			continue // not visible at this snapshot
 		}
-		key := recKey(r.w.data, o)
-		if !after.after(seq, key) {
-			continue // at or before the cursor
+		if seq < minSeq {
+			continue // an earlier commit than the cursor's
 		}
-		r.cur, r.seq, r.key, r.ok = recRef{w: r.w, off: o, dict: r.dict}, seq, key, true
+		r.cur, r.seq, r.key, r.ok = recRef{w: r.w, off: o, dict: r.dict}, seq, recKey(r.w.data, o), true
 		return
 	}
 	r.ok = false
 }
 
 // QueryRawFromSeq yields the records matching q that sort after the cursor, in
-// (shard, seq, key) order, at most limit of them. A nil query matches
-// everything. It is the paginated form of QueryRaw: successive calls, each
+// (shard, seq, key) order, at most limit of them, projected to the named
+// attributes. A nil query matches everything; an empty projection keeps the
+// whole ad. It is the paginated form of QueryRaw: successive calls, each
 // handed the previous page's Next cursor, visit every record exactly once.
 //
 // The zero cursor starts at the beginning. Each shard is frozen at the sequence
@@ -125,7 +124,7 @@ func (r *seqRun) advance(s0 uint64, after SeqCursor) {
 // already makes, which is likewise per shard.
 //
 // limit <= 0 means no limit, in which case More is always false.
-func (c *Collection) QueryRawFromSeq(q *vm.Query, after SeqCursor, limit int) (iter.Seq[RawAd], *SeqPage) {
+func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after SeqCursor, limit int) (iter.Seq[RawAd], *SeqPage) {
 	page := &SeqPage{Next: after}
 
 	return func(yield func(RawAd) bool) {
@@ -136,7 +135,10 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, after SeqCursor, limit int) (i
 			qp.q, qp.plan, qp.m = q, plan, q.Matcher()
 			qp.wireOK = q.Native() && plan.PartialSafe
 		}
-		emit := c.yieldRaw(yield, false)
+		// Same in-walk projection as QueryRawProjected: an empty projection
+		// means the whole ad, so a caller asking for four attributes does not
+		// pay to render the rest.
+		emit := c.yieldRawProjected(yield, c.newRawProjector(projection, false, false))
 
 		var dbuf []byte
 		emitted := 0
@@ -161,43 +163,48 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, after SeqCursor, limit int) (i
 			runs, release := shardRuns(sh, s0, cursor)
 			done := func() bool {
 				defer release()
+				var group []groupRec
 				for {
-					pick := pickRun(runs)
-					if pick == nil {
+					group = nextGroup(runs, s0, cursor.Seq, group[:0])
+					if len(group) == 0 {
 						return false // shard exhausted; fall through to the next
 					}
-					if limit > 0 && emitted == limit {
-						page.More = true
-						return true
-					}
-
-					r := pick.cur
-					seq, key := pick.seq, append([]byte(nil), pick.key...)
-					pick.advance(s0, cursor)
-
-					if isSystemKeyBytes(r.key()) {
-						continue // internal system record, hidden as in Scan
-					}
-					// The record's full ad — for a columnarized segment, its
-					// own bytes spliced with the segment's columnar payload.
-					w, err := c.wire(r, dbuf)
-					if err != nil {
-						continue // undecodable record: skip rather than abort
-					}
-					dbuf = w
-					ws.dict = r.dict
-					if q != nil && !matchWire(w, qp) {
-						continue
-					}
-					page.Next = SeqCursor{
-						Shard:    uint32(si),
-						Snapshot: s0,
-						Seq:      seq,
-						Key:      string(key),
-					}
-					emitted++
-					if !emit(w, r.dict) {
-						return true // the consumer stopped
+					gseq := group[0].seq
+					for _, g := range group {
+						// Within the cursor's own commit, skip what the last
+						// page already emitted. Elsewhere the whole group is
+						// new.
+						if gseq == cursor.Seq && cursor.Key != "" && bytes.Compare(g.key, []byte(cursor.Key)) <= 0 {
+							continue
+						}
+						if limit > 0 && emitted == limit {
+							page.More = true
+							return true
+						}
+						if isSystemKeyBytes(g.key) {
+							continue // internal system record, hidden as in Scan
+						}
+						// The record's full ad — for a columnarized segment,
+						// its own bytes spliced with the columnar payload.
+						w, err := c.wire(g.ref, dbuf)
+						if err != nil {
+							continue // undecodable record: skip, do not abort
+						}
+						dbuf = w
+						ws.dict = g.ref.dict
+						if q != nil && !matchWire(w, qp) {
+							continue
+						}
+						page.Next = SeqCursor{
+							Shard:    uint32(si),
+							Snapshot: s0,
+							Seq:      gseq,
+							Key:      string(g.key),
+						}
+						emitted++
+						if !emit(w, g.ref.dict) {
+							return true // the consumer stopped
+						}
 					}
 				}
 			}()
@@ -208,6 +215,42 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, after SeqCursor, limit int) (i
 			page.Next = SeqCursor{Shard: uint32(si) + 1}
 		}
 	}, page
+}
+
+// groupRec is one record of a commit group, held while the group is sorted.
+type groupRec struct {
+	ref recRef
+	seq uint64
+	key []byte
+}
+
+// nextGroup collects every record carrying the lowest sequence still pending
+// across the runs, sorted by key, and advances those runs past it. Appends into
+// buf so the backing array is reused between groups.
+//
+// A group is one commit's records within one shard: they share a sequence, and
+// the arena holds them in insertion order. Sorting them by key is what makes
+// (seq, key) an order a cursor can resume from — without it, a page boundary
+// inside a commit would skip whatever sorted below the last record emitted.
+func nextGroup(runs []*seqRun, s0, minSeq uint64, buf []groupRec) []groupRec {
+	gseq := uint64(0)
+	found := false
+	for _, r := range runs {
+		if r.ok && (!found || r.seq < gseq) {
+			gseq, found = r.seq, true
+		}
+	}
+	if !found {
+		return buf[:0]
+	}
+	for _, r := range runs {
+		for r.ok && r.seq == gseq {
+			buf = append(buf, groupRec{ref: r.cur, seq: r.seq, key: r.key})
+			r.advance(s0, minSeq)
+		}
+	}
+	sort.Slice(buf, func(i, j int) bool { return bytes.Compare(buf[i].key, buf[j].key) < 0 })
+	return buf
 }
 
 // shardRuns opens one run per segment of sh holding records visible at s0 above
@@ -223,7 +266,7 @@ func shardRuns(sh *shard, s0 uint64, after SeqCursor) ([]*seqRun, func()) {
 			continue
 		}
 		run := &seqRun{w: w, dict: w.dict()}
-		run.advance(s0, after)
+		run.advance(s0, after.Seq)
 		runs = append(runs, run)
 	}
 	return runs, func() {
@@ -231,20 +274,4 @@ func shardRuns(sh *shard, s0 uint64, after SeqCursor) ([]*seqRun, func()) {
 			releaseWindows([]segWindow{r.w})
 		}
 	}
-}
-
-// pickRun returns the run holding the smallest (seq, key) still to be emitted,
-// or nil when every run is exhausted.
-func pickRun(runs []*seqRun) *seqRun {
-	var pick *seqRun
-	for _, r := range runs {
-		if !r.ok {
-			continue
-		}
-		if pick == nil || r.seq < pick.seq ||
-			(r.seq == pick.seq && bytes.Compare(r.key, pick.key) < 0) {
-			pick = r
-		}
-	}
-	return pick
 }

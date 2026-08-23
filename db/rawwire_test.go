@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -170,5 +171,85 @@ func TestUpdateOldEncryptedFallback(t *testing.T) {
 	if bad, err := OpenConfig(Config{Dir: dir, PoolKeys: []KEK{poolKey("WRONG")}, EncryptedAttrs: []string{"Secret"}}); err == nil {
 		_ = bad.Close()
 		t.Fatal("reopen with wrong key succeeded: the ad was stored in plaintext (UpdateOld leaked past encryption)")
+	}
+}
+
+// TestQueryRawProjectedFromSeq covers the DB-level pagination: pages cover the
+// matching set exactly once, the constraint and projection are applied to every
+// page, and a resume from the returned cursor picks up where the last page
+// stopped.
+func TestQueryRawProjectedFromSeq(t *testing.T) {
+	d, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+
+	const n = 250
+	for i := 0; i < n; i++ {
+		owner := "alice"
+		if i%2 == 1 {
+			owner = "bob"
+		}
+		ad := fmt.Sprintf("MyType = \"Job\"\nClusterId = %d\nProcId = 0\nOwner = %q\nCmd = \"/bin/true\"", i, owner)
+		if err := d.UpdateOld(fmt.Sprintf("k%d", i), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var (
+		cursor SeqCursor
+		seen   = map[int]int{}
+		pages  int
+	)
+	for {
+		rows, page, err := d.QueryRawProjectedFromSeq(`Owner == "alice"`, []string{"ClusterId", "Owner"}, cursor, 16)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for ra := range rows {
+			var cluster int
+			owner := ""
+			for _, e := range ra.Exprs {
+				name, val, _ := strings.Cut(string(e), " = ")
+				switch name {
+				case "ClusterId":
+					if _, err := fmt.Sscanf(val, "%d", &cluster); err != nil {
+						t.Fatalf("ClusterId %q does not parse: %v", val, err)
+					}
+				case "Owner":
+					owner = strings.Trim(val, `"`)
+				case "Cmd", "ProcId":
+					t.Fatalf("projection kept %s, which was not requested", name)
+				}
+			}
+			if owner != "alice" {
+				t.Fatalf("constraint let through Owner %q", owner)
+			}
+			seen[cluster]++
+		}
+		pages++
+		if !page.More {
+			break
+		}
+		cursor = page.Next
+		if pages > 100 {
+			t.Fatal("pagination did not terminate")
+		}
+	}
+
+	if pages < 2 {
+		t.Fatalf("expected several pages, got %d", pages)
+	}
+	if len(seen) != n/2 {
+		t.Fatalf("paged over %d distinct jobs, want %d", len(seen), n/2)
+	}
+	for cluster, count := range seen {
+		if count != 1 {
+			t.Errorf("cluster %d seen %d times across pages, want 1", cluster, count)
+		}
+		if cluster%2 != 0 {
+			t.Errorf("cluster %d does not match the constraint", cluster)
+		}
 	}
 }

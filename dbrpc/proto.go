@@ -216,6 +216,22 @@ const (
 	// the diagnostic. Separate opcode rather than a flag so an older server rejects it cleanly and the
 	// client falls back to opTopK (rows, no breakdown). Same request frame as opTopK.
 	opTopKStats op = 63
+
+	// opQueryRawProjSeq is opQueryRawProj resumed from a cursor: the server yields at most
+	// limit matching ads AFTER the cursor position, in the store's commit-sequence order, and
+	// closes with a cursor trailer (stStreamCursor) saying where to continue and whether
+	// anything remains. It is the wire form of db.DB.QueryRawProjectedFromSeq.
+	//
+	// The cursor is (shard, snapshot, seq, key) because the order is per shard -- a shard is
+	// finished before the next is opened and each is frozen at the sequence it had when its
+	// first page was taken (see collections.SeqCursor). It names no physical position, so a
+	// compaction between pages cannot invalidate it.
+	//
+	// Separate opcode rather than a flag on opQueryRawProj so an older server rejects it as a
+	// bad request and the client falls back to an unpaginated read.
+	// [table][limit i32][constraint][shard u32][snapshot u64][seq u64][key][nattrs i32]{[attr]}
+	//   -> stream of [oldClassAdText], then [stStreamCursor][more u8][shard u32][snapshot u64][seq u64][key]
+	opQueryRawProjSeq op = 64
 )
 
 // putScanStats appends a ScanStats trailer: seven counts as int32 (each well under 2^31 for any
@@ -346,14 +362,15 @@ func (o op) String() string {
 
 // status codes returned in a response frame.
 const (
-	stOK          int32 = 0
-	stErr         int32 = -1 // generic error; payload is a UTF-8 message
-	stMissing     int32 = -2 // key/attribute absent
-	stConflict    int32 = -3 // commit had write-write conflicts; payload = conflicted keys
-	stBadReq      int32 = -4 // malformed request
-	stStream      int32 = 1  // one streamed result frame; more may follow
-	stStreamEnd   int32 = 2  // end of a stream (no payload)
-	stStreamStats int32 = 3  // a scan-stats trailer (ScanStats), sent just before stStreamEnd by a *Stats op
+	stOK           int32 = 0
+	stErr          int32 = -1 // generic error; payload is a UTF-8 message
+	stMissing      int32 = -2 // key/attribute absent
+	stConflict     int32 = -3 // commit had write-write conflicts; payload = conflicted keys
+	stBadReq       int32 = -4 // malformed request
+	stStream       int32 = 1  // one streamed result frame; more may follow
+	stStreamEnd    int32 = 2  // end of a stream (no payload)
+	stStreamStats  int32 = 3  // a scan-stats trailer (ScanStats), sent just before stStreamEnd by a *Stats op
+	stStreamCursor int32 = 4  // a resume cursor, sent just before stStreamEnd by a paginated op
 )
 
 // frameStatus reads the status field of a response frame (bytes 8..12).

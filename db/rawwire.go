@@ -168,3 +168,33 @@ func (db *DB) QueryRawWire(constraint string, projection []string, redact bool) 
 	}
 	return db.c.QueryRawWire(q, projection, redact), nil
 }
+
+// SeqCursor and SeqPage re-export the collections types so a caller of the DB
+// API does not have to import the storage layer to paginate.
+type (
+	SeqCursor = collections.SeqCursor
+	SeqPage   = collections.SeqPage
+)
+
+// QueryRawProjectedFromSeq is QueryRawProjected a page at a time: it yields at
+// most limit matching ads after the cursor and reports where to resume.
+//
+// The order is the store's commit sequence, which is what makes the cursor
+// stable — see collections.QueryRawFromSeq. A caller pages by handing back the
+// previous page's Next until More is false. The zero cursor starts at the
+// beginning.
+//
+// This is for a mutable table. An archive is already ordered newest-first with
+// its limit pushed down, so a "last K" read there needs no cursor at all.
+func (db *DB) QueryRawProjectedFromSeq(constraint string, projection []string, after SeqCursor, limit int) (iter.Seq[collections.RawAd], *SeqPage, error) {
+	var q *vm.Query
+	if s := strings.TrimSpace(constraint); s != "" && !strings.EqualFold(s, "true") {
+		parsed, err := vm.Parse(constraint)
+		if err != nil {
+			return nil, nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+		}
+		q = parsed
+	}
+	seq, page := db.c.QueryRawFromSeq(q, projection, after, limit)
+	return seq, page, nil
+}
