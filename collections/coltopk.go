@@ -69,7 +69,11 @@ func (t *topKKeep) threshold() (float64, bool) {
 //
 // The threshold is meaningful only when seen > k (the keep filled); at seen <= k there are k or
 // fewer rows and the caller should just fetch them directly.
-func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool, k int) (threshold float64, seen int, ok bool) {
+//
+// stats (may be nil) records the cutoff scan's work for EXPLAIN ANALYZE: which records were read
+// from columns vs reassembled by the active-segment fallback, and how many matched -- the same
+// ScanStats a projected scan reports, so the top-K path is no longer invisible to the diagnostic.
+func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool, k int, stats *ScanStats) (threshold float64, seen int, ok bool) {
 	if k <= 0 {
 		return 0, 0, false
 	}
@@ -124,11 +128,12 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 	var scratch []int64
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
+		stats.segments(len(wins), 0) // the cutoff scan filters on non-order fields, so no zone prune
 		for _, w := range wins {
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, rok := resolveStatsFields(cs, aggID, preds)
 			if !rok {
-				c.bruteTopK(w, s0, aggLookup, otherPreds, lookups, selfOK, tk)
+				c.bruteTopK(w, s0, aggLookup, otherPreds, lookups, selfOK, tk, stats)
 				continue
 			}
 			otherIdxs := make([]int, 0, len(otherPreds))
@@ -158,8 +163,11 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 						if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 							continue
 						}
+						stats.visit()
+						stats.columnDecided() // the filter is answered from the columns
 						if nv, vok := col.at(j, st.cache); vok && selfOK(nv.f) {
 							tk.offer(nv.f)
+							stats.matched()
 						}
 					}
 					base += blk.n
@@ -194,8 +202,11 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 						if !keep[j] {
 							continue
 						}
+						stats.visit()
+						stats.columnDecided()
 						if nv, vok := col.at(j, st.cache); vok && selfOK(nv.f) {
 							tk.offer(nv.f)
+							stats.matched()
 						}
 					}
 				}
@@ -212,7 +223,7 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 // the active segment: walk its visible records, test the predicates, and offer the order value --
 // reading only those attributes from the wire, never a full decode. Mirrors bruteStatsMulti.
 func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) ([]byte, bool),
-	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, tk *topKKeep) {
+	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, tk *topKKeep, stats *ScanStats) {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -223,6 +234,8 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
 			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
+				stats.visit()
+				stats.reassembled() // no columnar block here: the record was rebuilt to test it
 				ad := wire.Ad(ww)
 				match := true
 				for i := range preds {
@@ -241,6 +254,7 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 					if node, found := aggLookup(ad); found {
 						if nv, isNum := nodeColVal(node); isNum && selfOK(nv.f) {
 							tk.offer(nv.f)
+							stats.matched()
 						}
 					}
 				}

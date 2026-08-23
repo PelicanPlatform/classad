@@ -152,6 +152,28 @@ func TestArchiveTopKColumnarMatchesBrute(t *testing.T) {
 	if owner, _ := res[0][1].StringValue(); owner != maxRow.owner {
 		t.Fatalf("argmax Owner = %q, want %q (the max row's owner, i.e. the winner was reassembled)", owner, maxRow.owner)
 	}
+
+	// TopKStats returns the same rows plus a cutoff-scan ScanStats (for EXPLAIN ANALYZE): it must
+	// have visited records and matched the ProcId<5 set.
+	statRows, stats, err := fast.TopKStats("ProcId < 5", []string{"ClusterId"}, "ClusterId", true, 1)
+	if err != nil {
+		t.Fatalf("TopKStats: %v", err)
+	}
+	if got := gotCids(t, statRows); len(got) != 1 || got[0] != maxRow.cid {
+		t.Fatalf("TopKStats rows = %v, want [%d]", got, maxRow.cid)
+	}
+	wantMatched := 0
+	for _, r := range rows {
+		if r.proc < 5 {
+			wantMatched++
+		}
+	}
+	if stats.RecordsVisited == 0 {
+		t.Error("TopKStats: RecordsVisited = 0, cutoff scan not recorded")
+	}
+	if stats.RowsMatched != wantMatched {
+		t.Errorf("TopKStats: RowsMatched = %d, want %d", stats.RowsMatched, wantMatched)
+	}
 }
 
 func eqI64s(a, b []int64) bool {

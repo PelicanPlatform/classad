@@ -49,7 +49,7 @@ func TestTopKOrderThreshold(t *testing.T) {
 			}
 			return cids[i] < cids[j]
 		})
-		th, seen, ok := a.TopKOrderThreshold(q, "ClusterId", desc, k)
+		th, seen, ok := a.TopKOrderThreshold(q, "ClusterId", desc, k, nil)
 		if !ok {
 			t.Fatalf("desc=%v k=%d: columnar cutoff unavailable", desc, k)
 		}
@@ -66,7 +66,7 @@ func TestTopKOrderThreshold(t *testing.T) {
 	check(false, 25)
 
 	// An order attribute that is not a numeric schema field: decline, so the caller uses the row path.
-	if _, _, ok := a.TopKOrderThreshold(q, "NotAField", true, 1); ok {
+	if _, _, ok := a.TopKOrderThreshold(q, "NotAField", true, 1, nil); ok {
 		t.Error("expected ok=false for a non-numeric order attribute")
 	}
 }

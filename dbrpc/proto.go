@@ -210,6 +210,12 @@ const (
 	// fetch-and-sort.
 	// [table][constraint][orderAttr][desc u8][k i32][nattrs i32]{[attr]} -> stream of [oldClassAdText]
 	opTopK op = 62
+
+	// opTopKStats is opTopK that also streams a scan-stats trailer (stStreamStats) for the cutoff
+	// scan just before stStreamEnd, for EXPLAIN ANALYZE -- so a top-K query is no longer invisible to
+	// the diagnostic. Separate opcode rather than a flag so an older server rejects it cleanly and the
+	// client falls back to opTopK (rows, no breakdown). Same request frame as opTopK.
+	opTopKStats op = 63
 )
 
 // putScanStats appends a ScanStats trailer: seven counts as int32 (each well under 2^31 for any

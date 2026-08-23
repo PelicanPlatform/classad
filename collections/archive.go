@@ -388,9 +388,10 @@ func (a *Archive) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 }
 
 // TopKOrderThreshold computes the ORDER BY orderAttr {DESC|ASC} LIMIT k cutoff over the archive's
-// matching records via the columnar scan (see Collection.TopKOrderThreshold).
-func (a *Archive) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool, k int) (float64, int, bool) {
-	return a.c.TopKOrderThreshold(q, orderAttr, desc, k)
+// matching records via the columnar scan (see Collection.TopKOrderThreshold). stats (may be nil)
+// records the cutoff scan's work for EXPLAIN ANALYZE.
+func (a *Archive) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool, k int, stats *ScanStats) (float64, int, bool) {
+	return a.c.TopKOrderThreshold(q, orderAttr, desc, k, stats)
 }
 
 // SidecarSizes reports the archive's sealed-segment sidecar index bytes (mmap-backed,
