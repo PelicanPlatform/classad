@@ -53,7 +53,7 @@ func BenchmarkRegionCodecAggregate(b *testing.B) {
 				bl, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, regionCodec,
 					st.schema, st.hot, defaultColGrouping(),
 					func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
-				seg.colblk.Store(&colSegment{blocks: bl, offs: offs})
+				seg.colblk.Store(&colSegment{blocks: bl, offsB: packU32s(offs)})
 				for _, blk := range bl {
 					bytes += len(blk.coldNumComp) + len(blk.strComp) + len(blk.coldComp)
 				}

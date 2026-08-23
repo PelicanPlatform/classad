@@ -40,8 +40,8 @@ func TestColSegmentMarshalRoundTrip(t *testing.T) {
 				codec.Name(), gb.n, blk.n, gb.bitsStride, blk.bitsStride, len(gb.hotFields()), len(blk.hotFields()), len(gb.coldFields()), len(blk.coldFields()))
 		}
 		for i := range offs {
-			if got.offs[i] != offs[i] {
-				t.Fatalf("%s: offs[%d]=%d, want %d", codec.Name(), i, got.offs[i], offs[i])
+			if got.offAt(i) != offs[i] {
+				t.Fatalf("%s: offs[%d]=%d, want %d", codec.Name(), i, got.offAt(i), offs[i])
 			}
 		}
 		// Every record reconstructs byte-identically from the decoded block.

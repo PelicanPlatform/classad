@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"encoding/binary"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -33,11 +34,23 @@ type colSegment struct {
 	// intern ids, which are renumbered at every Open -- so the section names them instead.
 	dictKeyed bool
 	blocks    []*columnarBlock
-	offs      []uint32
+	// offsB is the per-record arena offset map (record index -> its byte offset in the segment),
+	// packed as little-endian uint32 -- the exact on-disk form. A reopened segment ALIASES the mmap
+	// here (zero heap); a freshly built one holds a compact heap buffer. Read via offAt/offsLen. It
+	// was []uint32 materialized on read; the aliased bytes remove that per-segment copy. The offsets
+	// are strictly ascending (records are appended in order), which indexOf relies on.
+	offsB []byte
 	// groups are the group schemas' selections, one colGroupBlock per group per base block. Empty
 	// when the collection carries no group schemas.
 	groups []*colGroup
 }
+
+// offsLen is the number of records the arena-offset map covers.
+func (cs *colSegment) offsLen() int { return len(cs.offsB) / 4 }
+
+// offAt returns record i's arena byte offset, decoded from the packed u32 map (which aliases the
+// mmap on a reopened segment).
+func (cs *colSegment) offAt(i int) uint32 { return binary.LittleEndian.Uint32(cs.offsB[i*4:]) }
 
 // schema returns the schema all of cs's blocks were built under, or nil if it carries none.
 func (cs *colSegment) schema() *adSchema {
@@ -354,7 +367,7 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 	if len(blocks) == 0 {
 		return nil
 	}
-	cs := &colSegment{blocks: blocks, offs: offs, dictKeyed: d != nil}
+	cs := &colSegment{blocks: blocks, offsB: packU32s(offs), dictKeyed: d != nil}
 	// Re-key the pinned groups onto this segment's selections: the schema and members are shared,
 	// the per-block bitmaps are not.
 	for gi, g := range groups {

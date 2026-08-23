@@ -85,7 +85,7 @@ func regroup(tb testing.TB, c *Collection, g colGrouping) (blocks, recs int) {
 			d := seg.dict.Load()
 			bl, offs := buildColumnarFromSegment(seg.data, seg.used, seg.codec, c.regionCodec(), st.schema, st.hot, g,
 				func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) })
-			seg.colblk.Store(&colSegment{blocks: bl, offs: offs})
+			seg.colblk.Store(&colSegment{blocks: bl, offsB: packU32s(offs)})
 			blocks += len(bl)
 			recs += len(offs)
 		}
