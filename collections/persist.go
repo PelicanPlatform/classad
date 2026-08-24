@@ -610,8 +610,13 @@ func (c *Collection) rebuildDir(sh *shard) {
 				maxSeq = sup
 			}
 			// Rebuild the segment's scan-pruning metadata from disk (zeroed on reopen).
+			// Note the local maxSeq above is the SHARD's high-water mark; seg.maxSeq is
+			// this segment's, which resume-from-sequence scans use to skip it whole.
 			if seg.minSeq == 0 || seq < seg.minSeq {
 				seg.minSeq = seq
+			}
+			if seq > seg.maxSeq {
+				seg.maxSeq = seq
 			}
 			// A time-checkpoint marker feeds the shard time index; it never enters the
 			// directory, and its bytes count as dead (as appendMarker does at runtime)
@@ -711,10 +716,13 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 			}
 			seq := recSeq(seg.data, o)
 			if seq > maxSeq {
-				maxSeq = seq
+				maxSeq = seq // the shard's high-water mark
 			}
 			if seg.minSeq == 0 || seq < seg.minSeq {
 				seg.minSeq = seq
+			}
+			if seq > seg.maxSeq {
+				seg.maxSeq = seq // this segment's, for resume-from-sequence pruning
 			}
 			if !recIsMarker(seg.data, o) {
 				count++ // append-only records are never superseded, so all are live

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"iter"
 	"strings"
 	"time"
@@ -356,6 +357,81 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 	write(respHead(reqID, stStreamEnd))
 }
 
+// streamQueryRawProjectSeq is streamQueryRawProject resumed from a cursor: it
+// streams at most limit matching ads after the cursor position and closes with a
+// cursor trailer saying where to continue.
+//
+// Mutable tables only. An archive already answers "the newest K" in one shot,
+// and a materialized view's backing is a mutable table, so both other kinds fall
+// through to the plain projection op rather than pretending to paginate.
+func (s *Server) streamQueryRawProjectSeq(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
+	table := r.str()
+	limit := int(r.i32())
+	constraint := r.str()
+	var after collections.SeqCursor
+	after.Shard = uint32(r.u64())
+	after.Snapshot = r.u64()
+	after.Seq = r.u64()
+	after.Key = r.str()
+	nattrs := int(r.i32())
+	attrs := make([]string, 0, nattrs)
+	for i := 0; i < nattrs; i++ {
+		attrs = append(attrs, r.str())
+	}
+	n := 0
+	if qlog != nil {
+		defer func() {
+			qlog(QueryLog{Op: "QueryRawProjSeq", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+		}()
+	}
+	if r.err != nil {
+		write(respBad(reqID))
+		return
+	}
+	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
+		return
+	}
+
+	d, ok := s.cat.Table(table)
+	if !ok {
+		if _, isView := s.cat.ViewBacking(table); isView {
+			write(respErr(reqID, "cursor pagination is not available for a view: "+table))
+			return
+		}
+		if _, isArchive := s.cat.ArchiveTable(table); isArchive {
+			write(respErr(reqID, "cursor pagination is not needed for an archive (it answers newest-first with the limit pushed down): "+table))
+			return
+		}
+		write(respErr(reqID, "no such table: "+table))
+		return
+	}
+
+	seq, page, err := d.QueryRawProjectedFromSeq(constraint, attrs, after, limit)
+	if err != nil {
+		write(respErr(reqID, err.Error()))
+		return
+	}
+	for ra := range seq {
+		if cancelled(ctx) {
+			return
+		}
+		write(putStr(respHead(reqID, stStream), rawAdText(ra)))
+		n++
+	}
+	cur := respHead(reqID, stStreamCursor)
+	more := byte(0)
+	if page.More {
+		more = 1
+	}
+	cur = append(cur, more)
+	cur = putU64(cur, uint64(page.Next.Shard))
+	cur = putU64(cur, page.Next.Snapshot)
+	cur = putU64(cur, page.Next.Seq)
+	write(putStr(cur, page.Next.Key))
+	write(respHead(reqID, stStreamEnd))
+}
+
 // WireBatchBudget caps one wire-row batch frame's payload bytes. It bounds the
 // per-stream buffer on BOTH sides (each holds ~one frame), amortizes the
 // per-frame syscall/wakeup cost, and stays well under the transport's 1MB
@@ -540,4 +616,68 @@ func projectOpName(chaseRefs bool) string {
 		return "QueryRawProjectRefs"
 	}
 	return "QueryRawProject"
+}
+
+// SeqCursor and SeqPage re-export the storage layer's pagination types, so a
+// dbrpc caller does not import collections just to hold a cursor.
+type (
+	SeqCursor = collections.SeqCursor
+	SeqPage   = collections.SeqPage
+)
+
+// ErrPaginationUnsupported is returned when the server does not implement the
+// paginated opcode (it rejects the request as a bad op), so a caller can fall
+// back to an unpaginated read rather than failing.
+var ErrPaginationUnsupported = errors.New("dbrpc: server does not support cursor pagination")
+
+// QueryRawProjectedFromSeqStream is QueryRawProjectedStream a page at a time: at
+// most limit rows after the cursor, in the store's commit-sequence order, plus
+// the cursor to continue from.
+//
+// Pagination lives on the server's own ordering, so a page costs a resume rather
+// than a re-scan, and the cursor names no physical position — a compaction
+// between pages cannot invalidate it. Hand the returned page's Next back
+// unchanged for the following page; the zero cursor starts at the beginning.
+func (c *Client) QueryRawProjectedFromSeqStream(ctx context.Context, table, constraint string, attrs []string, after SeqCursor, limit int, yield func(row string) bool) (*SeqPage, error) {
+	page := &SeqPage{}
+	err := c.streamEachCursor(ctx, func(id uint64) []byte {
+		b := putStr(putI32(putStr(req(id, opQueryRawProjSeq), table), int32(limit)), constraint)
+		b = putU64(b, uint64(after.Shard))
+		b = putU64(b, after.Snapshot)
+		b = putU64(b, after.Seq)
+		b = putStr(b, after.Key)
+		b = putI32(b, int32(len(attrs)))
+		for _, a := range attrs {
+			b = putStr(b, a)
+		}
+		return b
+	}, yield, func(r *reader) {
+		page.More = r.u8() == 1
+		page.Next.Shard = uint32(r.u64())
+		page.Next.Snapshot = r.u64()
+		page.Next.Seq = r.u64()
+		page.Next.Key = r.str()
+	})
+	if err != nil {
+		if errors.Is(err, ErrBadRequest) {
+			// How the server answers an opcode it does not implement.
+			return nil, fmt.Errorf("%w: %w", ErrPaginationUnsupported, err)
+		}
+		return nil, err
+	}
+	return page, nil
+}
+
+// QueryRawProjectedFromSeq is QueryRawProjectedFromSeqStream collected into a
+// slice, for a caller that wants the page in hand.
+func (c *Client) QueryRawProjectedFromSeq(ctx context.Context, table, constraint string, attrs []string, after SeqCursor, limit int) ([]string, *SeqPage, error) {
+	var rows []string
+	page, err := c.QueryRawProjectedFromSeqStream(ctx, table, constraint, attrs, after, limit, func(row string) bool {
+		rows = append(rows, row)
+		return true
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return rows, page, nil
 }

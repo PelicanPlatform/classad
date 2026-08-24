@@ -108,11 +108,13 @@ type segment struct {
 	// AND maxSup <= S0). This keeps current-time scans O(live) even when time travel
 	// retains a large history in separate (history-only) segments. minSeq is the
 	// smallest seq written here (0 = none yet, or a fast-reopened segment not walked --
-	// which is then never skipped, conservatively); maxSup is the largest finite
-	// supersededBySeq stamped here. "no current record" is read from the byte counters
+	// which is then never skipped, conservatively); maxSeq is the largest, which lets a
+	// resume-from-sequence scan skip a segment ending before its cursor (scanseq.go);
+	// maxSup is the largest finite supersededBySeq stamped here. "no current record" is read from the byte counters
 	// (dead >= used, markers counting as dead) rather than a separate live tally, so it
 	// cannot drift out of sync with the arena.
 	minSeq uint64
+	maxSeq uint64
 	maxSup uint64
 
 	// zones is this sealed segment's per-attribute numeric [min,max] zone map (see
@@ -474,6 +476,9 @@ func (s *segment) append(seq uint64, next loc, key, ad []byte) (uint32, bool) {
 	if s.minSeq == 0 || seq < s.minSeq {
 		s.minSeq = seq
 	}
+	if seq > s.maxSeq {
+		s.maxSeq = seq
+	}
 	return uint32(off), true
 }
 
@@ -508,6 +513,9 @@ func (s *segment) appendMarker(seq uint64, millis uint64) (uint32, bool) {
 	}
 	if s.minSeq == 0 || seq < s.minSeq {
 		s.minSeq = seq
+	}
+	if seq > s.maxSeq {
+		s.maxSeq = seq
 	}
 	// A marker is not live data: count its bytes as dead so a history-only segment that
 	// carries only superseded records plus checkpoints still reaches dead >= used (and

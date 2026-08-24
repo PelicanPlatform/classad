@@ -672,6 +672,45 @@ func (c *Client) streamEachStats(ctx context.Context, build func(id uint64) []by
 	}
 }
 
+// streamEachCursor is streamEach that also delivers a resume-cursor trailer
+// (stStreamCursor) to onCursor. A paginated op sends exactly one, just before
+// the end of the stream; an op that sends none leaves the caller's page zeroed,
+// which reads as "no more".
+func (c *Client) streamEachCursor(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool, onCursor func(*reader)) error {
+	_, ch, err := c.callStream(build)
+	if err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			drain(ch)
+			return ctx.Err()
+		case frame, ok := <-ch:
+			if !ok {
+				return nil // stStreamEnd: the read loop closed the channel
+			}
+			_, status, body, ok := respHeader(frame)
+			if !ok {
+				return errShort
+			}
+			switch status {
+			case stStream:
+				if !yield(body.str()) {
+					drain(ch) // consumer stopped early; let the server-side stream finish
+					return nil
+				}
+			case stStreamCursor:
+				if onCursor != nil {
+					onCursor(body)
+				}
+			case stErr, stBadReq:
+				return statusErr(status, body)
+			}
+		}
+	}
+}
+
 // Query returns the committed ads (old-ClassAd texts) in the default table ("ads")
 // matching a constraint. The server streams results; a slow scan does not block
 // other calls.
