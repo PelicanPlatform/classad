@@ -494,6 +494,14 @@ type hotSetHolder struct{ set map[uint32]struct{} }
 // currentCodec returns the codec new writes are compressed with.
 func (c *Collection) currentCodec() Codec { return c.codec.Load().c }
 
+// releaseIdleEncoders drops the warmed zstd encoder of every registered dictionary codec
+// except the current write codec. Called at the end of a maintenance pass that compresses
+// through older, non-current dictionary codecs (columnarize warms each sealed segment's own
+// codec; an append-only retrain leaves the previous generation's write codec resident and
+// read-only) so their multi-MB match-finder histories do not linger for the life of the
+// collection. Each encoder rebuilds lazily if that codec ever compresses again.
+func (c *Collection) releaseIdleEncoders() { c.dicts.releaseEncodersExcept(c.currentCodec()) }
+
 // currentHotSet returns the set of interned ids to front-load in the hot header,
 // or nil if none are configured.
 func (c *Collection) currentHotSet() map[uint32]struct{} {

@@ -116,6 +116,30 @@ func (r *dictReg) prune(keep func(Codec) bool) []uint32 {
 	return removed
 }
 
+// releaseEncodersExcept drops the lazily-built zstd encoder of every registered dictionary
+// codec except keep (the codec new writes currently compress with). A registered dict codec
+// is retained so its sealed segments stay decodable, but once it is no longer the write
+// codec it only ever Decompresses; its encoder was warmed by the maintenance pass that wrote
+// those segments (columnarize/retrain recompress) and then holds a multi-MB match-finder
+// history that reads never touch. Releasing it lets the GC reclaim that history; the encoder
+// rebuilds lazily if the codec is ever asked to compress again. Non-zstd codecs (the identity
+// base) have no encoder and are skipped.
+func (r *dictReg) releaseEncodersExcept(keep Codec) {
+	r.mu.Lock()
+	codecs := make([]Codec, 0, len(r.byID))
+	for _, c := range r.byID {
+		if c != keep {
+			codecs = append(codecs, c)
+		}
+	}
+	r.mu.Unlock()
+	for _, c := range codecs {
+		if z, ok := c.(*zstdCodec); ok {
+			z.releaseEncoder()
+		}
+	}
+}
+
 // writeDictFile writes a dictionary's bytes to path and fsyncs it (so a codec that
 // segments already reference cannot be lost across a crash).
 func writeDictFile(path string, dict []byte) error {
