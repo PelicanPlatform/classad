@@ -259,6 +259,20 @@ type Options struct {
 	// disables it with zero write-path cost -- retention collapses to the current seq,
 	// exactly as before. See timeseq.go. It can be toggled at runtime.
 	TimeTravel *TimeTravelOptions
+
+	// MutatingBlockCacheBytes and ArchiveBlockCacheBytes set the PROCESS-GLOBAL shared
+	// decompressed-columnar-block cache budgets, in bytes, for the two workload kinds: one budget
+	// shared by ALL mutating (sharded, key-superseding) collections, and a separate one shared by ALL
+	// append-only ARCHIVE collections. This replaces the old fixed 256 MB-per-collection cache, whose
+	// footprint grew as 256 MB × (number of columnarized tables) with no knob. Both are global
+	// ceilings, not per-collection budgets. A value ≤ 0 leaves the current/default budget
+	// (defaultMutatingCacheBytes / defaultArchiveCacheBytes, 512 MiB each). Setting either here is
+	// equivalent to calling Set{Mutating,Archive}BlockCacheBudget; the last non-zero setting wins and
+	// resizes the live shared cache. Because the budget is global, prefer setting it once (e.g. from
+	// db/ at startup) rather than per table. An archive collection uses the archive budget; every
+	// other collection uses the mutating budget.
+	MutatingBlockCacheBytes int64
+	ArchiveBlockCacheBytes  int64
 }
 
 // TimeTravelOptions configures point-in-time queries for a collection (see the
@@ -369,13 +383,15 @@ type Collection struct {
 	// decompressed-block cache) once EnableSchemaScan is called; nil otherwise. See colscan.go.
 	schemaScan atomic.Pointer[schemaScanState]
 
-	// colCache is the ONE decompressed-columnar-block cache shared by ALL of this collection's
-	// columnarized segments (see sharedColCache). It is deliberately not per-segment: ristretto
-	// sizes its admission metadata (count-min sketch + bloom) to NumCounters regardless of how
-	// much is cached, so a cache per segment made that fixed ~5MB overhead scale with segment
-	// count -- hundreds of segments = gigabytes of live heap that grew as the archive sealed more.
-	// Block ids are process-unique (colBlockSeq), so one cache keyed by (blockID,stream) never
-	// collides across segments. Created lazily on the first columnarized segment.
+	// colCache memoizes this collection's decompressed-columnar-block cache -- now the PROCESS-GLOBAL
+	// cache for the collection's kind (archive vs mutating), SHARED across every collection of that
+	// kind, not one cache per collection (see sharedColCache / blockcache.go). It is deliberately not
+	// per-segment nor per-collection: ristretto sizes its admission metadata (count-min sketch +
+	// bloom) to NumCounters regardless of how much is cached, so a cache per segment -- or per one of
+	// htcondordb's many tables -- made that fixed overhead scale with segment/table count (the reopen
+	// heap leak, and ~1 GB of block cache on a busy host). Block ids are process-unique (colBlockSeq),
+	// so one shared cache keyed by (blockID,stream) never collides across collections. Resolved lazily
+	// on the first columnarized segment.
 	colCache     *blockCache
 	colCacheOnce sync.Once
 
@@ -544,6 +560,11 @@ func (c *Collection) currentHotDisplay() []string {
 
 // New creates an empty Collection.
 func New(opts Options) *Collection {
+	// Apply any configured process-global block-cache budgets. These are whole-process ceilings
+	// (see Options), so this is intentionally a global side effect: the last non-zero value wins and
+	// resizes the live shared cache. A ≤0 value is ignored inside the setters.
+	SetMutatingBlockCacheBudget(opts.MutatingBlockCacheBytes)
+	SetArchiveBlockCacheBudget(opts.ArchiveBlockCacheBytes)
 	n := opts.Shards
 	if n <= 0 {
 		n = 16
