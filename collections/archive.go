@@ -336,6 +336,12 @@ func (a *Archive) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classad.V
 	return a.c.QueryProject(q, attrs)
 }
 
+// QueryProjectStats is QueryProject that also fills stats (may be nil) with the scan's work
+// breakdown, for an EXPLAIN ANALYZE of an aggregate that falls to the projected scan.
+func (a *Archive) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanStats) iter.Seq[[]classad.Value] {
+	return a.c.QueryProjectStats(q, attrs, stats)
+}
+
 // Watch streams the archive as change data: a full replay of retained records (oldest
 // first) then live appends, resumable from an opaque cursor. A cursor older than what
 // rotation still retains yields a WatchReset and resumes from the current floor. See

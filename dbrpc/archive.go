@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -51,19 +52,26 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 // engine so the result is identical to the same aggregate over a mutable table. Private
 // attributes are refused for an unprivileged reader, as with the mutable aggregate.
 func (sc *serverConn) streamArchiveAggregate(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, false)
+	sc.archiveAggregate(reqID, r, false, false)
 }
 
 // streamArchiveAggregateFiltered is streamArchiveAggregate's extended form: each group
 // column carries a bucket width and each spec a filter (opArchiveAggregateFiltered).
 func (sc *serverConn) streamArchiveAggregateFiltered(reqID uint64, r *reader) {
-	sc.archiveAggregate(reqID, r, true)
+	sc.archiveAggregate(reqID, r, true, false)
+}
+
+// streamArchiveAggregateStats is streamArchiveAggregate that also streams the scan's ScanStats
+// trailer for EXPLAIN ANALYZE. It carries the extended frame (a superset), so it serves any
+// aggregate shape.
+func (sc *serverConn) streamArchiveAggregateStats(reqID uint64, r *reader) {
+	sc.archiveAggregate(reqID, r, true, true)
 }
 
 // archiveAggregate is the body shared by both archive aggregate opcodes. extended says
 // whether the frame is the wide form -- each group column followed by a bucket width, each
 // aggregate spec by a filter expression -- rather than the base opcode's narrow one.
-func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended bool) {
+func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantStats bool) {
 	name := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -113,7 +121,14 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended bool) {
 		sc.write(respErr(reqID, "no such archive: "+name))
 		return
 	}
-	rows, err := a.AggregateCols(constraint, groupCols, aggs)
+	var stats collections.ScanStats
+	var rows []db.AggRow
+	var err error
+	if wantStats {
+		rows, err = a.AggregateColsStats(constraint, groupCols, aggs, &stats)
+	} else {
+		rows, err = a.AggregateCols(constraint, groupCols, aggs)
+	}
 	if err != nil {
 		sc.write(respErr(reqID, err.Error()))
 		return
@@ -130,6 +145,9 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended bool) {
 			frame = putStr(frame, v)
 		}
 		sc.write(frame)
+	}
+	if wantStats {
+		sc.write(putScanStats(respHead(reqID, stStreamStats), stats))
 	}
 	sc.write(respHead(reqID, stStreamEnd))
 }
@@ -233,12 +251,33 @@ func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint 
 		}
 		return putAggSpecs(b, aggs, extended)
 	}
-	return c.archiveAggregate(ctx, build, len(groups), len(aggs), filtered)
+	return c.archiveAggregate(ctx, build, len(groups), len(aggs), filtered, nil)
 }
 
-// archiveAggregate runs a built archive-aggregate request and collects its streamed rows.
-// filtered selects which "unsupported" error an old server's refusal maps to.
-func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, filtered bool) ([]AggRow, error) {
+// ArchiveAggregateStats is ArchiveAggregateBucketed that also fills stats (may be nil) with the
+// scan's work breakdown for EXPLAIN ANALYZE -- notably a large RecordsReassembled when the
+// aggregate fell to the per-record scan (an attribute the columnar accelerator does not cover). It
+// always sends the extended frame under opArchiveAggregateStats; against a server too old for the
+// opcode it returns an error wrapping ErrArchiveAggregateUnsupported (or ErrExtendedAggregateUnsupported
+// when a filter was requested), so the caller falls back to a plain aggregate without a breakdown.
+func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint string, groups []GroupCol, aggs []AggSpec, stats *collections.ScanStats) ([]AggRow, error) {
+	filtered := anyFiltered(aggs)
+	build := func(id uint64) []byte {
+		b := putStr(putStr(req(id, opArchiveAggregateStats), name), constraint)
+		b = putI32(b, int32(len(groups)))
+		for _, g := range groups {
+			b = putStr(b, g.Attr)
+			b = putU64(b, uint64(g.BucketWidth))
+		}
+		return putAggSpecs(b, aggs, true)
+	}
+	return c.archiveAggregate(ctx, build, len(groups), len(aggs), filtered, stats)
+}
+
+// archiveAggregate runs a built archive-aggregate request and collects its streamed rows. filtered
+// selects which "unsupported" error an old server's refusal maps to; stats (may be nil) receives a
+// ScanStats trailer if the server sends one (opArchiveAggregateStats).
+func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, filtered bool, stats *collections.ScanStats) ([]AggRow, error) {
 	_, frames, err := c.callStream(build)
 	if err != nil {
 		return nil, err
@@ -267,6 +306,10 @@ func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte
 					row.Values[i] = body.str()
 				}
 				out = append(out, row)
+			case stStreamStats:
+				if stats != nil {
+					*stats = readScanStats(body)
+				}
 			case stErr:
 				return out, statusErr(status, body)
 			case stBadReq:
