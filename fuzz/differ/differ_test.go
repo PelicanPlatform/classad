@@ -4,19 +4,24 @@ package differ
 
 import "testing"
 
-// TestCppTimeoutOnCyclicHang guards that a cyclic self-reference that makes
-// libclassad infinite-loop (a known C++ bug; the Go engine resolves it to
-// error) is reported as CppTimeout and treated as a non-divergence, rather than
-// hanging the differ. This test takes ~cppEvalTimeout to run.
-func TestCppTimeoutOnCyclicHang(t *testing.T) {
+// TestCyclicSelfRefNonDivergence pins the invariant for a cyclic self-reference
+// (`A0 = A0`, reached here through a ternary's lazy false branch): it must never
+// count as a divergence, regardless of which libclassad the harness is built
+// against. The Go engine detects the cycle and returns `error`; libclassad
+// returns `undefined` on a version that has the cyclic-eval fix (classified as a
+// KnownQuirk) or infinite-loops on one that does not (classified as CppTimeout).
+// Both are non-divergences. Neither engine may hang the differ.
+func TestCyclicSelfRefNonDivergence(t *testing.T) {
 	r := Compare(`[A0=0?e:A0]`, DefaultOptions())
-	if r.Category != CppTimeout {
-		t.Fatalf("category = %v, want cpp-timeout (cpp=%q)", r.Category, r.CppRaw)
-	}
 	if r.IsDivergence() {
-		t.Errorf("CppTimeout must not count as a divergence")
+		t.Fatalf("cyclic self-reference reported as a divergence: category=%v go=%q cpp=%q detail=%s",
+			r.Category, r.GoRaw, r.CppRaw, r.Detail)
 	}
-	// The Go engine should have resolved the cycle to error, not hung.
+	if r.Category != KnownQuirk && r.Category != CppTimeout {
+		t.Errorf("category = %v, want known-quirk (fixed libclassad) or cpp-timeout (unfixed); cpp=%q",
+			r.Category, r.CppRaw)
+	}
+	// The Go engine must parse it and resolve the cycle to error, never hang or panic.
 	if !r.GoParsed {
 		t.Errorf("Go should parse the input")
 	}

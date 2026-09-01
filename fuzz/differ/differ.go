@@ -32,9 +32,11 @@ const (
 	// GoPanic: the Go engine panicked while parsing or evaluating. Always a bug
 	// in the Go implementation (it should return error/undefined, never panic).
 	GoPanic
-	// CppTimeout: libclassad failed to terminate (it infinite-loops on some
-	// cyclic self-references that the Go engine resolves to error -- a C++ bug).
-	// The result is uncomparable, so this is treated as a non-divergence.
+	// CppTimeout: libclassad failed to terminate within cppEvalTimeout. Older libclassad
+	// infinite-loops on some cyclic self-references that the Go engine resolves to error (a C++ bug
+	// reported upstream and since fixed to return undefined -- a fixed libclassad instead lands in
+	// KnownQuirk via explainedByCyclicRefQuirk). The result is uncomparable, so this is a
+	// non-divergence; it remains as a safety net for any libclassad that has not taken the fix.
 	CppTimeout
 	// KnownQuirk: the engines disagree, but entirely because of a documented
 	// libclassad quirk the Go engine deliberately does not mirror (see
@@ -205,6 +207,15 @@ func Compare(src string, opts Options) Result {
 	if explainedByListIsQuirk(src, goVal, cppVal) {
 		r.Category = KnownQuirk
 		r.Detail = "CPP_QUIRKS #9: =?=/=!= on a list literal vs a function-produced list"
+		return r
+	}
+
+	// A cyclic self-reference is `undefined` in libclassad but `error` in the Go engine (which
+	// detects the cycle). Older libclassad infinite-looped and reached the CppTimeout path above;
+	// the fixed one terminates with undefined and lands here. Both are non-divergences.
+	if explainedByCyclicRefQuirk(src, goVal, cppVal) {
+		r.Category = KnownQuirk
+		r.Detail = "CPP_QUIRKS #2/#3: cyclic self-reference is undefined in libclassad, error in the Go engine"
 		return r
 	}
 

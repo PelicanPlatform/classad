@@ -25,25 +25,30 @@ changed to match.
 
 ---
 
-## 2. Infinite loop on a cyclic self-reference reached through a lazy operand — likely bug
+## 2. Infinite loop on a cyclic self-reference reached through a lazy operand — REPORTED, FIXED UPSTREAM
 
 ```
-classad_eval -quiet '[ A0 = 0 ? e : A0 ]' A0        # hangs forever
-classad_eval -quiet '[ a = 0 ? e : a ]' a           # hangs forever
+classad_eval -quiet '[ A0 = 0 ? e : A0 ]' A0        # (older libclassad) hangs forever; (fixed) undefined
+classad_eval -quiet '[ a = 0 ? e : a ]' a           # ditto
 ```
 
 When an attribute's value reaches a reference to *itself* through a lazily
-evaluated operand — the taken branch of a `?:` ternary here — libclassad's
-cycle guard never fires and evaluation does not terminate. Contrast with the
-direct self-reference, which is detected:
+evaluated operand — the taken branch of a `?:` ternary here — older libclassad's
+cycle guard never fired and evaluation did not terminate. Contrast with the
+direct self-reference, which was always detected:
 
 ```
 classad_eval -quiet '[ A0 = A0 ]' A0                # exception: "failed to evaluate"
 ```
 
-The Go engine detects all of these as a cyclic reference and returns `error`.
-Because libclassad hangs, the differential harness caps each C++ evaluation and
-reports a timeout rather than hanging (see `fuzz/README.md`).
+**Update:** this was reported upstream and fixed — a current libclassad now
+terminates and returns `undefined` for the lazy-operand cycle instead of
+hanging. The Go engine detects all of these as a cyclic reference and returns
+`error`, so the remaining difference is `undefined` (C++) vs `error` (Go) — a
+benign spelling difference the differ classifies as a KnownQuirk
+(`explainedByCyclicRefQuirk`). On any libclassad that still hangs, the harness
+caps each C++ evaluation and reports a CppTimeout instead (see `fuzz/README.md`);
+both are non-divergences.
 
 ---
 
