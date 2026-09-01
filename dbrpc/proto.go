@@ -232,6 +232,16 @@ const (
 	// [table][limit i32][constraint][shard u32][snapshot u64][seq u64][key][nattrs i32]{[attr]}
 	//   -> stream of [oldClassAdText], then [stStreamCursor][more u8][shard u32][snapshot u64][seq u64][key]
 	opQueryRawProjSeq op = 64
+
+	// opArchiveAggregateStats is opArchiveAggregate that also streams a scan-stats trailer
+	// (stStreamStats) just before stStreamEnd, for EXPLAIN ANALYZE of an aggregate over a history
+	// table. The stats reflect the scan the aggregate ran; in particular a large RecordsReassembled
+	// marks the slow path an aggregate takes over an attribute the columnar accelerator does not
+	// cover (the columnar fast paths do not reassemble and leave the counts zero). It carries the
+	// EXTENDED request frame (bucket widths + per-aggregate filters), a superset, so one opcode
+	// serves any aggregate shape. Separate opcode rather than a flag so an older server rejects it
+	// cleanly and the client falls back to opArchiveAggregate (rows, no breakdown).
+	opArchiveAggregateStats op = 65
 )
 
 // putScanStats appends a ScanStats trailer: seven counts as int32 (each well under 2^31 for any

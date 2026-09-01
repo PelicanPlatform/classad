@@ -24,6 +24,16 @@ import (
 // consumer must copy any value it needs to retain past the next step (the
 // aggregate reads each value into its group state immediately).
 func (c *Collection) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classad.Value] {
+	return c.QueryProjectStats(q, attrs, nil)
+}
+
+// QueryProjectStats is QueryProject that also fills stats (may be nil) with the scan's work
+// breakdown -- how many segments were pruned by zone maps vs scanned, and how many records were
+// answered from columns vs reassembled from the arena. It exists so an EXPLAIN ANALYZE of an
+// aggregate that falls to this projected scan (an attribute the columnar accelerator does not cover
+// numerically) can show WHERE the time went -- specifically a large RecordsReassembled, the slow
+// per-record path. Stats accumulate as the returned sequence is consumed.
+func (c *Collection) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanStats) iter.Seq[[]classad.Value] {
 	return func(yield func([]classad.Value) bool) {
 		// Chained collections need parent attributes merged in; fall back to the
 		// full-decode path (correctness over speed for the rarer chained case).
@@ -49,6 +59,7 @@ func (c *Collection) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classa
 			wireOK:   q.Native() && plan.PartialSafe,
 			ws:       ws,
 			resolver: ws.resolve,
+			stats:    stats,
 		}
 		probes := q.Probes()
 		if c.hasZones.Load() {

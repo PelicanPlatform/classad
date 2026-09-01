@@ -215,11 +215,18 @@ func (t *ArchiveTable) QueryLimit(constraint string, limit int) (iter.Seq[*class
 // wire-native where possible -- so an aggregate reads only the attributes it needs instead
 // of fully decoding every record. Errors only on a malformed constraint.
 func (t *ArchiveTable) QueryProject(constraint string, attrs []string) (iter.Seq[[]classad.Value], error) {
+	return t.QueryProjectStats(constraint, attrs, nil)
+}
+
+// QueryProjectStats is QueryProject that also fills stats (may be nil) with the scan's work
+// breakdown, so an EXPLAIN ANALYZE of an aggregate that falls to this projected scan can show the
+// large RecordsReassembled that marks the slow per-record path.
+func (t *ArchiveTable) QueryProjectStats(constraint string, attrs []string, stats *collections.ScanStats) (iter.Seq[[]classad.Value], error) {
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
 	}
-	return t.a.QueryProject(q, attrs), nil
+	return t.a.QueryProjectStats(q, attrs, stats), nil
 }
 
 // QueryRawProjected yields each matching ad as a raw projected subset (only the projection
@@ -285,6 +292,17 @@ func (t *ArchiveTable) Aggregate(constraint string, groupBy []string, aggs []Agg
 // AggregateCols is Aggregate where a group column may carry a bucket width, so a numeric
 // attribute can be grouped into fixed-width buckets (the "per day" dimension) server-side.
 func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, error) {
+	return t.AggregateColsStats(constraint, groupCols, aggs, nil)
+}
+
+// AggregateColsStats is AggregateCols that also fills stats (may be nil) with the scan's work
+// breakdown for EXPLAIN ANALYZE. Only the fall-through projected scan -- the slow path taken when
+// the aggregated attribute is not a numeric field the columnar accelerator covers -- fills it; the
+// columnar/index fast paths do not reassemble records and leave stats zero (RecordsVisited == 0),
+// which the caller reads as "served without a per-record scan". So a nonzero, large
+// RecordsReassembled here is exactly the signature of the slow aggregate this trailer exists to
+// surface.
+func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats) ([]AggRow, error) {
 	// A constraint that can never match needs no data read at all. Answered by running the ordinary
 	// aggregation over an EMPTY sequence rather than by constructing a result here, so the shape is whatever
 	// a scan that matched nothing would have produced -- 0 for a count, undefined for MIN -- by construction
@@ -329,8 +347,10 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 
 	// Scan wire-native, reading only the attributes the aggregation projects (empty for a
 	// pure COUNT), so it does not fully decode every matched record -- mirroring the mutable
-	// table's aggregate. Zone maps still prune segments no matching record can fall in.
-	seq, err := t.QueryProject(constraint, attrs)
+	// table's aggregate. Zone maps still prune segments no matching record can fall in. This is
+	// the path whose stats matter: an attribute the columnar accelerator does not cover forces a
+	// per-record reassembly here, which the trailer surfaces as a large RecordsReassembled.
+	seq, err := t.QueryProjectStats(constraint, attrs, stats)
 	if err != nil {
 		return nil, err
 	}
