@@ -110,6 +110,12 @@ type ArchiveOptions struct {
 	// RetrainDict/Rewrite. Optional; default off. Trades a per-seal transcode (off the write
 	// lock) for the win landing eagerly.
 	InternAtSeal bool
+
+	// BlockCacheBytes sets the PROCESS-GLOBAL shared archive block-cache budget (see
+	// Options.ArchiveBlockCacheBytes). It is shared by ALL archives in the process, not scoped to
+	// this one. 0 keeps the current/default archive budget. Setting it here is equivalent to
+	// calling SetArchiveBlockCacheBudget.
+	BlockCacheBytes int64
 }
 
 const defaultArchiveSegmentSize = 8 << 20 // 8 MiB
@@ -149,6 +155,8 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		GroupMergeJaccard:   opts.GroupMergeJaccard,
 		GroupMaxPartialFrac: opts.GroupMaxPartialFrac,
 		WatchHistory:        archiveWatchCap, // enable the append-stream watch
+		// Global shared ARCHIVE block-cache budget (0 keeps the current/default).
+		ArchiveBlockCacheBytes: opts.BlockCacheBytes,
 	}
 }
 

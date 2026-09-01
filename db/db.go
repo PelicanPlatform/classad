@@ -116,6 +116,16 @@ type Config struct {
 	// tests and for tuning the sealed-segment accelerators (columnar scan, sealed indexes).
 	SegmentSize int
 
+	// MutatingBlockCacheBytes and ArchiveBlockCacheBytes set the PROCESS-GLOBAL shared
+	// decompressed-columnar-block cache budgets (see collections.Options): one budget shared by all
+	// mutating tables and a separate one shared by all archive tables. They are global ceilings, not
+	// per-DB or per-table, so a process opening many tables (as htcondordb does) no longer multiplies
+	// a fixed per-table cache by the table count. 0 keeps the collections default (512 MiB each). The
+	// same Config feeds both the mutating and archive opens, so setting them once configures the
+	// whole process; the last non-zero value wins and resizes the live cache.
+	MutatingBlockCacheBytes int64
+	ArchiveBlockCacheBytes  int64
+
 	// PoolKeys enables encryption at rest: the DB master key is wrapped under each of
 	// these pool/signing keys (any one opens the DB; a rotated-in key is added on the
 	// next open). Empty ⇒ encryption disabled. See db/encrypt.go.
@@ -157,6 +167,11 @@ func OpenConfig(cfg Config) (*DB, error) {
 		DataKey:             enc.data(),
 		EncryptedAttrs:      cfg.EncryptedAttrs,
 		SegmentSize:         cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
+		// Process-global shared block-cache budgets (0 ⇒ collections default). Both are set here at DB
+		// open: collections.New applies BOTH the mutating and archive budgets to the process globals,
+		// so archives opened later from a plain ArchiveConfig inherit the archive budget set now.
+		MutatingBlockCacheBytes: cfg.MutatingBlockCacheBytes,
+		ArchiveBlockCacheBytes:  cfg.ArchiveBlockCacheBytes,
 		// Time travel is a persisted runtime toggle: read it before opening so recovery
 		// rebuilds the time index (and scan-pruning counters) from the segment markers
 		// instead of the directory snapshot. loadIndexConfig below keeps it in sync.
