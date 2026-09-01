@@ -291,6 +291,10 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	}
 	c.lastDictBytes.Store(int64(len(dict)))
 	c.lastRetrainUnix.Store(time.Now().UnixNano())
+	// The previous write codec (and, for an append-only log, every earlier generation still
+	// referenced by its segments) is now read-only. Drop its warmed encoder; the read path
+	// only needs the decoder, and the encoder rebuilds lazily if it ever compresses again.
+	c.releaseIdleEncoders()
 	return len(dict), nil
 }
 

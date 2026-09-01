@@ -405,6 +405,10 @@ func (c *Collection) columnarizeSealed() int {
 	}
 	if total > 0 {
 		c.reindexAfterCompaction()
+		// Columnarizing a sealed segment recompresses its remnants with that segment's own
+		// (non-current) dictionary codec, warming an encoder the read path never uses again.
+		// Drop those idle encoders so their match-finder history does not stay resident.
+		c.releaseIdleEncoders()
 	}
 	return total
 }

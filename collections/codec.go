@@ -7,6 +7,7 @@ import (
 	"io"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -44,8 +45,23 @@ func (identityCodec) Name() string { return "identity" }
 // zstdCodec compresses with ZSTD, optionally against a fixed shared dictionary.
 // EncodeAll/DecodeAll are safe for concurrent use, so a single encoder/decoder
 // pair serves all shards.
+//
+// The encoder is built LAZILY, on the first Compress, and can be released again
+// (releaseEncoder) once a codec reverts to read-only. A sealed/registered dictionary
+// codec is kept resident so its segments stay decodable (dictReg.byID), but the read
+// path only ever Decompresses -- the bundled encoder is warmed once (during the
+// columnarize/retrain pass that wrote those segments) and then never touched again,
+// while its match-finder history (fastBase.ensureHist, tens of MB per codec once warmed)
+// stays live purely because it was bundled with the decoder. Splitting the encoder out
+// keeps a decode-only codec at zero encoder cost; the encoder rebuilds on demand if the
+// codec is ever asked to compress again.
 type zstdCodec struct {
-	enc     *zstd.Encoder
+	// enc is the compressor: nil until the first Compress builds it, and nil again after
+	// releaseEncoder. Loaded with a plain atomic on the Compress fast path (no per-call
+	// lock); encMu serializes construction so concurrent first-Compress callers build one.
+	enc     atomic.Pointer[zstd.Encoder]
+	encMu   sync.Mutex     // serializes lazy encoder construction
+	eopts   []zstd.EOption // encoder options, retained so the encoder can be (re)built on demand
 	dec     *zstd.Decoder
 	hasDict bool
 	dopts   []zstd.DOption // decoder options, for pooled streaming (prefix) decoders
@@ -101,18 +117,51 @@ func NewZSTDCodec(dict []byte) (Codec, error) {
 		eopts = append(eopts, zstd.WithEncoderDict(dict))
 		dopts = append(dopts, zstd.WithDecoderDicts(dict))
 	}
-	enc, err := zstd.NewWriter(nil, eopts...)
+	// Validate the encoder options now -- so a bad dictionary/option is still surfaced as
+	// an error from NewZSTDCodec, exactly as before -- but do NOT retain the encoder: the
+	// probe is dropped immediately and the real encoder is built lazily on the first
+	// Compress (see encoder). An unused EncodeAll encoder starts no goroutines and warms
+	// no history, so the probe is cheap and GC'd; only a codec that actually compresses
+	// ever pays for a resident encoder.
+	probe, err := zstd.NewWriter(nil, eopts...)
 	if err != nil {
 		return nil, err
 	}
+	_ = probe // dropped; not stored. Lazy (re)built in encoder().
 	dec, err := zstd.NewReader(nil, dopts...)
 	if err != nil {
 		return nil, err
 	}
-	return &zstdCodec{enc: enc, dec: dec, hasDict: len(dict) > 0, dopts: dopts}, nil
+	return &zstdCodec{eopts: eopts, dec: dec, hasDict: len(dict) > 0, dopts: dopts}, nil
 }
 
-func (z *zstdCodec) Compress(dst, src []byte) []byte { return z.enc.EncodeAll(src, dst) }
+// encoder returns the codec's compressor, building it on first use. The build uses the
+// same options NewZSTDCodec already validated, so it cannot fail here; a build error would
+// mean the options became invalid after construction, which is impossible, so it panics.
+func (z *zstdCodec) encoder() *zstd.Encoder {
+	if e := z.enc.Load(); e != nil {
+		return e
+	}
+	z.encMu.Lock()
+	defer z.encMu.Unlock()
+	if e := z.enc.Load(); e != nil { // another Compress won the race
+		return e
+	}
+	e, err := zstd.NewWriter(nil, z.eopts...)
+	if err != nil {
+		panic(fmt.Sprintf("collections: build zstd encoder from validated options: %v", err))
+	}
+	z.enc.Store(e)
+	return e
+}
+
+// releaseEncoder drops the (possibly warmed) encoder so its multi-MB match-finder history
+// can be GC'd. Safe to call while another goroutine compresses: that caller keeps its own
+// encoder reference (EncodeAll is concurrency-safe) and the next Compress rebuilds one. A
+// no-op if no encoder is resident.
+func (z *zstdCodec) releaseEncoder() { z.enc.Store(nil) }
+
+func (z *zstdCodec) Compress(dst, src []byte) []byte { return z.encoder().EncodeAll(src, dst) }
 
 func (z *zstdCodec) Decompress(dst, src []byte) ([]byte, error) { return z.dec.DecodeAll(src, dst) }
 
