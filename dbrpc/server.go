@@ -24,6 +24,11 @@ type Server struct {
 	txns   sync.Map // txnID(uint64) -> *serverTxn
 	nextID atomic.Uint64
 	stopBG []func()
+	// bgWG tracks the background maintenance goroutines StartMaintenance launched, so Close
+	// can WAIT for an in-flight Maintain/Compact pass to finish -- not merely signal it to
+	// stop -- before the caller closes the catalog. Signalling without waiting let cat.Close
+	// munmap segments while a Compact/reindex pass was still reading them (SIGSEGV on restart).
+	bgWG sync.WaitGroup
 
 	// maintainOpts is the self-tuning configuration StartMaintenance was given; the on-demand
 	// "analyze" admin action reuses it so a manual optimize matches the scheduled pass.
@@ -233,6 +238,10 @@ const maintenanceMaxDutyCycle = 0.01
 // wait on the throttled retrain-dominated Maintain pass.
 const defaultCompactInterval = 2 * time.Minute
 
+// compactPassHook, when non-nil, is invoked at the start of each background compaction pass.
+// Test-only (nil in production); a test uses it to hold a pass in flight and prove Close waits.
+var compactPassHook func()
+
 // StartMaintenance starts server-managed background maintenance: a single goroutine that,
 // each tick, re-enumerates the catalog's tables and runs one Maintain pass (index
 // auto-tune, hot-set refresh, and -- if opts.Retrain -- dictionary retrain) on each.
@@ -249,7 +258,9 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 	}
 	s.maintainOpts = opts // reused by the on-demand "analyze" admin action
 	done := make(chan struct{})
+	s.bgWG.Add(1)
 	go func() {
+		defer s.bgWG.Done()
 		t := time.NewTimer(interval)
 		defer t.Stop()
 		for {
@@ -290,7 +301,9 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 			compactEvery = defaultCompactInterval
 		}
 		cdone := make(chan struct{})
+		s.bgWG.Add(1)
 		go func() {
+			defer s.bgWG.Done()
 			ct := time.NewTimer(compactEvery)
 			defer ct.Stop()
 			for {
@@ -298,6 +311,9 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 				case <-cdone:
 					return
 				case <-ct.C:
+				}
+				if compactPassHook != nil {
+					compactPassHook()
 				}
 				for _, name := range s.cat.Tables() {
 					if d, ok := s.cat.Table(name); ok {
@@ -333,6 +349,10 @@ func (s *Server) Close() {
 		stop()
 	}
 	s.stopBG = nil
+	// Wait for the signalled goroutines to actually return -- including finishing any pass
+	// already in flight -- before returning, so the caller can safely close the catalog
+	// (munmap segments) without racing a Compact/Maintain still reading them.
+	s.bgWG.Wait()
 }
 
 // ServeConn runs the request loop on one connection until it errors or the peer
