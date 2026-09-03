@@ -78,36 +78,55 @@ func (db *DB) withWriteRetry(stage func(*Txn)) error {
 // constraint, e.g. "<now> > LastHeardFrom + Lifetime"), replacing a client's
 // per-key query-then-delete loop with one call executed where the data lives.
 //
-// Each round re-scans on a fresh snapshot and, inside the deleting transaction,
-// re-checks the constraint against the ad as of that snapshot before removing it.
-// Two properties fall out of that:
-//   - Self-healing under concurrency: an ad concurrently modified so that it no
-//     longer matches (a re-advertised ad whose expiry constraint no longer holds)
-//     is spared, not deleted; and a partial commit's conflicted keys are simply
-//     re-evaluated on the next round.
-//   - Idempotent and safe to run alongside writers or another sweep.
+// The match set is snapshotted ONCE, up front, and only that fixed set of keys is
+// deleted -- rows that begin matching only after the scan are not chased. This is what
+// guarantees termination: the working set can only shrink (a deleted or spared key is
+// dropped; only a key whose delete lost an optimistic race is retried), so a writer that
+// keeps producing new matches can no longer make the sweep spin. It is also the correct
+// DELETE semantics -- the statement acts on the rows present when it began, like SQL --
+// which the previous re-scan-every-round design violated (and which let a continuously
+// refreshed match set, e.g. a hot "JobStatus is undefined", never converge).
 //
-// It errors on a malformed constraint, a non-conflict commit failure, or if the
-// sweep fails to converge within maxDeleteRounds (only reachable under relentless
-// churn of the match set); the returned count reflects what was removed so far.
+// Within the deleting transaction each key is still re-checked against the live ad before
+// removal, so a row edited out of the match set before it is reached is spared; a row
+// rewritten concurrently conflicts on commit and is retried (bounded by maxDeleteRounds,
+// now only ever reached under relentless rewrite of the SAME already-matched keys).
+//
+// It errors on a malformed constraint, a non-conflict commit failure, or if some already-
+// matched keys still conflict after maxDeleteRounds; the returned count reflects what was
+// removed so far.
+// deleteWhereAfterScanHook, when non-nil, is invoked once right after DeleteWhere snapshots
+// the match set. Test-only (nil in production); a test uses it to insert a new matching row
+// after the snapshot and assert that row is NOT deleted (proving the snapshot-once semantics).
+var deleteWhereAfterScanHook func()
+
 func (db *DB) DeleteWhere(constraint string) (int, error) {
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return 0, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	total := 0
-	for round := 0; round < maxDeleteRounds; round++ {
-		keys := db.matchingKeys(q, deleteBatch)
-		if len(keys) == 0 {
-			return total, nil
-		}
-		deleted, err := db.deleteMatching(q, keys)
-		if err != nil {
-			return total, err
-		}
-		total += deleted
+	pending := db.matchingKeysAll(q) // one scan: the rows matching at statement start
+	if deleteWhereAfterScanHook != nil {
+		deleteWhereAfterScanHook()
 	}
-	return total, fmt.Errorf("classad-db: DeleteWhere did not converge in %d rounds for %q (removed %d)", maxDeleteRounds, constraint, total)
+	total := 0
+	for round := 0; len(pending) > 0 && round < maxDeleteRounds; round++ {
+		var conflicted []string
+		for i := 0; i < len(pending); i += deleteBatch {
+			end := min(i+deleteBatch, len(pending))
+			deleted, conf, derr := db.deleteMatching(q, pending[i:end])
+			if derr != nil {
+				return total, derr
+			}
+			total += deleted
+			conflicted = append(conflicted, conf...)
+		}
+		pending = conflicted // retry ONLY keys whose delete lost a race; never re-scan for new matches
+	}
+	if len(pending) > 0 {
+		return total, fmt.Errorf("classad-db: DeleteWhere left %d key(s) after %d rounds of write conflicts for %q (removed %d)", len(pending), maxDeleteRounds, constraint, total)
+	}
+	return total, nil
 }
 
 // KeysWhere returns an iterator over the storage keys of every row whose ad matches constraint.
@@ -130,14 +149,16 @@ func (db *DB) KeysWhere(constraint string) (iter.Seq[string], error) {
 	}, nil
 }
 
-// matchingKeys collects up to limit keys whose ads currently match q.
-func (db *DB) matchingKeys(q *vm.Query, limit int) []string {
-	keys := make([]string, 0, min(limit, 256))
+// matchingKeysAll collects every key whose ad matches q at the time of the scan. Unbounded
+// by design: DeleteWhere snapshots the whole match set once (keys are small strings), rather
+// than re-scanning per round, so the sweep cannot chase matches that appear after it starts.
+func (db *DB) matchingKeysAll(q *vm.Query) []string {
+	var keys []string
 	db.c.ForEachAd(func(key string, ad *classad.ClassAd) bool {
 		if q.Matches(ad) {
 			keys = append(keys, key)
 		}
-		return len(keys) < limit
+		return true
 	})
 	return keys
 }
@@ -146,8 +167,9 @@ func (db *DB) matchingKeys(q *vm.Query, limit int) []string {
 // whose ads still match q as of the transaction's snapshot. Re-checking within
 // the transaction spares an ad refreshed out of the match set before the
 // snapshot; the optimistic commit spares one refreshed after it (its key
-// conflicts and is reported, not removed). Returns the number actually removed.
-func (db *DB) deleteMatching(q *vm.Query, keys []string) (int, error) {
+// conflicts and is reported, not removed). Returns the number actually removed and
+// the keys that conflicted (concurrently rewritten) so the caller can retry just those.
+func (db *DB) deleteMatching(q *vm.Query, keys []string) (int, []string, error) {
 	t := db.Begin()
 	staged := 0
 	for _, k := range keys {
@@ -163,16 +185,16 @@ func (db *DB) deleteMatching(q *vm.Query, keys []string) (int, error) {
 	}
 	if staged == 0 {
 		t.Abort()
-		return 0, nil
+		return 0, nil, nil
 	}
 	err := t.Commit()
 	if err == nil {
-		return staged, nil
+		return staged, nil, nil
 	}
 	if ce, ok := err.(*ConflictError); ok {
 		// Partial commit: the non-conflicted deletes landed; the conflicted keys
-		// (concurrently rewritten) did not, and are re-evaluated next round.
-		return staged - len(ce.Keys), nil
+		// (concurrently rewritten) did not, and are returned for a bounded retry.
+		return staged - len(ce.Keys), ce.Keys, nil
 	}
-	return 0, err
+	return 0, nil, err
 }
