@@ -26,8 +26,27 @@ import (
 // The source must be sealed (immutable), so it is read without the shard lock; the returned segment
 // is staged on disk and not yet part of the shard -- see columnarizeSealedSegment.
 func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, hot []int) (*segment, []uint32, []uint32) {
-	if src == nil || src.used == 0 || src.columnarized() || s == nil || len(s.fields) == 0 {
+	if src == nil || src.used == 0 || s == nil || len(s.fields) == 0 {
 		return nil, nil, nil
+	}
+	// recol re-columnarizes a segment that ALREADY holds a columnar payload, to bring its group set
+	// current after the committed groups changed (see refreshGroupSchemas). Its records are remnants,
+	// so its full ads are reconstructed (remnant spliced with the existing columns) before being
+	// re-split under the new group set. A colDamaged segment cannot be reconstructed -- its records
+	// are short of every attribute the unreadable payload held -- so it is refused rather than rewritten
+	// into ads missing half their content.
+	recol := src.columnarized()
+	if src.colDamaged.Load() {
+		return nil, nil, nil
+	}
+	var recolOffs []uint32
+	var recolFulls [][]byte
+	if recol {
+		var ok bool
+		recolOffs, recolFulls, ok = c.reconstructFullRecords(src)
+		if !ok || len(recolOffs) == 0 {
+			return nil, nil, nil
+		}
 	}
 
 	d := src.dict.Load()
@@ -92,9 +111,19 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	}
 
 	// Pass 1: build the columnar blocks over the segment's records, exactly as the accelerator
-	// does today. This also yields the per-record arena offsets the reader maps back through.
-	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(src.data, src.used, src.codec,
-		c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
+	// does today. This also yields the per-record arena offsets the reader maps back through. When
+	// re-columnarizing, the records are fed as reconstructed full ads rather than decompressed from
+	// the arena (their arena bytes are only the remnant); colBuild processes both identically.
+	var blocks []*columnarBlock
+	var gblocks [][]*colGroupBlock
+	var offs []uint32
+	if recol {
+		blocks, gblocks, offs = buildColumnarFromWires(recolOffs, recolFulls,
+			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
+	} else {
+		blocks, gblocks, offs = buildColumnarFromSegmentGrouped(src.data, src.used, src.codec,
+			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
+	}
 	if len(blocks) == 0 || len(offs) == 0 {
 		return nil, nil, nil
 	}
@@ -131,12 +160,30 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	rems := make([]remnant, 0, len(offs))
 	var buf []byte
 	total := 0
-	for _, o := range offs {
-		raw, err := src.codec.Decompress(buf[:0], recAd(src.data, o))
-		if err != nil {
-			return nil, nil, nil
+	// When re-columnarizing, the arena holds only each record's remnant; its full ad was
+	// reconstructed for pass 1 and is reused here so the new remnant is split from the same content.
+	var fullByOff map[uint32][]byte
+	if recol {
+		fullByOff = make(map[uint32][]byte, len(recolOffs))
+		for i, o := range recolOffs {
+			fullByOff[o] = recolFulls[i]
 		}
-		buf = raw
+	}
+	for _, o := range offs {
+		var raw []byte
+		if recol {
+			raw = fullByOff[o]
+			if raw == nil {
+				return nil, nil, nil
+			}
+		} else {
+			r, err := src.codec.Decompress(buf[:0], recAd(src.data, o))
+			if err != nil {
+				return nil, nil, nil
+			}
+			buf = r
+			raw = r
+		}
 		// What the columns could not take: expressions, and nothing else. An expression node carries
 		// attribute references as ids in the RECORD's space, and the block's nodes are re-encoded into
 		// the global one, so moving an expression rewrites which attribute it points at -- measured,
@@ -235,6 +282,37 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	dst.keyIdx.Store(ki)
 	dst.keyBloom.Store(bloomFromKeyIndex(ki))
 	return dst, srcOffs, newOffs
+}
+
+// reconstructFullRecords rebuilds every live data record of an already-columnarized segment into its
+// FULL wire ad (remnant spliced with the segment's columnar values), in arena order, returning each
+// record's arena offset alongside its ad. It is what lets a columnarized segment be re-columnarized
+// under a new group set: the source records are remnants, so they must be made whole before being
+// re-split. Reads immutable sealed bytes off the shard lock, like the rest of the build. ok=false on
+// any reconstruction error, so the caller keeps the original segment rather than rewriting it into
+// short ads.
+func (c *Collection) reconstructFullRecords(src *segment) ([]uint32, [][]byte, bool) {
+	var offs []uint32
+	var fulls [][]byte
+	var buf []byte
+	for off := 0; off < src.used; {
+		o := uint32(off)
+		total := recTotalLen(src.data, o)
+		if total == 0 {
+			break
+		}
+		if !recIsMarker(src.data, o) {
+			full, err := c.recordWireIn(src, src.data, o, buf[:0])
+			if err != nil {
+				return nil, nil, false
+			}
+			offs = append(offs, o)
+			fulls = append(fulls, append([]byte(nil), full...))
+			buf = full[:0]
+		}
+		off += int(total)
+	}
+	return offs, fulls, true
 }
 
 // stripSchemaAttrs returns the ad with every attribute the schema carries removed.
@@ -458,6 +536,64 @@ func (c *Collection) columnarizeSealed() int {
 		// Columnarizing a sealed segment recompresses its remnants with that segment's own
 		// (non-current) dictionary codec, warming an encoder the read path never uses again.
 		// Drop those idle encoders so their match-finder history does not stay resident.
+		c.releaseIdleEncoders()
+	}
+	return total
+}
+
+// recolumnarizeStaleGroups re-columnarizes the already-columnarized sealed segments whose built-in
+// group set differs from next (the newly-committed set), so a group the table has just started
+// committing to is actually applied to the segments that predate it. Bounded by the columnar budget,
+// so a change converges over several maintenance passes rather than stalling on one, exactly as the
+// initial columnarize backlog does. Returns how many segments were rewritten.
+//
+// Only segments whose group set is actually stale are touched -- one already carrying next is skipped
+// -- so a steady group set costs a comparison per segment and no rewrites. Holds maintMu, as the
+// other segment-rewriting passes do, so rewrites never overlap.
+func (c *Collection) recolumnarizeStaleGroups(next []*colGroup) int {
+	budget := c.columnarBudget()
+	if budget <= 0 {
+		return 0 // rewrite disabled: the adopted set still applies to future/non-columnarized segments
+	}
+	c.maintMu.Lock()
+	defer c.maintMu.Unlock()
+	st := c.schemaScan.Load()
+	if st == nil || st.schema == nil || len(st.schema.fields) == 0 {
+		return 0
+	}
+	total := 0
+	for _, sh := range c.shards {
+		if total >= budget {
+			break
+		}
+		if sh.allocNamed == nil || sh.segDir == "" {
+			continue // in-memory shard: nothing durable to rewrite
+		}
+		sh.mu.Lock()
+		act := sh.act
+		var srcs []*segment
+		for _, seg := range sh.segs {
+			if seg == nil || seg == act || seg.used == 0 || !seg.columnarized() {
+				continue
+			}
+			cn := seg.colNative.Load()
+			if cn == nil || c.sameGroupSet(cn.seg.groups, next) {
+				continue // already carries the committed group set
+			}
+			srcs = append(srcs, seg)
+		}
+		sh.mu.Unlock()
+		for _, src := range srcs {
+			if total >= budget {
+				break
+			}
+			if c.columnarizeSealedSegment(sh, src, st.schema, st.hot) {
+				total++
+			}
+		}
+	}
+	if total > 0 {
+		c.reindexAfterCompaction()
 		c.releaseIdleEncoders()
 	}
 	return total
