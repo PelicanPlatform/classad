@@ -74,7 +74,7 @@ func (c *Collection) mergeSegments(sh *shard, run []*segment) bool {
 		moved += int64(s.used)
 	}
 	mergedBytes.Add(moved)
-	return c.commitSegmentRewrite(sh, run, merged, nil)
+	return c.commitSegmentRewrite(sh, run, merged, nil, nil)
 }
 
 // commitSegmentRewrite makes a rewritten segment durable and swaps it in for its sources.
@@ -96,7 +96,14 @@ func (c *Collection) mergeSegments(sh *shard, run []*segment) bool {
 // them: a sealed segment in a MUTABLE table can still be superseded in place, and the output was
 // built off-lock, so a delete that landed mid-build would otherwise be dropped and the record would
 // come back to life. Nil for a rewrite whose sources are immutable.
-func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segment, reconcile func()) bool {
+//
+// postSwap, when non-nil, runs under the same shard lock immediately AFTER out replaces srcs[0] in
+// sh.segs (so out.id is set and out is the segment findCurrent/lookupSealed reach). It exists for a
+// rewrite that moves records to new offsets: by-key resolution (the directory and the sealed key
+// index) must be reconciled to those new offsets in the SAME critical section as the swap, so out is
+// never visible with a stale directory or an absent key index. Nil for a rewrite that does not move
+// offsets under a directory (the append-only merge path has neither).
+func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segment, reconcile, postSwap func()) bool {
 	abort := func() bool {
 		out.retire()
 		out.reapAndHook()
@@ -135,6 +142,9 @@ func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segme
 	}
 	out.id = srcs[0].id
 	sh.segs[srcs[0].id] = out
+	if postSwap != nil {
+		postSwap()
+	}
 	var toReap []*segment
 	for i, s := range srcs {
 		if i > 0 {

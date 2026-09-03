@@ -219,11 +219,21 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// the archive its segment pruning until the next reindex.
 	dst.zones = src.zones
 	publishColNative(c, dst)
-	if !dst.columnarized() {
+	// Attach dst's key index + Bloom over its NEW offsets, from the same immutable bytes the deferred
+	// reindex would use (buildKeyIndex over the whole segment; the dict/col records it also scans never
+	// match a real key). Built here, before the swap, so columnarizeSealedSegment can PUBLISH it on dst
+	// the instant dst becomes visible -- closing the window in which dst was reachable with keyIdx==nil,
+	// where lookupSealed missed a record a scan could still see (put/del could not supersede it -> a
+	// duplicate live version, and DeleteWhere never converged). dst is not yet visible, so storing it now
+	// is safe; the publish/evict under the swap lock is what makes it authoritative.
+	ki, kerr := parseKeyIndex(buildKeyIndex(dst.data, dst.used, c.h))
+	if !dst.columnarized() || kerr != nil {
 		dst.retire()
 		dst.reapAndHook()
-		return nil, nil, nil // the payload did not read back: refuse rather than ship a lossy segment
+		return nil, nil, nil // the payload did not read back (or its key index would not parse): refuse
 	}
+	dst.keyIdx.Store(ki)
+	dst.keyBloom.Store(bloomFromKeyIndex(ki))
 	return dst, srcOffs, newOffs
 }
 
@@ -334,12 +344,52 @@ func (c *Collection) columnarizeSealedSegment(sh *shard, src *segment, s *adSche
 			}
 		}
 	}
-	if !c.commitSegmentRewrite(sh, []*segment{src}, dst, reconcile) {
+	// Reconcile by-key resolution to the new offsets in the SAME critical section as the swap. dst
+	// already carries the key index/Bloom (columnarizeSegment attached them), so lookupSealed can find
+	// dst's records the moment the swap makes it visible; here, still under the swap lock, evict every
+	// directory entry whose current record lives in dst so findCurrent cannot return an old, now-stale
+	// offset for one of dst's keys -- those keys then resolve through the key index instead. dst.id is
+	// set by the swap that immediately precedes this, which evictSegKeys needs.
+	postSwap := func() {
+		sh.evictSegKeys(dst)
+	}
+	if !c.commitSegmentRewrite(sh, []*segment{src}, dst, reconcile, postSwap) {
 		return false // commitSegmentRewrite already discarded the staged file
 	}
+	// Persist dst's sidecar (key index, and the attribute index when one is configured) now that the
+	// swap has named its file. This is deliberately not left to reindexAfterCompaction: dst now carries
+	// an in-RAM key index, and sealSegmentIndex/sealAndEvictShard short-circuit on a set keyIdx, so the
+	// deferred path would never write the file. installSidecar STORES (not CAS) the key index, so it
+	// cleanly upgrades the in-RAM index to the file-backed one; on any I/O error dst keeps its in-RAM
+	// index (still correct) and is simply rebuilt on the next open. The zone map and columnar block are
+	// carried over unchanged (colBlobForSeg declines for a segment that holds its own block).
+	c.persistColumnarizedSidecar(sh, dst)
 	columnarizedSegments.Add(1)
 	columnarizedBytesSaved.Add(int64(src.used) - int64(dst.used))
 	return true
+}
+
+// persistColumnarizedSidecar writes the just-swapped columnar segment's sidecar container and swaps
+// the file-backed key index (plus an attribute index when the collection has a spec) in over the
+// in-RAM one published at commit. Best-effort and off the shard lock (installSidecar takes it for the
+// publish): on any failure dst keeps its in-RAM key index, so by-key resolution stays correct and the
+// only cost is rebuilding the sidecar on the next open.
+func (c *Collection) persistColumnarizedSidecar(sh *shard, dst *segment) {
+	path := snapshotPath(dst)
+	if path == "" {
+		return
+	}
+	var attrBlob []byte
+	if c.spec.Load().any() {
+		if si := buildSegIndex(c, dst, dst.used, c.spec.Load()); si != nil {
+			if b, e := buildSidecarIndex(si); e == nil {
+				attrBlob = b
+			}
+		}
+	}
+	container := buildSegmentSidecar(attrBlob, buildKeyIndex(dst.data, dst.used, c.h),
+		c.colBlobForSeg(dst), buildZoneBlob(dst.zones), dst.used, dst.dictRecOff())
+	c.installSidecar(sh, dst, path, container)
 }
 
 // columnarizeSealed rewrites every eligible sealed segment into columnar form and returns how many
