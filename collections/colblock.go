@@ -499,6 +499,67 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 // a question the base row can no longer answer (see buildGroupBlocks). The retained wire is bounded
 // by the same group budget that bounds the pending rows.
 func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
+	var buf []byte
+	for off := 0; off < upto; {
+		o := uint32(off)
+		total := recTotalLen(data, o)
+		if total == 0 {
+			break
+		}
+		if !recIsMarker(data, o) {
+			if w, err := arenaCodec.Decompress(buf[:0], recAd(data, o)); err == nil {
+				buf = w
+				cb.feed(o, w)
+			}
+		}
+		off += int(total)
+	}
+	return cb.finish()
+}
+
+// buildColumnarFromWires builds the same blocks/group-blocks/offsets as
+// buildColumnarFromSegmentGrouped, but from records already DECOMPRESSED into full wire ads (fulls)
+// carrying their source arena offsets (offs). It is the re-columnarize entry point: an already-
+// columnarized segment's records are remnants, so its full ads are reconstructed (remnant spliced
+// with the existing columns) before being re-split under a new group set. Sharing colBuild keeps the
+// block/group/offset logic byte-for-byte identical with the from-data path.
+func buildColumnarFromWires(offs []uint32, fulls [][]byte, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
+	for i, w := range fulls {
+		cb.feed(offs[i], w)
+	}
+	return cb.finish()
+}
+
+// colBuild accumulates a segment's columnar blocks and group blocks as records are fed to it in
+// order. Extracted from buildColumnarFromSegmentGrouped so the from-data build and the
+// re-columnarize-from-reconstructed-wires build share one implementation of the block sealing,
+// group membership and offset bookkeeping.
+type colBuild struct {
+	s            *adSchema
+	groups       []*colGroup
+	g            colGrouping
+	regionCodec  Codec
+	toInterned   func(dst, w []byte) ([]byte, bool)
+	toLocal      func(uint32) (uint32, bool)
+	coldToField  map[uint32]int
+	rm           *idRemap
+	baseLayout   *colLayout
+	groupLayouts []*colLayout
+
+	blocks      []*columnarBlock
+	groupBlocks [][]*colGroupBlock
+	recs        [][]byte
+	iws         [][]byte
+	offs        []uint32
+	groupBytes  int
+	// The group's extent as of the last colGroupAlign boundary, so an over-budget group can be
+	// sealed there rather than past it. See sealAt.
+	alignedRows, alignedBytes int
+}
+
+func newColBuild(regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) *colBuild {
 	// The cold tail is keyed by the segment's dictionary when there is one, so the classifier and the
 	// readers have to speak the same id space. Both maps are derived from the schema once, rather than
 	// per record.
@@ -519,90 +580,81 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 	// schema shared by all of that group's blocks -- computed once here rather than per block.
 	baseLayout := resolveColLayout(s, hot)
 	groupLayouts := make([]*colLayout, len(groups))
-	for gi, g := range groups {
-		groupLayouts[gi] = resolveColLayout(g.schema, nil)
+	for gi, gg := range groups {
+		groupLayouts[gi] = resolveColLayout(gg.schema, nil)
 	}
-	var blocks []*columnarBlock
-	var groupBlocks [][]*colGroupBlock
-	var recs [][]byte
-	var iws [][]byte
-	var offs []uint32
-	var buf []byte
-	groupBytes := 0
-	// The group's extent as of the last colGroupAlign boundary, so an over-budget group can be sealed
-	// there rather than past it. See sealAt.
-	alignedRows, alignedBytes := 0, 0
-	for off := 0; off < upto; {
-		o := uint32(off)
-		total := recTotalLen(data, o)
-		if total == 0 {
-			break
-		}
-		if !recIsMarker(data, o) {
-			if w, err := arenaCodec.Decompress(buf[:0], recAd(data, o)); err == nil {
-				buf = w
-				if iw, ok := toInterned(nil, w); ok {
-					// A record that holds a whole group has those attributes stored by the
-					// group's column, so they are left out of the base row entirely rather
-					// than written to its cold tail as a second copy.
-					var skip map[uint32]struct{}
-					if len(groups) > 0 {
-						skip = groupSkipSet(groups, iw)
-					}
-					rec := s.encodeExceptLocal(wire.Ad(iw), skip, toLocal)
-					recs = append(recs, rec)
-					if len(groups) > 0 {
-						iws = append(iws, append([]byte(nil), iw...))
-					}
-					offs = append(offs, o)
-					groupBytes += len(rec)
-					if len(recs)%colGroupAlign == 0 {
-						alignedRows, alignedBytes = len(recs), groupBytes
-					}
-					if g.full(len(recs), groupBytes) {
-						seal, sealBytes := g.sealAt(len(recs), groupBytes, alignedRows, alignedBytes)
-						nb := encodeColumnarBlock(s, recs[:seal], baseLayout, regionCodec, coldToField)
-						nb.remap = rm
-						blocks = append(blocks, nb)
-						if len(groups) > 0 {
-							// Slice the retained wire at the SAME point, so a group's membership
-							// bitmap is indexed by the base block's own record numbering.
-							groupBlocks = append(groupBlocks, buildGroupBlocks(groups, groupLayouts, iws[:seal], regionCodec, toLocal))
-							setGroupRemap(groupBlocks[len(groupBlocks)-1], rm)
-							m := copy(iws, iws[seal:])
-							iws = iws[:m]
-						}
-						// Carry the records past the seal point into the next group. encodeColumnarBlock
-						// has already copied what it needs out of the record slices, so moving their
-						// headers down is safe; offs is per SEGMENT and is not reset.
-						n := copy(recs, recs[seal:])
-						recs, groupBytes = recs[:n], groupBytes-sealBytes
-						alignedRows, alignedBytes = 0, 0
-						if n > 0 && n%colGroupAlign == 0 {
-							alignedRows, alignedBytes = n, groupBytes
-						}
-					}
-				}
-			}
-		}
-		off += int(total)
+	return &colBuild{
+		s: s, groups: groups, g: g, regionCodec: regionCodec,
+		toInterned: toInterned, toLocal: toLocal,
+		coldToField: coldToField, rm: rm, baseLayout: baseLayout, groupLayouts: groupLayouts,
 	}
-	if len(recs) > 0 {
-		fb := encodeColumnarBlock(s, recs, baseLayout, regionCodec, coldToField) // short final group
-		fb.remap = rm
-		blocks = append(blocks, fb)
-		if len(groups) > 0 {
-			groupBlocks = append(groupBlocks, buildGroupBlocks(groups, groupLayouts, iws, regionCodec, toLocal))
-			setGroupRemap(groupBlocks[len(groupBlocks)-1], rm)
+}
+
+// feed processes one decompressed record wire w at source arena offset o.
+func (cb *colBuild) feed(o uint32, w []byte) {
+	iw, ok := cb.toInterned(nil, w)
+	if !ok {
+		return
+	}
+	// A record that holds a whole group has those attributes stored by the group's column, so they
+	// are left out of the base row entirely rather than written to its cold tail as a second copy.
+	var skip map[uint32]struct{}
+	if len(cb.groups) > 0 {
+		skip = groupSkipSet(cb.groups, iw)
+	}
+	rec := cb.s.encodeExceptLocal(wire.Ad(iw), skip, cb.toLocal)
+	cb.recs = append(cb.recs, rec)
+	if len(cb.groups) > 0 {
+		cb.iws = append(cb.iws, append([]byte(nil), iw...))
+	}
+	cb.offs = append(cb.offs, o)
+	cb.groupBytes += len(rec)
+	if len(cb.recs)%colGroupAlign == 0 {
+		cb.alignedRows, cb.alignedBytes = len(cb.recs), cb.groupBytes
+	}
+	if cb.g.full(len(cb.recs), cb.groupBytes) {
+		seal, sealBytes := cb.g.sealAt(len(cb.recs), cb.groupBytes, cb.alignedRows, cb.alignedBytes)
+		nb := encodeColumnarBlock(cb.s, cb.recs[:seal], cb.baseLayout, cb.regionCodec, cb.coldToField)
+		nb.remap = cb.rm
+		cb.blocks = append(cb.blocks, nb)
+		if len(cb.groups) > 0 {
+			// Slice the retained wire at the SAME point, so a group's membership bitmap is indexed
+			// by the base block's own record numbering.
+			cb.groupBlocks = append(cb.groupBlocks, buildGroupBlocks(cb.groups, cb.groupLayouts, cb.iws[:seal], cb.regionCodec, cb.toLocal))
+			setGroupRemap(cb.groupBlocks[len(cb.groupBlocks)-1], cb.rm)
+			m := copy(cb.iws, cb.iws[seal:])
+			cb.iws = cb.iws[:m]
+		}
+		// Carry the records past the seal point into the next group. encodeColumnarBlock has already
+		// copied what it needs out of the record slices, so moving their headers down is safe; offs
+		// is per SEGMENT and is not reset.
+		n := copy(cb.recs, cb.recs[seal:])
+		cb.recs, cb.groupBytes = cb.recs[:n], cb.groupBytes-sealBytes
+		cb.alignedRows, cb.alignedBytes = 0, 0
+		if n > 0 && n%colGroupAlign == 0 {
+			cb.alignedRows, cb.alignedBytes = n, cb.groupBytes
 		}
 	}
-	if len(blocks) == 0 {
+}
+
+// finish seals the trailing group and returns the accumulated blocks, group blocks and offsets.
+func (cb *colBuild) finish() ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+	if len(cb.recs) > 0 {
+		fb := encodeColumnarBlock(cb.s, cb.recs, cb.baseLayout, cb.regionCodec, cb.coldToField) // short final group
+		fb.remap = cb.rm
+		cb.blocks = append(cb.blocks, fb)
+		if len(cb.groups) > 0 {
+			cb.groupBlocks = append(cb.groupBlocks, buildGroupBlocks(cb.groups, cb.groupLayouts, cb.iws, cb.regionCodec, cb.toLocal))
+			setGroupRemap(cb.groupBlocks[len(cb.groupBlocks)-1], cb.rm)
+		}
+	}
+	if len(cb.blocks) == 0 {
 		// A segment with no encodable records still gets one empty block, so a colSegment always
 		// carries the schema it was built under (which persistence and the scan's field resolution
 		// both read from the first block).
-		blocks = append(blocks, encodeColumnarBlock(s, nil, baseLayout, regionCodec, coldToField))
+		cb.blocks = append(cb.blocks, encodeColumnarBlock(cb.s, nil, cb.baseLayout, cb.regionCodec, cb.coldToField))
 	}
-	return blocks, groupBlocks, offs
+	return cb.blocks, cb.groupBlocks, cb.offs
 }
 
 // numericZones computes each numeric field's [min,max] over the records being encoded, and whether

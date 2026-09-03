@@ -2,6 +2,7 @@ package collections
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -521,6 +522,74 @@ func topKCells(cands []cand, k int) int {
 		total += len(cands[i].ids) * cands[i].holder
 	}
 	return total
+}
+
+// groupSetNames returns each group's member set as a sorted, lowercased name key, so two group sets
+// can be compared by MEMBERSHIP regardless of order or of the intern-id numbering (which differs
+// between a freshly built payload and one reloaded from disk). A group whose ids do not all resolve
+// to names is keyed by whatever resolves; the comparison is only ever used between sets derived in
+// the same process against the same intern table, where resolution is total.
+func (c *Collection) groupSetNames(groups []*colGroup) map[string]struct{} {
+	out := make(map[string]struct{}, len(groups))
+	for _, g := range groups {
+		names := make([]string, 0, len(g.ids))
+		for _, id := range g.ids {
+			if n, ok := c.schemaFieldName(id); ok {
+				names = append(names, strings.ToLower(n))
+			}
+		}
+		sort.Strings(names)
+		out[strings.Join(names, "\x00")] = struct{}{}
+	}
+	return out
+}
+
+// sameGroupSet reports whether two group sets carry the same member sets, order-independent. This is
+// the gate on doing any work in the routine refresh: an unchanged set means the committed groups
+// still qualify and nothing is republished or re-columnarized.
+func (c *Collection) sameGroupSet(a, b []*colGroup) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	an, bn := c.groupSetNames(a), c.groupSetNames(b)
+	if len(an) != len(bn) {
+		return false
+	}
+	for k := range an {
+		if _, ok := bn[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// refreshGroupSchemas is the auto-promotion step of a routine maintenance refresh: it re-evaluates
+// the gate-qualified group set against the accumulated derivation history and, ONLY when that set
+// differs from the currently-committed one, adopts it -- republishing the schema-scan state (same
+// base schema and hot set, new groups) and bringing already-columnarized segments current under the
+// budget. A no-op when the set is unchanged (the common, steady state), so a stable table never
+// churns.
+//
+// This is what closes the gap that left groups frozen at their first-enable value: groupSchemasFor
+// runs at first enable, when the history is too short to qualify anything, and BuildAndEnableSchemaScan's
+// refresh path reused the same schema pointer so installSchemaScan never re-derived. Here the refresh
+// re-derives explicitly, so the qualified set is adopted as the history matures -- no restart and no
+// manual .schema rebuild.
+func (c *Collection) refreshGroupSchemas(st *schemaScanState) {
+	if c.groupSchemaCountOrDefault() <= 0 {
+		return // groups disabled: nothing to adopt or re-columnarize
+	}
+	next := c.groupSchemasFor(st.schema)
+	if c.sameGroupSet(st.groups, next) {
+		return // unchanged: keep the light refresh, do no new work
+	}
+	// Adopt the new set for FUTURE segments (ColumnarizeSealed and the sidecar cover both read
+	// st.groups) by republishing the state with the SAME base schema and hot tier. Keeping the schema
+	// pointer means CountQuery routing and existing blocks are undisturbed; only the group set moves.
+	c.schemaScan.Store(&schemaScanState{schema: st.schema, hot: st.hot, cache: st.cache, groups: next})
+	// Bring already-columnarized segments (built under the OLD group set) current, bounded by the
+	// columnar budget so a change converges over several passes rather than stalling one.
+	c.recolumnarizeStaleGroups(next)
 }
 
 // groupSchemaCountOrDefault resolves Options.GroupSchemaCount: 0 takes the default, negative

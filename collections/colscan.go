@@ -484,6 +484,13 @@ func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 	// silently demoting them to the brute-scan fallback. Re-schema-ing (with a full block
 	// rebuild) is a separate, heavier operation, not part of a routine maintenance refresh.
 	if st := c.schemaScan.Load(); st != nil {
+		// Auto-promote the group set as the stability history matures: re-derive the gate-qualified
+		// groups and, only when they differ from the committed set, adopt them and bring existing
+		// segments current. A no-op when unchanged, so a stable table's refresh stays exactly the
+		// light pass it was. This is the routine-maintenance counterpart to the group derivation
+		// that first-enable and ReschemaScan do -- without it the set froze at its first-enable
+		// value (empty, because the history was too short then) for the life of the process.
+		c.refreshGroupSchemas(st)
 		c.schemaScanPass(st.schema, st.hot)
 		return true
 	}
