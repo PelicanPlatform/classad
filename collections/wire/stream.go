@@ -74,7 +74,7 @@ func (s *StreamEncoder) begin(name string) (uint32, int) {
 // end records hot-header/count bookkeeping after a node has been written.
 func (s *StreamEncoder) end(id uint32, nodeStart int) {
 	if s.inline {
-		if _, ok := s.hotNames[foldASCII(s.curName)]; ok {
+		if inFolded(s.hotNames, s.curName) {
 			s.hots = append(s.hots, hotPair{nameHash32(s.curName), uint32(s.curEntryOff)})
 		}
 	} else if _, ok := s.hot[id]; ok {

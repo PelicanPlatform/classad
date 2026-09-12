@@ -115,6 +115,23 @@ func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64) ([]byte, 
 	return out, adCodec, dict, true
 }
 
+// hasAt reports whether key had a version live at snapshot s0. It is getAt's resolution
+// half with none of its payload work -- no record copy, no dictionary name cache, no
+// decode -- because presence is decided entirely by finding the location.
+func (sh *shard) hasAt(h uint64, key []byte, s0 uint64) bool {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	l, ok := sh.findVisible(sh.dirGet(h), key, s0)
+	if !ok {
+		if l, ok = sh.lookupSealedAt(key, h, s0); !ok {
+			return false
+		}
+	}
+	// Same guard getAt applies: a location from the sealed key index can name a segment
+	// that has since been rewritten, in which case the key is not readable here.
+	return sh.segForLoc(l) != nil
+}
+
 // conflictSince reports whether key was modified after snapshot s0 -- the write-
 // write conflict test. It walks the bucket chain (superseded versions are retained
 // until compaction) and reports a conflict if any record for the key was written
@@ -397,6 +414,21 @@ func (tx *Txn) getOwn(key []byte) (*classad.ClassAd, bool) {
 		return nil, false
 	}
 	return ad, true
+}
+
+// Has reports whether key exists as the transaction sees it, without reading the stored
+// record: it resolves the key to a live record location and stops there. Get is the wrong
+// tool for a presence question -- it copies the record bytes out from under the shard lock
+// and decodes them, and for a wide job ad that decode is the most expensive thing in an
+// ingest -- so a caller that only needs presence (a diagnostic counter, an upsert-vs-insert
+// branch) should ask here.
+func (tx *Txn) Has(key []byte) bool {
+	if b, ok := tx.writes[string(key)]; ok {
+		return b.live()
+	}
+	h := tx.c.h.Hash(key)
+	idx := tx.c.shardOf(key, h)
+	return tx.c.shards[idx].hasAt(h, key, tx.snapOf(idx))
 }
 
 // Put buffers an insert or update of key. Nothing is written until Commit.
