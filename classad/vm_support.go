@@ -142,8 +142,22 @@ func FoldConstants(e ast.Expr) ast.Expr {
 // an error value, matching the tree-walker's top-level entry points. Use it as
 // `defer classad.RecoverCyclic(&result)` around a bytecode run so a cyclic
 // reference resolves to error rather than crashing.
+//
+// This repeats recoverCyclic's body rather than calling it. recover() only
+// stops a panic when the deferred function calls it DIRECTLY, and recoverCyclic
+// cannot be inlined (the compiler refuses to inline any function calling
+// recover), so delegating left recover() one frame too deep and it returned
+// nil. Go <=1.25 papered over that; 1.26 does not, which turned every cyclic or
+// over-deep expression reaching a vm entry point into a process-killing panic
+// instead of an error value.
 func RecoverCyclic(result *Value) {
-	recoverCyclic(result)
+	if r := recover(); r != nil {
+		if _, ok := r.(cyclicEvalError); ok {
+			*result = NewErrorValue()
+			return
+		}
+		panic(r)
+	}
 }
 
 // CompareStringsFold compares two strings the way every ClassAd string comparison operator does:
