@@ -334,9 +334,38 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	// non-"*" aggregate arguments), so the scan reads them wire-native instead of
 	// fully decoding every matching ad.
 	attrs, groupCol, aggCol := db.AggProjection(groupCols, aggs)
-	d, ok := s.tableOr(reqID, table, write)
+
+	// A name resolves to whatever table it names, archives included.
+	//
+	// The read opcodes already work this way -- QueryRawProject on an
+	// archive answers from the archive (see streamQueryRawProject) -- so
+	// a caller who has been reading a history table by name reasonably
+	// expects to aggregate it by name too. Before this, that one call
+	// answered "no such table" while every other read of the same name
+	// succeeded, which is not a difference anything in the API surface
+	// suggests. It cost a downstream caller a feature that failed only
+	// in production: the tests built a mutable table of the same name,
+	// where the call works.
+	//
+	// The archive engine reduces through the same db aggregate code as
+	// the mutable path, so the answer is identical -- this is a
+	// dispatch fix, not a second implementation.
+	d, ok := s.cat.Table(table)
 	if !ok {
-		return
+		if d, ok = s.cat.ViewBacking(table); !ok {
+			if a, isArchive := s.cat.ArchiveTable(table); isArchive {
+				rows, aerr := a.AggregateCols(constraint, groupCols, aggs)
+				if aerr != nil {
+					write(respErr(reqID, aerr.Error()))
+					return
+				}
+				// writeAggRows terminates the stream itself.
+				writeAggRows(reqID, rows, write)
+				return
+			}
+			write(respErr(reqID, "no such table: "+table))
+			return
+		}
 	}
 
 	// Fast path: an unconstrained COUNT(*) with no grouping is the collection's live row

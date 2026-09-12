@@ -3,6 +3,7 @@ package dbrpc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/db"
@@ -204,5 +205,114 @@ func TestArchiveAggregateOverRPC(t *testing.T) {
 		if got := r.Values[0]; got != fmt.Sprint(wantCounts[r.Group[0]]) {
 			t.Errorf("group %q count = %s, want %d", r.Group[0], got, wantCounts[r.Group[0]])
 		}
+	}
+}
+
+// A table name resolves to whatever table it names, archives included.
+//
+// The read opcodes already worked this way -- QueryRawProject on an
+// archive answers from the archive -- while AggregateTable on the same
+// name answered "no such table". Nothing in the API surface suggests
+// that split, and it is invisible until the aggregate is the one call a
+// caller happens to make: a downstream feature shipped broken because
+// its tests built a mutable table of the same name, where the call
+// works, and production had an archive, where it did not.
+func TestAggregateTableReachesAnArchive(t *testing.T) {
+	c, cleanup := catServerPair(t, ServeOptions{})
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := c.CreateArchiveTable(ctx, "history", db.ArchiveConfig{
+		ValueAttrs: []string{"ExitCode"},
+		ZoneAttrs:  []string{"CompletionDate"},
+	}); err != nil {
+		t.Fatalf("CreateArchiveTable: %v", err)
+	}
+	for i, code := range []int{0, 0, 1, 1, 1, 127} {
+		if err := c.ArchiveAppend(ctx, "history",
+			fmt.Sprintf("ClusterId = %d\nExitCode = %d\nCompletionDate = %d", i, code, 1700000000+i)); err != nil {
+			t.Fatalf("ArchiveAppend: %v", err)
+		}
+	}
+
+	// The call that used to fail, through the plain table opcode.
+	rows, err := c.AggregateTable(ctx, "history", "true",
+		[]string{"ExitCode"}, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatalf("AggregateTable on an archive: %v", err)
+	}
+
+	got := map[string]string{}
+	for _, r := range rows {
+		if len(r.Group) != 1 || len(r.Values) != 1 {
+			t.Fatalf("malformed row %+v", r)
+		}
+		got[r.Group[0]] = r.Values[0]
+	}
+	want := map[string]string{"0": "2", "1": "3", "127": "1"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for k, v := range want {
+		if got[k] != v {
+			t.Errorf("exit %s: count %s, want %s", k, got[k], v)
+		}
+	}
+
+	// And identical to what the archive opcode returns, because it is
+	// the same reduction -- this is a dispatch fix, not a second
+	// implementation.
+	viaArchive, err := c.ArchiveAggregate(ctx, "history", "true",
+		[]string{"ExitCode"}, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatalf("ArchiveAggregate: %v", err)
+	}
+	if len(viaArchive) != len(rows) {
+		t.Errorf("table opcode returned %d groups, archive opcode %d", len(rows), len(viaArchive))
+	}
+}
+
+// A constrained aggregate has to narrow the archive, not ignore the
+// constraint: a drill-down that silently returns everything is worse
+// than one that errors.
+func TestAggregateTableOnAnArchiveHonoursTheConstraint(t *testing.T) {
+	c, cleanup := catServerPair(t, ServeOptions{})
+	defer cleanup()
+	ctx := context.Background()
+
+	if err := c.CreateArchiveTable(ctx, "history", db.ArchiveConfig{
+		ZoneAttrs: []string{"CompletionDate"},
+	}); err != nil {
+		t.Fatalf("CreateArchiveTable: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := c.ArchiveAppend(ctx, "history",
+			fmt.Sprintf("ClusterId = %d\nCompletionDate = %d", i, 1700000000+i)); err != nil {
+			t.Fatalf("ArchiveAppend: %v", err)
+		}
+	}
+
+	rows, err := c.AggregateTable(ctx, "history", "CompletionDate >= 1700000007",
+		nil, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err != nil {
+		t.Fatalf("AggregateTable: %v", err)
+	}
+	if len(rows) != 1 || rows[0].Values[0] != "3" {
+		t.Errorf("constrained count = %+v, want a single group of 3", rows)
+	}
+}
+
+// A name that is neither still says so.
+func TestAggregateTableStillRefusesAnUnknownName(t *testing.T) {
+	c, cleanup := catServerPair(t, ServeOptions{})
+	defer cleanup()
+
+	_, err := c.AggregateTable(context.Background(), "nosuchthing", "true",
+		nil, []AggSpec{{Func: AggCount, Arg: "*"}})
+	if err == nil {
+		t.Fatal("aggregating a table that does not exist returned no error")
+	}
+	if !strings.Contains(err.Error(), "no such table") {
+		t.Errorf("error is %q, want it to name the missing table", err)
 	}
 }
