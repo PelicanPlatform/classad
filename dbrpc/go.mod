@@ -1,6 +1,6 @@
 module github.com/PelicanPlatform/classad/dbrpc
 
-go 1.25.0
+go 1.26.0
 
 require (
 	github.com/PelicanPlatform/classad v0.7.0
