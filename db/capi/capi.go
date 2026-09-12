@@ -17,6 +17,11 @@ package main
 
 /*
 #include <stdlib.h>
+// uintptr_t. Every cgo file needs its own includes -- the preamble is
+// per-file, not per-package -- and on macOS stdlib.h happens to pull
+// this in while glibc does not, so omitting it builds locally and fails
+// on Linux with "could not determine what C.uintptr_t refers to".
+#include <stdint.h>
 */
 import "C"
 
