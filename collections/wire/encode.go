@@ -63,7 +63,8 @@ func EncodeWithHotClosure(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[u
 	}
 	// Write the entries (id, node)* into a scratch buffer, recording the
 	// entries-relative offset of each hot attribute's node.
-	e := encoder{t: t}
+	e := encoder{t: t, buf: getScratch()}
+	defer func() { putScratch(e.buf) }()
 	var hots []hotPair
 	for _, attr := range ad.Attributes {
 		id := t.Intern(attr.Name)
@@ -74,15 +75,7 @@ func EncodeWithHotClosure(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[u
 			hots = append(hots, hotPair{id, uint32(nodeOff)})
 		}
 	}
-	out := append(dst, magicByte, formatVer, extraFlags)
-	out = binary.AppendUvarint(out, uint64(len(hots)))
-	for _, h := range hots {
-		out = binary.AppendUvarint(out, uint64(h.id))
-		out = binary.AppendUvarint(out, uint64(h.off))
-	}
-	out = binary.AppendUvarint(out, uint64(len(ad.Attributes))) // attrCount
-	out = append(out, e.buf...)                                 // entries region
-	return out
+	return frame(dst, extraFlags, hots, len(ad.Attributes), e.buf)
 }
 
 // EncodeInline encodes ad with inline attribute names (no interning), producing a
@@ -105,7 +98,8 @@ func EncodeWithHotEnc(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint3
 	if ad == nil {
 		return Encode(dst, ad, t)
 	}
-	e := encoder{t: t, seal: seal}
+	e := encoder{t: t, seal: seal, buf: getScratch()}
+	defer func() { putScratch(e.buf) }()
 	var hots []hotPair
 	for _, attr := range ad.Attributes {
 		id := t.Intern(attr.Name)
@@ -120,15 +114,7 @@ func EncodeWithHotEnc(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint3
 			hots = append(hots, hotPair{id, uint32(nodeOff)})
 		}
 	}
-	out := append(dst, magicByte, formatVer, 0 /* flags */)
-	out = binary.AppendUvarint(out, uint64(len(hots)))
-	for _, h := range hots {
-		out = binary.AppendUvarint(out, uint64(h.id))
-		out = binary.AppendUvarint(out, uint64(h.off))
-	}
-	out = binary.AppendUvarint(out, uint64(len(ad.Attributes))) // attrCount
-	out = append(out, e.buf...)                                 // entries region
-	return out
+	return frame(dst, 0 /* flags */, hots, len(ad.Attributes), e.buf)
 }
 
 func EncodeInlineWithHot(dst []byte, ad *ast.ClassAd, hot map[string]struct{}) []byte {
@@ -143,7 +129,8 @@ func EncodeInlineWithHot(dst []byte, ad *ast.ClassAd, hot map[string]struct{}) [
 // index/match fast path, so it is excluded from the hot header even if listed in hot.
 // encrypt and seal must both be non-nil to encrypt anything.
 func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
-	e := encoder{inline: true, seal: seal}
+	e := encoder{inline: true, seal: seal, buf: getScratch()}
+	defer func() { putScratch(e.buf) }()
 	var hots []hotPair
 	if ad != nil {
 		// Hot entries are written FIRST, so the hot region occupies a physical
@@ -155,8 +142,7 @@ func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}
 			if seal != nil && encrypt != nil && encrypt(attr.Name) {
 				return false // encrypted attributes are never indexed / hot
 			}
-			_, ok := hot[foldASCII(attr.Name)]
-			return ok
+			return inFolded(hot, attr.Name)
 		}
 		for _, attr := range ad.Attributes {
 			if !isHot(attr) {
@@ -179,19 +165,38 @@ func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}
 			e.node(attr.Value)
 		}
 	}
-	out := append(dst, magicByte, formatVer, flagInlineNames)
-	out = binary.AppendUvarint(out, uint64(len(hots)))
-	for _, h := range hots {
-		out = binary.AppendUvarint(out, uint64(h.id)) // nameHash32
-		out = binary.AppendUvarint(out, uint64(h.off))
-	}
 	n := 0
 	if ad != nil {
 		n = len(ad.Attributes)
 	}
-	out = binary.AppendUvarint(out, uint64(n)) // attrCount
-	out = append(out, e.buf...)                // entries region
-	return out
+	return frame(dst, flagInlineNames, hots, n, e.buf)
+}
+
+// inFolded reports whether set (keyed by foldASCII'd names) contains name, without
+// allocating the folded form. foldASCII allocates twice for any name carrying an
+// uppercase letter -- i.e. for essentially every ClassAd attribute -- and this lookup
+// runs once per attribute per encode, so the folded key is built in a stack buffer and
+// handed to the map lookup as a []byte->string conversion the compiler does not
+// materialize. A name longer than the buffer falls back to the allocating form.
+func inFolded(set map[string]struct{}, name string) bool {
+	if len(set) == 0 {
+		return false
+	}
+	var buf [96]byte
+	if len(name) > len(buf) {
+		_, ok := set[foldASCII(name)]
+		return ok
+	}
+	b := buf[:len(name)]
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b[i] = c
+	}
+	_, ok := set[string(b)]
+	return ok
 }
 
 // foldASCII lower-cases ASCII letters in s (attribute names are case-insensitive).

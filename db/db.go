@@ -953,6 +953,14 @@ func (t *Txn) LookupClassAd(key string) (*classad.ClassAd, bool) {
 	return t.tx.Get([]byte(key))
 }
 
+// Has reports whether key exists as the transaction sees it (its own buffered writes over
+// the snapshot, exactly as LookupClassAd does) without decoding the stored record. Use it
+// wherever only presence matters: LookupClassAd's decode of a wide ad dominates the cost of
+// an ingest that asks the question once per operation.
+func (t *Txn) Has(key string) bool {
+	return t.tx.Has([]byte(key))
+}
+
 // Query returns the ads matching the constraint as the transaction sees them: the
 // committed rows with the transaction's own buffered writes overlaid, so a query inside
 // a transaction observes work the transaction has not committed yet. DB.Query cannot --

@@ -8,8 +8,9 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"sort"
+	"slices"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/parser"
@@ -190,6 +191,53 @@ func normalizeName(name string) string {
 	return strings.ToLower(name)
 }
 
+// foldCompare orders two attribute names exactly as their normalizeName forms compare,
+// without allocating. The sort comparators below ran normalizeName on both operands of
+// every comparison -- and strings.ToLower allocates whenever a name contains an uppercase
+// letter, which for CamelCase ClassAd attributes is essentially always -- so sorting one
+// ad's attributes allocated O(n log n) throwaway strings. Ordering does not need the
+// lowered string, only the comparison, so fold a byte at a time instead.
+//
+// The ASCII path is exact; a non-ASCII byte anywhere that could affect the result defers
+// to the reference normalization, because Unicode lowercasing is not length-preserving
+// (U+0130 lowers to two runes) and a byte-wise fold would order such names differently.
+func foldCompare(a, b string) int {
+	n := len(a)
+	if len(b) < n {
+		n = len(b)
+	}
+	for i := 0; i < n; i++ {
+		ca, cb := a[i], b[i]
+		if ca >= utf8.RuneSelf || cb >= utf8.RuneSelf {
+			return strings.Compare(normalizeName(a), normalizeName(b))
+		}
+		if 'A' <= ca && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if 'A' <= cb && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			if ca < cb {
+				return -1
+			}
+			return 1
+		}
+	}
+	// The shared prefix folds equal, so only the longer name's tail can decide. Pure ASCII
+	// there means the shorter name sorts first; anything else goes to the reference path.
+	tail := a[n:]
+	if len(b) > n {
+		tail = b[n:]
+	}
+	for i := 0; i < len(tail); i++ {
+		if tail[i] >= utf8.RuneSelf {
+			return strings.Compare(normalizeName(a), normalizeName(b))
+		}
+	}
+	return len(a) - len(b)
+}
+
 // dedupAttributes collapses duplicate attribute names, keeping each name's
 // last assignment, matching the reference engine -- a ClassAd is a map there,
 // so a later "x = ..." overwrites an earlier one ([B=1;B=2] has B==2). The
@@ -272,16 +320,15 @@ func (c *ClassAd) ensureSorted() {
 		return
 	}
 
-	sort.SliceStable(c.ad.Attributes, func(i, j int) bool {
-		iName := normalizeName(c.ad.Attributes[i].Name)
-		jName := normalizeName(c.ad.Attributes[j].Name)
-		if iName == jName {
-			return c.ad.Attributes[i].Name < c.ad.Attributes[j].Name
-		}
-		return iName < jName
-	})
+	sortAttributeAssignments(c.ad.Attributes)
 	c.attrsDirty = false
-	c.rebuildIndex()
+	// Only ensure the index EXISTS -- do not rebuild it. ast.ClassAd.Attributes is a slice
+	// of POINTERS, and the index holds &assignment.Value, so reordering the slice does not
+	// move anything the index points at. The three mutators that mark the ad dirty (Insert,
+	// InsertListElement, Delete) each maintain the index as they go, so it is already
+	// correct here. Rebuilding it anyway re-folded every attribute name -- an allocation
+	// apiece -- and refilled the whole map, on every commit of a modified ad.
+	c.ensureIndex()
 }
 
 func (c *ClassAd) markDirty() {
@@ -1729,13 +1776,14 @@ func (c *ClassAd) UnmarshalJSON(data []byte) error {
 // sortAttributeAssignments provides deterministic ordering by case-insensitive name with
 // a secondary case-sensitive tie-breaker to preserve stable behavior.
 func sortAttributeAssignments(attrs []*ast.AttributeAssignment) {
-	sort.SliceStable(attrs, func(i, j int) bool {
-		iName := normalizeName(attrs[i].Name)
-		jName := normalizeName(attrs[j].Name)
-		if iName == jName {
-			return attrs[i].Name < attrs[j].Name
+	// slices.SortStableFunc over the concrete slice, not sort.SliceStable: the latter
+	// swaps through reflect, which on an already-near-sorted ad costs more than the
+	// comparisons do.
+	slices.SortStableFunc(attrs, func(x, y *ast.AttributeAssignment) int {
+		if c := foldCompare(x.Name, y.Name); c != 0 {
+			return c
 		}
-		return iName < jName
+		return strings.Compare(x.Name, y.Name)
 	})
 }
 
