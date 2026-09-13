@@ -6,7 +6,7 @@ require (
 	github.com/PelicanPlatform/classad v0.7.0
 	github.com/PelicanPlatform/classad/collections v0.7.0
 	github.com/PelicanPlatform/classad/db v0.7.1
-	github.com/bbockelm/cedar v0.5.3
+	github.com/bbockelm/cedar v0.6.15
 )
 
 require (
@@ -26,5 +26,3 @@ replace github.com/PelicanPlatform/classad => ../
 replace github.com/PelicanPlatform/classad/collections => ../collections
 
 replace github.com/PelicanPlatform/classad/db => ../db
-
-replace github.com/bbockelm/cedar => ../../golang-cedar
