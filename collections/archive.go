@@ -358,6 +358,13 @@ func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent
 	return a.c.Watch(ctx, cursor)
 }
 
+// WatchCursor returns an opaque cursor at the current head of the archive's change log,
+// so a following Watch streams only subsequent appends rather than replaying what is
+// retained. See Collection.WatchCursor.
+func (a *Archive) WatchCursor() ([]byte, error) {
+	return a.c.WatchCursor()
+}
+
 // ExplainQuery reports how the archive would execute q -- which conjuncts are index-usable
 // and the resulting access path -- as Collection.ExplainQuery does for a mutable table.
 //
