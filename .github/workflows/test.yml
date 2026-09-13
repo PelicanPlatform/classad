@@ -157,9 +157,8 @@ jobs:
   # because no CI had ever pointed the race detector at this module.
   #
   # Both suites are small -- seconds to a minute or so with -race -- so
-  # they run unsharded and together. dbrpc/ is the remaining gap and is
-  # too slow to join them; it needs the sharded treatment collections
-  # has.
+  # they run unsharded and together. dbrpc/ is far slower and gets its
+  # own sharded job below, for the same reason collections does.
   modules:
     name: Module (${{ matrix.module }})
     runs-on: ubuntu-latest
@@ -168,6 +167,24 @@ jobs:
       fail-fast: false
       matrix:
         module: [db, changefeed]
+  # dbrpc/ is a separate Go module, and the root module's `go test ./...` does not
+  # descend into a nested one -- so the RPC server for the whole database ran in NO CI
+  # job at all. A dispatch bug lived there long enough to ship a broken feature
+  # downstream: AggregateTable refused an archive table while every other read of the
+  # same name accepted one (#242).
+  #
+  # SHARDED because the suite is ~22 minutes under -race and its cost is concentrated:
+  # two tests that build multi-segment archives are 73% of it. Three shards put those in
+  # separate jobs, which is all sharding can buy here -- the floor is the slowest single
+  # test (~500s), so a fourth shard would idle. See dbrpc/shard-test.sh.
+  dbrpc:
+    name: dbrpc shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    strategy:
+      # Every shard reports: one shard failing must not hide a second failure elsewhere.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2]
 
     steps:
     - name: Check out code
@@ -191,6 +208,8 @@ jobs:
     # Every one of these modules replaces github.com/PelicanPlatform/classad
     # with ../, so they build against the root module in this checkout --
     # which has no parser until goyacc has run.
+    # dbrpc replaces github.com/PelicanPlatform/classad with ../, so it builds against
+    # the root module in this checkout -- which has no parser until goyacc has run.
     - name: Generate parser
       run: |
         export PATH=$PATH:$(go env GOPATH)/bin
@@ -198,6 +217,7 @@ jobs:
 
     - name: Build and vet
       working-directory: ${{ matrix.module }}
+      working-directory: dbrpc
       run: |
         go mod download
         go build ./...
@@ -206,6 +226,29 @@ jobs:
     - name: Test (race detector)
       working-directory: ${{ matrix.module }}
       run: go test -race -count=1 ./...
+      working-directory: dbrpc
+      env:
+        SHARD: ${{ matrix.shard }}
+        SHARDS: 3
+      run: ./shard-test.sh
+
+  # One check for the whole sharded suite, so a required status check (and anyone reading
+  # the PR) has a single "dbrpc module" result rather than three. Without it, adding or
+  # removing a shard silently changes which checks exist.
+  dbrpc-result:
+    name: dbrpc module
+    needs: dbrpc
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check shard results
+      env:
+        RESULT: ${{ needs.dbrpc.result }}
+      run: |
+        echo "shards: $RESULT"
+        # 'success' only when every matrix job succeeded; skipped/cancelled count as
+        # failure here, because a suite that did not run is not a suite that passed.
+        [ "$RESULT" = "success" ] || exit 1
 
   lint:
     name: Lint
