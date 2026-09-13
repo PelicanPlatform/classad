@@ -73,7 +73,7 @@ func Unmarshal(data string, v interface{}) error {
 // marshalValue converts a Go reflect.Value to an AST expression
 func marshalValue(val reflect.Value) (ast.Expr, error) {
 	// Handle pointers - check for special types first
-	if val.Kind() == reflect.Ptr {
+	if val.Kind() == reflect.Pointer {
 		if val.IsNil() {
 			return &ast.UndefinedLiteral{}, nil
 		}
@@ -198,7 +198,7 @@ func marshalStruct(val reflect.Value) (ast.Expr, error) {
 // unmarshalInto unmarshals a ClassAd into a Go value
 func unmarshalInto(ad *ClassAd, v interface{}) error {
 	val := reflect.ValueOf(v)
-	if val.Kind() != reflect.Ptr {
+	if val.Kind() != reflect.Pointer {
 		return fmt.Errorf("unmarshal target must be a pointer, got %v", val.Type())
 	}
 	if val.IsNil() {
@@ -215,7 +215,7 @@ func unmarshalValue(node *ast.ClassAd, val reflect.Value) error {
 	}
 
 	// Handle pointers
-	if val.Kind() == reflect.Ptr {
+	if val.Kind() == reflect.Pointer {
 		if val.IsNil() {
 			val.Set(reflect.New(val.Type().Elem()))
 		}
@@ -314,7 +314,7 @@ func unmarshalMap(node *ast.ClassAd, val reflect.Value) error {
 // unmarshalValueInto unmarshals a Value into a reflect.Value
 func unmarshalValueInto(result Value, val reflect.Value) error {
 	// Handle pointers - check for special types first
-	if val.Kind() == reflect.Ptr {
+	if val.Kind() == reflect.Pointer {
 		// Check if target is *ClassAd
 		if val.Type() == reflect.TypeOf((*ClassAd)(nil)) {
 			if result.IsClassAd() {
@@ -586,7 +586,7 @@ func isEmptyValue(v reflect.Value) bool {
 		return v.Uint() == 0
 	case reflect.Float32, reflect.Float64:
 		return v.Float() == 0
-	case reflect.Interface, reflect.Ptr:
+	case reflect.Interface, reflect.Pointer:
 		return v.IsNil()
 	}
 	return false
