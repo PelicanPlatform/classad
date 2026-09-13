@@ -486,15 +486,21 @@ func (c *ClassAd) Insert(name string, expr ast.Expr) {
 		c.ad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
 	}
 	c.ensureIndex()
-	c.markDirty()
 
 	normalized := normalizeName(name)
 	if ptr, ok := c.index[normalized]; ok {
+		// Replacing an existing attribute's VALUE, in place. The attribute set is unchanged,
+		// so a sorted ad is still sorted -- do not mark it dirty. This is the overwhelmingly
+		// common write on a live job: an update to LastJobLeaseRenewal or MemoryUsage names an
+		// attribute the ad already has, and marking dirty here made every one of them force a
+		// full re-sort of the whole ad that could not reorder anything. An ad that is ALREADY
+		// dirty stays dirty; this only declines to set the flag, never clears it.
 		*ptr = expr
 		return
 	}
 
-	// Add new attribute
+	// A new attribute name is appended, which can put the ad out of order.
+	c.markDirty()
 	c.ad.Attributes = append(c.ad.Attributes, &ast.AttributeAssignment{
 		Name:  name,
 		Value: expr,
