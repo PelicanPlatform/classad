@@ -633,6 +633,11 @@ func (t *ArchiveTable) Watch(ctx context.Context, cursor []byte) (iter.Seq[Watch
 	}, nil
 }
 
+// WatchCursor returns an opaque cursor at the current head of the archive's change log.
+// Watch(cursor) then streams only what is appended after it, which is how a client tails
+// an archive without first replaying everything rotation still retains.
+func (t *ArchiveTable) WatchCursor() ([]byte, error) { return t.a.WatchCursor() }
+
 // Truncate drops every record, resetting the archive to empty in place (see
 // collections.Archive.Truncate). It is the destructive reset behind a from-scratch history
 // re-sync: empty the table, then re-ingest from the source. The persisted config (indexes,

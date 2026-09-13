@@ -1012,11 +1012,23 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		if r.err != nil {
 			return respBad(reqID)
 		}
-		d, ok := s.cat.Table(table)
-		if !ok {
+		// Resolved the same way streamWatch resolves a watch: a mutable table, a
+		// materialized-view backing, or an append-only archive. Without the last two,
+		// a client could watch an archive but not ask where its head is -- so the
+		// "tail from now" path was unreachable for exactly the tables whose replay is
+		// most expensive, and the failure surfaced as "no such table" for a table the
+		// very next op would happily stream.
+		var cursor []byte
+		var err error
+		if d, ok := s.cat.Table(table); ok {
+			cursor, err = d.WatchCursor()
+		} else if d, ok := s.cat.ViewBacking(table); ok {
+			cursor, err = d.WatchCursor()
+		} else if a, ok := s.cat.ArchiveTable(table); ok {
+			cursor, err = a.WatchCursor()
+		} else {
 			return respErr(reqID, "no such table: "+table)
 		}
-		cursor, err := d.WatchCursor()
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
