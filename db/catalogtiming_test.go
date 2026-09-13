@@ -30,11 +30,18 @@ func TestCatalogOnOpenStepReportsEachTable(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Guarded: the catalog opens tables concurrently, so OnOpenStep is
+	// called from several goroutines at once and two plain maps are a
+	// data race. It went unnoticed because this module runs in no CI
+	// job -- nothing had ever pointed the race detector at it.
+	var stepMu sync.Mutex
 	seen := map[string]time.Duration{}
 	kinds := map[string]string{}
 	reopened, err := OpenCatalogConfig(CatalogConfig{
 		Dir: dir,
 		OnOpenStep: func(kind, name string, d time.Duration) {
+			stepMu.Lock()
+			defer stepMu.Unlock()
 			seen[name] = d
 			kinds[name] = kind
 		},

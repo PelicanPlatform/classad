@@ -144,6 +144,69 @@ jobs:
         # here, because a suite that did not run is not a suite that passed.
         [ "$RESULT" = "success" ] || exit 1
 
+  # db/ and changefeed/ are separate Go modules, and the root module's
+  # `go test ./...` does not descend into a nested one -- the same reason
+  # collections/ has its own job above. They had neither, so the database
+  # engine and the change-feed toolkit ran in NO CI job at all: every
+  # commit to them was merged on the strength of whatever the author ran
+  # locally.
+  #
+  # What that cost, concretely: db's catalog-timing test wrote two plain
+  # maps from OnOpenStep, which the catalog calls concurrently. A real
+  # data race, in the tree long enough to be unremarkable, and invisible
+  # because no CI had ever pointed the race detector at this module.
+  #
+  # Both suites are small -- seconds to a minute or so with -race -- so
+  # they run unsharded and together. dbrpc/ is the remaining gap and is
+  # too slow to join them; it needs the sharded treatment collections
+  # has.
+  modules:
+    name: Module (${{ matrix.module }})
+    runs-on: ubuntu-latest
+    strategy:
+      # Each module reports: one failing must not hide a failure in the other.
+      fail-fast: false
+      matrix:
+        module: [db, changefeed]
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: '1.25'
+
+    - name: Install goyacc
+      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
+      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
+      # the automatic toolchain switch. Override to auto for this build-tool install
+      # only -- the parser generator may build with a newer Go; the tests below still
+      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+      env:
+        GOTOOLCHAIN: auto
+      run: go install golang.org/x/tools/cmd/goyacc@latest
+
+    # Every one of these modules replaces github.com/PelicanPlatform/classad
+    # with ../, so they build against the root module in this checkout --
+    # which has no parser until goyacc has run.
+    - name: Generate parser
+      run: |
+        export PATH=$PATH:$(go env GOPATH)/bin
+        goyacc -o parser/y.go -p yy parser/classad.y
+
+    - name: Build and vet
+      working-directory: ${{ matrix.module }}
+      run: |
+        go mod download
+        go build ./...
+        go vet ./...
+
+    - name: Test (race detector)
+      working-directory: ${{ matrix.module }}
+      run: go test -race -count=1 ./...
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
