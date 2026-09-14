@@ -16,6 +16,10 @@ repos:
       - id: go-fmt
         args: [-w, -s]
       - id: go-vet
+        # .github/tools is its own module (it pins the goyacc CI runs), so
+        # vetting it from the root module fails with "no required module
+        # provides package .../.github/tools". Its own CI job vets it.
+        exclude: '^\.github/tools/'
       - id: go-imports
         args: [-w]
       - id: go-unit-tests

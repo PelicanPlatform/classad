@@ -29,15 +29,22 @@ jobs:
       with:
         go-version: ${{ matrix.go-version }}
 
-    - name: Install goyacc
-      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
-      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
-      # the automatic toolchain switch. Override to auto for this build-tool install
-      # only -- the parser generator may build with a newer Go; the tests below still
-      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+    - name: Install goyacc (version pinned in .github/tools)
+      # Built from .github/tools, where the version is pinned and recorded
+      # in that module's go.sum. `go install ...@latest` fetched whatever
+      # had just been published and verified it against nothing -- a parser
+      # generator running with full access to the build. Dependabot bumps
+      # it there, under the configured cooldown.
+      #
+      # GOTOOLCHAIN=auto because x/tools may require a newer Go than the
+      # matrix entry building it; the tests below still run on the matrix
+      # Go under the inherited GOTOOLCHAIN=local.
       env:
         GOTOOLCHAIN: auto
-      run: go install golang.org/x/tools/cmd/goyacc@latest
+      run: |
+        mkdir -p "$RUNNER_TEMP/bin"
+        (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/goyacc" golang.org/x/tools/cmd/goyacc)
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
     - name: Generate parser
       run: |
@@ -93,15 +100,22 @@ jobs:
       with:
         go-version: '1.27'
 
-    - name: Install goyacc
-      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
-      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
-      # the automatic toolchain switch. Override to auto for this build-tool install
-      # only -- the parser generator may build with a newer Go; the tests below still
-      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+    - name: Install goyacc (version pinned in .github/tools)
+      # Built from .github/tools, where the version is pinned and recorded
+      # in that module's go.sum. `go install ...@latest` fetched whatever
+      # had just been published and verified it against nothing -- a parser
+      # generator running with full access to the build. Dependabot bumps
+      # it there, under the configured cooldown.
+      #
+      # GOTOOLCHAIN=auto because x/tools may require a newer Go than the
+      # matrix entry building it; the tests below still run on the matrix
+      # Go under the inherited GOTOOLCHAIN=local.
       env:
         GOTOOLCHAIN: auto
-      run: go install golang.org/x/tools/cmd/goyacc@latest
+      run: |
+        mkdir -p "$RUNNER_TEMP/bin"
+        (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/goyacc" golang.org/x/tools/cmd/goyacc)
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
     - name: Generate parser
       run: |
@@ -177,15 +191,22 @@ jobs:
       with:
         go-version: '1.27'
 
-    - name: Install goyacc
-      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
-      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
-      # the automatic toolchain switch. Override to auto for this build-tool install
-      # only -- the parser generator may build with a newer Go; the tests below still
-      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+    - name: Install goyacc (version pinned in .github/tools)
+      # Built from .github/tools, where the version is pinned and recorded
+      # in that module's go.sum. `go install ...@latest` fetched whatever
+      # had just been published and verified it against nothing -- a parser
+      # generator running with full access to the build. Dependabot bumps
+      # it there, under the configured cooldown.
+      #
+      # GOTOOLCHAIN=auto because x/tools may require a newer Go than the
+      # matrix entry building it; the tests below still run on the matrix
+      # Go under the inherited GOTOOLCHAIN=local.
       env:
         GOTOOLCHAIN: auto
-      run: go install golang.org/x/tools/cmd/goyacc@latest
+      run: |
+        mkdir -p "$RUNNER_TEMP/bin"
+        (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/goyacc" golang.org/x/tools/cmd/goyacc)
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
     # These modules replace github.com/PelicanPlatform/classad with ../, so they
     # build against the root module in this checkout -- which has no parser until
@@ -234,15 +255,22 @@ jobs:
       with:
         go-version: '1.27'
 
-    - name: Install goyacc
-      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
-      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
-      # the automatic toolchain switch. Override to auto for this build-tool install
-      # only -- the parser generator may build with a newer Go; the tests below still
-      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+    - name: Install goyacc (version pinned in .github/tools)
+      # Built from .github/tools, where the version is pinned and recorded
+      # in that module's go.sum. `go install ...@latest` fetched whatever
+      # had just been published and verified it against nothing -- a parser
+      # generator running with full access to the build. Dependabot bumps
+      # it there, under the configured cooldown.
+      #
+      # GOTOOLCHAIN=auto because x/tools may require a newer Go than the
+      # matrix entry building it; the tests below still run on the matrix
+      # Go under the inherited GOTOOLCHAIN=local.
       env:
         GOTOOLCHAIN: auto
-      run: go install golang.org/x/tools/cmd/goyacc@latest
+      run: |
+        mkdir -p "$RUNNER_TEMP/bin"
+        (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/goyacc" golang.org/x/tools/cmd/goyacc)
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
     # These modules replace github.com/PelicanPlatform/classad with ../, so they
     # build against the root module in this checkout -- which has no parser until
@@ -297,15 +325,22 @@ jobs:
       with:
         go-version: '1.27'
 
-    - name: Install goyacc
-      # goyacc@latest tracks x/tools, whose module now requires a newer Go than the
-      # test matrix builds with; setup-go v6+ exports GOTOOLCHAIN=local, which blocks
-      # the automatic toolchain switch. Override to auto for this build-tool install
-      # only -- the parser generator may build with a newer Go; the tests below still
-      # run on the matrix Go under the inherited GOTOOLCHAIN=local.
+    - name: Install goyacc (version pinned in .github/tools)
+      # Built from .github/tools, where the version is pinned and recorded
+      # in that module's go.sum. `go install ...@latest` fetched whatever
+      # had just been published and verified it against nothing -- a parser
+      # generator running with full access to the build. Dependabot bumps
+      # it there, under the configured cooldown.
+      #
+      # GOTOOLCHAIN=auto because x/tools may require a newer Go than the
+      # matrix entry building it; the tests below still run on the matrix
+      # Go under the inherited GOTOOLCHAIN=local.
       env:
         GOTOOLCHAIN: auto
-      run: go install golang.org/x/tools/cmd/goyacc@latest
+      run: |
+        mkdir -p "$RUNNER_TEMP/bin"
+        (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/goyacc" golang.org/x/tools/cmd/goyacc)
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
 
     - name: Generate parser
       run: |
