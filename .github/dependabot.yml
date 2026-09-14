@@ -1,15 +1,53 @@
-# Managed by Dependabot: keep GitHub Actions current (including SHA-pinned actions,
-# whose pins are bumped when the action cuts a new release). Grouped into a single
-# weekly PR to keep the noise down.
 version: 2
+
 updates:
+  # GitHub Actions. Actions are pinned to commit SHAs (with a "# vX.Y.Z"
+  # comment); Dependabot bumps the SHA and the comment together.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+    # A release published minutes ago has had no time to be found
+    # malicious. The cooldown makes Dependabot wait before proposing one.
+    # Security updates are exempt by GitHub's own rules, so a real
+    # advisory still arrives immediately.
+    cooldown:
+      default-days: 7
     groups:
       github-actions:
         patterns:
           - "*"
     commit-message:
       prefix: "ci(deps)"
+
+  # Go modules. Previously unmanaged entirely: the only thing Dependabot
+  # watched here was Actions, so every Go dependency -- including the
+  # parser generator CI executes -- aged silently.
+  #
+  # /.github/tools is the module that pins goyacc. It is listed here
+  # precisely so that pin is a dependency Dependabot can bump rather than
+  # a floating @latest in seven workflow steps.
+  #
+  # Every module is listed: the submodules replace the root with ../, so a
+  # shared dependency bumped in one leaves the others' go.sum stale.
+  - package-ecosystem: "gomod"
+    directories:
+      - "/"
+      - "/collections"
+      - "/db"
+      - "/dbrpc"
+      - "/changefeed"
+      - "/.github/tools"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    groups:
+      go-minor-and-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "deps"
