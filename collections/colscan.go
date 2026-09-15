@@ -102,6 +102,18 @@ type SchemaScanInfo struct {
 	// look like -- which is what you need to judge whether the sampling recovered the shape
 	// you expected, or picked up something odd.
 	Schema []SchemaScanField `json:"schema,omitempty"`
+	// Groups is the committed secondary schemas, field by field (the members that GroupSchemas /
+	// GroupSchemaFields count). It is read from the live committed state -- no sampling -- so it is
+	// available to a READ-level client, unlike GroupSchemas(sampleMax, k), which derives fresh
+	// CANDIDATE groups from a new sample. Empty when no group is committed.
+	Groups []SchemaScanGroup `json:"groups,omitempty"`
+}
+
+// SchemaScanGroup is one committed secondary (group) schema: the co-occurring attributes stored
+// columnar together, field by field in layout order. Its members are what `.schema groups` shows
+// at READ; the candidate report from a fresh sample is a separate, DAEMON-level derivation.
+type SchemaScanGroup struct {
+	Fields []SchemaScanField `json:"fields"`
 }
 
 // SchemaScanField is one attribute in the derived schema: the name it was recovered under, the
@@ -142,6 +154,20 @@ func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 		info.GroupSchemas = len(st.groups)
 		for _, g := range st.groups {
 			info.GroupSchemaFields += len(g.schema.fields)
+			grp := SchemaScanGroup{Fields: make([]SchemaScanField, 0, len(g.schema.fields))}
+			for _, f := range g.schema.fields {
+				name, ok := c.schemaFieldName(f.id)
+				if !ok {
+					name = "?" // unnamed id: keep the slot so the field count still lines up
+				}
+				grp.Fields = append(grp.Fields, SchemaScanField{
+					Name:     name,
+					Kind:     f.kind.String(),
+					Width:    f.width,
+					Unsigned: f.unsigned,
+				})
+			}
+			info.Groups = append(info.Groups, grp)
 		}
 		hot := make(map[int]bool, len(st.hot))
 		for _, idx := range st.hot {
@@ -221,11 +247,20 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 func (c *Collection) installSchemaScan(s *adSchema, hot []int) bool {
 	st := c.schemaScan.Load()
 	if st == nil || st.schema != s {
+		var prevGroups []*colGroup
+		if st != nil {
+			prevGroups = st.groups
+		}
+		groups := c.groupSchemasFor(s)
+		// Log a committed-set change (diff + reason) if this (re)build adopts a different group set
+		// than was committed. A no-op at first enable when no group qualifies yet (both empty). See
+		// colgroupchanges.go.
+		c.recordGroupChange(prevGroups, groups, "schema (re)build")
 		// The collection's ONE shared columnar-block cache, not a second 256MiB cache: the schema
 		// scan and the colNative reconstruct read the SAME columnar blocks (keyed by process-unique
 		// block id), so two caches held largely the same decompressed blocks twice -- a needless
 		// ~256MiB on top of the per-collection cache. Sharing dedups them.
-		st = &schemaScanState{schema: s, hot: hot, cache: c.sharedColCache(), groups: c.groupSchemasFor(s)}
+		st = &schemaScanState{schema: s, hot: hot, cache: c.sharedColCache(), groups: groups}
 		c.schemaScan.Store(st)
 	}
 	return true

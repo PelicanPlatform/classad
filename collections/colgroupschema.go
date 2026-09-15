@@ -583,6 +583,9 @@ func (c *Collection) refreshGroupSchemas(st *schemaScanState) {
 	if c.sameGroupSet(st.groups, next) {
 		return // unchanged: keep the light refresh, do no new work
 	}
+	// Log the committed-set change (diff + reason) before adopting it, so the churn -- and its
+	// magnitude -- is visible after the fact. See colgroupchanges.go.
+	c.recordGroupChange(st.groups, next, "maintenance auto-promote")
 	// Adopt the new set for FUTURE segments (ColumnarizeSealed and the sidecar cover both read
 	// st.groups) by republishing the state with the SAME base schema and hot tier. Keeping the schema
 	// pointer means CountQuery routing and existing blocks are undisturbed; only the group set moves.

@@ -38,6 +38,15 @@ type Diagnostics struct {
 	// like it had no accelerator at all.
 	SchemaScan db.SchemaScanInfo `json:"schemaScan"`
 
+	// GroupDrift, GroupChanges and GroupAgreement are the READ-level observability for the
+	// secondary (group) schemas: how the sampler's candidate groups have drifted, the log of
+	// changes to the COMMITTED set (each a real block-rebuild event, with its diff and reason),
+	// and the last per-segment agreement. All read persisted sidecar state -- no sampling -- so
+	// they are safe to include in the READ diagnostics, unlike the fresh candidate derivation.
+	GroupDrift     db.GroupSchemaDrift          `json:"groupDrift"`
+	GroupChanges   []db.GroupSchemaChange       `json:"groupChanges,omitempty"`
+	GroupAgreement *db.GroupSchemaLastAgreement `json:"groupAgreement,omitempty"`
+
 	// Archive marks an append-only history table (vs. a mutable one), and Retention carries
 	// its rotation bounds -- the one genuinely kind-specific pair, since a mutable table has no
 	// rotation. SidecarSizes reports sealed-segment sidecar index bytes, for both kinds.
@@ -84,9 +93,14 @@ func (s *Server) diagJSON(t *db.DB) ([]byte, error) {
 		EncryptionEnabled:  t.EncryptionEnabled(),
 		EncryptedAttrs:     t.EncryptedAttrNames(),
 		SchemaScan:         t.SchemaScanInfo(),
+		GroupDrift:         t.GroupSchemaDrift(),
+		GroupChanges:       t.GroupSchemaChanges(),
 		// Reported for a mutable table as well as an archive: it has sidecars too, and without them
 		// its .stats could not account for its on-disk footprint the way an archive's could.
 		SidecarSizes: t.SidecarSizes(),
+	}
+	if ag, ok := t.GroupSchemaLastAgreement(); ok {
+		d.GroupAgreement = &ag
 	}
 	d.StaleIndexSegments, d.SealedSegments = t.StaleIndexSegments()
 	return json.Marshal(d)
@@ -114,12 +128,17 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 		SealedSegments:     sealed,
 		StaleIndexSegments: stale,
 		SchemaScan:         a.SchemaScanInfo(),
+		GroupDrift:         a.GroupSchemaDrift(),
+		GroupChanges:       a.GroupSchemaChanges(),
 		// The same three a mutable table reports. Encryption in particular is reported rather than
 		// left zero: an archive is NOT sealed today (its open path passes no data key), and a missing
 		// line reads as "not applicable" when the truth is "not protected".
 		Hot:               a.HotAttrs(),
 		EncryptionEnabled: a.EncryptionEnabled(),
 		EncryptedAttrs:    a.EncryptedAttrNames(),
+	}
+	if ag, ok := a.GroupSchemaLastAgreement(); ok {
+		d.GroupAgreement = &ag
 	}
 	return json.Marshal(d)
 }
