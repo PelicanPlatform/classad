@@ -5,11 +5,11 @@ go 1.26.0
 require github.com/PelicanPlatform/classad v0.0.0
 
 require (
-	github.com/RoaringBitmap/roaring/v2 v2.19.0
+	github.com/RoaringBitmap/roaring/v2 v2.27.0
 	github.com/dgraph-io/ristretto/v2 v2.4.2
-	github.com/klauspost/compress v1.19.0
+	github.com/klauspost/compress v1.20.0
 	github.com/tidwall/btree v1.8.1
-	golang.org/x/sys v0.46.0
+	golang.org/x/sys v0.48.0
 )
 
 require (
