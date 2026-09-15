@@ -66,6 +66,11 @@ func (c *Collection) Compact() int {
 	if c.appendOnly() {
 		return 0 // an append log never supersedes, so there is nothing to compact
 	}
+	// Collapse delta chains first: compaction may reclaim the older versions a delta is
+	// merged from, and its interning re-encode would strip the delta flag from any that
+	// survive -- turning a fragment into a record that claims to be whole. No-op unless delta
+	// records are enabled. See Collection.collapseBeforeRewrite.
+	c.collapseBeforeRewrite()
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
 	start := time.Now()
@@ -218,6 +223,10 @@ func (c *Collection) Rewrite() int {
 			n++
 		}
 	}
+	// compactShard's interning re-encode does not preserve a delta's flag, and it drops
+	// superseded bases -- so every route into it must collapse live chains first. See
+	// Collection.collapseLiveChains.
+	c.collapseBeforeRewrite()
 	target := c.currentCodec()
 	for _, sh := range c.shards {
 		c.compactShard(sh, target)
@@ -283,6 +292,7 @@ func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 		// re-compression would.
 		c.internSealedLocked()
 	} else {
+		c.collapseBeforeRewrite() // see Compact: a rewrite must not meet a live delta
 		for _, sh := range c.shards {
 			c.compactShard(sh, codec) // recompress to the new codec
 		}

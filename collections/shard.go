@@ -22,6 +22,12 @@ type shard struct {
 	// write lock, instead of waiting for the next periodic reindex. Bumped under the write
 	// lock; read lock-free.
 	sealSeq atomic.Uint64
+	// sealedPending marks that this shard sealed a segment whose delta chains have not been
+	// collapsed yet, and pendingSeal names those segments. The segments are needed explicitly
+	// because the collapse runs AFTER the seal, by which point sh.act is the new segment and
+	// the fragments to collapse are in the old one. Both are written under the write lock.
+	sealedPending atomic.Bool
+	pendingSeal   []*segment
 
 	// appendOnly makes this a pure append log (see Options.AppendOnly): put appends
 	// without superseding or indexing by key, del is a no-op, and compaction is
@@ -396,6 +402,15 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) 
 		if sh.appendOnly && sh.act != nil {
 			sh.sealSeq.Add(1) // a segment just sealed: signal eager sidecar indexing
 		}
+		if sh.act != nil {
+			// A segment just sealed. With delta records on, that is the moment every open
+			// chain has to be collapsed -- see Collection.collapseSealedChains. The work
+			// cannot happen here (this runs under the shard WRITE lock, inside a commit, and
+			// collapsing means reading and writing keys), so it is only flagged; the commit
+			// runs it on the way out.
+			sh.sealedPending.Store(true)
+			sh.pendingSeal = append(sh.pendingSeal, sh.act)
+		}
 		size := sh.segSize
 		if rl > size {
 			size = rl
@@ -472,6 +487,17 @@ func (sh *shard) get(c *Collection, h uint64, key []byte) ([]byte, Codec, *segDi
 	ad, adCodec, ok2 := segStoredOrReassembled(c, seg, l.off)
 	if !ok2 {
 		return nil, nil, nil, false
+	}
+	// A current read is a snapshot read at the newest sequence, so replay uses seqMax.
+	if raw, rc, handled, ok3 := sh.resolveDelta(c, key, h, seqMax, ad, adCodec); handled {
+		if !ok3 {
+			return nil, nil, nil, false
+		}
+		dict := seg.dict.Load()
+		if dict != nil {
+			dict.ensureNames()
+		}
+		return raw, rc, dict, true
 	}
 	out := make([]byte, len(ad))
 	copy(out, ad)
@@ -760,7 +786,7 @@ func releaseWindows(wins []segWindow) {
 func (c *Collection) forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var rbuf []byte
 	forEachVisibleRef(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf)
 		if !ok {
 			return true
 		}
@@ -774,7 +800,7 @@ func (c *Collection) forEachVisible(s0 uint64, wins []segWindow, fn func(ad []by
 func (c *Collection) forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var rbuf []byte
 	forEachVisibleRef(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf)
 		if !ok {
 			return true
 		}
@@ -787,7 +813,7 @@ func (c *Collection) forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(ke
 func (c *Collection) forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var rbuf []byte
 	forEachVisibleRefReverse(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf)
 		if !ok {
 			return true
 		}

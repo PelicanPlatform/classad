@@ -34,6 +34,18 @@ const (
 	// scanning the ad. Set only when that closure is statically determinable (no eval()).
 	flagHotClosure = 1 << 2
 
+	// flagDelta: this record holds only the attributes CHANGED by one write, not the whole
+	// ad. Reading it means walking back along the key's version chain, collecting deltas
+	// until a full record is reached, and merging them oldest-first (see shard.materialize).
+	// The point is write volume: a live job ad averages ~7.3 KB, while the attributes one
+	// schedd transaction changes average ~150 bytes, so storing the whole ad on every update
+	// hands the encoder and the compressor ~49x more bytes than the change contains.
+	//
+	// The marker lives in this flags byte rather than the record header so nothing in the
+	// segment/shard write path needs to know about it, and reading it costs nothing extra:
+	// replay has to decompress each delta to merge it anyway.
+	flagDelta = 1 << 3
+
 	// A hot-header pair is (internID, offset) in interned ads and
 	// (nameHash32, offset) in inline-names ads; the offset points at the attribute
 	// ENTRY (name+node for inline, node for interned) — see accessor.go.

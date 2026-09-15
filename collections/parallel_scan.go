@@ -64,7 +64,7 @@ func (c *Collection) gatherTasks() (tasks []scanTask, totalBytes int, release fu
 func (c *Collection) forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []byte, codec Codec) bool) {
 	var rbuf []byte
 	forEachVisibleWindowRef(s0, w, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf)
 		if !ok {
 			return true
 		}
@@ -78,7 +78,7 @@ func (c *Collection) forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []b
 func (c *Collection) forEachVisibleWindowKeyed(s0 uint64, w segWindow, fn func(key, ad []byte, codec Codec) bool) {
 	var rbuf []byte
 	forEachVisibleWindowRef(s0, w, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf)
 		if !ok {
 			return true
 		}

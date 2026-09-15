@@ -41,10 +41,37 @@ func (r recRef) codec() Codec { return r.w.codec }
 // attributes held in the columnar payload, and it reports an error rather than returning a partial
 // ad if that payload cannot be trusted.
 func (c *Collection) wire(r recRef, buf []byte) ([]byte, error) {
+	return c.wireAt(r, seqMax, buf)
+}
+
+// wireAt is wire for a reader that knows the snapshot it is reading at, which a DELTA record
+// needs: merging one means selecting the versions visible at that snapshot.
+//
+// Every reader that goes through here gets whole ads, which is the point -- this and adBytes
+// are the two places the package already reassembles a partial record (the columnar case), and
+// teaching readers one at a time is how roughly ten of them ended up serving fragments.
+// Callers that genuinely have no snapshot pass seqMax and get the current version.
+func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
+	var raw []byte
+	var err error
 	if seg := r.w.seg; seg != nil && (seg.columnarized() || seg.colDamaged.Load()) {
-		return c.recordWireIn(seg, r.w.data, r.off, buf)
+		raw, err = c.recordWireIn(seg, r.w.data, r.off, buf)
+	} else {
+		raw, err = r.w.codec.Decompress(buf[:0], r.stored())
 	}
-	return r.w.codec.Decompress(buf[:0], r.stored())
+	if err != nil || !c.deltaRead || !isDeltaRecord(raw) {
+		return raw, err
+	}
+	key := r.key()
+	h := c.h.Hash(key)
+	sh := c.shards[c.shardOf(key, h)]
+	sh.mu.RLock()
+	merged, ok := sh.materializeAt(c, key, h, s0)
+	sh.mu.RUnlock()
+	if !ok {
+		return nil, errBadRemnant // a fragment we cannot complete: skip, never serve half an ad
+	}
+	return merged, nil
 }
 
 // forEachVisibleRef walks the frozen windows in append order and calls fn for each record visible
@@ -131,17 +158,44 @@ func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 //
 // scratch is reused across records; the returned bytes are valid only until the next call, which is
 // already the contract for the compressed case (the window's mapping outlives neither).
-func (c *Collection) adBytes(r recRef, scratch *[]byte) ([]byte, Codec, bool) {
+func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Codec, bool) {
 	seg := r.w.seg
-	if seg == nil || !(seg.columnarized() || seg.colDamaged.Load()) {
-		return r.stored(), r.w.codec, true
+	stored, codec := r.stored(), r.w.codec
+	if seg != nil && (seg.columnarized() || seg.colDamaged.Load()) {
+		full, err := c.recordWireIn(seg, r.w.data, r.off, *scratch)
+		if err != nil {
+			return nil, nil, false // skip a record we cannot reassemble rather than serve half of it
+		}
+		*scratch = full
+		stored, codec = full, identityCodec{}
 	}
-	full, err := c.recordWireIn(seg, r.w.data, r.off, *scratch)
+	if !c.deltaRead {
+		return stored, codec, true
+	}
+	// A delta record holds only the attributes one write changed -- the same hazard the
+	// columnar branch above exists for: half an ad is indistinguishable from an ad whose
+	// attributes really were removed. Resolving it HERE covers every reader that goes through
+	// this primitive (the visible-record walks behind serial, reverse and chained scans, the
+	// ordered-index rebuild, ForEachAd, and the watch catch-up) rather than requiring each to
+	// be taught separately -- which is how about ten of them ended up serving fragments.
+	raw, err := codec.Decompress((*scratch)[:0], stored)
 	if err != nil {
-		return nil, nil, false // skip a record we cannot reassemble rather than serve half of it
+		return nil, nil, false
 	}
-	*scratch = full
-	return full, identityCodec{}, true
+	*scratch = raw
+	if !isDeltaRecord(raw) {
+		return raw, identityCodec{}, true
+	}
+	key := r.key()
+	h := c.h.Hash(key)
+	sh := c.shards[c.shardOf(key, h)]
+	sh.mu.RLock()
+	merged, ok := sh.materializeAt(c, key, h, s0)
+	sh.mu.RUnlock()
+	if !ok {
+		return nil, nil, false
+	}
+	return merged, identityCodec{}, true
 }
 
 // segStoredOrReassembled returns a record's bytes and the codec that decodes them, for the

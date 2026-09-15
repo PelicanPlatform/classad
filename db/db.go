@@ -95,6 +95,12 @@ type Config struct {
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
 
+	// DeltaMax turns on delta records for this table and bounds the chain length: a
+	// SetAttribute stores only the attributes it changed, until a key has accumulated
+	// DeltaMax of them and the next write stores the whole ad again. 0 (default) stores the
+	// whole ad every time. See collections.Options.DeltaMax for the trade.
+	DeltaMax int
+
 	// GroupSchemaCount is how many SECONDARY columnar schemas to derive: sets of attributes the
 	// base schema does not carry which are present or absent together, stored columnar for the
 	// ads that hold them without costing a slot in the ads that do not. 0 takes the default (4);
@@ -170,6 +176,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		GroupStabilityRuns:  cfg.GroupStabilityRuns,
 		GroupMergeJaccard:   cfg.GroupMergeJaccard,
 		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
+		DeltaMax:            cfg.DeltaMax,
 		Codec:               chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
 		DataKey:             enc.data(),
 		EncryptedAttrs:      cfg.EncryptedAttrs,
@@ -846,6 +853,65 @@ type Txn struct {
 	tx   *collections.Txn
 	db   *DB
 	done bool
+	// patch records, per key, which attributes this transaction changed -- the information
+	// the store needs to keep a delta instead of rewriting the whole ad. SetAttribute knows
+	// the name it is setting, so nothing above this layer has to be told about deltas.
+	patch map[string]*keyPatch
+}
+
+// keyPatch is one key's accumulated change set within a transaction. full marks a key whose
+// whole ad was written (NewClassAd, or a Put), after which a delta would be wrong: the
+// buffered ad is not derived from any stored base.
+type keyPatch struct {
+	changed []string
+	removed bool
+	full    bool
+	// patch accumulates this transaction's changed attributes WITHOUT reading the stored ad,
+	// and removed names what it deleted. Together they are all the store needs to write a
+	// delta, so the common update costs no read at all.
+	patch *classad.ClassAd
+	// removals is a SET, not a list: a later SetAttribute of a removed name must take the name
+	// back OUT, or the removal is applied after the patch and silently eats the set. It was
+	// append-only, and `DeleteAttribute(k,"A"); SetAttribute(k,"A",...)` lost the set -- in
+	// every configuration, delta mode or not, because these paths route through PatchAttrs
+	// unconditionally.
+	removals map[string]struct{}
+}
+
+// removalList renders the removal set for the store, which wants a slice.
+func (p *keyPatch) removalList() []string {
+	if len(p.removals) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(p.removals))
+	for n := range p.removals {
+		out = append(out, n)
+	}
+	return out
+}
+
+// patchFor returns key's change set, creating it on first touch.
+func (t *Txn) patchFor(key string) *keyPatch {
+	if t.patch == nil {
+		t.patch = make(map[string]*keyPatch)
+	}
+	p := t.patch[key]
+	if p == nil {
+		p = &keyPatch{}
+		t.patch[key] = p
+	}
+	return p
+}
+
+// putPatched buffers key's ad, as a delta when this transaction's writes to it are expressible
+// as one and the store has delta records enabled.
+func (t *Txn) putPatched(key string, ad *classad.ClassAd) {
+	p := t.patch[key]
+	if p == nil || p.full || len(p.changed) == 0 {
+		t.tx.Put([]byte(key), ad)
+		return
+	}
+	t.tx.PutPatch([]byte(key), ad, p.changed, p.removed)
 }
 
 // Begin starts a new independent transaction.
@@ -896,6 +962,9 @@ func (t *Txn) Abort() { t.done = true }
 // NewClassAd stores ad under key (classad_log.h LogNewClassAd). An existing ad at
 // key is replaced.
 func (t *Txn) NewClassAd(key string, ad *classad.ClassAd) {
+	// A whole new ad: nothing about it derives from a stored base, so neither this write nor
+	// any later write to the same key in this transaction may be stored as a delta.
+	t.patchFor(key).full = true
 	t.tx.Put([]byte(key), ad)
 }
 
@@ -914,6 +983,15 @@ func (t *Txn) NewClassAdOld(key, text string) bool {
 
 // DestroyClassAd removes key (classad_log.h LogDestroyClassAd).
 func (t *Txn) DestroyClassAd(key string) {
+	// Mark the key full for the rest of the transaction. Without this a following
+	// SetAttribute took the patch path, whose PatchAttrs REPLACED the buffered delete and then
+	// merged over the pre-delete stored ad -- so the destroy vanished and the old attributes
+	// came back. Marking it full routes any later write through the read-modify-write path,
+	// which composes with the delete correctly.
+	p := t.patchFor(key)
+	p.full = true
+	p.patch = nil
+	p.changed = nil
 	t.tx.Delete([]byte(key))
 }
 
@@ -926,25 +1004,61 @@ func (t *Txn) SetAttribute(key, name, expr string) error {
 	if err != nil {
 		return fmt.Errorf("classad-db: SetAttribute %s[%s]: %w", key, name, err)
 	}
-	ad, ok := t.tx.Get([]byte(key))
-	if !ok {
-		ad = classad.New()
+	p := t.patchFor(key)
+	if p.full {
+		// The whole ad was written in this transaction, so it is already buffered and the
+		// update composes with it directly -- there is nothing to read.
+		ad, ok := t.tx.Get([]byte(key))
+		if !ok {
+			ad = classad.New()
+		}
+		ad.InsertExpr(name, e)
+		p.changed = append(p.changed, name)
+		t.putPatched(key, ad)
+		return nil
 	}
-	ad.InsertExpr(name, e)
-	t.tx.Put([]byte(key), ad)
+	// No read: buffer the changed attribute and let the store decide whether it can be
+	// stored as a delta. This is the whole point of delta records -- the old path read the
+	// stored ad back on EVERY SetAttribute purely to hand a copy to the encoder.
+	if p.patch == nil {
+		p.patch = classad.New()
+	}
+	p.patch.InsertExpr(name, e)
+	delete(p.removals, name) // this transaction set it again: it is no longer removed
+	p.changed = append(p.changed, name)
+	t.tx.PatchAttrs([]byte(key), p.patch, p.removalList())
 	return nil
 }
 
 // DeleteAttribute removes one attribute of key (classad_log.h LogDeleteAttribute).
 // A no-op if key or the attribute is absent.
 func (t *Txn) DeleteAttribute(key, name string) {
-	ad, ok := t.tx.Get([]byte(key))
-	if !ok {
+	p := t.patchFor(key)
+	if p.full {
+		ad, ok := t.tx.Get([]byte(key))
+		if !ok {
+			return
+		}
+		if ad.Delete(name) {
+			p.removed = true
+			t.putPatched(key, ad)
+		}
 		return
 	}
-	if ad.Delete(name) {
-		t.tx.Put([]byte(key), ad)
+	// Recorded without reading. A removal cannot be expressed as a delta of present
+	// attributes, so the store composes a whole record for this key at commit -- which is
+	// also where it learns whether the attribute was there at all, making this the no-op
+	// the contract promises when it was not.
+	p.removed = true
+	if p.removals == nil {
+		p.removals = make(map[string]struct{})
 	}
+	p.removals[name] = struct{}{}
+	if p.patch == nil {
+		p.patch = classad.New()
+	}
+	p.patch.Delete(name)
+	t.tx.PatchAttrs([]byte(key), p.patch, p.removalList())
 }
 
 // LookupClassAd returns key's ad as the transaction sees it: its own buffered writes
@@ -1043,3 +1157,7 @@ func (db *DB) GroupSchemaChanges() []GroupSchemaChange { return db.c.GroupSchema
 func (db *DB) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool) {
 	return db.c.GroupSchemaLastAgreement()
 }
+
+// TrackedKeys reports how many keys the delta tracker holds in memory (0 when delta records
+// are off). It is the feature's one new in-memory structure, so it is the number to watch.
+func (db *DB) TrackedKeys() int { return db.c.TrackedKeys() }
