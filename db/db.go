@@ -462,6 +462,7 @@ type (
 	CodecStats      = collections.CodecStats
 	SchemaScanInfo  = collections.SchemaScanInfo
 	SchemaScanField = collections.SchemaScanField
+	SchemaScanGroup = collections.SchemaScanGroup
 	SchemaFieldFit  = collections.SchemaFieldFit
 	QueryExplain    = collections.QueryExplain
 	ProbeExplain    = collections.ProbeExplain
@@ -1013,6 +1014,10 @@ type GroupSchemaInfo = collections.GroupSchemaInfo
 type GroupSchemaEntry = collections.GroupSchemaEntry
 type GroupSchemaDrift = collections.GroupSchemaDrift
 type GroupSchemaAgreement = collections.GroupSchemaAgreement
+type GroupSchemaChange = collections.GroupSchemaChange
+type GroupSchemaDelta = collections.GroupSchemaDelta
+type GroupSchemaLastAgreement = collections.GroupSchemaLastAgreement
+type GroupAgreementItem = collections.GroupAgreementItem
 
 // GroupSchemas derives and reports candidate group schemas: sets of attributes the base schema
 // does not carry which are present or absent together, and could therefore be stored columnar for
@@ -1027,4 +1032,14 @@ func (db *DB) GroupSchemaDrift() GroupSchemaDrift { return db.c.GroupSchemaDrift
 // GroupSchemaAgreement reports how well per-segment derivations agree with the table-wide one.
 func (db *DB) GroupSchemaAgreement(sampleMax, k int) GroupSchemaAgreement {
 	return db.c.GroupSchemaAgreement(sampleMax, k)
+}
+
+// GroupSchemaChanges returns the committed-group change log: the moments the accelerator adopted a
+// different set of secondary schemas, with each change's diff and reason. Reads persisted state only
+// (no sampling), so it is available at READ.
+func (db *DB) GroupSchemaChanges() []GroupSchemaChange { return db.c.GroupSchemaChanges() }
+
+// GroupSchemaLastAgreement returns the last persisted per-segment agreement result, if any.
+func (db *DB) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool) {
+	return db.c.GroupSchemaLastAgreement()
 }

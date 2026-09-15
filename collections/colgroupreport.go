@@ -30,11 +30,56 @@ const (
 	groupHistoryMax = 16
 )
 
-// persistedGroupSchemas is the on-disk record: the current derivation plus a bounded history, so
-// a drift comparison does not depend on someone having captured the earlier report.
+// persistedGroupSchemas is the on-disk record: the sampler's derivation history (candidate wobble),
+// the log of COMMITTED-set changes (the churn that actually costs a rebuild), and the last computed
+// per-segment agreement -- so all three views survive a restart and a drift comparison does not
+// depend on someone having captured an earlier report.
+//
+// The change log and agreement are additive fields: an older (history-only) file still unmarshals,
+// and this code writes both going forward, so the version does not need to move.
 type persistedGroupSchemas struct {
 	Version int                   `json:"version"`
 	History []persistedGroupDeriv `json:"history"`
+	// Changes is the committed-set change log (see persistedGroupChange). Empty on a table that has
+	// never re-committed its groups; each entry is one real adoption, with its diff and reason.
+	Changes []persistedGroupChange `json:"changes,omitempty"`
+	// LastAgreement is the most recent per-segment agreement result (see GroupSchemaAgreement),
+	// persisted so a READ-level client can see it without triggering the O(segments*sample) recompute.
+	LastAgreement *persistedAgreement `json:"lastAgreement,omitempty"`
+}
+
+// persistedGroupChange is one committed-group-set change: when the accelerator actually adopted a
+// different set of secondary schemas, and how it differed. Groups are matched old->new by best
+// member overlap so a small membership shift reads as a Changed entry (with the attributes added /
+// removed), not as an unrelated drop-plus-add -- which is what lets a reader see whether a change
+// was one attribute moving or a whole group being replaced.
+type persistedGroupChange struct {
+	Unix    int64                 `json:"unix"`
+	Reason  string                `json:"reason"`
+	Added   [][]string            `json:"added,omitempty"`
+	Removed [][]string            `json:"removed,omitempty"`
+	Changed []persistedGroupDelta `json:"changed,omitempty"`
+}
+
+// persistedGroupDelta is one surviving group whose membership shifted across a change.
+type persistedGroupDelta struct {
+	Before  []string `json:"before"`
+	After   []string `json:"after"`
+	Added   []string `json:"added,omitempty"`
+	Removed []string `json:"removed,omitempty"`
+}
+
+// persistedAgreement is the last per-segment agreement result, with each group's members so the
+// numbers are legible on their own.
+type persistedAgreement struct {
+	Unix     int64              `json:"unix"`
+	Segments int                `json:"segments"`
+	Groups   []persistedAgrItem `json:"groups,omitempty"`
+}
+
+type persistedAgrItem struct {
+	Attrs []string `json:"attrs"`
+	Frac  float64  `json:"frac"`
 }
 
 type persistedGroupDeriv struct {
@@ -112,10 +157,11 @@ func (c *Collection) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
 	return info
 }
 
-// saveGroupSchemas appends a derivation to the checkpoint, keeping the last groupHistoryMax.
-// Best-effort, as for the other sidecar metadata: losing a diagnostic costs a comparison, not
-// correctness.
-func (c *Collection) saveGroupSchemas(info GroupSchemaInfo) {
+// mutateGroupSchemaFile is the shared read-modify-write of the group-schema sidecar: read the
+// current record (or start fresh), apply fn, write it back. Best-effort, as for the other sidecar
+// metadata: losing a diagnostic costs a comparison, not correctness. Callers hold no lock; the
+// derivation/refresh path that drives these is already serialized by maintenance.
+func (c *Collection) mutateGroupSchemaFile(fn func(*persistedGroupSchemas)) {
 	if c.dir == "" {
 		return
 	}
@@ -126,24 +172,36 @@ func (c *Collection) saveGroupSchemas(info GroupSchemaInfo) {
 			rec = got
 		}
 	}
-	rec.History = append(rec.History, persistedGroupDeriv{
-		Unix: time.Now().Unix(), Sampled: info.Sampled, BaseFields: info.BaseFields,
-		BaseCells: info.BaseCells, TotalCells: info.TotalCells, Groups: info.Groups,
-	})
-	if len(rec.History) > groupHistoryMax {
-		rec.History = rec.History[len(rec.History)-groupHistoryMax:]
-	}
+	fn(&rec)
 	if data, err := json.Marshal(rec); err == nil {
 		_ = writeFileSync(filepath.Join(c.dir, groupSchemaFile), data)
 	}
 }
 
+// saveGroupSchemas appends a derivation to the checkpoint, keeping the last groupHistoryMax.
+func (c *Collection) saveGroupSchemas(info GroupSchemaInfo) {
+	c.mutateGroupSchemaFile(func(rec *persistedGroupSchemas) {
+		rec.History = append(rec.History, persistedGroupDeriv{
+			Unix: time.Now().Unix(), Sampled: info.Sampled, BaseFields: info.BaseFields,
+			BaseCells: info.BaseCells, TotalCells: info.TotalCells, Groups: info.Groups,
+		})
+		if len(rec.History) > groupHistoryMax {
+			rec.History = rec.History[len(rec.History)-groupHistoryMax:]
+		}
+	})
+}
+
 // GroupSchemaDrift compares the earliest and latest retained derivations, so an operator can see
 // whether the groups are holding without having captured the earlier report themselves.
 type GroupSchemaDrift struct {
-	Derivations int   `json:"derivations"`
-	FirstUnix   int64 `json:"firstUnix,omitempty"`
-	LastUnix    int64 `json:"lastUnix,omitempty"`
+	// Derivations is how many candidate SNAPSHOTS the sampler has retained (capped at
+	// groupHistoryMax), NOT how many times the committed set changed -- most snapshots are
+	// identical. CommittedChanges is the count that answers "how much real churn": entries in the
+	// committed-set change log (see GroupSchemaChanges).
+	Derivations      int   `json:"derivations"`
+	CommittedChanges int   `json:"committedChanges"`
+	FirstUnix        int64 `json:"firstUnix,omitempty"`
+	LastUnix         int64 `json:"lastUnix,omitempty"`
 	// Retained is how many of the FIRST derivation's groups still appear, by exact member
 	// set, in the last -- the number that matters, because a group whose membership changed
 	// is a different group and its block would have to be rebuilt.
@@ -170,6 +228,7 @@ func (c *Collection) GroupSchemaDrift() GroupSchemaDrift {
 		return out
 	}
 	out.Derivations = len(rec.History)
+	out.CommittedChanges = len(rec.Changes)
 	first, last := rec.History[0], rec.History[len(rec.History)-1]
 	out.FirstUnix, out.LastUnix = first.Unix, last.Unix
 	key := func(e GroupSchemaEntry) string {
@@ -268,7 +327,28 @@ func (c *Collection) GroupSchemaAgreement(sampleMax, k int) GroupSchemaAgreement
 	for i, h := range hits {
 		out.PerGroup[i] = float64(h) / float64(segs)
 	}
+	// Persist it so a READ-level client can show the last agreement without paying this
+	// O(segments*sample) recompute (which is why the fresh derivation is DAEMON-gated).
+	c.saveAgreement(out, table.Groups)
 	return out
+}
+
+// saveAgreement records the last per-segment agreement result into the group-schema sidecar,
+// labelled with each group's members so it is legible on its own. Best-effort like the rest of the
+// sidecar: losing it costs a diagnostic, not correctness.
+func (c *Collection) saveAgreement(ag GroupSchemaAgreement, groups []GroupSchemaEntry) {
+	if c.dir == "" || len(ag.PerGroup) == 0 {
+		return
+	}
+	pa := &persistedAgreement{Unix: time.Now().Unix(), Segments: ag.Segments}
+	for i, frac := range ag.PerGroup {
+		var attrs []string
+		if i < len(groups) {
+			attrs = append(attrs, groups[i].Attrs...)
+		}
+		pa.Groups = append(pa.Groups, persistedAgrItem{Attrs: attrs, Frac: frac})
+	}
+	c.mutateGroupSchemaFile(func(rec *persistedGroupSchemas) { rec.LastAgreement = pa })
 }
 
 // windowSamples draws up to max records from one pinned segment window, in the same wire

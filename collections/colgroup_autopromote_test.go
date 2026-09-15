@@ -115,6 +115,63 @@ func TestGroupSchemasAutoPromoteOnRefresh(t *testing.T) {
 	}
 }
 
+// TestSchemaScanInfoReportsCommittedGroupFields is the regression for the READ-level view of
+// committed group schemas: once groups are promoted, SchemaScanInfo must report each group's
+// member fields (name + kind), not just the counts, so a READ-level client can see WHICH
+// attributes each secondary schema holds without the DAEMON fresh-sample derivation. Without the
+// fix info.Groups is nil while info.GroupSchemas > 0.
+func TestSchemaScanInfoReportsCommittedGroupFields(t *testing.T) {
+	c := autoPromoteFixture(t, 0)
+	defer c.Close()
+
+	c.GroupSchemas(4096, 0)
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Skip("schema scan did not enable")
+	}
+	adopted := 0
+	for pass := 0; pass < 8; pass++ {
+		c.GroupSchemas(4096, 0)
+		if !c.BuildAndEnableSchemaScan(4096, 8) {
+			t.Fatal("refresh returned false while enabled")
+		}
+		if got := len(c.schemaScan.Load().groups); got > 0 {
+			adopted = got
+			break
+		}
+	}
+	if adopted == 0 {
+		t.Skip("no group schema was promoted in this fixture")
+	}
+
+	info := c.SchemaScanInfo()
+	if len(info.Groups) != info.GroupSchemas {
+		t.Fatalf("SchemaScanInfo reported %d committed group(s) but %d group-detail entries",
+			info.GroupSchemas, len(info.Groups))
+	}
+	if len(info.Groups) == 0 {
+		t.Fatal("committed groups not reported field-by-field (info.Groups empty while GroupSchemas>0)")
+	}
+	total := 0
+	for gi, g := range info.Groups {
+		if len(g.Fields) == 0 {
+			t.Errorf("committed group %d reported with no fields", gi)
+		}
+		for _, f := range g.Fields {
+			total++
+			if f.Name == "" {
+				t.Errorf("committed group %d has a field with an empty name", gi)
+			}
+			if f.Kind == "" {
+				t.Errorf("committed group %d field %q has an empty kind", gi, f.Name)
+			}
+		}
+	}
+	if total != info.GroupSchemaFields {
+		t.Fatalf("group field-detail total %d != GroupSchemaFields count %d", total, info.GroupSchemaFields)
+	}
+	t.Logf("reported %d committed group(s), %d fields total, with names + kinds", len(info.Groups), total)
+}
+
 // TestGroupSchemasAppliedToColumnarizedSegments checks item 2: the adopted groups are actually
 // applied to segments that were columnarized BEFORE the group set qualified. Their columnar payload
 // must gain the group columns, within a bounded number of passes.

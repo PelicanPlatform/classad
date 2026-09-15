@@ -646,3 +646,13 @@ func (a *Archive) GroupSchemaDrift() GroupSchemaDrift { return a.c.GroupSchemaDr
 func (a *Archive) GroupSchemaAgreement(sampleMax, k int) GroupSchemaAgreement {
 	return a.c.GroupSchemaAgreement(sampleMax, k)
 }
+
+// GroupSchemaChanges returns the archive's committed-group change log (see
+// Collection.GroupSchemaChanges).
+func (a *Archive) GroupSchemaChanges() []GroupSchemaChange { return a.c.GroupSchemaChanges() }
+
+// GroupSchemaLastAgreement returns the archive's last persisted per-segment agreement (see
+// Collection.GroupSchemaLastAgreement).
+func (a *Archive) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool) {
+	return a.c.GroupSchemaLastAgreement()
+}

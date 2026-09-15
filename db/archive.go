@@ -868,3 +868,11 @@ func (t *ArchiveTable) GroupSchemaDrift() GroupSchemaDrift { return t.a.GroupSch
 func (t *ArchiveTable) GroupSchemaAgreement(sampleMax, k int) GroupSchemaAgreement {
 	return t.a.GroupSchemaAgreement(sampleMax, k)
 }
+
+// GroupSchemaChanges returns the archive's committed-group change log (see DB.GroupSchemaChanges).
+func (t *ArchiveTable) GroupSchemaChanges() []GroupSchemaChange { return t.a.GroupSchemaChanges() }
+
+// GroupSchemaLastAgreement returns the archive's last persisted per-segment agreement, if any.
+func (t *ArchiveTable) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool) {
+	return t.a.GroupSchemaLastAgreement()
+}
