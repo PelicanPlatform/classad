@@ -40,11 +40,26 @@ func ParseClassAd(input string) (*ast.ClassAd, error) {
 // a record literal and a bare expression -- while still giving callers direct
 // expression access.
 func ParseExpr(input string) (ast.Expr, error) {
+	return parseExpr(input, false)
+}
+
+// ParseExprOld parses a standalone expression with OLD-ClassAd string semantics: an
+// unrecognized escape sequence in a string literal (e.g. `"a\,\ b"`, the escaped comma
+// and space HTCondor writes into a TransferInput list, or `"\S"` from /etc/issue) is kept
+// literally rather than rejected. Use it for values that originate from old-ClassAd text --
+// notably a schedd's job_queue.log, whose attribute values are old-ClassAd-encoded. It
+// matches ParseExpr in every other respect. See StreamingLexer.lenientEscapes and
+// ParseOldClassAd, which applies the same leniency to a whole old-format ad.
+func ParseExprOld(input string) (ast.Expr, error) {
+	return parseExpr(input, true)
+}
+
+func parseExpr(input string, lenient bool) (ast.Expr, error) {
 	ep, ok := exprParserPool.Get().(*exprParser)
 	if !ok {
 		panic("exprParserPool held an unexpected type") // pool's New only makes *exprParser
 	}
-	ep.reset(input)
+	ep.reset(input, lenient)
 	ep.p.Parse(ep.lex)
 	node, err := ep.lex.Result()
 	ep.lex.result = nil // do not retain the parsed AST in the pooled instance

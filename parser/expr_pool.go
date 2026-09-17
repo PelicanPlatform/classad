@@ -72,10 +72,13 @@ var exprParserPool = sync.Pool{
 	},
 }
 
-func (ep *exprParser) reset(input string) {
+func (ep *exprParser) reset(input string, lenient bool) {
 	ep.wr.reset(input)
 	ep.br.Reset(&ep.wr)
 	ep.lex.resetForNext()
 	ep.lex.pos = 0
 	ep.lex.stopAfterClassAd = false
+	// Set explicitly every reset: resetForNext does not clear it, so a pooled instance
+	// reused after a lenient parse would otherwise leak lenience into a strict one.
+	ep.lex.lenientEscapes = lenient
 }

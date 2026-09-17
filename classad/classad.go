@@ -50,6 +50,20 @@ func ParseExpr(input string) (*Expr, error) {
 	return &Expr{expr: expr}, nil
 }
 
+// ParseExprOld parses a standalone expression with OLD-ClassAd string semantics: an
+// unrecognized escape sequence in a string literal is kept literally rather than rejected.
+// Use it for expression text that came from old-ClassAd sources -- notably a schedd's
+// job_queue.log attribute values, where a filename in a TransferInput list carries an
+// escaped comma or space (`"...\,\ ..."`). ParseExpr would reject those and drop the
+// attribute; this preserves them. Identical to ParseExpr otherwise.
+func ParseExprOld(input string) (*Expr, error) {
+	expr, err := parser.ParseExprOld(input)
+	if err != nil {
+		return nil, err
+	}
+	return &Expr{expr: expr}, nil
+}
+
 // Quote escapes a string for safe use in ClassAd expressions.
 // It adds surrounding quotes and escapes special characters according to ClassAd syntax.
 //
