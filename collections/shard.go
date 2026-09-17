@@ -308,12 +308,12 @@ func (sh *shard) findCurrent(head loc, key []byte) (loc, bool) {
 // commit sequence seq. A prior current version of the key (if any) is marked
 // superseded at seq; the new record is prepended as the bucket head. Caller holds
 // the write lock.
-func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
+func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec, hdrFlags uint32) {
 	if sh.appendOnly {
 		// Append log: write a new record with no bucket-chain link and never supersede
 		// or index it. Records accumulate in commit order; there is no per-key current
 		// version or directory (Get/Delete-by-key are inert), and Scan/Query see them all.
-		if _, ok := sh.writeRecord(seq, noLoc, key, ad, codec); ok {
+		if _, ok := sh.writeRecord(seq, noLoc, key, ad, codec, hdrFlags); ok {
 			sh.count++
 		}
 		return
@@ -321,7 +321,7 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
 	head := sh.dirGet(h)
 	// Write the new record first: if segment allocation fails (persistent store,
 	// disk full), the key is left unchanged rather than superseded-with-no-successor.
-	newLoc, ok := sh.writeRecord(seq, head, key, ad, codec)
+	newLoc, ok := sh.writeRecord(seq, head, key, ad, codec, hdrFlags)
 	if !ok {
 		return // sh.writeErr is set; surfaced to the caller
 	}
@@ -392,7 +392,7 @@ func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied b
 // new segment is allocated when the active one is full, over-small for the
 // record, or was written with a different codec (a segment's records all share
 // one codec so reads can decode by segment).
-func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) (loc, bool) {
+func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, hdrFlags uint32) (loc, bool) {
 	rl := recordLen(len(key), len(ad))
 	if sh.act == nil || sh.act.codec != codec || sh.act.used+rl > len(sh.act.data) {
 		// The segment we're leaving is now sealed (an append log never rewrites it):
@@ -422,7 +422,7 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) 
 		sh.segs = append(sh.segs, seg)
 		sh.act = seg
 	}
-	off, _ := sh.act.append(seq, next, key, ad)
+	off, _ := sh.act.appendFlagged(seq, next, key, ad, hdrFlags)
 	if sh.alloc != nil && (len(sh.dirty) == 0 || sh.dirty[len(sh.dirty)-1] != sh.act) {
 		sh.dirty = append(sh.dirty, sh.act) // track for msync (persistent)
 	}
@@ -489,7 +489,7 @@ func (sh *shard) get(c *Collection, h uint64, key []byte) ([]byte, Codec, *segDi
 		return nil, nil, nil, false
 	}
 	// A current read is a snapshot read at the newest sequence, so replay uses seqMax.
-	if raw, rc, handled, ok3 := sh.resolveDelta(c, key, h, seqMax, ad, adCodec); handled {
+	if raw, rc, handled, ok3 := sh.resolveDelta(c, key, h, seqMax, recIsDelta(seg.data, l.off), ad, adCodec); handled {
 		if !ok3 {
 			return nil, nil, nil, false
 		}

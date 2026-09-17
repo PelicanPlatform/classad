@@ -47,8 +47,8 @@ const (
 	// markerFlag is the high bit of the keyLen field, set on a "time checkpoint"
 	// marker entry (see timeseq.go): a non-keyed arena record whose 8-byte payload is
 	// a wall-clock unixMillis and whose seq is the shard commitSeq at that instant.
-	// Real keys are tiny, so the low 31 bits (keyLenMask) always hold the true key
-	// length and existing on-disk records (flag clear) read as ordinary records --
+	// Real keys are tiny, so the unflagged low bits (keyLenMask) always hold the true key
+	// length and existing on-disk records (flags clear) read as ordinary records --
 	// the discriminator is backward compatible and needs no header growth.
 	markerFlag = uint32(1) << 31
 	// dictFlag (the next bit down) marks the per-segment attribute DICTIONARY record of an
@@ -68,8 +68,20 @@ const (
 	// Putting it inside the segment rather than beside it is deliberate -- it shares the segment's
 	// framing, its per-record CRC, its fsync, and its lifetime, so there is no way to have one
 	// without the other.
-	colFlag    = uint32(1) << 29
-	keyLenMask = colFlag - 1
+	colFlag = uint32(1) << 29
+	// deltaFlag (the next bit down) marks a DELTA record: one holding only the attributes a
+	// single write changed, rather than the whole ad (see delta.go). Unlike the three flags
+	// above it does NOT set markerFlag -- a delta is an ordinary keyed record, visible to every
+	// walk -- it only says that the record's bytes are a fragment.
+	//
+	// It lives here, in the header, rather than in the record's payload (where wire.flagDelta
+	// also records it) because the header is readable WITHOUT decompressing. The payload-only
+	// form forced every reader on a delta-enabled collection to decompress every record just to
+	// discover it was an ordinary one, which is a cost paid per record scanned on a store whose
+	// records are mostly whole. The payload flag is still written and is still what a
+	// materialize reads; this is the index that lets the common case skip the work.
+	deltaFlag  = uint32(1) << 28
+	keyLenMask = deltaFlag - 1
 
 	noSeg  = ^uint32(0)
 	seqMax = ^uint64(0)
@@ -448,6 +460,15 @@ func recCRC(b []byte, crcOff int) uint32 {
 // record's commit sequence; supersededBySeq is initialized to seqMax (current).
 // The caller holds the shard lock.
 func (s *segment) append(seq uint64, next loc, key, ad []byte) (uint32, bool) {
+	return s.appendFlagged(seq, next, key, ad, 0)
+}
+
+// appendFlagged is append with header flag bits OR'd into the keyLen field -- deltaFlag, for a
+// record holding only what one write changed. Separated from append so that the flag has to be
+// passed deliberately: a COPY of a record (compaction, a dict retrain, a columnarizing rewrite)
+// must carry the source's flags forward, and a plain append that forgot them would turn a
+// fragment into something a reader believes is a whole ad.
+func (s *segment) appendFlagged(seq uint64, next loc, key, ad []byte, hdrFlags uint32) (uint32, bool) {
 	rl := recordLen(len(key), len(ad))
 	off := s.used
 	if off+rl > len(s.data) {
@@ -462,7 +483,7 @@ func (s *segment) append(seq uint64, next loc, key, ad []byte) (uint32, bool) {
 	binary.LittleEndian.PutUint32(b[recNextSegOff:], next.seg)
 	binary.LittleEndian.PutUint32(b[recNextOffOff:], next.off)
 	binary.LittleEndian.PutUint32(b[recTotalLenOff:], uint32(rl))
-	binary.LittleEndian.PutUint32(b[recKeyLenOff:], uint32(len(key)))
+	binary.LittleEndian.PutUint32(b[recKeyLenOff:], uint32(len(key))|hdrFlags)
 	copy(b[recKeyOff:], key)
 	adLenOff := recKeyOff + len(key)
 	binary.LittleEndian.PutUint32(b[adLenOff:], uint32(len(ad)))
@@ -674,8 +695,8 @@ func recTotalLen(b []byte, off uint32) uint32 {
 	return binary.LittleEndian.Uint32(b[off+recTotalLenOff:])
 }
 
-// recKeyLen is the true key length: the low 31 bits of the keyLen field, masking off
-// the marker flag (markerFlag) so a marker (flag set, key length 0) reads as keyless.
+// recKeyLen is the true key length: the keyLen field with its four flag bits masked off, so
+// a marker (flag set, key length 0) reads as keyless and a delta reads as its real key.
 func recKeyLen(b []byte, off uint32) uint32 {
 	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:]) & keyLenMask
 }
@@ -703,6 +724,20 @@ func recIsDict(b []byte, off uint32) bool {
 // recIsCol reports whether the record is the segment's columnar payload.
 func recIsCol(b []byte, off uint32) bool {
 	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&colFlag != 0
+}
+
+// srcHdrFlags returns the header flag bits a COPY of this record must carry forward. Only
+// deltaFlag is copyable: the marker/dict/columnar flags describe records that are rebuilt from
+// scratch by whatever is doing the copying, never copied through it.
+func srcHdrFlags(b []byte, off uint32) uint32 {
+	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:]) & deltaFlag
+}
+
+// recIsDelta reports whether a record holds only the attributes one write changed (deltaFlag)
+// rather than a whole ad. It reads the header only -- no decompression, no decode -- which is
+// the entire reason the flag is here and not just in the payload.
+func recIsDelta(b []byte, off uint32) bool {
+	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&deltaFlag != 0
 }
 
 // recFits reports whether a record at off lies wholly within b: its fixed header, its key, and the ad
@@ -745,7 +780,9 @@ func recAd(b []byte, off uint32) []byte {
 // rewrite must stay superseded after it, or a scan would resurrect an old version.
 func (s *segment) appendRawRecord(srcData []byte, srcOff uint32, ad []byte) (uint32, bool) {
 	key := recKey(srcData, srcOff)
-	off, ok := s.append(recSeq(srcData, srcOff), loc{seg: noSeg}, key, ad)
+	// The source's delta flag rides along: this rewrite replaces a record's payload, not its
+	// meaning, and a fragment copied without the flag becomes a fragment every reader trusts.
+	off, ok := s.appendFlagged(recSeq(srcData, srcOff), loc{seg: noSeg}, key, ad, srcHdrFlags(srcData, srcOff))
 	if !ok {
 		return 0, false
 	}

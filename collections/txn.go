@@ -93,7 +93,7 @@ func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64) ([]byte, 
 	if !ok2 {
 		return nil, nil, nil, false
 	}
-	if raw, rc, handled, ok3 := sh.resolveDelta(c, key, h, s0, ad, adCodec); handled {
+	if raw, rc, handled, ok3 := sh.resolveDelta(c, key, h, s0, recIsDelta(seg.data, l.off), ad, adCodec); handled {
 		if !ok3 {
 			return nil, nil, nil, false
 		}
@@ -200,12 +200,23 @@ type txnWrite struct {
 	ad    []byte // compressed bytes (nil for a delete)
 	codec Codec
 	del   bool
+	// delta records that ad holds only what this write CHANGED, so the record's header can say
+	// so and readers can tell without decompressing it (see segment.deltaFlag).
+	delta bool
 	base  uint64 // snapshot S0: conflict if the key changed after this
 	adObj *classad.ClassAd
 	// buf is the originating buffered write, so ordered-index maintenance can materialize
 	// a wire-ingested ad on demand -- a collection with no ordered index never does.
 	buf *txnBuf
 	ok  bool // committed (true) or conflicted (false)
+}
+
+// hdrFlags returns the record header flag bits for this write.
+func (w *txnWrite) hdrFlags() uint32 {
+	if w.delta {
+		return deltaFlag
+	}
+	return 0
 }
 
 // commitTxn applies a shard's buffered transactional writes with per-write conflict
@@ -254,7 +265,7 @@ func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 			}
 			continue
 		}
-		sh.put(w.hash, w.key, w.ad, seq, w.codec)
+		sh.put(w.hash, w.key, w.ad, seq, w.codec, w.hdrFlags())
 		changed = true
 	}
 	if changed {
@@ -534,6 +545,15 @@ func (tx *Txn) putWire(key, wire []byte, decode func([]byte) (*classad.ClassAd, 
 // merged view (Get applies the patch over the stored ad), so read-your-writes is unaffected.
 func (tx *Txn) PatchAttrs(key []byte, patch *classad.ClassAd, removed []string) {
 	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
+	// Reuse an existing patch buffer for this key instead of replacing it. A caller applying a
+	// schedd transaction calls this once per attribute it changed, accumulating into one patch
+	// object, so a fresh buffer and a fresh copy of the key per call was N-1 of each thrown away
+	// per transaction. A buffer holding anything else -- a whole ad, wire bytes, a delete -- is
+	// still REPLACED, which is what it meant before: the last write in a transaction wins.
+	if b, ok := tx.writes[string(key)]; ok && b.patch != nil && b.ad == nil && b.wire == nil && !b.del {
+		b.patch, b.removed = patch, removed
+		return
+	}
 	tx.writes[string(key)] = &txnBuf{
 		key: append([]byte(nil), key...), patch: patch, removed: removed,
 	}
@@ -617,9 +637,9 @@ func (tx *Txn) Commit() CommitResult {
 			switch {
 			case raw != nil:
 			case b.patch != nil && b.ad == nil:
-				raw = tx.encodePatchOnly(b)
+				raw, w.delta = tx.encodePatchOnly(b, h)
 			default:
-				raw = tx.c.encodeDelta(string(b.key), b.ad, b.changed, b.noDelta)
+				raw, w.delta = tx.c.encodeDelta(b.key, h, b.ad, b.changed, b.noDelta)
 			}
 			w.ad = w.codec.Compress(nil, raw)
 		}

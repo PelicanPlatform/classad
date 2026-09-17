@@ -611,6 +611,28 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 				continue
 			}
 			sup := recSuperseded(seg.data, o)
+			// A DELTA holds only what one write changed, and the INTERNING path below decodes
+			// each record and encodes it afresh -- which turns a fragment into something every
+			// later reader believes is a whole ad. The recompress-only path copies the stored
+			// bytes and carries the flag with them (see the appendFlagged calls), so it is safe
+			// and is not guarded here; only the re-encoding path is.
+			//
+			// collapseBeforeRewrite is supposed to leave no LIVE delta, so one here is an
+			// invariant violation: abort, which leaves the shard uncompacted rather than
+			// rewritten wrongly, and lets the next attempt collapse again. A SUPERSEDED delta
+			// still inside the travel window IS reachable -- in the window after time travel is
+			// switched on over a delta store -- and is dropped rather than carried: losing a
+			// historical version is recoverable, serving a fragment as a whole ad is not.
+			if intern && recIsDelta(seg.data, o) {
+				if sup == seqMax {
+					compactLiveDeltas.Add(1)
+					abort = true
+					break
+				}
+				compactDroppedDeltas.Add(1)
+				off += int(total)
+				continue
+			}
 			if sup == seqMax {
 				// Current version -> live stream (rebuilt into the directory).
 				key := recKey(seg.data, o)
@@ -636,7 +658,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 					if cur == nil || cur.codec != outCodec || cur.used+rl > len(cur.data) {
 						cur = newDst(&dstSegs, rl, outCodec)
 					}
-					dstOff, _ = cur.append(seq, noLoc, key, outAd)
+					dstOff, _ = cur.appendFlagged(seq, noLoc, key, outAd, srcHdrFlags(seg.data, o))
 					dstSeg = cur
 				}
 				moved = append(moved, movedRec{
@@ -671,7 +693,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 					if hcur == nil || hcur.codec != outCodec || hcur.used+rl > len(hcur.data) {
 						hcur = newDst(&histSegs, rl, outCodec)
 					}
-					dstOff, _ := hcur.append(seq, noLoc, key, outAd)
+					dstOff, _ := hcur.appendFlagged(seq, noLoc, key, outAd, srcHdrFlags(seg.data, o))
 					hcur.supersedeRec(dstOff, sup)
 				}
 			}

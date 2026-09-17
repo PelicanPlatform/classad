@@ -59,7 +59,14 @@ func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
 	} else {
 		raw, err = r.w.codec.Decompress(buf[:0], r.stored())
 	}
-	if err != nil || !c.deltaRead || !isDeltaRecord(raw) {
+	if err != nil || !c.deltaRead {
+		return raw, err
+	}
+	if deltaHdrDispatch {
+		if !recIsDelta(r.w.data, r.off) {
+			return raw, err
+		}
+	} else if !isDeltaRecord(raw) { // see deltaHdrDispatch: the pre-header dispatch
 		return raw, err
 	}
 	key := r.key()
@@ -169,22 +176,38 @@ func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Code
 		*scratch = full
 		stored, codec = full, identityCodec{}
 	}
-	if !c.deltaRead {
-		return stored, codec, true
-	}
 	// A delta record holds only the attributes one write changed -- the same hazard the
 	// columnar branch above exists for: half an ad is indistinguishable from an ad whose
 	// attributes really were removed. Resolving it HERE covers every reader that goes through
 	// this primitive (the visible-record walks behind serial, reverse and chained scans, the
 	// ordered-index rebuild, ForEachAd, and the watch catch-up) rather than requiring each to
 	// be taught separately -- which is how about ten of them ended up serving fragments.
-	raw, err := codec.Decompress((*scratch)[:0], stored)
-	if err != nil {
-		return nil, nil, false
+	//
+	// The test is the record HEADER, so an ordinary record in a delta-enabled collection leaves
+	// here on the same line it always did, still compressed, with the callback decompressing it
+	// once as before. Deciding this from the payload instead meant decompressing every record
+	// scanned -- and then the callback's identity Decompress copied the result again, so a scan
+	// of a store of whole ads paid a decompression and a full-ad memcpy per record for a feature
+	// none of its records used.
+	if !c.deltaRead {
+		return stored, codec, true
 	}
-	*scratch = raw
-	if !isDeltaRecord(raw) {
-		return raw, identityCodec{}, true
+	if deltaHdrDispatch {
+		if !recIsDelta(r.w.data, r.off) {
+			return stored, codec, true
+		}
+	} else {
+		// The pre-header dispatch (see deltaHdrDispatch), reproduced exactly so the A/B compares
+		// implementations and not incidental extra work: one decompression, reused by the caller
+		// through the identity codec when the record turns out to be an ordinary one.
+		raw, err := codec.Decompress((*scratch)[:0], stored)
+		if err != nil {
+			return nil, nil, false
+		}
+		*scratch = raw
+		if !isDeltaRecord(raw) {
+			return raw, identityCodec{}, true
+		}
 	}
 	key := r.key()
 	h := c.h.Hash(key)

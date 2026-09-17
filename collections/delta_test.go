@@ -2,6 +2,7 @@ package collections
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -498,10 +499,8 @@ func TestDeltaVsColumnarization(t *testing.T) {
 				if tl == 0 || off+tl > uint32(seg.used) {
 					break
 				}
-				if recKeyLen(seg.data, off)&markerFlag == 0 {
-					if raw, err := seg.codec.Decompress(nil, recAd(seg.data, off)); err == nil && isDeltaRecord(raw) {
-						sealedDeltas++
-					}
+				if !recIsMarker(seg.data, off) && deltaClassify(t, seg, off) {
+					sealedDeltas++
 				}
 				off += tl
 			}
@@ -759,17 +758,15 @@ func TestNoLiveDeltaOutsideActiveSegment(t *testing.T) {
 				if tl == 0 || off+tl > uint32(seg.used) {
 					break
 				}
-				if recKeyLen(seg.data, off)&markerFlag == 0 {
-					if raw, err := seg.codec.Decompress(nil, recAd(seg.data, off)); err == nil && isDeltaRecord(raw) {
-						live := recSuperseded(seg.data, off) == seqMax
-						switch {
-						case live && active:
-							liveActiveDeltas++
-						case live:
-							liveSealedDeltas++
-						default:
-							deadSealedDeltas++
-						}
+				if !recIsMarker(seg.data, off) && deltaClassify(t, seg, off) {
+					live := recSuperseded(seg.data, off) == seqMax
+					switch {
+					case live && active:
+						liveActiveDeltas++
+					case live:
+						liveSealedDeltas++
+					default:
+						deadSealedDeltas++
 					}
 				}
 				off += tl
@@ -973,5 +970,85 @@ func TestDeltaModeMarkerIsLazyAndReversible(t *testing.T) {
 	}
 	if n := len(ad.AST().Attributes); n != 45 {
 		t.Fatalf("m0 has %d attributes, want 45", n)
+	}
+}
+
+// deltaClassify reports whether the record at off is a delta, checking the record HEADER flag
+// (what production dispatches on) against the flag in the record's decompressed PAYLOAD (an
+// independent copy, written by the encoder). Disagreement is a hard failure: it is what a write
+// or copy path that lost or invented a flag looks like, and in production it is silent -- a
+// fragment served as a whole ad, or a whole ad sent hunting for a base it does not have.
+//
+// The tests below deliberately classify through this rather than through recIsDelta alone, so
+// every record every delta test walks is also a check that the two encodings agree.
+func deltaClassify(t *testing.T, seg *segment, off uint32) bool {
+	t.Helper()
+	hdr := recIsDelta(seg.data, off)
+	raw, err := seg.codec.Decompress(nil, recAd(seg.data, off))
+	if err != nil {
+		return hdr // encrypted or otherwise opaque here; the header is all we can read
+	}
+	if pay := isDeltaRecord(raw); pay != hdr {
+		t.Fatalf("record at off=%d: header says delta=%v, payload says delta=%v", off, hdr, pay)
+	}
+	return hdr
+}
+
+// TestPreReleaseDeltaMarkerRefused: a store whose deltamode marker says "1" holds delta records
+// that carry no header flag, so this build would read every one of them as a whole ad -- the
+// 45-attributes-becomes-1 failure the marker exists to prevent. Opening it must fail rather than
+// succeed and serve fragments.
+func TestPreReleaseDeltaMarkerRefused(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{Dir: dir, Shards: 2, DeltaMax: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("1.0")
+	tx := c.Begin()
+	tx.Put(key, jobAd(1, nil))
+	if r := tx.Commit(); r.Conflicted() {
+		t.Fatal("seed conflicted")
+	}
+	patch := classad.New()
+	patch.InsertAttr("JobStatus", 4)
+	tx = c.Begin()
+	tx.PatchAttrs(key, patch, nil)
+	if r := tx.Commit(); r.Conflicted() {
+		t.Fatal("patch conflicted")
+	}
+	if deltas, _ := c.DeltaStats(); deltas == 0 {
+		t.Fatal("no delta was written, so the marker under test was never created")
+	}
+	c.Close()
+
+	marker := filepath.Join(dir, deltaModeFile)
+	if b, rerr := os.ReadFile(marker); rerr != nil {
+		t.Fatal(rerr)
+	} else if string(b) != deltaModeVersion {
+		t.Fatalf("marker holds %q, want %q", b, deltaModeVersion)
+	}
+	// Reopening as written must work; only the old version is refused.
+	c2, err := Open(Options{Dir: dir, Shards: 2, DeltaMax: 4})
+	if err != nil {
+		t.Fatalf("reopening a current-version delta store: %v", err)
+	}
+	if ad, ok := c2.Get(key); !ok {
+		t.Fatal("key missing after reopen")
+	} else if n := ad.Size(); n < 40 {
+		t.Fatalf("reopen served %d attributes, want the whole ad", n)
+	}
+	c2.Close()
+
+	if werr := os.WriteFile(marker, []byte("1"), 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+	c3, err := Open(Options{Dir: dir, Shards: 2, DeltaMax: 4})
+	if err == nil {
+		c3.Close()
+		t.Fatal("opened a pre-release delta store: its deltas would be served as whole ads")
+	}
+	if !errors.Is(err, errPreReleaseDeltaStore) {
+		t.Fatalf("refused with the wrong error: %v", err)
 	}
 }

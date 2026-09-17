@@ -153,8 +153,66 @@ func mergeDelta(base, delta *classad.ClassAd) {
 // delta records, it is invisible in the results, and nothing else would notice it coming back.
 var storeReads atomic.Int64
 
-// isDeltaRecord reports whether decompressed record bytes are a delta.
+// deltaHdrDispatch selects how a reader decides whether a record is a delta.
+//
+//	true  -- from the record HEADER (recIsDelta): a 4-byte read, no decompression.
+//	false -- from the record PAYLOAD (isDeltaRecord): decompress the record first, which is how
+//	         delta records were first implemented.
+//
+// Production always uses the header; nothing outside a test writes this. It exists because the
+// two dispatches are the whole subject of a measurement -- running them as separate builds
+// compares two machine states as much as two implementations, and running them in one process
+// over one dataset does not -- and because a differential test that runs both is a stronger
+// check on the header flag than any assertion about it: for every record a test writes, the two
+// independent encodings of "this is a delta" must lead to the same ad.
+var deltaHdrDispatch = true
+
+// sealWalkRecords and sealWalkDeltas count what the seal-time walk (liveDeltaKeys) examines:
+// every live record in a sealing segment, and the few that are actually open chains. The ratio is
+// the argument for classifying from the header: under the payload dispatch every record counted
+// here cost a decompression, and only the second counter's worth of them needed one. Internal
+// because it answers a design question, not an operational one.
+var (
+	sealWalkRecords atomic.Int64
+	sealWalkDeltas  atomic.Int64
+)
+
+// segRecIsDelta classifies a record under whichever dispatch is selected. Only the seal-time
+// walk uses it: that walk visits every live record in a sealing segment, so it is where the
+// payload dispatch was most expensive -- tens of thousands of decompressions per seal, to find
+// the handful of keys whose chains are still open.
+func segRecIsDelta(seg *segment, off uint32) bool {
+	if deltaHdrDispatch {
+		return recIsDelta(seg.data, off)
+	}
+	raw, err := seg.codec.Decompress(nil, recAd(seg.data, off))
+	return err == nil && isDeltaRecord(raw)
+}
+
+// isDeltaRecord reports whether decompressed record bytes are a delta, according to the flag in
+// the record's PAYLOAD. The header flag (recIsDelta) is what the read paths dispatch on, because
+// it needs no decompression; this is the independent second copy, used to check that the two
+// agree at the one place where disagreement would be silent (see materializeAt).
 func isDeltaRecord(rec []byte) bool { return wire.IsDelta(rec) }
+
+// compactLiveDeltas counts live delta records met by a compaction, which collapseBeforeRewrite
+// is supposed to make impossible; each one aborts that shard's compaction.
+// compactDroppedDeltas counts superseded delta versions dropped from the time-travel window
+// rather than carried forward (see the compaction loop).
+// deltaFlagMismatches counts records whose header flag and payload flag disagree -- a refused
+// read, and the signal that a copy path lost or invented a flag.
+var (
+	compactLiveDeltas    atomic.Int64
+	compactDroppedDeltas atomic.Int64
+	deltaFlagMismatches  atomic.Int64
+)
+
+// DeltaAnomalies reports the three things that should all stay zero in a healthy delta store:
+// live deltas met by compaction, superseded deltas dropped from the travel window, and records
+// whose header and payload disagree about being a delta.
+func DeltaAnomalies() (liveAtCompact, droppedFromHistory, flagMismatch int64) {
+	return compactLiveDeltas.Load(), compactDroppedDeltas.Load(), deltaFlagMismatches.Load()
+}
 
 // encodeDelta encodes the record bytes for a write: a delta holding only the changed
 // attributes when the collection has delta mode on and this write qualifies, else the whole
@@ -163,9 +221,12 @@ func isDeltaRecord(rec []byte) bool { return wire.IsDelta(rec) }
 //
 // Delta mode is off unless Options.DeltaMax is set, so every existing caller and store keeps
 // byte-identical behavior.
-func (c *Collection) encodeDelta(key string, ad *classad.ClassAd, changed []string, removed bool) []byte {
+// h is the key's hash, which the caller has already computed: taking the key as a string and
+// re-deriving it here cost a string allocation for the parameter and a []byte allocation per use
+// of it, three per write, for a number the caller was holding.
+func (c *Collection) encodeDelta(key []byte, h uint64, ad *classad.ClassAd, changed []string, removed bool) ([]byte, bool) {
 	if c.deltaMax <= 0 || c.deltas == nil || !c.inline {
-		return c.encodeAd(ad.AST())
+		return c.encodeAd(ad.AST()), false
 	}
 	var d *ast.ClassAd
 	eligible := !removed && len(changed) > 0
@@ -180,12 +241,12 @@ func (c *Collection) encodeDelta(key string, ad *classad.ClassAd, changed []stri
 	if eligible && !c.canWriteDelta() {
 		eligible = false
 	}
-	if !c.deltas.next(c.h.Hash([]byte(key)), eligible, c.keyExists([]byte(key)), c.deltaMax) {
-		return c.encodeAd(ad.AST())
+	if !c.deltas.next(h, eligible, c.keyExists(key, h), c.deltaMax) {
+		return c.encodeAd(ad.AST()), false
 	}
 	// Deltas are encoded with the inline-name form and no hot header: the hot header indexes
 	// a whole ad for the match fast path, and a fragment has no business claiming to be one.
-	return wire.EncodeInlineDelta(nil, d, nil, c.shouldEncrypt, c.sealer)
+	return wire.EncodeInlineDelta(nil, d, nil, c.shouldEncrypt, c.sealer), true
 }
 
 // materializeAt reconstructs the whole ad for key as of snapshot s0 from a delta chain,
@@ -204,13 +265,9 @@ func (c *Collection) encodeDelta(key string, ad *classad.ClassAd, changed []stri
 // rather than guessed at: returning a partial ad would look like data and be wrong.
 // hasFull reports whether any gathered version is a whole record, i.e. whether the chain can
 // be resolved from what has been found so far.
-func (sh *shard) hasFull(c *Collection, vers []deltaVer) bool {
+func (sh *shard) hasFull(vers []deltaVer) bool {
 	for _, v := range vers {
-		stored, codec, ok := segStoredOrReassembled(c, v.seg, v.off)
-		if !ok {
-			continue
-		}
-		if raw, err := codec.Decompress(nil, stored); err == nil && !isDeltaRecord(raw) {
+		if !recIsDelta(v.seg.data, v.off) {
 			return true
 		}
 	}
@@ -249,14 +306,18 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64) (
 	// So when the routes above produced no whole record, fall back to reading the active
 	// segment directly. Chains never span a seal, so that is the only place the rest of one can
 	// be. Bounded to the case that actually needs it: with the directory intact this never runs.
-	if !sh.hasFull(c, vers) && sh.act != nil {
+	if !sh.hasFull(vers) && sh.act != nil {
 		seg := sh.act
 		for off := uint32(0); off < uint32(seg.used); {
 			tl := recTotalLen(seg.data, off)
 			if tl == 0 || off+tl > uint32(seg.used) {
 				break
 			}
-			if recKeyLen(seg.data, off)&markerFlag == 0 {
+			// recIsMarker, not recKeyLen()&markerFlag: recKeyLen MASKS the flag bits off, so that
+			// test was always true and this walk never skipped a marker. Harmless as it stood --
+			// a marker is keyless and add() matches on the key -- but it was not doing what it
+			// said, and with a second flag now in the same field it would matter.
+			if !recIsMarker(seg.data, off) {
 				add(seg, off)
 			}
 			off += tl
@@ -267,11 +328,22 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64) (
 	}
 	sort.Slice(vers, func(i, j int) bool { return vers[i].seq < vers[j].seq })
 
-	// Decode from the newest full record forward. Walking backwards to find it first would
-	// mean decoding the deltas twice.
+	// Locate the base -- the newest whole record -- from the record HEADERS, then decompress
+	// only from there forward. Establishing it by decompressing newest-first and stopping at the
+	// first whole record read the same set of records, but it could not know it had failed until
+	// it had decompressed every version.
 	base := -1
-	raws := make([][]byte, len(vers))
 	for i := len(vers) - 1; i >= 0; i-- {
+		if !recIsDelta(vers[i].seg.data, vers[i].off) {
+			base = i
+			break
+		}
+	}
+	if base < 0 {
+		return nil, false // no full record: see above, do not guess
+	}
+	raws := make([][]byte, len(vers))
+	for i := base; i < len(vers); i++ {
 		stored, codec, ok := segStoredOrReassembled(c, vers[i].seg, vers[i].off)
 		if !ok {
 			return nil, false
@@ -280,14 +352,15 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64) (
 		if err != nil {
 			return nil, false
 		}
-		raws[i] = raw
-		if !isDeltaRecord(raw) {
-			base = i
-			break
+		// The header said what this record is; the payload says so independently. They can only
+		// disagree if a copy path lost or invented a flag, and the consequence of trusting the
+		// header then is either merging onto a fragment or dropping every delta after it -- both
+		// silent. Checked here because these bytes are decompressed anyway, so it is free.
+		if isDeltaRecord(raw) != (i > base) {
+			deltaFlagMismatches.Add(1)
+			return nil, false
 		}
-	}
-	if base < 0 {
-		return nil, false // no full record: see above, do not guess
+		raws[i] = raw
 	}
 	full, err := c.decodeWire(raws[base])
 	if err != nil {
@@ -314,22 +387,30 @@ func (c *Collection) DeltaStats() (deltas, fulls int64) {
 }
 
 // resolveDelta is the shared tail of the point-read paths (shard.get and shard.getAt) once a
-// record's stored bytes are in hand. When delta mode is off it reports false and the caller
-// returns the bytes untouched, exactly as before. When it is on, the bytes have to be examined
-// -- so they are decompressed here and returned under identityCodec, sparing the caller a
-// second decompression -- and a delta is replayed into the whole ad.
+// record's stored bytes are in hand. It reports "handled" only for a record that actually IS a
+// delta; for everything else the caller proceeds exactly as it did before delta records existed.
+//
+// isDelta comes from the record HEADER (recIsDelta), read by the caller which has the segment and
+// offset. It used to be established here by decompressing the record and looking at its payload,
+// which meant that turning delta mode on made every point read of every ordinary record pay a
+// decompression it had no use for. A store's records are mostly ordinary, so that was the common
+// case.
 //
 // Callers must hold the shard read lock: materializeAt reads other segments' bytes.
-func (sh *shard) resolveDelta(c *Collection, key []byte, h, s0 uint64, stored []byte, codec Codec) ([]byte, Codec, bool, bool) {
+func (sh *shard) resolveDelta(c *Collection, key []byte, h, s0 uint64, isDelta bool, stored []byte, codec Codec) ([]byte, Codec, bool, bool) {
 	if !c.deltaRead {
 		return nil, nil, false, true // not handled here; caller proceeds as before
 	}
-	raw, err := codec.Decompress(nil, stored)
-	if err != nil {
-		return nil, nil, true, false
-	}
-	if !isDeltaRecord(raw) {
-		return raw, identityCodec{}, true, true
+	if !deltaHdrDispatch { // see deltaHdrDispatch: the pre-header dispatch, for the A/B
+		raw, err := codec.Decompress(nil, stored)
+		if err != nil {
+			return nil, nil, true, false
+		}
+		if !isDeltaRecord(raw) {
+			return raw, identityCodec{}, true, true
+		}
+	} else if !isDelta {
+		return nil, nil, false, true
 	}
 	merged, ok := sh.materializeAt(c, key, h, s0)
 	if !ok {
@@ -387,16 +468,16 @@ func (c *Collection) collapseBeforeRewrite() {
 // and merged: on a key's first write, when the chain has reached its bound, and when the write
 // removed an attribute (which a delta of present attributes cannot express). So a read happens
 // once per re-materialization rather than once per update.
-func (tx *Txn) encodePatchOnly(b *txnBuf) []byte {
+func (tx *Txn) encodePatchOnly(b *txnBuf, h uint64) ([]byte, bool) {
 	c := tx.c
 	eligible := len(b.removed) == 0 && b.patch != nil
 	if eligible && c.deltaMax > 0 && c.deltas != nil && c.inline && c.canWriteDelta() {
-		if c.deltas.next(c.h.Hash(b.key), true, c.keyExists(b.key), c.deltaMax) {
-			return wire.EncodeInlineDelta(nil, b.patch.AST(), nil, c.shouldEncrypt, c.sealer)
+		if c.deltas.next(h, true, c.keyExists(b.key, h), c.deltaMax) {
+			return wire.EncodeInlineDelta(nil, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true
 		}
 	} else if c.deltas != nil {
 		// Record the decision so the chain restarts here even when delta mode declined.
-		c.deltas.next(c.h.Hash(b.key), false, false, c.deltaMax)
+		c.deltas.next(h, false, false, c.deltaMax)
 	}
 	// A whole record is required: compose it from the stored ad plus this write's changes.
 	// b.ad is filled in so the rest of Commit (ordered-index maintenance, watch publication)
@@ -411,12 +492,31 @@ func (tx *Txn) encodePatchOnly(b *txnBuf) []byte {
 		ad.Delete(n)
 	}
 	b.ad = ad
-	return c.encodeAd(ad.AST())
+	return c.encodeAd(ad.AST()), false
 }
 
 // deltaModeFile records that a store has written delta records, so a later open knows it must
 // replay them whatever DeltaMax it was given. See initDeltaMode.
 const deltaModeFile = "deltamode"
+
+// deltaModeVersion is the marker's content: which of the two possible delta ENCODINGS the
+// store's records use.
+//
+//	"1" -- pre-release: the only record of being a delta is a flag inside the record's
+//	       compressed payload, so classifying a record required decompressing it.
+//	"2" -- current: the record HEADER carries deltaFlag as well, so a reader classifies without
+//	       decompressing (and the payload flag remains as a cross-check).
+//
+// A "1" store cannot be read by this code: its delta records have no header flag, so every one
+// of them would be taken for a whole ad and served as a fragment -- exactly the failure the
+// marker exists to prevent. It is refused at open instead. Only a build from the unmerged
+// delta-records branch could have written one.
+const deltaModeVersion = "2"
+
+// errPreReleaseDeltaStore reports a store whose delta records predate the header flag.
+var errPreReleaseDeltaStore = errors.New(
+	"collections: store contains pre-release delta records (deltamode marker \"1\") that this build cannot read; " +
+		"it was written by an unreleased build of the delta-records branch and must be rebuilt")
 
 // initDeltaMode reconciles the configured DeltaMax with what the store on disk already holds.
 //
@@ -428,7 +528,11 @@ const deltaModeFile = "deltamode"
 // change and safe to roll back.
 func (c *Collection) initDeltaMode(dir string) error {
 	path := filepath.Join(dir, deltaModeFile)
-	if _, err := os.Stat(path); err == nil {
+	if b, err := os.ReadFile(path); err == nil {
+		if v := string(bytes.TrimSpace(b)); v != deltaModeVersion {
+			// Refusing to open beats opening and serving fragments. See deltaModeVersion.
+			return errPreReleaseDeltaStore
+		}
 		c.deltaRead = true
 		c.deltaMarked.Store(true) // already recorded; do not rewrite it
 	} else if !os.IsNotExist(err) {
@@ -465,7 +569,7 @@ func (c *Collection) markDeltaMode() {
 	if c.deltaMarked.Load() {
 		return
 	}
-	if err := writeFileDurable(filepath.Join(c.deltaDir, deltaModeFile), []byte("1")); err != nil {
+	if err := writeFileDurable(filepath.Join(c.deltaDir, deltaModeFile), []byte(deltaModeVersion)); err != nil {
 		return // could not record it: the next write tries again rather than storing a delta
 	}
 	c.deltaMarked.Store(true)
@@ -600,8 +704,7 @@ func (c *Collection) collapseLiveChains() {
 // bookkeeping: after a seal-collapse the tracker is empty, so the question has to be asked of
 // the store -- but only the cheap half of it. A key with no record must get a whole record,
 // since a delta chained to nothing is unreadable.
-func (c *Collection) keyExists(key []byte) bool {
-	h := c.h.Hash(key)
+func (c *Collection) keyExists(key []byte, h uint64) bool {
 	sh := c.shards[c.shardOf(key, h)]
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
@@ -640,8 +743,10 @@ func (c *Collection) liveDeltaKeys() [][]byte {
 				if tl == 0 || off+tl > uint32(seg.used) {
 					break
 				}
-				if recKeyLen(seg.data, off)&markerFlag == 0 && recSuperseded(seg.data, off) == seqMax {
-					if raw, err := seg.codec.Decompress(nil, recAd(seg.data, off)); err == nil && isDeltaRecord(raw) {
+				if !recIsMarker(seg.data, off) && recSuperseded(seg.data, off) == seqMax {
+					sealWalkRecords.Add(1)
+					if segRecIsDelta(seg, off) {
+						sealWalkDeltas.Add(1)
 						out = append(out, append([]byte(nil), recKey(seg.data, off)...))
 					}
 				}

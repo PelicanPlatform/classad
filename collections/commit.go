@@ -120,7 +120,7 @@ func (sh *shard) applyWrites(writes []pendingPut) {
 	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
 	for i := range writes {
-		sh.put(writes[i].hash, writes[i].key, writes[i].ad, seq, writes[i].codec)
+		sh.put(writes[i].hash, writes[i].key, writes[i].ad, seq, writes[i].codec, 0)
 	}
 	sh.commitSeq = seq
 	sh.maybeCheckpoint(seq)
@@ -138,7 +138,7 @@ func (sh *shard) applyWrites(writes []pendingPut) {
 func (sh *shard) applyOne(p pendingPut) {
 	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
-	sh.put(p.hash, p.key, p.ad, seq, p.codec)
+	sh.put(p.hash, p.key, p.ad, seq, p.codec, 0)
 	sh.commitSeq = seq
 	sh.maybeCheckpoint(seq)
 	sh.unlockWrite(acq, held)
@@ -155,7 +155,7 @@ func (sh *shard) applyBatch(batch []*commitReq) {
 	seq := sh.commitSeq + 1
 	for _, r := range batch {
 		for i := range r.writes {
-			sh.put(r.writes[i].hash, r.writes[i].key, r.writes[i].ad, seq, r.writes[i].codec)
+			sh.put(r.writes[i].hash, r.writes[i].key, r.writes[i].ad, seq, r.writes[i].codec, 0)
 		}
 	}
 	sh.commitSeq = seq
