@@ -563,7 +563,7 @@ func (c *Collection) watchAdAs(key, rawAd []byte, codec Codec, redact bool) (*cl
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
 			sh := c.shards[c.shardOf(pk, ph)]
-			if pad, pcodec, pdict, ok := sh.get(c, ph, pk); ok {
+			if pad, pcodec, pdict, _, ok := sh.get(c, ph, pk, mWire); ok {
 				if parent, err := c.decodeAdDictAs(pdict, pad, pcodec, redact); err == nil {
 					c.mergeParent(ad, parent)
 				}

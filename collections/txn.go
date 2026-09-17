@@ -74,34 +74,36 @@ func (sh *shard) findVisible(head loc, key []byte, s0 uint64) (loc, bool) {
 
 // getAt returns a private copy of key's ad bytes as of snapshot s0, or (nil, nil,
 // false) if the key had no version live at s0.
-func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64) ([]byte, Codec, *segDictHandle, bool) {
+// The fourth result is the ad as an object, on the same terms as shard.get: non-nil only when a
+// delta chain had to be merged, in which case the bytes are just that object encoded.
+func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64, want materializeWant) ([]byte, Codec, *segDictHandle, *classad.ClassAd, bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	l, ok := sh.findVisible(sh.dirGet(h), key, s0)
 	if !ok {
 		if l, ok = sh.lookupSealedAt(key, h, s0); !ok {
-			return nil, nil, nil, false
+			return nil, nil, nil, nil, false
 		}
 	}
 	// segForLoc, not segAt: l can come from the sealed KEY INDEX as well as the chain, and a sidecar
 	// describing a segment that has since been rewritten names offsets that no longer hold records.
 	seg := sh.segForLoc(l)
 	if seg == nil {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	ad, adCodec, ok2 := segStoredOrReassembled(c, seg, l.off)
 	if !ok2 {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
-	if raw, rc, handled, ok3 := sh.resolveDelta(c, key, h, s0, recIsDelta(seg.data, l.off), ad, adCodec); handled {
+	if raw, rc, obj, handled, ok3 := sh.resolveDelta(c, key, h, s0, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
 		if !ok3 {
-			return nil, nil, nil, false
+			return nil, nil, nil, nil, false
 		}
 		dict := seg.dict.Load()
 		if dict != nil {
 			dict.ensureNames()
 		}
-		return raw, rc, dict, true
+		return raw, rc, dict, obj, true
 	}
 	out := make([]byte, len(ad))
 	copy(out, ad)
@@ -122,7 +124,7 @@ func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64) ([]byte, 
 	if dict != nil {
 		dict.ensureNames()
 	}
-	return out, adCodec, dict, true
+	return out, adCodec, dict, nil, true
 }
 
 // hasAt reports whether key had a version live at snapshot s0. It is getAt's resolution
@@ -306,7 +308,7 @@ func (sh *shard) publishTxn(c *Collection, ws []*txnWrite, seq uint64) {
 				// materializeAt reads other segments' bytes, so it needs the shard read lock;
 				// publishTxn runs after the write lock is dropped and holds none of its own.
 				sh.mu.RLock()
-				merged, ok := sh.materializeAt(c, w.key, w.hash, seq)
+				merged, _, ok := sh.materializeAt(c, w.key, w.hash, seq, mWire, nil)
 				sh.mu.RUnlock()
 				if ok {
 					ad, codec = merged, identityCodec{}
@@ -492,9 +494,15 @@ func (tx *Txn) readStored(key []byte) (*classad.ClassAd, bool) {
 	h := tx.c.h.Hash(key)
 	idx := tx.c.shardOf(key, h)
 	s0 := tx.snapOf(idx)
-	stored, codec, dict, ok := tx.c.shards[idx].getAt(tx.c, h, key, s0)
+	stored, codec, dict, obj, ok := tx.c.shards[idx].getAt(tx.c, h, key, s0, readWant(tx.redact))
 	if !ok {
 		return nil, false
+	}
+	// A merged delta chain arrives as the object it was encoded from; decoding the bytes back
+	// would rebuild what we are holding. Not for a redacting read -- redaction is applied by the
+	// decode, and the object has every sealed value open.
+	if obj != nil && !tx.redact {
+		return obj, true
 	}
 	ad, err := tx.c.decodeAdDictAs(dict, stored, codec, tx.redact)
 	if err != nil {
@@ -526,9 +534,18 @@ func (tx *Txn) Has(key []byte) bool {
 // back was 57% of the ingest run. The bytes must be a complete record in this collection's
 // encoding -- nothing validates that, which is why this is unexported and has one caller.
 func (tx *Txn) putWire(key, wire []byte, decode func([]byte) (*classad.ClassAd, error)) {
+	tx.putWireAd(key, wire, nil, decode)
+}
+
+// putWireAd is putWire for a caller that already holds the ad these bytes encode. The object is
+// buffered beside the bytes, so anything in Commit that wants it (ordered-index maintenance,
+// watch publication) gets it for free instead of decoding the bytes back into the object they
+// were just encoded from. decode is still required: ad may be nil, and a later caller may need
+// to materialize from bytes alone.
+func (tx *Txn) putWireAd(key, wire []byte, ad *classad.ClassAd, decode func([]byte) (*classad.ClassAd, error)) {
 	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
 	tx.writes[string(key)] = &txnBuf{
-		key: append([]byte(nil), key...), wire: wire, decodeWireFn: decode,
+		key: append([]byte(nil), key...), wire: wire, ad: ad, decodeWireFn: decode,
 	}
 }
 
@@ -619,6 +636,10 @@ func (tx *Txn) Commit() CommitResult {
 	// triggers it occurs under a shard write lock deep inside this call, and collapsing means
 	// ordinary reads and writes. No-op unless a segment actually sealed.
 	defer tx.c.collapseSealedChains()
+	// One scratch buffer for every encode in this commit: each write's uncompressed wire bytes
+	// are alive only until the line that compresses them, so the next write can have the same
+	// buffer. It grows once to the widest ad in the batch instead of being reallocated per write.
+	var encScratch []byte
 	byShard := make(map[int][]*txnWrite)
 	for _, b := range tx.writes {
 		if b.del && tx.c.deltas != nil {
@@ -636,10 +657,13 @@ func (tx *Txn) Commit() CommitResult {
 			raw := b.wire
 			switch {
 			case raw != nil:
+				// Bytes the caller buffered (Txn.putWire); they are not ours to reuse.
 			case b.patch != nil && b.ad == nil:
-				raw, w.delta = tx.encodePatchOnly(b, h)
+				raw, w.delta = tx.encodePatchOnly(encScratch[:0], b, h)
+				encScratch = raw
 			default:
-				raw, w.delta = tx.c.encodeDelta(b.key, h, b.ad, b.changed, b.noDelta)
+				raw, w.delta = tx.c.encodeDelta(encScratch[:0], b.key, h, b.ad, b.changed, b.noDelta)
+				encScratch = raw
 			}
 			w.ad = w.codec.Compress(nil, raw)
 		}

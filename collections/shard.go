@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // shard owns an independent slice of the keyspace: a directory mapping a key hash
@@ -467,37 +469,47 @@ func (sh *shard) writeMarker(seq, millis uint64) bool {
 	return true
 }
 
-// get returns a private copy of the current ad bytes for key and the codec they
-// were compressed with, or (nil, nil, false).
-func (sh *shard) get(c *Collection, h uint64, key []byte) ([]byte, Codec, *segDictHandle, bool) {
+// get returns a private copy of the current ad bytes for key and the codec they were compressed
+// with, or (nil, nil, nil, nil, false).
+//
+// The fourth result is the ad as an OBJECT, non-nil only when satisfying the read meant building
+// one anyway -- which is the case for a delta chain, where the bytes returned are what the merged
+// object was just encoded into. A caller that wants an object should use it rather than decode the
+// bytes back; see Collection.getAs and Txn.readStored, where that decode was 25% of a real queue
+// replay's allocation. It is a fresh object per call, so a caller may keep or mutate it.
+//
+// want says which form to produce; see shard.materializeAt. A redacting caller must ask for mWire
+// and decode: the object is built by opening every sealed value, and redaction is applied by the
+// decode.
+func (sh *shard) get(c *Collection, h uint64, key []byte, want materializeWant) ([]byte, Codec, *segDictHandle, *classad.ClassAd, bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	l, ok := sh.findCurrent(sh.dirGet(h), key)
 	if !ok {
 		if l, ok = sh.lookupSealed(key, h); !ok {
-			return nil, nil, nil, false
+			return nil, nil, nil, nil, false
 		}
 	}
 	// segForLoc, not segAt: l can come from the sealed KEY INDEX as well as the chain, and a sidecar
 	// describing a segment that has since been rewritten names offsets that no longer hold records.
 	seg := sh.segForLoc(l)
 	if seg == nil {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	ad, adCodec, ok2 := segStoredOrReassembled(c, seg, l.off)
 	if !ok2 {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	// A current read is a snapshot read at the newest sequence, so replay uses seqMax.
-	if raw, rc, handled, ok3 := sh.resolveDelta(c, key, h, seqMax, recIsDelta(seg.data, l.off), ad, adCodec); handled {
+	if raw, rc, obj, handled, ok3 := sh.resolveDelta(c, key, h, seqMax, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
 		if !ok3 {
-			return nil, nil, nil, false
+			return nil, nil, nil, nil, false
 		}
 		dict := seg.dict.Load()
 		if dict != nil {
 			dict.ensureNames()
 		}
-		return raw, rc, dict, true
+		return raw, rc, dict, obj, true
 	}
 	out := make([]byte, len(ad))
 	copy(out, ad)
@@ -509,7 +521,7 @@ func (sh *shard) get(c *Collection, h uint64, key []byte) ([]byte, Codec, *segDi
 	if dict != nil {
 		dict.ensureNames()
 	}
-	return out, adCodec, dict, true
+	return out, adCodec, dict, nil, true
 }
 
 // forEachSealedRecord calls fn for every record in this shard's SEALED, indexed

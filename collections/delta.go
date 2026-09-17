@@ -136,11 +136,19 @@ func deltaAd(full *classad.ClassAd, changed []string) *ast.ClassAd {
 
 // mergeDelta applies a delta's attributes over base, last write winning. base is mutated.
 func mergeDelta(base, delta *classad.ClassAd) {
-	if base == nil || delta == nil {
+	if delta == nil {
 		return
 	}
-	d := delta.AST()
-	if d == nil {
+	mergeDeltaAST(base, delta.AST())
+}
+
+// mergeDeltaAST is mergeDelta for a caller holding the delta as a decoded AST rather than as a
+// ClassAd. Merging only ever reads the AST's attribute list, so wrapping one in a ClassAd first
+// bought nothing and cost a full name-index rebuild per delta merged (classad.FromAST calls
+// rebuildIndex) -- which on a real queue replay was the largest single item under materializeAt
+// after the decode itself.
+func mergeDeltaAST(base *classad.ClassAd, d *ast.ClassAd) {
+	if base == nil || d == nil {
 		return
 	}
 	for _, a := range d.Attributes {
@@ -224,9 +232,9 @@ func DeltaAnomalies() (liveAtCompact, droppedFromHistory, flagMismatch int64) {
 // h is the key's hash, which the caller has already computed: taking the key as a string and
 // re-deriving it here cost a string allocation for the parameter and a []byte allocation per use
 // of it, three per write, for a number the caller was holding.
-func (c *Collection) encodeDelta(key []byte, h uint64, ad *classad.ClassAd, changed []string, removed bool) ([]byte, bool) {
+func (c *Collection) encodeDelta(dst []byte, key []byte, h uint64, ad *classad.ClassAd, changed []string, removed bool) ([]byte, bool) {
 	if c.deltaMax <= 0 || c.deltas == nil || !c.inline {
-		return c.encodeAd(ad.AST()), false
+		return c.encodeAdInto(dst, ad.AST()), false
 	}
 	var d *ast.ClassAd
 	eligible := !removed && len(changed) > 0
@@ -242,11 +250,11 @@ func (c *Collection) encodeDelta(key []byte, h uint64, ad *classad.ClassAd, chan
 		eligible = false
 	}
 	if !c.deltas.next(h, eligible, c.keyExists(key, h), c.deltaMax) {
-		return c.encodeAd(ad.AST()), false
+		return c.encodeAdInto(dst, ad.AST()), false
 	}
 	// Deltas are encoded with the inline-name form and no hot header: the hot header indexes
 	// a whole ad for the match fast path, and a fragment has no business claiming to be one.
-	return wire.EncodeInlineDelta(nil, d, nil, c.shouldEncrypt, c.sealer), true
+	return wire.EncodeInlineDelta(dst, d, nil, c.shouldEncrypt, c.sealer), true
 }
 
 // materializeAt reconstructs the whole ad for key as of snapshot s0 from a delta chain,
@@ -274,7 +282,24 @@ func (sh *shard) hasFull(vers []deltaVer) bool {
 	return false
 }
 
-func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64) ([]byte, bool) {
+// want says which FORM the caller needs, and it decides how the merge is done -- the two forms
+// have different cheapest routes and producing the unwanted one is pure waste:
+//
+//   - mWire alone: splice the entry bytes. Nothing is decoded and nothing is re-encoded, so this
+//     is the cheap path, and it is what the scans, the watch publisher and the seal-time collapse
+//     want (the collapse stores the bytes).
+//   - mObj: decode and merge into an object, and encode only if mWire was asked for too. A point
+//     read wants the object and nothing else, and used to get an encode of the merged ad that its
+//     caller immediately decoded again.
+//
+// Asking for both is the expensive combination and only the collapse does it, only when the
+// collection has an ordered index or a watcher -- the two things that need the object.
+//
+// dst, when non-nil, is where the merged BYTES are appended -- for a caller whose result is
+// transient and who already owns a reusable buffer (the scan iterators do, and their contract
+// already says the bytes live only until the next record). A caller that RETAINS the bytes must
+// pass nil: the collapse buffers them until its commit lands.
+func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, want materializeWant, dst []byte) ([]byte, *classad.ClassAd, bool) {
 	var vers []deltaVer
 	add := func(seg *segment, off uint32) {
 		if seg == nil {
@@ -324,7 +349,7 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64) (
 		}
 	}
 	if len(vers) == 0 {
-		return nil, false
+		return nil, nil, false
 	}
 	sort.Slice(vers, func(i, j int) bool { return vers[i].seq < vers[j].seq })
 
@@ -340,41 +365,175 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64) (
 		}
 	}
 	if base < 0 {
-		return nil, false // no full record: see above, do not guess
+		return nil, nil, false // no full record: see above, do not guess
 	}
-	raws := make([][]byte, len(vers))
+	// Decompress the participants into reused buffers. They all have to be live at once (the
+	// merge reads every one), so this is one buffer per chain position, reused across calls rather
+	// than allocated per call -- which at DeltaMax deltas of a multi-KB ad was 9% of a real queue
+	// replay's allocation. The pooled state therefore retains up to DeltaMax ad buffers per pooled
+	// instance, which is the memory this trades for the churn.
+	ds, _ := decompressPool.Get().(*decompressState)
+	if ds == nil {
+		ds = &decompressState{}
+	}
+	defer decompressPool.Put(ds)
+	raws := ds.grow(len(vers))
 	for i := base; i < len(vers); i++ {
 		stored, codec, ok := segStoredOrReassembled(c, vers[i].seg, vers[i].off)
 		if !ok {
-			return nil, false
+			return nil, nil, false
 		}
-		raw, err := codec.Decompress(nil, stored)
+		raw, err := codec.Decompress(ds.bufs[i][:0], stored)
 		if err != nil {
-			return nil, false
+			return nil, nil, false
 		}
+		ds.bufs[i] = raw
 		// The header said what this record is; the payload says so independently. They can only
 		// disagree if a copy path lost or invented a flag, and the consequence of trusting the
 		// header then is either merging onto a fragment or dropping every delta after it -- both
 		// silent. Checked here because these bytes are decompressed anyway, so it is free.
 		if isDeltaRecord(raw) != (i > base) {
 			deltaFlagMismatches.Add(1)
-			return nil, false
+			return nil, nil, false
 		}
 		raws[i] = raw
 	}
+	// Bytes only: splice the entry bytes and never build an object. Splicing and then decoding
+	// for a caller that wanted an object is no cheaper than decoding and merging -- measured as a
+	// wash -- which is why this is gated on what the caller asked for rather than always tried.
+	if want == mWire {
+		if spliced, ok := c.spliceMerge(dst, raws[base:]); ok {
+			return spliced, nil, true
+		}
+	}
+	if want&mObj != 0 {
+		objectMerges.Add(1)
+	}
 	full, err := c.decodeWire(raws[base])
 	if err != nil {
-		return nil, false
+		return nil, nil, false
 	}
 	merged := classad.FromAST(full)
 	for i := base + 1; i < len(vers); i++ {
 		d, derr := c.decodeWire(raws[i])
 		if derr != nil {
-			return nil, false
+			return nil, nil, false
 		}
-		mergeDelta(merged, classad.FromAST(d))
+		mergeDeltaAST(merged, d)
 	}
-	return c.encodeAd(merged.AST()), true
+	// Encode only for a caller that wants bytes. A point read does not: it takes the object, and
+	// encoding the merged ad so that its caller could decode it again was the round trip this
+	// whole path exists to avoid.
+	if want&mWire == 0 {
+		return nil, merged, true
+	}
+	return c.encodeAdInto(dst, merged.AST()), merged, true
+}
+
+// readWant is the form a point read needs: the object, except for a redacting read, which must
+// take the bytes because redaction happens in the decode.
+func readWant(redact bool) materializeWant {
+	if redact {
+		return mWire
+	}
+	return mObj
+}
+
+// materializeWant is the set of forms a materialize caller needs back.
+type materializeWant uint8
+
+const (
+	mWire materializeWant = 1 << iota // the merged ad as wire bytes
+	mObj                              // the merged ad as an object
+)
+
+// decompressState holds one reusable decompression buffer per chain position, for materializeAt.
+type decompressState struct {
+	bufs [][]byte
+	raws [][]byte
+}
+
+// grow sizes the state for a chain of n participants and returns the raws slice to fill.
+func (d *decompressState) grow(n int) [][]byte {
+	for len(d.bufs) < n {
+		d.bufs = append(d.bufs, nil)
+	}
+	if cap(d.raws) < n {
+		d.raws = make([][]byte, n)
+	}
+	d.raws = d.raws[:n]
+	clear(d.raws)
+	return d.raws
+}
+
+var decompressPool = sync.Pool{New: func() any { return &decompressState{} }}
+
+// mergeState is spliceMerge's reusable scratch: the wire splicer's per-call state plus the
+// overlay slice it takes. Pooled because materializeAt runs concurrently under the shard read
+// lock, and because the whole point of splicing is to stop allocating per merge.
+type mergeState struct {
+	sc       wire.MergeScratch
+	overlays []wire.Ad
+}
+
+var mergePool = sync.Pool{New: func() any { return &mergeState{} }}
+
+// spliceMerge merges a chain -- raws[0] the whole record, the rest its deltas oldest-first -- by
+// copying attribute entries rather than decoding them, and returns the merged wire bytes.
+//
+// It reports false when the splice does not apply, and the caller falls back to decoding, which
+// is the source of truth: an interned or standalone ad names its attributes by an id into a table
+// the other participants do not share, so entries cannot move between ads.
+func (c *Collection) spliceMerge(dst []byte, raws [][]byte) ([]byte, bool) {
+	if len(raws) == 0 || !c.inline {
+		return nil, false
+	}
+	// No shortcut for a chain of one. Returning raws[0] directly would hand the caller a slice of
+	// materializeAt's REUSED decompression buffer, which the next merge overwrites -- and the
+	// collapse retains what it is given until its commit lands. The splice below copies.
+
+	ms, _ := mergePool.Get().(*mergeState)
+	if ms == nil {
+		ms = &mergeState{}
+	}
+	defer func() {
+		// Clear before pooling, do not just truncate: the scratch holds slices of the
+		// DECOMPRESSED participant ads, and a pooled struct that keeps those pointers alive
+		// pins one ad per overlay per pooled instance for as long as the pool holds it. Length
+		// zero does not drop what the backing array still references.
+		ms.overlays = ms.overlays[:0]
+		clear(ms.overlays[:cap(ms.overlays)])
+		ms.sc.Release()
+		mergePool.Put(ms)
+	}()
+	ms.overlays = ms.overlays[:0]
+	for _, r := range raws[1:] {
+		ms.overlays = append(ms.overlays, wire.Ad(r))
+	}
+	out, ok := wire.AppendAdMergedInline(dst, wire.Ad(raws[0]), ms.overlays, &ms.sc)
+	if !ok {
+		spliceFallbacks.Add(1)
+		return nil, false
+	}
+	spliceMerges.Add(1)
+	return out, true
+}
+
+// The three ways a delta merge can be served. Reported together because any one of them alone
+// misleads: a store whose merges all fall back is paying for the splice attempt and getting the
+// decode, and a store whose callers all want objects never attempts a splice at all -- both read
+// back perfectly correctly, so nothing else would notice.
+var (
+	spliceMerges    atomic.Int64 // spliced entry bytes
+	spliceFallbacks atomic.Int64 // splice attempted and refused (interned/standalone/malformed)
+	objectMerges    atomic.Int64 // decoded and merged into an object, because the caller wanted one
+)
+
+// SpliceStats reports how delta merges were served: by splicing attribute bytes, by decoding
+// after the splice refused, and by decoding because the caller asked for an object rather than
+// bytes (a point read, or a collapse in a collection with an ordered index or a watcher).
+func SpliceStats() (spliced, spliceRefused, objectPath int64) {
+	return spliceMerges.Load(), spliceFallbacks.Load(), objectMerges.Load()
 }
 
 // DeltaStats reports how many records this collection has stored as deltas versus in full
@@ -396,27 +555,32 @@ func (c *Collection) DeltaStats() (deltas, fulls int64) {
 // decompression it had no use for. A store's records are mostly ordinary, so that was the common
 // case.
 //
+// The third result is the merged ad as an OBJECT, which materializeAt built to produce the bytes.
+// A caller wanting an object should take it rather than decode the bytes back -- but never for a
+// redacting read, since the object holds every sealed value open.
+//
 // Callers must hold the shard read lock: materializeAt reads other segments' bytes.
-func (sh *shard) resolveDelta(c *Collection, key []byte, h, s0 uint64, isDelta bool, stored []byte, codec Codec) ([]byte, Codec, bool, bool) {
+func (sh *shard) resolveDelta(c *Collection, key []byte, h, s0 uint64, isDelta bool, stored []byte, codec Codec, want materializeWant) ([]byte, Codec, *classad.ClassAd, bool, bool) {
+	// nil dst: a point read's bytes are copied out from under the shard lock by its caller.
 	if !c.deltaRead {
-		return nil, nil, false, true // not handled here; caller proceeds as before
+		return nil, nil, nil, false, true // not handled here; caller proceeds as before
 	}
 	if !deltaHdrDispatch { // see deltaHdrDispatch: the pre-header dispatch, for the A/B
 		raw, err := codec.Decompress(nil, stored)
 		if err != nil {
-			return nil, nil, true, false
+			return nil, nil, nil, true, false
 		}
 		if !isDeltaRecord(raw) {
-			return raw, identityCodec{}, true, true
+			return raw, identityCodec{}, nil, true, true
 		}
 	} else if !isDelta {
-		return nil, nil, false, true
+		return nil, nil, nil, false, true
 	}
-	merged, ok := sh.materializeAt(c, key, h, s0)
+	merged, mergedAd, ok := sh.materializeAt(c, key, h, s0, want, nil)
 	if !ok {
-		return nil, nil, true, false
+		return nil, nil, nil, true, false
 	}
-	return merged, identityCodec{}, true, true
+	return merged, identityCodec{}, mergedAd, true, true
 }
 
 // materializeOpenChains writes a full record for every key that currently ends in a delta,
@@ -468,12 +632,12 @@ func (c *Collection) collapseBeforeRewrite() {
 // and merged: on a key's first write, when the chain has reached its bound, and when the write
 // removed an attribute (which a delta of present attributes cannot express). So a read happens
 // once per re-materialization rather than once per update.
-func (tx *Txn) encodePatchOnly(b *txnBuf, h uint64) ([]byte, bool) {
+func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) ([]byte, bool) {
 	c := tx.c
 	eligible := len(b.removed) == 0 && b.patch != nil
 	if eligible && c.deltaMax > 0 && c.deltas != nil && c.inline && c.canWriteDelta() {
 		if c.deltas.next(h, true, c.keyExists(b.key, h), c.deltaMax) {
-			return wire.EncodeInlineDelta(nil, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true
+			return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true
 		}
 	} else if c.deltas != nil {
 		// Record the decision so the chain restarts here even when delta mode declined.
@@ -492,7 +656,7 @@ func (tx *Txn) encodePatchOnly(b *txnBuf, h uint64) ([]byte, bool) {
 		ad.Delete(n)
 	}
 	b.ad = ad
-	return c.encodeAd(ad.AST()), false
+	return c.encodeAdInto(dst, ad.AST()), false
 }
 
 // deltaModeFile records that a store has written delta records, so a later open knows it must
@@ -682,7 +846,16 @@ func (c *Collection) collapseLiveChains() {
 		// deadlocks the pair. Caught by the concurrent-writer test, which hung.
 		s0 := tx.snapOf(idx)
 		sh.mu.RLock()
-		merged, ok := sh.materializeAt(c, key, c.h.Hash(key), s0)
+		// Bytes are what the collapse stores. The object is wanted only by the two things that
+		// ask Commit for one -- ordered-index maintenance and watch publication -- so asking for
+		// it unconditionally would force the decode-and-encode route on every collapse in a
+		// collection that has neither.
+		want := mWire
+		if c.hasOrdered() || sh.hub.watching() {
+			want |= mObj
+		}
+		// nil dst: the collapse buffers these bytes until its commit lands.
+		merged, mergedAd, ok := sh.materializeAt(c, key, c.h.Hash(key), s0, want, nil)
 		sh.mu.RUnlock()
 		if !ok {
 			continue // deleted underneath us, or already whole; nothing to collapse
@@ -690,7 +863,12 @@ func (c *Collection) collapseLiveChains() {
 		// The merged WIRE BYTES, written straight through. Going via Get would decode these
 		// same bytes into a ClassAd purely so Put could encode them again -- a round trip per
 		// chain per seal, which profiled at 57% of an ingest run.
-		tx.putWire(key, merged, c.decodeWireAd)
+		//
+		// mergedAd rides along because materializeAt built it to produce those bytes. Commit
+		// asks for the object (ordered-index maintenance, watch publication) and, given only
+		// bytes, decoded them -- reinstating the same round trip from the other side, at 14% of
+		// a real queue replay's allocation. Handing over what we already have costs nothing.
+		tx.putWireAd(key, merged, mergedAd, c.decodeWireAd)
 		if r := tx.Commit(); r.Conflicted() {
 			// A newer writer won. Its write is the current version; if it was a delta the chain
 			// is still open and the next seal collapses it.

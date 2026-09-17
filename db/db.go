@@ -1158,6 +1158,18 @@ func (db *DB) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool) {
 	return db.c.GroupSchemaLastAgreement()
 }
 
+// DeltaStats reports how many of this table's writes were stored as delta records versus in
+// full. Both zero means delta records are off (or nothing has been written). It is the only way
+// to tell a working delta store from one that has quietly fallen back to storing whole ads --
+// which reads back perfectly correctly and saves nothing.
+func (db *DB) DeltaStats() (deltas, fulls int64) { return db.c.DeltaStats() }
+
+// SpliceStats reports, process-wide, how delta merges were served: by splicing attribute bytes,
+// by decoding after the splice refused, and by decoding because the caller wanted an object
+// rather than bytes. All three matter -- a merge that never attempts a splice and one that
+// attempts and refuses look identical in a one-number report.
+func SpliceStats() (spliced, spliceRefused, objectPath int64) { return collections.SpliceStats() }
+
 // TrackedKeys reports how many keys the delta tracker holds in memory (0 when delta records
 // are off). It is the feature's one new in-memory structure, so it is the number to watch.
 func (db *DB) TrackedKeys() int { return db.c.TrackedKeys() }

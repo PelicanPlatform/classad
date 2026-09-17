@@ -933,21 +933,29 @@ func (c *Collection) GetRedacted(key []byte) (*classad.ClassAd, bool) {
 func (c *Collection) getAs(key []byte, redact bool) (*classad.ClassAd, bool) {
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	stored, codec, dict, ok := sh.get(c, h, key)
+	stored, codec, dict, obj, ok := sh.get(c, h, key, readWant(redact))
 	if !ok {
 		return nil, false
 	}
-	ad, err := c.decodeAdDictAs(dict, stored, codec, redact)
-	if err != nil {
-		return nil, false
+	// A merged delta chain comes back as the object those bytes were encoded from, so decoding
+	// them would rebuild what we already hold. Never for a redacting read: redaction is applied by
+	// the decode and the object has every sealed value open.
+	ad := obj
+	if ad == nil || redact {
+		var err error
+		if ad, err = c.decodeAdDictAs(dict, stored, codec, redact); err != nil {
+			return nil, false
+		}
 	}
 	// Chain to the parent (same shard) so the returned ad resolves inherited
 	// attributes -- Get mirrors query semantics.
 	if c.parentKeyFor != nil {
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
-			if pad, pcodec, pdict, ok := sh.get(c, ph, pk); ok {
-				if parent, err := c.decodeAdDictAs(pdict, pad, pcodec, redact); err == nil {
+			if pad, pcodec, pdict, pobj, ok := sh.get(c, ph, pk, readWant(redact)); ok {
+				if pobj != nil && !redact {
+					c.mergeParent(ad, pobj)
+				} else if parent, err := c.decodeAdDictAs(pdict, pad, pcodec, redact); err == nil {
 					c.mergeParent(ad, parent)
 				}
 			}

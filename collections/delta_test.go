@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -1051,4 +1053,103 @@ func TestPreReleaseDeltaMarkerRefused(t *testing.T) {
 	if !errors.Is(err, errPreReleaseDeltaStore) {
 		t.Fatalf("refused with the wrong error: %v", err)
 	}
+}
+
+// TestSpliceMergeAgreesWithDecodeMerge exercises the splice at the COLLECTION level, where the two
+// merge routes meet: a scan asks for wire bytes and gets the splice, a point read asks for an
+// object and gets decode-and-merge. They must agree.
+//
+// It matters that the deltas ADD attributes the base does not have, not just overwrite ones it
+// does. The existing delta tests only ever patch an attribute already present, so a splice that
+// dropped every added attribute passed all of them -- found by mutating the splice and watching
+// the suite stay green.
+func TestSpliceMergeAgreesWithDecodeMerge(t *testing.T) {
+	c, _ := openDelta(t, 8)
+	defer c.Close()
+	keys := make([][]byte, 60)
+	for i := range keys {
+		keys[i] = []byte(fmt.Sprintf("%d.0", i))
+	}
+	tx := c.Begin()
+	for i, k := range keys {
+		tx.Put(k, jobAd(i, nil)) // no LastJobLeaseRenewal: the patches below ADD attributes
+	}
+	if r := tx.Commit(); r.Conflicted() {
+		t.Fatal("seed conflicted")
+	}
+	// Each key gets a different number of deltas, and each delta adds an attribute absent from the
+	// base as well as overwriting one present in it.
+	want := make([]map[string]int64, len(keys))
+	for i, k := range keys {
+		want[i] = map[string]int64{}
+		for r := 1; r <= i%7; r++ {
+			patch := classad.New()
+			patch.InsertAttr(fmt.Sprintf("Added%d", r), int64(1000+r)) // absent from the base
+			patch.InsertAttr("JobStatus", int64(r))                    // present in the base
+			// Present in the base under DIFFERENT casing. Attribute names are case-insensitive, so
+			// this must replace Pad07 rather than sit beside it -- a case-sensitive merge would
+			// emit both, and a decode resolving duplicates by first occurrence would then serve the
+			// base's stale value and silently lose the update.
+			patch.InsertAttr("pAd07", int64(2000+r))
+			want[i][fmt.Sprintf("Added%d", r)] = int64(1000 + r)
+			want[i]["JobStatus"] = int64(r)
+			want[i]["Pad07"] = int64(2000 + r)
+			tx := c.Begin()
+			tx.PatchAttrs(k, patch, nil)
+			if res := tx.Commit(); res.Conflicted() {
+				t.Fatal("patch conflicted")
+			}
+		}
+	}
+	if deltas, fulls := c.DeltaStats(); deltas == 0 {
+		t.Fatalf("no deltas stored (%d whole): nothing to merge", fulls)
+	}
+
+	spliced0, _, _ := SpliceStats()
+	// The SCAN path asks materializeAt for wire bytes, which is the splice.
+	byKey := map[string]*classad.ClassAd{}
+	for ad := range c.Scan() {
+		v, ok := ad.EvaluateAttrInt("ClusterId")
+		if !ok {
+			t.Fatal("scanned ad has no ClusterId to identify it by")
+		}
+		byKey[fmt.Sprintf("%d.0", v)] = ad
+	}
+	spliced1, _, _ := SpliceStats()
+	if spliced1 == spliced0 {
+		t.Fatal("the scan performed no spliced merge: this test is not exercising the splice")
+	}
+
+	for i, k := range keys {
+		scanned, ok := byKey[string(k)]
+		if !ok {
+			t.Fatalf("%s missing from the scan", k)
+		}
+		// The POINT READ path asks for an object, which is decode-and-merge.
+		read, ok := c.Get(k)
+		if !ok {
+			t.Fatalf("%s missing from the point read", k)
+		}
+		if a, b := adDigestT(t, scanned), adDigestT(t, read); a != b {
+			t.Fatalf("%s: scan (spliced) and point read (decoded) disagree:\n scan %s\n read %s", k, a, b)
+		}
+		// And both must actually hold what the writes said, not merely agree with each other.
+		for name, v := range want[i] {
+			got, ok := scanned.EvaluateAttrInt(name)
+			if !ok || got != v {
+				t.Fatalf("%s[%s] = %d (present=%v), want %d", k, name, got, ok, v)
+			}
+		}
+		if v, ok := scanned.EvaluateAttrInt("Pad39"); !ok || v != 39 {
+			t.Fatalf("%s: base attribute Pad39 lost (%d, present=%v)", k, v, ok)
+		}
+	}
+}
+
+// adDigestT renders an ad as sorted old-ClassAd text, for comparing two routes' results.
+func adDigestT(t *testing.T, ad *classad.ClassAd) string {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(ad.MarshalOld()), "\n")
+	sort.Strings(lines)
+	return strings.Join(lines, "|")
 }

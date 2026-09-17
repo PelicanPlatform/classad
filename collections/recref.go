@@ -73,7 +73,7 @@ func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
 	sh.mu.RLock()
-	merged, ok := sh.materializeAt(c, key, h, s0)
+	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, buf[:0])
 	sh.mu.RUnlock()
 	if !ok {
 		return nil, errBadRemnant // a fragment we cannot complete: skip, never serve half an ad
@@ -213,11 +213,12 @@ func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Code
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
 	sh.mu.RLock()
-	merged, ok := sh.materializeAt(c, key, h, s0)
+	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, (*scratch)[:0])
 	sh.mu.RUnlock()
 	if !ok {
 		return nil, nil, false
 	}
+	*scratch = merged
 	return merged, identityCodec{}, true
 }
 

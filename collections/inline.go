@@ -16,14 +16,22 @@ import (
 // When encryption at rest is enabled, the designated attributes' values are sealed
 // with the DB data key (persistent/inline collections only).
 func (c *Collection) encodeAd(ad *ast.ClassAd) []byte {
+	return c.encodeAdInto(nil, ad)
+}
+
+// encodeAdInto is encodeAd appending into dst, for a caller whose encoded bytes are transient --
+// which in Commit they are: the record is compressed out of them and they are dead on the next
+// line. Every encode allocating its own buffer made that 12% of a real queue replay's allocation.
+// A caller that RETAINS the result (Txn.putWire buffers it until the commit lands) must pass nil.
+func (c *Collection) encodeAdInto(dst []byte, ad *ast.ClassAd) []byte {
 	if c.inline {
 		if c.sealer != nil {
-			return wire.EncodeInlineWithHotEnc(nil, ad, c.currentHotNames(), c.shouldEncrypt, c.sealer)
+			return wire.EncodeInlineWithHotEnc(dst, ad, c.currentHotNames(), c.shouldEncrypt, c.sealer)
 		}
-		return wire.EncodeInlineWithHot(nil, ad, c.currentHotNames())
+		return wire.EncodeInlineWithHot(dst, ad, c.currentHotNames())
 	}
 	hot, closureComplete := c.hotSetForEncode(ad)
-	return wire.EncodeWithHotClosure(nil, ad, c.intern, hot, closureComplete)
+	return wire.EncodeWithHotClosure(dst, ad, c.intern, hot, closureComplete)
 }
 
 // decodeWire decodes stored wire bytes back to an ast.ClassAd, opening any encrypted
