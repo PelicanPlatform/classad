@@ -146,7 +146,7 @@ func TestColumnarizeRoundTrip(t *testing.T) {
 	}
 
 	sh.mu.Lock()
-	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot, c.planDeltasLocked(sh, src))
 	sh.mu.Unlock()
 	if dst == nil {
 		t.Fatal("columnarizeSegment returned nil")
@@ -206,7 +206,7 @@ func TestColumnarizeRemovesTheRowCopy(t *testing.T) {
 			break
 		}
 	}
-	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot, c.planDeltasLocked(sh, src))
 	sh.mu.Unlock()
 	if src == nil || dst == nil {
 		t.Skip("nothing to columnarize")
@@ -308,7 +308,7 @@ func TestColumnarizeShrinksTheSegment(t *testing.T) {
 	if src != nil {
 		beforeUsed = src.used
 	}
-	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot, c.planDeltasLocked(sh, src))
 	sh.mu.Unlock()
 	if src == nil || dst == nil {
 		t.Skip("nothing to columnarize")
@@ -345,7 +345,7 @@ func TestColumnarPayloadCorruptionFailsLoudly(t *testing.T) {
 			break
 		}
 	}
-	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot, c.planDeltasLocked(sh, src))
 	sh.mu.Unlock()
 	if src == nil || dst == nil {
 		t.Skip("nothing to columnarize")
@@ -426,7 +426,7 @@ func TestColumnarizedSegmentPublishesItsOwnBlock(t *testing.T) {
 			break
 		}
 	}
-	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot, c.planDeltasLocked(sh, src))
 	sh.mu.Unlock()
 	if src == nil || dst == nil {
 		t.Skip("nothing to columnarize")

@@ -23,7 +23,7 @@ func TestColNativeSharesOneBlockCache(t *testing.T) {
 	var caches []*blockCache
 	var dsts []*segment
 	for _, src := range srcs {
-		dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
+		dst, _, _ := c.columnarizeSegment(sh, src, s, hot, c.planDeltasLocked(sh, src))
 		if dst == nil || !dst.columnarized() {
 			continue
 		}

@@ -488,7 +488,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, layout *colLayout, regionCo
 // interned collection; a decode/re-encode for an inline/persistent one). encode reads the
 // id-keyed form, so a non-interned record must be converted first or the block would be empty.
 func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool)) ([]*columnarBlock, []uint32) {
-	blocks, _, offs := buildColumnarFromSegmentGrouped(data, upto, arenaCodec, regionCodec, s, hot, nil, g, toInterned, nil)
+	blocks, _, offs := buildColumnarFromSegmentGrouped(data, upto, arenaCodec, regionCodec, s, hot, nil, g, toInterned, nil, nil)
 	return blocks, offs
 }
 
@@ -498,7 +498,11 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 // It keeps each pending record's INTERNED WIRE alongside its base row, because group membership is
 // a question the base row can no longer answer (see buildGroupBlocks). The retained wire is bounded
 // by the same group budget that bounds the pending rows.
-func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+// skip, when non-nil, excludes a record from the columnar payload entirely -- it gets no block
+// row and no offset, so the rewrite that consumes these offsets does not carry it into the new
+// segment either. Used to drop DELTA records: each holds the attributes one write changed, so its
+// row would be almost entirely absent fields, and it is dead by the time its segment seals.
+func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
 	var buf []byte
 	for off := 0; off < upto; {
@@ -507,7 +511,7 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCo
 		if total == 0 {
 			break
 		}
-		if !recIsMarker(data, o) {
+		if !recIsMarker(data, o) && (skip == nil || !skip(o)) {
 			if w, err := arenaCodec.Decompress(buf[:0], recAd(data, o)); err == nil {
 				buf = w
 				cb.feed(o, w)

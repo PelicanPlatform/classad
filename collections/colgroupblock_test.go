@@ -226,7 +226,7 @@ func TestGroupBlocksFollowBaseBlockBoundaries(t *testing.T) {
 	blocks, gblocks, _ := buildColumnarFromSegmentGrouped(w.data, w.used, w.codec, c.regionCodec(),
 		bs, nil, []*colGroup{g}, byRows(256), func(dst, x []byte) ([]byte, bool) {
 			return c.recordToInterned(dst, x)
-		}, nil)
+		}, nil, nil)
 	if len(blocks) < 2 {
 		t.Skipf("only %d base block(s); need several to test boundaries", len(blocks))
 	}

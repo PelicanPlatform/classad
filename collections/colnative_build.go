@@ -3,6 +3,8 @@ package collections
 import (
 	"strings"
 
+	"sync/atomic"
+
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
@@ -25,7 +27,11 @@ import (
 //
 // The source must be sealed (immutable), so it is read without the shard lock; the returned segment
 // is staged on disk and not yet part of the shard -- see columnarizeSealedSegment.
-func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, hot []int) (*segment, []uint32, []uint32) {
+// plan is the delta disposition for src, computed by the caller because only the caller knows
+// whether it already holds the shard lock -- planDeltasLocked reads shard state and must not
+// acquire it itself. nil means "no delta records", which is every segment of a collection that
+// never enabled them.
+func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, hot []int, plan *deltaPlan) (*segment, []uint32, []uint32) {
 	if src == nil || src.used == 0 || s == nil || len(s.fields) == 0 {
 		return nil, nil, nil
 	}
@@ -39,11 +45,36 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	if src.colDamaged.Load() {
 		return nil, nil, nil
 	}
+	// DELTA records do not belong in a columnarized segment, and this is where they leave.
+	//
+	// A delta holds the attributes one write CHANGED -- two or three of forty-five -- so giving it
+	// a columnar row means a row whose schema fields are almost entirely absent. Measured over a
+	// delta-shaped workload (TestColumnarDensityWithDeltas), 77% of the rows in a columnarized
+	// segment were delta records and the sealed arena was 13% larger for them. They are also pure
+	// garbage by this point: sealing collapses every open chain, so each one has been superseded
+	// by the whole record the collapse wrote.
+	//
+	// Dropping is possible at all because the rewrite below carries forward exactly the records
+	// these offsets name -- one excluded here is simply not in the new segment. Nothing points at
+	// it: appendRawRecord writes no chain link, and the key index is rebuilt over the new offsets.
+	if plan != nil && plan.unresolved {
+		// A delta that has to survive but whose chain will not resolve. There is nothing to write
+		// in its place, so leave the segment alone: an uncolumnarized segment costs an
+		// accelerator, a wrong one costs attributes. Counted (colDeltaUnresolved).
+		return nil, nil, nil
+	}
+	skipDelta := plan.skipper()
+
+	// A segment holding delta records is fed through the WIRES path rather than read straight from
+	// the arena, because a materialized delta's content is not in the arena -- it is the merge of a
+	// chain. The path already exists for re-columnarization and treats both identically; sharing it
+	// keeps one record walk rather than two that must agree.
+	fromWires := recol || !plan.empty()
 	var recolOffs []uint32
 	var recolFulls [][]byte
-	if recol {
+	if fromWires {
 		var ok bool
-		recolOffs, recolFulls, ok = c.reconstructFullRecords(src)
+		recolOffs, recolFulls, ok = c.reconstructFullRecords(src, skipDelta, plan)
 		if !ok || len(recolOffs) == 0 {
 			return nil, nil, nil
 		}
@@ -117,12 +148,12 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	var blocks []*columnarBlock
 	var gblocks [][]*colGroupBlock
 	var offs []uint32
-	if recol {
+	if fromWires {
 		blocks, gblocks, offs = buildColumnarFromWires(recolOffs, recolFulls,
 			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
 	} else {
 		blocks, gblocks, offs = buildColumnarFromSegmentGrouped(src.data, src.used, src.codec,
-			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
+			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), skipDelta)
 	}
 	if len(blocks) == 0 || len(offs) == 0 {
 		return nil, nil, nil
@@ -163,7 +194,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// When re-columnarizing, the arena holds only each record's remnant; its full ad was
 	// reconstructed for pass 1 and is reused here so the new remnant is split from the same content.
 	var fullByOff map[uint32][]byte
-	if recol {
+	if fromWires {
 		fullByOff = make(map[uint32][]byte, len(recolOffs))
 		for i, o := range recolOffs {
 			fullByOff[o] = recolFulls[i]
@@ -171,7 +202,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	}
 	for _, o := range offs {
 		var raw []byte
-		if recol {
+		if fromWires {
 			raw = fullByOff[o]
 			if raw == nil {
 				return nil, nil, nil
@@ -219,7 +250,15 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	srcOffs := make([]uint32, 0, len(rems))
 	for _, r := range rems {
 		srcOffs = append(srcOffs, r.off)
-		no, ok := dst.appendRawRecord(src.data, r.off, r.body)
+		// A materialized delta is no longer a delta: its record now holds the whole ad, so the
+		// header flag must NOT come across or every reader would go hunting for a chain to merge.
+		flags := srcHdrFlags(src.data, r.off)
+		if plan != nil {
+			if _, materialized := plan.full[r.off]; materialized {
+				flags &^= deltaFlag
+			}
+		}
+		no, ok := dst.appendRawRecordFlags(src.data, r.off, r.body, flags)
 		if !ok {
 			dst.retire()
 			dst.reapAndHook()
@@ -291,7 +330,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 // re-split. Reads immutable sealed bytes off the shard lock, like the rest of the build. ok=false on
 // any reconstruction error, so the caller keeps the original segment rather than rewriting it into
 // short ads.
-func (c *Collection) reconstructFullRecords(src *segment) ([]uint32, [][]byte, bool) {
+func (c *Collection) reconstructFullRecords(src *segment, skip func(uint32) bool, plan *deltaPlan) ([]uint32, [][]byte, bool) {
 	var offs []uint32
 	var fulls [][]byte
 	var buf []byte
@@ -301,7 +340,16 @@ func (c *Collection) reconstructFullRecords(src *segment) ([]uint32, [][]byte, b
 		if total == 0 {
 			break
 		}
-		if !recIsMarker(src.data, o) {
+		if !recIsMarker(src.data, o) && (skip == nil || !skip(o)) {
+			// A delta the plan materialized contributes the MERGED ad, not its own fragment.
+			if plan != nil {
+				if m, ok := plan.full[o]; ok {
+					offs = append(offs, o)
+					fulls = append(fulls, m)
+					off += int(total)
+					continue
+				}
+			}
 			full, err := c.recordWireIn(src, src.data, o, buf[:0])
 			if err != nil {
 				return nil, nil, false
@@ -313,6 +361,105 @@ func (c *Collection) reconstructFullRecords(src *segment) ([]uint32, [][]byte, b
 		off += int(total)
 	}
 	return offs, fulls, true
+}
+
+// deltaPlan says what to do with each delta record in a segment being columnarized. A columnarized
+// segment must hold none of them, so there are exactly two dispositions and no third:
+//
+//	drop        -- superseded at or below the retain floor. Garbage: nothing can read it.
+//	materialize -- everything else. The whole ad the fragment resolves to, written in its place.
+//
+// There is no "keep it as a delta" case, and no "give up on the segment" case either. Refusing to
+// columnarize a segment because it held a delta was self-defeating: the segment then KEEPS the
+// delta, which is the state this exists to prevent.
+type deltaPlan struct {
+	drop map[uint32]struct{}
+	full map[uint32][]byte // materialized whole ad, by source offset
+	// unresolved marks a segment holding a delta that must survive but whose chain would not
+	// merge. Carried on the plan rather than returned separately so a caller cannot compute a
+	// plan and forget to check it.
+	unresolved bool
+}
+
+func (p *deltaPlan) empty() bool { return p == nil || (len(p.drop) == 0 && len(p.full) == 0) }
+
+// skipper returns the predicate excluding dropped records from the build, or nil.
+func (p *deltaPlan) skipper() func(uint32) bool {
+	if p == nil || len(p.drop) == 0 {
+		return nil
+	}
+	return func(o uint32) bool { _, ok := p.drop[o]; return ok }
+}
+
+// planDeltas surveys src and decides each delta's disposition, materializing the ones that have to
+// survive. Reports false only when a delta that must survive CANNOT be materialized -- an
+// unresolvable or damaged chain -- which is the one case where there is nothing to write and the
+// segment is better left alone.
+//
+// A superseded delta inside a travel window is materialized AS OF ITS OWN COMMIT SEQUENCE, not as
+// of now: an AS OF read landing on that version wants the ad as it stood then, which is the base
+// plus the deltas up to and including this one.
+// The CALLER must hold at least the shard read lock: this reads shard state (the retain floor)
+// and materializeAt reads other segments' bytes. It does not take the lock itself, because
+// columnarizeSegment's callers are split on whether they already hold it -- and taking a read lock
+// while the same goroutine holds the write lock is a permanent self-deadlock, which is exactly
+// what an earlier version of this did (TestTinyCacheColnativeUnchanged hung for 29 minutes).
+func (c *Collection) planDeltasLocked(sh *shard, src *segment) *deltaPlan {
+	retain := sh.retainFloorLocked()
+	var plan *deltaPlan
+	for off := 0; off < src.used; {
+		o := uint32(off)
+		total := recTotalLen(src.data, o)
+		if total == 0 {
+			break
+		}
+		if !recIsMarker(src.data, o) && recIsDelta(src.data, o) {
+			if plan == nil {
+				plan = &deltaPlan{drop: map[uint32]struct{}{}, full: map[uint32][]byte{}}
+			}
+			sup := recSuperseded(src.data, o)
+			if sup != seqMax && sup <= retain {
+				plan.drop[o] = struct{}{}
+			} else {
+				// Live, or still inside the travel window. Both are resolvable, and both must
+				// come out of here as whole ads.
+				key := recKey(src.data, o)
+				h := c.h.Hash(key)
+				merged, _, ok := sh.materializeAt(c, key, h, recSeq(src.data, o), mWire, nil)
+				if !ok {
+					colDeltaUnresolved.Add(1)
+					plan.unresolved = true
+					return plan
+				}
+				plan.full[o] = append([]byte(nil), merged...)
+			}
+		}
+		off += int(total)
+	}
+	if plan != nil {
+		colDeltasDropped.Add(int64(len(plan.drop)))
+		colDeltasMaterialized.Add(int64(len(plan.full)))
+	}
+	return plan
+}
+
+// What columnarization did about delta records. Dropped and materialized should account for every
+// one it met; unresolved should stay at zero, and a non-zero count means a segment was left
+// uncolumnarized because a chain could not be resolved.
+var (
+	colDeltasDropped      atomic.Int64
+	colDeltasMaterialized atomic.Int64
+	colDeltaUnresolved    atomic.Int64
+)
+
+// ColumnarDeltasDropped reports how many delta records columnarization has dropped rather than
+// carried into a rewritten segment.
+func ColumnarDeltasDropped() int64 { return colDeltasDropped.Load() }
+
+// ColumnarDeltaDisposition reports what columnarization did with the delta records it met: dropped
+// as garbage, materialized into whole ads, and left alone because the chain would not resolve.
+func ColumnarDeltaDisposition() (dropped, materialized, unresolved int64) {
+	return colDeltasDropped.Load(), colDeltasMaterialized.Load(), colDeltaUnresolved.Load()
 }
 
 // stripSchemaAttrs returns the ad with every attribute the schema carries removed.
@@ -401,7 +548,13 @@ func (c *Collection) columnarizeSealedSegment(sh *shard, src *segment, s *adSche
 	if sh.allocNamed == nil || sh.segDir == "" {
 		return false // in-memory collection: nothing to make durable, and no file to stage
 	}
-	dst, srcOffs, newOffs := c.columnarizeSegment(sh, src, s, hot)
+	// The plan is computed here, under a BRIEF read lock, rather than inside columnarizeSegment:
+	// the rewrite that follows is long and must not hold a shard lock, and the other caller of
+	// columnarizeSegment already holds the write lock.
+	sh.mu.RLock()
+	plan := c.planDeltasLocked(sh, src)
+	sh.mu.RUnlock()
+	dst, srcOffs, newOffs := c.columnarizeSegment(sh, src, s, hot, plan)
 	if dst == nil {
 		return false
 	}
