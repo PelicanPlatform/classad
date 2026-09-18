@@ -845,21 +845,94 @@ func (c *Collection) collapseLiveChains() {
 	clear(c.deltas.depth) // the tracker describes the active segment, which is now collapsed
 	c.deltas.mu.Unlock()
 
+	// Collapse in BATCHES, not one transaction per key. Each commit is durable, so a key per
+	// transaction meant an fsync per key: a single compaction pass on a mirror of a real schedd
+	// performed 6,174 of them. A transaction spanning many keys pays roughly one msync pass per
+	// SHARD it touched instead (Commit syncs the touched shards concurrently and group-commits),
+	// and the conflict check is unchanged -- each key's read still happens after its shard's
+	// snapshot is taken and before the commit that could lose to a newer writer.
+	//
+	// Retry a lost race rather than abandoning the key. A conflict means a concurrent writer
+	// committed in that window; the newer version is now current and may itself be a delta, so the
+	// answer is to redo the read-modify-write against it. Skipping was silently permanent: see
+	// collapseRetry.
+	for attempt := 0; attempt < collapseAttempts && len(open) > 0; attempt++ {
+		open = c.collapseBatch(open)
+	}
 	for _, key := range open {
-		// Retry a lost race rather than abandoning the key. A conflict means a concurrent writer
-		// committed between this transaction's snapshot and its commit; the newer version is now
-		// current and may itself be a delta, so the answer is to redo the read-modify-write, not
-		// to skip. Skipping was silently permanent: see collapseRetry.
-		done := false
-		for attempt := 0; attempt < collapseAttempts && !done; attempt++ {
-			done = c.collapseOneKey(key)
+		// Still not collapsed after the retries. Remember it so a later pass tries again; a key
+		// left ending in a delta is exactly what must not be forgotten.
+		c.rememberCollapse(key)
+	}
+}
+
+// Batch bounds. A batch buffers each key's MERGED ad until it commits, so the byte bound is what
+// keeps a collapse of tens of thousands of wide ads from holding all of them at once; the count
+// bound keeps a batch of small ads from growing an unwieldy transaction. Whichever comes first.
+const (
+	maxCollapseBatch      = 512
+	maxCollapseBatchBytes = 8 << 20
+)
+
+// collapseBatch collapses keys in batched transactions and returns the ones that must be tried
+// again -- those whose commit lost a conflict, and those whose materialize failed while the key
+// still ends in a delta.
+func (c *Collection) collapseBatch(keys [][]byte) [][]byte {
+	var retry [][]byte
+	tx := c.Begin()
+	n, bytes := 0, 0
+	flush := func() {
+		if n == 0 {
+			return
 		}
-		if !done {
-			// Still not collapsed. Remember it so the next pass tries again; a key that ends in
-			// a delta in a sealed segment is exactly what must not be left behind.
-			c.rememberCollapse(key)
+		res := tx.Commit()
+		for _, k := range res.Conflicts {
+			retry = append(retry, append([]byte(nil), k...))
+		}
+		tx = c.Begin()
+		n, bytes = 0, 0
+	}
+	for _, key := range keys {
+		h := c.h.Hash(key)
+		idx := c.shardOf(key, h)
+		sh := c.shards[idx]
+		// snapOf takes the shard read lock itself, so it must run BEFORE this one: Go's RWMutex is
+		// not reentrant for RLock, and a writer arriving between the two acquisitions deadlocks the
+		// pair. Caught once by the concurrent-writer test, which hung.
+		s0 := tx.snapOf(idx)
+		// Bytes are what the collapse stores. The object is wanted only by the two things that ask
+		// Commit for one -- ordered-index maintenance and watch publication -- so asking for it
+		// unconditionally would force the decode-and-encode route on every collapse in a collection
+		// that has neither.
+		want := mWire
+		if c.hasOrdered() || sh.hub.watching() {
+			want |= mObj
+		}
+		sh.mu.RLock()
+		// nil dst: the collapse buffers these bytes until its commit lands.
+		merged, mergedAd, ok := sh.materializeAt(c, key, h, s0, want, nil)
+		sh.mu.RUnlock()
+		if !ok {
+			// Deleted underneath us, or already whole -- both mean nothing to collapse. But
+			// "materialize failed" is not the same as "no longer a delta": a damaged chain also
+			// lands here, and dropping it would leave the fragment behind. Ask the store.
+			if c.endsInDelta(key) {
+				retry = append(retry, key)
+			}
+			continue
+		}
+		if collapseRaceHook != nil {
+			collapseRaceHook(key)
+		}
+		tx.putWireAd(key, merged, mergedAd, c.decodeWireAd)
+		n++
+		bytes += len(merged)
+		if n >= maxCollapseBatch || bytes >= maxCollapseBatchBytes {
+			flush()
 		}
 	}
+	flush()
+	return retry
 }
 
 // collapseAttempts bounds the immediate retries of one key's collapse. A conflict needs a
@@ -887,65 +960,11 @@ var collapseDeferred atomic.Int64
 // CollapseDeferrals reports how many delta-chain collapses have been postponed to a later pass.
 func CollapseDeferrals() int64 { return collapseDeferred.Load() }
 
-// collapseRaceHook, when non-nil, runs inside collapseOneKey after the transaction's snapshot is
+// collapseRaceHook, when non-nil, runs inside collapseBatch after the transaction's snapshot is
 // taken and before it commits -- the window a concurrent writer has to make the collapse conflict.
 // Test-only (nil in production): the race is otherwise not reachable on demand, and what it
 // guards is the invariant that no live delta outlives its segment's seal.
 var collapseRaceHook func(key []byte)
-
-// collapseOneKey attempts a single collapse of key, reporting whether the key is done -- either
-// collapsed, or no longer in need of it (deleted, or already whole). A false return means the
-// caller must try again: the key still ends in a delta.
-func (c *Collection) collapseOneKey(key []byte) bool {
-	{
-		// Read and write under ONE transaction, so the snapshot is taken before the read and a
-		// commit that lands in between actually conflicts. Reading with c.Get first and opening
-		// the transaction afterwards captured the snapshot AFTER the value, so the conflict
-		// check could never fire and the collapse wrote a stale whole ad over a newer update --
-		// reproduced as 16 of 16 keys losing committed increments.
-		tx := c.Begin()
-		idx := c.shardOf(key, c.h.Hash(key))
-		sh := c.shards[idx]
-		// snapOf takes the shard read lock itself, so it must run BEFORE this one: Go's RWMutex
-		// is not reentrant for RLock, and a writer arriving between the two acquisitions
-		// deadlocks the pair. Caught by the concurrent-writer test, which hung.
-		s0 := tx.snapOf(idx)
-		sh.mu.RLock()
-		// Bytes are what the collapse stores. The object is wanted only by the two things that
-		// ask Commit for one -- ordered-index maintenance and watch publication -- so asking for
-		// it unconditionally would force the decode-and-encode route on every collapse in a
-		// collection that has neither.
-		want := mWire
-		if c.hasOrdered() || sh.hub.watching() {
-			want |= mObj
-		}
-		// nil dst: the collapse buffers these bytes until its commit lands.
-		merged, mergedAd, ok := sh.materializeAt(c, key, c.h.Hash(key), s0, want, nil)
-		sh.mu.RUnlock()
-		if !ok {
-			// Deleted underneath us, or already whole -- both mean nothing to collapse. But
-			// "materialize failed" is not the same as "no longer a delta": a damaged chain also
-			// lands here, and dropping it would leave the fragment sealed. Ask the store.
-			return !c.endsInDelta(key)
-		}
-		// The merged WIRE BYTES, written straight through. Going via Get would decode these
-		// same bytes into a ClassAd purely so Put could encode them again -- a round trip per
-		// chain per seal, which profiled at 57% of an ingest run.
-		//
-		// mergedAd rides along because materializeAt built it to produce those bytes. Commit
-		// asks for the object (ordered-index maintenance, watch publication) and, given only
-		// bytes, decoded them -- reinstating the same round trip from the other side, at 14% of
-		// a real queue replay's allocation. Handing over what we already have costs nothing.
-		if collapseRaceHook != nil {
-			collapseRaceHook(key)
-		}
-		tx.putWireAd(key, merged, mergedAd, c.decodeWireAd)
-		if r := tx.Commit(); r.Conflicted() {
-			return false // a newer writer won; the caller retries against the newer version
-		}
-		return true
-	}
-}
 
 // endsInDelta reports whether key's CURRENT record is a delta, resolving the location without
 // decoding anything. It answers the question the collapse needs when a materialize fails: "is
