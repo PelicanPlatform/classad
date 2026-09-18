@@ -180,7 +180,7 @@ func TestTinyCacheColnativeUnchanged(t *testing.T) {
 		before[string(recKey(src.data, o))] = adSummary(t, c, raw)
 	}
 
-	dst, _, _ := c.columnarizeSegment(sh, src, s, hot)
+	dst, _, _ := c.columnarizeSegment(sh, src, s, hot, c.planDeltasLocked(sh, src))
 	sh.mu.Unlock()
 	if dst == nil || !dst.columnarized() {
 		t.Skip("segment did not columnarize")

@@ -34,12 +34,20 @@ import (
 // materialize the deltas that depend on it. Compaction retains superseded versions only
 // above a retain floor, so delta records and time travel are refused together (see Open).
 //
-// COLUMNARIZATION is compatible, which is worth stating because an earlier version of this
-// comment said it was not. The seal-collapse invariant is what makes it so: every live record
-// outside the active segment is a whole ad, because sealing collapses each open chain (see
-// collapseSealedChains), so a sealed-segment rewrite still sees exactly what it always saw.
-// TestDeltaVsColumnarization asserts it end to end -- every attribute survives, before and
-// after, over a store whose sealed segments provably contain delta records.
+// COLUMNARIZATION is where this is still unfinished, and the constraint is a DENSITY one rather
+// than the correctness one it looks like. Reads are fine: the seal-collapse invariant leaves only
+// SUPERSEDED deltas in a sealed segment, nothing reads those, and TestDeltaVsColumnarization
+// confirms every attribute survives the rewrite. But the columnar builder filters markers and
+// nothing else, so each dead fragment still takes a row whose schema fields are almost entirely
+// absent. Measured over a delta-shaped workload (TestColumnarDensityWithDeltas): 77% of the rows
+// in a columnarized segment were dead delta records, and the sealed arena grew 13%.
+//
+// So a sealed segment should ideally hold NO delta records at all. Getting there means dropping
+// them when the segment seals -- they are garbage by then, superseded by the whole records the
+// collapse just wrote -- which is a seal-time rewrite that does not exist yet.
+//
+// (An earlier version of this comment said the two were simply not enabled together. A later one
+// said they were compatible, citing the correctness test. Both were too strong.)
 
 // deltaTracker counts, per key, how many delta records have been written since that key's
 // last full record. Absence of a key means "no full record has been written by this process",
@@ -838,6 +846,58 @@ func (c *Collection) collapseLiveChains() {
 	c.deltas.mu.Unlock()
 
 	for _, key := range open {
+		// Retry a lost race rather than abandoning the key. A conflict means a concurrent writer
+		// committed between this transaction's snapshot and its commit; the newer version is now
+		// current and may itself be a delta, so the answer is to redo the read-modify-write, not
+		// to skip. Skipping was silently permanent: see collapseRetry.
+		done := false
+		for attempt := 0; attempt < collapseAttempts && !done; attempt++ {
+			done = c.collapseOneKey(key)
+		}
+		if !done {
+			// Still not collapsed. Remember it so the next pass tries again; a key that ends in
+			// a delta in a sealed segment is exactly what must not be left behind.
+			c.rememberCollapse(key)
+		}
+	}
+}
+
+// collapseAttempts bounds the immediate retries of one key's collapse. A conflict needs a
+// concurrent writer to that same key, so a couple of attempts covers it; anything that survives
+// this goes on the retry set for the next pass rather than spinning here, because the collapse
+// runs on the way out of a commit and must not block on a contended key.
+const collapseAttempts = 3
+
+// rememberCollapse records a key whose collapse did not complete, for a later pass to retry.
+func (c *Collection) rememberCollapse(key []byte) {
+	c.collapseMu.Lock()
+	if c.collapseRetry == nil {
+		c.collapseRetry = map[string]struct{}{}
+	}
+	c.collapseRetry[string(key)] = struct{}{}
+	c.collapseMu.Unlock()
+	collapseDeferred.Add(1)
+}
+
+// collapseDeferred counts collapses postponed to a later pass. It should be near zero; a climbing
+// count means keys are repeatedly losing the race and their chains are living in sealed segments
+// in the meantime.
+var collapseDeferred atomic.Int64
+
+// CollapseDeferrals reports how many delta-chain collapses have been postponed to a later pass.
+func CollapseDeferrals() int64 { return collapseDeferred.Load() }
+
+// collapseRaceHook, when non-nil, runs inside collapseOneKey after the transaction's snapshot is
+// taken and before it commits -- the window a concurrent writer has to make the collapse conflict.
+// Test-only (nil in production): the race is otherwise not reachable on demand, and what it
+// guards is the invariant that no live delta outlives its segment's seal.
+var collapseRaceHook func(key []byte)
+
+// collapseOneKey attempts a single collapse of key, reporting whether the key is done -- either
+// collapsed, or no longer in need of it (deleted, or already whole). A false return means the
+// caller must try again: the key still ends in a delta.
+func (c *Collection) collapseOneKey(key []byte) bool {
+	{
 		// Read and write under ONE transaction, so the snapshot is taken before the read and a
 		// commit that lands in between actually conflicts. Reading with c.Get first and opening
 		// the transaction afterwards captured the snapshot AFTER the value, so the conflict
@@ -863,7 +923,10 @@ func (c *Collection) collapseLiveChains() {
 		merged, mergedAd, ok := sh.materializeAt(c, key, c.h.Hash(key), s0, want, nil)
 		sh.mu.RUnlock()
 		if !ok {
-			continue // deleted underneath us, or already whole; nothing to collapse
+			// Deleted underneath us, or already whole -- both mean nothing to collapse. But
+			// "materialize failed" is not the same as "no longer a delta": a damaged chain also
+			// lands here, and dropping it would leave the fragment sealed. Ask the store.
+			return !c.endsInDelta(key)
 		}
 		// The merged WIRE BYTES, written straight through. Going via Get would decode these
 		// same bytes into a ClassAd purely so Put could encode them again -- a round trip per
@@ -873,13 +936,33 @@ func (c *Collection) collapseLiveChains() {
 		// asks for the object (ordered-index maintenance, watch publication) and, given only
 		// bytes, decoded them -- reinstating the same round trip from the other side, at 14% of
 		// a real queue replay's allocation. Handing over what we already have costs nothing.
+		if collapseRaceHook != nil {
+			collapseRaceHook(key)
+		}
 		tx.putWireAd(key, merged, mergedAd, c.decodeWireAd)
 		if r := tx.Commit(); r.Conflicted() {
-			// A newer writer won. Its write is the current version; if it was a delta the chain
-			// is still open and the next seal collapses it.
-			continue
+			return false // a newer writer won; the caller retries against the newer version
+		}
+		return true
+	}
+}
+
+// endsInDelta reports whether key's CURRENT record is a delta, resolving the location without
+// decoding anything. It answers the question the collapse needs when a materialize fails: "is
+// there still a fragment here to worry about", as distinct from "did the merge work".
+func (c *Collection) endsInDelta(key []byte) bool {
+	h := c.h.Hash(key)
+	sh := c.shards[c.shardOf(key, h)]
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	l, ok := sh.findCurrent(sh.dirGet(h), key)
+	if !ok {
+		if l, ok = sh.lookupSealed(key, h); !ok {
+			return false // no live record at all
 		}
 	}
+	seg := sh.segForLoc(l)
+	return seg != nil && recIsDelta(seg.data, l.off)
 }
 
 // keyExists reports whether key has a live record, resolving its location without decoding
@@ -906,7 +989,17 @@ func (c *Collection) keyExists(key []byte, h uint64) bool {
 // segments. The tracker is keyed by hash and so cannot name them; the active segments can,
 // and by the seal-collapse invariant they are the only place a live fragment exists.
 func (c *Collection) liveDeltaKeys() [][]byte {
+	// Keys a previous pass could not finish come first: their segments are already sealed and
+	// nothing else will ever scan them again (pendingSeal is consumed below), so this set is the
+	// only thing standing between a lost collapse and a permanent live delta in a sealed segment.
 	var out [][]byte
+	c.collapseMu.Lock()
+	for k := range c.collapseRetry {
+		out = append(out, []byte(k))
+	}
+	clear(c.collapseRetry)
+	c.collapseMu.Unlock()
+
 	for _, sh := range c.shards {
 		// Resolve AND read under one unbroken read lock, with no segment pointer carried
 		// across a release. Retirement happens under the write lock and the munmap runs after

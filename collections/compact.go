@@ -70,7 +70,29 @@ func (c *Collection) Compact() int {
 	// merged from, and its interning re-encode would strip the delta flag from any that
 	// survive -- turning a fragment into a record that claims to be whole. No-op unless delta
 	// records are enabled. See Collection.collapseBeforeRewrite.
-	c.collapseBeforeRewrite()
+	//
+	// Only when a shard is actually going to be REWRITTEN, though. The collapse is not free --
+	// it writes a whole record, in its own durable transaction, for every key whose chain is
+	// open -- and a background pass that finds nothing to compact used to pay all of it and
+	// then return 0. Measured on a mirror of a real schedd: 6,174 fsyncs, 450 MB and 5.4M
+	// objects for a pass that compacted nothing, every two minutes, because the server's sweep
+	// calls this on every table unconditionally. Worse, the work is not even saved for later:
+	// sealing collapses open chains anyway (collapseSealedChains), so this only pulls it
+	// forward -- and converting deltas back to whole records on a timer is the write
+	// amplification delta records exist to avoid.
+	//
+	// reclaimDeadShard needs the collapse too, which is not obvious and cost a test failure to
+	// learn: it unlinks segments where every record is superseded, and the BASE of a live delta
+	// is superseded (the delta superseded it). The tempting argument -- that a live delta's base
+	// is always in the active segment, since chains never span a seal -- is wrong, because
+	// collapseLiveChains SKIPS a key whose collapse loses a commit conflict and leaves its chain
+	// open across the seal. Rare, and it destroys the key when the base is later reclaimed.
+	//
+	// So the gate covers both kinds of work: rewriting a shard and unlinking a dead segment.
+	// What it skips is the case that motivated it -- a pass with nothing to do at all.
+	if c.anyShardNeedsRewrite() {
+		c.collapseBeforeRewrite()
+	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
 	start := time.Now()
@@ -359,6 +381,47 @@ func (sh *shard) shouldCompact() bool {
 		dead += seg.dead
 	}
 	return used >= compactMinBytes && float64(dead) >= compactThreshold*float64(used)
+}
+
+// anyShardNeedsRewrite reports whether a compaction pass has anything to do: a shard over the
+// compaction threshold, or a fully-dead segment to unlink. It exists so a pass with neither can
+// skip the pre-rewrite delta collapse, which is the expensive part of a pass that does nothing.
+// It takes each shard's read lock briefly and decodes nothing.
+//
+// Deliberately covers reclaiming as well as compacting: unlinking a dead segment can drop the
+// base of a live delta, so it is not safe to do without the collapse either. See Compact.
+//
+// The answer can change once the collapse has run -- collapsing supersedes a chain's deltas,
+// which ADDS dead bytes and can push a shard over the threshold, and adds live bytes, which can
+// pull it under. The per-shard checks inside the pass are what decide; this is only the cheap
+// "is any of this worth doing" question, asked first.
+func (c *Collection) anyShardNeedsRewrite() bool {
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		need := sh.shouldCompact() || sh.hasReclaimableSegment()
+		sh.mu.RUnlock()
+		if need {
+			return true
+		}
+	}
+	return false
+}
+
+// hasReclaimableSegment reports whether the shard holds a segment reclaimDeadShard would unlink:
+// sealed, non-empty, every record superseded at or below the retain floor. Caller holds at least
+// the read lock. Kept beside shouldCompact so the two conditions the gate asks about stay next to
+// the loop that acts on them.
+func (sh *shard) hasReclaimableSegment() bool {
+	retain := sh.retainFloorLocked()
+	for _, seg := range sh.segs {
+		if seg == nil || seg == sh.act || seg.used == 0 {
+			continue
+		}
+		if seg.dead >= int64(seg.used) && seg.maxSup <= retain {
+			return true
+		}
+	}
+	return false
 }
 
 // movedRec records a live source record copied to a destination segment during

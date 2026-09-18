@@ -398,7 +398,13 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.codec,
 		c.regionCodec(), s, hot, groups, c.colGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) },
-		c.segIDMapper(d))
+		c.segIDMapper(d),
+		// A delta record holds the attributes one write changed, so a columnar row for it is a row
+		// of absent fields. Excluded here as it is in the rewriting path (columnarizeSegment), but
+		// only excluded -- this builds a read accelerator beside the segment rather than rewriting
+		// it, so nothing is dropped and a reader that meets one simply finds no columnar row for
+		// its offset and uses the record's own bytes, which is what a delta needs anyway.
+		func(o uint32) bool { return recIsDelta(seg.data, o) })
 	if len(blocks) == 0 {
 		return nil
 	}

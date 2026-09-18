@@ -779,10 +779,16 @@ func recAd(b []byte, off uint32) []byte {
 // Preserving the supersession seq matters as much as the commit seq: a record superseded before the
 // rewrite must stay superseded after it, or a scan would resurrect an old version.
 func (s *segment) appendRawRecord(srcData []byte, srcOff uint32, ad []byte) (uint32, bool) {
+	return s.appendRawRecordFlags(srcData, srcOff, ad, srcHdrFlags(srcData, srcOff))
+}
+
+// appendRawRecordFlags is appendRawRecord with the destination's header flags given explicitly,
+// for a rewrite that changes what the record IS rather than only how it is stored. The one caller
+// that needs it is columnarization MATERIALIZING a delta: the new record holds the whole ad, so it
+// must not carry deltaFlag forward or every reader would go looking for a chain to merge.
+func (s *segment) appendRawRecordFlags(srcData []byte, srcOff uint32, ad []byte, hdrFlags uint32) (uint32, bool) {
 	key := recKey(srcData, srcOff)
-	// The source's delta flag rides along: this rewrite replaces a record's payload, not its
-	// meaning, and a fragment copied without the flag becomes a fragment every reader trusts.
-	off, ok := s.appendFlagged(recSeq(srcData, srcOff), loc{seg: noSeg}, key, ad, srcHdrFlags(srcData, srcOff))
+	off, ok := s.appendFlagged(recSeq(srcData, srcOff), loc{seg: noSeg}, key, ad, hdrFlags)
 	if !ok {
 		return 0, false
 	}
