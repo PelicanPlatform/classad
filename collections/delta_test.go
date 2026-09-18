@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1152,4 +1153,109 @@ func adDigestT(t *testing.T, ad *classad.ClassAd) string {
 	lines := strings.Split(strings.TrimSpace(ad.MarshalOld()), "\n")
 	sort.Strings(lines)
 	return strings.Join(lines, "|")
+}
+
+// TestCollapseSurvivesCommitConflict is about the one invariant everything that rewrites a sealed
+// segment depends on: NO LIVE DELTA outside the active segment. Columnarization assumes each live
+// record is a whole ad, compaction's interning re-encode would promote a fragment to a record that
+// claims to be whole, and reclaimDeadShard can unlink the segment holding a live delta's base.
+//
+// The collapse used to SKIP a key whose commit lost a race, on the stated reasoning that "the next
+// seal collapses it". It does not: liveDeltaKeys CONSUMES sh.pendingSeal, so once that segment has
+// sealed no later scan ever looks at it again and the fragment is sealed in permanently. This
+// forces the race with a hook and then checks the store, rather than trusting the reasoning.
+func TestCollapseSurvivesCommitConflict(t *testing.T) {
+	c, _ := openDelta(t, 4)
+	defer c.Close()
+
+	keys := make([][]byte, 400)
+	for i := range keys {
+		keys[i] = []byte(fmt.Sprintf("r%d.0", i))
+	}
+	tx := c.Begin()
+	for i, k := range keys {
+		tx.Put(k, jobAd(i, map[string]int64{"N": 0}))
+	}
+	if r := tx.Commit(); r.Conflicted() {
+		t.Fatal("seed conflicted")
+	}
+
+	// CollapseDeferrals is a package-level counter that accumulates across every test in the
+	// run, so this has to measure its OWN delta. Asserting the absolute value passed when the
+	// test ran alone and failed in the suite, where earlier tests had already deferred some.
+	deferredBefore := CollapseDeferrals()
+
+	// Every collapse loses its race the first time: the hook commits a newer delta for the very
+	// key being collapsed, in the window between the collapse's snapshot and its commit.
+	var raced sync.Map
+	collapseRaceHook = func(key []byte) {
+		if _, seen := raced.LoadOrStore(string(key), true); seen {
+			return // lose only the FIRST attempt, so a correct retry can finish
+		}
+		w := c.Begin()
+		patch := classad.New()
+		patch.InsertAttr("Raced", int64(1))
+		w.PatchAttrs(key, patch, nil)
+		w.Commit()
+	}
+	defer func() { collapseRaceHook = nil }()
+
+	for round := 1; round <= 14; round++ {
+		for i, k := range keys {
+			patch := classad.New()
+			patch.InsertAttr("N", int64(round))
+			w := c.Begin()
+			w.PatchAttrs(k, patch, nil)
+			if r := w.Commit(); r.Conflicted() {
+				t.Fatalf("round %d key %d conflicted", round, i)
+			}
+		}
+	}
+	if d, _ := c.DeltaStats(); d == 0 {
+		t.Fatal("no deltas written; the test is not exercising what it claims")
+	}
+	if n := 0; n == 0 {
+		var got int
+		raced.Range(func(any, any) bool { got++; return true })
+		if got == 0 {
+			t.Fatal("the hook never fired: no collapse raced, so nothing was tested")
+		}
+		t.Logf("forced a lost race on %d collapses; %d deferred to a later pass",
+			got, CollapseDeferrals()-deferredBefore)
+	}
+
+	// What this test can honestly assert. Two earlier versions of it asserted more and were
+	// wrong, both caught by mutation:
+	//
+	//   - "no live delta in a sealed segment" PASSES even with the skip restored, because a
+	//     conflicting writer always lands its own record in the ACTIVE segment, superseding the
+	//     sealed one. The conflict path cannot strand a fragment there.
+	//   - "no live delta's chain spans a segment" counted DEAD older versions in other segments,
+	//     which is normal and harmless -- it reported 222 spans against 12 live chains.
+	//
+	// The property that is both true and load-bearing is simply that no collapse is ABANDONED:
+	// liveDeltaKeys consumes sh.pendingSeal, so a key dropped here is a key no later scan
+	// revisits, and its chain stays open across the seal -- which leaves its base in a segment
+	// reclaimDeadShard can unlink. (That the collapse must precede reclaim is separately proven:
+	// removing it makes TestDeltaSurvivesCompaction lose a key outright.)
+	if d := CollapseDeferrals() - deferredBefore; d != 0 {
+		t.Errorf("%d collapses were deferred despite every race being retryable", d)
+	}
+
+	// And every key still reads correctly, including the racer's attribute.
+	for i, k := range keys {
+		ad, ok := c.Get(k)
+		if !ok {
+			t.Fatalf("%s missing", k)
+		}
+		if v, _ := ad.EvaluateAttrInt("N"); v != 14 {
+			t.Fatalf("%s N = %d, want 14", k, v)
+		}
+		if v, _ := ad.EvaluateAttrInt("ClusterId"); v != int64(i) {
+			t.Fatalf("%s ClusterId = %d, want %d", k, v, i)
+		}
+		if v, _ := ad.EvaluateAttrInt("Pad39"); v != 39 {
+			t.Fatalf("%s lost a base attribute: Pad39 = %d", k, v)
+		}
+	}
 }

@@ -335,6 +335,15 @@ type Collection struct {
 	// collapsing guards collapseSealedChains against re-entering itself: the whole records it
 	// writes can seal another segment, which flags the shard again.
 	collapsing atomic.Bool
+
+	// collapseRetry holds keys whose collapse did not complete -- a commit conflict, or a
+	// materialize that failed -- so a later pass tries again. It exists because losing one is
+	// not recoverable: liveDeltaKeys CONSUMES sh.pendingSeal, so a key skipped after its
+	// segment sealed is in a segment no future scan looks at, and its live delta stays in a
+	// sealed segment forever. That is the one thing the seal-collapse invariant promises will
+	// never happen, and everything that rewrites a sealed segment relies on it.
+	collapseMu    sync.Mutex
+	collapseRetry map[string]struct{}
 	// regionCodecCache holds the dictionary-less codec a columnar block's regions are compressed
 	// with (see regionCodec). Created on first use and never swapped, so a block built at any point
 	// in this collection's life decodes with the same codec.
