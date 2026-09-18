@@ -83,6 +83,34 @@ type (
 
 // Config opens a DB with indexing and ordered-index configuration. Dir empty is
 // in-memory; a non-empty Dir is persistent.
+// DefaultDeltaMax is the delta-record chain bound applied when Config.DeltaMax is left at zero,
+// which is to say: delta records are ON by default. Storing only what a write changed is the
+// cheaper way to hold a queue that is updated far more often than it is created -- measured at
+// -42% ingest CPU and -32% allocation replaying a real schedd's job_queue.log -- and a feature
+// that ships switched off is a feature that rots.
+//
+// It is NOT reversible for data already written. A store that has written one delta record
+// replays them for the rest of its life (the on-disk marker says so); setting DeltaMaxOff later
+// stops new deltas and leaves the existing ones readable, it does not convert them back.
+const DefaultDeltaMax = 16
+
+// DeltaMaxOff disables delta records for a table. Any negative Config.DeltaMax means off; this
+// spelling exists because zero means "use the default", so there has to be a way to say "none".
+const DeltaMaxOff = -1
+
+// resolveDeltaMax maps a configured DeltaMax onto what the store is given: zero takes the
+// default, negative means off, and anything else is used as written.
+func resolveDeltaMax(v int) int {
+	switch {
+	case v == 0:
+		return DefaultDeltaMax
+	case v < 0:
+		return 0
+	default:
+		return v
+	}
+}
+
 type Config struct {
 	Dir string
 	// Ordered configures maintained, filtered, sorted indexes -- e.g. the negotiator's
@@ -95,10 +123,13 @@ type Config struct {
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
 
-	// DeltaMax turns on delta records for this table and bounds the chain length: a
+	// DeltaMax bounds the delta-record chain length for this table; see DefaultDeltaMax and
+	// DeltaMaxOff for what 0 and a negative value mean.
+	//
+	// It turns on delta records for this table and bounds the chain length: a
 	// SetAttribute stores only the attributes it changed, until a key has accumulated
-	// DeltaMax of them and the next write stores the whole ad again. 0 (default) stores the
-	// whole ad every time. See collections.Options.DeltaMax for the trade.
+	// DeltaMax of them and the next write stores the whole ad again. See
+	// collections.Options.DeltaMax for the trade.
 	DeltaMax int
 
 	// GroupSchemaCount is how many SECONDARY columnar schemas to derive: sets of attributes the
@@ -176,7 +207,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		GroupStabilityRuns:  cfg.GroupStabilityRuns,
 		GroupMergeJaccard:   cfg.GroupMergeJaccard,
 		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
-		DeltaMax:            cfg.DeltaMax,
+		DeltaMax:            resolveDeltaMax(cfg.DeltaMax),
 		Codec:               chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
 		DataKey:             enc.data(),
 		EncryptedAttrs:      cfg.EncryptedAttrs,

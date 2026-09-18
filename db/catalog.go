@@ -27,6 +27,11 @@ type Catalog struct {
 	poolKeys []KEK
 	encAttrs []string
 
+	// deltaMax and deltaMaxFor are carried from CatalogConfig so every table this catalog opens --
+	// at startup as well as on demand -- gets the same delta-record setting. See CatalogConfig.
+	deltaMax    int
+	deltaMaxFor map[string]int
+
 	// onSealMigration and sealWorkers are carried from CatalogConfig so every table opened through this
 	// catalog reports its one-off migration, named (see CatalogConfig.OnSealMigration).
 	onSealMigration func(table string, segments int)
@@ -69,6 +74,21 @@ type CatalogConfig struct {
 	// stops matching the wall clock.
 	OnOpenStep func(kind, name string, d time.Duration)
 	Dir        string
+	// DeltaMax sets the delta-record chain bound (see Config.DeltaMax) for every table this
+	// catalog opens, and DeltaMaxFor overrides it per table name. Zero takes DefaultDeltaMax --
+	// delta records are ON by default -- and DeltaMaxOff turns them off.
+	//
+	// Both belong on the CATALOG rather than on CreateTableOpts: OpenCatalogConfig opens every
+	// existing table directory at startup, so by the time a caller reaches CreateTable the table
+	// is already open and per-call options are not re-applied. A per-table option would
+	// therefore take effect the first time a table was created and be silently ignored on every
+	// restart after -- a knob that works once.
+	//
+	// Note that a store which has written even one delta record replays them for the rest of its
+	// life (the on-disk marker says so), so this is not reversible for data already written;
+	// DeltaMaxOff stops NEW deltas and leaves the old ones readable.
+	DeltaMax    int
+	DeltaMaxFor map[string]int
 	// PoolKeys enables encryption at rest for every table (each table's master key is
 	// wrapped under these keys). EncryptedAttrs is the default explicit encrypted-attr
 	// set for each table (private attributes are always encrypted). See db/encrypt.go.
@@ -165,6 +185,8 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		poolKeys:         cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs,
 		onSealMigration: cfg.OnSealMigration,
 		sealWorkers:     cfg.SealMigrationWorkers,
+		deltaMax:        cfg.DeltaMax,
+		deltaMaxFor:     cfg.DeltaMaxFor,
 	}
 	if cfg.Dir == "" {
 		return cat, nil
@@ -246,6 +268,7 @@ func (cat *Catalog) tableConfig(dir string) Config {
 		PoolKeys:             cat.poolKeys,
 		EncryptedAttrs:       cat.encAttrs,
 		SealMigrationWorkers: cat.sealWorkers,
+		DeltaMax:             cat.deltaMaxForDir(dir),
 	}
 	if cat.onSealMigration != nil {
 		// Name the table the count belongs to: the per-table hook cannot know it, and the catalog can.
@@ -256,6 +279,18 @@ func (cat *Catalog) tableConfig(dir string) Config {
 		cfg.OnSealMigration = func(segments int) { cat.onSealMigration(name, segments) }
 	}
 	return cfg
+}
+
+// deltaMaxForDir returns the delta-record bound for the table living in dir: its per-table
+// override if one is configured, else the catalog-wide setting. The table name is the directory's
+// base name, which is how the catalog lays tables out.
+func (cat *Catalog) deltaMaxForDir(dir string) int {
+	if len(cat.deltaMaxFor) > 0 && dir != "" {
+		if v, ok := cat.deltaMaxFor[filepath.Base(dir)]; ok {
+			return v
+		}
+	}
+	return cat.deltaMax
 }
 
 // ValidTableName reports whether name is usable as a table (and a directory):

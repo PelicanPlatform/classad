@@ -32,9 +32,14 @@ import (
 //
 // The hard invariant is elsewhere: anything that can DROP an older version must first
 // materialize the deltas that depend on it. Compaction retains superseded versions only
-// above a retain floor, so it materializes current deltas as it copies them (see
-// compactShard). Sealing into columnar form has the same requirement, which is why delta
-// mode and columnarization are not currently enabled together.
+// above a retain floor, so delta records and time travel are refused together (see Open).
+//
+// COLUMNARIZATION is compatible, which is worth stating because an earlier version of this
+// comment said it was not. The seal-collapse invariant is what makes it so: every live record
+// outside the active segment is a whole ad, because sealing collapses each open chain (see
+// collapseSealedChains), so a sealed-segment rewrite still sees exactly what it always saw.
+// TestDeltaVsColumnarization asserts it end to end -- every attribute survives, before and
+// after, over a store whose sealed segments provably contain delta records.
 
 // deltaTracker counts, per key, how many delta records have been written since that key's
 // last full record. Absence of a key means "no full record has been written by this process",
