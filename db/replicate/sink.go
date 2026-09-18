@@ -79,6 +79,12 @@ type archiveSink struct {
 	a     *db.ArchiveTable
 	src   string
 	store CursorStore
+	// mu guards cur. Commit and Cursor are called from DIFFERENT goroutines by design: a puller
+	// commits from its main loop and again from an ack ticker (see changefeed's client, which
+	// runs commitAndAck on a timer beside the loop), so the two can land at once. Unguarded, that
+	// is a data race on the resume cursor -- the one piece of state whose corruption means
+	// replaying or skipping changes after a restart.
+	mu    sync.Mutex
 	cur   []byte
 	OnGap func(src string, fromMillis, toMillis int64)
 }
@@ -123,11 +129,17 @@ func (s *archiveSink) Commit(cursor []byte) error {
 	if err := s.store.Save(cursor); err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.cur = append([]byte(nil), cursor...)
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *archiveSink) Cursor() []byte { return s.cur }
+func (s *archiveSink) Cursor() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.cur...)
+}
 
 // tableSink upserts/deletes into a mutable table by key -- naturally idempotent (last-write-wins),
 // so a re-delivered tail is a no-op. Stamps SrcAttr on upserts. Reset clears no local state here
@@ -137,7 +149,9 @@ type tableSink struct {
 	d     *db.DB
 	src   string
 	store CursorStore
-	cur   []byte
+	// mu guards cur; see archiveSink for why a sink's cursor needs it.
+	mu  sync.Mutex
+	cur []byte
 }
 
 // NewTableSink builds a Sink that imports a source's changes into mutable table d, stamping SrcAttr.
@@ -180,8 +194,14 @@ func (s *tableSink) Commit(cursor []byte) error {
 	if err := s.store.Save(cursor); err != nil {
 		return err
 	}
+	s.mu.Lock()
 	s.cur = append([]byte(nil), cursor...)
+	s.mu.Unlock()
 	return nil
 }
 
-func (s *tableSink) Cursor() []byte { return s.cur }
+func (s *tableSink) Cursor() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]byte(nil), s.cur...)
+}
