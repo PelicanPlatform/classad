@@ -74,24 +74,36 @@ func (sh *shard) findVisible(head loc, key []byte, s0 uint64) (loc, bool) {
 
 // getAt returns a private copy of key's ad bytes as of snapshot s0, or (nil, nil,
 // false) if the key had no version live at s0.
-func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64) ([]byte, Codec, *segDictHandle, bool) {
+// The fourth result is the ad as an object, on the same terms as shard.get: non-nil only when a
+// delta chain had to be merged, in which case the bytes are just that object encoded.
+func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64, want materializeWant) ([]byte, Codec, *segDictHandle, *classad.ClassAd, bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	l, ok := sh.findVisible(sh.dirGet(h), key, s0)
 	if !ok {
 		if l, ok = sh.lookupSealedAt(key, h, s0); !ok {
-			return nil, nil, nil, false
+			return nil, nil, nil, nil, false
 		}
 	}
 	// segForLoc, not segAt: l can come from the sealed KEY INDEX as well as the chain, and a sidecar
 	// describing a segment that has since been rewritten names offsets that no longer hold records.
 	seg := sh.segForLoc(l)
 	if seg == nil {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	ad, adCodec, ok2 := segStoredOrReassembled(c, seg, l.off)
 	if !ok2 {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
+	}
+	if raw, rc, obj, handled, ok3 := sh.resolveDelta(c, key, h, s0, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
+		if !ok3 {
+			return nil, nil, nil, nil, false
+		}
+		dict := seg.dict.Load()
+		if dict != nil {
+			dict.ensureNames()
+		}
+		return raw, rc, dict, obj, true
 	}
 	out := make([]byte, len(ad))
 	copy(out, ad)
@@ -112,7 +124,7 @@ func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64) ([]byte, 
 	if dict != nil {
 		dict.ensureNames()
 	}
-	return out, adCodec, dict, true
+	return out, adCodec, dict, nil, true
 }
 
 // hasAt reports whether key had a version live at snapshot s0. It is getAt's resolution
@@ -190,6 +202,9 @@ type txnWrite struct {
 	ad    []byte // compressed bytes (nil for a delete)
 	codec Codec
 	del   bool
+	// delta records that ad holds only what this write CHANGED, so the record's header can say
+	// so and readers can tell without decompressing it (see segment.deltaFlag).
+	delta bool
 	base  uint64 // snapshot S0: conflict if the key changed after this
 	adObj *classad.ClassAd
 	// buf is the originating buffered write, so ordered-index maintenance can materialize
@@ -198,11 +213,19 @@ type txnWrite struct {
 	ok  bool // committed (true) or conflicted (false)
 }
 
+// hdrFlags returns the record header flag bits for this write.
+func (w *txnWrite) hdrFlags() uint32 {
+	if w.delta {
+		return deltaFlag
+	}
+	return 0
+}
+
 // commitTxn applies a shard's buffered transactional writes with per-write conflict
 // detection, all under one shard write lock so the check and apply are atomic with
 // respect to other committers (first-committer-wins). Conflicting writes are skipped
 // and flagged; the rest commit at one fresh sequence.
-func (sh *shard) commitTxn(ws []*txnWrite, durable bool) {
+func (sh *shard) commitTxn(c *Collection, ws []*txnWrite, durable bool) {
 	changed, seq := sh.applyTxn(ws)
 	if !changed {
 		return
@@ -210,7 +233,7 @@ func (sh *shard) commitTxn(ws []*txnWrite, durable bool) {
 	if durable {
 		sh.sync()
 	}
-	sh.publishTxn(ws, seq)
+	sh.publishTxn(c, ws, seq)
 }
 
 // applyTxn applies a shard's buffered writes under the write lock, advancing the shard's
@@ -244,7 +267,7 @@ func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 			}
 			continue
 		}
-		sh.put(w.hash, w.key, w.ad, seq, w.codec)
+		sh.put(w.hash, w.key, w.ad, seq, w.codec, w.hdrFlags())
 		changed = true
 	}
 	if changed {
@@ -258,7 +281,7 @@ func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 // publishTxn notifies the watch hub of a committed batch. It must run only after the batch
 // is durable (sh.sync has returned), so watchers never observe an event that a crash could
 // lose.
-func (sh *shard) publishTxn(ws []*txnWrite, seq uint64) {
+func (sh *shard) publishTxn(c *Collection, ws []*txnWrite, seq uint64) {
 	if sh.hub == nil {
 		return
 	}
@@ -272,7 +295,26 @@ func (sh *shard) publishTxn(ws []*txnWrite, seq uint64) {
 				sh.hub.publish(sh.idx, seq, w.key, nil, nil, true)
 			}
 		} else {
-			sh.hub.publish(sh.idx, seq, w.key, w.ad, w.codec, false)
+			ad, codec := w.ad, w.codec
+			// Gated on deltaRead AND on somebody actually watching. Neither guard was here, and
+			// since every SetAttribute routes through PatchAttrs the effect was that EVERY write
+			// -- in a store with no deltas and no watchers -- paid a full chain materialization
+			// at publish time. It was 24% of the delta-mode-OFF run.
+			if c.deltaRead && w.buf != nil && w.buf.patch != nil && sh.hub.watching() {
+				// A delta write's stored bytes are only the attributes that changed. Publishing
+				// them hands every watcher a fragment that looks like the whole ad -- a
+				// changefeed exporter replacing its destination document would delete the rest
+				// of the record downstream. Publish the merged form instead.
+				// materializeAt reads other segments' bytes, so it needs the shard read lock;
+				// publishTxn runs after the write lock is dropped and holds none of its own.
+				sh.mu.RLock()
+				merged, _, ok := sh.materializeAt(c, w.key, w.hash, seq, mWire, nil)
+				sh.mu.RUnlock()
+				if ok {
+					ad, codec = merged, identityCodec{}
+				}
+			}
+			sh.hub.publish(sh.idx, seq, w.key, ad, codec, false)
 		}
 	}
 }
@@ -302,12 +344,29 @@ type txnBuf struct {
 	// through the reference parser rather than round-tripping the encoding.
 	text string
 	del  bool
+	// changed names the attributes this write modified, when the caller knows (PutPatch).
+	// It is what lets Commit store a delta instead of the whole ad. Empty means "unknown",
+	// which forces a full record -- Put cannot tell what changed, so it says nothing.
+	changed []string
+	// noDelta forces a full record even when changed is populated: set when the write also
+	// REMOVED an attribute, which a delta of present attributes cannot express.
+	noDelta bool
+	// decodeWireFn rebuilds the object from wire when there is no source text; see putWire.
+	decodeWireFn func([]byte) (*classad.ClassAd, error)
+	// patch holds ONLY the attributes this write changed, with no full ad beside it -- the
+	// point being that the writer never had to read the stored ad to produce it. removed names
+	// attributes the write deleted. Commit turns this into a delta record directly; when a
+	// delta is not permissible it is here, once, that the stored ad is read and merged.
+	patch   *classad.ClassAd
+	removed []string
 }
 
 // live reports whether this buffer holds an ad -- as an object OR as wire bytes not yet
 // materialized. Anything scanning the buffered writes must ask this rather than testing
 // ad != nil, which silently skips every wire-ingested write.
-func (b *txnBuf) live() bool { return !b.del && (b.ad != nil || b.wire != nil) }
+func (b *txnBuf) live() bool {
+	return !b.del && (b.ad != nil || b.wire != nil || b.patch != nil)
+}
 
 // materialize returns the buffered ad as an object, decoding a wire-ingested one on
 // first use. Only two things need it -- a read-your-writes Get and ordered-index
@@ -317,6 +376,17 @@ func (b *txnBuf) materialize() (*classad.ClassAd, bool) {
 		return nil, false
 	}
 	if b.ad == nil && b.wire != nil {
+		if b.text == "" {
+			// Wire bytes with no source text: a whole record the caller already had encoded
+			// (see Txn.putWire). Decode them only if something actually needs the object --
+			// which for most tables is nothing, so the common path never pays it.
+			ad, err := b.decodeWire()
+			if err != nil {
+				return nil, false
+			}
+			b.ad = ad
+			return b.ad, true
+		}
 		ad, err := classad.ParseOld(b.text)
 		if err != nil {
 			return nil, false
@@ -400,14 +470,39 @@ func (tx *Txn) Get(key []byte) (*classad.ClassAd, bool) {
 // mutate (buffered writes are returned as-is -- the caller owns the buffered ad).
 func (tx *Txn) getOwn(key []byte) (*classad.ClassAd, bool) {
 	if b, ok := tx.writes[string(key)]; ok {
+		if b.patch != nil && b.ad == nil && b.wire == nil {
+			// A patch-only buffer holds no whole ad, so read-your-writes composes one here:
+			// the stored view with this transaction's changes applied over it. Only an actual
+			// READ pays this; the write that buffered the patch did not.
+			ad, sok := tx.readStored(key)
+			if !sok {
+				ad = classad.New()
+			}
+			mergeDelta(ad, b.patch)
+			for _, n := range b.removed {
+				ad.Delete(n)
+			}
+			return ad, true
+		}
 		return b.materialize()
 	}
+	return tx.readStored(key)
+}
+
+// readStored reads key as of the transaction's snapshot, ignoring its own buffered writes.
+func (tx *Txn) readStored(key []byte) (*classad.ClassAd, bool) {
 	h := tx.c.h.Hash(key)
 	idx := tx.c.shardOf(key, h)
 	s0 := tx.snapOf(idx)
-	stored, codec, dict, ok := tx.c.shards[idx].getAt(tx.c, h, key, s0)
+	stored, codec, dict, obj, ok := tx.c.shards[idx].getAt(tx.c, h, key, s0, readWant(tx.redact))
 	if !ok {
 		return nil, false
+	}
+	// A merged delta chain arrives as the object it was encoded from; decoding the bytes back
+	// would rebuild what we are holding. Not for a redacting read -- redaction is applied by the
+	// decode, and the object has every sealed value open.
+	if obj != nil && !tx.redact {
+		return obj, true
 	}
 	ad, err := tx.c.decodeAdDictAs(dict, stored, codec, tx.redact)
 	if err != nil {
@@ -429,6 +524,70 @@ func (tx *Txn) Has(key []byte) bool {
 	h := tx.c.h.Hash(key)
 	idx := tx.c.shardOf(key, h)
 	return tx.c.shards[idx].hasAt(h, key, tx.snapOf(idx))
+}
+
+// putWire buffers a whole record the caller already holds in encoded form, skipping the
+// decode-and-re-encode round trip a Put would make of it.
+//
+// It exists for the seal collapse, whose whole job is to turn a resolved chain into one whole
+// record: materializeAt hands back exactly those bytes, and routing them through a ClassAd and
+// back was 57% of the ingest run. The bytes must be a complete record in this collection's
+// encoding -- nothing validates that, which is why this is unexported and has one caller.
+func (tx *Txn) putWire(key, wire []byte, decode func([]byte) (*classad.ClassAd, error)) {
+	tx.putWireAd(key, wire, nil, decode)
+}
+
+// putWireAd is putWire for a caller that already holds the ad these bytes encode. The object is
+// buffered beside the bytes, so anything in Commit that wants it (ordered-index maintenance,
+// watch publication) gets it for free instead of decoding the bytes back into the object they
+// were just encoded from. decode is still required: ad may be nil, and a later caller may need
+// to materialize from bytes alone.
+func (tx *Txn) putWireAd(key, wire []byte, ad *classad.ClassAd, decode func([]byte) (*classad.ClassAd, error)) {
+	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
+	tx.writes[string(key)] = &txnBuf{
+		key: append([]byte(nil), key...), wire: wire, ad: ad, decodeWireFn: decode,
+	}
+}
+
+// PatchAttrs buffers a change to key expressed ONLY as the attributes it changes -- the whole
+// ad is never read, built, or buffered. That is the point: a mirror applying a schedd's
+// attribute updates spends most of its time reading an ad back just to hand a copy of it to
+// the encoder, and the update itself does not need it.
+//
+// Commit stores this as a delta record. When it cannot -- the key has no full record yet, the
+// chain has reached its bound, or the write removed an attribute -- Commit reads the stored ad
+// and merges there, so the read happens once per re-materialization instead of once per write.
+//
+// removed names attributes the write deletes. Reads through this transaction still see the
+// merged view (Get applies the patch over the stored ad), so read-your-writes is unaffected.
+func (tx *Txn) PatchAttrs(key []byte, patch *classad.ClassAd, removed []string) {
+	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
+	// Reuse an existing patch buffer for this key instead of replacing it. A caller applying a
+	// schedd transaction calls this once per attribute it changed, accumulating into one patch
+	// object, so a fresh buffer and a fresh copy of the key per call was N-1 of each thrown away
+	// per transaction. A buffer holding anything else -- a whole ad, wire bytes, a delete -- is
+	// still REPLACED, which is what it meant before: the last write in a transaction wins.
+	if b, ok := tx.writes[string(key)]; ok && b.patch != nil && b.ad == nil && b.wire == nil && !b.del {
+		b.patch, b.removed = patch, removed
+		return
+	}
+	tx.writes[string(key)] = &txnBuf{
+		key: append([]byte(nil), key...), patch: patch, removed: removed,
+	}
+}
+
+// PutPatch is Put for a caller that knows which attributes it changed. The full ad is still
+// buffered -- read-your-writes and the value lookup both need it -- but Commit may store only
+// the named attributes as a delta record, which for a wide ad is the difference between
+// encoding and compressing ~7.3 KB and ~150 B. removed reports that the write also deleted an
+// attribute, which a delta cannot express, so the whole ad is stored instead.
+//
+// It is always safe to call Put instead; a caller that does loses only the optimization.
+func (tx *Txn) PutPatch(key []byte, ad *classad.ClassAd, changed []string, removed bool) {
+	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
+	tx.writes[string(key)] = &txnBuf{
+		key: append([]byte(nil), key...), ad: ad, changed: changed, noDelta: removed,
+	}
 }
 
 // Put buffers an insert or update of key. Nothing is written until Commit.
@@ -473,8 +632,22 @@ func (tx *Txn) Delete(key []byte) {
 // successful writes are not rolled back). The transaction must not be used after
 // Commit.
 func (tx *Txn) Commit() CommitResult {
+	// Collapsing sealed delta chains happens on the way OUT of a commit: the seal that
+	// triggers it occurs under a shard write lock deep inside this call, and collapsing means
+	// ordinary reads and writes. No-op unless a segment actually sealed.
+	defer tx.c.collapseSealedChains()
+	// One scratch buffer for every encode in this commit: each write's uncompressed wire bytes
+	// are alive only until the line that compresses them, so the next write can have the same
+	// buffer. It grows once to the widest ad in the batch instead of being reallocated per write.
+	var encScratch []byte
 	byShard := make(map[int][]*txnWrite)
 	for _, b := range tx.writes {
+		if b.del && tx.c.deltas != nil {
+			// The key's records are going away, so the tracker must stop believing a full
+			// record exists for it -- otherwise a later re-creation could be stored as a
+			// delta chained to a base that was deleted.
+			tx.c.deltas.forget(tx.c.h.Hash(b.key))
+		}
 		h := tx.c.h.Hash(b.key)
 		idx := tx.c.shardOf(b.key, h)
 		w := &txnWrite{hash: h, key: b.key, del: b.del, base: tx.snap[idx], adObj: b.ad, buf: b}
@@ -482,8 +655,15 @@ func (tx *Txn) Commit() CommitResult {
 			w.codec = tx.c.currentCodec()
 			// A wire-ingested put is already encoded; only an object put encodes here.
 			raw := b.wire
-			if raw == nil {
-				raw = tx.c.encodeAd(b.ad.AST())
+			switch {
+			case raw != nil:
+				// Bytes the caller buffered (Txn.putWire); they are not ours to reuse.
+			case b.patch != nil && b.ad == nil:
+				raw, w.delta = tx.encodePatchOnly(encScratch[:0], b, h)
+				encScratch = raw
+			default:
+				raw, w.delta = tx.c.encodeDelta(encScratch[:0], b.key, h, b.ad, b.changed, b.noDelta)
+				encScratch = raw
 			}
 			w.ad = w.codec.Compress(nil, raw)
 		}
@@ -544,7 +724,7 @@ func (tx *Txn) Commit() CommitResult {
 	var res CommitResult
 	for _, c := range commits {
 		if c.changed {
-			tx.c.shards[c.idx].publishTxn(c.ws, c.seq)
+			tx.c.shards[c.idx].publishTxn(tx.c, c.ws, c.seq)
 		}
 		for _, w := range c.ws {
 			if !w.ok {
@@ -559,9 +739,35 @@ func (tx *Txn) Commit() CommitResult {
 				if ad == nil && w.buf != nil {
 					ad, _ = w.buf.materialize()
 				}
-				tx.c.maintainOrdered(w.key, ad)
+				// Gated on the collection HAVING an ordered index. maintainOrdered returns
+				// immediately without one, but the Get below is a full chain replay and was
+				// running on every delta write regardless -- 51% of an ingest run, to feed a
+				// consumer that did not exist. Same shape as the publish bug above: prepare the
+				// input only for a consumer that will use it.
+				if ad == nil && w.buf != nil && w.buf.patch != nil && tx.c.hasOrdered() {
+					// A delta write buffers only the changed attributes, so materialize() has
+					// no object to return. Handing nil to maintainOrdered evaluated the index
+					// predicate against nothing, which is never a member -- so every delta
+					// write EVICTED its key from every ordered index while the stored ad stayed
+					// correct. (On a chained collection it is worse: ordered.go dereferences
+					// the nil to read its parent.) Read the merged ad back instead.
+					if merged, ok := tx.c.Get(w.key); ok {
+						ad = merged
+					}
+				}
+				if ad != nil {
+					tx.c.maintainOrdered(w.key, ad)
+				}
 			}
 		}
 	}
 	return res
+}
+
+// decodeWire rebuilds this buffer's ad from its wire bytes.
+func (b *txnBuf) decodeWire() (*classad.ClassAd, error) {
+	if b.decodeWireFn == nil {
+		return nil, errNoWireDecoder
+	}
+	return b.decodeWireFn(b.wire)
 }

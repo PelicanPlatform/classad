@@ -129,6 +129,18 @@ func EncodeInlineWithHot(dst []byte, ad *ast.ClassAd, hot map[string]struct{}) [
 // index/match fast path, so it is excluded from the hot header even if listed in hot.
 // encrypt and seal must both be non-nil to encrypt anything.
 func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+	return encodeInline(dst, ad, hot, encrypt, seal, 0)
+}
+
+// EncodeInlineDelta encodes ad as a DELTA record: byte-identical to an ordinary inline ad
+// except that flagDelta is set, so a reader knows these are only the attributes one write
+// changed and that the rest must be merged in from older versions of the key. The caller is
+// responsible for having built ad from exactly the changed attributes.
+func EncodeInlineDelta(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+	return encodeInline(dst, ad, hot, encrypt, seal, flagDelta)
+}
+
+func encodeInline(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer, extraFlags byte) []byte {
 	e := encoder{inline: true, seal: seal, buf: getScratch()}
 	defer func() { putScratch(e.buf) }()
 	var hots []hotPair
@@ -169,7 +181,7 @@ func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}
 	if ad != nil {
 		n = len(ad.Attributes)
 	}
-	return frame(dst, flagInlineNames, hots, n, e.buf)
+	return frame(dst, flagInlineNames|extraFlags, hots, n, e.buf)
 }
 
 // inFolded reports whether set (keyed by foldASCII'd names) contains name, without

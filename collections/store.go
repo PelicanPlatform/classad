@@ -87,6 +87,19 @@ type Options struct {
 	Hasher Hasher
 	// Codec compresses stored ad bytes. Default identity (no compression).
 	Codec Codec
+	// DeltaMax turns on DELTA RECORDS and bounds the chain: it is IGNORED on an AppendOnly
+	// collection, where there is no earlier version of a key to merge with and the tracker
+	// would grow per record forever. A write that names the attributes
+	// it changed stores only those, until a key has accumulated DeltaMax deltas, at which
+	// point the next write stores the whole ad again. 0 (default) stores whole ads always,
+	// which is the historical behavior.
+	//
+	// It trades write volume for read work. A live job ad averages ~7.3 KB while one
+	// transaction's changes average ~150 B, so writes shrink by ~49x; a point read has to
+	// merge up to DeltaMax fragments over a full record. Requires inline-name records (a
+	// persistent store) and is not combined with columnarization, which assumes each record
+	// holds a whole ad.
+	DeltaMax int
 	// HotAttrs names the "popular" attributes to front-load in each ad's hot
 	// header, so a query filtering on them resolves each in O(1) instead of
 	// scanning the ad body. Typically the attributes common queries filter on
@@ -306,6 +319,22 @@ type Collection struct {
 	// of Open via OpenIndexDiagHook. Written only on the single-threaded Open path.
 	openIdxDiag OpenIndexDiag
 	codec       atomic.Pointer[codecHolder] // current codec for new writes; swapped by RetrainDict
+	// deltaMax and deltas implement delta records (see delta.go). deltaMax 0 disables them.
+	deltaMax int
+	deltas   *deltaTracker
+	// deltaDir is the store's directory, retained so the delta-mode marker can be written
+	// lazily on the first delta rather than at open; deltaMarked/deltaMarkMu make that happen
+	// once. Empty for an in-memory collection, which persists nothing.
+	deltaDir    string
+	deltaMarked atomic.Bool
+	deltaMarkMu sync.Mutex
+	// deltaRead enables REPLAY. It is set from the on-disk marker as well as from DeltaMax,
+	// because a store that already holds deltas must replay them even if this process was not
+	// told to write any. See initDeltaMode.
+	deltaRead bool
+	// collapsing guards collapseSealedChains against re-entering itself: the whole records it
+	// writes can seal another segment, which flags the shard again.
+	collapsing atomic.Bool
 	// regionCodecCache holds the dictionary-less codec a columnar block's regions are compressed
 	// with (see regionCodec). Created on first use and never swapped, so a block built at any point
 	// in this collection's life decodes with the same codec.
@@ -620,6 +649,35 @@ func New(opts Options) *Collection {
 	}
 	c.rowGroupBytes.Store(int64(opts.RowGroupBytes))
 	c.codec.Store(&codecHolder{codec})
+	// Delta records need inline names, which the persistent-open path sets LATER (see
+	// persist.go), so that condition is checked at encode time rather than here -- reading
+	// c.inline now would always find it false and silently disable the feature.
+	// Delta records are meaningless on an append-only log and actively harmful there. An
+	// append log has no per-key supersession and no key index, so there is no earlier version
+	// of a key to merge a fragment with -- and the tracker would accumulate an entry per
+	// RECORD rather than per key, since archive records have no reused identity and nothing
+	// ever deletes one. That is the O(#records) resident cost an archive avoids by having no
+	// key directory at all: a 5M-record history growing 500k/day would carry a few hundred MB
+	// of tracker and add tens of MB a day, forever. Refused rather than ignored quietly.
+	// Delta records are also refused alongside TIME TRAVEL, for a reason specific to how
+	// versions are reclaimed. Compaction retains superseded versions ABOVE the retain floor
+	// for as-of reads and drops the rest -- so a retained delta can outlive the whole record
+	// it merges from, and the interning re-encode that moves it into the history stream does
+	// not carry the delta flag either. An as-of read straddling that boundary gets a fragment
+	// presented as a complete ad.
+	//
+	// The fix that would lift this is to MATERIALIZE on the way into the history stream, so
+	// every retained record is self-contained and as-of reads never replay at all. That is a
+	// change inside compactShard, which runs off-lock over pinned segments and would need the
+	// chain resolved there; it is not attempted here. Refused rather than left to corrupt.
+	if opts.DeltaMax > 0 && opts.TimeTravel != nil {
+		opts.DeltaMax = 0
+	}
+	if opts.DeltaMax > 0 && !opts.AppendOnly {
+		c.deltaMax = opts.DeltaMax
+		c.deltas = newDeltaTracker()
+		c.deltaRead = true // an in-memory collection has no marker file; Open overwrites this
+	}
 	if cfg := newTTConfig(opts.TimeTravel); cfg != nil {
 		c.ttCfg.Store(cfg)
 	}
@@ -875,21 +933,29 @@ func (c *Collection) GetRedacted(key []byte) (*classad.ClassAd, bool) {
 func (c *Collection) getAs(key []byte, redact bool) (*classad.ClassAd, bool) {
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	stored, codec, dict, ok := sh.get(c, h, key)
+	stored, codec, dict, obj, ok := sh.get(c, h, key, readWant(redact))
 	if !ok {
 		return nil, false
 	}
-	ad, err := c.decodeAdDictAs(dict, stored, codec, redact)
-	if err != nil {
-		return nil, false
+	// A merged delta chain comes back as the object those bytes were encoded from, so decoding
+	// them would rebuild what we already hold. Never for a redacting read: redaction is applied by
+	// the decode and the object has every sealed value open.
+	ad := obj
+	if ad == nil || redact {
+		var err error
+		if ad, err = c.decodeAdDictAs(dict, stored, codec, redact); err != nil {
+			return nil, false
+		}
 	}
 	// Chain to the parent (same shard) so the returned ad resolves inherited
 	// attributes -- Get mirrors query semantics.
 	if c.parentKeyFor != nil {
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
-			if pad, pcodec, pdict, ok := sh.get(c, ph, pk); ok {
-				if parent, err := c.decodeAdDictAs(pdict, pad, pcodec, redact); err == nil {
+			if pad, pcodec, pdict, pobj, ok := sh.get(c, ph, pk, readWant(redact)); ok {
+				if pobj != nil && !redact {
+					c.mergeParent(ad, pobj)
+				} else if parent, err := c.decodeAdDictAs(pdict, pad, pcodec, redact); err == nil {
 					c.mergeParent(ad, parent)
 				}
 			}
@@ -1195,7 +1261,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		// the attributes held in the segment's columnar payload. Asking the ref rather than
 		// decompressing here is what lets a columnarized segment be scanned at all: its records
 		// carry only what the schema does not cover.
-		w, err := c.wire(r, dbuf)
+		w, err := c.wireAt(r, s0, dbuf)
 		if err != nil {
 			return true // skip a record we cannot decode rather than abort the scan
 		}

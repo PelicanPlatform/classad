@@ -232,6 +232,14 @@ func Open(opts Options) (*Collection, error) {
 	c := New(opts)
 	c.dir = opts.Dir
 	c.inline = true
+	// Whether this store CONTAINS deltas is a property of its records, not of the option this
+	// process was opened with, so it is recorded on disk and read back here. Without that, the
+	// same directory reopened without DeltaMax serves every delta as if it were a whole ad --
+	// a job ad coming back with one attribute instead of forty-five, and no error anywhere.
+	// Exactly the trap <dir>/basecodec exists to close for the codec, closed the same way.
+	if err := c.initDeltaMode(opts.Dir); err != nil {
+		return nil, err
+	}
 	// Records are inline-encoded (names, not interned ids); zone-map value extraction
 	// must look up by name. New defaulted the shards to id-based lookup for the in-memory
 	// case; flip them here now that inline encoding is confirmed.

@@ -78,14 +78,14 @@ func TestReadersDoNotLeakAMappingDependentDict(t *testing.T) {
 		read func(sh *shard, h uint64, k []byte) (*segDictHandle, bool)
 	}{
 		{"shard.get", func(sh *shard, h uint64, k []byte) (*segDictHandle, bool) {
-			_, _, d, ok := sh.get(c, h, k)
+			_, _, d, _, ok := sh.get(c, h, k, mObj)
 			return d, ok
 		}},
 		{"shard.getAt", func(sh *shard, h uint64, k []byte) (*segDictHandle, bool) {
 			sh.mu.RLock()
 			s0 := sh.commitSeq
 			sh.mu.RUnlock()
-			_, _, d, ok := sh.getAt(c, h, k, s0)
+			_, _, d, _, ok := sh.getAt(c, h, k, s0, mObj)
 			return d, ok
 		}},
 	}

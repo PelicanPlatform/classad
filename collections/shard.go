@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // shard owns an independent slice of the keyspace: a directory mapping a key hash
@@ -22,6 +24,12 @@ type shard struct {
 	// write lock, instead of waiting for the next periodic reindex. Bumped under the write
 	// lock; read lock-free.
 	sealSeq atomic.Uint64
+	// sealedPending marks that this shard sealed a segment whose delta chains have not been
+	// collapsed yet, and pendingSeal names those segments. The segments are needed explicitly
+	// because the collapse runs AFTER the seal, by which point sh.act is the new segment and
+	// the fragments to collapse are in the old one. Both are written under the write lock.
+	sealedPending atomic.Bool
+	pendingSeal   []*segment
 
 	// appendOnly makes this a pure append log (see Options.AppendOnly): put appends
 	// without superseding or indexing by key, del is a no-op, and compaction is
@@ -302,12 +310,12 @@ func (sh *shard) findCurrent(head loc, key []byte) (loc, bool) {
 // commit sequence seq. A prior current version of the key (if any) is marked
 // superseded at seq; the new record is prepended as the bucket head. Caller holds
 // the write lock.
-func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
+func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec, hdrFlags uint32) {
 	if sh.appendOnly {
 		// Append log: write a new record with no bucket-chain link and never supersede
 		// or index it. Records accumulate in commit order; there is no per-key current
 		// version or directory (Get/Delete-by-key are inert), and Scan/Query see them all.
-		if _, ok := sh.writeRecord(seq, noLoc, key, ad, codec); ok {
+		if _, ok := sh.writeRecord(seq, noLoc, key, ad, codec, hdrFlags); ok {
 			sh.count++
 		}
 		return
@@ -315,7 +323,7 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec) {
 	head := sh.dirGet(h)
 	// Write the new record first: if segment allocation fails (persistent store,
 	// disk full), the key is left unchanged rather than superseded-with-no-successor.
-	newLoc, ok := sh.writeRecord(seq, head, key, ad, codec)
+	newLoc, ok := sh.writeRecord(seq, head, key, ad, codec, hdrFlags)
 	if !ok {
 		return // sh.writeErr is set; surfaced to the caller
 	}
@@ -386,7 +394,7 @@ func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied b
 // new segment is allocated when the active one is full, over-small for the
 // record, or was written with a different codec (a segment's records all share
 // one codec so reads can decode by segment).
-func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) (loc, bool) {
+func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, hdrFlags uint32) (loc, bool) {
 	rl := recordLen(len(key), len(ad))
 	if sh.act == nil || sh.act.codec != codec || sh.act.used+rl > len(sh.act.data) {
 		// The segment we're leaving is now sealed (an append log never rewrites it):
@@ -395,6 +403,15 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) 
 		sh.sealZones(sh.act)
 		if sh.appendOnly && sh.act != nil {
 			sh.sealSeq.Add(1) // a segment just sealed: signal eager sidecar indexing
+		}
+		if sh.act != nil {
+			// A segment just sealed. With delta records on, that is the moment every open
+			// chain has to be collapsed -- see Collection.collapseSealedChains. The work
+			// cannot happen here (this runs under the shard WRITE lock, inside a commit, and
+			// collapsing means reading and writing keys), so it is only flagged; the commit
+			// runs it on the way out.
+			sh.sealedPending.Store(true)
+			sh.pendingSeal = append(sh.pendingSeal, sh.act)
 		}
 		size := sh.segSize
 		if rl > size {
@@ -407,7 +424,7 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec) 
 		sh.segs = append(sh.segs, seg)
 		sh.act = seg
 	}
-	off, _ := sh.act.append(seq, next, key, ad)
+	off, _ := sh.act.appendFlagged(seq, next, key, ad, hdrFlags)
 	if sh.alloc != nil && (len(sh.dirty) == 0 || sh.dirty[len(sh.dirty)-1] != sh.act) {
 		sh.dirty = append(sh.dirty, sh.act) // track for msync (persistent)
 	}
@@ -452,26 +469,47 @@ func (sh *shard) writeMarker(seq, millis uint64) bool {
 	return true
 }
 
-// get returns a private copy of the current ad bytes for key and the codec they
-// were compressed with, or (nil, nil, false).
-func (sh *shard) get(c *Collection, h uint64, key []byte) ([]byte, Codec, *segDictHandle, bool) {
+// get returns a private copy of the current ad bytes for key and the codec they were compressed
+// with, or (nil, nil, nil, nil, false).
+//
+// The fourth result is the ad as an OBJECT, non-nil only when satisfying the read meant building
+// one anyway -- which is the case for a delta chain, where the bytes returned are what the merged
+// object was just encoded into. A caller that wants an object should use it rather than decode the
+// bytes back; see Collection.getAs and Txn.readStored, where that decode was 25% of a real queue
+// replay's allocation. It is a fresh object per call, so a caller may keep or mutate it.
+//
+// want says which form to produce; see shard.materializeAt. A redacting caller must ask for mWire
+// and decode: the object is built by opening every sealed value, and redaction is applied by the
+// decode.
+func (sh *shard) get(c *Collection, h uint64, key []byte, want materializeWant) ([]byte, Codec, *segDictHandle, *classad.ClassAd, bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	l, ok := sh.findCurrent(sh.dirGet(h), key)
 	if !ok {
 		if l, ok = sh.lookupSealed(key, h); !ok {
-			return nil, nil, nil, false
+			return nil, nil, nil, nil, false
 		}
 	}
 	// segForLoc, not segAt: l can come from the sealed KEY INDEX as well as the chain, and a sidecar
 	// describing a segment that has since been rewritten names offsets that no longer hold records.
 	seg := sh.segForLoc(l)
 	if seg == nil {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
 	}
 	ad, adCodec, ok2 := segStoredOrReassembled(c, seg, l.off)
 	if !ok2 {
-		return nil, nil, nil, false
+		return nil, nil, nil, nil, false
+	}
+	// A current read is a snapshot read at the newest sequence, so replay uses seqMax.
+	if raw, rc, obj, handled, ok3 := sh.resolveDelta(c, key, h, seqMax, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
+		if !ok3 {
+			return nil, nil, nil, nil, false
+		}
+		dict := seg.dict.Load()
+		if dict != nil {
+			dict.ensureNames()
+		}
+		return raw, rc, dict, obj, true
 	}
 	out := make([]byte, len(ad))
 	copy(out, ad)
@@ -483,7 +521,7 @@ func (sh *shard) get(c *Collection, h uint64, key []byte) ([]byte, Codec, *segDi
 	if dict != nil {
 		dict.ensureNames()
 	}
-	return out, adCodec, dict, true
+	return out, adCodec, dict, nil, true
 }
 
 // forEachSealedRecord calls fn for every record in this shard's SEALED, indexed
@@ -760,7 +798,7 @@ func releaseWindows(wins []segWindow) {
 func (c *Collection) forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var rbuf []byte
 	forEachVisibleRef(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf)
 		if !ok {
 			return true
 		}
@@ -774,7 +812,7 @@ func (c *Collection) forEachVisible(s0 uint64, wins []segWindow, fn func(ad []by
 func (c *Collection) forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var rbuf []byte
 	forEachVisibleRef(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf)
 		if !ok {
 			return true
 		}
@@ -787,7 +825,7 @@ func (c *Collection) forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(ke
 func (c *Collection) forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var rbuf []byte
 	forEachVisibleRefReverse(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf)
 		if !ok {
 			return true
 		}

@@ -73,6 +73,14 @@ func nowMillis() uint64 { return nowMillisFn() }
 // versions from now on (it is not retroactive); disabling lets the next compaction
 // reclaim the retained history. Safe to call concurrently with reads and writes.
 func (c *Collection) SetTimeTravel(o *TimeTravelOptions) {
+	// Turning time travel on over a delta-mode collection would start retaining superseded
+	// fragments for as-of reads, which cannot be served correctly (see Options.DeltaMax).
+	// Collapse what is open and stop writing new deltas; the records already on disk stay
+	// readable, because deltaRead is left alone.
+	if newTTConfig(o) != nil && c.deltas != nil {
+		c.collapseLiveChains()
+		c.deltaMax = 0
+	}
 	c.ttCfg.Store(newTTConfig(o))
 }
 

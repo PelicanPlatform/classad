@@ -229,6 +229,15 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 				continue
 			}
 			seq := recSeq(src.data, o)
+			// A reseal DECODES each record and encodes it afresh, which a delta cannot survive:
+			// it holds only what one write changed, and re-encoding its fragment produces
+			// something a reader believes is a whole ad. An append-only shard never writes one
+			// (a delta needs a per-key current version, which an append log has no notion of),
+			// so meeting one means an assumption has moved -- skip the reseal rather than
+			// rewrite the data wrongly.
+			if recIsDelta(src.data, o) {
+				return nil
+			}
 			key := append([]byte(nil), recKey(src.data, o)...)
 			// The FULL ad: a columnarized source holds only part of each record, and the rest
 			// lives in a columnar payload that is not carried across. Reading it whole here

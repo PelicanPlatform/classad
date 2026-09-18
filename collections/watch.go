@@ -563,7 +563,7 @@ func (c *Collection) watchAdAs(key, rawAd []byte, codec Codec, redact bool) (*cl
 		if pk := c.parentKeyFor(key); pk != nil {
 			ph := c.h.Hash(pk)
 			sh := c.shards[c.shardOf(pk, ph)]
-			if pad, pcodec, pdict, ok := sh.get(c, ph, pk); ok {
+			if pad, pcodec, pdict, _, ok := sh.get(c, ph, pk, mWire); ok {
 				if parent, err := c.decodeAdDictAs(pdict, pad, pcodec, redact); err == nil {
 					c.mergeParent(ad, parent)
 				}
@@ -702,7 +702,7 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 				// The FULL ad: a columnarized record carries only what its schema does not
 				// cover, and a watch event holding half an ad is indistinguishable from an ad
 				// whose attributes really were removed.
-				adBytes, adCodec, aok := c.adBytes(recRef{w: wn, off: o, dict: wn.dict()}, &wbuf)
+				adBytes, adCodec, aok := c.adBytes(recRef{w: wn, off: o, dict: wn.dict()}, sReg, &wbuf)
 				if !aok {
 					off += int(total)
 					continue
@@ -730,4 +730,17 @@ func (c *Collection) catchupDeletes(i int, cursor uint64, yield func(WatchEvent)
 		}
 	}
 	return true
+}
+
+// watching reports whether any watcher is attached. Callers use it to skip work that only a
+// watcher would consume -- publishing already short-circuits on it, but work done to PREPARE
+// an event happens before that and would otherwise be paid whether or not anyone is listening.
+func (h *watchHub) watching() bool {
+	if h == nil || !h.active.Load() {
+		return false
+	}
+	h.mu.Lock()
+	n := len(h.watchers)
+	h.mu.Unlock()
+	return n > 0
 }

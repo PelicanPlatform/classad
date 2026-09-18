@@ -41,10 +41,44 @@ func (r recRef) codec() Codec { return r.w.codec }
 // attributes held in the columnar payload, and it reports an error rather than returning a partial
 // ad if that payload cannot be trusted.
 func (c *Collection) wire(r recRef, buf []byte) ([]byte, error) {
+	return c.wireAt(r, seqMax, buf)
+}
+
+// wireAt is wire for a reader that knows the snapshot it is reading at, which a DELTA record
+// needs: merging one means selecting the versions visible at that snapshot.
+//
+// Every reader that goes through here gets whole ads, which is the point -- this and adBytes
+// are the two places the package already reassembles a partial record (the columnar case), and
+// teaching readers one at a time is how roughly ten of them ended up serving fragments.
+// Callers that genuinely have no snapshot pass seqMax and get the current version.
+func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
+	var raw []byte
+	var err error
 	if seg := r.w.seg; seg != nil && (seg.columnarized() || seg.colDamaged.Load()) {
-		return c.recordWireIn(seg, r.w.data, r.off, buf)
+		raw, err = c.recordWireIn(seg, r.w.data, r.off, buf)
+	} else {
+		raw, err = r.w.codec.Decompress(buf[:0], r.stored())
 	}
-	return r.w.codec.Decompress(buf[:0], r.stored())
+	if err != nil || !c.deltaRead {
+		return raw, err
+	}
+	if deltaHdrDispatch {
+		if !recIsDelta(r.w.data, r.off) {
+			return raw, err
+		}
+	} else if !isDeltaRecord(raw) { // see deltaHdrDispatch: the pre-header dispatch
+		return raw, err
+	}
+	key := r.key()
+	h := c.h.Hash(key)
+	sh := c.shards[c.shardOf(key, h)]
+	sh.mu.RLock()
+	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, buf[:0])
+	sh.mu.RUnlock()
+	if !ok {
+		return nil, errBadRemnant // a fragment we cannot complete: skip, never serve half an ad
+	}
+	return merged, nil
 }
 
 // forEachVisibleRef walks the frozen windows in append order and calls fn for each record visible
@@ -131,17 +165,61 @@ func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 //
 // scratch is reused across records; the returned bytes are valid only until the next call, which is
 // already the contract for the compressed case (the window's mapping outlives neither).
-func (c *Collection) adBytes(r recRef, scratch *[]byte) ([]byte, Codec, bool) {
+func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Codec, bool) {
 	seg := r.w.seg
-	if seg == nil || !(seg.columnarized() || seg.colDamaged.Load()) {
-		return r.stored(), r.w.codec, true
+	stored, codec := r.stored(), r.w.codec
+	if seg != nil && (seg.columnarized() || seg.colDamaged.Load()) {
+		full, err := c.recordWireIn(seg, r.w.data, r.off, *scratch)
+		if err != nil {
+			return nil, nil, false // skip a record we cannot reassemble rather than serve half of it
+		}
+		*scratch = full
+		stored, codec = full, identityCodec{}
 	}
-	full, err := c.recordWireIn(seg, r.w.data, r.off, *scratch)
-	if err != nil {
-		return nil, nil, false // skip a record we cannot reassemble rather than serve half of it
+	// A delta record holds only the attributes one write changed -- the same hazard the
+	// columnar branch above exists for: half an ad is indistinguishable from an ad whose
+	// attributes really were removed. Resolving it HERE covers every reader that goes through
+	// this primitive (the visible-record walks behind serial, reverse and chained scans, the
+	// ordered-index rebuild, ForEachAd, and the watch catch-up) rather than requiring each to
+	// be taught separately -- which is how about ten of them ended up serving fragments.
+	//
+	// The test is the record HEADER, so an ordinary record in a delta-enabled collection leaves
+	// here on the same line it always did, still compressed, with the callback decompressing it
+	// once as before. Deciding this from the payload instead meant decompressing every record
+	// scanned -- and then the callback's identity Decompress copied the result again, so a scan
+	// of a store of whole ads paid a decompression and a full-ad memcpy per record for a feature
+	// none of its records used.
+	if !c.deltaRead {
+		return stored, codec, true
 	}
-	*scratch = full
-	return full, identityCodec{}, true
+	if deltaHdrDispatch {
+		if !recIsDelta(r.w.data, r.off) {
+			return stored, codec, true
+		}
+	} else {
+		// The pre-header dispatch (see deltaHdrDispatch), reproduced exactly so the A/B compares
+		// implementations and not incidental extra work: one decompression, reused by the caller
+		// through the identity codec when the record turns out to be an ordinary one.
+		raw, err := codec.Decompress((*scratch)[:0], stored)
+		if err != nil {
+			return nil, nil, false
+		}
+		*scratch = raw
+		if !isDeltaRecord(raw) {
+			return raw, identityCodec{}, true
+		}
+	}
+	key := r.key()
+	h := c.h.Hash(key)
+	sh := c.shards[c.shardOf(key, h)]
+	sh.mu.RLock()
+	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, (*scratch)[:0])
+	sh.mu.RUnlock()
+	if !ok {
+		return nil, nil, false
+	}
+	*scratch = merged
+	return merged, identityCodec{}, true
 }
 
 // segStoredOrReassembled returns a record's bytes and the codec that decodes them, for the

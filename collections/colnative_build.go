@@ -497,6 +497,23 @@ func (c *Collection) columnarizeSealed() int {
 	// Verified rather than argued -- TestColumnarNativeOverEncryptedStoresNoPlaintext columnarizes an
 	// encrypted collection, reads every ad back with its sealed value intact, and scans every file on
 	// disk for the plaintext.
+	// Delta records and columnarization coexist, which was not obvious and is worth recording.
+	//
+	// Columnarization only ever rewrites SEALED segments, and the seal collapse guarantees no
+	// LIVE delta exists outside the active one (TestNoLiveDeltaOutsideActiveSegment measures
+	// this directly: 0 live fragments across sealed segments). The fragments that do sit in a
+	// sealed segment are all superseded, and the only readers of a superseded version are
+	// time-travel reads -- refused for a delta-mode collection -- and conflictSince, which looks
+	// at sequence numbers and never at content.
+	//
+	// The remnant also keeps its flags byte regardless: SplitBody returns a[:hdrEnd], flags
+	// included, and BuildAd appends it verbatim. So even a columnarized delta still reads AS a
+	// delta and replays correctly; the invariant above means that path should not arise.
+	//
+	// This stood guarded for a while on the theory that it was unsafe, which cost a delta-mode
+	// table the columnar COUNT/MIN/MAX/SUM accelerator for nothing -- and the guard made its own
+	// test unfalsifiable, since ColumnarizeSealed returned 0 before doing anything.
+	// TestDeltaVsColumnarization now columnarizes 28 sealed segments and checks every ad.
 	st := c.schemaScan.Load()
 	if st == nil || st.schema == nil || len(st.schema.fields) == 0 {
 		return 0 // no schema derived yet: nothing to move into columns
