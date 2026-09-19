@@ -1195,6 +1195,9 @@ func (db *DB) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool) {
 // which reads back perfectly correctly and saves nothing.
 func (db *DB) DeltaStats() (deltas, fulls int64) { return db.c.DeltaStats() }
 
+// SealWalkStats reports what the collapse walk examined and found. See collections.SealWalkStats.
+func SealWalkStats() (examined, deltas int64) { return collections.SealWalkStats() }
+
 // FallbackReasons reports, process-wide, why patch writes had to store a whole record rather than
 // a delta: an attribute removal (which a delta cannot express), the chain reaching its bound, no
 // whole record to chain to yet, or delta records not being in use. Each fallback costs a read of

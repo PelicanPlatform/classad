@@ -118,6 +118,13 @@ func (t *deltaTracker) forget(h uint64) {
 	t.mu.Unlock()
 }
 
+// reset empties the tracker: every chain it described has just been collapsed.
+func (t *deltaTracker) reset() {
+	t.mu.Lock()
+	clear(t.depth)
+	t.mu.Unlock()
+}
+
 // deltaAd builds the ad to store in a delta record: the named attributes, taken from the
 // full ad the caller already has. Attribute names are case-insensitive, so the wanted set is
 // matched folded. Returns nil if any name is missing, which forces a full record rather than
@@ -573,6 +580,14 @@ func SpliceStats() (spliced, spliceRefused, objectPath int64) {
 
 // DeltaStats reports how many records this collection has stored as deltas versus in full
 // since it was opened. Both zero means delta mode is off (or nothing has been written).
+//
+// Both count decisions made by the delta tracker, which is the write path -- NOT every whole
+// record the store writes. A COLLAPSE does not appear here at all: collapseBatch writes its
+// merged records with tx.putWireAd, which takes bytes that are already encoded and so never
+// consults the tracker. So fulls does not move when a collapse rewrites thousands of chains,
+// and a "did the collapse do anything" check built on it reads zero in every case -- which is
+// exactly the wrong answer to take from a counter that looks like it should know. Use
+// SealWalkStats for what the collapse examined and found.
 func (c *Collection) DeltaStats() (deltas, fulls int64) {
 	if c.deltas == nil {
 		return 0, 0
@@ -876,9 +891,7 @@ func (c *Collection) collapseSealedChains() {
 // segment is the only place a live fragment can be.
 func (c *Collection) collapseLiveChains() {
 	open := c.liveDeltaKeys()
-	c.deltas.mu.Lock()
-	clear(c.deltas.depth) // the tracker describes the active segment, which is now collapsed
-	c.deltas.mu.Unlock()
+	c.deltas.reset() // the tracker describes the active segment, which is now collapsed
 
 	// Collapse in BATCHES, not one transaction per key. Each commit is durable, so a key per
 	// transaction meant an fsync per key: a single compaction pass on a mirror of a real schedd
@@ -994,6 +1007,13 @@ var collapseDeferred atomic.Int64
 
 // CollapseDeferrals reports how many delta-chain collapses have been postponed to a later pass.
 func CollapseDeferrals() int64 { return collapseDeferred.Load() }
+
+// SealWalkStats reports what the collapse walk has examined and found: live records looked at,
+// and live deltas among them. The ratio is the walk's yield -- whether it is finding chains to
+// collapse or scanning a segment to conclude there is nothing to do.
+func SealWalkStats() (examined, deltas int64) {
+	return sealWalkRecords.Load(), sealWalkDeltas.Load()
+}
 
 // collapseRaceHook, when non-nil, runs inside collapseBatch after the transaction's snapshot is
 // taken and before it commits -- the window a concurrent writer has to make the collapse conflict.
