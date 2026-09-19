@@ -1,11 +1,26 @@
 package collections
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
+
+// How compaction re-interned its records. A run that is all internViaAST is paying for the
+// transcode attempt and getting the decode anyway -- which reads back perfectly correctly, so
+// nothing else would notice.
+var (
+	internViaWire atomic.Int64
+	internViaAST  atomic.Int64
+)
+
+// CompactInternPaths reports how many records compaction re-interned by transcoding the wire bytes
+// versus by decoding into an ast and encoding it back.
+func CompactInternPaths() (wirePath, astPath int64) {
+	return internViaWire.Load(), internViaAST.Load()
+}
 
 // compactDictReserve is the arena space held back at the end of an interned destination
 // segment for its attribute dictionary (appended at finalize). Generous: a typical dict is
@@ -623,6 +638,62 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// appendInterned encodes ad interned (with a hot header) against st and appends it to stream
 	// *curp, rolling to a fresh segment+stream (finalizing the old one's dict) when it would not
 	// fit with the dict reserve. Returns the destination segment and record offset.
+	// srcWire returns a source record's DECOMPRESSED bytes without decoding them. It is what the
+	// wire-level re-intern below consumes; decodeSrc, which builds an ast, is the fallback.
+	srcWire := func(seg *segment, o uint32) ([]byte, bool) {
+		w, err := c.recordWireIn(seg, seg.data, o, decBuf[:0])
+		if err != nil {
+			return nil, false
+		}
+		decBuf = w
+		return w, true
+	}
+	// appendInternedWire is appendInterned without the ast. Re-interning a record means rewriting
+	// how its attribute NAMES are keyed, which is a byte-level rewrite (see
+	// wire.AppendInternedFromInline) -- decoding the record into an ast and encoding the ast back
+	// was 71% of a real compaction pass's allocation, 35% of it in readString copying every string
+	// value into a fresh Go string for the encoder to write straight out again.
+	//
+	// It reports false for a record the transcode will not take (already interned, standalone, or
+	// malformed), and the caller falls back to the ast path.
+	appendInternedWire := func(streamSegs *[]*segment, curp **segment, st *internStream, seq uint64, key, w []byte) (*segment, uint32, bool) {
+		if *curp == nil {
+			*curp = newDst(streamSegs, 0, target)
+			*st = newStream()
+		}
+		out, ok := wire.AppendInternedFromInline(wireBuf[:0], wire.Ad(w), st.table, st.hot)
+		if !ok {
+			internViaAST.Add(1)
+			return nil, 0, false
+		}
+		wireBuf = out
+		refreshHot(st)
+		body := target.Compress(encBuf[:0], out)
+		encBuf = body
+		rl := recordLen(len(key), len(body))
+		if (*curp).used+rl+reserve > len((*curp).data) {
+			finalizeInterned(*curp, st)
+			*curp = newDst(streamSegs, rl+reserve, target)
+			*st = newStream()
+			// A fresh stream means a fresh table, so the ids have to be reassigned against it.
+			out, ok = wire.AppendInternedFromInline(wireBuf[:0], wire.Ad(w), st.table, st.hot)
+			if !ok {
+				internViaAST.Add(1)
+				return nil, 0, false
+			}
+			wireBuf = out
+			refreshHot(st)
+			body = target.Compress(encBuf[:0], out)
+			encBuf = body
+			rl = recordLen(len(key), len(body))
+		}
+		off, _ := (*curp).append(seq, noLoc, key, body)
+		// Counted here, not at the transcode above: the rollover path can still refuse and hand
+		// the record to the ast fallback, and a counter used to check "no silent fallbacks" has
+		// to report the route the record actually went out by.
+		internViaWire.Add(1)
+		return *curp, off, true
+	}
 	appendInterned := func(streamSegs *[]*segment, curp **segment, st *internStream, seq uint64, key []byte, ad *ast.ClassAd) (*segment, uint32) {
 		if *curp == nil {
 			*curp = newDst(streamSegs, 0, target)
@@ -702,14 +773,22 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 				var dstSeg *segment
 				var dstOff uint32
 				if intern {
-					ad := decodeSrc(seg, o)
-					if ad == nil {
-						abort = true
-						break
+					placed := false
+					if w, ok := srcWire(seg, o); ok {
+						if ds, doff, ok2 := appendInternedWire(&dstSegs, &cur, &curStream, seq, key, w); ok2 {
+							dstSeg, dstOff, placed = ds, doff, true
+						}
 					}
-					dstSeg, dstOff = appendInterned(&dstSegs, &cur, &curStream, seq, key, ad)
-					if abort {
-						break
+					if !placed {
+						ad := decodeSrc(seg, o)
+						if ad == nil {
+							abort = true
+							break
+						}
+						dstSeg, dstOff = appendInterned(&dstSegs, &cur, &curStream, seq, key, ad)
+						if abort {
+							break
+						}
 					}
 				} else {
 					outAd, outCodec, rok := recompress(seg, o)
@@ -736,6 +815,13 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 				// segment's live/dead counters right: appended live, then retired).
 				key := recKey(seg.data, o)
 				if intern {
+					if w, ok := srcWire(seg, o); ok {
+						if hs, hoff, ok2 := appendInternedWire(&histSegs, &hcur, &hcurStream, seq, key, w); ok2 {
+							hs.supersedeRec(hoff, sup)
+							off += int(total)
+							continue
+						}
+					}
 					ad := decodeSrc(seg, o)
 					if ad == nil {
 						abort = true

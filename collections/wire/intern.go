@@ -118,6 +118,20 @@ func (t *InternTable) Intern(name string) uint32 {
 	return id
 }
 
+// InternBytes is Intern for a caller holding the name as bytes -- a wire-level transcode, which
+// never has it as a string. Taking the string conversion at the call site would allocate per
+// attribute per record; indexing the map with string(name) directly does not, because the compiler
+// elides the copy for a map index. Only a name never seen before pays for one, in Intern.
+func (t *InternTable) InternBytes(name []byte) uint32 {
+	t.mu.RLock()
+	id, ok := t.byExact[string(name)]
+	t.mu.RUnlock()
+	if ok {
+		return id
+	}
+	return t.Intern(string(name))
+}
+
 // LookupID returns the id for name if it has already been interned, without
 // allocating a new one (a read-only counterpart to Intern). Used by the query
 // fast path to resolve an attribute name to its id without polluting the table

@@ -1203,6 +1203,11 @@ func FallbackReasons() (removal, bound, noBase, ineligible int64) {
 	return collections.FallbackReasons()
 }
 
+// CompactInternPaths reports, process-wide, how compaction re-interned records: by transcoding the
+// wire bytes, or by decoding into an ast and encoding it back. All-ast means the transcode is being
+// attempted and refused on every record.
+func CompactInternPaths() (wirePath, astPath int64) { return collections.CompactInternPaths() }
+
 // SpliceStats reports, process-wide, how delta merges were served: by splicing attribute bytes,
 // by decoding after the splice refused, and by decoding because the caller wanted an object
 // rather than bytes. All three matter -- a merge that never attempts a splice and one that

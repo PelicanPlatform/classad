@@ -93,6 +93,20 @@ func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([
 	if dict == nil && !c.inline {
 		return w, true // in-memory: already global-interned
 	}
+	// Wire-level first: the two forms differ only in how attribute names are keyed, so the bytes
+	// can be rewritten without an ast (see wire.AppendInternedFromInline). It covers the shape this
+	// is called with -- a plain inline-names record -- and refuses anything else, which falls
+	// through to the decode below.
+	//
+	// Worth more than the allocation it saves: this path is also what feeds the derived schema and
+	// the on-disk sidecar, and the decode below opens every sealed value with the collection's key
+	// and must remember to re-seal. The transcode copies a sealed node without being able to read
+	// it, so it cannot leak one.
+	if dict == nil && c.inline {
+		if out, ok := wire.AppendInternedFromInline(dst[:0], wire.Ad(w), c.intern, nil); ok {
+			return out, true
+		}
+	}
 	ad, err := c.decodeWireDict(dict, w)
 	if err != nil {
 		return nil, false
