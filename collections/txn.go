@@ -490,7 +490,18 @@ func (tx *Txn) getOwn(key []byte) (*classad.ClassAd, bool) {
 }
 
 // readStored reads key as of the transaction's snapshot, ignoring its own buffered writes.
+// readStoredMissHook, when non-nil and returning true for a key, makes readStored report a miss
+// for it. Test-only (nil in production): a resolve miss on a key the store HOLDS is the condition
+// that produced identity-less fragment rows in production, and it is not reachable on demand --
+// it needs a key index and directory that disagree with the records. The behaviour it guards
+// (refuse and report a conflict, never store the patch against an empty ad) is worth a test that
+// does not depend on reproducing the miss.
+var readStoredMissHook func(key []byte) bool
+
 func (tx *Txn) readStored(key []byte) (*classad.ClassAd, bool) {
+	if readStoredMissHook != nil && readStoredMissHook(key) {
+		return nil, false // test-only: see readStoredMissHook
+	}
 	h := tx.c.h.Hash(key)
 	idx := tx.c.shardOf(key, h)
 	s0 := tx.snapOf(idx)
@@ -641,6 +652,12 @@ func (tx *Txn) Commit() CommitResult {
 	// buffer. It grows once to the widest ad in the batch instead of being reallocated per write.
 	var encScratch []byte
 	byShard := make(map[int][]*txnWrite)
+	// Keys whose patch could not be composed because the store holds the key but could not read
+	// its current record. They are reported as conflicts rather than written: see
+	// encodePatchOnly, where storing them against an empty ad is what turned a resolve miss into
+	// a fragment row. A conflict is the right shape for it -- the caller's existing retry path
+	// handles it, and a retry after the miss clears is exactly the correct response.
+	var unreadable [][]byte
 	for _, b := range tx.writes {
 		if b.del && tx.c.deltas != nil {
 			// The key's records are going away, so the tracker must stop believing a full
@@ -659,7 +676,12 @@ func (tx *Txn) Commit() CommitResult {
 			case raw != nil:
 				// Bytes the caller buffered (Txn.putWire); they are not ours to reuse.
 			case b.patch != nil && b.ad == nil:
-				raw, w.delta = tx.encodePatchOnly(encScratch[:0], b, h)
+				var ok bool
+				raw, w.delta, ok = tx.encodePatchOnly(encScratch[:0], b, h)
+				if !ok {
+					unreadable = append(unreadable, b.key)
+					continue
+				}
 				encScratch = raw
 			default:
 				raw, w.delta = tx.c.encodeDelta(encScratch[:0], b.key, h, b.ad, b.changed, b.noDelta)
@@ -722,6 +744,7 @@ func (tx *Txn) Commit() CommitResult {
 	// Phase 3: publish (now durable) and aggregate the result + ordered-index maintenance.
 	// Kept sequential: publishing and the ordered index touch collection-shared state.
 	var res CommitResult
+	res.Conflicts = append(res.Conflicts, unreadable...)
 	for _, c := range commits {
 		if c.changed {
 			tx.c.shards[c.idx].publishTxn(tx.c, c.ws, c.seq)
