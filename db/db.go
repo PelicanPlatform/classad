@@ -1198,6 +1198,12 @@ func (db *DB) DeltaStats() (deltas, fulls int64) { return db.c.DeltaStats() }
 // SealWalkStats reports what the collapse walk examined and found. See collections.SealWalkStats.
 func SealWalkStats() (examined, deltas int64) { return collections.SealWalkStats() }
 
+// UnreadableBaseRefusals reports, process-wide, how many patch writes were REFUSED because the
+// key was present in the store but its current record could not be read. Nonzero means a key the
+// store holds failed to resolve; the write was reported to the caller as a conflict rather than
+// stored against an empty ad, which is what used to turn such a miss into an identity-less row.
+func UnreadableBaseRefusals() int64 { return collections.UnreadableBaseRefusals() }
+
 // FallbackReasons reports, process-wide, why patch writes had to store a whole record rather than
 // a delta: an attribute removal (which a delta cannot express), the chain reaching its bound, no
 // whole record to chain to yet, or delta records not being in use. Each fallback costs a read of

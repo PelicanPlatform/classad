@@ -191,6 +191,11 @@ var (
 	fallbackBound      atomic.Int64
 	fallbackNoBase     atomic.Int64
 	fallbackIneligible atomic.Int64
+	// fallbackUnreadableBase counts patch writes REFUSED because the key is in the store but its
+	// current record could not be read. Distinct from fallbackNoBase (key genuinely absent, a
+	// create): this one is a resolve miss, and the write is reported to the caller as a conflict
+	// rather than stored against an empty ad.
+	fallbackUnreadableBase atomic.Int64
 )
 
 // FallbackReasons reports why patch writes stored whole records rather than deltas.
@@ -682,12 +687,12 @@ func (c *Collection) collapseBeforeRewrite() {
 // and merged: on a key's first write, when the chain has reached its bound, and when the write
 // removed an attribute (which a delta of present attributes cannot express). So a read happens
 // once per re-materialization rather than once per update.
-func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) ([]byte, bool) {
+func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isDelta, ok bool) {
 	c := tx.c
 	eligible := len(b.removed) == 0 && b.patch != nil
 	if eligible && c.deltaMax > 0 && c.deltas != nil && c.inline && c.canWriteDelta() {
 		if c.deltas.next(h, true, c.keyExists(b.key, h), c.deltaMax) {
-			return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true
+			return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true, true
 		}
 		// The delta was permissible but the tracker declined: either the key has no whole record
 		// to chain to, or the chain has reached DeltaMax. Distinguishing them matters because the
@@ -712,6 +717,25 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) ([]byte, bool) {
 	storeReads.Add(1)
 	ad, ok := tx.readStored(b.key)
 	if !ok {
+		// The base could not be read. Whether inventing one is right depends on WHY, and the
+		// two cases are opposites:
+		//
+		//	key genuinely absent -- a create. SetAttribute is documented to create, and a
+		//	                        first write for a key has nothing to merge with.
+		//	key present, unreadable -- NOT a create. Merging this write into an empty ad and
+		//	                        storing it replaces a whole ad with just the attributes
+		//	                        this one transaction touched.
+		//
+		// The second produced identity-less rows on a production mirror: a job-completion
+		// transaction stored as a "whole" record holding CompletionDate, LastRemoteHost and
+		// six siblings, with no ClusterId, no JobStatus and no Key -- and scheddsync's own
+		// absent-key counter read ZERO, so the key was present and the STORE failed to
+		// resolve it. Fabricating there turns a lookup miss into durable data loss for that
+		// key; refusing costs a retry.
+		if c.keyExists(b.key, h) {
+			fallbackUnreadableBase.Add(1)
+			return nil, false, false
+		}
 		ad = classad.New()
 	}
 	mergeDelta(ad, b.patch)
@@ -719,7 +743,7 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) ([]byte, bool) {
 		ad.Delete(n)
 	}
 	b.ad = ad
-	return c.encodeAdInto(dst, ad.AST()), false
+	return c.encodeAdInto(dst, ad.AST()), false, true
 }
 
 // deltaModeFile records that a store has written delta records, so a later open knows it must
@@ -811,6 +835,11 @@ func (c *Collection) canWriteDelta() bool {
 	c.markDeltaMode()
 	return c.deltaMarked.Load()
 }
+
+// UnreadableBaseRefusals reports, process-wide, how many patch writes were refused because the
+// key was present but its current record could not be read. Nonzero means the store failed to
+// resolve a key it holds -- the write was reported as a conflict rather than stored as a fragment.
+func UnreadableBaseRefusals() int64 { return fallbackUnreadableBase.Load() }
 
 // TrackedKeys reports how many keys the delta tracker holds. The tracker is the one new
 // in-memory structure delta records add -- one small entry per key that has been written -- so
