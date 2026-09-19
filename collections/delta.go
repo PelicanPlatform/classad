@@ -169,6 +169,28 @@ func mergeDeltaAST(base *classad.ClassAd, d *ast.ClassAd) {
 	}
 }
 
+// Why a patch write had to store a WHOLE record instead of a delta. Each one costs a read of the
+// stored ad (storeReads), which on a real queue replay was the largest single item in the write
+// path's allocation -- so which reason dominates decides what is worth fixing.
+//
+//	fallbackRemoval    -- the write DELETED an attribute, which a delta of present attributes
+//	                      cannot express. A schedd log is full of these.
+//	fallbackBound      -- the chain reached DeltaMax; this is the bound doing its job.
+//	fallbackNoBase     -- the key has no whole record yet (its first write, or just after a seal
+//	                      collapse emptied the tracker).
+//	fallbackIneligible -- delta mode off for this collection, or nothing to patch.
+var (
+	fallbackRemoval    atomic.Int64
+	fallbackBound      atomic.Int64
+	fallbackNoBase     atomic.Int64
+	fallbackIneligible atomic.Int64
+)
+
+// FallbackReasons reports why patch writes stored whole records rather than deltas.
+func FallbackReasons() (removal, bound, noBase, ineligible int64) {
+	return fallbackRemoval.Load(), fallbackBound.Load(), fallbackNoBase.Load(), fallbackIneligible.Load()
+}
+
 // storeReads counts reads of a stored record made to satisfy a write. It exists so a test can
 // assert that patching an attribute performs NONE: the removal of that read is the point of
 // delta records, it is invisible in the results, and nothing else would notice it coming back.
@@ -652,7 +674,20 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) ([]byte, bool) {
 		if c.deltas.next(h, true, c.keyExists(b.key, h), c.deltaMax) {
 			return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true
 		}
+		// The delta was permissible but the tracker declined: either the key has no whole record
+		// to chain to, or the chain has reached DeltaMax. Distinguishing them matters because the
+		// fixes differ -- one is a cold key, the other is the bound being too tight.
+		if c.keyExists(b.key, h) {
+			fallbackBound.Add(1)
+		} else {
+			fallbackNoBase.Add(1)
+		}
 	} else if c.deltas != nil {
+		if len(b.removed) > 0 {
+			fallbackRemoval.Add(1)
+		} else {
+			fallbackIneligible.Add(1)
+		}
 		// Record the decision so the chain restarts here even when delta mode declined.
 		c.deltas.next(h, false, false, c.deltaMax)
 	}

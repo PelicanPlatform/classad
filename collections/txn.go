@@ -734,17 +734,20 @@ func (tx *Txn) Commit() CommitResult {
 			res.Committed++
 			if w.del {
 				tx.c.removeOrdered(w.key)
-			} else {
+			} else if tx.c.hasOrdered() {
+				// The WHOLE block is gated on the collection having an ordered index, because
+				// maintainOrdered is the only thing that consumes the ad and it returns
+				// immediately without one. The gate used to sit on the inner Get alone, which
+				// left materialize() below running unconditionally -- and for a write buffered as
+				// wire bytes with no object (every spliced delta collapse) that is a full decode
+				// of the bytes the collapse had just produced, thrown away. On a real queue
+				// replay it was 142 MB, 14% of the tail's allocation, feeding a consumer that did
+				// not exist. Same mistake as the one the comment below describes, one line up.
 				ad := w.adObj
 				if ad == nil && w.buf != nil {
 					ad, _ = w.buf.materialize()
 				}
-				// Gated on the collection HAVING an ordered index. maintainOrdered returns
-				// immediately without one, but the Get below is a full chain replay and was
-				// running on every delta write regardless -- 51% of an ingest run, to feed a
-				// consumer that did not exist. Same shape as the publish bug above: prepare the
-				// input only for a consumer that will use it.
-				if ad == nil && w.buf != nil && w.buf.patch != nil && tx.c.hasOrdered() {
+				if ad == nil && w.buf != nil && w.buf.patch != nil {
 					// A delta write buffers only the changed attributes, so materialize() has
 					// no object to return. Handing nil to maintainOrdered evaluated the index
 					// predicate against nothing, which is never a member -- so every delta

@@ -1195,6 +1195,14 @@ func (db *DB) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool) {
 // which reads back perfectly correctly and saves nothing.
 func (db *DB) DeltaStats() (deltas, fulls int64) { return db.c.DeltaStats() }
 
+// FallbackReasons reports, process-wide, why patch writes had to store a whole record rather than
+// a delta: an attribute removal (which a delta cannot express), the chain reaching its bound, no
+// whole record to chain to yet, or delta records not being in use. Each fallback costs a read of
+// the stored ad, so this says which of those reads are worth attacking.
+func FallbackReasons() (removal, bound, noBase, ineligible int64) {
+	return collections.FallbackReasons()
+}
+
 // SpliceStats reports, process-wide, how delta merges were served: by splicing attribute bytes,
 // by decoding after the splice refused, and by decoding because the caller wanted an object
 // rather than bytes. All three matter -- a merge that never attempts a splice and one that
