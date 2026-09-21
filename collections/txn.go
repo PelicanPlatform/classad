@@ -399,13 +399,30 @@ func (b *txnBuf) materialize() (*classad.ClassAd, bool) {
 // CommitResult reports a transaction's outcome. Conflicts holds the keys whose
 // write lost a write-write race and were not applied; the caller may re-read and
 // retry just those. The other buffered writes committed.
+//
+// Unapplied is the OTHER kind of not-applied, and the distinction is the point: those writes
+// could not be composed at all, and re-applying the identical write cannot change that. A patch
+// whose stored base is unreadable is the case that exists today -- the key is present but the
+// record behind it will not come back (a delta chain that no longer materializes, a segment that
+// went away), so there is nothing to merge the patch onto.
+//
+// Reporting those as Conflicts made a caller that retries conflicts loop forever. On a production
+// mirror each one rewound the tailer, re-applied, failed identically, and after three attempts
+// escalated to a full 460-second replay of a 923 MB log that wrote nothing -- 285 times, which is
+// why the mirror could never catch up. A caller must be able to tell "try again" from "this will
+// never work"; nothing else about the commit changes.
 type CommitResult struct {
 	Committed int
 	Conflicts [][]byte
+	Unapplied [][]byte
 }
 
 // Conflicted reports whether any buffered write lost a conflict.
 func (r CommitResult) Conflicted() bool { return len(r.Conflicts) > 0 }
+
+// HasUnapplied reports whether any buffered write could not be composed at all. Retrying it is
+// futile; the caller should record it and make progress.
+func (r CommitResult) HasUnapplied() bool { return len(r.Unapplied) > 0 }
 
 // Begin starts an optimistic transaction. Its snapshot for a shard is captured the
 // first time the transaction reads or writes a key in that shard.
@@ -653,10 +670,10 @@ func (tx *Txn) Commit() CommitResult {
 	var encScratch []byte
 	byShard := make(map[int][]*txnWrite)
 	// Keys whose patch could not be composed because the store holds the key but could not read
-	// its current record. They are reported as conflicts rather than written: see
-	// encodePatchOnly, where storing them against an empty ad is what turned a resolve miss into
-	// a fragment row. A conflict is the right shape for it -- the caller's existing retry path
-	// handles it, and a retry after the miss clears is exactly the correct response.
+	// its current record. They are reported as UNAPPLIED, not as conflicts: storing them against
+	// an empty ad is what turned a resolve miss into a fragment row, but calling them conflicts
+	// made every caller that retries conflicts retry something that cannot succeed. See
+	// CommitResult.Unapplied.
 	var unreadable [][]byte
 	for _, b := range tx.writes {
 		if b.del && tx.c.deltas != nil {
@@ -744,7 +761,7 @@ func (tx *Txn) Commit() CommitResult {
 	// Phase 3: publish (now durable) and aggregate the result + ordered-index maintenance.
 	// Kept sequential: publishing and the ordered index touch collection-shared state.
 	var res CommitResult
-	res.Conflicts = append(res.Conflicts, unreadable...)
+	res.Unapplied = append(res.Unapplied, unreadable...)
 	for _, c := range commits {
 		if c.changed {
 			tx.c.shards[c.idx].publishTxn(tx.c, c.ws, c.seq)

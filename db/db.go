@@ -877,6 +877,18 @@ func (e *ConflictError) Error() string {
 	return fmt.Sprintf("classad-db: %d key(s) conflicted: %v", len(e.Keys), e.Keys)
 }
 
+// UnappliedError reports writes that could not be composed at all, as distinct from a conflict.
+// Re-applying the identical write cannot succeed -- the key is present but the record behind it
+// will not come back -- so a caller should record these and make progress rather than retry.
+// Treating them as conflicts made a tailer rewind and re-apply forever, escalating to full log
+// replays that changed nothing. See collections.CommitResult.Unapplied.
+type UnappliedError struct{ Keys []string }
+
+func (e *UnappliedError) Error() string {
+	return fmt.Sprintf("classad-db: %d key(s) could not be applied and must not be retried: %v",
+		len(e.Keys), e.Keys)
+}
+
 // Txn is an independent optimistic transaction. Operations are buffered and applied
 // at Commit under snapshot-isolation OCC. A *Txn is not safe for concurrent use by
 // multiple goroutines; independent transactions are.
@@ -975,6 +987,15 @@ func (t *Txn) Commit() error {
 			keys[i] = string(k)
 		}
 		return &ConflictError{Keys: keys}
+	}
+	// Reported only when nothing conflicted, so a caller's retry path keeps seeing the retryable
+	// case first; an unapplied write is not retryable and is reported so the caller can move on.
+	if res.HasUnapplied() {
+		keys := make([]string, len(res.Unapplied))
+		for i, k := range res.Unapplied {
+			keys[i] = string(k)
+		}
+		return &UnappliedError{Keys: keys}
 	}
 	return nil
 }

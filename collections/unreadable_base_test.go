@@ -55,7 +55,14 @@ func TestUnreadableBaseRefusesRatherThanFabricate(t *testing.T) {
 
 	res := patchTx(t, c, "42.0", "CompletionDate", 1789838852, "Pad00")
 
-	if !res.Conflicted() {
+	// Reported as UNAPPLIED, not as a conflict. It was a conflict when this refusal first landed,
+	// and a caller that retries conflicts then retried something that could never succeed --
+	// rewinding, failing identically, and escalating to full log replays. See
+	// CommitResult.Unapplied.
+	if res.Conflicted() {
+		t.Error("reported as a conflict: a caller will retry a write that cannot succeed")
+	}
+	if !res.HasUnapplied() {
 		t.Error("the write was accepted although its base could not be read")
 	}
 	if res.Committed != 0 {
