@@ -77,33 +77,42 @@ func (sh *shard) findVisible(head loc, key []byte, s0 uint64) (loc, bool) {
 // The fourth result is the ad as an object, on the same terms as shard.get: non-nil only when a
 // delta chain had to be merged, in which case the bytes are just that object encoded.
 func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64, want materializeWant) ([]byte, Codec, *segDictHandle, *classad.ClassAd, bool) {
+	raw, codec, dict, obj, ok, _ := sh.getAtWhy(c, h, key, s0, want)
+	return raw, codec, dict, obj, ok
+}
+
+// getAtWhy is getAt carrying the reason for a miss. getAt's bare false covers conditions with
+// unrelated causes -- an MVCC miss, a reaped segment, a missing columnar payload, an
+// unresolvable delta chain -- and a caller that must explain the failure needs to tell them
+// apart. See readFail.
+func (sh *shard) getAtWhy(c *Collection, h uint64, key []byte, s0 uint64, want materializeWant) ([]byte, Codec, *segDictHandle, *classad.ClassAd, bool, readFail) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	l, ok := sh.findVisible(sh.dirGet(h), key, s0)
 	if !ok {
 		if l, ok = sh.lookupSealedAt(key, h, s0); !ok {
-			return nil, nil, nil, nil, false
+			return nil, nil, nil, nil, false, failNotVisible
 		}
 	}
 	// segForLoc, not segAt: l can come from the sealed KEY INDEX as well as the chain, and a sidecar
 	// describing a segment that has since been rewritten names offsets that no longer hold records.
 	seg := sh.segForLoc(l)
 	if seg == nil {
-		return nil, nil, nil, nil, false
+		return nil, nil, nil, nil, false, failSegGone
 	}
-	ad, adCodec, ok2 := segStoredOrReassembled(c, seg, l.off)
+	ad, adCodec, ok2, why := segStoredOrReassembledWhy(c, seg, l.off)
 	if !ok2 {
-		return nil, nil, nil, nil, false
+		return nil, nil, nil, nil, false, why
 	}
 	if raw, rc, obj, handled, ok3 := sh.resolveDelta(c, key, h, s0, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
 		if !ok3 {
-			return nil, nil, nil, nil, false
+			return nil, nil, nil, nil, false, failDelta
 		}
 		dict := seg.dict.Load()
 		if dict != nil {
 			dict.ensureNames()
 		}
-		return raw, rc, dict, obj, true
+		return raw, rc, dict, obj, true, failNone
 	}
 	out := make([]byte, len(ad))
 	copy(out, ad)
@@ -124,7 +133,7 @@ func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64, want mate
 	if dict != nil {
 		dict.ensureNames()
 	}
-	return out, adCodec, dict, nil, true
+	return out, adCodec, dict, nil, true, failNone
 }
 
 // hasAt reports whether key had a version live at snapshot s0. It is getAt's resolution
@@ -516,27 +525,33 @@ func (tx *Txn) getOwn(key []byte) (*classad.ClassAd, bool) {
 var readStoredMissHook func(key []byte) bool
 
 func (tx *Txn) readStored(key []byte) (*classad.ClassAd, bool) {
+	ad, ok, _ := tx.readStoredWhy(key)
+	return ad, ok
+}
+
+// readStoredWhy is readStored carrying the reason for a miss. See readFail.
+func (tx *Txn) readStoredWhy(key []byte) (*classad.ClassAd, bool, readFail) {
 	if readStoredMissHook != nil && readStoredMissHook(key) {
-		return nil, false // test-only: see readStoredMissHook
+		return nil, false, failNotVisible // test-only: see readStoredMissHook
 	}
 	h := tx.c.h.Hash(key)
 	idx := tx.c.shardOf(key, h)
 	s0 := tx.snapOf(idx)
-	stored, codec, dict, obj, ok := tx.c.shards[idx].getAt(tx.c, h, key, s0, readWant(tx.redact))
+	stored, codec, dict, obj, ok, why := tx.c.shards[idx].getAtWhy(tx.c, h, key, s0, readWant(tx.redact))
 	if !ok {
-		return nil, false
+		return nil, false, why
 	}
 	// A merged delta chain arrives as the object it was encoded from; decoding the bytes back
 	// would rebuild what we are holding. Not for a redacting read -- redaction is applied by the
 	// decode, and the object has every sealed value open.
 	if obj != nil && !tx.redact {
-		return obj, true
+		return obj, true, failNone
 	}
 	ad, err := tx.c.decodeAdDictAs(dict, stored, codec, tx.redact)
 	if err != nil {
-		return nil, false
+		return nil, false, failDecode
 	}
-	return ad, true
+	return ad, true, failNone
 }
 
 // Has reports whether key exists as the transaction sees it, without reading the stored

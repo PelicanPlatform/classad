@@ -1225,6 +1225,17 @@ func SealWalkStats() (examined, deltas int64) { return collections.SealWalkStats
 // stored against an empty ad, which is what used to turn such a miss into an identity-less row.
 func UnreadableBaseRefusals() int64 { return collections.UnreadableBaseRefusals() }
 
+// UnreadableBaseReasons breaks UnreadableBaseRefusals down by WHY the base could not be read,
+// keyed by reason name ("not-visible", "segment-gone", "reassemble", "delta-chain", "decode").
+// The repair differs per reason -- a snapshot miss, a reaped segment, a lost columnar payload,
+// an unresolvable delta chain and a decode failure have nothing in common -- so the total alone
+// cannot direct an investigation. The values sum to UnreadableBaseRefusals.
+func UnreadableBaseReasons() map[string]int64 { return collections.UnreadableBaseReasons() }
+
+// UnreadableBaseReasonNames lists every reason name UnreadableBaseReasons can report, including
+// ones currently at zero, so a consumer can publish a stable set of counters.
+func UnreadableBaseReasonNames() []string { return collections.UnreadableBaseReasonNames() }
+
 // FallbackReasons reports, process-wide, why patch writes had to store a whole record rather than
 // a delta: an attribute removal (which a delta cannot express), the chain reaching its bound, no
 // whole record to chain to yet, or delta records not being in use. Each fallback costs a read of

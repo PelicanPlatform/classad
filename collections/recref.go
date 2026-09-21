@@ -234,12 +234,20 @@ func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Code
 // That is a lie, but the alternative is an ad missing every schema'd attribute, which a caller
 // cannot detect at all; ColNativeCRCFailures counts these so the cause is visible.
 func segStoredOrReassembled(c *Collection, seg *segment, off uint32) ([]byte, Codec, bool) {
+	ad, codec, ok, _ := segStoredOrReassembledWhy(c, seg, off)
+	return ad, codec, ok
+}
+
+// segStoredOrReassembledWhy is segStoredOrReassembled carrying the reason for a miss, so a
+// caller that has to explain a failed read (encodePatchOnly) can say which condition it hit
+// rather than reporting every one of them as the same opaque "unreadable base".
+func segStoredOrReassembledWhy(c *Collection, seg *segment, off uint32) ([]byte, Codec, bool, readFail) {
 	if !(seg.columnarized() || seg.colDamaged.Load() || recIsStripped(seg.data, off)) {
-		return recAd(seg.data, off), seg.codec, true
+		return recAd(seg.data, off), seg.codec, true, failNone
 	}
 	full, err := c.recordWireIn(seg, seg.data, off, nil)
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, false, failReassemble
 	}
-	return full, identityCodec{}, true
+	return full, identityCodec{}, true, failNone
 }

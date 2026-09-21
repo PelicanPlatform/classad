@@ -715,7 +715,7 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isD
 	// b.ad is filled in so the rest of Commit (ordered-index maintenance, watch publication)
 	// sees the same object it would have for an ordinary Put.
 	storeReads.Add(1)
-	ad, ok := tx.readStored(b.key)
+	ad, ok, why := tx.readStoredWhy(b.key)
 	if !ok {
 		// The base could not be read. Whether inventing one is right depends on WHY, and the
 		// two cases are opposites:
@@ -734,6 +734,11 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isD
 		// key; refusing costs a retry.
 		if c.keyExists(b.key, h) {
 			fallbackUnreadableBase.Add(1)
+			// Record WHICH failure this was. The refusal is correct either way, but the
+			// repair is not: a not-visible miss is an MVCC/snapshot problem, a reassemble
+			// miss is a lost columnar payload, and a delta-chain miss is an unresolvable
+			// chain. Without this the counter says only that something went wrong.
+			unreadableByReason[why].Add(1)
 			return nil, false, false
 		}
 		ad = classad.New()
