@@ -54,7 +54,7 @@ func (c *Collection) wire(r recRef, buf []byte) ([]byte, error) {
 func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
 	var raw []byte
 	var err error
-	if seg := r.w.seg; seg != nil && (seg.columnarized() || seg.colDamaged.Load()) {
+	if seg := r.w.seg; seg != nil && (seg.columnarized() || seg.colDamaged.Load() || recIsStripped(r.w.data, r.off)) {
 		raw, err = c.recordWireIn(seg, r.w.data, r.off, buf)
 	} else {
 		raw, err = r.w.codec.Decompress(buf[:0], r.stored())
@@ -168,7 +168,7 @@ func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Codec, bool) {
 	seg := r.w.seg
 	stored, codec := r.stored(), r.w.codec
-	if seg != nil && (seg.columnarized() || seg.colDamaged.Load()) {
+	if seg != nil && (seg.columnarized() || seg.colDamaged.Load() || recIsStripped(r.w.data, r.off)) {
 		full, err := c.recordWireIn(seg, r.w.data, r.off, *scratch)
 		if err != nil {
 			return nil, nil, false // skip a record we cannot reassemble rather than serve half of it
@@ -234,7 +234,7 @@ func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Code
 // That is a lie, but the alternative is an ad missing every schema'd attribute, which a caller
 // cannot detect at all; ColNativeCRCFailures counts these so the cause is visible.
 func segStoredOrReassembled(c *Collection, seg *segment, off uint32) ([]byte, Codec, bool) {
-	if !(seg.columnarized() || seg.colDamaged.Load()) {
+	if !(seg.columnarized() || seg.colDamaged.Load() || recIsStripped(seg.data, off)) {
 		return recAd(seg.data, off), seg.codec, true
 	}
 	full, err := c.recordWireIn(seg, seg.data, off, nil)

@@ -371,7 +371,11 @@ func TestColumnarPayloadCorruptionFailsLoudly(t *testing.T) {
 		if rl == 0 {
 			break
 		}
-		if recIsCol(dst.data, o) {
+		// The PAYLOAD record, which is a marker. A remnant carries colFlag too (recIsStripped),
+		// so matching on colFlag alone finds the first data record instead and this test then
+		// corrupts a remnant while the real payload stays intact -- publishColNative accepts it
+		// and the assertions below fail for the wrong reason.
+		if recIsCol(dst.data, o) && recIsMarker(dst.data, o) {
 			colOff, found = o, true
 			break
 		}
