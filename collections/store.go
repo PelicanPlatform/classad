@@ -314,6 +314,9 @@ type Collection struct {
 	shards []*shard
 	mask   uint64
 	h      Hasher
+	// maintStop is set by StopMaintenance to ask an in-flight maintenance pass to stop at
+	// its next safe boundary, so closing does not wait out a whole bounded pass.
+	maintStop atomic.Bool
 	// openIdxDiag accumulates, during Open's loadShard passes, how each sealed segment's
 	// persisted index sidecar was handled (adopted vs. to-be-rebuilt). Emitted once at the end
 	// of Open via OpenIndexDiagHook. Written only on the single-threaded Open path.

@@ -271,11 +271,23 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 			}
 			start := time.Now()
 			for _, name := range s.cat.Tables() {
+				// Between tables: a stop signalled mid-pass should not still have to walk
+				// every remaining table before the loop notices it at the top.
+				select {
+				case <-done:
+					return
+				default:
+				}
 				if d, ok := s.cat.Table(name); ok {
 					s.maintainMu.Lock()
 					d.Maintain(opts)
 					s.maintainMu.Unlock()
 				}
+			}
+			select {
+			case <-done:
+				return
+			default:
 			}
 			s.maintainArchives(opts)
 			// Keep the duty cycle under the cap: wait at least pass/dutyCycle before the
@@ -349,9 +361,24 @@ func (s *Server) Close() {
 		stop()
 	}
 	s.stopBG = nil
-	// Wait for the signalled goroutines to actually return -- including finishing any pass
-	// already in flight -- before returning, so the caller can safely close the catalog
-	// (munmap segments) without racing a Compact/Maintain still reading them.
+	// Closing the channels above only stops a loop BETWEEN passes. A pass already running
+	// keeps going, and a bounded-but-not-short one (the columnar rewrite budget is 64
+	// segments) then holds the wait below for tens of seconds on an archive at history
+	// scale -- a process that sits there after its logs say it stopped. Ask the stores to
+	// stop at their next safe boundary so the pass unwinds instead of running to completion.
+	for _, name := range s.cat.Tables() {
+		if d, ok := s.cat.Table(name); ok {
+			d.StopMaintenance()
+		}
+	}
+	for _, name := range s.cat.ArchiveTables() {
+		if a, ok := s.cat.ArchiveTable(name); ok {
+			a.StopMaintenance()
+		}
+	}
+	// Wait for the signalled goroutines to actually return -- including finishing whatever
+	// unit of work is in flight -- before returning, so the caller can safely close the
+	// catalog (munmap segments) without racing a Compact/Maintain still reading them.
 	s.bgWG.Wait()
 }
 

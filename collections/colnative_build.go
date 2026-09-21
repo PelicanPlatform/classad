@@ -681,7 +681,7 @@ func (c *Collection) columnarizeSealed() int {
 	}
 	total := 0
 	for _, sh := range c.shards {
-		if total >= budget {
+		if total >= budget || c.maintStopping() {
 			break
 		}
 		if sh.allocNamed == nil || sh.segDir == "" {
@@ -697,7 +697,11 @@ func (c *Collection) columnarizeSealed() int {
 		}
 		sh.mu.Unlock()
 		for _, src := range srcs {
-			if total >= budget {
+			// Between segments, not within one: a rewrite in progress must finish, because
+			// the close that follows unmaps what it is reading. Abandoning here costs
+			// nothing -- each segment is rewritten at most once, so the next pass resumes
+			// from the remaining backlog.
+			if total >= budget || c.maintStopping() {
 				break
 			}
 			if c.columnarizeSealedSegment(sh, src, st.schema, st.hot) {
@@ -737,7 +741,7 @@ func (c *Collection) recolumnarizeStaleGroups(next []*colGroup) int {
 	}
 	total := 0
 	for _, sh := range c.shards {
-		if total >= budget {
+		if total >= budget || c.maintStopping() {
 			break
 		}
 		if sh.allocNamed == nil || sh.segDir == "" {
@@ -758,7 +762,8 @@ func (c *Collection) recolumnarizeStaleGroups(next []*colGroup) int {
 		}
 		sh.mu.Unlock()
 		for _, src := range srcs {
-			if total >= budget {
+			// Between segments, not within one: see ColumnarizeSealed.
+			if total >= budget || c.maintStopping() {
 				break
 			}
 			if c.columnarizeSealedSegment(sh, src, st.schema, st.hot) {
