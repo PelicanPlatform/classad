@@ -104,9 +104,9 @@ func (sh *shard) getAtWhy(c *Collection, h uint64, key []byte, s0 uint64, want m
 	if !ok2 {
 		return nil, nil, nil, nil, false, why
 	}
-	if raw, rc, obj, handled, ok3 := sh.resolveDelta(c, key, h, s0, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
+	if raw, rc, obj, handled, ok3, why3 := sh.resolveDelta(c, key, h, s0, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
 		if !ok3 {
-			return nil, nil, nil, nil, false, failDelta
+			return nil, nil, nil, nil, false, why3
 		}
 		dict := seg.dict.Load()
 		if dict != nil {

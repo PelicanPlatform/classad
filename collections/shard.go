@@ -501,7 +501,7 @@ func (sh *shard) get(c *Collection, h uint64, key []byte, want materializeWant) 
 		return nil, nil, nil, nil, false
 	}
 	// A current read is a snapshot read at the newest sequence, so replay uses seqMax.
-	if raw, rc, obj, handled, ok3 := sh.resolveDelta(c, key, h, seqMax, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
+	if raw, rc, obj, handled, ok3, _ := sh.resolveDelta(c, key, h, seqMax, recIsDelta(seg.data, l.off), ad, adCodec, want); handled {
 		if !ok3 {
 			return nil, nil, nil, nil, false
 		}

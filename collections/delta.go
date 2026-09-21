@@ -347,6 +347,15 @@ func (sh *shard) hasFull(vers []deltaVer) bool {
 // already says the bytes live only until the next record). A caller that RETAINS the bytes must
 // pass nil: the collapse buffers them until its commit lands.
 func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, want materializeWant, dst []byte) ([]byte, *classad.ClassAd, bool) {
+	raw, ad, ok, _ := sh.materializeAtWhy(c, key, h, s0, want, dst)
+	return raw, ad, ok
+}
+
+// materializeAtWhy is materializeAt carrying the reason the chain could not be materialized.
+// Every exit below is a different fault with a different repair, and collapsing them into one
+// answer is what left a production mirror reporting every refused write under a single count.
+// See readFail.
+func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64, want materializeWant, dst []byte) ([]byte, *classad.ClassAd, bool, readFail) {
 	var vers []deltaVer
 	add := func(seg *segment, off uint32) {
 		if seg == nil {
@@ -396,7 +405,7 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 		}
 	}
 	if len(vers) == 0 {
-		return nil, nil, false
+		return nil, nil, false, failDeltaNoVersions
 	}
 	sort.Slice(vers, func(i, j int) bool { return vers[i].seq < vers[j].seq })
 
@@ -412,7 +421,10 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 		}
 	}
 	if base < 0 {
-		return nil, nil, false // no full record: see above, do not guess
+		// No whole record anywhere in the chain. This is the hazard the seal-collapse
+		// invariant exists to prevent: a live delta whose base was reclaimed can never be
+		// read again, and no retry changes that.
+		return nil, nil, false, failDeltaNoBase
 	}
 	// Decompress the participants into reused buffers. They all have to be live at once (the
 	// merge reads every one), so this is one buffer per chain position, reused across calls rather
@@ -428,11 +440,11 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 	for i := base; i < len(vers); i++ {
 		stored, codec, ok := segStoredOrReassembled(c, vers[i].seg, vers[i].off)
 		if !ok {
-			return nil, nil, false
+			return nil, nil, false, failDeltaReassemble
 		}
 		raw, err := codec.Decompress(ds.bufs[i][:0], stored)
 		if err != nil {
-			return nil, nil, false
+			return nil, nil, false, failDeltaDecompress
 		}
 		ds.bufs[i] = raw
 		// The header said what this record is; the payload says so independently. They can only
@@ -441,7 +453,7 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 		// silent. Checked here because these bytes are decompressed anyway, so it is free.
 		if isDeltaRecord(raw) != (i > base) {
 			deltaFlagMismatches.Add(1)
-			return nil, nil, false
+			return nil, nil, false, failDeltaFlagMismatch
 		}
 		raws[i] = raw
 	}
@@ -450,7 +462,7 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 	// wash -- which is why this is gated on what the caller asked for rather than always tried.
 	if want == mWire {
 		if spliced, ok := c.spliceMerge(dst, raws[base:]); ok {
-			return spliced, nil, true
+			return spliced, nil, true, failNone
 		}
 	}
 	if want&mObj != 0 {
@@ -458,13 +470,13 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 	}
 	full, err := c.decodeWire(raws[base])
 	if err != nil {
-		return nil, nil, false
+		return nil, nil, false, failDeltaDecode
 	}
 	merged := classad.FromAST(full)
 	for i := base + 1; i < len(vers); i++ {
 		d, derr := c.decodeWire(raws[i])
 		if derr != nil {
-			return nil, nil, false
+			return nil, nil, false, failDeltaDecode
 		}
 		mergeDeltaAST(merged, d)
 	}
@@ -472,9 +484,9 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 	// encoding the merged ad so that its caller could decode it again was the round trip this
 	// whole path exists to avoid.
 	if want&mWire == 0 {
-		return nil, merged, true
+		return nil, merged, true, failNone
 	}
-	return c.encodeAdInto(dst, merged.AST()), merged, true
+	return c.encodeAdInto(dst, merged.AST()), merged, true, failNone
 }
 
 // readWant is the form a point read needs: the object, except for a redacting read, which must
@@ -615,27 +627,27 @@ func (c *Collection) DeltaStats() (deltas, fulls int64) {
 // redacting read, since the object holds every sealed value open.
 //
 // Callers must hold the shard read lock: materializeAt reads other segments' bytes.
-func (sh *shard) resolveDelta(c *Collection, key []byte, h, s0 uint64, isDelta bool, stored []byte, codec Codec, want materializeWant) ([]byte, Codec, *classad.ClassAd, bool, bool) {
+func (sh *shard) resolveDelta(c *Collection, key []byte, h, s0 uint64, isDelta bool, stored []byte, codec Codec, want materializeWant) ([]byte, Codec, *classad.ClassAd, bool, bool, readFail) {
 	// nil dst: a point read's bytes are copied out from under the shard lock by its caller.
 	if !c.deltaRead {
-		return nil, nil, nil, false, true // not handled here; caller proceeds as before
+		return nil, nil, nil, false, true, failNone // not handled here; caller proceeds as before
 	}
 	if !deltaHdrDispatch { // see deltaHdrDispatch: the pre-header dispatch, for the A/B
 		raw, err := codec.Decompress(nil, stored)
 		if err != nil {
-			return nil, nil, nil, true, false
+			return nil, nil, nil, true, false, failDeltaDecompress
 		}
 		if !isDeltaRecord(raw) {
-			return raw, identityCodec{}, nil, true, true
+			return raw, identityCodec{}, nil, true, true, failNone
 		}
 	} else if !isDelta {
-		return nil, nil, nil, false, true
+		return nil, nil, nil, false, true, failNone
 	}
-	merged, mergedAd, ok := sh.materializeAt(c, key, h, s0, want, nil)
+	merged, mergedAd, ok, why := sh.materializeAtWhy(c, key, h, s0, want, nil)
 	if !ok {
-		return nil, nil, nil, true, false
+		return nil, nil, nil, true, false, why
 	}
-	return merged, identityCodec{}, mergedAd, true, true
+	return merged, identityCodec{}, mergedAd, true, true, failNone
 }
 
 // materializeOpenChains writes a full record for every key that currently ends in a delta,
