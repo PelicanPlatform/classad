@@ -544,7 +544,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// Such a record is reassembled and written whole, so compaction de-columnarizes -- a later
 	// maintenance pass can columnarize the output again.
 	recompress := func(seg *segment, o uint32) ([]byte, Codec, bool) {
-		if seg.columnarized() || seg.colDamaged.Load() {
+		if seg.columnarized() || seg.colDamaged.Load() || recIsStripped(seg.data, o) {
 			full, err := c.recordWireIn(seg, seg.data, o, decBuf[:0])
 			if err != nil {
 				return nil, nil, false

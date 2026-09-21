@@ -258,6 +258,10 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 				flags &^= deltaFlag
 			}
 		}
+		// Mark it a remnant: its ad is being written without the attributes that move into the
+		// payload, and recIsStripped is how every reader learns that from the record alone rather
+		// than from the segment state, which is precisely what goes missing when this breaks.
+		flags |= colFlag
 		no, ok := dst.appendRawRecordFlags(src.data, r.off, r.body, flags)
 		if !ok {
 			dst.retire()

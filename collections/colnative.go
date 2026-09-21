@@ -90,7 +90,9 @@ func publishColNative(c *Collection, seg *segment) {
 		if total == 0 {
 			break
 		}
-		if recIsCol(seg.data, o) {
+		// The PAYLOAD record, which is a marker; a remnant carries colFlag too (recIsStripped)
+		// and must not be parsed as one.
+		if recIsCol(seg.data, o) && recIsMarker(seg.data, o) {
 			// VERIFY the payload before trusting it. Every other region of a segment is either
 			// replaceable (the sidecar rebuilds) or one record's worth of damage; these bytes are
 			// the only copy of every schema'd attribute in the segment, so a flipped bit here is a
@@ -210,6 +212,12 @@ func (c *Collection) recordWireIn(seg *segment, data []byte, off uint32, buf []b
 	}
 	cn := seg.colNative.Load()
 	if cn == nil {
+		// Marked as a remnant, with no payload to complete it. Refusing is the whole point: the
+		// bytes decode cleanly into an ad that is simply missing the schema'd attributes, so a
+		// caller cannot tell it apart from a small ad and nothing downstream errors.
+		if recIsStripped(data, off) {
+			return nil, errColMissing
+		}
 		// A segment holding a columnar record whose payload could not be trusted. Its records were
 		// written WITHOUT the attributes that payload holds, so serving them would return ads
 		// missing half their content -- indistinguishable, to a caller, from ads that never had it.
@@ -324,6 +332,12 @@ var errBadRemnant = errors.New("collections: columnarized record cannot be reass
 // errColDamaged marks a segment whose columnar payload failed verification. Its records are short
 // of every attribute the payload held, so there is no partial answer worth giving.
 var errColDamaged = errors.New("collections: segment columnar payload failed verification")
+
+// errColMissing is a remnant whose segment has no columnar payload at all -- the payload record was
+// not found where the records say one must be. Distinct from errColDamaged (a payload that was
+// found and rejected) because the causes differ: damage is corruption, absence is a segment that
+// was columnarized and then lost, or never published, its payload.
+var errColMissing = errors.New("collections: record needs a columnar payload its segment does not have")
 
 // blockFor maps a segment-wide record index to its block and the index within it.
 func (cn *colNative) blockFor(k int) (*columnarBlock, int) {

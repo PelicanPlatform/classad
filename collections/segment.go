@@ -722,6 +722,22 @@ func recIsDict(b []byte, off uint32) bool {
 }
 
 // recIsCol reports whether the record is the segment's columnar payload.
+// recIsStripped reports whether a record's ad was written WITHOUT the attributes its segment's
+// columnar payload holds -- a remnant, readable only by splicing that payload back in.
+//
+// colFlag on a record that is NOT a marker means exactly this, and nothing else did before: the
+// flag's only other use is the payload record itself, which is a marker (markerFlag|colFlag, see
+// appendCol). Marking the remnants is what lets a reader tell "this segment was never
+// columnarized" from "this segment was columnarized and its payload is missing" -- two states that
+// were previously indistinguishable, so the second silently served ads missing half their
+// attributes. On a production mirror that was 2,687 job rows with no ClusterId, JobStatus or
+// Owner, and a compaction pass would have copied those remnants into fresh segments as whole
+// records, making the loss permanent.
+func recIsStripped(b []byte, off uint32) bool {
+	f := binary.LittleEndian.Uint32(b[off+recKeyLenOff:])
+	return f&colFlag != 0 && f&markerFlag == 0
+}
+
 func recIsCol(b []byte, off uint32) bool {
 	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&colFlag != 0
 }
