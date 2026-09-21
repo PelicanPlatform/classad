@@ -1236,6 +1236,11 @@ func UnreadableBaseReasons() map[string]int64 { return collections.UnreadableBas
 // ones currently at zero, so a consumer can publish a stable set of counters.
 func UnreadableBaseReasonNames() []string { return collections.UnreadableBaseReasonNames() }
 
+// StopMaintenance asks any maintenance pass running on this table to stop at its next safe
+// boundary, so a caller closing the server does not wait out a whole in-flight pass. See
+// collections.Collection.StopMaintenance.
+func (d *DB) StopMaintenance() { d.c.StopMaintenance() }
+
 // FallbackReasons reports, process-wide, why patch writes had to store a whole record rather than
 // a delta: an attribute removal (which a delta cannot express), the chain reaching its bound, no
 // whole record to chain to yet, or delta records not being in use. Each fallback costs a read of

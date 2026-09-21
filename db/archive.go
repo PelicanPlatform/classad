@@ -27,6 +27,10 @@ type ArchiveTable struct {
 	cfg ArchiveConfig // the persisted config (archiveconfig.json); its Retention is mutable at runtime
 }
 
+// StopMaintenance asks any maintenance pass running on this archive to stop at its next safe
+// boundary. See collections.Collection.StopMaintenance.
+func (a *ArchiveTable) StopMaintenance() { a.a.StopMaintenance() }
+
 // ArchiveConfig configures an archive table. Dir is set by the catalog.
 type ArchiveConfig struct {
 	// SegmentSize is the sealed-segment file size in bytes (default 8 MiB).
