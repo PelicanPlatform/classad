@@ -254,6 +254,13 @@ func isDeltaRecord(rec []byte) bool { return wire.IsDelta(rec) }
 // is supposed to make impossible; each one aborts that shard's compaction.
 // compactDroppedDeltas counts superseded delta versions dropped from the time-travel window
 // rather than carried forward (see the compaction loop).
+// deltaDecodeFailHook is a test seam: consulted after each participant of a chain decodes, so
+// a test can fail a CHOSEN position. Base and patch decode failures are separate reasons, and
+// the difference between them is which call in this loop returned the error -- which no test
+// can arrange from outside, because bytes that decompress and then refuse to decode are not
+// something a caller can write. Production leaves it nil.
+var deltaDecodeFailHook func() error
+
 // deltaFlagMismatches counts records whose header flag and payload flag disagree -- a refused
 // read, and the signal that a copy path lost or invented a flag.
 var (
@@ -469,14 +476,22 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 		objectMerges.Add(1)
 	}
 	full, err := c.decodeWire(raws[base])
+	if err == nil && deltaDecodeFailHook != nil {
+		err = deltaDecodeFailHook()
+	}
 	if err != nil {
-		return nil, nil, false, failDeltaDecode
+		noteDecodeFailure("base", err)
+		return nil, nil, false, failDeltaBaseDecode
 	}
 	merged := classad.FromAST(full)
 	for i := base + 1; i < len(vers); i++ {
 		d, derr := c.decodeWire(raws[i])
+		if derr == nil && deltaDecodeFailHook != nil {
+			derr = deltaDecodeFailHook()
+		}
 		if derr != nil {
-			return nil, nil, false, failDeltaDecode
+			noteDecodeFailure("patch", derr)
+			return nil, nil, false, failDeltaPatchDecode
 		}
 		mergeDeltaAST(merged, d)
 	}
