@@ -414,7 +414,16 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 	for gi, g := range groups {
 		sel := &colGroup{schema: g.schema, ids: g.ids}
 		for bi := range blocks {
-			if gi < len(gblocks[bi]) {
+			// bi indexes blocks, but gblocks is NOT always the same length: a segment with no
+			// encodable records still gets one synthetic block so the colSegment carries its
+			// schema, and no group row is built beside it. A sealed segment of pure deltas is
+			// exactly that shape -- every record skipped -- and indexing gblocks[bi] there
+			// crashed a production maintenance pass seven times.
+			//
+			// Falling short leaves sel.blocks shorter than blocks, so the coverage test below
+			// drops the group, which is the right answer: a segment with no encodable records
+			// has no group coverage to record.
+			if bi < len(gblocks) && gi < len(gblocks[bi]) {
 				sel.blocks = append(sel.blocks, gblocks[bi][gi])
 			}
 		}

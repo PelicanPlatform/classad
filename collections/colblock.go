@@ -656,6 +656,12 @@ func (cb *colBuild) finish() ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 		// A segment with no encodable records still gets one empty block, so a colSegment always
 		// carries the schema it was built under (which persistence and the scan's field resolution
 		// both read from the first block).
+		//
+		// No group row is added beside it, so from here the two returns are NOT parallel:
+		// len(groupBlocks) can be one short of len(blocks). Callers index groupBlocks by block
+		// position and must bound that themselves. It is left this way rather than padded with
+		// nils because a nil group block is a value every downstream reader would then have to
+		// handle, where a missing row simply means the block has no group coverage.
 		cb.blocks = append(cb.blocks, encodeColumnarBlock(cb.s, nil, cb.baseLayout, cb.regionCodec, cb.coldToField))
 	}
 	return cb.blocks, cb.groupBlocks, cb.offs
