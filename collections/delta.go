@@ -444,10 +444,27 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	}
 	defer decompressPool.Put(ds)
 	raws := ds.grow(len(vers))
+	// A chain's participants do not all share one encoding. Records are written inline (each
+	// carrying its own attribute names), but COMPACTION re-encodes what it rewrites as interned,
+	// against a dictionary belonging to the segment it lands in. So the moment a key's base has
+	// been through a compaction while its deltas are still in the active segment, the chain spans
+	// both forms -- and decoding all of it one way fails on the other. Production reported
+	// exactly that, in the decoder's own words: "DecodeInlineEnc requires an inline-names ad",
+	// on the base, for every patch to every key whose base had been compacted.
+	//
+	// Each participant is therefore decoded against ITS OWN segment's dictionary, which is what
+	// the ordinary read path does (getAt hands its caller seg.dict and decodes through it).
+	dicts := make([]*segDictHandle, len(vers))
 	for i := base; i < len(vers); i++ {
 		stored, codec, ok := segStoredOrReassembled(c, vers[i].seg, vers[i].off)
 		if !ok {
 			return nil, nil, false, failDeltaReassemble
+		}
+		if d := vers[i].seg.dict.Load(); d != nil {
+			// Build the id->name cache while the segment is guaranteed alive, as getAt does:
+			// resolving out of a mapping compaction has since unmapped is a SIGSEGV.
+			d.ensureNames()
+			dicts[i] = d
 		}
 		raw, err := codec.Decompress(ds.bufs[i][:0], stored)
 		if err != nil {
@@ -467,6 +484,10 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	// Bytes only: splice the entry bytes and never build an object. Splicing and then decoding
 	// for a caller that wanted an object is no cheaper than decoding and merging -- measured as a
 	// wash -- which is why this is gated on what the caller asked for rather than always tried.
+	// No guard for a mixed-encoding chain here: AppendAdMergedInline already refuses an interned
+	// participant and the splice falls back to the decode below (that refusal is what
+	// spliceFallbacks counts). Which is precisely why the decode has to be right -- it is where
+	// every chain spanning both encodings ends up.
 	if want == mWire {
 		if spliced, ok := c.spliceMerge(dst, raws[base:]); ok {
 			return spliced, nil, true, failNone
@@ -475,7 +496,7 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	if want&mObj != 0 {
 		objectMerges.Add(1)
 	}
-	full, err := c.decodeWire(raws[base])
+	full, err := c.decodeWireDict(dicts[base], raws[base])
 	if err == nil && deltaDecodeFailHook != nil {
 		err = deltaDecodeFailHook()
 	}
@@ -485,7 +506,7 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	}
 	merged := classad.FromAST(full)
 	for i := base + 1; i < len(vers); i++ {
-		d, derr := c.decodeWire(raws[i])
+		d, derr := c.decodeWireDict(dicts[i], raws[i])
 		if derr == nil && deltaDecodeFailHook != nil {
 			derr = deltaDecodeFailHook()
 		}
