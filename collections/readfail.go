@@ -29,7 +29,8 @@ const (
 	failDeltaReassemble   // a participant's columnar payload could not be reassembled
 	failDeltaDecompress   // a participant would not decompress
 	failDeltaFlagMismatch // a participant's header and payload disagree about being a delta
-	failDeltaDecode       // a participant would not decode
+	failDeltaBaseDecode   // the chain's WHOLE record would not decode
+	failDeltaPatchDecode  // a delta layered on top of the base would not decode
 
 	failMax // not a reason; bounds the counter array
 )
@@ -56,10 +57,42 @@ func (r readFail) String() string {
 		return "delta-decompress"
 	case failDeltaFlagMismatch:
 		return "delta-flag-mismatch"
-	case failDeltaDecode:
-		return "delta-decode"
+	case failDeltaBaseDecode:
+		return "delta-base-decode"
+	case failDeltaPatchDecode:
+		return "delta-patch-decode"
 	}
 	return "unknown"
+}
+
+// lastDecodeFailure samples the most recent decode error behind a delta-base-decode or
+// delta-patch-decode refusal. A count says how often the bytes would not decode; only the
+// error says what the decoder objected to, and without it a deployment refusing hundreds of
+// writes an hour still cannot tell a truncated record from one in a format the reader does
+// not recognise. Sampled, not accumulated: one live example is the diagnostic, and keeping
+// every message would be unbounded.
+var lastDecodeFailure atomic.Pointer[decodeFailure]
+
+type decodeFailure struct {
+	Stage string // "base" or "patch"
+	Err   string
+}
+
+// LastDeltaDecodeFailure returns the most recently sampled decode error behind a refused
+// chain merge, or ("", "") if none has happened.
+func LastDeltaDecodeFailure() (stage, msg string) {
+	if f := lastDecodeFailure.Load(); f != nil {
+		return f.Stage, f.Err
+	}
+	return "", ""
+}
+
+// noteDecodeFailure samples one decode error. Called only on the failure path.
+func noteDecodeFailure(stage string, err error) {
+	if err == nil {
+		return
+	}
+	lastDecodeFailure.Store(&decodeFailure{Stage: stage, Err: err.Error()})
 }
 
 // unreadableByReason counts refused patch writes per readFail, indexed by the reason. It is

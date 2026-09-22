@@ -1236,6 +1236,11 @@ func UnreadableBaseReasons() map[string]int64 { return collections.UnreadableBas
 // ones currently at zero, so a consumer can publish a stable set of counters.
 func UnreadableBaseReasonNames() []string { return collections.UnreadableBaseReasonNames() }
 
+// LastDeltaDecodeFailure returns the most recently sampled decode error behind a refused delta
+// chain merge, as (stage, message) where stage is "base" or "patch". The per-reason counts say
+// how often the bytes would not decode; this says what the decoder objected to.
+func LastDeltaDecodeFailure() (stage, msg string) { return collections.LastDeltaDecodeFailure() }
+
 // StopMaintenance asks any maintenance pass running on this table to stop at its next safe
 // boundary, so a caller closing the server does not wait out a whole in-flight pass. See
 // collections.Collection.StopMaintenance.
