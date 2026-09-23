@@ -372,15 +372,22 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 			vers = append(vers, deltaVer{recSeq(seg.data, off), seg, off})
 		}
 	}
+	chainBroke := false
 	for l := sh.dirGet(h); l.valid(); {
 		seg := sh.segForLoc(l)
 		if seg == nil {
+			// A link into a segment that no longer exists ends the walk -- and with it every
+			// OLDER version, which is where a chain's whole record lives. Recorded because that
+			// truncation and a base that was genuinely reclaimed are indistinguishable from the
+			// empty result, and they are different faults.
+			chainBroke = true
 			break
 		}
 		add(seg, l.off)
 		l = recNext(seg.data, l.off)
 	}
-	sh.forEachSealedRecord(key, h, func(seg *segment, off uint32) bool {
+	sealedSkipped := 0
+	sh.forEachSealedRecordCounting(key, h, &sealedSkipped, func(seg *segment, off uint32) bool {
 		add(seg, off)
 		return true
 	})
@@ -428,9 +435,18 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 		}
 	}
 	if base < 0 {
-		// No whole record anywhere in the chain. This is the hazard the seal-collapse
-		// invariant exists to prevent: a live delta whose base was reclaimed can never be
-		// read again, and no retry changes that.
+		// No whole record anywhere in the chain. Three different faults land here and the
+		// repairs are unrelated, so record which one this was rather than leaving the caller
+		// to guess: the walk truncated at a dead link, a sealed segment could not be probed
+		// because its key index is not built yet (a WINDOW, so this one is transient and the
+		// write would succeed on a retry), or the base is genuinely gone.
+		noteNoBase(len(vers), chainBroke, sealedSkipped)
+		switch {
+		case chainBroke:
+			return nil, nil, false, failDeltaChainBroken
+		case sealedSkipped > 0:
+			return nil, nil, false, failDeltaIndexPending
+		}
 		return nil, nil, false, failDeltaNoBase
 	}
 	// Decompress the participants into reused buffers. They all have to be live at once (the

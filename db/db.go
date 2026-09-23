@@ -1241,6 +1241,17 @@ func UnreadableBaseReasonNames() []string { return collections.UnreadableBaseRea
 // how often the bytes would not decode; this says what the decoder objected to.
 func LastDeltaDecodeFailure() (stage, msg string) { return collections.LastDeltaDecodeFailure() }
 
+// LastNoBaseDetail returns the shape of the most recent delta chain that had no whole record:
+// versions found, whether the walk truncated at a dead link, and how many sealed segments could
+// not be probed for want of a key index.
+func LastNoBaseDetail() (versions int, chainBroken bool, sealedSkipped int) {
+	return collections.LastNoBaseDetail()
+}
+
+// SealedProbesSkipped reports how many sealed-segment key probes were skipped because the
+// segment's key index is not built yet.
+func SealedProbesSkipped() int64 { return collections.SealedProbesSkipped() }
+
 // StopMaintenance asks any maintenance pass running on this table to stop at its next safe
 // boundary, so a caller closing the server does not wait out a whole in-flight pass. See
 // collections.Collection.StopMaintenance.

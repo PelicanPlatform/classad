@@ -532,13 +532,30 @@ func (sh *shard) get(c *Collection, h uint64, key []byte, want materializeWant) 
 // possibly twice, which is harmless -- every consumer here is find-first or an
 // idempotent predicate). Caller holds at least the shard read lock.
 func (sh *shard) forEachSealedRecord(key []byte, h uint64, fn func(seg *segment, off uint32) bool) {
+	sh.forEachSealedRecordCounting(key, h, nil, fn)
+}
+
+// forEachSealedRecordCounting is forEachSealedRecord, reporting through skipped how many sealed
+// segments it could not probe because their key index is not built yet.
+func (sh *shard) forEachSealedRecordCounting(key []byte, h uint64, skipped *int, fn func(seg *segment, off uint32) bool) {
 	for _, seg := range sh.segs {
 		if seg == nil || seg == sh.act {
 			continue
 		}
 		bf := seg.keyBloom.Load()
 		ki := seg.keyIdx.Load()
-		if bf == nil || ki == nil || !bf.mayContain(h) {
+		if bf == nil || ki == nil {
+			// A sealed segment whose key index has not been built yet is INVISIBLE here. The
+			// index is built by a reindex pass, not at seal time, so there is a window after a
+			// seal in which this probe cannot see the segment's records at all. Counted so a
+			// caller that came up empty can say whether that window is why.
+			sealedSkippedNoIndex.Add(1)
+			if skipped != nil {
+				*skipped++
+			}
+			continue
+		}
+		if !bf.mayContain(h) {
 			continue
 		}
 		for _, off := range ki.lookup(h) {
