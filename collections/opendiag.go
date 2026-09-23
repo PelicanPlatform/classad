@@ -26,6 +26,14 @@ type OpenIndexDiag struct {
 	//                                    absent, CRC-bad, or did not cover the segment
 	Reasons map[string]int
 
+	// StrandedSealedDeltas is how many LIVE delta records were found in sealed segments, and
+	// StrandedSealedKeys names up to openStrandedSampleMax of them. Both are zero on a healthy
+	// store: the seal-collapse invariant says a live fragment only ever sits in an active
+	// segment, and every collapse pass relies on that. A non-zero count means those keys are
+	// invisible to the collapse and will lose their base to the next compaction.
+	StrandedSealedDeltas int
+	StrandedSealedKeys   [][]byte
+
 	// Timing breaks a persistent Open into its phases so a slow reopen names the phase that
 	// dominated, instead of surfacing only as one elapsed number. Durations accumulate across the
 	// collection's shards; all zero for an in-memory Open. See OpenTiming. Purely observational.
@@ -75,3 +83,7 @@ func (d *OpenIndexDiag) note(reason string) {
 	}
 	d.Reasons[reason]++
 }
+
+// openStrandedSampleMax bounds how many stranded keys an open reports. The count is the signal;
+// the keys are there to make a handful chaseable, not to reproduce the whole set.
+const openStrandedSampleMax = 20

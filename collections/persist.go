@@ -332,6 +332,15 @@ func Open(opts Options) (*Collection, error) {
 	demandStart := time.Now()
 	c.loadDemand()
 	c.openIdxDiag.Timing.LoadDemand = time.Since(demandStart)
+	// Verify the seal-collapse invariant rather than continuing to assume it. Every collapse
+	// and every pre-compaction pass is built on "a live fragment can only be in an active
+	// segment", and nothing has ever checked it -- while a stranded one is invisible to those
+	// passes, loses its base to the next compaction, and leaves the key permanently unreadable.
+	// Done here because the segments are mapped, no reader is waiting, and the cost is bounded.
+	if stranded := c.checkSealCollapseInvariant(openStrandedSampleMax); len(stranded) > 0 {
+		c.openIdxDiag.StrandedSealedDeltas = len(stranded)
+		c.openIdxDiag.StrandedSealedKeys = stranded
+	}
 	// Emit the sidecar-adoption summary gathered during recovery (before the Reindex above
 	// rebuilds whatever was not adopted), so a slow reopen can be traced to its cause.
 	if OpenIndexDiagHook != nil {
