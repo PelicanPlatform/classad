@@ -31,6 +31,8 @@ const (
 	failDeltaFlagMismatch // a participant's header and payload disagree about being a delta
 	failDeltaBaseDecode   // the chain's WHOLE record would not decode
 	failDeltaPatchDecode  // a delta layered on top of the base would not decode
+	failDeltaChainBroken  // the version walk truncated at a link into a segment that is gone
+	failDeltaIndexPending // a sealed segment could not be probed: its key index is not built yet
 
 	failMax // not a reason; bounds the counter array
 )
@@ -61,6 +63,10 @@ func (r readFail) String() string {
 		return "delta-base-decode"
 	case failDeltaPatchDecode:
 		return "delta-patch-decode"
+	case failDeltaChainBroken:
+		return "delta-chain-broken"
+	case failDeltaIndexPending:
+		return "delta-index-pending"
 	}
 	return "unknown"
 }
@@ -93,6 +99,41 @@ func noteDecodeFailure(stage string, err error) {
 		return
 	}
 	lastDecodeFailure.Store(&decodeFailure{Stage: stage, Err: err.Error()})
+}
+
+// sealedSkippedNoIndex counts sealed segments a key probe could not look inside because their
+// key index has not been built yet. The index is built by a reindex pass rather than at seal
+// time, so this is a real window, and a probe that comes up empty during it is not the same as
+// a key that is absent.
+var sealedSkippedNoIndex atomic.Int64
+
+// SealedProbesSkipped reports how many sealed-segment probes were skipped for want of a key
+// index. A rising count alongside delta-index-pending says reads are racing the reindex pass.
+func SealedProbesSkipped() int64 { return sealedSkippedNoIndex.Load() }
+
+// lastNoBase samples the shape of the most recent chain that had no whole record. The reason
+// name says which of three faults it was; this says how much of the chain was found, which is
+// what separates "the base is one link past a dead segment" from "there is nothing here".
+var lastNoBase atomic.Pointer[noBaseSample]
+
+type noBaseSample struct {
+	Versions      int
+	ChainBroken   bool
+	SealedSkipped int
+}
+
+// LastNoBaseDetail returns the shape of the most recent no-base chain: how many versions the
+// walk did find, whether it truncated at a dead link, and how many sealed segments it could not
+// probe.
+func LastNoBaseDetail() (versions int, chainBroken bool, sealedSkipped int) {
+	if s := lastNoBase.Load(); s != nil {
+		return s.Versions, s.ChainBroken, s.SealedSkipped
+	}
+	return 0, false, 0
+}
+
+func noteNoBase(versions int, chainBroken bool, sealedSkipped int) {
+	lastNoBase.Store(&noBaseSample{Versions: versions, ChainBroken: chainBroken, SealedSkipped: sealedSkipped})
 }
 
 // unreadableByReason counts refused patch writes per readFail, indexed by the reason. It is
