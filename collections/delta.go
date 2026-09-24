@@ -479,7 +479,7 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	//
 	// Each participant is therefore decoded against ITS OWN segment's dictionary, which is what
 	// the ordinary read path does (getAt hands its caller seg.dict and decodes through it).
-	dicts := make([]*segDictHandle, len(vers))
+	dicts := ds.dicts
 	for i := base; i < len(vers); i++ {
 		stored, codec, ok := segStoredOrReassembled(c, vers[i].seg, vers[i].off)
 		if !ok {
@@ -569,11 +569,15 @@ const (
 
 // decompressState holds one reusable decompression buffer per chain position, for materializeAt.
 type decompressState struct {
-	bufs [][]byte
-	raws [][]byte
+	bufs  [][]byte
+	raws  [][]byte
+	dicts []*segDictHandle
 }
 
-// grow sizes the state for a chain of n participants and returns the raws slice to fill.
+// grow sizes the state for a chain of n participants and returns the raws slice to fill. The
+// per-participant dictionary slice is sized alongside it: decoding each participant against its
+// own segment's dictionary is per-READ work, so allocating it fresh put one allocation on every
+// chain merge -- beside the pool that exists to keep exactly that off the read path.
 func (d *decompressState) grow(n int) [][]byte {
 	for len(d.bufs) < n {
 		d.bufs = append(d.bufs, nil)
@@ -583,6 +587,13 @@ func (d *decompressState) grow(n int) [][]byte {
 	}
 	d.raws = d.raws[:n]
 	clear(d.raws)
+	if cap(d.dicts) < n {
+		d.dicts = make([]*segDictHandle, n)
+	}
+	d.dicts = d.dicts[:n]
+	// Cleared on acquire, as raws is: a handle left here would otherwise be read by the next
+	// chain that happens to be shorter.
+	clear(d.dicts)
 	return d.raws
 }
 
