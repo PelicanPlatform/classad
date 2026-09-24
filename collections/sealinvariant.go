@@ -21,12 +21,59 @@ var strandedSealedDeltas atomic.Int64
 // behind those records are on their way to becoming unreadable.
 func StrandedSealedDeltas() int64 { return strandedSealedDeltas.Load() }
 
+// repairStrandedSealedDeltas collapses the fragments checkSealCollapseInvariant found, rescuing
+// every one whose base is still on disk, and returns the keys it acted on for reporting.
+//
+// Repairing is worth the write because the loss is otherwise permanent AND silent. Of the first
+// five stranded keys sampled on a production mirror, one was still readable -- its base intact,
+// rescuable by exactly this collapse -- and four were already gone, compaction having reclaimed
+// their bases while nothing was looking. A fragment collapsed here becomes a whole record; one
+// left alone becomes an unreadable row that also refuses every future write to that key.
+//
+// A key whose base is ALREADY gone cannot be collapsed (collapsing it means reading it), so it
+// stays as it is: this recovers what is recoverable and does not pretend about the rest.
+func (c *Collection) repairStrandedSealedDeltas(keys [][]byte) {
+	if len(keys) == 0 {
+		return
+	}
+	if c.deltas == nil {
+		c.deltas = newDeltaTracker() // a reopen may not have one yet; collapseBatch needs it
+	}
+	for attempt := 0; attempt < collapseAttempts && len(keys) > 0; attempt++ {
+		keys = c.collapseBatch(keys)
+	}
+	// Remember what is still not collapsed, as collapseLiveChains does. Discarding it here made
+	// the one pass whose whole purpose is rescuing stranded fragments the one pass that forgot
+	// its own failures.
+	for _, k := range keys {
+		c.rememberCollapse(k)
+	}
+}
+
+// segHasLiveDelta reports whether a segment holds any LIVE delta record. Callers about to seal
+// a segment use it to refuse: sealing one is what strands the fragment.
+//
+// Caller holds the shard lock.
+func segHasLiveDelta(seg *segment) bool {
+	if seg == nil || seg.used == 0 {
+		return false
+	}
+	for off := uint32(0); off < uint32(seg.used); {
+		tl := recTotalLen(seg.data, off)
+		if tl == 0 || off+tl > uint32(seg.used) {
+			break
+		}
+		if !recIsMarker(seg.data, off) && recSuperseded(seg.data, off) == seqMax && segRecIsDelta(seg, off) {
+			return true
+		}
+		off += tl
+	}
+	return false
+}
+
 // checkSealCollapseInvariant counts live deltas in this collection's sealed segments and returns
 // their keys, capped. It runs at open, where the cost is bounded by what is already being mapped
 // and no reader is waiting on it -- not per pass, which would be a full scan on the hot path.
-//
-// It reports rather than repairs: a repair here would write during open, and until it is known
-// HOW a fragment gets stranded, quietly rewriting them would erase the evidence for the cause.
 func (c *Collection) checkSealCollapseInvariant(maxKeys int) [][]byte {
 	if !c.deltaRead {
 		return nil // no delta records: the invariant is vacuous

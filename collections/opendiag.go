@@ -87,3 +87,8 @@ func (d *OpenIndexDiag) note(reason string) {
 // openStrandedSampleMax bounds how many stranded keys an open reports. The count is the signal;
 // the keys are there to make a handful chaseable, not to reproduce the whole set.
 const openStrandedSampleMax = 20
+
+// openStrandedRepairMax bounds how many stranded fragments one open will collect and try to
+// collapse. Bounded because the repair writes: an unbounded set would turn a pathological store's
+// open into an arbitrarily long write pass. What it does not finish, the next open picks up.
+const openStrandedRepairMax = 10000

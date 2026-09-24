@@ -476,7 +476,28 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// Phase 1 (lock): choose the working-set sources (segments with a current record),
 	// capture the retain floor, and seal the active segment so concurrent writes land
 	// in fresh post-barrier segments. Pure-history segments are not sources.
-	sh.mu.Lock()
+	// The collapse that is supposed to guarantee "no live delta in a sealed segment" ran back in
+	// Compact, outside any lock a committer respects, and shards are processed one at a time with
+	// a lock-free phase 2 in between -- so by the time this shard's turn comes, seconds may have
+	// passed and new deltas may sit in sh.act. Sealing it at the `sh.act = nil` below bypasses the
+	// sealedPending/pendingSeal protocol entirely (writeRecord is its only producer), so such a
+	// fragment becomes invisible to every later collapse while THIS pass reclaims its base.
+	//
+	// Re-check under the lock, which is the only place the answer cannot change under us, and
+	// collapse once before giving up on the shard for this pass. Deferring costs a pass; sealing
+	// costs the row.
+	for attempt := 0; ; attempt++ {
+		sh.mu.Lock()
+		if sh.act == nil || !segHasLiveDelta(sh.act) {
+			break // proceed with the lock held
+		}
+		sh.mu.Unlock()
+		if attempt > 0 {
+			compactDeferredLiveDelta.Add(1)
+			return // still dirty after a collapse: leave the shard alone rather than strand it
+		}
+		c.collapseLiveChains(false) // active segments only; this is exactly what is dirty
+	}
 	retain := sh.retainFloorLocked()
 	origLen := len(sh.segs)
 	sources := make([]*segment, 0, origLen)
