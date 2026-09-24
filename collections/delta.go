@@ -3,6 +3,7 @@ package collections
 import (
 	"bytes"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -115,6 +116,21 @@ func (t *deltaTracker) next(h uint64, eligible, baseExists bool, max int) bool {
 func (t *deltaTracker) forget(h uint64) {
 	t.mu.Lock()
 	delete(t.depth, h)
+	t.mu.Unlock()
+}
+
+// mustCompose marks a key so its next write stores a WHOLE record rather than extending a
+// chain, whatever the tracker previously believed about its depth.
+//
+// It exists for the key whose collapse FAILED. reset() runs before the collapse and wipes every
+// depth, and absence means "depth 0, base exists" -- so a key that was not collapsed looks
+// freshly collapsed to the next write, which then starts a new chain on a base that is not
+// there. That is what grew baseless chains to 29-41 versions on a production mirror: DeltaMax
+// never bit, because the count restarted at every pass. Forcing a compose makes the next write
+// either repair the key or be refused, instead of silently lengthening something unreadable.
+func (t *deltaTracker) mustCompose(h uint64) {
+	t.mu.Lock()
+	t.depth[h] = math.MaxInt // >= any caller's max, so next() always takes the full-record branch
 	t.mu.Unlock()
 }
 
@@ -1049,8 +1065,10 @@ func (c *Collection) collapseLiveChains(includeSealed bool) {
 		open = c.collapseBatch(open)
 	}
 	for _, key := range open {
-		// Still not collapsed after the retries. Remember it so a later pass tries again; a key
+		// Still not collapsed after the retries. Mark it so the next write cannot extend the
+		// chain -- see mustCompose -- and remember it so a later pass tries again; a key
 		// left ending in a delta is exactly what must not be forgotten.
+		c.deltas.mustCompose(c.h.Hash(key))
 		c.rememberCollapse(key)
 	}
 }
