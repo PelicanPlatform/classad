@@ -882,9 +882,23 @@ func (e *ConflictError) Error() string {
 // will not come back -- so a caller should record these and make progress rather than retry.
 // Treating them as conflicts made a tailer rewind and re-apply forever, escalating to full log
 // replays that changed nothing. See collections.CommitResult.Unapplied.
-type UnappliedError struct{ Keys []string }
+type UnappliedError struct {
+	Keys []string
+	// Reasons is parallel to Keys: why each one could not be composed ("delta-no-base",
+	// "delta-chain-broken", ...). Carried so a caller can log what happened rather than only
+	// that something did.
+	Reasons []string
+}
 
 func (e *UnappliedError) Error() string {
+	if len(e.Reasons) == len(e.Keys) && len(e.Keys) > 0 {
+		pairs := make([]string, len(e.Keys))
+		for i, k := range e.Keys {
+			pairs[i] = k + " (" + e.Reasons[i] + ")"
+		}
+		return fmt.Sprintf("classad-db: %d key(s) could not be applied and must not be retried: %v",
+			len(e.Keys), pairs)
+	}
 	return fmt.Sprintf("classad-db: %d key(s) could not be applied and must not be retried: %v",
 		len(e.Keys), e.Keys)
 }
@@ -995,7 +1009,7 @@ func (t *Txn) Commit() error {
 		for i, k := range res.Unapplied {
 			keys[i] = string(k)
 		}
-		return &UnappliedError{Keys: keys}
+		return &UnappliedError{Keys: keys, Reasons: res.UnappliedReasons}
 	}
 	return nil
 }

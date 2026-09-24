@@ -288,6 +288,11 @@ var (
 	// alternative is sealing the fragment away from every collapse -- but a rising count means
 	// the pre-pass collapse is routinely being overtaken by writers.
 	compactDeferredLiveDelta atomic.Int64
+	// migrateSkippedLiveDelta counts shards the sealed-attribute migration left alone because
+	// their active segment still held a live delta. The migration is one-shot per store, so a
+	// non-zero count means that shard's legacy records are still unmigrated and the pass needs
+	// running again.
+	migrateSkippedLiveDelta atomic.Int64
 )
 
 // DeltaAnomalies reports the three things that should all stay zero in a healthy delta store:
@@ -300,6 +305,10 @@ func DeltaAnomalies() (liveAtCompact, droppedFromHistory, flagMismatch int64) {
 // CompactDeferredLiveDelta reports how many shard compactions were deferred because the active
 // segment still held a live delta. See compactDeferredLiveDelta.
 func CompactDeferredLiveDelta() int64 { return compactDeferredLiveDelta.Load() }
+
+// MigrateSkippedLiveDelta reports how many shards the sealed-attribute migration skipped because
+// their active segment still held a live delta. See migrateSkippedLiveDelta.
+func MigrateSkippedLiveDelta() int64 { return migrateSkippedLiveDelta.Load() }
 
 // encodeDelta encodes the record bytes for a write: a delta holding only the changed
 // attributes when the collection has delta mode on and this write qualifies, else the whole
@@ -790,12 +799,16 @@ func (c *Collection) collapseBeforeRewrite() {
 // and merged: on a key's first write, when the chain has reached its bound, and when the write
 // removed an attribute (which a delta of present attributes cannot express). So a read happens
 // once per re-materialization rather than once per update.
-func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isDelta, ok bool) {
+// The fourth return names WHY a refusal happened, so the caller can say so. A refused write is
+// reported to an operator as a dropped key; without the reason that line is a bare fact with no
+// action attached, which on a production mirror meant reading the counters on the daemon ad and
+// correlating by hand.
+func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isDelta, ok bool, why readFail) {
 	c := tx.c
 	eligible := len(b.removed) == 0 && b.patch != nil
 	if eligible && c.deltaMax > 0 && c.deltas != nil && c.inline && c.canWriteDelta() {
 		if c.deltas.next(h, true, c.keyExists(b.key, h), c.deltaMax) {
-			return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true, true
+			return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true, true, failNone
 		}
 		// The delta was permissible but the tracker declined: either the key has no whole record
 		// to chain to, or the chain has reached DeltaMax. Distinguishing them matters because the
@@ -842,7 +855,7 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isD
 			// miss is a lost columnar payload, and a delta-chain miss is an unresolvable
 			// chain. Without this the counter says only that something went wrong.
 			unreadableByReason[why].Add(1)
-			return nil, false, false
+			return nil, false, false, why
 		}
 		ad = classad.New()
 	}
@@ -851,7 +864,7 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isD
 		ad.Delete(n)
 	}
 	b.ad = ad
-	return c.encodeAdInto(dst, ad.AST()), false, true
+	return c.encodeAdInto(dst, ad.AST()), false, true, failNone
 }
 
 // deltaModeFile records that a store has written delta records, so a later open knows it must
@@ -1013,6 +1026,16 @@ func (c *Collection) collapseSealedChains() {
 			break
 		}
 	}
+	// A key parked in collapseRetry is also work waiting to be done, and it used to schedule
+	// nothing: pending was computed from sealedPending alone, so a key whose collapse failed
+	// waited for the next SEAL rather than the next commit. On a table that then went quiet, or a
+	// process that then exited, it was never retried -- and collapseRetry is RAM only, so a
+	// restart lost it and the fragment it named stayed live in a sealed segment forever.
+	if !pending {
+		c.collapseMu.Lock()
+		pending = len(c.collapseRetry) > 0
+		c.collapseMu.Unlock()
+	}
 	if !pending || !c.collapsing.CompareAndSwap(false, true) {
 		// Deliberately does NOT clear sealedPending before the CAS. Clearing it first meant a
 		// committer that sealed while a collapse was in flight consumed its own flag and then
@@ -1123,9 +1146,15 @@ func (c *Collection) collapseBatch(keys [][]byte) [][]byte {
 			// Deleted underneath us, or already whole -- both mean nothing to collapse. But
 			// "materialize failed" is not the same as "no longer a delta": a damaged chain also
 			// lands here, and dropping it would leave the fragment behind. Ask the store.
-			if c.endsInDelta(key) {
-				retry = append(retry, key)
-			}
+			//
+			// endsInDelta answers by INDEX lookup while the key was found by SCANNING segment
+			// bytes, and the two disagree exactly where it matters: lookupSealed skips a sealed
+			// segment whose key index is not built, findCurrent stops at a dead link, and
+			// segForLoc can return nil. Each makes a genuinely stranded fragment look absent, so
+			// it was dropped here and re-found by the next scan, identically, forever. Trust the
+			// scan that produced the key and retry; a key that really is whole costs one wasted
+			// materialize on the next pass, where the previous behaviour cost the row.
+			retry = append(retry, key)
 			continue
 		}
 		if collapseRaceHook != nil {

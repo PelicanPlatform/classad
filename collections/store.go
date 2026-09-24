@@ -856,6 +856,7 @@ func (c *Collection) Update(batch []AdUpdate) error {
 	for si, writes := range byShard {
 		c.shards[si].commit(writes)
 	}
+	c.collapseSealedChains() // see Put: a seal here must schedule its own drain
 	err := c.writeError()
 	if err == nil && len(c.ordered) > 0 {
 		for i := range batch {
@@ -890,6 +891,11 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	stored := codec.Compress(nil, c.encodeAd(ad.AST()))
 	h := c.h.Hash(key)
 	c.shards[c.shardOf(key, h)].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
+	// A write through this path can roll a segment, and rolling one is what flags a seal whose
+	// open chains still need collapsing. Only Txn.Commit used to schedule that drain, so a seal
+	// caused here left the work parked in RAM until some later transaction happened along -- and
+	// a restart in between stranded every fragment in the sealed segment.
+	c.collapseSealedChains()
 	err := c.writeError()
 	if err == nil {
 		c.maintainOrdered(key, ad)

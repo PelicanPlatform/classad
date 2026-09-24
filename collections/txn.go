@@ -424,6 +424,10 @@ type CommitResult struct {
 	Committed int
 	Conflicts [][]byte
 	Unapplied [][]byte
+	// UnappliedReasons is parallel to Unapplied: why each key could not be composed. A dropped
+	// key reported without a reason is a bare fact with no action attached -- an operator reading
+	// it had to go to the daemon ad's counters and correlate by hand.
+	UnappliedReasons []string
 }
 
 // Conflicted reports whether any buffered write lost a conflict.
@@ -690,6 +694,7 @@ func (tx *Txn) Commit() CommitResult {
 	// made every caller that retries conflicts retry something that cannot succeed. See
 	// CommitResult.Unapplied.
 	var unreadable [][]byte
+	var unreadableWhy []string
 	for _, b := range tx.writes {
 		if b.del && tx.c.deltas != nil {
 			// The key's records are going away, so the tracker must stop believing a full
@@ -709,9 +714,11 @@ func (tx *Txn) Commit() CommitResult {
 				// Bytes the caller buffered (Txn.putWire); they are not ours to reuse.
 			case b.patch != nil && b.ad == nil:
 				var ok bool
-				raw, w.delta, ok = tx.encodePatchOnly(encScratch[:0], b, h)
+				var why readFail
+				raw, w.delta, ok, why = tx.encodePatchOnly(encScratch[:0], b, h)
 				if !ok {
 					unreadable = append(unreadable, b.key)
+					unreadableWhy = append(unreadableWhy, why.String())
 					continue
 				}
 				encScratch = raw
@@ -777,6 +784,7 @@ func (tx *Txn) Commit() CommitResult {
 	// Kept sequential: publishing and the ordered index touch collection-shared state.
 	var res CommitResult
 	res.Unapplied = append(res.Unapplied, unreadable...)
+	res.UnappliedReasons = append(res.UnappliedReasons, unreadableWhy...)
 	for _, c := range commits {
 		if c.changed {
 			tx.c.shards[c.idx].publishTxn(tx.c, c.ws, c.seq)
