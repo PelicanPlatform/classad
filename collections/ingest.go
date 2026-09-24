@@ -60,6 +60,7 @@ func (c *Collection) UpdateOld(batch []OldAdUpdate) error {
 	for si, writes := range byShard {
 		c.shards[si].commit(writes)
 	}
+	c.collapseSealedChains() // see Collection.Put: a seal here must schedule its own drain
 	return c.writeError()
 }
 

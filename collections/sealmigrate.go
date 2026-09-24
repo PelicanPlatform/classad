@@ -68,9 +68,23 @@ func (c *Collection) MigrateSealedAttrs(workers int) int {
 		}
 	}
 	codec := c.currentCodec()
+	// Collapse first, for the same reason every other rewrite does: this pass retires the active
+	// segment below, and a live delta caught in it would be sealed somewhere no collapse looks.
+	// Worse here than elsewhere -- resealSegmentsAs REFUSES a segment holding a delta, so the
+	// segment is not migrated either, and the pass reports success having both stranded the
+	// fragment and left the legacy bytes it exists to remove.
+	c.collapseBeforeRewrite()
 	migrated := 0
 	for _, sh := range c.shards {
 		sh.mu.Lock()
+		// Refuse to retire an active segment that still holds a live delta: the collapse above
+		// runs off the shard lock, so a commit can land between it and here. Skipping the shard
+		// leaves it for the next run; retiring it strands the fragment permanently.
+		if segHasLiveDelta(sh.act) {
+			sh.mu.Unlock()
+			migrateSkippedLiveDelta.Add(1)
+			continue
+		}
 		// Retire the active segment from the write path so it is migrated too, exactly as the dict
 		// reseal does. On reopen the last segment becomes the write target again, and its records are
 		// the LEGACY ones -- skipping it left a store that reported a successful migration with
