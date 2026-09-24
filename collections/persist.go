@@ -337,9 +337,16 @@ func Open(opts Options) (*Collection, error) {
 	// segment", and nothing has ever checked it -- while a stranded one is invisible to those
 	// passes, loses its base to the next compaction, and leaves the key permanently unreadable.
 	// Done here because the segments are mapped, no reader is waiting, and the cost is bounded.
-	if stranded := c.checkSealCollapseInvariant(openStrandedSampleMax); len(stranded) > 0 {
+	if stranded := c.checkSealCollapseInvariant(openStrandedRepairMax); len(stranded) > 0 {
 		c.openIdxDiag.StrandedSealedDeltas = len(stranded)
 		c.openIdxDiag.StrandedSealedKeys = stranded
+		if len(c.openIdxDiag.StrandedSealedKeys) > openStrandedSampleMax {
+			c.openIdxDiag.StrandedSealedKeys = c.openIdxDiag.StrandedSealedKeys[:openStrandedSampleMax]
+		}
+		// Rescue the ones whose base is still there. Reported first, so the diagnostic reflects
+		// what was FOUND rather than what survived the repair -- otherwise a successful repair
+		// would erase its own evidence and the count would read zero forever.
+		c.repairStrandedSealedDeltas(stranded)
 	}
 	// Emit the sidecar-adoption summary gathered during recovery (before the Reindex above
 	// rebuilds whatever was not adopted), so a slow reopen can be traced to its cause.

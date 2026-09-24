@@ -3,6 +3,7 @@ package collections
 import (
 	"bytes"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -115,6 +116,21 @@ func (t *deltaTracker) next(h uint64, eligible, baseExists bool, max int) bool {
 func (t *deltaTracker) forget(h uint64) {
 	t.mu.Lock()
 	delete(t.depth, h)
+	t.mu.Unlock()
+}
+
+// mustCompose marks a key so its next write stores a WHOLE record rather than extending a
+// chain, whatever the tracker previously believed about its depth.
+//
+// It exists for the key whose collapse FAILED. reset() runs before the collapse and wipes every
+// depth, and absence means "depth 0, base exists" -- so a key that was not collapsed looks
+// freshly collapsed to the next write, which then starts a new chain on a base that is not
+// there. That is what grew baseless chains to 29-41 versions on a production mirror: DeltaMax
+// never bit, because the count restarted at every pass. Forcing a compose makes the next write
+// either repair the key or be refused, instead of silently lengthening something unreadable.
+func (t *deltaTracker) mustCompose(h uint64) {
+	t.mu.Lock()
+	t.depth[h] = math.MaxInt // >= any caller's max, so next() always takes the full-record branch
 	t.mu.Unlock()
 }
 
@@ -267,6 +283,11 @@ var (
 	compactLiveDeltas    atomic.Int64
 	compactDroppedDeltas atomic.Int64
 	deltaFlagMismatches  atomic.Int64
+	// compactDeferredLiveDelta counts shards a compaction left alone because their active segment
+	// still held a live delta when its turn came. Deferring is the correct outcome -- the
+	// alternative is sealing the fragment away from every collapse -- but a rising count means
+	// the pre-pass collapse is routinely being overtaken by writers.
+	compactDeferredLiveDelta atomic.Int64
 )
 
 // DeltaAnomalies reports the three things that should all stay zero in a healthy delta store:
@@ -275,6 +296,10 @@ var (
 func DeltaAnomalies() (liveAtCompact, droppedFromHistory, flagMismatch int64) {
 	return compactLiveDeltas.Load(), compactDroppedDeltas.Load(), deltaFlagMismatches.Load()
 }
+
+// CompactDeferredLiveDelta reports how many shard compactions were deferred because the active
+// segment still held a live delta. See compactDeferredLiveDelta.
+func CompactDeferredLiveDelta() int64 { return compactDeferredLiveDelta.Load() }
 
 // encodeDelta encodes the record bytes for a write: a delta holding only the changed
 // attributes when the collection has delta mode on and this write qualifies, else the whole
@@ -470,7 +495,7 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	//
 	// Each participant is therefore decoded against ITS OWN segment's dictionary, which is what
 	// the ordinary read path does (getAt hands its caller seg.dict and decodes through it).
-	dicts := make([]*segDictHandle, len(vers))
+	dicts := ds.dicts
 	for i := base; i < len(vers); i++ {
 		stored, codec, ok := segStoredOrReassembled(c, vers[i].seg, vers[i].off)
 		if !ok {
@@ -560,11 +585,15 @@ const (
 
 // decompressState holds one reusable decompression buffer per chain position, for materializeAt.
 type decompressState struct {
-	bufs [][]byte
-	raws [][]byte
+	bufs  [][]byte
+	raws  [][]byte
+	dicts []*segDictHandle
 }
 
-// grow sizes the state for a chain of n participants and returns the raws slice to fill.
+// grow sizes the state for a chain of n participants and returns the raws slice to fill. The
+// per-participant dictionary slice is sized alongside it: decoding each participant against its
+// own segment's dictionary is per-READ work, so allocating it fresh put one allocation on every
+// chain merge -- beside the pool that exists to keep exactly that off the read path.
 func (d *decompressState) grow(n int) [][]byte {
 	for len(d.bufs) < n {
 		d.bufs = append(d.bufs, nil)
@@ -574,6 +603,13 @@ func (d *decompressState) grow(n int) [][]byte {
 	}
 	d.raws = d.raws[:n]
 	clear(d.raws)
+	if cap(d.dicts) < n {
+		d.dicts = make([]*segDictHandle, n)
+	}
+	d.dicts = d.dicts[:n]
+	// Cleared on acquire, as raws is: a handle left here would otherwise be read by the next
+	// chain that happens to be shorter.
+	clear(d.dicts)
 	return d.raws
 }
 
@@ -739,7 +775,10 @@ func (c *Collection) collapseBeforeRewrite() {
 	if c.deltas == nil {
 		c.deltas = newDeltaTracker() // read-only reopen: still needs somewhere to track a collapse
 	}
-	c.collapseLiveChains()
+	// Pre-compaction: include the sealed segments. This is the last moment a stranded fragment
+	// can still be rescued -- the rewrite about to run is what drops the superseded base it
+	// depends on.
+	c.collapseLiveChains(true)
 }
 
 // encodePatchOnly produces the record bytes for a write buffered as a bare patch (see
@@ -944,7 +983,12 @@ func (c *Collection) TrackedKeys() int {
 // Runs after a commit, never inside one: collapsing reads and writes keys, and the seal that
 // triggers it happens under the shard write lock.
 func (c *Collection) collapseSealedChains() {
-	if c.deltas == nil {
+	// deltaRead, not deltas: a store reopened with DeltaMax back at 0, or with time travel on,
+	// writes no NEW deltas but still holds live ones on disk. Draining the seal flags without
+	// collapsing them -- which the branch below does -- strands every one, deterministically,
+	// on the first seal after such a reopen. The write-side variable was the wrong gate here for
+	// the same reason collapseBeforeRewrite documents at its own head.
+	if !c.deltaRead {
 		// Delta mode off: nothing to collapse, but the seal bookkeeping still has to be
 		// drained. writeRecord appends to pendingSeal unconditionally, and leaving it to grow
 		// retains a pointer to every segment the shard has ever sealed -- including ones
@@ -958,6 +1002,9 @@ func (c *Collection) collapseSealedChains() {
 			}
 		}
 		return
+	}
+	if c.deltas == nil {
+		c.deltas = newDeltaTracker() // read-only reopen: still needs somewhere to track a collapse
 	}
 	pending := false
 	for _, sh := range c.shards {
@@ -976,7 +1023,9 @@ func (c *Collection) collapseSealedChains() {
 	}
 	defer c.collapsing.Store(false)
 
-	c.collapseLiveChains()
+	// Per-seal: active segments only. The fragments this pass exists for were just written, and
+	// scanning every sealed segment on every seal would put a full scan on the write path.
+	c.collapseLiveChains(false)
 }
 
 // collapseLiveChains writes a whole record for every key whose current record is a delta, and
@@ -985,10 +1034,20 @@ func (c *Collection) collapseSealedChains() {
 // depends on anything that is about to be sealed away or reclaimed.
 //
 // The keys come from the active segments rather than the tracker, which is keyed by hash and
-// cannot name them. That is not a workaround: by this function's own invariant the active
-// segment is the only place a live fragment can be.
-func (c *Collection) collapseLiveChains() {
-	open := c.liveDeltaKeys()
+// cannot name them.
+//
+// includeSealed additionally scans the SEALED segments. That was long held to be unnecessary --
+// "by this function's own invariant the active segment is the only place a live fragment can
+// be" -- and production disproved it: an open-time check found 15 live fragments sitting in
+// sealed segments of one table, four of the five sampled already unreadable because compaction
+// had since reclaimed their bases. The invariant is what every collapse relies on and nothing
+// enforced.
+//
+// It is passed only by the PRE-COMPACTION caller, because compaction is the step that turns a
+// stranded fragment into a lost row, and compaction is rare. The per-seal caller keeps the cheap
+// active-only scan, so the hot path is unchanged.
+func (c *Collection) collapseLiveChains(includeSealed bool) {
+	open := c.liveDeltaKeys(includeSealed)
 	c.deltas.reset() // the tracker describes the active segment, which is now collapsed
 
 	// Collapse in BATCHES, not one transaction per key. Each commit is durable, so a key per
@@ -1006,8 +1065,10 @@ func (c *Collection) collapseLiveChains() {
 		open = c.collapseBatch(open)
 	}
 	for _, key := range open {
-		// Still not collapsed after the retries. Remember it so a later pass tries again; a key
+		// Still not collapsed after the retries. Mark it so the next write cannot extend the
+		// chain -- see mustCompose -- and remember it so a later pass tries again; a key
 		// left ending in a delta is exactly what must not be forgotten.
+		c.deltas.mustCompose(c.h.Hash(key))
 		c.rememberCollapse(key)
 	}
 }
@@ -1160,7 +1221,7 @@ func (c *Collection) keyExists(key []byte, h uint64) bool {
 // liveDeltaKeys returns the keys whose CURRENT record is a delta, read from the active
 // segments. The tracker is keyed by hash and so cannot name them; the active segments can,
 // and by the seal-collapse invariant they are the only place a live fragment exists.
-func (c *Collection) liveDeltaKeys() [][]byte {
+func (c *Collection) liveDeltaKeys(includeSealed bool) [][]byte {
 	// Keys a previous pass could not finish come first: their segments are already sealed and
 	// nothing else will ever scan them again (pendingSeal is consumed below), so this set is the
 	// only thing standing between a lost collapse and a permanent live delta in a sealed segment.
@@ -1184,6 +1245,17 @@ func (c *Collection) liveDeltaKeys() [][]byte {
 		sh.pendingSeal = nil
 		if sh.act != nil {
 			segs = append(segs, sh.act)
+		}
+		if includeSealed {
+			// Every sealed segment, not just the ones this shard remembers pending. What is
+			// pending is in-memory and does not survive the process; a fragment stranded by a
+			// restart, or by a collapse that failed and was then forgotten, is only findable
+			// by looking at the segments themselves.
+			for _, seg := range sh.segs {
+				if seg != nil && seg != sh.act && seg.used > 0 {
+					segs = append(segs, seg)
+				}
+			}
 		}
 		for _, seg := range segs {
 			for off := uint32(0); off < uint32(seg.used); {

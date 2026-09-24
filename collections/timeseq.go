@@ -78,7 +78,9 @@ func (c *Collection) SetTimeTravel(o *TimeTravelOptions) {
 	// Collapse what is open and stop writing new deltas; the records already on disk stay
 	// readable, because deltaRead is left alone.
 	if newTTConfig(o) != nil && c.deltas != nil {
-		c.collapseLiveChains()
+		// Sealed segments included: this is a make-everything-whole moment, and a fragment left
+		// behind here would be retained for as-of reads it cannot serve.
+		c.collapseLiveChains(true)
 		c.deltaMax = 0
 	}
 	c.ttCfg.Store(newTTConfig(o))
