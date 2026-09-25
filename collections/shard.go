@@ -545,13 +545,32 @@ func (sh *shard) forEachSealedRecordCounting(key []byte, h uint64, skipped *int,
 		bf := seg.keyBloom.Load()
 		ki := seg.keyIdx.Load()
 		if bf == nil || ki == nil {
-			// A sealed segment whose key index has not been built yet is INVISIBLE here. The
-			// index is built by a reindex pass, not at seal time, so there is a window after a
-			// seal in which this probe cannot see the segment's records at all. Counted so a
-			// caller that came up empty can say whether that window is why.
+			// A sealed segment's key index is built by a reindex pass, not at seal time, so
+			// there is a window after every seal in which there is no index to probe. Skipping
+			// the segment made this probe silently BLIND for that window: a chain whose base
+			// lived there could not be found, the write was refused as delta-index-pending, and
+			// because a refusal is terminal the update was dropped -- when a retry moments later
+			// would have succeeded. Production ran at 14 of these in 98 minutes once the real
+			// stranding was fixed, which is 14 updates lost to a transient condition.
+			//
+			// Walk the segment instead. It costs a linear pass over a segment that has no index,
+			// which is rare and self-limiting (the next reindex ends it), and it is the
+			// difference between a correct answer and a confidently wrong one.
 			sealedSkippedNoIndex.Add(1)
 			if skipped != nil {
 				*skipped++
+			}
+			for off := uint32(0); off < uint32(seg.used); {
+				tl := recTotalLen(seg.data, off)
+				if tl == 0 || off+tl > uint32(seg.used) {
+					break
+				}
+				if !recIsMarker(seg.data, off) && bytes.Equal(recKey(seg.data, off), key) {
+					if !fn(seg, off) {
+						return
+					}
+				}
+				off += tl
 			}
 			continue
 		}
