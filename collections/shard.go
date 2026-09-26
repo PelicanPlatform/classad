@@ -31,6 +31,12 @@ type shard struct {
 	sealedPending atomic.Bool
 	pendingSeal   []*segment
 
+	// needsSealIndex marks that this shard has a sealed segment with no key index yet. It gates
+	// the post-commit index build so that a commit which sealed nothing pays one atomic load
+	// rather than a walk of every segment in the shard -- that walk was on the path of EVERY
+	// commit, which is not somewhere to put O(segments) work.
+	needsSealIndex atomic.Bool
+
 	// appendOnly makes this a pure append log (see Options.AppendOnly): put appends
 	// without superseding or indexing by key, del is a no-op, and compaction is
 	// skipped. Set once at construction; never mutated.
@@ -412,6 +418,10 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, 
 			// runs it on the way out.
 			sh.sealedPending.Store(true)
 			sh.pendingSeal = append(sh.pendingSeal, sh.act)
+			// And it needs a key index, which the durable reindex pass will not get to for a
+			// while. Flagged rather than built here: this runs under the shard WRITE lock, on
+			// the path every commit takes.
+			sh.needsSealIndex.Store(true)
 		}
 		size := sh.segSize
 		if rl > size {

@@ -6,6 +6,12 @@ import "sync/atomic"
 // pass. It is the work this closes the window with: one build per sealed segment, once.
 var provisionalIndexBuilds atomic.Int64
 
+// sealIndexScans counts shards this hook actually walked. It is the cost the needsSealIndex flag
+// exists to avoid: the hook runs from the post-commit path, so an unguarded walk would examine
+// every segment of every shard on every commit. Builds alone cannot show that -- a walk over
+// already-indexed segments builds nothing while still paying for the walk.
+var sealIndexScans atomic.Int64
+
 // ProvisionalIndexBuilds reports how many sealed segments were given a provisional key index at
 // seal time. See segment.keyIdxMem.
 func ProvisionalIndexBuilds() int64 { return provisionalIndexBuilds.Load() }
@@ -24,6 +30,11 @@ func ProvisionalIndexBuilds() int64 { return provisionalIndexBuilds.Load() }
 // itself is a nil check per sealed segment; the build happens once per segment, ever.
 func (c *Collection) indexSealedSegments() {
 	for _, sh := range c.shards {
+		// One atomic load for a commit that sealed nothing, which is almost all of them.
+		if !sh.needsSealIndex.Load() {
+			continue
+		}
+		sealIndexScans.Add(1)
 		sh.mu.RLock()
 		var todo []*segment
 		for _, seg := range sh.segs {
@@ -35,6 +46,9 @@ func (c *Collection) indexSealedSegments() {
 			}
 		}
 		sh.mu.RUnlock()
+		// Cleared before the build, not after: a seal landing while this runs must re-flag the
+		// shard rather than be swallowed by a clear that happens later.
+		sh.needsSealIndex.Store(false)
 		if len(todo) == 0 {
 			continue
 		}
