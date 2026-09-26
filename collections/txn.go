@@ -683,6 +683,9 @@ func (tx *Txn) Commit() CommitResult {
 	// triggers it occurs under a shard write lock deep inside this call, and collapsing means
 	// ordinary reads and writes. No-op unless a segment actually sealed.
 	defer tx.c.collapseSealedChains()
+	// Give any segment this commit sealed a key index now, rather than leaving it unprobeable
+	// until the next reindex. See indexSealedSegments.
+	defer tx.c.indexSealedSegments()
 	// One scratch buffer for every encode in this commit: each write's uncompressed wire bytes
 	// are alive only until the line that compresses them, so the next write can have the same
 	// buffer. It grows once to the widest ad in the batch instead of being reallocated per write.

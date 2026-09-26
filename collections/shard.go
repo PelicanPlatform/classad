@@ -544,6 +544,20 @@ func (sh *shard) forEachSealedRecordCounting(key []byte, h uint64, skipped *int,
 		}
 		bf := seg.keyBloom.Load()
 		ki := seg.keyIdx.Load()
+		if ki == nil {
+			// The provisional index built at seal time, while the durable sidecar is still
+			// pending. It has no bloom filter, so the probe goes straight to the lookup.
+			if mem := seg.keyIdxMem.Load(); mem != nil {
+				for _, off := range mem.lookup(h) {
+					if bytes.Equal(recKey(seg.data, off), key) {
+						if !fn(seg, off) {
+							return
+						}
+					}
+				}
+				continue
+			}
+		}
 		if bf == nil || ki == nil {
 			// A sealed segment's key index is built by a reindex pass, not at seal time, so
 			// there is a window after every seal in which there is no index to probe. Skipping

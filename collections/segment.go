@@ -209,6 +209,17 @@ type segment struct {
 	keyIdx    atomic.Pointer[mmapKeyIndex]
 	onReapKey func() // key-sidecar unmap; run with onReap at reap/close
 
+	// keyIdxMem is a PROVISIONAL key index, built on the Go heap when the segment seals and
+	// consulted only while keyIdx is nil. The durable index is written by a reindex pass, not at
+	// seal time, which left a window after every seal in which the sealed-segment probe had
+	// nothing to look in -- measured at three million skipped probes in six hours on a
+	// production mirror, and the cause of every write refused as delta-index-pending there.
+	//
+	// Kept separate from keyIdx rather than filling it, because sealSegmentIndex returns early
+	// when keyIdx is set: publishing here would suppress the real sidecar and leave the segment
+	// rebuilding its index at every open. Dropped once the sidecar lands.
+	keyIdxMem atomic.Pointer[mmapKeyIndex]
+
 	// keyBloom is a resident membership filter over this sealed segment's key-hashes
 	// (phase 2), built from keyIdx at seal/load. It gates the sealed-segment probe so
 	// a Get miss in the active directory only touches segments that might hold the
