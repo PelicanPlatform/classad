@@ -119,3 +119,50 @@ func TestTheProvisionalIndexFindsTheSameKeys(t *testing.T) {
 		t.Errorf("%d probe(s) fell back to walking a segment: the provisional index was not used", got)
 	}
 }
+
+// The build must cost nothing on a commit that sealed nothing. It runs from the post-commit
+// hook, so walking every shard's segments unconditionally would put O(segments) work on the path
+// of every commit -- which is not somewhere to put it.
+func TestIndexBuildIsFreeWhenNothingSealed(t *testing.T) {
+	c, _ := openDelta(t, 16)
+	defer c.Close()
+
+	// Seal some segments and let the hook do its work.
+	for i := range 3000 {
+		ad := classad.New()
+		ad.InsertAttr("ClusterId", int64(i))
+		for j := range 20 {
+			ad.InsertAttr(fmt.Sprintf("Pad%02d", j), int64(j))
+		}
+		tx := c.Begin()
+		tx.Put([]byte(fmt.Sprintf("%d.0", i)), ad)
+		tx.Commit()
+	}
+	if ProvisionalIndexBuilds() == 0 {
+		t.Fatal("nothing was indexed, so the fixture never sealed and this proves nothing")
+	}
+
+	// Now commits that seal nothing: no shard may still be asking for an index build.
+	for _, sh := range c.shards {
+		if sh.needsSealIndex.Load() {
+			t.Errorf("a shard still flags needsSealIndex after the hook ran; every later commit pays for the walk")
+		}
+	}
+	beforeScans := sealIndexScans.Load()
+	before := ProvisionalIndexBuilds()
+	for i := range 20 {
+		ad := classad.New()
+		ad.InsertAttr("ClusterId", int64(i))
+		tx := c.Begin()
+		tx.Put([]byte(fmt.Sprintf("tiny%d", i)), ad)
+		tx.Commit()
+	}
+	if got := ProvisionalIndexBuilds() - before; got != 0 {
+		t.Errorf("%d index(es) built by commits that sealed nothing", got)
+	}
+	// The walk itself, not just the builds: an unguarded hook walks every shard on every commit
+	// and builds nothing, which the build count alone cannot distinguish from doing no work.
+	if got := sealIndexScans.Load() - beforeScans; got != 0 {
+		t.Errorf("%d shard walk(s) by commits that sealed nothing: the post-commit hook is not free", got)
+	}
+}
