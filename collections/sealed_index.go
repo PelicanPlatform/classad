@@ -287,6 +287,9 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 	// by the pin drain instead.
 	sh.mu.Lock()
 	seg.keyIdx.Store(ki)
+	// The durable index supersedes any provisional one built at seal time; drop it so the heap
+	// copy is not retained for the life of the segment.
+	seg.keyIdxMem.Store(nil)
 	seg.keyBloom.Store(bloomFromKeyIndex(ki))
 	if mm != nil {
 		seg.msidx.Store(mm)
