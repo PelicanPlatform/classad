@@ -6,11 +6,11 @@ require (
 	github.com/PelicanPlatform/classad v0.7.0
 	github.com/PelicanPlatform/classad/collections v0.7.0
 	github.com/PelicanPlatform/classad/db v0.7.1
-	github.com/bbockelm/cedar v0.6.15
+	github.com/bbockelm/cedar v0.6.19
 )
 
 require (
-	github.com/RoaringBitmap/roaring/v2 v2.27.0 // indirect
+	github.com/RoaringBitmap/roaring/v2 v2.28.0 // indirect
 	github.com/bits-and-blooms/bitset v1.24.4 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/dgraph-io/ristretto/v2 v2.4.2 // indirect
