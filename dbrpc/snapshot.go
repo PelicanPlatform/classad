@@ -108,6 +108,10 @@ func (sc *serverConn) restoreStart(reqID uint64, r *reader) {
 		sc.write(respErr(reqID, "no such table: "+table))
 		return
 	}
+	if !sc.tableWritable(table) {
+		sc.write(respTableReadOnly(reqID, table, "Restore"))
+		return
+	}
 	f, err := os.CreateTemp("", "htcondordb-restore-*.cadb")
 	if err != nil {
 		sc.write(respErr(reqID, "restore spool: "+err.Error()))
@@ -152,6 +156,11 @@ func (sc *serverConn) restoreEnd(reqID uint64) {
 	d, ok := sc.s.cat.Table(ru.table)
 	if !ok {
 		sc.write(respErr(reqID, "no such table: "+ru.table))
+		return
+	}
+	// Re-checked: TableWritable may have stopped admitting the table during the upload.
+	if !sc.tableWritable(ru.table) {
+		sc.write(respTableReadOnly(reqID, ru.table, "Restore"))
 		return
 	}
 	f, err := os.Open(ru.path)

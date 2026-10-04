@@ -93,6 +93,10 @@ type serverTxn struct {
 	mu    sync.Mutex
 	table string    // the transaction's table (from opBegin), for the propose hook
 	batch []WriteOp // ops accumulated for the propose hook (nil unless propose is set)
+	// wrote is set (under mu) once an ad write has been accepted into the transaction,
+	// so Commit can refuse to apply writes to a table that stopped being writable after
+	// they were buffered (ServeOptions.TableWritable).
+	wrote bool
 
 	// conn owns this transaction; when that connection closes, its still-open
 	// transactions are aborted (a client that drops mid-transaction -- e.g. a
@@ -188,6 +192,28 @@ type ServeOptions struct {
 	// only a DAEMON peer sets this true. Read-only diagnostics are a separate opcode and
 	// are not gated here.
 	Privileged bool
+
+	// TableWritable, if non-nil, is consulted for every request that would modify a
+	// named table; returning false refuses it as if the connection were read-only for
+	// that table alone, with an error the client sees as ErrTableReadOnly. A server
+	// whose table is owned by an in-process writer (a mirror of another store) uses it
+	// so no remote peer -- Privileged included -- can change that table underneath
+	// the writer. Reads, watches, snapshots and read-only transactions on the table
+	// are unaffected. Nil means every table is writable (the historical behavior).
+	//
+	// Gated: ad writes in a transaction on the table and a Commit that carries them,
+	// CommitIdempotent (it writes a marker), DeleteWhere, ArchiveAppend, ArchiveRotate,
+	// Create/Drop of a table, archive or view by that name, ConvertTableToMemory,
+	// Restore, and the admin actions that remove data or change what is kept
+	// (truncate, rotate, retention.set). Not gated: layout and tuning admin actions
+	// that preserve every row (index.*, hot.*, compact, rewrite, codec.retrain,
+	// schema.*, analyze, encrypt.set, timetravel.*, backup.key), and exporter ops,
+	// which name no table. See tableWriteTarget.
+	//
+	// Called from request goroutines concurrently; it must be safe for that and must
+	// not block. It may change its answer over time: a Commit re-checks it, so writes
+	// buffered while a table was writable do not land after it stops being so.
+	TableWritable func(table string) bool
 
 	// QueryLog, if set, is called once per streamed query with a summary of what
 	// the client asked for and what it cost. It is an opt-in query log for
@@ -458,6 +484,12 @@ func (sc *serverConn) dispatch(frame []byte) {
 	if sc.opts.ReadOnly && o.isMutating() {
 		sc.write(respErr(reqID, "read-only connection: "+o.String()+" not permitted"))
 		return
+	}
+	if sc.opts.TableWritable != nil {
+		if table, what, ok := sc.tableWriteTarget(o, body); ok && !sc.opts.TableWritable(table) {
+			sc.write(respTableReadOnly(reqID, table, what))
+			return
+		}
 	}
 	priv := sc.opts.IncludePrivate
 	switch o {
@@ -1068,6 +1100,9 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			return respErr(reqID, "no such transaction")
 		}
 		sc.removeTxn(id)
+		if refused := sc.refuseCommit(reqID, st); refused != nil {
+			return refused
+		}
 		// Consistent-HA routing: propose the accumulated writes through consensus (raft)
 		// instead of committing locally. The local transaction was only for read-your-
 		// writes during the session; the propose hook (via the FSM) is the real writer.
@@ -1174,6 +1209,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 				}
 				st.tx.NewClassAd(key, ad)
 			}
+			st.wrote = true
 			st.record(s, WriteOp{Kind: WriteNewClassAd, Key: key, Value: adText})
 			return resp(reqID, stOK)
 		})
@@ -1207,6 +1243,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 					st.tx.NewClassAd(key, ad)
 				}
 				st.record(s, WriteOp{Kind: WriteNewClassAd, Key: key, Value: adText})
+				st.wrote = true
 			}
 			b := putI32(resp(reqID, stOK), int32(len(rejIdx)))
 			for i := range rejIdx {
@@ -1218,6 +1255,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 	case opDestroyAd:
 		return s.withTxn(reqID, r, func(st *serverTxn) []byte {
 			key := r.str()
+			st.wrote = true
 			st.tx.DestroyClassAd(key)
 			st.record(s, WriteOp{Kind: WriteDestroyClassAd, Key: key})
 			return resp(reqID, stOK)
@@ -1229,6 +1267,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			if r.err != nil {
 				return respBad(reqID)
 			}
+			st.wrote = true
 			if err := st.tx.SetAttribute(key, name, expr); err != nil {
 				return respErr(reqID, err.Error())
 			}
@@ -1242,6 +1281,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			if r.err != nil {
 				return respBad(reqID)
 			}
+			st.wrote = true
 			st.tx.DeleteAttribute(key, name)
 			st.record(s, WriteOp{Kind: WriteDeleteAttribute, Key: key, Name: name})
 			return resp(reqID, stOK)
