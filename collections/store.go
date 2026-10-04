@@ -462,6 +462,9 @@ type Collection struct {
 	hub           *watchHub
 	watchBuf      int
 	watchCoalesce time.Duration
+	// watchEpochDir is set for a persistent append-only collection with Watch enabled: its
+	// epoch survives a clean Close/Open via <watchEpochDir>/watch.epoch (see watchepoch.go).
+	watchEpochDir string
 
 	// Parent/child chaining (see docs/PARENT_CHILD.md). parentKeyFor derives a
 	// child's parent key (nil ⇒ no chaining); isStructural marks parent-only ads

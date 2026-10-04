@@ -1,8 +1,8 @@
 # Watch: resumable full-ad subscriptions
 
 > Status: **implemented** — `Collection.Watch` (`watch.go`, enabled by
-> `Options.WatchHistory > 0`) and `Archive.Watch` (`archive_watch.go`, always
-> available). The Collection reuses the MVCC sequence machinery; its one real
+> `Options.WatchHistory > 0`) and `Archive.Watch` (`archive.go`, a thin wrapper
+> over the append-only Collection's Watch, always available). The Collection reuses the MVCC sequence machinery; its one real
 > limitation is that precise *deletes* are only replayable within the retention window
 > (`WatchHistory`), older resumes falling back to a full replay the client rebuilds
 > from. The Archive is append-only, so its Watch is a durable log tail with none of
@@ -25,26 +25,63 @@ There is no single global transaction counter — each shard has its own monoton
 cursor is **opaque to the client** and internally is:
 
 ```
-Collection cursor = { epoch, perShardSeq[nShards] }     // one commitSeq per shard
-Archive cursor    = { epoch, logPosition }               // an append-log offset
+cursor = { epoch, perShardSeq[nShards] }     // one commitSeq per shard
 ```
+
+The Archive uses the same cursor: it is an append-only Collection, whose record `seq`s
+are assigned in append order and never change.
 
 - **`perShardSeq`** — for each shard, the `commitSeq` up to which the client has
   processed. On resume, shard *i* replays records with `seq > perShardSeq[i]`. This
   is exact per shard, needs no global ordering, and costs nothing on the write path.
-- **`epoch`** — a per-store identity (a UUID persisted in the store dir; per-process
-  for in-memory). If it does not match, the client's sequence numbers are from a
-  different store generation (e.g. the store was rebuilt from empty and seqs reset),
-  so the server ignores the numbers and does a **full replay**.
-- **Archive `logPosition`** — the archive is append-only with a constant record
-  sequence, so its cursor is a *position* in the append log (segment id + record
-  ordinal), like a Kafka offset — not an MVCC seq.
+- **`epoch`** — the identity of the sequence space the numbers belong to. If it does
+  not match, the client's sequence numbers are from a different store generation, so
+  the server ignores them and does a **full replay** (`WatchReset`). It is a random
+  value chosen per process, except for a persistent append-only collection (an
+  Archive), which carries it across a clean restart — see **Epoch across a restart**.
+- A cursor whose `seq` for some shard is **ahead of** that shard's current head was
+  not issued by the log as it now stands (e.g. an older copy of the store reopened),
+  so it also gets a full replay — never a resume that would skip the records later
+  assigned those numbers.
 
 The client treats the whole thing as opaque bytes, stores the latest one it fully
-processed, and hands it back on reconnect. Cursors survive a **server** restart:
-recovery rebuilds each shard's `commitSeq` from the segments and record `seq`s are
-immutable (and preserved across compaction), so the numbers still mean the same
-thing; the epoch guards the store-was-wiped case.
+processed, and hands it back on reconnect.
+
+### Epoch across a restart
+
+**Mutable collections** (tables) pick a fresh random epoch every time they are opened,
+so **every watcher Resets after a server restart**. That is deliberate: the delete
+journal lives in memory, so a resume could not replay deletes precisely anyway.
+
+**Persistent append-only collections** (`Archive`, and so `db.ArchiveTable`) keep their
+epoch across a **clean** restart, so a cursor issued before `Close` resumes after
+`Open` with no Reset, as long as the records it points past are still retained (at or
+above the append floor; otherwise the rotation-gap Reset below applies).
+
+Persisting the epoch alone would be unsafe. A commit's `seq` becomes visible
+(`WatchCursor`, catch-up) before its msync completes, so a watcher can hold a cursor
+past a record that a crash then loses; recovery rebuilds `commitSeq` from what is on
+disk, and the lost numbers would be reassigned to *different* records that a resumed
+cursor silently skips. The protocol (`watchepoch.go`) therefore only vouches for an
+epoch the previous process proved safe:
+
+1. **Open consumes `<dir>/watch.epoch`** before mapping any segment: it reads the
+   epoch and the per-shard high-water `commitSeq`, removes the file, and fsyncs the
+   directory. From then until a successful `Close`, there is no marker on disk.
+2. **Close**, after every segment flushed without error and with no write/sync error
+   pending, fsyncs each shard directory and only then durably writes the marker
+   (tmp + fsync + rename + dir fsync) with the epoch and each shard's `commitSeq`. A
+   marker on disk thus implies every record issued under its epoch is durable.
+3. On reopen with a valid marker, the epoch is adopted and each shard's `commitSeq`
+   becomes `max(recovered, high-water)`, so a number issued before the restart is never
+   reissued even if its record is gone (`Truncate`, or a shard `Rotate` emptied).
+4. A missing, corrupt, or mismatched (shard count) marker — any crash, kill, or failed
+   `Close` — means a **new random epoch**: every cursor Resets. Conservative (a crash
+   whose data all survived still Resets) but never a silent skip.
+
+A store directory copied while cleanly closed carries its marker; reopening an *older*
+copy is only caught while its head is still behind the cursor (the ahead-of-head
+check). Delete `watch.epoch` when restoring a store from a copy.
 
 ## Collection Watch: catch-up then live
 
@@ -119,11 +156,11 @@ The archive is append-only — no updates, no deletes — so Watch is a log tail
 func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error)
 ```
 
-- **Cursor** = `{epoch, segment id, offset}` — a durable **log position**, not an MVCC
-  sequence. Segment ids and offsets are stable once written and the catalog persists
-  them, and the epoch is persisted at `<dir>/watch.epoch`, so **a cursor resumes
-  incrementally even across a reopen** (unlike the Collection today). No per-shard
-  vector, no delete journal.
+- **Cursor** = the Collection's `{epoch, perShardSeq[]}`. Record `seq`s are assigned
+  in append order and preserved by merge, re-encode, and recovery, so a `seq` is a
+  durable **log position**. The epoch survives a clean restart (see **Epoch across a
+  restart**), so **a cursor resumes incrementally across a clean reopen**; after a
+  crash it Resets. No delete journal.
 - **Events**: only `WatchUpsert` (an appended ad; `Key` is nil, `Ad` is the payload),
   plus `WatchSynced`/`WatchResync`. `WatchReset` here means a **history gap** — the
   cursor is older than what rotation still retains (or from a different archive), so
@@ -242,10 +279,10 @@ Done (Collection):
 
 Also done:
 
-4. **Archive Watch** (`archive_watch.go`) — positional `{epoch, seg, off}` cursor,
-   oldest-first catch-up, live tail, Reset-on-rotation-gap. The epoch is persisted at
-   `<dir>/watch.epoch` and segment ids are catalog-stable, so archive resumes survive
-   a reopen incrementally. (Also fixed a `Rotate` bug it surfaced: an index-less
+4. **Archive Watch** — the append-only Collection's Watch: oldest-first catch-up, live
+   tail, Reset-on-rotation-gap. The epoch and per-shard high-water seq are persisted
+   at `<dir>/watch.epoch` on a clean `Close` (consumed by `Open`), so archive resumes
+   survive a clean reopen incrementally and Reset after a crash. (Also fixed a `Rotate` bug it surfaced: an index-less
    archive failed to drop segments because it tried to unlink a sidecar that was never
    written.)
 
@@ -254,8 +291,9 @@ Deferred:
 5. **Collection catch-up efficiency** — currently a full `seq`-filtered scan of every
    segment (correct, O(records)). Per-segment `[minSeq,maxSeq]` to skip old segments
    is a follow-up.
-6. **Collection epoch persistence** — the Collection's epoch is per-process, so **a
-   reopened persistent collection gets a new epoch and forces watchers to full-replay**
-   (safe, but not incremental across a server restart). Persisting the epoch and the
-   delete journal under `Dir` (as the Archive already does for its epoch) is a
-   follow-up. The Archive already resumes incrementally across a reopen.
+6. **Mutable Collection epoch persistence** — a mutable collection's epoch is
+   per-process, so **a reopened persistent table gets a new epoch and forces watchers
+   to full-replay** (safe, but not incremental across a server restart). Persisting
+   the delete journal under `Dir` as well, and reusing the archive's clean-shutdown
+   marker, is a follow-up. Append-only collections already resume across a clean
+   reopen.
