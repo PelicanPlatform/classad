@@ -1,7 +1,7 @@
-github.com/RoaringBitmap/roaring/v2 v2.28.0 h1:DgbDUowq/upwAdbVCuH+aDrQ3dHonkRcRqn1TkCp/Xg=
-github.com/RoaringBitmap/roaring/v2 v2.28.0/go.mod h1:BZufmFbox589n3j5eOmyTaLSGXbRLc2LmQvjKjzSEGU=
-github.com/bbockelm/cedar v0.6.19 h1:kvdL3DxV3xLuytx9+1IUxxtcdT6+/cRSMnEVLmjgXUM=
-github.com/bbockelm/cedar v0.6.19/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
+github.com/RoaringBitmap/roaring/v2 v2.29.0 h1:jSjxqZEqiF9W5dHUFsemupb9bnLaQJwZVe5yMetbsZg=
+github.com/RoaringBitmap/roaring/v2 v2.29.0/go.mod h1:BZufmFbox589n3j5eOmyTaLSGXbRLc2LmQvjKjzSEGU=
+github.com/bbockelm/cedar v0.7.1 h1:NIPXbSPzsgpzf2akoZi5tABljvNQgfvwnXqC8IUyGew=
+github.com/bbockelm/cedar v0.7.1/go.mod h1:1SABFonyJbC729ODTx03voZhpMSBQqqy+Q+6TvpE08s=
 github.com/bits-and-blooms/bitset v1.24.4 h1:95H15Og1clikBrKr/DuzMXkQzECs1M6hhoGXLwLQOZE=
 github.com/bits-and-blooms/bitset v1.24.4/go.mod h1:7hO7Gc7Pp1vODcmWvKMRA9BNmbv6a/7QIWpPxHddWR8=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
@@ -14,8 +14,8 @@ github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da h1:aIftn67I1fkbMa5
 github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da/go.mod h1:SqUrOPUnsFjfmXRMNPybcSiG0BgUW2AuFH8PAnS2iTw=
 github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
 github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
-github.com/klauspost/compress v1.20.0 h1:a3C1ke2ohxFymNlb2HWAHjDeKCI90scRskErZkR0ezA=
-github.com/klauspost/compress v1.20.0/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
+github.com/klauspost/compress v1.20.1 h1:T7kKElXUMXrUJ2E9QhQhxFtcK5rPyLdsGZvdbLMPdiQ=
+github.com/klauspost/compress v1.20.1/go.mod h1:LUdAzn7YLVvxLpc7y3V1m40wESHTgc1422pwwBSKYuI=
 github.com/mschoch/smat v0.2.0 h1:8imxQsjDm8yFEAVBe7azKmKSgzSkZXDuKkSq9374khM=
 github.com/mschoch/smat v0.2.0/go.mod h1:kc9mz7DoBKqDyiRL7VZN8KvXQMWeTaVnttLRXOlotKw=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=
