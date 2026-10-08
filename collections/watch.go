@@ -32,7 +32,9 @@ const (
 	// WatchReset tells the client to discard its state (build into a shadow): an
 	// authoritative full snapshot of Upserts follows, ending at WatchSynced. Emitted
 	// when a precise incremental resume is impossible (first subscribe, cursor older
-	// than the delete-retention window, or a different store generation).
+	// than the delete-retention window or append floor, a cursor ahead of the head, or
+	// a different store generation -- including any restart of a mutable collection and
+	// an unclean restart of an append-only one; see watchepoch.go).
 	WatchReset
 	// WatchSynced marks the end of the initial catch-up/snapshot: the client is now
 	// live. Its Cursor is a durable resume point (and, after a Reset, the point to
@@ -168,6 +170,8 @@ type watcher struct {
 }
 
 type watchHub struct {
+	// epoch is random per process; Open restores it for a persistent append-only
+	// collection that was closed cleanly (see watchepoch.go). Fixed once Open returns.
 	epoch    uint64
 	active   atomic.Bool // lock-free gate: any watchers?
 	mu       sync.Mutex
@@ -275,11 +279,14 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 			sReg[i] = sh.commitSeq
 			sh.mu.RUnlock()
 		}
+		// A cursor ahead of the head was not issued by this store's log as it stands (e.g. an
+		// older copy of a persistent store reopened under the same epoch): its seqs may later
+		// be reassigned to records it never saw, so it cannot be resumed -> full replay.
 		// Retention: if a shard's cursor predates its delete horizon, a delete may have
 		// been trimmed -> full replay.
 		if !full {
 			for i, sh := range c.shards {
-				if seqs[i] < sh.delLog.horizonSeq() {
+				if seqs[i] > sReg[i] || seqs[i] < sh.delLog.horizonSeq() {
 					full = true
 					break
 				}

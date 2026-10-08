@@ -272,6 +272,15 @@ func Open(opts Options) (*Collection, error) {
 			c.codec.Store(&codecHolder{codec})
 		}
 	}
+	// A persistent append log keeps its watch epoch across a clean restart. The marker is
+	// consumed BEFORE any segment is mapped or any seq issued, so a crash from here on
+	// rotates the epoch instead of letting recovery reissue seqs a cursor already covers.
+	var watchHW []uint64
+	if c.hub != nil && opts.AppendOnly {
+		if watchHW, err = c.claimWatchEpoch(opts.Dir); err != nil {
+			return nil, err
+		}
+	}
 	// Give each shard an mmap-segment factory writing to its own subdirectory.
 	// Files are named "seg-<counter>.d<dictid>.dat": the counter is a per-shard
 	// monotonic sequence (independent of the logical segment id, which is the array
@@ -304,6 +313,13 @@ func Open(opts Options) (*Collection, error) {
 		sh.segDir = shardDir
 		sh.alloc = func(id uint32, size int, codec Codec) (*segment, error) {
 			return sh.allocNamed(id, size, codec, "seg")
+		}
+	}
+	// Never reissue a seq the previous process issued, even if its record is gone from disk
+	// (Truncate, or a shard emptied by Rotate): a resumed cursor would skip the new record.
+	for i, hw := range watchHW {
+		if sh := c.shards[i]; hw > sh.commitSeq {
+			sh.commitSeq = hw
 		}
 	}
 	// Recovery is complete: every live segment's codec is known, so dictionaries only
@@ -795,8 +811,16 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 // after Close.
 func (c *Collection) Close() error {
 	var firstErr error
+	// watchSeqs is each shard's commitSeq for the watch-epoch marker; watchClean is cleared by
+	// anything that leaves doubt about what reached disk (see watchepoch.go).
+	watchSeqs := make([]uint64, len(c.shards))
+	watchClean := c.watchEpochDir != ""
 	for i, sh := range c.shards {
 		sh.mu.Lock()
+		watchSeqs[i] = sh.commitSeq
+		if sh.writeErr != nil || sh.syncErr.Load() != nil {
+			watchClean = false
+		}
 		// Flush every segment durable BEFORE writing the directory snapshot, so the
 		// snapshot never references bytes not yet on disk.
 		for _, seg := range sh.segs {
@@ -838,6 +862,10 @@ func (c *Collection) Close() error {
 			}
 		}
 		sh.mu.Unlock()
+	}
+	// Only now, with every segment flushed, may the epoch be vouched for across a restart.
+	if watchClean && firstErr == nil {
+		c.persistWatchEpoch(watchSeqs)
 	}
 	// Release the shared columnar-block cache once. Every columnarized segment AND the schema scan
 	// share this one cache, so it is closed here rather than per-segment or per-schemaScan (closing
