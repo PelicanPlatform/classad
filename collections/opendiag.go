@@ -34,6 +34,14 @@ type OpenIndexDiag struct {
 	StrandedSealedDeltas int
 	StrandedSealedKeys   [][]byte
 
+	// IgnoredFiles names files in a shard directory that recovery did not load because
+	// their names do not parse as "seg-<n>.d<dict>.dat". Recovery skips them in silence,
+	// which is how a mangled segment name becomes invisible -- and an invisible segment's
+	// dictionary looks unreferenced, so pruning retires it. The data is still there and
+	// still recoverable, but nothing says so. Non-empty means someone should look; see
+	// Fsck, which reports the same files with the reason spelled out.
+	IgnoredFiles []string
+
 	// Timing breaks a persistent Open into its phases so a slow reopen names the phase that
 	// dominated, instead of surfacing only as one elapsed number. Durations accumulate across the
 	// collection's shards; all zero for an in-memory Open. See OpenTiming. Purely observational.
@@ -92,3 +100,16 @@ const openStrandedSampleMax = 20
 // collapse. Bounded because the repair writes: an unbounded set would turn a pathological store's
 // open into an arbitrarily long write pass. What it does not finish, the next open picks up.
 const openStrandedRepairMax = 10000
+
+// openIgnoredSampleMax bounds IgnoredFiles: a directory that somehow filled with
+// unparseable names should produce a diagnostic, not an unbounded slice.
+const openIgnoredSampleMax = 32
+
+// ignoreFile records a file recovery skipped. Safe on a nil receiver so a collection
+// opened without diagnostics costs nothing.
+func (d *OpenIndexDiag) ignoreFile(path string) {
+	if d == nil || len(d.IgnoredFiles) >= openIgnoredSampleMax {
+		return
+	}
+	d.IgnoredFiles = append(d.IgnoredFiles, path)
+}

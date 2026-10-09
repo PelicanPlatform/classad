@@ -110,7 +110,7 @@ func (r *dictReg) prune(keep func(Codec) bool) []uint32 {
 	r.mu.Unlock()
 	for _, id := range removed {
 		if dir != "" {
-			_ = os.Remove(filepath.Join(dir, fmt.Sprintf("%d.zst", id)))
+			retireDictFile(dir, id)
 		}
 	}
 	return removed
@@ -137,6 +137,33 @@ func (r *dictReg) releaseEncodersExcept(keep Codec) {
 		if z, ok := c.(*zstdCodec); ok {
 			z.releaseEncoder()
 		}
+	}
+}
+
+// retireDictFile moves a no-longer-referenced dictionary into dicts/attic/ instead of
+// unlinking it.
+//
+// Pruning decides a dictionary is dead by asking which ones the LIVE segments name, and
+// a segment is live only if its file name parses as "seg-<n>.d<dict>.dat". A segment
+// whose name was mangled -- by a restore, a rename, a half-finished move -- is invisible
+// to that question, so its dictionary looks unreferenced and used to be deleted. The
+// segment's bytes were still perfectly good and its name still repairable, but without
+// the dictionary nothing could ever decode them again: a recoverable mistake became
+// permanent loss, silently, at the next clean open.
+//
+// The attic costs one dictionary-sized file per retrain (tens of KB) and makes that
+// unrecoverable. Deleting an attic file is an explicit operator decision; see Fsck,
+// which reports segments whose dictionary is missing.
+func retireDictFile(dir string, id uint32) {
+	name := fmt.Sprintf("%d.zst", id)
+	attic := filepath.Join(dir, "attic")
+	if err := os.MkdirAll(attic, 0o755); err != nil {
+		return // leave the dictionary in place rather than removing what we cannot keep
+	}
+	if err := os.Rename(filepath.Join(dir, name), filepath.Join(attic, name)); err != nil {
+		// A rename within one directory should not fail; if it did, the file is still
+		// there, which is the safe outcome. Never fall back to removing it.
+		return
 	}
 }
 
@@ -429,7 +456,13 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			if n > maxNum {
 				maxNum = n
 			}
+			continue
 		}
+		// A ".dat" that does not parse is a segment whose name was mangled. Recovery
+		// cannot load it (the dictionary it needs is named only here), but saying
+		// nothing is worse: the data is intact and the name repairable, while silence
+		// lets the next prune retire the dictionary that reads it.
+		c.openIdxDiag.ignoreFile(filepath.Join(shardDir, e.Name()))
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].num < files[j].num })
 
