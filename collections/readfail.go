@@ -17,6 +17,7 @@ const (
 	failSegGone                    // the location resolved, but its segment is no longer mapped
 	failReassemble                 // a stripped record whose segment's columnar payload is missing or damaged
 	failDecode                     // the bytes were fetched but would not decode
+	failRecordCRC                  // the record's own checksum did not match its bytes (see VerifyReads)
 
 	// A delta chain that could not be materialized, split by WHERE the walk gave up. These
 	// started as one reason, and production then reported 100% of its refusals under it --
@@ -49,6 +50,8 @@ func (r readFail) String() string {
 		return "reassemble"
 	case failDecode:
 		return "decode"
+	case failRecordCRC:
+		return "record-crc"
 	case failDeltaNoVersions:
 		return "delta-no-versions"
 	case failDeltaNoBase:

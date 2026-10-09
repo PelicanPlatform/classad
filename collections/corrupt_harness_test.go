@@ -141,9 +141,8 @@ func (s *corruptStore) survivors() (found []string, missing []string, wrong []st
 			missing = append(missing, k)
 			continue
 		}
-		want := int64(1790000000 + i)
-		if got, ok := ad.EvaluateAttrInt("QDate"); !ok || got != want {
-			wrong = append(wrong, fmt.Sprintf("%s(QDate=%d want %d)", k, got, want))
+		if diff := adDiff(ad, i); diff != "" {
+			wrong = append(wrong, fmt.Sprintf("%s(%s)", k, diff))
 			continue
 		}
 		found = append(found, k)
@@ -187,4 +186,43 @@ func TestHarnessBaselineIsClean(t *testing.T) {
 	if found != len(s.keys) || missing != 0 || wrong != 0 {
 		t.Fatalf("an undamaged store did not read back whole: %d/%d", found, len(s.keys))
 	}
+}
+
+// adDiff compares every attribute record i was written with, and returns a
+// description of the first that differs (or "" when the ad is exactly right).
+//
+// An earlier version of this checked QDate alone, which made the harness blind to
+// the failure that matters most: a bit flip inside an encoded ad changes some OTHER
+// attribute and is served as a plausible value, so the census read "0 WRONG" while
+// Owner had quietly become "urer3". A harness that can only see missing keys cannot
+// see the corruption it exists to find.
+func adDiff(ad *classad.ClassAd, i int) string {
+	if got, ok := ad.EvaluateAttrString("Owner"); !ok || got != fmt.Sprintf("user%d", i%7) {
+		return fmt.Sprintf("Owner=%q want %q", got, fmt.Sprintf("user%d", i%7))
+	}
+	if got, ok := ad.EvaluateAttrString("Cmd"); !ok || got != "/bin/sleep" {
+		return fmt.Sprintf("Cmd=%q want %q", got, "/bin/sleep")
+	}
+	if got, ok := ad.EvaluateAttrInt("RequestCpus"); !ok || got != int64(1+i%4) {
+		return fmt.Sprintf("RequestCpus=%d want %d", got, 1+i%4)
+	}
+	if got, ok := ad.EvaluateAttrInt("QDate"); !ok || got != int64(1790000000+i) {
+		return fmt.Sprintf("QDate=%d want %d", got, 1790000000+i)
+	}
+	return ""
+}
+
+// adBodyOffset returns the absolute file offset of the middle of record k's encoded
+// ad, for damaging the payload rather than the key.
+func adBodyOffset(t *testing.T, path string, recordIndex int) int {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	off := recordOffsets(t, path)[recordIndex]
+	kl := int(binary.LittleEndian.Uint32(b[off+recKeyLenOff:]) & keyLenMask)
+	adLenOff := off + recKeyOff + kl
+	adLen := int(binary.LittleEndian.Uint32(b[adLenOff:]))
+	return adLenOff + 4 + adLen/2
 }

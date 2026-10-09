@@ -242,6 +242,14 @@ func segStoredOrReassembled(c *Collection, seg *segment, off uint32) ([]byte, Co
 // caller that has to explain a failed read (encodePatchOnly) can say which condition it hit
 // rather than reporting every one of them as the same opaque "unreadable base".
 func segStoredOrReassembledWhy(c *Collection, seg *segment, off uint32) ([]byte, Codec, bool, readFail) {
+	// Every record carries a checksum over its own bytes, but nothing on the read path
+	// looks at it -- it is verified at recovery and at columnarization, and in between a
+	// bit flip inside an encoded ad comes back as a plausible wrong value. Checking here
+	// turns that into a miss. Off by default (Options.VerifyReads) because it is a CRC
+	// per point read on a hot path.
+	if c != nil && c.verifyReads && seg.persistent && !recVerifyCRC(seg.data, off) {
+		return nil, nil, false, failRecordCRC
+	}
 	if !(seg.columnarized() || seg.colDamaged.Load() || recIsStripped(seg.data, off)) {
 		return recAd(seg.data, off), seg.codec, true, failNone
 	}
