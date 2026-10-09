@@ -281,6 +281,17 @@ func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 	}
 	if changed {
 		sh.commitSeq = seq
+		// Journal the deletes under the same lock that advances commitSeq: a watcher that
+		// snapshots a commitSeq covering them must find them in the journal (see watchAs).
+		// They are journaled here rather than at publish, which runs after unlock and sync.
+		if sh.delLog != nil {
+			for _, w := range ws {
+				if w.ok && w.del {
+					sh.journalDeleteLocked(w.key, seq)
+				}
+			}
+		}
+		sh.trackPublishLocked(seq)
 		sh.maybeCheckpoint(seq)
 	}
 	sh.unlockWrite(acq, held)
@@ -289,9 +300,11 @@ func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 
 // publishTxn notifies the watch hub of a committed batch. It must run only after the batch
 // is durable (sh.sync has returned), so watchers never observe an event that a crash could
-// lose.
+// lose. The batch's deletes were already journaled by applyTxn.
 func (sh *shard) publishTxn(c *Collection, ws []*txnWrite, seq uint64) {
-	if sh.hub == nil {
+	pub := sh.beginPublish(seq)
+	defer pub.end()
+	if !pub.on {
 		return
 	}
 	for _, w := range ws {
@@ -299,10 +312,7 @@ func (sh *shard) publishTxn(c *Collection, ws []*txnWrite, seq uint64) {
 			continue
 		}
 		if w.del {
-			if sh.delLog != nil {
-				sh.delLog.record(w.key, seq)
-				sh.hub.publish(sh.idx, seq, w.key, nil, nil, true)
-			}
+			pub.add(w.key, nil, nil, true)
 		} else {
 			ad, codec := w.ad, w.codec
 			// Gated on deltaRead AND on somebody actually watching. Neither guard was here, and
@@ -323,7 +333,7 @@ func (sh *shard) publishTxn(c *Collection, ws []*txnWrite, seq uint64) {
 					ad, codec = merged, identityCodec{}
 				}
 			}
-			sh.hub.publish(sh.idx, seq, w.key, ad, codec, false)
+			pub.add(w.key, ad, codec, false)
 		}
 	}
 }

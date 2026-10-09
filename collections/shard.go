@@ -113,6 +113,7 @@ type shard struct {
 	idx    int
 	hub    *watchHub
 	delLog *deleteLog
+	pub    pubOrder // orders live cursors against out-of-order publishes (watch.go)
 
 	// Chained-parent child counting (see store.go). childParentHash, if set, maps a
 	// key to its parent's dir-hash and reports whether the key is a chained child;
@@ -227,9 +228,8 @@ func (sh *shard) dirGet(h uint64) loc {
 // must full-replay. Returns 0 when the shard holds no records (a fresh cursor is handled
 // separately). Reads the record directly rather than trusting seg.minSeq so it is correct
 // whether or not the time-travel pruning counters are maintained on the write path.
-func (sh *shard) appendFloor() uint64 {
-	sh.mu.RLock()
-	defer sh.mu.RUnlock()
+// Caller holds at least the read lock.
+func (sh *shard) appendFloorLocked() uint64 {
 	for _, seg := range sh.segs {
 		if seg == nil || seg.used == 0 {
 			continue
@@ -247,6 +247,15 @@ func (sh *shard) appendFloor() uint64 {
 		}
 	}
 	return 0
+}
+
+// appendCatchupView pins the windows a watch catch-up reads at sReg and returns them with
+// the append floor, both from one read-lock hold so a Rotate cannot fall between them.
+// The caller must releaseWindows(wins).
+func (sh *shard) appendCatchupView(sReg uint64) (wins []segWindow, floor uint64) {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	return sh.buildWindowsLocked(sReg), sh.appendFloorLocked()
 }
 
 // segAt returns the segment for a location's index, or nil if the index is out of range or
