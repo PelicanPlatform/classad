@@ -98,8 +98,12 @@ func randomEpoch() uint64 {
 // Deletes write no record, so their evidence would vanish; the journal retains the
 // most recent deletes so a resuming watcher can be told precisely which keys went
 // away. It holds between cap and 2*cap entries; older ones are trimmed and horizon
-// advances to the newest trimmed seq -- a cursor at or below horizon may have missed
+// advances to the newest trimmed seq -- a cursor below horizon may have missed
 // a trimmed delete and must fall back to a full replay.
+//
+// A delete is journaled under the shard write lock, in the same critical section that
+// advances commitSeq past it (see journalDeleteLocked), so the journal holds every
+// delete at or below any commitSeq a watcher can snapshot.
 
 type delEntry struct {
 	key []byte
@@ -128,23 +132,140 @@ func (d *deleteLog) record(key []byte, seq uint64) {
 	d.mu.Unlock()
 }
 
-// since returns the deletes with seq > cursor (a copy) and the current horizon.
-func (d *deleteLog) since(cursor uint64) []delEntry {
+// window returns the deletes with seq in (cursor, upTo] (a copy; the keys are never
+// mutated) and the horizon, read together: a cursor below the returned horizon may have
+// lost a trimmed delete, and checking the horizon separately from the read would let a
+// trim slip in between.
+func (d *deleteLog) window(cursor, upTo uint64) ([]delEntry, uint64) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	var out []delEntry
 	for _, e := range d.entries {
-		if e.seq > cursor {
+		if e.seq > cursor && e.seq <= upTo {
 			out = append(out, e)
 		}
 	}
-	return out
+	return out, d.horizon
 }
 
-func (d *deleteLog) horizonSeq() uint64 {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.horizon
+// journalDeleteLocked journals a delete committed at seq. Caller holds the shard write
+// lock and is about to (or just did) set commitSeq = seq in the same critical section.
+func (sh *shard) journalDeleteLocked(key []byte, seq uint64) {
+	if sh.delLog != nil {
+		sh.delLog.record(key, seq)
+	}
+}
+
+// --- publish ordering ---
+//
+// A commit advances commitSeq under the shard lock but publishes its events only after
+// unlocking and syncing, so two commits to one shard can reach the hub in either order,
+// and a batch's events reach it one at a time. A live event's cursor tells the client
+// "you have everything at or below this seq", so it may only name a seq once every
+// event at or below it has been handed to the watcher. pubOrder tracks which seqs are
+// still being published, and each event carries the highest seq that is safe to name
+// (rawEvent.through).
+//
+// Only commits made while a watcher is attached are tracked. A commit that saw no
+// watcher (hub.active false under the shard write lock) is at or below the S_reg of
+// every watcher that registers later -- registration sets active before snapshotting
+// commitSeq under the shard lock -- so every watcher covers it in catch-up and drops
+// its live event, and it can never hold a cursor back.
+
+type pubOrder struct {
+	n       atomic.Int32 // len(pending), for publish's no-watcher fast path
+	mu      sync.Mutex
+	pending []uint64 // tracked seqs not yet fully published, ascending
+	done    uint64   // highest seq fully published
+}
+
+// throughLocked is the highest seq whose events have all been handed to the hub (or
+// need not be: untracked, or a seq that published nothing). Caller holds o.mu.
+func (o *pubOrder) throughLocked() uint64 {
+	if len(o.pending) > 0 {
+		return o.pending[0] - 1
+	}
+	return o.done
+}
+
+// trackPublishLocked registers a commit at seq that will publish. Caller holds the
+// shard write lock, in the critical section that sets commitSeq = seq.
+func (sh *shard) trackPublishLocked(seq uint64) {
+	if sh.hub == nil || !sh.hub.active.Load() {
+		return
+	}
+	o := &sh.pub
+	o.mu.Lock()
+	o.pending = append(o.pending, seq) // seqs are issued in order under the shard lock
+	o.n.Add(1)
+	o.mu.Unlock()
+}
+
+// A tracked seq that never retired would hold every later cursor back (resumes then
+// over-deliver; nothing is lost), so every commit that tracks a seq must publish it:
+// applyOne/applyWrites/applyBatch, Delete, and Txn.Commit/commitTxn via publishTxn.
+
+// seqPublisher hands one commit's events to the watch hub. It holds back the last
+// event so that event can be sent in the same critical section that retires the seq:
+// only then may its cursor name the seq itself.
+type seqPublisher struct {
+	sh   *shard
+	seq  uint64
+	on   bool
+	has  bool
+	held rawEvent
+}
+
+// beginPublish starts publishing the events committed at seq. Must run after the
+// commit's durability sync (watchers never see an event a crash could lose), and every
+// beginPublish must be paired with end.
+func (sh *shard) beginPublish(seq uint64) seqPublisher {
+	on := sh.hub != nil && (sh.hub.active.Load() || sh.pub.n.Load() > 0)
+	return seqPublisher{sh: sh, seq: seq, on: on}
+}
+
+// add queues one event of this commit. key, ad must stay valid until end.
+func (p *seqPublisher) add(key, ad []byte, codec Codec, deleted bool) {
+	if !p.on {
+		return
+	}
+	if p.has {
+		// Not the last event: its seq is still pending, so through stays below it.
+		o := &p.sh.pub
+		o.mu.Lock()
+		p.held.through = o.throughLocked()
+		o.mu.Unlock()
+		p.sh.hub.send(p.held)
+	}
+	p.held = rawEvent{shard: p.sh.idx, seq: p.seq, key: key, ad: ad, codec: codec, deleted: deleted}
+	p.has = true
+}
+
+// end sends the last event and retires the seq, atomically with respect to every other
+// publisher of the shard: none can compute a through at or above this seq until this
+// commit's last event is in every watcher's buffer.
+func (p *seqPublisher) end() {
+	if !p.on {
+		return
+	}
+	o := &p.sh.pub
+	o.mu.Lock()
+	for i, s := range o.pending {
+		if s == p.seq {
+			o.pending = append(o.pending[:i], o.pending[i+1:]...)
+			o.n.Add(-1)
+			break
+		}
+	}
+	if p.seq > o.done {
+		o.done = p.seq
+	}
+	if p.has {
+		p.held.through = o.throughLocked()
+		p.sh.hub.send(p.held)
+	}
+	o.mu.Unlock()
+	p.has, p.held = false, rawEvent{}
 }
 
 // --- live subscription hub ---
@@ -162,6 +283,10 @@ type rawEvent struct {
 	ad      []byte // nil for a delete
 	codec   Codec
 	deleted bool
+	// through is the highest seq of this shard whose events had all been handed to the
+	// hub when this one was (see pubOrder): the furthest a cursor can safely point once
+	// the watcher has received this event.
+	through uint64
 }
 
 type watcher struct {
@@ -200,10 +325,10 @@ func (h *watchHub) deregister(w *watcher) {
 	h.mu.Unlock()
 }
 
-// publish fans one committed change out to every active watcher, non-blocking: a
+// send fans one committed change out to every active watcher, non-blocking: a
 // watcher whose buffer is full is marked lagged (it will be told to resync) rather
-// than stalling the commit path.
-func (h *watchHub) publish(shard int, seq uint64, key, ad []byte, codec Codec, deleted bool) {
+// than stalling the commit path. Callers go through seqPublisher.
+func (h *watchHub) send(ev rawEvent) {
 	if !h.active.Load() {
 		return
 	}
@@ -212,7 +337,7 @@ func (h *watchHub) publish(shard int, seq uint64, key, ad []byte, codec Codec, d
 		h.mu.Unlock()
 		return
 	}
-	ev := rawEvent{shard, seq, append([]byte(nil), key...), ad, codec, deleted}
+	ev.key = append([]byte(nil), ev.key...)
 	for w := range h.watchers {
 		select {
 		case w.ch <- ev:
@@ -271,59 +396,29 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 		epoch, seqs, ok := decodeCursor(cursor)
 		full := !ok || epoch != c.hub.epoch || len(seqs) != len(c.shards)
 
-		// Snapshot each shard's commit sequence: the upper bound of catch-up. The
-		// watcher is already registered, so any commit past this point is buffered.
+		// Snapshot each shard's commit sequence: S_reg, the upper bound of catch-up. The
+		// watcher is already registered, so every commit past S_reg reaches it live.
+		//
+		// Invariant: every event with seq in (cursor, S_reg] is delivered exactly once, in
+		// catch-up; every event with seq > S_reg exactly once, live. Everything catch-up
+		// reads -- records and the delete journal -- is written under the shard write lock
+		// in the same critical section that advances commitSeq, so it is complete through
+		// S_reg the moment S_reg is read; catch-up reads only seq <= S_reg; and the live
+		// phase drops seq <= S_reg. Publishing runs after unlock and sync, so the live
+		// buffer may hold events at or below S_reg -- those are exactly the ones dropped.
 		sReg := make([]uint64, len(c.shards))
 		for i, sh := range c.shards {
 			sh.mu.RLock()
 			sReg[i] = sh.commitSeq
 			sh.mu.RUnlock()
 		}
-		// A cursor ahead of the head was not issued by this store's log as it stands (e.g. an
-		// older copy of a persistent store reopened under the same epoch): its seqs may later
-		// be reassigned to records it never saw, so it cannot be resumed -> full replay.
-		// Retention: if a shard's cursor predates its delete horizon, a delete may have
-		// been trimmed -> full replay.
-		if !full {
-			for i, sh := range c.shards {
-				if seqs[i] > sReg[i] || seqs[i] < sh.delLog.horizonSeq() {
-					full = true
-					break
-				}
-			}
-		}
-		// Append-only rotation gap: a cursor pointing below the oldest still-retained
-		// record (its segment was rotated out) has missed history -> full replay from the
-		// current floor. Append logs keep no delete journal, so this is their reset trigger.
-		if !full && c.appendOnly() {
-			for i, sh := range c.shards {
-				if seqs[i] < sh.appendFloor() {
-					full = true
-					break
-				}
-			}
+		if watchSnapshotHook != nil {
+			watchSnapshotHook(c)
 		}
 
-		if full {
-			if !yield(WatchEvent{Kind: WatchReset}) {
-				return
-			}
-			for i := range c.shards {
-				if !c.catchupUpserts(i, 0, sReg[i], yield, redact) {
-					return
-				}
-			}
-		} else {
-			for i := range c.shards {
-				// Deletes before upserts: a key deleted then re-added since the cursor
-				// must end present (Delete then Upsert), not absent.
-				if !c.catchupDeletes(i, seqs[i], yield) {
-					return
-				}
-				if !c.catchupUpserts(i, seqs[i], sReg[i], yield, redact) {
-					return
-				}
-			}
+		plan := c.planCatchup(seqs, sReg, full)
+		if !c.runCatchup(&plan, seqs, sReg, yield, redact) {
+			return
 		}
 		if !yield(WatchEvent{Kind: WatchSynced, Cursor: encodeCursor(c.hub.epoch, sReg)}) {
 			return
@@ -345,10 +440,16 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 			case <-ctx.Done():
 				return
 			case raw := <-w.ch:
+				if w.lagged.Load() {
+					// An event was dropped before this one was sent, and this one's
+					// through may cover it: never hand out that cursor.
+					yield(WatchEvent{Kind: WatchResync})
+					return
+				}
 				if raw.seq <= sReg[raw.shard] {
 					continue // already covered by catch-up
 				}
-				vec[raw.shard] = raw.seq
+				vec[raw.shard] = max(vec[raw.shard], raw.through)
 				if !raw.deleted && c.watchHidden(raw.key) {
 					// A structural (parent) change: fan out to its children if an
 					// inherited attribute changed; the parent itself is not emitted.
@@ -523,10 +624,18 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 				return
 			}
 		case raw := <-w.ch:
+			if w.lagged.Load() {
+				// Dropped event before this one; see the uncoalesced loop.
+				if !flush() {
+					return
+				}
+				yield(WatchEvent{Kind: WatchResync})
+				return
+			}
 			if raw.seq <= sReg[raw.shard] {
 				continue // already covered by catch-up
 			}
-			vec[raw.shard] = raw.seq
+			vec[raw.shard] = max(vec[raw.shard], raw.through)
 			if !raw.deleted && c.watchHidden(raw.key) {
 				// Structural parent change: coalesce its children's synthetic
 				// upserts (the parent itself is not emitted).
@@ -687,14 +796,116 @@ func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]s
 	return out
 }
 
+// catchupPlan is the input to one watcher's catch-up, captured right after S_reg so
+// each retention check is made against exactly what catch-up then reads.
+type catchupPlan struct {
+	full bool
+	dels [][]delEntry  // per shard: journaled deletes in (cursor, S_reg]; incremental only
+	wins [][]segWindow // per shard, append-only: windows pinned at S_reg; nil = snapshot on read
+}
+
+func (p *catchupPlan) release() {
+	for _, w := range p.wins {
+		releaseWindows(w)
+	}
+	p.wins = nil
+}
+
+func (p *catchupPlan) shardWins(i int) []segWindow {
+	if p.wins == nil {
+		return nil
+	}
+	return p.wins[i]
+}
+
+// planCatchup decides incremental vs. full replay for cursor seqs (full already set if
+// the cursor is unusable) and captures what catch-up will read.
+func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
+	p := catchupPlan{full: full}
+	// Append-only rotation gap: a cursor below the oldest still-retained record (its
+	// segment was rotated out) has missed history -> full replay from the current floor.
+	// Append logs keep no delete journal, so this is their reset trigger. The windows
+	// catch-up reads are pinned in the same lock hold that reads the floor; otherwise a
+	// Rotate between the check and the read drops records the check counted on. (An
+	// append-only collection has one shard, so pinning up front holds no more than
+	// catch-up itself would.)
+	if c.appendOnly() {
+		p.wins = make([][]segWindow, len(c.shards))
+		for i, sh := range c.shards {
+			var floor uint64
+			p.wins[i], floor = sh.appendCatchupView(sReg[i])
+			if !p.full && seqs[i] < floor {
+				p.full = true
+			}
+		}
+	}
+	if p.full {
+		return p
+	}
+	p.dels = make([][]delEntry, len(c.shards))
+	for i, sh := range c.shards {
+		// A cursor ahead of the head was not issued by this store's log as it stands (e.g.
+		// an older copy of a persistent store reopened under the same epoch): its seqs may
+		// later be reassigned to records it never saw, so it cannot be resumed.
+		if seqs[i] > sReg[i] {
+			p.full = true
+			break
+		}
+		// Retention: a cursor below the delete horizon may have missed a trimmed delete.
+		var horizon uint64
+		p.dels[i], horizon = sh.delLog.window(seqs[i], sReg[i])
+		if seqs[i] < horizon {
+			p.full = true
+			break
+		}
+	}
+	if p.full {
+		p.dels = nil
+	}
+	return p
+}
+
+// runCatchup emits the catch-up for plan: a Reset and every record visible at S_reg, or
+// per shard the deletes and then the upserts in (cursor, S_reg]. Returns false if the
+// consumer stopped. Releases the plan's pins either way.
+func (c *Collection) runCatchup(p *catchupPlan, seqs, sReg []uint64, yield func(WatchEvent) bool, redact bool) bool {
+	defer p.release()
+	if p.full {
+		if !yield(WatchEvent{Kind: WatchReset}) {
+			return false
+		}
+		for i := range c.shards {
+			if !c.catchupUpserts(i, 0, sReg[i], p.shardWins(i), yield, redact) {
+				return false
+			}
+		}
+		return true
+	}
+	for i := range c.shards {
+		// Deletes before upserts: a key deleted then re-added since the cursor must end
+		// present (Delete then Upsert), not absent.
+		if !c.catchupDeletes(p.dels[i], yield) {
+			return false
+		}
+		if !c.catchupUpserts(i, seqs[i], sReg[i], p.shardWins(i), yield, redact) {
+			return false
+		}
+	}
+	return true
+}
+
 // catchupUpserts emits an Upsert for every record visible at sReg whose seq is in
-// (cursor, sReg] -- the keys whose current version changed since the cursor.
-// catchupUpserts replays a shard's missed upserts; redact is the watcher's entitlement (see
-// WatchRedacted), threaded because this decodes ads itself.
-func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(WatchEvent) bool, redact bool) bool {
-	sh := c.shards[i]
-	_, wins := sh.snapshot()
-	defer releaseWindows(wins)
+// (cursor, sReg] -- the keys whose current version changed since the cursor. wins, if
+// non-nil, are windows already pinned at sReg (the caller releases them); otherwise
+// they are taken here. redact is the watcher's entitlement (see WatchRedacted),
+// threaded because this decodes ads itself.
+func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, wins []segWindow, yield func(WatchEvent) bool, redact bool) bool {
+	if wins == nil {
+		// Windows at sReg, not at the current head: a segment whose records were all
+		// superseded after sReg still holds versions catch-up must emit.
+		wins = c.shards[i].snapshotAt(sReg)
+		defer releaseWindows(wins)
+	}
 	var wbuf []byte
 	for _, wn := range wins {
 		for off := 0; off < wn.used; {
@@ -726,9 +937,9 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, yield func(Watch
 	return true
 }
 
-// catchupDeletes emits a Delete for each journaled delete with seq > cursor.
-func (c *Collection) catchupDeletes(i int, cursor uint64, yield func(WatchEvent) bool) bool {
-	for _, e := range c.shards[i].delLog.since(cursor) {
+// catchupDeletes emits a Delete for each journaled delete in dels.
+func (c *Collection) catchupDeletes(dels []delEntry, yield func(WatchEvent) bool) bool {
+	for _, e := range dels {
 		if c.watchHidden(e.key) {
 			continue // structural delete: hidden
 		}
@@ -751,3 +962,8 @@ func (h *watchHub) watching() bool {
 	h.mu.Unlock()
 	return n > 0
 }
+
+// watchSnapshotHook, when set (tests only), runs in Watch on c right after the watcher
+// has snapshotted S_reg and before catch-up reads anything, so a test can commit inside
+// that window deterministically.
+var watchSnapshotHook func(c *Collection)

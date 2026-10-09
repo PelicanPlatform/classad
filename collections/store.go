@@ -916,16 +916,19 @@ func (c *Collection) Delete(key []byte) bool {
 	ok, parentEmptied := sh.del(h, key, seq)
 	if ok {
 		sh.commitSeq = seq
+		// Journal under the same lock that advances commitSeq: a watcher that snapshots
+		// a commitSeq covering this delete must find it in the journal (see watchAs).
+		sh.journalDeleteLocked(key, seq)
+		sh.trackPublishLocked(seq)
 		sh.maybeCheckpoint(seq)
 	}
 	sh.unlockWrite(acq, held)
 	if ok {
 		c.removeOrdered(key)
 		sh.sync() // durability point for the tombstone (group-committed via syncFor)
-		if sh.delLog != nil {
-			sh.delLog.record(key, seq) // retain for resuming watchers
-			sh.hub.publish(sh.idx, seq, key, nil, nil, true)
-		}
+		pub := sh.beginPublish(seq)
+		pub.add(key, nil, nil, true)
+		pub.end()
 		// Auto-delete a structural parent whose last child just left (HTCondor
 		// ClusterCleanup): a structural ad exists only to be chained to, so once no
 		// child references it, remove it. sh.del maintained the live-child count and

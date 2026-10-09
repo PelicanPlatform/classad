@@ -95,20 +95,40 @@ Two phases, arranged so there is no gap between them.
    Reading `seq` is cheap and needs no decode, so old records (the vast majority for a
    recent cursor) are skipped without cost. Each survivor is decoded and emitted as a
    full ad.
-3. **Drain the live buffer**, then stream live. Events buffered during catch-up (all
-   at `seq > S_reg`) are flushed; any overlap with the catch-up tail is a harmless
-   duplicate (at-least-once). From here the watcher streams live commits.
+3. **Drain the live buffer**, then stream live. Events buffered during catch-up are
+   flushed, minus any at `seq <= S_reg` (a commit publishes after it unlocks and syncs,
+   so the buffer can hold events catch-up already covered). From here the watcher
+   streams live commits.
 
 The union of (catch-up `(cursor, S_reg]`) and (live `> S_reg`) covers everything
-`> cursor` with no gap — the correctness crux.
+`> cursor` with no gap and no overlap — the correctness crux: every event in
+`(cursor, S_reg]` is delivered exactly once, in catch-up, and every event `> S_reg`
+exactly once, live. It needs everything catch-up reads to be complete through `S_reg`
+the moment `S_reg` is read, so the records *and the delete journal* are written under
+the shard write lock in the same critical section that advances `commitSeq`, and
+catch-up reads the journal bounded by `S_reg` (together with its horizon, so a trim
+cannot slip between the retention check and the read). An archive's catch-up windows
+are likewise pinned in the same lock hold that reads its append floor.
+
+### Live cursors
+
+A live event's cursor promises that the client has every event at or below it. Two
+things make the naive "cursor = this event's seq" break that promise: a commit's
+events share one seq but reach the watcher one at a time, and two commits to one shard
+can publish in the opposite order to their seqs (each publishes after its own sync).
+So each shard tracks the seqs still being published, and an event's cursor advances
+only to the highest seq whose events have *all* been handed to the watcher — the last
+event of a commit is sent in the same critical section that retires its seq. Commits
+made while nobody watches are not tracked: they are at or below every later watcher's
+`S_reg`. A cursor can therefore lag (a resume re-delivers), but never runs ahead.
 
 ### Live notification
 
 Commits finalize under the shard lock in `applyOne`/`applyBatch` (`commit.go`), right
-where `commitSeq` is bumped. Add a hook there that, for each committed write, hands
-the watcher `{key, wireAd, codec, seq}` (deletes hand `{key, tombstone, seq}`). The
-watcher decodes to a full ad off the write path. This reuses the group-commit
-structure — one notification per coalesced batch.
+where `commitSeq` is bumped; after unlocking and the durability sync, each committed
+write is handed to the watcher as `{key, wireAd, codec, seq}` (deletes hand
+`{key, tombstone, seq}`). The watcher decodes to a full ad off the write path. This
+reuses the group-commit structure — one notification per coalesced batch.
 
 ## The hard part: deletes across compaction
 

@@ -123,14 +123,15 @@ func (sh *shard) applyWrites(writes []pendingPut) {
 		sh.put(writes[i].hash, writes[i].key, writes[i].ad, seq, writes[i].codec, 0)
 	}
 	sh.commitSeq = seq
+	sh.trackPublishLocked(seq)
 	sh.maybeCheckpoint(seq)
 	sh.unlockWrite(acq, held)
 	sh.syncFor(seq)
-	if sh.hub != nil {
-		for i := range writes {
-			sh.hub.publish(sh.idx, seq, writes[i].key, writes[i].ad, writes[i].codec, false)
-		}
+	pub := sh.beginPublish(seq)
+	for i := range writes {
+		pub.add(writes[i].key, writes[i].ad, writes[i].codec, false)
 	}
+	pub.end()
 }
 
 // applyOne commits a single write under the shard lock at a fresh commit
@@ -140,12 +141,13 @@ func (sh *shard) applyOne(p pendingPut) {
 	seq := sh.commitSeq + 1
 	sh.put(p.hash, p.key, p.ad, seq, p.codec, 0)
 	sh.commitSeq = seq
+	sh.trackPublishLocked(seq)
 	sh.maybeCheckpoint(seq)
 	sh.unlockWrite(acq, held)
 	sh.syncFor(seq)
-	if sh.hub != nil {
-		sh.hub.publish(sh.idx, seq, p.key, p.ad, p.codec, false)
-	}
+	pub := sh.beginPublish(seq)
+	pub.add(p.key, p.ad, p.codec, false)
+	pub.end()
 }
 
 // applyBatch commits a coalesced batch of requests under the shard lock at a
@@ -159,16 +161,17 @@ func (sh *shard) applyBatch(batch []*commitReq) {
 		}
 	}
 	sh.commitSeq = seq
+	sh.trackPublishLocked(seq)
 	sh.maybeCheckpoint(seq)
 	sh.unlockWrite(acq, held)
 	sh.syncFor(seq)
-	if sh.hub != nil {
-		for _, r := range batch {
-			for i := range r.writes {
-				sh.hub.publish(sh.idx, seq, r.writes[i].key, r.writes[i].ad, r.writes[i].codec, false)
-			}
+	pub := sh.beginPublish(seq)
+	for _, r := range batch {
+		for i := range r.writes {
+			pub.add(r.writes[i].key, r.writes[i].ad, r.writes[i].codec, false)
 		}
 	}
+	pub.end()
 }
 
 // sync is the durability point for callers that do not know their commit sequence:
