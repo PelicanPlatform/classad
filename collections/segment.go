@@ -33,7 +33,13 @@ var crcTable = crc32.MakeTable(crc32.Castagnoli)
 //	off+32  key             bytes   the full stable key (for exact match / collision resolution)
 //	        adLen           uint32  length of the (possibly codec-compressed) wire ad
 //	        ad              bytes   the encoded ad
+//	        crc32           uint32  CRC-32C over the immutable bytes (see recCRC)
 //	        padding         so totalLen is a multiple of 8
+//
+// The CRC is 4 bytes in the format but 0 or 8 on disk: records are 8-byte aligned, so
+// it either fits in padding that would have existed anyway or pushes the record to the
+// next boundary, depending on (36 + keyLen + adLen) mod 8. Across varied ad sizes that
+// averages about 4 bytes a record.
 const (
 	recSeqOff      = 0
 	recSupOff      = 8
