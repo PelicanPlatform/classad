@@ -195,10 +195,17 @@ type Options struct {
 	// for an ad-sized record -- and turns a corrupt record from something served as
 	// if it were real data into a miss, counted under the "record-crc" reason.
 	//
-	// It is off by default because it is not free and because corruption is rare;
-	// turn it on where serving a wrong answer is worse than serving none. It does
-	// NOT cover scans, which walk records directly; Fsck is what examines a whole
-	// store.
+	// It covers point reads AND the iterator path every scan and query goes through
+	// (wire/wireAt and adBytes, the two places the package already reassembles a
+	// partial record), so one switch governs both. A refused record is skipped, never
+	// half-served, and counted by VerifyReadSkips -- a shrunken answer has to be
+	// observable, since "fewer rows came back" is otherwise indistinguishable from
+	// "there were fewer rows".
+	//
+	// It costs about 17ns per record (a hardware CRC-32C over a 160-byte record),
+	// against roughly 760ns to decode one on a scan: a few percent either way. It is
+	// off by default so turning it on stays a deliberate choice; turn it on where
+	// serving a wrong answer is worse than serving none.
 	//
 	// Without it, a bit flip inside a sealed record's encoded ad is invisible: the
 	// record's own CRC would catch it, but nothing on the read path looks. The value
