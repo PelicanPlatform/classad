@@ -12,7 +12,7 @@ import (
 // reports how many ads came back right, wrong, or not at all.
 func (s *corruptStore) scanCensus(verify bool) (found, missing, wrong int) {
 	s.t.Helper()
-	c, err := Open(Options{Dir: s.dir, Shards: 1, SegmentSize: 1 << 14, VerifyReads: verify})
+	c, err := Open(Options{Dir: s.dir, Shards: 1, SegmentSize: 1 << 14, DisableReadVerification: !verify})
 	if err != nil {
 		s.t.Fatalf("open (VerifyReads=%v): %v", verify, err)
 	}
@@ -121,12 +121,12 @@ func BenchmarkScan(b *testing.B) {
 	verifyBenchStore(b, dir, n)
 
 	for _, verify := range []bool{false, true} {
-		name := "VerifyReads=false"
+		name := "verification off"
 		if verify {
-			name = "VerifyReads=true"
+			name = "verification on"
 		}
 		b.Run(name, func(b *testing.B) {
-			c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20, VerifyReads: verify})
+			c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20, DisableReadVerification: !verify})
 			if err != nil {
 				b.Fatal(err)
 			}

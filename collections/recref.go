@@ -18,13 +18,13 @@ import (
 // it makes the columnar case impossible to forget: there is no way to get bytes out of a recRef
 // without going through a function that knows about it.
 
-// errRecordCRC is returned when VerifyReads is on and a record's stored checksum does
+// errRecordCRC is returned when read verification is on and a record's stored checksum does
 // not match its bytes. Callers of wire/wireAt already skip a record they cannot
 // complete rather than serve half an ad; a record that fails its own checksum is the
 // same decision for the same reason.
 var errRecordCRC = errors.New("collections: record failed its checksum")
 
-// verifyReadSkips counts records VerifyReads refused. A skipped record silently
+// verifyReadSkips counts records read verification refused. A skipped record silently
 // shrinks a query's answer, so this has to be observable: "the query returned fewer
 // rows" is not something a caller can otherwise distinguish from "there were fewer
 // rows".
@@ -32,7 +32,7 @@ var verifyReadSkips atomic.Int64
 
 // VerifyReadSkips reports how many records have been refused because their checksum did
 // not match, across every collection in this process. It is zero unless some collection
-// was opened with VerifyReads.
+// was opened with DisableReadVerification.
 //
 // Non-zero means reads are quietly incomplete, and fsck is what says where.
 func VerifyReadSkips() int64 { return verifyReadSkips.Load() }
@@ -289,8 +289,7 @@ func segStoredOrReassembledWhy(c *Collection, seg *segment, off uint32) ([]byte,
 	// Every record carries a checksum over its own bytes, but nothing on the read path
 	// looks at it -- it is verified at recovery and at columnarization, and in between a
 	// bit flip inside an encoded ad comes back as a plausible wrong value. Checking here
-	// turns that into a miss. Off by default (Options.VerifyReads) because it is a CRC
-	// per point read on a hot path.
+	// turns that into a miss. On by default; see Options.DisableReadVerification.
 	if c != nil && c.verifyReads && seg.persistent && !recVerifyCRC(seg.data, off) {
 		return nil, nil, false, failRecordCRC
 	}

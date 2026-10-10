@@ -11,7 +11,7 @@ import (
 // key reads back as.
 func (s *corruptStore) censusWith(verify bool) (found, missing, wrong int) {
 	s.t.Helper()
-	c, err := Open(Options{Dir: s.dir, Shards: 1, SegmentSize: 1 << 14, VerifyReads: verify})
+	c, err := Open(Options{Dir: s.dir, Shards: 1, SegmentSize: 1 << 14, DisableReadVerification: !verify})
 	if err != nil {
 		s.t.Fatalf("open (VerifyReads=%v): %v", verify, err)
 	}
@@ -78,13 +78,13 @@ func TestVerifyReadsCostsNothingWhenClean(t *testing.T) {
 // decision with a number behind it rather than a guess.
 func BenchmarkGet(b *testing.B) {
 	for _, verify := range []bool{false, true} {
-		name := "VerifyReads=false"
+		name := "verification off"
 		if verify {
-			name = "VerifyReads=true"
+			name = "verification on"
 		}
 		b.Run(name, func(b *testing.B) {
 			dir := b.TempDir()
-			c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20, VerifyReads: verify})
+			c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20, DisableReadVerification: !verify})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -103,7 +103,7 @@ func BenchmarkGet(b *testing.B) {
 			}
 			c.Close()
 
-			c2, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20, VerifyReads: verify})
+			c2, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 20, DisableReadVerification: !verify})
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -115,5 +115,69 @@ func BenchmarkGet(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+// TestReadVerificationIsOnByDefault pins the default itself. The whole point of the
+// inverted option name is that the safe setting is the one you get without asking for
+// it, so a future refactor that quietly restores the zero value to "off" has to fail
+// here rather than in production.
+func TestReadVerificationIsOnByDefault(t *testing.T) {
+	s := buildCorruptStore(t, 400)
+	seg := s.segments()[0]
+	flipBit(t, seg, adBodyOffset(t, seg, len(recordOffsets(t, seg))/2))
+
+	// Open with NOTHING asked for beyond the directory.
+	c, err := Open(Options{Dir: s.dir, Shards: 1, SegmentSize: 1 << 14})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.verifyReads {
+		t.Fatal("a persistent collection opened with default options is not verifying reads")
+	}
+	var wrong, missing int
+	for i, k := range s.keys {
+		ad, ok := c.Get([]byte(k))
+		if !ok {
+			missing++
+			continue
+		}
+		if adDiff(ad, i) != "" {
+			wrong++
+		}
+	}
+	c.Close()
+	if wrong != 0 {
+		t.Errorf("default options served %d corrupt ad(s)", wrong)
+	}
+	if missing != 1 {
+		t.Errorf("want the one corrupt record to be a miss, got %d missing", missing)
+	}
+}
+
+// TestDisableReadVerificationStillWorks: the escape hatch has to actually disable it,
+// or a read-bound deployment has no way out.
+func TestDisableReadVerificationStillWorks(t *testing.T) {
+	s := buildCorruptStore(t, 400)
+	c, err := Open(Options{Dir: s.dir, Shards: 1, SegmentSize: 1 << 14, DisableReadVerification: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if c.verifyReads {
+		t.Error("DisableReadVerification did not disable verification")
+	}
+}
+
+// TestInMemoryNeverVerifies: an in-memory arena cannot have been corrupted on disk, so
+// it must not pay for a check that cannot find anything.
+func TestInMemoryNeverVerifies(t *testing.T) {
+	c, err := Open(Options{Shards: 1, SegmentSize: 1 << 14})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if c.verifyReads {
+		t.Error("an in-memory collection is verifying reads it cannot usefully verify")
 	}
 }

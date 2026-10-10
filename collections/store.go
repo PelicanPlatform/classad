@@ -189,29 +189,28 @@ type Options struct {
 	// so a negotiator can iterate a partition in order (and resume) without
 	// re-sorting each cycle. A malformed expression in a spec panics New. Optional.
 	Ordered []OrderSpec
-	// VerifyReads checks a record's stored checksum before its bytes are used, on
-	// every point read (Get, a transactional read, a delta chain participant). It
-	// costs one CRC-32C over the record -- hardware-accelerated, a few nanoseconds
-	// for an ad-sized record -- and turns a corrupt record from something served as
-	// if it were real data into a miss, counted under the "record-crc" reason.
+	// DisableReadVerification turns OFF the check that a record's stored checksum
+	// matches its bytes before they are used.
 	//
-	// It covers point reads AND the iterator path every scan and query goes through
+	// Verification is ON by default, which is why this option is phrased as a
+	// negative: Go's zero value is false, and the safe setting is the one you get
+	// without thinking about it. Without the check, a bit flip inside a sealed
+	// record's encoded ad is served as a plausible value -- Owner "urer3" where
+	// "user3" was written -- with no error anywhere, because the checksum that would
+	// catch it was only ever read at recovery.
+	//
+	// It covers point reads and the iterator path every scan and query goes through
 	// (wire/wireAt and adBytes, the two places the package already reassembles a
 	// partial record), so one switch governs both. A refused record is skipped, never
 	// half-served, and counted by VerifyReadSkips -- a shrunken answer has to be
 	// observable, since "fewer rows came back" is otherwise indistinguishable from
 	// "there were fewer rows".
 	//
-	// It costs about 17ns per record (a hardware CRC-32C over a 160-byte record),
-	// against roughly 760ns to decode one on a scan: a few percent either way. It is
-	// off by default so turning it on stays a deliberate choice; turn it on where
-	// serving a wrong answer is worse than serving none.
-	//
-	// Without it, a bit flip inside a sealed record's encoded ad is invisible: the
-	// record's own CRC would catch it, but nothing on the read path looks. The value
-	// comes back subtly wrong -- Owner "urer3" where "user3" was written -- with no
-	// error anywhere.
-	VerifyReads bool
+	// The cost is about 17ns a record: a hardware CRC-32C over a 160-byte record,
+	// against roughly 760ns to decode one on a scan. It adds NO storage -- the
+	// checksum has always been written. Turn this on only for a read-bound workload
+	// that has measured the difference and prefers a wrong answer to a slow one.
+	DisableReadVerification bool
 
 	// Dir, if set, makes the collection persistent: arenas are memory-mapped files
 	// under this directory and committed writes are flushed to disk (see Open).
@@ -435,7 +434,8 @@ type Collection struct {
 	// internAtSeal interns each append-only segment as soon as it seals (see
 	// Options.InternAtSeal), via InternSealed from the Archive.Append eager-seal hook.
 	internAtSeal bool
-	// verifyReads checks each record's CRC before its bytes are used; see Options.VerifyReads.
+	// verifyReads checks each record's CRC before its bytes are used; see
+	// Options.DisableReadVerification. On by default for a persistent collection.
 	verifyReads bool
 
 	// reverseScan yields records newest-first (see Options.ReverseScan). Forces
@@ -828,7 +828,9 @@ func New(opts Options) *Collection {
 	// Reads are only worth verifying against a persistent segment: an in-memory
 	// arena cannot have been corrupted on disk, and its records carry the same CRC
 	// only incidentally.
-	c.verifyReads = opts.VerifyReads && opts.Dir != ""
+	// On unless explicitly disabled, and only for a persistent collection: an
+	// in-memory arena cannot have been corrupted on disk.
+	c.verifyReads = !opts.DisableReadVerification && opts.Dir != ""
 	c.indexBackfillBytes = opts.IndexBackfillBytes
 	c.ret = opts.Retention
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
