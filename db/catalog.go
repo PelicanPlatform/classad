@@ -31,6 +31,8 @@ type Catalog struct {
 	// at startup as well as on demand -- gets the same delta-record setting. See CatalogConfig.
 	deltaMax    int
 	deltaMaxFor map[string]int
+	// disableReadVerify is CatalogConfig.DisableReadVerification, applied to every table.
+	disableReadVerify bool
 
 	// onSealMigration and sealWorkers are carried from CatalogConfig so every table opened through this
 	// catalog reports its one-off migration, named (see CatalogConfig.OnSealMigration).
@@ -89,6 +91,12 @@ type CatalogConfig struct {
 	// DeltaMaxOff stops NEW deltas and leaves the old ones readable.
 	DeltaMax    int
 	DeltaMaxFor map[string]int
+
+	// DisableReadVerification turns off the per-record checksum check on reads for
+	// EVERY table in this catalog. See Config.DisableReadVerification; this is the
+	// catalog-wide form, because an operator reaching for it is reacting to a
+	// whole-database read cost, not to one table.
+	DisableReadVerification bool
 	// PoolKeys enables encryption at rest for every table (each table's master key is
 	// wrapped under these keys). EncryptedAttrs is the default explicit encrypted-attr
 	// set for each table (private attributes are always encrypted). See db/encrypt.go.
@@ -183,10 +191,11 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		exporters:        map[string]ExporterDef{},
 		memExporterState: map[string][]byte{},
 		poolKeys:         cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs,
-		onSealMigration: cfg.OnSealMigration,
-		sealWorkers:     cfg.SealMigrationWorkers,
-		deltaMax:        cfg.DeltaMax,
-		deltaMaxFor:     cfg.DeltaMaxFor,
+		disableReadVerify: cfg.DisableReadVerification,
+		onSealMigration:   cfg.OnSealMigration,
+		sealWorkers:       cfg.SealMigrationWorkers,
+		deltaMax:          cfg.DeltaMax,
+		deltaMaxFor:       cfg.DeltaMaxFor,
 	}
 	if cfg.Dir == "" {
 		return cat, nil
@@ -264,11 +273,12 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 // tableConfig builds a per-table Config carrying the catalog-wide encryption settings.
 func (cat *Catalog) tableConfig(dir string) Config {
 	cfg := Config{
-		Dir:                  dir,
-		PoolKeys:             cat.poolKeys,
-		EncryptedAttrs:       cat.encAttrs,
-		SealMigrationWorkers: cat.sealWorkers,
-		DeltaMax:             cat.deltaMaxForDir(dir),
+		Dir:                     dir,
+		DisableReadVerification: cat.disableReadVerify,
+		PoolKeys:                cat.poolKeys,
+		EncryptedAttrs:          cat.encAttrs,
+		SealMigrationWorkers:    cat.sealWorkers,
+		DeltaMax:                cat.deltaMaxForDir(dir),
 	}
 	if cat.onSealMigration != nil {
 		// Name the table the count belongs to: the per-table hook cannot know it, and the catalog can.
