@@ -177,7 +177,7 @@ func Fsck(dir string) (*FsckReport, error) {
 	}
 	missing := map[uint32]bool{}
 	for _, e := range entries {
-		if !e.IsDir() || e.Name() == "dicts" {
+		if !e.IsDir() || e.Name() == "dicts" || e.Name() == quarantineDir {
 			continue
 		}
 		shardDir := filepath.Join(dir, e.Name())
@@ -315,6 +315,21 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 		off = fsckResync(s, data, off)
 		if off < 0 {
 			break
+		}
+	}
+
+	// Damage with nothing but zeroes after it is the LAST written record, which is
+	// what an interrupted write leaves behind: the record never committed, and Open
+	// already does the right thing by stopping there.
+	//
+	// A genuinely corrupt last record is indistinguishable from a torn one -- both are
+	// a bad record followed by unwritten space -- so this treats the ambiguous case as
+	// the benign one. The cost of being wrong is one uncommitted record; the cost of
+	// the other choice is rewriting the active segment on every run forever.
+	if n := len(s.Damage); n > 0 {
+		last := &s.Damage[n-1]
+		if end := last.Offset + last.Length; end <= len(data) && allZero(data[end:]) {
+			last.Trailing = true
 		}
 	}
 	return s, nil
