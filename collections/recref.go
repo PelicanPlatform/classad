@@ -1,5 +1,10 @@
 package collections
 
+import (
+	"errors"
+	"sync/atomic"
+)
+
 // LOCATING A RECORD, RATHER THAN HANDING OUT ITS BYTES.
 //
 // The visible-record iterators historically passed a callback the record's compressed ad, its
@@ -12,6 +17,39 @@ package collections
 // asks for it. That keeps the reconciliation in one place instead of at every decompress site, and
 // it makes the columnar case impossible to forget: there is no way to get bytes out of a recRef
 // without going through a function that knows about it.
+
+// errRecordCRC is returned when read verification is on and a record's stored checksum does
+// not match its bytes. Callers of wire/wireAt already skip a record they cannot
+// complete rather than serve half an ad; a record that fails its own checksum is the
+// same decision for the same reason.
+var errRecordCRC = errors.New("collections: record failed its checksum")
+
+// verifyReadSkips counts records read verification refused. A skipped record silently
+// shrinks a query's answer, so this has to be observable: "the query returned fewer
+// rows" is not something a caller can otherwise distinguish from "there were fewer
+// rows".
+var verifyReadSkips atomic.Int64
+
+// VerifyReadSkips reports how many records have been refused because their checksum did
+// not match, across every collection in this process. It is zero unless some collection
+// was opened with DisableReadVerification.
+//
+// Non-zero means reads are quietly incomplete, and fsck is what says where.
+func VerifyReadSkips() int64 { return verifyReadSkips.Load() }
+
+// recordFailsCRC reports whether verification is on and this record does not verify.
+// It is the one place the condition is written, so the iterator paths and the point-read
+// path cannot drift apart on what "verified" means.
+func (c *Collection) recordFailsCRC(seg *segment, data []byte, off uint32) bool {
+	if c == nil || !c.verifyReads || seg == nil || !seg.persistent {
+		return false
+	}
+	if recVerifyCRC(data, off) {
+		return false
+	}
+	verifyReadSkips.Add(1)
+	return true
+}
 
 // recRef locates one visible record inside a frozen window.
 //
@@ -52,6 +90,9 @@ func (c *Collection) wire(r recRef, buf []byte) ([]byte, error) {
 // teaching readers one at a time is how roughly ten of them ended up serving fragments.
 // Callers that genuinely have no snapshot pass seqMax and get the current version.
 func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
+	if c.recordFailsCRC(r.w.seg, r.w.data, r.off) {
+		return nil, errRecordCRC
+	}
 	var raw []byte
 	var err error
 	if seg := r.w.seg; seg != nil && (seg.columnarized() || seg.colDamaged.Load() || recIsStripped(r.w.data, r.off)) {
@@ -167,6 +208,9 @@ func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 // already the contract for the compressed case (the window's mapping outlives neither).
 func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Codec, bool) {
 	seg := r.w.seg
+	if c.recordFailsCRC(seg, r.w.data, r.off) {
+		return nil, nil, false
+	}
 	stored, codec := r.stored(), r.w.codec
 	if seg != nil && (seg.columnarized() || seg.colDamaged.Load() || recIsStripped(r.w.data, r.off)) {
 		full, err := c.recordWireIn(seg, r.w.data, r.off, *scratch)
@@ -245,8 +289,7 @@ func segStoredOrReassembledWhy(c *Collection, seg *segment, off uint32) ([]byte,
 	// Every record carries a checksum over its own bytes, but nothing on the read path
 	// looks at it -- it is verified at recovery and at columnarization, and in between a
 	// bit flip inside an encoded ad comes back as a plausible wrong value. Checking here
-	// turns that into a miss. Off by default (Options.VerifyReads) because it is a CRC
-	// per point read on a hot path.
+	// turns that into a miss. On by default; see Options.DisableReadVerification.
 	if c != nil && c.verifyReads && seg.persistent && !recVerifyCRC(seg.data, off) {
 		return nil, nil, false, failRecordCRC
 	}
