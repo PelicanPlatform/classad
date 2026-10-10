@@ -130,6 +130,44 @@ write is handed to the watcher as `{key, wireAd, codec, seq}` (deletes hand
 `{key, tombstone, seq}`). The watcher decodes to a full ad off the write path. This
 reuses the group-commit structure — one notification per coalesced batch.
 
+## Truncate
+
+`Truncate` (a DB restore's first half, the admin `truncate` action, an archive's
+from-scratch re-sync, a view rebuild) removes every row at once. It cannot be conveyed as
+per-key deletes: journaling one per row would be as costly as the rows themselves, and
+once they are gone their keys are not even enumerable. So every watcher that could miss
+it gets a **Reset** instead. Per shard, in the one critical section that commits the
+truncate at seq `T` (`truncate.go`):
+
+1. **The resume floor moves to `T`** -- the delete journal's horizon on a mutable shard
+   (its entries are dropped), the append floor on an append-only one. A cursor below `T`
+   was issued before the truncate, so it is too old to resume: `Reset` and a full snapshot
+   of what exists now. A cursor at or past `T` resumes normally (no spurious Reset), and
+   deletes after `T` are journaled and replayed precisely as before.
+2. **Every attached watcher is kicked**: marked lagged, as if its buffer had overflowed,
+   and woken in case it is idle. It ends its stream with `WatchResync`; the client
+   reconnects with its last cursor, which predates `T`, and so gets the Reset. Because the
+   kick happens before the shard lock is released, no commit after `T` can publish to a
+   watcher that has not been kicked, so no live cursor advances past `T` on a watcher that
+   never saw the truncate. A watcher that registers after the kick snapshots `S_reg >= T`
+   for that shard and needs no kick. Shards are truncated one at a time, so a client that
+   reconnects between two shards' kicks is kicked again: an extra round trip, never a
+   missed truncate.
+
+`T` carries no events and is not tracked for publication, so it never holds a later
+cursor back. A watcher kicked mid-catch-up may already have handed out a `Synced` cursor
+below `T`; that cursor Resets on resume like any other.
+
+Persistent append-only collections do not persist the append floor; `Open` rebuilds it
+from the oldest retained record, or the shard's `commitSeq` (after the high-water mark is
+applied) when nothing is retained. A cursor from before a truncate therefore still Resets
+after a clean restart. This is conservative by one: a cursor taken right after a truncate
+whose shard was then written to before `Close` also Resets after the restart.
+
+Truncate is serialized with writers by its callers (the db layer holds its DB-wide lock;
+an archive's single appender is the caller's to serialize); the hub interaction itself
+needs no such help.
+
 ## The hard part: deletes across compaction
 
 A delete writes **no new record**; it only stamps `supersededBySeq` on the old record.
@@ -183,9 +221,9 @@ func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent
   crash it Resets. No delete journal.
 - **Events**: only `WatchUpsert` (an appended ad; `Key` is nil, `Ad` is the payload),
   plus `WatchSynced`/`WatchResync`. `WatchReset` here means a **history gap** — the
-  cursor is older than what rotation still retains (or from a different archive), so
-  the replay restarts from the current floor; a log consumer notes it may have missed
-  entries (there is no current state to rebuild).
+  cursor is older than what rotation still retains, predates a `Truncate`, or is from a
+  different archive, so the replay restarts from the current floor; a log consumer notes
+  it may have missed entries, and a mirror of the archive rebuilds from the replay.
 - **Catch-up** replays every retained record after the cursor, oldest-first; **live**
   streams new appends. `Append` publishes under its lock so live events are strictly
   in log order. Always available (no option); zero cost when no one is watching.
@@ -196,6 +234,7 @@ Each watcher has a bounded buffer. A slow client that overflows it is **demoted*
 allowed to block writers: the server drops its live buffer and the client simply
 reconnects with its last acked cursor, re-entering catch-up. At-least-once holds
 because the cursor is only advanced by the client after it durably processes an event.
+`Truncate` demotes every watcher the same way (see **Truncate**).
 
 ## API (implemented)
 
@@ -213,7 +252,7 @@ const (
     WatchDelete                  // Ad nil: key removed
     WatchReset                   // discard state; a full snapshot of Upserts follows
     WatchSynced                  // end of catch-up; now live. Cursor is a resume point
-    WatchResync                  // stream fell behind; reconnect with your last cursor
+    WatchResync                  // stream fell behind or was truncated; reconnect with your last cursor
 )
 
 type WatchEvent struct {
@@ -237,13 +276,14 @@ func (c *Collection) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEv
 | `WatchDelete` | key removed | `Key` |
 | `WatchReset` | discard local state; an authoritative full snapshot of `Upsert`s follows | — |
 | `WatchSynced` | catch-up complete, now live | `Cursor` (durable resume point; swap the shadow here) |
-| `WatchResync` | live stream lagged — reconnect with the last cursor | — |
+| `WatchResync` | live stream lagged, or the collection was truncated — reconnect with the last cursor | — |
 
 `Upsert`/`Delete` are applied identically whether catching up or live — there is no
-separate "mode". The only control the client must honor is `Reset`, which exists
-**solely to convey deletes that fell out of the retention window**: rather than
-diffing, the client rebuilds from the following snapshot, so deleted keys simply never
-reappear. (An add/update-only store would need none of `Reset`/`Synced`.)
+separate "mode". The only control the client must honor is `Reset`, which conveys
+**deletes the server cannot replay one by one** — those that fell out of the retention
+window, and a `Truncate`: rather than diffing, the client rebuilds from the following
+snapshot, so deleted keys simply never reappear. (An add/update-only store that is never
+truncated would need none of `Reset`/`Synced`.)
 
 ### Client model
 
@@ -279,8 +319,8 @@ makes resume at-least-once. On restart, call `Watch(lastCursor)`.
 - **At-least-once, not exactly-once** — duplicates are possible by design.
 - **No global order across shards** — the stream is per-shard-ordered and interleaved.
   Fine for independent full-ad updates; not a global change log.
-- **Deletes beyond the retention horizon** cannot be replayed precisely → full replay
-  + client-side reconcile. This is the one inherent limit.
+- **Deletes beyond the retention horizon**, and a `Truncate`, cannot be replayed
+  precisely → full replay + client-side reconcile. This is the one inherent limit.
 - **Very slow clients** are demoted to a fresh catch-up rather than throttling writers.
 
 ## Status of the plan

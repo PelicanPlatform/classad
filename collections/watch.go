@@ -31,17 +31,19 @@ const (
 	WatchDelete
 	// WatchReset tells the client to discard its state (build into a shadow): an
 	// authoritative full snapshot of Upserts follows, ending at WatchSynced. Emitted
-	// when a precise incremental resume is impossible (first subscribe, cursor older
-	// than the delete-retention window or append floor, a cursor ahead of the head, or
-	// a different store generation -- including any restart of a mutable collection and
-	// an unclean restart of an append-only one; see watchepoch.go).
+	// when a precise incremental resume is impossible: first subscribe; a cursor older
+	// than the delete-retention window or append floor, which includes every cursor
+	// issued before a Truncate; a cursor ahead of the head; or a different store
+	// generation -- any restart of a mutable collection and an unclean restart of an
+	// append-only one (see watchepoch.go).
 	WatchReset
 	// WatchSynced marks the end of the initial catch-up/snapshot: the client is now
 	// live. Its Cursor is a durable resume point (and, after a Reset, the point to
 	// swap the shadow state live).
 	WatchSynced
-	// WatchResync tells the client the live stream fell behind and it must reconnect
-	// with its last persisted cursor (which re-enters catch-up). No state is implied.
+	// WatchResync tells the client the live stream fell behind, or the collection was
+	// truncated, and it must reconnect with its last persisted cursor (which re-enters
+	// catch-up; after a Truncate that cursor gets a Reset). No state is implied.
 	WatchResync
 )
 
@@ -129,6 +131,17 @@ func (d *deleteLog) record(key []byte, seq uint64) {
 		d.horizon = d.entries[drop-1].seq
 		d.entries = append([]delEntry(nil), d.entries[drop:]...) // compact
 	}
+	d.mu.Unlock()
+}
+
+// truncate forgets every journaled delete and raises the horizon to seq: the collection
+// was emptied at seq, and a cursor below it must fall back to a full replay rather than
+// replay the journal. Caller holds the shard write lock, in the critical section that sets
+// commitSeq = seq (Truncate).
+func (d *deleteLog) truncate(seq uint64) {
+	d.mu.Lock()
+	d.entries = nil
+	d.horizon = max(d.horizon, seq)
 	d.mu.Unlock()
 }
 
@@ -343,6 +356,25 @@ func (h *watchHub) send(ev rawEvent) {
 		case w.ch <- ev:
 		default:
 			w.lagged.Store(true)
+		}
+	}
+	h.mu.Unlock()
+}
+
+// kick forces every attached watcher to resync: each is marked lagged, exactly as if its
+// buffer had overflowed, and woken with an inert event in case it is idle waiting for one.
+// A lagged watcher yields WatchResync instead of anything it receives afterwards, and its
+// client reconnects with its last cursor. Truncate calls this under the shard write lock
+// (lock order: shard.mu, then h.mu, as publishing takes pub.mu then h.mu).
+func (h *watchHub) kick() {
+	h.mu.Lock()
+	for w := range h.watchers {
+		w.lagged.Store(true)
+		select {
+		// Never processed: lagged is stored before the send, so the receiver sees it and
+		// stops first. (A zero event's seq, 0, is at or below every S_reg in any case.)
+		case w.ch <- rawEvent{}:
+		default: // buffer full: the watcher has events to read and will see lagged then
 		}
 	}
 	h.mu.Unlock()
@@ -822,8 +854,8 @@ func (p *catchupPlan) shardWins(i int) []segWindow {
 // the cursor is unusable) and captures what catch-up will read.
 func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
 	p := catchupPlan{full: full}
-	// Append-only rotation gap: a cursor below the oldest still-retained record (its
-	// segment was rotated out) has missed history -> full replay from the current floor.
+	// Append-only gap: a cursor below the append floor -- records it may hold or never saw
+	// were rotated out or truncated -- cannot resume -> full replay from the current floor.
 	// Append logs keep no delete journal, so this is their reset trigger. The windows
 	// catch-up reads are pinned in the same lock hold that reads the floor; otherwise a
 	// Rotate between the check and the read drops records the check counted on. (An
@@ -851,7 +883,8 @@ func (c *Collection) planCatchup(seqs, sReg []uint64, full bool) catchupPlan {
 			p.full = true
 			break
 		}
-		// Retention: a cursor below the delete horizon may have missed a trimmed delete.
+		// Retention: a cursor below the delete horizon may have missed a trimmed delete,
+		// or predates a Truncate (which raises the horizon to its seq).
 		var horizon uint64
 		p.dels[i], horizon = sh.delLog.window(seqs[i], sReg[i])
 		if seqs[i] < horizon {

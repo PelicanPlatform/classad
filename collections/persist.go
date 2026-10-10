@@ -349,6 +349,14 @@ func Open(opts Options) (*Collection, error) {
 			sh.commitSeq = hw
 		}
 	}
+	// The append floor is not persisted; derive it from what recovery found. With the
+	// high-water mark applied, a shard Truncated (or rotated empty) before a clean Close
+	// gets commitSeq as its floor, so a cursor from before the truncate still Resets.
+	for _, sh := range c.shards {
+		if sh.appendOnly {
+			sh.appendFloor = sh.droppedFloorLocked()
+		}
+	}
 	// Recovery is complete: every live segment's codec is known, so dictionaries only
 	// history references (loadDicts loads the full on-disk set) can be dropped now
 	// instead of holding an inflatable codec each for the life of the process.
