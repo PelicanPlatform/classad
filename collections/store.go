@@ -189,6 +189,23 @@ type Options struct {
 	// so a negotiator can iterate a partition in order (and resume) without
 	// re-sorting each cycle. A malformed expression in a spec panics New. Optional.
 	Ordered []OrderSpec
+	// VerifyReads checks a record's stored checksum before its bytes are used, on
+	// every point read (Get, a transactional read, a delta chain participant). It
+	// costs one CRC-32C over the record -- hardware-accelerated, a few nanoseconds
+	// for an ad-sized record -- and turns a corrupt record from something served as
+	// if it were real data into a miss, counted under the "record-crc" reason.
+	//
+	// It is off by default because it is not free and because corruption is rare;
+	// turn it on where serving a wrong answer is worse than serving none. It does
+	// NOT cover scans, which walk records directly; Fsck is what examines a whole
+	// store.
+	//
+	// Without it, a bit flip inside a sealed record's encoded ad is invisible: the
+	// record's own CRC would catch it, but nothing on the read path looks. The value
+	// comes back subtly wrong -- Owner "urer3" where "user3" was written -- with no
+	// error anywhere.
+	VerifyReads bool
+
 	// Dir, if set, makes the collection persistent: arenas are memory-mapped files
 	// under this directory and committed writes are flushed to disk (see Open).
 	// Empty ⇒ in-memory (the default). Unix-only.
@@ -411,6 +428,8 @@ type Collection struct {
 	// internAtSeal interns each append-only segment as soon as it seals (see
 	// Options.InternAtSeal), via InternSealed from the Archive.Append eager-seal hook.
 	internAtSeal bool
+	// verifyReads checks each record's CRC before its bytes are used; see Options.VerifyReads.
+	verifyReads bool
 
 	// reverseScan yields records newest-first (see Options.ReverseScan). Forces
 	// serial scans (no fan-out), since fan-out has no cross-segment order.
@@ -799,6 +818,10 @@ func New(opts Options) *Collection {
 	// Persistent (Dir set) append-only only: c.inline (set later in persist setup) is exactly
 	// Dir != "", and InternSealed is a no-op otherwise, so gate on the option's preconditions here.
 	c.internAtSeal = opts.InternAtSeal && opts.AppendOnly && opts.Dir != ""
+	// Reads are only worth verifying against a persistent segment: an in-memory
+	// arena cannot have been corrupted on disk, and its records carry the same CRC
+	// only incidentally.
+	c.verifyReads = opts.VerifyReads && opts.Dir != ""
 	c.indexBackfillBytes = opts.IndexBackfillBytes
 	c.ret = opts.Retention
 	c.queryPar = resolveQueryParallelism(opts.QueryParallelism)
