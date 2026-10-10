@@ -139,3 +139,88 @@ func codecAdDiff(ad *classad.ClassAd, i int) string {
 	}
 	return ""
 }
+
+// TestZstdLeavesTheRecordHeaderUncovered measures the regions a ZSTD frame does NOT
+// span: the stored key, the framing lengths, and the commit sequence. Those are raw
+// record bytes, and only the record CRC covers them.
+//
+// It exists because "ZSTD already protects the ad, so verification is redundant" is
+// true for the ad BODY and not for the record. The commit sequence is the case that
+// matters: with verification off a seq-corrupted record reads back with its ad intact,
+// so an ad-content census scores it as fine -- while the record now claims a commit
+// sequence it never had. Anything that pages by commit sequence (a mirror cursor, a
+// watch resume, a time-travel read) is steered by exactly that field.
+//
+// Shards: 1 so that corrupting a key cannot also move the record to a different shard,
+// a confound that masked the read path in an earlier attempt at this.
+func TestZstdLeavesTheRecordHeaderUncovered(t *testing.T) {
+	zstd, err := NewZSTDCodec(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []struct {
+		name string
+		// offset of the byte to flip, relative to the record start; -1 means adLen,
+		// whose position depends on the key length.
+		rel int
+		// refusedWithoutVerification is whether the record is already lost when the
+		// record checksum is not consulted.
+		refusedWithoutVerification bool
+	}{
+		{"key byte", recKeyOff, true},
+		{"commit seq", recSeqOff, false},
+		{"adLen", -1, true},
+	} {
+		t.Run(p.name, func(t *testing.T) {
+			on := zstdRegionCensus(t, zstd, p.rel, true)
+			off := zstdRegionCensus(t, zstd, p.rel, false)
+			t.Logf("verification on:  %v", on)
+			t.Logf("verification off: %v", off)
+
+			if on.missing != 1 || on.wrong != 0 {
+				t.Errorf("verification should refuse exactly the damaged record, got %v", on)
+			}
+			if got := off.missing == 1; got != p.refusedWithoutVerification {
+				t.Errorf("without verification, refused=%v want %v (%v)",
+					got, p.refusedWithoutVerification, off)
+			}
+			// Whatever happens, a corrupt record must never be SERVED with wrong content.
+			if off.wrong != 0 {
+				t.Errorf("without verification, %d record(s) came back with wrong content", off.wrong)
+			}
+		})
+	}
+}
+
+func zstdRegionCensus(t *testing.T, codec Codec, rel int, verify bool) codecCensus {
+	t.Helper()
+	dir := t.TempDir()
+	keys := seedForCodec(t, dir, codec, 600)
+	s := &corruptStore{t: t, dir: dir, keys: keys}
+
+	var seg string
+	for _, q := range s.segments() {
+		if _, e := os.Stat(q + ".idx"); e == nil {
+			seg = q
+			break
+		}
+	}
+	if seg == "" {
+		t.Fatal("no sealed segment with a sidecar; the test would prove nothing")
+	}
+	b, err := os.ReadFile(seg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offs := recordOffsets(t, seg)
+	off := offs[len(offs)/2]
+	target := off + rel
+	if rel < 0 { // adLen sits just past the inline key
+		target = off + recKeyOff + int(recKeyLen(b, uint32(off)))
+	}
+	b[target] ^= 0x01
+	if err := os.WriteFile(seg, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return censusForCodec(t, dir, codec, verify, keys)
+}
