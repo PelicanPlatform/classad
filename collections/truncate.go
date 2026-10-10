@@ -13,6 +13,17 @@ import (
 // collection. Ordered indexes are cleared in place. Callers needing atomicity against
 // concurrent writers must serialize Truncate with them (the db layer holds its DB-wide
 // lock); at the shard level Truncate is itself consistent.
+//
+// Watchers: the removal is too large to journal as per-key deletes (and the keys are gone),
+// so every watcher that could otherwise miss it gets a Reset instead. Per shard, in the
+// critical section that commits the truncate at seq T, the resume floor moves to T -- the
+// delete journal's horizon for a mutable shard, the append floor for an append-only one --
+// so a cursor below T (issued before the truncate) is too old to resume and gets a Reset
+// and a full snapshot, while a cursor at or past T resumes normally. Every attached watcher
+// is told to resync (WatchResync) in the same critical section, before any later commit to
+// the shard can publish, so no live cursor can advance past T on a watcher that has not
+// seen the truncate. T carries no events and is not tracked for publication, so it holds
+// no later cursor back. See docs/WATCH.md.
 func (c *Collection) Truncate() {
 	for _, sh := range c.shards {
 		var toReap []*segment
@@ -32,6 +43,14 @@ func (c *Collection) Truncate() {
 		// applied over the truncated state (it conflicts), and new scans see the reset.
 		sh.commitSeq++
 		sh.gcFloor = sh.commitSeq
+		if sh.appendOnly {
+			sh.appendFloor = sh.commitSeq
+		} else if sh.delLog != nil {
+			sh.delLog.truncate(sh.commitSeq)
+		}
+		if sh.hub != nil {
+			sh.hub.kick()
+		}
 		if sh.childCount != nil {
 			sh.childCount = make(map[uint64]int)
 		}

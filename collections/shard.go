@@ -114,6 +114,13 @@ type shard struct {
 	hub    *watchHub
 	delLog *deleteLog
 	pub    pubOrder // orders live cursors against out-of-order publishes (watch.go)
+	// appendFloor (append-only shards; guarded by mu) is the append log's counterpart of
+	// the delete journal's horizon: a watch cursor whose seq for this shard is below it
+	// cannot resume incrementally, because records it may hold or never saw are gone.
+	// Rotate raises it to the oldest retained record's seq, Truncate to the seq it
+	// commits at, and Open initializes it from what recovery found (see
+	// droppedFloorLocked).
+	appendFloor uint64
 
 	// Chained-parent child counting (see store.go). childParentHash, if set, maps a
 	// key to its parent's dir-hash and reports whether the key is a chained child;
@@ -222,14 +229,11 @@ func (sh *shard) dirGet(h uint64) loc {
 	return noLoc
 }
 
-// appendFloor returns the smallest commit sequence still retained on this (append-only)
-// shard: the seq of the first record in the oldest live segment. After retention drops
-// old segments this rises, so a watch cursor below it has missed rotated-out history and
-// must full-replay. Returns 0 when the shard holds no records (a fresh cursor is handled
-// separately). Reads the record directly rather than trusting seg.minSeq so it is correct
-// whether or not the time-travel pruning counters are maintained on the write path.
-// Caller holds at least the read lock.
-func (sh *shard) appendFloorLocked() uint64 {
+// oldestRecordSeqLocked returns the seq of the first record in the oldest live segment of
+// an append-only shard, or 0 when the shard holds no records. Reads the record directly
+// rather than trusting seg.minSeq so it is correct whether or not the time-travel pruning
+// counters are maintained on the write path. Caller holds at least the read lock.
+func (sh *shard) oldestRecordSeqLocked() uint64 {
 	for _, seg := range sh.segs {
 		if seg == nil || seg.used == 0 {
 			continue
@@ -249,13 +253,25 @@ func (sh *shard) appendFloorLocked() uint64 {
 	return 0
 }
 
+// droppedFloorLocked is the append floor implied by the records still retained, for use
+// after records were dropped by means this process did not witness (recovery) or did not
+// track exactly (Rotate): the oldest retained record's seq -- records of the same commit
+// may have sat in a dropped segment, so a cursor just below it is not trusted -- or, with
+// nothing retained, commitSeq (everything ever issued is gone). Caller holds the lock.
+func (sh *shard) droppedFloorLocked() uint64 {
+	if f := sh.oldestRecordSeqLocked(); f > 0 {
+		return f
+	}
+	return sh.commitSeq
+}
+
 // appendCatchupView pins the windows a watch catch-up reads at sReg and returns them with
-// the append floor, both from one read-lock hold so a Rotate cannot fall between them.
-// The caller must releaseWindows(wins).
+// the append floor, both from one read-lock hold so a Rotate or Truncate cannot fall
+// between them. The caller must releaseWindows(wins).
 func (sh *shard) appendCatchupView(sReg uint64) (wins []segWindow, floor uint64) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
-	return sh.buildWindowsLocked(sReg), sh.appendFloorLocked()
+	return sh.buildWindowsLocked(sReg), sh.appendFloor
 }
 
 // segAt returns the segment for a location's index, or nil if the index is out of range or

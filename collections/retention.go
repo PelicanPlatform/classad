@@ -70,6 +70,12 @@ func (c *Collection) Rotate(now float64) (int, error) {
 		sh.segs[idx] = nil // keep the slot so seg.id still equals its index (segAt invariant)
 		dropped++
 	}
+	if dropped > 0 {
+		// A watch cursor below the new oldest record has missed rotated-out history. Raised
+		// in the same critical section that drops the segments, so a catch-up that reads the
+		// floor (appendCatchupView) never sees the drop without it.
+		sh.appendFloor = max(sh.appendFloor, sh.droppedFloorLocked())
+	}
 	sh.mu.Unlock()
 
 	var err error
