@@ -23,7 +23,9 @@ package collections
 //     files.
 
 import (
+	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"sort"
@@ -61,11 +63,33 @@ type FsckSegment struct {
 	// rejection reason. A sidecar is derived state, so a bad one costs only the
 	// rebuild -- it is never data loss.
 	Sidecar string
+	// maxSeq and supersede are scratch for the supersession check, folded into the
+	// report once every segment has been walked.
+	maxSeq    uint64
+	supersede []FsckSupersede
+
 	// ExtentTrusted is true when the sidecar's recorded extent was usable, which is
 	// how Open avoids walking the segment. When it is true and damage was found, the
 	// damage is INSIDE the trusted extent: Open will not notice it, and queries will
 	// hit it one record at a time.
 	ExtentTrusted bool
+}
+
+// FsckSupersede is a record whose supersededBySeq cannot be true.
+//
+// That field is one of the two the record checksum does NOT cover (it is rewritten in
+// place when a later version supersedes this one), so corruption there is invisible to
+// every other check. It matters because the field alone decides whether a record is
+// live: a live record whose supersededBySeq is corrupted simply stops being returned.
+// The key does not come back wrong -- it comes back missing, with nothing anywhere
+// saying why.
+type FsckSupersede struct {
+	Path string // the segment holding the record
+	Off  int    // its offset within that segment
+	Key  string
+	Seq  uint64 // the record's own commit sequence
+	Sup  uint64 // the superseding sequence it claims
+	Why  string // which invariant it breaks
 }
 
 // FsckStray is a file in a shard directory that recovery will silently ignore.
@@ -87,6 +111,19 @@ type FsckReport struct {
 	// DictsInAttic are missing dictionaries whose file is sitting in dicts/attic/,
 	// retired by pruning. Those segments ARE recoverable: move the file back.
 	DictsInAttic []uint32
+	// Supersede lists records whose supersededBySeq is impossible. Each one is a key
+	// that may silently not be returned.
+	Supersede []FsckSupersede
+	// MaxSeq is the highest commit sequence a record could legitimately name: the
+	// shard commit sequences recorded in the directory snapshots when available,
+	// otherwise the highest sequence written into any record.
+	MaxSeq uint64
+	// CommitSeqKnown is true when a directory snapshot supplied the real commit
+	// sequence. Without one, MaxSeq is only a floor -- a delete advances the commit
+	// sequence without writing a record, so a legitimate tombstone can name a
+	// sequence higher than any record's -- and the "superseded by a commit that
+	// never happened" check is skipped rather than reporting healthy deletes.
+	CommitSeqKnown bool
 }
 
 // Totals sums the per-segment counts.
@@ -135,6 +172,19 @@ func (r *FsckReport) String() string {
 		if s.ExtentTrusted && len(s.Damage) > 0 {
 			b.WriteString("    note: inside the sidecar's trusted extent -- a normal open will not notice\n")
 		}
+	}
+	if n := len(r.Supersede); n > 0 {
+		fmt.Fprintf(&b, "  %d record(s) with an impossible supersededBySeq "+
+			"(highest commit seen: %d):\n", n, r.MaxSeq)
+		for _, f := range r.Supersede {
+			fmt.Fprintf(&b, "    %s@%d key=%q seq=%d supersededBy=%d -- %s\n",
+				filepath.Base(f.Path), f.Off, f.Key, f.Seq, f.Sup, f.Why)
+		}
+		b.WriteString("    That field is not covered by the record checksum, and it alone\n")
+		b.WriteString("    decides whether a record is live, so such a key may simply not be\n")
+		b.WriteString("    returned. Repair is a JUDGEMENT CALL and fsck will not make it: a\n")
+		b.WriteString("    corrupted tombstone is indistinguishable from a real delete, so\n")
+		b.WriteString("    restoring the record could un-delete data someone removed.\n")
 	}
 	for _, s := range r.Strays {
 		fmt.Fprintf(&b, "  IGNORED %s: %s\n", s.Path, s.Why)
@@ -233,6 +283,44 @@ func Fsck(dir string) (*FsckReport, error) {
 	}
 	sort.Slice(r.DictsInAttic, func(i, j int) bool { return r.DictsInAttic[i] < r.DictsInAttic[j] })
 	sort.Slice(r.DictsMissing, func(i, j int) bool { return r.DictsMissing[i] < r.DictsMissing[j] })
+
+	// Fold in the supersession findings. The "commit that never happened" ones were
+	// collected against a running maximum, so a later segment may have raised it past
+	// them; re-check against the whole store's maximum before reporting any of them.
+	for _, seg := range r.Segments {
+		if seg.maxSeq > r.MaxSeq {
+			r.MaxSeq = seg.maxSeq
+		}
+	}
+	// A clean Close leaves each shard's commit sequence in its directory snapshot.
+	// That is the only true upper bound: deletes advance it without writing records,
+	// so the highest record sequence is a floor and nothing more.
+	if cs, ok := fsckCommitSeq(dir); ok {
+		r.CommitSeqKnown = true
+		if cs > r.MaxSeq {
+			r.MaxSeq = cs
+		}
+	}
+	for _, seg := range r.Segments {
+		for _, f := range seg.supersede {
+			if f.Sup > f.Seq {
+				// "Never happened" is only decidable against a real commit sequence.
+				if !r.CommitSeqKnown || f.Sup <= r.MaxSeq {
+					continue
+				}
+			}
+			r.Supersede = append(r.Supersede, f)
+		}
+	}
+	sort.Slice(r.Supersede, func(i, j int) bool {
+		if r.Supersede[i].Path != r.Supersede[j].Path {
+			return r.Supersede[i].Path < r.Supersede[j].Path
+		}
+		return r.Supersede[i].Off < r.Supersede[j].Off
+	})
+	if len(r.Supersede) > fsckSupersedeMax {
+		r.Supersede = r.Supersede[:fsckSupersedeMax]
+	}
 	sort.Slice(r.Segments, func(i, j int) bool { return r.Segments[i].Path < r.Segments[j].Path })
 	return r, nil
 }
@@ -294,6 +382,7 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 			run = nil // a good record ends any run of damage
 			s.Records++
 			s.Bytes += total
+			noteSupersede(s, data, off)
 			off += total
 			continue
 		}
@@ -381,4 +470,92 @@ func allZero(b []byte) bool {
 		}
 	}
 	return true
+}
+
+// fsckSupersedeMax bounds how many impossible supersededBySeq records are kept. The
+// point is to name the problem and some of its keys, not to materialize a list as long
+// as the damage.
+const fsckSupersedeMax = 64
+
+// noteSupersede records a verified record's sequence numbers for the supersession
+// check, and keeps the ones that are already impossible on their own terms.
+//
+// Two invariants need no knowledge of the rest of the store:
+//
+//   - A record cannot be superseded by a commit at or before the one that wrote it.
+//   - A marker record carries no supersession at all.
+//
+// The third -- superseded by a commit that never happened -- needs the highest sequence
+// in the store, which is only known once every segment has been walked, so candidates
+// above the running maximum are kept provisionally and filtered at the end.
+func noteSupersede(s *FsckSegment, data []byte, off int) {
+	if recIsMarker(data, uint32(off)) {
+		return
+	}
+	seq := recSeq(data, uint32(off))
+	if seq > s.maxSeq {
+		s.maxSeq = seq
+	}
+	sup := recSuperseded(data, uint32(off))
+	if sup == seqMax {
+		return // current: the ordinary case
+	}
+	switch {
+	case sup <= seq:
+		s.supersede = append(s.supersede, FsckSupersede{
+			Path: s.Path, Off: off, Key: string(recKey(data, uint32(off))), Seq: seq, Sup: sup,
+			Why: "superseded at or before the commit that wrote it",
+		})
+	case sup > s.maxSeq:
+		// Provisional: a later segment may raise the maximum past this. Re-checked
+		// against the whole store's maximum in Fsck.
+		s.supersede = append(s.supersede, FsckSupersede{
+			Path: s.Path, Off: off, Key: string(recKey(data, uint32(off))), Seq: seq, Sup: sup,
+			Why: "superseded by a commit that never happened",
+		})
+	}
+	if len(s.supersede) > fsckSupersedeMax {
+		s.supersede = s.supersede[:fsckSupersedeMax]
+	}
+}
+
+// fsckCommitSeq reads the highest shard commit sequence recorded in the directory
+// snapshots under dir, and whether any snapshot was found.
+//
+// A snapshot is written on a clean Close and consumed by the next open, so it is
+// present exactly when the database was shut down cleanly and not reopened since --
+// which is the state an operator running fsck is usually in. After a crash there is
+// none, and the supersession upper bound is simply unavailable.
+//
+// Only the header is read, and only after the trailing CRC verifies, so a corrupt
+// snapshot contributes nothing rather than a wild bound.
+func fsckCommitSeq(dir string) (uint64, bool) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0, false
+	}
+	var max uint64
+	var found bool
+	for _, e := range entries {
+		if !e.IsDir() || e.Name() == "dicts" || e.Name() == quarantineDir {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(dir, e.Name(), dirSnapName))
+		if err != nil || len(data) < 4+4+4+8 {
+			continue
+		}
+		body := data[:len(data)-4]
+		if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(data[len(data)-4:]) {
+			continue
+		}
+		if binary.LittleEndian.Uint32(body[0:]) != dirSnapMagic ||
+			binary.LittleEndian.Uint32(body[4:]) != dirSnapVersion {
+			continue
+		}
+		if cs := binary.LittleEndian.Uint64(body[8:]); cs > max {
+			max = cs
+		}
+		found = true
+	}
+	return max, found
 }
