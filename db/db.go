@@ -1044,7 +1044,14 @@ func (t *Txn) NewClassAd(key string, ad *classad.ClassAd) {
 // encoder does not seal, and a few ad shapes (a repeated attribute name, an escape the
 // fast lexer would read differently) defer to the reference parser by design.
 func (t *Txn) NewClassAdOld(key, text string) bool {
-	return t.tx.PutOld([]byte(key), text)
+	if !t.tx.PutOld([]byte(key), text) {
+		return false
+	}
+	// A whole new ad, as in NewClassAd: without this a following SetAttribute in the same
+	// transaction took the patch path over a base that does not exist, and the commit stored
+	// only the patched attribute.
+	t.patchFor(key).full = true
+	return true
 }
 
 // DestroyClassAd removes key (classad_log.h LogDestroyClassAd).
