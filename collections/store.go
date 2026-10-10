@@ -210,6 +210,18 @@ type Options struct {
 	// against roughly 760ns to decode one on a scan. It adds NO storage -- the
 	// checksum has always been written. Turn this on only for a read-bound workload
 	// that has measured the difference and prefers a wrong answer to a slow one.
+	//
+	// What it is worth depends on the CODEC, and the difference is stark. A ZSTD frame
+	// carries its own content checksum, so a flipped bit in a compressed ad is refused
+	// either way and verification adds little for the ad body (it still covers the key,
+	// the framing and the commit sequence, which no codec touches). Under the identity
+	// codec nothing covers the ad, and the record CRC is the only thing between a
+	// flipped bit and a plausible wrong value: Owner "urer3" where "user3" was written.
+	// See TestVerificationValueDependsOnTheCodec, which measures both.
+	//
+	// That is not an academic distinction. db's chooseBaseCodec gives NEW stores ZSTD
+	// but keeps identity for one that already held data, so the stores where this is
+	// load-bearing are the oldest -- usually the largest and busiest.
 	DisableReadVerification bool
 
 	// Dir, if set, makes the collection persistent: arenas are memory-mapped files
