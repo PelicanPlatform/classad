@@ -37,6 +37,14 @@ var verifyReadSkips atomic.Int64
 // Non-zero means reads are quietly incomplete, and fsck is what says where.
 func VerifyReadSkips() int64 { return verifyReadSkips.Load() }
 
+// VerifyingReads reports whether this collection checks each record's stored checksum
+// before using its bytes. It is true for a persistent collection unless
+// Options.DisableReadVerification was set, and always false in memory.
+//
+// Exported so a daemon can state which mode it is running in rather than inferring it
+// from its own configuration parsing, which is the sort of thing that drifts.
+func (c *Collection) VerifyingReads() bool { return c != nil && c.verifyReads }
+
 // recordFailsCRC reports whether verification is on and this record does not verify.
 // It is the one place the condition is written, so the iterator paths and the point-read
 // path cannot drift apart on what "verified" means.

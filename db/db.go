@@ -123,6 +123,16 @@ type Config struct {
 	CategoricalAttrs, ValueAttrs []string
 	MatchClosureRoots            []string
 
+	// DisableReadVerification turns off the per-record checksum check on reads for
+	// this table. Verification is ON by default (see
+	// collections.Options.DisableReadVerification): without it a bit flip inside a
+	// stored ad is served as a plausible value rather than reported.
+	//
+	// This exists so an operator has a way out without downgrading. Turning it off
+	// trades a few percent of read CPU for the chance of serving a wrong answer, and
+	// should follow a measurement rather than a hunch.
+	DisableReadVerification bool
+
 	// DeltaMax bounds the delta-record chain length for this table; see DefaultDeltaMax and
 	// DeltaMaxOff for what 0 and a negative value mean.
 	//
@@ -196,22 +206,23 @@ func OpenConfig(cfg Config) (*DB, error) {
 		return nil, err
 	}
 	opts := collections.Options{
-		Dir:                 cfg.Dir,
-		WatchHistory:        4096, // enables Watch
-		Ordered:             cfg.Ordered,
-		HotAttrs:            cfg.HotAttrs,
-		CategoricalAttrs:    cfg.CategoricalAttrs,
-		ValueAttrs:          cfg.ValueAttrs,
-		MatchClosureRoots:   cfg.MatchClosureRoots,
-		GroupSchemaCount:    cfg.GroupSchemaCount,
-		GroupStabilityRuns:  cfg.GroupStabilityRuns,
-		GroupMergeJaccard:   cfg.GroupMergeJaccard,
-		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
-		DeltaMax:            resolveDeltaMax(cfg.DeltaMax),
-		Codec:               chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
-		DataKey:             enc.data(),
-		EncryptedAttrs:      cfg.EncryptedAttrs,
-		SegmentSize:         cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
+		Dir:                     cfg.Dir,
+		WatchHistory:            4096, // enables Watch
+		Ordered:                 cfg.Ordered,
+		HotAttrs:                cfg.HotAttrs,
+		CategoricalAttrs:        cfg.CategoricalAttrs,
+		ValueAttrs:              cfg.ValueAttrs,
+		MatchClosureRoots:       cfg.MatchClosureRoots,
+		GroupSchemaCount:        cfg.GroupSchemaCount,
+		GroupStabilityRuns:      cfg.GroupStabilityRuns,
+		GroupMergeJaccard:       cfg.GroupMergeJaccard,
+		GroupMaxPartialFrac:     cfg.GroupMaxPartialFrac,
+		DeltaMax:                resolveDeltaMax(cfg.DeltaMax),
+		DisableReadVerification: cfg.DisableReadVerification,
+		Codec:                   chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
+		DataKey:                 enc.data(),
+		EncryptedAttrs:          cfg.EncryptedAttrs,
+		SegmentSize:             cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
 		// Process-global shared block-cache budgets (0 ⇒ collections default). Both are set here at DB
 		// open: collections.New applies BOTH the mutating and archive budgets to the process globals,
 		// so archives opened later from a plain ArchiveConfig inherit the archive budget set now.
@@ -284,6 +295,12 @@ func loadOrCreateDBID(dir string) string {
 
 // Close releases the log's resources.
 func (db *DB) Close() error { return db.c.Close() }
+
+// VerifyingReads reports whether this table checks each record's stored checksum before
+// using its bytes -- true unless Config.DisableReadVerification was set, and always
+// false for an in-memory table. See collections.VerifyReadSkips for how many records
+// that check has refused.
+func (db *DB) VerifyingReads() bool { return db.c.VerifyingReads() }
 
 // MaintainOptions configures one maintenance pass (DB.Maintain).
 type MaintainOptions struct {
