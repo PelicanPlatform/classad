@@ -460,7 +460,7 @@ func builtinToLower(args []Value) Value {
 	if !ok {
 		return NewErrorValue()
 	}
-	return NewStringValue(strings.ToLower(str))
+	return NewStringValue(toLowerKeepBytes(str))
 }
 
 // builtinToUpper converts string to uppercase
@@ -479,7 +479,7 @@ func builtinToUpper(args []Value) Value {
 	if !ok {
 		return NewErrorValue()
 	}
-	return NewStringValue(strings.ToUpper(str))
+	return NewStringValue(toUpperKeepBytes(str))
 }
 
 // Built-in math functions
@@ -828,7 +828,7 @@ func stringListMemberImpl(args []Value, ignoreCase bool) Value {
 
 	for _, elem := range parseStringList(listStr, delim) {
 		if ignoreCase {
-			if strings.EqualFold(elem, item) {
+			if equalFoldKeepBytes(elem, item) {
 				return NewBoolValue(true)
 			}
 		} else if elem == item {
@@ -1664,7 +1664,7 @@ func builtinStricmp(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	result := strings.Compare(strings.ToLower(str1), strings.ToLower(str2))
+	result := strings.Compare(toLowerKeepBytes(str1), toLowerKeepBytes(str2))
 	return NewIntValue(int64(result))
 }
 
