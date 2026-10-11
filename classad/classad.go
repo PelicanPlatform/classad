@@ -51,12 +51,13 @@ func ParseExpr(input string) (*Expr, error) {
 	return &Expr{expr: expr}, nil
 }
 
-// ParseExprOld parses a standalone expression with OLD-ClassAd string semantics: an
-// unrecognized escape sequence in a string literal is kept literally rather than rejected.
-// Use it for expression text that came from old-ClassAd sources -- notably a schedd's
-// job_queue.log attribute values, where a filename in a TransferInput list carries an
-// escaped comma or space (`"...\,\ ..."`). ParseExpr would reject those and drop the
-// attribute; this preserves them. Identical to ParseExpr otherwise.
+// ParseExprOld parses a standalone expression as HTCondor's ParseClassAdRvalExpr does,
+// which reads config macro functions ($INT, $EVAL, ...), submit expressions and
+// job_queue.log values. String literals have OLD-ClassAd semantics: an unrecognized escape
+// sequence is kept literally rather than rejected (a filename in a TransferInput list
+// carries an escaped comma or space, `"...\,\ ..."`, which ParseExpr would reject), and
+// adjacent literals are not concatenated. Like libclassad, it ignores whatever follows a
+// top-level conditional (a ? b : c). See parser.ParseExprOld.
 func ParseExprOld(input string) (*Expr, error) {
 	expr, err := parser.ParseExprOld(input)
 	if err != nil {

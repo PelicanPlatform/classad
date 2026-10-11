@@ -32,29 +32,50 @@ func ParseClassAd(input string) (*ast.ClassAd, error) {
 
 // ParseExpr parses a standalone ClassAd expression (for example "a + 1",
 // `strcat("x", "y")`, or "{1, 2, 3}") and returns its expression AST. It returns
-// an error if the input is not a single well-formed expression.
-//
-// The grammar's top-level production is a ClassAd, so the expression is parsed
-// inside a throwaway single-attribute wrapper and the attribute's value is
-// returned. This keeps Parse ClassAd-only -- avoiding grammar ambiguity between
-// a record literal and a bare expression -- while still giving callers direct
-// expression access.
+// an error if the input is not a single well-formed expression: like libclassad's
+// ClassAdParser::ParseExpression with full set, it rejects anything after the
+// expression, including a ';'.
 func ParseExpr(input string) (ast.Expr, error) {
 	return parseExpr(input, false)
 }
 
-// ParseExprOld parses a standalone expression with OLD-ClassAd string semantics: an
-// unrecognized escape sequence in a string literal (e.g. `"a\,\ b"`, the escaped comma
-// and space HTCondor writes into a TransferInput list, or `"\S"` from /etc/issue) is kept
-// literally rather than rejected. Use it for values that originate from old-ClassAd text --
-// notably a schedd's job_queue.log, whose attribute values are old-ClassAd-encoded. It
-// matches ParseExpr in every other respect. See StreamingLexer.lenientEscapes and
-// ParseOldClassAd, which applies the same leniency to a whole old-format ad.
+// ParseExprOld parses a standalone expression the way HTCondor's
+// ParseClassAdRvalExpr does (ClassAdParser::SetOldClassAd(true), then a full
+// ParseExpression), which reads config macro functions ($INT, $EVAL, ...),
+// submit expressions and job_queue.log values. It differs from ParseExpr in two
+// ways:
+//
+//   - Old-ClassAd string literals: an unrecognized escape sequence (e.g.
+//     `"a\,\ b"`, the escaped comma and space HTCondor writes into a
+//     TransferInput list, or `"\S"` from /etc/issue) is kept literally rather than
+//     rejected, as in ParseOldClassAd (see StreamingLexer.lenientEscapes); and
+//     adjacent string literals are an error rather than concatenated.
+//   - libclassad returns from a top-level conditional (a ? b : c) before it
+//     checks for the end of the input, so it ignores whatever follows one:
+//     "1 ? 2 : 3 4" is 1 ? 2 : 3. ParseExprOld does the same.
 func ParseExprOld(input string) (ast.Expr, error) {
-	return parseExpr(input, true)
+	expr, failAt, err := parseExprAt(input, true)
+	if err == nil || failAt <= 0 || failAt >= len(input) {
+		return expr, err
+	}
+	// The parse failed at the token starting at failAt. If what precedes it is
+	// a whole top-level conditional, libclassad would have stopped there.
+	if prefix, _, perr := parseExprAt(input[:failAt], true); perr == nil {
+		if _, ok := prefix.(*ast.ConditionalExpr); ok {
+			return prefix, nil
+		}
+	}
+	return nil, err
 }
 
 func parseExpr(input string, lenient bool) (ast.Expr, error) {
+	expr, _, err := parseExprAt(input, lenient)
+	return expr, err
+}
+
+// parseExprAt parses input as one expression. On failure it also returns the
+// input offset at which the lexer started the token that failed the parse.
+func parseExprAt(input string, lenient bool) (ast.Expr, int, error) {
 	ep, ok := exprParserPool.Get().(*exprParser)
 	if !ok {
 		panic("exprParserPool held an unexpected type") // pool's New only makes *exprParser
@@ -62,16 +83,18 @@ func parseExpr(input string, lenient bool) (ast.Expr, error) {
 	ep.reset(input, lenient)
 	ep.p.Parse(ep.lex)
 	node, err := ep.lex.Result()
+	failAt := ep.lex.errAt
 	ep.lex.result = nil // do not retain the parsed AST in the pooled instance
+	ep.sr.Reset("")
 	exprParserPool.Put(ep)
 	if err != nil {
-		return nil, err
+		return nil, failAt, err
 	}
-	ad, ok := node.(*ast.ClassAd)
-	if !ok || len(ad.Attributes) != 1 {
-		return nil, fmt.Errorf("input is not a single expression")
+	expr, ok := node.(ast.Expr)
+	if !ok || expr == nil {
+		return nil, failAt, fmt.Errorf("input is not a single expression")
 	}
-	return ad.Attributes[0].Value, nil
+	return expr, 0, nil
 }
 
 // ReaderParser parses consecutive ClassAds from a buffered reader without

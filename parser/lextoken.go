@@ -11,7 +11,9 @@ const TokEOF = 0
 // multi-character tokens:
 //
 //	IDENTIFIER, STRING_LITERAL, INTEGER_LITERAL, REAL_LITERAL, BOOLEAN_LITERAL,
-//	UNDEFINED, ERROR, INT64_MIN_MAGNITUDE, and the operators/keywords
+//	UNDEFINED, ERROR, INT64_MIN_MAGNITUDE, NEG (a '-' that is a number's sign:
+//	it is always followed by an INTEGER_LITERAL, REAL_LITERAL or
+//	INT64_MIN_MAGNITUDE), and the operators/keywords
 //	OR AND EQ NE IS ISNT LE GE LSHIFT RSHIFT URSHIFT ELVIS
 //
 // or the byte value of a single-character operator or punctuation

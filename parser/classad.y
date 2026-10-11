@@ -25,14 +25,23 @@ import (
 %token <real> REAL_LITERAL
 %token <boolean> BOOLEAN_LITERAL
 %token UNDEFINED ERROR
-/* The magnitude 2^63 overflows a signed 64-bit int, so it is valid only as the
-   operand of a unary minus (yielding INT64_MIN). The lexer emits this token for
-   it; the grammar accepts it ONLY after '-'. A bare 2^63 has no rule and stays
-   a syntax error -- positive integer overflow, which the Go engine rejects
-   rather than wrapping to 0 the way libclassad does. */
+/* NEG is a '-' that libclassad lexes as part of a number literal: one where
+   an operand is expected, directly before a digit or a '.' and a digit. The
+   two make one operand ("-5"), a primary expression, so it can be the right
+   operand of ?: and a postfix operator applies to it ("-5[0]" is (-5)[0]). The
+   literal is represented as a unary minus applied to its magnitude. */
+%token NEG
+/* The magnitude 2^63 overflows a signed 64-bit int, so it is valid only after
+   NEG (yielding INT64_MIN), and the lexer emits this token for it only there;
+   anywhere else 2^63 is out of range and, as in libclassad, lexes as 0. */
 %token INT64_MIN_MAGNITUDE
-/* ELVIS is the adjacent "?:" operator. Unlike the spaced "? :" (which the
-   lexer leaves as two tokens and which binds at ternary precedence), it is a
+/* EXPR_START is never in the input: the lexer emits it first when it is asked
+   to parse a standalone expression (ParseExpr), selecting the expression start
+   rule instead of the ClassAd one. */
+%token EXPR_START
+/* ELVIS is the "?:" operator: a '?' followed by a ':' with only whitespace
+   between them (since HTCONDOR-3814, libclassad 25.14, the lexer skips that
+   whitespace; before it, a spaced "? :" was a low-precedence elvis). It is a
    high-precedence postfix operator alongside '.' and '[', matching the
    reference parser (10 ?: 2 + 3 is (10 ?: 2) + 3). */
 %token ELVIS
@@ -57,8 +66,8 @@ import (
 %left '.' '[' '('
 
 %type <classad> classad record_literal
-%type <attrs> attr_list
-%type <attr> attr_assign attr_stmt
+%type <attrs> attr_list attr_seq
+%type <attr> attr_assign
 %type <str> strings
 %type <expr> expr literal primary_expr postfix_expr unary_expr
 %type <expr> mult_expr add_expr shift_expr rel_expr eq_expr
@@ -75,6 +84,12 @@ start
 				lex.SetResult($1)
 			}
 		}
+	| EXPR_START expr
+		{
+			if lex, ok := yylex.(interface{ SetResult(ast.Node) }); ok {
+				lex.SetResult($2)
+			}
+		}
 	;
 
 classad
@@ -87,27 +102,42 @@ record_literal
 		{ $$ = &ast.ClassAd{Attributes: $2} }
 	;
 
-/* Assignments are separated by ';', but empty statements are allowed anywhere
-   (leading, trailing, doubled, or a semicolon-only/empty body), matching the
-   reference parser: "[;a=1;;b=2;]" and "[ ; ]" and "[]" all parse. Two
-   assignments with no ';' between them ("[a=1 b=2]") is still an error. */
+/* Assignments are separated by ';', and extra ';' are allowed before, between
+   and after them: "[;a=1;;b=2;]" and "[]" parse. As in libclassad's
+   parseClassAd, a ';' with no assignment after it at all ("[;]", "[ ; ]") is
+   an error, because a leading ';' must be followed by an assignment. Two
+   assignments with no ';' between them ("[a=1 b=2]") is an error. */
 attr_list
-	: attr_stmt
-		{ if $1 != nil { $$ = []*ast.AttributeAssignment{$1} } else { $$ = []*ast.AttributeAssignment{} } }
-	| attr_list ';' attr_stmt
-		{ if $3 != nil { $$ = append($1, $3) } else { $$ = $1 } }
+	: /* empty */
+		{ $$ = []*ast.AttributeAssignment{} }
+	| lead_semis attr_seq
+		{ $$ = $2 }
 	;
 
-attr_stmt
+lead_semis
 	: /* empty */
-		{ $$ = nil }
-	| attr_assign
+	| lead_semis ';'
+	;
+
+attr_seq
+	: attr_assign
+		{ $$ = []*ast.AttributeAssignment{$1} }
+	| attr_seq ';'
 		{ $$ = $1 }
+	| attr_seq ';' attr_assign
+		{ $$ = append($1, $3) }
 	;
 
 attr_assign
 	: IDENTIFIER '=' expr
-		{ $$ = &ast.AttributeAssignment{Name: $1, Value: $3} }
+		{
+			// libclassad's ClassAd::Insert refuses an empty name (''), which
+			// fails the parse.
+			if $1 == "" {
+				yylex.Error("empty attribute name")
+			}
+			$$ = &ast.AttributeAssignment{Name: $1, Value: $3}
+		}
 	;
 
 expr
@@ -120,8 +150,6 @@ cond_expr
 		{ $$ = $1 }
 	| logical_or_expr '?' expr ':' cond_expr
 		{ $$ = &ast.ConditionalExpr{Condition: $1, TrueExpr: $3, FalseExpr: $5} }
-	| logical_or_expr '?' ':' cond_expr
-		{ $$ = &ast.ElvisExpr{Left: $1, Right: $4} }
 	;
 
 logical_or_expr
@@ -221,8 +249,6 @@ unary_expr
 		{ $$ = $1 }
 	| '-' unary_expr %prec UNARY
 		{ $$ = &ast.UnaryOp{Op: "-", Expr: $2} }
-	| '-' INT64_MIN_MAGNITUDE %prec UNARY
-		{ $$ = &ast.IntegerLiteral{Value: -9223372036854775808} }
 	| '+' unary_expr %prec UNARY
 		{ $$ = &ast.UnaryOp{Op: "+", Expr: $2} }
 	| '!' unary_expr
@@ -259,6 +285,12 @@ primary_expr
 			name, scope := ParseScopedIdentifier($2)
 			$$ = ast.NewAttributeReference(name, scope)
 		}
+	| NEG INTEGER_LITERAL
+		{ $$ = &ast.UnaryOp{Op: "-", Expr: &ast.IntegerLiteral{Value: $2}} }
+	| NEG REAL_LITERAL
+		{ $$ = &ast.UnaryOp{Op: "-", Expr: &ast.RealLiteral{Value: $2}} }
+	| NEG INT64_MIN_MAGNITUDE
+		{ $$ = &ast.IntegerLiteral{Value: -9223372036854775808} }
 	| '(' expr ')'
 		{ $$ = ast.Parenthesize($2) }
 	| '{' opt_expr_list '}'

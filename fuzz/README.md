@@ -278,14 +278,20 @@ change is caught (see [`CPP_QUIRKS.md`](CPP_QUIRKS.md)).
   Matching it needs nested-ad scope-chain resolution plus cross-scope cycle
   detection; the case is pathological (cyclic) and left for a focused
   follow-up. (`[B = [].A]` and other non-cyclic selects already match.)
-- **Non-UTF-8 string literals.** The Go lexer decodes string literals as UTF-8
-  (an invalid byte becomes the 3-byte U+FFFD) while libclassad keeps raw bytes.
-  `FuzzDifferential` skips non-UTF-8 inputs; ClassAd source is text.
+- **Non-UTF-8 strings in regexp functions.** Both engines keep a string
+  literal's bytes (CPP_QUIRKS #15), but Go's regexp functions use RE2, which
+  rejects a pattern or target that is not valid UTF-8, where PCRE2 matches
+  bytes. `FuzzDifferential` skips non-UTF-8 inputs.
+- **Deep nesting.** libclassad 25.14 refuses to parse or evaluate past fixed
+  depths (CPP_QUIRKS, "Not mirrored"); the Go engine's limits differ.
 - **`length(...)`** *was* a Go alias for `size()`; the reference engine has no
   such function, so it has been removed (now an error), matching the reference.
-- **Integer-literal overflow** (`9223372036854775808`): the reference engine
-  silently evaluates it to `0` (a libclassad bug, reported upstream); Go rejects
-  it at parse time. Not mirrored.
+
+`TestExprParity` and `FuzzParseExprOldDifferential` (`expr_differential_test.go`)
+compare standalone-expression parsing, `classad.ParseExprOld` against
+`ParseClassAdRvalExpr`'s recipe: the lexer cases HTCondor's config functions
+(`$INT`, `$EVAL`, ...) reach, which the whole-ad targets above, and the
+`-ignore-parse` survey, do not compare.
 Surprising or likely-buggy libclassad behaviors found along the way are
 collected in [`CPP_QUIRKS.md`](CPP_QUIRKS.md) for upstream reporting.
 

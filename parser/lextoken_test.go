@@ -25,6 +25,8 @@ func kindName(k int) string {
 		return "ERROR"
 	case INT64_MIN_MAGNITUDE:
 		return "INT64MIN"
+	case NEG:
+		return "NEG"
 	case ELVIS:
 		return "ELVIS"
 	case OR:
@@ -103,7 +105,14 @@ func TestLexTokenStream(t *testing.T) {
 		{`a ?: b`, `IDENT(a) ELVIS IDENT(b)`},
 		{`x >= 1 && x <= 2`, `IDENT(x) GE INT AND IDENT(x) LE INT`},
 		{`a << 2 >> 3 >>> 4`, `IDENT(a) LSHIFT INT RSHIFT INT URSHIFT INT`},
-		{`-5`, `'-' INT`},
+		{`-5`, `NEG INT`},
+		{`- 5`, `'-' INT`},
+		{`a-5`, `IDENT(a) '-' INT`},
+		{`(1)-5`, `'(' INT ')' '-' INT`},
+		{`a ?: -.5`, `IDENT(a) ELVIS NEG REAL`},
+		{`-a`, `'-' IDENT(a)`},
+		{`-9223372036854775808`, `NEG INT64MIN`},
+		{`- 9223372036854775808`, `'-' INT`},
 		{`!x`, `'!' IDENT(x)`},
 		{`~y`, `'~' IDENT(y)`},
 		{`"he\"llo"`, `STR(he"llo)`},

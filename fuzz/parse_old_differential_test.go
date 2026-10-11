@@ -17,7 +17,6 @@ package fuzz
 import (
 	"strings"
 	"testing"
-	"unicode/utf8"
 
 	"github.com/PelicanPlatform/classad/fuzz/differ"
 )
@@ -70,9 +69,9 @@ func FuzzParseOldClassAdDifferential(f *testing.F) {
 	opts.OldClassAd = true
 
 	f.Fuzz(func(t *testing.T, s string) {
-		// Same lexer-scope exclusions as the new-parser target: non-UTF-8 and embedded NUL
-		// are known byte-vs-rune / C-string-terminator deltas, out of scope here.
-		if !utf8.ValidString(s) || strings.IndexByte(s, 0) >= 0 {
+		// Same exclusion as the new-parser target: libclassad's C-string lexer ends the
+		// input at an embedded NUL.
+		if strings.IndexByte(s, 0) >= 0 {
 			t.Skip()
 		}
 		// A bare (unescaped) double quote in the content terminates the wrapper string and

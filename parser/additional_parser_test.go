@@ -229,7 +229,9 @@ func TestStreamingLexerInvalidNumbers(t *testing.T) {
 		wantMessage string
 	}{
 		{"InvalidReal", "1e", "invalid real number: 1e"},
-		{"InvalidInteger", strings.Repeat("9", 30), "invalid integer"},
+		{"InvalidOctal", "08", "invalid octal integer: 08"},
+		{"LeadingZero", "007", "leading zero in integer literal: 007"},
+		{"InvalidHex", "0xg", "invalid hexadecimal integer: 0x"},
 	}
 
 	for _, tc := range cases {

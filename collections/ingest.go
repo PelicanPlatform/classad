@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -213,9 +212,9 @@ func fastScalar(enc *wire.StreamEncoder, name, val string) bool {
 // instead of being rejected), EXCEPT immediately before the closing quote where it
 // escapes it (\" -> a literal quote, the string continues). It returns false, deferring
 // to the parser, only for a value that is not a lone string literal or is unterminated;
-// non-ASCII bytes are decoded to runes exactly as the lexer's scanString does (an invalid
-// byte becomes U+FFFD), so a lone string literal is ALWAYS handled here and never reaches the
-// strict expression fallback (which would octal-interpret \1 and diverge from ParseOld).
+// other bytes, valid UTF-8 or not, are copied as they are, as the lexer's scanString does,
+// so a lone string literal is ALWAYS handled here and never reaches the strict expression
+// fallback (which would octal-interpret \1 and diverge from ParseOld).
 //
 // Keeping this byte-identical to ParseOld is the invariant TestUpdateOldMatchesParseOld
 // and FuzzIngestOld enforce; the escape handling here must therefore track the lexer's
@@ -229,8 +228,7 @@ func fastString(enc *wire.StreamEncoder, name, val string, unesc *[]byte) bool {
 	}
 	buf := (*unesc)[:0]
 	for i := 1; i < len(val); {
-		r, size := utf8.DecodeRuneInString(val[i:])
-		switch r {
+		switch val[i] {
 		case '"':
 			if i != len(val)-1 {
 				return false // content after the closing quote: not a lone string literal
@@ -250,8 +248,8 @@ func fastString(enc *wire.StreamEncoder, name, val string, unesc *[]byte) bool {
 				i++
 			}
 		default:
-			buf = utf8.AppendRune(buf, r) // invalid byte -> U+FFFD, matching scanString
-			i += size
+			buf = append(buf, val[i])
+			i++
 		}
 	}
 	return false // no closing quote

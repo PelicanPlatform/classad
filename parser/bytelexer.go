@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 )
 
@@ -25,6 +24,10 @@ type ByteLexer struct {
 	src string
 	pos int
 	err error
+	// prevKind is the kind of the last token returned, and signed is set
+	// when that token is a NEG before an integer-looking number (number.go).
+	prevKind int
+	signed   bool
 }
 
 // NewByteLexer returns a lexer over src. Drive it with Next.
@@ -36,12 +39,20 @@ func (l *ByteLexer) Reset(src string) {
 	l.src = src
 	l.pos = 0
 	l.err = nil
+	l.prevKind = 0
+	l.signed = false
 }
 
 // Next scans and returns the next token; at end of input its Kind is TokEOF. A
 // lexical error (unterminated string, bad escape, malformed number, ...) is
 // returned as a non-nil error, matching what the StreamingLexer path reports.
 func (l *ByteLexer) Next() (LexToken, error) {
+	tok, err := l.next()
+	l.prevKind = tok.Kind
+	return tok, err
+}
+
+func (l *ByteLexer) next() (LexToken, error) {
 	l.skipTrivia()
 	if l.err != nil {
 		return LexToken{}, l.err
@@ -52,13 +63,31 @@ func (l *ByteLexer) Next() (LexToken, error) {
 
 	c := l.src[l.pos]
 	switch c {
-	case '[', ']', '{', '}', '(', ')', ';', ',', ':', '^', '~', '+', '-', '*', '%', '/':
+	case '-':
+		// Where an operand is expected, a '-' directly before a number is its
+		// sign (NEG), which changes how the number lexes (see number.go).
+		l.pos++
+		if !endsOperand(l.prevKind) && l.pos < len(l.src) {
+			if isASCIIDigit(rune(l.src[l.pos])) {
+				l.signed = true
+				return LexToken{Kind: NEG}, nil
+			}
+			if l.src[l.pos] == '.' && l.pos+1 < len(l.src) && isASCIIDigit(rune(l.src[l.pos+1])) {
+				return LexToken{Kind: NEG}, nil
+			}
+		}
+		return LexToken{Kind: '-'}, nil
+	case '[', ']', '{', '}', '(', ')', ';', ',', ':', '^', '~', '+', '*', '%', '/':
 		// '/' reaches here only as division; comments are consumed in skipTrivia.
 		l.pos++
 		return LexToken{Kind: int(c)}, nil
 	case '?':
-		// Adjacent "?:" is the elvis operator; a spaced "? :" stays two tokens.
+		// '?' then ':' with only whitespace between is the elvis operator, as
+		// in StreamingLexer.
 		l.pos++
+		for l.pos < len(l.src) && isCSpace(rune(l.src[l.pos])) {
+			l.pos++
+		}
 		if l.pos < len(l.src) && l.src[l.pos] == ':' {
 			l.pos++
 			return LexToken{Kind: ELVIS}, nil
@@ -66,8 +95,16 @@ func (l *ByteLexer) Next() (LexToken, error) {
 		return LexToken{Kind: '?'}, nil
 	case '.':
 		// ".5" begins a fractional float; otherwise '.' is the selection operator.
+		// A second '.' is taken with the first: "..5" is a real (0.0) and "a..b"
+		// is a.b, as in libclassad and StreamingLexer.
 		if l.pos+1 < len(l.src) && isASCIIDigit(rune(l.src[l.pos+1])) {
 			return l.scanNumber(l.pos)
+		}
+		if l.pos+1 < len(l.src) && l.src[l.pos+1] == '.' {
+			if l.pos+2 < len(l.src) && isASCIIDigit(rune(l.src[l.pos+2])) {
+				return l.scanNumber(l.pos)
+			}
+			l.pos++
 		}
 		l.pos++
 		return LexToken{Kind: '.'}, nil
@@ -168,35 +205,26 @@ func (l *ByteLexer) Next() (LexToken, error) {
 func (l *ByteLexer) skipTrivia() {
 	for l.pos < len(l.src) {
 		c := l.src[l.pos]
-		if c < utf8.RuneSelf {
-			if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v' {
-				l.pos++
+		if isCSpace(rune(c)) {
+			l.pos++
+			continue
+		}
+		if c == '/' && l.pos+1 < len(l.src) {
+			switch l.src[l.pos+1] {
+			case '/':
+				l.pos += 2
+				for l.pos < len(l.src) && l.src[l.pos] != '\n' {
+					l.pos++
+				}
+				continue
+			case '*':
+				l.pos += 2
+				l.skipBlockComment()
+				if l.err != nil {
+					return
+				}
 				continue
 			}
-			if c == '/' && l.pos+1 < len(l.src) {
-				switch l.src[l.pos+1] {
-				case '/':
-					l.pos += 2
-					for l.pos < len(l.src) && l.src[l.pos] != '\n' {
-						l.pos++
-					}
-					continue
-				case '*':
-					l.pos += 2
-					l.skipBlockComment()
-					if l.err != nil {
-						return
-					}
-					continue
-				}
-			}
-			return
-		}
-		// Non-ASCII: honor unicode.IsSpace for parity with StreamingLexer.
-		r, size := utf8.DecodeRuneInString(l.src[l.pos:])
-		if unicode.IsSpace(r) {
-			l.pos += size
-			continue
 		}
 		return
 	}
@@ -214,70 +242,23 @@ func (l *ByteLexer) skipBlockComment() {
 }
 
 // scanNumber scans an integer or real literal beginning at start (which may be a
-// '.' for a leading-dot fraction) and returns the token. It mirrors
-// StreamingLexer.scanNumber, parsing the final text from a source sub-slice.
+// '.' for a leading-dot fraction) and returns the token, parsing the final text
+// from a source sub-slice. See number.go.
 func (l *ByteLexer) scanNumber(start int) (LexToken, error) {
-	i := start
-	hasDecimal := l.src[i] == '.'
-	hasExponent := false
-	i++ // consume the first byte (digit or leading '.')
-
-	for i < len(l.src) {
-		c := l.src[i]
-		if isASCIIDigit(rune(c)) {
-			i++
-			continue
-		}
-		if c == '.' && !hasDecimal && !hasExponent {
-			hasDecimal = true
-			i++
-			// A digit must follow the decimal point ("1." and "1.e5" are errors).
-			if i >= len(l.src) || !isASCIIDigit(rune(l.src[i])) {
-				l.pos = i
-				return LexToken{}, l.fail(start, fmt.Sprintf("expected digit after decimal point in %q", l.src[start:i]))
-			}
-			continue
-		}
-		if (c == 'e' || c == 'E') && !hasExponent {
-			hasExponent = true
-			hasDecimal = true
-			i++
-			if i < len(l.src) && (l.src[i] == '+' || l.src[i] == '-') {
-				i++
-			}
-			continue
-		}
-		break
+	signed := l.signed
+	l.signed = false
+	c := numCursor{src: l.src, pos: start + 1}
+	isReal, msg := scanNumberText(l.src[start], &c)
+	l.pos = c.pos
+	text := l.src[start:c.pos]
+	if msg != "" {
+		return LexToken{}, l.fail(start, fmt.Sprintf(msg, text))
 	}
-
-	text := l.src[start:i]
-	l.pos = i
-
-	if hasDecimal || hasExponent {
-		val, err := strconv.ParseFloat(text, 64)
-		// A range error still yields the correctly-rounded value (+/-Inf or 0),
-		// matching the reference's strtod; only a syntax error is fatal.
-		if err != nil && !errors.Is(err, strconv.ErrRange) {
-			return LexToken{}, l.fail(start, fmt.Sprintf("invalid real number: %s", text))
-		}
-		return LexToken{Kind: REAL_LITERAL, Real: val}, nil
-	}
-
-	// A leading zero (other than a bare "0") is rejected, not read as octal.
-	if len(text) > 1 && text[0] == '0' {
-		return LexToken{}, l.fail(start, fmt.Sprintf("leading zero in integer literal: %s", text))
-	}
-
-	val, err := strconv.ParseInt(text, 10, 64)
+	kind, i, r, err := numberToken(text, isReal, signed)
 	if err != nil {
-		// 2^63 is the magnitude of INT64_MIN: emit a dedicated token so the caller
-		// can fold '-' 2^63 into INT64_MIN. A bare 2^63 stays a syntax error there.
-		if u, uerr := strconv.ParseUint(text, 10, 64); uerr == nil && u == 1<<63 {
-			return LexToken{Kind: INT64_MIN_MAGNITUDE}, nil
-		}
-		return LexToken{}, l.fail(start, fmt.Sprintf("invalid integer: %s", text))
+		return LexToken{}, l.fail(start, err.Error())
 	}
-	return LexToken{Kind: INTEGER_LITERAL, Int: val}, nil
+	return LexToken{Kind: kind, Int: i, Real: r}, nil
 }
 
 // scanIdentifierOrKeyword scans a bare identifier (optionally folding a
@@ -297,23 +278,19 @@ func (l *ByteLexer) scanIdentifierOrKeyword() (LexToken, error) {
 	}
 
 	// Scope-prefix fold: MY./TARGET./PARENT. followed by an identifier becomes one
-	// token. Matching StreamingLexer, the '.' is consumed once the prefix matches
-	// even if what follows is not an identifier char (a benign quirk preserved for
-	// byte-identical behavior).
+	// token, as in StreamingLexer. Otherwise the '.' stays a separate token.
 	word := l.src[start:l.pos]
-	if l.pos < len(l.src) && l.src[l.pos] == '.' &&
+	if l.pos+1 < len(l.src) && l.src[l.pos] == '.' &&
+		(isASCIILetter(rune(l.src[l.pos+1])) || l.src[l.pos+1] == '_') &&
 		(strings.EqualFold(word, "MY") || strings.EqualFold(word, "TARGET") || strings.EqualFold(word, "PARENT")) {
-		l.pos++ // consume '.'
-		if l.pos < len(l.src) && (isASCIILetter(rune(l.src[l.pos])) || l.src[l.pos] == '_') {
-			l.pos++
-			for l.pos < len(l.src) {
-				c := l.src[l.pos]
-				if isASCIILetter(rune(c)) || isASCIIDigit(rune(c)) || c == '_' {
-					l.pos++
-					continue
-				}
-				break
+		l.pos += 2 // the '.' and the name's first byte
+		for l.pos < len(l.src) {
+			c := l.src[l.pos]
+			if isASCIILetter(rune(c)) || isASCIIDigit(rune(c)) || c == '_' {
+				l.pos++
+				continue
 			}
+			break
 		}
 	}
 
@@ -348,12 +325,8 @@ func (l *ByteLexer) scanString() (LexToken, error) {
 		if c == '"' {
 			s := l.src[l.pos+1 : i]
 			l.pos = i + 1
-			// The reference reads the body through bufio.ReadRune, which maps each
-			// invalid UTF-8 byte to U+FFFD; normalize to stay byte-identical (valid
-			// UTF-8 stays a zero-copy sub-slice).
-			if !utf8.ValidString(s) {
-				s = normalizeUTF8(s)
-			}
+			// The bytes are kept as they are, valid UTF-8 or not: libclassad
+			// strings are bytes.
 			return LexToken{Kind: STRING_LITERAL, Str: s}, nil
 		}
 		if c == '\\' {
@@ -368,7 +341,7 @@ func (l *ByteLexer) scanString() (LexToken, error) {
 
 	// Escape path: copy what we have, then decode escapes.
 	var b strings.Builder
-	writeNormalized(&b, l.src[l.pos+1:i])
+	b.WriteString(l.src[l.pos+1 : i])
 	l.pos = i
 	for l.pos < len(l.src) {
 		c := l.src[l.pos]
@@ -412,36 +385,10 @@ func (l *ByteLexer) scanString() (LexToken, error) {
 			}
 			continue
 		}
-		// Decode a full rune (invalid byte -> U+FFFD) to match ReadRune/WriteRune.
-		r, size := utf8.DecodeRuneInString(l.src[l.pos:])
-		b.WriteRune(r)
-		l.pos += size
+		b.WriteByte(c)
+		l.pos++
 	}
 	return LexToken{}, l.fail(start, fmt.Sprintf("unterminated string starting at byte %d", start))
-}
-
-// normalizeUTF8 re-encodes s rune by rune, mapping each invalid UTF-8 byte to
-// U+FFFD exactly as bufio.ReadRune + WriteRune does in the streaming lexer. Valid
-// UTF-8 is returned unchanged (callers avoid it via a utf8.ValidString check).
-func normalizeUTF8(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	writeNormalized(&b, s)
-	return b.String()
-}
-
-// writeNormalized appends s to b, replacing each invalid UTF-8 byte with U+FFFD
-// (bufio.ReadRune + WriteRune semantics). Valid UTF-8 is appended verbatim.
-func writeNormalized(b *strings.Builder, s string) {
-	if utf8.ValidString(s) {
-		b.WriteString(s)
-		return
-	}
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		b.WriteRune(r)
-		i += size
-	}
 }
 
 // scanOctalEscape consumes an octal escape (the leading digit already read as
@@ -471,7 +418,7 @@ func (l *ByteLexer) scanOctalEscape(first byte, b *strings.Builder) bool {
 		l.err = errors.New(l.formatError(l.pos, fmt.Sprintf("null character (\\%s) not allowed in string at position %d", digits, l.pos)))
 		return false
 	}
-	b.WriteRune(rune(val))
+	b.WriteByte(byte(val)) // one byte, as convert_escapes writes it
 	return true
 }
 
@@ -487,9 +434,6 @@ func (l *ByteLexer) scanQuotedIdentifier() (LexToken, error) {
 		if c == '\'' {
 			s := l.src[l.pos+1 : i]
 			l.pos = i + 1
-			if !utf8.ValidString(s) {
-				s = normalizeUTF8(s)
-			}
 			return LexToken{Kind: IDENTIFIER, Str: s}, nil
 		}
 		if c == '\n' {
@@ -507,7 +451,7 @@ func (l *ByteLexer) scanQuotedIdentifier() (LexToken, error) {
 	}
 
 	var b strings.Builder
-	writeNormalized(&b, l.src[l.pos+1:i])
+	b.WriteString(l.src[l.pos+1 : i])
 	l.pos = i
 	for l.pos < len(l.src) {
 		c := l.src[l.pos]
@@ -523,13 +467,12 @@ func (l *ByteLexer) scanQuotedIdentifier() (LexToken, error) {
 				return LexToken{}, l.fail(start, fmt.Sprintf("unterminated quoted attribute name starting at byte %d", start))
 			}
 			// The reference reads the escaped rune whole and writes it verbatim.
-			r, size := utf8.DecodeRuneInString(l.src[l.pos:])
-			b.WriteRune(r)
+			_, size := utf8.DecodeRuneInString(l.src[l.pos:])
+			b.WriteString(l.src[l.pos : l.pos+size])
 			l.pos += size
 		default:
-			r, size := utf8.DecodeRuneInString(l.src[l.pos:])
-			b.WriteRune(r)
-			l.pos += size
+			b.WriteByte(c)
+			l.pos++
 		}
 	}
 	return LexToken{}, l.fail(start, fmt.Sprintf("unterminated quoted attribute name starting at byte %d", start))

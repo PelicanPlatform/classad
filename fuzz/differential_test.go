@@ -107,11 +107,10 @@ func FuzzDifferential(f *testing.F) {
 	opts := seedOpts
 
 	f.Fuzz(func(t *testing.T, src string) {
-		// ClassAd source is text. Skip non-UTF-8 mutations: the Go lexer
-		// decodes string literals as UTF-8 (so an invalid byte like 0xa2
-		// becomes the 3-byte U+FFFD) while libclassad keeps raw bytes -- a
-		// known, niche byte-vs-rune divergence in string-literal scanning that
-		// is out of scope for evaluation-semantics fuzzing (see README).
+		// Skip non-UTF-8 mutations. Both engines keep a string literal's
+		// bytes, but Go's regexp functions (RE2) reject a pattern or target
+		// that is not valid UTF-8, where libclassad's PCRE2 matches bytes
+		// (see README).
 		if !utf8.ValidString(src) {
 			t.Skip()
 		}
