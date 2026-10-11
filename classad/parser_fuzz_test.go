@@ -2,7 +2,6 @@ package classad
 
 import (
 	"testing"
-	"unicode/utf8"
 )
 
 // parserFuzzSeeds are representative ClassAd sources spanning operators,
@@ -51,14 +50,9 @@ func FuzzParse(f *testing.F) {
 			t.Fatalf("Parse returned nil ad and nil error for %q", src)
 		}
 		out := ad.String()
-		// The re-parse invariant holds for UTF-8 text; non-UTF-8 string
-		// literals are a known lexer limitation (the lexer decodes UTF-8 while
-		// bytes round-trip lossily), out of scope here as in FuzzDifferential.
-		if utf8.ValidString(src) {
-			if _, err := Parse(out); err != nil {
-				t.Fatalf("unparse of a parsed ad does not re-parse:\n  in:  %q\n  out: %q\n  err: %v",
-					src, out, err)
-			}
+		if _, err := Parse(out); err != nil {
+			t.Fatalf("unparse of a parsed ad does not re-parse:\n  in:  %q\n  out: %q\n  err: %v",
+				src, out, err)
 		}
 	})
 }
@@ -71,10 +65,6 @@ func FuzzRoundTrip(f *testing.F) {
 		f.Add(s)
 	}
 	f.Fuzz(func(t *testing.T, src string) {
-		// Non-UTF-8 string literals round-trip lossily (known lexer limitation).
-		if !utf8.ValidString(src) {
-			return
-		}
 		ad1, err := Parse(src)
 		if err != nil {
 			return

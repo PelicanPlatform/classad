@@ -7,7 +7,6 @@ import (
 	"io"
 	"strconv"
 	"strings"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -29,12 +28,29 @@ type StreamingLexer struct {
 	pendingSize      int
 	hasPending       bool
 	seen             []rune
-	// lenientEscapes keeps an unrecognized string escape sequence literally (the
-	// backslash and the following character both) instead of erroring. This matches the
-	// C++ old-ClassAd string tokenizer (Lexer::tokenizeStringOld), which does no escape
-	// processing at all -- so a value like OSIssue = "\S" (agetty escapes from /etc/issue)
-	// round-trips instead of failing the whole ad. Set only on the old-ClassAd parse path.
+	// lenientEscapes selects old-ClassAd string and quoted-name lexing (scanStringOld,
+	// C++ Lexer::tokenizeStringOld), which does no escape processing at all -- so a
+	// value like OSIssue = "\S" (agetty escapes from /etc/issue) round-trips instead of
+	// failing the whole ad. Set only on the old-ClassAd parse path.
 	lenientEscapes bool
+	// exprStart makes the next token the grammar's EXPR_START, so the input is
+	// parsed as one standalone expression rather than a ClassAd.
+	exprStart bool
+	// noStringConcat rejects adjacent string literals, which old ClassAd syntax
+	// does not concatenate (Lexer::tokenizeStringOld has no such step, unlike
+	// tokenizeString). Set only by ParseExprOld.
+	noStringConcat bool
+	// prevTok is the kind of the last token returned; a '-' after an operand is
+	// the binary operator, elsewhere the sign of a following number.
+	prevTok int
+	// signedNum is set when the NEG just returned signs an integer-looking
+	// number, which then lexes by different rules (see number.go).
+	signedNum bool
+	// tokStart is the input offset at which the last Lex call started, and
+	// errAt is tokStart when the first error was recorded: the start of the
+	// token that failed the parse.
+	tokStart int
+	errAt    int
 }
 
 // NewStreamingLexer creates a lexer that consumes tokens directly from a reader.
@@ -58,6 +74,10 @@ func (l *StreamingLexer) resetForNext() {
 	l.pendingSize = 0
 	l.hasPending = false
 	l.seen = l.seen[:0]
+	l.prevTok = 0
+	l.signedNum = false
+	l.exprStart = false
+	l.noStringConcat = false
 }
 
 // isASCIILetter and isASCIIDigit define the character classes for identifiers
@@ -74,6 +94,22 @@ func isASCIIDigit(r rune) bool {
 
 // Lex implements the goyacc Lexer interface.
 func (l *StreamingLexer) Lex(lval *yySymType) int {
+	l.tokStart = l.pos
+	if l.exprStart {
+		l.exprStart = false
+		l.prevTok = EXPR_START
+		return EXPR_START
+	}
+	tok := l.lex(lval)
+	if tok == STRING_LITERAL && l.prevTok == STRING_LITERAL && l.noStringConcat && l.err == nil {
+		l.Error("adjacent string literals")
+		tok = 0
+	}
+	l.prevTok = tok
+	return tok
+}
+
+func (l *StreamingLexer) lex(lval *yySymType) int {
 	if l.done {
 		return 0
 	}
@@ -128,9 +164,19 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 	case ',':
 		return int(',')
 	case '?':
-		// An adjacent "?:" is the high-precedence elvis operator; a spaced
-		// "? :" stays two tokens and binds at ternary precedence (matching the
-		// reference lexer, which only fuses an immediately-following ':').
+		// A '?' followed by a ':', with only whitespace between them, is the
+		// high-precedence elvis operator; libclassad's lexer skips the
+		// whitespace (HTCONDOR-3814). A comment between them leaves two tokens.
+		for {
+			next, err := l.peekRune()
+			if err != nil || !isCSpace(next) {
+				break
+			}
+			if err := l.discardRune(); err != nil {
+				l.err = err
+				return 0
+			}
+		}
 		if next, err := l.peekRune(); err == nil && next == ':' {
 			if err := l.discardRune(); err != nil {
 				l.err = err
@@ -148,6 +194,18 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 	case '+':
 		return int('+')
 	case '-':
+		// Where an operand is expected, a '-' directly before a number is its
+		// sign (NEG), which changes how the number lexes (see number.go).
+		if !endsOperand(l.prevTok) {
+			if next, err := l.peekRune(); err == nil && isASCIIDigit(next) {
+				l.signedNum = true
+				return NEG
+			} else if err == nil && next == '.' {
+				if after, perr := l.r.Peek(1); perr == nil && isASCIIDigit(rune(after[0])) {
+					return NEG
+				}
+			}
+		}
 		return int('-')
 	case '*':
 		return int('*')
@@ -156,9 +214,19 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 	case '.':
 		// A '.' immediately before a digit begins a fractional float literal
 		// (".5"), which the reference accepts; otherwise it is the selection
-		// operator.
+		// operator. Like libclassad, a second '.' is taken with the first:
+		// before a digit the two begin a real that strtod reads as 0.0 ("..5"),
+		// and otherwise they are one selection operator ("a..b" is a.b).
 		if next, err := l.peekRune(); err == nil && isASCIIDigit(next) {
 			return l.scanNumber('.', lval)
+		} else if err == nil && next == '.' {
+			if after, perr := l.r.Peek(1); perr == nil && isASCIIDigit(rune(after[0])) {
+				return l.scanNumber('.', lval)
+			}
+			if err := l.discardRune(); err != nil {
+				l.err = err
+				return 0
+			}
 		}
 		return int('.')
 	case '"':
@@ -166,6 +234,13 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 		lval.str = str
 		return STRING_LITERAL
 	case '\'':
+		if l.lenientEscapes {
+			lval.str = l.scanStringOld('\'')
+			if l.err != nil {
+				return 0
+			}
+			return IDENTIFIER
+		}
 		return l.scanQuotedIdentifier(lval)
 	case '=':
 		if next, err := l.peekRune(); err == nil {
@@ -297,7 +372,7 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 					l.err = err
 					return 0
 				}
-				return l.Lex(lval)
+				return l.lex(lval)
 			case '*':
 				if err := l.discardRune(); err != nil {
 					l.err = err
@@ -307,7 +382,7 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 					l.err = err
 					return 0
 				}
-				return l.Lex(lval)
+				return l.lex(lval)
 			}
 		}
 		return int('/')
@@ -332,6 +407,9 @@ func (l *StreamingLexer) Lex(lval *yySymType) int {
 
 // Error implements the goyacc Lexer interface.
 func (l *StreamingLexer) Error(s string) {
+	if l.err == nil {
+		l.errAt = l.tokStart
+	}
 	l.err = errors.New(l.formatError(s))
 }
 
@@ -354,12 +432,30 @@ func (l *StreamingLexer) readRune() (rune, int, error) {
 		return ch, size, nil
 	}
 
-	ch, size, err := l.r.ReadRune()
+	ch, size, err := l.readRawRune()
 	if err != nil {
 		return 0, 0, err
 	}
 	l.recordRune(ch, size)
 	return ch, size, nil
+}
+
+// readRawRune reads the next rune from the reader. A byte that is not part of
+// valid UTF-8 comes back as rawByteBase+byte rather than U+FFFD, so a string
+// literal keeps it.
+func (l *StreamingLexer) readRawRune() (rune, int, error) {
+	ch, size, err := l.r.ReadRune()
+	if err == nil && ch == utf8.RuneError && size == 1 {
+		if uerr := l.r.UnreadRune(); uerr != nil {
+			return 0, 0, uerr
+		}
+		b, berr := l.r.ReadByte()
+		if berr != nil {
+			return 0, 0, berr
+		}
+		return rawByteBase + rune(b), 1, nil
+	}
+	return ch, size, err
 }
 
 func (l *StreamingLexer) unreadRune(size int) {
@@ -379,7 +475,7 @@ func (l *StreamingLexer) peekRune() (rune, error) {
 		return l.pendingRune, nil
 	}
 
-	ch, size, err := l.r.ReadRune()
+	ch, size, err := l.readRawRune()
 	if err != nil {
 		return 0, err
 	}
@@ -401,11 +497,15 @@ func (l *StreamingLexer) peekRuneRaw() (rune, error) {
 	if l.hasPending {
 		return l.pendingRune, nil
 	}
-	ch, _, err := l.r.ReadRune()
+	ch, _, err := l.readRawRune()
 	if err != nil {
 		return 0, err
 	}
-	if uerr := l.r.UnreadRune(); uerr != nil {
+	unread := l.r.UnreadRune
+	if ch >= rawByteBase {
+		unread = l.r.UnreadByte
+	}
+	if uerr := unread(); uerr != nil {
 		return 0, uerr
 	}
 	return ch, nil
@@ -424,7 +524,7 @@ func (l *StreamingLexer) skipTrivia() error {
 			return err
 		}
 
-		if unicode.IsSpace(ch) {
+		if isCSpace(ch) {
 			continue
 		}
 
@@ -504,6 +604,9 @@ func (l *StreamingLexer) skipBlockComment() error {
 }
 
 func (l *StreamingLexer) scanString() string {
+	if l.lenientEscapes {
+		return l.scanStringOld('"')
+	}
 	var result strings.Builder
 	startPos := l.pos - utf8.RuneLen('"')
 
@@ -521,24 +624,6 @@ func (l *StreamingLexer) scanString() string {
 		}
 
 		if ch == '\\' {
-			if l.lenientEscapes {
-				// Old-ClassAd string semantics (C++ Lexer::tokenizeStringOld): a backslash is
-				// literal EXCEPT immediately before the closing quote, where it escapes it --
-				// \" becomes a literal quote and the string continues. So no other escape is
-				// interpreted (\S \r \n \t stay literal, backslash and all), matching the C++
-				// collector byte-for-byte; and a string cannot end in a lone backslash ("\\"
-				// is unterminated), exactly as in C++. Process ONE backslash at a time (peek,
-				// don't consume the next rune) so \\" correctly reads as \ then an escaped ".
-				if next, perr := l.peekRune(); perr == nil && next == '"' {
-					if err := l.discardRune(); err != nil {
-						return result.String()
-					}
-					result.WriteRune('"')
-				} else {
-					result.WriteRune('\\')
-				}
-				continue
-			}
 			escaped, _, err := l.readRune()
 			if err != nil {
 				l.Error(fmt.Sprintf("unterminated escape sequence in string starting at position %d", startPos))
@@ -594,15 +679,62 @@ func (l *StreamingLexer) scanString() string {
 					l.Error(fmt.Sprintf("null character (\\%s) not allowed in string at position %d", octalStr.String(), l.pos))
 					return result.String()
 				}
-				result.WriteRune(rune(val))
+				result.WriteByte(byte(val)) // one byte, as convert_escapes writes it
 			default:
 				l.Error(fmt.Sprintf("invalid escape sequence \\%c at position %d", escaped, l.pos-2))
-				result.WriteRune(escaped)
+				writeLexRune(&result, escaped)
 			}
 			continue
 		}
 
-		result.WriteRune(ch)
+		writeLexRune(&result, ch)
+	}
+}
+
+// scanStringOld scans the rest of a string literal (delim is a double quote)
+// or a quoted attribute name (a single quote) in old ClassAd syntax, as C++
+// Lexer::tokenizeStringOld does. No escape sequence is interpreted (\S \n \t
+// stay literal, backslash and all), except that a backslash immediately before
+// the delimiter escapes it: the delimiter is kept and the literal continues --
+// unless that delimiter is the last thing on the line or in the input, where
+// the literal ends there, with the backslash as its last byte. One backslash
+// is processed at a time (peek, don't consume the next rune), so \\" reads as
+// \ then an escaped ".
+func (l *StreamingLexer) scanStringOld(delim rune) string {
+	var result strings.Builder
+	startPos := l.pos - 1
+	for {
+		ch, _, err := l.readRune()
+		if err != nil {
+			if err == io.EOF {
+				l.Error(fmt.Sprintf("unterminated string starting at byte %d", startPos))
+			}
+			return result.String()
+		}
+		switch ch {
+		case delim:
+			return result.String()
+		case '\\':
+			if next, perr := l.peekRune(); perr == nil && next == delim {
+				if err := l.discardRune(); err != nil {
+					return result.String()
+				}
+				if after, aerr := l.peekRune(); aerr != nil || after == '\n' {
+					if aerr == nil {
+						if err := l.discardRune(); err != nil { // the newline
+							return result.String()
+						}
+					}
+					result.WriteByte('\\')
+					return result.String()
+				}
+				result.WriteRune(delim)
+			} else {
+				result.WriteByte('\\')
+			}
+		default:
+			writeLexRune(&result, ch)
+		}
 	}
 }
 
@@ -635,9 +767,9 @@ func (l *StreamingLexer) scanQuotedIdentifier(lval *yySymType) int {
 				l.Error(fmt.Sprintf("unterminated quoted attribute name starting at byte %d", startPos))
 				return 0
 			}
-			sb.WriteRune(escaped)
+			writeLexRune(&sb, escaped)
 		default:
-			sb.WriteRune(ch)
+			writeLexRune(&sb, ch)
 		}
 	}
 }
@@ -674,101 +806,22 @@ func (l *StreamingLexer) formatError(msg string) string {
 }
 
 func (l *StreamingLexer) scanNumber(first rune, lval *yySymType) int {
-	var sb strings.Builder
-	sb.WriteRune(first)
-
-	// first may be '.' when the literal has no integer part (".5").
-	hasDecimal := first == '.'
-	hasExponent := false
-
-	for {
-		ch, err := l.peekRune()
-		if err != nil {
-			break
-		}
-
-		if isASCIIDigit(ch) {
-			if err := l.discardRune(); err != nil {
-				return 0
-			}
-			sb.WriteRune(ch)
-			continue
-		}
-
-		if ch == '.' && !hasDecimal && !hasExponent {
-			hasDecimal = true
-			if err := l.discardRune(); err != nil {
-				return 0
-			}
-			sb.WriteRune(ch)
-			// The reference requires a digit after the decimal point, so "1.",
-			// "5.", and "1.e5" are rejected (a leading-dot ".5" is fine because
-			// the caller only starts a number on '.' when a digit follows).
-			if next, perr := l.peekRune(); perr != nil || !isASCIIDigit(next) {
-				l.Error(fmt.Sprintf("expected digit after decimal point in %q", sb.String()))
-				return 0
-			}
-			continue
-		}
-
-		if (ch == 'e' || ch == 'E') && !hasExponent {
-			hasExponent = true
-			hasDecimal = true
-			if err := l.discardRune(); err != nil {
-				return 0
-			}
-			sb.WriteRune(ch)
-			next, err := l.peekRune()
-			if err == nil && (next == '+' || next == '-') {
-				if err := l.discardRune(); err != nil {
-					return 0
-				}
-				sb.WriteRune(next)
-			}
-			continue
-		}
-
-		break
-	}
-
-	text := sb.String()
-
-	if hasDecimal || hasExponent {
-		val, err := strconv.ParseFloat(text, 64)
-		// A range error still yields the correctly-rounded value: an
-		// out-of-range magnitude overflows to +/-Inf and a tiny one underflows
-		// to 0, exactly as the reference's strtod does (e.g. "1e1000" is
-		// real(inf)). Only a genuine syntax error is fatal.
-		if err != nil && !errors.Is(err, strconv.ErrRange) {
-			l.Error(fmt.Sprintf("invalid real number: %s", text))
-			return 0
-		}
-		lval.real = val
-		return REAL_LITERAL
-	}
-
-	// The reference parser rejects an integer literal with a leading zero (only
-	// a bare "0" is allowed); it is not read as octal. Match that rather than
-	// silently treating "010" as decimal 10.
-	if len(text) > 1 && text[0] == '0' {
-		l.Error(fmt.Sprintf("leading zero in integer literal: %s", text))
+	signed := l.signedNum
+	l.signedNum = false
+	c := numCursor{sl: l, buf: append(make([]byte, 0, 24), byte(first))}
+	isReal, msg := scanNumberText(byte(first), &c)
+	text := string(c.buf)
+	if msg != "" {
+		l.Error(fmt.Sprintf(msg, text))
 		return 0
 	}
-
-	val, err := strconv.ParseInt(text, 10, 64)
+	kind, i, r, err := numberToken(text, isReal, signed)
 	if err != nil {
-		// 2^63 overflows int64 but is the magnitude of INT64_MIN. Emit a
-		// dedicated token so the grammar can fold '-' 2^63 into INT64_MIN; a
-		// bare 2^63 has no grammar rule and stays a syntax error (positive
-		// overflow, which the Go engine rejects rather than wrapping).
-		if u, uerr := strconv.ParseUint(text, 10, 64); uerr == nil && u == 1<<63 {
-			return INT64_MIN_MAGNITUDE
-		}
-		l.Error(fmt.Sprintf("invalid integer: %s", text))
+		l.Error(err.Error())
 		return 0
 	}
-	lval.integer = val
-	return INTEGER_LITERAL
+	lval.integer, lval.real = i, r
+	return kind
 }
 
 func (l *StreamingLexer) scanIdentifierOrKeyword(first rune, lval *yySymType) int {
@@ -796,12 +849,17 @@ func (l *StreamingLexer) scanIdentifierOrKeyword(first rune, lval *yySymType) in
 	if next, err := l.peekRune(); err == nil && next == '.' {
 		switch textUpper {
 		case "MY", "TARGET", "PARENT":
-			// Consume '.'
-			if err := l.discardRune(); err != nil {
-				return 0
-			}
-			peek, err := l.peekRune()
-			if err == nil && (isASCIILetter(peek) || peek == '_') {
+			// Fold "MY.name" into one token only when a name follows the '.';
+			// otherwise the '.' stays a separate token, as in libclassad.
+			after, aerr := l.r.Peek(1)
+			if aerr == nil && (isASCIILetter(rune(after[0])) || after[0] == '_') {
+				if err := l.discardRune(); err != nil { // the '.'
+					return 0
+				}
+				peek, err := l.peekRune()
+				if err != nil {
+					return 0
+				}
 				if err := l.discardRune(); err != nil {
 					return 0
 				}

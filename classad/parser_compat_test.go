@@ -44,16 +44,20 @@ func TestParserCompat(t *testing.T) {
 		{`[a = 1.5e3]`, true},
 		{`[a = 00.5]`, true},
 
-		// ';' separates assignments but empty statements are allowed anywhere;
-		// two assignments with no ';' between them is still an error.
+		// ';' separates assignments and extra ones are allowed around them, but
+		// (as in libclassad's parseClassAd) not with no assignment at all; two
+		// assignments with no ';' between them is an error.
 		{`[;a=1]`, true},
+		{`[;;a=1]`, true},
 		{`[a=1;]`, true},
+		{`[a=1;;]`, true},
 		{`[a=1;;b=2]`, true},
-		{`[;;]`, true},
-		{`[ ; ]`, true},
+		{`[;;]`, false},
+		{`[ ; ]`, false},
 		{`[]`, true},
 		{`[;a=1;;b=2;]`, true},
 		{`[a=1 b=2]`, false},
+		{`[''=0]`, false}, // libclassad refuses an empty attribute name
 
 		// A leading-dot reference (".A") is accepted (it resolves like "A").
 		{`[A=1; B=.A]`, true},
@@ -90,7 +94,7 @@ func TestParserCompat(t *testing.T) {
 
 		// INT64_MIN parses; a bare 2^63 (positive overflow) does not.
 		{`[a = -9223372036854775808]`, true},
-		{`[a = 9223372036854775808]`, false},
+		{`[a = 9223372036854775808]`, true}, // out of range: 0, as in libclassad
 
 		// A real literal whose magnitude overflows float64 is accepted as
 		// +/-Inf (matching strtod), not rejected; a tiny one underflows to 0.

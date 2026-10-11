@@ -601,17 +601,19 @@ func TestShortCircuitLazyOperand(t *testing.T) {
 	}
 }
 
-// TestElvisPrecedence guards that the adjacent "?:" elvis operator binds at
-// postfix precedence (tighter than arithmetic), so 10 ?: 2 + 3 is (10 ?: 2) + 3
-// == 13, while a spaced "? :" stays at ternary precedence (10 ? : 2 + 3 is
-// 10 ?: (2 + 3) == 10). Matches the reference parser.
+// TestElvisPrecedence guards that the "?:" elvis operator binds at postfix
+// precedence (tighter than arithmetic), so 10 ?: 2 + 3 is (10 ?: 2) + 3 == 13.
+// Whitespace between '?' and ':' does not matter: libclassad's lexer skips it
+// since HTCONDOR-3814 (25.14); before that a spaced "? :" bound at ternary
+// precedence. A comment between them is a conditional missing its middle.
 func TestElvisPrecedence(t *testing.T) {
 	cases := []struct {
 		src  string
 		want int64
 	}{
-		{`[ a = 10 ?: 2 + 3 ]`, 13},  // adjacent: (10 ?: 2) + 3
-		{`[ a = 10 ? : 2 + 3 ]`, 10}, // spaced: 10 ?: (2 + 3)
+		{`[ a = 10 ?: 2 + 3 ]`, 13},   // adjacent: (10 ?: 2) + 3
+		{`[ a = 10 ? : 2 + 3 ]`, 13},  // spaced: still (10 ?: 2) + 3
+		{"[ a = 10 ?\n: 2 + 3 ]", 13}, // any C whitespace
 		{`[ a = 0 ?: 3 + 4 ?: 9 ]`, 4},
 		{`[ a = 1 ?: 2 ?: 3 ]`, 1},
 	}
@@ -624,6 +626,9 @@ func TestElvisPrecedence(t *testing.T) {
 		if got, _ := v.IntValue(); !v.IsInteger() || got != tc.want {
 			t.Errorf("%s: a = %v, want int(%d)", tc.src, v, tc.want)
 		}
+	}
+	if _, err := Parse(`[ a = 10 ? /* c */ : 2 ]`); err == nil {
+		t.Errorf("10 ? /* c */ : 2 parsed; libclassad rejects it")
 	}
 }
 
@@ -1165,9 +1170,27 @@ func TestInt64MinLiteral(t *testing.T) {
 			t.Errorf("%s => %s", tc.expr, msg)
 		}
 	}
-	// A bare 2^63 must remain a parse error (positive overflow).
-	if _, err := Parse(`[ x = 9223372036854775808 ]`); err == nil {
-		t.Errorf("bare 9223372036854775808 (2^63) should be a parse error, but parsed")
+	// Anywhere but directly after a '-' in operand position, 2^63 is out of
+	// range, and libclassad lexes an out-of-range integer as 0.
+	zero := []struct {
+		expr string
+		want string
+	}{
+		{`9223372036854775808`, "I:0"},
+		{`- 9223372036854775808`, "I:0"},
+		{`1-9223372036854775808`, "I:1"},
+		{`-9223372036854775809`, "I:0"},
+		{`123456789012345678901234567890`, "I:0"},
+	}
+	for _, tc := range zero {
+		ad, err := Parse("[ x = " + tc.expr + " ]")
+		if err != nil {
+			t.Errorf("%s: unexpected parse error: %v", tc.expr, err)
+			continue
+		}
+		if msg := checkValue(ad.EvaluateAttr("x"), tc.want); msg != "" {
+			t.Errorf("%s => %s", tc.expr, msg)
+		}
 	}
 }
 

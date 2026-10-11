@@ -45,9 +45,17 @@ var byteLexerCases = []string{
 	// literals
 	`1`, `0`, `42`, `3.14`, `.5`, `1.0e10`, `1E-3`, `2.5e+8`, `9223372036854775807`,
 	`"hi"`, `""`, `"a\"b\n\t\\"`, `"tab\there"`, `"oct\101\0777"`, `"utf: ✓ �z"`,
-	// invalid UTF-8 in string/quoted-name bodies must normalize to U+FFFD, matching
-	// the reference's bufio.ReadRune (each bad byte -> one replacement char).
-	"\"\xec\"", "\"a\xec\xecb\"", "\"pre\\n\xff\"", "'\xecname'", "\"\xe2\x9c\"",
+	// bytes that are not valid UTF-8 in string/quoted-name bodies are kept as they are
+	"\"\xec\"", "\"a\xec\xecb\"", "\"pre\\n\xff\"", "'\xecname'", "\"\xe2\x9c\"", "'a\\\xffb'",
+	// numbers as libclassad lexes them: a '-' where an operand is expected signs
+	// the number (NEG); out-of-range integers are 0; hex reals; doubled dots
+	`-00`, `-07`, `-0x10`, `1-5`, `1 - 5`, `(-5)`, `a ?: -1`, `-.5`, `- .5`, `-9223372036854775808`,
+	`9223372036854775808`, `- 9223372036854775808`, `99999999999999999999`, `0x1.8`, `0x1F.5e+3`,
+	`..5`, `a..b`, `00`, `08`, `0x`, `0x1.`, `1e`, `08.5`, `00e5`,
+	// whitespace is C isspace only; ? and : with whitespace between are ELVIS
+	"1\xc2\xa0+1", "1\v+1", "a ? : b", "a ?\n: b", "a ? /**/ : b",
+	// a scope prefix folds only when a name follows its '.'
+	"mY. ", "MY.", "TARGET.1", "MY.'x'", "parent._a",
 	`true`, `false`, `TRUE`, `False`, `undefined`, `Undefined`, `error`, `ERROR`,
 	// identifiers and scopes
 	`x`, `_x9`, `FooBar_123`, `TARGET.Cpus`, `my.rank`, `Parent.Foo`, `target.a.b`,

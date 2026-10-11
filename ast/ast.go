@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"strings"
 	"unicode"
-	"unicode/utf8"
 )
 
 // QuoteAttributeName renders an attribute name so it re-parses: a valid bare
@@ -19,11 +18,13 @@ func QuoteAttributeName(name string) string {
 	}
 	var b strings.Builder
 	b.WriteByte('\'')
-	for _, r := range name {
-		if r == '\'' || r == '\\' {
+	// Byte by byte: only ASCII bytes are escaped, and a byte that is not valid
+	// UTF-8 is kept (the lexer keeps it too).
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c == '\'' || c == '\\' {
 			b.WriteByte('\\')
 		}
-		b.WriteRune(r)
+		b.WriteByte(name[i])
 	}
 	b.WriteByte('\'')
 	return b.String()
@@ -32,8 +33,8 @@ func QuoteAttributeName(name string) string {
 // QuoteString renders a string value as a double-quoted ClassAd string literal
 // that the lexer can read back: it uses only the escapes the lexer decodes
 // (\b \f \n \r \t \\ \"), octal (\NNN) for other control characters, and emits
-// everything else (printable ASCII and valid Unicode) verbatim. It deliberately
-// avoids Go's \xNN hex escapes, which the lexer does not understand.
+// every other byte verbatim, valid UTF-8 or not. It deliberately avoids Go's
+// \xNN hex escapes, which the lexer does not understand.
 // stringNeedsEscape reports whether QuoteString must escape any byte of s: a
 // quote, a backslash, or a control character (< 0x20). Bytes >= 0x20, including
 // every byte of a multi-byte UTF-8 rune, pass through unescaped.
@@ -55,35 +56,13 @@ func QuoteString(s string) string {
 	if !stringNeedsEscape(s) {
 		return `"` + s + `"`
 	}
-	var b strings.Builder
-	b.Grow(len(s) + 2)
-	b.WriteByte('"')
-	for _, r := range s {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\b':
-			b.WriteString(`\b`)
-		case '\f':
-			b.WriteString(`\f`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		default:
-			if r < 0x20 {
-				fmt.Fprintf(&b, "\\%03o", r)
-			} else {
-				b.WriteRune(r)
-			}
-		}
+	b := make([]byte, 0, len(s)+8)
+	b = append(b, '"')
+	for i := 0; i < len(s); i++ {
+		b = appendEscapedByte(b, s[i])
 	}
-	b.WriteByte('"')
-	return b.String()
+	b = append(b, '"')
+	return string(b)
 }
 
 // AppendQuoteString appends QuoteString(s) to dst and returns the extended slice,
@@ -95,8 +74,8 @@ func AppendQuoteString(dst []byte, s string) []byte {
 		dst = append(dst, s...)
 		return append(dst, '"')
 	}
-	for _, r := range s {
-		dst = appendEscapedRune(dst, r)
+	for i := 0; i < len(s); i++ {
+		dst = appendEscapedByte(dst, s[i])
 	}
 	return append(dst, '"')
 }
@@ -105,16 +84,15 @@ func AppendQuoteString(dst []byte, s string) []byte {
 // byte slice (e.g. a string literal's bytes inside a wire buffer): it quotes s
 // without first copying it into a Go string, producing output identical to
 // AppendQuoteString(dst, string(s)). The common no-escape case is a plain byte
-// copy; the escape path iterates runes via `range string(s)`, which the compiler
-// lowers without allocating a string.
+// copy; the escape path goes byte by byte.
 func AppendQuoteStringBytes(dst, s []byte) []byte {
 	dst = append(dst, '"')
 	if !bytesNeedEscape(s) {
 		dst = append(dst, s...)
 		return append(dst, '"')
 	}
-	for _, r := range string(s) {
-		dst = appendEscapedRune(dst, r)
+	for _, c := range s {
+		dst = appendEscapedByte(dst, c)
 	}
 	return append(dst, '"')
 }
@@ -177,10 +155,12 @@ func AppendQuoteStringOldBytes(dst, s []byte) []byte {
 	return append(dst, '"')
 }
 
-// appendEscapedRune appends one rune of a string value using only the escapes the
+// appendEscapedByte appends one byte of a string value using only the escapes the
 // lexer decodes (\b \f \n \r \t \\ \"), octal (\NNN) for other control characters,
-// and the rune verbatim otherwise. Shared by the string and []byte quoters.
-func appendEscapedRune(dst []byte, r rune) []byte {
+// and the byte verbatim otherwise: every byte of a multi-byte UTF-8 rune, and
+// any byte that is not valid UTF-8, which the lexer keeps as it is. Shared by
+// the string and []byte quoters.
+func appendEscapedByte(dst []byte, r byte) []byte {
 	switch r {
 	case '"':
 		return append(dst, '\\', '"')
@@ -198,9 +178,9 @@ func appendEscapedRune(dst []byte, r rune) []byte {
 		return append(dst, '\\', 't')
 	default:
 		if r < 0x20 {
-			return append(dst, fmt.Sprintf("\\%03o", r)...)
+			return append(dst, '\\', '0'+r>>6, '0'+(r>>3)&7, '0'+r&7)
 		}
-		return utf8.AppendRune(dst, r)
+		return append(dst, r)
 	}
 }
 
@@ -224,11 +204,11 @@ func AppendQuoteAttributeName(dst []byte, name string) []byte {
 		return append(dst, name...)
 	}
 	dst = append(dst, '\'')
-	for _, r := range name {
-		if r == '\'' || r == '\\' {
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c == '\'' || c == '\\' {
 			dst = append(dst, '\\')
 		}
-		dst = utf8.AppendRune(dst, r)
+		dst = append(dst, name[i])
 	}
 	return append(dst, '\'')
 }

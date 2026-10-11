@@ -19,7 +19,9 @@ var handledExprs = []string{
 	`time()`, `strcat("a", "b")`, `ifThenElse(a, b, c)`, `regexp("p", s, "i")`,
 	`{1, 2, 3}`, `{}`, `{a, b + 1, "x"}`, `{ {1}, {2, 3} }`,
 	`a ? b : c`, `a ? b : c ? d : e`, `a > 0 ? x : y`,
-	`a ?: b`, `a ?: b ?: c`,
+	`a ?: b`, `a ?: b ?: c`, `a ? : b`,
+	// a '-' that is part of a number literal binds as a primary
+	`-5[0]`, `a ?: -1`, `-.5`, `-00`, `1 - -2`, `-5 * 3`, `- 5`, `-0x10`,
 	`(TARGET.Cpus >= RequestCpus) && (TARGET.Memory >= RequestMemory)`,
 	`ifThenElse(State == "Claimed", RemoteOwner, "none")`,
 	`(GPUs =?= undefined) || (GPUs == 0) || ((CPUs > 8 * GPUs) && (Memory > 32000 * GPUs))`,
