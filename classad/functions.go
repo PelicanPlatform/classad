@@ -218,6 +218,14 @@ func unparseString(s string) string {
 	return b.String()
 }
 
+// Unparse renders v as the reference unparser does (ClassAdUnParser::Unparse
+// of a Value): strings quoted and escaped, reals as "%1.15E" ("0.0" for zero),
+// lists as "{ e1,e2 }", undefined and error as their keywords. ok is false for
+// values it cannot render that way (currently nested classads).
+func (v Value) Unparse() (string, bool) {
+	return unparseValueNested(v)
+}
+
 // unparseValueNested renders a value as it appears inside a list literal: like
 // classadScalarString but strings are quoted and undefined/error print as their
 // keywords. Returns ok=false for nested classads (not yet supported).
