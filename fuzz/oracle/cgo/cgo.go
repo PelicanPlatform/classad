@@ -80,6 +80,51 @@ func EvalAdOld(src string) (encoded string, parsed bool) {
 	return C.GoString(out), true
 }
 
+// EvalExpr parses src as one standalone expression (ClassAdParser::ParseExpression
+// with full set; with old, after SetOldClassAd(true), which is HTCondor's
+// ParseClassAdRvalExpr) and evaluates it in an empty ClassAd. It returns the
+// canonical encoding of the value; parsed is false when libclassad rejects the
+// input. src must not contain a NUL byte.
+func EvalExpr(src string, old bool) (encoded string, parsed bool) {
+	cppMu.Lock()
+	defer cppMu.Unlock()
+
+	csrc := C.CString(src)
+	defer C.free(unsafe.Pointer(csrc))
+
+	oldSyntax := C.int(0)
+	if old {
+		oldSyntax = 1
+	}
+	var out *C.char
+	rc := C.classad_eval_expr(csrc, oldSyntax, &out)
+	if rc == 0 {
+		return "", false
+	}
+	defer C.classad_free(out)
+	return C.GoString(out), true
+}
+
+// EvalExprTimeout is EvalExpr with the same wall-clock cap and leaked-goroutine
+// handling as EvalAdTimeout.
+func EvalExprTimeout(src string, old bool, timeout time.Duration) (encoded string, parsed, timedOut bool) {
+	type result struct {
+		enc string
+		ok  bool
+	}
+	ch := make(chan result, 1)
+	go func() {
+		enc, ok := EvalExpr(src, old)
+		ch <- result{enc, ok}
+	}()
+	select {
+	case r := <-ch:
+		return r.enc, r.ok, false
+	case <-time.After(timeout):
+		return "", false, true
+	}
+}
+
 // EvalAdTimeout is EvalAd with a wall-clock cap. libclassad can infinite-loop
 // on some cyclic self-references reached through lazy operands (e.g.
 // [A0 = 0 ? e : A0], where its cycle guard never fires) -- a libclassad bug.

@@ -134,7 +134,11 @@ void encodeValue(std::string &out, const Value &v, const ClassAd *scope, int dep
 		if (scope != nullptr) {
 			mlst->SetParentScope(scope);
 		}
-		std::vector<Value> evaled;
+		// Encode each element while its EvalState is alive: a value such as
+		// a list produced by a projection ({}.a) is owned by the state, and
+		// reading it after the state is gone crashes ({{}.lp}).
+		std::string elems;
+		size_t count = 0;
 		for (auto it = mlst->begin(); it != mlst->end(); ++it) {
 			Value ev;
 			EvalState state;
@@ -142,14 +146,13 @@ void encodeValue(std::string &out, const Value &v, const ClassAd *scope, int dep
 			if (*it == nullptr || !(*it)->Evaluate(state, ev)) {
 				ev.SetErrorValue();
 			}
-			evaled.push_back(ev);
+			encodeValue(elems, ev, scope, depth + 1);
+			count++;
 		}
 		out += 'L';
-		out += std::to_string(evaled.size());
+		out += std::to_string(count);
 		out += ',';
-		for (const auto &ev : evaled) {
-			encodeValue(out, ev, scope, depth + 1);
-		}
+		out += elems;
 	} else if (v.IsClassAdValue(sub) && sub != nullptr) {
 		encodeClassAd(out, sub, depth);
 	} else {
@@ -243,6 +246,35 @@ extern "C" int classad_eval_ad_old(const char *adStr, char **out) {
 		}
 		std::string encoded;
 		encodeClassAd(encoded, &ad, 0);
+		*out = strdup(encoded.c_str());
+		return 1;
+	} catch (...) {
+		if (*out) { free(*out); *out = nullptr; }
+		return 0;
+	}
+}
+
+extern "C" int classad_eval_expr(const char *exprStr, int oldSyntax, char **out) {
+	static const bool reconfigured = [] { ClassAdReconfig(); return true; }();
+	(void)reconfigured;
+
+	*out = nullptr;
+	try {
+		ClassAdParser parser;
+		parser.SetOldClassAd(oldSyntax != 0);
+		ExprTree *tree = parser.ParseExpression(exprStr, true);
+		if (tree == nullptr) {
+			return 0;
+		}
+		ClassAd ad;
+		tree->SetParentScope(&ad);
+		Value v;
+		if (!ad.EvaluateExpr(tree, v)) {
+			v.SetErrorValue();
+		}
+		std::string encoded;
+		encodeValue(encoded, v, &ad, 0);
+		delete tree;
 		*out = strdup(encoded.c_str());
 		return 1;
 	} catch (...) {

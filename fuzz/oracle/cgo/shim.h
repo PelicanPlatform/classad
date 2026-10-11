@@ -32,6 +32,16 @@ int classad_eval_ad(const char *adStr, char **out);
  */
 int classad_eval_ad_old(const char *adStr, char **out);
 
+/*
+ * Parse exprStr as one standalone expression, as ClassAdParser::ParseExpression
+ * does with full set (the whole input must be the expression), and evaluate it
+ * in an empty ClassAd. oldSyntax selects ClassAdParser::SetOldClassAd(true),
+ * which together with a full parse is HTCondor's ParseClassAdRvalExpr: what
+ * config macro functions ($INT, $EVAL, ...) use. *out gets the canonical
+ * encoding of the value. Same return convention as classad_eval_ad.
+ */
+int classad_eval_expr(const char *exprStr, int oldSyntax, char **out);
+
 /* Free a string previously returned via classad_eval_ad's out parameter. */
 void classad_free(char *p);
 
