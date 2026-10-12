@@ -802,7 +802,11 @@ func (c *ClassAd) InsertListElement(name string, element *Expr) {
 
 	if ptr, ok := c.index[normalizeName(name)]; ok {
 		if list, ok := (*ptr).(*ast.ListLiteral); ok {
-			list.Elements = append(list.Elements, astExpr)
+			// Replace the list node rather than append to it: the node may be shared
+			// with another ad (InsertExpr of a Lookup result) or a caller's Expr, and
+			// appending in place grew their list too. Clip so the append copies.
+			elems := append(slices.Clip(list.Elements), astExpr)
+			*ptr = &ast.ListLiteral{Elements: elems}
 			return
 		}
 		*ptr = &ast.ListLiteral{Elements: []ast.Expr{astExpr}}
