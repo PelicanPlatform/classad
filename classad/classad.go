@@ -1867,7 +1867,7 @@ func (c *ClassAd) marshalJSON(includePrivate bool) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		value, err := c.marshalValue(attr.Value)
+		value, err := c.marshalValue(attr.Value, includePrivate)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal attribute %s: %w", attr.Name, err)
 		}
@@ -1890,7 +1890,8 @@ func (c *ClassAd) marshalJSON(includePrivate bool) ([]byte, error) {
 
 // marshalValue converts an AST expression to a JSON-serializable value.
 // Simple literals are converted directly, complex expressions are wrapped.
-func (c *ClassAd) marshalValue(expr ast.Expr) (interface{}, error) {
+// includePrivate carries the caller's choice into nested records.
+func (c *ClassAd) marshalValue(expr ast.Expr, includePrivate bool) (interface{}, error) {
 	switch v := expr.(type) {
 	case *ast.IntegerLiteral:
 		return v.Value, nil
@@ -1905,7 +1906,7 @@ func (c *ClassAd) marshalValue(expr ast.Expr) (interface{}, error) {
 	case *ast.ListLiteral:
 		list := make([]interface{}, len(v.Elements))
 		for i, elem := range v.Elements {
-			val, err := c.marshalValue(elem)
+			val, err := c.marshalValue(elem, includePrivate)
 			if err != nil {
 				return nil, err
 			}
@@ -1918,7 +1919,7 @@ func (c *ClassAd) marshalValue(expr ast.Expr) (interface{}, error) {
 		// the AST itself.
 		canon := (&ClassAd{ad: v.ClassAd}).canonicalAttrs()
 		nested := &ClassAd{ad: &ast.ClassAd{Attributes: canon}}
-		nestedBytes, err := nested.MarshalJSON()
+		nestedBytes, err := nested.marshalJSON(includePrivate)
 		if err != nil {
 			return nil, err
 		}

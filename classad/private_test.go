@@ -101,3 +101,29 @@ func TestRedacted(t *testing.T) {
 		t.Error("Redacted mutated the original ad")
 	}
 }
+
+// TestMarshalJSONWithPrivateNested: the opt-in JSON serializer keeps private
+// attributes inside nested records too (it dropped them, so a WithPrivate JSON
+// round trip lost a nested secret), while the default one still omits them.
+func TestMarshalJSONWithPrivateNested(t *testing.T) {
+	ad, err := Parse(`[Outer = [ClaimId = "SECRET-123"; Name = "x"]; L = {[Capability = "SECRET-456"]}]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	full, err := ad.MarshalJSONWithPrivate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"SECRET-123", "SECRET-456"} {
+		if !strings.Contains(string(full), secret) {
+			t.Errorf("MarshalJSONWithPrivate dropped nested %s: %s", secret, full)
+		}
+	}
+	safe, err := ad.MarshalJSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(safe), "SECRET") {
+		t.Errorf("MarshalJSON leaked a nested secret: %s", safe)
+	}
+}
