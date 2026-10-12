@@ -143,6 +143,13 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 			}
 			base := 0
 			for _, blk := range cs.blocks {
+				// A record holding the attribute as an expression kept it in the record, where the
+				// block's escape bit, escape class and cold tail all describe it as missing. Its
+				// value needs evaluating, so the count is the row path's to give.
+				if blk.heldAny(pred.fieldID) {
+					releaseWindows(wins)
+					return 0, false
+				}
 				// No record in this block carries the attribute: every visible one of them is
 				// undefined, settled without touching a bitmap per record or the cold tail at all.
 				if blk.fieldAbsentFromBlock(idx) {

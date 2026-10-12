@@ -79,7 +79,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
 			strEq := plan.stringEq(c, q, seg.schema())
 			base := 0
-			for _, blk := range seg.blocks {
+			for bi, blk := range seg.blocks {
 				// Pruning is sound for grouping: a block no matching record falls in contributes no
 				// groups, so skipping it drops nothing.
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {
@@ -131,6 +131,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 				if nLive*minLiveDen < blk.n*minLiveNum {
 					split.churnBlocks++
 					cs.setBlock(blk)
+					cs.setGroups(seg, bi)
 					if !c.groupBlockScoped(cs, resolver, m, fallbackM, w, seg, blk, base, s0,
 						col, aggCols, st.cache, acc) {
 						releaseWindows(wins)
@@ -140,11 +141,13 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 					continue
 				}
 				src.blk = blk
+				src.setGroups(seg, bi)
 				vec, ok := q.VecEval(src, blk.n, scratch)
 				if !ok {
 					// This block only. Every other block still vectorizes.
 					split.scopeBlocks++
 					cs.setBlock(blk)
+					cs.setGroups(seg, bi)
 					if !c.groupBlockScoped(cs, resolver, m, fallbackM, w, seg, blk, base, s0,
 						col, aggCols, st.cache, acc) {
 						releaseWindows(wins)
@@ -187,8 +190,13 @@ func addGroupFromColumns(k int, col numCol, aggCols []numCol, bc *blockCache, ac
 	g.n++
 	for i := range aggCols {
 		// An absent or non-numeric aggregate value contributes nothing, which is what the reference
-		// computes for it -- unlike the group value, which decides whether the row exists at all.
-		if av, ok := aggCols[i].at(k, bc); ok {
+		// computes for it -- unlike the group value, which decides whether the row exists at all. An
+		// EXPRESSION has a value this cannot compute, so it gives the query back.
+		av, cell := aggCols[i].cell(k, bc)
+		if cell == cellExpr {
+			return false
+		}
+		if cell == cellNumber {
 			g.stats[i].add(av)
 		}
 	}
@@ -279,6 +287,9 @@ func addGroupFromAd(ad wire.Ad, groupLookup func(a wire.Ad) ([]byte, bool),
 	g.n++
 	for i := range aggLookups {
 		if an, found := aggLookups[i](ad); found {
+			if isExprNode(an) {
+				return false
+			}
 			if av, isNum := nodeColVal(an); isNum {
 				g.stats[i].add(av)
 			}

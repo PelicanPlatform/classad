@@ -336,6 +336,9 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 			return false
 		}
 		if !found {
+			if s.blk.heldAt(k, id) {
+				return false // the value stayed in the record (an expression): only it can answer
+			}
 			dst.St[k] = vm.VsUndef
 			continue
 		}

@@ -363,7 +363,11 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, preds
 					if live == 0 {
 						break
 					}
-					live = narrowByField(blk, predIdxs[i], preds[i], bc, keep, scratch[:blk.n])
+					var nok bool
+					if live, nok = narrowByField(blk, predIdxs[i], preds[i], bc, keep, scratch[:blk.n]); !nok {
+						releaseWindows(wins)
+						return nil, false
+					}
 				}
 				if live > 0 {
 					for k := 0; k < blk.n; k++ {
@@ -388,8 +392,14 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, preds
 						for i := range aggCols {
 							// An absent or non-numeric aggregate value contributes nothing, which is
 							// what the reference computes for it -- unlike the group value above,
-							// which decides whether the row exists at all.
-							if av, ok := aggCols[i].at(k, bc); ok {
+							// which decides whether the row exists at all. An EXPRESSION has a value
+							// this cannot compute, so it gives the query back.
+							av, cell := aggCols[i].cell(k, bc)
+							if cell == cellExpr {
+								releaseWindows(wins)
+								return nil, false
+							}
+							if cell == cellNumber {
 								g.stats[i].add(av)
 							}
 						}
@@ -449,6 +459,9 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookup func(wir
 						match = false
 						break
 					}
+					if isExprNode(node) {
+						return false
+					}
 					nv, isNum := nodeColVal(node)
 					if !isNum || !preds[i].eval(nv.f) {
 						match = false
@@ -473,6 +486,9 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookup func(wir
 					g.n++
 					for i := range aggLookups {
 						if an, found := aggLookups[i](ad); found {
+							if isExprNode(an) {
+								return false
+							}
 							if av, isNum := nodeColVal(an); isNum {
 								g.stats[i].add(av)
 							}

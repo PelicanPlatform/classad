@@ -280,6 +280,11 @@ type columnarBlock struct {
 	// coldIDs are the attribute ids this block's cold tail holds. A segment with no dictionary has
 	// no durable id space of its own, so the section names these instead; see marshalColSegment.
 	coldIDs map[uint32]struct{}
+	// native is the columnarized segment this block belongs to, and segBase its first record's index
+	// in that segment, so the block can ask which of its cells the records still hold (heldAt). nil
+	// for a sidecar block.
+	native  *colSegment
+	segBase int
 }
 
 // blockZone is one numeric column's range within a block.
@@ -1044,32 +1049,61 @@ func (b *columnarBlock) escapedNode(k int, fieldID uint32, bc *blockCache) (node
 	return nil, false, nil
 }
 
-// escapedNumVal is escapedNumField returning the value WITH its ClassAd kind. A caller that
+// numCell classifies what an escaped numeric field holds for one record.
+type numCell uint8
+
+const (
+	cellAbsent numCell = iota // the record does not have the attribute
+	cellNumber                // a numeric (or boolean) literal; the value is valid
+	cellOther                 // a literal of another kind: a string, UNDEFINED, ERROR
+	// cellExpr is a value only evaluating it can give: an expression in the cold tail, a value the
+	// cold tail could not be read for, or -- in a columnarized segment -- one the record kept (see
+	// colheld.go). A reader that skipped it as absent would return a wrong answer, so every reader
+	// that meets one gives the query back to the row path.
+	cellExpr
+)
+
+// escapedNumCell is escapedNumField returning the value WITH its ClassAd kind. A caller that
 // renders or sums the value needs the kind, and the cold tail carries the wire node, so it is read
 // from the node rather than assumed from the segment's schema (an escaped value is by definition
-// one the schema field did not fit).
-func (b *columnarBlock) escapedNumVal(k int, fieldID uint32, bc *blockCache) (colVal, bool) {
+// one the schema field did not fit). It also says WHY there is no number (see numCell).
+//
+// The aggregate and count paths need the reason: an absent or non-numeric literal simply contributes
+// nothing, while an expression has a value they cannot compute.
+func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (colVal, numCell) {
 	tail, err := bc.stream(b, kindCold)
 	if err != nil {
-		return colVal{}, false
+		return colVal{}, cellExpr
 	}
+	// The tail is keyed by the ids it was WRITTEN with, as escapedNode and escapedNumField read it.
+	stored := b.remap.stored(fieldID)
 	cold := tail[b.coldOffAt(k):b.coldOffAt(k+1)]
 	for len(cold) > 0 {
 		id, m := binary.Uvarint(cold)
 		if m <= 0 {
-			return colVal{}, false // malformed tail: treat fieldID as absent
+			return colVal{}, cellExpr // malformed tail: nothing can be said about the value
 		}
 		cold = cold[m:]
 		nl, ok := wire.NodeLen(cold)
 		if !ok || nl > len(cold) {
-			return colVal{}, false
+			return colVal{}, cellExpr
 		}
-		if uint32(id) == fieldID {
-			return nodeColVal(cold[:nl])
+		if uint32(id) == stored {
+			node := cold[:nl]
+			if v, ok := nodeColVal(node); ok {
+				return v, cellNumber
+			}
+			if _, lit := wire.LiteralValue(node); lit {
+				return colVal{}, cellOther
+			}
+			return colVal{}, cellExpr
 		}
 		cold = cold[nl:]
 	}
-	return colVal{}, false
+	if b.heldAt(k, fieldID) {
+		return colVal{}, cellExpr
+	}
+	return colVal{}, cellAbsent
 }
 
 // idRemap translates between the attribute ids a payload was WRITTEN with and the ids the current

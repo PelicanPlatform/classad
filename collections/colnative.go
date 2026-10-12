@@ -126,6 +126,7 @@ func publishColNative(c *Collection, seg *segment) {
 			// per segment made ristretto's fixed admission metadata scale with segment count (a
 			// multi-GB reopen leak on a large archive). A nil cache (creation failed) is valid --
 			// blockCache methods then decompress every time -- so it never damages the segment.
+			cs.bindNative(c, seg)
 			cn := &colNative{seg: cs, cache: c.sharedColCache()}
 			cn.dict = seg.dict.Load()
 			// The payload's cold tails are keyed by the SEGMENT's dictionary, so readers translate

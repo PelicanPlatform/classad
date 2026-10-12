@@ -336,6 +336,7 @@ func countAttrWhere(c *Collection, w segWindow, attr string, conds []rangeCond, 
 		var val string
 		gotVal := false
 		matches := true
+		undecidable := false
 		seenCond := make([]bool, len(conds))
 		wire.Ad(raw).ForEachNamed(c.intern, func(name string, node []byte) bool {
 			if !gotVal && strings.EqualFold(name, attr) {
@@ -352,6 +353,12 @@ func countAttrWhere(c *Collection, w segWindow, attr string, conds []rangeCond, 
 				}
 				f, ok := literalFloat(node)
 				if !ok {
+					// A literal that is not a number fails the comparison. An EXPRESSION has a value
+					// only evaluating it gives, and treating it as failing dropped the record from its
+					// group whenever the group attribute had already been read.
+					if isExprNode(node) {
+						undecidable = true
+					}
 					matches = false
 					return false
 				}
@@ -362,7 +369,7 @@ func countAttrWhere(c *Collection, w segWindow, attr string, conds []rangeCond, 
 			}
 			return true
 		})
-		if !gotVal {
+		if !gotVal || undecidable {
 			return 0, false // cannot attribute this record to a group
 		}
 		for i := range conds {

@@ -204,7 +204,8 @@ func BenchmarkSingleFieldRoute(b *testing.B) {
 		b.Fatal("single-field analysis declined")
 	}
 	// Same answer from both, or the comparison is meaningless.
-	if a, bb := c.schemaScanCountMulti(preds, st.cache), c.schemaScanCount(fieldID, st.cache, eval); a != bb {
+	a, _ := c.schemaScanCountMulti(preds, st.cache)
+	if bb, _ := c.schemaScanCount(fieldID, st.cache, eval); a != bb {
 		b.Fatalf("multi=%d single=%d", a, bb)
 	}
 	b.Run("multiPath", func(b *testing.B) {
