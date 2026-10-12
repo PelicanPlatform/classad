@@ -1,5 +1,29 @@
 // Package classad provides a public API for working with HTCondor ClassAds.
 // It mimics the C++ ClassAd library API from HTCondor.
+//
+// # Concurrency
+//
+// A *ClassAd may be read by any number of goroutines at once. Reading covers every
+// method that does not change the ad: serialization (String, MarshalOld,
+// MarshalJSON and their WithPrivate forms, json.Marshal), Equal, Lookup, Size,
+// GetAttributes, AST, Redacted, Flatten, ExternalRefs/InternalRefs, and evaluation
+// (EvaluateAttr*, EvaluateExpr*, Expr.Eval, Expr.EvalWithContext,
+// EvaluateExprWithTarget, EvaluateExprAgainst). Reads do not modify the ad, so
+// they need no locking and see consistent results.
+//
+// Writes need exclusive access: while one runs, no other goroutine may read or
+// write the same ad. The writes are Insert and the methods built on it
+// (InsertAttr*, InsertExpr, InsertListElement, InsertAttrList, Set), Delete, Clear,
+// UnmarshalJSON, SetParent and SetTarget. NewMatchClassAd, ReplaceLeftAd and
+// ReplaceRightAd call SetTarget on the ads they pair, so they are writes to both;
+// to evaluate against a target that other goroutines share, use
+// EvaluateExprAgainst, which binds MY and TARGET for one evaluation without
+// changing either ad. An Evaluator is not safe for concurrent use (create one per
+// goroutine); the ads it evaluates are only read.
+//
+// A Value is immutable and may be shared. A ClassAd obtained from a Value (a nested
+// record) is a read-only view of the ad it came from; writing it detaches it onto a
+// private copy and never changes that ad.
 package classad
 
 import (
@@ -10,6 +34,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"unicode/utf8"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -141,33 +166,54 @@ func (e *Expr) EvalWithContext(scope, target *ClassAd) (result Value) {
 		return NewUndefinedValue()
 	}
 
-	// Set up the scope with target for evaluation
-	if scope != nil && target != nil {
-		// Temporarily set the target
-		oldTarget := scope.target
-		scope.target = target
-		defer func() { scope.target = oldTarget }()
-	}
-
 	defer recoverCyclic(&result)
 	evaluator := NewEvaluator(scope)
+	// TARGET is bound for this evaluation only, not written onto scope: the scope ad
+	// may be shared by goroutines evaluating it against other targets.
+	if scope != nil && target != nil {
+		evaluator.bind = &targetBinding{a: scope, b: target}
+	}
 	return evaluator.Evaluate(e.expr)
 }
 
 // ClassAd represents a ClassAd with attributes that can be evaluated.
 // This is the main type for working with ClassAds.
+//
+// A ClassAd is safe for concurrent reads: any number of goroutines may serialize,
+// compare, look up, iterate and evaluate one ad at once, provided none of them writes
+// it. The writes are Insert and its InsertAttr*/InsertExpr/InsertListElement/Set
+// forms, Delete, Clear, UnmarshalJSON, SetParent and SetTarget -- and therefore
+// NewMatchClassAd, ReplaceLeftAd and ReplaceRightAd, which call SetTarget on the ads
+// they are given. A write needs exclusive access: no other goroutine may read or write
+// the ad until it returns. See the package documentation.
 type ClassAd struct {
-	ad         *ast.ClassAd
-	parent     *ClassAd
-	target     *ClassAd
-	index      map[string]*ast.Expr
-	attrsDirty bool // true when attributes changed since last sort
-	// evaluating holds the normalized names of attributes currently being
-	// evaluated in this ad, to detect cyclic references (e.g. [a=a] or
-	// [a=b;b=a]). The reference engine reports such a cycle as a failed
-	// evaluation; without this guard the Go evaluator would recurse until the
-	// stack overflows.
-	evaluating map[string]bool
+	ad     *ast.ClassAd
+	parent *ClassAd
+	target *ClassAd
+	// index maps each normalized attribute name to its value slot.
+	//
+	// A non-nil index marks an OWNED ad (every constructor: New, Parse, ParseOld,
+	// FromAST, UnmarshalJSON, Reader). Its attributes are kept duplicate-free and
+	// indexed AT ALL TIMES -- each write maintains both -- so no read has to
+	// deduplicate or index. (A lazily built index used to be filled in by the first
+	// read, a write that raced with every other reader.)
+	//
+	// A nil index with a non-nil ad marks a VIEW of an AST owned by something else,
+	// e.g. the value of a nested record literal, which aliases the enclosing ad's
+	// AST. A view is never modified: lookups scan it. Its first write detaches it
+	// onto its own copy (see own), so writing a record value cannot reach the ad it
+	// came from.
+	index map[string]*ast.Expr
+	// ordered holds the attributes in canonical order (sortAttributeAssignments:
+	// case-insensitive by name), for the readers that need it -- the serializers,
+	// Equal, AST. It is ad itself when ad is already in that order (the usual case
+	// for parsed `condor_status -l` output and decoded wire ads), otherwise a sorted
+	// copy built by the first reader that asks. Readers never reorder ad itself: the
+	// slice used to be sorted in place on first read, so one reader could be walking
+	// it while another reordered it, producing missing and duplicated attributes.
+	// Racing first readers each build the same order and the atomic publish makes
+	// either result safe to use. A write that can break the order clears it.
+	ordered atomic.Pointer[ast.ClassAd]
 }
 
 // Equal reports whether two ClassAds have the same attributes and values, ignoring
@@ -180,16 +226,14 @@ func (c *ClassAd) Equal(other *ClassAd) bool {
 		return false
 	}
 
-	c.ensureSorted()
-	other.ensureSorted()
-
-	if len(c.ad.Attributes) != len(other.ad.Attributes) {
+	la, ra := c.canonicalAttrs(), other.canonicalAttrs()
+	if len(la) != len(ra) {
 		return false
 	}
 
-	for i := range c.ad.Attributes {
-		left := c.ad.Attributes[i]
-		right := other.ad.Attributes[i]
+	for i := range la {
+		left := la[i]
+		right := ra[i]
 		if normalizeName(left.Name) != normalizeName(right.Name) {
 			return false
 		}
@@ -253,21 +297,21 @@ func foldCompare(a, b string) int {
 	return len(a) - len(b)
 }
 
-// dedupAttributes collapses duplicate attribute names, keeping each name's
-// last assignment, matching the reference engine -- a ClassAd is a map there,
-// so a later "x = ..." overwrites an earlier one ([B=1;B=2] has B==2). The
-// retained entries keep the order of their last occurrence.
-func (c *ClassAd) dedupAttributes() {
-	if c.ad == nil || len(c.ad.Attributes) < 2 {
-		return
+// dedupAssignments collapses duplicate attribute names, keeping each name's last
+// assignment, matching the reference engine -- a ClassAd is a map there, so a later
+// "x = ..." overwrites an earlier one ([B=1;B=2] has B==2). Attribute names are
+// case-insensitive: the reference engine keeps the first occurrence's name (its casing
+// and position) but the last occurrence's value, so [A=1; a=2] is A==2. It returns
+// attrs itself when there is no duplicate, and otherwise a new slice of new
+// assignments -- attrs and the assignments it holds are never modified.
+func dedupAssignments(attrs []*ast.AttributeAssignment) []*ast.AttributeAssignment {
+	if len(attrs) < 2 {
+		return attrs
 	}
-	// Attribute names are case-insensitive. The reference engine keeps the
-	// first occurrence's name (its casing and position) but the last
-	// occurrence's value: [A=1; a=2] is A==2.
-	firstIdx := make(map[string]int, len(c.ad.Attributes))
-	lastValue := make(map[string]ast.Expr, len(c.ad.Attributes))
-	order := make([]string, 0, len(c.ad.Attributes))
-	for i, attr := range c.ad.Attributes {
+	firstIdx := make(map[string]int, len(attrs))
+	lastValue := make(map[string]ast.Expr, len(attrs))
+	order := make([]string, 0, len(attrs))
+	for i, attr := range attrs {
 		n := normalizeName(attr.Name)
 		if _, seen := firstIdx[n]; !seen {
 			firstIdx[n] = i
@@ -275,86 +319,195 @@ func (c *ClassAd) dedupAttributes() {
 		}
 		lastValue[n] = attr.Value
 	}
-	if len(firstIdx) == len(c.ad.Attributes) {
-		return // no duplicates
+	if len(firstIdx) == len(attrs) {
+		return attrs // no duplicates
 	}
 	kept := make([]*ast.AttributeAssignment, 0, len(firstIdx))
 	for _, n := range order {
-		first := c.ad.Attributes[firstIdx[n]]
+		first := attrs[firstIdx[n]]
 		kept = append(kept, &ast.AttributeAssignment{Name: first.Name, Value: lastValue[n]})
 	}
-	c.ad.Attributes = kept
+	return kept
 }
 
-// rebuildIndex recreates the fast lookup map from the underlying attributes.
-func (c *ClassAd) rebuildIndex() {
-	if c.ad == nil {
-		c.index = nil
-		return
+// hasDuplicateNames reports whether two of attrs' names are equal case-insensitively.
+func hasDuplicateNames(attrs []*ast.AttributeAssignment) bool {
+	if len(attrs) <= 16 {
+		for i := 1; i < len(attrs); i++ {
+			for j := 0; j < i; j++ {
+				if foldCompare(attrs[i].Name, attrs[j].Name) == 0 {
+					return true
+				}
+			}
+		}
+		return false
 	}
+	seen := make(map[string]struct{}, len(attrs))
+	for _, attr := range attrs {
+		n := normalizeName(attr.Name)
+		if _, dup := seen[n]; dup {
+			return true
+		}
+		seen[n] = struct{}{}
+	}
+	return false
+}
+
+// establish puts c.ad's attributes into the owned-ad invariant -- duplicate-free and
+// indexed -- in place, and records whether they are already in canonical order. It
+// runs only while the ad is being constructed (or detached), before any other
+// goroutine can see it.
+//
+// The common input -- a parse of `condor_status -l` output or a wire decode, both
+// already sorted and duplicate-free -- costs one fold of each name (which the index
+// needs anyway) plus one comparison of adjacent folded names; it allocates only the
+// index map. A duplicate (rare: hand-built or malformed input) falls back to the full
+// dedup.
+func (c *ClassAd) establish() {
+	attrs := c.ad.Attributes
 	if c.index == nil {
-		c.index = make(map[string]*ast.Expr, len(c.ad.Attributes))
+		c.index = make(map[string]*ast.Expr, len(attrs))
 	} else {
 		clear(c.index)
 	}
-	// Single pass: build the index and detect a duplicate normalized name inline.
-	// The overwhelmingly common case -- every ClassAd from a parse or wire decode,
-	// whose attributes are already unique -- folds each name once and allocates only
-	// the index map, avoiding dedupAttributes' two maps + order slice + a second fold
-	// per attribute. A genuine duplicate (rare: hand-built or malformed input) falls
-	// back to the full dedup, then reindexes the collapsed attributes.
-	dup := false
-	for i := range c.ad.Attributes {
-		attr := c.ad.Attributes[i]
+	sorted, dup := true, false
+	prev := ""
+	for i, attr := range attrs {
 		n := normalizeName(attr.Name)
 		if _, exists := c.index[n]; exists {
 			dup = true
 			break
 		}
+		// foldCompare orders names exactly as their normalized forms compare, so
+		// comparing the folded strings checks the order sortAttributeAssignments
+		// produces (names are distinct here, so its case-sensitive tie-break never
+		// applies).
+		if i > 0 && n < prev {
+			sorted = false
+		}
+		prev = n
 		c.index[n] = &attr.Value
 	}
 	if dup {
-		c.dedupAttributes()
+		c.ad.Attributes = dedupAssignments(attrs)
 		clear(c.index)
-		for i := range c.ad.Attributes {
-			attr := c.ad.Attributes[i]
+		for _, attr := range c.ad.Attributes {
 			c.index[normalizeName(attr.Name)] = &attr.Value
 		}
+		sorted = false
+	}
+	if sorted {
+		c.ordered.Store(c.ad)
+	} else {
+		c.ordered.Store(nil)
 	}
 }
 
-// ensureSorted sorts attributes in-place by normalized name when dirty,
-// then rebuilds the index so pointers remain valid.
-func (c *ClassAd) ensureSorted() {
+// adopt wraps a in an owned ClassAd, taking ownership of it: its attribute slice may
+// be deduplicated (see establish).
+func adopt(a *ast.ClassAd) *ClassAd {
+	if a == nil {
+		a = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
+	}
+	c := &ClassAd{ad: a}
+	c.establish()
+	return c
+}
+
+// own prepares c for a write. A zero ClassAd gets an empty attribute list, and a view
+// is detached onto a private copy of its attributes -- new assignments as well as a
+// new slice, since Insert writes through an assignment's Value slot -- so the write
+// cannot reach the AST the view was reading.
+func (c *ClassAd) own() {
+	if c.index != nil {
+		return
+	}
 	if c.ad == nil {
-		c.attrsDirty = false
+		c.ad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
+		c.index = map[string]*ast.Expr{}
+		c.ordered.Store(c.ad)
 		return
 	}
-	if !c.attrsDirty {
-		c.ensureIndex()
-		return
+	attrs := make([]*ast.AttributeAssignment, len(c.ad.Attributes))
+	for i, a := range c.ad.Attributes {
+		attrs[i] = &ast.AttributeAssignment{Name: a.Name, Value: a.Value}
 	}
-
-	sortAttributeAssignments(c.ad.Attributes)
-	c.attrsDirty = false
-	// Only ensure the index EXISTS -- do not rebuild it. ast.ClassAd.Attributes is a slice
-	// of POINTERS, and the index holds &assignment.Value, so reordering the slice does not
-	// move anything the index points at. The three mutators that mark the ad dirty (Insert,
-	// InsertListElement, Delete) each maintain the index as they go, so it is already
-	// correct here. Rebuilding it anyway re-folded every attribute name -- an allocation
-	// apiece -- and refilled the whole map, on every commit of a modified ad.
-	c.ensureIndex()
+	c.ad = &ast.ClassAd{Attributes: attrs}
+	c.establish()
 }
 
-func (c *ClassAd) markDirty() {
-	c.attrsDirty = true
+// canonical returns the attributes duplicate-free and in canonical order without
+// modifying c.ad: c.ad itself if it is already in order, otherwise a sorted copy. The
+// result is cached in c.ordered; it must not be modified. c.ad must be non-nil.
+func (c *ClassAd) canonical() *ast.ClassAd {
+	if p := c.ordered.Load(); p != nil {
+		return p
+	}
+	attrs := c.ad.Attributes
+	p := c.ad
+	if !strictlyOrdered(attrs) {
+		sorted := attrs
+		if c.index == nil {
+			// A view may repeat a name (an owned ad cannot); dedup copies if so.
+			sorted = dedupAssignments(attrs)
+		}
+		if len(sorted) == len(attrs) {
+			sorted = slices.Clone(attrs) // never sort attrs itself
+		}
+		sortAttributeAssignments(sorted)
+		p = &ast.ClassAd{Attributes: sorted}
+	}
+	c.ordered.Store(p)
+	return p
 }
 
-// ensureIndex lazily initializes the lookup map if needed.
-func (c *ClassAd) ensureIndex() {
-	if c.index == nil {
-		c.rebuildIndex()
+// strictlyOrdered reports whether attrs is in canonical order with no repeated name.
+func strictlyOrdered(attrs []*ast.AttributeAssignment) bool {
+	for i := 1; i < len(attrs); i++ {
+		if foldCompare(attrs[i-1].Name, attrs[i].Name) >= 0 { // equal names are duplicates
+			return false
+		}
 	}
+	return true
+}
+
+// attrs returns the attributes to iterate for output, without modifying c.ad: an owned
+// ad's attributes in canonical order, or a view's in source order (as the record was
+// written) with duplicates collapsed.
+func (c *ClassAd) attrs() []*ast.AttributeAssignment {
+	if c.ad == nil {
+		return nil
+	}
+	if c.index != nil {
+		return c.canonical().Attributes
+	}
+	if !hasDuplicateNames(c.ad.Attributes) {
+		return c.ad.Attributes
+	}
+	return dedupAssignments(c.ad.Attributes)
+}
+
+// canonicalAttrs returns the attributes duplicate-free and in canonical order, for an
+// owned ad and a view alike.
+func (c *ClassAd) canonicalAttrs() []*ast.AttributeAssignment {
+	if c.ad == nil {
+		return nil
+	}
+	return c.canonical().Attributes
+}
+
+// scan finds the value of name in a view by a linear search, honoring the
+// last-assignment-wins rule for a duplicated name. Views are nested records -- a few
+// attributes, looked up a few times per evaluation of the record -- for which a scan is
+// cheaper than building an index.
+func (c *ClassAd) scan(name string) ast.Expr {
+	attrs := c.ad.Attributes
+	for i := len(attrs) - 1; i >= 0; i-- {
+		if foldCompare(attrs[i].Name, name) == 0 {
+			return attrs[i].Value
+		}
+	}
+	return nil
 }
 
 // New creates a new empty ClassAd.
@@ -363,8 +516,7 @@ func New() *ClassAd {
 		ad: &ast.ClassAd{
 			Attributes: []*ast.AttributeAssignment{},
 		},
-		index:      map[string]*ast.Expr{},
-		attrsDirty: false,
+		index: map[string]*ast.Expr{},
 	}
 }
 
@@ -377,9 +529,7 @@ func Parse(input string) (*ClassAd, error) {
 	if ad == nil {
 		return nil, fmt.Errorf("failed to parse ClassAd")
 	}
-	obj := &ClassAd{ad: ad, attrsDirty: true}
-	obj.rebuildIndex()
-	return obj, nil
+	return adopt(ad), nil
 }
 
 // ParseOld parses a ClassAd in the "old" HTCondor format and returns a ClassAd object.
@@ -397,9 +547,7 @@ func ParseOld(input string) (*ClassAd, error) {
 	if ad == nil {
 		return nil, fmt.Errorf("failed to parse old ClassAd")
 	}
-	obj := &ClassAd{ad: ad, attrsDirty: true}
-	obj.rebuildIndex()
-	return obj, nil
+	return adopt(ad), nil
 }
 
 // String returns the string representation of the ClassAd.
@@ -424,11 +572,10 @@ func (c *ClassAd) unparse(includePrivate bool) string {
 		return "[]"
 	}
 
-	c.ensureSorted()
 	var b strings.Builder
 	b.WriteByte('[')
 	first := true
-	for _, attr := range c.ad.Attributes {
+	for _, attr := range c.attrs() {
 		if !includePrivate && IsPrivateAttribute(attr.Name) {
 			continue
 		}
@@ -466,13 +613,12 @@ func (c *ClassAd) marshalOld(includePrivate bool) string {
 		return ""
 	}
 
-	c.ensureSorted()
 	// Build in a strings.Builder: `result += ...` in a loop is O(n^2) (each += copies
 	// the whole accumulated string), which allocated tens of MB to render a single
 	// large (~21 KB) ad.
 	var b strings.Builder
 	first := true
-	for _, attr := range c.ad.Attributes {
+	for _, attr := range c.attrs() {
 		if !includePrivate && IsPrivateAttribute(attr.Name) {
 			continue
 		}
@@ -497,30 +643,32 @@ func (c *ClassAd) marshalOld(includePrivate bool) string {
 
 // Insert inserts an attribute with an expression into the ClassAd.
 func (c *ClassAd) Insert(name string, expr ast.Expr) {
-	if c.ad == nil {
-		c.ad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
-	}
-	c.ensureIndex()
-
+	c.own()
 	normalized := normalizeName(name)
 	if ptr, ok := c.index[normalized]; ok {
-		// Replacing an existing attribute's VALUE, in place. The attribute set is unchanged,
-		// so a sorted ad is still sorted -- do not mark it dirty. This is the overwhelmingly
-		// common write on a live job: an update to LastJobLeaseRenewal or MemoryUsage names an
-		// attribute the ad already has, and marking dirty here made every one of them force a
-		// full re-sort of the whole ad that could not reorder anything. An ad that is ALREADY
-		// dirty stays dirty; this only declines to set the flag, never clears it.
+		// Replacing an existing attribute's VALUE, in place. The attribute set is
+		// unchanged, so the ad stays sorted. This is the overwhelmingly common write on a
+		// live job: an update to LastJobLeaseRenewal or MemoryUsage names an attribute the
+		// ad already has.
 		*ptr = expr
 		return
 	}
+	c.insertNew(normalized, &ast.AttributeAssignment{Name: name, Value: expr})
+}
 
-	// A new attribute name is appended, which can put the ad out of order.
-	c.markDirty()
-	c.ad.Attributes = append(c.ad.Attributes, &ast.AttributeAssignment{
-		Name:  name,
-		Value: expr,
-	})
-	c.index[normalized] = &c.ad.Attributes[len(c.ad.Attributes)-1].Value
+// insertNew appends an attribute the owned ad c does not have. Appending is what
+// keeps building an ad cheap (a wire decode inserts every attribute of every ad it
+// receives, in the sender's order); the canonical order is rebuilt by the next reader
+// that needs it, unless the new name sorts after every other, which keeps it.
+func (c *ClassAd) insertNew(normalized string, a *ast.AttributeAssignment) {
+	n := len(c.ad.Attributes)
+	inOrder := c.ordered.Load() == c.ad &&
+		(n == 0 || foldCompare(c.ad.Attributes[n-1].Name, a.Name) < 0)
+	c.ad.Attributes = append(c.ad.Attributes, a)
+	c.index[normalized] = &a.Value
+	if !inOrder {
+		c.ordered.Store(nil)
+	}
 }
 
 // InsertExpr inserts an attribute with an Expr value into the ClassAd.
@@ -643,11 +791,7 @@ func valueToAstExpr[T int64 | float64 | string | bool | *ClassAd | *Expr](v T) a
 //	ad.InsertListElement("items", expr2)
 //	// Result: items = {"first", "second"}
 func (c *ClassAd) InsertListElement(name string, element *Expr) {
-	if c.ad == nil {
-		c.ad = &ast.ClassAd{Attributes: []*ast.AttributeAssignment{}}
-	}
-	c.ensureIndex()
-	c.markDirty()
+	c.own()
 
 	var astExpr ast.Expr
 	if element == nil {
@@ -666,11 +810,10 @@ func (c *ClassAd) InsertListElement(name string, element *Expr) {
 	}
 
 	// Add new list attribute
-	c.ad.Attributes = append(c.ad.Attributes, &ast.AttributeAssignment{
+	c.insertNew(normalizeName(name), &ast.AttributeAssignment{
 		Name:  name,
 		Value: &ast.ListLiteral{Elements: []ast.Expr{astExpr}},
 	})
-	c.index[normalizeName(name)] = &c.ad.Attributes[len(c.ad.Attributes)-1].Value
 }
 
 // Lookup returns the unevaluated expression for an attribute.
@@ -685,13 +828,8 @@ func (c *ClassAd) InsertListElement(name string, element *Expr) {
 //	    fmt.Println(expr.String())  // Prints: x * 2
 //	}
 func (c *ClassAd) Lookup(name string) (*Expr, bool) {
-	if c.ad == nil {
-		return nil, false
-	}
-	c.ensureIndex()
-
-	if ptr, ok := c.index[normalizeName(name)]; ok {
-		return &Expr{expr: *ptr}, true
+	if expr := c.lookupInternal(name); expr != nil {
+		return &Expr{expr: expr}, true
 	}
 	return nil, false
 }
@@ -703,7 +841,9 @@ func (c *ClassAd) lookupInternal(name string) ast.Expr {
 	if c.ad == nil {
 		return nil
 	}
-	c.ensureIndex()
+	if c.index == nil {
+		return c.scan(name)
+	}
 	// Attribute names are ASCII identifiers, so case-fold into a stack buffer and
 	// index the map with string(buf): the compiler special-cases a string([]byte)
 	// map key to avoid a heap allocation, eliminating the strings.ToLower that
@@ -744,8 +884,9 @@ func (c *ClassAd) lookupNorm(norm string) ast.Expr {
 	if c.ad == nil {
 		return nil
 	}
-	c.ensureIndex()
-
+	if c.index == nil {
+		return c.scan(norm)
+	}
 	if ptr, ok := c.index[norm]; ok {
 		return *ptr
 	}
@@ -887,8 +1028,7 @@ func (c *ClassAd) Delete(name string) bool {
 	if c.ad == nil {
 		return false
 	}
-	c.ensureIndex()
-	c.markDirty()
+	c.own()
 
 	normalized := normalizeName(name)
 	ptr, ok := c.index[normalized]
@@ -896,7 +1036,11 @@ func (c *ClassAd) Delete(name string) bool {
 		return false
 	}
 
-	// Find the matching attribute by pointer equality on Value.
+	// Find the matching attribute by pointer equality on Value. Removing an element
+	// leaves the rest of c.ad in order, but a separate sorted copy is now stale.
+	if c.ordered.Load() != c.ad {
+		c.ordered.Store(nil)
+	}
 	for i := range c.ad.Attributes {
 		if &c.ad.Attributes[i].Value == ptr {
 			c.ad.Attributes = append(c.ad.Attributes[:i], c.ad.Attributes[i+1:]...)
@@ -912,26 +1056,33 @@ func (c *ClassAd) Size() int {
 	if c.ad == nil {
 		return 0
 	}
-	return len(c.ad.Attributes)
+	if c.index != nil {
+		return len(c.ad.Attributes)
+	}
+	return len(c.attrs())
 }
 
 // Clear removes all attributes from the ClassAd.
 func (c *ClassAd) Clear() {
-	if c.ad != nil {
-		c.ad.Attributes = []*ast.AttributeAssignment{}
+	if c.ad == nil || c.index == nil {
+		// A view must not clear the AST it is reading: start a new one.
+		c.ad = &ast.ClassAd{}
 	}
+	c.ad.Attributes = []*ast.AttributeAssignment{}
 	c.index = map[string]*ast.Expr{}
-	c.attrsDirty = false
+	c.ordered.Store(c.ad)
 }
 
-// GetAttributes returns a list of all attribute names.
+// GetAttributes returns a list of all attribute names, in the order the ad
+// serializes them (sorted case-insensitively).
 func (c *ClassAd) GetAttributes() []string {
 	if c.ad == nil {
 		return []string{}
 	}
 
-	names := make([]string, len(c.ad.Attributes))
-	for i, attr := range c.ad.Attributes {
+	attrs := c.attrs()
+	names := make([]string, len(attrs))
+	for i, attr := range attrs {
 		names[i] = attr.Name
 	}
 	return names
@@ -939,6 +1090,7 @@ func (c *ClassAd) GetAttributes() []string {
 
 // SetParent sets the parent ClassAd for this ClassAd.
 // The parent is used for PARENT.attr references during evaluation.
+// SetParent is a write: see the package documentation.
 func (c *ClassAd) SetParent(parent *ClassAd) {
 	c.parent = parent
 }
@@ -950,6 +1102,7 @@ func (c *ClassAd) GetParent() *ClassAd {
 
 // SetTarget sets the target ClassAd for this ClassAd.
 // The target is used for TARGET.attr references during evaluation.
+// SetTarget is a write: see the package documentation.
 func (c *ClassAd) SetTarget(target *ClassAd) {
 	c.target = target
 }
@@ -1089,6 +1242,24 @@ func (c *ClassAd) EvaluateExprWithTarget(expr *Expr, target *ClassAd) Value {
 		return NewUndefinedValue()
 	}
 	return expr.EvalWithContext(c, target)
+}
+
+// EvaluateExprAgainst evaluates expr with this ClassAd as MY and target as TARGET,
+// pairing them as NewMatchClassAd does -- within target's attributes, TARGET is this
+// ad -- but for this evaluation only: neither ad is modified, so many goroutines may
+// evaluate against one shared target (a cached slot ad, say) at once. NewMatchClassAd
+// instead records each ad as the other's TARGET on the ads themselves, which is a
+// write to both.
+//
+// Example:
+//
+//	expr, _ := parser.ParseExpr("TARGET.Memory >= RequestMemory")
+//	v := jobAd.EvaluateExprAgainst(expr, slotAd)
+func (c *ClassAd) EvaluateExprAgainst(expr ast.Expr, target *ClassAd) (result Value) {
+	defer recoverCyclic(&result)
+	evaluator := NewEvaluator(c)
+	evaluator.bind = &targetBinding{a: c, b: target, symmetric: true}
+	return evaluator.Evaluate(expr)
 }
 
 // ExternalRefs returns a list of attribute names referenced in the expression
@@ -1604,11 +1775,8 @@ func exprEqual(a, b ast.Expr) bool {
 		if !ok {
 			return false
 		}
-		left := &ClassAd{ad: av.ClassAd, attrsDirty: true}
-		left.rebuildIndex()
-		right := &ClassAd{ad: bv.ClassAd, attrsDirty: true}
-		right.rebuildIndex()
-		return left.Equal(right)
+		// Views: Equal compares canonical copies and never touches the shared ASTs.
+		return (&ClassAd{ad: av.ClassAd}).Equal(&ClassAd{ad: bv.ClassAd})
 	case *ast.SelectExpr:
 		bv, ok := b.(*ast.SelectExpr)
 		return ok && strings.EqualFold(av.Attr, bv.Attr) && exprEqual(av.Record, bv.Record)
@@ -1680,11 +1848,10 @@ func (c *ClassAd) marshalJSON(includePrivate bool) ([]byte, error) {
 		return []byte("{}"), nil
 	}
 
-	c.ensureSorted()
 	var buf bytes.Buffer
 	buf.WriteByte('{')
 	first := true
-	for _, attr := range c.ad.Attributes {
+	for _, attr := range c.attrs() {
 		if !includePrivate && IsPrivateAttribute(attr.Name) {
 			continue
 		}
@@ -1742,9 +1909,11 @@ func (c *ClassAd) marshalValue(expr ast.Expr) (interface{}, error) {
 		}
 		return list, nil
 	case *ast.RecordLiteral:
-		// Nested ClassAd: serialize deterministically and embed as raw JSON.
-		nested := &ClassAd{ad: v.ClassAd, attrsDirty: true}
-		nested.rebuildIndex()
+		// Nested ClassAd: serialize deterministically (in canonical order) and embed as
+		// raw JSON. The record's AST belongs to the enclosing ad, so order a copy; never
+		// the AST itself.
+		canon := (&ClassAd{ad: v.ClassAd}).canonicalAttrs()
+		nested := &ClassAd{ad: &ast.ClassAd{Attributes: canon}}
 		nestedBytes, err := nested.MarshalJSON()
 		if err != nil {
 			return nil, err
@@ -1789,8 +1958,7 @@ func (c *ClassAd) UnmarshalJSON(data []byte) error {
 	sortAttributeAssignments(attributes)
 
 	c.ad = &ast.ClassAd{Attributes: attributes}
-	c.attrsDirty = true
-	c.rebuildIndex()
+	c.establish()
 	return nil
 }
 

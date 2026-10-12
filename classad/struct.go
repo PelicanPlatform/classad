@@ -257,6 +257,9 @@ func unmarshalStruct(node *ast.ClassAd, val reflect.Value) error {
 		}
 	}
 
+	// Evaluate attributes in the context of the ClassAd (a read-only view of node).
+	ad := &ClassAd{ad: node}
+
 	// Iterate over ClassAd attributes
 	for _, attr := range node.Attributes {
 		fieldIdx, ok := fieldMap[attr.Name]
@@ -275,8 +278,6 @@ func unmarshalStruct(node *ast.ClassAd, val reflect.Value) error {
 			continue
 		}
 
-		// Evaluate the attribute in the context of the ClassAd
-		ad := &ClassAd{ad: node}
 		result := ad.EvaluateAttr(attr.Name)
 
 		// Unmarshal the result into the field

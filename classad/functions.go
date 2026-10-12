@@ -747,7 +747,7 @@ func builtinTime(args []Value) Value {
 // Built-in list functions
 
 // builtinMember checks if element is in list
-func builtinMember(args []Value) Value {
+func builtinMember(ev *Evaluator, args []Value) Value {
 	if len(args) != 2 {
 		return NewErrorValue()
 	}
@@ -768,7 +768,7 @@ func builtinMember(args []Value) Value {
 	}
 
 	element := args[0]
-	list, _ := args[1].ListValue()
+	list, _ := args[1].listValueIn(ev)
 
 	// Membership uses the == operator's semantics (numeric coercion,
 	// case-insensitive strings). A comparison that is not boolean-true -- including
@@ -1026,7 +1026,7 @@ func builtinPow(args []Value) Value {
 }
 
 // builtinQuantize computes ceiling(a/b)*b for scalars, or finds first value in list >= a
-func builtinQuantize(args []Value) Value {
+func builtinQuantize(ev *Evaluator, args []Value) Value {
 	if len(args) != 2 {
 		return NewErrorValue()
 	}
@@ -1049,7 +1049,7 @@ func builtinQuantize(args []Value) Value {
 	// element unchanged; if none, quantize using the last element as the base.
 	// An empty list means "do not quantize" and returns arg unchanged.
 	if args[1].IsList() {
-		list, _ := args[1].ListValue()
+		list, _ := args[1].listValueIn(ev)
 		var last Value
 		haveLast := false
 		for _, item := range list {
@@ -1110,19 +1110,19 @@ func quantizeScalar(arg Value, rval float64, base Value) Value {
 // or all-undefined list sums/averages to integer 0; min/max of one is undefined.
 // These let callers outside the expression evaluator (e.g. a GROUP BY engine)
 // aggregate with identical semantics.
-func Sum(values []Value) Value { return builtinSum([]Value{NewListValue(values)}) }
+func Sum(values []Value) Value { return builtinSum(nil, []Value{NewListValue(values)}) }
 
 // Avg averages values under the ClassAd coercion rules (see Sum).
-func Avg(values []Value) Value { return builtinAvg([]Value{NewListValue(values)}) }
+func Avg(values []Value) Value { return builtinAvg(nil, []Value{NewListValue(values)}) }
 
 // Min returns the numeric minimum under the ClassAd coercion rules (see Sum).
-func Min(values []Value) Value { return builtinMin([]Value{NewListValue(values)}) }
+func Min(values []Value) Value { return builtinMin(nil, []Value{NewListValue(values)}) }
 
 // Max returns the numeric maximum under the ClassAd coercion rules (see Sum).
-func Max(values []Value) Value { return builtinMax([]Value{NewListValue(values)}) }
+func Max(values []Value) Value { return builtinMax(nil, []Value{NewListValue(values)}) }
 
 // builtinSum sums numeric values in a list
-func builtinSum(args []Value) Value {
+func builtinSum(ev *Evaluator, args []Value) Value {
 	if len(args) > 1 {
 		return NewErrorValue()
 	}
@@ -1143,7 +1143,7 @@ func builtinSum(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	list, _ := args[0].ListValue()
+	list, _ := args[0].listValueIn(ev)
 	if len(list) == 0 {
 		return NewIntValue(0)
 	}
@@ -1198,7 +1198,7 @@ func builtinSum(args []Value) Value {
 }
 
 // builtinAvg computes average of numeric values in a list
-func builtinAvg(args []Value) Value {
+func builtinAvg(ev *Evaluator, args []Value) Value {
 	if len(args) > 1 {
 		return NewErrorValue()
 	}
@@ -1219,7 +1219,7 @@ func builtinAvg(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	list, _ := args[0].ListValue()
+	list, _ := args[0].listValueIn(ev)
 	if len(list) == 0 {
 		return NewIntValue(0) // avg of an empty list is int 0 in the reference
 	}
@@ -1260,7 +1260,7 @@ func builtinAvg(args []Value) Value {
 }
 
 // builtinMin finds minimum value in a list
-func builtinMin(args []Value) Value {
+func builtinMin(ev *Evaluator, args []Value) Value {
 	if len(args) > 1 {
 		return NewErrorValue()
 	}
@@ -1281,7 +1281,7 @@ func builtinMin(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	list, _ := args[0].ListValue()
+	list, _ := args[0].listValueIn(ev)
 	if len(list) == 0 {
 		return NewUndefinedValue()
 	}
@@ -1340,7 +1340,7 @@ func builtinMin(args []Value) Value {
 }
 
 // builtinMax finds maximum value in a list
-func builtinMax(args []Value) Value {
+func builtinMax(ev *Evaluator, args []Value) Value {
 	if len(args) > 1 {
 		return NewErrorValue()
 	}
@@ -1361,7 +1361,7 @@ func builtinMax(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	list, _ := args[0].ListValue()
+	list, _ := args[0].listValueIn(ev)
 	if len(list) == 0 {
 		return NewUndefinedValue()
 	}
@@ -1421,7 +1421,7 @@ func builtinMax(args []Value) Value {
 
 // builtinJoin joins strings with a separator
 // join(sep, arg1, arg2, ...) or join(sep, list) or join(list)
-func builtinJoin(args []Value) Value {
+func builtinJoin(ev *Evaluator, args []Value) Value {
 	if len(args) == 0 {
 		return NewErrorValue()
 	}
@@ -1435,7 +1435,7 @@ func builtinJoin(args []Value) Value {
 			return NewErrorValue()
 		}
 		if last.IsList() {
-			items, _ := last.ListValue()
+			items, _ := last.listValueIn(ev)
 			var sep Value
 			if len(args) == 2 {
 				sep = args[0]
@@ -2013,7 +2013,7 @@ func builtinInterval(args []Value) Value {
 }
 
 // builtinIdenticalMember checks if m is in list using =?= (strict identity)
-func builtinIdenticalMember(args []Value) Value {
+func builtinIdenticalMember(ev *Evaluator, args []Value) Value {
 	if len(args) != 2 {
 		return NewErrorValue()
 	}
@@ -2036,7 +2036,7 @@ func builtinIdenticalMember(args []Value) Value {
 		return NewErrorValue()
 	}
 
-	list, _ := args[1].ListValue()
+	list, _ := args[1].listValueIn(ev)
 	e := &Evaluator{}
 	for _, item := range list {
 		if b, _ := e.evaluateIs(args[0], item).BoolValue(); b {
@@ -2055,7 +2055,7 @@ func builtinIdenticalMember(args []Value) Value {
 // semantics: a comparison that errors makes the whole call error; for
 // anyCompare a true element wins (else false), for allCompare a non-true
 // element (false or undefined) loses (else true, vacuously true for []).
-func compareList(args []Value, all bool) Value {
+func compareList(ev *Evaluator, args []Value, all bool) Value {
 	if len(args) != 3 {
 		return NewErrorValue()
 	}
@@ -2086,7 +2086,7 @@ func compareList(args []Value, all bool) Value {
 	if args[2].IsError() {
 		return NewErrorValue()
 	}
-	list, _ := args[1].ListValue()
+	list, _ := args[1].listValueIn(ev)
 	target := args[2]
 
 	for _, item := range list {
@@ -2111,13 +2111,13 @@ func compareList(args []Value, all bool) Value {
 
 // builtinAnyCompare checks if any element in list satisfies the comparison.
 // anyCompare(op, list, target), op one of < <= == != >= > is isnt =?= =!=
-func builtinAnyCompare(args []Value) Value {
-	return compareList(args, false)
+func builtinAnyCompare(ev *Evaluator, args []Value) Value {
+	return compareList(ev, args, false)
 }
 
 // builtinAllCompare checks if all elements in list satisfy the comparison.
-func builtinAllCompare(args []Value) Value {
-	return compareList(args, true)
+func builtinAllCompare(ev *Evaluator, args []Value) Value {
+	return compareList(ev, args, true)
 }
 
 // compareValues performs comparison based on operator string
@@ -2545,7 +2545,7 @@ func builtinStringListRegexpMember(args []Value) Value {
 }
 
 // builtinRegexpMember checks if pattern matches any string in a list
-func builtinRegexpMember(args []Value) Value {
+func builtinRegexpMember(ev *Evaluator, args []Value) Value {
 	if len(args) < 2 || len(args) > 3 {
 		return NewErrorValue()
 	}
@@ -2561,7 +2561,7 @@ func builtinRegexpMember(args []Value) Value {
 	}
 
 	pattern, _ := args[0].StringValue()
-	list, _ := args[1].ListValue()
+	list, _ := args[1].listValueIn(ev)
 	options := ""
 
 	if len(args) == 3 {

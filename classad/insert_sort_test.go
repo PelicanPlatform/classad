@@ -6,18 +6,14 @@ import (
 	"github.com/PelicanPlatform/classad/ast"
 )
 
-// Insert marks an ad dirty only when it APPENDS a new attribute, because replacing an
-// existing attribute's value cannot change the attribute set and therefore cannot put a
-// sorted ad out of order. That is a pure optimization -- nothing about the output changes
-// -- so these tests pin the ordering and lookup invariants it must not break, including
-// the case it would be easy to get wrong: an ad that is ALREADY unsorted must stay that
-// way, since the change may only decline to SET the dirty flag, never clear it.
+// An owned ad keeps its attributes sorted at all times: Insert of a new attribute puts
+// it at its sorted position, and replacing an existing attribute's value cannot change
+// the attribute set. These tests pin the ordering and lookup invariants, including an
+// ad adopted from an unsorted AST.
 
-// names returns the attribute names in the order the ad renders them, which is the sorted
-// order ensureSorted establishes.
+// names returns the attribute names in the order the ad renders them.
 func names(t *testing.T, c *ClassAd) []string {
 	t.Helper()
-	_ = c.String() // forces ensureSorted
 	a := c.AST()
 	out := make([]string, 0, len(a.Attributes))
 	for _, attr := range a.Attributes {
@@ -84,9 +80,8 @@ func TestInsertAppendStillSorts(t *testing.T) {
 	eq(t, names(t, c), []string{"Alpha", "Beta", "Mid"}, "append that sorts into the middle")
 }
 
-// TestInsertInPlaceOnDirtyAdStaysDirty is the subtle case. An ad built directly from an
-// unsorted AST is dirty and has never been sorted; an in-place update must not be taken as
-// evidence that it is in order. The optimization is only allowed to skip SETTING the flag.
+// TestInsertInPlaceOnDirtyAdStaysDirty: an ad adopted from an unsorted AST is sorted when
+// adopted, and an in-place update before anything reads it keeps it so.
 func TestInsertInPlaceOnDirtyAdStaysDirty(t *testing.T) {
 	// Built out of order, deliberately not through a path that sorts.
 	raw := &ast.ClassAd{Attributes: []*ast.AttributeAssignment{
@@ -95,9 +90,6 @@ func TestInsertInPlaceOnDirtyAdStaysDirty(t *testing.T) {
 		{Name: "Mid", Value: &ast.IntegerLiteral{Value: 3}},
 	}}
 	c := FromAST(raw)
-	if !c.attrsDirty {
-		t.Fatal("precondition: an ad from an unsorted AST should start dirty")
-	}
 	// An in-place update BEFORE anything sorts the ad.
 	c.InsertAttr("Zebra", 99)
 	eq(t, names(t, c), []string{"alpha", "Mid", "Zebra"}, "dirty ad must still sort after an in-place update")

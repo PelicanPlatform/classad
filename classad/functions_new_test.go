@@ -1340,7 +1340,7 @@ func TestAnyCompare(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			args := []Value{NewStringValue(tt.op), NewListValue(tt.list), tt.target}
-			val := builtinAnyCompare(args)
+			val := builtinAnyCompare(nil, args)
 			if !val.IsBool() {
 				t.Errorf("anyCompare() did not return boolean, got %v", val.Type())
 			} else {
@@ -1394,7 +1394,7 @@ func TestAllCompare(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			args := []Value{NewStringValue(tt.op), NewListValue(tt.list), tt.target}
-			val := builtinAllCompare(args)
+			val := builtinAllCompare(nil, args)
 			if !val.IsBool() {
 				t.Errorf("allCompare() did not return boolean, got %v", val.Type())
 			} else {
@@ -1826,7 +1826,7 @@ func TestRegexpMember(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			args := []Value{NewStringValue(tt.pattern), NewListValue(tt.list)}
-			val := builtinRegexpMember(args)
+			val := builtinRegexpMember(nil, args)
 			if !val.IsBool() {
 				t.Errorf("regexpMember() did not return boolean, got %v", val.Type())
 			} else {
