@@ -89,14 +89,13 @@ func (c *ClassAd) Redacted() *ClassAd {
 	if c == nil || c.ad == nil {
 		return c
 	}
-	kept := make([]*ast.AttributeAssignment, 0, len(c.ad.Attributes))
-	for _, attr := range c.ad.Attributes {
+	attrs := c.attrs()
+	kept := make([]*ast.AttributeAssignment, 0, len(attrs))
+	for _, attr := range attrs {
 		if IsPrivateAttribute(attr.Name) {
 			continue
 		}
 		kept = append(kept, attr)
 	}
-	out := &ClassAd{ad: &ast.ClassAd{Attributes: kept}, attrsDirty: true}
-	out.rebuildIndex()
-	return out
+	return adopt(&ast.ClassAd{Attributes: kept})
 }

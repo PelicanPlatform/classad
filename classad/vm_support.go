@@ -54,15 +54,17 @@ func (e *Evaluator) ResolveRefNode(ref *ast.AttributeReference) Value {
 // depth, so one Evaluator can be reused across many evaluations (e.g. a bytecode
 // Matcher scanning a collection) instead of allocating a fresh one per ad.
 //
-// Cyclic-reference state is tracked per ClassAd (in ClassAd.evaluating), not on
-// the Evaluator, and each attribute evaluation removes its own marker on the way
-// out, so nothing carries over between scopes. Depth is balanced by Evaluate's
-// deferred decrement even when a cyclic panic unwinds, so it is 0 here after any
-// completed or recovered evaluation; the reset is a defensive guarantee. The
-// Evaluator is not safe for concurrent use.
+// Cyclic-reference state is tracked on the Evaluator, and each attribute
+// evaluation pops its own marker on the way out (even when a cyclic panic
+// unwinds), so nothing carries over between scopes; the reset of it and of depth
+// here is a defensive guarantee. The Evaluator is not safe for concurrent use, but
+// the ads it evaluates are only read, so many Evaluators may share them.
 func (e *Evaluator) SetScope(ad *ClassAd) {
 	e.classad = ad
 	e.depth = 0
+	for e.nActive > 0 {
+		e.popActive()
+	}
 }
 
 // SetResolver installs (or clears, with nil) a custom attribute resolver. While
@@ -105,25 +107,22 @@ func (e *Evaluator) ShortCircuit(op string, left Value) (result Value, done bool
 // AST returns the underlying ast.ClassAd. It is intended for serialization
 // layers (e.g. collections/wire) that need the attribute expressions directly.
 // The returned value aliases the ClassAd's internal storage and must not be
-// mutated; attributes are sorted by normalized name.
+// mutated; attributes are sorted by normalized name. When the ad's own attribute
+// list is not in that order, the result is a sorted copy of it (built once, and
+// shared by later calls until the ad is written).
 func (c *ClassAd) AST() *ast.ClassAd {
-	if c == nil {
+	if c == nil || c.ad == nil {
 		return nil
 	}
-	c.ensureSorted()
-	return c.ad
+	return c.canonical()
 }
 
 // FromAST wraps an ast.ClassAd in a ClassAd. The ast.ClassAd is adopted (not
-// copied); callers should not mutate it afterward. It is the inverse of AST for
+// copied): FromAST may reorder its attributes into sorted order and collapse duplicate
+// names, and callers should not mutate it afterward. It is the inverse of AST for
 // serialization layers that decode to an ast.ClassAd.
 func FromAST(a *ast.ClassAd) *ClassAd {
-	if a == nil {
-		a = &ast.ClassAd{}
-	}
-	obj := &ClassAd{ad: a, attrsDirty: true}
-	obj.rebuildIndex()
-	return obj
+	return adopt(a)
 }
 
 // FoldConstants returns e with its constant sub-expressions pre-computed

@@ -70,11 +70,16 @@ type Value struct {
 // materialization (A = {A}) -- where each materialization step would otherwise
 // start a fresh evaluator at depth 0 -- still hits maxEvalDepth and resolves to
 // error instead of overflowing the goroutine stack.
+//
+// bind records the TARGET binding in force when a lazy list value was created, so
+// elements materialized after that evaluation returned still resolve TARGET as they
+// would have during it.
 type listData struct {
 	vals  []Value
 	exprs []ast.Expr
 	scope *ClassAd
 	depth int
+	bind  *targetBinding
 }
 
 // NewUndefinedValue creates an undefined value.
@@ -224,13 +229,20 @@ func (v Value) StringValue() (string, error) {
 
 // ListValue returns the list value. Returns error if not a list.
 func (v Value) ListValue() ([]Value, error) {
+	return v.listValueIn(nil)
+}
+
+// listValueIn is ListValue for a list materialized while parent is evaluating -- a
+// builtin function consuming a list argument -- so the elements are evaluated as part
+// of that evaluation (see lazyEvaluator).
+func (v Value) listValueIn(parent *Evaluator) ([]Value, error) {
 	if v.valueType != ListValue {
 		return nil, fmt.Errorf("value is not a list")
 	}
 	if v.list.exprs != nil {
 		// Lazy list: evaluate each element expression in its stored scope now.
 		vals := make([]Value, len(v.list.exprs))
-		ev := v.lazyEvaluator(nil)
+		ev := v.lazyEvaluator(parent)
 		for i, e := range v.list.exprs {
 			vals[i] = evalRecoveringCyclic(ev, e)
 		}
@@ -285,12 +297,23 @@ func (v Value) listElementAt(i int, parent *Evaluator) Value {
 // (parent, which may be nil at a top-level entry such as ListValue/String) and
 // the depth at which the list value was created, so recursion accounting never
 // resets going into materialization and a materialization-only cycle terminates.
+//
+// With a parent -- materialization during an evaluation -- the elements are evaluated
+// as part of it: they see its TARGET binding and its in-progress attributes, so an
+// element that refers back to an attribute being evaluated is a cycle. Without one
+// (materialization after the evaluation returned) they start afresh.
 func (v Value) lazyEvaluator(parent *Evaluator) *Evaluator {
-	depth := v.list.depth
-	if parent != nil && parent.depth > depth {
-		depth = parent.depth
+	if parent == nil {
+		return &Evaluator{classad: v.list.scope, depth: v.list.depth, bind: v.list.bind}
 	}
-	return &Evaluator{classad: v.list.scope, depth: depth}
+	ev := parent.child(v.list.scope)
+	if v.list.depth > ev.depth {
+		ev.depth = v.list.depth
+	}
+	if ev.bind == nil {
+		ev.bind = v.list.bind
+	}
+	return ev
 }
 
 // ClassAdValue returns the ClassAd value. Returns error if not a ClassAd.
@@ -363,6 +386,98 @@ type Evaluator struct {
 	// scope (see SetResolver). It lets a caller evaluate against an alternate
 	// backing (e.g. an encoded ad) without materializing a ClassAd.
 	resolver func(name string, scope ast.AttributeScope) Value
+	// bind, when non-nil, supplies TARGET for the ads it names in place of their own
+	// target field, so an evaluation can be run against a target without writing it
+	// onto either ad (see targetOf).
+	bind *targetBinding
+	// active is the set of (ad, attribute) pairs whose evaluation is in progress, for
+	// cyclic-reference detection (see evalAttrExpr). It lives on the evaluation, not on
+	// the ad: kept on the ad, every evaluation wrote to the ad, so two goroutines
+	// evaluating one ad made concurrent map writes -- a fatal, unrecoverable crash.
+	//
+	// The first activeInline entries are stored in the Evaluator itself, so the common
+	// evaluation (a handful of nested attribute references) allocates nothing; the
+	// root Evaluator lives on the caller's stack. Deeper chains spill to activeMore.
+	// Child evaluators start from a copy of their parent's set (see child): an
+	// evaluation is strictly nested within its parent's, so a child's pushes never
+	// outlive it and the parent's entries are unchanged when it resumes.
+	active     [activeInline]activeAttr
+	nActive    int
+	activeMore []activeAttr
+}
+
+// activeInline is the number of in-progress attribute evaluations an Evaluator holds
+// without allocating. Real ads rarely nest attribute references deeper than this
+// (Requirements -> Start -> WithinResourceLimits -> ...).
+const activeInline = 6
+
+// activeAttr names one attribute evaluation in progress: the attribute's normalized
+// name in the ad that defines it.
+type activeAttr struct {
+	ad   *ClassAd
+	norm string
+}
+
+// targetBinding is an evaluation-scoped MY/TARGET pairing: within the evaluation,
+// a's TARGET is b, and -- when symmetric -- b's TARGET is a, as a MatchClassAd pairs
+// two ads. Neither ad is modified.
+type targetBinding struct {
+	a, b      *ClassAd
+	symmetric bool
+}
+
+// targetOf returns the ad that TARGET denotes while evaluating in ad.
+func (e *Evaluator) targetOf(ad *ClassAd) *ClassAd {
+	if b := e.bind; b != nil {
+		if ad == b.a {
+			return b.b
+		}
+		if b.symmetric && ad == b.b {
+			return b.a
+		}
+	}
+	return ad.target
+}
+
+// isActive reports whether the attribute norm of ad is being evaluated.
+func (e *Evaluator) isActive(ad *ClassAd, norm string) bool {
+	n := e.nActive
+	if n > activeInline {
+		// Only the first n-activeInline spill entries are live; the slice may be
+		// longer (pops do not shrink it, and a child shares its backing array).
+		for _, a := range e.activeMore[:n-activeInline] {
+			if a.ad == ad && a.norm == norm {
+				return true
+			}
+		}
+		n = activeInline
+	}
+	for i := 0; i < n; i++ {
+		if e.active[i].ad == ad && e.active[i].norm == norm {
+			return true
+		}
+	}
+	return false
+}
+
+// pushActive records that the attribute norm of ad is being evaluated.
+func (e *Evaluator) pushActive(ad *ClassAd, norm string) {
+	if e.nActive < activeInline {
+		e.active[e.nActive] = activeAttr{ad: ad, norm: norm}
+	} else {
+		e.activeMore = append(e.activeMore[:e.nActive-activeInline], activeAttr{ad: ad, norm: norm})
+	}
+	e.nActive++
+}
+
+// popActive removes the most recently pushed in-progress attribute.
+func (e *Evaluator) popActive() {
+	e.nActive--
+	if e.nActive < activeInline {
+		e.active[e.nActive] = activeAttr{}
+	} else {
+		e.activeMore[e.nActive-activeInline] = activeAttr{}
+	}
 }
 
 // maxEvalDepth bounds evaluation recursion. It is far below what overflows the
@@ -375,9 +490,18 @@ func NewEvaluator(ad *ClassAd) *Evaluator {
 }
 
 // child creates a sub-evaluator for ad that continues this evaluator's
-// recursion-depth accounting.
+// recursion-depth accounting, TARGET binding and in-progress attribute set. The child
+// must finish before e resumes (it shares e's spill slice: its pushes land past e's
+// entries, which e overwrites on its next push).
 func (e *Evaluator) child(ad *ClassAd) *Evaluator {
-	return &Evaluator{classad: ad, depth: e.depth}
+	return &Evaluator{
+		classad:    ad,
+		depth:      e.depth,
+		bind:       e.bind,
+		active:     e.active,
+		nActive:    e.nActive,
+		activeMore: e.activeMore,
+	}
 }
 
 // Evaluate evaluates an expression in the context of the ClassAd.
@@ -453,6 +577,7 @@ func (e *Evaluator) evalNode(expr ast.Expr) Value {
 		return e.evaluateList(v)
 
 	case *ast.RecordLiteral:
+		// A read-only view of the record: its AST belongs to the enclosing ad.
 		return NewClassAdValue(&ClassAd{ad: v.ClassAd})
 
 	case *ast.FunctionCall:
@@ -500,7 +625,7 @@ func (e *Evaluator) resolveAttributeReference(ref *ast.AttributeReference) Value
 		if e.classad == nil {
 			return NewUndefinedValue()
 		}
-		return e.evalAttrIn(e.classad.target, norm)
+		return e.evalAttrIn(e.targetOf(e.classad), norm)
 	case ast.ParentScope:
 		if e.classad == nil {
 			return NewUndefinedValue()
@@ -536,7 +661,7 @@ func (e *Evaluator) resolveAttributeReference(ref *ast.AttributeReference) Value
 		// target -- the same ping-pong the C++ code allows, bounded by the shared
 		// per-(ad,attr) cyclic-reference guard in evalAttrExpr.
 		if e.classad != nil {
-			for ad := e.classad.target; ad != nil; ad = ad.parent {
+			for ad := e.targetOf(e.classad); ad != nil; ad = ad.parent {
 				if expr := ad.lookupNorm(norm); expr != nil {
 					return e.evalAttrExpr(ad, norm, expr)
 				}
@@ -560,15 +685,14 @@ func (e *Evaluator) evalAttrIn(ad *ClassAd, norm string) Value {
 
 // evalAttrExpr evaluates expr -- the value bound to the already-normalized name
 // norm in ad -- with cyclic-reference detection. A cycle (the attribute is
-// already being evaluated in ad) panics a cyclicEvalError sentinel, recovered as
-// error at the top-level entry points (distinct from an error value, which
-// =?= / =!= would compare as a type).
+// already being evaluated in ad, by this evaluation) panics a cyclicEvalError
+// sentinel, recovered as error at the top-level entry points (distinct from an
+// error value, which =?= / =!= would compare as a type).
 //
 // The expression is evaluated in ad's context by temporarily rebinding the
 // evaluator's ClassAd rather than allocating a child evaluator per reference.
-// The deferred cleanup restores the ClassAd and clears the cyclic marker even
-// when a cyclic panic unwinds; recursion depth is restored by Evaluate's own
-// deferred decrement (which runs during the same unwind).
+// The deferred cleanup restores the ClassAd and pops the in-progress marker even
+// when a cyclic panic unwinds. Nothing here writes to ad.
 func (e *Evaluator) evalAttrExpr(ad *ClassAd, norm string, expr ast.Expr) Value {
 	// Fast path: a literal attribute value references nothing, so it cannot form a
 	// cyclic reference and its value does not depend on the scope. Skip the
@@ -579,18 +703,15 @@ func (e *Evaluator) evalAttrExpr(ad *ClassAd, norm string, expr ast.Expr) Value 
 	if isLiteralExpr(expr) {
 		return e.Evaluate(expr)
 	}
-	if ad.evaluating[norm] {
+	if e.isActive(ad, norm) {
 		panic(cyclicEvalError{})
 	}
-	if ad.evaluating == nil {
-		ad.evaluating = make(map[string]bool)
-	}
-	ad.evaluating[norm] = true
+	e.pushActive(ad, norm)
 	saved := e.classad
 	e.classad = ad
 	defer func() {
 		e.classad = saved
-		delete(ad.evaluating, norm)
+		e.popActive()
 	}()
 
 	return e.Evaluate(expr)
@@ -802,7 +923,7 @@ func (e *Evaluator) evaluateList(list *ast.ListLiteral) Value {
 	if exprs == nil {
 		exprs = []ast.Expr{}
 	}
-	return Value{valueType: ListValue, list: &listData{exprs: exprs, scope: e.classad, depth: e.depth}}
+	return Value{valueType: ListValue, list: &listData{exprs: exprs, scope: e.classad, depth: e.depth, bind: e.bind}}
 }
 
 func (e *Evaluator) evaluateSelectExpr(sel *ast.SelectExpr) Value {
@@ -876,11 +997,14 @@ func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
 	// attribute missing from the nested ad -- or an unscoped reference inside
 	// the selected attribute's value -- resolves up the enclosing scope chain,
 	// matching the reference engine ([x=1].A resolves A in the enclosing ad,
-	// and [A=[].A] is a cycle). The nested ad value is freshly built per
-	// evaluation, so setting its parent here is safe. Resolve the attribute as
-	// an unscoped reference so it chains (and participates in cycle detection).
-	ad.parent = e.classad
-	nested := e.child(ad)
+	// and [A=[].A] is a cycle). The parent link goes on a copy of the ad
+	// value: the value need not be private to this evaluation (a resolver or
+	// NewClassAdValue can hand back a shared ad), and writing its parent would
+	// both race with other readers and leave it chained to this scope. Resolve
+	// the attribute as an unscoped reference so it chains (and participates in
+	// cycle detection).
+	scoped := &ClassAd{ad: ad.ad, index: ad.index, target: ad.target, parent: e.classad}
+	nested := e.child(scoped)
 	return nested.evaluateAttributeReference(ast.NewAttributeReference(attr, ast.NoScope))
 }
 
@@ -1515,7 +1639,7 @@ func (e *Evaluator) evaluateUnparse(args []ast.Expr) Value {
 		targetClassAd = e.classad
 	case ast.TargetScope:
 		if e.classad != nil {
-			targetClassAd = e.classad.target
+			targetClassAd = e.targetOf(e.classad)
 		}
 	case ast.ParentScope:
 		if e.classad != nil {
@@ -1643,7 +1767,7 @@ func (e *Evaluator) evaluateEvalInEach(args []ast.Expr, wantList bool) Value {
 		}
 		return NewIntValue(0)
 	}
-	elems, err := listV.ListValue()
+	elems, err := listV.listValueIn(e)
 	if err != nil {
 		return NewErrorValue()
 	}
@@ -1686,7 +1810,7 @@ func (e *Evaluator) lookupBoundExpr(ref *ast.AttributeReference) (ast.Expr, bool
 		if ad == nil {
 			return nil, false
 		}
-		ad = ad.target
+		ad = e.targetOf(ad)
 	}
 	if ad == nil {
 		return nil, false
@@ -1898,7 +2022,7 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 
 	// List functions
 	case "member":
-		return builtinMember(args)
+		return builtinMember(e, args)
 	case "stringlistmember":
 		return builtinStringListMember(args)
 	case "stringlistimember":
@@ -1921,21 +2045,21 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	case "pow":
 		return builtinPow(args)
 	case "quantize":
-		return builtinQuantize(args)
+		return builtinQuantize(e, args)
 
 	// List aggregation functions
 	case "sum":
-		return builtinSum(args)
+		return builtinSum(e, args)
 	case "avg":
-		return builtinAvg(args)
+		return builtinAvg(e, args)
 	case "min":
-		return builtinMin(args)
+		return builtinMin(e, args)
 	case "max":
-		return builtinMax(args)
+		return builtinMax(e, args)
 
 	// String manipulation functions
 	case "join":
-		return builtinJoin(args)
+		return builtinJoin(e, args)
 	case "split":
 		return builtinSplit(args)
 	case "splitusername":
@@ -1976,11 +2100,11 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 
 	// List comparison functions
 	case "identicalmember":
-		return builtinIdenticalMember(args)
+		return builtinIdenticalMember(e, args)
 	case "anycompare":
-		return builtinAnyCompare(args)
+		return builtinAnyCompare(e, args)
 	case "allcompare":
-		return builtinAllCompare(args)
+		return builtinAllCompare(e, args)
 
 	// StringList functions
 	case "stringlistsize":
@@ -2002,7 +2126,7 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 
 	// Regex functions
 	case "regexpmember":
-		return builtinRegexpMember(args)
+		return builtinRegexpMember(e, args)
 	case "regexps":
 		return builtinRegexps(args)
 	case "replace":

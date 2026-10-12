@@ -367,6 +367,7 @@ func TestRoundTrip_JSONIdentityWithNested(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to parse source ClassAd: %v", err)
 	}
+	before := ad1.String()
 
 	jsonBytes1, err := json.Marshal(ad1)
 	if err != nil {
@@ -379,12 +380,23 @@ func TestRoundTrip_JSONIdentityWithNested(t *testing.T) {
 		t.Fatalf("unmarshal failed: %v", err)
 	}
 
-	// Structural identity: string and old-format renderings must match.
-	if ad1.String() != ad2.String() {
-		t.Fatalf("String mismatch after round-trip:\norig: %s\nnew:  %s", ad1.String(), ad2.String())
+	// Marshaling is a read: it must not reorder the source ad's nested records (it used
+	// to sort them in place, which raced with any concurrent reader of ad1).
+	if after := ad1.String(); after != before {
+		t.Fatalf("json.Marshal modified the ad:\nbefore: %s\nafter:  %s", before, after)
 	}
-	if ad1.MarshalOld() != ad2.MarshalOld() {
-		t.Fatalf("MarshalOld mismatch after round-trip:\norig:\n%s\nnew:\n%s", ad1.MarshalOld(), ad2.MarshalOld())
+
+	// Structural identity. JSON orders nested records canonically, while String
+	// renders a nested record in its source order, so compare structurally.
+	if !ad1.Equal(&ad2) {
+		t.Fatalf("round-trip not equal:\norig: %s\nnew:  %s", ad1.String(), ad2.String())
+	}
+	var ad3 ClassAd
+	if err := json.Unmarshal(jsonBytes1, &ad3); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if ad2.String() != ad3.String() || ad2.MarshalOld() != ad3.MarshalOld() {
+		t.Fatalf("rendering of the round-tripped ad is not deterministic:\n%s\n%s", ad2.String(), ad3.String())
 	}
 
 	// Deterministic JSON: re-marshal should produce identical bytes.

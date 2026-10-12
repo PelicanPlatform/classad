@@ -77,7 +77,7 @@ func (r *Reader) nextNew() bool {
 		return false
 	}
 
-	r.current = &ClassAd{ad: ad}
+	r.current = adopt(ad)
 	return true
 }
 

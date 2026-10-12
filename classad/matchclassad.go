@@ -19,6 +19,13 @@ type MatchClassAd struct {
 // NewMatchClassAd creates a new MatchClassAd with two ClassAds.
 // The left ClassAd can reference the right using TARGET.attr
 // The right ClassAd can reference the left using TARGET.attr
+//
+// The pairing is recorded ON THE ADS: NewMatchClassAd calls SetTarget on both, so it
+// is a write to each of them -- no other goroutine may be reading either ad -- and the
+// TARGET stays set after the MatchClassAd is discarded (callers rely on this to
+// evaluate left.EvaluateExpr(...) directly afterwards). To evaluate against an ad other
+// goroutines share, such as a cached slot ad, use ClassAd.EvaluateExprAgainst, which
+// pairs the two for one evaluation without writing either.
 func NewMatchClassAd(left, right *ClassAd) *MatchClassAd {
 	match := &MatchClassAd{
 		left:  left,
@@ -127,7 +134,7 @@ func (m *MatchClassAd) EvaluateRankRight() (float64, bool) {
 }
 
 // ReplaceLeftAd replaces the left ClassAd.
-// Updates TARGET references appropriately.
+// Updates TARGET references appropriately: like NewMatchClassAd, a write to both ads.
 func (m *MatchClassAd) ReplaceLeftAd(left *ClassAd) {
 	m.left = left
 	if left != nil {
@@ -139,7 +146,7 @@ func (m *MatchClassAd) ReplaceLeftAd(left *ClassAd) {
 }
 
 // ReplaceRightAd replaces the right ClassAd.
-// Updates TARGET references appropriately.
+// Updates TARGET references appropriately: like NewMatchClassAd, a write to both ads.
 func (m *MatchClassAd) ReplaceRightAd(right *ClassAd) {
 	m.right = right
 	if right != nil {
