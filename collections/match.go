@@ -294,7 +294,7 @@ func (ms *matchScope) lookupTarget(name string) ([]byte, bool) {
 
 // jobRequirementsExpr returns the job's Requirements expression, or nil if absent.
 func jobRequirementsExpr(job *classad.ClassAd) ast.Expr {
-	for _, a := range job.AST().Attributes { // AST() sorts once; benign + idempotent
+	for _, a := range job.AST().Attributes { // AST() is read-only (a cached sorted view)
 		if strings.EqualFold(a.Name, "Requirements") {
 			return a.Value
 		}

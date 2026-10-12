@@ -63,9 +63,8 @@ func TestInsertInPlaceKeepsOrder(t *testing.T) {
 	}
 }
 
-// TestInsertAppendStillSorts is the other half: an append CAN disorder the ad, so it must
-// still mark it dirty. A change that stopped marking dirty entirely would pass the test
-// above and fail here.
+// TestInsertAppendStillSorts is the other half: an append CAN disorder the ad, so the
+// ad must still render sorted afterwards.
 func TestInsertAppendStillSorts(t *testing.T) {
 	c := New()
 	c.InsertAttr("Mid", 1)
@@ -92,7 +91,7 @@ func TestInsertInPlaceOnDirtyAdStaysDirty(t *testing.T) {
 	c := FromAST(raw)
 	// An in-place update BEFORE anything sorts the ad.
 	c.InsertAttr("Zebra", 99)
-	eq(t, names(t, c), []string{"alpha", "Mid", "Zebra"}, "dirty ad must still sort after an in-place update")
+	eq(t, names(t, c), []string{"alpha", "Mid", "Zebra"}, "unsorted input must still render sorted after an in-place update")
 	if v, _ := c.EvaluateAttrInt("Zebra"); v != 99 {
 		t.Errorf("Zebra = %d, want 99", v)
 	}

@@ -220,9 +220,7 @@ func FuzzRoundTrip(f *testing.F) {
 		if err != nil {
 			t.Fatalf("decode failed for parseable ad %q: %v", src, err)
 		}
-		// Re-encoding the freshly-decoded ad must be byte-stable. This must run
-		// before the Equal check below, because classad.Equal sorts nested
-		// records in place (ensureSorted), which would reorder got's attributes.
+		// Re-encoding the freshly-decoded ad must be byte-stable.
 		if string(enc) != string(EncodeStandalone(got)) {
 			t.Fatalf("re-encode not stable for %q", src)
 		}

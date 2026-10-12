@@ -22,7 +22,7 @@ func readBenchFixture(b *testing.B, shards int) *Collection {
 	b.Helper()
 	c := New(Options{Shards: shards, Codec: identityCodec{}})
 	ad := mustAd(b, `[MyType="Machine"; Cpus=8; Memory=16384; Arch="X86_64"; State="Unclaimed"]`)
-	_ = ad.AST() // Put's AST() sorts in place; do it once rather than per iteration
+	_ = ad.AST() // build the cached sorted view once rather than per iteration
 	for i := 0; i < readBenchKeys; i++ {
 		if err := c.Put([]byte("k"+strconv.Itoa(i)), ad); err != nil {
 			b.Fatal(err)
