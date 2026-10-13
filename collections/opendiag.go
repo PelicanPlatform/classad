@@ -73,11 +73,11 @@ type OpenTiming struct {
 	ZoneRecomputed    int
 	ZoneUpgraded      int
 	ZoneUpgradeFailed int
-	Reindex        time.Duration // post-recovery rebuild of indexes not adopted from sidecars
-	RebuildOrdered time.Duration // post-recovery rebuild of the maintained ordered indexes
-	AdoptSchema    time.Duration // re-enable columnar schema-scan from persisted blocks
-	LoadDicts      time.Duration // load on-disk dictionaries before segment recovery
-	LoadDemand     time.Duration // load checkpointed query demand
+	Reindex           time.Duration // post-recovery rebuild of indexes not adopted from sidecars
+	RebuildOrdered    time.Duration // post-recovery rebuild of the maintained ordered indexes
+	AdoptSchema       time.Duration // re-enable columnar schema-scan from persisted blocks
+	LoadDicts         time.Duration // load on-disk dictionaries before segment recovery
+	LoadDemand        time.Duration // load checkpointed query demand
 }
 
 // add accumulates o2 into o (used to fold each shard's phase timings into the collection total).
