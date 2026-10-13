@@ -103,15 +103,22 @@ func newNumCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCache)
 // at reads record k's value with its ClassAd kind, taking the cold-tail path only when the value
 // escaped its slot.
 func (c *numCol) at(k int, bc *blockCache) (colVal, bool) {
+	v, cell := c.cell(k, bc)
+	return v, cell == cellNumber
+}
+
+// cell is at saying why there is no value (see numCell). A caller that skips missing values must use
+// this and give up on cellExpr: skipping an expression as if it were missing is a wrong answer.
+func (c *numCol) cell(k int, bc *blockCache) (colVal, numCell) {
 	base := k * c.blk.bitsStride
 	if testBit(c.blk.bits[base:base+c.escBytes], c.fieldIdx) {
-		return c.blk.escapedNumVal(k, c.fieldID, bc)
+		return c.blk.escapedNumCell(k, c.fieldID, bc)
 	}
 	raw := readIntLE(c.region[c.start+k*c.width:], c.width, c.unsigned)
 	if c.isReal {
-		return colVal{f: math.Float64frombits(uint64(raw)), kind: akReal}, true
+		return colVal{f: math.Float64frombits(uint64(raw)), kind: akReal}, cellNumber
 	}
-	return colVal{f: float64(raw), i: raw, kind: akInt}, true
+	return colVal{f: float64(raw), i: raw, kind: akInt}, cellNumber
 }
 
 // fieldIntAt reads one record's raw slot value for a numeric field: a strided read of the uncompressed
@@ -140,7 +147,9 @@ func (b *columnarBlock) fieldIntAt(k, fieldIdx int, bc *blockCache) (int64, bool
 //
 // A segment whose own schema lacks the aggregated field or any predicated one, and the active segment,
 // fall back to a row walk reading only those attributes -- never a full ad decode.
-func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *blockCache) NumStats {
+//
+// ok=false when a value involved is an expression, which the columns cannot evaluate.
+func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *blockCache) (NumStats, bool) {
 	// A predicate on the AGGREGATED attribute is applied during the value pass, not as a narrowing
 	// pass of its own: the value is being read anyway, so testing it there costs nothing, while a
 	// separate pass reads the same column twice. Skipping that fusion made
@@ -176,7 +185,10 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)
 			if !ok {
-				bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, &acc)
+				if !bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, &acc) {
+					releaseWindows(wins)
+					return NumStats{}, false
+				}
 				continue
 			}
 			// Narrowing uses only the OTHER fields; pruning may use them all, since ruling a block
@@ -211,7 +223,12 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 						if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
 							continue
 						}
-						if nv, ok := col.at(k, bc); ok && selfOK(nv.f) {
+						nv, cell := col.cell(k, bc)
+						if cell == cellExpr {
+							releaseWindows(wins)
+							return NumStats{}, false
+						}
+						if cell == cellNumber && selfOK(nv.f) {
 							acc.add(nv)
 						}
 					}
@@ -240,14 +257,23 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 					if live == 0 {
 						break
 					}
-					live = narrowByField(blk, otherIdxs[i], otherPreds[i], bc, keep, scratch)
+					var ok bool
+					if live, ok = narrowByField(blk, otherIdxs[i], otherPreds[i], bc, keep, scratch); !ok {
+						releaseWindows(wins)
+						return NumStats{}, false
+					}
 				}
 				if live > 0 {
 					for k := 0; k < blk.n; k++ {
 						if !keep[k] {
 							continue
 						}
-						if nv, ok := col.at(k, bc); ok && selfOK(nv.f) {
+						nv, cell := col.cell(k, bc)
+						if cell == cellExpr {
+							releaseWindows(wins)
+							return NumStats{}, false
+						}
+						if cell == cellNumber && selfOK(nv.f) {
 							acc.add(nv)
 						}
 					}
@@ -257,7 +283,7 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 		}
 		releaseWindows(wins)
 	}
-	return acc.result()
+	return acc.result(), true
 }
 
 // attrLookup returns the wire lookup for an attribute in this collection's mode: by interned id in
@@ -292,7 +318,7 @@ func resolveStatsFields(cs *colSegment, aggID uint32, preds []fieldPred) (int, [
 // bruteStatsMulti is the row fallback: walk a window's visible records, test the predicated
 // attributes, and accumulate the aggregated one -- reading only those attributes from the wire ad.
 func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.Ad) ([]byte, bool),
-	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, acc *statsAccum) {
+	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, acc *statsAccum) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -311,6 +337,9 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.
 						match = false
 						break
 					}
+					if isExprNode(node) {
+						return false
+					}
 					nv, isNum := nodeColVal(node)
 					if !isNum || !preds[i].eval(nv.f) {
 						match = false
@@ -319,6 +348,9 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.
 				}
 				if match {
 					if node, found := aggLookup(ad); found {
+						if isExprNode(node) {
+							return false
+						}
 						if nv, isNum := nodeColVal(node); isNum && selfOK(nv.f) {
 							acc.add(nv)
 						}
@@ -328,4 +360,5 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.
 		}
 		off += int(total)
 	}
+	return true
 }

@@ -43,6 +43,13 @@ type colSegment struct {
 	// groups are the group schemas' selections, one colGroupBlock per group per base block. Empty
 	// when the collection carries no group schemas.
 	groups []*colGroup
+
+	// For a columnarized segment's payload only (see bindNative): the collection and the arena the
+	// remnants live in, and the lazily built index of the schema-field cells those remnants still
+	// hold (colheld.go). nil on a sidecar payload, whose blocks hold every value they describe.
+	owner   *Collection
+	arena   *segment
+	heldIdx *heldIndex
 }
 
 // offsLen is the number of records the arena-offset map covers.
@@ -725,7 +732,12 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 		if len(names) > 0 {
 			c.demand.recordReads(names)
 		}
-		return c.schemaScanCountMulti(preds, st.cache), true
+		if n, ok := c.schemaScanCountMulti(preds, st.cache); ok {
+			return n, true
+		}
+		// Some value is an expression, which the column scan cannot compare. The vectorized tier
+		// evaluates exactly those records one at a time, so it still answers from the columns.
+		return c.vectorCountUnlessIndexed(q)
 	}
 	fieldID, eval, ok := c.numPredOnField(q, st.schema)
 	if !ok {
@@ -748,17 +760,26 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 		// so against a selective indexed constraint the scan wins, and a routing that ignored that was
 		// measured 2.9x slower on exactly such a query.
 		// Skipped only when an index could prune the row path instead.
-		if !c.indexCanPrune(q) {
-			return c.VectorEvalCount(q)
-		}
-		return 0, false
+		return c.vectorCountUnlessIndexed(q)
 	}
 	// As NumStatsQuery: record the predicate's attribute so the hot tier keeps tracking the
 	// columns queries actually read, instead of freezing once the accelerator starts serving them.
 	if name, ok := c.schemaFieldName(fieldID); ok {
 		c.demand.recordReads([]string{name})
 	}
-	return c.schemaScanCount(fieldID, st.cache, eval), true
+	if n, ok := c.schemaScanCount(fieldID, st.cache, eval); ok {
+		return n, true
+	}
+	return c.vectorCountUnlessIndexed(q) // an expression among the values; see above
+}
+
+// vectorCountUnlessIndexed is CountQuery's last tier: VectorEvalCount, unless an index could prune the
+// row path instead (see CountQuery for why that routing matters).
+func (c *Collection) vectorCountUnlessIndexed(q *vm.Query) (int, bool) {
+	if !c.indexCanPrune(q) {
+		return c.VectorEvalCount(q)
+	}
+	return 0, false
 }
 
 func numCmp(op string, t float64) (func(float64) bool, bool) {
@@ -782,14 +803,15 @@ func numCmp(op string, t float64) (func(float64) bool, bool) {
 // schemaScanCount counts the records whose numeric attribute fieldID satisfies eval, over the
 // shared columnar value scan -- see scanNumValues for the per-block schema resolution, the MVCC
 // visibility rule and the row fallback. A record whose value is absent is skipped, not counted.
-func (c *Collection) schemaScanCount(fieldID uint32, bc *blockCache, eval func(float64) bool) int {
+// ok=false when some value is an expression, which only the row path can evaluate.
+func (c *Collection) schemaScanCount(fieldID uint32, bc *blockCache, eval func(float64) bool) (int, bool) {
 	count := 0
-	c.scanNumValues(fieldID, bc, func(nv colVal) {
+	ok := c.scanNumValues(fieldID, bc, func(nv colVal) {
 		if eval(nv.f) {
 			count++
 		}
 	})
-	return count
+	return count, ok
 }
 
 // schemaScanIntCount is the int-typed convenience wrapper (used by tests/benchmarks).
@@ -798,7 +820,8 @@ func (c *Collection) schemaScanIntCount(s *adSchema, fieldIdx int, match func(in
 	if st := c.schemaScan.Load(); st != nil {
 		bc = st.cache
 	}
-	return c.schemaScanCount(s.fields[fieldIdx].id, bc, func(f float64) bool { return match(int64(f)) })
+	n, _ := c.schemaScanCount(s.fields[fieldIdx].id, bc, func(f float64) bool { return match(int64(f)) })
+	return n
 }
 
 // The row-scan fallback now lives with the shared value scan, as bruteNumValues in colagg.go.

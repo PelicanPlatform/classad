@@ -90,10 +90,17 @@ func (cs *colScope) resolveGroup(name string) (classad.Value, bool) {
 	gb := cs.gblocks[b.gi]
 	idx, member := gb.index(cs.k)
 	if !member {
+		id := cs.groups[b.gi].schema.fields[b.fi].id
 		if gb.isException(cs.k) {
 			// Holds part of the group. Not in the group block, but a group attribute is not a
 			// base schema field either, so the base encoder left it in the cold tail.
-			return cs.fromColdTail(cs.groups[b.gi].schema.fields[b.fi].id), true
+			return cs.fromColdTail(id), true
+		}
+		// Membership is decided over the record's LITERALS, so a record holding this attribute as
+		// an expression is not a member either -- and the value is in the record, not undefined.
+		if cs.blk.heldAt(cs.k, id) {
+			cs.fallBack()
+			return classad.NewUndefinedValue(), true
 		}
 		// Holds none of the group: every member attribute is undefined here, proven by the
 		// membership bit alone -- no decode of any kind.
@@ -122,6 +129,9 @@ func (cs *colScope) groupScope(gi int, gb *colGroupBlock) *colScope {
 	if sub.blk != gb.blk {
 		sub.setBlock(gb.blk)
 	}
+	// The group block's cold tail is no more complete than the base block's: in a columnarized
+	// segment a value missing from it may be in the record.
+	sub.schemaOnly = cs.schemaOnly
 	return sub
 }
 
@@ -146,6 +156,9 @@ func (cs *colScope) groupAbsentAt(name string, k int) (bool, bool) {
 	gb := cs.gblocks[b.gi]
 	if _, member := gb.index(k); member {
 		return false, true
+	}
+	if cs.blk.heldAt(k, cs.groups[b.gi].schema.fields[b.fi].id) {
+		return false, false // the value is in the record: membership proves nothing
 	}
 	return !gb.isException(k), true
 }
@@ -185,6 +198,12 @@ func (s *blockVecSource) loadGroupColumn(name string, dst *vm.Vec) (bool, bool) 
 	gb := s.gblocks[b.gi]
 	g := s.groups[b.gi]
 	id := g.schema.fields[b.fi].id
+	// A record holding this attribute as a value the columns could not take (an expression) is
+	// neither a member nor an exception the cold tail can answer for, so the scatter below would
+	// present it as undefined. Decline the block; its per-record path reads the record.
+	if s.blk.heldAny(id) {
+		return false, true
+	}
 	dst.Mask = false
 	dst.Raw = nil
 

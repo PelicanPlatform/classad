@@ -106,7 +106,7 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 // A segment whose own schema lacks any of the fields, and the active segment (no block), are counted
 // by a row walk that reads only the predicated attributes -- not by decoding the ad. So a schema
 // change never costs more than the segments it actually affects.
-func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int {
+func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) (int, bool) {
 	lookups := make([]func(wire.Ad) ([]byte, bool), len(preds))
 	for i, p := range preds {
 		id := p.fieldID
@@ -126,7 +126,12 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 			cs := w.seg.colblk.Load()
 			idxs, resolved := resolveFields(cs, preds)
 			if !resolved {
-				count += bruteCountMulti(c, w, s0, preds, lookups)
+				n, ok := bruteCountMulti(c, w, s0, preds, lookups)
+				if !ok {
+					releaseWindows(wins)
+					return 0, false
+				}
+				count += n
 				continue
 			}
 			base := 0
@@ -162,7 +167,11 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 					if live == 0 {
 						break // nothing left in this block; later columns would be read for nothing
 					}
-					live = narrowByField(blk, idxs[i], preds[i], bc, keep, scratch)
+					var ok bool
+					if live, ok = narrowByField(blk, idxs[i], preds[i], bc, keep, scratch); !ok {
+						releaseWindows(wins)
+						return 0, false
+					}
 				}
 				count += live
 				base += blk.n
@@ -170,7 +179,7 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) int
 		}
 		releaseWindows(wins)
 	}
-	return count
+	return count, true
 }
 
 // blockMayMatch reports whether blk could hold a record satisfying every predicate.
@@ -204,7 +213,10 @@ func resolveFields(cs *colSegment, preds []fieldPred) ([]int, bool) {
 // narrowByField clears keep[k] for every still-candidate record failing this field's predicate, and
 // returns how many survive. A real field's slot holds math.Float64bits, so the raw value is
 // converted by kind -- reading a real as an integer would silently produce astronomical values.
-func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, keep []bool, scratch []int64) int {
+//
+// ok=false when a candidate's value is one the columns cannot evaluate (cellExpr): the caller gives
+// the query back to the row path, since treating it as failing the predicate is a wrong answer.
+func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, keep []bool, scratch []int64) (int, bool) {
 	isReal := blk.schema.fields[idx].kind == akReal
 	live := 0
 	// Batch form: one tight typed load of the whole column, then one predicate loop. Escaped records
@@ -219,8 +231,11 @@ func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, kee
 			var v float64
 			if !escFree && testBit(blk.escapeAt(k), idx) {
 				// The value is not in the column: missing, wrong kind, or too wide for the slot.
-				nv, ok := blk.escapedNumVal(k, p.fieldID, bc)
-				if !ok {
+				nv, cell := blk.escapedNumCell(k, p.fieldID, bc)
+				if cell == cellExpr {
+					return 0, false
+				}
+				if cell != cellNumber {
 					keep[k] = false
 					continue
 				}
@@ -236,17 +251,22 @@ func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, kee
 			}
 			live++
 		}
-		return live
+		return live, true
 	}
+	ok := true
 	_ = blk.scanInt(idx, bc, func(k int, present bool, v int64) {
-		if !keep[k] {
+		if !ok || !keep[k] {
 			return
 		}
 		if !present {
 			// Escaped: read just this field from the cold tail. Absent or non-numeric leaves the
 			// comparison UNDEFINED, so the record cannot satisfy the conjunction.
-			nv, ok := blk.escapedNumVal(k, p.fieldID, bc)
-			if !ok || !p.eval(nv.f) {
+			nv, cell := blk.escapedNumCell(k, p.fieldID, bc)
+			if cell == cellExpr {
+				ok = false
+				return
+			}
+			if cell != cellNumber || !p.eval(nv.f) {
 				keep[k] = false
 				return
 			}
@@ -263,12 +283,15 @@ func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, kee
 		}
 		live++
 	})
-	return live
+	return live, ok
 }
 
 // bruteCountMulti is the row fallback: walk a window's visible records and test the predicated
 // attributes from their wire nodes, reading only those attributes rather than decoding the ad.
-func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool)) int {
+//
+// ok=false when a predicated attribute holds an expression: comparing it needs evaluating it, which
+// only the general scan does, and skipping it would undercount.
+func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool)) (int, bool) {
 	count := 0
 	var buf []byte
 	for off := 0; off < w.used; {
@@ -287,6 +310,9 @@ func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, l
 						ok = false
 						break
 					}
+					if isExprNode(node) {
+						return 0, false
+					}
 					nv, isNum := nodeColVal(node)
 					if !isNum || !preds[i].eval(nv.f) {
 						ok = false
@@ -300,5 +326,5 @@ func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, l
 		}
 		off += int(total)
 	}
-	return count
+	return count, true
 }

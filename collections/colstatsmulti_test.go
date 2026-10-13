@@ -272,7 +272,8 @@ func BenchmarkStatsSameAttrRoute(b *testing.B) {
 		})
 		return acc.result()
 	}
-	if a, bb := c.schemaScanStatsMulti(id, preds, st.cache), oldPath(); a.N != bb.N || a.IntSum != bb.IntSum {
+	a, _ := c.schemaScanStatsMulti(id, preds, st.cache)
+	if bb := oldPath(); a.N != bb.N || a.IntSum != bb.IntSum {
 		b.Fatalf("paths disagree: (n %d sum %d) vs (n %d sum %d)", a.N, a.IntSum, bb.N, bb.IntSum)
 	}
 	b.Run("newTwoPass", func(b *testing.B) {

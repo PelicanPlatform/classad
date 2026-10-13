@@ -91,7 +91,7 @@ func (c *Collection) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 	}
 	c.demand.recordReads(reads)
 
-	return c.schemaScanStatsMulti(id, preds, st.cache), true
+	return c.schemaScanStatsMulti(id, preds, st.cache)
 }
 
 // numericKind reports whether a schema field's kind is one the numeric column scan can read.
@@ -168,7 +168,10 @@ func (c *Collection) numPredOnField(q *vm.Query, s *adSchema) (uint32, func(floa
 // lacks. It also decides the value conversion, because a REAL field's fixed slot holds
 // math.Float64bits and scanInt returns those bits as an int64 -- reading them as an integer
 // would silently produce astronomically wrong values.
-func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVal)) {
+//
+// Returns false when some live record's value is an expression, which this cannot evaluate; fn has
+// then seen a partial set and the caller must answer by scanning.
+func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVal)) bool {
 	// The row fallback reads records straight from the arena, so it must honor the collection's
 	// wire mode: look the field up by inline name on a persistent store, by interned id in memory.
 	lookup := func(a wire.Ad) ([]byte, bool) { return a.Lookup(fieldID) }
@@ -195,14 +198,21 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 				}
 			}
 			if bidx < 0 {
-				bruteNumValues(c, w, s0, lookup, fn)
+				if !bruteNumValues(c, w, s0, lookup, fn) {
+					releaseWindows(wins)
+					return false
+				}
 				continue
 			}
 			// Walk the segment's row groups in record order, tracking each group's base so a
 			// group-local record index maps back into the segment-wide offs array.
 			base := 0
+			expr := false
 			for _, blk := range cs.blocks {
 				blk.scanInt(bidx, bc, func(k int, present bool, v int64) {
+					if expr {
+						return
+					}
 					gk := base + k
 					if gk >= cs.offsLen() {
 						return // truncated offs: cannot establish visibility, so do not count it
@@ -225,20 +235,28 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 					// The cold tail carries the wire node, so its kind is read from the node
 					// itself rather than assumed from this block's schema field. With row groups
 					// this decompresses only the escaped record's OWN group's tail.
-					if nv, ok := blk.escapedNumVal(k, fieldID, bc); ok {
+					switch nv, cell := blk.escapedNumCell(k, fieldID, bc); cell {
+					case cellNumber:
 						fn(nv)
+					case cellExpr:
+						expr = true
 					}
 				})
+				if expr {
+					releaseWindows(wins)
+					return false
+				}
 				base += blk.n
 			}
 		}
 		releaseWindows(wins)
 	}
+	return true
 }
 
 // bruteNumValues is the row-scan fallback: walk a window's visible records, read the numeric
 // field from the wire ad, and hand over each value found.
-func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), fn func(colVal)) {
+func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), fn func(colVal)) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -250,6 +268,9 @@ func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) 
 			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
 				if node, ok := lookup(wire.Ad(ww)); ok {
+					if isExprNode(node) {
+						return false
+					}
 					if nv, ok := nodeColVal(node); ok {
 						fn(nv)
 					}
@@ -258,11 +279,19 @@ func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) 
 		}
 		off += int(total)
 	}
+	return true
 }
 
 // nodeColVal reads a wire node as a numeric value, keeping the kind the reference's aggregates
 // dispatch on. A boolean coerces to 1/0 as the reference does, and is reported as akBool so a
 // caller can decline rather than approximate the reference's boolean quirks.
+// isExprNode reports whether a wire node is a value only evaluation can give -- an expression rather
+// than a literal. The numeric column paths read literals; meeting one of these, they decline.
+func isExprNode(node []byte) bool {
+	_, lit := wire.LiteralValue(node)
+	return !lit
+}
+
 func nodeColVal(node []byte) (colVal, bool) {
 	switch k, lit := nodeKind(node); k {
 	case akInt:

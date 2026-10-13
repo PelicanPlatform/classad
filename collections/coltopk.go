@@ -133,7 +133,10 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, rok := resolveStatsFields(cs, aggID, preds)
 			if !rok {
-				c.bruteTopK(w, s0, aggLookup, otherPreds, lookups, selfOK, tk, stats)
+				if !c.bruteTopK(w, s0, aggLookup, otherPreds, lookups, selfOK, tk, stats) {
+					releaseWindows(wins)
+					return 0, 0, false
+				}
 				continue
 			}
 			otherIdxs := make([]int, 0, len(otherPreds))
@@ -165,7 +168,12 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 						}
 						stats.visit()
 						stats.columnDecided() // the filter is answered from the columns
-						if nv, vok := col.at(j, st.cache); vok && selfOK(nv.f) {
+						nv, cell := col.cell(j, st.cache)
+						if cell == cellExpr {
+							releaseWindows(wins)
+							return 0, 0, false
+						}
+						if cell == cellNumber && selfOK(nv.f) {
 							tk.offer(nv.f)
 							stats.matched()
 						}
@@ -195,7 +203,11 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 					if live == 0 {
 						break
 					}
-					live = narrowByField(blk, otherIdxs[i], otherPreds[i], st.cache, keep, scratch)
+					var nok bool
+					if live, nok = narrowByField(blk, otherIdxs[i], otherPreds[i], st.cache, keep, scratch); !nok {
+						releaseWindows(wins)
+						return 0, 0, false
+					}
 				}
 				if live > 0 {
 					for j := 0; j < blk.n; j++ {
@@ -204,7 +216,12 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 						}
 						stats.visit()
 						stats.columnDecided()
-						if nv, vok := col.at(j, st.cache); vok && selfOK(nv.f) {
+						nv, cell := col.cell(j, st.cache)
+						if cell == cellExpr {
+							releaseWindows(wins)
+							return 0, 0, false
+						}
+						if cell == cellNumber && selfOK(nv.f) {
 							tk.offer(nv.f)
 							stats.matched()
 						}
@@ -223,7 +240,7 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 // the active segment: walk its visible records, test the predicates, and offer the order value --
 // reading only those attributes from the wire, never a full decode. Mirrors bruteStatsMulti.
 func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) ([]byte, bool),
-	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, tk *topKKeep, stats *ScanStats) {
+	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, tk *topKKeep, stats *ScanStats) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -244,6 +261,9 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 						match = false
 						break
 					}
+					if isExprNode(node) {
+						return false
+					}
 					nv, isNum := nodeColVal(node)
 					if !isNum || !preds[i].eval(nv.f) {
 						match = false
@@ -252,6 +272,9 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 				}
 				if match {
 					if node, found := aggLookup(ad); found {
+						if isExprNode(node) {
+							return false
+						}
 						if nv, isNum := nodeColVal(node); isNum && selfOK(nv.f) {
 							tk.offer(nv.f)
 							stats.matched()
@@ -262,4 +285,5 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 		}
 		off += int(total)
 	}
+	return true
 }
