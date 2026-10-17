@@ -3,6 +3,8 @@ package collections
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
+	"slices"
 	"testing"
 )
 
@@ -72,8 +74,18 @@ func TestSidecarContainerZones(t *testing.T) {
 	key := []byte("KEYBLOB!")
 	col := []byte("COLBLOB!")
 	zones := map[uint32]zoneRange{7: {Min: -1.5, Max: 100}, 3: {Min: 0, Max: 0}}
+	names := map[uint32]string{7: "Memory", 3: "Cpus"}
+	nameOf := func(id uint32) (string, bool) { n, ok := names[id]; return n, ok }
+	idOf := func(name string) (uint32, bool) {
+		for id, n := range names {
+			if n == name {
+				return id, true
+			}
+		}
+		return 0, false
+	}
 
-	c4 := buildSegmentSidecar(attr, key, col, buildZoneBlob(zones), 4096, 0)
+	c4 := buildSegmentSidecar(attr, key, col, buildZoneBlob(zones, nameOf), 4096, 0)
 	a, k, cc, z, ok := splitSegmentSidecar(c4)
 	if !ok {
 		t.Fatal("v3 container did not parse")
@@ -81,8 +93,8 @@ func TestSidecarContainerZones(t *testing.T) {
 	if string(a) != string(attr) || string(k) != string(key) || string(cc) != string(col) {
 		t.Fatalf("sections mangled: attr=%q key=%q col=%q", a, k, cc)
 	}
-	got, ok := parseZoneBlob(z)
-	if !ok {
+	got, st := parseZoneBlob(z, idOf)
+	if st != zoneBlobOK {
 		t.Fatal("zone section did not parse")
 	}
 	if len(got) != len(zones) {
@@ -101,14 +113,55 @@ func TestSidecarContainerZones(t *testing.T) {
 
 	// A malformed zone section must be rejected, not half-decoded: a wrong [min,max] would
 	// silently prune segments that hold matches.
-	for _, bad := range [][]byte{{}, {1, 0, 0, 0}, append([]byte{1, 0, 0, 0}, make([]byte, 19)...)} {
-		if _, ok := parseZoneBlob(bad); ok {
+	good := buildZoneBlob(zones, nameOf)
+	for _, bad := range [][]byte{{}, {1, 0, 0, 0}, append([]byte{1, 0, 0, 0}, make([]byte, 19)...),
+		good[:len(good)-1], append(append([]byte(nil), good...), 0), good[:9]} {
+		if _, st := parseZoneBlob(bad, idOf); st == zoneBlobOK {
 			t.Errorf("parseZoneBlob(%v) accepted a malformed section", bad)
 		}
 	}
 	// min > max is impossible for a real zone map and must be refused.
-	bad := buildZoneBlob(map[uint32]zoneRange{1: {Min: 5, Max: 1}})
-	if _, ok := parseZoneBlob(bad); ok {
+	bad := buildZoneBlob(map[uint32]zoneRange{7: {Min: 5, Max: 1}}, nameOf)
+	if _, st := parseZoneBlob(bad, idOf); st == zoneBlobOK {
 		t.Error("parseZoneBlob accepted min > max")
+	}
+}
+
+// legacyZoneBlob is the first zone-section format, keyed by intern id.
+func legacyZoneBlob(zones map[uint32]zoneRange) []byte {
+	ids := make([]uint32, 0, len(zones))
+	for id := range zones {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	b := binary.LittleEndian.AppendUint32(nil, uint32(len(ids)))
+	for _, id := range ids {
+		b = binary.LittleEndian.AppendUint32(b, id)
+		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(zones[id].Min))
+		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(zones[id].Max))
+	}
+	return b
+}
+
+// A zone section is bound to attributes by name: an id that means something else in this
+// process cannot pick up another attribute's range, a name this process does not know is
+// dropped, and an id-keyed (legacy) section is recognized and never trusted.
+func TestZoneBlobByName(t *testing.T) {
+	zones := map[uint32]zoneRange{4: {Min: 1, Max: 7}, 9: {Min: 1.7e9, Max: 1.8e9}}
+	writer := map[uint32]string{4: "RequestMemory", 9: "CompletionDate"}
+	blob := buildZoneBlob(zones, func(id uint32) (string, bool) { n, ok := writer[id]; return n, ok })
+	// The reader's ids are not the writer's: CompletionDate is 4 here, RequestMemory 12, and
+	// it has never heard of a third name.
+	reader := map[string]uint32{"CompletionDate": 4, "RequestMemory": 12}
+	got, st := parseZoneBlob(blob, func(n string) (uint32, bool) { id, ok := reader[n]; return id, ok })
+	if st != zoneBlobOK || len(got) != 2 || got[4] != (zoneRange{Min: 1.7e9, Max: 1.8e9}) || got[12] != (zoneRange{Min: 1, Max: 7}) {
+		t.Errorf("rebound zones = %v (%v)", got, st)
+	}
+	got, st = parseZoneBlob(blob, func(n string) (uint32, bool) { return 3, n == "CompletionDate" })
+	if st != zoneBlobOK || len(got) != 1 || got[3].Min != 1.7e9 {
+		t.Errorf("unknown name kept: %v", got)
+	}
+	if got, st := parseZoneBlob(legacyZoneBlob(zones), func(string) (uint32, bool) { return 0, true }); st != zoneBlobLegacy || got != nil {
+		t.Errorf("legacy section: %v, %v", got, st)
 	}
 }
