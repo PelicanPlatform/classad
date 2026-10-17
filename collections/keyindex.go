@@ -331,52 +331,127 @@ func writeFileAtomic(path string, b []byte) error {
 // measured at ~95% of reopen time, and hours for an archive of any size. It is computed once
 // at seal anyway, so persist it beside the index it lives with.
 //
-// Format: [n u32] then n x { attrID u32, min f64, max f64 }. Empty when the segment has no
-// zone map, in which case the container stays at v2 and readers fall back to recomputing.
+// The section is keyed by attribute NAME. The first format keyed it by the attribute's intern
+// id, which is process-local: ids are handed out in the order a process meets names, so once the
+// zone or value-index configuration changes (an attribute added, removed or reordered -- or a value
+// index added at runtime, whose id comes after the data's) the same id names a different
+// attribute in the next process. A zone map adopted that way applies one attribute's [min,max]
+// to another and prunes segments that hold matches: silently wrong answers, and age retention
+// dropping segments by the wrong attribute.
+//
+// Format: [zoneBlobMagic u32][n u32] then n x { nameLen u16, name, min f64, max f64 }. Empty when
+// the segment has no zone map. A legacy section ([n u32] then n x { id u32, min f64, max f64 })
+// cannot be told which attributes its ids meant, so it is never adopted: the segment's zones are
+// recomputed once and the sidecar rewritten in this format (see persistSegZonesUpgrade). The
+// magic cannot open a valid legacy section, which would need a 16 GiB blob, so neither format is
+// mistaken for the other -- including by an older build, which rejects this one as malformed and
+// recomputes.
 
-func buildZoneBlob(zones map[uint32]zoneRange) []byte {
+// zoneBlobMagic opens a name-keyed zone section ("ZNM2").
+const zoneBlobMagic uint32 = 0x324d4e5a
+
+// zoneBlobStatus is what parseZoneBlob made of a section.
+type zoneBlobStatus uint8
+
+const (
+	zoneBlobBad    zoneBlobStatus = iota // empty or malformed: not a zone map
+	zoneBlobLegacy                       // well-formed but id-keyed: not to be trusted
+	zoneBlobOK
+)
+
+// buildZoneBlob encodes a zone map keyed by the names nameOf gives its ids. An id with no name
+// is left out: a missing entry only stops that attribute pruning, where a wrong one would prune
+// wrongly.
+func buildZoneBlob(zones map[uint32]zoneRange, nameOf func(uint32) (string, bool)) []byte {
 	if len(zones) == 0 {
 		return nil
 	}
-	ids := make([]uint32, 0, len(zones))
-	for id := range zones {
-		ids = append(ids, id)
+	type entry struct {
+		name string
+		z    zoneRange
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	b := make([]byte, 0, 4+len(ids)*20)
-	b = binary.LittleEndian.AppendUint32(b, uint32(len(ids)))
-	for _, id := range ids {
-		z := zones[id]
-		b = binary.LittleEndian.AppendUint32(b, id)
-		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(z.Min))
-		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(z.Max))
+	entries := make([]entry, 0, len(zones))
+	for id, z := range zones {
+		if name, ok := nameOf(id); ok && name != "" && len(name) <= math.MaxUint16 {
+			entries = append(entries, entry{name, z})
+		}
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+	b := make([]byte, 0, 8+len(entries)*32)
+	b = binary.LittleEndian.AppendUint32(b, zoneBlobMagic)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(entries)))
+	for _, e := range entries {
+		b = binary.LittleEndian.AppendUint16(b, uint16(len(e.name)))
+		b = append(b, e.name...)
+		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(e.z.Min))
+		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(e.z.Max))
 	}
 	return b
 }
 
-// parseZoneBlob decodes a zone section. ok=false on any malformation, which the caller
-// treats as "not persisted" and recomputes -- a corrupt sidecar must never yield a WRONG
-// zone map, since a too-narrow range would silently prune segments that hold matches.
-func parseZoneBlob(b []byte) (map[uint32]zoneRange, bool) {
+// parseZoneBlob decodes a zone section, binding each name to this process's id for it via idOf; a
+// name idOf does not know is dropped. Only a zoneBlobOK result is a zone map -- a corrupt or
+// legacy section must never yield one, since a too-narrow or misattributed range silently prunes
+// segments that hold matches.
+func parseZoneBlob(b []byte, idOf func(string) (uint32, bool)) (map[uint32]zoneRange, zoneBlobStatus) {
 	if len(b) < 4 {
-		return nil, false
+		return nil, zoneBlobBad
 	}
+	if binary.LittleEndian.Uint32(b) != zoneBlobMagic {
+		if legacyZoneBlobValid(b) {
+			return nil, zoneBlobLegacy
+		}
+		return nil, zoneBlobBad
+	}
+	if len(b) < 8 {
+		return nil, zoneBlobBad
+	}
+	n := int(binary.LittleEndian.Uint32(b[4:]))
+	out := make(map[uint32]zoneRange, n)
+	off := 8
+	for range n {
+		if len(b) < off+2 {
+			return nil, zoneBlobBad
+		}
+		nl := int(binary.LittleEndian.Uint16(b[off:]))
+		off += 2
+		if nl == 0 || len(b) < off+nl+16 {
+			return nil, zoneBlobBad
+		}
+		name := string(b[off : off+nl])
+		off += nl
+		mn := math.Float64frombits(binary.LittleEndian.Uint64(b[off:]))
+		mx := math.Float64frombits(binary.LittleEndian.Uint64(b[off+8:]))
+		off += 16
+		if mn > mx {
+			return nil, zoneBlobBad
+		}
+		if id, ok := idOf(name); ok {
+			out[id] = zoneRange{Min: mn, Max: mx}
+		}
+	}
+	if off != len(b) {
+		return nil, zoneBlobBad
+	}
+	return out, zoneBlobOK
+}
+
+// legacyZoneBlobValid reports whether b is a well-formed id-keyed section.
+func legacyZoneBlobValid(b []byte) bool {
 	n := int(binary.LittleEndian.Uint32(b))
 	if n < 0 || 4+n*20 != len(b) {
-		return nil, false
+		return false
 	}
-	out := make(map[uint32]zoneRange, n)
 	for i := 0; i < n; i++ {
 		off := 4 + i*20
-		id := binary.LittleEndian.Uint32(b[off:])
-		mn := math.Float64frombits(binary.LittleEndian.Uint64(b[off+4:]))
-		mx := math.Float64frombits(binary.LittleEndian.Uint64(b[off+12:]))
-		if mn > mx {
-			return nil, false
+		if math.Float64frombits(binary.LittleEndian.Uint64(b[off+4:])) > math.Float64frombits(binary.LittleEndian.Uint64(b[off+12:])) {
+			return false
 		}
-		out[id] = zoneRange{Min: mn, Max: mx}
 	}
-	return out, true
+	return true
 }
 
 // readSidecarExtent reads just the trailer of a sealed segment's sidecar to recover the
