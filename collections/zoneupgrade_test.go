@@ -119,12 +119,12 @@ func TestZoneUpgradeRepairsAnUnreadableSection(t *testing.T) {
 		if !ok || len(zone) == 0 {
 			continue
 		}
-		// Flip the count so 4+n*20 no longer matches the length: present, unreadable.
+		// Flip the first byte (the magic): present, unreadable.
 		off := len(data) - len(zone) - sidecarTrailerLenV4
 		if off < 0 || off+4 > len(data) {
 			continue
 		}
-		if _, good := parseZoneBlob(zone); !good {
+		if _, st := parseZoneBlob(zone, func(string) (uint32, bool) { return 0, true }); st != zoneBlobOK {
 			continue
 		}
 		data[off] ^= 0xFF

@@ -38,7 +38,7 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 		_ = closer()
 		return false
 	}
-	adoptPersistedZones(seg, zone)
+	c.adoptPersistedZones(seg, zone)
 	ki, err := parseKeyIndex(key)
 	if err != nil || int(ki.upto) != seg.used {
 		_ = closer()
@@ -125,7 +125,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 		attrBlob = b
 	}
 	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobForSeg(seg),
-		buildZoneBlob(seg.zones), seg.used, seg.dictRecOff())
+		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff())
 	if err := writeFileAtomic(path, container); err != nil {
 		return
 	}
@@ -164,8 +164,10 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 		_ = closer() // the container itself is unreadable; leave it for a reindex to rebuild
 		return false
 	}
+	// A legacy (id-keyed) section is well-formed but cannot be trusted (see buildZoneBlob), so it
+	// is rewritten too; only a name-keyed section is left alone.
 	if len(zone) > 0 {
-		if _, good := parseZoneBlob(zone); good {
+		if _, st := parseZoneBlob(zone, c.intern.LookupID); st == zoneBlobOK {
 			_ = closer() // a usable zone section: genuinely nothing to upgrade
 			return false
 		}
@@ -176,7 +178,7 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 	colCopy := append([]byte(nil), col...)
 	_ = closer()
 	container := buildSegmentSidecar(attrCopy, buildKeyIndex(seg.data, seg.used, c.h), colCopy,
-		buildZoneBlob(seg.zones), seg.used, seg.dictRecOff())
+		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff())
 	// Report the write. Discarding this error is how a permanently slow start stays
 	// invisible: the recompute recurs every open and nothing anywhere says the repair
 	// that was supposed to make it one-time never landed.
@@ -244,7 +246,7 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 		return false
 	}
 	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h), c.colBlobPreserve(seg),
-		buildZoneBlob(c.zonesForSeg(sh, seg)), seg.used, seg.dictRecOff())
+		buildZoneBlob(c.zonesForSeg(sh, seg), c.intern.Name), seg.used, seg.dictRecOff())
 	return c.installSidecar(sh, seg, path, container)
 }
 
@@ -271,7 +273,7 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 		_ = closer()
 		return false
 	}
-	adoptPersistedZones(seg, zone)
+	c.adoptPersistedZones(seg, zone)
 	ki, err := parseKeyIndex(key)
 	if err != nil || int(ki.upto) != seg.used {
 		_ = closer()
@@ -460,11 +462,14 @@ func (c *Collection) zonesForSeg(sh *shard, seg *segment) map[uint32]zoneRange {
 // A segment that already has zones keeps them, and an absent or malformed section is simply
 // ignored: the caller's existing recompute path then fills it in. Being wrong here is worse
 // than being slow, since a too-narrow range would prune segments that hold matches.
-func adoptPersistedZones(seg *segment, zone []byte) {
+//
+// Only a name-keyed section is adopted, its names bound to this process's ids; a legacy id-keyed
+// one is ignored, so the segment's zones are recomputed and the section rewritten (persist.go).
+func (c *Collection) adoptPersistedZones(seg *segment, zone []byte) {
 	if seg == nil || seg.zones != nil || len(zone) == 0 {
 		return
 	}
-	if z, ok := parseZoneBlob(zone); ok {
+	if z, st := parseZoneBlob(zone, c.intern.LookupID); st == zoneBlobOK {
 		seg.zones = z
 	}
 }

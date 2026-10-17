@@ -632,7 +632,7 @@ func (c *Collection) persistColumnarizedSidecar(sh *shard, dst *segment) {
 		}
 	}
 	container := buildSegmentSidecar(attrBlob, buildKeyIndex(dst.data, dst.used, c.h),
-		c.colBlobForSeg(dst), buildZoneBlob(dst.zones), dst.used, dst.dictRecOff())
+		c.colBlobForSeg(dst), buildZoneBlob(dst.zones, c.intern.Name), dst.used, dst.dictRecOff())
 	c.installSidecar(sh, dst, path, container)
 }
 
