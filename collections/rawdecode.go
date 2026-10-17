@@ -56,7 +56,7 @@ func (c *Collection) queryRaw(q *vm.Query, redact bool) iter.Seq[RawAd] {
 		}
 		probes := q.Probes()
 		c.demand.record(probes)
-		usable := c.planIndex(probes)
+		usable := c.planRead(probes)
 		emit := c.yieldRaw(yield, redact)
 		for _, sh := range c.shards {
 			var cont bool

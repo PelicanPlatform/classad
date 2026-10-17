@@ -71,7 +71,7 @@ func (c *Collection) QueryRawProjectedStats(q *vm.Query, projection []string, ch
 			qp.zoneProbes = probes // enable sealed-segment zone pruning (mirrors Query)
 		}
 		c.demand.record(probes)
-		usable := c.planIndex(probes)
+		usable := c.planRead(probes)
 		for _, sh := range c.shards {
 			var cont bool
 			if len(usable) > 0 {

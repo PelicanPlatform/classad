@@ -66,7 +66,7 @@ func (c *Collection) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanS
 			qp.zoneProbes = probes // enable sealed-segment zone pruning (mirrors Query)
 		}
 		c.demand.record(probes)
-		usable := c.planIndex(probes)
+		usable := c.planRead(probes)
 
 		scratch := make([]classad.Value, len(attrs))
 		rs := &wireScope{ctx: c} // projection resolver, distinct from the match ws

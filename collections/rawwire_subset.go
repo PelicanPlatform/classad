@@ -67,7 +67,7 @@ func (c *Collection) QueryRawWire(q *vm.Query, projection []string, redact bool)
 		}
 		probes := q.Probes()
 		c.demand.record(probes)
-		usable := c.planIndex(probes)
+		usable := c.planRead(probes)
 		for _, sh := range c.shards {
 			var cont bool
 			if len(usable) > 0 {
