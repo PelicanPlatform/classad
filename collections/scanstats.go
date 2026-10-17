@@ -17,6 +17,16 @@ type ScanStats struct {
 	RecordsColumnDecided int // WHERE answered from the columnar prefilter (no reassembly to test it)
 	RecordsReassembled   int // record rebuilt from the arena (the ~O(ad width) path)
 	RowsMatched          int // records that satisfied the WHERE and were emitted
+
+	// The index probe, when the scan visited index candidates instead of every record:
+	// SegmentsIndexed segments answered from their postings (IndexCandidates offsets in all),
+	// SegmentsIndexSkipped proved by their index to hold no candidate, and SegmentsUnindexed
+	// walked in full because no index covered the probe there (an unsealed segment, or one
+	// sealed before the attribute was indexed). All zero on a plain scan.
+	SegmentsIndexed      int
+	SegmentsIndexSkipped int
+	SegmentsUnindexed    int
+	IndexCandidates      int
 }
 
 func (s *ScanStats) visit() {
@@ -39,6 +49,24 @@ func (s *ScanStats) matched() {
 		s.RowsMatched++
 	}
 }
+
+// indexSegment records one segment's index verdict: n candidate offsets from its postings,
+// skipped when the index proved it holds none, or unindexed when it was walked in full.
+func (s *ScanStats) indexSegment(n int, skipped, unindexed bool) {
+	if s == nil {
+		return
+	}
+	switch {
+	case unindexed:
+		s.SegmentsUnindexed++
+	case skipped:
+		s.SegmentsIndexSkipped++
+	default:
+		s.SegmentsIndexed++
+		s.IndexCandidates += n
+	}
+}
+
 func (s *ScanStats) segments(total, pruned int) {
 	if s != nil {
 		s.SegmentsTotal += total

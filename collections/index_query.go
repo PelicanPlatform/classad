@@ -1,7 +1,9 @@
 package collections
 
 import (
+	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -601,6 +603,18 @@ type QueryExplain struct {
 	Shards      int `json:"shards"`
 	// TotalAds is the live ad count, the denominator for probe selectivity.
 	TotalAds int `json:"totalAds"`
+	// EstCandidates is, for an indexed plan, the estimated records the index hands the scan:
+	// per segment, the smallest of its probes' posting estimates, summed. IndexSegments is how
+	// many segments answer from an index, IndexSkippedSegments how many the index proves hold
+	// no candidate, and UnindexedSegments how many no index covers (an unsealed segment, or
+	// one sealed before the attribute was indexed), which are walked in full.
+	EstCandidates        int64 `json:"estCandidates,omitempty"`
+	IndexSegments        int   `json:"indexSegments,omitempty"`
+	IndexSkippedSegments int   `json:"indexSkippedSegments,omitempty"`
+	UnindexedSegments    int   `json:"unindexedSegments,omitempty"`
+	// Reason says, in a sentence, why the plan is what it is: which index probe and how many
+	// candidates, or why the scan won.
+	Reason string `json:"reason,omitempty"`
 }
 
 // ExplainQuery reports how the store would execute q: which of its conjuncts are
@@ -618,11 +632,15 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		TotalAds:    total,
 	}
 	merges := rangeMerges(usable)
+	var indexedAttrs []string // the usable probes' attributes, as the query spells them
 	for _, p := range probes {
 		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
 		var up usableProbe
 		var isUsable bool
 		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
+		if isUsable && !slices.ContainsFunc(indexedAttrs, func(a string) bool { return strings.EqualFold(a, p.Attr) }) {
+			indexedAttrs = append(indexedAttrs, p.Attr)
+		}
 		up = applyMerge(merges, up, &pe)
 		if isUsable {
 			if cand, covered := c.estimateCandidates(up); covered {
@@ -635,20 +653,94 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		}
 		ex.Probes = append(ex.Probes, pe)
 	}
+	scan := "serial-scan"
+	if c.queryPar > 1 && !c.reverseScan {
+		scan = "parallel-scan" // a newest-first archive always walks serially (see queryAs)
+	}
+	frac, gated := c.overReadGate(usable)
 	switch {
 	case unsatisfiable(usable):
 		// A contradictory conjunct (`Memory < 1024 && Memory > 2048`) makes the whole
 		// query impossible, so no shard is even opened. Naming it is the point: this is
 		// the answer to "why does my constraint return nothing".
 		ex.Plan = "empty"
+		ex.Reason = "the filter's indexed conjuncts contradict each other: nothing can match"
+	case gated:
+		ex.Plan = scan
+		ex.Reason = fmt.Sprintf("full scan: the index on %s would hand the scan about %.0f%% of the records, "+
+			"over the %.0f%% at which an index walk stops paying", strings.Join(indexedAttrs, " and "), 100*frac, 100*maxPushdownFrac)
 	case len(usable) > 0:
 		ex.Plan = "indexed"
-	case c.queryPar > 1:
-		ex.Plan = "parallel-scan"
+		c.explainIndexSegments(usable, &ex)
+		ex.Reason = fmt.Sprintf("index probe on %s: %d of %d segments answer from postings, ~%d candidate records",
+			strings.Join(indexedAttrs, " and "), ex.IndexSegments, ex.IndexSegments+ex.IndexSkippedSegments+ex.UnindexedSegments,
+			ex.EstCandidates)
+		if ex.IndexSkippedSegments > 0 {
+			ex.Reason += fmt.Sprintf("; %d segments ruled out by their index", ex.IndexSkippedSegments)
+		}
+		if ex.UnindexedSegments > 0 {
+			ex.Reason += fmt.Sprintf("; %d segments have no index on it and are scanned in full", ex.UnindexedSegments)
+		}
+	case len(probes) == 0:
+		ex.Plan = scan
+		ex.Reason = "full scan: the filter has no conjunct an index or zone map can use"
 	default:
-		ex.Plan = "serial-scan"
+		ex.Plan = scan
+		ex.Reason = "full scan: no conjunct of the filter is on an indexed attribute"
 	}
 	return ex
+}
+
+// planRead is the index plan a read uses: planIndex, unless the index would hand the scan
+// nearly every record (overReadGate), when walking the records in order is cheaper than
+// building and iterating the candidate set -- the candidates are a subset of the same walk,
+// so the scan never visits a record the index would have spared it.
+func (c *Collection) planRead(probes []vm.Probe) []usableProbe {
+	usable := c.planIndex(probes)
+	if _, gated := c.overReadGate(usable); gated {
+		return nil
+	}
+	return usable
+}
+
+// overReadGate reports the estimated fraction of records usable's candidates cover and
+// whether that is over maxPushdownFrac. Not gated when there is nothing to estimate from.
+//
+// Only an append-only archive is gated. The estimate reads every segment's index stats, which
+// is nothing beside an archive read but would be a real share of a point lookup on a mutable
+// table, where the candidate walk was never the slow part.
+func (c *Collection) overReadGate(usable []usableProbe) (frac float64, gated bool) {
+	if len(usable) == 0 || unsatisfiable(usable) || !c.appendOnly() {
+		return 0, false
+	}
+	frac, ok := c.planFrac([][]usableProbe{usable})
+	return frac, ok && frac > maxPushdownFrac
+}
+
+// explainIndexSegments fills ex's per-segment index breakdown for an indexed plan.
+func (c *Collection) explainIndexSegments(usable []usableProbe, ex *QueryExplain) {
+	var cand float64
+	for _, sh := range c.shards {
+		_, wins := sh.snapshot()
+		for _, w := range wins {
+			si := w.seg.readIdx()
+			switch {
+			case si == nil || !si.covers(usable):
+				ex.UnindexedSegments++
+			case si.skipsPrefix(usable):
+				ex.IndexSkippedSegments++
+			default:
+				ex.IndexSegments++
+				least := math.Inf(1)
+				for _, up := range usable {
+					least = math.Min(least, si.estCandidates(up))
+				}
+				cand += least
+			}
+		}
+		releaseWindows(wins)
+	}
+	ex.EstCandidates = clampEst(cand, ex.TotalAds)
 }
 
 // probeIndexKind reports whether a probe's attribute is indexed and, if so, its
@@ -1109,34 +1201,15 @@ func cmpFloat(op string, k, t float64) bool {
 
 // scanShardIndexed yields the shard's matching ads using each segment's index to
 // visit only candidate records, and full-scanning any records the index does not
-// cover (a segment with no index, or the tail beyond its build watermark). Every
-// visited record is MVCC-visibility filtered and full-query re-verified, so the
-// result is identical to a full scan. Returns false if the consumer stopped.
+// cover (a segment with no index, or the tail beyond its build watermark). Each
+// candidate gets exactly what a full scan gives every record -- the columnar
+// prefilter, column projection, reassembly and the full-query match (refVisitor) --
+// so the result is identical to a full scan, and a candidate
+// the columns reject is never rebuilt. That last part is what makes a lookup into a
+// big cluster cheap: an archived job's ClusterId posting can hold hundreds of
+// thousands of records, and rebuilding each one to test its ProcId cost seconds.
+// Returns false if the consumer stopped.
 func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryPlan, emit scanEmit) bool {
-	return c.scanShardCandidates(sh, usable, c.reverseScan, func(w []byte, dict *segDictHandle) bool {
-		if qp.ws != nil {
-			qp.ws.dict = dict
-		}
-		if !matchWire(w, qp) {
-			return true // not a match: keep scanning
-		}
-		return emit(w, dict)
-	})
-}
-
-// scanShardCandidates visits the candidate records for `usable` in one shard,
-// handing each candidate's decompressed wire bytes to onCand (which returns false to
-// stop the whole scan). Windows whose per-segment index does not cover the probes,
-// and the un-indexed tail of those that do, are full-scanned -- so onCand sees a
-// superset of the true candidates and the caller must re-verify. Returns false if
-// onCand asked to stop. This is the shared candidate-enumeration used by the indexed
-// Query path (scanShardIndexed).
-//
-// When reverse is set (an append-only, newest-first collection), candidates are visited
-// newest-first: segments from the last backward, and within a segment the un-indexed tail
-// (written last) before the indexed prefix, each in descending offset order. A consumer
-// that stops early then gets the newest matches -- a pushed-down LIMIT through the index.
-func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, reverse bool, onCand scanEmit) bool {
 	if unsatisfiable(usable) {
 		// The conjunction is impossible on its face; nothing in this shard -- indexed
 		// prefix, un-indexed tail, or exception set -- can match. Skip the snapshot too,
@@ -1145,95 +1218,49 @@ func (c *Collection) scanShardCandidates(sh *shard, usable []usableProbe, revers
 	}
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
-	var dbuf []byte
-	// visit tests one record's visibility and hands its decompressed wire bytes to
-	// onCand; returns stop = true when the consumer asked to stop.
-	visit := func(w segWindow, o uint32) (stop bool) {
-		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
-			return false
-		}
-		// Defensive: an internal system record carries no normal indexed attributes,
-		// so it can never appear as an index candidate; the tail full-scan could still
-		// reach one, and Match reuses this primitive, so skip it here too.
-		if isSystemKeyBytes(recKey(w.data, o)) {
-			return false
-		}
-		// The record's FULL ad. In a columnarized segment the record itself holds only the
-		// attributes the schema does not cover, so decompressing it here would hand the consumer
-		// a partial ad that looks complete.
-		ww, err := c.wireAt(recRef{w: w, off: o, dict: w.dict()}, s0, dbuf)
-		if err != nil {
-			return false
-		}
-		dbuf = ww
-		return !onCand(ww, w.dict())
-	}
-	// scanRange full-scans records in [from, to).
-	scanRange := func(w segWindow, from, to int) bool {
-		for off := from; off < to; {
-			o := uint32(off)
-			total := recTotalLen(w.data, o)
-			if total == 0 {
-				break
-			}
-			if visit(w, o) {
-				return false
-			}
-			off += int(total)
-		}
-		return true
-	}
-
-	if reverse {
-		return scanShardCandidatesReverse(wins, usable, visit)
-	}
-
-	for _, w := range wins {
-		si := w.seg.readIdx()
-		if si == nil || !si.covers(usable) {
-			if !scanRange(w, 0, w.used) { // no usable index: full-scan the window
-				return false
-			}
-			continue
-		}
-		// Segment skip: if any probe provably has no candidate in the indexed prefix
-		// (min/max out of range, bloom miss), the conjunction is empty there — skip
-		// the prefix and only full-scan the tail written after the index was built.
-		if si.skipsPrefix(usable) {
-			if int(si.coveredUpto()) < w.used {
-				if !scanRange(w, int(si.coveredUpto()), w.used) {
-					return false
-				}
-			}
-			continue
-		}
-		// Indexed prefix [0, upto): visit only candidate offsets.
-		if cand := si.candidateOffsets(usable); cand != nil {
-			it := cand.Iterator()
-			for it.HasNext() {
-				if visit(w, it.Next()) {
-					return false
-				}
-			}
-		}
-		// Tail [upto, used): written after the index was built — full-scan it.
-		if int(si.coveredUpto()) < w.used {
-			if !scanRange(w, int(si.coveredUpto()), w.used) {
-				return false
-			}
-		}
-	}
-	return true
+	// No zone pruning here, unlike the scan: the index already rules segments out from its own
+	// per-segment bounds (skipsPrefix), which are keyed durably, while a zone map adopted from a
+	// sidecar is keyed by intern ids that need not mean the same attributes after the
+	// collection's zone or index configuration changes.
+	qp.stats.segments(len(wins), 0)
+	visit, stopped := c.refVisitor(s0, qp, emit)
+	forEachCandidateRef(s0, wins, usable, c.reverseScan, qp.stats, visit)
+	return !stopped()
 }
 
-// scanShardCandidatesReverse is scanShardCandidates' newest-first traversal: segments from
-// the last backward, and within each the tail (newest records, written after the index)
-// before the indexed prefix, both in descending offset order. visit returns true to stop.
-// Records are variable-length (forward-length only), so a range walked in reverse is
-// collected forward into a reused slice, then replayed backward.
-func scanShardCandidatesReverse(wins []segWindow, usable []usableProbe, visit func(w segWindow, o uint32) bool) bool {
-	var offs []uint32 // reused across ranges
-	scanRangeReverse := func(w segWindow, from, to int) bool {
+// forEachCandidateRef calls fn for each record of wins, visible at s0, that the segment
+// indexes cannot rule out for usable: a covering segment's candidate offsets, the tail
+// written after its index was built, and every record of a segment no index covers. fn
+// sees a superset of the true matches and must re-verify; it returns false to stop, and
+// so does forEachCandidateRef.
+//
+// When reverse is set (an append-only, newest-first collection), candidates are visited
+// newest-first: segments from the last backward, and within a segment the un-indexed tail
+// (written last) before the indexed prefix, each in descending offset order. A consumer
+// that stops early then gets the newest matches -- a pushed-down LIMIT through the index.
+func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, reverse bool, st *ScanStats, fn func(recRef) bool) bool {
+	var offs []uint32 // reused across reversed ranges
+	visible := func(w segWindow, o uint32) bool {
+		return !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
+	}
+	// scanRange visits the records in [from, to), in walk order.
+	scanRange := func(w segWindow, d *segDictHandle, from, to int) bool {
+		if !reverse {
+			for off := from; off < to; {
+				o := uint32(off)
+				total := recTotalLen(w.data, o)
+				if total == 0 {
+					break
+				}
+				if visible(w, o) && !fn(recRef{w: w, off: o, dict: d}) {
+					return false
+				}
+				off += int(total)
+			}
+			return true
+		}
+		// Records are variable-length and self-describe only their forward length, so a
+		// range walked in reverse is collected forward, then replayed backward.
 		offs = offs[:0]
 		for off := from; off < to; {
 			o := uint32(off)
@@ -1245,38 +1272,58 @@ func scanShardCandidatesReverse(wins []segWindow, usable []usableProbe, visit fu
 			off += int(total)
 		}
 		for i := len(offs) - 1; i >= 0; i-- {
-			if visit(w, offs[i]) {
+			if visible(w, offs[i]) && !fn(recRef{w: w, off: offs[i], dict: d}) {
 				return false
 			}
 		}
 		return true
 	}
-	for wi := len(wins) - 1; wi >= 0; wi-- {
-		w := wins[wi]
+	// window visits one window's candidates: the indexed prefix's postings and the tail
+	// beyond the index, the tail first when walking newest-first.
+	window := func(w segWindow) bool {
+		d := w.dict()
 		si := w.seg.readIdx()
 		if si == nil || !si.covers(usable) {
-			if !scanRangeReverse(w, 0, w.used) {
-				return false
-			}
-			continue
+			st.indexSegment(0, false, true)
+			return scanRange(w, d, 0, w.used) // no usable index: walk the window in full
 		}
-		// Tail (newest, written after the index) first, descending.
-		if int(si.coveredUpto()) < w.used {
-			if !scanRangeReverse(w, int(si.coveredUpto()), w.used) {
-				return false
-			}
+		upto := int(si.coveredUpto())
+		tail := func() bool { return upto >= w.used || scanRange(w, d, upto, w.used) }
+		if reverse && !tail() {
+			return false
 		}
+		// Segment skip: if any probe provably has no candidate in the indexed prefix
+		// (min/max out of range, bloom miss), the conjunction is empty there.
 		if si.skipsPrefix(usable) {
-			continue // prefix provably has no candidate
-		}
-		// Then the indexed prefix candidates, descending (newest of the prefix first).
-		if cand := si.candidateOffsets(usable); cand != nil {
-			it := cand.ReverseIterator()
+			st.indexSegment(0, true, false)
+		} else if cand := si.candidateOffsets(usable); cand != nil {
+			st.indexSegment(int(cand.GetCardinality()), false, false)
+			var it roaring.IntIterable
+			if reverse {
+				it = cand.ReverseIterator()
+			} else {
+				it = cand.Iterator()
+			}
 			for it.HasNext() {
-				if visit(w, it.Next()) {
+				o := it.Next()
+				if visible(w, o) && !fn(recRef{w: w, off: o, dict: d}) {
 					return false
 				}
 			}
+		}
+		return reverse || tail()
+	}
+	if reverse {
+		for wi := len(wins) - 1; wi >= 0; wi-- {
+			if !window(wins[wi]) {
+				return false
+			}
+		}
+		return true
+	}
+	for _, w := range wins {
+		if !window(w) {
+			return false
 		}
 	}
 	return true

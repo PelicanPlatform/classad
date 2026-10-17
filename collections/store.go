@@ -1219,7 +1219,7 @@ func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd
 		probes := q.Probes()
 		c.demand.record(probes)
 		c.demand.recordReads(q.ReadAttrs()) // hot-set signal: attributes the query evaluates
-		usable := c.planIndex(probes)
+		usable := c.planRead(probes)
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.
 		if c.queryPar > 1 && len(usable) == 0 && !c.reverseScan {
@@ -1268,6 +1268,41 @@ func (c *Collection) scanShardAt(sh *shard, s0 uint64, qp queryPlan, emit scanEm
 // scanWindows match-tests and emits the visible records of a frozen window set at
 // snapshot s0. Shared by the current-time and AS OF scan paths.
 func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit scanEmit) bool {
+	visit, stopped := c.refVisitor(s0, qp, emit)
+	walk := c.zoneWalk(wins, qp)
+	if c.reverseScan {
+		forEachVisibleRefReverse(s0, walk, visit)
+	} else {
+		forEachVisibleRef(s0, walk, visit)
+	}
+	return !stopped()
+}
+
+// zoneWalk drops the sealed segments whose [min,max] zone map cannot contain a record
+// satisfying a required conjunct (e.g. CompletionDate > T skips every older segment), and
+// records the pruning in qp.stats. A nil-zones window (the active segment, or any collection
+// without ZoneAttrs) is never prunable. The caller still releases every original window; this
+// only narrows what is walked.
+func (c *Collection) zoneWalk(wins []segWindow, qp queryPlan) []segWindow {
+	walk := wins
+	if len(qp.zoneProbes) > 0 {
+		walk = make([]segWindow, 0, len(wins))
+		for _, w := range wins {
+			if w.zones != nil && zonePrune(w.zones, qp.zoneProbes, c.intern) {
+				continue
+			}
+			walk = append(walk, w)
+		}
+	}
+	qp.stats.segments(len(wins), len(wins)-len(walk))
+	return walk
+}
+
+// refVisitor is how a query treats one visible record, whichever walk -- every record, or an
+// index's candidates -- reached it: hide system records, ask the columns before rebuilding the
+// record, project from the columns when nothing needs the whole ad, else reassemble, match and
+// emit. visit returns false to stop the walk; stopped reports whether the consumer asked to.
+func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit func(recRef) bool, stopped func() bool) {
 	cont := true
 	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
 	// Ask the columns before rebuilding a record: over a columnarized segment a rejected record
@@ -1286,7 +1321,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		}
 	}
 	constQuery := qp.q == nil || (qp.plan.PartialSafe && len(qp.plan.Seeds) == 0)
-	visit := func(r recRef) bool {
+	visit = func(r recRef) bool {
 		if isSystemKeyBytes(r.key()) {
 			return true // internal system record: hidden from client scans/queries
 		}
@@ -1351,28 +1386,7 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 		}
 		return true
 	}
-	// Zone pruning: drop sealed segments whose [min,max] zone map cannot contain a
-	// record satisfying a required conjunct (e.g. CompletionDate > T skips every
-	// older segment). A nil-zones window (the active segment, or any collection
-	// without ZoneAttrs) is never prunable. The caller still releases every original
-	// window; this only narrows what is walked.
-	walk := wins
-	if len(qp.zoneProbes) > 0 {
-		walk = make([]segWindow, 0, len(wins))
-		for _, w := range wins {
-			if w.zones != nil && zonePrune(w.zones, qp.zoneProbes, c.intern) {
-				continue
-			}
-			walk = append(walk, w)
-		}
-	}
-	qp.stats.segments(len(wins), len(wins)-len(walk))
-	if c.reverseScan {
-		forEachVisibleRefReverse(s0, walk, visit)
-	} else {
-		forEachVisibleRef(s0, walk, visit)
-	}
-	return cont
+	return visit, func() bool { return !cont }
 }
 
 // mergeParent flattens into child every (non-private) attribute of parent that

@@ -244,21 +244,24 @@ const (
 	opArchiveAggregateStats op = 65
 )
 
-// putScanStats appends a ScanStats trailer: seven counts as int32 (each well under 2^31 for any
-// real scan). readScanStats reverses it.
+// putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
+// scan) -- the seven scan counts, then the four index-probe counts. readScanStats reverses it.
 func putScanStats(b []byte, s collections.ScanStats) []byte {
 	for _, v := range [...]int{
 		s.SegmentsTotal, s.SegmentsPruned, s.SegmentsScanned,
 		s.RecordsVisited, s.RecordsColumnDecided, s.RecordsReassembled, s.RowsMatched,
+		s.SegmentsIndexed, s.SegmentsIndexSkipped, s.SegmentsUnindexed, s.IndexCandidates,
 	} {
 		b = putI32(b, int32(v))
 	}
 	return b
 }
 
-// readScanStats decodes a ScanStats trailer written by putScanStats.
+// readScanStats decodes a ScanStats trailer written by putScanStats. A server older than the
+// index-probe counts sends only the first seven, and those are all it fills; an older client
+// reads the first seven of a newer trailer and ignores the rest.
 func readScanStats(r *reader) collections.ScanStats {
-	return collections.ScanStats{
+	s := collections.ScanStats{
 		SegmentsTotal:        int(r.i32()),
 		SegmentsPruned:       int(r.i32()),
 		SegmentsScanned:      int(r.i32()),
@@ -267,6 +270,13 @@ func readScanStats(r *reader) collections.ScanStats {
 		RecordsReassembled:   int(r.i32()),
 		RowsMatched:          int(r.i32()),
 	}
+	if r.err == nil && len(r.b) >= 16 {
+		s.SegmentsIndexed = int(r.i32())
+		s.SegmentsIndexSkipped = int(r.i32())
+		s.SegmentsUnindexed = int(r.i32())
+		s.IndexCandidates = int(r.i32())
+	}
+	return s
 }
 
 // String names an opcode for diagnostics (e.g. the read-only rejection message).
