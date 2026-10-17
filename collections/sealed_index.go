@@ -145,19 +145,30 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 // lacks the section, stays valid for the current run because seg.zones is already set in RAM. Best
 // effort: any error (or a sidecar that already carries zones) leaves the file untouched and simply
 // recomputes again next time.
-func (c *Collection) persistSegZonesUpgrade(seg *segment) {
+func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 	path := snapshotPath(seg)
 	if path == "" || !seg.persistent || seg.zones == nil {
-		return
+		return false
 	}
 	data, closer, err := mapFile(path)
 	if err != nil {
-		return
+		return false
 	}
 	attr, _, col, zone, ok := splitSegmentSidecar(data)
-	if !ok || len(zone) > 0 {
-		_ = closer() // unreadable, or already has a zone section: nothing to upgrade
-		return
+	// A zone section that is PRESENT but unreadable has to be rewritten, not skipped.
+	// parseZoneBlob rejects a non-empty blob whose length does not match its count or
+	// whose range is inverted, and adoption then leaves seg.zones nil -- so the caller
+	// recomputes. Treating "present" as "nothing to do" meant that segment decoded every
+	// record on every open, forever, with no way to tell from the outside.
+	if !ok {
+		_ = closer() // the container itself is unreadable; leave it for a reindex to rebuild
+		return false
+	}
+	if len(zone) > 0 {
+		if _, good := parseZoneBlob(zone); good {
+			_ = closer() // a usable zone section: genuinely nothing to upgrade
+			return false
+		}
 	}
 	// The sections alias the mapping; copy them before unmapping so the rebuilt container is
 	// independent of the file we are about to replace.
@@ -166,7 +177,10 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) {
 	_ = closer()
 	container := buildSegmentSidecar(attrCopy, buildKeyIndex(seg.data, seg.used, c.h), colCopy,
 		buildZoneBlob(seg.zones), seg.used, seg.dictRecOff())
-	_ = writeFileAtomic(path, container)
+	// Report the write. Discarding this error is how a permanently slow start stays
+	// invisible: the recompute recurs every open and nothing anywhere says the repair
+	// that was supposed to make it one-time never landed.
+	return writeFileAtomic(path, container) == nil
 }
 
 // reindexSealed rebuilds a sealed segment's index sidecar in place, under the current

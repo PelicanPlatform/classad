@@ -61,11 +61,23 @@ type OpenTiming struct {
 	PublishColumns time.Duration // publish each columnarized segment's columnar payload
 	LoadSidecars   time.Duration // map each sealed segment's index sidecar (adopt zone map + indexes)
 	ZoneRecompute  time.Duration // of LoadSidecars, time decoding records to rebuild a missing zone map
-	Reindex        time.Duration // post-recovery rebuild of indexes not adopted from sidecars
-	RebuildOrdered time.Duration // post-recovery rebuild of the maintained ordered indexes
-	AdoptSchema    time.Duration // re-enable columnar schema-scan from persisted blocks
-	LoadDicts      time.Duration // load on-disk dictionaries before segment recovery
-	LoadDemand     time.Duration // load checkpointed query demand
+	// ZoneRecomputed is how many segments needed that rebuild, and ZoneUpgraded how many
+	// then had the result written back into their sidecar so the next open adopts it
+	// instead of decoding again.
+	//
+	// These exist because the two situations look identical in a timing log and are
+	// completely different problems. Recomputed == Upgraded is a ONE-TIME cost that
+	// disappears on the next start. Upgraded short of Recomputed means the write-back is
+	// not sticking, and every start pays the full decode forever -- which is invisible
+	// without this, since the upgrade is best-effort and its errors used to be discarded.
+	ZoneRecomputed    int
+	ZoneUpgraded      int
+	ZoneUpgradeFailed int
+	Reindex           time.Duration // post-recovery rebuild of indexes not adopted from sidecars
+	RebuildOrdered    time.Duration // post-recovery rebuild of the maintained ordered indexes
+	AdoptSchema       time.Duration // re-enable columnar schema-scan from persisted blocks
+	LoadDicts         time.Duration // load on-disk dictionaries before segment recovery
+	LoadDemand        time.Duration // load checkpointed query demand
 }
 
 // add accumulates o2 into o (used to fold each shard's phase timings into the collection total).
@@ -77,6 +89,9 @@ func (o *OpenTiming) add(o2 OpenTiming) {
 	o.PublishColumns += o2.PublishColumns
 	o.LoadSidecars += o2.LoadSidecars
 	o.ZoneRecompute += o2.ZoneRecompute
+	o.ZoneRecomputed += o2.ZoneRecomputed
+	o.ZoneUpgraded += o2.ZoneUpgraded
+	o.ZoneUpgradeFailed += o2.ZoneUpgradeFailed
 }
 
 // OpenIndexDiagHook, when non-nil, is called once at the end of each Collection Open with a

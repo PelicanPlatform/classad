@@ -661,12 +661,17 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 				zoneStart := time.Now()
 				seg.zones = computeSegZones(c, seg, seg.used, sh.zoneAttrs, sh.zoneInline)
 				tm.ZoneRecompute += time.Since(zoneStart)
+				tm.ZoneRecomputed++
 				// Write the freshly computed zone map back into the sidecar (a legacy sidecar
 				// predating zone persistence), so the next open ADOPTS it instead of decoding
 				// every record again -- otherwise this recompute recurs on every start forever
 				// (sealSegmentIndex never revisits an already-sealed segment). One-time per
 				// segment; this open already paid the decode.
-				c.persistSegZonesUpgrade(seg)
+				if c.persistSegZonesUpgrade(seg) {
+					tm.ZoneUpgraded++
+				} else {
+					tm.ZoneUpgradeFailed++
+				}
 			}
 			if loaded {
 				// Phase 3: the segment's keys are now reachable through the sealed
