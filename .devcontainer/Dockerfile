@@ -9,8 +9,7 @@
 FROM rockylinux:9
 
 # Set environment variables
-ENV GO_VERSION=1.27.1 \
-    GOPATH=/go \
+ENV GOPATH=/go \
     PATH=/usr/local/go/bin:/go/bin:$PATH \
     CONDOR_CONFIG=/etc/condor/condor_config
 
@@ -33,8 +32,15 @@ RUN dnf update -y && \
     python3-devel \
     && dnf clean all
 
-# Install Go
-RUN ARCH=$(uname -m) && \
+# Install Go: the newest stable patch of the minor in GO_MINOR, the same
+# version CI's setup-go resolves for '1.27'.
+ARG GO_MINOR=1.27
+RUN GO_MINOR_RE=$(printf '%s' "$GO_MINOR" | sed 's/\./\\./g') && \
+    GO_VERSION=$(curl -fsSL 'https://go.dev/dl/?mode=json&include=all' | \
+        grep -oE "\"go${GO_MINOR_RE}(\\.[0-9]+)?\"" | tr -d '"' | sed 's/^go//' | sort -V | tail -n 1) && \
+    test -n "$GO_VERSION" && \
+    echo "Installing Go ${GO_VERSION} for GO_MINOR ${GO_MINOR}" && \
+    ARCH=$(uname -m) && \
     if [ "$ARCH" = "aarch64" ]; then GOARCH="arm64"; else GOARCH="amd64"; fi && \
     wget -q https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz && \
     tar -C /usr/local -xzf go${GO_VERSION}.linux-${GOARCH}.tar.gz && \

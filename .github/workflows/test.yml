@@ -35,6 +35,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
+        check-latest: true
         go-version: ${{ matrix.go-version }}
 
     - name: Install goyacc (version pinned in .github/tools)
@@ -106,6 +107,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
+        check-latest: true
         go-version: '1.27'
 
     - name: Install goyacc (version pinned in .github/tools)
@@ -197,6 +199,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
+        check-latest: true
         go-version: '1.27'
 
     - name: Install goyacc (version pinned in .github/tools)
@@ -261,6 +264,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
+        check-latest: true
         go-version: '1.27'
 
     - name: Install goyacc (version pinned in .github/tools)
@@ -331,6 +335,7 @@ jobs:
     - name: Set up Go
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
+        check-latest: true
         go-version: '1.27'
 
     - name: Install goyacc (version pinned in .github/tools)
