@@ -14,6 +14,9 @@ type refInfo struct {
 	// can be evaluated concurrently by several Matchers.
 	node  *ast.AttributeReference
 	scope ast.AttributeScope
+	// curTime marks the magic CurrentTime attribute, whose value when the ad does not
+	// define it is a time rather than undefined.
+	curTime bool
 }
 
 // Program is a compiled expression: a flat instruction stream plus the constant
@@ -33,6 +36,10 @@ type Program struct {
 	// expr is the source expression, retained so the store can compute a read
 	// plan (see ReadPlan) for partial-decode evaluation.
 	expr ast.Expr
+
+	// now, when nonzero, is the time a CurrentTime reference the scope does not define
+	// evaluates to (see Compile). Zero reads the clock, as the evaluator does.
+	now int64
 }
 
 // ReadAttrs returns the distinct unscoped attribute names the program may read.

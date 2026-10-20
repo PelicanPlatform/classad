@@ -48,9 +48,13 @@ type presencePred struct {
 // ok=false for anything else: a non-native query, no probes, more than one probe, a probe that is
 // not present/absent, or an attribute the schema does not carry. Unlike numPredOnField this accepts
 // any schema field kind, since presence does not depend on the value's type.
+//
+// ExactProbes, not Probes, for the reason numPredOnField gives: the count is answered from the probe
+// alone, and Probes drops a conjunct it cannot index, so `ProcId is undefined && ClusterId > Owner`
+// would otherwise count every record without a ProcId.
 func (c *Collection) presencePredOnField(q *vm.Query, s *adSchema) (presencePred, bool) {
-	probes := q.Probes()
-	if !q.Native() || len(probes) != 1 {
+	probes, exact := q.ExactProbes()
+	if !q.Native() || !exact || len(probes) != 1 {
 		return presencePred{}, false
 	}
 	p := probes[0]

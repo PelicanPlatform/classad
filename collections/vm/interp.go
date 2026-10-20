@@ -16,6 +16,7 @@ import "github.com/PelicanPlatform/classad/classad"
 // expression is bit-identical to the tree-walker (enforced by FuzzDifferential).
 func Run(p *Program, scope *classad.ClassAd) (result classad.Value) {
 	ev := classad.NewEvaluator(scope)
+	ev.PinCurrentTime(p.now)
 	defer classad.RecoverCyclic(&result)
 	result, _ = exec(p, ev, make([]classad.Value, 0, 16))
 	return result

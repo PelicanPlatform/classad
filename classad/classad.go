@@ -141,6 +141,16 @@ func (e *Expr) internal() ast.Expr {
 	return e.expr
 }
 
+// FoldConstants returns the expression with its constant sub-expressions pre-computed
+// (see the package-level FoldConstants). The result evaluates exactly as e does, in any
+// scope.
+func (e *Expr) FoldConstants() *Expr {
+	if e == nil {
+		return nil
+	}
+	return &Expr{expr: FoldConstants(e.expr)}
+}
+
 // Eval evaluates the expression in the context of the given ClassAd.
 // This is equivalent to calling classad.EvaluateExpr(expr).
 func (e *Expr) Eval(scope *ClassAd) (result Value) {
@@ -1410,15 +1420,42 @@ func (c *ClassAd) Flatten(expr *Expr) *Expr {
 	return &Expr{expr: flattened}
 }
 
-// flattenExpr recursively flattens an AST expression
+// flattenExpr recursively flattens an AST expression in the context of c. A CurrentTime
+// reference c does not define folds to the current time, since c is the scope.
 func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
+	return (&flattener{c: c, time: timeClock}).flatten(expr)
+}
+
+// curTimeFold says what flattening does with a CurrentTime reference the ad does not define.
+type curTimeFold int
+
+const (
+	timeClock curTimeFold = iota // fold it to the current time: the ad is the evaluation scope
+	timeKeep                     // keep the reference: the scope is not known (FoldConstants)
+	timeFixed                    // fold it to flattener.now (FoldConstantsAt)
+)
+
+// flattener carries the options of one flattening pass.
+type flattener struct {
+	c    *ClassAd
+	time curTimeFold
+	now  int64
+	// keepLists leaves list literals as written. A list's elements are expressions until
+	// something reads them, and string() / strcat() print those expressions, so folding
+	// `{-(-1.0)}` to `{1.0}` changes what string({-(-1.0)}) returns. FoldConstants, whose
+	// result must evaluate exactly like its input, sets it.
+	keepLists bool
+}
+
+func (f *flattener) flatten(expr ast.Expr) ast.Expr {
+	c := f.c
 	if expr == nil {
 		return nil
 	}
 
 	switch v := expr.(type) {
 	case *ast.ParenExpr:
-		inner := c.flattenExpr(v.Inner)
+		inner := f.flatten(v.Inner)
 		// Keep the parentheses only around an operator, where they carry
 		// precedence; drop them once the inner expression has collapsed to a
 		// literal/primary so constant folding can see it (and so the flattened
@@ -1439,13 +1476,20 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 				return c.valueToExpr(val)
 			}
 		}
-		// The magic CurrentTime attribute folds to the current time (a constant) when the
-		// ad does not define it, so the query optimizer sees an indexable literal (e.g.
-		// `CompletionDate > CurrentTime - 86400` becomes a range probe). Mirrors the
-		// evaluation-time magic in evaluateAttributeReference.
+		// The magic CurrentTime attribute, when the ad does not define it, is the current
+		// time (the evaluation-time magic in evaluateAttributeReference). Flatten folds it
+		// to the clock, since the ad is the scope; FoldConstantsAt to a given time, so a
+		// query optimizer sees an indexable literal (`CompletionDate > CurrentTime - 86400`
+		// becomes a range probe); FoldConstants keeps it, since the scope it will be
+		// evaluated in may define CurrentTime.
 		if isCurrentTimeRef(v) {
 			if _, ok := c.Lookup(v.Name); !ok {
-				return c.valueToExpr(currentTimeValue())
+				switch f.time {
+				case timeClock:
+					return c.valueToExpr(currentTimeValue())
+				case timeFixed:
+					return &ast.IntegerLiteral{Value: f.now}
+				}
 			}
 		}
 		// Keep the reference if undefined or scoped
@@ -1453,50 +1497,19 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 
 	case *ast.BinaryOp:
 		// Flatten both sides
-		left := c.flattenExpr(v.Left)
-		right := c.flattenExpr(v.Right)
+		left := f.flatten(v.Left)
+		right := f.flatten(v.Right)
+
+		if v.Op == "&&" || v.Op == "||" {
+			if folded, ok := c.foldLogical(v.Op, left, right); ok {
+				return folded
+			}
+			return &ast.BinaryOp{Op: v.Op, Left: left, Right: right}
+		}
 
 		// Try to evaluate if both sides are literals
 		leftVal := c.exprToValue(left)
 		rightVal := c.exprToValue(right)
-
-		// Apply boolean short-circuiting when either side is a literal bool.
-		if v.Op == "&&" || v.Op == "||" {
-			if leftVal.IsBool() {
-				boolVal, err := leftVal.BoolValue()
-				if err != nil {
-					return &ast.ErrorLiteral{}
-				}
-				if v.Op == "&&" {
-					if !boolVal {
-						return &ast.BooleanLiteral{Value: false}
-					}
-					return right
-				}
-				// v.Op == "||"
-				if boolVal {
-					return &ast.BooleanLiteral{Value: true}
-				}
-				return right
-			}
-			if rightVal.IsBool() {
-				boolVal, err := rightVal.BoolValue()
-				if err != nil {
-					return &ast.ErrorLiteral{}
-				}
-				if v.Op == "&&" {
-					if !boolVal {
-						return &ast.BooleanLiteral{Value: false}
-					}
-					return left
-				}
-				// v.Op == "||"
-				if boolVal {
-					return &ast.BooleanLiteral{Value: true}
-				}
-				return left
-			}
-		}
 
 		// `is`/`isnt` (=?=/=!=) are total: they compare undefined/error as values, so
 		// fold them whenever both operands are literals (including undefined/error) --
@@ -1528,7 +1541,7 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		}
 
 	case *ast.UnaryOp:
-		operand := c.flattenExpr(v.Expr)
+		operand := f.flatten(v.Expr)
 		operandVal := c.exprToValue(operand)
 
 		if !operandVal.IsUndefined() {
@@ -1544,9 +1557,9 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		}
 
 	case *ast.ConditionalExpr:
-		condition := c.flattenExpr(v.Condition)
-		trueExpr := c.flattenExpr(v.TrueExpr)
-		falseExpr := c.flattenExpr(v.FalseExpr)
+		condition := f.flatten(v.Condition)
+		trueExpr := f.flatten(v.TrueExpr)
+		falseExpr := f.flatten(v.FalseExpr)
 
 		// If condition is a literal boolean, return the appropriate branch
 		condVal := c.exprToValue(condition)
@@ -1564,8 +1577,8 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		}
 
 	case *ast.ElvisExpr:
-		left := c.flattenExpr(v.Left)
-		right := c.flattenExpr(v.Right)
+		left := f.flatten(v.Left)
+		right := f.flatten(v.Right)
 
 		// If left is a literal undefined, return right. exprToValue reads any
 		// non-literal as undefined, so check that left really is a literal.
@@ -1582,7 +1595,7 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		// Flatten arguments
 		args := make([]ast.Expr, len(v.Args))
 		for i, arg := range v.Args {
-			args[i] = c.flattenExpr(arg)
+			args[i] = f.flatten(arg)
 		}
 
 		// Fold ifThenElse when the condition is a literal boolean after flattening.
@@ -1603,24 +1616,27 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		return &ast.FunctionCall{Name: v.Name, Args: args}
 
 	case *ast.ListLiteral:
+		if f.keepLists {
+			return expr
+		}
 		elements := make([]ast.Expr, len(v.Elements))
 		for i, elem := range v.Elements {
-			elements[i] = c.flattenExpr(elem)
+			elements[i] = f.flatten(elem)
 		}
 		return &ast.ListLiteral{
 			Elements: elements,
 		}
 
 	case *ast.SelectExpr:
-		record := c.flattenExpr(v.Record)
+		record := f.flatten(v.Record)
 		return &ast.SelectExpr{
 			Record: record,
 			Attr:   v.Attr,
 		}
 
 	case *ast.SubscriptExpr:
-		container := c.flattenExpr(v.Container)
-		index := c.flattenExpr(v.Index)
+		container := f.flatten(v.Container)
+		index := f.flatten(v.Index)
 		return &ast.SubscriptExpr{
 			Container: container,
 			Index:     index,
@@ -1630,6 +1646,66 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 	default:
 		return expr
 	}
+}
+
+// foldLogical folds `left op right` for op "&&" or "||", given the already-flattened operands,
+// and reports whether it did.
+//
+// && and || evaluate left to right and are not commutative. The left operand alone can decide the
+// result -- FALSE && x is FALSE and TRUE || x is TRUE whatever x is, and an ERROR or non-boolean
+// left operand makes either one ERROR -- but a literal on the right decides nothing about a left
+// operand that may turn out ERROR or non-boolean: ERROR && FALSE is ERROR, and "a" || TRUE is
+// ERROR. The identity cases (TRUE && x, FALSE || x, x && TRUE, x || FALSE) reduce to x only when x
+// can only be boolean, undefined or error, because the operator maps any other value: a number
+// to a boolean (5 && TRUE is TRUE, not 5) and anything else to ERROR.
+func (c *ClassAd) foldLogical(op string, left, right ast.Expr) (ast.Expr, bool) {
+	leftLit, rightLit := isLiteralExpr(left), isLiteralExpr(right)
+	switch {
+	case leftLit && rightLit:
+		return c.valueToExpr(c.evaluateBinaryOp(op, c.exprToValue(left), c.exprToValue(right))), true
+	case leftLit:
+		switch ls := logicalView(c.exprToValue(left)); {
+		case ls == lsErr:
+			return &ast.ErrorLiteral{}, true
+		case op == "&&" && ls == lsFalse:
+			return &ast.BooleanLiteral{Value: false}, true
+		case op == "||" && ls == lsTrue:
+			return &ast.BooleanLiteral{Value: true}, true
+		case (op == "&&" && ls == lsTrue || op == "||" && ls == lsFalse) && isLogicalTyped(right):
+			return right, true
+		}
+	case rightLit:
+		rs := logicalView(c.exprToValue(right))
+		if (op == "&&" && rs == lsTrue || op == "||" && rs == lsFalse) && isLogicalTyped(left) {
+			return left, true
+		}
+	}
+	return nil, false
+}
+
+// isLogicalTyped reports whether e can only evaluate to a boolean, undefined or error: a
+// comparison, a logical operator, or a literal of one of those values. && and || pass such an
+// operand through unchanged where they would map any other value.
+func isLogicalTyped(e ast.Expr) bool {
+	for {
+		p, ok := e.(*ast.ParenExpr)
+		if !ok {
+			break
+		}
+		e = p.Inner
+	}
+	switch v := e.(type) {
+	case *ast.BooleanLiteral, *ast.UndefinedLiteral, *ast.ErrorLiteral:
+		return true
+	case *ast.UnaryOp:
+		return v.Op == "!"
+	case *ast.BinaryOp:
+		switch v.Op {
+		case "==", "!=", "<", "<=", ">", ">=", "is", "isnt", "&&", "||":
+			return true
+		}
+	}
+	return false
 }
 
 // exprToValue converts a literal expression to a Value, returns undefined for non-literals

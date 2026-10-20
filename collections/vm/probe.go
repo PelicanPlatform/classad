@@ -14,6 +14,12 @@ import (
 // (is/isnt undefined). A store matches Probes against its configured indexes to
 // build a candidate set; because the store still re-verifies the full query, any
 // Probe the planner omits only costs selectivity, never correctness.
+//
+// A query that reads CurrentTime has its probes computed with CurrentTime folded to the
+// query's pinned time (see Compile), so `CompletionDate > CurrentTime - 86400` yields a
+// range probe. Those probes describe only the ads that do not define CurrentTime; HTCondor
+// does not store it in job or history ads. ExactProbes reports such a query as inexact,
+// since a count computed from the probes alone would be wrong for an ad that does.
 type Probe struct {
 	Attr string
 	Op   string
@@ -29,7 +35,7 @@ func (q *Query) Probes() []Probe {
 	if q == nil || q.prog == nil || q.prog.expr == nil {
 		return nil
 	}
-	conj := flattenAnd(classad.FoldConstants(q.prog.expr), nil)
+	conj := flattenAnd(q.foldedExpr(), nil)
 	var out []Probe
 	for _, c := range conj {
 		if p, ok := probeFrom(c); ok {
@@ -54,7 +60,7 @@ func (q *Query) ExactProbes() (probes []Probe, exact bool) {
 	if q == nil || q.prog == nil || q.prog.expr == nil {
 		return nil, false
 	}
-	conj := flattenAnd(classad.FoldConstants(q.prog.expr), nil)
+	conj := flattenAnd(q.foldedExpr(), nil)
 	out := make([]Probe, 0, len(conj))
 	for _, c := range conj {
 		p, ok := probeFrom(c)
@@ -63,7 +69,9 @@ func (q *Query) ExactProbes() (probes []Probe, exact bool) {
 		}
 		out = append(out, p)
 	}
-	return out, len(out) > 0
+	// A pinned CurrentTime was folded into the probes, which is exact only for an ad that
+	// does not define CurrentTime.
+	return out, len(out) > 0 && q.prog.now == 0
 }
 
 // ProbeGroup is a conjunction of index probes -- a candidate matches the group when
@@ -85,7 +93,7 @@ func (q *Query) ProbePlan() []ProbeGroup {
 	if q == nil || q.prog == nil || q.prog.expr == nil {
 		return nil
 	}
-	exprGroups := distributeDNF(classad.FoldConstants(q.prog.expr))
+	exprGroups := distributeDNF(q.foldedExpr())
 	groups := make([]ProbeGroup, 0, len(exprGroups))
 	for _, g := range exprGroups {
 		var probes []Probe

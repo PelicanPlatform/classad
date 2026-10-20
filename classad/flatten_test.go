@@ -174,6 +174,9 @@ func TestFlattenBooleanOrPropagatesRightWhenFalse(t *testing.T) {
 	}
 }
 
+// A literal on the right of && / || does not decide the result: the left operand is
+// evaluated first, and ERROR (or a non-boolean) there makes the whole expression ERROR.
+// `Unknown > 0` is ERROR when Unknown is a string, and ERROR && FALSE is ERROR.
 func TestFlattenBooleanAndRightLiteralFalse(t *testing.T) {
 	ad := New()
 	ad.InsertAttrBool("Flag", true)
@@ -184,8 +187,8 @@ func TestFlattenBooleanAndRightLiteralFalse(t *testing.T) {
 	}
 
 	flat := ad.Flatten(expr)
-	if flat.String() != "false" {
-		t.Fatalf("expected false due to right-hand literal, got %s", flat.String())
+	if flat.String() != "((Unknown > 0) && false)" {
+		t.Fatalf("expected the expression unchanged, got %s", flat.String())
 	}
 }
 
@@ -199,8 +202,8 @@ func TestFlattenBooleanOrRightLiteralTrue(t *testing.T) {
 	}
 
 	flat := ad.Flatten(expr)
-	if flat.String() != "true" {
-		t.Fatalf("expected true due to right-hand literal, got %s", flat.String())
+	if flat.String() != "((Unknown > 0) || true)" {
+		t.Fatalf("expected the expression unchanged, got %s", flat.String())
 	}
 }
 

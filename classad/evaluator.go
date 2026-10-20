@@ -404,6 +404,9 @@ type Evaluator struct {
 	active     [activeInline]activeAttr
 	nActive    int
 	activeMore []activeAttr
+	// now, when nonzero, is the value a CurrentTime reference the scope does not define
+	// takes, in place of reading the clock (see PinCurrentTime).
+	now int64
 }
 
 // activeInline is the number of in-progress attribute evaluations an Evaluator holds
@@ -501,6 +504,7 @@ func (e *Evaluator) child(ad *ClassAd) *Evaluator {
 		active:     e.active,
 		nActive:    e.nActive,
 		activeMore: e.activeMore,
+		now:        e.now,
 	}
 }
 
@@ -600,6 +604,9 @@ func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Valu
 	// otherwise define resolves to the current time (Unix seconds). An ad-defined
 	// CurrentTime wins, since resolveAttributeReference then returns a defined value.
 	if v.IsUndefined() && isCurrentTimeRef(ref) {
+		if e.now != 0 {
+			return NewIntValue(e.now)
+		}
 		return currentTimeValue()
 	}
 	return v

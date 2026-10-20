@@ -40,7 +40,8 @@ import (
 //
 // NOT HANDLED, returning ok=false so the caller falls back rather than guessing: string values
 // (constants or columns), the Elvis operator (a per-record select with no combine opcode to hang it
-// on), and delegated subtrees (OpEvalNode, which Native() already excludes).
+// on), the magic CurrentTime attribute, and delegated subtrees (OpEvalNode, which Native() already
+// excludes).
 
 // Element states. A vector carries one per element, which is how three-valued logic and ERROR survive
 // vectorization, and how int and real stay distinguishable -- 7/2 is not 7.0/2.0.
@@ -291,7 +292,9 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			fillState(s.push(), VsError)
 		case OpLoadRef:
 			r := p.refs[in.A]
-			if !src.LoadColumn(r.name, r.scope, s.push()) {
+			// A column reads an absent CurrentTime as undefined, where the evaluator reads
+			// the time; per-record evaluation gets that right.
+			if r.curTime || !src.LoadColumn(r.name, r.scope, s.push()) {
 				return nil, false
 			}
 		case OpBinop:

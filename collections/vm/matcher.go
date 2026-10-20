@@ -19,9 +19,11 @@ type Matcher struct {
 // Matcher returns a reusable Matcher for the query. Create one per scanning
 // goroutine.
 func (q *Query) Matcher() *Matcher {
+	ev := classad.NewEvaluator(nil)
+	ev.PinCurrentTime(q.prog.now)
 	return &Matcher{
 		prog:  q.prog,
-		ev:    classad.NewEvaluator(nil),
+		ev:    ev,
 		stack: make([]classad.Value, 0, 16),
 	}
 }
