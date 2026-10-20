@@ -1567,9 +1567,9 @@ func (c *ClassAd) flattenExpr(expr ast.Expr) ast.Expr {
 		left := c.flattenExpr(v.Left)
 		right := c.flattenExpr(v.Right)
 
-		// If left is a literal undefined, return right
-		leftVal := c.exprToValue(left)
-		if leftVal.IsUndefined() {
+		// If left is a literal undefined, return right. exprToValue reads any
+		// non-literal as undefined, so check that left really is a literal.
+		if isLiteralExpr(left) && c.exprToValue(left).IsUndefined() {
 			return right
 		}
 
