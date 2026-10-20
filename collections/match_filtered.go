@@ -73,7 +73,6 @@ func (c *Collection) MatchSortedRankedFiltered(job *classad.ClassAd, targetConst
 // candidate groups with the constraint's, so the indexed scan visits the intersection.
 // Materialization is never deferred here (the caller re-checks the constraint on the ad).
 func (c *Collection) collectMatchesFiltered(job *classad.ClassAd, targetExpr ast.Expr) []rankedMatch {
-	job = c.reorderJobRequirements(job)
 	if c.parentKeyFor != nil {
 		return c.serialScanMatches(job) // chained: the caller re-checks the constraint
 	}

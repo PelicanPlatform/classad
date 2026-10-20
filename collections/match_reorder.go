@@ -9,19 +9,23 @@ import (
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
-// Short-circuit operand reordering. The ClassAd evaluator evaluates a && / || chain
-// left to right and stops as soon as one operand decides the result (|| stops on the
-// first TRUE, && on the first FALSE). So the ORDER of a chain's operands is a pure
-// evaluation-cost lever: put the operand that most cheaply and most often
-// short-circuits first, and the expensive operands (an opaque function, a split /
-// regexp) are skipped on most candidates.
+// Short-circuit conjunct ordering. The ClassAd evaluator evaluates a && chain left to
+// right and stops at the first operand that is not TRUE, so the order of the job
+// Requirements' top-level conjuncts is an evaluation-cost lever: put the cheap conjunct
+// that most often rejects first, and an expensive one (an opaque function, a split /
+// regexp) is skipped on most candidates.
 //
-// This is the runtime complement to the index cost gate: the gate decides index vs.
-// scan, and reordering makes the scan itself -- and the per-candidate re-verify of the
-// indexed path -- cheaper. It changes only evaluation order, never which slots match:
-// ClassAd && / || are associative and commutative in three-valued logic, so reordering
-// PURE operands is result-preserving (an impure operand like random()/time() could be
-// evaluated or skipped differently, so a chain with one keeps its top-level order).
+// ClassAd && and || are NOT commutative. They are left-biased with respect to ERROR and
+// non-boolean operands: ERROR || TRUE is ERROR but TRUE || ERROR is TRUE, and
+// FALSE && ERROR is FALSE but ERROR && FALSE is ERROR. Reordering an operand chain can
+// therefore change its value. What it cannot change is whether a && chain of pure
+// operands is TRUE: that holds exactly when every operand is TRUE, in any order. The
+// match verdict on the job side is only that question (is Requirements TRUE?), so the
+// reordered conjunction is used solely to decide it -- by the wire-native pre-filter and
+// in place of evaluating the job's Requirements on a decoded candidate. The job ad
+// itself is never rewritten: anything else that reads its Requirements (a slot's
+// TARGET.Requirements, the job's own attributes) sees the original expression. Nested
+// chains, || chains, and chains with an impure operand keep their written order.
 
 // shortCircuitEps floors an operand's short-circuit probability so a probe estimated to
 // never fire (fraction ~0) does not blow the rank up to infinity and pin an operand.
@@ -146,95 +150,68 @@ func (c *Collection) operandTrueProb(operand ast.Expr, jobVals map[string]classa
 	return frac, true
 }
 
-// reorderJobRequirements returns job with its Requirements operands reordered for
-// cheaper short-circuit evaluation. The input job is never modified: when reordering
-// changes the expression a copy carrying the reordered Requirements is returned,
-// otherwise job is returned unchanged. Reordering never changes which slots match.
-func (c *Collection) reorderJobRequirements(job *classad.ClassAd) *classad.ClassAd {
-	reqExpr := jobRequirementsExpr(job)
-	if reqExpr == nil {
-		return job
+// conjunctOrder returns the evaluation order for the top-level && conjuncts of reqExpr
+// (as flattened by topConjuncts): a permutation of their indexes, cheapest and most
+// often rejecting first. It returns nil when reqExpr is not a && chain, when any
+// conjunct is impure, or when the order would not change. Only the TRUE-ness of the
+// reordered conjunction matches that of reqExpr, so callers must use it only for the
+// job-side verdict (see the comment at the top of this file).
+func (c *Collection) conjunctOrder(reqExpr ast.Expr, jobVals map[string]classad.Value) []int {
+	ops := topConjuncts(reqExpr)
+	if len(ops) < 2 || !allPure(ops) {
+		return nil
 	}
-	jobVals := jobValues(job)
-	changed := false
-	reordered := c.reorderShortCircuit(reqExpr, jobVals, &changed)
-	if !changed || reordered == nil {
-		return job
+	type ranked struct {
+		rank float64
+		seq  int
 	}
-	copyAd, err := classad.Parse(job.StringWithPrivate())
-	if err != nil {
-		return job // cannot round-trip: keep the original order
+	rs := make([]ranked, len(ops))
+	for i, o := range ops {
+		falseProb := 0.5
+		if p, ok := c.operandTrueProb(o, jobVals); ok {
+			falseProb = 1 - p // && stops on a non-TRUE operand: prefer likely-false
+		}
+		rs[i] = ranked{rank: exprEvalCost(o) / math.Max(falseProb, shortCircuitEps), seq: i}
 	}
-	copyAd.Insert("Requirements", reordered)
-	return copyAd
+	sort.SliceStable(rs, func(i, j int) bool { return rs[i].rank < rs[j].rank })
+	perm := make([]int, len(rs))
+	moved := false
+	for i := range rs {
+		perm[i] = rs[i].seq
+		if rs[i].seq != i {
+			moved = true
+		}
+	}
+	if !moved {
+		return nil
+	}
+	return perm
 }
 
-// reorderShortCircuit returns e with every associative && / || chain reordered so the
-// evaluator short-circuits sooner. It sets *changed when it actually moves an operand,
-// so the caller can skip copying the job when nothing reordered.
-func (c *Collection) reorderShortCircuit(e ast.Expr, jobVals map[string]classad.Value, changed *bool) ast.Expr {
-	switch n := e.(type) {
-	case *ast.ParenExpr:
-		return &ast.ParenExpr{Inner: c.reorderShortCircuit(n.Inner, jobVals, changed)}
-	case *ast.BinaryOp:
-		if n.Op == "||" || n.Op == "&&" {
-			return c.reorderChain(n, jobVals, changed)
-		}
-		return &ast.BinaryOp{Op: n.Op,
-			Left:  c.reorderShortCircuit(n.Left, jobVals, changed),
-			Right: c.reorderShortCircuit(n.Right, jobVals, changed)}
-	case *ast.UnaryOp:
-		return &ast.UnaryOp{Op: n.Op, Expr: c.reorderShortCircuit(n.Expr, jobVals, changed)}
-	case *ast.ConditionalExpr:
-		return &ast.ConditionalExpr{
-			Condition: c.reorderShortCircuit(n.Condition, jobVals, changed),
-			TrueExpr:  c.reorderShortCircuit(n.TrueExpr, jobVals, changed),
-			FalseExpr: c.reorderShortCircuit(n.FalseExpr, jobVals, changed)}
-	case *ast.ElvisExpr:
-		return &ast.ElvisExpr{
-			Left:  c.reorderShortCircuit(n.Left, jobVals, changed),
-			Right: c.reorderShortCircuit(n.Right, jobVals, changed)}
-	default:
-		return e
+// topConjuncts returns the operands of reqExpr's top-level && chain, or nil when reqExpr
+// is not a && chain.
+func topConjuncts(reqExpr ast.Expr) []ast.Expr {
+	if b, ok := unparenExpr(reqExpr).(*ast.BinaryOp); !ok || b.Op != "&&" {
+		return nil
 	}
+	return flattenChain(reqExpr, "&&")
 }
 
-// reorderChain flattens one associative && / || chain, recurses into its operands, and
-// (when every operand is pure) sorts them by short-circuit rank. The rank favors cheap
-// operands that most often decide the result: in an || chain, likely-true operands; in
-// an && chain, likely-false ones.
-func (c *Collection) reorderChain(root *ast.BinaryOp, jobVals map[string]classad.Value, changed *bool) ast.Expr {
-	op := root.Op
-	operands := flattenChain(root, op)
-	for i := range operands {
-		operands[i] = c.reorderShortCircuit(operands[i], jobVals, changed)
+// orderedConjunction rebuilds reqExpr's top-level && chain with its conjuncts in perm
+// order (from conjunctOrder). It returns nil when perm is nil or does not fit reqExpr.
+func orderedConjunction(reqExpr ast.Expr, perm []int) ast.Expr {
+	if perm == nil {
+		return nil
 	}
-	if len(operands) > 1 && allPure(operands) {
-		type ranked struct {
-			e    ast.Expr
-			rank float64
-			seq  int
-		}
-		rs := make([]ranked, len(operands))
-		for i, o := range operands {
-			favor := 0.5
-			if p, ok := c.operandTrueProb(o, jobVals); ok {
-				favor = p
-			}
-			if op == "&&" {
-				favor = 1 - favor // && stops on FALSE: prefer likely-false
-			}
-			rs[i] = ranked{e: o, rank: exprEvalCost(o) / math.Max(favor, shortCircuitEps), seq: i}
-		}
-		sort.SliceStable(rs, func(i, j int) bool { return rs[i].rank < rs[j].rank })
-		for i := range rs {
-			if rs[i].seq != i {
-				*changed = true
-			}
-			operands[i] = rs[i].e
-		}
+	ops := topConjuncts(reqExpr)
+	if len(ops) != len(perm) {
+		return nil
 	}
-	return rebuildChain(op, operands)
+	ordered := make([]ast.Expr, len(perm))
+	for i, j := range perm {
+		ordered[i] = ops[j]
+	}
+	return rebuildChain("&&", ordered)
 }
 
 // flattenChain collects the operands of an associative op chain, descending through
@@ -263,8 +240,7 @@ func flattenChain(e ast.Expr, op string) []ast.Expr {
 	return out
 }
 
-// rebuildChain rebuilds a left-deep op chain from operands (re-association is sound for
-// && / ||).
+// rebuildChain rebuilds a left-deep op chain from operands.
 func rebuildChain(op string, operands []ast.Expr) ast.Expr {
 	if len(operands) == 0 {
 		return nil
@@ -303,8 +279,8 @@ func unparenExpr(e ast.Expr) ast.Expr {
 	}
 }
 
-// allPure reports whether every operand is side-effect free, so the chain may be
-// reordered without changing its three-valued result.
+// allPure reports whether every operand is side-effect free, so evaluating the operands
+// in another order (or skipping some) cannot change any operand's value.
 func allPure(operands []ast.Expr) bool {
 	for _, o := range operands {
 		if !isPureExpr(o) {

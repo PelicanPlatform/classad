@@ -735,10 +735,18 @@ func firstChain(e ast.Expr, op string) []ast.Expr {
 	return found
 }
 
+// orderedReq returns the job's Requirements with its top-level conjuncts in the order
+// the match's job-side verdict evaluates them, or nil when that order is unchanged.
+func orderedReq(c *Collection, job *classad.ClassAd) ast.Expr {
+	req := jobRequirementsExpr(job)
+	return orderedConjunction(req, c.conjunctOrder(req, jobValues(job)))
+}
+
 // TestReorderShortCircuitOrder: the expensive opaque function
 // (versionGE(split(...)[1],...)) sorts AFTER the cheap comparison (Disk >= X) in the
-// `||`, so the evaluator tests the cheap operand first and skips the split/subscript on
-// the slots the cheap test already decides.
+// top-level &&, so the evaluator tests the cheap conjunct first and skips the
+// split/subscript on the slots it rejects. An || chain is never reordered: || is
+// left-biased with respect to ERROR, so its order is part of its meaning.
 func TestReorderShortCircuitOrder(t *testing.T) {
 	t.Parallel()
 	c := New(Options{Shards: 4, ValueAttrs: []string{"Disk"}, CategoricalAttrs: []string{"CondorVersion"}})
@@ -750,30 +758,45 @@ func TestReorderShortCircuitOrder(t *testing.T) {
 	}
 	c.Reindex()
 	job := mustAd(t, `[ RequestDisk=1000;
-		Requirements = (versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)) && (TARGET.Arch == "X86_64");
+		Requirements = versionGE(split(TARGET.CondorVersion)[1], "25.12.0") && (TARGET.Disk >= RequestDisk) && (TARGET.Arch == "X86_64");
 		Rank = 0 ]`)
 
-	rj := c.reorderJobRequirements(job)
-	if rj == job {
-		t.Fatal("expected reorderJobRequirements to reorder the || (cheap Disk before versionGE)")
+	ord := orderedReq(c, job)
+	if ord == nil {
+		t.Fatal("expected the && conjuncts to be reordered (cheap Disk before versionGE)")
 	}
-	ops := firstChain(jobRequirementsExpr(rj), "||")
-	if len(ops) != 2 {
-		t.Fatalf("expected a 2-operand || chain, got %d: %s", len(ops), jobRequirementsExpr(rj))
+	ops := topConjuncts(ord)
+	if len(ops) != 3 {
+		t.Fatalf("expected 3 conjuncts, got %d: %s", len(ops), ord)
 	}
-	first := ops[0].String()
-	if !strings.Contains(first, "Disk") || strings.Contains(first, "versionGE") {
-		t.Errorf("cheap Disk operand should sort first; got first=%q full=%s", first, jobRequirementsExpr(rj))
+	if first := ops[0].String(); !strings.Contains(first, "Disk") {
+		t.Errorf("cheap Disk conjunct should sort first; got first=%q full=%s", first, ord)
 	}
-	// The input job is never mutated.
-	if in := firstChain(jobRequirementsExpr(job), "||"); !strings.Contains(in[0].String(), "versionGE") {
+	if last := ops[2].String(); !strings.Contains(last, "versionGE") {
+		t.Errorf("expensive versionGE conjunct should sort last; got last=%q full=%s", last, ord)
+	}
+	// The job is never rewritten.
+	if in := topConjuncts(jobRequirementsExpr(job)); !strings.Contains(in[0].String(), "versionGE") {
 		t.Errorf("input job was mutated: %s", jobRequirementsExpr(job))
 	}
-	// ExplainMatch shows the same optimized order: the cheap Disk test appears before
-	// the expensive versionGE(split(...)) in the displayed slot predicate.
+	// ExplainMatch shows the same order: the cheap Disk test appears before the
+	// expensive versionGE(split(...)) in the displayed slot predicate.
 	sp := c.ExplainMatch(job, "").SlotPredicate
 	if di, vi := strings.Index(sp, "Disk >= 1000"), strings.Index(sp, "versionGE"); di < 0 || vi < 0 || di > vi {
 		t.Errorf("explain slot predicate = %q, want Disk shown before versionGE", sp)
+	}
+
+	// The same operands under || keep their written order, top-level or nested.
+	for _, req := range []string{
+		`versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)`,
+		`(versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk)) && (TARGET.Arch == "X86_64")`,
+	} {
+		j := mustAd(t, `[ RequestDisk=1000; Requirements = `+req+` ]`)
+		if ord := orderedReq(c, j); ord != nil {
+			if or := firstChain(ord, "||"); len(or) == 2 && !strings.Contains(or[0].String(), "versionGE") {
+				t.Errorf("|| chain was reordered: %s", ord)
+			}
+		}
 	}
 }
 
@@ -799,18 +822,18 @@ func TestReorderIndexedFlagSinks(t *testing.T) {
 		Requirements = TARGET.HasFileTransfer && (TARGET.Memory >= RequestMemory);
 		Rank = 0 ]`)
 
-	rj := c.reorderJobRequirements(job)
-	if rj == job {
+	ord := orderedReq(c, job)
+	if ord == nil {
 		t.Fatal("expected reorder to move the always-true flag behind the selective Memory test")
 	}
-	ops := firstChain(jobRequirementsExpr(rj), "&&")
+	ops := topConjuncts(ord)
 	if len(ops) != 2 {
-		t.Fatalf("expected a 2-operand && chain, got %d: %s", len(ops), jobRequirementsExpr(rj))
+		t.Fatalf("expected a 2-operand && chain, got %d: %s", len(ops), ord)
 	}
 	// Memory (selective, ~25% true -> most likely to reject) must come first; the
 	// always-true HasFileTransfer flag must come last.
 	if !strings.Contains(ops[0].String(), "Memory") || !strings.Contains(ops[len(ops)-1].String(), "HasFileTransfer") {
-		t.Errorf("want selective Memory first, always-true flag last; got %s", jobRequirementsExpr(rj))
+		t.Errorf("want selective Memory first, always-true flag last; got %s", ord)
 	}
 }
 
@@ -861,9 +884,8 @@ func TestMatchCategoricalBoolEqualsFullScan(t *testing.T) {
 	}
 }
 
-// TestReorderPreservesMatches: reordering is a pure evaluation-order change -- the match
-// set is identical to a brute-force bilateral match over the ORIGINAL (un-reordered)
-// Requirements.
+// TestReorderPreservesMatches: conjunct ordering never changes the match set -- it is
+// identical to a brute-force bilateral match over the ORIGINAL Requirements.
 func TestReorderPreservesMatches(t *testing.T) {
 	t.Parallel()
 	const n = 1500
@@ -895,7 +917,7 @@ func TestReorderPreservesMatches(t *testing.T) {
 		}
 	}
 	sort.Ints(bruteIDs)
-	got := matchIDSet(t, c, job) // goes through reorderJobRequirements
+	got := matchIDSet(t, c, job) // goes through conjunctOrder
 	if !equalInts(got, bruteIDs) {
 		t.Fatalf("reordered match (%d) != brute-force bilateral (%d)", len(got), len(bruteIDs))
 	}

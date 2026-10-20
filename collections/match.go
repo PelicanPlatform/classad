@@ -42,18 +42,29 @@ type rankedMatch struct {
 // and (for a match) the job's Rank of it. It clears ad's match target afterward so the
 // result is not left pointing at the job.
 func matchOne(m *classad.MatchClassAd, ad *classad.ClassAd) (ok bool, rank float64, hasRank bool) {
-	return matchOneLeftKnown(m, ad, false)
+	return matchOneLeftKnown(m, ad, false, nil)
 }
 
-// matchOneLeftKnown is matchOne with an escape hatch: when leftKnownTrue, the left
-// (job) Requirements has already been proven true wire-native by the candidate
-// pre-filter, so the bilateral match only needs the right (slot) Requirements --
-// skipping a redundant tree-walk of the job's Requirements per surviving candidate.
+// matchOneLeftKnown is matchOne with two escape hatches for the left (job) side. When
+// leftKnownTrue, the job's Requirements has already been proven true wire-native by the
+// candidate pre-filter, so the bilateral match only needs the right (slot) Requirements
+// -- skipping a redundant tree-walk of the job's Requirements per surviving candidate.
 // The wire-native pre-filter is authoritative exactly when it returned a definitive
-// bool (see matchCandidate), which is the only case that sets leftKnownTrue, so this
-// is result-identical to the full Symmetry.
-func matchOneLeftKnown(m *classad.MatchClassAd, ad *classad.ClassAd, leftKnownTrue bool) (ok bool, rank float64, hasRank bool) {
+// bool (see matchCandidate), which is the only case that sets leftKnownTrue. Otherwise,
+// when leftReq is non-nil it is the job's top-level && conjuncts in short-circuit order
+// (orderedConjunction), evaluated in the job's scope in place of its Requirements: it is
+// TRUE exactly when the Requirements is, so either way this is result-identical to the
+// full Symmetry.
+func matchOneLeftKnown(m *classad.MatchClassAd, ad *classad.ClassAd, leftKnownTrue bool, leftReq ast.Expr) (ok bool, rank float64, hasRank bool) {
 	m.ReplaceRightAd(ad)
+	if !leftKnownTrue && leftReq != nil {
+		v := m.EvaluateExprLeft(leftReq)
+		if b, err := v.BoolValue(); err != nil || !v.IsBool() || !b {
+			ad.SetTarget(nil)
+			return false, 0, false
+		}
+		leftKnownTrue = true
+	}
 	var matched bool
 	if leftKnownTrue {
 		rightReq := m.EvaluateAttrRight("Requirements")
@@ -152,10 +163,6 @@ func (c *Collection) MatchSortedRanked(job *classad.ClassAd, limit int) []Ranked
 // job's Requirements yield an index-usable constraint on the slots, it visits only
 // candidate slots (A2); otherwise it scans every slot with the wire-native reject.
 func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []rankedMatch {
-	// Reorder the job's Requirements && / || operands so the evaluator short-circuits
-	// on the cheapest, most-decisive operand first (a copy; the caller's job is not
-	// modified). Purely an evaluation-order optimization -- the match set is unchanged.
-	job = c.reorderJobRequirements(job)
 	if c.parentKeyFor != nil {
 		return c.serialScanMatches(job) // chained: need Scan's flatten/hide-structural view
 	}
@@ -321,9 +328,16 @@ func jobValues(job *classad.ClassAd) map[string]classad.Value {
 // job's own attribute values. jobPlan.vals is always populated (the index pre-filter
 // uses it too); rankPresent records a Rank attribute regardless of compilability, so
 // a non-wire-native Rank still forces a decode rather than being read as "unranked".
+// When the Requirements' top-level conjuncts are worth reordering (conjunctOrder), the
+// compiled job-side verdict evaluates them in that order, and jp.order lets each worker
+// build the same order over its own job copy.
 func (c *Collection) compileJobSide(job *classad.ClassAd) *jobPlan {
 	jp := &jobPlan{vals: jobValues(job)}
 	if reqExpr := jobRequirementsExpr(job); reqExpr != nil {
+		jp.order = c.conjunctOrder(reqExpr, jp.vals)
+		if ordered := orderedConjunction(reqExpr, jp.order); ordered != nil {
+			reqExpr = ordered
+		}
 		if q := vm.Compile(reqExpr); q.Native() {
 			jp.req = q // ternary/list/func etc. leave req nil (no wire-native path)
 		}
@@ -344,6 +358,7 @@ func (c *Collection) compileJobSide(job *classad.ClassAd) *jobPlan {
 // survivors without a ClassAd.
 type matchWorker struct {
 	mc          *classad.MatchClassAd
+	leftReq     ast.Expr    // the job's conjuncts in short-circuit order, or nil (see matchOneLeftKnown)
 	jm          *vm.Matcher // job.Requirements matcher, or nil (no wire-native reject)
 	rankM       *vm.Matcher // job.Rank matcher, or nil
 	rankPresent bool        // job has a Rank attribute
@@ -362,6 +377,10 @@ type matchWorker struct {
 
 func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat bool) *matchWorker {
 	mw := &matchWorker{mc: classad.NewMatchClassAd(job, nil), rankPresent: jp.rankPresent, deferMat: deferMat}
+	if jp.order != nil {
+		// Built over this worker's own job copy, so no AST is shared across workers.
+		mw.leftReq = orderedConjunction(jobRequirementsExpr(job), jp.order)
+	}
 	if jp.rank != nil {
 		mw.rankM = jp.rank.Matcher()
 	}
@@ -499,7 +518,7 @@ func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatc
 				partial = c.closureDecode(w, mw)
 			}
 			if partial != nil {
-				if ok, r, hr := matchOneLeftKnown(mw.mc, partial, true); ok {
+				if ok, r, hr := matchOneLeftKnown(mw.mc, partial, true, nil); ok {
 					c.appendSurvivor(mw, w, r, hr, out)
 				}
 				return
@@ -511,7 +530,7 @@ func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatc
 		return
 	}
 	ad := classad.FromAST(node)
-	if ok, r, hr := matchOneLeftKnown(mw.mc, ad, leftKnownTrue); ok {
+	if ok, r, hr := matchOneLeftKnown(mw.mc, ad, leftKnownTrue, mw.leftReq); ok {
 		*out = append(*out, rankedMatch{ad: ad, rank: r, hasRank: hr})
 	}
 }
