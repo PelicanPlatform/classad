@@ -86,6 +86,11 @@ type FsckSegment struct {
 	// that reads the version opens it normally.
 	ColumnarUnsupported bool
 	ColumnarVersion     uint32
+	// Columnarized is true when any record that frames carries the columnar flag --
+	// the payload or a stripped remnant, whether or not it verified. Such a segment's
+	// payload maps each row to its record by arena offset, so its records cannot
+	// move, and Repair leaves it alone.
+	Columnarized bool
 }
 
 // FsckSupersede is a record whose supersededBySeq cannot be true.
@@ -186,6 +191,10 @@ func (r *FsckReport) String() string {
 			}
 			fmt.Fprintf(&b, "    %s at %d (+%d bytes, %s, %s)\n",
 				kind, d.Offset, d.Length, count, d.Reason)
+		}
+		if s.Columnarized && segmentNeedsRepair(s) {
+			b.WriteString("    columnarized: repair leaves this segment alone; its records cannot move " +
+				"without rewriting its columnar payload\n")
 		}
 		if s.ExtentTrusted && len(s.Damage) > 0 {
 			b.WriteString("    note: inside the sidecar's trusted extent -- a normal open will not notice\n")
@@ -402,10 +411,14 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 			s.Bytes += total
 			noteSupersede(s, data, off)
 			noteColPayload(s, data, off)
+			s.Columnarized = s.Columnarized || recIsCol(data, uint32(off))
 			off += total
 			continue
 		}
 		if framed {
+			// The flag is read from a record that failed its CRC, so it may be wrong; a
+			// false positive only keeps Repair from rewriting the segment.
+			s.Columnarized = s.Columnarized || recIsCol(data, uint32(off))
 			// Contents corrupt, framing fine: count exactly one record and step over it,
 			// merging into the current run so consecutive bad records read as one region.
 			if run == nil {

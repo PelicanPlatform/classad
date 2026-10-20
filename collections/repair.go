@@ -8,7 +8,7 @@ package collections
 // valid record after it. Repair copies the good records into a fresh segment file, so
 // what follows the damage comes back.
 //
-// Four rules it does not break:
+// Five rules it does not break:
 //
 //   - The original is never destroyed. It moves to quarantine/, because an operator
 //     who disagrees with what repair kept needs the bytes to argue with. Deleting a
@@ -25,8 +25,15 @@ package collections
 //     left exactly as it is, damaged or not. That payload is the only copy of what
 //     its records were written without, and a build that does not understand it is
 //     in no position to decide what a rewrite of that segment must preserve.
+//   - A columnarized segment is left exactly as it is. Its payload finds each record's
+//     row by the record's arena offset, and every columnar reader reads the record
+//     header at that offset for visibility. Packing the survivors together moves them,
+//     so each one would read a neighbour's row (or none); keeping the offsets valid
+//     means removing the dropped records' rows from every column, which is a rewrite
+//     of the payload that this byte-level tool does not attempt.
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -72,6 +79,10 @@ type RepairReport struct {
 	// format version this build cannot read (FsckSegment.ColumnarUnsupported),
 	// whether or not they also hold damage. They are not counted in Untouched.
 	Unsupported []string
+	// Columnarized lists damaged segments left alone because they are columnarized
+	// (FsckSegment.Columnarized). Their damage remains as Fsck reports it. They are not
+	// counted in Untouched.
+	Columnarized []string
 }
 
 // Totals sums the records kept and dropped across every rewritten segment.
@@ -95,6 +106,10 @@ func (r *RepairReport) String() string {
 	for _, p := range r.Unsupported {
 		fmt.Fprintf(&b, "  LEFT ALONE %s: its columnar payload is a format version this build cannot read; "+
 			"repair it with a build that can\n", filepath.Base(p))
+	}
+	for _, p := range r.Columnarized {
+		fmt.Fprintf(&b, "  LEFT ALONE %s: damaged, but columnarized; its records cannot move without "+
+			"rewriting its columnar payload, which repair does not do\n", filepath.Base(p))
 	}
 	if len(r.Segments) == 0 {
 		fmt.Fprintf(&b, "  nothing to do (%d segment(s) need no repair)\n", r.Untouched)
@@ -132,6 +147,10 @@ func Repair(dir string, opts RepairOptions) (*RepairReport, error) {
 			continue
 		}
 		done, err := repairSegment(seg.Path, opts)
+		if errors.Is(err, errRepairColumnarized) {
+			rep.Columnarized = append(rep.Columnarized, seg.Path)
+			continue
+		}
 		if err != nil {
 			return rep, fmt.Errorf("repairing %s: %w", seg.Path, err)
 		}
@@ -155,7 +174,12 @@ func segmentNeedsRepair(s FsckSegment) bool {
 	return false
 }
 
-// repairSegment rewrites one segment file, keeping the records that verify.
+// errRepairColumnarized is repairSegment refusing a columnarized segment.
+var errRepairColumnarized = errors.New("collections: repair does not rewrite a columnarized segment")
+
+// repairSegment rewrites one segment file, keeping the records that verify. It returns
+// errRepairColumnarized, having written nothing, for a segment holding any record that
+// carries the columnar flag.
 func repairSegment(path string, opts RepairOptions) (*RepairSegment, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -170,6 +194,11 @@ func repairSegment(path string, opts RepairOptions) (*RepairSegment, error) {
 	for off := 0; off+recHeaderSize <= len(data); {
 		total := int(recTotalLen(data, uint32(off)))
 		framed := total > 0 && total%8 == 0 && off+total <= len(data)
+		// Decided from the bytes about to be rewritten, not from the scan that chose this
+		// segment, and from bad records too: a wrong flag only costs the rewrite.
+		if framed && recIsCol(data, uint32(off)) {
+			return nil, errRepairColumnarized
+		}
 		if framed && recVerifyCRC(data, uint32(off)) {
 			kept = append(kept, data[off:off+total]...)
 			out.RecordsKept++
