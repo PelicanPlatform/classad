@@ -241,6 +241,13 @@ func (c *Collection) recordWireIn(seg *segment, data []byte, off uint32, buf []b
 	}
 	k, ok := cn.indexOf(off)
 	if !ok {
+		// A remnant the payload has no row for: its bytes are only the attributes the schema does
+		// not cover, so returning them would be a short ad nothing downstream can tell apart from a
+		// small one. Fail, and count it.
+		if recIsStripped(data, off) {
+			colNativeRowMisses.Add(1)
+			return nil, errColRowMissing
+		}
 		return raw, nil // not a columnarized record (a marker, or written after the transform)
 	}
 	return cn.spliceInto(c, raw, k, nil)
@@ -254,7 +261,7 @@ func (c *Collection) recordWireIn(seg *segment, data []byte, off uint32, buf []b
 func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte) ([]byte, error) {
 	blk, local := cn.blockFor(k)
 	if blk == nil {
-		return remnant, nil
+		return nil, errBadRemnant // an index past every block: the remnant alone is half an ad
 	}
 	hdr, entries, n, inline, ok := wire.Ad(remnant).SplitBody()
 	if !ok {
@@ -351,6 +358,11 @@ var errColDamaged = errors.New("collections: segment columnar payload failed ver
 // was columnarized and then lost, or never published, its payload.
 var errColMissing = errors.New("collections: record needs a columnar payload its segment does not have")
 
+// errColRowMissing is a remnant in a columnarized segment whose payload has no row at its offset.
+// The payload maps rows to records by arena offset, so this is a payload that does not describe the
+// records around it -- the records moved, or the map is wrong.
+var errColRowMissing = errors.New("collections: columnarized record has no row in its segment's columnar payload")
+
 // blockFor maps a segment-wide record index to its block and the index within it.
 func (cn *colNative) blockFor(k int) (*columnarBlock, int) {
 	for _, b := range cn.seg.blocks {
@@ -375,6 +387,15 @@ var colNativeCRCFailures atomic.Int64
 // unparseable body since the process started. A payload in a format version this build does not read
 // is not counted here; see ColNativeUnsupportedVersions.
 func ColNativeCRCFailures() int64 { return colNativeCRCFailures.Load() }
+
+// colNativeRowMisses counts reads refused with errColRowMissing.
+var colNativeRowMisses atomic.Int64
+
+// ColNativeRowMisses reports how many record reads, since the process started, found a columnarized
+// record whose segment's columnar payload has no row for it. Each such read fails rather than return
+// the record's remnant as a whole ad; a scan skips the record. Nonzero means a segment's payload does
+// not match its records.
+func ColNativeRowMisses() int64 { return colNativeRowMisses.Load() }
 
 // colNativeUnsupported counts columnar payloads refused because a newer build wrote them.
 var colNativeUnsupported atomic.Int64
