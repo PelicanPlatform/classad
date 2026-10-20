@@ -879,7 +879,7 @@ func TestMatchCategoricalBoolEqualsFullScan(t *testing.T) {
 	}
 	// The selective GPUs==true flag should be estimable from its categorical index.
 	gpuRef := &ast.AttributeReference{Name: "GPUs", Scope: ast.TargetScope}
-	if frac, ok := indexed.operandTrueProb(gpuRef, map[string]classad.Value{}); !ok || frac > 0.4 {
+	if frac, ok := indexed.operandTrueProb(gpuRef, &jobScope{}); !ok || frac > 0.4 {
 		t.Errorf("GPUs truthiness estimate = %.3f ok=%v, want ~0.25 from the categorical index", frac, ok)
 	}
 }

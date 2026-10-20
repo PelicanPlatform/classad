@@ -110,14 +110,14 @@ func lowerASCII(s string) string {
 // slot rewrite. ok is false when nothing indexable backs the operand (the caller then
 // uses a neutral prior). Best-effort: a superset probe over-estimates the true fraction,
 // which only softens the ordering and never changes the match result.
-func (c *Collection) operandTrueProb(operand ast.Expr, jobVals map[string]classad.Value) (float64, bool) {
+func (c *Collection) operandTrueProb(operand ast.Expr, js *jobScope) (float64, bool) {
 	total := float64(c.Len())
 	if total <= 0 {
 		return 0, false
 	}
 	// Same rewrite the probe planner uses: TARGET.attr -> slot self-ref, job refs baked,
 	// opaque pure functions of a low-cardinality categorical folded to a membership probe.
-	pred := c.materializeFinite(rewriteForSlot(operand, jobVals, nil, false))
+	pred := c.materializeFinite(rewriteForSlot(operand, js, nil, false))
 	ups := c.planIndex(vm.Compile(pred).Probes())
 	if len(ups) == 0 {
 		// A bare boolean conjunct (`HasFileTransfer`, `!HasFileTransfer`) is a truthiness
@@ -156,7 +156,7 @@ func (c *Collection) operandTrueProb(operand ast.Expr, jobVals map[string]classa
 // conjunct is impure, or when the order would not change. Only the TRUE-ness of the
 // reordered conjunction matches that of reqExpr, so callers must use it only for the
 // job-side verdict (see the comment at the top of this file).
-func (c *Collection) conjunctOrder(reqExpr ast.Expr, jobVals map[string]classad.Value) []int {
+func (c *Collection) conjunctOrder(reqExpr ast.Expr, js *jobScope) []int {
 	ops := topConjuncts(reqExpr)
 	if len(ops) < 2 || !allPure(ops) {
 		return nil
@@ -168,7 +168,7 @@ func (c *Collection) conjunctOrder(reqExpr ast.Expr, jobVals map[string]classad.
 	rs := make([]ranked, len(ops))
 	for i, o := range ops {
 		falseProb := 0.5
-		if p, ok := c.operandTrueProb(o, jobVals); ok {
+		if p, ok := c.operandTrueProb(o, js); ok {
 			falseProb = 1 - p // && stops on a non-TRUE operand: prefer likely-false
 		}
 		rs[i] = ranked{rank: exprEvalCost(o) / math.Max(falseProb, shortCircuitEps), seq: i}

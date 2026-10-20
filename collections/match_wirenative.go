@@ -33,9 +33,11 @@ type jobPlan struct {
 	req         *vm.Query // job.Requirements, or nil (no wire-native job-side reject)
 	rank        *vm.Query // job.Rank wire-native, or nil
 	rankPresent bool      // job has a Rank attribute (whether or not wire-native)
-	rankRefs    []string  // slot attributes the job Rank reads (for the closure seed)
-	vals        map[string]classad.Value
-	order       []int // short-circuit order of the Requirements' top-level conjuncts, or nil
+	rankRefs    []string  // slot attributes the job Rank reads, through job attributes (closure seed)
+	rankOpaque  bool      // the job Rank's slot reads are not statically known (no closure decode)
+	vals        *jobScope // the job's attribute values and which depend on the slot
+	deps        []depAttr // target-dependent job attributes and the slot attributes they read
+	order       []int     // short-circuit order of the Requirements' top-level conjuncts, or nil
 }
 
 // jobRankExpr returns the job's Rank expression, or nil if absent.
@@ -88,7 +90,8 @@ func (c *Collection) wireNativeSurvivor(mw *matchWorker) (matched bool, rank flo
 	}
 	// Rank: absent -> unranked; present and wire-native -> evaluate against the slot
 	// (job's Rank sees the slot as TARGET, so ms's resolver already fits); present but
-	// not wire-native, or falling back on a non-literal slot attribute -> full decode.
+	// not wire-native, or falling back on a non-literal slot attribute or a job
+	// attribute whose value depends on the slot -> full decode.
 	if !mw.rankPresent {
 		return true, 0, false, true
 	}

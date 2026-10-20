@@ -14,20 +14,20 @@ import (
 
 // matchIndexPlan derives an index candidate pre-filter (A2) from the job's
 // Requirements: it rewrites Requirements into a predicate over the *slot* --
-// TARGET.attr becomes the slot's own attribute, and every job reference is baked to
-// its constant value -- then extracts that predicate's index-satisfiable conjuncts
-// and matches them against the collection's configured indexes. An empty result
-// means no usable constraint (Match then scans every slot).
+// TARGET.attr becomes the slot's own attribute, and every target-independent job
+// reference is baked to its constant value -- then extracts that predicate's
+// index-satisfiable conjuncts and matches them against the collection's configured
+// indexes. An empty result means no usable constraint (Match then scans every slot).
 //
 // It is sound by construction: the rewrite can only ever yield probes on the slot's
 // own attributes compared to job constants, and Match re-verifies every candidate
 // with the full bilateral MatchClassAd, so a dropped or over-broad probe costs only
 // selectivity, never correctness.
-func (c *Collection) matchIndexPlan(job *classad.ClassAd, jobVals map[string]classad.Value) []usableProbe {
+func (c *Collection) matchIndexPlan(job *classad.ClassAd, js *jobScope) []usableProbe {
 	if !c.spec.Load().any() {
 		return nil // no indexes configured: nothing to plan against
 	}
-	return c.planIndex(c.slotProbes(job, jobVals))
+	return c.planIndex(c.slotProbes(job, js))
 }
 
 // slotProbes rewrites the job's Requirements into a slot-side predicate and extracts
@@ -35,12 +35,12 @@ func (c *Collection) matchIndexPlan(job *classad.ClassAd, jobVals map[string]cla
 // They drive the candidate pre-filter (matchIndexPlan) when covered by an index, and
 // -- recorded as demand even when nothing is indexed -- let SuggestIndexes recommend
 // indexing exactly those attributes to speed the match.
-func (c *Collection) slotProbes(job *classad.ClassAd, jobVals map[string]classad.Value) []vm.Probe {
+func (c *Collection) slotProbes(job *classad.ClassAd, js *jobScope) []vm.Probe {
 	reqExpr := jobRequirementsExpr(job)
 	if reqExpr == nil {
 		return nil
 	}
-	return vm.Compile(rewriteForSlot(reqExpr, jobVals, nil, false)).Probes()
+	return vm.Compile(rewriteForSlot(reqExpr, js, nil, false)).Probes()
 }
 
 // MatchExplain describes how matchmaking a specific job against this (resource)
@@ -101,23 +101,23 @@ type ConjunctExplain struct {
 // conjunctExplains breaks reqExpr's top-level && spine into per-conjunct explanations in
 // evaluation order, each tagged as an active pruning probe or a re-check with its
 // index-estimated selectivity. reqExpr is expected already short-circuit-reordered.
-func (c *Collection) conjunctExplains(reqExpr ast.Expr, jobVals map[string]classad.Value) []ConjunctExplain {
+func (c *Collection) conjunctExplains(reqExpr ast.Expr, js *jobScope) []ConjunctExplain {
 	conj := flattenChain(reqExpr, "&&")
 	out := make([]ConjunctExplain, 0, len(conj))
 	seen := map[string]bool{}
 	for _, cj := range conj {
-		ce := ConjunctExplain{Text: classad.FoldConstants(displayRewrite(cj, jobVals)).String()}
+		ce := ConjunctExplain{Text: classad.FoldConstants(displayRewrite(cj, js)).String()}
 		if seen[ce.Text] { // a Requirements that repeats a conjunct shows it once
 			continue
 		}
 		seen[ce.Text] = true
 		// Active pushdown probe? (real probeFrom coverage -- what the Probes block lists).
-		realPred := c.materializeFinite(rewriteForSlot(cj, jobVals, nil, false))
+		realPred := c.materializeFinite(rewriteForSlot(cj, js, nil, false))
 		if len(c.planIndex(vm.Compile(realPred).Probes())) > 0 {
 			ce.Probed = true
 		}
 		// Selectivity from the index, including bare-boolean flags (synthBoolProbe).
-		if frac, ok := c.operandTrueProb(cj, jobVals); ok {
+		if frac, ok := c.operandTrueProb(cj, js); ok {
 			ce.Indexed = true
 			ce.HasSelectivity = true
 			ce.TrueFrac = frac
@@ -146,19 +146,19 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 		return ex
 	}
 	ex.HasRequirements = true
-	jobVals := jobValues(job)
+	js := jobValues(job)
 	// Show the conjuncts in the order the match's job-side verdict evaluates them, so
 	// the explanation reflects real evaluation order (cheap, most-decisive conjunct first).
-	if ordered := orderedConjunction(reqExpr, c.conjunctOrder(reqExpr, jobVals)); ordered != nil {
+	if ordered := orderedConjunction(reqExpr, c.conjunctOrder(reqExpr, js)); ordered != nil {
 		reqExpr = ordered
 	}
 	// Display: honest, baked, de-duplicated (functions kept, not shown as undefined).
-	ex.SlotPredicate = slotDisplayExpr(reqExpr, jobVals)
+	ex.SlotPredicate = slotDisplayExpr(reqExpr, js)
 	// Per-conjunct evaluation order (probe vs re-check + selectivity), so the reordering
 	// is transparent -- an always-true indexed flag reads as a late re-check, not a probe.
-	ex.EvalOrder = c.conjunctExplains(reqExpr, jobVals)
+	ex.EvalOrder = c.conjunctExplains(reqExpr, js)
 	// Probes: from the probe rewrite (opaque functions -> undefined, so they drop).
-	plan := vm.Compile(c.slotMatchExpr(reqExpr, jobVals)).ProbePlan()
+	plan := vm.Compile(c.slotMatchExpr(reqExpr, js)).ProbePlan()
 	groups, prunable := c.planIndexGroups(plan)
 	if frac, ok := c.planFrac(groups); prunable && ok && frac > maxPushdownFrac {
 		prunable = false // estimated to barely prune -> a scan is cheaper
@@ -309,9 +309,11 @@ func scanPlanName(queryPar int) string {
 //
 //   - TARGET.attr -> the slot's own (self-scoped) attribute, so a probe on it maps to
 //     the slot index.
-//   - MY.attr / unscoped / PARENT.attr (a job reference) -> the job's constant value,
-//     or the undefined literal when it has no scalar value (TARGET-dependent, missing,
-//     or non-scalar) -- which makes its conjunct non-probeable and thus dropped.
+//   - MY.attr / unscoped / PARENT.attr (a job reference) -> see slotFrameRef: the
+//     job's constant value when it has one; TARGET.attr (the job's attribute, opaque to
+//     folding and probes, so its conjunct is dropped) when the value depends on the
+//     slot or is a list/record; the slot's own attribute for an unscoped name the job
+//     does not define.
 //   - literals pass through; arithmetic/negation over baked constants is left for the
 //     probe extractor's constant folding.
 //
@@ -322,39 +324,36 @@ func scanPlanName(queryPar int) string {
 // undefined is an approximation (unscoped refs fall through to the slot at eval time);
 // rewriteForSlot records it in `assumed` (only inside a control-flow construct, where
 // it can actually enable a fold) so slotMatchPlan can add a sound `name isnt undefined`
-// exception disjunct. Other function calls / lists / records remain undefined (opaque
-// to the index).
-func rewriteForSlot(e ast.Expr, jobVals map[string]classad.Value, assumed map[string]bool, inCtrl bool) ast.Expr {
+// exception disjunct. Other function calls keep their (rewritten) arguments; record
+// literals and unrecognized nodes become an opaque TARGET reference.
+func rewriteForSlot(e ast.Expr, js *jobScope, assumed map[string]bool, inCtrl bool) ast.Expr {
 	switch n := e.(type) {
 	case *ast.AttributeReference:
 		if n.Scope == ast.TargetScope {
 			return &ast.AttributeReference{Name: n.Name, Scope: ast.NoScope}
 		}
-		if v, ok := jobVals[strings.ToLower(n.Name)]; ok {
-			if lit := valueToLiteral(v); lit != nil {
-				return lit
-			}
-		}
-		if n.Scope == ast.NoScope && inCtrl && assumed != nil {
+		ref, absentUnscoped := slotFrameRef(n, js)
+		if absentUnscoped && inCtrl && assumed != nil {
 			assumed[n.Name] = true // unscoped + absent inside a guard: assumed undefined
+			return &ast.UndefinedLiteral{}
 		}
-		return &ast.UndefinedLiteral{}
+		return ref
 	case *ast.BinaryOp:
-		return &ast.BinaryOp{Op: n.Op, Left: rewriteForSlot(n.Left, jobVals, assumed, inCtrl), Right: rewriteForSlot(n.Right, jobVals, assumed, inCtrl)}
+		return &ast.BinaryOp{Op: n.Op, Left: rewriteForSlot(n.Left, js, assumed, inCtrl), Right: rewriteForSlot(n.Right, js, assumed, inCtrl)}
 	case *ast.UnaryOp:
-		return &ast.UnaryOp{Op: n.Op, Expr: rewriteForSlot(n.Expr, jobVals, assumed, inCtrl)}
+		return &ast.UnaryOp{Op: n.Op, Expr: rewriteForSlot(n.Expr, js, assumed, inCtrl)}
 	case *ast.ParenExpr:
-		return &ast.ParenExpr{Inner: rewriteForSlot(n.Inner, jobVals, assumed, inCtrl)}
+		return &ast.ParenExpr{Inner: rewriteForSlot(n.Inner, js, assumed, inCtrl)}
 	case *ast.ConditionalExpr:
 		return &ast.ConditionalExpr{
-			Condition: rewriteForSlot(n.Condition, jobVals, assumed, true),
-			TrueExpr:  rewriteForSlot(n.TrueExpr, jobVals, assumed, true),
-			FalseExpr: rewriteForSlot(n.FalseExpr, jobVals, assumed, true),
+			Condition: rewriteForSlot(n.Condition, js, assumed, true),
+			TrueExpr:  rewriteForSlot(n.TrueExpr, js, assumed, true),
+			FalseExpr: rewriteForSlot(n.FalseExpr, js, assumed, true),
 		}
 	case *ast.ElvisExpr:
 		return &ast.ElvisExpr{
-			Left:  rewriteForSlot(n.Left, jobVals, assumed, true),
-			Right: rewriteForSlot(n.Right, jobVals, assumed, true),
+			Left:  rewriteForSlot(n.Left, js, assumed, true),
+			Right: rewriteForSlot(n.Right, js, assumed, true),
 		}
 	case *ast.FunctionCall:
 		// Keep the function (arguments baked) rather than collapsing it to undefined:
@@ -364,20 +363,33 @@ func rewriteForSlot(e ast.Expr, jobVals map[string]classad.Value, assumed map[st
 		ctrl := inCtrl || strings.EqualFold(n.Name, "ifThenElse")
 		args := make([]ast.Expr, len(n.Args))
 		for i := range n.Args {
-			args[i] = rewriteForSlot(n.Args[i], jobVals, assumed, ctrl)
+			args[i] = rewriteForSlot(n.Args[i], js, assumed, ctrl)
 		}
 		return &ast.FunctionCall{Name: n.Name, Args: args}
 	case *ast.SubscriptExpr:
-		return &ast.SubscriptExpr{Container: rewriteForSlot(n.Container, jobVals, assumed, inCtrl), Index: rewriteForSlot(n.Index, jobVals, assumed, inCtrl)}
+		return &ast.SubscriptExpr{Container: rewriteForSlot(n.Container, js, assumed, inCtrl), Index: rewriteForSlot(n.Index, js, assumed, inCtrl)}
 	case *ast.SelectExpr:
-		return &ast.SelectExpr{Record: rewriteForSlot(n.Record, jobVals, assumed, inCtrl), Attr: n.Attr}
+		return &ast.SelectExpr{Record: rewriteForSlot(n.Record, js, assumed, inCtrl), Attr: n.Attr}
 	case *ast.IntegerLiteral, *ast.RealLiteral, *ast.StringLiteral, *ast.BooleanLiteral,
 		*ast.UndefinedLiteral, *ast.ErrorLiteral:
 		return e
+	case *ast.ListLiteral:
+		elems := make([]ast.Expr, len(n.Elements))
+		for i := range n.Elements {
+			elems[i] = rewriteForSlot(n.Elements[i], js, assumed, inCtrl)
+		}
+		return &ast.ListLiteral{Elements: elems}
 	default:
-		return &ast.UndefinedLiteral{}
+		// A record literal or unrecognized node: opaque. Not the undefined literal --
+		// that is a value, which folding or finite-domain materialization would use.
+		return &ast.AttributeReference{Name: opaqueSlotRef, Scope: ast.TargetScope}
 	}
 }
+
+// opaqueSlotRef names the stand-in rewriteForSlot uses for an expression it cannot
+// rewrite: a TARGET reference (the job side in the slot's frame), which constant
+// folding and probe extraction leave alone. It is never evaluated.
+const opaqueSlotRef = "_opaque_"
 
 // slotMatchExpr rewrites the job's Requirements over the slot and returns the sound
 // pushdown predicate: the rewritten predicate OR one `name isnt undefined` disjunct per
@@ -385,9 +397,9 @@ func rewriteForSlot(e ast.Expr, jobVals map[string]classad.Value, assumed map[st
 // slot where an assumed attribute is actually present keeps the pushdown sound (there
 // the approximation may not hold, so the candidate is visited and re-verified); a slot
 // where it is absent is covered by the main predicate.
-func (c *Collection) slotMatchExpr(reqExpr ast.Expr, jobVals map[string]classad.Value) ast.Expr {
+func (c *Collection) slotMatchExpr(reqExpr ast.Expr, js *jobScope) ast.Expr {
 	assumed := map[string]bool{}
-	pred := rewriteForSlot(reqExpr, jobVals, assumed, false)
+	pred := rewriteForSlot(reqExpr, js, assumed, false)
 	// Finite-domain materialization: turn opaque pure functions of a single
 	// low-cardinality categorical attribute into membership probes.
 	pred = c.materializeFinite(pred)
@@ -416,8 +428,8 @@ func (c *Collection) slotMatchExpr(reqExpr ast.Expr, jobVals map[string]classad.
 // it really is -- rather than `HasFileTransfer && undefined`. It is display-only; probe
 // extraction uses slotMatchExpr. Top-level conjuncts are de-duplicated (a Requirements
 // that repeats `TARGET.HasSingularity` shows it once).
-func slotDisplayExpr(reqExpr ast.Expr, jobVals map[string]classad.Value) string {
-	folded := classad.FoldConstants(displayRewrite(reqExpr, jobVals))
+func slotDisplayExpr(reqExpr ast.Expr, js *jobScope) string {
+	folded := classad.FoldConstants(displayRewrite(reqExpr, js))
 	conj := dedupConjuncts(folded)
 	parts := make([]string, len(conj))
 	for i, c := range conj {
@@ -426,38 +438,34 @@ func slotDisplayExpr(reqExpr ast.Expr, jobVals map[string]classad.Value) string 
 	return strings.Join(parts, " && ")
 }
 
-func displayRewrite(e ast.Expr, jobVals map[string]classad.Value) ast.Expr {
+func displayRewrite(e ast.Expr, js *jobScope) ast.Expr {
 	switch n := e.(type) {
 	case *ast.AttributeReference:
 		if n.Scope == ast.TargetScope {
 			return &ast.AttributeReference{Name: n.Name, Scope: ast.NoScope}
 		}
-		if v, ok := jobVals[strings.ToLower(n.Name)]; ok {
-			if lit := valueToLiteral(v); lit != nil {
-				return lit
-			}
-		}
-		return &ast.UndefinedLiteral{}
+		ref, _ := slotFrameRef(n, js)
+		return ref
 	case *ast.BinaryOp:
-		return &ast.BinaryOp{Op: n.Op, Left: displayRewrite(n.Left, jobVals), Right: displayRewrite(n.Right, jobVals)}
+		return &ast.BinaryOp{Op: n.Op, Left: displayRewrite(n.Left, js), Right: displayRewrite(n.Right, js)}
 	case *ast.UnaryOp:
-		return &ast.UnaryOp{Op: n.Op, Expr: displayRewrite(n.Expr, jobVals)}
+		return &ast.UnaryOp{Op: n.Op, Expr: displayRewrite(n.Expr, js)}
 	case *ast.ParenExpr:
-		return &ast.ParenExpr{Inner: displayRewrite(n.Inner, jobVals)}
+		return &ast.ParenExpr{Inner: displayRewrite(n.Inner, js)}
 	case *ast.ConditionalExpr:
-		return &ast.ConditionalExpr{Condition: displayRewrite(n.Condition, jobVals), TrueExpr: displayRewrite(n.TrueExpr, jobVals), FalseExpr: displayRewrite(n.FalseExpr, jobVals)}
+		return &ast.ConditionalExpr{Condition: displayRewrite(n.Condition, js), TrueExpr: displayRewrite(n.TrueExpr, js), FalseExpr: displayRewrite(n.FalseExpr, js)}
 	case *ast.ElvisExpr:
-		return &ast.ElvisExpr{Left: displayRewrite(n.Left, jobVals), Right: displayRewrite(n.Right, jobVals)}
+		return &ast.ElvisExpr{Left: displayRewrite(n.Left, js), Right: displayRewrite(n.Right, js)}
 	case *ast.FunctionCall:
 		args := make([]ast.Expr, len(n.Args))
 		for i := range n.Args {
-			args[i] = displayRewrite(n.Args[i], jobVals)
+			args[i] = displayRewrite(n.Args[i], js)
 		}
 		return &ast.FunctionCall{Name: n.Name, Args: args}
 	case *ast.SubscriptExpr:
-		return &ast.SubscriptExpr{Container: displayRewrite(n.Container, jobVals), Index: displayRewrite(n.Index, jobVals)}
+		return &ast.SubscriptExpr{Container: displayRewrite(n.Container, js), Index: displayRewrite(n.Index, js)}
 	case *ast.SelectExpr:
-		return &ast.SelectExpr{Record: displayRewrite(n.Record, jobVals), Attr: n.Attr}
+		return &ast.SelectExpr{Record: displayRewrite(n.Record, js), Attr: n.Attr}
 	default:
 		return e
 	}
@@ -673,6 +681,11 @@ func (c *Collection) tryMaterializeLeaf(leaf ast.Expr) ast.Expr {
 	if !isPureExpr(leaf) {
 		return leaf
 	}
+	// A leaf that still reads the job (a target-dependent attribute or an opaque
+	// stand-in) has no value from the slot attribute alone.
+	if refersToJob(leaf) {
+		return leaf
+	}
 	refs := vm.SelfRefs(leaf)
 	if len(refs) != 1 {
 		return leaf // needs exactly one slot attribute's domain
@@ -772,12 +785,12 @@ func membershipExpr(attr string, values []string) ast.Expr {
 // slot predicate (with undefined-guard exceptions) compiled to a probe plan and matched
 // to the configured indexes. prunable is false when some disjunct is unconstrained (the
 // caller then full-scans / re-verifies every slot).
-func (c *Collection) slotMatchPlan(job *classad.ClassAd, jobVals map[string]classad.Value) (groups [][]usableProbe, prunable bool) {
+func (c *Collection) slotMatchPlan(job *classad.ClassAd, js *jobScope) (groups [][]usableProbe, prunable bool) {
 	reqExpr := jobRequirementsExpr(job)
 	if reqExpr == nil {
 		return nil, false
 	}
-	plan := vm.Compile(c.slotMatchExpr(reqExpr, jobVals)).ProbePlan()
+	plan := vm.Compile(c.slotMatchExpr(reqExpr, js)).ProbePlan()
 	groups, prunable = c.planIndexGroups(plan)
 	if frac, ok := c.planFrac(groups); prunable && ok && frac > maxPushdownFrac {
 		// The estimated candidate union is nearly the whole set -- the index would

@@ -196,7 +196,8 @@ func (c *Collection) recordMatchReads(job *classad.ClassAd, jp *jobPlan) {
 	// Requirements and Rank reference.
 	reads := []string{"Requirements", "Rank"}
 	if reqExpr := jobRequirementsExpr(job); reqExpr != nil {
-		reads = append(reads, vm.SelfRefs(rewriteForSlot(reqExpr, jp.vals, nil, false))...)
+		refs, _ := jp.vals.slotReads(reqExpr)
+		reads = append(reads, refs...)
 	}
 	reads = append(reads, jp.rankRefs...)
 	c.demand.recordReads(reads)
@@ -218,27 +219,30 @@ func (c *Collection) serialScanMatches(job *classad.ClassAd) []rankedMatch {
 
 // matchScope resolves references while evaluating the JOB's Requirements over a slot:
 // TARGET.attr comes from the slot's wire bytes (wire-native, no decode), and unscoped
-// / MY.attr come from the job's precomputed attribute values. If a TARGET attribute is
-// a non-literal expression, it sets fellBack and the caller decodes the slot fully.
+// / MY.attr come from the job's precomputed attribute values. An unscoped name the job
+// does not define falls through to the slot, as in ClassAd matchmaking. If a slot
+// attribute is a non-literal expression, or a job attribute's value depends on the
+// slot, it sets fellBack and the caller decodes the slot fully.
 //
 // The job's Requirements references a small, fixed set of attribute names, resolved
 // once per candidate slot across the whole match. Rather than re-fold and re-look-up
 // those names every candidate (a locked, allocating intern LookupID on the target
 // side; a ToLower on the job side), matchScope caches each name's resolution: the
-// interned id for a target ref (stable for the collection) and the constant value for
-// a job ref (stable for the job). One matchScope lives per worker for one match, so
-// the caches populate on the first candidate and are pure hits thereafter.
+// interned id for a target ref (stable for the collection) and the classification
+// and value of a job ref (stable for the job). One matchScope lives per worker for
+// one match, so the caches populate on the first candidate and are pure hits
+// thereafter.
 type matchScope struct {
 	slot     wire.Ad
 	ctx      wireCtx
-	jobVals  map[string]classad.Value
+	job      *jobScope
 	fellBack bool
 
 	// resolution caches, keyed by the reference name as it appears in the expression.
 	inline   bool                // collection uses inline names (no intern table)
 	intern   *wire.InternTable   // interned-mode attribute id table (nil when inline)
 	idCache  map[string]cachedID // target ref name -> interned id (interned mode only)
-	jobCache map[string]classad.Value
+	jobCache map[string]cachedJobRef
 }
 
 // cachedID memoizes an interned-mode target-attribute name resolution.
@@ -247,33 +251,55 @@ type cachedID struct {
 	found bool
 }
 
+// cachedJobRef memoizes a job-side reference's classification and constant value.
+type cachedJobRef struct {
+	v    classad.Value
+	kind jobRefKind
+}
+
 func (ms *matchScope) resolve(name string, scope ast.AttributeScope) classad.Value {
-	if scope == ast.TargetScope {
-		node, ok := ms.lookupTarget(name)
-		if !ok {
-			return classad.NewUndefinedValue()
-		}
-		lit, ok := wire.LiteralValue(node)
-		if !ok {
-			ms.fellBack = true // non-literal slot attr: cannot decide wire-native
-			return classad.NewUndefinedValue()
-		}
-		return litToValue(lit)
+	switch scope {
+	case ast.TargetScope:
+		return ms.resolveTarget(name)
+	case ast.ParentScope:
+		return classad.NewUndefinedValue() // a top-level job ad has no parent scope
 	}
-	// Job side: the value is a constant for the whole match, so cache it by the
+	// Job side: the classification is fixed for the whole match, so cache it by the
 	// reference's own casing and fold only on the first miss.
-	if v, ok := ms.jobCache[name]; ok {
-		return v
-	}
-	v, ok := ms.jobVals[strings.ToLower(name)]
+	e, ok := ms.jobCache[name]
 	if !ok {
-		v = classad.NewUndefinedValue()
+		e.v, e.kind = ms.job.lookup(name)
+		if ms.jobCache == nil {
+			ms.jobCache = make(map[string]cachedJobRef, 4)
+		}
+		ms.jobCache[name] = e
 	}
-	if ms.jobCache == nil {
-		ms.jobCache = make(map[string]classad.Value, 4)
+	switch e.kind {
+	case jobRefConst:
+		return e.v
+	case jobRefDep:
+		ms.fellBack = true // its value depends on the slot: evaluate on the decoded ad
+		return classad.NewUndefinedValue()
 	}
-	ms.jobCache[name] = v
-	return v
+	if scope == ast.NoScope {
+		return ms.resolveTarget(name) // not defined by the job: resolves in the slot
+	}
+	return classad.NewUndefinedValue()
+}
+
+// resolveTarget reads a slot attribute's literal value from wire, setting fellBack
+// when the attribute is a non-literal expression.
+func (ms *matchScope) resolveTarget(name string) classad.Value {
+	node, ok := ms.lookupTarget(name)
+	if !ok {
+		return classad.NewUndefinedValue()
+	}
+	lit, ok := wire.LiteralValue(node)
+	if !ok {
+		ms.fellBack = true // non-literal slot attr: cannot decide wire-native
+		return classad.NewUndefinedValue()
+	}
+	return litToValue(lit)
 }
 
 // lookupTarget returns the slot's raw node bytes for a TARGET reference, caching the
@@ -309,20 +335,6 @@ func jobRequirementsExpr(job *classad.ClassAd) ast.Expr {
 	return nil
 }
 
-// jobValues precomputes the job's own attribute values with no target set, so
-// unscoped/MY references resolve to constants (a TARGET-dependent job attribute
-// evaluates to undefined) without touching the shared job concurrently.
-func jobValues(job *classad.ClassAd) map[string]classad.Value {
-	orig := job.GetTarget()
-	job.SetTarget(nil)
-	vals := make(map[string]classad.Value)
-	for _, name := range job.GetAttributes() {
-		vals[strings.ToLower(name)] = job.EvaluateAttr(name)
-	}
-	job.SetTarget(orig)
-	return vals
-}
-
 // compileJobSide prepares the wire-native job side: it compiles job.Requirements and
 // job.Rank (each nil when absent or not wire-native evaluable) and precomputes the
 // job's own attribute values. jobPlan.vals is always populated (the index pre-filter
@@ -347,8 +359,10 @@ func (c *Collection) compileJobSide(job *classad.ClassAd) *jobPlan {
 		if q := vm.Compile(rankExpr); q.Native() {
 			jp.rank = q
 		}
-		jp.rankRefs = rankSlotRefs(job, jp.vals)
+		refs, ok := jp.vals.slotReads(rankExpr)
+		jp.rankRefs, jp.rankOpaque = refs, !ok
 	}
+	jp.deps = jp.vals.depAttrs()
 	return jp
 }
 
@@ -367,12 +381,14 @@ type matchWorker struct {
 
 	// Closure-decode scratch (deferred path, wide interned ads): a partial ClassAd of
 	// just the match closure instead of a full FromAST. Buffers are reused per worker.
-	closureSeeds []string          // Requirements + job Rank's slot refs
-	rankRefs     []string          // job Rank's slot refs (for hot-path top-up)
-	nodeIdx      map[uint32][]byte // id -> node bytes, refilled per candidate
-	seenIDs      map[uint32]bool   // BFS visited set, cleared per candidate
-	closureWork  []uint32          // BFS work stack, reused
-	hotPresent   map[string]bool   // hot-closure names present, cleared per candidate
+	closureSeeds  []string          // Requirements + job Rank's slot refs
+	rankRefs      []string          // job Rank's slot refs (for hot-path top-up)
+	deps          []depAttr         // target-dependent job attributes (slot reads to pull in)
+	nodeIdx       map[uint32][]byte // id -> node bytes, refilled per candidate
+	seenIDs       map[uint32]bool   // BFS visited set, cleared per candidate
+	closureWork   []uint32          // BFS work stack, reused
+	hotPresent    map[string]bool   // hot-closure names present, cleared per candidate
+	jobRefScratch []slotJobRef      // hot-path references into target-dependent job attributes
 }
 
 func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat bool) *matchWorker {
@@ -386,9 +402,12 @@ func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat b
 	}
 	if jp.req != nil {
 		mw.jm = jp.req.Matcher()
-		mw.ms = &matchScope{ctx: c, jobVals: jp.vals, inline: c.inline, intern: c.intern}
-		mw.closureSeeds = buildClosureSeeds(jp.rankRefs)
-		mw.rankRefs = jp.rankRefs
+		mw.ms = &matchScope{ctx: c, job: jp.vals, inline: c.inline, intern: c.intern}
+		if !jp.rankOpaque {
+			mw.closureSeeds = buildClosureSeeds(jp.rankRefs)
+			mw.rankRefs = jp.rankRefs
+			mw.deps = jp.deps
+		}
 	}
 	return mw
 }

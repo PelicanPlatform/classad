@@ -1,6 +1,7 @@
 package classad
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -554,5 +555,22 @@ func TestElvisOperatorHTCondorExample(t *testing.T) {
 	expected2 := NewIntValue(7)
 	if !elvisValuesEqual(result2, expected2) {
 		t.Errorf("HTCondor example with foo defined: got %v, want %v", result2, expected2)
+	}
+}
+
+// TestFoldConstantsElvisKeepsUnknownLeft: folding `x ?: y` to y is only valid when x is
+// the undefined literal. A reference the folder cannot resolve (an attribute of another
+// ad, a TARGET reference) must stay, or `(x ?: false) || y` folds to y and an index
+// planner drops every ad where x is true.
+func TestFoldConstantsElvisKeepsUnknownLeft(t *testing.T) {
+	for _, src := range []string{`(x ?: false) || y > 5`, `(TARGET.x ?: false) || y > 5`, `MY.x ?: 3`} {
+		e, err := ParseExpr(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		folded := FoldConstants(e.internal()).String()
+		if !strings.Contains(strings.ToLower(folded), "x ?:") {
+			t.Errorf("FoldConstants(%s) = %s, dropped the elvis left operand", src, folded)
+		}
 	}
 }
