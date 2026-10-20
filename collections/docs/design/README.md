@@ -798,6 +798,14 @@ handle a store that may be damaged:
 - **`Repair(dir, opts)`** moves damaged originals to `<Dir>/quarantine/` and drops
   stale `.idx` and `dir.snap` files, so the next open rebuilds them. It never deletes
   the only copy of data.
+  - It **leaves columnarized segments alone** and reports them. Dropping a damaged
+    record means packing the survivors together, which moves their offsets. The columnar
+    payload maps rows to records by offset, so a packed segment would serve other keys'
+    values. A byte-level tool cannot rewrite the payload's blocks, dictionaries and
+    offset map consistently.
+  - It also leaves segments with an unsupported payload version alone.
+  - At read time, a columnarized record with no row in the payload fails and is counted
+    (`ColNativeRowMisses`); it is never returned as a short ad.
 
 
 ## 9. Columnar segments
@@ -1833,6 +1841,12 @@ always has the last word.
     a literal and the result is boolean false — the full decode and match are skipped.
   - Any uncertainty falls through to the full match: an undefined, a non-literal
     attribute, or a non-native `Requirements`.
+  - The job's own attributes are precomputed once per match only if they **cannot
+    depend on the slot**. An attribute can depend on the slot if it reads `TARGET.x`,
+    reads an unscoped name the job does not define (matchmaking resolves it in the
+    slot), or reads such an attribute transitively, or uses `eval()`. The resolver falls
+    back to the full match for any slot-dependent attribute, because evaluating it
+    without a target would freeze it at UNDEFINED or ERROR.
   - For survivors whose job side is already known true, only the slot side is evaluated
     (`matchOneLeftKnown`).
   - On a 40k-slot pool with half the slots rejected, this takes serial matching from
@@ -1840,8 +1854,11 @@ always has the last word.
 - **Index candidate pre-filter (A2).** When the slots are indexed and the job is
   selective, it is better not to *visit* a non-candidate at all.
   - The job's `Requirements` is rewritten into a predicate *over the slot*:
-    `TARGET.attr` becomes the slot's own attribute, and every job reference is baked to
-    its evaluated constant.
+    `TARGET.attr` becomes the slot's own attribute, and every job reference that cannot
+    depend on the slot is baked to its evaluated constant. A slot-dependent job
+    reference is left opaque rather than baked to `undefined`. Constant folding would
+    otherwise reason about the wrong value, for example folding `=!= undefined` to false,
+    and drop candidates.
   - Undefined-guarded terms get `isnt undefined` exception disjuncts, so a slot missing
     the attribute is still a candidate when the job's expression would tolerate that.
   - Pure functions of low-cardinality categorical attributes are **materialized** into
