@@ -42,6 +42,11 @@ type OpenIndexDiag struct {
 	// Fsck, which reports the same files with the reason spelled out.
 	IgnoredFiles []string
 
+	// DamageStops lists, up to openDamageStopMax, segments whose recovery walk stopped at a
+	// damaged record with records that verify after it. Those records are not loaded (see
+	// RecordsPastDamage). Empty on a healthy store; Fsck reports the same damage.
+	DamageStops []OpenDamageStop
+
 	// Timing breaks a persistent Open into its phases so a slow reopen names the phase that
 	// dominated, instead of surfacing only as one elapsed number. Durations accumulate across the
 	// collection's shards; all zero for an in-memory Open. See OpenTiming. Purely observational.
@@ -127,4 +132,32 @@ func (d *OpenIndexDiag) ignoreFile(path string) {
 		return
 	}
 	d.IgnoredFiles = append(d.IgnoredFiles, path)
+}
+
+// OpenDamageStop is one segment whose recovery walk stopped at damage in the middle.
+type OpenDamageStop struct {
+	Path   string // the segment file
+	Offset int    // where the walk stopped: the first record that failed its checksum
+	// Records is how many keyed records after Offset verify and were not loaded, and Damaged
+	// how many keyed records from Offset on frame but fail their checksum (at least the one at
+	// Offset, unless that is the dictionary or payload). Records inside damage whose framing is
+	// lost cannot be counted.
+	Records int
+	Damaged int
+	// Dictionary is set when the segment's attribute dictionary is among them. Every record of
+	// the segment is keyed by it, so the records before Offset fail to read too.
+	Dictionary bool
+	// ColumnarPayload is set when the segment's columnar payload is among them. The records
+	// before Offset are remnants that need it, so they fail to read too.
+	ColumnarPayload bool
+}
+
+// openDamageStopMax bounds DamageStops.
+const openDamageStopMax = 32
+
+func (d *OpenIndexDiag) notePastDamage(s OpenDamageStop) {
+	if d == nil || len(d.DamageStops) >= openDamageStopMax {
+		return
+	}
+	d.DamageStops = append(d.DamageStops, s)
 }

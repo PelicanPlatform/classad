@@ -174,6 +174,11 @@ type segment struct {
 	// records are then missing the attributes that payload held, so reads must fail rather than
 	// return short ads.
 	colDamaged atomic.Bool
+	// dictUnusable is set when this segment holds an attribute dictionary record that cannot be
+	// used: it failed its checksum, or recovery stopped at damage before reaching it. Every record
+	// in the segment is keyed by that dictionary, so reads fail rather than resolve ids through
+	// bytes nothing vouches for (a flipped bit in a name renames that attribute in every ad).
+	dictUnusable atomic.Bool
 
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned
@@ -736,6 +741,15 @@ func recMarkerMillis(b []byte, off uint32) uint64 {
 // record walks skip it; recovery uses recIsDict to publish the segment's dict instead.
 func recIsDict(b []byte, off uint32) bool {
 	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&dictFlag != 0
+}
+
+// recMayBeDict reports whether a record that failed its checksum may be the segment's dictionary
+// record. Its flags field is suspect, so this asks for dictFlag and one corroborating header field: a
+// dictionary record also carries markerFlag and is written with sequence 0, which a keyed record
+// never is. A dictionary with one damaged bit still passes; a keyed record whose dictFlag bit flipped
+// does not.
+func recMayBeDict(b []byte, off uint32) bool {
+	return recIsDict(b, off) && (recIsMarker(b, off) || recSeq(b, off) == 0)
 }
 
 // recIsCol reports whether the record is the segment's columnar payload.

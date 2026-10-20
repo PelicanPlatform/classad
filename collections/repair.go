@@ -8,7 +8,7 @@ package collections
 // valid record after it. Repair copies the good records into a fresh segment file, so
 // what follows the damage comes back.
 //
-// Five rules it does not break:
+// Six rules it does not break:
 //
 //   - The original is never destroyed. It moves to quarantine/, because an operator
 //     who disagrees with what repair kept needs the bytes to argue with. Deleting a
@@ -31,6 +31,10 @@ package collections
 //     so each one would read a neighbour's row (or none); keeping the offsets valid
 //     means removing the dropped records' rows from every column, which is a rewrite
 //     of the payload that this byte-level tool does not attempt.
+//   - A segment whose attribute dictionary record is damaged is left exactly as it is.
+//     Every record of an interned segment is keyed by that dictionary, so a rewrite
+//     that drops it keeps records nothing can decode; leaving the original keeps the
+//     bytes a better tool could still recover the names from.
 
 import (
 	"errors"
@@ -83,6 +87,9 @@ type RepairReport struct {
 	// (FsckSegment.Columnarized). Their damage remains as Fsck reports it. They are not
 	// counted in Untouched.
 	Columnarized []string
+	// DictDamaged lists damaged segments left alone because their attribute dictionary
+	// record is damaged (FsckSegment.DictDamaged). They are not counted in Untouched.
+	DictDamaged []string
 }
 
 // Totals sums the records kept and dropped across every rewritten segment.
@@ -110,6 +117,10 @@ func (r *RepairReport) String() string {
 	for _, p := range r.Columnarized {
 		fmt.Fprintf(&b, "  LEFT ALONE %s: damaged, but columnarized; its records cannot move without "+
 			"rewriting its columnar payload, which repair does not do\n", filepath.Base(p))
+	}
+	for _, p := range r.DictDamaged {
+		fmt.Fprintf(&b, "  LEFT ALONE %s: its attribute dictionary record is damaged, and every record "+
+			"in it needs that dictionary; a rewrite without it could not be read\n", filepath.Base(p))
 	}
 	if len(r.Segments) == 0 {
 		fmt.Fprintf(&b, "  nothing to do (%d segment(s) need no repair)\n", r.Untouched)
@@ -151,6 +162,10 @@ func Repair(dir string, opts RepairOptions) (*RepairReport, error) {
 			rep.Columnarized = append(rep.Columnarized, seg.Path)
 			continue
 		}
+		if errors.Is(err, errRepairDictDamaged) {
+			rep.DictDamaged = append(rep.DictDamaged, seg.Path)
+			continue
+		}
 		if err != nil {
 			return rep, fmt.Errorf("repairing %s: %w", seg.Path, err)
 		}
@@ -166,6 +181,9 @@ func Repair(dir string, opts RepairOptions) (*RepairReport, error) {
 // already handles it exactly right by stopping there. Rewriting would churn the file
 // for no gain.
 func segmentNeedsRepair(s FsckSegment) bool {
+	if s.ColumnarMismatch != "" {
+		return true // not rewritable (it is columnarized), but listed so the report names it
+	}
 	for _, d := range s.Damage {
 		if !d.Trailing {
 			return true
@@ -177,14 +195,27 @@ func segmentNeedsRepair(s FsckSegment) bool {
 // errRepairColumnarized is repairSegment refusing a columnarized segment.
 var errRepairColumnarized = errors.New("collections: repair does not rewrite a columnarized segment")
 
+// errRepairDictDamaged is repairSegment refusing a segment whose dictionary record is damaged.
+var errRepairDictDamaged = errors.New("collections: repair does not rewrite a segment whose dictionary record is damaged")
+
 // repairSegment rewrites one segment file, keeping the records that verify. It returns
 // errRepairColumnarized, having written nothing, for a segment holding any record that
-// carries the columnar flag.
+// carries the columnar flag, and errRepairDictDamaged for one whose attribute
+// dictionary record does not verify.
 func repairSegment(path string, opts RepairOptions) (*RepairSegment, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	// The sidecar, when it has one, records where the dictionary record is, so a segment
+	// whose dictionary does not survive is refused even when the damage hid its flags or
+	// its framing. Only a sidecar whose extent fits the segment is believed, as Open
+	// believes it.
+	extent, dictRec := readSidecarTrailer(path + ".idx")
+	if extent <= 0 || extent > len(data) || !recExtentEndsCleanly(data, extent) {
+		dictRec = 0
+	}
+	keptDict := false
 	out := &RepairSegment{Path: path, BytesBefore: len(data)}
 
 	// Collect the good records in order. Records are copied verbatim: their bytes
@@ -200,10 +231,15 @@ func repairSegment(path string, opts RepairOptions) (*RepairSegment, error) {
 			return nil, errRepairColumnarized
 		}
 		if framed && recVerifyCRC(data, uint32(off)) {
+			keptDict = keptDict || recIsDict(data, uint32(off))
 			kept = append(kept, data[off:off+total]...)
 			out.RecordsKept++
 			off += total
 			continue
+		}
+		// Dropping the dictionary would leave every record that survives undecodable.
+		if recMayBeDict(data, uint32(off)) {
+			return nil, errRepairDictDamaged
 		}
 		if framed {
 			out.RecordsDropped++
@@ -216,6 +252,9 @@ func repairSegment(path string, opts RepairOptions) (*RepairSegment, error) {
 		}
 		out.RecordsDropped++ // at least one; the framing is gone so the count is a floor
 		off = next
+	}
+	if dictRec > 0 && !keptDict {
+		return nil, errRepairDictDamaged // the sidecar names a dictionary no verified record holds
 	}
 	// Keep the file its original size. A segment is preallocated and mmapped at that
 	// size, and the active one is still appended to; the walk stops at the first zero

@@ -1012,6 +1012,7 @@ func (c *Collection) getAs(key []byte, redact bool) (*classad.ClassAd, bool) {
 	if ad == nil || redact {
 		var err error
 		if ad, err = c.decodeAdDictAs(dict, stored, codec, redact); err != nil {
+			noteReadSkip(err)
 			return nil, false
 		}
 	}
@@ -1366,7 +1367,7 @@ func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit f
 		// carry only what the schema does not cover.
 		w, err := c.wireAt(r, s0, dbuf)
 		if err != nil {
-			return true // skip a record we cannot decode rather than abort the scan
+			return true // skip a record we cannot decode rather than abort the scan; wireAt counted it
 		}
 		qp.stats.reassembled() // the record was rebuilt from the arena (~O(ad width))
 		dbuf = w               // retain the (possibly grown) backing for the next ad
@@ -1455,6 +1456,7 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 		}
 		w, err := codec.Decompress(dbuf[:0], ad)
 		if err != nil {
+			noteReadSkip(err)
 			return true
 		}
 		dbuf = w
@@ -1472,6 +1474,7 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 		}
 		a, err := c.decodeWireDictAs(dict, w, redact)
 		if err != nil {
+			noteReadSkip(err)
 			return true
 		}
 		child := classad.FromAST(a)
@@ -1509,6 +1512,7 @@ func (c *Collection) yieldAdAs(yield func(*classad.ClassAd) bool, redact bool) s
 	return func(w []byte, dict *segDictHandle) bool {
 		a, err := c.decodeWireDictAs(dict, w, redact)
 		if err != nil {
+			noteReadSkip(err)
 			return true // skip malformed record, keep scanning
 		}
 		return yield(classad.FromAST(a))

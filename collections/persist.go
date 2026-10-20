@@ -537,15 +537,16 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			recExtentEndsCleanly(seg.data, rec) {
 			used = rec
 		} else {
-			for used+recHeaderSize <= len(seg.data) {
-				total := int(recTotalLen(seg.data, uint32(used)))
-				if total <= 0 || used+total > len(seg.data) {
-					break // unwritten (zero) tail or an impossible length
+			var crcStop bool
+			used, crcStop = recoveryExtent(seg.data)
+			// A torn tail has nothing after it. Records that verify past the stop are damage in
+			// the middle, and they are not loaded: say so, rather than come back short in silence.
+			if crcStop {
+				if past := surveyPastDamage(seg.data, used); past.Records > 0 || past.Dictionary || past.ColumnarPayload {
+					past.Path, past.Offset = seg.path, used
+					c.openIdxDiag.notePastDamage(past)
+					recordsPastDamage.Add(int64(past.Records + past.Damaged))
 				}
-				if !recVerifyCRC(seg.data, uint32(used)) {
-					break // torn/partial record: the durable data ends here
-				}
-				used += total
 			}
 		}
 		seg.used = used
@@ -618,6 +619,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	for _, seg := range sh.segs {
 		if seg != nil {
 			publishSegDictAt(seg, segDictHint[seg])
+			markSegDictNeed(seg)
 		}
 	}
 	tm.PublishDict = time.Since(dictStart)
@@ -944,6 +946,81 @@ func (c *Collection) Close() error {
 	// blocks of a compacted or truncated segment age out.
 	return firstErr
 }
+
+// recoveryExtent walks a segment from the start the way recovery does when no trusted extent is
+// recorded, returning where the written data ends. The walk stops at an unwritten (zero) or
+// impossible length, or at the first record that fails its checksum, which crcStop reports.
+func recoveryExtent(data []byte) (used int, crcStop bool) {
+	for used+recHeaderSize <= len(data) {
+		total := int(recTotalLen(data, uint32(used)))
+		if total <= 0 || used+total > len(data) {
+			return used, false // unwritten (zero) tail or an impossible length
+		}
+		if !recVerifyCRC(data, uint32(used)) {
+			return used, true // torn/partial record: the durable data ends here
+		}
+		used += total
+	}
+	return used, false
+}
+
+// surveyPastDamage reports what a recovery walk that stopped at from leaves unloaded: the keyed
+// records that verify after it, the keyed records that frame but fail their checksum, and whether
+// the segment's dictionary or columnar payload is among them. It steps over records whose framing
+// holds and resyncs past those whose framing does not, as Fsck does. Path and Offset are left to
+// the caller. It runs only when the walk stopped on a checksum, so a clean open pays nothing for it.
+func surveyPastDamage(data []byte, from int) OpenDamageStop {
+	var out OpenDamageStop
+	for off := from; off+recHeaderSize <= len(data); {
+		total := int(recTotalLen(data, uint32(off)))
+		framed := total > 0 && total%8 == 0 && off+total <= len(data)
+		if framed && recVerifyCRC(data, uint32(off)) {
+			switch {
+			case recIsDict(data, uint32(off)):
+				out.Dictionary = true
+			case recIsCol(data, uint32(off)) && recIsMarker(data, uint32(off)):
+				out.ColumnarPayload = true
+			case !recIsMarker(data, uint32(off)):
+				out.Records++
+			}
+			off += total
+			continue
+		}
+		if framed {
+			// Unverified, so its flags may be wrong; at worst a record is reported as the
+			// dictionary or payload it is not, and its segment's reads fail instead of decoding.
+			switch {
+			case recMayBeDict(data, uint32(off)):
+				out.Dictionary = true
+			case recIsCol(data, uint32(off)) && recIsMarker(data, uint32(off)):
+				out.ColumnarPayload = true
+			case !recIsMarker(data, uint32(off)):
+				out.Damaged++
+			}
+			off += total
+			continue
+		}
+		next := repairResync(data, off)
+		if next < 0 {
+			break
+		}
+		off = next
+	}
+	return out
+}
+
+// recordsPastDamage counts records not loaded because recovery stopped at damage at or before them.
+var recordsPastDamage atomic.Int64
+
+// RecordsPastDamage reports how many keyed records, since the process started, were not loaded
+// because Open's recovery walk stopped at damage in the middle of their segment: the records that
+// verify after the stop, plus the damaged ones that still frame (the record the walk stopped at
+// among them). It counts only stops with something readable after them. Recovery walks a
+// segment whose sidecar does not supply a trusted extent and stops at the first record that fails
+// its checksum; that is right for a torn tail and drops everything after damage in the middle.
+// OpenIndexDiag.DamageStops names the segments. Fsck reports the damage, and Repair recovers the
+// records of a segment it may rewrite.
+func RecordsPastDamage() int64 { return recordsPastDamage.Load() }
 
 // recExtentEndsCleanly sanity-checks a recorded extent in O(1): it must be record-aligned,
 // fit the mapping, and point at the end of written data -- either the end of the arena, or a
