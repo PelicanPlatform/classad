@@ -305,9 +305,8 @@ func TestBigIntPathsAgreeArchive(t *testing.T) {
 		{"indexed", ArchiveOptions{ValueAttrs: []string{"N"}, CategoricalAttrs: []string{"G"}}},
 		{"zoned", ArchiveOptions{ZoneAttrs: []string{"N"}, CategoricalAttrs: []string{"G"}}},
 	} {
-		// Sequential, not parallel: Collection.Close closes the process-wide archive block cache,
-		// so one subtest closing its archive while the other queries can panic in the cache.
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			opts := tc.opts
 			opts.Dir, opts.SegmentSize = t.TempDir(), 16<<10
 			a, err := OpenArchive(opts)

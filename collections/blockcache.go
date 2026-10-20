@@ -150,6 +150,9 @@ func (s *sharedBlockCacheSlot) get(def int64) *blockCache {
 	return s.bc
 }
 
+// globalBlockCaches are never closed. Collections open and close independently while others of
+// the same kind keep reading, and a closed ristretto cache panics a concurrent Set ("send on closed
+// channel") and then misses every lookup for the rest of the process.
 var globalBlockCaches [numBlockCacheKinds]sharedBlockCacheSlot
 
 // SetMutatingBlockCacheBudget and SetArchiveBlockCacheBudget set the process-global shared
@@ -232,11 +235,4 @@ func (bc *blockCache) streams(b *columnarBlock) (*decodedStreams, error) {
 		return nil, err
 	}
 	return &decodedStreams{coldNum: coldNum, str: str, cold: cold}, nil
-}
-
-// close releases the cache's resources.
-func (bc *blockCache) close() {
-	if bc != nil && bc.c != nil {
-		bc.c.Close()
-	}
 }

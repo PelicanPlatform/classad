@@ -22,7 +22,7 @@ func TestBlockCacheRejectsOversizedRegion(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer bc.close()
+	defer bc.c.Close()
 
 	codec, err := NewZSTDCodec(nil)
 	if err != nil {
