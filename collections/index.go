@@ -388,6 +388,8 @@ func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segI
 		if w, err := c.recordWireIn(seg, data, o, buf); err == nil {
 			buf = w
 			si.indexRecord(o, wire.Ad(w), spec, dict)
+		} else if !recIsMarker(data, o) {
+			noteReadSkip(err) // left out of the postings: a query served by them will not find it
 		}
 		off += int(total)
 	}

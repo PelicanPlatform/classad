@@ -97,9 +97,21 @@ func (c *Collection) wire(r recRef, buf []byte) ([]byte, error) {
 // are the two places the package already reassembles a partial record (the columnar case), and
 // teaching readers one at a time is how roughly ten of them ended up serving fragments.
 // Callers that genuinely have no snapshot pass seqMax and get the current version.
+//
+// Every failure is counted by reason (RecordReadSkips): the callers skip the record, so the count is
+// the only trace that an answer came back short.
 func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
-	if c.recordFailsCRC(r.w.seg, r.w.data, r.off) {
-		return nil, errRecordCRC
+	w, err := c.wireAtUncounted(r, s0, buf)
+	if err != nil {
+		noteReadSkip(err)
+	}
+	return w, err
+}
+
+// wireAtUncounted is wireAt without the count, so each failure is counted once, in wireAt.
+func (c *Collection) wireAtUncounted(r recRef, s0 uint64, buf []byte) ([]byte, error) {
+	if err := c.recordRefused(r.w.seg, r.w.data, r.off); err != nil {
+		return nil, err
 	}
 	var raw []byte
 	var err error
@@ -125,9 +137,25 @@ func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
 	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, buf[:0])
 	sh.mu.RUnlock()
 	if !ok {
-		return nil, errBadRemnant // a fragment we cannot complete: skip, never serve half an ad
+		return nil, errDeltaUnresolved // a fragment we cannot complete: skip, never serve half an ad
 	}
 	return merged, nil
+}
+
+// errDeltaUnresolved is a delta record whose chain could not be merged into a whole ad.
+var errDeltaUnresolved = errors.New("collections: delta record could not be merged into a whole ad")
+
+// recordRefused reports why a record must not be read at all, before any of its bytes are used:
+// errRecordCRC when verification is on and its checksum does not match, errSegDictUnusable when its
+// segment's attribute dictionary is unusable. nil otherwise.
+func (c *Collection) recordRefused(seg *segment, data []byte, off uint32) error {
+	if c.recordFailsCRC(seg, data, off) {
+		return errRecordCRC
+	}
+	if seg != nil && seg.dictUnusable.Load() {
+		return errSegDictUnusable
+	}
+	return nil
 }
 
 // forEachVisibleRef walks the frozen windows in append order and calls fn for each record visible
@@ -214,16 +242,28 @@ func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 //
 // scratch is reused across records; the returned bytes are valid only until the next call, which is
 // already the contract for the compressed case (the window's mapping outlives neither).
+//
+// A false return is counted by reason (RecordReadSkips), since every caller skips the record.
 func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Codec, bool) {
-	seg := r.w.seg
-	if c.recordFailsCRC(seg, r.w.data, r.off) {
+	ad, codec, err := c.adBytesErr(r, s0, scratch)
+	if err != nil {
+		noteReadSkip(err)
 		return nil, nil, false
+	}
+	return ad, codec, true
+}
+
+// adBytesErr is adBytes reporting why a record could not be presented.
+func (c *Collection) adBytesErr(r recRef, s0 uint64, scratch *[]byte) ([]byte, Codec, error) {
+	seg := r.w.seg
+	if err := c.recordRefused(seg, r.w.data, r.off); err != nil {
+		return nil, nil, err
 	}
 	stored, codec := r.stored(), r.w.codec
 	if seg != nil && (seg.columnarized() || seg.colDamaged.Load() || recIsStripped(r.w.data, r.off)) {
 		full, err := c.recordWireIn(seg, r.w.data, r.off, *scratch)
 		if err != nil {
-			return nil, nil, false // skip a record we cannot reassemble rather than serve half of it
+			return nil, nil, err // skip a record we cannot reassemble rather than serve half of it
 		}
 		*scratch = full
 		stored, codec = full, identityCodec{}
@@ -242,11 +282,11 @@ func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Code
 	// of a store of whole ads paid a decompression and a full-ad memcpy per record for a feature
 	// none of its records used.
 	if !c.deltaRead {
-		return stored, codec, true
+		return stored, codec, nil
 	}
 	if deltaHdrDispatch {
 		if !recIsDelta(r.w.data, r.off) {
-			return stored, codec, true
+			return stored, codec, nil
 		}
 	} else {
 		// The pre-header dispatch (see deltaHdrDispatch), reproduced exactly so the A/B compares
@@ -254,11 +294,11 @@ func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Code
 		// through the identity codec when the record turns out to be an ordinary one.
 		raw, err := codec.Decompress((*scratch)[:0], stored)
 		if err != nil {
-			return nil, nil, false
+			return nil, nil, err
 		}
 		*scratch = raw
 		if !isDeltaRecord(raw) {
-			return raw, identityCodec{}, true
+			return raw, identityCodec{}, nil
 		}
 	}
 	key := r.key()
@@ -268,10 +308,10 @@ func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Code
 	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, (*scratch)[:0])
 	sh.mu.RUnlock()
 	if !ok {
-		return nil, nil, false
+		return nil, nil, errDeltaUnresolved
 	}
 	*scratch = merged
-	return merged, identityCodec{}, true
+	return merged, identityCodec{}, nil
 }
 
 // segStoredOrReassembled returns a record's bytes and the codec that decodes them, for the
@@ -299,13 +339,19 @@ func segStoredOrReassembledWhy(c *Collection, seg *segment, off uint32) ([]byte,
 	// bit flip inside an encoded ad comes back as a plausible wrong value. Checking here
 	// turns that into a miss. On by default; see Options.DisableReadVerification.
 	if c != nil && c.verifyReads && seg.persistent && !recVerifyCRC(seg.data, off) {
+		noteReadSkip(errRecordCRC)
 		return nil, nil, false, failRecordCRC
+	}
+	if seg.dictUnusable.Load() {
+		noteReadSkip(errSegDictUnusable)
+		return nil, nil, false, failDecode
 	}
 	if !(seg.columnarized() || seg.colDamaged.Load() || recIsStripped(seg.data, off)) {
 		return recAd(seg.data, off), seg.codec, true, failNone
 	}
 	full, err := c.recordWireIn(seg, seg.data, off, nil)
 	if err != nil {
+		noteReadSkip(err)
 		return nil, nil, false, failReassemble
 	}
 	return full, identityCodec{}, true, failNone

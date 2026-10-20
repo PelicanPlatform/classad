@@ -1,6 +1,9 @@
 package collections
 
-import "sync/atomic"
+import (
+	"errors"
+	"sync/atomic"
+)
 
 // readFail names WHY a stored record could not be read. A read that misses returns a bare
 // false, which collapses five unrelated conditions into one answer -- and on a production
@@ -161,6 +164,101 @@ func UnreadableBaseReasons() map[string]int64 {
 	out := make(map[string]int64, len(unreadableByReason))
 	for r := failNone; r < failMax; r++ {
 		if n := unreadableByReason[r].Load(); n != 0 {
+			out[r.String()] = n
+		}
+	}
+	return out
+}
+
+// readSkip names why a record read returned nothing. A scan skips such a record rather than fail
+// the query, and a point read reports the key as not found; either way the answer is short, and
+// this is the only place that says so.
+type readSkip uint8
+
+const (
+	skipRecordCRC       readSkip = iota // the record's own checksum did not match its bytes
+	skipDictUnusable                    // the segment's attribute dictionary failed its checksum or was not recovered
+	skipColMissing                      // a remnant whose segment has no columnar payload
+	skipColDamaged                      // a record in a segment whose columnar payload was refused
+	skipColRowMissing                   // a remnant the segment's columnar payload has no row for
+	skipReassemble                      // a remnant and its columnar row would not rejoin
+	skipDeltaUnresolved                 // a delta record whose chain could not be merged
+	skipDecode                          // the bytes would not decompress or decode
+	skipMax                             // not a reason; bounds the counter array
+)
+
+func (r readSkip) String() string {
+	switch r {
+	case skipRecordCRC:
+		return "record-crc"
+	case skipDictUnusable:
+		return "dict-unusable"
+	case skipColMissing:
+		return "col-missing"
+	case skipColDamaged:
+		return "col-damaged"
+	case skipColRowMissing:
+		return "col-row-missing"
+	case skipReassemble:
+		return "reassemble"
+	case skipDeltaUnresolved:
+		return "delta-unresolved"
+	case skipDecode:
+		return "decode"
+	}
+	return "unknown"
+}
+
+// readSkips counts record reads that returned nothing, indexed by readSkip.
+var readSkips [skipMax]atomic.Int64
+
+// noteReadSkip counts one record read that returned nothing because of err. Called only on the
+// failure path.
+func noteReadSkip(err error) { readSkips[readSkipOf(err)].Add(1) }
+
+// readSkipOf classifies a record-read error.
+func readSkipOf(err error) readSkip {
+	switch {
+	case errors.Is(err, errRecordCRC):
+		return skipRecordCRC
+	case errors.Is(err, errSegDictUnusable):
+		return skipDictUnusable
+	case errors.Is(err, errColMissing):
+		return skipColMissing
+	case errors.Is(err, errColDamaged):
+		return skipColDamaged
+	case errors.Is(err, errColRowMissing):
+		return skipColRowMissing
+	case errors.Is(err, errBadRemnant):
+		return skipReassemble
+	case errors.Is(err, errDeltaUnresolved):
+		return skipDeltaUnresolved
+	}
+	return skipDecode
+}
+
+// RecordReadSkipReasonNames lists every reason RecordReadSkips can report, including those at zero.
+func RecordReadSkipReasonNames() []string {
+	out := make([]string, 0, skipMax)
+	for r := readSkip(0); r < skipMax; r++ {
+		out = append(out, r.String())
+	}
+	return out
+}
+
+// RecordReadSkips reports, by reason, how many record reads since the process started returned
+// nothing because the stored record could not be turned into a whole ad. Only nonzero reasons are
+// present.
+//
+// Such a record is not an error to the caller: a scan or query skips it and carries on, and a point
+// read reports the key as not found. A nonzero count therefore means some answers were short, which
+// nothing in the answers themselves shows; Fsck is what says where. Each count is of reads, not
+// records: a record two scans skip counts twice. VerifyReadSkips still counts the "record-crc"
+// refusals of scans on its own.
+func RecordReadSkips() map[string]int64 {
+	out := make(map[string]int64, skipMax)
+	for r := readSkip(0); r < skipMax; r++ {
+		if n := readSkips[r].Load(); n != 0 {
 			out[r.String()] = n
 		}
 	}

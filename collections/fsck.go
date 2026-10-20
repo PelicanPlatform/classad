@@ -91,6 +91,29 @@ type FsckSegment struct {
 	// payload maps each row to its record by arena offset, so its records cannot
 	// move, and Repair leaves it alone.
 	Columnarized bool
+	// ColumnarMismatch says how a verified columnar payload fails to describe this
+	// segment's records, or is "" when it describes them or there is none to check. The
+	// payload names each row's record by arena offset, so every row must name the start
+	// of a keyed record and every keyed record must have a row. A segment whose records
+	// were packed under an unchanged payload (by a Repair before columnarized segments
+	// were left alone) fails this, and its reads would return other records' values; Open
+	// refuses such a payload (ColNativeOffsetMismatches) when its ends do not fit. Rows
+	// inside damage are not counted against it. The original is in quarantine/.
+	ColumnarMismatch string
+	// ColumnarMismatchRows counts the rows naming no keyed record plus the keyed records
+	// no row names.
+	ColumnarMismatchRows int
+	// DictDamaged is true when the segment's attribute dictionary record failed its
+	// checksum. Every record of an interned segment is keyed by it, so none can be read:
+	// Open refuses the dictionary (SegDictCRCFailures), and Repair leaves the segment
+	// alone rather than write one without it.
+	DictDamaged bool
+	// OpenStop is set when a normal open's recovery walk stops at damage in this segment
+	// with something readable after it: the sidecar supplies no trusted extent, so Open
+	// walks the records and stops at the first one that fails its checksum. What follows
+	// is not loaded. When the dictionary or columnar payload is among it, the records
+	// before the stop are unreadable too.
+	OpenStop *OpenDamageStop
 }
 
 // FsckSupersede is a record whose supersededBySeq cannot be true.
@@ -165,13 +188,29 @@ func (r *FsckReport) String() string {
 	rec, runs, lost := r.Totals()
 	fmt.Fprintf(&b, "fsck %s\n", r.Dir)
 	fmt.Fprintf(&b, "  %d segment(s), %d record(s) readable\n", len(r.Segments), rec)
-	if runs == 0 {
-		b.WriteString("  no damage found\n")
-	} else {
+	mismatched, dictDamaged := 0, 0
+	for i := range r.Segments {
+		if r.Segments[i].ColumnarMismatch != "" {
+			mismatched++
+		}
+		if r.Segments[i].DictDamaged {
+			dictDamaged++
+		}
+	}
+	switch {
+	case runs > 0:
 		fmt.Fprintf(&b, "  %d damaged run(s), %d record(s) unreadable\n", runs, lost)
+	case mismatched == 0 && dictDamaged == 0:
+		b.WriteString("  no damage found\n")
+	}
+	if mismatched > 0 {
+		fmt.Fprintf(&b, "  %d segment(s) whose columnar payload does not match its records\n", mismatched)
+	}
+	if dictDamaged > 0 {
+		fmt.Fprintf(&b, "  %d segment(s) with a damaged attribute dictionary\n", dictDamaged)
 	}
 	for _, s := range r.Segments {
-		if len(s.Damage) == 0 && s.Sidecar == "ok" && !s.ColumnarUnsupported {
+		if len(s.Damage) == 0 && s.Sidecar == "ok" && !s.ColumnarUnsupported && s.ColumnarMismatch == "" {
 			continue
 		}
 		fmt.Fprintf(&b, "  %s: %d records, sidecar %s\n", filepath.Base(s.Path), s.Records, s.Sidecar)
@@ -192,12 +231,32 @@ func (r *FsckReport) String() string {
 			fmt.Fprintf(&b, "    %s at %d (+%d bytes, %s, %s)\n",
 				kind, d.Offset, d.Length, count, d.Reason)
 		}
+		if s.ColumnarMismatch != "" {
+			fmt.Fprintf(&b, "    COLUMNAR PAYLOAD DOES NOT MATCH ITS RECORDS (%d row(s) or record(s)): %s; "+
+				"read through it, records would return other records' values; if a repair rewrote "+
+				"this segment, the original is in %s/\n", s.ColumnarMismatchRows, s.ColumnarMismatch, quarantineDir)
+		}
+		if s.DictDamaged {
+			b.WriteString("    DICTIONARY DAMAGED: every record of this segment is keyed by its attribute " +
+				"dictionary, so none can be read; repair leaves this segment alone\n")
+		}
 		if s.Columnarized && segmentNeedsRepair(s) {
 			b.WriteString("    columnarized: repair leaves this segment alone; its records cannot move " +
 				"without rewriting its columnar payload\n")
 		}
 		if s.ExtentTrusted && len(s.Damage) > 0 {
 			b.WriteString("    note: inside the sidecar's trusted extent -- a normal open will not notice\n")
+		}
+		if st := s.OpenStop; st != nil {
+			fmt.Fprintf(&b, "    note: no trusted extent, so a normal open stops at %d and does not load "+
+				"the %d readable record(s) after it", st.Offset, st.Records)
+			switch {
+			case st.Dictionary:
+				b.WriteString("; the attribute dictionary is past it too, so the records before it cannot be read either")
+			case st.ColumnarPayload:
+				b.WriteString("; the columnar payload is past it too, so the records before it cannot be read either")
+			}
+			b.WriteString("\n")
 		}
 	}
 	if n := len(r.Supersede); n > 0 {
@@ -383,10 +442,16 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 
 	// Report the sidecar's state, and whether Open would trust its extent -- damage
 	// inside a trusted extent is damage a normal open will not see.
-	if extent, _ := readSidecarTrailer(path + ".idx"); extent > 0 {
+	// A trusted sidecar also records where the dictionary record is, which names a damaged
+	// dictionary even when the damage cleared its flag.
+	dictAt := -1
+	if extent, dictRec := readSidecarTrailer(path + ".idx"); extent > 0 {
 		s.Sidecar = "ok"
 		if extent <= len(data) && recExtentEndsCleanly(data, extent) {
 			s.ExtentTrusted = true
+			if dictRec > 0 {
+				dictAt = int(dictRec)
+			}
 		} else {
 			s.Sidecar = "extent does not match the segment; recovery will rewalk"
 		}
@@ -401,6 +466,11 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 	// the rest of the file. Only when the framing itself is unusable do we fall back to
 	// scanning for the next offset that verifies.
 	var run *FsckDamage
+	// starts records each framed record's start for the columnar offset check: true for a
+	// keyed record that verified, false for a record that did not.
+	starts := map[int]bool{}
+	payloadAt, dictBadAt := -1, -1
+	dictVerified := false
 	for off := 0; off+recHeaderSize <= len(data); {
 		total := int(recTotalLen(data, uint32(off)))
 		framed := total > 0 && total%8 == 0 && off+total <= len(data)
@@ -412,10 +482,25 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 			noteSupersede(s, data, off)
 			noteColPayload(s, data, off)
 			s.Columnarized = s.Columnarized || recIsCol(data, uint32(off))
+			if recIsCol(data, uint32(off)) && recIsMarker(data, uint32(off)) {
+				payloadAt = off
+			}
+			dictVerified = dictVerified || recIsDict(data, uint32(off))
+			if !recIsMarker(data, uint32(off)) {
+				starts[off] = true
+			}
 			off += total
 			continue
 		}
+		// A record that does not verify, whether or not it frames, may be the dictionary.
+		// Its header failed the CRC, so recMayBeDict asks for corroboration; a false positive
+		// only keeps Repair from rewriting the segment.
+		if recMayBeDict(data, uint32(off)) || off == dictAt {
+			s.DictDamaged = true
+			dictBadAt = off
+		}
 		if framed {
+			starts[off] = false
 			// The flag is read from a record that failed its CRC, so it may be wrong; a
 			// false positive only keeps Repair from rewriting the segment.
 			s.Columnarized = s.Columnarized || recIsCol(data, uint32(off))
@@ -447,13 +532,116 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 	// a bad record followed by unwritten space -- so this treats the ambiguous case as
 	// the benign one. The cost of being wrong is one uncommitted record; the cost of
 	// the other choice is rewriting the active segment on every run forever.
+	//
+	// A dictionary record is the exception. It is written only when a segment is sealed,
+	// into a complete segment, so it is never what an interrupted append leaves behind --
+	// and every record of the segment needs it.
+	//
+	// The sidecar's dictionary offset also catches a dictionary the walk never reached
+	// as a record, lost inside damage whose framing was gone.
+	if dictAt >= 0 && !dictVerified && dictBadAt < 0 {
+		s.DictDamaged = true
+		dictBadAt = dictAt
+	}
 	if n := len(s.Damage); n > 0 {
 		last := &s.Damage[n-1]
-		if end := last.Offset + last.Length; end <= len(data) && allZero(data[end:]) {
+		end := last.Offset + last.Length
+		switch {
+		case dictBadAt >= last.Offset && dictBadAt < end:
+			last.Trailing = false
+		case end <= len(data) && allZero(data[end:]):
 			last.Trailing = true
 		}
 	}
+	if payloadAt >= 0 && !s.ColumnarUnsupported {
+		fsckColOffsets(s, data, payloadAt, starts)
+	}
+	// Where a normal open stops, when the sidecar does not hand it the extent.
+	if !s.ExtentTrusted {
+		if used, crcStop := recoveryExtent(data); crcStop {
+			if st := surveyPastDamage(data, used); st.Records > 0 || st.Dictionary || st.ColumnarPayload {
+				st.Path, st.Offset = path, used
+				s.OpenStop = &st
+			}
+		}
+	}
 	return s, nil
+}
+
+// fsckColOffsets checks a verified columnar payload's offset map against the records the walk
+// found: each row must name the start of a keyed record, in ascending order, and each keyed record
+// that verified must be named by a row. A row naming a record that did not verify, or a spot inside
+// a run whose framing was lost, is not held against the payload: the damage is already reported.
+//
+// Keyed rather than remnant: segments columnarized before remnants carried colFlag hold unmarked
+// remnants, which read correctly.
+func fsckColOffsets(s *FsckSegment, data []byte, payloadAt int, starts map[int]bool) {
+	cs, err := unmarshalColPayload(recAd(data, uint32(payloadAt)), identityCodec{}, fsckInterner())
+	if err != nil {
+		s.ColumnarMismatch = fmt.Sprintf("the payload at %d verifies but does not parse: %v", payloadAt, err)
+		s.ColumnarMismatchRows = 1
+		return
+	}
+	inLostFraming := func(o int) bool {
+		for _, d := range s.Damage {
+			if d.Reason == "framing" && o >= d.Offset && o < d.Offset+d.Length {
+				return true
+			}
+		}
+		return false
+	}
+	named := make(map[int]bool, cs.offsLen())
+	bad, first := 0, ""
+	note := func(why string) {
+		bad++
+		if first == "" {
+			first = why
+		}
+	}
+	prev := -1
+	for k := 0; k < cs.offsLen(); k++ {
+		o := int(cs.offAt(k))
+		named[o] = true
+		switch verified, ok := starts[o]; {
+		case o <= prev:
+			note(fmt.Sprintf("row %d names offset %d, not after row %d's %d", k, o, k-1, prev))
+		case ok && !verified:
+			// A damaged record: reported as damage already.
+		case ok:
+			// A keyed record that verified: the row is where it should be.
+		case inLostFraming(o):
+			// Inside damage whose records cannot be told apart.
+		case o+recHeaderSize <= len(data) && recIsMarker(data, uint32(o)):
+			note(fmt.Sprintf("row %d names offset %d, which is a marker, not a record", k, o))
+		default:
+			note(fmt.Sprintf("row %d names offset %d, which is not the start of a record", k, o))
+		}
+		prev = o
+	}
+	for o, verified := range starts {
+		if verified && !named[o] {
+			note(fmt.Sprintf("the record at %d (key %q) has no row", o, recKey(data, uint32(o))))
+		}
+	}
+	if bad > 0 {
+		s.ColumnarMismatch = first
+		s.ColumnarMismatchRows = bad
+	}
+}
+
+// fsckInterner returns an intern function for parsing a payload offline: the ids it assigns are
+// local to the parse, which is all the offset check needs.
+func fsckInterner() func(string) uint32 {
+	ids := map[string]uint32{}
+	return func(name string) uint32 {
+		k := strings.ToLower(name)
+		id, ok := ids[k]
+		if !ok {
+			id = uint32(len(ids))
+			ids[k] = id
+		}
+		return id
+	}
 }
 
 // noteColPayload records a verified columnar payload's format version. Only the

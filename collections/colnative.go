@@ -92,6 +92,11 @@ func publishColNative(c *Collection, seg *segment) error {
 	if seg == nil || seg.colNative.Load() != nil {
 		return nil
 	}
+	// An interned segment's payload is keyed through the segment's dictionary, so it is not published
+	// without one. Every record of the segment already fails on the dictionary (errSegDictUnusable).
+	if seg.dictUnusable.Load() {
+		return nil
+	}
 	for off := 0; off < seg.used; {
 		o := uint32(off)
 		total := recTotalLen(seg.data, o)
@@ -128,6 +133,16 @@ func publishColNative(c *Collection, seg *segment) error {
 			}
 			if err != nil {
 				colNativeCRCFailures.Add(1)
+				seg.colDamaged.Store(true)
+				return nil
+			}
+			// A payload that verifies can still describe records that are no longer where it says:
+			// a repair that packed the records of a columnarized segment moved every record after a
+			// dropped one onto its predecessor's offset, and each then read its predecessor's row.
+			// The read-time check cannot see that (each lookup finds a row, just the wrong one), so
+			// the ends of the offset map are checked against the records here. Fsck checks every row.
+			if !colOffsetsFitRecords(seg, cs) {
+				colNativeOffsetMismatches.Add(1)
 				seg.colDamaged.Store(true)
 				return nil
 			}
@@ -197,6 +212,47 @@ func publishColNative(c *Collection, seg *segment) error {
 	return nil
 }
 
+// colOffsetsFitRecords reports whether a columnar payload's offset map fits seg's records at its
+// ends: the first and last rows name keyed records, and the record after the last row is a marker
+// (the dictionary or the payload, which a columnarized segment holds after its records). Constant
+// work, so it adds nothing per record to an open.
+//
+// That is enough to catch records that moved under the payload. Dropping any keyed record and packing
+// the rest moves the last one to a lower offset, so the last row then names the middle of a record,
+// the dictionary, or a keyed record that is not the last.
+//
+// Keyed rather than remnant: segments columnarized before remnants carried colFlag hold unmarked
+// remnants, and they are still read correctly.
+func colOffsetsFitRecords(seg *segment, cs *colSegment) bool {
+	n := cs.offsLen()
+	if n == 0 {
+		return true
+	}
+	keyed := func(o uint32) bool {
+		if int(o)+recHeaderSize > seg.used {
+			return false
+		}
+		total := int(recTotalLen(seg.data, o))
+		return total > 0 && total%8 == 0 && int(o)+total <= seg.used && !recIsMarker(seg.data, o)
+	}
+	first, last := cs.offAt(0), cs.offAt(n-1)
+	if !keyed(first) || !keyed(last) {
+		return false
+	}
+	next := int(last) + int(recTotalLen(seg.data, last))
+	return next+recHeaderSize <= seg.used && recIsMarker(seg.data, uint32(next))
+}
+
+// colNativeOffsetMismatches counts payloads refused because their offset map does not fit their
+// segment's records.
+var colNativeOffsetMismatches atomic.Int64
+
+// ColNativeOffsetMismatches reports how many columnar payloads, since the process started, verified
+// but were refused because their offset map does not fit their segment's records (see
+// colOffsetsFitRecords). Like a payload refused for its checksum, such a segment's records then fail
+// to read rather than return another record's values. Fsck names the segment.
+func ColNativeOffsetMismatches() int64 { return colNativeOffsetMismatches.Load() }
+
 // recordWire returns record `off`'s FULL wire form: its own bytes for a whole-record segment, or
 // its remnant spliced with its columnar values for a columnarized one.
 //
@@ -218,24 +274,28 @@ func (c *Collection) recordWire(seg *segment, off uint32, buf []byte) ([]byte, e
 // sealed segment can be retired and unmapped while a scan still walks it, so reading seg.data
 // directly would be a use-after-munmap. The window's slice is passed in instead.
 func (c *Collection) recordWireIn(seg *segment, data []byte, off uint32, buf []byte) ([]byte, error) {
+	if seg.dictUnusable.Load() {
+		return nil, errSegDictUnusable
+	}
 	raw, err := seg.codec.Decompress(buf[:0], recAd(data, off))
 	if err != nil {
 		return nil, err
 	}
 	cn := seg.colNative.Load()
 	if cn == nil {
+		// A segment holding a columnar record whose payload could not be trusted. Its records were
+		// written WITHOUT the attributes that payload holds, so serving them would return ads
+		// missing half their content -- indistinguishable, to a caller, from ads that never had it.
+		// Fail instead: a read error is recoverable attention, a silently short ad is not. Checked
+		// before the remnant flag so the error names the payload that was refused.
+		if seg.colDamaged.Load() {
+			return nil, errColDamaged
+		}
 		// Marked as a remnant, with no payload to complete it. Refusing is the whole point: the
 		// bytes decode cleanly into an ad that is simply missing the schema'd attributes, so a
 		// caller cannot tell it apart from a small ad and nothing downstream errors.
 		if recIsStripped(data, off) {
 			return nil, errColMissing
-		}
-		// A segment holding a columnar record whose payload could not be trusted. Its records were
-		// written WITHOUT the attributes that payload holds, so serving them would return ads
-		// missing half their content -- indistinguishable, to a caller, from ads that never had it.
-		// Fail instead: a read error is recoverable attention, a silently short ad is not.
-		if seg.colDamaged.Load() {
-			return nil, errColDamaged
 		}
 		return raw, nil
 	}

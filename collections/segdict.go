@@ -1,9 +1,12 @@
 package collections
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"sync/atomic"
+
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // segDict is a sealed segment's per-segment attribute-name dictionary in its serialized,
@@ -162,12 +165,18 @@ func publishSegDict(seg *segment) { publishSegDictAt(seg, 0) }
 // corruption of reads rather than a failure. So it must land inside the written extent, on a
 // record whose length is sane, and on one actually flagged as a dict; anything else falls
 // back to the walk, which is always correct.
+//
+// A persistent segment's dictionary record is checked against its CRC before it is published, as
+// the columnar payload is: every attribute name in the segment resolves through it, so a flipped
+// bit in a name would rename that attribute in every ad the segment holds, and nothing downstream
+// could tell. A record that fails is not published (SegDictCRCFailures counts it); markSegDictNeed
+// then finds the segment's records interned and makes their reads fail.
 func publishSegDictAt(seg *segment, hint uint32) {
 	if seg == nil || seg.dict.Load() != nil {
 		return
 	}
 	if hint > 0 && dictRecordAt(seg, hint) {
-		seg.dict.Store(&segDictHandle{data: seg.data, base: hint + recKeyOff + 4, rec: hint})
+		publishSegDictRec(seg, hint)
 		return
 	}
 	for off := 0; off < seg.used; {
@@ -177,13 +186,80 @@ func publishSegDictAt(seg *segment, hint uint32) {
 			break
 		}
 		if recIsDict(seg.data, o) {
-			// The keyless dict record's body (the serialized dict) starts after the header + adLen.
-			seg.dict.Store(&segDictHandle{data: seg.data, base: o + recKeyOff + 4, rec: o})
+			publishSegDictRec(seg, o)
 			return
 		}
 		off += int(total)
 	}
 }
+
+// publishSegDictRec publishes the dictionary record at o, which must lie inside seg's written
+// extent, once its checksum verifies.
+func publishSegDictRec(seg *segment, o uint32) {
+	if seg.persistent && !recVerifyCRC(seg.data, o) {
+		segDictCRCFailures.Add(1)
+		return
+	}
+	// The keyless dict record's body (the serialized dict) starts after the header + adLen.
+	seg.dict.Store(&segDictHandle{data: seg.data, base: o + recKeyOff + 4, rec: o})
+}
+
+// markSegDictNeed marks a recovered segment dictUnusable when its records are interned and no
+// dictionary was published for them: the dictionary record failed its checksum, recovery stopped
+// at damage before reaching it, or its flags were damaged so it was not recognised. Without the
+// mark such a record decodes through no dictionary, which fails, and a query treats the failure as
+// a non-match -- the record drops out of every answer with nothing counted.
+//
+// Whether the records are interned is read from the first keyed record that verifies and
+// decompresses: a segment is written wholly interned or wholly inline. One decompression, and only
+// for a segment without a dictionary. Run during Open, before any read.
+func markSegDictNeed(seg *segment) {
+	if seg == nil || !seg.persistent || seg.dict.Load() != nil {
+		return
+	}
+	for off := 0; off+recHeaderSize <= seg.used; {
+		o := uint32(off)
+		total := int(recTotalLen(seg.data, o))
+		if total <= 0 || off+total > seg.used {
+			return
+		}
+		off += total
+		if recIsMarker(seg.data, o) || !recVerifyCRC(seg.data, o) {
+			continue
+		}
+		raw, err := seg.codec.Decompress(nil, recAd(seg.data, o))
+		if err != nil {
+			continue
+		}
+		if _, _, _, inline, ok := wire.Ad(raw).SplitBody(); ok {
+			if !inline {
+				seg.dictUnusable.Store(true)
+				segDictsUnusable.Add(1)
+			}
+			return
+		}
+	}
+}
+
+// errSegDictUnusable is a record in a segment whose attribute dictionary record cannot be used:
+// it failed its checksum, or recovery did not reach it. The record's attribute ids resolve only
+// through that dictionary.
+var errSegDictUnusable = errors.New("collections: segment's attribute dictionary is damaged or was not recovered")
+
+// segDictCRCFailures counts dictionary records refused for a bad checksum, and segDictsUnusable the
+// segments left with interned records and no dictionary.
+var segDictCRCFailures, segDictsUnusable atomic.Int64
+
+// SegDictCRCFailures reports how many segment attribute dictionary records have been refused for a
+// bad checksum since the process started.
+func SegDictCRCFailures() int64 { return segDictCRCFailures.Load() }
+
+// SegDictsUnusable reports how many segments, since the process started, were opened with interned
+// records and no usable dictionary: its record failed its checksum (SegDictCRCFailures), recovery
+// stopped at damage before it, or it was not recognised. Every record of such a segment fails to read
+// (RecordReadSkips reason "dict-unusable") rather than decode through a dictionary that may rename
+// attributes, or through none.
+func SegDictsUnusable() int64 { return segDictsUnusable.Load() }
 
 // dictRecOff returns the offset of the segment's dictionary record, or 0 if the segment is
 // inline (no dictionary). Recorded in the sidecar so a reopen need not search for it.

@@ -534,7 +534,8 @@ Two refinements sit on top of the rule:
   (Chapter 15).
 - **Read verification.** By default every record read off a persistent segment has its
   CRC checked. A record that fails is **skipped and counted** (`VerifyReadSkips`), never
-  served (`Options.DisableReadVerification` turns this off).
+  served (`Options.DisableReadVerification` turns this off). Every record a read skips,
+  for any reason, is also counted by reason in `RecordReadSkips`.
 
 **A delete writes no record.** It only stamps `supersededBySeq` on the current version,
 an MVCC tombstone. Scans already in progress still see the pre-delete version; new
@@ -794,18 +795,30 @@ handle a store that may be damaged:
 
 - **`Fsck(dir)`** is read-only. It walks every segment, resynchronizes past bad CRCs to
   count what survives, checks sidecars and the columnar payload, and names files whose
-  names do not parse.
+  names do not parse. It checks that a columnar payload's offset map names exactly the
+  segment's keyed records, reports a damaged attribute dictionary, and says where a
+  normal open would stop when no sidecar supplies a trusted extent.
 - **`Repair(dir, opts)`** moves damaged originals to `<Dir>/quarantine/` and drops
   stale `.idx` and `dir.snap` files, so the next open rebuilds them. It never deletes
-  the only copy of data.
-  - It **leaves columnarized segments alone** and reports them. Dropping a damaged
-    record means packing the survivors together, which moves their offsets. The columnar
-    payload maps rows to records by offset, so a packed segment would serve other keys'
-    values. A byte-level tool cannot rewrite the payload's blocks, dictionaries and
-    offset map consistently.
-  - It also leaves segments with an unsupported payload version alone.
-  - At read time, a columnarized record with no row in the payload fails and is counted
-    (`ColNativeRowMisses`); it is never returned as a short ad.
+  the only copy of data. It leaves some segments exactly as they are and reports them,
+  because packing them would make the survivors read wrong or not at all:
+  - **Columnarized segments.** Dropping a damaged record means packing the survivors
+    together, which moves their offsets. The columnar payload maps rows to records by
+    offset, so a packed segment would serve other keys' values. A byte-level tool cannot
+    rewrite the payload's blocks, dictionaries and offset map consistently.
+  - **Segments whose dictionary record is damaged.** Without it, an interned segment's
+    records cannot be decoded at all.
+  - **Segments with an unsupported payload version.**
+
+At read time, a columnarized record with no row in the payload fails and is counted
+(`ColNativeRowMisses`); it is never returned as a short ad.
+
+Open's recovery walk stops at the first record that fails its CRC when no sidecar
+supplies a trusted extent. Records that verify after the stop are not loaded; they are
+counted (`RecordsPastDamage`), and the segment is named in `OpenIndexDiag.DamageStops`.
+A dictionary record is CRC-checked before it is published. A segment whose records are
+interned but which has no usable dictionary (its record failed, or lay past the stop)
+has its records fail to read (`SegDictsUnusable`).
 
 
 ## 9. Columnar segments
@@ -1019,8 +1032,10 @@ read, which is why the query engine tries hard not to do it (Chapter 11).
 - **Schema freeze.** A schema fixed at first enable never adapts to drift short of
   `ReschemaScan`.
 - **Error visibility.** A record whose payload cannot be read is skipped by scans and
-  counted (`ColNativeCRCFailures`). The query does not fail. Damage is visible to
-  operators but not to the query that missed it.
+  counted (`ColNativeCRCFailures`, and per record in `RecordReadSkips`). The query does
+  not fail. Damage is visible to operators but not to the query that missed it. A
+  payload whose offset map does not fit its records is refused the same way
+  (`ColNativeOffsetMismatches`).
 
 ## 10. Encryption at rest
 

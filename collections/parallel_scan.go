@@ -184,6 +184,7 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 					}
 					w, err := codec.Decompress(dbuf[:0], ad)
 					if err != nil {
+						noteReadSkip(err)
 						return true
 					}
 					dbuf = w
@@ -193,6 +194,7 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 					}
 					a, err := c.decodeWireDictAs(dict, w, redact)
 					if err != nil {
+						noteReadSkip(err)
 						return true
 					}
 					batch = append(batch, classad.FromAST(a))
@@ -235,6 +237,7 @@ func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(
 			}
 			w, err := codec.Decompress(dbuf[:0], ad)
 			if err != nil {
+				noteReadSkip(err)
 				return true
 			}
 			dbuf = w
@@ -244,6 +247,7 @@ func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(
 			}
 			a, err := c.decodeWireDictAs(dict, w, redact)
 			if err != nil {
+				noteReadSkip(err)
 				return true
 			}
 			if !yield(classad.FromAST(a)) {

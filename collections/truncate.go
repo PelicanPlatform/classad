@@ -88,6 +88,7 @@ func (c *Collection) ForEachAd(fn func(key string, ad *classad.ClassAd) bool) {
 			}
 			decoded, err := c.decodeAdDict(dict, ad, codec)
 			if err != nil {
+				noteReadSkip(err)
 				return true // skip an undecodable record rather than abort the backup
 			}
 			if !fn(string(key), decoded) {
@@ -124,6 +125,7 @@ func (c *Collection) ForEachAdAt(snapOf func(shardIdx int) uint64, fn func(key s
 			}
 			decoded, err := c.decodeAdDict(dict, ad, codec)
 			if err != nil {
+				noteReadSkip(err)
 				return true // skip an undecodable record, as ForEachAd does
 			}
 			if !fn(string(key), decoded) {
@@ -153,6 +155,7 @@ func (c *Collection) ForEachSystemAd(fn func(key string, ad *classad.ClassAd) bo
 			}
 			decoded, err := c.decodeAdDict(dict, ad, codec)
 			if err != nil {
+				noteReadSkip(err)
 				return true // skip an undecodable record rather than abort the sweep
 			}
 			if !fn(string(key), decoded) {
