@@ -38,10 +38,10 @@ transactions**. Commit applies each write on its own:
 - there is **no rollback of the successful writes** — the caller gets the set of
   conflicted keys and retries just those (re-read, re-apply, re-commit).
 
-This is opt-in per transaction (`CommitIndependent`), matching how the schedd
-actually uses large transactions. A strict all-or-nothing mode
-(`Commit`, any conflict aborts the whole batch) is also offered for callers that
-want it.
+This is how `Txn.Commit` always behaves, matching how the schedd actually uses large
+transactions; there is no all-or-nothing mode. `CommitResult` reports retryable
+`Conflicts` separately from `Unapplied` writes (a patch whose base can never be
+composed), which a retry cannot fix.
 
 ## How it maps onto the existing store
 
