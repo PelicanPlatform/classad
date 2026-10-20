@@ -2,6 +2,8 @@ package collections
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"hash/crc32"
 	"math"
 	"sort"
@@ -56,6 +58,104 @@ const (
 	colSectionVersion = 7
 	colSectionHdr     = 4 + 2 + 4 + 4 // magic u32 | version u16 | upto u32 | crc u32
 )
+
+// The AUTHORITATIVE copy of the same structure -- a columnarized segment's in-segment payload record
+// (see colnative.go) -- is versioned separately, because the two copies follow opposite rules. The
+// sidecar section is derived: a version it does not know is rejected and rebuilt. The payload is the
+// only copy of every value its records were written without, so nothing can rebuild it, and a version
+// this build does not know must be refused loudly rather than read as damage.
+//
+// A payload is
+//
+//	magic u32 | version u32 | body
+//
+// where body is appendColSegment's output. The header is 8 bytes so a body keeps the alignment it had
+// relative to the record before the header existed.
+//
+// Payloads written before the header existed are body alone, and are read as version 0 permanently:
+// every segment columnarized before this format change holds one, and its values exist nowhere else.
+// They are told apart by the first four bytes. A body begins with its schema's field count as a
+// little-endian u32, which readAdSchema caps at adSchemaMaxFields (1<<20), so a readable legacy
+// payload's fourth byte is always zero. The magic's fourth byte is 'N'. Even an unreadable legacy
+// payload cannot collide: matching would need 0x4e4c4f43 (~1.3e9) fields of at least 10 bytes each,
+// and a record's payload length is a u32.
+//
+// The magic was also chosen for what an OLDER build does with a versioned payload: it reads the magic
+// as a field count above adSchemaMaxFields and rejects the payload at its first field, rather than
+// misreading it as a plausible schema.
+const (
+	colPayloadMagic = 0x4e4c4f43 // "COLN" on disk (little-endian)
+	// colPayloadVersion history. 0: no header (legacy). 1: the header; the body is byte-identical to
+	// version 0's. A change to anything the body holds -- the schema, a block, the group section --
+	// bumps this and teaches unmarshalColPayload the new layout, keeping the old ones readable.
+	colPayloadVersion = 1
+	colPayloadHdr     = 4 + 4 // magic u32 | version u32
+)
+
+// adSchemaMaxFields bounds a stored schema's field count. readAdSchema rejects anything larger, which
+// is also what keeps a legacy payload's first four bytes clear of colPayloadMagic.
+const adSchemaMaxFields = 1 << 20
+
+// ErrUnsupportedColumnarVersion is returned (wrapped, naming the segment) by Open when a columnarized
+// segment's payload carries a format version this build cannot read -- a payload written by a newer
+// build. The payload is the only copy of the values its records were written without, so the
+// collection is refused rather than opened with those records missing; open it with a build that
+// reads that version. Fsck reports such a segment (FsckSegment.ColumnarUnsupported) and Repair leaves
+// it alone.
+var ErrUnsupportedColumnarVersion = errors.New("collections: columnar payload format version is not one this build reads")
+
+// errColPayloadMalformed is a payload that carries the version header but not a parseable body or
+// header. It is damage, not an unknown version: no writer produces it.
+var errColPayloadMalformed = errors.New("collections: columnar payload is malformed")
+
+// marshalColPayload serializes cs as an in-segment columnar payload: the version header, then the
+// body. Returns nil for a colSegment carrying no schema, as marshalColSegment does.
+func marshalColPayload(cs *colSegment, nameOf func(uint32) (string, bool)) []byte {
+	hdr := make([]byte, 0, colPayloadHdr)
+	hdr = appendU32(hdr, colPayloadMagic)
+	hdr = appendU32(hdr, colPayloadVersion)
+	return appendColSegment(hdr, cs, nameOf)
+}
+
+// splitColPayload reads a payload's header, returning its body and version. A payload without the
+// header is version 0 and is its own body. A header naming a version this build does not read returns
+// ErrUnsupportedColumnarVersion with that version; a header too short to hold one returns
+// errColPayloadMalformed.
+func splitColPayload(blob []byte) (body []byte, version uint32, err error) {
+	if len(blob) < 4 || binary.LittleEndian.Uint32(blob) != colPayloadMagic {
+		return blob, 0, nil
+	}
+	if len(blob) < colPayloadHdr {
+		return nil, 0, errColPayloadMalformed
+	}
+	version = binary.LittleEndian.Uint32(blob[4:])
+	// 0 under a header is not legacy -- legacy has no header -- and no writer emits it. It is refused
+	// with the unknown versions rather than marked damaged: a header this build did not write is not
+	// evidence of corruption, and refusing costs an error where damage would cost the rows.
+	if version == 0 || version > colPayloadVersion {
+		return nil, version, fmt.Errorf("%w: version %d, this build reads 0-%d",
+			ErrUnsupportedColumnarVersion, version, colPayloadVersion)
+	}
+	return blob[colPayloadHdr:], version, nil
+}
+
+// unmarshalColPayload parses an in-segment columnar payload of any version this build reads. The
+// error is ErrUnsupportedColumnarVersion (wrapped) for a version it does not, and
+// errColPayloadMalformed for bytes that do not parse. The returned segment aliases blob, as
+// unmarshalColSegment's does.
+func unmarshalColPayload(blob []byte, codec Codec, internName func(string) uint32) (*colSegment, error) {
+	body, _, err := splitColPayload(blob)
+	if err != nil {
+		return nil, err
+	}
+	// Versions 0 and 1 share one body layout. A later version that changes it dispatches here on the
+	// version splitColPayload returns.
+	cs := unmarshalColSegment(body, codec, internName)
+	if cs == nil {
+		return nil, errColPayloadMalformed
+	}
+	return cs, nil
+}
 
 // wrapColSection frames a marshaled columnar block for the sidecar. upto is the segment byte
 // length the block was built from.
@@ -168,7 +268,7 @@ func marshalAdSchema(dst []byte, s *adSchema, nameOf func(uint32) (string, bool)
 // (c.err) is rejected without polluting the intern table with junk names.
 func readAdSchema(c *cursor, internName func(string) uint32) *adSchema {
 	n := int(c.u32())
-	if n < 0 || n > 1<<20 || !c.need(0) {
+	if n < 0 || n > adSchemaMaxFields || !c.need(0) {
 		return nil
 	}
 	type raw struct {
@@ -196,13 +296,22 @@ func readAdSchema(c *cursor, internName func(string) uint32) *adSchema {
 // them, so storing them per group would multiply a ~kB blob by the group count), then each block's
 // record count, byte streams and per-record offsets, then offs -- the segment-wide record->arena map
 // for MVCC visibility. Returns nil for a colSegment carrying no schema, which cannot be reloaded.
+//
+// This is the sidecar section's body. The in-segment payload is the same body behind a version
+// header; see marshalColPayload.
 func marshalColSegment(cs *colSegment, nameOf func(uint32) (string, bool)) []byte {
+	return appendColSegment(nil, cs, nameOf)
+}
+
+// appendColSegment is marshalColSegment appending to dst. Returns nil (not dst) for a colSegment
+// carrying no schema.
+func appendColSegment(dst []byte, cs *colSegment, nameOf func(uint32) (string, bool)) []byte {
 	sch := cs.schema()
 	if sch == nil {
 		return nil
 	}
 	hotNum := cs.hotNum()
-	dst := marshalAdSchema(nil, sch, nameOf)
+	dst = marshalAdSchema(dst, sch, nameOf)
 	// Cold-tail keys. A dictionary-keyed payload needs nothing here: the dictionary travels with the
 	// segment and names them. A globally-keyed one does -- its ids are this process's and mean nothing
 	// after a restart, which read as UNDEFINED for values that were present.
@@ -439,8 +548,9 @@ func readColBlock(c *cursor, s *adSchema, layout *colLayout, codec Codec) *colum
 	return b
 }
 
-// unmarshalColSegment reconstructs a colSegment from marshalColSegment's output, attaching the
-// segment's codec (for later decompression). Returns nil on malformed data.
+// unmarshalColSegment reconstructs a colSegment from marshalColSegment's output -- a sidecar section
+// body, or a payload body once unmarshalColPayload has read its header -- attaching the segment's
+// codec (for later decompression). Returns nil on malformed data.
 //
 // ZERO-COPY: the block's byte streams (the two uncompressed regions + the three compressed cold streams)
 // ALIAS data rather than being copied -- a hot column is then one contiguous span of the mmap, and the cold

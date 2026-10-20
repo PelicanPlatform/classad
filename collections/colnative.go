@@ -2,6 +2,7 @@ package collections
 
 import (
 	"errors"
+	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -80,9 +81,16 @@ type colNative struct {
 
 // publishColNative finds a segment's columnar record and parses it, as publishSegDict does for the
 // dictionary. A segment without one is whole-record and reads unchanged.
-func publishColNative(c *Collection, seg *segment) {
+//
+// A payload that fails its checksum or does not parse marks the segment colDamaged and returns nil:
+// that is corruption, and reads of the segment's records fail from then on. A payload whose format
+// version this build does not read is NOT damage -- it is intact data in a layout a newer build wrote
+// -- so it is neither published nor marked; the error (ErrUnsupportedColumnarVersion, wrapped) is
+// returned for Open to refuse the collection with. Marking it damaged would let scans skip its records
+// silently, and the payload is the only copy of what they are missing.
+func publishColNative(c *Collection, seg *segment) error {
 	if seg == nil || seg.colNative.Load() != nil {
-		return
+		return nil
 	}
 	for off := 0; off < seg.used; {
 		o := uint32(off)
@@ -105,23 +113,25 @@ func publishColNative(c *Collection, seg *segment) {
 			if seg.persistent && !recVerifyCRC(seg.data, o) {
 				colNativeCRCFailures.Add(1)
 				seg.colDamaged.Store(true)
-				return
+				return nil
 			}
 			blob := recAd(seg.data, o)
 			// The REGION codec, not the segment's record codec: a block's regions are
 			// compressed dictionary-less (see Collection.regionCodec), and decoding them with
 			// the segment's trained dictionary fails or, worse, succeeds into nonsense.
-			cs := unmarshalColSegment(blob, c.regionCodec(), func(name string) uint32 {
+			cs, err := unmarshalColPayload(blob, c.regionCodec(), func(name string) uint32 {
 				return c.intern.Intern(name)
 			})
-			if cs != nil {
-				cs.schemaOnly = true
+			if errors.Is(err, ErrUnsupportedColumnarVersion) {
+				colNativeUnsupported.Add(1)
+				return fmt.Errorf("segment %s: %w", seg.path, err)
 			}
-			if cs == nil {
+			if err != nil {
 				colNativeCRCFailures.Add(1)
 				seg.colDamaged.Store(true)
-				return
+				return nil
 			}
+			cs.schemaOnly = true
 			// The collection's ONE shared block cache, not a fresh per-segment cache: a cache
 			// per segment made ristretto's fixed admission metadata scale with segment count (a
 			// multi-GB reopen leak on a large archive). A nil cache (creation failed) is valid --
@@ -180,10 +190,11 @@ func publishColNative(c *Collection, seg *segment) {
 			// duplicated: the builder skips a segment that already has one (see enableSchemaScan),
 			// so nothing rebuilds it and nothing writes it.
 			seg.colblk.Store(cs)
-			return
+			return nil
 		}
 		off += int(total)
 	}
+	return nil
 }
 
 // recordWire returns record `off`'s FULL wire form: its own bytes for a whole-record segment, or
@@ -354,15 +365,24 @@ func (cn *colNative) blockFor(k int) (*columnarBlock, int) {
 // columnarized reports whether the segment stores its schema'd attributes columnar.
 func (s *segment) columnarized() bool { return s != nil && s.colNative.Load() != nil }
 
-// colNativeCRCFailures counts columnar payloads refused for a bad checksum. A nonzero value means a
-// segment is missing the attributes its records no longer carry, which is data loss rather than a
-// slow path -- so it is counted rather than merely logged, and a test can hold the line that a
-// corrupt payload is refused instead of read.
+// colNativeCRCFailures counts columnar payloads refused for a bad checksum or a body that does not
+// parse. A nonzero value means a segment is missing the attributes its records no longer carry, which
+// is data loss rather than a slow path -- so it is counted rather than merely logged, and a test can
+// hold the line that a corrupt payload is refused instead of read.
 var colNativeCRCFailures atomic.Int64
 
-// ColNativeCRCFailures reports how many columnar payloads have been refused for a bad checksum
-// since the process started.
+// ColNativeCRCFailures reports how many columnar payloads have been refused for a bad checksum or an
+// unparseable body since the process started. A payload in a format version this build does not read
+// is not counted here; see ColNativeUnsupportedVersions.
 func ColNativeCRCFailures() int64 { return colNativeCRCFailures.Load() }
+
+// colNativeUnsupported counts columnar payloads refused because a newer build wrote them.
+var colNativeUnsupported atomic.Int64
+
+// ColNativeUnsupportedVersions reports how many columnar payloads have been found, since the process
+// started, in a format version this build cannot read. Each one makes Open fail with
+// ErrUnsupportedColumnarVersion.
+func ColNativeUnsupportedVersions() int64 { return colNativeUnsupported.Load() }
 
 // columnarizedSegments counts segments successfully rewritten into columnar form, and
 // columnarizedBytesSaved the arena bytes the rewrites removed (negative if a rewrite grew a

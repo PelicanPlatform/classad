@@ -8,7 +8,7 @@ package collections
 // valid record after it. Repair copies the good records into a fresh segment file, so
 // what follows the damage comes back.
 //
-// Three rules it does not break:
+// Four rules it does not break:
 //
 //   - The original is never destroyed. It moves to quarantine/, because an operator
 //     who disagrees with what repair kept needs the bytes to argue with. Deleting a
@@ -21,6 +21,10 @@ package collections
 //   - Nothing is written until the replacement is complete and fsynced. A crash
 //     mid-repair leaves either the original or the finished replacement, never a
 //     half-written segment.
+//   - A segment whose columnar payload is a format version this build cannot read is
+//     left exactly as it is, damaged or not. That payload is the only copy of what
+//     its records were written without, and a build that does not understand it is
+//     in no position to decide what a rewrite of that segment must preserve.
 
 import (
 	"fmt"
@@ -64,6 +68,10 @@ type RepairReport struct {
 	// Untouched counts segments that needed nothing: either undamaged, or damaged
 	// only at the tail, which is an interrupted write rather than corruption.
 	Untouched int
+	// Unsupported lists segments left alone because their columnar payload is a
+	// format version this build cannot read (FsckSegment.ColumnarUnsupported),
+	// whether or not they also hold damage. They are not counted in Untouched.
+	Unsupported []string
 }
 
 // Totals sums the records kept and dropped across every rewritten segment.
@@ -84,6 +92,10 @@ func (r *RepairReport) String() string {
 		verb = "would repair"
 	}
 	fmt.Fprintf(&b, "%s %s\n", verb, r.Dir)
+	for _, p := range r.Unsupported {
+		fmt.Fprintf(&b, "  LEFT ALONE %s: its columnar payload is a format version this build cannot read; "+
+			"repair it with a build that can\n", filepath.Base(p))
+	}
 	if len(r.Segments) == 0 {
 		fmt.Fprintf(&b, "  nothing to do (%d segment(s) need no repair)\n", r.Untouched)
 		return b.String()
@@ -111,6 +123,10 @@ func Repair(dir string, opts RepairOptions) (*RepairReport, error) {
 	rep := &RepairReport{Dir: dir, DryRun: opts.DryRun}
 
 	for _, seg := range scan.Segments {
+		if seg.ColumnarUnsupported {
+			rep.Unsupported = append(rep.Unsupported, seg.Path)
+			continue
+		}
 		if !segmentNeedsRepair(seg) {
 			rep.Untouched++
 			continue
