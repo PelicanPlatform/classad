@@ -35,6 +35,7 @@ type jobPlan struct {
 	rankPresent bool      // job has a Rank attribute (whether or not wire-native)
 	rankRefs    []string  // slot attributes the job Rank reads (for the closure seed)
 	vals        map[string]classad.Value
+	order       []int // short-circuit order of the Requirements' top-level conjuncts, or nil
 }
 
 // jobRankExpr returns the job's Rank expression, or nil if absent.

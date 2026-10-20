@@ -147,10 +147,11 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 	}
 	ex.HasRequirements = true
 	jobVals := jobValues(job)
-	// Show the same short-circuit-reordered predicate the match actually evaluates, so
-	// the explanation reflects real evaluation order (cheap, most-decisive operand first).
-	changed := false
-	reqExpr = c.reorderShortCircuit(reqExpr, jobVals, &changed)
+	// Show the conjuncts in the order the match's job-side verdict evaluates them, so
+	// the explanation reflects real evaluation order (cheap, most-decisive conjunct first).
+	if ordered := orderedConjunction(reqExpr, c.conjunctOrder(reqExpr, jobVals)); ordered != nil {
+		reqExpr = ordered
+	}
 	// Display: honest, baked, de-duplicated (functions kept, not shown as undefined).
 	ex.SlotPredicate = slotDisplayExpr(reqExpr, jobVals)
 	// Per-conjunct evaluation order (probe vs re-check + selectivity), so the reordering

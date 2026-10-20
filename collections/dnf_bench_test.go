@@ -173,12 +173,13 @@ func BenchmarkMatchFiniteDomain(b *testing.B) {
 	}
 }
 
-// BenchmarkMatchReorder isolates the short-circuit-reorder win on the full-scan path:
+// BenchmarkMatchReorder measures what operand order is worth on the full-scan path:
 // the same predicate written expensive-first (versionGE(split(...)) || Disk>=X) vs
 // cheap-first (Disk>=X || versionGE(split(...))), each bilaterally matched over every
-// slot WITHOUT the reorder path, so operand order is the only variable. Cheap-first runs
-// the split/subscript/version parse only on the slots the cheap Disk test does not
-// already decide -- exactly what reorderJobRequirements produces automatically.
+// slot, so operand order is the only variable. Cheap-first runs the
+// split/subscript/version parse only on the slots the cheap Disk test does not already
+// decide. The match does not reorder || chains itself: || is left-biased with respect
+// to ERROR, so the two orders are not equivalent in general.
 func BenchmarkMatchReorder(b *testing.B) {
 	const n = 100_000
 	versions := []string{`$CondorVersion: 25.12.0 x $`, `$CondorVersion: 24.0.0 x $`,
@@ -220,6 +221,48 @@ func BenchmarkMatchReorder(b *testing.B) {
 		b.Run(fmt.Sprintf("%s/matches=%d", tc.name, m), func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				_ = bruteCount(tc.job)
+			}
+		})
+	}
+}
+
+// BenchmarkMatchChainOrder runs Collection.Match end to end (so through whatever
+// short-circuit ordering the match applies) over a 100k-slot full scan, for an
+// expensive-first || chain, an expensive-first && chain whose cheap Disk operand rejects
+// ~70% of slots, and an all-comparison && chain the wire-native pre-filter evaluates.
+func BenchmarkMatchChainOrder(b *testing.B) {
+	const n = 100_000
+	versions := []string{`$CondorVersion: 25.12.0 x $`, `$CondorVersion: 24.0.0 x $`,
+		`$CondorVersion: 23.5.0 x $`, `$CondorVersion: 22.1.0 x $`}
+	c := New(Options{Shards: 8})
+	for i := 0; i < n; i++ {
+		disk := 1024 * (1 + (i*2654435761)%500)
+		v := versions[1+i%3]
+		if i%50 == 0 {
+			v = versions[0]
+		}
+		c.Put([]byte(fmt.Sprintf("m%d", i)), mustAd(b, fmt.Sprintf(
+			`[ Id=%d; Disk=%d; Memory=%d; Arch="X86_64"; OpSys="LINUX"; HasFileTransfer=true; CondorVersion=%q; Requirements=true ]`,
+			i, disk, 1024*(1+i%16), v)))
+	}
+	for _, tc := range []struct{ name, job string }{
+		{"or-expensive-first", `[ RequestDisk=154624;
+			Requirements = versionGE(split(TARGET.CondorVersion)[1], "25.12.0") || (TARGET.Disk >= RequestDisk) ]`},
+		{"and-expensive-first", `[ RequestDisk=358400;
+			Requirements = versionGE(split(TARGET.CondorVersion)[1], "23.0.0") && (TARGET.Disk >= RequestDisk) ]`},
+		{"and-native", `[ RequestDisk=358400; RequestMemory=4096;
+			Requirements = (TARGET.Arch == "X86_64") && (TARGET.OpSys == "LINUX") && TARGET.HasFileTransfer &&
+				(TARGET.Memory >= RequestMemory) && (TARGET.Disk >= RequestDisk) ]`},
+	} {
+		job := mustAd(b, tc.job)
+		count := 0
+		for range c.Match(job) {
+			count++
+		}
+		b.Run(fmt.Sprintf("%s/matches=%d", tc.name, count), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				for range c.Match(job) {
+				}
 			}
 		})
 	}
