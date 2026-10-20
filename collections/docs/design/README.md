@@ -1722,12 +1722,13 @@ recomputed once at open and written back by name.
 **A zone knows what it did not see.** When a zone is built, each record's value for
 the attribute is classified:
 - **A number** widens the range. Booleans count as 1 or 0, as they do to the
-  comparison operators.
+  comparison operators, and a negative constant counts as the number it is.
 - **A value no numeric comparison can be true of** — absent, a string, undefined,
-  error — is left out of the range, since it can never satisfy a numeric probe. It
+  error, NaN — is left out of the range, since it can never satisfy a numeric probe. It
   clears the zone's `Full` flag, so the zone no longer claims to cover every record.
-- **An expression or an encrypted value**, whose value only evaluating the record can
-  tell, removes the attribute's zone for that segment entirely.
+- **An expression, an encrypted value, a list or a nested ad**, whose value only
+  evaluating the record can tell, removes the attribute's zone for that segment
+  entirely. A record that cannot be read at all leaves the segment with no zones.
 
 A missing zone means "nothing known" to every reader: no pruning, no age-based
 retention, and no wholesale counting.
