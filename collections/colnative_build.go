@@ -187,7 +187,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 			cs.groups = append(cs.groups, sel)
 		}
 	}
-	blob := marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
+	blob := marshalColPayload(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
 	if blob == nil {
 		return nil, nil, nil
 	}
@@ -297,7 +297,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// The offsets moved, so the columnar payload must describe the NEW ones or a reader would map
 	// a record to another record's columns.
 	cs.offsB = packU32s(newOffs)
-	blob = marshalColSegment(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
+	blob = marshalColPayload(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
 	if blob == nil || len(blob) == 0 {
 		dst.retire()
 		dst.reapAndHook()
@@ -317,7 +317,9 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// with the same values -- so it is carried over rather than recomputed. Dropping it would cost
 	// the archive its segment pruning until the next reindex.
 	dst.zones = src.zones
-	publishColNative(c, dst)
+	// The payload was just written at the current version, so this cannot report an unsupported one;
+	// any failure leaves dst unpublished, and the check below refuses it.
+	perr := publishColNative(c, dst)
 	// Attach dst's key index + Bloom over its NEW offsets, from the same immutable bytes the deferred
 	// reindex would use (buildKeyIndex over the whole segment; the dict/col records it also scans never
 	// match a real key). Built here, before the swap, so columnarizeSealedSegment can PUBLISH it on dst
@@ -326,7 +328,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// duplicate live version, and DeleteWhere never converged). dst is not yet visible, so storing it now
 	// is safe; the publish/evict under the swap lock is what makes it authoritative.
 	ki, kerr := parseKeyIndex(buildKeyIndex(dst.data, dst.used, c.h))
-	if !dst.columnarized() || kerr != nil {
+	if perr != nil || !dst.columnarized() || kerr != nil {
 		dst.retire()
 		dst.reapAndHook()
 		return nil, nil, nil // the payload did not read back (or its key index would not parse): refuse

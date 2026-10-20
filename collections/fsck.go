@@ -24,6 +24,7 @@ package collections
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -73,6 +74,18 @@ type FsckSegment struct {
 	// damage is INSIDE the trusted extent: Open will not notice it, and queries will
 	// hit it one record at a time.
 	ExtentTrusted bool
+
+	// Columnar is true when the segment holds a columnar payload that verified, and
+	// ColumnarVersion is that payload's format version: 0 for one written before
+	// payloads carried a version.
+	Columnar bool
+	// ColumnarUnsupported is set when ColumnarVersion is one this build cannot read.
+	// That is not damage: the payload is intact, and it is the only copy of the
+	// values its segment's records were written without. Open refuses the collection
+	// (ErrUnsupportedColumnarVersion), Repair leaves the segment alone, and a build
+	// that reads the version opens it normally.
+	ColumnarUnsupported bool
+	ColumnarVersion     uint32
 }
 
 // FsckSupersede is a record whose supersededBySeq cannot be true.
@@ -153,10 +166,15 @@ func (r *FsckReport) String() string {
 		fmt.Fprintf(&b, "  %d damaged run(s), %d record(s) unreadable\n", runs, lost)
 	}
 	for _, s := range r.Segments {
-		if len(s.Damage) == 0 && s.Sidecar == "ok" {
+		if len(s.Damage) == 0 && s.Sidecar == "ok" && !s.ColumnarUnsupported {
 			continue
 		}
 		fmt.Fprintf(&b, "  %s: %d records, sidecar %s\n", filepath.Base(s.Path), s.Records, s.Sidecar)
+		if s.ColumnarUnsupported {
+			fmt.Fprintf(&b, "    UNSUPPORTED columnar payload format version %d (this build reads 0-%d): "+
+				"not damage; open the collection with a build that reads it, and repair will not touch this segment\n",
+				s.ColumnarVersion, colPayloadVersion)
+		}
 		for _, d := range s.Damage {
 			kind := "DAMAGE"
 			if d.Trailing {
@@ -383,6 +401,7 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 			s.Records++
 			s.Bytes += total
 			noteSupersede(s, data, off)
+			noteColPayload(s, data, off)
 			off += total
 			continue
 		}
@@ -422,6 +441,19 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 		}
 	}
 	return s, nil
+}
+
+// noteColPayload records a verified columnar payload's format version. Only the
+// header is read: the version decides whether this build can interpret the payload
+// at all, which is what an operator needs to know before anything opens it.
+func noteColPayload(s *FsckSegment, data []byte, off int) {
+	if !recIsCol(data, uint32(off)) || !recIsMarker(data, uint32(off)) {
+		return
+	}
+	_, version, err := splitColPayload(recAd(data, uint32(off)))
+	s.Columnar = true
+	s.ColumnarVersion = version
+	s.ColumnarUnsupported = errors.Is(err, ErrUnsupportedColumnarVersion)
 }
 
 // fsckResync scans forward from a bad record for the next offset that frames and

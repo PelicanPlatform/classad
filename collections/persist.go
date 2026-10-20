@@ -320,7 +320,7 @@ func Open(opts Options) (*Collection, error) {
 		}
 		maxNum, err := c.loadShard(sh, shardDir)
 		if err != nil {
-			return nil, fmt.Errorf("recover shard %d: %w", i, err)
+			return nil, errors.Join(fmt.Errorf("recover shard %d: %w", i, err), c.releaseLoadedSegments())
 		}
 		counter := maxNum
 		// allocNamed builds a segment file under prefix. "seg" is the live form recovery
@@ -407,6 +407,22 @@ func Open(opts Options) (*Collection, error) {
 		OpenIndexDiagHook(d)
 	}
 	return c, nil
+}
+
+// releaseLoadedSegments unmaps every segment recovery has installed so far, for an Open that fails
+// part way. The files are untouched; only this process's mappings and descriptors go.
+func (c *Collection) releaseLoadedSegments() error {
+	var errs []error
+	for _, sh := range c.shards {
+		for _, seg := range sh.segs {
+			if seg != nil {
+				errs = append(errs, seg.closeUnmap())
+			}
+		}
+		sh.segs = nil
+		sh.act = nil
+	}
+	return errors.Join(errs...)
 }
 
 // loadShard mmaps the existing segment files under shardDir (in file-number order,
@@ -611,10 +627,16 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	// Publication must follow the dictionary loop above -- an interned segment's payload is
 	// translated through its dictionary -- and must cover every segment, because a reader cannot ask
 	// whether the format was recognised, only for the ad.
+	//
+	// A payload in a format version this build cannot read fails the open. The alternative is a
+	// collection whose scans skip that segment's records without saying so, and nothing in this
+	// process could rebuild what they are missing.
 	colStart := time.Now()
 	for _, seg := range sh.segs {
 		if seg != nil {
-			publishColNative(c, seg)
+			if err := publishColNative(c, seg); err != nil {
+				return 0, err
+			}
 		}
 	}
 	tm.PublishColumns = time.Since(colStart)
