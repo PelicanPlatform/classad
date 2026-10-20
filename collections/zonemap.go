@@ -1,6 +1,10 @@
 package collections
 
-import "github.com/PelicanPlatform/classad/collections/wire"
+import (
+	"math"
+
+	"github.com/PelicanPlatform/classad/collections/wire"
+)
 
 // Zone maps for an append-only collection: a sealed segment records the numeric
 // [min,max] span of each configured ZoneAttr across its records, so a query with a
@@ -8,6 +12,10 @@ import "github.com/PelicanPlatform/classad/collections/wire"
 // cannot contain a match (the archive's per-segment pruning, expressed as a Collection
 // rule). The zoneRange type and the zonePrune/zoneMayMatch predicates are shared with
 // the archive (archive.go / archive_query.go).
+//
+// A missing entry means "nothing known" to every reader: no pruning, no age retention, no
+// wholesale attribution. That is how an attribute some record holds an expression for is
+// represented, since the expression's value is unknown until the record is evaluated.
 //
 // Only sealed segments carry zones; the active (still-appended) segment has nil zones
 // and is always scanned, so an in-flight record is never pruned away. Zones are
@@ -23,12 +31,63 @@ type zoneAttr struct {
 	id   uint32
 }
 
-// computeSegZones scans a sealed segment's records and returns the per-attribute
-// numeric min/max for the given zone attributes (absent/non-numeric values ignored).
+// zoneCell is what one record's value for a zone attribute means to the zone map.
+type zoneCell uint8
+
+const (
+	// zoneNumber: a number, which the range must contain.
+	zoneNumber zoneCell = iota
+	// zoneNever: a value no numeric comparison can be true of. Ordering and equality against a
+	// number give UNDEFINED for undefined and ERROR for an error, a string, a list or a nested ad;
+	// every comparison with NaN is false. The range can leave these out and still prune soundly.
+	zoneNever
+	// zoneOpaque: a value only evaluating the record can give -- an expression, or an encrypted
+	// value. The range cannot bound it, so the attribute gets no zone in this segment.
+	zoneOpaque
+)
+
+// zoneValue classifies a record's value node for a zone map, returning the number for a
+// zoneNumber. A boolean is a number here (1 or 0), as it is to the comparison operators. A
+// negative constant is stored as unary minus over a literal and counts as the number it is; a
+// list or nested ad is opaque only because it is not worth decoding to prove otherwise.
+func zoneValue(node []byte) (float64, zoneCell) {
+	lit, ok := wire.LiteralValue(node)
+	if !ok {
+		lit, ok = wire.NumberValue(node)
+		if !ok {
+			return 0, zoneOpaque
+		}
+	}
+	switch lit.Kind {
+	case wire.LitInt:
+		return float64(lit.Int), zoneNumber
+	case wire.LitReal:
+		if math.IsNaN(lit.Real) {
+			return 0, zoneNever
+		}
+		return lit.Real, zoneNumber
+	case wire.LitBool:
+		if lit.Bool {
+			return 1, zoneNumber
+		}
+		return 0, zoneNumber
+	}
+	return 0, zoneNever // string, undefined, error
+}
+
+// computeSegZones scans a sealed segment's records and returns the per-attribute numeric
+// min/max for the given zone attributes. An attribute any record holds an expression for gets no
+// entry: the zone could not bound that record, and pruning on it would drop the record whenever
+// the expression evaluates into the queried range. Values no numeric comparison can be true of
+// (absent, string, undefined) are left out of the range and clear Full (see zoneRange).
+// Returns nil when no zone attributes are configured, or when a record cannot be read: a record
+// the zone never saw could hold anything.
+//
 // inline selects name-based vs id-based attribute lookup, matching how the collection
 // encodes records (persistent collections store inline names; in-memory ones store
-// interned ids). Returns nil when no zone attributes are configured. Caller holds the
-// shard write lock (seal) or runs single-threaded during Open (reopen).
+// interned ids). Caller holds the shard write lock (seal) or runs single-threaded during
+// Open (reopen).
+//
 // computeSegZones takes the SEGMENT rather than its bytes for the same reason buildSegIndex does: a
 // zone map built from a columnarized segment's stored bytes would cover only the attributes its
 // schema does not cover, and a zone map that under-reports a range makes the scan SKIP segments that
@@ -45,7 +104,13 @@ func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, in
 	if len(attrs) == 0 {
 		return nil
 	}
-	zones := make(map[uint32]zoneRange, len(attrs))
+	type zoneAcc struct {
+		z      zoneRange
+		seen   bool // some record held a number
+		sparse bool // some record held no number
+		opaque bool // some record held an expression
+	}
+	accs := make([]zoneAcc, len(attrs))
 	var buf []byte
 	for off := 0; off < upto; {
 		o := uint32(off)
@@ -57,44 +122,59 @@ func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, in
 			off += int(total)
 			continue
 		}
-		if w, err := c.recordWireIn(seg, data, o, buf); err == nil {
-			buf = w
-			ad := wire.Ad(w)
-			for _, za := range attrs {
-				var node []byte
-				var ok bool
-				switch {
-				case dict != nil: // interned segment: resolve the zone attr's segment-local id
-					if id, has := dict.lookup(za.name); has {
-						node, ok = ad.Lookup(id)
-					}
-				case inline:
-					node, ok = ad.LookupByName(za.name)
-				default:
-					node, ok = ad.Lookup(za.id)
+		w, err := c.recordWireIn(seg, data, o, buf)
+		if err != nil {
+			return nil
+		}
+		buf = w
+		ad := wire.Ad(w)
+		for i, za := range attrs {
+			a := &accs[i]
+			if a.opaque {
+				continue
+			}
+			var node []byte
+			var ok bool
+			switch {
+			case dict != nil: // interned segment: resolve the zone attr's segment-local id
+				if id, has := dict.lookup(za.name); has {
+					node, ok = ad.Lookup(id)
 				}
-				if !ok {
-					continue
-				}
-				f, ok := literalFloat(node)
-				if !ok {
-					continue
-				}
-				z, seen := zones[za.id]
-				if !seen {
-					zones[za.id] = zoneRange{Min: f, Max: f}
-				} else {
-					if f < z.Min {
-						z.Min = f
-					}
-					if f > z.Max {
-						z.Max = f
-					}
-					zones[za.id] = z
+			case inline:
+				node, ok = ad.LookupByName(za.name)
+			default:
+				node, ok = ad.Lookup(za.id)
+			}
+			if !ok {
+				a.sparse = true
+				continue
+			}
+			f, cell := zoneValue(node)
+			switch cell {
+			case zoneOpaque:
+				a.opaque = true
+			case zoneNever:
+				a.sparse = true
+			default:
+				if !a.seen {
+					a.z, a.seen = zoneRange{Min: f, Max: f}, true
+				} else if f < a.z.Min {
+					a.z.Min = f
+				} else if f > a.z.Max {
+					a.z.Max = f
 				}
 			}
 		}
 		off += int(total)
+	}
+	zones := make(map[uint32]zoneRange, len(attrs))
+	for i, za := range attrs {
+		a := accs[i]
+		if a.opaque || !a.seen {
+			continue
+		}
+		a.z.Full = !a.sparse
+		zones[za.id] = a.z
 	}
 	return zones
 }

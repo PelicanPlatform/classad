@@ -164,8 +164,9 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 		_ = closer() // the container itself is unreadable; leave it for a reindex to rebuild
 		return false
 	}
-	// A legacy (id-keyed) section is well-formed but cannot be trusted (see buildZoneBlob), so it
-	// is rewritten too; only a name-keyed section is left alone.
+	// A legacy section (id-keyed, or ZNM2 with ranges that skipped expressions) is well-formed
+	// but cannot be trusted (see buildZoneBlob), so it is rewritten too; only a current section
+	// is left alone.
 	if len(zone) > 0 {
 		if _, st := parseZoneBlob(zone, c.intern.LookupID); st == zoneBlobOK {
 			_ = closer() // a usable zone section: genuinely nothing to upgrade
@@ -463,8 +464,9 @@ func (c *Collection) zonesForSeg(sh *shard, seg *segment) map[uint32]zoneRange {
 // ignored: the caller's existing recompute path then fills it in. Being wrong here is worse
 // than being slow, since a too-narrow range would prune segments that hold matches.
 //
-// Only a name-keyed section is adopted, its names bound to this process's ids; a legacy id-keyed
-// one is ignored, so the segment's zones are recomputed and the section rewritten (persist.go).
+// Only a current section is adopted, its names bound to this process's ids; a legacy one
+// (id-keyed, or ZNM2) is ignored, so the segment's zones are recomputed and the section
+// rewritten (persist.go).
 func (c *Collection) adoptPersistedZones(seg *segment, zone []byte) {
 	if seg == nil || seg.zones != nil || len(zone) == 0 {
 		return

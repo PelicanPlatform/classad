@@ -47,7 +47,13 @@ func diffHistoryAd(rng *rand.Rand, i int, exprs bool) string {
 	w("ProcId = %d", i%10)
 	w("Owner = %q", owner)
 	w("QDate = %d", t0-500)
-	w("EnteredHistoryTime = %d", t0+5)
+	// A zone-mapped attribute that is an expression in a few records, evaluating past every literal
+	// in its segment: a zone map that leaves it out prunes the segment holding it.
+	if exprs && rng.Intn(20) == 0 {
+		w("EnteredHistoryTime = QDate + 40505")
+	} else {
+		w("EnteredHistoryTime = %d", t0+5)
+	}
 	w("JobUniverse = %d", []int{5, 5, 5, 7}[rng.Intn(4)])
 	w("CondorVersion = %q", fmt.Sprintf("$CondorVersion: 24.%d.%d BuildID: %d $", rng.Intn(4), rng.Intn(3), 7000+rng.Intn(3)))
 	w("Cmd = %q", "/home/"+owner+"/run.sh")
@@ -67,7 +73,11 @@ func diffHistoryAd(rng *rand.Rand, i int, exprs bool) string {
 	}
 	if rng.Intn(100) < 15 { // removed before it ran: no usage at all
 		w("JobStatus = 3")
-		w("CompletionDate = 0")
+		if exprs && rng.Intn(4) == 0 {
+			w("CompletionDate = -1") // a negative constant is unary minus over a literal
+		} else {
+			w("CompletionDate = 0")
+		}
 		w("RemoteWallClockTime = 0.0")
 		w("NumJobStarts = 0")
 		if rng.Intn(2) == 0 {
@@ -114,7 +124,8 @@ func diffHistoryAd(rng *rand.Rand, i int, exprs bool) string {
 // someone asking for "jobs with no usage" writes.
 func diffConstraint(rng *rand.Rand, depth int) string {
 	nums := []string{"CpusUsage", "RemoteUserCpu", "RemoteWallClockTime", "NumJobStarts", "JobStatus",
-		"FooExpr", "DiskUsage", "HoldReasonCode", "ExitCode", "MemoryUsage", "ResidentSetSize", "EnteredHistoryTime"}
+		"FooExpr", "DiskUsage", "HoldReasonCode", "ExitCode", "MemoryUsage", "ResidentSetSize", "EnteredHistoryTime",
+		"CompletionDate"}
 	strs := []string{"Owner", "BarStr", "LastRemoteHost", "CondorVersion", "MachineAttrGLIDEIN_Site0"}
 	all := append(append([]string(nil), nums...), strs...)
 	if depth > 0 && rng.Intn(3) == 0 {
@@ -334,6 +345,10 @@ func TestArchiveAggregateMatchesBruteForce(t *testing.T) {
 		"Owner == \"user03\" && CpusUsage is undefined",
 		"Owner == \"user03\" && FooExpr is undefined",
 		"EnteredHistoryTime > 1700010000 && RemoteWallClockTime == 0",
+		"EnteredHistoryTime > 1700010000",
+		"Owner == \"user03\" && EnteredHistoryTime >= 1700010000",
+		"CompletionDate < 0",
+		"CompletionDate == -1 && JobStatus == 3",
 	}
 	fixed := len(constraints)
 	rng := rand.New(rand.NewSource(7))

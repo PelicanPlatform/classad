@@ -110,3 +110,42 @@ func LiteralValue(node []byte) (Literal, bool) {
 		return Literal{}, false
 	}
 }
+
+// NumberValue returns the number a node denotes without evaluating anything: an int or real
+// literal under any parentheses and unary minus or plus. The parser keeps a negative constant as
+// unary minus over its magnitude, so `-5` is not a literal, and a reader summarizing numeric
+// values (a zone map) would otherwise have to treat every negative number as an expression.
+//
+// The result is what the evaluator computes for the node: minus negates (an int wraps, as int64
+// negation does), plus is the identity. Any other operand -- a boolean included, which the
+// evaluator's unary minus rejects -- is not a number here.
+func NumberValue(node []byte) (Literal, bool) {
+	neg := false
+	for depth := 0; depth < 64 && len(node) > 0; depth++ {
+		switch node[0] {
+		case nInt, nReal:
+			lit, ok := LiteralValue(node)
+			if ok && neg {
+				lit.Int, lit.Real = -lit.Int, -lit.Real
+			}
+			return lit, ok
+		case nParen:
+			node = node[1:]
+		case nUnOp:
+			if len(node) < 2 || int(node[1]) >= len(unOps) {
+				return Literal{}, false
+			}
+			switch unOps[node[1]] {
+			case "-":
+				neg = !neg
+			case "+":
+			default:
+				return Literal{}, false
+			}
+			node = node[2:]
+		default:
+			return Literal{}, false
+		}
+	}
+	return Literal{}, false
+}
