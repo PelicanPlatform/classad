@@ -106,12 +106,18 @@ func plainAttr(e ast.Expr) (string, bool) {
 	return a.Name, true
 }
 
+// numericLiteral returns a literal's value as the float64 the zone maps and holds compare in.
+// An integer at or past 2^53 is refused: float64 cannot tell it from its neighbors, so neither a
+// zone verdict nor holds could decide it exactly (see floatKeyOp).
 func numericLiteral(e ast.Expr) (float64, bool) {
 	if p, ok := e.(*ast.ParenExpr); ok {
 		return numericLiteral(p.Inner)
 	}
 	switch l := e.(type) {
 	case *ast.IntegerLiteral:
+		if l.Value >= floatExactLimit || l.Value <= -floatExactLimit {
+			return 0, false
+		}
 		return float64(l.Value), true
 	case *ast.RealLiteral:
 		return l.Value, true

@@ -120,12 +120,17 @@ func numAggValue(fn AggFunc, ns NumStats) string {
 	if ns.N == 0 {
 		return ValueText(classad.NewUndefinedValue())
 	}
-	v := ns.Min
-	if fn == AggMax {
-		v = ns.Max
-	}
 	if ns.AnyReal {
+		v := ns.Min
+		if fn == AggMax {
+			v = ns.Max
+		}
 		return ValueText(classad.NewRealValue(v))
 	}
-	return ValueText(classad.NewIntValue(int64(v)))
+	// All integers: render the exact int64 extreme, not the float64 one, which cannot tell
+	// integers past 2^53 apart.
+	if fn == AggMax {
+		return ValueText(classad.NewIntValue(ns.IntMax))
+	}
+	return ValueText(classad.NewIntValue(ns.IntMin))
 }

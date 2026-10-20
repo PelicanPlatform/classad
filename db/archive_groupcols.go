@@ -153,6 +153,12 @@ func mergeGroupStats(dst, src *collections.GroupStats) {
 			*d = s
 			continue
 		}
+		// IntMin/IntMax are read only when no real contributed to either side, so both hold
+		// values whenever the result is rendered from them.
+		if !d.AnyReal && !s.AnyReal {
+			d.IntMin = min(d.IntMin, s.IntMin)
+			d.IntMax = max(d.IntMax, s.IntMax)
+		}
 		d.N += s.N
 		d.Sum += s.Sum
 		d.IntSum += s.IntSum

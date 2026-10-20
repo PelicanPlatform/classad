@@ -22,7 +22,10 @@ import (
 // statsAccum accumulates one aggregate pass, carrying the reference's type-promotion rules: SUM stays
 // integral until a real appears, and a boolean is coerced but flagged so a caller can decline rather
 // than reproduce the reference's boolean quirks.
-type statsAccum struct{ out NumStats }
+type statsAccum struct {
+	out    NumStats
+	anyInt bool // some integer contributed, so out.IntMin/IntMax hold values
+}
 
 func newStatsAccum() statsAccum {
 	return statsAccum{out: NumStats{Min: math.Inf(1), Max: math.Inf(-1)}}
@@ -34,11 +37,13 @@ func (a *statsAccum) add(nv colVal) {
 	switch nv.kind {
 	case akInt:
 		a.out.IntSum += nv.i
+		a.addInt(nv.i)
 	case akReal:
 		a.out.AnyReal = true
 	case akBool:
 		a.out.IntSum += nv.i
 		a.out.AnyBool = true
+		a.addInt(nv.i)
 	}
 	if nv.f < a.out.Min {
 		a.out.Min = nv.f
@@ -46,6 +51,16 @@ func (a *statsAccum) add(nv colVal) {
 	if nv.f > a.out.Max {
 		a.out.Max = nv.f
 	}
+}
+
+func (a *statsAccum) addInt(i int64) {
+	if !a.anyInt || i < a.out.IntMin {
+		a.out.IntMin = i
+	}
+	if !a.anyInt || i > a.out.IntMax {
+		a.out.IntMax = i
+	}
+	a.anyInt = true
 }
 
 func (a *statsAccum) result() NumStats {

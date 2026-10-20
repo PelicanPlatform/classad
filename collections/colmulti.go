@@ -69,6 +69,12 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 		if !ok || len(up.fvals) != 1 {
 			return nil, false // present/absent/in/isnt or non-numeric: not a scalar comparison
 		}
+		if up.inexact || p.Op == "is" {
+			// The comparison below is on float64, which cannot tell an integer past 2^53 from
+			// its neighbors (see floatKeyOp), nor an integer from the real of equal value that
+			// =?= must reject -- valUsable plans =?= as ==.
+			return nil, false
+		}
 		cmp, ok := numCmp(up.op, up.fvals[0])
 		if !ok {
 			return nil, false
