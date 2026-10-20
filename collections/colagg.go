@@ -29,6 +29,12 @@ type NumStats struct {
 	// -- a float64 accumulator loses precision past 2^53, so an all-integer sum rendered from
 	// Sum would disagree with the scanning aggregator on large values.
 	IntSum int64 `json:"intSum,omitempty"`
+	// IntMin/IntMax are the extremes of the INTEGER contributions, compared as int64 the way the
+	// reference's min/max compare two integers. Min/Max are float64 and cannot tell integers past
+	// 2^53 apart, so an all-integer MIN/MAX renders from these. Meaningless when no integer
+	// contributed.
+	IntMin int64 `json:"intMin,omitempty"`
+	IntMax int64 `json:"intMax,omitempty"`
 	// AnyReal records whether any contributing value was a REAL rather than an integer, which is
 	// exactly the reference's promotion rule: SUM stays an integer unless a real appears, and
 	// MIN/MAX keep their element's type. Without it the same query would print differently
@@ -140,6 +146,12 @@ func (c *Collection) numPredOnField(q *vm.Query, s *adSchema) (uint32, func(floa
 		up, ok := valUsable(id, p)
 		if !ok || len(up.fvals) != 1 {
 			return 0, nil, false // present/absent/in/isnt or non-numeric: not a scalar comparison
+		}
+		if up.inexact || p.Op == "is" {
+			// The comparison below is on float64, which cannot tell an integer past 2^53 from
+			// its neighbors (see floatKeyOp), nor an integer from the real of equal value that
+			// =?= must reject -- valUsable plans =?= as ==.
+			return 0, nil, false
 		}
 		cmp, ok := numCmp(up.op, up.fvals[0])
 		if !ok {

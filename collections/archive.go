@@ -592,7 +592,13 @@ func zonePrune(zones map[uint32]zoneRange, probes []vm.Probe, intern *wire.Inter
 		if len(vals) == 0 {
 			continue // non-numeric constraint: zone map can't rule it out
 		}
-		if !zoneMayMatch(z, p.Op, vals) {
+		// Zones hold float64 bounds, so an integer probe past 2^53 prunes only on the
+		// widened operator (see floatKeyOp).
+		op, _, ok := floatKeyOp(p.Op, p.Vals)
+		if !ok {
+			continue
+		}
+		if !zoneMayMatch(z, op, vals) {
 			return true
 		}
 	}

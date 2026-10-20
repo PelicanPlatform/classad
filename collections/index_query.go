@@ -169,6 +169,10 @@ type usableProbe struct {
 	// was emptied by a range, or by another equality, on the same attribute (see
 	// foldEqualities). An inverted band is proved structurally instead, by emptyBand.
 	unsat bool
+
+	// inexact marks a value probe on an integer float64 cannot represent exactly, whose op
+	// floatKeyOp widened. Its candidates are a superset; see floatKeyOp.
+	inexact bool
 }
 
 // twoSided reports whether up carries both bounds of a numeric band.
@@ -327,13 +331,14 @@ func mergeRange(a, b usableProbe) usableProbe {
 			hiOp, hiVal, hasHi = op, v, true
 		}
 	}
+	inexact := a.inexact || b.inexact
 	switch {
 	case hasLo && hasHi:
-		return usableProbe{attrID: a.attrID, op: loOp, fvals: []float64{loVal}, hiOp: hiOp, hiVal: hiVal}
+		return usableProbe{attrID: a.attrID, op: loOp, fvals: []float64{loVal}, hiOp: hiOp, hiVal: hiVal, inexact: inexact}
 	case hasLo:
-		return usableProbe{attrID: a.attrID, op: loOp, fvals: []float64{loVal}}
+		return usableProbe{attrID: a.attrID, op: loOp, fvals: []float64{loVal}, inexact: inexact}
 	default:
-		return usableProbe{attrID: a.attrID, op: hiOp, fvals: []float64{hiVal}}
+		return usableProbe{attrID: a.attrID, op: hiOp, fvals: []float64{hiVal}, inexact: inexact}
 	}
 }
 
@@ -937,7 +942,58 @@ func valUsable(id uint32, p vm.Probe) (usableProbe, bool) {
 		}
 		fvals = append(fvals, f)
 	}
-	return usableProbe{attrID: id, cat: false, op: op, fvals: fvals}, true
+	op, inexact, ok := floatKeyOp(op, p.Vals)
+	if !ok {
+		return usableProbe{}, false
+	}
+	return usableProbe{attrID: id, cat: false, op: op, fvals: fvals, inexact: inexact}, true
+}
+
+// floatExactLimit bounds the integers whose float64 image identifies them: every integer in
+// (-2^53, 2^53) converts exactly, and no other integer converts to the same float64. 2^53
+// itself is excluded because 2^53+1 rounds onto it.
+const floatExactLimit = 1 << 53
+
+// intBeyondFloat reports whether v is an integer that float64 cannot keep distinct from its
+// neighbors.
+func intBeyondFloat(v classad.Value) bool {
+	i, err := v.IntValue()
+	return err == nil && (i >= floatExactLimit || i <= -floatExactLimit)
+}
+
+// floatKeyOp adapts a numeric probe to structures that hold values as float64 -- value-index
+// keys, segment stats, segment and block zones -- and reports whether the probe is inexact there.
+//
+// Comparing float64(x) with float64(c) gives exactly what the comparison operators give
+// whenever the probe's integers lie in (-2^53, 2^53): a real operand is compared as a double by
+// the operators too, and an integer x on either side of such a c lands on the same side of it
+// after conversion, because conversion is monotonic and c and its neighbors c-1 and c+1 are all
+// exact. For a larger integer c, distinct integers share c's float64, so x > c only implies
+// float64(x) >= float64(c). The strict orderings are therefore widened to their non-strict forms,
+// which keeps every match; == and in already keep every match of the shared key; and != is
+// refused (ok=false), since excluding the shared key would drop integers that are not c.
+//
+// A widened probe is a candidate superset that the caller must re-verify. A path that answers
+// from the probe without re-verifying must refuse an inexact probe outright.
+func floatKeyOp(op string, vals []classad.Value) (newOp string, inexact, ok bool) {
+	for _, v := range vals {
+		if intBeyondFloat(v) {
+			inexact = true
+			break
+		}
+	}
+	if !inexact {
+		return op, false, true
+	}
+	switch op {
+	case ">":
+		return ">=", true, true
+	case "<":
+		return "<=", true, true
+	case "!=":
+		return "", true, false
+	}
+	return op, true, true
 }
 
 func numericFloat(v classad.Value) (float64, bool) {

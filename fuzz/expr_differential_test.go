@@ -123,6 +123,19 @@ var exprParityCases = []struct {
 	// A scope prefix is one token with the name after its '.', and only then.
 	{"mY. ", true, parseError},
 	{"MY.x", true, "undefined"},
+	// Two integers compare as int64 (doComparison -> compareIntegers), so integers past 2^53
+	// that share a double still order; an integer against a real is promoted to a double
+	// (coerceToNumber -> compareReals). min/max pick their extremum with < and >.
+	{"9007199254740993 > 9007199254740992", false, "true"},
+	{"9007199254740992 < 9007199254740993", false, "true"},
+	{"9007199254740993 <= 9007199254740992", false, "false"},
+	{"9007199254740992 >= 9007199254740993", false, "false"},
+	{"9223372036854775807 > 9223372036854775806", false, "true"},
+	{"-9007199254740993 < -9007199254740992", false, "true"},
+	{"9007199254740993 > 9007199254740992.0", false, "false"},
+	{"9007199254740993 == 9007199254740992.0", false, "true"},
+	{"max({9007199254740992, 9007199254740993})", false, "int(9007199254740993)"},
+	{"min({9007199254740993, 9007199254740992})", false, "int(9007199254740992)"},
 }
 
 // goEvalExpr parses src with ParseExprOld (old) or ParseExpr and evaluates it in

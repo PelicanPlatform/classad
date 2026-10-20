@@ -1292,14 +1292,23 @@ func compareStringsFold(a, b string) int {
 	}
 }
 
-// Comparison operations
+// Comparison operations.
+//
+// The ordering operators follow the reference engine's doComparison: operands
+// are promoted by coerceToNumber, so two integers (booleans count as 0/1)
+// compare as int64 and only an int/real pair promotes the integer to a double.
+// Comparing two integers as float64 would make 9007199254740993 >
+// 9007199254740992 false, since both round to 2^53.
 func (e *Evaluator) evaluateLessThan(left, right Value) Value {
 	if left.IsUndefined() || right.IsUndefined() {
 		return NewUndefinedValue()
 	}
 
-	if ln, _, _, lrv := numericOperand(left); ln {
-		if rn, _, _, rrv := numericOperand(right); rn {
+	if ln, li, liv, lrv := numericOperand(left); ln {
+		if rn, ri, riv, rrv := numericOperand(right); rn {
+			if li && ri {
+				return NewBoolValue(liv < riv)
+			}
 			return NewBoolValue(lrv < rrv)
 		}
 	}
@@ -1318,8 +1327,11 @@ func (e *Evaluator) evaluateGreaterThan(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if ln, _, _, lrv := numericOperand(left); ln {
-		if rn, _, _, rrv := numericOperand(right); rn {
+	if ln, li, liv, lrv := numericOperand(left); ln {
+		if rn, ri, riv, rrv := numericOperand(right); rn {
+			if li && ri {
+				return NewBoolValue(liv > riv)
+			}
 			return NewBoolValue(lrv > rrv)
 		}
 	}
@@ -1338,8 +1350,11 @@ func (e *Evaluator) evaluateLessOrEqual(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if ln, _, _, lrv := numericOperand(left); ln {
-		if rn, _, _, rrv := numericOperand(right); rn {
+	if ln, li, liv, lrv := numericOperand(left); ln {
+		if rn, ri, riv, rrv := numericOperand(right); rn {
+			if li && ri {
+				return NewBoolValue(liv <= riv)
+			}
 			return NewBoolValue(lrv <= rrv)
 		}
 	}
@@ -1358,8 +1373,11 @@ func (e *Evaluator) evaluateGreaterOrEqual(left, right Value) Value {
 		return NewUndefinedValue()
 	}
 
-	if ln, _, _, lrv := numericOperand(left); ln {
-		if rn, _, _, rrv := numericOperand(right); rn {
+	if ln, li, liv, lrv := numericOperand(left); ln {
+		if rn, ri, riv, rrv := numericOperand(right); rn {
+			if li && ri {
+				return NewBoolValue(liv >= riv)
+			}
 			return NewBoolValue(lrv >= rrv)
 		}
 	}

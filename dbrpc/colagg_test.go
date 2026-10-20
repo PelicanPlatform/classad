@@ -30,10 +30,13 @@ func aggPair(t *testing.T, n int) (*Client, *db.DB, func()) {
 	for i := 0; i < n; i++ {
 		qdate := 1700000000 + i // large enough that float notation would be visible
 		// Huge is chosen so the column's integer SUM exceeds 2^53: rendering that from a float64
-		// accumulator would round, and disagree with the reference's int64 sum.
+		// accumulator would round, and disagree with the reference's int64 sum. Big sits just past
+		// 2^53, where neighboring integers share a float64, so a MIN or MAX taken or rendered
+		// through float64 lands on a value no record holds.
+		big := int64(1)<<53 + int64(i%4)
 		if err := tx.NewClassAd(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf(
-			"ClusterId = %d\nProcId = %d\nRequestMemory = %d\nQDate = %d\nWallClock = %d.5\nHuge = %d",
-			i/10, i%10, ((i%16)+1)*512, qdate, i, 4000000000000+int64(i))); err != nil {
+			"ClusterId = %d\nProcId = %d\nRequestMemory = %d\nQDate = %d\nWallClock = %d.5\nHuge = %d\nBig = %d",
+			i/10, i%10, ((i%16)+1)*512, qdate, i, 4000000000000+int64(i), big)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -84,6 +87,9 @@ func TestColumnarAggregateMatchesScan(t *testing.T) {
 		{db.AggSum, "WallClock", "true"}, // a real column: promotes to a real
 		{db.AggAvg, "ProcId", "true"},
 		{db.AggAvg, "WallClock", "true"},
+		{db.AggMax, "Big", "true"}, // integers past 2^53: the float64 extreme is 2^53+4
+		{db.AggMin, "Big", "true"},
+		{db.AggMin, "Big", "Big > 9007199254740000"},             // a same-field predicate, exact below 2^53
 		{db.AggSum, "RequestMemory", "RequestMemory > 99999999"}, // empty SUM
 		{db.AggAvg, "RequestMemory", "RequestMemory > 99999999"}, // empty AVG
 	}
