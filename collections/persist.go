@@ -936,10 +936,12 @@ func (c *Collection) Close() error {
 	if watchClean && firstErr == nil {
 		c.persistWatchEpoch(watchSeqs)
 	}
-	// Release the shared columnar-block cache once. Every columnarized segment AND the schema scan
-	// share this one cache, so it is closed here rather than per-segment or per-schemaScan (closing
-	// st.cache too would double-close the same ristretto cache).
-	c.colCache.close()
+	// The columnar-block cache is NOT closed here: c.colCache is the process-wide cache for this
+	// collection's kind, shared with every other open collection of that kind, and it lives for the
+	// life of the process. This collection's entries are not evicted either. Block ids are
+	// process-unique, so no later read can ask for them again; they hold no more than the shared
+	// byte budget and are displaced by live entries as the cache admits them, the same way the
+	// blocks of a compacted or truncated segment age out.
 	return firstErr
 }
 
