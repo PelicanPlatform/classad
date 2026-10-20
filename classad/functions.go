@@ -1287,7 +1287,9 @@ func builtinMin(ev *Evaluator, args []Value) Value {
 	}
 
 	var minVal float64
+	var minInt int64
 	var minItem Value
+	minIsInt := false
 	hasValue := false
 	hasReal := false
 	contributing := 0
@@ -1300,24 +1302,27 @@ func builtinMin(ev *Evaluator, args []Value) Value {
 			continue
 		}
 
-		var val float64
-		if item.IsInteger() {
-			v, _ := item.IntValue()
-			val = float64(v)
-		} else if item.IsBool() {
-			if b, _ := item.BoolValue(); b {
-				val = 1
-			}
-		} else if item.IsReal() {
-			val, _ = item.RealValue()
-			hasReal = true
-		} else {
+		isNum, isInt, iv, val := numericOperand(item)
+		if !isNum {
 			return NewErrorValue()
+		}
+		if !isInt {
+			hasReal = true
 		}
 
 		contributing++
-		if !hasValue || val < minVal {
-			minVal = val
+		// The reference picks the extremum with the < operator, so two
+		// integers compare exactly rather than as doubles.
+		better := !hasValue
+		if hasValue {
+			if isInt && minIsInt {
+				better = iv < minInt
+			} else {
+				better = val < minVal
+			}
+		}
+		if better {
+			minVal, minInt, minIsInt = val, iv, isInt
 			minItem = item
 			hasValue = true
 		}
@@ -1367,7 +1372,9 @@ func builtinMax(ev *Evaluator, args []Value) Value {
 	}
 
 	var maxVal float64
+	var maxInt int64
 	var maxItem Value
+	maxIsInt := false
 	hasValue := false
 	hasReal := false
 	contributing := 0
@@ -1380,24 +1387,27 @@ func builtinMax(ev *Evaluator, args []Value) Value {
 			continue
 		}
 
-		var val float64
-		if item.IsInteger() {
-			v, _ := item.IntValue()
-			val = float64(v)
-		} else if item.IsBool() {
-			if b, _ := item.BoolValue(); b {
-				val = 1
-			}
-		} else if item.IsReal() {
-			val, _ = item.RealValue()
-			hasReal = true
-		} else {
+		isNum, isInt, iv, val := numericOperand(item)
+		if !isNum {
 			return NewErrorValue()
+		}
+		if !isInt {
+			hasReal = true
 		}
 
 		contributing++
-		if !hasValue || val > maxVal {
-			maxVal = val
+		// The reference picks the extremum with the > operator, so two
+		// integers compare exactly rather than as doubles.
+		better := !hasValue
+		if hasValue {
+			if isInt && maxIsInt {
+				better = iv > maxInt
+			} else {
+				better = val > maxVal
+			}
+		}
+		if better {
+			maxVal, maxInt, maxIsInt = val, iv, isInt
 			maxItem = item
 			hasValue = true
 		}

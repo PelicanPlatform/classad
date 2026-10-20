@@ -59,6 +59,7 @@ var seeds = []string{
 	`[ a = "a,b,c"; b = split(a) ]`,
 	`[ a = 1 =!= 2; b = "x" =!= "y" ]`,
 	`[ a = quantize(7, 5); b = quantize(7, {2, 4, 8}) ]`,
+	`[ a = 9007199254740993; b = 9007199254740992; c = a > b; d = a <= b; e = a == 9007199254740992.0; f = max({b, a}) ]`,
 }
 
 // seedOpts is shared by seeding and the fuzz body.
