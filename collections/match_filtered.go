@@ -83,11 +83,15 @@ func (c *Collection) collectMatchesFiltered(job *classad.ClassAd, targetExpr ast
 	var tGroups [][]usableProbe
 	tPrunable := false
 	if targetExpr != nil {
-		tplan := vm.Compile(targetExpr).ProbePlan()
+		tq := vm.Compile(targetExpr)
+		tplan := tq.ProbePlan()
 		for _, g := range tplan {
 			c.demand.record(g.Probes) // the WHERE TARGET filter is resource-index demand too
 		}
-		tGroups, tPrunable = c.planIndexGroups(tplan)
+		// Probes over a CurrentTime the slot may define would assume it does not.
+		if !tq.ReadsCurrentTime() {
+			tGroups, tPrunable = c.planIndexGroups(tplan)
+		}
 	}
 
 	if c.spec.Load().any() {

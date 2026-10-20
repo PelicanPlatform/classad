@@ -1,7 +1,7 @@
 package vm
 
 import (
-	"strings"
+	"time"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
@@ -16,28 +16,78 @@ type Query struct {
 
 // Compile compiles an already-parsed expression into a Query.
 //
-// When the expression references the magic CurrentTime attribute, its constants are folded
-// once here (FoldConstants resolves CurrentTime to the current time) so a single "now" is
-// baked into both the program and its index probes -- the constraint prunes correctly and
-// evaluates consistently, instead of the program re-reading the clock per ad. Expressions
-// that do not reference CurrentTime are compiled unchanged.
+// When the expression references the magic CurrentTime attribute, Compile reads the clock
+// once and pins it: an ad that does not define CurrentTime evaluates it to that time on
+// every evaluation, so the program and its index probes share a single "now" instead of
+// the program re-reading the clock per ad. An ad that defines CurrentTime supplies its
+// own value, as it does to the evaluator; the expression itself is compiled unchanged.
 func Compile(expr ast.Expr) *Query {
+	p := CompileProgram(expr)
 	if referencesCurrentTime(expr) {
-		expr = classad.FoldConstants(expr)
+		p.now = time.Now().Unix()
 	}
-	return &Query{prog: CompileProgram(expr)}
+	return &Query{prog: p}
 }
 
 // referencesCurrentTime reports whether expr reads the magic CurrentTime attribute (an
-// unscoped reference by that name). It reuses the read-collection walk, so it sees the same
-// unscoped references the planner does.
+// unscoped or MY reference by that name), anywhere in the expression.
 func referencesCurrentTime(expr ast.Expr) bool {
-	for _, n := range collectReads(expr, map[string]bool{}, nil) {
-		if strings.EqualFold(n, "CurrentTime") {
-			return true
+	found := false
+	var walk func(ast.Expr)
+	walk = func(e ast.Expr) {
+		if found || e == nil {
+			return
+		}
+		switch v := e.(type) {
+		case *ast.AttributeReference:
+			found = classad.IsCurrentTimeRef(v)
+		case *ast.ParenExpr:
+			walk(v.Inner)
+		case *ast.UnaryOp:
+			walk(v.Expr)
+		case *ast.BinaryOp:
+			walk(v.Left)
+			walk(v.Right)
+		case *ast.ElvisExpr:
+			walk(v.Left)
+			walk(v.Right)
+		case *ast.ConditionalExpr:
+			walk(v.Condition)
+			walk(v.TrueExpr)
+			walk(v.FalseExpr)
+		case *ast.ListLiteral:
+			for _, el := range v.Elements {
+				walk(el)
+			}
+		case *ast.FunctionCall:
+			for _, a := range v.Args {
+				walk(a)
+			}
+		case *ast.SelectExpr:
+			walk(v.Record)
+		case *ast.SubscriptExpr:
+			walk(v.Container)
+			walk(v.Index)
+		case *ast.RecordLiteral:
+			if v.ClassAd != nil {
+				for _, attr := range v.ClassAd.Attributes {
+					walk(attr.Value)
+				}
+			}
 		}
 	}
-	return false
+	walk(expr)
+	return found
+}
+
+// foldedExpr is the source expression with its constants folded for the planner. A pinned
+// CurrentTime folds to the pinned time, which is exact for an ad that does not define
+// CurrentTime (see Probe for what the planner may assume about that).
+func (q *Query) foldedExpr() ast.Expr {
+	if q.prog.now != 0 {
+		return classad.FoldConstantsAt(q.prog.expr, q.prog.now)
+	}
+	return classad.FoldConstants(q.prog.expr)
 }
 
 // Parse parses a ClassAd expression string and compiles it into a Query.
@@ -48,6 +98,10 @@ func Parse(exprStr string) (*Query, error) {
 	}
 	return Compile(expr), nil
 }
+
+// ReadsCurrentTime reports whether the query reads the magic CurrentTime attribute, so
+// its probes assume the ads do not define CurrentTime (see Probe).
+func (q *Query) ReadsCurrentTime() bool { return q != nil && q.prog != nil && q.prog.now != 0 }
 
 // Program returns the underlying compiled program.
 func (q *Query) Program() *Program { return q.prog }

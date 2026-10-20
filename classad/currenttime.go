@@ -14,11 +14,13 @@ import (
 //
 // The magic is provided in two places, which must agree:
 //   - Evaluation: evaluateAttributeReference returns the current time when an unscoped (or
-//     MY-scoped) CurrentTime reference is otherwise undefined.
-//   - Query planning: FoldConstants (flattenExpr) folds CurrentTime to a literal, so a
-//     constraint like `CompletionDate > CurrentTime - 86400` becomes an indexable range
-//     probe and can prune whole segments/zones. The query compiler folds once at compile
-//     time (see collections/vm), so a single "now" is shared by the program and its probes.
+//     MY-scoped) CurrentTime reference is otherwise undefined. An Evaluator can pin that
+//     time (PinCurrentTime), so every evaluation of a compiled query sees one "now".
+//   - Query planning: FoldConstantsAt folds CurrentTime to a given time, so a constraint
+//     like `CompletionDate > CurrentTime - 86400` becomes an indexable range probe and can
+//     prune whole segments/zones. That fold is exact only for an ad that does not define
+//     CurrentTime, so FoldConstants, whose result must evaluate like its input in any
+//     scope, leaves the reference alone.
 
 // currentTimeAttr is the folded (lower-case) name of the magic attribute.
 const currentTimeAttr = "currenttime"

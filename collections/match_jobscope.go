@@ -304,6 +304,16 @@ func slotFrameRef(n *ast.AttributeReference, js *jobScope) (e ast.Expr, absentUn
 	case jobRefDep:
 		return &ast.AttributeReference{Name: n.Name, Scope: ast.TargetScope}, false
 	}
+	if classad.IsCurrentTimeRef(n) {
+		// The job does not define CurrentTime, yet it is not undefined: unscoped, it is the
+		// slot's own CurrentTime or the current time, which is what the slot-frame
+		// reference evaluates to; MY.CurrentTime is the current time whatever the slot
+		// holds, so it stays the job's (opaque) reference.
+		if n.Scope == ast.MyScope {
+			return &ast.AttributeReference{Name: n.Name, Scope: ast.TargetScope}, false
+		}
+		return &ast.AttributeReference{Name: n.Name, Scope: ast.NoScope}, false
+	}
 	if n.Scope == ast.MyScope {
 		return &ast.UndefinedLiteral{}, false
 	}

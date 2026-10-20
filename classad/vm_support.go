@@ -130,11 +130,40 @@ func FromAST(a *ast.ClassAd) *ClassAd {
 // empty scope so attribute references are left intact. It is a thin bridge over
 // the flattener (see ClassAd.Flatten) for query planners that pattern-match
 // normalized expressions. Returns nil for a nil input.
+//
+// The result evaluates exactly as e does in any scope. That is why CurrentTime is
+// left as a reference: its value is the scope's own CurrentTime when the scope
+// defines one, so it is not a constant (see FoldConstantsAt).
 func FoldConstants(e ast.Expr) ast.Expr {
 	if e == nil {
 		return nil
 	}
-	return New().flattenExpr(e)
+	return (&flattener{c: New(), time: timeKeep, keepLists: true}).flatten(e)
+}
+
+// FoldConstantsAt is FoldConstants that also folds the magic CurrentTime attribute
+// (an unscoped or MY reference) to now. The result evaluates as e does in a scope
+// that does not define CurrentTime, at time now; in a scope that defines it, it may
+// not. A query planner uses it to turn `CompletionDate > CurrentTime - 86400` into a
+// range probe.
+func FoldConstantsAt(e ast.Expr, now int64) ast.Expr {
+	if e == nil {
+		return nil
+	}
+	return (&flattener{c: New(), time: timeFixed, now: now, keepLists: true}).flatten(e)
+}
+
+// IsCurrentTimeRef reports whether ref names the magic CurrentTime attribute: an
+// unscoped or MY reference, which evaluates to the current time when the scope does
+// not define CurrentTime.
+func IsCurrentTimeRef(ref *ast.AttributeReference) bool { return isCurrentTimeRef(ref) }
+
+// PinCurrentTime makes a CurrentTime reference the scope does not define evaluate
+// to now rather than to the clock's current reading, so every evaluation of a
+// compiled query sees one time. now == 0 restores reading the clock. An ad that
+// defines CurrentTime still supplies its own value.
+func (e *Evaluator) PinCurrentTime(now int64) {
+	e.now = now
 }
 
 // RecoverCyclic converts a cyclic-reference panic raised during evaluation into

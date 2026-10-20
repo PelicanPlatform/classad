@@ -136,6 +136,48 @@ var exprParityCases = []struct {
 	{"9007199254740993 == 9007199254740992.0", false, "true"},
 	{"max({9007199254740992, 9007199254740993})", false, "int(9007199254740993)"},
 	{"min({9007199254740993, 9007199254740992})", false, "int(9007199254740992)"},
+	// && and || are evaluated left to right and are not commutative (operators.cpp
+	// Operation::shortCircuit, then doLogical): the left operand alone decides FALSE && x,
+	// TRUE || x and ERROR on the left, while a non-boolean operand on either side (a number
+	// is read as a boolean) makes the result ERROR. TestExprParity also evaluates each
+	// case after classad.FoldConstants, so these pin which folds are sound: a literal on
+	// the right decides nothing about a left operand that may be ERROR or non-boolean.
+	{`"s" && false`, false, "error"},
+	{`"s" || true`, false, "error"},
+	{`false || "s"`, false, "error"},
+	{`true && "s"`, false, "error"},
+	{`true && {1}`, false, "error"},
+	{`error && false`, false, "error"},
+	{`error || true`, false, "error"},
+	{`false && error`, false, "false"},
+	{`true || error`, false, "true"},
+	{`false && "s"`, false, "false"},
+	{`undefined && false`, false, "false"},
+	{`undefined || true`, false, "true"},
+	{`undefined && true`, false, "undefined"},
+	{`true && 5`, false, "true"},
+	{`5 && true`, false, "true"},
+	{`0 || false`, false, "false"},
+	{`[x = "s"].x && false`, false, "error"},
+	{`[x = "s"].x || true`, false, "error"},
+	{`([x = "s"].x && false) =!= false`, false, "true"},
+	{`(false || [x = "s"].x) =?= "s"`, false, "false"},
+	{`(true && [x = 5].x) =?= true`, false, "true"},
+	{`([x = 5].x && true) =?= true`, false, "true"},
+	{`([x = 2.5].x || false) =?= true`, false, "true"},
+	{`isError([x = error].x && false)`, false, "true"},
+	{`isError(true && [x = "s"].x)`, false, "true"},
+	{`(true && ([x = "s"].x == 1)) =?= error`, false, "true"},
+	// A list's elements are expressions until read, and string() prints them, so
+	// FoldConstants leaves list literals as written.
+	{`string({1 + 1})`, false, `string("{ 1 + 1 }")`},
+	// HTCondor's old ClassAd semantics (ClassAdReconfig -> SetOldClassAdSemantics) make
+	// CurrentTime an alias for time() only where the ad does not define it
+	// (classad.cpp ClassAd::LookupInScope), so FoldConstants cannot fold it to a time.
+	{`[CurrentTime = 5; r = CurrentTime].r`, false, "int(5)"},
+	{`[CurrentTime = 5; r = MY.CurrentTime].r`, false, "int(5)"},
+	{`[CurrentTime = 5; r = CurrentTime + 1].r`, false, "int(6)"},
+	{`CurrentTime > 1700000000`, false, "true"},
 }
 
 // goEvalExpr parses src with ParseExprOld (old) or ParseExpr and evaluates it in
@@ -184,7 +226,25 @@ func TestExprParity(t *testing.T) {
 			t.Errorf("%q (old=%v): Go=%s libclassad=%s", tc.src, tc.old,
 				describeResult(goVal, goParsed), describeResult(cppVal, cppParsed))
 		}
+		// Constant folding must not change the value.
+		if foldVal, ok := goEvalFolded(tc.src, tc.old); ok && cppParsed && !canon.Equal(foldVal, cppVal, canon.DefaultTolerance) {
+			t.Errorf("%q (old=%v): Go after FoldConstants=%s libclassad=%s", tc.src, tc.old,
+				canon.Describe(foldVal), canon.Describe(cppVal))
+		}
 	}
+}
+
+// goEvalFolded is goEvalExpr on the expression after classad.FoldConstants.
+func goEvalFolded(src string, old bool) (canon.Value, bool) {
+	parse := classad.ParseExpr
+	if old {
+		parse = classad.ParseExprOld
+	}
+	e, err := parse(src)
+	if err != nil {
+		return canon.Value{}, false
+	}
+	return canon.FromGoValue(e.FoldConstants().Eval(classad.New())), true
 }
 
 // exprFuzzSeeds are config-function arguments and the cases above.

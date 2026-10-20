@@ -1,7 +1,6 @@
 package classad
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
@@ -59,25 +58,43 @@ func TestCurrentTimeAdOverride(t *testing.T) {
 	}
 }
 
-// TestFoldConstantsCurrentTime verifies FoldConstants replaces CurrentTime with a literal so
-// the query optimizer sees a constant threshold (range-probe extraction).
+// TestFoldConstantsCurrentTime verifies FoldConstants leaves CurrentTime alone (an ad may
+// define it, so it is not a constant) and FoldConstantsAt replaces it with the given time,
+// so the query optimizer sees a constant threshold (range-probe extraction).
 func TestFoldConstantsCurrentTime(t *testing.T) {
-	before := time.Now().Unix()
 	e, err := ParseExpr(`CompletionDate > CurrentTime - 86400`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	folded := FoldConstants(e.internal())
-	if strings.Contains(strings.ToLower(folded.String()), "currenttime") {
-		t.Errorf("FoldConstants left CurrentTime unfolded: %q", folded.String())
+	if got := FoldConstants(e.internal()).String(); got != "(CompletionDate > (CurrentTime - 86400))" {
+		t.Errorf("FoldConstants = %q, want CurrentTime kept", got)
 	}
-	// The RHS folds to a literal now-86400.
-	rhs, _ := ParseExpr(`CurrentTime - 86400`)
-	n, err := New().exprToValue(FoldConstants(rhs.internal())).IntValue()
-	if err != nil {
-		t.Fatalf("CurrentTime - 86400 did not fold to an int literal: %q", FoldConstants(rhs.internal()).String())
+	const now = 1700000000
+	if got := FoldConstantsAt(e.internal(), now).String(); got != "(CompletionDate > 1699913600)" {
+		t.Errorf("FoldConstantsAt = %q, want CurrentTime folded to %d", got, now)
 	}
-	if n < before-86400 || n > time.Now().Unix()-86400+1 {
-		t.Errorf("folded CurrentTime-86400 = %d, out of expected range", n)
+	my, _ := ParseExpr(`MY.CurrentTime`)
+	if got := FoldConstantsAt(my.internal(), now).String(); got != "1700000000" {
+		t.Errorf("FoldConstantsAt(MY.CurrentTime) = %q, want %d", got, now)
+	}
+	tgt, _ := ParseExpr(`TARGET.CurrentTime`)
+	if got := FoldConstantsAt(tgt.internal(), now).String(); got != "TARGET.CurrentTime" {
+		t.Errorf("FoldConstantsAt(TARGET.CurrentTime) = %q, want the reference kept", got)
+	}
+}
+
+// TestPinCurrentTime verifies a pinned evaluator resolves an undefined CurrentTime to the
+// pinned time, and an ad's own CurrentTime still wins.
+func TestPinCurrentTime(t *testing.T) {
+	e, _ := ParseExpr(`CurrentTime + MY.CurrentTime`)
+	ev := NewEvaluator(New())
+	ev.PinCurrentTime(1000)
+	if v, _ := ev.Evaluate(e.internal()).IntValue(); v != 2000 {
+		t.Errorf("pinned CurrentTime + MY.CurrentTime = %d, want 2000", v)
+	}
+	ad, _ := Parse(`[CurrentTime = 7]`)
+	ev.SetScope(ad)
+	if v, _ := ev.Evaluate(e.internal()).IntValue(); v != 14 {
+		t.Errorf("ad-defined CurrentTime + MY.CurrentTime = %d, want 14", v)
 	}
 }

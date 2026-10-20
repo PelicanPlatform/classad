@@ -45,3 +45,38 @@ func TestProbePlanDNF(t *testing.T) {
 		}
 	}
 }
+
+// TestProbesLeftBiasedLogic verifies the probes of a query whose && / || has a literal
+// operand describe the query as written. && and || are evaluated left to right, and a
+// literal on the right decides nothing about a left operand that is ERROR or not boolean:
+// with X = "str", `X && false` is ERROR, so `(X && false) || ProcId == 5` matches nothing,
+// and `true && X` with X = 5 is TRUE although X itself is not. Folded to `ProcId == 5` or
+// to the bare `X`, they would be reported as exactly equivalent to the query, and a count
+// answered from them would be wrong.
+func TestProbesLeftBiasedLogic(t *testing.T) {
+	for _, tc := range []struct {
+		src   string
+		exact bool
+	}{
+		{`(X && false) || ProcId == 5`, false},
+		{`ProcId == 5 && (true && X)`, false},
+		{`ProcId == 5 && (X && true)`, false},
+		{`(false || X) && ProcId == 5`, false},
+		{`ProcId == 5 && (true && X > 3)`, true}, // a comparison passes through `true &&`
+		{`(ProcId == 5 || false) && X > 3`, true},
+		{`false || ProcId == 5`, true},
+	} {
+		q, err := Parse(tc.src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, exact := q.ExactProbes(); exact != tc.exact {
+			t.Errorf("%s: ExactProbes exact = %v, want %v", tc.src, exact, tc.exact)
+		}
+	}
+	// The fold that remains sound still feeds the planner.
+	q, _ := Parse(`ProcId == 5 && (true && X > 3)`)
+	if p := q.Probes(); len(p) != 2 {
+		t.Errorf("probes = %v, want ProcId == 5 and X > 3", p)
+	}
+}

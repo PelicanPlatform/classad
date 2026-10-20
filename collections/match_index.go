@@ -158,10 +158,14 @@ func (c *Collection) ExplainMatch(job *classad.ClassAd, targetConstraint string)
 	// is transparent -- an always-true indexed flag reads as a late re-check, not a probe.
 	ex.EvalOrder = c.conjunctExplains(reqExpr, js)
 	// Probes: from the probe rewrite (opaque functions -> undefined, so they drop).
-	plan := vm.Compile(c.slotMatchExpr(reqExpr, js)).ProbePlan()
+	slotQ := vm.Compile(c.slotMatchExpr(reqExpr, js))
+	plan := slotQ.ProbePlan()
 	groups, prunable := c.planIndexGroups(plan)
 	if frac, ok := c.planFrac(groups); prunable && ok && frac > maxPushdownFrac {
 		prunable = false // estimated to barely prune -> a scan is cheaper
+	}
+	if slotQ.ReadsCurrentTime() {
+		prunable = false // see slotMatchPlan
 	}
 	for _, g := range plan {
 		// Report the merged probe's selectivity for every range conjunct folded into it,
@@ -330,6 +334,11 @@ func rewriteForSlot(e ast.Expr, js *jobScope, assumed map[string]bool, inCtrl bo
 	switch n := e.(type) {
 	case *ast.AttributeReference:
 		if n.Scope == ast.TargetScope {
+			if strings.EqualFold(n.Name, "CurrentTime") {
+				// TARGET.CurrentTime is undefined when the slot lacks it, but the slot's own
+				// CurrentTime reads the current time then: no slot-frame form says the same.
+				return &ast.AttributeReference{Name: opaqueSlotRef, Scope: ast.TargetScope}
+			}
 			return &ast.AttributeReference{Name: n.Name, Scope: ast.NoScope}
 		}
 		ref, absentUnscoped := slotFrameRef(n, js)
@@ -700,14 +709,44 @@ func (c *Collection) tryMaterializeLeaf(leaf ast.Expr) ast.Expr {
 	for _, v := range values {
 		ad := classad.New()
 		insertCatValue(ad, attr, v) // typed insert so boolean "true"/"false" evaluate correctly
-		if b, err := ad.EvaluateExpr(leaf).BoolValue(); err == nil && b {
+		// Truthy, not just TRUE: && and || read a nonzero number as TRUE, so a leaf that
+		// yields 5 for this value still satisfies the predicate around it.
+		if b, ok := truthOf(ad.EvaluateExpr(leaf)); ok && b {
 			if f := strings.ToLower(v); !passingFolded[f] {
 				passingFolded[f] = true
 				passing = append(passing, f)
 			}
 		}
 	}
-	return membershipExpr(attr, passing)
+	m := membershipExpr(attr, passing)
+	// The membership is undefined on a slot without the attribute, but the leaf need not
+	// be: `ifThenElse(isUndefined(V), true, ...)` is TRUE there, and its negation is TRUE
+	// where the leaf is FALSE. Carry the leaf's value on such a slot into the probe form.
+	absentRef := &ast.AttributeReference{Name: attr, Scope: ast.NoScope}
+	switch b, ok := truthOf(classad.New().EvaluateExpr(leaf)); {
+	case ok && b:
+		return &ast.BinaryOp{Op: "||", Left: m, Right: &ast.BinaryOp{Op: "is", Left: absentRef, Right: &ast.UndefinedLiteral{}}}
+	case ok:
+		return &ast.BinaryOp{Op: "&&", Left: &ast.BinaryOp{Op: "isnt", Left: absentRef, Right: &ast.UndefinedLiteral{}}, Right: m}
+	}
+	return m
+}
+
+// truthOf is how && and || read v: a boolean, or a number (nonzero is TRUE). ok is false
+// for undefined, error and every other type.
+func truthOf(v classad.Value) (b, ok bool) {
+	switch {
+	case v.IsBool():
+		b, err := v.BoolValue()
+		return b, err == nil
+	case v.IsInteger():
+		i, err := v.IntValue()
+		return i != 0, err == nil
+	case v.IsReal():
+		r, err := v.RealValue()
+		return r != 0, err == nil
+	}
+	return false, false
 }
 
 // insertCatValue inserts a categorical index value into ad for materialization,
@@ -790,7 +829,12 @@ func (c *Collection) slotMatchPlan(job *classad.ClassAd, js *jobScope) (groups [
 	if reqExpr == nil {
 		return nil, false
 	}
-	plan := vm.Compile(c.slotMatchExpr(reqExpr, js)).ProbePlan()
+	q := vm.Compile(c.slotMatchExpr(reqExpr, js))
+	if q.ReadsCurrentTime() {
+		// The probes assume a slot does not define CurrentTime, and a slot may.
+		return nil, false
+	}
+	plan := q.ProbePlan()
 	groups, prunable = c.planIndexGroups(plan)
 	if frac, ok := c.planFrac(groups); prunable && ok && frac > maxPushdownFrac {
 		// The estimated candidate union is nearly the whole set -- the index would

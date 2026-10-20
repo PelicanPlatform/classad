@@ -186,13 +186,16 @@ func TestMatchLeftBiasedOr(t *testing.T) {
 // wire-native (literal slot attributes) and not (a function call, an expression-valued
 // slot attribute). Some read job attributes whose value depends on the slot
 // (matchDiffJob's Dep*), directly or through another job attribute, or read the slot
-// through an unscoped name the job does not define.
+// through an unscoped name the job does not define. Others put a literal beside && or ||,
+// which decides nothing when it is on the right, or read CurrentTime, which one slot defines.
 var matchDiffAtoms = []string{
 	`TARGET.A`, `TARGET.B`, `(TARGET.N > 2)`, `(TARGET.N * 2 > 1)`, `(TARGET.S == "x")`,
 	`(TARGET.E > 0)`, `(size(TARGET.S) > 1)`, `(TARGET.N >= RequestN)`, `MY.JobFlag`,
 	`true`, `false`, `undefined`, `error`, `"str"`, `TARGET.Missing`,
 	`MY.DepB`, `(MY.DepN > 3)`, `DepChain`, `(MY.DepS == "x")`, `(N > 2)`,
 	`(MY.DepB =!= undefined)`, `(MY.DepB ?: false)`, `(DepN is 6)`,
+	`(TARGET.A && false)`, `(true && TARGET.N)`, `(TARGET.B || false)`,
+	`((TARGET.A && false) =!= false)`, `((true && TARGET.A) =?= true)`, `(CurrentTime < 1000)`,
 }
 
 // matchDiffJob is the differential job: target-independent attributes, attributes that
@@ -264,10 +267,11 @@ func matchDiffSlots() []string {
 			}
 		}
 	}
-	// Absent attributes.
+	// Absent attributes, and a slot that defines CurrentTime.
 	out = append(out,
 		fmt.Sprintf(`[ Id = %d; Requirements = true ]`, id),
-		fmt.Sprintf(`[ Id = %d; A = true; N = 5; Requirements = true ]`, id+1))
+		fmt.Sprintf(`[ Id = %d; A = true; N = 5; Requirements = true ]`, id+1),
+		fmt.Sprintf(`[ Id = %d; A = "str"; N = 0; CurrentTime = 5; Requirements = true ]`, id+2))
 	return out
 }
 
