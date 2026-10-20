@@ -4,9 +4,11 @@
 > interned segments at compaction, with per-segment dictionaries; recovery restores them; every
 > read path (scan, point lookup, index build, adschema) resolves segment-local ids. On by
 > default; validated by the full collections suite plus `TestInterningEndToEnd` /
-> `TestInterningSchemaScan`. Follow-ups: hot-header on the interned encode, corrupt-dict
-> auto-rebuild, tighter dict reserve, then phase 2 (encryption) / phase 3 (migrate + retire
-> inline).
+> `TestInterningSchemaScan`. Since then: the hot header is written on interned encodes, and
+> interning composes with encryption (names in the dictionary, values sealed). Mutable
+> collections intern every compaction output; append-only collections intern at retrain or
+> rewrite, or at seal with `InternAtSeal`. Active segments stay inline. See chapter 3 of
+> [the design book](README.md).
 
 ## Motivation
 

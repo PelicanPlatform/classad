@@ -1,6 +1,8 @@
 # Design: pageable primary key index (key-count past RAM)
 
-Status: proposal / RFC
+Status: implemented. Sealed segments carry a key index (the KIDX section of the
+`<seg>.idx` sidecar container) and their keys are evicted from `shard.dir`; see chapters 5
+and 8 of [the design book](design/README.md). The text below is the original proposal.
 Scope: `collections` mmap-segment store (and, transitively, `db`, the collector, htcondordb)
 
 ## Problem

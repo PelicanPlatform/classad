@@ -1,6 +1,8 @@
 # Design note: mmap-backed indexes for sealed segments (live + in-memory)
 
-Status: plan. Stacked on the MPH work (sidecar v6, PR #27).
+Status: implemented. The attribute index is now the ARCX v9 section of a per-segment sidecar
+container (`SCN4`); see chapters 8 and 12 of [the design book](README.md). The text below is
+the original plan.
 
 ## Motivation
 

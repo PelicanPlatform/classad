@@ -1,5 +1,11 @@
 # Design: the ClassAd history / archive store
 
+> **Superseded.** This is the original design of the archive as a separate store type, kept for
+> its rationale. The archive has since been reimplemented as an append-only mode of `Collection`
+> (`Options.AppendOnly`), with no catalog file; zone maps, sidecars and rotation are now
+> `Collection` features. The current design is chapter 18 of
+> [the design book](design/README.md#18-the-history-archive).
+
 > Status: **implemented (H1–H5)** in `collections/archive*.go`. Built on the mmap
 > segment backend + epoch reclamation (`mmapseg.go`, `segment.pin/unpin/retire/reap`,
 > `shard.snapshot`/`releaseWindows`). Companion to the in-memory `collections` store

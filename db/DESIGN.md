@@ -1,5 +1,20 @@
 # ClassAd DB: embedded + client/server
 
+> **Status.** This is the July 2026 design for the first versions of both modules. Both have
+> shipped and grown well beyond it:
+> - the catalog of tables, archive tables, views and exporters;
+> - encryption at rest, and snapshot/restore;
+> - delta records and time travel;
+> - aggregate and TopK pushdown;
+> - replication hooks;
+> - a much larger C and RPC surface.
+>
+> The current design and on-disk layout are chapter 22 of
+> [the collections design book](../collections/docs/design/README.md#22-the-db-package-tables-catalog-views-exporters).
+> The "planned" sections below are historical. The zero-alloc wire path was delivered as
+> `UpdateOld` and the raw-wire read and ingest paths rather than `PutWire`. The dbrpc
+> framing and pool shipped in `dbrpc/`.
+
 Two standalone modules layered on the `collections` store (which already provides
 memory-dense storage, indexing, wire-native match, and multi-writer MVCC
 transactions). Each has its own `go.mod` so it can pull in additional dependencies
