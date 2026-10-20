@@ -51,7 +51,8 @@ func (a *Archive) CategoricalGroupCounts(attr string) (map[string]int64, bool) {
 // It is cheap for the same reason the ungrouped form is, plus one more: an archive is
 // append-ordered, so a segment's values for a monotonically advancing attribute like a
 // completion time span a narrow range. When a segment's zone map for bucketAttr falls
-// wholly inside one bucket -- the common case -- every record in it belongs to that bucket
+// wholly inside one bucket and every record holds a number for it -- the common case --
+// every record in it belongs to that bucket
 // and its per-value counts are attributed wholesale, with no record read. Only the segments
 // straddling a bucket boundary are scanned, and with buckets much wider than a segment's
 // time span those are a small minority.
@@ -98,9 +99,10 @@ func (c *Collection) categoricalGroupCountsBucketed(attr, bucketAttr string, wid
 				z, hasZone := w.zones[zoneID]
 				idx := w.seg.readIdx()
 				covered := 0
-				// Whole-segment attribution: the segment's entire value range for bucketAttr
-				// sits in one bucket, so every record it holds lands there.
-				if idx != nil && hasZone && bucketOf(z.Min, width) == bucketOf(z.Max, width) {
+				// Whole-segment attribution: every record holds a number for bucketAttr (Full)
+				// and the segment's entire range sits in one bucket, so every record lands there.
+				// Without Full a record with no bucket value would be counted in one.
+				if idx != nil && hasZone && z.Full && bucketOf(z.Min, width) == bucketOf(z.Max, width) {
 					b := bucketOf(z.Min, width)
 					covered = min(int(idx.coveredUpto()), w.used)
 					complete := idx.catCanonicalValues(id, func(v string) bool {

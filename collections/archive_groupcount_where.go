@@ -297,12 +297,16 @@ func segmentVerdict(w segWindow, conds []rangeCond, condIDs []uint32) segVerdict
 	for i, cond := range conds {
 		z, ok := w.zones[condIDs[i]]
 		if !ok {
-			return segStraddle // undecidable without reading records
+			return segStraddle // undecidable without reading records (including an expression-valued one)
 		}
+		// The zone's range holds every value that could satisfy the condition, so one that
+		// rules the condition out rules out the segment. Every record is in the range only
+		// when the zone is Full; a record with no value fails the condition, so without Full
+		// the segment cannot be counted wholesale.
 		if cond.neverHolds(z) {
 			return segNever
 		}
-		if !cond.alwaysHolds(z) {
+		if !z.Full || !cond.alwaysHolds(z) {
 			always = false
 		}
 	}

@@ -178,8 +178,9 @@ func (sh *shard) overRetention(r Retention, idx int, now float64, maxAgeID uint3
 		}
 	}
 	// MaxAge ceiling: newest MaxAgeAttr value older than now-MaxAge ⇒ drop, unconditionally.
-	// (A segment with no zone for the attribute carries no such value and is left to the
-	// size ceilings above; the active segment has nil zones and is never dropped here.)
+	// (A segment with no zone for the attribute is left to the size ceilings above: it holds
+	// no numeric value for it, or some record holds an expression whose age only evaluating
+	// it could tell, so it is kept. The active segment has nil zones and is never dropped here.)
 	if r.MaxAge > 0 && maxAgeOK {
 		if z, ok := sh.segs[idx].zones[maxAgeID]; ok && z.Max < now-r.MaxAge {
 			return true

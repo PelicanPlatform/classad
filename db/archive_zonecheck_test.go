@@ -71,3 +71,72 @@ func TestArchiveZoneCheckAfterRuntimeIndex(t *testing.T) {
 		}
 	}
 }
+
+// The same check over records whose zone attribute is not a literal: an expression (evaluating far
+// past every literal), and a negative constant (stored as unary minus). Segment zones once skipped
+// both, so the segments holding them were pruned for any range they fell in but the literals did
+// not -- here every one, since both sit in the oldest, sealed segment.
+func TestArchiveZoneCheckExpressionValued(t *testing.T) {
+	dir := t.TempDir()
+	cat, err := OpenCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := ArchiveConfig{SegmentSize: 16 << 10, CategoricalAttrs: []string{"Owner"},
+		ZoneAttrs: []string{"CompletionDate"}}
+	a, err := cat.CreateArchiveTable("history", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 1000 {
+		cd := fmt.Sprintf("%d", 1700000000+i)
+		switch i {
+		case 3:
+			cd = "1700000000 + 100000"
+		case 5:
+			cd = "-5"
+		}
+		if aerr := a.AppendOld(fmt.Sprintf("ID = %d\nOwner = \"u%d\"\nCompletionDate = %s\n"+
+			"Pad = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx%d\"", i, i%3, cd, i)); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	check := func(stage string) {
+		t.Helper()
+		for _, pair := range [][2]string{
+			{"CompletionDate > 1700050000", "CompletionDate + 0 > 1700050000"},
+			{"CompletionDate == 1700100000", "CompletionDate + 0 == 1700100000"},
+			{"CompletionDate < 0", "CompletionDate + 0 < 0"},
+			{"CompletionDate == -5", "CompletionDate + 0 == -5"},
+		} {
+			pruned, unpruned := zoneCheckCount(t, a, pair[0]), zoneCheckCount(t, a, pair[1])
+			if pruned != unpruned || unpruned != "1" {
+				t.Errorf("%s: %s counts %s, %s counts %s, want 1", stage, pair[0], pruned, pair[1], unpruned)
+			}
+			got, gerr := a.Aggregate(pair[0], []string{"Owner"}, []AggSpec{{Func: AggCount, Arg: "*"}})
+			if gerr != nil {
+				t.Fatal(gerr)
+			}
+			want, werr := a.Aggregate(pair[1], []string{"Owner"}, []AggSpec{{Func: AggCount, Arg: "*"}})
+			if werr != nil {
+				t.Fatal(werr)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(want) || len(want) != 1 {
+				t.Errorf("%s: GROUP BY Owner WHERE %s: %v, want %v", stage, pair[0], got, want)
+			}
+		}
+	}
+	check("written")
+	if cerr := cat.Close(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	if cat, err = OpenCatalog(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	var ok bool
+	if a, ok = cat.ArchiveTable("history"); !ok {
+		t.Fatal("history not reopened")
+	}
+	check("reopened")
+}

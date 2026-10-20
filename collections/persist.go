@@ -653,8 +653,9 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 					c.openIdxDiag.note("attr-section-missing-or-stale")
 				}
 			}
-			// Fall back to rebuilding only when the sidecar carried no zone map (written
-			// before v3, or none configured at the time). This decodes every record of the
+			// Fall back to rebuilding only when the sidecar carried no zone map it can trust
+			// (written before v3, in an older section format, or with none configured at the
+			// time). This decodes every record of the
 			// segment, so it is the phase that turns a segment-count reopen into a record-count
 			// one -- timed separately (ZoneRecompute) so the log can pin it.
 			if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {

@@ -339,31 +339,46 @@ func writeFileAtomic(path string, b []byte) error {
 // to another and prunes segments that hold matches: silently wrong answers, and age retention
 // dropping segments by the wrong attribute.
 //
-// Format: [zoneBlobMagic u32][n u32] then n x { nameLen u16, name, min f64, max f64 }. Empty when
-// the segment has no zone map. A legacy section ([n u32] then n x { id u32, min f64, max f64 })
-// cannot be told which attributes its ids meant, so it is never adopted: the segment's zones are
-// recomputed once and the sidecar rewritten in this format (see persistSegZonesUpgrade). The
-// magic cannot open a valid legacy section, which would need a 16 GiB blob, so neither format is
-// mistaken for the other -- including by an older build, which rejects this one as malformed and
-// recomputes.
+// Format: [zoneBlobMagic u32][n u32] then n x { nameLen u16, name, flags u8, min f64, max f64 },
+// flags bit 0 being zoneRange.Full. A segment with zone attributes but no entries writes the
+// header alone, so it is adopted as such rather than recomputed at every open; a segment with no
+// zone attributes writes nothing.
+//
+// Two older formats are well-formed but never adopted; the segment's zones are recomputed once
+// and the sidecar rewritten in this format (see persistSegZonesUpgrade):
+//   - id-keyed ([n u32] then n x { id u32, min f64, max f64 }): cannot be told which attributes
+//     its ids meant. Its marker-free layout cannot be mistaken for a marked one, which would need
+//     a 16 GiB blob.
+//   - "ZNM2" (as above without flags): its ranges skipped every value that was not a numeric
+//     literal, expressions included, so one can exclude a record whose expression evaluates
+//     into a queried range, and pruning on it drops that record.
+//
+// An older build rejects this section as malformed and recomputes, since neither its marker nor
+// the id-keyed layout matches.
 
-// zoneBlobMagic opens a name-keyed zone section ("ZNM2").
-const zoneBlobMagic uint32 = 0x324d4e5a
+// zoneBlobMagic opens a name-keyed zone section with flags ("ZNM3").
+const zoneBlobMagic uint32 = 0x334d4e5a
+
+// zoneBlobMagicV2 opened the previous name-keyed section ("ZNM2"), which is never adopted.
+const zoneBlobMagicV2 uint32 = 0x324d4e5a
+
+// zoneFlagFull marks a zoneRange.Full entry; any other flag bit makes the section malformed.
+const zoneFlagFull = 1 << 0
 
 // zoneBlobStatus is what parseZoneBlob made of a section.
 type zoneBlobStatus uint8
 
 const (
 	zoneBlobBad    zoneBlobStatus = iota // empty or malformed: not a zone map
-	zoneBlobLegacy                       // well-formed but id-keyed: not to be trusted
+	zoneBlobLegacy                       // an older format (id-keyed or ZNM2): not to be trusted
 	zoneBlobOK
 )
 
 // buildZoneBlob encodes a zone map keyed by the names nameOf gives its ids. An id with no name
 // is left out: a missing entry only stops that attribute pruning, where a wrong one would prune
-// wrongly.
+// wrongly. A nil map encodes as nothing, an empty one as the header alone.
 func buildZoneBlob(zones map[uint32]zoneRange, nameOf func(uint32) (string, bool)) []byte {
-	if len(zones) == 0 {
+	if zones == nil {
 		return nil
 	}
 	type entry struct {
@@ -376,16 +391,18 @@ func buildZoneBlob(zones map[uint32]zoneRange, nameOf func(uint32) (string, bool
 			entries = append(entries, entry{name, z})
 		}
 	}
-	if len(entries) == 0 {
-		return nil
-	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
-	b := make([]byte, 0, 8+len(entries)*32)
+	b := make([]byte, 0, 8+len(entries)*33)
 	b = binary.LittleEndian.AppendUint32(b, zoneBlobMagic)
 	b = binary.LittleEndian.AppendUint32(b, uint32(len(entries)))
 	for _, e := range entries {
 		b = binary.LittleEndian.AppendUint16(b, uint16(len(e.name)))
 		b = append(b, e.name...)
+		var flags byte
+		if e.z.Full {
+			flags |= zoneFlagFull
+		}
+		b = append(b, flags)
 		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(e.z.Min))
 		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(e.z.Max))
 	}
@@ -400,7 +417,10 @@ func parseZoneBlob(b []byte, idOf func(string) (uint32, bool)) (map[uint32]zoneR
 	if len(b) < 4 {
 		return nil, zoneBlobBad
 	}
-	if binary.LittleEndian.Uint32(b) != zoneBlobMagic {
+	switch magic := binary.LittleEndian.Uint32(b); {
+	case magic == zoneBlobMagicV2:
+		return nil, zoneBlobLegacy
+	case magic != zoneBlobMagic:
 		if legacyZoneBlobValid(b) {
 			return nil, zoneBlobLegacy
 		}
@@ -410,7 +430,7 @@ func parseZoneBlob(b []byte, idOf func(string) (uint32, bool)) (map[uint32]zoneR
 		return nil, zoneBlobBad
 	}
 	n := int(binary.LittleEndian.Uint32(b[4:]))
-	out := make(map[uint32]zoneRange, n)
+	out := make(map[uint32]zoneRange, min(n, len(b)/19))
 	off := 8
 	for range n {
 		if len(b) < off+2 {
@@ -418,19 +438,20 @@ func parseZoneBlob(b []byte, idOf func(string) (uint32, bool)) (map[uint32]zoneR
 		}
 		nl := int(binary.LittleEndian.Uint16(b[off:]))
 		off += 2
-		if nl == 0 || len(b) < off+nl+16 {
+		if nl == 0 || len(b) < off+nl+17 {
 			return nil, zoneBlobBad
 		}
 		name := string(b[off : off+nl])
 		off += nl
-		mn := math.Float64frombits(binary.LittleEndian.Uint64(b[off:]))
-		mx := math.Float64frombits(binary.LittleEndian.Uint64(b[off+8:]))
-		off += 16
-		if mn > mx {
+		flags := b[off]
+		mn := math.Float64frombits(binary.LittleEndian.Uint64(b[off+1:]))
+		mx := math.Float64frombits(binary.LittleEndian.Uint64(b[off+9:]))
+		off += 17
+		if mn > mx || flags&^zoneFlagFull != 0 {
 			return nil, zoneBlobBad
 		}
 		if id, ok := idOf(name); ok {
-			out[id] = zoneRange{Min: mn, Max: mx}
+			out[id] = zoneRange{Min: mn, Max: mx, Full: flags&zoneFlagFull != 0}
 		}
 	}
 	if off != len(b) {

@@ -35,8 +35,15 @@ type Archive struct {
 
 // zoneRange is one attribute's numeric span within a segment (a zone map entry). Shared
 // with the Collection's zone maps (see zonemap.go). Fields are exported for JSON.
+//
+// A segment zone map has an entry for an attribute only when [Min,Max] holds every value in the
+// segment that could satisfy a numeric comparison; values that cannot (absent, string,
+// undefined, NaN) lie outside it. That is what pruning needs. Full says more: every record in
+// the segment holds a number for the attribute, so all of them lie in [Min,Max], which is what
+// attributing a whole segment to a range or bucket needs.
 type zoneRange struct {
 	Min, Max float64
+	Full     bool
 }
 
 // Retention bounds how much history an append-only store keeps. Rotate drops the oldest
