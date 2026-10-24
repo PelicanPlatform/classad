@@ -168,3 +168,63 @@ func fitsInt16(v int64) bool  { return v >= -1<<15 && v < 1<<15 }
 func fitsUint16(v int64) bool { return v >= 0 && v < 1<<16 }
 func fitsInt32(v int64) bool  { return v >= -1<<31 && v < 1<<31 }
 func fitsUint32(v int64) bool { return v >= 0 && v < 1<<32 }
+
+// --- Bitplane comparison, for callers that are not running a Vec through the executor ---
+//
+// The columnar group/filter path narrows a candidate set one column at a time without ever building a
+// Vec: it has the column and one literal, and wants the answer as the bitplane it is intersecting into.
+// Routing it through VecEval to reach the same kernel would cost a program, a register file and the
+// three-valued apparatus for a shape that is two-valued by construction -- a stored slot value is never
+// UNDEFINED, which is what the escape bitmap is for.
+//
+// So these are the same two kernels the executor's comparison uses, with the Vec taken off the front.
+// One representation of a comparison result in the whole package, which is the property that stops the
+// two paths disagreeing about a boundary value.
+
+// CompareRawPlane writes one bit per record into lo: 1 where the column's STORED value satisfies op
+// against lit, 0 otherwise, with the bits past n left clear.
+//
+// ok=false when no engine on this build and this CPU has lanes for the column's width, or op is not one
+// of the six scalar comparisons. The caller then widens the column itself and uses CompareIntsPlane --
+// which is why this does NOT fall back the way simdCompareRaw does: a caller holding a raw column has
+// not necessarily widened it, and widening inside here would hide the cost of doing so.
+func CompareRawPlane(op string, raw []byte, width int, unsigned bool, lit int64, n int, lo []uint64) bool {
+	if !rawSupported {
+		return false
+	}
+	c, ok := parseCmpOp(op)
+	if !ok {
+		return false
+	}
+	if width < 1 || width > 8 || len(raw) < n*width || len(lo) < (n+63)/64 {
+		return false
+	}
+	base, negate := baseFor(c)
+	if !simdBaseMask(base, raw, width, unsigned, lit, n, lo[:(n+63)/64]) {
+		return false
+	}
+	if negate {
+		complementPlane(lo[:(n+63)/64], n)
+	}
+	return true
+}
+
+// CompareIntsPlane writes one bit per record into lo from an already-widened column, with the bits past
+// n left clear. It always answers for one of the six scalar comparisons.
+//
+// This is the kernel the production build runs: without GOEXPERIMENT=simd there is no engine, so every
+// width lands here. It is still a bitplane rather than a bool per record, and that is not only for the
+// SIMD build's benefit -- assembling a word of results and intersecting it with one AND is fewer stores
+// and fewer branches than writing and re-reading a byte per record, whatever compares them.
+func CompareIntsPlane(op string, vals []int64, lit int64, n int, lo []uint64) bool {
+	c, ok := parseCmpOp(op)
+	if !ok || len(vals) < n || len(lo) < (n+63)/64 {
+		return false
+	}
+	base, negate := baseFor(c)
+	scalarBaseMaskInts(base, vals, lit, n, lo[:(n+63)/64])
+	if negate {
+		complementPlane(lo[:(n+63)/64], n)
+	}
+	return true
+}

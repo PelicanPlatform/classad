@@ -2,6 +2,7 @@ package collections
 
 import (
 	"math"
+	"math/bits"
 	"sort"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -426,8 +427,8 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 		aggLookups[i] = c.attrLookup(id)
 	}
 
-	var keep []bool
-	var scratch []int64
+	var cand candSet
+	var sc predScratch
 	var gsc groupColScratch
 	aggCols := make([]numCol, len(aggIDs))
 	ct := predsNeedCT(preds)
@@ -471,39 +472,24 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 						return nil, false
 					}
 				}
-				if cap(keep) < blk.n {
-					keep = make([]bool, blk.n)
-					scratch = make([]int64, blk.n)
-				}
-				keep = keep[:blk.n]
-				live := 0
-				for k := 0; k < blk.n; k++ {
-					gk := base + k
-					vis := gk < cs.offsLen()
-					if vis {
-						o := cs.offAt(gk)
-						vis = w.visible(o, s0)
-					}
-					keep[k] = vis
-					if vis {
-						live++
-					}
-				}
+				sc.prepare(blk.n)
+				cand.setVisible(cs, w, s0, base, blk.n)
 				for i := range preds {
-					if live == 0 {
+					if cand.live == 0 {
 						break
 					}
-					var nok bool
-					if live, nok = narrowByField(blk, predIdxs[i], preds[i], bc, keep, scratch[:blk.n]); !nok {
+					if !narrowByField(blk, predIdxs[i], preds[i], bc, &cand, &sc) {
 						releaseWindows(wins)
 						return nil, false
 					}
 				}
-				if live > 0 {
-					for k := 0; k < blk.n; k++ {
-						if !keep[k] {
-							continue
-						}
+				// One test per 64 records rules out a word of them, and the survivors are
+				// reached by their set bits rather than by reading a byte for each of the
+				// records an earlier pass already removed.
+				for wi, word := range cand.w {
+					for word != 0 {
+						k := wi*64 + bits.TrailingZeros64(word)
+						word &= word - 1
 						// Shared with the vector tier, so group identity and the aggregate
 						// skip rules cannot depend on which tier answered.
 						if !addGroupFromColumns(k, &col, aggCols, bc, acc) {
