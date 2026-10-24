@@ -71,7 +71,7 @@ func (q *Query) ExactProbes() (probes []Probe, exact bool) {
 	}
 	// A pinned CurrentTime was folded into the probes, which is exact only for an ad that
 	// does not define CurrentTime.
-	return out, len(out) > 0 && q.prog.now == 0
+	return out, len(out) > 0 && !q.prog.foldNow
 }
 
 // ProbeGroup is a conjunction of index probes -- a candidate matches the group when

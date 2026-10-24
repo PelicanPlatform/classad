@@ -14,8 +14,8 @@ type refInfo struct {
 	// can be evaluated concurrently by several Matchers.
 	node  *ast.AttributeReference
 	scope ast.AttributeScope
-	// curTime marks the magic CurrentTime attribute, whose value when the ad does not
-	// define it is a time rather than undefined.
+	// curTime marks a reference named CurrentTime, in any scope: when the ad it names
+	// does not define it, its value is a time rather than undefined.
 	curTime bool
 }
 
@@ -40,6 +40,9 @@ type Program struct {
 	// now, when nonzero, is the time a CurrentTime reference the scope does not define
 	// evaluates to (see Compile). Zero reads the clock, as the evaluator does.
 	now int64
+	// foldNow reports that the query reads an unscoped or MY CurrentTime, which the
+	// planner's probes fold to now (see Probe).
+	foldNow bool
 }
 
 // ReadAttrs returns the distinct unscoped attribute names the program may read.

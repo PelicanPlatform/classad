@@ -283,6 +283,44 @@ extern "C" int classad_eval_expr(const char *exprStr, int oldSyntax, char **out)
 	}
 }
 
+extern "C" int classad_eval_match(const char *leftStr, const char *rightStr, const char *attr, char **out) {
+	static const bool reconfigured = [] { ClassAdReconfig(); return true; }();
+	(void)reconfigured;
+
+	*out = nullptr;
+	ClassAd *left = nullptr;
+	ClassAd *right = nullptr;
+	try {
+		ClassAdParser parser;
+		left = parser.ParseClassAd(leftStr, true);
+		right = parser.ParseClassAd(rightStr, true);
+		if (left == nullptr || right == nullptr) {
+			delete left;
+			delete right;
+			return 0;
+		}
+		std::string encoded;
+		{
+			MatchClassAd match(left, right);
+			Value v;
+			if (!left->EvaluateAttr(attr, v)) {
+				v.SetErrorValue();
+			}
+			encodeValue(encoded, v, left, 0);
+			// The match ad owns what it holds; take the two ads back before it goes.
+			match.RemoveLeftAd();
+			match.RemoveRightAd();
+		}
+		delete left;
+		delete right;
+		*out = strdup(encoded.c_str());
+		return 1;
+	} catch (...) {
+		if (*out) { free(*out); *out = nullptr; }
+		return 0;
+	}
+}
+
 extern "C" void classad_free(char *p) {
 	free(p);
 }

@@ -6,6 +6,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 // TestCurrentTimeProbe verifies a query referencing CurrentTime folds it to a constant at
@@ -153,5 +154,61 @@ func TestCurrentTimeVecDeclines(t *testing.T) {
 	q, _ := Parse(`A < CurrentTime`)
 	if _, ok := q.VecEval(src, 2, nil); ok {
 		t.Error("VecEval served a query reading CurrentTime")
+	}
+}
+
+// TestCurrentTimeScopesCompiled verifies a compiled query reads CurrentTime as the
+// evaluator does (libclassad's LookupInScope): an ad that defines it supplies its value,
+// undefined included; one that lacks it gives the pinned time, never the target's value;
+// TARGET.CurrentTime is the target's, or the pinned time when the target lacks it.
+func TestCurrentTimeScopesCompiled(t *testing.T) {
+	const pin = 12345
+	ads := []string{`[]`, `[CurrentTime = undefined]`, `[CurrentTime = 7]`, `[Base = 1; CurrentTime = Base + 1]`, `[CurrentTime = NoSuchAttr]`}
+	for _, src := range []string{`CurrentTime`, `MY.CurrentTime`, `TARGET.CurrentTime`, `CurrentTime + TARGET.CurrentTime`, `isUndefined(CurrentTime)`} {
+		q, err := Parse(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		q.prog.now = pin
+		e, _ := parser.ParseExpr(src)
+		for _, adSrc := range ads {
+			for _, slotSrc := range ads {
+				ad, _ := classad.Parse(adSrc)
+				slot, _ := classad.Parse(slotSrc)
+				classad.NewMatchClassAd(ad, slot)
+				ev := classad.NewEvaluator(ad)
+				ev.PinCurrentTime(pin)
+				want := ev.Evaluate(e).String()
+				if got := q.Eval(ad).String(); got != want {
+					t.Errorf("%s on %s vs %s: Eval = %s, evaluator = %s", src, adSrc, slotSrc, got, want)
+				}
+				if got := q.Matcher().Eval(ad).String(); got != want {
+					t.Errorf("%s on %s vs %s: Matcher.Eval = %s, evaluator = %s", src, adSrc, slotSrc, got, want)
+				}
+			}
+		}
+	}
+}
+
+// TestCurrentTimeTargetPinnedNotFolded verifies TARGET.CurrentTime, which reads the clock
+// when the target lacks CurrentTime, is pinned, but is not folded into probes, so it does
+// not mark the query as one whose probes assume ads lack CurrentTime.
+func TestCurrentTimeTargetPinnedNotFolded(t *testing.T) {
+	for _, src := range []string{`X > 5 && TARGET.CurrentTime > 5`, `X > 5 && [a = 1].CurrentTime > 5`} {
+		q, _ := Parse(src)
+		if q.prog.now == 0 {
+			t.Errorf("%s: not pinned", src)
+		}
+		if q.ReadsCurrentTime() {
+			t.Errorf("%s: ReadsCurrentTime = true", src)
+		}
+		if p := q.Probes(); len(p) != 1 || p[0].Attr != "X" {
+			t.Errorf("%s: probes = %v, want X > 5", src, p)
+		}
+	}
+	for _, src := range []string{`CurrentTime > 5`, `MY.CurrentTime > 5`} {
+		if q, _ := Parse(src); !q.ReadsCurrentTime() {
+			t.Errorf("%s: ReadsCurrentTime = false", src)
+		}
 	}
 }

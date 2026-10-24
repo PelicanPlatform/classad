@@ -599,17 +599,61 @@ func (e *Evaluator) evalNode(expr ast.Expr) Value {
 }
 
 func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Value {
-	v := e.resolveAttributeReference(ref)
-	// CurrentTime is a magic attribute: an unscoped/MY reference that the ad does not
-	// otherwise define resolves to the current time (Unix seconds). An ad-defined
-	// CurrentTime wins, since resolveAttributeReference then returns a defined value.
-	if v.IsUndefined() && isCurrentTimeRef(ref) {
-		if e.now != 0 {
-			return NewIntValue(e.now)
-		}
-		return currentTimeValue()
+	if ref.NormalizedName() == currentTimeAttr {
+		return e.evaluateCurrentTime(ref)
 	}
-	return v
+	return e.resolveAttributeReference(ref)
+}
+
+// evaluateCurrentTime resolves a reference named CurrentTime (see currenttime.go). The ad
+// the reference names -- this ad for an unscoped or MY reference, the target for TARGET,
+// the parent for PARENT -- supplies its own CurrentTime when it defines one, whatever the
+// value, undefined included. When it does not, the reference is the current time: the
+// lookup does not go on to an enclosing scope or, in matchmaking, to the target ad. No
+// such ad (TARGET with no target, PARENT at the top level) is undefined.
+func (e *Evaluator) evaluateCurrentTime(ref *ast.AttributeReference) Value {
+	if e.resolver != nil {
+		// The resolver contract (SetResolver): undefined for an unscoped or MY
+		// CurrentTime means the ad does not define it.
+		v := e.resolver(ref.Name, ref.Scope)
+		if v.IsUndefined() && isCurrentTimeRef(ref) {
+			return e.nowValue()
+		}
+		return v
+	}
+	ad := e.classad
+	switch ref.Scope {
+	case ast.TargetScope:
+		if ad == nil {
+			return NewUndefinedValue()
+		}
+		ad = e.targetOf(ad)
+	case ast.ParentScope:
+		if ad == nil {
+			return NewUndefinedValue()
+		}
+		ad = ad.parent
+	default:
+		if ad == nil {
+			return e.nowValue() // no scope: evaluated as in an empty ad
+		}
+	}
+	if ad == nil {
+		return NewUndefinedValue()
+	}
+	if owner, expr := ad.currentTimeExpr(); expr != nil {
+		return e.evalAttrExpr(owner, currentTimeAttr, expr)
+	}
+	return e.nowValue()
+}
+
+// nowValue is the value of a CurrentTime the scope does not define: the pinned time
+// (PinCurrentTime), or the clock.
+func (e *Evaluator) nowValue() Value {
+	if e.now != 0 {
+		return NewIntValue(e.now)
+	}
+	return currentTimeValue()
 }
 
 func (e *Evaluator) resolveAttributeReference(ref *ast.AttributeReference) Value {
@@ -1010,7 +1054,7 @@ func (e *Evaluator) selectAttr(recordVal Value, attr string) Value {
 	// both race with other readers and leave it chained to this scope. Resolve
 	// the attribute as an unscoped reference so it chains (and participates in
 	// cycle detection).
-	scoped := &ClassAd{ad: ad.ad, index: ad.index, target: ad.target, parent: e.classad}
+	scoped := &ClassAd{ad: ad.ad, index: ad.index, target: ad.target, parent: e.classad, lexicalParent: true}
 	nested := e.child(scoped)
 	return nested.evaluateAttributeReference(ast.NewAttributeReference(attr, ast.NoScope))
 }

@@ -335,8 +335,9 @@ func rewriteForSlot(e ast.Expr, js *jobScope, assumed map[string]bool, inCtrl bo
 	case *ast.AttributeReference:
 		if n.Scope == ast.TargetScope {
 			if strings.EqualFold(n.Name, "CurrentTime") {
-				// TARGET.CurrentTime is undefined when the slot lacks it, but the slot's own
-				// CurrentTime reads the current time then: no slot-frame form says the same.
+				// TARGET.CurrentTime is the slot's own CurrentTime, the time when the slot
+				// lacks it. The slot-frame form would read CurrentTime, which makes the
+				// whole plan decline (slotMatchPlan); kept opaque, only its conjunct drops.
 				return &ast.AttributeReference{Name: opaqueSlotRef, Scope: ast.TargetScope}
 			}
 			return &ast.AttributeReference{Name: n.Name, Scope: ast.NoScope}

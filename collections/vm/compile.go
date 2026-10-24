@@ -110,7 +110,7 @@ func (c *compiler) addOp(op string) int32 {
 
 func (c *compiler) addRef(name string, scope ast.AttributeScope) int32 {
 	node := ast.NewAttributeReference(name, scope)
-	c.p.refs = append(c.p.refs, refInfo{name: name, scope: scope, node: node, curTime: classad.IsCurrentTimeRef(node)})
+	c.p.refs = append(c.p.refs, refInfo{name: name, scope: scope, node: node, curTime: classad.IsCurrentTimeName(name)})
 	return int32(len(c.p.refs) - 1)
 }
 

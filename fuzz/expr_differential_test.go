@@ -178,6 +178,25 @@ var exprParityCases = []struct {
 	{`[CurrentTime = 5; r = MY.CurrentTime].r`, false, "int(5)"},
 	{`[CurrentTime = 5; r = CurrentTime + 1].r`, false, "int(6)"},
 	{`CurrentTime > 1700000000`, false, "true"},
+	// An ad that defines CurrentTime supplies its value, undefined included; the time
+	// stands in only where the ad lacks it. A lookup starts in the record a select or a
+	// nested reference names, and stops there: an enclosing ad's CurrentTime is not read.
+	{`[CurrentTime = undefined; r = CurrentTime].r`, false, "undefined"},
+	{`[CurrentTime = undefined; r = MY.CurrentTime].r`, false, "undefined"},
+	{`[CurrentTime = undefined; r = isUndefined(CurrentTime)].r`, false, "true"},
+	{`[CurrentTime = NoSuchAttr; r = CurrentTime].r`, false, "undefined"},
+	{`[Base = 2; CurrentTime = Base + 1; r = CurrentTime].r`, false, "int(3)"},
+	{`[r = CurrentTime > 1700000000].r`, false, "true"},
+	{`[CurrentTime = 5; a = [x = 1]; r = a.CurrentTime > 1700000000].r`, false, "true"},
+	{`[CurrentTime = 5; a = [r = CurrentTime > 1700000000]; z = a.r].z`, false, "true"},
+	{`[CurrentTime = 5; a = [r = MY.CurrentTime > 1700000000]; z = a.r].z`, false, "true"},
+	{`[CurrentTime = 5; a = [r = PARENT.CurrentTime]; z = a.r].z`, false, "int(5)"},
+	{`[a = [r = PARENT.CurrentTime > 1700000000]; z = a.r].z`, false, "true"},
+	{`[a = [CurrentTime = 7]; r = a.CurrentTime].r`, false, "int(7)"},
+	{`[a = [CurrentTime = undefined]; r = a.CurrentTime].r`, false, "undefined"},
+	{`{[x = 1], [CurrentTime = 7]}.CurrentTime[1]`, false, "int(7)"},
+	{`{[x = 1], [CurrentTime = 7]}.CurrentTime[0] > 1700000000`, false, "true"},
+	{`isUndefined(TARGET.CurrentTime)`, false, "true"},
 }
 
 // goEvalExpr parses src with ParseExprOld (old) or ParseExpr and evaluates it in
@@ -230,6 +249,68 @@ func TestExprParity(t *testing.T) {
 		if foldVal, ok := goEvalFolded(tc.src, tc.old); ok && cppParsed && !canon.Equal(foldVal, cppVal, canon.DefaultTolerance) {
 			t.Errorf("%q (old=%v): Go after FoldConstants=%s libclassad=%s", tc.src, tc.old,
 				canon.Describe(foldVal), canon.Describe(cppVal))
+		}
+	}
+}
+
+// matchParityCases evaluate attribute r of the left ad of a MatchClassAd (left is MY,
+// right is TARGET) and pin libclassad's result. CurrentTime is a special name in
+// ClassAd::LookupInScope: a lookup in an ad without it is the time and succeeds, so
+// AttributeReference::FindExpr never tries the alternate scope (the match target) for it.
+var matchParityCases = []struct {
+	left, right string
+	want        string
+}{
+	// The alternate scope itself: an unscoped name the left ad lacks resolves in the right.
+	{`[r = Foo]`, `[Foo = 3]`, "int(3)"},
+	// Unscoped CurrentTime the left ad lacks is the time, not the right ad's.
+	{`[r = CurrentTime > 1700000000]`, `[CurrentTime = 5]`, "true"},
+	{`[r = CurrentTime > 1700000000]`, `[CurrentTime = undefined]`, "true"},
+	{`[r = MY.CurrentTime > 1700000000]`, `[CurrentTime = 5]`, "true"},
+	{`[r = TARGET.N > 2 || CurrentTime < 1000]`, `[N = 1; CurrentTime = 5]`, "false"},
+	{`[Deadline = CurrentTime + 100; r = Deadline > 1700000000]`, `[CurrentTime = 5]`, "true"},
+	// The left ad's own CurrentTime, whatever its value.
+	{`[CurrentTime = undefined; r = CurrentTime]`, `[CurrentTime = 5]`, "undefined"},
+	{`[CurrentTime = 7; r = CurrentTime]`, `[CurrentTime = 5]`, "int(7)"},
+	{`[CurrentTime = NoSuchAttr; r = CurrentTime]`, `[CurrentTime = 5]`, "undefined"},
+	// TARGET.CurrentTime: the right ad's, or the time when it lacks it.
+	{`[r = TARGET.CurrentTime > 1700000000]`, `[N = 1]`, "true"},
+	{`[r = TARGET.CurrentTime]`, `[CurrentTime = 5]`, "int(5)"},
+	{`[r = TARGET.CurrentTime]`, `[CurrentTime = undefined]`, "undefined"},
+	{`[CurrentTime = 7; r = TARGET.CurrentTime > 1700000000]`, `[N = 1]`, "true"},
+	{`[r = TARGET.CurrentTime]`, `[Base = 2; CurrentTime = Base + 3]`, "int(5)"},
+	// An attribute of the right ad reads the right ad's CurrentTime, never the left's.
+	{`[CurrentTime = 5; r = TARGET.T]`, `[T = CurrentTime > 1700000000]`, "true"},
+	{`[CurrentTime = 5; r = TARGET.T]`, `[T = CurrentTime; CurrentTime = 9]`, "int(9)"},
+}
+
+// TestMatchParity evaluates each matchParityCases entry in libclassad and in the Go
+// engine and requires both to give the recorded value.
+func TestMatchParity(t *testing.T) {
+	for _, tc := range matchParityCases {
+		raw, ok := cppengine.EvalMatch(tc.left, tc.right, "r")
+		if !ok {
+			t.Errorf("%s / %s: libclassad did not parse", tc.left, tc.right)
+			continue
+		}
+		cppVal, err := canon.Parse(raw)
+		if err != nil {
+			t.Fatalf("%s / %s: decoding libclassad's result %q: %v", tc.left, tc.right, raw, err)
+		}
+		if got := canon.Describe(cppVal); got != tc.want {
+			t.Errorf("%s / %s: libclassad now returns %s, recorded %s", tc.left, tc.right, got, tc.want)
+		}
+		left, err := classad.Parse(tc.left)
+		if err != nil {
+			t.Fatal(err)
+		}
+		right, err := classad.Parse(tc.right)
+		if err != nil {
+			t.Fatal(err)
+		}
+		goVal := canon.FromGoValue(classad.NewMatchClassAd(left, right).EvaluateAttrLeft("r"))
+		if !canon.Equal(goVal, cppVal, canon.DefaultTolerance) {
+			t.Errorf("%s / %s: Go=%s libclassad=%s", tc.left, tc.right, canon.Describe(goVal), canon.Describe(cppVal))
 		}
 	}
 }

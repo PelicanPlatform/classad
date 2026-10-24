@@ -16,7 +16,8 @@ import (
 // that in the target), or an eval() call (whose references are not statically known),
 // directly or through another job attribute it references. Such an attribute has no
 // value independent of the slot: evaluating it once with no target set would bake a
-// per-slot value as a constant. Only target-independent attributes are evaluated
+// per-slot value as a constant. One that reads a CurrentTime the job does not define is
+// treated the same way: its value is the clock's, which a baked value would freeze. Only target-independent attributes are evaluated
 // here; every match path treats a target-dependent one as unknown until evaluated
 // against the slot.
 type jobScope struct {
@@ -31,6 +32,7 @@ type jobAttrReads struct {
 	slot   []string // slot attributes: TARGET.x, and unscoped x the job does not define
 	job    []string // folded names of job attributes: MY.x, and unscoped x the job defines
 	opaque bool     // calls eval() or has an unrecognized node: reads are not statically known
+	clock  bool     // reads a CurrentTime the job does not define: the time, not the slot's
 }
 
 // jobRefKind classifies a job-side attribute reference.
@@ -85,7 +87,9 @@ func targetDependent(reads map[string]*jobAttrReads) map[string]bool {
 		for _, ref := range r.job {
 			users[ref] = append(users[ref], name)
 		}
-		if len(r.slot) > 0 || r.opaque {
+		// An attribute that reads the clock is not baked either: one evaluation here and
+		// another during the match could read different times.
+		if len(r.slot) > 0 || r.opaque || r.clock {
 			dep[name] = true
 			work = append(work, name)
 		}
@@ -119,10 +123,14 @@ func collectJobReads(e ast.Expr, has func(string) bool, r *jobAttrReads) {
 		case ast.MyScope:
 			if has(n.Name) {
 				r.job = append(r.job, strings.ToLower(n.Name))
+			} else if classad.IsCurrentTimeName(n.Name) {
+				r.clock = true
 			}
 		default:
 			if has(n.Name) {
 				r.job = append(r.job, strings.ToLower(n.Name))
+			} else if classad.IsCurrentTimeName(n.Name) {
+				r.clock = true // the time, whatever the slot holds
 			} else {
 				r.slot = append(r.slot, n.Name) // falls through to the target
 			}
@@ -305,14 +313,11 @@ func slotFrameRef(n *ast.AttributeReference, js *jobScope) (e ast.Expr, absentUn
 		return &ast.AttributeReference{Name: n.Name, Scope: ast.TargetScope}, false
 	}
 	if classad.IsCurrentTimeRef(n) {
-		// The job does not define CurrentTime, yet it is not undefined: unscoped, it is the
-		// slot's own CurrentTime or the current time, which is what the slot-frame
-		// reference evaluates to; MY.CurrentTime is the current time whatever the slot
-		// holds, so it stays the job's (opaque) reference.
-		if n.Scope == ast.MyScope {
-			return &ast.AttributeReference{Name: n.Name, Scope: ast.TargetScope}, false
-		}
-		return &ast.AttributeReference{Name: n.Name, Scope: ast.NoScope}, false
+		// The job does not define CurrentTime, yet it is not undefined: unscoped or MY, it
+		// is the current time whatever the slot holds. No slot-frame form says that (the
+		// slot's own CurrentTime is the slot's value when it has one), so it stays the
+		// job's (opaque) reference.
+		return &ast.AttributeReference{Name: n.Name, Scope: ast.TargetScope}, false
 	}
 	if n.Scope == ast.MyScope {
 		return &ast.UndefinedLiteral{}, false
