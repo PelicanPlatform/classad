@@ -29,10 +29,11 @@ import (
 type demandCounts struct {
 	eq  atomic.Int64 // == / != / in
 	rng atomic.Int64 // < <= > >=
-	// reads counts how often a query or match READS this attribute (its Requirements /
-	// Rank / WHERE reference it), which drives the hot set -- an attribute the workload
-	// actually evaluates is worth front-loading, unlike one that is merely present in
-	// every ad (which would make all attributes look equally "hot").
+	// reads counts how often the workload pulls this attribute's value OUT OF A STORED
+	// RECORD, which drives the hot set and the columnar hot tier -- an attribute the
+	// workload actually touches is worth front-loading, unlike one that is merely
+	// present in every ad (which would make all attributes look equally "hot"). See
+	// recordReads for exactly what counts.
 	reads atomic.Int64
 }
 
@@ -91,11 +92,51 @@ func (d *demandTracker) record(probes []vm.Probe) {
 	}
 }
 
-// recordReads tallies one access to each named attribute (a query/match evaluated a
-// reference to it), for hot-set ranking.
+// recordReads tallies one access to each named attribute, for hot-set and hot-tier
+// ranking.
+//
+// WHAT COUNTS AS AN ACCESS. A scan pulls an attribute's value out of a stored record
+// for one of two reasons, and BOTH count:
+//
+//   - FILTER: the constraint expression references it, so the matcher reads it out of
+//     every record the scan visits. That is q.ReadAttrs(), recorded in newQueryPlan
+//     for every query-bearing path at once; for a match, the slot references.
+//   - PROJECTION: it is among the attributes the scan selects, so the renderer reads
+//     it out of every record that matched. Necessarily per path -- not every path has
+//     a projection.
+//
+// Both count because the two consumers of this counter make the same access cheaper
+// whichever reason drove it: a hot-header attribute is found without walking the
+// record whether the matcher or the renderer wants it, and an escape-free hot column
+// is read without a cold-tail trip either way. A counter that saw only one reason
+// would rank an attribute every query filters on below one a few queries project.
+//
+// An attribute in BOTH roles of one query is counted once per role, i.e. twice. That
+// is deliberate -- it really is two accesses per record, so it should outrank an
+// attribute touched once -- and deduplicating would cost a set allocation per scan to
+// suppress a signal we want.
+//
+// AN EMPTY PROJECTION IS NOT EVERY ATTRIBUTE. "condor_status -l" asks for the whole
+// ad; expanding that into a read of every attribute would make all of them equally
+// hot and destroy the signal. A whole-ad scan records only its constraint's
+// attributes. See TestWholeAdQueriesRecordNoProjectionDemand.
+//
+// PER QUERY, NEVER PER RECORD. Every call site fires once per query execution,
+// outside the record loop. The tally stands in for "records scanned x accesses per
+// record"; it does not count accesses. A call from inside a scan's per-record loop
+// would be a map lookup per attribute per record -- a hot-path regression, and a
+// count the ranking does not expect.
 func (d *demandTracker) recordReads(names []string) {
 	for _, n := range names {
-		v, _ := d.m.LoadOrStore(strings.ToLower(n), &demandCounts{})
+		fold := strings.ToLower(n)
+		// Load before LoadOrStore: after the first query naming an attribute every
+		// later one hits, and LoadOrStore would heap-allocate a demandCounts on each
+		// of them only to discard it. This runs on every scan, so the throwaway is
+		// worth not making.
+		v, ok := d.m.Load(fold)
+		if !ok {
+			v, _ = d.m.LoadOrStore(fold, &demandCounts{})
+		}
 		v.(*demandCounts).reads.Add(1)
 	}
 }
