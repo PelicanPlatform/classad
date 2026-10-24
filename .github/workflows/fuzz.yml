@@ -20,6 +20,9 @@ on:
       seeds:
         description: "Space-separated survey seeds"
         default: "1 2 3 4"
+      fuzztime:
+        description: "Duration of the aggregate-strategy coverage-guided fuzz leg"
+        default: "120s"
 
 # One in-flight run per pull request. Pushing a fixup used to leave the
 # previous run going to completion -- a full duplicate set of jobs holding
@@ -81,3 +84,64 @@ jobs:
               go run -tags libclassad ./fuzz/cmd/cafuzz -n "$COUNT" -seed "$seed" -ignore-parse
             done
           '
+
+  # The second differential axis: the archive's aggregate STRATEGIES against each other.
+  #
+  # Same process as the job above, different oracle. A grouped aggregate can be answered by an
+  # index path, a columnar path or a record scan, and they must agree; the record scan is the
+  # reference. This needs no libclassad, so it runs on a stock runner rather than in the
+  # devcontainer image, and it lives here rather than in test.yml because the bounded `-fuzz` leg
+  # is a fuzz run, not a unit test.
+  #
+  # It runs without GOEXPERIMENT=simd, which is what production ships: the SIMD engine changes
+  # which comparison routine the columnar scan executes, so the two builds are different code
+  # under the same test. The experiment build is worth a periodic manual leg, not a second job
+  # on every PR.
+  aggregate:
+    name: Differential fuzz (aggregate strategies)
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        check-latest: true
+        go-version: '1.27'
+
+    - name: Install goyacc (version pinned in .github/tools)
+      env:
+        GOTOOLCHAIN: auto
+      run: |
+        mkdir -p "$RUNNER_TEMP/bin"
+        (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/goyacc" golang.org/x/tools/cmd/goyacc)
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+    # db/ and collections/ replace github.com/PelicanPlatform/classad with this checkout, which
+    # has no parser until goyacc has run.
+    - name: Generate parser
+      run: goyacc -o parser/y.go -p yy parser/classad.y
+
+    # The generator's own assertions: the sharp values are in the data by construction, the
+    # queries still reach every gated shape, and a record is a pure function of its index.
+    - name: Generator self-tests
+      run: go test -count=1 ./aggfuzz/...
+
+    # The fixtures only test what they reach. This asserts the string columns actually
+    # dictionary-encode -- which nothing above the collections package can see.
+    - name: Fixture encodes string dictionaries
+      working-directory: collections
+      run: go test -count=1 -run TestAggFuzzFixtureBuildsStringDictionaries ./
+
+    # The bounded, deterministic sweep. It fails when a strategy never answered: coverage here is
+    # an assertion, and it prints the tier histogram either way.
+    - name: Tier coverage sweep
+      working-directory: db
+      run: go test -count=1 -v -run 'TestAggregateFuzzFixtureSteering|TestAggregateStrategyTierCoverage' ./
+
+    - name: Coverage-guided fuzz
+      working-directory: db
+      env:
+        FUZZTIME: ${{ github.event.inputs.fuzztime || '120s' }}
+      run: go test -count=1 -run '^$' -fuzz 'FuzzAggregateStrategies' -fuzztime "$FUZZTIME" ./
