@@ -373,8 +373,7 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 	if st == nil || c.intern == nil || q == nil || !q.Native() {
 		return 0, false
 	}
-	m := q.Matcher()
-	fallbackM := q.Matcher()
+	sides := c.newEvalSides(q)
 	cs := &colScope{bc: st.cache, c: c}
 	resolver := cs.resolve
 	src := &blockVecSource{c: c, bc: st.cache}
@@ -384,21 +383,23 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 		vecScratchPool.Put(scratch)
 	}()
 	var live []uint64
-	var plan prunePlan
 	var split vecSplit
 	defer func() { lastVecSplit.Store(&split) }()
 	count := 0
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			// The CurrentTime-folded form where the window is proven free of CurrentTime.
+			sd := sides.at(w)
+			q, m, fallbackM := sd.q, sd.m, sd.rm
 			seg := w.seg.colblk.Load()
 			if seg == nil || seg.schema() == nil {
 				split.rowWindows++
 				count += c.rowEvalWindow(w, s0, fallbackM)
 				continue
 			}
-			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
-			strEq := plan.stringEq(c, q, seg.schema())
+			pruneIdxs, prunePreds := sd.tests(c, seg.schema())
+			strEq := sd.stringEq(c, seg.schema())
 			base := 0
 			for bi, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {

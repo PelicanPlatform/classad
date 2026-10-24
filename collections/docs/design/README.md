@@ -782,7 +782,8 @@ length:
   carries its own CRC-32C footer.
 - The **key index** (KIDX v1) is a sorted array of `(keyhash u64, offset u32)`, one entry
   per record in the segment, behind a small header and an IEEE CRC. It is probed by
-  binary search over the mapping.
+  binary search over the mapping. Its header's flags carry the segment's `CurrentTime`
+  proof (Chapter 11).
 - The **columnar section** (COLX v7) is a *derived* copy of the segment's columnar
   blocks. It is used only before the segment is columnarized in place, and by in-memory
   collections (Chapter 9).
@@ -1248,7 +1249,11 @@ dictionary.
 
 **Where it declines.** The executor declines per *block*, not per query. A block with
 little live data — less than a quarter of its records visible — goes back to per-record
-column resolution, and a window with no block takes the row path.
+column resolution, and a window with no block takes the row path. A record the column
+resolver cannot settle is evaluated the way the row scan evaluates it: wire-native over
+its reassembled bytes, falling back to partial or full decode. It used to be decoded
+into a ClassAd and tree-walked, which made the fallback about twice as slow as the row
+scan it stands in for.
 
 **SIMD.** Optional SIMD compare kernels build only under `GOEXPERIMENT=simd`; the
 default build uses the scalar width-native kernels.
@@ -1273,6 +1278,55 @@ Not every read wants ClassAd objects. The collection offers:
 `QueryRawFromSeq` is the pagination primitive. A sequence cursor resumes exactly where
 the last page stopped, even while the store is changing underneath, which a key- or
 offset-based page cannot do.
+
+### CurrentTime
+
+HTCondor's ClassAds give `CurrentTime` old-ClassAd semantics: an unscoped or `MY`
+reference reads the ad's own `CurrentTime` when the ad (or a chained parent) defines
+one, undefined included, and the current time otherwise. `vm.Compile` pins one time per
+query, so every record and every probe sees the same "now".
+
+A reference is opaque to every fast path: `CompletionDate > CurrentTime - 3600` is not
+`attr OP literal`, a column cannot load it, and a zone cannot bound it. So a query that
+reads `CurrentTime` also has a **folded form** (`vm.Query.Folded`): the expression with
+`CurrentTime` replaced by the pinned time and its constants folded
+(`classad.FoldConstantsAt`), compiled on its own. `CompletionDate > <literal>` is a
+probe, a column comparison and a zone test. The folded form evaluates exactly as the
+query on every ad that does not define `CurrentTime`, and only there.
+
+So each segment carries a **proof** that none of its records names `CurrentTime`
+(`ctproof.go`), case-insensitively, and a scan evaluates the folded form in a proven
+window and the query as written everywhere else:
+
+- An **interned** segment is proven from its attribute dictionary. Every name a record
+  can carry — remnant, cold tail, base and group columns — is keyed through it, and a
+  reassembled field the dictionary lacks fails the read, so a name absent from the
+  dictionary is absent from every record. The dictionary also holds names that records
+  only refer to, and job ads refer to `CurrentTime` in their expressions, so a
+  dictionary that has the name proves nothing and the segment is walked.
+- The **write path** checks each ad it appends (`Put`, `Update`, `UpdateOld`,
+  transactions and their deltas) and marks the active segment when one names
+  `CurrentTime`. Records written before this process first wrote to the segment — the
+  append target recovery picked — are proven by a walk.
+- A **sealed** segment's proof is stored in its sidecar's key index (Appendix C), written
+  at seal from the write path's knowledge, and adopted on open.
+- Anything else — a sidecar written before the proof existed, a rewrite's output that is
+  not interned — is proven by **walking** its records (reassembled, for a columnarized
+  segment), within a byte budget per pass. `Reindex`, which compaction, merges and
+  maintenance run after rewriting segments, walks what they wrote and writes the proofs
+  into the sidecars. A segment `Open` loaded without a proof is not walked at open: the
+  first `CurrentTime` queries walk it, 32 MiB at a time, and once one has run, `Reindex`
+  walks the rest and persists them. A segment that defines
+  `CurrentTime`, or is not yet proven, is evaluated as written.
+- Rewrites (compaction, merges, columnarization, interning, codec upgrades) produce new
+  segments, which start unproven: none inherits a source's proof.
+
+A record's ad is not always its own bytes. A delta record merges over a base in an older
+segment, and a chained child reads its parent; both live in the same shard. So in a
+mutable or chained collection a window counts as proven only when every segment of its
+shard is; an append-only, unchained collection decides per segment.
+
+`ExplainQuery` reports whether a query was folded and how many segments are not proven.
 
 Every tier, and every read surface, is **differentially tested to equal a full decode
 plus tree-walk evaluation**. The bytecode interpreter is fuzzed against the tree-walker
@@ -1320,6 +1374,11 @@ The query planner is the reusable heart of the index path, and it embodies tenet
   verifications it could save is skipped, which measured 14 ms → 0.76 ms.
   - In append-only collections, the whole plan is refused when it would hand over more
     than 95% of the records; a scan is cheaper.
+- **CurrentTime.** Probes fold an unscoped or `MY` `CurrentTime` to the query's pinned
+  time, so `CompletionDate > CurrentTime - 86400` is a range probe. That describes only
+  the records that do not define `CurrentTime`, so zone maps, index postings and
+  segment statistics prune with it only in segments proven free of it (Chapter 11). Any
+  other segment is walked in full.
 - **Superset + re-verify.** The scan visits only candidates, and **the full query is
   re-verified against every candidate.** Candidates in columnarized segments pass
   through the column prefilter first (an indexed archive fetch went from 2.9 s to
@@ -1482,6 +1541,13 @@ otherwise. Two rules make that hold:
   re-verified; it over-counts when it *is* the answer.
 - **Expressions decline.** A held cell, an escaped value, or a field outside the schema
   sends the record, block or segment to the ordinary evaluator.
+- **CurrentTime folds only where proven.** A query reading `CurrentTime` takes these
+  paths through its folded form (Chapter 11). A path that answers from probes or
+  hand-written column predicates — the column scans, `NumStatsQuery`, grouping, the
+  zone-verdict counts, top-K — does so only when every window it reads is proven free of
+  `CurrentTime`, and declines on meeting one that is not. The vectorized count and
+  grouping choose per window: the folded form in a proven window, the query as written,
+  unpruned, in any other.
 
 ### Counting
 
@@ -2592,10 +2658,16 @@ Older trailers are still read: `SCNT` (attrLen, keyLen), `SCN2` (+ colLen), `SCN
 ### The key index (KIDX v1)
 
 ```
-magic u32 | version u16 | pad u16 | upto u32 | count u32
+magic u32 | version u16 | flags u16 | upto u32 | count u32
 count × { keyhash u64, offset u32 }        sorted by hash, then offset
 crc32 u32                                  IEEE, over all preceding bytes
 ```
+
+`flags` was a zero pad. It now carries the segment's `CurrentTime` proof (Chapter 11):
+bit 0 says every record in `[0, upto)` was checked for an attribute named
+`CurrentTime`, bit 1 that at least one has it. The version is unchanged because the
+field is optional both ways. A build that predates it ignores the field and writes zero,
+which reads as "not checked", never as "clean".
 
 ---
 

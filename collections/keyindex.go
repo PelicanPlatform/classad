@@ -24,9 +24,14 @@ import (
 //
 // Format (little-endian):
 //
-//	magic u32 | version u16 | pad u16 | upto u32 | count u32
+//	magic u32 | version u16 | flags u16 | upto u32 | count u32
 //	count * { hash u64, off u32 }   (sorted by hash, then off)
 //	crc32 u32   (IEEE, over all preceding bytes)
+//
+// flags was a zero pad until it carried the segment's CurrentTime proof (kidxCTChecked,
+// kidxCTDefines; see ctproof.go). The version is unchanged because the field is optional both ways:
+// a build that predates it reads the flags as padding and ignores them, and writes zero, which this
+// build reads as "not checked".
 const (
 	keyIdxMagic     = 0x4b494458 // "KIDX"
 	keyIdxVersion   = 1
@@ -39,7 +44,10 @@ const (
 // same Hasher the directory uses, so sidecar hashes match directory hashes.
 //
 // dm is the segment's damage set: a damaged record is left out, so no lookup reaches it.
-func buildKeyIndex(data []byte, upto int, h Hasher, dm *damageSet) []byte {
+//
+// flags is the key index's flags field: the segment's CurrentTime proof over [0, upto)
+// (segment.ctKIDXFlags), or zero.
+func buildKeyIndex(data []byte, upto int, h Hasher, dm *damageSet, flags uint16) []byte {
 	type ent struct {
 		hash uint64
 		off  uint32
@@ -68,7 +76,7 @@ func buildKeyIndex(data []byte, upto int, h Hasher, dm *damageSet) []byte {
 	buf := make([]byte, 0, keyIdxHeaderLen+len(ents)*keyIdxEntryLen+4)
 	buf = binary.LittleEndian.AppendUint32(buf, keyIdxMagic)
 	buf = binary.LittleEndian.AppendUint16(buf, keyIdxVersion)
-	buf = binary.LittleEndian.AppendUint16(buf, 0)
+	buf = binary.LittleEndian.AppendUint16(buf, flags)
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(upto))
 	buf = binary.LittleEndian.AppendUint32(buf, uint32(len(ents)))
 	for _, e := range ents {
@@ -85,6 +93,7 @@ func buildKeyIndex(data []byte, upto int, h Hasher, dm *damageSet) []byte {
 type mmapKeyIndex struct {
 	upto  uint32
 	count uint32
+	flags uint16 // the header's flags field (see the format above)
 	ents  []byte // count*keyIdxEntryLen bytes, sorted by hash
 }
 
@@ -111,7 +120,7 @@ func parseKeyIndex(data []byte) (*mmapKeyIndex, error) {
 	if entEnd != len(body) {
 		return nil, fmt.Errorf("collections: key sidecar count %d does not match length", count)
 	}
-	return &mmapKeyIndex{upto: upto, count: count, ents: data[entStart:entEnd]}, nil
+	return &mmapKeyIndex{upto: upto, count: count, flags: binary.LittleEndian.Uint16(data[6:]), ents: data[entStart:entEnd]}, nil
 }
 
 func (m *mmapKeyIndex) hashAt(i uint32) uint64 {

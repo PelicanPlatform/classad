@@ -92,7 +92,7 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 	var preds []fieldPred
 	if q != nil {
 		var pok bool
-		preds, pok = c.numPredsOnFields(q, st.schema)
+		preds, pok = c.numPredsCT(q, st.schema)
 		if !pok {
 			return 0, 0, false // not a conjunction of scalar numeric comparisons
 		}
@@ -126,10 +126,15 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 	tk := &topKKeep{k: k, desc: desc}
 	var keep []bool
 	var scratch []int64
+	ct := predsNeedCT(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		stats.segments(len(wins), 0) // the cutoff scan filters on non-order fields, so no zone prune
 		for _, w := range wins {
+			if ct && !w.ctFree {
+				releaseWindows(wins) // a folded predicate is exact only in a proven window
+				return 0, 0, false
+			}
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, rok := resolveStatsFields(cs, aggID, preds)
 			if !rok {

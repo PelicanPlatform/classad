@@ -614,6 +614,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	dictStart := time.Now()
 	for _, seg := range sh.segs {
 		if seg != nil {
+			seg.ct.opened.Store(true) // its CurrentTime proof, if any, comes from its sidecar (ctproof.go)
 			publishSegDictAt(seg, segDictHint[seg])
 			markSegDictNeed(seg)
 		}

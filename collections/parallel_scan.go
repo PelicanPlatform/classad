@@ -172,7 +172,7 @@ func (c *Collection) runParallelQuery(qp queryPlan, yield func(*classad.ClassAd)
 					}
 					dbuf = w
 					qp.ws.dict = dict
-					if !matchWire(w, qp) {
+					if !matchWire(w, *qp.at(tasks[idx].win)) {
 						return true
 					}
 					a, err := c.decodeWireDictAs(dict, w, redact)
@@ -225,7 +225,7 @@ func (c *Collection) scanTasksSerial(tasks []scanTask, qp queryPlan, yield func(
 			}
 			dbuf = w
 			qp.ws.dict = dict
-			if !matchWire(w, qp) {
+			if !matchWire(w, *qp.at(t.win)) {
 				return true
 			}
 			a, err := c.decodeWireDictAs(dict, w, redact)

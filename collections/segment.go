@@ -257,6 +257,9 @@ type segment struct {
 	// GC-managed, so scans must pin it and compaction/Close must unmap it via onReap, exactly
 	// as for a file-backed segment. Set at creation for an in-memory sealing shard; immutable.
 	pinReap bool
+
+	// ct is the proof that no record of the segment names CurrentTime (ctproof.go).
+	ct segCT
 }
 
 // mapped reports whether the segment holds a non-GC mapping that scans must pin and reap

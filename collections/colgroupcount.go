@@ -150,8 +150,11 @@ func (c *Collection) GroupStatsQueryBucketed(q *vm.Query, groupAttr string, buck
 	}
 	// First tier: a conjunction of numeric comparisons against literals, narrowed column by column with
 	// zone-map pruning. Fastest, and the shape a history dashboard asks most.
-	if preds, ok := c.numPredsOnFields(q, st.schema); ok {
-		return c.groupStats(groupID, aggIDs, bucket, preds, st)
+	if preds, pok := c.numPredsCT(q, st.schema); pok {
+		if gs, served := c.groupStats(groupID, aggIDs, bucket, preds, st); served || !predsNeedCT(preds) {
+			return gs, served
+		}
+		// A window turned out unproven: the per-window tier below still serves the query.
 	}
 	// Second tier: evaluate the query itself against the columns -- a column at a time where the
 	// expression allows it, per record where it does not. This serves any NATIVE query, so a string
@@ -427,9 +430,14 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 	var scratch []int64
 	var gsc groupColScratch
 	aggCols := make([]numCol, len(aggIDs))
+	ct := predsNeedCT(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			if ct && !w.ctFree {
+				releaseWindows(wins) // a folded predicate is exact only in a proven window
+				return nil, false
+			}
 			cs := w.seg.colblk.Load()
 			groupIdx, aggIdxs, predIdxs, ok := resolveGroupFields(cs, groupID, aggIDs, preds)
 			if !ok {

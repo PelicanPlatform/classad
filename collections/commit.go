@@ -24,6 +24,8 @@ type pendingPut struct {
 	key   []byte
 	ad    []byte
 	codec Codec
+	// ct reports that the ad names CurrentTime (see Collection.namesCurrentTime).
+	ct bool
 }
 
 // commitReq is a queued writer's request (one Update's writes for one shard).
@@ -120,7 +122,7 @@ func (sh *shard) applyWrites(writes []pendingPut) {
 	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
 	for i := range writes {
-		sh.put(writes[i].hash, writes[i].key, writes[i].ad, seq, writes[i].codec, 0)
+		sh.put(writes[i].hash, writes[i].key, writes[i].ad, seq, writes[i].codec, 0, writes[i].ct)
 	}
 	sh.commitSeq = seq
 	sh.trackPublishLocked(seq)
@@ -139,7 +141,7 @@ func (sh *shard) applyWrites(writes []pendingPut) {
 func (sh *shard) applyOne(p pendingPut) {
 	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
-	sh.put(p.hash, p.key, p.ad, seq, p.codec, 0)
+	sh.put(p.hash, p.key, p.ad, seq, p.codec, 0, p.ct)
 	sh.commitSeq = seq
 	sh.trackPublishLocked(seq)
 	sh.maybeCheckpoint(seq)
@@ -157,7 +159,7 @@ func (sh *shard) applyBatch(batch []*commitReq) {
 	seq := sh.commitSeq + 1
 	for _, r := range batch {
 		for i := range r.writes {
-			sh.put(r.writes[i].hash, r.writes[i].key, r.writes[i].ad, seq, r.writes[i].codec, 0)
+			sh.put(r.writes[i].hash, r.writes[i].key, r.writes[i].ad, seq, r.writes[i].codec, 0, r.writes[i].ct)
 		}
 	}
 	sh.commitSeq = seq

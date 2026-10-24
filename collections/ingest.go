@@ -54,7 +54,8 @@ func (c *Collection) UpdateOld(batch []OldAdUpdate) error {
 		}
 		stored := codec.Compress(nil, wireBytes)
 		h := c.h.Hash(batch[i].Key)
-		byShard[int(h&c.mask)] = append(byShard[int(h&c.mask)], pendingPut{hash: h, key: batch[i].Key, ad: stored, codec: codec})
+		byShard[int(h&c.mask)] = append(byShard[int(h&c.mask)], pendingPut{hash: h, key: batch[i].Key, ad: stored, codec: codec,
+			ct: c.namesCurrentTime(wireBytes)})
 	}
 	for si, writes := range byShard {
 		c.shards[si].commit(writes)

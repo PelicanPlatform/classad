@@ -194,9 +194,14 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 
 	var keep []bool
 	var scratch []int64
+	ct := predsNeedCT(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			if ct && !w.ctFree {
+				releaseWindows(wins) // a folded predicate is exact only in a proven window
+				return NumStats{}, false
+			}
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)
 			if !ok {

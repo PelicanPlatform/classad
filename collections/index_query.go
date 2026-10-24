@@ -139,6 +139,7 @@ func (c *Collection) Reindex() {
 		for _, sh := range c.shards {
 			c.sealAndEvictShard(sh)
 		}
+		c.persistCTProofs()
 	}
 }
 
@@ -620,6 +621,12 @@ type QueryExplain struct {
 	// Reason says, in a sentence, why the plan is what it is: which index probe and how many
 	// candidates, or why the scan won.
 	Reason string `json:"reason,omitempty"`
+	// CurrentTimeFolded reports a query that reads CurrentTime and has a folded form
+	// (vm.Query.Folded): segments proven to hold no record defining CurrentTime evaluate the folded
+	// form and may be pruned by its probes. CurrentTimeUnprovenSegments counts the segments not (yet)
+	// proven, which evaluate the query as written and are never pruned by a probe on CurrentTime.
+	CurrentTimeFolded           bool `json:"currentTimeFolded,omitempty"`
+	CurrentTimeUnprovenSegments int  `json:"currentTimeUnprovenSegments,omitempty"`
 }
 
 // ExplainQuery reports how the store would execute q: which of its conjuncts are
@@ -692,6 +699,14 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 	default:
 		ex.Plan = scan
 		ex.Reason = "full scan: no conjunct of the filter is on an indexed attribute"
+	}
+	if q.Folded() != nil {
+		ex.CurrentTimeFolded = true
+		ex.CurrentTimeUnprovenSegments = c.ctUnprovenSegments()
+		if ex.CurrentTimeUnprovenSegments > 0 {
+			ex.Reason += fmt.Sprintf("; %d segments are not proven free of CurrentTime, so they evaluate it as written and are not pruned on it",
+				ex.CurrentTimeUnprovenSegments)
+		}
 	}
 	return ex
 }
@@ -1280,7 +1295,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 	// collection's zone or index configuration changes.
 	qp.stats.segments(len(wins), 0)
 	visit, stopped := c.refVisitor(s0, qp, emit)
-	forEachCandidateRef(s0, wins, usable, c.reverseScan, qp.stats, visit)
+	forEachCandidateRef(s0, wins, usable, qp.prunesCT(), c.reverseScan, qp.stats, visit)
 	return !stopped()
 }
 
@@ -1294,7 +1309,10 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 // newest-first: segments from the last backward, and within a segment the un-indexed tail
 // (written last) before the indexed prefix, each in descending offset order. A consumer
 // that stops early then gets the newest matches -- a pushed-down LIMIT through the index.
-func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, reverse bool, st *ScanStats, fn func(recRef) bool) bool {
+//
+// ct marks probes computed with CurrentTime folded to the query's pinned time, which hold only for
+// records without CurrentTime: a window not proven free of it (segWindow.ctFree) is walked in full.
+func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, ct, reverse bool, st *ScanStats, fn func(recRef) bool) bool {
 	var offs []uint32 // reused across reversed ranges
 	visible := func(w segWindow, o uint32) bool {
 		return !recIsMarker(w.data, o) && w.visible(o, s0)
@@ -1347,7 +1365,7 @@ func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, reve
 	window := func(w segWindow) bool {
 		d := w.dict()
 		si := w.seg.readIdx()
-		if si == nil || !si.covers(usable) {
+		if si == nil || !si.covers(usable) || (ct && !w.ctFree) {
 			st.indexSegment(0, false, true)
 			return scanRange(w, d, 0, w.used) // no usable index: walk the window in full
 		}
@@ -1396,11 +1414,15 @@ func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, reve
 // scanShardIndexedGroups is scanShardIndexed for a DNF plan: it visits the union of
 // the groups' candidates and re-verifies each against the full query.
 func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, qp queryPlan, emit scanEmit) bool {
-	return c.scanShardCandidatesGroups(sh, groups, c.reverseScan, func(w []byte, dict *segDictHandle) bool {
+	return c.scanShardCandidatesGroups(sh, groups, c.reverseScan, qp.prunesCT(), func(w []byte, dict *segDictHandle, ctFree bool) bool {
 		if qp.ws != nil {
 			qp.ws.dict = dict
 		}
-		if !matchWire(w, qp) {
+		cur := &qp
+		if ctFree && qp.fold != nil {
+			cur = qp.fold
+		}
+		if !matchWire(w, *cur) {
 			return true
 		}
 		return emit(w, dict)
@@ -1414,7 +1436,11 @@ func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, q
 // only when EVERY disjunct is empty, and visiting a few extra candidates is cheaper
 // than proving that per group -- but a window whose index does not cover all groups,
 // and every covered window's un-indexed tail, are still full-scanned.
-func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, reverse bool, onCand scanEmit) bool {
+//
+// ct marks groups computed with CurrentTime folded (see forEachCandidateRef): a window not proven
+// free of it is scanned in full. onCand learns whether the candidate's window is proven.
+func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, reverse, ct bool,
+	onCand func(w []byte, dict *segDictHandle, ctFree bool) bool) bool {
 	if unsatisfiableGroups(groups) {
 		return true // every disjunct is impossible: the union is empty (see scanShardCandidates)
 	}
@@ -1449,7 +1475,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 			return false
 		}
 		dbuf = ww
-		return !onCand(ww, w.dict())
+		return !onCand(ww, w.dict(), w.ctFree)
 	}
 	scanRange := func(w segWindow, from, to int) bool {
 		for off := from; off < to; {
@@ -1471,12 +1497,12 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 	}
 
 	if reverse {
-		return scanShardCandidatesGroupsReverse(wins, groups, visit)
+		return scanShardCandidatesGroupsReverse(wins, groups, ct, visit)
 	}
 
 	for _, w := range wins {
 		si := w.seg.idx.Load()
-		if si == nil || !si.coversGroups(groups) {
+		if si == nil || !si.coversGroups(groups) || (ct && !w.ctFree) {
 			if !scanRange(w, 0, w.used) { // index can't serve every disjunct: full-scan
 				return false
 			}
@@ -1515,7 +1541,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 // before the union of the groups' candidate offsets, both in descending offset order. It
 // reads the segment index via readIdx (so a sealed segment's mmap sidecar is used, not only
 // an in-RAM index), which the forward path does not yet do. visit returns true to stop.
-func scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, visit func(w segWindow, o uint32) bool) bool {
+func scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, ct bool, visit func(w segWindow, o uint32) bool) bool {
 	var offs []uint32
 	scanRangeReverse := func(w segWindow, from, to int) bool {
 		offs = offs[:0]
@@ -1542,7 +1568,7 @@ func scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, 
 	for wi := len(wins) - 1; wi >= 0; wi-- {
 		w := wins[wi]
 		si := w.seg.readIdx()
-		if si == nil || !si.coversGroups(groups) {
+		if si == nil || !si.coversGroups(groups) || (ct && !w.ctFree) {
 			if !scanRangeReverse(w, 0, w.used) { // index can't serve every disjunct: full-scan
 				return false
 			}

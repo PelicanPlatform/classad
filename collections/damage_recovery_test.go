@@ -822,14 +822,14 @@ func TestDamageSidecarFormat(t *testing.T) {
 			t.Fatal(err)
 		}
 		used, _, _ := readSidecarTrailer(target + ".idx")
-		own, err := parseKeyIndex(buildKeyIndex(seg, used, fnvHasher{}, nil))
+		own, err := parseKeyIndex(buildKeyIndex(seg, used, fnvHasher{}, nil, 0))
 		if err != nil {
 			t.Fatal(err)
 		}
 		if spans, ok := keyIndexDamage(seg, used, own, fnvHasher{}, nil); !ok || len(spans) != 0 {
 			t.Fatalf("the segment's own key index: %v, %v; want no damage", spans, ok)
 		}
-		other, err := parseKeyIndex(buildKeyIndex(seg, used, otherHasher{}, nil))
+		other, err := parseKeyIndex(buildKeyIndex(seg, used, otherHasher{}, nil, 0))
 		if err != nil {
 			t.Fatal(err)
 		}
