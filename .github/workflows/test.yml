@@ -86,11 +86,13 @@ jobs:
   #
   # The suite is SHARDED by test name across parallel jobs. Every test here is `package
   # collections`, so there is one test binary and `go test -p` (which parallelizes across
-  # packages) has nothing to work with; the tests do use t.Parallel(), so the suite is
-  # core-bound -- ~7min on a 12-core box, ~20min on a 4-vCPU runner, two minutes under the
-  # 25m timeout. It went red on one merge commit and green on the next with the same code.
-  # Four shards give it the cores one runner does not have, with no test skipped and the
-  # race detector still on everywhere. See collections/shard-test.sh.
+  # packages) has nothing to work with, and most tests are serial: ~55 minutes of runner
+  # time under -race. The shards give it the cores one runner does not have, with no test
+  # skipped and the race detector still on everywhere. Tests are packed by their recorded
+  # durations (collections/shard-durations.txt), so each shard gets about the same time.
+  # Four shards balanced by test COUNT left one at 19-25 minutes and it hit the 25m
+  # timeout. To add a shard, add its index below: the script reads the shard count from
+  # the matrix. See collections/shard-test.sh.
   collections:
     name: Collections shard ${{ matrix.shard }}
     runs-on: ubuntu-latest
@@ -98,7 +100,7 @@ jobs:
       # Every shard reports: one shard failing must not hide a second failure elsewhere.
       fail-fast: false
       matrix:
-        shard: [0, 1, 2, 3]
+        shard: [0, 1, 2, 3, 4, 5]
 
     steps:
     - name: Check out code
@@ -142,17 +144,18 @@ jobs:
     # Tests parallelize via t.Parallel(), so each shard also scales across its own runner's
     # cores; the race detector's ~5-10x memory is bounded because the few heaviest tests are
     # sized to a few thousand ads. The script prints its shard sizes and refuses to run a
-    # partition that would drop or duplicate a test.
+    # partition that would drop or duplicate a test. SHARDS comes from the matrix size, so
+    # the shard list above is the only place the count is written down.
     - name: Test (race detector)
       working-directory: collections
       env:
         SHARD: ${{ matrix.shard }}
-        SHARDS: 4
+        SHARDS: ${{ strategy.job-total }}
       run: ./shard-test.sh
 
   # A single check that stays green/red for the whole sharded suite, so a required status
   # check (and anyone reading the PR) has one "Collections module" result to look at rather
-  # than four. Without it, adding or removing a shard silently changes which checks exist.
+  # than one per shard. Without it, adding or removing a shard silently changes which checks exist.
   collections-result:
     name: Collections module
     needs: collections
