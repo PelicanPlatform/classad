@@ -257,12 +257,21 @@ const (
 )
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
-// scan) -- the seven scan counts, then the four index-probe counts. readScanStats reverses it.
+// scan) -- the seven scan counts, then the four index-probe counts, then the answering tier.
+// readScanStats reverses it.
+//
+// The trailer grows by APPEND ONLY, never by renumbering: it rides in its own length-delimited
+// frame, so a reader that stops early simply drops the bytes it does not know with the frame, and
+// readScanStats guards each appended block on what is left to read. A field that does not apply to
+// an op -- the index-probe counts for one that probes no index, the tier for one that does not fan
+// out -- is sent as zero, which is why the zero value of each has to mean "not reported" rather
+// than a measurement.
 func putScanStats(b []byte, s collections.ScanStats) []byte {
 	for _, v := range [...]int{
 		s.SegmentsTotal, s.SegmentsPruned, s.SegmentsScanned,
 		s.RecordsVisited, s.RecordsColumnDecided, s.RecordsReassembled, s.RowsMatched,
 		s.SegmentsIndexed, s.SegmentsIndexSkipped, s.SegmentsUnindexed, s.IndexCandidates,
+		int(s.Tier),
 	} {
 		b = putI32(b, int32(v))
 	}
@@ -271,7 +280,9 @@ func putScanStats(b []byte, s collections.ScanStats) []byte {
 
 // readScanStats decodes a ScanStats trailer written by putScanStats. A server older than the
 // index-probe counts sends only the first seven, and those are all it fills; an older client
-// reads the first seven of a newer trailer and ignores the rest.
+// reads the first seven of a newer trailer and ignores the rest. The tier appended after them
+// reads the same way: a server that does not send one leaves TierUnreported -- "did not say" --
+// rather than a tier it never reported, which is the whole reason that is the zero value.
 func readScanStats(r *reader) collections.ScanStats {
 	s := collections.ScanStats{
 		SegmentsTotal:        int(r.i32()),
@@ -287,6 +298,9 @@ func readScanStats(r *reader) collections.ScanStats {
 		s.SegmentsIndexSkipped = int(r.i32())
 		s.SegmentsUnindexed = int(r.i32())
 		s.IndexCandidates = int(r.i32())
+	}
+	if r.err == nil && len(r.b) >= 4 {
+		s.Tier = collections.AggTier(r.i32())
 	}
 	return s
 }
