@@ -431,6 +431,29 @@ func (a *Archive) SidecarSizes() SidecarSizes { return a.c.SidecarSizes() }
 // an archive look like it had none.
 func (a *Archive) HotAttrNames() []string { return a.c.HotAttrNames() }
 
+// RefreshHotSet recomputes the hot set from accumulated query demand and installs it for
+// FUTURE writes, returning how many attributes were chosen. See Collection.RefreshHotSet
+// for the ranking.
+//
+// On an archive this applies to segments written from now on and to nothing already on
+// disk. That is safe without any rewrite because the hot header is per RECORD and
+// self-describing -- each record states its own hot count and pairs -- so records written
+// under different hot sets coexist in one archive, a reader resolving an attribute that is
+// not in a given record's header simply misses and falls back to the entry scan.
+//
+// It also means an archive, unlike a mutable table, never CONVERGES on the refreshed set:
+// a mutable table's population catches up because its ads are rewritten in place, and an
+// append-only one has nothing to rewrite short of Rewrite(), which re-encodes every record
+// in the history. The refreshed set therefore improves reads of data arriving from now on
+// and leaves older data exactly as fast as it was. That is the whole of what it offers, and
+// it is still worth having: an archive's reads are overwhelmingly of its newest data.
+func (a *Archive) RefreshHotSet(sampleMax, topN int) int { return a.c.RefreshHotSet(sampleMax, topN) }
+
+// AddHotAttrs pins the named attributes into the hot set, merging them with the current
+// one, and returns the resulting hot attributes. As with RefreshHotSet this governs future
+// writes only; existing records keep the header they were written with.
+func (a *Archive) AddHotAttrs(names ...string) []string { return a.c.AddHotAttrs(names...) }
+
 // EncryptionEnabled reports whether this archive's values are sealed (mirroring
 // Collection.EncryptionEnabled). It is currently FALSE for every archive a catalog opens: the archive
 // open path passes no data key, so an archive stores private attributes in the clear where a mutable

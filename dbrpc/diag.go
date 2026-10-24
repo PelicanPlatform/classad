@@ -318,13 +318,19 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 // only to future writes and would not prune the current data.
 // archiveAdmin runs a management action on an append-only archive (history) table: the
 // layout-tuning subset of table admin -- retrain the ZSTD dictionary, add/drop/rebuild
-// per-segment indexes, rewrite, set retention, rotate -- plus truncate (empty the archive).
-// Encryption/time-travel/hot-set actions do not apply to an archive. DAEMON-gated by the
-// caller, like the mutable-table admin.
+// per-segment indexes, refresh the hot set, rewrite, set retention, rotate -- plus truncate
+// (empty the archive). Encryption and time-travel actions do not apply to an archive.
+// DAEMON-gated by the caller, like the mutable-table admin.
+//
+// The hot-set actions behave as they do on a mutable table except in reach: an archive's hot
+// header is written per record, so a changed set applies to records appended from now on and
+// leaves sealed segments on the set they were written with (rewrite re-encodes them, at the
+// cost of reading the whole history back).
 //
 // schema.fit / schema.rebuild run the same shared implementations the mutable path uses, so the
 // two table types cannot drift apart in behaviour or output.
-func archiveAdmin(a *db.ArchiveTable, action string, args []string, hotTopN int) (string, error) {
+func archiveAdmin(a *db.ArchiveTable, action string, args []string, maintainOpts db.MaintainOptions) (string, error) {
+	hotTopN := maintainOpts.HotTopN
 	switch action {
 	case "truncate":
 		// Destructive reset: drop every record (a from-scratch re-sync empties the archive,
@@ -354,11 +360,61 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string, hotTopN int)
 		a.Reindex()
 		return "reindexed", nil
 	case "analyze":
-		// An append-only archive has no demand-driven index/hot auto-tune (its layout is fixed
-		// at creation), so "redo statistics" is a reindex: it rebuilds each segment's per-value
-		// histogram and other selectivity stats. Superseded-version drift does not apply.
+		// On-demand self-tuning, the manual counterpart of the scheduled archive maintenance
+		// pass: refresh the hot set from accumulated read demand, add the indexes that demand
+		// justifies when a threshold is configured, then reindex so the new indexes and each
+		// segment's per-value histogram and other selectivity stats are rebuilt.
+		//
+		// What it does NOT do is touch data already on disk. The refreshed hot set reaches
+		// records appended from here on; sealed segments keep theirs until a rewrite.
+		topN := hotTopN
+		if topN <= 0 {
+			topN = defaultAnalyzeHotTopN
+		}
+		if len(args) == 1 { // optional hot-set size override: analyze <topN>
+			if v, err := strconv.Atoi(args[0]); err == nil && v > 0 {
+				topN = v
+			}
+		}
+		sampleMax := maintainOpts.SampleMax
+		if sampleMax <= 0 {
+			sampleMax = diagSampleMax
+		}
+		hot := a.RefreshHotSet(sampleMax, topN)
+		tuned := ""
+		if maintainOpts.ArchiveIndexMinDemand > 0 {
+			res := a.AutoTune(db.AutoTuneOptions{
+				SampleMax: sampleMax,
+				MinDemand: maintainOpts.ArchiveIndexMinDemand,
+				Reindex:   true,
+			})
+			if res.Changed {
+				names := make([]string, 0, len(res.Changes))
+				for _, ch := range res.Changes {
+					names = append(names, ch.Action+" "+ch.Kind+" index on "+ch.Attr)
+				}
+				tuned = ", " + join(names)
+			}
+		}
 		a.Reindex()
-		return "analyzed (reindexed selectivity statistics)", nil
+		return fmt.Sprintf("analyzed: hot set = %d attribute(s) for future records%s (reindexed selectivity statistics)",
+			hot, tuned), nil
+	case "hot.add":
+		if len(args) == 0 {
+			return "", fmt.Errorf("hot.add needs at least one attribute")
+		}
+		return "hot attributes (future records): " + join(a.AddHotAttrs(args...)), nil
+	case "hot.refresh":
+		if len(args) != 2 {
+			return "", fmt.Errorf("hot.refresh needs <sampleMax> <topN>")
+		}
+		sampleMax, e1 := strconv.Atoi(args[0])
+		topN, e2 := strconv.Atoi(args[1])
+		if e1 != nil || e2 != nil {
+			return "", fmt.Errorf("hot.refresh arguments must be integers")
+		}
+		return fmt.Sprintf("refreshed hot set: %d attribute(s), applied to records appended from now on "+
+			"(sealed segments keep the set they were written with)", a.RefreshHotSet(sampleMax, topN)), nil
 	case "rewrite":
 		return fmt.Sprintf("rewrote %d record(s) with the current hot set", a.Rewrite()), nil
 	case "codec.retrain":

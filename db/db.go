@@ -335,6 +335,21 @@ type MaintainOptions struct {
 	// budget. ArchiveMergeDisabled turns the archive side of maintenance off entirely.
 	ArchiveMerge         MergeOptions
 	ArchiveMergeDisabled bool
+	// ArchiveHotRefreshDisabled turns off the demand-driven hot-set refresh on ARCHIVE
+	// tables, which otherwise runs on the same HotTopN the mutable tables use.
+	//
+	// It shares HotTopN rather than taking a threshold of its own because, alone among the
+	// archive's self-tuning passes, it reads nothing back: the hot header is per record and
+	// self-describing, so a refreshed set governs records written from now on and leaves
+	// every sealed segment untouched and correct. The pass costs one bounded sample plus a
+	// pointer swap -- nothing like the whole-history backfill behind ArchiveIndexMinDemand
+	// or ArchiveSchemaScanHotTopN -- so there is nothing for an operator to weigh before
+	// letting it run, and an off-by-default knob would leave it dark for the same reason
+	// those two were.
+	//
+	// The escape hatch exists because the refresh does change what future segments look
+	// like, and an archive whose hot set was chosen deliberately should be able to keep it.
+	ArchiveHotRefreshDisabled bool
 	// ArchiveIndexMinDemand is the minimum observed query demand for the auto-tuner to add
 	// an index to an ARCHIVE table; 0 leaves archive index auto-tune off.
 	//

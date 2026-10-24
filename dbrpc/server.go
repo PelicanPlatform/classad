@@ -1451,7 +1451,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 				if !privileged {
 					return respErr(reqID, fmt.Sprintf("admin action %q requires DAEMON authorization", action))
 				}
-				msg, err := archiveAdmin(a, action, args, s.maintainOpts.HotTopN)
+				msg, err := archiveAdmin(a, action, args, s.maintainOpts)
 				if err != nil {
 					return respErr(reqID, err.Error())
 				}
@@ -1666,9 +1666,11 @@ func respBad(reqID uint64) []byte { return resp(reqID, stBadReq) }
 // vm.max_map_count stops the daemon STARTING, and the condition is not self-correcting: with
 // nothing merging, the count only rises, and the symptom does not appear until a restart.
 //
-// The work is deliberately narrow -- merge cold runs, and rebuild indexes left stale by an
-// interrupted pass. Retraining and rewriting are excluded: both re-encode the whole archive,
-// which is not something to do on a timer.
+// The work is deliberately narrow -- merge cold runs, rebuild indexes left stale by an
+// interrupted pass, and apply the demand-driven tuning that does not re-encode anything.
+// Retraining and rewriting are excluded: both re-encode the whole archive, which is not
+// something to do on a timer. That exclusion is also why the hot-set refresh here only
+// reaches future records: applying a new hot set to existing ones IS a rewrite.
 func (s *Server) maintainArchives(opts db.MaintainOptions) {
 	if opts.ArchiveMergeDisabled {
 		return
@@ -1687,16 +1689,24 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 		if stale, _ := a.StaleIndexSegments(); stale > 0 {
 			a.Reindex()
 		}
+		sampleMax := opts.SampleMax
+		if sampleMax <= 0 {
+			sampleMax = diagSampleMax
+		}
 		// The per-segment columnar accelerator, off unless configured (see
 		// ArchiveSchemaScanHotTopN): the first build reads the whole history once. After that
 		// this only extends coverage to segments sealed since, including those a merge just
 		// produced.
 		if opts.ArchiveSchemaScanHotTopN > 0 {
-			sampleMax := opts.SampleMax
-			if sampleMax <= 0 {
-				sampleMax = diagSampleMax
-			}
 			a.BuildAndEnableSchemaScan(sampleMax, opts.ArchiveSchemaScanHotTopN)
+		}
+		// Re-rank the hot header from accumulated read demand, for records written from here
+		// on. This is the one archive pass that reads nothing back: the hot header is per
+		// record, so sealed segments keep -- and still read correctly under -- the set they
+		// were written with, and nothing is rebuilt. A sample and a pointer swap, which is
+		// why it runs on the shared HotTopN instead of a threshold of its own.
+		if opts.HotTopN > 0 && !opts.ArchiveHotRefreshDisabled {
+			a.RefreshHotSet(sampleMax, opts.HotTopN)
 		}
 		// Add the indexes observed demand justifies. Off unless a threshold is configured:
 		// an archive index is paid for by reading history back, so it is not something to
