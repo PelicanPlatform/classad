@@ -190,6 +190,10 @@ type segment struct {
 	// could not load. Those bytes are what Repair recovers them from, so the segment is not
 	// rewritten (verifyForRewrite). Set during Open; read-only after.
 	stoppedAtDamage bool
+	// framingLost is set when a walk of this segment did not land on its extent: a damaged totalLen
+	// its damage set does not know. Close then writes no directory snapshot for its shard, so the
+	// next open walks the records and reframes the segment.
+	framingLost atomic.Bool
 
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned

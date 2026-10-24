@@ -1048,7 +1048,9 @@ func (c *Collection) Close() error {
 		}
 		// Persist the directory for a scan-free reopen (best effort; skipped for a
 		// chained collection -- see tryLoadDirSnapshot). Only for a persistent store.
-		if c.dir != "" && sh.childParentHash == nil {
+		// Not when a walk lost a segment's framing: restoring the snapshot would skip the record walk
+		// that finds and records that damage, and every later scan would come back short again.
+		if c.dir != "" && sh.childParentHash == nil && !shardFramingLost(sh) {
 			shardDir := filepath.Join(c.dir, fmt.Sprintf("%d", i))
 			_ = writeDirSnapshot(sh, shardDir)
 		}
@@ -1079,6 +1081,16 @@ func (c *Collection) Close() error {
 	// byte budget and are displaced by live entries as the cache admits them, the same way the
 	// blocks of a compacted or truncated segment age out.
 	return firstErr
+}
+
+// shardFramingLost reports whether a walk of any of the shard's segments lost its framing.
+func shardFramingLost(sh *shard) bool {
+	for _, seg := range sh.segs {
+		if seg != nil && seg.framingLost.Load() {
+			return true
+		}
+	}
+	return false
 }
 
 // recoverExtent derives a segment's extent when its sidecar supplies no trusted one: the recovery

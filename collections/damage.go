@@ -402,6 +402,7 @@ func verifyForRewrite(seg *segment) bool {
 		total := int(recTotalLen(seg.data, o))
 		if total <= 0 || total%8 != 0 || off+total > seg.used {
 			rewritesRefusedDamaged.Add(1)
+			seg.framingLost.Store(true)
 			return false
 		}
 		if !recVerifyCRC(seg.data, o) {

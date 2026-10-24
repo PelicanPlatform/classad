@@ -185,16 +185,21 @@ func forEachVisibleRef(s0 uint64, wins []segWindow, fn func(recRef) bool) {
 			}
 			off += int(total)
 		}
-		noteFramingLost(off, w.used)
+		noteFramingLost(w, off)
 	}
 }
 
-// noteFramingLost counts a walk of a window that did not land on its end: a damaged totalLen the
-// segment's damage set does not know misframed it, and the records past that point were not read.
-// That is damage inside a trusted extent, which only a walk finds (Fsck names the segment).
-func noteFramingLost(off, used int) {
-	if off != used {
+// noteFramingLost counts a walk of a window that ended at off without landing on its end: a damaged
+// totalLen the segment's damage set does not know misframed it, and the records past that point were
+// not read. That is damage inside a trusted extent, which only a walk finds. The segment is marked so
+// that Close writes no directory snapshot: the next open then rebuilds the directory, which reframes
+// the segment and records its damage (see Collection.rebuildDir).
+func noteFramingLost(w segWindow, off int) {
+	if off != w.used {
 		noteReadSkip(errFramingLost)
+		if w.seg != nil {
+			w.seg.framingLost.Store(true)
+		}
 	}
 }
 
@@ -228,7 +233,7 @@ func forEachVisibleRefReverse(s0 uint64, wins []segWindow, fn func(recRef) bool)
 			offs = append(offs, o)
 			off += int(total)
 		}
-		noteFramingLost(off, w.used)
+		noteFramingLost(w, off)
 		for i := len(offs) - 1; i >= 0; i-- {
 			o := offs[i]
 			if !recIsMarker(w.data, o) && w.visible(o, s0) {
@@ -262,7 +267,7 @@ func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 		}
 		off += int(total)
 	}
-	noteFramingLost(off, w.used)
+	noteFramingLost(w, off)
 }
 
 // adBytes presents a record as a whole ad plus the codec that decodes it, for the byte-passing

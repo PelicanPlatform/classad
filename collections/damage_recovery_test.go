@@ -630,10 +630,9 @@ func TestDamageInTrustedExtent(t *testing.T) {
 
 	t.Run("total-length-snapshot", func(t *testing.T) {
 		// With the directory snapshot the open walks no records, so nothing finds the damage before a
-		// scan does. A scan it cuts short must say so.
-		dir, _, missing := damage(t, func(p string, data []byte, o int) string { return damageTotal(t, p, data, o) })
+		// scan does. A scan it cuts short must say so, and the next open must walk the records.
+		dir, target, missing := damage(t, func(p string, data []byte, o int) string { return damageTotal(t, p, data, o) })
 		c, _ := openCounting(t, internedStoreOpts(dir))
-		defer c.Close()
 		before := readSkipsOf("framing")
 		n := 0
 		for range c.Scan() {
@@ -643,6 +642,18 @@ func TestDamageInTrustedExtent(t *testing.T) {
 		if n < len(orig)-len(missing) && readSkipsOf("framing") == before {
 			t.Errorf("a scan returned %d of %d ads and counted no lost framing", n, len(orig)-len(missing))
 		}
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+		c, oc := openCounting(t, internedStoreOpts(dir))
+		defer c.Close()
+		if oc.skipped != 1 {
+			t.Errorf("reopen: DamagedRecordsSkipped rose by %d, want 1", oc.skipped)
+		}
+		if dm := sidecarDamage(t, target); dm.len() != 1 {
+			t.Errorf("the sidecar records %d damaged spans, want 1", dm.len())
+		}
+		requireReads(t, c, orig, missing, true)
 	})
 
 	t.Run("key-length", func(t *testing.T) {
