@@ -281,9 +281,21 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 		attrs = append(attrs, r.str())
 	}
 	n := 0
+	// The scan breakdown is computed when the client asked for it (EXPLAIN ANALYZE) and
+	// ALSO whenever the server is aggregating queries, so the aggregate can report what
+	// pruned and what did not instead of leaving its most diagnostic column blank.
+	var stats *collections.ScanStats
+	if wantStats || s.queryStatsOn() {
+		stats = &collections.ScanStats{}
+	}
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: projectOpName(chaseRefs), Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+			q := QueryLog{Op: projectOpName(chaseRefs), Table: table, Constraint: constraint, Limit: limit,
+				Rows: n, Projection: len(attrs), Duration: time.Since(start)}
+			if stats != nil {
+				q.Scan = *stats
+			}
+			qlog(q)
 		}()
 	}
 	if r.err != nil {
@@ -302,35 +314,37 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	// stats is filled by the *RefsStats db methods during iteration when wantStats (which the
-	// caller only sets on the chaseRefs path). nil pointer otherwise, so the normal ops pay
-	// nothing.
-	var stats *collections.ScanStats
-	if wantStats {
-		stats = &collections.ScanStats{}
-	}
 	if d, ok := s.cat.Table(table); ok {
-		if wantStats {
+		switch {
+		case stats != nil && chaseRefs:
 			seq, err = d.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
-		} else if chaseRefs {
+		case stats != nil:
+			seq, err = d.QueryRawProjectedStats(constraint, attrs, redact, stats)
+		case chaseRefs:
 			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
-		} else {
+		default:
 			seq, err = d.QueryRawProjected(constraint, attrs, redact)
 		}
 	} else if d, ok := s.cat.ViewBacking(table); ok {
-		if wantStats {
+		switch {
+		case stats != nil && chaseRefs:
 			seq, err = d.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
-		} else if chaseRefs {
+		case stats != nil:
+			seq, err = d.QueryRawProjectedStats(constraint, attrs, redact, stats)
+		case chaseRefs:
 			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
-		} else {
+		default:
 			seq, err = d.QueryRawProjected(constraint, attrs, redact)
 		}
 	} else if a, ok := s.cat.ArchiveTable(table); ok {
-		if wantStats {
+		switch {
+		case stats != nil && chaseRefs:
 			seq, err = a.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
-		} else if chaseRefs {
+		case stats != nil:
+			seq, err = a.QueryRawProjectedStats(constraint, attrs, redact, stats)
+		case chaseRefs:
 			seq, err = a.QueryRawProjectedRefs(constraint, attrs, redact)
-		} else {
+		default:
 			seq, err = a.QueryRawProjected(constraint, attrs, redact)
 		}
 	} else {
@@ -382,7 +396,8 @@ func (s *Server) streamQueryRawProjectSeq(ctx context.Context, reqID uint64, r *
 	n := 0
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: "QueryRawProjSeq", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+			qlog(QueryLog{Op: "QueryRawProjSeq", Table: table, Constraint: constraint, Limit: limit,
+				Rows: n, Projection: len(attrs), Duration: time.Since(start)})
 		}()
 	}
 	if r.err != nil {
@@ -541,7 +556,8 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 	n := 0
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: "QueryRawWire", Table: table, Constraint: constraint, Limit: limit, Rows: n, Duration: time.Since(start)})
+			qlog(QueryLog{Op: "QueryRawWire", Table: table, Constraint: constraint, Limit: limit,
+				Rows: n, Projection: len(attrs), Duration: time.Since(start)})
 		}()
 	}
 	if r.err != nil {

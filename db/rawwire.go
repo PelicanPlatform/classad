@@ -105,6 +105,20 @@ func (db *DB) QueryRawProjected(constraint string, projection []string, redact b
 	return db.c.QueryRawProjected(q, projection, false, redact), nil
 }
 
+// QueryRawProjectedStats is QueryRawProjected that also fills stats (may be nil) with the
+// per-scan work breakdown -- the mutable-table counterpart of ArchiveTable.QueryRawProjectedStats.
+// An empty/true constraint takes the no-WHERE scan path and leaves stats zero.
+func (db *DB) QueryRawProjectedStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[collections.RawAd], error) {
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return db.c.ScanRawProjected(projection, false, redact), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryRawProjectedStats(q, projection, false, redact, stats), nil
+}
+
 // QueryRawProjectedRefs is QueryRawProjected that also carries the attributes the
 // projected expressions reference, transitively, so each yielded ad EVALUATES
 // self-contained (collections chaseRefs).

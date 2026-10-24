@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -42,7 +43,32 @@ type Server struct {
 	// the accumulated ops are handed to propose, which is the store's sole writer. Set by
 	// the consistent-HA daemon on the leader; nil for a standalone store. See propose.go.
 	propose ProposeFunc
+
+	// qstats aggregates served queries by shape (EnableQueryStats); nil when the server
+	// is not aggregating. Held in an atomic pointer because it is read on every query
+	// and may be enabled after connections are already being served.
+	qstats atomic.Pointer[queryStats]
 }
+
+// EnableQueryStats starts (or reconfigures and restarts) aggregation of the queries this
+// server serves: each one is bucketed by its shape -- opcode, table, constraint
+// fingerprint and whether a LIMIT was sent -- with the slowest actual instances of each
+// shape kept as exemplars. A client reads the result with Client.QueryStats; exemplars
+// are returned only on a DAEMON-authorized connection, since they carry real constraint
+// text and the requesting identity.
+//
+// Recording happens on the goroutine that served the query, after its last frame went
+// out, and costs one constraint parse plus a map update under a mutex.
+func (s *Server) EnableQueryStats(opts QueryStatsOptions) {
+	s.qstats.Store(newQueryStats(opts))
+}
+
+// DisableQueryStats stops aggregation and discards what was collected.
+func (s *Server) DisableQueryStats() { s.qstats.Store(nil) }
+
+// queryStatsOn reports whether aggregation is running. The query ops consult it to decide
+// whether to collect a scan breakdown they would not otherwise compute.
+func (s *Server) queryStatsOn() bool { return s.qstats.Load() != nil }
 
 // Catalog is the set of named tables the server serves. *db.Catalog implements
 // it; a single-DB server wraps its DB as a one-table catalog.
@@ -222,6 +248,12 @@ type ServeOptions struct {
 	// query pattern). Called from the connection's read-loop goroutine, so it must
 	// not block.
 	QueryLog func(QueryLog)
+
+	// Peer names the authenticated identity on the other end of this connection, for
+	// diagnostics only: it is stamped into QueryLog.User, so a per-query log line and a
+	// slow-query exemplar can say WHO ran the expensive query. Never used for access
+	// control -- that is ReadOnly/IncludePrivate/Privileged.
+	Peer string
 }
 
 // QueryLog is one observed query, passed to ServeOptions.QueryLog.
@@ -232,6 +264,22 @@ type QueryLog struct {
 	Limit      int           // the client's LIMIT (0 = unlimited)
 	Rows       int           // rows streamed back
 	Duration   time.Duration // wall-clock time to run + stream the query
+
+	// Projection is how many attributes the client asked the server to return; 0 means
+	// it asked for no projection at all, so every attribute of every matched ad crossed
+	// the wire. That is the chatty pattern this log exists to make visible, and without
+	// this field it was the one thing the log could not show.
+	Projection int
+
+	// Scan is the server-side work breakdown for the query -- notably segments scanned
+	// versus pruned, which separates "slow because the window is big" from "slow because
+	// nothing pruned". It is filled on the read paths that thread it (the projection and
+	// top-K ops); elsewhere it is zero, which means NOT MEASURED rather than no work.
+	Scan collections.ScanStats
+
+	// User is the connection's authenticated identity (ServeOptions.Peer), or empty when
+	// the front end did not name one.
+	User string
 }
 
 // isMutating reports whether o writes to a transaction (and so is refused on a
@@ -423,6 +471,7 @@ func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel() // stop this connection's watches when it closes
 	sc := &serverConn{s: s, ctx: ctx, opts: opts, watches: make(map[uint64]context.CancelFunc), txns: make(map[uint64]struct{})}
+	sc.qlog = s.queryLogger(opts)
 	// Abort any transactions still open when the connection ends, so a client that
 	// drops mid-transaction (a transient reset, a crash, a cancelled context) does
 	// not leak the server-side txn and its buffered write-set.
@@ -449,6 +498,24 @@ func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 	}
 }
 
+// queryLogger builds the per-connection query observer: it stamps the peer identity onto
+// each record, feeds the server's shape aggregation when that is enabled, and then calls
+// the caller's hook. It is always non-nil so that enabling aggregation reaches connections
+// that are already open.
+func (s *Server) queryLogger(opts ServeOptions) func(QueryLog) {
+	hook := opts.QueryLog
+	peer := opts.Peer
+	return func(q QueryLog) {
+		q.User = peer
+		if qs := s.qstats.Load(); qs != nil {
+			qs.record(q)
+		}
+		if hook != nil {
+			hook(q)
+		}
+	}
+}
+
 func isRestoreOp(o op) bool {
 	return o == opRestore || o == opRestoreChunk || o == opRestoreEnd
 }
@@ -461,6 +528,11 @@ type serverConn struct {
 	ctx   context.Context
 	opts  ServeOptions
 	write func([]byte)
+
+	// qlog is the per-query observer for this connection: it feeds the server's shape
+	// aggregation and then the caller's own ServeOptions.QueryLog hook. Built once per
+	// connection so the query ops need not know about either.
+	qlog func(QueryLog)
 
 	wmu     sync.Mutex
 	watches map[uint64]context.CancelFunc
@@ -494,25 +566,25 @@ func (sc *serverConn) dispatch(frame []byte) {
 	priv := sc.opts.IncludePrivate
 	switch o {
 	case opQuery:
-		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamQuery(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryAsOf:
-		sc.s.streamQueryAsOf(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamQueryAsOf(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRaw:
-		sc.s.streamQueryRaw(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamQueryRaw(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawProj:
-		sc.s.streamQueryRawProject(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamQueryRawProject(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawProjSeq:
-		sc.s.streamQueryRawProjectSeq(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamQueryRawProjectSeq(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawProjRefs:
-		sc.s.streamQueryRawProjectRefs(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamQueryRawProjectRefs(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawProjRefsStats:
-		sc.s.streamQueryRawProjectRefsStats(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamQueryRawProjectRefsStats(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTopK:
-		sc.s.streamTopK(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamTopK(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTopKStats:
-		sc.s.streamTopKStats(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamTopKStats(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawWire:
-		sc.s.streamQueryRawWire(sc.ctx, reqID, body, priv, sc.write, sc.opts.QueryLog)
+		sc.s.streamQueryRawWire(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchSorted:
 		sc.s.streamMatchSorted(sc.ctx, reqID, body, priv, sc.write)
 	case opOrdered:
@@ -1328,6 +1400,39 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			return respErr(reqID, "no such table: "+table)
 		}
 		data, err := s.diagJSON(d)
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putStr(resp(reqID, stOK), string(data))
+
+	case opQueryStats:
+		table := r.str()
+		reset := r.u8() != 0
+		if r.err != nil {
+			return respBad(reqID)
+		}
+		qs := s.qstats.Load()
+		if qs == nil {
+			data, err := json.Marshal(QueryStatsReport{})
+			if err != nil {
+				return respErr(reqID, err.Error())
+			}
+			return putStr(resp(reqID, stOK), string(data))
+		}
+		// Exemplars name a user and quote the constraint they ran, so they are DAEMON-only
+		// even though the shapes they belong to are not. Clearing the window is DAEMON-only
+		// for the same reason the rest of the admin surface is: any reader could otherwise
+		// erase what an operator was about to look at.
+		if reset && !privileged {
+			return respErr(reqID, "resetting query statistics requires DAEMON authorization")
+		}
+		// Snapshot BEFORE clearing, so a reset is "show me and start over" rather than a
+		// request that throws away the very numbers it returns.
+		rep := qs.report(table, privileged)
+		if reset {
+			qs.reset()
+		}
+		data, err := json.Marshal(rep)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
