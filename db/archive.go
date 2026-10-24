@@ -349,58 +349,97 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 // RecordsReassembled here is exactly the signature of the slow aggregate this trailer exists to
 // surface.
 func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats) ([]AggRow, error) {
-	// A constraint that can never match needs no data read at all. Answered by running the ordinary
-	// aggregation over an EMPTY sequence rather than by constructing a result here, so the shape is whatever
-	// a scan that matched nothing would have produced -- 0 for a count, undefined for MIN -- by construction
-	// rather than by a second implementation that could disagree.
-	if IsMatchNone(constraint) {
-		attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
-		return AggregateValues(func(func([]classad.Value) bool) {}, attrs, groupCols, aggs, groupCol, aggCol, nil)
-	}
-	if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
-		return rows, nil
-	}
-	// A CONSTRAINED COUNT(*) with no grouping: read the predicated columns out of the columnar
-	// blocks instead of scanning records. aggregateFromIndex above only answers the UNCONSTRAINED
-	// case (a constraint cannot be attributed to a whole segment's stored count), and
-	// ColumnarAggregate below declines a COUNT(*) because it has no attribute to aggregate -- so
-	// this shape reached neither, and fell to the scan even on an archive that carries an
-	// accelerator. It is the shape a history table is asked most.
-	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		aggs[0].Filter == "" {
-		if n, ok := t.a.CountConstraint(constraint); ok {
-			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, nil
-		}
-	}
-	// A COUNT(*) GROUPED BY one numeric schema column: a histogram of that column, computed in the
-	// same columnar pass the ungrouped count above makes. aggregateFromIndex answers a grouped
-	// count only from the CATEGORICAL index, so a group column that is a hot numeric (`GROUP BY
-	// NumJobStarts`) reached neither it nor the ungrouped fast path and fell to a full row scan --
-	// the same predicate costing ~200x its ungrouped count, constrained or not.
-	if rows, ok := t.groupedFromColumns(constraint, groupCols, aggs); ok {
-		return rows, nil
-	}
-	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
-	// per-segment columnar blocks instead of decoding every record. Declines (and falls through
-	// to the scan) unless the archive carries an accelerator and the aggregate is in scope.
-	if rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
-		return t.NumStats(constraint, attr)
-	}, groupCols, aggs); ok {
-		return rows, nil
-	}
+	return runAggLadder(t.aggLadder(stats), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
+}
 
-	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
-
-	// Scan wire-native, reading only the attributes the aggregation projects (empty for a
-	// pure COUNT), so it does not fully decode every matched record -- mirroring the mutable
-	// table's aggregate. Zone maps still prune segments no matching record can fall in. This is
-	// the path whose stats matter: an attribute the columnar accelerator does not cover forces a
-	// per-record reassembly here, which the trailer surfaces as a large RecordsReassembled.
-	seq, err := t.QueryProjectStats(constraint, attrs, stats)
-	if err != nil {
-		return nil, err
+// aggLadder is the archive's ordered list of aggregate strategies: each serves the whole request
+// or declines to the next, and the projected scan at the end always answers. The ladder is built
+// per call because its last rung has to close over the caller's stats block; the rungs above it
+// read nothing but the request.
+//
+// Order is load-bearing in one place and incidental elsewhere. Match-none has to come first, since
+// it is the only rung that can answer without consulting storage at all. The index rung has to
+// precede the constrained count, because the index answers the unconstrained shape the count rung
+// would otherwise pay a columnar pass for. The rest are mutually exclusive on the number of group
+// columns, so their order is the order they were added rather than a requirement.
+func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
+	return []AggStrategy{
+		aggRung{"match-none", func(req AggRequest) ([]AggRow, bool, error) {
+			// A constraint that can never match needs no data read at all. Answered by running the
+			// ordinary aggregation over an EMPTY sequence rather than by constructing a result here, so
+			// the shape is whatever a scan that matched nothing would have produced -- 0 for a count,
+			// undefined for MIN -- by construction rather than by a second implementation that could
+			// disagree. It is also the one rung that can fail on a malformed request before any storage
+			// is touched, because it runs the same reduce engine the scan does.
+			if !IsMatchNone(req.Constraint) {
+				return nil, false, nil
+			}
+			attrs, groupCol, aggCol := AggProjection(req.GroupCols, req.Aggs)
+			rows, err := AggregateValues(func(func([]classad.Value) bool) {}, attrs, req.GroupCols, req.Aggs, groupCol, aggCol, nil)
+			if err != nil {
+				return nil, false, err
+			}
+			return rows, true, nil
+		}},
+		aggRung{"index", func(req AggRequest) ([]AggRow, bool, error) {
+			// Answered from postings and stored counts, reading no record at all -- the one rung
+			// that is not a scan of anything.
+			rows, ok := t.aggregateFromIndex(req.Constraint, req.GroupCols, req.Aggs)
+			return rows, ok, nil
+		}},
+		aggRung{"count-constraint", func(req AggRequest) ([]AggRow, bool, error) {
+			// A CONSTRAINED COUNT(*) with no grouping: read the predicated columns out of the columnar
+			// blocks instead of scanning records. The index rung above only answers the UNCONSTRAINED
+			// case (a constraint cannot be attributed to a whole segment's stored count), and
+			// columnar-aggregate below declines a COUNT(*) because it has no attribute to aggregate --
+			// so this shape reached neither, and fell to the scan even on an archive that carries an
+			// accelerator. It is the shape a history table is asked most.
+			if !req.isPlainCount() {
+				return nil, false, nil
+			}
+			n, ok := t.a.CountConstraint(req.Constraint)
+			if !ok {
+				return nil, false, nil
+			}
+			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, true, nil
+		}},
+		aggRung{"grouped-columns", func(req AggRequest) ([]AggRow, bool, error) {
+			// A COUNT(*) GROUPED BY one numeric schema column: a histogram of that column, computed in
+			// the same columnar pass the ungrouped count above makes. The index rung answers a grouped
+			// count only from the CATEGORICAL index, so a group column that is a hot numeric (`GROUP BY
+			// NumJobStarts`) reached neither it nor the ungrouped fast path and fell to a full row scan
+			// -- the same predicate costing ~200x its ungrouped count, constrained or not.
+			rows, ok := t.groupedFromColumns(req.Constraint, req.GroupCols, req.Aggs)
+			return rows, ok, nil
+		}},
+		aggRung{"columnar-aggregate", func(req AggRequest) ([]AggRow, bool, error) {
+			// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
+			// per-segment columnar blocks instead of decoding every record. Declines (and falls through
+			// to the scan) unless the archive carries an accelerator and the aggregate is in scope.
+			rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
+				return t.NumStats(req.Constraint, attr)
+			}, req.GroupCols, req.Aggs)
+			return rows, ok, nil
+		}},
+		aggRung{"projected-scan", func(req AggRequest) ([]AggRow, bool, error) {
+			// The reference, and the rung that must never decline. Scan wire-native, reading only the
+			// attributes the aggregation projects (empty for a pure COUNT), so it does not fully decode
+			// every matched record -- mirroring the mutable table's aggregate. Zone maps still prune
+			// segments no matching record can fall in. This is the path whose stats matter: an
+			// attribute the columnar accelerator does not cover forces a per-record reassembly here,
+			// which the trailer surfaces as a large RecordsReassembled.
+			attrs, groupCol, aggCol := AggProjection(req.GroupCols, req.Aggs)
+			seq, err := t.QueryProjectStats(req.Constraint, attrs, stats)
+			if err != nil {
+				return nil, false, err
+			}
+			rows, err := AggregateValues(seq, attrs, req.GroupCols, req.Aggs, groupCol, aggCol, nil)
+			if err != nil {
+				return nil, false, err
+			}
+			return rows, true, nil
+		}},
 	}
-	return AggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, nil)
 }
 
 // aggregateFromIndex answers the aggregate without reading records where the per-segment
