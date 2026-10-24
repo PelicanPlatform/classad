@@ -303,13 +303,17 @@ func TestScanRawProjectedInline(t *testing.T) {
 	}
 }
 
-// TestWholeAdQueriesRecordNoHotDemand locks in the "condor_status -l" rule: a
-// whole-ad query (no projection) -- text or wire-form, with or without a
-// constraint -- must record NO read demand, so requesting everything can never
-// drag every attribute into the demand-ranked hot set. A constraint's attrs may
-// gain filter (eq/rng) demand for index suggestions, but never reads; only a
-// real projection records reads, and only for its own attributes.
-func TestWholeAdQueriesRecordNoHotDemand(t *testing.T) {
+// TestWholeAdQueriesRecordNoProjectionDemand locks in the "condor_status -l" rule: a
+// whole-ad query (no projection) -- text or wire-form -- records no PROJECTION read
+// demand, so asking for everything can never drag every attribute into the
+// demand-ranked hot set. Only a real projection records reads, and only for its own
+// attributes.
+//
+// A constraint is a separate matter, covered below and in
+// TestFilterReadDemandIsUniformAcrossPaths: the matcher really does read its
+// attributes out of every record the scan visits, so they are read demand on every
+// path that evaluates them.
+func TestWholeAdQueriesRecordNoProjectionDemand(t *testing.T) {
 	t.Parallel()
 	c := projTestCollectionInline(t)
 
@@ -320,27 +324,39 @@ func TestWholeAdQueriesRecordNoHotDemand(t *testing.T) {
 		return 0
 	}
 
-	// Whole-ad, every flavor.
+	// Unconstrained whole-ad scans: nothing is filtered and nothing is selected, so
+	// there is no evidence about any attribute at all.
 	for range c.ScanRaw() {
 	}
 	for range c.ScanRawRedacted() {
 	}
 	for range c.ScanRawWire(nil, true) {
 	}
-	if q, err := vm.Parse(`Cpus == 8`); err == nil {
-		for range c.QueryRawWire(q, nil, true) {
-		}
-		for range c.QueryRaw(q) {
-		}
-	} else {
-		t.Fatal(err)
-	}
 	for _, attr := range []string{"Name", "State", "Cpus", "Memory", "OpSys", "MyType"} {
 		if n := reads(attr); n != 0 {
-			t.Errorf("whole-ad queries recorded read demand for %s (%d); -l must not shape the hot set", attr, n)
+			t.Errorf("unconstrained whole-ad scan recorded read demand for %s (%d)", attr, n)
 		}
 	}
-	// The constraint attr gained only filter demand.
+
+	// Constrained whole-ad queries: the constraint's attribute is read demand, and the
+	// rest of the ad -- which the query returns in full -- is not.
+	q, err := vm.Parse(`Cpus == 8`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range c.QueryRawWire(q, nil, true) {
+	}
+	for range c.QueryRaw(q) {
+	}
+	if reads("Cpus") == 0 {
+		t.Error("constrained whole-ad query recorded no read demand for the constraint attr")
+	}
+	for _, attr := range []string{"Name", "State", "Memory", "OpSys", "MyType"} {
+		if n := reads(attr); n != 0 {
+			t.Errorf("whole-ad query recorded read demand for unfiltered %s (%d); -l must not shape the hot set", attr, n)
+		}
+	}
+	// The constraint attr also gained filter demand, for index suggestions.
 	if v, ok := c.demand.m.Load("cpus"); ok {
 		if v.(*demandCounts).eq.Load() == 0 {
 			t.Error("constraint attr recorded no filter demand")

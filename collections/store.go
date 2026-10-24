@@ -1220,7 +1220,6 @@ func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd
 			}
 			// Not prunable (some disjunct is unconstrained): fall through to a full scan.
 		}
-		c.demand.recordReads(q.ReadAttrs()) // hot-set signal: attributes the query evaluates
 		usable := c.planQuery(qp)
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.

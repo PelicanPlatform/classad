@@ -49,11 +49,21 @@ type queryPlan struct {
 //
 // It is the only constructor of a plan that carries a query. Every filtered scan
 // path goes through it, so none can be written that evaluates q but skips index
-// demand, zone pruning, or the wire-native fast path -- the prologue is not
-// something a path assembles for itself.
+// demand, zone pruning, read demand, or the wire-native fast path -- the prologue is
+// not something a path assembles for itself.
+//
+// Recording the constraint's read demand here, rather than in planQuery, is
+// deliberate: planQuery is skipped by the paths that do not plan an index (the
+// chained scan, the disjunctive index path, the point-in-time scan), and those scans
+// read the constraint's attributes out of every record just the same.
 func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats) queryPlan {
 	plan := q.ReadPlan()
 	ws := &wireScope{ctx: c}
+	// Read demand for the attributes the constraint evaluates -- once per scan, never
+	// per record. Only the FILTER half: a path with a projection records that itself,
+	// because not every path has one and "no projection" means the whole ad, which is
+	// not evidence that any particular attribute is worth front-loading.
+	c.demand.recordReads(q.ReadAttrs())
 	qp := queryPlan{
 		q:        q,
 		plan:     plan,
