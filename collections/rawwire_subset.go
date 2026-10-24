@@ -60,36 +60,7 @@ func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact 
 			return
 		}
 		sel := c.newWireSubsetSelector(projection, redact)
-		emit := c.yieldWireRow(yield, sel)
-		plan := q.ReadPlan()
-		ws := &wireScope{ctx: c}
-		qp := queryPlan{
-			q:        q,
-			plan:     plan,
-			m:        q.Matcher(),
-			wireOK:   q.Native() && plan.PartialSafe,
-			ws:       ws,
-			resolver: ws.resolve,
-			proj:     c.newProjPlan(projection),
-			stats:    stats,
-		}
-		probes := q.Probes()
-		if c.hasZones.Load() {
-			qp.zoneProbes = probes // enable sealed-segment zone pruning (mirrors Query)
-		}
-		c.demand.record(probes)
-		usable := c.planRead(probes)
-		for _, sh := range c.shards {
-			var cont bool
-			if len(usable) > 0 {
-				cont = c.scanShardIndexed(sh, usable, qp, emit)
-			} else {
-				cont = c.scanShard(sh, qp, emit)
-			}
-			if !cont {
-				return
-			}
-		}
+		c.scanQuery(c.newQueryPlan(q, c.newProjPlan(projection), stats), c.yieldWireRow(yield, sel))
 	}
 }
 

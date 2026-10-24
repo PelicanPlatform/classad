@@ -50,47 +50,13 @@ func (c *Collection) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanS
 			return
 		}
 
-		plan := q.ReadPlan()
-		ws := &wireScope{ctx: c}
-		qp := queryPlan{
-			q:        q,
-			plan:     plan,
-			m:        q.Matcher(),
-			wireOK:   q.Native() && plan.PartialSafe,
-			ws:       ws,
-			resolver: ws.resolve,
-			stats:    stats,
-		}
-		probes := q.Probes()
-		if c.hasZones.Load() {
-			qp.zoneProbes = probes // enable sealed-segment zone pruning (mirrors Query)
-		}
-		c.demand.record(probes)
-		usable := c.planRead(probes)
-
 		scratch := make([]classad.Value, len(attrs))
 		rs := &wireScope{ctx: c} // projection resolver, distinct from the match ws
-		stopped := false
-		emit := func(w []byte, dict *segDictHandle) bool {
+		c.scanQuery(c.newQueryPlan(q, nil, stats), func(w []byte, dict *segDictHandle) bool {
 			rs.dict = dict
 			c.projectInto(rs, w, attrs, scratch)
-			if !yield(scratch) {
-				stopped = true
-				return false
-			}
-			return true
-		}
-		for _, sh := range c.shards {
-			var cont bool
-			if len(usable) > 0 {
-				cont = c.scanShardIndexed(sh, usable, qp, emit)
-			} else {
-				cont = c.scanShard(sh, qp, emit)
-			}
-			if !cont || stopped {
-				return
-			}
-		}
+			return yield(scratch)
+		})
 	}
 }
 

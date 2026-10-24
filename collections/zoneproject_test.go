@@ -24,9 +24,10 @@ func (c *decompCountingCodec) Name() string { return "counting" }
 // query on a zone-mapped attribute must skip whole sealed segments in the PROJECTED scan paths
 // (QueryProject, which backs COUNT/GROUP BY aggregates, and QueryRawProjected, which backs
 // column-projected SELECTs) -- not only in the full Query path. Before the fix these two paths
-// never set qp.zoneProbes, so a `SELECT COUNT(*) ... WHERE Ts > <future>` full-scanned every
-// segment instead of pruning. We prove pruning by counting record decompressions: a fully-out-of-
-// range predicate must decompress nothing.
+// built a plan that carried no probes for the zone maps to test, so a
+// `SELECT COUNT(*) ... WHERE Ts > <future>` full-scanned every segment instead of pruning. We
+// prove pruning by counting record decompressions: a fully-out-of-range predicate must
+// decompress nothing.
 func TestZoneMapPruneProjectedPaths(t *testing.T) {
 	codec := &decompCountingCodec{}
 	c := New(Options{AppendOnly: true, SegmentSize: 1 << 12, ZoneAttrs: []string{"Ts"}, Codec: codec})
@@ -109,4 +110,50 @@ func countActiveRecords(sh *shard) int {
 		off += int(total)
 	}
 	return n
+}
+
+// TestZoneMapPruneRawPath covers the scan path the two tests above do not: QueryRaw, which
+// serves AST-free result sets to a collector. It planned its own scan and so pruned nothing,
+// the same omission in a fourth place. The plan now carries the query's probes whatever the
+// path, and zone pruning follows from the probes rather than from each path remembering to
+// ask for it, so this is coverage of the shared behaviour rather than of one more copy.
+func TestZoneMapPruneRawPath(t *testing.T) {
+	codec := &decompCountingCodec{}
+	c := New(Options{AppendOnly: true, SegmentSize: 1 << 12, ZoneAttrs: []string{"Ts"}, Codec: codec})
+	const n = 400
+	for i := 0; i < n; i++ {
+		ad, _ := classad.Parse(fmt.Sprintf(`[ N = %d; Ts = %d ]`, i, i))
+		if err := c.Put([]byte("k"), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sh := c.shards[0]
+	if sealedWithZones(sh) == 0 {
+		t.Fatal("expected sealed segments to carry zone maps")
+	}
+	activeRecords := int64(countActiveRecords(sh))
+
+	q, _ := vm.Parse(`Ts >= 100000`)
+	codec.decompressions.Store(0)
+	rows := 0
+	for range c.QueryRaw(q) {
+		rows++
+	}
+	if rows != 0 {
+		t.Fatalf("QueryRaw(Ts>=100000) returned %d rows, want 0", rows)
+	}
+	if got := codec.decompressions.Load(); got > activeRecords {
+		t.Fatalf("QueryRaw decompressed %d records for an out-of-range predicate (active seg has %d); "+
+			"sealed segments were not pruned", got, activeRecords)
+	}
+
+	// Pruning must never drop a match.
+	q2, _ := vm.Parse(`Ts >= 380`)
+	got := 0
+	for range c.QueryRaw(q2) {
+		got++
+	}
+	if got != n-380 {
+		t.Errorf("QueryRaw(Ts>=380) returned %d rows, want %d", got, n-380)
+	}
 }

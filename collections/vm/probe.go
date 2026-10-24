@@ -31,10 +31,16 @@ type Probe struct {
 // top-level && spine and classifies each conjunct, pushing `!` into comparisons
 // where that is identity under ClassAd three-valued logic. Conjuncts that are not
 // a recognizable `Attr OP literal` (or OR-of-equalities on one attr) are omitted.
+// The result is memoized and SHARED: callers read it, none may modify it.
 func (q *Query) Probes() []Probe {
 	if q == nil || q.prog == nil || q.prog.expr == nil {
 		return nil
 	}
+	q.probesOnce.Do(func() { q.probes = q.computeProbes() })
+	return q.probes
+}
+
+func (q *Query) computeProbes() []Probe {
 	conj := flattenAnd(q.foldedExpr(), nil)
 	var out []Probe
 	for _, c := range conj {

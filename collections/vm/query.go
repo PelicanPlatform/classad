@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"sync"
 	"time"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -12,6 +13,12 @@ import (
 // convenience of a match predicate). The store uses ReadAttrs for planning.
 type Query struct {
 	prog *Program
+	// probesOnce/probes memoize Probes. A query's folded expression is fixed at
+	// Compile (CurrentTime is pinned there), so its probes are too, and the scan
+	// paths ask for them once per scan -- a paged read, once per page. The slice is
+	// shared by every caller and must not be modified.
+	probesOnce sync.Once
+	probes     []Probe
 }
 
 // Compile compiles an already-parsed expression into a Query.

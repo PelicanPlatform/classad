@@ -5,7 +5,6 @@ import (
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/classad"
-	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 // Cross-segment query parallelism. A full-scan Query can fan out across the
@@ -104,22 +103,6 @@ func tryAcquire(sem chan struct{}, n int) int {
 	return got
 }
 
-// makeWorkerPlan builds a queryPlan with fresh per-goroutine execution state (a
-// Matcher, a wireScope, and a bound resolver). The program/read-plan it references is
-// immutable and shared.
-func (c *Collection) makeWorkerPlan(q *vm.Query) queryPlan {
-	plan := q.ReadPlan()
-	ws := &wireScope{ctx: c}
-	return queryPlan{
-		q:        q,
-		plan:     plan,
-		m:        q.Matcher(),
-		wireOK:   q.Native() && plan.PartialSafe,
-		ws:       ws,
-		resolver: ws.resolve,
-	}
-}
-
 // runParallelQuery executes a full-scan query, fanning out across segments when the
 // scan is large enough and the collection-wide worker budget has capacity; otherwise
 // it runs serially over the same snapshotted tasks. It yields each matching ad and
@@ -127,7 +110,7 @@ func (c *Collection) makeWorkerPlan(q *vm.Query) queryPlan {
 // runParallelQuery fans a full scan across workers. redact is the read's entitlement to sealed values,
 // threaded because this path decodes ads ITSELF rather than through the caller's emit -- which is exactly
 // how a redacted Query kept returning opened secrets while every emit-based path was fixed.
-func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) bool, redact bool) {
+func (c *Collection) runParallelQuery(qp queryPlan, yield func(*classad.ClassAd) bool, redact bool) {
 	tasks, totalBytes, release := c.gatherTasks()
 	defer release()
 
@@ -143,7 +126,7 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 		for i := 0; i < W; i++ {
 			<-c.qsem // release the lone token; not enough to parallelize
 		}
-		c.scanTasksSerial(tasks, c.makeWorkerPlan(q), yield, redact)
+		c.scanTasksSerial(tasks, c.workerPlan(qp), yield, redact)
 		return
 	}
 	defer func() {
@@ -160,7 +143,7 @@ func (c *Collection) runParallelQuery(q *vm.Query, yield func(*classad.ClassAd) 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			qp := c.makeWorkerPlan(q)
+			qp := c.workerPlan(qp)
 			var dbuf []byte
 			batch := make([]*classad.ClassAd, 0, parallelBatch)
 			for {

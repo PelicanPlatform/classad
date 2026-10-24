@@ -44,31 +44,7 @@ func (c *Collection) QueryRawRedacted(q *vm.Query) iter.Seq[RawAd] {
 
 func (c *Collection) queryRaw(q *vm.Query, redact bool) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
-		plan := q.ReadPlan()
-		ws := &wireScope{ctx: c}
-		qp := queryPlan{
-			q:        q,
-			plan:     plan,
-			m:        q.Matcher(),
-			wireOK:   q.Native() && plan.PartialSafe,
-			ws:       ws,
-			resolver: ws.resolve,
-		}
-		probes := q.Probes()
-		c.demand.record(probes)
-		usable := c.planRead(probes)
-		emit := c.yieldRaw(yield, redact)
-		for _, sh := range c.shards {
-			var cont bool
-			if len(usable) > 0 {
-				cont = c.scanShardIndexed(sh, usable, qp, emit)
-			} else {
-				cont = c.scanShard(sh, qp, emit)
-			}
-			if !cont {
-				return
-			}
-		}
+		c.scanQuery(c.newQueryPlan(q, nil, nil), c.yieldRaw(yield, redact))
 	}
 }
 
