@@ -152,6 +152,131 @@ func (sh *shard) applyOne(p pendingPut) {
 	pub.end()
 }
 
+// deferredEvent is the watch event of a deferred append, held until a durability sync
+// covers its seq.
+type deferredEvent struct {
+	seq   uint64
+	key   []byte
+	ad    []byte
+	codec Codec
+}
+
+// commitDeferred commits a single append-log write at a fresh commit sequence without
+// the durability sync: the record is readable on return, and becomes durable at the
+// shard's next sync -- a later durable commit, a Flush barrier, a segment roll, or
+// Close. Its watch event, if a watcher is attached, is held in sh.deferred and
+// published by the sync that covers it, so watchers still see only durable records.
+//
+// A segment the write would roll out of is synced first, so a segment never seals
+// holding deferred bytes: a sealed segment is what maintenance builds durable sidecars
+// and rewrites over, and those must not describe records a crash could take back.
+// Retried once if a concurrent writer dirties the segment again; past that the roll
+// proceeds, with the sealed segment covered by that writer's own sync.
+//
+// Held events are capped at maxHeldDeferred: the append that reaches the cap syncs, which
+// publishes them. A sync publishes its events in one burst, and a burst larger than a
+// watcher's buffer overflows it and forces a resync.
+//
+// Persistent append-only shards only; callers route anything else through commitOne.
+func (sh *shard) commitDeferred(p pendingPut) {
+	rl := recordLen(len(p.key), len(p.ad))
+	for tries := 0; ; tries++ {
+		acq, held := sh.lockWrite()
+		if tries < 2 && sh.rollLeavesUnsyncedLocked(rl, p.codec) {
+			sh.unlockWrite(acq, held)
+			sh.sync()
+			continue
+		}
+		seq := sh.commitSeq + 1
+		sh.put(p.hash, p.key, p.ad, seq, p.codec, 0, p.ct)
+		sh.commitSeq = seq
+		full := false
+		if sh.trackPublishLocked(seq) {
+			sh.dmu.Lock()
+			sh.deferred = append(sh.deferred, deferredEvent{seq: seq, key: p.key, ad: p.ad, codec: p.codec})
+			full = sh.ndeferred.Add(1) >= maxHeldDeferred
+			sh.dmu.Unlock()
+		}
+		sh.maybeCheckpoint(seq)
+		sh.unlockWrite(acq, held)
+		if full {
+			sh.sync()
+		}
+		return
+	}
+}
+
+// maxHeldDeferred caps the watch events a shard holds for deferred appends; see
+// commitDeferred. Well under the default watch buffer (Options.WatchBuffer, 1024).
+const maxHeldDeferred = 256
+
+// rollLeavesUnsyncedLocked reports whether writing a record of rl bytes under codec would
+// seal the active segment while it still holds bytes no sync pass has captured. It
+// mirrors writeRecord's roll test. Caller holds the shard write lock.
+func (sh *shard) rollLeavesUnsyncedLocked(rl int, codec Codec) bool {
+	a := sh.act
+	return a != nil && a.used > a.synced && (a.codec != codec || a.used+rl > len(a.data))
+}
+
+// publishDeferred hands the hub every held deferred event with seq <= through, the seq a
+// completed sync pass covers, in commit order. Nothing is published once a sync has
+// failed: those records may not be on disk, and their seqs stay pending, holding live
+// cursors below them.
+func (sh *shard) publishDeferred(through uint64) {
+	if sh.syncErr.Load() != nil {
+		return
+	}
+	sh.dpub.Lock()
+	defer sh.dpub.Unlock()
+	sh.dmu.Lock()
+	n := 0
+	for n < len(sh.deferred) && sh.deferred[n].seq <= through {
+		n++
+	}
+	if n == 0 {
+		sh.dmu.Unlock()
+		return
+	}
+	evs := sh.deferred[:n]
+	sh.deferred = append([]deferredEvent(nil), sh.deferred[n:]...)
+	sh.ndeferred.Add(-int32(n))
+	sh.dmu.Unlock()
+	for _, ev := range evs {
+		pub := sh.beginPublish(ev.seq)
+		pub.add(ev.key, ev.ad, ev.codec, false)
+		pub.end()
+	}
+}
+
+// dropDeferredLocked discards the held deferred events (Truncate removed their records)
+// and retires their seqs, so they hold no later cursor back. Caller holds the shard
+// write lock.
+func (sh *shard) dropDeferredLocked() {
+	sh.dmu.Lock()
+	evs := sh.deferred
+	sh.deferred = nil
+	sh.ndeferred.Store(0)
+	sh.dmu.Unlock()
+	if len(evs) == 0 {
+		return
+	}
+	o := &sh.pub
+	o.mu.Lock()
+	for _, ev := range evs {
+		for i, s := range o.pending {
+			if s == ev.seq {
+				o.pending = append(o.pending[:i], o.pending[i+1:]...)
+				o.n.Add(-1)
+				break
+			}
+		}
+		if ev.seq > o.done {
+			o.done = ev.seq
+		}
+	}
+	o.mu.Unlock()
+}
+
 // applyBatch commits a coalesced batch of requests under the shard lock at a
 // single fresh commit sequence, then runs the durability sync once for the batch.
 func (sh *shard) applyBatch(batch []*commitReq) {
@@ -222,7 +347,12 @@ func (sh *shard) syncFor(need uint64) {
 		sh.syncing = false
 		sh.scond.Broadcast()
 	}
+	synced := sh.syncedSeq
 	sh.smu.Unlock()
+	// Every sync publishes the deferred appends it made durable, whoever ran it.
+	if sh.ndeferred.Load() > 0 {
+		sh.publishDeferred(synced)
+	}
 }
 
 // syncPass runs one durability pass: msync the pages written since the last pass.

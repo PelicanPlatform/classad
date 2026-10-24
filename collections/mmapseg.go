@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
@@ -63,20 +64,32 @@ func openMmapSegment(id uint32, codec Codec, f *os.File, size int) (*segment, er
 	return &segment{id: id, data: data, codec: codec, persistent: true, path: path}, nil
 }
 
+// pageSize is the system page size, which msync's start address must be aligned to. It is
+// not always 4 KiB: Apple silicon uses 16 KiB pages and some arm64 Linux kernels 64 KiB,
+// and a start aligned only to 4 KiB fails there with EINVAL.
+var pageSize = os.Getpagesize()
+
 // flush msyncs the not-yet-durable bytes [synced, used) to disk and advances the
 // durable length. Page-aligned start is required by msync. No-op for RAM segments.
 func (s *segment) flush() error {
 	if !s.persistent || s.used <= s.synced {
 		return nil
 	}
-	const page = 4096
-	start := s.synced &^ (page - 1)
+	start := s.synced &^ (pageSize - 1)
 	if err := unix.Msync(s.data[start:s.used], unix.MS_SYNC); err != nil {
 		return err
+	}
+	if h := msyncDoneHook.Load(); h != nil {
+		(*h)(s.path, s.used)
 	}
 	s.synced = s.used
 	return nil
 }
+
+// msyncDoneHook is a test seam: when set, it is called after every successful msync of a
+// segment with the segment's path and the end of the range now on disk, so a test can
+// build the image a machine crash would leave. Nil in production.
+var msyncDoneHook atomic.Pointer[func(path string, to int)]
 
 // msyncFailHook is a test seam: when non-nil and it returns a non-nil error, msyncRange fails with
 // that error instead of calling the syscall, simulating a durability-sync failure (e.g. EIO). Nil
@@ -87,6 +100,8 @@ var msyncFailHook func() error
 // must be treated as non-durable and fail-stopped) versus a benign/platform error like EINVAL
 // (which some platforms return for MS_SYNC ranges and which does not indicate data loss). Only the
 // former is latched into syncErr; latching EINVAL would wrongly wedge the store on such platforms.
+// EINVAL also answers a start address not aligned to the page size, with nothing synced, which is
+// why every msync here aligns its start to pageSize.
 func isDurabilityFailure(err error) bool {
 	return errors.Is(err, unix.EIO) || errors.Is(err, unix.ENOSPC) || errors.Is(err, unix.EDQUOT)
 }
@@ -103,9 +118,14 @@ func (s *segment) msyncRange(from, to int) error {
 			return err
 		}
 	}
-	const page = 4096
-	start := from &^ (page - 1)
-	return unix.Msync(s.data[start:to], unix.MS_SYNC)
+	start := from &^ (pageSize - 1)
+	if err := unix.Msync(s.data[start:to], unix.MS_SYNC); err != nil {
+		return err
+	}
+	if h := msyncDoneHook.Load(); h != nil {
+		(*h)(s.path, to)
+	}
+	return nil
 }
 
 // reap unmaps (without a final flush — the file is being discarded) and unlinks a

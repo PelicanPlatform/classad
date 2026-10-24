@@ -201,22 +201,26 @@ func (o *pubOrder) throughLocked() uint64 {
 	return o.done
 }
 
-// trackPublishLocked registers a commit at seq that will publish. Caller holds the
-// shard write lock, in the critical section that sets commitSeq = seq.
-func (sh *shard) trackPublishLocked(seq uint64) {
+// trackPublishLocked registers a commit at seq that will publish, reporting whether it
+// did (a watcher is attached). Caller holds the shard write lock, in the critical
+// section that sets commitSeq = seq.
+func (sh *shard) trackPublishLocked(seq uint64) bool {
 	if sh.hub == nil || !sh.hub.active.Load() {
-		return
+		return false
 	}
 	o := &sh.pub
 	o.mu.Lock()
 	o.pending = append(o.pending, seq) // seqs are issued in order under the shard lock
 	o.n.Add(1)
 	o.mu.Unlock()
+	return true
 }
 
 // A tracked seq that never retired would hold every later cursor back (resumes then
 // over-deliver; nothing is lost), so every commit that tracks a seq must publish it:
-// applyOne/applyWrites/applyBatch, Delete, and Txn.Commit/commitTxn via publishTxn.
+// applyOne/applyWrites/applyBatch, Delete, and Txn.Commit/commitTxn via publishTxn. A
+// deferred append (commitDeferred) publishes from the sync that makes it durable
+// (publishDeferred), or is retired unpublished when Truncate drops it.
 
 // seqPublisher hands one commit's events to the watch hub. It holds back the last
 // event so that event can be sent in the same critical section that retires the seq:
@@ -395,6 +399,8 @@ func (c *Collection) WatchCursor() ([]byte, error) {
 		sh.mu.RLock()
 		seqs[i] = sh.commitSeq
 		sh.mu.RUnlock()
+		// A cursor names only durable seqs: a deferred append it covers is synced first.
+		sh.syncFor(seqs[i])
 	}
 	return encodeCursor(c.hub.epoch, seqs), nil
 }
@@ -443,6 +449,12 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 			sh.mu.RLock()
 			sReg[i] = sh.commitSeq
 			sh.mu.RUnlock()
+		}
+		// Catch-up reads the store through S_reg, so make it durable first: a deferred
+		// append at or below S_reg would otherwise reach this watcher in catch-up before a
+		// sync covers it, and a crash could take it back.
+		for i, sh := range c.shards {
+			sh.syncFor(sReg[i])
 		}
 		if watchSnapshotHook != nil {
 			watchSnapshotHook(c)

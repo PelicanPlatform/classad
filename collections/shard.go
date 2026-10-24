@@ -114,6 +114,15 @@ type shard struct {
 	hub    *watchHub
 	delLog *deleteLog
 	pub    pubOrder // orders live cursors against out-of-order publishes (watch.go)
+	// deferred holds the events of deferred appends (commitDeferred) committed while a
+	// watcher was attached, in commit order, until a durability sync covers them and
+	// publishDeferred hands them to the hub. dmu guards it and nests inside mu; ndeferred
+	// is len(deferred) for syncFor's lock-free check. dpub serializes publishDeferred so
+	// the events reach the hub in commit order.
+	dmu       sync.Mutex
+	dpub      sync.Mutex
+	deferred  []deferredEvent
+	ndeferred atomic.Int32
 	// appendFloor (append-only shards; guarded by mu) is the append log's counterpart of
 	// the delete journal's horizon: a watch cursor whose seq for this shard is below it
 	// cannot resume incrementally, because records it may hold or never saw are gone.

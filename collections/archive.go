@@ -218,20 +218,51 @@ func dirHasEntries(dir string) bool {
 
 // Append adds one ad to the archive: it is appended to the log (never superseding any
 // prior record) and, when the active segment fills, a new one is started and the old one
-// sealed with its index and zone maps. Safe for one writer concurrent with queries.
+// sealed with its index and zone maps. The ad is durable when Append returns. Safe for
+// one writer concurrent with queries.
 func (a *Archive) Append(ad *classad.ClassAd) error {
 	// An append log has no key; a nil key routes to the single append-only shard and
 	// stores a zero-length key. Duplicate appends are all retained.
 	if err := a.c.Put(nil, ad); err != nil {
 		return err
 	}
-	// If this append sealed a segment, do the eager per-seal work now (off the write lock):
-	// intern the just-sealed segment (Options.InternAtSeal) so its density/decode win lands
-	// immediately, then build its sidecar index so categorical/value queries on just-appended
-	// history are accelerated instead of scanning until the next periodic reindex. Interning
-	// runs first so the sidecar is built over the interned segment. Both are idempotent, build
-	// only what is missing (all older segments are already sealed/interned), and are serialized
-	// against the periodic passes. Skipped when neither is configured (nothing to do).
+	a.afterAppend()
+	return nil
+}
+
+// AppendDeferred is Append without waiting for the ad to reach disk. The ad is readable
+// by queries when it returns; it becomes durable at the next Flush, at the next durable
+// Append, when its segment seals, or at Close (and, while a watcher is attached, at least
+// every 256 appends). Until then a crash of the machine can lose it (a process crash
+// leaves it in the page cache). What survives such a crash is always a prefix of the
+// appends, since recovery cuts the log at the first torn record.
+//
+// Watchers see a deferred ad only once it is durable: its event is published by the sync
+// that makes it so, and a Watch or WatchCursor syncs before it reads. So nothing a watcher
+// has seen, and no cursor it holds, can be lost to a crash.
+//
+// A caller that records its own progress through the archive's source (a history file
+// offset, a remote cursor) calls Flush before persisting it: Flush returning nil means
+// every ad appended before it is on disk, so the persisted position never gets ahead of
+// the archive. The loss window between Flushes is at most one segment, because a segment
+// is synced before it seals.
+func (a *Archive) AppendDeferred(ad *classad.ClassAd) error {
+	if err := a.c.putDeferred(nil, ad); err != nil {
+		return err
+	}
+	a.afterAppend()
+	return nil
+}
+
+// afterAppend does the eager per-seal work after an append, off the write lock: if the
+// append sealed a segment, intern the just-sealed segment (Options.InternAtSeal) so its
+// density/decode win lands immediately, then build its sidecar index so categorical/value
+// queries on just-appended history are accelerated instead of scanning until the next
+// periodic reindex. Interning runs first so the sidecar is built over the interned segment.
+// Both are idempotent, build only what is missing (all older segments are already
+// sealed/interned), and are serialized against the periodic passes. Skipped when neither
+// is configured (nothing to do).
+func (a *Archive) afterAppend() {
 	if a.c.internAtSeal || a.c.hasSegmentIndexes() {
 		if seal := a.c.appendSealSeq(); seal != a.lastSeal {
 			a.lastSeal = seal
@@ -243,13 +274,14 @@ func (a *Archive) Append(ad *classad.ClassAd) error {
 			}
 		}
 	}
-	return nil
 }
 
-// Flush makes prior appends durable and queryable. The Collection keeps appended records
-// queryable in place and mmap-durable across a process crash without an explicit seal, so
-// this is a no-op retained for API compatibility.
-func (a *Archive) Flush() error { return nil }
+// Flush is the durability barrier for AppendDeferred: it returns once every ad appended
+// before the call is on disk and published to watchers, or reports the sticky write or
+// sync error that prevented it. The error is sticky: every later Append, AppendDeferred
+// and Flush reports it until the archive is truncated or reopened. With no deferred
+// appends outstanding Flush is cheap.
+func (a *Archive) Flush() error { return a.c.syncAll() }
 
 // Rotate drops whole oldest segments until the archive is back within its Retention
 // bounds, returning the number dropped. now is the caller's wall clock (unix seconds) for
@@ -323,7 +355,8 @@ func (a *Archive) GroupCountAll(groupAttr string) ([]GroupCount, bool) {
 // callers must serialize Truncate against the single Append writer.
 func (a *Archive) Truncate() { a.c.Truncate() }
 
-// Close flushes and unmaps the archive. It must not be used afterward.
+// Close flushes and unmaps the archive, making every append durable, deferred ones
+// included. It must not be used afterward.
 func (a *Archive) Close() error { return a.c.Close() }
 
 // Query returns an iterator over the ads matching q, newest first.

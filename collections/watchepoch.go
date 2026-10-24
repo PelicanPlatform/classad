@@ -15,11 +15,11 @@ import (
 // issued. Within one process that holds by construction. Across a restart it holds only if
 // the reopened store (1) contains every record the old process ever handed a watcher, and
 // (2) never assigns a sequence the old process already assigned to a different record.
-// Neither holds after a crash: a record can be published, and its seq end up in a client's
-// cursor, before that record's bytes are durable (WatchCursor and catch-up read commitSeq,
-// which advances before the commit's msync), so recovery can come back with a shorter log,
-// rebuild commitSeq from it, and reissue the lost seqs to new records -- which a resumed
-// cursor would then silently skip.
+// Neither is guaranteed after a crash. WatchCursor and catch-up sync through the commitSeq
+// they read, and live events are published after the sync, so a cursor should only cover
+// durable records -- but if one ever covered a record the crash lost, recovery would come
+// back with a shorter log, rebuild commitSeq from it, and reissue the lost seqs to new
+// records, which a resumed cursor would then silently skip. The epoch does not depend on it.
 //
 // So the epoch is carried across a restart only when the previous process proved, at Close,
 // that both conditions hold, and is otherwise rotated (every cursor then gets a Reset):
