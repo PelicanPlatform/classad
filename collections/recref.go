@@ -167,7 +167,8 @@ func (c *Collection) recordRefused(seg *segment, data []byte, off uint32) error 
 func forEachVisibleRef(s0 uint64, wins []segWindow, fn func(recRef) bool) {
 	for _, w := range wins {
 		d := w.dict()
-		for off := 0; off < w.used; {
+		off := 0
+		for off < w.used {
 			o := uint32(off)
 			if end, ok := w.dmg.skip(o); ok {
 				off = int(end)
@@ -184,8 +185,21 @@ func forEachVisibleRef(s0 uint64, wins []segWindow, fn func(recRef) bool) {
 			}
 			off += int(total)
 		}
+		noteFramingLost(off, w.used)
 	}
 }
+
+// noteFramingLost counts a walk of a window that did not land on its end: a damaged totalLen the
+// segment's damage set does not know misframed it, and the records past that point were not read.
+// That is damage inside a trusted extent, which only a walk finds (Fsck names the segment).
+func noteFramingLost(off, used int) {
+	if off != used {
+		noteReadSkip(errFramingLost)
+	}
+}
+
+// errFramingLost is a walk that lost the records' framing at a damaged length.
+var errFramingLost = errors.New("collections: a walk lost the records' framing at a damaged length")
 
 // forEachVisibleRefReverse is forEachVisibleRef in newest-first order: windows from the last
 // (newest) segment backward and, within each, records back-to-front.
@@ -200,7 +214,8 @@ func forEachVisibleRefReverse(s0 uint64, wins []segWindow, fn func(recRef) bool)
 		w := wins[wi]
 		d := w.dict()
 		offs = offs[:0]
-		for off := 0; off < w.used; {
+		off := 0
+		for off < w.used {
 			o := uint32(off)
 			if end, ok := w.dmg.skip(o); ok {
 				off = int(end)
@@ -213,6 +228,7 @@ func forEachVisibleRefReverse(s0 uint64, wins []segWindow, fn func(recRef) bool)
 			offs = append(offs, o)
 			off += int(total)
 		}
+		noteFramingLost(off, w.used)
 		for i := len(offs) - 1; i >= 0; i-- {
 			o := offs[i]
 			if !recIsMarker(w.data, o) && w.visible(o, s0) {
@@ -228,7 +244,8 @@ func forEachVisibleRefReverse(s0 uint64, wins []segWindow, fn func(recRef) bool)
 // workers.
 func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 	d := w.dict()
-	for off := 0; off < w.used; {
+	off := 0
+	for off < w.used {
 		o := uint32(off)
 		if end, ok := w.dmg.skip(o); ok {
 			off = int(end)
@@ -245,6 +262,7 @@ func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 		}
 		off += int(total)
 	}
+	noteFramingLost(off, w.used)
 }
 
 // adBytes presents a record as a whole ad plus the codec that decodes it, for the byte-passing

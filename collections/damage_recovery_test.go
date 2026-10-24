@@ -377,6 +377,46 @@ func TestRecoverPastDamage(t *testing.T) {
 		requireReads(t, c, orig, inSeg, true)
 	})
 
+	t.Run("rows-do-not-tile", func(t *testing.T) {
+		// A payload whose rows do not account for every byte before it does not prove the framing,
+		// even when every record that verifies is a row: here one row names the next record instead
+		// of the damaged one, and nothing would delimit the damage.
+		dir, _, _ := setup(t, func(p string, data []byte, offs []int) map[string]bool {
+			k := len(offs) / 2
+			damageKey(t, p, data, offs[k])
+			damageKey(t, p, data, offs[k+5]) // a second, properly delimited damaged row
+			b, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pay, _ := payloadOffset(b)
+			blob := append([]byte(nil), recAd(b, uint32(pay))...)
+			cs, err := unmarshalColPayload(blob, identityCodec{}, fsckInterner())
+			if err != nil {
+				t.Fatal(err)
+			}
+			rows := make([]uint32, cs.offsLen())
+			for i := range rows {
+				rows[i] = cs.offAt(i)
+			}
+			at := bytes.Index(blob, packU32s(rows))
+			if at < 0 || int(rows[k]) != offs[k] {
+				t.Fatal("cannot find the payload's offset map")
+			}
+			binary.LittleEndian.PutUint32(blob[at+4*k:], rows[k+1])
+			rewritePayload(t, b, pay, blob)
+			if err := os.WriteFile(p, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return nil
+		})
+		c, oc := openCounting(t, payloadFixtureOpts(dir))
+		defer c.Close()
+		if ds := oc.diag.DamageStops; len(ds) != 1 || ds[0].Recovered {
+			t.Errorf("DamageStops %+v, want a stop that is not recovered", ds)
+		}
+	})
+
 	t.Run("written-after-payload", func(t *testing.T) {
 		// The payload must be the segment's last record; with anything written after it, it does not
 		// prove where the segment ends.
@@ -588,6 +628,23 @@ func TestDamageInTrustedExtent(t *testing.T) {
 		requireReads(t, c, orig, missing, true)
 	})
 
+	t.Run("total-length-snapshot", func(t *testing.T) {
+		// With the directory snapshot the open walks no records, so nothing finds the damage before a
+		// scan does. A scan it cuts short must say so.
+		dir, _, missing := damage(t, func(p string, data []byte, o int) string { return damageTotal(t, p, data, o) })
+		c, _ := openCounting(t, internedStoreOpts(dir))
+		defer c.Close()
+		before := readSkipsOf("framing")
+		n := 0
+		for range c.Scan() {
+			n++
+		}
+		t.Logf("a scan returned %d of %d ads; framing losses counted: %d", n, len(orig)-len(missing), readSkipsOf("framing")-before)
+		if n < len(orig)-len(missing) && readSkipsOf("framing") == before {
+			t.Errorf("a scan returned %d of %d ads and counted no lost framing", n, len(orig)-len(missing))
+		}
+	})
+
 	t.Run("key-length", func(t *testing.T) {
 		// A key length running past the segment: a walk that read the key without checking the CRC
 		// sliced past the mapping and panicked.
@@ -743,6 +800,33 @@ func TestDamageSidecarFormat(t *testing.T) {
 		t.Error("a segment without damage no longer writes a v4 container")
 	}
 
+	// The key-index proof refuses an index that does not describe the segment: one whose hashes come
+	// from another hasher here, as an index left over from some other segment's records would.
+	{
+		dir := t.TempDir()
+		buildInternedStore(t, dir)
+		target, _ := firstInternedSegment(t, dir)
+		seg, err := os.ReadFile(target)
+		if err != nil {
+			t.Fatal(err)
+		}
+		used, _, _ := readSidecarTrailer(target + ".idx")
+		own, err := parseKeyIndex(buildKeyIndex(seg, used, fnvHasher{}, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if spans, ok := keyIndexDamage(seg, used, own, fnvHasher{}, nil); !ok || len(spans) != 0 {
+			t.Fatalf("the segment's own key index: %v, %v; want no damage", spans, ok)
+		}
+		other, err := parseKeyIndex(buildKeyIndex(seg, used, otherHasher{}, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := keyIndexDamage(seg, used, other, fnvHasher{}, nil); ok {
+			t.Error("a key index that does not describe the segment proved its framing")
+		}
+	}
+
 	// A set must end where a record that verifies begins (or at the extent).
 	data := make([]byte, 256)
 	if damageFits(data, 128, newDamageSet([]damageSpan{{0, 64}})) {
@@ -862,3 +946,8 @@ func TestMergeLeavesDamageOut(t *testing.T) {
 		}
 	})
 }
+
+// otherHasher hashes keys differently from the default, for an index that is not the segment's.
+type otherHasher struct{}
+
+func (otherHasher) Hash(key []byte) uint64 { return fnvHasher{}.Hash(key) ^ 0x9e3779b97f4a7c15 }

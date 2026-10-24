@@ -893,7 +893,8 @@ Damage inside a trusted extent is found only where something walks the segment: 
 directory replay (no `dir.snap`, time travel, chained collections), a rewrite, or Fsck.
 An open that restores `dir.snap` walks no records, so until one of those runs, a scan can
 still meet such a record. Read verification refuses it, but a misframing `totalLen`
-there can cut a scan of that segment short.
+there can cut a scan of that segment short; the scan counts that (`RecordReadSkips`
+reason `framing`) rather than come back short in silence.
 
 Fsck reports what a normal open will do: `FsckSegment.OpenStop.Recovered` when the
 framing past a stop is proven, and `FsckSegment.SidecarDamage` for ranges a sidecar
