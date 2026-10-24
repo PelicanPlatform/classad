@@ -128,6 +128,17 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 				return nil, false
 			}
 		}
+		// A NaN in a column some MIN/MAX reads declines the same way. The reference's min()/max()
+		// seeds from the first contributing element and NaN loses every comparison, so its answer
+		// depends on the order records are visited in -- an order this pass does not share (see
+		// minMaxDeclinesNaN). The check is per aggregate, not per column, so a SUM or AVG over a
+		// NaN-bearing column is still served; and one tripped group declines the whole query,
+		// because half a columnar result cannot be stitched to half a scan.
+		for i, a := range aggs {
+			if slot[i] >= 0 && minMaxDeclinesNaN(a.Func, g.Stats[slot[i]]) {
+				return nil, false
+			}
+		}
 		text := ValueText(g.Value)
 		if j, dup := rowAt[text]; dup {
 			mergeGroupStats(merged[j], g)
@@ -176,6 +187,7 @@ func mergeGroupStats(dst, src *collections.GroupStats) {
 		d.IntSum += s.IntSum
 		d.AnyReal = d.AnyReal || s.AnyReal
 		d.AnyBool = d.AnyBool || s.AnyBool
+		d.AnyNaN = d.AnyNaN || s.AnyNaN
 		if s.Min < d.Min {
 			d.Min = s.Min
 		}

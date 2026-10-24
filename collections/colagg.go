@@ -45,6 +45,26 @@ type NumStats struct {
 	// a further quirk for a lone boolean element; rather than reproduce that, a caller declines
 	// and lets the scan answer. Pathological data, exact answer.
 	AnyBool bool `json:"anyBool,omitempty"`
+	// AnyNaN records that a NaN turned up in the column, which makes Min/Max unusable for MIN/MAX.
+	// SUM and AVG are unaffected: NaN propagates through addition identically on both paths.
+	//
+	// Every comparison against NaN is false, so the reference's min()/max() -- which seed from the
+	// FIRST contributing element and then keep whichever wins a `<` / `>` -- returns NaN when the
+	// first element is NaN and ignores NaN entirely when it is not. Its answer therefore depends on
+	// the order records are visited in, which no aggregate here promises and which a pass over
+	// columns does not share with a record scan. There is no rule this fast path could follow that
+	// matches the reference on every input, so a caller DECLINES a MIN/MAX over such a column and
+	// lets the scan give its own order-dependent answer rather than a different wrong one. (What
+	// the unflagged code did was report the seeds: an all-NaN group's MAX came back -Inf.)
+	//
+	// NaN is unreachable from old-ClassAd text -- `nan` lexes as a bare reference and evaluates to
+	// UNDEFINED, and there is no literal for it -- so it only arrives programmatically.
+	//
+	// ±Inf needs no such flag. The seeds are +Inf for Min and -Inf for Max, which are exactly the
+	// identities for min/max over the extended reals, so a column legitimately holding ±Inf
+	// accumulates to the reference's answer; N == 0, not the seed value, is what tells a caller
+	// there was nothing to aggregate.
+	AnyNaN bool `json:"anyNaN,omitempty"`
 }
 
 // NumStatsQuery computes the numeric aggregate inputs for attr over the records matching q, using

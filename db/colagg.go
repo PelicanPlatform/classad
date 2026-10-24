@@ -60,11 +60,12 @@ func numStatsQuery(constraint string) (*vm.Query, bool) {
 // appears, AVG is always a real, and MIN/MAX keep their element's type. A formatting difference
 // would be as wrong as a numeric one and far easier to ship unnoticed, so the test compares text.
 //
-// Two refusals. A FILTER is refused rather than approximated: the columnar pass knows nothing about
-// it, so answering would report an unfiltered aggregate as if it were filtered. And a column that
+// Three refusals. A FILTER is refused rather than approximated: the columnar pass knows nothing about
+// it, so answering would report an unfiltered aggregate as if it were filtered. A column that
 // turned up a BOOLEAN declines: the reference coerces booleans to 1/0 and then has a further quirk
 // for a lone boolean element, which is not worth reproducing for data this pathological -- the scan
-// gives the exact answer.
+// gives the exact answer. And a MIN/MAX over a column holding a NaN declines, because the reference's
+// answer there depends on the order the records are visited in (see minMaxDeclinesNaN).
 func ColumnarAggregate(stats func(attr string) (NumStats, bool), groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
 	if len(groupCols) != 0 || len(aggs) != 1 {
 		return nil, false
@@ -85,7 +86,28 @@ func ColumnarAggregate(stats func(attr string) (NumStats, bool), groupCols []Gro
 	if ns.AnyBool {
 		return nil, false
 	}
+	if minMaxDeclinesNaN(a.Func, ns) {
+		return nil, false
+	}
 	return []AggRow{{Values: []string{numAggValue(a.Func, ns)}}}, true
+}
+
+// minMaxDeclinesNaN reports whether this aggregate must fall back to the record scan because the
+// column it reads holds a NaN.
+//
+// The reference's min()/max() seeds from the FIRST contributing element and then keeps whichever
+// wins a `<` / `>`. NaN loses every comparison, so the reference answers NaN when the first element
+// it sees is NaN and ignores NaN completely when it is not -- the same bag of values gives two
+// different answers depending on the order it is walked in. A columnar pass walks blocks, not scan
+// order, so there is no rule it could follow that agrees with the reference on every input; the
+// honest move is to decline and let the scan produce its own answer. (Before this check the fast
+// path reported the accumulator's SEEDS for an all-NaN group: MIN +Inf, MAX -Inf, values that were
+// never in the data.)
+//
+// Only MIN and MAX are affected. COUNT counts NaN as a number on both paths, and SUM/AVG propagate
+// it through addition identically, so those stay served.
+func minMaxDeclinesNaN(fn AggFunc, ns NumStats) bool {
+	return ns.AnyNaN && (fn == AggMin || fn == AggMax)
 }
 
 // numAggValue renders one aggregate from a columnar pass through the same value rendering the
