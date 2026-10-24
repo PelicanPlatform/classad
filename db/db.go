@@ -882,11 +882,20 @@ func (db *DB) TimeTravel() (maxDistance, checkpoint time.Duration, enabled bool)
 // yielded slice is reused across iterations; copy any value to retain it past the
 // next step. Errors only on a malformed constraint.
 func (db *DB) QueryProject(constraint string, attrs []string) (iter.Seq[[]classad.Value], error) {
+	return db.QueryProjectStats(constraint, attrs, nil)
+}
+
+// QueryProjectStats is QueryProject that also fills stats (may be nil) with the scan's work
+// breakdown -- the mutable-table counterpart of ArchiveTable.QueryProjectStats. It exists so an
+// EXPLAIN ANALYZE of an aggregate that falls through to this projected scan can show where the
+// time went, specifically a large RecordsReassembled, the slow per-record path. Stats accumulate
+// as the returned sequence is consumed.
+func (db *DB) QueryProjectStats(constraint string, attrs []string, stats *collections.ScanStats) (iter.Seq[[]classad.Value], error) {
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryProject(q, attrs), nil
+	return db.c.QueryProjectStats(q, attrs, stats), nil
 }
 
 // Match returns the ads that symmetrically match job (bilateral Requirements), pushed
