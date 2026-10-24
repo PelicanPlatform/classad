@@ -408,15 +408,15 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		return
 	}
 
-	// Fast path: a GROUP BY one numeric column, with COUNT(*) and/or MIN/MAX/SUM/AVG/COUNT(attr),
-	// answered from the columnar blocks. Every fast path above is gated on there being NO grouping, so
-	// `select JobStatus, count(*) from jobs group by JobStatus` -- a shape a dashboard asks constantly --
-	// decoded every matching record even on a table carrying the accelerator. Archive tables already
-	// route this through db.GroupedFromColumns; this gives mutable tables the same path and the same
-	// row-shaping rather than a second implementation. The group column may be bucketed, which is what
-	// makes a time series ("per day") take this path rather than the scan below. Declines (and falls
-	// through) for a string group column, more than one group column, a per-aggregate FILTER,
-	// COUNT(DISTINCT), or a chained table.
+	// Fast path: a GROUP BY one column -- numeric or string, raw or bucketed -- with COUNT(*) and/or
+	// MIN/MAX/SUM/AVG/COUNT(attr), answered from the columnar blocks. Every fast path above is gated on
+	// there being NO grouping, so `select JobStatus, count(*) from jobs group by JobStatus` -- a shape a
+	// dashboard asks constantly -- decoded every matching record even on a table carrying the
+	// accelerator. Archive tables already route this through db.GroupedFromColumns; this gives mutable
+	// tables the same path and the same row-shaping rather than a second implementation. A bucketed
+	// group column is what makes a time series ("per day") take this path rather than the scan below.
+	// Declines (and falls through) for more than one group column, an aggregate over a non-numeric
+	// column, a per-aggregate FILTER, COUNT(DISTINCT), or a chained table.
 	if rows, ok := db.GroupedFromColumns(d, constraint, groupCols, aggs); ok {
 		writeAggRows(reqID, rows, write)
 		return

@@ -199,18 +199,92 @@ func TestArchiveBucketedGroupDropsUnbucketable(t *testing.T) {
 	}
 }
 
-// TestArchiveUnbucketedGroupStillDeclinesUnbucketable is the other half: WITHOUT a bucket, an absent
-// or non-numeric group value still has to give the query back, because the scan renders it as its own
-// group (`undefined`, or the string) and a column read cannot produce that group.
-func TestArchiveUnbucketedGroupStillDeclinesUnbucketable(t *testing.T) {
+// TestArchiveUnbucketedGroupKeepsUnbucketable is the other half, and the contrast is the point:
+// WITHOUT a bucket the same records are GROUPED rather than dropped.
+//
+// They have no bucket to be floored into, but they do have a value to be grouped by -- `undefined`
+// for an absent attribute, the text for a string, true/false for a boolean -- and the columnar reader
+// renders all three. So the unbucketed form keeps every record the bucketed form drops, and the two
+// totals differ by exactly the unbucketable count.
+//
+// This test previously asserted the opposite, that the unbucketed form must DECLINE here. That was
+// true when a column read could not render those values; it is a limitation rather than a
+// correctness rule, and it no longer holds.
+func TestArchiveUnbucketedGroupKeepsUnbucketable(t *testing.T) {
 	cat, a := bucketOddFixture(t)
 	defer cat.Close()
 
-	if _, ok := GroupedFromColumns(a, "true",
-		[]GroupCol{{Attr: "CompletionDate"}},
-		[]AggSpec{{Func: AggCount, Arg: "*"}}); ok {
-		t.Fatal("unbucketed group answered from columns despite records it cannot render a group for; " +
-			"those records would be silently missing from the result")
+	groupCols := []GroupCol{{Attr: "CompletionDate"}}
+	aggs := []AggSpec{{Func: AggCount, Arg: "*"}}
+
+	rows, ok := GroupedFromColumns(a, "true", groupCols, aggs)
+	if !ok {
+		t.Fatal("columnar path declined an unbucketed group over renderable non-numeric values")
+	}
+	got := bucketRows(t, rows, 1)
+	want := bucketRows(t, scanAggregate(t, a, "true", groupCols, aggs), 1)
+	if len(got) != len(want) {
+		t.Fatalf("got %d groups, scan says %d", len(got), len(want))
+	}
+	var total int
+	for k, wv := range want {
+		if got[k] == nil {
+			t.Errorf("group %s missing; scan has %v", k, wv)
+			continue
+		}
+		if got[k][0] != wv[0] {
+			t.Errorf("group %s = %s, scan says %s", k, got[k][0], wv[0])
+		}
+		n, err := strconv.Atoi(wv[0])
+		if err != nil {
+			t.Fatalf("non-numeric count %q", wv[0])
+		}
+		total += n
+	}
+	// Every record is in some group, unlike the bucketed form above which drops 240 of them.
+	if total != 4000 {
+		t.Errorf("groups hold %d records, want all 4000", total)
+	}
+}
+
+// TestArchiveUnbucketedGroupStillDeclinesExpressions is what survives of the rule above. An
+// EXPRESSION is not a value a column read can render -- only evaluating it produces one -- and the
+// scan does make a group out of it, so serving the query would return a result with a group missing.
+// Unlike absent or string values, this declines whether or not a bucket was asked for.
+func TestArchiveUnbucketedGroupStillDeclinesExpressions(t *testing.T) {
+	cat, err := OpenCatalogConfig(CatalogConfig{Dir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cat.Close()
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{SegmentSize: 1 << 16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 4000; i++ {
+		src := fmt.Sprintf("ClusterId = %d\nJobStatus = 4\nCompletionDate = %d\n", i, 1700000000+i*60)
+		if i%50 == 7 {
+			src = fmt.Sprintf("ClusterId = %d\nJobStatus = 4\nCompletionDate = ClusterId + 1\n", i)
+		}
+		ad, perr := classad.ParseOld(src)
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		if aerr := a.Append(ad); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+	if !a.BuildAndEnableSchemaScan(4000, 8) {
+		t.Skip("no sealed segments to accelerate")
+	}
+
+	for _, width := range []int64{0, 3600} {
+		if _, ok := GroupedFromColumns(a, "true",
+			[]GroupCol{{Attr: "CompletionDate", BucketWidth: width}},
+			[]AggSpec{{Func: AggCount, Arg: "*"}}); ok {
+			t.Errorf("bucket width %d: served a group column holding an expression; the scan makes a "+
+				"group out of it, so that group would be silently missing", width)
+		}
 	}
 }
 
@@ -300,5 +374,62 @@ func TestMutableBucketedGroupMatchesScan(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestArchiveBucketedGroupOnStringColumn is where the two columnar group-by changes meet.
+//
+// A string column groups from the block dictionary, and a bucket floors a number. A string is not a
+// number, so a bucketed GROUP BY on a string column has no groups at all -- and that is the scan's
+// answer too, since bucketKeyText runs number(v) and drops every row whose bucket attribute is not
+// one. The risk this pins is the opposite: that the dictionary path, which caches an accumulator per
+// block code, would happily build string groups and ignore the bucket entirely.
+func TestArchiveBucketedGroupOnStringColumn(t *testing.T) {
+	cat, a := archiveCountFixture(t, 5000)
+	defer cat.Close()
+
+	groupCols := []GroupCol{{Attr: "Owner", BucketWidth: 86400}}
+	aggs := []AggSpec{{Func: AggCount, Arg: "*"}}
+
+	rows, ok := GroupedFromColumns(a, "true", groupCols, aggs)
+	if !ok {
+		t.Fatal("columnar path declined a bucketed group on a string column")
+	}
+	want := scanAggregate(t, a, "true", groupCols, aggs)
+	if len(rows) != len(want) {
+		t.Fatalf("columnar returned %d groups, scan says %d", len(rows), len(want))
+	}
+	if len(rows) != 0 {
+		t.Errorf("a bucketed group on a string column produced %d groups; a string cannot be "+
+			"floored into one, so the bucket was ignored", len(rows))
+	}
+}
+
+// TestArchiveUnbucketedGroupOnStringColumnStillGroups is the control for the test above: without a
+// bucket the same column must group normally, so the emptiness there is the bucket's doing and not a
+// string column quietly failing to group at all.
+func TestArchiveUnbucketedGroupOnStringColumnStillGroups(t *testing.T) {
+	cat, a := archiveCountFixture(t, 5000)
+	defer cat.Close()
+
+	groupCols := []GroupCol{{Attr: "Owner"}}
+	aggs := []AggSpec{{Func: AggCount, Arg: "*"}}
+
+	rows, ok := GroupedFromColumns(a, "true", groupCols, aggs)
+	if !ok {
+		t.Fatal("columnar path declined an unbucketed group on a string column")
+	}
+	if len(rows) == 0 {
+		t.Fatal("no groups at all from a string column without a bucket")
+	}
+	got := bucketRows(t, rows, 1)
+	want := bucketRows(t, scanAggregate(t, a, "true", groupCols, aggs), 1)
+	if len(got) != len(want) {
+		t.Fatalf("got %d groups, scan says %d", len(got), len(want))
+	}
+	for k, wv := range want {
+		if got[k] == nil || got[k][0] != wv[0] {
+			t.Errorf("group %s = %v, scan says %s", k, got[k], wv[0])
+		}
 	}
 }

@@ -220,10 +220,54 @@ func TestRPCGroupedAggregateFallbackStillCorrect(t *testing.T) {
 	seedGroupable(t, c, d, 2000)
 	ctx := context.Background()
 
-	// A string group column: out of scope for a numeric histogram, so this must come from the scan.
+	// COUNT(DISTINCT) needs the values themselves, not their aggregate, so the columnar pass cannot
+	// answer it and the scan behind it must.
+	distinct := []db.AggSpec{{Func: db.AggCountDistinct, Arg: "RequestCpus"}}
 	if _, ok := db.GroupedFromColumns(d, "RequestMemory > 4096", []db.GroupCol{{Attr: "Owner"}},
-		[]db.AggSpec{{Func: db.AggCount, Arg: "*"}}); ok {
-		t.Fatal("a string group column was served columnar")
+		distinct); ok {
+		t.Fatal("COUNT(DISTINCT) was served columnar")
+	}
+	rows, err := c.Aggregate(ctx, "RequestMemory > 4096", []string{"Owner"},
+		[]AggSpec{{Func: AggCountDistinct, Arg: "RequestCpus"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]map[int64]bool{}
+	texts, err := c.Query(ctx, "RequestMemory > 4096")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range texts {
+		o := attrStr(t, text, "Owner")
+		if want[o] == nil {
+			want[o] = map[int64]bool{}
+		}
+		want[o][attrInt(t, text, "RequestCpus")] = true
+	}
+	if len(rows) != len(want) {
+		t.Errorf("got %d groups, want %d", len(rows), len(want))
+	}
+	for _, r := range rows {
+		var got int
+		fmt.Sscanf(r.Values[0], "%d", &got)
+		if got != len(want[r.Group[0]]) {
+			t.Errorf("group %q: %d distinct, reference %d", r.Group[0], got, len(want[r.Group[0]]))
+		}
+	}
+}
+
+// TestRPCGroupedAggregateStringColumn is the RPC-level pin that a STRING group column is served from
+// the columns. It used to be the fallback case above, on the grounds that the column read produced
+// numbers; it reads the group value through the block string dictionary now.
+func TestRPCGroupedAggregateStringColumn(t *testing.T) {
+	c, d, cleanup := acceleratedPair(t)
+	defer cleanup()
+	seedGroupable(t, c, d, 2000)
+	ctx := context.Background()
+
+	if _, ok := db.GroupedFromColumns(d, "RequestMemory > 4096", []db.GroupCol{{Attr: "Owner"}},
+		[]db.AggSpec{{Func: db.AggCount, Arg: "*"}}); !ok {
+		t.Fatal("a string group column was not served columnar; nothing here is exercised")
 	}
 	rows, err := c.Aggregate(ctx, "RequestMemory > 4096", []string{"Owner"},
 		[]AggSpec{{Func: AggCount, Arg: "*"}})

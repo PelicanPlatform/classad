@@ -9,7 +9,7 @@ import (
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
-// GROUP BY one numeric column, answered from the columns.
+// GROUP BY one column, answered from the columns.
 //
 // The ungrouped count already reads a column and never decodes a record:
 //
@@ -29,6 +29,11 @@ import (
 //
 // Memory is one entry per distinct group value, which is what the scanning aggregator this replaces also
 // builds -- so a high-cardinality group column is no worse here, just faster.
+//
+// A STRING group column takes the same route, reading the group value through the per-block string
+// dictionary instead of a numeric slot; see colgroupstr.go for why that is cheap. That case was the same
+// 200x apart from the numeric one (21.1 s against 90 ms on a 726k-record window) purely for the column's
+// type.
 
 // GroupCount is one group of a GROUP BY: the group column's value and how many records held it.
 type GroupCount struct {
@@ -103,13 +108,16 @@ func (c *Collection) GroupStatsConstraintBucketed(constraint, groupAttr string, 
 // NumStatsQuery returns for the ungrouped case, so the rendering is shared and cannot diverge.
 //
 // ok=false when the shape is not columnar-servable -- no accelerator, a non-native constraint, a predicate
-// that is not a conjunction of scalar numeric comparisons, or a group/aggregate attribute the schema does
-// not carry as a numeric field -- and the caller then scans as before. It also declines mid-flight if a
-// matching record's GROUP value is not a scalar number, because such a record still forms a group: the row
-// path emits a group per distinct rendered value (`undefined` for an absent attribute, the text for a
-// string), and a column read cannot tell absent from present-but-non-numeric, let alone render one.
-// Dropping those records instead would return a result silently missing groups, so the query goes back to
-// the scan that can render them.
+// that is not a conjunction of scalar numeric comparisons, a group attribute the schema does not carry as
+// a numeric or string field, or an aggregate attribute it does not carry as a numeric one -- and the
+// caller then scans as before.
+//
+// It also declines mid-flight if a matching record's GROUP value is one only EVALUATION can produce: an
+// expression, a list, a nested ad. Such a record still forms a group -- the row path emits a group per
+// distinct rendered value -- so dropping it would return a result silently missing groups, and the query
+// goes back to the scan that can render it. Every SCALAR shape is now served instead of declined: a
+// number, a string, a boolean, and `undefined` for a record whose attribute is absent, each rendering as
+// the scan renders it.
 //
 // An absent AGGREGATE value is different and is simply skipped: MIN/SUM/COUNT(attr) over a set that does
 // not include the record is what the reference computes for a record whose attribute is undefined. Only
@@ -122,18 +130,15 @@ func (c *Collection) GroupStatsQuery(q *vm.Query, groupAttr string, aggAttrs []s
 }
 
 // GroupStatsQueryBucketed is GroupStatsQuery grouping by the group column FLOORED into buckets of
-// bucket (0 = the raw value, i.e. GroupStatsQuery).
+// bucket (0 = the raw value, i.e. GroupStatsQuery). This is the shape a time series asks -- "per day",
+// not "per second".
 //
-// This is the shape a time series asks -- "per day", not "per second" -- and it was the shape that
-// fell off this path entirely: db.GroupedFromColumns declined any bucket width, so a dashboard's
-// `GROUP BY time_bucket(t,'1d')` scanned every record while its ungrouped form was served from the
-// columns. Bucketing changes only how a value becomes a key, which is one floor per record on top of
-// a column read that was already happening.
+// Only a NUMBER can be floored, so a record whose group value is a string, a boolean, undefined or
+// error is DROPPED from a bucketed result rather than declining it: that is what the scanning
+// aggregator does with one (db.bucketKeyText runs number(v), which rejects all four). The unbucketed
+// form groups all of them, because there a column read can render them.
 //
-// A record whose group value is absent or not a number is DROPPED here rather than declining, because
-// that is what the scanning aggregator does with one (db.bucketKeyText): there is no bucket to floor
-// it into, so it leaves the series. The unbucketed form still declines, because there the scan emits
-// a group for it.
+// A bucketed GROUP BY on a STRING column therefore has no groups at all, which is the scan's answer too.
 func (c *Collection) GroupStatsQueryBucketed(q *vm.Query, groupAttr string, bucket int64, aggAttrs []string) ([]GroupStats, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil {
@@ -192,27 +197,32 @@ func (c *Collection) GroupStatsAllBucketed(groupAttr string, bucket int64, aggAt
 }
 
 // resolveGroupAttrs interns the group and aggregate attribute names and checks each is carried by the
-// collection-wide schema as a numeric field. A name repeated in aggAttrs resolves to the same id, which
-// costs one extra read per record and keeps the result positional -- callers ask for MIN(x) and MAX(x).
+// collection-wide schema as a field this can read. A name repeated in aggAttrs resolves to the same id,
+// which costs one extra read per record and keeps the result positional -- callers ask for MIN(x) and
+// MAX(x).
+//
+// The GROUP column may be numeric or string; an AGGREGATE column must be numeric. That asymmetry is the
+// shapes themselves: MIN/SUM/AVG of a string is not something the columns compute, while grouping by one
+// only needs its identity.
 func (c *Collection) resolveGroupAttrs(st *schemaScanState, groupAttr string, aggAttrs []string) (uint32, []uint32, bool) {
-	numericField := func(name string) (uint32, bool) {
+	field := func(name string, want func(adKind) bool) (uint32, bool) {
 		id, ok := c.intern.LookupID(name)
 		if !ok {
 			return 0, false
 		}
 		idx, ok := st.schema.byID[id]
-		if !ok || !numericKind(st.schema.fields[idx].kind) {
+		if !ok || !want(st.schema.fields[idx].kind) {
 			return 0, false
 		}
 		return id, true
 	}
-	groupID, ok := numericField(groupAttr)
+	groupID, ok := field(groupAttr, groupableKind)
 	if !ok {
 		return 0, nil, false
 	}
 	var aggIDs []uint32
 	for _, a := range aggAttrs {
-		id, ok := numericField(a)
+		id, ok := field(a, numericKind)
 		if !ok {
 			return 0, nil, false
 		}
@@ -257,109 +267,124 @@ func (c *Collection) shapeGroupStats(ga *groupAccum, groupID uint32, aggIDs []ui
 	return out, true
 }
 
-// groupKey is a group column's raw slot value plus its kind, so an int and a real that share a bit pattern do
-// not collide and each renders as the type it was stored as.
+// groupKey identifies one group: the raw slot value for a number or a boolean, the text for a string,
+// and the kind, so an int and a real that share a bit pattern do not collide and each renders as the
+// type it was stored as.
+//
+// The string field costs one header per GROUP, not per record -- the map holds one entry per distinct
+// value either way -- so carrying it here is cheaper than the alternative of a second side table keyed
+// by something narrower. Keeping one key type also keeps the four tiers, groupLess and shapeGroupStats
+// on one definition of group identity, which is the property that stops them disagreeing.
 type groupKey struct {
 	raw  int64
-	kind adKind
+	s    string
+	kind groupValKind
 }
 
-// groupKeyOf turns a column value into a map key: the raw bits plus the kind, so an int and a real sharing a
-// bit pattern do not merge and each renders as the type it was stored as.
+// groupKeyOf turns a numeric column value into a map key. A boolean reaches this only from a cold tail
+// (a numeric column's slot holds numbers), and keeps its kind so it renders "true"/"false" as the scan
+// does rather than as the 1/0 the aggregates coerce it to.
 func groupKeyOf(nv colVal) groupKey {
-	if nv.kind == akReal {
-		return groupKey{raw: int64(math.Float64bits(nv.f)), kind: akReal}
+	switch nv.kind {
+	case akReal:
+		return groupKey{raw: int64(math.Float64bits(nv.f)), kind: gkReal}
+	case akBool:
+		return groupKey{raw: nv.i, kind: gkBool}
 	}
-	return groupKey{raw: nv.i, kind: nv.kind}
+	return groupKey{raw: nv.i, kind: gkInt}
+}
+
+// number returns the key's numeric value, which is what a bucket floors.
+//
+// A boolean is deliberately NOT a number here, matching db.bucketKeyText: it runs number(v), which
+// rejects a ClassAd boolean, so the scan drops a boolean from a bucketed series rather than
+// bucketing it as 0 or 1.
+func (k groupKey) number() (float64, bool) {
+	switch k.kind {
+	case gkInt:
+		return float64(k.raw), true
+	case gkReal:
+		return math.Float64frombits(uint64(k.raw)), true
+	}
+	return 0, false
 }
 
 func (k groupKey) value() classad.Value {
-	if k.kind == akReal {
+	switch k.kind {
+	case gkReal:
 		return classad.NewRealValue(math.Float64frombits(uint64(k.raw)))
+	case gkString:
+		return classad.NewStringValue(k.s)
+	case gkBool:
+		return classad.NewBoolValue(k.raw != 0)
+	case gkUndef:
+		return classad.NewUndefinedValue()
+	case gkError:
+		return classad.NewErrorValue()
 	}
 	return classad.NewIntValue(k.raw)
 }
 
-// groupAccum is the accumulation map plus the one thing every tier has to agree on: how a
-// column value becomes a group key. Bundling them is what stops one tier forming a raw key
-// while its sibling forms a bucketed one, which would split a group in two and read as a
-// plain wrong count.
-//
-// A bucket width > 0 floors the value into fixed-width buckets -- the shape a time series
-// asks for, where the group is the day rather than the second.
-type groupAccum struct {
-	acc    map[groupKey]*groupAcc
-	bucket int64 // 0 = group by the raw value
-}
-
-func newGroupAccum(bucket int64) *groupAccum {
-	return &groupAccum{acc: map[groupKey]*groupAcc{}, bucket: bucket}
-}
-
-// keyOf derives the group key, flooring into a bucket when one was asked for.
-//
-// The floor goes through float64 and renders as an integer because that is what the
-// scanning aggregator does (db.bucketKeyText): a bucket start is a whole number whatever
-// the column's own type, so an int column and a real column land in the same group. Sharing
-// the arithmetic rather than writing it twice is what keeps the two paths from disagreeing.
-func (a *groupAccum) keyOf(nv colVal) groupKey {
-	if a.bucket <= 0 {
-		return groupKeyOf(nv)
+// groupRank buckets a group value by type for ordering. The buckets are tested in the order a value is
+// classified for RENDERING -- undefined and error before bool, bool before string, string before number
+// -- so two values that sort into one bucket are exactly the two a caller will render comparably, and
+// the order cannot drift from the labels.
+func groupRank(v classad.Value) int {
+	switch {
+	case v.IsUndefined():
+		return 3
+	case v.IsError():
+		return 4
+	case v.IsBool():
+		return 2
+	case v.IsString():
+		return 1
+	case v.IsInteger(), v.IsReal():
+		return 0
 	}
-	return groupKey{raw: int64(math.Floor(nv.f/float64(a.bucket))) * a.bucket, kind: akInt}
-}
-
-// groupFor returns the accumulator for the group this value belongs to, creating it on
-// first sight and counting the record. Three outcomes, which callers must keep distinct:
-//
-//	g != nil, ok     accumulate this record's aggregates into g
-//	g == nil, ok     this record is in no group; skip it
-//	g == nil, !ok    cannot be answered here; give the whole query back
-//
-// An EXPRESSION always gives the query back: only evaluating it yields a value, so which group it
-// belongs to -- or whether it belongs to one at all -- is unknown here, and skipping it would drop a
-// record from a count without saying so.
-//
-// A value that reads but is not a scalar number is the one place the two forms differ. The
-// raw form gives the query back, because the scan emits a group per distinct rendered value
-// (`undefined` for an absent attribute, the text for a string) and a column read can render
-// neither. The bucketed form floors a NUMBER, so the scan drops such a record from the
-// series entirely -- and dropping it here matches that, rather than declining a query this
-// path could have answered.
-func (a *groupAccum) groupFor(nv colVal, cell numCell, nAgg int) (*groupAcc, bool) {
-	if cell == cellExpr {
-		return nil, false
-	}
-	// numericKind excludes BOOLEAN, which cellNumber includes. That is deliberate and matches the
-	// reference: db.bucketKeyText floors number(v), and a ClassAd boolean is not a number to it, so
-	// the scan drops a boolean from the series rather than bucketing it as 0 or 1.
-	if cell != cellNumber || !numericKind(nv.kind) {
-		return nil, a.bucket > 0
-	}
-	key := a.keyOf(nv)
-	g := a.acc[key]
-	if g == nil {
-		g = newGroupAcc(nAgg)
-		a.acc[key] = g
-	}
-	g.n++
-	return g, true
+	return 5
 }
 
 // groupLess orders groups by value, ints before reals only when they are equal, so ORDER BY on the group
 // column gets the order it expects without the caller re-deriving it.
+//
+// A group set is no longer necessarily all numbers: a string column groups by text, and a record missing
+// the attribute groups as `undefined`. Mixed sets are ordered by type first -- numbers, then strings,
+// then booleans, then undefined and error -- because there is no meaningful order ACROSS those and an
+// arbitrary-but-total one at least keeps the answer deterministic between runs.
 func groupLess(a, b classad.Value) bool {
-	af, aerr := a.NumberValue()
-	bf, berr := b.NumberValue()
-	if aerr == nil && berr == nil {
+	ar, br := groupRank(a), groupRank(b)
+	if ar != br {
+		return ar < br
+	}
+	switch ar {
+	case 0:
+		af, _ := a.NumberValue()
+		bf, _ := b.NumberValue()
 		// NaN sorts last rather than comparing false against everything, which would leave it
 		// anywhere and stop equal values from landing next to each other.
 		if an, bn := af != af, bf != bf; an || bn {
 			return !an && bn
 		}
 		return af < bf
+	case 1:
+		as, _ := a.StringValue()
+		bs, _ := b.StringValue()
+		// The evaluator's own case-insensitive comparison, which is also the order the block
+		// dictionaries are sorted in, with a byte tiebreak so values that fold equal -- distinct
+		// groups, since the scan groups by exact text -- still have a stable place.
+		if c := classad.CompareStringsFold(as, bs); c != 0 {
+			return c < 0
+		}
+		return as < bs
+	case 2:
+		ab, _ := a.BoolValue()
+		bb, _ := b.BoolValue()
+		return !ab && bb
+	case 5:
+		return a.String() < b.String()
 	}
-	return a.String() < b.String()
+	return false // undefined and error are one group each: nothing to order within
 }
 
 // groupAcc is one group's accumulation: the record count plus one aggregate accumulator per requested
@@ -383,9 +408,8 @@ func newGroupAcc(nAgg int) *groupAcc {
 // schemaScanGroupStats buckets the group column for every record satisfying preds -- one narrowing pass
 // per predicate column, then one read of the group column and of each aggregate column for the survivors.
 //
-// ok=false means a surviving record's GROUP value is one this cannot turn into a group (see
-// groupAccum.groupFor, which decides that and depends on whether a bucket was asked for); the partial
-// result is then discarded and the caller scans.
+// ok=false means a surviving record's GROUP value is one only evaluation can produce, which this cannot
+// turn into a group (see GroupStatsQuery); the partial result is then discarded and the caller scans.
 func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucket int64, preds []fieldPred,
 	bc *blockCache) (*groupAccum, bool) {
 	acc := newGroupAccum(bucket)
@@ -401,6 +425,7 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 
 	var keep []bool
 	var scratch []int64
+	var gsc groupColScratch
 	aggCols := make([]numCol, len(aggIDs))
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
@@ -422,11 +447,12 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 					base += blk.n
 					continue
 				}
-				col, colOK := newNumCol(blk, groupIdx, groupID, bc)
+				col, colOK := newGroupCol(blk, groupIdx, groupID, bc, &gsc)
 				if !colOK {
 					// The block's schema carries the field but its column will not read (an
-					// unreadable cold stream). Skipping the block would drop its records from
-					// their groups without saying so, so the query goes back to the scan.
+					// unreadable cold stream, an unreadable dictionary). Skipping the block would
+					// drop its records from their groups without saying so, so the query goes back
+					// to the scan.
 					releaseWindows(wins)
 					return nil, false
 				}
@@ -470,31 +496,11 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 						if !keep[k] {
 							continue
 						}
-						nv, cell := col.cell(k, bc)
-						g, ok := acc.groupFor(nv, cell, len(aggIDs))
-						if !ok {
-							// This record matches and forms a group the caller can render but this
-							// cannot; see GroupStatsQuery. Give the whole query back rather than
-							// return a result with groups missing.
+						// Shared with the vector tier, so group identity and the aggregate
+						// skip rules cannot depend on which tier answered.
+						if !addGroupFromColumns(k, &col, aggCols, bc, acc) {
 							releaseWindows(wins)
 							return nil, false
-						}
-						if g == nil {
-							continue // in no bucket; the scan drops it too
-						}
-						for i := range aggCols {
-							// An absent or non-numeric aggregate value contributes nothing, which is
-							// what the reference computes for it -- unlike the group value above,
-							// which decides whether the row exists at all. An EXPRESSION has a value
-							// this cannot compute, so it gives the query back.
-							av, cell := aggCols[i].cell(k, bc)
-							if cell == cellExpr {
-								releaseWindows(wins)
-								return nil, false
-							}
-							if cell == cellNumber {
-								g.stats[i].add(av)
-							}
 						}
 					}
 				}
@@ -510,11 +516,20 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 // SEGMENT's schema. ok=false when any is absent, since segments sealed under different schemas coexist.
 func resolveGroupFields(cs *colSegment, groupID uint32, aggIDs []uint32,
 	preds []fieldPred) (int, []int, []int, bool) {
-	groupIdx, predIdxs, ok := resolveStatsFields(cs, groupID, preds)
+	sch := cs.schema()
+	if sch == nil {
+		return 0, nil, nil, false
+	}
+	// Not resolveStatsFields: that one is for an AGGREGATED field and so insists on a numeric kind,
+	// which a string group column is not.
+	groupIdx, ok := sch.byID[groupID]
+	if !ok || !groupableKind(sch.fields[groupIdx].kind) {
+		return 0, nil, nil, false
+	}
+	predIdxs, ok := resolveFields(cs, preds)
 	if !ok {
 		return 0, nil, nil, false
 	}
-	sch := cs.schema()
 	aggIdxs := make([]int, len(aggIDs))
 	for i, id := range aggIDs {
 		idx, ok := sch.byID[id]
@@ -526,34 +541,11 @@ func resolveGroupFields(cs *colSegment, groupID uint32, aggIDs []uint32,
 	return groupIdx, aggIdxs, predIdxs, true
 }
 
-// adGroupCell reads a group attribute off a wire ad and says what kind of cell it is, in the same
-// vocabulary numCol.cell uses -- so the row fallback and the column tier classify a record identically
-// rather than by two sets of conditions that could drift apart.
-//
-// The expression case is the one worth naming: an unbucketed group gave the query back for it only as a
-// side effect of nodeColVal declining, and a bucketed group MUST NOT quietly drop it, because evaluating
-// it could well yield a number that belongs in a bucket.
-func adGroupCell(groupLookup func(wire.Ad) ([]byte, bool), ad wire.Ad) (colVal, numCell) {
-	node, found := groupLookup(ad)
-	if !found {
-		return colVal{}, cellAbsent
-	}
-	if isExprNode(node) {
-		return colVal{}, cellExpr
-	}
-	nv, isNum := nodeColVal(node)
-	if !isNum || !numericKind(nv.kind) {
-		return colVal{}, cellOther
-	}
-	return nv, cellNumber
-}
-
 // bruteGroupStats is the row fallback for a segment whose schema lacks a field involved: walk the visible
 // records and read only those attributes, never decoding the whole ad.
 //
-// It returns false under the same give-up condition as the column path, for the same reason: a matching
-// record whose group attribute this cannot turn into a group. Which records those are depends on whether
-// a bucket was asked for -- see groupAccum.groupFor.
+// It returns false if a matching record's group value is one only evaluation can produce -- the same
+// give-up condition as the column path, for the same reason.
 func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookup func(wire.Ad) ([]byte, bool),
 	aggLookups []func(wire.Ad) ([]byte, bool), preds []fieldPred,
 	lookups []func(wire.Ad) ([]byte, bool), acc *groupAccum) bool {
@@ -584,25 +576,8 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookup func(wir
 						break
 					}
 				}
-				if match {
-					nv, cell := adGroupCell(groupLookup, ad)
-					g, ok := acc.groupFor(nv, cell, len(aggLookups))
-					if !ok {
-						return false
-					}
-					// g == nil means this record is in no bucket, which the scan drops too.
-					for i := 0; g != nil && i < len(aggLookups); i++ {
-						an, found := aggLookups[i](ad)
-						if !found {
-							continue
-						}
-						if isExprNode(an) {
-							return false
-						}
-						if av, isNum := nodeColVal(an); isNum {
-							g.stats[i].add(av)
-						}
-					}
+				if match && !addGroupFromAd(ad, groupLookup, aggLookups, acc) {
+					return false
 				}
 			}
 		}

@@ -29,9 +29,9 @@ import (
 // vecGroupStats accumulates per-group stats for every visible record matching q, evaluating q against the
 // columns (a column at a time where the expression allows it, per record where it does not).
 //
-// ok=false when q is not native, or when a matching record's group value is one this cannot turn into a
-// group -- the same give-up condition as the predicate-analysis path, for the same reason, and like it
-// narrower when a bucket was asked for (see groupAccum.groupFor).
+// ok=false when q is not native, or when a matching record's group value is one only evaluation can
+// produce -- the same give-up condition as the predicate-analysis path, for the same reason (see
+// GroupStatsQuery).
 func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32, bucket int64,
 	st *schemaScanState) (*groupAccum, bool) {
 	if q == nil || !q.Native() {
@@ -58,6 +58,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 	var plan prunePlan
 	var split vecSplit
 	defer func() { lastGroupSplit.Store(&split) }()
+	var gsc groupColScratch
 	aggCols := make([]numCol, len(aggIDs))
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
@@ -93,7 +94,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 					base += blk.n
 					continue
 				}
-				col, colOK := newNumCol(blk, groupIdx, groupID, st.cache)
+				col, colOK := newGroupCol(blk, groupIdx, groupID, st.cache, &gsc)
 				if !colOK {
 					releaseWindows(wins)
 					return nil, false
@@ -134,7 +135,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 					cs.setBlock(blk)
 					cs.setGroups(seg, bi)
 					if !c.groupBlockScoped(cs, resolver, m, fallbackM, w, seg, blk, base, s0,
-						col, aggCols, st.cache, acc) {
+						&col, aggCols, st.cache, acc) {
 						releaseWindows(wins)
 						return nil, false
 					}
@@ -150,7 +151,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 					cs.setBlock(blk)
 					cs.setGroups(seg, bi)
 					if !c.groupBlockScoped(cs, resolver, m, fallbackM, w, seg, blk, base, s0,
-						col, aggCols, st.cache, acc) {
+						&col, aggCols, st.cache, acc) {
 						releaseWindows(wins)
 						return nil, false
 					}
@@ -162,7 +163,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 					if live[k/64]&(1<<uint(k%64)) == 0 || !vec.IsTrue(k) {
 						continue
 					}
-					if !addGroupFromColumns(k, col, aggCols, st.cache, acc) {
+					if !addGroupFromColumns(k, &col, aggCols, st.cache, acc) {
 						releaseWindows(wins)
 						return nil, false
 					}
@@ -176,11 +177,10 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 }
 
 // addGroupFromColumns reads record k's group and aggregate values from the block's columns and folds them
-// into acc. ok=false when this cannot turn the record's group value into a group; which values those are
-// depends on whether a bucket was asked for (see groupAccum.groupFor).
-func addGroupFromColumns(k int, col numCol, aggCols []numCol, bc *blockCache, acc *groupAccum) bool {
-	nv, cell := col.cell(k, bc)
-	g, ok := acc.groupFor(nv, cell, len(aggCols))
+// into acc. ok=false when the group value is one only evaluation can produce, which cannot be turned
+// into a group here.
+func addGroupFromColumns(k int, col *groupCol, aggCols []numCol, bc *blockCache, acc *groupAccum) bool {
+	g, ok := col.accFor(k, bc, acc, len(aggCols))
 	if !ok {
 		return false
 	}
@@ -207,7 +207,7 @@ func addGroupFromColumns(k int, col numCol, aggCols []numCol, bc *blockCache, ac
 // be worth vectorizing.
 func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, scope ast.AttributeScope) classad.Value,
 	m, fallbackM *vm.Matcher, w segWindow, seg *colSegment, blk *columnarBlock, base int, s0 uint64,
-	col numCol, aggCols []numCol, bc *blockCache, acc *groupAccum) bool {
+	col *groupCol, aggCols []numCol, bc *blockCache, acc *groupAccum) bool {
 	for k := 0; k < blk.n; k++ {
 		gk := base + k
 		if gk >= seg.offsLen() {
@@ -269,11 +269,11 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *vm.Matcher,
 // addGroupFromAd is addGroupFromColumns reading from a wire ad instead of a block's columns.
 func addGroupFromAd(ad wire.Ad, groupLookup func(a wire.Ad) ([]byte, bool),
 	aggLookups []func(a wire.Ad) ([]byte, bool), acc *groupAccum) bool {
-	nv, cell := adGroupCell(groupLookup, ad)
-	g, ok := acc.groupFor(nv, cell, len(aggLookups))
+	key, ok := adGroupKey(groupLookup(ad))
 	if !ok {
 		return false
 	}
+	g, _ := acc.accFor(key, len(aggLookups))
 	if g == nil {
 		return true // in no bucket, which the scan drops too
 	}
