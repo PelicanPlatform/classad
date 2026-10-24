@@ -96,6 +96,18 @@ func BenchmarkScanPaths(b *testing.B) {
 		}
 		reportScanned(b, got)
 	})
+	b.Run("QueryRawFromSeq", func(b *testing.B) {
+		b.ReportAllocs()
+		got := 0
+		for i := 0; i < b.N; i++ {
+			got = 0
+			seq, _ := pc.QueryRawFromSeq(q, benchScanPathsProj, SeqCursor{}, 0)
+			for range seq {
+				got++
+			}
+		}
+		reportScanned(b, got)
+	})
 }
 
 // BenchmarkScanPathsPerQuery isolates the FIXED per-query cost of each scan path:
@@ -150,6 +162,14 @@ func BenchmarkScanPathsPerQuery(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
 			for range mc.QueryRaw(q) {
+			}
+		}
+	})
+	b.Run("QueryRawFromSeq", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			seq, _ := pc.QueryRawFromSeq(q, benchScanPathsProj, SeqCursor{}, 0)
+			for range seq {
 			}
 		}
 	})

@@ -132,13 +132,18 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 	page := &SeqPage{Next: after}
 
 	return func(yield func(RawAd) bool) {
-		ws := &wireScope{ctx: c}
-		qp := queryPlan{ws: ws, resolver: ws.resolve}
+		// The paged walk reaches records through its own cursor rather than the
+		// shard scan, so it uses only the plan's match state -- but it takes the
+		// whole plan from the one constructor regardless, so there is no second
+		// place in the package that decides what evaluating a query requires.
+		var qp queryPlan
 		if q != nil {
-			plan := q.ReadPlan()
-			qp.q, qp.plan, qp.m = q, plan, q.Matcher()
-			qp.wireOK = q.Native() && plan.PartialSafe
+			qp = c.newQueryPlan(q, nil, nil)
+		} else {
+			s := &wireScope{ctx: c}
+			qp.ws, qp.resolver = s, s.resolve
 		}
+		ws := qp.ws
 		// Same in-walk projection as QueryRawProjected: an empty projection
 		// means the whole ad, so a caller asking for four attributes does not
 		// pay to render the rest.

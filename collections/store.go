@@ -9,7 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -1157,34 +1156,6 @@ func (c *Collection) Scan() iter.Seq[*classad.ClassAd] {
 	}
 }
 
-// queryPlan bundles a compiled query with everything a scan needs to evaluate it,
-// including reusable per-scan state.
-// scanEmit consumes each visible record's decompressed wire bytes w and its segment dict
-// (nil for an inline/global segment; non-nil resolves segment-local interned ids). The
-// consumer decodes/renders w -- via dict when set -- so one scan path serves Query, QueryRaw,
-// projection, and aggregates over both inline and interned segments. w aliases a reused
-// buffer; the consumer must not retain it.
-type scanEmit = func(w []byte, dict *segDictHandle) bool
-
-type queryPlan struct {
-	q        *vm.Query
-	plan     vm.ReadPlan
-	m        *vm.Matcher
-	wireOK   bool // native + partial-safe: try wire-native evaluation
-	ws       *wireScope
-	resolver func(name string, scope ast.AttributeScope) classad.Value
-	// proj, when non-nil, is the projection the consumer will keep, so the scan can build a narrower
-	// ad directly from a columnarized segment's columns instead of reassembling a whole record.
-	proj *projPlan
-	// zoneProbes are the query's top-level AND probes, used to skip whole sealed
-	// segments whose zone map cannot contain a match (append-only zone pruning). Set
-	// only when the collection has zone attributes; nil otherwise (no pruning cost).
-	zoneProbes []vm.Probe
-	// stats, when non-nil, accumulates per-scan work counts for EXPLAIN ANALYZE. nil on the
-	// normal path (no overhead beyond nil checks).
-	stats *ScanStats
-}
-
 // Query returns an iterator over the ads matching q, with the same
 // scan-exactly-once guarantee as Scan.
 //
@@ -1211,19 +1182,7 @@ func (c *Collection) QueryRedacted(q *vm.Query) iter.Seq[*classad.ClassAd] {
 
 func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
-		plan := q.ReadPlan()
-		ws := &wireScope{ctx: c}
-		qp := queryPlan{
-			q:        q,
-			plan:     plan,
-			m:        q.Matcher(), // reused across ads; the iterator runs single-threaded
-			wireOK:   q.Native() && plan.PartialSafe,
-			ws:       ws,
-			resolver: ws.resolve, // bound once to avoid a per-ad closure allocation
-		}
-		if c.hasZones.Load() {
-			qp.zoneProbes = q.Probes() // enable sealed-segment zone pruning
-		}
+		qp := c.newQueryPlan(q, nil, nil)
 		// Chained collection: a serial two-pass scan per shard resolves each ad's
 		// inherited (parent) attributes. Indexes and query fan-out are bypassed here
 		// (they don't yet understand chaining); correctness first.
@@ -1256,31 +1215,15 @@ func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd
 			}
 			// Not prunable (some disjunct is unconstrained): fall through to a full scan.
 		}
-		// Record which attributes the query filters on (for SuggestIndexes), then,
-		// if the query has an index-usable constraint, visit only candidate ads;
-		// otherwise fall back to a full scan. Both re-verify the full predicate.
-		probes := q.Probes()
-		c.demand.record(probes)
 		c.demand.recordReads(q.ReadAttrs()) // hot-set signal: attributes the query evaluates
-		usable := c.planRead(probes)
+		usable := c.planQuery(qp)
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.
 		if c.queryPar > 1 && len(usable) == 0 && !c.reverseScan {
-			c.runParallelQuery(q, yield, redact)
+			c.runParallelQuery(qp, yield, redact)
 			return
 		}
-		emit := c.yieldAdAs(yield, redact)
-		for _, sh := range c.shards {
-			var cont bool
-			if len(usable) > 0 {
-				cont = c.scanShardIndexed(sh, usable, qp, emit)
-			} else {
-				cont = c.scanShard(sh, qp, emit)
-			}
-			if !cont {
-				return
-			}
-		}
+		c.runQuery(qp, usable, c.yieldAdAs(yield, redact))
 	}
 }
 
@@ -1328,10 +1271,10 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 // only narrows what is walked.
 func (c *Collection) zoneWalk(wins []segWindow, qp queryPlan) []segWindow {
 	walk := wins
-	if len(qp.zoneProbes) > 0 {
+	if len(qp.probes) > 0 && c.hasZones.Load() {
 		walk = make([]segWindow, 0, len(wins))
 		for _, w := range wins {
-			if w.zones != nil && zonePrune(w.zones, qp.zoneProbes, c.intern) {
+			if w.zones != nil && zonePrune(w.zones, qp.probes, c.intern) {
 				continue
 			}
 			walk = append(walk, w)

@@ -143,16 +143,7 @@ func (c *Collection) QueryAsOf(q *vm.Query, t time.Time) (iter.Seq[*classad.Clas
 		return nil, err
 	}
 	return func(yield func(*classad.ClassAd) bool) {
-		plan := q.ReadPlan()
-		ws := &wireScope{ctx: c}
-		qp := queryPlan{
-			q:        q,
-			plan:     plan,
-			m:        q.Matcher(),
-			wireOK:   q.Native() && plan.PartialSafe,
-			ws:       ws,
-			resolver: ws.resolve,
-		}
+		qp := c.newQueryPlan(q, nil, nil)
 		emit := c.yieldAd(yield)
 		for i, sh := range c.shards {
 			if !c.scanShardAt(sh, seqs[i], qp, emit) {

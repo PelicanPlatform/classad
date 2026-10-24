@@ -10,7 +10,7 @@ import (
 
 // TestZoneMapPruneWirePath is the third instance of the bug TestZoneMapPruneProjectedPaths
 // covers: a scan path that extracts probes for index planning but never hands them to the
-// query plan as zoneProbes, so sealed segments it could skip wholesale are walked instead.
+// query plan at all, so sealed segments it could skip wholesale are walked instead.
 // QueryProject and QueryRawProjected were fixed; QueryRawWire was not.
 //
 // It is kept separate from that test because the wire path needs a PERSISTENT collection
