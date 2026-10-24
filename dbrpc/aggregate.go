@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
@@ -330,11 +329,6 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		}
 	}
 
-	// Project only the attributes the aggregation reads (group columns + the
-	// non-"*" aggregate arguments), so the scan reads them wire-native instead of
-	// fully decoding every matching ad.
-	attrs, groupCol, aggCol := db.AggProjection(groupCols, aggs)
-
 	// A name resolves to whatever table it names, archives included.
 	//
 	// The read opcodes already work this way -- QueryRawProject on an
@@ -368,66 +362,12 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		}
 	}
 
-	// Fast path: an unconstrained COUNT(*) with no grouping is the collection's live row
-	// count, which it tracks in O(shards) via Len() -- no scan of every ad. This is the common
-	// `SELECT COUNT(*) FROM <table>`. Only when the collection has no hidden structural
-	// (parent-only) ads, which a match-all scan excludes but Len() counts (a chained job_queue
-	// has them; a flat table like Startd does not). Mirrors ArchiveTable.Aggregate.
-	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		aggs[0].Filter == "" && db.IsMatchAll(constraint) && !d.Chained() {
-		frame := respHead(reqID, stStream)
-		frame = putStr(frame, strconv.Itoa(d.Len()))
-		write(frame)
-		write(respHead(reqID, stStreamEnd))
-		return
-	}
-
-	// Fast path: a constrained COUNT(*) WHERE <numeric comparison on one int schema field> runs
-	// as the adschema columnar scan when the table has schema-scan enabled and the predicate is
-	// eligible. CountConstraint returns ok=false otherwise (schema-scan off, or a predicate the
-	// columnar path can't handle), and we fall through to the projected scan.
-	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		aggs[0].Filter == "" && !db.IsMatchAll(constraint) {
-		if n, ok := d.CountConstraint(constraint); ok {
-			frame := respHead(reqID, stStream)
-			frame = putStr(frame, strconv.Itoa(n))
-			write(frame)
-			write(respHead(reqID, stStreamEnd))
-			return
-		}
-	}
-
-	// Fast path: a single MIN/MAX/COUNT(attr) over a numeric column, read from the columnar
-	// blocks rather than by decoding every record. Only counting was routed here before, so an
-	// unconstrained MAX over a large table scanned row-wise. Declines unless the table has
-	// schema-scan enabled and the aggregate is in scope (see db.ColumnarAggregate).
-	if rows, ok := db.ColumnarAggregate(func(attr string) (db.NumStats, bool) {
-		return d.NumStats(constraint, attr)
-	}, groupCols, aggs); ok {
-		writeAggRows(reqID, rows, write)
-		return
-	}
-
-	// Fast path: a GROUP BY one column -- numeric or string, raw or bucketed -- with COUNT(*) and/or
-	// MIN/MAX/SUM/AVG/COUNT(attr), answered from the columnar blocks. Every fast path above is gated on
-	// there being NO grouping, so `select JobStatus, count(*) from jobs group by JobStatus` -- a shape a
-	// dashboard asks constantly -- decoded every matching record even on a table carrying the
-	// accelerator. Archive tables already route this through db.GroupedFromColumns; this gives mutable
-	// tables the same path and the same row-shaping rather than a second implementation. A bucketed
-	// group column is what makes a time series ("per day") take this path rather than the scan below.
-	// Declines (and falls through) for more than one group column, an aggregate over a non-numeric
-	// column, a per-aggregate FILTER, COUNT(DISTINCT), or a chained table.
-	if rows, ok := db.GroupedFromColumns(d, constraint, groupCols, aggs); ok {
-		writeAggRows(reqID, rows, write)
-		return
-	}
-
-	seq, err := d.QueryProject(constraint, attrs)
-	if err != nil {
-		write(respErr(reqID, err.Error()))
-		return
-	}
-	rows, err := db.AggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, func() bool { return cancelled(ctx) })
+	// The aggregate fan-out -- the Len()/CountConstraint/columnar/grouped-columnar fast paths and
+	// the projected-scan fall-through -- lives in db alongside the archive's, so the two ladders
+	// stay one implementation and an embedded caller of db gets the same planning this handler
+	// does. What stays here is the RPC layer's own job: table resolution, the private-attribute
+	// gates above, and framing. The stop callback abandons a scan whose client has gone away.
+	rows, err := d.AggregateColsStats(constraint, groupCols, aggs, nil, func() bool { return cancelled(ctx) })
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
