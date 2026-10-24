@@ -34,59 +34,93 @@ import (
 // callback rather than a context because every other query entry point here takes none, and the
 // one caller that cares already holds the connection's context.
 func (db *DB) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats, stop func() bool) ([]AggRow, error) {
-	// Fast path: an unconstrained COUNT(*) with no grouping is the collection's live row
-	// count, which it tracks in O(shards) via Len() -- no scan of every ad. This is the common
-	// `SELECT COUNT(*) FROM <table>`. Only when the collection has no hidden structural
-	// (parent-only) ads, which a match-all scan excludes but Len() counts (a chained job_queue
-	// has them; a flat table like Startd does not). Mirrors ArchiveTable.Aggregate.
-	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		aggs[0].Filter == "" && IsMatchAll(constraint) && !db.Chained() {
-		return []AggRow{{Values: []string{strconv.Itoa(db.Len())}}}, nil
-	}
+	return runAggLadder(db.aggLadder(stats, stop), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
+}
 
-	// Fast path: a constrained COUNT(*) WHERE <numeric comparison on one int schema field> runs
-	// as the adschema columnar scan when the table has schema-scan enabled and the predicate is
-	// eligible. CountConstraint returns ok=false otherwise (schema-scan off, or a predicate the
-	// columnar path can't handle), and we fall through to the projected scan.
-	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		aggs[0].Filter == "" && !IsMatchAll(constraint) {
-		if n, ok := db.CountConstraint(constraint); ok {
-			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, nil
-		}
+// aggLadder is the mutable table's ordered list of aggregate strategies, the counterpart of
+// ArchiveTable.aggLadder: each rung serves the whole request or declines to the next, and the
+// projected scan at the end always answers. Built per call because its last rung closes over the
+// caller's stats block and stop callback; the rungs above it read nothing but the request.
+//
+// It is deliberately NOT the archive's ladder with rungs removed. Two differences are real and
+// preserved rather than reconciled:
+//
+//   - There is no match-none rung. The archive grew one when `where false` was measured costing a
+//     full scan of a history table; a mutable table never had one, and giving it one here would
+//     change what this ladder does rather than describe it.
+//   - Columnar-aggregate precedes grouped-columns, where the archive has them the other way round.
+//     The two are mutually exclusive -- one serves exactly zero group columns and the other
+//     exactly one -- so the order has no effect on any answer, and each ladder keeps the order it
+//     was written in rather than being normalised to look like the other.
+func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool) []AggStrategy {
+	return []AggStrategy{
+		aggRung{"live-count", func(req AggRequest) ([]AggRow, bool, error) {
+			// An unconstrained COUNT(*) with no grouping is the collection's live row count,
+			// which it tracks in O(shards) via Len() -- no scan of every ad. This is the common
+			// `SELECT COUNT(*) FROM <table>`. Only when the collection has no hidden structural
+			// (parent-only) ads, which a match-all scan excludes but Len() counts (a chained
+			// job_queue has them; a flat table like Startd does not). Mirrors the archive's index
+			// rung, which reads the same shape from the archive's own O(1) tally.
+			if !req.isPlainCount() || !IsMatchAll(req.Constraint) || db.Chained() {
+				return nil, false, nil
+			}
+			return []AggRow{{Values: []string{strconv.Itoa(db.Len())}}}, true, nil
+		}},
+		aggRung{"count-constraint", func(req AggRequest) ([]AggRow, bool, error) {
+			// A constrained COUNT(*) WHERE <numeric comparison on one int schema field> runs as
+			// the adschema columnar scan when the table has schema-scan enabled and the predicate
+			// is eligible. CountConstraint declines otherwise (schema-scan off, or a predicate the
+			// columnar path can't handle), and we fall through to the projected scan.
+			if !req.isPlainCount() || IsMatchAll(req.Constraint) {
+				return nil, false, nil
+			}
+			n, ok := db.CountConstraint(req.Constraint)
+			if !ok {
+				return nil, false, nil
+			}
+			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, true, nil
+		}},
+		aggRung{"columnar-aggregate", func(req AggRequest) ([]AggRow, bool, error) {
+			// A single MIN/MAX/COUNT(attr) over a numeric column, read from the columnar blocks
+			// rather than by decoding every record. Only counting was routed here before, so an
+			// unconstrained MAX over a large table scanned row-wise. Declines unless the table has
+			// schema-scan enabled and the aggregate is in scope (see ColumnarAggregate).
+			rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
+				return db.NumStats(req.Constraint, attr)
+			}, req.GroupCols, req.Aggs)
+			return rows, ok, nil
+		}},
+		aggRung{"grouped-columns", func(req AggRequest) ([]AggRow, bool, error) {
+			// A GROUP BY one column -- numeric or string, raw or bucketed -- with COUNT(*) and/or
+			// MIN/MAX/SUM/AVG/COUNT(attr), answered from the columnar blocks. Every rung above is
+			// gated on there being NO grouping, so `select JobStatus, count(*) from jobs group by
+			// JobStatus` -- a shape a dashboard asks constantly -- decoded every matching record
+			// even on a table carrying the accelerator. Archive tables already route this through
+			// GroupedFromColumns; this gives mutable tables the same path and the same row-shaping
+			// rather than a second implementation. A bucketed group column is what makes a time
+			// series ("per day") take this path rather than the scan below. Declines (and falls
+			// through) for more than one group column, an aggregate over a non-numeric column, a
+			// per-aggregate FILTER, COUNT(DISTINCT), or a chained table -- the DB.GroupStats*
+			// wrappers refuse a chained table because the columnar pass reads a record's own
+			// columns and knows nothing about the parent it would have inherited the group or
+			// aggregate attribute from.
+			rows, ok := GroupedFromColumns(db, req.Constraint, req.GroupCols, req.Aggs)
+			return rows, ok, nil
+		}},
+		aggRung{"projected-scan", func(req AggRequest) ([]AggRow, bool, error) {
+			// The reference, and the rung that must never decline. Project only the attributes the
+			// aggregation reads (group columns + the non-"*" aggregate arguments), so the scan
+			// reads them wire-native instead of fully decoding every matching ad.
+			attrs, groupCol, aggCol := AggProjection(req.GroupCols, req.Aggs)
+			seq, err := db.QueryProjectStats(req.Constraint, attrs, stats)
+			if err != nil {
+				return nil, false, err
+			}
+			rows, err := AggregateValues(seq, attrs, req.GroupCols, req.Aggs, groupCol, aggCol, stop)
+			if err != nil {
+				return nil, false, err
+			}
+			return rows, true, nil
+		}},
 	}
-
-	// Fast path: a single MIN/MAX/COUNT(attr) over a numeric column, read from the columnar
-	// blocks rather than by decoding every record. Only counting was routed here before, so an
-	// unconstrained MAX over a large table scanned row-wise. Declines unless the table has
-	// schema-scan enabled and the aggregate is in scope (see ColumnarAggregate).
-	if rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
-		return db.NumStats(constraint, attr)
-	}, groupCols, aggs); ok {
-		return rows, nil
-	}
-
-	// Fast path: a GROUP BY one column -- numeric or string, raw or bucketed -- with COUNT(*) and/or
-	// MIN/MAX/SUM/AVG/COUNT(attr), answered from the columnar blocks. Every fast path above is gated on
-	// there being NO grouping, so `select JobStatus, count(*) from jobs group by JobStatus` -- a shape a
-	// dashboard asks constantly -- decoded every matching record even on a table carrying the
-	// accelerator. Archive tables already route this through GroupedFromColumns; this gives mutable
-	// tables the same path and the same row-shaping rather than a second implementation. A bucketed
-	// group column is what makes a time series ("per day") take this path rather than the scan below.
-	// Declines (and falls through) for more than one group column, an aggregate over a non-numeric
-	// column, a per-aggregate FILTER, COUNT(DISTINCT), or a chained table -- the DB.GroupStats*
-	// wrappers refuse a chained table because the columnar pass reads a record's own columns and
-	// knows nothing about the parent it would have inherited the group or aggregate attribute from.
-	if rows, ok := GroupedFromColumns(db, constraint, groupCols, aggs); ok {
-		return rows, nil
-	}
-
-	// Project only the attributes the aggregation reads (group columns + the non-"*" aggregate
-	// arguments), so the scan reads them wire-native instead of fully decoding every matching ad.
-	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
-
-	seq, err := db.QueryProjectStats(constraint, attrs, stats)
-	if err != nil {
-		return nil, err
-	}
-	return AggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, stop)
 }
