@@ -903,6 +903,7 @@ func (c *Collection) Update(batch []AdUpdate) error {
 	for si, writes := range byShard {
 		c.shards[si].commit(writes)
 	}
+	c.indexSealedSegments()  // see Put
 	c.collapseSealedChains() // see Put: a seal here must schedule its own drain
 	err := c.writeError()
 	if err == nil && len(c.ordered) > 0 {
@@ -938,10 +939,17 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	stored := codec.Compress(nil, c.encodeAd(ad.AST()))
 	h := c.h.Hash(key)
 	c.shards[c.shardOf(key, h)].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
-	// A write through this path can roll a segment, and rolling one is what flags a seal whose
-	// open chains still need collapsing. Only Txn.Commit used to schedule that drain, so a seal
-	// caused here left the work parked in RAM until some later transaction happened along -- and
-	// a restart in between stranded every fragment in the sealed segment.
+	// A write through this path can roll a segment, and the sealed segment needs a key index.
+	// Only Txn.Commit used to build one, so on a store written through Put every sealed segment
+	// stayed unindexed until a reindex pass, and each later insert of a new key walked every
+	// one of them looking for a prior version: quadratic in the record count (60k Puts into a
+	// 64KiB-segment store took 23s, most of it in that walk). Indexed first, so the collapse
+	// below can find chain bases in the segment that just sealed.
+	c.indexSealedSegments()
+	// Rolling a segment is also what flags a seal whose open chains still need collapsing. Only
+	// Txn.Commit used to schedule that drain, so a seal caused here left the work parked in RAM
+	// until some later transaction happened along -- and a restart in between stranded every
+	// fragment in the sealed segment.
 	c.collapseSealedChains()
 	err := c.writeError()
 	if err == nil {

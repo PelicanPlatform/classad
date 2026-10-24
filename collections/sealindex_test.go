@@ -166,3 +166,68 @@ func TestIndexBuildIsFreeWhenNothingSealed(t *testing.T) {
 		t.Errorf("%d shard walk(s) by commits that sealed nothing: the post-commit hook is not free", got)
 	}
 }
+
+// Every write path seals segments, so every one has to index them. Only Txn.Commit did: a store
+// written through Put, Update or UpdateOld kept its sealed segments unindexed until a reindex pass
+// (which an in-memory store may never run), and each insert of a new key walked every sealed
+// segment looking for a prior version -- quadratic in the record count.
+func TestEveryWritePathIndexesSealedSegments(t *testing.T) {
+	const n = 3000
+	src := func(i int) string {
+		return fmt.Sprintf("ClusterId = %d\nOwner = \"user%d\"\nCmd = \"/home/user%d/run.sh\"\n"+
+			"Args = \"--input in%d.dat --output out%d.dat\"", i, i%7, i%7, i, i)
+	}
+	for _, tc := range []struct {
+		name  string
+		write func(c *Collection, i int) error
+	}{
+		{"Put", func(c *Collection, i int) error {
+			return c.Put([]byte(fmt.Sprintf("%d.0", i)), mustAdOld(t, src(i)))
+		}},
+		{"Update", func(c *Collection, i int) error {
+			return c.Update([]AdUpdate{{Key: []byte(fmt.Sprintf("%d.0", i)), Ad: mustAdOld(t, src(i))}})
+		}},
+		{"UpdateOld", func(c *Collection, i int) error {
+			return c.UpdateOld([]OldAdUpdate{{Key: []byte(fmt.Sprintf("%d.0", i)), Text: src(i)}})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := New(Options{Shards: 1, SegmentSize: 1 << 14})
+			defer c.Close()
+			before := SealedProbesSkipped()
+			for i := range n {
+				if err := tc.write(c, i); err != nil {
+					t.Fatal(err)
+				}
+			}
+			sealed, unprobeable := 0, 0
+			for _, sh := range c.shards {
+				sh.mu.RLock()
+				for _, seg := range sh.segs {
+					if seg == nil || seg == sh.act || seg.used == 0 {
+						continue
+					}
+					sealed++
+					if seg.keyIdx.Load() == nil && seg.keyIdxMem.Load() == nil {
+						unprobeable++
+					}
+				}
+				sh.mu.RUnlock()
+			}
+			if sealed < 2 {
+				t.Fatalf("only %d sealed segment(s): the fixture did not roll enough to prove anything", sealed)
+			}
+			if unprobeable != 0 {
+				t.Errorf("%s left %d of %d sealed segments with no key index", tc.name, unprobeable, sealed)
+			}
+			// The cost itself: every insert of a new key probes the sealed segments, and an
+			// unindexed one is walked and counted. The write that seals a segment probes it before
+			// the index is built, so one walk per seal is expected; one per segment per write is
+			// the quadratic case.
+			if got := SealedProbesSkipped() - before; got > int64(sealed) {
+				t.Errorf("%s: %d sealed-segment probes walked a segment for want of an index, across %d seals",
+					tc.name, got, sealed)
+			}
+		})
+	}
+}
