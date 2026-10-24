@@ -559,7 +559,7 @@ func TestArchiveGroupedGeneralPredicates(t *testing.T) {
 		{"RequestMemory >= 2048 || RequestCpus >= 4", "ProcId", true, "a disjunction"},
 		{`Owner == "user3" || JobStatus == 4`, "JobStatus", true, "string OR numeric"},
 		{`regexp("user3", Owner)`, "ProcId", false, "not native: cannot be lowered at all"},
-		{"RequestMemory > 4096", "Owner", false, "a STRING group column is still out of scope"},
+		{"RequestMemory > 4096", "Owner", true, "a STRING group column reads through the block dictionary"},
 	} {
 		groupCols := []GroupCol{{Attr: tc.group}}
 		got, err := a.AggregateCols(tc.constraint, groupCols, countStar)

@@ -6,7 +6,7 @@ import (
 	"github.com/PelicanPlatform/classad/collections"
 )
 
-// A GROUP BY on one numeric column served from the columnar blocks.
+// A GROUP BY on one column served from the columnar blocks.
 //
 // aggregateFromIndex answers a grouped COUNT(*) only from the CATEGORICAL index, the constrained-count
 // fast path is gated on there being no grouping, and ColumnarAggregate declines any grouping at all. So
@@ -17,9 +17,12 @@ import (
 // is left here is turning it into rows the way the SCANNING aggregator would have, which is where the two
 // can disagree:
 //
-//   - Group identity. Storage keys a group by (bits, kind), so an integer 3 and a real 3.0 are distinct
-//     keys; the scan path keys by rendered text, where both are "3". Merging on the text reproduces the
-//     scan's partition instead of emitting one group as two rows sharing a label.
+//   - Group identity. Storage keys a group by its value and kind, so an integer 3 and a real 3.0 are
+//     distinct keys; the scan path keys by rendered text, where both are "3". Merging on the text
+//     reproduces the scan's partition instead of emitting one group as two rows sharing a label. A
+//     string group column makes that merge load-bearing rather than a corner case: a record whose
+//     attribute is absent groups as UNDEFINED and renders "undefined", which is also what a record
+//     holding the literal string "undefined" renders, and the scan puts both in one group.
 //   - Value rendering. Each aggregate renders through numAggValue, the same function the ungrouped
 //     columnar aggregate uses, so SUM's int64 accumulation, AVG's always-real, MIN/MAX keeping their
 //     element's type, and the empty cases all match the reference by construction rather than by a second
@@ -43,15 +46,17 @@ type GroupStatsSource interface {
 	GroupStatsAllBucketed(groupAttr string, bucket int64, aggAttrs []string) ([]collections.GroupStats, bool)
 }
 
-// groupedFromColumns answers a single-numeric-column GROUP BY from the archive's columns.
+// groupedFromColumns answers a single-column GROUP BY from the archive's columns.
 func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
 	return GroupedFromColumns(t, constraint, groupCols, aggs)
 }
 
-// GroupedFromColumns answers a single-numeric-column GROUP BY from src's columns, or ok=false to scan.
+// GroupedFromColumns answers a single-column GROUP BY from src's columns, or ok=false to scan.
 //
-// Served: one group column -- raw, or floored into fixed-width buckets -- and aggregates drawn from
-// COUNT(*), COUNT(attr), MIN, MAX, SUM and AVG over numeric attributes the schema carries.
+// Served: one group column -- numeric or STRING, raw or floored into fixed-width buckets -- and
+// aggregates drawn from COUNT(*), COUNT(attr), MIN, MAX, SUM and AVG over NUMERIC attributes the
+// schema carries. A string group value is read through the block's string dictionary; an aggregate
+// over a string column is still not this shape.
 //
 // The bucketed form is what a time series asks ("per day", not "per second"), and it is the form this
 // used to decline outright, sending every `GROUP BY time_bucket(t,'1d')` to a record scan while its

@@ -62,6 +62,150 @@ func rowGroupTruth(t *testing.T, c *Collection, constraint, attr string) (map[in
 	return out, nonInt
 }
 
+// rowGroupTexts is rowGroupTruth for a group column that is not necessarily numeric: it keys by the
+// rendering of the row path's own evaluated value, so the reference stays the ordinary evaluator rather
+// than a second implementation of the grouping rules.
+//
+// Both sides key by classad.Value.String() on values the two paths each produced, which is also how two
+// storage keys that render alike get folded together -- the same merge the db layer does by rendered
+// text, and the reason an absent attribute and a literal "undefined" land in one group.
+func rowGroupTexts(t *testing.T, c *Collection, constraint, attr string) map[string]int {
+	t.Helper()
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string]int{}
+	for ad := range c.Query(q) {
+		out[ad.EvaluateAttr(attr).String()]++
+	}
+	return out
+}
+
+// checkGroupTexts asserts a columnar group set is exactly the row path's partition.
+func checkGroupTexts(t *testing.T, c *Collection, got []GroupCount, constraint, attr string) {
+	t.Helper()
+	want := rowGroupTexts(t, c, constraint, attr)
+	gotM := map[string]int{}
+	for _, g := range got {
+		gotM[g.Value.String()] += g.Count
+	}
+	for k, n := range want {
+		if gotM[k] != n {
+			t.Errorf("%q GROUP BY %s: group %s counted %d, row path %d", constraint, attr, k, gotM[k], n)
+		}
+	}
+	for k, n := range gotM {
+		if _, ok := want[k]; !ok {
+			t.Errorf("%q GROUP BY %s: group %s (%d records) is not in the row path's result at all",
+				constraint, attr, k, n)
+		}
+	}
+}
+
+// TestGroupCountStringDictionary is the dictionary half of the string group column: the path where a
+// block's distinct values are resolved to groups ONCE and the per-record step is an array index.
+//
+// Which reader a block uses is decided by the DATA, not by the query (see dictWorthwhile), so this uses
+// the fixture built for dictionaries -- the shared scope fixture leaves every string field positional --
+// and asserts the encoding happened, or it would exercise none of this and still pass every count.
+func TestGroupCountStringDictionary(t *testing.T) {
+	c := strDictFixture(t, 6000, 200)
+	defer c.Close()
+	if withDict, blocks := dictStats(t, c, "Owner"); withDict == 0 {
+		t.Fatalf("no block of %d dictionary-encodes Owner: the dictionary reader is not exercised", blocks)
+	}
+	for _, tc := range []struct{ constraint, attr string }{
+		{"RequestMemory > 4096", "Owner"},
+		{"RequestMemory > 4096", "Cmd"},
+		{"RequestMemory > 4096", "Iwd"},
+		{`Owner == "user3"`, "Owner"}, // the group column IS the predicate column
+		{`Owner != "user3"`, "Cmd"},   // a string predicate, so the vector tier
+		{"RequestCpus >= 0", "Owner"}, // every record matches, via the predicate tier
+	} {
+		q, err := vm.Parse(tc.constraint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := c.GroupCountQuery(q, tc.attr)
+		if !ok {
+			t.Errorf("%q GROUP BY %s: declined", tc.constraint, tc.attr)
+			continue
+		}
+		checkGroupTexts(t, c, got, tc.constraint, tc.attr)
+	}
+	got, ok := c.GroupCountAll("Owner")
+	if !ok {
+		t.Fatal("GROUP BY Owner over every record: declined")
+	}
+	checkGroupTexts(t, c, got, "true", "Owner")
+}
+
+// TestGroupCountStringColumn is the anti-vacuity gate for the string group column: these shapes must be
+// SERVED from the columns, not merely answered correctly by falling back to the scan, which is the whole
+// point of reading the group value from the columns.
+//
+// The shared fixture leaves every string field POSITIONAL (its Owner has ~512 distinct values over a
+// ~378-record row group, so dictWorthwhile declines), so this covers the walk-the-region reader across
+// the tiers and TestGroupCountStringDictionary covers the other one.
+func TestGroupCountStringColumn(t *testing.T) {
+	c := groupReadFixture(t)
+	if withDict, _ := dictStats(t, c, "Owner"); withDict != 0 {
+		t.Fatalf("Owner is dictionary-encoded in %d blocks of the shared fixture; this test is the "+
+			"positional reader's and no longer covers it", withDict)
+	}
+	for _, tc := range []struct{ constraint, attr, why string }{
+		{"RequestMemory > 4096", "Owner", "numeric predicate, string group column"},
+		{"RequestMemory > 4096", "Cmd", "a second string column"},
+		{"RequestMemory > 4096", "Iwd", "distinct per record: ~3000 groups over several blocks"},
+		{`Owner == "user3"`, "Cmd", "a STRING predicate routes through the vector tier"},
+		{"RequestMemory > RequestCpus", "Owner", "attribute-to-attribute: the vector tier again"},
+		{"ClusterId > 9999999", "Owner", "nothing matches: no groups at all"},
+	} {
+		q, err := vm.Parse(tc.constraint)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := c.GroupCountQuery(q, tc.attr)
+		if !ok {
+			t.Errorf("%q GROUP BY %s: declined, but this is served from the columns (%s)",
+				tc.constraint, tc.attr, tc.why)
+			continue
+		}
+		checkGroupTexts(t, c, got, tc.constraint, tc.attr)
+		// The groups must partition the matches: the same records the ungrouped count returns.
+		total := 0
+		for _, g := range got {
+			total += g.Count
+		}
+		if plain, ok := c.CountQuery(q); ok && total != plain {
+			t.Errorf("%q GROUP BY %s: groups sum to %d but count(*) is %d",
+				tc.constraint, tc.attr, total, plain)
+		}
+	}
+	// The unconstrained form is a separate entry point with no predicate to analyze.
+	got, ok := c.GroupCountAll("Owner")
+	if !ok {
+		t.Fatal("GROUP BY Owner over every record: declined")
+	}
+	checkGroupTexts(t, c, got, "true", "Owner")
+	total := 0
+	for _, g := range got {
+		total += g.Count
+	}
+	if total != c.Len() {
+		t.Errorf("GROUP BY Owner: groups sum to %d but the collection holds %d records", total, c.Len())
+	}
+	// Sorted, so an ORDER BY on the group column needs no re-derivation.
+	for i := 1; i < len(got); i++ {
+		a, _ := got[i-1].Value.StringValue()
+		b, _ := got[i].Value.StringValue()
+		if !groupLess(got[i-1].Value, got[i].Value) {
+			t.Errorf("GROUP BY Owner: groups not ordered at %d (%q then %q)", i, a, b)
+		}
+	}
+}
+
 func TestGroupCountQueryMatchesRowPath(t *testing.T) {
 	c := groupReadFixture(t)
 
@@ -118,8 +262,12 @@ func TestGroupCountQueryMatchesRowPath(t *testing.T) {
 }
 
 // TestGroupCountQueryDeclinesUnservable pins the declines that are about the GROUP COLUMN: this path
-// answers by reading that column as numbers, so a column it cannot read that way is out of scope by
-// construction, not merely unimplemented.
+// answers by reading that column, so a column it cannot read is out of scope by construction, not merely
+// unimplemented.
+//
+// It used to assert that a STRING column declines too. That stopped being true when the group column
+// learned to read strings through the block dictionary, which is what TestGroupCountStringColumn now
+// covers.
 //
 // It used to also assert that `Owner == "user3"`, `RequestMemory > RequestCpus` and `true` decline. Those
 // were true of the predicate ANALYSIS and stopped being true when the second tier evaluated the query
@@ -130,8 +278,8 @@ func TestGroupCountQueryMatchesRowPath(t *testing.T) {
 func TestGroupCountQueryDeclinesUnservable(t *testing.T) {
 	c := groupReadFixture(t)
 	for _, tc := range []struct{ constraint, attr, why string }{
-		{"RequestMemory > 4096", "Owner", "a string column is not a numeric histogram"},
 		{"RequestMemory > 4096", "NoSuchAttr", "attribute absent from the schema"},
+		{"RequestMemory > 4096", "WantCheckpoint", "a bool is bit-packed, not a column this can read"},
 	} {
 		q, err := vm.Parse(tc.constraint)
 		if err != nil {
@@ -184,9 +332,8 @@ func BenchmarkGroupCount(b *testing.B) {
 }
 
 // heteroGroupFixture is a collection where the group attribute is NOT uniformly a number: some records omit
-// it and some hold a string. The row path makes a group out of each of those renderings ("undefined", the
-// string), which a column read cannot reproduce -- it cannot even tell the two apart, since both surface as
-// "no numeric value here".
+// it, some hold a string, some hold an expression. The row path makes a group out of each of those
+// renderings, and the columnar path has to produce the same partition or decline.
 func heteroGroupFixture(tb testing.TB, n int, shape func(i int) string) *Collection {
 	tb.Helper()
 	cd, err := NewZSTDCodec(nil)
@@ -214,25 +361,48 @@ func heteroGroupFixture(tb testing.TB, n int, shape func(i int) string) *Collect
 	return c
 }
 
-func TestGroupCountQueryDeclinesUnrepresentableGroups(t *testing.T) {
+// TestGroupCountHeterogeneousGroupValues covers a group column whose values are not uniformly numbers.
+//
+// Every SCALAR shape is served: the column read now renders a string as its text and an absent attribute
+// as `undefined`, which is what the row path's projection yields for them, so the partition matches
+// instead of the query being handed back. An EXPRESSION still declines -- only evaluating it produces a
+// value -- and that decline is what keeps the result from silently missing a group.
+func TestGroupCountHeterogeneousGroupValues(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		shape func(i int) string
+		name   string
+		shape  func(i int) string
+		served bool
 	}{
-		// A record that simply lacks the attribute: the row path groups it under "undefined".
+		// A record that simply lacks the attribute: both paths group it under "undefined".
 		{"attribute_absent", func(i int) string {
 			if i%50 == 7 {
 				return "Other = 1"
 			}
 			return fmt.Sprintf("Tally = %d", i%10)
-		}},
-		// A record where it is present but a string: the row path groups it under that text.
+		}, true},
+		// Present but a string: both paths group it under that text, beside the numeric groups.
 		{"attribute_is_string", func(i int) string {
 			if i%50 == 7 {
 				return `Tally = "many"`
 			}
 			return fmt.Sprintf("Tally = %d", i%10)
-		}},
+		}, true},
+		// Present but a boolean: a numeric column's aggregates coerce it to 1/0, but as a GROUP value
+		// it has to render "true", which is why the key keeps its kind.
+		{"attribute_is_bool", func(i int) string {
+			if i%50 == 7 {
+				return "Tally = true"
+			}
+			return fmt.Sprintf("Tally = %d", i%10)
+		}, true},
+		// An expression: its value exists only once something evaluates it, so this must decline --
+		// even though the row path renders it perfectly well and makes a group out of it.
+		{"attribute_is_expression", func(i int) string {
+			if i%50 == 7 {
+				return `Tally = strcat("g", ClusterId % 3)`
+			}
+			return fmt.Sprintf("Tally = %d", i%10)
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := heteroGroupFixture(t, groupFixtureRecords, tc.shape)
@@ -241,29 +411,28 @@ func TestGroupCountQueryDeclinesUnrepresentableGroups(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// The point of the fixture: the row path really does see records this cannot render, so a
-			// decline is the only correct answer and not an artifact of a uniform fixture.
-			_, nonInt := rowGroupTruth(t, c, "RequestMemory > 4096", "Tally")
-			if nonInt == 0 {
+			// The point of the fixture: the row path really does see records whose group value is not
+			// an integer, so the case is about those values and not an artifact of a uniform fixture.
+			if _, nonInt := rowGroupTruth(t, c, "RequestMemory > 4096", "Tally"); nonInt == 0 {
 				t.Fatal("fixture is uniform after all: no matching record has a non-integer Tally")
 			}
-			if got, ok := c.GroupCountQuery(q, "Tally"); ok {
-				total := 0
-				for _, g := range got {
-					total += g.Count
+			got, ok := c.GroupCountQuery(q, "Tally")
+			if ok != tc.served {
+				t.Fatalf("served = %v, want %v", ok, tc.served)
+			}
+			if !ok {
+				// Declining is only acceptable because the shape is otherwise servable -- so the
+				// decline is about the values, not about the query being out of scope to begin with.
+				c2 := heteroGroupFixture(t, groupFixtureRecords,
+					func(i int) string { return fmt.Sprintf("Tally = %d", i%10) })
+				defer c2.Close()
+				if _, ok := c2.GroupCountQuery(q, "Tally"); !ok {
+					t.Error("declined the same query on a uniform fixture, so the decline above was " +
+						"not about the unrepresentable values")
 				}
-				t.Errorf("served the query with %d groups totalling %d records, but %d matching records "+
-					"have a group value it cannot render; those groups would be missing from the result",
-					len(got), total, nonInt)
+				return
 			}
-			// And the shape is otherwise servable, so the decline is about the values -- not about the
-			// query being outside the fast path to begin with.
-			c2 := heteroGroupFixture(t, groupFixtureRecords, func(i int) string { return fmt.Sprintf("Tally = %d", i%10) })
-			defer c2.Close()
-			if _, ok := c2.GroupCountQuery(q, "Tally"); !ok {
-				t.Error("declined the same query on a uniform fixture, so the decline above was not about " +
-					"the unrepresentable values")
-			}
+			checkGroupTexts(t, c, got, "RequestMemory > 4096", "Tally")
 		})
 	}
 }
@@ -301,8 +470,9 @@ func TestGroupCountAllMatchesRowPath(t *testing.T) {
 			t.Errorf("GROUP BY %s: groups sum to %d but the collection holds %d records", attr, total, c.Len())
 		}
 	}
-	// A string column has no numeric column to read, so it declines rather than answering wrongly.
-	if _, ok := c.GroupCountAll("Owner"); ok {
-		t.Error("GROUP BY Owner (a string) was served as a numeric histogram")
+	// A string column is served too, through the block dictionary; TestGroupCountStringColumn checks
+	// its partition against the row path.
+	if _, ok := c.GroupCountAll("Owner"); !ok {
+		t.Error("GROUP BY Owner (a string) declined over every record")
 	}
 }
