@@ -435,18 +435,19 @@ func (a *Archive) HotAttrNames() []string { return a.c.HotAttrNames() }
 // FUTURE writes, returning how many attributes were chosen. See Collection.RefreshHotSet
 // for the ranking.
 //
-// On an archive this applies to segments written from now on and to nothing already on
-// disk. That is safe without any rewrite because the hot header is per RECORD and
+// It takes effect immediately for records appended from now on, and changes nothing already
+// sealed. That is safe without any rewrite because the hot header is per RECORD and
 // self-describing -- each record states its own hot count and pairs -- so records written
-// under different hot sets coexist in one archive, a reader resolving an attribute that is
-// not in a given record's header simply misses and falls back to the entry scan.
+// under different hot sets coexist in one archive, and a reader resolving an attribute that
+// is not in a given record's header simply misses and falls back to the entry scan.
 //
-// It also means an archive, unlike a mutable table, never CONVERGES on the refreshed set:
-// a mutable table's population catches up because its ads are rewritten in place, and an
-// append-only one has nothing to rewrite short of Rewrite(), which re-encodes every record
-// in the history. The refreshed set therefore improves reads of data arriving from now on
-// and leaves older data exactly as fast as it was. That is the whole of what it offers, and
-// it is still worth having: an archive's reads are overwhelmingly of its newest data.
+// Older records are not stranded on the old set forever either, though they converge more
+// slowly than a mutable table's ads do. MergePass re-encodes the records it merges
+// (resealSegments), under the hot set in effect AT MERGE TIME -- so a cold run picks the
+// refreshed set up when it is next folded together. What that leaves behind is whatever the
+// merge policy never merges: the KeepRecent tail (which was written under a recent set
+// anyway) and any run the watermarks never select. Rewrite() is the way to force the rest,
+// at the cost of re-encoding the whole history.
 func (a *Archive) RefreshHotSet(sampleMax, topN int) int { return a.c.RefreshHotSet(sampleMax, topN) }
 
 // AddHotAttrs pins the named attributes into the hot set, merging them with the current

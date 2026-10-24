@@ -786,9 +786,10 @@ func (t *ArchiveTable) HotAttrs() []string { return t.a.HotAttrNames() }
 // RefreshHotSet recomputes the archive's hot set from accumulated query demand, installs it
 // for future writes, and persists it. Returns how many attributes the sample chose.
 //
-// The refreshed set governs records written from now on and nothing already sealed; see
-// collections.Archive.RefreshHotSet for why that needs no rewrite and why an archive never
-// converges on it the way a mutable table does.
+// The refreshed set governs records appended from now on and changes nothing already sealed.
+// Older records pick it up as the merge pass folds their segments together, which re-encodes
+// them under the hot set in effect at merge time; see collections.Archive.RefreshHotSet for
+// why none of that needs a rewrite, and what a merge never reaches.
 //
 // The configured HotAttrs are re-pinned afterwards: RefreshHotSet replaces the set outright,
 // and an attribute an operator asked to keep hot should not be dropped because a 4096-record

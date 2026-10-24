@@ -1669,8 +1669,9 @@ func respBad(reqID uint64) []byte { return resp(reqID, stBadReq) }
 // The work is deliberately narrow -- merge cold runs, rebuild indexes left stale by an
 // interrupted pass, and apply the demand-driven tuning that does not re-encode anything.
 // Retraining and rewriting are excluded: both re-encode the whole archive, which is not
-// something to do on a timer. That exclusion is also why the hot-set refresh here only
-// reaches future records: applying a new hot set to existing ones IS a rewrite.
+// something to do on a timer. The hot-set refresh is excluded from that reasoning because it
+// rewrites nothing: it changes what future records are written under, and the merge pass
+// above carries it to older records as it folds their segments together.
 func (s *Server) maintainArchives(opts db.MaintainOptions) {
 	if opts.ArchiveMergeDisabled {
 		return
@@ -1700,11 +1701,17 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 		if opts.ArchiveSchemaScanHotTopN > 0 {
 			a.BuildAndEnableSchemaScan(sampleMax, opts.ArchiveSchemaScanHotTopN)
 		}
-		// Re-rank the hot header from accumulated read demand, for records written from here
-		// on. This is the one archive pass that reads nothing back: the hot header is per
-		// record, so sealed segments keep -- and still read correctly under -- the set they
-		// were written with, and nothing is rebuilt. A sample and a pointer swap, which is
-		// why it runs on the shared HotTopN instead of a threshold of its own.
+		// Re-rank the hot header from accumulated read demand. This is the one archive pass
+		// that reads nothing back: the hot header is per record, so sealed segments keep --
+		// and still read correctly under -- the set they were written with, and nothing is
+		// rebuilt here. A sample and a pointer swap, which is why it runs on the shared
+		// HotTopN instead of a threshold of its own.
+		//
+		// It is placed after the merge deliberately. A merge re-encodes the records it folds
+		// together under the current hot set, so the ordering decides which set this pass's
+		// merged output carries: refreshing first would apply a set chosen from demand that
+		// the merge has not yet been measured against. Refreshing after means the NEXT pass's
+		// merge carries it, which is the conservative order.
 		if opts.HotTopN > 0 && !opts.ArchiveHotRefreshDisabled {
 			a.RefreshHotSet(sampleMax, opts.HotTopN)
 		}

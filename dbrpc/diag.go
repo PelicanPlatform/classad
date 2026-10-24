@@ -324,8 +324,9 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 //
 // The hot-set actions behave as they do on a mutable table except in reach: an archive's hot
 // header is written per record, so a changed set applies to records appended from now on and
-// leaves sealed segments on the set they were written with (rewrite re-encodes them, at the
-// cost of reading the whole history back).
+// leaves sealed segments on the set they were written with. Older records converge as the
+// merge pass folds their segments together (a merge re-encodes under the current set);
+// rewrite forces the rest, at the cost of reading the whole history back.
 //
 // schema.fit / schema.rebuild run the same shared implementations the mutable path uses, so the
 // two table types cannot drift apart in behaviour or output.
@@ -365,8 +366,9 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string, maintainOpts
 		// justifies when a threshold is configured, then reindex so the new indexes and each
 		// segment's per-value histogram and other selectivity stats are rebuilt.
 		//
-		// What it does NOT do is touch data already on disk. The refreshed hot set reaches
-		// records appended from here on; sealed segments keep theirs until a rewrite.
+		// What it does NOT do is re-encode data already on disk. The refreshed hot set reaches
+		// records appended from here on; sealed segments keep theirs until a merge folds them
+		// together or a rewrite forces it.
 		topN := hotTopN
 		if topN <= 0 {
 			topN = defaultAnalyzeHotTopN
@@ -397,13 +399,13 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string, maintainOpts
 			}
 		}
 		a.Reindex()
-		return fmt.Sprintf("analyzed: hot set = %d attribute(s) for future records%s (reindexed selectivity statistics)",
-			hot, tuned), nil
+		return fmt.Sprintf("analyzed: hot set = %d attribute(s), applied to new records (older ones "+
+			"as segments merge)%s (reindexed selectivity statistics)", hot, tuned), nil
 	case "hot.add":
 		if len(args) == 0 {
 			return "", fmt.Errorf("hot.add needs at least one attribute")
 		}
-		return "hot attributes (future records): " + join(a.AddHotAttrs(args...)), nil
+		return "hot attributes (new records; older ones as segments merge): " + join(a.AddHotAttrs(args...)), nil
 	case "hot.refresh":
 		if len(args) != 2 {
 			return "", fmt.Errorf("hot.refresh needs <sampleMax> <topN>")
@@ -413,8 +415,8 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string, maintainOpts
 		if e1 != nil || e2 != nil {
 			return "", fmt.Errorf("hot.refresh arguments must be integers")
 		}
-		return fmt.Sprintf("refreshed hot set: %d attribute(s), applied to records appended from now on "+
-			"(sealed segments keep the set they were written with)", a.RefreshHotSet(sampleMax, topN)), nil
+		return fmt.Sprintf("refreshed hot set: %d attribute(s), applied to records appended from now on; "+
+			"sealed segments keep theirs until a merge folds them together", a.RefreshHotSet(sampleMax, topN)), nil
 	case "rewrite":
 		return fmt.Sprintf("rewrote %d record(s) with the current hot set", a.Rewrite()), nil
 	case "codec.retrain":
