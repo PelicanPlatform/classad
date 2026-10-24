@@ -748,7 +748,7 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 	// Multi-field first: it subsumes the single-field case (one combined predicate) and additionally
 	// serves conjunctions across several columns, which used to fall off the cliff into a full row
 	// scan even though the shape is still `Attr OP literal`, just repeated.
-	if preds, ok := c.numPredsOnFields(q, st.schema); ok {
+	if preds, ok := c.numPredsCT(q, st.schema); ok {
 		names := make([]string, 0, len(preds))
 		for _, p := range preds {
 			if name, ok := c.schemaFieldName(p.fieldID); ok {

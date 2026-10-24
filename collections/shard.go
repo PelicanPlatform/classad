@@ -345,12 +345,12 @@ func (sh *shard) findCurrent(head loc, key []byte) (loc, bool) {
 // commit sequence seq. A prior current version of the key (if any) is marked
 // superseded at seq; the new record is prepended as the bucket head. Caller holds
 // the write lock.
-func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec, hdrFlags uint32) {
+func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec, hdrFlags uint32, ct bool) {
 	if sh.appendOnly {
 		// Append log: write a new record with no bucket-chain link and never supersede
 		// or index it. Records accumulate in commit order; there is no per-key current
 		// version or directory (Get/Delete-by-key are inert), and Scan/Query see them all.
-		if _, ok := sh.writeRecord(seq, noLoc, key, ad, codec, hdrFlags); ok {
+		if _, ok := sh.writeRecord(seq, noLoc, key, ad, codec, hdrFlags, ct); ok {
 			sh.count++
 		}
 		return
@@ -358,7 +358,7 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec, hdrFlags
 	head := sh.dirGet(h)
 	// Write the new record first: if segment allocation fails (persistent store,
 	// disk full), the key is left unchanged rather than superseded-with-no-successor.
-	newLoc, ok := sh.writeRecord(seq, head, key, ad, codec, hdrFlags)
+	newLoc, ok := sh.writeRecord(seq, head, key, ad, codec, hdrFlags, ct)
 	if !ok {
 		return // sh.writeErr is set; surfaced to the caller
 	}
@@ -429,7 +429,9 @@ func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied b
 // new segment is allocated when the active one is full, over-small for the
 // record, or was written with a different codec (a segment's records all share
 // one codec so reads can decode by segment).
-func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, hdrFlags uint32) (loc, bool) {
+//
+// ct reports that the ad names CurrentTime (Collection.namesCurrentTime), for the segment's proof.
+func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, hdrFlags uint32, ct bool) (loc, bool) {
 	rl := recordLen(len(key), len(ad))
 	if sh.act == nil || sh.act.codec != codec || sh.act.used+rl > len(sh.act.data) {
 		// The segment we're leaving is now sealed (an append log never rewrites it):
@@ -463,6 +465,7 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, 
 		sh.segs = append(sh.segs, seg)
 		sh.act = seg
 	}
+	sh.act.ctNoteWrite(ct)
 	off, _ := sh.act.appendFlagged(seq, next, key, ad, hdrFlags)
 	if sh.alloc != nil && (len(sh.dirty) == 0 || sh.dirty[len(sh.dirty)-1] != sh.act) {
 		sh.dirty = append(sh.dirty, sh.act) // track for msync (persistent)
@@ -776,6 +779,11 @@ type segWindow struct {
 	seg   *segment             // for reindex-on-demand and the per-segment index (idx)
 	zones map[uint32]zoneRange // sealed segment's zone map (nil ⇒ never prunable)
 	dmg   *damageSet           // the segment's damaged records, which every walk skips (nil: none)
+	// ctFree reports that no record visible through this window, nor anything its ad inherits,
+	// names CurrentTime, so a query's CurrentTime-folded form is exact here (ctproof.go). Captured
+	// under the shard lock with used, so a write that adds such a record is either beyond used or
+	// already reflected.
+	ctFree bool
 }
 
 // visible reports whether the record at o is visible at snapshot s0. A damaged record never is: its
@@ -829,12 +837,17 @@ func (sh *shard) snapshotAt(s0 uint64) []segWindow {
 // Caller holds the read lock.
 func (sh *shard) buildWindowsLocked(s0 uint64) []segWindow {
 	wins := make([]segWindow, 0, len(sh.segs))
+	// A delta's base and a child's parent live in other segments of the same shard, so outside an
+	// append-only, unchained shard a window is proven only with the whole shard (see ctproof.go).
+	perSeg := sh.ctPerSegment()
+	shardFree := perSeg || sh.ctShardProvenLocked()
 	for _, seg := range sh.segs {
 		if seg == nil || seg.used == 0 || !seg.visibleAt(s0) {
 			continue
 		}
 		seg.pin() // no-op for RAM segments
-		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg, zones: seg.zones, dmg: seg.damaged()})
+		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg, zones: seg.zones, dmg: seg.damaged(),
+			ctFree: shardFree && seg.ctProven(seg.used)})
 	}
 	return wins
 }

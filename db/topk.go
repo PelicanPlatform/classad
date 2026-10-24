@@ -10,6 +10,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 // topKMaxColumnar caps k for the columnar cutoff pass: beyond this "top k" is close to a full sort
@@ -48,11 +49,7 @@ func (t *ArchiveTable) topKRun(constraint string, attrs []string, orderAttr stri
 	if err != nil {
 		return nil, err
 	}
-	seq, err := t.QueryProject(c2, proj)
-	if err != nil {
-		return nil, err
-	}
-	return topKResult(seq, orderIdx, desc, k, added), nil
+	return topKResult(t.a.QueryProjectStats(c2, proj, nil), orderIdx, desc, k, added), nil
 }
 
 // TopK is ArchiveTable.TopK for a mutable table.
@@ -75,44 +72,46 @@ func (db *DB) topKRun(constraint string, attrs []string, orderAttr string, desc 
 	if err != nil {
 		return nil, err
 	}
-	seq, err := db.QueryProject(c2, proj)
-	if err != nil {
-		return nil, err
-	}
-	return topKResult(seq, orderIdx, desc, k, added), nil
+	return topKResult(db.c.QueryProject(c2, proj), orderIdx, desc, k, added), nil
 }
 
-// topKAugment returns the constraint the projection pass should use: the original with
+// topKAugment returns the query the projection pass should use: the original with
 // `orderAttr {>=|<=} cutoff` appended when a columnar cutoff scan (threshold) yields a usable one
 // (available, and more than k matching rows so the cutoff is the true k-th value). Otherwise it
 // returns the original unchanged -- the plain full-scan path -- so behavior is never worse than
 // before. A blank constraint is treated as `true`.
-func topKAugment(constraint, orderAttr string, desc bool, k int, threshold func(*vm.Query) (float64, int, bool)) (string, error) {
+//
+// The cutoff is appended to the compiled query (vm.Query.And) rather than to the text, so a
+// CurrentTime in the constraint means the same instant in both passes. Recompiling the text would
+// pin a later time, and a record that left the window in between would leave fewer than k rows
+// above a cutoff computed with it.
+func topKAugment(constraint, orderAttr string, desc bool, k int, threshold func(*vm.Query) (float64, int, bool)) (*vm.Query, error) {
 	base := constraint
 	if strings.TrimSpace(base) == "" {
 		base = "true"
 	}
-	if k <= 0 || k > topKMaxColumnar {
-		return base, nil
-	}
 	q, err := vm.Parse(base)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	if k <= 0 || k > topKMaxColumnar {
+		return q, nil
 	}
 	cut, seen, ok := threshold(q)
 	if !ok || seen <= k {
-		return base, nil // columnar cutoff unavailable, or <=k rows: nothing to narrow
+		return q, nil // columnar cutoff unavailable, or <=k rows: nothing to narrow
 	}
 	op := ">="
 	if !desc {
 		op = "<="
 	}
-	return "(" + base + ") && (" + orderAttr + " " + op + " " + fmtNum(cut) + ")", nil
+	bound, err := parser.ParseExpr(orderAttr + " " + op + " " + fmtNum(cut))
+	if err != nil {
+		return nil, err
+	}
+	return q.And(bound), nil
 }
 
-// fmtNum renders a cutoff value as a ClassAd numeric literal: an integer when the value is integral
-// (the common case -- ClusterId, QDate), else a round-tripping real. The literal is compared against
-// the order column, so it must parse back to exactly this value.
 func fmtNum(v float64) string {
 	if v == math.Trunc(v) && v >= -9.007199254740992e15 && v <= 9.007199254740992e15 {
 		return strconv.FormatInt(int64(v), 10)
