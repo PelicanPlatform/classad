@@ -59,6 +59,20 @@ type ArchiveConfig struct {
 	// from a restart indistinguishable from one someone asked for -- exempt from trimming
 	// and from any future auto-drop, permanently, on the strength of nothing.
 	AutoAttrs []string
+	// AutoHotAttrs names the hot attributes the demand-driven refresh (RefreshHotSet)
+	// installed on top of HotAttrs, and is the hot-set counterpart of AutoAttrs: on reopen
+	// the live set is HotAttrs plus these.
+	//
+	// It is a separate field rather than an update of HotAttrs because this file is
+	// authoritative on reopen, so folding a sampled set back into HotAttrs would make the
+	// tuner's guess indistinguishable from what an operator asked for -- and would quietly
+	// discard the operator's list the first time a sample disagreed with it. HotAttrs stays
+	// whatever a human configured; this records what the samples added.
+	//
+	// Without persisting it at all, a refreshed set would reset to the creation-time
+	// HotAttrs on every restart, and the hot headers of the segments written since would be
+	// the only trace that it ever ran.
+	AutoHotAttrs []string
 	// IndexBackfillBytes bounds how far back an index configuration change is carried: only
 	// segments within the newest N bytes have their existing index rebuilt, older ones keep
 	// the one they have (see collections.Options.IndexBackfillBytes).
@@ -159,6 +173,12 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 	// provenance.
 	if len(cfg.AutoAttrs) > 0 {
 		a.MarkAutoIndexes(cfg.AutoAttrs)
+	}
+	// Restore the demand-refreshed hot attributes on top of the human-configured ones, so a
+	// refresh does not silently reset to the creation-time set on every restart. Merged, not
+	// installed over: HotAttrs is what someone asked for and stays hot.
+	if len(cfg.AutoHotAttrs) > 0 {
+		a.AddHotAttrs(cfg.AutoHotAttrs...)
 	}
 	if create {
 		// Persist the config so a later reopen rebuilds the same indexes/retention.
@@ -774,6 +794,76 @@ func (t *ArchiveTable) ZoneAttrs() []string { return t.a.ZoneAttrs() }
 
 // HotAttrs reports the archive's hot-header attributes, matching DB.HotAttrs for a mutable table.
 func (t *ArchiveTable) HotAttrs() []string { return t.a.HotAttrNames() }
+
+// RefreshHotSet recomputes the archive's hot set from accumulated query demand, installs it
+// for future writes, and persists it. Returns how many attributes the sample chose.
+//
+// The refreshed set governs records appended from now on and changes nothing already sealed.
+// Older records pick it up as the merge pass folds their segments together, which re-encodes
+// them under the hot set in effect at merge time; see collections.Archive.RefreshHotSet for
+// why none of that needs a rewrite, and what a merge never reaches.
+//
+// The configured HotAttrs are re-pinned afterwards: RefreshHotSet replaces the set outright,
+// and an attribute an operator asked to keep hot should not be dropped because a 4096-record
+// sample happened not to read it.
+func (t *ArchiveTable) RefreshHotSet(sampleMax, topN int) int {
+	n := t.a.RefreshHotSet(sampleMax, topN)
+	if n == 0 {
+		return 0
+	}
+	if len(t.cfg.HotAttrs) > 0 {
+		t.a.AddHotAttrs(t.cfg.HotAttrs...)
+	}
+	t.saveHotConfig()
+	return n
+}
+
+// AddHotAttrs pins the named attributes into the archive's hot set for future writes and
+// persists them as human-configured, returning the resulting hot attributes.
+func (t *ArchiveTable) AddHotAttrs(names ...string) []string {
+	hot := t.a.AddHotAttrs(names...)
+	// A named add is someone asking, so it joins HotAttrs rather than the auto set -- which
+	// keeps it from being attributed to, or recomputed away by, a later refresh.
+	t.cfg.HotAttrs = mergeNames(t.cfg.HotAttrs, names)
+	t.saveHotConfig()
+	return hot
+}
+
+// saveHotConfig folds the live hot set back into the saved config, split by provenance:
+// HotAttrs keeps whatever was configured or explicitly added, AutoHotAttrs records what the
+// demand-driven refresh put on top. Best-effort, like saveIndexConfig: a write failure
+// leaves the change live for this run but unpersisted.
+func (t *ArchiveTable) saveHotConfig() {
+	human := make(map[string]bool, len(t.cfg.HotAttrs))
+	for _, n := range t.cfg.HotAttrs {
+		human[strings.ToLower(n)] = true
+	}
+	var auto []string
+	for _, n := range t.a.HotAttrNames() {
+		if !human[strings.ToLower(n)] {
+			auto = append(auto, n)
+		}
+	}
+	sort.Strings(auto)
+	t.cfg.AutoHotAttrs = auto
+	_ = t.saveConfig()
+}
+
+// mergeNames appends to base the names of add it does not already hold (case-insensitively),
+// preserving base's order and each new name's spelling.
+func mergeNames(base, add []string) []string {
+	have := make(map[string]bool, len(base))
+	for _, n := range base {
+		have[strings.ToLower(n)] = true
+	}
+	for _, n := range add {
+		if f := strings.ToLower(n); !have[f] {
+			have[f] = true
+			base = append(base, n)
+		}
+	}
+	return base
+}
 
 // EncryptionEnabled reports whether this archive's values are sealed. See
 // collections.Archive.EncryptionEnabled: today this is false for every archive, because the archive
