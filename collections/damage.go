@@ -44,6 +44,7 @@ type damageSpan struct{ start, end uint32 }
 // damageSet is a segment's damaged spans, sorted by start and disjoint. Immutable once published.
 type damageSet struct {
 	spans []damageSpan
+	end   uint32 // the last span's end: no offset at or past it is damaged
 }
 
 // newDamageSet returns spans as a set, or nil when there are none. spans must be disjoint.
@@ -53,7 +54,7 @@ func newDamageSet(spans []damageSpan) *damageSet {
 	}
 	s := append([]damageSpan(nil), spans...)
 	sort.Slice(s, func(i, j int) bool { return s[i].start < s[j].start })
-	return &damageSet{spans: s}
+	return &damageSet{spans: s, end: s[len(s)-1].end}
 }
 
 // skip reports whether o lies in a damaged span and, if so, the offset the walk resumes at. Nil-safe:
@@ -72,6 +73,22 @@ func (d *damageSet) covers(o uint32) bool {
 	}
 	_, ok := d.find(o)
 	return ok
+}
+
+// holds is covers for segWindow.visible, which runs once per row of a columnar scan and must stay
+// within the inliner's budget: covers' binary search is a call, which alone costs more than the budget
+// leaves. d must be non-nil. An offset at or past the last span costs one comparison and one before
+// the first span two; only an offset between them walks the spans that end before it.
+func (d *damageSet) holds(o uint32) bool {
+	if o >= d.end {
+		return false
+	}
+	for _, s := range d.spans {
+		if o < s.end {
+			return o >= s.start
+		}
+	}
+	return false
 }
 
 func (d *damageSet) find(o uint32) (uint32, bool) {
@@ -150,7 +167,7 @@ func decodeDamage(b []byte) (*damageSet, bool) {
 		spans[i] = s
 		prev = s.end
 	}
-	return &damageSet{spans: spans}, true
+	return &damageSet{spans: spans, end: prev}, true
 }
 
 // damageFits checks a persisted damage set against the segment it came with, in O(spans): every span

@@ -780,8 +780,11 @@ type segWindow struct {
 
 // visible reports whether the record at o is visible at snapshot s0. A damaged record never is: its
 // seq and supersededBySeq are not to be believed.
+//
+// It runs once per row of every columnar count and aggregate, so it must stay inlinable (see
+// TestSegWindowVisibleInlinable): out of line, the call and the copy of w cost those scans 10-37%.
 func (w segWindow) visible(o uint32, s0 uint64) bool {
-	if w.dmg != nil && w.dmg.covers(o) {
+	if w.dmg != nil && w.dmg.holds(o) {
 		return false
 	}
 	return recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0

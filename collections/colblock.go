@@ -293,10 +293,17 @@ type columnarBlock struct {
 // if any record in the block has this field ESCAPED (missing, wrong type, or too wide) its value is
 // not represented here and the range cannot rule the block out. A too-wide value in particular is by
 // definition outside the column's range, so pruning on an inexact zone would drop records that match.
+//
+// Min and Max are spelled out rather than embedding zoneRange: zoneRange's Full flag means nothing
+// for a block, and its padding would grow every blockZoneEntry from 32 to 40 bytes -- one per numeric
+// field per block, the bulk of a columnar store's zone heap. TestBlockZoneEntrySize pins the size.
 type blockZone struct {
-	zoneRange
-	escaped bool
+	Min, Max float64
+	escaped  bool
 }
+
+// span is the block's range as a zoneRange, for the predicates shared with segment zone maps.
+func (z blockZone) span() zoneRange { return zoneRange{Min: z.Min, Max: z.Max} }
 
 // blockZoneEntry is one numeric field's zone in a block's zone slice, which is sorted by idx so a
 // lookup binary-searches (see zone) instead of hashing -- the slice replaced a per-block map whose
@@ -686,7 +693,7 @@ func numericZones(s *adSchema, b *columnarBlock, recs [][]byte) []blockZoneEntry
 	out := make([]blockZoneEntry, 0, len(b.hotFields())+len(b.coldFields()))
 	for _, idx := range append(append([]int(nil), b.hotFields()...), b.coldFields()...) {
 		f := s.fields[idx]
-		z := blockZone{zoneRange: zoneRange{Min: math.Inf(1), Max: math.Inf(-1)}}
+		z := blockZone{Min: math.Inf(1), Max: math.Inf(-1)}
 		n := 0
 		for _, r := range recs {
 			if testBit(r[:s.escBytes], idx) {
@@ -724,7 +731,7 @@ func (b *columnarBlock) mayMatch(idx int, tests []zoneTest) bool {
 		return true
 	}
 	for _, t := range tests {
-		if !zoneMayMatch(z.zoneRange, t.op, t.vals) {
+		if !zoneMayMatch(z.span(), t.op, t.vals) {
 			return false
 		}
 	}
