@@ -212,3 +212,55 @@ func TestCurrentTimeTargetPinnedNotFolded(t *testing.T) {
 		}
 	}
 }
+
+// TestCurrentTimeFolded: the folded form shares the pinned time, is fully constant-folded (so its
+// probes are exact `attr OP literal`), and evaluates as the original on every ad that does not
+// define CurrentTime. A query with no magic reference, or one whose reference the fold cannot reach
+// (inside a list literal), has none.
+func TestCurrentTimeFolded(t *testing.T) {
+	q, err := Parse(`CompletionDate > CurrentTime - 3600 && JobStatus == 4`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qf := q.Folded()
+	if qf == nil || qf != q.Folded() {
+		t.Fatal("Folded is nil or not cached")
+	}
+	if qf.ReadsCurrentTime() || qf.Folded() != nil {
+		t.Error("the folded form still reads CurrentTime")
+	}
+	probes, exact := qf.ExactProbes()
+	if !exact || len(probes) != 2 {
+		t.Fatalf("folded probes = %v exact=%v, want two exact probes", probes, exact)
+	}
+	now := q.prog.now
+	if v, _ := probes[0].Vals[0].IntValue(); probes[0].Attr != "CompletionDate" || v != now-3600 {
+		t.Errorf("probe %+v, want CompletionDate > %d", probes[0], now-3600)
+	}
+	for _, src := range []string{
+		`[CompletionDate = ` + itoa(now-10) + `; JobStatus = 4]`,
+		`[CompletionDate = ` + itoa(now-3600) + `; JobStatus = 4]`,
+		`[CompletionDate = ` + itoa(now-7200) + `; JobStatus = 4]`,
+		`[JobStatus = 4]`,
+		`[CompletionDate = "x"; JobStatus = 4]`,
+	} {
+		ad, err := classad.Parse(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if a, b := q.Eval(ad), qf.Eval(ad); a.String() != b.String() {
+			t.Errorf("%s: original %v, folded %v", src, a, b)
+		}
+	}
+	// TARGET.CurrentTime survives the fold and keeps the pinned time.
+	q2, _ := Parse(`CurrentTime > 0 && TARGET.CurrentTime > 0`)
+	if f := q2.Folded(); f == nil || f.prog.now != q2.prog.now {
+		t.Error("TARGET.CurrentTime lost the pinned time in the folded form")
+	}
+	for _, src := range []string{`JobStatus == 4`, `TARGET.CurrentTime > 0`, `member(CurrentTime, {CurrentTime})`} {
+		q, _ := Parse(src)
+		if q.Folded() != nil {
+			t.Errorf("%s: unexpected folded form", src)
+		}
+	}
+}

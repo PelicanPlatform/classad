@@ -378,6 +378,9 @@ type Collection struct {
 	// maintStop is set by StopMaintenance to ask an in-flight maintenance pass to stop at
 	// its next safe boundary, so closing does not wait out a whole bounded pass.
 	maintStop atomic.Bool
+	// ctQueried is set once this process has run a query reading CurrentTime, from which point
+	// Reindex proves the segments Open loaded without a CurrentTime proof (ctproof.go).
+	ctQueried atomic.Bool
 	// openIdxDiag accumulates, during Open's loadShard passes, how each sealed segment's
 	// persisted index sidecar was handled (adopted vs. to-be-rebuilt). Emitted once at the end
 	// of Open via OpenIndexDiagHook. Written only on the single-threaded Open path.
@@ -928,10 +931,11 @@ func (c *Collection) Update(batch []AdUpdate) error {
 	codec := c.currentCodec()
 	byShard := make(map[int][]pendingPut, len(c.shards))
 	for i := range batch {
-		stored := codec.Compress(nil, c.encodeAd(batch[i].Ad.AST()))
+		raw := c.encodeAd(batch[i].Ad.AST())
+		stored := codec.Compress(nil, raw)
 		h := c.h.Hash(batch[i].Key)
 		si := c.shardOf(batch[i].Key, h)
-		byShard[si] = append(byShard[si], pendingPut{hash: h, key: batch[i].Key, ad: stored, codec: codec})
+		byShard[si] = append(byShard[si], pendingPut{hash: h, key: batch[i].Key, ad: stored, codec: codec, ct: c.namesCurrentTime(raw)})
 	}
 	for si, writes := range byShard {
 		c.shards[si].commit(writes)
@@ -969,9 +973,10 @@ func (c *Collection) hasSegmentIndexes() bool { return c.spec.Load().any() }
 
 func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
 	codec := c.currentCodec()
-	stored := codec.Compress(nil, c.encodeAd(ad.AST()))
+	raw := c.encodeAd(ad.AST())
+	stored := codec.Compress(nil, raw)
 	h := c.h.Hash(key)
-	c.shards[c.shardOf(key, h)].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec})
+	c.shards[c.shardOf(key, h)].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec, ct: c.namesCurrentTime(raw)})
 	// A write through this path can roll a segment, and the sealed segment needs a key index.
 	// Only Txn.Commit used to build one, so on a store written through Put every sealed segment
 	// stayed unindexed until a reindex pass, and each later insert of a new key walked every
@@ -1272,9 +1277,12 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 func (c *Collection) zoneWalk(wins []segWindow, qp queryPlan) []segWindow {
 	walk := wins
 	if len(qp.probes) > 0 && c.hasZones.Load() {
+		// Probes that fold CurrentTime describe only records without it: they prune a proven window
+		// and no other.
+		ct := qp.prunesCT()
 		walk = make([]segWindow, 0, len(wins))
 		for _, w := range wins {
-			if w.zones != nil && zonePrune(w.zones, qp.probes, c.intern) {
+			if w.zones != nil && (!ct || w.ctFree) && zonePrune(w.zones, qp.probes, c.intern) {
 				continue
 			}
 			walk = append(walk, w)
@@ -1295,6 +1303,10 @@ func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit f
 	// would otherwise be reassembled in full and then thrown away. nil when the columns cannot
 	// usefully decide this query, which leaves the scan exactly as it was.
 	pre := c.newColPrefilter(qp.q)
+	var preFold *colPrefilter
+	if qp.fold != nil {
+		preFold = c.newColPrefilter(qp.fold.q)
+	}
 	// A projected read can be built from the named columns instead of reassembling the record and then
 	// discarding most of it -- but only when the match did not need the ad. See colproject.go.
 	var (
@@ -1306,18 +1318,26 @@ func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit f
 			projCS = &colScope{bc: st.cache, c: c}
 		}
 	}
-	constQuery := qp.q == nil || (qp.plan.PartialSafe && len(qp.plan.Seeds) == 0)
+	// A query that reads no attribute has the same answer for every record. Only a TRUE one lets a record
+	// skip the match; a constant false or undefined must still reject it.
+	constQuery := qp.q == nil || constTrue(&qp)
+	constFold := qp.fold != nil && constTrue(qp.fold)
 	visit = func(r recRef) bool {
 		if isSystemKeyBytes(r.key()) {
 			return true // internal system record: hidden from client scans/queries
 		}
 		qp.stats.visit()
+		// The CurrentTime-folded form where the window is proven free of CurrentTime (ctproof.go).
+		cur, prefilter, isConst := &qp, pre, constQuery
+		if qp.fold != nil && r.w.ctFree {
+			cur, prefilter, isConst = qp.fold, preFold, constFold
+		}
 		dict := r.dict
 		cn := r.w.seg.colNative.Load()
 		colDecided := false
-		if pre != nil && cn != nil {
+		if prefilter != nil && cn != nil {
 			if k, ok := cn.indexOf(r.off); ok {
-				matches, decided := pre.test(cn, k)
+				matches, decided := prefilter.test(cn, k)
 				if decided {
 					qp.stats.columnDecided()
 					if !matches {
@@ -1331,7 +1351,7 @@ func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit f
 		// reads no attribute (so it is constant and the ad cannot change its answer) or the match was
 		// just decided FROM the columns. Anything less certain reassembles, because a narrowed ad
 		// cannot be handed to the matcher -- its seed set is not closed.
-		if projCS != nil && cn != nil && (constQuery || colDecided) {
+		if projCS != nil && cn != nil && (isConst || colDecided) {
 			if k, ok := cn.indexOf(r.off); ok {
 				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &projScratch); ok {
 					qp.stats.matched() // projected straight from columns; no reassembly
@@ -1362,7 +1382,7 @@ func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit f
 		if qp.ws != nil {
 			qp.ws.dict = dict
 		}
-		if qp.q != nil && !matchWire(w, qp) {
+		if cur.q != nil && !matchWire(w, *cur) {
 			return true
 		}
 		qp.stats.matched()

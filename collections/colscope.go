@@ -514,21 +514,21 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 	if st == nil || c.intern == nil || q == nil || !q.Native() {
 		return 0, false
 	}
-	m := q.Matcher()
+	sides := c.newEvalSides(q)
 	cs := &colScope{bc: st.cache, c: c}
 	resolver := cs.resolve // hoisted: a method value expression allocates
-	fallbackM := q.Matcher()
 	count := 0
-	var plan prunePlan
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			sd := sides.at(w)
+			m, fallbackM := sd.m, sd.rm
 			seg := w.seg.colblk.Load()
 			if seg == nil || seg.schema() == nil {
 				count += c.rowEvalWindow(w, s0, fallbackM)
 				continue
 			}
-			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
+			pruneIdxs, prunePreds := sd.tests(c, seg.schema())
 			base := 0
 			for bi, blk := range seg.blocks {
 				if len(prunePreds) > 0 && !blockMayMatch(blk, pruneIdxs, prunePreds) {
@@ -550,7 +550,7 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 // so the vectorized scan can fall back to it for a single block it cannot serve, rather than abandoning
 // the whole query.
 func (c *Collection) countBlockScoped(cs *colScope, resolver func(name string, scope ast.AttributeScope) classad.Value,
-	m, fallbackM *vm.Matcher, w segWindow, seg *colSegment, blk *columnarBlock, base int, s0 uint64) int {
+	m *vm.Matcher, fallbackM *rowMatch, w segWindow, seg *colSegment, blk *columnarBlock, base int, s0 uint64) int {
 	count := 0
 	for k := 0; k < blk.n; k++ {
 		gk := base + k
@@ -577,22 +577,45 @@ func (c *Collection) countBlockScoped(cs *colScope, resolver func(name string, s
 	return count
 }
 
-// evalOneRecord decodes a single arena record and evaluates the query against it the ordinary way.
-func (c *Collection) evalOneRecord(w segWindow, off uint32, m *vm.Matcher) bool {
-	ww, err := c.wire(recRef{w: w, off: off, dict: w.dict()}, nil)
+// rowMatch evaluates a query against single arena records the way the row scan does (matchWire): the
+// record's wire bytes, reassembled for a columnarized segment, evaluated wire-natively where the query
+// allows and by partial or full decode where it does not. It is the per-record fallback of the column
+// scans. It used to decode every record into a ClassAd and tree-walk it, which cost about twice the row
+// scan the fallback stands in for.
+//
+// Not safe for concurrent use: it reuses its buffer and wireScope.
+type rowMatch struct {
+	c   *Collection
+	qp  queryPlan
+	buf []byte
+}
+
+func (c *Collection) newRowMatch(q *vm.Query) *rowMatch {
+	return &rowMatch{c: c, qp: c.newQueryPlan(q, nil, nil)}
+}
+
+// match reports whether the record at off matches, and returns its wire bytes (valid until the next
+// call) for a caller that reads more from it. A record that cannot be read does not match.
+func (r *rowMatch) match(w segWindow, off uint32) ([]byte, bool) {
+	d := w.dict()
+	ww, err := r.c.wire(recRef{w: w, off: off, dict: d}, r.buf)
 	if err != nil {
-		return false
+		return nil, false
 	}
-	node, err := c.decodeWireDict(w.dict(), ww)
-	if err != nil {
-		return false
-	}
-	return m.Matches(classad.FromAST(node))
+	r.buf = ww
+	r.qp.ws.dict = d
+	return ww, matchWire(ww, r.qp)
+}
+
+// evalOneRecord evaluates the query against a single arena record (see rowMatch).
+func (c *Collection) evalOneRecord(w segWindow, off uint32, rm *rowMatch) bool {
+	_, ok := rm.match(w, off)
+	return ok
 }
 
 // rowEvalWindow counts matches in a window with no columnar block (the active segment, or one the
 // accelerator has not reached) by evaluating each visible record the ordinary way.
-func (c *Collection) rowEvalWindow(w segWindow, s0 uint64, m *vm.Matcher) int {
+func (c *Collection) rowEvalWindow(w segWindow, s0 uint64, m *rowMatch) int {
 	count := 0
 	for off := 0; off < w.used; {
 		o := uint32(off)

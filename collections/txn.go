@@ -211,6 +211,8 @@ type txnWrite struct {
 	ad    []byte // compressed bytes (nil for a delete)
 	codec Codec
 	del   bool
+	// ct reports that ad names CurrentTime (see Collection.namesCurrentTime).
+	ct bool
 	// delta records that ad holds only what this write CHANGED, so the record's header can say
 	// so and readers can tell without decompressing it (see segment.deltaFlag).
 	delta bool
@@ -276,7 +278,7 @@ func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 			}
 			continue
 		}
-		sh.put(w.hash, w.key, w.ad, seq, w.codec, w.hdrFlags())
+		sh.put(w.hash, w.key, w.ad, seq, w.codec, w.hdrFlags(), w.ct)
 		changed = true
 	}
 	if changed {
@@ -739,6 +741,7 @@ func (tx *Txn) Commit() CommitResult {
 				raw, w.delta = tx.c.encodeDelta(encScratch[:0], b.key, h, b.ad, b.changed, b.noDelta)
 				encScratch = raw
 			}
+			w.ct = tx.c.namesCurrentTime(raw)
 			w.ad = w.codec.Compress(nil, raw)
 		}
 		byShard[idx] = append(byShard[idx], w)

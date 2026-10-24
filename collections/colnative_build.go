@@ -327,7 +327,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// where lookupSealed missed a record a scan could still see (put/del could not supersede it -> a
 	// duplicate live version, and DeleteWhere never converged). dst is not yet visible, so storing it now
 	// is safe; the publish/evict under the swap lock is what makes it authoritative.
-	ki, kerr := parseKeyIndex(buildKeyIndex(dst.data, dst.used, c.h, dst.damaged()))
+	ki, kerr := parseKeyIndex(c.segKeyIndex(dst))
 	if perr != nil || !dst.columnarized() || kerr != nil {
 		dst.retire()
 		dst.reapAndHook()
@@ -645,7 +645,7 @@ func (c *Collection) persistColumnarizedSidecar(sh *shard, dst *segment) {
 			}
 		}
 	}
-	container := buildSegmentSidecar(attrBlob, buildKeyIndex(dst.data, dst.used, c.h, dst.damaged()),
+	container := buildSegmentSidecar(attrBlob, c.segKeyIndex(dst),
 		c.colBlobForSeg(dst), buildZoneBlob(dst.zones, c.intern.Name), dst.used, dst.dictRecOff(), encodeDamage(dst.damaged()))
 	c.installSidecar(sh, dst, path, container)
 }

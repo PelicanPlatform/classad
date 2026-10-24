@@ -37,6 +37,10 @@ type queryPlan struct {
 	// stats, when non-nil, accumulates per-scan work counts for EXPLAIN ANALYZE. nil on the
 	// normal path (no overhead beyond nil checks).
 	stats *ScanStats
+	// fold is this plan for the query's CurrentTime-folded form (vm.Query.Folded), evaluated in
+	// windows proven free of CurrentTime (segWindow.ctFree); nil when the query has none. It shares
+	// the plan's wireScope, projection and stats. See at.
+	fold *queryPlan
 }
 
 // newQueryPlan builds the scan plan for q: the reusable match state, the projection
@@ -50,7 +54,7 @@ type queryPlan struct {
 func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats) queryPlan {
 	plan := q.ReadPlan()
 	ws := &wireScope{ctx: c}
-	return queryPlan{
+	qp := queryPlan{
 		q:        q,
 		plan:     plan,
 		m:        q.Matcher(), // reused across ads; the iterator runs single-threaded
@@ -61,6 +65,32 @@ func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats)
 		probes:   q.Probes(),
 		stats:    stats,
 	}
+	if qf := c.foldFor(q); qf != nil {
+		f := qp
+		fplan := qf.ReadPlan()
+		f.q, f.plan, f.m, f.wireOK = qf, fplan, qf.Matcher(), qf.Native() && fplan.PartialSafe
+		qp.fold = &f
+	}
+	return qp
+}
+
+// at returns the plan to evaluate in window w: the folded form's where w is proven free of
+// CurrentTime, qp's own everywhere else.
+func (qp *queryPlan) at(w segWindow) *queryPlan {
+	if qp.fold != nil && w.ctFree {
+		return qp.fold
+	}
+	return qp
+}
+
+// prunesCT reports whether qp's probes were computed with CurrentTime folded to the pinned time
+// (vm.Query.ReadsCurrentTime), so they may prune only a window proven free of CurrentTime.
+func (qp *queryPlan) prunesCT() bool { return qp.q != nil && qp.q.ReadsCurrentTime() }
+
+// constTrue reports whether qp's query reads no attribute and is TRUE, so no record can change its
+// answer.
+func constTrue(qp *queryPlan) bool {
+	return qp.plan.PartialSafe && len(qp.plan.Seeds) == 0 && qp.q.Matches(classad.New())
 }
 
 // workerPlan clones qp with fresh per-goroutine execution state (a Matcher, a
@@ -75,6 +105,11 @@ func (c *Collection) workerPlan(qp queryPlan) queryPlan {
 	qp.ws = ws
 	qp.resolver = ws.resolve
 	qp.stats = nil
+	if qp.fold != nil {
+		f := *qp.fold
+		f.m, f.ws, f.resolver, f.stats = f.q.Matcher(), ws, ws.resolve, nil
+		qp.fold = &f
+	}
 	return qp
 }
 

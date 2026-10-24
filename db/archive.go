@@ -364,9 +364,16 @@ func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCo
 		stats.SetTier(collections.TierMatchNone)
 		return AggregateValues(func(func([]classad.Value) bool) {}, attrs, groupCols, aggs, groupCol, aggCol, nil)
 	}
-	if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
-		stats.SetTier(collections.TierIndex)
-		return rows, nil
+	// The index answers an unconstrained count from postings, which nothing beats. A constrained
+	// grouped count it answers from zone verdicts, reading every straddling segment's records one at a
+	// time, so there the columns go first: on a 400k-record archive the columnar GROUP BY took 4 ms
+	// for a day's window where the zone verdicts took 51 ms (42 ms against 117 ms for 30 days).
+	matchAll := IsMatchAll(constraint)
+	if matchAll {
+		if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
+			stats.SetTier(collections.TierIndex)
+			return rows, nil
+		}
 	}
 	// A CONSTRAINED COUNT(*) with no grouping: read the predicated columns out of the columnar
 	// blocks instead of scanning records. aggregateFromIndex above only answers the UNCONSTRAINED
@@ -389,6 +396,12 @@ func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCo
 	if rows, ok := t.groupedFromColumns(constraint, groupCols, aggs); ok {
 		stats.SetTier(collections.TierColumnar)
 		return rows, nil
+	}
+	if !matchAll {
+		if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
+			stats.SetTier(collections.TierIndex)
+			return rows, nil
+		}
 	}
 	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
 	// per-segment columnar blocks instead of decoding every record. Declines (and falls through

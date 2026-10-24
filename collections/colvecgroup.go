@@ -38,8 +38,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 		return nil, false
 	}
 	acc := newGroupAccum(bucket)
-	m := q.Matcher()
-	fallbackM := q.Matcher()
+	sides := c.newEvalSides(q)
 	cs := &colScope{bc: st.cache, c: c}
 	resolver := cs.resolve
 	src := &blockVecSource{c: c, bc: st.cache}
@@ -55,7 +54,6 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 	}
 
 	var live []uint64
-	var plan prunePlan
 	var split vecSplit
 	defer func() { lastGroupSplit.Store(&split) }()
 	var gsc groupColScratch
@@ -63,6 +61,9 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			// The CurrentTime-folded form where the window is proven free of CurrentTime.
+			sd := sides.at(w)
+			q, m, fallbackM := sd.q, sd.m, sd.rm
 			seg := w.seg.colblk.Load()
 			groupIdx, aggIdxs, ok := 0, []int(nil), false
 			if seg != nil && seg.schema() != nil {
@@ -78,8 +79,8 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 				}
 				continue
 			}
-			pruneIdxs, prunePreds := plan.tests(c, q, seg.schema())
-			strEq := plan.stringEq(c, q, seg.schema())
+			pruneIdxs, prunePreds := sd.tests(c, seg.schema())
+			strEq := sd.stringEq(c, seg.schema())
 			base := 0
 			for bi, blk := range seg.blocks {
 				// Pruning is sound for grouping: a block no matching record falls in contributes no
@@ -206,7 +207,7 @@ func addGroupFromColumns(k int, col *groupCol, aggCols []numCol, bc *blockCache,
 // with the per-record resolver, for a block the vector executor declined or one too heavily superseded to
 // be worth vectorizing.
 func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, scope ast.AttributeScope) classad.Value,
-	m, fallbackM *vm.Matcher, w segWindow, seg *colSegment, blk *columnarBlock, base int, s0 uint64,
+	m *vm.Matcher, fallbackM *rowMatch, w segWindow, seg *colSegment, blk *columnarBlock, base int, s0 uint64,
 	col *groupCol, aggCols []numCol, bc *blockCache, acc *groupAccum) bool {
 	for k := 0; k < blk.n; k++ {
 		gk := base + k
@@ -239,7 +240,7 @@ func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, s
 // rowGroupWindow is rowEvalWindow accumulating groups: for a window with no columnar block (the active
 // segment, or one the accelerator has not reached) or one whose schema lacks a column involved, evaluate
 // each visible record the ordinary way and read the group and aggregate values from the record itself.
-func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *vm.Matcher,
+func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
 	groupLookup func(a wire.Ad) ([]byte, bool), aggLookups []func(a wire.Ad) ([]byte, bool),
 	acc *groupAccum) bool {
 	for off := 0; off < w.used; {
@@ -252,15 +253,14 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *vm.Matcher,
 		if total == 0 {
 			break
 		}
-		if !recIsMarker(w.data, o) && w.visible(o, s0) &&
-			c.evalOneRecord(w, o, m) {
+		if recIsMarker(w.data, o) || !w.visible(o, s0) {
+			off += int(total)
+			continue
+		}
+		if ww, matched := m.match(w, o); matched {
 			// Matched, so this record forms a group: read its values from the wire form, the same
 			// lookups the predicate-analysis path's row fallback uses, so group identity does not
 			// depend on which tier answered.
-			ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, nil)
-			if err != nil {
-				return false
-			}
 			if !addGroupFromAd(wire.Ad(ww), groupLookup, aggLookups, acc) {
 				return false
 			}

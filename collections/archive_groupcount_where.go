@@ -45,6 +45,11 @@ func parseConjunctiveRanges(constraint string) ([]rangeCond, bool) {
 	if err != nil {
 		return nil, false
 	}
+	return conjunctiveRanges(q.Expr())
+}
+
+// conjunctiveRanges is parseConjunctiveRanges over a parsed expression.
+func conjunctiveRanges(e ast.Expr) ([]rangeCond, bool) {
 	var out []rangeCond
 	var walk func(e ast.Expr) bool
 	walk = func(e ast.Expr) bool {
@@ -65,7 +70,7 @@ func parseConjunctiveRanges(constraint string) ([]rangeCond, bool) {
 			return false
 		}
 	}
-	if !walk(q.Expr()) || len(out) == 0 {
+	if !walk(e) || len(out) == 0 {
 		return nil, false
 	}
 	return out, true
@@ -204,9 +209,24 @@ func (a *Archive) CategoricalGroupCountsWhere(attr, constraint string) (map[stri
 }
 
 func (c *Collection) categoricalGroupCountsWhere(attr, constraint string) (map[string]int64, bool) {
-	conds, ok := parseConjunctiveRanges(constraint)
-	if !ok {
+	q, err := vm.Parse(constraint)
+	if err != nil {
 		return nil, false
+	}
+	conds, ok := conjunctiveRanges(q.Expr())
+	// A constraint reading CurrentTime is read in its folded form, which is the constraint itself
+	// for records without CurrentTime: so only when every segment is proven free of it, and every
+	// window read below must be (ct).
+	ct := false
+	if !ok {
+		qf := c.foldFor(q)
+		if qf == nil || !c.ctAllProven() {
+			return nil, false
+		}
+		if conds, ok = conjunctiveRanges(qf.Expr()); !ok {
+			return nil, false
+		}
+		ct = true
 	}
 	spec := c.spec.Load()
 	id, ok := c.categoricalAttrID(spec, attr)
@@ -233,6 +253,9 @@ func (c *Collection) categoricalGroupCountsWhere(attr, constraint string) (map[s
 		ok := func() bool {
 			defer releaseWindows(wins)
 			for _, w := range wins {
+				if ct && !w.ctFree {
+					return false
+				}
 				verdict := segmentVerdict(w, conds, condIDs)
 				idx := w.seg.readIdx()
 				covered := 0

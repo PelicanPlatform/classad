@@ -44,6 +44,7 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 		_ = closer()
 		return false
 	}
+	seg.ctAdoptKIDX(ki) // the key index covers exactly this segment's records, so its proof does
 	var mm *mmapSegIndex
 	if len(attr) > 0 && sidecarCRCValid(attr) {
 		// Publish the sidecar whatever configuration it was built under, provided it covers
@@ -124,7 +125,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 		}
 		attrBlob = b
 	}
-	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h, seg.damaged()), c.colBlobForSeg(seg),
+	container := buildSegmentSidecar(attrBlob, c.segKeyIndex(seg), c.colBlobForSeg(seg),
 		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
 	if err := writeFileAtomic(path, container); err != nil {
 		return
@@ -178,7 +179,7 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 	attrCopy := append([]byte(nil), attr...)
 	colCopy := append([]byte(nil), col...)
 	_ = closer()
-	container := buildSegmentSidecar(attrCopy, buildKeyIndex(seg.data, seg.used, c.h, seg.damaged()), colCopy,
+	container := buildSegmentSidecar(attrCopy, c.segKeyIndex(seg), colCopy,
 		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
 	// Report the write. Discarding this error is how a permanently slow start stays
 	// invisible: the recompute recurs every open and nothing anywhere says the repair
@@ -246,7 +247,7 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 	if err != nil {
 		return false
 	}
-	container := buildSegmentSidecar(attrBlob, buildKeyIndex(seg.data, seg.used, c.h, seg.damaged()), c.colBlobPreserve(seg),
+	container := buildSegmentSidecar(attrBlob, c.segKeyIndex(seg), c.colBlobPreserve(seg),
 		buildZoneBlob(c.zonesForSeg(sh, seg), c.intern.Name), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
 	return c.installSidecar(sh, seg, path, container)
 }
@@ -280,6 +281,7 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 		_ = closer()
 		return false
 	}
+	seg.ctAdoptKIDX(ki) // the key index covers exactly this segment's records, so its proof does
 	var mm *mmapSegIndex
 	if len(attr) > 0 && sidecarCRCValid(attr) {
 		if m, e := parseMmapSidecar(attr); e == nil && m != nil && int(m.upto) == seg.used {

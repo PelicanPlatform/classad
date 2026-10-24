@@ -34,6 +34,41 @@ type fieldPred struct {
 	fieldID uint32
 	eval    func(float64) bool
 	tests   []zoneTest
+	// ct marks a predicate from a query's CurrentTime-folded form (numPredsCT): it holds only for
+	// records without CurrentTime, so a scan using it must answer from proven windows alone.
+	ct bool
+}
+
+// numPredsCT is numPredsOnFields that also serves a query reading CurrentTime, through its folded
+// form (vm.Query.Folded), when every segment is proven free of CurrentTime. The predicates it returns
+// then carry ct, and a scan using them declines on meeting a window that is not proven (predsNeedCT):
+// a write may land between this check and the scan's snapshot.
+func (c *Collection) numPredsCT(q *vm.Query, s *adSchema) ([]fieldPred, bool) {
+	if preds, ok := c.numPredsOnFields(q, s); ok {
+		return preds, true
+	}
+	qf := c.foldFor(q)
+	if qf == nil || !c.ctAllProven() {
+		return nil, false
+	}
+	preds, ok := c.numPredsOnFields(qf, s)
+	if !ok {
+		return nil, false
+	}
+	for i := range preds {
+		preds[i].ct = true
+	}
+	return preds, true
+}
+
+// predsNeedCT reports whether preds came from a CurrentTime-folded query (see numPredsCT).
+func predsNeedCT(preds []fieldPred) bool {
+	for _, p := range preds {
+		if p.ct {
+			return true
+		}
+	}
+	return false
 }
 
 // zoneTest is one comparison in the form the zone map reasons about (see zoneMayMatch).
@@ -126,9 +161,14 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) (in
 	count := 0
 	var keep []bool
 	var scratch []int64
+	ct := predsNeedCT(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			if ct && !w.ctFree {
+				releaseWindows(wins)
+				return 0, false
+			}
 			cs := w.seg.colblk.Load()
 			idxs, resolved := resolveFields(cs, preds)
 			if !resolved {

@@ -77,7 +77,7 @@ func (c *Collection) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 	var preds []fieldPred
 	if q != nil {
 		var ok bool
-		preds, ok = c.numPredsOnFields(q, st.schema)
+		preds, ok = c.numPredsCT(q, st.schema)
 		if !ok {
 			return NumStats{}, false // not a conjunction of scalar comparisons on numeric fields
 		}

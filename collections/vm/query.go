@@ -19,6 +19,16 @@ type Query struct {
 	// shared by every caller and must not be modified.
 	probesOnce sync.Once
 	probes     []Probe
+	// fold is set when the query reads an unscoped or MY CurrentTime; it holds the folded
+	// form (see Folded), compiled on first use.
+	fold *foldedQuery
+}
+
+// foldedQuery is a Query's CurrentTime-folded form, compiled once. q stays nil when the
+// fold leaves a CurrentTime reference behind (one inside a list or record literal).
+type foldedQuery struct {
+	once sync.Once
+	q    *Query
 }
 
 // Compile compiles an already-parsed expression into a Query.
@@ -29,12 +39,59 @@ type Query struct {
 // clock per ad. An ad that defines CurrentTime supplies its own value, as it does to the
 // evaluator; the expression itself is compiled unchanged.
 func Compile(expr ast.Expr) *Query {
+	return compileAt(expr, 0)
+}
+
+// compileAt is Compile with the pinned time given (0 reads the clock).
+func compileAt(expr ast.Expr, now int64) *Query {
 	p := CompileProgram(expr)
+	q := &Query{prog: p}
 	if magic, named := currentTimeRefs(expr); named {
-		p.now = time.Now().Unix()
+		if now == 0 {
+			now = time.Now().Unix()
+		}
+		p.now = now
 		p.foldNow = magic
+		if magic {
+			q.fold = &foldedQuery{}
+		}
 	}
-	return &Query{prog: p}
+	return q
+}
+
+// And returns the query `(q) && (e)`, compiled with q's pinned time, so a CurrentTime both
+// read means the same instant. A caller that refines a query it has already run -- a top-K
+// pass that adds the cutoff it computed -- needs that: recompiling from text would pin a
+// later time and could select a different set.
+func (q *Query) And(e ast.Expr) *Query {
+	return compileAt(&ast.BinaryOp{Op: "&&", Left: &ast.ParenExpr{Inner: q.prog.expr}, Right: &ast.ParenExpr{Inner: e}}, q.prog.now)
+}
+
+// Folded returns the query with its unscoped and MY CurrentTime references folded to the
+// pinned time and its constants folded (classad.FoldConstantsAt), compiled as a query of
+// its own. It is nil when the query does not read CurrentTime that way, or when the fold
+// leaves such a reference behind.
+//
+// The folded query evaluates exactly as q does on an ad that does not define CurrentTime
+// (neither it nor a chained parent), at the same pinned time: that is FoldConstantsAt's
+// contract. On an ad that defines CurrentTime it may not. So a store may evaluate it, and
+// answer from its probes (ExactProbes), only over records it has proven lack the attribute;
+// everywhere else it must evaluate q. Any CurrentTime reference the fold keeps (TARGET,
+// PARENT, a select) is pinned to the same time as in q.
+func (q *Query) Folded() *Query {
+	if q == nil || q.fold == nil {
+		return nil
+	}
+	q.fold.once.Do(func() {
+		e := classad.FoldConstantsAt(q.prog.expr, q.prog.now)
+		if magic, _ := currentTimeRefs(e); magic {
+			return
+		}
+		p := CompileProgram(e)
+		p.now = q.prog.now
+		q.fold.q = &Query{prog: p}
+	})
+	return q.fold.q
 }
 
 // currentTimeRefs reports whether expr reads CurrentTime unscoped or as MY.CurrentTime
