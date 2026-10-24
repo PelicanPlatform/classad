@@ -204,6 +204,10 @@ func segLiveCount(seg *segment) int {
 	n := 0
 	for off := 0; off < seg.used; {
 		o := uint32(off)
+		if end, ok := seg.damaged().skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(seg.data, o)
 		if total == 0 {
 			break

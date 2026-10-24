@@ -179,6 +179,17 @@ type segment struct {
 	// in the segment is keyed by that dictionary, so reads fail rather than resolve ids through
 	// bytes nothing vouches for (a flipped bit in a name renames that attribute in every ad).
 	dictUnusable atomic.Bool
+	// damage is the byte ranges of this segment's records known to be damaged (see damage.go), nil
+	// when there are none. Every walk skips them. Set while the segment is opened, before anything
+	// else can see it, and persisted in its sidecar.
+	damage atomic.Pointer[damageSet]
+	// damageUnsaved is set when Open found damage its sidecar does not record yet, so the sidecar is
+	// rewritten with it. Open-only.
+	damageUnsaved bool
+	// stoppedAtDamage is set when recovery stopped at damage with readable records past it that it
+	// could not load. Those bytes are what Repair recovers them from, so the segment is not
+	// rewritten (verifyForRewrite). Set during Open; read-only after.
+	stoppedAtDamage bool
 
 	// Persistent (mmap) segments only; nil/zero for RAM segments. See mmapseg.go.
 	// The file name is independent of the logical id (id == array index, reassigned
@@ -439,6 +450,9 @@ func (s *segment) retire() (reapNow bool) {
 		return false
 	}
 	s.reapMu.Lock()
+	if !s.retired {
+		damagedRecordsDropped.Add(int64(s.damaged().len()))
+	}
 	s.retired = true
 	reapNow = s.refs == 0 && !s.reaped
 	if reapNow {
@@ -805,18 +819,30 @@ func recFits(b []byte, off uint32) bool {
 	return adLenAt+4+int(binary.LittleEndian.Uint32(b[adLenAt:])) <= len(b)
 }
 
+// recKey returns the record's key, aliasing b. A key length that runs past b -- a damaged header,
+// read by a walk that has not checked the record's CRC -- yields nil rather than a panic; such a
+// record fails its CRC wherever it is read.
 func recKey(b []byte, off uint32) []byte {
-	kl := recKeyLen(b, off)
-	start := off + recKeyOff
-	return b[start : start+kl]
+	start := uint64(off) + recKeyOff
+	end := start + uint64(recKeyLen(b, off))
+	if end > uint64(len(b)) {
+		return nil
+	}
+	return b[start:end]
 }
 
+// recAd returns the record's stored ad, aliasing b; nil when a damaged length runs past b, as recKey.
 func recAd(b []byte, off uint32) []byte {
-	kl := recKeyLen(b, off)
-	adLenOff := off + recKeyOff + kl
-	adLen := binary.LittleEndian.Uint32(b[adLenOff:])
+	adLenOff := uint64(off) + recKeyOff + uint64(recKeyLen(b, off))
+	if adLenOff+4 > uint64(len(b)) {
+		return nil
+	}
 	start := adLenOff + 4
-	return b[start : start+adLen]
+	end := start + uint64(binary.LittleEndian.Uint32(b[adLenOff:]))
+	if end > uint64(len(b)) {
+		return nil
+	}
+	return b[start:end]
 }
 
 // appendRawRecord copies a record's identity from src -- its commit seq, its supersession seq, its

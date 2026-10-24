@@ -90,6 +90,10 @@ type seqRun struct {
 func (r *seqRun) advance(s0, minSeq uint64) {
 	for int(r.off) < r.w.used {
 		o := r.off
+		if end, ok := r.w.dmg.skip(o); ok {
+			r.off = end
+			continue
+		}
 		total := recTotalLen(r.w.data, o)
 		if total == 0 {
 			break

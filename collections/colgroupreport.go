@@ -360,6 +360,10 @@ func (c *Collection) windowSamples(w segWindow, max int) [][]byte {
 	dict := w.dict()
 	for off := 0; off < w.used && len(out) < max; {
 		o := uint32(off)
+		if end, ok := w.dmg.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		rl := recTotalLen(w.data, o)
 		if rl == 0 {
 			break

@@ -211,7 +211,7 @@ func repairSegment(path string, opts RepairOptions) (*RepairSegment, error) {
 	// whose dictionary does not survive is refused even when the damage hid its flags or
 	// its framing. Only a sidecar whose extent fits the segment is believed, as Open
 	// believes it.
-	extent, dictRec := readSidecarTrailer(path + ".idx")
+	extent, dictRec, _ := readSidecarTrailer(path + ".idx")
 	if extent <= 0 || extent > len(data) || !recExtentEndsCleanly(data, extent) {
 		dictRec = 0
 	}

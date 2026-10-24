@@ -330,7 +330,7 @@ func (c *Collection) persistColSeg(sh *shard, seg *segment) {
 		return
 	}
 	container := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...), colBlob,
-		append([]byte(nil), zone...), seg.used, seg.dictRecOff())
+		append([]byte(nil), zone...), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
 	_ = closer()
 	c.installSidecar(sh, seg, path, container)
 }
@@ -402,7 +402,7 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 	if st := c.schemaScan.Load(); st != nil {
 		groups = st.groups
 	}
-	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.codec,
+	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.damaged(), seg.codec,
 		c.regionCodec(), s, hot, groups, c.colGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) },
 		c.segIDMapper(d),

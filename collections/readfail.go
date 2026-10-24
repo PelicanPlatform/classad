@@ -184,6 +184,7 @@ const (
 	skipReassemble                      // a remnant and its columnar row would not rejoin
 	skipDeltaUnresolved                 // a delta record whose chain could not be merged
 	skipDecode                          // the bytes would not decompress or decode
+	skipDamaged                         // a record its segment holds as damaged (see DamagedRecordsSkipped)
 	skipMax                             // not a reason; bounds the counter array
 )
 
@@ -205,6 +206,8 @@ func (r readSkip) String() string {
 		return "delta-unresolved"
 	case skipDecode:
 		return "decode"
+	case skipDamaged:
+		return "damaged"
 	}
 	return "unknown"
 }
@@ -221,6 +224,8 @@ func readSkipOf(err error) readSkip {
 	switch {
 	case errors.Is(err, errRecordCRC):
 		return skipRecordCRC
+	case errors.Is(err, errRecordDamaged):
+		return skipDamaged
 	case errors.Is(err, errSegDictUnusable):
 		return skipDictUnusable
 	case errors.Is(err, errColMissing):

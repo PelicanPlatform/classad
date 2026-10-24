@@ -185,6 +185,10 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 	for _, seg := range dead {
 		for off := 0; off < seg.used; {
 			o := uint32(off)
+			if end, ok := seg.damaged().skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(seg.data, o)
 			if total == 0 {
 				break
@@ -526,6 +530,14 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// immutable, which is true and beside the point. Immutability is about content; a munmap is about
 	// lifetime.
 	defer unpinAll(sources)
+	// No record is copied before its checksum is checked: a copy carries a fresh one. Damaged records
+	// join their segment's damage set and are left out; a segment whose framing is damaged leaves the
+	// shard uncompacted, as a failed copy does below.
+	for _, seg := range sources {
+		if !verifyForRewrite(seg) {
+			return
+		}
+	}
 
 	if compactPhase2Hook != nil {
 		compactPhase2Hook(sources)
@@ -742,6 +754,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	for _, seg := range sources {
 		for off := 0; off < seg.used; {
 			o := uint32(off)
+			if end, ok := seg.damaged().skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(seg.data, o)
 			if total == 0 {
 				break
@@ -932,6 +948,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 		for off := 0; off < seg.used; {
 			o := uint32(off)
+			if end, ok := seg.damaged().skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(seg.data, o)
 			if total == 0 {
 				break

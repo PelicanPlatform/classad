@@ -434,7 +434,7 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 						break
 					}
 					o := seg.offAt(gk)
-					if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+					if w.visible(o, s0) {
 						live[k/64] |= 1 << uint(k%64)
 						nLive++
 					}

@@ -79,10 +79,14 @@ func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
 	recs := map[uint32][]uint32{}
 	var buf []byte
 	n := cs.offsLen()
+	dm := seg.damaged()
 	for i := 0; i < n; i++ {
 		o := cs.offAt(i)
 		if int(o) >= len(seg.data) {
 			return nil, false
+		}
+		if dm.covers(o) {
+			continue // a damaged record's row: nothing of the record can be read
 		}
 		raw, err := seg.codec.Decompress(buf[:0], recAd(seg.data, o))
 		if err != nil {

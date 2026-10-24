@@ -179,8 +179,13 @@ func publishSegDictAt(seg *segment, hint uint32) {
 		publishSegDictRec(seg, hint)
 		return
 	}
+	dm := seg.damaged()
 	for off := 0; off < seg.used; {
 		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(seg.data, o)
 		if total == 0 {
 			break
@@ -217,8 +222,13 @@ func markSegDictNeed(seg *segment) {
 	if seg == nil || !seg.persistent || seg.dict.Load() != nil {
 		return
 	}
+	dm := seg.damaged()
 	for off := 0; off+recHeaderSize <= seg.used; {
 		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := int(recTotalLen(seg.data, o))
 		if total <= 0 || off+total > seg.used {
 			return
@@ -272,7 +282,7 @@ func (s *segment) dictRecOff() uint32 {
 
 // dictRecordAt reports whether off names a well-formed dict record inside seg's written data.
 func dictRecordAt(seg *segment, off uint32) bool {
-	if int(off)+recHeaderSize > seg.used {
+	if int(off)+recHeaderSize > seg.used || seg.damaged().covers(off) {
 		return false
 	}
 	total := recTotalLen(seg.data, off)

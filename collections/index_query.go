@@ -1297,13 +1297,17 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, reverse bool, st *ScanStats, fn func(recRef) bool) bool {
 	var offs []uint32 // reused across reversed ranges
 	visible := func(w segWindow, o uint32) bool {
-		return !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
+		return !recIsMarker(w.data, o) && w.visible(o, s0)
 	}
 	// scanRange visits the records in [from, to), in walk order.
 	scanRange := func(w segWindow, d *segDictHandle, from, to int) bool {
 		if !reverse {
 			for off := from; off < to; {
 				o := uint32(off)
+				if end, ok := w.dmg.skip(o); ok {
+					off = int(end)
+					continue
+				}
 				total := recTotalLen(w.data, o)
 				if total == 0 {
 					break
@@ -1320,6 +1324,10 @@ func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, reve
 		offs = offs[:0]
 		for off := from; off < to; {
 			o := uint32(off)
+			if end, ok := w.dmg.skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(w.data, o)
 			if total == 0 {
 				break
@@ -1428,7 +1436,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 	defer releaseWindows(wins)
 	var dbuf []byte
 	visit := func(w segWindow, o uint32) (stop bool) {
-		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+		if !w.visible(o, s0) {
 			return false
 		}
 		// Defensive: internal system records carry no normal indexed attributes and
@@ -1446,6 +1454,10 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 	scanRange := func(w segWindow, from, to int) bool {
 		for off := from; off < to; {
 			o := uint32(off)
+			if end, ok := w.dmg.skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(w.data, o)
 			if total == 0 {
 				break
@@ -1509,6 +1521,10 @@ func scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, 
 		offs = offs[:0]
 		for off := from; off < to; {
 			o := uint32(off)
+			if end, ok := w.dmg.skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(w.data, o)
 			if total == 0 {
 				break

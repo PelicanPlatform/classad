@@ -163,7 +163,7 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 							break
 						}
 						o := cs.offAt(gk)
-						if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+						if !w.visible(o, s0) {
 							continue
 						}
 						stats.visit()
@@ -192,7 +192,7 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 					vis := gk < cs.offsLen()
 					if vis {
 						o := cs.offAt(gk)
-						vis = recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
+						vis = w.visible(o, s0)
 					}
 					keep[j] = vis
 					if vis {
@@ -244,11 +244,15 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
+		if end, ok := w.dmg.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(w.data, o)
 		if total == 0 {
 			break
 		}
-		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+		if !recIsMarker(w.data, o) && w.visible(o, s0) {
 			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
 				stats.visit()

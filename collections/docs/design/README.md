@@ -712,8 +712,11 @@ source.
 
 1. **Enumerate and map** the segment files, and load every referenced dictionary.
 2. **Find each segment's extent.** For a sealed segment it is read from its sidecar
-   trailer. Otherwise it is found by walking records until the first bad CRC: a torn
-   tail from a crash mid-write is ignored, and only the committed prefix recovers.
+   trailer, with the segment's damage set when the sidecar records one. Otherwise it
+   is found by walking records until the first bad CRC: a torn tail from a crash
+   mid-write is ignored, and only the committed prefix recovers. A bad CRC with
+   readable records after it is damage in the middle; the walk continues past it only
+   where the framing can be proven (see *Damaged records* below).
 3. **Publish in-segment structures.** These are the attribute dictionary record
    (Chapter 3) and the columnar payload (Chapter 9). The payload is CRC-checked here,
    because step 2 skipped walking a sealed segment.
@@ -725,6 +728,9 @@ source.
      path. Time-travel and chained collections always use the slow path.
    - **Slow path.** Replay records by `seq`: **the current version of a key is its
      record with the maximum `seq`**. Append-only collections skip the dedup below.
+     When two records claim one key, both are CRC-checked before either is believed,
+     and a walk that does not land exactly on its segment's extent is reframed; either
+     finding adds to the segment's damage set and restarts the replay.
 5. **Evict sealed keys** to the key indexes (Chapter 5).
 6. **Map the sidecars.** Rebuild only the ones that are missing, fail validation, or
    lack coverage for the current index configuration, within the
@@ -763,6 +769,14 @@ their lengths:
 [ attrLen u32 | keyLen u32 | colLen u32 | zoneLen u32 | segUsed u64 | dictRec u32 | "SCN4" ]
 ```
 
+A segment with a damage set writes `SCN5` instead, which adds one section and its
+length:
+
+```
+[ … as above … ][ damage (DMG1) ]
+[ attrLen | keyLen | colLen | zoneLen | damageLen u32 | segUsed u64 | dictRec u32 | "SCN5" ]
+```
+
 - The **attribute index** is written first, so its roaring bitmaps stay aligned at
   offset 0. Its format (ARCX, currently version 9) is described in Chapter 12. It
   carries its own CRC-32C footer.
@@ -776,10 +790,16 @@ their lengths:
   *name* (Chapter 18).
 - **`segUsed`** is the sealed extent, which spares recovery the CRC walk. **`dictRec`**
   is the offset of the segment's dictionary record.
+- The **damage section** (`DMG1`) lists the segment's damaged records as byte ranges,
+  behind a count and ahead of an IEEE CRC. The key index leaves those records out.
 
-The trailer magic distinguishes four container versions, each a superset of the last:
-`SCNT` (attr + key), `SCN2` (+ columnar), `SCN3` (+ zones and extent), and `SCN4`
-(+ dictionary offset).
+The trailer magic distinguishes five container versions, each a superset of the last:
+`SCNT` (attr + key), `SCN2` (+ columnar), `SCN3` (+ zones and extent), `SCN4`
+(+ dictionary offset), and `SCN5` (+ damage). Only a segment with damage is written
+as `SCN5`. A build that predates it does not recognise the container, so it neither
+trusts the extent nor adopts the key index: it walks the segment and stops at the
+damage. A new build trusts an `SCN5` extent only if every damaged range ends inside
+the extent on a record that verifies (or on another range, or the extent itself).
 
 The sidecar is a **validated, disposable cache**. It is written once to a temp file and
 renamed into place. On open it is checked against its CRCs, the segment's extent, and
@@ -797,7 +817,8 @@ handle a store that may be damaged:
   count what survives, checks sidecars and the columnar payload, and names files whose
   names do not parse. It checks that a columnar payload's offset map names exactly the
   segment's keyed records, reports a damaged attribute dictionary, and says where a
-  normal open would stop when no sidecar supplies a trusted extent.
+  normal open would stop when no sidecar supplies a trusted extent, or that it continues
+  past the damage (see *Damaged records*).
 - **`Repair(dir, opts)`** moves damaged originals to `<Dir>/quarantine/` and drops
   stale `.idx` and `dir.snap` files, so the next open rebuilds them. It never deletes
   the only copy of data. It leaves some segments exactly as they are and reports them,
@@ -813,12 +834,70 @@ handle a store that may be damaged:
 At read time, a columnarized record with no row in the payload fails and is counted
 (`ColNativeRowMisses`); it is never returned as a short ad.
 
-Open's recovery walk stops at the first record that fails its CRC when no sidecar
-supplies a trusted extent. Records that verify after the stop are not loaded; they are
-counted (`RecordsPastDamage`), and the segment is named in `OpenIndexDiag.DamageStops`.
 A dictionary record is CRC-checked before it is published. A segment whose records are
 interned but which has no usable dictionary (its record failed, or lay past the stop)
 has its records fail to read (`SegDictsUnusable`).
+
+### Damaged records
+
+A record that fails its CRC cannot be trusted for anything, its header included. Most
+walks of a segment read header fields without checking the CRC: the directory replay
+picks a winner per key from `key` and `seq` and supersedes the losers on disk, every
+scan's visibility check reads `seq` and `supersededBySeq`, and every walk steps by
+`totalLen`. A damaged record could therefore supersede a live record whose key it
+happens to match, look live when it was not, or misframe the walk.
+
+So a segment carries a **damage set**: the byte ranges of its records known to be
+damaged. Every walk skips them, every visibility check treats them as invisible, every
+key-index probe ignores them, and a read of one fails and is counted (`RecordReadSkips`
+reason `damaged`). A range's end is never taken on the damaged header's word alone. It
+comes from a proof of the framing:
+
+- **A verified columnar payload after the damage.** When the recovery walk stops at a
+  bad CRC, it resyncs forward and collects every record that verifies. The last must be
+  the payload, with nothing written after it, and its offset map must tile the segment
+  from 0: each row is either a verified keyed record ending where the next row begins,
+  or damage that ends there (the last row's damage ends at the next verified record).
+  After the rows come the dictionary, verified or damaged, and then the payload. A record
+  that verifies but is not accounted for that way — a keyed record no row names, or one
+  starting inside a damaged row — refuses the proof. Bytes inside a damaged record are
+  never read, so a record image stored inside an ad cannot be taken for a record.
+- **The sidecar's key index**, which lists every record's offset as it stood at seal.
+  This covers a segment that is not columnarized when its sidecar is present but its
+  extent is not trusted, and a trusted extent whose walk is misframed by a damaged
+  `totalLen`. A verified record whose key does not hash to its entry means the index
+  belongs to another segment, and refuses the proof.
+- **A walk that lands on a trusted extent**, for a record the directory replay finds by
+  CRC. Every other walk of that segment steps the same way.
+
+A segment that is not columnarized and has no sidecar has no proof: there, the walk
+still stops at the damage, the records that verify after it are counted
+(`RecordsPastDamage`) rather than loaded, and the segment is named in
+`OpenIndexDiag.DamageStops`. Repair recovers them offline.
+
+Where recovery continues, the damaged records are counted (`DamagedRecordsSkipped`),
+the stop is marked `Recovered` in `OpenIndexDiag.DamageStops`, and everything else
+reads normally. The set is written into the sidecar (`SCN5`), either when the segment is
+next sealed or, for damage found in a segment whose sidecar was adopted, during the
+open itself, so a later open that trusts the extent still knows what to skip.
+
+**Rewrites.** Compaction, columnarization, merges and reseals copy a record's key,
+`seq` and `supersededBySeq` and write a fresh CRC over them, so a damaged record copied
+that way would stop looking damaged. Each source is therefore CRC-checked before it is
+copied, and a record that fails joins its segment's damage set. The rewrite leaves
+damaged records out (`DamagedRecordsDropped`), and the new segment starts with no set.
+A source whose walk does not land on its extent, or whose recovery stopped with records
+past the stop that only Repair can recover, is not rewritten (`RewritesRefusedDamaged`).
+
+Damage inside a trusted extent is found only where something walks the segment: the
+directory replay (no `dir.snap`, time travel, chained collections), a rewrite, or Fsck.
+An open that restores `dir.snap` walks no records, so until one of those runs, a scan can
+still meet such a record. Read verification refuses it, but a misframing `totalLen`
+there can cut a scan of that segment short.
+
+Fsck reports what a normal open will do: `FsckSegment.OpenStop.Recovered` when the
+framing past a stop is proven, and `FsckSegment.SidecarDamage` for ranges a sidecar
+records.
 
 
 ## 9. Columnar segments
@@ -2464,7 +2543,7 @@ Persistent and append-only collections share one layout. Shard directories are n
 | Path | Content | Format |
 |---|---|---|
 | `<shard>/seg-<n>.d<dictID>.dat` | a segment: 8-byte-aligned records from offset 0, no file header | record layout in Chapter 5; ads in wire v1 (Chapter 3) |
-| `<shard>/seg-<n>.d<dictID>.dat.idx` | sidecar container: attribute index, key index, columnar copy, zones, extent, dictionary offset | container `SCN4`; ARCX v9; KIDX v1; COLX v7; zones `ZNM3` (Chapter 8) |
+| `<shard>/seg-<n>.d<dictID>.dat.idx` | sidecar container: attribute index, key index, columnar copy, zones, extent, dictionary offset, damaged ranges | container `SCN4` (`SCN5` with damage); ARCX v9; KIDX v1; COLX v7; zones `ZNM3`; damage `DMG1` (Chapter 8) |
 | `<shard>/dir.snap` | key-directory snapshot from a clean `Close`; consumed on the next open | `DIRS` v1, CRC-checked |
 | `<shard>/tmp-merge-*.dat`, `<shard>/*.merging` | a rewrite's staged output and its intent marker | transient; completed or ignored by recovery |
 | `<shard>/*.idx.tmp` | a sidecar being written | transient |
@@ -2496,8 +2575,16 @@ Persistent and append-only collections share one layout. Shard directories are n
 attrLen u32 | keyLen u32 | colLen u32 | zoneLen u32 | segUsed u64 | dictRec u32 | magic "SCN4"
 ```
 
+A segment with damaged records writes `SCN5`, with a damage section after the zones:
+
+```
+… sections … damage …
+attrLen u32 | keyLen u32 | colLen u32 | zoneLen u32 | damageLen u32 | segUsed u64 | dictRec u32 | magic "SCN5"
+damage section: magic "DMG1" u32 | n u32 | n × { start u32, end u32 } | crc32 (IEEE) u32
+```
+
 Older trailers are still read: `SCNT` (attrLen, keyLen), `SCN2` (+ colLen), `SCN3`
-(+ zoneLen and segUsed).
+(+ zoneLen and segUsed), `SCN4` (+ dictRec).
 
 ### The key index (KIDX v1)
 

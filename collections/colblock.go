@@ -493,7 +493,7 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, layout *colLayout, regionCo
 // interned collection; a decode/re-encode for an inline/persistent one). encode reads the
 // id-keyed form, so a non-interned record must be converted first or the block would be empty.
 func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool)) ([]*columnarBlock, []uint32) {
-	blocks, _, offs := buildColumnarFromSegmentGrouped(data, upto, arenaCodec, regionCodec, s, hot, nil, g, toInterned, nil, nil)
+	blocks, _, offs := buildColumnarFromSegmentGrouped(data, upto, nil, arenaCodec, regionCodec, s, hot, nil, g, toInterned, nil, nil)
 	return blocks, offs
 }
 
@@ -507,11 +507,15 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 // row and no offset, so the rewrite that consumes these offsets does not carry it into the new
 // segment either. Used to drop DELTA records: each holds the attributes one write changed, so its
 // row would be almost entirely absent fields, and it is dead by the time its segment seals.
-func buildColumnarFromSegmentGrouped(data []byte, upto int, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+func buildColumnarFromSegmentGrouped(data []byte, upto int, dm *damageSet, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
 	var buf []byte
 	for off := 0; off < upto; {
 		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(data, o)
 		if total == 0 {
 			break

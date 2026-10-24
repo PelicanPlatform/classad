@@ -127,6 +127,9 @@ func keysOfSegment(t *testing.T, path string) map[string]bool {
 // the payload -- both after the records -- unread, so the records before the damage cannot be read
 // either: 1475 of 2000 ads came back, and nothing counted the other 525. Every key must now read
 // exactly as written or be counted: the records past the stop at Open, the ones before it per read.
+//
+// A verified payload after the damage lets Open continue past it (TestRecoverPastDamage), so the
+// payload is damaged here too: with nothing to prove the framing, the walk stops and counts.
 func TestOpenCountsRecordsPastDamage(t *testing.T) {
 	base := t.TempDir()
 	payloadFixture(t, base)
@@ -152,6 +155,8 @@ func TestOpenCountsRecordsPastDamage(t *testing.T) {
 		}
 	}
 	flipBit(t, target, stop+recKeyOff+2)
+	payload, _ := payloadOffset(data)
+	flipBit(t, target, payload+recKeyOff+4+colPayloadHdr+2)
 	if err = os.Remove(target + ".idx"); err != nil {
 		t.Fatal(err)
 	}

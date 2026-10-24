@@ -118,7 +118,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 						break
 					}
 					o := seg.offAt(gk)
-					if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+					if w.visible(o, s0) {
 						live[k/64] |= 1 << uint(k%64)
 						nLive++
 					}
@@ -215,7 +215,7 @@ func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, s
 			break
 		}
 		o := seg.offAt(gk)
-		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+		if !w.visible(o, s0) {
 			continue
 		}
 		cs.k, cs.fellBack = k, false
@@ -245,11 +245,15 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *vm.Matcher,
 	acc map[groupKey]*groupAcc) bool {
 	for off := 0; off < w.used; {
 		o := uint32(off)
+		if end, ok := w.dmg.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(w.data, o)
 		if total == 0 {
 			break
 		}
-		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 &&
+		if !recIsMarker(w.data, o) && w.visible(o, s0) &&
 			c.evalOneRecord(w, o, m) {
 			// Matched, so this record forms a group: read its values from the wire form, the same
 			// lookups the predicate-analysis path's row fallback uses, so group identity does not

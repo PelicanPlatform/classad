@@ -183,6 +183,11 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	if len(srcs) == 0 {
 		return nil
 	}
+	for _, s := range srcs {
+		if !verifyForRewrite(s) {
+			return nil // damaged framing: leave the sources as they are
+		}
+	}
 	// A persistent collection reseals INTERNED: records carry segment-local ids against a
 	// per-segment table + a hot header, and the segment gets a dictionary appended at the end
 	// (see segdict.go / the interning design). Encryption at rest composes -- encodeInterned seals
@@ -216,6 +221,10 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	for _, src := range srcs {
 		for off := 0; off < src.used; {
 			o := uint32(off)
+			if end, ok := src.damaged().skip(o); ok {
+				off = int(end)
+				continue
+			}
 			rl := recTotalLen(src.data, o)
 			if rl == 0 {
 				break

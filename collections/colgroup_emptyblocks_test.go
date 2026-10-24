@@ -33,7 +33,7 @@ func makeEveryRecordDelta(seg *segment) {
 // silent change here would put the bounds check in those consumers back out of step.
 func TestEmptySegmentBuildsBlockWithoutGroupRow(t *testing.T) {
 	c, st, seg := emptyGroupRowFixture(t)
-	blocks, gblocks, _ := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.codec,
+	blocks, gblocks, _ := buildColumnarFromSegmentGrouped(seg.data, seg.used, nil, seg.codec,
 		c.regionCodec(), st.schema, st.hot, st.groups, c.colGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return w, true },
 		func(u uint32) (uint32, bool) { return u, true },

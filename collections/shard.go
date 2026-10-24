@@ -240,6 +240,10 @@ func (sh *shard) oldestRecordSeqLocked() uint64 {
 		}
 		for off := 0; off < seg.used; {
 			o := uint32(off)
+			if end, ok := seg.damaged().skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(seg.data, o)
 			if total == 0 {
 				break
@@ -584,6 +588,9 @@ func (sh *shard) forEachSealedRecordCounting(key []byte, h uint64, skipped *int,
 			// pending. It has no bloom filter, so the probe goes straight to the lookup.
 			if mem := seg.keyIdxMem.Load(); mem != nil {
 				for _, off := range mem.lookup(h) {
+					if seg.damaged().covers(off) {
+						continue // a damaged record answers for no key
+					}
 					if bytes.Equal(recKey(seg.data, off), key) {
 						if !fn(seg, off) {
 							return
@@ -610,6 +617,10 @@ func (sh *shard) forEachSealedRecordCounting(key []byte, h uint64, skipped *int,
 				*skipped++
 			}
 			for off := uint32(0); off < uint32(seg.used); {
+				if end, ok := seg.damaged().skip(off); ok {
+					off = end
+					continue
+				}
 				tl := recTotalLen(seg.data, off)
 				if tl == 0 || off+tl > uint32(seg.used) {
 					break
@@ -627,6 +638,10 @@ func (sh *shard) forEachSealedRecordCounting(key []byte, h uint64, skipped *int,
 			continue
 		}
 		for _, off := range ki.lookup(h) {
+			// A key index written before the damage was known still names the damaged record.
+			if seg.damaged().covers(off) {
+				continue
+			}
 			if bytes.Equal(recKey(seg.data, off), key) {
 				if !fn(seg, off) {
 					return
@@ -760,6 +775,16 @@ type segWindow struct {
 	codec Codec
 	seg   *segment             // for reindex-on-demand and the per-segment index (idx)
 	zones map[uint32]zoneRange // sealed segment's zone map (nil ⇒ never prunable)
+	dmg   *damageSet           // the segment's damaged records, which every walk skips (nil: none)
+}
+
+// visible reports whether the record at o is visible at snapshot s0. A damaged record never is: its
+// seq and supersededBySeq are not to be believed.
+func (w segWindow) visible(o uint32, s0 uint64) bool {
+	if w.dmg != nil && w.dmg.covers(o) {
+		return false
+	}
+	return recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
 }
 
 // dict is the window's segment attribute dictionary when the segment is interned, else nil
@@ -809,7 +834,7 @@ func (sh *shard) buildWindowsLocked(s0 uint64) []segWindow {
 			continue
 		}
 		seg.pin() // no-op for RAM segments
-		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg, zones: seg.zones})
+		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg, zones: seg.zones, dmg: seg.damaged()})
 	}
 	return wins
 }

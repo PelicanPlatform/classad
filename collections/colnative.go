@@ -97,8 +97,13 @@ func publishColNative(c *Collection, seg *segment) error {
 	if seg.dictUnusable.Load() {
 		return nil
 	}
+	dm := seg.damaged()
 	for off := 0; off < seg.used; {
 		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(seg.data, o)
 		if total == 0 {
 			break
@@ -228,18 +233,34 @@ func colOffsetsFitRecords(seg *segment, cs *colSegment) bool {
 	if n == 0 {
 		return true
 	}
-	keyed := func(o uint32) bool {
+	// A row may name a damaged record (recovery continued past it); such a row ends where its damage
+	// does, which recovery proved from this payload's own rows.
+	dm := seg.damaged()
+	recEnd := func(o uint32) (int, bool) {
+		if end, ok := dm.skip(o); ok {
+			return int(end), int(end) <= seg.used
+		}
 		if int(o)+recHeaderSize > seg.used {
-			return false
+			return 0, false
 		}
 		total := int(recTotalLen(seg.data, o))
-		return total > 0 && total%8 == 0 && int(o)+total <= seg.used && !recIsMarker(seg.data, o)
+		if total <= 0 || total%8 != 0 || int(o)+total > seg.used || recIsMarker(seg.data, o) {
+			return 0, false
+		}
+		return int(o) + total, true
 	}
 	first, last := cs.offAt(0), cs.offAt(n-1)
-	if !keyed(first) || !keyed(last) {
+	if _, ok := recEnd(first); !ok {
 		return false
 	}
-	next := int(last) + int(recTotalLen(seg.data, last))
+	next, ok := recEnd(last)
+	if !ok {
+		return false
+	}
+	// The record after the last row is the dictionary or the payload; a damaged dictionary is a span.
+	if _, damaged := dm.skip(uint32(next)); damaged {
+		return true
+	}
 	return next+recHeaderSize <= seg.used && recIsMarker(seg.data, uint32(next))
 }
 

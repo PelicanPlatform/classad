@@ -222,7 +222,7 @@ func TestSegDictOffsetIsRecorded(t *testing.T) {
 		t.Fatal("fixture produced no interned segments")
 	}
 	for _, seg := range segs {
-		_, dictRec := readSidecarTrailer(seg.path + ".idx")
+		_, dictRec, _ := readSidecarTrailer(seg.path + ".idx")
 		if dictRec == 0 {
 			t.Errorf("segment %s: sidecar records no dict offset", seg.path)
 			continue

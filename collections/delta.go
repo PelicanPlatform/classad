@@ -438,6 +438,10 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	if !sh.hasFull(vers) && sh.act != nil {
 		seg := sh.act
 		for off := uint32(0); off < uint32(seg.used); {
+			if end, ok := seg.damaged().skip(off); ok {
+				off = end
+				continue
+			}
 			tl := recTotalLen(seg.data, off)
 			if tl == 0 || off+tl > uint32(seg.used) {
 				break
@@ -1288,6 +1292,10 @@ func (c *Collection) liveDeltaKeys(includeSealed bool) [][]byte {
 		}
 		for _, seg := range segs {
 			for off := uint32(0); off < uint32(seg.used); {
+				if end, ok := seg.damaged().skip(off); ok {
+					off = end
+					continue
+				}
 				tl := recTotalLen(seg.data, off)
 				if tl == 0 || off+tl > uint32(seg.used) {
 					break

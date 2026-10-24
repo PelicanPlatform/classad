@@ -180,7 +180,7 @@ func legacyizeZones(t *testing.T, dir string, ids map[string]uint32, swap map[st
 			legacy = binary.LittleEndian.AppendUint64(legacy, math.Float64bits(z.Max))
 		}
 		out := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...),
-			append([]byte(nil), col...), legacy, used, dictRec)
+			append([]byte(nil), col...), legacy, used, dictRec, nil)
 		if err := os.WriteFile(p, out, 0o644); err != nil {
 			t.Fatal(err)
 		}

@@ -110,10 +110,15 @@ type FsckSegment struct {
 	DictDamaged bool
 	// OpenStop is set when a normal open's recovery walk stops at damage in this segment
 	// with something readable after it: the sidecar supplies no trusted extent, so Open
-	// walks the records and stops at the first one that fails its checksum. What follows
-	// is not loaded. When the dictionary or columnar payload is among it, the records
-	// before the stop are unreadable too.
+	// walks the records and stops at the first one that fails its checksum. When the
+	// framing past the stop can be proven -- a verified columnar payload after it, or the
+	// sidecar's key index -- Open continues past it and sets the damaged records aside
+	// (OpenStop.Recovered). Otherwise what follows is not loaded, and when the dictionary
+	// or columnar payload is among it, the records before the stop are unreadable too.
 	OpenStop *OpenDamageStop
+	// SidecarDamage is how many damaged spans the sidecar records for this segment. A normal
+	// open that trusts the sidecar's extent skips them; they are not damage it fails to see.
+	SidecarDamage int
 }
 
 // FsckSupersede is a record whose supersededBySeq cannot be true.
@@ -245,9 +250,22 @@ func (r *FsckReport) String() string {
 				"without rewriting its columnar payload\n")
 		}
 		if s.ExtentTrusted && len(s.Damage) > 0 {
-			b.WriteString("    note: inside the sidecar's trusted extent -- a normal open will not notice\n")
+			if s.SidecarDamage > 0 {
+				fmt.Fprintf(&b, "    note: inside the sidecar's trusted extent, which records %d damaged span(s) "+
+					"that a normal open skips\n", s.SidecarDamage)
+			} else {
+				b.WriteString("    note: inside the sidecar's trusted extent -- a normal open will not notice\n")
+			}
 		}
-		if st := s.OpenStop; st != nil {
+		if st := s.OpenStop; st != nil && st.Recovered {
+			fmt.Fprintf(&b, "    note: no trusted extent, so a normal open walks to the damage at %d; the framing "+
+				"past it is proven, so the open continues and loads the %d readable record(s) after it, "+
+				"setting %d damaged span(s) aside", st.Offset, st.Loaded, st.Damaged)
+			if s.DictDamaged {
+				b.WriteString("; the attribute dictionary is among them, so the segment's records cannot be read")
+			}
+			b.WriteString("\n")
+		} else if st != nil {
 			fmt.Fprintf(&b, "    note: no trusted extent, so a normal open stops at %d and does not load "+
 				"the %d readable record(s) after it", st.Offset, st.Records)
 			switch {
@@ -445,10 +463,11 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 	// A trusted sidecar also records where the dictionary record is, which names a damaged
 	// dictionary even when the damage cleared its flag.
 	dictAt := -1
-	if extent, dictRec := readSidecarTrailer(path + ".idx"); extent > 0 {
+	if extent, dictRec, dmg := readSidecarTrailer(path + ".idx"); extent > 0 {
 		s.Sidecar = "ok"
-		if extent <= len(data) && recExtentEndsCleanly(data, extent) {
+		if extent <= len(data) && recExtentEndsCleanly(data, extent) && damageFits(data, extent, dmg) {
 			s.ExtentTrusted = true
+			s.SidecarDamage = dmg.len()
 			if dictRec > 0 {
 				dictAt = int(dictRec)
 			}
@@ -561,6 +580,11 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 		if used, crcStop := recoveryExtent(data); crcStop {
 			if st := surveyPastDamage(data, used); st.Records > 0 || st.Dictionary || st.ColumnarPayload {
 				st.Path, st.Offset = path, used
+				// The store's hasher is not known offline; the default is the one the key-index
+				// proof is checked against.
+				if _, spans, ok := proveFramingPastDamage(data, used, path+".idx", fnvHasher{}); ok {
+					st.Recovered, st.Loaded, st.Records, st.Damaged = true, st.Records, 0, len(spans)
+				}
 				s.OpenStop = &st
 			}
 		}

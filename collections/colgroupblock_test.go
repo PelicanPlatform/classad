@@ -223,7 +223,7 @@ func TestGroupBlocksFollowBaseBlockBoundaries(t *testing.T) {
 	ids := []uint32{c.intern.Intern("GA"), c.intern.Intern("GB"), c.intern.Intern("GC")}
 	g := &colGroup{ids: ids, schema: buildAdSchemaFor(samples, ids)}
 
-	blocks, gblocks, _ := buildColumnarFromSegmentGrouped(w.data, w.used, w.codec, c.regionCodec(),
+	blocks, gblocks, _ := buildColumnarFromSegmentGrouped(w.data, w.used, nil, w.codec, c.regionCodec(),
 		bs, nil, []*colGroup{g}, byRows(256), func(dst, x []byte) ([]byte, bool) {
 			return c.recordToInterned(dst, x)
 		}, nil, nil)

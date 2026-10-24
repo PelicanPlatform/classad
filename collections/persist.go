@@ -531,23 +531,19 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		// segment falls back to the scan rather than being trusted.
 		// The same trailer read also yields the offset of the segment's dictionary record,
 		// used below so publishSegDict need not search for it.
-		extent, dictRec := readSidecarTrailer(seg.path + ".idx")
+		// A v5 sidecar also names the segment's damaged records, which are skipped from here on
+		// (see damage.go); the set must fit the segment or the extent is not trusted either.
+		extent, dictRec, dmg := readSidecarTrailer(seg.path + ".idx")
 		segDictHint[seg] = dictRec
 		if rec := extent; rec > 0 && rec <= len(seg.data) &&
-			recExtentEndsCleanly(seg.data, rec) {
+			recExtentEndsCleanly(seg.data, rec) && damageFits(seg.data, rec, dmg) {
 			used = rec
-		} else {
-			var crcStop bool
-			used, crcStop = recoveryExtent(seg.data)
-			// A torn tail has nothing after it. Records that verify past the stop are damage in
-			// the middle, and they are not loaded: say so, rather than come back short in silence.
-			if crcStop {
-				if past := surveyPastDamage(seg.data, used); past.Records > 0 || past.Dictionary || past.ColumnarPayload {
-					past.Path, past.Offset = seg.path, used
-					c.openIdxDiag.notePastDamage(past)
-					recordsPastDamage.Add(int64(past.Records + past.Damaged))
-				}
+			if dmg != nil {
+				seg.damage.Store(dmg)
+				damagedRecordsSkipped.Add(int64(dmg.len()))
 			}
+		} else {
+			used = c.recoverExtent(seg)
 		}
 		seg.used = used
 		seg.synced = used
@@ -659,6 +655,12 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 				c.openIdxDiag.SidecarFiles++
 			}
 			loaded := c.loadSealedIndex(seg, spec)
+			// Damage found by this open, in a segment whose existing sidecar was adopted, goes into
+			// that sidecar now: the next open may trust its extent, and must then know what to skip.
+			// A segment with no adopted sidecar gets one, with its damage, when it is sealed.
+			if seg.damageUnsaved && seg.keyIdx.Load() != nil {
+				c.persistSegDamage(seg)
+			}
 			// Record how this segment's index was handled: an adopted attribute index needs no
 			// rebuild; anything else the post-Open Reindex rebuilds by decoding every record,
 			// which is the slow-startup path this diagnostic exists to explain.
@@ -715,6 +717,14 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 // by replaying records: for each key the record with the greatest seq is its
 // current version, live iff it is not superseded (a key whose latest record was
 // tombstoned by a delete is absent). Chains are rebuilt fresh.
+//
+// It decides from record headers, which a damaged record's are not fit for: a damaged key that
+// matches a live one would win it with a damaged seq and have the live record superseded on disk
+// below. So when two records claim one key, both are checked against their CRC before either is
+// believed, and a damaged one joins its segment's damage set. A walk that does not land exactly on
+// its segment's extent was misframed by a damaged totalLen; the segment's damage is then derived
+// again (reframeSegment). Either finding restarts the replay, so every decision is made by a walk
+// that skips all the damage known.
 func (c *Collection) rebuildDir(sh *shard) {
 	if sh.appendOnly {
 		c.rebuildAppendLog(sh)
@@ -725,60 +735,114 @@ func (c *Collection) rebuildDir(sh *shard) {
 		seq        uint64
 		superseded uint64
 	}
-	byKey := make(map[string]best)
-	var maxSeq uint64
-	for _, seg := range sh.segs {
-		if seg == nil {
-			continue
+	type mark struct{ seq, millis uint64 }
+	var (
+		byKey  map[string]best
+		maxSeq uint64
+		marks  []mark
+	)
+	intact := map[loc]bool{} // CRC results, by record
+	recIntact := func(l loc) bool {
+		seg := sh.segs[l.seg]
+		if !seg.persistent {
+			return true // a RAM segment carries no CRC
 		}
-		for off := 0; off < seg.used; {
-			o := uint32(off)
-			total := recTotalLen(seg.data, o)
-			if total == 0 {
-				break
-			}
-			seq := recSeq(seg.data, o)
-			sup := recSuperseded(seg.data, o)
-			// commitSeq must cover every sequence ever assigned, including delete
-			// sequences (a delete bumps the sequence via supersededBySeq without
-			// writing a record); otherwise a deleted record would look current
-			// (S0 < its supersededBySeq) to a post-recovery scan.
-			if seq > maxSeq {
-				maxSeq = seq
-			}
-			if sup != seqMax && sup > maxSeq {
-				maxSeq = sup
-			}
-			// Rebuild the segment's scan-pruning metadata from disk (zeroed on reopen).
-			// Note the local maxSeq above is the SHARD's high-water mark; seg.maxSeq is
-			// this segment's, which resume-from-sequence scans use to skip it whole.
-			if seg.minSeq == 0 || seq < seg.minSeq {
-				seg.minSeq = seq
-			}
-			if seq > seg.maxSeq {
-				seg.maxSeq = seq
-			}
-			// A time-checkpoint marker feeds the shard time index; it never enters the
-			// directory, and its bytes count as dead (as appendMarker does at runtime)
-			// so a history-only segment reaches dead >= used.
-			if recIsMarker(seg.data, o) {
-				sh.tseq.record(seq, recMarkerMillis(seg.data, o))
-				seg.dead += int64(total)
-				off += int(total)
+		ok, seen := intact[l]
+		if !seen {
+			ok = recVerifyCRC(seg.data, l.off)
+			intact[l] = ok
+		}
+		return ok
+	}
+	reframed := map[*segment]int{}
+	for {
+		byKey = make(map[string]best)
+		maxSeq = 0
+		marks = marks[:0]
+		changed := false
+		for _, seg := range sh.segs {
+			if seg == nil {
 				continue
 			}
-			if sup != seqMax {
-				seg.dead += int64(total)
-				if sup > seg.maxSup {
-					seg.maxSup = sup
+			seg.minSeq, seg.maxSeq, seg.maxSup, seg.dead = 0, 0, 0, 0
+			dm := seg.damaged()
+			off := 0
+			for off < seg.used {
+				o := uint32(off)
+				if end, ok := dm.skip(o); ok {
+					off = int(end)
+					continue
 				}
+				total := recTotalLen(seg.data, o)
+				if total == 0 || total%8 != 0 || off+int(total) > seg.used {
+					break
+				}
+				seq := recSeq(seg.data, o)
+				sup := recSuperseded(seg.data, o)
+				// commitSeq must cover every sequence ever assigned, including delete
+				// sequences (a delete bumps the sequence via supersededBySeq without
+				// writing a record); otherwise a deleted record would look current
+				// (S0 < its supersededBySeq) to a post-recovery scan.
+				if seq > maxSeq {
+					maxSeq = seq
+				}
+				if sup != seqMax && sup > maxSeq {
+					maxSeq = sup
+				}
+				// Rebuild the segment's scan-pruning metadata from disk (zeroed on reopen).
+				// Note the local maxSeq above is the SHARD's high-water mark; seg.maxSeq is
+				// this segment's, which resume-from-sequence scans use to skip it whole.
+				if seg.minSeq == 0 || seq < seg.minSeq {
+					seg.minSeq = seq
+				}
+				if seq > seg.maxSeq {
+					seg.maxSeq = seq
+				}
+				// A time-checkpoint marker feeds the shard time index; it never enters the
+				// directory, and its bytes count as dead (as appendMarker does at runtime)
+				// so a history-only segment reaches dead >= used.
+				if recIsMarker(seg.data, o) {
+					marks = append(marks, mark{seq, recMarkerMillis(seg.data, o)})
+					seg.dead += int64(total)
+					off += int(total)
+					continue
+				}
+				if sup != seqMax {
+					seg.dead += int64(total)
+					if sup > seg.maxSup {
+						seg.maxSup = sup
+					}
+				}
+				key := string(recKey(seg.data, o))
+				cand := loc{seg.id, o}
+				if b, ok := byKey[key]; ok {
+					// Two records claim the key. Whichever wins supersedes the other on disk, so
+					// neither is believed until its checksum is.
+					for _, l := range [2]loc{b.loc, cand} {
+						if !recIntact(l) {
+							c.noteDamagedRecord(sh.segs[l.seg], l.off)
+							changed = true
+						}
+					}
+				}
+				if b, ok := byKey[key]; !ok || seq >= b.seq {
+					byKey[key] = best{cand, seq, sup}
+				}
+				off += int(total)
 			}
-			key := string(recKey(seg.data, o))
-			if b, ok := byKey[key]; !ok || seq >= b.seq {
-				byKey[key] = best{loc{seg.id, o}, seq, sup}
+			if off != seg.used {
+				// A damaged totalLen stepped the walk off the records' framing.
+				reframed[seg]++
+				c.reframeSegment(seg, reframed[seg] > 1)
+				changed = true
 			}
-			off += int(total)
 		}
+		if !changed {
+			break
+		}
+	}
+	for _, m := range marks {
+		sh.tseq.record(m.seq, m.millis)
 	}
 	sh.commitSeq = maxSeq
 
@@ -797,8 +861,13 @@ func (c *Collection) rebuildDir(sh *shard) {
 		if seg == nil {
 			continue
 		}
+		dm := seg.damaged()
 		for off := 0; off < seg.used; {
 			o := uint32(off)
+			if end, ok := dm.skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(seg.data, o)
 			if total == 0 {
 				break
@@ -836,11 +905,59 @@ func (c *Collection) rebuildDir(sh *shard) {
 	}
 }
 
+// noteDamagedRecord adds the record at off, found failing its checksum, to its segment's damage set.
+// The span ends where the record's own totalLen says: the caller has walked the segment by those
+// lengths to its extent (or will, and reframes it if not), which is how every other walk steps too.
+func (c *Collection) noteDamagedRecord(seg *segment, off uint32) {
+	dm := seg.damaged()
+	if dm.covers(off) {
+		return
+	}
+	seg.damage.Store(dm.with(damageSpan{off, off + recTotalLen(seg.data, off)}))
+	seg.damageUnsaved = true
+	damagedRecordsSkipped.Add(1)
+	c.openIdxDiag.notePastDamage(OpenDamageStop{Path: seg.path, Offset: int(off), Damaged: 1, Recovered: true})
+}
+
+// reframeSegment re-derives the damage of a segment whose header walk did not land on its extent: a
+// damaged totalLen inside a trusted extent misframes every walk that steps over it. The sidecar key
+// index, which lists every record's offset, delimits each record; one that does not frame to the next
+// or does not verify is damaged. Without a key index that describes the segment, the extent is not
+// trusted after all, and the segment is recovered as if it had none. last cuts the segment back to
+// the records the recovery walk verifies, for a segment that misframed again after reframing.
+func (c *Collection) reframeSegment(seg *segment, last bool) {
+	known := seg.damaged()
+	if last {
+		seg.damage.Store(nil)
+		seg.used, _ = recoveryExtent(seg.data)
+		seg.synced = seg.used
+		seg.stoppedAtDamage = true
+		return
+	}
+	if ki := sidecarKeyIndex(seg); ki != nil {
+		if spans, ok := keyIndexDamage(seg.data, seg.used, ki, c.h, known); ok && len(spans) > 0 {
+			dm := newDamageSet(spans)
+			seg.damage.Store(dm)
+			seg.damageUnsaved = true
+			if n := dm.len() - known.len(); n > 0 {
+				damagedRecordsSkipped.Add(int64(n))
+			}
+			c.openIdxDiag.notePastDamage(OpenDamageStop{Path: seg.path, Offset: int(spans[0].start),
+				Damaged: dm.len(), Recovered: true})
+			return
+		}
+	}
+	seg.damage.Store(nil)
+	seg.used = c.recoverExtent(seg)
+	seg.synced = seg.used
+}
+
 // rebuildAppendLog restores an append-only shard on reopen. An append log has no per-key
 // supersession or directory, so the single-current-version dedup that rebuildDir performs for a
 // mutable shard must be skipped: every on-disk record stays live (duplicate keys are intentional
 // here). It only recovers the commit sequence, the per-segment min sequence, the live count, and
-// the active (last) segment for continued appends.
+// the active (last) segment for continued appends. A segment whose walk is misframed is reframed
+// and walked again, as in rebuildDir.
 func (c *Collection) rebuildAppendLog(sh *shard) {
 	var maxSeq uint64
 	count := 0
@@ -848,26 +965,43 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 		if seg == nil {
 			continue
 		}
-		for off := 0; off < seg.used; {
-			o := uint32(off)
-			total := recTotalLen(seg.data, o)
-			if total == 0 {
-				break
+		for attempt := 1; ; attempt++ {
+			segMax, segCount := maxSeq, 0
+			seg.minSeq, seg.maxSeq = 0, 0
+			dm := seg.damaged()
+			off := 0
+			for off < seg.used {
+				o := uint32(off)
+				if end, ok := dm.skip(o); ok {
+					off = int(end)
+					continue
+				}
+				total := recTotalLen(seg.data, o)
+				if total == 0 || total%8 != 0 || off+int(total) > seg.used {
+					break
+				}
+				seq := recSeq(seg.data, o)
+				if seq > segMax {
+					segMax = seq // the shard's high-water mark
+				}
+				if seg.minSeq == 0 || seq < seg.minSeq {
+					seg.minSeq = seq
+				}
+				if seq > seg.maxSeq {
+					seg.maxSeq = seq // this segment's, for resume-from-sequence pruning
+				}
+				if !recIsMarker(seg.data, o) {
+					segCount++ // append-only records are never superseded, so all are live
+				}
+				off += int(total)
 			}
-			seq := recSeq(seg.data, o)
-			if seq > maxSeq {
-				maxSeq = seq // the shard's high-water mark
+			if off != seg.used {
+				c.reframeSegment(seg, attempt > 1)
+				continue
 			}
-			if seg.minSeq == 0 || seq < seg.minSeq {
-				seg.minSeq = seq
-			}
-			if seq > seg.maxSeq {
-				seg.maxSeq = seq // this segment's, for resume-from-sequence pruning
-			}
-			if !recIsMarker(seg.data, o) {
-				count++ // append-only records are never superseded, so all are live
-			}
-			off += int(total)
+			maxSeq = segMax
+			count += segCount
+			break
 		}
 	}
 	sh.commitSeq = maxSeq
@@ -947,14 +1081,100 @@ func (c *Collection) Close() error {
 	return firstErr
 }
 
+// recoverExtent derives a segment's extent when its sidecar supplies no trusted one: the recovery
+// walk, continued past damage in the middle of the segment where the framing can be proven (see
+// damage.go), with the damaged records stored as the segment's damage set. Where it cannot be proven
+// the walk stops at the damage, and what lies past it is counted (RecordsPastDamage) rather than
+// loaded.
+func (c *Collection) recoverExtent(seg *segment) int {
+	used, crcStop := recoveryExtent(seg.data)
+	// A torn tail has nothing after it. Records that verify past the stop are damage in the middle.
+	if !crcStop {
+		return used
+	}
+	past := surveyPastDamage(seg.data, used)
+	if past.Records == 0 && !past.Dictionary && !past.ColumnarPayload {
+		return used
+	}
+	past.Path, past.Offset = seg.path, used
+	if end, spans, ok := proveFramingPastDamage(seg.data, used, snapshotPath(seg), c.h); ok {
+		dm := newDamageSet(spans)
+		seg.damage.Store(dm)
+		seg.damageUnsaved = true
+		damagedRecordsSkipped.Add(int64(dm.len()))
+		past.Recovered = true
+		past.Loaded = past.Records
+		past.Records = 0
+		past.Damaged = len(spans)
+		c.openIdxDiag.notePastDamage(past)
+		return end
+	}
+	// Not loaded: say so, rather than come back short in silence.
+	seg.stoppedAtDamage = true
+	c.openIdxDiag.notePastDamage(past)
+	recordsPastDamage.Add(int64(past.Records + past.Damaged))
+	return used
+}
+
+// proveFramingPastDamage looks for a proof of a segment's framing past a recovery walk that stopped
+// at stop: a verified columnar payload after the damage, or failing that the key index of the
+// segment's sidecar (at sidecarPath) when one parses and describes the segment under hasher h. It
+// returns the extent and the damaged spans. Fsck runs it too, to say what a normal open will do.
+func proveFramingPastDamage(data []byte, stop int, sidecarPath string, h Hasher) (int, []damageSpan, bool) {
+	if end, spans, ok := recoverPastDamage(data, stop); ok {
+		return end, spans, true
+	}
+	ki := sidecarKeyIndexAt(sidecarPath)
+	if ki == nil || int(ki.upto) <= stop {
+		return 0, nil, false
+	}
+	upto := int(ki.upto)
+	if !recExtentEndsCleanly(data, upto) {
+		return 0, nil, false
+	}
+	spans, ok := keyIndexDamage(data, upto, ki, h, nil)
+	if !ok || len(spans) == 0 {
+		return 0, nil, false
+	}
+	return upto, spans, true
+}
+
+// sidecarKeyIndex reads a segment's key index from its sidecar file, or nil when there is none that
+// parses. Copied out of the file, so it does not depend on a mapping.
+func sidecarKeyIndex(seg *segment) *mmapKeyIndex { return sidecarKeyIndexAt(snapshotPath(seg)) }
+
+// sidecarKeyIndexAt is sidecarKeyIndex for a sidecar path.
+func sidecarKeyIndexAt(path string) *mmapKeyIndex {
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	_, key, _, _, ok := splitSegmentSidecar(data)
+	if !ok {
+		return nil
+	}
+	ki, err := parseKeyIndex(key)
+	if err != nil {
+		return nil
+	}
+	return ki
+}
+
 // recoveryExtent walks a segment from the start the way recovery does when no trusted extent is
-// recorded, returning where the written data ends. The walk stops at an unwritten (zero) or
-// impossible length, or at the first record that fails its checksum, which crcStop reports.
+// recorded, returning where the written data ends. The walk stops at an unwritten (zero) length, or
+// at damage, which crcStop reports: a record that fails its checksum, or a length that cannot be one
+// (not a multiple of 8, or running past the file).
 func recoveryExtent(data []byte) (used int, crcStop bool) {
 	for used+recHeaderSize <= len(data) {
 		total := int(recTotalLen(data, uint32(used)))
-		if total <= 0 || used+total > len(data) {
-			return used, false // unwritten (zero) tail or an impossible length
+		if total == 0 {
+			return used, false // unwritten tail
+		}
+		if total%8 != 0 || used+total > len(data) {
+			return used, true // a damaged length
 		}
 		if !recVerifyCRC(data, uint32(used)) {
 			return used, true // torn/partial record: the durable data ends here
@@ -1048,9 +1268,18 @@ func recExtentEndsCleanly(data []byte, used int) bool {
 
 // segFirstSeq returns the commit sequence of a segment's first record, which is its position
 // in append order. ok is false for an empty segment.
+//
+// A damaged first record's seq is not believed; the first record past its damage is used instead.
 func segFirstSeq(seg *segment) (uint64, bool) {
 	if seg == nil || seg.used < recHeaderSize {
 		return 0, false
 	}
-	return recSeq(seg.data, 0), true
+	off := uint32(0)
+	if end, ok := seg.damaged().skip(0); ok {
+		if int(end)+recHeaderSize > seg.used {
+			return 0, false
+		}
+		off = end
+	}
+	return recSeq(seg.data, off), true
 }
