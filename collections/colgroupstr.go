@@ -135,15 +135,21 @@ func newGroupCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCach
 // Such a record still forms a group in the scan, so the caller gives the query back rather than
 // returning a result with a group missing.
 func (c *groupCol) accFor(k int, bc *blockCache, acc *groupAccum, nAgg int) (*groupAcc, bool) {
-	// A bucket floors a NUMBER, so a string column has no groups at all under one. Answering here
-	// also keeps the per-code table below from caching accumulators for groups that must not exist.
-	if c.isStr && acc.bucket > 0 {
-		return nil, true
-	}
 	// The dictionary fast path: one indexed read of the code column, then an array index. The group
 	// is resolved once per distinct value per block, so this loop does no hashing at all after the
 	// block's first few records.
 	if c.hasDict && !testBit(c.blk.escapeAt(k), c.fieldIdx) {
+		// Under a bucket this record's value comes from the string dictionary, and a string has
+		// no bucket to be floored into, so it leaves the series exactly as the scan drops it.
+		//
+		// Only this RECORD, not the column. A column is typed by what dominates it, and a string
+		// column still carries the records whose value escaped that type -- a number among the
+		// strings buckets normally, and those records reach keyAt below. Skipping the whole column
+		// here instead lost them silently: every count stayed plausible and most of the groups
+		// simply were not there.
+		if acc.bucket > 0 {
+			return nil, true
+		}
 		code := dictCodeAt(c.codes, c.codeW, k)
 		if code >= len(c.entries) {
 			return nil, false
@@ -152,7 +158,7 @@ func (c *groupCol) accFor(k int, bc *blockCache, acc *groupAccum, nAgg int) (*gr
 			g.n++
 			return g, true
 		}
-		// Unreachable with a bucket (the guard above returns first), so accFor cannot decline here.
+		// Unreachable with a bucket (the guard above returns first), so accFor cannot decline.
 		g, _ := acc.accFor(groupKey{kind: gkString, s: bytesToStr(c.entries[code])}, nAgg)
 		c.codeAcc[code] = g
 		return g, true
