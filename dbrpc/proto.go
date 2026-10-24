@@ -242,6 +242,18 @@ const (
 	// serves any aggregate shape. Separate opcode rather than a flag so an older server rejects it
 	// cleanly and the client falls back to opArchiveAggregate (rows, no breakdown).
 	opArchiveAggregateStats op = 65
+
+	// opQueryStats returns the server's aggregated query report (see QueryStatsReport):
+	// every served query bucketed by its SHAPE -- opcode, table, constraint fingerprint
+	// and whether a LIMIT was sent -- ranked by total time, each bucket carrying the
+	// slowest actual instances as exemplars.
+	//
+	// The shapes carry no user data and are returned to any peer that may read. The
+	// exemplars carry real constraint text and the requesting identity, so the server
+	// includes them only on a DAEMON-authorized connection; reset is likewise refused
+	// without DAEMON (it would let any reader erase the evidence).
+	// [table ("" = all)][reset u8] -> [json QueryStatsReport]
+	opQueryStats op = 66
 )
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
@@ -324,6 +336,8 @@ func (o op) String() string {
 		return "AggregateBucketed"
 	case opDiag:
 		return "Diagnostics"
+	case opQueryStats:
+		return "QueryStats"
 	case opExplain:
 		return "Explain"
 	case opMatchExplain:

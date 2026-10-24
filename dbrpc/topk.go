@@ -97,9 +97,19 @@ func (s *Server) streamTopKOpt(ctx context.Context, reqID uint64, r *reader, inc
 		attrs = append(attrs, r.str())
 	}
 	n := 0
+	// Collect the cutoff scan's breakdown when the client asked for it (EXPLAIN ANALYZE)
+	// and also whenever the server is aggregating queries, so a top-K shows in the
+	// aggregate with its scan work rather than as an unexplained duration.
+	useStats := wantStats || s.queryStatsOn()
+	var stats collections.ScanStats
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: "TopK", Table: table, Constraint: constraint, Limit: k, Rows: n, Duration: time.Since(start)})
+			q := QueryLog{Op: "TopK", Table: table, Constraint: constraint, Limit: k,
+				Rows: n, Projection: len(attrs), Duration: time.Since(start)}
+			if useStats {
+				q.Scan = stats
+			}
+			qlog(q)
 		}()
 	}
 	if r.err != nil {
@@ -119,22 +129,21 @@ func (s *Server) streamTopKOpt(ctx context.Context, reqID uint64, r *reader, inc
 		}
 	}
 	var rows [][]classad.Value
-	var stats collections.ScanStats
 	var err error
 	if d, ok := s.cat.Table(table); ok {
-		if wantStats {
+		if useStats {
 			rows, stats, err = d.TopKStats(constraint, attrs, orderAttr, desc, k)
 		} else {
 			rows, err = d.TopK(constraint, attrs, orderAttr, desc, k)
 		}
 	} else if d, ok := s.cat.ViewBacking(table); ok {
-		if wantStats {
+		if useStats {
 			rows, stats, err = d.TopKStats(constraint, attrs, orderAttr, desc, k)
 		} else {
 			rows, err = d.TopK(constraint, attrs, orderAttr, desc, k)
 		}
 	} else if a, ok := s.cat.ArchiveTable(table); ok {
-		if wantStats {
+		if useStats {
 			rows, stats, err = a.TopKStats(constraint, attrs, orderAttr, desc, k)
 		} else {
 			rows, err = a.TopK(constraint, attrs, orderAttr, desc, k)
