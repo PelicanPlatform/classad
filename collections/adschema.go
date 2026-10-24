@@ -75,6 +75,46 @@ type adSchemaOpts struct {
 	// Strings includes string attributes as 8-byte SSO slots (a per-record string table). Off
 	// by default: with no cross-record dedup this can regress compressed size.
 	Strings bool
+	// Require names attribute ids that bypass the PRESENCE test -- nothing else. A required
+	// attribute still has to have a dominant storable kind, and an int's width is still chosen
+	// by Fit from the sampled values exactly as for any other field.
+	//
+	// It exists because presence and demand measure different things and only presence decides
+	// membership. A field costs bytes in every record that lacks it, which is what the floor
+	// bounds; but an attribute written only once a record reaches a given state can sit far
+	// below the floor while being the one the workload reads most, and no amount of demand
+	// would ever admit it. The floor is the right default and the wrong absolute.
+	//
+	// The library attaches no meaning to the names -- which attributes deserve this is a
+	// property of the data's lifecycle, which only the use case knows.
+	Require map[uint32]struct{}
+}
+
+// Why a required attribute was not admitted after all. A required attribute that quietly does
+// nothing is the failure mode worth spending diagnostics on: the operator asked for a column,
+// got none, and has no way to tell that from "the column is there and not helping".
+const (
+	// requireSkipAbsent: zero occurrences in the sample, so there is no kind and no width to
+	// lay a slot out with. Skipping is the only option; it is reported so the operator can see
+	// that the name is wrong, or that the data does not carry it yet.
+	requireSkipAbsent = "absent from the sample: no kind or width to lay out a slot with"
+	// requireSkipNoLiteral: present, but never as a stored literal -- an expression, a list, or
+	// undefined. Forcing a slot here is strictly worse than leaving the attribute alone. The
+	// value is never in the column, so every read falls through to the record exactly as it would
+	// with no field at all, while every record carries an escape bit and the layout for a slot
+	// nothing occupies -- and a numeric column whose cells escape to EXPRESSIONS makes the
+	// vectorized count hand the query back per record, turning a block-at-a-time scan into a
+	// row-at-a-time one. That is the opposite of what a schema field is for.
+	requireSkipNoLiteral = "no dominant literal value (expression-valued): a slot would escape in every record"
+	// requireSkipStringsOff: dominantly a string while string fields are disabled for this
+	// schema. Admitting it would contradict the Strings option rather than the presence floor.
+	requireSkipStringsOff = "string-valued, and string fields are disabled for this schema"
+)
+
+// requireSkip is one required attribute that could not become a field, and why.
+type requireSkip struct {
+	ID     uint32
+	Reason string
 }
 
 // intFits reports whether v fits the given width and signedness.
@@ -157,6 +197,14 @@ func nodeKind(node []byte) (adKind, wire.Literal) {
 // buildAdSchema samples wire ads and resolves a schema: attributes whose dominant storable kind
 // is present in >= opts.Presence of the ads, laid out smallest-to-largest.
 func buildAdSchema(sample [][]byte, opts adSchemaOpts) *adSchema {
+	s, _ := buildAdSchemaReport(sample, opts)
+	return s
+}
+
+// buildAdSchemaReport is buildAdSchema, also returning what became of each opts.Require entry
+// that did not make it into the schema. The skips are the whole reason the report exists: the
+// field list shows what was admitted, and nothing else shows what was asked for and refused.
+func buildAdSchemaReport(sample [][]byte, opts adSchemaOpts) (*adSchema, []requireSkip) {
 	n := len(sample)
 	type stat struct {
 		kinds   [5]int
@@ -180,17 +228,30 @@ func buildAdSchema(sample [][]byte, opts adSchemaOpts) *adSchema {
 	}
 
 	var fields []adField
+	var skipped []requireSkip
 	for id, st := range stats {
+		_, required := opts.Require[id]
 		domK, domC := akNone, 0
 		for k := akBool; k <= akString; k++ {
 			if st.kinds[k] > domC {
 				domC, domK = st.kinds[k], adKind(k)
 			}
 		}
-		if domK == akNone || (domK == akString && !opts.Strings) {
+		switch {
+		case domK == akNone:
+			if required {
+				skipped = append(skipped, requireSkip{id, requireSkipNoLiteral})
+			}
+			continue
+		case domK == akString && !opts.Strings:
+			if required {
+				skipped = append(skipped, requireSkip{id, requireSkipStringsOff})
+			}
 			continue
 		}
-		if n == 0 || float64(domC)/float64(n) < opts.Presence {
+		// Required bypasses the presence floor and nothing else: the kind is still the
+		// dominant one found above, and an int's width is still chosen by Fit below.
+		if !required && (n == 0 || float64(domC)/float64(n) < opts.Presence) {
 			continue
 		}
 		f := adField{id: id, kind: domK}
@@ -202,8 +263,14 @@ func buildAdSchema(sample [][]byte, opts adSchemaOpts) *adSchema {
 		} // akString has no fixed width -- it is positional in the string region
 		fields = append(fields, f)
 	}
+	for id := range opts.Require {
+		if _, seen := stats[id]; !seen {
+			skipped = append(skipped, requireSkip{id, requireSkipAbsent})
+		}
+	}
+	sort.Slice(skipped, func(i, j int) bool { return skipped[i].ID < skipped[j].ID })
 
-	return layoutSchema(fields)
+	return layoutSchema(fields), skipped
 }
 
 // layoutSchema orders the fields (bool, int by ascending width, real, string; ties by id) and

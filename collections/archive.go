@@ -106,6 +106,12 @@ type ArchiveOptions struct {
 	// made once per segment and lived with.
 	RowGroupBytes int
 
+	// SchemaRequireAttrs names attributes that enter the derived columnar schema whatever their
+	// presence rate (see Options.SchemaRequireAttrs). It matters most on an archive: a record is
+	// written once, in a final state, so attributes a record only acquires late in its life are
+	// exactly the ones a history query reads and exactly the ones the presence floor keeps out.
+	SchemaRequireAttrs []string
+
 	// GroupSchemaCount and its companions enable secondary columnar schemas (see Options).
 	GroupSchemaCount    int
 	GroupStabilityRuns  int
@@ -157,6 +163,7 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		InternAtSeal:        opts.InternAtSeal, // intern each segment eagerly at seal
 		IndexBackfillBytes:  opts.IndexBackfillBytes,
 		RowGroupBytes:       opts.RowGroupBytes,
+		SchemaRequireAttrs:  opts.SchemaRequireAttrs,
 		GroupSchemaCount:    opts.GroupSchemaCount,
 		GroupStabilityRuns:  opts.GroupStabilityRuns,
 		GroupMergeJaccard:   opts.GroupMergeJaccard,
@@ -419,6 +426,26 @@ func (a *Archive) ReschemaScan(sampleMax, hotTopN int) bool {
 
 // SchemaScanInfo reports the columnar accelerator's state for the archive.
 func (a *Archive) SchemaScanInfo() SchemaScanInfo { return a.c.SchemaScanInfo() }
+
+// SchemaRequireAttrs returns the archive's effective required-attribute set, and
+// SchemaRequireRuntimeAttrs the subset added at runtime (see Collection).
+func (a *Archive) SchemaRequireAttrs() []string        { return a.c.SchemaRequireAttrs() }
+func (a *Archive) SchemaRequireRuntimeAttrs() []string { return a.c.SchemaRequireRuntimeAttrs() }
+
+// SetSchemaRequireAttrs / AddSchemaRequireAttrs / DropSchemaRequireAttrs change the required set
+// (see Collection). Each reports whether the effective set changed; none re-derives anything --
+// adopting a new schema means ReschemaScan, which rebuilds every sealed segment's block.
+func (a *Archive) SetSchemaRequireAttrs(names []string) bool { return a.c.SetSchemaRequireAttrs(names) }
+func (a *Archive) AddSchemaRequireAttrs(names ...string) bool {
+	return a.c.AddSchemaRequireAttrs(names...)
+}
+func (a *Archive) DropSchemaRequireAttrs(names ...string) bool {
+	return a.c.DropSchemaRequireAttrs(names...)
+}
+
+// SchemaRequireSkipped returns the required attributes the archive's last schema derivation
+// refused, with the reason (see Collection.SchemaRequireSkipped).
+func (a *Archive) SchemaRequireSkipped() []SchemaRequireSkip { return a.c.SchemaRequireSkipped() }
 
 // NumStatsQuery computes numeric aggregate inputs for attr over the archive's matching records
 // via the columnar scan (see Collection.NumStatsQuery). Only meaningful once the archive carries

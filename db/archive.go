@@ -84,6 +84,22 @@ type ArchiveConfig struct {
 	// for deliberately and a bad thing to get by leaving a field unset, which is why it is
 	// not what zero means.
 	IndexBackfillBytes int64
+	// SchemaRequireAttrs names attributes that enter the derived columnar schema whatever their
+	// presence rate (see collections.Options.SchemaRequireAttrs). It is the CONFIGURED tier:
+	// read at create, persisted here, and authoritative on reopen like the rest of this config,
+	// so an application whose own configuration changed re-asserts it with SetSchemaRequireAttrs.
+	//
+	// An archive is where this matters most. Its records are written once, already in their
+	// final state, so an attribute a record acquires only late in its life -- the resource
+	// figures a job has only after it has run -- is simultaneously the thing history queries read
+	// and the thing the presence floor excludes, because the records that never reached that
+	// state are in the same table.
+	SchemaRequireAttrs []string
+	// SchemaRequireRuntime names the subset added at runtime rather than configured, kept apart
+	// for the reason AutoAttrs is: a name that comes back from a restart should say where it came
+	// from. SetSchemaRequireAttrs replaces the configured tier and leaves this one alone, so an
+	// operator's experiment is not erased by the application re-asserting its config.
+	SchemaRequireRuntime []string
 	// GroupSchemaCount is how many secondary columnar schemas to derive for attributes the base
 	// schema does not carry (see db.Config). 0 takes the default; a NEGATIVE value builds none.
 	// An archive's maintenance cadence is long, so the stability gate's several derivations span
@@ -155,6 +171,7 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		CategoricalAttrs:    cfg.CategoricalAttrs,
 		ValueAttrs:          cfg.ValueAttrs,
 		ZoneAttrs:           cfg.ZoneAttrs,
+		SchemaRequireAttrs:  cfg.SchemaRequireAttrs,
 		IndexBackfillBytes:  cfg.backfillHorizon(),
 		Retention:           cfg.Retention,
 	}
@@ -179,6 +196,11 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 	// installed over: HotAttrs is what someone asked for and stays hot.
 	if len(cfg.AutoHotAttrs) > 0 {
 		a.AddHotAttrs(cfg.AutoHotAttrs...)
+	}
+	// The configured tier went in through the options above; restore the runtime tier on top of
+	// it. Nothing is re-derived: a required-set change takes effect at the next ReschemaScan.
+	if len(cfg.SchemaRequireRuntime) > 0 {
+		a.AddSchemaRequireAttrs(cfg.SchemaRequireRuntime...)
 	}
 	if create {
 		// Persist the config so a later reopen rebuilds the same indexes/retention.
@@ -913,6 +935,65 @@ func (t *ArchiveTable) SetRowGroupBytes(n int) error {
 
 // RowGroupBytes reports the budget currently in effect (0 meaning the default).
 func (t *ArchiveTable) RowGroupBytes() int { return t.a.RowGroupBytes() }
+
+// SchemaRequireAttrs returns the archive's effective required-attribute set, and
+// SchemaRequireSkipped the members of it the last derivation could not make a field of.
+func (t *ArchiveTable) SchemaRequireAttrs() []string { return t.a.SchemaRequireAttrs() }
+func (t *ArchiveTable) SchemaRequireSkipped() []SchemaRequireSkip {
+	return t.a.SchemaRequireSkipped()
+}
+
+// SetSchemaRequireAttrs replaces the CONFIGURED required-attribute set and persists it
+// (archiveconfig.json), which is how an application re-asserts its own configuration onto an
+// archive that was created with a different one -- archiveconfig.json is authoritative on reopen,
+// so the ArchiveConfig field alone takes effect only at create.
+//
+// It reports whether the effective set changed, and re-derives NOTHING. Every sealed segment's
+// columnar block was built against the current schema; adopting a new one means ReschemaScan,
+// re-encoding a block per sealed segment, which at history scale is the whole archive read back
+// through the decompressor. A true return is the signal that the rebuild is owed, not that it ran.
+func (t *ArchiveTable) SetSchemaRequireAttrs(names []string) (bool, error) {
+	if !t.a.SetSchemaRequireAttrs(names) {
+		return false, nil
+	}
+	return true, t.saveRequireConfig()
+}
+
+// AddSchemaRequireAttrs / DropSchemaRequireAttrs change the set by name and persist it. Add goes
+// to the runtime tier (it survives a restart); Drop removes from both, and dropping a configured
+// attribute lasts only until the application re-asserts its configuration.
+func (t *ArchiveTable) AddSchemaRequireAttrs(names ...string) (bool, error) {
+	if !t.a.AddSchemaRequireAttrs(names...) {
+		return false, nil
+	}
+	return true, t.saveRequireConfig()
+}
+
+func (t *ArchiveTable) DropSchemaRequireAttrs(names ...string) (bool, error) {
+	if !t.a.DropSchemaRequireAttrs(names...) {
+		return false, nil
+	}
+	return true, t.saveRequireConfig()
+}
+
+// saveRequireConfig folds the archive's live required set back into the saved config, keeping the
+// two tiers apart, and rewrites archiveconfig.json.
+func (t *ArchiveTable) saveRequireConfig() error {
+	runtime := t.a.SchemaRequireRuntimeAttrs()
+	runtimeSet := make(map[string]bool, len(runtime))
+	for _, n := range runtime {
+		runtimeSet[n] = true
+	}
+	var configured []string
+	for _, n := range t.a.SchemaRequireAttrs() {
+		if !runtimeSet[n] {
+			configured = append(configured, n)
+		}
+	}
+	t.cfg.SchemaRequireAttrs = configured
+	t.cfg.SchemaRequireRuntime = runtime
+	return t.saveConfig()
+}
 
 // SetGCFloor installs a runtime GC watermark (in the archive's MinAgeAttr units) so the next
 // Rotate may reclaim already-consumed records early: a change-feed source passes the feed's

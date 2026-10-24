@@ -120,7 +120,8 @@ func (c *Collection) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
 	if st := c.schemaScan.Load(); st != nil {
 		base = st.schema
 	} else {
-		base = buildAdSchema(samples, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
+		opts, _ := c.baseSchemaOpts()
+		base = buildAdSchema(samples, opts)
 	}
 	groups := c.deriveGroupSchemas(samples, base, k)
 
@@ -299,7 +300,8 @@ func (c *Collection) GroupSchemaAgreement(sampleMax, k int) GroupSchemaAgreement
 				continue
 			}
 			segs++
-			base := buildAdSchema(samples, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
+			opts, _ := c.baseSchemaOpts()
+			base := buildAdSchema(samples, opts)
 			found := map[string]bool{}
 			for _, g := range c.deriveGroupSchemas(samples, base, k) {
 				var attrs []string

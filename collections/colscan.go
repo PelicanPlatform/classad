@@ -114,6 +114,15 @@ type SchemaScanInfo struct {
 	// available to a READ-level client, unlike GroupSchemas(sampleMax, k), which derives fresh
 	// CANDIDATE groups from a new sample. Empty when no group is committed.
 	Groups []SchemaScanGroup `json:"groups,omitempty"`
+	// Require is the attribute set configured to enter the schema whatever its presence rate, and
+	// RequireSkipped the members of it the last derivation could not make a field of, with the
+	// reason. Both are reported because the alternative is an operator who asked for a column,
+	// did not get one, and has nothing to look at: the Schema list above shows what IS a field,
+	// and a required attribute that is absent from it looks exactly like one that was never
+	// required. The per-field Required flag closes the other half -- which fields are here
+	// because they were asked for rather than because they cleared the floor.
+	Require        []string            `json:"require,omitempty"`
+	RequireSkipped []SchemaRequireSkip `json:"requireSkipped,omitempty"`
 }
 
 // SchemaScanGroup is one committed secondary (group) schema: the co-occurring attributes stored
@@ -135,6 +144,10 @@ type SchemaScanField struct {
 	Width    int    `json:"width,omitempty"`
 	Unsigned bool   `json:"unsigned,omitempty"`
 	Hot      bool   `json:"hot,omitempty"`
+	// Required marks a field admitted because it was named in the required set, rather than
+	// because its presence cleared the floor. It says nothing about whether the slot is paying
+	// for itself -- SchemaFit's Missing rate is where that shows.
+	Required bool `json:"required,omitempty"`
 }
 
 // String names a schema field's kind for display.
@@ -155,6 +168,16 @@ func (k adKind) String() string {
 // SchemaScanInfo returns the columnar accelerator's current state (see SchemaScanInfo).
 func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 	var info SchemaScanInfo
+	info.Require = c.SchemaRequireAttrs()
+	info.RequireSkipped = c.SchemaRequireSkipped()
+	required := make(map[uint32]bool, len(info.Require))
+	if c.intern != nil {
+		for _, n := range info.Require {
+			if id, ok := c.intern.LookupID(n); ok {
+				required[id] = true
+			}
+		}
+	}
 	if st := c.schemaScan.Load(); st != nil {
 		info.Enabled = true
 		info.SchemaFields = len(st.schema.fields)
@@ -198,6 +221,7 @@ func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 				Width:    f.width,
 				Unsigned: f.unsigned,
 				Hot:      hot[i],
+				Required: required[f.id],
 			})
 		}
 	}
@@ -599,7 +623,9 @@ func (c *Collection) deriveSchema(sampleMax, hotTopN int) (*adSchema, []int, boo
 			return nil, nil, false
 		}
 	}
-	s := buildAdSchema(samples, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})
+	opts, reqNames := c.baseSchemaOpts()
+	s, reqSkipped := buildAdSchemaReport(samples, opts)
+	c.recordRequireSkips(reqSkipped, reqNames)
 	if len(s.fields) == 0 {
 		return nil, nil, false
 	}

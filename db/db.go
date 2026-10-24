@@ -142,6 +142,16 @@ type Config struct {
 	// collections.Options.DeltaMax for the trade.
 	DeltaMax int
 
+	// SchemaRequireAttrs names attributes that enter the derived columnar schema whatever their
+	// presence rate, overriding the rule that an attribute becomes a fixed-slot field only when
+	// it appears in at least 90% of sampled ads. See collections.Options.SchemaRequireAttrs for
+	// what the override does and does not relax.
+	//
+	// Read at open and treated as the CONFIGURED tier: anything added later with
+	// AddSchemaRequireAttrs is kept alongside it and persisted, so a runtime addition survives a
+	// restart while a change to this field still takes effect on the next open.
+	SchemaRequireAttrs []string
+
 	// GroupSchemaCount is how many SECONDARY columnar schemas to derive: sets of attributes the
 	// base schema does not carry which are present or absent together, stored columnar for the
 	// ads that hold them without costing a slot in the ads that do not. 0 takes the default (4);
@@ -213,6 +223,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		CategoricalAttrs:        cfg.CategoricalAttrs,
 		ValueAttrs:              cfg.ValueAttrs,
 		MatchClosureRoots:       cfg.MatchClosureRoots,
+		SchemaRequireAttrs:      cfg.SchemaRequireAttrs,
 		GroupSchemaCount:        cfg.GroupSchemaCount,
 		GroupStabilityRuns:      cfg.GroupStabilityRuns,
 		GroupMergeJaccard:       cfg.GroupMergeJaccard,
@@ -552,11 +563,13 @@ type (
 	CodecStats      = collections.CodecStats
 	SchemaScanInfo  = collections.SchemaScanInfo
 	SchemaScanField = collections.SchemaScanField
-	SchemaScanGroup = collections.SchemaScanGroup
-	SchemaFieldFit  = collections.SchemaFieldFit
-	QueryExplain    = collections.QueryExplain
-	ProbeExplain    = collections.ProbeExplain
-	MatchExplain    = collections.MatchExplain
+	// SchemaRequireSkip is one required attribute the last schema derivation refused, with why.
+	SchemaRequireSkip = collections.SchemaRequireSkip
+	SchemaScanGroup   = collections.SchemaScanGroup
+	SchemaFieldFit    = collections.SchemaFieldFit
+	QueryExplain      = collections.QueryExplain
+	ProbeExplain      = collections.ProbeExplain
+	MatchExplain      = collections.MatchExplain
 )
 
 // CodecStats reports the storage codec's state and effectiveness (name, dictionary
@@ -633,6 +646,45 @@ func (db *DB) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) { return db.c.Sch
 // deliberately keeps the schema stable. Returns false if there was nothing to sample or the
 // accelerator cannot run here.
 func (db *DB) ReschemaScan(sampleMax, hotTopN int) bool { return db.c.ReschemaScan(sampleMax, hotTopN) }
+
+// SchemaRequireAttrs returns the effective required-attribute set -- the attributes that enter
+// the derived schema whatever their presence rate (see Config.SchemaRequireAttrs).
+func (db *DB) SchemaRequireAttrs() []string { return db.c.SchemaRequireAttrs() }
+
+// SchemaRequireSkipped returns the required attributes the last schema derivation could not make
+// a field of, with the reason (absent from the sample, or no dominant literal value).
+func (db *DB) SchemaRequireSkipped() []SchemaRequireSkip { return db.c.SchemaRequireSkipped() }
+
+// SetSchemaRequireAttrs replaces the configured required-attribute set, keeping anything added at
+// runtime. AddSchemaRequireAttrs / DropSchemaRequireAttrs change it by name. Each reports whether
+// the effective set changed, and persists the runtime tier so it survives a restart.
+//
+// None of them re-derives anything. Every sealed segment's columnar block was built against the
+// current schema, so a changed set takes effect only at the next ReschemaScan -- which re-encodes
+// a block per sealed segment, a cost on the scale of the whole table. The caller decides when to
+// pay it; a configuration reload must not start it by itself.
+// The error return is always nil: index-config persistence here is best-effort, as it is for
+// AddIndex and the hot set. It exists so both table types present the same surface -- an archive
+// writes archiveconfig.json and can fail -- and so a caller that starts checking it does not have
+// to change shape.
+func (db *DB) SetSchemaRequireAttrs(names []string) (bool, error) {
+	return db.persistRequire(db.c.SetSchemaRequireAttrs(names))
+}
+
+func (db *DB) AddSchemaRequireAttrs(names ...string) (bool, error) {
+	return db.persistRequire(db.c.AddSchemaRequireAttrs(names...))
+}
+
+func (db *DB) DropSchemaRequireAttrs(names ...string) (bool, error) {
+	return db.persistRequire(db.c.DropSchemaRequireAttrs(names...))
+}
+
+func (db *DB) persistRequire(changed bool) (bool, error) {
+	if changed {
+		db.saveIndexConfig()
+	}
+	return changed, nil
+}
 
 // IndexedAttrs returns the currently-indexed attribute names, split into
 // categorical (string equality/membership) and value (numeric + range) indexes.
