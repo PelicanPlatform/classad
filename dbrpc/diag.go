@@ -155,6 +155,10 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 //	schema.fit [sampleMax]            report how well the derived schema still fits the data
 //	schema.rebuild [sampleMax topN]   re-derive the schema and rebuild every columnar block
 //	                                  (both also available on an archive table)
+//	schema.require                    list the attributes required in the schema regardless of
+//	                                  presence, and any the last derivation refused
+//	schema.require.add <attr>...      require attributes whose presence is too low to admit them
+//	schema.require.drop <attr>...     stop requiring them (both: schema.rebuild to take effect)
 //	compact                           reclaim dead space in warranted shards
 //	rewrite                           re-encode all ads with the current hot set
 //	codec.retrain [sampleMax]         train/refresh the ZSTD dictionary + recompress
@@ -282,6 +286,8 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 		return schemaGroupsAgreeAction(t, args)
 	case "schema.rebuild":
 		return schemaRebuildAction(t, args, s.maintainOpts.HotTopN)
+	case "schema.require", "schema.require.add", "schema.require.drop":
+		return schemaRequireAction(t, action, args)
 	case "analyze":
 		// On-demand self-tuning pass ("optimize now"), the manual counterpart to the scheduled
 		// StartMaintenance. Reuses the server's configured maintenance options so it matches the
@@ -448,6 +454,8 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string, maintainOpts
 		return schemaGroupsAgreeAction(a, args)
 	case "schema.rebuild":
 		return schemaRebuildAction(a, args, hotTopN)
+	case "schema.require", "schema.require.add", "schema.require.drop":
+		return schemaRequireAction(a, action, args)
 	case "rotate":
 		n, err := a.Rotate(float64(time.Now().Unix()))
 		if err != nil {
@@ -782,6 +790,59 @@ type schemaScanTable interface {
 	GroupSchemas(sampleMax, k int) db.GroupSchemaInfo
 	GroupSchemaDrift() db.GroupSchemaDrift
 	GroupSchemaAgreement(sampleMax, k int) db.GroupSchemaAgreement
+	SchemaRequireAttrs() []string
+	SchemaRequireSkipped() []db.SchemaRequireSkip
+	AddSchemaRequireAttrs(names ...string) (bool, error)
+	DropSchemaRequireAttrs(names ...string) (bool, error)
+}
+
+// schemaRequireAction lists or changes the required-attribute set: the attributes that enter the
+// derived columnar schema whatever their presence rate. One implementation for both table types.
+//
+// Changing the set is deliberately only half the operation. Every sealed segment's columnar block
+// was built against the schema the old set produced, and adopting a new one means re-deriving it
+// and rebuilding every one of those blocks -- a cost on the scale of the whole table, the same
+// shape as the first columnar build. So the change is recorded and persisted here, and the
+// response says plainly that schema.rebuild is what makes it take effect. Doing the rebuild
+// inside an "add an attribute" verb would hide hours of I/O behind a one-word command.
+func schemaRequireAction(t schemaScanTable, action string, args []string) (string, error) {
+	switch action {
+	case "schema.require":
+		if len(args) > 0 {
+			return "", fmt.Errorf("schema.require takes no arguments (use schema.require.add / schema.require.drop)")
+		}
+		cur := t.SchemaRequireAttrs()
+		b, err := json.Marshal(struct {
+			Require []string               `json:"require"`
+			Skipped []db.SchemaRequireSkip `json:"skipped,omitempty"`
+		}{cur, t.SchemaRequireSkipped()})
+		if err != nil {
+			return "", err
+		}
+		return string(b), nil
+	case "schema.require.add", "schema.require.drop":
+		if len(args) == 0 {
+			return "", fmt.Errorf("%s needs at least one attribute", action)
+		}
+		var changed bool
+		var err error
+		if action == "schema.require.add" {
+			changed, err = t.AddSchemaRequireAttrs(args...)
+		} else {
+			changed, err = t.DropSchemaRequireAttrs(args...)
+		}
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", action, err)
+		}
+		cur := t.SchemaRequireAttrs()
+		if !changed {
+			return "required schema attributes unchanged: " + join(cur), nil
+		}
+		return fmt.Sprintf("required schema attributes: %s (run schema.rebuild to re-derive the "+
+			"schema and rebuild every sealed segment's columnar block -- until then the change is "+
+			"recorded but not in effect)", join(cur)), nil
+	}
+	return "", fmt.Errorf("unknown schema.require action %q", action)
 }
 
 // schemaFitAction reports how well the derived schema still matches the data. Report only: the

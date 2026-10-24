@@ -111,6 +111,33 @@ type Options struct {
 	// header) instead of decoding the whole ad. Optional; enables the hot-closure match
 	// fast path. The frequency/HotAttrs hot set is unioned in, so queries are unaffected.
 	MatchClosureRoots []string
+	// SchemaRequireAttrs names attributes that enter the derived columnar schema whatever their
+	// presence rate -- the override on the rule that an attribute becomes a fixed-slot field only
+	// when its dominant storable kind appears in at least 90% of sampled records.
+	//
+	// That floor bounds a real cost (a slot is bytes in EVERY record, including those that lack
+	// the attribute) and it is the right default, but it is the only test of membership: the
+	// demand ranking that picks the hot tier chooses among fields the schema already has, so no
+	// amount of reading ever admits one. An attribute written only once a record reaches some
+	// state can sit far below the floor and still be the most-queried attribute in the workload.
+	//
+	// Required bypasses PRESENCE only. The attribute must still have a dominant storable literal
+	// kind -- one that is usually an expression is refused, because a slot that escapes in every
+	// record is strictly worse than no slot: the value is read from the record either way, every
+	// record pays the escape bit and the layout, and a numeric column of escaped expressions makes
+	// the vectorized count hand the query back per record. An int's width is still chosen by Fit
+	// from the sampled values. One with no occurrences at all
+	// is skipped, since there is no kind or width to lay a slot out with. Both refusals are
+	// reported (SchemaRequireSkipped, SchemaScanInfo.RequireSkipped).
+	//
+	// Nothing in this package reads an attribute NAME. Which attributes deserve a slot they have
+	// not earned by presence depends on the lifecycle of the records being stored, which only the
+	// use case knows; this is the knob it supplies them through.
+	//
+	// Changing the set on a live collection does NOT re-derive anything: every sealed segment's
+	// columnar block was built against the current schema, so adopting a new one means
+	// ReschemaScan, which rebuilds them all. See SetSchemaRequireAttrs.
+	SchemaRequireAttrs []string
 	// GroupSchemaCount is how many SECONDARY columnar schemas to derive and build alongside the
 	// base one, for attributes the base schema does not carry which are present or absent
 	// together. 0 uses defaultGroupSchemas; a NEGATIVE value builds none.
@@ -423,12 +450,18 @@ type Collection struct {
 	// ops' internal reindexAfterCompaction must not re-take).
 	reindexMu sync.Mutex
 
-	demand           *demandTracker // per-attribute query demand, for SuggestIndexes
-	demandHalf       time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
-	groupSchemaCount int            // Options.GroupSchemaCount
-	groupStability   int            // Options.GroupStabilityRuns
-	groupJac         float64        // Options.GroupMergeJaccard
-	colBudget        int            // Options.ColumnarSegmentBudget
+	demand     *demandTracker // per-attribute query demand, for SuggestIndexes
+	demandHalf time.Duration  // Options.DemandHalfLife, verbatim (0 = default, <0 = no decay)
+	// require is the attribute set that enters the derived schema whatever its presence rate,
+	// guarded by requireMu because the admin surface changes it on a live table; requireReport
+	// holds the last derivation's refusals. See schemarequire.go.
+	requireMu        sync.Mutex
+	require          schemaRequireSet
+	requireReport    atomic.Pointer[schemaRequireReport]
+	groupSchemaCount int     // Options.GroupSchemaCount
+	groupStability   int     // Options.GroupStabilityRuns
+	groupJac         float64 // Options.GroupMergeJaccard
+	colBudget        int     // Options.ColumnarSegmentBudget
 	// rowGroupBytes is Options.RowGroupBytes, settable at runtime (SetRowGroupBytes) because it only
 	// governs row groups sealed from now on -- blocks already written record their own layout. Atomic
 	// because every scan that seals a segment reads it.
@@ -694,6 +727,7 @@ func New(opts Options) *Collection {
 		intern:           wire.NewInternTableWithPrivacy(classad.IsPrivateAttribute),
 		demand:           newDemandTracker(),
 		demandHalf:       opts.DemandHalfLife,
+		require:          schemaRequireSet{configured: foldUnique(opts.SchemaRequireAttrs)},
 		groupSchemaCount: opts.GroupSchemaCount,
 		groupStability:   opts.GroupStabilityRuns,
 		groupJac:         opts.GroupMergeJaccard,

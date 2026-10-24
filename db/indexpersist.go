@@ -30,6 +30,13 @@ type persistedIndexConfig struct {
 	// change consistent across restarts -- and, in HA, lets a follower converge on the
 	// policy by reloading, since there is no op-stream replication of config.
 	Encrypted []string `json:"encrypted,omitempty"`
+	// SchemaRequire lists the required schema attributes added AT RUNTIME (the configured tier
+	// comes back from Config.SchemaRequireAttrs on the next open, so persisting it too would
+	// freeze a configuration change out -- the same provenance split the Auto field above makes
+	// for indexes). Restoring it keeps a runtime addition from silently resetting on restart,
+	// which is exactly the kind of loss nothing surfaces: the attribute just stops being a
+	// column, and queries get slower with no sign of why.
+	SchemaRequire []string `json:"schemaRequire,omitempty"`
 	// Time-travel (point-in-time / AS OF) settings, a runtime-toggled per-table policy
 	// persisted like Encrypted. TimeTravel off (default) leaves the others inert.
 	TimeTravel                bool `json:"timeTravel,omitempty"`
@@ -85,7 +92,7 @@ func (db *DB) saveIndexConfig() {
 	cat, val := db.c.IndexedAttrs()
 	cfg := persistedIndexConfig{
 		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(), Hot: db.c.HotAttrNames(),
-		Encrypted: db.c.EncryptedAttrNames(),
+		Encrypted: db.c.EncryptedAttrNames(), SchemaRequire: db.c.SchemaRequireRuntimeAttrs(),
 	}
 	if o, on := db.c.TimeTravelConfig(); on {
 		cfg.TimeTravel = true
@@ -184,6 +191,12 @@ func (db *DB) loadIndexConfig() {
 	}
 	if len(cfg.Hot) > 0 {
 		db.c.AddHotAttrs(cfg.Hot...)
+	}
+	// Restore the runtime-required schema attributes on top of the configured tier. Changing the
+	// set does not re-derive the schema (that is ReschemaScan's job and costs the whole table),
+	// so this only ensures the next derivation sees what the operator asked for.
+	if len(cfg.SchemaRequire) > 0 {
+		db.c.AddSchemaRequireAttrs(cfg.SchemaRequire...)
 	}
 	// Restore the runtime encryption policy over the reconciled indexes. Best-effort:
 	// ignored if encryption is disabled on this open (no data key) or an attribute has
