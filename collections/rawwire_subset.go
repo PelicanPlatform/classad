@@ -74,6 +74,9 @@ func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact 
 			stats:    stats,
 		}
 		probes := q.Probes()
+		if c.hasZones.Load() {
+			qp.zoneProbes = probes // enable sealed-segment zone pruning (mirrors Query)
+		}
 		c.demand.record(probes)
 		usable := c.planRead(probes)
 		for _, sh := range c.shards {
