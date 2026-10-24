@@ -77,21 +77,34 @@ func (ws *wireScope) resolve(name string, scope ast.AttributeScope) classad.Valu
 		if ws.parent == nil {
 			return classad.NewUndefinedValue()
 		}
-		v, _ := ws.tryResolve(ws.parent, ws.parentDict, name)
+		v, found := ws.tryResolve(ws.parent, ws.parentDict, name)
+		if !found && classad.IsCurrentTimeName(name) {
+			ws.fellBack = true // a parent without CurrentTime gives the time (see SetResolver)
+		}
 		return v
 	default:
 		// Unscoped: this ad, then fall through to its parent (chaining), matching
 		// the ClassAd evaluator's parent walk.
 		if v, found := ws.tryResolve(ws.ad, ws.dict, name); found {
-			return v
+			return ws.definedValue(name, v)
 		}
 		if ws.parent != nil {
 			if v, found := ws.tryResolve(ws.parent, ws.parentDict, name); found {
-				return v
+				return ws.definedValue(name, v)
 			}
 		}
 		return classad.NewUndefinedValue()
 	}
+}
+
+// definedValue returns v, the value of an attribute the ad defines. The evaluator reads
+// an undefined CurrentTime from the resolver as one the ad lacks, and substitutes the
+// time, so a CurrentTime defined as undefined is left to the ordinary evaluator.
+func (ws *wireScope) definedValue(name string, v classad.Value) classad.Value {
+	if v.IsUndefined() && classad.IsCurrentTimeName(name) {
+		ws.fellBack = true
+	}
+	return v
 }
 
 // tryResolve looks name up in ad. found reports whether ad has the attribute at

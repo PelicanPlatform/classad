@@ -42,6 +42,14 @@ int classad_eval_ad_old(const char *adStr, char **out);
  */
 int classad_eval_expr(const char *exprStr, int oldSyntax, char **out);
 
+/*
+ * Parse leftStr and rightStr as ClassAds, pair them in a MatchClassAd (left is
+ * MY, right is TARGET; with HTCondor's old ClassAd semantics each is the other's
+ * alternate scope), and evaluate attribute attr of the left ad. *out gets the
+ * canonical encoding of the value. Returns 0 when either ad fails to parse.
+ */
+int classad_eval_match(const char *leftStr, const char *rightStr, const char *attr, char **out);
+
 /* Free a string previously returned via classad_eval_ad's out parameter. */
 void classad_free(char *p);
 

@@ -105,6 +105,26 @@ func EvalExpr(src string, old bool) (encoded string, parsed bool) {
 	return C.GoString(out), true
 }
 
+// EvalMatch parses left and right as ClassAds, pairs them in a MatchClassAd (left
+// is MY, right is TARGET) and evaluates attr in the left ad. It returns the
+// canonical encoding of the value; parsed is false when either ad fails to parse.
+func EvalMatch(left, right, attr string) (encoded string, parsed bool) {
+	cppMu.Lock()
+	defer cppMu.Unlock()
+
+	cl, cr, ca := C.CString(left), C.CString(right), C.CString(attr)
+	defer C.free(unsafe.Pointer(cl))
+	defer C.free(unsafe.Pointer(cr))
+	defer C.free(unsafe.Pointer(ca))
+
+	var out *C.char
+	if C.classad_eval_match(cl, cr, ca, &out) == 0 {
+		return "", false
+	}
+	defer C.classad_free(out)
+	return C.GoString(out), true
+}
+
 // EvalExprTimeout is EvalExpr with the same wall-clock cap and leaked-goroutine
 // handling as EvalAdTimeout.
 func EvalExprTimeout(src string, old bool, timeout time.Duration) (encoded string, parsed, timedOut bool) {

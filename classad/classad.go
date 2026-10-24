@@ -200,6 +200,11 @@ type ClassAd struct {
 	ad     *ast.ClassAd
 	parent *ClassAd
 	target *ClassAd
+	// lexicalParent marks parent as the scope a select reached this ad from (see
+	// selectAttr), libclassad's parentScope, rather than a chained parent set with
+	// SetParent, which libclassad's Lookup reads as part of the ad. The two differ for
+	// CurrentTime: a lookup stops at the first ad that does not define it.
+	lexicalParent bool
 	// index maps each normalized attribute name to its value slot.
 	//
 	// A non-nil index marks an OWNED ad (every constructor: New, Parse, ParseOld,
@@ -1130,10 +1135,11 @@ func (c *ClassAd) GetTarget() *ClassAd {
 func (c *ClassAd) EvaluateAttr(name string) (result Value) {
 	expr := c.lookupInternal(name)
 	if expr == nil {
-		// CurrentTime is a magic attribute: when the ad does not define it, it resolves to
-		// the current time (matching how an expression referencing it evaluates).
-		if strings.EqualFold(name, currentTimeAttr) {
-			return currentTimeValue()
+		// CurrentTime is a magic attribute: when the ad does not define it, it resolves as
+		// an expression referencing it does (see currenttime.go).
+		if IsCurrentTimeName(name) {
+			defer recoverCyclic(&result)
+			return NewEvaluator(c).evaluateCurrentTime(ast.NewAttributeReference(name, ast.NoScope))
 		}
 		return NewUndefinedValue()
 	}
@@ -1483,7 +1489,7 @@ func (f *flattener) flatten(expr ast.Expr) ast.Expr {
 		// becomes a range probe); FoldConstants keeps it, since the scope it will be
 		// evaluated in may define CurrentTime.
 		if isCurrentTimeRef(v) {
-			if _, ok := c.Lookup(v.Name); !ok {
+			if _, def := c.currentTimeExpr(); def == nil {
 				switch f.time {
 				case timeClock:
 					return c.valueToExpr(currentTimeValue())

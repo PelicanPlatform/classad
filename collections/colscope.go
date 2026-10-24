@@ -104,6 +104,19 @@ func (cs *colScope) bindField(name string) int {
 
 // resolve is the attribute resolver handed to vm.Matcher.EvalResolved.
 func (cs *colScope) resolve(name string, scope ast.AttributeScope) classad.Value {
+	v := cs.resolveAttr(name, scope)
+	if v.IsUndefined() && classad.IsCurrentTimeName(name) && (scope == ast.NoScope || scope == ast.MyScope) &&
+		cs.bindField(name) != bindUnknown {
+		// The evaluator reads an undefined CurrentTime from the resolver as one the record
+		// lacks and substitutes the time. The table holds CurrentTime somewhere, so this
+		// record may define it as undefined: leave that to the ordinary evaluator.
+		cs.fallBack()
+	}
+	return v
+}
+
+// resolveAttr resolves a reference from the record's columns (see resolve).
+func (cs *colScope) resolveAttr(name string, scope ast.AttributeScope) classad.Value {
 	if scope != ast.NoScope && scope != ast.MyScope {
 		// TARGET/PARENT: a collection scan has no match target, and a chained parent lives in another
 		// record. wireScope returns undefined for TARGET; do the same rather than fall back, since

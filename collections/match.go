@@ -220,7 +220,8 @@ func (c *Collection) serialScanMatches(job *classad.ClassAd) []rankedMatch {
 // matchScope resolves references while evaluating the JOB's Requirements over a slot:
 // TARGET.attr comes from the slot's wire bytes (wire-native, no decode), and unscoped
 // / MY.attr come from the job's precomputed attribute values. An unscoped name the job
-// does not define falls through to the slot, as in ClassAd matchmaking. If a slot
+// does not define falls through to the slot, as in ClassAd matchmaking, except
+// CurrentTime, which is then the time. If a slot
 // attribute is a non-literal expression, or a job attribute's value depends on the
 // slot, it sets fellBack and the caller decodes the slot fully.
 //
@@ -260,6 +261,14 @@ type cachedJobRef struct {
 func (ms *matchScope) resolve(name string, scope ast.AttributeScope) classad.Value {
 	switch scope {
 	case ast.TargetScope:
+		if classad.IsCurrentTimeName(name) {
+			if _, ok := ms.lookupTarget(name); !ok {
+				// A slot without CurrentTime gives TARGET.CurrentTime the time, which the
+				// resolver cannot (see SetResolver): evaluate on the decoded ad.
+				ms.fellBack = true
+				return classad.NewUndefinedValue()
+			}
+		}
 		return ms.resolveTarget(name)
 	case ast.ParentScope:
 		return classad.NewUndefinedValue() // a top-level job ad has no parent scope
@@ -276,13 +285,20 @@ func (ms *matchScope) resolve(name string, scope ast.AttributeScope) classad.Val
 	}
 	switch e.kind {
 	case jobRefConst:
+		if e.v.IsUndefined() && classad.IsCurrentTimeName(name) {
+			// The job defines CurrentTime as undefined, which the evaluator would read from
+			// the resolver as absent (see SetResolver).
+			ms.fellBack = true
+		}
 		return e.v
 	case jobRefDep:
 		ms.fellBack = true // its value depends on the slot: evaluate on the decoded ad
 		return classad.NewUndefinedValue()
 	}
-	if scope == ast.NoScope {
-		return ms.resolveTarget(name) // not defined by the job: resolves in the slot
+	if scope == ast.NoScope && !classad.IsCurrentTimeName(name) {
+		// Not defined by the job: resolves in the slot. A CurrentTime the job lacks is the
+		// time, never the slot's (undefined here: the evaluator substitutes the time).
+		return ms.resolveTarget(name)
 	}
 	return classad.NewUndefinedValue()
 }

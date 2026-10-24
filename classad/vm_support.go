@@ -73,6 +73,15 @@ func (e *Evaluator) SetScope(ad *ClassAd) {
 // can be evaluated against an alternate backing (e.g. an encoded ad) without
 // materializing a ClassAd. fn should return the attribute's value, or undefined
 // if absent. The Evaluator is not safe for concurrent use.
+//
+// CurrentTime (IsCurrentTimeName) needs care, because whether the ad defines it
+// matters, not only its value. The evaluator reads undefined from fn for an unscoped
+// or MY CurrentTime as "the ad does not define it" and substitutes the time, so fn
+// must not return undefined for a CurrentTime the ad defines as undefined. For TARGET
+// and PARENT the evaluator returns fn's value as is, so fn must not return undefined
+// for a CurrentTime a target or parent that exists lacks; that one is the time. A
+// resolver that cannot give the value must make its caller evaluate the ad the
+// ordinary way instead.
 func (e *Evaluator) SetResolver(fn func(name string, scope ast.AttributeScope) Value) {
 	e.resolver = fn
 }
