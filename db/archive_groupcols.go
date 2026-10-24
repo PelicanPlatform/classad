@@ -35,11 +35,12 @@ import (
 // table. Both back onto the same collections primitive, so both get the same fast path and the same
 // row-shaping rather than a copy per table type that could drift.
 type GroupStatsSource interface {
-	// GroupStatsConstraint answers the grouped stats for rows matching constraint.
-	GroupStatsConstraint(constraint, groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool)
-	// GroupStatsAll answers them over every row, for a constraint the caller has established is
-	// match-all (the predicate analysis has no predicate to work with there).
-	GroupStatsAll(groupAttr string, aggAttrs []string) ([]collections.GroupStats, bool)
+	// GroupStatsConstraintBucketed answers the grouped stats for rows matching constraint, with the
+	// group column floored into buckets of bucket (0 = the raw value).
+	GroupStatsConstraintBucketed(constraint, groupAttr string, bucket int64, aggAttrs []string) ([]collections.GroupStats, bool)
+	// GroupStatsAllBucketed answers them over every row, for a constraint the caller has established
+	// is match-all (the predicate analysis has no predicate to work with there).
+	GroupStatsAllBucketed(groupAttr string, bucket int64, aggAttrs []string) ([]collections.GroupStats, bool)
 }
 
 // groupedFromColumns answers a single-numeric-column GROUP BY from the archive's columns.
@@ -49,14 +50,20 @@ func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCo
 
 // GroupedFromColumns answers a single-numeric-column GROUP BY from src's columns, or ok=false to scan.
 //
-// Served: one group column with no bucket width, and aggregates drawn from COUNT(*), COUNT(attr), MIN,
-// MAX, SUM and AVG over numeric attributes the schema carries. A per-aggregate FILTER declines -- the
+// Served: one group column -- raw, or floored into fixed-width buckets -- and aggregates drawn from
+// COUNT(*), COUNT(attr), MIN, MAX, SUM and AVG over numeric attributes the schema carries.
+//
+// The bucketed form is what a time series asks ("per day", not "per second"), and it is the form this
+// used to decline outright, sending every `GROUP BY time_bucket(t,'1d')` to a record scan while its
+// ungrouped sibling was answered from the columns. Measured against a production history archive, the
+// two differed by more than two orders of magnitude. A per-aggregate FILTER declines -- the
 // columnar pass knows nothing about it, so answering would report an unfiltered aggregate as a filtered
 // one. COUNT(DISTINCT) declines: it needs the values, not their aggregate.
 func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
-	if len(groupCols) != 1 || groupCols[0].BucketWidth != 0 || len(aggs) == 0 {
+	if len(groupCols) != 1 || groupCols[0].BucketWidth < 0 || len(aggs) == 0 {
 		return nil, false
 	}
+	bucket := groupCols[0].BucketWidth
 	// Which attribute each aggregate reads, and where its stats land. Attributes are de-duplicated so
 	// MIN(x) alongside MAX(x) reads the column once.
 	var attrs []string
@@ -95,9 +102,9 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 	var groups []collections.GroupStats
 	var ok bool
 	if IsMatchAll(constraint) {
-		groups, ok = src.GroupStatsAll(groupCols[0].Attr, attrs)
+		groups, ok = src.GroupStatsAllBucketed(groupCols[0].Attr, bucket, attrs)
 	} else {
-		groups, ok = src.GroupStatsConstraint(constraint, groupCols[0].Attr, attrs)
+		groups, ok = src.GroupStatsConstraintBucketed(constraint, groupCols[0].Attr, bucket, attrs)
 	}
 	if !ok {
 		return nil, false
