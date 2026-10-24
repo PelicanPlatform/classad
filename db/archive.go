@@ -744,6 +744,18 @@ func (t *ArchiveTable) GroupStatsAll(groupAttr string, aggAttrs []string) ([]col
 	return t.a.GroupStatsAll(groupAttr, aggAttrs)
 }
 
+// GroupStatsConstraintBucketed is GroupStatsConstraint with the group column floored into buckets of
+// bucket (0 = the raw value). See collections.Collection.GroupStatsQueryBucketed.
+func (t *ArchiveTable) GroupStatsConstraintBucketed(constraint, groupAttr string, bucket int64, aggAttrs []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsConstraintBucketed(constraint, groupAttr, bucket, aggAttrs)
+}
+
+// GroupStatsAllBucketed is GroupStatsAll with the group column floored into buckets of bucket
+// (0 = the raw value). See collections.Collection.GroupStatsQueryBucketed.
+func (t *ArchiveTable) GroupStatsAllBucketed(groupAttr string, bucket int64, aggAttrs []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsAllBucketed(groupAttr, bucket, aggAttrs)
+}
+
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).
 func (t *ArchiveTable) CodecStats(sampleMax int) CodecStats { return t.a.CodecStats(sampleMax) }
 

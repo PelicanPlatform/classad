@@ -29,14 +29,15 @@ import (
 // vecGroupStats accumulates per-group stats for every visible record matching q, evaluating q against the
 // columns (a column at a time where the expression allows it, per record where it does not).
 //
-// ok=false when q is not native, or when a matching record's group value is not a scalar number -- the
-// same give-up condition as the predicate-analysis path, for the same reason (see GroupStatsQuery).
-func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
-	st *schemaScanState) (map[groupKey]*groupAcc, bool) {
+// ok=false when q is not native, or when a matching record's group value is one this cannot turn into a
+// group -- the same give-up condition as the predicate-analysis path, for the same reason, and like it
+// narrower when a bucket was asked for (see groupAccum.groupFor).
+func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32, bucket int64,
+	st *schemaScanState) (*groupAccum, bool) {
 	if q == nil || !q.Native() {
 		return nil, false
 	}
-	acc := map[groupKey]*groupAcc{}
+	acc := newGroupAccum(bucket)
 	m := q.Matcher()
 	fallbackM := q.Matcher()
 	cs := &colScope{bc: st.cache, c: c}
@@ -175,19 +176,17 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 }
 
 // addGroupFromColumns reads record k's group and aggregate values from the block's columns and folds them
-// into acc. ok=false when the group value is not a scalar number, which cannot be turned into a group.
-func addGroupFromColumns(k int, col numCol, aggCols []numCol, bc *blockCache, acc map[groupKey]*groupAcc) bool {
-	nv, ok := col.at(k, bc)
-	if !ok || !numericKind(nv.kind) {
+// into acc. ok=false when this cannot turn the record's group value into a group; which values those are
+// depends on whether a bucket was asked for (see groupAccum.groupFor).
+func addGroupFromColumns(k int, col numCol, aggCols []numCol, bc *blockCache, acc *groupAccum) bool {
+	nv, cell := col.cell(k, bc)
+	g, ok := acc.groupFor(nv, cell, len(aggCols))
+	if !ok {
 		return false
 	}
-	key := groupKeyOf(nv)
-	g := acc[key]
 	if g == nil {
-		g = newGroupAcc(len(aggCols))
-		acc[key] = g
+		return true // in no bucket, which the scan drops too
 	}
-	g.n++
 	for i := range aggCols {
 		// An absent or non-numeric aggregate value contributes nothing, which is what the reference
 		// computes for it -- unlike the group value, which decides whether the row exists at all. An
@@ -208,7 +207,7 @@ func addGroupFromColumns(k int, col numCol, aggCols []numCol, bc *blockCache, ac
 // be worth vectorizing.
 func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, scope ast.AttributeScope) classad.Value,
 	m, fallbackM *vm.Matcher, w segWindow, seg *colSegment, blk *columnarBlock, base int, s0 uint64,
-	col numCol, aggCols []numCol, bc *blockCache, acc map[groupKey]*groupAcc) bool {
+	col numCol, aggCols []numCol, bc *blockCache, acc *groupAccum) bool {
 	for k := 0; k < blk.n; k++ {
 		gk := base + k
 		if gk >= seg.offsLen() {
@@ -242,7 +241,7 @@ func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, s
 // each visible record the ordinary way and read the group and aggregate values from the record itself.
 func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *vm.Matcher,
 	groupLookup func(a wire.Ad) ([]byte, bool), aggLookups []func(a wire.Ad) ([]byte, bool),
-	acc map[groupKey]*groupAcc) bool {
+	acc *groupAccum) bool {
 	for off := 0; off < w.used; {
 		o := uint32(off)
 		total := recTotalLen(w.data, o)
@@ -269,22 +268,15 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *vm.Matcher,
 
 // addGroupFromAd is addGroupFromColumns reading from a wire ad instead of a block's columns.
 func addGroupFromAd(ad wire.Ad, groupLookup func(a wire.Ad) ([]byte, bool),
-	aggLookups []func(a wire.Ad) ([]byte, bool), acc map[groupKey]*groupAcc) bool {
-	node, found := groupLookup(ad)
-	if !found {
+	aggLookups []func(a wire.Ad) ([]byte, bool), acc *groupAccum) bool {
+	nv, cell := adGroupCell(groupLookup, ad)
+	g, ok := acc.groupFor(nv, cell, len(aggLookups))
+	if !ok {
 		return false
 	}
-	nv, isNum := nodeColVal(node)
-	if !isNum || !numericKind(nv.kind) {
-		return false
-	}
-	key := groupKeyOf(nv)
-	g := acc[key]
 	if g == nil {
-		g = newGroupAcc(len(aggLookups))
-		acc[key] = g
+		return true // in no bucket, which the scan drops too
 	}
-	g.n++
 	for i := range aggLookups {
 		if an, found := aggLookups[i](ad); found {
 			if isExprNode(an) {

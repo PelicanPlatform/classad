@@ -275,17 +275,29 @@ func (a *Archive) GroupCountConstraint(constraint, groupAttr string) ([]GroupCou
 // matching constraint, read out of the columnar blocks. ok=false ⇒ not columnar-eligible; group by
 // scanning records. See Collection.GroupStatsQuery.
 func (a *Archive) GroupStatsConstraint(constraint, groupAttr string, aggAttrs []string) ([]GroupStats, bool) {
+	return a.GroupStatsConstraintBucketed(constraint, groupAttr, 0, aggAttrs)
+}
+
+// GroupStatsConstraintBucketed is GroupStatsConstraint with the group column floored into buckets of
+// bucket (0 = the raw value). See Collection.GroupStatsQueryBucketed.
+func (a *Archive) GroupStatsConstraintBucketed(constraint, groupAttr string, bucket int64, aggAttrs []string) ([]GroupStats, bool) {
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, false
 	}
-	return a.c.GroupStatsQuery(q, groupAttr, aggAttrs)
+	return a.c.GroupStatsQueryBucketed(q, groupAttr, bucket, aggAttrs)
 }
 
 // GroupStatsAll is GroupStatsConstraint over EVERY record. The caller must have established that its
 // query matches all records.
 func (a *Archive) GroupStatsAll(groupAttr string, aggAttrs []string) ([]GroupStats, bool) {
 	return a.c.GroupStatsAll(groupAttr, aggAttrs)
+}
+
+// GroupStatsAllBucketed is GroupStatsAll with the group column floored into buckets of bucket
+// (0 = the raw value). See Collection.GroupStatsQueryBucketed.
+func (a *Archive) GroupStatsAllBucketed(groupAttr string, bucket int64, aggAttrs []string) ([]GroupStats, bool) {
+	return a.c.GroupStatsAllBucketed(groupAttr, bucket, aggAttrs)
 }
 
 // GroupCountAll returns the per-value record counts of groupAttr over EVERY record, read out of the

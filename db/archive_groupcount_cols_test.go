@@ -483,8 +483,11 @@ func TestArchiveGroupedAggregateRefusals(t *testing.T) {
 			[]GroupCol{{Attr: "ProcId"}}, []AggSpec{{Func: AggCount, Arg: "*", Filter: "RequestCpus >= 4"}}},
 		{"COUNT(DISTINCT) needs the values, not their aggregate", "RequestMemory > 2048",
 			[]GroupCol{{Attr: "ProcId"}}, []AggSpec{{Func: AggCountDistinct, Arg: "RequestCpus"}}},
-		{"a bucketed group column is not this shape", "RequestMemory > 2048",
-			[]GroupCol{{Attr: "ClusterId", BucketWidth: 100}}, []AggSpec{{Func: AggCount, Arg: "*"}}},
+		// A bucketed group column used to be listed here. It is now served -- see
+		// TestArchiveBucketedGroupMatchesScan -- because the floor is a transform of a value this
+		// path was already reading, not a shape it cannot see.
+		{"a NEGATIVE bucket width is not a bucket", "RequestMemory > 2048",
+			[]GroupCol{{Attr: "ClusterId", BucketWidth: -100}}, []AggSpec{{Func: AggCount, Arg: "*"}}},
 		{"two group columns", "RequestMemory > 2048",
 			[]GroupCol{{Attr: "ProcId"}, {Attr: "RequestCpus"}}, []AggSpec{{Func: AggCount, Arg: "*"}}},
 		{"aggregating a string column", "RequestMemory > 2048",
