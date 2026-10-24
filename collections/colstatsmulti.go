@@ -40,6 +40,16 @@ func (a *statsAccum) add(nv colVal) {
 		a.addInt(nv.i)
 	case akReal:
 		a.out.AnyReal = true
+		// NaN loses every comparison, so it slips past both updates below without ever
+		// becoming an extreme -- an all-NaN group would report the seeds, +Inf for MIN and
+		// -Inf for MAX, as if they were data. Flag it so a MIN/MAX caller can decline (see
+		// NumStats.AnyNaN); the extremes below stay exactly as they were for every other
+		// column, NaN or not. A real is the ONLY kind that can be NaN: akInt's f is a
+		// converted int64 and akBool's is 0 or 1, so an integer column pays nothing for this
+		// and a real column pays one compare that is false on every ordinary value.
+		if nv.f != nv.f {
+			a.out.AnyNaN = true
+		}
 	case akBool:
 		a.out.IntSum += nv.i
 		a.out.AnyBool = true
