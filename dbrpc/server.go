@@ -274,8 +274,9 @@ type QueryLog struct {
 
 	// Scan is the server-side work breakdown for the query -- notably segments scanned
 	// versus pruned, which separates "slow because the window is big" from "slow because
-	// nothing pruned". It is filled on the read paths that thread it (the projection and
-	// top-K ops); elsewhere it is zero, which means NOT MEASURED rather than no work.
+	// nothing pruned". It is filled on the read paths that thread it (the projection,
+	// wire and top-K ops); elsewhere it is zero, which means NOT MEASURED rather than
+	// no work.
 	Scan collections.ScanStats
 
 	// User is the connection's authenticated identity (ServeOptions.Peer), or empty when
