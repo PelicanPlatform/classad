@@ -58,11 +58,11 @@ epoch across a **clean** restart, so a cursor issued before `Close` resumes afte
 `Open` with no Reset, as long as the records it points past are still retained (at or
 above the append floor; otherwise the rotation-gap Reset below applies).
 
-Persisting the epoch alone would be unsafe. A commit's `seq` becomes visible
-(`WatchCursor`, catch-up) before its msync completes, so a watcher can hold a cursor
-past a record that a crash then loses; recovery rebuilds `commitSeq` from what is on
-disk, and the lost numbers would be reassigned to *different* records that a resumed
-cursor silently skips. The protocol (`watchepoch.go`) therefore only vouches for an
+Persisting the epoch alone would be unsafe. `WatchCursor` and catch-up sync through
+the `seq` they read, and live events are published only after the sync, but the epoch
+does not rely on that: if a watcher held a cursor past a record that a crash then lost,
+recovery would rebuild `commitSeq` from what is on disk, and the lost numbers would be
+reassigned to *different* records that a resumed cursor silently skips. The protocol (`watchepoch.go`) therefore only vouches for an
 epoch the previous process proved safe:
 
 1. **Open consumes `<dir>/watch.epoch`** before mapping any segment: it reads the

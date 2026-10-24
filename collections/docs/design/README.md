@@ -573,6 +573,29 @@ only the sync layer:
 - A transaction commit (Chapter 15) applies each shard's writes, then syncs all touched
   shards in parallel. `Txn.SetDurable(false)` defers that sync for callers that batch
   durability themselves.
+- A deferred archive append (`Archive.AppendDeferred`, Chapter 18) applies under the
+  shard lock and does not sync at all. Its bytes are covered by the shard's next sync
+  pass, whoever runs it.
+
+**Publish after sync.** A watcher must never be handed a record that a crash could take
+back. Every durable write path therefore publishes its watch events only after its
+`syncFor` returns. A deferred append cannot: nothing syncs on its behalf. So its event,
+when a watcher is attached, is held per shard in commit order, and `syncFor` itself
+publishes every held event whose seq the completed pass covers, whichever caller ran the
+pass. The seq stays pending in the publish order until then, which holds every later live
+cursor below it. A shard holds at most 256 such events: the deferred append that reaches
+the cap syncs. A sync publishes its held events in one burst, and a burst larger than a
+watcher's buffer (1024 by default) would overflow it and force a resync. Watch registration and `WatchCursor` sync through the seq they snapshot,
+so catch-up never reads, and a cursor never names, a record not yet on disk. When a sync
+has failed, nothing held is published. `Truncate` drops the held events and retires
+their seqs. (`Txn.SetDurable(false)` is the exception: it publishes at commit, before
+the sync.)
+
+**Page alignment.** `msync` needs a page-aligned start address. The start is aligned
+to the system page size, not 4 KiB: Apple silicon uses 16 KiB pages and some arm64
+Linux kernels 64 KiB. Aligned only to 4 KiB, most calls on those systems fail with
+`EINVAL`. That error is treated as benign, not latched, so those ranges were silently
+never synced.
 
 The payoff is real. With a simulated 200 µs sync, ads per sync rise from 1 to 12.5 as
 writers scale from 1 to 24 (≈12.6× throughput). With a real `msync` on the persistent
@@ -1873,6 +1896,32 @@ There is **no catalog file**. Recovery is a directory listing of
 extents read from each sidecar's trailer. Restart is O(segments), not O(records). The
 segment set on disk *is* the archive's state; structural changes commit through the
 rename-and-marker protocol of Chapter 7.
+
+### Deferred appends
+
+`Append` is durable when it returns, at the price of one `msync` per ad. For a history
+tailer that is most of the ingest time: on Linux, with a real disk, a per-ad sync caps
+ingest at a few thousand ads a second, nearly all of it waiting on I/O.
+`AppendDeferred` returns once the ad is applied and readable, without the sync. `Flush`
+is the barrier: it returns once every ad appended before it is on disk and published
+to watchers, or returns the sticky write/sync error. Other syncs cover deferred appends
+too: a durable `Append`, a segment roll, `Close`, and a Watch subscription.
+
+The contract a caller relies on:
+
+- **Flush, then persist your position.** A caller that records its progress through the
+  source (a history-file offset, a remote cursor) calls `Flush` before saving it. After
+  a crash the saved position is then never ahead of the archive, and replaying from it,
+  deduplicating against the archive, rebuilds exactly the source.
+- **A crash keeps a prefix.** A process crash loses nothing: the writes are already in
+  the page cache. A machine crash can lose deferred appends not yet synced. Recovery
+  cuts the log at the first torn record, so what survives is always a prefix of the
+  appends, and it always includes everything before the last successful `Flush`.
+- **No segment seals with deferred bytes.** Before a deferred append rolls the active
+  segment, it syncs the shard. Maintenance builds durable sidecars over sealed segments,
+  and rewrites them, so a sealed segment must never hold bytes a crash could take back.
+  This also bounds the unsynced tail to one segment.
+- **Watchers see only durable ads** (Chapter 6, publish after sync).
 
 ### Zone maps
 

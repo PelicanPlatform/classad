@@ -252,7 +252,17 @@ func (t *ArchiveTable) saveConfigLocked() error {
 }
 
 // Append adds one ad to the archive (append-only; there is no update or per-key delete).
+// The ad is durable when Append returns.
 func (t *ArchiveTable) Append(ad *classad.ClassAd) error { return t.a.Append(ad) }
+
+// AppendDeferred adds one ad without waiting for it to reach disk: it is readable at once
+// and durable at the next Flush. A caller persisting its own progress through the source
+// calls Flush first. See collections.Archive.AppendDeferred.
+func (t *ArchiveTable) AppendDeferred(ad *classad.ClassAd) error { return t.a.AppendDeferred(ad) }
+
+// Flush returns once every ad appended before it is durable, or reports why not. See
+// collections.Archive.Flush.
+func (t *ArchiveTable) Flush() error { return t.a.Flush() }
 
 // AppendOld appends an ad parsed from old-ClassAd text (the qmgmt/history line format).
 func (t *ArchiveTable) AppendOld(text string) error {

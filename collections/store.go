@@ -604,6 +604,16 @@ func (c *Collection) shardOf(key []byte, h uint64) int {
 	return int(c.h.Hash(c.rootKey(key)) & c.mask)
 }
 
+// syncAll is the durability barrier: it returns once everything committed to every shard
+// before the call is on disk, and every deferred append it covers has been published to
+// watchers. It reports the first sticky write or sync error, as Put does.
+func (c *Collection) syncAll() error {
+	for _, sh := range c.shards {
+		sh.sync()
+	}
+	return c.writeError()
+}
+
 // writeError returns the first sticky durability error across shards (persistent stores) -- a
 // segment-allocation failure (writeErr) or a durability-sync/msync failure (syncErr) -- or nil.
 // Surfaced by Put/Update so a caller learns a write did not land or did not reach disk.
@@ -971,12 +981,26 @@ func (c *Collection) appendSealSeq() uint64 {
 // so eager reindexing is skipped when there is nothing to build.
 func (c *Collection) hasSegmentIndexes() bool { return c.spec.Load().any() }
 
-func (c *Collection) Put(key []byte, ad *classad.ClassAd) error {
+func (c *Collection) Put(key []byte, ad *classad.ClassAd) error { return c.put(key, ad, false) }
+
+// putDeferred is Put without the durability sync, for an append log: the record is
+// readable on return and durable at the shard's next sync (see shard.commitDeferred
+// and Collection.syncAll). Anything other than a persistent append-only shard commits
+// durably, as Put does.
+func (c *Collection) putDeferred(key []byte, ad *classad.ClassAd) error { return c.put(key, ad, true) }
+
+func (c *Collection) put(key []byte, ad *classad.ClassAd, deferred bool) error {
 	codec := c.currentCodec()
 	raw := c.encodeAd(ad.AST())
 	stored := codec.Compress(nil, raw)
 	h := c.h.Hash(key)
-	c.shards[c.shardOf(key, h)].commitOne(pendingPut{hash: h, key: key, ad: stored, codec: codec, ct: c.namesCurrentTime(raw)})
+	sh := c.shards[c.shardOf(key, h)]
+	p := pendingPut{hash: h, key: key, ad: stored, codec: codec, ct: c.namesCurrentTime(raw)}
+	if deferred && sh.appendOnly && sh.alloc != nil {
+		sh.commitDeferred(p)
+	} else {
+		sh.commitOne(p)
+	}
 	// A write through this path can roll a segment, and the sealed segment needs a key index.
 	// Only Txn.Commit used to build one, so on a store written through Put every sealed segment
 	// stayed unindexed until a reindex pass, and each later insert of a new key walked every
