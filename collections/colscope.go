@@ -558,7 +558,7 @@ func (c *Collection) countBlockScoped(cs *colScope, resolver func(name string, s
 			break
 		}
 		o := seg.offAt(gk)
-		if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+		if !w.visible(o, s0) {
 			continue
 		}
 		cs.k, cs.fellBack = k, false
@@ -596,11 +596,15 @@ func (c *Collection) rowEvalWindow(w segWindow, s0 uint64, m *vm.Matcher) int {
 	count := 0
 	for off := 0; off < w.used; {
 		o := uint32(off)
+		if end, ok := w.dmg.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(w.data, o)
 		if total == 0 {
 			break
 		}
-		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+		if !recIsMarker(w.data, o) && w.visible(o, s0) {
 			if c.evalOneRecord(w, o, m) {
 				count++
 			}

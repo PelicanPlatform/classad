@@ -220,6 +220,10 @@ func countAttrRange(c *Collection, w segWindow, attr string, from, to int, dbuf 
 	var n int64
 	for off := from; off < to; {
 		o := uint32(off)
+		if end, ok := w.dmg.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(w.data, o)
 		if total == 0 {
 			break
@@ -262,6 +266,10 @@ func countAttrBucketRange(c *Collection, w segWindow, attr, bucketAttr string, w
 	var n int64
 	for off := from; off < to; {
 		o := uint32(off)
+		if end, ok := w.dmg.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(w.data, o)
 		if total == 0 {
 			break

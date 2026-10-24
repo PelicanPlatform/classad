@@ -59,6 +59,10 @@ func segHasLiveDelta(seg *segment) bool {
 		return false
 	}
 	for off := uint32(0); off < uint32(seg.used); {
+		if end, ok := seg.damaged().skip(off); ok {
+			off = end
+			continue
+		}
 		tl := recTotalLen(seg.data, off)
 		if tl == 0 || off+tl > uint32(seg.used) {
 			break
@@ -86,6 +90,10 @@ func (c *Collection) checkSealCollapseInvariant(maxKeys int) [][]byte {
 				continue
 			}
 			for off := uint32(0); off < uint32(seg.used); {
+				if end, ok := seg.damaged().skip(off); ok {
+					off = end
+					continue
+				}
 				tl := recTotalLen(seg.data, off)
 				if tl == 0 || off+tl > uint32(seg.used) {
 					break

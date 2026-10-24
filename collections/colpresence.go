@@ -163,7 +163,7 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 							break
 						}
 						o := cs.offAt(gk)
-						if recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+						if w.visible(o, s0) {
 							tally(true)
 						}
 					}
@@ -176,7 +176,7 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 						break
 					}
 					o := cs.offAt(gk)
-					if !(recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0) {
+					if !w.visible(o, s0) {
 						continue // not visible at this snapshot
 					}
 					if !testBit(blk.escapeAt(k), idx) {
@@ -225,11 +225,15 @@ func brutePresence(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) (
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
+		if end, ok := w.dmg.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(w.data, o)
 		if total == 0 {
 			break
 		}
-		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+		if !recIsMarker(w.data, o) && w.visible(o, s0) {
 			ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf)
 			if err != nil {
 				return false

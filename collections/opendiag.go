@@ -44,7 +44,9 @@ type OpenIndexDiag struct {
 
 	// DamageStops lists, up to openDamageStopMax, segments whose recovery walk stopped at a
 	// damaged record with records that verify after it. Those records are not loaded (see
-	// RecordsPastDamage). Empty on a healthy store; Fsck reports the same damage.
+	// RecordsPastDamage), unless the stop is marked Recovered: recovery then continued past the
+	// damage and set the damaged records aside. Empty on a healthy store; Fsck reports the same
+	// damage.
 	DamageStops []OpenDamageStop
 
 	// Timing breaks a persistent Open into its phases so a slow reopen names the phase that
@@ -150,6 +152,15 @@ type OpenDamageStop struct {
 	// ColumnarPayload is set when the segment's columnar payload is among them. The records
 	// before Offset are remnants that need it, so they fail to read too.
 	ColumnarPayload bool
+	// Recovered is set when recovery continued past the damage because the framing past it
+	// could be proven (a verified columnar payload after it, or the segment's sidecar key index).
+	// Loaded is then how many keyed records after Offset verify and were loaded, Records is 0, and
+	// Damaged is how many damaged spans every walk skips (DamagedRecordsSkipped): one per damaged
+	// record, plus one for a damaged dictionary. Dictionary and ColumnarPayload still say whether
+	// those lie past Offset; a dictionary that does not verify leaves the segment's records
+	// unreadable (SegDictsUnusable).
+	Recovered bool
+	Loaded    int
 }
 
 // openDamageStopMax bounds DamageStops.

@@ -448,7 +448,7 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 					vis := gk < cs.offsLen()
 					if vis {
 						o := cs.offAt(gk)
-						vis = recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0
+						vis = w.visible(o, s0)
 					}
 					keep[k] = vis
 					if vis {
@@ -560,11 +560,15 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookup func(wir
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
+		if end, ok := w.dmg.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(w.data, o)
 		if total == 0 {
 			break
 		}
-		if !recIsMarker(w.data, o) && recSeq(w.data, o) <= s0 && recSuperseded(w.data, o) > s0 {
+		if !recIsMarker(w.data, o) && w.visible(o, s0) {
 			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
 				ad := wire.Ad(ww)

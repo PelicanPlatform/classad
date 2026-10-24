@@ -184,6 +184,10 @@ func (c *Collection) segmentHasUnsealedValue(seg *segment) bool {
 	found := false
 	for off := 0; off < seg.used && !found; {
 		o := uint32(off)
+		if end, ok := seg.damaged().skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(seg.data, o)
 		if total == 0 {
 			break

@@ -378,8 +378,13 @@ func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segI
 		si.val[id] = &valPostings{post: map[float64]*roaring.Bitmap{}, exc: roaring.New(), posted: roaring.New()}
 	}
 	var buf []byte
+	dm := seg.damaged()
 	for off := 0; off < upto; {
 		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(data, o)
 		if total == 0 {
 			break

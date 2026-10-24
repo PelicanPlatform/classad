@@ -55,7 +55,7 @@ func (c *Collection) indexSealedSegments() {
 		// Built off the lock. A segment retired between the two is harmless: the index is
 		// published onto the segment and goes away with it.
 		for _, seg := range todo {
-			ki, err := parseKeyIndex(buildKeyIndex(seg.data, seg.used, c.h))
+			ki, err := parseKeyIndex(buildKeyIndex(seg.data, seg.used, c.h, seg.damaged()))
 			if err != nil {
 				continue // the durable pass will build it; the probe falls back to a walk
 			}

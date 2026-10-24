@@ -700,10 +700,16 @@ func (c *Collection) watchAd(key, rawAd []byte, codec Codec) (*classad.ClassAd, 
 
 // watchAdAs is watchAd for a watcher that may not be entitled to sealed values (see WatchRedacted).
 func (c *Collection) watchAdAs(key, rawAd []byte, codec Codec, redact bool) (*classad.ClassAd, bool) {
+	return c.watchAdDictAs(key, rawAd, codec, nil, redact)
+}
+
+// watchAdDictAs is watchAdAs for a record of an interned segment, whose attribute ids resolve only
+// through the segment's dictionary.
+func (c *Collection) watchAdDictAs(key, rawAd []byte, codec Codec, dict *segDictHandle, redact bool) (*classad.ClassAd, bool) {
 	if c.isStructural != nil && c.isStructural(key) {
 		return nil, false // structural ads are hidden from watches
 	}
-	ad, err := c.decodeAdAs(rawAd, codec, redact)
+	ad, err := c.decodeAdDictAs(dict, rawAd, codec, redact)
 	if err != nil {
 		return nil, false
 	}
@@ -943,6 +949,10 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, wins []segWindow
 	for _, wn := range wins {
 		for off := 0; off < wn.used; {
 			o := uint32(off)
+			if end, ok := wn.dmg.skip(o); ok {
+				off = int(end)
+				continue
+			}
 			total := recTotalLen(wn.data, o)
 			if total == 0 {
 				break
@@ -958,7 +968,9 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, wins []segWindow
 					off += int(total)
 					continue
 				}
-				if ad, ok := c.watchAdAs(key, adBytes, adCodec, redact); ok {
+				// Through the segment's dictionary: an interned record decoded without it fails, and
+				// catch-up then dropped every record of an interned segment.
+				if ad, ok := c.watchAdDictAs(key, adBytes, adCodec, wn.dict(), redact); ok {
 					if !yield(WatchEvent{Kind: WatchUpsert, Key: append([]byte(nil), key...), Ad: ad}) {
 						return false
 					}

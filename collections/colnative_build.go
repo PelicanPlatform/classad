@@ -42,7 +42,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// are short of every attribute the unreadable payload held -- so it is refused rather than rewritten
 	// into ads missing half their content.
 	recol := src.columnarized()
-	if src.colDamaged.Load() {
+	if src.colDamaged.Load() || !verifyForRewrite(src) {
 		return nil, nil, nil
 	}
 	// DELTA records do not belong in a columnarized segment, and this is where they leave.
@@ -152,7 +152,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		blocks, gblocks, offs = buildColumnarFromWires(recolOffs, recolFulls,
 			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
 	} else {
-		blocks, gblocks, offs = buildColumnarFromSegmentGrouped(src.data, src.used, src.codec,
+		blocks, gblocks, offs = buildColumnarFromSegmentGrouped(src.data, src.used, src.damaged(), src.codec,
 			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), skipDelta)
 	}
 	if len(blocks) == 0 || len(offs) == 0 {
@@ -327,7 +327,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// where lookupSealed missed a record a scan could still see (put/del could not supersede it -> a
 	// duplicate live version, and DeleteWhere never converged). dst is not yet visible, so storing it now
 	// is safe; the publish/evict under the swap lock is what makes it authoritative.
-	ki, kerr := parseKeyIndex(buildKeyIndex(dst.data, dst.used, c.h))
+	ki, kerr := parseKeyIndex(buildKeyIndex(dst.data, dst.used, c.h, dst.damaged()))
 	if perr != nil || !dst.columnarized() || kerr != nil {
 		dst.retire()
 		dst.reapAndHook()
@@ -351,6 +351,10 @@ func (c *Collection) reconstructFullRecords(src *segment, skip func(uint32) bool
 	var buf []byte
 	for off := 0; off < src.used; {
 		o := uint32(off)
+		if end, ok := src.damaged().skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(src.data, o)
 		if total == 0 {
 			break
@@ -424,6 +428,10 @@ func (c *Collection) planDeltasLocked(sh *shard, src *segment) *deltaPlan {
 	var plan *deltaPlan
 	for off := 0; off < src.used; {
 		o := uint32(off)
+		if end, ok := src.damaged().skip(o); ok {
+			off = int(end)
+			continue
+		}
 		total := recTotalLen(src.data, o)
 		if total == 0 {
 			break
@@ -529,6 +537,10 @@ func keepAttrs(w []byte, keep func(id uint32, name string, node []byte) bool) ([
 func segDictBlob(s *segment) []byte {
 	for off := 0; off < s.used; {
 		o := uint32(off)
+		if end, ok := s.damaged().skip(o); ok {
+			off = int(end)
+			continue
+		}
 		rl := recTotalLen(s.data, o)
 		if rl == 0 {
 			return nil
@@ -633,8 +645,8 @@ func (c *Collection) persistColumnarizedSidecar(sh *shard, dst *segment) {
 			}
 		}
 	}
-	container := buildSegmentSidecar(attrBlob, buildKeyIndex(dst.data, dst.used, c.h),
-		c.colBlobForSeg(dst), buildZoneBlob(dst.zones, c.intern.Name), dst.used, dst.dictRecOff())
+	container := buildSegmentSidecar(attrBlob, buildKeyIndex(dst.data, dst.used, c.h, dst.damaged()),
+		c.colBlobForSeg(dst), buildZoneBlob(dst.zones, c.intern.Name), dst.used, dst.dictRecOff(), encodeDamage(dst.damaged()))
 	c.installSidecar(sh, dst, path, container)
 }
 

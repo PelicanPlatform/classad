@@ -164,6 +164,10 @@ func (c *Collection) projectRecodeGain(src *segment, target Codec, sample int) (
 	var dbuf []byte
 	for off := 0; off < src.used && n < sample; {
 		o := uint32(off)
+		if end, ok := src.damaged().skip(o); ok {
+			off = int(end)
+			continue
+		}
 		rl := recTotalLen(src.data, o)
 		if rl == 0 {
 			break
