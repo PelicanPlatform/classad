@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
@@ -24,6 +25,18 @@ import (
 type ArchiveTable struct {
 	a   *collections.Archive
 	dir string
+
+	// mu guards cfg and serializes the rewrite of archiveconfig.json.
+	//
+	// Several methods fold live state back into cfg and persist it -- the index set, the hot
+	// set, retention, the row-group budget, the required-attribute set -- and a caller is free
+	// to drive them from different goroutines (a background index backfill while the
+	// foreground asserts a config, say). cfg is one struct and saveConfig marshals all of it,
+	// so an unguarded pair is a torn read as well as a data race.
+	//
+	// Held across the file write too, not just the field update: two savers would otherwise
+	// race on the same .tmp path and the loser's rename could publish the other's bytes.
+	mu  sync.Mutex
 	cfg ArchiveConfig // the persisted config (archiveconfig.json); its Retention is mutable at runtime
 }
 
@@ -215,6 +228,14 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 // archiveconfig.json atomically (tmp + rename), so a runtime change survives a restart and
 // a reader never sees a torn file. A no-op for an in-memory archive (dir == "").
 func (t *ArchiveTable) saveConfig() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.saveConfigLocked()
+}
+
+// saveConfigLocked is saveConfig with t.mu already held, for the callers that update cfg and
+// persist it as one step.
+func (t *ArchiveTable) saveConfigLocked() error {
 	if t.dir == "" {
 		return nil
 	}
@@ -758,9 +779,13 @@ func (t *ArchiveTable) DropIndex(names ...string) bool {
 // other kind, lands as categorical). Mirrors DB.saveIndexConfig, including its best-effort
 // contract: a write failure is ignored, leaving the change live for this run but unpersisted.
 func (t *ArchiveTable) saveIndexConfig() {
-	t.cfg.CategoricalAttrs, t.cfg.ValueAttrs = t.a.IndexedAttrs()
-	t.cfg.AutoAttrs = t.a.AutoIndexNames()
-	_ = t.saveConfig()
+	cats, vals := t.a.IndexedAttrs()
+	auto := t.a.AutoIndexNames()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.cfg.CategoricalAttrs, t.cfg.ValueAttrs = cats, vals
+	t.cfg.AutoAttrs = auto
+	_ = t.saveConfigLocked()
 }
 
 // Reindex rebuilds the per-segment indexes over all segments.
@@ -858,8 +883,11 @@ func (t *ArchiveTable) RefreshHotSet(sampleMax, topN int) int {
 	if n == 0 {
 		return 0
 	}
-	if len(t.cfg.HotAttrs) > 0 {
-		t.a.AddHotAttrs(t.cfg.HotAttrs...)
+	t.mu.Lock()
+	pinned := append([]string(nil), t.cfg.HotAttrs...)
+	t.mu.Unlock()
+	if len(pinned) > 0 {
+		t.a.AddHotAttrs(pinned...)
 	}
 	t.saveHotConfig()
 	return n
@@ -871,7 +899,9 @@ func (t *ArchiveTable) AddHotAttrs(names ...string) []string {
 	hot := t.a.AddHotAttrs(names...)
 	// A named add is someone asking, so it joins HotAttrs rather than the auto set -- which
 	// keeps it from being attributed to, or recomputed away by, a later refresh.
+	t.mu.Lock()
 	t.cfg.HotAttrs = mergeNames(t.cfg.HotAttrs, names)
+	t.mu.Unlock()
 	t.saveHotConfig()
 	return hot
 }
@@ -881,19 +911,22 @@ func (t *ArchiveTable) AddHotAttrs(names ...string) []string {
 // demand-driven refresh put on top. Best-effort, like saveIndexConfig: a write failure
 // leaves the change live for this run but unpersisted.
 func (t *ArchiveTable) saveHotConfig() {
+	live := t.a.HotAttrNames()
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	human := make(map[string]bool, len(t.cfg.HotAttrs))
 	for _, n := range t.cfg.HotAttrs {
 		human[strings.ToLower(n)] = true
 	}
 	var auto []string
-	for _, n := range t.a.HotAttrNames() {
+	for _, n := range live {
 		if !human[strings.ToLower(n)] {
 			auto = append(auto, n)
 		}
 	}
 	sort.Strings(auto)
 	t.cfg.AutoHotAttrs = auto
-	_ = t.saveConfig()
+	_ = t.saveConfigLocked()
 }
 
 // mergeNames appends to base the names of add it does not already hold (case-insensitively),
@@ -940,8 +973,10 @@ func (t *ArchiveTable) Retention() collections.Retention { return t.a.Retention(
 // take effect on the next Rotate and survive a restart.
 func (t *ArchiveTable) SetRetention(r collections.Retention) error {
 	t.a.SetRetention(r)
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.cfg.Retention = r
-	return t.saveConfig()
+	return t.saveConfigLocked()
 }
 
 // SetRowGroupBytes changes the columnar row-group budget and persists it (archiveconfig.json), so a
@@ -954,8 +989,10 @@ func (t *ArchiveTable) SetRetention(r collections.Retention) error {
 // can answer, and finding it must not mean rebuilding the archive.
 func (t *ArchiveTable) SetRowGroupBytes(n int) error {
 	t.a.SetRowGroupBytes(n)
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.cfg.RowGroupBytes = n
-	return t.saveConfig()
+	return t.saveConfigLocked()
 }
 
 // RowGroupBytes reports the budget currently in effect (0 meaning the default).
@@ -1015,9 +1052,11 @@ func (t *ArchiveTable) saveRequireConfig() error {
 			configured = append(configured, n)
 		}
 	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.cfg.SchemaRequireAttrs = configured
 	t.cfg.SchemaRequireRuntime = runtime
-	return t.saveConfig()
+	return t.saveConfigLocked()
 }
 
 // SetGCFloor installs a runtime GC watermark (in the archive's MinAgeAttr units) so the next
@@ -1052,7 +1091,10 @@ func (t *ArchiveTable) AutoTune(opts AutoTuneOptions) AutoTuneResult {
 	//
 	// Declining is the conservative direction: the cost of not indexing is slower queries,
 	// the cost of indexing unbounded is hours of I/O on a schedule.
-	if t.cfg.backfillHorizon() <= 0 {
+	t.mu.Lock()
+	horizon := t.cfg.backfillHorizon()
+	t.mu.Unlock()
+	if horizon <= 0 {
 		return AutoTuneResult{}
 	}
 	res := t.a.AutoTune(opts)
