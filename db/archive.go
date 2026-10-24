@@ -343,11 +343,17 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 
 // AggregateColsStats is AggregateCols that also fills stats (may be nil) with the scan's work
 // breakdown for EXPLAIN ANALYZE. Only the fall-through projected scan -- the slow path taken when
-// the aggregated attribute is not a numeric field the columnar accelerator covers -- fills it; the
-// columnar/index fast paths do not reassemble records and leave stats zero (RecordsVisited == 0),
-// which the caller reads as "served without a per-record scan". So a nonzero, large
-// RecordsReassembled here is exactly the signature of the slow aggregate this trailer exists to
-// surface.
+// the aggregated attribute is not a numeric field the columnar accelerator covers -- fills the
+// per-record counts; the columnar/index fast paths do not reassemble records and leave them zero.
+// So a nonzero, large RecordsReassembled here is the signature of the slow aggregate this trailer
+// exists to surface.
+//
+// Every return below also TAGS stats with the tier that served it (stats.Tier), because the
+// strategies here differ by more than two orders of magnitude and zero counts were never a
+// statement that a fast path ran -- only the absence of a scan, which a provably-empty constraint
+// and a columnar answer produce alike. Tag at every return, including the ones that read nothing:
+// an untagged return reports TierUnreported, which reads as "did not say" and cannot be told from
+// a peer too old to report a tier at all.
 func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats) ([]AggRow, error) {
 	// A constraint that can never match needs no data read at all. Answered by running the ordinary
 	// aggregation over an EMPTY sequence rather than by constructing a result here, so the shape is whatever
@@ -355,9 +361,11 @@ func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCo
 	// rather than by a second implementation that could disagree.
 	if IsMatchNone(constraint) {
 		attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
+		stats.SetTier(collections.TierMatchNone)
 		return AggregateValues(func(func([]classad.Value) bool) {}, attrs, groupCols, aggs, groupCol, aggCol, nil)
 	}
 	if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
+		stats.SetTier(collections.TierIndex)
 		return rows, nil
 	}
 	// A CONSTRAINED COUNT(*) with no grouping: read the predicated columns out of the columnar
@@ -369,6 +377,7 @@ func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCo
 	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
 		aggs[0].Filter == "" {
 		if n, ok := t.a.CountConstraint(constraint); ok {
+			stats.SetTier(collections.TierColumnar)
 			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, nil
 		}
 	}
@@ -378,6 +387,7 @@ func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCo
 	// NumJobStarts`) reached neither it nor the ungrouped fast path and fell to a full row scan --
 	// the same predicate costing ~200x its ungrouped count, constrained or not.
 	if rows, ok := t.groupedFromColumns(constraint, groupCols, aggs); ok {
+		stats.SetTier(collections.TierColumnar)
 		return rows, nil
 	}
 	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
@@ -386,6 +396,7 @@ func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCo
 	if rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
 		return t.NumStats(constraint, attr)
 	}, groupCols, aggs); ok {
+		stats.SetTier(collections.TierColumnar)
 		return rows, nil
 	}
 
@@ -396,6 +407,7 @@ func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCo
 	// table's aggregate. Zone maps still prune segments no matching record can fall in. This is
 	// the path whose stats matter: an attribute the columnar accelerator does not cover forces a
 	// per-record reassembly here, which the trailer surfaces as a large RecordsReassembled.
+	stats.SetTier(collections.TierScan)
 	seq, err := t.QueryProjectStats(constraint, attrs, stats)
 	if err != nil {
 		return nil, err

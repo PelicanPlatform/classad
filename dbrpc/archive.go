@@ -256,7 +256,10 @@ func (c *Client) ArchiveAggregateBucketed(ctx context.Context, name, constraint 
 
 // ArchiveAggregateStats is ArchiveAggregateBucketed that also fills stats (may be nil) with the
 // scan's work breakdown for EXPLAIN ANALYZE -- notably a large RecordsReassembled when the
-// aggregate fell to the per-record scan (an attribute the columnar accelerator does not cover). It
+// aggregate fell to the per-record scan (an attribute the columnar accelerator does not cover) --
+// and with stats.Tier, which NAMES the strategy that answered rather than leaving it to be
+// inferred from the counts. A server too old to send a tier leaves it TierUnreported; the rest of
+// the trailer is unaffected, because the tier is appended to it (see putScanStats). It
 // always sends the extended frame under opArchiveAggregateStats; against a server too old for the
 // opcode it returns an error wrapping ErrArchiveAggregateUnsupported (or ErrExtendedAggregateUnsupported
 // when a filter was requested), so the caller falls back to a plain aggregate without a breakdown.

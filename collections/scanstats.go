@@ -1,5 +1,52 @@
 package collections
 
+import "strconv"
+
+// AggTier names WHICH strategy answered an aggregate -- the thing a caller previously had to
+// INFER from the scan counts being zero. That inference was wrong in two ways: it rested on an
+// accidental property (the fast paths happen not to reassemble records, so they leave the counts
+// at zero) rather than on anything stated, and it could not tell a columnar answer from a
+// constraint that was proved empty without reading anything, since both report all-zero counts.
+//
+// The values ride on the wire as an int32 appended to the scan-stats trailer, so they are
+// permanent: add new tiers at the end, never renumber. TierUnreported is the zero value so a
+// response from a peer that never sent a tier -- an older server, or an op whose trailer predates
+// the field -- reads as "did not say" rather than claiming a tier it never reported.
+type AggTier int
+
+const (
+	// TierUnreported means no tier was reported: the zero value, NOT a claim about the strategy.
+	TierUnreported AggTier = 0
+	// TierMatchNone: the constraint was proved to match nothing, so no data was read at all.
+	TierMatchNone AggTier = 1
+	// TierIndex: answered from per-segment metadata -- postings, stored record counts, zone maps
+	// -- without opening a segment's records.
+	TierIndex AggTier = 2
+	// TierColumnar: answered from the columnar accelerator, reading only the columns the query
+	// touches rather than reassembling records.
+	TierColumnar AggTier = 3
+	// TierScan: answered by walking records (the fall-through path); the scan counts in the rest
+	// of ScanStats describe it.
+	TierScan AggTier = 4
+)
+
+// String names the tier for a diagnostic (EXPLAIN ANALYZE prints it next to the counts).
+func (t AggTier) String() string {
+	switch t {
+	case TierUnreported:
+		return "unreported"
+	case TierMatchNone:
+		return "match-none"
+	case TierIndex:
+		return "index"
+	case TierColumnar:
+		return "columnar"
+	case TierScan:
+		return "scan"
+	}
+	return "AggTier(" + strconv.Itoa(int(t)) + ")"
+}
+
 // ScanStats accumulates, for one query scan, how the work broke down -- so a diagnostic
 // (EXPLAIN ANALYZE) can show WHERE a slow scan spent itself rather than leaving it to be
 // guessed. All counts are for a single scan; pass a fresh &ScanStats to a *Stats query method.
@@ -27,6 +74,19 @@ type ScanStats struct {
 	SegmentsIndexSkipped int
 	SegmentsUnindexed    int
 	IndexCandidates      int
+
+	// Tier is WHICH strategy produced the answer, for the query paths that fan out over several
+	// (see AggTier). It is reported, not inferred: TierUnreported means nothing said, which is
+	// what a plain scan path that never tags itself and an older server's response both leave.
+	Tier AggTier
+}
+
+// SetTier records which strategy answered. Nil-safe like the counters, so a path can tag itself
+// without first checking whether the caller wanted stats.
+func (s *ScanStats) SetTier(t AggTier) {
+	if s != nil {
+		s.Tier = t
+	}
 }
 
 func (s *ScanStats) visit() {
