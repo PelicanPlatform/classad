@@ -329,6 +329,51 @@ func TestQueryStatsProjectionAndScan(t *testing.T) {
 	}
 }
 
+// TestQueryStatsWireScan covers the read path most clients actually use: the wire op has
+// no EXPLAIN ANALYZE variant, so unless it collects a breakdown for the aggregate the
+// report's scan column is blank exactly where it is needed most.
+func TestQueryStatsWireScan(t *testing.T) {
+	dir := t.TempDir()
+	d, derr := db.Open(dir)
+	if derr != nil {
+		t.Fatal(derr)
+	}
+	defer d.Close()
+	s := NewServer(d)
+	defer s.Close()
+	s.EnableQueryStats(QueryStatsOptions{})
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConnOpts(sconn, ServeOptions{Privileged: true}) }()
+	c := NewClient(cconn)
+	defer c.Close()
+
+	ctx := context.Background()
+	seedJobs(t, ctx, c, 40)
+	if err := c.QueryRawWireStream(ctx, DefaultTable, "JobStatus == 2", []string{"Owner"}, 0, false,
+		func([]byte) bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	rep := waitRecorded(t, s, 1)
+	var wire *QueryShapeStat
+	for i := range rep.Shapes {
+		if rep.Shapes[i].Op == "QueryRawWire" {
+			wire = &rep.Shapes[i]
+		}
+	}
+	if wire == nil {
+		t.Fatalf("no QueryRawWire shape recorded: %+v", rep.Shapes)
+	}
+	if wire.ScanSamples != 1 {
+		t.Errorf("ScanSamples = %d, want 1", wire.ScanSamples)
+	}
+	if wire.SegmentsScanned+wire.SegmentsPruned == 0 {
+		t.Error("no segment accounting recorded on the wire path")
+	}
+	if wire.ProjectionMax != 1 {
+		t.Errorf("ProjectionMax = %d, want 1", wire.ProjectionMax)
+	}
+}
+
 // TestQueryStatsDisabled confirms a server that is not aggregating answers cleanly
 // instead of erroring, and that the caller's own per-query hook still runs.
 func TestQueryStatsDisabled(t *testing.T) {

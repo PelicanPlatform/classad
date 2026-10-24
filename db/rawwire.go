@@ -183,6 +183,23 @@ func (db *DB) QueryRawWire(constraint string, projection []string, redact bool) 
 	return db.c.QueryRawWire(q, projection, redact), nil
 }
 
+// QueryRawWireStats is QueryRawWire that also fills stats (may be nil) with the per-scan
+// work breakdown. An empty/true constraint takes the no-WHERE scan path and leaves stats
+// zero.
+func (db *DB) QueryRawWireStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[[]byte], error) {
+	if !db.c.SupportsRawWire() {
+		return nil, ErrRawWireUnsupported
+	}
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return db.c.ScanRawWire(projection, redact), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return db.c.QueryRawWireStats(q, projection, redact, stats), nil
+}
+
 // SeqCursor and SeqPage re-export the collections types so a caller of the DB
 // API does not have to import the storage layer to paginate.
 type (

@@ -554,10 +554,22 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 		attrs = append(attrs, r.str())
 	}
 	n := 0
+	// The wire path has no EXPLAIN ANALYZE variant, so the scan breakdown is collected
+	// only when the server is aggregating -- but it is collected, because this is the op
+	// most clients actually read with, and leaving it blank left the aggregate's most
+	// diagnostic column empty for the common case.
+	var stats *collections.ScanStats
+	if s.queryStatsOn() {
+		stats = &collections.ScanStats{}
+	}
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: "QueryRawWire", Table: table, Constraint: constraint, Limit: limit,
-				Rows: n, Projection: len(attrs), Duration: time.Since(start)})
+			q := QueryLog{Op: "QueryRawWire", Table: table, Constraint: constraint, Limit: limit,
+				Rows: n, Projection: len(attrs), Duration: time.Since(start)}
+			if stats != nil {
+				q.Scan = *stats
+			}
+			qlog(q)
 		}()
 	}
 	if r.err != nil {
@@ -571,7 +583,13 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 	if !ok {
 		return
 	}
-	seq, err := d.QueryRawWire(constraint, attrs, redact)
+	var seq iter.Seq[[]byte]
+	var err error
+	if stats != nil {
+		seq, err = d.QueryRawWireStats(constraint, attrs, redact, stats)
+	} else {
+		seq, err = d.QueryRawWire(constraint, attrs, redact)
+	}
 	if errors.Is(err, db.ErrRawWireUnsupported) {
 		// Not a failure: this table cannot produce self-contained rows (it is in
 		// memory). Reject the request the same way an older server rejects the

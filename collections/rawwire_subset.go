@@ -48,6 +48,13 @@ func (c *Collection) ScanRawWire(projection []string, redact bool) iter.Seq[[]by
 
 // QueryRawWire is ScanRawWire restricted to ads matching q.
 func (c *Collection) QueryRawWire(q *vm.Query, projection []string, redact bool) iter.Seq[[]byte] {
+	return c.QueryRawWireStats(q, projection, redact, nil)
+}
+
+// QueryRawWireStats is QueryRawWire that also fills stats (may be nil) with the per-scan
+// work breakdown. Iterate the returned sequence to completion (or stop early) before
+// reading stats; a partial iteration leaves partial counts.
+func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact bool, stats *ScanStats) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		if !c.inline {
 			return
@@ -64,6 +71,7 @@ func (c *Collection) QueryRawWire(q *vm.Query, projection []string, redact bool)
 			ws:       ws,
 			resolver: ws.resolve,
 			proj:     c.newProjPlan(projection),
+			stats:    stats,
 		}
 		probes := q.Probes()
 		c.demand.record(probes)
