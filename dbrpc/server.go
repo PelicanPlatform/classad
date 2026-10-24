@@ -245,8 +245,9 @@ type ServeOptions struct {
 	// the client asked for and what it cost. It is an opt-in query log for
 	// operators: it makes visible, for example, a client that fetches every
 	// attribute of every ad instead of projecting server-side (a slow, chatty
-	// query pattern). Called from the connection's read-loop goroutine, so it must
-	// not block.
+	// query pattern). Called on the goroutine that served the query, once its last
+	// frame has been written -- so it delays nothing the client is waiting for, but it
+	// does hold a serving goroutine and must not block.
 	QueryLog func(QueryLog)
 
 	// Peer names the authenticated identity on the other end of this connection, for
