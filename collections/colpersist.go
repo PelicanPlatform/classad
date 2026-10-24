@@ -474,10 +474,10 @@ func readColBlock(c *cursor, s *adSchema, layout *colLayout, codec Codec) *colum
 		b.zones = make([]blockZoneEntry, 0, nz)
 		for j := 0; j < nz; j++ {
 			idx := int(c.u32())
-			z := blockZone{zoneRange: zoneRange{
+			z := blockZone{
 				Min: math.Float64frombits(c.u64()),
 				Max: math.Float64frombits(c.u64()),
-			}}
+			}
 			z.escaped = c.u32() != 0
 			if idx < 0 || idx >= len(s.fields) {
 				return nil
