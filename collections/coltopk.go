@@ -1,6 +1,8 @@
 package collections
 
 import (
+	"math/bits"
+
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -124,8 +126,8 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 	aggLookup := c.attrLookup(aggID)
 
 	tk := &topKKeep{k: k, desc: desc}
-	var keep []bool
-	var scratch []int64
+	var cand candSet
+	var sc predScratch
 	ct := predsNeedCT(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
@@ -186,39 +188,21 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 					base += blk.n
 					continue
 				}
-				if cap(keep) < blk.n {
-					keep = make([]bool, blk.n)
-					scratch = make([]int64, blk.n)
-				}
-				keep, scratch = keep[:blk.n], scratch[:blk.n]
-				live := 0
-				for j := 0; j < blk.n; j++ {
-					gk := base + j
-					vis := gk < cs.offsLen()
-					if vis {
-						o := cs.offAt(gk)
-						vis = w.visible(o, s0)
-					}
-					keep[j] = vis
-					if vis {
-						live++
-					}
-				}
+				sc.prepare(blk.n)
+				cand.setVisible(cs, w, s0, base, blk.n)
 				for i := range otherPreds {
-					if live == 0 {
+					if cand.live == 0 {
 						break
 					}
-					var nok bool
-					if live, nok = narrowByField(blk, otherIdxs[i], otherPreds[i], st.cache, keep, scratch); !nok {
+					if !narrowByField(blk, otherIdxs[i], otherPreds[i], st.cache, &cand, &sc) {
 						releaseWindows(wins)
 						return 0, 0, false
 					}
 				}
-				if live > 0 {
-					for j := 0; j < blk.n; j++ {
-						if !keep[j] {
-							continue
-						}
+				for wi, word := range cand.w {
+					for word != 0 {
+						j := wi*64 + bits.TrailingZeros64(word)
+						word &= word - 1
 						stats.visit()
 						stats.columnDecided()
 						nv, cell := col.cell(j, st.cache)

@@ -2,6 +2,7 @@ package collections
 
 import (
 	"math"
+	"math/bits"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -192,8 +193,8 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 	}
 	aggLookup := c.attrLookup(aggID)
 
-	var keep []bool
-	var scratch []int64
+	var cand candSet
+	var sc predScratch
 	ct := predsNeedCT(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
@@ -255,39 +256,21 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 					base += blk.n
 					continue
 				}
-				if cap(keep) < blk.n {
-					keep = make([]bool, blk.n)
-					scratch = make([]int64, blk.n)
-				}
-				keep, scratch = keep[:blk.n], scratch[:blk.n]
-				live := 0
-				for k := 0; k < blk.n; k++ {
-					gk := base + k
-					vis := gk < cs.offsLen()
-					if vis {
-						o := cs.offAt(gk)
-						vis = w.visible(o, s0)
-					}
-					keep[k] = vis
-					if vis {
-						live++
-					}
-				}
+				sc.prepare(blk.n)
+				cand.setVisible(cs, w, s0, base, blk.n)
 				for i := range otherPreds {
-					if live == 0 {
+					if cand.live == 0 {
 						break
 					}
-					var ok bool
-					if live, ok = narrowByField(blk, otherIdxs[i], otherPreds[i], bc, keep, scratch); !ok {
+					if !narrowByField(blk, otherIdxs[i], otherPreds[i], bc, &cand, &sc) {
 						releaseWindows(wins)
 						return NumStats{}, false
 					}
 				}
-				if live > 0 {
-					for k := 0; k < blk.n; k++ {
-						if !keep[k] {
-							continue
-						}
+				for wi, word := range cand.w {
+					for word != 0 {
+						k := wi*64 + bits.TrailingZeros64(word)
+						word &= word - 1
 						nv, cell := col.cell(k, bc)
 						if cell == cellExpr {
 							releaseWindows(wins)

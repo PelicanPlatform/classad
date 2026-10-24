@@ -2,6 +2,7 @@ package collections
 
 import (
 	"math"
+	"math/bits"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -30,10 +31,18 @@ import (
 //
 // tests keeps each probe's (op, values) alongside the compiled eval, because a block's zone can rule
 // the block out from the operator and bound alone -- and an eval closure cannot be reasoned about.
+//
+// ints is the same conjunction lowered to integer comparisons, for the plane kernels, and intOK says
+// whether every test lowered. It is derived ONCE per query rather than per block: the lowering depends
+// only on the operator and the literal, and the thing that does vary per block -- whether the column
+// is an integer one narrow enough for the two forms to agree -- is a separate check at the block (see
+// intLowerable).
 type fieldPred struct {
 	fieldID uint32
 	eval    func(float64) bool
 	tests   []zoneTest
+	ints    []intTest
+	intOK   bool
 	// ct marks a predicate from a query's CurrentTime-folded form (numPredsCT): it holds only for
 	// records without CurrentTime, so a scan using it must answer from proven windows alone.
 	ct bool
@@ -126,18 +135,19 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 	preds := make([]fieldPred, 0, len(order))
 	for _, id := range order {
 		list := cmps[id]
-		if len(list) == 1 {
-			preds = append(preds, fieldPred{fieldID: id, eval: list[0], tests: tests[id]})
-			continue
-		}
-		preds = append(preds, fieldPred{fieldID: id, eval: func(v float64) bool {
-			for _, cmp := range list {
-				if !cmp(v) {
-					return false
+		p := fieldPred{fieldID: id, eval: list[0], tests: tests[id]}
+		if len(list) > 1 {
+			p.eval = func(v float64) bool {
+				for _, cmp := range list {
+					if !cmp(v) {
+						return false
+					}
 				}
+				return true
 			}
-			return true
-		}, tests: tests[id]})
+		}
+		p.ints, p.intOK = lowerIntTests(p.tests)
+		preds = append(preds, p)
 	}
 	return preds, true
 }
@@ -159,8 +169,8 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) (in
 		}
 	}
 	count := 0
-	var keep []bool
-	var scratch []int64
+	var cand candSet
+	var sc predScratch
 	ct := predsNeedCT(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
@@ -189,37 +199,20 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) (in
 					base += blk.n
 					continue
 				}
-				if cap(keep) < blk.n {
-					keep = make([]bool, blk.n)
-					scratch = make([]int64, blk.n)
-				}
-				keep, scratch = keep[:blk.n], scratch[:blk.n]
+				sc.prepare(blk.n)
 				// Pass 0 establishes visibility, so later passes never touch a record no
 				// snapshot can see.
-				live := 0
-				for k := 0; k < blk.n; k++ {
-					gk := base + k
-					vis := gk < cs.offsLen()
-					if vis {
-						o := cs.offAt(gk)
-						vis = w.visible(o, s0)
-					}
-					keep[k] = vis
-					if vis {
-						live++
-					}
-				}
+				cand.setVisible(cs, w, s0, base, blk.n)
 				for i := range preds {
-					if live == 0 {
+					if cand.live == 0 {
 						break // nothing left in this block; later columns would be read for nothing
 					}
-					var ok bool
-					if live, ok = narrowByField(blk, idxs[i], preds[i], bc, keep, scratch); !ok {
+					if !narrowByField(blk, idxs[i], preds[i], bc, &cand, &sc) {
 						releaseWindows(wins)
 						return 0, false
 					}
 				}
-				count += live
+				count += cand.live
 				base += blk.n
 			}
 		}
@@ -256,54 +249,139 @@ func resolveFields(cs *colSegment, preds []fieldPred) ([]int, bool) {
 	return idxs, true
 }
 
-// narrowByField clears keep[k] for every still-candidate record failing this field's predicate, and
-// returns how many survive. A real field's slot holds math.Float64bits, so the raw value is
-// converted by kind -- reading a real as an integer would silently produce astronomical values.
+// narrowByField removes from cand every still-candidate record failing this field's predicate.
+//
+// Two forms. The PLANE form compares the whole column in one kernel call and intersects the result
+// with the candidate set as word arithmetic, with no per-record read or write of the set at all; it
+// serves an integer column whose comparisons lower into the integer domain (see lowerIntTests and
+// intLowerable). The RECORD form is the original loop, kept for a real column -- whose slot holds
+// math.Float64bits, so reading it as an integer would silently produce astronomical values -- for a
+// column too wide for the two to agree, and for a literal that does not lower.
 //
 // ok=false when a candidate's value is one the columns cannot evaluate (cellExpr): the caller gives
 // the query back to the row path, since treating it as failing the predicate is a wrong answer.
-func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, keep []bool, scratch []int64) (int, bool) {
-	isReal := blk.schema.fields[idx].kind == akReal
-	live := 0
-	// Batch form: one tight typed load of the whole column, then one predicate loop. Escaped records
-	// are read from the cold tail as they come up, so the batch load is unconditional -- gating it on
-	// an escape-free block made it fire almost never (see loadIntBatch).
-	if len(scratch) >= blk.n && blk.loadIntBatch(idx, bc, scratch) {
-		escFree := blk.escapeFree(idx)
-		for k := 0; k < blk.n; k++ {
-			if !keep[k] {
+func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, cand *candSet,
+	sc *predScratch) bool {
+	f := blk.schema.fields[idx]
+	if p.intOK && intLowerable(f) {
+		if plane, built := comparePlane(blk, idx, f, p.ints, bc, sc); built {
+			if blk.escapeFree(idx) {
+				cand.and(plane)
+				return true
+			}
+			return fixEscapedPlane(blk, idx, p, bc, cand, plane)
+		}
+	}
+	return narrowByRecord(blk, idx, f, p, bc, cand, sc)
+}
+
+// intLowerable reports whether a column's values and the float64s the predicate was compiled against
+// order identically, which is what lets the integer kernels answer for it.
+//
+// Six bytes is the cutoff: nothing a six-byte slot holds reaches 2^48, well inside the integers
+// float64 identifies individually, so float64(v) orders exactly as v does and the two forms cannot
+// disagree about any literal at all. An eight-byte column can hold two values that share a float64,
+// and there the agreement depends on where the LITERAL falls -- numPredsOnFields happens to bound it
+// to (-2^53, 2^53), which is enough, but resting a correctness argument on a filter somewhere else
+// is how the argument stops holding when a second caller appears. Eight bytes is the fitted width of
+// last resort, so those columns keep the float64 loop and the question does not arise.
+func intLowerable(f adField) bool { return f.kind == akInt && f.width <= 6 }
+
+// fixEscapedPlane repairs the plane bits of the candidates whose value is not in the column, then
+// intersects it. An escape means the value is MISSING or did not fit the slot, so the slot's bytes
+// are undefined and the kernel's answer for that record is meaningless.
+//
+// It walks the CANDIDATES rather than the block, so a block whose set is already narrow pays for the
+// records still in play and not for the ones an earlier pass removed. A non-candidate's plane bit is
+// left as the kernel wrote it, garbage included, because the intersection below clears it anyway.
+func fixEscapedPlane(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, cand *candSet,
+	plane []uint64) bool {
+	for wi, word := range cand.w {
+		for word != 0 {
+			k := wi*64 + bits.TrailingZeros64(word)
+			word &= word - 1
+			if !testBit(blk.escapeAt(k), idx) {
 				continue
 			}
+			pass := false
+			// The value is not in the column: missing, wrong kind, or too wide for the slot. Absent
+			// or non-numeric leaves the comparison UNDEFINED, so the record cannot satisfy the
+			// conjunction.
+			if nv, cell := blk.escapedNumCell(k, p.fieldID, bc); cell == cellExpr {
+				return false
+			} else if cell == cellNumber {
+				pass = p.eval(nv.f)
+			}
+			if pass {
+				plane[wi] |= 1 << uint(k&63)
+			} else {
+				plane[wi] &^= 1 << uint(k&63)
+			}
+		}
+	}
+	cand.and(plane)
+	return true
+}
+
+// narrowByRecord is the per-record form: one tight typed load of the whole column, then the predicate
+// closure over the candidates.
+//
+// It visits the SET BITS of the candidate set rather than every record, so a pass after a selective
+// one costs what is left rather than what the block holds -- which the []bool it replaces could not
+// do, since finding the survivors there meant reading a byte per record either way.
+//
+// Escaped records are read from the cold tail as they come up, so the batch load is unconditional --
+// gating it on an escape-free block made it fire almost never (see loadIntBatch).
+func narrowByRecord(blk *columnarBlock, idx int, f adField, p fieldPred, bc *blockCache,
+	cand *candSet, sc *predScratch) bool {
+	isReal := f.kind == akReal
+	if !blk.loadIntBatch(idx, bc, sc.ints) {
+		return narrowByScan(blk, idx, isReal, p, bc, cand)
+	}
+	escFree := blk.escapeFree(idx)
+	live := 0
+	for wi, word := range cand.w {
+		keep := word
+		for word != 0 {
+			k := wi*64 + bits.TrailingZeros64(word)
+			word &= word - 1
 			var v float64
 			if !escFree && testBit(blk.escapeAt(k), idx) {
-				// The value is not in the column: missing, wrong kind, or too wide for the slot.
 				nv, cell := blk.escapedNumCell(k, p.fieldID, bc)
 				if cell == cellExpr {
-					return 0, false
+					return false
 				}
 				if cell != cellNumber {
-					keep[k] = false
+					keep &^= 1 << uint(k&63)
 					continue
 				}
 				v = nv.f
 			} else if isReal {
-				v = math.Float64frombits(uint64(scratch[k]))
+				v = math.Float64frombits(uint64(sc.ints[k]))
 			} else {
-				v = float64(scratch[k])
+				v = float64(sc.ints[k])
 			}
 			if !p.eval(v) {
-				keep[k] = false
-				continue
+				keep &^= 1 << uint(k&63)
 			}
-			live++
 		}
-		return live, true
+		cand.w[wi] = keep
+		live += bits.OnesCount64(keep)
 	}
+	cand.live = live
+	return true
+}
+
+// narrowByScan is the last resort: the column would not batch-load, so it is walked through scanInt's
+// callback, which is what every form here replaced and is kept only for the blocks that need it.
+func narrowByScan(blk *columnarBlock, idx int, isReal bool, p fieldPred, bc *blockCache,
+	cand *candSet) bool {
 	ok := true
 	_ = blk.scanInt(idx, bc, func(k int, present bool, v int64) {
-		if !ok || !keep[k] {
+		if !ok || !cand.test(k) {
 			return
 		}
+		f := float64(v)
 		if !present {
 			// Escaped: read just this field from the cold tail. Absent or non-numeric leaves the
 			// comparison UNDEFINED, so the record cannot satisfy the conjunction.
@@ -312,24 +390,19 @@ func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, kee
 				ok = false
 				return
 			}
-			if cell != cellNumber || !p.eval(nv.f) {
-				keep[k] = false
+			if cell != cellNumber {
+				cand.clear(k)
 				return
 			}
-			live++
-			return
-		}
-		f := float64(v)
-		if isReal {
+			f = nv.f
+		} else if isReal {
 			f = math.Float64frombits(uint64(v))
 		}
 		if !p.eval(f) {
-			keep[k] = false
-			return
+			cand.clear(k)
 		}
-		live++
 	})
-	return live, ok
+	return ok
 }
 
 // bruteCountMulti is the row fallback: walk a window's visible records and test the predicated
