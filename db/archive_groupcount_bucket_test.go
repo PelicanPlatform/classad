@@ -377,31 +377,88 @@ func TestMutableBucketedGroupMatchesScan(t *testing.T) {
 	}
 }
 
-// TestArchiveBucketedGroupOnStringColumn is where the two columnar group-by changes meet.
+// mixedStringColumnFixture is a column the schema types as a STRING because strings dominate it,
+// but which also carries records holding a NUMBER. That is the case a column-typed-by-its-majority
+// always has in real data, and the case a homogeneous fixture never produces.
+func mixedStringColumnFixture(tb testing.TB, n int) (*Catalog, *ArchiveTable) {
+	tb.Helper()
+	cat, err := OpenCatalogConfig(CatalogConfig{Dir: tb.TempDir()})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	a, err := cat.CreateArchiveTable("history", ArchiveConfig{SegmentSize: 1 << 15})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		src := fmt.Sprintf("ClusterId = %d\nFoo = \"name-%d\"\n", i, i%23)
+		if i%17 == 0 {
+			src = fmt.Sprintf("ClusterId = %d\nFoo = %d\n", i, 1700000000+i*600)
+		}
+		ad, perr := classad.ParseOld(src)
+		if perr != nil {
+			tb.Fatal(perr)
+		}
+		if aerr := a.Append(ad); aerr != nil {
+			tb.Fatal(aerr)
+		}
+	}
+	if !a.BuildAndEnableSchemaScan(n, 8) {
+		tb.Skip("no sealed segments to accelerate")
+	}
+	return cat, a
+}
+
+// TestArchiveBucketedGroupOnStringColumnKeepsNumbers is the regression for a wrong answer this
+// path used to give with complete confidence.
 //
-// A string column groups from the block dictionary, and a bucket floors a number. A string is not a
-// number, so a bucketed GROUP BY on a string column has no groups at all -- and that is the scan's
-// answer too, since bucketKeyText runs number(v) and drops every row whose bucket attribute is not
-// one. The risk this pins is the opposite: that the dictionary path, which caches an accumulator per
-// block code, would happily build string groups and ignore the bucket entirely.
-func TestArchiveBucketedGroupOnStringColumn(t *testing.T) {
-	cat, a := archiveCountFixture(t, 5000)
+// A bucket floors a number, and a string has none, so it was tempting to answer a bucketed group
+// over a STRING COLUMN with "no groups at all". That is wrong, and the earlier version of this test
+// asserted it -- passing only because its fixture's string column was homogeneous. A column is
+// typed by what dominates it; the records whose value escaped that type still hold numbers, and
+// those bucket normally. Skipping the column dropped them, leaving a plausible answer with most of
+// its groups missing and no error anywhere.
+//
+// The assertion is equality with the scan, not a count, because the count is what made the old
+// version look right.
+func TestArchiveBucketedGroupOnStringColumnKeepsNumbers(t *testing.T) {
+	cat, a := mixedStringColumnFixture(t, 3000)
 	defer cat.Close()
 
-	groupCols := []GroupCol{{Attr: "Owner", BucketWidth: 86400}}
+	groupCols := []GroupCol{{Attr: "Foo", BucketWidth: 86400}}
 	aggs := []AggSpec{{Func: AggCount, Arg: "*"}}
 
 	rows, ok := GroupedFromColumns(a, "true", groupCols, aggs)
 	if !ok {
 		t.Fatal("columnar path declined a bucketed group on a string column")
 	}
-	want := scanAggregate(t, a, "true", groupCols, aggs)
-	if len(rows) != len(want) {
-		t.Fatalf("columnar returned %d groups, scan says %d", len(rows), len(want))
+	got := bucketRows(t, rows, 1)
+	want := bucketRows(t, scanAggregate(t, a, "true", groupCols, aggs), 1)
+	if len(want) < 2 {
+		t.Fatalf("fixture produced %d buckets; it cannot show the bug it exists for", len(want))
 	}
-	if len(rows) != 0 {
-		t.Errorf("a bucketed group on a string column produced %d groups; a string cannot be "+
-			"floored into one, so the bucket was ignored", len(rows))
+	if len(got) != len(want) {
+		t.Fatalf("columnar returned %d buckets, scan says %d", len(got), len(want))
+	}
+	var total int
+	for k, wv := range want {
+		if got[k] == nil {
+			t.Errorf("bucket %s missing; scan has %v", k, wv)
+			continue
+		}
+		if got[k][0] != wv[0] {
+			t.Errorf("bucket %s = %s, scan says %s", k, got[k][0], wv[0])
+		}
+		n, err := strconv.Atoi(wv[0])
+		if err != nil {
+			t.Fatalf("non-numeric count %q", wv[0])
+		}
+		total += n
+	}
+	// The strings are dropped (no bucket to floor into) and the numbers are kept, so the groups
+	// must hold exactly the records that carried a number.
+	if wantRecords := (3000 + 16) / 17; total != wantRecords {
+		t.Errorf("buckets hold %d records, want %d -- the numbers among the strings", total, wantRecords)
 	}
 }
 
