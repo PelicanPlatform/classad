@@ -301,7 +301,34 @@ type groupAccum struct {
 	// A numeric group column looks up a group once per record, so that is the per-record cost.
 	// It points at the same accumulators as acc, which stays the one place results are read from.
 	num map[numGroupKey]*groupAcc
+
+	// The bucket memo: the half-open interval of VALUES that fell in the previous record's bucket,
+	// and that bucket's accumulator. Only meaningful when bucket > 0.
+	//
+	// Records arrive in insertion order and a bucketed group column advances slowly against its
+	// width -- an hour bucket over a per-second timestamp holds thousands of consecutive records --
+	// so the next record is overwhelmingly in the bucket the last one was. Remembering the INTERVAL
+	// rather than the resulting key is what makes that worth having: the per-record cost of a
+	// bucketed group is the float divide and floor in bucketOf, which runs before any map is
+	// touched, so a memo on the finished key would still pay for the divide. Two compares replace
+	// the divide, the floor and the map probe together.
+	//
+	// bHi is pulled a few ulps BELOW the interval's true top edge, because bucketOf reaches its
+	// bucket through a float division whose rounding can place a value within about an ulp of that
+	// edge in the next bucket. Admitting slightly less than the real interval only sends those few
+	// values down the slow path, where bucketOf itself decides; admitting slightly more would group
+	// one of them differently from every other tier.
+	bLo, bHi float64
+	bAcc     *groupAcc
 }
+
+// bucketMemoMargin is how far inside its top edge a bucket interval has to be for the memo to decide
+// a value, as a fraction of the edge. bucketOf's quotient is off by at most half an ulp, which is
+// worth at most the edge times 2^-53 once it is scaled back up, so eight times that is margin to
+// spare. At the magnitudes a timestamp or a counter has, the excluded band is a fraction of a second
+// wide and no ordinary value is ever in it; TestBucketMemoDeclinesTheCoarseTopEdge covers one that
+// is.
+const bucketMemoMargin = 1.0 / (1 << 50)
 
 // numGroupKey is groupKey without the string, for a group whose value is not one.
 type numGroupKey struct {
@@ -323,29 +350,34 @@ func newGroupAccum(bucket int64) *groupAccum {
 // such a record from the series rather than bucketing it as zero, so this drops it too.
 func (a *groupAccum) accFor(key groupKey, nAgg int) (*groupAcc, bool) {
 	if a.bucket > 0 {
+		// The type test stays ahead of the memo. A string, boolean, undefined or error has no
+		// number at all, so it is in no bucket however near the last one its raw bits sit --
+		// number() is a switch on the kind, and it is the divide below that this avoids, not this.
 		f, isNum := key.number()
 		if !isNum {
 			return nil, true
 		}
-		// The floor goes through float64 and renders as an integer because that is what
-		// db.bucketKeyText does: a bucket start is a whole number whatever the column's own type,
-		// so an int column and a real column land in the same group. Sharing the arithmetic rather
-		// than writing it twice is what keeps the two paths from disagreeing.
-		//
-		// A number can still be in no bucket: a NaN or an infinity lies in no half-open interval
-		// [b, b+width), so bucketOf declines it and the record leaves the series the same way a
-		// string does. See bucketOf for why that beats letting the int64 cast invent a bucket.
-		b, inBucket := bucketOf(f, a.bucket)
-		if !inBucket {
-			return nil, true
+		// The interval memo. False for a NaN -- every comparison against one is -- so a non-finite
+		// value falls through to bucketOf, which is the only thing that decides it is in no bucket.
+		if g := a.bAcc; g != nil && a.bLo <= f && f < a.bHi {
+			g.n++
+			return g, true
 		}
-		key = groupKey{raw: b, kind: gkInt}
+		return a.enterBucket(f, nAgg)
 	}
+	// No memo without a bucket. The same one-entry memo on the raw KEY was measured here and did
+	// not pay: an unbucketed group column repeats its value only when the records themselves do,
+	// which is a far shorter run than a bucket's, and the key compare it saves is a map probe
+	// rather than the divide a bucket costs. It was a few percent either way on a column whose
+	// values run in short blocks and a steady loss on every column that cycles.
 	if key.kind == gkString {
 		g := groupAccFor(a.acc, key, nAgg)
 		g.n++
 		return g, true
 	}
+	// Open-coded rather than through numAcc, which the compiler does not inline. This runs once per
+	// RECORD on an unbucketed numeric column, where a call is worth around a tenth of the step; the
+	// bucketed path above calls it only when the memo misses, which is once per bucket.
 	nk := numGroupKey{raw: key.raw, kind: key.kind}
 	g := a.num[nk]
 	if g == nil {
@@ -354,6 +386,48 @@ func (a *groupAccum) accFor(key groupKey, nAgg int) (*groupAcc, bool) {
 	}
 	g.n++
 	return g, true
+}
+
+// enterBucket floors f into its bucket, finds that bucket's accumulator and arms the interval memo
+// with it. It is accFor's bucketed slow path: reached on the first record of each bucket, and on any
+// record the memo declines to decide.
+//
+// Kept out of accFor rather than written inline, because accFor's hot path is a handful of
+// instructions and the code around it is what decides how they are laid out: folding this in cost the
+// UNBUCKETED path measurably while doing nothing for the bucketed one, which runs this once per
+// bucket.
+func (a *groupAccum) enterBucket(f float64, nAgg int) (*groupAcc, bool) {
+	// The floor goes through float64 and renders as an integer because that is what
+	// db.bucketKeyText does: a bucket start is a whole number whatever the column's own type, so an
+	// int column and a real column land in the same group. Sharing the arithmetic rather than
+	// writing it twice is what keeps the two paths from disagreeing.
+	//
+	// A number can still be in no bucket: a NaN or an infinity lies in no half-open interval
+	// [b, b+width), so bucketOf declines it and the record leaves the series the same way a string
+	// does. See bucketOf for why that beats letting the int64 cast invent a bucket.
+	b, inBucket := bucketOf(f, a.bucket)
+	if !inBucket {
+		return nil, true
+	}
+	g := a.numAcc(groupKey{raw: b, kind: gkInt}, nAgg)
+	g.n++
+	lo := float64(b)
+	hi := lo + float64(a.bucket)
+	a.bLo, a.bHi, a.bAcc = lo, hi-math.Abs(hi)*bucketMemoMargin, g
+	return g, true
+}
+
+// numAcc returns a non-string key's accumulator through the pointer-free index, creating the group
+// when it is new. The index points at the same accumulators acc holds, which stays the one place
+// results are read from.
+func (a *groupAccum) numAcc(key groupKey, nAgg int) *groupAcc {
+	nk := numGroupKey{raw: key.raw, kind: key.kind}
+	g := a.num[nk]
+	if g == nil {
+		g = groupAccFor(a.acc, key, nAgg)
+		a.num[nk] = g
+	}
+	return g
 }
 
 // groupAccFor returns key's accumulator, creating it when the group is new.

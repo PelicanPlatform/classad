@@ -476,3 +476,51 @@ func TestGroupCountAllMatchesRowPath(t *testing.T) {
 		t.Error("GROUP BY Owner (a string) declined over every record")
 	}
 }
+
+// TestGroupCountAdjacentKindCollision covers group values that share raw BITS and differ only in kind,
+// placed next to each other.
+//
+// An integer 1 and a boolean true are stored as the same int64 and are two groups, rendering "1" and
+// "true"; so are an integer 0 and false. The group key carries the kind for exactly that reason, and
+// anything that carries a group forward from one record to the next -- a cached accumulator, a memo,
+// a per-block key vector -- has to carry the kind with it. Dropping it reads as a count moved from one
+// real group to another and as a group that is simply not in the result.
+//
+// The fixture places each boolean DIRECTLY AFTER the integer it collides with, and nowhere else does
+// that integer appear, so only a carry-forward can merge them. The surrounding values are 2..9 for the
+// same reason: if 0 and 1 occurred freely both groups would exist anyway and the mistake would hide
+// inside their counts.
+func TestGroupCountAdjacentKindCollision(t *testing.T) {
+	c := heteroGroupFixture(t, groupFixtureRecords, func(i int) string {
+		switch i % 50 {
+		case 6:
+			return "Tally = 1"
+		case 7:
+			return "Tally = true"
+		case 16:
+			return "Tally = 0"
+		case 17:
+			return "Tally = false"
+		}
+		return fmt.Sprintf("Tally = %d", 2+i%8)
+	})
+	defer c.Close()
+	// A constraint every record satisfies: the colliding pair has to stay ADJACENT among the
+	// survivors, and a predicate that dropped either one would leave the memo nothing to confuse.
+	const constraint = "ClusterId >= 0"
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := rowGroupTexts(t, c, constraint, "Tally")
+	for _, k := range []string{"0", "1", "true", "false"} {
+		if want[k] == 0 {
+			t.Fatalf("fixture produced no %s group, so the collision this test is about is absent", k)
+		}
+	}
+	got, ok := c.GroupCountQuery(q, "Tally")
+	if !ok {
+		t.Fatal("declined: this test needs the columnar path, which is the one that caches groups")
+	}
+	checkGroupTexts(t, c, got, constraint, "Tally")
+}
