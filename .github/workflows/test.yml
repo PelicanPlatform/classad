@@ -171,6 +171,99 @@ jobs:
         # here, because a suite that did not run is not a suite that passed.
         [ "$RESULT" = "success" ] || exit 1
 
+  # The width-native SIMD kernels (collections/vm/simdengine_amd64.go and
+  # simdengine_arm64.go) sit behind //go:build goexperiment.simd. Nothing else in
+  # this workflow sets GOEXPERIMENT, so until this job existed they compiled in NO
+  # CI run at all: both engines, every column width, and the arm64 movemask
+  # emulation were verified only by whoever happened to build with the experiment
+  # locally. The differential test that compares those kernels against the scalar
+  # ones could not fail, because the configuration it tests was never built.
+  #
+  # Deliberately ONE job and not a shard matrix. Every tagged file lives in
+  # collections/vm, which is small enough to run whole under -race in well under a
+  # minute; the rest of the module is unaffected by the tag and the sharded job
+  # above already covers it. Building the whole module is still worth doing as a
+  # compile check, because a tagged file that stops compiling is the failure mode.
+  #
+  # ubuntu-latest is amd64, which makes this the only place the amd64 engine runs
+  # at all: 32-lane AVX2 with a free Mask.ToBits, against arm64's 16 lanes and a
+  # two-reduction movemask emulation. Development on this project happens on arm64.
+  simd:
+    name: SIMD engine
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up Go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        check-latest: true
+        # simd/archsimd needs 1.27 on arm64. amd64 would take 1.26, but both
+        # engines are held to one toolchain so a failure here is never "which Go".
+        go-version: '1.27'
+
+    - name: Install goyacc (version pinned in .github/tools)
+      env:
+        GOTOOLCHAIN: auto
+      run: |
+        mkdir -p "$RUNNER_TEMP/bin"
+        (cd .github/tools && GOWORK=off go build -o "$RUNNER_TEMP/bin/goyacc" golang.org/x/tools/cmd/goyacc)
+        echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+    - name: Generate parser
+      run: |
+        export PATH=$PATH:$(go env GOPATH)/bin
+        goyacc -o parser/y.go -p yy parser/classad.y
+
+    - name: Build and vet with the engine compiled in
+      working-directory: collections
+      env:
+        GOEXPERIMENT: simd
+      run: |
+        go mod download
+        go build ./...
+        go vet ./...
+
+    # This is NOT redundant with the test it runs. On a toolchain that supports the
+    # experiment, TestSIMDEngineTurnsOnByItself PASSES when no engine is compiled
+    # in -- it only fails past the Go minor it was last verified against. So if
+    # GOEXPERIMENT ever stopped taking effect (a toolchain change, or the tag
+    # graduating) every test below would still pass while quietly exercising the
+    # scalar path: a green job testing the opposite of what its name claims, which
+    # is the blindness this job exists to remove. Assert the engine is in.
+    - name: Assert an engine is actually compiled in
+      working-directory: collections
+      env:
+        GOEXPERIMENT: simd
+      run: |
+        set -o pipefail
+        go test ./vm/ -run TestSIMDEngineTurnsOnByItself -count=1 -v 2>&1 | tee "$RUNNER_TEMP/engine.log"
+        grep -q 'engine compiled in = true' "$RUNNER_TEMP/engine.log" || {
+          echo "::error::GOEXPERIMENT=simd compiled no engine in; this job would be testing the scalar path."
+          exit 1
+        }
+
+    - name: Test collections/vm with the engine (race detector)
+      working-directory: collections
+      env:
+        GOEXPERIMENT: simd
+      run: go test -race -count=1 ./vm/...
+
+    # The kernels only matter through a query, and this is the one check that runs
+    # the aggregate fast paths against the record scan as reference with the engine
+    # active -- the comparison kernels are the part a wrong answer would come from.
+    # The fuzz workflow deliberately runs WITHOUT the experiment, because that is
+    # what production ships, so this is the other half of that pair.
+    - name: Aggregate tier sweep with the engine
+      working-directory: db
+      env:
+        GOEXPERIMENT: simd
+      run: |
+        go mod download
+        go test -count=1 -run 'TestAggregateFuzzFixtureSteering|TestAggregateStrategyTierCoverage' ./
+
   # db/ and changefeed/ are separate Go modules, and the root module's
   # `go test ./...` does not descend into a nested one -- the same reason
   # collections/ has its own job above. They had neither, so the database
