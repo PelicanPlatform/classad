@@ -63,6 +63,12 @@ type Diagnostics struct {
 	// rewrite reaches them). Both kinds.
 	SealedSegments     int `json:"sealedSegments,omitempty"`
 	StaleIndexSegments int `json:"staleIndexSegments,omitempty"`
+	// BackfillPendingSegments and BackfillPendingBytes are the sealed archive segments (and
+	// their stored bytes) whose index lacks postings for some indexed attribute -- typically
+	// ones beyond the backfill horizon when an index was added. Queries scan them in full on
+	// that attribute until the maintenance backfill or an index.reindex reaches them.
+	BackfillPendingSegments int   `json:"backfillPendingSegments,omitempty"`
+	BackfillPendingBytes    int64 `json:"backfillPendingBytes,omitempty"`
 }
 
 // diagSampleMax bounds the ad sample the server takes for index suggestions.
@@ -137,6 +143,7 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 		EncryptionEnabled: a.EncryptionEnabled(),
 		EncryptedAttrs:    a.EncryptedAttrNames(),
 	}
+	d.BackfillPendingSegments, d.BackfillPendingBytes = a.IndexBackfillPending()
 	if ag, ok := a.GroupSchemaLastAgreement(); ok {
 		d.GroupAgreement = &ag
 	}
@@ -364,8 +371,15 @@ func archiveAdmin(a *db.ArchiveTable, action string, args []string, maintainOpts
 		}
 		return archiveIndexMsg(a, changedMsg("dropped index on "+join(args), changed)), nil
 	case "index.reindex":
-		a.Reindex()
-		return "reindexed", nil
+		// An operator's reindex goes past the backfill horizon: it is the way to have every
+		// segment answer from its index now rather than as maintenance gets to it.
+		res := a.ReindexAll()
+		msg := fmt.Sprintf("reindexed; %d segment(s) beyond the backfill horizon rebuilt to cover every indexed attribute", res.Rebuilt)
+		if res.PendingSegments > 0 {
+			msg += fmt.Sprintf("; %d segment(s) still lack one (%d failed to rebuild) -- retry with index.reindex",
+				res.PendingSegments, res.Failed)
+		}
+		return msg, nil
 	case "analyze":
 		// On-demand self-tuning, the manual counterpart of the scheduled archive maintenance
 		// pass: refresh the hot set from accumulated read demand, add the indexes that demand

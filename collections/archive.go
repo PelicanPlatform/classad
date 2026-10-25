@@ -101,8 +101,8 @@ type ArchiveOptions struct {
 	ZoneAttrs []string
 	// Retention bounds what rotation keeps. Zero ⇒ keep everything.
 	Retention Retention
-	// IndexBackfillBytes bounds how far back an index configuration change is carried (see
-	// Options.IndexBackfillBytes). 0 carries it across the whole archive.
+	// IndexBackfillBytes bounds how far back Reindex carries an index configuration change
+	// (see Options.IndexBackfillBytes). 0 carries it across the whole archive.
 	IndexBackfillBytes int64
 
 	// RowGroupBytes is the uncompressed record-bytes budget for one columnar row group (see
@@ -575,9 +575,26 @@ func (a *Archive) AddIndex(categorical, value []string) bool {
 func (a *Archive) DropIndex(names ...string) bool { return a.c.DropIndex(names...) }
 
 // Reindex rebuilds the per-segment indexes over all segments: those sealed since the last
-// build, and those whose sidecar was built under a superseded index configuration. Segment
-// data is never touched.
+// build, and those whose sidecar was built under a superseded index configuration and lie
+// within ArchiveOptions.IndexBackfillBytes of the newest data. Segment data is never touched.
 func (a *Archive) Reindex() { a.c.Reindex() }
+
+// ReindexAll is Reindex carried to every segment regardless of the backfill horizon, so each
+// sealed segment ends up holding postings for every indexed attribute. See
+// Collection.ReindexAll.
+func (a *Archive) ReindexAll() IndexBackfillResult { return a.c.ReindexAll() }
+
+// BackfillIndexes rebuilds, newest first and up to maxBytes of segment data, the sidecars of
+// sealed segments that lack postings for an indexed attribute. See Collection.BackfillIndexes.
+func (a *Archive) BackfillIndexes(maxBytes int64) IndexBackfillResult {
+	return a.c.BackfillIndexes(maxBytes)
+}
+
+// IndexBackfillPending reports the sealed segments, and their bytes, still lacking postings
+// for some indexed attribute.
+func (a *Archive) IndexBackfillPending() (segments int, bytes int64) {
+	return a.c.IndexBackfillPending()
+}
 
 // SaveDemand checkpoints recorded query demand to the archive's directory, ageing it by the
 // time since the last checkpoint, so index decisions are not restarted from zero every time
@@ -640,7 +657,8 @@ func (a *Archive) ZoneAttrs() []string { return a.c.ZoneAttrs() }
 func (a *Archive) StaleIndexSegments() (stale, sealed int) { return a.c.StaleIndexSegments() }
 
 // StaleIndexSegmentsByPolicy reports segments left on an older index configuration because
-// they fall outside the backfill horizon: expected, and not actionable.
+// they fall outside the backfill horizon: expected, and not actionable. Those among them that
+// lack an indexed attribute are what BackfillIndexes works through (IndexBackfillPending).
 func (a *Archive) StaleIndexSegmentsByPolicy() int { return a.c.StaleIndexSegmentsByPolicy() }
 
 // --- zone-map helpers (shared with the Collection's per-segment zone maps) ---

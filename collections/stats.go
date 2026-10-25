@@ -60,5 +60,6 @@ func (c *Collection) OpStats() OpStats {
 	s.Compact = c.opm.compact.snapshot()
 	s.Retrain = c.opm.retrain.snapshot()
 	s.Reindex = c.opm.reindex.snapshot()
+	s.IndexBackfill = c.opm.backfill.snapshot()
 	return s
 }
