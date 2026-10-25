@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"math"
 	"sort"
 	"strings"
 
@@ -326,6 +327,11 @@ type catPostings struct {
 	stats     segStats        // filled by finishStats after all records are indexed
 }
 type valPostings struct {
+	// post's keys are the values this attribute takes, and a key must therefore be usable
+	// both as a map key and as a sort key. Every float64 is except NaN: it equals nothing
+	// (not even itself), so a map keyed by it can never be read back and sort.Float64s
+	// cannot place it. indexRecord keeps NaN out and puts the record in exc instead, so
+	// every key here is a value a lookup and a boundary search can both find.
 	post map[float64]*roaring.Bitmap
 	// sortedKeys is post's keys in ascending order (filled by finishStats), so a range
 	// probe boundary-searches to the matching run instead of scanning every key.
@@ -454,6 +460,28 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *seg
 				addOffset(vp.post, float64(lit.Int), o)
 				vp.posted.Add(o)
 			case wire.LitReal:
+				if math.IsNaN(lit.Real) {
+					// A NaN cannot be a map key and cannot be a sort key, so it cannot be a
+					// posting. `NaN != NaN`, so the map inserts a FRESH entry for every NaN
+					// posted and then finds none of them again -- post[NaN] is always nil, which
+					// is what nil-dereferenced the stats pass -- and sort.Float64s gives a NaN no
+					// position, so even a posting that survived would be unreachable to the
+					// boundary search that serves ranges. A posting nothing can look up is worse
+					// than no posting.
+					//
+					// So a NaN goes to exc, with the strings and the expressions, rather than to
+					// posted: exc says "the index cannot reason about this record's value", which
+					// is the whole truth about a NaN. Every candidate set unions exc in and a
+					// non-zero exc forbids a segment skip, so the record stays a candidate for
+					// every probe however the planner pushes it down, and the caller re-verifies
+					// it. The price is that a presence probe treats it as a candidate instead of
+					// deciding it -- a superset, which is re-verified too.
+					//
+					// +/-Inf is a totally ordered float64 that keys and sorts fine; it is NOT
+					// swept in here and keeps taking the normal posting path.
+					vp.exc.Add(o)
+					continue
+				}
 				addOffset(vp.post, lit.Real, o)
 				vp.posted.Add(o)
 			case wire.LitBool:

@@ -1199,6 +1199,17 @@ func (s *segStats) estEqualFloat(v float64) float64 {
 // against threshold t. It uses the equi-depth histogram when present (skew-aware), falling
 // back to linear interpolation over [min,max] for a pre-v9 sidecar or a degenerate span.
 func (s *segStats) estRange(op string, t float64) float64 {
+	// A NaN THRESHOLD is reachable from an ordinary query -- `Rate >= 0.0/0.0` folds to a probe
+	// whose value is a NaN -- and no stored value satisfies any ordering comparison against it,
+	// so the indexable records contribute nothing. Caught here because a NaN is no more usable
+	// as a search key than as a stored one: the histogram's boundary search matches no bucket
+	// (`bound[j] >= NaN` is false for every j), so it indexed one past the last bucket and took
+	// the process down, and the [min,max] fallback below divides into a NaN that then poisons
+	// the comparison the selectivity ordering sorts by. The caller still adds the exception
+	// count, so the probe keeps a candidate estimate to be ordered on.
+	if math.IsNaN(t) {
+		return 0
+	}
 	if s.hist != nil {
 		return s.hist.estRange(op, t)
 	}

@@ -197,6 +197,10 @@ func (s *segStats) avgTailCount() float64 {
 
 // finishValStats fills the numeric-range, top-N, NDV and HLL fields from a value
 // index's completed postings. Called once at the end of buildSegIndex.
+//
+// Every key in post is a value this reads back (post[k]), orders (sort.Float64s), compares
+// against min/max and interpolates into a histogram, so it relies on indexRecord's invariant
+// that no key is a NaN -- which none of those four operations can do anything correct with.
 func (vp *valPostings) finishStats() {
 	s := &vp.stats
 	s.exc = vp.exc.GetCardinality()
