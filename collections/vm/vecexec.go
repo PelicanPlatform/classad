@@ -38,10 +38,16 @@ import (
 // right side ran. The cost is that both sides are always evaluated; the benefit is that both are
 // evaluated as vectors.
 //
-// NOT HANDLED, returning ok=false so the caller falls back rather than guessing: string values
-// (constants or columns), the Elvis operator (a per-record select with no combine opcode to hang it
-// on), the magic CurrentTime attribute, and delegated subtrees (OpEvalNode, which Native() already
-// excludes).
+// STRINGS are served, in two representations. A plain string element carries the string; a
+// dictionary-encoded column carries a CODE into the block's dictionary, and because that dictionary is
+// sorted by the evaluator's fold comparison, a comparison against a literal is an integer range test
+// over codes with no string comparison at all. Every other string shape -- code against code, code
+// against a plain string, either against a number -- resolves the code and compares with the
+// evaluator's own fold comparison, or hooks, so the representation never reaches the semantics.
+//
+// NOT HANDLED, returning ok=false so the caller falls back rather than guessing: the Elvis operator (a
+// per-record select with no combine opcode to hang it on), the magic CurrentTime attribute, and
+// delegated subtrees (OpEvalNode, which Native() already excludes).
 
 // Element states. A vector carries one per element, which is how three-valued logic and ERROR survive
 // vectorization, and how int and real stay distinguishable -- 7/2 is not 7.0/2.0.
@@ -363,7 +369,11 @@ func (s *VecScratch) push() *Vec {
 	v.n = s.n
 	v.I, v.S, v.St = v.I[:s.n], v.S[:s.n], v.St[:s.n]
 	v.Hi, v.Lo = v.Hi[:maskWords(s.n)], v.Lo[:maskWords(s.n)]
-	v.Mask, v.Const, v.Raw = false, false, nil
+	// Dict as well as Raw: the stack is pooled across queries, so a slot that served a dictionary-encoded
+	// column would otherwise still point at that block's dictionary. Harmless today -- a resolver is only
+	// consulted for a VsDictCode element and nothing else writes one -- but a stale pointer to another
+	// table's dictionary is not a thing to leave lying in a reused buffer.
+	v.Mask, v.Const, v.Raw, v.Dict = false, false, nil, nil
 	s.depth++
 	return v
 }
@@ -383,8 +393,7 @@ func fillState(v *Vec, st uint8) {
 	v.St[0], v.Const, v.Mask = st, true, false
 }
 
-// broadcast fills a vector with one constant. A string constant declines: `Name == "x"` is a real
-// query shape, just not one this executor serves yet.
+// broadcast fills a vector with one constant, kept in element 0 (see Vec.Const).
 func broadcast(v *Vec, c classad.Value) bool {
 	v.Const, v.Mask = true, false
 	switch c.Type() {
@@ -436,7 +445,7 @@ func binopVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 		return compareVec(ev, op, l, r)
 	case "+", "-", "*":
 		return arithVec(ev, op, l, r)
-	case "=?=", "=!=":
+	case opIs, opIsnt:
 		return identicalVec(op, l, r)
 	default:
 		return hookAll(ev, op, l, r)
@@ -837,6 +846,28 @@ func cmpOrder(c cmpOp, o int) bool {
 	return o != 0
 }
 
+// strState reports whether an element is a STRING, in either representation. A dictionary-encoded
+// column carries codes rather than strings, and a kernel that tests for VsString alone silently sends
+// every such element to the hook -- correct, and several times the cost of resolving the code.
+func strState(st uint8) bool { return st == VsString || st == VsDictCode }
+
+// flipCmp is the operator that compares the same two operands in the opposite order: `lit < col` is
+// `col > lit`. Used only where the flipped form is a total kernel over every element, so no hook ever
+// sees the swapped argument order.
+func flipCmp(c cmpOp) cmpOp {
+	switch c {
+	case cmpLT:
+		return cmpGT
+	case cmpLE:
+		return cmpGE
+	case cmpGT:
+		return cmpLT
+	case cmpGE:
+		return cmpLE
+	}
+	return c // == and != are symmetric
+}
+
 func boolMask(b bool) int {
 	if b {
 		return mTrue
@@ -879,6 +910,19 @@ func compareVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	}
 	l.toData()
 	r.toData()
+	// A literal on the LEFT against a dictionary-encoded column -- `"user3" == Owner`, which the probe
+	// extractor already treats as the same predicate as the other order. Flipping it reaches the integer
+	// range test instead of materializing the literal across the block and hooking every element. Tried
+	// BEFORE materialize, which would otherwise have already spread the literal over n elements.
+	//
+	// Safe to flip only because compareVecDict is total: it serves every element or declines the whole
+	// column, so no hook is ever handed the operands in the wrong order.
+	if l.Const && !r.Const && r.Dict != nil && l.St[0] == VsString {
+		r.ensureInts()
+		if compareVecDict(flipCmp(c), l, r, l.S[0]) {
+			return true
+		}
+	}
 	l.materialize()
 	if !r.Const {
 		l.ensureInts()
@@ -895,7 +939,7 @@ func compareVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 		l.ensureInts()
 		// A dictionary-encoded column against a literal: an integer range test, no string comparison at all.
 		if l.Dict != nil && r.St[0] == VsString {
-			if ok := compareVecDict(c, l, r.S[0]); ok {
+			if ok := compareVecDict(c, l, l, r.S[0]); ok {
 				return true
 			}
 		}
@@ -916,6 +960,22 @@ func compareVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 				// Case-INSENSITIVE, via the evaluator's own comparison function. Every ClassAd
 				// comparison operator folds case; only =?= and =!= do not.
 				st = boolMask(cmpOrder(c, classad.CompareStringsFold(l.S[i], r.S[i])))
+			case strState(ls) && strState(rs):
+				// At least one side is a dictionary CODE: two dictionary-encoded columns, or one
+				// against a plain string. Codes from two columns index two different dictionaries,
+				// so they can only be compared once resolved -- but resolving is an indexed read,
+				// against boxing both sides for the hook.
+				lstr, lok := l.str(i)
+				rstr, rok := r.str(i)
+				if !lok || !rok {
+					var ok bool
+					st, ok = valueToMaskState(ev.ApplyBinaryOp(op, l.valueData(i), r.valueData(i)))
+					if !ok {
+						return false
+					}
+					break
+				}
+				st = boolMask(cmpOrder(c, classad.CompareStringsFold(lstr, rstr)))
 			case ls == VsInt && rs == VsInt:
 				st = boolMask(cmpInt(c, l.I[i], r.I[i]))
 			case numeric(ls) && numeric(rs):
@@ -966,6 +1026,19 @@ func compareVecConst(ev *classad.Evaluator, op string, c cmpOp, l, r *Vec) bool 
 				st = boolMask(cmpInt(c, l.I[i], rInt))
 			case rIsStr && ls == VsString:
 				st = boolMask(cmpOrder(c, classad.CompareStringsFold(l.S[i], rStr)))
+			case rIsStr && ls == VsDictCode:
+				// A code column the range test could not take: one with undefined elements (a group
+				// column's non-members) or with plain strings mixed in (a value repaired from the
+				// cold tail). Resolve the code and fold-compare rather than boxing for the hook.
+				a, ok := l.str(i)
+				if !ok {
+					st, ok = valueToMaskState(ev.ApplyBinaryOp(op, l.valueData(i), r.valueData(i)))
+					if !ok {
+						return false
+					}
+					break
+				}
+				st = boolMask(cmpOrder(c, classad.CompareStringsFold(a, rStr)))
 			case rIsNum && numeric(ls):
 				st = boolMask(cmpFloat(c, l.Float(i), rFloat))
 			default:
@@ -992,27 +1065,32 @@ func compareVecConst(ev *classad.Evaluator, op string, c cmpOp, l, r *Vec) bool 
 //
 //	== lo <= c < hi     != !(lo <= c < hi)     < c < lo     <= c < hi     > c >= hi     >= c >= lo
 //
+// dst is where the mask lands and col is where the codes come from. They are the same vector in the usual
+// `col OP lit` form; they differ when the literal was on the LEFT and the comparison was flipped to get
+// here, since the result still has to land on the operand the stack left on top.
+//
 // ok=false leaves the caller to take the ordinary path -- which happens when the resolver cannot answer, and
-// for any element that is not a code (an escaped record's value comes from the cold tail as a real string).
-func compareVecDict(c cmpOp, l *Vec, lit string) bool {
-	lo, hi, ok := l.Dict.Range(lit)
+// for any element that is not a code (an escaped record's value comes from the cold tail as a real string,
+// and a group column's non-members have no value at all).
+func compareVecDict(c cmpOp, dst, col *Vec, lit string) bool {
+	lo, hi, ok := col.Dict.Range(lit)
 	if !ok {
 		return false
 	}
-	for _, st := range l.St {
+	for _, st := range col.St {
 		if st != VsDictCode {
 			return false // a mixed column: let the string path handle all of it rather than half of it
 		}
 	}
-	for w := range l.Hi {
+	for w := range dst.Hi {
 		base := w * 64
 		end := base + 64
-		if end > l.n {
-			end = l.n
+		if end > col.n {
+			end = col.n
 		}
 		var lob uint64
 		for i := base; i < end; i++ {
-			code := int(l.I[i])
+			code := int(col.I[i])
 			var res bool
 			switch c {
 			case cmpEQ:
@@ -1032,9 +1110,11 @@ func compareVecDict(c cmpOp, l *Vec, lit string) bool {
 				lob |= 1 << uint(i-base)
 			}
 		}
-		l.Hi[w], l.Lo[w] = 0, lob
+		dst.Hi[w], dst.Lo[w] = 0, lob
 	}
-	l.Mask = true
+	// Const must be cleared as well as Mask: dst is the LITERAL's vector in the flipped form, and a
+	// mask whose Const flag is still set reads element 0's bit for every record.
+	dst.Mask, dst.Const = true, false
 	return true
 }
 
@@ -1064,6 +1144,15 @@ func (v *Vec) str(i int) (string, bool) {
 	return v.S[i], true
 }
 
+// The identity operators as the COMPILER spells them. `=?=` and `is` are the same operator and the parser
+// normalizes both to "is", so a kernel keyed on the source spelling never runs: this one did not, for as
+// long as it has existed, and every identity comparison went to the hook instead. Named constants here and
+// asserted against a compiled program in TestVecIdentityOpStrings, so the next rename cannot do it again.
+const (
+	opIs   = "is"
+	opIsnt = "isnt"
+)
+
 // identicalVec is =?= / =!=: total, never undefined, and case SENSITIVE for strings. Two elements are
 // identical when their ClassAd TYPES match and their payloads match -- so 1 =?= 1.0 is false, which is why
 // int and real are distinct states rather than one numeric state.
@@ -1072,11 +1161,30 @@ func (v *Vec) str(i int) (string, bool) {
 // to get wrong, and because a vector cannot hold the values (lists, nested ads) whose identity the
 // reference treats as an error.
 func identicalVec(op string, l, r *Vec) bool {
-	negate := op == "=!="
+	var negate bool
+	switch op {
+	case opIs:
+	case opIsnt:
+		negate = true
+	default:
+		return false // an operator string this kernel was not written for: decline rather than guess
+	}
 	l.ensureInts()
 	r.ensureInts()
 	l.toData()
 	r.toData()
+	// One side a LITERAL. Identity is symmetric -- `a is b` asks the same question as `b is a` -- so the
+	// literal is handled on either side by the same kernel, and the result still lands on l because that
+	// is the operand the stack left on top. Worth separating because the alternative is materializing the
+	// literal across the block: for a string that is a 16-byte header per record, written to say the same
+	// thing n times, and it cost more than the comparison did.
+	if l.Const != r.Const {
+		col, lit := l, r
+		if l.Const {
+			col, lit = r, l
+		}
+		return identicalConst(negate, l, col, lit)
+	}
 	l.materialize()
 	r.materialize()
 	for w := range l.Hi {
@@ -1090,8 +1198,15 @@ func identicalVec(op string, l, r *Vec) bool {
 			same := identKind(l.St[i]) == identKind(r.St[i])
 			if same {
 				switch identKind(l.St[i]) {
-				case VsInt, VsReal, VsBool:
+				case VsInt, VsBool:
 					same = l.I[i] == r.I[i]
+				case VsReal:
+					// By VALUE, not by bits. The reference compares two reals with ==, so 0.0 and
+					// -0.0 are identical although their bit patterns differ, and a NaN is identical
+					// to nothing although its bits may match. Comparing the payload words instead
+					// gets both backwards, which is what this kernel did for as long as nothing
+					// reached it.
+					same = l.Float(i) == r.Float(i)
 				case VsString:
 					ls, lok := l.str(i)
 					rs, rok := r.str(i)
@@ -1105,6 +1220,43 @@ func identicalVec(op string, l, r *Vec) bool {
 		l.Hi[w], l.Lo[w] = 0, lo
 	}
 	l.Mask = true
+	return true
+}
+
+// identicalConst is identicalVec against a literal, read once into registers rather than spread over the
+// block. dst is where the mask lands; col and lit are the column and the literal, in whichever order the
+// expression wrote them.
+func identicalConst(negate bool, dst, col, lit *Vec) bool {
+	lk := identKind(lit.St[0])
+	lInt, lFloat := lit.I[0], lit.Float(0)
+	lStr, lStrOK := lit.str(0)
+	for w := range dst.Hi {
+		base := w * 64
+		end := base + 64
+		if end > col.n {
+			end = col.n
+		}
+		var lo uint64
+		for i := base; i < end; i++ {
+			same := identKind(col.St[i]) == lk
+			if same {
+				switch lk {
+				case VsInt, VsBool:
+					same = col.I[i] == lInt
+				case VsReal:
+					same = col.Float(i) == lFloat
+				case VsString:
+					cs, cok := col.str(i)
+					same = cok && lStrOK && cs == lStr
+				}
+			}
+			if same != negate {
+				lo |= 1 << uint(i-base)
+			}
+		}
+		dst.Hi[w], dst.Lo[w] = 0, lo
+	}
+	dst.Mask, dst.Const = true, false
 	return true
 }
 

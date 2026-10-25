@@ -201,6 +201,15 @@ func BenchmarkStrDict(b *testing.B) {
 		`Owner > "user7"`, // above the maximum: prunes every block
 		`Owner == "user3" && RequestCpus > 2`,
 		`Cmd == "/home/user3/run1.sh"`,
+		// The shapes that are not `column OP literal`: the literal on the LEFT, which is the same
+		// predicate flipped; two dictionary-encoded columns, whose codes index different dictionaries
+		// and so have to be resolved; and identity, which cannot use the range test because it does
+		// not fold case.
+		`"user3" == Owner`,
+		`"user5" > Owner`,
+		`Owner == Cmd`,
+		`Owner =?= "user3"`,
+		`Owner =?= Cmd`,
 	} {
 		q, err := vm.Parse(expr)
 		if err != nil {

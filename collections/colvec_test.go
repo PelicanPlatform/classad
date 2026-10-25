@@ -188,6 +188,12 @@ func BenchmarkVectorEval(b *testing.B) {
 		"ProcId + ClusterId > 100",
 		`Owner == "user3"`,
 		`Owner == "user3" || Owner == "user10"`,
+		// The string shapes that are not `column == literal`. This fixture's Owner is nearly unique
+		// within a block, so these measure the PLAIN-string path; the dictionary-encoded path is
+		// BenchmarkStrDict, over the fixture built for it.
+		`"user3" == Owner`,
+		`Owner =?= "user3"`,
+		`Owner =?= Cmd`,
 	} {
 		q, err := vm.Parse(expr)
 		if err != nil {
