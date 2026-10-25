@@ -102,8 +102,11 @@ func (c *Collection) categoricalGroupCountsBucketed(attr, bucketAttr string, wid
 				// Whole-segment attribution: every record holds a number for bucketAttr (Full)
 				// and the segment's entire range sits in one bucket, so every record lands there.
 				// Without Full a record with no bucket value would be counted in one.
-				if idx != nil && hasZone && z.Full && bucketOf(z.Min, width) == bucketOf(z.Max, width) {
-					b := bucketOf(z.Min, width)
+				b, oneBucket := int64(0), false
+				if hasZone && z.Full {
+					b, oneBucket = zoneBucket(z, width)
+				}
+				if idx != nil && oneBucket {
 					covered = min(int(idx.coveredUpto()), w.used)
 					complete := idx.catCanonicalValues(id, func(v string) bool {
 						n, ok := idx.catValueCount(id, v)
@@ -142,8 +145,45 @@ func (c *Collection) categoricalGroupCountsBucketed(attr, bucketAttr string, wid
 
 // bucketOf floors v into a width-aligned bucket. It must agree exactly with the aggregate
 // engine's bucketKeyText, or the fast path would label rows differently from the scan.
-func bucketOf(v float64, width int64) int64 {
-	return int64(math.Floor(v/float64(width))) * width
+//
+// ok is false when v is not finite, which means it is in NO bucket: a bucket is the half-open
+// interval [b, b+width) on the number line, and neither a NaN nor an infinity lies in one of
+// those -- there is nothing to floor. Going ahead anyway is worse than useless, because
+// int64() of a non-finite float is implementation-defined in Go: on darwin/arm64 with width
+// 86400 a NaN comes out as bucket 0, right beside genuine epoch-0 records, and a +Inf as
+// bucket -86400. Those are legitimate-looking bucket keys that differ by architecture, so the
+// wrong answer is silent. Declining is the only answer that is the same everywhere, and it is
+// what the bucketed path already does with every other value it cannot floor -- a string, a
+// boolean, an absent attribute: the record leaves the series.
+//
+// Finiteness is the whole test: a finite value whose bucket start does not fit in an int64 still
+// gets whatever the cast invents for it, because narrowing the accepted range would change where
+// ordinary values bucket. Nothing within 9.2e18 of zero is affected, which is every timestamp and
+// every counter a bucket is asked for.
+func bucketOf(v float64, width int64) (int64, bool) {
+	// Rejecting non-finite values rather than clamping them: a distinguished bucket would have
+	// to be an int64 on the wire like any other group key, so it would collide with whatever
+	// legitimate bucket that integer names -- which is exactly how the unguarded cast goes wrong.
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	return int64(math.Floor(v/float64(width))) * width, true
+}
+
+// zoneBucket returns the single bucket a segment's whole zone range sits in. ok is false when
+// the range straddles a bucket boundary, and when an edge is in no bucket at all: a NaN never
+// reaches a zone edge (it clears Full, which the caller requires), but an infinity does, and
+// Min == Max == +Inf would otherwise attribute every record in the segment to one bogus bucket.
+func zoneBucket(z zoneRange, width int64) (int64, bool) {
+	lo, ok := bucketOf(z.Min, width)
+	if !ok {
+		return 0, false
+	}
+	hi, ok := bucketOf(z.Max, width)
+	if !ok || lo != hi {
+		return 0, false
+	}
+	return lo, true
 }
 
 func (c *Collection) categoricalGroupCounts(attr string) (map[string]int64, bool) {
@@ -285,7 +325,7 @@ func countAttrBucketRange(c *Collection, w segWindow, attr, bucketAttr string, w
 		*dbuf = raw
 		var val string
 		var bucket int64
-		gotVal, gotBucket := false, false
+		gotVal, gotBucket, inBucket := false, false, false
 		wire.Ad(raw).ForEachNamed(c.intern, func(name string, node []byte) bool {
 			switch {
 			case !gotVal && strings.EqualFold(name, attr):
@@ -295,18 +335,24 @@ func countAttrBucketRange(c *Collection, w segWindow, attr, bucketAttr string, w
 					return false // present but not indexable: decline
 				}
 			case !gotBucket && strings.EqualFold(name, bucketAttr):
-				if f, ok := literalFloat(node); ok {
-					bucket, gotBucket = bucketOf(f, width), true
-				} else {
-					return false
+				f, ok := literalFloat(node)
+				if !ok {
+					return false // present but not a number: decline
 				}
+				// A non-finite number is READ but belongs to no bucket, so the record is
+				// accounted for (it counts toward the completeness total below) while
+				// contributing to no group -- which is what the scan does with it too.
+				bucket, inBucket = bucketOf(f, width)
+				gotBucket = true
 			}
 			return !(gotVal && gotBucket)
 		})
 		if !gotVal || !gotBucket {
 			return 0, false
 		}
-		addTo(bucket, val, 1)
+		if inBucket {
+			addTo(bucket, val, 1)
+		}
 		n++
 	}
 	return n, true

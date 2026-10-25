@@ -302,7 +302,13 @@ func (v *View) contributionOf(ad *classad.ClassAd) contribution {
 				// contributes to no group (dropped from the series).
 				return contribution{valid: false}
 			}
-			bucketStart = bucketFloorInt(num, g.BucketWidth)
+			bucketStart, ok = bucketFloorInt(num, g.BucketWidth)
+			if !ok {
+				// A number can still be in no bucket: EvaluateAttrNumber accepts a NaN or
+				// an infinity because they are reals, and neither names an interval on the
+				// number line. Same outcome as a non-numeric value.
+				return contribution{valid: false}
+			}
 			labels[i] = strconv.FormatInt(bucketStart, 10)
 			continue
 		}
@@ -329,10 +335,31 @@ func (v *View) contributionOf(ad *classad.ClassAd) contribution {
 	return contribution{valid: true, groupKey: strings.Join(labels, "\x00"), labels: labels, inputs: inputs, bucketStart: bucketStart}
 }
 
-// bucketFloorInt floors unix-epoch seconds to an epoch-aligned bucket of the given width
-// (seconds), returning the bucket start in seconds.
-func bucketFloorInt(sec float64, width int64) int64 {
-	return int64(math.Floor(sec/float64(width))) * width
+// bucketFloorInt floors a value into a zero-aligned bucket of the given width, returning the
+// bucket start. The view engine floors unix-epoch seconds with it (hence the name) and
+// bucketKeyText floors whatever column an aggregate buckets; one floor, so the two cannot label
+// a row differently.
+//
+// ok is false when sec is not finite, which means it is in NO bucket: a bucket is the half-open
+// interval [b, b+width) on the number line, and neither a NaN nor an infinity lies in one of
+// those, so there is nothing to floor. The cast cannot be left to decide, because int64() of a
+// non-finite float is implementation-defined in Go -- on darwin/arm64 with width 86400 a NaN
+// yields bucket 0, indistinguishable from genuine epoch-0 rows, and a +Inf yields -86400 -- so
+// the wrong answer is both silent and architecture-dependent. A distinguished bucket is no
+// better: it would travel as an int64 group key like any other and collide with the legitimate
+// bucket that integer names. Dropping is the answer every architecture agrees on, and it is
+// already how the bucketed path treats every other value it cannot floor (a string, a boolean,
+// an absent attribute): the row leaves the series.
+//
+// Finiteness is the whole test: a finite value whose bucket start does not fit in an int64 still
+// gets whatever the cast invents for it, because narrowing the accepted range would change where
+// ordinary values bucket. Nothing within 9.2e18 of zero is affected, which is every timestamp and
+// every counter a bucket is asked for.
+func bucketFloorInt(sec float64, width int64) (int64, bool) {
+	if math.IsNaN(sec) || math.IsInf(sec, 0) {
+		return 0, false
+	}
+	return int64(math.Floor(sec/float64(width))) * width, true
 }
 
 // add folds a key's contribution into its group (+1 member, +metrics). Creates the group if

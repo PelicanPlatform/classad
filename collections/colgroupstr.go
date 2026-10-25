@@ -305,9 +305,9 @@ func newGroupAccum(bucket int64) *groupAccum {
 //	g != nil, ok     accumulate this record's aggregates into g
 //	g == nil, ok     this record is in no group; skip it
 //
-// The second only happens under a bucket. Only a NUMBER can be floored, so a string, boolean,
-// undefined or error has no bucket to land in -- and db.bucketKeyText drops such a record from the
-// series rather than bucketing it as zero, so this drops it too.
+// The second only happens under a bucket. Only a FINITE number can be floored, so a string,
+// boolean, undefined, error, NaN or infinity has no bucket to land in -- and db.bucketKeyText drops
+// such a record from the series rather than bucketing it as zero, so this drops it too.
 func (a *groupAccum) accFor(key groupKey, nAgg int) (*groupAcc, bool) {
 	if a.bucket > 0 {
 		f, isNum := key.number()
@@ -318,7 +318,15 @@ func (a *groupAccum) accFor(key groupKey, nAgg int) (*groupAcc, bool) {
 		// db.bucketKeyText does: a bucket start is a whole number whatever the column's own type,
 		// so an int column and a real column land in the same group. Sharing the arithmetic rather
 		// than writing it twice is what keeps the two paths from disagreeing.
-		key = groupKey{raw: int64(math.Floor(f/float64(a.bucket))) * a.bucket, kind: gkInt}
+		//
+		// A number can still be in no bucket: a NaN or an infinity lies in no half-open interval
+		// [b, b+width), so bucketOf declines it and the record leaves the series the same way a
+		// string does. See bucketOf for why that beats letting the int64 cast invent a bucket.
+		b, inBucket := bucketOf(f, a.bucket)
+		if !inBucket {
+			return nil, true
+		}
+		key = groupKey{raw: b, kind: gkInt}
 	}
 	g := groupAccFor(a.acc, key, nAgg)
 	g.n++
