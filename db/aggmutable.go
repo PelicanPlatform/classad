@@ -101,21 +101,20 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool) []AggStr
 			return rows, ok, nil
 		}},
 		aggRung{"grouped-columns", func(req AggRequest) ([]AggRow, bool, error) {
-			// A GROUP BY one or more columns -- each numeric or string, each raw or bucketed -- with COUNT(*) and/or
-			// MIN/MAX/SUM/AVG/COUNT(attr), answered from the columnar blocks. Every rung above is
-			// gated on there being NO grouping, so `select JobStatus, count(*) from jobs group by
-			// JobStatus` -- a shape a dashboard asks constantly -- decoded every matching record
-			// even on a table carrying the accelerator. Archive tables already route this through
-			// GroupedFromColumns; this gives mutable tables the same path and the same row-shaping
-			// rather than a second implementation. A bucketed group column is what makes a time
-			// series ("per day") take this path rather than the scan below, and a raw column beside
-			// a bucketed one is "per owner per day". Declines (and falls
-			// through) for more group columns than the packed key holds, an aggregate over a
-			// non-numeric column, a
-			// per-aggregate FILTER, COUNT(DISTINCT), a predicate not proven free of CurrentTime,
-			// or a chained table -- the DB.GroupStats* wrappers refuse a chained table because the
-			// columnar pass reads a record's own columns and knows nothing about the parent it
-			// would have inherited the group or aggregate attribute from.
+			// A GROUP BY one or more columns -- each numeric or string, each raw or bucketed --
+			// with COUNT(*) and/or MIN/MAX/SUM/AVG/COUNT(attr), answered from the columnar blocks.
+			// Every rung above is gated on there being NO grouping, so `select JobStatus, count(*)
+			// from jobs group by JobStatus` -- a shape a dashboard asks constantly -- decoded every
+			// matching record even on a table carrying the accelerator. Archive tables already
+			// route this through GroupedFromColumns; this gives mutable tables the same path and
+			// the same row-shaping rather than a second implementation. A bucketed group column is
+			// what makes a time series ("per day") take this path rather than the scan below, and a
+			// raw column beside a bucketed one is "per owner per day". Declines (and falls through)
+			// for more group columns than the packed key holds, an aggregate over a non-numeric
+			// column, a per-aggregate FILTER, COUNT(DISTINCT), a predicate not proven free of
+			// CurrentTime, or a chained table -- the DB.GroupStats* wrappers refuse a chained table
+			// because the columnar pass reads a record's own columns and knows nothing about the
+			// parent it would have inherited the group or aggregate attribute from.
 			rows, ok := GroupedFromColumns(db, req.Constraint, req.GroupCols, req.Aggs)
 			return rows, ok, nil
 		}},
