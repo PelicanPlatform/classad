@@ -119,7 +119,7 @@ func mxProbe(t *testing.T, c *Client, build func(id uint64) []byte, wait time.Du
 	if wait == 0 {
 		wait = 2 * time.Second
 	}
-	id, ch, err := c.callStream(build)
+	id, ch, _, err := c.callStream(build)
 	if err != nil {
 		t.Fatalf("send: %v", err)
 	}

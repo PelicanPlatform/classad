@@ -56,7 +56,7 @@ func (c *Client) WatchWire(ctx context.Context, cursor []byte) (<-chan WireWatch
 // does not implement the opcode it returns ErrWatchWireUnsupported, before any event, and
 // the caller falls back to WatchTable.
 func (c *Client) WatchWireTable(ctx context.Context, table string, cursor []byte) (<-chan WireWatchEvent, func(), error) {
-	id, frames, err := c.callStream(func(rid uint64) []byte {
+	id, frames, _, err := c.callStream(func(rid uint64) []byte {
 		return putBytes(putStr(req(rid, opWatchWire), table), cursor)
 	})
 	if err != nil {

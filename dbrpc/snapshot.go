@@ -191,7 +191,7 @@ func (sc *serverConn) abortRestore() {
 // snapshot carries every attribute, including private ones. The server streams it in
 // chunks, so neither side buffers the whole database.
 func (c *Client) SnapshotTable(ctx context.Context, table string, w io.Writer) error {
-	_, ch, err := c.callStream(func(id uint64) []byte {
+	_, ch, strm, err := c.callStream(func(id uint64) []byte {
 		return putStr(req(id, opSnapshot), table)
 	})
 	if err != nil {
@@ -204,7 +204,7 @@ func (c *Client) SnapshotTable(ctx context.Context, table string, w io.Writer) e
 			return ctx.Err()
 		case frame, ok := <-ch:
 			if !ok {
-				return nil
+				return c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {

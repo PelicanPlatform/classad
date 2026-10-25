@@ -34,7 +34,7 @@ type MatchRow struct {
 // depends on (the request's Requirements and Rank, and the request attributes the
 // resources' Requirements reference).
 func (c *Client) MatchTables(ctx context.Context, reqTable, resTable, keyAttr, reqWhere, targetWhere string, limit int, significantAttrs []string) ([]MatchRow, error) {
-	_, frames, err := c.callStream(func(id uint64) []byte {
+	_, frames, strm, err := c.callStream(func(id uint64) []byte {
 		b := putStr(req(id, opMatchTables), reqTable)
 		b = putStr(b, resTable)
 		b = putStr(b, keyAttr)
@@ -58,7 +58,7 @@ func (c *Client) MatchTables(ctx context.Context, reqTable, resTable, keyAttr, r
 			return out, ctx.Err()
 		case frame, ok := <-frames:
 			if !ok {
-				return out, nil
+				return out, c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {

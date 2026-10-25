@@ -59,6 +59,14 @@ type CallStats struct {
 type pending struct {
 	ch     chan []byte
 	stream bool
+	// broken is the transport failure that closed ch, recorded by failAll before
+	// the close. A stream's channel is closed BOTH by the server's stream
+	// terminator and by the connection dying under it, so without this the two are
+	// indistinguishable to the consumer and a truncated stream reads as a complete
+	// one -- a relay forwarding the rows (the collector, the schedd's queue
+	// queries) then serves a short result as if it were the whole answer. Guarded
+	// by Client.mu.
+	broken error
 }
 
 // NewClient runs the mux over conn. Close (or a transport error) fails all in-flight
@@ -122,6 +130,7 @@ func (c *Client) failAll(err error) {
 		c.closeErr = fmt.Errorf("%w: %v", ErrConnClosed, err)
 	}
 	for id, p := range c.pending {
+		p.broken = c.closeErr
 		close(p.ch)
 		delete(c.pending, id)
 	}
@@ -175,13 +184,28 @@ func (c *Client) cancelPending(id uint64) {
 // callStream issues a streaming request; the returned channel yields each result
 // frame and is closed at the stream's end (or on connection failure). The reqID is
 // returned so the caller can cancel a long-lived stream (opWatchStop).
-func (c *Client) callStream(build func(reqID uint64) []byte) (uint64, <-chan []byte, error) {
+func (c *Client) callStream(build func(reqID uint64) []byte) (uint64, <-chan []byte, *pending, error) {
 	id := c.nextReq.Add(1)
 	ch, err := c.sendID(id, build, true)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
-	return id, ch, nil
+	c.mu.Lock()
+	p := c.pending[id]
+	c.mu.Unlock()
+	return id, ch, p, nil
+}
+
+// streamEnd reports why a stream's channel closed: nil when the server sent the
+// stream terminator, and the transport failure when the connection died under the
+// stream. p may be nil when the stream had already finished and been reaped.
+func (c *Client) streamEnd(p *pending) error {
+	if p == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return p.broken
 }
 
 // send assigns a request id, registers the pending call, and writes the request.
@@ -590,7 +614,7 @@ func (t *Tx) LookupClassAd(ctx context.Context, key string) (string, bool, error
 // stream frame, and the pending entry is cleaned only when the server's stream
 // terminator arrives, so we keep reading (discarding) rather than orphaning it.
 func (c *Client) streamCtx(ctx context.Context, build func(id uint64) []byte) ([]string, error) {
-	_, ch, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(build)
 	if err != nil {
 		return nil, err
 	}
@@ -602,7 +626,7 @@ func (c *Client) streamCtx(ctx context.Context, build func(id uint64) []byte) ([
 			return out, ctx.Err()
 		case frame, ok := <-ch:
 			if !ok {
-				return out, nil
+				return out, c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {
@@ -638,7 +662,7 @@ func (c *Client) streamEach(ctx context.Context, build func(id uint64) []byte, y
 // onStats when the op sends one (the *Stats projection op). onStats is nil for every ordinary
 // stream, which then ignores such a frame if one ever arrives.
 func (c *Client) streamEachStats(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool, onStats func(*reader)) error {
-	_, ch, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(build)
 	if err != nil {
 		return err
 	}
@@ -649,7 +673,11 @@ func (c *Client) streamEachStats(ctx context.Context, build func(id uint64) []by
 			return ctx.Err()
 		case frame, ok := <-ch:
 			if !ok {
-				return nil // stStreamEnd: the read loop closed the channel
+				// The channel closes on the server's stream terminator AND on a
+				// transport failure, so ask which it was: reporting a truncated
+				// stream as a complete one hands the caller a short answer with
+				// no sign anything went wrong.
+				return c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {
@@ -677,7 +705,7 @@ func (c *Client) streamEachStats(ctx context.Context, build func(id uint64) []by
 // the end of the stream; an op that sends none leaves the caller's page zeroed,
 // which reads as "no more".
 func (c *Client) streamEachCursor(ctx context.Context, build func(id uint64) []byte, yield func(row string) bool, onCursor func(*reader)) error {
-	_, ch, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(build)
 	if err != nil {
 		return err
 	}
@@ -688,7 +716,11 @@ func (c *Client) streamEachCursor(ctx context.Context, build func(id uint64) []b
 			return ctx.Err()
 		case frame, ok := <-ch:
 			if !ok {
-				return nil // stStreamEnd: the read loop closed the channel
+				// The channel closes on the server's stream terminator AND on a
+				// transport failure, so ask which it was: reporting a truncated
+				// stream as a complete one hands the caller a short answer with
+				// no sign anything went wrong.
+				return c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {
@@ -781,7 +813,7 @@ func (c *Client) Ordered(ctx context.Context, index int, partition string) ([]Or
 
 // OrderedTable streams one partition of an ordered index in the named table.
 func (c *Client) OrderedTable(ctx context.Context, table string, index int, partition string) ([]OrderedRow, error) {
-	_, frames, err := c.callStream(func(id uint64) []byte {
+	_, frames, strm, err := c.callStream(func(id uint64) []byte {
 		return putStr(putI32(putStr(req(id, opOrdered), table), int32(index)), partition)
 	})
 	if err != nil {
@@ -795,7 +827,7 @@ func (c *Client) OrderedTable(ctx context.Context, table string, index int, part
 			return out, ctx.Err()
 		case frame, ok := <-frames:
 			if !ok {
-				return out, nil
+				return out, c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {
@@ -847,7 +879,7 @@ func (c *Client) WatchHead(ctx context.Context, table string) ([]byte, error) {
 
 // WatchTable streams changes to the named table.
 func (c *Client) WatchTable(ctx context.Context, table string, cursor []byte) (<-chan WatchEvent, func(), error) {
-	id, frames, err := c.callStream(func(rid uint64) []byte {
+	id, frames, _, err := c.callStream(func(rid uint64) []byte {
 		return putBytes(putStr(req(rid, opWatch), table), cursor)
 	})
 	if err != nil {

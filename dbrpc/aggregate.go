@@ -60,7 +60,7 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 		}
 		return putAggSpecs(b, aggs, false)
 	}
-	_, frames, err := c.callStream(build)
+	_, frames, strm, err := c.callStream(build)
 	if err != nil {
 		return nil, err
 	}
@@ -72,7 +72,7 @@ func (c *Client) AggregateTable(ctx context.Context, table, constraint string, g
 			return out, ctx.Err()
 		case frame, ok := <-frames:
 			if !ok {
-				return out, nil
+				return out, c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {
@@ -132,7 +132,7 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 		}
 		return putAggSpecs(b, aggs, filtered)
 	}
-	_, frames, err := c.callStream(build)
+	_, frames, strm, err := c.callStream(build)
 	if err != nil {
 		return nil, err
 	}
@@ -144,7 +144,7 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 			return out, ctx.Err()
 		case frame, ok := <-frames:
 			if !ok {
-				return out, nil
+				return out, c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {
