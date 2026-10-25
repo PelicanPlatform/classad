@@ -1784,7 +1784,8 @@ func respBad(reqID uint64) []byte { return resp(reqID, stBadReq) }
 // nothing merging, the count only rises, and the symptom does not appear until a restart.
 //
 // The work is deliberately narrow -- merge cold runs, rebuild indexes left stale by an
-// interrupted pass, and apply the demand-driven tuning that does not re-encode anything.
+// interrupted pass, carry the index set to older segments within a per-pass budget, and apply
+// the demand-driven tuning that does not re-encode anything.
 // Retraining and rewriting are excluded: both re-encode the whole archive, which is not
 // something to do on a timer. The hot-set refresh is excluded from that reasoning because it
 // rewrites nothing: it changes what future records are written under, and the merge pass
@@ -1830,6 +1831,14 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 		// stale segments behind, and they stay stale until something rebuilds them.
 		if stale, _ := a.StaleIndexSegments(); stale > 0 {
 			a.Reindex()
+		}
+		// Carry the index set to older segments that predate it, a budgeted slice per pass,
+		// newest first. Reindex stops at the backfill horizon, so without this an index added
+		// to a large history only ever reaches its newest segments.
+		if budget, ok := opts.ArchiveIndexBackfillBudget(); ok {
+			if pending, _ := a.IndexBackfillPending(); pending > 0 {
+				a.BackfillIndexes(budget)
+			}
 		}
 		// Derive and checkpoint the candidate group schemas on the ARCHIVE's cadence, which is
 		// far longer than a mutable table's -- so the stability gate's several derivations span

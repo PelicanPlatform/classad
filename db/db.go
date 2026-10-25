@@ -358,13 +358,20 @@ type MaintainOptions struct {
 	// budget.
 	//
 	// ArchiveMergeDisabled turns off the MERGE, leaving the rest of the archive pass running:
-	// the stale-index reindex, the hot-set refresh, index auto-tune, the schema scan and the
-	// demand checkpoint. It once meant the whole archive side, because when it was written the
-	// archive side was the merge and the reindex that follows one; the steps added since are
-	// not merges and do not re-encode anything, and the only one that changes what future
-	// writes look like is governed by ArchiveHotRefreshDisabled.
+	// the stale-index reindex, the index backfill, the hot-set refresh, index auto-tune, the
+	// schema scan and the demand checkpoint. It once meant the whole archive side, because
+	// when it was written the archive side was the merge and the reindex that follows one;
+	// the steps added since are not merges and do not re-encode anything, and the only one
+	// that changes what future writes look like is governed by ArchiveHotRefreshDisabled.
 	ArchiveMerge         MergeOptions
 	ArchiveMergeDisabled bool
+	// ArchiveIndexBackfillBytes is the per-pass budget, in stored segment bytes, for carrying
+	// the current index set to sealed archive segments that lack postings for an indexed
+	// attribute -- the ones beyond ArchiveConfig.IndexBackfillBytes when the index was added.
+	// Each pass rebuilds the newest such segments first until it has re-read this much, so a
+	// large history is covered over several passes without one long stall. 0 takes
+	// DefaultArchiveIndexBackfillBytes; a negative value turns the backfill off.
+	ArchiveIndexBackfillBytes int64
 	// ArchiveHotRefreshDisabled turns off the demand-driven hot-set refresh on ARCHIVE
 	// tables, which otherwise runs on the same HotTopN the mutable tables use.
 	//
@@ -414,6 +421,24 @@ type MaintainOptions struct {
 	// segments, so a table opts into the columnar count path once maintenance runs and stays
 	// covered as it grows. 0 leaves it off.
 	SchemaScanHotTopN int
+}
+
+// DefaultArchiveIndexBackfillBytes is the per-pass index backfill budget when
+// MaintainOptions.ArchiveIndexBackfillBytes is zero: 32 segments at the default 8 MiB segment
+// size, small enough that a pass does not hold up the maintenance that follows it.
+const DefaultArchiveIndexBackfillBytes = 256 << 20
+
+// ArchiveIndexBackfillBudget resolves ArchiveIndexBackfillBytes: the byte budget for one pass,
+// and false when the backfill is turned off.
+func (o MaintainOptions) ArchiveIndexBackfillBudget() (int64, bool) {
+	switch {
+	case o.ArchiveIndexBackfillBytes < 0:
+		return 0, false
+	case o.ArchiveIndexBackfillBytes == 0:
+		return DefaultArchiveIndexBackfillBytes, true
+	default:
+		return o.ArchiveIndexBackfillBytes, true
+	}
 }
 
 // Maintain runs one self-tuning pass: it auto-tunes indexes (adds demand-driven ones,

@@ -26,6 +26,10 @@ import (
 // index is dropped) so the removed attribute's postings are reclaimed. A whole
 // span of segments therefore evolves toward the current spec at whatever cadence
 // the caller reindexes — no write-path or compaction coupling.
+//
+// With Options.IndexBackfillBytes set, rebuilding an already-sealed segment for a
+// configuration change is confined to the newest IndexBackfillBytes; BackfillIndexes and
+// ReindexAll carry it further.
 func (c *Collection) Reindex() {
 	// Serialize concurrent reindexers so two do not build and install the same segment's
 	// sidecar at once (the eager per-seal reindex vs. the periodic one). Idempotent and
@@ -123,7 +127,15 @@ func (c *Collection) Reindex() {
 			// GC-invisible) -- a file sidecar for a persistent segment, an anonymous mapping
 			// for a RAM one. Best-effort; on failure the in-RAM index stays.
 			if t.seal {
-				if persistent {
+				if persistent && t.seg.keyIdx.Load() != nil {
+					// Already sealed to a sidecar that carries no attribute index -- sealed
+					// while nothing was indexed, or by a path that seals the key index before
+					// building postings. sealSegmentIndex is a no-op once a key index exists,
+					// so writing through it would leave this index on the heap for the life of
+					// the process and rebuild it from every record at every open. Rewrite the
+					// sidecar with the attribute section instead.
+					c.reindexSealedFile(sh, t.seg, si)
+				} else if persistent {
 					c.sealSegmentIndex(t.seg, si)
 				} else {
 					c.sealSegmentIndexAnon(t.seg, si)

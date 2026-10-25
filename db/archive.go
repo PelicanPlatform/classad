@@ -79,16 +79,17 @@ type ArchiveConfig struct {
 	// HotAttrs on every restart, and the hot headers of the segments written since would be
 	// the only trace that it ever ran.
 	AutoHotAttrs []string
-	// IndexBackfillBytes bounds how far back an index configuration change is carried: only
-	// segments within the newest N bytes have their existing index rebuilt, older ones keep
-	// the one they have (see collections.Options.IndexBackfillBytes).
+	// IndexBackfillBytes bounds how far back an index configuration change is carried at the
+	// moment it is made: only segments within the newest N bytes have their existing index
+	// rebuilt by AddIndex and Reindex; older ones keep the one they have until the
+	// maintenance pass's budgeted backfill (MaintainOptions.ArchiveIndexBackfillBytes) or an
+	// explicit ReindexAll reaches them (see collections.Options.IndexBackfillBytes).
 	//
 	// Zero takes defaultIndexBackfillBytes. A NEGATIVE value means no bound: the change is
-	// carried across the whole archive, which for history means decompressing every record
-	// to add one index -- hours at scale, to speed up reads of the oldest data that a
-	// newest-first query with a limit may never reach. That is a reasonable thing to ask
-	// for deliberately and a bad thing to get by leaving a field unset, which is why it is
-	// not what zero means.
+	// carried across the whole archive in one go, which for history means decompressing every
+	// record to add one index -- hours at scale, in a call that holds up whatever made it.
+	// That is a reasonable thing to ask for deliberately and a bad thing to get by leaving a
+	// field unset, which is why it is not what zero means.
 	IndexBackfillBytes int64
 	// SchemaRequireAttrs names attributes that enter the derived columnar schema whatever their
 	// presence rate (see collections.Options.SchemaRequireAttrs). It is the CONFIGURED tier:
@@ -708,6 +709,9 @@ type MergeOptions = collections.MergeOptions
 type AutoTuneOptions = collections.AutoTuneOptions
 type AutoTuneResult = collections.AutoTuneResult
 
+// IndexBackfillResult reports one index backfill pass (see collections.IndexBackfillResult).
+type IndexBackfillResult = collections.IndexBackfillResult
+
 // MergePass merges cold segment runs when the archive has reached its trigger watermark,
 // down to its target. Returns the number of merges performed.
 //
@@ -843,8 +847,27 @@ func (t *ArchiveTable) saveIndexConfig() {
 	})
 }
 
-// Reindex rebuilds the per-segment indexes over all segments.
+// Reindex rebuilds the per-segment indexes of segments sealed since the last build, and of
+// segments within the backfill horizon whose index predates the current configuration.
 func (t *ArchiveTable) Reindex() { t.a.Reindex() }
+
+// ReindexAll is Reindex carried past the backfill horizon to every sealed segment, so each
+// holds postings for every indexed attribute. It decompresses every segment that lacks one --
+// on a large archive, a long time -- and is meant for an operator who asked for it; the
+// maintenance pass gets there incrementally through BackfillIndexes.
+func (t *ArchiveTable) ReindexAll() IndexBackfillResult { return t.a.ReindexAll() }
+
+// BackfillIndexes rebuilds, newest first and up to maxBytes of segment data (<= 0: no bound),
+// the sidecars of sealed segments lacking postings for an indexed attribute.
+func (t *ArchiveTable) BackfillIndexes(maxBytes int64) IndexBackfillResult {
+	return t.a.BackfillIndexes(maxBytes)
+}
+
+// IndexBackfillPending reports the sealed segments, and their stored bytes, still lacking
+// postings for some indexed attribute: the backfill's remaining work.
+func (t *ArchiveTable) IndexBackfillPending() (segments int, bytes int64) {
+	return t.a.IndexBackfillPending()
+}
 
 // --- diagnostics (mirrors the mutable-table stat surface for symmetry) ---
 
@@ -993,10 +1016,10 @@ func (t *ArchiveTable) EncryptionEnabled() bool { return t.a.EncryptionEnabled()
 // EncryptedAttrNames reports the attributes this archive seals, matching DB.EncryptedAttrNames.
 func (t *ArchiveTable) EncryptedAttrNames() []string { return t.a.EncryptedAttrNames() }
 
-// StaleIndexSegments reports how many sealed segments still carry an index built under an
-// older configuration, and how many are sealed in total (see collections.Archive.AddIndex:
-// a sealed sidecar is immutable, so a runtime index change reaches old segments only via
-// a Rewrite).
+// StaleIndexSegments reports how many sealed segments within the backfill horizon still carry
+// an index built under an older configuration, and how many are sealed in total. Normally zero;
+// segments beyond the horizon are counted by StaleIndexSegmentsByPolicy and, the ones missing
+// an indexed attribute, by IndexBackfillPending.
 func (t *ArchiveTable) StaleIndexSegments() (stale, sealed int) { return t.a.StaleIndexSegments() }
 
 // StaleIndexSegmentsByPolicy reports segments deliberately left on an older index

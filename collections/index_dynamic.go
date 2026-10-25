@@ -134,11 +134,12 @@ func (c *Collection) DropIndex(names ...string) bool {
 // StaleIndexSegments reports sealed segments whose index was built under a superseded
 // configuration and is still due a rebuild, out of the sealed segments total.
 //
-// "Due a rebuild" is the operative part. With Options.IndexBackfillBytes set, a
-// configuration change is deliberately carried only to recent segments; older ones keep the
-// index they have, permanently and by design. Counting those would leave the number
-// permanently non-zero and say nothing about whether anything is wrong -- so they are
-// excluded here and reported separately by StaleIndexSegmentsByPolicy.
+// "Due a rebuild" is the operative part. With Options.IndexBackfillBytes set, Reindex
+// deliberately carries a configuration change only to recent segments; older ones keep the
+// index they have until BackfillIndexes reaches them, which on a large archive takes many
+// passes. Counting those would leave the number non-zero for that long and say nothing about
+// whether anything is wrong -- so they are excluded here and reported separately by
+// StaleIndexSegmentsByPolicy (and, the ones missing an attribute, by IndexBackfillPending).
 //
 // A persistent non-zero value from this therefore still means what it always meant: a
 // reindex is failing, or never running.
@@ -149,7 +150,9 @@ func (c *Collection) StaleIndexSegments() (stale, sealed int) {
 
 // StaleIndexSegmentsByPolicy reports sealed segments left on a superseded index
 // configuration because they fall outside the backfill horizon. Expected, not actionable:
-// it is the size of the deliberate mixture, and it grows as the store does.
+// it is the size of the deliberate mixture. It includes segments that already cover every
+// indexed attribute and differ only by postings for a dropped one, which nothing rebuilds;
+// IndexBackfillPending counts the ones that are missing an attribute.
 func (c *Collection) StaleIndexSegmentsByPolicy() int {
 	_, byPolicy, _ := c.staleIndexCounts()
 	return byPolicy
@@ -175,7 +178,7 @@ func (c *Collection) staleIndexCounts() (pending, byPolicy, sealed int) {
 				continue
 			}
 			if window != nil && !window[seg] {
-				byPolicy++ // outside the horizon: never going to be rebuilt, and that is fine
+				byPolicy++ // outside the horizon: left to BackfillIndexes, not to Reindex
 				continue
 			}
 			pending++

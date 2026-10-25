@@ -51,15 +51,16 @@ type Options struct {
 	// history archive's aging-out). The zero value keeps everything (Rotate is
 	// then inert). Only meaningful with AppendOnly. See Rotate.
 	Retention Retention
-	// IndexBackfillBytes bounds how far back an index configuration change is carried. When
-	// set, only segments within the newest IndexBackfillBytes have their existing index
-	// rebuilt under a new configuration; older ones keep the index they already have.
+	// IndexBackfillBytes bounds how far back Reindex carries an index configuration change.
+	// When set, Reindex rebuilds the existing index of only the segments within the newest
+	// IndexBackfillBytes; older ones keep the index they already have until BackfillIndexes
+	// (or ReindexAll) reaches them.
 	//
 	// The point is that rebuilding is not free -- it decompresses every record it covers --
 	// while an out-of-date index is still perfectly usable for the attributes it does hold
-	// (recovery uses whatever a segment's index covers, deciding per probe). On an archive
-	// queried newest-first with a limit, the oldest segments may never be reached at all, so
-	// re-indexing them buys little and costs the whole archive.
+	// (recovery uses whatever a segment's index covers, deciding per probe). Reindex runs
+	// after every seal of an archive and inside every AddIndex, so it must not pay for the
+	// whole history; BackfillIndexes pays for it a budgeted slice at a time instead.
 	//
 	// 0 carries a change across every segment, which is the historical behaviour.
 	IndexBackfillBytes int64

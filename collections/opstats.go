@@ -110,6 +110,7 @@ type opMetrics struct {
 	compact    opCounter // Compact() reclaiming dead space
 	retrain    opCounter // dictionary retrain + rewrite
 	reindex    opCounter // index rebuild
+	backfill   opCounter // one sealed segment's sidecar rebuilt by BackfillIndexes
 	commitSync opCounter // per-commit durability wall time (the parallel shard-sync phase)
 }
 
@@ -147,6 +148,9 @@ type OpStats struct {
 	Compact    OpStat `json:"compact"`
 	Retrain    OpStat `json:"retrain"`
 	Reindex    OpStat `json:"reindex"`
+	// IndexBackfill counts sealed segments whose sidecar BackfillIndexes rebuilt to cover the
+	// current index set, one occurrence per segment.
+	IndexBackfill OpStat `json:"indexBackfill"`
 }
 
 // add accumulates one shard's counters into the snapshot.
