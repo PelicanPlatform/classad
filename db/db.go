@@ -351,7 +351,14 @@ type MaintainOptions struct {
 	IndexBudgetSlackBytes int64
 	// ArchiveMerge tunes the merge pass run over each archive table. The zero value uses
 	// the policy defaults, which target a segment count well clear of the process's mapping
-	// budget. ArchiveMergeDisabled turns the archive side of maintenance off entirely.
+	// budget.
+	//
+	// ArchiveMergeDisabled turns off the MERGE, leaving the rest of the archive pass running:
+	// the stale-index reindex, the hot-set refresh, index auto-tune, the schema scan and the
+	// demand checkpoint. It once meant the whole archive side, because when it was written the
+	// archive side was the merge and the reindex that follows one; the steps added since are
+	// not merges and do not re-encode anything, and the only one that changes what future
+	// writes look like is governed by ArchiveHotRefreshDisabled.
 	ArchiveMerge         MergeOptions
 	ArchiveMergeDisabled bool
 	// ArchiveHotRefreshDisabled turns off the demand-driven hot-set refresh on ARCHIVE
