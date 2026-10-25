@@ -1007,8 +1007,65 @@ func floatKeyOp(op string, vals []classad.Value) (newOp string, inexact, ok bool
 		return "<=", true, true
 	case "!=":
 		return "", true, false
+	// A negated ordering probe widens through the comparison its negation IS over a NaN-free
+	// range: `!(x <= c)` is `x > c` there, which widens to `x >= c`, i.e. `!(x < c)`. The other
+	// two already negate to a non-strict comparison (`!(x < c)` is `x >= c`), so the fallthrough
+	// leaves them alone. Only a consumer that has proven NaN-freeness may use either (see
+	// negOrdering); one that evaluates the stored value refuses an inexact probe outright.
+	case "!<=":
+		return "!<", true, true
+	case "!>=":
+		return "!>", true, true
 	}
 	return op, true, true
+}
+
+// negOrderingBase maps a negated-ordering probe operator (vm.Probe's "!<", "!<=", "!>", "!>=") to
+// the comparison inside the negation, and reports whether op was one. See vm's negOrdering for
+// why a negated ordering comparison is not the flipped one: every comparison with a NaN is false,
+// so the negation is TRUE of a NaN where the flipped comparison is false.
+func negOrderingBase(op string) (string, bool) {
+	switch op {
+	case "!<":
+		return "<", true
+	case "!<=":
+		return "<=", true
+	case "!>":
+		return ">", true
+	case "!>=":
+		return ">=", true
+	}
+	return "", false
+}
+
+// orderingFlip maps an ordering comparison to the one its negation is equivalent to OVER VALUES
+// THAT ARE NOT NaN. Reaching for it means asserting that: on a zone proven Full (every record
+// holds a number, so none holds a NaN) or on an integer column, where NaN cannot be stored.
+var orderingFlip = map[string]string{"<": ">=", "<=": ">", ">": "<=", ">=": "<"}
+
+// numPredProbe is valUsable for a path that evaluates the probe as a float predicate over each
+// stored value and negates the RESULT, rather than looking the probe up in an index.
+//
+// That is the one place a negated ordering probe needs no extra proof: `!(v <= c)` computed as
+// the negation of the float comparison is right for every v, NaN included, and costs the same as
+// the comparison. valUsable itself must keep refusing these, because an index posting lookup
+// reasons about the comparison's RANGE and a NaN lies outside every range -- so a range scan over
+// the postings would silently drop exactly the records the negation keeps.
+//
+// An integer literal past 2^53 is refused rather than widened: a widened probe is a candidate
+// superset, and these callers answer from the probe without re-verifying.
+func numPredProbe(id uint32, p vm.Probe) (usableProbe, bool) {
+	if _, neg := negOrderingBase(p.Op); !neg {
+		return valUsable(id, p)
+	}
+	if len(p.Vals) != 1 || intBeyondFloat(p.Vals[0]) {
+		return usableProbe{}, false
+	}
+	f, ok := numericFloat(p.Vals[0])
+	if !ok {
+		return usableProbe{}, false
+	}
+	return usableProbe{attrID: id, cat: false, op: p.Op, fvals: []float64{f}}, true
 }
 
 func numericFloat(v classad.Value) (float64, bool) {

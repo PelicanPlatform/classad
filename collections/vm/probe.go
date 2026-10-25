@@ -9,7 +9,8 @@ import (
 
 // Probe is an index-satisfiable constraint extracted from a query: a self-scoped
 // attribute Attr related by Op to one or more literal values. Op is one of
-// "==","!=","<","<=",">=",">" (a single Val), "in" (a set of Vals, from an
+// "==","!=","<","<=",">=",">" (a single Val), "!<","!<=","!>","!>=" (a NEGATED ordering
+// comparison, which is not the flipped one -- see negOrdering), "in" (a set of Vals, from an
 // OR-of-equalities), "is"/"isnt" (=?=/=!= exact identity), or "present"/"absent"
 // (is/isnt undefined). A store matches Probes against its configured indexes to
 // build a candidate set; because the store still re-verifies the full query, any
@@ -207,17 +208,38 @@ func unparen(e ast.Expr) ast.Expr {
 	}
 }
 
-// negFlip maps a comparison operator to its negation, valid under ClassAd
-// three-valued logic (both forms yield undefined/error in the same cases).
-var negFlip = map[string]string{
-	"==": "!=", "!=": "==", "<": ">=", "<=": ">", ">": "<=", ">=": "<",
-}
+// negFlip maps a comparison operator to the operator its NEGATION is equivalent to -- for the
+// equality pair only. `!(x == c)` is `x != c` and `!(x != c)` is `x == c` for every value of x:
+// the two forms are UNDEFINED or ERROR together (an absent value, a string against a number), and
+// wherever both are defined they are exact complements -- a NaN is != c and is not == c, so even
+// there negation and flip agree. That last part is where the ordering operators part company.
+//
+// THE FOUR ORDERING OPERATORS ARE DELIBERATELY ABSENT. `!(x <= c)` is NOT `x > c`. Every
+// comparison with a NaN is false, so a stored NaN makes `x <= c` FALSE and `!(x <= c)` TRUE while
+// `x > c` is FALSE. Flipping the operator loses exactly the NaN records: an undercount wherever a
+// consumer answers from the probe, and -- because zone pruning gates the row scan -- a whole
+// segment silently dropped from the scan itself. They get their own operator spelling instead
+// (negOrdering), which every consumer that cannot honour the difference refuses by default.
+var negFlip = map[string]string{"==": "!=", "!=": "=="}
+
+// negOrdering spells the negation of an ordering comparison as a probe operator of its own,
+// rather than as the flipped comparison it is not (see negFlip).
+//
+// A consumer may act on one of these only if it either evaluates the comparison on the stored
+// value and negates the RESULT -- which gets NaN right for free and costs nothing -- or has
+// PROVEN that the values it reasons about hold no NaN. Everything else (every index posting
+// lookup, every string-dictionary prune, every estimate) must decline it, which the op-string
+// switches do by default. The negated form is still a necessary condition for its conjunct, so
+// declining only costs selectivity.
+var negOrdering = map[string]string{"<": "!<", "<=": "!<=", ">": "!>", ">=": "!>="}
 
 // operandFlip maps a comparison to the operator that holds when its operands are
 // swapped (e.g. `5 < Memory` is `Memory > 5`).
 var operandFlip = map[string]string{
 	"==": "==", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<=",
 	"is": "is", "isnt": "isnt", // =?= / =!= are symmetric
+	// The negated orderings swap the same way: `!(5 < Memory)` is `!(Memory > 5)`.
+	"!<": "!>", "!<=": "!>=", "!>": "!<", "!>=": "!<=",
 }
 
 // ProbeOf returns the index probe a single (already slot-rewritten) expression yields,
@@ -239,6 +261,11 @@ func probeFrom(c ast.Expr) (Probe, bool) {
 		if b, ok := inner.(*ast.BinaryOp); ok {
 			if fl, ok := negFlip[b.Op]; ok {
 				return cmpProbe(fl, b.Left, b.Right)
+			}
+			// A negated ordering comparison keeps the negation in its operator rather than
+			// flipping it away: the two are not the same predicate over a NaN (see negOrdering).
+			if nf, ok := negOrdering[b.Op]; ok {
+				return cmpProbe(nf, b.Left, b.Right)
 			}
 			if b.Op == "is" || b.Op == "isnt" {
 				if name, ok := refVsUndefined(b.Left, b.Right); ok {

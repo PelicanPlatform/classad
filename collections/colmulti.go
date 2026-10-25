@@ -109,7 +109,9 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 		if !ok || !numericKind(s.fields[idx].kind) {
 			return nil, false
 		}
-		up, ok := valUsable(id, p)
+		// numPredProbe, not valUsable: this path compares each STORED value, so it can honour a
+		// negated ordering probe exactly (see numPredProbe) where an index lookup cannot.
+		up, ok := numPredProbe(id, p)
 		if !ok || len(up.fvals) != 1 {
 			return nil, false // present/absent/in/isnt or non-numeric: not a scalar comparison
 		}

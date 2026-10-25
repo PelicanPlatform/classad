@@ -186,6 +186,14 @@ func lowerIntTests(tests []zoneTest) ([]intTest, bool) {
 			return nil, false
 		}
 		op, fl := t.op, math.Floor(v)
+		if base, neg := negOrderingBase(op); neg {
+			// The plane kernels run ONLY on an integer column (intLowerable), and NaN is the one
+			// value for which a negated ordering comparison differs from the flipped one. An
+			// integer column cannot store a NaN -- such a record escapes the slot, and the one
+			// caller fixes escaped records up from p.eval, which is the float form that gets the
+			// negation right. So the flip is sound here, and only because of that.
+			op = orderingFlip[base]
+		}
 		if fl != v {
 			switch op {
 			case "<", "<=":

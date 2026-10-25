@@ -84,8 +84,8 @@ func (d *demandTracker) record(probes []vm.Probe) {
 		v, _ := d.m.LoadOrStore(strings.ToLower(p.Attr), &demandCounts{})
 		c := v.(*demandCounts)
 		switch p.Op {
-		case "<", "<=", ">", ">=":
-			c.rng.Add(1)
+		case "<", "<=", ">", ">=", "!<", "!<=", "!>", "!>=":
+			c.rng.Add(1) // the negated orderings are range-shaped demand too
 		default: // ==, !=, in
 			c.eq.Add(1)
 		}

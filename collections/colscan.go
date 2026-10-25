@@ -822,6 +822,20 @@ func numCmp(op string, t float64) (func(float64) bool, bool) {
 		return func(v float64) bool { return v == t }, true
 	case "!=":
 		return func(v float64) bool { return v != t }, true
+	// The NEGATED orderings, spelled out rather than flipped away: `!(v <= t)` is not `v > t` when
+	// v is a NaN, where every comparison is false and the negation is therefore TRUE. Computing
+	// the comparison and negating the result is exactly right for every v, NaN included, and costs
+	// the same. A record whose value is absent or non-numeric never reaches here -- the column
+	// scan skips it -- which is also what the negation needs: the comparison is UNDEFINED and so
+	// is `!`, so the record is not a match either way.
+	case "!<":
+		return func(v float64) bool { return !(v < t) }, true
+	case "!<=":
+		return func(v float64) bool { return !(v <= t) }, true
+	case "!>":
+		return func(v float64) bool { return !(v > t) }, true
+	case "!>=":
+		return func(v float64) bool { return !(v >= t) }, true
 	}
 	return nil, false
 }
