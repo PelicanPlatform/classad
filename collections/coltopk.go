@@ -129,13 +129,19 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 	var cand candSet
 	var sc predScratch
 	ct := predsNeedCT(preds)
+	zp := predZoneProbes(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		stats.segments(len(wins), 0) // the cutoff scan filters on non-order fields, so no zone prune
+		pruned := 0
 		for _, w := range wins {
 			if ct && !w.ctFree {
 				releaseWindows(wins) // a folded predicate is exact only in a proven window
 				return 0, 0, false
+			}
+			// No record here can match, so none offers an order value; see schemaScanCountMulti.
+			if c.segZoneExcludes(w, zp, ct) {
+				pruned++
+				continue
 			}
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, rok := resolveStatsFields(cs, aggID, preds)
@@ -219,6 +225,7 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 				base += blk.n
 			}
 		}
+		stats.segments(len(wins), pruned)
 		releaseWindows(wins)
 	}
 	th, _ := tk.threshold()
