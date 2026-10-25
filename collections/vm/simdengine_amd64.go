@@ -19,10 +19,27 @@ const rawSupported = true
 // Declines without AVX2 rather than adding a 128-bit path. The shared scalar kernel is still width-native, so
 // declining costs the vector width and not the whole representation, and AVX2 is 2013 hardware -- a pool
 // without it is not the case worth a third code path.
+//
+// WIDTHS 1 AND 4 ARE AVX2; WIDTH 2 NEEDS AVX-512, and the difference is entirely in how the bitmask is
+// extracted, not in the comparison. Mask8x32.ToBits is VPMOVMSKB and Mask32x8.ToBits is VMOVMSKPS, both
+// AVX2 or older, but Mask16x16.ToBits is KMOVW -- reading an AVX-512 mask register. The comparison that
+// produces the mask (VPCMPGTW) is AVX2 either way.
+//
+// So width 2 is gated on AVX512 separately. Gating the whole engine on AVX2 alone put a KMOVW on every
+// AVX2-without-AVX512 CPU, which is most of them: SIGILL, an illegal instruction, on the first 2-byte
+// column compared. A 16-lane AVX2 extraction is possible -- mask to a vector, reinterpret as bytes,
+// VPMOVMSKB, then compress the duplicated bits -- and would restore width 2 on those CPUs, but it is a
+// kernel of its own and wants its own measurement.
 
 // simdSupportsWidth reports whether this engine has lanes for a column of this width, on this CPU.
 func simdSupportsWidth(width int, _ bool) bool {
-	return archsimd.X86.AVX2() && (width == 1 || width == 2 || width == 4)
+	if !archsimd.X86.AVX2() {
+		return false
+	}
+	if width == 2 {
+		return archsimd.X86.AVX512()
+	}
+	return width == 1 || width == 4
 }
 
 func simdBaseMask(base cmpBase, raw []byte, width int, unsigned bool, lit int64, n int, lo []uint64) bool {
@@ -34,9 +51,10 @@ func simdBaseMask(base cmpBase, raw []byte, width int, unsigned bool, lit int64,
 		return maskInt8x32(base, raw, int8(lit), n, lo)
 	case width == 1 && unsigned && fitsUint8(lit):
 		return maskUint8x32(base, raw, uint8(lit), n, lo)
-	case width == 2 && !unsigned && fitsInt16(lit):
+	// Both of these extract with KMOVW; see the AVX-512 note on the engine above.
+	case width == 2 && archsimd.X86.AVX512() && !unsigned && fitsInt16(lit):
 		return maskInt16x16(base, raw, int16(lit), n, lo)
-	case width == 2 && unsigned && fitsUint16(lit):
+	case width == 2 && archsimd.X86.AVX512() && unsigned && fitsUint16(lit):
 		return maskUint16x16(base, raw, uint16(lit), n, lo)
 	case width == 4 && !unsigned && fitsInt32(lit):
 		return maskInt32x8(base, raw, int32(lit), n, lo)
