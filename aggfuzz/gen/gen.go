@@ -58,7 +58,14 @@ var (
 	// total against the record count and declines when they disagree).
 	CategoricalAttrs = []string{"Owner"}
 	// ValueAttrs gets a per-segment value index (and a zone map for free).
-	ValueAttrs = []string{"ClusterId"}
+	//
+	// Rate is here for one reason: it holds a NaN in a minority of records, and a value index is
+	// keyed by the value, so a NaN key can never be looked up again -- the index built a sorted
+	// key list holding a NaN whose own lookup returned a nil bitmap and dereferenced it. This
+	// fixture crashed on that during index build, which is why Rate was kept out of the set while
+	// the bug stood. It is fixed now, so the set covers it: drop Rate from here and the only
+	// indexed column is one that cannot hold a NaN, which is the shape that let the crash exist.
+	ValueAttrs = []string{"ClusterId", "Rate"}
 	// ZoneAttrs get per-segment [min,max] zone maps, and the set is deliberately mixed, because a
 	// zone is only interesting where it is NOT total. Ts/ClusterId/Mem hold a number in every
 	// record, so their zones come out Full and a segment can be attributed to a range wholesale
