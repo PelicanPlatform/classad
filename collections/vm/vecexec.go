@@ -324,6 +324,10 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			if !logicalVec("||", left, right) {
 				return nil, false
 			}
+		case OpMember:
+			if !memberVec(p.members[in.A], s.top(), s) {
+				return nil, false
+			}
 		default:
 			return nil, false // OpJmpIfNotUndef (Elvis), OpEvalNode, anything added later
 		}
@@ -342,6 +346,8 @@ type VecScratch struct {
 	depth int
 	n     int
 	ev    *classad.Evaluator
+	// codeBits is OpMember's per-block bitset over a dictionary's codes (see memberCodes).
+	codeBits []uint64
 }
 
 func (s *VecScratch) evaluator() *classad.Evaluator {
@@ -704,24 +710,7 @@ func (v *Vec) toMask() {
 	v.ensureInts()
 	if v.Const {
 		// One state repeated: the planes are all-ones or all-zeros words, so there is nothing to walk.
-		st := dataStateToMask(v.St[0], v.I[0])
-		hi, lo := uint64(0), uint64(0)
-		if st&2 != 0 {
-			hi = ^uint64(0)
-		}
-		if st&1 != 0 {
-			lo = ^uint64(0)
-		}
-		for w := range v.Hi {
-			v.Hi[w], v.Lo[w] = hi, lo
-		}
-		// Bits past n must be clear, or a popcount over the tail counts records that do not exist.
-		if tail := uint(v.n % 64); tail != 0 && len(v.Hi) > 0 {
-			m := (uint64(1) << tail) - 1
-			v.Hi[len(v.Hi)-1] &= m
-			v.Lo[len(v.Lo)-1] &= m
-		}
-		v.Const, v.Mask = false, true
+		fillMaskConst(v, dataStateToMask(v.St[0], v.I[0]))
 		return
 	}
 	for w := range v.Hi {

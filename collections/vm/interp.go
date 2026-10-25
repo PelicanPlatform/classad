@@ -96,6 +96,9 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value) (classad.Val
 		case OpEvalNode:
 			stack = append(stack, ev.Evaluate(p.nodes[in.A]))
 			ip++
+		case OpMember:
+			stack[len(stack)-1] = p.members[in.A].eval(stack[len(stack)-1])
+			ip++
 		default:
 			stack = append(stack, classad.NewErrorValue())
 			ip++
