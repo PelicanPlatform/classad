@@ -4,6 +4,7 @@ import (
 	"math/rand"
 	"os"
 	"os/exec"
+	"reflect"
 	"regexp"
 	"testing"
 	"unsafe"
@@ -16,6 +17,24 @@ import (
 func TestBlockZoneEntrySize(t *testing.T) {
 	if got := unsafe.Sizeof(blockZoneEntry{}); got != 32 {
 		t.Fatalf("unsafe.Sizeof(blockZoneEntry{}) = %d, want 32", got)
+	}
+}
+
+// TestNumGroupKeyIsPlainMemory pins numGroupKey to fixed-size scalar fields. A numeric group column looks
+// its group up once per record, and the runtime hashes and compares a key like this as a block of memory;
+// a string or pointer field makes it hash field by field instead, which made a numeric GROUP BY 55%
+// slower when groupKey gained its string. Change it only on purpose.
+func TestNumGroupKeyIsPlainMemory(t *testing.T) {
+	typ := reflect.TypeFor[numGroupKey]()
+	for i := 0; i < typ.NumField(); i++ {
+		switch f := typ.Field(i); f.Type.Kind() {
+		case reflect.Int64, reflect.Uint8:
+		default:
+			t.Fatalf("numGroupKey.%s is a %s; keep the key to fixed-size integers", f.Name, f.Type)
+		}
+	}
+	if got := unsafe.Sizeof(numGroupKey{}); got != 16 {
+		t.Fatalf("unsafe.Sizeof(numGroupKey{}) = %d, want 16", got)
 	}
 }
 

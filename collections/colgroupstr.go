@@ -294,10 +294,23 @@ func adGroupKey(node []byte, found bool) (groupKey, bool) {
 type groupAccum struct {
 	acc    map[groupKey]*groupAcc
 	bucket int64 // 0 = group by the raw value
+
+	// num indexes acc's non-string groups by a key with no string in it. groupKey's string field
+	// makes the runtime hash and compare it field by field, a string hash included, even when the
+	// string is empty; this key has no pointers, so it hashes and compares as 16 bytes of memory.
+	// A numeric group column looks up a group once per record, so that is the per-record cost.
+	// It points at the same accumulators as acc, which stays the one place results are read from.
+	num map[numGroupKey]*groupAcc
+}
+
+// numGroupKey is groupKey without the string, for a group whose value is not one.
+type numGroupKey struct {
+	raw  int64
+	kind groupValKind
 }
 
 func newGroupAccum(bucket int64) *groupAccum {
-	return &groupAccum{acc: map[groupKey]*groupAcc{}, bucket: bucket}
+	return &groupAccum{acc: map[groupKey]*groupAcc{}, bucket: bucket, num: map[numGroupKey]*groupAcc{}}
 }
 
 // accFor returns key's accumulator and counts the record against it, applying the bucket.
@@ -328,7 +341,17 @@ func (a *groupAccum) accFor(key groupKey, nAgg int) (*groupAcc, bool) {
 		}
 		key = groupKey{raw: b, kind: gkInt}
 	}
-	g := groupAccFor(a.acc, key, nAgg)
+	if key.kind == gkString {
+		g := groupAccFor(a.acc, key, nAgg)
+		g.n++
+		return g, true
+	}
+	nk := numGroupKey{raw: key.raw, kind: key.kind}
+	g := a.num[nk]
+	if g == nil {
+		g = groupAccFor(a.acc, key, nAgg)
+		a.num[nk] = g
+	}
 	g.n++
 	return g, true
 }
