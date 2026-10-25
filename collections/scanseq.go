@@ -29,9 +29,10 @@ import (
 // sequence survives all of that — compaction carries the stamps to the
 // destination records because MVCC correctness depends on it.
 //
-// The cost of a page is one forward skip inside the segment straddling the
-// cursor, plus a merge across the segments above it; segments that end before
-// the cursor are skipped whole via maxSeq.
+// The cost of a page is a seek into each segment that may hold records after
+// the cursor, plus a merge across them; segments that end before the cursor are
+// skipped whole via maxSeq. The seek (seqSeek) is what keeps a deep page from
+// walking every record header below the cursor again on every page.
 
 // SeqCursor marks a position in a sequence-ordered scan: the last record the
 // caller consumed. The zero value starts at the beginning.
@@ -81,7 +82,7 @@ type seqRun struct {
 	dict *segDictHandle
 	// cand iterates the index's candidates in the covered prefix, nil once
 	// exhausted or when the run walks its whole segment.
-	cand roaring.IntIterable
+	cand roaring.IntPeekable
 	// off is the next offset of the walk that follows the candidates: the
 	// uncovered tail, or the whole segment for a run without an index.
 	off uint32
@@ -347,7 +348,8 @@ func (c *Collection) shardRuns(sh *shard, s0 uint64, after SeqCursor, qp queryPl
 
 	// A segment whose newest record predates the cursor holds nothing this page
 	// can want. maxSeq is 0 on a segment whose records were not walked (fast
-	// reopen), which is never skipped, as with minSeq.
+	// reopen), which is never skipped, as with minSeq; its seek (seekSeq) then
+	// passes over it instead.
 	walk := make([]segWindow, 0, len(wins))
 	for i, w := range wins {
 		if ms := maxSeqs[i]; ms == 0 || ms >= after.Seq {
@@ -368,16 +370,111 @@ func (c *Collection) shardRuns(sh *shard, s0 uint64, after SeqCursor, qp queryPl
 	runs := make([]*seqRun, 0, len(walk))
 	for _, w := range walk {
 		run := &seqRun{w: w, dict: w.dict()}
+		// Every record before from has a sequence below the cursor's, so the walk would pass over
+		// it: start there, and drop the candidates before it too.
+		from := seekSeq(w, after.Seq)
+		run.off = from
 		if len(usable) > 0 {
 			if ix := windowIndex(w, usable, ct); ix != nil {
 				if cand := prefixCandidates(w, ix, usable, ds, nil); cand != nil {
 					run.cand = cand.Iterator()
+					run.cand.AdvanceIfNeeded(from)
 				}
-				run.off = ix.coveredUpto()
+				run.off = max(ix.coveredUpto(), from)
 			}
 		}
 		run.advance(s0, after.Seq)
 		runs = append(runs, run)
 	}
 	return runs, release
+}
+
+// seqSeekBlock is how many records one seek checkpoint spans, which bounds how many records below
+// the cursor a seek can leave the walk to pass over.
+const seqSeekBlock = 32
+
+// seqSeek lets a paged read start walking a segment near its cursor instead of at offset 0.
+//
+// The walk passes over every record whose sequence is below the cursor's. A page deep into a shard
+// therefore re-reads, in every segment it opens, the headers of every record the earlier pages
+// consumed -- and where a segment's maxSeq is unknown (zero after a reopen from the directory
+// snapshot, which does not walk the records) it cannot skip even a segment that ends below the
+// cursor. A page's cost then grows with its depth and the size of the shard rather than with the
+// page.
+//
+// seqSeek records, for each block of seqSeekBlock records, where the block starts and the highest
+// sequence of any record from the segment's start through the end of the block. That running
+// maximum never decreases, so a binary search finds the first block that can hold a record at or
+// past the cursor, and every record before it is one the walk would have skipped. Nothing here
+// assumes a segment is in sequence order: a running maximum is sound over any order, it only skips
+// less over a segment that is not.
+//
+// It is built from bytes that never change once written: a record's sequence and length are set at
+// append, and a segment only grows. Each version is immutable once published; a reader that finds
+// the segment has grown past it extends a copy.
+type seqSeek struct {
+	offs []uint32 // the offset of each block's first record
+	maxs []uint64 // the highest sequence of any record from offset 0 through the end of each block
+	upto uint32   // the offset just past the last record covered
+	last int      // records in the last block, which an extension fills before opening another
+}
+
+// seekSeq returns the offset at which a walk of w for records with sequence >= minSeq may start:
+// every record before it has a lower sequence. It is an offset the walk from 0 itself reaches, or
+// one at or past w.used when no record of w can qualify. It is 0 when there is nothing to skip.
+//
+// A window with damage walks from the start: the walk steps over damaged spans the framing does
+// not describe, so the checkpoints, which follow the framing, would not be offsets it reaches.
+func seekSeq(w segWindow, minSeq uint64) uint32 {
+	if minSeq == 0 || w.seg == nil || w.dmg != nil {
+		return 0
+	}
+	ss := w.seg.seqSeek.Load()
+	if ss == nil || int(ss.upto) < w.used {
+		ss = ss.extend(w)
+		for {
+			cur := w.seg.seqSeek.Load()
+			if (cur != nil && cur.upto >= ss.upto) || w.seg.seqSeek.CompareAndSwap(cur, ss) {
+				break
+			}
+		}
+	}
+	// A version extended by a reader whose window reached further than w's still holds for w: its
+	// first len(offs) blocks are w's records plus later ones, so the block it picks starts at or
+	// before the first record of w that qualifies, or at or past w.used when none does.
+	i := sort.Search(len(ss.maxs), func(i int) bool { return ss.maxs[i] >= minSeq })
+	if i == len(ss.maxs) {
+		return ss.upto
+	}
+	return ss.offs[i]
+}
+
+// extend returns a copy of ss (nil: an empty one) covering w's records up to w.used, following the
+// same framing as the walk. It stops short at a record the walk would stop at or end on -- a zero
+// length, or one running past w.used -- leaving that record to the walk.
+func (ss *seqSeek) extend(w segWindow) *seqSeek {
+	n := &seqSeek{}
+	if ss != nil {
+		n.offs, n.maxs, n.upto, n.last = slices.Clone(ss.offs), slices.Clone(ss.maxs), ss.upto, ss.last
+	}
+	o := n.upto
+	for int(o) < w.used {
+		total := recTotalLen(w.data, o)
+		if total == 0 || int(o)+int(total) > w.used {
+			break
+		}
+		seq := recSeq(w.data, o)
+		if k := len(n.maxs); k == 0 || n.last == seqSeekBlock {
+			if k > 0 {
+				seq = max(seq, n.maxs[k-1])
+			}
+			n.offs, n.maxs, n.last = append(n.offs, o), append(n.maxs, seq), 1
+		} else {
+			n.maxs[k-1] = max(n.maxs[k-1], seq)
+			n.last++
+		}
+		o += total
+	}
+	n.upto = o
+	return n
 }

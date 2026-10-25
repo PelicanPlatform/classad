@@ -332,7 +332,7 @@ func TestSeqReadMatchesFullWalk(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer c.Close()
+			defer func() { c.Close() }() // c is replaced by the reopen below
 			now := time.Now().Unix()
 			next := 0
 			for ; next < 600; next++ {
@@ -383,43 +383,97 @@ func TestSeqReadMatchesFullWalk(t *testing.T) {
 					}
 				}
 			}
-			// Then random combinations with writes and maintenance between pages.
-			for range 40 {
+			randomQuery := func() (*vm.Query, []string) {
 				expr := seqEquivConstraints[rng.Intn(len(seqEquivConstraints))]
 				var q *vm.Query
 				if expr != "" {
-					if q, err = vm.Parse(expr); err != nil {
-						t.Fatal(err)
+					var perr error
+					if q, perr = vm.Parse(expr); perr != nil {
+						t.Fatal(perr)
 					}
 				}
-				proj := seqEquivProjections[rng.Intn(len(seqEquivProjections))]
-				// Page size 1 puts a page boundary inside every commit group, but costs a
-				// page per match: keep it to the selective constraints.
-				limit := []int{3, 17, 50, 1000}[rng.Intn(4)]
-				if q != nil && rng.Intn(3) == 0 {
-					limit = 1
-				}
-				pageBoth(t, c, q, proj, limit, func() {
-					writes := rng.Intn(3)
-					if opts.AppendOnly && rng.Intn(4) != 0 {
-						writes = 0
-					}
-					for range writes {
-						seqWriter(t, c, rng, &next, now)
-					}
-					switch rng.Intn(40) {
-					case 0:
-						c.Compact()
-					case 1:
-						c.Reindex()
-					case 2:
-						if opts.Dir != "" {
-							c.BuildAndEnableSchemaScan(4096, 8)
-							c.ColumnarizeSealed()
-						}
-					}
-				})
+				return q, seqEquivProjections[rng.Intn(len(seqEquivProjections))]
 			}
+			// maintain writes and runs maintenance, compacting, reindexing or columnarizing
+			// about one call in every 3*every.
+			maintain := func(every int) {
+				writes := rng.Intn(3)
+				if opts.AppendOnly && rng.Intn(4) != 0 {
+					writes = 0
+				}
+				for range writes {
+					seqWriter(t, c, rng, &next, now)
+				}
+				switch rng.Intn(3 * every) {
+				case 0:
+					c.Compact()
+				case 1:
+					c.Reindex()
+				case 2:
+					if opts.Dir != "" {
+						c.BuildAndEnableSchemaScan(4096, 8)
+						c.ColumnarizeSealed()
+					}
+				}
+			}
+			// randomPages pages random combinations with writes and maintenance between pages.
+			randomPages := func(n int) {
+				for range n {
+					q, proj := randomQuery()
+					// Page size 1 puts a page boundary inside every commit group, but costs a
+					// page per match: keep it to the selective constraints.
+					limit := []int{3, 17, 50, 1000}[rng.Intn(4)]
+					if q != nil && rng.Intn(3) == 0 {
+						limit = 1
+					}
+					pageBoth(t, c, q, proj, limit, func() { maintain(13) })
+				}
+			}
+			randomPages(40)
+
+			if opts.Dir != "" {
+				// A clean close and reopen restores each shard from its directory snapshot, which
+				// does not walk the records, so no segment knows its sequence bounds and none is
+				// skipped whole: the seek alone keeps a page from walking what earlier pages read.
+				if err = c.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if c, err = Open(opts); err != nil {
+					t.Fatal(err)
+				}
+				c.Reindex()
+				if !opts.AppendOnly && !anySegmentWithoutSeqBounds(c) {
+					t.Fatal("every segment knows its sequence bounds after the reopen; the reopened shape goes untested")
+				}
+			}
+			// Deep cursors: resume directly from cursors throughout the order, with writes and
+			// maintenance between, so the seek is built deep in a segment, extended over a grown
+			// active segment, and built afresh over the segments compaction and columnarization
+			// put in place.
+			var cursors []SeqCursor
+			for cur := (SeqCursor{}); ; {
+				_, page := refQueryRawFromSeq(c, nil, nil, cur, 23)
+				if !page.More {
+					break
+				}
+				cursors = append(cursors, page.Next)
+				cur = page.Next
+			}
+			rng.Shuffle(len(cursors), func(i, j int) { cursors[i], cursors[j] = cursors[j], cursors[i] })
+			for _, cur := range cursors[:min(len(cursors), 40)] {
+				q, proj := randomQuery()
+				limit := []int{1, 7, 50}[rng.Intn(3)]
+				gotN, pn := seqPage(c, q, proj, cur, limit)
+				gotR, pr := refQueryRawFromSeq(c, q, proj, cur, limit)
+				if !slices.Equal(gotN, gotR) {
+					t.Fatalf("page from cursor %+v differs\n read:      %q\n reference: %q", cur, gotN, gotR)
+				}
+				if pn.More && !pr.More {
+					t.Fatalf("page from cursor %+v: the read reports More, the reference does not", cur)
+				}
+				maintain(4)
+			}
+			randomPages(10)
 		})
 	}
 }
@@ -456,4 +510,20 @@ func columnarSegmentsForTest(c *Collection) int {
 		sh.mu.RUnlock()
 	}
 	return n
+}
+
+// anySegmentWithoutSeqBounds reports whether some segment of c does not know its sequence bounds,
+// as a segment restored without walking its records does not.
+func anySegmentWithoutSeqBounds(c *Collection) bool {
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg != nil && seg.used > 0 && seg.maxSeq == 0 {
+				sh.mu.RUnlock()
+				return true
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return false
 }
