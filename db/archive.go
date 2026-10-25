@@ -386,77 +386,162 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 // an untagged return reports TierUnreported, which reads as "did not say" and cannot be told from
 // a peer too old to report a tier at all.
 func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats) ([]AggRow, error) {
-	// A constraint that can never match needs no data read at all. Answered by running the ordinary
-	// aggregation over an EMPTY sequence rather than by constructing a result here, so the shape is whatever
-	// a scan that matched nothing would have produced -- 0 for a count, undefined for MIN -- by construction
-	// rather than by a second implementation that could disagree.
-	if IsMatchNone(constraint) {
-		attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
-		stats.SetTier(collections.TierMatchNone)
-		return AggregateValues(func(func([]classad.Value) bool) {}, attrs, groupCols, aggs, groupCol, aggCol, nil)
-	}
-	// The index answers an unconstrained count from postings, which nothing beats. A constrained
-	// grouped count it answers from zone verdicts, reading every straddling segment's records one at a
-	// time, so there the columns go first: on a 400k-record archive the columnar GROUP BY took 4 ms
-	// for a day's window where the zone verdicts took 51 ms (42 ms against 117 ms for 30 days).
-	matchAll := IsMatchAll(constraint)
-	if matchAll {
-		if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
+	return runAggLadder(t.aggLadder(stats), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
+}
+
+// aggLadder is the archive's ordered list of aggregate strategies: each serves the whole request
+// or declines to the next, and the projected scan at the end always answers. Built per call
+// because its rungs close over the caller's stats block, which they tag with the tier that served
+// the request, and because the match-all memo they share is per constraint.
+//
+// Order is measured, not incidental, and the index rung appears TWICE on purpose. The index
+// answers an unconstrained count from postings, which nothing beats, so it goes above the columnar
+// rungs. A CONSTRAINED grouped count it answers from zone verdicts instead, reading every
+// straddling segment's records one at a time, so there the columns go first: on a 400k-record
+// archive the columnar GROUP BY took 4 ms for a day's window where the zone verdicts took 51 ms
+// (42 ms against 117 ms for 30 days). Splitting the rung on match-all is what lets each half sit
+// where it wins. Match-none stays first because it is the only rung that answers without
+// consulting storage at all; the rest are mutually exclusive on the number of group columns, so
+// their relative order is the order they were added.
+//
+// Every rung that answers tags stats with its tier, including the ones that read nothing: an
+// untagged return reports TierUnreported, which reads as "did not say" and cannot be told from a
+// peer too old to report a tier at all. A rung that declines tags nothing, so the tier a caller
+// sees is always the tier of the rung that actually answered.
+func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
+	var matchAll matchAllMemo
+	return []AggStrategy{
+		aggRung{"match-none", func(req AggRequest) ([]AggRow, bool, error) {
+			// A constraint that can never match needs no data read at all. Answered by running the
+			// ordinary aggregation over an EMPTY sequence rather than by constructing a result
+			// here, so the shape is whatever a scan that matched nothing would have produced -- 0
+			// for a count, undefined for MIN -- by construction rather than by a second
+			// implementation that could disagree. It is also the one fast rung that can fail on a
+			// malformed request before any storage is touched, because it runs the same reduce
+			// engine the scan does.
+			if !IsMatchNone(req.Constraint) {
+				return nil, false, nil
+			}
+			attrs, groupCol, aggCol := AggProjection(req.GroupCols, req.Aggs)
+			stats.SetTier(collections.TierMatchNone)
+			rows, err := AggregateValues(func(func([]classad.Value) bool) {}, attrs, req.GroupCols, req.Aggs, groupCol, aggCol, nil)
+			if err != nil {
+				return nil, false, err
+			}
+			return rows, true, nil
+		}},
+		aggRung{"index-unconstrained", func(req AggRequest) ([]AggRow, bool, error) {
+			// Postings and stored counts, reading no record at all -- the one strategy that is not
+			// a scan of anything. Unbeatable for the unconstrained shapes, which is why this half
+			// of the rung sits above the columnar ones.
+			if !matchAll.is(req.Constraint) {
+				return nil, false, nil
+			}
+			rows, ok := t.aggregateFromIndex(req.Constraint, req.GroupCols, req.Aggs)
+			if !ok {
+				return nil, false, nil
+			}
 			stats.SetTier(collections.TierIndex)
-			return rows, nil
-		}
-	}
-	// A CONSTRAINED COUNT(*) with no grouping: read the predicated columns out of the columnar
-	// blocks instead of scanning records. aggregateFromIndex above only answers the UNCONSTRAINED
-	// case (a constraint cannot be attributed to a whole segment's stored count), and
-	// ColumnarAggregate below declines a COUNT(*) because it has no attribute to aggregate -- so
-	// this shape reached neither, and fell to the scan even on an archive that carries an
-	// accelerator. It is the shape a history table is asked most.
-	if len(groupCols) == 0 && len(aggs) == 1 && aggs[0].Func == AggCount && aggs[0].Arg == "*" &&
-		aggs[0].Filter == "" {
-		if n, ok := t.a.CountConstraint(constraint); ok {
+			return rows, true, nil
+		}},
+		aggRung{"count-constraint", func(req AggRequest) ([]AggRow, bool, error) {
+			// A CONSTRAINED COUNT(*) with no grouping: read the predicated columns out of the
+			// columnar blocks instead of scanning records. The index rung above only answers the
+			// UNCONSTRAINED case (a constraint cannot be attributed to a whole segment's stored
+			// count), and columnar-aggregate below declines a COUNT(*) because it has no attribute
+			// to aggregate -- so this shape reached neither, and fell to the scan even on an
+			// archive that carries an accelerator. It is the shape a history table is asked most.
+			//
+			// Not gated on match-all, unlike its mutable counterpart: an unconstrained plain count
+			// has already been taken by the index rung above unless that declined, and this is a
+			// better answer than the scan when it does.
+			if !req.isPlainCount() {
+				return nil, false, nil
+			}
+			n, ok := t.a.CountConstraint(req.Constraint)
+			if !ok {
+				return nil, false, nil
+			}
 			stats.SetTier(collections.TierColumnar)
-			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, nil
-		}
-	}
-	// A COUNT(*) GROUPED BY one numeric schema column: a histogram of that column, computed in the
-	// same columnar pass the ungrouped count above makes. aggregateFromIndex answers a grouped
-	// count only from the CATEGORICAL index, so a group column that is a hot numeric (`GROUP BY
-	// NumJobStarts`) reached neither it nor the ungrouped fast path and fell to a full row scan --
-	// the same predicate costing ~200x its ungrouped count, constrained or not.
-	if rows, ok := t.groupedFromColumns(constraint, groupCols, aggs); ok {
-		stats.SetTier(collections.TierColumnar)
-		return rows, nil
-	}
-	if !matchAll {
-		if rows, ok := t.aggregateFromIndex(constraint, groupCols, aggs); ok {
+			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, true, nil
+		}},
+		aggRung{"grouped-columns", func(req AggRequest) ([]AggRow, bool, error) {
+			// A COUNT(*) GROUPED BY one numeric schema column: a histogram of that column, computed
+			// in the same columnar pass the ungrouped count above makes. The index rung answers a
+			// grouped count only from the CATEGORICAL index, so a group column that is a hot
+			// numeric (`GROUP BY NumJobStarts`) reached neither it nor the ungrouped fast path and
+			// fell to a full row scan -- the same predicate costing ~200x its ungrouped count,
+			// constrained or not. Declines, among other reasons, for a predicate not proven free of
+			// CurrentTime: a window whose bounds move between the two passes is not one segment
+			// statistics can be attributed to.
+			rows, ok := t.groupedFromColumns(req.Constraint, req.GroupCols, req.Aggs)
+			if !ok {
+				return nil, false, nil
+			}
+			stats.SetTier(collections.TierColumnar)
+			return rows, true, nil
+		}},
+		aggRung{"index-constrained", func(req AggRequest) ([]AggRow, bool, error) {
+			// The same index strategy, below the columns rather than above them, for the
+			// constrained shapes it answers from zone verdicts -- which read every straddling
+			// segment record by record, and so lose to the columnar pass by an order of magnitude
+			// on exactly the windowed grouped counts a dashboard asks. See the measurement above.
+			if matchAll.is(req.Constraint) {
+				return nil, false, nil
+			}
+			rows, ok := t.aggregateFromIndex(req.Constraint, req.GroupCols, req.Aggs)
+			if !ok {
+				return nil, false, nil
+			}
 			stats.SetTier(collections.TierIndex)
-			return rows, nil
-		}
+			return rows, true, nil
+		}},
+		aggRung{"columnar-aggregate", func(req AggRequest) ([]AggRow, bool, error) {
+			// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
+			// per-segment columnar blocks instead of decoding every record. Declines (and falls
+			// through to the scan) unless the archive carries an accelerator and the aggregate is
+			// in scope.
+			rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
+				return t.NumStats(req.Constraint, attr)
+			}, req.GroupCols, req.Aggs)
+			if !ok {
+				return nil, false, nil
+			}
+			stats.SetTier(collections.TierColumnar)
+			return rows, true, nil
+		}},
+		aggRung{"projected-scan", func(req AggRequest) ([]AggRow, bool, error) {
+			// The reference, and the rung that must never decline. Scan wire-native, reading only
+			// the attributes the aggregation projects (empty for a pure COUNT), so it does not
+			// fully decode every matched record -- mirroring the mutable table's aggregate. Zone
+			// maps still prune segments no matching record can fall in. This is the path whose
+			// stats matter: an attribute the columnar accelerator does not cover forces a
+			// per-record reassembly here, which the trailer surfaces as a large
+			// RecordsReassembled.
+			//
+			// The tier is tagged BEFORE the read, as it was: a scan that then fails has still
+			// reported which strategy was attempted, and the caller discards the stats anyway.
+			//
+			// An empty constraint is match-all to every rung above and a PARSE ERROR here, so the
+			// same query succeeds or fails depending on which rung serves it. Left alone: the
+			// fast rungs above take every empty-constraint shape they can, and making this one
+			// agree with them would change what the server answers.
+			//
+			// No stop callback, unlike the mutable scan: the archive path takes none, and giving
+			// it one would be a new behaviour rather than a description of this one.
+			attrs, groupCol, aggCol := AggProjection(req.GroupCols, req.Aggs)
+			stats.SetTier(collections.TierScan)
+			seq, err := t.QueryProjectStats(req.Constraint, attrs, stats)
+			if err != nil {
+				return nil, false, err
+			}
+			rows, err := AggregateValues(seq, attrs, req.GroupCols, req.Aggs, groupCol, aggCol, nil)
+			if err != nil {
+				return nil, false, err
+			}
+			return rows, true, nil
+		}},
 	}
-	// A single MIN/MAX/COUNT(attr) over a numeric column reads that column out of the
-	// per-segment columnar blocks instead of decoding every record. Declines (and falls through
-	// to the scan) unless the archive carries an accelerator and the aggregate is in scope.
-	if rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
-		return t.NumStats(constraint, attr)
-	}, groupCols, aggs); ok {
-		stats.SetTier(collections.TierColumnar)
-		return rows, nil
-	}
-
-	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
-
-	// Scan wire-native, reading only the attributes the aggregation projects (empty for a
-	// pure COUNT), so it does not fully decode every matched record -- mirroring the mutable
-	// table's aggregate. Zone maps still prune segments no matching record can fall in. This is
-	// the path whose stats matter: an attribute the columnar accelerator does not cover forces a
-	// per-record reassembly here, which the trailer surfaces as a large RecordsReassembled.
-	stats.SetTier(collections.TierScan)
-	seq, err := t.QueryProjectStats(constraint, attrs, stats)
-	if err != nil {
-		return nil, err
-	}
-	return AggregateValues(seq, attrs, groupCols, aggs, groupCol, aggCol, nil)
 }
 
 // aggregateFromIndex answers the aggregate without reading records where the per-segment
