@@ -344,23 +344,25 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	// The archive engine reduces through the same db aggregate code as
 	// the mutable path, so the answer is identical -- this is a
 	// dispatch fix, not a second implementation.
-	d, ok := s.cat.Table(table)
-	if !ok {
-		if d, ok = s.cat.ViewBacking(table); !ok {
-			if a, isArchive := s.cat.ArchiveTable(table); isArchive {
-				rows, aerr := a.AggregateCols(constraint, groupCols, aggs)
-				if aerr != nil {
-					write(respErr(reqID, aerr.Error()))
-					return
-				}
-				// writeAggRows terminates the stream itself.
-				writeAggRows(reqID, rows, write)
-				return
-			}
-			write(respErr(reqID, "no such table: "+table))
+	ref := s.resolveTable(table)
+	switch ref.kind {
+	case kindTable, kindView:
+	case kindArchive:
+		// The archive ladder takes no stop callback, so this reduction runs to completion
+		// even once the client has gone -- unlike the mutable one below.
+		rows, aerr := ref.arch.AggregateCols(constraint, groupCols, aggs)
+		if aerr != nil {
+			write(respErr(reqID, aerr.Error()))
 			return
 		}
+		// writeAggRows terminates the stream itself.
+		writeAggRows(reqID, rows, write)
+		return
+	default:
+		write(respErr(reqID, "no such table: "+table))
+		return
 	}
+	d := ref.db
 
 	// The aggregate fan-out -- the Len()/CountConstraint/columnar/grouped-columnar fast paths and
 	// the projected-scan fall-through -- lives in db alongside the archive's, so the two ladders

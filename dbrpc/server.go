@@ -415,20 +415,27 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 	}
 }
 
-// tableOr writes a "no such table" error under reqID and returns ok=false if the
-// named table does not exist.
-func (s *Server) tableOr(reqID uint64, name string, write func([]byte)) (*db.DB, bool) {
-	d, ok := s.cat.Table(name)
-	if !ok {
-		// A materialized view is queried like a table via its in-memory backing. Only reads
-		// reach tableOr; writes (opBegin) resolve through cat.Table only, so a view stays
-		// read-only.
-		if d, ok = s.cat.ViewBacking(name); ok {
-			return d, true
-		}
+// tableOr resolves the table op o names, writing the refusal under reqID and returning
+// ok=false when o cannot serve it.
+//
+// It serves a mutable table and a materialized view (through its in-memory backing). Only
+// reads reach tableOr; writes (opBegin) resolve through cat.Table only, so a view stays
+// read-only.
+//
+// An archive gets a refusal that says it is an archive and why o does not read one. It used
+// to get "no such table", which is how a history table that plainly existed came to deny
+// its own existence to half the read surface -- and why a bug on one of those paths could
+// sit unseen, since the path was unreachable for the only table that exercises it.
+func (s *Server) tableOr(reqID uint64, o op, name string, write func([]byte)) (*db.DB, bool) {
+	switch ref := s.resolveTable(name); ref.kind {
+	case kindTable, kindView:
+		return ref.db, true
+	case kindArchive:
+		write(respArchiveTable(reqID, name, archiveRefusal(o)))
+	default:
 		write(respErr(reqID, "no such table: "+name))
 	}
-	return d, ok
+	return nil, false
 }
 
 // Close stops the server's managed goroutines. It does not close the DB.
@@ -665,26 +672,22 @@ func (sc *serverConn) streamWatch(reqID uint64, r *reader, wireForm bool) {
 		cancel()
 	}()
 
-	// Resolve the watch source uniformly across a mutable table, a materialized-view backing,
-	// and an append-only archive (history) table, so one watch op serves them all.
+	// One watch op serves all three kinds. The archive branch does not fork on privilege:
+	// ArchiveTable has no WatchRedacted, so an unprivileged peer watching an archive sees
+	// private attributes a query of the same archive would strip.
 	var seq iter.Seq[db.WatchEvent]
 	var err error
 	priv := sc.opts.IncludePrivate
-	if d, ok := sc.s.cat.Table(table); ok {
+	switch ref := sc.s.resolveTable(table); ref.kind {
+	case kindTable, kindView:
 		if priv {
-			seq, err = d.Watch(ctx, cursor)
+			seq, err = ref.db.Watch(ctx, cursor)
 		} else {
-			seq, err = d.WatchRedacted(ctx, cursor)
+			seq, err = ref.db.WatchRedacted(ctx, cursor)
 		}
-	} else if d, ok := sc.s.cat.ViewBacking(table); ok {
-		if priv {
-			seq, err = d.Watch(ctx, cursor)
-		} else {
-			seq, err = d.WatchRedacted(ctx, cursor)
-		}
-	} else if a, ok := sc.s.cat.ArchiveTable(table); ok {
-		seq, err = a.Watch(ctx, cursor)
-	} else {
+	case kindArchive:
+		seq, err = ref.arch.Watch(ctx, cursor)
+	default:
 		sc.write(respErr(reqID, "no such table: "+table))
 		return
 	}
@@ -743,7 +746,7 @@ func (s *Server) streamQueryKeys(ctx context.Context, reqID uint64, r *reader, i
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	d, ok := s.tableOr(reqID, table, write)
+	d, ok := s.tableOr(reqID, opQueryKeys, table, write)
 	if !ok {
 		return
 	}
@@ -779,7 +782,7 @@ func (s *Server) streamQuery(ctx context.Context, reqID uint64, r *reader, inclu
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	d, ok := s.tableOr(reqID, table, write)
+	d, ok := s.tableOr(reqID, opQuery, table, write)
 	if !ok {
 		return
 	}
@@ -862,7 +865,7 @@ func (s *Server) streamQueryAsOf(ctx context.Context, reqID uint64, r *reader, i
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	d, ok := s.tableOr(reqID, table, write)
+	d, ok := s.tableOr(reqID, opQueryAsOf, table, write)
 	if !ok {
 		return
 	}
@@ -894,7 +897,7 @@ func (s *Server) streamMatchSorted(ctx context.Context, reqID uint64, r *reader,
 		write(respBad(reqID))
 		return
 	}
-	d, ok := s.tableOr(reqID, table, write)
+	d, ok := s.tableOr(reqID, opMatchSorted, table, write)
 	if !ok {
 		return
 	}
@@ -921,7 +924,7 @@ func (s *Server) streamOrdered(ctx context.Context, reqID uint64, r *reader, inc
 		write(respBad(reqID))
 		return
 	}
-	d, ok := s.tableOr(reqID, table, write)
+	d, ok := s.tableOr(reqID, opOrdered, table, write)
 	if !ok {
 		return
 	}
@@ -1009,7 +1012,15 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		return resp(reqID, stOK)
 
 	case opListTables:
-		names := s.cat.Tables()
+		// Mutable tables AND archives, merged into one sorted list. They are one name
+		// space -- the catalog refuses a name the other kind holds -- so a client that
+		// sees a name here can address it without first asking which kind it is, and the
+		// merge introduces no duplicates. Listing only the mutable half made every archive
+		// invisible to the op whose whole job is to say what exists, so each client grew
+		// its own second call and its own concatenation.
+		//
+		// Views stay out: they have their own op (opListViews) and their own lifecycle.
+		names := mergeSorted(s.cat.Tables(), s.cat.ArchiveTables())
 		b := putI32(resp(reqID, stOK), int32(len(names)))
 		for _, n := range names {
 			b = putStr(b, n)
@@ -1153,13 +1164,12 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		// very next op would happily stream.
 		var cursor []byte
 		var err error
-		if d, ok := s.cat.Table(table); ok {
-			cursor, err = d.WatchCursor()
-		} else if d, ok := s.cat.ViewBacking(table); ok {
-			cursor, err = d.WatchCursor()
-		} else if a, ok := s.cat.ArchiveTable(table); ok {
-			cursor, err = a.WatchCursor()
-		} else {
+		switch ref := s.resolveTable(table); ref.kind {
+		case kindTable, kindView:
+			cursor, err = ref.db.WatchCursor()
+		case kindArchive:
+			cursor, err = ref.arch.WatchCursor()
+		default:
 			return respErr(reqID, "no such table: "+table)
 		}
 		if err != nil {
@@ -1388,20 +1398,20 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		if r.err != nil {
 			return respBad(reqID)
 		}
-		d, ok := s.cat.Table(table)
-		if !ok {
-			// Not a mutable table: it may be an append-only archive (history) table, whose
-			// diagnostics mirror the mutable stat surface plus retention.
-			if a, aok := s.cat.ArchiveTable(table); aok {
-				data, err := s.archiveDiagJSON(a)
-				if err != nil {
-					return respErr(reqID, err.Error())
-				}
-				return putStr(resp(reqID, stOK), string(data))
-			}
+		// An archive's diagnostics mirror the mutable stat surface plus retention. A VIEW is
+		// not answered here, though its backing is an ordinary *db.DB that diagJSON could
+		// read: that has always reported "no such table" and no reason is recorded, so it
+		// is left as it is rather than widened by a resolution change.
+		var data []byte
+		var err error
+		switch ref := s.resolveTable(table); ref.kind {
+		case kindTable:
+			data, err = s.diagJSON(ref.db)
+		case kindArchive:
+			data, err = s.archiveDiagJSON(ref.arch)
+		default:
 			return respErr(reqID, "no such table: "+table)
 		}
-		data, err := s.diagJSON(d)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
@@ -1480,18 +1490,17 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		}
 		// An archive (history) table is not a mutable table, so resolving only the mutable
 		// catalog reported `.explain` on a history table as a nonexistent table -- while
-		// queries against it worked. Both types can explain.
+		// queries against it worked. Both types can explain. A view is not answered here,
+		// as in opDiag.
 		var ex db.QueryExplain
 		var err error
-		switch d, ok := s.cat.Table(table); {
-		case ok:
-			ex, err = d.Explain(constraint)
+		switch ref := s.resolveTable(table); ref.kind {
+		case kindTable:
+			ex, err = ref.db.Explain(constraint)
+		case kindArchive:
+			ex, err = ref.arch.Explain(constraint)
 		default:
-			a, aok := s.cat.ArchiveTable(table)
-			if !aok {
-				return respErr(reqID, "no such table: "+table)
-			}
-			ex, err = a.Explain(constraint)
+			return respErr(reqID, "no such table: "+table)
 		}
 		if err != nil {
 			return respErr(reqID, err.Error())
@@ -1550,23 +1559,24 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		if r.err != nil {
 			return respBad(reqID)
 		}
-		d, ok := s.cat.Table(table)
-		if !ok {
-			// Not a mutable table: it may be an append-only archive (history) table, which
-			// supports the layout-tuning subset of admin actions (retrain/reindex/rewrite).
-			if a, aok := s.cat.ArchiveTable(table); aok {
-				if !privileged {
-					return respErr(reqID, fmt.Sprintf("admin action %q requires DAEMON authorization", action))
-				}
-				msg, err := archiveAdmin(a, action, args, s.maintainOpts)
-				if err != nil {
-					return respErr(reqID, err.Error())
-				}
-				return putStr(resp(reqID, stOK), msg)
+		// An archive supports the layout-tuning subset of admin actions
+		// (retrain/reindex/rewrite); a view is not answered here, as in opDiag. The archive
+		// branch checks privilege itself and the mutable one checks inside s.admin, which
+		// is why the two refusals differ in wording -- per-action for a mutable table,
+		// whole-op for an archive.
+		var msg string
+		var err error
+		switch ref := s.resolveTable(table); ref.kind {
+		case kindTable:
+			msg, err = s.admin(ref.db, action, args, privileged)
+		case kindArchive:
+			if !privileged {
+				return respErr(reqID, fmt.Sprintf("admin action %q requires DAEMON authorization", action))
 			}
+			msg, err = archiveAdmin(ref.arch, action, args, s.maintainOpts)
+		default:
 			return respErr(reqID, "no such table: "+table)
 		}
-		msg, err := s.admin(d, action, args, privileged)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}

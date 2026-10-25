@@ -192,7 +192,7 @@ func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, in
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	d, ok := s.tableOr(reqID, table, write)
+	d, ok := s.tableOr(reqID, opQueryRaw, table, write)
 	if !ok {
 		return
 	}
@@ -314,40 +314,30 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	if d, ok := s.cat.Table(table); ok {
+	switch ref := s.resolveTable(table); ref.kind {
+	case kindTable, kindView:
 		switch {
 		case stats != nil && chaseRefs:
-			seq, err = d.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
+			seq, err = ref.db.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
 		case stats != nil:
-			seq, err = d.QueryRawProjectedStats(constraint, attrs, redact, stats)
+			seq, err = ref.db.QueryRawProjectedStats(constraint, attrs, redact, stats)
 		case chaseRefs:
-			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
+			seq, err = ref.db.QueryRawProjectedRefs(constraint, attrs, redact)
 		default:
-			seq, err = d.QueryRawProjected(constraint, attrs, redact)
+			seq, err = ref.db.QueryRawProjected(constraint, attrs, redact)
 		}
-	} else if d, ok := s.cat.ViewBacking(table); ok {
+	case kindArchive:
 		switch {
 		case stats != nil && chaseRefs:
-			seq, err = d.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
+			seq, err = ref.arch.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
 		case stats != nil:
-			seq, err = d.QueryRawProjectedStats(constraint, attrs, redact, stats)
+			seq, err = ref.arch.QueryRawProjectedStats(constraint, attrs, redact, stats)
 		case chaseRefs:
-			seq, err = d.QueryRawProjectedRefs(constraint, attrs, redact)
+			seq, err = ref.arch.QueryRawProjectedRefs(constraint, attrs, redact)
 		default:
-			seq, err = d.QueryRawProjected(constraint, attrs, redact)
+			seq, err = ref.arch.QueryRawProjected(constraint, attrs, redact)
 		}
-	} else if a, ok := s.cat.ArchiveTable(table); ok {
-		switch {
-		case stats != nil && chaseRefs:
-			seq, err = a.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
-		case stats != nil:
-			seq, err = a.QueryRawProjectedStats(constraint, attrs, redact, stats)
-		case chaseRefs:
-			seq, err = a.QueryRawProjectedRefs(constraint, attrs, redact)
-		default:
-			seq, err = a.QueryRawProjected(constraint, attrs, redact)
-		}
-	} else {
+	default:
 		write(respErr(reqID, "no such table: "+table))
 		return
 	}
@@ -408,19 +398,20 @@ func (s *Server) streamQueryRawProjectSeq(ctx context.Context, reqID uint64, r *
 		return
 	}
 
-	d, ok := s.cat.Table(table)
-	if !ok {
-		if _, isView := s.cat.ViewBacking(table); isView {
-			write(respErr(reqID, "cursor pagination is not available for a view: "+table))
-			return
-		}
-		if _, isArchive := s.cat.ArchiveTable(table); isArchive {
-			write(respErr(reqID, "cursor pagination is not needed for an archive (it answers newest-first with the limit pushed down): "+table))
-			return
-		}
+	ref := s.resolveTable(table)
+	switch ref.kind {
+	case kindTable:
+	case kindView:
+		write(respErr(reqID, "cursor pagination is not available for a view: "+table))
+		return
+	case kindArchive:
+		write(respArchiveTable(reqID, table, "cursor pagination is not needed; an archive answers newest-first with the limit pushed down"))
+		return
+	default:
 		write(respErr(reqID, "no such table: "+table))
 		return
 	}
+	d := ref.db
 
 	seq, page, err := d.QueryRawProjectedFromSeq(constraint, attrs, after, limit)
 	if err != nil {
@@ -579,7 +570,7 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	d, ok := s.tableOr(reqID, table, write)
+	d, ok := s.tableOr(reqID, opQueryRawWire, table, write)
 	if !ok {
 		return
 	}

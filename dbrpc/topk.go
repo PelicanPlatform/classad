@@ -130,25 +130,20 @@ func (s *Server) streamTopKOpt(ctx context.Context, reqID uint64, r *reader, inc
 	}
 	var rows [][]classad.Value
 	var err error
-	if d, ok := s.cat.Table(table); ok {
+	switch ref := s.resolveTable(table); ref.kind {
+	case kindTable, kindView:
 		if useStats {
-			rows, stats, err = d.TopKStats(constraint, attrs, orderAttr, desc, k)
+			rows, stats, err = ref.db.TopKStats(constraint, attrs, orderAttr, desc, k)
 		} else {
-			rows, err = d.TopK(constraint, attrs, orderAttr, desc, k)
+			rows, err = ref.db.TopK(constraint, attrs, orderAttr, desc, k)
 		}
-	} else if d, ok := s.cat.ViewBacking(table); ok {
+	case kindArchive:
 		if useStats {
-			rows, stats, err = d.TopKStats(constraint, attrs, orderAttr, desc, k)
+			rows, stats, err = ref.arch.TopKStats(constraint, attrs, orderAttr, desc, k)
 		} else {
-			rows, err = d.TopK(constraint, attrs, orderAttr, desc, k)
+			rows, err = ref.arch.TopK(constraint, attrs, orderAttr, desc, k)
 		}
-	} else if a, ok := s.cat.ArchiveTable(table); ok {
-		if useStats {
-			rows, stats, err = a.TopKStats(constraint, attrs, orderAttr, desc, k)
-		} else {
-			rows, err = a.TopK(constraint, attrs, orderAttr, desc, k)
-		}
-	} else {
+	default:
 		write(respErr(reqID, "no such table: "+table))
 		return
 	}
