@@ -762,7 +762,14 @@ func (c *Client) DropTable(ctx context.Context, name string) error {
 	return nil
 }
 
-// Tables lists the table names.
+// Tables lists the table names: mutable tables and append-only archives, sorted, each
+// once. Views are not included; they have their own listing (ListViews).
+//
+// A server from before archives were listed here returns the mutable tables only, so a
+// caller that wants every name against either server unions this with ArchiveTables and
+// DEDUPLICATES -- concatenating lists each archive twice against a current server. A
+// caller that needs the names it may WRITE must subtract ArchiveTables rather than assume
+// every listed name is mutable.
 func (c *Client) Tables(ctx context.Context) ([]string, error) {
 	status, body, err := c.callCtx(ctx, func(id uint64) []byte { return req(id, opListTables) })
 	if err != nil {

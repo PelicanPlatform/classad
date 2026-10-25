@@ -24,7 +24,7 @@ func (sc *serverConn) streamSnapshot(reqID uint64, r *reader) {
 		return
 	}
 	table := r.str()
-	d, ok := sc.s.tableOr(reqID, table, sc.write)
+	d, ok := sc.s.tableOr(reqID, opSnapshot, table, sc.write)
 	if !ok {
 		return
 	}

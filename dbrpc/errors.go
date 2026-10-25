@@ -36,10 +36,17 @@ type ServerError struct{ Msg string }
 
 func (e *ServerError) Error() string { return "dbrpc: " + e.Msg }
 
-// Is matches ErrTableReadOnly for a per-table write refusal, so errors.Is tells that
-// refusal apart from other server errors while errors.As still yields the *ServerError.
+// Is matches the prefix-tagged refusals -- a per-table write refusal and an
+// op-does-not-serve-an-archive refusal -- so errors.Is tells each apart from other server
+// errors while errors.As still yields the *ServerError.
 func (e *ServerError) Is(target error) bool {
-	return target == ErrTableReadOnly && strings.HasPrefix(e.Msg, readOnlyTablePrefix)
+	switch target {
+	case ErrTableReadOnly:
+		return strings.HasPrefix(e.Msg, readOnlyTablePrefix)
+	case ErrArchiveTable:
+		return strings.HasPrefix(e.Msg, archiveTablePrefix)
+	}
+	return false
 }
 
 // ErrTableReadOnly reports that the server refused to modify a table this connection may
@@ -47,3 +54,10 @@ func (e *ServerError) Is(target error) bool {
 // as a mirror of another store. It arrives as a *ServerError and, like every ServerError,
 // is deterministic: replaying the write fails the same way, so surface it, never retry.
 var ErrTableReadOnly = errors.New("dbrpc: table is read-only")
+
+// ErrArchiveTable reports that the named table exists and is an append-only archive, and
+// that the op the caller used does not serve one. It arrives as a *ServerError whose
+// message names what to use instead, or why nothing applies. Deterministic: the call fails
+// the same way on replay, so surface it rather than retry -- and do not read it as the
+// table being absent, which is what "no such table" means and this does not.
+var ErrArchiveTable = errors.New("dbrpc: table is an append-only archive")
