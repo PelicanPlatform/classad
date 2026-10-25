@@ -424,10 +424,9 @@ func TestBucketArithmeticTableDriven(t *testing.T) {
 		{1 << 53, 86400, (1 << 53) / 86400 * 86400, true, "2^53"},
 		{(1 << 53) - 1, 86400, ((1 << 53) - 1) / 86400 * 86400, true, "just below 2^53"},
 		{(1 << 53) + 2, 86400, ((1 << 53) + 2) / 86400 * 86400, true, "just above 2^53"},
-		// Past 1e18 the float grid is coarser than the bucket width in places, but a bucket start
-		// is still a multiple of the width -- which is the property every tier relies on.
-		{1e18, 86400, int64(math.Floor(1e18/86400)) * 86400, true, "1e18"},
-		{2e18, 3600, int64(math.Floor(2e18/3600)) * 3600, true, "2e18, hourly"},
+		// 1e18 and above are covered by TestBucketIsMonotoneAndAligned instead: the answer there
+		// cannot be written down without re-deriving it from the implementation, so the test is a
+		// property rather than a value.
 		{math.NaN(), 86400, 0, false, "a NaN is in no half-open interval"},
 		{math.Inf(1), 86400, 0, false, "nor is +Inf"},
 		{math.Inf(-1), 86400, 0, false, "nor -Inf"},
@@ -475,6 +474,42 @@ func TestBucketedKeyMatchesBucketOfPerComponent(t *testing.T) {
 			}
 			if want := a.acc[key1(groupComp{kind: gkInt, raw: b})]; want != g {
 				t.Errorf("width %d value %v: landed somewhere other than bucket %d", width, v, b)
+			}
+		}
+	}
+}
+
+// TestBucketIsMonotoneAndAligned covers the magnitudes where the answer cannot be written down: past
+// about 1e18 the float grid is coarser than a bucket width in places, so re-deriving the expected
+// bucket with the same floor-and-divide the implementation uses would assert nothing. These are the
+// two properties every tier actually relies on, and neither restates the arithmetic:
+//
+//   - a bucket start is a MULTIPLE of the width, so a bucket key names a point on the same grid
+//     whatever the value's magnitude;
+//   - bucketing is MONOTONE, so a later timestamp never lands in an earlier bucket -- the property
+//     a time series is read with.
+func TestBucketIsMonotoneAndAligned(t *testing.T) {
+	for _, width := range []int64{1, 60, 3600, 86400, 604800} {
+		for _, start := range []float64{-2e18, -1e18, -1 << 53, 0, 1 << 53, 1e18, 2e18, 4e18} {
+			prev, havePrev := int64(0), false
+			for step := 0; step < 64; step++ {
+				v := math.Nextafter(start, math.Inf(1))
+				for i := 0; i < step; i++ {
+					v = math.Nextafter(v, math.Inf(1))
+				}
+				b, ok := bucketOf(v, width)
+				if !ok {
+					t.Errorf("bucketOf(%v, %d) declined a finite value", v, width)
+					continue
+				}
+				if b%width != 0 {
+					t.Errorf("bucketOf(%v, %d) = %d, not a multiple of the width", v, width, b)
+				}
+				if havePrev && b < prev {
+					t.Errorf("bucketOf(%v, %d) = %d, below the previous value's bucket %d: bucketing "+
+						"went backwards as the value went forwards", v, width, b, prev)
+				}
+				prev, havePrev = b, true
 			}
 		}
 	}
