@@ -41,6 +41,12 @@ type Archive struct {
 // undefined, NaN) lie outside it. That is what pruning needs. Full says more: every record in
 // the segment holds a number for the attribute, so all of them lie in [Min,Max], which is what
 // attributing a whole segment to a range or bucket needs.
+//
+// Full is also what a NEGATED ordering comparison needs, and for a reason worth stating here
+// because it is the inverse of the one above: a value the range leaves out because no comparison
+// can be TRUE of it may still make the NEGATION true. A NaN is such a value -- comparisons with it
+// are false rather than undefined -- so it satisfies `!(x <= c)` while lying outside [Min,Max],
+// invisible to the probe. Only Full rules a NaN out. See zoneMayMatch.
 type zoneRange struct {
 	Min, Max float64
 	Full     bool
@@ -721,9 +727,35 @@ func zoneMayMatch(z zoneRange, op string, vals []float64) bool {
 		return z.Max > vals[0]
 	case ">=":
 		return z.Max >= vals[0]
-	default:
-		return true // != and anything else: not prunable
 	}
+	// A NEGATED ordering comparison. Pruning on one is sound ONLY over a Full zone, and the reason
+	// is the exact inverse of what makes the positive form prunable.
+	//
+	// The range deliberately leaves out every value no numeric comparison can be true of -- absent,
+	// string, undefined, NaN (zoneValue classes them zoneNever/sparse). For the positive form that
+	// is free: such a value cannot satisfy the comparison, so a probe that misses it prunes nothing
+	// it should have kept. Under negation it inverts. A NaN makes `x <= c` FALSE -- every
+	// comparison with a NaN is false, not undefined -- so it makes `!(x <= c)` TRUE, and it is
+	// invisible to the range. Reusing the flipped-operator test would prune a segment whose only
+	// matches are NaN: a wrong answer, served faster than the right one, and wrong for the ROW SCAN
+	// too, since zonePrune decides which segments the scan reads at all.
+	//
+	// (Absent/string/undefined do NOT satisfy the negation: the comparison is UNDEFINED or ERROR
+	// there, and `!` of either is not TRUE. NaN is the only sparse cause that flips sides, but the
+	// zone map does not record WHICH cause made a zone sparse.)
+	//
+	// Full is exactly the missing proof: it says every record in the segment holds a number for the
+	// attribute, which rules out NaN along with absent and non-numeric, so the segment's values are
+	// precisely the numbers in [Min,Max]. Over those, the negation IS the flipped comparison and
+	// the ordinary test decides it. Without Full the segment may hold a NaN the range cannot show,
+	// so the conjunct is undecidable here and the segment must be read.
+	if base, neg := negOrderingBase(op); neg {
+		if !z.Full {
+			return true
+		}
+		return zoneMayMatch(z, orderingFlip[base], vals)
+	}
+	return true // != and anything else: not prunable
 }
 
 // probeFloats returns the numeric values of a probe, or nil if any value is non-numeric

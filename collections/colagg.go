@@ -163,7 +163,9 @@ func (c *Collection) numPredOnField(q *vm.Query, s *adSchema) (uint32, func(floa
 		} else if idx != fieldIdx {
 			return 0, nil, false // more than one field: not this fast path
 		}
-		up, ok := valUsable(id, p)
+		// numPredProbe, not valUsable: see numPredsOnFields -- a negated ordering probe is exact
+		// when it is evaluated against the stored value rather than looked up in an index.
+		up, ok := numPredProbe(id, p)
 		if !ok || len(up.fvals) != 1 {
 			return 0, nil, false // present/absent/in/isnt or non-numeric: not a scalar comparison
 		}
