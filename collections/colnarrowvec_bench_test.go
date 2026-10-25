@@ -343,8 +343,9 @@ func (c *candSet) setAll(n int) {
 // WIDTH, because that is what decides whether an engine has lanes for it:
 //
 //	EnteredHistoryTime  four bytes: 4 lanes on NEON, 8 on AVX2
-//	JobStatus           one byte:   no engine has a kernel for it, so this arm measures the scalar
-//	                                bitplane path in BOTH builds and must not differ between them
+//	JobStatus           one byte:  16 lanes on NEON, 32 on AVX2 -- the widest ratio there is, and the
+//	                               column whose widened form is most wasteful, since restating one byte
+//	                               as an int64 is eight bytes written and eight read to compare one
 //
 // Run it both ways to see the engine's contribution and to check the scalar path did not regress:
 //

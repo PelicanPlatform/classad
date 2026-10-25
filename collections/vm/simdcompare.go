@@ -2,9 +2,13 @@ package vm
 
 // Width-native comparison of a stored column against a literal.
 //
-// LANES COME FROM WIDTH. Storage fits each int column to 1/2/4/6/8 bytes, so a column fitted to two bytes is
-// 8 lanes of a 128-bit vector where int64 is 2 -- and widening at load throws that away before any kernel
+// LANES COME FROM WIDTH. Storage fits each int column to 1/2/4/6/8 bytes, so a column fitted to one byte is
+// 16 lanes of a 128-bit vector where int64 is 2 -- and widening at load throws that away before any kernel
 // sees it. This is the path that keeps the stored width all the way into the compare.
+//
+// The narrowest columns are where that ratio is largest and where the widened form is worst: a one-byte
+// column reaches the scalar kernel only after a load that writes eight bytes per record to restate one, so
+// the kernel then reads sixteen times the column to compare it.
 //
 // The architecture-specific engines below it implement exactly three BASE operations -- equal, greater, less
 // -- and this file derives the other three by complementing the extracted bits:
@@ -164,6 +168,8 @@ func scalarTailInt(base cmpBase, raw []byte, width int, unsigned bool, lit int64
 	return word
 }
 
+func fitsInt8(v int64) bool   { return v >= -1<<7 && v < 1<<7 }
+func fitsUint8(v int64) bool  { return v >= 0 && v < 1<<8 }
 func fitsInt16(v int64) bool  { return v >= -1<<15 && v < 1<<15 }
 func fitsUint16(v int64) bool { return v >= 0 && v < 1<<16 }
 func fitsInt32(v int64) bool  { return v >= -1<<31 && v < 1<<31 }
