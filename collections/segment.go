@@ -155,6 +155,10 @@ type segment struct {
 	// Its backing mapping is released via onReap when the segment's scan pins drain.
 	msidx atomic.Pointer[mmapSegIndex]
 
+	// deltas caches which records of the index's covered prefix are delta records, which every
+	// index candidate set must include (index_deltas.go).
+	deltas atomic.Pointer[segDeltas]
+
 	// colblk is this segment's columnar (adschema PAX) accelerator: nil unless schema-scan
 	// is enabled on the collection. Built from the immutable record bytes and swapped in
 	// atomically (like idx); a scan reads it lock-free and uses colSegment.offs to map a
