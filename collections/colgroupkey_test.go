@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -510,6 +511,84 @@ func TestBucketIsMonotoneAndAligned(t *testing.T) {
 						"went backwards as the value went forwards", v, width, b, prev)
 				}
 				prev, havePrev = b, true
+			}
+		}
+	}
+}
+
+// TestGroupKeyCaseSplitsThroughTheDictionaryReader is TestGroupKeyStringsAreExactBytes one layer
+// down, through the reader where the trap actually lives.
+//
+// The exact-bytes test above drives strComp directly, which covers the intern table but not the
+// path that reaches it. A string group component is normally resolved through the per-block
+// DICTIONARY -- and the dictionary is where folding is everywhere: distinctFold sorts its entries
+// with the evaluator's fold comparison, and dictRange hands back a RANGE of codes that fold equal.
+// A component keyed by that range, or by a folded id, would merge the two spellings here while
+// leaving the direct test above passing.
+//
+// So the dictionary is asserted to have FORMED before the groups are counted. Which reader a block
+// uses is a property of the data, not of the query, so a fixture that quietly stopped clearing
+// dictWorthwhile would move this test onto the positional walk and it would no longer be testing
+// what it says.
+func TestGroupKeyCaseSplitsThroughTheDictionaryReader(t *testing.T) {
+	const n = 4000
+	c := New(Options{Shards: 1, SegmentSize: 1 << 16})
+	want := map[string]int{}
+	for i := 0; i < n; i++ {
+		// Eight owners, two of them also spelled in upper case for part of their run. Low enough
+		// cardinality that dictWorthwhile (distinct*2 <= block records) clears in every block.
+		o := (i / 16) % 8
+		owner := fmt.Sprintf("u%02d", o)
+		if (o == 3 && i%3 == 0) || (o == 6 && i%5 == 0) {
+			owner = strings.ToUpper(owner)
+		}
+		want[owner]++
+		ad := classad.New()
+		ad.InsertAttrString("Owner", owner)
+		ad.InsertAttr("ProcId", int64(i%4))
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(4000, 16) {
+		t.Skip("no sealed segments to accelerate")
+	}
+	withDict, blocks := dictStats(t, c, "Owner")
+	if blocks == 0 || withDict != blocks {
+		t.Fatalf("%d of %d blocks carry an Owner dictionary: this fixture is on the positional "+
+			"walk, so it is not testing the dictionary reader it claims to", withDict, blocks)
+	}
+
+	for _, specs := range [][]GroupSpec{
+		{{Attr: "Owner"}},                   // the whole key: the code -> group memo
+		{{Attr: "Owner"}, {Attr: "ProcId"}}, // one component of a tuple: the code -> id memo
+	} {
+		gs, ok := c.GroupStatsAllCols(specs, nil)
+		if !ok {
+			t.Fatalf("%d group column(s): declined", len(specs))
+		}
+		got := map[string]int{}
+		for _, g := range gs {
+			o, err := g.Values[0].StringValue()
+			if err != nil {
+				t.Fatalf("group component 0 is %v, not a string", g.Values[0])
+			}
+			got[o] += g.Count
+		}
+		if len(got) != len(want) {
+			t.Errorf("%d group column(s): %d distinct owners, want %d -- the dictionary reader "+
+				"merged spellings that fold equal", len(specs), len(got), len(want))
+		}
+		for o, k := range want {
+			if got[o] != k {
+				t.Errorf("%d group column(s): owner %q counted %d, want %d", len(specs), o, got[o], k)
+			}
+		}
+		// Named, since a count can be right for the wrong reason.
+		for _, pair := range [][2]string{{"u03", "U03"}, {"u06", "U06"}} {
+			if got[pair[0]] == 0 || got[pair[1]] == 0 {
+				t.Errorf("%d group column(s): %q counted %d and %q counted %d: one spelling "+
+					"vanished into the other", len(specs), pair[0], got[pair[0]], pair[1], got[pair[1]])
 			}
 		}
 	}
