@@ -3,7 +3,6 @@ package db
 import (
 	"fmt"
 	"iter"
-	"math"
 	"strconv"
 	"strings"
 
@@ -391,14 +390,21 @@ func (a *aggAcc) result(spec AggSpec) string {
 
 // bucketKeyText floors a numeric value into an epoch-aligned bucket of the given
 // width (seconds) and returns its integer-seconds text. ok is false when v is not a
-// finite number (undefined/error/non-numeric string), so the row drops out of the
-// series -- matching the client-side time_bucket semantics.
+// finite number -- undefined, error, a non-numeric string, a boolean, or a real that is
+// a NaN or an infinity -- so the row drops out of the series, matching the client-side
+// time_bucket semantics.
 func bucketKeyText(v classad.Value, width int64) (string, bool) {
 	f, ok := numberOf(v)
 	if !ok {
 		return "", false
 	}
-	b := int64(math.Floor(f/float64(width))) * width
+	// numberOf accepts a NaN or an infinity -- they ARE reals -- so the finiteness test lives in
+	// bucketFloorInt, one floor shared with the view engine. A value in no bucket drops here just
+	// as a string does.
+	b, ok := bucketFloorInt(f, width)
+	if !ok {
+		return "", false
+	}
 	return strconv.FormatInt(b, 10), true
 }
 

@@ -442,7 +442,10 @@ func bucketTruth(t *testing.T, a *Archive) map[int64]map[string]int64 {
 			continue
 		}
 		o, _ := ad.EvaluateAttrString("Owner")
-		b := bucketOf(f, 86400)
+		b, inBucket := bucketOf(f, 86400)
+		if !inBucket {
+			continue // non-finite: in no bucket, as in the engine
+		}
 		if out[b] == nil {
 			out[b] = map[string]int64{}
 		}
