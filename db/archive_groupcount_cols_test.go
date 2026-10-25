@@ -488,8 +488,15 @@ func TestArchiveGroupedAggregateRefusals(t *testing.T) {
 		// path was already reading, not a shape it cannot see.
 		{"a NEGATIVE bucket width is not a bucket", "RequestMemory > 2048",
 			[]GroupCol{{Attr: "ClusterId", BucketWidth: -100}}, []AggSpec{{Func: AggCount, Arg: "*"}}},
-		{"two group columns", "RequestMemory > 2048",
-			[]GroupCol{{Attr: "ProcId"}, {Attr: "RequestCpus"}}, []AggSpec{{Func: AggCount, Arg: "*"}}},
+		// Two group columns used to be listed here. They are now served -- see
+		// TestArchiveGroupedMultipleColumns -- because the storage key holds a tuple and this
+		// layer merges the keys that render alike, exactly as it already did for one column. What
+		// is still refused is MORE columns than the key has slots, since the alternative is a
+		// truncated key that merges groups the scan keeps apart.
+		{"more group columns than the packed key holds", "RequestMemory > 2048",
+			[]GroupCol{{Attr: "ProcId"}, {Attr: "RequestCpus"}, {Attr: "ClusterId"},
+				{Attr: "RequestMemory"}, {Attr: "JobStatus"}},
+			[]AggSpec{{Func: AggCount, Arg: "*"}}},
 		{"aggregating a string column", "RequestMemory > 2048",
 			[]GroupCol{{Attr: "ProcId"}}, []AggSpec{{Func: AggMax, Arg: "Owner"}}},
 	} {

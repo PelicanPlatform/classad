@@ -587,6 +587,25 @@ func (db *DB) GroupStatsAllBucketed(groupAttr string, bucket int64, aggAttrs []s
 	return db.c.GroupStatsAllBucketed(groupAttr, bucket, aggAttrs)
 }
 
+// GroupStatsConstraintCols is GroupStatsConstraintBucketed over SEVERAL group columns: the group is
+// the tuple of their (individually bucketed) values. Declines on a chained table for the reason
+// above. See collections.Collection.GroupStatsQueryCols.
+func (db *DB) GroupStatsConstraintCols(constraint string, groups []collections.GroupSpec, aggAttrs []string) ([]collections.GroupStats, bool) {
+	if db.c.Chained() {
+		return nil, false
+	}
+	return db.c.GroupStatsConstraintCols(constraint, groups, aggAttrs)
+}
+
+// GroupStatsAllCols is GroupStatsAllBucketed over SEVERAL group columns. Declines on a chained table
+// for the reason above. See collections.Collection.GroupStatsQueryCols.
+func (db *DB) GroupStatsAllCols(groups []collections.GroupSpec, aggAttrs []string) ([]collections.GroupStats, bool) {
+	if db.c.Chained() {
+		return nil, false
+	}
+	return db.c.GroupStatsAllCols(groups, aggAttrs)
+}
+
 // LookupClassAd returns the committed ad for key (the hash table, outside any
 // transaction), or (nil, false).
 func (db *DB) LookupClassAd(key string) (*classad.ClassAd, bool) {

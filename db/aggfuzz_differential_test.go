@@ -75,13 +75,21 @@ const numTiers = int(collections.TierScan) + 1
 type probe int
 
 const (
-	probeCountConstraint probe = iota // the ungrouped constrained COUNT(*) over columnar blocks
-	probeGroupColumns                 // GroupedFromColumns: a grouped read of the columnar blocks
-	probeColumnar                     // ColumnarAggregate: one numeric column, ungrouped
+	probeCountConstraint   probe = iota // the ungrouped constrained COUNT(*) over columnar blocks
+	probeGroupColumns                   // GroupedFromColumns: a grouped read of the columnar blocks
+	probeGroupColumnsMulti              // ... of the same, with MORE THAN ONE group column
+	probeColumnar                       // ColumnarAggregate: one numeric column, ungrouped
 	numProbes
 )
 
-var probeNames = [numProbes]string{"count-constraint", "grouped-columns", "columnar"}
+var probeNames = [numProbes]string{"count-constraint", "grouped-columns", "grouped-columns(n>1)", "columnar"}
+
+// probeFloor is the minimum number of queries each probe must have answered for the sweep to prove
+// anything about it. Zero is the obvious floor and it is not enough for the multi-column probe: a
+// handful of two-column queries that all happen to decline would leave the count at one or two and
+// read as covered. The floors below are a small fraction of what a clean run reports (the histogram
+// is logged either way), so they fail on a path that stopped firing and not on ordinary drift.
+var probeFloor = [numProbes]int64{1, 1, 200, 1}
 
 func (p probe) String() string { return probeNames[p] }
 
@@ -429,6 +437,13 @@ func checkQuery(f *aggFixture, q gen.Query) (collections.AggTier, probeSet, []st
 	diffs = append(diffs, prefix(tier.String(), compareAgg(got, want, aggs, tols))...)
 	if groupedOK {
 		ps |= 1 << probeGroupColumns
+		if len(groups) > 1 {
+			// Counted separately because the single-column case dominates the draw: a run where
+			// every multi-column query declined would still show the grouped-columns probe firing
+			// thousands of times, and nothing would have compared a packed multi-component key
+			// against the scan.
+			ps |= 1 << probeGroupColumnsMulti
+		}
 		diffs = append(diffs, prefix("grouped-columns(direct)", compareAgg(groupedRows, want, aggs, tols))...)
 	}
 	if columnarOK {
@@ -643,11 +658,11 @@ func TestAggregateStrategyTierCoverage(t *testing.T) {
 			}
 		}
 		for i, n := range h.probes {
-			if n == 0 {
-				t.Errorf("the %s strategy never answered a query when asked directly, so nothing "+
-					"compared it against the scan. It reports as TierColumnar when the dispatcher "+
-					"picks it, so the tier counts above cannot stand in for this. Histogram: %s",
-					probe(i), h)
+			if n < probeFloor[i] {
+				t.Errorf("the %s strategy answered %d queries when asked directly, below the floor "+
+					"of %d, so the sweep proves little or nothing about it. It reports as "+
+					"TierColumnar when the dispatcher picks it, so the tier counts above cannot "+
+					"stand in for this. Histogram: %s", probe(i), n, probeFloor[i], h)
 			}
 		}
 		fs.report(t)

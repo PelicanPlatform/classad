@@ -14,13 +14,13 @@ import (
 // The order matters as much as the values: the memo is STATE, so what it answers for a key depends on
 // the key before it. Every interesting value is therefore placed directly after a value that would
 // have primed the memo with a neighbouring interval.
-func memoKeys(width int64, rng *rand.Rand) []groupKey {
-	intKey := func(i int64) groupKey { return groupKey{kind: gkInt, raw: i} }
-	realKey := func(f float64) groupKey {
-		return groupKey{kind: gkReal, raw: int64(math.Float64bits(f))}
+func memoKeys(width int64, rng *rand.Rand) []groupComp {
+	intKey := func(i int64) groupComp { return groupComp{kind: gkInt, raw: i} }
+	realKey := func(f float64) groupComp {
+		return groupComp{kind: gkReal, raw: int64(math.Float64bits(f))}
 	}
 	w := float64(width)
-	var keys []groupKey
+	var keys []groupComp
 	for _, base := range []int64{0, width, 17 * width, -3 * width, 1700000000 / width * width} {
 		lo := float64(base)
 		hi := lo + w
@@ -44,10 +44,10 @@ func memoKeys(width int64, rng *rand.Rand) []groupKey {
 			realKey(math.Inf(-1)), realKey(lo+w/2),
 			// No number at all: these must be dropped on their kind, not on their bits, and
 			// their raw bits are deliberately those of a value inside the live bucket.
-			groupKey{kind: gkString, s: "x"}, realKey(lo+w/2),
-			groupKey{kind: gkBool, raw: base}, realKey(lo+w/2),
-			groupKey{kind: gkUndef, raw: base}, realKey(lo+w/2),
-			groupKey{kind: gkError, raw: base}, realKey(lo+w/2),
+			groupComp{kind: gkString, raw: base}, realKey(lo+w/2),
+			groupComp{kind: gkBool, raw: base}, realKey(lo+w/2),
+			groupComp{kind: gkUndef, raw: base}, realKey(lo+w/2),
+			groupComp{kind: gkError, raw: base}, realKey(lo+w/2),
 		)
 	}
 	return keys
@@ -64,10 +64,10 @@ func TestBucketIntervalMemoMatchesBucketOf(t *testing.T) {
 	for _, width := range []int64{1, 7, 3600, 86400, 1 << 40} {
 		rng := rand.New(rand.NewSource(width))
 		keys := memoKeys(width, rng)
-		a := newGroupAccum(width)
+		a := newGroupAccum([]int64{width})
 		want := map[int64]int{}
 		for i, k := range keys {
-			g, ok := a.accFor(k, 0)
+			g, ok := accFor1(a, k, 0)
 			if !ok {
 				t.Fatalf("width %d key %d (%+v): accFor declined", width, i, k)
 			}
@@ -89,7 +89,7 @@ func TestBucketIntervalMemoMatchesBucketOf(t *testing.T) {
 			}
 			// Which group it landed in, read back from the accumulation map: the bucket the
 			// memo decided has to be the one keyed by bucketOf's own answer.
-			if want := a.acc[groupKey{kind: gkInt, raw: b}]; want != g {
+			if want := a.acc[key1(groupComp{kind: gkInt, raw: b})]; want != g {
 				t.Errorf("width %d key %d (%+v, value %v): did not land in bucket %d",
 					width, i, k, f, b)
 			}
@@ -99,9 +99,9 @@ func TestBucketIntervalMemoMatchesBucketOf(t *testing.T) {
 			t.Errorf("width %d: %d groups, bucketOf gives %d", width, len(a.acc), len(want))
 		}
 		for key, g := range a.acc {
-			if want[key.raw] != g.n {
+			if want[key.raw[0]] != g.n {
 				t.Errorf("width %d: bucket %d counted %d, bucketOf counts %d",
-					width, key.raw, g.n, want[key.raw])
+					width, key.raw[0], g.n, want[key.raw[0]])
 			}
 		}
 	}
@@ -118,19 +118,19 @@ func TestBucketIntervalMemoMatchesBucketOf(t *testing.T) {
 // non-numeric record into a full recomputation for the next real one.
 func TestBucketMemoDoesNotPrimeOnNonNumbers(t *testing.T) {
 	const day = 86400
-	a := newGroupAccum(day)
-	live, ok := a.accFor(groupKey{kind: gkInt, raw: 3*day + 10}, 0)
+	a := newGroupAccum([]int64{day})
+	live, ok := accFor1(a, groupComp{kind: gkInt, raw: 3*day + 10}, 0)
 	if !ok || live == nil {
 		t.Fatal("a plain timestamp formed no group")
 	}
-	for _, k := range []groupKey{
-		{kind: gkString, s: "many"},
+	for _, k := range []groupComp{
+		{kind: gkString, raw: 7},
 		{kind: gkBool, raw: 1},
 		{kind: gkBool, raw: 3*day + 11}, // bits inside the live bucket
 		{kind: gkUndef, raw: 3*day + 12},
 		{kind: gkError, raw: 3*day + 13},
 	} {
-		g, ok := a.accFor(k, 0)
+		g, ok := accFor1(a, k, 0)
 		if !ok || g != nil {
 			t.Errorf("accFor(%+v) under a bucket = %v, %v; want nil, true (no number, no bucket)", k, g, ok)
 		}
@@ -138,10 +138,10 @@ func TestBucketMemoDoesNotPrimeOnNonNumbers(t *testing.T) {
 	if live.n != 1 {
 		t.Errorf("the live bucket absorbed %d records, want 1: a non-numeric key reached the memo", live.n)
 	}
-	if a.bAcc != live {
+	if a.mAcc != live {
 		t.Error("a non-numeric key cleared the interval memo, so a run of them restarts the bucket each time")
 	}
-	if g, ok := a.accFor(groupKey{kind: gkInt, raw: 3*day + 20}, 0); !ok || g != live {
+	if g, ok := accFor1(a, groupComp{kind: gkInt, raw: 3*day + 20}, 0); !ok || g != live {
 		t.Errorf("the next timestamp in the same day got %v, want the group the first one made", g)
 	}
 	if len(a.acc) != 1 {
@@ -161,8 +161,8 @@ func TestBucketMemoDoesNotPrimeOnNonNumbers(t *testing.T) {
 // disagreeing with the plain interval here, the test says so rather than passing on a case that no
 // longer tests anything.
 func TestBucketMemoDeclinesTheCoarseTopEdge(t *testing.T) {
-	realKey := func(f float64) groupKey {
-		return groupKey{kind: gkReal, raw: int64(math.Float64bits(f))}
+	realKey := func(f float64) groupComp {
+		return groupComp{kind: gkReal, raw: int64(math.Float64bits(f))}
 	}
 	for _, tc := range []struct{ width, start int64 }{
 		{86400, 4394786696646854400},
@@ -183,12 +183,12 @@ func TestBucketMemoDeclinesTheCoarseTopEdge(t *testing.T) {
 			t.Fatalf("width %d: %v now buckets to %d like the rest of the interval, so this case no "+
 				"longer exercises the top edge", tc.width, top, tc.start)
 		}
-		a := newGroupAccum(tc.width)
-		primed, ok := a.accFor(realKey(mid), 0)
+		a := newGroupAccum([]int64{tc.width})
+		primed, ok := accFor1(a, realKey(mid), 0)
 		if !ok || primed == nil {
 			t.Fatalf("width %d: the priming value formed no group", tc.width)
 		}
-		g, ok := a.accFor(realKey(top), 0)
+		g, ok := accFor1(a, realKey(top), 0)
 		if !ok || g == nil {
 			t.Fatalf("width %d: %v formed no group, but bucketOf puts it in %d", tc.width, top, want)
 		}
@@ -196,7 +196,7 @@ func TestBucketMemoDeclinesTheCoarseTopEdge(t *testing.T) {
 			t.Errorf("width %d: %v went in bucket %d off the memo's interval, bucketOf says %d",
 				tc.width, top, tc.start, want)
 		}
-		if g != a.acc[groupKey{kind: gkInt, raw: want}] {
+		if g != a.acc[key1(groupComp{kind: gkInt, raw: want})] {
 			t.Errorf("width %d: %v did not land in bucket %d", tc.width, top, want)
 		}
 	}

@@ -430,12 +430,15 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
 			return []AggRow{{Values: []string{strconv.Itoa(n)}}}, true, nil
 		}},
 		aggRung{"grouped-columns", func(req AggRequest) ([]AggRow, bool, error) {
-			// A COUNT(*) GROUPED BY one numeric schema column: a histogram of that column, computed
+			// A COUNT(*) GROUPED BY one or more schema columns: a histogram of them, computed
 			// in the same columnar pass the ungrouped count above makes. The index rung answers a
 			// grouped count only from the CATEGORICAL index, so a group column that is a hot
 			// numeric (`GROUP BY NumJobStarts`) reached neither it nor the ungrouped fast path and
 			// fell to a full row scan -- the same predicate costing ~200x its ungrouped count,
-			// constrained or not. Declines, among other reasons, for a predicate not proven free of
+			// constrained or not. Several columns is the "per owner per day" shape: the index rung
+			// serves its unconstrained COUNT(*) form over a categorically indexed column and nothing
+			// else, so the same two columns under a WHERE clause or beside a SUM reached no fast
+			// rung at all. Declines, among other reasons, for a predicate not proven free of
 			// CurrentTime: a window whose bounds move between the two passes is not one segment
 			// statistics can be attributed to.
 			rows, ok := t.groupedFromColumns(req.Constraint, req.GroupCols, req.Aggs)
@@ -924,6 +927,19 @@ func (t *ArchiveTable) GroupStatsConstraintBucketed(constraint, groupAttr string
 // (0 = the raw value). See collections.Collection.GroupStatsQueryBucketed.
 func (t *ArchiveTable) GroupStatsAllBucketed(groupAttr string, bucket int64, aggAttrs []string) ([]collections.GroupStats, bool) {
 	return t.a.GroupStatsAllBucketed(groupAttr, bucket, aggAttrs)
+}
+
+// GroupStatsConstraintCols is GroupStatsConstraintBucketed over SEVERAL group columns: the group is
+// the tuple of their (individually bucketed) values, which is the "per owner per day" shape.
+// See collections.Collection.GroupStatsQueryCols.
+func (t *ArchiveTable) GroupStatsConstraintCols(constraint string, groups []collections.GroupSpec, aggAttrs []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsConstraintCols(constraint, groups, aggAttrs)
+}
+
+// GroupStatsAllCols is GroupStatsAllBucketed over SEVERAL group columns, for a constraint this layer
+// has established is match-all. See collections.Collection.GroupStatsQueryCols.
+func (t *ArchiveTable) GroupStatsAllCols(groups []collections.GroupSpec, aggAttrs []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsAllCols(groups, aggAttrs)
 }
 
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).

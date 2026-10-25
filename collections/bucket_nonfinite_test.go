@@ -83,12 +83,12 @@ func TestZoneBucketDeclinesNonFiniteEdge(t *testing.T) {
 // forms no group, the same (nil, true) a string gets, rather than creating one under a bogus key.
 func TestGroupAccumDropsNonFiniteBucket(t *testing.T) {
 	const day = 86400
-	realKey := func(f float64) groupKey {
-		return groupKey{kind: gkReal, raw: int64(math.Float64bits(f))}
+	realKey := func(f float64) groupComp {
+		return groupComp{kind: gkReal, raw: int64(math.Float64bits(f))}
 	}
-	a := newGroupAccum(day)
+	a := newGroupAccum([]int64{day})
 	for _, f := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
-		g, ok := a.accFor(realKey(f), 0)
+		g, ok := accFor1(a, realKey(f), 0)
 		if !ok || g != nil {
 			t.Errorf("accFor(%v) = %v, %v; want nil, true (in no bucket)", f, g, ok)
 		}
@@ -98,8 +98,8 @@ func TestGroupAccumDropsNonFiniteBucket(t *testing.T) {
 	}
 	// The finite neighbours still group, and a real and an int that floor alike share one group --
 	// the property the bucket exists for, which the guard must not disturb.
-	for _, k := range []groupKey{realKey(100), realKey(day + 0.5), {kind: gkInt, raw: day + 1}} {
-		if g, ok := a.accFor(k, 0); !ok || g == nil {
+	for _, k := range []groupComp{realKey(100), realKey(day + 0.5), {kind: gkInt, raw: day + 1}} {
+		if g, ok := accFor1(a, k, 0); !ok || g == nil {
 			t.Fatalf("accFor(%+v) = %v, %v; want a group", k, g, ok)
 		}
 	}
@@ -160,9 +160,9 @@ func TestBucketedGroupStatsExcludeNonFinite(t *testing.T) {
 	}
 	got := map[int64]int{}
 	for _, g := range gs {
-		i, err := g.Value.IntValue()
+		i, err := g.Values[0].IntValue()
 		if err != nil {
-			t.Fatalf("bucket key %v is not an integer: %v", g.Value, err)
+			t.Fatalf("bucket key %v is not an integer: %v", g.Values[0], err)
 		}
 		if _, dup := got[i]; dup {
 			t.Fatalf("bucket %d appears twice", i)

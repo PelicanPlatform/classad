@@ -1,7 +1,6 @@
 package collections
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
@@ -81,44 +80,46 @@ func BenchmarkGroupMemoShapes(b *testing.B) {
 	}
 }
 
-// groupKeySeq builds one shape of group-key sequence for BenchmarkGroupAccum.
+// groupCompSeq builds one shape of group-component sequence for BenchmarkGroupAccum.
 //
 // n is deliberately the same six figures the end-to-end fixture holds, so the accumulation maps reach
 // the same size and the measurement is not one of a map that fits in L1.
-func groupKeySeq(shape string, n int) []groupKey {
+//
+// A string shape carries the query-local ID a string component holds in the packed key, not the
+// string: that is what the accumulator sees, because the column reader resolves a dictionary code to
+// an id once per distinct value per block and the per-record step is the id. So the string arms here
+// measure the accumulation of a string-KINDED component, which is what they always measured; the
+// resolution itself is in the end-to-end arms.
+func groupCompSeq(shape string, n int) []groupComp {
 	const base = 1700000000
-	keys := make([]groupKey, n)
+	keys := make([]groupComp, n)
 	switch shape {
 	case "bucket_76groups", "bucket_run3600", "bucket_run1":
 		// A per-second timestamp read in order: which bucket WIDTH is applied decides the run.
 		for i := range keys {
-			keys[i] = groupKey{kind: gkInt, raw: base + int64(i)}
+			keys[i] = groupComp{kind: gkInt, raw: base + int64(i)}
 		}
 	case "bucket_scattered":
 		// The group advances by a whole day every record and wraps after a month: a timestamp
 		// column whose buckets still change on every single record.
 		for i := range keys {
-			keys[i] = groupKey{kind: gkInt, raw: base + int64(i%30)*86400 + int64(i)}
+			keys[i] = groupComp{kind: gkInt, raw: base + int64(i%30)*86400 + int64(i)}
 		}
 	case "raw_run4":
 		for i := range keys {
-			keys[i] = groupKey{kind: gkInt, raw: int64(i / 4)}
+			keys[i] = groupComp{kind: gkInt, raw: int64(i / 4)}
 		}
 	case "raw_cycle4":
 		for i := range keys {
-			keys[i] = groupKey{kind: gkInt, raw: int64(i % 4)}
+			keys[i] = groupComp{kind: gkInt, raw: int64(i % 4)}
 		}
 	case "raw_str_cycle256":
-		pool := make([]string, 256)
-		for i := range pool {
-			pool[i] = fmt.Sprintf("user%03d", i)
-		}
 		for i := range keys {
-			keys[i] = groupKey{kind: gkString, s: pool[i%256]}
+			keys[i] = groupComp{kind: gkString, raw: int64(i % 256)}
 		}
 	case "raw_str_unique":
 		for i := range keys {
-			keys[i] = groupKey{kind: gkString, s: fmt.Sprintf("ap2001.chtc.wisc.edu#%d.%d", i/4, i%4)}
+			keys[i] = groupComp{kind: gkString, raw: int64(i)}
 		}
 	default:
 		panic("unknown shape " + shape)
@@ -149,16 +150,60 @@ func BenchmarkGroupAccum(b *testing.B) {
 		{"raw_str_cycle256", 0},
 		{"raw_str_unique", 0},
 	} {
-		keys := groupKeySeq(arm.shape, n)
+		keys := groupCompSeq(arm.shape, n)
 		b.Run(arm.shape, func(b *testing.B) {
 			b.ReportAllocs()
+			var comps [maxGroupCols]groupComp
 			for i := 0; i < b.N; i++ {
-				a := newGroupAccum(arm.bucket)
+				a := newGroupAccum([]int64{arm.bucket})
 				for j := range keys {
-					a.accFor(keys[j], 0)
+					comps[0] = keys[j]
+					a.accFor(&comps, 0)
 				}
 				if len(a.acc) == 0 {
 					b.Fatal("no groups")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGroupAccumTwoCols is BenchmarkGroupAccum for the two-column shape: a raw categorical
+// component beside a bucketed time component, which is "per owner per day". The arms differ in how
+// the two advance against each other, because that is what the interval memo can and cannot help
+// with: a memo hit needs the categorical component to be UNCHANGED as well as the timestamp to be in
+// the same bucket, so a column that cycles every record defeats it however slow the bucket is.
+func BenchmarkGroupAccumTwoCols(b *testing.B) {
+	const n = 120_000
+	const day = 86400
+	for _, arm := range []struct {
+		name   string
+		owner  func(i int) int64
+		bucket int64
+		why    string
+	}{
+		// Submit bursts: one owner for a long run, timestamps advancing a second at a time. Both
+		// components hold still, which is the memo's best case and the common production shape.
+		{"runs/owner256_day", func(i int) int64 { return int64(i / 256) }, day, "owner runs of 256, ~1.4 days"},
+		// The same timestamps with an owner drawn round-robin: the bucket holds, the owner does
+		// not, so the memo misses on the key compare every record.
+		{"cycle/owner16_day", func(i int) int64 { return int64(i % 16) }, day, "owner cycles every record"},
+		// Both components change every record: a group per record and no memo hit at all.
+		{"cycle/owner16_sec", func(i int) int64 { return int64(i % 16) }, 1, "a group per record"},
+	} {
+		b.Run(arm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			const base = 1700000000
+			var comps [maxGroupCols]groupComp
+			for i := 0; i < b.N; i++ {
+				a := newGroupAccum([]int64{0, arm.bucket})
+				for j := 0; j < n; j++ {
+					comps[0] = groupComp{kind: gkString, raw: arm.owner(j)}
+					comps[1] = groupComp{kind: gkInt, raw: base + int64(j)}
+					a.accFor(&comps, 0)
+				}
+				if len(a.acc) == 0 {
+					b.Fatalf("no groups (%s)", arm.why)
 				}
 			}
 		})

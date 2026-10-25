@@ -207,7 +207,7 @@ func TestGroupStatsGeneralPredicateAggregates(t *testing.T) {
 		t.Fatalf("%d groups, row path found %d", len(got), len(want))
 	}
 	for _, g := range got {
-		p, _ := g.Value.IntValue()
+		p, _ := g.Values[0].IntValue()
 		a := want[p]
 		if a == nil {
 			t.Errorf("group %d is not in the row path's result", p)
