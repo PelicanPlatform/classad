@@ -306,3 +306,50 @@ func groupColNames(gs []GroupCol) string {
 	}
 	return strings.Join(parts, ", ")
 }
+
+// TestArchiveGroupedMultipleColumnsReachesTheColumnarTier is the end-to-end statement, and the one
+// that does not depend on a clock: the DISPATCHER must pick the columnar rung for the motivating
+// shape, and the scan trailer must report that no record was reassembled.
+//
+// GroupedFromColumns answering when asked directly proves nothing on its own -- the fan-out stops at
+// the first rung that answers, and a rung that is eligible but never reached is a rung that does
+// nothing. Before several group columns were served, every shape below reported the SCAN tier with
+// one reassembly per matching record; a regression that sent them back there would leave every other
+// test in this file passing.
+func TestArchiveGroupedMultipleColumnsReachesTheColumnarTier(t *testing.T) {
+	const day = 86400
+	cat, a := multiColFixture(t, 8000)
+	defer cat.Close()
+	groups := []GroupCol{{Attr: "Owner"}, {Attr: "Ts", BucketWidth: day}}
+	for _, tc := range []struct {
+		why        string
+		constraint string
+		aggs       []AggSpec
+	}{
+		{"match-all COUNT(*)", "true", []AggSpec{{Func: AggCount, Arg: "*"}}},
+		{"constrained COUNT(*)", "Mem > 30000", []AggSpec{{Func: AggCount, Arg: "*"}}},
+		{"match-all with AVG", "true",
+			[]AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggAvg, Arg: "Mem"}}},
+		{"constrained with AVG", "Mem > 30000",
+			[]AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggAvg, Arg: "Mem"}}},
+	} {
+		var st collections.ScanStats
+		rows, err := a.AggregateColsStats(tc.constraint, groups, tc.aggs, &st)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.why, err)
+		}
+		// The index tier is also a correct answer for the unconstrained COUNT(*) -- it reads no
+		// record at all -- so what is asserted is that the SCAN did not serve it.
+		if st.Tier == collections.TierScan {
+			t.Errorf("%s: served by the record scan, reassembling %d records",
+				tc.why, st.RecordsReassembled)
+		}
+		if st.RecordsReassembled != 0 {
+			t.Errorf("%s: %d records were reassembled; the columnar and index rungs read none",
+				tc.why, st.RecordsReassembled)
+		}
+		if len(rows) == 0 {
+			t.Errorf("%s: no rows", tc.why)
+		}
+	}
+}
