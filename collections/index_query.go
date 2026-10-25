@@ -673,7 +673,7 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		if isUsable {
 			if cand, covered := c.estimateCandidates(up); covered {
 				pe.HasSelectivity = true
-				pe.EstCandidates = int64(cand + 0.5)
+				pe.EstCandidates = clampEst(cand, total)
 				if total > 0 {
 					pe.Selectivity = math.Min(1, cand/float64(total))
 				}
@@ -768,7 +768,8 @@ func (c *Collection) explainIndexSegments(q *vm.Query, usable []usableProbe, ex 
 	var cand float64
 	for _, sh := range c.shards {
 		_, wins := sh.snapshot()
-		for _, w := range wins {
+		live := sh.liveFractions(wins)
+		for i, w := range wins {
 			si := w.seg.readIdx()
 			switch {
 			case zoned && c.zoneExcludes(w, probes, ct):
@@ -783,7 +784,7 @@ func (c *Collection) explainIndexSegments(q *vm.Query, usable []usableProbe, ex 
 				for _, up := range usable {
 					least = math.Min(least, si.estCandidates(up))
 				}
-				cand += least
+				cand += least * live[i]
 			}
 		}
 		releaseWindows(wins)
@@ -844,21 +845,44 @@ func (c *Collection) probeIndexKind(p vm.Probe) (indexed bool, kind string, up u
 // planner uses to order intersections. covered reports whether any built segment
 // index contributed (false when the matching records are only in an unsealed
 // segment with no stats yet, so no estimate is available). Approximate: it counts
-// the indexed prefix (not the un-indexed tail) and may include superseded records.
+// the indexed prefix (not the un-indexed tail).
+//
+// A segment index counts every record it posted, and in a mutable table most of
+// those are versions a later write has superseded: a jobs table of 54k ads
+// estimated `JobStatus == 2` at 405k. So each segment's count is scaled by the
+// share of the segment that is still live (liveFractions) -- by bytes, which the
+// segment keeps exact, standing in for records, which it does not count.
 func (c *Collection) estimateCandidates(up usableProbe) (cand float64, covered bool) {
 	single := []usableProbe{up}
 	for _, sh := range c.shards {
-		s0, wins := sh.snapshot()
-		for _, w := range wins {
+		_, wins := sh.snapshot()
+		live := sh.liveFractions(wins)
+		for i, w := range wins {
 			if si := w.seg.readIdx(); si != nil && si.covers(single) {
-				cand += si.estCandidates(up)
+				cand += si.estCandidates(up) * live[i]
 				covered = true
 			}
 		}
 		releaseWindows(wins)
-		_ = s0
 	}
 	return cand, covered
+}
+
+// liveFractions returns, for each window, the share of its segment's bytes that
+// belong to records no later write has superseded: 1 for a segment of current
+// records, 0 for one holding only history. The segment tracks its dead bytes as
+// records are superseded, under the shard lock, which is taken here to read them.
+func (sh *shard) liveFractions(wins []segWindow) []float64 {
+	out := make([]float64, len(wins))
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	for i, w := range wins {
+		used := int64(w.seg.used)
+		if live := used - w.seg.dead; used > 0 && live > 0 {
+			out[i] = float64(live) / float64(used)
+		}
+	}
+	return out
 }
 
 // planIndexGroups plans a DNF probe plan (from vm.ProbePlan): each group's probes are
