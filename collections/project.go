@@ -57,6 +57,22 @@ func (c *Collection) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanS
 
 		scratch := make([]classad.Value, len(attrs))
 		rs := &wireScope{ctx: c} // projection resolver, distinct from the match ws
+		// NO PROJECTION PLAN HERE, deliberately -- this is the one scan that must not have one,
+		// and it is worth saying why because the plan would make it measurably faster (~3x, a
+		// third of the allocations) while silently changing answers.
+		//
+		// A plan lets the scan hand this emit an ad NARROWED to attrs, built from a
+		// columnarized segment's columns instead of reassembling the record. That is sufficient
+		// for a consumer that SHIPS the entries it is given (QueryRawWire does, and so has a
+		// plan). This one EVALUATES them: projectInto falls back to decoding the ad whenever a
+		// requested attribute is stored as an expression rather than a literal, and an
+		// expression's own references are not in the projection -- `RequestMemory = ProcId*512+7`
+		// projected as just RequestMemory loses ProcId and evaluates to UNDEFINED. Measured on a
+		// columnarized fixture: 14 of 3000 records turned UNDEFINED, with no error anywhere.
+		//
+		// Expression-valued attributes are routine in real job ads, and this scan backs COUNT and
+		// GROUP BY, where UNDEFINED is not an error but a different answer. Pinned by
+		// TestQueryProjectExpressionValues.
 		c.scanQuery(c.newQueryPlan(q, nil, stats), func(w []byte, dict *segDictHandle) bool {
 			rs.dict = dict
 			c.projectInto(rs, w, attrs, scratch)

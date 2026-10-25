@@ -30,6 +30,13 @@ import (
 //   - the match was already decided FROM the columns, so no ad was needed to decide it.
 //
 // Everything else reassembles as before.
+//
+// WHICH CONSUMERS MAY ASK FOR IT is the other half, and it is a property of the consumer rather
+// than of the scan. A narrowed ad is enough to SHIP: the entries are emitted as stored, which is
+// what QueryRawWire does. It is not enough to EVALUATE, because a kept attribute may be an
+// expression whose references were narrowed away, and evaluating it then yields UNDEFINED rather
+// than an error. So the scans whose emit evaluates -- QueryProject, and QueryRawProjected under
+// chaseRefs -- pass no plan and take the reassembled record; see the note at each.
 
 // projPlan is a projection resolved for the scan: which attributes to keep, and where they live.
 type projPlan struct {
