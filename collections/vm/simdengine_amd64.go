@@ -9,8 +9,8 @@ import (
 
 const rawSupported = true
 
-// The amd64 engine: AVX2, 256 bits, so 16 lanes at a 2-byte column width and 8 at 4 bytes -- twice arm64's
-// NEON, and the mask comes free.
+// The amd64 engine: AVX2, 256 bits, so 32 lanes at a 1-byte column width, 16 at 2 bytes and 8 at 4 bytes --
+// twice arm64's NEON, and the mask comes free.
 //
 // An AVX-512 mask register already IS a bitmask, so ToBits is a register read rather than the weight-vector
 // reduction arm64 has to emulate. That extraction was 30% of the arm64 kernel, which is why this engine should
@@ -22,7 +22,7 @@ const rawSupported = true
 
 // simdSupportsWidth reports whether this engine has lanes for a column of this width, on this CPU.
 func simdSupportsWidth(width int, _ bool) bool {
-	return archsimd.X86.AVX2() && (width == 2 || width == 4)
+	return archsimd.X86.AVX2() && (width == 1 || width == 2 || width == 4)
 }
 
 func simdBaseMask(base cmpBase, raw []byte, width int, unsigned bool, lit int64, n int, lo []uint64) bool {
@@ -30,6 +30,10 @@ func simdBaseMask(base cmpBase, raw []byte, width int, unsigned bool, lit int64,
 		return false
 	}
 	switch {
+	case width == 1 && !unsigned && fitsInt8(lit):
+		return maskInt8x32(base, raw, int8(lit), n, lo)
+	case width == 1 && unsigned && fitsUint8(lit):
+		return maskUint8x32(base, raw, uint8(lit), n, lo)
 	case width == 2 && !unsigned && fitsInt16(lit):
 		return maskInt16x16(base, raw, int16(lit), n, lo)
 	case width == 2 && unsigned && fitsUint16(lit):
@@ -139,6 +143,62 @@ func maskUint32x8(base cmpBase, raw []byte, lit uint32, n int, lo []uint64) bool
 			}
 			x := archsimd.LoadUint32x8(unsafe.Slice((*uint32)(unsafe.Pointer(&raw[i*4])), lanes))
 			var m archsimd.Mask32x8
+			switch base {
+			case baseEQ:
+				m = x.Equal(v)
+			case baseGT:
+				m = x.Greater(v)
+			default:
+				m = x.Less(v)
+			}
+			word |= uint64(m.ToBits()) << uint(g*lanes)
+		}
+		lo[w] = word
+	}
+	return true
+}
+
+func maskInt8x32(base cmpBase, raw []byte, lit int8, n int, lo []uint64) bool {
+	v := archsimd.BroadcastInt8x32(lit)
+	const lanes = 32
+	for w := range lo {
+		var word uint64
+		for g := 0; g*lanes < 64; g++ {
+			i := w*64 + g*lanes
+			if i+lanes > n {
+				word |= scalarTailInt(base, raw, 1, false, int64(lit), i, n, w*64)
+				break
+			}
+			x := archsimd.LoadInt8x32(unsafe.Slice((*int8)(unsafe.Pointer(&raw[i])), lanes))
+			var m archsimd.Mask8x32
+			switch base {
+			case baseEQ:
+				m = x.Equal(v)
+			case baseGT:
+				m = x.Greater(v)
+			default:
+				m = x.Less(v)
+			}
+			word |= uint64(m.ToBits()) << uint(g*lanes)
+		}
+		lo[w] = word
+	}
+	return true
+}
+
+func maskUint8x32(base cmpBase, raw []byte, lit uint8, n int, lo []uint64) bool {
+	v := archsimd.BroadcastUint8x32(lit)
+	const lanes = 32
+	for w := range lo {
+		var word uint64
+		for g := 0; g*lanes < 64; g++ {
+			i := w*64 + g*lanes
+			if i+lanes > n {
+				word |= scalarTailInt(base, raw, 1, true, int64(lit), i, n, w*64)
+				break
+			}
+			x := archsimd.LoadUint8x32(unsafe.Slice((*uint8)(unsafe.Pointer(&raw[i])), lanes))
+			var m archsimd.Mask8x32
 			switch base {
 			case baseEQ:
 				m = x.Equal(v)
