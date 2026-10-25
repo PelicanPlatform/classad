@@ -1,6 +1,8 @@
 package db
 
 import (
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/PelicanPlatform/classad/collections"
@@ -21,7 +23,25 @@ type persistedIndexConfig struct {
 	// restoring this provenance keeps the memory-budget trimmer able to remove them and
 	// keeps human-created indexes exempt across restarts.
 	Auto []string `json:"auto,omitempty"`
-	Hot  []string `json:"hot,omitempty"`
+	// Hot is the HUMAN tier of the hot set: what Config.HotAttrs asked for at open plus
+	// whatever AddHotAttrs named since. AutoHot is what the demand-driven RefreshHotSet put
+	// on top. The live set is their union, and each is restored separately on reopen.
+	//
+	// They were one field, holding the whole live set, which is the same mistake the Auto
+	// field above exists to avoid: a sampled attribute came back from a restart
+	// indistinguishable from one an operator pinned, so nothing downstream could tell a
+	// guess from an instruction -- and the operator's list was whatever the last sample
+	// happened to agree with.
+	//
+	// A file written before the split has `hot` and no `autoHot`, and every entry in it is
+	// read as human. That direction is chosen because the two errors are not comparable:
+	// reading an auto entry as human leaves an attribute pinned that a refresh could
+	// otherwise have dropped, which costs a few bytes in each record's hot header and is
+	// undone by naming it; reading a human entry as auto discards an operator's pin the
+	// first time a sample disagrees, silently and with no record that it was ever asked
+	// for. The first is visible and reversible, the second is neither.
+	Hot     []string `json:"hot,omitempty"`
+	AutoHot []string `json:"autoHot,omitempty"`
 	// Encrypted lists the explicitly encrypted attributes (the human-toggled set, not
 	// the always-on private attributes). Restoring it keeps a runtime encryption-policy
 	// change consistent across restarts -- and, in HA, lets a follower converge on the
@@ -76,17 +96,29 @@ func readPersistedTimeTravel(dir string) *collections.TimeTravelOptions {
 // The derive runs inside the store's critical section, so that two savers cannot each
 // snapshot the collection and then write in the opposite order -- which drops whichever
 // change the older snapshot had not seen.
-func (db *DB) saveIndexConfig() {
-	_ = db.cfg.update(func(cfg *persistedIndexConfig) { *cfg = db.deriveIndexConfig() })
+//
+// pinHot names attributes to fold into the human hot tier as part of the same write -- what
+// AddHotAttrs passes, so the name someone asked for and the save that records it cannot be
+// split by another saver. Every other caller passes none.
+func (db *DB) saveIndexConfig(pinHot ...string) {
+	_ = db.cfg.update(func(cfg *persistedIndexConfig) {
+		*cfg = db.deriveIndexConfig(mergeNames(cfg.Hot, pinHot))
+	})
 }
 
 // deriveIndexConfig reads the collection's current index set, hot set, encryption policy,
 // runtime required tier and time-travel setting into the persisted shape. Called with the
 // config store's lock held.
-func (db *DB) deriveIndexConfig() persistedIndexConfig {
+//
+// humanHot is the human tier carried over from the held config, because the collection does
+// not track hot provenance -- it knows only the live set. Everything live and not in that
+// tier is what a refresh added. This is the one field the derive cannot take wholly from
+// the collection, which is why it is threaded through rather than read here.
+func (db *DB) deriveIndexConfig(humanHot []string) persistedIndexConfig {
 	cat, val := db.c.IndexedAttrs()
 	cfg := persistedIndexConfig{
-		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(), Hot: db.c.HotAttrNames(),
+		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(),
+		Hot: humanHot, AutoHot: autoHotNames(humanHot, db.c.HotAttrNames()),
 		Encrypted: db.c.EncryptedAttrNames(), SchemaRequire: db.c.SchemaRequireRuntimeAttrs(),
 	}
 	if o, on := db.c.TimeTravelConfig(); on {
@@ -105,7 +137,14 @@ func (db *DB) loadIndexConfig() {
 	if !ok {
 		return
 	}
-	db.cfg.with(func(held *persistedIndexConfig) { *held = cfg })
+	db.cfg.with(func(held *persistedIndexConfig) {
+		// The store was seeded with Config.HotAttrs, which is configured and therefore human
+		// however old the file is. Keep it: a name the application asks for at open must not
+		// be filed as a sample's doing by the next save just because the file predates it.
+		configured := held.Hot
+		*held = cfg
+		held.Hot = mergeNames(append([]string(nil), configured...), cfg.Hot)
+	})
 
 	// Desired kind per attribute (categorical wins if listed as both).
 	want := map[string]string{}
@@ -169,8 +208,13 @@ func (db *DB) loadIndexConfig() {
 	if changed {
 		db.c.Reindex() // build the reconciled indexes over the already-loaded ads
 	}
+	// Restore both hot tiers, human first. Each is added rather than installed over, so the
+	// live set comes back as their union and neither can erase the other.
 	if len(cfg.Hot) > 0 {
 		db.c.AddHotAttrs(cfg.Hot...)
+	}
+	if len(cfg.AutoHot) > 0 {
+		db.c.AddHotAttrs(cfg.AutoHot...)
 	}
 	// Restore the runtime-required schema attributes on top of the configured tier. Changing the
 	// set does not re-derive the schema (that is ReschemaScan's job and costs the whole table),
@@ -184,4 +228,25 @@ func (db *DB) loadIndexConfig() {
 	if len(cfg.Encrypted) > 0 {
 		_ = db.c.SetEncryptedAttrs(cfg.Encrypted)
 	}
+}
+
+// autoHotNames is the live hot set minus the human tier: what a demand-driven refresh added.
+// Case-insensitive, like every other attribute-name comparison here, and sorted so the file
+// does not churn on a set that has not changed.
+func autoHotNames(human, live []string) []string {
+	if len(live) == 0 {
+		return nil
+	}
+	isHuman := make(map[string]bool, len(human))
+	for _, n := range human {
+		isHuman[strings.ToLower(n)] = true
+	}
+	var auto []string
+	for _, n := range live {
+		if !isHuman[strings.ToLower(n)] {
+			auto = append(auto, n)
+		}
+	}
+	sort.Strings(auto)
+	return auto
 }

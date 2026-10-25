@@ -526,3 +526,201 @@ func TestViewArchiveConfigPersists(t *testing.T) {
 		t.Errorf("view archive holds %d sealed buckets after reload, want 1", got)
 	}
 }
+
+// hotProvenanceDB builds a table whose ads give a refresh something to choose, with read
+// demand on one attribute that is not configured hot, and returns its directory.
+func hotProvenanceDB(t *testing.T, dir string, cfg Config) *DB {
+	t.Helper()
+	cfg.Dir = dir
+	d, err := OpenConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 400 {
+		ad := mustAd(t, fmt.Sprintf("ClusterId = %d\nOwner = \"u%d\"\nGlobalJobId = \"ap1#%d.0#17\"\nExitCode = %d",
+			i, i%5, i, i%3))
+		if err := d.Put(fmt.Sprintf("%d.0", i), ad); err != nil {
+			d.Close()
+			t.Fatal(err)
+		}
+	}
+	for range 10 {
+		seq, err := d.Query(`GlobalJobId == "ap1#3.0#17"`)
+		if err != nil {
+			d.Close()
+			t.Fatal(err)
+		}
+		for range seq { //nolint:revive // draining the iterator is the point
+		}
+	}
+	return d
+}
+
+// readIndexConfig reads dir's persisted index config, failing if it is not there.
+func readIndexConfig(t *testing.T, dir string) persistedIndexConfig {
+	t.Helper()
+	cfg, _, ok := readConfigFile[persistedIndexConfig](dir, indexConfigFile)
+	if !ok {
+		t.Fatal("no readable indexcfg.json")
+	}
+	return cfg
+}
+
+// TestHotProvenanceSplitSurvivesReopen: the mutable table persists WHICH hot attributes a
+// human asked for and which a demand-driven refresh added, and restores the two separately.
+//
+// It used to persist the whole live set under one field, so after a restart a sampled
+// attribute was indistinguishable from a configured one -- and the operator's list was
+// whatever the last sample happened to agree with. The reopen is the whole point of the
+// test: in one process the live set looks correct either way.
+func TestHotProvenanceSplitSurvivesReopen(t *testing.T) {
+	dir := t.TempDir()
+	d := hotProvenanceDB(t, dir, Config{HotAttrs: []string{"Owner"}})
+	d.AddHotAttrs("Pinned")
+	if n := d.RefreshHotSet(2000, 4); n == 0 {
+		d.Close()
+		t.Skip("the refresh chose nothing, so there is no auto tier to measure")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	saved := readIndexConfig(t, dir)
+	for _, want := range []string{"Owner", "Pinned"} {
+		if !containsFold(saved.Hot, want) {
+			t.Errorf("persisted human hot set = %v, want %s", saved.Hot, want)
+		}
+	}
+	if len(saved.AutoHot) == 0 {
+		t.Fatalf("nothing recorded as refresh-added; hot = %v, autoHot = %v", saved.Hot, saved.AutoHot)
+	}
+	for _, human := range []string{"Owner", "Pinned"} {
+		if containsFold(saved.AutoHot, human) {
+			t.Errorf("autoHot = %v holds %s, which a human asked for", saved.AutoHot, human)
+		}
+	}
+	for _, auto := range saved.AutoHot {
+		if containsFold(saved.Hot, auto) {
+			t.Errorf("hot = %v holds %s, which the refresh added", saved.Hot, auto)
+		}
+	}
+
+	// Reopen: the live set is the union again, and a refresh over a sample that need not
+	// read them keeps the human tier, because the file still says who asked for it.
+	d2, err := OpenConfig(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	for _, want := range append([]string{"Owner", "Pinned"}, saved.AutoHot...) {
+		if !containsFold(d2.HotAttrs(), want) {
+			t.Errorf("hot set after reopen = %v, want %s", d2.HotAttrs(), want)
+		}
+	}
+	d2.RefreshHotSet(2000, 1)
+	for _, want := range []string{"Owner", "Pinned"} {
+		if !containsFold(d2.HotAttrs(), want) {
+			t.Errorf("hot set after a post-restart refresh = %v, want %s kept: the pin did not "+
+				"survive the restart as a pin", d2.HotAttrs(), want)
+		}
+	}
+}
+
+// TestHotProvenanceLegacyFileLoadsAsHuman pins the first-load decision: a file written
+// before the split has `hot` and no `autoHot`, and every entry in it is read as
+// human-configured.
+//
+// The alternative -- read them as auto -- would discard an operator's pin the first time a
+// sample disagreed with it, on an upgrade, with nothing to say so. Reading them as human
+// keeps an attribute hot that a refresh could otherwise have dropped, which is visible and
+// is undone by naming it.
+func TestHotProvenanceLegacyFileLoadsAsHuman(t *testing.T) {
+	dir := t.TempDir()
+	copyFixture(t, indexConfigFile, filepath.Join(dir, indexConfigFile))
+	// The committed fixture predates the split: it has `hot` and no `autoHot`.
+	if legacy := readIndexConfig(t, dir); len(legacy.AutoHot) != 0 {
+		t.Fatalf("the fixture already carries an auto tier (%v), so it no longer stands in "+
+			"for a pre-split file", legacy.AutoHot)
+	}
+
+	d := hotProvenanceDB(t, dir, Config{})
+	for _, want := range []string{"Owner", "JobStatus"} {
+		if !containsFold(d.HotAttrs(), want) {
+			t.Errorf("hot set from the pre-split file = %v, want %s", d.HotAttrs(), want)
+		}
+	}
+	d.RefreshHotSet(2000, 1)
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	saved := readIndexConfig(t, dir)
+	for _, want := range []string{"Owner", "JobStatus"} {
+		if !containsFold(saved.Hot, want) {
+			t.Errorf("human hot set after a refresh over a pre-split file = %v, want %s: the "+
+				"file's entries were not read as human", saved.Hot, want)
+		}
+	}
+	d2, err := OpenConfig(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	for _, want := range []string{"Owner", "JobStatus"} {
+		if !containsFold(d2.HotAttrs(), want) {
+			t.Errorf("hot set after reopening the upgraded file = %v, want %s", d2.HotAttrs(), want)
+		}
+	}
+}
+
+// TestMaintainPersistsHotRefresh: the scheduled pass's hot-set refresh has to reach the
+// file, as the archive pass's does. It went straight to the collection, so the one piece of
+// hot-set tuning a daemon does unattended was live for that process and gone on restart --
+// with the segments written in between as the only trace that it ever ran.
+func TestMaintainPersistsHotRefresh(t *testing.T) {
+	dir := t.TempDir()
+	d := hotProvenanceDB(t, dir, Config{})
+	d.Maintain(MaintainOptions{HotTopN: 4})
+	live := append([]string(nil), d.HotAttrs()...)
+	if len(live) == 0 {
+		d.Close()
+		t.Skip("the refresh chose nothing")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	d2, err := OpenConfig(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	for _, want := range live {
+		if !containsFold(d2.HotAttrs(), want) {
+			t.Errorf("hot set after a restart = %v, want %s: the maintenance refresh was "+
+				"never persisted", d2.HotAttrs(), want)
+		}
+	}
+}
+
+// TestIndexConfigAutoHotTagged pins the new field's JSON tag the way
+// TestConfigFileFormatUnchanged pins the others. The committed fixture is deliberately left
+// as the pre-split writer produced it -- that is what makes it evidence of backward
+// compatibility -- so it cannot carry this field, and the tag is pinned here instead.
+func TestIndexConfigAutoHotTagged(t *testing.T) {
+	data, err := json.Marshal(persistedIndexConfig{Hot: []string{"Owner"}, AutoHot: []string{"GlobalJobId"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != `{"hot":["Owner"],"autoHot":["GlobalJobId"]}` {
+		t.Errorf("persistedIndexConfig JSON = %s, want the hot/autoHot tags", got)
+	}
+	// And omitted when empty, which is why adding it left the committed fixture's bytes alone.
+	data, err = json.Marshal(persistedIndexConfig{Hot: []string{"Owner"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(data); got != `{"hot":["Owner"]}` {
+		t.Errorf("persistedIndexConfig JSON without an auto tier = %s, want autoHot omitted", got)
+	}
+}

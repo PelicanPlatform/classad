@@ -964,19 +964,7 @@ func (t *ArchiveTable) AddHotAttrs(names ...string) []string {
 // leaves the change live for this run but unpersisted.
 func (t *ArchiveTable) saveHotConfig() {
 	_ = t.cfg.update(func(cfg *ArchiveConfig) {
-		live := t.a.HotAttrNames()
-		human := make(map[string]bool, len(cfg.HotAttrs))
-		for _, n := range cfg.HotAttrs {
-			human[strings.ToLower(n)] = true
-		}
-		var auto []string
-		for _, n := range live {
-			if !human[strings.ToLower(n)] {
-				auto = append(auto, n)
-			}
-		}
-		sort.Strings(auto)
-		cfg.AutoHotAttrs = auto
+		cfg.AutoHotAttrs = autoHotNames(cfg.HotAttrs, t.a.HotAttrNames())
 	})
 }
 
