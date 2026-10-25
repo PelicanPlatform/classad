@@ -1780,8 +1780,21 @@ func respBad(reqID uint64) []byte { return resp(reqID, stBadReq) }
 // rewrites nothing: it changes what future records are written under, and the merge pass
 // above carries it to older records as it folds their segments together.
 func (s *Server) maintainArchives(opts db.MaintainOptions) {
-	if opts.ArchiveMergeDisabled {
-		return
+	// Resolve the sample bound ONCE, for the whole pass, as DB.Maintain does. Each step used
+	// to default it for itself or not at all, and an unset SampleMax therefore meant two
+	// different things inside one pass: diagSampleMax for the schema scan and the hot-set
+	// refresh, and 4096 for the index tuner and the group derivation, because collections'
+	// AutoTune and GroupSchemas both substitute their own maxDistinctSample for a
+	// non-positive bound. Neither step was ever unsampled, so this is not a dark pass -- it
+	// is two sample sizes where there should be one, with the steps that sample an archive's
+	// records silently drawing the larger of them.
+	//
+	// The pass's own default is the one kept: sampling an archive decompresses records, and
+	// the two steps that were drawing 4096 were taking it from a library fallback rather than
+	// asking for it. A caller that wants a different bound sets SampleMax, which every step
+	// has always honoured.
+	if opts.SampleMax <= 0 {
+		opts.SampleMax = diagSampleMax
 	}
 	for _, name := range s.cat.ArchiveTables() {
 		a, ok := s.cat.ArchiveTable(name)
@@ -1789,24 +1802,44 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 			continue
 		}
 		s.maintainMu.Lock()
-		// Below its trigger watermark this is a segment count and a comparison, so the
-		// common case costs nothing.
-		a.MergePass(opts.ArchiveMerge)
+		// ArchiveMergeDisabled gates the MERGE, and only the merge. It used to return from
+		// the whole function, which was the same statement when the pass was a merge and the
+		// reindex that follows one; every step added since -- hot-set refresh, index
+		// auto-tune, the schema scan, the group derivation, the demand checkpoint -- was
+		// silently switched off with it. None of those re-encode the archive, which is what
+		// the knob's name is about, and the one that changes future writes has its own switch
+		// in ArchiveHotRefreshDisabled.
+		if !opts.ArchiveMergeDisabled {
+			// Below its trigger watermark this is a segment count and a comparison, so the
+			// common case costs nothing.
+			a.MergePass(opts.ArchiveMerge)
+		}
 		// A merge leaves its output without a sidecar, and an interrupted reindex leaves
-		// segments stale; either way queries fall back to scanning until it is rebuilt.
+		// segments stale; either way queries fall back to scanning until it is rebuilt. Not
+		// gated on the merge: a pass interrupted before the knob was set leaves the same
+		// stale segments behind, and they stay stale until something rebuilds them.
 		if stale, _ := a.StaleIndexSegments(); stale > 0 {
 			a.Reindex()
 		}
-		sampleMax := opts.SampleMax
-		if sampleMax <= 0 {
-			sampleMax = diagSampleMax
+		// Derive and checkpoint the candidate group schemas on the ARCHIVE's cadence, which is
+		// far longer than a mutable table's -- so the stability gate's several derivations span
+		// days rather than minutes. That is the intended shape: an archive's structure should be
+		// established over the period it actually changes on.
+		//
+		// BEFORE the schema scan, as DB.Maintain does it: the gate reads the derivation
+		// history that this call appends to, so deriving afterwards means the scan's
+		// auto-promotion never sees the current pass and a qualifying group waits one extra
+		// review interval -- a day on an archive -- to be committed. One derivation per pass
+		// either way; the history still accumulates on the pass cadence and no faster.
+		if opts.ArchiveSchemaScanHotTopN > 0 {
+			a.GroupSchemas(opts.SampleMax, 0)
 		}
 		// The per-segment columnar accelerator, off unless configured (see
 		// ArchiveSchemaScanHotTopN): the first build reads the whole history once. After that
 		// this only extends coverage to segments sealed since, including those a merge just
 		// produced.
 		if opts.ArchiveSchemaScanHotTopN > 0 {
-			a.BuildAndEnableSchemaScan(sampleMax, opts.ArchiveSchemaScanHotTopN)
+			a.BuildAndEnableSchemaScan(opts.SampleMax, opts.ArchiveSchemaScanHotTopN)
 		}
 		// Re-rank the hot header from accumulated read demand. This is the one archive pass
 		// that reads nothing back: the hot header is per record, so sealed segments keep --
@@ -1820,7 +1853,7 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 		// the merge has not yet been measured against. Refreshing after means the NEXT pass's
 		// merge carries it, which is the conservative order.
 		if opts.HotTopN > 0 && !opts.ArchiveHotRefreshDisabled {
-			a.RefreshHotSet(sampleMax, opts.HotTopN)
+			a.RefreshHotSet(opts.SampleMax, opts.HotTopN)
 		}
 		// Add the indexes observed demand justifies. Off unless a threshold is configured:
 		// an archive index is paid for by reading history back, so it is not something to
@@ -1831,13 +1864,6 @@ func (s *Server) maintainArchives(opts db.MaintainOptions) {
 				MinDemand: opts.ArchiveIndexMinDemand,
 				Reindex:   true,
 			})
-		}
-		// Derive and checkpoint the candidate group schemas on the ARCHIVE's cadence, which is
-		// far longer than a mutable table's -- so the stability gate's several derivations span
-		// days rather than minutes. That is the intended shape: an archive's structure should be
-		// established over the period it actually changes on.
-		if opts.ArchiveSchemaScanHotTopN > 0 {
-			a.GroupSchemas(opts.SampleMax, 0)
 		}
 		// Age and checkpoint the recorded query demand. An archive needs this more than a
 		// mutable table does: indexing one is paid for by decompressing history, so the

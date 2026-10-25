@@ -2,11 +2,16 @@ package dbrpc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -279,4 +284,149 @@ func TestArchiveAdminAnalyzeAutoTunesIndexes(t *testing.T) {
 	if !hasHotFold(cat, "GlobalJobId") && !hasHotFold(val, "GlobalJobId") {
 		t.Errorf("indexes after analyze = %v/%v, want the queried GlobalJobId", cat, val)
 	}
+}
+
+// TestArchiveMaintenanceMergeDisabledStillTunes: ArchiveMergeDisabled is a merge knob, and
+// the rest of the pass must keep running under it. It used to return from the whole
+// function, so every step added after it -- hot-set refresh, auto-tune, schema scan, group
+// derivation, demand checkpoint -- was switched off by a knob that never mentioned them.
+func TestArchiveMaintenanceMergeDisabledStillTunes(t *testing.T) {
+	a, srv, cleanup := archiveHotFixture(t)
+	defer cleanup()
+
+	srv.maintainArchives(db.MaintainOptions{HotTopN: 8, ArchiveMergeDisabled: true})
+
+	if !hasHotFold(a.HotAttrs(), "GlobalJobId") {
+		t.Errorf("hot set after a merge-disabled pass = %v, want the queried GlobalJobId: "+
+			"disabling the merge must not disable the rest of the pass", a.HotAttrs())
+	}
+}
+
+// groupArchiveFixture builds an archive whose ads carry a recurring attribute group, with the
+// stability gate set to two derivations so a short test can reach it. It returns the catalog
+// directory so a test can read the derivation checkpoint the gate reads.
+func groupArchiveFixture(t *testing.T, records, stabilityRuns int) (*db.ArchiveTable, *Server, string, func()) {
+	t.Helper()
+	dir := t.TempDir()
+	cat, err := db.OpenCatalog(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServerCatalog(cat)
+	cleanup := func() { s.Close(); cat.Close() }
+	a, err := cat.CreateArchiveTable("history", db.ArchiveConfig{
+		SegmentSize: 1 << 14, GroupSchemaCount: 4, GroupStabilityRuns: stabilityRuns,
+	})
+	if err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	for i := range records {
+		ad := classad.New()
+		ad.Set("ClusterId", int64(i))
+		ad.Set("Owner", fmt.Sprintf("u%d", i%5))
+		if i%4 == 0 {
+			ad.Set("GA", int64(i))
+			ad.Set("GB", int64(i*2))
+			ad.Set("GC", int64(i*3))
+		}
+		if err := a.Append(ad); err != nil {
+			cleanup()
+			t.Fatal(err)
+		}
+	}
+	if err := a.Flush(); err != nil {
+		cleanup()
+		t.Fatal(err)
+	}
+	return a, s, dir, cleanup
+}
+
+// TestArchiveMaintenanceDerivesGroupsBeforeSchemaScan: the group derivation appends to the
+// history the schema scan's stability gate reads, so it has to run FIRST within a pass -- as
+// DB.Maintain does it. Deriving afterwards means the gate never sees the current pass and a
+// qualifying group waits one extra review interval, which on an archive is a day.
+//
+// With the gate at two derivations, two passes must be enough.
+func TestArchiveMaintenanceDerivesGroupsBeforeSchemaScan(t *testing.T) {
+	a, srv, _, cleanup := groupArchiveFixture(t, 800, 2)
+	defer cleanup()
+
+	for range 2 {
+		srv.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8})
+	}
+
+	info := a.SchemaScanInfo()
+	if !info.Enabled {
+		t.Fatal("the accelerator did not enable, so this test measures nothing")
+	}
+	if info.GroupSchemas == 0 {
+		t.Errorf("no group schemas committed after %d passes at a 2-derivation gate: "+
+			"the derivation ran after the schema scan, so the gate never saw this pass", 2)
+	}
+}
+
+// TestArchiveMaintenanceSamplesOnceForTheWholePass: one pass, one sample bound. The pass
+// defaulted SampleMax for some steps and handed the raw (possibly unset) value to the group
+// derivation and the index tuner, which substitute collections' own larger fallback -- two
+// sample sizes inside one pass, the larger of them on the steps nobody chose it for.
+//
+// Measured on the derivation checkpoint, which is the only one of the two that records what
+// it looked at. The fixture holds more records than the pass's bound and fewer than the
+// library's, so the two are distinguishable.
+func TestArchiveMaintenanceSamplesOnceForTheWholePass(t *testing.T) {
+	const records = 3000
+	a, srv, dir, cleanup := groupArchiveFixture(t, records, 2)
+	defer cleanup()
+	if a.Count() != records {
+		t.Fatalf("fixture holds %d records, want %d", a.Count(), records)
+	}
+
+	srv.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8})
+
+	sampled := lastGroupDerivationSampled(t, dir)
+	if sampled == 0 {
+		t.Fatal("no group derivation was checkpointed, so this test measures nothing")
+	}
+	if sampled > diagSampleMax {
+		t.Errorf("the group derivation sampled %d records; the pass's bound is %d, so it is "+
+			"running on a different sample size than the rest of the pass", sampled, diagSampleMax)
+	}
+}
+
+// lastGroupDerivationSampled reads how many records the most recent group derivation under
+// dir looked at. The checkpoint is the file the stability gate itself reads.
+func lastGroupDerivationSampled(t *testing.T, dir string) int {
+	t.Helper()
+	var found string
+	if err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && d.Name() == "groupschemas.json" {
+			found = p
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if found == "" {
+		t.Fatal("no groupschemas.json under the catalog directory")
+	}
+	data, err := os.ReadFile(found)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec struct {
+		History []struct {
+			Sampled int `json:"sampled"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal(data, &rec); err != nil {
+		t.Fatal(err)
+	}
+	if len(rec.History) == 0 {
+		return 0
+	}
+	return rec.History[len(rec.History)-1].Sampled
 }
