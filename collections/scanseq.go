@@ -3,7 +3,10 @@ package collections
 import (
 	"bytes"
 	"iter"
+	"slices"
 	"sort"
+
+	"github.com/RoaringBitmap/roaring/v2"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
@@ -68,10 +71,20 @@ type SeqPage struct {
 // seqRun is one segment's records, positioned at the first one after the
 // cursor. Records within a segment are appended in commit order, so a run is
 // already sorted by sequence and is consumed front to back.
+//
+// A run whose segment index can serve the query visits only that index's
+// candidates in the covered prefix -- offsets ascending, so still in commit
+// order -- and then every record of the uncovered tail. Either way it yields a
+// superset of the segment's matches, in the same order the whole walk would.
 type seqRun struct {
 	w    segWindow
-	off  uint32
 	dict *segDictHandle
+	// cand iterates the index's candidates in the covered prefix, nil once
+	// exhausted or when the run walks its whole segment.
+	cand roaring.IntIterable
+	// off is the next offset of the walk that follows the candidates: the
+	// uncovered tail, or the whole segment for a run without an index.
+	off uint32
 	// cur is the record the run is positioned at, valid while ok.
 	cur recRef
 	seq uint64
@@ -88,6 +101,26 @@ type seqRun struct {
 // before it. The key comparison happens once a sequence's whole group has been
 // collected and sorted.
 func (r *seqRun) advance(s0, minSeq uint64) {
+	for r.cand != nil {
+		if !r.cand.HasNext() {
+			r.cand = nil
+			break
+		}
+		o := r.cand.Next()
+		if int(o) >= r.w.used {
+			// Beyond the window: an index built after this snapshot was taken can
+			// cover records written since, none of which the snapshot can see.
+			r.cand = nil
+			break
+		}
+		if recIsMarker(r.w.data, o) || !r.w.visible(o, s0) {
+			continue
+		}
+		if seq := recSeq(r.w.data, o); seq >= minSeq {
+			r.cur, r.seq, r.key, r.ok = recRef{w: r.w, off: o, dict: r.dict}, seq, recKey(r.w.data, o), true
+			return
+		}
+	}
 	for int(r.off) < r.w.used {
 		o := r.off
 		if end, ok := r.w.dmg.skip(o); ok {
@@ -127,30 +160,72 @@ func (r *seqRun) advance(s0, minSeq uint64) {
 // had already started, and visible if it had not. That is the guarantee Scan
 // already makes, which is likewise per shard.
 //
+// It reads the way a query does, only in a different order: a segment index
+// that can serve the constraint narrows each segment to its candidates, the
+// columns are asked before a record is rebuilt, and a projection the columns
+// can serve is built from them (refVisitor). None of that changes which records
+// match or the order they come in -- the candidates of a segment are a subset of
+// its records in their arena order -- so the pages are the ones the whole walk
+// gives. More may differ: it is set when the page is full and another CANDIDATE
+// follows, which is a record the walk would have reached too, so it still never
+// reports false while a match remains.
+//
 // limit <= 0 means no limit, in which case More is always false.
 func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after SeqCursor, limit int) (iter.Seq[RawAd], *SeqPage) {
 	page := &SeqPage{Next: after}
 
 	return func(yield func(RawAd) bool) {
-		// The paged walk reaches records through its own cursor rather than the
-		// shard scan, so it uses only the plan's match state -- but it takes the
-		// whole plan from the one constructor regardless, so there is no second
-		// place in the package that decides what evaluating a query requires.
-		var qp queryPlan
+		// Built by the one constructor, so this read takes the same match state,
+		// read demand, CurrentTime fold and index plan as any other query.
+		//
+		// The projection plan lets a record the columns decided be built from the
+		// named columns rather than reassembled. Safe here because this emit only
+		// SHIPS the projected entries (chaseRefs is off): see colproject.go for the
+		// consumers that evaluate and so must not narrow.
+		//
+		// It also names MyType and TargetType, which the raw projector lifts into
+		// the RawAd from whatever ad it is handed, projected or not: an ad built
+		// from columns without them would come back typeless.
+		var proj *projPlan
+		if len(projection) > 0 {
+			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
+		}
+		var (
+			qp     queryPlan
+			usable []usableProbe
+		)
 		if q != nil {
-			qp = c.newQueryPlan(q, nil, nil)
+			qp = c.newQueryPlan(q, proj, nil)
+			usable = c.planQuery(qp)
 		} else {
 			s := &wireScope{ctx: c}
-			qp.ws, qp.resolver = s, s.resolve
+			qp.ws, qp.resolver, qp.proj = s, s.resolve, proj
 		}
-		ws := qp.ws
 		// Same in-walk projection as QueryRawProjected: an empty projection
 		// means the whole ad, so a caller asking for four attributes does not
 		// pay to render the rest.
-		emit := c.yieldRawProjected(yield, c.newRawProjector(projection, false, false))
+		render := c.yieldRawProjected(yield, c.newRawProjector(projection, false, false))
 
-		var dbuf []byte
+		if unsatisfiable(usable) {
+			// The constraint's indexed conjuncts contradict each other: nothing
+			// anywhere can match, so no shard is worth opening.
+			page.Next = SeqCursor{Shard: uint32(len(c.shards))}
+			return
+		}
+
 		emitted := 0
+		// The record being visited: the emit below stamps it into the cursor when
+		// the visitor finds that it matches, so only a match pays for the key copy.
+		var (
+			atShard     uint32
+			atS0, atSeq uint64
+			atKey       []byte
+		)
+		emit := func(w []byte, dict *segDictHandle) bool {
+			page.Next = SeqCursor{Shard: atShard, Snapshot: atS0, Seq: atSeq, Key: string(atKey)}
+			emitted++
+			return render(w, dict)
+		}
 
 		for si := int(after.Shard); si < len(c.shards); si++ {
 			sh := c.shards[si]
@@ -169,7 +244,9 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 			}
 			s0 := cursor.Snapshot
 
-			runs, release := shardRuns(sh, s0, cursor)
+			runs, release := c.shardRuns(sh, s0, cursor, qp, usable)
+			visit, stopped := c.refVisitor(s0, qp, emit)
+			ckey := []byte(cursor.Key)
 			done := func() bool {
 				defer release()
 				var group []groupRec
@@ -183,35 +260,16 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 						// Within the cursor's own commit, skip what the last
 						// page already emitted. Elsewhere the whole group is
 						// new.
-						if gseq == cursor.Seq && cursor.Key != "" && bytes.Compare(g.key, []byte(cursor.Key)) <= 0 {
+						if gseq == cursor.Seq && cursor.Key != "" && bytes.Compare(g.key, ckey) <= 0 {
 							continue
 						}
 						if limit > 0 && emitted == limit {
 							page.More = true
 							return true
 						}
-						if isSystemKeyBytes(g.key) {
-							continue // internal system record, hidden as in Scan
-						}
-						// The record's full ad — for a columnarized segment,
-						// its own bytes spliced with the columnar payload.
-						w, err := c.wire(g.ref, dbuf)
-						if err != nil {
-							continue // undecodable record: skip, do not abort
-						}
-						dbuf = w
-						ws.dict = g.ref.dict
-						if q != nil && !matchWire(w, qp) {
-							continue
-						}
-						page.Next = SeqCursor{
-							Shard:    uint32(si),
-							Snapshot: s0,
-							Seq:      gseq,
-							Key:      string(g.key),
-						}
-						emitted++
-						if !emit(w, g.ref.dict) {
+						// System records are hidden by the visitor, as in Scan.
+						atShard, atS0, atSeq, atKey = uint32(si), s0, gseq, g.key
+						if !visit(g.ref) || stopped() {
 							return true // the consumer stopped
 						}
 					}
@@ -264,23 +322,62 @@ func nextGroup(runs []*seqRun, s0, minSeq uint64, buf []groupRec) []groupRec {
 
 // shardRuns opens one run per segment of sh holding records visible at s0 above
 // the cursor, and returns a release for their pins.
-func shardRuns(sh *shard, s0 uint64, after SeqCursor) ([]*seqRun, func()) {
-	var runs []*seqRun
-	for _, w := range sh.snapshotAt(s0) {
-		// A segment whose newest record predates the cursor holds nothing this
-		// page can want. maxSeq is 0 on a segment whose records were not walked
-		// (fast reopen), which is never skipped, as with minSeq.
-		if w.seg != nil && w.seg.maxSeq != 0 && w.seg.maxSeq < after.Seq {
-			releaseWindows([]segWindow{w})
-			continue
+//
+// Sealed segments the query's zone maps rule out are dropped whole
+// (zoneExcludes), and with usable index probes a segment whose index covers
+// them is narrowed to its candidates (windowIndex, prefixCandidates) -- the
+// decisions the query paths make (scanShardIndexed, scanWindows). Neither
+// touches the cursor: a dropped segment or record holds no match, so the pages
+// are the same, and its order within a segment is the arena's.
+//
+// A zone map summarizes each record's own bytes, which for a delta record lack
+// what it inherits -- but only an append-only collection keeps zone maps, and
+// it writes no delta records, so the two never meet.
+func (c *Collection) shardRuns(sh *shard, s0 uint64, after SeqCursor, qp queryPlan, usable []usableProbe) ([]*seqRun, func()) {
+	// Each segment's newest sequence, read under the lock that guards it: the
+	// active segment's moves with every write.
+	sh.mu.RLock()
+	wins := sh.buildWindowsLocked(s0)
+	maxSeqs := make([]uint64, len(wins))
+	for i, w := range wins {
+		maxSeqs[i] = w.seg.maxSeq
+	}
+	sh.mu.RUnlock()
+	release := func() { releaseWindows(wins) }
+
+	// A segment whose newest record predates the cursor holds nothing this page
+	// can want. maxSeq is 0 on a segment whose records were not walked (fast
+	// reopen), which is never skipped, as with minSeq.
+	walk := make([]segWindow, 0, len(wins))
+	for i, w := range wins {
+		if ms := maxSeqs[i]; ms == 0 || ms >= after.Seq {
+			walk = append(walk, w)
 		}
+	}
+	ct := qp.prunesCT()
+	if len(qp.probes) > 0 && c.hasZones.Load() {
+		kept := walk[:0]
+		for _, w := range walk {
+			if !c.zoneExcludes(w, qp.probes, ct) {
+				kept = append(kept, w)
+			}
+		}
+		walk = kept
+	}
+	ds := c.newDeltaScope(sh, s0, walk, usable, ct)
+	runs := make([]*seqRun, 0, len(walk))
+	for _, w := range walk {
 		run := &seqRun{w: w, dict: w.dict()}
+		if len(usable) > 0 {
+			if ix := windowIndex(w, usable, ct); ix != nil {
+				if cand := prefixCandidates(w, ix, usable, ds, nil); cand != nil {
+					run.cand = cand.Iterator()
+				}
+				run.off = ix.coveredUpto()
+			}
+		}
 		run.advance(s0, after.Seq)
 		runs = append(runs, run)
 	}
-	return runs, func() {
-		for _, r := range runs {
-			releaseWindows([]segWindow{r.w})
-		}
-	}
+	return runs, release
 }
