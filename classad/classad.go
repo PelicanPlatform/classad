@@ -1799,6 +1799,13 @@ func exprEqual(a, b ast.Expr) bool {
 			break
 		}
 	}
+	// So is the spelling of a negative number: the reference engine folds a unary minus on a
+	// numeric literal into a signed literal at parse time, and this package's old-ClassAd
+	// serializer prints both forms identically, so two ads that differ only there are the same
+	// ad. The forms meet in practice because a stored ad comes back folded while a freshly
+	// parsed one is not -- comparing them structurally would otherwise report every ad holding
+	// a negative number as changed, forever.
+	a, b = signedLiteral(a), signedLiteral(b)
 
 	switch av := a.(type) {
 	case *ast.IntegerLiteral:
@@ -2125,4 +2132,21 @@ func (c *ClassAd) parseExpression(exprStr string) (ast.Expr, error) {
 		return nil, fmt.Errorf("failed to parse expression %q: %w", exprStr, err)
 	}
 	return expr, nil
+}
+
+// signedLiteral collapses `-<numeric literal>` to the signed literal it denotes, leaving every
+// other expression alone. Negating the int64 minimum wraps to itself, which is what evaluating
+// the unary minus gives too.
+func signedLiteral(e ast.Expr) ast.Expr {
+	u, ok := e.(*ast.UnaryOp)
+	if !ok || u.Op != "-" {
+		return e
+	}
+	switch v := u.Expr.(type) {
+	case *ast.IntegerLiteral:
+		return &ast.IntegerLiteral{Value: -v.Value}
+	case *ast.RealLiteral:
+		return &ast.RealLiteral{Value: -v.Value}
+	}
+	return e
 }

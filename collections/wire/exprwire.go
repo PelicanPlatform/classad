@@ -282,18 +282,27 @@ func (p *exprParser) parsePrefix() error {
 	case '[':
 		return p.parseRecord()
 	case '-', '+', '!', '~':
+		mark := p.em.Mark()
 		p.advance()
 		p.em.UnOp(string(rune(k)))
-		return p.parseExpr(bpUnary)
+		if err := p.parseExpr(bpUnary); err != nil {
+			return err
+		}
+		p.em.FoldNegate(mark)
 	case parser.NEG:
 		// A '-' that is part of a number literal: the two are one primary, a
-		// unary minus on the literal, as the reference parser builds it.
+		// unary minus on the literal, as the reference parser builds it -- and, like
+		// the reference encoder, folded into the signed literal it denotes.
+		mark := p.em.Mark()
 		p.advance()
 		if k := p.cur.Kind; k != parser.INTEGER_LITERAL && k != parser.REAL_LITERAL {
 			return ErrUnsupported // INT64_MIN_MAGNITUDE: the reference folds it
 		}
 		p.em.UnOp("-")
-		return p.parsePrefix()
+		if err := p.parsePrefix(); err != nil {
+			return err
+		}
+		p.em.FoldNegate(mark)
 	default:
 		return ErrUnsupported
 	}

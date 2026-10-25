@@ -72,10 +72,15 @@ func TestArchiveZoneCheckAfterRuntimeIndex(t *testing.T) {
 	}
 }
 
-// The same check over records whose zone attribute is not a literal: an expression (evaluating far
-// past every literal), and a negative constant (stored as unary minus). Segment zones once skipped
+// The same check over records whose zone attribute is not a literal: an expression evaluating far
+// past every literal, and a negative value only evaluation can give. Segment zones once skipped
 // both, so the segments holding them were pruned for any range they fell in but the literals did
 // not -- here every one, since both sit in the oldest, sealed segment.
+//
+// The negative one is written as arithmetic on purpose. It used to be the constant `-5`, which was
+// an expression only because old-ClassAd text had no negative literal and the encoder left the
+// unary minus in place; now that the encoder folds it, `-5` is a literal and the record stopped
+// testing the non-literal path without the test noticing.
 func TestArchiveZoneCheckExpressionValued(t *testing.T) {
 	dir := t.TempDir()
 	cat, err := OpenCatalog(dir)
@@ -94,7 +99,7 @@ func TestArchiveZoneCheckExpressionValued(t *testing.T) {
 		case 3:
 			cd = "1700000000 + 100000"
 		case 5:
-			cd = "-5"
+			cd = "0 - 5" // -5, as a value no zone can read without evaluating
 		}
 		if aerr := a.AppendOld(fmt.Sprintf("ID = %d\nOwner = \"u%d\"\nCompletionDate = %s\n"+
 			"Pad = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx%d\"", i, i%3, cd, i)); aerr != nil {
