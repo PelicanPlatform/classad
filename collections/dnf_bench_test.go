@@ -267,3 +267,43 @@ func BenchmarkMatchChainOrder(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkDNFSealedSidecar: a top-level OR on a persistent table whose sealed segments are indexed
+// by their mapped sidecars, so the union of the disjuncts' postings is read from the sidecar rather
+// than every sealed record being walked.
+func BenchmarkDNFSealedSidecar(b *testing.B) {
+	if !mmapSupported {
+		b.Skip("persistence is unix-only")
+	}
+	const n = 50_000
+	c, err := Open(Options{Dir: b.TempDir(), Shards: 4, SegmentSize: 1 << 20,
+		ValueAttrs: []string{"ClusterId", "QDate"}, CategoricalAttrs: []string{"Owner"}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+	for i := 0; i < n; i++ {
+		ad := jobAd(i, map[string]int64{"QDate": int64(1_000_000 + i)})
+		ad.InsertAttrString("Owner", fmt.Sprintf("user%d", i%500))
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			b.Fatal(err)
+		}
+	}
+	c.Reindex()
+	for _, tc := range []struct{ name, expr string }{
+		{"eq-or-eq", `ClusterId == 4242 || Owner == "user7"`},
+		{"range-or-range", `ClusterId < 50 || QDate >= 1049950`},
+	} {
+		q := mustQuery(b, tc.expr)
+		rows := 0
+		for range c.Query(q) {
+			rows++
+		}
+		b.Run(fmt.Sprintf("%s/rows=%d", tc.name, rows), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				for range c.Query(q) {
+				}
+			}
+		})
+	}
+}
