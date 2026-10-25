@@ -54,6 +54,10 @@ func (c *Collection) QueryRawProjected(q *vm.Query, projection []string, chaseRe
 func (c *Collection) QueryRawProjectedStats(q *vm.Query, projection []string, chaseRefs, redact bool, stats *ScanStats) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
 		p := c.newRawProjector(projection, chaseRefs, redact)
+		// No projection plan, for the second of the two reasons given in QueryProjectStats: under
+		// chaseRefs this emit resolves each emitted expression's references AGAINST THE SAME AD,
+		// so an ad narrowed to the projection would resolve exactly the references the narrowing
+		// removed. The narrowing has to stay inside this projector, which sees the whole record.
 		c.scanQuery(c.newQueryPlan(q, nil, stats), c.yieldRawProjected(yield, p))
 	}
 }
