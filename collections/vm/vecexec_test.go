@@ -92,6 +92,14 @@ func sameValue(a, b classad.Value) bool {
 		x, _ := a.BoolValue()
 		y, _ := b.BoolValue()
 		return x == y
+	case classad.StringValue:
+		// BYTE equality, deliberately, even though every comparison OPERATOR folds case. The question
+		// here is whether the executor produced the same value the reference produced, and "user3" is
+		// not the same value as "USER3" -- a kernel that resolved a dictionary code to the wrong entry
+		// of a fold-equal run would otherwise pass.
+		x, _ := a.StringValue()
+		y, _ := b.StringValue()
+		return x == y
 	}
 	return true // undefined / error carry no payload
 }
@@ -113,6 +121,9 @@ func vecCorpus() *testSource {
 		{"A": "error", "B": "1"},
 		{"A": "1152921504606846976", "B": "1152921504606846976"}, // 2^60: beyond float64 exactness
 		{"A": "1.5", "B": "0"},                                   // real division by zero
+		{"A": "0.0", "B": "-0.0"},                                // identity on signed zero: same value, different bits
+		{"A": "-0.0", "B": "0"},                                  // ... and a real against an integer zero
+		{"A": "true", "B": "1"},                                  // a boolean against the integer it is not
 	})
 }
 
@@ -134,8 +145,13 @@ var vecExprs = []string{
 	"F && 1 / 0", // a FALSE that must dominate an ERROR the vector executor computed anyway
 	// unary
 	"-A > 0", "-A", "-(A + B)",
-	// identity operators, hook-routed
+	// identity: total, type-sensitive, case-sensitive, and spelled both ways
 	"A =?= B", "A =!= B", "A =?= undefined", "A =!= undefined",
+	"A is B", "A isnt B", "A is undefined", "A isnt error",
+	"A =?= 1", "A =?= 1.0", "A =?= true", "A =?= 0", "A =?= -0.0",
+	"F =?= true", "F =?= 1", "F =!= true",
+	`S =?= S`, "A =?= A", "B =?= B", "A =?= error",
+	`A =?= "10"`, `S =?= 10`,
 	// mixed nesting
 	"(A + B) * 2 > A", "(A > B) == (B < A)", "A > 4 && (B == 3 || B == 4)",
 	// constants
@@ -149,6 +165,8 @@ var vecExprs = []string{
 	`S == A`,    // string against a number: the hook's problem
 	`S < A`,     // likewise, ordered
 	`S && true`, // a string as a logical operand
+	// string-VALUED results, so the payload itself is compared and not just the type
+	`S`, `S + 1`, `-S`,
 }
 
 // TestVecMatchesScalarPerRecord is the executor's core test: same Program, per-record equality.
@@ -316,6 +334,74 @@ func TestVecBatchInvariantToSize(t *testing.T) {
 		for i := range want {
 			if got[i] != want[i] {
 				t.Errorf("batch=%d record %d: %s != %s", batch, i, got[i], want[i])
+			}
+		}
+	}
+}
+
+// TestVecIdentityOpStrings pins the operator strings the identity kernel is keyed on against what the
+// COMPILER actually emits.
+//
+// `=?=` and `is` are one operator and the parser normalizes both to "is", so a kernel written for the
+// source spelling is unreachable -- which is what had happened: every identity comparison went to the
+// hook, and identicalVec, dictionary-code handling and all, had never run. A parity test cannot see
+// that (the hook is correct, just slower), so the reachability is asserted directly.
+func TestVecIdentityOpStrings(t *testing.T) {
+	for _, expr := range []string{"A =?= B", "A is B", "A =!= B", "A isnt B"} {
+		q, err := Parse(expr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(q.prog.ops) != 1 {
+			t.Fatalf("%q compiled to ops %q, want exactly one", expr, q.prog.ops)
+		}
+		if op := q.prog.ops[0]; op != opIs && op != opIsnt {
+			t.Errorf("%q compiles to operator %q, which binopVec routes to the hook rather than to "+
+				"identicalVec", expr, op)
+		}
+	}
+}
+
+// identityStates is one record per VALUE, so a pair of them is one cell of the identity truth table.
+var identityStates = []string{
+	"0", "1", "-1", "0.0", "-0.0", "1.0", "true", "false", `"a"`, `"A"`, `""`, "undefined", "error",
+}
+
+// TestVecIdentityExhaustive runs every ordered pair of those values through `is` and `isnt`, against the
+// scalar interpreter.
+//
+// Exhaustive rather than sampled, in the style of the short-circuit test, because identity's rules are
+// about the pairs a corpus does not naturally contain: a real against the integer that equals it, two
+// strings differing only in case, signed zero, and UNDEFINED against UNDEFINED -- where identity is TRUE
+// while every other operator is UNDEFINED.
+func TestVecIdentityExhaustive(t *testing.T) {
+	var recs []map[string]string
+	for _, l := range identityStates {
+		for _, r := range identityStates {
+			recs = append(recs, map[string]string{"L": l, "R": r})
+		}
+	}
+	src := newTestSource(recs)
+	exprs := []string{"L is R", "L isnt R", "L =?= R", "L =!= R"}
+	// ... and against a LITERAL on each side, which is a separate kernel: the literal is read once
+	// instead of being spread across the batch, so it has its own type and payload comparison to get
+	// wrong, and `undefined is undefined` is true while every ordering operator on it is undefined.
+	for _, lit := range identityStates {
+		exprs = append(exprs, "L is "+lit, "L isnt "+lit, lit+" is L", lit+" isnt L")
+	}
+	for _, expr := range exprs {
+		q, err := Parse(expr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := q.VecEval(src, len(recs), nil)
+		if !ok {
+			t.Fatalf("%q declined", expr)
+		}
+		for i := range recs {
+			if want := q.Eval(src.ad(i)); !sameValue(got.value(i), want) {
+				t.Errorf("%q with L=%s R=%s: vector %s != scalar %s",
+					expr, recs[i]["L"], recs[i]["R"], got.value(i), want)
 			}
 		}
 	}
