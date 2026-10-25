@@ -281,7 +281,7 @@ func (c *Client) ArchiveAggregateStats(ctx context.Context, name, constraint str
 // selects which "unsupported" error an old server's refusal maps to; stats (may be nil) receives a
 // ScanStats trailer if the server sends one (opArchiveAggregateStats).
 func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte, nGroup, nAgg int, filtered bool, stats *collections.ScanStats) ([]AggRow, error) {
-	_, frames, err := c.callStream(build)
+	_, frames, strm, err := c.callStream(build)
 	if err != nil {
 		return nil, err
 	}
@@ -293,7 +293,7 @@ func (c *Client) archiveAggregate(ctx context.Context, build func(uint64) []byte
 			return out, ctx.Err()
 		case frame, ok := <-frames:
 			if !ok {
-				return out, nil
+				return out, c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {

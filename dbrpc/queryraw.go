@@ -486,7 +486,7 @@ func (c *Client) QueryRawWireStream(ctx context.Context, table, constraint strin
 		}
 		return b
 	}
-	_, ch, err := c.callStream(build)
+	_, ch, strm, err := c.callStream(build)
 	if err != nil {
 		return err
 	}
@@ -497,7 +497,7 @@ func (c *Client) QueryRawWireStream(ctx context.Context, table, constraint strin
 			return ctx.Err()
 		case frame, ok := <-ch:
 			if !ok {
-				return nil // stStreamEnd
+				return c.streamEnd(strm)
 			}
 			_, status, body, ok := respHeader(frame)
 			if !ok {
