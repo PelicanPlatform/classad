@@ -943,6 +943,9 @@ func valueToLiteral(v classad.Value) ast.Expr {
 // out across shards when the worker budget allows. Each candidate is fully matched
 // with MatchClassAd (plus the wire-native reject), so the index only narrows which
 // slots are visited -- correctness is unchanged from a full scan.
+//
+// No zone pruning: only an append-only collection keeps zone maps, and a matchmaking
+// collection of slots is mutable.
 func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe, jp *jobPlan, deferMat bool) []rankedMatch {
 	shards := c.shards
 
@@ -964,7 +967,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 		mw := newMatchWorker(job, c, jp, deferMat)
 		var out []rankedMatch
 		for _, sh := range shards {
-			c.scanShardCandidatesGroups(sh, groups, false, false, func(w []byte, dict *segDictHandle, _ bool) bool {
+			c.scanShardCandidatesGroups(sh, groups, false, false, nil, nil, func(w []byte, dict *segDictHandle, _ bool) bool {
 				c.matchCandidate(c.wireToInline(dict, w), mw, &out)
 				return true
 			})
@@ -992,7 +995,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 				if idx >= len(shards) {
 					break
 				}
-				c.scanShardCandidatesGroups(shards[idx], groups, false, false, func(w []byte, dict *segDictHandle, _ bool) bool {
+				c.scanShardCandidatesGroups(shards[idx], groups, false, false, nil, nil, func(w []byte, dict *segDictHandle, _ bool) bool {
 					c.matchCandidate(c.wireToInline(dict, w), mw, &local)
 					return true
 				})
