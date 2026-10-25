@@ -148,6 +148,41 @@ func intFits(v int64, w int, unsigned bool) bool {
 	return true
 }
 
+// realEscapes reports whether a real value must be kept OUT of its fixed slot and carried in the
+// cold tail instead, like any other exceptional value. Only NaN qualifies.
+//
+// A NaN is a number by KIND and a member of no order. Every kind-based guard in the columnar layer
+// -- numericKind, akReal, "is this a numeric column" -- answers yes for it, so a NaN sitting in a
+// real slot reaches every accelerator built on ORDERING while satisfying none of ordering's
+// assumptions: it is neither less than, equal to nor greater than anything, including itself. Each
+// consumer that met one got it wrong independently (the min/max seeds came back instead of NaN; a
+// block's [min,max] was summarized as if the NaN were not there, so the zone claimed a range the
+// NaN provably sits outside of while still reporting itself EXACT). The pattern is the giveaway:
+// the defect is not in any one consumer but in letting a non-ordered value occupy an ordered column.
+//
+// What escaping buys, precisely. The slot is the one place a value is read with NO classification
+// at all -- a summarizer or a comparison kernel loads the raw bytes, compares, and keeps whatever
+// wins, which is exactly the step a NaN loses silently. Escaping moves it behind the escape bit, so
+// a reader either asks what the cell holds (escapedNumCell hands back the literal, NaN included, and
+// the reader decides) or treats the field as inexact (numericZones marks the block escaped, so no
+// range test can prune it away). It does not make the NaN disappear downstream and is no substitute
+// for a consumer handling one; it removes the way a consumer gets it wrong WITHOUT EVER BEING ASKED,
+// which is what a per-consumer "contains NaN" flag can never do for the consumer nobody has written
+// yet.
+//
+// +/-Inf deliberately does NOT escape. It is a well-behaved member of the extended reals: it orders
+// against every other value, and it is the identity min()/max() seed from, so a column that
+// legitimately holds infinities accumulates to the right extreme with no special handling. The one
+// place an infinity is still wrong is int64(math.Floor(f/w))*w, the bucket key, where a non-finite
+// float makes the int64 conversion implementation-defined (+Inf measures to a NEGATIVE bucket). A
+// bucket key is derived from the VALUE, so moving the value to the cold tail does not change it --
+// the fix belongs in that derivation, where the finiteness is what actually matters. Escaping would
+// only cost the column its acceleration without correcting the bucket at all.
+//
+// kind is passed so the call reads as one clause of the escape condition; a non-real field never
+// escapes on this ground.
+func realEscapes(kind adKind, v float64) bool { return kind == akReal && math.IsNaN(v) }
+
 // chooseIntWidth picks the smallest (width, signedness) covering >= fit of the sampled values;
 // the rest become per-record exceptions. Unsigned is used when every sample is non-negative.
 func chooseIntWidth(vals []int64, fit float64) (int, bool) {
@@ -398,7 +433,7 @@ func (s *adSchema) encodeExceptLocal(w wire.Ad, skip map[uint32]struct{}, toLoca
 		}
 		f := &s.fields[idx]
 		k, lit := nodeKind(node)
-		if k != f.kind || (f.kind == akInt && !intFits(lit.Int, f.width, f.unsigned)) {
+		if k != f.kind || (f.kind == akInt && !intFits(lit.Int, f.width, f.unsigned)) || realEscapes(f.kind, lit.Real) {
 			cold = appendColdEntry(cold, id, node, toLocal) // escaped -> cold tail
 			return true                                     // filled stays false
 		}
