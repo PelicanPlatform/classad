@@ -38,7 +38,27 @@ type scanTask struct {
 // gatherTasks snapshots every shard once and flattens their live segment windows into
 // a task list (with the total live bytes). release unpins every window; the caller
 // must invoke it only after all workers have finished reading.
+//
+// It is the unfiltered form, for the scans that carry no query (the wire-row relay
+// scan) or no queryPlan at all (matchmaking). A filtered scan uses gatherTasksPruned.
 func (c *Collection) gatherTasks() (tasks []scanTask, totalBytes int, release func()) {
+	return c.gatherTasksPruned(queryPlan{})
+}
+
+// gatherTasksPruned is gatherTasks with qp's sealed-segment zone maps applied to each
+// shard's windows, so a parallel full scan skips exactly the segments the serial path
+// (scanWindows) skips. Without this a zoned collection full-scanned in parallel while
+// the serial path over the same snapshot proved whole sealed segments impossible --
+// fan-out silently bought back the work zone maps had already removed.
+//
+// A pruned window is still PINNED and still released: the narrowing decides what is
+// walked, never what was snapshotted. totalBytes counts only the windows that will be
+// walked, because it exists to size the fan-out against the work actually left.
+//
+// The pruning runs here, on the calling goroutine, which is also why qp keeps its stats
+// sink: the per-worker plans drop it (workerPlan), but the segment counts are settled
+// before any worker starts.
+func (c *Collection) gatherTasksPruned(qp queryPlan) (tasks []scanTask, totalBytes int, release func()) {
 	var pinned [][]segWindow
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
@@ -46,9 +66,10 @@ func (c *Collection) gatherTasks() (tasks []scanTask, totalBytes int, release fu
 			continue
 		}
 		pinned = append(pinned, wins)
-		for i := range wins {
-			tasks = append(tasks, scanTask{win: wins[i], s0: s0})
-			totalBytes += wins[i].used
+		walk := c.zoneWalk(wins, qp)
+		for i := range walk {
+			tasks = append(tasks, scanTask{win: walk[i], s0: s0})
+			totalBytes += walk[i].used
 		}
 	}
 	return tasks, totalBytes, func() {
@@ -111,7 +132,7 @@ func tryAcquire(sem chan struct{}, n int) int {
 // threaded because this path decodes ads ITSELF rather than through the caller's emit -- which is exactly
 // how a redacted Query kept returning opened secrets while every emit-based path was fixed.
 func (c *Collection) runParallelQuery(qp queryPlan, yield func(*classad.ClassAd) bool, redact bool) {
-	tasks, totalBytes, release := c.gatherTasks()
+	tasks, totalBytes, release := c.gatherTasksPruned(qp)
 	defer release()
 
 	W := 0
