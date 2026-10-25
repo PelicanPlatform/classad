@@ -30,11 +30,16 @@ import (
 // file is left either unparseable or holding an older configuration, and nothing reports
 // it. The next open quietly reverts to the creation-time index set.
 //
-// Deriving the whole config from live state at save time, which the mutable table does and
-// the archive cannot, does not substitute for the lock. It makes the CONTENT self-healing
-// -- any save that runs after the last change sees all of them -- and leaves the temp file
-// exactly as exposed. Both properties are wanted; this type supplies the second so each
-// table is free to choose the first.
+// Deriving the config from live state at save time, which both tables do for the fields
+// the storage layer owns, does not substitute for the lock and is not outside it. Read the
+// live state before taking the lock and two savers can interleave into a lost update: each
+// snapshots, the second writes, then the FIRST writes its older snapshot over the top, and
+// the index one of them just built is absent from the file with nothing to say so. So the
+// read goes inside -- fn is where a caller reads the storage layer, not before the call.
+//
+// That nests the storage layer's own lock inside this one. It is safe in the one direction
+// used here, because the storage layer never calls back into a config file; a caller that
+// changes that has to revisit it.
 //
 // What it owns, and what it deliberately does not:
 //
@@ -92,7 +97,8 @@ func (f *configFile[T]) with(fn func(cfg *T)) {
 }
 
 // update applies fn to the held configuration and writes the result, as one step under the
-// lock. fn should do no I/O and take no other lock.
+// lock. fn is where a caller folds live state in, so that the read and the write cannot be
+// split by another saver; it should do no file I/O and must not call back into this store.
 func (f *configFile[T]) update(fn func(cfg *T)) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

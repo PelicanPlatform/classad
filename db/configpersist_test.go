@@ -2,9 +2,12 @@ package db
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -168,6 +171,241 @@ func TestDBReopensCommittedConfig(t *testing.T) {
 	maxD, ckpt, on := d.TimeTravel()
 	if !on || maxD != 600*time.Second || ckpt != 60*time.Second {
 		t.Errorf("TimeTravel = (%v, %v, %v), want (10m, 1m, true)", maxD, ckpt, on)
+	}
+}
+
+// TestIndexConfigConcurrentPersist is the mutable-table counterpart of
+// TestArchiveConfigConcurrentPersist: several runtime changes persisting at once, each
+// rewriting indexcfg.json through the same temp path and each re-deriving the whole file
+// from the collection.
+//
+// The mutable table shares no config struct between its savers, so -race has nothing to
+// report here and the collision looked like it could not happen. Two ways it can, both
+// measured against the writers this replaced:
+//
+//   - The shared temp path. Unserialized, 7 of 20 runs left indexcfg.json unparseable or
+//     carrying none of the index set.
+//   - A lost update. With the file write serialized but the derive outside the lock, two
+//     savers snapshot the collection and write in the opposite order, so the older
+//     snapshot lands last and the index the other one just built is simply absent.
+//
+// Neither leaves a trace: the next open reverts to the creation-time configuration and
+// the indexes are rebuilt from scratch, or not at all.
+//
+// This is the end-to-end form and it finds the collision readily (7 of 20 single rounds).
+// It finds the lost update only sometimes, so TestIndexConfigSaveDerivesUnderTheLock
+// pins that one down without depending on an interleaving.
+func TestIndexConfigConcurrentPersist(t *testing.T) {
+	// Each round races one saver per attribute, then checks the file holds all of them.
+	attrs := []string{"Owner", "Universe", "AccountingGroup", "Cmd", "RemoteHost", "GlobalJobId"}
+	for round := 0; round < 12; round++ {
+		dir := t.TempDir()
+		d, err := OpenConfig(Config{Dir: dir})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 10; i++ {
+			if perr := d.Put(fmt.Sprintf("k%d", i), mustAd(t, fmt.Sprintf("ClusterId = %d\nOwner = \"u\"\nRequestMemory = %d", i, i))); perr != nil {
+				t.Fatal(perr)
+			}
+		}
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		run := func(fn func()) {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				fn()
+			}()
+		}
+		for _, a := range attrs {
+			run(func() { d.AddIndex([]string{a}, nil) })
+		}
+		run(func() { d.AddIndex(nil, []string{"RequestMemory"}) })
+		run(func() { d.AddHotAttrs("Owner") })
+		run(func() { d.SetTimeTravel(10*time.Minute, time.Minute) })
+		run(func() {
+			if _, rerr := d.AddSchemaRequireAttrs("ImageSize"); rerr != nil {
+				t.Errorf("AddSchemaRequireAttrs: %v", rerr)
+			}
+		})
+		close(start)
+		wg.Wait()
+		if cerr := d.Close(); cerr != nil {
+			t.Fatal(cerr)
+		}
+
+		raw, rerr := os.ReadFile(filepath.Join(dir, indexConfigFile))
+		if rerr != nil {
+			t.Fatalf("round %d: reading the config the storm left behind: %v", round, rerr)
+		}
+		var saved persistedIndexConfig
+		if uerr := json.Unmarshal(raw, &saved); uerr != nil {
+			t.Fatalf("round %d: config left unparseable by concurrent writers: %v\n%s", round, uerr, raw)
+		}
+
+		for _, a := range attrs {
+			if !containsFold(saved.Categorical, a) {
+				t.Errorf("round %d: categorical index on %s missing from the saved config: %v", round, a, saved.Categorical)
+			}
+		}
+		if !containsFold(saved.Value, "RequestMemory") {
+			t.Errorf("round %d: value index on RequestMemory missing from the saved config: %v", round, saved.Value)
+		}
+		if !containsFold(saved.Hot, "Owner") {
+			t.Errorf("round %d: hot attrs missing from the saved config: %v", round, saved.Hot)
+		}
+		if !containsFold(saved.SchemaRequire, "ImageSize") {
+			t.Errorf("round %d: required attrs missing from the saved config: %v", round, saved.SchemaRequire)
+		}
+		if !saved.TimeTravel {
+			t.Errorf("round %d: time-travel setting missing from the saved config", round)
+		}
+		if t.Failed() {
+			return
+		}
+
+		// Once, end to end: what the file says is what the table comes back with.
+		if round == 0 {
+			d2, oerr := OpenConfig(Config{Dir: dir})
+			if oerr != nil {
+				t.Fatal(oerr)
+			}
+			cats, vals := d2.IndexedAttrs()
+			for _, a := range attrs {
+				if !containsFold(cats, a) {
+					t.Errorf("categorical index on %s lost across reopen: %v", a, cats)
+				}
+			}
+			if !containsFold(vals, "RequestMemory") {
+				t.Errorf("value index on RequestMemory lost across reopen: %v", vals)
+			}
+			if !containsFold(d2.HotAttrs(), "Owner") {
+				t.Errorf("hot attrs lost across reopen: %v", d2.HotAttrs())
+			}
+			if !containsFold(d2.SchemaRequireAttrs(), "imagesize") {
+				t.Errorf("required attrs lost across reopen: %v", d2.SchemaRequireAttrs())
+			}
+			if _, _, on := d2.TimeTravel(); !on {
+				t.Error("time-travel setting lost across reopen")
+			}
+			d2.Close()
+		}
+	}
+}
+
+// TestIndexConfigSaveDerivesUnderTheLock pins the lost update down deterministically,
+// where the concurrent storm above finds it only by luck.
+//
+// A saver that reads the collection BEFORE taking the config lock writes a snapshot of a
+// configuration that has since moved on, so a change made while it waited is absent from
+// the file although it is live in the table -- and the next open reverts to what the file
+// says. Here the second change is made with the first saver provably still waiting, so
+// the two orderings give different files every time rather than occasionally.
+func TestIndexConfigSaveDerivesUnderTheLock(t *testing.T) {
+	dir := t.TempDir()
+	d, err := OpenConfig(Config{Dir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+
+	// Hold the config store's lock, so a save arriving now cannot reach the file.
+	release, holding := make(chan struct{}), make(chan struct{})
+	go d.cfg.with(func(*persistedIndexConfig) { close(holding); <-release })
+	<-holding
+
+	// A saver arrives. Its index goes live immediately; its write waits on the lock.
+	done := make(chan struct{})
+	go func() { defer close(done); d.AddIndex([]string{"Alpha"}, nil) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if cats, _ := d.IndexedAttrs(); containsFold(cats, "Alpha") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the saver never made Alpha live")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Alpha is live, so the saver is at or past the point where it would read the
+	// collection. Give it room to get there and block. Sleeping too little would let this
+	// test pass against the ordering it is here to reject, never fail against the right
+	// one, so the margin is generous and costs one fixed pause.
+	time.Sleep(100 * time.Millisecond)
+
+	// A second change lands while that saver is still waiting.
+	d.c.AddIndex([]string{"Beta"}, nil)
+
+	close(release)
+	<-done
+
+	// The saver wrote after Beta became live. Reading the collection under the lock, it
+	// wrote both; reading it beforehand, it wrote a snapshot that predates Beta.
+	cfg, _, ok := readConfigFile[persistedIndexConfig](dir, indexConfigFile)
+	if !ok {
+		t.Fatal("no config file written")
+	}
+	if !containsFold(cfg.Categorical, "Alpha") {
+		t.Errorf("saved categorical = %v, want Alpha", cfg.Categorical)
+	}
+	if !containsFold(cfg.Categorical, "Beta") {
+		t.Errorf("saved categorical = %v, want Beta -- it was live before the save wrote, "+
+			"so a save that read the collection before taking the lock dropped it", cfg.Categorical)
+	}
+}
+
+// TestArchiveIndexSaveDerivesUnderTheLock is the archive's half of the invariant above.
+// Its savers read the live index set, hot set and required set the same way, so the same
+// ordering drops the same kind of change -- and on an archive the dropped change is an
+// index whose backfill read the whole history to build.
+func TestArchiveIndexSaveDerivesUnderTheLock(t *testing.T) {
+	dir := t.TempDir()
+	a, err := openArchiveTable(dir, ArchiveConfig{IndexBackfillBytes: archiveTestHorizon})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	for i := 0; i < 20; i++ {
+		if aerr := a.AppendOld(fmt.Sprintf("ClusterId = %d\nOwner = \"u\"", i)); aerr != nil {
+			t.Fatal(aerr)
+		}
+	}
+
+	release, holding := make(chan struct{}), make(chan struct{})
+	go a.cfg.with(func(*ArchiveConfig) { close(holding); <-release })
+	<-holding
+
+	done := make(chan struct{})
+	go func() { defer close(done); a.AddIndex([]string{"Owner"}, nil) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if cats, _ := a.IndexedAttrs(); containsFold(cats, "Owner") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the saver never made Owner live")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(100 * time.Millisecond) // see the note in the mutable-table test
+
+	a.a.AddIndex(nil, []string{"ClusterId"})
+
+	close(release)
+	<-done
+
+	cfg, _, ok := readConfigFile[ArchiveConfig](dir, archiveConfigFile)
+	if !ok {
+		t.Fatal("no config file written")
+	}
+	if !containsFold(cfg.CategoricalAttrs, "Owner") {
+		t.Errorf("saved categorical = %v, want Owner", cfg.CategoricalAttrs)
+	}
+	if !containsFold(cfg.ValueAttrs, "ClusterId") {
+		t.Errorf("saved value = %v, want ClusterId -- it was live before the save wrote", cfg.ValueAttrs)
 	}
 }
 

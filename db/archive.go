@@ -837,11 +837,9 @@ func (t *ArchiveTable) DropIndex(names ...string) bool {
 // other kind, lands as categorical). Mirrors DB.saveIndexConfig, including its best-effort
 // contract: a write failure is ignored, leaving the change live for this run but unpersisted.
 func (t *ArchiveTable) saveIndexConfig() {
-	cats, vals := t.a.IndexedAttrs()
-	auto := t.a.AutoIndexNames()
 	_ = t.cfg.update(func(cfg *ArchiveConfig) {
-		cfg.CategoricalAttrs, cfg.ValueAttrs = cats, vals
-		cfg.AutoAttrs = auto
+		cfg.CategoricalAttrs, cfg.ValueAttrs = t.a.IndexedAttrs()
+		cfg.AutoAttrs = t.a.AutoIndexNames()
 	})
 }
 
@@ -965,8 +963,8 @@ func (t *ArchiveTable) AddHotAttrs(names ...string) []string {
 // demand-driven refresh put on top. Best-effort, like saveIndexConfig: a write failure
 // leaves the change live for this run but unpersisted.
 func (t *ArchiveTable) saveHotConfig() {
-	live := t.a.HotAttrNames()
 	_ = t.cfg.update(func(cfg *ArchiveConfig) {
+		live := t.a.HotAttrNames()
 		human := make(map[string]bool, len(cfg.HotAttrs))
 		for _, n := range cfg.HotAttrs {
 			human[strings.ToLower(n)] = true
@@ -1088,18 +1086,18 @@ func (t *ArchiveTable) DropSchemaRequireAttrs(names ...string) (bool, error) {
 // saveRequireConfig folds the archive's live required set back into the saved config, keeping the
 // two tiers apart, and rewrites archiveconfig.json.
 func (t *ArchiveTable) saveRequireConfig() error {
-	runtime := t.a.SchemaRequireRuntimeAttrs()
-	runtimeSet := make(map[string]bool, len(runtime))
-	for _, n := range runtime {
-		runtimeSet[n] = true
-	}
-	var configured []string
-	for _, n := range t.a.SchemaRequireAttrs() {
-		if !runtimeSet[n] {
-			configured = append(configured, n)
-		}
-	}
 	return t.cfg.update(func(cfg *ArchiveConfig) {
+		runtime := t.a.SchemaRequireRuntimeAttrs()
+		runtimeSet := make(map[string]bool, len(runtime))
+		for _, n := range runtime {
+			runtimeSet[n] = true
+		}
+		var configured []string
+		for _, n := range t.a.SchemaRequireAttrs() {
+			if !runtimeSet[n] {
+				configured = append(configured, n)
+			}
+		}
 		cfg.SchemaRequireAttrs = configured
 		cfg.SchemaRequireRuntime = runtime
 	})

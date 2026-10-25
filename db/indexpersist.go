@@ -72,18 +72,29 @@ func readPersistedTimeTravel(dir string) *collections.TimeTravelOptions {
 // accumulated in the held struct, because the collection is where this table tracks
 // index provenance (AutoIndexNames) and the runtime required tier. The archive tracks
 // its own provenance in the held struct instead; see ArchiveTable.
+//
+// The derive runs inside the store's critical section, so that two savers cannot each
+// snapshot the collection and then write in the opposite order -- which drops whichever
+// change the older snapshot had not seen.
 func (db *DB) saveIndexConfig() {
+	_ = db.cfg.update(func(cfg *persistedIndexConfig) { *cfg = db.deriveIndexConfig() })
+}
+
+// deriveIndexConfig reads the collection's current index set, hot set, encryption policy,
+// runtime required tier and time-travel setting into the persisted shape. Called with the
+// config store's lock held.
+func (db *DB) deriveIndexConfig() persistedIndexConfig {
 	cat, val := db.c.IndexedAttrs()
-	next := persistedIndexConfig{
+	cfg := persistedIndexConfig{
 		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(), Hot: db.c.HotAttrNames(),
 		Encrypted: db.c.EncryptedAttrNames(), SchemaRequire: db.c.SchemaRequireRuntimeAttrs(),
 	}
 	if o, on := db.c.TimeTravelConfig(); on {
-		next.TimeTravel = true
-		next.TimeTravelMaxSeconds = int(o.MaxDistance / time.Second)
-		next.TimeTravelCheckpointSeced = int(o.CheckpointInterval / time.Second)
+		cfg.TimeTravel = true
+		cfg.TimeTravelMaxSeconds = int(o.MaxDistance / time.Second)
+		cfg.TimeTravelCheckpointSeced = int(o.CheckpointInterval / time.Second)
 	}
-	_ = db.cfg.update(func(cfg *persistedIndexConfig) { *cfg = next })
+	return cfg
 }
 
 // loadIndexConfig reconciles the live index configuration to the persisted set
