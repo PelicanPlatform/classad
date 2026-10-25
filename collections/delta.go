@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -247,6 +248,15 @@ var (
 	sealWalkRecords atomic.Int64
 	sealWalkDeltas  atomic.Int64
 )
+
+// pendingSealRetired counts segments the seal-time walk found retired before it reached them, and
+// so did not walk. Internal: it exists so a test can tell the case was reached.
+var pendingSealRetired atomic.Int64
+
+// liveDeltaWalkHook, when set, is called with each segment the seal-time walk is about to read,
+// under the shard lock. A test hook: whether a walk read a segment that was already unmapped is
+// otherwise visible only as a fault, and only when the address was not reused.
+var liveDeltaWalkHook func(sh *shard, seg *segment)
 
 // segRecIsDelta classifies a record under whichever dispatch is selected. Only the seal-time
 // walk uses it: that walk visits every live record in a sealing segment, so it is where the
@@ -1274,12 +1284,27 @@ func (c *Collection) liveDeltaKeys(includeSealed bool) [][]byte {
 		// consumed here, by the collapse that is about to act on them.
 		sh.mu.Lock()
 		sh.sealedPending.Store(false)
-		segs := append([]*segment(nil), sh.pendingSeal...)
+		// A segment named here may since have been RETIRED -- columnarized, compacted, merged --
+		// and nothing removes it from pendingSeal when that happens. Its mapping is then gone,
+		// or reused by a newer segment, so walking it faults or reads another segment's bytes.
+		// The shard's live set is the authority, under this lock. The retired segment's records
+		// were carried to a sealed replacement this pass would not otherwise look at, so a
+		// retirement widens the walk to every sealed segment, as the pre-compaction pass does.
+		var segs []*segment
+		sealed := includeSealed
+		for _, seg := range sh.pendingSeal {
+			if slices.Contains(sh.segs, seg) {
+				segs = append(segs, seg)
+			} else {
+				pendingSealRetired.Add(1)
+				sealed = true
+			}
+		}
 		sh.pendingSeal = nil
 		if sh.act != nil {
 			segs = append(segs, sh.act)
 		}
-		if includeSealed {
+		if sealed {
 			// Every sealed segment, not just the ones this shard remembers pending. What is
 			// pending is in-memory and does not survive the process; a fragment stranded by a
 			// restart, or by a collapse that failed and was then forgotten, is only findable
@@ -1291,6 +1316,9 @@ func (c *Collection) liveDeltaKeys(includeSealed bool) [][]byte {
 			}
 		}
 		for _, seg := range segs {
+			if liveDeltaWalkHook != nil {
+				liveDeltaWalkHook(sh, seg)
+			}
 			for off := uint32(0); off < uint32(seg.used); {
 				if end, ok := seg.damaged().skip(off); ok {
 					off = end
