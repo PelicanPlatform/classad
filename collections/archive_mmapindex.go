@@ -182,11 +182,14 @@ func (si *mmapSegIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 			bm := si.allBitmap().Clone()
 			bm.AndNot(si.bitmapAt(postedOff))
 			return bm
-		case "is": // =?= exact (case-sensitive) via the exact-case run
+		case "is": // =?= exact (case-sensitive) via the exact-case run, plus the exceptions (see
+			// segIndex.probeOffsets)
+			bm := roaring.New()
 			if off, ok := si.catFindExact(attrOff, up.svals[0]); ok {
-				return si.bitmapAt(off)
+				bm.Or(si.bitmapAt(off))
 			}
-			return roaring.New()
+			bm.Or(si.bitmapAt(excOff))
+			return bm
 		case "isnt": // =!= exact: everything but the exact-case matches
 			bm := si.allBitmap().Clone()
 			if off, ok := si.catFindExact(attrOff, up.svals[0]); ok {

@@ -1336,10 +1336,15 @@ func (si *segIndex) probeOffsets(up usableProbe) *roaring.Bitmap {
 			bm.AndNot(cp.posted)
 			return bm
 		case "is": // =?= exact (case-sensitive)
+			// The exceptions too: an attribute holding an expression rather than a string literal
+			// (`strcat("al", "ice")`) is in exc, not in any exact bucket, and can still evaluate
+			// to the probe's value.
+			bm := roaring.New()
 			if e := cp.exactBitmap(up.svals[0]); e != nil {
-				return e.Clone()
+				bm.Or(e)
 			}
-			return roaring.New()
+			bm.Or(cp.exc)
+			return bm
 		case "isnt": // =!= exact: everything but the exact-case matches
 			bm := si.all.Clone()
 			if e := cp.exactBitmap(up.svals[0]); e != nil {
@@ -1438,7 +1443,8 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 	// describes the attribute it names whatever the zone or index configuration has become.
 	walk := c.zoneWalk(wins, qp)
 	visit, stopped := c.refVisitor(s0, qp, emit)
-	forEachCandidateRef(s0, walk, usable, qp.prunesCT(), c.reverseScan, qp.stats, visit)
+	ds := c.newDeltaScope(sh, s0, walk, usable, qp.prunesCT())
+	c.forEachCandidateRef(s0, walk, usable, ds, qp.prunesCT(), c.reverseScan, qp.stats, visit)
 	return !stopped()
 }
 
@@ -1446,7 +1452,8 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 // indexes cannot rule out for usable: a covering segment's candidate offsets, the tail
 // written after its index was built, and every record of a segment no index covers. fn
 // sees a superset of the true matches and must re-verify; it returns false to stop, and
-// so does forEachCandidateRef.
+// so does forEachCandidateRef. A covering segment's delta records are candidates too, as far as
+// ds admits them (see deltaScope).
 //
 // When reverse is set (an append-only, newest-first collection), candidates are visited
 // newest-first: segments from the last backward, and within a segment the un-indexed tail
@@ -1455,7 +1462,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 //
 // ct marks probes computed with CurrentTime folded to the query's pinned time, which hold only for
 // records without CurrentTime: a window not proven free of it (segWindow.ctFree) is walked in full.
-func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, ct, reverse bool, st *ScanStats, fn func(recRef) bool) bool {
+func (c *Collection) forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, ds *deltaScope, ct, reverse bool, st *ScanStats, fn func(recRef) bool) bool {
 	var offs []uint32 // reused across reversed ranges
 	visible := func(w segWindow, o uint32) bool {
 		return !recIsMarker(w.data, o) && w.visible(o, s0)
@@ -1507,8 +1514,8 @@ func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, ct, 
 	// beyond the index, the tail first when walking newest-first.
 	window := func(w segWindow) bool {
 		d := w.dict()
-		si := w.seg.readIdx()
-		if si == nil || !si.covers(usable) || (ct && !w.ctFree) {
+		si := windowIndex(w, usable, ct)
+		if si == nil {
 			st.indexSegment(0, false, true)
 			return scanRange(w, d, 0, w.used) // no usable index: walk the window in full
 		}
@@ -1517,12 +1524,7 @@ func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, ct, 
 		if reverse && !tail() {
 			return false
 		}
-		// Segment skip: if any probe provably has no candidate in the indexed prefix
-		// (min/max out of range, bloom miss), the conjunction is empty there.
-		if si.skipsPrefix(usable) {
-			st.indexSegment(0, true, false)
-		} else if cand := si.candidateOffsets(usable); cand != nil {
-			st.indexSegment(int(cand.GetCardinality()), false, false)
+		if cand := prefixCandidates(w, si, usable, ds, st); cand != nil {
 			var it roaring.IntIterable
 			if reverse {
 				it = cand.ReverseIterator()
@@ -1552,6 +1554,35 @@ func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, ct, 
 		}
 	}
 	return true
+}
+
+// windowIndex returns the index that can narrow w to usable's candidates, or nil when w has to be
+// walked in full: it has no index, its index does not cover every probe's attribute, or the probes
+// fold CurrentTime (ct) and w is not proven free of it.
+func windowIndex(w segWindow, usable []usableProbe, ct bool) readIndex {
+	si := w.seg.readIdx()
+	if si == nil || !si.covers(usable) || (ct && !w.ctFree) {
+		return nil
+	}
+	return si
+}
+
+// prefixCandidates returns the records of si's covered prefix of w that the index cannot rule out
+// for usable -- the postings' intersection, plus the delta records ds admits (index_deltas.go) --
+// in a bitmap of offsets, nil for none. The rest of w, from si.coveredUpto(), is not covered and is the
+// caller's to walk.
+//
+// Segment skip: if any probe provably has no candidate in the indexed prefix (min/max out of range,
+// bloom miss), the conjunction is empty there -- among the records the index could post. A delta
+// record it could not is a candidate regardless.
+func prefixCandidates(w segWindow, si readIndex, usable []usableProbe, ds *deltaScope, st *ScanStats) *roaring.Bitmap {
+	var cand *roaring.Bitmap
+	if si.skipsPrefix(usable) {
+		st.indexSegment(0, true, false)
+	} else if cand = si.candidateOffsets(usable); cand != nil {
+		st.indexSegment(int(cand.GetCardinality()), false, false)
+	}
+	return ds.withDeltas(w, cand)
 }
 
 // scanShardIndexedGroups is scanShardIndexed for a DNF plan: it visits the union of
@@ -1665,7 +1696,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 	}
 
 	if reverse {
-		return scanShardCandidatesGroupsReverse(wins, groups, ct, visit)
+		return c.scanShardCandidatesGroupsReverse(wins, groups, ct, visit)
 	}
 
 	for _, w := range wins {
@@ -1677,17 +1708,14 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 			continue
 		}
 		// Single group (a conjunctive plan): reuse the segment-skip fast path -- if a
-		// probe provably has no candidate in the indexed prefix, only the tail needs a
-		// scan. A union of groups cannot skip this cheaply, so it visits candidates.
-		if len(groups) == 1 && si.skipsPrefix(groups[0]) {
-			if int(si.upto) < w.used {
-				if !scanRange(w, int(si.upto), w.used) {
-					return false
-				}
-			}
-			continue
+		// probe provably has no candidate in the indexed prefix, only the tail and the
+		// prefix's delta records need a visit. A union of groups cannot skip this cheaply,
+		// so it visits candidates.
+		var cand *roaring.Bitmap
+		if len(groups) != 1 || !si.skipsPrefix(groups[0]) {
+			cand = si.candidateOffsetsGroups(groups)
 		}
-		if cand := si.candidateOffsetsGroups(groups); cand != nil {
+		if cand = c.withDeltas(w, si.upto, cand); cand != nil {
 			it := cand.Iterator()
 			for it.HasNext() {
 				if visit(w, it.Next()) {
@@ -1709,7 +1737,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 // before the union of the groups' candidate offsets, both in descending offset order. It
 // reads the segment index via readIdx (so a sealed segment's mmap sidecar is used, not only
 // an in-RAM index), which the forward path does not yet do. visit returns true to stop.
-func scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, ct bool, visit func(w segWindow, o uint32) bool) bool {
+func (c *Collection) scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, ct bool, visit func(w segWindow, o uint32) bool) bool {
 	var offs []uint32
 	scanRangeReverse := func(w segWindow, from, to int) bool {
 		offs = offs[:0]
@@ -1748,13 +1776,14 @@ func scanShardCandidatesGroupsReverse(wins []segWindow, groups [][]usableProbe, 
 				return false
 			}
 		}
-		// Single-group segment skip (a conjunctive plan routed here): if the prefix
-		// provably has no candidate, only the tail (already scanned) applied.
-		if len(groups) == 1 && si.skipsPrefix(groups[0]) {
-			continue
+		// Then the union of the groups' indexed-prefix candidates, descending. Single-group
+		// segment skip (a conjunctive plan routed here): if the prefix provably has no
+		// candidate, only the tail (already scanned) and the prefix's delta records apply.
+		var cand *roaring.Bitmap
+		if len(groups) != 1 || !si.skipsPrefix(groups[0]) {
+			cand = si.candidateOffsetsGroups(groups)
 		}
-		// Then the union of the groups' indexed-prefix candidates, descending.
-		if cand := si.candidateOffsetsGroups(groups); cand != nil {
+		if cand = c.withDeltas(w, si.coveredUpto(), cand); cand != nil {
 			it := cand.ReverseIterator()
 			for it.HasNext() {
 				if visit(w, it.Next()) {
