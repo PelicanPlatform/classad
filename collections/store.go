@@ -1236,7 +1236,7 @@ func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd
 			if groups, prunable := c.planIndexGroups(plan); prunable && !overSelectivityGate(c, groups) {
 				emit := c.yieldAdAs(yield, redact)
 				for _, sh := range c.shards {
-					if !c.scanShardIndexedGroups(sh, groups, qp, emit) {
+					if !c.scanShardIndexedGroups(sh, groups, plan, qp, emit) {
 						return
 					}
 				}
@@ -1300,12 +1300,10 @@ func (c *Collection) scanWindows(s0 uint64, wins []segWindow, qp queryPlan, emit
 func (c *Collection) zoneWalk(wins []segWindow, qp queryPlan) []segWindow {
 	walk := wins
 	if len(qp.probes) > 0 && c.hasZones.Load() {
-		// Probes that fold CurrentTime describe only records without it: they prune a proven window
-		// and no other.
 		ct := qp.prunesCT()
 		walk = make([]segWindow, 0, len(wins))
 		for _, w := range wins {
-			if w.zones != nil && (!ct || w.ctFree) && zonePrune(w.zones, qp.probes, c.intern) {
+			if c.zoneExcludes(w, qp.probes, ct) {
 				continue
 			}
 			walk = append(walk, w)
@@ -1313,6 +1311,33 @@ func (c *Collection) zoneWalk(wins []segWindow, qp queryPlan) []segWindow {
 	}
 	qp.stats.segments(len(wins), len(wins)-len(walk))
 	return walk
+}
+
+// zoneExcludes reports whether w's zone map proves that no record visible through it satisfies
+// probes, a query's required conjuncts. ct marks probes computed with CurrentTime folded to the
+// query's pinned time (queryPlan.prunesCT): they describe only records that do not define
+// CurrentTime, so they prune a window proven free of it (segWindow.ctFree) and no other.
+//
+// The plain scan, the parallel fan-out and the index candidate walks all prune through it, so a
+// query skips the same segments whichever of them its plan picks.
+func (c *Collection) zoneExcludes(w segWindow, probes []vm.Probe, ct bool) bool {
+	return w.zones != nil && (!ct || w.ctFree) && zonePrune(w.zones, probes, c.intern)
+}
+
+// zoneExcludesGroups is zoneExcludes for a disjunctive plan (vm.Query.ProbePlan): w is excluded
+// only when its zone map rules out EVERY group, since a match satisfies all the probes of at
+// least one. A group with no probe is unconstrained and rules nothing out, and neither does an
+// empty plan.
+func (c *Collection) zoneExcludesGroups(w segWindow, plan []vm.ProbeGroup, ct bool) bool {
+	if len(plan) == 0 || w.zones == nil || (ct && !w.ctFree) {
+		return false
+	}
+	for _, g := range plan {
+		if !zonePrune(w.zones, g.Probes, c.intern) {
+			return false
+		}
+	}
+	return true
 }
 
 // refVisitor is how a query treats one visible record, whichever walk -- every record, or an

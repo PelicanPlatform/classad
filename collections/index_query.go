@@ -618,6 +618,10 @@ type QueryExplain struct {
 	IndexSegments        int   `json:"indexSegments,omitempty"`
 	IndexSkippedSegments int   `json:"indexSkippedSegments,omitempty"`
 	UnindexedSegments    int   `json:"unindexedSegments,omitempty"`
+	// ZonePrunedSegments is how many segments the zone maps rule out before any record or
+	// posting is read, on either plan. An indexed plan's segment counts above cover only the
+	// segments left after it.
+	ZonePrunedSegments int `json:"zonePrunedSegments,omitempty"`
 	// Reason says, in a sentence, why the plan is what it is: which index probe and how many
 	// candidates, or why the scan won.
 	Reason string `json:"reason,omitempty"`
@@ -683,10 +687,13 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 			"over the %.0f%% at which an index walk stops paying", strings.Join(indexedAttrs, " and "), 100*frac, 100*maxPushdownFrac)
 	case len(usable) > 0:
 		ex.Plan = "indexed"
-		c.explainIndexSegments(usable, &ex)
+		c.explainIndexSegments(q, usable, &ex)
 		ex.Reason = fmt.Sprintf("index probe on %s: %d of %d segments answer from postings, ~%d candidate records",
-			strings.Join(indexedAttrs, " and "), ex.IndexSegments, ex.IndexSegments+ex.IndexSkippedSegments+ex.UnindexedSegments,
-			ex.EstCandidates)
+			strings.Join(indexedAttrs, " and "), ex.IndexSegments,
+			ex.IndexSegments+ex.IndexSkippedSegments+ex.UnindexedSegments+ex.ZonePrunedSegments, ex.EstCandidates)
+		if ex.ZonePrunedSegments > 0 {
+			ex.Reason += fmt.Sprintf("; %d segments ruled out by their zone maps", ex.ZonePrunedSegments)
+		}
 		if ex.IndexSkippedSegments > 0 {
 			ex.Reason += fmt.Sprintf("; %d segments ruled out by their index", ex.IndexSkippedSegments)
 		}
@@ -699,6 +706,11 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 	default:
 		ex.Plan = scan
 		ex.Reason = "full scan: no conjunct of the filter is on an indexed attribute"
+	}
+	if ex.Plan == scan {
+		if ex.ZonePrunedSegments = c.explainZonePruned(q); ex.ZonePrunedSegments > 0 {
+			ex.Reason += fmt.Sprintf("; %d segments ruled out by their zone maps", ex.ZonePrunedSegments)
+		}
 	}
 	if q.Folded() != nil {
 		ex.CurrentTimeFolded = true
@@ -737,14 +749,18 @@ func (c *Collection) overReadGate(usable []usableProbe) (frac float64, gated boo
 	return frac, ok && frac > maxPushdownFrac
 }
 
-// explainIndexSegments fills ex's per-segment index breakdown for an indexed plan.
-func (c *Collection) explainIndexSegments(usable []usableProbe, ex *QueryExplain) {
+// explainIndexSegments fills ex's per-segment index breakdown for an indexed plan of q, after
+// the zone pruning scanShardIndexed applies first.
+func (c *Collection) explainIndexSegments(q *vm.Query, usable []usableProbe, ex *QueryExplain) {
+	probes, ct, zoned := q.Probes(), q.ReadsCurrentTime(), c.hasZones.Load()
 	var cand float64
 	for _, sh := range c.shards {
 		_, wins := sh.snapshot()
 		for _, w := range wins {
 			si := w.seg.readIdx()
 			switch {
+			case zoned && c.zoneExcludes(w, probes, ct):
+				ex.ZonePrunedSegments++
 			case si == nil || !si.covers(usable):
 				ex.UnindexedSegments++
 			case si.skipsPrefix(usable):
@@ -761,6 +777,25 @@ func (c *Collection) explainIndexSegments(usable []usableProbe, ex *QueryExplain
 		releaseWindows(wins)
 	}
 	ex.EstCandidates = clampEst(cand, ex.TotalAds)
+}
+
+// explainZonePruned counts the segments a scan of q skips on their zone maps (zoneWalk).
+func (c *Collection) explainZonePruned(q *vm.Query) int {
+	probes := q.Probes()
+	if len(probes) == 0 || !c.hasZones.Load() {
+		return 0
+	}
+	ct, n := q.ReadsCurrentTime(), 0
+	for _, sh := range c.shards {
+		_, wins := sh.snapshot()
+		for _, w := range wins {
+			if c.zoneExcludes(w, probes, ct) {
+				n++
+			}
+		}
+		releaseWindows(wins)
+	}
+	return n
 }
 
 // probeIndexKind reports whether a probe's attribute is indexed and, if so, its
@@ -1357,13 +1392,17 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 	}
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
-	// No zone pruning here, unlike the scan: the index already rules segments out from its own
-	// per-segment bounds (skipsPrefix), which are keyed durably, while a zone map adopted from a
-	// sidecar is keyed by intern ids that need not mean the same attributes after the
-	// collection's zone or index configuration changes.
-	qp.stats.segments(len(wins), 0)
+	// Zone-prune before walking candidates, exactly as the scan does. The index's own
+	// per-segment skip (skipsPrefix) only reaches segments whose index covers the probe; a
+	// segment sealed before the attribute was indexed has no postings to consult and would
+	// otherwise be walked record by record, even when its zone map proves it holds no match --
+	// on an archive whose index was added late, that is nearly every segment. A zone map adopted
+	// from a sidecar is safe to apply here for the same reason it is on the scan: the section is
+	// keyed by attribute name and bound to this process's ids on load (parseZoneBlob), so it
+	// describes the attribute it names whatever the zone or index configuration has become.
+	walk := c.zoneWalk(wins, qp)
 	visit, stopped := c.refVisitor(s0, qp, emit)
-	forEachCandidateRef(s0, wins, usable, qp.prunesCT(), c.reverseScan, qp.stats, visit)
+	forEachCandidateRef(s0, walk, usable, qp.prunesCT(), c.reverseScan, qp.stats, visit)
 	return !stopped()
 }
 
@@ -1481,8 +1520,20 @@ func forEachCandidateRef(s0 uint64, wins []segWindow, usable []usableProbe, ct, 
 
 // scanShardIndexedGroups is scanShardIndexed for a DNF plan: it visits the union of
 // the groups' candidates and re-verifies each against the full query.
-func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, qp queryPlan, emit scanEmit) bool {
-	return c.scanShardCandidatesGroups(sh, groups, c.reverseScan, qp.prunesCT(), func(w []byte, dict *segDictHandle, ctFree bool) bool {
+//
+// plan is the query's DNF (vm.Query.ProbePlan) that groups was planned from. A window is
+// zone-pruned when its zone map rules out the query's required conjuncts, or every disjunct of
+// plan: a record satisfying the query satisfies every probe of some group, so a window no group
+// can match holds no match either.
+func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, plan []vm.ProbeGroup, qp queryPlan, emit scanEmit) bool {
+	ct := qp.prunesCT()
+	var prune func(segWindow) bool
+	if c.hasZones.Load() {
+		prune = func(w segWindow) bool {
+			return c.zoneExcludes(w, qp.probes, ct) || c.zoneExcludesGroups(w, plan, ct)
+		}
+	}
+	return c.scanShardCandidatesGroups(sh, groups, c.reverseScan, ct, prune, qp.stats, func(w []byte, dict *segDictHandle, ctFree bool) bool {
 		if qp.ws != nil {
 			qp.ws.dict = dict
 		}
@@ -1507,8 +1558,11 @@ func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, q
 //
 // ct marks groups computed with CurrentTime folded (see forEachCandidateRef): a window not proven
 // free of it is scanned in full. onCand learns whether the candidate's window is proven.
+//
+// prune, when non-nil, drops a window before any of its candidates is computed (zone pruning; see
+// scanShardIndexedGroups); st, when non-nil, records how many windows it dropped.
 func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, reverse, ct bool,
-	onCand func(w []byte, dict *segDictHandle, ctFree bool) bool) bool {
+	prune func(segWindow) bool, st *ScanStats, onCand func(w []byte, dict *segDictHandle, ctFree bool) bool) bool {
 	if unsatisfiableGroups(groups) {
 		return true // every disjunct is impossible: the union is empty (see scanShardCandidates)
 	}
@@ -1526,8 +1580,18 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 		}
 		groups = kept
 	}
-	s0, wins := sh.snapshot()
-	defer releaseWindows(wins)
+	s0, snap := sh.snapshot()
+	defer releaseWindows(snap)
+	wins := snap
+	if prune != nil {
+		wins = make([]segWindow, 0, len(snap))
+		for _, w := range snap {
+			if !prune(w) {
+				wins = append(wins, w)
+			}
+		}
+	}
+	st.segments(len(snap), len(snap)-len(wins))
 	var dbuf []byte
 	visit := func(w segWindow, o uint32) (stop bool) {
 		if !w.visible(o, s0) {

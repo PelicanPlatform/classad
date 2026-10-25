@@ -264,8 +264,9 @@ func TestArchiveIndexedFetchStats(t *testing.T) {
 
 // A cluster lives in one or two segments; with no long-lived cluster widening every
 // segment's ClusterId range and every ClusterId a number (no exception set to search), every
-// other segment's index rules it out before a posting is read. (With a long-lived cluster in
-// the mix, as in the other tests, no segment can be ruled out: each one's range spans it.)
+// other segment is ruled out before a posting is read -- by its zone map, which the indexed plan
+// consults first, or by its index. (With a long-lived cluster in the mix, as in the other tests,
+// no segment can be ruled out: each one's range spans it.)
 func TestArchiveIndexedFetchSkipsSegments(t *testing.T) {
 	a, err := CreateArchive(historyArchiveOptions(t.TempDir(), 64<<10))
 	if err != nil {
@@ -289,7 +290,7 @@ func TestArchiveIndexedFetchSkipsSegments(t *testing.T) {
 	if want := len(reference(t, a, "ClusterId == 1003")); st.RowsMatched != want || want == 0 {
 		t.Fatalf("matched %d, want %d", st.RowsMatched, want)
 	}
-	if st.SegmentsIndexSkipped < st.SegmentsTotal-3 || st.IndexCandidates != st.RowsMatched {
+	if st.SegmentsPruned+st.SegmentsIndexSkipped < st.SegmentsTotal-3 || st.IndexCandidates != st.RowsMatched {
 		t.Errorf("small cluster: %+v", st)
 	}
 }
