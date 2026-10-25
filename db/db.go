@@ -35,6 +35,11 @@ type DB struct {
 	instance string // this open's instance identity (fresh each Open)
 	dir      string // on-disk directory ("" for in-memory); where index config persists
 
+	// cfg is the persisted index/hot-set configuration (indexcfg.json). See
+	// db/configpersist.go: it owns the atomic rewrite and the lock that serializes it,
+	// shared with the archive table's archiveconfig.json.
+	cfg *configFile[persistedIndexConfig]
+
 	// enc is the derived encryption state (data key for the live store, backup key +
 	// master envelope for snapshots), or nil when encryption is disabled. See db/encrypt.go.
 	enc *dbCrypto
@@ -253,7 +258,10 @@ func OpenConfig(cfg Config) (*DB, error) {
 			return nil, err
 		}
 	}
-	db := &DB{c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID(), dir: cfg.Dir, enc: enc}
+	db := &DB{
+		c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID(), dir: cfg.Dir, enc: enc,
+		cfg: newConfigFile(cfg.Dir, indexConfigFile, persistedIndexConfig{}),
+	}
 	// Reapply any index/hot-set configuration persisted by a previous run's
 	// runtime changes (AddIndex/AddHotAttrs/...), so they survive a restart.
 	db.loadIndexConfig()

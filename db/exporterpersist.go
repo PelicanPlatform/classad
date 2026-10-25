@@ -80,13 +80,3 @@ func loadExporterStateFile(dir, name string) ([]byte, bool, error) {
 func removeExporterDir(dir, name string) error {
 	return os.RemoveAll(exporterDir(dir, name))
 }
-
-// writeAtomic writes data to path via a temp file and rename, so a reader never observes
-// a partial write.
-func writeAtomic(path string, data []byte) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil { //nolint:gosec // G306 - catalog metadata, not secret
-		return err
-	}
-	return os.Rename(tmp, path)
-}

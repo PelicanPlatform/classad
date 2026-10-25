@@ -3,7 +3,13 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # db/testdata holds config files captured byte-for-byte as the code writes
+        # them, to catch a format change. json.MarshalIndent ends them at the closing
+        # brace, so appending a newline would both break the comparison and leave the
+        # fixture no longer representing what is on disk.
+        exclude: '^db/testdata/'
       - id: end-of-file-fixer
+        exclude: '^db/testdata/'
       - id: check-yaml
       - id: check-added-large-files
       - id: check-merge-conflict

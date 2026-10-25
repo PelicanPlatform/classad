@@ -9,8 +9,9 @@ import (
 
 // A materialized view persists only its DEFINITION (ViewSpec) at
 // <dir>/views/<name>/view.json; its data is in-memory and is rebuilt from the base table
-// on reload (see Catalog.recoverViews). The definition is written atomically (tmp+rename),
-// mirroring db/indexpersist.go.
+// on reload (see Catalog.recoverViews). The definition goes through the same atomic write
+// as the tuned-configuration files (db/configpersist.go), and needs no lock of its own:
+// it is written once when the view is created and never folded into afterwards.
 
 const viewDefFile = "view.json"
 
@@ -24,12 +25,7 @@ func saveViewDef(dir, name string, spec ViewSpec) error {
 	if err != nil {
 		return err
 	}
-	path := filepath.Join(vdir, viewDefFile)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeAtomic(filepath.Join(vdir, viewDefFile), data)
 }
 
 // loadViewDef reads the persisted definition for a view.

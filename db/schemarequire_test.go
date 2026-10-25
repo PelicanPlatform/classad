@@ -78,10 +78,12 @@ func TestArchiveSchemaRequireReassertKeepsRuntime(t *testing.T) {
 	if got, want := a.SchemaRequireAttrs(), []string{"diskusage", "imagesize"}; !slices.Equal(got, want) {
 		t.Fatalf("after re-assert = %v, want %v", got, want)
 	}
-	if got, want := a.cfg.SchemaRequireRuntime, []string{"imagesize"}; !slices.Equal(got, want) {
+	var saved ArchiveConfig
+	a.cfg.with(func(cfg *ArchiveConfig) { saved = *cfg })
+	if got, want := saved.SchemaRequireRuntime, []string{"imagesize"}; !slices.Equal(got, want) {
 		t.Errorf("persisted runtime tier = %v, want %v -- provenance must survive the re-assert", got, want)
 	}
-	if got, want := a.cfg.SchemaRequireAttrs, []string{"diskusage"}; !slices.Equal(got, want) {
+	if got, want := saved.SchemaRequireAttrs, []string{"diskusage"}; !slices.Equal(got, want) {
 		t.Errorf("persisted configured tier = %v, want %v", got, want)
 	}
 }

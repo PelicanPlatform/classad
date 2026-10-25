@@ -1,9 +1,6 @@
 package db
 
 import (
-	"encoding/json"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/PelicanPlatform/classad/collections"
@@ -60,72 +57,44 @@ func (p persistedIndexConfig) timeTravelOptions() *collections.TimeTravelOptions
 // file, before the collection is opened, so recovery can rebuild the time index. Nil
 // when there is no dir, no file, or time travel is off.
 func readPersistedTimeTravel(dir string) *collections.TimeTravelOptions {
-	if dir == "" {
-		return nil
-	}
-	data, err := os.ReadFile(filepath.Join(dir, indexConfigFile))
-	if err != nil {
-		return nil
-	}
-	var cfg persistedIndexConfig
-	if json.Unmarshal(data, &cfg) != nil {
+	cfg, _, ok := readConfigFile[persistedIndexConfig](dir, indexConfigFile)
+	if !ok {
 		return nil
 	}
 	return cfg.timeTravelOptions()
 }
 
-func (db *DB) indexConfigPath() string {
-	if db.dir == "" {
-		return ""
-	}
-	return filepath.Join(db.dir, indexConfigFile)
-}
-
 // saveIndexConfig writes the current index + hot-set configuration atomically.
 // Best-effort: a write failure is ignored (the configuration is still live for
 // this run; only its persistence is lost).
+//
+// The whole file is derived from the live collection on every save rather than
+// accumulated in the held struct, because the collection is where this table tracks
+// index provenance (AutoIndexNames) and the runtime required tier. The archive tracks
+// its own provenance in the held struct instead; see ArchiveTable.
 func (db *DB) saveIndexConfig() {
-	path := db.indexConfigPath()
-	if path == "" {
-		return
-	}
 	cat, val := db.c.IndexedAttrs()
-	cfg := persistedIndexConfig{
+	next := persistedIndexConfig{
 		Categorical: cat, Value: val, Auto: db.c.AutoIndexNames(), Hot: db.c.HotAttrNames(),
 		Encrypted: db.c.EncryptedAttrNames(), SchemaRequire: db.c.SchemaRequireRuntimeAttrs(),
 	}
 	if o, on := db.c.TimeTravelConfig(); on {
-		cfg.TimeTravel = true
-		cfg.TimeTravelMaxSeconds = int(o.MaxDistance / time.Second)
-		cfg.TimeTravelCheckpointSeced = int(o.CheckpointInterval / time.Second)
+		next.TimeTravel = true
+		next.TimeTravelMaxSeconds = int(o.MaxDistance / time.Second)
+		next.TimeTravelCheckpointSeced = int(o.CheckpointInterval / time.Second)
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return
-	}
-	tmp := path + ".tmp"
-	if os.WriteFile(tmp, data, 0o644) != nil {
-		return
-	}
-	_ = os.Rename(tmp, path)
+	_ = db.cfg.update(func(cfg *persistedIndexConfig) { *cfg = next })
 }
 
 // loadIndexConfig reconciles the live index configuration to the persisted set
 // and rebuilds the indexes over the loaded ads, then pins the persisted hot
 // attributes. A missing/unreadable file is a no-op (first run, or in-memory).
 func (db *DB) loadIndexConfig() {
-	path := db.indexConfigPath()
-	if path == "" {
+	cfg, _, ok := readConfigFile[persistedIndexConfig](db.dir, indexConfigFile)
+	if !ok {
 		return
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return
-	}
-	var cfg persistedIndexConfig
-	if json.Unmarshal(data, &cfg) != nil {
-		return
-	}
+	db.cfg.with(func(held *persistedIndexConfig) { *held = cfg })
 
 	// Desired kind per attribute (categorical wins if listed as both).
 	want := map[string]string{}
