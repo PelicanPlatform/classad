@@ -260,7 +260,11 @@ func OpenConfig(cfg Config) (*DB, error) {
 	}
 	db := &DB{
 		c: c, id: loadOrCreateDBID(cfg.Dir), instance: randID(), dir: cfg.Dir, enc: enc,
-		cfg: newConfigFile(cfg.Dir, indexConfigFile, persistedIndexConfig{}),
+		// Seeded with the configured hot attributes so the first save files them under the
+		// human tier rather than attributing them to a refresh that has not run yet.
+		cfg: newConfigFile(cfg.Dir, indexConfigFile, persistedIndexConfig{
+			Hot: append([]string(nil), cfg.HotAttrs...),
+		}),
 	}
 	// Reapply any index/hot-set configuration persisted by a previous run's
 	// runtime changes (AddIndex/AddHotAttrs/...), so they survive a restart.
@@ -428,7 +432,11 @@ func (db *DB) Maintain(opts MaintainOptions) {
 		}
 	}
 	if opts.HotTopN > 0 {
-		db.c.RefreshHotSet(opts.SampleMax, opts.HotTopN)
+		// Through the DB wrapper, not the collection: the pass's refresh has to be persisted
+		// with its provenance, like the archive pass's is. Called on the collection directly
+		// it was live for this process only, so the one piece of tuning a scheduled pass does
+		// to the hot set was discarded by every restart.
+		db.RefreshHotSet(opts.SampleMax, opts.HotTopN)
 	}
 	if opts.Retrain {
 		_, _ = db.c.RetrainDict(opts.SampleMax) // recompacts + reindexes
@@ -741,7 +749,10 @@ func (db *DB) Reindex() { db.c.Reindex() }
 // resulting hot attributes. The hot set is persisted.
 func (db *DB) AddHotAttrs(names ...string) []string {
 	hot := db.c.AddHotAttrs(names...)
-	db.saveIndexConfig()
+	// A named add is someone asking, so it joins the human tier and is not attributed to --
+	// or recomputed away by -- a later refresh. Folded in by the save itself, as one step
+	// under its lock, so a concurrent saver cannot write between the two and drop it.
+	db.saveIndexConfig(names...)
 	return hot
 }
 
@@ -750,6 +761,18 @@ func (db *DB) AddHotAttrs(names ...string) []string {
 // resulting hot set is persisted.
 func (db *DB) RefreshHotSet(sampleMax, topN int) int {
 	n := db.c.RefreshHotSet(sampleMax, topN)
+	if n == 0 {
+		return 0
+	}
+	// RefreshHotSet replaces the set outright, so re-pin the human tier: an attribute
+	// someone asked to keep hot should not be dropped because a bounded sample happened not
+	// to read it. Doing it here is also what keeps the live set equal to the union the file
+	// records, so a restart restores exactly what is live now.
+	var human []string
+	db.cfg.with(func(cfg *persistedIndexConfig) { human = append(human, cfg.Hot...) })
+	if len(human) > 0 {
+		db.c.AddHotAttrs(human...)
+	}
 	db.saveIndexConfig()
 	return n
 }
