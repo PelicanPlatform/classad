@@ -310,6 +310,10 @@ func (e *encoder) node(expr ast.Expr) {
 		e.node(v.Left)
 		e.node(v.Right)
 	case *ast.UnaryOp:
+		if lit, ok := negatedNumericLiteral(v); ok {
+			e.node(lit)
+			return
+		}
 		if id, ok := unOpID[v.Op]; ok {
 			e.buf = append(e.buf, nUnOp, id)
 		} else {
@@ -375,4 +379,46 @@ func (e *encoder) node(expr ast.Expr) {
 func (e *encoder) putString(s string) {
 	e.buf = binary.AppendUvarint(e.buf, uint64(len(s)))
 	e.buf = append(e.buf, s...)
+}
+
+// negatedNumericLiteral folds `-<int literal>` / `-<real literal>` into the single negative
+// literal it denotes, returning the folded literal and true, or (nil, false) for any other
+// unary expression.
+//
+// Why the encoder and not the parser: the grammar really does make `-1` a unary minus applied
+// to 1, and the syntax tree is the one place that has to keep saying so -- its String() and the
+// evaluator are written against that shape. The wire form has no such obligation. It is a
+// storage representation of a VALUE, and `-1` is a number, so a node tag that can hold it should.
+//
+// Why it matters beyond bytes: every reader that asks "is this cell a stored scalar?" answers by
+// the node tag. Unfolded, a negative number answers no, and so lands outside whatever the reader
+// was built to accelerate -- it never enters a columnar field's sampled values (so the width
+// chooser sees only the non-negative ones, picks UNSIGNED, and every negative value then escapes
+// the column it should have lived in; an attribute that is negative throughout presents no
+// storable scalar at all and gets no column), it declines a value index, and it hands a
+// vectorized scan back a per-record callback. None of that is a property of the number. It is a
+// property of the spelling, which is exactly what an encoder is entitled to normalize.
+//
+// Scope is deliberately one level over a bare numeric literal: `-(-1)`, `+1` and `-x` are left
+// alone. The win is in the stored negative numbers real ads carry (ExitCode, offsets, Rank
+// terms), and a wider fold would start rewriting expressions for no storage benefit.
+//
+// Int overflow: negating the int64 minimum wraps to itself, which is precisely what the
+// evaluator and NumberValue compute for the unfolded node, so the folded and unfolded forms
+// still denote the same value.
+//
+// Reading back: nothing on the decode side changes. Records written before this fold still carry
+// the unary-minus node and still decode through it (TestEncodeNegativeOldFormDecodes pins that),
+// and NumberValue stays the accessor that sees through one.
+func negatedNumericLiteral(v *ast.UnaryOp) (ast.Expr, bool) {
+	if v.Op != "-" {
+		return nil, false
+	}
+	switch in := v.Expr.(type) {
+	case *ast.IntegerLiteral:
+		return &ast.IntegerLiteral{Value: -in.Value}, true
+	case *ast.RealLiteral:
+		return &ast.RealLiteral{Value: -in.Value}, true
+	}
+	return nil, false
 }

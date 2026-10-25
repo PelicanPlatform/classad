@@ -91,11 +91,12 @@ func shrinkReport(t *testing.T, f *aggFixture, q gen.Query) string {
 	fmt.Fprintf(&b, "  repro:  %d of %d records still disagree -- gen.ShapeByID(%d).AdsAt(%v)\n",
 		len(small), f.shape.N, f.shape.ID, small)
 	// The text form is lossy in exactly one way, and saying so is cheaper than someone pasting it
-	// into a test and getting a different answer: a NaN prints as real("NaN") and a negative number
-	// as unary minus over a literal, both of which re-parse to the same VALUE but as expressions
-	// rather than the stored literals the columns are built from.
-	fmt.Fprintf(&b, "  ads (old-ClassAd form; NaN and negative numbers re-parse as expressions,\n")
-	fmt.Fprintf(&b, "       not as the stored literals -- gen.Shape.Ad re-inserts them):\n")
+	// into a test and getting a different answer: a NaN prints as real("NaN"), which re-parses to
+	// the same VALUE but as an expression rather than the stored literal the columns are built
+	// from. A negative number no longer has that problem -- the encoder folds it into a signed
+	// literal -- which is why gen.Shape.Ad only has to patch the NaN back in.
+	fmt.Fprintf(&b, "  ads (old-ClassAd form; a NaN re-parses as an expression, not as the stored\n")
+	fmt.Fprintf(&b, "       literal -- gen.Shape.Ad re-inserts it):\n")
 	for k, i := range small {
 		if k == 40 {
 			fmt.Fprintf(&b, "    ... %d more\n", len(small)-k)

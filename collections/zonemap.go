@@ -48,8 +48,9 @@ const (
 
 // zoneValue classifies a record's value node for a zone map, returning the number for a
 // zoneNumber. A boolean is a number here (1 or 0), as it is to the comparison operators. A
-// negative constant is stored as unary minus over a literal and counts as the number it is; a
-// list or nested ad is opaque only because it is not worth decoding to prove otherwise.
+// negative constant written before the encoder folded one into a signed literal is stored as
+// unary minus over a literal, and counts as the number it is either way; a list or nested ad is
+// opaque only because it is not worth decoding to prove otherwise.
 func zoneValue(node []byte) (float64, zoneCell) {
 	lit, ok := wire.LiteralValue(node)
 	if !ok {

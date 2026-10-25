@@ -118,6 +118,10 @@ var unOps = []string{"-", "+", "!", "~"}
 
 var binOpID, unOpID map[string]byte
 
+// unOpMinusID is unOpID["-"], hoisted out of the wire-native parser's inner loop, which checks
+// it for every prefix operator it emits.
+var unOpMinusID byte
+
 func init() {
 	binOpID = make(map[string]byte, len(binOps))
 	for i, op := range binOps {
@@ -127,4 +131,5 @@ func init() {
 	for i, op := range unOps {
 		unOpID[op] = byte(i)
 	}
+	unOpMinusID = unOpID["-"]
 }

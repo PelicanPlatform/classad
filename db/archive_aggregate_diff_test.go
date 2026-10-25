@@ -74,7 +74,10 @@ func diffHistoryAd(rng *rand.Rand, i int, exprs bool) string {
 	if rng.Intn(100) < 15 { // removed before it ran: no usage at all
 		w("JobStatus = 3")
 		if exprs && rng.Intn(4) == 0 {
-			w("CompletionDate = -1") // a negative constant is unary minus over a literal
+			// A negative CompletionDate only evaluation can give. Written as arithmetic:
+			// the constant `-1` was an expression only while the encoder left the unary minus
+			// in place, and folding it into a literal would have quietly retired this arm.
+			w("CompletionDate = 0 - 1")
 		} else {
 			w("CompletionDate = 0")
 		}

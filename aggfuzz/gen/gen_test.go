@@ -70,7 +70,7 @@ func TestGeneratedAdsCarryTheSharpValues(t *testing.T) {
 			switch {
 			case v.IsReal() && math.IsNaN(r):
 				calcArithNaN++
-			case e.String() == v.String():
+			case storedScalar(e.String(), v.String()):
 				calcLiteral++
 			}
 		}
@@ -145,11 +145,22 @@ func literalInt(ad *classad.ClassAd, e *classad.Expr) (int64, bool) {
 	if !v.IsInteger() {
 		return 0, false
 	}
-	// An expression that happens to evaluate to an integer is not a literal; compare the
-	// unparsed source against the rendered value, which only matches for a literal.
 	i, _ := v.IntValue()
-	return i, e.String() == v.String()
+	return i, storedScalar(e.String(), v.String())
 }
+
+// storedScalar reports whether an attribute's source renders as nothing but its own value, which
+// is what separates a scalar the encoder puts in a column from an expression a reader has to
+// evaluate. An expression that happens to evaluate to the same number does not match, which is
+// the point.
+//
+// The parenthesised form is accepted because a negative number is one: old-ClassAd text has no
+// negative literal, so the syntax tree keeps `-9.25` as the unary minus it parses to and renders
+// it "(-9.25)" while the value renders bare. The encoder folds that spelling into a signed
+// literal, so the record does reach the column, and comparing the two renderings alone counted
+// every negative value as an expression -- which is how this check stopped describing the data
+// the generator makes.
+func storedScalar(src, val string) bool { return src == val || src == "("+val+")" }
 
 // TestGeneratedAdsAreDeterministic pins the property the shrinker and every reproducer rest on: a
 // record is a pure function of its shape and index.

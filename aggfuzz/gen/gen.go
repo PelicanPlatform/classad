@@ -301,31 +301,6 @@ func (s Shape) Ad(i int) *classad.ClassAd {
 	if hasNaN(i) {
 		ad.InsertAttrFloat("Rate", math.NaN())
 	}
-	// Re-insert the negative values as LITERALS. Old-ClassAd text has no negative literal -- `-20`
-	// is unary minus over the literal 20 -- and a non-literal has no storable kind, so a column
-	// written with negative numbers in its text fails the schema's presence floor and is never
-	// columnar. Only a value inserted programmatically reaches a column as a negative.
-	//
-	// -Inf goes through here too, and must: `-1.0e999` is unary minus over a literal exactly as
-	// `-20` is, so a Rate written that way stayed an EXPRESSION while the comment above it claimed
-	// a literal. That cost the fixture more than one record. An expression-valued zone attribute
-	// makes a whole path decline -- a record whose value only evaluation can give cannot be decided
-	// from a zone -- so every constrained index-resident group count over Rate refused before any
-	// of them could be compared against the scan.
-	for _, name := range []string{"Prio", "Rate", "Big", "Calc"} {
-		switch v := ad.EvaluateAttr(name); {
-		case v.IsInteger():
-			// The kind check above makes the error unreachable; it is bound rather than
-			// discarded so a future change to that guard cannot silently insert a zero.
-			if n, err := v.IntValue(); err == nil && n < 0 {
-				ad.InsertAttr(name, n)
-			}
-		case v.IsReal():
-			if r, err := v.RealValue(); err == nil && r < 0 {
-				ad.InsertAttrFloat(name, r)
-			}
-		}
-	}
 	return ad
 }
 

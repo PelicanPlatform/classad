@@ -112,9 +112,13 @@ func LiteralValue(node []byte) (Literal, bool) {
 }
 
 // NumberValue returns the number a node denotes without evaluating anything: an int or real
-// literal under any parentheses and unary minus or plus. The parser keeps a negative constant as
-// unary minus over its magnitude, so `-5` is not a literal, and a reader summarizing numeric
-// values (a zone map) would otherwise have to treat every negative number as an expression.
+// literal under any parentheses and unary minus or plus.
+//
+// The encoder folds `-<numeric literal>` into a signed literal, so a node written today spells a
+// negative number as a literal and LiteralValue alone reads it. This stays because a record is
+// read as it was written: a segment sealed before that fold still carries `-5` as unary minus
+// over 5, as does any spelling the fold leaves alone (`-(5)`, `+5`), and a reader summarizing
+// numeric values -- a zone map -- would otherwise have to treat those as expressions.
 //
 // The result is what the evaluator computes for the node: minus negates (an int wraps, as int64
 // negation does), plus is the identity. Any other operand -- a boolean included, which the

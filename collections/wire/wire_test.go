@@ -9,7 +9,9 @@ import (
 )
 
 // toClassAd bridges an *ast.ClassAd into a *classad.ClassAd so we can use the
-// reference Equal for structural comparison.
+// reference Equal for structural comparison. Equal reads `-1` and the unary minus over 1 that
+// old-ClassAd text parses to as one value, which is what lets these round trips stay strict
+// about everything else while the encoder folds that one spelling.
 func toClassAd(a *ast.ClassAd) *classad.ClassAd {
 	c := classad.New()
 	if a != nil {

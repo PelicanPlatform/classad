@@ -34,7 +34,7 @@ func TestMainEncodingsDecode(t *testing.T) {
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if len(fields) != 4 {
+		if len(fields) != 4 && len(fields) != 5 {
 			t.Fatalf("malformed fixture line %q", line)
 		}
 		src, err1 := strconv.Unquote(fields[1])
@@ -42,6 +42,19 @@ func TestMainEncodingsDecode(t *testing.T) {
 		want, err3 := strconv.Unquote(fields[3])
 		if err1 != nil || err2 != nil || err3 != nil {
 			t.Fatalf("malformed fixture line %q", line)
+		}
+		// An optional 5th field is what the encoder writes for this source TODAY, for a
+		// source whose encoding has deliberately changed since. Field 3 stays what it was --
+		// the bytes already on disk somewhere -- and keeps guarding that they still decode to
+		// field 4. Overwriting field 3 instead would have retired that guarantee silently,
+		// which is the whole thing this fixture exists to prevent.
+		wantEnc := enc
+		if len(fields) == 5 {
+			cur, err := hex.DecodeString(fields[4])
+			if err != nil {
+				t.Fatalf("malformed fixture line %q", line)
+			}
+			wantEnc = cur
 		}
 		n++
 
@@ -71,8 +84,8 @@ func TestMainEncodingsDecode(t *testing.T) {
 			}
 			reenc = EncodeInline(nil, nad)
 		}
-		if !bytes.Equal(reenc, enc) {
-			t.Errorf("%q: encodes to\n  %x\nnow, was\n  %x", src, reenc, enc)
+		if !bytes.Equal(reenc, wantEnc) {
+			t.Errorf("%q: encodes to\n  %x\nnow, want\n  %x", src, reenc, wantEnc)
 		}
 	}
 	if n == 0 {

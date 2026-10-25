@@ -88,7 +88,7 @@ func TestAdSchemaRoundTripSynthetic(t *testing.T) {
 	// Edge ads (still exercised for round-trip regardless of schema membership):
 	edge := []string{
 		`Cpus = 99999` + "\n" + `Memory = 2048` + "\n" + `Big = true` + "\n" + `Load = 1.5` + "\n" + `Arch = "X86_64"` + "\n" + `Machine = "huge.example.org"`,  // Cpus past uint8/uint16 -> escapes
-		`Cpus = -3` + "\n" + `Memory = 4096` + "\n" + `Big = false` + "\n" + `Load = 0.0` + "\n" + `Arch = "ARM"` + "\n" + `Machine = "neg.example.org"`,        // negative -> signed
+		`Cpus = -3` + "\n" + `Memory = 4096` + "\n" + `Big = false` + "\n" + `Load = 0.0` + "\n" + `Arch = "ARM"` + "\n" + `Machine = "neg.example.org"`,        // negative -> signed (asserted below)
 		`Cpus = 2` + "\n" + `Memory = "unknown"` + "\n" + `Big = true` + "\n" + `Load = 2.0` + "\n" + `Arch = "X86_64"` + "\n" + `Machine = "typo.example.org"`, // Memory string -> type exception
 		`Memory = 8192` + "\n" + `Big = true` + "\n" + `Load = 3.0` + "\n" + `Arch = "PPC"` + "\n" + `Machine = "nocpus.example.org"`,                           // Cpus missing
 		`Cpus = 4` + "\n" + `Memory = 512` + "\n" + `Big = false` + "\n" + `Load = -1.25` + "\n" + `Arch = "s"` + "\n" + `Machine = "x"` + "\n" + `Extra = 7`,   // short strings (<=7) inline; a rare attr
@@ -99,9 +99,37 @@ func TestAdSchemaRoundTripSynthetic(t *testing.T) {
 
 	for _, strings := range []bool{false, true} {
 		s := buildAdSchema(wires, adSchemaOpts{Presence: 0.80, Fit: 0.90, Strings: strings})
+		// The `Cpus = -3` edge ad is in the corpus to make Cpus a SIGNED column. Asserting it
+		// rather than only saying so in a comment: the comment was wrong for as long as the
+		// encoder left `-3` a unary-minus expression, because the negative value then never
+		// reached the sampled ints at all and the width chooser picked unsigned from a sample
+		// that looked entirely non-negative. Nothing failed -- the record just escaped the
+		// column -- which is exactly why the claim has to be checked rather than asserted in
+		// prose.
+		assertIntField(t, s, c, "Cpus", false)
 		for i, w := range wires {
 			assertRoundTrip(t, s, w, fmt.Sprintf("strings=%v ad[%d]", strings, i))
 		}
+	}
+}
+
+// assertIntField checks that name is an int column of the expected signedness.
+func assertIntField(t *testing.T, s *adSchema, c *Collection, name string, wantUnsigned bool) {
+	t.Helper()
+	id, ok := c.intern.LookupID(name)
+	if !ok {
+		t.Fatalf("%s was never interned", name)
+	}
+	idx, ok := s.byID[id]
+	if !ok {
+		t.Fatalf("%s got no columnar field", name)
+	}
+	f := s.fields[idx]
+	if f.kind != akInt {
+		t.Fatalf("%s is kind %d, want akInt", name, f.kind)
+	}
+	if f.unsigned != wantUnsigned {
+		t.Errorf("%s column unsigned=%v, want %v", name, f.unsigned, wantUnsigned)
 	}
 }
 
