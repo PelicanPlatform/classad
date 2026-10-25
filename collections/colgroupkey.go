@@ -16,9 +16,9 @@ import (
 //
 // Pointer-free is the property, not an accident. A key with a string in it makes the map hash and
 // compare it field by field, string hash included, even when the string is empty -- and a group
-// lookup happens once per RECORD, so that is the per-record cost of grouping. Replacing a string
-// key with a numeric one is worth ~20% of an unbucketed grouped scan, which is why the key carries
-// a query-local ID for a string rather than the string.
+// lookup happens once per RECORD, so that is the per-record cost of grouping. A numeric GROUP BY
+// was measured 55% slower when the key gained a string field, which is why this key carries a
+// query-local ID for a string and not the string. TestGroupKeyIsPlainMemory pins it.
 //
 // THE IDENTITY CONTRACT, which is what makes the fast path safe where the two could disagree:
 //
@@ -40,9 +40,12 @@ import (
 //
 // Past it the columnar path DECLINES and the query goes back to the scan. It never truncates: a
 // truncated key would merge groups that differ only in a component the key dropped, and report that
-// merge as an answer. Four covers every shape measured (the deepest asked in production is three --
-// a dimension, a status and a time bucket) while keeping the key at 40 bytes, which the runtime
-// hashes in one pass.
+// merge as an answer.
+//
+// Four is a budget, not a limit the shapes impose: the key is hashed and compared once per record,
+// so every slot costs every query whatever it groups by, and four keeps it at 40 bytes. The shapes
+// asked here are one and two columns -- a dimension and a time bucket -- so four leaves room
+// without making the common case pay for it. Raising it is a one-line change plus a benchmark.
 const maxGroupCols = 4
 
 // MaxGroupCols is maxGroupCols, for the db layer's eligibility test. A caller that groups by more
@@ -303,9 +306,6 @@ func (a *groupAccum) accForBucketed(comps *[maxGroupCols]groupComp, nAgg int) (*
 // the UNBUCKETED path measurably while doing nothing for the bucketed one, which runs this once per
 // bucket.
 func (a *groupAccum) enterBuckets(comps *[maxGroupCols]groupComp, nAgg int, probe groupKey) (*groupAcc, bool) {
-	// Disarm first. The interval slots are overwritten component by component below, and a record
-	// that turns out to be in NO bucket returns partway through -- leaving fresh intervals beside
-	// the PREVIOUS record's accumulator, which a later record would then hit on.
 	// probe already carries the unbucketed components (and is the zero key when there are none,
 	// which is the only case the caller leaves it unfilled), so the key is built by filling in the
 	// bucketed slots beside them.

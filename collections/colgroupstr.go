@@ -67,7 +67,7 @@ type groupCol struct {
 	codes   []byte
 	codeW   int
 	codeAcc []*groupAcc
-	codeID  []int32
+	codeID  []int64
 
 	// String fields with no dictionary in this block: the decompressed positional string region,
 	// walked per record.
@@ -83,7 +83,7 @@ type groupCol struct {
 type groupColScratch struct {
 	dict [][]byte
 	code []*groupAcc
-	ids  []int32
+	ids  []int64
 }
 
 // groupCols is the GROUP BY columns of one block, in request order, plus the per-record component
@@ -154,7 +154,7 @@ func newGroupCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCach
 			return c, true
 		}
 		if cap(sc.ids) < len(entries) {
-			sc.ids = make([]int32, len(entries))
+			sc.ids = make([]int64, len(entries))
 		}
 		sc.ids = sc.ids[:len(entries)]
 		clear(sc.ids)
@@ -232,12 +232,14 @@ func (gc *groupCols) accFor(k int, bc *blockCache, acc *groupAccum, nAgg int) (*
 			if code >= len(c.entries) {
 				return nil, false
 			}
+			// The table holds the id PLUS ONE, so its zero value is "not yet resolved" and the
+			// whole table is armed by clearing it rather than by filling it with a sentinel.
 			id := c.codeID[code]
 			if id == 0 {
-				id = int32(acc.internStr(bytesToStr(c.entries[code]))) + 1
+				id = acc.internStr(bytesToStr(c.entries[code])) + 1
 				c.codeID[code] = id
 			}
-			gc.comps[i] = groupComp{raw: int64(id - 1), kind: gkString}
+			gc.comps[i] = groupComp{raw: id - 1, kind: gkString}
 			continue
 		}
 		comp, ok := c.compAt(k, bc, acc)

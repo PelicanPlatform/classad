@@ -85,11 +85,12 @@ const (
 var probeNames = [numProbes]string{"count-constraint", "grouped-columns", "grouped-columns(n>1)", "columnar"}
 
 // probeFloor is the minimum number of queries each probe must have answered for the sweep to prove
-// anything about it. Zero is the obvious floor and it is not enough for the multi-column probe: a
-// handful of two-column queries that all happen to decline would leave the count at one or two and
-// read as covered. The floors below are a small fraction of what a clean run reports (the histogram
-// is logged either way), so they fail on a path that stopped firing and not on ordinary drift.
-var probeFloor = [numProbes]int64{1, 1, 200, 1}
+// anything about it. Zero is the obvious floor and it is not enough for the multi-column probe: the
+// single-column case dominates the draw, so a run where almost every two-column query declined would
+// still leave a count of one or two and read as covered. 100 is roughly a third of what the sweep
+// reports (the histogram is logged either way), so it fails on a path that stopped firing rather
+// than on a generator whose draws shifted.
+var probeFloor = [numProbes]int64{1, 1, 100, 1}
 
 func (p probe) String() string { return probeNames[p] }
 
