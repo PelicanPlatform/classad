@@ -52,6 +52,11 @@ const (
 	// evaluator and pushes its value. The escape hatch for node types the
 	// compiler does not lower to native instructions.
 	OpEvalNode
+
+	// OpMember replaces the top of the stack (member's or identicalMember's
+	// first argument) with the call's value against members[A], a list of
+	// constants compiled to sets. See member.go.
+	OpMember
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose

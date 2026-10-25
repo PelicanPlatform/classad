@@ -443,7 +443,8 @@ func (c *Collection) strEqProbes(q *vm.Query, s *adSchema) []strProbe {
 }
 
 // zonePrunableTests extracts the query's probes that a block zone can reason about: scalar numeric
-// comparisons on numeric fields of THIS schema, as (field index, tests).
+// comparisons and numeric set membership ("in": an OR-of-equalities or a member() call) on numeric
+// fields of THIS schema, as (field index, tests).
 //
 // A SUBSET is sound, and Probes (not ExactProbes) is the right input here: pruning only skips a block
 // when some NECESSARY condition cannot hold in it, so omitting conjuncts costs selectivity and never
@@ -463,11 +464,18 @@ func (c *Collection) zonePrunableTests(q *vm.Query, s *adSchema) ([]int, []field
 			continue
 		}
 		up, ok := valUsable(id, p)
-		if !ok || len(up.fvals) != 1 {
+		if !ok {
 			continue
 		}
-		if _, ok := numCmp(up.op, up.fvals[0]); !ok {
-			continue
+		// A set rules a block out when none of its values falls inside the zone (zoneMayMatch), which
+		// needs no per-value predicate. Every other probe must be one comparison numCmp knows.
+		if up.op != "in" {
+			if len(up.fvals) != 1 {
+				continue
+			}
+			if _, ok := numCmp(up.op, up.fvals[0]); !ok {
+				continue
+			}
 		}
 		idxs = append(idxs, idx)
 		preds = append(preds, fieldPred{fieldID: id, tests: []zoneTest{{op: up.op, vals: up.fvals}}})

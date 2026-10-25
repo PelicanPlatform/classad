@@ -9,6 +9,8 @@ import (
 // subtle scope/short-circuit/laziness semantics (conditional, list, record,
 // function call, select, subscript) are emitted as OpEvalNode and delegated to
 // the tree-walking evaluator at run time; the rest are native instructions.
+// The one function call compiled natively is member/identicalMember over a
+// list of constants (OpMember).
 func CompileProgram(expr ast.Expr) *Program {
 	c := &compiler{p: &Program{}, seen: map[string]bool{}}
 	if astHeight(expr) >= maxNativeDepth {
@@ -162,9 +164,15 @@ func (c *compiler) emit(expr ast.Expr) {
 		j := c.ins(OpJmpIfNotUndef, -1)
 		c.emit(v.Right)
 		c.patch(j, len(c.p.code))
+	case *ast.FunctionCall:
+		// member/identicalMember over a constant list is native; every other call
+		// is delegated.
+		if !c.emitMember(v) {
+			c.ins(OpEvalNode, c.addNode(expr))
+		}
 	default:
-		// ConditionalExpr, ListLiteral, RecordLiteral, FunctionCall, SelectExpr,
-		// SubscriptExpr, or any future node: delegate to the evaluator.
+		// ConditionalExpr, ListLiteral, RecordLiteral, SelectExpr, SubscriptExpr,
+		// or any future node: delegate to the evaluator.
 		c.ins(OpEvalNode, c.addNode(expr))
 	}
 }

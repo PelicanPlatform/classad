@@ -10,8 +10,9 @@ import (
 // Probe is an index-satisfiable constraint extracted from a query: a self-scoped
 // attribute Attr related by Op to one or more literal values. Op is one of
 // "==","!=","<","<=",">=",">" (a single Val), "!<","!<=","!>","!>=" (a NEGATED ordering
-// comparison, which is not the flipped one -- see negOrdering), "in" (a set of Vals, from an
-// OR-of-equalities), "is"/"isnt" (=?=/=!= exact identity), or "present"/"absent"
+// comparison, which is not the flipped one -- see negOrdering), "in" (a set of Vals: the
+// attribute is == to one of them, from an OR-of-equalities or a member() call over a
+// constant list), "is"/"isnt" (=?=/=!= exact identity), or "present"/"absent"
 // (is/isnt undefined). A store matches Probes against its configured indexes to
 // build a candidate set; because the store still re-verifies the full query, any
 // Probe the planner omits only costs selectivity, never correctness.
@@ -69,16 +70,57 @@ func (q *Query) ExactProbes() (probes []Probe, exact bool) {
 	}
 	conj := flattenAnd(q.foldedExpr(), nil)
 	out := make([]Probe, 0, len(conj))
+	allExact := true
 	for _, c := range conj {
 		p, ok := probeFrom(c)
 		if !ok {
 			return out, false // an unrecognized conjunct: the probe set does not cover the query
 		}
 		out = append(out, p)
+		allExact = allExact && probeIsExact(c, p)
+	}
+	if !allExact {
+		return out, false // every conjunct is probed, but some probe is only a superset of it
 	}
 	// A pinned CurrentTime was folded into the probes, which is exact only for an ad that
 	// does not define CurrentTime.
 	return out, len(out) > 0 && !q.prog.foldNow
+}
+
+// probeIsExact reports whether probe p, which probeFrom built from conjunct c, holds for exactly
+// the records c is TRUE for -- rather than for a superset of them, which is all a candidate filter
+// needs. Two recognized shapes are only supersets:
+//
+//   - identicalMember(attr, {...}) plans as "in", the attribute == one of the values. =?= implies ==,
+//     but not conversely: 1.0 == 1 while 1.0 =?= 1 is FALSE, and "A" == "a" while "A" =?= "a" is FALSE.
+//   - an OR-of-equalities whose literals mix strings with numbers. `x == 1 || x == "a"` is ERROR, not
+//     TRUE, for x = "a", because the first disjunct is ERROR (a string compared with a number) and
+//     ERROR || TRUE is ERROR. "in" reads as the union of the equalities, which counts x = "a". With
+//     one kind of literal no disjunct can be ERROR where another is TRUE, so the union is exact.
+//
+// member(attr, {...}) itself is exact: it is TRUE precisely when some element compares == TRUE,
+// because the reference skips an element whose comparison is ERROR or UNDEFINED rather than
+// propagating it.
+func probeIsExact(c ast.Expr, p Probe) bool {
+	switch v := unparen(c).(type) {
+	case *ast.FunctionCall:
+		identical, isMember := isMemberFunc(v.Name)
+		return !isMember || !identical
+	case *ast.BinaryOp:
+		if v.Op != "||" {
+			return true
+		}
+		var str, num bool
+		for _, val := range p.Vals {
+			if val.IsString() {
+				str = true
+			} else {
+				num = true
+			}
+		}
+		return !str || !num
+	}
+	return true
 }
 
 // ProbeGroup is a conjunction of index probes -- a candidate matches the group when
@@ -282,8 +324,12 @@ func probeFrom(c ast.Expr) (Probe, bool) {
 		}
 		return Probe{}, false
 	}
-	// isUndefined(attr) is a presence probe (matches when attr is absent/undefined).
+	// isUndefined(attr) is a presence probe (matches when attr is absent/undefined);
+	// member(attr, {constants}) is set membership.
 	if fc, ok := c.(*ast.FunctionCall); ok {
+		if p, ok := memberProbe(fc); ok {
+			return p, true
+		}
 		return undefinedFuncProbe(fc, false)
 	}
 	// A bare attribute reference (`HAS_CVMFS`) is a truthiness test. Only a categorical
@@ -362,6 +408,48 @@ func orEqProbe(b *ast.BinaryOp) (Probe, bool) {
 		return Probe{}, false
 	}
 	return Probe{Attr: attr, Op: "in", Vals: vals}, true
+}
+
+// memberProbe builds a set-membership probe from member(attr, {c1, c2, ...}) or
+// identicalMember(attr, {...}) over a self-scoped attribute and a list of constants.
+//
+// member is TRUE exactly when attr == some element is TRUE, which is what "in" means. An
+// UNDEFINED or ERROR element is never == to anything, so it is dropped without changing the
+// set. identicalMember is TRUE only where member is (=?= implies ==), so "in" is a sound
+// superset for it -- except that =?= does find an UNDEFINED or ERROR element, which "in" cannot
+// say (identicalMember(attr, {undefined}) holds where attr is absent), so such a list is not
+// probed at all. ExactProbes knows the identicalMember probe is only a superset (probeIsExact).
+//
+// A list with no element left (`member(attr, {})`) can never be TRUE, but it is not probed:
+// an empty "in" is not a shape the probe consumers are written for, and declining costs only
+// selectivity.
+func memberProbe(fc *ast.FunctionCall) (Probe, bool) {
+	identical, ok := isMemberFunc(fc.Name)
+	if !ok || len(fc.Args) != 2 {
+		return Probe{}, false
+	}
+	name, ok := indexableRef(fc.Args[0])
+	if !ok {
+		return Probe{}, false
+	}
+	elems, ok := constListOf(fc.Args[1])
+	if !ok {
+		return Probe{}, false
+	}
+	vals := make([]classad.Value, 0, len(elems))
+	for _, v := range elems {
+		if v.IsUndefined() || v.IsError() {
+			if identical {
+				return Probe{}, false
+			}
+			continue
+		}
+		vals = append(vals, v)
+	}
+	if len(vals) == 0 {
+		return Probe{}, false
+	}
+	return Probe{Attr: name, Op: "in", Vals: vals}, true
 }
 
 // indexableRef returns the name of a self-scoped (unscoped or MY) attribute

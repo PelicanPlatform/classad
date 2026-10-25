@@ -25,8 +25,8 @@ import (
 //	a boolean or expression column      -> a forced decline, which must reach the scan and agree
 //
 // and the constraint draws cover match-all, match-none, numeric conjunctions (the predicate
-// analysis path), string equalities (the dictionary prune), disjunctions (the vector path) and
-// presence probes.
+// analysis path), string equalities (the dictionary prune), disjunctions (the vector path),
+// presence probes and member() over constant lists (set-membership probes).
 
 // Func is an aggregate function. Mirrors db.AggFunc's set without importing it.
 type Func int
@@ -374,8 +374,8 @@ func constraintFrom(s *src, depth int) string {
 		return fmt.Sprintf("(Status == %d) || (Mem > %d)", pick(s, statusLits), pick(s, memLits))
 	case 8: // presence, including on attributes the columns do not carry
 		return pick(s, groupAttrs) + pick(s, []string{" is undefined", " isnt undefined", " =?= undefined", " =!= undefined"})
-	case 9: // a plain numeric comparison on a column of each width
-		switch s.n(5) {
+	case 9: // a plain numeric comparison on a column of each width, or set membership
+		switch s.n(6) {
 		case 0:
 			return "ProcId " + pick(s, []string{"==", "<", ">="}) + " " + strconv.FormatInt(pick(s, procLits), 10)
 		case 1:
@@ -384,8 +384,23 @@ func constraintFrom(s *src, depth int) string {
 			return "Prio " + pick(s, []string{"==", "<", ">="}) + " " + strconv.FormatInt(int64(-20+s.n(41)), 10)
 		case 3:
 			return "Big " + pick(s, []string{"<", ">="}) + " " + strconv.FormatInt(int64(s.n(200)), 10)
-		default:
+		case 4:
 			return "Rate " + pick(s, []string{"==", "<", ">="}) + " " + pick(s, rateLits)
+		default:
+			// member over a constant list: an "in" probe for the value index, the zones and the
+			// dictionary prune, and a compiled set for the row and vector evaluators.
+			switch s.n(4) {
+			case 0:
+				return fmt.Sprintf("member(ClusterId, {%d, %d, %d})", 1000+s.n(200), 1000+s.n(200), 1000+s.n(200))
+			case 1:
+				return fmt.Sprintf("member(ClusterId, {%d, %d.0, true}) && Status == %d",
+					1000+s.n(200), 1000+s.n(200), pick(s, statusLits))
+			case 2:
+				return fmt.Sprintf("member(Owner, {%s, %s})", strconv.Quote(pick(s, ownerLits)), strconv.Quote(pick(s, ownerLits)))
+			default:
+				return fmt.Sprintf("identicalMember(Owner, {%s}) || member(Status, {%d, %d})",
+					strconv.Quote(pick(s, ownerLits)), pick(s, statusLits), pick(s, statusLits))
+			}
 		}
 	case 10: // a range every value a zone can bound satisfies; see zoneWideConds
 		return pick(s, zoneWideConds)

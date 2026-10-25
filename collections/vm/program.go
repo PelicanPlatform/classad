@@ -27,6 +27,8 @@ type Program struct {
 	ops    []string        // OpBinop / OpUnop operator strings
 	refs   []refInfo       // OpLoadRef
 	nodes  []ast.Expr      // OpEvalNode (delegated subtrees)
+	// members are the constant lists of member/identicalMember calls (OpMember).
+	members []*memberSet
 
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick
