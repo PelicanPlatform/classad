@@ -1,0 +1,24 @@
+{
+  "categorical": [
+    "Owner"
+  ],
+  "value": [
+    "ClusterId"
+  ],
+  "auto": [
+    "ClusterId"
+  ],
+  "hot": [
+    "Owner",
+    "JobStatus"
+  ],
+  "encrypted": [
+    "Arguments"
+  ],
+  "schemaRequire": [
+    "ImageSize"
+  ],
+  "timeTravel": true,
+  "timeTravelMaxSeconds": 600,
+  "timeTravelCheckpointSeconds": 60
+}
