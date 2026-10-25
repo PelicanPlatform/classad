@@ -184,3 +184,47 @@ func TestValHistogramCDFProperties(t *testing.T) {
 		t.Errorf("<=20 (%.4f) + >20 (%.4f) != 1", lo, hi)
 	}
 }
+
+// TestValHistogramStrictVsInclusive pins the one place `<` and `<=` must disagree: a value held
+// by more records than a bucket's depth gets a bucket of its own, topped by that value, and the
+// records holding it belong to `<=` and not to `<`.
+//
+// Interpolating to the top of that bucket for both put the whole point mass on the strict side.
+// With a history whose ExitCode is 96% zero that read `ExitCode < 0` as 96% of the table rather
+// than the 2% it matches, which is over the fraction at which an index walk stops paying -- so
+// the query that the index serves best was planned as a full scan.
+func TestValHistogramStrictVsInclusive(t *testing.T) {
+	// 2% below zero, 96% at zero, 2% above: one dominant value, as a status column has.
+	keys := []float64{-3, -2, -1, 0, 1, 2, 3}
+	counts := []uint64{70, 70, 60, 9600, 70, 70, 60}
+	var total uint64
+	for _, c := range counts {
+		total += c
+	}
+	h := buildValHistogram(keys, counts, total)
+	if h == nil {
+		t.Fatal("no histogram")
+	}
+	below := float64(counts[0]+counts[1]+counts[2]) / float64(total) // 2%
+
+	if got := h.estRange("<", 0); math.Abs(got-below) > 0.01 {
+		t.Errorf("estRange(\"<\", 0) = %.4f, want ~%.4f -- the records AT 0 are not below it", got, below)
+	}
+	if got := h.estRange("<=", 0); got < below+0.9 {
+		t.Errorf("estRange(\"<=\", 0) = %.4f, want ~%.4f -- the records at 0 ARE <= it", got, below+0.96)
+	}
+	if got := h.estRange(">=", 0); got < 0.9 {
+		t.Errorf("estRange(\">=\", 0) = %.4f, want ~0.98 -- the records at 0 are >= it", got)
+	}
+	if got := h.estRange(">", 0); got > 0.1 {
+		t.Errorf("estRange(\">\", 0) = %.4f, want ~0.02 -- the records at 0 are not above it", got)
+	}
+	// Each strict op stays complementary to its inclusive opposite.
+	for _, p := range []struct{ a, b string }{{"<", ">="}, {"<=", ">"}} {
+		for _, x := range []float64{-3, -1, 0, 1, 3, 7} {
+			if lo, hi := h.estRange(p.a, x), h.estRange(p.b, x); math.Abs(lo+hi-1) > 1e-9 {
+				t.Errorf("%s%v (%.4f) + %s%v (%.4f) != 1", p.a, x, lo, p.b, x, hi)
+			}
+		}
+	}
+}

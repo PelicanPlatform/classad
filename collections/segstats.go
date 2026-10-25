@@ -163,14 +163,57 @@ func (h *valHistogram) cdf(t float64) float64 {
 	return (cumPrev + frac*(float64(h.cum[i])-cumPrev)) / total
 }
 
+// cdfBelow estimates the fraction of indexable records with value STRICTLY below t.
+//
+// It differs from cdf only when t is itself a bucket boundary, and there it is the whole
+// difference. A bucket closes on the key that fills it, so a value held by more records than a
+// bucket's depth becomes a bucket whose top boundary IS that value -- and cdf, interpolating to
+// the top of that bucket, charges every one of those records to `< t`. For an attribute
+// dominated by one value, which a job-status or exit-code column is, that is most of the table.
+// A real case: with 96% of a history's ExitCode equal to 0, `ExitCode < 0` was estimated at 96%
+// of the records rather than the 2% it matches, which pushed it past the over-read gate and
+// turned an index walk into a full scan.
+//
+// The estimate here is the cumulative count BELOW the boundary bucket, which is exact when the
+// bucket is a single heavy value (the case that matters) and otherwise low by at most what the
+// bucket holds -- one bucket depth, ~1/histMaxBuckets of the records. Erring by a bucket depth
+// is the right trade against erring by a point mass.
+func (h *valHistogram) cdfBelow(t float64) float64 {
+	n := len(h.bound)
+	total := float64(h.cum[n-1])
+	if total <= 0 || t <= h.lo {
+		return 0
+	}
+	if t > h.bound[n-1] {
+		return 1
+	}
+	i := sort.Search(n, func(j int) bool { return h.bound[j] >= t })
+	if i < n && h.bound[i] == t {
+		if i == 0 {
+			return 0
+		}
+		return float64(h.cum[i-1]) / total
+	}
+	return h.cdf(t)
+}
+
 // estRange returns the estimated fraction of indexable records passing op against t.
+//
+// The strict and inclusive forms are NOT the same estimate: they differ by whatever mass sits
+// exactly at t, which for a skewed attribute is most of the column. Each side is therefore
+// measured from the bound that excludes or includes it, so `<` and `>=` stay complementary, as
+// do `<=` and `>`.
 func (h *valHistogram) estRange(op string, t float64) float64 {
-	f := h.cdf(t)
+	clamp := func(f float64) float64 { return math.Max(0, math.Min(1, f)) }
 	switch op {
-	case "<", "<=":
-		return math.Max(0, math.Min(1, f))
-	case ">", ">=":
-		return math.Max(0, math.Min(1, 1-f))
+	case "<":
+		return clamp(h.cdfBelow(t))
+	case "<=":
+		return clamp(h.cdf(t))
+	case ">":
+		return clamp(1 - h.cdf(t))
+	case ">=":
+		return clamp(1 - h.cdfBelow(t))
 	}
 	return 1
 }
