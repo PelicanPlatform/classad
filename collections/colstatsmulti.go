@@ -206,12 +206,17 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 	var cand candSet
 	var sc predScratch
 	ct := predsNeedCT(preds)
+	zp := predZoneProbes(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
 			if ct && !w.ctFree {
 				releaseWindows(wins) // a folded predicate is exact only in a proven window
 				return NumStats{}, false
+			}
+			// No record here can match, so none contributes; see schemaScanCountMulti.
+			if c.segZoneExcludes(w, zp, ct) {
+				continue
 			}
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)

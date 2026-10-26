@@ -3,6 +3,7 @@ package collections
 import (
 	"math"
 	"math/bits"
+	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -46,6 +47,36 @@ type fieldPred struct {
 	// ct marks a predicate from a query's CurrentTime-folded form (numPredsCT): it holds only for
 	// records without CurrentTime, so a scan using it must answer from proven windows alone.
 	ct bool
+	// probes are the query conjuncts this predicate was built from, which is the form a SEGMENT's
+	// zone map reasons about (zoneExcludes). Block zones cover only the fields a segment's own schema
+	// carries, so a segment sealed before the field joined the schema has no block zone for it and
+	// only its segment zone can rule it out.
+	probes []vm.Probe
+}
+
+// segZonePrunes counts the segments a column aggregate skipped on the segment zone map, so a test
+// can tell a pruned segment from one that was read and happened to contribute nothing.
+var segZonePrunes atomic.Int64
+
+// predZoneProbes collects the probes behind preds, for zoneExcludes. Every one is a required
+// conjunct of the query preds came from, so any of them ruling a segment out is sound.
+func predZoneProbes(preds []fieldPred) []vm.Probe {
+	var out []vm.Probe
+	for _, p := range preds {
+		out = append(out, p.probes...)
+	}
+	return out
+}
+
+// segZoneExcludes is zoneExcludes for the column aggregates: it reports whether w's segment zone map
+// proves no record in it satisfies probes, counting the prune. ct is whether the probes were computed
+// with CurrentTime folded (see zoneExcludes); such probes prune only a window proven free of it.
+func (c *Collection) segZoneExcludes(w segWindow, probes []vm.Probe, ct bool) bool {
+	if len(probes) == 0 || !c.zoneExcludes(w, probes, ct) {
+		return false
+	}
+	segZonePrunes.Add(1)
+	return true
 }
 
 // numPredsCT is numPredsOnFields that also serves a query reading CurrentTime, through its folded
@@ -100,6 +131,7 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 	order := make([]uint32, 0, len(probes))
 	cmps := make(map[uint32][]func(float64) bool, len(probes))
 	tests := make(map[uint32][]zoneTest, len(probes))
+	srcs := make(map[uint32][]vm.Probe, len(probes))
 	for _, p := range probes {
 		id, ok := c.intern.LookupID(p.Attr)
 		if !ok {
@@ -130,6 +162,7 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 		}
 		cmps[id] = append(cmps[id], cmp)
 		tests[id] = append(tests[id], zoneTest{op: up.op, vals: up.fvals})
+		srcs[id] = append(srcs[id], p)
 	}
 	if len(order) == 0 {
 		return nil, false
@@ -137,7 +170,7 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 	preds := make([]fieldPred, 0, len(order))
 	for _, id := range order {
 		list := cmps[id]
-		p := fieldPred{fieldID: id, eval: list[0], tests: tests[id]}
+		p := fieldPred{fieldID: id, eval: list[0], tests: tests[id], probes: srcs[id]}
 		if len(list) > 1 {
 			p.eval = func(v float64) bool {
 				for _, cmp := range list {
@@ -174,12 +207,19 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) (in
 	var cand candSet
 	var sc predScratch
 	ct := predsNeedCT(preds)
+	zp := predZoneProbes(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
 			if ct && !w.ctFree {
 				releaseWindows(wins)
 				return 0, false
+			}
+			// The segment zone first: it is what rules out a segment whose own schema lacks a
+			// predicated field, where the block zones below have nothing to say and the row walk
+			// would read every record.
+			if c.segZoneExcludes(w, zp, ct) {
+				continue
 			}
 			cs := w.seg.colblk.Load()
 			idxs, resolved := resolveFields(cs, preds)

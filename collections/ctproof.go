@@ -470,10 +470,18 @@ type evalSide struct {
 type evalSides struct {
 	orig evalSide
 	fold *evalSide // nil when the query has no folded form
+	// probes and ct are the query's required conjuncts and whether they fold CurrentTime, for
+	// pruning a whole segment on its zone map (excludes) exactly as the row scan does.
+	probes []vm.Probe
+	ct     bool
 }
 
 func (c *Collection) newEvalSides(q *vm.Query) *evalSides {
-	s := &evalSides{orig: evalSide{q: q, m: q.Matcher(), rm: c.newRowMatch(q), prune: !q.ReadsCurrentTime()}}
+	s := &evalSides{
+		orig:   evalSide{q: q, m: q.Matcher(), rm: c.newRowMatch(q), prune: !q.ReadsCurrentTime()},
+		probes: q.Probes(),
+		ct:     q.ReadsCurrentTime(),
+	}
 	if qf := c.foldFor(q); qf != nil && qf.Native() {
 		s.fold = &evalSide{q: qf, m: qf.Matcher(), rm: c.newRowMatch(qf), prune: true}
 	}
@@ -486,6 +494,13 @@ func (s *evalSides) at(w segWindow) *evalSide {
 		return s.fold
 	}
 	return &s.orig
+}
+
+// excludes reports whether w's segment zone map proves no record in it matches the query. It is the
+// only pruning a window gets when it has no columnar block, or when its block's schema lacks the
+// constrained field and so has no block zone for it.
+func (s *evalSides) excludes(c *Collection, w segWindow) bool {
+	return c.segZoneExcludes(w, s.probes, s.ct)
 }
 
 // tests is prunePlan.tests for this side, or nothing when its probes may not prune.

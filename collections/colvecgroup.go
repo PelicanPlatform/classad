@@ -61,6 +61,11 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupID uint32, aggIDs []uint32,
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			// No matching record, so no group: pruning is as sound here as for the count.
+			if sides.excludes(c, w) {
+				split.prunedSegs++
+				continue
+			}
 			// The CurrentTime-folded form where the window is proven free of CurrentTime.
 			sd := sides.at(w)
 			q, m, fallbackM := sd.q, sd.m, sd.rm

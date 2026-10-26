@@ -432,12 +432,17 @@ func (c *Collection) schemaScanGroupStats(groupID uint32, aggIDs []uint32, bucke
 	var gsc groupColScratch
 	aggCols := make([]numCol, len(aggIDs))
 	ct := predsNeedCT(preds)
+	zp := predZoneProbes(preds)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
 			if ct && !w.ctFree {
 				releaseWindows(wins) // a folded predicate is exact only in a proven window
 				return nil, false
+			}
+			// No record here can match, so it adds no group; see schemaScanCountMulti.
+			if c.segZoneExcludes(w, zp, ct) {
+				continue
 			}
 			cs := w.seg.colblk.Load()
 			groupIdx, aggIdxs, predIdxs, ok := resolveGroupFields(cs, groupID, aggIDs, preds)

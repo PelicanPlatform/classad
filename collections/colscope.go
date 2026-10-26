@@ -529,6 +529,9 @@ func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			if sides.excludes(c, w) {
+				continue
+			}
 			sd := sides.at(w)
 			m, fallbackM := sd.m, sd.rm
 			seg := w.seg.colblk.Load()

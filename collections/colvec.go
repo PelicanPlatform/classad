@@ -46,6 +46,7 @@ type vecSplit struct {
 	prunedBlocks int // a zone ruled the block out; no records were examined at all
 	emptyBlocks  int // nothing in the block was visible to this snapshot
 	rowWindows   int
+	prunedSegs   int // the segment zone map ruled the whole window out
 }
 
 // vecScratchPool reuses the vector stack across queries. Without it each call allocated its own stack
@@ -389,6 +390,10 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
+			if sides.excludes(c, w) {
+				split.prunedSegs++
+				continue
+			}
 			// The CurrentTime-folded form where the window is proven free of CurrentTime.
 			sd := sides.at(w)
 			q, m, fallbackM := sd.q, sd.m, sd.rm
