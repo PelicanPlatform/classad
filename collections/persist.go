@@ -596,6 +596,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		c.rebuildDir(sh) // sets sh.act to the last (active) segment
 		tm.DirRebuilt = true
 	}
+	c.openIdxDiag.ChainLinksRepaired += c.relinkActiveChains(sh)
 	tm.DirRestore = time.Since(dirStart)
 	// Map each sealed segment's existing sidecar directly (skip the active append target,
 	// which stays in-RAM): the reopen restores the index by mmapping it instead of
@@ -802,8 +803,13 @@ func (c *Collection) rebuildDir(sh *shard) {
 				// A time-checkpoint marker feeds the shard time index; it never enters the
 				// directory, and its bytes count as dead (as appendMarker does at runtime)
 				// so a history-only segment reaches dead >= used.
+				// Only a time checkpoint feeds the index: a dictionary or columnar record is a
+				// marker too, and its body read as millis put a sequence-0 checkpoint at an
+				// arbitrary time into it.
 				if recIsMarker(seg.data, o) {
-					marks = append(marks, mark{seq, recMarkerMillis(seg.data, o)})
+					if recIsTimeMarker(seg.data, o) {
+						marks = append(marks, mark{seq, recMarkerMillis(seg.data, o)})
+					}
 					seg.dead += int64(total)
 					off += int(total)
 					continue
@@ -890,20 +896,94 @@ func (c *Collection) rebuildDir(sh *shard) {
 	}
 
 	sh.dir = make(map[uint64]loc, len(byKey))
+	// The last segment becomes the write target, and its records' links are not touched here:
+	// relinkActiveChains, which runs after either restore path, owns them. Relinking a current
+	// record in it to the other current records of its bucket, as is done for the sealed ones,
+	// cut it off from the key's older versions in the same segment -- the delta records a read
+	// merges -- and wrote that into the file.
+	actID := noSeg
+	if n := len(sh.segs); n > 0 && sh.segs[n-1] != nil {
+		actID = sh.segs[n-1].id
+	}
 	count := 0
 	for keyStr, b := range byKey {
 		if b.superseded != seqMax {
 			continue // latest version was superseded (deleted) -> key absent
 		}
+		count++
+		if b.loc.seg == actID {
+			continue
+		}
 		h := c.h.Hash([]byte(keyStr))
 		setRecNext(sh.segs[b.loc.seg].data, b.loc.off, dirGetOr(sh.dir, h))
 		sh.dir[h] = b.loc
-		count++
 	}
 	sh.count = count
 	if len(sh.segs) > 0 {
 		sh.act = sh.segs[len(sh.segs)-1]
 	}
+}
+
+// relinkActiveChains rebuilds the bucket chains inside the write-target segment after either
+// restore path, and returns how many links between that segment's records it had to change.
+//
+// Every by-key walk (findCurrent, findVisible, conflictSince, materializeAtWhy) follows a bucket's
+// chain from the directory and then probes every OTHER segment by key index, which skips the
+// write target by construction. So the chain is the only route to a record in the write target,
+// and it must reach every one of them: a delta record a read merges sits there, usually behind
+// the key's current record. Within one segment records are appended in commit order and each was
+// linked to its bucket's head when written, so the correct chain is simply the bucket's records
+// in descending offset. That is what this writes. The oldest record of each bucket is linked to
+// nothing: what lies beyond it is in other segments, which the probe covers, and a link out of the
+// segment could lead back into it through a link an older build wrote. The directory head of
+// each such bucket becomes its newest record here.
+//
+// On a store written by this build nothing between records of the segment changes, so a non-zero
+// count means an earlier recovery had relinked them -- reads of the affected keys merged too few
+// versions until now -- and is reported as ChainLinksRepaired. Links are only written when they
+// differ, so a healthy store's pages are not dirtied. Caller holds the shard lock (Open).
+func (c *Collection) relinkActiveChains(sh *shard) int {
+	act := sh.act
+	if act == nil || sh.appendOnly || sh.dir == nil {
+		return 0
+	}
+	newest := make(map[uint64]uint32) // bucket -> offset of its newest record so far
+	repaired := 0
+	dm := act.damaged()
+	for off := 0; off < act.used; {
+		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
+		total := recTotalLen(act.data, o)
+		if total == 0 || total%8 != 0 || off+int(total) > act.used {
+			break
+		}
+		off += int(total)
+		if recIsMarker(act.data, o) {
+			continue
+		}
+		h := c.h.Hash(recKey(act.data, o))
+		want := noLoc
+		prev, ok := newest[h]
+		if ok {
+			want = loc{seg: act.id, off: prev}
+		}
+		if got := recNext(act.data, o); got != want {
+			// Only a link between two of this segment's records is a repair; the bucket's
+			// oldest record pointing out of the segment is how a healthy chain looks.
+			if ok || got.seg == act.id {
+				repaired++
+			}
+			setRecNext(act.data, o, want)
+		}
+		newest[h] = o
+	}
+	for h, o := range newest {
+		sh.dir[h] = loc{seg: act.id, off: o}
+	}
+	return repaired
 }
 
 // noteDamagedRecord adds the record at off, found failing its checksum, to its segment's damage set.

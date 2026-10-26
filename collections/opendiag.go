@@ -49,6 +49,12 @@ type OpenIndexDiag struct {
 	// damage.
 	DamageStops []OpenDamageStop
 
+	// ChainLinksRepaired is how many bucket-chain links between records of a write-target
+	// segment Open had to rewrite (see relinkActiveChains). Zero on a store this build wrote. A
+	// non-zero count means an earlier crash recovery had cut those links, so until this Open a
+	// read of the affected keys could merge too few delta records and return an older value.
+	ChainLinksRepaired int
+
 	// Timing breaks a persistent Open into its phases so a slow reopen names the phase that
 	// dominated, instead of surfacing only as one elapsed number. Durations accumulate across the
 	// collection's shards; all zero for an in-memory Open. See OpenTiming. Purely observational.
