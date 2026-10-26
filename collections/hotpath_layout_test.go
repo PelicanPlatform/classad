@@ -20,21 +20,33 @@ func TestBlockZoneEntrySize(t *testing.T) {
 	}
 }
 
-// TestNumGroupKeyIsPlainMemory pins numGroupKey to fixed-size scalar fields. A numeric group column looks
-// its group up once per record, and the runtime hashes and compares a key like this as a block of memory;
-// a string or pointer field makes it hash field by field instead, which made a numeric GROUP BY 55%
-// slower when groupKey gained its string. Change it only on purpose.
-func TestNumGroupKeyIsPlainMemory(t *testing.T) {
-	typ := reflect.TypeFor[numGroupKey]()
+// TestGroupKeyIsPlainMemory pins groupKey to fixed-size scalar fields. A group column looks its group
+// up once per record, and the runtime hashes and compares a key like this as a block of memory; a
+// string or pointer field makes it hash field by field instead, which made a numeric GROUP BY 55%
+// slower when the key carried a string. That is why a string COMPONENT is a query-local integer id
+// and not the string. Change it only on purpose.
+func TestGroupKeyIsPlainMemory(t *testing.T) {
+	typ := reflect.TypeFor[groupKey]()
 	for i := 0; i < typ.NumField(); i++ {
-		switch f := typ.Field(i); f.Type.Kind() {
+		f := typ.Field(i)
+		et := f.Type
+		if et.Kind() == reflect.Array {
+			et = et.Elem()
+		}
+		switch et.Kind() {
 		case reflect.Int64, reflect.Uint8:
 		default:
-			t.Fatalf("numGroupKey.%s is a %s; keep the key to fixed-size integers", f.Name, f.Type)
+			t.Fatalf("groupKey.%s is a %s; keep the key to fixed-size integers", f.Name, f.Type)
 		}
 	}
-	if got := unsafe.Sizeof(numGroupKey{}); got != 16 {
-		t.Fatalf("unsafe.Sizeof(numGroupKey{}) = %d, want 16", got)
+	// 2 slots: 2 int64 plus 2 kind bytes, padded to 24. The width is not incidental -- it is hashed
+	// and compared once per record -- and the measurement that chose it is in maxGroupCols's doc.
+	if got := unsafe.Sizeof(groupKey{}); got != 24 {
+		t.Fatalf("unsafe.Sizeof(groupKey{}) = %d, want 24", got)
+	}
+	// And the component the key is assembled from, which is passed by value per record per column.
+	if got := unsafe.Sizeof(groupComp{}); got != 16 {
+		t.Fatalf("unsafe.Sizeof(groupComp{}) = %d, want 16", got)
 	}
 }
 

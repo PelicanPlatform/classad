@@ -2,6 +2,7 @@ package gen
 
 import (
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -121,6 +122,39 @@ func TestGeneratedAdsCarryTheSharpValues(t *testing.T) {
 		if c.n < c.min {
 			t.Errorf("%s: %d of %d records, want at least %d", c.name, c.n, len(ads), c.min)
 		}
+	}
+
+	// Pairs of records whose string group value differs ONLY in case. The dictionaries this data is
+	// read through are fold-ORDERED, so a group key taken from a folded form -- or from a fold
+	// range -- merges such a pair into one group where the record scan gives two. Every other value
+	// above is a collision the two paths must AGREE on; this is the one they must not. Without a
+	// pair in the data a sweep cannot see the difference, and the wrong key passes by luck.
+	for _, attr := range []string{"Owner", "Site"} {
+		byFold := map[string]map[string]int{}
+		for _, ad := range ads {
+			v := ad.EvaluateAttr(attr)
+			if !v.IsString() {
+				continue
+			}
+			str, _ := v.StringValue()
+			f := strings.ToLower(str)
+			if byFold[f] == nil {
+				byFold[f] = map[string]int{}
+			}
+			byFold[f][str]++
+		}
+		pairs := 0
+		for _, spellings := range byFold {
+			if len(spellings) > 1 {
+				pairs++
+			}
+		}
+		if pairs < 1 {
+			t.Errorf("%s: no value appears in two cases, so nothing in this fixture can tell an "+
+				"exact-bytes group key from a fold-keyed one", attr)
+		}
+		t.Logf("%s: %d values spelled in more than one case, out of %d fold-distinct values",
+			attr, pairs, len(byFold))
 	}
 
 	// The presence rates the schema derivation acts on. A string column needs its dominant kind in

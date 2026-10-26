@@ -345,6 +345,22 @@ func (a *Archive) GroupStatsAllBucketed(groupAttr string, bucket int64, aggAttrs
 	return a.c.GroupStatsAllBucketed(groupAttr, bucket, aggAttrs)
 }
 
+// GroupStatsConstraintCols is GroupStatsConstraintBucketed over SEVERAL group columns: the group is
+// the tuple of their (individually bucketed) values. See Collection.GroupStatsQueryCols.
+func (a *Archive) GroupStatsConstraintCols(constraint string, groups []GroupSpec, aggAttrs []string) ([]GroupStats, bool) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, false
+	}
+	return a.c.GroupStatsQueryCols(q, groups, aggAttrs)
+}
+
+// GroupStatsAllCols is GroupStatsAllBucketed over SEVERAL group columns. The caller must have
+// established that its query matches all records. See Collection.GroupStatsQueryCols.
+func (a *Archive) GroupStatsAllCols(groups []GroupSpec, aggAttrs []string) ([]GroupStats, bool) {
+	return a.c.GroupStatsAllCols(groups, aggAttrs)
+}
+
 // GroupCountAll returns the per-value record counts of groupAttr over EVERY record, read out of the
 // columnar blocks. The caller must have established that its query matches all records.
 // ok=false ⇒ not columnar-eligible; group by scanning records.

@@ -200,7 +200,7 @@ func TestGroupCountStringColumn(t *testing.T) {
 	for i := 1; i < len(got); i++ {
 		a, _ := got[i-1].Value.StringValue()
 		b, _ := got[i].Value.StringValue()
-		if !groupLess(got[i-1].Value, got[i].Value) {
+		if !groupValueLess(got[i-1].Value, got[i].Value) {
 			t.Errorf("GROUP BY Owner: groups not ordered at %d (%q then %q)", i, a, b)
 		}
 	}

@@ -140,7 +140,7 @@ func ctSurfaces(t *testing.T, label string, c *Collection, expr string) map[stri
 		served["groupstats"] = true
 		got := map[string][2]int64{}
 		for _, g := range gs {
-			o, _ := g.Value.StringValue()
+			o, _ := g.Values[0].StringValue()
 			got[o] = [2]int64{int64(g.Count), g.Stats[0].IntSum}
 		}
 		if fmt.Sprint(got) != fmt.Sprint(ref.groups) {

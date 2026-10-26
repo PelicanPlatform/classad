@@ -87,6 +87,7 @@ func TestMutableGroupedFromColumnsMatchesScan(t *testing.T) {
 		{"RequestMemory > 4096", "JobStatus",
 			[]AggSpec{{Func: AggCount, Arg: "*", Filter: "RequestCpus >= 4"}}, false, "a FILTER is invisible here"},
 	} {
+
 		groupCols := []GroupCol{{Attr: tc.group}}
 		got, served := GroupedFromColumns(d, tc.constraint, groupCols, tc.aggs)
 		if served != tc.wantServed {
@@ -231,4 +232,44 @@ func BenchmarkMutableGroupedCount(b *testing.B) {
 			}
 		}
 	})
+}
+
+// TestMutableGroupedMultipleColumnsMatchesScan is the mutable half of the multi-column path. A
+// mutable table and an archive share GroupedFromColumns and the storage primitive under it, so this
+// is here to say that the mutable GroupStatsSource reaches it at all -- the archive's own coverage
+// of the shapes is in archive_groupcols_multi_test.go.
+func TestMutableGroupedMultipleColumnsMatchesScan(t *testing.T) {
+	d := mutableGroupFixture(t, 5000)
+	for _, tc := range []struct {
+		constraint string
+		groups     []GroupCol
+		aggs       []AggSpec
+		why        string
+	}{
+		{"true", []GroupCol{{Attr: "Owner"}, {Attr: "JobStatus"}},
+			[]AggSpec{{Func: AggCount, Arg: "*"}}, "a string column beside a numeric one"},
+		{"RequestMemory > 4096", []GroupCol{{Attr: "JobStatus"}, {Attr: "ProcId"}},
+			[]AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggAvg, Arg: "RequestMemory"}},
+			"two numeric columns with a value aggregate"},
+		{"true", []GroupCol{{Attr: "Owner"}, {Attr: "RequestMemory", BucketWidth: 4096}},
+			[]AggSpec{{Func: AggCount, Arg: "*"}}, "per owner per bucket"},
+	} {
+		got, served := GroupedFromColumns(d, tc.constraint, tc.groups, tc.aggs)
+		if !served {
+			t.Errorf("%s GROUP BY %s: declined (%s)", tc.constraint, groupColNames(tc.groups), tc.why)
+			continue
+		}
+		want := scanGroupedMutable(t, d, tc.constraint, tc.groups, tc.aggs)
+		gotM, wantM := tupleRows(t, got), tupleRows(t, want)
+		if len(gotM) != len(wantM) {
+			t.Errorf("%s GROUP BY %s: %d groups, scan found %d",
+				tc.constraint, groupColNames(tc.groups), len(gotM), len(wantM))
+		}
+		for g, v := range wantM {
+			if fmt.Sprint(gotM[g]) != fmt.Sprint(v) {
+				t.Errorf("%s GROUP BY %s: group %q = %v, scan = %v",
+					tc.constraint, groupColNames(tc.groups), g, gotM[g], v)
+			}
+		}
+	}
 }

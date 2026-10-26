@@ -17,8 +17,8 @@ func TestNumAggValueIntExtremesMerged(t *testing.T) {
 		return collections.NumStats{N: 2, Min: float64(lo), Max: float64(hi), IntMin: lo, IntMax: hi,
 			IntSum: lo + hi, Sum: float64(lo) + float64(hi)}
 	}
-	a := collections.GroupStats{Value: classad.NewIntValue(1), Count: 2, Stats: []collections.NumStats{stats(p53, p53+1)}}
-	b := collections.GroupStats{Value: classad.NewIntValue(1), Count: 2, Stats: []collections.NumStats{stats(p53-1, p53+3)}}
+	a := collections.GroupStats{Values: []classad.Value{classad.NewIntValue(1)}, Count: 2, Stats: []collections.NumStats{stats(p53, p53+1)}}
+	b := collections.GroupStats{Values: []classad.Value{classad.NewIntValue(1)}, Count: 2, Stats: []collections.NumStats{stats(p53-1, p53+3)}}
 	mergeGroupStats(&a, &b)
 	if got, want := numAggValue(AggMin, a.Stats[0]), "9007199254740991"; got != want {
 		t.Errorf("MIN = %s, want %s", got, want)
@@ -28,7 +28,7 @@ func TestNumAggValueIntExtremesMerged(t *testing.T) {
 	}
 
 	// Once a real contributes, MIN/MAX are reals rendered from the float64 extremes.
-	r := collections.GroupStats{Value: classad.NewIntValue(1), Count: 1,
+	r := collections.GroupStats{Values: []classad.Value{classad.NewIntValue(1)}, Count: 1,
 		Stats: []collections.NumStats{{N: 1, Min: 0.5, Max: 0.5, Sum: 0.5, AnyReal: true}}}
 	mergeGroupStats(&a, &r)
 	if got := numAggValue(AggMin, a.Stats[0]); got != ValueText(classad.NewRealValue(0.5)) {

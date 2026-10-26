@@ -170,13 +170,17 @@ func (s Shape) Source(i int) string {
 	// distinct*2 <= the block's record count, and the smallest shape here puts ~78 records in a
 	// block, so 40 owners silently cost those shapes their dictionaries (the collections-side
 	// assertion caught exactly that).
-	w("Owner = %q", fmt.Sprintf("u%02d", (i/s.RunLen)%OwnerCardinality))
+	w("Owner = %q", ownerOf(i, s.RunLen))
 	// Host: distinct per record. distinct*2 > records in any block, so dictWorthwhile declines and
 	// this field is read by the positional string walk instead.
 	w("Host = %q", fmt.Sprintf("slot%d@host%d.example.net", i%13, i))
 	// Site: the sharp group column. Three spellings render "undefined" and must land in ONE group;
 	// the number 42 and the string "42" likewise. The moduli are coprime so the exceptions do not
 	// line up with each other or with the predicates a query draws.
+	//
+	// Its ordinary values also come in two CASES (see ownerOf for why that is here and not only a
+	// constraint literal), so the group column that carries every render-alike collision also
+	// carries the pair that must NOT be merged.
 	switch {
 	case i%37 == 3: // absent entirely
 	case i%37 == 11:
@@ -188,7 +192,11 @@ func (s Shape) Source(i int) string {
 	case i%47 == 9:
 		w("Site = %q", "42") // ... beside the string that renders identically to it
 	default:
-		w("Site = %q", fmt.Sprintf("site-%02d", (i/3)%12))
+		site := fmt.Sprintf("site-%02d", (i/3)%12)
+		if i%5 == 2 {
+			site = strings.ToUpper(site)
+		}
+		w("Site = %q", site)
 	}
 	// NumLike: a STRING column whose values are the decimal spellings of the integers ProcId holds,
 	// with a minority stored as actual integers. Two storage kinds, one rendered group.
@@ -288,6 +296,30 @@ const (
 	// OwnerCardinality is the number of distinct Owner values. See Source for why it is this low.
 	OwnerCardinality = 16
 )
+
+// ownerOf is record i's Owner: OwnerCardinality lower-case values in runs of RunLen, with two of
+// them ALSO spelled in upper case for part of their run.
+//
+// The case variants are the fixture's statement that group identity is the EXACT BYTES. The
+// dictionaries this data is read through are fold-ORDERED and the comparison path works in fold
+// ranges, so a group key derived from a folded form -- or from a fold range -- would merge "u07"
+// with "U07" and report one group where the record scan gives two. Without a pair of records that
+// differ ONLY in case, a sweep over this data cannot tell the two apart and such a key passes by
+// luck. ("U07" was already a constraint literal, which exercises the dictionary PRUNE; that is a
+// different question from identity.)
+//
+// Two owners, not sixteen: dictWorthwhile needs distinct*2 <= the block's record count, the
+// smallest shape here puts ~78 records in a block, and a spelling per owner would push the distinct
+// count past half of that and silently cost those shapes their dictionaries.
+func ownerOf(i, runLen int) string {
+	o := (i / runLen) % OwnerCardinality
+	lower := fmt.Sprintf("u%02d", o)
+	switch {
+	case o == 7 && i%3 == 0, o == 15 && i%5 == 0:
+		return strings.ToUpper(lower)
+	}
+	return lower
+}
 
 // hasNaN reports whether record i is one of the records whose Rate is patched to NaN.
 func hasNaN(i int) bool { return i%107 == 23 }
