@@ -335,6 +335,14 @@ type Options struct {
 	// exactly as before. See timeseq.go. It can be toggled at runtime.
 	TimeTravel *TimeTravelOptions
 
+	// SeqCursorLease is how long a paged read (QueryRawFromSeq) keeps a shard's snapshot
+	// readable after taking it: compaction retains the versions it sees, or in a collection
+	// with delta records defers reclaiming the shard, for at most this long. A cursor resumed
+	// after maintenance has reclaimed past its snapshot gets ErrSeqCursorExpired rather than
+	// a short listing. Zero means 10 minutes; negative disables the lease, leaving only the
+	// refusal. See seqlease.go.
+	SeqCursorLease time.Duration
+
 	// MutatingBlockCacheBytes and ArchiveBlockCacheBytes set the PROCESS-GLOBAL shared
 	// decompressed-columnar-block cache budgets, in bytes, for the two workload kinds: one budget
 	// shared by ALL mutating (sharded, key-superseding) collections, and a separate one shared by ALL
@@ -729,6 +737,9 @@ func New(opts Options) *Collection {
 	for i := range shards {
 		shards[i] = newShard(segSize, opts.CommitSync)
 		shards[i].appendOnly = opts.AppendOnly
+		if opts.SeqCursorLease != 0 {
+			shards[i].leaseFor = opts.SeqCursorLease
+		}
 	}
 	c := &Collection{
 		shards: shards,

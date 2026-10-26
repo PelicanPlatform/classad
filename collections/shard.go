@@ -54,12 +54,21 @@ type shard struct {
 	commitSeq uint64 // bumped once per committed batch; scan snapshots capture it
 	count     int    // number of live keys
 
-	// gcFloor is the commit sequence at the most recent compaction: superseded/delete
+	// gcFloor is the retain floor of the most recent reclamation: superseded/delete
 	// evidence at or below it may have been reclaimed. A transaction whose snapshot
 	// predates it cannot prove a currently-absent key was not deleted after its
-	// snapshot, so conflictSince conservatively treats such a write as a conflict.
-	// Guarded by mu.
+	// snapshot, so conflictSince conservatively treats such a write as a conflict, and a
+	// paged read whose snapshot predates it is refused (seqlease.go). Open starts it at
+	// the recovered commit sequence, since what an earlier process reclaimed is not
+	// recorded. Guarded by mu.
 	gcFloor uint64
+
+	// leases protects paged reads' snapshots from reclamation for leaseFor after they are
+	// taken, read through leaseNow (seqlease.go). leaseFor <= 0 disables leasing. Set at
+	// construction.
+	leases   seqLeases
+	leaseFor time.Duration
+	leaseNow func() time.Time
 
 	segSize int
 
@@ -187,9 +196,11 @@ type supRef struct {
 
 func newShard(segSize int, onSync func()) *shard {
 	sh := &shard{
-		dir:     make(map[uint64]loc),
-		segSize: segSize,
-		onSync:  onSync,
+		dir:      make(map[uint64]loc),
+		segSize:  segSize,
+		onSync:   onSync,
+		leaseFor: defaultSeqCursorLease,
+		leaseNow: time.Now,
 	}
 	sh.scond = sync.NewCond(&sh.smu)
 	return sh

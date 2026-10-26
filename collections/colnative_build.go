@@ -392,8 +392,11 @@ func (c *Collection) reconstructFullRecords(src *segment, skip func(uint32) bool
 // columnarize a segment because it held a delta was self-defeating: the segment then KEEPS the
 // delta, which is the state this exists to prevent.
 type deltaPlan struct {
-	drop map[uint32]struct{}
-	full map[uint32][]byte // materialized whole ad, by source offset
+	// retain is the retain floor the plan was made against: every dropped delta was
+	// superseded at or below it, so committing the plan raises the shard's gcFloor to it.
+	retain uint64
+	drop   map[uint32]struct{}
+	full   map[uint32][]byte // materialized whole ad, by source offset
 	// unresolved marks a segment holding a delta that must survive but whose chain would not
 	// merge. Carried on the plan rather than returned separately so a caller cannot compute a
 	// plan and forget to check it.
@@ -438,7 +441,7 @@ func (c *Collection) planDeltasLocked(sh *shard, src *segment) *deltaPlan {
 		}
 		if !recIsMarker(src.data, o) && recIsDelta(src.data, o) {
 			if plan == nil {
-				plan = &deltaPlan{drop: map[uint32]struct{}{}, full: map[uint32][]byte{}}
+				plan = &deltaPlan{retain: retain, drop: map[uint32]struct{}{}, full: map[uint32][]byte{}}
 			}
 			sup := recSuperseded(src.data, o)
 			if sup != seqMax && sup <= retain {
@@ -600,6 +603,12 @@ func (c *Collection) columnarizeSealedSegment(sh *shard, src *segment, s *adSche
 			if sup != recSuperseded(dst.data, newOffs[i]) {
 				dst.supersedeRec(newOffs[i], sup)
 			}
+		}
+		// The deltas the plan dropped were superseded at or below its retain floor, which is
+		// reclaiming versions like compaction does: raise the floor with them, so a transaction
+		// or paged read whose snapshot predates it does not trust what is gone.
+		if plan != nil && len(plan.drop) > 0 && plan.retain > sh.gcFloor {
+			sh.gcFloor = plan.retain
 		}
 	}
 	// Reconcile by-key resolution to the new offsets in the SAME critical section as the swap. dst

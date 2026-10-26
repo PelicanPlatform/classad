@@ -45,6 +45,8 @@ func (e *ServerError) Is(target error) bool {
 		return strings.HasPrefix(e.Msg, readOnlyTablePrefix)
 	case ErrArchiveTable:
 		return strings.HasPrefix(e.Msg, archiveTablePrefix)
+	case ErrCursorExpired:
+		return strings.HasPrefix(e.Msg, cursorExpiredPrefix)
 	}
 	return false
 }
@@ -61,3 +63,15 @@ var ErrTableReadOnly = errors.New("dbrpc: table is read-only")
 // the same way on replay, so surface it rather than retry -- and do not read it as the
 // table being absent, which is what "no such table" means and this does not.
 var ErrArchiveTable = errors.New("dbrpc: table is an append-only archive")
+
+// ErrCursorExpired reports that a paginated read's cursor names a snapshot the server has
+// since reclaimed versions of -- its lease ran out before the listing finished, or the
+// server restarted -- so the rest of that listing cannot be read. It arrives as a
+// *ServerError before any row of the page. Replaying the same cursor fails the same way:
+// restart the listing from the zero cursor, and surface the restart to whoever holds the
+// page token rather than presenting the rows so far as the whole list.
+var ErrCursorExpired = errors.New("dbrpc: pagination cursor expired")
+
+// cursorExpiredPrefix opens the message of a cursor-expired refusal, which the client maps to
+// ErrCursorExpired.
+const cursorExpiredPrefix = "cursor expired: "

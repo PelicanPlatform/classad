@@ -155,6 +155,12 @@ func (c *Collection) Compact() int {
 // is pin-aware so an in-flight scan keeps the mapping mapped until it unpins.
 func (c *Collection) reclaimDeadShard(sh *shard) int {
 	sh.mu.Lock()
+	// A paged read's lease holds back the reclaim of a delta store: a superseded record here
+	// can be the base a delta the leased snapshot still reads merges from (seqlease.go).
+	if sh.reclaimDeferredLocked(c.deltaRead) {
+		sh.mu.Unlock()
+		return 0
+	}
 	retain := sh.retainFloorLocked()
 	var dead []*segment
 	for _, seg := range sh.segs {
@@ -501,6 +507,13 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			return // still dirty after a collapse: leave the shard alone rather than strand it
 		}
 		c.collapseLiveChains(false) // active segments only; this is exactly what is dirty
+	}
+	// A paged read's lease holds back the rewrite of a delta store: this pass would drop the
+	// bases of deltas the leased snapshot still reads, and its interning path drops in-window
+	// superseded deltas outright (seqlease.go).
+	if sh.reclaimDeferredLocked(c.deltaRead) {
+		sh.mu.Unlock()
+		return
 	}
 	retain := sh.retainFloorLocked()
 	origLen := len(sh.segs)

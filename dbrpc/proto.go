@@ -224,8 +224,9 @@ const (
 	//
 	// The cursor is (shard, snapshot, seq, key) because the order is per shard -- a shard is
 	// finished before the next is opened and each is frozen at the sequence it had when its
-	// first page was taken (see collections.SeqCursor). It names no physical position, so a
-	// compaction between pages cannot invalidate it.
+	// first page was taken (see collections.SeqCursor). It names no physical position, so
+	// compaction moving records does not disturb it; a cursor whose snapshot the server has
+	// since reclaimed is refused with an error prefixed cursorExpiredPrefix before any row.
 	//
 	// Separate opcode rather than a flag on opQueryRawProj so an older server rejects it as a
 	// bad request and the client falls back to an unpaginated read.

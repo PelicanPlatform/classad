@@ -207,13 +207,18 @@ type (
 	SeqPage   = collections.SeqPage
 )
 
+// ErrSeqCursorExpired is collections.ErrSeqCursorExpired: a page's Err wraps it when the
+// cursor's snapshot has been reclaimed, and the listing must restart from the zero cursor.
+var ErrSeqCursorExpired = collections.ErrSeqCursorExpired
+
 // QueryRawProjectedFromSeq is QueryRawProjected a page at a time: it yields at
 // most limit matching ads after the cursor and reports where to resume.
 //
 // The order is the store's commit sequence, which is what makes the cursor
 // stable — see collections.QueryRawFromSeq. A caller pages by handing back the
 // previous page's Next until More is false. The zero cursor starts at the
-// beginning.
+// beginning. After consuming a page's rows, check its Err: a cursor whose
+// snapshot has been reclaimed yields nothing and Err wraps ErrSeqCursorExpired.
 //
 // This is for a mutable table. An archive is already ordered newest-first with
 // its limit pushed down, so a "last K" read there needs no cursor at all.
