@@ -134,3 +134,18 @@ func (s *ScanStats) segments(total, pruned int) {
 		s.SegmentsScanned += total - pruned
 	}
 }
+
+// mergeWorker folds a parallel worker's private counts into s.
+//
+// Only the per-RECORD counters. The segment verdicts (total, pruned, and the index ones) are
+// settled on the calling goroutine before any worker starts, so adding them here would report
+// each segment once per worker.
+func (s *ScanStats) mergeWorker(w *ScanStats) {
+	if s == nil || w == nil {
+		return
+	}
+	s.RecordsVisited += w.RecordsVisited
+	s.RecordsColumnDecided += w.RecordsColumnDecided
+	s.RecordsReassembled += w.RecordsReassembled
+	s.RowsMatched += w.RowsMatched
+}

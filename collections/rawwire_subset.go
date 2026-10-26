@@ -68,7 +68,18 @@ func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact 
 		if len(projection) > 0 {
 			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
 		}
-		c.scanQuery(c.newQueryPlan(q, proj, stats), c.yieldWireRow(yield, sel))
+		qp := c.newQueryPlan(q, proj, stats)
+		rp := c.planReadQuery(qp)
+		// A full-scan constrained read fans out across segments, on the same terms the full-decode
+		// Query does: no index plan to walk (the fan-out visits whole segments), and no reverse
+		// order to preserve. The helper declines when the scan is too small or the worker budget
+		// is busy, and then the serial run below covers it -- the read is planned once either way.
+		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 && !c.reverseScan {
+			if c.runParallelWireQuery(qp, sel, sel.neededCount(), yield) {
+				return
+			}
+		}
+		c.runQuery(qp, rp, c.yieldWireRow(yield, sel))
 	}
 }
 

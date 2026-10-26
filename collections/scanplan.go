@@ -104,8 +104,8 @@ func constTrue(qp *queryPlan) bool {
 }
 
 // workerPlan clones qp with fresh per-goroutine execution state (a Matcher, a
-// wireScope and a bound resolver). The program, read plan and probes it references
-// are immutable and shared.
+// wireScope, a bound resolver and the projection plan's segment cache). The program,
+// read plan and probes it references are immutable and shared.
 //
 // The stats sink is dropped: ScanStats is not safe for concurrent accumulation, and
 // a worker that inherited one would corrupt an EXPLAIN ANALYZE rather than fail.
@@ -115,9 +115,19 @@ func (c *Collection) workerPlan(qp queryPlan) queryPlan {
 	qp.ws = ws
 	qp.resolver = ws.resolve
 	qp.stats = nil
+	// The projection plan caches one segment's resolved id space IN ITSELF (projPlan.localWanted),
+	// so despite its name it is execution state and not program. Workers steal different segments,
+	// so a shared one is both a data race on the cache fields and a chance to narrow a record with
+	// the ids another segment's dictionary resolved -- which keeps the wrong attributes rather than
+	// failing. Only the cache is reset; the resolved names and global ids are immutable and shared.
+	if qp.proj != nil {
+		p := *qp.proj
+		p.localDict, p.local = nil, nil
+		qp.proj = &p
+	}
 	if qp.fold != nil {
 		f := *qp.fold
-		f.m, f.ws, f.resolver, f.stats = f.q.Matcher(), ws, ws.resolve, nil
+		f.m, f.ws, f.resolver, f.stats, f.proj = f.q.Matcher(), ws, ws.resolve, nil, qp.proj
 		qp.fold = &f
 	}
 	return qp
