@@ -20,29 +20,56 @@ func TestBlockZoneEntrySize(t *testing.T) {
 	}
 }
 
-// TestGroupKeyIsPlainMemory pins groupKey to fixed-size scalar fields. A group column looks its group
-// up once per record, and the runtime hashes and compares a key like this as a block of memory; a
-// string or pointer field makes it hash field by field instead, which made a numeric GROUP BY 55%
-// slower when the key carried a string. That is why a string COMPONENT is a query-local integer id
-// and not the string. Change it only on purpose.
+// TestGroupKeyIsPlainMemory pins every packed key type to fixed-size scalar fields, and pins its
+// WIDTH.
+//
+// A group column looks its group up once per record, and the runtime hashes and compares a key like
+// this as a block of memory; a string or pointer field makes it hash field by field instead, which
+// made a numeric GROUP BY 55% slower when the key carried a string. That is why a string COMPONENT
+// is a query-local integer id and not the string.
+//
+// The widths are the point of there being three types. One key per arity exists so that a
+// one-column GROUP BY hashes and compares 16 bytes rather than the widest key any query might need:
+// narrowing a one-column group from the 24-byte two-slot key to this one was worth 6-16% on the raw
+// arms of BenchmarkGroupAccum. A type that grew here would charge its growth to every record of
+// every query at that arity, so change these only on purpose.
 func TestGroupKeyIsPlainMemory(t *testing.T) {
-	typ := reflect.TypeFor[groupKey]()
-	for i := 0; i < typ.NumField(); i++ {
-		f := typ.Field(i)
-		et := f.Type
-		if et.Kind() == reflect.Array {
-			et = et.Elem()
+	for _, k := range []struct {
+		name string
+		typ  reflect.Type
+		size uintptr
+		n    int
+	}{
+		{"groupKey1", reflect.TypeFor[groupKey1](), 16, 1}, // 1 int64 + 1 kind byte, padded
+		{"groupKey2", reflect.TypeFor[groupKey2](), 24, 2},
+		{"groupKey3", reflect.TypeFor[groupKey3](), 32, 3},
+	} {
+		for i := 0; i < k.typ.NumField(); i++ {
+			f := k.typ.Field(i)
+			et := f.Type
+			if et.Kind() == reflect.Array {
+				et = et.Elem()
+			}
+			switch et.Kind() {
+			case reflect.Int64, reflect.Uint8:
+			default:
+				t.Fatalf("%s.%s is a %s; keep the key to fixed-size integers", k.name, f.Name, f.Type)
+			}
 		}
-		switch et.Kind() {
-		case reflect.Int64, reflect.Uint8:
-		default:
-			t.Fatalf("groupKey.%s is a %s; keep the key to fixed-size integers", f.Name, f.Type)
+		if got := k.typ.Size(); got != k.size {
+			t.Fatalf("unsafe.Sizeof(%s{}) = %d, want %d", k.name, got, k.size)
 		}
 	}
-	// 2 slots: 2 int64 plus 2 kind bytes, padded to 24. The width is not incidental -- it is hashed
-	// and compared once per record -- and the measurement that chose it is in maxGroupCols's doc.
-	if got := unsafe.Sizeof(groupKey{}); got != 24 {
-		t.Fatalf("unsafe.Sizeof(groupKey{}) = %d, want 24", got)
+	// There is a key type for every arity the cap admits. Without this, raising maxGroupCols
+	// without adding a type would leave the top arity dispatching to nothing -- which declines
+	// rather than truncating, so it is safe, but it is also silently not the acceleration the cap
+	// now claims to offer.
+	for n := 1; n <= maxGroupCols; n++ {
+		a := newGroupAccum(make([]int64, n))
+		if a.n != n {
+			t.Fatalf("%d group columns built an accumulator of arity %d: maxGroupCols admits an "+
+				"arity with no key type", n, a.n)
+		}
 	}
 	// And the component the key is assembled from, which is passed by value per record per column.
 	if got := unsafe.Sizeof(groupComp{}); got != 16 {

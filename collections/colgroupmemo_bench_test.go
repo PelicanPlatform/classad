@@ -160,7 +160,7 @@ func BenchmarkGroupAccum(b *testing.B) {
 					comps[0] = keys[j]
 					a.accFor(&comps, 0)
 				}
-				if len(a.acc) == 0 {
+				if a.nGroups() == 0 {
 					b.Fatal("no groups")
 				}
 			}
@@ -202,7 +202,52 @@ func BenchmarkGroupAccumTwoCols(b *testing.B) {
 					comps[1] = groupComp{kind: gkInt, raw: base + int64(j)}
 					a.accFor(&comps, 0)
 				}
-				if len(a.acc) == 0 {
+				if a.nGroups() == 0 {
+					b.Fatalf("no groups (%s)", arm.why)
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkGroupThreeCols is BenchmarkGroupAccumTwoCols at the top arity: two raw categorical
+// components beside one bucketed time component, which is "per owner per site per day".
+//
+// There is nothing to compare it against on the two-slot key -- three group columns declined there
+// and the query scanned -- so what it measures is the arity's own cost, beside the two-column arms
+// above. The same three shapes, because the memo's hit rate is what separates them: a hit needs
+// EVERY unbucketed component unchanged as well as the timestamp still in its bucket, so a third
+// categorical column is a third way to miss.
+func BenchmarkGroupThreeCols(b *testing.B) {
+	const n = 120_000
+	const day = 86400
+	for _, arm := range []struct {
+		name   string
+		owner  func(i int) int64
+		site   func(i int) int64
+		bucket int64
+		why    string
+	}{
+		{"runs/owner256_site8_day", func(i int) int64 { return int64(i / 256) },
+			func(i int) int64 { return int64(i / 1024) }, day, "both categoricals run"},
+		{"cycle/owner16_site4_day", func(i int) int64 { return int64(i % 16) },
+			func(i int) int64 { return int64(i % 4) }, day, "the categoricals cycle every record"},
+		{"cycle/owner16_site4_sec", func(i int) int64 { return int64(i % 16) },
+			func(i int) int64 { return int64(i % 4) }, 1, "a group per record"},
+	} {
+		b.Run(arm.name, func(b *testing.B) {
+			b.ReportAllocs()
+			const base = 1700000000
+			var comps [maxGroupCols]groupComp
+			for i := 0; i < b.N; i++ {
+				a := newGroupAccum([]int64{0, 0, arm.bucket})
+				for j := 0; j < n; j++ {
+					comps[0] = groupComp{kind: gkString, raw: arm.owner(j)}
+					comps[1] = groupComp{kind: gkString, raw: arm.site(j)}
+					comps[2] = groupComp{kind: gkInt, raw: base + int64(j)}
+					a.accFor(&comps, 0)
+				}
+				if a.nGroups() == 0 {
 					b.Fatalf("no groups (%s)", arm.why)
 				}
 			}

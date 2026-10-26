@@ -93,8 +93,8 @@ func TestGroupAccumDropsNonFiniteBucket(t *testing.T) {
 			t.Errorf("accFor(%v) = %v, %v; want nil, true (in no bucket)", f, g, ok)
 		}
 	}
-	if len(a.acc) != 0 {
-		t.Fatalf("non-finite values created %d group(s): %v", len(a.acc), a.acc)
+	if a.nGroups() != 0 {
+		t.Fatalf("non-finite values created %d group(s): %v", a.nGroups(), a.g1.acc)
 	}
 	// The finite neighbours still group, and a real and an int that floor alike share one group --
 	// the property the bucket exists for, which the guard must not disturb.
@@ -103,8 +103,8 @@ func TestGroupAccumDropsNonFiniteBucket(t *testing.T) {
 			t.Fatalf("accFor(%+v) = %v, %v; want a group", k, g, ok)
 		}
 	}
-	if len(a.acc) != 2 {
-		t.Errorf("finite values formed %d groups, want 2", len(a.acc))
+	if a.nGroups() != 2 {
+		t.Errorf("finite values formed %d groups, want 2", a.nGroups())
 	}
 }
 

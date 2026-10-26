@@ -89,19 +89,19 @@ func TestBucketIntervalMemoMatchesBucketOf(t *testing.T) {
 			}
 			// Which group it landed in, read back from the accumulation map: the bucket the
 			// memo decided has to be the one keyed by bucketOf's own answer.
-			if want := a.acc[key1(groupComp{kind: gkInt, raw: b})]; want != g {
+			if want := a.g1.acc[key1(groupComp{kind: gkInt, raw: b})]; want != g {
 				t.Errorf("width %d key %d (%+v, value %v): did not land in bucket %d",
 					width, i, k, f, b)
 			}
 			want[b]++
 		}
-		if len(a.acc) != len(want) {
-			t.Errorf("width %d: %d groups, bucketOf gives %d", width, len(a.acc), len(want))
+		if a.nGroups() != len(want) {
+			t.Errorf("width %d: %d groups, bucketOf gives %d", width, a.nGroups(), len(want))
 		}
-		for key, g := range a.acc {
-			if want[key.raw[0]] != g.n {
+		for key, g := range a.g1.acc {
+			if want[key.raw] != g.n {
 				t.Errorf("width %d: bucket %d counted %d, bucketOf counts %d",
-					width, key.raw[0], g.n, want[key.raw[0]])
+					width, key.raw, g.n, want[key.raw])
 			}
 		}
 	}
@@ -144,8 +144,8 @@ func TestBucketMemoDoesNotPrimeOnNonNumbers(t *testing.T) {
 	if g, ok := accFor1(a, groupComp{kind: gkInt, raw: 3*day + 20}, 0); !ok || g != live {
 		t.Errorf("the next timestamp in the same day got %v, want the group the first one made", g)
 	}
-	if len(a.acc) != 1 {
-		t.Errorf("formed %d groups, want 1", len(a.acc))
+	if a.nGroups() != 1 {
+		t.Errorf("formed %d groups, want 1", a.nGroups())
 	}
 }
 
@@ -196,7 +196,7 @@ func TestBucketMemoDeclinesTheCoarseTopEdge(t *testing.T) {
 			t.Errorf("width %d: %v went in bucket %d off the memo's interval, bucketOf says %d",
 				tc.width, top, tc.start, want)
 		}
-		if g != a.acc[key1(groupComp{kind: gkInt, raw: want})] {
+		if g != a.g1.acc[key1(groupComp{kind: gkInt, raw: want})] {
 			t.Errorf("width %d: %v did not land in bucket %d", tc.width, top, want)
 		}
 	}
