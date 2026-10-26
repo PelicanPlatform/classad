@@ -13,10 +13,10 @@ import (
 
 // key1 packs one component the way the accumulator does, for a test that wants to look a
 // single-column group up in the accumulation map.
-func key1(c groupComp) groupKey {
-	var k groupKey
-	k.raw[0], k.kind[0] = c.raw, c.kind
-	return k
+func key1(c groupComp) groupKey1 {
+	// A component and a one-component key hold the same two fields, which is what makes packing
+	// one into the other a pair of stores on the hot path.
+	return groupKey1(c)
 }
 
 // accFor1 is groupAccum.accFor for a single component, which is the shape most of these tests want.
@@ -90,9 +90,9 @@ func TestGroupKeyStringsAreExactBytes(t *testing.T) {
 	for _, s := range spellings {
 		want[s] = true
 	}
-	if len(a.acc) != len(want) {
+	if a.nGroups() != len(want) {
 		t.Fatalf("%d groups for %d distinct spellings (%v): case-folding merged groups the scan "+
-			"keeps apart", len(a.acc), len(want), want)
+			"keeps apart", a.nGroups(), len(want), want)
 	}
 	// Named explicitly, since a count can be right for the wrong reason.
 	if accs["u07"] == accs["U07"] {
@@ -133,14 +133,14 @@ func TestGroupKeyKindSeparatesRawBits(t *testing.T) {
 		}
 		seen[g] = append(seen[g], c)
 	}
-	if len(a.acc) != len(comps) {
+	if a.nGroups() != len(comps) {
 		for g, cs := range seen {
 			if len(cs) > 1 {
 				t.Errorf("these share a group though they render differently: %+v (acc %p)", cs, g)
 			}
 		}
 		t.Fatalf("%d components formed %d groups: the key is not separating them by kind",
-			len(comps), len(a.acc))
+			len(comps), a.nGroups())
 	}
 }
 
@@ -172,10 +172,10 @@ func TestGroupKeyRefinesRenderedIdentity(t *testing.T) {
 		{kind: gkReal, raw: int64(math.Float64bits(0))},
 		{kind: gkReal, raw: int64(math.Float64bits(math.Copysign(0, -1)))},
 	}
-	byKey := map[groupKey]string{}
+	byKey := map[groupKey1]string{}
 	for _, c := range comps {
 		k := key1(c)
-		text := valueText(a.values(k)[0])
+		text := valueText(a.values1(k)[0])
 		if prev, seen := byKey[k]; seen && prev != text {
 			t.Errorf("one key renders as both %q and %q: the key is coarser than the scan's identity",
 				prev, text)
@@ -196,7 +196,7 @@ func TestGroupKeyRefinesRenderedIdentity(t *testing.T) {
 			t.Errorf("%+v and %+v are one key; they are two storage values the renderer merges",
 				pair[0], pair[1])
 		}
-		if ta, tb := valueText(a.values(ka)[0]), valueText(a.values(kb)[0]); ta != tb {
+		if ta, tb := valueText(a.values1(ka)[0]), valueText(a.values1(kb)[0]); ta != tb {
 			t.Errorf("%+v renders %q and %+v renders %q: this pair no longer exercises the merge",
 				pair[0], ta, pair[1], tb)
 		}
@@ -363,8 +363,8 @@ func TestBucketMemoAcrossComponents(t *testing.T) {
 	if g4 == g1 {
 		t.Error("the next day landed in the previous day's group")
 	}
-	if len(a.acc) != 3 {
-		t.Errorf("formed %d groups, want 3 (alice/day3, bob/day3, alice/day4)", len(a.acc))
+	if a.nGroups() != 3 {
+		t.Errorf("formed %d groups, want 3 (alice/day3, bob/day3, alice/day4)", a.nGroups())
 	}
 }
 
@@ -386,14 +386,14 @@ func TestBucketedComponentDropsTheWholeRecord(t *testing.T) {
 			t.Errorf("a record with an unbucketable %+v grouped as %v; want nil, true", bad, g)
 		}
 	}
-	if len(a.acc) != 0 {
-		t.Fatalf("unbucketable records formed %d groups: %v", len(a.acc), a.acc)
+	if a.nGroups() != 0 {
+		t.Fatalf("unbucketable records formed %d groups: %v", a.nGroups(), a.g2.acc)
 	}
 	// The memo must be left disarmed by those, so the next good record is not handed one of their
 	// (never-created) groups.
 	g, ok := accForN(a, []groupComp{owner, {kind: gkInt, raw: 3*day + 5}}, 0)
-	if !ok || g == nil || len(a.acc) != 1 {
-		t.Fatalf("a groupable record after the dropped ones gave %v, %v with %d groups", g, ok, len(a.acc))
+	if !ok || g == nil || a.nGroups() != 1 {
+		t.Fatalf("a groupable record after the dropped ones gave %v, %v with %d groups", g, ok, a.nGroups())
 	}
 }
 
@@ -473,7 +473,7 @@ func TestBucketedKeyMatchesBucketOfPerComponent(t *testing.T) {
 				t.Errorf("width %d value %v: dropped, but bucketOf puts it in %d", width, v, b)
 				continue
 			}
-			if want := a.acc[key1(groupComp{kind: gkInt, raw: b})]; want != g {
+			if want := a.g1.acc[key1(groupComp{kind: gkInt, raw: b})]; want != g {
 				t.Errorf("width %d value %v: landed somewhere other than bucket %d", width, v, b)
 			}
 		}
@@ -591,5 +591,172 @@ func TestGroupKeyCaseSplitsThroughTheDictionaryReader(t *testing.T) {
 					"vanished into the other", len(specs), pair[0], got[pair[0]], pair[1], got[pair[1]])
 			}
 		}
+	}
+}
+
+// tupleText renders a tuple of components the way the record scan renders the group it stands for:
+// each component to its text, joined. It is the identity the storage key must refine, so it is what
+// the arity tests below compare groups by.
+func tupleText(a *groupAccum, cs []groupComp) string {
+	parts := make([]string, len(cs))
+	for i, c := range cs {
+		parts[i] = valueText(a.compValue(c.raw, c.kind))
+	}
+	return strings.Join(parts, "|")
+}
+
+// TestGroupKeyArityKeepsEveryComponent runs every arity that has a key type, and checks at each one
+// that a difference in ANY single component is a difference in the group.
+//
+// Each arity is its own key type with its own packing, its own map and its own case in the
+// dispatch, so nothing the one-column tests establish carries to the two- and three-column ones. The
+// failures this is here to catch are all silent counts:
+//
+//   - a component dropped from the packing, which merges tuples differing only in it;
+//   - a component's KIND dropped, which merges the integer 1 with the boolean TRUE (both have a raw
+//     of 1) though the scan renders them "1" and "true";
+//   - a string component keyed by its FOLDED form, which merges "u07" with "U07" though the scan
+//     keeps the exact bytes apart;
+//   - a dispatch that sends an arity to another arity's path, which either drops the components past
+//     that arity or accumulates into a map nothing then reads.
+//
+// The variants are placed at every position in turn, because a packing writes each slot separately
+// and a slot can be missed on its own.
+func TestGroupKeyArityKeepsEveryComponent(t *testing.T) {
+	for n := 1; n <= maxGroupCols; n++ {
+		a := newGroupAccum(make([]int64, n))
+		variants := []groupComp{
+			{kind: gkInt, raw: 1},
+			{kind: gkInt, raw: 2},
+			a.strComp("u07"),
+			a.strComp("U07"),       // ... and the same name in another case: two groups, not one
+			{kind: gkBool, raw: 1}, // raw 1, like the integer above, and renders "true"
+			{kind: gkUndef},
+		}
+		base := make([]groupComp, n)
+		for i := range base {
+			base[i] = a.strComp("base")
+		}
+		want := map[string]int{}
+		for pos := 0; pos < n; pos++ {
+			for rep := 1; rep <= 2; rep++ { // twice, so a count is wrong if two tuples merge
+				for _, v := range variants {
+					cs := append([]groupComp(nil), base...)
+					cs[pos] = v
+					g, ok := accForN(a, cs, 0)
+					if !ok || g == nil {
+						t.Fatalf("arity %d: %s formed no group (ok=%v)", n, tupleText(a, cs), ok)
+					}
+					want[tupleText(a, cs)]++
+				}
+			}
+		}
+		got := map[string]int{}
+		a.each(func(vals []classad.Value, g *groupAcc) {
+			if len(vals) != n {
+				t.Fatalf("arity %d: a group came back with %d component values", n, len(vals))
+			}
+			parts := make([]string, len(vals))
+			for i, v := range vals {
+				parts[i] = valueText(v)
+			}
+			got[strings.Join(parts, "|")] += g.n
+		})
+		if len(got) != len(want) {
+			t.Errorf("arity %d: %d groups, the tuples fed are %d distinct ones", n, len(got), len(want))
+		}
+		if a.nGroups() != len(got) {
+			t.Errorf("arity %d: nGroups reports %d, iterating yields %d", n, a.nGroups(), len(got))
+		}
+		for k, w := range want {
+			if got[k] != w {
+				t.Errorf("arity %d: tuple %q counted %d, fed %d", n, k, got[k], w)
+			}
+		}
+		for k := range got {
+			if _, ok := want[k]; !ok {
+				t.Errorf("arity %d: tuple %q was never fed", n, k)
+			}
+		}
+	}
+}
+
+// TestGroupAccumDeclinesPastTopArity pins the behaviour past the highest arity with a key type:
+// accFor DECLINES, and nothing is accumulated.
+//
+// The callers check the arity before they read anything (resolveGroupAttrs), so this is the backstop
+// rather than the gate -- and it is the one that matters, because the failure it guards against is
+// not a decline but an ANSWER. A path that packed as many components as its widest key holds and
+// dropped the rest would merge every pair of groups that differs only in a dropped component, and
+// report the merged counts as the result; there is nothing downstream that could tell, since the
+// rows look like ordinary rows.
+func TestGroupAccumDeclinesPastTopArity(t *testing.T) {
+	for n := maxGroupCols + 1; n <= maxGroupCols+2; n++ {
+		a := newGroupAccum(make([]int64, n))
+		if a.n != 0 {
+			t.Fatalf("%d group columns built an accumulator of arity %d; no key type covers it", n, a.n)
+		}
+		// Two tuples that differ only in a component past the top arity: if anything truncated,
+		// these would be one group and the second call would find the first one's accumulator.
+		var comps [maxGroupCols]groupComp
+		for i := range comps {
+			comps[i] = groupComp{kind: gkInt, raw: int64(i)}
+		}
+		for _, last := range []int64{7, 8} {
+			comps[maxGroupCols-1] = groupComp{kind: gkInt, raw: last}
+			g, ok := a.accFor(&comps, 0)
+			if ok || g != nil {
+				t.Fatalf("%d group columns were SERVED (%v, %v): a key that holds %d components "+
+					"cannot answer this without merging groups the scan keeps apart", n, g, ok, maxGroupCols)
+			}
+		}
+		if a.nGroups() != 0 {
+			t.Fatalf("%d group columns accumulated %d groups after declining", n, a.nGroups())
+		}
+	}
+}
+
+// TestBucketMemoAcrossThreeComponents is TestBucketMemoAcrossComponents at the top arity: two raw
+// categorical components beside one bucketed time component, which is "per owner per site per day".
+//
+// The three-component bucketed path has its own key type, its own memo probe and its own packing, so
+// the two-column test says nothing about it. The sharp case is the same one: a memo hit needs EVERY
+// unbucketed component to match as well as the bucketed one to fall in the remembered interval, and
+// a probe that compared only the first would attribute a record to the previous record's group.
+func TestBucketMemoAcrossThreeComponents(t *testing.T) {
+	const day = 86400
+	a := newGroupAccum([]int64{0, 0, day})
+	alice, bob := a.strComp("alice"), a.strComp("bob")
+	sa, sb := a.strComp("site-a"), a.strComp("site-b")
+	ts := func(f int64) groupComp { return groupComp{kind: gkInt, raw: f} }
+	at := func(o, s, tv groupComp) *groupAcc {
+		t.Helper()
+		g, ok := accForN(a, []groupComp{o, s, tv}, 0)
+		if !ok || g == nil {
+			t.Fatalf("a record was dropped (ok=%v)", ok)
+		}
+		return g
+	}
+	g1 := at(alice, sa, ts(3*day+10))
+	// Same day, same owner, DIFFERENT site: the interval holds and the first component matches, so
+	// only the second component separates these.
+	if g2 := at(alice, sb, ts(3*day+20)); g2 == g1 {
+		t.Error("two sites in one owner-day share a group: the memo probe is not comparing every " +
+			"unbucketed component")
+	}
+	// Same day, same site, different owner.
+	if g3 := at(bob, sa, ts(3*day+30)); g3 == g1 {
+		t.Error("two owners in one site-day share a group")
+	}
+	// A genuine hit: it has to find the FIRST group again, not the one the memo now holds.
+	if g4 := at(alice, sa, ts(3*day+40)); g4 != g1 {
+		t.Error("the same owner-site-day formed a second group")
+	}
+	// Next day, everything else the same: a miss on the interval.
+	if g5 := at(alice, sa, ts(4*day+1)); g5 == g1 {
+		t.Error("the next day landed in the previous day's group")
+	}
+	if a.nGroups() != 4 {
+		t.Errorf("formed %d groups, want 4", a.nGroups())
 	}
 }

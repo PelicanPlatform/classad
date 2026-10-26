@@ -78,11 +78,14 @@ const (
 	probeCountConstraint   probe = iota // the ungrouped constrained COUNT(*) over columnar blocks
 	probeGroupColumns                   // GroupedFromColumns: a grouped read of the columnar blocks
 	probeGroupColumnsMulti              // ... of the same, with MORE THAN ONE group column
+	probeGroupColumnsTri                // ... of the same, at the TOP arity the packed key covers
 	probeColumnar                       // ColumnarAggregate: one numeric column, ungrouped
 	numProbes
 )
 
-var probeNames = [numProbes]string{"count-constraint", "grouped-columns", "grouped-columns(n>1)", "columnar"}
+var probeNames = [numProbes]string{
+	"count-constraint", "grouped-columns", "grouped-columns(n>1)", "grouped-columns(n=3)", "columnar",
+}
 
 // probeFloor is the minimum number of queries each probe must have answered for the sweep to prove
 // anything about it. Zero is the obvious floor and it is not enough for the multi-column probe: the
@@ -90,7 +93,14 @@ var probeNames = [numProbes]string{"count-constraint", "grouped-columns", "group
 // still leave a count of one or two and read as covered. 100 is roughly a third of what the sweep
 // reports (the histogram is logged either way), so it fails on a path that stopped firing rather
 // than on a generator whose draws shifted.
-var probeFloor = [numProbes]int64{1, 1, 100, 1}
+//
+// The three-column probe has a floor of its own for the same reason one level up: each ARITY is a
+// separate key type with a separate map and its own packing, so a two-column query exercises
+// nothing about the three-column one. Without a floor here, an arity that quietly stopped being
+// served -- a cap lowered, a dispatch that fell through -- would leave this probe at zero and the
+// sweep would still pass, having compared nothing against the scan at that width. 25 is roughly a
+// third of what the sweep reports for it, the same ratio the two-column floor is set at.
+var probeFloor = [numProbes]int64{1, 1, 100, 25, 1}
 
 func (p probe) String() string { return probeNames[p] }
 
@@ -444,6 +454,9 @@ func checkQuery(f *aggFixture, q gen.Query) (collections.AggTier, probeSet, []st
 			// thousands of times, and nothing would have compared a packed multi-component key
 			// against the scan.
 			ps |= 1 << probeGroupColumnsMulti
+		}
+		if len(groups) > 2 {
+			ps |= 1 << probeGroupColumnsTri
 		}
 		diffs = append(diffs, prefix("grouped-columns(direct)", compareAgg(groupedRows, want, aggs, tols))...)
 	}

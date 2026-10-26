@@ -302,6 +302,37 @@ func groupsFrom(s *src) []Group {
 		}
 	case 4: // two columns, neither bucketed, and two in the other order: both decline every fast
 		return []Group{{Attr: pick(s, groupAttrs)}, {Attr: pick(s, groupAttrs)}} // path and must scan
+	case 5, 6:
+		// THREE columns: the top arity the packed key covers, and the one a sweep will otherwise
+		// never draw -- the free-form shape below draws one column, and nothing else here asks for
+		// three. A key per arity means the three-component key has its own type, its own map and
+		// its own packing, so none of what the one- and two-column shapes cover reaches it.
+		//
+		// Both halves are drawn: the production shape ("per owner per site per day", two raw
+		// categorical columns beside one bucketed time column, in either order so the bucketed
+		// component is not always last) and a free draw over every attribute, which is what reaches
+		// the kinds that have no bucket and the columns that decline.
+		if s.n(4) != 0 {
+			b := Group{Attr: pick(s, []string{"Ts", "ClusterId", "Mem"}), BucketWidth: pick(s, []int64{1, 100, 3600, 86400})}
+			g := []Group{{Attr: "Owner"}, {Attr: "Site"}, b}
+			if s.n(2) == 0 {
+				g = []Group{{Attr: "Owner"}, b, {Attr: "Site"}}
+			}
+			return g
+		}
+		return []Group{
+			{Attr: pick(s, groupAttrs), BucketWidth: pick(s, bucketWidths)},
+			{Attr: pick(s, groupAttrs), BucketWidth: pick(s, bucketWidths)},
+			{Attr: pick(s, groupAttrs), BucketWidth: pick(s, bucketWidths)},
+		}
+	case 7:
+		// FOUR columns, which no key type covers: the storage path must decline it and the scan
+		// must answer, rather than the key dropping a component and reporting the merge.
+		return []Group{
+			{Attr: "Owner"}, {Attr: "Site"},
+			{Attr: pick(s, groupAttrs), BucketWidth: pick(s, bucketWidths)},
+			{Attr: pick(s, groupAttrs), BucketWidth: pick(s, bucketWidths)},
+		}
 	default:
 		return []Group{{Attr: pick(s, groupAttrs), BucketWidth: pick(s, bucketWidths)}}
 	}

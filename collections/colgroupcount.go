@@ -307,9 +307,9 @@ func (c *Collection) groupStats(groupIDs []uint32, aggIDs []uint32, buckets []in
 // shapeGroupStats turns an accumulator map into the sorted result and records the read demand. Shared by
 // every tier, so the shape and order of the answer cannot depend on which one produced it.
 func (c *Collection) shapeGroupStats(ga *groupAccum, groupIDs []uint32, aggIDs []uint32) ([]GroupStats, bool) {
-	out := make([]GroupStats, 0, len(ga.acc))
-	for raw, a := range ga.acc {
-		g := GroupStats{Values: ga.values(raw), Count: a.n}
+	out := make([]GroupStats, 0, ga.nGroups())
+	ga.each(func(vals []classad.Value, a *groupAcc) {
+		g := GroupStats{Values: vals, Count: a.n}
 		if len(aggIDs) > 0 {
 			g.Stats = make([]NumStats, len(aggIDs))
 			for i := range a.stats {
@@ -317,7 +317,7 @@ func (c *Collection) shapeGroupStats(ga *groupAccum, groupIDs []uint32, aggIDs [
 			}
 		}
 		out = append(out, g)
-	}
+	})
 	sort.Slice(out, func(i, j int) bool { return groupTupleLess(out[i].Values, out[j].Values) })
 	// Reading a column is demand for it, the same as any other query that touches one.
 	read := make([]string, 0, len(groupIDs)+len(aggIDs))
