@@ -53,7 +53,16 @@ import (
 // simply rejected and reindexed.
 const (
 	sidecarMagic   = 0x41524358 // "ARCX"
-	sidecarVersion = 9          // v9 appended a per-value-attr equi-depth histogram to each stats block
+	sidecarVersion = 10         // v10: value postings include negatives stored as unary minus over a literal
+
+	// sidecarMinVersion is the oldest layout still read. v9 is byte-for-byte v10; it differs only in
+	// what its value postings hold. A v9 builder put a negative number stored as unary minus over a
+	// literal -- every negative written before the encoder folded them -- in the attribute's EXCEPTION
+	// set rather than posting it. Exceptions are a superset the query re-verifies, so a v9 sidecar
+	// answers correctly, only slower: such a record is a candidate for every probe on the attribute
+	// and keeps the segment from being skipped. So it is still read, and the index backfill rebuilds
+	// it when it has value exceptions that might be such records (see mmapSegIndex.stalePostings).
+	sidecarMinVersion = 9
 
 	// mphNDVThreshold gates the categorical minimal-perfect-hash: only an attribute with
 	// at least this many distinct values in a segment gets one. Below it, the sorted key

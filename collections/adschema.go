@@ -229,6 +229,45 @@ func nodeKind(node []byte) (adKind, wire.Literal) {
 	return akNone, lit
 }
 
+// scalarValue is wire.LiteralValue that also reads a number spelled as a sign over a numeric literal
+// (wire.NumberValue). The encoder folds `-5` into a signed literal, but a record keeps the bytes it was
+// written with: one encoded before that fold holds unary minus over 5, and so does any record carrying
+// `-(5)` or `+5`. Every one of those is the number the evaluator computes for it, with no attribute
+// reference in it, so a reader that summarizes or serves VALUES -- an index posting, a column cell, a
+// group key -- reads it as that number rather than as an expression only evaluation can answer.
+//
+// nodeKind deliberately does not use it: it decides what a column SLOT stores, and a slot holds a value,
+// not its spelling. Storing such a node in an int slot would hand it back as the folded literal, so it
+// escapes to the cold tail instead, where its bytes are kept exactly as written.
+func scalarValue(node []byte) (wire.Literal, bool) {
+	if lit, ok := wire.LiteralValue(node); ok {
+		return lit, true
+	}
+	return wire.NumberValue(node)
+}
+
+// sampledKind is nodeKind for DERIVING a schema from sampled records: a number spelled as a sign over a
+// numeric literal (see scalarValue) counts as the int or real it is. Counted as no storable kind, a
+// negative written before the encoder folded it never entered a field's sampled values -- so the width
+// chooser saw only the non-negative ones and picked unsigned -- and an attribute holding such numbers
+// throughout cleared no presence floor and got no column, base or group, for the readers that now
+// serve those cells to use. Such a cell still escapes its slot when stored (nodeKind), which is where
+// its bytes are kept as written.
+func sampledKind(node []byte) (adKind, wire.Literal) {
+	if k, lit := nodeKind(node); k != akNone {
+		return k, lit
+	}
+	if lit, ok := wire.NumberValue(node); ok {
+		switch lit.Kind {
+		case wire.LitInt:
+			return akInt, lit
+		case wire.LitReal:
+			return akReal, lit
+		}
+	}
+	return akNone, wire.Literal{}
+}
+
 // buildAdSchema samples wire ads and resolves a schema: attributes whose dominant storable kind
 // is present in >= opts.Presence of the ads, laid out smallest-to-largest.
 func buildAdSchema(sample [][]byte, opts adSchemaOpts) *adSchema {
@@ -253,7 +292,7 @@ func buildAdSchemaReport(sample [][]byte, opts adSchemaOpts) (*adSchema, []requi
 				st = &stat{}
 				stats[id] = st
 			}
-			k, lit := nodeKind(node)
+			k, lit := sampledKind(node)
 			st.kinds[k]++
 			if k == akInt {
 				st.intVals = append(st.intVals, lit.Int)

@@ -454,7 +454,11 @@ func (si *segIndex) indexRecord(o uint32, ad wire.Ad, spec *indexSpec, dict *seg
 		if !ok {
 			continue
 		}
-		if lit, ok := wire.LiteralValue(node); ok {
+		// scalarValue, not LiteralValue: a negative number written before the encoder folded it
+		// into a signed literal is unary minus over a literal, and is posted as the number it is.
+		// As an exception it was a candidate for every probe on the attribute and pushed every
+		// selectivity estimate toward the whole segment.
+		if lit, ok := scalarValue(node); ok {
 			switch lit.Kind {
 			case wire.LitInt:
 				addOffset(vp.post, float64(lit.Int), o)

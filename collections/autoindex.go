@@ -184,7 +184,7 @@ func (c *Collection) profileAttrs(sampleMax int) map[string]*attrProfile {
 				profiles[fold] = p
 			}
 			p.present++
-			lit, ok := wire.LiteralValue(node)
+			lit, ok := scalarValue(node) // an old-form negative number is a number
 			if !ok {
 				p.other++ // expression / list / record
 				return true

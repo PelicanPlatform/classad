@@ -691,7 +691,7 @@ func refitHotIntWidths(s *adSchema, samples [][]byte, hot []int, hotFit float64)
 	for _, w := range samples {
 		wire.Ad(w).ForEach(func(id uint32, node []byte) bool {
 			if hotIntIDs[id] {
-				if k, lit := nodeKind(node); k == akInt {
+				if k, lit := sampledKind(node); k == akInt {
 					vals[id] = append(vals[id], lit.Int)
 				}
 			}

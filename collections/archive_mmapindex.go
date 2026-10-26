@@ -17,6 +17,7 @@ import (
 // Bitmaps are built lazily via roaring FromBuffer (zero-copy) only for the postings
 // a probe actually touches.
 type mmapSegIndex struct {
+	version uint16 // sidecar layout version it was read from (see sidecarMinVersion)
 	data    []byte
 	upto    uint32
 	specGen uint64
@@ -27,6 +28,22 @@ type mmapSegIndex struct {
 	// skip/selectivity paths can read them without paging the postings (v7).
 	catStats map[uint32]*segStats
 	valStats map[uint32]*segStats
+}
+
+// stalePostings reports whether the sidecar was built before negative numbers stored as unary minus
+// over a literal were posted, and holds value exceptions that may be such numbers. Its answers are
+// right either way (exceptions are re-verified); a rebuild only makes them cheaper, and is pointless
+// for a sidecar with no value exception at all.
+func (si *mmapSegIndex) stalePostings() bool {
+	if si.version >= sidecarVersion {
+		return false
+	}
+	for _, st := range si.valStats {
+		if st != nil && st.exc > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // statsFor returns the parsed per-segment summary for a probe's attribute (nil if the
@@ -46,7 +63,8 @@ func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
 	if c.u32() != sidecarMagic {
 		return nil, fmt.Errorf("archive: bad sidecar magic")
 	}
-	if v := c.u16(); v != sidecarVersion {
+	v := c.u16()
+	if v < sidecarMinVersion || v > sidecarVersion {
 		return nil, fmt.Errorf("archive: unsupported sidecar version %d", v)
 	}
 	metaOff := c.u32()
@@ -55,6 +73,7 @@ func parseMmapSidecar(data []byte) (*mmapSegIndex, error) {
 	}
 	m := &cursor{b: data, i: int(metaOff)}
 	si := &mmapSegIndex{
+		version:  v,
 		data:     data,
 		catDir:   map[uint32]uint32{},
 		valDir:   map[uint32]uint32{},

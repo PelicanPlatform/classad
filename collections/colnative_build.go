@@ -856,8 +856,13 @@ func (c *Collection) ColumnarizeSealed() int {
 // a schema field holding one already ESCAPES, so the block marks it absent and reconstruct skips it
 // rather than carrying a second copy. Translating ids inside arbitrary expression nodes would be the
 // alternative, and it would have to be exactly right for every node shape forever.
+//
+// A number spelled as a sign over a numeric literal (see scalarValue) holds no reference, so it moves
+// like a literal. It cannot take an int or real slot (nodeKind), and so lands in the cold tail with its
+// bytes as written; left in the record it read as an expression, and one such cell made every column
+// aggregate over its attribute decline.
 func storableInColumn(node []byte) bool {
-	_, ok := wire.LiteralValue(node)
+	_, ok := scalarValue(node)
 	return ok
 }
 

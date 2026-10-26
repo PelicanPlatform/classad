@@ -332,7 +332,7 @@ func escapedGroupComp(b *columnarBlock, k int, fieldID uint32, bc *blockCache, a
 // literal -- an expression, a list, a nested ad -- because rendering one needs the evaluator the scan
 // has and this does not.
 func litGroupComp(node []byte, acc *groupAccum) (groupComp, bool) {
-	lit, ok := wire.LiteralValue(node)
+	lit, ok := scalarValue(node)
 	if !ok {
 		return groupComp{}, false
 	}

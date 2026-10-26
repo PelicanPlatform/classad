@@ -9,7 +9,6 @@ import (
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // Evaluating a query directly against columnar storage.
@@ -213,7 +212,7 @@ func (cs *colScope) fromColdTail(id uint32) classad.Value {
 		}
 		return classad.NewUndefinedValue() // genuinely absent from this record
 	}
-	lit, ok := wire.LiteralValue(node)
+	lit, ok := scalarValue(node)
 	if !ok {
 		cs.fallBack()
 		return classad.NewUndefinedValue()
