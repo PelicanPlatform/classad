@@ -797,10 +797,12 @@ func TestCrashDifferential(t *testing.T) {
 				switch rng.Intn(60) {
 				case 0:
 					c.Compact()
+					checkRecordChecksums(t, c, step)
 				case 1:
 					c.Reindex()
 				case 2:
 					c.BuildAndEnableSchemaScan(4096, 8)
+					checkRecordChecksums(t, c, step)
 				}
 				if step%40 == 39 {
 					img := shadow.crashImage(t, c, opts.Dir, rng)
@@ -850,5 +852,33 @@ func TestCrashDifferential(t *testing.T) {
 				t.Fatal("no images")
 			}
 		})
+	}
+}
+
+// checkRecordChecksums fails the test if any record of the live store fails its checksum. A
+// maintenance pass that writes through a stale location corrupts the record that now occupies it,
+// and the damage would otherwise only show, as a missing ad, in whatever image is taken next.
+func checkRecordChecksums(t *testing.T, c *Collection, step int) {
+	t.Helper()
+	for si, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg == nil {
+				continue
+			}
+			for off := 0; off < seg.used; {
+				o := uint32(off)
+				tl := recTotalLen(seg.data, o)
+				if tl == 0 {
+					break
+				}
+				if !seg.damaged().covers(o) && !recVerifyCRC(seg.data, o) {
+					sh.mu.RUnlock()
+					t.Fatalf("step %d: shard %d %s: the record at %d fails its checksum", step, si, filepath.Base(seg.path), o)
+				}
+				off += int(tl)
+			}
+		}
+		sh.mu.RUnlock()
 	}
 }

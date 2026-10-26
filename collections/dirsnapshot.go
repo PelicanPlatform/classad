@@ -2,15 +2,10 @@ package collections
 
 import (
 	"encoding/binary"
-	"errors"
 	"hash/crc32"
 	"os"
 	"path/filepath"
 )
-
-// errStaleDirEntry aborts a snapshot write when a directory entry points at a
-// retired segment (an unexpected state); the reopen then falls back to a scan.
-var errStaleDirEntry = errors.New("collections: directory entry references a retired segment")
 
 // A directory snapshot is a per-shard fast-reopen optimization. On a clean Close the
 // shard writes its directory (key-hash -> record location), commit sequence, and live
@@ -30,20 +25,71 @@ var errStaleDirEntry = errors.New("collections: directory entry references a ret
 // no compaction is mid-flight). That is exactly the state rebuildDir's crash-dedup
 // pass exists to repair, so a clean reopen can safely skip both the rebuild and the
 // dedup.
+//
+// Version 2 also carries each segment's scan-pruning counters (minSeq, maxSeq, maxSup,
+// dead), which rebuildDir otherwise derives by walking every record. Without them a
+// restored segment knows none of its bounds: no scan skips it by sequence, and the
+// garbage it held before the restart is invisible to the compaction trigger and to dead-
+// segment reclaim until new garbage accumulates. A version 1 snapshot is still read; its
+// segments' counters are then derived by a header-only walk (walkSegBounds).
 const (
-	dirSnapName    = "dir.snap"
-	dirSnapMagic   = 0x53524944 // "DIRS"
-	dirSnapVersion = 1
+	dirSnapName      = "dir.snap"
+	dirSnapMagic     = 0x53524944 // "DIRS"
+	dirSnapVersionV1 = 1          // directory only
+	dirSnapVersion   = 2          // + per-segment scan-pruning counters
 )
+
+// dirSnapVersionKnown reports whether v is a snapshot version this build reads. The header
+// (magic, version, commit sequence) is laid out identically in every version.
+func dirSnapVersionKnown(v uint32) bool {
+	return v == dirSnapVersionV1 || v == dirSnapVersion
+}
+
+// dirEntryValid reports whether the directory entry h -> (seg, off) names a record that can
+// head h's bucket chain: a whole keyed record inside the segment's durable extent whose key
+// hashes to h. A directory can hold entries that do not: a delete leaves its key's superseded
+// record as the bucket head, and a segment rewrite that drops that record (columnarizing,
+// resealing) moves every offset in the segment without evicting it, so the head names bytes
+// that are no longer that record. Bucket-chain walks tolerate such a head (segForLoc), and a
+// lookup that misses through it falls through to the sealed-segment probe -- every record
+// still in that bucket lives in a sealed segment, because the head was the newest of them and
+// its segment was sealed before it was rewritten.
+func dirEntryValid(seg *segment, off uint32, h uint64, hasher Hasher) bool {
+	if seg == nil || int(off)+recHeaderSize > seg.used || seg.damaged().covers(off) {
+		return false
+	}
+	total := recTotalLen(seg.data, off)
+	if total == 0 || total%8 != 0 || int(off)+int(total) > seg.used || recIsMarker(seg.data, off) {
+		return false
+	}
+	if !recFits(seg.data[:int(off)+int(total)], off) {
+		return false // key or body length runs past the record's own extent
+	}
+	return hasher.Hash(recKey(seg.data, off)) == h
+}
 
 // writeDirSnapshot persists shard sh's directory to <shardDir>/dir.snap. The caller
 // holds sh.mu and must have flushed every segment durable first, so the snapshot
-// never references not-yet-durable bytes. Best effort: an error just means the next
-// open falls back to a full scan.
-func writeDirSnapshot(sh *shard, shardDir string) error {
+// never references not-yet-durable bytes. Best effort, so it reports nothing: a snapshot
+// that is not written just means the next open falls back to a full scan.
+//
+// Directory entries that no longer name their bucket's record (dirEntryValid) are left
+// out rather than written. The reopen checks every entry the same way and refuses the
+// whole snapshot on one that fails, so writing a stale head made every clean reopen after
+// a segment rewrite fall back to the full scan. Leaving it out restores exactly what a
+// lookup through it finds today: nothing, then the sealed probe.
+func writeDirSnapshot(sh *shard, shardDir string, hasher Hasher) {
 	if writeFaultHook != nil {
 		if err := writeFaultHook(filepath.Join(shardDir, dirSnapName)); err != nil {
-			return err
+			return
+		}
+	}
+	// A segment still in the shard but already unmapped means the collection was closed before.
+	// Its state is then not the store's: a later Open may have consumed the snapshot and written a
+	// newer one, which this would replace. The directory checks below read the segments, too.
+	for _, seg := range sh.segs {
+		if seg != nil && seg.isReaped() {
+			return
 		}
 	}
 	// Segments are referenced by their file basename, which is stable across reopen;
@@ -51,7 +97,7 @@ func writeDirSnapshot(sh *shard, shardDir string) error {
 	// them). Assign each live (non-nil) segment a snapshot slot and record its
 	// basename + durable length; directory entries then reference the slot.
 	slotOf := make(map[uint32]uint32, len(sh.segs)) // array index -> snapshot slot
-	buf := make([]byte, 0, 32+len(sh.segs)*24+len(sh.dir)*16)
+	buf := make([]byte, 0, 32+len(sh.segs)*56+len(sh.dir)*16)
 	buf = binary.LittleEndian.AppendUint32(buf, dirSnapMagic)
 	buf = binary.LittleEndian.AppendUint32(buf, dirSnapVersion)
 	buf = binary.LittleEndian.AppendUint64(buf, sh.commitSeq)
@@ -69,6 +115,24 @@ func writeDirSnapshot(sh *shard, shardDir string) error {
 		buf = binary.LittleEndian.AppendUint64(buf, uint64(seg.used))
 		buf = binary.LittleEndian.AppendUint16(buf, uint16(len(name)))
 		buf = append(buf, name...)
+		// The counters as this process kept them. Every segment is flushed and no rewrite is in
+		// flight, so they describe exactly the bytes the reopen maps (it checks the extent). They
+		// are the values every scan-skip, compaction and reclaim decision of this process ran on;
+		// the reopen resumes from them rather than from zero.
+		//
+		// Soundness: a skip drops records only if minSeq is too HIGH, maxSeq too LOW, or dead or
+		// maxSup wrong in the direction that makes a segment look emptier or older than it is. The
+		// runtime keeps all four exact -- every append and every supersession updates them under
+		// the shard lock (appendFlagged, appendMarker, the keyless appends, supersedeRec,
+		// appendRawRecordFlags) -- and a supersession only ever stamps a current record, so no
+		// byte is counted dead twice. They therefore equal what rebuildDir's walk derives from the
+		// same bytes (TestDirSnapshotReopenMatchesWalk), and nothing between this Close and the
+		// next Open changes a record header without also changing a segment's extent or name,
+		// which the reopen checks.
+		buf = binary.LittleEndian.AppendUint64(buf, seg.minSeq)
+		buf = binary.LittleEndian.AppendUint64(buf, seg.maxSeq)
+		buf = binary.LittleEndian.AppendUint64(buf, seg.maxSup)
+		buf = binary.LittleEndian.AppendUint64(buf, uint64(seg.dead))
 	}
 	binary.LittleEndian.PutUint32(buf[nSegOff:], nSegs)
 	nEntOff := len(buf)
@@ -80,7 +144,10 @@ func writeDirSnapshot(sh *shard, shardDir string) error {
 			// A live directory entry pointing at a retired segment should never
 			// happen on a clean shutdown; if it does, skip the snapshot entirely so
 			// the reopen falls back to the authoritative scan.
-			return errStaleDirEntry
+			return
+		}
+		if !dirEntryValid(sh.segs[l.seg], l.off, h, hasher) {
+			continue
 		}
 		buf = binary.LittleEndian.AppendUint64(buf, h)
 		buf = binary.LittleEndian.AppendUint32(buf, slot)
@@ -93,23 +160,21 @@ func writeDirSnapshot(sh *shard, shardDir string) error {
 	tmp := filepath.Join(shardDir, dirSnapName+".tmp")
 	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
-		return err
+		return
 	}
-	if _, err := f.Write(buf); err != nil {
-		f.Close()
+	_, werr := f.Write(buf)
+	if werr == nil {
+		werr = f.Sync()
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Rename(tmp, filepath.Join(shardDir, dirSnapName))
+	}
+	if werr != nil {
 		os.Remove(tmp)
-		return err
 	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, filepath.Join(shardDir, dirSnapName))
 }
 
 // onDirSnapLoad, if set, is notified whether a shard's directory was restored from a
@@ -155,7 +220,11 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 	}
 
 	r := snapReader{b: body}
-	if r.u32() != dirSnapMagic || r.u32() != dirSnapVersion {
+	if r.u32() != dirSnapMagic {
+		return false
+	}
+	version := r.u32()
+	if !dirSnapVersionKnown(version) {
 		return false
 	}
 	commitSeq := r.u64()
@@ -167,6 +236,10 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 	// Resolve each snapshot slot to a loaded segment by basename, verifying its
 	// durable length is unchanged.
 	slotToArray := make([]uint32, nSegs)
+	var bounds []segBounds // by array index; v2 only
+	if version >= 2 {
+		bounds = make([]segBounds, len(sh.segs))
+	}
 	for j := 0; j < nSegs; j++ {
 		used := int(r.u64())
 		name := r.str16()
@@ -178,6 +251,13 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 			return false
 		}
 		slotToArray[j] = ai
+		if bounds != nil {
+			b := segBounds{minSeq: r.u64(), maxSeq: r.u64(), maxSup: r.u64(), dead: int64(r.u64())}
+			if r.err || !b.plausible(used, commitSeq) {
+				return false
+			}
+			bounds[ai] = b
+		}
 	}
 	nEntries := int(r.u64())
 	if r.err {
@@ -192,9 +272,8 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 			return false
 		}
 		l := loc{seg: slotToArray[slot], off: off}
-		s := sh.segs[l.seg]
-		if int(l.off)+recHeaderSize > s.used || recTotalLen(s.data, l.off) == 0 {
-			return false // location out of the durable region / unwritten
+		if !dirEntryValid(sh.segs[l.seg], l.off, h, c.h) {
+			return false // not a record of this bucket: the snapshot does not describe these segments
 		}
 		dir[h] = l
 	}
@@ -205,10 +284,46 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 	sh.dir = dir
 	sh.commitSeq = commitSeq
 	sh.count = count
+	if bounds != nil {
+		for ai, seg := range sh.segs {
+			if seg != nil {
+				bounds[ai].apply(seg)
+			}
+		}
+	} else {
+		// A version 1 snapshot carries no counters. Derive them from the record headers: the
+		// same values rebuildDir would, without the per-key replay that makes it expensive.
+		for _, seg := range sh.segs {
+			if seg != nil {
+				walkSegBounds(seg, sh.appendOnly)
+			}
+		}
+	}
 	if len(sh.segs) > 0 {
 		sh.act = sh.segs[len(sh.segs)-1]
 	}
 	return true
+}
+
+// segBounds is a segment's scan-pruning counters as a snapshot carries them.
+type segBounds struct {
+	minSeq, maxSeq, maxSup uint64
+	dead                   int64
+}
+
+// plausible checks the counters against what they describe, so a snapshot that does not belong
+// to these segments is refused rather than trusted. Each check is a bound the counters cannot
+// exceed when they are right: dead bytes are bytes of the segment; no sequence written or
+// stamped in it is past the shard's commit sequence; a segment's smallest sequence is not past
+// its largest. The CRC and the segment extents are what make a snapshot believable; this only
+// keeps a wrong one from being believed.
+func (b segBounds) plausible(used int, commitSeq uint64) bool {
+	return b.dead >= 0 && b.dead <= int64(used) &&
+		b.maxSeq <= commitSeq && b.maxSup <= commitSeq && b.minSeq <= b.maxSeq
+}
+
+func (b segBounds) apply(seg *segment) {
+	seg.minSeq, seg.maxSeq, seg.maxSup, seg.dead = b.minSeq, b.maxSeq, b.maxSup, b.dead
 }
 
 // snapReader is a bounds-checked little-endian reader over a snapshot body; any
