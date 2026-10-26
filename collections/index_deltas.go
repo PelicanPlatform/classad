@@ -264,18 +264,3 @@ func (ds *deltaScope) withDeltas(w segWindow, cand *roaring.Bitmap) *roaring.Bit
 	cand.Or(d)
 	return cand
 }
-
-// withDeltas returns cand with every delta record in w's first upto bytes added, visible or not,
-// for the paths that do not build a deltaScope (the disjunctive candidate walks). cand may be nil;
-// the result is nil only when both are empty.
-func (c *Collection) withDeltas(w segWindow, upto uint32, cand *roaring.Bitmap) *roaring.Bitmap {
-	d := c.deltaCandidates(w, upto)
-	if d == nil {
-		return cand
-	}
-	if cand == nil {
-		return d.Clone()
-	}
-	cand.Or(d)
-	return cand
-}

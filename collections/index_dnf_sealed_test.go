@@ -42,6 +42,42 @@ func dnfSidecarCounts(c *Collection) (sidecar, total int) {
 	return sidecar, total
 }
 
+// visibleDeltas counts the delta records of c a read sees now: the current versions that are
+// fragments, which an index can only reach through the delta scopes.
+func visibleDeltas(c *Collection) int {
+	n := 0
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		forEachVisibleRef(s0, wins, func(r recRef) bool {
+			if recIsDelta(r.w.data, r.off) {
+				n++
+			}
+			return true
+		})
+		releaseWindows(wins)
+	}
+	return n
+}
+
+// hasUncoveredTail reports whether some indexed segment of c holds records past what its index
+// covers, which a candidate walk visits in full.
+func hasUncoveredTail(c *Collection) bool {
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg == nil {
+				continue
+			}
+			if si := seg.readIdx(); si != nil && int(si.coveredUpto()) < seg.used {
+				sh.mu.RUnlock()
+				return true
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return false
+}
+
 // dnfStats runs the disjunctive index path for expr over every shard of c, as Query does, and
 // returns its scan statistics and the number of records the query accepted.
 func dnfStats(t *testing.T, c *Collection, expr string) (ScanStats, int) {
@@ -168,9 +204,21 @@ func TestDNFQuerySealedSidecar(t *testing.T) {
 			t.Fatal("no deltas written; the test is not exercising what it claims")
 		}
 		c.Reindex()
-		// Records after the index: the active segment's un-indexed tail.
-		for i := n; i < n+40; i++ {
+		// A few records after the index: an active segment's un-indexed tail. Few, because rolling
+		// segments compacts them, which rewrites the delta records into whole ones. Where the
+		// segments roll is not fixed -- time checkpoints land where the clock says -- so a record
+		// that opens a new, unindexed segment is followed by indexing that one.
+		for i := n; !hasUncoveredTail(c); i++ {
+			if i == n+50 {
+				t.Fatal("no indexed segment has an un-indexed tail; the test is not exercising what it claims")
+			}
 			put(i)
+			if !hasUncoveredTail(c) {
+				c.Reindex()
+			}
+		}
+		if deltas && visibleDeltas(c) == 0 {
+			t.Fatal("no delta record is visible; the test is not exercising what it claims")
 		}
 		checkDNF(t, label, c)
 		if cerr := c.Close(); cerr != nil {
@@ -239,8 +287,9 @@ func TestDNFCandidatesSkipMarkers(t *testing.T) {
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
-	for _, zstd := range []bool{false, true} {
-		opts := Options{Dir: t.TempDir(), Shards: 1, SegmentSize: 1 << 13,
+	for _, tc := range []struct{ zstd, reverse bool }{{false, false}, {true, false}, {false, true}, {true, true}} {
+		zstd := tc.zstd
+		opts := Options{Dir: t.TempDir(), Shards: 1, SegmentSize: 1 << 13, ReverseScan: tc.reverse,
 			ValueAttrs: []string{"ClusterId"}, CategoricalAttrs: []string{"Owner"},
 			TimeTravel: &TimeTravelOptions{MaxDistance: time.Hour, CheckpointInterval: time.Millisecond}}
 		if zstd {
@@ -281,8 +330,9 @@ func TestDNFCandidatesSkipMarkers(t *testing.T) {
 		if markers == 0 {
 			t.Fatal("no marker was written; the test is not exercising what it claims")
 		}
-		// No index is built, so every window is walked in full, markers and all: the visitor must
-		// see exactly the n live records, in either direction.
+		// No index is built, so every window is walked in full, markers and all: the visitors must
+		// see exactly the n live records -- the query's (in this collection's walk order) and the
+		// matchmaking one.
 		q, err := vm.Parse(`Owner == "user1" || ClusterId == 5`)
 		if err != nil {
 			t.Fatal(err)
@@ -291,19 +341,21 @@ func TestDNFCandidatesSkipMarkers(t *testing.T) {
 		if !prunable {
 			t.Fatal("the OR is not planned through the disjunctive index path")
 		}
-		for _, reverse := range []bool{false, true} {
-			seen, notAds := 0, 0
-			c.scanShardCandidatesGroups(sh, groups, reverse, false, nil, nil, func(w []byte, _ *segDictHandle, _ bool) bool {
-				seen++
-				if len(w) == 0 || w[0] != 0xCA {
-					notAds++
-				}
-				return true
-			})
-			if seen != n || notAds != 0 {
-				t.Errorf("zstd=%v reverse=%v: visitor saw %d records (%d not an ad), want the %d live ones (%d markers in the segments)",
-					zstd, reverse, seen, notAds, n, markers)
+		if st, _ := dnfStats(t, c, `Owner == "user1" || ClusterId == 5`); st.RecordsVisited != n {
+			t.Errorf("zstd=%v reverse=%v: query visitor saw %d records, want the %d live ones (%d markers in the segments)",
+				zstd, tc.reverse, st.RecordsVisited, n, markers)
+		}
+		seen, notAds := 0, 0
+		c.scanShardCandidatesGroups(sh, groups, func(w []byte, _ *segDictHandle) bool {
+			seen++
+			if len(w) == 0 || w[0] != 0xCA {
+				notAds++
 			}
+			return true
+		})
+		if seen != n || notAds != 0 {
+			t.Errorf("zstd=%v: match visitor saw %d records (%d not an ad), want the %d live ones (%d markers in the segments)",
+				zstd, seen, notAds, n, markers)
 		}
 		// Through Query: a marker's payload does not decompress under zstd, and, uncompressed, it
 		// has no attributes for the matcher to find, so `Owner is undefined` accepts it and only
