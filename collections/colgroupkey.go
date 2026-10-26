@@ -53,9 +53,10 @@ import (
 //	    4   40 bytes                 +27.5%                                             +11.3%
 //
 // Two covers the shape this change exists for -- one dimension beside one time bucket, "per owner
-// per day" -- and the shape the index tier already recognizes. A third column is a four-byte-wider
-// key for every query in the system to buy a shape nothing asks yet; when something does, raising
-// this is one line, and the table above is the measurement to repeat.
+// per day" -- which is also the only multi-column shape anything else here recognizes: the index
+// tier's own two-column path serves exactly that pair. A third slot is eight more bytes of key for
+// every query in the system; when a third column is actually asked for, raising this is one line,
+// and the table above is the measurement to repeat.
 const maxGroupCols = 2
 
 // MaxGroupCols is maxGroupCols, for the db layer's eligibility test. A caller that groups by more
