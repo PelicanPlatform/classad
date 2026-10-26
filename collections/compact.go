@@ -154,6 +154,15 @@ func (c *Collection) Compact() int {
 // that can no longer find a key conservatively conflicts (see conflictSince), and the reap
 // is pin-aware so an in-flight scan keeps the mapping mapped until it unpins.
 func (c *Collection) reclaimDeadShard(sh *shard) int {
+	// The reclaimed records include ones crash recovery reads stamps against, so the durable
+	// horizon must cover them first (see horizon.go); a segment holding anything newer than what
+	// it covers is left for a later pass.
+	sh.mu.RLock()
+	horizonNeed := sh.commitSeq
+	sh.mu.RUnlock()
+	if !c.raiseHorizon(sh, horizonNeed) {
+		return 0
+	}
 	sh.mu.Lock()
 	// A paged read's lease holds back the reclaim of a delta store: a superseded record here
 	// can be the base a delta the leased snapshot still reads merges from (seqlease.go).
@@ -173,7 +182,7 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 		// check: a history segment carrying checkpoint markers still reclaims once its
 		// data has aged out. With time travel off, retain == commitSeq, so any
 		// all-superseded segment qualifies -- exactly the previous behavior.
-		if seg.dead >= int64(seg.used) && seg.maxSup <= retain {
+		if seg.dead >= int64(seg.used) && seg.maxSup <= retain && seg.maxSeq <= horizonNeed {
 			dead = append(dead, seg)
 		}
 	}
@@ -516,6 +525,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		return
 	}
 	retain := sh.retainFloorLocked()
+	horizonNeed := sh.commitSeq // every source record is at or below it
 	origLen := len(sh.segs)
 	sources := make([]*segment, 0, origLen)
 	sourceSet := make(map[*segment]struct{}, origLen)
@@ -543,6 +553,12 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// immutable, which is true and beside the point. Immutability is about content; a munmap is about
 	// lifetime.
 	defer unpinAll(sources)
+	// Compaction drops records -- superseded versions, markers -- that crash recovery reads
+	// stamps against, so the shard's durable horizon must cover the sources before any of them is
+	// retired (see horizon.go). If it cannot be raised the shard is left uncompacted.
+	if !c.raiseHorizon(sh, horizonNeed) {
+		return
+	}
 	// No record is copied before its checksum is checked: a copy carries a fresh one. Damaged records
 	// join their segment's damage set and are left out; a segment whose framing is damaged leaves the
 	// shard uncompacted, as a failed copy does below.

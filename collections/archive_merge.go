@@ -112,6 +112,15 @@ func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segme
 	if err := out.flush(); err != nil {
 		return abort()
 	}
+	// The sources' records leave the shard, and crash recovery reads stamps against records, so
+	// the durable horizon must cover them first (see horizon.go). A no-op for an append log.
+	var need uint64
+	for _, s := range srcs {
+		need = max(need, s.maxSeq)
+	}
+	if !c.raiseHorizon(sh, need) {
+		return abort()
+	}
 
 	// Record the intent before removing anything, so a crash from here on is finishable.
 	marker := filepath.Join(sh.segDir, filepath.Base(out.path)+mergeMarkerSuffix)

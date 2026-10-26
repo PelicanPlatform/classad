@@ -453,6 +453,8 @@ type Collection struct {
 	// retrain (orphaning the new segments' dictionary, which recovery then cannot
 	// load). Commits and queries never take it.
 	maintMu sync.Mutex
+	// hzMu serializes writes of the horizon file (horizon.go).
+	hzMu sync.Mutex
 
 	// reindexMu serializes Reindex so concurrent callers (the archive's eager per-seal
 	// reindex, the periodic maintenance reindex, and compaction's reindexAfterCompaction)
@@ -1037,7 +1039,7 @@ func (c *Collection) Delete(key []byte) bool {
 	sh := c.shards[c.shardOf(key, h)]
 	acq, held := sh.lockWrite()
 	seq := sh.commitSeq + 1
-	ok, parentEmptied := sh.del(h, key, seq)
+	ok, parentEmptied := sh.del(h, key, seq, c.currentCodec())
 	if ok {
 		sh.commitSeq = seq
 		// Journal under the same lock that advances commitSeq: a watcher that snapshots

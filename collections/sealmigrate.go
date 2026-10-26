@@ -138,7 +138,15 @@ func (c *Collection) MigrateSealedAttrs(workers int) int {
 				srcs = append(srcs, s)
 			}
 		}
+		horizonNeed := sh.commitSeq
 		sh.mu.Unlock()
+		// Each rewritten segment replaces its source whole, and crash recovery reads stamps
+		// against the source's records: the durable horizon must cover them before any swap (see
+		// horizon.go). A shard whose horizon cannot be raised is left for the next run.
+		if !c.raiseHorizon(sh, horizonNeed) {
+			complete = false
+			continue
+		}
 
 		// Scan and rewrite off the shard lock; only the swap takes it.
 		type result struct {

@@ -308,6 +308,8 @@ func Open(opts Options) (*Collection, error) {
 			return nil, err
 		}
 	}
+	// Each shard's durable horizon, which its recovery reads stamps against (see horizon.go).
+	horizons := readHorizons(opts.Dir, len(c.shards))
 	// Give each shard an mmap-segment factory writing to its own subdirectory.
 	// Files are named "seg-<counter>.d<dictid>.dat": the counter is a per-shard
 	// monotonic sequence (independent of the logical segment id, which is the array
@@ -318,6 +320,7 @@ func Open(opts Options) (*Collection, error) {
 		if err := os.MkdirAll(shardDir, 0o755); err != nil {
 			return nil, err
 		}
+		sh.horizon.Store(horizons[i])
 		maxNum, err := c.loadShard(sh, shardDir)
 		if err != nil {
 			return nil, errors.Join(fmt.Errorf("recover shard %d: %w", i, err), c.releaseLoadedSegments())
@@ -406,6 +409,11 @@ func Open(opts Options) (*Collection, error) {
 		// what was FOUND rather than what survived the repair -- otherwise a successful repair
 		// would erase its own evidence and the count would read zero forever.
 		c.repairStrandedSealedDeltas(stranded)
+	}
+	// From here on every commit leaves the record stream recovery reads stamps against; make what
+	// recovery found durable and record it as each shard's horizon (see horizon.go).
+	if err := c.persistOpenHorizons(); err != nil {
+		return nil, errors.Join(err, c.releaseLoadedSegments())
 	}
 	// Emit the sidecar-adoption summary gathered during recovery (before the Reindex above
 	// rebuilds whatever was not adopted), so a slow reopen can be traced to its cause.
@@ -746,11 +754,39 @@ func (c *Collection) rebuildDir(sh *shard) {
 		superseded uint64
 	}
 	type mark struct{ seq, millis uint64 }
+	// A stamped record whose stamp recovery has to account for, and a delete marker that may have
+	// to be replayed (see horizon.go). Collected only when the shard has a horizon; only stamps
+	// and markers above it qualify.
+	type stamped struct {
+		l   loc
+		key string
+		sup uint64
+	}
+	type delMark struct {
+		key string
+		seq uint64
+	}
 	var (
-		byKey  map[string]best
-		maxSeq uint64
-		marks  []mark
+		byKey    map[string]best
+		maxSeq   uint64
+		marks    []mark
+		stamps   []stamped
+		delMarks []delMark
+		lastSeq  uint64              // newest record of the stream, markers included
+		lastKeys map[string]struct{} // keys the commit at lastSeq wrote or deleted
+		touched  []supRef            // supersession fields recovery rewrote, flushed at the end
 	)
+	hz := sh.horizon.Load()
+	hzOK := hz != horizonUnknown
+	noteLast := func(seq uint64, key string) {
+		if seq > lastSeq {
+			lastSeq = seq
+			clear(lastKeys)
+		}
+		if seq == lastSeq && key != "" {
+			lastKeys[key] = struct{}{}
+		}
+	}
 	intact := map[loc]bool{} // CRC results, by record
 	recIntact := func(l loc) bool {
 		seg := sh.segs[l.seg]
@@ -769,6 +805,8 @@ func (c *Collection) rebuildDir(sh *shard) {
 		byKey = make(map[string]best)
 		maxSeq = 0
 		marks = marks[:0]
+		stamps, delMarks = stamps[:0], delMarks[:0]
+		lastSeq, lastKeys = 0, map[string]struct{}{}
 		changed := false
 		for _, seg := range sh.segs {
 			if seg == nil {
@@ -820,6 +858,14 @@ func (c *Collection) rebuildDir(sh *shard) {
 					}
 					seg.dead += int64(total)
 					off += int(total)
+					if hzOK && seq > hz {
+						if k, ok := recDeleteMarkerKey(seg.data, o); ok {
+							noteLast(seq, string(k))
+							delMarks = append(delMarks, delMark{string(k), seq})
+						} else if !recIsDict(seg.data, o) && !recIsCol(seg.data, o) {
+							noteLast(seq, "") // a time checkpoint carries its commit's sequence
+						}
+					}
 					continue
 				}
 				if sup != seqMax {
@@ -829,6 +875,14 @@ func (c *Collection) rebuildDir(sh *shard) {
 					}
 				}
 				key := string(recKey(seg.data, o))
+				if hzOK {
+					if seq > hz {
+						noteLast(seq, key)
+					}
+					if sup != seqMax && sup > hz {
+						stamps = append(stamps, stamped{loc{seg.id, o}, key, sup})
+					}
+				}
 				cand := loc{seg.id, o}
 				if b, ok := byKey[key]; ok {
 					// Two records claim the key. Whichever wins supersedes the other on disk, so
@@ -852,8 +906,47 @@ func (c *Collection) rebuildDir(sh *shard) {
 				changed = true
 			}
 		}
+		// Undo every stamp above the horizon whose commit did not survive: one above the newest
+		// surviving record, or one at it on a key that commit left nothing for. The key's
+		// previous version is then current again, and the next pass sees it so.
+		if !changed {
+			for _, st := range stamps {
+				if st.sup < lastSeq {
+					continue
+				}
+				if _, ok := lastKeys[st.key]; ok && st.sup == lastSeq {
+					continue
+				}
+				seg := sh.segs[st.l.seg]
+				setRecSuperseded(seg.data, st.l.off, seqMax)
+				touched = append(touched, supRef{seg, st.l.off})
+				c.openIdxDiag.SupersessionsUndone++
+				changed = true
+			}
+		}
 		if !changed {
 			break
+		}
+	}
+	// Replay delete markers whose stamp did not survive: the key's newest surviving version
+	// predates the delete and is still current.
+	for _, dm := range delMarks {
+		b, ok := byKey[dm.key]
+		if !ok || b.seq >= dm.seq || b.superseded != seqMax {
+			continue
+		}
+		seg := sh.segs[b.loc.seg]
+		seg.supersedeRec(b.loc.off, dm.seq)
+		touched = append(touched, supRef{seg, b.loc.off})
+		b.superseded = dm.seq
+		byKey[dm.key] = b
+		c.openIdxDiag.DeletesReplayed++
+	}
+	// What recovery rewrote must be on disk before the horizon written at the end of Open says
+	// so, or a second crash could bring back a stamp this recovery decided against.
+	for _, t := range touched {
+		if err := t.seg.msyncRange(int(t.off)+recSupOff, int(t.off)+recSupOff+8); err != nil && isDurabilityFailure(err) {
+			sh.syncErr.CompareAndSwap(nil, &syncFail{err})
 		}
 	}
 	for _, m := range marks {
@@ -1135,6 +1228,12 @@ func (c *Collection) Close() error {
 				}
 			}
 		}
+		// Delete stamps a sync pass deferred (see horizon.go) must be on disk before the
+		// snapshot: its reopen reads no delete markers.
+		if err := msyncSups(sh.dirtySup); err != nil && isDurabilityFailure(err) && firstErr == nil {
+			firstErr = err
+		}
+		sh.dirtySup = nil
 		// Persist the directory for a scan-free reopen (best effort; skipped for a
 		// chained collection -- see tryLoadDirSnapshot). Only for a persistent store.
 		// Not when a walk lost a segment's framing: restoring the snapshot would skip the record walk

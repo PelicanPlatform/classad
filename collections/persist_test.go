@@ -789,51 +789,72 @@ func TestPersistentDeleteSurvivesReopen(t *testing.T) {
 	}
 }
 
-// TestDeleteTombstoneFlushPath is a white-box check that a delete on a persistent
-// shard records a tombstone for flushing and that sync drains (msyncs) it. True
-// power-loss durability is not observable via a same-process reopen (the page cache
-// retains dirty mmap pages regardless of msync), so this verifies the durability
-// code path executes rather than its on-disk effect.
+// TestDeleteTombstoneFlushPath is a white-box check of how a delete on a persistent shard is made
+// durable. Its delete marker rides the record ranges a sync flushes, and its stamp (the tombstone) is
+// queued: left for later while the shard has a horizon -- crash recovery replays the marker --
+// drained by the sync itself when it has none, and always drained before a horizon is written over
+// it. True power-loss durability is not observable via a same-process reopen (the page cache retains
+// dirty mmap pages regardless of msync), so this verifies the code path rather than its effect.
 func TestDeleteTombstoneFlushPath(t *testing.T) {
 	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
-	dir := t.TempDir()
-	c, err := Open(Options{Shards: 1, Dir: dir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	key := []byte("k")
-	if err := c.Put(key, mustAd(t, `[A=1]`)); err != nil {
-		t.Fatal(err)
-	}
-	sh := c.shards[0]
-	h := c.h.Hash(key)
+	for _, withHorizon := range []bool{true, false} {
+		t.Run(fmt.Sprintf("horizon=%v", withHorizon), func(t *testing.T) {
+			dir := t.TempDir()
+			c, err := Open(Options{Shards: 1, Dir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			key := []byte("k")
+			if err := c.Put(key, mustAd(t, `[A=1]`)); err != nil {
+				t.Fatal(err)
+			}
+			sh := c.shards[0]
+			if !withHorizon {
+				sh.horizon.Store(horizonUnknown)
+			}
+			h := c.h.Hash(key)
 
-	sh.mu.Lock()
-	sh.dirtySup = nil // clear any prior state
-	seq := sh.commitSeq + 1
-	ok, _ := sh.del(h, key, seq)
-	// Mirror the real Delete path: advance the commit sequence for the tombstone.
-	// sync() group-commits by sequence (syncFor), so dirty state queued WITHOUT a
-	// sequence bump -- which no production path does -- would look already-covered.
-	sh.commitSeq = seq
-	nQueued := len(sh.dirtySup)
-	sh.mu.Unlock()
-	if !ok {
-		t.Fatal("del returned false")
-	}
-	if nQueued != 1 {
-		t.Fatalf("del queued %d tombstones, want 1", nQueued)
-	}
+			sh.mu.Lock()
+			sh.dirtySup = nil // clear any prior state
+			seq := sh.commitSeq + 1
+			ok, _ := sh.del(h, key, seq, c.currentCodec())
+			// Mirror the real Delete path: advance the commit sequence for the tombstone.
+			// sync() group-commits by sequence (syncFor), so dirty state queued WITHOUT a
+			// sequence bump -- which no production path does -- would look already-covered.
+			sh.commitSeq = seq
+			nQueued := len(sh.dirtySup)
+			sh.mu.Unlock()
+			if !ok {
+				t.Fatal("del returned false")
+			}
+			if nQueued != 1 {
+				t.Fatalf("del queued %d tombstones, want 1", nQueued)
+			}
 
-	sh.sync()
-	sh.mu.RLock()
-	nAfter := len(sh.dirtySup)
-	sh.mu.RUnlock()
-	if nAfter != 0 {
-		t.Fatalf("sync left %d tombstones unflushed, want 0", nAfter)
+			sh.sync()
+			sh.mu.RLock()
+			nAfter := len(sh.dirtySup)
+			markerSynced := sh.act.synced == sh.act.used
+			sh.mu.RUnlock()
+			if !markerSynced {
+				t.Fatal("sync left the delete marker unflushed")
+			}
+			if want := map[bool]int{true: 1, false: 0}[withHorizon]; nAfter != want {
+				t.Fatalf("sync left %d tombstones queued, want %d", nAfter, want)
+			}
+			if !c.raiseHorizon(sh, seq) {
+				t.Fatal("raiseHorizon failed")
+			}
+			sh.mu.RLock()
+			nAfter = len(sh.dirtySup)
+			sh.mu.RUnlock()
+			if nAfter != 0 {
+				t.Fatalf("a horizon was written over %d unflushed tombstones", nAfter)
+			}
+		})
 	}
 }

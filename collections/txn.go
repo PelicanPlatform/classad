@@ -273,7 +273,7 @@ func (sh *shard) applyTxn(ws []*txnWrite) (changed bool, seq uint64) {
 		}
 		w.ok = true
 		if w.del {
-			if removed, _ := sh.del(w.hash, w.key, seq); removed {
+			if removed, _ := sh.del(w.hash, w.key, seq, w.codec); removed {
 				changed = true
 			}
 			continue
@@ -720,8 +720,8 @@ func (tx *Txn) Commit() CommitResult {
 		h := tx.c.h.Hash(b.key)
 		idx := tx.c.shardOf(b.key, h)
 		w := &txnWrite{hash: h, key: b.key, del: b.del, base: tx.snap[idx], adObj: b.ad, buf: b}
+		w.codec = tx.c.currentCodec() // a delete's marker allocates a segment with it if it must
 		if !b.del {
-			w.codec = tx.c.currentCodec()
 			// A wire-ingested put is already encoded; only an object put encodes here.
 			raw := b.wire
 			switch {

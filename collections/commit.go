@@ -364,8 +364,13 @@ func (sh *shard) syncPass() uint64 {
 	covered := sh.commitSeq
 	dirty := sh.dirty
 	sh.dirty = nil
-	sup := sh.dirtySup
-	sh.dirtySup = nil
+	// A delete's stamp waits (see deferSupFlushLocked): its delete marker, in the ranges below,
+	// is what makes the delete durable.
+	var sup []supRef
+	if !sh.deferSupFlushLocked() {
+		sup = sh.dirtySup
+		sh.dirtySup = nil
+	}
 	type flushRange struct {
 		seg      *segment
 		from, to int
@@ -401,15 +406,11 @@ func (sh *shard) syncPass() uint64 {
 		}
 	}
 	// Flush delete tombstones: the supersededBySeq field a delete wrote may sit in an
-	// already-synced region (so it is not covered by the append ranges above); msync
-	// its page so the delete survives a crash. Overwrites need no such flush — their
-	// new record is in an append range and recovery's max-seq rule supersedes the old
-	// version regardless.
-	for _, s := range sup {
-		off := int(s.off) + recSupOff
-		if err := s.seg.msyncRange(off, off+8); serr == nil && isDurabilityFailure(err) {
-			serr = err
-		}
+	// already-synced region (so it is not covered by the append ranges above). Overwrites
+	// need no such flush — their new record is in an append range and recovery's max-seq
+	// rule supersedes the old version regardless.
+	if err := msyncSups(sup); serr == nil && isDurabilityFailure(err) {
+		serr = err
 	}
 	// Latch the first durability-sync failure (set-once) so writeError surfaces it: a commit whose
 	// pages did not reach disk must not be silently reported as durable. Fail-stop, like writeErr.
