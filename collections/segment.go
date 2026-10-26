@@ -159,6 +159,11 @@ type segment struct {
 	// index candidate set must include (index_deltas.go).
 	deltas atomic.Pointer[segDeltas]
 
+	// seqSeek tells a paged read where in this segment to start walking for a cursor's sequence
+	// (scanseq.go). Built on first use from the immutable record headers, and extended rather than
+	// rebuilt when the segment has grown past it.
+	seqSeek atomic.Pointer[seqSeek]
+
 	// colblk is this segment's columnar (adschema PAX) accelerator: nil unless schema-scan
 	// is enabled on the collection. Built from the immutable record bytes and swapped in
 	// atomically (like idx); a scan reads it lock-free and uses colSegment.offs to map a
