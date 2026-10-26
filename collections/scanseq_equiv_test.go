@@ -442,8 +442,12 @@ func TestSeqReadMatchesFullWalk(t *testing.T) {
 					t.Fatal(err)
 				}
 				c.Reindex()
-				if !opts.AppendOnly && !anySegmentWithoutSeqBounds(c) {
-					t.Fatal("every segment knows its sequence bounds after the reopen; the reopened shape goes untested")
+				if !anySegmentWithoutSeqBounds(c) {
+					// The snapshot is refused when the segment set it was taken over does not match
+					// the one Open loads, which some histories produce; Open then walks the records
+					// and every segment learns its bounds. Put the segments in the state the
+					// snapshot leaves, so the reopened shape is tested either way.
+					clearSegmentSeqBounds(c)
 				}
 			}
 			// Deep cursors: resume directly from cursors throughout the order, with writes and
@@ -510,6 +514,20 @@ func columnarSegmentsForTest(c *Collection) int {
 		sh.mu.RUnlock()
 	}
 	return n
+}
+
+// clearSegmentSeqBounds zeroes every segment's sequence bounds and dead-byte counters, as a reopen
+// from the directory snapshot leaves them.
+func clearSegmentSeqBounds(c *Collection) {
+	for _, sh := range c.shards {
+		sh.mu.Lock()
+		for _, seg := range sh.segs {
+			if seg != nil {
+				seg.minSeq, seg.maxSeq, seg.maxSup, seg.dead = 0, 0, 0, 0
+			}
+		}
+		sh.mu.Unlock()
+	}
 }
 
 // anySegmentWithoutSeqBounds reports whether some segment of c does not know its sequence bounds,

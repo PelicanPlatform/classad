@@ -142,9 +142,13 @@ func TestSeekSeqDamagedWindow(t *testing.T) {
 }
 
 // TestSeqReadConcurrentReadersShareTheSeek pages one collection from several readers at once while a
-// writer rewrites keys and compaction runs, so readers extend the same segments' seeks concurrently
-// -- the active segment's as it grows -- and build fresh ones over compaction's output. Each reader
-// must still see every key exactly once. Run it under -race.
+// writer adds and rewrites keys and compaction runs, so readers extend the same segments' seeks
+// concurrently -- the active segment's as it grows -- and build fresh ones over compaction's output.
+// Each reader must still see every original key exactly once. Run it under -race.
+//
+// The writer rewrites only keys of its own, never the originals: a cursor's snapshot holds no
+// retention, so a compaction after a rewrite reclaims the version that snapshot sees, and a read
+// already past that shard's start would lose the key.
 func TestSeqReadConcurrentReadersShareTheSeek(t *testing.T) {
 	t.Parallel()
 	c := New(Options{Shards: 2, SegmentSize: 4096})
@@ -161,8 +165,12 @@ func TestSeqReadConcurrentReadersShareTheSeek(t *testing.T) {
 		defer writers.Done()
 		rng := rand.New(rand.NewSource(1))
 		for w := 0; !stop.Load(); w++ {
-			i := rng.Intn(n)
-			if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d; W=%d]`, i, w))); err != nil {
+			// Ids from 10,000 on are the writer's, which the readers do not count.
+			key := fmt.Sprintf("w%d", rng.Intn(50))
+			if rng.Intn(2) == 0 {
+				key = fmt.Sprintf("late%d", w)
+			}
+			if err := c.Put([]byte(key), mustAd(t, fmt.Sprintf(`[Id=%d]`, 10_000+w))); err != nil {
 				t.Error(err)
 				return
 			}
@@ -185,7 +193,9 @@ func TestSeqReadConcurrentReadersShareTheSeek(t *testing.T) {
 				}
 				seq, page := c.QueryRawFromSeq(nil, nil, cursor, 3+r)
 				for raw := range seq {
-					seen[rawIDOf(t, raw)]++
+					if id := rawIDOf(t, raw); id < n {
+						seen[id]++
+					}
 				}
 				if !page.More {
 					break
