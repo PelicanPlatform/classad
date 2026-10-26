@@ -38,15 +38,25 @@ import (
 
 // maxGroupCols is how many GROUP BY columns one packed key holds.
 //
-// Past it the columnar path DECLINES and the query goes back to the scan. It never truncates: a
-// truncated key would merge groups that differ only in a component the key dropped, and report that
-// merge as an answer.
+// Past it the columnar path DECLINES and the query goes back to the scan -- which is what EVERY
+// multi-column group did before this, so a cap costs nothing that was not already being paid. It
+// never truncates: a truncated key would merge groups that differ only in a component the key
+// dropped, and report that merge as an answer.
 //
-// Four is a budget, not a limit the shapes impose: the key is hashed and compared once per record,
-// so every slot costs every query whatever it groups by, and four keeps it at 40 bytes. The shapes
-// asked here are one and two columns -- a dimension and a time bucket -- so four leaves room
-// without making the common case pay for it. Raising it is a one-line change plus a benchmark.
-const maxGroupCols = 4
+// Two, and the number is measured rather than chosen. Every slot costs EVERY query, because the key
+// is hashed and compared once per record whatever it groups by, and a single group column over a
+// small group set is a couple of nanoseconds a record -- a path where the key's width is most of
+// the work. Against main, on the one-column arms of BenchmarkGroupAccum:
+//
+//	slots  key size   raw_cycle4 (4 groups)   bucket_scattered (30 buckets, memo always misses)
+//	    2   24 bytes                  +3.7%                                              -0.3%
+//	    4   40 bytes                 +27.5%                                             +11.3%
+//
+// Two covers the shape this change exists for -- one dimension beside one time bucket, "per owner
+// per day" -- and the shape the index tier already recognizes. A third column is a four-byte-wider
+// key for every query in the system to buy a shape nothing asks yet; when something does, raising
+// this is one line, and the table above is the measurement to repeat.
+const maxGroupCols = 2
 
 // MaxGroupCols is maxGroupCols, for the db layer's eligibility test. A caller that groups by more
 // columns than this must not be handed a truncated key, so it has to know where the limit is rather
@@ -173,6 +183,15 @@ type groupAccum struct {
 	mCmp     bool     // ... and whether there are any, so a lone bucketed column skips the compare
 	mLo, mHi [maxGroupCols]float64
 	mAcc     *groupAcc
+
+	// The per-record key scratch, held here rather than declared per call.
+	//
+	// A fresh `var key groupKey` is a key's worth of zeroing on every record, and the paths that
+	// pay it are the ones where the accumulation map is small enough to sit in L1 -- a status
+	// histogram, a daily series -- so it is pure overhead against a probe that costs almost
+	// nothing. Reusing one value works because the slots past the query's component count are
+	// never written (they start zero) and the rest are overwritten every record.
+	key groupKey
 }
 
 // bucketMemoMargin is how far inside its top edge a bucket interval has to be for the memo to decide
@@ -242,10 +261,44 @@ func (a *groupAccum) strComp(s string) groupComp {
 // several group columns ONE unbucketable component drops the whole record, because the reference
 // drops the row as soon as any of its bucket keys fails to render.
 func (a *groupAccum) accFor(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
+	// ONE group column gets a straight-line path, bucketed and not. It is the shape almost every
+	// query asks, it costs a couple of nanoseconds per record, and at that size the structure of
+	// the code is most of the cost: routing it through the N-component form -- a second call, a
+	// loop over the bucketed component indices, indexed loads of the interval instead of direct
+	// ones -- was measured at +55% on a bucketed column and +32% on a raw one against main, on a
+	// path whose whole purpose is to be a few instructions. Both branches below do exactly what the
+	// general code does for n == 1, with the loops unrolled; enterBucket1 is the same split one
+	// level down, for the records the memo cannot decide.
+	if a.n == 1 {
+		if a.bktN == 0 {
+			k := &a.key
+			k.raw[0], k.kind[0] = comps[0].raw, comps[0].kind
+			g := a.acc[*k]
+			if g == nil {
+				g = newGroupAcc(nAgg)
+				a.acc[*k] = g
+			}
+			g.n++
+			return g, true
+		}
+		// The type test stays ahead of the memo: a string, boolean, undefined or error has no
+		// number at all, so it is in no bucket however near the last one its raw bits sit.
+		f, isNum := comps[0].number()
+		if !isNum {
+			return nil, true
+		}
+		// Positive containment, never `f < lo || f >= hi` -- see inMemoIntervals for why a NaN
+		// makes the negated form hand out the previous record's bucket.
+		if g := a.mAcc; g != nil && a.mLo[0] <= f && f < a.mHi[0] {
+			g.n++
+			return g, true
+		}
+		return a.enterBucket1(f, nAgg)
+	}
 	if a.bktN > 0 {
 		return a.accForBucketed(comps, nAgg)
 	}
-	var key groupKey
+	key := &a.key
 	for i := 0; i < a.n; i++ {
 		key.raw[i], key.kind[i] = comps[i].raw, comps[i].kind
 	}
@@ -254,10 +307,10 @@ func (a *groupAccum) accFor(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc
 	// which is a far shorter run than a bucket's, and the key compare it saves is a map probe
 	// rather than the divide a bucket costs. It was a few percent either way on a column whose
 	// values run in short blocks and a steady loss on every column that cycles.
-	g := a.acc[key]
+	g := a.acc[*key]
 	if g == nil {
 		g = newGroupAcc(nAgg)
-		a.acc[key] = g
+		a.acc[*key] = g
 	}
 	g.n++
 	return g, true
@@ -266,35 +319,48 @@ func (a *groupAccum) accFor(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc
 // accForBucketed is accFor where at least one component is floored into buckets: it tries the
 // interval memo first and falls to enterBuckets, which does the arithmetic and re-arms it.
 func (a *groupAccum) accForBucketed(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
-	// The unbucketed components, which the memo has to match exactly. Bucketed slots stay zero in
-	// the probe so one struct compare answers for all of them at once.
-	var probe groupKey
-	if a.mCmp {
-		for _, i := range a.rawIdx[:a.rawN] {
-			probe.raw[i], probe.kind[i] = comps[i].raw, comps[i].kind
-		}
-	}
-	if g := a.mAcc; g != nil && (!a.mCmp || probe == a.mKey) {
-		hit := true
-		for _, i := range a.bktIdx[:a.bktN] {
-			f, isNum := comps[i].number()
-			// Written as the POSITIVE containment test and negated, never as `f < lo || f >= hi`.
-			// Every comparison against a NaN is false, so the negated form reads a NaN as "neither
-			// below nor above, therefore inside" and hands it the previous record's bucket -- a NaN
-			// counted as an ordinary day, which is exactly what bucketOf refuses to let happen. The
-			// positive form is false for a NaN, so it falls through to bucketOf, which is the only
-			// thing that decides a value is in no bucket.
-			if !isNum || !(a.mLo[i] <= f && f < a.mHi[i]) {
-				hit = false
-				break
-			}
-		}
-		if hit {
+	// Every component bucketed -- two time buckets, say -- means no unbucketed component, so the
+	// memo key is the zero key on both sides and there is nothing to compare. Split out rather than
+	// folded into the general case, because the general case has to BUILD a key to compare, and
+	// building one is a key's worth of writes on a path whose whole job is to replace a float
+	// divide with two compares. (A LONE bucketed column never reaches here: accFor serves n == 1
+	// straight-line.)
+	if !a.mCmp {
+		if g := a.mAcc; g != nil && a.inMemoIntervals(comps) {
 			g.n++
 			return g, true
 		}
+		return a.enterBuckets(comps, nAgg, groupKey{})
+	}
+	// The unbucketed components, which the memo has to match exactly. Bucketed slots stay zero in
+	// the probe so one struct compare answers for all of them at once.
+	var probe groupKey
+	for _, i := range a.rawIdx[:a.rawN] {
+		probe.raw[i], probe.kind[i] = comps[i].raw, comps[i].kind
+	}
+	if g := a.mAcc; g != nil && probe == a.mKey && a.inMemoIntervals(comps) {
+		g.n++
+		return g, true
 	}
 	return a.enterBuckets(comps, nAgg, probe)
+}
+
+// inMemoIntervals reports whether every bucketed component falls in the interval the memo remembers
+// for it.
+//
+// The containment test is written in its POSITIVE form and negated, never as `f < lo || f >= hi`.
+// Every comparison against a NaN is false, so the negated form reads a NaN as "neither below nor
+// above, therefore inside" and hands it the previous record's bucket -- a NaN counted as an ordinary
+// day, which is exactly what bucketOf refuses to let happen. The positive form is false for a NaN,
+// so it falls through to bucketOf, which is the only thing that decides a value is in no bucket.
+func (a *groupAccum) inMemoIntervals(comps *[maxGroupCols]groupComp) bool {
+	for _, i := range a.bktIdx[:a.bktN] {
+		f, isNum := comps[i].number()
+		if !isNum || !(a.mLo[i] <= f && f < a.mHi[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 // enterBuckets floors every bucketed component, finds the resulting group's accumulator and arms the
@@ -348,6 +414,37 @@ func (a *groupAccum) enterBuckets(comps *[maxGroupCols]groupComp, nAgg int, prob
 		a.mLo[i], a.mHi[i] = lo[i], hi[i]-math.Abs(hi[i])*bucketMemoMargin
 	}
 	a.mKey, a.mAcc = probe, g
+	return g, true
+}
+
+// enterBucket1 is enterBuckets for a single bucketed group column: floor f, find the bucket's
+// accumulator, arm the memo. Written out rather than routed through the N-component form for the
+// reason accFor is: this runs once per record on a column whose buckets change often (a timestamp
+// scattered across days rather than advancing through them), and at a couple of nanoseconds a
+// record the loop over component indices and the key copy the general form needs are most of the
+// cost.
+func (a *groupAccum) enterBucket1(f float64, nAgg int) (*groupAcc, bool) {
+	// The floor goes through float64 and renders as an integer because that is what
+	// db.bucketKeyText does: a bucket start is a whole number whatever the column's own type, so an
+	// int column and a real column land in the same group. A number can still be in NO bucket -- a
+	// NaN or an infinity lies in no half-open interval [b, b+width) -- and then the record leaves
+	// the series the same way a string does.
+	b, inBucket := bucketOf(f, a.bucket[0])
+	if !inBucket {
+		return nil, true
+	}
+	k := &a.key
+	k.raw[0], k.kind[0] = b, gkInt
+	g := a.acc[*k]
+	if g == nil {
+		g = newGroupAcc(nAgg)
+		a.acc[*k] = g
+	}
+	g.n++
+	lo := float64(b)
+	hi := lo + float64(a.bucket[0])
+	a.mLo[0], a.mHi[0] = lo, hi-math.Abs(hi)*bucketMemoMargin
+	a.mAcc = g
 	return g, true
 }
 

@@ -39,10 +39,10 @@ func TestGroupKeyIsPlainMemory(t *testing.T) {
 			t.Fatalf("groupKey.%s is a %s; keep the key to fixed-size integers", f.Name, f.Type)
 		}
 	}
-	// 4 slots: 4 int64 plus 4 kind bytes, padded to 40. The number is the component cap times the
-	// per-component cost, so a change here is a change to maxGroupCols or to what a component holds.
-	if got := unsafe.Sizeof(groupKey{}); got != 40 {
-		t.Fatalf("unsafe.Sizeof(groupKey{}) = %d, want 40", got)
+	// 2 slots: 2 int64 plus 2 kind bytes, padded to 24. The width is not incidental -- it is hashed
+	// and compared once per record -- and the measurement that chose it is in maxGroupCols's doc.
+	if got := unsafe.Sizeof(groupKey{}); got != 24 {
+		t.Fatalf("unsafe.Sizeof(groupKey{}) = %d, want 24", got)
 	}
 	// And the component the key is assembled from, which is passed by value per record per column.
 	if got := unsafe.Sizeof(groupComp{}); got != 16 {
