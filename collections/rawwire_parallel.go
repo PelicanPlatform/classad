@@ -73,7 +73,7 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 	// did not leave an encrypted value sealed, it made the whole row fail to assemble and be
 	// skipped, so a projection naming an encrypted attribute returned every ad stripped of it,
 	// silently and only on the parallel path.
-	seal := c.sealer
+	seal := c.renderKey(sel.redact)
 
 	results := make(chan wireRowBatch, W)
 	// Arena free-list: the consumer recycles drained batches back to the workers,
@@ -148,7 +148,8 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 							return true
 						}
 						nw := c.narrowProjected(&narrow, sel, dict, w)
-						out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(c.wireToInline(dict, nw)), sel.keep, needed, seal, &sc)
+						out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf,
+							wire.Ad(c.wireToInlineRead(dict, nw, sel.redact)), sel.keep, needed, seal, &sc)
 						if !ok {
 							batch.buf = out[:start]
 							return true

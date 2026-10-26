@@ -285,6 +285,33 @@ func (c *Collection) wireToInlineNoKey(dict *segDictHandle, w []byte) []byte {
 	return wire.EncodeInline(nil, a)
 }
 
+// wireToInlineRead is wireToInline for a SCAN serving a reader, and differs from it twice.
+//
+// It dispatches on entitlement. A redacted read decodes with no key at all, so a sealed value
+// becomes undefined and no plaintext secret is materialized; only an entitled read opens one. The
+// scans used to call wireToInline unconditionally, which opened every secret and left redaction to
+// a filter on the attribute NAME afterwards -- and that filter only knows private names, so an
+// attribute encrypted at rest under EncryptedAttrs but not private by name was served in the clear.
+//
+// It also does not re-seal. wireToInline re-seals because its sampling and rewrite callers PERSIST
+// what they produce, where plaintext would leak into a retrained dictionary or a columnar block. A
+// scan's inline buffer is transient -- the subset assembler consumes it and it is dropped -- so
+// opening a value only to seal it again is work nobody reads, and the assembler then opens the
+// survivors a third time. On an encrypted store that round trip was the bulk of a read.
+func (c *Collection) wireToInlineRead(dict *segDictHandle, w []byte, redact bool) []byte {
+	if redact {
+		return c.wireToInlineNoKey(dict, w)
+	}
+	if dict == nil {
+		return w
+	}
+	a, err := c.decodeWireDict(dict, w) // opens sealed values: this reader is entitled to them
+	if err != nil {
+		return w
+	}
+	return wire.EncodeInline(nil, a)
+}
+
 // toSelfContained converts a stored record's (compressed) ad bytes into a form that decodes
 // WITHOUT the source segment's dict, for DEFERRED/cold paths (e.g. a watch event) that copy ad
 // bytes out of the scan and decode them later, when the segment and its dict are no longer in
