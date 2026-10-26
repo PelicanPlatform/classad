@@ -324,7 +324,7 @@ type Options struct {
 	// meaningful with DataKey set. An encrypted attribute may NOT also be indexed
 	// (CategoricalAttrs/ValueAttrs) -- New panics on overlap -- since its value is
 	// opaque at rest. The set can be changed at runtime via the toggle meta-command;
-	// existing records keep their prior form until rewritten.
+	// existing records keep their prior form until MigrateSealedAttrs rewrites them.
 	EncryptedAttrs []string
 
 	// TimeTravel, if non-nil, enables point-in-time ("AS OF") queries: superseded

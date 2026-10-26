@@ -832,7 +832,8 @@ func (db *DB) RefreshHotSet(sampleMax, topN int) int {
 // human-toggled set; private attributes are always encrypted). It errors if encryption
 // is disabled or a named attribute is indexed. The policy is persisted so it survives a
 // restart and, in HA, lets a follower converge on reload. New writes seal the new set;
-// existing records re-seal when next rewritten (compaction/Rewrite).
+// existing records are sealed by the migration the next open runs (see
+// collections.MigrateSealedAttrs) -- compaction copies stored values as they are.
 func (db *DB) SetEncryptedAttrs(attrs []string) error {
 	if err := db.c.SetEncryptedAttrs(attrs); err != nil {
 		return err

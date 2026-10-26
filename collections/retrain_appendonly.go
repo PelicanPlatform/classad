@@ -216,7 +216,7 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	// Pass 1: decode + re-encode + recompress every record, computing the exact size the
 	// new segment needs so it fits in a single segment (append order is 1:1).
 	var entries []resealEntry
-	total := 0
+	total, dropped := 0, 0
 	var wireBuf []byte
 	for _, src := range srcs {
 		for off := 0; off < src.used; {
@@ -241,11 +241,22 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 			// A reseal DECODES each record and encodes it afresh, which a delta cannot survive:
 			// it holds only what one write changed, and re-encoding its fragment produces
 			// something a reader believes is a whole ad. An append-only shard never writes one
-			// (a delta needs a per-key current version, which an append log has no notion of),
-			// so meeting one means an assumption has moved -- skip the reseal rather than
-			// rewrite the data wrongly.
+			// (a delta needs a per-key current version, which an append log has no notion of).
+			//
+			// A LIVE one refuses the reseal rather than rewrite the data wrongly. A SUPERSEDED one
+			// is dropped, as compaction drops it: nothing reads it once the key's current version
+			// is a whole record, and the caller that reaches here with a mutable segment (the
+			// sealed-attribute migration) establishes that for the whole shard first. Refusing it
+			// instead refused nearly every segment of a delta store, since a sealed segment holds
+			// the superseded fragments its collapse left behind.
 			if recIsDelta(src.data, o) {
-				return nil
+				if recSuperseded(src.data, o) == seqMax {
+					return nil
+				}
+				resealDroppedDeltas.Add(1)
+				dropped++
+				off += int(rl)
+				continue
 			}
 			key := append([]byte(nil), recKey(src.data, o)...)
 			// The FULL ad: a columnarized source holds only part of each record, and the rest
@@ -273,7 +284,10 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 			off += int(rl)
 		}
 	}
-	if total == 0 {
+	// Nothing to write is a failure, except for an interned segment whose every record was a dropped
+	// delta -- the state a collapse leaves a segment in. That one is rebuilt holding only its
+	// dictionary; refusing it left the segment, and whatever it held, in place for good.
+	if total == 0 && (dropped == 0 || !intern) {
 		return nil
 	}
 	// The dict (interned only) is a trailing record; size the segment to include it exactly.

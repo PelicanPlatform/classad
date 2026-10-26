@@ -167,7 +167,8 @@ func (c *Collection) EncryptedAttrNames() []string {
 // if any named attribute is currently indexed (an encrypted value is opaque, so it
 // cannot be indexed). Private attributes are always encrypted regardless of this set.
 // New records use the new set immediately; existing records keep their prior form until
-// rewritten (compaction/Rewrite re-encodes them under the current policy).
+// MigrateSealedAttrs rewrites them. Compaction does not: it copies stored values as they are.
+// The migration's marker records the set it ran under, so the next open after a change runs it.
 func (c *Collection) SetEncryptedAttrs(attrs []string) error {
 	if c.sealer == nil {
 		return errEncryptionDisabled

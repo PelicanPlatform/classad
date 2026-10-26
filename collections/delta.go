@@ -303,6 +303,9 @@ var (
 	// non-zero count means that shard's legacy records are still unmigrated and the pass needs
 	// running again.
 	migrateSkippedLiveDelta atomic.Int64
+	// resealDroppedDeltas counts superseded delta records a reseal left out of the segment it
+	// rebuilt (see resealSegmentsAs).
+	resealDroppedDeltas atomic.Int64
 )
 
 // DeltaAnomalies reports the three things that should all stay zero in a healthy delta store:
