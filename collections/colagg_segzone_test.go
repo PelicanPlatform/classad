@@ -141,7 +141,7 @@ func TestColumnAggregatesZonePruneSchemaLagSegments(t *testing.T) {
 						t.Errorf("GroupStatsQuery(%s): %d groups, plain %d", expr, len(gs), len(wantGroups))
 					}
 					for _, g := range gs {
-						k, _ := g.Value.IntValue()
+						k, _ := g.Values[0].IntValue()
 						if w := wantGroups[k]; int64(g.Count) != w[0] || g.Stats[0].IntSum != w[1] {
 							t.Errorf("GroupStatsQuery(%s) group %d: count=%d sum=%d, plain %v", expr, k, g.Count, g.Stats[0].IntSum, w)
 						}
@@ -157,11 +157,12 @@ func TestColumnAggregatesZonePruneSchemaLagSegments(t *testing.T) {
 					return ok
 				})
 				check("vecGroupStats", true, func() bool {
-					acc, ok := c.vecGroupStats(q, mustID(t, c, "Grp"), []uint32{mustID(t, c, "Val")}, 0, c.schemaScan.Load())
+					grp := []uint32{mustID(t, c, "Grp")}
+					acc, ok := c.vecGroupStats(q, grp, []uint32{mustID(t, c, "Val")}, []int64{0}, c.schemaScan.Load())
 					if !ok {
 						return false
 					}
-					gs, ok := c.shapeGroupStats(acc, mustID(t, c, "Grp"), []uint32{mustID(t, c, "Val")})
+					gs, ok := c.shapeGroupStats(acc, grp, []uint32{mustID(t, c, "Val")})
 					if ok {
 						checkGroups(gs)
 					}
