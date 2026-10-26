@@ -1,6 +1,11 @@
 package collections
 
-import "github.com/PelicanPlatform/classad/collections/wire"
+import (
+	"math"
+	"slices"
+
+	"github.com/PelicanPlatform/classad/collections/wire"
+)
 
 // Append-only recompression. The mutable store recompresses (RetrainDict) and repacks
 // (Rewrite) via compaction -- a live-copy that supersedes old versions, renumbers
@@ -320,6 +325,11 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 		}
 		newseg.dict.Store(&segDictHandle{data: newseg.data, base: doff + recKeyOff + 4, rec: doff})
 	}
+	// The zone map, before the segment is published: a reader prunes on it, retention ages
+	// segments out by it, and the sidecar the post-swap reindex writes persists it -- so a
+	// segment published without one is scanned in full and never aged out, until a reopen
+	// recomputes it from every record.
+	newseg.zones = c.rewriteZones(sh, srcs, newseg)
 	// Persistent segments: flush the written extent so recovery sees a complete segment.
 	if newseg.persistent {
 		newseg.synced = newseg.used
@@ -328,4 +338,48 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 		}
 	}
 	return newseg
+}
+
+// rewriteZones returns the zone map for out, a segment resealSegmentsAs rebuilt from srcs, or nil
+// when the shard keeps none (it is not append-only, or no attribute is zoned).
+//
+// out holds exactly the records of srcs, with the same values: a reseal re-encodes each ad (its
+// attribute ids become segment-local, its codec may change) but does not change what any value
+// is, and both it and the sources' zone computation leave out the same damaged spans. So when
+// every source carries a zone map, out's is their union -- per attribute, the widest range,
+// full only where every source's was -- over the attributes every source has a zone for; an
+// attribute one source has none for (an expression, no number, or zoned after it sealed) has
+// none in out either. The maps are keyed by this process's ids, not the records' encoding, so
+// the segment-local ids out's records use do not enter into it. A source without a zone map has
+// it recomputed from out's records instead.
+func (c *Collection) rewriteZones(sh *shard, srcs []*segment, out *segment) map[uint32]zoneRange {
+	sh.mu.RLock()
+	attrs, inline, appendOnly := sh.zoneAttrs, sh.zoneInline, sh.appendOnly
+	zs := make([]map[uint32]zoneRange, len(srcs))
+	for i, s := range srcs {
+		zs[i] = s.zones // replaced, never mutated, under the shard lock (rezoneSealed)
+	}
+	sh.mu.RUnlock()
+	if !appendOnly || len(attrs) == 0 {
+		return nil
+	}
+	if slices.ContainsFunc(zs, func(z map[uint32]zoneRange) bool { return z == nil }) {
+		return computeSegZones(c, out, out.used, attrs, inline)
+	}
+	merged := make(map[uint32]zoneRange, len(zs[0]))
+	for id, z := range zs[0] {
+		ok := true
+		for _, other := range zs[1:] {
+			o, has := other[id]
+			if !has {
+				ok = false
+				break
+			}
+			z.Min, z.Max, z.Full = math.Min(z.Min, o.Min), math.Max(z.Max, o.Max), z.Full && o.Full
+		}
+		if ok {
+			merged[id] = z
+		}
+	}
+	return merged
 }
