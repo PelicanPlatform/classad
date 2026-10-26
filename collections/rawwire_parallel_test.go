@@ -147,6 +147,9 @@ func TestRawWireInternedParallelMatchesSerial(t *testing.T) {
 				t.Skip("parallel wire scan did not engage (too few workers available)")
 			}
 
+			// Force the comparison arm serial: a constrained wire read fans out too now, so
+			// leaving the gate at 0 would have compared the parallel path with itself.
+			c.parallelMinBytes = 1 << 62
 			var ser []map[string]string
 			for row := range c.QueryRawWire(mustParseQ(t, "true"), tc.proj, tc.redact) {
 				attrs, myType := wireRowAttrs(t, row)

@@ -1331,32 +1331,56 @@ func (c *Collection) zoneExcludesGroups(w segWindow, plan []vm.ProbeGroup, ct bo
 	return true
 }
 
+// scanVisitState is the working state a refVisitor reuses from record to record: the
+// decompression buffer, the columnar prefilters and the columnar projection scope.
+//
+// It is separable from refVisitor because a refVisitor is bound to ONE snapshot sequence, while
+// a parallel worker steals windows from several shards and so needs a visitor per window. With
+// the state in the closure that worker would rebuild the prefilter -- and regrow the
+// decompression buffer from nil -- once per segment rather than once per scan.
+//
+// Not safe for concurrent use: the colScopes inside the prefilters cache per-block state. One per
+// goroutine, which is exactly what makes the prefilter usable from the parallel workers at all.
+type scanVisitState struct {
+	dbuf        []byte
+	pre         *colPrefilter
+	preFold     *colPrefilter
+	projCS      *colScope
+	projScratch projectScratch
+	built       bool // prefilters/projection scope built; they depend only on the plan
+}
+
 // refVisitor is how a query treats one visible record, whichever walk -- every record, or an
 // index's candidates -- reached it: hide system records, ask the columns before rebuilding the
 // record, project from the columns when nothing needs the whole ad, else reassemble, match and
 // emit. visit returns false to stop the walk; stopped reports whether the consumer asked to.
 func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit func(recRef) bool, stopped func() bool) {
+	return c.refVisitorState(&scanVisitState{}, s0, qp, emit)
+}
+
+// refVisitorState is refVisitor over caller-owned state, so one set survives across the windows a
+// parallel worker visits. st must belong to the calling goroutine and must be used with plans that
+// carry the same query (the prefilters are built from it once).
+func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan, emit scanEmit) (visit func(recRef) bool, stopped func() bool) {
 	cont := true
-	var dbuf []byte // decompression buffer reused across ads (single-threaded scan)
-	// Ask the columns before rebuilding a record: over a columnarized segment a rejected record
-	// would otherwise be reassembled in full and then thrown away. nil when the columns cannot
-	// usefully decide this query, which leaves the scan exactly as it was.
-	pre := c.newColPrefilter(qp.q)
-	var preFold *colPrefilter
-	if qp.fold != nil {
-		preFold = c.newColPrefilter(qp.fold.q)
-	}
-	// A projected read can be built from the named columns instead of reassembling the record and then
-	// discarding most of it -- but only when the match did not need the ad. See colproject.go.
-	var (
-		projCS      *colScope
-		projScratch projectScratch
-	)
-	if qp.proj != nil {
-		if st := c.schemaScan.Load(); st != nil {
-			projCS = &colScope{bc: st.cache, c: c}
+	if !st.built {
+		st.built = true
+		// Ask the columns before rebuilding a record: over a columnarized segment a rejected record
+		// would otherwise be reassembled in full and then thrown away. nil when the columns cannot
+		// usefully decide this query, which leaves the scan exactly as it was.
+		st.pre = c.newColPrefilter(qp.q)
+		if qp.fold != nil {
+			st.preFold = c.newColPrefilter(qp.fold.q)
+		}
+		// A projected read can be built from the named columns instead of reassembling the record and
+		// then discarding most of it -- but only when the match did not need the ad. See colproject.go.
+		if qp.proj != nil {
+			if sc := c.schemaScan.Load(); sc != nil {
+				st.projCS = &colScope{bc: sc.cache, c: c}
+			}
 		}
 	}
+	pre, preFold, projCS := st.pre, st.preFold, st.projCS
 	// A query that reads no attribute has the same answer for every record. Only a TRUE one lets a record
 	// skip the match; a constant false or undefined must still reject it.
 	constQuery := qp.q == nil || constTrue(&qp)
@@ -1392,7 +1416,7 @@ func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit f
 		// cannot be handed to the matcher -- its seed set is not closed.
 		if projCS != nil && cn != nil && (isConst || colDecided) {
 			if k, ok := cn.indexOf(r.off); ok {
-				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &projScratch); ok {
+				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &st.projScratch); ok {
 					qp.stats.matched() // projected straight from columns; no reassembly
 					if qp.ws != nil {
 						qp.ws.dict = dict
@@ -1409,12 +1433,12 @@ func (c *Collection) refVisitor(s0 uint64, qp queryPlan, emit scanEmit) (visit f
 		// the attributes held in the segment's columnar payload. Asking the ref rather than
 		// decompressing here is what lets a columnarized segment be scanned at all: its records
 		// carry only what the schema does not cover.
-		w, err := c.wireAt(r, s0, dbuf)
+		w, err := c.wireAt(r, s0, st.dbuf)
 		if err != nil {
 			return true // skip a record we cannot decode rather than abort the scan; wireAt counted it
 		}
 		qp.stats.reassembled() // the record was rebuilt from the arena (~O(ad width))
-		dbuf = w               // retain the (possibly grown) backing for the next ad
+		st.dbuf = w            // retain the (possibly grown) backing for the next ad
 		// Publish the record's segment dict on the wireScope so the match eval resolves an
 		// interned segment's ids (nil for inline; ws is nil on a plain no-query scan). The
 		// emit consumer gets the dict via a separate channel (emit-widening; TODO make-live).
