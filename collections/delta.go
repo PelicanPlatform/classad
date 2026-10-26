@@ -290,6 +290,9 @@ var deltaDecodeFailHook func() error
 // deltaFlagMismatches counts records whose header flag and payload flag disagree -- a refused
 // read, and the signal that a copy path lost or invented a flag.
 var (
+	// deltaChainGapScans counts delta reads whose versions did not join up and that read the
+	// active segment directly to find the rest (see deltaChainGap). Zero on a healthy store.
+	deltaChainGapScans   atomic.Int64
 	compactLiveDeltas    atomic.Int64
 	compactDroppedDeltas atomic.Int64
 	deltaFlagMismatches  atomic.Int64
@@ -380,6 +383,58 @@ func (sh *shard) hasFull(vers []deltaVer) bool {
 	return false
 }
 
+// sortDeltaVers orders a key's versions by commit sequence and drops repeats: the chain walk, the
+// sealed probe and the active-segment read can each reach the same record.
+func sortDeltaVers(vers []deltaVer) []deltaVer {
+	sort.Slice(vers, func(i, j int) bool {
+		if vers[i].seq != vers[j].seq {
+			return vers[i].seq < vers[j].seq
+		}
+		if vers[i].seg.id != vers[j].seg.id {
+			return vers[i].seg.id < vers[j].seg.id
+		}
+		return vers[i].off < vers[j].off
+	})
+	out := vers[:0]
+	for i, v := range vers {
+		if i > 0 && v.seg == vers[i-1].seg && v.off == vers[i-1].off {
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
+// deltaBase locates the base -- the newest whole record -- from the record HEADERS, so only it and
+// what follows are decompressed. Establishing it by decompressing newest-first and stopping at the
+// first whole record read the same set of records, but it could not know it had failed until it
+// had decompressed every version. -1 when there is none.
+func deltaBase(vers []deltaVer) int {
+	for i := len(vers) - 1; i >= 0; i-- {
+		if !recIsDelta(vers[i].seg.data, vers[i].off) {
+			return i
+		}
+	}
+	return -1
+}
+
+// deltaChainGap reports whether a key's versions from its base forward (sorted by sequence) may be
+// missing one. Each write of a key supersedes its previous version AT the new version's sequence,
+// so in a complete chain every version's supersededBySeq is the next one's seq. A version
+// superseded at a sequence the next found version does not carry is followed by one the walk did
+// not reach -- or it is a duplicate a crash recovery retired at its own sequence, which a second
+// look costs only time to rule out. The newest version needs no such check: it is the one the
+// caller found visible, by the same chain.
+func deltaChainGap(vers []deltaVer) bool {
+	for i := 0; i+1 < len(vers); i++ {
+		v, next := vers[i], vers[i+1].seq
+		if next != v.seq && recSuperseded(v.seg.data, v.off) != next {
+			return true
+		}
+	}
+	return false
+}
+
 // want says which FORM the caller needs, and it decides how the merge is done -- the two forms
 // have different cheapest routes and producing the unwanted one is pure waste:
 //
@@ -435,17 +490,16 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 		add(seg, off)
 		return true
 	})
-	// Neither route is guaranteed to reach a key's OLDER versions. rebuildDir -- which runs on
-	// every crash recovery, and on a clean reopen of a time-travel or parent/child collection --
-	// relinks each bucket to only each key's CURRENT record, and forEachSealedRecord skips the
-	// active segment by construction. A chain living inside the active segment, which is the
-	// normal shape, therefore loses its base and the key silently vanishes: Get says not-found
-	// while Has says true and a scan yields a fragment.
-	//
-	// So when the routes above produced no whole record, fall back to reading the active
-	// segment directly. Chains never span a seal, so that is the only place the rest of one can
-	// be. Bounded to the case that actually needs it: with the directory intact this never runs.
-	if !sh.hasFull(vers) && sh.act != nil {
+	// The active segment is the one place neither route above is guaranteed to cover:
+	// forEachSealedRecord skips it by construction, so its records are reachable only through the
+	// chain. relinkActiveChains rebuilds that chain at Open, but a chain is only as good as every
+	// path that writes one, and the cost of a miss is a merge that silently drops a delta. So the
+	// versions found are checked for completeness from the record headers below, and the active
+	// segment is read directly when they are not: when no whole record was found, or when the
+	// versions from the base forward do not join up.
+	actScanned := false
+	scanAct := func() {
+		actScanned = true
 		seg := sh.act
 		for off := uint32(0); off < uint32(seg.used); {
 			if end, ok := seg.damaged().skip(off); ok {
@@ -466,21 +520,19 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 			off += tl
 		}
 	}
+	if !sh.hasFull(vers) && sh.act != nil {
+		scanAct()
+	}
 	if len(vers) == 0 {
 		return nil, nil, false, failDeltaNoVersions
 	}
-	sort.Slice(vers, func(i, j int) bool { return vers[i].seq < vers[j].seq })
-
-	// Locate the base -- the newest whole record -- from the record HEADERS, then decompress
-	// only from there forward. Establishing it by decompressing newest-first and stopping at the
-	// first whole record read the same set of records, but it could not know it had failed until
-	// it had decompressed every version.
-	base := -1
-	for i := len(vers) - 1; i >= 0; i-- {
-		if !recIsDelta(vers[i].seg.data, vers[i].off) {
-			base = i
-			break
-		}
+	vers = sortDeltaVers(vers)
+	base := deltaBase(vers)
+	if base >= 0 && !actScanned && sh.act != nil && deltaChainGap(vers[base:]) {
+		deltaChainGapScans.Add(1)
+		scanAct()
+		vers = sortDeltaVers(vers)
+		base = deltaBase(vers)
 	}
 	if base < 0 {
 		// No whole record anywhere in the chain. Three different faults land here and the

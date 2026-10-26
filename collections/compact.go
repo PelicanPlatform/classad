@@ -777,7 +777,9 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			}
 			seq := recSeq(seg.data, o)
 			if recIsMarker(seg.data, o) {
-				if seq > retain { // carry an in-window checkpoint forward (to history)
+				// Carry an in-window checkpoint forward (to history). A dictionary or columnar
+				// record is rebuilt by whatever writes the destination, never copied.
+				if seq > retain && recIsTimeMarker(seg.data, o) {
 					markerReserve := 0
 					if intern {
 						markerReserve = reserve

@@ -759,9 +759,17 @@ func recIsMarker(b []byte, off uint32) bool {
 	return binary.LittleEndian.Uint32(b[off+recKeyLenOff:])&markerFlag != 0
 }
 
+// recIsTimeMarker reports whether the record at off is a time checkpoint: a marker that is neither
+// a segment's dictionary record nor its columnar payload, which set markerFlag too and carry their
+// own bodies rather than a millis value.
+func recIsTimeMarker(b []byte, off uint32) bool {
+	f := binary.LittleEndian.Uint32(b[off+recKeyLenOff:])
+	return f&markerFlag != 0 && f&(dictFlag|colFlag) == 0
+}
+
 // recMarkerMillis reads a marker's wall-clock payload (unixMillis). Only valid when
-// recIsMarker(b, off) is true AND recIsDict(b, off) is false (a dict record also sets
-// markerFlag but carries a serialized dict, not a millis payload).
+// recIsTimeMarker(b, off): a dictionary or columnar record also sets markerFlag but carries its
+// own body, not a millis payload.
 func recMarkerMillis(b []byte, off uint32) uint64 {
 	return binary.LittleEndian.Uint64(recAd(b, off))
 }

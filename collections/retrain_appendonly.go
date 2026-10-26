@@ -235,6 +235,14 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 				break
 			}
 			if recIsMarker(src.data, o) {
+				// The source's dictionary and columnar records are not carried: the output gets
+				// a dictionary of its own and is written whole. Carried as markers, each became a
+				// sequence-0 time checkpoint holding its body's first bytes as a time, one more on
+				// every reseal of the segment.
+				if !recIsTimeMarker(src.data, o) {
+					off += int(rl)
+					continue
+				}
 				seq := recSeq(src.data, o)
 				millis := recMarkerMillis(src.data, o)
 				entries = append(entries, resealEntry{seq: seq, marker: true, millis: millis})
