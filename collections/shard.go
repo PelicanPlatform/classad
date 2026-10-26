@@ -784,12 +784,34 @@ func (sh *shard) lookupSealedAt(key []byte, h uint64, s0 uint64) (loc, bool) {
 // bucket head is a current record and a fully-dead segment holds none, so the head is
 // normally not dead; the leading loop still advances (or clears) it defensively, since after
 // the reap the directory must not reference a removed segment. Caller holds the write lock.
-func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
+//
+// It WRITES links, so it follows only links that name a record of bucket h (dirEntryValid:
+// framed, inside its segment's extent, key hashing to h). A directory head or a link can name an
+// offset that no longer holds that record -- a segment rewrite (columnarizing, resealing) moves
+// every offset in its segment without evicting a deleted key's head -- and the old walk wrote a
+// link into whatever bytes sat 16 bytes past it: in one case the middle of a columnarized
+// segment's payload, which then failed its checksum and took every attribute it held with it.
+// A head that is not its bucket's record is dropped, and a link that is not one ends the walk:
+// every record of the bucket still current lives in a sealed segment, which the sealed probe
+// reaches without the chain (the head was the newest record of the bucket, and its segment was
+// sealed before it was rewritten).
+func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}, hasher Hasher) {
 	isDead := func(l loc) bool { _, d := deadSet[l.seg]; return l.valid() && d }
-	// segNext reads the next link from l, terminating the walk (returns noLoc) if l dangles
-	// into a nonexistent segment -- the same corruption findCurrent guards against.
+	// record returns the segment holding a link's record, or nil when the link does not name a
+	// record of this bucket: it dangles into a nonexistent segment (the corruption findCurrent
+	// guards against) or names bytes that are not such a record.
+	record := func(l loc) *segment {
+		if !l.valid() {
+			return nil
+		}
+		s := sh.segForLoc(l)
+		if s == nil || !dirEntryValid(s, l.off, h, hasher) {
+			return nil
+		}
+		return s
+	}
 	segNext := func(l loc) loc {
-		if s := sh.segForLoc(l); s != nil {
+		if s := record(l); s != nil {
 			return recNext(s.data, l.off)
 		}
 		return noLoc
@@ -797,6 +819,9 @@ func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
 	head := sh.dir[h]
 	for isDead(head) {
 		head = segNext(head)
+	}
+	if record(head) == nil {
+		head = noLoc
 	}
 	if head != sh.dir[h] {
 		if head.valid() {
@@ -806,7 +831,7 @@ func (sh *shard) spliceDeadFromChain(h uint64, deadSet map[uint32]struct{}) {
 		}
 	}
 	for l := head; l.valid(); {
-		seg := sh.segForLoc(l)
+		seg := record(l)
 		if seg == nil {
 			break
 		}

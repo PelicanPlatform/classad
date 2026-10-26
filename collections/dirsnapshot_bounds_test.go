@@ -592,7 +592,7 @@ func TestDirSnapshotSecondCloseKeepsNewerSnapshot(t *testing.T) {
 	for i := range 100 {
 		put(c1, i)
 	}
-	if err := c1.Close(); err != nil {
+	if err = c1.Close(); err != nil {
 		t.Fatal(err)
 	}
 	c2, err := Open(opts)
@@ -602,10 +602,10 @@ func TestDirSnapshotSecondCloseKeepsNewerSnapshot(t *testing.T) {
 	for i := 100; i < 200; i++ {
 		put(c2, i)
 	}
-	if err := c2.Close(); err != nil {
+	if err = c2.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := c1.Close(); err != nil {
+	if err = c1.Close(); err != nil {
 		t.Fatal(err)
 	}
 	c3, restored, _ := openCountingSnapshots(t, opts)

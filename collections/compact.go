@@ -212,7 +212,7 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 			if _, done := repaired[h]; !done {
 				repaired[h] = struct{}{}
 				if _, ok := sh.dir[h]; ok {
-					sh.spliceDeadFromChain(h, deadSet)
+					sh.spliceDeadFromChain(h, deadSet, c.h)
 				}
 			}
 			off += int(total)
