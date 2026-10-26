@@ -90,8 +90,13 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 		// Narrow in ID SPACE first, so the conversion below only converts what the caller asked
 		// for (see narrowProjected).
 		w = c.narrowProjected(&narrow, sel, dict, w)
-		w = c.wireToInline(dict, w) // AppendAdSubsetInlineHotFirst needs inline-name wire
-		out, ok := wire.AppendAdSubsetInlineHotFirst(scratch[:0], wire.Ad(w), sel.keep, needed, c.sealer, &sc)
+		// AppendAdSubsetInlineHotFirst needs inline-name wire. Both this conversion and the
+		// assembler below take the key only when the reader is entitled to it: an inline segment
+		// converts nothing, so for that case the assembler's key is the ONLY thing standing
+		// between a redacted read and a sealed value.
+		w = c.wireToInlineRead(dict, w, sel.redact)
+		out, ok := wire.AppendAdSubsetInlineHotFirst(scratch[:0], wire.Ad(w), sel.keep, needed,
+			c.renderKey(sel.redact), &sc)
 		scratch = out
 		if !ok {
 			return true // not an inline ad / malformed: skip, keep scanning

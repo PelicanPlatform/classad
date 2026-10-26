@@ -112,8 +112,14 @@ func (nw *wireNarrower) localWanted(sel *wireSubsetSelector, dict *segDictHandle
 // 100k ~45-attribute job ads with a five-attribute projection on an interned store, giving the
 // parallel scan the same narrowing took it from 3.0 to 1.4 us/ad, and the conversion from 29% of
 // the scan's CPU to 5%.
+// An ENCRYPTED collection is narrowed like any other. This used to be excluded on the grounds that
+// the conversion downstream opens sealed values while this shortcut does not -- but that is a
+// reason to narrow, not to skip: narrowAd copies a node's bytes without interpreting them, so a
+// sealed value survives narrowing untouched and only the attributes the caller asked for are ever
+// opened. Skipping meant an encrypted store opened, re-sealed and re-opened every attribute of
+// every record to serve a handful.
 func (c *Collection) narrowProjected(nw *wireNarrower, sel *wireSubsetSelector, dict *segDictHandle, w []byte) []byte {
-	if sel.wantAll || dict == nil || c.sealer != nil {
+	if sel.wantAll || dict == nil {
 		return w
 	}
 	want := nw.localWanted(sel, dict)
