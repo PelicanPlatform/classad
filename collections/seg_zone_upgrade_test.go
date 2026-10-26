@@ -88,7 +88,7 @@ func stripZoneSections(t *testing.T, dir string) int {
 		}
 		rebuilt := buildSegmentSidecar(
 			append([]byte(nil), attr...), append([]byte(nil), key...), append([]byte(nil), col...),
-			nil, used, dictRec, nil)
+			nil, used, dictRec, 0, nil)
 		if os.WriteFile(path, rebuilt, 0o644) == nil {
 			n++
 		}

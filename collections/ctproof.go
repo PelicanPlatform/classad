@@ -386,7 +386,7 @@ func (sh *shard) ctPerSegment() bool {
 // CurrentTime proof as far as it is known. It never walks the records for it: an unknown proof is
 // written as unknown and proven later (ensureCTProofs, then Reindex persists it).
 func (c *Collection) segKeyIndex(seg *segment) []byte {
-	flags := seg.ctKIDXFlags(seg.used)
+	flags := seg.ctKIDXFlags(seg.used) | seg.trailerAbsenceFlags()
 	return buildKeyIndex(seg.data, seg.used, c.h, seg.damaged(), flags)
 }
 
@@ -447,7 +447,7 @@ func (c *Collection) persistCTProof(seg *segment) {
 		return
 	}
 	container := buildSegmentSidecar(append([]byte(nil), attr...), c.segKeyIndex(seg), append([]byte(nil), col...),
-		append([]byte(nil), zone...), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
+		append([]byte(nil), zone...), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	_ = closer()
 	if writeFileAtomic(path, container) == nil {
 		seg.ct.persisted.Store(true)

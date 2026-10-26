@@ -91,11 +91,29 @@ type OpenTiming struct {
 	ZoneRecomputed    int
 	ZoneUpgraded      int
 	ZoneUpgradeFailed int
-	Reindex           time.Duration // post-recovery rebuild of indexes not adopted from sidecars
-	RebuildOrdered    time.Duration // post-recovery rebuild of the maintained ordered indexes
-	AdoptSchema       time.Duration // re-enable columnar schema-scan from persisted blocks
-	LoadDicts         time.Duration // load on-disk dictionaries before segment recovery
-	LoadDemand        time.Duration // load checkpointed query demand
+	// TrailerFlagsUpgraded is how many sealed segments had the absence of their trailer
+	// records written into their sidecar by this open (kidxNoDictRec / kidxNoColRec), and
+	// TrailerFlagsUpgradeFailed how many could not be. Same reasoning as the zone counters
+	// above: an upgrade that does not land leaves every start walking every record to learn
+	// what the sidecar was supposed to say, and nothing else would show it.
+	TrailerFlagsUpgraded      int
+	TrailerFlagsUpgradeFailed int
+	// RecordsWalked is how many records this Open examined ONE AT A TIME, summed over every
+	// phase in this struct that has a per-record step.
+	//
+	// It is the invariant's own measurement: opening a store is O(segments), not
+	// O(records), so this must stay bounded by the segment count (plus whatever the
+	// one active segment holds, which has no sidecar and must be walked). A value that
+	// tracks the store's record count means a phase is walking the whole archive --
+	// the regression this counter exists to catch, which a wall-clock number hides
+	// because it looks merely slow.
+	RecordsWalked int
+
+	Reindex        time.Duration // post-recovery rebuild of indexes not adopted from sidecars
+	RebuildOrdered time.Duration // post-recovery rebuild of the maintained ordered indexes
+	AdoptSchema    time.Duration // re-enable columnar schema-scan from persisted blocks
+	LoadDicts      time.Duration // load on-disk dictionaries before segment recovery
+	LoadDemand     time.Duration // load checkpointed query demand
 }
 
 // add accumulates o2 into o (used to fold each shard's phase timings into the collection total).
@@ -110,6 +128,8 @@ func (o *OpenTiming) add(o2 OpenTiming) {
 	o.ZoneRecomputed += o2.ZoneRecomputed
 	o.ZoneUpgraded += o2.ZoneUpgraded
 	o.ZoneUpgradeFailed += o2.ZoneUpgradeFailed
+	o.TrailerFlagsUpgraded += o2.TrailerFlagsUpgraded
+	o.TrailerFlagsUpgradeFailed += o2.TrailerFlagsUpgradeFailed
 }
 
 // OpenIndexDiagHook, when non-nil, is called once at the end of each Collection Open with a

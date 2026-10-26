@@ -319,8 +319,8 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	dst.zones = src.zones
 	// The payload was just written at the current version, so this cannot report an unsupported one;
 	// any failure leaves dst unpublished, and the check below refuses it.
-	perr := publishColNative(c, dst)
-	// Attach dst's key index + Bloom over its NEW offsets, from the same immutable bytes the deferred
+	perr := publishColNative(c, dst, 0, 0) // the payload was just appended; there is something to find
+	// Attach dst's key index over its NEW offsets, from the same immutable bytes the deferred
 	// reindex would use (buildKeyIndex over the whole segment; the dict/col records it also scans never
 	// match a real key). Built here, before the swap, so columnarizeSealedSegment can PUBLISH it on dst
 	// the instant dst becomes visible -- closing the window in which dst was reachable with keyIdx==nil,
@@ -334,7 +334,6 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		return nil, nil, nil // the payload did not read back (or its key index would not parse): refuse
 	}
 	dst.keyIdx.Store(ki)
-	dst.keyBloom.Store(bloomFromKeyIndex(ki))
 	return dst, srcOffs, newOffs
 }
 
@@ -655,7 +654,7 @@ func (c *Collection) persistColumnarizedSidecar(sh *shard, dst *segment) {
 		}
 	}
 	container := buildSegmentSidecar(attrBlob, c.segKeyIndex(dst),
-		c.colBlobForSeg(dst), buildZoneBlob(dst.zones, c.intern.Name), dst.used, dst.dictRecOff(), encodeDamage(dst.damaged()))
+		c.colBlobForSeg(dst), buildZoneBlob(dst.zones, c.intern.Name), dst.used, dst.dictRecOff(), dst.colRecOff(), encodeDamage(dst.damaged()))
 	c.installSidecar(sh, dst, path, container)
 }
 

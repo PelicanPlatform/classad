@@ -296,7 +296,7 @@ func TestZNM2ZoneSectionsRecomputedOnce(t *testing.T) {
 			continue
 		}
 		out := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...),
-			append([]byte(nil), col...), znm2Blob(map[string]zoneRange{"CompletionDate": {Min: 100, Max: 100}}), used, dictRec, nil)
+			append([]byte(nil), col...), znm2Blob(map[string]zoneRange{"CompletionDate": {Min: 100, Max: 100}}), used, dictRec, 0, nil)
 		if err := os.WriteFile(p, out, 0o644); err != nil {
 			t.Fatal(err)
 		}

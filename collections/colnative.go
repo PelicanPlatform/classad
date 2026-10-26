@@ -68,6 +68,11 @@ type colNative struct {
 	// the schema's global ids into this segment's local ones.
 	dict *segDictHandle
 
+	// rec is the offset of the payload record in the segment, recorded in the sidecar so a
+	// reopen goes straight to it instead of walking the segment's records to find it (the
+	// dictionary record's offset is carried the same way; see segment.colRecOff).
+	rec uint32
+
 	// localOf translates the payload schema's GLOBAL intern ids into this segment's local
 	// dictionary ids, resolved once when the payload is published.
 	//
@@ -88,7 +93,7 @@ type colNative struct {
 // -- so it is neither published nor marked; the error (ErrUnsupportedColumnarVersion, wrapped) is
 // returned for Open to refuse the collection with. Marking it damaged would let scans skip its records
 // silently, and the payload is the only copy of what they are missing.
-func publishColNative(c *Collection, seg *segment) error {
+func publishColNative(c *Collection, seg *segment, hint uint32, flags uint16) error {
 	if seg == nil || seg.colNative.Load() != nil {
 		return nil
 	}
@@ -97,6 +102,21 @@ func publishColNative(c *Collection, seg *segment) error {
 	if seg.dictUnusable.Load() {
 		return nil
 	}
+	// The sidecar says this sealed segment holds no payload record. Without this the search below
+	// reads every record of every segment at every open to conclude the same (see kidxNoColRec).
+	if flags&kidxNoColRec != 0 {
+		return nil
+	}
+	// Or it names where the payload is, so the search is one verified record read rather than a
+	// walk to the end of the segment.
+	if hint > 0 && colRecordAt(seg, hint) {
+		return publishColRecord(c, seg, hint)
+	}
+	// The fallback search reads one record header after another, which is the other half of what
+	// made opening a store scale with its record count; count what it examines (see
+	// OpenTiming.RecordsWalked).
+	walked := 0
+	defer func() { c.recWalked.Add(int64(walked)) }()
 	dm := seg.damaged()
 	for off := 0; off < seg.used; {
 		o := uint32(off)
@@ -108,112 +128,120 @@ func publishColNative(c *Collection, seg *segment) error {
 		if total == 0 {
 			break
 		}
+		walked++
 		// The PAYLOAD record, which is a marker; a remnant carries colFlag too (recIsStripped)
 		// and must not be parsed as one.
 		if recIsCol(seg.data, o) && recIsMarker(seg.data, o) {
-			// VERIFY the payload before trusting it. Every other region of a segment is either
-			// replaceable (the sidecar rebuilds) or one record's worth of damage; these bytes are
-			// the only copy of every schema'd attribute in the segment, so a flipped bit here is a
-			// silently wrong value with nothing to fall back on.
-			//
-			// The record CRC is otherwise checked in exactly one place -- recovery's extent scan,
-			// which the recorded-extent shortcut normally skips -- so it functions as a torn-tail
-			// detector rather than an integrity check. That is fine for a row record and not fine
-			// for this one, which is why it is checked here explicitly rather than relied upon.
-			if seg.persistent && !recVerifyCRC(seg.data, o) {
-				colNativeCRCFailures.Add(1)
-				seg.colDamaged.Store(true)
-				return nil
-			}
-			blob := recAd(seg.data, o)
-			// The REGION codec, not the segment's record codec: a block's regions are
-			// compressed dictionary-less (see Collection.regionCodec), and decoding them with
-			// the segment's trained dictionary fails or, worse, succeeds into nonsense.
-			cs, err := unmarshalColPayload(blob, c.regionCodec(), func(name string) uint32 {
-				return c.intern.Intern(name)
-			})
-			if errors.Is(err, ErrUnsupportedColumnarVersion) {
-				colNativeUnsupported.Add(1)
-				return fmt.Errorf("segment %s: %w", seg.path, err)
-			}
-			if err != nil {
-				colNativeCRCFailures.Add(1)
-				seg.colDamaged.Store(true)
-				return nil
-			}
-			// A payload that verifies can still describe records that are no longer where it says:
-			// a repair that packed the records of a columnarized segment moved every record after a
-			// dropped one onto its predecessor's offset, and each then read its predecessor's row.
-			// The read-time check cannot see that (each lookup finds a row, just the wrong one), so
-			// the ends of the offset map are checked against the records here. Fsck checks every row.
-			if !colOffsetsFitRecords(seg, cs) {
-				colNativeOffsetMismatches.Add(1)
-				seg.colDamaged.Store(true)
-				return nil
-			}
-			cs.schemaOnly = true
-			// The collection's ONE shared block cache, not a fresh per-segment cache: a cache
-			// per segment made ristretto's fixed admission metadata scale with segment count (a
-			// multi-GB reopen leak on a large archive). A nil cache (creation failed) is valid --
-			// blockCache methods then decompress every time -- so it never damages the segment.
-			cs.bindNative(c, seg)
-			cn := &colNative{seg: cs, cache: c.sharedColCache()}
-			cn.dict = seg.dict.Load()
-			// The payload's cold tails are keyed by the SEGMENT's dictionary, so readers translate
-			// through that dictionary rather than trusting this process's intern numbering.
-			// Only for a dictionary-keyed payload. A globally-keyed one already carries its own
-			// translation, built from the names the section stores, and overwriting it with a
-			// dictionary-derived map would point every cold-tail lookup at the wrong attribute.
-			if rm := segIDRemap(c, cn.dict); rm != nil && cs.dictKeyed {
-				for _, b := range cs.blocks {
-					b.remap = rm
-				}
-				for _, g := range cs.groups {
-					setGroupRemap(g.blocks, rm)
-				}
-			}
-			if cn.dict != nil {
-				cn.localOf = make(map[uint32]uint32, 256)
-				schemas := make([]*adSchema, 0, len(cs.blocks)+len(cs.groups))
-				for _, b := range cs.blocks {
-					schemas = append(schemas, b.schema)
-				}
-				for _, g := range cs.groups {
-					// The group schemas too: reassembly translates their fields into the record's id
-					// space exactly as it does base fields, and doing that with a dictionary probe per
-					// field per record is the cost this cache exists to remove.
-					schemas = append(schemas, g.schema)
-				}
-				for _, sch := range schemas {
-					if sch == nil {
-						continue
-					}
-					for _, f := range sch.fields {
-						if _, done := cn.localOf[f.id]; done {
-							continue
-						}
-						name, ok := c.intern.Name(f.id)
-						if !ok {
-							continue
-						}
-						if lid, ok := cn.dict.lookup(name); ok {
-							cn.localOf[f.id] = lid
-						}
-					}
-				}
-			}
-			seg.colNative.Store(cn)
-			// Publish it as the segment's read-path columnar block too. It IS a colSegment, so
-			// every existing columnar reader -- the aggregate scans, the presence count, the
-			// per-record resolver, the vectorized evaluator -- works against the in-segment copy
-			// unchanged. That is what makes the sidecar's copy redundant rather than merely
-			// duplicated: the builder skips a segment that already has one (see enableSchemaScan),
-			// so nothing rebuilds it and nothing writes it.
-			seg.colblk.Store(cs)
-			return nil
+			return publishColRecord(c, seg, o)
 		}
 		off += int(total)
 	}
+	return nil
+}
+
+// publishColRecord parses the columnar payload record at o and publishes it as the segment's
+// authoritative columnar data. Shared by the sidecar-hinted path and the fallback search, so both
+// verify and publish identically; o must name a framed payload record (colRecordAt).
+func publishColRecord(c *Collection, seg *segment, o uint32) error {
+	// VERIFY the payload before trusting it. Every other region of a segment is either
+	// replaceable (the sidecar rebuilds) or one record's worth of damage; these bytes are
+	// the only copy of every schema'd attribute in the segment, so a flipped bit here is a
+	// silently wrong value with nothing to fall back on.
+	//
+	// The record CRC is otherwise checked in exactly one place -- recovery's extent scan,
+	// which the recorded-extent shortcut normally skips -- so it functions as a torn-tail
+	// detector rather than an integrity check. That is fine for a row record and not fine
+	// for this one, which is why it is checked here explicitly rather than relied upon.
+	if seg.persistent && !recVerifyCRC(seg.data, o) {
+		colNativeCRCFailures.Add(1)
+		seg.colDamaged.Store(true)
+		return nil
+	}
+	blob := recAd(seg.data, o)
+	// The REGION codec, not the segment's record codec: a block's regions are
+	// compressed dictionary-less (see Collection.regionCodec), and decoding them with
+	// the segment's trained dictionary fails or, worse, succeeds into nonsense.
+	cs, err := unmarshalColPayload(blob, c.regionCodec(), func(name string) uint32 {
+		return c.intern.Intern(name)
+	})
+	if errors.Is(err, ErrUnsupportedColumnarVersion) {
+		colNativeUnsupported.Add(1)
+		return fmt.Errorf("segment %s: %w", seg.path, err)
+	}
+	if err != nil {
+		colNativeCRCFailures.Add(1)
+		seg.colDamaged.Store(true)
+		return nil
+	}
+	// A payload that verifies can still describe records that are no longer where it says:
+	// a repair that packed the records of a columnarized segment moved every record after a
+	// dropped one onto its predecessor's offset, and each then read its predecessor's row.
+	// The read-time check cannot see that (each lookup finds a row, just the wrong one), so
+	// the ends of the offset map are checked against the records here. Fsck checks every row.
+	if !colOffsetsFitRecords(seg, cs) {
+		colNativeOffsetMismatches.Add(1)
+		seg.colDamaged.Store(true)
+		return nil
+	}
+	cs.schemaOnly = true
+	// The collection's ONE shared block cache, not a fresh per-segment cache: a cache
+	// per segment made ristretto's fixed admission metadata scale with segment count (a
+	// multi-GB reopen leak on a large archive). A nil cache (creation failed) is valid --
+	// blockCache methods then decompress every time -- so it never damages the segment.
+	cs.bindNative(c, seg)
+	cn := &colNative{seg: cs, cache: c.sharedColCache(), rec: o}
+	cn.dict = seg.dict.Load()
+	// The payload's cold tails are keyed by the SEGMENT's dictionary, so readers translate
+	// through that dictionary rather than trusting this process's intern numbering.
+	// Only for a dictionary-keyed payload. A globally-keyed one already carries its own
+	// translation, built from the names the section stores, and overwriting it with a
+	// dictionary-derived map would point every cold-tail lookup at the wrong attribute.
+	if rm := segIDRemap(c, cn.dict); rm != nil && cs.dictKeyed {
+		for _, b := range cs.blocks {
+			b.remap = rm
+		}
+		for _, g := range cs.groups {
+			setGroupRemap(g.blocks, rm)
+		}
+	}
+	if cn.dict != nil {
+		cn.localOf = make(map[uint32]uint32, 256)
+		schemas := make([]*adSchema, 0, len(cs.blocks)+len(cs.groups))
+		for _, b := range cs.blocks {
+			schemas = append(schemas, b.schema)
+		}
+		for _, g := range cs.groups {
+			// The group schemas too: reassembly translates their fields into the record's id
+			// space exactly as it does base fields, and doing that with a dictionary probe per
+			// field per record is the cost this cache exists to remove.
+			schemas = append(schemas, g.schema)
+		}
+		for _, sch := range schemas {
+			if sch == nil {
+				continue
+			}
+			for _, f := range sch.fields {
+				if _, done := cn.localOf[f.id]; done {
+					continue
+				}
+				name, ok := c.intern.Name(f.id)
+				if !ok {
+					continue
+				}
+				if lid, ok := cn.dict.lookup(name); ok {
+					cn.localOf[f.id] = lid
+				}
+			}
+		}
+	}
+	seg.colNative.Store(cn)
+	// Publish it as the segment's read-path columnar block too. It IS a colSegment, so
+	// every existing columnar reader -- the aggregate scans, the presence count, the
+	// per-record resolver, the vectorized evaluator -- works against the in-segment copy
+	// unchanged. That is what makes the sidecar's copy redundant rather than merely
+	// duplicated: the builder skips a segment that already has one (see enableSchemaScan),
+	// so nothing rebuilds it and nothing writes it.
+	seg.colblk.Store(cs)
 	return nil
 }
 
@@ -457,6 +485,31 @@ func (cn *colNative) blockFor(k int) (*columnarBlock, int) {
 
 // columnarized reports whether the segment stores its schema'd attributes columnar.
 func (s *segment) columnarized() bool { return s != nil && s.colNative.Load() != nil }
+
+// colRecOff returns the offset of the segment's columnar payload record, or 0 when it has none.
+// Recorded in the sidecar (container v6) so a reopen need not search for it; 0 reads as "not
+// recorded", and the search runs as before.
+func (s *segment) colRecOff() uint32 {
+	if cn := s.colNative.Load(); cn != nil {
+		return cn.rec
+	}
+	return 0
+}
+
+// colRecordAt reports whether off names a framed columnar payload record inside seg's written
+// data. The recorded offset is VERIFIED and not trusted, for the same reason the dictionary's is:
+// these bytes hold every schema'd attribute the segment's records no longer carry, so publishing
+// the wrong record would be silently wrong values rather than a failure.
+func colRecordAt(seg *segment, off uint32) bool {
+	if int(off)+recHeaderSize > seg.used || seg.damaged().covers(off) {
+		return false
+	}
+	total := recTotalLen(seg.data, off)
+	if total == 0 || int(off)+int(total) > seg.used {
+		return false
+	}
+	return recIsCol(seg.data, off) && recIsMarker(seg.data, off)
+}
 
 // colNativeCRCFailures counts columnar payloads refused for a bad checksum or a body that does not
 // parse. A nonzero value means a segment is missing the attributes its records no longer carry, which

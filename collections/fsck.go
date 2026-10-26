@@ -463,7 +463,8 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 	// A trusted sidecar also records where the dictionary record is, which names a damaged
 	// dictionary even when the damage cleared its flag.
 	dictAt := -1
-	if extent, dictRec, dmg := readSidecarTrailer(path + ".idx"); extent > 0 {
+	if facts := readSidecarTrailer(path + ".idx"); facts.used > 0 {
+		extent, dictRec, dmg := facts.used, facts.dictRec, facts.damage
 		s.Sidecar = "ok"
 		if extent <= len(data) && recExtentEndsCleanly(data, extent) && damageFits(data, extent, dmg) {
 			s.ExtentTrusted = true
@@ -577,7 +578,7 @@ func fsckSegment(path string, dictID uint32) (*FsckSegment, error) {
 	}
 	// Where a normal open stops, when the sidecar does not hand it the extent.
 	if !s.ExtentTrusted {
-		if used, crcStop := recoveryExtent(data); crcStop {
+		if used, _, crcStop := recoveryExtent(data); crcStop {
 			if st := surveyPastDamage(data, used); st.Records > 0 || st.Dictionary || st.ColumnarPayload {
 				st.Path, st.Offset = path, used
 				// The store's hasher is not known offline; the default is the one the key-index

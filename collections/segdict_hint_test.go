@@ -63,7 +63,7 @@ func TestSegDictHintMatchesWalk(t *testing.T) {
 	for _, seg := range segs {
 		hinted := seg.dict.Load().rec
 		seg.dict.Store(nil)
-		publishSegDictAt(seg, 0) // force the walk
+		publishSegDictAt(seg, 0, 0) // force the walk
 		walked := seg.dict.Load()
 		if walked == nil {
 			t.Fatalf("walk found no dict in an interned segment")
@@ -111,7 +111,7 @@ func TestSegDictHintRejectsBadOffset(t *testing.T) {
 				}
 			}
 			seg.dict.Store(nil)
-			publishSegDictAt(seg, hint)
+			publishSegDictAt(seg, hint, 0)
 			got := seg.dict.Load()
 			if got == nil {
 				t.Fatalf("bad hint %d left the segment with no dict at all", hint)
@@ -222,7 +222,7 @@ func TestSegDictOffsetIsRecorded(t *testing.T) {
 		t.Fatal("fixture produced no interned segments")
 	}
 	for _, seg := range segs {
-		_, dictRec, _ := readSidecarTrailer(seg.path + ".idx")
+		dictRec := readSidecarTrailer(seg.path + ".idx").dictRec
 		if dictRec == 0 {
 			t.Errorf("segment %s: sidecar records no dict offset", seg.path)
 			continue

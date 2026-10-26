@@ -488,7 +488,7 @@ func stripKIDXFlags(t *testing.T, path string) {
 	nk[6], nk[7] = 0, 0
 	binary.LittleEndian.PutUint32(nk[len(nk)-4:], crc32.ChecksumIEEE(nk[:len(nk)-4]))
 	out := buildSegmentSidecar(append([]byte(nil), attr...), nk, append([]byte(nil), col...), append([]byte(nil), zone...),
-		used, dictRec, append([]byte(nil), v5.damage...))
+		used, dictRec, v5.colRec, append([]byte(nil), v5.damage...))
 	_ = closer()
 	if strings.HasSuffix(path, ".idx") && ki.flags == 0 {
 		t.Fatalf("%s: sidecar had no proof to strip", path)

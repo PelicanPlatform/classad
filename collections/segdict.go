@@ -152,7 +152,7 @@ func (h *segDictHandle) buildNameCache() *[]string {
 // segment's dict handle so its records resolve segment-local ids. A segment with no dict record
 // is inline -- seg.dict stays nil. Called during Open before any body decode. The dict record
 // is a trailer, so this walks to it; the walk reads only record headers (no decompress).
-func publishSegDict(seg *segment) { publishSegDictAt(seg, 0) }
+func publishSegDict(seg *segment) { publishSegDictAt(seg, 0, 0) }
 
 // publishSegDictAt is publishSegDict with a hint: the dict record's offset as recorded in the
 // segment's sidecar. The dict is a TRAILER, so the unhinted walk always traverses the whole
@@ -171,13 +171,22 @@ func publishSegDict(seg *segment) { publishSegDictAt(seg, 0) }
 // bit in a name would rename that attribute in every ad the segment holds, and nothing downstream
 // could tell. A record that fails is not published (SegDictCRCFailures counts it); markSegDictNeed
 // then finds the segment's records interned and makes their reads fail.
-func publishSegDictAt(seg *segment, hint uint32) {
+// walked is how many records the fallback search examined, which the caller folds into
+// OpenTiming.RecordsWalked: this search is one of the two that made opening a store scale with
+// its record count, so it is the counter's business to show when it runs.
+func publishSegDictAt(seg *segment, hint uint32, flags uint16) (walked int) {
 	if seg == nil || seg.dict.Load() != nil {
-		return
+		return 0
 	}
 	if hint > 0 && dictRecordAt(seg, hint) {
 		publishSegDictRec(seg, hint)
-		return
+		return 0
+	}
+	// The sidecar says this sealed segment holds no dictionary record, so there is nothing for
+	// the walk to find. Without this the segment is read end to end at every open to learn the
+	// same thing again (see kidxNoDictRec).
+	if flags&kidxNoDictRec != 0 {
+		return 0
 	}
 	dm := seg.damaged()
 	for off := 0; off < seg.used; {
@@ -190,12 +199,14 @@ func publishSegDictAt(seg *segment, hint uint32) {
 		if total == 0 {
 			break
 		}
+		walked++
 		if recIsDict(seg.data, o) {
 			publishSegDictRec(seg, o)
-			return
+			return walked
 		}
 		off += int(total)
 	}
+	return walked
 }
 
 // publishSegDictRec publishes the dictionary record at o, which must lie inside seg's written
@@ -270,6 +281,31 @@ func SegDictCRCFailures() int64 { return segDictCRCFailures.Load() }
 // (RecordReadSkips reason "dict-unusable") rather than decode through a dictionary that may rename
 // attributes, or through none.
 func SegDictsUnusable() int64 { return segDictsUnusable.Load() }
+
+// trailerAbsenceFlags states, for the key index of a sidecar written over this segment, which
+// of its two trailer records the segment does NOT carry (see kidxNoDictRec / kidxNoColRec).
+//
+// Only an absence the segment itself can vouch for is claimed, because a wrong claim here is not
+// a slow open but a silently incomplete one: a segment wrongly marked as having no columnar
+// payload reads as ads missing every attribute the payload holds, with nothing saying so. dict
+// and colNative are published before this is ever asked -- from the sidecar's own offsets, or by
+// a search that ran to the end of the segment -- so nil means the record is not there, EXCEPT in
+// the cases the guards below cover, where the search did not run or cannot be trusted.
+func (s *segment) trailerAbsenceFlags() uint16 {
+	// Any damage puts the framing itself in doubt, and an unusable dictionary stops the payload
+	// search before it runs (publishColNative), so neither record's absence can be vouched for.
+	if s == nil || s.damaged() != nil || s.stoppedAtDamage || s.dictUnusable.Load() {
+		return 0
+	}
+	var f uint16
+	if s.dict.Load() == nil {
+		f |= kidxNoDictRec
+	}
+	if s.colNative.Load() == nil && !s.colDamaged.Load() {
+		f |= kidxNoColRec
+	}
+	return f
+}
 
 // dictRecOff returns the offset of the segment's dictionary record, or 0 if the segment is
 // inline (no dictionary). Recorded in the sidecar so a reopen need not search for it.

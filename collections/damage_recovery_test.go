@@ -197,7 +197,7 @@ func damageTotal(t *testing.T, path string, data []byte, off int) string {
 // sidecarDamage returns the damage set a segment's sidecar records, or nil.
 func sidecarDamage(t *testing.T, path string) *damageSet {
 	t.Helper()
-	_, _, dm := readSidecarTrailer(path + ".idx")
+	dm := readSidecarTrailer(path + ".idx").damage
 	return dm
 }
 
@@ -785,7 +785,7 @@ func TestDamageSidecarFormat(t *testing.T) {
 	}
 
 	key := []byte("key-section")
-	v5 := buildSegmentSidecar([]byte("attr"), key, nil, nil, 4096, 8, encodeDamage(dm))
+	v5 := buildSegmentSidecar([]byte("attr"), key, nil, nil, 4096, 8, 0, encodeDamage(dm))
 	if sc, isV5 := splitSidecarV5(v5); !sc.ok || !isV5 || !bytes.Equal(sc.key, key) || sc.used != 4096 || sc.dictRec != 8 {
 		t.Fatalf("v5 split: %+v, v5=%v", sc, isV5)
 	}
@@ -804,10 +804,10 @@ func TestDamageSidecarFormat(t *testing.T) {
 	if err := os.WriteFile(path, v5, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if used, rec, d := readSidecarTrailer(path); used != 4096 || rec != 8 || d.len() != 2 {
-		t.Errorf("readSidecarTrailer = %d, %d, %v", used, rec, d)
+	if f := readSidecarTrailer(path); f.used != 4096 || f.dictRec != 8 || f.damage.len() != 2 {
+		t.Errorf("readSidecarTrailer = %d, %d, %v", f.used, f.dictRec, f.damage)
 	}
-	if v4 := buildSegmentSidecar([]byte("attr"), key, nil, nil, 4096, 8, nil); binary.LittleEndian.Uint32(v4[len(v4)-4:]) != sidecarContainerMagicV4 {
+	if v4 := buildSegmentSidecar([]byte("attr"), key, nil, nil, 4096, 8, 0, nil); binary.LittleEndian.Uint32(v4[len(v4)-4:]) != sidecarContainerMagicV4 {
 		t.Error("a segment without damage no longer writes a v4 container")
 	}
 
@@ -821,7 +821,7 @@ func TestDamageSidecarFormat(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		used, _, _ := readSidecarTrailer(target + ".idx")
+		used := readSidecarTrailer(target + ".idx").used
 		own, err := parseKeyIndex(buildKeyIndex(seg, used, fnvHasher{}, nil, 0))
 		if err != nil {
 			t.Fatal(err)

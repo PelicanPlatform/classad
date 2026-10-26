@@ -415,6 +415,8 @@ func Open(opts Options) (*Collection, error) {
 	if err := c.persistOpenHorizons(); err != nil {
 		return nil, errors.Join(err, c.releaseLoadedSegments())
 	}
+	// Every phase that walks records has run by now, so the walk count is final.
+	c.openIdxDiag.Timing.RecordsWalked = int(c.recWalked.Load())
 	// Emit the sidecar-adoption summary gathered during recovery (before the Reindex above
 	// rebuilds whatever was not adopted), so a slow reopen can be traced to its cause.
 	if OpenIndexDiagHook != nil {
@@ -465,9 +467,13 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	var tm OpenTiming
 	defer func() { c.openIdxDiag.Timing.add(tm) }()
 	mapStart := time.Now()
-	// Each sealed segment's sidecar trailer names the offset of its dictionary record; the
-	// hints are collected while mapping and consumed once every segment is in place.
+	// Each sealed segment's sidecar trailer names where its trailer records are -- the attribute
+	// dictionary and the columnar payload -- and its key-index flags say which of them the segment
+	// does not carry at all. All three spare the searches below a walk over the segment's records,
+	// and are collected while mapping and consumed once every segment is in place.
 	segDictHint := map[*segment]uint32{}
+	segColHint := map[*segment]uint32{}
+	segFlags := map[*segment]uint16{}
 	entries, err := os.ReadDir(shardDir)
 	if err != nil {
 		return 0, err
@@ -549,8 +555,11 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		// used below so publishSegDict need not search for it.
 		// A v5 sidecar also names the segment's damaged records, which are skipped from here on
 		// (see damage.go); the set must fit the segment or the extent is not trusted either.
-		extent, dictRec, dmg := readSidecarTrailer(seg.path + ".idx")
+		facts := readSidecarTrailer(seg.path + ".idx")
+		extent, dictRec, dmg := facts.used, facts.dictRec, facts.damage
 		segDictHint[seg] = dictRec
+		segColHint[seg] = facts.colRec
+		segFlags[seg] = facts.flags
 		if rec := extent; rec > 0 && rec <= len(seg.data) &&
 			recExtentEndsCleanly(seg.data, rec) && damageFits(seg.data, rec, dmg) {
 			used = rec
@@ -632,7 +641,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	for _, seg := range sh.segs {
 		if seg != nil {
 			seg.ct.opened.Store(true) // its CurrentTime proof, if any, comes from its sidecar (ctproof.go)
-			publishSegDictAt(seg, segDictHint[seg])
+			c.recWalked.Add(int64(publishSegDictAt(seg, segDictHint[seg], segFlags[seg])))
 			markSegDictNeed(seg)
 		}
 	}
@@ -650,7 +659,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	colStart := time.Now()
 	for _, seg := range sh.segs {
 		if seg != nil {
-			if err := publishColNative(c, seg); err != nil {
+			if err := publishColNative(c, seg, segColHint[seg], segFlags[seg]); err != nil {
 				return 0, err
 			}
 		}
@@ -716,6 +725,17 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 					tm.ZoneUpgraded++
 				} else {
 					tm.ZoneUpgradeFailed++
+				}
+			}
+			// Record in the sidecar where this segment's trailer records are, or that it has
+			// none, when its sidecar predates those fields. The searches above ran over every
+			// record of the segment to establish it; writing it back is what stops the next open
+			// doing the same (see persistSegTrailerHintsUpgrade).
+			if loaded && segTrailerHintsStale(seg, segColHint[seg], segFlags[seg]) {
+				if c.persistSegTrailerHintsUpgrade(seg, segColHint[seg]) {
+					tm.TrailerFlagsUpgraded++
+				} else {
+					tm.TrailerFlagsUpgradeFailed++
 				}
 			}
 			if loaded {
@@ -787,6 +807,8 @@ func (c *Collection) rebuildDir(sh *shard) {
 			lastKeys[key] = struct{}{}
 		}
 	}
+	walked := 0
+	defer func() { c.recWalked.Add(int64(walked)) }()
 	intact := map[loc]bool{} // CRC results, by record
 	recIntact := func(l loc) bool {
 		seg := sh.segs[l.seg]
@@ -845,6 +867,7 @@ func (c *Collection) rebuildDir(sh *shard) {
 				// directory. Only a time checkpoint feeds the index: a dictionary or columnar
 				// record is a marker too, and its body read as millis put a sequence-0 checkpoint
 				// at an arbitrary time into it.
+				walked++
 				if recIsMarker(seg.data, o) {
 					if recIsTimeMarker(seg.data, o) {
 						marks = append(marks, mark{seq, recMarkerMillis(seg.data, o)})
@@ -1163,7 +1186,7 @@ func (c *Collection) reframeSegment(seg *segment, last bool) {
 	known := seg.damaged()
 	if last {
 		seg.damage.Store(nil)
-		seg.used, _ = recoveryExtent(seg.data)
+		seg.used, _, _ = recoveryExtent(seg.data)
 		seg.synced = seg.used
 		seg.stoppedAtDamage = true
 		return
@@ -1195,6 +1218,8 @@ func (c *Collection) reframeSegment(seg *segment, last bool) {
 func (c *Collection) rebuildAppendLog(sh *shard) {
 	var maxSeq uint64
 	count := 0
+	walked := 0
+	defer func() { c.recWalked.Add(int64(walked)) }()
 	for _, seg := range sh.segs {
 		if seg == nil {
 			continue
@@ -1222,6 +1247,7 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 				if !recIsMarker(seg.data, o) {
 					segCount++ // append-only records are never superseded, so all are live
 				}
+				walked++
 				off += int(total)
 			}
 			if off != seg.used {
@@ -1334,7 +1360,8 @@ func shardFramingLost(sh *shard) bool {
 // the walk stops at the damage, and what lies past it is counted (RecordsPastDamage) rather than
 // loaded.
 func (c *Collection) recoverExtent(seg *segment) int {
-	used, crcStop := recoveryExtent(seg.data)
+	used, recs, crcStop := recoveryExtent(seg.data)
+	c.recWalked.Add(int64(recs))
 	// A torn tail has nothing after it. Records that verify past the stop are damage in the middle.
 	if !crcStop {
 		return used
@@ -1411,24 +1438,25 @@ func sidecarKeyIndexAt(path string) *mmapKeyIndex {
 }
 
 // recoveryExtent walks a segment from the start the way recovery does when no trusted extent is
-// recorded, returning where the written data ends. The walk stops at an unwritten (zero) length, or
-// at damage, which crcStop reports: a record that fails its checksum, or a length that cannot be one
-// (not a multiple of 8, or running past the file).
-func recoveryExtent(data []byte) (used int, crcStop bool) {
+// recorded, returning where the written data ends and how many records it had to examine to say so.
+// The walk stops at an unwritten (zero) length, or at damage, which crcStop reports: a record that
+// fails its checksum, or a length that cannot be one (not a multiple of 8, or running past the file).
+func recoveryExtent(data []byte) (used, recs int, crcStop bool) {
 	for used+recHeaderSize <= len(data) {
 		total := int(recTotalLen(data, uint32(used)))
 		if total == 0 {
-			return used, false // unwritten tail
+			return used, recs, false // unwritten tail
 		}
 		if total%8 != 0 || used+total > len(data) {
-			return used, true // a damaged length
+			return used, recs, true // a damaged length
 		}
 		if !recVerifyCRC(data, uint32(used)) {
-			return used, true // torn/partial record: the durable data ends here
+			return used, recs, true // torn/partial record: the durable data ends here
 		}
 		used += total
+		recs++
 	}
-	return used, false
+	return used, recs, false
 }
 
 // surveyPastDamage reports what a recovery walk that stopped at from leaves unloaded: the keyed

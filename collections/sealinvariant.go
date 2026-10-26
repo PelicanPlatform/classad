@@ -83,6 +83,7 @@ func (c *Collection) checkSealCollapseInvariant(maxKeys int) [][]byte {
 		return nil // no delta records: the invariant is vacuous
 	}
 	var keys [][]byte
+	walked := 0
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		for _, seg := range sh.segs {
@@ -106,10 +107,12 @@ func (c *Collection) checkSealCollapseInvariant(maxKeys int) [][]byte {
 						keys = append(keys, append([]byte(nil), recKey(seg.data, off)...))
 					}
 				}
+				walked++
 				off += tl
 			}
 		}
 		sh.mu.RUnlock()
 	}
+	c.recWalked.Add(int64(walked))
 	return keys
 }
