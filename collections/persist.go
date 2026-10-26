@@ -840,23 +840,15 @@ func (c *Collection) rebuildDir(sh *shard) {
 				// Rebuild the segment's scan-pruning metadata from disk (zeroed on reopen).
 				// Note the local maxSeq above is the SHARD's high-water mark; seg.maxSeq is
 				// this segment's, which resume-from-sequence scans use to skip it whole.
-				if seg.minSeq == 0 || seq < seg.minSeq {
-					seg.minSeq = seq
-				}
-				if seq > seg.maxSeq {
-					seg.maxSeq = seq
-				}
+				seg.noteWalkedRec(o, total, false)
 				// A time-checkpoint marker feeds the shard time index; it never enters the
-				// directory, and its bytes count as dead (as appendMarker does at runtime)
-				// so a history-only segment reaches dead >= used.
-				// Only a time checkpoint feeds the index: a dictionary or columnar record is a
-				// marker too, and its body read as millis put a sequence-0 checkpoint at an
-				// arbitrary time into it.
+				// directory. Only a time checkpoint feeds the index: a dictionary or columnar
+				// record is a marker too, and its body read as millis put a sequence-0 checkpoint
+				// at an arbitrary time into it.
 				if recIsMarker(seg.data, o) {
 					if recIsTimeMarker(seg.data, o) {
 						marks = append(marks, mark{seq, recMarkerMillis(seg.data, o)})
 					}
-					seg.dead += int64(total)
 					off += int(total)
 					if hzOK && seq > hz {
 						if k, ok := recDeleteMarkerKey(seg.data, o); ok {
@@ -867,12 +859,6 @@ func (c *Collection) rebuildDir(sh *shard) {
 						}
 					}
 					continue
-				}
-				if sup != seqMax {
-					seg.dead += int64(total)
-					if sup > seg.maxSup {
-						seg.maxSup = sup
-					}
 				}
 				key := string(recKey(seg.data, o))
 				if hzOK {
@@ -1087,6 +1073,72 @@ func (c *Collection) relinkActiveChains(sh *shard) int {
 	return repaired
 }
 
+// noteWalkedRec folds the record at o, of length total, into the segment's scan-pruning counters,
+// for a walk that rebuilds them from the record headers (the counters start at zero). It derives
+// exactly what the append and supersede paths maintain at runtime:
+//   - minSeq/maxSeq span every record's sequence, time markers included (appendMarker counts
+//     them). A dictionary or columnar record is left out: it is written with sequence 0 whatever
+//     the segment holds and is never visible, so counting it would only zero minSeq -- the
+//     "unknown" value, which disables every sequence skip for the segment. The append paths
+//     that write those records do not count them either.
+//   - dead is the bytes of every superseded record plus every keyless one (markers, dictionary,
+//     columnar), and maxSup the largest supersession stamped here, as supersedeRec and the
+//     keyless appends keep them. An append-only walk leaves both alone, as it always has: its
+//     records are never superseded.
+func (s *segment) noteWalkedRec(o, total uint32, appendOnly bool) {
+	marker := recIsMarker(s.data, o)
+	// colFlag alone also marks a columnarized segment's stripped records (recIsStripped), which
+	// are ordinary keyed records; only with markerFlag is it the payload.
+	if !marker || (!recIsDict(s.data, o) && !recIsCol(s.data, o)) {
+		seq := recSeq(s.data, o)
+		if s.minSeq == 0 || seq < s.minSeq {
+			s.minSeq = seq
+		}
+		if seq > s.maxSeq {
+			s.maxSeq = seq
+		}
+	}
+	if appendOnly {
+		return
+	}
+	if marker {
+		s.dead += int64(total)
+		return
+	}
+	if sup := recSuperseded(s.data, o); sup != seqMax {
+		s.dead += int64(total)
+		if sup > s.maxSup {
+			s.maxSup = sup
+		}
+	}
+}
+
+// walkSegBounds derives seg's scan-pruning counters from its record headers alone: the values
+// rebuildDir (or, for an append-only shard, rebuildAppendLog) arrives at, without the per-key
+// replay and dedup that make those walks expensive. For a shard whose directory came from a
+// snapshot that does not carry the counters. The walk steps the way rebuildDir's does, skipping
+// the segment's damaged records.
+func walkSegBounds(seg *segment, appendOnly bool) {
+	seg.minSeq, seg.maxSeq = 0, 0
+	if !appendOnly {
+		seg.maxSup, seg.dead = 0, 0
+	}
+	dm := seg.damaged()
+	for off := 0; off < seg.used; {
+		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
+		total := recTotalLen(seg.data, o)
+		if total == 0 || total%8 != 0 || off+int(total) > seg.used {
+			break
+		}
+		seg.noteWalkedRec(o, total, appendOnly)
+		off += int(total)
+	}
+}
+
 // noteDamagedRecord adds the record at off, found failing its checksum, to its segment's damage set.
 // The span ends where the record's own totalLen says: the caller has walked the segment by those
 // lengths to its extent (or will, and reframes it if not), which is how every other walk steps too.
@@ -1166,12 +1218,7 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 				if seq > segMax {
 					segMax = seq // the shard's high-water mark
 				}
-				if seg.minSeq == 0 || seq < seg.minSeq {
-					seg.minSeq = seq
-				}
-				if seq > seg.maxSeq {
-					seg.maxSeq = seq // this segment's, for resume-from-sequence pruning
-				}
+				seg.noteWalkedRec(o, total, true) // this segment's bounds, for resume-from-sequence pruning
 				if !recIsMarker(seg.data, o) {
 					segCount++ // append-only records are never superseded, so all are live
 				}
@@ -1240,7 +1287,7 @@ func (c *Collection) Close() error {
 		// that finds and records that damage, and every later scan would come back short again.
 		if c.dir != "" && sh.childParentHash == nil && !shardFramingLost(sh) {
 			shardDir := filepath.Join(c.dir, fmt.Sprintf("%d", i))
-			_ = writeDirSnapshot(sh, shardDir)
+			writeDirSnapshot(sh, shardDir, c.h)
 		}
 		for _, seg := range sh.segs {
 			if seg == nil {

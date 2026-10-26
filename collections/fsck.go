@@ -806,7 +806,7 @@ func fsckCommitSeq(dir string) (uint64, bool) {
 			continue
 		}
 		if binary.LittleEndian.Uint32(body[0:]) != dirSnapMagic ||
-			binary.LittleEndian.Uint32(body[4:]) != dirSnapVersion {
+			!dirSnapVersionKnown(binary.LittleEndian.Uint32(body[4:])) {
 			continue
 		}
 		if cs := binary.LittleEndian.Uint64(body[8:]); cs > max {

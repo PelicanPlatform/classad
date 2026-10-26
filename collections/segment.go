@@ -366,6 +366,14 @@ func (s *segment) closeUnmap() error {
 	return s.unmapAndHook()
 }
 
+// isReaped reports whether the segment's mapping has been released -- by the reap that follows its
+// retirement, or by a Close. Its data must not be read once it has.
+func (s *segment) isReaped() bool {
+	s.reapMu.Lock()
+	defer s.reapMu.Unlock()
+	return s.reaped
+}
+
 // setOnReap registers a callback run once when the segment is reaped or explicitly
 // unhooked (the Archive's sidecar-index unmap). Guarded by reapMu; set while the
 // segment is pinned, so it is visible to the last unpin that reaps.
@@ -903,13 +911,24 @@ func (s *segment) appendRawRecordFlags(srcData []byte, srcOff uint32, ad []byte,
 	if !ok {
 		return 0, false
 	}
-	binary.LittleEndian.PutUint64(s.data[off+recSupOff:], recSuperseded(srcData, srcOff))
+	sup := recSuperseded(srcData, srcOff)
+	binary.LittleEndian.PutUint64(s.data[off+recSupOff:], sup)
 	if s.persistent {
 		// The supersession seq is inside the CRC's range, so it has to be recomputed after the
 		// overwrite or recovery would reject every rewritten record as torn.
 		adLenOff := int(off) + recKeyOff + len(key)
 		crcOff := adLenOff + 4 + len(ad)
 		binary.LittleEndian.PutUint32(s.data[crcOff:], recCRC(s.data[off:], crcOff-int(off)))
+	}
+	// A record copied already superseded is dead here as it was in the source: count it as
+	// supersedeRec would. Left out, the copy's garbage is invisible to the compaction trigger and
+	// to dead-segment reclaim for as long as this process runs, and for every later process that
+	// resumes from its counters rather than walking the records.
+	if sup != seqMax {
+		s.dead += int64(recTotalLen(s.data, off))
+		if sup > s.maxSup {
+			s.maxSup = sup
+		}
 	}
 	return off, true
 }

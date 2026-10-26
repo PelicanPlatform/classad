@@ -235,7 +235,7 @@ func seqFixtureAd(i int, now int64, rng *rand.Rand) *classad.ClassAd {
 
 // seqWriter applies a random write to c: a new key, a patch (a delta record where delta mode is
 // on), a whole rewrite, or a delete. It returns the next key number.
-func seqWriter(t *testing.T, c *Collection, rng *rand.Rand, next *int, now int64) {
+func seqWriter(t testing.TB, c *Collection, rng *rand.Rand, next *int, now int64) {
 	t.Helper()
 	key := func() []byte { return []byte(fmt.Sprintf("%d.0", rng.Intn(*next))) }
 	switch r := rng.Intn(10); {
