@@ -2,6 +2,7 @@ package collections
 
 import (
 	"bytes"
+	"encoding/binary"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -115,6 +116,16 @@ type shard struct {
 	// overwrite, a delete writes no new record, so recovery's max-seq rule cannot
 	// re-derive it — the tombstone itself must reach disk). Guarded by mu.
 	dirtySup []supRef
+	// lastAct is the most recent write target, kept after maintenance clears act so the next
+	// segment allocated can make it durable first (syncOutgoingLocked). Guarded by mu.
+	lastAct *segment
+
+	// horizon is the shard's durable horizon (see horizon.go): every commit at or below it is
+	// durable, and recovery believes every supersession stamp at or below it. horizonUnknown when
+	// no horizon was found at Open (a store last written by an earlier build) and none has been
+	// written since. hzMu serializes raising it.
+	hzMu    sync.Mutex
+	horizon atomic.Uint64
 
 	// Watch support (see watch.go); nil/zero unless WatchHistory > 0. idx is the
 	// shard's index (used to tag events for the cursor). hub fans committed changes
@@ -414,7 +425,7 @@ func (sh *shard) put(h uint64, key, ad []byte, seq uint64, codec Codec, hdrFlags
 // chained child, whether that removal dropped its parent's live-child count to
 // zero (parentEmptied) -- the signal Delete uses to auto-delete an orphaned
 // structural parent. Caller holds the write lock.
-func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied bool) {
+func (sh *shard) del(h uint64, key []byte, seq uint64, codec Codec) (removed, parentEmptied bool) {
 	if sh.appendOnly {
 		return false, false // an append log has no per-key delete
 	}
@@ -425,6 +436,13 @@ func (sh *shard) del(h uint64, key []byte, seq uint64) (removed, parentEmptied b
 		if !ok {
 			return false, false
 		}
+	}
+	// A persistent shard records the delete in the write target before stamping, as a put writes
+	// its record first: recovery takes a stamp nothing in the record stream accounts for as a
+	// commit that did not survive (see horizon.go). If the marker cannot be written the key is
+	// left as it was.
+	if sh.alloc != nil && !sh.writeDeleteMarker(seq, key, codec) {
+		return false, false
 	}
 	seg := sh.segs[old.seg]
 	seg.supersedeRec(old.off, seq)
@@ -474,6 +492,14 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, 
 			// the path every commit takes.
 			sh.needsSealIndex.Store(true)
 		}
+		// The write target is changing: make the outgoing one durable before anything is written
+		// to the new one, so a crash can only take records off the end of the last write target
+		// and never leave a hole that later records survive (see horizon.go).
+		if out := sh.act; out != nil {
+			sh.syncOutgoingLocked(out)
+		} else if sh.lastAct != nil {
+			sh.syncOutgoingLocked(sh.lastAct)
+		}
 		size := sh.segSize
 		if rl > size {
 			size = rl
@@ -484,6 +510,7 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, 
 		}
 		sh.segs = append(sh.segs, seg)
 		sh.act = seg
+		sh.lastAct = seg
 	}
 	sh.act.ctNoteWrite(ct)
 	off, _ := sh.act.appendFlagged(seq, next, key, ad, hdrFlags)
@@ -491,6 +518,53 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, 
 		sh.dirty = append(sh.dirty, sh.act) // track for msync (persistent)
 	}
 	return loc{seg: sh.act.id, off: off}, true
+}
+
+// writeDeleteMarker appends the delete marker for key at seq to the write target: a keyless marker
+// record whose body is the current time in milliseconds followed by the key. Read as a time
+// checkpoint -- by a build that does not know delete markers, and by the time index -- it is a
+// valid one. Its bytes count as dead, as every marker's do. Caller holds the shard write lock.
+func (sh *shard) writeDeleteMarker(seq uint64, key []byte, codec Codec) bool {
+	if sh.act != nil {
+		codec = sh.act.codec // the body is not compressed: never roll a segment over the codec
+	}
+	body := make([]byte, 8+len(key))
+	binary.LittleEndian.PutUint64(body, nowMillis())
+	copy(body[8:], key)
+	l, ok := sh.writeRecord(seq, noLoc, nil, body, codec, markerFlag, false)
+	if !ok {
+		return false
+	}
+	seg := sh.segs[l.seg]
+	seg.dead += int64(recTotalLen(seg.data, l.off))
+	return true
+}
+
+// syncOutgoingLocked msyncs a write target a mutable shard is leaving, over its whole written extent.
+// A segment retired since it was the write target is skipped: whatever retired it copied its
+// records somewhere durable first, and its mapping may already be gone. Persistent shards only;
+// once per segment roll, so it is not on the per-commit path. Caller holds the shard write lock.
+func (sh *shard) syncOutgoingLocked(seg *segment) {
+	sh.lastAct = nil
+	// An append log keeps no supersession stamps, so it has nothing for recovery to account for;
+	// its deferred appends already sync a segment before rolling out of it (commitDeferred).
+	if sh.alloc == nil || sh.appendOnly || seg == nil || !seg.persistent || seg.used == 0 {
+		return
+	}
+	seg.reapMu.Lock()
+	gone := seg.retired || seg.reaped
+	if !gone {
+		seg.refs++ // keep the mapping for the msync; unpin below reaps if it was retired meanwhile
+	}
+	seg.reapMu.Unlock()
+	if gone {
+		return
+	}
+	if err := seg.msyncRange(0, seg.used); err != nil && isDurabilityFailure(err) {
+		sh.syncErr.CompareAndSwap(nil, &syncFail{err})
+	}
+	seg.synced = seg.used
+	seg.unpin()
 }
 
 // maybeCheckpoint records a time->seq checkpoint (see timeseq.go) if time travel is

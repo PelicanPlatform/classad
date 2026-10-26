@@ -767,6 +767,20 @@ func recIsTimeMarker(b []byte, off uint32) bool {
 	return f&markerFlag != 0 && f&(dictFlag|colFlag) == 0
 }
 
+// recDeleteMarkerKey returns the key a delete marker records (see shard.writeDeleteMarker), and
+// false for any other record. A delete marker is a keyless marker that is neither a dictionary nor
+// a columnar record and whose body is longer than a time checkpoint's: the millis, then the key.
+func recDeleteMarkerKey(b []byte, off uint32) ([]byte, bool) {
+	if !recIsMarker(b, off) || recIsDict(b, off) || recIsCol(b, off) {
+		return nil, false
+	}
+	body := recAd(b, off)
+	if len(body) <= 8 {
+		return nil, false
+	}
+	return body[8:], true
+}
+
 // recMarkerMillis reads a marker's wall-clock payload (unixMillis). Only valid when
 // recIsTimeMarker(b, off): a dictionary or columnar record also sets markerFlag but carries its
 // own body, not a millis payload.

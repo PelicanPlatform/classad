@@ -82,6 +82,9 @@ func (s *segment) flush() error {
 	if h := msyncDoneHook.Load(); h != nil {
 		(*h)(s.path, s.used)
 	}
+	if h := msyncCopyHook.Load(); h != nil {
+		(*h)(s, start, s.data[start:s.used])
+	}
 	s.synced = s.used
 	return nil
 }
@@ -90,6 +93,12 @@ func (s *segment) flush() error {
 // segment with the segment's path and the end of the range now on disk, so a test can
 // build the image a machine crash would leave. Nil in production.
 var msyncDoneHook atomic.Pointer[func(path string, to int)]
+
+// msyncCopyHook is a test seam like msyncDoneHook that also hands over the bytes an msync just made
+// durable (b, starting at offset start of the segment's file), so a test can keep the image a
+// machine crash would leave of a segment whose pages are rewritten in place. The segment, not its
+// path, names the file: a rewrite renames its output after syncing it. Nil in production.
+var msyncCopyHook atomic.Pointer[func(seg *segment, start int, b []byte)]
 
 // msyncFailHook is a test seam: when non-nil and it returns a non-nil error, msyncRange fails with
 // that error instead of calling the syscall, simulating a durability-sync failure (e.g. EIO). Nil
@@ -124,6 +133,9 @@ func (s *segment) msyncRange(from, to int) error {
 	}
 	if h := msyncDoneHook.Load(); h != nil {
 		(*h)(s.path, to)
+	}
+	if h := msyncCopyHook.Load(); h != nil {
+		(*h)(s, start, s.data[start:to])
 	}
 	return nil
 }
