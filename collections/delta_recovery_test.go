@@ -393,7 +393,7 @@ func TestDeltaReadFindsUnlinkedActiveVersion(t *testing.T) {
 func TestRecoveryTimeIndexIgnoresPayloadMarkers(t *testing.T) {
 	dir := t.TempDir()
 	opts := Options{Dir: dir, Shards: 1, SegmentSize: 1 << 12,
-		TimeTravel: &TimeTravelOptions{MaxDistance: 2 * time.Millisecond, CheckpointInterval: time.Millisecond}}
+		TimeTravel: &TimeTravelOptions{MaxDistance: time.Hour, CheckpointInterval: time.Millisecond}}
 	c := openOrFatal(t, opts)
 	for g := range 4 {
 		for i := range 60 {
@@ -411,6 +411,18 @@ func TestRecoveryTimeIndexIgnoresPayloadMarkers(t *testing.T) {
 	c.BuildAndEnableSchemaScan(4096, 8)
 	if columnarSegmentsForTest(c) == 0 {
 		t.Fatal("fixture: nothing columnarized")
+	}
+	// Checkpoints in the write target, which no rewrite above has touched: the recovered index
+	// must hold these and nothing else.
+	for i := range 20 {
+		ad, err := classad.Parse(fmt.Sprintf(`[ ClusterId=%d; G=9 ]`, i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
