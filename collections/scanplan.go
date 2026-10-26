@@ -130,16 +130,65 @@ func (c *Collection) planQuery(qp queryPlan) []usableProbe {
 	return c.planRead(qp.probes)
 }
 
+// readPlan is how a filtered read narrows its walk with the segment indexes: through the
+// candidates of one conjunction of probes (usable), through the union of a disjunctive plan's
+// groups (groups, planned from the query's DNF plan), or not at all (both empty: a full walk).
+type readPlan struct {
+	usable []usableProbe
+	plan   []vm.ProbeGroup // the DNF groups was planned from; nil for a conjunctive read
+	groups [][]usableProbe
+}
+
+// disjunctive reports a read through the union of a DNF plan's groups.
+func (rp readPlan) disjunctive() bool { return rp.groups != nil }
+
+// planReadQuery records the query's index demand and plans its read. A query whose top-level OR
+// spine (after distributing nested ORs, vm.Query.ProbePlan) yields more than one group, every one
+// of them index-usable, reads the union of the groups' candidates, unless the estimated union is
+// nearly the whole collection (overSelectivityGate); anything else is planned as a conjunction
+// (planQuery). Every filtered read plans here -- Query, the raw and projected reads, the paged
+// read -- so they all take the same access path, and ExplainQuery reports it (dnfReadPlan).
+func (c *Collection) planReadQuery(qp queryPlan) readPlan {
+	if qp.q != nil {
+		if plan := qp.q.ProbePlan(); len(plan) > 1 {
+			for _, g := range plan {
+				c.demand.record(g.Probes)
+			}
+			if groups, ok := c.dnfReadPlan(plan); ok {
+				return readPlan{plan: plan, groups: groups}
+			}
+		}
+	}
+	return readPlan{usable: c.planQuery(qp)}
+}
+
+// dnfReadPlan returns the index groups a read of the multi-group DNF plan uses, or false when
+// some disjunct has no index-usable probe (the union covers everything) or the estimated union is
+// nearly every record.
+func (c *Collection) dnfReadPlan(plan []vm.ProbeGroup) ([][]usableProbe, bool) {
+	groups, prunable := c.planIndexGroups(plan)
+	if !prunable || overSelectivityGate(c, groups) {
+		return nil, false
+	}
+	if live, none := liveGroups(groups); !none {
+		groups = live // a disjunct proved impossible contributes nothing to the union
+	}
+	return groups, true
+}
+
 // runQuery drives the per-shard scan for a planned query: a shard whose index can
 // narrow the candidates is visited through it, the rest are walked in full, and both
 // re-verify the whole predicate before emit sees a record. Returns false if the
 // consumer stopped iteration.
-func (c *Collection) runQuery(qp queryPlan, usable []usableProbe, emit scanEmit) bool {
+func (c *Collection) runQuery(qp queryPlan, rp readPlan, emit scanEmit) bool {
 	for _, sh := range c.shards {
 		var cont bool
-		if len(usable) > 0 {
-			cont = c.scanShardIndexed(sh, usable, qp, emit)
-		} else {
+		switch {
+		case rp.disjunctive():
+			cont = c.scanShardIndexedGroups(sh, rp.groups, rp.plan, qp, emit)
+		case len(rp.usable) > 0:
+			cont = c.scanShardIndexed(sh, rp.usable, qp, emit)
+		default:
 			cont = c.scanShard(sh, qp, emit)
 		}
 		if !cont {
@@ -153,5 +202,5 @@ func (c *Collection) runQuery(qp queryPlan, usable []usableProbe, emit scanEmit)
 // that have no special case of their own -- the projected, raw-projected and
 // wire-subset scans -- are this call plus their own emitter.
 func (c *Collection) scanQuery(qp queryPlan, emit scanEmit) bool {
-	return c.runQuery(qp, c.planQuery(qp), emit)
+	return c.runQuery(qp, c.planReadQuery(qp), emit)
 }

@@ -967,7 +967,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 		mw := newMatchWorker(job, c, jp, deferMat)
 		var out []rankedMatch
 		for _, sh := range shards {
-			c.scanShardCandidatesGroups(sh, groups, false, false, nil, nil, func(w []byte, dict *segDictHandle, _ bool) bool {
+			c.scanShardCandidatesGroups(sh, groups, func(w []byte, dict *segDictHandle) bool {
 				c.matchCandidate(c.wireToInline(dict, w), mw, &out)
 				return true
 			})
@@ -995,7 +995,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 				if idx >= len(shards) {
 					break
 				}
-				c.scanShardCandidatesGroups(shards[idx], groups, false, false, nil, nil, func(w []byte, dict *segDictHandle, _ bool) bool {
+				c.scanShardCandidatesGroups(shards[idx], groups, func(w []byte, dict *segDictHandle) bool {
 					c.matchCandidate(c.wireToInline(dict, w), mw, &local)
 					return true
 				})

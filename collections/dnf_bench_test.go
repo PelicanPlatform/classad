@@ -307,3 +307,71 @@ func BenchmarkDNFSealedSidecar(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkDNFRawReads: the raw, projected and paged reads of a top-level OR -- plain and scoped by
+// a conjunct, the shape of a time-windowed listing -- on a persistent table and on a newest-first
+// archive with zone maps, each sealed segment indexed by its sidecar.
+func BenchmarkDNFRawReads(b *testing.B) {
+	if !mmapSupported {
+		b.Skip("persistence is unix-only")
+	}
+	const n = 50_000
+	proj := []string{"ClusterId", "Owner", "QDate"}
+	ad := func(i int) *classad.ClassAd {
+		a := jobAd(i, map[string]int64{"QDate": int64(1_000_000 + i)})
+		a.InsertAttrString("Owner", fmt.Sprintf("user%d", i%500))
+		return a
+	}
+	c, err := Open(Options{Dir: b.TempDir(), Shards: 4, SegmentSize: 1 << 20,
+		ValueAttrs: []string{"ClusterId", "QDate"}, CategoricalAttrs: []string{"Owner"}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer c.Close()
+	for i := 0; i < n; i++ {
+		if perr := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad(i)); perr != nil {
+			b.Fatal(perr)
+		}
+	}
+	c.Reindex()
+	a, err := CreateArchive(ArchiveOptions{Dir: b.TempDir(), SegmentSize: 1 << 20,
+		ValueAttrs: []string{"ClusterId", "QDate"}, CategoricalAttrs: []string{"Owner"},
+		ZoneAttrs: []string{"ClusterId", "QDate"}})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer a.Close()
+	for i := 0; i < n; i++ {
+		if aerr := a.Append(ad(i)); aerr != nil {
+			b.Fatal(aerr)
+		}
+	}
+	for _, tc := range []struct {
+		name, expr string
+		c          *Collection
+	}{
+		{"table/eq-or-eq", `ClusterId == 4242 || Owner == "user7"`, c},
+		{"table/scoped-window", `Owner == "user7" && (QDate >= 1049900 || ClusterId < 50)`, c},
+		{"archive/window", `QDate >= 1049950 || ClusterId >= 49950`, a.c},
+		{"archive/scoped-window", `Owner == "user7" && (QDate >= 1045000 || ClusterId < 50)`, a.c},
+	} {
+		q := mustQuery(b, tc.expr)
+		rows := 0
+		for range tc.c.QueryRawProjected(q, proj, false, false) {
+			rows++
+		}
+		b.Run(fmt.Sprintf("%s/QueryRawProjected/rows=%d", tc.name, rows), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				for range tc.c.QueryRawProjected(q, proj, false, false) {
+				}
+			}
+		})
+		b.Run(fmt.Sprintf("%s/QueryRawFromSeq-page100/rows=%d", tc.name, rows), func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				seq, _ := tc.c.QueryRawFromSeq(q, proj, SeqCursor{}, 100)
+				for range seq {
+				}
+			}
+		})
+	}
+}

@@ -601,6 +601,16 @@ type ProbeExplain struct {
 	Coalesced bool `json:"coalesced,omitempty"`
 }
 
+// GroupExplain is one disjunct of a disjunctive plan: its index-satisfiable conjuncts and their
+// index status, as ProbeExplain reports them for a conjunctive one.
+type GroupExplain struct {
+	Probes      []ProbeExplain `json:"probes"`
+	IndexUsable int            `json:"indexUsable"`
+	// Unsatisfiable marks a disjunct whose indexed conjuncts contradict each other: it
+	// contributes nothing to the union.
+	Unsatisfiable bool `json:"unsatisfiable,omitempty"`
+}
+
 // QueryExplain is a description of how the store would execute a query, for the
 // diagnostic ".explain" command -- what the planner sees and the access path it
 // would choose.
@@ -612,15 +622,20 @@ type QueryExplain struct {
 	Probes []ProbeExplain `json:"probes"`
 	// IndexUsable is how many probes can prune via an index.
 	IndexUsable int `json:"indexUsable"`
-	// Plan is the chosen access path: "indexed" (visit index candidates),
-	// "parallel-scan", "serial-scan" (full scan), or "empty" (a contradictory conjunct
-	// makes the query unsatisfiable, so no records are visited at all).
+	// Plan is the chosen access path: "indexed" (visit index candidates), "indexed-union"
+	// (visit the union of the candidates of each disjunct in Groups), "parallel-scan",
+	// "serial-scan" (full scan), or "empty" (a contradictory conjunct makes the query
+	// unsatisfiable, so no records are visited at all).
 	Plan string `json:"plan"`
 	// Parallelism is the configured per-query worker cap; Shards is the shard count.
 	Parallelism int `json:"parallelism"`
 	Shards      int `json:"shards"`
 	// TotalAds is the live ad count, the denominator for probe selectivity.
 	TotalAds int `json:"totalAds"`
+	// Groups are, for a filter whose top-level ORs (nested ORs distributed) give more than one
+	// disjunct, each disjunct's index-satisfiable conjuncts. Set whether or not the plan reads
+	// through them: an "indexed-union" plan does, and a scan's Reason says why it does not.
+	Groups []GroupExplain `json:"groups,omitempty"`
 	// EstCandidates is, for an indexed plan, the estimated records the index hands the scan:
 	// per segment, the smallest of its probes' posting estimates, summed. IndexSegments is how
 	// many segments answer from an index, IndexSkippedSegments how many the index proves hold
@@ -659,31 +674,20 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		Shards:      len(c.shards),
 		TotalAds:    total,
 	}
-	merges := rangeMerges(usable)
 	var indexedAttrs []string // the usable probes' attributes, as the query spells them
-	for _, p := range probes {
-		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
-		var up usableProbe
-		var isUsable bool
-		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
-		if isUsable && !slices.ContainsFunc(indexedAttrs, func(a string) bool { return strings.EqualFold(a, p.Attr) }) {
-			indexedAttrs = append(indexedAttrs, p.Attr)
-		}
-		up = applyMerge(merges, up, &pe)
-		if isUsable {
-			if cand, covered := c.estimateCandidates(up); covered {
-				pe.HasSelectivity = true
-				pe.EstCandidates = clampEst(cand, total)
-				if total > 0 {
-					pe.Selectivity = math.Min(1, cand/float64(total))
-				}
-			}
-		}
-		ex.Probes = append(ex.Probes, pe)
-	}
+	ex.Probes, indexedAttrs = c.explainProbes(probes, usable, total)
 	scan := "serial-scan"
 	if c.queryPar > 1 && !c.reverseScan {
 		scan = "parallel-scan" // a newest-first archive always walks serially (see queryAs)
+	}
+	// A disjunctive plan, when the read takes it (planReadQuery): the union of its groups' candidates.
+	var dnfReason string
+	if plan := q.ProbePlan(); len(plan) > 1 {
+		if c.explainGroups(q, plan, &ex) {
+			return ex
+		}
+		dnfReason = ex.Reason
+		ex.Reason = ""
 	}
 	frac, gated := c.overReadGate(usable)
 	switch {
@@ -712,6 +716,9 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		if ex.UnindexedSegments > 0 {
 			ex.Reason += fmt.Sprintf("; %d segments have no index on it and are scanned in full", ex.UnindexedSegments)
 		}
+	case dnfReason != "":
+		ex.Plan = scan
+		ex.Reason = dnfReason
 	case len(probes) == 0:
 		ex.Plan = scan
 		ex.Reason = "full scan: the filter has no conjunct an index or zone map can use"
@@ -733,6 +740,127 @@ func (c *Collection) ExplainQuery(q *vm.Query) QueryExplain {
 		}
 	}
 	return ex
+}
+
+// explainProbes describes probes, the conjuncts of one conjunction, against the configured
+// indexes: each probe's index status and selectivity (with usable, its planned form, supplying the
+// range merges), and the attributes of the usable ones, as the query spells them.
+func (c *Collection) explainProbes(probes []vm.Probe, usable []usableProbe, total int) ([]ProbeExplain, []string) {
+	merges := rangeMerges(usable)
+	var out []ProbeExplain
+	var indexedAttrs []string
+	for _, p := range probes {
+		pe := ProbeExplain{Attr: p.Attr, Op: p.Op}
+		var up usableProbe
+		var isUsable bool
+		pe.Indexed, pe.Kind, up, isUsable = c.probeIndexKind(p)
+		if isUsable && !slices.ContainsFunc(indexedAttrs, func(a string) bool { return strings.EqualFold(a, p.Attr) }) {
+			indexedAttrs = append(indexedAttrs, p.Attr)
+		}
+		up = applyMerge(merges, up, &pe)
+		if isUsable {
+			if cand, covered := c.estimateCandidates(up); covered {
+				pe.HasSelectivity = true
+				pe.EstCandidates = clampEst(cand, total)
+				if total > 0 {
+					pe.Selectivity = math.Min(1, cand/float64(total))
+				}
+			}
+		}
+		out = append(out, pe)
+	}
+	return out, indexedAttrs
+}
+
+// explainGroups fills ex for the multi-group DNF plan of q. It reports true when the read takes the
+// disjunctive path (dnfReadPlan) -- ex is then complete, as an "indexed-union" or an "empty" plan --
+// and false when it does not, leaving ex.Reason saying why for the caller's scan verdict.
+func (c *Collection) explainGroups(q *vm.Query, plan []vm.ProbeGroup, ex *QueryExplain) bool {
+	var attrs []string // per disjunct, its usable attributes joined with " and "
+	unusable := 0      // the first disjunct with no index-usable probe, 1-based; 0 for none
+	for i, g := range plan {
+		u := c.planIndex(g.Probes)
+		ge := GroupExplain{IndexUsable: len(u), Unsatisfiable: len(u) > 0 && unsatisfiable(u)}
+		var ga []string
+		ge.Probes, ga = c.explainProbes(g.Probes, u, ex.TotalAds)
+		ex.Groups = append(ex.Groups, ge)
+		attrs = append(attrs, strings.Join(ga, " and "))
+		if len(u) == 0 && unusable == 0 {
+			unusable = i + 1
+		}
+	}
+	if unusable > 0 {
+		ex.Reason = fmt.Sprintf("full scan: disjunct %d of %d has no conjunct an index can use, so it could match any record", unusable, len(plan))
+		return false
+	}
+	groups, ok := c.dnfReadPlan(plan)
+	if !ok {
+		all, _ := c.planIndexGroups(plan)
+		frac, _ := c.planFrac(all)
+		ex.Reason = fmt.Sprintf("full scan: the index union over %d disjuncts would hand the scan about %.0f%% of the records, "+
+			"over the %.0f%% at which an index walk stops paying", len(plan), 100*frac, 100*maxPushdownFrac)
+		return false
+	}
+	if unsatisfiableGroups(groups) {
+		ex.Plan = "empty"
+		ex.Reason = "the indexed conjuncts of every disjunct of the filter contradict each other: nothing can match"
+		return true
+	}
+	ex.Plan = "indexed-union"
+	c.explainIndexSegmentsGroups(q, plan, groups, ex)
+	ex.Reason = fmt.Sprintf("index union over %d disjuncts (%s): %d of %d segments answer from postings, ~%d candidate records",
+		len(plan), strings.Join(attrs, " | "), ex.IndexSegments,
+		ex.IndexSegments+ex.IndexSkippedSegments+ex.UnindexedSegments+ex.ZonePrunedSegments, ex.EstCandidates)
+	if ex.ZonePrunedSegments > 0 {
+		ex.Reason += fmt.Sprintf("; %d segments ruled out by their zone maps", ex.ZonePrunedSegments)
+	}
+	if ex.IndexSkippedSegments > 0 {
+		ex.Reason += fmt.Sprintf("; %d segments ruled out by their index", ex.IndexSkippedSegments)
+	}
+	if ex.UnindexedSegments > 0 {
+		ex.Reason += fmt.Sprintf("; %d segments have no index on every disjunct and are scanned in full", ex.UnindexedSegments)
+	}
+	return true
+}
+
+// explainIndexSegmentsGroups is explainIndexSegments for a disjunctive plan: each segment's verdict
+// as scanShardIndexedGroups reaches it -- zone-pruned (zoneWalkGroups), walked in full
+// (groupsWindowIndex), proven empty by its index (skipsPrefixGroups), or answered from postings --
+// and the estimated candidates, per segment the sum over disjuncts of each one's smallest probe
+// estimate.
+func (c *Collection) explainIndexSegmentsGroups(q *vm.Query, plan []vm.ProbeGroup, groups [][]usableProbe, ex *QueryExplain) {
+	probes, ct, zoned := q.Probes(), q.ReadsCurrentTime(), c.hasZones.Load()
+	var cand float64
+	for _, sh := range c.shards {
+		_, wins := sh.snapshot()
+		live := sh.liveFractions(wins)
+		for i, w := range wins {
+			if zoned && (c.zoneExcludes(w, probes, ct) || c.zoneExcludesGroups(w, plan, ct)) {
+				ex.ZonePrunedSegments++
+				continue
+			}
+			si := groupsWindowIndex(w, groups, ct)
+			switch {
+			case si == nil:
+				ex.UnindexedSegments++
+			case skipsPrefixGroups(si, groups):
+				ex.IndexSkippedSegments++
+			default:
+				ex.IndexSegments++
+				var sum float64
+				for _, g := range groups {
+					least := math.Inf(1)
+					for _, up := range g {
+						least = math.Min(least, si.estCandidates(up))
+					}
+					sum += least
+				}
+				cand += sum * live[i]
+			}
+		}
+		releaseWindows(wins)
+	}
+	ex.EstCandidates = clampEst(cand, ex.TotalAds)
 }
 
 // planRead is the index plan a read uses: planIndex, unless the index would hand the scan
@@ -1452,8 +1580,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 // forEachCandidateRef calls fn for each keyed record of wins, visible at s0, that the segment
 // indexes cannot rule out for src: a covering segment's candidate offsets (src.prefix), the
 // tail written after its index was built, and every record of a segment src finds no index
-// for. fn sees a superset of the true matches and must re-verify; it returns false to stop,
-// and so does forEachCandidateRef. Markers -- time checkpoints, a segment's dictionary and
+// for. fn sees a superset of the true matches and must re-verify; it returns false to stop. Markers -- time checkpoints, a segment's dictionary and
 // columnar records -- are never handed to fn: they are not ads, and the full walks of
 // uncovered windows and tails pass over them.
 //
@@ -1461,7 +1588,7 @@ func (c *Collection) scanShardIndexed(sh *shard, usable []usableProbe, qp queryP
 // newest-first: segments from the last backward, and within a segment the un-indexed tail
 // (written last) before the indexed prefix, each in descending offset order. A consumer
 // that stops early then gets the newest matches -- a pushed-down LIMIT through the index.
-func (c *Collection) forEachCandidateRef(s0 uint64, wins []segWindow, src candidateSource, reverse bool, st *ScanStats, fn func(recRef) bool) bool {
+func (c *Collection) forEachCandidateRef(s0 uint64, wins []segWindow, src candidateSource, reverse bool, st *ScanStats, fn func(recRef) bool) {
 	var offs []uint32 // reused across reversed ranges
 	visible := func(w segWindow, o uint32) bool {
 		return !recIsMarker(w.data, o) && w.visible(o, s0)
@@ -1542,17 +1669,16 @@ func (c *Collection) forEachCandidateRef(s0 uint64, wins []segWindow, src candid
 	if reverse {
 		for wi := len(wins) - 1; wi >= 0; wi-- {
 			if !window(wins[wi]) {
-				return false
+				return
 			}
 		}
-		return true
+		return
 	}
 	for _, w := range wins {
 		if !window(w) {
-			return false
+			return
 		}
 	}
-	return true
 }
 
 // candidateSource narrows one window of a candidate walk (forEachCandidateRef) to the records its
@@ -1582,35 +1708,84 @@ func (cc conjCandidates) prefix(w segWindow, si readIndex, st *ScanStats) *roari
 }
 
 // groupCandidates is the candidate source for a DNF plan: the union over groups of each group's
-// postings intersection, plus every delta record of the covered prefix (no deltaScope narrows a
-// union). A window is served only by an index covering every probe of every group -- one disjunct
-// it cannot answer could match any record -- and, with ct as for conjCandidates, only when proven
-// free of CurrentTime.
+// postings intersection plus the delta records that group's scope admits (ds[i] for groups[i]).
+// A delta record that satisfies the query satisfies some group, so the union of the groups'
+// scopes keeps every delta that can match. A window is served only by an index covering every
+// probe of every group -- one disjunct it cannot answer could match any record -- and, with ct as
+// for conjCandidates, only when proven free of CurrentTime.
 type groupCandidates struct {
-	c      *Collection
 	groups [][]usableProbe
+	ds     []*deltaScope
 	ct     bool
 }
 
-func (gc groupCandidates) index(w segWindow) readIndex {
+// newGroupCandidates builds the candidate source for groups over the windows wins of sh, visible
+// at s0, with one delta scope per group.
+func (c *Collection) newGroupCandidates(sh *shard, s0 uint64, wins []segWindow, groups [][]usableProbe, ct bool) groupCandidates {
+	gc := groupCandidates{groups: groups, ct: ct}
+	if c.deltaRead {
+		gc.ds = make([]*deltaScope, len(groups))
+		for i, g := range groups {
+			gc.ds[i] = c.newDeltaScope(sh, s0, wins, g, ct)
+		}
+	}
+	return gc
+}
+
+func (gc groupCandidates) index(w segWindow) readIndex { return groupsWindowIndex(w, gc.groups, gc.ct) }
+
+// groupsWindowIndex is windowIndex for a DNF plan: the index that can narrow w to every group's
+// candidates, or nil when w has to be walked in full.
+func groupsWindowIndex(w segWindow, groups [][]usableProbe, ct bool) readIndex {
 	si := w.seg.readIdx()
-	if si == nil || !si.coversGroups(gc.groups) || (gc.ct && !w.ctFree) {
+	if si == nil || !si.coversGroups(groups) || (ct && !w.ctFree) {
 		return nil
 	}
 	return si
 }
 
-// prefix applies segment skipping only to a single group (a conjunctive plan routed here): a union
-// is empty only when every disjunct is, and visiting a few extra candidates is cheaper than proving
-// that per group.
+// skipsPrefixGroups reports whether si proves that no record it posts satisfies any group: the
+// union is empty exactly when every disjunct is.
+func skipsPrefixGroups(si readIndex, groups [][]usableProbe) bool {
+	for _, g := range groups {
+		if !si.skipsPrefix(g) {
+			return false
+		}
+	}
+	return len(groups) > 0
+}
+
 func (gc groupCandidates) prefix(w segWindow, si readIndex, st *ScanStats) *roaring.Bitmap {
 	var cand *roaring.Bitmap
-	if len(gc.groups) == 1 && si.skipsPrefix(gc.groups[0]) {
+	if skipsPrefixGroups(si, gc.groups) {
 		st.indexSegment(0, true, false)
 	} else if cand = si.candidateOffsetsGroups(gc.groups); cand != nil {
 		st.indexSegment(int(cand.GetCardinality()), false, false)
 	}
-	return gc.c.withDeltas(w, si.coveredUpto(), cand)
+	for _, ds := range gc.ds {
+		cand = ds.withDeltas(w, cand)
+	}
+	return cand
+}
+
+// liveGroups drops the disjuncts the planner proved impossible -- they contribute nothing to the
+// union -- and reports none when every disjunct is. groups may be SHARED (the match path fans a
+// scan out one goroutine per shard over a single plan), so a filtered slice is freshly allocated,
+// never compacted in place; the common case allocates nothing.
+func liveGroups(groups [][]usableProbe) (live [][]usableProbe, none bool) {
+	if unsatisfiableGroups(groups) {
+		return nil, true
+	}
+	if !anyUnsatisfiableGroup(groups) {
+		return groups, false
+	}
+	live = make([][]usableProbe, 0, len(groups))
+	for _, g := range groups {
+		if !unsatisfiable(g) {
+			live = append(live, g)
+		}
+	}
+	return live, false
 }
 
 // windowIndex returns the index that can narrow w to usable's candidates, or nil when w has to be
@@ -1642,83 +1817,62 @@ func prefixCandidates(w segWindow, si readIndex, usable []usableProbe, ds *delta
 	return ds.withDeltas(w, cand)
 }
 
-// scanShardIndexedGroups is scanShardIndexed for a DNF plan: it visits the union of
-// the groups' candidates and re-verifies each against the full query.
+// scanShardIndexedGroups is scanShardIndexed for a DNF plan: it visits the union of the groups'
+// candidates (groupCandidates) and re-verifies each against the full query with the same visitor
+// as the conjunctive path (refVisitor), in the same order a scan visits them.
 //
 // plan is the query's DNF (vm.Query.ProbePlan) that groups was planned from. A window is
 // zone-pruned when its zone map rules out the query's required conjuncts, or every disjunct of
 // plan: a record satisfying the query satisfies every probe of some group, so a window no group
 // can match holds no match either.
 func (c *Collection) scanShardIndexedGroups(sh *shard, groups [][]usableProbe, plan []vm.ProbeGroup, qp queryPlan, emit scanEmit) bool {
-	ct := qp.prunesCT()
-	var prune func(segWindow) bool
+	groups, none := liveGroups(groups)
+	if none {
+		return true // every disjunct is impossible: the union is empty
+	}
+	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
+	walk := c.zoneWalkGroups(wins, qp, plan)
+	visit, stopped := c.refVisitor(s0, qp, emit)
+	src := c.newGroupCandidates(sh, s0, walk, groups, qp.prunesCT())
+	c.forEachCandidateRef(s0, walk, src, c.reverseScan, qp.stats, visit)
+	return !stopped()
+}
+
+// zoneWalkGroups is zoneWalk for a DNF plan: it drops the windows whose zone maps rule out the
+// query's required conjuncts or every disjunct of plan, and records the counts in qp.stats.
+func (c *Collection) zoneWalkGroups(wins []segWindow, qp queryPlan, plan []vm.ProbeGroup) []segWindow {
+	walk := wins
 	if c.hasZones.Load() {
-		prune = func(w segWindow) bool {
-			return c.zoneExcludes(w, qp.probes, ct) || c.zoneExcludesGroups(w, plan, ct)
+		ct := qp.prunesCT()
+		walk = make([]segWindow, 0, len(wins))
+		for _, w := range wins {
+			if c.zoneExcludes(w, qp.probes, ct) || c.zoneExcludesGroups(w, plan, ct) {
+				continue
+			}
+			walk = append(walk, w)
 		}
 	}
-	return c.scanShardCandidatesGroups(sh, groups, c.reverseScan, ct, prune, qp.stats, func(w []byte, dict *segDictHandle, ctFree bool) bool {
-		if qp.ws != nil {
-			qp.ws.dict = dict
-		}
-		cur := &qp
-		if ctFree && qp.fold != nil {
-			cur = qp.fold
-		}
-		if !matchWire(w, *cur) {
-			return true
-		}
-		return emit(w, dict)
-	})
+	qp.stats.segments(len(wins), len(wins)-len(walk))
+	return walk
 }
 
 // scanShardCandidatesGroups visits a DNF plan's (vm.ProbePlan with more than one group)
-// candidates in one shard: per window, the union over groups of each group's candidate
-// intersection (groupCandidates), so onCand sees a superset of the union's true matches and the
-// caller re-verifies. A window no index serves for every group, and every served window's
-// un-indexed tail, are walked in full. The walk is forEachCandidateRef's, so it is newest-first
-// when reverse is set, reads a sealed segment's index from its sidecar, and never hands onCand a
-// marker.
-//
-// ct marks groups computed with CurrentTime folded (see conjCandidates): a window not proven
-// free of it is walked in full. onCand learns whether the candidate's window is proven.
-//
-// prune, when non-nil, drops a window before any of its candidates is computed (zone pruning; see
-// scanShardIndexedGroups); st, when non-nil, records how many windows it dropped and each
-// remaining window's index verdict.
-func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, reverse, ct bool,
-	prune func(segWindow) bool, st *ScanStats, onCand func(w []byte, dict *segDictHandle, ctFree bool) bool) bool {
-	if unsatisfiableGroups(groups) {
-		return true // every disjunct is impossible: the union is empty
+// candidates in one shard for matchmaking: per window, the union over groups of each group's
+// candidate intersection (groupCandidates), so onCand sees a superset of the union's true matches
+// and the caller re-verifies; onCand returns false to stop. A window no index serves for every
+// group, and every served window's un-indexed tail, are walked in full. No zone pruning: only an
+// append-only collection keeps zone maps, and a collection of slots is mutable.
+func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, onCand func(w []byte, dict *segDictHandle) bool) {
+	groups, none := liveGroups(groups)
+	if none {
+		return // every disjunct is impossible: the union is empty
 	}
-	// An impossible disjunct contributes nothing to the union, so drop it rather than
-	// building its (empty) candidate set per window. groups is SHARED -- the match path
-	// fans this function out one goroutine per shard over a single plan -- so the filtered
-	// slice must be freshly allocated, never a compaction in place. The guard keeps the
-	// common case allocation-free.
-	if anyUnsatisfiableGroup(groups) {
-		kept := make([][]usableProbe, 0, len(groups))
-		for _, g := range groups {
-			if !unsatisfiable(g) {
-				kept = append(kept, g)
-			}
-		}
-		groups = kept
-	}
-	s0, snap := sh.snapshot()
-	defer releaseWindows(snap)
-	wins := snap
-	if prune != nil {
-		wins = make([]segWindow, 0, len(snap))
-		for _, w := range snap {
-			if !prune(w) {
-				wins = append(wins, w)
-			}
-		}
-	}
-	st.segments(len(snap), len(snap)-len(wins))
+	s0, wins := sh.snapshot()
+	defer releaseWindows(wins)
 	var dbuf []byte
-	return c.forEachCandidateRef(s0, wins, groupCandidates{c: c, groups: groups, ct: ct}, reverse, st, func(r recRef) bool {
+	src := c.newGroupCandidates(sh, s0, wins, groups, false)
+	c.forEachCandidateRef(s0, wins, src, false, nil, func(r recRef) bool {
 		// Internal system records carry no normal indexed attributes and are hidden from
 		// client results.
 		if isSystemKeyBytes(r.key()) {
@@ -1729,7 +1883,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 			return true // counted by wireAt; skip it, as every reader does
 		}
 		dbuf = ww
-		return onCand(ww, r.dict, r.w.ctFree)
+		return onCand(ww, r.dict)
 	})
 }
 

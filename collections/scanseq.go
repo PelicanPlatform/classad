@@ -204,12 +204,12 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
 		}
 		var (
-			qp     queryPlan
-			usable []usableProbe
+			qp queryPlan
+			rp readPlan
 		)
 		if q != nil {
 			qp = c.newQueryPlan(q, proj, nil)
-			usable = c.planQuery(qp)
+			rp = c.planReadQuery(qp)
 		} else {
 			s := &wireScope{ctx: c}
 			qp.ws, qp.resolver, qp.proj = s, s.resolve, proj
@@ -219,9 +219,9 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 		// pay to render the rest.
 		render := c.yieldRawProjected(yield, c.newRawProjector(projection, false, false))
 
-		if unsatisfiable(usable) {
-			// The constraint's indexed conjuncts contradict each other: nothing
-			// anywhere can match, so no shard is worth opening.
+		if unsatisfiable(rp.usable) || (rp.disjunctive() && unsatisfiableGroups(rp.groups)) {
+			// The constraint's indexed conjuncts contradict each other (in every
+			// disjunct): nothing anywhere can match, so no shard is worth opening.
 			page.Next = SeqCursor{Shard: uint32(len(c.shards))}
 			return
 		}
@@ -260,7 +260,7 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 			}
 			s0 := cursor.Snapshot
 
-			runs, release := c.shardRuns(sh, s0, cursor, qp, usable)
+			runs, release := c.shardRuns(sh, s0, cursor, qp, rp)
 			// The windows are complete for s0 only if nothing had reclaimed versions
 			// above s0 when they were taken. The floor only rises, so finding it at or
 			// below s0 now proves it was then.
@@ -287,7 +287,7 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 					return
 				}
 				cursor.Snapshot = s0
-				runs, release = c.shardRuns(sh, s0, cursor, qp, usable)
+				runs, release = c.shardRuns(sh, s0, cursor, qp, rp)
 			}
 			visit, stopped := c.refVisitor(s0, qp, emit)
 			ckey := []byte(cursor.Key)
@@ -368,16 +368,17 @@ func nextGroup(runs []*seqRun, s0, minSeq uint64, buf []groupRec) []groupRec {
 // the cursor, and returns a release for their pins.
 //
 // Sealed segments the query's zone maps rule out are dropped whole
-// (zoneExcludes), and with usable index probes a segment whose index covers
-// them is narrowed to its candidates (windowIndex, prefixCandidates) -- the
-// decisions the query paths make (scanShardIndexed, scanWindows). Neither
+// (zoneExcludes, and for a disjunctive read zoneExcludesGroups), and a segment
+// whose index serves the read plan is narrowed to its candidates (the plan's
+// candidateSource) -- the decisions the query paths make (scanShardIndexed,
+// scanShardIndexedGroups, scanWindows). Neither
 // touches the cursor: a dropped segment or record holds no match, so the pages
 // are the same, and its order within a segment is the arena's.
 //
 // A zone map summarizes each record's own bytes, which for a delta record lack
 // what it inherits -- but only an append-only collection keeps zone maps, and
 // it writes no delta records, so the two never meet.
-func (c *Collection) shardRuns(sh *shard, s0 uint64, after SeqCursor, qp queryPlan, usable []usableProbe) ([]*seqRun, func()) {
+func (c *Collection) shardRuns(sh *shard, s0 uint64, after SeqCursor, qp queryPlan, rp readPlan) ([]*seqRun, func()) {
 	// Each segment's newest sequence, read under the lock that guards it: the
 	// active segment's moves with every write.
 	sh.mu.RLock()
@@ -400,16 +401,22 @@ func (c *Collection) shardRuns(sh *shard, s0 uint64, after SeqCursor, qp queryPl
 		}
 	}
 	ct := qp.prunesCT()
-	if len(qp.probes) > 0 && c.hasZones.Load() {
+	if (len(qp.probes) > 0 || rp.disjunctive()) && c.hasZones.Load() {
 		kept := walk[:0]
 		for _, w := range walk {
-			if !c.zoneExcludes(w, qp.probes, ct) {
+			if !c.zoneExcludes(w, qp.probes, ct) && !c.zoneExcludesGroups(w, rp.plan, ct) {
 				kept = append(kept, w)
 			}
 		}
 		walk = kept
 	}
-	ds := c.newDeltaScope(sh, s0, walk, usable, ct)
+	var src candidateSource
+	switch {
+	case rp.disjunctive():
+		src = c.newGroupCandidates(sh, s0, walk, rp.groups, ct)
+	case len(rp.usable) > 0:
+		src = conjCandidates{usable: rp.usable, ds: c.newDeltaScope(sh, s0, walk, rp.usable, ct), ct: ct}
+	}
 	runs := make([]*seqRun, 0, len(walk))
 	for _, w := range walk {
 		run := &seqRun{w: w, dict: w.dict()}
@@ -417,9 +424,9 @@ func (c *Collection) shardRuns(sh *shard, s0 uint64, after SeqCursor, qp queryPl
 		// it: start there, and drop the candidates before it too.
 		from := seekSeq(w, after.Seq)
 		run.off = from
-		if len(usable) > 0 {
-			if ix := windowIndex(w, usable, ct); ix != nil {
-				if cand := prefixCandidates(w, ix, usable, ds, nil); cand != nil {
+		if src != nil {
+			if ix := src.index(w); ix != nil {
+				if cand := src.prefix(w, ix, nil); cand != nil {
 					run.cand = cand.Iterator()
 					run.cand.AdvanceIfNeeded(from)
 				}

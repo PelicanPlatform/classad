@@ -1235,35 +1235,14 @@ func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd
 			}
 			return
 		}
-		// Disjunctive queries: if the top-level OR spine yields more than one probe
-		// group and every group is index-usable, prune via the union of the groups'
-		// candidate sets (DNF: OR of AND-of-probes), re-verifying each candidate. A
-		// single group falls through to the conjunctive path below unchanged.
-		// The disjunctive index path is reverse-aware (scanShardCandidatesGroups honors
-		// c.reverseScan), so a newest-first collection can prune ORs through the index too.
-		if plan := q.ProbePlan(); len(plan) > 1 {
-			for _, g := range plan {
-				c.demand.record(g.Probes)
-			}
-			if groups, prunable := c.planIndexGroups(plan); prunable && !overSelectivityGate(c, groups) {
-				emit := c.yieldAdAs(yield, redact)
-				for _, sh := range c.shards {
-					if !c.scanShardIndexedGroups(sh, groups, plan, qp, emit) {
-						return
-					}
-				}
-				return
-			}
-			// Not prunable (some disjunct is unconstrained): fall through to a full scan.
-		}
-		usable := c.planQuery(qp)
+		rp := c.planReadQuery(qp)
 		// A large full-scan query (no index) can fan out across segments; the helper
 		// falls back to a serial scan of the same snapshot when it is not worthwhile.
-		if c.queryPar > 1 && len(usable) == 0 && !c.reverseScan {
+		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 && !c.reverseScan {
 			c.runParallelQuery(qp, yield, redact)
 			return
 		}
-		c.runQuery(qp, usable, c.yieldAdAs(yield, redact))
+		c.runQuery(qp, rp, c.yieldAdAs(yield, redact))
 	}
 }
 
