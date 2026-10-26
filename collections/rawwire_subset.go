@@ -2,6 +2,7 @@ package collections
 
 import (
 	"iter"
+	"slices"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -60,7 +61,14 @@ func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact 
 			return
 		}
 		sel := c.newWireSubsetSelector(projection, redact)
-		c.scanQuery(c.newQueryPlan(q, c.newProjPlan(projection), stats), c.yieldWireRow(yield, sel))
+		// The projection plan names the type fields as well: a columnar segment builds the record
+		// from the columns the plan asks for, and sel.keep ships MyType/TargetType whatever the
+		// caller projected -- so a plan without them produced typeless rows off columnar segments.
+		var proj *projPlan
+		if len(projection) > 0 {
+			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
+		}
+		c.scanQuery(c.newQueryPlan(q, proj, stats), c.yieldWireRow(yield, sel))
 	}
 }
 
@@ -77,25 +85,11 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 	var scratch []byte
 	var sc wire.SubsetScratch
 	needed := sel.neededCount()
-	var narrow narrowScratch
+	var narrow wireNarrower
 	return func(w []byte, dict *segDictHandle) bool {
-		// Narrow in ID SPACE first. wireToInline decodes the whole ad and re-encodes every
-		// attribute with inline names, so handing it the full record means paying for hundreds of
-		// attributes to emit a handful. Skipped when the record is already inline (nothing to
-		// convert) or the collection is encrypted (values are opened during the conversion, which
-		// this shortcut does not do).
-		if !sel.wantAll && dict != nil && c.sealer == nil {
-			want := sel.localWanted(dict)
-			if nw, ok := narrowAd(&narrow, w, func(id uint32, name string) bool {
-				if name != "" {
-					return true // inline entry in an interned record: keep, the real test is below
-				}
-				_, ok := want[id]
-				return ok
-			}); ok {
-				w = nw
-			}
-		}
+		// Narrow in ID SPACE first, so the conversion below only converts what the caller asked
+		// for (see narrowProjected).
+		w = c.narrowProjected(&narrow, sel, dict, w)
 		w = c.wireToInline(dict, w) // AppendAdSubsetInlineHotFirst needs inline-name wire
 		out, ok := wire.AppendAdSubsetInlineHotFirst(scratch[:0], wire.Ad(w), sel.keep, needed, c.sealer, &sc)
 		scratch = out
@@ -110,15 +104,14 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 // same name-hash-first matching the projected text scans use, with private
 // names pre-pruned from a redacted projection so redaction costs nothing per
 // entry on the projected path.
+//
+// Immutable once built, which is what lets the parallel scan share one across its workers. Any
+// per-scan state that has to be written belongs in the per-worker wireNarrower, not here.
 type wireSubsetSelector struct {
 	wantAll bool
 	redact  bool
 	names   []string
 	hashes  []uint32
-	// projDict/localIDs cache the projection resolved into one segment's local id space, so a
-	// projected read can narrow a record before converting it to inline names. See localWanted.
-	projDict *segDictHandle
-	localIDs map[uint32]struct{}
 }
 
 func (c *Collection) newWireSubsetSelector(projection []string, redact bool) *wireSubsetSelector {

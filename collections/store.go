@@ -571,11 +571,9 @@ type Collection struct {
 	// Encryption at rest (see encrypt.go). sealer is the DB-wide data-key Sealer (nil
 	// disables encryption); encAttrs is the case-folded explicit set of attributes whose
 	// values are sealed, swapped atomically by the toggle meta-command (private attributes
-	// are always sealed regardless). privCache memoizes the immutable per-name private
-	// determination. Encrypted attributes are never indexed and never hot.
-	sealer    wire.Sealer
-	encAttrs  atomic.Pointer[encSetHolder]
-	privCache sync.Map // attribute name -> bool (classad.IsPrivateAttribute), memoized
+	// are always sealed regardless). Encrypted attributes are never indexed and never hot.
+	sealer   wire.Sealer
+	encAttrs atomic.Pointer[encSetHolder]
 
 	// opm accumulates the collection-wide maintenance timings (compact/retrain/reindex)
 	// for OpStats; per-shard write/segment/sync timings live on each shard. See opstats.go.
