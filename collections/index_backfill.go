@@ -32,9 +32,10 @@ type IndexBackfillResult struct {
 }
 
 // lacksCoverage reports whether seg is a sealed segment whose sidecar index does not hold
-// postings for every attribute spec indexes. Only segments already sealed to a sidecar
-// qualify: one without a sidecar index is Reindex's to build, whatever its age, because a
-// missing index is not optional the way an out-of-date one is. Caller holds sh.mu.
+// postings for every attribute spec indexes, or holds them as an older builder left them
+// (mmapSegIndex.stalePostings). Only segments already sealed to a sidecar qualify: one
+// without a sidecar index is Reindex's to build, whatever its age, because a missing index is
+// not optional the way an out-of-date one is. Caller holds sh.mu.
 func lacksCoverage(seg, act *segment, spec *indexSpec) bool {
 	if seg == nil || seg == act || seg.used == 0 || !spec.any() {
 		return false
@@ -43,7 +44,7 @@ func lacksCoverage(seg, act *segment, spec *indexSpec) bool {
 	if mm == nil {
 		return false
 	}
-	return !mm.coversSpec(spec)
+	return !mm.coversSpec(spec) || mm.stalePostings()
 }
 
 // coversSpec reports whether the sidecar holds every attribute spec indexes, as the kind

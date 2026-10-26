@@ -250,7 +250,7 @@ func buildAdSchemaFor(samples [][]byte, ids []uint32) *adSchema {
 			if _, ok := want[id]; !ok {
 				return true
 			}
-			k, lit := nodeKind(node)
+			k, lit := sampledKind(node)
 			ks := kinds[id]
 			if ks == nil {
 				ks = &[5]int{}

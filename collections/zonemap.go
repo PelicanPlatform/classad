@@ -52,12 +52,9 @@ const (
 // unary minus over a literal, and counts as the number it is either way; a list or nested ad is
 // opaque only because it is not worth decoding to prove otherwise.
 func zoneValue(node []byte) (float64, zoneCell) {
-	lit, ok := wire.LiteralValue(node)
+	lit, ok := scalarValue(node)
 	if !ok {
-		lit, ok = wire.NumberValue(node)
-		if !ok {
-			return 0, zoneOpaque
-		}
+		return 0, zoneOpaque
 	}
 	switch lit.Kind {
 	case wire.LitInt:

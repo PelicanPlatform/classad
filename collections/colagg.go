@@ -324,19 +324,24 @@ func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) 
 // dispatch on. A boolean coerces to 1/0 as the reference does, and is reported as akBool so a
 // caller can decline rather than approximate the reference's boolean quirks.
 // isExprNode reports whether a wire node is a value only evaluation can give -- an expression rather
-// than a literal. The numeric column paths read literals; meeting one of these, they decline.
+// than a literal. The numeric column paths read literals; meeting one of these, they decline. A
+// negative number stored as unary minus over a literal is not one (see scalarValue).
 func isExprNode(node []byte) bool {
-	_, lit := wire.LiteralValue(node)
+	_, lit := scalarValue(node)
 	return !lit
 }
 
 func nodeColVal(node []byte) (colVal, bool) {
-	switch k, lit := nodeKind(node); k {
-	case akInt:
+	lit, ok := scalarValue(node)
+	if !ok {
+		return colVal{}, false
+	}
+	switch lit.Kind {
+	case wire.LitInt:
 		return colVal{f: float64(lit.Int), i: lit.Int, kind: akInt}, true
-	case akReal:
+	case wire.LitReal:
 		return colVal{f: lit.Real, kind: akReal}, true
-	case akBool:
+	case wire.LitBool:
 		var i int64
 		if lit.Bool {
 			i = 1

@@ -260,7 +260,7 @@ func (s *blockVecSource) fillGroupExceptions(gb *colGroupBlock, id uint32, dst *
 			dst.St[k] = vm.VsUndef
 			continue
 		}
-		lit, ok := wire.LiteralValue(node)
+		lit, ok := scalarValue(node)
 		if !ok {
 			return false // a computed expression: decline rather than guess
 		}

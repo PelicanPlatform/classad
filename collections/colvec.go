@@ -343,7 +343,7 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 			dst.St[k] = vm.VsUndef
 			continue
 		}
-		lit, ok := wire.LiteralValue(node)
+		lit, ok := scalarValue(node)
 		if !ok {
 			return false // a computed expression
 		}
