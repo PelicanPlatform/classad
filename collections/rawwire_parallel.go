@@ -68,6 +68,13 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 		}
 	}()
 
+	// The key that opens a sealed value during assembly -- nil unless the store encrypts at rest,
+	// read once rather than per record. The serial scan passes the same thing; passing nil here
+	// did not leave an encrypted value sealed, it made the whole row fail to assemble and be
+	// skipped, so a projection naming an encrypted attribute returned every ad stripped of it,
+	// silently and only on the parallel path.
+	seal := c.sealer
+
 	results := make(chan wireRowBatch, W)
 	// Arena free-list: the consumer recycles drained batches back to the workers,
 	// so a steady scan reuses ~2W arenas total instead of allocating one per 64KB
@@ -94,6 +101,9 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 			defer wg.Done()
 			var dbuf []byte
 			var sc wire.SubsetScratch
+			// Per-worker, like dbuf and sc: it holds reusable buffers and a resolved-projection
+			// cache, so one shared between workers would both race and corrupt rows.
+			var narrow wireNarrower
 			// Adaptive prefix gate: a stretch of records that cannot be served from
 			// their prefix (not yet re-encoded hot-first, or the projection is not
 			// hot-covered) would pay a wasted prefix decompress each -- so after
@@ -129,12 +139,16 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 					if dict != nil {
 						// Interned segment: the prefix/hot-first inline renderer needs inline
 						// wire, so fully decompress and flatten via the dict, then subset.
+						// Narrowing to the projection in the segment's own id space FIRST is
+						// what keeps the flatten from re-encoding the whole ad (see
+						// narrowProjected) -- the serial scan does the same.
 						w, err := codec.Decompress(dbuf[:0], ad)
 						dbuf = w
 						if err != nil {
 							return true
 						}
-						out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(c.wireToInline(dict, w)), sel.keep, needed, nil, &sc)
+						nw := c.narrowProjected(&narrow, sel, dict, w)
+						out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(c.wireToInline(dict, nw)), sel.keep, needed, seal, &sc)
 						if !ok {
 							batch.buf = out[:start]
 							return true
@@ -154,7 +168,7 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 						w, perr := pd.DecompressPrefix(dbuf[:0], ad, wirePrefixBytes)
 						dbuf = w
 						if perr == nil {
-							if out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(w), sel.keep, needed, nil, &sc); ok {
+							if out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(w), sel.keep, needed, seal, &sc); ok {
 								consecFail = 0
 								batch.buf = out
 								batch.offs = append(batch.offs, len(out))
@@ -175,7 +189,7 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 					if err != nil {
 						return true // undecodable record: skip, matching the serial scan
 					}
-					out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(w), sel.keep, needed, nil, &sc)
+					out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(w), sel.keep, needed, seal, &sc)
 					if !ok {
 						batch.buf = out[:start] // discard the partial append
 						return true

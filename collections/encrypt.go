@@ -27,9 +27,13 @@ var errEncryptionDisabled = errors.New("collections: encryption at rest is not e
 // An attribute is encrypted when encryption is enabled AND it is either private (an
 // HTCondor secret -- claim ids, capabilities, transfer keys, _condor_priv*; always
 // encrypted, non-negotiable) or in the human-toggled explicit set. Privateness is a
-// compiled-in, name-only property, so it is memoized: classad.IsPrivateAttribute is
-// consulted once per distinct attribute name and the result cached (privCache). The
-// explicit set can change at runtime (SetEncryptedAttrs), so it is consulted live.
+// compiled-in, name-only property and classad.IsPrivateAttribute is written for exactly this
+// call frequency -- a length gate and a first-byte switch reject almost every name before any
+// map is touched, with no allocation -- so it is called directly, per attribute. Memoizing it
+// in a per-collection sync.Map measured 2.5x SLOWER than the predicate it cached (12.0ns vs
+// 4.9ns per name over a realistic job ad's attributes): hashing the whole name costs more than
+// the two comparisons it replaces, and the cache grew without bound over an unbounded key
+// space. The explicit set can change at runtime (SetEncryptedAttrs), so it is consulted live.
 
 // dataKeySealer adapts the DB data key to wire.Sealer via crypt's AES-256-GCM.
 type dataKeySealer struct{ key []byte }
@@ -78,10 +82,11 @@ func (c *Collection) encryptedAttrs() map[string]struct{} {
 }
 
 // shouldEncrypt is the per-attribute encryption predicate handed to the wire encoder.
-// It is only consulted when a sealer is present (encodeAd guards that), so it need not
-// re-check. An attribute is encrypted if it is private (memoized) or in the explicit set.
+// It is only consulted when a sealer is present (encodeAd guards that, and the encoders
+// short-circuit on a nil Sealer), so it need not re-check. An attribute is encrypted if it
+// is private or in the explicit set.
 func (c *Collection) shouldEncrypt(name string) bool {
-	if c.attrIsPrivate(name) {
+	if classad.IsPrivateAttribute(name) {
 		return true
 	}
 	if set := c.encryptedAttrs(); set != nil {
@@ -93,7 +98,7 @@ func (c *Collection) shouldEncrypt(name string) bool {
 
 // anySealedAttr reports whether any of the interned attribute ids this collection just streamed names an
 // attribute it would seal. Used to defer a streaming ingest to the sealing path for that ad only (see
-// encodeOld); the id set is one ad's worth, and shouldEncrypt memoizes per name.
+// encodeOld); the id set is one ad's worth.
 func (c *Collection) anySealedAttr(seen map[uint32]struct{}) bool {
 	for id := range seen {
 		name, ok := c.intern.Name(id)
@@ -107,17 +112,6 @@ func (c *Collection) anySealedAttr(seen map[uint32]struct{}) bool {
 		}
 	}
 	return false
-}
-
-// attrIsPrivate reports whether name is an HTCondor private attribute, memoizing the
-// (immutable) answer so classad.IsPrivateAttribute is called once per distinct name.
-func (c *Collection) attrIsPrivate(name string) bool {
-	if v, ok := c.privCache.Load(name); ok {
-		return v.(bool)
-	}
-	p := classad.IsPrivateAttribute(name)
-	c.privCache.Store(name, p)
-	return p
 }
 
 // EncryptionEnabled reports whether this collection has a data key (encryption at
