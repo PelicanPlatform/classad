@@ -160,6 +160,9 @@ func pageBoth(t *testing.T, c *Collection, q *vm.Query, projection []string, lim
 		var pn, pr SeqPage
 		if !doneN {
 			gotN, pn = seqPage(c, q, projection, cn, limit)
+			if pn.Err != nil {
+				t.Fatalf("page %d (cursor %+v): %v", pages, cn, pn.Err)
+			}
 		}
 		if !doneR {
 			gotR, pr = refQueryRawFromSeq(c, q, projection, cr, limit)
@@ -454,9 +457,16 @@ func TestSeqReadMatchesFullWalk(t *testing.T) {
 			// maintenance between, so the seek is built deep in a segment, extended over a grown
 			// active segment, and built afresh over the segments compaction and columnarization
 			// put in place.
+			//
+			// The cursors come from the read, which leases each shard's snapshot as a paginating
+			// client's would: the reference takes none, and maintenance between pages would be
+			// free to reclaim what an unleased snapshot sees.
 			var cursors []SeqCursor
 			for cur := (SeqCursor{}); ; {
-				_, page := refQueryRawFromSeq(c, nil, nil, cur, 23)
+				_, page := seqPage(c, nil, nil, cur, 23)
+				if page.Err != nil {
+					t.Fatal(page.Err)
+				}
 				if !page.More {
 					break
 				}
@@ -468,6 +478,9 @@ func TestSeqReadMatchesFullWalk(t *testing.T) {
 				q, proj := randomQuery()
 				limit := []int{1, 7, 50}[rng.Intn(3)]
 				gotN, pn := seqPage(c, q, proj, cur, limit)
+				if pn.Err != nil {
+					t.Fatalf("page from cursor %+v: %v", cur, pn.Err)
+				}
 				gotR, pr := refQueryRawFromSeq(c, q, proj, cur, limit)
 				if !slices.Equal(gotN, gotR) {
 					t.Fatalf("page from cursor %+v differs\n read:      %q\n reference: %q", cur, gotN, gotR)

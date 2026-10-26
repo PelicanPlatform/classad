@@ -1003,7 +1003,10 @@ func (b *columnarBlock) reconstructInto(dst []byte, k int, bc *blockCache) ([]by
 // on one block share a single decompression. Callers use this only for records the scan has
 // already found escaped for fieldID; a hot/cold-column value never reaches here.
 func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (float64, bool, error) {
-	fieldID = b.remap.stored(fieldID)
+	fieldID, known := b.remap.storedID(fieldID)
+	if !known {
+		return 0, false, nil // no attribute of that name in this payload's tail
+	}
 	tail, err := bc.stream(b, kindCold)
 	if err != nil {
 		return 0, false, err
@@ -1036,7 +1039,10 @@ func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (
 // literal it is (or on evaluating it, if it is an expression), and a value-returning accessor throws
 // exactly that away. Reads only this field, not the whole record.
 func (b *columnarBlock) escapedNode(k int, fieldID uint32, bc *blockCache) (node []byte, found bool, err error) {
-	fieldID = b.remap.stored(fieldID)
+	fieldID, known := b.remap.storedID(fieldID)
+	if !known {
+		return nil, false, nil // no attribute of that name in this payload's tail
+	}
 	tail, err := bc.stream(b, kindCold)
 	if err != nil {
 		return nil, false, err
@@ -1087,8 +1093,11 @@ func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (c
 		return colVal{}, cellExpr
 	}
 	// The tail is keyed by the ids it was WRITTEN with, as escapedNode and escapedNumField read it.
-	stored := b.remap.stored(fieldID)
+	stored, known := b.remap.storedID(fieldID)
 	cold := tail[b.coldOffAt(k):b.coldOffAt(k+1)]
+	if !known {
+		cold = nil // no attribute of that name in this payload's tail
+	}
 	for len(cold) > 0 {
 		id, m := binary.Uvarint(cold)
 		if m <= 0 {
@@ -1124,7 +1133,8 @@ type idRemap struct {
 	toCurrent map[uint32]uint32
 }
 
-// stored maps a current intern id to the id this payload used for the same attribute.
+// stored maps a current intern id to the id this payload used for the same attribute. It is for
+// an id already known to be in the payload; a lookup uses storedID.
 func (r *idRemap) stored(id uint32) uint32 {
 	if r == nil {
 		return id
@@ -1133,6 +1143,23 @@ func (r *idRemap) stored(id uint32) uint32 {
 		return v
 	}
 	return id
+}
+
+// storedID is stored for a lookup: it reports false when the payload holds no attribute of that
+// name, which is then absent from every record of it.
+//
+// It must not fall back to the id itself. The two id spaces are different numberings of different
+// name sets -- the current process interns names in the order it meets them, and the payload's ids
+// were assigned by an earlier process or are a segment dictionary's -- so a current id the payload
+// does not know is, as often as not, the stored id of some OTHER attribute. Looking it up returned
+// that attribute's value under the asked-for name: after a restart, a projection naming an attribute
+// a record lacks came back with another attribute's value.
+func (r *idRemap) storedID(id uint32) (uint32, bool) {
+	if r == nil {
+		return id, true
+	}
+	v, ok := r.toStored[id]
+	return v, ok
 }
 
 // setGroupRemap hands a row group's selections the same id translation the base block carries, so a

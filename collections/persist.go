@@ -349,6 +349,14 @@ func Open(opts Options) (*Collection, error) {
 			sh.commitSeq = hw
 		}
 	}
+	// Nothing records what an earlier process reclaimed, so a paged-read cursor issued before
+	// this open cannot be trusted to find the versions it sees: start the reclamation floor at
+	// the recovered sequence, which refuses every such cursor except one whose shard has not
+	// moved since (see seqlease.go). A transaction never spans an open, so conflictSince is
+	// unaffected.
+	for _, sh := range c.shards {
+		sh.gcFloor = max(sh.gcFloor, sh.commitSeq)
+	}
 	// The append floor is not persisted; derive it from what recovery found. With the
 	// high-water mark applied, a shard Truncated (or rotated empty) before a clean Close
 	// gets commitSeq as its floor, so a cursor from before the truncate still Resets.

@@ -425,6 +425,16 @@ func (s *Server) streamQueryRawProjectSeq(ctx context.Context, reqID uint64, r *
 		write(putStr(respHead(reqID, stStream), rawAdText(ra)))
 		n++
 	}
+	if page.Err != nil {
+		// Set before any row, so nothing above was written: the caller gets the refusal in
+		// place of the page, never a page that silently ends the listing.
+		msg := page.Err.Error()
+		if errors.Is(page.Err, collections.ErrSeqCursorExpired) {
+			msg = cursorExpiredPrefix + msg
+		}
+		write(respErr(reqID, msg))
+		return
+	}
 	cur := respHead(reqID, stStreamCursor)
 	more := byte(0)
 	if page.More {
@@ -660,9 +670,14 @@ var ErrPaginationUnsupported = errors.New("dbrpc: server does not support cursor
 // the cursor to continue from.
 //
 // Pagination lives on the server's own ordering, so a page costs a resume rather
-// than a re-scan, and the cursor names no physical position — a compaction
-// between pages cannot invalidate it. Hand the returned page's Next back
-// unchanged for the following page; the zero cursor starts at the beginning.
+// than a re-scan, and the cursor names no physical position, so compaction moving
+// records does not disturb it. Hand the returned page's Next back unchanged for
+// the following page; the zero cursor starts at the beginning.
+//
+// A cursor's snapshot is kept readable for the server's lease period
+// (collections.Options.SeqCursorLease). A cursor resumed after the server has
+// reclaimed versions its snapshot sees fails with ErrCursorExpired before any
+// row: restart the listing from the zero cursor.
 func (c *Client) QueryRawProjectedFromSeqStream(ctx context.Context, table, constraint string, attrs []string, after SeqCursor, limit int, yield func(row string) bool) (*SeqPage, error) {
 	page := &SeqPage{}
 	err := c.streamEachCursor(ctx, func(id uint64) []byte {

@@ -154,19 +154,25 @@ func (c *Collection) QueryAsOf(q *vm.Query, t time.Time) (iter.Seq[*classad.Clas
 }
 
 // retainFloorLocked is the commit sequence below which superseded versions may be
-// reclaimed by compaction: the current commitSeq when time travel is off (reclaim
-// every superseded version, exactly as before), else the sequence that was current
-// MaxDistance ago (retain anything newer for AS OF queries). A version is kept iff its
-// supersededBySeq is strictly greater than this. Caller holds at least the read lock.
+// reclaimed by compaction: the current commitSeq when time travel is off and no paged
+// read holds a lease (reclaim every superseded version, exactly as before), else the
+// lowest of the sequence that was current MaxDistance ago (retain anything newer for AS
+// OF queries) and the oldest leased paged-read snapshot (seqlease.go). A version is kept
+// iff its supersededBySeq is strictly greater than this. Caller holds at least the read
+// lock.
 func (sh *shard) retainFloorLocked() uint64 {
+	floor := sh.commitSeq
 	if sh.tt != nil {
 		if cfg := sh.tt.Load(); cfg != nil {
-			if f := sh.tseq.retainFloor(nowMillis(), cfg.maxDistance); f < sh.commitSeq {
-				return f
+			if f := sh.tseq.retainFloor(nowMillis(), cfg.maxDistance); f < floor {
+				floor = f
 			}
 		}
 	}
-	return sh.commitSeq
+	if f, ok := sh.leaseFloorLocked(); ok && f < floor {
+		floor = f
+	}
+	return floor
 }
 
 // timeSeqEntry is one checkpoint: seq was the shard's commit sequence at wall-clock

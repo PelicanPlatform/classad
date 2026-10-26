@@ -2,6 +2,7 @@ package collections
 
 import (
 	"bytes"
+	"fmt"
 	"iter"
 	"slices"
 	"sort"
@@ -67,6 +68,12 @@ type SeqPage struct {
 	// More reports whether the scan stopped at the page limit with records
 	// still to come, as opposed to having reached the end of the collection.
 	More bool
+	// Err, when set, means the page could not be read and yielded nothing: it
+	// wraps ErrSeqCursorExpired when maintenance has reclaimed versions the
+	// cursor's snapshot sees. More is false and Next is the cursor handed in,
+	// but the listing is NOT complete -- restart it from the zero cursor. Check
+	// it after consuming the rows.
+	Err error
 }
 
 // seqRun is one segment's records, positioned at the first one after the
@@ -161,6 +168,11 @@ func (r *seqRun) advance(s0, minSeq uint64) {
 // had already started, and visible if it had not. That is the guarantee Scan
 // already makes, which is likewise per shard.
 //
+// A shard's snapshot stays readable for Options.SeqCursorLease after it is
+// taken. A cursor resumed after maintenance has reclaimed versions its snapshot
+// sees is refused rather than read short: the page yields nothing and its Err
+// wraps ErrSeqCursorExpired (seqlease.go).
+//
 // It reads the way a query does, only in a different order: a segment index
 // that can serve the constraint narrows each segment to its candidates, the
 // columns are asked before a record is rebuilt, and a projection the columns
@@ -234,18 +246,49 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 			if si == int(after.Shard) {
 				cursor = after
 			}
-			if cursor.Snapshot == 0 {
+			resumed := cursor.Snapshot != 0
+			if !resumed {
 				// First page for this shard: freeze it here. Later pages carry
 				// the same value back, so a write that lands meanwhile is
 				// invisible to them — the per-shard form of what Scan
-				// guarantees.
+				// guarantees. The lease keeps the versions it sees from being
+				// reclaimed while the pagination is expected to need them.
 				sh.mu.RLock()
 				cursor.Snapshot = sh.commitSeq
+				sh.leaseSnapshotLocked(cursor.Snapshot)
 				sh.mu.RUnlock()
 			}
 			s0 := cursor.Snapshot
 
 			runs, release := c.shardRuns(sh, s0, cursor, qp, usable)
+			// The windows are complete for s0 only if nothing had reclaimed versions
+			// above s0 when they were taken. The floor only rises, so finding it at or
+			// below s0 now proves it was then.
+			for {
+				sh.mu.RLock()
+				floor := sh.gcFloor
+				expired := sh.seqCursorExpiredLocked(s0)
+				if expired && !resumed {
+					// A snapshot this read took itself, overtaken before its windows were
+					// built (a pass that ran with no lease to respect). Nothing of this
+					// shard has been yielded, so take it again.
+					s0 = sh.commitSeq
+					sh.leaseSnapshotLocked(s0)
+				}
+				sh.mu.RUnlock()
+				if !expired {
+					break
+				}
+				release()
+				if resumed {
+					seqCursorsExpired.Add(1)
+					page.Next, page.More = after, false
+					page.Err = fmt.Errorf("%w (shard %d: snapshot %d, reclaimed through %d)", ErrSeqCursorExpired, si, s0, floor)
+					return
+				}
+				cursor.Snapshot = s0
+				runs, release = c.shardRuns(sh, s0, cursor, qp, usable)
+			}
 			visit, stopped := c.refVisitor(s0, qp, emit)
 			ckey := []byte(cursor.Key)
 			done := func() bool {
