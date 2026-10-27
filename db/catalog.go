@@ -425,9 +425,11 @@ func (cat *Catalog) ConvertTableToMemory(name string) error {
 		return fmt.Errorf("catalog: copying %q into memory: %w", name, err)
 	}
 
-	// Swap in the RAM table and retire the on-disk original.
+	// Swap in the RAM table and retire the on-disk original. A reader still holding the
+	// old *DB keeps its mappings until it is done (dropClose), so the removal below cannot
+	// pull the ground out from under it.
 	cat.tables[name] = mem
-	_ = old.Close()
+	_ = old.dropClose()
 	if err := os.RemoveAll(filepath.Join(cat.dir, tablesSubdir, name)); err != nil {
 		return fmt.Errorf("catalog: removing on-disk data for %q: %w", name, err)
 	}
@@ -435,6 +437,18 @@ func (cat *Catalog) ConvertTableToMemory(name string) error {
 }
 
 // DropTable closes and removes the table named name, deleting its on-disk data.
+//
+// A query already streaming out of the table keeps reading it: the drop marks the table
+// closed (nothing new may start reading it, and it is out of the catalog before anything
+// else happens) and the actual unmap is handed to the last reader on its way out. Without
+// that, unmapping under a slow consumer faulted the whole process -- a Go runtime fault, so
+// not something a per-connection recover could contain. DropTable itself never waits: the
+// reader is an iterator whose end it cannot see, and the catalog lock is held here.
+//
+// The directory goes immediately regardless. Unlinking a mapped file does not disturb the
+// mapping, and a deferred teardown writes nothing (DB.dropClose discards rather than
+// flushes), so a table recreated under the same name afterwards cannot have its fresh files
+// deleted or overwritten by the old one's tail.
 func (cat *Catalog) DropTable(name string) error {
 	cat.mu.Lock()
 	defer cat.mu.Unlock()
@@ -443,7 +457,7 @@ func (cat *Catalog) DropTable(name string) error {
 		return fmt.Errorf("catalog: no such table %q", name)
 	}
 	delete(cat.tables, name)
-	_ = d.Close()
+	_ = d.dropClose()
 	if cat.dir != "" {
 		if err := os.RemoveAll(filepath.Join(cat.dir, tablesSubdir, name)); err != nil {
 			return fmt.Errorf("catalog: removing table %q data: %w", name, err)
@@ -519,7 +533,7 @@ func (cat *Catalog) DropArchiveTable(name string) error {
 		return fmt.Errorf("catalog: no such archive %q", name)
 	}
 	delete(cat.archives, name)
-	_ = a.Close()
+	_ = a.dropClose() // reader-aware, like DropTable
 	if cat.dir != "" {
 		if err := os.RemoveAll(filepath.Join(cat.dir, archivesSubdir, name)); err != nil {
 			return fmt.Errorf("catalog: removing archive %q data: %w", name, err)

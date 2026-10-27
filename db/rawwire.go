@@ -64,13 +64,13 @@ func (db *DB) UpdateOldBatch(items []OldAdText) error {
 // only on a malformed constraint.
 func (db *DB) QueryRaw(constraint string) (iter.Seq[collections.RawAd], error) {
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
-		return db.c.ScanRaw(), nil // match-all: full raw scan
+		return gated(db, db.c.ScanRaw()), nil // match-all: full raw scan
 	}
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRaw(q), nil
+	return gated(db, db.c.QueryRaw(q)), nil
 }
 
 // QueryRawRedacted is QueryRaw with private (secret) attributes stripped inside
@@ -79,13 +79,13 @@ func (db *DB) QueryRaw(constraint string) (iter.Seq[collections.RawAd], error) {
 // collections.ScanRawRedacted).
 func (db *DB) QueryRawRedacted(constraint string) (iter.Seq[collections.RawAd], error) {
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
-		return db.c.ScanRawRedacted(), nil
+		return gated(db, db.c.ScanRawRedacted()), nil
 	}
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRawRedacted(q), nil
+	return gated(db, db.c.QueryRawRedacted(q)), nil
 }
 
 // QueryRawProjected is QueryRaw restricted to the projected attribute names,
@@ -96,13 +96,13 @@ func (db *DB) QueryRawRedacted(constraint string) (iter.Seq[collections.RawAd], 
 // An empty projection means no attribute filter.
 func (db *DB) QueryRawProjected(constraint string, projection []string, redact bool) (iter.Seq[collections.RawAd], error) {
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
-		return db.c.ScanRawProjected(projection, false, redact), nil
+		return gated(db, db.c.ScanRawProjected(projection, false, redact)), nil
 	}
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRawProjected(q, projection, false, redact), nil
+	return gated(db, db.c.QueryRawProjected(q, projection, false, redact)), nil
 }
 
 // QueryRawProjectedStats is QueryRawProjected that also fills stats (may be nil) with the
@@ -110,13 +110,13 @@ func (db *DB) QueryRawProjected(constraint string, projection []string, redact b
 // An empty/true constraint takes the no-WHERE scan path and leaves stats zero.
 func (db *DB) QueryRawProjectedStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[collections.RawAd], error) {
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
-		return db.c.ScanRawProjected(projection, false, redact), nil
+		return gated(db, db.c.ScanRawProjected(projection, false, redact)), nil
 	}
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRawProjectedStats(q, projection, false, redact, stats), nil
+	return gated(db, db.c.QueryRawProjectedStats(q, projection, false, redact, stats)), nil
 }
 
 // QueryRawProjectedRefs is QueryRawProjected that also carries the attributes the
@@ -134,13 +134,13 @@ func (db *DB) QueryRawProjectedStats(constraint string, projection []string, red
 // this one when the recipient is going to EVALUATE what it receives.
 func (db *DB) QueryRawProjectedRefs(constraint string, projection []string, redact bool) (iter.Seq[collections.RawAd], error) {
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
-		return db.c.ScanRawProjected(projection, true, redact), nil
+		return gated(db, db.c.ScanRawProjected(projection, true, redact)), nil
 	}
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRawProjected(q, projection, true, redact), nil
+	return gated(db, db.c.QueryRawProjected(q, projection, true, redact)), nil
 }
 
 // QueryRawProjectedRefsStats is QueryRawProjectedRefs that also fills stats (may be nil) with the
@@ -148,13 +148,13 @@ func (db *DB) QueryRawProjectedRefs(constraint string, projection []string, reda
 // path and leaves stats zero.
 func (db *DB) QueryRawProjectedRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[collections.RawAd], error) {
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
-		return db.c.ScanRawProjected(projection, true, redact), nil
+		return gated(db, db.c.ScanRawProjected(projection, true, redact)), nil
 	}
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRawProjectedStats(q, projection, true, redact, stats), nil
+	return gated(db, db.c.QueryRawProjectedStats(q, projection, true, redact, stats)), nil
 }
 
 // QueryRawWire yields each matching ad as a self-contained WIRE-FORM ROW (an
@@ -174,13 +174,13 @@ func (db *DB) QueryRawWire(constraint string, projection []string, redact bool) 
 		return nil, ErrRawWireUnsupported
 	}
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
-		return db.c.ScanRawWire(projection, redact), nil
+		return gated(db, db.c.ScanRawWire(projection, redact)), nil
 	}
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRawWire(q, projection, redact), nil
+	return gated(db, db.c.QueryRawWire(q, projection, redact)), nil
 }
 
 // QueryRawWireStats is QueryRawWire that also fills stats (may be nil) with the per-scan
@@ -191,13 +191,13 @@ func (db *DB) QueryRawWireStats(constraint string, projection []string, redact b
 		return nil, ErrRawWireUnsupported
 	}
 	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
-		return db.c.ScanRawWire(projection, redact), nil
+		return gated(db, db.c.ScanRawWire(projection, redact)), nil
 	}
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRawWireStats(q, projection, redact, stats), nil
+	return gated(db, db.c.QueryRawWireStats(q, projection, redact, stats)), nil
 }
 
 // SeqCursor and SeqPage re-export the collections types so a caller of the DB
@@ -232,5 +232,5 @@ func (db *DB) QueryRawProjectedFromSeq(constraint string, projection []string, a
 		q = parsed
 	}
 	seq, page := db.c.QueryRawFromSeq(q, projection, after, limit)
-	return seq, page, nil
+	return gated(db, seq), page, nil
 }

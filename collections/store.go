@@ -590,6 +590,10 @@ type Collection struct {
 	// ttCfg is the active time-travel configuration, or nil when disabled (the
 	// default). Swappable at runtime via SetTimeTravel. See timeseq.go.
 	ttCfg atomic.Pointer[ttConfig]
+
+	// gate accounts for readers that are inside the collection across more than one segment
+	// pin, so Close/Discard cannot unmap memory under them. See closegate.go.
+	gate closeGate
 }
 
 // rootKey returns the key of the family root for key: it follows parentKeyFor to

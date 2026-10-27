@@ -249,7 +249,7 @@ func (t *ArchiveTable) QueryLimit(constraint string, limit int) (iter.Seq[*class
 	if err != nil {
 		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
 	}
-	return t.a.QueryLimit(q, limit), nil
+	return gatedArch(t, t.a.QueryLimit(q, limit)), nil
 }
 
 // QueryProject scans the matching ads and yields each projected to just attrs' values, read
@@ -267,7 +267,7 @@ func (t *ArchiveTable) QueryProjectStats(constraint string, attrs []string, stat
 	if err != nil {
 		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
 	}
-	return t.a.QueryProjectStats(q, attrs, stats), nil
+	return gatedArch(t, t.a.QueryProjectStats(q, attrs, stats)), nil
 }
 
 // QueryRawProjected yields each matching ad as a raw projected subset (only the projection
@@ -280,7 +280,7 @@ func (t *ArchiveTable) QueryRawProjected(constraint string, projection []string,
 	if err != nil {
 		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
 	}
-	return t.a.QueryRawProjected(q, projection, false, redact), nil
+	return gatedArch(t, t.a.QueryRawProjected(q, projection, false, redact)), nil
 }
 
 // QueryRawProjectedStats is QueryRawProjected that also fills stats (may be nil) with the
@@ -291,7 +291,7 @@ func (t *ArchiveTable) QueryRawProjectedStats(constraint string, projection []st
 	if err != nil {
 		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
 	}
-	return t.a.QueryRawProjectedStats(q, projection, false, redact, stats), nil
+	return gatedArch(t, t.a.QueryRawProjectedStats(q, projection, false, redact, stats)), nil
 }
 
 // QueryRawProjectedRefs is QueryRawProjected with the projected expressions' attribute
@@ -302,7 +302,7 @@ func (t *ArchiveTable) QueryRawProjectedRefs(constraint string, projection []str
 	if err != nil {
 		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
 	}
-	return t.a.QueryRawProjected(q, projection, true, redact), nil
+	return gatedArch(t, t.a.QueryRawProjected(q, projection, true, redact)), nil
 }
 
 // QueryRawProjectedRefsStats is QueryRawProjectedRefs that also fills stats (may be nil) with the
@@ -312,7 +312,7 @@ func (t *ArchiveTable) QueryRawProjectedRefsStats(constraint string, projection 
 	if err != nil {
 		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
 	}
-	return t.a.QueryRawProjectedStats(q, projection, true, redact, stats), nil
+	return gatedArch(t, t.a.QueryRawProjectedStats(q, projection, true, redact, stats)), nil
 }
 
 // Aggregate runs a server-side GROUP BY over the archive's matches: it applies the

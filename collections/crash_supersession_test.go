@@ -657,7 +657,20 @@ func (d *diskShadow) image(t *testing.T, c *Collection, dir string, lose func() 
 	img := liveImage(t, c, dir)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// The live shards are the authority for which segment owns a file, but a Close has
+	// emptied them (it releases the mappings, so nothing may reach a segment through a
+	// shard afterwards). The segments the msync hook recorded stand in for that case: by
+	// the time image runs, a rewrite has already renamed its output, so each one's path is
+	// final. Reaped segments go in first so that where a rewrite reused a name, the live
+	// owner wins; after a Close every segment is reaped and this is all there is.
 	byPath := map[string]*segment{}
+	for _, reaped := range []bool{true, false} {
+		for seg := range d.files {
+			if seg.path != "" && seg.isReaped() == reaped {
+				byPath[seg.path] = seg
+			}
+		}
+	}
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		for _, seg := range sh.segs {

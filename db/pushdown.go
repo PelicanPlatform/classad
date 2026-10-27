@@ -139,14 +139,14 @@ func (db *DB) KeysWhere(constraint string) (iter.Seq[string], error) {
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return func(yield func(string) bool) {
+	return gated(db, func(yield func(string) bool) {
 		db.c.ForEachAd(func(key string, ad *classad.ClassAd) bool {
 			if q.Matches(ad) {
 				return yield(key)
 			}
 			return true
 		})
-	}, nil
+	}), nil
 }
 
 // matchingKeysAll collects every key whose ad matches q at the time of the scan. Unbounded
