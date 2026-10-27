@@ -60,15 +60,41 @@ func TestGroupKeyIsPlainMemory(t *testing.T) {
 			t.Fatalf("unsafe.Sizeof(%s{}) = %d, want %d", k.name, got, k.size)
 		}
 	}
-	// There is a key type for every arity the cap admits. Without this, raising maxGroupCols
-	// without adding a type would leave the top arity dispatching to nothing -- which declines
-	// rather than truncating, so it is safe, but it is also silently not the acceleration the cap
-	// now claims to offer.
+	// There is a key type for every arity the cap admits, AND the dispatch reaches it. Without
+	// this, raising maxGroupCols without instantiating the key at that width would leave the top
+	// arity dispatching to nothing -- which declines rather than truncating, so it is safe, but it
+	// is also silently not the acceleration the cap now claims to offer.
+	//
+	// The accumulator's own arity is not enough to show that. newGroupAccum sets it from the column
+	// count before it picks a map, so an arity with no map still reports the arity it was asked
+	// for; what distinguishes "served" from "declined" is whether accFor forms a key. Both the raw
+	// and the bucketed dispatch are asked, because they are separate switches and a case missing
+	// from either one is a width that silently falls back.
 	for n := 1; n <= maxGroupCols; n++ {
-		a := newGroupAccum(make([]int64, n))
-		if a.n != n {
-			t.Fatalf("%d group columns built an accumulator of arity %d: maxGroupCols admits an "+
-				"arity with no key type", n, a.n)
+		for _, bucketed := range []bool{false, true} {
+			buckets := make([]int64, n)
+			if bucketed {
+				buckets[n-1] = 3600
+			}
+			a := newGroupAccum(buckets)
+			if a.n != n {
+				t.Fatalf("%d group columns built an accumulator of arity %d: maxGroupCols admits "+
+					"an arity with no key type", n, a.n)
+			}
+			var comps [maxGroupCols]groupComp
+			for i := range comps[:n] {
+				comps[i] = groupComp{kind: gkInt, raw: int64(i) + 1}
+			}
+			g, ok := a.accFor(&comps, 0)
+			if !ok || g == nil {
+				t.Fatalf("%d group columns (bucketed=%v): accFor = %v, %v; maxGroupCols admits an "+
+					"arity the dispatch does not serve, so the cap claims an acceleration that "+
+					"falls back to the record scan", n, bucketed, g, ok)
+			}
+			if a.nGroups() != 1 {
+				t.Fatalf("%d group columns (bucketed=%v): one record formed %d groups; the arity "+
+					"has a key type but nGroups does not read its map", n, bucketed, a.nGroups())
+			}
 		}
 	}
 	// And the component the key is assembled from, which is passed by value per record per column.

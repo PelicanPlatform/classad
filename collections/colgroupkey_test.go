@@ -14,9 +14,9 @@ import (
 // key1 packs one component the way the accumulator does, for a test that wants to look a
 // single-column group up in the accumulation map.
 func key1(c groupComp) groupKey1 {
-	// A component and a one-component key hold the same two fields, which is what makes packing
-	// one into the other a pair of stores on the hot path.
-	return groupKey1(c)
+	// Component 0 of a one-component key, which is the whole key: the accumulator's arity-1 path
+	// stores exactly these two fields at a constant index.
+	return groupKey1{raw: [1]int64{c.raw}, kind: [1]groupValKind{c.kind}}
 }
 
 // accFor1 is groupAccum.accFor for a single component, which is the shape most of these tests want.
@@ -175,7 +175,7 @@ func TestGroupKeyRefinesRenderedIdentity(t *testing.T) {
 	byKey := map[groupKey1]string{}
 	for _, c := range comps {
 		k := key1(c)
-		text := valueText(a.values1(k)[0])
+		text := valueText(keyValues(a, k)[0])
 		if prev, seen := byKey[k]; seen && prev != text {
 			t.Errorf("one key renders as both %q and %q: the key is coarser than the scan's identity",
 				prev, text)
@@ -196,7 +196,7 @@ func TestGroupKeyRefinesRenderedIdentity(t *testing.T) {
 			t.Errorf("%+v and %+v are one key; they are two storage values the renderer merges",
 				pair[0], pair[1])
 		}
-		if ta, tb := valueText(a.values1(ka)[0]), valueText(a.values1(kb)[0]); ta != tb {
+		if ta, tb := valueText(keyValues(a, ka)[0]), valueText(keyValues(a, kb)[0]); ta != tb {
 			t.Errorf("%+v renders %q and %+v renders %q: this pair no longer exercises the merge",
 				pair[0], ta, pair[1], tb)
 		}

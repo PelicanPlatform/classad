@@ -559,6 +559,7 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookups []func(
 	aggLookups []func(wire.Ad) ([]byte, bool), preds []fieldPred,
 	lookups []func(wire.Ad) ([]byte, bool), acc *groupAccum) bool {
 	var buf []byte
+	var comps [maxGroupCols]groupComp
 	for off := 0; off < w.used; {
 		o := uint32(off)
 		if end, ok := w.dmg.skip(o); ok {
@@ -589,7 +590,7 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookups []func(
 						break
 					}
 				}
-				if match && !addGroupFromAd(ad, groupLookups, aggLookups, acc) {
+				if match && !addGroupFromAd(ad, groupLookups, aggLookups, acc, &comps) {
 					return false
 				}
 			}
