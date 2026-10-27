@@ -28,6 +28,12 @@ import (
 // while errors.Unwrap reaches the specific I/O error.
 var ErrConnClosed = errors.New("dbrpc: connection closed")
 
+// ErrServerClosed is returned by ServeConn/ServeConnOpts when the Server has been closed:
+// either the connection was handed to a server that was already closing, or a frame
+// arrived on it after Close began. The server takes no new work once Close starts, so the
+// requests it waits for cannot grow while it waits. Not retryable on this Server.
+var ErrServerClosed = errors.New("dbrpc: server closed")
+
 // ServerError is a logical error the server returned for a request (wire status
 // stErr): a bad constraint, an unknown table, a malformed op. It is deterministic
 // -- replaying the request fails the same way -- so callers should surface it

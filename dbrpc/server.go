@@ -31,6 +31,33 @@ type Server struct {
 	// munmap segments while a Compact/reindex pass was still reading them (SIGSEGV on restart).
 	bgWG sync.WaitGroup
 
+	// CloseGrace bounds how long Close waits for cancelled requests to unwind before it
+	// gives up on them. Zero means defaultCloseGrace. Set it before serving connections.
+	CloseGrace time.Duration
+
+	// Shutdown barrier for the per-request goroutines ServeConnOpts dispatches. Those
+	// goroutines read the catalog's segments, which the caller munmaps when it closes the
+	// catalog after Close returns, so Close must not return while any of them is still
+	// running. closing is set first, so the set waited on cannot grow while we wait on it;
+	// inflight counts the requests in flight; conns holds the live connections, so a
+	// request blocked writing to a client that stopped reading can be released by closing
+	// its transport. shutMu also guards stopBG.
+	shutMu   sync.Mutex
+	closing  bool
+	conns    map[*serverConn]MsgConn
+	inflight sync.WaitGroup
+
+	// closeOnce makes Close idempotent: a second call must not re-run the stop functions
+	// (they close channels) nor wait a second grace period.
+	closeOnce sync.Once
+	// rootOnce guards the lazily built server context that every served connection derives
+	// its own context from. Cancelling it ends every watch and stops every scan that checks
+	// for cancellation -- the cancellation surface Close needs, since a request goroutine
+	// is otherwise unreachable from the Server.
+	rootOnce sync.Once
+	rootCtx  context.Context
+	rootStop context.CancelFunc
+
 	// maintainOpts is the self-tuning configuration StartMaintenance was given; the on-demand
 	// "analyze" admin action reuses it so a manual optimize matches the scheduled pass.
 	// maintainMu serializes any Maintain pass (scheduled or on-demand) on this server so two
@@ -375,7 +402,7 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 			t.Reset(next)
 		}
 	}()
-	s.stopBG = append(s.stopBG, func() { close(done) })
+	s.addStopBG(func() { close(done) })
 
 	// Standalone compaction pass, decoupled from the retrain-dominated Maintain
 	// pass above. Compaction is cheap and self-limiting (Compact unlinks fully-dead
@@ -411,7 +438,7 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 				ct.Reset(compactEvery) // reset after the pass so a slow pass never overlaps
 			}
 		}()
-		s.stopBG = append(s.stopBG, func() { close(cdone) })
+		s.addStopBG(func() { close(cdone) })
 	}
 }
 
@@ -438,12 +465,109 @@ func (s *Server) tableOr(reqID uint64, o op, name string, write func([]byte)) (*
 	return nil, false
 }
 
-// Close stops the server's managed goroutines. It does not close the DB.
-func (s *Server) Close() {
-	for _, stop := range s.stopBG {
+// defaultCloseGrace bounds, by default, how long Close waits for cancelled in-flight
+// requests before giving up on them. Long enough for a scan to notice cancellation and
+// for a client that is still reading to drain a stream's last frames; short enough that a
+// shutdown is not visibly stalled by one wedged peer.
+const defaultCloseGrace = 5 * time.Second
+
+// root returns the server context every served connection derives from, building it on
+// first use so a Server made by either constructor (or, in tests, by a struct literal)
+// has one.
+func (s *Server) root() context.Context {
+	s.rootOnce.Do(func() { s.rootCtx, s.rootStop = context.WithCancel(context.Background()) })
+	return s.rootCtx
+}
+
+// addStopBG registers a background loop's stop function for Close to call.
+func (s *Server) addStopBG(stop func()) {
+	s.shutMu.Lock()
+	s.stopBG = append(s.stopBG, stop)
+	s.shutMu.Unlock()
+}
+
+// beginRequest admits one request to the shutdown barrier, reporting false once Close has
+// started: after that the server takes no new work, so the set of in-flight requests Close
+// waits on cannot grow while it waits.
+func (s *Server) beginRequest() bool {
+	s.shutMu.Lock()
+	defer s.shutMu.Unlock()
+	if s.closing {
+		return false
+	}
+	s.inflight.Add(1)
+	return true
+}
+
+func (s *Server) endRequest() { s.inflight.Done() }
+
+// addConn registers a connection being served, so Close can close its transport as a
+// backstop. It reports false once Close has started, so a connection handed to the server
+// after that is refused rather than served by a stopped server.
+func (s *Server) addConn(sc *serverConn, conn MsgConn) bool {
+	s.shutMu.Lock()
+	defer s.shutMu.Unlock()
+	if s.closing {
+		return false
+	}
+	if s.conns == nil {
+		s.conns = make(map[*serverConn]MsgConn)
+	}
+	s.conns[sc] = conn
+	return true
+}
+
+func (s *Server) removeConn(sc *serverConn) {
+	s.shutMu.Lock()
+	delete(s.conns, sc)
+	s.shutMu.Unlock()
+}
+
+// waitFor waits for wg, reporting false if d elapses first.
+func waitFor(wg *sync.WaitGroup, d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+// Close stops the server's managed goroutines and the requests it is serving. It does not
+// close the DB; the caller does that afterwards, which is why Close must leave nothing
+// running that still reads the catalog.
+//
+// It takes no new work, stops and waits for background maintenance, cancels every served
+// connection (ending its watches and stopping its scans) and then waits up to CloseGrace
+// for the in-flight requests to unwind. It closes the connections' transports, which both
+// tells the peers the server is gone and releases a request blocked writing to a client
+// that stopped reading -- the one case cancellation cannot reach, since no context reaches
+// a blocked WriteMsg. A request still running when the budget runs out is abandoned: Close
+// returns anyway rather than hang, so closing the catalog can still race it.
+//
+// Close is idempotent. A request that completes on its own is unaffected.
+func (s *Server) Close() { s.closeOnce.Do(s.close) }
+
+func (s *Server) close() {
+	// Take no new work first: a request admitted after this point would be one more thing
+	// to wait for, arriving while we wait.
+	s.shutMu.Lock()
+	s.closing = true
+	stops := s.stopBG
+	s.stopBG = nil
+	conns := make([]MsgConn, 0, len(s.conns))
+	for _, c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.shutMu.Unlock()
+
+	for _, stop := range stops {
 		stop()
 	}
-	s.stopBG = nil
 	// Closing the channels above only stops a loop BETWEEN passes. A pass already running
 	// keeps going, and a bounded-but-not-short one (the columnar rewrite budget is 64
 	// segments) then holds the wait below for tens of seconds on an archive at history
@@ -463,6 +587,28 @@ func (s *Server) Close() {
 	// unit of work is in flight -- before returning, so the caller can safely close the
 	// catalog (munmap segments) without racing a Compact/Maintain still reading them.
 	s.bgWG.Wait()
+
+	// The same hazard, from the other side: every request runs on its own goroutine, and a
+	// watch streams until it is cancelled. Cancel the served connections, then wait for
+	// their requests to unwind.
+	s.root()
+	s.rootStop()
+	grace := s.CloseGrace
+	if grace <= 0 {
+		grace = defaultCloseGrace
+	}
+	drained := waitFor(&s.inflight, grace/2)
+	// Close the transports either way: the server has stopped serving them, so a peer
+	// should see the connection drop rather than wait for an answer that will never come,
+	// and the one kind of request cancellation cannot reach -- one blocked writing to a
+	// client that stopped reading, where no context reaches a blocked WriteMsg -- is
+	// released only by failing its transport. This also ends the connections' read loops.
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	if !drained {
+		waitFor(&s.inflight, grace-grace/2) // and if it STILL has not unwound, abandon it
+	}
 }
 
 // ServeConn runs the request loop on one connection until it errors or the peer
@@ -477,9 +623,15 @@ func (s *Server) ServeConn(conn MsgConn) error {
 // private-stripping view of the same DB. Use it to serve a privilege-scoped
 // peer (e.g. an HTCondor READ-level client) from the same Server.
 func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
-	ctx, cancel := context.WithCancel(context.Background())
+	// Derived from the server context, not from Background: Close cancels that one, which
+	// is how it reaches this connection's watches and scans.
+	ctx, cancel := context.WithCancel(s.root())
 	defer cancel() // stop this connection's watches when it closes
 	sc := &serverConn{s: s, ctx: ctx, opts: opts, watches: make(map[uint64]context.CancelFunc), txns: make(map[uint64]struct{})}
+	if !s.addConn(sc, conn) {
+		return ErrServerClosed
+	}
+	defer s.removeConn(sc)
 	sc.qlog = s.queryLogger(opts)
 	// Abort any transactions still open when the connection ends, so a client that
 	// drops mid-transaction (a transient reset, a crash, a cancelled context) does
@@ -497,13 +649,23 @@ func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 			sc.abortRestore()
 			return err
 		}
+		// Every request, inline or dispatched, joins the shutdown barrier before it starts
+		// touching the catalog; once Close has begun, the frame is not served at all.
+		if !s.beginRequest() {
+			sc.abortRestore()
+			return ErrServerClosed
+		}
 		// Restore-upload frames are handled inline (synchronously) so their chunks are
 		// spooled in receive order; every other op dispatches concurrently.
 		if reqID, o, body, ok := reqHeader(frame); ok && isRestoreOp(o) {
 			sc.handleRestore(reqID, o, body)
+			s.endRequest()
 			continue
 		}
-		go sc.dispatch(frame)
+		go func() {
+			defer s.endRequest()
+			sc.dispatch(frame)
+		}()
 	}
 }
 
@@ -1729,7 +1891,11 @@ func (s *Server) reapIdleTxns(maxIdle time.Duration) int {
 // connections starts this.
 func (s *Server) StartTxnReaper(interval, maxIdle time.Duration) (stop func()) {
 	done := make(chan struct{})
+	// Tracked like the other managed loops: aborting a transaction touches the store, so
+	// Close must stop this loop and wait for the pass in flight.
+	s.bgWG.Add(1)
 	go func() {
+		defer s.bgWG.Done()
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -1742,7 +1908,9 @@ func (s *Server) StartTxnReaper(interval, maxIdle time.Duration) (stop func()) {
 		}
 	}()
 	var once sync.Once
-	return func() { once.Do(func() { close(done) }) }
+	stop = func() { once.Do(func() { close(done) }) }
+	s.addStopBG(stop)
+	return stop
 }
 
 // record appends a write op to the transaction's batch when the server routes commits
