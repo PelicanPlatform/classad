@@ -77,7 +77,11 @@ func (s *Server) reapIdemMarkers(maxAge time.Duration) int {
 // never see CommitIdempotent need not start it (there is nothing to reap).
 func (s *Server) StartIdemReaper(interval, maxAge time.Duration) (stop func()) {
 	done := make(chan struct{})
+	// Tracked like the other managed loops: a reap pass writes to the store, so Close must
+	// stop it and wait for the pass in flight before the caller closes the catalog.
+	s.bgWG.Add(1)
 	go func() {
+		defer s.bgWG.Done()
 		t := time.NewTicker(interval)
 		defer t.Stop()
 		for {
@@ -90,5 +94,7 @@ func (s *Server) StartIdemReaper(interval, maxAge time.Duration) (stop func()) {
 		}
 	}()
 	var once sync.Once
-	return func() { once.Do(func() { close(done) }) }
+	stop = func() { once.Do(func() { close(done) }) }
+	s.addStopBG(stop)
+	return stop
 }
