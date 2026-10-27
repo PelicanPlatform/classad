@@ -904,7 +904,7 @@ func (db *DB) Query(constraint string) (iter.Seq[*classad.ClassAd], error) {
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.Query(q), nil
+	return gated(db, db.c.Query(q)), nil
 }
 
 // QueryRedacted is Query for a caller NOT entitled to sealed values: the ads are decoded with no key, so
@@ -917,7 +917,7 @@ func (db *DB) QueryRedacted(constraint string) (iter.Seq[*classad.ClassAd], erro
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryRedacted(q), nil
+	return gated(db, db.c.QueryRedacted(q)), nil
 }
 
 // LookupClassAdRedacted is LookupClassAd for a caller not entitled to sealed values; see QueryRedacted.
@@ -937,7 +937,8 @@ func (db *DB) QueryAsOf(constraint string, t time.Time) (iter.Seq[*classad.Class
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryAsOf(q, t)
+	seq, err := db.c.QueryAsOf(q, t)
+	return gatedErr(db, seq, err)
 }
 
 // SetTimeTravel enables (with a positive maxDistance), retunes, or disables (maxDistance
@@ -978,13 +979,13 @@ func (db *DB) QueryProjectStats(constraint string, attrs []string, stats *collec
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	return db.c.QueryProjectStats(q, attrs, stats), nil
+	return gated(db, db.c.QueryProjectStats(q, attrs, stats)), nil
 }
 
 // Match returns the ads that symmetrically match job (bilateral Requirements), pushed
 // down to the store. For the negotiator's pick-best pattern, prefer MatchSorted.
 func (db *DB) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {
-	return db.c.Match(job)
+	return gated(db, db.c.Match(job))
 }
 
 // RecordDemand notes the attributes constraint filters on (for index suggestions)
@@ -1056,12 +1057,12 @@ func (c *Constraint) Matches(ad *classad.ClassAd) bool { return c.q.Matches(ad) 
 // run (e.g. an Owner); it is ignored for an index with no Partition. A zero resume
 // starts at the beginning. The snapshot is O(1) and stable under concurrent churn.
 func (db *DB) Ordered(index int, partition string, resume OrderCursor) iter.Seq[OrderedAd] {
-	return db.c.Ordered(index, classad.NewStringValue(partition), resume)
+	return gated(db, db.c.Ordered(index, classad.NewStringValue(partition), resume))
 }
 
 // OrderedRedacted is Ordered for a caller NOT entitled to sealed values; see QueryRedacted.
 func (db *DB) OrderedRedacted(index int, partition string, resume OrderCursor) iter.Seq[OrderedAd] {
-	return db.c.OrderedRedacted(index, classad.NewStringValue(partition), resume)
+	return gated(db, db.c.OrderedRedacted(index, classad.NewStringValue(partition), resume))
 }
 
 // ConflictError reports the keys whose writes lost an optimistic write-write race at

@@ -1269,52 +1269,85 @@ func (c *Collection) rebuildAppendLog(sh *shard) {
 // Close flushes all committed data to disk and unmaps the collection's segment
 // files. It is a no-op for an in-memory collection. The collection must not be used
 // after Close.
+//
+// It does not wait for readers and does not defer: the write-out is what the returned error
+// reports on, so it happens before Close returns. A reader in flight keeps the segments it
+// has pinned (their unmap is deferred to its last unpin) and finds the rest of the
+// collection empty, which is a short answer rather than a fault. A second Close does
+// nothing.
 func (c *Collection) Close() error {
+	if !c.gate.closeNow() {
+		return nil
+	}
+	return c.teardown(false)
+}
+
+// Discard is Close for a collection whose files are being DELETED (a dropped table): it
+// releases the mappings without flushing anything, writing a directory snapshot, sealing
+// sidecar indexes or vouching for the watch epoch.
+//
+// Skipping that work is not only an optimization. The caller removes the directory right
+// after, and the teardown may be deferred behind a reader for an unbounded time, by which
+// point a table of the same name may have recreated the very paths a late dir-snapshot
+// write would land on. Writing nothing is what makes deferring safe.
+func (c *Collection) Discard() error {
+	if c.gate.beginClose(func() { _ = c.teardown(true) }) {
+		return nil
+	}
+	return c.teardown(true)
+}
+
+// teardown unmaps the collection's segments and empties its shards. discard skips every
+// persistence step (see Discard). It runs at most once per collection, either from
+// Close/Discard directly or, for a deferred Discard, from the last reader on its way out.
+func (c *Collection) teardown(discard bool) error {
 	var firstErr error
 	// watchSeqs is each shard's commitSeq for the watch-epoch marker; watchClean is cleared by
 	// anything that leaves doubt about what reached disk (see watchepoch.go).
 	watchSeqs := make([]uint64, len(c.shards))
-	watchClean := c.watchEpochDir != ""
+	watchClean := !discard && c.watchEpochDir != ""
 	for i, sh := range c.shards {
 		sh.mu.Lock()
 		watchSeqs[i] = sh.commitSeq
 		if sh.writeErr != nil || sh.syncErr.Load() != nil {
 			watchClean = false
 		}
-		// Flush every segment durable BEFORE writing the directory snapshot, so the
-		// snapshot never references bytes not yet on disk.
-		for _, seg := range sh.segs {
-			if seg != nil {
-				if err := seg.flush(); err != nil && firstErr == nil {
-					firstErr = err
-				}
-			}
-		}
-		// Ensure each sealed (non-active) segment has its sidecar container on disk so a
-		// reopen can map it -- the key index (phase 1 of the pageable primary index) plus
-		// any in-RAM attribute index. sealSegmentIndex is a no-op for a segment already
-		// sealed (by the Reindex pass during operation). Best effort; data is still mapped.
-		if c.dir != "" {
+		if !discard {
+			// Flush every segment durable BEFORE writing the directory snapshot, so the
+			// snapshot never references bytes not yet on disk.
 			for _, seg := range sh.segs {
-				if seg != nil && seg != sh.act {
-					c.sealSegmentIndex(seg, seg.idx.Load())
+				if seg != nil {
+					if err := seg.flush(); err != nil && firstErr == nil {
+						firstErr = err
+					}
 				}
 			}
-		}
-		// Delete stamps a sync pass deferred (see horizon.go) must be on disk before the
-		// snapshot: its reopen reads no delete markers.
-		if err := msyncSups(sh.dirtySup); err != nil && isDurabilityFailure(err) && firstErr == nil {
-			firstErr = err
+			// Ensure each sealed (non-active) segment has its sidecar container on disk so a
+			// reopen can map it -- the key index (phase 1 of the pageable primary index) plus
+			// any in-RAM attribute index. sealSegmentIndex is a no-op for a segment already
+			// sealed (by the Reindex pass during operation). Best effort; data is still mapped.
+			if c.dir != "" {
+				for _, seg := range sh.segs {
+					if seg != nil && seg != sh.act {
+						c.sealSegmentIndex(seg, seg.idx.Load())
+					}
+				}
+			}
+			// Delete stamps a sync pass deferred (see horizon.go) must be on disk before the
+			// snapshot: its reopen reads no delete markers.
+			if err := msyncSups(sh.dirtySup); err != nil && isDurabilityFailure(err) && firstErr == nil {
+				firstErr = err
+			}
+			// Persist the directory for a scan-free reopen (best effort; skipped for a
+			// chained collection -- see tryLoadDirSnapshot). Only for a persistent store.
+			// Not when a walk lost a segment's framing: restoring the snapshot would skip the record walk
+			// that finds and records that damage, and every later scan would come back short again.
+			if c.dir != "" && sh.childParentHash == nil && !shardFramingLost(sh) {
+				shardDir := filepath.Join(c.dir, fmt.Sprintf("%d", i))
+				writeDirSnapshot(sh, shardDir, c.h)
+			}
 		}
 		sh.dirtySup = nil
-		// Persist the directory for a scan-free reopen (best effort; skipped for a
-		// chained collection -- see tryLoadDirSnapshot). Only for a persistent store.
-		// Not when a walk lost a segment's framing: restoring the snapshot would skip the record walk
-		// that finds and records that damage, and every later scan would come back short again.
-		if c.dir != "" && sh.childParentHash == nil && !shardFramingLost(sh) {
-			shardDir := filepath.Join(c.dir, fmt.Sprintf("%d", i))
-			writeDirSnapshot(sh, shardDir, c.h)
-		}
 		for _, seg := range sh.segs {
 			if seg == nil {
 				continue
@@ -1329,6 +1362,18 @@ func (c *Collection) Close() error {
 				firstErr = err
 			}
 		}
+		// Empty the shard under its own lock, the way a failed Open does
+		// (releaseLoadedSegments). Unmapping alone leaves every segment still reachable
+		// from sh.segs and every key still resolving through sh.dir to one, so a read that
+		// arrives after the close -- a point lookup, a scan that started on an earlier
+		// shard -- walks straight into the released mapping and takes the process down with
+		// a runtime fault. With nothing left to find, such a read answers empty instead.
+		// Segments a scan pinned stay alive through their windows until it unpins them.
+		sh.dir = nil
+		sh.segs = nil
+		sh.act = nil
+		sh.pendingSeal = nil
+		sh.count = 0
 		sh.mu.Unlock()
 	}
 	// Only now, with every segment flushed, may the epoch be vouched for across a restart.

@@ -593,6 +593,25 @@ func (v *View) stop() {
 	})
 }
 
+// discard is stop for a view whose files are about to be removed: the backing store
+// releases its mappings without flushing or persisting, and a reader still inside it keeps
+// them alive until it leaves (see DB.dropClose). Writing nothing is what makes it safe for
+// that teardown to land after the directory has gone, or after a view of the same name has
+// recreated it.
+func (v *View) discard() {
+	v.stopOnce.Do(func() {
+		if v.cancel != nil {
+			v.cancel()
+		}
+		if v.backing != nil {
+			_ = v.backing.dropClose()
+		}
+		if v.archive != nil {
+			_ = v.archive.dropClose()
+		}
+	})
+}
+
 // renderLabel converts an evaluated ClassAd value to a label string. Undefined/error render
 // empty so an absent attribute groups as "".
 func renderLabel(v classad.Value) string {
@@ -704,7 +723,7 @@ func (cat *Catalog) DropView(name string) error {
 		return fmt.Errorf("catalog: no such view %q", name)
 	}
 	delete(cat.views, name)
-	v.stop()
+	v.discard()
 	if cat.dir != "" {
 		if err := os.RemoveAll(filepath.Join(cat.dir, viewsSubdir, name)); err != nil {
 			return fmt.Errorf("catalog: removing view %q: %w", name, err)

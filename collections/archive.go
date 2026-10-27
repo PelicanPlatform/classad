@@ -831,3 +831,15 @@ func (a *Archive) GroupSchemaChanges() []GroupSchemaChange { return a.c.GroupSch
 func (a *Archive) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool) {
 	return a.c.GroupSchemaLastAgreement()
 }
+
+// Discard is Close for an archive whose files are being DELETED (a dropped archive table):
+// it releases the mappings without flushing or persisting anything. See
+// Collection.Discard.
+func (a *Archive) Discard() error { return a.c.Discard() }
+
+// AcquireRead registers the caller as an in-flight reader of the archive; see
+// Collection.AcquireRead. Balance a true answer with ReleaseRead.
+func (a *Archive) AcquireRead() bool { return a.c.AcquireRead() }
+
+// ReleaseRead balances an AcquireRead that returned true.
+func (a *Archive) ReleaseRead() { a.c.ReleaseRead() }
