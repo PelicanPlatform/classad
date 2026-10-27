@@ -80,7 +80,7 @@ func archiveRefusal(o op) string {
 		return "Query is not served from an archive; use ArchiveQuery, which answers newest-first with the limit pushed down"
 	case opQueryRaw:
 		return "QueryRaw is not served from an archive; use QueryRawProject, which does read one"
-	case opQueryRawWire:
+	case opQueryRawWire, opQueryRawWireOpts:
 		return "QueryRawWire is not served from an archive; use QueryRawProject, which does read one"
 	case opQueryKeys:
 		return "an archive has no key directory, so its rows have no storage keys to return"

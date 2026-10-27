@@ -756,6 +756,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamTopKStats(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opQueryRawWire:
 		sc.s.streamQueryRawWire(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+	case opQueryRawWireOpts:
+		sc.s.streamQueryRawWireOpts(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchSorted:
 		sc.s.streamMatchSorted(sc.ctx, reqID, body, priv, sc.write)
 	case opOrdered:

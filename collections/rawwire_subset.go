@@ -94,9 +94,9 @@ func (sel *wireSubsetSelector) neededCount() int {
 
 func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelector) scanEmit {
 	var scratch []byte
-	var sc wire.SubsetScratch
 	needed := sel.neededCount()
 	var narrow wireNarrower
+	asm := c.newWireRowAssembler(sel)
 	return func(w []byte, dict *segDictHandle) bool {
 		// Narrow in ID SPACE first, so the conversion below only converts what the caller asked
 		// for (see narrowProjected).
@@ -106,8 +106,7 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 		// converts nothing, so for that case the assembler's key is the ONLY thing standing
 		// between a redacted read and a sealed value.
 		w = c.wireToInlineRead(dict, w, sel.redact)
-		out, ok := wire.AppendAdSubsetInlineHotFirst(scratch[:0], wire.Ad(w), sel.keep, needed,
-			c.renderKey(sel.redact), &sc)
+		out, ok := asm.appendRow(scratch[:0], wire.Ad(w), needed, c.renderKey(sel.redact))
 		scratch = out
 		if !ok {
 			return true // not an inline ad / malformed: skip, keep scanning
@@ -126,12 +125,21 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 type wireSubsetSelector struct {
 	wantAll bool
 	redact  bool
-	names   []string
-	hashes  []uint32
+	// chaseRefs closes the selection under the emitted expressions' own attribute
+	// references, per record (see rawwire_refs.go). It changes what every path below
+	// assembles and narrows, which is why it lives on the selector all of them already
+	// carry rather than being threaded separately through each.
+	chaseRefs bool
+	names     []string
+	hashes    []uint32
 }
 
 func (c *Collection) newWireSubsetSelector(projection []string, redact bool) *wireSubsetSelector {
-	sel := &wireSubsetSelector{wantAll: len(projection) == 0, redact: redact}
+	return c.newWireSubsetSelectorRefs(projection, redact, false)
+}
+
+func (c *Collection) newWireSubsetSelectorRefs(projection []string, redact, chaseRefs bool) *wireSubsetSelector {
+	sel := &wireSubsetSelector{wantAll: len(projection) == 0, redact: redact, chaseRefs: chaseRefs}
 	seen := make(map[string]struct{}, len(projection))
 	for _, name := range projection {
 		fold := strings.ToLower(name)
@@ -153,7 +161,13 @@ func (c *Collection) newWireSubsetSelector(projection []string, redact bool) *wi
 	return sel
 }
 
-func (sel *wireSubsetSelector) keep(name, _ []byte) bool {
+func (sel *wireSubsetSelector) keep(name, node []byte) bool {
+	return sel.keepHashed(name, wire.NameHash32Bytes(name), node)
+}
+
+// keepHashed is keep for a caller that has already hashed the name -- the reference closure,
+// which hashes each name once per record and then tests it on every pass.
+func (sel *wireSubsetSelector) keepHashed(name []byte, h uint32, _ []byte) bool {
 	// The type fields always ship so the row stays typed (never private).
 	if wire.FoldEqualBytes(name, "MyType") || wire.FoldEqualBytes(name, "TargetType") {
 		return true
@@ -161,7 +175,13 @@ func (sel *wireSubsetSelector) keep(name, _ []byte) bool {
 	if sel.wantAll {
 		return !(sel.redact && isPrivateNameBytes(name))
 	}
-	h := wire.NameHash32Bytes(name)
+	return sel.inProjection(name, h)
+}
+
+// inProjection reports whether name is one of the projected attributes: the same
+// hash-first match keep makes, factored out so the reference closure can ask it directly
+// (a reference to an attribute the caller already projected is not a closure addition).
+func (sel *wireSubsetSelector) inProjection(name []byte, h uint32) bool {
 	for i, wh := range sel.hashes {
 		if wh == h && wire.FoldEqualBytes(name, sel.names[i]) {
 			return true

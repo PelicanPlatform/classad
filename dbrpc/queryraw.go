@@ -481,9 +481,51 @@ var ErrRawWireUnsupported = errors.New("dbrpc: wire-form rows unavailable for th
 // the text row stream. An empty stream means the query matched nothing; it never
 // means the table could not answer.
 func (c *Client) QueryRawWireStream(ctx context.Context, table, constraint string, attrs []string, limit int, redact bool, yield func(row []byte) bool) error {
+	return c.queryRawWireStream(ctx, opQueryRawWire, 0, table, constraint, attrs, limit, redact, yield)
+}
+
+// ErrRawWireRefsUnsupported reports that the REFERENCE-CHASING wire-row stream is not
+// available for this request. Two causes, one response, exactly as with ErrRawWireUnsupported
+// (which it wraps, so a caller matching only the general case still matches): a server too old
+// to know the opcode, and a table that cannot produce self-contained rows.
+//
+// It wraps rather than replaces because the two have different best fallbacks. A caller that
+// wanted the closure can retry the PLAIN wire stream for the whole ad and compute the closure
+// itself -- which works against a server that has opQueryRawWire but not this one, and is what
+// the mirror did before this op existed. That retry will itself return
+// ErrRawWireUnsupported for a table that serves no wire rows at all, at which point the text
+// stream is the only answer left.
+//
+// Like ErrRawWireUnsupported it is always delivered BEFORE the first row.
+var ErrRawWireRefsUnsupported = fmt.Errorf("%w: reference-chasing wire rows", ErrRawWireUnsupported)
+
+// QueryRawWireRefsStream is QueryRawWireStream whose projection also carries the attributes
+// the projected expressions reference, transitively, so each row EVALUATES self-contained --
+// the wire-row form of QueryRawProjectRefsStream, returning the same attributes it does.
+//
+// Use it whenever the rows will be evaluated rather than relayed verbatim. The closure is
+// computed at the store, per record, which is the only place it can be: whether a projected
+// attribute holds an expression is a property of the stored ad, so a client cannot decide it
+// for the query and cannot discover it from rows it has already been sent.
+//
+// An empty attrs is a whole-ad request, which has no closure to compute and behaves exactly
+// like QueryRawWireStream. Against a server without the opcode it returns
+// ErrRawWireRefsUnsupported before any row; see there for the fallback.
+func (c *Client) QueryRawWireRefsStream(ctx context.Context, table, constraint string, attrs []string, limit int, redact bool, yield func(row []byte) bool) error {
+	err := c.queryRawWireStream(ctx, opQueryRawWireOpts, wireFlagRefs, table, constraint, attrs, limit, redact, yield)
+	if errors.Is(err, ErrRawWireUnsupported) {
+		return ErrRawWireRefsUnsupported
+	}
+	return err
+}
+
+func (c *Client) queryRawWireStream(ctx context.Context, o op, flags uint32, table, constraint string, attrs []string, limit int, redact bool, yield func(row []byte) bool) error {
 	build := func(id uint64) []byte {
-		b := putStr(req(id, opQueryRawWire), table)
+		b := putStr(req(id, o), table)
 		b = putI32(b, int32(limit))
+		if o == opQueryRawWireOpts {
+			b = putI32(b, int32(flags))
+		}
 		r := byte(0)
 		if redact {
 			r = 1
@@ -544,9 +586,36 @@ func (c *Client) QueryRawWireStream(ctx context.Context, table, constraint strin
 // bytes (a single over-budget row still gets its own frame -- exactly the old
 // one-frame-per-ad behavior, so a jumbo ad is never unshippable).
 func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamQueryRawWireOpt(ctx, reqID, r, includePrivate, write, qlog, false)
+}
+
+// streamQueryRawWireOpts serves opQueryRawWireOpts: streamQueryRawWire with a flags word.
+// Unknown bits are refused before any row (see wireFlagsKnown), which is what lets options
+// be added here instead of as new opcodes.
+func (s *Server) streamQueryRawWireOpts(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamQueryRawWireOpt(ctx, reqID, r, includePrivate, write, qlog, true)
+}
+
+// streamQueryRawWireOpt is the shared body of the two wire-row ops. withFlags says whether
+// the frame carries the flags word, which only opQueryRawWireOpts does -- opQueryRawWire's
+// frame is frozen.
+func (s *Server) streamQueryRawWireOpt(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog), withFlags bool) {
 	start := time.Now()
 	table := r.str()
 	limit := int(r.i32())
+	var flags uint32
+	if withFlags {
+		flags = uint32(r.i32())
+	}
+	if flags&^wireFlagsKnown != 0 {
+		// stBadReq, the same refusal an unknown OPCODE gets, so a newer client falls back
+		// down the path it already has. Refusing beats serving the request without the
+		// option asked for: a row stream that silently lacks the closure is the failure
+		// this guards against.
+		write(respBad(reqID))
+		return
+	}
+	chaseRefs := flags&wireFlagRefs != 0
 	redact := r.u8() != 0 || !includePrivate
 	constraint := r.str()
 	nattrs := int(r.i32())
@@ -565,7 +634,7 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 	}
 	if qlog != nil {
 		defer func() {
-			q := QueryLog{Op: "QueryRawWire", Table: table, Constraint: constraint, Limit: limit,
+			q := QueryLog{Op: wireOpName(chaseRefs), Table: table, Constraint: constraint, Limit: limit,
 				Rows: n, Projection: len(attrs), Duration: time.Since(start)}
 			if stats != nil {
 				q.Scan = *stats
@@ -580,15 +649,18 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	d, ok := s.tableOr(reqID, opQueryRawWire, table, write)
+	d, ok := s.tableOr(reqID, wireOp(chaseRefs), table, write)
 	if !ok {
 		return
 	}
 	var seq iter.Seq[[]byte]
 	var err error
-	if stats != nil {
+	switch {
+	case chaseRefs:
+		seq, err = d.QueryRawWireRefsStats(constraint, attrs, redact, stats)
+	case stats != nil:
 		seq, err = d.QueryRawWireStats(constraint, attrs, redact, stats)
-	} else {
+	default:
 		seq, err = d.QueryRawWire(constraint, attrs, redact)
 	}
 	if errors.Is(err, db.ErrRawWireUnsupported) {
@@ -643,6 +715,22 @@ func (s *Server) streamQueryRawWire(ctx context.Context, reqID uint64, r *reader
 	}
 	flush()
 	write(respHead(reqID, stStreamEnd))
+}
+
+// wireOp and wireOpName name the wire-row contract a request arrived under, so the archive
+// refusal and the query log both say which one the caller asked for.
+func wireOp(chaseRefs bool) op {
+	if chaseRefs {
+		return opQueryRawWireOpts
+	}
+	return opQueryRawWire
+}
+
+func wireOpName(chaseRefs bool) string {
+	if chaseRefs {
+		return "QueryRawWireRefs"
+	}
+	return "QueryRawWire"
 }
 
 // projectOpName labels a projection query in the query log by which contract it ran under.

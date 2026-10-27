@@ -244,6 +244,28 @@ const (
 	// cleanly and the client falls back to opArchiveAggregate (rows, no breakdown).
 	opArchiveAggregateStats op = 65
 
+	// opQueryRawWireOpts is opQueryRawWire carrying a FLAGS word, so the wire-row family
+	// stops spending an opcode per request option. Its frame is opQueryRawWire's with
+	// [flags u32] inserted after the limit:
+	// [table][limit i32][flags u32][redact u8][constraint][nattrs i32]{[attr]}
+	//
+	// Flags rather than more opcodes because the options are orthogonal and the opcode
+	// space was multiplying through them: the text family already spends four opcodes on
+	// the product of {refs} x {stats} x {cursor}, and sparsely -- RefsStats exists, plain
+	// ProjStats does not. The two options the wire family is still missing (a stats
+	// trailer, cursor pagination) become bits here instead of opcodes 68 and 69.
+	//
+	// The safety that a separate opcode buys is kept, because it never came from the
+	// opcode: it came from the server REFUSING what it does not understand. A server that
+	// rejects an unknown BIT with stBadReq, before any row, is exactly as safe as one
+	// rejecting an unknown opcode -- see wireFlagsKnown, which is the whole contract. A
+	// flag the server quietly ignored would be the dangerous shape, serving rows that
+	// silently lack the closure.
+	//
+	// opQueryRawWire (52) stays as it is, frame unchanged: it is deployed, and an old
+	// client must keep reaching it.
+	opQueryRawWireOpts op = 67
+
 	// opQueryStats returns the server's aggregated query report (see QueryStatsReport):
 	// every served query bucketed by its SHAPE -- opcode, table, constraint fingerprint
 	// and whether a LIMIT was sent -- ranked by total time, each bucket carrying the
@@ -405,6 +427,10 @@ func (o op) String() string {
 		return "TxnQueryKeys"
 	case opQueryRawProjRefs:
 		return "QueryRawProjectRefs"
+	case opQueryRawWire:
+		return "QueryRawWire"
+	case opQueryRawWireOpts:
+		return "QueryRawWireOpts"
 	}
 	return "op(unknown)"
 }
@@ -547,3 +573,16 @@ func respHeader(frame []byte) (reqID uint64, status int32, body *reader, ok bool
 	}
 	return reqID, status, r, true
 }
+
+// Wire-row request flags, carried by opQueryRawWireOpts.
+const (
+	// wireFlagRefs closes the projection under the projected expressions' own attribute
+	// references, per record, so each row evaluates self-contained at the consumer.
+	wireFlagRefs uint32 = 1 << 0
+
+	// wireFlagsKnown is every bit this server implements. A request carrying anything else
+	// is refused with stBadReq before a single row, which is what makes a flag as safe to
+	// add as an opcode: a newer client asking for something this server cannot do finds out
+	// immediately instead of receiving rows that silently lack it.
+	wireFlagsKnown = wireFlagRefs
+)

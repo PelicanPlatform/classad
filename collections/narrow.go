@@ -24,6 +24,15 @@ import "github.com/PelicanPlatform/classad/collections/wire"
 type narrowScratch struct {
 	entries []byte
 	out     []byte
+	// The reference-chasing narrowing (narrowAdRefs) needs the record's entries in hand
+	// across several passes, since a referenced attribute may sit earlier in the ad than
+	// the expression that named it. Held here with everything else a narrowing pass
+	// reuses, for the same reason: per-record allocation is what this is avoiding.
+	ids    []uint32
+	nodes  [][]byte
+	keep   []bool
+	refs   []uint32
+	refIDs []uint32
 }
 
 // narrowAd rebuilds w keeping only the attributes keep accepts, preserving the header (which carries
@@ -123,6 +132,16 @@ func (c *Collection) narrowProjected(nw *wireNarrower, sel *wireSubsetSelector, 
 		return w
 	}
 	want := nw.localWanted(sel, dict)
+	if sel.chaseRefs {
+		// The plain narrowing below would drop exactly the attributes the closure exists to
+		// recover, so the chasing read narrows to the projection CLOSED under the kept
+		// nodes' references, in the record's own id space (see narrowAdRefs).
+		out, ok := narrowAdRefs(&nw.scratch, w, want)
+		if !ok {
+			return w
+		}
+		return out
+	}
 	out, ok := narrowAd(&nw.scratch, w, func(id uint32, name string) bool {
 		if name != "" {
 			return true // inline entry in an interned record: keep, the real test is sel.keep below

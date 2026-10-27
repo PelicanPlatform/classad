@@ -200,6 +200,37 @@ func (db *DB) QueryRawWireStats(constraint string, projection []string, redact b
 	return gated(db, db.c.QueryRawWireStats(q, projection, redact, stats)), nil
 }
 
+// QueryRawWireRefs is QueryRawWire whose projection also carries the attributes the
+// projected expressions reference, transitively, so each yielded ROW evaluates
+// self-contained -- the wire-row twin of QueryRawProjectedRefs, and it returns the same
+// attribute set that call does for the same projection.
+//
+// Which of the two a caller wants is decided the same way: QueryRawWire reproduces
+// HTCondor's projection protocol (exactly the requested attributes), and this one serves a
+// consumer that will EVALUATE what it receives, for which the references are not optional.
+// The closure is computed per record, inside the scan, because whether a projected attribute
+// holds an expression is a property of the stored ad rather than of the query.
+func (db *DB) QueryRawWireRefs(constraint string, projection []string, redact bool) (iter.Seq[[]byte], error) {
+	return db.QueryRawWireRefsStats(constraint, projection, redact, nil)
+}
+
+// QueryRawWireRefsStats is QueryRawWireRefs that also fills stats (may be nil) with the
+// per-scan work breakdown. An empty/true constraint takes the no-WHERE scan path and leaves
+// stats zero.
+func (db *DB) QueryRawWireRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[[]byte], error) {
+	if !db.c.SupportsRawWire() {
+		return nil, ErrRawWireUnsupported
+	}
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return gated(db, db.c.ScanRawWireRefs(projection, redact)), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return gated(db, db.c.QueryRawWireRefsStats(q, projection, redact, stats)), nil
+}
+
 // SeqCursor and SeqPage re-export the collections types so a caller of the DB
 // API does not have to import the storage layer to paginate.
 type (

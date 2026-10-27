@@ -394,6 +394,12 @@ var mxWant = map[string]map[mxKind]string{
 		kArchive: "err: archive table \"hist\": QueryRawWire is not served from an archive; use QueryRawProject, which does read one",
 		kMissing: "err: no such table: nope",
 	},
+	"QueryRawWireRefs": {
+		kTable:   "stream",
+		kView:    "badreq",
+		kArchive: "err: archive table \"hist\": QueryRawWire is not served from an archive; use QueryRawProject, which does read one",
+		kMissing: "err: no such table: nope",
+	},
 	"QueryStats": {
 		kTable:   "ok",
 		kView:    "ok",
@@ -623,6 +629,16 @@ func mxCases() []mxCase {
 			return func(id uint64) []byte {
 				b := putStr(req(id, opQueryRawWire), n)
 				b = putI32(b, 0)
+				b = putU8(b, 0)
+				b = putStr(b, "true")
+				return projTail(b)
+			}
+		}},
+		{op: "QueryRawWireRefs", build: func(n string) func(uint64) []byte {
+			return func(id uint64) []byte {
+				b := putStr(req(id, opQueryRawWireOpts), n)
+				b = putI32(b, 0)
+				b = putI32(b, int32(wireFlagRefs)) // the opts frame carries its flags word
 				b = putU8(b, 0)
 				b = putStr(b, "true")
 				return projTail(b)
