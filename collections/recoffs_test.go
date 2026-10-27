@@ -26,7 +26,7 @@ func revStore(t *testing.T, segSize int) *Collection {
 // revPut appends one ad carrying its own ordinal, which is what the newest-first assertions read.
 func revPut(t *testing.T, c *Collection, i int) {
 	t.Helper()
-	ad, err := classad.Parse(fmt.Sprintf(`[ Seq=%d; Owner="user%d"; Pad="%s" ]`, i, i%7, "xxxxxxxxxxxxxxxx"))
+	ad, err := classad.Parse(fmt.Sprintf(`[ Seq=%d; Owner="user%d"; Pad="xxxxxxxxxxxxxxxx" ]`, i, i%7))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestReverseScanDuringAppends(t *testing.T) {
 				return
 			default:
 			}
-			ad, err := classad.Parse(fmt.Sprintf(`[ Seq=%d; Owner="user%d"; Pad="%s" ]`, i, i%7, "xxxxxxxxxxxxxxxx"))
+			ad, err := classad.Parse(fmt.Sprintf(`[ Seq=%d; Owner="user%d"; Pad="xxxxxxxxxxxxxxxx" ]`, i, i%7))
 			if err != nil {
 				return
 			}
