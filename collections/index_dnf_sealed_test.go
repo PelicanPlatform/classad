@@ -383,3 +383,106 @@ func TestDNFCandidatesSkipMarkers(t *testing.T) {
 		}
 	}
 }
+
+// TestDNFPlanIgnoresMarkers: a time-checkpoint marker is not a record the planner may count.
+//
+// `attr is undefined` executes as "every record the index covers, minus the ones that posted a
+// value", so the estimate for it is the segment's record count minus its indexable ones. Markers
+// used to be in that record count, which made them look like records missing the attribute: with
+// time travel on, the estimate for `Owner is undefined` grew with the number of checkpoints the
+// clock had written, and once the union's estimated fraction crossed the pushdown gate the
+// planner dropped the index for a query whose selectivity had not changed at all. On a loaded
+// machine, where a commit takes longer than the checkpoint interval, a marker lands before nearly
+// every record -- so whether an OR planned through the index depended on how busy the box was.
+//
+// The interval here is a nanosecond, so every commit crosses it and the marker density is the
+// worst case by construction rather than by timing.
+func TestDNFPlanIgnoresMarkers(t *testing.T) {
+	t.Parallel()
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	opts := Options{Dir: t.TempDir(), Shards: 1, SegmentSize: 1 << 13,
+		ValueAttrs: []string{"ClusterId"}, CategoricalAttrs: []string{"Owner"},
+		TimeTravel: &TimeTravelOptions{MaxDistance: time.Hour, CheckpointInterval: time.Nanosecond}}
+	c, err := Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const n = 300
+	absent := 0
+	for i := 0; i < n; i++ {
+		ad := jobAd(i, nil)
+		if i%11 == 0 {
+			ad.Delete("Owner")
+			absent++
+		} else {
+			ad.InsertAttrString("Owner", fmt.Sprintf("user%d", i%5))
+		}
+		if perr := c.Put([]byte(fmt.Sprintf("k%04d.0", i)), ad); perr != nil {
+			t.Fatal(perr)
+		}
+	}
+	c.Reindex()
+	markers, indexed := 0, 0
+	sh := c.shards[0]
+	_, wins := sh.snapshot()
+	for _, w := range wins {
+		si := w.seg.readIdx()
+		for off := uint32(0); int(off) < w.used; {
+			total := recTotalLen(w.data, off)
+			if total == 0 {
+				break
+			}
+			if recIsMarker(w.data, off) {
+				markers++
+			}
+			off += total
+		}
+		if pix, ok := si.(indexPrimitives); ok {
+			indexed += int(pix.recordCount())
+		}
+	}
+	releaseWindows(wins)
+	if markers < n/2 {
+		t.Fatalf("only %d markers in the segments; the test is not exercising what it claims", markers)
+	}
+	if indexed > n {
+		t.Errorf("the segment indexes cover %d records over %d live ones and %d markers; markers are counted as records", indexed, n, markers)
+	}
+	q, err := vm.Parse(`Owner is undefined || ClusterId == 7`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups, prunable := c.planIndexGroups(q.ProbePlan())
+	if !prunable {
+		t.Fatal("the OR is not planned through the disjunctive index path")
+	}
+	// The absent disjunct must score near the records that really lack Owner, not near the whole
+	// segment: markers outnumber those here, so an estimate that counted them is off by an order
+	// of magnitude and nothing about the query says so.
+	for _, g := range groups {
+		for _, up := range g {
+			if up.op != "absent" {
+				continue
+			}
+			cand, covered := c.estimateCandidates(up)
+			if !covered {
+				t.Fatal("`Owner is undefined` has no candidate estimate; no segment index covers it")
+			}
+			if cand > 2*float64(absent) {
+				t.Errorf("`Owner is undefined` estimated at %.0f candidates; %d records lack Owner and %d markers are in the segments",
+					cand, absent, markers)
+			}
+		}
+	}
+	if frac, est := c.planFrac(groups); !est || frac > maxPushdownFrac {
+		t.Errorf("the union is estimated at %.3f of the collection (estimable=%v); the pushdown gate is %.2f", frac, est, maxPushdownFrac)
+	}
+	if rp := c.planReadQuery(c.newQueryPlan(q, nil, nil)); !rp.disjunctive() {
+		t.Error("`Owner is undefined || ClusterId == 7` is not planned through the union of its disjuncts")
+	}
+	sigsEqual(t, "Query(Owner is undefined || ClusterId == 7)",
+		collectQuery(t, c, `Owner is undefined || ClusterId == 7`), scanMatches(t, c, q))
+}
