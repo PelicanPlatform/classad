@@ -397,11 +397,26 @@ func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segI
 		if total == 0 {
 			break
 		}
+		if recIsMarker(data, o) {
+			// Not an ad: a time checkpoint, a delete marker, the segment's dictionary record or
+			// its columnar payload. It must stay out of `all`, which is the universe the
+			// complement probes subtract from (`absent`, `!=`, `isnt` are all-minus-posted), for
+			// two reasons. It is never a candidate -- the scan drops it again on the way to the
+			// visitor, so posting it only buys work. And `all` is also what the candidate
+			// estimate counts, so a marker counted there reads as "a record that does not carry
+			// the attribute": with time travel on, `attr is undefined` then scored in proportion
+			// to how many checkpoints the clock happened to write, and once the estimate crossed
+			// the pushdown gate the planner gave up the index for a query that is as selective as
+			// ever.
+			walked++
+			off += int(total)
+			continue
+		}
 		si.all.Add(o)
 		if w, err := c.recordWireIn(seg, data, o, buf); err == nil {
 			buf = w
 			si.indexRecord(o, wire.Ad(w), spec, dict)
-		} else if !recIsMarker(data, o) {
+		} else {
 			noteReadSkip(err) // left out of the postings: a query served by them will not find it
 		}
 		walked++
