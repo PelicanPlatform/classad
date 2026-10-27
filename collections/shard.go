@@ -480,6 +480,10 @@ func (sh *shard) writeRecord(seq uint64, next loc, key, ad []byte, codec Codec, 
 			sh.sealSeq.Add(1) // a segment just sealed: signal eager sidecar indexing
 		}
 		if sh.act != nil {
+			// Nothing will be appended to it again, so its record-offset table will not grow
+			// and no newest-first scan will start there: keeping one per sealed segment is
+			// what would make that memory a function of the store (recoffs.go).
+			sh.act.dropRecOffs()
 			// A segment just sealed. With delta records on, that is the moment every open
 			// chain has to be collapsed -- see Collection.collapseSealedChains. The work
 			// cannot happen here (this runs under the shard WRITE lock, inside a commit, and
@@ -903,6 +907,10 @@ type segWindow struct {
 	// under the shard lock with used, so a write that adds such a record is either beyond used or
 	// already reflected.
 	ctFree bool
+	// active reports that this window's segment was the shard's write target when the window
+	// was captured. It is what decides which segment keeps a record-offset table for
+	// newest-first scans (recoffs.go); it shares ctFree's padding, so the window does not grow.
+	active bool
 }
 
 // visible reports whether the record at o is visible at snapshot s0. A damaged record never is: its
@@ -969,7 +977,7 @@ func (sh *shard) buildWindowsLocked(s0 uint64) []segWindow {
 		}
 		seg.pin() // no-op for RAM segments
 		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg, zones: seg.zones, dmg: seg.damaged(),
-			ctFree: shardFree && seg.ctProven(seg.used)})
+			ctFree: shardFree && seg.ctProven(seg.used), active: seg == sh.act})
 	}
 	return wins
 }

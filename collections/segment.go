@@ -164,6 +164,15 @@ type segment struct {
 	// rebuilt when the segment has grown past it.
 	seqSeek atomic.Pointer[seqSeek]
 
+	// recOffs holds this segment's per-record offsets so a newest-first scan can replay them
+	// backward instead of framing the whole arena forward to find its last few records
+	// (recoffs.go). Only the shard's write target carries one -- a sealed segment's offsets are
+	// in its sidecar -- and it is dropped when the segment stops being the write target, so the
+	// memory is one segment's worth rather than the store's. Published lock-free; recOffsMu
+	// serializes the readers that extend it.
+	recOffs   atomic.Pointer[recOffsSnap]
+	recOffsMu sync.Mutex
+
 	// colblk is this segment's columnar (adschema PAX) accelerator: nil unless schema-scan
 	// is enabled on the collection. Built from the immutable record bytes and swapped in
 	// atomically (like idx); a scan reads it lock-free and uses colSegment.offs to map a
