@@ -271,7 +271,7 @@ func ageSidecars(tb testing.TB, a *Archive) int {
 			binary.LittleEndian.PutUint16(attr[4:], 9)
 			binary.LittleEndian.PutUint32(attr[len(attr)-4:], crc32.Checksum(attr[:len(attr)-4], crcTable))
 			container := buildSegmentSidecar(attr, c.segKeyIndex(seg), c.colBlobPreserve(seg),
-				buildZoneBlob(c.zonesForSeg(sh, seg), c.intern.Name), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
+				buildZoneBlob(c.zonesForSeg(sh, seg), c.intern.Name), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 			if !c.installSidecar(sh, seg, snapshotPath(seg), container) {
 				tb.Fatal("installSidecar failed")
 			}

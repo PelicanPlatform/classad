@@ -111,6 +111,10 @@ func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, in
 	accs := make([]zoneAcc, len(attrs))
 	var buf []byte
 	dm := seg.damaged()
+	walked := 0
+	if c != nil {
+		defer func() { c.recWalked.Add(int64(walked)) }()
+	}
 	for off := 0; off < upto; {
 		o := uint32(off)
 		if end, ok := dm.skip(o); ok {
@@ -168,6 +172,7 @@ func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, in
 				}
 			}
 		}
+		walked++
 		off += int(total)
 	}
 	zones := make(map[uint32]zoneRange, len(attrs))

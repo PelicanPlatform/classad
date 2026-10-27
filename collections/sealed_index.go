@@ -86,16 +86,35 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 		// leaving it to hold by a chain of reasoning about which sidecars can exist.
 		seg.colblk.Store(cs)
 	}
-	// Phase 2: a resident key Bloom over the segment's key-hashes, built from the key
-	// index, gates the sealed-segment probe. Published after keyIdx so a probe that
-	// observes the Bloom always finds the index behind it.
-	seg.keyBloom.Store(bloomFromKeyIndex(ki))
 	if mm != nil {
 		seg.msidx.Store(mm)
 		seg.idx.Store(nil) // free the heap attr index; readIdx now returns msidx
 	}
 	seg.setOnReapKey(func() { _ = closer() })
 	return true
+}
+
+// bloom returns the segment's resident key-hash membership filter (phase 2 of the sealed-segment
+// probe), building it from the segment's key index on first use.
+//
+// It is built HERE, and not when the index is published, because building it reads one entry per
+// record: doing that for every sealed segment at open made opening a store scale with its record
+// count instead of its segment count, for a filter that a store nobody looks keys up in -- an
+// append-only archive, whose records are keyless -- never uses at all.
+//
+// Nil until the segment has a key index. Racing callers may each build one; they are equivalent,
+// so whichever lands last wins and the others are garbage. Safe under the shard READ lock.
+func (s *segment) bloom() *bloomFilter {
+	if bf := s.keyBloom.Load(); bf != nil {
+		return bf
+	}
+	ki := s.keyIdx.Load()
+	if ki == nil {
+		return nil
+	}
+	bf := bloomFromKeyIndex(ki)
+	s.keyBloom.Store(bf)
+	return bf
 }
 
 // bloomFromKeyIndex builds a membership filter over a key index's hashes. It over-
@@ -126,7 +145,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 		attrBlob = b
 	}
 	container := buildSegmentSidecar(attrBlob, c.segKeyIndex(seg), c.colBlobForSeg(seg),
-		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
+		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	if err := writeFileAtomic(path, container); err != nil {
 		return
 	}
@@ -180,10 +199,73 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 	colCopy := append([]byte(nil), col...)
 	_ = closer()
 	container := buildSegmentSidecar(attrCopy, c.segKeyIndex(seg), colCopy,
-		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
+		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	// Report the write. Discarding this error is how a permanently slow start stays
 	// invisible: the recompute recurs every open and nothing anywhere says the repair
 	// that was supposed to make it one-time never landed.
+	return writeFileAtomic(path, container) == nil
+}
+
+// segTrailerHintsStale reports whether a sealed segment knows something about its trailer records
+// that its sidecar does not: an absence the sidecar does not state, or a payload record whose
+// offset it does not carry. It is the guard on the upgrade, so an open over sidecars that are
+// already current rewrites nothing.
+func segTrailerHintsStale(seg *segment, haveColRec uint32, haveFlags uint16) bool {
+	return seg.trailerAbsenceFlags()&^haveFlags != 0 || (seg.colRecOff() > 0 && haveColRec == 0)
+}
+
+// persistSegTrailerHintsUpgrade records in an already-sealed segment's sidecar what open had to
+// walk the segment's records to learn: which of its two trailer records it does not carry
+// (kidxNoDictRec / kidxNoColRec), and where its columnar payload record is (container v6).
+// haveColRec is the offset the sidecar already records, 0 if none. Returns whether it rewrote.
+//
+// It exists for the same reason persistSegZonesUpgrade does, and against the same failure: open
+// learns the fact by walking every record of the segment, and then throws it away at close, so
+// every start walks the whole archive again to learn it again. The walk is cheap PER RECORD --
+// headers only, no decode -- which is what let it go unnoticed; what it is not is bounded by the
+// segment count, and on a 545 MiB archive it was the largest phase of open, twice over.
+//
+// Only bits the segment can currently vouch for are added, and existing ones are kept: this
+// widens what the sidecar states and never narrows it. The key index is REFLAGGED rather than
+// rebuilt, so the upgrade itself does not walk the records it is removing a walk over. The write
+// is atomic (temp + rename); this process's mapping of the old file stays valid, since the facts
+// are already in RAM for this run. Best effort -- on any error the sidecar is left alone and the
+// next open walks again.
+func (c *Collection) persistSegTrailerHintsUpgrade(seg *segment, haveColRec uint32) bool {
+	path := snapshotPath(seg)
+	if path == "" || !seg.persistent {
+		return false
+	}
+	ki := seg.keyIdx.Load()
+	if ki == nil {
+		return false // not sealed to a sidecar; sealSegmentIndex writes the hints when it is
+	}
+	if !segTrailerHintsStale(seg, haveColRec, ki.flags) {
+		return false // the sidecar already states everything this segment can vouch for
+	}
+	want := seg.trailerAbsenceFlags()
+	data, closer, err := mapFile(path)
+	if err != nil {
+		return false
+	}
+	attr, key, col, zone, ok := splitSegmentSidecar(data)
+	if !ok {
+		_ = closer()
+		return false
+	}
+	reflagged := reflagKeyIndex(key, ki.flags|want)
+	if reflagged == nil {
+		_ = closer()
+		return false
+	}
+	// The sections alias the mapping; copy them before unmapping so the rebuilt container is
+	// independent of the file about to be replaced.
+	attrCopy := append([]byte(nil), attr...)
+	colCopy := append([]byte(nil), col...)
+	zoneCopy := append([]byte(nil), zone...)
+	_ = closer()
+	container := buildSegmentSidecar(attrCopy, reflagged, colCopy, zoneCopy,
+		seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	return writeFileAtomic(path, container) == nil
 }
 
@@ -248,7 +330,7 @@ func (c *Collection) reindexSealedFile(sh *shard, seg *segment, si *segIndex) bo
 		return false
 	}
 	container := buildSegmentSidecar(attrBlob, c.segKeyIndex(seg), c.colBlobPreserve(seg),
-		buildZoneBlob(c.zonesForSeg(sh, seg), c.intern.Name), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
+		buildZoneBlob(c.zonesForSeg(sh, seg), c.intern.Name), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	return c.installSidecar(sh, seg, path, container)
 }
 
@@ -309,7 +391,7 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 	// The durable index supersedes any provisional one built at seal time; drop it so the heap
 	// copy is not retained for the life of the segment.
 	seg.keyIdxMem.Store(nil)
-	seg.keyBloom.Store(bloomFromKeyIndex(ki))
+	seg.keyBloom.Store(nil) // rebuilt from this index on the first key probe (segment.bloom)
 	if mm != nil {
 		seg.msidx.Store(mm)
 		seg.idx.Store(nil) // the heap copy stays dropped; msidx serves queries

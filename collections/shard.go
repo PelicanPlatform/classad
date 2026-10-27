@@ -678,8 +678,8 @@ func (sh *shard) forEachSealedRecordCounting(key []byte, h uint64, skipped *int,
 		if seg == nil || seg == sh.act {
 			continue
 		}
-		bf := seg.keyBloom.Load()
 		ki := seg.keyIdx.Load()
+		bf := seg.bloom()
 		if ki == nil {
 			// The provisional index built at seal time, while the durable sidecar is still
 			// pending. It has no bloom filter, so the probe goes straight to the lookup.

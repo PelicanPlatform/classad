@@ -354,7 +354,7 @@ func (c *Collection) persistColSeg(sh *shard, seg *segment) {
 		return
 	}
 	container := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...), colBlob,
-		append([]byte(nil), zone...), seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
+		append([]byte(nil), zone...), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	_ = closer()
 	c.installSidecar(sh, seg, path, container)
 }

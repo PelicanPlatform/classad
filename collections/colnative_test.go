@@ -393,7 +393,7 @@ func TestColumnarPayloadCorruptionFailsLoudly(t *testing.T) {
 	before := ColNativeCRCFailures()
 	dst.colNative.Store(nil)
 	dst.colDamaged.Store(false)
-	publishColNative(c, dst)
+	publishColNative(c, dst, 0, 0)
 
 	if dst.columnarized() {
 		t.Error("a payload with a broken checksum was accepted")

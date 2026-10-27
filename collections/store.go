@@ -394,7 +394,13 @@ type Collection struct {
 	// persisted index sidecar was handled (adopted vs. to-be-rebuilt). Emitted once at the end
 	// of Open via OpenIndexDiagHook. Written only on the single-threaded Open path.
 	openIdxDiag OpenIndexDiag
-	codec       atomic.Pointer[codecHolder] // current codec for new writes; swapped by RetrainDict
+	// recWalked counts records examined one at a time by the phases that walk them: extent
+	// recovery, the directory rebuild, the searches for a segment's dictionary and columnar
+	// payload records, index and zone builds, and the seal-collapse check. Open reads it into
+	// OpenTiming.RecordsWalked, which is how the "open is O(segments), not O(records)"
+	// invariant is actually checked.
+	recWalked atomic.Int64
+	codec     atomic.Pointer[codecHolder] // current codec for new writes; swapped by RetrainDict
 	// deltaMax and deltas implement delta records (see delta.go). deltaMax 0 disables them.
 	deltaMax int
 	deltas   *deltaTracker

@@ -17,7 +17,7 @@ func TestSegmentSidecarContainer(t *testing.T) {
 	col := []byte("COLX-columnar-block-payload-bytes")
 
 	// v2: all three sections round-trip.
-	c2 := buildSegmentSidecar(attr, key, col, nil, 0, 0, nil)
+	c2 := buildSegmentSidecar(attr, key, col, nil, 0, 0, 0, nil)
 	if binary.LittleEndian.Uint32(c2[len(c2)-4:]) != sidecarContainerMagicV2 {
 		t.Fatal("v2 container: wrong trailing magic")
 	}
@@ -28,7 +28,7 @@ func TestSegmentSidecarContainer(t *testing.T) {
 
 	// Empty col writes the v1 layout byte-for-byte (identical to a pre-columnar sidecar): trailing
 	// magic is SCNT, length is attr+key+12, and split returns col == nil.
-	c1 := buildSegmentSidecar(attr, key, nil, nil, 0, 0, nil)
+	c1 := buildSegmentSidecar(attr, key, nil, nil, 0, 0, 0, nil)
 	if binary.LittleEndian.Uint32(c1[len(c1)-4:]) != sidecarContainerMagic {
 		t.Fatal("empty col should write the v1 magic")
 	}
@@ -41,7 +41,7 @@ func TestSegmentSidecarContainer(t *testing.T) {
 	}
 
 	// Empty attr (no attribute index) still frames correctly alongside a columnar block.
-	c3 := buildSegmentSidecar(nil, key, col, nil, 0, 0, nil)
+	c3 := buildSegmentSidecar(nil, key, col, nil, 0, 0, 0, nil)
 	a, k, cc, _, ok = splitSegmentSidecar(c3)
 	if !ok || len(a) != 0 || !bytes.Equal(k, key) || !bytes.Equal(cc, col) {
 		t.Fatalf("empty-attr split: ok=%v attr=%q key=%q col=%q", ok, a, k, cc)
@@ -85,7 +85,7 @@ func TestSidecarContainerZones(t *testing.T) {
 		return 0, false
 	}
 
-	c4 := buildSegmentSidecar(attr, key, col, buildZoneBlob(zones, nameOf), 4096, 0, nil)
+	c4 := buildSegmentSidecar(attr, key, col, buildZoneBlob(zones, nameOf), 4096, 0, 0, nil)
 	a, k, cc, z, ok := splitSegmentSidecar(c4)
 	if !ok {
 		t.Fatal("v3 container did not parse")
@@ -107,7 +107,7 @@ func TestSidecarContainerZones(t *testing.T) {
 	}
 
 	// No zones: stays at the older shape, and yields a nil zone section.
-	if _, _, _, z2, ok := splitSegmentSidecar(buildSegmentSidecar(attr, key, col, nil, 0, 0, nil)); !ok || z2 != nil {
+	if _, _, _, z2, ok := splitSegmentSidecar(buildSegmentSidecar(attr, key, col, nil, 0, 0, 0, nil)); !ok || z2 != nil {
 		t.Errorf("container without zones: ok=%v zone=%v, want ok and nil", ok, z2)
 	}
 

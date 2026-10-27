@@ -381,7 +381,7 @@ func (c *Collection) persistSegDamage(seg *segment) bool {
 		return false
 	}
 	container := buildSegmentSidecar(attr, c.segKeyIndex(seg), col,
-		zone, seg.used, seg.dictRecOff(), encodeDamage(seg.damaged()))
+		zone, seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	if writeFileAtomic(path, container) != nil {
 		return false
 	}

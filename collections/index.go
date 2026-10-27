@@ -385,6 +385,8 @@ func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segI
 	}
 	var buf []byte
 	dm := seg.damaged()
+	walked := 0
+	defer func() { c.recWalked.Add(int64(walked)) }()
 	for off := 0; off < upto; {
 		o := uint32(off)
 		if end, ok := dm.skip(o); ok {
@@ -402,6 +404,7 @@ func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segI
 		} else if !recIsMarker(data, o) {
 			noteReadSkip(err) // left out of the postings: a query served by them will not find it
 		}
+		walked++
 		off += int(total)
 	}
 	// Summarize each attribute's completed postings for segment-skip and
