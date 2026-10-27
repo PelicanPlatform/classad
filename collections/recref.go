@@ -213,29 +213,39 @@ var errFramingLost = errors.New("collections: a walk lost the records' framing a
 // offsets are collected in one forward pass and replayed in reverse -- the walk stays O(records)
 // at the cost of a per-segment offset slice. A caller that stops after K records therefore
 // receives the K most recently appended.
+//
+// The window this starts at -- the newest -- is the one a short newest-first query pays for and
+// the only one it frames, so its offsets are kept between scans when it is the segment still
+// being appended to (recoffs.go). Nothing else about the walk changes: a cached offset is only
+// a starting point, and damaged spans, markers and MVCC visibility are decided here exactly as
+// they are for a window framed on the spot.
 func forEachVisibleRefReverse(s0 uint64, wins []segWindow, fn func(recRef) bool) {
-	var offs []uint32 // reused across windows
+	var offs []uint32 // reused across the windows this frames itself
 	for wi := len(wins) - 1; wi >= 0; wi-- {
 		w := wins[wi]
 		d := w.dict()
-		offs = offs[:0]
-		off := 0
-		for off < w.used {
-			o := uint32(off)
-			if end, ok := w.dmg.skip(o); ok {
-				off = int(end)
-				continue
+		ro := reverseOffsets(w)
+		if ro == nil {
+			offs = offs[:0]
+			off := 0
+			for off < w.used {
+				o := uint32(off)
+				if end, ok := w.dmg.skip(o); ok {
+					off = int(end)
+					continue
+				}
+				total := recTotalLen(w.data, o)
+				if total == 0 {
+					break
+				}
+				offs = append(offs, o)
+				off += int(total)
 			}
-			total := recTotalLen(w.data, o)
-			if total == 0 {
-				break
-			}
-			offs = append(offs, o)
-			off += int(total)
+			noteFramingLost(w, off)
+			ro = offs
 		}
-		noteFramingLost(w, off)
-		for i := len(offs) - 1; i >= 0; i-- {
-			o := offs[i]
+		for i := len(ro) - 1; i >= 0; i-- {
+			o := ro[i]
 			if !recIsMarker(w.data, o) && w.visible(o, s0) {
 				if !fn(recRef{w: w, off: o, dict: d}) {
 					return
