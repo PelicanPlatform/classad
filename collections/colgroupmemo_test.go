@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"fmt"
 	"math"
 	"math/rand"
 	"testing"
@@ -200,4 +201,160 @@ func TestBucketMemoDeclinesTheCoarseTopEdge(t *testing.T) {
 			t.Errorf("width %d: %v did not land in bucket %d", tc.width, top, want)
 		}
 	}
+}
+
+// TestBucketMemoDecidesARepeatedRecord fails if the bucket interval memo stops ANSWERING, at any
+// arity.
+//
+// Nothing else here can fail that way. A memo that never hits is still CORRECT: every record it
+// declines goes to the slow path, which floors the value itself and finds the same group, so every
+// count a correctness test checks comes out right while the acceleration the memo exists for is
+// quietly gone. The way that happens in practice is an index convention drifting -- the intervals
+// are written at the BUCKET RANK and read at the COMPONENT INDEX, or the reverse -- which at any
+// arity above one leaves the reader comparing against a slot that was never armed, so the test is
+// `0 <= f && f < 0`, false, every record, forever. Swapping the two in either direction leaves the
+// whole package green without this.
+//
+// The hit is made observable by removing the fallback: feed a record, then EMPTY the accumulation
+// map and feed the same record again. A memo hit never touches a map, so it returns the same
+// accumulator and leaves the map empty. A miss re-creates the group, which the map then shows.
+func TestBucketMemoDecidesARepeatedRecord(t *testing.T) {
+	for _, shape := range memoShapes() {
+		a := newGroupAccum(shape.buckets)
+		first, ok := accForN(a, shape.comps, 0)
+		if !ok || first == nil {
+			t.Fatalf("%s: the first record formed no group (ok %v)", shape.name, ok)
+		}
+		if got := a.nGroups(); got != 1 {
+			t.Fatalf("%s: %d groups after one record, want 1", shape.name, got)
+		}
+		clearGroupMaps(t, a)
+		second, ok := accForN(a, shape.comps, 0)
+		if !ok || second == nil {
+			t.Fatalf("%s: the repeated record formed no group (ok %v)", shape.name, ok)
+		}
+		if second != first || a.nGroups() != 0 {
+			t.Fatalf("%s: the repeated record went to the map (%d groups formed, same "+
+				"accumulator %v); the interval memo is meant to decide it without one, and it "+
+				"cannot if the intervals are armed at one index, one rank or one WIDTH and read "+
+				"at another", shape.name, a.nGroups(), second == first)
+		}
+	}
+}
+
+// clearGroupMaps empties whichever arity's accumulation map is live, leaving the interval memo armed.
+//
+// It names the arities one at a time, so raising the cap without adding a line here would leave the
+// live map FULL and the test above would then read a perfectly good memo hit as a miss. t is taken
+// so that it says which of the two went wrong rather than letting the caller guess.
+func clearGroupMaps(t *testing.T, a *groupAccum) {
+	t.Helper()
+	clear(a.g1.acc)
+	clear(a.g2.acc)
+	clear(a.g3.acc)
+	if n := a.nGroups(); n != 0 {
+		t.Fatalf("arity %d: clearing left %d groups; clearGroupMaps does not know this arity, so "+
+			"the memo check below would read a hit as a miss", a.n, n)
+	}
+}
+
+// TestBucketMemoDeclinesARecordThatMovedBucket is the other half of the memo's contract, and the
+// half that is a WRONG ANSWER rather than a slow one.
+//
+// The test above says a repeated record must be decided by the memo. This one says a record that
+// moved to a different bucket in ANY ONE component must not be: the interval armed for a component
+// has to be that component's own bucket, so a record outside it falls through to bucketOf and forms
+// its own group.
+//
+// What it catches that nothing else does is an interval armed TOO WIDE -- a component's interval
+// built from another component's bucket WIDTH. Too narrow is merely slow, and the test above finds
+// it. Too wide hands the previous record's group to a record that belongs in a different one, and
+// the count that comes back is simply wrong. It takes components with DIFFERENT widths to see at
+// all: with equal widths every component's interval is the same size and the bug is invisible.
+func TestBucketMemoDeclinesARecordThatMovedBucket(t *testing.T) {
+	for _, shape := range memoShapes() {
+		for moved := 0; moved < shape.n; moved++ {
+			if shape.buckets[moved] == 0 {
+				continue // an unbucketed component is the probe's job, not the interval's
+			}
+			a := newGroupAccum(shape.buckets)
+			if _, ok := accForN(a, shape.comps, 0); !ok {
+				t.Fatalf("%s: the first record formed no group", shape.name)
+			}
+			// Move this component a whole bucket on, leaving every other component alone.
+			next := append([]groupComp(nil), shape.comps...)
+			next[moved] = groupComp{kind: gkInt, raw: next[moved].raw + shape.buckets[moved]}
+			g, ok := accForN(a, next, 0)
+			if !ok || g == nil {
+				t.Fatalf("%s: moving component %d formed no group", shape.name, moved)
+			}
+			if n := a.nGroups(); n != 2 {
+				t.Fatalf("%s: component %d moved a full bucket (width %d) and the accumulator "+
+					"holds %d group(s), want 2; the memo decided a record that belongs in a "+
+					"different bucket, which means that component's interval was armed from "+
+					"something other than its own width",
+					shape.name, moved, shape.buckets[moved], n)
+			}
+		}
+	}
+}
+
+// memoShapes enumerates the bucketing shapes the memo has to decide, at every arity the cap admits.
+//
+// TWO FAMILIES, because they reach different code and fail differently:
+//
+//   - "one bucket" is what production asks: categorical columns beside ONE time bucket. The
+//     bucketed component is LAST, so its component index is n-1 while its rank is 0 -- at n == 3
+//     those differ by two, which is what makes confusing the two visible at all.
+//   - "all bucketed" is every component floored, which is the branch accForBucketed takes when
+//     there is no unbucketed component to probe (!mCmp) -- a branch the first family never enters.
+//     The widths DIFFER between components on purpose: with equal widths, arming every interval
+//     from the first component's width is indistinguishable from arming each from its own, and the
+//     bug that does exactly that survives. The timestamps are placed well past the narrowest width
+//     into their own bucket, so an interval armed too narrow fails to contain the record it was
+//     armed for and the memo misses.
+func memoShapes() []struct {
+	name    string
+	n       int
+	buckets []int64
+	comps   []groupComp
+} {
+	const hour, day = 3600, 86400
+	const stamp = 1700000000 + 12345 // 12345s into its day: past an hour, so a too-narrow interval shows
+	var out []struct {
+		name    string
+		n       int
+		buckets []int64
+		comps   []groupComp
+	}
+	for n := 1; n <= maxGroupCols; n++ {
+		one := make([]int64, n)
+		one[n-1] = day
+		oc := make([]groupComp, n)
+		for i := 0; i < n-1; i++ {
+			oc[i] = groupComp{kind: gkInt, raw: int64(100 + i)}
+		}
+		oc[n-1] = groupComp{kind: gkInt, raw: stamp}
+		out = append(out, struct {
+			name    string
+			n       int
+			buckets []int64
+			comps   []groupComp
+		}{fmt.Sprintf("arity %d, one bucket", n), n, one, oc})
+
+		// Every component bucketed, each with its own width.
+		all := make([]int64, n)
+		ac := make([]groupComp, n)
+		for i := 0; i < n; i++ {
+			all[i] = []int64{day, hour, day * 7}[i%3]
+			ac[i] = groupComp{kind: gkInt, raw: stamp}
+		}
+		out = append(out, struct {
+			name    string
+			n       int
+			buckets []int64
+			comps   []groupComp
+		}{fmt.Sprintf("arity %d, all bucketed", n), n, all, ac})
+	}
+	return out
 }
