@@ -29,9 +29,6 @@ import (
 // projection already ships every attribute and behaves exactly like ScanRawWire.
 func (c *Collection) ScanRawWireRefs(projection []string, redact bool) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
-		if !c.inline {
-			return
-		}
 		sel := c.newWireSubsetSelectorRefs(projection, redact, true)
 		if c.runParallelWireScan(sel, sel.neededCount(), yield) {
 			return
@@ -55,9 +52,6 @@ func (c *Collection) QueryRawWireRefs(q *vm.Query, projection []string, redact b
 // per-scan work breakdown.
 func (c *Collection) QueryRawWireRefsStats(q *vm.Query, projection []string, redact bool, stats *ScanStats) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
-		if !c.inline {
-			return
-		}
 		sel := c.newWireSubsetSelectorRefs(projection, redact, true)
 		// NO projection plan, for the reason QueryRawProjectedStats gives for passing none:
 		// the plan builds a columnar record restricted to the projected attributes, and the
@@ -116,10 +110,14 @@ func (rs *wireRefSet) index(name []byte, h uint32) (int, bool) {
 // is what keeps a new piece of per-record state from being accidentally shared the way the
 // narrower's resolved-projection cache once was.
 type wireRowAssembler struct {
+	c       *Collection
 	sel     *wireSubsetSelector
 	sc      wire.SubsetScratch
 	refs    wireRefSet
 	scratch [][]byte // per-node reference-name scratch, recycled across nodes
+	// flat holds an in-memory record rewritten to inline names, when one had to be; see
+	// appendRow. Reused across records like everything else here.
+	flat []byte
 	// Counts for pending, reset per record: entries taken because the SELECTOR wanted them
 	// (the projection plus the two type fields) and references taken because the closure
 	// surfaced them.
@@ -136,13 +134,41 @@ func (a *wireRowAssembler) pending(needed int) int {
 }
 
 func (c *Collection) newWireRowAssembler(sel *wireSubsetSelector) *wireRowAssembler {
-	return &wireRowAssembler{sel: sel}
+	return &wireRowAssembler{c: c, sel: sel}
 }
 
 // appendRow assembles one wire-form row for src into dst, returning the extended buffer.
-// Reports false for a record the assembler cannot read (not an inline ad, or malformed), in
-// which case the caller discards the partial append and keeps scanning.
+// Reports false for a record the assembler cannot read (malformed, or an id it cannot
+// resolve), in which case the caller discards the partial append and keeps scanning.
+//
+// It is the one place that knows how the two stored encodings reach the same self-contained
+// inline-names row, so every wire scan -- serial and parallel -- agrees on it. A persistent
+// collection's records already carry inline names (an interned SEALED segment's are converted
+// upstream by wireToInlineRead). An IN-MEMORY collection's are keyed by ids against the shared
+// intern table, which the far side of a relay does not have, so they are rewritten here.
+//
+// open is the caller's renderKey(redact) and governs sealed values identically on every path:
+// no key means an at-rest-encrypted entry is dropped rather than shipped.
 func (a *wireRowAssembler) appendRow(dst []byte, src wire.Ad, needed int, open wire.Sealer) ([]byte, bool) {
+	if !a.c.inline {
+		if !a.sel.chaseRefs {
+			// No closure to compute, so the rewrite is FUSED with the selection and only
+			// the entries actually shipped are converted.
+			return wire.AppendAdSubsetInlineFromInterned(dst, src, a.c.intern.Name, a.sel.keep, open, &a.sc)
+		}
+		// The closure resolves references BY NAME against the record it is assembling, so
+		// the record has to be in name space before it runs -- and it must be the WHOLE
+		// record, because a referenced attribute the selection would have dropped is
+		// exactly what the closure exists to recover. Rewriting once and reusing the one
+		// tested closure beats a second implementation of it over interned ids.
+		flat, ok := wire.AppendAdSubsetInlineFromInterned(a.flat[:0], src, a.c.intern.Name, nil, open, &a.sc)
+		a.flat = flat
+		if !ok {
+			return dst, false
+		}
+		// Sealed values were opened by the rewrite, so there is no key left to apply.
+		src, open = wire.Ad(flat), nil
+	}
 	if !a.sel.chaseRefs {
 		return wire.AppendAdSubsetInlineHotFirst(dst, src, a.sel.keep, needed, open, &a.sc)
 	}

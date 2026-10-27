@@ -282,67 +282,74 @@ func TestQueryRawWireRefsLimit(t *testing.T) {
 	}
 }
 
-// TestQueryRawWireRefsFallback: the refusal a server gives for an opcode it does not know,
-// and for a table that cannot serve wire rows, arrives BEFORE any row and as a sentinel the
-// caller can act on -- the general one, so existing handling still matches, and the specific
-// one, so a caller can retry the plain wire stream rather than dropping to text.
-func TestQueryRawWireRefsFallback(t *testing.T) {
+// TestQueryRawWireRefsServesBothStorageKinds: the chased wire stream is a DB operation, not
+// a property of where the rows happen to live, so an in-memory table and a persistent one
+// both serve it -- and both close the projection under the projected expressions'
+// references. An in-memory record is keyed by interned ids rather than inline names, which
+// is a storage detail the relay's consumer never sees.
+//
+// Asserting the ATTRIBUTES rather than a row count is the point. In-memory tables used to
+// refuse this stream outright; a version that serves rows WITHOUT the closure would satisfy
+// any count-based check while handing the consumer a Requirements it cannot evaluate.
+func TestQueryRawWireRefsServesBothStorageKinds(t *testing.T) {
 	c, cleanup := catServerPair(t, ServeOptions{Privileged: true})
 	defer cleanup()
 	ctx := context.Background()
 
-	if err := c.CreateTableInMemory(ctx, "scratch"); err != nil {
-		t.Fatal(err)
-	}
-	tx, err := c.BeginTable(ctx, "scratch")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.NewClassAd(ctx, "k1", "Name = \"one\"\nCpus = 4\nReq = Cpus > 0"); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	const ad = "Name = \"one\"\nCpus = 4\nReq = Cpus > 0"
+	for _, tbl := range []struct {
+		name   string
+		create func(context.Context, string) error
+	}{
+		{"scratch", c.CreateTableInMemory},
+		{"durable", c.CreateTable},
+	} {
+		if err := tbl.create(ctx, tbl.name); err != nil {
+			t.Fatal(err)
+		}
+		tx, err := c.BeginTable(ctx, tbl.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.NewClassAd(ctx, "k1", ad); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
 
-	rows := 0
-	err = c.QueryRawWireRefsStream(ctx, "scratch", "true", []string{"Req"}, 0, false, func([]byte) bool {
-		rows++
-		return true
-	})
-	if !errors.Is(err, ErrRawWireRefsUnsupported) {
-		t.Errorf("err = %v, want ErrRawWireRefsUnsupported", err)
-	}
-	if !errors.Is(err, ErrRawWireUnsupported) {
-		t.Errorf("err = %v must also match the general ErrRawWireUnsupported, so existing fallbacks still fire", err)
-	}
-	if rows != 0 {
-		t.Errorf("delivered %d rows before refusing; the refusal must precede any row", rows)
-	}
-
-	// A persistent table on the same server serves the chased stream.
-	if err := c.CreateTable(ctx, "durable"); err != nil {
-		t.Fatal(err)
-	}
-	tx, err = c.BeginTable(ctx, "durable")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.NewClassAd(ctx, "k1", "Name = \"two\"\nCpus = 8\nReq = Cpus > 0"); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	rows = 0
-	if err := c.QueryRawWireRefsStream(ctx, "durable", "true", []string{"Req"}, 0, false, func([]byte) bool {
-		rows++
-		return true
-	}); err != nil {
-		t.Fatalf("persistent table: %v", err)
-	}
-	if rows != 1 {
-		t.Errorf("persistent table returned %d wire rows, want 1", rows)
+		var names []string
+		rows := 0
+		var buf []byte
+		var offs []int
+		err = c.QueryRawWireRefsStream(ctx, tbl.name, "true", []string{"Req"}, 0, false, func(row []byte) bool {
+			rows++
+			var ok bool
+			buf, offs, _, _, ok = collections.RenderRawAdInline(row, buf, offs)
+			if !ok {
+				t.Fatal("render failed on a wire row")
+			}
+			names = names[:0]
+			for i := 0; i+1 < len(offs); i++ {
+				name, _, found := strings.Cut(string(buf[offs[i]:offs[i+1]]), " = ")
+				if !found {
+					t.Fatalf("malformed expr %q", buf[offs[i]:offs[i+1]])
+				}
+				names = append(names, name)
+			}
+			return true
+		})
+		if err != nil {
+			t.Fatalf("%s: %v", tbl.name, err)
+		}
+		if rows != 1 {
+			t.Fatalf("%s: returned %d wire rows, want 1", tbl.name, rows)
+		}
+		sort.Strings(names)
+		// Req references Cpus, which the projection does not name; the closure must add it.
+		if got := strings.Join(names, ","); got != "Cpus,Req" {
+			t.Errorf("%s: row carries %s, want Cpus,Req -- a row without Cpus means the closure did not run on this storage kind", tbl.name, got)
+		}
 	}
 }
 

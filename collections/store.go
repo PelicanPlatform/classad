@@ -1154,11 +1154,20 @@ func (c *Collection) Len() int {
 // which the COUNT(*) fast path relies on.
 func (c *Collection) Chained() bool { return c.isStructural != nil }
 
+// Persistent reports whether this collection is backed by a directory, which is also what
+// decides its record encoding: a persistent collection stores attribute names inline (so its
+// segment files recover without a table), an in-memory one interns them against the shared
+// table. Callers that used to read SupportsRawWire for this -- it was c.inline -- want this.
+func (c *Collection) Persistent() bool { return c.inline }
+
 // SupportsRawWire reports whether ScanRawWire/QueryRawWire can serve this collection.
-// Only an inline (persistent) collection can: a RAM collection's ads are not
-// self-contained, so the relay scans yield nothing for one. A caller MUST check this
-// rather than treat an empty relay scan as an empty result -- they look identical.
-func (c *Collection) SupportsRawWire() bool { return c.inline }
+// Every collection can: a persistent one stores inline names already, and an in-memory one's
+// interned keys are rewritten to names while the row is assembled (see appendWireRow). It
+// returned c.inline while that rewrite did not exist, and the relay scans then yielded nothing
+// for a RAM table -- indistinguishable from a query that matched nothing, which is why the
+// callers were made to check first. It is kept, always true, so those callers still compile
+// and so a future storage form that genuinely cannot relay has somewhere to say so.
+func (c *Collection) SupportsRawWire() bool { return true }
 
 // Keys returns every visible key in the collection at a consistent per-shard
 // snapshot, in no particular order. Structural (parent-only) keys of a chained

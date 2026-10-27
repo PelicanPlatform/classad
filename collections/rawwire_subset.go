@@ -22,14 +22,15 @@ import (
 // MyType/TargetType always ship so the ad stays typed); empty means every
 // entry. redact drops private attributes -- pre-pruned from a projection, or
 // tested per entry with a byte-gated predicate for the whole-ad case. The
-// yielded row aliases a buffer reused across the iteration. Non-inline (RAM)
-// collections yield nothing: their ads are not self-contained, and an
-// in-process consumer reads them through the collection directly.
+// yielded row aliases a buffer reused across the iteration.
+//
+// An IN-MEMORY collection serves this scan too. Its records are not self-contained as stored
+// -- their keys are ids against the shared intern table -- but the difference from the
+// persistent form is only how names are spelled, so the row is assembled by rewriting those
+// ids back to names as it is built (see appendWireRow). Refusing RAM tables here was a
+// property of the first implementation, not of what they store.
 func (c *Collection) ScanRawWire(projection []string, redact bool) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
-		if !c.inline {
-			return
-		}
 		sel := c.newWireSubsetSelector(projection, redact)
 		// Decompression dominates a compressed scan and parallelizes across
 		// segments; the serial path below is the fallback (small scans, no budget,
@@ -57,9 +58,6 @@ func (c *Collection) QueryRawWire(q *vm.Query, projection []string, redact bool)
 // reading stats; a partial iteration leaves partial counts.
 func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact bool, stats *ScanStats) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
-		if !c.inline {
-			return
-		}
 		sel := c.newWireSubsetSelector(projection, redact)
 		// The projection plan names the type fields as well: a columnar segment builds the record
 		// from the columns the plan asks for, and sel.keep ships MyType/TargetType whatever the
@@ -101,15 +99,18 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 		// Narrow in ID SPACE first, so the conversion below only converts what the caller asked
 		// for (see narrowProjected).
 		w = c.narrowProjected(&narrow, sel, dict, w)
-		// AppendAdSubsetInlineHotFirst needs inline-name wire. Both this conversion and the
-		// assembler below take the key only when the reader is entitled to it: an inline segment
-		// converts nothing, so for that case the assembler's key is the ONLY thing standing
-		// between a redacted read and a sealed value.
+		// A per-segment INTERNED record (a sealed segment of a persistent store) is flattened
+		// here, because its ids resolve against that segment's dict rather than against
+		// anything appendWireRow can reach. An in-memory record is left alone -- dict is nil --
+		// and its global ids are resolved inside the assembler instead. Both this conversion
+		// and the assembler below take the key only when the reader is entitled to it: an
+		// inline segment converts nothing, so for that case the assembler's key is the ONLY
+		// thing standing between a redacted read and a sealed value.
 		w = c.wireToInlineRead(dict, w, sel.redact)
 		out, ok := asm.appendRow(scratch[:0], wire.Ad(w), needed, c.renderKey(sel.redact))
 		scratch = out
 		if !ok {
-			return true // not an inline ad / malformed: skip, keep scanning
+			return true // malformed (or unresolvable) record: skip, keep scanning
 		}
 		return yield(out)
 	}

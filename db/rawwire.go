@@ -157,6 +157,11 @@ func (db *DB) QueryRawProjectedRefsStats(constraint string, projection []string,
 	return gated(db, db.c.QueryRawProjectedStats(q, projection, true, redact, stats)), nil
 }
 
+// Persistent reports whether the table is backed by a directory (collections.Persistent).
+// Both storage forms serve every query API; this is for a caller that needs to know which
+// one it has -- a test asserting its own fixture, or a tool reporting the table's mode.
+func (db *DB) Persistent() bool { return db.c.Persistent() }
+
 // QueryRawWire yields each matching ad as a self-contained WIRE-FORM ROW (an
 // inline-names subset ad assembled by slice copies -- see
 // collections.ScanRawWire): the relay form for shipping ads to a remote
@@ -165,10 +170,11 @@ func (db *DB) QueryRawProjectedRefsStats(constraint string, projection []string,
 // attributes at the source. At-rest-encrypted values are opened during assembly
 // (the consumer holds no data key).
 //
-// Only a persistent (inline) store can serve wire rows. An in-memory table returns
-// ErrRawWireUnsupported rather than an empty sequence: a relay scan that yields
-// nothing is indistinguishable from a query that matched nothing, so returning one
-// would turn every RAM-table query into a silent empty result at the consumer.
+// Both storage forms serve wire rows: a persistent table's records already carry inline
+// names, and an in-memory table's interned keys are rewritten to names as the row is
+// assembled. ErrRawWireUnsupported is still returned, before any row, by a table that cannot
+// produce self-contained rows at all -- a relay scan that yields nothing is indistinguishable
+// from a query that matched nothing, so such a table must refuse rather than come back empty.
 func (db *DB) QueryRawWire(constraint string, projection []string, redact bool) (iter.Seq[[]byte], error) {
 	if !db.c.SupportsRawWire() {
 		return nil, ErrRawWireUnsupported

@@ -94,6 +94,10 @@ type SubsetScratch struct {
 	// the two above.
 	ents  []subsetEnt
 	plain []byte
+	// nameBuf holds one resolved attribute name at a time for the interned assembler,
+	// whose keep test takes bytes while an intern table hands back a string. Reused so
+	// resolving a name costs no allocation per entry.
+	nameBuf []byte
 }
 
 // subsetEnt is ONE indexed entry of the record being assembled: where its bytes are, and
