@@ -51,6 +51,8 @@ type Catalog struct {
 	// memExporterState holds exporter resume-state blobs for an in-memory catalog
 	// (dir == ""), where there is no disk to persist to. Unused when dir is set.
 	memExporterState map[string][]byte
+	// queryPar is the catalog-wide Options.QueryParallelism applied to each table.
+	queryPar int
 }
 
 // tablesSubdir / archivesSubdir are where a persistent catalog keeps its per-table
@@ -119,6 +121,8 @@ type CatalogConfig struct {
 	// collections.MigrateSealedAttrs). 0 takes a per-table default. Tables are already opened in
 	// parallel, so this multiplies with that.
 	SealMigrationWorkers int
+	// QueryParallelism applies Config.QueryParallelism to every table the catalog opens.
+	QueryParallelism int
 }
 
 // OpenCatalog opens the catalog rooted at dir with no encryption. See OpenCatalogConfig
@@ -191,6 +195,7 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		exporters:        map[string]ExporterDef{},
 		memExporterState: map[string][]byte{},
 		poolKeys:         cfg.PoolKeys, encAttrs: cfg.EncryptedAttrs,
+		queryPar:          cfg.QueryParallelism,
 		disableReadVerify: cfg.DisableReadVerification,
 		onSealMigration:   cfg.OnSealMigration,
 		sealWorkers:       cfg.SealMigrationWorkers,
@@ -278,6 +283,7 @@ func (cat *Catalog) tableConfig(dir string) Config {
 		PoolKeys:                cat.poolKeys,
 		EncryptedAttrs:          cat.encAttrs,
 		SealMigrationWorkers:    cat.sealWorkers,
+		QueryParallelism:        cat.queryPar,
 		DeltaMax:                cat.deltaMaxForDir(dir),
 	}
 	if cat.onSealMigration != nil {
