@@ -1366,6 +1366,13 @@ type scanVisitState struct {
 	preFold     *colPrefilter
 	projCS      *colScope
 	projScratch projectScratch
+	selfClosed  selfClosedScratch
+	// closureMiss counts CONSECUTIVE records whose projected ad was not self-contained, so a
+	// scan whose projection names an expression reaching outside itself stops paying for the
+	// attempt. Without it that scan reads the columns, finds the ad unusable and reassembles
+	// anyway -- strictly worse than never having tried. Same adaptive shape as the prefix
+	// gate in the parallel wire scan, and reset by any record that does stay on the fast path.
+	closureMiss int
 	built       bool // prefilters/projection scope built; they depend only on the plan
 }
 
@@ -1433,9 +1440,19 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		// reads no attribute (so it is constant and the ad cannot change its answer) or the match was
 		// just decided FROM the columns. Anything less certain reassembles, because a narrowed ad
 		// cannot be handed to the matcher -- its seed set is not closed.
-		if projCS != nil && cn != nil && (isConst || colDecided) {
+		if projCS != nil && cn != nil && (isConst || colDecided) && st.closureMiss < closureMissGiveUp {
 			if k, ok := cn.indexOf(r.off); ok {
-				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &st.projScratch); ok {
+				// A plan whose consumer evaluates takes the fast path only for records whose
+				// projected ad is self-contained; the rest fall through and reassemble. See
+				// adSelfClosed for why that is the real condition rather than "has a plan".
+				out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &st.projScratch)
+				if ok && qp.proj.closure && !adSelfClosed(out, &st.selfClosed) {
+					ok = false
+					st.closureMiss++
+					qp.stats.closureReassembled()
+				}
+				if ok {
+					st.closureMiss = 0
 					qp.stats.matched() // projected straight from columns; no reassembly
 					if qp.ws != nil {
 						qp.ws.dict = dict

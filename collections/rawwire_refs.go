@@ -53,13 +53,22 @@ func (c *Collection) QueryRawWireRefs(q *vm.Query, projection []string, redact b
 func (c *Collection) QueryRawWireRefsStats(q *vm.Query, projection []string, redact bool, stats *ScanStats) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		sel := c.newWireSubsetSelectorRefs(projection, redact, true)
-		// NO projection plan, for the reason QueryRawProjectedStats gives for passing none:
-		// the plan builds a columnar record restricted to the projected attributes, and the
-		// closure resolves references AGAINST THE SAME RECORD -- so a record narrowed by the
-		// plan would be missing exactly the attributes the closure is there to recover, and
-		// the columns they live in would never be read. The narrowing that DOES survive is
-		// the id-space one in narrowProjected, which chases references itself.
-		qp := c.newQueryPlan(q, nil, stats)
+		// A projection plan, but one MARKED as feeding a consumer that evaluates. Passing no
+		// plan at all -- which every other chasing scan does -- costs the columnar fast path
+		// on every record: measured on 20k real job ads it was 83ms with the plan against
+		// 255ms without, dwarfing the closure itself at 17ms.
+		//
+		// The plan is safe here because the scan checks each projected record for being
+		// self-contained and reassembles the ones that are not (see adSelfClosed). A
+		// projection of literals refers to nothing and never triggers that; a projection
+		// naming an expression that reaches outside itself falls back per record, which is
+		// exactly the behaviour passing no plan gave unconditionally.
+		var proj *projPlan
+		if len(projection) > 0 {
+			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
+			proj.closure = true
+		}
+		qp := c.newQueryPlan(q, proj, stats)
 		rp := c.planReadQuery(qp)
 		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 && !c.reverseScan {
 			if c.runParallelWireQuery(qp, sel, sel.neededCount(), yield) {

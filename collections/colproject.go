@@ -50,6 +50,10 @@ type projPlan struct {
 	// would keep the wrong attributes.
 	localDict *segDictHandle
 	local     map[uint32]struct{}
+	// closure marks a plan whose consumer will EVALUATE the projected ad rather than just
+	// relay it. Such a plan is still used, but each projected record is checked for being
+	// self-contained (adSelfClosed) and reassembled when it is not.
+	closure bool
 }
 
 // newProjPlan resolves a projection for the scan, or returns nil when there is nothing to project.
@@ -267,3 +271,108 @@ func (cs *colScope) appendSlotNode(dst []byte, idx int, f *adField) ([]byte, boo
 	}
 	return dst, false
 }
+
+// selfClosedScratch is adSelfClosed's reusable working set, held by the scan so the check
+// allocates nothing per record.
+type selfClosedScratch struct {
+	ids   []uint32
+	refs  []uint32
+	names [][]byte
+	nrefs [][]byte
+}
+
+// adSelfClosed reports whether every attribute reference the ad's own nodes make resolves to
+// an attribute the ad itself carries.
+//
+// This is the question the blanket "evaluating consumers get no plan" rule was standing in
+// for, and it is a weaker one. A projected ad is unsafe to evaluate only when it kept an
+// EXPRESSION whose references were narrowed away; an ad of literals refers to nothing and is
+// perfectly self-contained however hard it was narrowed. Asking per record lets the common
+// projection -- all literals -- keep the columnar fast path, and makes only the records that
+// really need the rest of the ad pay for it.
+//
+// The walk is in whichever key space the record is in, for the reason narrowAdRefs gives:
+// an interned record's references are its segment's own dictionary ids, and an inline one's
+// are names. A record it cannot read is reported NOT closed, so the caller reassembles --
+// the safe direction, since a wrongly-kept fast path ships a row that evaluates to undefined.
+func adSelfClosed(w []byte, sc *selfClosedScratch) bool {
+	_, _, _, inline, ok := wire.Ad(w).SplitBody()
+	if !ok {
+		return false
+	}
+	if inline {
+		sc.names = sc.names[:0]
+		if !wire.Ad(w).ForEachNameNode(func(name, _ []byte) bool {
+			sc.names = append(sc.names, name)
+			return true
+		}) {
+			return false
+		}
+		closed := true
+		if !wire.Ad(w).ForEachNameNode(func(_, node []byte) bool {
+			sc.nrefs = wire.AppendNodeRefNames(node, sc.nrefs[:0])
+			for _, r := range sc.nrefs {
+				if len(r) == 0 {
+					continue
+				}
+				found := false
+				for _, have := range sc.names {
+					if wire.FoldEqualNames(r, have) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					closed = false
+					return false
+				}
+			}
+			return true
+		}) {
+			return false
+		}
+		return closed
+	}
+	sc.ids = sc.ids[:0]
+	if !wire.Ad(w).ForEachRaw(func(id uint32, name string, _ []byte) bool {
+		if name != "" {
+			// An inline entry inside an interned record: it has no id to match a reference
+			// against, so treat the record as unreadable for this purpose rather than
+			// guessing. Rare, and the cost of being wrong is a row that cannot evaluate.
+			id = 0
+		}
+		sc.ids = append(sc.ids, id)
+		return true
+	}) {
+		return false
+	}
+	closed := true
+	if !wire.Ad(w).ForEachRaw(func(_ uint32, _ string, node []byte) bool {
+		sc.refs = wire.AppendNodeRefIDs(node, sc.refs[:0])
+		for _, r := range sc.refs {
+			found := false
+			for _, have := range sc.ids {
+				if have == r {
+					found = true
+					break
+				}
+			}
+			if !found {
+				closed = false
+				return false
+			}
+		}
+		return true
+	}) {
+		return false
+	}
+	return closed
+}
+
+// closureMissGiveUp is how many CONSECUTIVE records may fail the self-contained check before
+// a scan stops attempting the columnar projection at all. Whether a projection's expressions
+// reach outside it is a property of the data, so it is discovered rather than declared --
+// and once discovered, every further attempt is pure waste ahead of the reassembly that
+// follows it. Small, because the attempt is not free and the signal is consistent: a
+// projection either names expressions that escape or it does not.
+const closureMissGiveUp = 8

@@ -402,7 +402,7 @@ var mxWant = map[string]map[mxKind]string{
 		// Same as QueryRawWire above: a view is backed by an in-memory db, and those serve
 		// wire rows now. The closure runs on that path too -- the record is rewritten to
 		// name space first -- so a view gets chased rows rather than a refusal.
-		kView: "stream",
+		kView:    "stream",
 		kArchive: "err: archive table \"hist\": QueryRawWire is not served from an archive; use QueryRawProject, which does read one",
 		kMissing: "err: no such table: nope",
 	},
