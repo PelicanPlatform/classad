@@ -176,20 +176,34 @@ func BenchmarkGroupAccum(b *testing.B) {
 func BenchmarkGroupAccumTwoCols(b *testing.B) {
 	const n = 120_000
 	const day = 86400
+	// A nil second means the timestamp column, which is what a bucketed arm wants; an arm with
+	// bucket 0 supplies its own, because a per-second timestamp grouped RAW is one group per record
+	// and measures the map growing rather than the key being packed.
 	for _, arm := range []struct {
 		name   string
 		owner  func(i int) int64
+		second func(i int) int64
 		bucket int64
 		why    string
 	}{
 		// Submit bursts: one owner for a long run, timestamps advancing a second at a time. Both
 		// components hold still, which is the memo's best case and the common production shape.
-		{"runs/owner256_day", func(i int) int64 { return int64(i / 256) }, day, "owner runs of 256, ~1.4 days"},
+		{"runs/owner256_day", func(i int) int64 { return int64(i / 256) }, nil, day, "owner runs of 256, ~1.4 days"},
 		// The same timestamps with an owner drawn round-robin: the bucket holds, the owner does
 		// not, so the memo misses on the key compare every record.
-		{"cycle/owner16_day", func(i int) int64 { return int64(i % 16) }, day, "owner cycles every record"},
+		{"cycle/owner16_day", func(i int) int64 { return int64(i % 16) }, nil, day, "owner cycles every record"},
 		// Both components change every record: a group per record and no memo hit at all.
-		{"cycle/owner16_sec", func(i int) int64 { return int64(i % 16) }, 1, "a group per record"},
+		{"cycle/owner16_sec", func(i int) int64 { return int64(i % 16) }, nil, 1, "a group per record"},
+		// NEITHER component bucketed, which is the only shape that reaches the two-column raw
+		// lookup -- every arm above enters the bucketed path and answers most records from the
+		// interval memo without packing a key at all. This is where a two-component key is
+		// actually PACKED and hashed once per record, so it is the arm that measures the packing.
+		{"raw/owner256_cluster4", func(i int) int64 { return int64(i / 256) },
+			func(i int) int64 { return int64(i / 4) }, 0, "~30k groups, key packed every record"},
+		// The same without the map growing: a handful of groups that stay in L1, so what is left
+		// is the pack and the probe.
+		{"raw/owner16_cycle7", func(i int) int64 { return int64(i % 16) },
+			func(i int) int64 { return int64(i % 7) }, 0, "112 groups, all in L1"},
 	} {
 		b.Run(arm.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -199,7 +213,11 @@ func BenchmarkGroupAccumTwoCols(b *testing.B) {
 				a := newGroupAccum([]int64{0, arm.bucket})
 				for j := 0; j < n; j++ {
 					comps[0] = groupComp{kind: gkString, raw: arm.owner(j)}
-					comps[1] = groupComp{kind: gkInt, raw: base + int64(j)}
+					if arm.second != nil {
+						comps[1] = groupComp{kind: gkInt, raw: arm.second(j)}
+					} else {
+						comps[1] = groupComp{kind: gkInt, raw: base + int64(j)}
+					}
 					a.accFor(&comps, 0)
 				}
 				if a.nGroups() == 0 {
@@ -234,6 +252,11 @@ func BenchmarkGroupThreeCols(b *testing.B) {
 			func(i int) int64 { return int64(i % 4) }, day, "the categoricals cycle every record"},
 		{"cycle/owner16_site4_sec", func(i int) int64 { return int64(i % 16) },
 			func(i int) int64 { return int64(i % 4) }, 1, "a group per record"},
+		// Nothing bucketed: the only shape that reaches the three-column raw lookup, where a
+		// three-component key is packed and hashed once per record. Every arm above answers most
+		// of its records from the interval memo without packing a key.
+		{"raw/owner256_site8_cluster4", func(i int) int64 { return int64(i / 256) },
+			func(i int) int64 { return int64(i / 1024) }, 0, "key packed every record"},
 	} {
 		b.Run(arm.name, func(b *testing.B) {
 			b.ReportAllocs()
@@ -244,7 +267,11 @@ func BenchmarkGroupThreeCols(b *testing.B) {
 				for j := 0; j < n; j++ {
 					comps[0] = groupComp{kind: gkString, raw: arm.owner(j)}
 					comps[1] = groupComp{kind: gkString, raw: arm.site(j)}
-					comps[2] = groupComp{kind: gkInt, raw: base + int64(j)}
+					if arm.bucket == 0 {
+						comps[2] = groupComp{kind: gkInt, raw: int64(j / 4)}
+					} else {
+						comps[2] = groupComp{kind: gkInt, raw: base + int64(j)}
+					}
 					a.accFor(&comps, 0)
 				}
 				if a.nGroups() == 0 {

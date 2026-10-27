@@ -99,9 +99,9 @@ func TestBucketIntervalMemoMatchesBucketOf(t *testing.T) {
 			t.Errorf("width %d: %d groups, bucketOf gives %d", width, a.nGroups(), len(want))
 		}
 		for key, g := range a.g1.acc {
-			if want[key.raw] != g.n {
+			if want[key.raw[0]] != g.n {
 				t.Errorf("width %d: bucket %d counted %d, bucketOf counts %d",
-					width, key.raw, g.n, want[key.raw])
+					width, key.raw[0], g.n, want[key.raw[0]])
 			}
 		}
 	}

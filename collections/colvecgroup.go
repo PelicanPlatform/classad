@@ -251,6 +251,7 @@ func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, s
 func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
 	groupLookups []func(a wire.Ad) ([]byte, bool), aggLookups []func(a wire.Ad) ([]byte, bool),
 	acc *groupAccum) bool {
+	var comps [maxGroupCols]groupComp
 	for off := 0; off < w.used; {
 		o := uint32(off)
 		if end, ok := w.dmg.skip(o); ok {
@@ -269,7 +270,7 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
 			// Matched, so this record forms a group: read its values from the wire form, the same
 			// lookups the predicate-analysis path's row fallback uses, so group identity does not
 			// depend on which tier answered.
-			if !addGroupFromAd(wire.Ad(ww), groupLookups, aggLookups, acc) {
+			if !addGroupFromAd(wire.Ad(ww), groupLookups, aggLookups, acc, &comps) {
 				return false
 			}
 		}
@@ -279,9 +280,16 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
 }
 
 // addGroupFromAd is addGroupFromColumns reading from a wire ad instead of a block's columns.
+//
+// comps is the caller's scratch, held across the window rather than declared here. Declaring it was
+// a maxGroupCols-wide array zeroed once per RECORD on this path, which made the cap a per-record
+// cost at every arity -- a query grouping by one column paid for the widest key any query could
+// ask, and raising the cap raised that. Every slot the accumulator reads is comps[:len(groupLookups)]
+// and the loop below writes all of them, so reusing one array cannot carry a component over from
+// the previous record.
 func addGroupFromAd(ad wire.Ad, groupLookups []func(a wire.Ad) ([]byte, bool),
-	aggLookups []func(a wire.Ad) ([]byte, bool), acc *groupAccum) bool {
-	var comps [maxGroupCols]groupComp
+	aggLookups []func(a wire.Ad) ([]byte, bool), acc *groupAccum,
+	comps *[maxGroupCols]groupComp) bool {
 	for i := range groupLookups {
 		node, found := groupLookups[i](ad)
 		comp, ok := adGroupComp(node, found, acc)
@@ -290,7 +298,7 @@ func addGroupFromAd(ad wire.Ad, groupLookups []func(a wire.Ad) ([]byte, bool),
 		}
 		comps[i] = comp
 	}
-	g, _ := acc.accFor(&comps, len(aggLookups))
+	g, _ := acc.accFor(comps, len(aggLookups))
 	if g == nil {
 		return true // in no bucket, which the scan drops too
 	}

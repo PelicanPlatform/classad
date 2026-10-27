@@ -36,7 +36,8 @@ import (
 // scan keeps as two groups. Fold is for ORDERING AND PRUNING ONLY, never for identity: the intern
 // table below is keyed on the EXACT BYTES. TestGroupKeyStringsAreExactBytes pins it.
 //
-// ONE KEY TYPE PER ARITY, which is why there are three of them below.
+// ONE KEY TYPE PER ARITY, which is why the key below is a generic struct over two array widths
+// rather than a plain one.
 //
 // The key is hashed and compared once per RECORD whatever the query groups by, so a key wide enough
 // for the widest GROUP BY would charge its width to the narrowest. It used to: one fixed-width key
@@ -63,6 +64,17 @@ import (
 // query from the number of group columns rather than per record, and a one-column GROUP BY pays for
 // one component.
 //
+// The types are INSTANTIATIONS of one generic struct rather than three hand-written ones, and so
+// are the packing, the memo probe, the bucket entry, the insert and the unpacking. What stayed
+// per-arity is the shell: which map, and the branch structure around it. That split is not a matter
+// of taste. A generic function called out of line is called with a runtime dictionary in the first
+// argument register, and its outgoing arguments and that dictionary are part of the CALLER's frame
+// -- so putting one on a per-record path moves cost onto the function that calls it, including
+// accFor itself, which every arity goes through. Reached only through a concrete per-arity shell,
+// the generic bodies either instantiate INTO it (the packing) or sit behind it on a path taken once
+// per bucket (the entry), and every per-record function compiles to the frame it had before any of
+// this was shared. accFor is opcode-for-opcode what it was.
+//
 // The two arms that LOSE are the ones where the key is never touched. A bucketed column whose runs
 // are long answers almost every record from the interval memo below, which decides before any map
 // is reached -- so there is no key to narrow there, and what is left is the layout the bigger
@@ -77,17 +89,27 @@ import (
 // truncated key would merge groups that differ only in a component the key dropped, and report that
 // merge as an answer.
 //
-// Three. Each arity is a separate type and a separate map, so a fourth does not widen anything the
-// first three hash or compare -- the measurement that justified the old cap of two does not apply
-// to this one. It is not quite free either: the accumulator holds one key scratch and one memo
-// probe per arity and the per-component arrays are sized by the cap, and raising the cap from two
-// to three was measured at about 5% on the two-column bucketed arm whose records almost all answer
-// from the interval memo, with the same cap held at two showing no change on it at all. That is
-// layout, not key width, and it buys a column that previously fell to the record scan -- two orders
-// of magnitude -- so it is worth paying once. It is not worth paying repeatedly for shapes nothing
-// asks: one dimension beside one time bucket is what a dashboard draws, and a third column covers
-// "per owner per site per day". Raising it further is a key type, a case in each switch and a fuzz
-// shape that reaches it, plus that measurement repeated.
+// Three. Each arity is a separate key width and a separate map, so a fourth does not widen anything
+// the first three hash or compare -- the measurement that justified the old cap of two does not
+// apply to this one. Nothing per-record is sized by the cap any more either: the row fallback's
+// component scratch is held across a window rather than declared per record, and the bucket entry
+// recovers its intervals from the finished key instead of from a pair of cap-sized arrays.
+//
+// What is still sized by the cap is the ACCUMULATOR: one map, one key scratch and one memo probe
+// per arity, plus the memo's interval array and the bucket widths. That is layout, and layout is
+// what the measurement could not pin down. A control build at four, A/B'd against this one over
+// nine interleaved rounds, moved the three-column bucketed arm whose records almost all answer from
+// the interval memo by -36% -- four was FASTER -- while moving a two-column raw arm +5% and a
+// three-column adversarial one +10%, with two builds of equivalent code spanning 9% on the same
+// arms in the same run. A swing that large, in that direction, on an arm whose instruction stream
+// does not change is not a price that can be quoted; it is the accumulator falling differently in
+// memory. Raising the cap on that evidence would be guessing, so it stays where a measurement
+// supported putting it.
+//
+// Three also covers what is asked: one dimension beside one time bucket is what a dashboard draws,
+// and a third column covers "per owner per site per day". Raising it is now a line in each
+// constraint, an alias, two small per-arity functions, a case in each switch and a fuzz shape that
+// reaches it -- plus a machine quiet enough to measure what it costs the arities below.
 const maxGroupCols = 3
 
 // MaxGroupCols is maxGroupCols, for the db layer's eligibility test. A caller that groups by more
@@ -111,32 +133,56 @@ const (
 	gkError
 )
 
-// The packed key types, one per arity. Each identifies one group: per component, the kind and a raw
-// int64 that identifies the value within that kind -- the value itself for an integer, Float64bits
-// for a real, 0/1 for a boolean, a query-local id for a string, and 0 for undefined and error.
+// The packed key, one instantiation per arity. Each identifies one group: per component, the kind
+// and a raw int64 that identifies the value within that kind -- the value itself for an integer,
+// Float64bits for a real, 0/1 for a boolean, a query-local id for a string, and 0 for undefined and
+// error.
 //
 // The KIND is part of every key and may never be dropped. Without it an integer 1 and the boolean
 // TRUE share a raw of 1 and would collide into one group, while the scan renders them "1" and
 // "true" -- a coarsening, and the one the contract above forbids. TestGroupKeyKindSeparatesRawBits
 // pins it.
 //
-// A one-component key is a pair of scalars rather than a pair of length-1 arrays. It is the same 16
-// bytes either way, but the arrays make the packing an indexed store and the unpacking an indexed
-// load on the path where there is exactly one of each.
-type groupKey1 struct {
-	raw  int64
-	kind groupValKind
+// ONE type, parameterised on the two array widths, rather than a hand-written struct per arity.
+// Every type in each constraint below is an array with the same element type, which is what lets
+// the generic body INDEX k.raw[i] and k.kind[i] and take len(k.raw); and distinct array lengths are
+// distinct shapes, so the compiler stencils genuinely separate code and a map keyed on one of these
+// is a map on a concrete comparable struct. There is no interface and no per-record dispatch here.
+//
+// What this buys is that the packing, the memo probe, the bucket entry and the unpacking are each
+// written ONCE instead of once per arity, so an added arity is a line in each union, a case in the
+// dispatch switch and nothing else. What it does not buy is a free arity: see maxGroupCols.
+//
+// Go has no const generics, so the set is CLOSED -- an arity must be named in both unions. That is
+// deliberate rather than a limitation worked around: an arity with no instantiation has no key, and
+// accFor declines it instead of truncating a key to fit.
+//
+// A one-component key is [1]int64 + [1]groupValKind, which measures the same 16 bytes the pair of
+// scalars it replaced did (TestGroupKeyIsPlainMemory pins the width). The arity-1 hot paths index
+// it with a CONSTANT 0 against the concrete field, so they compile to the same direct stores and
+// loads the scalar form did; only the multi-component paths are generic, and those are the ones
+// that were duplicated.
+type rawArr interface {
+	[1]int64 | [2]int64 | [3]int64
 }
 
-type groupKey2 struct {
-	raw  [2]int64
-	kind [2]groupValKind
+type kindArr interface {
+	[1]groupValKind | [2]groupValKind | [3]groupValKind
 }
 
-type groupKey3 struct {
-	raw  [3]int64
-	kind [3]groupValKind
+type groupKeyN[R rawArr, K kindArr] struct {
+	raw  R
+	kind K
 }
+
+// One alias per arity the cap admits. They name the instantiations the dispatch switch selects, and
+// pairing the two widths here rather than at each use is what stops a key being built with its raw
+// and kind arrays at different lengths.
+type (
+	groupKey1 = groupKeyN[[1]int64, [1]groupValKind]
+	groupKey2 = groupKeyN[[2]int64, [2]groupValKind]
+	groupKey3 = groupKeyN[[3]int64, [3]groupValKind]
+)
 
 // groupComp is one component of a group key as read from a column, already resolved: a string has
 // become its query-local id, so this is pointer-free too and packing it is a pair of stores.
@@ -375,7 +421,7 @@ func (a *groupAccum) accFor(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc
 	if a.n == 1 {
 		if a.bktN == 0 {
 			m := &a.g1
-			m.key.raw, m.key.kind = comps[0].raw, comps[0].kind
+			m.key.raw[0], m.key.kind[0] = comps[0].raw, comps[0].kind
 			g := m.acc[m.key]
 			if g == nil {
 				g = newGroupAcc(nAgg)
@@ -428,97 +474,6 @@ func (a *groupAccum) accFor(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc
 	return nil, false // no key type for this arity: decline, never truncate
 }
 
-// accForRaw2 is accFor for two unbucketed group columns.
-//
-// The packing is written out rather than looped, here and in accForRaw3, because it is the one part
-// of the key that cannot be shared across arities: a two-slot key and a three-slot key have no
-// common element type to index through, so a loop over them would have to go through an interface
-// or a generic dictionary and give up the direct stores.
-//
-// No memo without a bucket. The same one-entry memo on the raw KEY was measured and did not pay: an
-// unbucketed group column repeats its value only when the records themselves do, which is a far
-// shorter run than a bucket's, and the key compare it saves is a map probe rather than the divide a
-// bucket costs. It was a few percent either way on a column whose values run in short blocks and a
-// steady loss on every column that cycles.
-func (a *groupAccum) accForRaw2(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
-	m := &a.g2
-	m.key.raw[0], m.key.kind[0] = comps[0].raw, comps[0].kind
-	m.key.raw[1], m.key.kind[1] = comps[1].raw, comps[1].kind
-	g := m.acc[m.key]
-	if g == nil {
-		g = newGroupAcc(nAgg)
-		m.acc[m.key] = g
-	}
-	g.n++
-	return g, true
-}
-
-// accForRaw3 is accForRaw2 for three unbucketed group columns.
-func (a *groupAccum) accForRaw3(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
-	m := &a.g3
-	m.key.raw[0], m.key.kind[0] = comps[0].raw, comps[0].kind
-	m.key.raw[1], m.key.kind[1] = comps[1].raw, comps[1].kind
-	m.key.raw[2], m.key.kind[2] = comps[2].raw, comps[2].kind
-	g := m.acc[m.key]
-	if g == nil {
-		g = newGroupAcc(nAgg)
-		m.acc[m.key] = g
-	}
-	g.n++
-	return g, true
-}
-
-// accForBucketed2 is accFor2 where at least one component is floored into buckets: it tries the
-// interval memo first and falls to enterBuckets2, which does the arithmetic and re-arms it.
-func (a *groupAccum) accForBucketed2(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
-	m := &a.g2
-	// Every component bucketed -- two time buckets, say -- means no unbucketed component, so the
-	// memo key is the zero key on both sides and there is nothing to compare. Split out rather than
-	// folded into the general case, because the general case has to BUILD a key to compare, and
-	// building one is a key's worth of writes on a path whose whole job is to replace a float
-	// divide with two compares. (A LONE bucketed column never reaches here: accFor serves n == 1
-	// straight-line.)
-	if !a.mCmp {
-		if g := a.mAcc; g != nil && a.inMemoIntervals(comps) {
-			g.n++
-			return g, true
-		}
-		return a.enterBuckets2(comps, nAgg, groupKey2{})
-	}
-	// The unbucketed components, which the memo has to match exactly. Bucketed slots stay zero in
-	// the probe so one struct compare answers for all of them at once.
-	var probe groupKey2
-	for _, i := range a.rawIdx[:a.rawN] {
-		probe.raw[i], probe.kind[i] = comps[i].raw, comps[i].kind
-	}
-	if g := a.mAcc; g != nil && probe == m.mKey && a.inMemoIntervals(comps) {
-		g.n++
-		return g, true
-	}
-	return a.enterBuckets2(comps, nAgg, probe)
-}
-
-// accForBucketed3 is accForBucketed2 for three group columns.
-func (a *groupAccum) accForBucketed3(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
-	m := &a.g3
-	if !a.mCmp {
-		if g := a.mAcc; g != nil && a.inMemoIntervals(comps) {
-			g.n++
-			return g, true
-		}
-		return a.enterBuckets3(comps, nAgg, groupKey3{})
-	}
-	var probe groupKey3
-	for _, i := range a.rawIdx[:a.rawN] {
-		probe.raw[i], probe.kind[i] = comps[i].raw, comps[i].kind
-	}
-	if g := a.mAcc; g != nil && probe == m.mKey && a.inMemoIntervals(comps) {
-		g.n++
-		return g, true
-	}
-	return a.enterBuckets3(comps, nAgg, probe)
-}
-
 // inMemoIntervals reports whether every bucketed component falls in the interval the memo remembers
 // for it.
 //
@@ -537,94 +492,218 @@ func (a *groupAccum) inMemoIntervals(comps *[maxGroupCols]groupComp) bool {
 	return true
 }
 
-// enterBuckets2 floors every bucketed component, finds the resulting group's accumulator and arms
-// the interval memo with it. It is accForBucketed2's slow path: reached on the first record of each
-// bucket, and on any record the memo declines to decide.
+// armMemoN points the interval memo at the buckets key landed in.
 //
-// Kept out of accForBucketed2 rather than written inline, because the hot path there is a handful of
-// instructions and the code around it is what decides how they are laid out: folding this in cost
-// the UNBUCKETED path measurably while doing nothing for the bucketed one.
+// Called only once every component has bucketed, and read back from the FINISHED key rather than
+// from intervals accumulated as the floor loop went: key.raw[i] is the bucket start it stored, so the
+// interval is recoverable from it and there is no pair of per-call arrays to zero -- which also
+// means the cap does not size anything on this path. A record that turns out to be in NO bucket
+// never reaches here, and it has to leave the memo exactly as it found it: writing intervals in
+// place as they were computed would strand fresh ones beside the PREVIOUS record's accumulator,
+// which a later record would then hit on. Leaving it armed is also what keeps a run of unbucketable
+// records interleaved with ordinary ones from restarting the bucket on every one of them.
 //
-// The floor loop is written out again in enterBuckets3 rather than shared. It cannot be shared as
-// written -- it stores into the key, and a two-slot key and a three-slot key have no common element
-// type -- and hoisting just the arithmetic into a helper that returns the bucket starts costs a call
-// per record on the shape where every record enters a new bucket. What the two DO share is bucketOf
-// itself, which is where agreeing with the scan on where a bucket edge lies is decided.
-func (a *groupAccum) enterBuckets2(comps *[maxGroupCols]groupComp, nAgg int, probe groupKey2) (*groupAcc, bool) {
+// The top of each interval is pulled a few ulps BELOW its true edge; see the memo's field.
+func armMemoN[R rawArr, K kindArr](a *groupAccum, key *groupKeyN[R, K]) {
+	for _, i := range a.bktIdx[:a.bktN] {
+		lo := float64(key.raw[i])
+		hi := lo + float64(a.bucket[i])
+		a.mIv[i][0], a.mIv[i][1] = lo, hi-math.Abs(hi)*bucketMemoMargin
+	}
+}
+
+// packProbeN writes only the components idx names, leaving the rest of the key zero. It is the
+// memo's probe: the bucketed slots stay zero on both sides so one struct compare answers for every
+// unbucketed component at once.
+func packProbeN[R rawArr, K kindArr](k *groupKeyN[R, K], comps *[maxGroupCols]groupComp, idx []uint8) {
+	for _, i := range idx {
+		k.raw[i], k.kind[i] = comps[i].raw, comps[i].kind
+	}
+}
+
+// newGroupN creates the group k names and files it in m. Once per GROUP rather than once per
+// record, and shared between the raw and the bucketed paths so the two cannot create a group
+// differently.
+//
+// k is a POINTER for the caller's sake, not this function's. A key is an array pair and Go's ABI
+// never puts an array in a register, so by value it is copied into the caller's outgoing argument
+// area -- and the caller is the per-record lookup, whose frame then carries a whole key it never
+// otherwise needs.
+func newGroupN[R rawArr, K kindArr](m *groupMap[groupKeyN[R, K]], k *groupKeyN[R, K],
+	nAgg int) *groupAcc {
+	g := newGroupAcc(nAgg)
+	m.acc[*k] = g
+	return g
+}
+
+// accForRaw2 / accForRaw3 are accFor for two or three unbucketed group columns.
+//
+// What is left here per arity is which map to use, the stores that fill its key, and a probe of it.
+// None of those is shared, and the reason is the same for all three: a generic function the
+// compiler declines to instantiate INTO its caller becomes a call with a runtime dictionary in the
+// first argument register, and every line of this function runs once per RECORD. The packing in
+// particular was shared first and measured: a loop over len(key.raw) -- a constant the compiler
+// knows and does not unroll -- cost about 7% on a two-column raw group whose map is small enough to
+// sit in L1, where the stores are most of the work. The widths are spelled out instead.
+//
+// What IS shared is everything that is not per-record: the key TYPE, the insert (newGroupN), the
+// memo probe's packing, the bucket arithmetic and the unpacking. Those are where an arity could be
+// got wrong, and they are written once.
+//
+// The arity-1 shape never reaches here: accFor serves it straight-line, because at a couple of
+// nanoseconds a record the structure of the code is most of the cost there.
+//
+// No memo without a bucket. The same one-entry memo on the raw KEY was measured and did not pay: an
+// unbucketed group column repeats its value only when the records themselves do, which is a far
+// shorter run than a bucket's, and the key compare it saves is a map probe rather than the divide a
+// bucket costs. It was a few percent either way on a column whose values run in short blocks and a
+// steady loss on every column that cycles.
+func (a *groupAccum) accForRaw2(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
+	m := &a.g2
+	m.key.raw[0], m.key.kind[0] = comps[0].raw, comps[0].kind
+	m.key.raw[1], m.key.kind[1] = comps[1].raw, comps[1].kind
+	g := m.acc[m.key]
+	if g == nil {
+		g = newGroupN(m, &m.key, nAgg)
+	}
+	g.n++
+	return g, true
+}
+
+func (a *groupAccum) accForRaw3(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
+	m := &a.g3
+	m.key.raw[0], m.key.kind[0] = comps[0].raw, comps[0].kind
+	m.key.raw[1], m.key.kind[1] = comps[1].raw, comps[1].kind
+	m.key.raw[2], m.key.kind[2] = comps[2].raw, comps[2].kind
+	g := m.acc[m.key]
+	if g == nil {
+		g = newGroupN(m, &m.key, nAgg)
+	}
+	g.n++
+	return g, true
+}
+
+// accForBucketed2 / accForBucketed3 are accForRaw2 / accForRaw3 where at least one component is
+// floored into buckets: they try the interval memo first and fall to enterBucketsN, which does the
+// arithmetic and re-arms it.
+//
+// The `!a.mCmp` case is an early return rather than a condition around the probe below, which reads
+// the same and is not the same. Guarding only the fill leaves the compiler laying the common case
+// -- there IS an unbucketed component -- out of line, so a memo hit runs three disjoint stretches
+// of code joined by two long branches instead of falling through; it measured +36% on the
+// three-column arm whose records almost all answer from the memo, with the instructions themselves
+// unchanged.
+//
+// Every component bucketed -- two time buckets, say -- means no unbucketed component, so the memo
+// key is the zero key on both sides and there is nothing to compare. (A LONE bucketed column never
+// reaches here: accFor serves n == 1 straight-line.)
+func (a *groupAccum) accForBucketed2(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
+	m := &a.g2
+	if !a.mCmp {
+		if g := a.mAcc; g != nil && a.inMemoIntervals(comps) {
+			g.n++
+			return g, true
+		}
+		return a.enterBuckets2(comps, nAgg, groupKey2{})
+	}
+	var probe groupKey2
+	packProbeN(&probe, comps, a.rawIdx[:a.rawN])
+	if g := a.mAcc; g != nil && probe == m.mKey && a.inMemoIntervals(comps) {
+		g.n++
+		return g, true
+	}
+	return a.enterBuckets2(comps, nAgg, probe)
+}
+
+func (a *groupAccum) accForBucketed3(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc, bool) {
+	m := &a.g3
+	if !a.mCmp {
+		if g := a.mAcc; g != nil && a.inMemoIntervals(comps) {
+			g.n++
+			return g, true
+		}
+		return a.enterBuckets3(comps, nAgg, groupKey3{})
+	}
+	var probe groupKey3
+	packProbeN(&probe, comps, a.rawIdx[:a.rawN])
+	if g := a.mAcc; g != nil && probe == m.mKey && a.inMemoIntervals(comps) {
+		g.n++
+		return g, true
+	}
+	return a.enterBuckets3(comps, nAgg, probe)
+}
+
+// enterBuckets2 / enterBuckets3 are accForBucketed2 / accForBucketed3's slow path: reached on the
+// first record of each bucket, and on any record the memo declines to decide. They floor the
+// bucketed components into the key beside the unbucketed ones probe already carries, find the
+// resulting group and re-arm the memo with it.
+//
+// What is shared is the arming (armMemoN) and the insert (newGroupN); what is written out here is
+// the floor loop and the map probe. That split is where the compiler put it, not where taste would:
+// a generic function it declines to instantiate into its caller becomes a CALL with a runtime
+// dictionary, and on a column whose buckets are as narrow as the step between its values this
+// function runs once per RECORD rather than once per bucket, so a frame added here is a frame per
+// record. The flooring is just over the size the compiler will inline, and it measured.
+//
+// The arithmetic the floor loop performs is bucketOf, which IS shared -- that is where agreeing
+// with the scan on where a bucket edge lies is decided, and it is the part that could disagree.
+// What is repeated is the loop around it.
+//
+// Kept out of accForBucketed2 rather than written inline, because the hot path there is a handful
+// of instructions and the code around it is what decides how they are laid out: folding this in
+// cost the UNBUCKETED path measurably while doing nothing for the bucketed one.
+//
+//go:noinline
+func (a *groupAccum) enterBuckets2(comps *[maxGroupCols]groupComp, nAgg int,
+	probe groupKey2) (*groupAcc, bool) {
 	// probe already carries the unbucketed components (and is the zero key when there are none,
 	// which is the only case the caller leaves it unfilled), so the key is built by filling in the
 	// bucketed slots beside them.
 	key := probe
-	// The intervals go into locals and are committed only once every component has bucketed. A
-	// record that turns out to be in NO bucket returns partway through, and it has to leave the memo
-	// exactly as it found it: writing the intervals in place would strand fresh ones beside the
-	// PREVIOUS record's accumulator, which a later record would then hit on. Leaving it armed is
-	// also what keeps a run of unbucketable records interleaved with ordinary ones from restarting
-	// the bucket on every one of them.
-	var lo, hi [maxGroupCols]float64
 	for _, i := range a.bktIdx[:a.bktN] {
 		f, isNum := comps[i].number()
 		if !isNum {
 			return nil, true // no number to floor: the record leaves the series
 		}
-		// The floor goes through float64 and renders as an integer because that is what
-		// db.bucketKeyText does: a bucket start is a whole number whatever the column's own type,
-		// so an int column and a real column land in the same group. Sharing the arithmetic rather
-		// than writing it twice is what keeps the two paths from disagreeing.
-		//
-		// A number can still be in no bucket: a NaN or an infinity lies in no half-open interval
-		// [b, b+width), so bucketOf declines it and the record leaves the series the same way a
-		// string does. See bucketOf for why that beats letting the int64 cast invent a bucket.
 		b, inBucket := bucketOf(f, a.bucket[i])
 		if !inBucket {
 			return nil, true
 		}
 		key.raw[i], key.kind[i] = b, gkInt
-		lo[i] = float64(b)
-		hi[i] = lo[i] + float64(a.bucket[i])
 	}
 	m := &a.g2
 	g := m.acc[key]
 	if g == nil {
-		g = newGroupAcc(nAgg)
-		m.acc[key] = g
+		g = newGroupN(m, &key, nAgg)
 	}
 	g.n++
-	for _, i := range a.bktIdx[:a.bktN] {
-		a.mIv[i][0], a.mIv[i][1] = lo[i], hi[i]-math.Abs(hi[i])*bucketMemoMargin
-	}
+	armMemoN(a, &key)
 	m.mKey, a.mAcc = probe, g
 	return g, true
 }
 
-// enterBuckets3 is enterBuckets2 for three group columns. See there for why the loop is written out
-// rather than shared.
-func (a *groupAccum) enterBuckets3(comps *[maxGroupCols]groupComp, nAgg int, probe groupKey3) (*groupAcc, bool) {
+//go:noinline
+func (a *groupAccum) enterBuckets3(comps *[maxGroupCols]groupComp, nAgg int,
+	probe groupKey3) (*groupAcc, bool) {
 	key := probe
-	var lo, hi [maxGroupCols]float64
 	for _, i := range a.bktIdx[:a.bktN] {
 		f, isNum := comps[i].number()
 		if !isNum {
-			return nil, true
+			return nil, true // no number to floor: the record leaves the series
 		}
 		b, inBucket := bucketOf(f, a.bucket[i])
 		if !inBucket {
 			return nil, true
 		}
 		key.raw[i], key.kind[i] = b, gkInt
-		lo[i] = float64(b)
-		hi[i] = lo[i] + float64(a.bucket[i])
 	}
 	m := &a.g3
 	g := m.acc[key]
 	if g == nil {
-		g = newGroupAcc(nAgg)
-		m.acc[key] = g
+		g = newGroupN(m, &key, nAgg)
 	}
 	g.n++
-	for _, i := range a.bktIdx[:a.bktN] {
-		a.mIv[i][0], a.mIv[i][1] = lo[i], hi[i]-math.Abs(hi[i])*bucketMemoMargin
-	}
+	armMemoN(a, &key)
 	m.mKey, a.mAcc = probe, g
 	return g, true
 }
@@ -646,7 +725,7 @@ func (a *groupAccum) enterBucket1(f float64, nAgg int) (*groupAcc, bool) {
 		return nil, true
 	}
 	m := &a.g1
-	m.key.raw, m.key.kind = b, gkInt
+	m.key.raw[0], m.key.kind[0] = b, gkInt
 	g := m.acc[m.key]
 	if g == nil {
 		g = newGroupAcc(nAgg)
@@ -679,20 +758,22 @@ func (a *groupAccum) compValue(raw int64, kind groupValKind) classad.Value {
 	return classad.NewIntValue(raw)
 }
 
-// values1 / values2 / values3 render a key back to the group's component values, in request order.
-func (a *groupAccum) values1(k groupKey1) []classad.Value {
-	return []classad.Value{a.compValue(k.raw, k.kind)}
+// keyValues renders a key back to the group's component values, in request order. It runs once per
+// GROUP rather than once per record, so the loop the generic form costs is charged to the result
+// shaping and not to the scan.
+func keyValues[R rawArr, K kindArr](a *groupAccum, k groupKeyN[R, K]) []classad.Value {
+	vs := make([]classad.Value, len(k.raw))
+	for i := 0; i < len(k.raw); i++ {
+		vs[i] = a.compValue(k.raw[i], k.kind[i])
+	}
+	return vs
 }
 
-func (a *groupAccum) values2(k groupKey2) []classad.Value {
-	return []classad.Value{a.compValue(k.raw[0], k.kind[0]), a.compValue(k.raw[1], k.kind[1])}
-}
-
-func (a *groupAccum) values3(k groupKey3) []classad.Value {
-	return []classad.Value{
-		a.compValue(k.raw[0], k.kind[0]),
-		a.compValue(k.raw[1], k.kind[1]),
-		a.compValue(k.raw[2], k.kind[2]),
+// eachGroup calls f once per group of one arity's map, which is what each dispatches to.
+func eachGroup[R rawArr, K kindArr](a *groupAccum, m *groupMap[groupKeyN[R, K]],
+	f func([]classad.Value, *groupAcc)) {
+	for k, g := range m.acc {
+		f(keyValues(a, k), g)
 	}
 }
 
@@ -714,17 +795,11 @@ func (a *groupAccum) nGroups() int {
 func (a *groupAccum) each(f func([]classad.Value, *groupAcc)) {
 	switch a.n {
 	case 1:
-		for k, g := range a.g1.acc {
-			f(a.values1(k), g)
-		}
+		eachGroup(a, &a.g1, f)
 	case 2:
-		for k, g := range a.g2.acc {
-			f(a.values2(k), g)
-		}
+		eachGroup(a, &a.g2, f)
 	case 3:
-		for k, g := range a.g3.acc {
-			f(a.values3(k), g)
-		}
+		eachGroup(a, &a.g3, f)
 	}
 }
 
