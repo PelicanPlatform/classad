@@ -35,6 +35,15 @@ type recOffsSnap struct {
 	upto uint32   // the offset just past the last record covered
 }
 
+// offsRetired marks a segment that is no longer the shard's write target. It is one shared,
+// empty snapshot, so a retired segment costs a pointer.
+//
+// A plain nil would not do: a reader that loaded the table just before the roll publishes with a
+// compare-and-swap against what it loaded, and against nil that swap would succeed and put a
+// table back on a segment that has just dropped one. Swapping against this cannot, so a sealed
+// segment never holds a table and the memory stays bounded by the segment being appended to.
+var offsRetired = &recOffsSnap{}
+
 // reverseOffsets returns the offsets of w's records, ascending, for a newest-first walk to
 // replay backward -- or nil when the caller must frame the window itself.
 //
@@ -49,24 +58,31 @@ func reverseOffsets(w segWindow) []uint32 {
 	if w.seg == nil {
 		return nil
 	}
+	cur := w.seg.recOffs.Load()
+	if cur == offsRetired {
+		return nil
+	}
 	if !w.active {
 		// No longer appended to (or never was): release whatever table it has. The write
 		// target drops its own at the roll; this catches a segment that stopped being the
 		// target some other way.
-		if w.seg.recOffs.Load() != nil {
-			w.seg.recOffs.Store(nil)
+		if cur != nil {
+			w.seg.dropRecOffs()
 		}
 		return nil
 	}
 	if w.dmg != nil {
 		return nil
 	}
-	if cur := w.seg.recOffs.Load(); cur != nil && int(cur.upto) >= w.used {
+	if cur != nil && int(cur.upto) >= w.used {
 		return offsBelow(cur.offs, w.used)
 	}
 	w.seg.recOffsMu.Lock()
 	defer w.seg.recOffsMu.Unlock()
-	cur := w.seg.recOffs.Load()
+	cur = w.seg.recOffs.Load()
+	if cur == offsRetired {
+		return nil
+	}
 	if cur != nil && int(cur.upto) >= w.used {
 		return offsBelow(cur.offs, w.used)
 	}
@@ -74,9 +90,9 @@ func reverseOffsets(w segWindow) []uint32 {
 	if next == nil {
 		return nil
 	}
-	// A failed swap means the segment was retired as the write target while this ran; the
-	// table built here still describes bytes that never change, so this walk uses it and
-	// nothing is published.
+	// A failed swap means the segment was retired as the write target while this ran (see
+	// offsRetired); the table built here still describes bytes that never change, so this walk
+	// uses it and nothing is published.
 	w.seg.recOffs.CompareAndSwap(cur, next)
 	return offsBelow(next.offs, w.used)
 }
@@ -127,8 +143,8 @@ func offsBelow(offs []uint32, used int) []uint32 {
 // write target: it will not grow again, and keeping one per sealed segment would make the
 // memory a function of the store rather than of the segment being written.
 func (s *segment) dropRecOffs() {
-	if s != nil && s.recOffs.Load() != nil {
-		s.recOffs.Store(nil)
+	if s != nil {
+		s.recOffs.Store(offsRetired)
 	}
 }
 
@@ -136,7 +152,7 @@ func (s *segment) dropRecOffs() {
 // far into the arena, or (0, 0, false) when it has none.
 func (s *segment) recOffsState() (records int, upto uint32, ok bool) {
 	c := s.recOffs.Load()
-	if c == nil {
+	if c == nil || c == offsRetired {
 		return 0, 0, false
 	}
 	return len(c.offs), c.upto, true
