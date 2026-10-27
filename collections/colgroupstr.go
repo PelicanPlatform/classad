@@ -191,7 +191,7 @@ func (gc *groupCols) accFor(k int, bc *blockCache, acc *groupAccum, nAgg int) (*
 			// among the strings buckets normally, and those records reach compAt below. Skipping
 			// the whole column here instead lost them silently: every count stayed plausible and
 			// most of the groups simply were not there.
-			if acc.bucket[0] > 0 {
+			if acc.bucketed(0) {
 				return nil, true
 			}
 			code := dictCodeAt(c.codes, c.codeW, k)
@@ -225,7 +225,7 @@ func (gc *groupCols) accFor(k int, bc *blockCache, acc *groupAccum, nAgg int) (*
 			// as any one of its bucket keys fails to render -- so this record is in no group at
 			// all, whatever the other columns say. Only this record, not the column: a number that
 			// escaped a string column reaches compAt below and buckets normally.
-			if acc.bucket[i] > 0 {
+			if acc.bucketed(i) {
 				return nil, true
 			}
 			code := dictCodeAt(c.codes, c.codeW, k)
