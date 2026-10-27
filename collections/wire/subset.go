@@ -89,46 +89,10 @@ func patchUvarint5(b []byte, v uint64) {
 type SubsetScratch struct {
 	hot    []uint32
 	copied []int
-	// The reference closure's index of one record (see AppendAdSubsetInlineRefs) and the
-	// plaintext it opened while building it, both reused across ads for the same reason as
-	// the two above.
-	ents  []subsetEnt
-	plain []byte
 	// nameBuf holds one resolved attribute name at a time for the interned assembler,
 	// whose keep test takes bytes while an intern table hands back a string. Reused so
 	// resolving a name costs no allocation per entry.
 	nameBuf []byte
-}
-
-// subsetEnt is ONE indexed entry of the record being assembled: where its bytes are, and
-// whether the closure has taken it. Parsing an entry costs a name read and a node skip, and
-// the closure needs several passes over the entries, so the passes run over these instead --
-// the record is walked once and every later pass is a loop over small slices.
-//
-// field, name and node are sub-slices of the record, so an entry is valid only for the
-// record it was built from. plainOff/plainLen instead index SubsetScratch.plain, because an
-// opened sealed value is not part of the record and appending the next one may move it.
-type subsetEnt struct {
-	start int32  // entry offset in the record, for the hot phase's duplicate test
-	hash  uint32 // NameHash32Bytes(name), computed once here because the closure's
-	// repeated passes would otherwise recompute it for every entry on every pass -- which
-	// is the actual per-pass cost, not the entry parsing.
-	plainOff int32 // -1 unless the node was sealed and opened
-	plainLen int32
-	field    []byte // the encoded name field, copied to the output verbatim
-	name     []byte // the decoded name, for the caller's keep test
-	node     []byte // the stored value node
-	sel      bool
-}
-
-// value is the bytes the entry contributes to the row: the opened plaintext for a sealed
-// node, the stored node otherwise. It is also what the closure reads references from, so the
-// closure sees what the consumer will evaluate rather than an opaque ciphertext.
-func (e *subsetEnt) value(sc *SubsetScratch) []byte {
-	if e.plainOff < 0 {
-		return e.node
-	}
-	return sc.plain[e.plainOff : e.plainOff+e.plainLen]
 }
 
 // AppendAdSubsetInlineHotFirst is AppendAdSubsetInline with the hot-header
