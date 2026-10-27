@@ -389,8 +389,11 @@ var mxWant = map[string]map[mxKind]string{
 		kMissing: "err: no such table: nope",
 	},
 	"QueryRawWire": {
-		kTable:   "stream",
-		kView:    "badreq",
+		kTable: "stream",
+		// A view's backing store is an in-memory db, and a RAM table serves wire rows now
+		// (its interned keys are rewritten to names as the row is assembled), so a view
+		// streams here like it already did for every other raw read.
+		kView:    "stream",
 		kArchive: "err: archive table \"hist\": QueryRawWire is not served from an archive; use QueryRawProject, which does read one",
 		kMissing: "err: no such table: nope",
 	},

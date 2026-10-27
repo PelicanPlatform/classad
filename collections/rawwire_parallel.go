@@ -148,8 +148,8 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 							return true
 						}
 						nw := c.narrowProjected(&narrow, sel, dict, w)
-						out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf,
-							wire.Ad(c.wireToInlineRead(dict, nw, sel.redact)), sel.keep, needed, seal, &sc)
+						out, ok := c.appendWireRow(batch.buf,
+							c.wireToInlineRead(dict, nw, sel.redact), sel, needed, seal, &sc)
 						if !ok {
 							batch.buf = out[:start]
 							return true
@@ -169,7 +169,7 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 						w, perr := pd.DecompressPrefix(dbuf[:0], ad, wirePrefixBytes)
 						dbuf = w
 						if perr == nil {
-							if out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(w), sel.keep, needed, seal, &sc); ok {
+							if out, ok := c.appendWireRow(batch.buf, w, sel, needed, seal, &sc); ok {
 								consecFail = 0
 								batch.buf = out
 								batch.offs = append(batch.offs, len(out))
@@ -190,7 +190,7 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 					if err != nil {
 						return true // undecodable record: skip, matching the serial scan
 					}
-					out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(w), sel.keep, needed, seal, &sc)
+					out, ok := c.appendWireRow(batch.buf, w, sel, needed, seal, &sc)
 					if !ok {
 						batch.buf = out[:start] // discard the partial append
 						return true

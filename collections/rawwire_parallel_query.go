@@ -129,7 +129,7 @@ func (c *Collection) runParallelWireQuery(qp queryPlan, sel *wireSubsetSelector,
 				start := len(batch.buf)
 				w = c.narrowProjected(&narrow, sel, dict, w)
 				w = c.wireToInlineRead(dict, w, sel.redact)
-				out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(w), sel.keep, needed, seal, &sc)
+				out, ok := c.appendWireRow(batch.buf, w, sel, needed, seal, &sc)
 				if !ok {
 					batch.buf = out[:start] // discard the partial append
 					return true             // not an inline ad / malformed: skip, keep scanning
