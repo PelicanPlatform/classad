@@ -1154,11 +1154,20 @@ func (c *Collection) Len() int {
 // which the COUNT(*) fast path relies on.
 func (c *Collection) Chained() bool { return c.isStructural != nil }
 
+// Persistent reports whether this collection is backed by a directory, which is also what
+// decides its record encoding: a persistent collection stores attribute names inline (so its
+// segment files recover without a table), an in-memory one interns them against the shared
+// table. Callers that used to read SupportsRawWire for this -- it was c.inline -- want this.
+func (c *Collection) Persistent() bool { return c.inline }
+
 // SupportsRawWire reports whether ScanRawWire/QueryRawWire can serve this collection.
-// Only an inline (persistent) collection can: a RAM collection's ads are not
-// self-contained, so the relay scans yield nothing for one. A caller MUST check this
-// rather than treat an empty relay scan as an empty result -- they look identical.
-func (c *Collection) SupportsRawWire() bool { return c.inline }
+// Every collection can: a persistent one stores inline names already, and an in-memory one's
+// interned keys are rewritten to names while the row is assembled (see appendWireRow). It
+// returned c.inline while that rewrite did not exist, and the relay scans then yielded nothing
+// for a RAM table -- indistinguishable from a query that matched nothing, which is why the
+// callers were made to check first. It is kept, always true, so those callers still compile
+// and so a future storage form that genuinely cannot relay has somewhere to say so.
+func (c *Collection) SupportsRawWire() bool { return true }
 
 // Keys returns every visible key in the collection at a consistent per-shard
 // snapshot, in no particular order. Structural (parent-only) keys of a chained
@@ -1357,6 +1366,13 @@ type scanVisitState struct {
 	preFold     *colPrefilter
 	projCS      *colScope
 	projScratch projectScratch
+	selfClosed  selfClosedScratch
+	// closureMiss counts CONSECUTIVE records whose projected ad was not self-contained, so a
+	// scan whose projection names an expression reaching outside itself stops paying for the
+	// attempt. Without it that scan reads the columns, finds the ad unusable and reassembles
+	// anyway -- strictly worse than never having tried. Same adaptive shape as the prefix
+	// gate in the parallel wire scan, and reset by any record that does stay on the fast path.
+	closureMiss int
 	built       bool // prefilters/projection scope built; they depend only on the plan
 }
 
@@ -1424,9 +1440,19 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		// reads no attribute (so it is constant and the ad cannot change its answer) or the match was
 		// just decided FROM the columns. Anything less certain reassembles, because a narrowed ad
 		// cannot be handed to the matcher -- its seed set is not closed.
-		if projCS != nil && cn != nil && (isConst || colDecided) {
+		if projCS != nil && cn != nil && (isConst || colDecided) && st.closureMiss < closureMissGiveUp {
 			if k, ok := cn.indexOf(r.off); ok {
-				if out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &st.projScratch); ok {
+				// A plan whose consumer evaluates takes the fast path only for records whose
+				// projected ad is self-contained; the rest fall through and reassemble. See
+				// adSelfClosed for why that is the real condition rather than "has a plan".
+				out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &st.projScratch)
+				if ok && qp.proj.closure && !adSelfClosed(out, &st.selfClosed) {
+					ok = false
+					st.closureMiss++
+					qp.stats.closureReassembled()
+				}
+				if ok {
+					st.closureMiss = 0
 					qp.stats.matched() // projected straight from columns; no reassembly
 					if qp.ws != nil {
 						qp.ws.dict = dict

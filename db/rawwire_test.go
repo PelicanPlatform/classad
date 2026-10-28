@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/PelicanPlatform/classad/collections"
 )
 
 // TestUpdateOldVisibleInQueryRawAndWatch proves the wire-native ingest path goes
@@ -251,5 +253,153 @@ func TestQueryRawProjectedFromSeq(t *testing.T) {
 		if cluster%2 != 0 {
 			t.Errorf("cluster %d does not match the constraint", cluster)
 		}
+	}
+}
+
+// TestQueryRawWireInMemoryTable is the RAM table's half of the relay contract: QueryRawWire
+// must serve an in-memory table, and the rows it serves must render to exactly what the text
+// path returns for the same query -- expression-valued attributes included, since those are
+// where the two record encodings actually differ (an interned record spells the attribute
+// references INSIDE an expression as ids too, not just the attribute keys).
+//
+// It fails loudly on the empty result, which is the failure mode this path invites: a relay
+// scan that yields nothing is indistinguishable from a query that matched nothing.
+func TestQueryRawWireInMemoryTable(t *testing.T) {
+	d, err := Open("") // in-memory -> interned encoding
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = d.Close() }()
+	if d.Persistent() {
+		t.Fatal("Open(\"\") produced a persistent table: this test would not cover the RAM path")
+	}
+
+	ads := map[string]string{
+		"a": "MyType = \"Machine\"\nName = \"slotA\"\nState = \"Unclaimed\"\nCpus = 8\n" +
+			"ClaimId = \"<secret>\"\n" +
+			"Requirements = (TARGET.RequestCpus <= Cpus) && (MY.State =?= \"Unclaimed\")\n" +
+			"Rank = strcat(Name, \"/\", State)\nNested = [Inner = Cpus * 2]\nPicked = Nested.Inner",
+		"b": "MyType = \"Machine\"\nName = \"slotB\"\nState = \"Claimed\"\nCpus = 4\n" +
+			"Requirements = Cpus > 2\nRank = -Cpus",
+	}
+	for k, text := range ads {
+		if err := d.UpdateOld(k, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	collect := func(constraint string, proj []string, redact bool) map[string]map[string]string {
+		t.Helper()
+		seq, err := d.QueryRawWire(constraint, proj, redact)
+		if err != nil {
+			t.Fatalf("QueryRawWire: %v", err)
+		}
+		out := map[string]map[string]string{}
+		var buf []byte
+		var offs []int
+		for row := range seq {
+			var ok bool
+			buf, offs, _, _, ok = collections.RenderRawAdInline(row, buf, offs)
+			if !ok {
+				t.Fatal("RenderRawAdInline failed on a shipped row")
+			}
+			m := map[string]string{}
+			for i := 0; i+1 < len(offs); i++ {
+				name, val, found := strings.Cut(string(buf[offs[i]:offs[i+1]]), " = ")
+				if !found {
+					t.Fatalf("malformed expr %q", buf[offs[i]:offs[i+1]])
+				}
+				m[name] = val
+			}
+			out[strings.Trim(m["Name"], `"`)] = m
+		}
+		return out
+	}
+	collectText := func(constraint string, proj []string, redact bool) map[string]map[string]string {
+		t.Helper()
+		seq, err := d.QueryRawProjected(constraint, proj, redact)
+		if err != nil {
+			t.Fatalf("QueryRawProjected: %v", err)
+		}
+		out := map[string]map[string]string{}
+		for ra := range seq {
+			m := map[string]string{}
+			for _, e := range ra.Exprs {
+				name, val, found := strings.Cut(string(e), " = ")
+				if !found {
+					t.Fatalf("malformed expr %q", e)
+				}
+				m[name] = val
+			}
+			out[strings.Trim(m["Name"], `"`)] = m
+		}
+		return out
+	}
+
+	cases := []struct {
+		name       string
+		constraint string
+		proj       []string
+		redact     bool
+	}{
+		{"whole-ad", "true", nil, false},
+		{"whole-ad-redacted", "true", nil, true},
+		{"projected", "true", []string{"Name", "Requirements", "Rank", "Picked", "Nested"}, false},
+		{"constrained", `Cpus == 8`, []string{"Name", "Requirements"}, false},
+		{"projected-redacted", "true", []string{"Name", "ClaimId"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			want := collectText(tc.constraint, tc.proj, tc.redact)
+			got := collect(tc.constraint, tc.proj, tc.redact)
+			if len(got) == 0 {
+				t.Fatal("QueryRawWire returned no rows for an in-memory table")
+			}
+			if len(got) != len(want) {
+				t.Fatalf("wire returned %d ads, text %d", len(got), len(want))
+			}
+			for name, attrs := range want {
+				g, ok := got[name]
+				if !ok {
+					t.Errorf("%s: missing from the wire result", name)
+					continue
+				}
+				if len(g) != len(attrs) {
+					t.Errorf("%s: wire %v != text %v", name, g, attrs)
+					continue
+				}
+				for a, v := range attrs {
+					if g[a] != v {
+						t.Errorf("%s.%s: wire %q != text %q", name, a, g[a], v)
+					}
+				}
+			}
+		})
+	}
+
+	// Redaction is applied at the source, not by the renderer: the private value's bytes must
+	// not be in the row at all. And the entitled read must still carry it, or the check above
+	// would pass for the trivial reason that nothing ships.
+	seq, err := d.QueryRawWire("true", nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for row := range seq {
+		if strings.Contains(string(row), "<secret>") {
+			t.Fatal("a redacted wire row carries the private value bytes")
+		}
+	}
+	seq, err = d.QueryRawWire("true", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entitled := false
+	for row := range seq {
+		if strings.Contains(string(row), "<secret>") {
+			entitled = true
+		}
+	}
+	if !entitled {
+		t.Fatal("an entitled whole-ad wire row dropped the private attribute")
 	}
 }

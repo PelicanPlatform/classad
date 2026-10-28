@@ -389,8 +389,20 @@ var mxWant = map[string]map[mxKind]string{
 		kMissing: "err: no such table: nope",
 	},
 	"QueryRawWire": {
-		kTable:   "stream",
-		kView:    "badreq",
+		kTable: "stream",
+		// A view's backing store is an in-memory db, and a RAM table serves wire rows now
+		// (its interned keys are rewritten to names as the row is assembled), so a view
+		// streams here like it already did for every other raw read.
+		kView:    "stream",
+		kArchive: "err: archive table \"hist\": QueryRawWire is not served from an archive; use QueryRawProject, which does read one",
+		kMissing: "err: no such table: nope",
+	},
+	"QueryRawWireRefs": {
+		kTable: "stream",
+		// Same as QueryRawWire above: a view is backed by an in-memory db, and those serve
+		// wire rows now. The closure runs on that path too -- the record is rewritten to
+		// name space first -- so a view gets chased rows rather than a refusal.
+		kView:    "stream",
 		kArchive: "err: archive table \"hist\": QueryRawWire is not served from an archive; use QueryRawProject, which does read one",
 		kMissing: "err: no such table: nope",
 	},
@@ -623,6 +635,16 @@ func mxCases() []mxCase {
 			return func(id uint64) []byte {
 				b := putStr(req(id, opQueryRawWire), n)
 				b = putI32(b, 0)
+				b = putU8(b, 0)
+				b = putStr(b, "true")
+				return projTail(b)
+			}
+		}},
+		{op: "QueryRawWireRefs", build: func(n string) func(uint64) []byte {
+			return func(id uint64) []byte {
+				b := putStr(req(id, opQueryRawWireOpts), n)
+				b = putI32(b, 0)
+				b = putI32(b, int32(wireFlagRefs)) // the opts frame carries its flags word
 				b = putU8(b, 0)
 				b = putStr(b, "true")
 				return projTail(b)

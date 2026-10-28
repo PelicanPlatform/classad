@@ -63,7 +63,13 @@ type ScanStats struct {
 	RecordsVisited       int // records the scan iterated
 	RecordsColumnDecided int // WHERE answered from the columnar prefilter (no reassembly to test it)
 	RecordsReassembled   int // record rebuilt from the arena (the ~O(ad width) path)
-	RowsMatched          int // records that satisfied the WHERE and were emitted
+	// RecordsClosureReassembled counts records that COULD have been projected straight from
+	// their columns but were reassembled anyway, because the projected ad referred to an
+	// attribute the projection left out and the consumer evaluates what it receives. A large
+	// share here means the projection names expressions reaching outside it, and the columnar
+	// fast path cannot serve that caller; zero means the closure costs nothing.
+	RecordsClosureReassembled int
+	RowsMatched               int // records that satisfied the WHERE and were emitted
 
 	// The index probe, when the scan visited index candidates instead of every record:
 	// SegmentsIndexed segments answered from their postings (IndexCandidates offsets in all),
@@ -102,6 +108,11 @@ func (s *ScanStats) columnDecided() {
 func (s *ScanStats) reassembled() {
 	if s != nil {
 		s.RecordsReassembled++
+	}
+}
+func (s *ScanStats) closureReassembled() {
+	if s != nil {
+		s.RecordsClosureReassembled++
 	}
 }
 func (s *ScanStats) matched() {
@@ -147,5 +158,6 @@ func (s *ScanStats) mergeWorker(w *ScanStats) {
 	s.RecordsVisited += w.RecordsVisited
 	s.RecordsColumnDecided += w.RecordsColumnDecided
 	s.RecordsReassembled += w.RecordsReassembled
+	s.RecordsClosureReassembled += w.RecordsClosureReassembled
 	s.RowsMatched += w.RowsMatched
 }

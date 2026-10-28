@@ -157,6 +157,11 @@ func (db *DB) QueryRawProjectedRefsStats(constraint string, projection []string,
 	return gated(db, db.c.QueryRawProjectedStats(q, projection, true, redact, stats)), nil
 }
 
+// Persistent reports whether the table is backed by a directory (collections.Persistent).
+// Both storage forms serve every query API; this is for a caller that needs to know which
+// one it has -- a test asserting its own fixture, or a tool reporting the table's mode.
+func (db *DB) Persistent() bool { return db.c.Persistent() }
+
 // QueryRawWire yields each matching ad as a self-contained WIRE-FORM ROW (an
 // inline-names subset ad assembled by slice copies -- see
 // collections.ScanRawWire): the relay form for shipping ads to a remote
@@ -165,10 +170,11 @@ func (db *DB) QueryRawProjectedRefsStats(constraint string, projection []string,
 // attributes at the source. At-rest-encrypted values are opened during assembly
 // (the consumer holds no data key).
 //
-// Only a persistent (inline) store can serve wire rows. An in-memory table returns
-// ErrRawWireUnsupported rather than an empty sequence: a relay scan that yields
-// nothing is indistinguishable from a query that matched nothing, so returning one
-// would turn every RAM-table query into a silent empty result at the consumer.
+// Both storage forms serve wire rows: a persistent table's records already carry inline
+// names, and an in-memory table's interned keys are rewritten to names as the row is
+// assembled. ErrRawWireUnsupported is still returned, before any row, by a table that cannot
+// produce self-contained rows at all -- a relay scan that yields nothing is indistinguishable
+// from a query that matched nothing, so such a table must refuse rather than come back empty.
 func (db *DB) QueryRawWire(constraint string, projection []string, redact bool) (iter.Seq[[]byte], error) {
 	if !db.c.SupportsRawWire() {
 		return nil, ErrRawWireUnsupported
@@ -198,6 +204,37 @@ func (db *DB) QueryRawWireStats(constraint string, projection []string, redact b
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
 	return gated(db, db.c.QueryRawWireStats(q, projection, redact, stats)), nil
+}
+
+// QueryRawWireRefs is QueryRawWire whose projection also carries the attributes the
+// projected expressions reference, transitively, so each yielded ROW evaluates
+// self-contained -- the wire-row twin of QueryRawProjectedRefs, and it returns the same
+// attribute set that call does for the same projection.
+//
+// Which of the two a caller wants is decided the same way: QueryRawWire reproduces
+// HTCondor's projection protocol (exactly the requested attributes), and this one serves a
+// consumer that will EVALUATE what it receives, for which the references are not optional.
+// The closure is computed per record, inside the scan, because whether a projected attribute
+// holds an expression is a property of the stored ad rather than of the query.
+func (db *DB) QueryRawWireRefs(constraint string, projection []string, redact bool) (iter.Seq[[]byte], error) {
+	return db.QueryRawWireRefsStats(constraint, projection, redact, nil)
+}
+
+// QueryRawWireRefsStats is QueryRawWireRefs that also fills stats (may be nil) with the
+// per-scan work breakdown. An empty/true constraint takes the no-WHERE scan path and leaves
+// stats zero.
+func (db *DB) QueryRawWireRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[[]byte], error) {
+	if !db.c.SupportsRawWire() {
+		return nil, ErrRawWireUnsupported
+	}
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return gated(db, db.c.ScanRawWireRefs(projection, redact)), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return gated(db, db.c.QueryRawWireRefsStats(q, projection, redact, stats)), nil
 }
 
 // SeqCursor and SeqPage re-export the collections types so a caller of the DB

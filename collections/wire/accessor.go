@@ -273,6 +273,28 @@ func NameHash32Bytes(name []byte) uint32 {
 // case-insensitively (ASCII fold, matching ClassAd attribute-name semantics).
 func FoldEqualBytes(b []byte, name string) bool { return foldEqualBytes(b, name) }
 
+// FoldEqualNames is FoldEqualBytes between two raw name byte slices, for a caller whose
+// wanted names are themselves sub-slices of a record (a per-record reference closure) and
+// would otherwise have to allocate a string per name to compare them.
+func FoldEqualNames(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
 // ForEachIDNode iterates the ad's attribute entries as raw (interned id, node
 // bytes) pairs, resolving nothing: the caller filters by id -- a projection's
 // wanted-set test, a privacy flag -- before paying for name resolution or value

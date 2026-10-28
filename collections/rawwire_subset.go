@@ -22,14 +22,15 @@ import (
 // MyType/TargetType always ship so the ad stays typed); empty means every
 // entry. redact drops private attributes -- pre-pruned from a projection, or
 // tested per entry with a byte-gated predicate for the whole-ad case. The
-// yielded row aliases a buffer reused across the iteration. Non-inline (RAM)
-// collections yield nothing: their ads are not self-contained, and an
-// in-process consumer reads them through the collection directly.
+// yielded row aliases a buffer reused across the iteration.
+//
+// An IN-MEMORY collection serves this scan too. Its records are not self-contained as stored
+// -- their keys are ids against the shared intern table -- but the difference from the
+// persistent form is only how names are spelled, so the row is assembled by rewriting those
+// ids back to names as it is built (see appendWireRow). Refusing RAM tables here was a
+// property of the first implementation, not of what they store.
 func (c *Collection) ScanRawWire(projection []string, redact bool) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
-		if !c.inline {
-			return
-		}
 		sel := c.newWireSubsetSelector(projection, redact)
 		// Decompression dominates a compressed scan and parallelizes across
 		// segments; the serial path below is the fallback (small scans, no budget,
@@ -57,9 +58,6 @@ func (c *Collection) QueryRawWire(q *vm.Query, projection []string, redact bool)
 // reading stats; a partial iteration leaves partial counts.
 func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact bool, stats *ScanStats) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
-		if !c.inline {
-			return
-		}
 		sel := c.newWireSubsetSelector(projection, redact)
 		// The projection plan names the type fields as well: a columnar segment builds the record
 		// from the columns the plan asks for, and sel.keep ships MyType/TargetType whatever the
@@ -94,23 +92,25 @@ func (sel *wireSubsetSelector) neededCount() int {
 
 func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelector) scanEmit {
 	var scratch []byte
-	var sc wire.SubsetScratch
 	needed := sel.neededCount()
 	var narrow wireNarrower
+	asm := c.newWireRowAssembler(sel)
 	return func(w []byte, dict *segDictHandle) bool {
 		// Narrow in ID SPACE first, so the conversion below only converts what the caller asked
 		// for (see narrowProjected).
 		w = c.narrowProjected(&narrow, sel, dict, w)
-		// AppendAdSubsetInlineHotFirst needs inline-name wire. Both this conversion and the
-		// assembler below take the key only when the reader is entitled to it: an inline segment
-		// converts nothing, so for that case the assembler's key is the ONLY thing standing
-		// between a redacted read and a sealed value.
+		// A per-segment INTERNED record (a sealed segment of a persistent store) is flattened
+		// here, because its ids resolve against that segment's dict rather than against
+		// anything appendWireRow can reach. An in-memory record is left alone -- dict is nil --
+		// and its global ids are resolved inside the assembler instead. Both this conversion
+		// and the assembler below take the key only when the reader is entitled to it: an
+		// inline segment converts nothing, so for that case the assembler's key is the ONLY
+		// thing standing between a redacted read and a sealed value.
 		w = c.wireToInlineRead(dict, w, sel.redact)
-		out, ok := wire.AppendAdSubsetInlineHotFirst(scratch[:0], wire.Ad(w), sel.keep, needed,
-			c.renderKey(sel.redact), &sc)
+		out, ok := asm.appendRow(scratch[:0], wire.Ad(w), needed, c.renderKey(sel.redact))
 		scratch = out
 		if !ok {
-			return true // not an inline ad / malformed: skip, keep scanning
+			return true // malformed (or unresolvable) record: skip, keep scanning
 		}
 		return yield(out)
 	}
@@ -126,12 +126,21 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 type wireSubsetSelector struct {
 	wantAll bool
 	redact  bool
-	names   []string
-	hashes  []uint32
+	// chaseRefs closes the selection under the emitted expressions' own attribute
+	// references, per record (see rawwire_refs.go). It changes what every path below
+	// assembles and narrows, which is why it lives on the selector all of them already
+	// carry rather than being threaded separately through each.
+	chaseRefs bool
+	names     []string
+	hashes    []uint32
 }
 
 func (c *Collection) newWireSubsetSelector(projection []string, redact bool) *wireSubsetSelector {
-	sel := &wireSubsetSelector{wantAll: len(projection) == 0, redact: redact}
+	return c.newWireSubsetSelectorRefs(projection, redact, false)
+}
+
+func (c *Collection) newWireSubsetSelectorRefs(projection []string, redact, chaseRefs bool) *wireSubsetSelector {
+	sel := &wireSubsetSelector{wantAll: len(projection) == 0, redact: redact, chaseRefs: chaseRefs}
 	seen := make(map[string]struct{}, len(projection))
 	for _, name := range projection {
 		fold := strings.ToLower(name)
@@ -153,7 +162,13 @@ func (c *Collection) newWireSubsetSelector(projection []string, redact bool) *wi
 	return sel
 }
 
-func (sel *wireSubsetSelector) keep(name, _ []byte) bool {
+func (sel *wireSubsetSelector) keep(name, node []byte) bool {
+	return sel.keepHashed(name, wire.NameHash32Bytes(name), node)
+}
+
+// keepHashed is keep for a caller that has already hashed the name -- the reference closure,
+// which hashes each name once per record and then tests it on every pass.
+func (sel *wireSubsetSelector) keepHashed(name []byte, h uint32, _ []byte) bool {
 	// The type fields always ship so the row stays typed (never private).
 	if wire.FoldEqualBytes(name, "MyType") || wire.FoldEqualBytes(name, "TargetType") {
 		return true
@@ -161,7 +176,13 @@ func (sel *wireSubsetSelector) keep(name, _ []byte) bool {
 	if sel.wantAll {
 		return !(sel.redact && isPrivateNameBytes(name))
 	}
-	h := wire.NameHash32Bytes(name)
+	return sel.inProjection(name, h)
+}
+
+// inProjection reports whether name is one of the projected attributes: the same
+// hash-first match keep makes, factored out so the reference closure can ask it directly
+// (a reference to an attribute the caller already projected is not a closure addition).
+func (sel *wireSubsetSelector) inProjection(name []byte, h uint32) bool {
 	for i, wh := range sel.hashes {
 		if wh == h && wire.FoldEqualBytes(name, sel.names[i]) {
 			return true

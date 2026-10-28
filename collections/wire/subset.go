@@ -89,6 +89,10 @@ func patchUvarint5(b []byte, v uint64) {
 type SubsetScratch struct {
 	hot    []uint32
 	copied []int
+	// nameBuf holds one resolved attribute name at a time for the interned assembler,
+	// whose keep test takes bytes while an intern table hands back a string. Reused so
+	// resolving a name costs no allocation per entry.
+	nameBuf []byte
 }
 
 // AppendAdSubsetInlineHotFirst is AppendAdSubsetInline with the hot-header

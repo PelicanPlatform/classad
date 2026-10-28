@@ -112,8 +112,8 @@ func (c *Collection) runParallelWireQuery(qp queryPlan, sel *wireSubsetSelector,
 			// this worker's columnar prefilter and decompression buffer), the narrower's
 			// resolved-projection cache and the subset assembler's scratch.
 			var st scanVisitState
-			var sc wire.SubsetScratch
 			var narrow wireNarrower
+			asm := c.newWireRowAssembler(sel)
 			batch := getBatch()
 			flush := func() {
 				if len(batch.offs) > 1 {
@@ -129,7 +129,7 @@ func (c *Collection) runParallelWireQuery(qp queryPlan, sel *wireSubsetSelector,
 				start := len(batch.buf)
 				w = c.narrowProjected(&narrow, sel, dict, w)
 				w = c.wireToInlineRead(dict, w, sel.redact)
-				out, ok := wire.AppendAdSubsetInlineHotFirst(batch.buf, wire.Ad(w), sel.keep, needed, seal, &sc)
+				out, ok := asm.appendRow(batch.buf, wire.Ad(w), needed, seal)
 				if !ok {
 					batch.buf = out[:start] // discard the partial append
 					return true             // not an inline ad / malformed: skip, keep scanning

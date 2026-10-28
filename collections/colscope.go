@@ -60,6 +60,11 @@ type colScope struct {
 	bindFor *adSchema
 
 	strScratch []byte
+	// numScratch is strScratch's twin for the cold NUMERIC region. Without it every cold
+	// numeric slot read went to the block cache, which is a per-RECORD lookup for a region
+	// that changes per BLOCK -- and the lookup is not free: most of its cost is ristretto's
+	// access-tracking ring buffer, paid on a hit. Dropped by setBlock, like the others.
+	numScratch []byte
 
 	// Group schemas for the current segment, and their selections for the current base block
 	// (index-aligned with groups). bindG caches name -> (group, field) as bind does for the base
@@ -230,11 +235,14 @@ func (cs *colScope) slotInt(idx int, f adField) (int64, bool) {
 	if !ok {
 		return 0, false
 	}
-	coldNum, err := cs.bc.stream(b, kindColdNum)
-	if err != nil {
-		return 0, false
+	if cs.numScratch == nil {
+		raw, err := cs.bc.stream(b, kindColdNum)
+		if err != nil {
+			return 0, false
+		}
+		cs.numScratch = raw
 	}
-	return readIntLE(coldNum[start+cs.k*f.width:], f.width, f.unsigned), true
+	return readIntLE(cs.numScratch[start+cs.k*f.width:], f.width, f.unsigned), true
 }
 
 // slotBool reads a bit-packed boolean. The bool bitset sits immediately after the escape bitmap in
@@ -333,6 +341,7 @@ func (cs *colScope) dictEntriesCached(idx int) ([][]byte, bool) {
 func (cs *colScope) setBlock(blk *columnarBlock) {
 	cs.blk = blk
 	cs.strScratch = nil
+	cs.numScratch = nil
 	// The parsed entries alias the previous block's region, so they must not survive the rebind.
 	for k := range cs.dictEnt {
 		delete(cs.dictEnt, k)
