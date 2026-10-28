@@ -649,6 +649,16 @@ Run all tests:
 go test ./...
 ```
 
+`collections` needs a longer timeout than the Go default:
+```bash
+cd collections && go test -timeout 15m ./...
+```
+Its suite is one dense test binary and takes close to ten minutes on a developer
+machine, so `go test ./...` can fail there with `panic: test timed out` and name
+whichever test happened to be running -- which is not the one at fault. CI does
+not hit this: it shards the package across several jobs and already passes
+`-timeout 25m` (see `collections/shard-test.sh`).
+
 Run tests with verbose output:
 ```bash
 go test -v ./...
