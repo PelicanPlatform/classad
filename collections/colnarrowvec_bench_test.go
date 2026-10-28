@@ -323,19 +323,6 @@ func benchNarrowPhases(b *testing.B, c *Collection, preds []fieldPred, bc *block
 	}
 }
 
-// setAll marks every record a candidate. Only a benchmark wants this: production always arrives here
-// through setVisible, and measuring the narrowing on its own means not paying for that first.
-func (c *candSet) setAll(n int) {
-	c.reset(n)
-	for i := range c.w {
-		c.w[i] = ^uint64(0)
-	}
-	if tail := uint(n % 64); tail != 0 && len(c.w) > 0 {
-		c.w[len(c.w)-1] = (uint64(1) << tail) - 1
-	}
-	c.live = n
-}
-
 // BenchmarkNarrowField measures ONE narrowing pass with nothing else in the frame -- no visibility
 // walk, no group accumulation -- against the same blocks the full query walks.
 //

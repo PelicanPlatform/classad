@@ -162,14 +162,11 @@ type aggTol struct {
 // the error bound needs. It groups by the same key AggregateValues does -- deliberately calling the
 // same bucketKeyText/ValueText -- so the budgets line up with the rows being compared.
 func (f *aggFixture) scanTols(constraint string, groups []GroupCol, aggs []AggSpec) (map[string][]aggTol, error) {
-	// The budget only ever applies to a real-valued SUM or AVG, and a filtered aggregate is
-	// declined by every fast path (so the comparison is scan against scan and exact). Skipping
-	// both cases skips this extra scan for most queries.
+	// The budget only ever applies to a real-valued SUM or AVG, so most queries skip this extra
+	// scan. A FILTERED one needs it too, now that the columnar path serves filters: before it did,
+	// a filtered aggregate was scan against scan and exact, and this returned early.
 	need := false
 	for _, a := range aggs {
-		if a.Filter != "" {
-			return nil, nil
-		}
 		need = need || a.Func == AggSum || a.Func == AggAvg
 	}
 	if !need {
@@ -182,6 +179,17 @@ func (f *aggFixture) scanTols(constraint string, groups []GroupCol, aggs []AggSp
 	seq, err := f.tbl.QueryProjectStats(constraint, attrs, nil)
 	if err != nil {
 		return nil, err
+	}
+	// The same compiled filters the reference reduction uses, so a budget counts exactly the
+	// values the aggregate it belongs to accumulated. Counting the filtered-out ones would inflate
+	// every filtered aggregate's tolerance and hide a real disagreement inside it.
+	filters, anyFilter, err := compileFilters(attrs, aggs)
+	if err != nil {
+		return nil, err
+	}
+	var scope *classad.ClassAd
+	if anyFilter {
+		scope = classad.New()
 	}
 	out := map[string][]aggTol{}
 	scratch := make([]string, len(groups))
@@ -210,6 +218,9 @@ func (f *aggFixture) scanTols(constraint string, groups []GroupCol, aggs []AggSp
 		}
 		for i := range aggs {
 			if aggCol[i] < 0 {
+				continue
+			}
+			if filters[i] != nil && !filters[i].keeps(scope, vals) {
 				continue
 			}
 			v := vals[aggCol[i]]
@@ -339,8 +350,8 @@ func compareAgg(got, want []AggRow, aggs []AggSpec, tols map[string][]aggTol) []
 }
 
 // tolAt returns the error budget for one group's one aggregate, or the zero budget (meaning
-// "compare exactly") when none was measured -- which is the case for a filtered aggregate, where
-// every fast path declines and the comparison is scan against scan.
+// "compare exactly") when none was measured -- the case for every aggregate but a SUM or an AVG,
+// whose float addition is the only thing the two paths may order differently.
 func tolAt(tols map[string][]aggTol, key string, i int) aggTol {
 	ts := tols[key]
 	if i >= len(ts) {

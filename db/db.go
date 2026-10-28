@@ -606,6 +606,27 @@ func (db *DB) GroupStatsAllCols(groups []collections.GroupSpec, aggAttrs []strin
 	return db.c.GroupStatsAllCols(groups, aggAttrs)
 }
 
+// GroupStatsConstraintAggs is GroupStatsConstraintCols where an aggregate column may carry a
+// per-aggregate FILTER. Declines on a chained table for the reason above.
+// See collections.Collection.GroupStatsConstraintAggs.
+func (db *DB) GroupStatsConstraintAggs(constraint string, groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string) ([]collections.GroupStats, bool) {
+	if db.c.Chained() {
+		return nil, false
+	}
+	return db.c.GroupStatsConstraintAggs(constraint, groups, aggCols, countFilters)
+}
+
+// GroupStatsAllAggs is GroupStatsConstraintAggs over every row. Declines on a chained table for the
+// reason above. See collections.Collection.GroupStatsAllAggs.
+func (db *DB) GroupStatsAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
+	countFilters []string) ([]collections.GroupStats, bool) {
+	if db.c.Chained() {
+		return nil, false
+	}
+	return db.c.GroupStatsAllAggs(groups, aggCols, countFilters)
+}
+
 // LookupClassAd returns the committed ad for key (the hash table, outside any
 // transaction), or (nil, false).
 func (db *DB) LookupClassAd(key string) (*classad.ClassAd, bool) {

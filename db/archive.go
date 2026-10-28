@@ -942,6 +942,20 @@ func (t *ArchiveTable) GroupStatsAllCols(groups []collections.GroupSpec, aggAttr
 	return t.a.GroupStatsAllCols(groups, aggAttrs)
 }
 
+// GroupStatsConstraintAggs is GroupStatsConstraintCols where an aggregate column may carry a
+// per-aggregate FILTER. See collections.Collection.GroupStatsConstraintAggs.
+func (t *ArchiveTable) GroupStatsConstraintAggs(constraint string, groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsConstraintAggs(constraint, groups, aggCols, countFilters)
+}
+
+// GroupStatsAllAggs is GroupStatsConstraintAggs over every row, for a constraint this layer has
+// established is match-all. See collections.Collection.GroupStatsAllAggs.
+func (t *ArchiveTable) GroupStatsAllAggs(groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string) ([]collections.GroupStats, bool) {
+	return t.a.GroupStatsAllAggs(groups, aggCols, countFilters)
+}
+
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).
 func (t *ArchiveTable) CodecStats(sampleMax int) CodecStats { return t.a.CodecStats(sampleMax) }
 

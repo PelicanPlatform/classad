@@ -111,8 +111,8 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool) []AggStr
 			// what makes a time series ("per day") take this path rather than the scan below, and a
 			// raw column beside a bucketed one is "per owner per day". Declines (and falls through)
 			// for more group columns than the packed key holds, an aggregate over a non-numeric
-			// column, a per-aggregate FILTER, COUNT(DISTINCT), a predicate not proven free of
-			// CurrentTime, or a chained table -- the DB.GroupStats* wrappers refuse a chained table
+			// column, a per-aggregate FILTER the column narrowing cannot express, COUNT(DISTINCT),
+			// a predicate not proven free of CurrentTime, or a chained table -- the DB.GroupStats* wrappers refuse a chained table
 			// because the columnar pass reads a record's own columns and knows nothing about the
 			// parent it would have inherited the group or aggregate attribute from.
 			rows, ok := GroupedFromColumns(db, req.Constraint, req.GroupCols, req.Aggs)

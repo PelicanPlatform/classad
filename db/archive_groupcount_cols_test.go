@@ -479,8 +479,13 @@ func TestArchiveGroupedAggregateRefusals(t *testing.T) {
 		groupCols  []GroupCol
 		aggs       []AggSpec
 	}{
-		{"a FILTER is invisible to the columnar pass", "RequestMemory > 2048",
-			[]GroupCol{{Attr: "ProcId"}}, []AggSpec{{Func: AggCount, Arg: "*", Filter: "RequestCpus >= 4"}}},
+		// A FILTER the column narrowing CAN express used to be listed here. It is now served --
+		// see TestFilteredAggregateMatchesScan -- because a filter lowers to exactly the planes a
+		// WHERE clause lowers to. What is still refused is a filter it cannot express, for the
+		// same reason the WHERE clause refuses one: there is no plane to build.
+		{"a FILTER the column narrowing cannot express", "RequestMemory > 2048",
+			[]GroupCol{{Attr: "ProcId"}},
+			[]AggSpec{{Func: AggCount, Arg: "*", Filter: `Owner == "user3"`}}},
 		{"COUNT(DISTINCT) needs the values, not their aggregate", "RequestMemory > 2048",
 			[]GroupCol{{Attr: "ProcId"}}, []AggSpec{{Func: AggCountDistinct, Arg: "RequestCpus"}}},
 		// A bucketed group column used to be listed here. It is now served -- see

@@ -366,6 +366,11 @@ type groupAccum struct {
 	g2 groupState2
 	g3 groupState3
 
+	// How many DISTINCT per-aggregate filters the query carries, which sizes groupAcc.rows. It is
+	// read only when a group is CREATED, so it sits back here with the other cold per-query state
+	// rather than ahead of g1/g2/g3, where it would push the memo's intervals off the first line.
+	nFilt int
+
 	// The query-local string table. A string component's raw is an index into strVal; strID maps
 	// the EXACT BYTES back to that index (see the fold warning at the top of this file).
 	//
@@ -525,7 +530,7 @@ func (a *groupAccum) accFor(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc
 			m.key.raw[0], m.key.kind[0] = comps[0].raw, comps[0].kind
 			g := m.acc[m.key]
 			if g == nil {
-				g = newGroupAcc(nAgg)
+				g = newGroupAcc(nAgg, a.nFilt)
 				m.acc[m.key] = g
 			}
 			g.n++
@@ -684,8 +689,8 @@ func packProbeN[R rawArr, K kindArr](k *groupKeyN[R, K], comps *[maxGroupCols]gr
 // area -- and the caller is the per-record lookup, whose frame then carries a whole key it never
 // otherwise needs.
 func newGroupN[R rawArr, K kindArr](m *groupMap[groupKeyN[R, K]], k *groupKeyN[R, K],
-	nAgg int) *groupAcc {
-	g := newGroupAcc(nAgg)
+	nAgg, nFilt int) *groupAcc {
+	g := newGroupAcc(nAgg, nFilt)
 	m.acc[*k] = g
 	return g
 }
@@ -718,7 +723,7 @@ func (a *groupAccum) accForRaw2(comps *[maxGroupCols]groupComp, nAgg int) (*grou
 	m.key.raw[1], m.key.kind[1] = comps[1].raw, comps[1].kind
 	g := m.acc[m.key]
 	if g == nil {
-		g = newGroupN(&m.groupMap, &m.key, nAgg)
+		g = newGroupN(&m.groupMap, &m.key, nAgg, a.nFilt)
 	}
 	g.n++
 	return g, true
@@ -731,7 +736,7 @@ func (a *groupAccum) accForRaw3(comps *[maxGroupCols]groupComp, nAgg int) (*grou
 	m.key.raw[2], m.key.kind[2] = comps[2].raw, comps[2].kind
 	g := m.acc[m.key]
 	if g == nil {
-		g = newGroupN(&m.groupMap, &m.key, nAgg)
+		g = newGroupN(&m.groupMap, &m.key, nAgg, a.nFilt)
 	}
 	g.n++
 	return g, true
@@ -828,7 +833,7 @@ func (a *groupAccum) enterBuckets2(comps *[maxGroupCols]groupComp, nAgg int,
 	}
 	g := m.acc[key]
 	if g == nil {
-		g = newGroupN(&m.groupMap, &key, nAgg)
+		g = newGroupN(&m.groupMap, &key, nAgg, a.nFilt)
 	}
 	g.n++
 	m.armMemo(&key, a.bktN)
@@ -854,7 +859,7 @@ func (a *groupAccum) enterBuckets3(comps *[maxGroupCols]groupComp, nAgg int,
 	}
 	g := m.acc[key]
 	if g == nil {
-		g = newGroupN(&m.groupMap, &key, nAgg)
+		g = newGroupN(&m.groupMap, &key, nAgg, a.nFilt)
 	}
 	g.n++
 	m.armMemo(&key, a.bktN)
@@ -882,7 +887,7 @@ func (a *groupAccum) enterBucket1(f float64, nAgg int) (*groupAcc, bool) {
 	m.key.raw[0], m.key.kind[0] = b, gkInt
 	g := m.acc[m.key]
 	if g == nil {
-		g = newGroupAcc(nAgg)
+		g = newGroupAcc(nAgg, a.nFilt)
 		m.acc[m.key] = g
 	}
 	g.n++
@@ -957,20 +962,31 @@ func (a *groupAccum) each(f func([]classad.Value, *groupAcc)) {
 	}
 }
 
-// groupAcc is one group's accumulation: the record count plus one aggregate accumulator per
-// requested aggregate column.
+// groupAcc is one group's accumulation: the record count, one aggregate accumulator per requested
+// aggregate column, and -- only for a query carrying per-aggregate FILTERs -- one record count per
+// distinct filter.
+//
+// rows is what `COUNT(*) FILTER (WHERE ...)` is counted in. It cannot be read off stats: a stats
+// accumulator counts the records whose COLUMN held a number, and a filtered COUNT(*) counts the
+// records that passed the filter whether or not they carry any particular attribute. It is nil for
+// the unfiltered query, which is every query that existed before filters were served, so that one
+// allocates exactly what it used to.
 type groupAcc struct {
 	n     int
 	stats []statsAccum
+	rows  []int32
 }
 
-func newGroupAcc(nAgg int) *groupAcc {
+func newGroupAcc(nAgg, nFilt int) *groupAcc {
 	g := &groupAcc{}
 	if nAgg > 0 {
 		g.stats = make([]statsAccum, nAgg)
 		for i := range g.stats {
 			g.stats[i] = newStatsAccum()
 		}
+	}
+	if nFilt > 0 {
+		g.rows = make([]int32, nFilt)
 	}
 	return g
 }

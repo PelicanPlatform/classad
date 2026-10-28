@@ -85,7 +85,11 @@ func TestMutableGroupedFromColumnsMatchesScan(t *testing.T) {
 		{"RequestMemory > 4096", "JobStatus",
 			[]AggSpec{{Func: AggCountDistinct, Arg: "RequestCpus"}}, false, "COUNT(DISTINCT) needs the values"},
 		{"RequestMemory > 4096", "JobStatus",
-			[]AggSpec{{Func: AggCount, Arg: "*", Filter: "RequestCpus >= 4"}}, false, "a FILTER is invisible here"},
+			[]AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggCount, Arg: "*", Filter: "RequestCpus >= 4"}},
+			true, "a FILTER lowers to the same column narrowing the WHERE clause does"},
+		{"RequestMemory > 4096", "JobStatus",
+			[]AggSpec{{Func: AggCount, Arg: "*", Filter: `Owner == "user3"`}}, false,
+			"a FILTER the column narrowing cannot express: no plane to build, so the query scans"},
 	} {
 
 		groupCols := []GroupCol{{Attr: tc.group}}
