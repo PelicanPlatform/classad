@@ -158,11 +158,11 @@ func TestColumnAggregatesZonePruneSchemaLagSegments(t *testing.T) {
 				})
 				check("vecGroupStats", true, func() bool {
 					grp := []uint32{mustID(t, c, "Grp")}
-					acc, ok := c.vecGroupStats(q, grp, []uint32{mustID(t, c, "Val")}, []int64{0}, c.schemaScan.Load())
+					acc, ok := c.vecGroupStats(q, grp, []uint32{mustID(t, c, "Val")}, []int64{0}, nil, c.schemaScan.Load())
 					if !ok {
 						return false
 					}
-					gs, ok := c.shapeGroupStats(acc, grp, []uint32{mustID(t, c, "Val")})
+					gs, ok := c.shapeGroupStats(acc, grp, []uint32{mustID(t, c, "Val")}, nil)
 					if ok {
 						checkGroups(gs)
 					}

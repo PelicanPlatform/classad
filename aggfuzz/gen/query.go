@@ -65,7 +65,10 @@ type Group struct {
 }
 
 // Agg is one aggregate: a function over an argument attribute, with an optional per-aggregate
-// FILTER (which every fast path must decline rather than answer unfiltered).
+// FILTER restricting that one aggregate to the rows of its group matching it. The grouped columnar
+// path serves a filter it can lower to column narrowing and declines the rest, so the draws below
+// deliberately produce both: an answer that ignored a filter and a decline that got it wrong are
+// different bugs and both have to be reachable.
 type Agg struct {
 	Func   Func
 	Arg    string
@@ -348,10 +351,22 @@ func aggsFrom(s *src) []Agg {
 		} else {
 			a.Arg = pick(s, aggAttrs)
 		}
-		// A FILTER on 1-in-16 aggregates: every fast path must decline it rather than report an
-		// unfiltered aggregate as a filtered one, so this is a decline that has to be checked.
-		if s.n(16) == 0 {
-			a.Filter = fmt.Sprintf("Status == %d", pick(s, statusLits))
+		// A FILTER on 1-in-8 aggregates, drawn across the lowerable and the non-lowerable shapes.
+		// The first two narrow columns; the last two cannot and must send the whole query to the
+		// scan rather than be answered with the filter half-applied.
+		if s.n(8) == 0 {
+			switch s.n(4) {
+			case 0:
+				a.Filter = fmt.Sprintf("Status == %d", pick(s, statusLits))
+			case 1:
+				a.Filter = fmt.Sprintf("Status >= %d && Status <= %d",
+					pick(s, statusLits), pick(s, statusLits))
+			case 2:
+				a.Filter = fmt.Sprintf("Status == %d || Status == %d",
+					pick(s, statusLits), pick(s, statusLits))
+			default:
+				a.Filter = fmt.Sprintf("Owner == %q", pick(s, ownerLits))
+			}
 		}
 		out[i] = a
 	}

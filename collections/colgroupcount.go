@@ -48,6 +48,13 @@ type GroupStats struct {
 	Values []classad.Value
 	Count  int
 	Stats  []NumStats
+	// CountOf is one record count per requested filtered COUNT(*) (see GroupStatsConstraintAggs),
+	// in the order requested: how many of the group's records passed that filter. It is nil for a
+	// query that asked for none, which is every query that predates per-aggregate FILTER.
+	//
+	// It is not derivable from Stats: a NumStats counts the records whose COLUMN held a number,
+	// and a filtered COUNT(*) counts the records that passed the filter whatever they carry.
+	CountOf []int
 }
 
 // GroupSpec is one GROUP BY column: the attribute, optionally floored into fixed-width buckets.
@@ -178,6 +185,68 @@ func (c *Collection) GroupStatsQueryBucketed(q *vm.Query, groupAttr string, buck
 // truncating past it would merge groups that differ only in a dropped component, so the query goes
 // back to the scan instead.
 func (c *Collection) GroupStatsQueryCols(q *vm.Query, groups []GroupSpec, aggAttrs []string) ([]GroupStats, bool) {
+	return c.groupStatsQuery(q, groups, aggAttrs, nil, nil)
+}
+
+// GroupAggCol is one aggregate column of a grouped columnar query: the numeric attribute it reads
+// and the per-aggregate FILTER deciding which records feed it ("" = every record the WHERE clause
+// kept). It mirrors the (Arg, Filter) pair db.AggSpec carries, so a caller translating between the
+// two moves fields rather than reinterpreting them.
+//
+// The SAME attribute under two different filters is two columns here, each with its own
+// accumulator. Deduplicating aggregates is the caller's job and its key has to include the filter:
+// MIN(x) beside MAX(x) still reads x once, but MIN(x) beside MIN(x) FILTER (...) cannot.
+type GroupAggCol struct {
+	Attr   string
+	Filter string
+}
+
+// GroupStatsConstraintAggs is GroupStatsConstraintCols where each aggregate column may carry a
+// per-aggregate FILTER, and countFilters asks additionally for a filtered RECORD COUNT per group --
+// SQL's `COUNT(*) FILTER (WHERE ...)`, which reads no column at all.
+//
+// GroupStats.Stats stays aligned with aggCols and holds only the records that passed that column's
+// filter; GroupStats.CountOf is aligned with countFilters. A filter narrows an aggregate and never
+// a group: a group whose every record fails every filter is still returned, with zero counts and
+// empty stats, which is what SQL specifies.
+//
+// ok=false when any filter is a shape the columns cannot answer (see compileGroupFilters), and the
+// caller then scans. That is a decline of the WHOLE query: half a columnar result cannot be
+// stitched to half a scan.
+func (c *Collection) GroupStatsConstraintAggs(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string) ([]GroupStats, bool) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, false
+	}
+	attrs, filters := splitAggCols(aggCols)
+	return c.groupStatsQuery(q, groups, attrs, filters, countFilters)
+}
+
+// GroupStatsAllAggs is GroupStatsConstraintAggs over every record, for a constraint the caller has
+// established is match-all. See GroupStatsAllCols.
+func (c *Collection) GroupStatsAllAggs(groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string) ([]GroupStats, bool) {
+	attrs, filters := splitAggCols(aggCols)
+	return c.groupStatsAll(groups, attrs, filters, countFilters)
+}
+
+// splitAggCols splits aggregate columns into the parallel attribute and filter lists the internals
+// carry, which keeps the attribute list the one shape every tier below already resolves.
+func splitAggCols(aggCols []GroupAggCol) ([]string, []string) {
+	if len(aggCols) == 0 {
+		return nil, nil
+	}
+	attrs := make([]string, len(aggCols))
+	filters := make([]string, len(aggCols))
+	for i, a := range aggCols {
+		attrs[i], filters[i] = a.Attr, a.Filter
+	}
+	return attrs, filters
+}
+
+func (c *Collection) groupStatsQuery(q *vm.Query, groups []GroupSpec, aggAttrs, colFilters,
+	countFilters []string) ([]GroupStats, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil {
 		return nil, false
@@ -186,10 +255,14 @@ func (c *Collection) GroupStatsQueryCols(q *vm.Query, groups []GroupSpec, aggAtt
 	if !ok {
 		return nil, false
 	}
+	gf, ok := c.compileGroupFilters(st.schema, colFilters, countFilters)
+	if !ok {
+		return nil, false
+	}
 	// First tier: a conjunction of numeric comparisons against literals, narrowed column by column with
 	// zone-map pruning. Fastest, and the shape a history dashboard asks most.
 	if preds, pok := c.numPredsCT(q, st.schema); pok {
-		if gs, served := c.groupStats(groupIDs, aggIDs, buckets, preds, st); served || !predsNeedCT(preds) {
+		if gs, served := c.groupStats(groupIDs, aggIDs, buckets, preds, gf, st); served || !predsNeedCT(preds) {
 			return gs, served
 		}
 		// A window turned out unproven: the per-window tier below still serves the query.
@@ -204,11 +277,11 @@ func (c *Collection) GroupStatsQueryCols(q *vm.Query, groups []GroupSpec, aggAtt
 	if c.indexCanPrune(q) {
 		return nil, false
 	}
-	acc, ok := c.vecGroupStats(q, groupIDs, aggIDs, buckets, st)
+	acc, ok := c.vecGroupStats(q, groupIDs, aggIDs, buckets, gf, st)
 	if !ok {
 		return nil, false
 	}
-	return c.shapeGroupStats(acc, groupIDs, aggIDs)
+	return c.shapeGroupStats(acc, groupIDs, aggIDs, nil)
 }
 
 // GroupStatsAll is GroupStatsQuery with no constraint: the whole column's histogram plus aggregates. The
@@ -231,6 +304,11 @@ func (c *Collection) GroupStatsAllBucketed(groupAttr string, bucket int64, aggAt
 
 // GroupStatsAllCols is GroupStatsAllBucketed over SEVERAL group columns. See GroupStatsQueryCols.
 func (c *Collection) GroupStatsAllCols(groups []GroupSpec, aggAttrs []string) ([]GroupStats, bool) {
+	return c.groupStatsAll(groups, aggAttrs, nil, nil)
+}
+
+func (c *Collection) groupStatsAll(groups []GroupSpec, aggAttrs, colFilters,
+	countFilters []string) ([]GroupStats, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil {
 		return nil, false
@@ -239,7 +317,11 @@ func (c *Collection) GroupStatsAllCols(groups []GroupSpec, aggAttrs []string) ([
 	if !ok {
 		return nil, false
 	}
-	return c.groupStats(groupIDs, aggIDs, buckets, nil, st)
+	gf, ok := c.compileGroupFilters(st.schema, colFilters, countFilters)
+	if !ok {
+		return nil, false
+	}
+	return c.groupStats(groupIDs, aggIDs, buckets, nil, gf, st)
 }
 
 // resolveGroupAttrs interns the group and aggregate attribute names and checks each is carried by the
@@ -296,24 +378,36 @@ func (c *Collection) resolveGroupAttrs(st *schemaScanState, groups []GroupSpec, 
 
 // groupStats runs the scan and shapes its result: the part GroupStatsQuery and GroupStatsAll share once
 // the columns and the predicate set are resolved. A nil preds means every visible record survives.
-func (c *Collection) groupStats(groupIDs []uint32, aggIDs []uint32, buckets []int64, preds []fieldPred, st *schemaScanState) ([]GroupStats, bool) {
-	acc, ok := c.schemaScanGroupStats(groupIDs, aggIDs, buckets, preds, st.cache)
+func (c *Collection) groupStats(groupIDs []uint32, aggIDs []uint32, buckets []int64, preds []fieldPred,
+	gf *groupFilters, st *schemaScanState) ([]GroupStats, bool) {
+	acc, ok := c.schemaScanGroupStats(groupIDs, aggIDs, buckets, preds, gf, st.cache)
 	if !ok {
 		return nil, false
 	}
-	return c.shapeGroupStats(acc, groupIDs, aggIDs)
+	return c.shapeGroupStats(acc, groupIDs, aggIDs, gf)
 }
 
 // shapeGroupStats turns an accumulator map into the sorted result and records the read demand. Shared by
 // every tier, so the shape and order of the answer cannot depend on which one produced it.
-func (c *Collection) shapeGroupStats(ga *groupAccum, groupIDs []uint32, aggIDs []uint32) ([]GroupStats, bool) {
+func (c *Collection) shapeGroupStats(ga *groupAccum, groupIDs []uint32, aggIDs []uint32,
+	gf *groupFilters) ([]GroupStats, bool) {
 	out := make([]GroupStats, 0, ga.nGroups())
+	nCount := 0
+	if gf != nil {
+		nCount = len(gf.countOf)
+	}
 	ga.each(func(vals []classad.Value, a *groupAcc) {
 		g := GroupStats{Values: vals, Count: a.n}
 		if len(aggIDs) > 0 {
 			g.Stats = make([]NumStats, len(aggIDs))
 			for i := range a.stats {
 				g.Stats[i] = a.stats[i].result()
+			}
+		}
+		if nCount > 0 {
+			g.CountOf = make([]int, nCount)
+			for i, f := range gf.countOf {
+				g.CountOf[i] = int(a.rows[f])
 			}
 		}
 		out = append(out, g)
@@ -416,8 +510,9 @@ func groupValueLess(a, b classad.Value) bool {
 // ok=false means a surviving record's GROUP value is one only evaluation can produce, which this cannot
 // turn into a group (see GroupStatsQuery); the partial result is then discarded and the caller scans.
 func (c *Collection) schemaScanGroupStats(groupIDs []uint32, aggIDs []uint32, buckets []int64, preds []fieldPred,
-	bc *blockCache) (*groupAccum, bool) {
+	gf *groupFilters, bc *blockCache) (*groupAccum, bool) {
 	acc := newGroupAccum(buckets)
+	acc.nFilt = gf.n()
 	lookups := make([]func(wire.Ad) ([]byte, bool), len(preds))
 	for i, p := range preds {
 		lookups[i] = c.attrLookup(p.fieldID)
@@ -450,8 +545,14 @@ func (c *Collection) schemaScanGroupStats(groupIDs []uint32, aggIDs []uint32, bu
 			}
 			cs := w.seg.colblk.Load()
 			groupIdxs, aggIdxs, predIdxs, ok := resolveGroupFields(cs, groupIDs, aggIDs, preds)
+			// A filter whose field this segment's schema lacks sends the segment down the same
+			// row fallback a missing group or predicate column does, rather than evaluating the
+			// filter against a column that is not there.
+			if ok {
+				ok = gf.resolveSeg(cs)
+			}
 			if !ok {
-				if !bruteGroupStats(c, w, s0, groupLookups, aggLookups, preds, lookups, acc) {
+				if !bruteGroupStats(c, w, s0, groupLookups, aggLookups, preds, lookups, gf, acc) {
 					releaseWindows(wins)
 					return nil, false
 				}
@@ -492,6 +593,16 @@ func (c *Collection) schemaScanGroupStats(groupIDs []uint32, aggIDs []uint32, bu
 						return nil, false
 					}
 				}
+				// The per-aggregate FILTER planes, built AFTER the WHERE narrowing and only for a
+				// block that still has survivors. A filter plane costs a pass over its column
+				// whatever the block contributes, so building it for a block the WHERE emptied
+				// would be a scan whose every bit is then never read. The planes themselves are
+				// not intersected with cand: they are consulted only at a record cand already
+				// kept, so the intersection would be work with no reader either.
+				if cand.live > 0 && !gf.narrowBlock(blk, bc, &sc) {
+					releaseWindows(wins)
+					return nil, false
+				}
 				// One test per 64 records rules out a word of them, and the survivors are
 				// reached by their set bits rather than by reading a byte for each of the
 				// records an earlier pass already removed.
@@ -501,7 +612,7 @@ func (c *Collection) schemaScanGroupStats(groupIDs []uint32, aggIDs []uint32, bu
 						word &= word - 1
 						// Shared with the vector tier, so group identity and the aggregate
 						// skip rules cannot depend on which tier answered.
-						if !addGroupFromColumns(k, &cols, aggCols, bc, acc) {
+						if !addGroupFromColumns(k, &cols, aggCols, bc, acc, gf) {
 							releaseWindows(wins)
 							return nil, false
 						}
@@ -557,7 +668,7 @@ func resolveGroupFields(cs *colSegment, groupIDs []uint32, aggIDs []uint32,
 // give-up condition as the column path, for the same reason.
 func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookups []func(wire.Ad) ([]byte, bool),
 	aggLookups []func(wire.Ad) ([]byte, bool), preds []fieldPred,
-	lookups []func(wire.Ad) ([]byte, bool), acc *groupAccum) bool {
+	lookups []func(wire.Ad) ([]byte, bool), gf *groupFilters, acc *groupAccum) bool {
 	var buf []byte
 	var comps [maxGroupCols]groupComp
 	for off := 0; off < w.used; {
@@ -590,7 +701,7 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookups []func(
 						break
 					}
 				}
-				if match && !addGroupFromAd(ad, groupLookups, aggLookups, acc, &comps) {
+				if match && !addGroupFromAd(ad, groupLookups, aggLookups, acc, &comps, gf) {
 					return false
 				}
 			}

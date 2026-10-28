@@ -361,6 +361,20 @@ func (a *Archive) GroupStatsAllCols(groups []GroupSpec, aggAttrs []string) ([]Gr
 	return a.c.GroupStatsAllCols(groups, aggAttrs)
 }
 
+// GroupStatsConstraintAggs is GroupStatsConstraintCols where an aggregate column may carry a
+// per-aggregate FILTER. See Collection.GroupStatsConstraintAggs.
+func (a *Archive) GroupStatsConstraintAggs(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string) ([]GroupStats, bool) {
+	return a.c.GroupStatsConstraintAggs(constraint, groups, aggCols, countFilters)
+}
+
+// GroupStatsAllAggs is GroupStatsConstraintAggs over every record, for a constraint the caller has
+// established is match-all. See Collection.GroupStatsAllAggs.
+func (a *Archive) GroupStatsAllAggs(groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string) ([]GroupStats, bool) {
+	return a.c.GroupStatsAllAggs(groups, aggCols, countFilters)
+}
+
 // GroupCountAll returns the per-value record counts of groupAttr over EVERY record, read out of the
 // columnar blocks. The caller must have established that its query matches all records.
 // ok=false ⇒ not columnar-eligible; group by scanning records.

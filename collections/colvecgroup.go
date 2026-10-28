@@ -33,8 +33,18 @@ import (
 // produce -- the same give-up condition as the predicate-analysis path, for the same reason (see
 // GroupStatsQuery).
 func (c *Collection) vecGroupStats(q *vm.Query, groupIDs []uint32, aggIDs []uint32, buckets []int64,
-	st *schemaScanState) (*groupAccum, bool) {
+	gf *groupFilters, st *schemaScanState) (*groupAccum, bool) {
 	if q == nil || !q.Native() {
+		return nil, false
+	}
+	// This tier does not carry per-aggregate FILTER planes: its per-block work is the EXPRESSION
+	// evaluator, not the column narrowing a filter is lowered to, and lowering filters a second way
+	// here would be a second notion of what a filter means. A filtered query whose WHERE clause
+	// needs this tier therefore scans; the shape filters exist for -- several conditioned counts
+	// over a dashboard's group, under a numeric WHERE or none at all -- is served by the tier
+	// above. Refusing HERE rather than at the caller is what lets every accumulator call below pass
+	// a nil filter set and be right about it.
+	if gf != nil {
 		return nil, false
 	}
 	acc := newGroupAccum(buckets)
@@ -172,7 +182,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupIDs []uint32, aggIDs []uint
 					if live[k/64]&(1<<uint(k%64)) == 0 || !vec.IsTrue(k) {
 						continue
 					}
-					if !addGroupFromColumns(k, &cols, aggCols, st.cache, acc) {
+					if !addGroupFromColumns(k, &cols, aggCols, st.cache, acc, nil) {
 						releaseWindows(wins)
 						return nil, false
 					}
@@ -188,7 +198,12 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupIDs []uint32, aggIDs []uint
 // addGroupFromColumns reads record k's group and aggregate values from the block's columns and folds them
 // into acc. ok=false when the group value is one only evaluation can produce, which cannot be turned
 // into a group here.
-func addGroupFromColumns(k int, cols *groupCols, aggCols []numCol, bc *blockCache, acc *groupAccum) bool {
+//
+// gf is the query's per-aggregate FILTERs (nil for the unfiltered query). A filter decides which
+// aggregates this record feeds; it never decides whether the record forms a group, so marking it
+// happens AFTER the group has been entered and an unfiltered aggregate is unaffected by it.
+func addGroupFromColumns(k int, cols *groupCols, aggCols []numCol, bc *blockCache, acc *groupAccum,
+	gf *groupFilters) bool {
 	g, ok := cols.accFor(k, bc, acc, len(aggCols))
 	if !ok {
 		return false
@@ -196,7 +211,12 @@ func addGroupFromColumns(k int, cols *groupCols, aggCols []numCol, bc *blockCach
 	if g == nil {
 		return true // in no bucket, which the scan drops too
 	}
+	gf.mark(k)
+	gf.countInto(g)
 	for i := range aggCols {
+		if !gf.keepsCol(i) {
+			continue
+		}
 		// An absent or non-numeric aggregate value contributes nothing, which is what the reference
 		// computes for it -- unlike the group value, which decides whether the row exists at all. An
 		// EXPRESSION has a value this cannot compute, so it gives the query back.
@@ -238,7 +258,7 @@ func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, s
 		if !matched {
 			continue
 		}
-		if !addGroupFromColumns(k, cols, aggCols, bc, acc) {
+		if !addGroupFromColumns(k, cols, aggCols, bc, acc, nil) {
 			return false
 		}
 	}
@@ -270,7 +290,7 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
 			// Matched, so this record forms a group: read its values from the wire form, the same
 			// lookups the predicate-analysis path's row fallback uses, so group identity does not
 			// depend on which tier answered.
-			if !addGroupFromAd(wire.Ad(ww), groupLookups, aggLookups, acc, &comps) {
+			if !addGroupFromAd(wire.Ad(ww), groupLookups, aggLookups, acc, &comps, nil) {
 				return false
 			}
 		}
@@ -289,7 +309,7 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
 // the previous record.
 func addGroupFromAd(ad wire.Ad, groupLookups []func(a wire.Ad) ([]byte, bool),
 	aggLookups []func(a wire.Ad) ([]byte, bool), acc *groupAccum,
-	comps *[maxGroupCols]groupComp) bool {
+	comps *[maxGroupCols]groupComp, gf *groupFilters) bool {
 	for i := range groupLookups {
 		node, found := groupLookups[i](ad)
 		comp, ok := adGroupComp(node, found, acc)
@@ -302,7 +322,14 @@ func addGroupFromAd(ad wire.Ad, groupLookups []func(a wire.Ad) ([]byte, bool),
 	if g == nil {
 		return true // in no bucket, which the scan drops too
 	}
+	if !gf.markAd(ad) {
+		return false
+	}
+	gf.countInto(g)
 	for i := range aggLookups {
+		if !gf.keepsCol(i) {
+			continue
+		}
 		if an, found := aggLookups[i](ad); found {
 			if isExprNode(an) {
 				return false

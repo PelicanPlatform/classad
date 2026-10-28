@@ -46,12 +46,16 @@ import (
 // table. Both back onto the same collections primitive, so both get the same fast path and the same
 // row-shaping rather than a copy per table type that could drift.
 type GroupStatsSource interface {
-	// GroupStatsConstraintCols answers the grouped stats for rows matching constraint, grouping by
-	// the tuple of the given columns, each optionally floored into fixed-width buckets.
-	GroupStatsConstraintCols(constraint string, groups []collections.GroupSpec, aggAttrs []string) ([]collections.GroupStats, bool)
-	// GroupStatsAllCols answers them over every row, for a constraint the caller has established
+	// GroupStatsConstraintAggs answers the grouped stats for rows matching constraint, grouping by
+	// the tuple of the given columns, each optionally floored into fixed-width buckets. An
+	// aggregate column may carry a per-aggregate FILTER, and countFilters asks for a filtered
+	// record count per group.
+	GroupStatsConstraintAggs(constraint string, groups []collections.GroupSpec,
+		aggCols []collections.GroupAggCol, countFilters []string) ([]collections.GroupStats, bool)
+	// GroupStatsAllAggs answers them over every row, for a constraint the caller has established
 	// is match-all (the predicate analysis has no predicate to work with there).
-	GroupStatsAllCols(groups []collections.GroupSpec, aggAttrs []string) ([]collections.GroupStats, bool)
+	GroupStatsAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
+		countFilters []string) ([]collections.GroupStats, bool)
 }
 
 // groupedFromColumns answers a GROUP BY from the archive's columns.
@@ -77,10 +81,18 @@ func (t *ArchiveTable) groupedFromColumns(constraint string, groupCols []GroupCo
 // categorically indexed column with no WHERE clause, and nothing else: add an aggregate, a
 // constraint, or a group column the index does not carry, and it fell to the record scan.
 //
-// A per-aggregate FILTER declines -- the columnar pass knows nothing about it, so answering would
-// report an unfiltered aggregate as a filtered one. COUNT(DISTINCT) declines: it needs the values,
-// not their aggregate. More than MaxGroupCols columns declines: the storage key has that many
-// component slots and a truncated key would merge groups the scan keeps apart.
+// A per-aggregate FILTER is served: `COUNT(*) FILTER (WHERE JobStatus == 2)` beside a plain
+// COUNT(*) answers two differently-conditioned questions in one pass, where it used to decline the
+// whole query and send a shape the columns nearly answered back to the record scan. The filter is
+// lowered to the same column narrowing the WHERE clause is lowered to, so it is served for exactly
+// the expressions the WHERE clause is served for -- a conjunction of scalar comparisons against
+// literals over numeric schema fields -- and a filter outside that declines the query.
+//
+// COUNT(DISTINCT) declines: it needs the values, not their aggregate. More than MaxGroupCols
+// columns declines: the storage key has that many component slots and a truncated key would merge
+// groups the scan keeps apart. An UNGROUPED filtered aggregate declines too, because this whole
+// path is the grouped one -- `SELECT COUNT(*) FILTER (WHERE ...)` with no GROUP BY still scans,
+// and the ungrouped columnar rung above refuses a filter for the same reason the index rung does.
 func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
 	if len(groupCols) == 0 || len(groupCols) > collections.MaxGroupCols || len(aggs) == 0 {
 		return nil, false
@@ -92,19 +104,34 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 		}
 		specs[i] = collections.GroupSpec{Attr: g.Attr, BucketWidth: g.BucketWidth}
 	}
-	// Which attribute each aggregate reads, and where its stats land. Attributes are de-duplicated so
-	// MIN(x) alongside MAX(x) reads the column once.
-	var attrs []string
-	slot := make([]int, len(aggs)) // -1 for COUNT(*), which needs no column
+	// Which column each aggregate reads, and where its stats land. Columns are de-duplicated so
+	// MIN(x) alongside MAX(x) reads x once -- and the key is (attribute, FILTER), because two
+	// aggregates share a column only when they see the same records. MIN(x) beside
+	// MIN(x) FILTER (WHERE ...) is two columns with two accumulators.
+	var cols []collections.GroupAggCol
+	// The filters of aggregates that read no column at all: `COUNT(*) FILTER (WHERE ...)`, whose
+	// answer is a record count and not a column's statistics. De-duplicated by filter text, so
+	// several counts under one condition narrow one plane.
+	var countFilters []string
+	slot := make([]int, len(aggs))  // index into cols, or -1
+	cslot := make([]int, len(aggs)) // index into countFilters, or -1
 	at := map[string]int{}
+	cat := map[string]int{}
 	for i, a := range aggs {
-		if a.Filter != "" {
-			return nil, false
-		}
+		slot[i], cslot[i] = -1, -1
 		switch a.Func {
 		case AggCount:
 			if a.Arg == "*" {
-				slot[i] = -1
+				if a.Filter == "" {
+					continue // the group's own record count
+				}
+				j, ok := cat[a.Filter]
+				if !ok {
+					j = len(countFilters)
+					cat[a.Filter] = j
+					countFilters = append(countFilters, a.Filter)
+				}
+				cslot[i] = j
 				continue
 			}
 		case AggMin, AggMax, AggSum, AggAvg:
@@ -114,11 +141,12 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 		if a.Arg == "" || a.Arg == "*" {
 			return nil, false
 		}
-		j, ok := at[a.Arg]
+		key := a.Arg + "\x00" + a.Filter
+		j, ok := at[key]
 		if !ok {
-			j = len(attrs)
-			at[a.Arg] = j
-			attrs = append(attrs, a.Arg)
+			j = len(cols)
+			at[key] = j
+			cols = append(cols, collections.GroupAggCol{Attr: a.Arg, Filter: a.Filter})
 		}
 		slot[i] = j
 	}
@@ -130,12 +158,21 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 	var groups []collections.GroupStats
 	var ok bool
 	if IsMatchAll(constraint) {
-		groups, ok = src.GroupStatsAllCols(specs, attrs)
+		groups, ok = src.GroupStatsAllAggs(specs, cols, countFilters)
 	} else {
-		groups, ok = src.GroupStatsConstraintCols(constraint, specs, attrs)
+		groups, ok = src.GroupStatsConstraintAggs(constraint, specs, cols, countFilters)
 	}
 	if !ok {
 		return nil, false
+	}
+	// A source that answered without filling the filtered counts would have ignored the filters,
+	// and reading past the slice it did return would panic rather than say so. GroupStatsSource is
+	// exported, so this is the check that turns an implementation that predates filtered counts
+	// into a decline.
+	for i := range groups {
+		if len(groups[i].CountOf) != len(countFilters) {
+			return nil, false
+		}
 	}
 
 	rows := make([]AggRow, 0, len(groups))
@@ -186,11 +223,17 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 	for n, g := range merged {
 		values := make([]string, len(aggs))
 		for i, a := range aggs {
-			if slot[i] < 0 {
+			switch {
+			case cslot[i] >= 0:
+				// COUNT(*) FILTER: the records of the group that passed the filter. A group
+				// none of them passed still appears, with zero -- a filter narrows the
+				// aggregate and never the group.
+				values[i] = strconv.Itoa(g.CountOf[cslot[i]])
+			case slot[i] < 0:
 				values[i] = strconv.Itoa(g.Count)
-				continue
+			default:
+				values[i] = numAggValue(a.Func, g.Stats[slot[i]])
 			}
-			values[i] = numAggValue(a.Func, g.Stats[slot[i]])
 		}
 		rows = append(rows, AggRow{Group: labels[n], Values: values})
 	}
@@ -203,6 +246,14 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 // records would have set them.
 func mergeGroupStats(dst, src *collections.GroupStats) {
 	dst.Count += src.Count
+	// Two storage keys rendering as one group merge their filtered record counts the same way
+	// they merge the unfiltered one: a record passed a filter or it did not, whichever key it
+	// was filed under.
+	for i := range dst.CountOf {
+		if i < len(src.CountOf) {
+			dst.CountOf[i] += src.CountOf[i]
+		}
+	}
 	for i := range dst.Stats {
 		d, s := &dst.Stats[i], src.Stats[i]
 		if s.N == 0 {
