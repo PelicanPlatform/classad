@@ -164,8 +164,14 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 					base += blk.n
 					continue
 				}
+				// A column that will not read (an unreadable cold stream): this block's records are
+				// read from the arena instead of left out of the cutoff, and counted as reassembled.
 				col, colOK := newNumCol(blk, aggIdx, aggID, st.cache)
-				if !colOK {
+				if !colOK || !blk.numColsReadable(otherIdxs, st.cache) {
+					if !c.topKBlockRows(w, s0, cs, base, blk.n, aggLookup, otherPreds, lookups, selfOK, tk, stats) {
+						releaseWindows(wins)
+						return 0, 0, false
+					}
 					base += blk.n
 					continue
 				}
@@ -284,6 +290,45 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 			}
 		}
 		off += int(total)
+	}
+	return true
+}
+
+// topKBlockRows is the row fallback for one columnar block whose columns will not read: its visible
+// records, read from the arena (see eachBlockRecord). Kept out of the column loop so that loop's
+// code is the same whether or not a block ever falls back.
+func (c *Collection) topKBlockRows(w segWindow, s0 uint64, cs *colSegment, base, n int,
+	aggLookup func(wire.Ad) ([]byte, bool), preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool),
+	selfOK func(float64) bool, tk *topKKeep, stats *ScanStats) bool {
+	return c.eachBlockRecord(w, s0, cs, base, n, func(ad wire.Ad) bool {
+		return topKFromAd(ad, aggLookup, preds, lookups, selfOK, tk, stats)
+	})
+}
+
+// topKFromAd is the row fallback's step for one record: test the predicates and offer the order value,
+// counting the record as visited and reassembled (it was rebuilt to test it). ok=false when a value
+// involved is an expression. bruteTopK takes the same step inline, for the reason statsFromAd gives.
+func topKFromAd(ad wire.Ad, aggLookup func(wire.Ad) ([]byte, bool), preds []fieldPred,
+	lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, tk *topKKeep, stats *ScanStats) bool {
+	stats.visit()
+	stats.reassembled()
+	match, ok := wirePredsMatch(ad, preds, lookups)
+	if !ok {
+		return false
+	}
+	if !match {
+		return true
+	}
+	node, found := aggLookup(ad)
+	if !found {
+		return true
+	}
+	if isExprNode(node) {
+		return false
+	}
+	if nv, isNum := nodeColVal(node); isNum && selfOK(nv.f) {
+		tk.offer(nv.f)
+		stats.matched()
 	}
 	return true
 }

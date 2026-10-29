@@ -241,6 +241,22 @@ func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) (in
 					base += blk.n
 					continue
 				}
+				// A predicated column that will not read (an unreadable cold stream): count this
+				// block's records from the arena rather than let the narrowing guess at them.
+				if !blk.numColsReadable(idxs, bc) {
+					if !c.eachBlockRecord(w, s0, cs, base, blk.n, func(ad wire.Ad) bool {
+						match, ok := wirePredsMatch(ad, preds, lookups)
+						if match {
+							count++
+						}
+						return ok
+					}) {
+						releaseWindows(wins)
+						return 0, false
+					}
+					base += blk.n
+					continue
+				}
 				sc.prepare(blk.n)
 				// Pass 0 establishes visibility, so later passes never touch a record no
 				// snapshot can see.
@@ -300,8 +316,9 @@ func resolveFields(cs *colSegment, preds []fieldPred) ([]int, bool) {
 // math.Float64bits, so reading it as an integer would silently produce astronomical values -- for a
 // column too wide for the two to agree, and for a literal that does not lower.
 //
-// ok=false when a candidate's value is one the columns cannot evaluate (cellExpr): the caller gives
-// the query back to the row path, since treating it as failing the predicate is a wrong answer.
+// ok=false when a candidate's value is one the columns cannot evaluate (cellExpr), or the column will
+// not read at all: the caller gives the query back to the row path, since treating either as failing
+// (or passing) the predicate is a wrong answer.
 func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, cand *candSet,
 	sc *predScratch) bool {
 	f := blk.schema.fields[idx]
@@ -419,7 +436,7 @@ func narrowByRecord(blk *columnarBlock, idx int, f adField, p fieldPred, bc *blo
 func narrowByScan(blk *columnarBlock, idx int, isReal bool, p fieldPred, bc *blockCache,
 	cand *candSet) bool {
 	ok := true
-	_ = blk.scanInt(idx, bc, func(k int, present bool, v int64) {
+	err := blk.scanInt(idx, bc, func(k int, present bool, v int64) {
 		if !ok || !cand.test(k) {
 			return
 		}
@@ -444,7 +461,9 @@ func narrowByScan(blk *columnarBlock, idx int, isReal bool, p fieldPred, bc *blo
 			cand.clear(k)
 		}
 	})
-	return ok
+	// A column that will not read tested nothing, so every candidate would otherwise pass a
+	// predicate it was never compared against.
+	return ok && err == nil
 }
 
 // bruteCountMulti is the row fallback: walk a window's visible records and test the predicated
@@ -468,23 +487,11 @@ func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, l
 		if !recIsMarker(w.data, o) && w.visible(o, s0) {
 			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
-				ok := true
-				for i := range preds {
-					node, found := lookups[i](wire.Ad(ww))
-					if !found {
-						ok = false
-						break
-					}
-					if isExprNode(node) {
-						return 0, false
-					}
-					nv, isNum := nodeColVal(node)
-					if !isNum || !preds[i].eval(nv.f) {
-						ok = false
-						break
-					}
+				match, ok := wirePredsMatch(wire.Ad(ww), preds, lookups)
+				if !ok {
+					return 0, false
 				}
-				if ok {
+				if match {
 					count++
 				}
 			}

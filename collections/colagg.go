@@ -243,7 +243,7 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 			base := 0
 			expr := false
 			for _, blk := range cs.blocks {
-				blk.scanInt(bidx, bc, func(k int, present bool, v int64) {
+				err := blk.scanInt(bidx, bc, func(k int, present bool, v int64) {
 					if expr {
 						return
 					}
@@ -280,6 +280,14 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 					releaseWindows(wins)
 					return false
 				}
+				// The column would not read (an unreadable cold stream), so scanInt handed over
+				// nothing for this block: read its records from the arena rather than drop them.
+				if err != nil && !c.eachBlockRecord(w, s0, cs, base, blk.n, func(ad wire.Ad) bool {
+					return numValueFromAd(ad, lookup, fn)
+				}) {
+					releaseWindows(wins)
+					return false
+				}
 				base += blk.n
 			}
 		}
@@ -305,17 +313,28 @@ func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) 
 		if !recIsMarker(w.data, o) && w.visible(o, s0) {
 			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
-				if node, ok := lookup(wire.Ad(ww)); ok {
-					if isExprNode(node) {
-						return false
-					}
-					if nv, ok := nodeColVal(node); ok {
-						fn(nv)
-					}
+				if !numValueFromAd(wire.Ad(ww), lookup, fn) {
+					return false
 				}
 			}
 		}
 		off += int(total)
+	}
+	return true
+}
+
+// numValueFromAd is the row fallback's step for one record: hand over the field's value when it is a
+// number. ok=false when it is an expression.
+func numValueFromAd(ad wire.Ad, lookup func(wire.Ad) ([]byte, bool), fn func(colVal)) bool {
+	node, ok := lookup(ad)
+	if !ok {
+		return true
+	}
+	if isExprNode(node) {
+		return false
+	}
+	if nv, ok := nodeColVal(node); ok {
+		fn(nv)
 	}
 	return true
 }
