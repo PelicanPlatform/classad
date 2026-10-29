@@ -87,10 +87,14 @@ func newSchemaLagArchive(tb testing.TB, nOld, nNew int, poison bool) (*schemaLag
 	}
 	f.append(tb, a, f.old, f.old+f.new)
 	a.AddSchemaRequireAttrs("Ts")
-	if !a.ReschemaScan(1<<16, 8) {
+	// Commit the schema WITH Ts without converging the old segments onto it -- the state a table is in
+	// for the passes a convergence takes. ReschemaScan or a maintenance pass would rewrite them (a
+	// budget's worth per pass, and this fixture is smaller than one budget), so the schema is installed
+	// directly and only the segments sealed since are columnarized.
+	s, hot, ok := a.c.deriveSchema(1<<16, 8)
+	if !ok || !a.c.installSchemaScan(s, hot) {
 		tb.Fatal("reschema failed")
 	}
-	a.BuildAndEnableSchemaScan(1<<16, 8)
 	for a.c.ColumnarizeSealed() > 0 {
 	}
 

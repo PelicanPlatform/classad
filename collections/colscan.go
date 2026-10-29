@@ -5,6 +5,7 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -97,6 +98,14 @@ type SchemaScanInfo struct {
 	SchemaFields    int      `json:"schemaFields,omitempty"`
 	SealedSegments  int      `json:"sealedSegments,omitempty"`
 	CoveredSegments int      `json:"coveredSegments,omitempty"`
+	// StaleSegments is how many covered segments were built under an earlier committed schema, hot
+	// tier or group set and are still to be brought current -- the backlog a schema change leaves,
+	// which maintenance works through ColumnarSegmentBudget segments per pass. Such a segment reads
+	// correctly under its own schema; it is only not yet accelerated the new way.
+	StaleSegments int `json:"staleSegments,omitempty"`
+	// BaseChanges is the base-schema change log, oldest first: each adoption of a different base
+	// schema, with the reason it was adopted and what moved.
+	BaseChanges []BaseSchemaChange `json:"baseChanges,omitempty"`
 	// GroupSchemas is how many SECONDARY schemas are built alongside the base one, and
 	// GroupSchemaFields their total field count. Zero when the feature is off, and also when it
 	// is on but no group has yet kept its members together long enough to be committed to
@@ -225,6 +234,10 @@ func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 			})
 		}
 	}
+	var stale *staleCheck
+	if st := c.schemaScan.Load(); st != nil {
+		stale = c.newStaleCheck(st)
+	}
 	for _, sh := range c.shards {
 		sh.mu.RLock()
 		act := sh.act
@@ -233,11 +246,15 @@ func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 				info.SealedSegments++
 				if seg.colblk.Load() != nil {
 					info.CoveredSegments++
+					if stale != nil && stale.segStale(seg) {
+						info.StaleSegments++
+					}
 				}
 			}
 		}
 		sh.mu.RUnlock()
 	}
+	info.BaseChanges = c.BaseSchemaChanges()
 	return info
 }
 
@@ -276,17 +293,33 @@ func (c *Collection) EnableSchemaScan(s *adSchema, hot []int) {
 // The cost is per ATTRIBUTE, which is the intended trade: a private attribute is excluded from the
 // columns and so is slow, while every other attribute keeps the accelerator.
 func (c *Collection) installSchemaScan(s *adSchema, hot []int) bool {
+	c.schemaMu.Lock()
+	defer c.schemaMu.Unlock()
+	return c.installSchemaScanLocked(s, hot, "schema build")
+}
+
+// installSchemaScanLocked is installSchemaScan for a caller already holding schemaMu, with the reason
+// a base-schema change is logged under. Publishing a NEW base schema also commits it to disk first,
+// so a restart reopens with the schema this process adopted rather than whichever one the last
+// segment it happens to load was written under (see adoptPersistedSchemaScan).
+func (c *Collection) installSchemaScanLocked(s *adSchema, hot []int, reason string) bool {
 	st := c.schemaScan.Load()
 	if st == nil || st.schema != s {
 		var prevGroups []*colGroup
+		var prevSchema *adSchema
+		var prevHot []int
 		if st != nil {
-			prevGroups = st.groups
+			prevGroups, prevSchema, prevHot = st.groups, st.schema, st.hot
 		}
 		groups := c.groupSchemasFor(s)
 		// Log a committed-set change (diff + reason) if this (re)build adopts a different group set
 		// than was committed. A no-op at first enable when no group qualifies yet (both empty). See
 		// colgroupchanges.go.
 		c.recordGroupChange(prevGroups, groups, "schema (re)build")
+		// Durable before visible, and before any segment is rewritten under it: a crash after the
+		// rewrites start must find this schema committed, or the reopen could adopt an older one and
+		// spend the next passes rewriting the converged segments back.
+		c.commitBaseSchema(prevSchema, prevHot, s, hot, reason)
 		// The collection's ONE shared columnar-block cache, not a second 256MiB cache: the schema
 		// scan and the colNative reconstruct read the SAME columnar blocks (keyed by process-unique
 		// block id), so two caches held largely the same decompressed blocks twice -- a needless
@@ -422,10 +455,7 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 		colBuildStallHook()
 	}
 	d := seg.dict.Load() // interned segment -> resolve its local ids during transcode
-	var groups []*colGroup
-	if st := c.schemaScan.Load(); st != nil {
-		groups = st.groups
-	}
+	groups := c.groupsFor(s)
 	blocks, gblocks, offs := buildColumnarFromSegmentGrouped(seg.data, seg.used, seg.damaged(), seg.codec,
 		c.regionCodec(), s, hot, groups, c.colGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return c.recordToInternedDict(d, dst, w) },
@@ -463,6 +493,23 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 		}
 	}
 	return cs
+}
+
+// groupsFor returns the committed group set to build alongside base schema s: the committed one when
+// s IS the committed base schema, and none otherwise.
+//
+// A group set is derived against a particular base -- its members are exactly the attributes that
+// base does not carry -- so it is only valid beside that base. The builders take s from a state they
+// loaded earlier, and a schema adoption can land in between; pairing that s with the NEW state's groups
+// would put an attribute the old base carries into a group as well, and the encoder leaves a group
+// member out of the base cold tail, so the block would hold an escaped base field with its value
+// nowhere -- read as absent. Building no groups is always valid; the segment is then simply stale
+// against the committed state and the next convergence pass rebuilds it.
+func (c *Collection) groupsFor(s *adSchema) []*colGroup {
+	if st := c.schemaScan.Load(); st != nil && st.schema == s {
+		return st.groups
+	}
+	return nil
 }
 
 // colBlobForSeg builds and marshals seg's columnar block under the collection's CURRENT schema-scan
@@ -519,6 +566,17 @@ func (c *Collection) adoptPersistedSchemaScan() {
 	if c.schemaScan.Load() != nil {
 		return
 	}
+	// The committed schema wins over anything a segment carries. While a schema change converges,
+	// segments hold DIFFERENT schemas -- some the committed one, some the one before it -- so "any
+	// segment's schema is a valid seed" stops being true: seeding from an old segment would make the
+	// reopened table treat the converged segments as stale and rewrite them back, undoing the
+	// convergence and, across repeated restarts, never finishing it. The blocks below are the
+	// fallback for a store written before the schema was committed separately.
+	if s, hot, ok := c.loadCommittedBaseSchema(); ok {
+		c.baseCommitted.Store(true)
+		c.schemaScan.Store(&schemaScanState{schema: s, hot: hot, cache: c.sharedColCache()})
+		return
+	}
 	var adopt *colSegment
 	for _, sh := range c.shards {
 		sh.mu.RLock()
@@ -554,49 +612,57 @@ func (c *Collection) adoptPersistedSchemaScan() {
 // BuildAndEnableSchemaScan samples the collection, builds an adschema, chooses the hot numeric
 // tier as the top-hotTopN int/real fields by accumulated read demand (c.demand -- the same
 // signal RefreshHotSet uses; the schema's hot tier IS the hot set), and enables the columnar
-// scan over the sealed segments. Returns false if there is nothing to sample. Re-callable to
-// pick up newly-sealed segments (existing blocks are kept).
+// scan over the sealed segments. Returns false if there is nothing to sample. Re-callable: this is
+// the routine maintenance pass.
 func (c *Collection) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 	// Encryption is no longer exclusive with the accelerator; see EnableSchemaScan.
-	// Already enabled: keep the stable schema and hot set chosen at first enable, and just
-	// extend coverage to any segments sealed since (their blocks are built against this same
-	// schema, so nothing is orphaned). Rebuilding a fresh schema here would give every new
-	// block a different schema pointer, leaving earlier segments' blocks unmatched and
-	// silently demoting them to the brute-scan fallback. Re-schema-ing (with a full block
-	// rebuild) is a separate, heavier operation, not part of a routine maintenance refresh.
 	if st := c.schemaScan.Load(); st != nil {
-		// Auto-promote the group set as the stability history matures: re-derive the gate-qualified
-		// groups and, only when they differ from the committed set, adopt them and bring existing
-		// segments current. A no-op when unchanged, so a stable table's refresh stays exactly the
-		// light pass it was. This is the routine-maintenance counterpart to the group derivation
-		// that first-enable and ReschemaScan do -- without it the set froze at its first-enable
-		// value (empty, because the history was too short then) for the life of the process.
-		c.refreshGroupSchemas(st)
-		c.schemaScanPass(st.schema, st.hot)
+		// Already enabled: review the committed state rather than re-derive it blindly. The base
+		// schema is re-derived from a fresh sample and adopted ONLY when the difference is material
+		// (see reviewBaseSchema); otherwise the group set gets its own auto-promotion review. Either
+		// way the pointer a steady table carries does not move, so nothing is rebuilt for a
+		// derivation that merely wobbled.
+		c.refreshSchemaState(sampleMax, hotTopN)
+		c.schemaScanPass()
+		// Bring segments built under an earlier committed state current, a budget's worth per pass.
+		// Run on every pass, not only on the pass that adopted a change: a table with more stale
+		// segments than one budget would otherwise stop converging the moment the adoption pass ended.
+		c.convergeStaleSegments()
 		return true
 	}
+	c.schemaMu.Lock()
 	s, hot, ok := c.deriveSchema(sampleMax, hotTopN)
+	if ok {
+		ok = c.installSchemaScanLocked(s, hot, "first enable")
+		c.reviewed = schemaReviewMark{at: time.Now(), require: c.SchemaRequireAttrs()}
+	}
+	c.schemaMu.Unlock()
 	if !ok {
 		return false
 	}
-	c.schemaScanPass(s, hot)
+	c.schemaScanPass()
 	return true
 }
 
-// schemaScanPass is what a routine schema review does: publish the schema, move each sealed
-// segment's schema'd attributes INTO the segment (columnar-native, bounded by
+// schemaScanPass is what a routine schema review does once the committed state is published: move
+// each sealed segment's schema'd attributes INTO the segment (columnar-native, bounded by
 // ColumnarSegmentBudget), then build sidecar blocks for whatever the rewrite did not take.
 //
 // The order is the point. Columnarizing makes a sidecar block redundant, so covering first
 // would compress and write one only to strand it; and columnarizing needs the schema, so it
 // cannot go before the state is published. A collection with the rewrite disabled sees exactly
-// the old behaviour, because the middle step returns 0 and covering does all the work.
-func (c *Collection) schemaScanPass(s *adSchema, hot []int) {
-	if !c.installSchemaScan(s, hot) {
+// the old behaviour, because the first step returns 0 and covering does all the work.
+//
+// It reads the committed state rather than taking a schema argument: a pass that published one
+// schema and then covered with another it had been handed earlier would build blocks for a state
+// that a concurrent adoption had already replaced.
+func (c *Collection) schemaScanPass() {
+	st := c.schemaScan.Load()
+	if st == nil {
 		return
 	}
 	c.ColumnarizeSealed()
-	c.coverSealedSegments(s, hot)
+	c.coverSealedSegments(st.schema, st.hot)
 }
 
 // deriveSchema samples the collection and derives a schema plus its hot numeric tier, without
@@ -604,30 +670,32 @@ func (c *Collection) schemaScanPass(s *adSchema, hot []int) {
 // ReschemaScan (a deliberate rebuild). Returns false if there is nothing to sample or no field
 // survived the presence threshold.
 func (c *Collection) deriveSchema(sampleMax, hotTopN int) (*adSchema, []int, bool) {
-	samples := c.CollectSamplesRecentN(sampleMax)
+	s, hot, _, ok := c.deriveSchemaFrom(c.schemaSamples(sampleMax), hotTopN)
+	return s, hot, ok
+}
+
+// schemaSamples draws a derivation sample in the id-keyed wire form buildAdSchema reads. A
+// persistent (inline) collection's records store names, so they are canonicalized to interned wire
+// first -- else every ad looks empty, the schema comes out empty and the accelerator silently never
+// enables.
+func (c *Collection) schemaSamples(sampleMax int) [][]byte {
+	return c.normalizeSamples(c.CollectSamplesRecentN(sampleMax))
+}
+
+// deriveSchemaFrom derives a schema and hot tier from an already-drawn sample, also returning the
+// required attributes the derivation refused (which it publishes for diagnostics as well). Split
+// from deriveSchema so the maintenance review can measure the current and the candidate schema
+// against the SAME sample: two independent samples would differ by sampling noise alone, and that
+// noise would read as drift.
+func (c *Collection) deriveSchemaFrom(samples [][]byte, hotTopN int) (*adSchema, []int, []requireSkip, bool) {
 	if len(samples) == 0 {
-		return nil, nil, false
-	}
-	// buildAdSchema reads the id-keyed wire form; a persistent (inline) collection's records
-	// store names, so canonicalize them to interned wire first (else the schema is empty and
-	// the accelerator silently never enables).
-	if c.inline {
-		interned := make([][]byte, 0, len(samples))
-		for _, w := range samples {
-			if iw, ok := c.recordToInterned(nil, w); ok {
-				interned = append(interned, iw)
-			}
-		}
-		samples = interned
-		if len(samples) == 0 {
-			return nil, nil, false
-		}
+		return nil, nil, nil, false
 	}
 	opts, reqNames := c.baseSchemaOpts()
 	s, reqSkipped := buildAdSchemaReport(samples, opts)
 	c.recordRequireSkips(reqSkipped, reqNames)
 	if len(s.fields) == 0 {
-		return nil, nil, false
+		return nil, nil, reqSkipped, false
 	}
 	type fieldDemand struct {
 		idx   int
@@ -661,7 +729,7 @@ func (c *Collection) deriveSchema(sampleMax, hotTopN int) (*adSchema, []int, boo
 	// width that covers essentially all its values. Cold fields keep the tight base width. See
 	// refitHotIntWidths.
 	s, hot = refitHotIntWidths(s, samples, hot, hotIntFit)
-	return s, hot, true
+	return s, hot, reqSkipped, true
 }
 
 // hotIntFit is the width fit percentile for HOT (demand-queried) int columns: high enough to

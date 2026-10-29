@@ -84,7 +84,7 @@ type colScope struct {
 
 const (
 	bindColdTail = -1 // not a schema field: look in the cold tail
-	bindUnknown  = -2 // the table has never interned this name: no record can have it
+	bindUnknown  = -2 // the table has never interned this name (see resolveAttr for what that proves)
 )
 
 // bindField resolves name against the current block's schema, caching the answer.
@@ -129,7 +129,18 @@ func (cs *colScope) resolveAttr(name string, scope ast.AttributeScope) classad.V
 	}
 	idx := cs.bindField(name)
 	if idx == bindUnknown {
-		// The table never interned this name, so no record defines it. Exact, no fallback.
+		if cs.c.inline {
+			// NOT proof of absence on a persistent store. Its records carry attribute NAMES, and the
+			// intern table is rebuilt at every Open from what recovery happens to resolve -- schema
+			// fields, payload sections -- so an attribute that lives only in a columnarized segment's
+			// remnants is never interned after a restart. Answering undefined here dropped every
+			// sealed record from `MemoryUsage > 1` (an expression attribute, which always stays in
+			// the remnant) the moment the table was reopened: 46 of 4050 counted.
+			cs.fallBack()
+			return classad.NewUndefinedValue()
+		}
+		// An in-memory table interns every attribute its records hold, so a name it never interned
+		// is in no record. Exact, no fallback.
 		return classad.NewUndefinedValue()
 	}
 	if idx == bindColdTail {

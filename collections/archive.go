@@ -478,7 +478,8 @@ func (a *Archive) ExplainQuery(q *vm.Query) QueryExplain { return a.c.ExplainQue
 //
 // The first call reads every sealed record once to sample and to build a block per segment,
 // which over a long history is the same "paid for by reading history back" cost an archive
-// index backfill has. Later calls only cover segments sealed since.
+// index backfill has. Later calls cover segments sealed since, re-derive the schema and adopt it
+// when the change is material, and converge stale segments a budget's worth per call.
 func (a *Archive) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 	return a.c.BuildAndEnableSchemaScan(sampleMax, hotTopN)
 }
@@ -487,8 +488,8 @@ func (a *Archive) BuildAndEnableSchemaScan(sampleMax, hotTopN int) bool {
 // escape rates (see Collection.SchemaFit).
 func (a *Archive) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) { return a.c.SchemaFit(sampleMax) }
 
-// ReschemaScan re-derives the archive's schema and rebuilds every sealed segment's columnar
-// block against it (see Collection.ReschemaScan).
+// ReschemaScan re-derives the archive's schema and adopts it, rebuilding sidecar blocks now and
+// converging columnarized segments over maintenance passes (see Collection.ReschemaScan).
 func (a *Archive) ReschemaScan(sampleMax, hotTopN int) bool {
 	return a.c.ReschemaScan(sampleMax, hotTopN)
 }
@@ -502,8 +503,9 @@ func (a *Archive) SchemaRequireAttrs() []string        { return a.c.SchemaRequir
 func (a *Archive) SchemaRequireRuntimeAttrs() []string { return a.c.SchemaRequireRuntimeAttrs() }
 
 // SetSchemaRequireAttrs / AddSchemaRequireAttrs / DropSchemaRequireAttrs change the required set
-// (see Collection). Each reports whether the effective set changed; none re-derives anything --
-// adopting a new schema means ReschemaScan, which rebuilds every sealed segment's block.
+// (see Collection). Each reports whether the effective set changed; none re-derives anything
+// itself -- the next maintenance review adopts the schema the new set produces and converges the
+// sealed segments onto it, ColumnarSegmentBudget per pass.
 func (a *Archive) SetSchemaRequireAttrs(names []string) bool { return a.c.SetSchemaRequireAttrs(names) }
 func (a *Archive) AddSchemaRequireAttrs(names ...string) bool {
 	return a.c.AddSchemaRequireAttrs(names...)

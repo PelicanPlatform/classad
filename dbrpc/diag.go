@@ -820,12 +820,10 @@ type schemaScanTable interface {
 // schemaRequireAction lists or changes the required-attribute set: the attributes that enter the
 // derived columnar schema whatever their presence rate. One implementation for both table types.
 //
-// Changing the set is deliberately only half the operation. Every sealed segment's columnar block
-// was built against the schema the old set produced, and adopting a new one means re-deriving it
-// and rebuilding every one of those blocks -- a cost on the scale of the whole table, the same
-// shape as the first columnar build. So the change is recorded and persisted here, and the
-// response says plainly that schema.rebuild is what makes it take effect. Doing the rebuild
-// inside an "add an attribute" verb would hide hours of I/O behind a one-word command.
+// Changing the set is recorded and persisted here and nothing else: adopting the schema it produces
+// means rewriting the sealed segments, which the maintenance passes do a budget's worth at a time.
+// Doing it inside an "add an attribute" verb would hide hours of I/O behind a one-word command. The
+// response says so, and that schema.rebuild adopts at once.
 func schemaRequireAction(t schemaScanTable, action string, args []string) (string, error) {
 	switch action {
 	case "schema.require":
@@ -859,9 +857,9 @@ func schemaRequireAction(t schemaScanTable, action string, args []string) (strin
 		if !changed {
 			return "required schema attributes unchanged: " + join(cur), nil
 		}
-		return fmt.Sprintf("required schema attributes: %s (run schema.rebuild to re-derive the "+
-			"schema and rebuild every sealed segment's columnar block -- until then the change is "+
-			"recorded but not in effect)", join(cur)), nil
+		return fmt.Sprintf("required schema attributes: %s (the next maintenance pass adopts the "+
+			"re-derived schema and converges the sealed segments onto it a budget at a time; "+
+			"schema.rebuild adopts it now)", join(cur)), nil
 	}
 	return "", fmt.Errorf("unknown schema.require action %q", action)
 }
@@ -893,9 +891,9 @@ func schemaFitAction(t schemaScanTable, args []string) (string, error) {
 	return string(b), nil
 }
 
-// schemaRebuildAction re-derives the schema and rebuilds every sealed segment's columnar block.
-// Routine maintenance keeps the schema pinned forever, so this is the only way to re-derive it as
-// the workload drifts. hotTopN is the server's configured hot-column count, or 0 for the default.
+// schemaRebuildAction re-derives the schema and adopts it now, rather than waiting for maintenance
+// to judge the change material. hotTopN is the server's configured hot-column count, or 0 for the
+// default.
 func schemaRebuildAction(t schemaScanTable, args []string, hotTopN int) (string, error) {
 	sampleMax, topN := diagSampleMax, hotTopN
 	if topN <= 0 {
@@ -918,8 +916,9 @@ func schemaRebuildAction(t schemaScanTable, args []string, hotTopN int) (string,
 			"accelerator is unavailable here (encryption at rest)")
 	}
 	info := t.SchemaScanInfo()
-	return fmt.Sprintf("schema rebuilt: %d field(s), %d hot, %d/%d sealed segments covered",
-		info.SchemaFields, len(info.HotFields), info.CoveredSegments, info.SealedSegments), nil
+	return fmt.Sprintf("schema rebuilt: %d field(s), %d hot, %d/%d sealed segments covered, %d still "+
+		"on an earlier schema (maintenance converges them)",
+		info.SchemaFields, len(info.HotFields), info.CoveredSegments, info.SealedSegments, info.StaleSegments), nil
 }
 
 // schemaGroupsAction reports the candidate group schemas: attribute sets the base schema does not

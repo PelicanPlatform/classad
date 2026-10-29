@@ -963,10 +963,17 @@ A value that does not fit its slot — the wrong kind, an integer too wide, or a
 expression rather than a literal — **escapes**. Escaped values are carried elsewhere in
 the record, as described below.
 
-The schema is fixed when columnar storage is first enabled on a collection. Routine
-refreshes only extend it to new segments. `ReschemaScan` is the heavy operation that
-rebuilds it. Each columnarized segment carries its own schema, and readers resolve the
-schema per block.
+The schema is derived when columnar storage is first enabled on a collection. Routine
+maintenance re-derives it when the required-attribute set changes, and otherwise at most
+hourly, and adopts the re-derivation only when the change is material: a required
+attribute that is not a field, an attribute present in at least 95% of the sample, a field
+in its slot in under 80%, or a field the new layout stores better by 10% of the sample.
+The adopted schema is committed to `baseschema.json` before any segment is rewritten, so a
+reopen restores it. Segments built under an earlier schema are rewritten (columnarized) or
+rebuilt (sidecar blocks) `ColumnarSegmentBudget` per pass. `ReschemaScan` adopts a
+re-derivation unconditionally. Each columnarized segment carries its own schema, and
+readers resolve the schema per block, so old and new segments coexist while a change
+converges.
 
 ### Group schemas
 
@@ -1135,8 +1142,6 @@ read, which is why the query engine tries hard not to do it (Chapter 11).
 - **Chaining.** Chained (parent/child) collections never use the column paths.
 - **Remnants** are still compressed one record at a time. Grouping a few dozen per
   region measured 3–5× smaller; it is not yet implemented.
-- **Schema freeze.** A schema fixed at first enable never adapts to drift short of
-  `ReschemaScan`.
 - **Error visibility.** A record whose payload cannot be read is skipped by scans and
   counted (`ColNativeCRCFailures`, and per record in `RecordReadSkips`). The query does
   not fail. Damage is visible to operators but not to the query that missed it. A
