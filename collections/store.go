@@ -1442,6 +1442,18 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		// cannot be handed to the matcher -- its seed set is not closed.
 		if projCS != nil && cn != nil && (isConst || colDecided) && st.closureMiss < closureMissGiveUp {
 			if k, ok := cn.indexOf(r.off); ok {
+				// The record is about to be SERVED, and partly from its own bytes (the remnant and
+				// header), so it takes the same integrity gate wireAt applies before reassembling:
+				// a record whose checksum fails, or whose segment dictionary is unusable, is skipped
+				// and counted exactly as the reassembling path skips and counts it. Without this the
+				// projection served rows the plain scan refuses.
+				//
+				// A record the columns REJECT above needs no gate: it is skipped whichever path
+				// runs, and the plain scan does not read its bytes either.
+				if err := c.recordRefused(r.w.seg, r.w.data, r.off); err != nil {
+					noteReadSkip(err)
+					return true
+				}
 				// A plan whose consumer evaluates takes the fast path only for records whose
 				// projected ad is self-contained; the rest fall through and reassemble. See
 				// adSelfClosed for why that is the real condition rather than "has a plan".
