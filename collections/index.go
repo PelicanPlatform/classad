@@ -23,8 +23,9 @@ import (
 // consults the index for [0, upto) and full-scans the remaining tail, so a stale
 // or partial index is always correct, just less selective. Indexes are (re)built
 // on a schedule the caller controls (Reindex), independently of writes and
-// compaction — new/active/compacted segments are simply full-scanned until their
-// next reindex.
+// compaction. Between reindexes an indexed read extends the index of a writable
+// segment whose uncovered tail has grown (catchUpIndexes, index_extend.go) rather
+// than walking every record written since.
 
 // indexSpec is the collection's configured indexes: interned attribute ids
 // partitioned into categorical (string) and value (numeric). It is immutable once
@@ -364,6 +365,30 @@ type segIndex struct {
 // post only the attributes its schema does not cover, and an indexed query would then miss records
 // that plainly match -- a wrong answer with a fast path in front of it.
 func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segIndex {
+	si := indexSegRange(c, seg, 0, upto, spec)
+	// Summarize each attribute's completed postings for segment-skip and
+	// selectivity ordering (see segstats.go). One pass over the distinct values.
+	si.finish()
+	return si
+}
+
+// finish completes a freshly indexed segIndex: it collapses the case-uniform exact buckets and
+// computes each attribute's summary stats. Nothing may be added to si afterwards.
+func (si *segIndex) finish() {
+	for _, cp := range si.cat {
+		cp.finalizeExact()
+		cp.finishStats()
+	}
+	for _, vp := range si.val {
+		vp.finishStats()
+	}
+}
+
+// indexSegRange posts seg's records in [from, upto) into a new, UNFINISHED segIndex whose upto is
+// upto: exact still holds every spelling, and no stats are computed. buildSegIndex finishes it
+// as it stands; extendSegIndex merges it into an index of [0, from) first. from must be a record
+// boundary (0, or an earlier index's upto).
+func indexSegRange(c *Collection, seg *segment, from, upto int, spec *indexSpec) *segIndex {
 	data, dict := seg.data, seg.dict.Load()
 	si := &segIndex{
 		upto:    uint32(upto),
@@ -387,7 +412,7 @@ func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segI
 	dm := seg.damaged()
 	walked := 0
 	defer func() { c.recWalked.Add(int64(walked)) }()
-	for off := 0; off < upto; {
+	for off := from; off < upto; {
 		o := uint32(off)
 		if end, ok := dm.skip(o); ok {
 			off = int(end)
@@ -421,15 +446,6 @@ func buildSegIndex(c *Collection, seg *segment, upto int, spec *indexSpec) *segI
 		}
 		walked++
 		off += int(total)
-	}
-	// Summarize each attribute's completed postings for segment-skip and
-	// selectivity ordering (see segstats.go). One pass over the distinct values.
-	for _, cp := range si.cat {
-		cp.finalizeExact()
-		cp.finishStats()
-	}
-	for _, vp := range si.val {
-		vp.finishStats()
 	}
 	return si
 }

@@ -911,6 +911,13 @@ type segWindow struct {
 	// was captured. It is what decides which segment keeps a record-offset table for
 	// newest-first scans (recoffs.go); it shares ctFree's padding, so the window does not grow.
 	active bool
+	// idx is the segment's index as of the snapshot (nil: none), which every step of one indexed
+	// read consults rather than the segment's current one. An index is replaced while reads run
+	// (Reindex, catchUpIndexes), and a read that asked twice could plan its delta candidates over
+	// one covered prefix and walk the postings of a longer one: the deltas in between, which post
+	// nothing for what they inherit, would be in neither. Loaded with used, under the shard lock,
+	// so it never covers more than the window holds.
+	idx readIndex
 }
 
 // visible reports whether the record at o is visible at snapshot s0. A damaged record never is: its
@@ -977,7 +984,7 @@ func (sh *shard) buildWindowsLocked(s0 uint64) []segWindow {
 		}
 		seg.pin() // no-op for RAM segments
 		wins = append(wins, segWindow{data: seg.data, used: seg.used, codec: seg.codec, seg: seg, zones: seg.zones, dmg: seg.damaged(),
-			ctFree: shardFree && seg.ctProven(seg.used), active: seg == sh.act})
+			ctFree: shardFree && seg.ctProven(seg.used), active: seg == sh.act, idx: seg.readIdx()})
 	}
 	return wins
 }

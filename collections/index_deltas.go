@@ -30,17 +30,38 @@ type segDeltas struct {
 //
 // The returned bitmap is shared; callers Or it into their own and never modify it.
 //
-// Cached on the segment. A sealed segment's prefix never changes, and an active one's covered
-// prefix only grows when its index is rebuilt, which changes upto and so misses the cache.
+// Cached on the segment. A sealed segment's prefix never changes. A writable one's covered prefix
+// grows each time its index is extended, so a longer prefix carries the cached set forward and
+// walks only the headers past it; a read still holding an older, shorter index gets the cached set
+// cut back to its prefix.
 func (c *Collection) deltaCandidates(w segWindow, upto uint32) *roaring.Bitmap {
 	if !c.deltaRead || w.seg == nil || upto == 0 {
 		return nil
 	}
-	if d := w.seg.deltas.Load(); d != nil && d.upto == upto {
-		return d.bm
-	}
+	d := w.seg.deltas.Load()
+	from := uint32(0)
 	var bm *roaring.Bitmap
-	for off := uint32(0); off < upto; {
+	switch {
+	case d != nil && d.upto == upto:
+		return d.bm
+	case d != nil && d.upto > upto:
+		if d.bm == nil {
+			return nil
+		}
+		cut := d.bm.Clone()
+		cut.RemoveRange(uint64(upto), uint64(d.upto))
+		if cut.IsEmpty() {
+			return nil
+		}
+		return cut
+	case d != nil:
+		// Both offsets are index watermarks, so from is a record boundary.
+		from = d.upto
+		if d.bm != nil {
+			bm = d.bm.Clone()
+		}
+	}
+	for off := from; off < upto; {
 		if end, ok := w.dmg.skip(off); ok {
 			off = end
 			continue
@@ -170,7 +191,7 @@ func (c *Collection) newDeltaScope(sh *shard, s0 uint64, wins []segWindow, usabl
 		// Deltas that do not carry the probe's attribute and are not candidates on their own:
 		// they inherit it, and are decided by their key below.
 		inherit := make([]*roaring.Bitmap, len(todo))
-		need := map[string]struct{}{}
+		inherits := false
 		for i, t := range todo {
 			own := t.si.candidateOffsets(single)
 			carry := t.si.candidateOffsets(present)
@@ -190,25 +211,48 @@ func (c *Collection) newDeltaScope(sh *shard, s0 uint64, wins []segWindow, usabl
 				inh.AndNot(carry)
 			}
 			inherit[i] = inh
-			it := inh.Iterator()
-			for it.HasNext() {
-				need[string(recKey(t.w.data, it.Next()))] = struct{}{}
-			}
+			inherits = inherits || !inh.IsEmpty()
 		}
-		if len(need) == 0 {
+		if !inherits {
 			continue
 		}
-		// The keys among them with some record, in any segment, that the probe admits.
-		found := make(map[string]struct{}, len(need))
+		// The segments whose index may post a record the probe admits. With none, no key has
+		// such a record, and every inheriting delta is dropped without reading a key: the common
+		// answer for a probe on a recent timestamp or a value nothing holds.
+		type posting struct {
+			sw segWindow
+			si readIndex
+		}
+		var postSegs []posting
 		for _, sw := range segs {
+			if si := sw.seg.readIdx(); si != nil && !si.skipsPrefix(single) {
+				postSegs = append(postSegs, posting{sw: sw, si: si})
+			}
+		}
+		if len(postSegs) == 0 {
+			for i := range todo {
+				keep[i].AndNot(inherit[i])
+			}
+			continue
+		}
+		// Keys are compared by hash. Two keys sharing one only keep a delta the probe could have
+		// dropped, and the caller re-verifies every candidate; hashing spares a string per key,
+		// which was most of the cost of a probe over a store patched since its last compaction.
+		need := map[uint64]struct{}{}
+		for i, t := range todo {
+			it := inherit[i].Iterator()
+			for it.HasNext() {
+				need[c.h.Hash(recKey(t.w.data, it.Next()))] = struct{}{}
+			}
+		}
+		// The keys among them with some record, in any segment, that the probe admits.
+		found := make(map[uint64]struct{}, len(need))
+		for _, ps := range postSegs {
 			if len(found) == len(need) {
 				break
 			}
-			si := sw.seg.readIdx()
-			if si == nil || si.skipsPrefix(single) {
-				continue
-			}
-			cand := si.candidateOffsets(single)
+			sw := ps.sw
+			cand := ps.si.candidateOffsets(single)
 			if cand == nil {
 				continue
 			}
@@ -221,9 +265,9 @@ func (c *Collection) newDeltaScope(sh *shard, s0 uint64, wins []segWindow, usabl
 				if (sw.dmg != nil && sw.dmg.holds(o)) || recIsMarker(sw.data, o) {
 					continue
 				}
-				k := recKey(sw.data, o)
-				if _, ok := need[string(k)]; ok {
-					found[string(k)] = struct{}{}
+				h := c.h.Hash(recKey(sw.data, o))
+				if _, ok := need[h]; ok {
+					found[h] = struct{}{}
 				}
 			}
 		}
@@ -232,7 +276,7 @@ func (c *Collection) newDeltaScope(sh *shard, s0 uint64, wins []segWindow, usabl
 			it := inherit[i].Iterator()
 			for it.HasNext() {
 				o := it.Next()
-				if _, ok := found[string(recKey(t.w.data, o))]; !ok {
+				if _, ok := found[c.h.Hash(recKey(t.w.data, o))]; !ok {
 					drop.Add(o)
 				}
 			}

@@ -1737,7 +1737,7 @@ func (gc groupCandidates) index(w segWindow) readIndex { return groupsWindowInde
 // groupsWindowIndex is windowIndex for a DNF plan: the index that can narrow w to every group's
 // candidates, or nil when w has to be walked in full.
 func groupsWindowIndex(w segWindow, groups [][]usableProbe, ct bool) readIndex {
-	si := w.seg.readIdx()
+	si := w.idx
 	if si == nil || !si.coversGroups(groups) || (ct && !w.ctFree) {
 		return nil
 	}
@@ -1792,7 +1792,7 @@ func liveGroups(groups [][]usableProbe) (live [][]usableProbe, none bool) {
 // walked in full: it has no index, its index does not cover every probe's attribute, or the probes
 // fold CurrentTime (ct) and w is not proven free of it.
 func windowIndex(w segWindow, usable []usableProbe, ct bool) readIndex {
-	si := w.seg.readIdx()
+	si := w.idx
 	if si == nil || !si.covers(usable) || (ct && !w.ctFree) {
 		return nil
 	}

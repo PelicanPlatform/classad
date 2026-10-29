@@ -158,7 +158,19 @@ func (rp readPlan) disjunctive() bool { return rp.groups != nil }
 // nearly the whole collection (overSelectivityGate); anything else is planned as a conjunction
 // (planQuery). Every filtered read plans here -- Query, the raw and projected reads, the paged
 // read -- so they all take the same access path, and ExplainQuery reports it (dnfReadPlan).
+//
+// A read that will walk index candidates first brings the segment indexes up to date
+// (catchUpIndexes), so it does not walk every record written since the last Reindex.
 func (c *Collection) planReadQuery(qp queryPlan) readPlan {
+	rp := c.planReadShape(qp)
+	if rp.disjunctive() || (len(rp.usable) > 0 && !unsatisfiable(rp.usable)) {
+		c.catchUpIndexes()
+	}
+	return rp
+}
+
+// planReadShape is planReadQuery's choice of access path.
+func (c *Collection) planReadShape(qp queryPlan) readPlan {
 	if qp.q != nil {
 		if plan := qp.q.ProbePlan(); len(plan) > 1 {
 			for _, g := range plan {
