@@ -54,9 +54,9 @@ func (c *Collection) QueryRawWireRefsStats(q *vm.Query, projection []string, red
 	return func(yield func([]byte) bool) {
 		sel := c.newWireSubsetSelectorRefs(projection, redact, true)
 		// A projection plan, but one MARKED as feeding a consumer that evaluates. Passing no
-		// plan at all -- which every other chasing scan does -- costs the columnar fast path
-		// on every record: measured on 20k real job ads it was 83ms with the plan against
-		// 255ms without, dwarfing the closure itself at 17ms.
+		// plan at all costs the columnar fast path on every record: measured on 20k real job
+		// ads it was 83ms with the plan against 255ms without, dwarfing the closure itself at
+		// 17ms.
 		//
 		// The plan is safe here because the scan checks each projected record for being
 		// self-contained and reassembles the ones that are not (see adSelfClosed). A

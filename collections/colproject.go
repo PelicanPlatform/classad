@@ -35,8 +35,10 @@ import (
 // than of the scan. A narrowed ad is enough to SHIP: the entries are emitted as stored, which is
 // what QueryRawWire does. It is not enough to EVALUATE, because a kept attribute may be an
 // expression whose references were narrowed away, and evaluating it then yields UNDEFINED rather
-// than an error. So the scans whose emit evaluates -- QueryProject, and QueryRawProjected under
-// chaseRefs -- pass no plan and take the reassembled record; see the note at each.
+// than an error. A consumer that follows references -- QueryRawWireRefs, and QueryRawProjected
+// under chaseRefs -- passes a closure plan (projPlan.closure): the scan keeps a narrowed ad only
+// when it is self-contained and reassembles the rest. QueryProject, which evaluates, passes no
+// plan at all; see the note there.
 
 // projPlan is a projection resolved for the scan: which attributes to keep, and where they live.
 type projPlan struct {
@@ -44,6 +46,9 @@ type projPlan struct {
 	ids map[uint32]struct{}
 	// names is the projection as given, for resolving into a segment's local id space.
 	names []string
+	// nameHashes are names' case-folded hashes (wire.NameHash32), for testing an inline-keyed
+	// entry of the record by name.
+	nameHashes []uint32
 	// localDict/local cache names resolved against one segment's dictionary, since the record half
 	// of the output is keyed by local ids and resolving is a dictionary probe per name. Keyed by the
 	// dict's identity: a different segment is a different id space, and reusing the mapping there
@@ -66,8 +71,42 @@ func (c *Collection) newProjPlan(names []string) *projPlan {
 		if id, ok := c.intern.LookupID(n); ok {
 			p.ids[id] = struct{}{}
 		}
+		p.nameHashes = append(p.nameHashes, wire.NameHash32(n))
 	}
 	return p
+}
+
+// wantsName reports whether name, an inline-keyed entry's name, is one of the projected names,
+// compared case-insensitively as attribute names are.
+func (p *projPlan) wantsName(name string) bool {
+	h := wire.NameHash32(name)
+	for i, ph := range p.nameHashes {
+		if ph == h && foldEqualStrings(name, p.names[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// foldEqualStrings is wire.FoldEqualBytes for two strings: equal under ASCII case folding, the
+// folding wire.NameHash32 applies.
+func foldEqualStrings(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 'a' - 'A'
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 'a' - 'A'
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
 }
 
 // localWanted returns the projection resolved into dict's id space.
@@ -121,9 +160,12 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 	}
 	narrowed, ok := narrowAd(&sc.narrow, raw, func(id uint32, name string) bool {
 		if name != "" {
-			// An inline entry: keep it and let the consumer's own keep test decide. Cheap, and being
-			// generous here is safe -- being stingy would drop a requested attribute.
-			return true
+			// An inline entry (an inline-keyed segment's remnant holds nothing else): keep it only if
+			// it is projected. Every consumer's own keep test admits a subset of the plan's names, so
+			// nothing it wants is dropped. Keeping the rest instead would hand a closure plan's check
+			// (adSelfClosed) every expression in the remnant, and one of them reaching outside the
+			// projection sends a record that never asked for it back to reassembly.
+			return p.wantsName(name)
 		}
 		if want == nil {
 			_, in := p.ids[id]
