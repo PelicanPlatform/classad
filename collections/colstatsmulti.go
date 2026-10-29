@@ -243,8 +243,14 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 					base += blk.n
 					continue
 				}
+				// The schema carries every field, but a column may still not read (an unreadable
+				// cold stream). Answer that block from its records rather than drop them.
 				col, colOK := newNumCol(blk, aggIdx, aggID, bc)
-				if !colOK {
+				if !colOK || !blk.numColsReadable(otherIdxs, bc) {
+					if !c.statsBlockRows(w, s0, cs, base, blk.n, aggLookup, otherPreds, lookups, selfOK, &acc) {
+						releaseWindows(wins)
+						return NumStats{}, false
+					}
 					base += blk.n
 					continue
 				}
@@ -381,6 +387,43 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.
 			}
 		}
 		off += int(total)
+	}
+	return true
+}
+
+// statsBlockRows is the row fallback for one columnar block whose columns will not read: its visible
+// records, read from the arena (see eachBlockRecord). Kept out of the column loop so that loop's
+// code is the same whether or not a block ever falls back.
+func (c *Collection) statsBlockRows(w segWindow, s0 uint64, cs *colSegment, base, n int,
+	aggLookup func(wire.Ad) ([]byte, bool), preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool),
+	selfOK func(float64) bool, acc *statsAccum) bool {
+	return c.eachBlockRecord(w, s0, cs, base, n, func(ad wire.Ad) bool {
+		return statsFromAd(ad, aggLookup, preds, lookups, selfOK, acc)
+	})
+}
+
+// statsFromAd is the row fallback's step for one record: test the predicated attributes and
+// accumulate the aggregated one. ok=false when a value involved is an expression. bruteStatsMulti
+// takes the same step inline; routing it through here measured 3-5% slower on the COLUMN pass of
+// schemaScanStatsMulti, which does not even call it.
+func statsFromAd(ad wire.Ad, aggLookup func(wire.Ad) ([]byte, bool), preds []fieldPred,
+	lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, acc *statsAccum) bool {
+	match, ok := wirePredsMatch(ad, preds, lookups)
+	if !ok {
+		return false
+	}
+	if !match {
+		return true
+	}
+	node, found := aggLookup(ad)
+	if !found {
+		return true
+	}
+	if isExprNode(node) {
+		return false
+	}
+	if nv, isNum := nodeColVal(node); isNum && selfOK(nv.f) {
+		acc.add(nv)
 	}
 	return true
 }
