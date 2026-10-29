@@ -513,15 +513,15 @@ func (c *Collection) schemaScanGroupStats(groupIDs []uint32, aggIDs []uint32, bu
 	gf *groupFilters, bc *blockCache) (*groupAccum, bool) {
 	acc := newGroupAccum(buckets)
 	acc.nFilt = gf.n()
-	lookups := make([]func(wire.Ad) ([]byte, bool), len(preds))
+	lookups := make([]fieldLookup, len(preds))
 	for i, p := range preds {
 		lookups[i] = c.attrLookup(p.fieldID)
 	}
-	groupLookups := make([]func(wire.Ad) ([]byte, bool), len(groupIDs))
+	groupLookups := make([]fieldLookup, len(groupIDs))
 	for i, id := range groupIDs {
 		groupLookups[i] = c.attrLookup(id)
 	}
-	aggLookups := make([]func(wire.Ad) ([]byte, bool), len(aggIDs))
+	aggLookups := make([]fieldLookup, len(aggIDs))
 	for i, id := range aggIDs {
 		aggLookups[i] = c.attrLookup(id)
 	}
@@ -666,9 +666,9 @@ func resolveGroupFields(cs *colSegment, groupIDs []uint32, aggIDs []uint32,
 //
 // It returns false if a matching record's group value is one only evaluation can produce -- the same
 // give-up condition as the column path, for the same reason.
-func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookups []func(wire.Ad) ([]byte, bool),
-	aggLookups []func(wire.Ad) ([]byte, bool), preds []fieldPred,
-	lookups []func(wire.Ad) ([]byte, bool), gf *groupFilters, acc *groupAccum) bool {
+func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookups []fieldLookup,
+	aggLookups []fieldLookup, preds []fieldPred,
+	lookups []fieldLookup, gf *groupFilters, acc *groupAccum) bool {
 	var buf []byte
 	var comps [maxGroupCols]groupComp
 	for off := 0; off < w.used; {
@@ -687,7 +687,7 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookups []func(
 				ad := wire.Ad(ww)
 				match := true
 				for i := range preds {
-					node, found := lookups[i](ad)
+					node, found := lookups[i](w.dict(), ad)
 					if !found {
 						match = false
 						break
@@ -701,7 +701,7 @@ func bruteGroupStats(c *Collection, w segWindow, s0 uint64, groupLookups []func(
 						break
 					}
 				}
-				if match && !addGroupFromAd(ad, groupLookups, aggLookups, acc, &comps, gf) {
+				if match && !addGroupFromAd(w.dict(), ad, groupLookups, aggLookups, acc, &comps, gf) {
 					return false
 				}
 			}

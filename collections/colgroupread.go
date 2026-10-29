@@ -40,6 +40,19 @@ func (cs *colScope) setGroups(seg *colSegment, bi int) {
 	prev := cs.groups
 	cs.groups = nil
 	cs.schemaOnly = seg != nil && seg.schemaOnly
+	// A sidecar block (not schemaOnly) holds every attribute of its records outside the schema in its
+	// cold tail, whose names were interned when the block was built or loaded, so its segment's names
+	// are all known. A columnarized one is decided below.
+	cs.remnants, cs.namesInterned = nil, true
+	if cs.schemaOnly {
+		cs.remnants = seg.remnants
+		// A remnant-name list was interned when the payload loaded. Without one, a segment with a
+		// dictionary still has every record name interned (segIDRemap interns the whole dictionary)
+		// as long as no record carries inline names -- which only a materialized delta does, and an
+		// append-only table has none. Anything else may hold names the table never saw.
+		cs.namesInterned = seg.remnants != nil ||
+			(seg.arena != nil && seg.arena.dict.Load() != nil && cs.c.appendOnly())
+	}
 	if seg == nil || len(seg.groups) == 0 {
 		if len(prev) != 0 {
 			cs.bindG = nil
@@ -158,6 +171,7 @@ func (cs *colScope) groupScope(gi int, gb *colGroupBlock) *colScope {
 	// The group block's cold tail is no more complete than the base block's: in a columnarized
 	// segment a value missing from it may be in the record.
 	sub.schemaOnly = cs.schemaOnly
+	sub.remnants, sub.namesInterned = cs.remnants, cs.namesInterned
 	return sub
 }
 

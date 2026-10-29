@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"sort"
 	"strings"
 
 	"sync/atomic"
@@ -206,6 +207,10 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 			fullByOff[o] = recolFulls[i]
 		}
 	}
+	// Every top-level attribute name the remnants keep, for the payload's remnant-name trailer (see
+	// colRemnantTrailer). Folded to one entry per name, since names compare case-insensitively.
+	remNames := map[string]string{}
+	remNamed := colWriteRemnantList
 	for _, o := range offs {
 		var raw []byte
 		if fromWires {
@@ -235,9 +240,41 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		if !ok {
 			return nil, nil, nil
 		}
+		if remNamed {
+			wire.Ad(body).ForEachRaw(func(id uint32, name string, _ []byte) bool {
+				if name == "" {
+					// An interned record keys the attribute by the segment dictionary's id.
+					var nm []byte
+					if d != nil {
+						nm = d.name(id)
+					}
+					if nm == nil {
+						remNamed = false // cannot name it: write no list rather than an incomplete one
+						return false
+					}
+					name = string(nm)
+				}
+				if f := strings.ToLower(name); remNames[f] == "" {
+					remNames[f] = name
+				}
+				return true
+			})
+		}
 		enc := src.codec.Compress(nil, body)
 		rems = append(rems, remnant{off: o, body: enc})
 		total += recordLen(len(recKey(src.data, o)), len(enc))
+	}
+	if remNamed {
+		names := make([]string, 0, len(remNames))
+		for _, n := range remNames {
+			names = append(names, n)
+		}
+		sort.Strings(names)
+		cs.remnants = &remnantSet{names: names}
+		// Re-marshaled so the size below includes the trailer.
+		if blob = marshalColPayload(cs, func(id uint32) (string, bool) { return c.intern.Name(id) }); blob == nil {
+			return nil, nil, nil
+		}
 	}
 	total += recordLen(0, len(blob)) + recHeaderSize
 	if b := segDictBlob(src); b != nil {
@@ -333,6 +370,11 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	dst.keyIdx.Store(ki)
 	return dst, srcOffs, newOffs
 }
+
+// colWriteRemnantList is a test seam: false writes payloads without the remnant-name trailer, the
+// shape every segment columnarized before it existed has, so a test can build the mixed store an
+// upgraded table holds. Production leaves it true.
+var colWriteRemnantList = true
 
 // reconstructFullRecords rebuilds every live data record of an already-columnarized segment into its
 // FULL wire ad (remnant spliced with the segment's columnar values), in arena order, returning each

@@ -208,12 +208,7 @@ func (c *Collection) numPredOnField(q *vm.Query, s *adSchema) (uint32, func(floa
 func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVal)) bool {
 	// The row fallback reads records straight from the arena, so it must honor the collection's
 	// wire mode: look the field up by inline name on a persistent store, by interned id in memory.
-	lookup := func(a wire.Ad) ([]byte, bool) { return a.Lookup(fieldID) }
-	if c.inline {
-		if name, ok := c.intern.Name(fieldID); ok {
-			lookup = func(a wire.Ad) ([]byte, bool) { return a.LookupByName(name) }
-		}
-	}
+	lookup := c.attrLookup(fieldID)
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		for _, w := range wins {
@@ -283,7 +278,7 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 				// The column would not read (an unreadable cold stream), so scanInt handed over
 				// nothing for this block: read its records from the arena rather than drop them.
 				if err != nil && !c.eachBlockRecord(w, s0, cs, base, blk.n, func(ad wire.Ad) bool {
-					return numValueFromAd(ad, lookup, fn)
+					return numValueFromAd(w.dict(), ad, lookup, fn)
 				}) {
 					releaseWindows(wins)
 					return false
@@ -298,7 +293,7 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 
 // bruteNumValues is the row-scan fallback: walk a window's visible records, read the numeric
 // field from the wire ad, and hand over each value found.
-func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), fn func(colVal)) bool {
+func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup fieldLookup, fn func(colVal)) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -313,7 +308,7 @@ func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) 
 		if !recIsMarker(w.data, o) && w.visible(o, s0) {
 			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
 				buf = ww
-				if !numValueFromAd(wire.Ad(ww), lookup, fn) {
+				if !numValueFromAd(w.dict(), wire.Ad(ww), lookup, fn) {
 					return false
 				}
 			}
@@ -325,8 +320,8 @@ func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) 
 
 // numValueFromAd is the row fallback's step for one record: hand over the field's value when it is a
 // number. ok=false when it is an expression.
-func numValueFromAd(ad wire.Ad, lookup func(wire.Ad) ([]byte, bool), fn func(colVal)) bool {
-	node, ok := lookup(ad)
+func numValueFromAd(d *segDictHandle, ad wire.Ad, lookup fieldLookup, fn func(colVal)) bool {
+	node, ok := lookup(d, ad)
 	if !ok {
 		return true
 	}
