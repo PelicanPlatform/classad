@@ -67,6 +67,31 @@ func (q *Query) And(e ast.Expr) *Query {
 	return compileAt(&ast.BinaryOp{Op: "&&", Left: &ast.ParenExpr{Inner: q.prog.expr}, Right: &ast.ParenExpr{Inner: e}}, q.prog.now)
 }
 
+// Conjuncts returns one query per top-level `&&` conjunct of q (parentheses unwrapped), each
+// compiled as `(conjunct) && true` with q's pinned time. It is nil when q has fewer than two.
+//
+// They exist to REJECT, never to accept. A ClassAd `&&` is TRUE only when both of its operands
+// are logically true -- the boolean true, or a nonzero number -- so q cannot match an ad on which
+// any one conjunct is not. The trailing `&& true` is what makes that test exact: it maps the
+// conjunct through the operator's own truth table, so a conjunct query matches precisely when the
+// conjunct is logically true, and isTrueValue need not reimplement the operator. Evaluating a
+// conjunct on its own gives the value it has inside q, since evaluation has no side effects and
+// the pinned time is shared.
+func (q *Query) Conjuncts() []*Query {
+	if q == nil || q.prog == nil || q.prog.expr == nil {
+		return nil
+	}
+	cs := flattenAnd(q.prog.expr, nil)
+	if len(cs) < 2 {
+		return nil
+	}
+	out := make([]*Query, len(cs))
+	for i, e := range cs {
+		out[i] = compileAt(&ast.BinaryOp{Op: "&&", Left: &ast.ParenExpr{Inner: e}, Right: &ast.BooleanLiteral{Value: true}}, q.prog.now)
+	}
+	return out
+}
+
 // Folded returns the query with its unscoped and MY CurrentTime references folded to the
 // pinned time and its constants folded (classad.FoldConstantsAt), compiled as a query of
 // its own. It is nil when the query does not read CurrentTime that way, or when the fold

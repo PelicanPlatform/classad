@@ -1214,17 +1214,35 @@ For each visible record, a scan uses the cheapest path that is safe (`refVisitor
    The prefilter is a filter on the existing scan, not a second scan. It inherits
    visibility, ordering, limits and every fallback, so its only possible effect is not
    doing work. Being unsure is allowed; being wrong is not.
+
+   A record the columns leave undecided — or any record, when the query reads an attribute
+   outside the schema — is next **matched on its narrowed form**: the record restricted to
+   the attributes the query reads, gathered from the remnant, the slots, the cold tail and
+   the group columns (`projectFromColumns`, the same builder the projection uses), and handed
+   to tiers 2–3 instead of the reassembled record. That is exact only when the narrowed
+   record is *closed* (`adClosed`): every reference reachable from the query's attributes
+   names an attribute it holds, or one the query names and the record therefore lacks too.
+   A stored `eval()`, a sealed value or an unreadable record is not closed, and the record
+   is reassembled. A record decided this way that matches goes on to the projection path
+   like a column-decided one.
+
+   When neither settled the record, the query's top-level `&&` conjuncts that read only
+   base-schema fields may still **reject** it: `A && B` is true only when both operands are
+   logically true, so a conjunct that evaluates from the columns to anything else rules the
+   record out. Each conjunct is compiled as `(conjunct) && true`, which applies the
+   operator's own truth table. Conjuncts never accept.
 2. **Wire-native.** If the query is *native* (no `OpEvalNode`), it evaluates directly
    against the encoded bytes. A pluggable resolver reads scalar-literal attributes
    straight out of the wire (`wire.LiteralValue`), building no ClassAd. If a referenced
    attribute turns out to be a non-literal expression, the resolver signals `fellBack`,
    and the engine drops to the next tier for that ad. For a columnarized record, this and
-   the next tiers run on the reassembled bytes.
+   the next tiers run on the narrowed or the reassembled bytes.
 3. **Partial decode.** Decode only the attributes the query reads — the transitive
    closure of referenced names, including `MY`-scope self-references — and evaluate
    against that. Everything else in the ad stays encoded.
 4. **Full decode.** For queries that read attributes by a runtime-computed name
-   (`eval()`), decode the whole ad.
+   (`eval()`), decode the whole ad — and likewise for an ad whose decoded expressions call
+   `eval()`, since the partial closure cannot see what it reads.
 
 The tiers have different soundness contracts (tenet 3):
 
@@ -1242,6 +1260,9 @@ On selective queries over row-form records the effect is dramatic:
 - Partial decode alone is ~15×, and the hot header adds roughly another 2× on that path.
 
 On columnarized segments, the prefilter took a 2%-selective scan from 35.9 ms to 6.3 ms.
+On an epoch-history archive under an 8-field schema, whose filter reads an attribute the
+schema does not carry, matching on the narrowed record took a 9%-selective projected scan
+from 585 ms to 258 ms.
 
 ### The vectorized executor
 

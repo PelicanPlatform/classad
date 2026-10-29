@@ -1367,6 +1367,14 @@ type scanVisitState struct {
 	projCS      *colScope
 	projScratch projectScratch
 	selfClosed  selfClosedScratch
+	// narrow / narrowFold are the attributes the query (and its CurrentTime-folded form) reads, as a
+	// plan for building a record narrowed to them; nil when the query cannot be matched that way.
+	// matchCS and matchScratch are that build's column scope and buffers, and narrowMiss counts
+	// CONSECUTIVE records it could not use, with the same give-up rule as closureMiss.
+	narrow, narrowFold *projPlan
+	matchCS            *colScope
+	matchScratch       projectScratch
+	narrowMiss         int
 	// closureMiss counts CONSECUTIVE records whose projected ad was not self-contained, so a
 	// scan whose projection names an expression reaching outside itself stops paying for the
 	// attempt. Without it that scan reads the columns, finds the ad unusable and reassembles
@@ -1375,6 +1383,11 @@ type scanVisitState struct {
 	closureMiss int
 	built       bool // prefilters/projection scope built; they depend only on the plan
 }
+
+// narrowMatchOff and conjunctRejectOff turn off the narrowed match and the conjunct rejection, so a
+// benchmark can time the scan with and without them over one store in one process. Test seams:
+// production leaves both false, and nothing may change them while a scan runs.
+var narrowMatchOff, conjunctRejectOff bool
 
 // refVisitor is how a query treats one visible record, whichever walk -- every record, or an
 // index's candidates -- reached it: hide system records, ask the columns before rebuilding the
@@ -1405,6 +1418,17 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 				st.projCS = &colScope{bc: sc.cache, c: c}
 			}
 		}
+		// A record the columns cannot decide can still be matched without rebuilding it: on the
+		// record narrowed to what the query reads. See narrowMatchPlan.
+		if sc := c.schemaScan.Load(); sc != nil && !narrowMatchOff {
+			st.narrow = c.narrowMatchPlan(&qp)
+			if qp.fold != nil {
+				st.narrowFold = c.narrowMatchPlan(qp.fold)
+			}
+			if st.narrow != nil || st.narrowFold != nil {
+				st.matchCS = &colScope{bc: sc.cache, c: c}
+			}
+		}
 	}
 	pre, preFold, projCS := st.pre, st.preFold, st.projCS
 	// A query that reads no attribute has the same answer for every record. Only a TRUE one lets a record
@@ -1417,64 +1441,114 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		}
 		qp.stats.visit()
 		// The CurrentTime-folded form where the window is proven free of CurrentTime (ctproof.go).
-		cur, prefilter, isConst := &qp, pre, constQuery
+		cur, prefilter, isConst, narrow := &qp, pre, constQuery, st.narrow
 		if qp.fold != nil && r.w.ctFree {
-			cur, prefilter, isConst = qp.fold, preFold, constFold
+			cur, prefilter, isConst, narrow = qp.fold, preFold, constFold, st.narrowFold
 		}
 		dict := r.dict
 		cn := r.w.seg.colNative.Load()
-		colDecided := false
-		if prefilter != nil && cn != nil {
-			if k, ok := cn.indexOf(r.off); ok {
-				matches, decided := prefilter.test(cn, k)
-				if decided {
-					qp.stats.columnDecided()
-					if !matches {
-						return true // decided from columns alone: never reassembled
-					}
-					colDecided = true
-				}
+		k, inCols := 0, false
+		if cn != nil {
+			k, inCols = cn.indexOf(r.off)
+			// A delta's row would hold only the attributes one write changed; the whole record is a
+			// merge of its chain, which only the full read performs. None should be here (sealing
+			// collapses every live chain), and if one is, nothing is decided from its row.
+			if inCols && c.deltaRead && recIsDelta(r.w.data, r.off) {
+				inCols = false
 			}
+		}
+		colDecided, matched := false, false
+		// The integrity gate wireAt applies before reassembling (checksum, damage, segment
+		// dictionary), for the paths below that read the record's own bytes without reassembling
+		// it. Asked at most once per record: gated records that it ran, refused its answer.
+		gated, refused := false, error(nil)
+		if prefilter != nil && prefilter.m != nil && inCols {
+			matches, decided := prefilter.test(cn, k)
+			if decided {
+				qp.stats.columnDecided()
+				if !matches {
+					return true // decided from columns alone: never reassembled
+				}
+				colDecided = true
+			}
+		}
+		// Match on the record narrowed to what the query reads, when the columns could not decide:
+		// the record's columns, cold tail and remnant hold every attribute it has, so the few the
+		// query names can be gathered without rebuilding the rest. Exact only when the narrowed
+		// record is closed under the query's references (adClosed), and only for a record the
+		// integrity gate admits: one it refuses falls through to the full read, which refuses and
+		// counts it as it always has.
+		if !colDecided && !isConst && narrow != nil && inCols && st.narrowMiss < closureMissGiveUp {
+			gated, refused = true, c.recordRefused(r.w.seg, r.w.data, r.off)
+		}
+		if gated && refused == nil {
+			out, ok := c.projectFromColumns(cn, r, k, narrow, st.matchCS, &st.matchScratch)
+			if ok && c.adClosed(out, narrow, cn.dict, &st.selfClosed) {
+				st.narrowMiss = 0
+				qp.stats.columnDecided()
+				qp.stats.narrowMatched()
+				if qp.ws != nil {
+					qp.ws.dict = dict
+				}
+				if !matchWire(out, *cur) {
+					return true // matched on the narrowed record: never reassembled
+				}
+				colDecided, matched = true, true
+			} else {
+				st.narrowMiss++
+			}
+		}
+		// The query's conjuncts that read only schema fields, to reject what the narrowed match did
+		// not decide. Asked after it rather than before: the narrowed match evaluates the whole query
+		// for little more than these conjuncts cost, so asking them first only pays twice for the
+		// records they pass. Where it did not run -- a query it cannot serve, a record it could not
+		// use -- a rejection here still saves the reassembly.
+		if !colDecided && prefilter != nil && prefilter.m == nil && inCols && prefilter.rejects(cn, k) {
+			qp.stats.columnDecided()
+			qp.stats.conjunctRejected()
+			return true
 		}
 		// Project straight from the columns when nothing still needs the whole ad: either the query
 		// reads no attribute (so it is constant and the ad cannot change its answer) or the match was
-		// just decided FROM the columns. Anything less certain reassembles, because a narrowed ad
-		// cannot be handed to the matcher -- its seed set is not closed.
-		if projCS != nil && cn != nil && (isConst || colDecided) && st.closureMiss < closureMissGiveUp {
-			if k, ok := cn.indexOf(r.off); ok {
-				// The record is about to be SERVED, and partly from its own bytes (the remnant and
-				// header), so it takes the same integrity gate wireAt applies before reassembling:
-				// a record whose checksum fails, or whose segment dictionary is unusable, is skipped
-				// and counted exactly as the reassembling path skips and counts it. Without this the
-				// projection served rows the plain scan refuses.
-				//
-				// A record the columns REJECT above needs no gate: it is skipped whichever path
-				// runs, and the plain scan does not read its bytes either.
-				if err := c.recordRefused(r.w.seg, r.w.data, r.off); err != nil {
-					noteReadSkip(err)
-					return true
+		// just decided without it -- from the columns, or on the narrowed record. Anything less
+		// certain reassembles.
+		if projCS != nil && inCols && (isConst || colDecided) && st.closureMiss < closureMissGiveUp {
+			// The record is about to be SERVED, and partly from its own bytes (the remnant and
+			// header), so it takes the same integrity gate wireAt applies before reassembling:
+			// a record whose checksum fails, or whose segment dictionary is unusable, is skipped
+			// and counted exactly as the reassembling path skips and counts it. Without this the
+			// projection served rows the plain scan refuses. A record the narrowed match decided
+			// has already passed it, and is not checked twice.
+			//
+			// A record the columns REJECT above needs no gate: it is skipped whichever path
+			// runs, and the plain scan does not read its bytes either.
+			if !gated {
+				refused = c.recordRefused(r.w.seg, r.w.data, r.off)
+			}
+			if refused != nil {
+				noteReadSkip(refused)
+				return true
+			}
+			// A plan whose consumer evaluates takes the fast path only for records whose
+			// projected ad is closed; the rest fall through and reassemble. See adClosed for
+			// why that is the real condition rather than "has a plan".
+			out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &st.projScratch)
+			if ok && qp.proj.closure && !c.adClosed(out, qp.proj, cn.dict, &st.selfClosed) {
+				ok = false
+				st.closureMiss++
+				qp.stats.closureReassembled()
+			}
+			if ok {
+				st.closureMiss = 0
+				qp.stats.matched() // projected straight from columns; no reassembly
+				if qp.ws != nil {
+					qp.ws.dict = dict
 				}
-				// A plan whose consumer evaluates takes the fast path only for records whose
-				// projected ad is self-contained; the rest fall through and reassemble. See
-				// adSelfClosed for why that is the real condition rather than "has a plan".
-				out, ok := c.projectFromColumns(cn, r, k, qp.proj, projCS, &st.projScratch)
-				if ok && qp.proj.closure && !adSelfClosed(out, &st.selfClosed) {
-					ok = false
-					st.closureMiss++
-					qp.stats.closureReassembled()
+				if !emit(out, dict) {
+					cont = false
+					return false
 				}
-				if ok {
-					st.closureMiss = 0
-					qp.stats.matched() // projected straight from columns; no reassembly
-					if qp.ws != nil {
-						qp.ws.dict = dict
-					}
-					if !emit(out, dict) {
-						cont = false
-						return false
-					}
-					return true
-				}
+				return true
 			}
 		}
 		// The record's FULL ad, which in a columnarized segment means its own bytes spliced with
@@ -1493,7 +1567,7 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		if qp.ws != nil {
 			qp.ws.dict = dict
 		}
-		if cur.q != nil && !matchWire(w, *cur) {
+		if cur.q != nil && !matched && !matchWire(w, *cur) {
 			return true
 		}
 		qp.stats.matched()
@@ -1504,6 +1578,21 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		return true
 	}
 	return visit, func() bool { return !cont }
+}
+
+// narrowMatchPlan is the plan for matching qp's query on a record narrowed to the attributes it reads
+// (its read plan's seeds), or nil when the query cannot be matched that way.
+//
+// The query must read a statically known set (no eval() in the query itself), and some attribute at
+// all -- a constant query needs no record. A record narrowed to that set evaluates the query exactly
+// as the whole record does when adClosed holds for it, which the scan checks per record: matchWire
+// reads each seed, and resolves an expression-valued one by decoding the seeds and what they refer to,
+// transitively -- all of it in the narrowed record or absent from both.
+func (c *Collection) narrowMatchPlan(qp *queryPlan) *projPlan {
+	if qp.q == nil || !qp.plan.PartialSafe || len(qp.plan.Seeds) == 0 {
+		return nil
+	}
+	return c.newProjPlan(qp.plan.Seeds)
 }
 
 // mergeParent flattens into child every (non-private) attribute of parent that
@@ -1650,13 +1739,19 @@ func matchWire(w []byte, qp queryPlan) bool {
 		// A queried attribute was a non-literal expression; fall back.
 	}
 	if qp.plan.PartialSafe {
-		child := partialDecodeWire(qp.ws.ctx, qp.ws.dict, w, qp.plan.Seeds)
-		if qp.ws.parent != nil {
+		child, complete := partialDecodeWire(qp.ws.ctx, qp.ws.dict, w, qp.plan.Seeds)
+		if complete && qp.ws.parent != nil {
 			// The child inherits any seed it lacks from the parent, so decode the
 			// same seeds from the parent and chain.
-			child.SetParent(partialDecodeWire(qp.ws.ctx, qp.ws.parentDict, []byte(qp.ws.parent), qp.plan.Seeds))
+			var parent *classad.ClassAd
+			parent, complete = partialDecodeWire(qp.ws.ctx, qp.ws.parentDict, []byte(qp.ws.parent), qp.plan.Seeds)
+			child.SetParent(parent)
 		}
-		return qp.m.Matches(child)
+		if complete {
+			return qp.m.Matches(child)
+		}
+		// A stored expression calls eval(): what it reads is known only when it runs, so the
+		// partial ad may lack it. Decode the whole ad instead.
 	}
 	a, err := decodeWireDictCtx(qp.ws.ctx, qp.ws.dict, w)
 	if err != nil {
@@ -1676,7 +1771,12 @@ func matchWire(w []byte, qp queryPlan) bool {
 // bytes without materializing its other (potentially many) attributes. An
 // attribute the ad lacks is simply omitted, so a reference to it evaluates to
 // undefined — exactly as it would against a full decode.
-func partialDecodeWire(ctx wireCtx, dict *segDictHandle, w []byte, seeds []string) *classad.ClassAd {
+//
+// complete is false when a decoded attribute's expression calls eval(), whose
+// argument names an attribute only when it runs: the static references cannot
+// say what it reads, so the partial ad may lack it and is not a stand-in for the
+// whole one.
+func partialDecodeWire(ctx wireCtx, dict *segDictHandle, w []byte, seeds []string) (ad *classad.ClassAd, complete bool) {
 	a := wire.Ad(w)
 	out := classad.New()
 	done := make(map[string]bool, len(seeds))
@@ -1698,9 +1798,13 @@ func partialDecodeWire(ctx wireCtx, dict *segDictHandle, w []byte, seeds []strin
 			continue
 		}
 		out.Insert(name, expr)
-		work = append(work, vm.SelfRefs(expr)...) // expand transitive references
+		refs, safe := vm.SelfRefsSafe(expr)
+		if !safe {
+			return out, false
+		}
+		work = append(work, refs...) // expand transitive references
 	}
-	return out
+	return out, true
 }
 
 func (c *Collection) decodeAd(stored []byte, codec Codec) (*classad.ClassAd, error) {

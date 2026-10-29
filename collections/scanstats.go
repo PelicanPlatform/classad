@@ -61,8 +61,15 @@ type ScanStats struct {
 	SegmentsScanned int // segments actually walked
 
 	RecordsVisited       int // records the scan iterated
-	RecordsColumnDecided int // WHERE answered from the columnar prefilter (no reassembly to test it)
-	RecordsReassembled   int // record rebuilt from the arena (the ~O(ad width) path)
+	RecordsColumnDecided int // WHERE answered without reassembling the record to test it
+	// The two ways a record counted in RecordsColumnDecided was decided other than by evaluating the
+	// whole query from its columns. RecordsConjunctRejected: one of the query's top-level conjuncts
+	// was answered from the columns and was not true, so the record cannot match. RecordsNarrowMatched:
+	// the query was evaluated on the record narrowed to the attributes it reads, gathered from the
+	// columns, the cold tail and the remnant without rebuilding the rest.
+	RecordsConjunctRejected int
+	RecordsNarrowMatched    int
+	RecordsReassembled      int // record rebuilt from the arena (the ~O(ad width) path)
 	// RecordsClosureReassembled counts records that COULD have been projected straight from
 	// their columns but were reassembled anyway, because the projected ad referred to an
 	// attribute the projection left out and the consumer evaluates what it receives. A large
@@ -103,6 +110,16 @@ func (s *ScanStats) visit() {
 func (s *ScanStats) columnDecided() {
 	if s != nil {
 		s.RecordsColumnDecided++
+	}
+}
+func (s *ScanStats) conjunctRejected() {
+	if s != nil {
+		s.RecordsConjunctRejected++
+	}
+}
+func (s *ScanStats) narrowMatched() {
+	if s != nil {
+		s.RecordsNarrowMatched++
 	}
 }
 func (s *ScanStats) reassembled() {
@@ -157,6 +174,8 @@ func (s *ScanStats) mergeWorker(w *ScanStats) {
 	}
 	s.RecordsVisited += w.RecordsVisited
 	s.RecordsColumnDecided += w.RecordsColumnDecided
+	s.RecordsConjunctRejected += w.RecordsConjunctRejected
+	s.RecordsNarrowMatched += w.RecordsNarrowMatched
 	s.RecordsReassembled += w.RecordsReassembled
 	s.RecordsClosureReassembled += w.RecordsClosureReassembled
 	s.RowsMatched += w.RowsMatched

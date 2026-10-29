@@ -72,10 +72,10 @@ func (c *Collection) QueryRawProjectedStats(q *vm.Query, projection []string, ch
 // every projected attribute the record has, so the narrowing cannot change a row. Under
 // chaseRefs it resolves each emitted expression's references AGAINST THE AD IT IS GIVEN, and a
 // narrowed ad lacks exactly the attributes the projection did not name. So the plan is marked
-// as a closure plan: the scan keeps the columnar ad only when its expressions refer to nothing
-// outside it (adSelfClosed), and reassembles the rest. When the narrowed ad is self-contained,
-// the closure over it is the closure over the whole record -- every attribute the walk can
-// reach is in it, with the same bytes.
+// as a closure plan: the scan keeps the columnar ad only when every reference its projected
+// expressions reach is in it or is a projected attribute the record lacks (adClosed), and
+// reassembles the rest. When the narrowed ad is closed, the closure over it is the closure over
+// the whole record -- every attribute the walk can reach is in it, with the same bytes.
 func (c *Collection) rawProjPlan(projection []string, chaseRefs bool) *projPlan {
 	if len(projection) == 0 {
 		return nil
@@ -83,6 +83,9 @@ func (c *Collection) rawProjPlan(projection []string, chaseRefs bool) *projPlan 
 	proj := c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
 	if proj != nil {
 		proj.closure = chaseRefs
+		// The projector follows references in the stored nodes only (wire.AppendNodeRefNames and
+		// AppendNodeRefIDs see nothing inside a sealed value), so a sealed attribute ends a closure.
+		proj.sealedOpaque = true
 	}
 	return proj
 }

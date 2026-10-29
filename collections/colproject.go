@@ -1,7 +1,9 @@
 package collections
 
 import (
+	"encoding/binary"
 	"math"
+	"slices"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -21,13 +23,14 @@ import (
 // The header comes from the record too, because it holds MyType/TargetType, which a projection keeps.
 //
 // WHEN THIS IS ALLOWED TO RUN is the subtle part, and it is not "whenever there is a projection". The
-// match still has to see whatever it reads, and a narrowed ad cannot be handed to it -- vm.ReadPlan's
-// seed set is not closed, since an attribute's value may be an expression whose own references are
-// expanded transitively while decoding, so an ad narrowed to the projection can be missing something
-// the query needed. Two cases are safe, and the scan checks for exactly those:
+// match still has to see whatever it reads, and an ad narrowed to the PROJECTION cannot be handed to
+// it -- an attribute's value may be an expression whose own references are expanded transitively while
+// decoding, so the projection can be missing something the query needed. Two cases are safe, and the
+// scan checks for exactly those:
 //
 //   - the query reads no attribute at all, so it is constant and cannot care what the ad contains, and
-//   - the match was already decided FROM the columns, so no ad was needed to decide it.
+//   - the match was already decided without the whole ad: from the columns, or on the record narrowed
+//     to what the QUERY reads, built here too and checked closed under its references (adClosed).
 //
 // Everything else reassembles as before.
 //
@@ -57,8 +60,13 @@ type projPlan struct {
 	local     map[uint32]struct{}
 	// closure marks a plan whose consumer will EVALUATE the projected ad rather than just
 	// relay it. Such a plan is still used, but each projected record is checked for being
-	// self-contained (adSelfClosed) and reassembled when it is not.
+	// closed (adClosed) and reassembled when it is not.
 	closure bool
+	// sealedOpaque marks a plan whose consumer never looks inside a sealed value for references:
+	// the text projection renders a sealed value but follows only references it can see in the
+	// stored node, so a sealed node leads its closure nowhere. Every other reader -- the matcher,
+	// the wire-row assembler -- opens it first, and a sealed node makes the record not closed.
+	sealedOpaque bool
 }
 
 // newProjPlan resolves a projection for the scan, or returns nil when there is nothing to project.
@@ -82,6 +90,17 @@ func (p *projPlan) wantsName(name string) bool {
 	h := wire.NameHash32(name)
 	for i, ph := range p.nameHashes {
 		if ph == h && foldEqualStrings(name, p.names[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// wantsNameBytes is wantsName for a name held as bytes (a reference read out of a node).
+func (p *projPlan) wantsNameBytes(name []byte) bool {
+	h := wire.NameHash32Bytes(name)
+	for i, ph := range p.nameHashes {
+		if ph == h && wire.FoldEqualBytes(name, p.names[i]) {
 			return true
 		}
 	}
@@ -130,10 +149,48 @@ type projectScratch struct {
 	narrow  narrowScratch
 	entries []byte
 	out     []byte
+	// coldBlk/coldPlan key coldWant: the plan's attributes as the ids the block's cold tail stores
+	// them under (one translation per block, not per record), and how many of them are not schema
+	// fields -- the ones the tail is the only home of.
+	coldBlk       *columnarBlock
+	coldPlan      *projPlan
+	coldWant      []uint32
+	coldNonSchema int
 }
 
-// projectFromColumns builds record k's ad restricted to the projection, reading the named columns
+// coldWanted returns p's attributes in blk's cold-tail id space, and how many are not schema fields.
+func (sc *projectScratch) coldWanted(blk *columnarBlock, p *projPlan) ([]uint32, int) {
+	if sc.coldBlk == blk && sc.coldPlan == p {
+		return sc.coldWant, sc.coldNonSchema
+	}
+	sc.coldWant, sc.coldNonSchema = sc.coldWant[:0], 0
+	for id := range p.ids {
+		sid, ok := blk.remap.storedID(id)
+		if !ok {
+			continue // no record of this payload has it in its tail
+		}
+		sc.coldWant = append(sc.coldWant, sid)
+		if _, isField := blk.schema.byID[id]; !isField {
+			sc.coldNonSchema++
+		}
+	}
+	sc.coldBlk, sc.coldPlan = blk, p
+	return sc.coldWant, sc.coldNonSchema
+}
+
+// projectFromColumns builds record k's ad restricted to p's attributes, reading the named columns
 // directly and never reassembling the record.
+//
+// The result is the reassembled record (spliceInto) with every other attribute removed, in the same
+// order: the remnant's entries p names, then p's schema fields held in their slots in schema order,
+// then p's attributes in the block's cold tail in the order the tail stores them (escaped schema
+// fields and non-schema attributes alike), then p's group-column values. Keeping the order is what
+// lets a consumer that walks the ad -- a text projection renders in ad order -- produce the same
+// bytes from either.
+//
+// Two callers. The projection fast path builds the projected ad it will emit. The narrowed match
+// builds the record restricted to what the query reads, to evaluate the query on it (see adClosed
+// for when that is exact).
 //
 // Reports false when it cannot be sure of the result -- a value it cannot read from its column, an
 // attribute whose translation into the record's id space is missing, a malformed remnant. The caller
@@ -154,6 +211,9 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 		return nil, false
 	}
 	sc.remnant = raw
+	if c.deltaRead && isDeltaRecord(raw) {
+		return nil, false // a delta's bytes are one write's changes, not the record: only the full read merges them
+	}
 	var want map[uint32]struct{}
 	if sd != nil {
 		want = p.localWanted(sd)
@@ -161,10 +221,11 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 	narrowed, ok := narrowAd(&sc.narrow, raw, func(id uint32, name string) bool {
 		if name != "" {
 			// An inline entry (an inline-keyed segment's remnant holds nothing else): keep it only if
-			// it is projected. Every consumer's own keep test admits a subset of the plan's names, so
-			// nothing it wants is dropped. Keeping the rest instead would hand a closure plan's check
-			// (adSelfClosed) every expression in the remnant, and one of them reaching outside the
-			// projection sends a record that never asked for it back to reassembly.
+			// it is one of p's names. Every consumer's own keep test admits a subset of them, so
+			// nothing it wants is dropped, and a narrowed match needs nothing else. Keeping the rest
+			// instead would hand the closure check (adClosed) every expression in the remnant, and
+			// one of them reaching outside the plan sends a record that never asked for it back to
+			// reassembly.
 			return p.wantsName(name)
 		}
 		if want == nil {
@@ -181,17 +242,30 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 	if !ok {
 		return nil, false
 	}
+	if inline && sd != nil {
+		// An inline-keyed record in an interned segment: its cold-tail entries are keyed by the
+		// segment dictionary, and an inline key needs a name the reassembly would look up in a table
+		// those ids do not belong to. There is no faithful narrowed form of that; reassemble.
+		return nil, false
+	}
 
-	// The column half: only the projected attributes, read from their own columns.
-	cs.setBlock(blk)
-	cs.setGroups(cn.seg, cn.blockIndexOf(blk))
+	// The column half: only p's schema fields held in their slots. An escaped field is in the cold
+	// tail if anywhere, and is taken from there below, in the tail's order.
+	if cs.blk != blk {
+		cs.setBlock(blk)
+		cs.setGroups(cn.seg, cn.blockIndexOf(blk))
+	}
 	cs.k, cs.fellBack = local, false
 	sc.entries = append(sc.entries[:0], entries...)
-	added := 0
+	added, escWanted := 0, 0
 	esc := blk.escapeAt(local)
 	for idx := range blk.schema.fields {
 		f := &blk.schema.fields[idx]
 		if _, in := p.ids[f.id]; !in {
+			continue
+		}
+		if testBit(esc, idx) {
+			escWanted++
 			continue
 		}
 		outID := f.id
@@ -210,22 +284,6 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 			}
 			name = nm
 		}
-		if testBit(esc, idx) {
-			// Escaped: absent from this record, or present but too wide for its slot. Both live in
-			// the cold tail, and both are LITERALS -- an expression is never moved into a column (see
-			// storableInColumn) -- so a found node is appended exactly as stored.
-			node, found, err := blk.escapedNode(local, f.id, cs.bc)
-			if err != nil {
-				return nil, false
-			}
-			if !found {
-				continue // genuinely absent from this record: the projection simply omits it
-			}
-			sc.entries = wire.AppendKey(sc.entries, inline, outID, name)
-			sc.entries = append(sc.entries, node...)
-			added++
-			continue
-		}
 		sc.entries = wire.AppendKey(sc.entries, inline, outID, name)
 		sc.entries, ok = cs.appendSlotNode(sc.entries, idx, f)
 		if !ok {
@@ -236,36 +294,49 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 		}
 		added++
 	}
-	// Attributes the base schema does not carry. They used to be in the record; on an interned
-	// segment the rewrite moves them into the block's COLD TAIL, so a projection naming one has to
-	// look there or it comes back empty for every record that has it.
-	for id := range p.ids {
-		if _, isField := blk.schema.byID[id]; isField {
-			continue // already emitted from its column above
-		}
-		node, found, err := blk.escapedNode(local, id, cs.bc)
+
+	// The cold tail: escaped schema fields (absent, or present but too wide for the slot) and the
+	// attributes the base schema does not carry, which the rewrite moves here. Both are LITERALS --
+	// an expression is never moved out of the record (see storableInColumn) -- so a found node is
+	// appended exactly as stored. One walk, in stored order, stopping once every attribute that can
+	// be here has been found.
+	cw, nonSchema := sc.coldWanted(blk, p)
+	if need := nonSchema + escWanted; need > 0 {
+		tail, err := cs.bc.stream(blk, kindCold)
 		if err != nil {
 			return nil, false
 		}
-		if !found {
-			continue // not in the tail either: genuinely absent, or still in the record
-		}
-		outID := id
-		name := ""
-		if sd != nil {
-			// A cold-tail entry is already keyed by the segment dictionary, which is the record's own
-			// key space -- so it is emitted as it was stored, with no translation.
-			outID = blk.remap.stored(id)
-		} else if inline {
-			nm, ok := c.intern.Name(id)
-			if !ok {
+		cold := tail[blk.coldOffAt(local):blk.coldOffAt(local+1)]
+		for found := 0; len(cold) > 0 && found < need; {
+			sid, m := binary.Uvarint(cold)
+			if m <= 0 {
 				return nil, false
 			}
-			name = nm
+			cold = cold[m:]
+			nl, ok := wire.NodeLen(cold)
+			if !ok || nl > len(cold) {
+				return nil, false
+			}
+			node := cold[:nl]
+			cold = cold[nl:]
+			if !slices.Contains(cw, uint32(sid)) {
+				continue
+			}
+			found++
+			// Keyed as the reassembly keys a cold-tail entry: an interned segment's tail is already in
+			// the record's own key space, and an inline record names it through this process's ids.
+			name := ""
+			if inline {
+				nm, ok := c.intern.Name(blk.remap.current(uint32(sid)))
+				if !ok {
+					return nil, false
+				}
+				name = nm
+			}
+			sc.entries = wire.AppendKey(sc.entries, inline, uint32(sid), name)
+			sc.entries = append(sc.entries, node...)
+			added++
 		}
-		sc.entries = wire.AppendKey(sc.entries, inline, outID, name)
-		sc.entries = append(sc.entries, node...)
-		added++
 	}
 
 	// The GROUP columns, restricted to the projection. A group attribute is not a base schema field,
@@ -314,101 +385,155 @@ func (cs *colScope) appendSlotNode(dst []byte, idx int, f *adField) ([]byte, boo
 	return dst, false
 }
 
-// selfClosedScratch is adSelfClosed's reusable working set, held by the scan so the check
+// selfClosedScratch is adClosed's reusable working set, held by the scan so the check
 // allocates nothing per record.
 type selfClosedScratch struct {
 	ids   []uint32
-	refs  []uint32
 	names [][]byte
-	nrefs [][]byte
+	nodes [][]byte
+	reach []bool
+	done  []bool
+	refs  wire.NodeRefs
 }
 
-// adSelfClosed reports whether every attribute reference the ad's own nodes make resolves to
-// an attribute the ad itself carries.
+// adClosed reports whether w, a record narrowed to p's attributes, reads exactly as the whole record
+// would wherever p's attributes lead: every reference reachable from them names an attribute w
+// carries, or one p names.
 //
-// This is the question the blanket "evaluating consumers get no plan" rule was standing in
-// for, and it is a weaker one. A projected ad is unsafe to evaluate only when it kept an
-// EXPRESSION whose references were narrowed away; an ad of literals refers to nothing and is
-// perfectly self-contained however hard it was narrowed. Asking per record lets the common
-// projection -- all literals -- keep the columnar fast path, and makes only the records that
-// really need the rest of the ad pay for it.
+// That is the condition under which a narrowed ad can stand in for the whole one, and it is the same
+// question for both uses. A consumer that chases the references of the attributes it emits -- the
+// wire-row and text projections under chaseRefs -- reaches only what the walk here reaches. And a
+// query evaluated on the narrowed record reads its seeds and whatever their expressions refer to,
+// transitively, which is again the walk from p (the plan built from the seeds).
 //
-// The walk is in whichever key space the record is in, for the reason narrowAdRefs gives:
-// an interned record's references are its segment's own dictionary ids, and an inline one's
-// are names. A record it cannot read is reported NOT closed, so the caller reassembles --
-// the safe direction, since a wrongly-kept fast path ships a row that evaluates to undefined.
-func adSelfClosed(w []byte, sc *selfClosedScratch) bool {
+// Both halves of the condition are exact. An attribute w carries is a copy of the record's entry. An
+// attribute p names but w lacks is one the record lacks too, because the narrowing kept every one of
+// p's attributes the record has -- so it is undefined either way. Anything else might be in the record
+// and not in w, and w is then not a stand-in.
+//
+// The reference walk must be COMPLETE, so it is wire.AppendNodeRefsExact: a node calling eval(), whose
+// argument names an attribute only at run time, makes w not closed, and so does one holding a sealed
+// value, whose plaintext may refer to anything -- unless p's consumer never opens it (sealedOpaque). So does a reference in the other key encoding than the record's, or an
+// entry keyed that way, which the walk cannot match against the record's keys. Each of those is the
+// safe answer: the caller reassembles.
+//
+// p nil makes every entry a root and accepts no absent reference: whether the ad refers to nothing
+// outside itself at all.
+func (c *Collection) adClosed(w []byte, p *projPlan, sd *segDictHandle, sc *selfClosedScratch) bool {
 	_, _, _, inline, ok := wire.Ad(w).SplitBody()
 	if !ok {
 		return false
 	}
+	sc.ids, sc.names, sc.nodes = sc.ids[:0], sc.names[:0], sc.nodes[:0]
 	if inline {
-		sc.names = sc.names[:0]
-		if !wire.Ad(w).ForEachNameNode(func(name, _ []byte) bool {
+		if !wire.Ad(w).ForEachNameNode(func(name, node []byte) bool {
 			sc.names = append(sc.names, name)
+			sc.nodes = append(sc.nodes, node)
 			return true
 		}) {
 			return false
 		}
-		closed := true
-		if !wire.Ad(w).ForEachNameNode(func(_, node []byte) bool {
-			sc.nrefs = wire.AppendNodeRefNames(node, sc.nrefs[:0])
-			for _, r := range sc.nrefs {
-				if len(r) == 0 {
-					continue
-				}
-				found := false
-				for _, have := range sc.names {
-					if wire.FoldEqualNames(r, have) {
-						found = true
-						break
-					}
-				}
-				if !found {
-					closed = false
-					return false
-				}
-			}
-			return true
-		}) {
-			return false
-		}
-		return closed
-	}
-	sc.ids = sc.ids[:0]
-	if !wire.Ad(w).ForEachRaw(func(id uint32, name string, _ []byte) bool {
-		if name != "" {
-			// An inline entry inside an interned record: it has no id to match a reference
-			// against, so treat the record as unreadable for this purpose rather than
-			// guessing. Rare, and the cost of being wrong is a row that cannot evaluate.
-			id = 0
-		}
-		sc.ids = append(sc.ids, id)
-		return true
-	}) {
-		return false
-	}
-	closed := true
-	if !wire.Ad(w).ForEachRaw(func(_ uint32, _ string, node []byte) bool {
-		sc.refs = wire.AppendNodeRefIDs(node, sc.refs[:0])
-		for _, r := range sc.refs {
-			found := false
-			for _, have := range sc.ids {
-				if have == r {
-					found = true
-					break
-				}
-			}
-			if !found {
-				closed = false
+	} else {
+		mixed := false
+		if !wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
+			if name != "" {
+				mixed = true
 				return false
 			}
+			sc.ids = append(sc.ids, id)
+			sc.nodes = append(sc.nodes, node)
+			return true
+		}) || mixed {
+			return false
 		}
-		return true
-	}) {
-		return false
 	}
-	return closed
+	var want map[uint32]struct{} // p's attributes in the record's id space (interned records)
+	if p != nil && !inline {
+		want = p.ids
+		if sd != nil {
+			want = p.localWanted(sd)
+		}
+	}
+	n := len(sc.nodes)
+	sc.reach = slices.Grow(sc.reach[:0], n)[:n]
+	sc.done = slices.Grow(sc.done[:0], n)[:n]
+	clear(sc.done)
+	for i := 0; i < n; i++ {
+		switch {
+		case p == nil:
+			sc.reach[i] = true
+		case inline:
+			sc.reach[i] = p.wantsNameBytes(sc.names[i])
+		default:
+			_, sc.reach[i] = want[sc.ids[i]]
+		}
+	}
+	var isEval func(uint32) bool
+	if !inline {
+		isEval = func(id uint32) bool {
+			var nm []byte
+			if sd != nil {
+				nm = sd.name(id)
+			} else if s, ok := c.intern.Name(id); ok {
+				nm = []byte(s)
+			} else {
+				return true // an id this process cannot name: assume the worst
+			}
+			return wire.FoldEqualBytes(nm, "eval")
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for i := 0; i < n; i++ {
+			if !sc.reach[i] || sc.done[i] {
+				continue
+			}
+			sc.done[i] = true
+			sc.refs.IDs, sc.refs.Names, sc.refs.Sealed = sc.refs.IDs[:0], sc.refs.Names[:0], false
+			if !wire.AppendNodeRefsExact(sc.nodes[i], inline, &sc.refs, isEval) {
+				return false
+			}
+			if sc.refs.Sealed && (p == nil || !p.sealedOpaque) {
+				return false
+			}
+			if inline {
+				if len(sc.refs.IDs) > 0 {
+					return false
+				}
+				for _, r := range sc.refs.Names {
+					j := slices.IndexFunc(sc.names, func(have []byte) bool { return wire.FoldEqualNames(r, have) })
+					switch {
+					case j >= 0:
+						if !sc.reach[j] {
+							sc.reach[j], changed = true, true
+						}
+					case p == nil || !p.wantsNameBytes(r):
+						return false
+					}
+				}
+				continue
+			}
+			if len(sc.refs.Names) > 0 {
+				return false
+			}
+			for _, r := range sc.refs.IDs {
+				j := slices.Index(sc.ids, r)
+				switch {
+				case j >= 0:
+					if !sc.reach[j] {
+						sc.reach[j], changed = true, true
+					}
+				case p == nil:
+					return false
+				default:
+					if _, in := want[r]; !in {
+						return false
+					}
+				}
+			}
+		}
+	}
+	return true
 }
 
 // closureMissGiveUp is how many CONSECUTIVE records may fail the self-contained check before

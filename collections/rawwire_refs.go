@@ -59,7 +59,7 @@ func (c *Collection) QueryRawWireRefsStats(q *vm.Query, projection []string, red
 		// 17ms.
 		//
 		// The plan is safe here because the scan checks each projected record for being
-		// self-contained and reassembles the ones that are not (see adSelfClosed). A
+		// closed under its references and reassembles the ones that are not (see adClosed). A
 		// projection of literals refers to nothing and never triggers that; a projection
 		// naming an expression that reaches outside itself falls back per record, which is
 		// exactly the behaviour passing no plan gave unconditionally.
