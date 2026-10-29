@@ -216,9 +216,8 @@ func (db *DB) loadIndexConfig() {
 	if len(cfg.AutoHot) > 0 {
 		db.c.AddHotAttrs(cfg.AutoHot...)
 	}
-	// Restore the runtime-required schema attributes on top of the configured tier. Changing the
-	// set does not re-derive the schema (that is ReschemaScan's job and costs the whole table),
-	// so this only ensures the next derivation sees what the operator asked for.
+	// Restore the runtime-required schema attributes on top of the configured tier. Nothing is
+	// re-derived here; the next maintenance pass adopts what the set produces.
 	if len(cfg.SchemaRequire) > 0 {
 		db.c.AddSchemaRequireAttrs(cfg.SchemaRequire...)
 	}

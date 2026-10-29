@@ -72,10 +72,11 @@ func (c *Collection) SchemaRequireRuntimeAttrs() []string {
 // SetSchemaRequireAttrs replaces the CONFIGURED tier, leaving anything added at runtime in place.
 // It reports whether the effective set changed.
 //
-// A true return means every sealed segment's columnar block was built against a schema this set
-// would no longer produce. Nothing here acts on that: adopting a new schema means re-deriving it
-// and rebuilding every block (ReschemaScan), which costs the whole table and is not something a
-// configuration reload should start on its own. The caller decides when to pay it.
+// A true return means the committed schema may no longer be the one this set produces. Nothing here
+// acts on it -- a configuration reload must not start a rewrite of the table by itself. The next
+// routine maintenance review (BuildAndEnableSchemaScan) re-derives the schema, adopts it when a
+// required attribute the derivation admits is not yet a field, and converges the sealed segments
+// onto it a budget's worth per pass. ReschemaScan adopts immediately.
 func (c *Collection) SetSchemaRequireAttrs(names []string) bool {
 	c.requireMu.Lock()
 	defer c.requireMu.Unlock()

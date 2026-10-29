@@ -202,7 +202,7 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		a.AddHotAttrs(cfg.AutoHotAttrs...)
 	}
 	// The configured tier went in through the options above; restore the runtime tier on top of
-	// it. Nothing is re-derived: a required-set change takes effect at the next ReschemaScan.
+	// it. Nothing is re-derived here: the next maintenance pass adopts what the set produces.
 	if len(cfg.SchemaRequireRuntime) > 0 {
 		a.AddSchemaRequireAttrs(cfg.SchemaRequireRuntime...)
 	}
@@ -743,8 +743,7 @@ func (t *ArchiveTable) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) {
 	return t.a.SchemaFit(sampleMax)
 }
 
-// ReschemaScan re-derives the archive's schema and rebuilds every sealed segment's columnar
-// block (see DB.ReschemaScan).
+// ReschemaScan re-derives the archive's schema and adopts it (see DB.ReschemaScan).
 func (t *ArchiveTable) ReschemaScan(sampleMax, hotTopN int) bool {
 	return t.a.ReschemaScan(sampleMax, hotTopN)
 }
@@ -1096,10 +1095,10 @@ func (t *ArchiveTable) SchemaRequireSkipped() []SchemaRequireSkip {
 // archive that was created with a different one -- archiveconfig.json is authoritative on reopen,
 // so the ArchiveConfig field alone takes effect only at create.
 //
-// It reports whether the effective set changed, and re-derives NOTHING. Every sealed segment's
-// columnar block was built against the current schema; adopting a new one means ReschemaScan,
-// re-encoding a block per sealed segment, which at history scale is the whole archive read back
-// through the decompressor. A true return is the signal that the rebuild is owed, not that it ran.
+// It reports whether the effective set changed, and re-derives nothing itself. The next maintenance
+// pass adopts the schema the new set produces and rewrites the sealed segments onto it a
+// ColumnarSegmentBudget per pass, so at history scale the change converges over several passes
+// rather than reading the whole archive back at once.
 func (t *ArchiveTable) SetSchemaRequireAttrs(names []string) (bool, error) {
 	if !t.a.SetSchemaRequireAttrs(names) {
 		return false, nil

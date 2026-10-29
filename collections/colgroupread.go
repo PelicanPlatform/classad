@@ -37,12 +37,25 @@ type groupBind struct{ gi, fi int }
 // block's own index because a colGroupBlock is per (group, base block).
 func (cs *colScope) setGroups(seg *colSegment, bi int) {
 	cs.gblocks = cs.gblocks[:0]
+	prev := cs.groups
 	cs.groups = nil
 	cs.schemaOnly = seg != nil && seg.schemaOnly
 	if seg == nil || len(seg.groups) == 0 {
+		if len(prev) != 0 {
+			cs.bindG = nil
+		}
 		return
 	}
 	cs.groups = seg.groups
+	// bindG caches (group, field) POSITIONS, which mean something only against the group list they
+	// were resolved in. One scope walks every segment of a scan, and segments built under different
+	// committed group sets -- the normal state while a schema change converges -- order and populate
+	// their groups differently: a cached hit then reads another group's field, and a cached miss sends
+	// a group member to a cold tail that never held it. So the cache is dropped whenever the list
+	// changes, as bindField's is when the base schema does.
+	if !sameGroupSchemas(prev, seg.groups) {
+		cs.bindG = nil
+	}
 	for _, g := range seg.groups {
 		if bi < len(g.blocks) {
 			cs.gblocks = append(cs.gblocks, g.blocks[bi])
@@ -50,6 +63,19 @@ func (cs *colScope) setGroups(seg *colSegment, bi int) {
 			cs.gblocks = append(cs.gblocks, nil)
 		}
 	}
+}
+
+// sameGroupSchemas reports whether two group lists are the same schemas in the same order.
+func sameGroupSchemas(a, b []*colGroup) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].schema != b[i].schema {
+			return false
+		}
+	}
+	return true
 }
 
 // bindGroupField finds name in a group schema, caching the answer for the query's lifetime as

@@ -566,9 +566,9 @@ func (c *Collection) sameGroupSet(a, b []*colGroup) bool {
 // refreshGroupSchemas is the auto-promotion step of a routine maintenance refresh: it re-evaluates
 // the gate-qualified group set against the accumulated derivation history and, ONLY when that set
 // differs from the currently-committed one, adopts it -- republishing the schema-scan state (same
-// base schema and hot set, new groups) and bringing already-columnarized segments current under the
-// budget. A no-op when the set is unchanged (the common, steady state), so a stable table never
-// churns.
+// base schema and hot set, new groups); the pass's convergence step then brings already-columnarized
+// segments current under the budget. A no-op when the set is unchanged (the common, steady state), so
+// a stable table never churns. The caller holds schemaMu.
 //
 // This is what closes the gap that left groups frozen at their first-enable value: groupSchemasFor
 // runs at first enable, when the history is too short to qualify anything, and BuildAndEnableSchemaScan's
@@ -590,9 +590,9 @@ func (c *Collection) refreshGroupSchemas(st *schemaScanState) {
 	// st.groups) by republishing the state with the SAME base schema and hot tier. Keeping the schema
 	// pointer means CountQuery routing and existing blocks are undisturbed; only the group set moves.
 	c.schemaScan.Store(&schemaScanState{schema: st.schema, hot: st.hot, cache: st.cache, groups: next})
-	// Bring already-columnarized segments (built under the OLD group set) current, bounded by the
-	// columnar budget so a change converges over several passes rather than stalling one.
-	c.recolumnarizeStaleGroups(next)
+	// Segments built under the OLD group set are brought current by the pass's convergence step
+	// (convergeStaleSegments), bounded by the columnar budget and run on EVERY pass -- not just this
+	// one, which would leave a backlog larger than one budget unconverged for good.
 }
 
 // groupSchemaCountOrDefault resolves Options.GroupSchemaCount: 0 takes the default, negative

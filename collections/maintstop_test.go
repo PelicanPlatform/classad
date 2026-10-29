@@ -134,14 +134,14 @@ func TestColumnarizeSealedStopsMidPass(t *testing.T) {
 	}
 }
 
-// recolumnarizeStaleGroups is the loop the production hang was actually in: the stack from a
-// SIGQUIT during shutdown ran StartMaintenance -> maintainArchives -> BuildAndEnableSchemaScan
-// -> refreshGroupSchemas -> recolumnarizeStaleGroups -> columnarizeSealedSegment. It is a
-// second copy of ColumnarizeSealed's loop shape, so its guards need their own coverage -- the
-// tests above pass with this function's checks deleted.
+// recolumnarizeStale is the loop the production hang was actually in (as recolumnarizeStaleGroups,
+// before it also covered the base schema): the stack from a SIGQUIT during shutdown ran
+// StartMaintenance -> maintainArchives -> BuildAndEnableSchemaScan -> refreshGroupSchemas ->
+// recolumnarizeStaleGroups -> columnarizeSealedSegment. It is a second copy of ColumnarizeSealed's
+// loop shape, so its guards need their own coverage -- the tests above pass with this function's
+// checks deleted.
 //
-// The segments here carry no group set (GroupSchemaCount is off), so any non-empty set is
-// stale for all of them and every columnarized segment becomes a candidate.
+// Every columnarized segment is made stale by committing a state with a different hot tier.
 func TestRecolumnarizeStaleGroupsStopsMidPass(t *testing.T) {
 	const budget = 4
 
@@ -183,7 +183,13 @@ func TestRecolumnarizeStaleGroupsStopsMidPass(t *testing.T) {
 			}
 			defer func() { colCommitStallHook = nil }()
 		}
-		return c.recolumnarizeStaleGroups([]*colGroup{{schema: st.schema, ids: []uint32{0, 1}}})
+		if len(st.hot) == 0 {
+			t.Skip("no hot tier to change")
+		}
+		// Commit a state every columnarized segment is stale against -- the same schema with one hot
+		// column fewer -- so the rewrite loop has the whole population to work through.
+		c.schemaScan.Store(&schemaScanState{schema: st.schema, hot: st.hot[:len(st.hot)-1], cache: st.cache, groups: st.groups})
+		return c.recolumnarizeStale()
 	}
 
 	full := run(false)

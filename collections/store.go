@@ -134,9 +134,9 @@ type Options struct {
 	// not earned by presence depends on the lifecycle of the records being stored, which only the
 	// use case knows; this is the knob it supplies them through.
 	//
-	// Changing the set on a live collection does NOT re-derive anything: every sealed segment's
-	// columnar block was built against the current schema, so adopting a new one means
-	// ReschemaScan, which rebuilds them all. See SetSchemaRequireAttrs.
+	// Changing the set on a live collection re-derives nothing by itself; the next maintenance
+	// review (BuildAndEnableSchemaScan) adopts the schema it produces and converges the sealed
+	// segments onto it, ColumnarSegmentBudget per pass. See SetSchemaRequireAttrs.
 	SchemaRequireAttrs []string
 	// GroupSchemaCount is how many SECONDARY columnar schemas to derive and build alongside the
 	// base one, for attributes the base schema does not carry which are present or absent
@@ -513,6 +513,17 @@ type Collection struct {
 	// schemaScan holds the adschema columnar scan state (resolved schema, hot fields, and the
 	// decompressed-block cache) once EnableSchemaScan is called; nil otherwise. See colscan.go.
 	schemaScan atomic.Pointer[schemaScanState]
+	// schemaMu serializes changes to the committed schema-scan state -- the maintenance review, a
+	// first enable and ReschemaScan -- together with the on-disk record of it, so two adopters cannot
+	// interleave a publish with the other's commit. Never held across a segment rewrite (those take
+	// maintMu), so the lock order between the two never arises.
+	schemaMu sync.Mutex
+	// baseCommitted records that the committed base schema is on disk (see commitBaseSchema).
+	baseCommitted atomic.Bool
+	// reviewed is when the base schema was last re-derived by maintenance and against which
+	// required set, which decides whether the next pass re-derives at all (see schemaReviewDue).
+	// Guarded by schemaMu.
+	reviewed schemaReviewMark
 
 	// colCache memoizes this collection's decompressed-columnar-block cache -- now the PROCESS-GLOBAL
 	// cache for the collection's kind (archive vs mutating), SHARED across every collection of that

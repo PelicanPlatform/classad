@@ -192,6 +192,12 @@ type segment struct {
 	// records are then missing the attributes that payload held, so reads must fail rather than
 	// return short ads.
 	colDamaged atomic.Bool
+	// convergeTried records the committed schema-scan state this segment was last brought current
+	// against, set when a convergence attempt either could not rewrite it or rewrote it into a
+	// payload that still differs from that state (a segment with no records a group can cover keeps
+	// no group selection, for one). Without it such a segment reads stale on every maintenance pass
+	// and is rewritten again each time for nothing. Process-local on purpose: a restart retries once.
+	convergeTried atomic.Pointer[schemaScanState]
 	// dictUnusable is set when this segment holds an attribute dictionary record that cannot be
 	// used: it failed its checksum, or recovery stopped at damage before reaching it. Every record
 	// in the segment is keyed by that dictionary, so reads fail rather than resolve ids through
