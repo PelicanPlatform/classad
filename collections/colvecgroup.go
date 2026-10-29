@@ -57,11 +57,11 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupIDs []uint32, aggIDs []uint
 		scratch.Release()
 		vecScratchPool.Put(scratch)
 	}()
-	groupLookups := make([]func(a wire.Ad) ([]byte, bool), 0, len(groupIDs))
+	groupLookups := make([]fieldLookup, 0, len(groupIDs))
 	for _, id := range groupIDs {
 		groupLookups = append(groupLookups, c.attrLookup(id))
 	}
-	aggLookups := make([]func(a wire.Ad) ([]byte, bool), 0, len(aggIDs))
+	aggLookups := make([]fieldLookup, 0, len(aggIDs))
 	for _, id := range aggIDs {
 		aggLookups = append(aggLookups, c.attrLookup(id))
 	}
@@ -269,7 +269,7 @@ func (c *Collection) groupBlockScoped(cs *colScope, resolver func(name string, s
 // segment, or one the accelerator has not reached) or one whose schema lacks a column involved, evaluate
 // each visible record the ordinary way and read the group and aggregate values from the record itself.
 func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
-	groupLookups []func(a wire.Ad) ([]byte, bool), aggLookups []func(a wire.Ad) ([]byte, bool),
+	groupLookups []fieldLookup, aggLookups []fieldLookup,
 	acc *groupAccum) bool {
 	var comps [maxGroupCols]groupComp
 	for off := 0; off < w.used; {
@@ -290,7 +290,7 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
 			// Matched, so this record forms a group: read its values from the wire form, the same
 			// lookups the predicate-analysis path's row fallback uses, so group identity does not
 			// depend on which tier answered.
-			if !addGroupFromAd(wire.Ad(ww), groupLookups, aggLookups, acc, &comps, nil) {
+			if !addGroupFromAd(w.dict(), wire.Ad(ww), groupLookups, aggLookups, acc, &comps, nil) {
 				return false
 			}
 		}
@@ -307,11 +307,11 @@ func (c *Collection) rowGroupWindow(w segWindow, s0 uint64, m *rowMatch,
 // ask, and raising the cap raised that. Every slot the accumulator reads is comps[:len(groupLookups)]
 // and the loop below writes all of them, so reusing one array cannot carry a component over from
 // the previous record.
-func addGroupFromAd(ad wire.Ad, groupLookups []func(a wire.Ad) ([]byte, bool),
-	aggLookups []func(a wire.Ad) ([]byte, bool), acc *groupAccum,
+func addGroupFromAd(d *segDictHandle, ad wire.Ad, groupLookups []fieldLookup,
+	aggLookups []fieldLookup, acc *groupAccum,
 	comps *[maxGroupCols]groupComp, gf *groupFilters) bool {
 	for i := range groupLookups {
-		node, found := groupLookups[i](ad)
+		node, found := groupLookups[i](d, ad)
 		comp, ok := adGroupComp(node, found, acc)
 		if !ok {
 			return false
@@ -322,7 +322,7 @@ func addGroupFromAd(ad wire.Ad, groupLookups []func(a wire.Ad) ([]byte, bool),
 	if g == nil {
 		return true // in no bucket, which the scan drops too
 	}
-	if !gf.markAd(ad) {
+	if !gf.markAd(d, ad) {
 		return false
 	}
 	gf.countInto(g)
@@ -330,7 +330,7 @@ func addGroupFromAd(ad wire.Ad, groupLookups []func(a wire.Ad) ([]byte, bool),
 		if !gf.keepsCol(i) {
 			continue
 		}
-		if an, found := aggLookups[i](ad); found {
+		if an, found := aggLookups[i](d, ad); found {
 			if isExprNode(an) {
 				return false
 			}

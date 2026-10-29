@@ -64,9 +64,9 @@ func (c *Collection) eachBlockRecord(w segWindow, s0 uint64, cs *colSegment, bas
 // wirePredsMatch tests a record's predicated attributes from their wire nodes: the row fallbacks'
 // form of the column narrowing. An absent or non-numeric value leaves the comparison UNDEFINED, so the
 // record does not match. ok=false when a value is an expression, which only evaluation can compare.
-func wirePredsMatch(ad wire.Ad, preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool)) (match, ok bool) {
+func wirePredsMatch(d *segDictHandle, ad wire.Ad, preds []fieldPred, lookups []fieldLookup) (match, ok bool) {
 	for i := range preds {
-		node, found := lookups[i](ad)
+		node, found := lookups[i](d, ad)
 		if !found {
 			return false, true
 		}

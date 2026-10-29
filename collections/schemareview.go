@@ -261,15 +261,22 @@ func (c *Collection) newStaleCheck(st *schemaScanState) *staleCheck {
 }
 
 // payloadStale reports whether cs differs from the committed state in base schema, hot tier or group
-// set. Any of the three is a reason to rebuild: the base schema decides which attributes are columns,
-// the hot tier which of them are read without decompression, and the group set which attributes a
-// group column carries.
+// set, or is a columnarized payload without a remnant-name list. Any of these is a reason to rebuild:
+// the base schema decides which attributes are columns, the hot tier which of them are read without
+// decompression, the group set which attributes a group column carries, and the list whether absence
+// is answered from the payload or by reading every record.
 func (k *staleCheck) payloadStale(cs *colSegment) bool {
 	sch := cs.schema()
 	if sch == nil {
 		return false // nothing columnar to compare; covering it is coverSealedSegments' job
 	}
 	if !sameSchemaLayout(sch, k.st.schema) || !sameHotSet(sch, cs.hotNum(), k.st.schema, k.st.hot) {
+		return true
+	}
+	if cs.schemaOnly && cs.remnants == nil {
+		// A columnarized segment written before payloads listed their remnant names: readable, but a
+		// column reader cannot tell absence there without reading every record. Rewriting it adds the
+		// list, so it converges like any other stale payload.
 		return true
 	}
 	if len(cs.groups) != len(k.st.groups) {

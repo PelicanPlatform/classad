@@ -975,6 +975,13 @@ re-derivation unconditionally. Each columnarized segment carries its own schema,
 readers resolve the schema per block, so old and new segments coexist while a change
 converges.
 
+A columnarized segment's payload ends with a list of every attribute name its remnants
+still hold (expressions, mostly). A column reader resolving an attribute that is neither
+a column nor in that list answers undefined for the whole segment without reading a
+record; without the list it has to read each remnant. The list follows the group section,
+which older builds stop parsing at, so it does not change what they read. Segments written
+without it are stale and converge like any other.
+
 ### Group schemas
 
 The base schema holds attributes present in nearly every ad. That threshold makes a slot

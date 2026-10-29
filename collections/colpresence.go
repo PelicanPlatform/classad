@@ -116,12 +116,7 @@ func (c *Collection) PresenceCountQuery(q *vm.Query) (int, bool) {
 func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) (int, bool) {
 	// The row fallback must honor the collection's wire mode: inline names on a persistent store,
 	// interned ids in memory.
-	lookup := func(a wire.Ad) ([]byte, bool) { return a.Lookup(pred.fieldID) }
-	if c.inline {
-		if name, ok := c.intern.Name(pred.fieldID); ok {
-			lookup = func(a wire.Ad) ([]byte, bool) { return a.LookupByName(name) }
-		}
-	}
+	lookup := c.attrLookup(pred.fieldID)
 	count := 0
 	tally := func(undefined bool) {
 		if undefined == pred.wantAbsent {
@@ -221,7 +216,7 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 // brutePresence is the row fallback: walk a window's visible records and classify the attribute from
 // its wire node. It reads ONE attribute per record rather than decoding the ad. Returns false if a
 // value is an expression, which the caller must answer by evaluation.
-func brutePresence(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) ([]byte, bool), tally func(bool)) bool {
+func brutePresence(c *Collection, w segWindow, s0 uint64, lookup fieldLookup, tally func(bool)) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -239,7 +234,7 @@ func brutePresence(c *Collection, w segWindow, s0 uint64, lookup func(wire.Ad) (
 				return false
 			}
 			buf = ww
-			node, found := lookup(wire.Ad(ww))
+			node, found := lookup(w.dict(), wire.Ad(ww))
 			if !found {
 				tally(true)
 			} else {
