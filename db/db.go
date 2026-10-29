@@ -735,11 +735,11 @@ func (db *DB) SchemaScanInfo() SchemaScanInfo { return db.c.SchemaScanInfo() }
 // (see collections.Collection.SchemaFit). Returns nil when the accelerator is not enabled.
 func (db *DB) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) { return db.c.SchemaFit(sampleMax) }
 
-// ReschemaScan derives a new schema from a fresh sample and rebuilds every sealed segment's
-// columnar block against it, replacing the one pinned at first enable. Heavy -- a block per
-// sealed segment is re-encoded and re-persisted -- and never done by routine maintenance, which
-// deliberately keeps the schema stable. Returns false if there was nothing to sample or the
-// accelerator cannot run here.
+// ReschemaScan derives a new schema from a fresh sample and adopts it unconditionally (routine
+// maintenance adopts a re-derivation only when the change is material). Sidecar blocks are rebuilt
+// before it returns; columnarized segments are rewritten one ColumnarSegmentBudget now and the rest
+// by maintenance (see collections.Collection.ReschemaScan). Returns false if there was nothing to
+// sample.
 func (db *DB) ReschemaScan(sampleMax, hotTopN int) bool { return db.c.ReschemaScan(sampleMax, hotTopN) }
 
 // SchemaRequireAttrs returns the effective required-attribute set -- the attributes that enter
@@ -754,10 +754,9 @@ func (db *DB) SchemaRequireSkipped() []SchemaRequireSkip { return db.c.SchemaReq
 // runtime. AddSchemaRequireAttrs / DropSchemaRequireAttrs change it by name. Each reports whether
 // the effective set changed, and persists the runtime tier so it survives a restart.
 //
-// None of them re-derives anything. Every sealed segment's columnar block was built against the
-// current schema, so a changed set takes effect only at the next ReschemaScan -- which re-encodes
-// a block per sealed segment, a cost on the scale of the whole table. The caller decides when to
-// pay it; a configuration reload must not start it by itself.
+// None of them re-derives anything itself; a configuration reload must not start a rewrite of the
+// table. The next maintenance pass adopts the schema the changed set produces and converges the
+// sealed segments onto it, a ColumnarSegmentBudget of them per pass; ReschemaScan adopts at once.
 // The error return is always nil: index-config persistence here is best-effort, as it is for
 // AddIndex and the hot set. It exists so both table types present the same surface -- an archive
 // writes archiveconfig.json and can fail -- and so a caller that starts checking it does not have

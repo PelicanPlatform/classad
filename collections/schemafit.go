@@ -1,16 +1,12 @@
 package collections
 
-import (
-	"github.com/PelicanPlatform/classad/collections/wire"
-)
+import "time"
 
 // Rebuilding the derived schema, and deciding when to.
 //
-// The schema is recovered by sampling once, at first enable, and then deliberately held stable:
-// every segment's columnar block is built against a particular schema, so swapping the current
-// schema mid-flight would leave earlier blocks unmatched. That stability is right for routine
-// maintenance and wrong forever -- a workload drifts, and nothing here noticed. SchemaFit
-// measures the drift; ReschemaScan acts on it.
+// The schema is recovered by sampling at first enable, and routine maintenance re-derives it and
+// adopts the re-derivation when the difference is material (see reviewBaseSchema). SchemaFit measures
+// the drift for an operator; ReschemaScan adopts a fresh derivation unconditionally.
 
 // SchemaFieldFit reports how well one schema field still fits the data, measured against a fresh
 // sample rather than the one the schema was built from.
@@ -65,39 +61,7 @@ func (c *Collection) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) {
 	for _, idx := range st.hot {
 		hot[idx] = true
 	}
-	missing := make([]int, len(s.fields))
-	escaped := make([]int, len(s.fields))
-	present := make([]bool, len(s.fields)) // reused per record
-	stored := make([]bool, len(s.fields))  // reused per record
-	for _, w := range samples {
-		for i := range present {
-			present[i] = false
-			stored[i] = false
-		}
-		wire.Ad(w).ForEach(func(id uint32, node []byte) bool {
-			idx, ok := s.byID[id]
-			if !ok {
-				return true // not a schema field: lives in the cold tail either way
-			}
-			present[idx] = true
-			// The same test adSchema.encode applies when deciding the fixed slot.
-			f := &s.fields[idx]
-			k, lit := nodeKind(node)
-			if k == f.kind && (f.kind != akInt || intFits(lit.Int, f.width, f.unsigned)) {
-				stored[idx] = true
-			}
-			return true
-		})
-		for i := range s.fields {
-			if !present[i] {
-				missing[i]++
-			}
-			if !stored[i] {
-				escaped[i]++
-			}
-		}
-	}
-	n := float64(len(samples))
+	fc := measureSchemaFit(s, samples)
 	out := make([]SchemaFieldFit, 0, len(s.fields))
 	for i, f := range s.fields {
 		name, ok := c.schemaFieldName(f.id)
@@ -109,69 +73,47 @@ func (c *Collection) SchemaFit(sampleMax int) ([]SchemaFieldFit, int) {
 			Kind:    f.kind.String(),
 			Width:   f.width,
 			Hot:     hot[i],
-			Escaped: float64(escaped[i]) / n,
-			Missing: float64(missing[i]) / n,
+			Escaped: fc.rate(fc.n - fc.stored[i]),
+			Missing: fc.rate(fc.n - fc.present[i]),
 		})
 	}
 	return out, len(samples)
 }
 
-// ReschemaScan derives a NEW schema from a fresh sample and rebuilds every sealed segment's
-// columnar block against it, replacing the schema that BuildAndEnableSchemaScan pinned at first
-// enable. This is the deliberate, heavy operation that routine maintenance refuses to do: it
-// re-encodes and re-persists a block per sealed segment, so its cost scales with the whole
-// table, not with what changed.
+// ReschemaScan derives a NEW schema from a fresh sample and adopts it as the committed one,
+// unconditionally -- the deliberate counterpart of the maintenance review, which adopts a
+// re-derivation only when the difference is material. Returns false if there was nothing to sample,
+// leaving the existing schema in place.
 //
-// Use it when SchemaFit shows the schema no longer matching the data -- escapes climbing on a
-// queried column, or a field that has become common since. Returns false if the accelerator
-// cannot run here (encryption at rest) or there was nothing to sample, leaving the existing
-// schema in place.
+// What it does to existing segments:
 //
-// Existing blocks are dropped first: EnableSchemaScan builds only where a segment has none, so
-// without that it would keep every old block and the new schema would match none of them. A
-// COLUMNARIZED segment is exempt -- its block holds attributes its records no longer carry, so it
-// keeps both the block and the schema it was written with; adopting a new schema there means
-// rewriting the segment.
-// Queries during the rebuild take the row path, which is correct but slower.
+//   - Sidecar blocks (a segment whose records still hold every attribute) are rebuilt against the
+//     new schema before this returns, as they always were. Each block is replaced in place, so a
+//     concurrent query reads either the old block or the new one, never neither.
+//   - Columnarized segments hold their schema'd attributes ONLY in their payload, so adopting a new
+//     schema there means rewriting the segment. That is NOT done synchronously for the whole table:
+//     at archive scale it is hours of I/O behind one admin command. One budgeted pass runs here
+//     (ColumnarSegmentBudget segments) and routine maintenance converges the rest, the same budget per
+//     pass. Until a segment is rewritten it is read under the schema it was written with -- correct,
+//     only not yet accelerated for the new fields. SchemaScanInfo.StaleSegments reports how many
+//     remain.
+//
+// The new schema is committed to disk before any segment is touched, so a restart mid-convergence
+// resumes converging toward it rather than reverting to the old one.
 func (c *Collection) ReschemaScan(sampleMax, hotTopN int) bool {
 	// Encryption is no longer exclusive with the accelerator; see EnableSchemaScan.
+	c.schemaMu.Lock()
 	s, hot, ok := c.deriveSchema(sampleMax, hotTopN)
+	if ok {
+		ok = c.installSchemaScanLocked(s, hot, "schema rebuild")
+		c.reviewed = schemaReviewMark{at: time.Now(), require: c.SchemaRequireAttrs()}
+	}
+	c.schemaMu.Unlock()
 	if !ok {
 		return false
 	}
-	// Stand down before dropping blocks, so a concurrent query sees "no accelerator" (row
-	// path) rather than a live schema with no blocks behind it.
-	c.schemaScan.Store(nil)
-	for _, sh := range c.shards {
-		sh.mu.RLock()
-		act := sh.act
-		segs := make([]*segment, 0, len(sh.segs))
-		for _, seg := range sh.segs {
-			if seg != nil && seg != act && seg.used > 0 {
-				segs = append(segs, seg)
-			}
-		}
-		sh.mu.RUnlock()
-		for _, seg := range segs {
-			if seg.columnarized() {
-				// A COLUMNARIZED segment's block is not a rebuildable accelerator -- it is where the
-				// segment's schema'd attributes are STORED, and its records no longer carry them. So
-				// it is not dropped: dropping it cannot be undone here, because the rebuild below
-				// deliberately refuses to build a block from records that are missing the very values
-				// it would need, leaving the segment with no columnar path at all until a reopen
-				// republished it.
-				//
-				// Keeping it is also the right answer rather than merely the safe one. The payload
-				// carries its own schema, so the segment stays readable and queryable against the
-				// schema it was written with, which is the per-segment-schema property the format is
-				// built on. Re-schema-ing such a segment means REWRITING it, not rebuilding a sidecar.
-				continue
-			}
-			// A scan that already loaded the old block keeps reading it safely; only new
-			// lookups see nil and fall back until the rebuild republishes.
-			seg.colblk.Store(nil)
-		}
-	}
-	c.EnableSchemaScan(s, hot)
+	c.schemaScanPass()
+	c.recolumnarizeStale()
+	c.rebuildStaleSidecarsAll()
 	return true
 }

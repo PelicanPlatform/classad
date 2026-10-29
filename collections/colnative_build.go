@@ -102,10 +102,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// rewrite that left them out silently retired the group accelerator for every segment it touched
 	// (measured: 0 of 9). Their attributes are not base schema fields, so without them the group
 	// columns simply do not exist and every group attribute stays in the record.
-	var groups []*colGroup
-	if st := c.schemaScan.Load(); st != nil {
-		groups = st.groups
-	}
+	groups := c.groupsFor(s)
 	// A record's group-owned attributes, captured while the block builder walks the records so the
 	// remnant pass strips exactly what the columns took. groupSkipSet admits only WHOLE membership --
 	// a record holding part of a group is not in that group's column, so its values must stay in the
@@ -750,19 +747,26 @@ func (c *Collection) columnarizeSealed() int {
 	return total
 }
 
-// recolumnarizeStaleGroups re-columnarizes the already-columnarized sealed segments whose built-in
-// group set differs from next (the newly-committed set), so a group the table has just started
-// committing to is actually applied to the segments that predate it. Bounded by the columnar budget,
-// so a change converges over several maintenance passes rather than stalling on one, exactly as the
+// recolumnarizeStale re-columnarizes the already-columnarized sealed segments whose payload was built
+// under a different committed state -- base schema, hot tier or group set -- so a schema or group
+// change is actually applied to the segments that predate it. Bounded by the columnar budget, so a
+// change converges over several maintenance passes rather than stalling on one, exactly as the
 // initial columnarize backlog does. Returns how many segments were rewritten.
 //
-// Only segments whose group set is actually stale are touched -- one already carrying next is skipped
-// -- so a steady group set costs a comparison per segment and no rewrites. Holds maintMu, as the
-// other segment-rewriting passes do, so rewrites never overlap.
-func (c *Collection) recolumnarizeStaleGroups(next []*colGroup) int {
+// Rewriting is the only way to move such a segment: its schema'd attributes live ONLY in its payload,
+// so there is no sidecar to swap. columnarizeSegment reconstructs every full ad from the old payload
+// and the remnants and re-splits it under the committed state, so an attribute the new schema drops
+// goes back into the records, and one it adds comes out of them.
+//
+// Only stale segments are touched, so a steady state costs a comparison per segment and no rewrites.
+// One that cannot be brought current -- the rewrite is refused, or produces a payload that still
+// differs -- is marked against this state and not retried until the state changes (see
+// segment.convergeTried). Holds maintMu, as the other segment-rewriting passes do, so rewrites never
+// overlap.
+func (c *Collection) recolumnarizeStale() int {
 	budget := c.columnarBudget()
 	if budget <= 0 {
-		return 0 // rewrite disabled: the adopted set still applies to future/non-columnarized segments
+		return 0 // rewrite disabled: the committed state still applies to future/non-columnarized segments
 	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
@@ -770,6 +774,7 @@ func (c *Collection) recolumnarizeStaleGroups(next []*colGroup) int {
 	if st == nil || st.schema == nil || len(st.schema.fields) == 0 {
 		return 0
 	}
+	k := c.newStaleCheck(st)
 	total := 0
 	for _, sh := range c.shards {
 		if total >= budget || c.maintStopping() {
@@ -782,12 +787,8 @@ func (c *Collection) recolumnarizeStaleGroups(next []*colGroup) int {
 		act := sh.act
 		var srcs []*segment
 		for _, seg := range sh.segs {
-			if seg == nil || seg == act || seg.used == 0 || !seg.columnarized() {
+			if seg == nil || seg == act || seg.used == 0 || !seg.columnarized() || !k.segStale(seg) {
 				continue
-			}
-			cn := seg.colNative.Load()
-			if cn == nil || c.sameGroupSet(cn.seg.groups, next) {
-				continue // already carries the committed group set
 			}
 			srcs = append(srcs, seg)
 		}
@@ -797,9 +798,22 @@ func (c *Collection) recolumnarizeStaleGroups(next []*colGroup) int {
 			if total >= budget || c.maintStopping() {
 				break
 			}
-			if c.columnarizeSealedSegment(sh, src, st.schema, st.hot) {
-				total++
+			if !c.columnarizeSealedSegment(sh, src, st.schema, st.hot) {
+				src.convergeTried.Store(st)
+				continue
 			}
+			total++
+			// The replacement is a new segment; find it by id to mark it if it still differs.
+			sh.mu.RLock()
+			for _, seg := range sh.segs {
+				if seg != nil && seg.id == src.id && seg != src {
+					if cs := seg.colblk.Load(); cs != nil && k.payloadStale(cs) {
+						seg.convergeTried.Store(st)
+					}
+					break
+				}
+			}
+			sh.mu.RUnlock()
 		}
 	}
 	if total > 0 {
