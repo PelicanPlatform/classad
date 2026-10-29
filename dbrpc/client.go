@@ -33,6 +33,13 @@ type Client struct {
 	pending  map[uint64]*pending
 	closeErr error
 
+	// What the peer advertised about itself in the handshake, set at
+	// construction by WithPeerSessionAttrs and read-only thereafter. A nil
+	// peerFeatures means the peer advertised nothing, which is not the same as
+	// advertising an empty set -- see Support.
+	peerProtocol int
+	peerFeatures map[Feature]bool
+
 	// Observer, if set before use, receives a timing breakdown for each completed unary
 	// call. It lets an embedder (e.g. a collector's Prometheus metrics) localize where a
 	// round-trip spends its time -- client-side write-lock contention, the socket write
@@ -71,8 +78,11 @@ type pending struct {
 
 // NewClient runs the mux over conn. Close (or a transport error) fails all in-flight
 // and future calls.
-func NewClient(conn MsgConn) *Client {
+func NewClient(conn MsgConn, opts ...ClientOption) *Client {
 	c := &Client{conn: conn, pending: make(map[uint64]*pending)}
+	for _, opt := range opts {
+		opt(c)
+	}
 	go c.readLoop()
 	return c
 }
