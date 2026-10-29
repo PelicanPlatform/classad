@@ -245,6 +245,18 @@ func (s *segStats) avgTailCount() float64 {
 // against min/max and interpolates into a histogram, so it relies on indexRecord's invariant
 // that no key is a NaN -- which none of those four operations can do anything correct with.
 func (vp *valPostings) finishStats() {
+	sorted := make([]float64, 0, len(vp.post))
+	for k := range vp.post {
+		sorted = append(sorted, k)
+	}
+	sort.Float64s(sorted)
+	vp.finishStatsSorted(sorted)
+}
+
+// finishStatsSorted is finishStats given post's keys already in ascending order, which becomes
+// sortedKeys: an extended index (extendSegIndex) merges its new keys into its base's order instead
+// of sorting every key again.
+func (vp *valPostings) finishStatsSorted(sorted []float64) {
 	s := &vp.stats
 	s.exc = vp.exc.GetCardinality()
 	s.ndv = uint64(len(vp.post))
@@ -271,11 +283,7 @@ func (vp *valPostings) finishStats() {
 	s.covered = indexable + s.exc
 	s.top = topEntries(entries)
 	// Sorted keys for range boundary search (probeOffsets `<`,`<=`,`>`,`>=`).
-	vp.sortedKeys = make([]float64, 0, len(vp.post))
-	for k := range vp.post {
-		vp.sortedKeys = append(vp.sortedKeys, k)
-	}
-	sort.Float64s(vp.sortedKeys)
+	vp.sortedKeys = sorted
 	// Equi-depth histogram over the exact (value, count) distribution, for skew-aware range
 	// selectivity (replaces uniform [min,max] interpolation in estRange).
 	counts := make([]uint64, len(vp.sortedKeys))
@@ -309,20 +317,40 @@ func (cp *catPostings) finishStats() {
 
 // topEntries returns the topNMax highest-count entries, descending by count
 // (value as a deterministic tie-break so a rebuild is reproducible).
+//
+// A selection, not a sort: every finishStats call makes one, over every distinct value of the
+// attribute, and sorting all of them to keep ten was most of the cost of re-summarizing a
+// timestamp's postings. The order is total over distinct values, so the result is the same as
+// sorting the whole slice and cutting it.
 func topEntries(entries []topEntry) []topEntry {
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].count != entries[j].count {
-			return entries[i].count > entries[j].count
-		}
-		if entries[i].skey != entries[j].skey {
-			return entries[i].skey < entries[j].skey
-		}
-		return entries[i].fkey < entries[j].fkey
-	})
-	if len(entries) > topNMax {
-		entries = entries[:topNMax]
+	if len(entries) <= topNMax {
+		sort.Slice(entries, func(i, j int) bool { return topBefore(entries[i], entries[j]) })
+		return entries
 	}
-	return entries
+	best := make([]topEntry, 0, topNMax)
+	for _, e := range entries {
+		if len(best) == topNMax && !topBefore(e, best[topNMax-1]) {
+			continue
+		}
+		i := sort.Search(len(best), func(i int) bool { return topBefore(e, best[i]) })
+		if len(best) < topNMax {
+			best = append(best, topEntry{})
+		}
+		copy(best[i+1:], best[i:len(best)-1])
+		best[i] = e
+	}
+	return best
+}
+
+// topBefore is topEntries' order: higher count first, then the smaller value.
+func topBefore(a, b topEntry) bool {
+	if a.count != b.count {
+		return a.count > b.count
+	}
+	if a.skey != b.skey {
+		return a.skey < b.skey
+	}
+	return a.fkey < b.fkey
 }
 
 // sketchBytes is the resident memory of this attribute's per-segment sketches: the
