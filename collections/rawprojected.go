@@ -2,6 +2,7 @@ package collections
 
 import (
 	"iter"
+	"slices"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -33,7 +34,8 @@ func (c *Collection) ScanRawProjected(projection []string, chaseRefs, redact boo
 	return func(yield func(RawAd) bool) {
 		p := c.newRawProjector(projection, chaseRefs, redact)
 		emit := c.yieldRawProjected(yield, p)
-		q := queryPlan{}
+		// No query, so every record is a candidate for the columnar projection (see rawProjPlan).
+		q := queryPlan{proj: c.rawProjPlan(projection, chaseRefs)}
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {
 				return
@@ -54,12 +56,35 @@ func (c *Collection) QueryRawProjected(q *vm.Query, projection []string, chaseRe
 func (c *Collection) QueryRawProjectedStats(q *vm.Query, projection []string, chaseRefs, redact bool, stats *ScanStats) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
 		p := c.newRawProjector(projection, chaseRefs, redact)
-		// No projection plan, for the second of the two reasons given in QueryProjectStats: under
-		// chaseRefs this emit resolves each emitted expression's references AGAINST THE SAME AD,
-		// so an ad narrowed to the projection would resolve exactly the references the narrowing
-		// removed. The narrowing has to stay inside this projector, which sees the whole record.
-		c.scanQuery(c.newQueryPlan(q, nil, stats), c.yieldRawProjected(yield, p))
+		c.scanQuery(c.newQueryPlan(q, c.rawProjPlan(projection, chaseRefs), stats), c.yieldRawProjected(yield, p))
 	}
+}
+
+// rawProjPlan is the projection plan a raw projected scan hands the scan, so a record whose
+// match did not need the whole ad (the query is constant, or the columns decided it) is built
+// from the named columns instead of reassembled. nil for an empty projection, which means the
+// whole ad.
+//
+// The plan names MyType and TargetType too: the projector lifts them into the RawAd from
+// whatever ad it is handed, and an ad built from columns without them would come back typeless.
+//
+// Without chaseRefs the projector only renders the entries it keeps, and the narrowed ad holds
+// every projected attribute the record has, so the narrowing cannot change a row. Under
+// chaseRefs it resolves each emitted expression's references AGAINST THE AD IT IS GIVEN, and a
+// narrowed ad lacks exactly the attributes the projection did not name. So the plan is marked
+// as a closure plan: the scan keeps the columnar ad only when its expressions refer to nothing
+// outside it (adSelfClosed), and reassembles the rest. When the narrowed ad is self-contained,
+// the closure over it is the closure over the whole record -- every attribute the walk can
+// reach is in it, with the same bytes.
+func (c *Collection) rawProjPlan(projection []string, chaseRefs bool) *projPlan {
+	if len(projection) == 0 {
+		return nil
+	}
+	proj := c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
+	if proj != nil {
+		proj.closure = chaseRefs
+	}
+	return proj
 }
 
 // rawTypeFieldNames are the type fields every raw response lifts into RawAd;

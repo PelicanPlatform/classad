@@ -192,17 +192,9 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 		// read demand, CurrentTime fold and index plan as any other query.
 		//
 		// The projection plan lets a record the columns decided be built from the
-		// named columns rather than reassembled. Safe here because this emit only
-		// SHIPS the projected entries (chaseRefs is off): see colproject.go for the
-		// consumers that evaluate and so must not narrow.
-		//
-		// It also names MyType and TargetType, which the raw projector lifts into
-		// the RawAd from whatever ad it is handed, projected or not: an ad built
-		// from columns without them would come back typeless.
-		var proj *projPlan
-		if len(projection) > 0 {
-			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
-		}
+		// named columns rather than reassembled (see rawProjPlan). This read does
+		// not chase references, so no closure check is needed.
+		proj := c.rawProjPlan(projection, false)
 		var (
 			qp queryPlan
 			rp readPlan
