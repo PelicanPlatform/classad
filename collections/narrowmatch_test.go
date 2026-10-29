@@ -153,9 +153,12 @@ func buildNarrowFixture(t *testing.T, f nmFixture) *Collection {
 	c.InternSealed()
 	// A second schema carrying VacateReasonCode, which the first does not: sealed segments
 	// columnarized from here on hold it in a column, the earlier ones in their cold tails.
+	// Installed directly rather than through ReschemaScan, which rewrites the already-columnarized
+	// segments onto the new schema and would leave the fixture with one schema, not two.
 	c.AddSchemaRequireAttrs("VacateReasonCode")
-	if !c.ReschemaScan(4096, 8) {
-		t.Fatal("reschema declined")
+	s2, hot2, ok := c.deriveSchema(4096, 8)
+	if !ok || !c.installSchemaScan(s2, hot2) {
+		t.Fatal("second schema declined")
 	}
 	c.ColumnarizeSealed()
 	if f.updates {
