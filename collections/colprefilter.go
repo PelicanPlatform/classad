@@ -37,11 +37,24 @@ import (
 type colPrefilter struct {
 	c        *Collection
 	cs       *colScope
-	m        *vm.Matcher
+	m        *vm.Matcher // the whole query; nil when only conjuncts can be asked
 	resolver func(name string, scope ast.AttributeScope) classad.Value
+	// conj are the query's top-level conjuncts the columns can evaluate, used when the whole query
+	// cannot be: each can only REJECT a record (see vm.Query.Conjuncts).
+	conj []colConjunct
 	// blk is the block cs is currently bound to, so a scan walking records in order rebinds once per
 	// block rather than once per record.
 	blk *columnarBlock
+}
+
+// colConjunct is one top-level conjunct of a query the prefilter can test from columns.
+type colConjunct struct {
+	m   *vm.Matcher
+	ids []uint32 // the conjunct's attributes as global intern ids
+	// inBlk reports whether every attribute is a field of the current block's schema. A conjunct
+	// reading one the block does not carry would go to the record's cold tail and, in a columnarized
+	// segment, come back undecided for every record that lacks it -- so it is not asked at all there.
+	inBlk bool
 }
 
 // newColPrefilter returns a prefilter for q, or nil when the columns cannot usefully decide it.
@@ -52,46 +65,75 @@ type colPrefilter struct {
 // reassembly it cannot avoid. A query reading an attribute the schema does not carry is refused for
 // the same reason from the other direction -- every record would come back undecided, and the scan
 // would pay for the attempt on all of them.
+//
+// Such a query may still have CONJUNCTS that read only schema fields: `EpochWriteDate >= T &&
+// VacateReasonCode isnt undefined` cannot be answered from a narrow schema, but its first half can,
+// and a record failing it cannot match whatever the second half says. Those conjuncts are kept, to
+// reject; accepting still needs the whole query, so a record that passes them all is undecided.
 func (c *Collection) newColPrefilter(q *vm.Query) *colPrefilter {
-	if q == nil || !q.Native() || c.intern == nil {
+	if q == nil || c.intern == nil {
 		return nil
 	}
 	st := c.schemaScan.Load()
 	if st == nil || st.schema == nil {
 		return nil
 	}
+	if _, ok := c.schemaSeedIDs(q, st.schema); ok && q.Native() {
+		cs := &colScope{bc: st.cache, c: c}
+		return &colPrefilter{c: c, cs: cs, m: q.Matcher(), resolver: cs.resolve}
+	}
+	if conjunctRejectOff {
+		return nil
+	}
+	var conj []colConjunct
+	for _, cq := range q.Conjuncts() {
+		if !cq.Native() {
+			continue
+		}
+		if ids, ok := c.schemaSeedIDs(cq, st.schema); ok {
+			conj = append(conj, colConjunct{m: cq.Matcher(), ids: ids})
+		}
+	}
+	if len(conj) == 0 {
+		return nil
+	}
+	cs := &colScope{bc: st.cache, c: c}
+	return &colPrefilter{c: c, cs: cs, conj: conj, resolver: cs.resolve}
+}
+
+// schemaSeedIDs returns the attributes q reads as global intern ids, and whether every one of them
+// is a field of schema. False also for a query that reads nothing statically visible (eval), or
+// nothing at all: there is no rejection to win there.
+func (c *Collection) schemaSeedIDs(q *vm.Query, schema *adSchema) ([]uint32, bool) {
 	plan := q.ReadPlan()
 	if !plan.PartialSafe || len(plan.Seeds) == 0 {
-		return nil // reads nothing statically visible, or nothing at all: no rejection to win
+		return nil, false
 	}
+	ids := make([]uint32, 0, len(plan.Seeds))
 	for _, name := range plan.Seeds {
 		id, ok := c.intern.LookupID(name)
 		if !ok {
-			return nil
+			return nil, false
 		}
-		if _, ok := st.schema.byID[id]; !ok {
+		if _, ok := schema.byID[id]; !ok {
 			// Not a schema field. It may still be reachable (a group column, the cold tail, the
 			// record), but not by a test that has to be cheap to be worth running.
-			return nil
+			return nil, false
 		}
+		ids = append(ids, id)
 	}
-	cs := &colScope{bc: st.cache, c: c}
-	return &colPrefilter{c: c, cs: cs, m: q.Matcher(), resolver: cs.resolve}
+	return ids, true
 }
 
 // test reports whether record k of the segment matches, and whether it could tell.
 //
 // decided is false whenever anything about the record needs the ordinary evaluator, which the caller
-// must then run -- see the note above on why unsure is the safe answer and wrong is not.
+// must then run -- see the note above on why unsure is the safe answer and wrong is not. Only for a
+// prefilter of the whole query (p.m set); one holding only conjuncts answers through rejects.
 func (p *colPrefilter) test(cn *colNative, k int) (matches, decided bool) {
-	blk, local := cn.blockFor(k)
-	if blk == nil || blk.schema == nil {
+	local, ok := p.bind(cn, k)
+	if !ok {
 		return false, false
-	}
-	if blk != p.blk {
-		p.cs.setBlock(blk)
-		p.cs.setGroups(cn.seg, cn.blockIndexOf(blk))
-		p.blk = blk
 	}
 	p.cs.k, p.cs.fellBack = local, false
 	v := p.m.EvalResolved(p.resolver)
@@ -104,6 +146,45 @@ func (p *colPrefilter) test(cn *colNative, k int) (matches, decided bool) {
 	return isTrueValue(v), true
 }
 
+// rejects reports whether one of the query's conjuncts, answered from record k's columns, is not
+// logically true -- so the record cannot match. False means only that no conjunct could say so.
+func (p *colPrefilter) rejects(cn *colNative, k int) bool {
+	local, ok := p.bind(cn, k)
+	if !ok {
+		return false
+	}
+	for i := range p.conj {
+		cj := &p.conj[i]
+		if !cj.inBlk {
+			continue
+		}
+		p.cs.k, p.cs.fellBack = local, false
+		v := cj.m.EvalResolved(p.resolver)
+		if !p.cs.fellBack && !isTrueValue(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// bind points the scope at record k's block, rebinding only when the block changes, and returns the
+// record's index within it.
+func (p *colPrefilter) bind(cn *colNative, k int) (int, bool) {
+	blk, local := cn.blockFor(k)
+	if blk == nil || blk.schema == nil {
+		return 0, false
+	}
+	if blk != p.blk {
+		p.cs.setBlock(blk)
+		p.cs.setGroups(cn.seg, cn.blockIndexOf(blk))
+		p.blk = blk
+		for i := range p.conj {
+			p.conj[i].inBlk = blk.schema.hasAll(p.conj[i].ids)
+		}
+	}
+	return local, true
+}
+
 // blockIndexOf returns a block's position in the segment, which the group selections are keyed by.
 func (cn *colNative) blockIndexOf(blk *columnarBlock) int {
 	for i, b := range cn.seg.blocks {
@@ -112,4 +193,14 @@ func (cn *colNative) blockIndexOf(blk *columnarBlock) int {
 		}
 	}
 	return 0
+}
+
+// hasAll reports whether every id is a field of the schema.
+func (s *adSchema) hasAll(ids []uint32) bool {
+	for _, id := range ids {
+		if _, ok := s.byID[id]; !ok {
+			return false
+		}
+	}
+	return true
 }
