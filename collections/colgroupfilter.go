@@ -55,7 +55,7 @@ import (
 type groupFilters struct {
 	// One entry per distinct filter, in order of first appearance.
 	preds   [][]fieldPred
-	lookups [][]func(wire.Ad) ([]byte, bool) // the row fallback's attribute readers, per filter
+	lookups [][]fieldLookup // the row fallback's attribute readers, per filter
 
 	// colOf[j] is aggregate column j's filter index, or -1 when it is unfiltered. countOf[k] is
 	// requested filtered record count k's filter index, which is never -1: an unfiltered count is
@@ -115,7 +115,7 @@ func (c *Collection) compileGroupFilters(s *adSchema, colFilters, countFilters [
 		i := len(gf.preds)
 		at[filter] = i
 		gf.preds = append(gf.preds, preds)
-		lk := make([]func(wire.Ad) ([]byte, bool), len(preds))
+		lk := make([]fieldLookup, len(preds))
 		for j, p := range preds {
 			lk[j] = c.attrLookup(p.fieldID)
 		}
@@ -222,14 +222,14 @@ func (gf *groupFilters) mark(k int) {
 //
 // ok=false when a predicated attribute holds an expression, which only evaluation can resolve; the
 // query then goes back to the scan, as it does when the WHERE clause meets one.
-func (gf *groupFilters) markAd(ad wire.Ad) bool {
+func (gf *groupFilters) markAd(d *segDictHandle, ad wire.Ad) bool {
 	if gf == nil {
 		return true
 	}
 	for i, preds := range gf.preds {
 		gf.pass[i] = true
 		for j := range preds {
-			node, found := gf.lookups[i][j](ad)
+			node, found := gf.lookups[i][j](d, ad)
 			if !found {
 				gf.pass[i] = false
 				break

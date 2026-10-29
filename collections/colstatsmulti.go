@@ -197,7 +197,7 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 		return true
 	}
 	acc := newStatsAccum()
-	lookups := make([]func(wire.Ad) ([]byte, bool), len(otherPreds))
+	lookups := make([]fieldLookup, len(otherPreds))
 	for i, p := range otherPreds {
 		lookups[i] = c.attrLookup(p.fieldID)
 	}
@@ -304,15 +304,27 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 	return acc.result(), true
 }
 
-// attrLookup returns the wire lookup for an attribute in this collection's mode: by interned id in
-// memory, by inline name on a persistent store.
-func (c *Collection) attrLookup(id uint32) func(wire.Ad) ([]byte, bool) {
+// fieldLookup reads one attribute from a record's own wire form, given the dictionary of the segment
+// the record came from (nil for a segment without one).
+type fieldLookup func(d *segDictHandle, a wire.Ad) ([]byte, bool)
+
+// attrLookup returns the wire lookup for an attribute in the form each record is stored in: by
+// interned id in memory; on a persistent store by inline name, or -- in a segment with a dictionary --
+// by that segment's local id for the name.
+//
+// The dictionary case is why it takes one. A row fallback reads records in their stored encoding, and
+// an interned segment's records carry local ids, not names: looking one up by name finds nothing, so
+// every row-path aggregate over such a segment counted its records as lacking the attribute. That
+// stayed hidden while the row path ran only for segments with no block at all, and a dictionary-keyed
+// columnarized segment whose own schema lacks a field -- the normal state while a schema change
+// converges -- is exactly the case it got wrong.
+func (c *Collection) attrLookup(id uint32) fieldLookup {
 	if c.inline {
 		if name, ok := c.intern.Name(id); ok {
-			return func(a wire.Ad) ([]byte, bool) { return a.LookupByName(name) }
+			return func(d *segDictHandle, a wire.Ad) ([]byte, bool) { return c.wireLookupDict(d, a, name) }
 		}
 	}
-	return func(a wire.Ad) ([]byte, bool) { return a.Lookup(id) }
+	return func(_ *segDictHandle, a wire.Ad) ([]byte, bool) { return a.Lookup(id) }
 }
 
 // resolveStatsFields maps the aggregated field and every predicated field into this SEGMENT's schema.
@@ -335,8 +347,8 @@ func resolveStatsFields(cs *colSegment, aggID uint32, preds []fieldPred) (int, [
 
 // bruteStatsMulti is the row fallback: walk a window's visible records, test the predicated
 // attributes, and accumulate the aggregated one -- reading only those attributes from the wire ad.
-func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.Ad) ([]byte, bool),
-	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, acc *statsAccum) bool {
+func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup fieldLookup,
+	preds []fieldPred, lookups []fieldLookup, selfOK func(float64) bool, acc *statsAccum) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -354,7 +366,7 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.
 				ad := wire.Ad(ww)
 				match := true
 				for i := range preds {
-					node, found := lookups[i](ad)
+					node, found := lookups[i](w.dict(), ad)
 					if !found {
 						match = false
 						break
@@ -369,7 +381,7 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup func(wire.
 					}
 				}
 				if match {
-					if node, found := aggLookup(ad); found {
+					if node, found := aggLookup(w.dict(), ad); found {
 						if isExprNode(node) {
 							return false
 						}

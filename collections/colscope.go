@@ -51,6 +51,12 @@ type colScope struct {
 	// only escaped SCHEMA fields, so a miss there means the attribute is in the record rather than
 	// absent, and the record has to be read.
 	schemaOnly bool
+	// remnants is the current segment's remnant-name list (colRemnantTrailer), nil when its payload
+	// predates the list or it is not columnarized. namesInterned says every attribute name any record
+	// of the current segment holds is in the intern table, so a name the table lacks is in none of
+	// them. Both are set per segment by setGroups.
+	remnants      *remnantSet
+	namesInterned bool
 
 	// bind caches name -> schema field index for the schema in bindFor: -1 means "not a schema field"
 	// (it lives in the cold tail), -2 means the table has never seen the name. A query's references
@@ -129,18 +135,18 @@ func (cs *colScope) resolveAttr(name string, scope ast.AttributeScope) classad.V
 	}
 	idx := cs.bindField(name)
 	if idx == bindUnknown {
-		if cs.c.inline {
-			// NOT proof of absence on a persistent store. Its records carry attribute NAMES, and the
-			// intern table is rebuilt at every Open from what recovery happens to resolve -- schema
-			// fields, payload sections -- so an attribute that lives only in a columnarized segment's
-			// remnants is never interned after a restart. Answering undefined here dropped every
-			// sealed record from `MemoryUsage > 1` (an expression attribute, which always stays in
-			// the remnant) the moment the table was reopened: 46 of 4050 counted.
+		if cs.c.inline && !cs.namesInterned {
+			// Not proof of absence for this segment. A persistent store's records carry attribute
+			// NAMES, and the intern table is rebuilt at every Open from what recovery resolves, so a
+			// columnarized segment written without a remnant-name list can hold an attribute -- one
+			// living only in its remnants, such as an expression -- that was never interned after a
+			// restart. Answering undefined dropped every such record: `MemoryUsage > 1` counted 46 of
+			// 4050 after a reopen.
 			cs.fallBack()
 			return classad.NewUndefinedValue()
 		}
-		// An in-memory table interns every attribute its records hold, so a name it never interned
-		// is in no record. Exact, no fallback.
+		// Every name this segment's records hold is interned (see setGroups), so one the table lacks
+		// is in no record here. Exact, no fallback.
 		return classad.NewUndefinedValue()
 	}
 	if idx == bindColdTail {
@@ -220,9 +226,13 @@ func (cs *colScope) fromColdTail(id uint32) classad.Value {
 	}
 	if !found {
 		if cs.schemaOnly {
-			// The cold tail carries only escaped SCHEMA fields here; every other attribute stayed
-			// in the record. Absent from the block is therefore not absent from the ad, and
-			// answering "undefined" would be a wrong answer with a fast path in front of it.
+			// Absent from the block is not absent from the ad: a columnarized record keeps what the
+			// columns could not take (expressions, and in older payloads every non-schema attribute)
+			// in its remnant. The remnant-name list settles it without reading the record -- an
+			// attribute no remnant of this segment holds is undefined here, exactly.
+			if cs.remnants != nil && !cs.remnants.has(id) {
+				return classad.NewUndefinedValue()
+			}
 			cs.fallBack()
 			return classad.NewUndefinedValue()
 		}

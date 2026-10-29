@@ -119,7 +119,7 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 		}
 		return true
 	}
-	lookups := make([]func(wire.Ad) ([]byte, bool), len(otherPreds))
+	lookups := make([]fieldLookup, len(otherPreds))
 	for i, p := range otherPreds {
 		lookups[i] = c.attrLookup(p.fieldID)
 	}
@@ -235,8 +235,8 @@ func (c *Collection) TopKOrderThreshold(q *vm.Query, orderAttr string, desc bool
 // bruteTopK is the row fallback for a window whose schema lacks the order/predicate fields, and for
 // the active segment: walk its visible records, test the predicates, and offer the order value --
 // reading only those attributes from the wire, never a full decode. Mirrors bruteStatsMulti.
-func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) ([]byte, bool),
-	preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool), selfOK func(float64) bool, tk *topKKeep, stats *ScanStats) bool {
+func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup fieldLookup,
+	preds []fieldPred, lookups []fieldLookup, selfOK func(float64) bool, tk *topKKeep, stats *ScanStats) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -256,7 +256,7 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 				ad := wire.Ad(ww)
 				match := true
 				for i := range preds {
-					node, found := lookups[i](ad)
+					node, found := lookups[i](w.dict(), ad)
 					if !found {
 						match = false
 						break
@@ -271,7 +271,7 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup func(wire.Ad) (
 					}
 				}
 				if match {
-					if node, found := aggLookup(ad); found {
+					if node, found := aggLookup(w.dict(), ad); found {
 						if isExprNode(node) {
 							return false
 						}

@@ -45,6 +45,12 @@ type colSegment struct {
 	// when the collection carries no group schemas.
 	groups []*colGroup
 
+	// remnants is, for a columnarized segment's payload, every top-level attribute name its records
+	// (the remnants) hold, resolved to this process's intern ids -- nil when the payload predates the
+	// list (see colRemnantTrailer). With it, an attribute that is in neither the columns nor this set
+	// is in no record of the segment, which is an exact answer; without it the remnant has to be read.
+	remnants *remnantSet
+
 	// For a columnarized segment's payload only (see bindNative): the collection and the arena the
 	// remnants live in, and the lazily built index of the schema-field cells those remnants still
 	// hold (colheld.go). nil on a sidecar payload, whose blocks hold every value they describe.

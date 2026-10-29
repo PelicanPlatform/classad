@@ -381,6 +381,11 @@ func appendColSegment(dst []byte, cs *colSegment, nameOf func(uint32) (string, b
 			dst = appendColBlock(dst, gb.blk)
 		}
 	}
+	// The remnant-name trailer goes last, after everything an older build parses (see
+	// colRemnantTrailer). Only a columnarized segment's payload carries one.
+	if cs.remnants != nil {
+		dst = appendRemnantTrailer(dst, cs.remnants.names)
+	}
 	return dst
 }
 
@@ -684,7 +689,77 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	if c.err != nil {
 		return nil
 	}
+	// Anything after the group section is the remnant-name trailer or nothing: an older payload ends
+	// exactly here. A malformed trailer drops only the trailer -- the segment then reads as one that
+	// predates it, which is correct, only slower.
+	cs.remnants = readRemnantTrailer(c.b[c.i:], internName)
 	return cs
+}
+
+// colRemnantTrailer marks the remnant-name trailer of a columnarized segment's payload: the magic,
+// the name count, then each name as (u32 length, bytes). It lists every top-level attribute name the
+// segment's records hold once the columns have taken theirs.
+//
+// WHY. A column reader resolving an attribute that is not a column of this segment cannot tell from
+// the payload whether a record holds it: a columnarized record's remnant is not in the block. Asking
+// the record is the per-record fallback. And the global intern table is no proxy for "some record has
+// it" -- a persistent store's records carry names, which are not interned at Open, so after a restart
+// an attribute that lives only in remnants (an expression, which never moves into a column) is missing
+// from the table while every record holds it. With this list the absence is exact per segment: not a
+// column and not listed means no record of this segment has the attribute.
+//
+// WHY A TRAILER and not a payload version. An older build parses the payload up to the end of the
+// group section and ignores what follows, so it reads a payload with a trailer exactly as before, and
+// a store written by this build still opens under the previous one. A version bump would have made it
+// refuse the store. The magic keeps the trailer unambiguous: a payload without one ends at the group
+// section, so the bytes there are either this magic or nothing.
+const colRemnantTrailer = 0x4d4e4d52 // "RMNM" on disk (little-endian)
+
+// remnantSet is a decoded remnant-name trailer: the names as written, and their intern ids.
+type remnantSet struct {
+	names []string
+	ids   map[uint32]struct{}
+}
+
+// has reports whether some record of the segment holds attribute id outside the columns.
+func (r *remnantSet) has(id uint32) bool {
+	_, ok := r.ids[id]
+	return ok
+}
+
+func appendRemnantTrailer(dst []byte, names []string) []byte {
+	dst = appendU32(dst, colRemnantTrailer)
+	dst = appendU32(dst, uint32(len(names)))
+	for _, n := range names {
+		dst = appendBytes(dst, []byte(n))
+	}
+	return dst
+}
+
+// readRemnantTrailer decodes a trailer from rest (the bytes after the group section), interning every
+// name, or returns nil when there is none or it does not parse. Names are read before any is interned,
+// so a torn trailer leaves nothing in the intern table.
+func readRemnantTrailer(rest []byte, internName func(string) uint32) *remnantSet {
+	c := &cursor{b: rest}
+	if len(rest) < 8 || c.u32() != colRemnantTrailer {
+		return nil
+	}
+	n := int(c.u32())
+	if n < 0 || n > 1<<20 || c.err != nil {
+		return nil
+	}
+	names := make([]string, 0, n)
+	for range n {
+		names = append(names, string(c.bytes()))
+	}
+	if c.err != nil || c.i != len(rest) {
+		return nil
+	}
+	r := &remnantSet{names: names, ids: make(map[uint32]struct{}, n)}
+	for _, nm := range names {
+		r.ids[internName(nm)] = struct{}{}
+	}
+	return r
 }
 
 // packU32s encodes a uint32 slice as packed little-endian bytes -- the form colSegment.offsB and a

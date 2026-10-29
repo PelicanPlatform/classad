@@ -193,15 +193,9 @@ func (c *Collection) numPredsOnFields(q *vm.Query, s *adSchema) ([]fieldPred, bo
 // by a row walk that reads only the predicated attributes -- not by decoding the ad. So a schema
 // change never costs more than the segments it actually affects.
 func (c *Collection) schemaScanCountMulti(preds []fieldPred, bc *blockCache) (int, bool) {
-	lookups := make([]func(wire.Ad) ([]byte, bool), len(preds))
+	lookups := make([]fieldLookup, len(preds))
 	for i, p := range preds {
-		id := p.fieldID
-		lookups[i] = func(a wire.Ad) ([]byte, bool) { return a.Lookup(id) }
-		if c.inline {
-			if name, ok := c.intern.Name(id); ok {
-				lookups[i] = func(a wire.Ad) ([]byte, bool) { return a.LookupByName(name) }
-			}
-		}
+		lookups[i] = c.attrLookup(p.fieldID)
 	}
 	count := 0
 	var cand candSet
@@ -452,7 +446,7 @@ func narrowByScan(blk *columnarBlock, idx int, isReal bool, p fieldPred, bc *blo
 //
 // ok=false when a predicated attribute holds an expression: comparing it needs evaluating it, which
 // only the general scan does, and skipping it would undercount.
-func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, lookups []func(wire.Ad) ([]byte, bool)) (int, bool) {
+func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, lookups []fieldLookup) (int, bool) {
 	count := 0
 	var buf []byte
 	for off := 0; off < w.used; {
@@ -470,7 +464,7 @@ func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, l
 				buf = ww
 				ok := true
 				for i := range preds {
-					node, found := lookups[i](wire.Ad(ww))
+					node, found := lookups[i](w.dict(), wire.Ad(ww))
 					if !found {
 						ok = false
 						break
