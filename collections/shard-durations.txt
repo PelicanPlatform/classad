@@ -12,6 +12,7 @@
 0.0 TestAdSchemaRoundTripOSPool
 0.0 TestAdSchemaRoundTripSynthetic
 0.0 TestAddDropSemantics
+0.3 TestAddIndexSkipsSealedAttrs
 0.0 TestAllDefinedFastPathMatchesGeneral
 0.0 TestAppendNodeTextInlineMatchesString
 0.0 TestAppendNodeTextMatchesString
@@ -551,6 +552,7 @@
 0.2 TestQueryFastPathTransitive
 0.0 TestQueryMatches
 0.0 TestQueryProject
+0.4 TestQueryProjectInternedSegments
 0.0 TestQueryProjectMatchesQuery
 0.1 TestQueryServesCorruptAdWithoutVerification
 0.2 TestRangeBandExplain
@@ -664,11 +666,13 @@
 5.7 TestSealWalkWork
 0.2 TestSealedIndexBackings
 0.0 TestSealedOpensWithTheKey
+1.6 TestSealedParentValueDictSegmentParity
 0.1 TestSealedProbeOracle
 0.0 TestSealedRedactYieldsUndefinedNotFailure
 0.5 TestSealedSegmentsGoAnonMmap
 2.6 TestSealedSegmentsGoMmap
 0.0 TestSealedStrictStillFailsAndSaysWhy
+30.6 TestSealedValueDictSegmentParity
 0.0 TestSegDictEmpty
 8.2 TestSegDictFallsBackToWalkOnOldSidecar
 21.5 TestSegDictHintMatchesWalk

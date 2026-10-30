@@ -22,6 +22,12 @@ import (
 // on strings is the common case and categorical also serves it). The new indexes
 // take effect for existing segments on the next Reindex; new segments pick them up
 // when they are first indexed.
+//
+// An attribute the collection seals at rest (EncryptedAttrs, or private, with encryption
+// on) is skipped, as Open refuses it and SetEncryptedAttrs refuses to seal an indexed one:
+// the index builds from the stored value, which for a sealed attribute is the ciphertext,
+// so every record would be a candidate and the index would cost memory and answer nothing.
+// Building it from the plaintext instead would write the secret into the sidecar on disk.
 func (c *Collection) AddIndex(categorical, value []string) bool {
 	return c.addIndex(categorical, value, false)
 }
@@ -33,6 +39,7 @@ func (c *Collection) addIndexAuto(categorical, value []string) bool {
 }
 
 func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
+	categorical, value = c.withoutSealed(categorical), c.withoutSealed(value)
 	for {
 		cur := c.spec.Load()
 		next := cur.clone()
@@ -95,6 +102,20 @@ func (c *Collection) addIndex(categorical, value []string, auto bool) bool {
 			return true
 		}
 	}
+}
+
+// withoutSealed returns names without the attributes this collection seals at rest (see AddIndex).
+func (c *Collection) withoutSealed(names []string) []string {
+	if c.sealer == nil {
+		return names
+	}
+	out := names[:0:0]
+	for _, n := range names {
+		if !c.shouldEncrypt(n) {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // DropIndex removes the given attributes from the configured indexes (categorical
