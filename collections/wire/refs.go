@@ -264,16 +264,17 @@ func refAdBodyNames(c *cursor, depth int, dst [][]byte) [][]byte {
 type NodeRefs struct {
 	IDs   []uint32 // interned-id references (nAttrRef), unscoped or MY.
 	Names [][]byte // inline-name references (nAttrRefStr), unscoped or MY.; sub-slices of the node
-	// Sealed reports that the node holds a sealed value, whose plaintext may refer to anything.
-	// Whether that matters is the caller's question: a reader that opens sealed values and
-	// follows their references must treat the set as incomplete, one that does not need not.
+	// Sealed reports that the node holds a sealed value. The walk cannot see its plaintext and
+	// contributes nothing for it: by the encryption-at-rest contract a sealed value refers to no
+	// other attribute, and no reader follows a reference inside one. It is reported for a caller
+	// that wants to know a sealed value was there, not because the set is incomplete.
 	Sealed bool
 }
 
 // AppendNodeRefsExact appends node's unscoped and MY. references to r and reports whether the set
 // is complete. It is not complete when the node calls eval(), whose string argument names an
-// attribute only at run time, or when it does not parse. A sealed value, whose plaintext the walk
-// cannot see, sets r.Sealed and contributes nothing. inline is the enclosing ad's key encoding, which a nested record
+// attribute only at run time, or when it does not parse. A sealed value, which by contract refers to
+// nothing, sets r.Sealed and contributes nothing. inline is the enclosing ad's key encoding, which a nested record
 // literal's members share. isEval reports whether an interned function-name id is eval; nil means
 // no interned id is (an inline-keyed ad names its functions inline).
 //

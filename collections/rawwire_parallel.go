@@ -148,8 +148,7 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 							return true
 						}
 						nw := c.narrowProjected(&narrow, sel, dict, w)
-						out, ok := asm.appendRow(batch.buf,
-							wire.Ad(c.wireToInlineRead(dict, nw, sel.redact)), needed, seal)
+						out, ok := asm.appendRowConverted(batch.buf, dict, nw, needed, seal)
 						if !ok {
 							batch.buf = out[:start]
 							return true

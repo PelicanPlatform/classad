@@ -106,8 +106,7 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 		// and the assembler below take the key only when the reader is entitled to it: an
 		// inline segment converts nothing, so for that case the assembler's key is the ONLY
 		// thing standing between a redacted read and a sealed value.
-		w = c.wireToInlineRead(dict, w, sel.redact)
-		out, ok := asm.appendRow(scratch[:0], wire.Ad(w), needed, c.renderKey(sel.redact))
+		out, ok := asm.appendRowConverted(scratch[:0], dict, w, needed, c.renderKey(sel.redact))
 		scratch = out
 		if !ok {
 			return true // malformed (or unresolvable) record: skip, keep scanning

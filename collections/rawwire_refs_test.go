@@ -327,56 +327,6 @@ func TestQueryRawWireRefsParallelMatchesSerial(t *testing.T) {
 	}
 }
 
-// TestNarrowAdRefsKeepsSealedRecordsWhole: the id-space narrowing cannot read a sealed node's
-// references, and the assembler DOES open it -- so narrowing a record holding one would risk
-// dropping an attribute the opened expression refers to. It hands such a record on whole.
-func TestNarrowAdRefsKeepsSealedRecordsWhole(t *testing.T) {
-	key := make([]byte, 32)
-	for i := range key {
-		key[i] = byte(i + 3)
-	}
-	c, err := Open(Options{Dir: t.TempDir(), Shards: 1, SegmentSize: 1 << 16,
-		DataKey: key, EncryptedAttrs: []string{"Secret"}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer c.Close()
-	for i := 0; i < 3000; i++ {
-		ad := fmt.Sprintf(`[ MyType="Job"; ClusterId=%d; Threshold=%d; Secret = (Threshold > 1); Note="n%d" ]`, i, i%3, i)
-		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), mustAd(t, ad)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := c.RetrainDict(3000); err != nil {
-		t.Fatal(err)
-	}
-	c.Reindex()
-	interned := 0
-	for _, sh := range c.shards {
-		sh.mu.RLock()
-		for _, s := range sh.segs {
-			if s != nil && s.used > 0 && s.dict.Load() != nil {
-				interned++
-			}
-		}
-		sh.mu.RUnlock()
-	}
-	if interned == 0 {
-		t.Fatal("no interned segment: the id-space narrowing this test is about never ran")
-	}
-	rows := 0
-	for row := range c.QueryRawWireRefs(mustParseQ(t, "true"), []string{"ClusterId", "Secret"}, false) {
-		m := wireRowMap(t, row)
-		if _, ok := m["Threshold"]; !ok {
-			t.Fatalf("the sealed expression's reference was narrowed away: %v", sortedKeys(m))
-		}
-		rows++
-	}
-	if rows != 3000 {
-		t.Fatalf("got %d rows, want 3000", rows)
-	}
-}
-
 // TestAppendAdSubsetInlineRefsNeedsAnEarlierPass: the referenced attribute sits BEFORE the
 // expression that names it, so a single forward pass cannot find it. Built at the wire level
 // so the repetition is pinned where it lives rather than through a whole store.

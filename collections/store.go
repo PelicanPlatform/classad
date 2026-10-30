@@ -325,6 +325,14 @@ type Options struct {
 	// (CategoricalAttrs/ValueAttrs) -- New panics on overlap -- since its value is
 	// opaque at rest. The set can be changed at runtime via the toggle meta-command;
 	// existing records keep their prior form until MigrateSealedAttrs rewrites them.
+	//
+	// An encrypted attribute's value must not depend on other attributes: it should be a
+	// literal -- a token or a secret string, as every private attribute is. Reads rely on
+	// this and treat a sealed value as referring to nothing: a reference inside one is not
+	// followed by the projections that close over references (QueryRawProjected with
+	// chaseRefs, QueryRawWireRefs), nor by the narrowed or partial decode a query is
+	// evaluated on, so such a value is evaluated as if the attributes it names were absent
+	// unless the read loaded them for another reason.
 	EncryptedAttrs []string
 
 	// TimeTravel, if non-nil, enables point-in-time ("AS OF") queries: superseded
@@ -1787,6 +1795,11 @@ func matchWire(w []byte, qp queryPlan) bool {
 // argument names an attribute only when it runs: the static references cannot
 // say what it reads, so the partial ad may lack it and is not a stand-in for the
 // whole one.
+//
+// A sealed attribute is decoded (opened) for its value, but its references are
+// not followed: a sealed value refers to no other attribute by the encryption-at-
+// rest contract, and the narrowed match (adClosed) and the projections stop at one
+// too, so following them here would make the plain match disagree with those.
 func partialDecodeWire(ctx wireCtx, dict *segDictHandle, w []byte, seeds []string) (ad *classad.ClassAd, complete bool) {
 	a := wire.Ad(w)
 	out := classad.New()
@@ -1809,6 +1822,9 @@ func partialDecodeWire(ctx wireCtx, dict *segDictHandle, w []byte, seeds []strin
 			continue
 		}
 		out.Insert(name, expr)
+		if wire.IsEncryptedNode(node) {
+			continue
+		}
 		refs, safe := vm.SelfRefsSafe(expr)
 		if !safe {
 			return out, false

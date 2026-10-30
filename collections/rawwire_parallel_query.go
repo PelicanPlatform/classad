@@ -3,8 +3,6 @@ package collections
 import (
 	"sync"
 	"sync/atomic"
-
-	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // wireQueryFanouts counts the constrained wire reads that actually fanned out.
@@ -128,8 +126,7 @@ func (c *Collection) runParallelWireQuery(qp queryPlan, sel *wireSubsetSelector,
 			emit := func(w []byte, dict *segDictHandle) bool {
 				start := len(batch.buf)
 				w = c.narrowProjected(&narrow, sel, dict, w)
-				w = c.wireToInlineRead(dict, w, sel.redact)
-				out, ok := asm.appendRow(batch.buf, wire.Ad(w), needed, seal)
+				out, ok := asm.appendRowConverted(batch.buf, dict, w, needed, seal)
 				if !ok {
 					batch.buf = out[:start] // discard the partial append
 					return true             // not an inline ad / malformed: skip, keep scanning

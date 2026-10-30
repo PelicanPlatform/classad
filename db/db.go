@@ -201,7 +201,8 @@ type Config struct {
 	PoolKeys []KEK
 	// EncryptedAttrs names the attributes whose values are sealed at rest (case-
 	// insensitive). Only meaningful with PoolKeys set. An encrypted attribute may not
-	// also be indexed. See collections.Options.EncryptedAttrs.
+	// also be indexed, and its value must not refer to other attributes: reads do not
+	// follow a reference inside a sealed value. See collections.Options.EncryptedAttrs.
 	EncryptedAttrs []string
 
 	// QueryParallelism is collections.Options.QueryParallelism: 0 auto, 1 serial, N>=2 a
@@ -860,7 +861,8 @@ func (db *DB) RefreshHotSet(sampleMax, topN int) int {
 // is disabled or a named attribute is indexed. The policy is persisted so it survives a
 // restart and, in HA, lets a follower converge on reload. New writes seal the new set;
 // existing records are sealed by the migration the next open runs (see
-// collections.MigrateSealedAttrs) -- compaction copies stored values as they are.
+// collections.MigrateSealedAttrs) -- compaction copies stored values as they are. The
+// named attributes' values must not refer to other attributes (see Config.EncryptedAttrs).
 func (db *DB) SetEncryptedAttrs(attrs []string) error {
 	if err := db.c.SetEncryptedAttrs(attrs); err != nil {
 		return err

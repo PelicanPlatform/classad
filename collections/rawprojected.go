@@ -83,9 +83,6 @@ func (c *Collection) rawProjPlan(projection []string, chaseRefs bool) *projPlan 
 	proj := c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
 	if proj != nil {
 		proj.closure = chaseRefs
-		// The projector follows references in the stored nodes only (wire.AppendNodeRefNames and
-		// AppendNodeRefIDs see nothing inside a sealed value), so a sealed attribute ends a closure.
-		proj.sealedOpaque = true
 	}
 	return proj
 }
