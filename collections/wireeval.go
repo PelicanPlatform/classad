@@ -9,10 +9,18 @@ import (
 // wireCtx supplies the mode-aware wire touchpoints (interned-id vs inline-name
 // attribute lookup and decode) that wire-native matching needs. Both *Collection
 // and *Archive implement it, so they share one match path (matchWire).
+//
+// The dict-aware decoders belong to the context, not to free functions over a segment's resolver,
+// because only the context holds the key that opens a sealed value. An interned segment of an
+// encrypted collection carries sealed value nodes just as an inline one does, and a decode that
+// resolved its ids without the key failed on every sealed value -- read as absent, so a filter on
+// a sealed attribute silently dropped every record stored in an interned segment.
 type wireCtx interface {
 	decodeWire(w []byte) (*ast.ClassAd, error)
 	wireLookup(a wire.Ad, name string) ([]byte, bool)
 	decodeNode(node []byte) (ast.Expr, error)
+	decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error)
+	decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr, error)
 }
 
 // wireScope resolves attribute references directly from an ad's wire bytes for
@@ -52,18 +60,14 @@ func wireLookupDictCtx(ctx wireCtx, dict *segDictHandle, a wire.Ad, name string)
 	return ctx.wireLookup(a, name)
 }
 
+// decodeNodeDictCtx and decodeWireDictCtx open sealed values with the context's key whichever
+// layout the record is in (see wireCtx).
 func decodeNodeDictCtx(ctx wireCtx, dict *segDictHandle, node []byte) (ast.Expr, error) {
-	if dict != nil {
-		return wire.DecodeNodeResolve(node, dict.resolve)
-	}
-	return ctx.decodeNode(node)
+	return ctx.decodeNodeDict(dict, node)
 }
 
 func decodeWireDictCtx(ctx wireCtx, dict *segDictHandle, w []byte) (*ast.ClassAd, error) {
-	if dict != nil {
-		return wire.DecodeResolve(w, dict.resolve)
-	}
-	return ctx.decodeWire(w)
+	return ctx.decodeWireDict(dict, w)
 }
 
 // resolve is the attribute resolver handed to vm.Matcher.EvalResolved.

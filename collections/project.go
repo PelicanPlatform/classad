@@ -103,7 +103,11 @@ func (c *Collection) projectInto(rs *wireScope, w []byte, attrs []string, out []
 		}
 	}
 	if needDecode {
-		if a, err := c.decodeWire(w); err == nil {
+		// Through the record's segment dictionary, with the collection's key: an interned record is
+		// keyed by that segment's local ids, which the collection-wide decode cannot read -- it failed,
+		// and every attribute of the row came back ERROR -- and a sealed value has to be opened to be
+		// evaluated, as it is in an inline segment.
+		if a, err := c.decodeWireDict(rs.dict, w); err == nil {
 			full := classad.FromAST(a)
 			for i, name := range attrs {
 				out[i] = full.EvaluateAttr(name)
