@@ -156,6 +156,18 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	if len(blocks) == 0 || len(offs) == 0 {
 		return nil, nil, nil
 	}
+	// Every data record handed to the build has to come out of it. The build passes over a record it
+	// cannot read or canonicalize -- one that does not decompress, or one toInterned refuses, such as
+	// an inline-keyed record in an interned segment -- and the rewrite below carries forward only the
+	// records the build kept, so a record passed over would vanish from the table rather than fail to
+	// read. Refuse instead: the original segment stays, and its records read as they did.
+	fed := len(recolOffs)
+	if !fromWires {
+		fed = dataRecordCount(src, skipDelta)
+	}
+	if len(offs) != fed {
+		return nil, nil, nil
+	}
 	if len(skips) != len(offs) {
 		// The remnant pass indexes skips by record position, so the two passes must have seen the
 		// same records in the same order. Refuse rather than strip by a misaligned index, which
@@ -371,6 +383,29 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	return dst, srcOffs, newOffs
 }
 
+// dataRecordCount counts the records buildColumnarFromSegmentGrouped is handed from src: every record
+// outside a damaged span that is not a marker and that skip does not exclude.
+func dataRecordCount(src *segment, skip func(uint32) bool) int {
+	n := 0
+	dm := src.damaged()
+	for off := 0; off < src.used; {
+		o := uint32(off)
+		if end, ok := dm.skip(o); ok {
+			off = int(end)
+			continue
+		}
+		total := recTotalLen(src.data, o)
+		if total == 0 {
+			break
+		}
+		if !recIsMarker(src.data, o) && (skip == nil || !skip(o)) {
+			n++
+		}
+		off += int(total)
+	}
+	return n
+}
+
 // colWriteRemnantList is a test seam: false writes payloads without the remnant-name trailer, the
 // shape every segment columnarized before it existed has, so a test can build the mixed store an
 // upgraded table holds. Production leaves it true.
@@ -537,8 +572,7 @@ func stripSchemaAttrs(w []byte, covered func(id uint32, name string, node []byte
 	}
 	var entries []byte
 	kept := 0
-	bad := false
-	wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
+	if !wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
 		if covered(id, name, node) {
 			return true // the column holds it now
 		}
@@ -546,9 +580,8 @@ func stripSchemaAttrs(w []byte, covered func(id uint32, name string, node []byte
 		entries = append(entries, node...)
 		kept++
 		return true
-	})
-	if bad {
-		return nil, false
+	}) {
+		return nil, false // a malformed record: a remnant built from part of it would be short
 	}
 	return wire.BuildAd(nil, hdr, kept, entries), true
 }
@@ -562,7 +595,7 @@ func keepAttrs(w []byte, keep func(id uint32, name string, node []byte) bool) ([
 	}
 	var entries []byte
 	n := 0
-	wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
+	if !wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
 		if !keep(id, name, node) {
 			return true
 		}
@@ -570,7 +603,9 @@ func keepAttrs(w []byte, keep func(id uint32, name string, node []byte) bool) ([
 		entries = append(entries, node...)
 		n++
 		return true
-	})
+	}) {
+		return nil, false
+	}
 	return wire.BuildAd(nil, hdr, n, entries), true
 }
 

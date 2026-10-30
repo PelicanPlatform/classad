@@ -47,7 +47,7 @@ func narrowAd(sc *narrowScratch, w []byte, keep func(id uint32, name string) boo
 	}
 	sc.entries = sc.entries[:0]
 	n := 0
-	wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
+	if !wire.Ad(w).ForEachRaw(func(id uint32, name string, node []byte) bool {
 		if !keep(id, name) {
 			return true
 		}
@@ -55,7 +55,9 @@ func narrowAd(sc *narrowScratch, w []byte, keep func(id uint32, name string) boo
 		sc.entries = append(sc.entries, node...)
 		n++
 		return true
-	})
+	}) {
+		return nil, false // the entries stop short: what was kept is not the record narrowed
+	}
 	sc.out = wire.BuildAd(sc.out[:0], hdr, n, sc.entries)
 	return sc.out, true
 }

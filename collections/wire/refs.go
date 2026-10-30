@@ -20,8 +20,11 @@ import (
 // node is opaque and contributes nothing. Returns dst unchanged (beyond any
 // partial appends) with no error indication on a malformed node -- the caller's
 // subsequent render of the same bytes surfaces the corruption.
+//
+// node must come from an interned (id-keyed) ad, the only kind whose references are
+// ids: a nested record literal's members are keyed the way the enclosing ad is.
 func AppendNodeRefIDs(node []byte, dst []uint32) []uint32 {
-	c := &cursor{b: node, ok: true}
+	c := &cursor{b: node, ok: true, inline: false}
 	return refNode(c, 0, dst)
 }
 
@@ -38,8 +41,13 @@ func AppendNodeRefIDs(node []byte, dst []uint32) []uint32 {
 // Same superset semantics as AppendNodeRefIDs: nested record members are included even
 // though member resolution could shadow them, duplicates are appended as-is, and an
 // encrypted node contributes nothing.
+//
+// A nested record literal's members are keyed the way the enclosing ad's attributes are,
+// so they are inline names here. Walking them as ids misreads the first member's name as
+// its value and stops the walk there, losing every reference the node makes from that
+// point on -- including ones outside the record, such as Baz in `[a = Foo].a + Baz`.
 func AppendNodeRefNames(node []byte, dst [][]byte) [][]byte {
-	c := &cursor{b: node, ok: true}
+	c := &cursor{b: node, ok: true, inline: true}
 	return refNodeNames(c, 0, dst)
 }
 
@@ -237,8 +245,7 @@ func refNodeNames(c *cursor, depth int, dst [][]byte) [][]byte {
 	return dst
 }
 
-// refAdBody walks a nested record body ([hotCount][hot][attrCount][key+node]*),
-// collecting references from each member's value node.
+// refAdBodyNames is refAdBody for an inline-keyed ad's nested record body.
 func refAdBodyNames(c *cursor, depth int, dst [][]byte) [][]byte {
 	if !c.ok || depth > maxDepth {
 		c.ok = false
