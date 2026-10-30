@@ -512,7 +512,7 @@ func (s *adSchema) encodeExceptLocal(w wire.Ad, skip map[uint32]struct{}, toLoca
 
 // forEach yields every attribute of a schema record as (id, wire node), reconstructing a node
 // for each non-escaped field and replaying the cold tail. Returns false if the record is
-// malformed or fn stopped early.
+// malformed; fn stopping early still returns true.
 func (s *adSchema) forEach(rec []byte, fn func(id uint32, node []byte) bool) bool {
 	return s.forEachKeyed(rec, func(id uint32, node []byte, _ bool) bool { return fn(id, node) })
 }

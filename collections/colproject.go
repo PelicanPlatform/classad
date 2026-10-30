@@ -244,8 +244,9 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 	}
 	if inline && sd != nil {
 		// An inline-keyed record in an interned segment: its cold-tail entries are keyed by the
-		// segment dictionary, and an inline key needs a name the reassembly would look up in a table
-		// those ids do not belong to. There is no faithful narrowed form of that; reassemble.
+		// segment dictionary, not by this process's ids, and the cold-tail walk below names an inline
+		// record's entries through the latter. The reassembly names them through the dictionary; leave
+		// the record to it.
 		return nil, false
 	}
 

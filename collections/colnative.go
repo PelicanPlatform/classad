@@ -392,7 +392,7 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 	added := 0
 	bad := false
 	sd := cn.dict
-	blk.schema.forEachKeyed(rec, func(id uint32, node []byte, fromCold bool) bool {
+	whole := blk.schema.forEachKeyed(rec, func(id uint32, node []byte, fromCold bool) bool {
 		name := ""
 		out := id
 		if fromCold && sd == nil {
@@ -406,7 +406,27 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 			// which is the record's own key space, so they are emitted exactly as stored.
 			id = blk.remap.current(id)
 		}
-		if sd != nil && !fromCold {
+		switch {
+		case inline:
+			// An inline record is keyed by name, so each id is named through the table it belongs
+			// to. A schema field's id is this process's; a cold-tail id is too, once remapped above,
+			// unless the segment has a dictionary -- the payload keys its cold tail by that dictionary
+			// whatever the key encoding of the record it came from, so an inline record in an
+			// interned segment is named through the dictionary. Naming it through this process's
+			// table instead would emit it under whatever attribute holds that number here.
+			var nm string
+			var ok bool
+			if fromCold && sd != nil {
+				nm, ok = sd.resolve(id)
+			} else {
+				nm, ok = c.intern.Name(id)
+			}
+			if !ok {
+				bad = true
+				return false
+			}
+			name = nm
+		case sd != nil && !fromCold:
 			// A SCHEMA field's id belongs to this process and has to be translated into the record's.
 			// A COLD TAIL entry is already keyed by the segment dictionary -- translating it too looks
 			// up a local id in a global table, misses, and silently drops the whole record.
@@ -416,13 +436,6 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 				return false
 			}
 			out = lid
-		} else if inline {
-			nm, ok := c.intern.Name(id)
-			if !ok {
-				bad = true
-				return false
-			}
-			name = nm
 		}
 		extra = wire.AppendKey(extra, inline, out, name)
 		extra = append(extra, node...)
@@ -430,6 +443,14 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 		return true
 	})
 	putRecBuf(rec) // rec's nodes were copied into extra above; done with it
+	if !whole {
+		// The row did not parse to its end -- in practice a cold tail whose entries do not split.
+		// What came before the damage is in extra, so going on would return the ad short of every
+		// attribute after it, which no reader can tell from an ad that never had them. Counted, as
+		// a payload row that is missing outright is.
+		colNativeBadRows.Add(1)
+		return nil, errBadRemnant
+	}
 	if bad {
 		return nil, errBadRemnant
 	}
@@ -530,6 +551,15 @@ var colNativeRowMisses atomic.Int64
 // the record's remnant as a whole ad; a scan skips the record. Nonzero means a segment's payload does
 // not match its records.
 func ColNativeRowMisses() int64 { return colNativeRowMisses.Load() }
+
+// colNativeBadRows counts reads refused because the record's columnar row did not parse.
+var colNativeBadRows atomic.Int64
+
+// ColNativeBadRows reports how many record reads, since the process started, found the record's row
+// in its segment's columnar payload unparseable -- a cold tail whose entries do not split, say. Each
+// such read fails rather than return the part of the ad that preceded the damage; a scan skips the
+// record. Nonzero means a payload is corrupt in a way its checksum did not catch.
+func ColNativeBadRows() int64 { return colNativeBadRows.Load() }
 
 // colNativeUnsupported counts columnar payloads refused because a newer build wrote them.
 var colNativeUnsupported atomic.Int64

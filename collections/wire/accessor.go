@@ -487,7 +487,8 @@ func (a Ad) ForEachHot(fn func(id uint32, node []byte) bool) bool {
 	return true
 }
 
-// nodeBytesAt returns the node bytes starting at absolute offset off.
+// nodeBytesAt returns the node bytes starting at absolute offset off in an interned ad: its cursor
+// reads nested record keys as ids.
 func nodeBytesAt(a Ad, off int) ([]byte, bool) {
 	if off < 0 || off > len(a) {
 		return nil, false
@@ -615,14 +616,25 @@ func foldEqualBytes(b []byte, s string) bool {
 	return true
 }
 
-// skipNode advances c past exactly one node without allocating.
 // NodeLen returns the byte length of the single wire node at the start of b -- a scalar
 // literal (int/real/bool/string/undefined/error) or a computed expression (op/ref/list/
 // record/func). It lets a caller that stores concatenated uvarint(id)+node entries (e.g. the
 // per-segment schema's cold tail) split them without a separate length prefix. ok is false if
 // b does not begin with a well-formed node.
+//
+// b must come from an INTERNED (id-keyed) ad: a nested record literal's members are keyed the
+// way the enclosing ad's attributes are, and nothing in the node itself says which, so a node
+// from an inline-keyed ad is measured with NodeLenKeyed(b, true).
 func NodeLen(b []byte) (int, bool) {
-	c := &cursor{b: b, ok: true}
+	return NodeLenKeyed(b, false)
+}
+
+// NodeLenKeyed is NodeLen for a node from an ad of either key encoding: inline is the enclosing
+// ad's (flagInlineNames), which every nested record literal inside the node shares. Measuring an
+// inline-keyed node as id-keyed reads each member name's length as an id and the name's bytes as
+// the member's value, so a node holding a record literal comes back malformed or mis-sized.
+func NodeLenKeyed(b []byte, inline bool) (int, bool) {
+	c := &cursor{b: b, ok: true, inline: inline}
 	skipNode(c, 0)
 	if !c.ok {
 		return 0, false
@@ -630,6 +642,8 @@ func NodeLen(b []byte) (int, bool) {
 	return c.pos, true
 }
 
+// skipNode advances c past exactly one node without allocating. A nested record's member keys
+// are read in c's key encoding, so c must carry the enclosing ad's.
 func skipNode(c *cursor, depth int) {
 	if !c.ok {
 		return
