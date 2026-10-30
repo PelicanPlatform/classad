@@ -280,9 +280,15 @@ primary_expr
 		}
 	| '.' IDENTIFIER
 		{
-			// A leading-dot reference (".A") is a plain reference in the
-			// reference engine (".A" resolves identically to "A").
+			// ".A" is an absolute reference: the reference engine resolves it
+			// against the root ad (AttributeReference carries an `absolute`
+			// flag, and attrrefs.cpp selects state.rootAd over state.curAd),
+			// so it is NOT the same lookup as "A" inside a nested or chained
+			// ad. An explicit inner scope (".MY.A") keeps that scope.
 			name, scope := ParseScopedIdentifier($2)
+			if scope == ast.NoScope {
+				scope = ast.RootScope
+			}
 			$$ = ast.NewAttributeReference(name, scope)
 		}
 	| NEG INTEGER_LITERAL

@@ -598,6 +598,17 @@ func (e *Evaluator) evalNode(expr ast.Expr) Value {
 	}
 }
 
+// rootOf returns the outermost ad of ad's enclosing scope chain -- the root ad
+// an absolute (".attr") reference resolves against. The chain is the same one
+// an unscoped lookup walks; a top-level ad is its own root. A nil ad has no
+// root, and the caller resolves that to undefined.
+func rootOf(ad *ClassAd) *ClassAd {
+	for ad != nil && ad.parent != nil {
+		ad = ad.parent
+	}
+	return ad
+}
+
 func (e *Evaluator) evaluateAttributeReference(ref *ast.AttributeReference) Value {
 	if ref.NormalizedName() == currentTimeAttr {
 		return e.evaluateCurrentTime(ref)
@@ -682,6 +693,12 @@ func (e *Evaluator) resolveAttributeReference(ref *ast.AttributeReference) Value
 			return NewUndefinedValue()
 		}
 		return e.evalAttrIn(e.classad.parent, norm)
+	case ast.RootScope:
+		// .attr - the outermost ad of the enclosing scope chain, which is what
+		// the reference engine calls the root ad. No fallthrough: an absolute
+		// reference names one ad, so a miss there is undefined rather than a
+		// walk back down it.
+		return e.evalAttrIn(rootOf(e.classad), norm)
 	default:
 		// Unscoped: search the current ad, then up the enclosing (parent) scope
 		// chain, matching the reference engine. The chain is established by the
@@ -1714,6 +1731,8 @@ func (e *Evaluator) evaluateUnparse(args []ast.Expr) Value {
 		if e.classad != nil {
 			targetClassAd = e.classad.parent
 		}
+	case ast.RootScope:
+		targetClassAd = rootOf(e.classad)
 	default:
 		targetClassAd = e.classad
 	}
