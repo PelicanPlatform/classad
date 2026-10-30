@@ -62,11 +62,11 @@ type projPlan struct {
 	// relay it. Such a plan is still used, but each projected record is checked for being
 	// closed (adClosed) and reassembled when it is not.
 	closure bool
-	// sealedOpaque marks a plan whose consumer never looks inside a sealed value for references:
-	// the text projection renders a sealed value but follows only references it can see in the
-	// stored node, so a sealed node leads its closure nowhere. Every other reader -- the matcher,
-	// the wire-row assembler -- opens it first, and a sealed node makes the record not closed.
-	sealedOpaque bool
+	// readsSealed marks a narrowed-match plan naming an attribute the collection seals. Matching
+	// on such a record opens the sealed value (a decrypt and a partial decode), which makes the
+	// narrowed match dearer than the column conjuncts the scan otherwise asks after it; see
+	// refVisitorState.
+	readsSealed bool
 }
 
 // newProjPlan resolves a projection for the scan, or returns nil when there is nothing to project.
@@ -413,10 +413,15 @@ type selfClosedScratch struct {
 // and not in w, and w is then not a stand-in.
 //
 // The reference walk must be COMPLETE, so it is wire.AppendNodeRefsExact: a node calling eval(), whose
-// argument names an attribute only at run time, makes w not closed, and so does one holding a sealed
-// value, whose plaintext may refer to anything -- unless p's consumer never opens it (sealedOpaque). So does a reference in the other key encoding than the record's, or an
-// entry keyed that way, which the walk cannot match against the record's keys. Each of those is the
-// safe answer: the caller reassembles.
+// argument names an attribute only at run time, makes w not closed. So does a reference in the other
+// key encoding than the record's, or an entry keyed that way, which the walk cannot match against the
+// record's keys. Each of those is the safe answer: the caller reassembles.
+//
+// A sealed value refers to nothing. Its plaintext cannot be read here, and an attribute is sealed
+// (EncryptedAttrs, or private) on the contract that its value does not depend on other attributes --
+// a token or a secret string. Every consumer holds to the same rule: none follows a reference inside
+// a sealed value (the text projection, the wire-row assembler and the partial match all stop at one),
+// so treating it as reference-free here keeps the closure computed and the closure consumed the same.
 //
 // p nil makes every entry a root and accepts no absent reference: whether the ad refers to nothing
 // outside itself at all.
@@ -490,11 +495,8 @@ func (c *Collection) adClosed(w []byte, p *projPlan, sd *segDictHandle, sc *self
 				continue
 			}
 			sc.done[i] = true
-			sc.refs.IDs, sc.refs.Names, sc.refs.Sealed = sc.refs.IDs[:0], sc.refs.Names[:0], false
+			sc.refs.IDs, sc.refs.Names = sc.refs.IDs[:0], sc.refs.Names[:0]
 			if !wire.AppendNodeRefsExact(sc.nodes[i], inline, &sc.refs, isEval) {
-				return false
-			}
-			if sc.refs.Sealed && (p == nil || !p.sealedOpaque) {
 				return false
 			}
 			if inline {

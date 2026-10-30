@@ -101,7 +101,8 @@ type CatalogConfig struct {
 	DisableReadVerification bool
 	// PoolKeys enables encryption at rest for every table (each table's master key is
 	// wrapped under these keys). EncryptedAttrs is the default explicit encrypted-attr
-	// set for each table (private attributes are always encrypted). See db/encrypt.go.
+	// set for each table (private attributes are always encrypted); its values must not
+	// refer to other attributes (see Config.EncryptedAttrs). See db/encrypt.go.
 	PoolKeys       []KEK
 	EncryptedAttrs []string
 

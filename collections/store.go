@@ -3,6 +3,7 @@ package collections
 import (
 	"iter"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -325,6 +326,14 @@ type Options struct {
 	// (CategoricalAttrs/ValueAttrs) -- New panics on overlap -- since its value is
 	// opaque at rest. The set can be changed at runtime via the toggle meta-command;
 	// existing records keep their prior form until MigrateSealedAttrs rewrites them.
+	//
+	// An encrypted attribute's value must not depend on other attributes: it should be a
+	// literal -- a token or a secret string, as every private attribute is. Reads rely on
+	// this and treat a sealed value as referring to nothing: a reference inside one is not
+	// followed by the projections that close over references (QueryRawProjected with
+	// chaseRefs, QueryRawWireRefs), nor by the narrowed or partial decode a query is
+	// evaluated on, so such a value is evaluated as if the attributes it names were absent
+	// unless the read loaded them for another reason.
 	EncryptedAttrs []string
 
 	// TimeTravel, if non-nil, enables point-in-time ("AS OF") queries: superseded
@@ -1483,6 +1492,19 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 				colDecided = true
 			}
 		}
+		// The column conjuncts are normally asked after the narrowed match (see below). A narrowed
+		// match that reads a sealed attribute is the exception: it opens the value for every record
+		// it decides, so the conjuncts, which read only columns, go first and spare it the records
+		// they reject.
+		conjAsked := false
+		if !colDecided && narrow != nil && narrow.readsSealed && prefilter != nil && prefilter.m == nil && inCols {
+			conjAsked = true
+			if prefilter.rejects(cn, k) {
+				qp.stats.columnDecided()
+				qp.stats.conjunctRejected()
+				return true
+			}
+		}
 		// Match on the record narrowed to what the query reads, when the columns could not decide:
 		// the record's columns, cold tail and remnant hold every attribute it has, so the few the
 		// query names can be gathered without rebuilding the rest. Exact only when the narrowed
@@ -1514,7 +1536,7 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		// for little more than these conjuncts cost, so asking them first only pays twice for the
 		// records they pass. Where it did not run -- a query it cannot serve, a record it could not
 		// use -- a rejection here still saves the reassembly.
-		if !colDecided && prefilter != nil && prefilter.m == nil && inCols && prefilter.rejects(cn, k) {
+		if !colDecided && !conjAsked && prefilter != nil && prefilter.m == nil && inCols && prefilter.rejects(cn, k) {
 			qp.stats.columnDecided()
 			qp.stats.conjunctRejected()
 			return true
@@ -1603,7 +1625,11 @@ func (c *Collection) narrowMatchPlan(qp *queryPlan) *projPlan {
 	if qp.q == nil || !qp.plan.PartialSafe || len(qp.plan.Seeds) == 0 {
 		return nil
 	}
-	return c.newProjPlan(qp.plan.Seeds)
+	p := c.newProjPlan(qp.plan.Seeds)
+	if p != nil && c.sealer != nil {
+		p.readsSealed = slices.ContainsFunc(qp.plan.Seeds, c.shouldEncrypt)
+	}
+	return p
 }
 
 // mergeParent flattens into child every (non-private) attribute of parent that
@@ -1787,6 +1813,11 @@ func matchWire(w []byte, qp queryPlan) bool {
 // argument names an attribute only when it runs: the static references cannot
 // say what it reads, so the partial ad may lack it and is not a stand-in for the
 // whole one.
+//
+// A sealed attribute is decoded (opened) for its value, but its references are
+// not followed: a sealed value refers to no other attribute by the encryption-at-
+// rest contract, and the narrowed match (adClosed) and the projections stop at one
+// too, so following them here would make the plain match disagree with those.
 func partialDecodeWire(ctx wireCtx, dict *segDictHandle, w []byte, seeds []string) (ad *classad.ClassAd, complete bool) {
 	a := wire.Ad(w)
 	out := classad.New()
@@ -1809,6 +1840,9 @@ func partialDecodeWire(ctx wireCtx, dict *segDictHandle, w []byte, seeds []strin
 			continue
 		}
 		out.Insert(name, expr)
+		if wire.IsEncryptedNode(node) {
+			continue
+		}
 		refs, safe := vm.SelfRefsSafe(expr)
 		if !safe {
 			return out, false

@@ -20,7 +20,8 @@ package wire
 // self-contained at the far end.
 //
 // keep is the caller's membership test, consulted per entry; note is called with every node
-// that was emitted and collects that node's unscoped/MY.-scoped references into the caller's
+// that was emitted, except a sealed one (which refers to nothing), right after keep accepted
+// it, and collects that node's unscoped/MY.-scoped references into the caller's
 // wanted set, reporting true when it surfaced a name the set did not already hold. keep must
 // accept those names on a later pass -- the two callbacks share the caller's set, and that
 // sharing is the whole mechanism.
@@ -61,10 +62,10 @@ func AppendAdSubsetInlineRefs(dst []byte, src Ad, keep func(name []byte, h uint3
 	sc.copied = sc.copied[:0]
 	again := false
 
-	// emit copies one entry and feeds its node to the closure. The node handed to note is the
-	// one that will be RENDERED at the far end -- the opened plaintext for a sealed value, the
-	// stored bytes otherwise -- so the closure sees what the consumer will evaluate rather than
-	// an opaque ciphertext whose references it could not read anyway.
+	// emit copies one entry and feeds its node to the closure. A sealed value is shipped opened
+	// but NOT noted: a sealed value refers to no other attribute (the encryption-at-rest
+	// contract), so no reader follows a reference inside one, and the closure here must not
+	// either or it would ship attributes the other paths do not.
 	emit := func(entryStart, nameEnd int, node []byte) bool {
 		if IsEncryptedNode(node) {
 			plain, opened := OpenEncryptedNode(node, open)
@@ -73,9 +74,6 @@ func AppendAdSubsetInlineRefs(dst []byte, src Ad, keep func(name []byte, h uint3
 			}
 			dst = append(dst, src[entryStart:nameEnd]...)
 			dst = append(dst, plain...)
-			if note(plain) {
-				again = true
-			}
 			return true
 		}
 		dst = append(dst, src[entryStart:nameEnd]...)

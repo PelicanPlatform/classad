@@ -47,8 +47,9 @@ const colPlanN = 1600
 // keys are patched after columnarization so their current versions are deltas over a full
 // record.
 //
-// encrypted seals Owner (a literal) and MemoryUsage (an expression) at rest, so sealed values
-// travel through both paths: a redacted read must render them undefined either way.
+// encrypted seals Owner and Filler00 at rest (and ClaimId, which is private), so sealed values
+// travel through both paths: a redacted read must render them undefined either way. Both are
+// strings, as sealed values are by contract (a sealed value refers to no other attribute).
 func colPlanMutable(t testing.TB, encrypted bool) *Collection {
 	t.Helper()
 	opts := Options{Dir: t.TempDir(), Shards: 2, SegmentSize: 1 << 16, DeltaMax: 8}
@@ -57,7 +58,7 @@ func colPlanMutable(t testing.TB, encrypted bool) *Collection {
 		for i := range opts.DataKey {
 			opts.DataKey[i] = byte(i + 7)
 		}
-		opts.EncryptedAttrs = []string{"Owner", "MemoryUsage"}
+		opts.EncryptedAttrs = []string{"Owner", "Filler00"}
 	}
 	c, err := Open(opts)
 	if err != nil {

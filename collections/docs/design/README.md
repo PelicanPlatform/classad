@@ -1180,6 +1180,15 @@ deployment configured. The engine seals them at the *value* level (`encrypt.go`,
     `masterkey.unprotected`.
   - In the unwrapped case values are still sealed, but that is not encryption at rest,
     and `EncryptionEnabled` reports false.
+- **Values refer to nothing.** A sealed value must not depend on other attributes: it
+  should be a literal, a token or a secret string, as every private attribute is. Reads
+  rely on this. A reference inside a sealed value is never followed: the projections that
+  close over references (`QueryRawProjected` with `chaseRefs`, `QueryRawWireRefs`) do not
+  ship the attribute it names, and the narrowed and partial decodes a query is evaluated on
+  do not load it. So a sealed value that is an expression over another attribute evaluates
+  as if that attribute were absent, unless the read loaded it for another reason. In return
+  a sealed attribute costs a projection or a narrowed match nothing: the record still counts
+  as self-contained, and is served from its columns.
 - **What it costs.** Sealed attributes are opaque to every fast path. They are never
   indexed, never hot, never in a column, and never zone-mapped. The `*Redacted` read
   variants (`QueryRedacted`, `BeginRedacted`, `WatchRedacted`, `OrderedRedacted`)

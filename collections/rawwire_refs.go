@@ -132,6 +132,16 @@ type wireRowAssembler struct {
 	// surfaced them.
 	selBase   int
 	refsFound int
+	// sealed names the entries of the record being assembled whose STORED value is sealed, for
+	// a record that reaches the assembly already converted to inline names: the conversion opens
+	// sealed values, and the converted bytes no longer say which ones were. The closure does not
+	// follow a reference inside a sealed value (see adClosed), and this is how it still knows
+	// where one was. Empty for a record that was not converted -- an inline record's sealed
+	// nodes are recognised as they are emitted.
+	sealed wireRefSet
+	// noteOff is whether the entry keep last accepted is in sealed. The subset assembler notes
+	// an accepted entry's node right after accepting it, and note then records nothing.
+	noteOff bool
 }
 
 // pending reports how many wanted attributes this record has not yielded yet: the projected
@@ -170,6 +180,7 @@ func (a *wireRowAssembler) appendRow(dst []byte, src wire.Ad, needed int, open w
 		// record, because a referenced attribute the selection would have dropped is
 		// exactly what the closure exists to recover. Rewriting once and reusing the one
 		// tested closure beats a second implementation of it over interned ids.
+		a.markSealed(src, nil)
 		flat, ok := wire.AppendAdSubsetInlineFromInterned(a.flat[:0], src, a.c.intern.Name, nil, open, &a.sc)
 		a.flat = flat
 		if !ok {
@@ -187,22 +198,76 @@ func (a *wireRowAssembler) appendRow(dst []byte, src wire.Ad, needed int, open w
 		func() int { return a.pending(needed) }, needed, open, &a.sc)
 }
 
+// appendRowConverted is appendRow for a record of an INTERNED segment (dict non-nil; nil passes
+// w through): it converts w to inline names with wireToInlineRead, which opens the sealed values
+// an entitled reader may see, and assembles the row -- noting first which entries were sealed,
+// so the closure does not follow references inside their opened plaintext.
+func (a *wireRowAssembler) appendRowConverted(dst []byte, dict *segDictHandle, w []byte, needed int, open wire.Sealer) ([]byte, bool) {
+	if dict != nil {
+		a.markSealed(w, dict)
+	}
+	out, ok := a.appendRow(dst, wire.Ad(a.c.wireToInlineRead(dict, w, a.sel.redact)), needed, open)
+	a.sealed.reset()
+	return out, ok
+}
+
+// markSealed records in a.sealed the entries of w, a record about to be converted to inline
+// names, whose stored value is sealed. Ids resolve through dict, or the collection's intern
+// table when dict is nil. Only a closure-computing, entitled read needs it: a redacted
+// conversion turns a sealed value into undefined, which refers to nothing anyway, and an
+// unencrypted collection has none to find.
+func (a *wireRowAssembler) markSealed(w []byte, dict *segDictHandle) {
+	a.sealed.reset()
+	if !a.sel.chaseRefs || a.sel.redact || a.c.sealer == nil {
+		return
+	}
+	wire.Ad(w).ForEachRaw(func(id uint32, inlineName string, node []byte) bool {
+		if !wire.IsEncryptedNode(node) {
+			return true
+		}
+		var name []byte
+		switch {
+		case inlineName != "":
+			name = []byte(inlineName)
+		case dict != nil:
+			name = dict.name(id)
+		default:
+			if n, ok := a.c.intern.Name(id); ok {
+				name = []byte(n)
+			}
+		}
+		if len(name) > 0 {
+			a.sealed.names = append(a.sealed.names, name)
+			a.sealed.hashes = append(a.sealed.hashes, wire.NameHash32Bytes(name))
+		}
+		return true
+	})
+}
+
 // keep is the selector's membership test widened by whatever the closure has surfaced for
 // THIS record so far.
 func (a *wireRowAssembler) keep(name []byte, h uint32, node []byte) bool {
 	if a.sel.keepHashed(name, h, node) {
 		a.selBase++
+		a.noteOff = len(a.sealed.names) > 0 && a.sealed.has(name, h)
 		return true
 	}
 	i, ok := a.refs.index(name, h)
-	if ok && !a.refs.found[i] {
-		a.refs.found[i], a.refsFound = true, a.refsFound+1
+	if ok {
+		if !a.refs.found[i] {
+			a.refs.found[i], a.refsFound = true, a.refsFound+1
+		}
+		a.noteOff = len(a.sealed.names) > 0 && a.sealed.has(name, h)
 	}
 	return ok
 }
 
-// note records the references an emitted node made, reporting whether any were new.
+// note records the references an emitted node made, reporting whether any were new. A node
+// whose stored value was sealed records nothing: a sealed value refers to no other attribute.
 func (a *wireRowAssembler) note(node []byte) bool {
+	if a.noteOff {
+		return false
+	}
 	a.scratch = wire.AppendNodeRefNames(node, a.scratch[:0])
 	added := false
 	for _, rn := range a.scratch {
@@ -236,11 +301,10 @@ func (a *wireRowAssembler) note(node []byte) bool {
 // keyed by -- so the closure needs no dictionary probe and no conversion here; the
 // authoritative name-space closure still runs afterwards, over this superset.
 //
-// Two cases hand the whole record on instead of narrowing it. An inline-keyed record (an
-// interned segment may hold one) has no id space to chase in, and the assembler's name-space
-// closure covers it. A kept node that is SEALED is opaque to the reference walk, and its
-// plaintext -- which the assembler does open -- may refer to attributes this pass cannot see,
-// so narrowing it would risk dropping one silently.
+// An inline-keyed record (an interned segment may hold one) has no id space to chase in, and is
+// handed on whole for the assembler's name-space closure to cover. A kept node that is SEALED is
+// kept and not chased: a sealed value refers to no other attribute (see adClosed), and the
+// assembler does not follow references inside one either.
 //
 // Reports false if w is not a well-formed ad, in which case the caller must fall back rather
 // than treat the result as an empty ad.
@@ -253,7 +317,6 @@ func narrowAdRefs(sc *narrowScratch, w []byte, want map[uint32]struct{}) ([]byte
 		return w, true
 	}
 	sc.ids, sc.nodes, sc.keep = sc.ids[:0], sc.nodes[:0], sc.keep[:0]
-	sealed := false
 	if !wire.Ad(w).ForEachRaw(func(id uint32, _ string, node []byte) bool {
 		sc.ids = append(sc.ids, id)
 		sc.nodes = append(sc.nodes, node)
@@ -273,11 +336,7 @@ func narrowAdRefs(sc *narrowScratch, w []byte, want map[uint32]struct{}) ([]byte
 				continue
 			}
 			sc.keep[i] = true
-			if wire.IsEncryptedNode(sc.nodes[i]) {
-				sealed = true
-				break
-			}
-			sc.refs = wire.AppendNodeRefIDs(sc.nodes[i], sc.refs[:0])
+			sc.refs = wire.AppendNodeRefIDs(sc.nodes[i], sc.refs[:0]) // nothing for a sealed node
 			for _, r := range sc.refs {
 				if _, isWanted := want[r]; isWanted || slices.Contains(sc.refIDs, r) {
 					continue
@@ -286,12 +345,9 @@ func narrowAdRefs(sc *narrowScratch, w []byte, want map[uint32]struct{}) ([]byte
 				again = true
 			}
 		}
-		if sealed || !again {
+		if !again {
 			break
 		}
-	}
-	if sealed {
-		return w, true
 	}
 	sc.entries = sc.entries[:0]
 	n := 0

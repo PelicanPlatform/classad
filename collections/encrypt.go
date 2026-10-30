@@ -24,6 +24,15 @@ var errEncryptionDisabled = errors.New("collections: encryption at rest is not e
 // encrypted records unchanged (no re-encryption, no per-segment key). Encrypted
 // attributes are never indexed and never hot -- they are opaque to the fast path.
 //
+// A sealed value refers to no other attribute. That is a contract on what gets encrypted, not
+// something checked: private attributes are literal secrets, and an attribute in the explicit
+// set is expected to be one too. Every read relies on it -- the closure checks (adClosed), the
+// wire-row and text projections that chase references, and the partial decode a query runs on all
+// stop at a sealed value -- so a sealed expression over another attribute is evaluated without
+// that attribute unless the read loaded it anyway. Honouring the reference instead would mean
+// opening every sealed value just to learn what else to load, on every path, which is what the
+// contract avoids.
+//
 // An attribute is encrypted when encryption is enabled AND it is either private (an
 // HTCondor secret -- claim ids, capabilities, transfer keys, _condor_priv*; always
 // encrypted, non-negotiable) or in the human-toggled explicit set. Privateness is a
@@ -160,6 +169,8 @@ func (c *Collection) EncryptedAttrNames() []string {
 // toggle meta-command). It is a no-op-with-error if encryption is disabled, and errors
 // if any named attribute is currently indexed (an encrypted value is opaque, so it
 // cannot be indexed). Private attributes are always encrypted regardless of this set.
+// The named attributes' values must not refer to other attributes; see
+// Options.EncryptedAttrs.
 // New records use the new set immediately; existing records keep their prior form until
 // MigrateSealedAttrs rewrites them. Compaction does not: it copies stored values as they are.
 // The migration's marker records the set it ran under, so the next open after a change runs it.

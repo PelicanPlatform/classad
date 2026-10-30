@@ -77,7 +77,11 @@ func narrowTestAd(t *testing.T, i, phase int) *classad.ClassAd {
 	}
 	fmt.Fprintf(&b, "Secret = \"tok%d\"\n", i)
 	if i%31 == 0 {
-		b.WriteString("SecretExpr = ProcId + RSS\n") // a sealed expression reaching outside itself
+		// A second sealed attribute most records lack. Sealed values are strings by contract: one
+		// that refers to another attribute is not followed by the narrowed match or the partial
+		// decode, so its answer would legitimately differ from a whole-ad evaluation's (pinned
+		// separately, in TestSealedValueReferencesAreNotFollowed).
+		fmt.Fprintf(&b, "Token = \"tk%d\"\n", i)
 	}
 	for k := 0; k < 12; k++ {
 		if some(20+k, 65) {
@@ -105,7 +109,7 @@ func narrowFixtures(t *testing.T) []nmFixture {
 	}
 	base := Options{Shards: 1, SegmentSize: 1 << 15, ColumnarSegmentBudget: 2, GroupSchemaCount: -1}
 	enc := base
-	enc.DataKey, enc.EncryptedAttrs = key, []string{"Secret", "SecretExpr"}
+	enc.DataKey, enc.EncryptedAttrs = key, []string{"Secret", "Token"}
 	delta := base
 	delta.DeltaMax = 8
 	interned := base
@@ -277,9 +281,9 @@ var narrowTestQueries = []string{
 	// Nested && is still a conjunction.
 	`(ProcId < 3) && (Owner == "u1" && VacateReasonCode > 20)`,
 	`!(ProcId >= 3 || Owner != "u1") && A > 3`,
-	// A sealed attribute, and a sealed expression.
+	// Sealed attributes: one every record has, and one most lack.
 	`Secret == "tok42" && ProcId == 2`,
-	`SecretExpr > 0 && ProcId == 0`,
+	`Token isnt undefined && ProcId < 5`,
 	// Decided wholly from columns (in the schemas that carry the fields).
 	`ProcId < 3 && ClusterId > 10`,
 	`T >= 1100 && T < 2000`,
@@ -289,7 +293,7 @@ var narrowTestQueries = []string{
 }
 
 var narrowTestProjection = []string{"ProcId", "Owner", "VacateReasonCode", "MemoryUsage", "A", "E", "Secret",
-	"SecretExpr", "NeverThere", "T"}
+	"Token", "NeverThere", "T"}
 
 // classAdSummary renders an ad order-insensitively, expressions by their text.
 func classAdSummary(ad *classad.ClassAd) string {
