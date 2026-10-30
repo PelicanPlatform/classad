@@ -3,6 +3,7 @@ package collections
 import (
 	"iter"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1491,6 +1492,19 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 				colDecided = true
 			}
 		}
+		// The column conjuncts are normally asked after the narrowed match (see below). A narrowed
+		// match that reads a sealed attribute is the exception: it opens the value for every record
+		// it decides, so the conjuncts, which read only columns, go first and spare it the records
+		// they reject.
+		conjAsked := false
+		if !colDecided && narrow != nil && narrow.readsSealed && prefilter != nil && prefilter.m == nil && inCols {
+			conjAsked = true
+			if prefilter.rejects(cn, k) {
+				qp.stats.columnDecided()
+				qp.stats.conjunctRejected()
+				return true
+			}
+		}
 		// Match on the record narrowed to what the query reads, when the columns could not decide:
 		// the record's columns, cold tail and remnant hold every attribute it has, so the few the
 		// query names can be gathered without rebuilding the rest. Exact only when the narrowed
@@ -1522,7 +1536,7 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		// for little more than these conjuncts cost, so asking them first only pays twice for the
 		// records they pass. Where it did not run -- a query it cannot serve, a record it could not
 		// use -- a rejection here still saves the reassembly.
-		if !colDecided && prefilter != nil && prefilter.m == nil && inCols && prefilter.rejects(cn, k) {
+		if !colDecided && !conjAsked && prefilter != nil && prefilter.m == nil && inCols && prefilter.rejects(cn, k) {
 			qp.stats.columnDecided()
 			qp.stats.conjunctRejected()
 			return true
@@ -1611,7 +1625,11 @@ func (c *Collection) narrowMatchPlan(qp *queryPlan) *projPlan {
 	if qp.q == nil || !qp.plan.PartialSafe || len(qp.plan.Seeds) == 0 {
 		return nil
 	}
-	return c.newProjPlan(qp.plan.Seeds)
+	p := c.newProjPlan(qp.plan.Seeds)
+	if p != nil && c.sealer != nil {
+		p.readsSealed = slices.ContainsFunc(qp.plan.Seeds, c.shouldEncrypt)
+	}
+	return p
 }
 
 // mergeParent flattens into child every (non-private) attribute of parent that

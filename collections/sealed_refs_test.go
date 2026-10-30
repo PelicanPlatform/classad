@@ -232,7 +232,7 @@ func TestSealedValuesKeepTheFastPaths(t *testing.T) {
 				want++
 			}
 		}
-		restore := narrowBenchArm{"narrow", true, false}.set()
+		restore := narrowBenchArm{"both", true, true}.set() // production: both savings on
 		defer restore()
 		var st ScanStats
 		got := 0
@@ -241,6 +241,12 @@ func TestSealedValuesKeepTheFastPaths(t *testing.T) {
 		}
 		if got != want || want == 0 {
 			t.Fatalf("%s: %d rows, whole-ad evaluation %d", expr, got, want)
+		}
+		// The column conjunct (ProcId < 4) rejects most records before the narrowed match has to
+		// open Token for them: a sealed read makes the narrowed match the dearer of the two.
+		if st.RecordsConjunctRejected == 0 {
+			t.Errorf("%s: the column conjunct rejected nothing (%+v); a narrowed match reading a sealed "+
+				"attribute should be asked after it", expr, st)
 		}
 		if st.RecordsNarrowMatched == 0 {
 			t.Fatalf("%s: no record was matched on its narrowed form (%+v); a sealed string refers to nothing, "+
@@ -258,7 +264,7 @@ func TestSealedValuesKeepTheFastPaths(t *testing.T) {
 func TestWireRowAssemblerSkipsOpenedSealedValues(t *testing.T) {
 	ad := mustAd(t, `[ MyType="Job"; ClusterId=7; Threshold=2; Secret = (Threshold > 1); Note="n" ]`)
 	proj := []string{"ClusterId", "Secret"}
-	check := func(label string, row []byte, ok bool) {
+	check := func(t *testing.T, label string, row []byte, ok bool) {
 		t.Helper()
 		if !ok {
 			t.Fatalf("%s: the assembler refused the record", label)
@@ -287,7 +293,7 @@ func TestWireRowAssemblerSkipsOpenedSealedValues(t *testing.T) {
 		sel := c.newWireSubsetSelectorRefs(proj, false, true)
 		asm := c.newWireRowAssembler(sel)
 		row, ok := asm.appendRowConverted(nil, dict, w, sel.neededCount(), c.renderKey(false))
-		check("interned", row, ok)
+		check(t, "interned", row, ok)
 	})
 	t.Run("in-memory", func(t *testing.T) {
 		c := New(Options{Shards: 1, DataKey: sealedRefKey(), EncryptedAttrs: []string{"Secret"}})
@@ -299,7 +305,7 @@ func TestWireRowAssemblerSkipsOpenedSealedValues(t *testing.T) {
 		sel := c.newWireSubsetSelectorRefs(proj, false, true)
 		asm := c.newWireRowAssembler(sel)
 		row, ok := asm.appendRow(nil, wire.Ad(w), sel.neededCount(), c.renderKey(false))
-		check("in-memory", row, ok)
+		check(t, "in-memory", row, ok)
 	})
 }
 

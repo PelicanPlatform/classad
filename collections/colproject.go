@@ -62,6 +62,11 @@ type projPlan struct {
 	// relay it. Such a plan is still used, but each projected record is checked for being
 	// closed (adClosed) and reassembled when it is not.
 	closure bool
+	// readsSealed marks a narrowed-match plan naming an attribute the collection seals. Matching
+	// on such a record opens the sealed value (a decrypt and a partial decode), which makes the
+	// narrowed match dearer than the column conjuncts the scan otherwise asks after it; see
+	// refVisitorState.
+	readsSealed bool
 }
 
 // newProjPlan resolves a projection for the scan, or returns nil when there is nothing to project.
