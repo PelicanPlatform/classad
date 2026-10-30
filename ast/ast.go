@@ -368,6 +368,10 @@ const (
 	TargetScope
 	// ParentScope represents PARENT.attr (parent ClassAd)
 	ParentScope
+	// RootScope represents .attr, which resolves against the outermost ad of
+	// the enclosing scope chain rather than the current one. Appended last so
+	// the existing values keep their numbers.
+	RootScope
 )
 
 // AttributeReference represents a reference to an attribute by name.
@@ -408,6 +412,8 @@ func (a *AttributeReference) String() string {
 		return "TARGET." + name
 	case ParentScope:
 		return "PARENT." + name
+	case RootScope:
+		return "." + name
 	default:
 		return name
 	}

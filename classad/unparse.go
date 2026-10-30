@@ -79,6 +79,8 @@ func unparseExpr(b *strings.Builder, e ast.Expr, old bool) {
 			b.WriteString("TARGET.")
 		case ast.ParentScope:
 			b.WriteString("PARENT.")
+		case ast.RootScope:
+			b.WriteString(".")
 		}
 		b.WriteString(unparseAttrName(v.Name))
 	case *ast.ParenExpr:

@@ -82,6 +82,16 @@ func (ws *wireScope) resolve(name string, scope ast.AttributeScope) classad.Valu
 			ws.fellBack = true // a parent without CurrentTime gives the time (see SetResolver)
 		}
 		return v
+	case ast.RootScope:
+		// .attr - the outermost ad of the chain, which here is the parent when
+		// the ad is chained and the ad itself otherwise. No fallthrough: an
+		// absolute reference names one ad.
+		if ws.parent != nil {
+			v, _ := ws.tryResolve(ws.parent, ws.parentDict, name)
+			return v
+		}
+		v, _ := ws.tryResolve(ws.ad, ws.dict, name)
+		return v
 	default:
 		// Unscoped: this ad, then fall through to its parent (chaining), matching
 		// the ClassAd evaluator's parent walk.
