@@ -135,6 +135,9 @@ func DecodeStandalone(b []byte) (*ast.ClassAd, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := d.checkCount(n); err != nil {
+		return nil, err
+	}
 	names := make([]string, n)
 	for i := range names {
 		s, err := d.readString()
@@ -189,6 +192,9 @@ func (d *decoder) adBody(depth int) (*ast.ClassAd, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := d.checkCount(attrCount); err != nil {
+		return nil, err
+	}
 	attrs := make([]*ast.AttributeAssignment, 0, attrCount)
 	for i := uint64(0); i < attrCount; i++ {
 		name, err := d.key()
@@ -214,11 +220,37 @@ func (d *decoder) key() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return d.resolveID(id, "intern")
+}
+
+// resolveID turns an interned name id read off the wire into its name. Every id the decoder
+// resolves goes through here, so none can skip the checks: a decoder with no resolver -- an
+// inline-names ad, which has no id space, holding an id-keyed node (a remnant written in the wrong
+// key space), or an interned reader handed a nil table -- an id wider than the uint32 ids are, which
+// would otherwise wrap onto an unrelated real id, and an id the resolver does not know are all
+// ErrMalformed. what names the id's role for the error.
+func (d *decoder) resolveID(id uint64, what string) (string, error) {
+	if d.resolve == nil {
+		return "", fmt.Errorf("%w: %s id %d in an ad with no intern table", ErrMalformed, what, id)
+	}
+	if id > math.MaxUint32 {
+		return "", fmt.Errorf("%w: %s id %d out of range", ErrMalformed, what, id)
+	}
 	name, ok := d.resolve(uint32(id))
 	if !ok {
-		return "", fmt.Errorf("%w: unknown intern id %d", ErrMalformed, id)
+		return "", fmt.Errorf("%w: unknown %s id %d", ErrMalformed, what, id)
 	}
 	return name, nil
+}
+
+// tableResolver is t.Name, or nil for a nil table: a method value on a nil *InternTable is not
+// nil, and calling it dereferences the table. A nil resolver makes resolveID report the ad
+// malformed instead.
+func tableResolver(t *InternTable) func(uint32) (string, bool) {
+	if t == nil {
+		return nil
+	}
+	return t.Name
 }
 
 // node reads a single expression node.
@@ -266,9 +298,9 @@ func (d *decoder) node(depth int) (ast.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		name, ok := d.resolve(uint32(id))
-		if !ok {
-			return nil, fmt.Errorf("%w: unknown attr-ref id %d", ErrMalformed, id)
+		name, err := d.resolveID(id, "attr-ref")
+		if err != nil {
+			return nil, err
 		}
 		return &ast.AttributeReference{Name: name, Scope: ast.AttributeScope(scope)}, nil
 	case nAttrRefStr:
@@ -333,9 +365,9 @@ func (d *decoder) node(depth int) (ast.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		name, ok := d.resolve(uint32(id))
-		if !ok {
-			return nil, fmt.Errorf("%w: unknown func id %d", ErrMalformed, id)
+		name, err := d.resolveID(id, "func")
+		if err != nil {
+			return nil, err
 		}
 		argc, err := d.uvarint()
 		if err != nil {
@@ -407,9 +439,9 @@ func (d *decoder) node(depth int) (ast.Expr, error) {
 		if err != nil {
 			return nil, err
 		}
-		name, ok := d.resolve(uint32(id))
-		if !ok {
-			return nil, fmt.Errorf("%w: unknown select attr id %d", ErrMalformed, id)
+		name, err := d.resolveID(id, "select attr")
+		if err != nil {
+			return nil, err
 		}
 		return &ast.SelectExpr{Record: rec, Attr: name}, nil
 	case nSelectStr:

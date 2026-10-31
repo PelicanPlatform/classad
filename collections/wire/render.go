@@ -15,7 +15,7 @@ import (
 // non-scalar values (lists, records, computed expressions) that LiteralValue
 // cannot format directly. Interned name ids resolve via t.
 func AppendNodeText(dst, node []byte, t *InternTable) ([]byte, error) {
-	d := &decoder{b: node, resolve: t.Name}
+	d := &decoder{b: node, resolve: tableResolver(t)}
 	return d.appendNode(dst, 0)
 }
 
@@ -35,7 +35,7 @@ func AppendNodeTextInline(dst, node []byte) ([]byte, error) {
 // that text to an old-ClassAd reader, as every raw-projection consumer does, doubles a
 // backslash on each round trip -- so a caller emitting old text must use this.
 func AppendNodeTextOld(dst, node []byte, t *InternTable) ([]byte, error) {
-	d := &decoder{b: node, resolve: t.Name, oldStrings: true}
+	d := &decoder{b: node, resolve: tableResolver(t), oldStrings: true}
 	return d.appendNode(dst, 0)
 }
 
@@ -60,7 +60,7 @@ func AppendNodeTextInlineOldEnc(dst, node []byte, open Sealer, redactSealed bool
 // AppendNodeTextOldEnc is AppendNodeTextOld for wire that may carry sealed values; see
 // AppendNodeTextInlineOldEnc.
 func AppendNodeTextOldEnc(dst, node []byte, t *InternTable, open Sealer, redactSealed bool) ([]byte, error) {
-	d := &decoder{b: node, resolve: t.Name, oldStrings: true, open: open, redactSealed: redactSealed}
+	d := &decoder{b: node, resolve: tableResolver(t), oldStrings: true, open: open, redactSealed: redactSealed}
 	return d.appendNode(dst, 0)
 }
 
@@ -331,6 +331,8 @@ func (d *decoder) appendAdBody(dst []byte, depth int) ([]byte, error) {
 // refName reads a name that is either an inline string (str variant) or an
 // interned id resolved via d.resolve — the name-source split shared by the
 // attr-ref / func / select node pairs.
+// An id in an inline-names node has no table to resolve against, and resolveID
+// reports it malformed.
 func (d *decoder) refName(str bool) (string, error) {
 	if str {
 		return d.readString()
@@ -339,11 +341,7 @@ func (d *decoder) refName(str bool) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	name, ok := d.resolve(uint32(id))
-	if !ok {
-		return "", ErrMalformed
-	}
-	return name, nil
+	return d.resolveID(id, "name")
 }
 
 // appendScope prepends the scope qualifier for an attribute reference, matching

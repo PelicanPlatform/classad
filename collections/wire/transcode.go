@@ -122,8 +122,7 @@ func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 
 	case nAttrRefStr:
 		// scope byte + inline name -> scope byte + id.
-		scope := c.b[c.pos]
-		c.skip(1)
+		scope := c.byteAt()
 		name := c.readNameBytes()
 		if !c.ok {
 			return false

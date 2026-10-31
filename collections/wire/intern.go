@@ -167,9 +167,11 @@ func (t *InternTable) IsPrivate(id uint32) bool {
 
 // isPrivateName classifies a (non-interned) name with the table's privacy
 // predicate -- the redacting iterator uses it for inline-encoded ads, whose
-// attribute names are stored in the ad body rather than as interned ids.
+// attribute names are stored in the ad body rather than as interned ids. A nil
+// table has no predicate: an inline ad needs no table to be read, so a caller
+// may redact one without any.
 func (t *InternTable) isPrivateName(name string) bool {
-	return t.privacy != nil && t.privacy(name)
+	return t != nil && t.privacy != nil && t.privacy(name)
 }
 
 // Len returns the number of interned names (== the next id to be allocated).

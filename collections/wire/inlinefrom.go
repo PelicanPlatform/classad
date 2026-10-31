@@ -55,6 +55,9 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 	if c.inline {
 		return AppendAdSubsetInline(dst, src, keep, open)
 	}
+	if resolve == nil {
+		return dst, false // an interned src's ids cannot be named without one
+	}
 	if src[2]&flagStandalone != 0 {
 		return dst, false // ids index the embedded table, which resolve knows nothing about
 	}
@@ -75,7 +78,7 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 	kept := uint64(0)
 
 	for i := uint64(0); i < attrCount && c.ok; i++ {
-		id := uint32(c.uvarint())
+		id := c.id32()
 		nodeStart := c.pos
 		skipNode(c, 0)
 		if !c.ok {
@@ -185,7 +188,7 @@ func inlineNode(c *cursor, out *[]byte, resolve func(uint32) (string, bool), dep
 		}
 		scope := c.b[c.pos]
 		c.skip(1)
-		id := uint32(c.uvarint())
+		id := c.id32()
 		if !c.ok {
 			return false
 		}
@@ -238,7 +241,7 @@ func inlineNode(c *cursor, out *[]byte, resolve func(uint32) (string, bool), dep
 		return inlineAdBody(c, out, resolve, depth+1)
 
 	case nFunc:
-		id := uint32(c.uvarint())
+		id := c.id32()
 		n := c.uvarint()
 		if !c.ok {
 			return false
@@ -286,7 +289,7 @@ func inlineNode(c *cursor, out *[]byte, resolve func(uint32) (string, bool), dep
 		if !inlineNode(c, out, resolve, depth+1) { // the record
 			return false
 		}
-		id := uint32(c.uvarint())
+		id := c.id32()
 		if !c.ok {
 			return false
 		}
@@ -337,7 +340,7 @@ func inlineAdBody(c *cursor, out *[]byte, resolve func(uint32) (string, bool), d
 	*out = binary.AppendUvarint(*out, 0) // hot header: empty
 	*out = binary.AppendUvarint(*out, n)
 	for i := uint64(0); i < n; i++ {
-		id := uint32(c.uvarint())
+		id := c.id32()
 		if !c.ok {
 			return false
 		}
