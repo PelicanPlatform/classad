@@ -294,6 +294,19 @@ func aggShape(aggs []AggSpec) string {
 	return clampShape(strings.Join(parts, ", "))
 }
 
+// GroupingText renders an observed query's GROUP BY columns -- the same fingerprint the
+// shape report keys on. It is empty for a plain read and for an aggregate over the whole
+// match, so a caller prints the field only when it has one.
+//
+// Exported because the per-query log is the other operator surface these records feed,
+// and a front end that formatted the raw GroupCol slice itself would render the same
+// aggregate differently from the shape report it sits beside.
+func (q QueryLog) GroupingText() string { return groupShape(q.Groups) }
+
+// AggregatesText renders the functions an observed query reduced over each group. Empty
+// for a plain read.
+func (q QueryLog) AggregatesText() string { return aggShape(q.Aggs) }
+
 // aggFuncName names an aggregate function for a fingerprint. An unknown selector renders
 // by number rather than as one of the known names: a function added to the wire after this
 // was written must not be reported as a different one.

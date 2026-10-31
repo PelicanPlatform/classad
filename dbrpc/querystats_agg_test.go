@@ -384,3 +384,23 @@ func TestArchiveAggregateWithStatsOff(t *testing.T) {
 		t.Errorf("GROUP BY Owner produced %d groups, want 2", len(rows))
 	}
 }
+
+// TestQueryLogGroupingText covers the renderers a front end uses for its own per-query
+// log line, so one aggregate reads the same there as in the shape report.
+func TestQueryLogGroupingText(t *testing.T) {
+	q := QueryLog{
+		Op: "ArchiveAggregate", Table: "history",
+		Groups: []GroupCol{{Attr: "Owner"}, {Attr: "EnteredHistoryTime", BucketWidth: 3600}},
+		Aggs:   []AggSpec{{Func: AggCount, Arg: "*"}},
+	}
+	if got, want := q.GroupingText(), "owner, enteredhistorytime/3600"; got != want {
+		t.Errorf("GroupingText = %q, want %q", got, want)
+	}
+	if got, want := q.AggregatesText(), "count(*)"; got != want {
+		t.Errorf("AggregatesText = %q, want %q", got, want)
+	}
+	var plain QueryLog
+	if plain.GroupingText() != "" || plain.AggregatesText() != "" {
+		t.Errorf("a plain read rendered a grouping: %q / %q", plain.GroupingText(), plain.AggregatesText())
+	}
+}
