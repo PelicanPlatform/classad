@@ -348,10 +348,14 @@ func buildAdSchemaReport(sample [][]byte, opts adSchemaOpts) (*adSchema, []requi
 }
 
 // layoutSchema orders the fields (bool, int by ascending width, real, string; ties by id) and
-// assigns each its fixed-blob offset / bit index, deriving boolBytes/fixedLen/escBytes/byID. It
-// is deterministic in the field set, so both buildAdSchema and the persisted-schema decoder
-// produce an identical layout. Grouping bools first lets them bit-pack; grouping ints by width
-// keeps the blob dense.
+// assigns each its fixed-blob offset / bit index. Grouping bools first lets them bit-pack;
+// grouping ints by width keeps the blob dense.
+//
+// ONLY for a schema being DERIVED. The tie-break is the attribute's intern id, and intern ids are
+// process-local -- they are handed out in first-seen order at every Open, so the same set of
+// attributes can sort differently in two processes. A schema read back from disk must therefore
+// keep the order it was STORED in (layoutStoredSchema); re-deriving its order here would move the
+// fields of records that are already written.
 func layoutSchema(fields []adField) *adSchema {
 	sort.Slice(fields, func(i, j int) bool {
 		if fields[i].kind != fields[j].kind {
@@ -362,6 +366,30 @@ func layoutSchema(fields []adField) *adSchema {
 		}
 		return fields[i].id < fields[j].id
 	})
+	return layoutStoredSchema(fields)
+}
+
+// layoutStoredSchema assigns offsets and bit indices to fields IN THE ORDER GIVEN, for a schema
+// read back from disk.
+//
+// The order is not cosmetic: a field's position in the list IS its slot. It fixes the field's
+// offset in the numeric blob (each field is placed after the one before it), its bit in the bool
+// bitset, its bit in the record's escape bitmap, and its turn in the string region, which stores
+// its values back to back with no per-string offset slot. So the order the writer laid out under
+// is part of the record format, and the persisted schema records it by writing its fields in
+// layout order.
+//
+// This used to re-sort, on the reasoning that layoutSchema is deterministic in the field SET. It
+// is not: the tie-break within a (kind, width) group is the intern id, which a persistent
+// collection renumbers at every Open in first-seen order. One process's numbering is recovered
+// from whatever it reads first, so a store holding segments written under two different schemas --
+// which is the ordinary state while a base-schema change converges, since convergence is budgeted
+// -- could intern the names in an order that sorts an older segment's fields differently than the
+// process that wrote it did. Every record in that segment then decoded one slot out of step, and
+// returned a NEIGHBOURING attribute's value: no error, no missing attribute, just the wrong number
+// under the right name. Measured on a production history archive, 25 of 159 attributes in a record
+// came back holding each other's values.
+func layoutStoredSchema(fields []adField) *adSchema {
 	nBool := 0
 	for _, f := range fields {
 		if f.kind == akBool {
