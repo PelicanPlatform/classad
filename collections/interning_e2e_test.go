@@ -11,6 +11,7 @@ import (
 // the dictionaries). It exercises current + superseded records (updates), multiple sealed
 // segments, and multiple shards.
 func TestInterningEndToEnd(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -147,6 +148,7 @@ func TestInterningEndToEnd(t *testing.T) {
 // per-segment block build must resolve segment-local ids (recordToInternedDict), so a
 // CountConstraint routed through the columnar scan matches the query engine.
 func TestInterningSchemaScan(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

@@ -23,6 +23,7 @@ func scanAllN(t *testing.T, c *Collection) []int64 {
 // a dictionary, recompresses every segment in place preserving all records and order, keeps
 // queries correct, and survives a reopen. The retrained data should be no larger than before.
 func TestAppendOnlyRetrain(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	open := func() *Collection {
 		c, err := Open(Options{AppendOnly: true, Dir: dir, SegmentSize: 1 << 13, ValueAttrs: []string{"N"}})

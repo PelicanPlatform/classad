@@ -681,6 +681,7 @@ func TestReviewWaitsForConvergence(t *testing.T) {
 // schema AND brings the columnarized segments onto it -- one budget synchronously, the rest through
 // maintenance. It used to skip them, leaving every existing segment on the old schema for good.
 func TestReschemaScanConvergesColumnarized(t *testing.T) {
+	t.Parallel()
 	f := newReviewFixture(t, 3000, false, false)
 	if !f.c.BuildAndEnableSchemaScan(4096, 8) {
 		t.Fatal("schema scan did not enable")

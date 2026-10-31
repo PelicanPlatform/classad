@@ -81,6 +81,7 @@ func dictStats(t *testing.T, c *Collection, attr string) (withDict, blocks int) 
 // TestStrDictIsBuiltWhenValuesRepeat pins that the encoding decision goes the way each fixture implies --
 // otherwise every other dictionary test could pass without a dictionary existing.
 func TestStrDictIsBuiltWhenValuesRepeat(t *testing.T) {
+	t.Parallel()
 	rep := strDictFixture(t, 20000, 200)
 	defer rep.Close()
 	got, blocks := dictStats(t, rep, "Owner")

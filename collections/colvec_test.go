@@ -141,6 +141,7 @@ func TestVectorEvalDeclinesGracefully(t *testing.T) {
 // TestVectorEvalSeesUpdates checks the vector path honours snapshot visibility -- it evaluates every
 // record in a block including superseded ones, and must not count them.
 func TestVectorEvalSeesUpdates(t *testing.T) {
+	t.Parallel()
 	c := scopeFixtureCodec(t, 20000)
 	defer c.Close()
 

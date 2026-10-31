@@ -139,6 +139,7 @@ func TestGroupVecColumnMatchesScalar(t *testing.T) {
 // block length. Verified by instrumenting loadGroupColumn: 15 calls per query here, one per sealed
 // block, and 30 for a two-column expression.
 func TestGroupQueryMatchesRowPath(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Small segments so several SEAL: an unsealed segment carries no columnar block at all, and the
 	// comparison below would then be the row path against itself.

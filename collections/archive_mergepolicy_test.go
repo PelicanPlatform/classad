@@ -6,6 +6,7 @@ import "testing"
 // target is merged down to it, and every record survives in order -- checked again after a
 // reopen, since that is where a merge landing in the wrong position would surface.
 func TestMergePassReachesTarget(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -55,6 +56,7 @@ func TestMergePassReachesTarget(t *testing.T) {
 // intact: nothing happens under target, the newest segments are never consumed, and no
 // merged segment exceeds the size cap.
 func TestMergePassRespectsLimits(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

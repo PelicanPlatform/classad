@@ -12,6 +12,7 @@ import (
 // archive puzzle is about: a columnarized scan decides the WHERE from columns and reassembles
 // only matches, while an un-columnarized scan reassembles what it visits.
 func TestScanStatsColumnarVsReassembled(t *testing.T) {
+	t.Parallel()
 	build := func(columnar bool) *Archive {
 		a, err := CreateArchive(ArchiveOptions{Dir: t.TempDir(), SegmentSize: 1 << 16, ValueAttrs: []string{"ClusterId"}})
 		if err != nil {

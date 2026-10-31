@@ -12,6 +12,7 @@ import (
 // and every collapse pass is built on it. The check must agree on a store that is actually
 // healthy, or its first production reading is noise.
 func TestSealInvariantHoldsOnAHealthyStore(t *testing.T) {
+	t.Parallel()
 	c, dir := openDelta(t, 16)
 	for i := range 400 {
 		ad := classad.New()

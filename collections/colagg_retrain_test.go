@@ -55,6 +55,7 @@ func aggAll(t *testing.T, c *Collection, attr string) NumStats {
 // compressed under the previous dictionary, reading them through the new codec would fail or return
 // nonsense -- so the aggregate has to keep returning the same answers.
 func TestColumnarSurvivesRetrain(t *testing.T) {
+	t.Parallel()
 	c := retrainStore(t)
 	defer c.Close()
 
@@ -92,6 +93,7 @@ func TestColumnarSurvivesRetrain(t *testing.T) {
 // TestColumnarSurvivesRewrite covers the other recompacting path, which an operator reaches as
 // `.rewrite`.
 func TestColumnarSurvivesRewrite(t *testing.T) {
+	t.Parallel()
 	c := retrainStore(t)
 	defer c.Close()
 

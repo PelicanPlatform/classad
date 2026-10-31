@@ -96,6 +96,7 @@ func sameStats(t *testing.T, what string, got, want NumStats) {
 // TestNumStatsMatchesRowScan is the correctness case: the columnar aggregate must agree with a
 // row scan, including over records whose value escaped to the cold tail.
 func TestNumStatsMatchesRowScan(t *testing.T) {
+	t.Parallel()
 	c := aggStore(t, 2000)
 	defer c.Close()
 
@@ -113,6 +114,7 @@ func TestNumStatsMatchesRowScan(t *testing.T) {
 // around 4.6e18 instead of a few thousand. Nothing else in the package exercised a real column,
 // because the count fast path refused them.
 func TestNumStatsRealField(t *testing.T) {
+	t.Parallel()
 	c := aggStore(t, 2000)
 	defer c.Close()
 
@@ -135,6 +137,7 @@ func TestNumStatsRealField(t *testing.T) {
 // TestNumStatsWithSameFieldPredicate covers the constrained form: a predicate on the aggregate's
 // own field is in scope, and must narrow the aggregate the same way a row scan would.
 func TestNumStatsWithSameFieldPredicate(t *testing.T) {
+	t.Parallel()
 	c := aggStore(t, 2000)
 	defer c.Close()
 
@@ -169,6 +172,7 @@ func TestNumStatsWithSameFieldPredicate(t *testing.T) {
 // TestNumStatsDeclines pins the boundaries, because each of these would otherwise be answered
 // from the wrong data rather than refused.
 func TestNumStatsDeclines(t *testing.T) {
+	t.Parallel()
 	c := aggStore(t, 2000)
 	defer c.Close()
 
@@ -226,6 +230,7 @@ func TestNumStatsDeclines(t *testing.T) {
 // TestNumStatsAcrossMVCC checks the visibility rule: an updated key contributes its new value
 // once, not both values, and a deleted key contributes nothing.
 func TestNumStatsAcrossMVCC(t *testing.T) {
+	t.Parallel()
 	c := aggStore(t, 2000)
 	defer c.Close()
 
@@ -274,6 +279,7 @@ func TestNumStatsIncludesEscapedValues(t *testing.T) {
 
 // TestNumStatsEmpty reports N=0 rather than an infinite Min left over from initialization.
 func TestNumStatsEmpty(t *testing.T) {
+	t.Parallel()
 	c := aggStore(t, 2000)
 	defer c.Close()
 

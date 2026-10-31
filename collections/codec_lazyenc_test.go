@@ -118,6 +118,7 @@ func TestReleaseEncodersExceptKeepsCurrent(t *testing.T) {
 // trained generation's codec read-only, and the retrain sweep must drop its warmed encoder
 // while every record from all three generations still reads back intact.
 func TestIdleEncoderReleasedAcrossRetrain(t *testing.T) {
+	t.Parallel()
 	run := func(t *testing.T, dir string) {
 		var c *Collection
 		if dir == "" {

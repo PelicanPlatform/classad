@@ -26,6 +26,7 @@ import (
 // reindexAfterCompaction runs -- every key a scan can still see must resolve by key, both for a read
 // (Get) and for the delete the server drives (Delete must report removed==true).
 func TestDeleteConvergesDuringColumnarize(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// Small segments => many sealed segments to columnarize; a large budget so a single
 	// ColumnarizeSealed pass would sweep them all (we instead drive per-segment below).

@@ -67,6 +67,7 @@ func columnarizedFixture(t *testing.T) (*Collection, *segment) {
 
 // TestRemnantsAreMarked: the records of a columnarized segment must say so themselves.
 func TestRemnantsAreMarked(t *testing.T) {
+	t.Parallel()
 	c, seg := columnarizedFixture(t)
 	defer c.Close()
 	marked, plain := 0, 0
@@ -95,6 +96,7 @@ func TestRemnantsAreMarked(t *testing.T) {
 // way a failed publish leaves it -- nil pointer, NOT flagged damaged, which is the combination that
 // used to fall through to "return the bytes as they are".
 func TestMissingPayloadErrorsRatherThanServingRemnants(t *testing.T) {
+	t.Parallel()
 	c, seg := columnarizedFixture(t)
 	defer c.Close()
 
@@ -140,6 +142,7 @@ func TestMissingPayloadErrorsRatherThanServingRemnants(t *testing.T) {
 // TestCompactionRefusesRemnantsWithoutPayload: the permanence half. Compaction must not copy a
 // remnant into a fresh segment as though it were a whole record.
 func TestCompactionRefusesRemnantsWithoutPayload(t *testing.T) {
+	t.Parallel()
 	c, seg := columnarizedFixture(t)
 	defer c.Close()
 	seg.colNative.Store(nil)

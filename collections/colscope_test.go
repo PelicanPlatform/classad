@@ -67,6 +67,7 @@ var scopeQueries2 = []string{
 
 // TestColScopeMatchesRowPath is the equivalence gate for every newly-served shape.
 func TestColScopeMatchesRowPath(t *testing.T) {
+	t.Parallel()
 	c := scopeFixture2(t, 5000)
 	defer c.Close()
 	for _, expr := range scopeQueries2 {
@@ -100,6 +101,7 @@ func TestColScopeMatchesRowPath(t *testing.T) {
 // selective constraint on an indexed attribute is better served by the row path's posting list --
 // routing without checking that was measured 2.9x slower on an archive.
 func TestColScopeRoutedOnlyWithoutIndex(t *testing.T) {
+	t.Parallel()
 	c := scopeFixture2(t, 3000)
 	defer c.Close()
 	// A string comparison is served: zero-copy region reads made it competitive with the row path
@@ -150,6 +152,7 @@ func TestColScopeRoutedOnlyWithoutIndex(t *testing.T) {
 
 // TestColScopeMVCC checks visibility through the evaluator path.
 func TestColScopeMVCC(t *testing.T) {
+	t.Parallel()
 	c := scopeFixture2(t, 3000)
 	defer c.Close()
 	for i := 0; i < 300; i++ {

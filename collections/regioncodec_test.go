@@ -17,6 +17,7 @@ import (
 // TestRegionCodecIsDictionaryLessAndStable pins the two properties the reload depends on: the region
 // codec carries no trained dictionary, and it does not change when the collection's codec does.
 func TestRegionCodecIsDictionaryLessAndStable(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 1, SegmentSize: 1 << 16})
 	defer c.Close()
 	for i := 0; i < 3000; i++ {
@@ -49,6 +50,7 @@ func TestRegionCodecIsDictionaryLessAndStable(t *testing.T) {
 // be rebuilt to stay readable. With a dictionary-less region codec the block is independent of the
 // segment's dictionary generation entirely.
 func TestColumnarSurvivesRetrainWithRegionCodec(t *testing.T) {
+	t.Parallel()
 	c := New(Options{Shards: 1, SegmentSize: 1 << 16})
 	defer c.Close()
 	for i := 0; i < 3000; i++ {

@@ -86,6 +86,7 @@ func TestOperationTimeEviction(t *testing.T) {
 // compacts does not leak the directory back to O(all keys). Writes create heavy garbage
 // (each key overwritten many times) so compaction actually fires.
 func TestCompactionEviction(t *testing.T) {
+	t.Parallel()
 	const n = 2000
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, Shards: 4, SegmentSize: 4096})

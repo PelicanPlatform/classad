@@ -48,6 +48,7 @@ func internedPersistent(t *testing.T, shards, n int) (*Collection, func(i int) [
 }
 
 func TestReadersDoNotLeakAMappingDependentDict(t *testing.T) {
+	t.Parallel()
 	const n = 3000
 	c, key := internedPersistent(t, 2, n)
 	defer c.Close()

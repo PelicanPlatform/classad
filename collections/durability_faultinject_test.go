@@ -97,6 +97,7 @@ func checkNoSilentCorruption(t *testing.T, dir string, n int, what string) (open
 // across every on-disk file of a crash-image store, reopening a fresh copy for each fault and
 // asserting no silent corruption and no panic.
 func TestTornWriteAndBitRotSweep(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

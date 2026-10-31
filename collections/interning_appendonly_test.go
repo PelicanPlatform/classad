@@ -13,6 +13,7 @@ import (
 // query genuinely prunes segments; a wrong (dict-blind) zone extraction would mis-prune and
 // change the count.
 func TestAppendOnlyInterning(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

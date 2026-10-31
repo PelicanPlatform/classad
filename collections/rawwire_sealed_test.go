@@ -20,6 +20,7 @@ import (
 // path was given the key unconditionally and leaked too -- so all four combinations are pinned, in
 // both the entitled and the redacted direction.
 func TestWireRowSealedValueNeedsEntitlement(t *testing.T) {
+	t.Parallel()
 	const secret = "SUPERSECRET"
 	for _, interned := range []bool{false, true} {
 		for _, parallel := range []bool{true, false} {

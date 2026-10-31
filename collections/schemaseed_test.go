@@ -22,6 +22,7 @@ import (
 // Simulated by writing a sidecar and then poking its version, which is exactly what an older build's file
 // looks like to this one.
 func TestSchemaSurvivesSectionVersionBump(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	build := func() {
 		c := New(Options{Shards: 1, SegmentSize: 1 << 16, Dir: dir})

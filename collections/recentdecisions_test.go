@@ -111,6 +111,7 @@ func TestDerivedSchemaFollowsRecentData(t *testing.T) {
 // whether the schema still matches the data. Sampling the oldest records made it report on the wrong
 // end of the table, so a schema that had drifted badly could still look like a clean fit.
 func TestSchemaFitReportsRecentData(t *testing.T) {
+	t.Parallel()
 	c, procID := growingFixture(t, 4000)
 	defer c.Close()
 

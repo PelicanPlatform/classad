@@ -55,6 +55,7 @@ func internedSegments(c *Collection) []*segment {
 // would have found. If it were not, every attribute name in the segment would resolve
 // through the wrong dictionary.
 func TestSegDictHintMatchesWalk(t *testing.T) {
+	t.Parallel()
 	c := internedArchive(t, t.TempDir())
 	segs := internedSegments(c)
 	if len(segs) == 0 {
@@ -80,6 +81,7 @@ func TestSegDictHintMatchesWalk(t *testing.T) {
 // which is far worse than the walk it replaces. Every bad hint must fall back and still land
 // on the real dictionary.
 func TestSegDictHintRejectsBadOffset(t *testing.T) {
+	t.Parallel()
 	c := internedArchive(t, t.TempDir())
 	segs := internedSegments(c)
 	if len(segs) == 0 {
@@ -131,6 +133,7 @@ func TestSegDictHintRejectsBadOffset(t *testing.T) {
 // TestSegDictNamesResolveAfterReopen is the end-to-end guard: whichever path published the
 // dictionary, a reopened interned segment must decode its records to the right names.
 func TestSegDictNamesResolveAfterReopen(t *testing.T) {
+	t.Parallel()
 	c := internedArchive(t, t.TempDir())
 	n := 0
 	seen := map[string]bool{}
@@ -151,6 +154,7 @@ func TestSegDictNamesResolveAfterReopen(t *testing.T) {
 // TestSegDictFallsBackToWalkOnOldSidecar: a sidecar written by an earlier version carries no
 // dictionary offset. Recovery must still find the dictionary, just by walking.
 func TestSegDictFallsBackToWalkOnOldSidecar(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c := internedArchive(t, dir)
 	segs := internedSegments(c)
@@ -216,6 +220,7 @@ func buildV3Sidecar(attrBlob, keyBlob, colBlob, zoneBlob []byte, segUsed int) []
 // TestSegDictOffsetIsRecorded: the sidecar of an interned segment must actually carry the
 // dictionary offset, or the fast path is dead code and reopen silently keeps walking.
 func TestSegDictOffsetIsRecorded(t *testing.T) {
+	t.Parallel()
 	c := internedArchive(t, t.TempDir())
 	segs := internedSegments(c)
 	if len(segs) == 0 {

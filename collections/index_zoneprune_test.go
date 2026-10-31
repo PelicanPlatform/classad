@@ -260,6 +260,7 @@ func TestIndexedPlanZonePrunesUncoveredSegments(t *testing.T) {
 // its zone map rules out every disjunct (or a required conjunct), and the union still returns
 // every match.
 func TestIndexedDNFPlanZonePrunes(t *testing.T) {
+	t.Parallel()
 	f, a := newLateIndexArchive(t)
 	defer a.Close()
 	c := a.c

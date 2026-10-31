@@ -80,6 +80,7 @@ func seedForStranding(t *testing.T, c *Collection, n int) {
 // fragment depends on -- and it used to scan only the active segments, so a stranded fragment
 // went into compaction invisible and came out unreadable.
 func TestPreCompactionCollapseFindsStrandedFragments(t *testing.T) {
+	t.Parallel()
 	c, _ := openDelta(t, 16)
 	defer c.Close()
 	seedForStranding(t, c, 2000)

@@ -314,6 +314,7 @@ func TestRepairLeavesDamagedDictionaryAlone(t *testing.T) {
 // flags say nothing. The sidecar still records where it was: Fsck must report it damaged and Repair
 // must not write the segment without it. Only Fsck and Repair run; neither changes anything here.
 func TestRepairRefusesWhenDictionaryIsInLostFraming(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	buildInternedStore(t, dir)
 	target, dict := firstInternedSegment(t, dir)
