@@ -1,6 +1,8 @@
 package collections
 
 import (
+	"log"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -20,6 +22,45 @@ var (
 // versus by decoding into an ast and encoding it back.
 func CompactInternPaths() (wirePath, astPath int64) {
 	return internViaWire.Load(), internViaAST.Load()
+}
+
+// compactPreservedUndecodable counts records compaction copied unchanged because they do not decode,
+// and compactBlockedSegments the segments whose shard it left uncompacted because a record could not
+// be read at all. See preserveUndecodable in compactShard.
+var compactPreservedUndecodable, compactBlockedSegments atomic.Int64
+
+// CompactPreservedUndecodable reports how many records, since the process started, compaction copied
+// forward unchanged because they would not decode. Such a record reads exactly as it did before --
+// a reader that refused it still does -- and the rest of its shard compacts around it. Each record is
+// counted once per process, by the pass that first meets it.
+func CompactPreservedUndecodable() int64 { return compactPreservedUndecodable.Load() }
+
+// CompactBlockedSegments reports how many segments, since the process started, held a record
+// compaction could not read at all (an unusable dictionary, a damaged columnar payload, bytes that do
+// not decompress). The shard holding such a segment is left uncompacted, and later passes skip it
+// until the segment is gone (Repair, or every record in it superseded) or the process restarts.
+func CompactBlockedSegments() int64 { return compactBlockedSegments.Load() }
+
+// CompactUndecodable describes one record compaction could not re-encode.
+type CompactUndecodable struct {
+	Dir     string // the collection's directory ("" in memory)
+	Shard   int    // the shard's index
+	Key     string // the record's key
+	Err     string // why it could not be decoded or read
+	Blocked bool   // true: the record could not be read and the shard was left uncompacted; false: copied unchanged
+}
+
+// CompactUndecodableHook is called once for each record CompactPreservedUndecodable or
+// CompactBlockedSegments counts. The default logs it with the standard library logger; a daemon with
+// its own logger replaces it, and nil silences it. Set it before opening collections.
+var CompactUndecodableHook = func(e CompactUndecodable) {
+	if e.Blocked {
+		log.Printf("collections: compaction left shard %d of %q uncompacted: record %q cannot be read: %s",
+			e.Shard, e.Dir, e.Key, e.Err)
+		return
+	}
+	log.Printf("collections: compaction of shard %d of %q copied record %q unchanged: it does not decode: %s",
+		e.Shard, e.Dir, e.Key, e.Err)
 }
 
 // compactDictReserve is the arena space held back at the end of an interned destination
@@ -547,6 +588,14 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		sh.mu.Unlock()
 		return
 	}
+	// A segment an earlier pass could not read a record of is still there: this pass would stop at
+	// the same record. Leave the shard as it is until that segment goes (see compactBlocked).
+	for _, seg := range sh.segs {
+		if seg != nil && seg.compactBlocked.Load() {
+			sh.mu.Unlock()
+			return
+		}
+	}
 	retain := sh.retainFloorLocked()
 	horizonNeed := sh.commitSeq // every source record is at or below it
 	origLen := len(sh.segs)
@@ -628,28 +677,28 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// part of its ad: the rest is in the segment's columnar payload, which the output does not carry.
 	// Such a record is reassembled and written whole, so compaction de-columnarizes -- a later
 	// maintenance pass can columnarize the output again.
-	recompress := func(seg *segment, o uint32) ([]byte, Codec, bool) {
+	recompress := func(seg *segment, o uint32) ([]byte, Codec, error) {
 		if seg.columnarized() || seg.colDamaged.Load() || recIsStripped(seg.data, o) {
 			full, err := c.recordWireIn(seg, seg.data, o, decBuf[:0])
 			if err != nil {
-				return nil, nil, false
+				return nil, nil, err
 			}
 			decBuf = full
 			out := target.Compress(encBuf[:0], full)
 			encBuf = out
-			return out, target, true
+			return out, target, nil
 		}
 		ad := recAd(seg.data, o)
 		if seg.codec == target {
-			return ad, seg.codec, true
+			return ad, seg.codec, nil
 		}
 		if w, err := seg.codec.Decompress(decBuf[:0], ad); err == nil {
 			decBuf = w
 			out := target.Compress(encBuf[:0], w)
 			encBuf = out
-			return out, target, true
+			return out, target, nil
 		}
-		return ad, seg.codec, true
+		return ad, seg.codec, nil
 	}
 
 	// Interning: on a persistent, plaintext collection each destination segment is written
@@ -706,19 +755,116 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		seg.dict.Store(&segDictHandle{data: seg.data, base: off + recKeyOff + 4, rec: off})
 	}
 	// decodeSrc decodes a source record to an ast, honoring the source segment's own encoding
-	// (inline or interned). Returns nil on any decompress/decode failure.
-	decodeSrc := func(seg *segment, o uint32) *ast.ClassAd {
+	// (inline or interned). When the record does not decode it returns a nil ad with the error and,
+	// if the record's whole wire could be read, that wire (decBuf, valid until the next read), which
+	// preserveUndecodable copies. A nil wire means the record could not be read at all.
+	decodeSrc := func(seg *segment, o uint32) (*ast.ClassAd, []byte, error) {
 		// The FULL ad: a columnarized source stores only what its schema does not cover.
 		w, err := c.recordWireIn(seg, seg.data, o, decBuf[:0])
 		if err != nil {
-			return nil
+			return nil, nil, err
 		}
 		decBuf = w
 		ad, err := c.decodeWireDict(seg.dict.Load(), w)
 		if err != nil {
-			return nil
+			return nil, w, err
 		}
-		return ad
+		return ad, nil, nil
+	}
+	// A record the interning path cannot re-encode -- one that does not decode -- is not a reason
+	// to leave the whole shard uncompacted, which used to happen on every pass for as long as the
+	// record existed. It is copied unchanged instead, into a segment of the same key form as the
+	// one it came from, so every reader treats it exactly as before: a reader that refused it still
+	// refuses it, and nothing reads it as different values.
+	//
+	// It cannot go into an interned destination. Those records are keyed by the destination's own
+	// dictionary, and a reader resolves every record of the segment through it; the copied bytes
+	// are keyed by names (an inline source) or by the SOURCE segment's ids (an interned one). So
+	// each source key form gets a destination of its own: one with no dictionary for records from
+	// inline segments, and for records from an interned segment one carrying an exact copy of that
+	// segment's dictionary, so every id names what it named before. The whole wire is copied --
+	// for a columnarized source that includes the columns, as the ordinary copy does -- under the
+	// target codec, with the source's header flags.
+	//
+	// A record whose wire cannot be read at all (an unusable dictionary, a damaged columnar
+	// payload, bytes that do not decompress) is a different matter: the source segment holds what
+	// Fsck and Repair work from, and a copy would not carry it. That shard is left uncompacted and
+	// the segment marked (compactBlocked) so later passes do not repeat the attempt.
+	type preserveStream struct {
+		cur  *segment
+		dict []byte // the source's serialized dictionary; nil for inline sources
+	}
+	preserveStreams := map[*segDictHandle]*preserveStream{}
+	var preserveSegs []*segment
+	finalizePreserve := func(ps *preserveStream) {
+		if ps.cur == nil || ps.dict == nil {
+			return
+		}
+		off, ok := ps.cur.appendDict(ps.dict)
+		if !ok {
+			abort = true // sized for it below, so this does not happen; never publish ids without names
+			return
+		}
+		ps.cur.dict.Store(&segDictHandle{data: ps.cur.data, base: off + recKeyOff + 4, rec: off})
+	}
+	shardIdx := -1
+	preserveUndecodable := func(src *segment, o uint32, seq uint64, key, w []byte, cause error) (*segment, uint32) {
+		h := src.dict.Load()
+		ps := preserveStreams[h]
+		if ps == nil {
+			ps = &preserveStream{}
+			if h != nil {
+				names := make([]string, h.count())
+				for i := range names {
+					names[i] = string(h.name(uint32(i)))
+				}
+				ps.dict = appendSegDict(nil, names)
+			}
+			preserveStreams[h] = ps
+		}
+		body := target.Compress(nil, w)
+		rl := recordLen(len(key), len(body))
+		need := rl
+		if ps.dict != nil {
+			need += recordLen(0, len(ps.dict))
+		}
+		if ps.cur == nil || ps.cur.used+need > len(ps.cur.data) {
+			finalizePreserve(ps)
+			ps.cur = newDst(&preserveSegs, need, target)
+			ps.cur.preservesUndecodable = true
+		}
+		off, ok := ps.cur.appendFlagged(seq, noLoc, key, body, srcHdrFlags(src.data, o))
+		if !ok {
+			abort = true
+			return nil, 0
+		}
+		// Counted once per process: a record already preserved by an earlier pass is copied again
+		// by every later one, and reporting it each time would bury a new one.
+		if !src.preservesUndecodable {
+			if shardIdx < 0 {
+				shardIdx = slices.Index(c.shards, sh)
+			}
+			compactPreservedUndecodable.Add(1)
+			if hook := CompactUndecodableHook; hook != nil {
+				hook(CompactUndecodable{Dir: c.dir, Shard: shardIdx, Key: string(key), Err: cause.Error()})
+			}
+		}
+		return ps.cur, off
+	}
+	// blockShard marks src, whose record at key could not be read at all, so no later pass
+	// rewrites the shard while src is in it.
+	blockShard := func(src *segment, key []byte, cause error) {
+		abort = true
+		if !src.compactBlocked.CompareAndSwap(false, true) {
+			return
+		}
+		if shardIdx < 0 {
+			shardIdx = slices.Index(c.shards, sh)
+		}
+		compactBlockedSegments.Add(1)
+		if hook := CompactUndecodableHook; hook != nil {
+			hook(CompactUndecodable{Dir: c.dir, Shard: shardIdx, Key: string(key), Err: cause.Error(), Blocked: true})
+		}
 	}
 	// appendInterned encodes ad interned (with a hot header) against st and appends it to stream
 	// *curp, rolling to a fresh segment+stream (finalizing the old one's dict) when it would not
@@ -872,20 +1018,23 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 						}
 					}
 					if !placed {
-						ad := decodeSrc(seg, o)
-						if ad == nil {
-							abort = true
-							break
+						ad, w, derr := decodeSrc(seg, o)
+						switch {
+						case ad != nil:
+							dstSeg, dstOff = appendInterned(&dstSegs, &cur, &curStream, seq, key, ad)
+						case w != nil:
+							dstSeg, dstOff = preserveUndecodable(seg, o, seq, key, w, derr)
+						default:
+							blockShard(seg, key, derr)
 						}
-						dstSeg, dstOff = appendInterned(&dstSegs, &cur, &curStream, seq, key, ad)
 						if abort {
 							break
 						}
 					}
 				} else {
-					outAd, outCodec, rok := recompress(seg, o)
-					if !rok {
-						abort = true
+					outAd, outCodec, rerr := recompress(seg, o)
+					if rerr != nil {
+						blockShard(seg, key, rerr)
 						break
 					}
 					rl := recordLen(len(key), len(outAd))
@@ -914,20 +1063,25 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 							continue
 						}
 					}
-					ad := decodeSrc(seg, o)
-					if ad == nil {
-						abort = true
-						break
+					var hseg *segment
+					var hoff uint32
+					ad, w, derr := decodeSrc(seg, o)
+					switch {
+					case ad != nil:
+						hseg, hoff = appendInterned(&histSegs, &hcur, &hcurStream, seq, key, ad)
+					case w != nil:
+						hseg, hoff = preserveUndecodable(seg, o, seq, key, w, derr)
+					default:
+						blockShard(seg, key, derr)
 					}
-					hseg, hoff := appendInterned(&histSegs, &hcur, &hcurStream, seq, key, ad)
 					if abort {
 						break
 					}
 					hseg.supersedeRec(hoff, sup)
 				} else {
-					outAd, outCodec, rok := recompress(seg, o)
-					if !rok {
-						abort = true
+					outAd, outCodec, rerr := recompress(seg, o)
+					if rerr != nil {
+						blockShard(seg, key, rerr)
 						break
 					}
 					rl := recordLen(len(key), len(outAd))
@@ -949,6 +1103,11 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		finalizeInterned(cur, &curStream)
 		finalizeInterned(hcur, &hcurStream)
 	}
+	if !abort {
+		for _, ps := range preserveStreams {
+			finalizePreserve(ps)
+		}
+	}
 	if abort {
 		// Unpublished destinations: unmap + unlink them and leave the shard uncompacted (its
 		// sources remain in place; sh.act stays as Phase 1 / concurrent writes left it).
@@ -957,6 +1116,9 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		}
 		for _, s := range histSegs {
 			_ = s.reap()
+		}
+		for _, s := range preserveSegs {
+			_ = s.reap() //nolint:errcheck // best-effort, as for the destinations above
 		}
 		return
 	}
@@ -968,10 +1130,13 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	for _, seg := range histSegs {
 		_ = seg.flush()
 	}
+	for _, seg := range preserveSegs {
+		_ = seg.flush()
+	}
 
 	// Phase 3 (lock): finalize, rebuild the directory, and install.
 	sh.mu.Lock()
-	allDst := append(append([]*segment{}, dstSegs...), histSegs...)
+	allDst := append(append(append([]*segment{}, dstSegs...), histSegs...), preserveSegs...)
 	baseID := uint32(len(sh.segs))
 	for i, s := range allDst {
 		s.id = baseID + uint32(i)

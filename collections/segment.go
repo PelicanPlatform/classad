@@ -206,6 +206,14 @@ type segment struct {
 	// internSkipCounted is set once interning has counted this segment as skipped for an unusable
 	// dictionary (InternSkippedDictUnusable), so a segment counts once rather than once per pass.
 	internSkipCounted atomic.Bool
+	// compactBlocked is set when compaction met a record in this segment it could not read at all,
+	// and so left the shard uncompacted. Later passes skip the shard while this segment is in it:
+	// they would stop at the same record. Process-local, so a restart tries once more.
+	compactBlocked atomic.Bool
+	// preservesUndecodable marks a segment compaction wrote to hold records it copied unchanged
+	// because they do not decode. Set before the segment is published and never changed. A later
+	// pass copies such a record again without reporting it a second time.
+	preservesUndecodable bool
 	// damage is the byte ranges of this segment's records known to be damaged (see damage.go), nil
 	// when there are none. Every walk skips them. Set while the segment is opened, before anything
 	// else can see it, and persisted in its sidecar.

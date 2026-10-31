@@ -26,6 +26,10 @@ import "encoding/binary"
 // holds no key, so a record with any sealed value is refused. The caller's fallback decodes with
 // the key and re-encodes interned with the sealer, sealing each value afresh in the interned form;
 // the cost is only that such records do not get the transcode's speedup.
+//
+// An id-keyed node (nAttrRef/nFunc/nSelect) inside an inline-names ad is refused as malformed. The
+// inline encoder never writes one, and its id indexes no table this ad carries; copied into the
+// interned output it would index the NEW table and name whatever attribute holds that id there.
 
 // AppendInternedFromInline appends to dst the INTERNED form of src, an inline-names ad, and
 // returns the extended buffer. Names are interned into t; ids present in hot get a hot-header
@@ -115,10 +119,10 @@ func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 		// Refused, not malformed: the plaintext may hold inline names that cannot be rewritten
 		// without opening it. See the note at the top of this file.
 		return false
-	case nAttrRef:
-		c.skip(1) // scope byte
-		c.uvarint()
-		return copyFrom()
+	case nAttrRef, nFunc, nSelect:
+		// An id with no table behind it: see the note at the top of this file.
+		c.ok = false
+		return false
 
 	case nAttrRefStr:
 		// scope byte + inline name -> scope byte + id.
@@ -171,18 +175,6 @@ func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 		*out = append(*out, nRecord)
 		return transcodeAdBody(c, out, t, depth+1)
 
-	case nFunc:
-		c.uvarint() // name id
-		n := c.uvarint()
-		if !copyFrom() {
-			return false
-		}
-		for i := uint64(0); i < n; i++ {
-			if !transcodeNode(c, out, t, depth+1) {
-				return false
-			}
-		}
-		return true
 	case nFuncStr:
 		name := c.readNameBytes()
 		if !c.ok {
@@ -214,20 +206,6 @@ func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 			return false
 		}
 		return transcodeNode(c, out, t, depth+1) && transcodeNode(c, out, t, depth+1)
-	case nSelect:
-		if !copyFrom() {
-			return false
-		}
-		if !transcodeNode(c, out, t, depth+1) { // the record
-			return false
-		}
-		at := c.pos
-		c.uvarint()
-		if !c.ok {
-			return false
-		}
-		*out = append(*out, c.b[at:c.pos]...)
-		return true
 	case nSelectStr:
 		// node(record) + inline name -> node(record) + id. The TAG has to be written before the
 		// record node, so it cannot share the copyFrom path.

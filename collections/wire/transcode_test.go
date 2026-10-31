@@ -382,3 +382,40 @@ func TestTranscodeRefusesSealedValues(t *testing.T) {
 		})
 	}
 }
+
+// TestTranscodeRefusesIDKeyedNodes: an inline-names ad holding an id-keyed node carries an id that
+// indexes no table of its own. Copied into the interned output, the id would index the table being
+// built and name whatever attribute holds that id there -- a different value, read back as if it
+// were right. Each id-keyed node, at the top level and nested, is refused.
+func TestTranscodeRefusesIDKeyedNodes(t *testing.T) {
+	// [Id = 5; Bad = <node>] in the inline-names form.
+	inlineAd := func(node ...byte) Ad {
+		b := []byte{magicByte, formatVer, flagInlineNames, 0, 2, 2, 'I', 'd', nInt, 10, 3, 'B', 'a', 'd'}
+		return Ad(append(b, node...))
+	}
+	cases := []struct {
+		name string
+		node []byte
+	}{
+		{"attribute reference", []byte{nAttrRef, 0, 0}},
+		{"function call", []byte{nFunc, 0, 0}},
+		{"select", []byte{nSelect, nUndefined, 0}},
+		{"reference inside a list", []byte{nList, 2, nInt, 2, nAttrRef, 0, 0}},
+		{"reference inside a record", []byte{nRecord, 0, 1, 1, 'a', nAttrRef, 0, 0}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tt := NewInternTable()
+			tt.Intern("Id") // id 0 names a real attribute in the table the output is keyed by
+			if out, ok := AppendInternedFromInline(nil, inlineAd(tc.node...), tt, nil); ok {
+				back, err := DecodeResolve(out, tt.Name)
+				t.Fatalf("transcoded an inline ad holding an id-keyed node; it reads back as %v, %v", back, err)
+			}
+		})
+	}
+	// The same shapes with inline names transcode, so the refusal is the id and not the shape.
+	tt := NewInternTable()
+	if _, ok := AppendInternedFromInline(nil, inlineAd(nList, 2, nInt, 2, nAttrRefStr, 0, 2, 'I', 'd'), tt, nil); !ok {
+		t.Fatal("refused the inline-name form of the same ad")
+	}
+}
