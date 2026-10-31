@@ -1,8 +1,6 @@
 package collections
 
 import (
-	"strings"
-
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -350,6 +348,11 @@ func segmentVerdict(w segWindow, conds []rangeCond, condIDs []uint32) segVerdict
 // a segment already proven to match nothing: its records still count toward completeness.
 func countAttrWhere(c *Collection, w segWindow, attr string, conds []rangeCond, skip bool,
 	from, to int, dbuf *[]byte, counts map[string]int64) (int64, bool) {
+	ra := c.recAttrIn(w, attr)
+	rconds := make([]recAttr, len(conds))
+	for i, cond := range conds {
+		rconds[i] = c.recAttrIn(w, cond.attr)
+	}
 	var n int64
 	for off := from; off < to; {
 		o := uint32(off)
@@ -362,61 +365,47 @@ func countAttrWhere(c *Collection, w segWindow, attr string, conds []rangeCond, 
 			break
 		}
 		off += int(total)
-		if isSystemKeyBytes(recKey(w.data, o)) {
-			continue
+		if recIsMarker(w.data, o) || isSystemKeyBytes(recKey(w.data, o)) {
+			continue // not an ad (see countAttrRange)
 		}
 		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
 		if err != nil {
 			return 0, false
 		}
 		*dbuf = raw
-		var val string
-		gotVal := false
-		matches := true
-		undecidable := false
-		seenCond := make([]bool, len(conds))
-		wire.Ad(raw).ForEachNamed(c.intern, func(name string, node []byte) bool {
-			if !gotVal && strings.EqualFold(name, attr) {
-				if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitString {
-					val, gotVal = lit.Str, true
-				} else {
-					matches = false
-					return false
-				}
-			}
-			for i, cond := range conds {
-				if seenCond[i] || !strings.EqualFold(name, cond.attr) {
-					continue
-				}
-				f, ok := literalFloat(node)
-				if !ok {
-					// A literal that is not a number fails the comparison. An EXPRESSION has a value
-					// only evaluating it gives, and treating it as failing dropped the record from its
-					// group whenever the group attribute had already been read.
-					if isExprNode(node) {
-						undecidable = true
-					}
-					matches = false
-					return false
-				}
-				seenCond[i] = true
-				if !cond.holds(f) {
-					matches = false
-				}
-			}
-			return true
-		})
-		if !gotVal || undecidable {
+		ad := wire.Ad(raw)
+		node, ok := ra.lookup(ad)
+		if !ok {
 			return 0, false // cannot attribute this record to a group
 		}
-		for i := range conds {
-			if !seenCond[i] {
+		lit, ok := wire.LiteralValue(node)
+		if !ok || lit.Kind != wire.LitString {
+			return 0, false
+		}
+		matches := true
+		for i, cond := range conds {
+			node, ok := rconds[i].lookup(ad)
+			if !ok {
 				matches = false // the constraint references an attribute this record lacks
+				continue
+			}
+			f, ok := literalFloat(node)
+			if !ok {
+				// A literal that is not a number fails the comparison. An EXPRESSION has a value
+				// only evaluating it gives, so the record cannot be placed without evaluating it.
+				if isExprNode(node) {
+					return 0, false
+				}
+				matches = false
+				continue
+			}
+			if !cond.holds(f) {
+				matches = false
 			}
 		}
 		n++
 		if !skip && matches {
-			counts[val]++
+			counts[lit.Str]++
 		}
 	}
 	return n, true

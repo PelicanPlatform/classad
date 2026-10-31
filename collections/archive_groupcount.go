@@ -253,10 +253,11 @@ func (c *Collection) categoricalGroupCounts(attr string) (map[string]int64, bool
 //
 // Attributes are matched by name rather than by the index's attribute id: an index spec may
 // be inline, in which case its ids are synthetic and share no id space with the encoded
-// records. Name matching is the one bridge that holds in either regime. It costs a walk of
-// each record's attributes, which is affordable because this only ever runs over the
-// segment the index does not cover -- bounded by the segment size, not the archive.
+// records. The name is resolved to the key the window's records use once (see recAttrIn),
+// and each record is then probed for it. This only ever runs over the segment the index
+// does not cover -- bounded by the segment size, not the archive.
 func countAttrRange(c *Collection, w segWindow, attr string, from, to int, dbuf *[]byte, counts map[string]int64) (int64, bool) {
+	ra := c.recAttrIn(w, attr)
 	var n int64
 	for off := from; off < to; {
 		o := uint32(off)
@@ -269,29 +270,25 @@ func countAttrRange(c *Collection, w segWindow, attr string, from, to int, dbuf 
 			break
 		}
 		off += int(total)
-		if isSystemKeyBytes(recKey(w.data, o)) {
-			continue // internal record, not part of the user's data (nor of Len)
+		// A marker (a time checkpoint, the segment's dictionary or its columnar payload) is not an
+		// ad, and neither is an internal record: neither is part of the user's data, nor of Len.
+		if recIsMarker(w.data, o) || isSystemKeyBytes(recKey(w.data, o)) {
+			continue
 		}
 		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
 		if err != nil {
 			return 0, false
 		}
 		*dbuf = raw
-		var val string
-		found := false
-		wire.Ad(raw).ForEachNamed(c.intern, func(name string, node []byte) bool {
-			if !strings.EqualFold(name, attr) {
-				return true
-			}
-			if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitString {
-				val, found = lit.Str, true
-			}
-			return false // stop at the attribute, however it turned out
-		})
-		if !found {
-			return 0, false // absent, or present but not an indexable string literal
+		node, ok := ra.lookup(wire.Ad(raw))
+		if !ok {
+			return 0, false // absent
 		}
-		counts[val]++
+		lit, ok := wire.LiteralValue(node)
+		if !ok || lit.Kind != wire.LitString {
+			return 0, false // present but not an indexable string literal
+		}
+		counts[lit.Str]++
 		n++
 	}
 	return n, true
@@ -303,6 +300,7 @@ func countAttrRange(c *Collection, w segWindow, attr string, from, to int, dbuf 
 // indexed path holds.
 func countAttrBucketRange(c *Collection, w segWindow, attr, bucketAttr string, width int64,
 	from, to int, dbuf *[]byte, addTo func(bucket int64, v string, n int64)) (int64, bool) {
+	ra, rb := c.recAttrIn(w, attr), c.recAttrIn(w, bucketAttr)
 	var n int64
 	for off := from; off < to; {
 		o := uint32(off)
@@ -315,7 +313,7 @@ func countAttrBucketRange(c *Collection, w segWindow, attr, bucketAttr string, w
 			break
 		}
 		off += int(total)
-		if isSystemKeyBytes(recKey(w.data, o)) {
+		if recIsMarker(w.data, o) || isSystemKeyBytes(recKey(w.data, o)) {
 			continue
 		}
 		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
@@ -323,39 +321,68 @@ func countAttrBucketRange(c *Collection, w segWindow, attr, bucketAttr string, w
 			return 0, false
 		}
 		*dbuf = raw
-		var val string
-		var bucket int64
-		gotVal, gotBucket, inBucket := false, false, false
-		wire.Ad(raw).ForEachNamed(c.intern, func(name string, node []byte) bool {
-			switch {
-			case !gotVal && strings.EqualFold(name, attr):
-				if lit, ok := wire.LiteralValue(node); ok && lit.Kind == wire.LitString {
-					val, gotVal = lit.Str, true
-				} else {
-					return false // present but not indexable: decline
-				}
-			case !gotBucket && strings.EqualFold(name, bucketAttr):
-				f, ok := literalFloat(node)
-				if !ok {
-					return false // present but not a number: decline
-				}
-				// A non-finite number is READ but belongs to no bucket, so the record is
-				// accounted for (it counts toward the completeness total below) while
-				// contributing to no group -- which is what the scan does with it too.
-				bucket, inBucket = bucketOf(f, width)
-				gotBucket = true
-			}
-			return !(gotVal && gotBucket)
-		})
-		if !gotVal || !gotBucket {
+		ad := wire.Ad(raw)
+		node, ok := ra.lookup(ad)
+		if !ok {
 			return 0, false
 		}
-		if inBucket {
-			addTo(bucket, val, 1)
+		lit, ok := wire.LiteralValue(node)
+		if !ok || lit.Kind != wire.LitString {
+			return 0, false // present but not indexable: decline
+		}
+		if node, ok = rb.lookup(ad); !ok {
+			return 0, false
+		}
+		f, ok := literalFloat(node)
+		if !ok {
+			return 0, false // present but not a number: decline
+		}
+		// A non-finite number is READ but belongs to no bucket, so the record is accounted for
+		// (it counts toward the completeness total below) while contributing to no group --
+		// which is what the scan does with it too.
+		if bucket, inBucket := bucketOf(f, width); inBucket {
+			addTo(bucket, lit.Str, 1)
 		}
 		n++
 	}
 	return n, true
+}
+
+// recAttr is one attribute name resolved to the key a single segment window's records carry it
+// under, so a record walk resolves the name once per window rather than once per record.
+type recAttr struct {
+	name   string
+	byName bool   // inline-names records: matched by their stored name
+	id     uint32 // otherwise the id the window's records key the attribute by
+	has    bool   // false: no record in the window can carry the attribute
+}
+
+// recAttrIn resolves name for the records of window w. An interned segment's records key their
+// attributes by ids from the segment's OWN dictionary, which is a different id space from the
+// global intern table: naming those ids through the intern table reads some other attribute's
+// value under this name. So the name goes through the dictionary when the window has one, and
+// through the collection's own encoding (inline names, or global intern ids) otherwise.
+func (c *Collection) recAttrIn(w segWindow, name string) recAttr {
+	if d := w.dict(); d != nil {
+		id, ok := d.lookup(name)
+		return recAttr{id: id, has: ok}
+	}
+	if c.inline {
+		return recAttr{name: name, byName: true, has: true}
+	}
+	id, ok := c.intern.LookupID(name)
+	return recAttr{id: id, has: ok}
+}
+
+// lookup returns the attribute's node in one record of the window it was resolved for.
+func (r recAttr) lookup(a wire.Ad) ([]byte, bool) {
+	switch {
+	case !r.has:
+		return nil, false
+	case r.byName:
+		return a.LookupByName(r.name)
+	}
+	return a.Lookup(r.id)
 }
 
 // categoricalAttrID resolves an attribute name to its id among the spec's categorical
