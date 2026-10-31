@@ -600,6 +600,11 @@ func (c *Collection) readBaseSchemaFile() (persistedBaseSchema, bool) {
 // loadCommittedBaseSchema decodes the committed base schema, binding each field to this process's
 // intern id. ok=false for anything that does not decode to a valid layout, so a damaged record falls
 // back to recovering the schema from a segment rather than running under a wrong one.
+//
+// The file lists the fields in LAYOUT order (commitBaseSchema writes s.fields as they are), and that
+// order is kept as it stands -- see layoutStoredSchema. Re-sorting it here would hand this process a
+// different layout than the one the record was committed under, which is both wrong for the segments
+// already written under it and a reason to call every one of them stale.
 func (c *Collection) loadCommittedBaseSchema() (*adSchema, []int, bool) {
 	if c.intern == nil {
 		return nil, nil, false
@@ -643,7 +648,7 @@ func (c *Collection) loadCommittedBaseSchema() (*adSchema, []int, bool) {
 		seen[id] = true
 		fields = append(fields, adField{id: id, kind: k, width: pf.Width, unsigned: pf.Unsigned})
 	}
-	s := layoutSchema(fields)
+	s := layoutStoredSchema(fields)
 	var hot []int
 	for _, n := range rec.Hot {
 		id, ok := c.intern.LookupID(n)

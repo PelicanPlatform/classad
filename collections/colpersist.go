@@ -266,6 +266,10 @@ func marshalAdSchema(dst []byte, s *adSchema, nameOf func(uint32) (string, bool)
 // readAdSchema reads a name-keyed schema and re-binds each field to the current intern id via
 // internName (c.intern.Intern). Names are collected before any interning so a torn/corrupt read
 // (c.err) is rejected without polluting the intern table with junk names.
+//
+// The STORED ORDER is the layout, so it is kept exactly (layoutStoredSchema) rather than re-derived
+// from the ids this process happened to assign. Only the ids are rebound; where each field sits in
+// the record is what the writer decided.
 func readAdSchema(c *cursor, internName func(string) uint32) *adSchema {
 	n := int(c.u32())
 	if n < 0 || n > adSchemaMaxFields || !c.need(0) {
@@ -289,7 +293,7 @@ func readAdSchema(c *cursor, internName func(string) uint32) *adSchema {
 	for i, r := range raws {
 		fields[i] = adField{id: internName(r.name), kind: r.kind, width: r.width, unsigned: r.unsigned}
 	}
-	return layoutSchema(fields)
+	return layoutStoredSchema(fields)
 }
 
 // marshalColSegment serializes cs: the schema and hot set ONCE (every row group in a segment shares

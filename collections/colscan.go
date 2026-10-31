@@ -520,9 +520,12 @@ func (c *Collection) groupsFor(s *adSchema) []*colGroup {
 
 // colBlobForSeg builds and marshals seg's columnar block under the collection's CURRENT schema-scan
 // schema, for embedding in the segment's sidecar container so the block persists. Returns nil when
-// schema-scan is not enabled (nothing to persist) -- and never runs for an encryption-at-rest
-// collection, since EnableSchemaScan refuses those (a columnar block would store values in the
-// clear). Written at seal (sealSegmentIndex) and rebuilt on reindex (reindexSealedFile).
+// schema-scan is not enabled (nothing to persist). Written at seal (sealSegmentIndex) and rebuilt on
+// reindex (reindexSealedFile).
+//
+// An encryption-at-rest collection takes one like any other. It did not while sealing and the
+// accelerator were mutually exclusive, which is no longer true: a sealed value is not a literal, so
+// it never becomes a column and never reaches a block in the clear (see installSchemaScan).
 func (c *Collection) colBlobForSeg(seg *segment) []byte {
 	if colNativeBlobRedundant(seg) {
 		// The segment carries the authoritative copy; a sidecar copy would be the duplication
@@ -566,8 +569,8 @@ func (c *Collection) colBlobPreserve(seg *segment) []byte {
 // the collection adopts one block's schema + hot tier as the current schema-scan state, so
 // CountQuery routes and future seals build under it. Existing segments keep their OWN per-segment
 // schemas -- the scan resolves the field per block -- so this only seeds the "current" schema; it
-// never rewrites anything. A no-op when schema-scan is already enabled or no block was persisted
-// (so an encryption-at-rest collection, which never persists a block, never enables it here).
+// never rewrites anything. A no-op when schema-scan is already enabled, or when nothing on disk
+// describes a schema -- no committed base schema and no segment carrying a block.
 func (c *Collection) adoptPersistedSchemaScan() {
 	if c.schemaScan.Load() != nil {
 		return
