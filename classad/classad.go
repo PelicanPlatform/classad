@@ -132,6 +132,39 @@ func (e *Expr) String() string {
 	return e.expr.String()
 }
 
+// Unparse renders the expression the way the reference ClassAd unparser does,
+// which is what HTCondor writes into a job ad and what another ClassAd
+// implementation will read back.
+//
+// This is NOT what String returns. String is a debugging form: it
+// parenthesises every binary operation, and it prints a real with %g, so the
+// whole-number real 8.0 comes out as "8" and parses back as an INTEGER. Either
+// difference makes a comparison against a ClassAd produced elsewhere fail on
+// text that means the same thing -- or, in the real case, on text that no
+// longer means the same thing at all.
+//
+// Reach for this whenever the output leaves the process: a job ad, a wire
+// message, a diff against another implementation. Callers previously had to
+// get here by inserting into a scratch ClassAd, calling MarshalOld and
+// stripping the "X = " prefix.
+func (e *Expr) Unparse() string {
+	if e == nil || e.expr == nil {
+		return "undefined"
+	}
+	return unparseExprString(e.expr)
+}
+
+// UnparseOld renders the expression in old-ClassAd form, which differs from
+// Unparse only in string-literal escaping: the old format escapes the
+// delimiter alone, so a Windows path or a regex survives a round trip instead
+// of gaining a backslash each hop. See marshalOld.
+func (e *Expr) UnparseOld() string {
+	if e == nil || e.expr == nil {
+		return "undefined"
+	}
+	return unparseExprStringOld(e.expr)
+}
+
 // internal returns the internal ast.Expr representation.
 // This is used internally for operations that require the AST node.
 func (e *Expr) internal() ast.Expr {
