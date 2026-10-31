@@ -47,3 +47,8 @@ func (s *segment) unmap() error {
 	}
 	return errNoMmap
 }
+
+// adviseSequential and adviseNormal are readahead hints for the recovery walk; there is
+// no mapping to advise without persistence.
+func (s *segment) adviseSequential() {}
+func (s *segment) adviseNormal()     {}

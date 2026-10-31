@@ -541,6 +541,10 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			f.Close()
 			return 0, err
 		}
+		// Everything between here and the end of loadShard that touches this mapping --
+		// the extent walk below, rebuildDir, a zone recompute -- reads it front to back,
+		// so hint for that now and reset it once the open is done.
+		seg.adviseSequential()
 		// The write extent is the run of records from offset 0 until an unwritten
 		// (zero totalLen) or out-of-bounds record — the file is zero-initialized.
 		used := 0
@@ -748,6 +752,13 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		}
 	}
 	tm.LoadSidecars = time.Since(sidecarStart)
+	// Every front-to-back pass over these mappings is finished; from here on access is
+	// by key, so drop the sequential hint.
+	for _, seg := range sh.segs {
+		if seg != nil {
+			seg.adviseNormal()
+		}
+	}
 	return maxNum, nil
 }
 
@@ -1344,6 +1355,14 @@ func (c *Collection) teardown(discard bool) error {
 			// that finds and records that damage, and every later scan would come back short again.
 			if c.dir != "" && sh.childParentHash == nil && !shardFramingLost(sh) {
 				shardDir := filepath.Join(c.dir, fmt.Sprintf("%d", i))
+				// Writing the snapshot validates every entry, which reads the record it
+				// names; the entries are sorted so that runs forwards through each segment.
+				// Hint for it. No reset: these mappings are unmapped a few lines below.
+				for _, seg := range sh.segs {
+					if seg != nil {
+						seg.adviseSequential()
+					}
+				}
 				writeDirSnapshot(sh, shardDir, c.h)
 			}
 		}

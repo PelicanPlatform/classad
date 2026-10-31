@@ -5,6 +5,7 @@ import (
 	"hash/crc32"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
 // A directory snapshot is a per-shard fast-reopen optimization. On a clean Close the
@@ -37,6 +38,9 @@ const (
 	dirSnapMagic     = 0x53524944 // "DIRS"
 	dirSnapVersionV1 = 1          // directory only
 	dirSnapVersion   = 2          // + per-segment scan-pruning counters
+
+	// dirSnapEntryLen is one serialized directory entry: hash u64, slot u32, offset u32.
+	dirSnapEntryLen = 16
 )
 
 // dirSnapVersionKnown reports whether v is a snapshot version this build reads. The header
@@ -67,6 +71,61 @@ func dirEntryValid(seg *segment, off uint32, h uint64, hasher Hasher) bool {
 	}
 	return hasher.Hash(recKey(seg.data, off)) == h
 }
+
+// dirSnapEnt is one directory entry while it is being ordered: the key hash, the
+// snapshot slot it is written under, and the segment array index + offset it names.
+// Both the writer and the reader sort by (seg, off) so that validating the entries --
+// which reads each record -- walks every segment forwards instead of at random.
+type dirSnapEnt struct {
+	hash uint64
+	slot uint32
+	seg  uint32
+	off  uint32
+}
+
+// sortDirSnapEnts orders entries by the record they name, so a pass that reads those
+// records runs in offset order within each segment. Sorting by slot rather than by
+// array index is the same order -- slots are handed out in increasing array index --
+// and it is the order the file is written in, which is what the reader sorts back to.
+func sortDirSnapEnts(ents []dirSnapEnt) {
+	sort.Slice(ents, func(i, j int) bool {
+		if ents[i].slot != ents[j].slot {
+			return ents[i].slot < ents[j].slot
+		}
+		return ents[i].off < ents[j].off
+	})
+}
+
+// dirSnapEntryBytes sorts a serialized entry array in place. It is sortDirSnapEnts over
+// the on-disk form: each element is one dirSnapEntryLen-byte entry, ordered by the
+// (slot, offset) it names, so a reader validating them walks each segment forwards.
+type dirSnapEntryBytes []byte
+
+func (e dirSnapEntryBytes) Len() int { return len(e) / dirSnapEntryLen }
+
+func (e dirSnapEntryBytes) at(i int) []byte {
+	return e[i*dirSnapEntryLen : (i+1)*dirSnapEntryLen]
+}
+
+func (e dirSnapEntryBytes) Less(i, j int) bool {
+	a, b := e.at(i), e.at(j)
+	as, bs := binary.LittleEndian.Uint32(a[8:]), binary.LittleEndian.Uint32(b[8:])
+	if as != bs {
+		return as < bs
+	}
+	return binary.LittleEndian.Uint32(a[12:]) < binary.LittleEndian.Uint32(b[12:])
+}
+
+func (e dirSnapEntryBytes) Swap(i, j int) {
+	var tmp [dirSnapEntryLen]byte
+	a, b := e.at(i), e.at(j)
+	copy(tmp[:], a)
+	copy(a, b)
+	copy(b, tmp[:])
+}
+
+// sortDirSnapEntryBytes orders a serialized entry array in place; see dirSnapEntryBytes.
+func sortDirSnapEntryBytes(b []byte) { sort.Sort(dirSnapEntryBytes(b)) }
 
 // writeDirSnapshot persists shard sh's directory to <shardDir>/dir.snap. The caller
 // holds sh.mu and must have flushed every segment durable first, so the snapshot
@@ -138,6 +197,18 @@ func writeDirSnapshot(sh *shard, shardDir string, hasher Hasher) {
 	nEntOff := len(buf)
 	buf = binary.LittleEndian.AppendUint64(buf, 0) // entry count, back-patched below
 	var nEntries uint64
+	// Collect and order the entries by the record they name BEFORE validating any of
+	// them, because dirEntryValid reads the record -- its header, and its key, which it
+	// re-hashes. Ranging over sh.dir hands those out in map order, so validating as we
+	// went touched one page per live key in random order, with nothing for readahead to
+	// work with. On a large table that is the dominant cost of both Close and the reopen
+	// that reads this file back, and it can exceed the full sequential walk the snapshot
+	// exists to avoid -- invisible until a store outgrows the page cache.
+	//
+	// Sorted, each segment is read front to back instead. The order is also what the
+	// reader sees, so the same win lands on the Open side; see loadDirSnapshot, which
+	// sorts too rather than trusting the file to be ordered.
+	ents := make([]dirSnapEnt, 0, len(sh.dir))
 	for h, l := range sh.dir {
 		slot, ok := slotOf[l.seg]
 		if !ok {
@@ -146,12 +217,16 @@ func writeDirSnapshot(sh *shard, shardDir string, hasher Hasher) {
 			// the reopen falls back to the authoritative scan.
 			return
 		}
-		if !dirEntryValid(sh.segs[l.seg], l.off, h, hasher) {
+		ents = append(ents, dirSnapEnt{hash: h, slot: slot, seg: l.seg, off: l.off})
+	}
+	sortDirSnapEnts(ents)
+	for _, e := range ents {
+		if !dirEntryValid(sh.segs[e.seg], e.off, e.hash, hasher) {
 			continue
 		}
-		buf = binary.LittleEndian.AppendUint64(buf, h)
-		buf = binary.LittleEndian.AppendUint32(buf, slot)
-		buf = binary.LittleEndian.AppendUint32(buf, l.off)
+		buf = binary.LittleEndian.AppendUint64(buf, e.hash)
+		buf = binary.LittleEndian.AppendUint32(buf, e.slot)
+		buf = binary.LittleEndian.AppendUint32(buf, e.off)
 		nEntries++
 	}
 	binary.LittleEndian.PutUint64(buf[nEntOff:], nEntries)
@@ -263,12 +338,34 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 	if r.err {
 		return false
 	}
+	entryStart := r.pos
+	// Order the entries by the record they name before validating any of them, because
+	// dirEntryValid reads that record -- its header, and its key, which it re-hashes.
+	// Taken in file order those are one page touch per live key wherever the writer
+	// happened to emit them, which for a map range is random, with nothing for readahead
+	// to work with. On a store whose segments no longer fit in page cache that is the
+	// dominant cost of the fast reopen, and it can exceed the full sequential walk the
+	// snapshot exists to avoid.
+	//
+	// The sort is over the file's own bytes, in place, rather than over decoded entries:
+	// a decoded slice would add 24 bytes per live key to the peak of the path being made
+	// cheaper. A current writer has already sorted them, but the file is not trusted to
+	// be ordered -- an older snapshot is still read, and re-sorting a sorted slice costs
+	// almost nothing next to the faults it saves.
+	//
+	// Validation order does not affect the outcome: a single failure refuses the whole
+	// snapshot, so it does not matter which entry is reached first.
+	if nEntries < 0 || entryStart+nEntries*dirSnapEntryLen != len(body) {
+		return false // entry count does not match the remaining bytes
+	}
+	sortDirSnapEntryBytes(body[entryStart:])
 	dir := make(map[uint64]loc, nEntries)
 	for i := 0; i < nEntries; i++ {
-		h := r.u64()
-		slot := int(r.u32())
-		off := r.u32()
-		if r.err || slot >= nSegs {
+		e := body[entryStart+i*dirSnapEntryLen:]
+		h := binary.LittleEndian.Uint64(e)
+		slot := int(binary.LittleEndian.Uint32(e[8:]))
+		off := binary.LittleEndian.Uint32(e[12:])
+		if slot >= nSegs {
 			return false
 		}
 		l := loc{seg: slotToArray[slot], off: off}
@@ -276,9 +373,6 @@ func (c *Collection) loadDirSnapshot(sh *shard, shardDir string) bool {
 			return false // not a record of this bucket: the snapshot does not describe these segments
 		}
 		dir[h] = l
-	}
-	if r.err || r.pos != len(body) {
-		return false // trailing garbage
 	}
 
 	sh.dir = dir
