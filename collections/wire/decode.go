@@ -492,11 +492,10 @@ func (d *decoder) node(depth int) (ast.Expr, error) {
 			}
 			return nil, fmt.Errorf("%w: decrypting attribute: %w", ErrMalformed, err)
 		}
-		// Decode the recovered node with a sub-decoder in the same mode (and with the
-		// same key, so nested encryption also opens).
-		sub := &decoder{b: pt, inline: d.inline, resolve: d.resolve, open: d.open,
-			redactSealed: d.redactSealed}
-		return sub.node(depth + 1)
+		// Decode the recovered node in the ad's key form, or in the inline form an earlier build
+		// left some sealed values in (see readSealedPlain).
+		v, _, _, err := d.readSealedPlain(pt, depth+1, sealedExpr, nil)
+		return v, err
 	default:
 		return nil, fmt.Errorf("%w: unknown node tag 0x%02x", ErrMalformed, tag)
 	}

@@ -279,9 +279,8 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 			}
 			return dst, fmt.Errorf("%w: opening sealed value: %w", ErrMalformed, err)
 		}
-		sub := &decoder{b: pt, inline: d.inline, resolve: d.resolve, open: d.open,
-			redactSealed: d.redactSealed, oldStrings: d.oldStrings}
-		return sub.appendNode(dst, depth+1)
+		_, dst, _, err = d.readSealedPlain(pt, depth+1, sealedText, dst)
+		return dst, err
 	default:
 		return dst, ErrMalformed
 	}

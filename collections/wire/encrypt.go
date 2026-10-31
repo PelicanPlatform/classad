@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/binary"
 	"fmt"
+	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/ast"
 )
@@ -38,6 +39,87 @@ func (e *encoder) encNode(v ast.Expr) {
 	e.buf = append(e.buf, nonce...)
 	e.buf = binary.AppendUvarint(e.buf, uint64(len(ct)))
 	e.buf = append(e.buf, ct...)
+}
+
+// sealedInlineFormRecoveries counts sealed values read in the inline-names key form from inside an
+// interned ad; see readSealedPlain.
+var sealedInlineFormRecoveries atomic.Int64
+
+// SealedInlineFormRecoveries reports how many sealed values, since the process started, were read from
+// an interned ad in the inline-names key form because they did not parse in the interned form (see
+// readSealedPlain). Each is a value an earlier build copied unopened from an inline-names record into an
+// interned one. It counts reads, not records: a record read twice counts twice, and a record stops
+// counting once a rewrite re-seals it in the interned form.
+func SealedInlineFormRecoveries() int64 { return sealedInlineFormRecoveries.Load() }
+
+// refuseIDs is the resolver of a decoder reading inline-names plaintext. An inline encoder writes every
+// name inline, so an interned id in such plaintext means it is not what an inline encoder wrote.
+func refuseIDs(uint32) (string, bool) { return "", false }
+
+// sealedRead says what readSealedPlain produces from a sealed value's plaintext.
+type sealedRead uint8
+
+const (
+	sealedExpr sealedRead = iota // an ast.Expr (decoder.node)
+	sealedText                   // the value's text appended to dst (decoder.appendNode)
+)
+
+// readSealedPlain reads pt, the opened plaintext of a sealed value in the ad d is reading, as an
+// expression or as text appended to dst (as says which), and reports whether it was read in the
+// inline-names form from an interned ad. On error the returned slice is dst as it was passed.
+//
+// A sealed value's plaintext is its node encoding in the key form of the ad it was SEALED in, and the
+// reader assumes that is the form of the ad it is read from. An earlier build broke that: compaction
+// copied sealed values unopened from inline-names records into interned ones. A value holding a record
+// literal then carries its member names inline, and reading it with interned key semantics takes a
+// name's length for an id and the name's first byte for a node tag. Those values are intact -- only the
+// key form is wrong -- so when the interned parse of a sealed value in an interned ad is rejected, it is
+// read again in the inline-names form.
+//
+// A parse is accepted only if it succeeds AND consumes every byte of pt. The encoder seals exactly one
+// node, so leftover bytes mean the node was read in the wrong form even when what was read happened to
+// be well formed. The inline retry is stricter still: an interned id anywhere in it is refused
+// (refuseIDs), as is a nested sealed value (no key), because an inline encoder writes neither. A value
+// rejected by both parses reports the first parse's error, exactly as before the retry existed.
+//
+// The interned form is tried first and wins whenever it parses, so the retry never reinterprets a value
+// that is correct in the interned form, which is every value an interned encoder sealed. Both forms
+// parsing is not ambiguous in practice: values without record members encode identically in both, and
+// for a record the interned parse reads each member name's first byte as a node tag, which is below
+// 0x18 only for a name starting with a control character -- something no unquoted attribute name can.
+//
+// The two decoders are values and the parse is chosen by as rather than passed in as a function, so
+// that the common case, one accepted parse, allocates no decoder.
+func (d *decoder) readSealedPlain(pt []byte, depth int, as sealedRead, dst []byte) (ast.Expr, []byte, bool, error) {
+	sub := decoder{b: pt, inline: d.inline, resolve: d.resolve, open: d.open,
+		redactSealed: d.redactSealed, oldStrings: d.oldStrings}
+	v, out, err := sub.readSealedAs(as, depth, dst)
+	if err == nil && sub.pos != len(pt) {
+		err = fmt.Errorf("%w: %d bytes left over after a sealed value", ErrMalformed, len(pt)-sub.pos)
+	}
+	if err == nil {
+		return v, out, false, nil
+	}
+	if d.inline {
+		return nil, dst, false, err
+	}
+	alt := decoder{b: pt, inline: true, resolve: refuseIDs, oldStrings: d.oldStrings}
+	av, aout, aerr := alt.readSealedAs(as, depth, dst)
+	if aerr != nil || alt.pos != len(pt) {
+		return nil, dst, false, err
+	}
+	sealedInlineFormRecoveries.Add(1)
+	return av, aout, true, nil
+}
+
+// readSealedAs is one parse of readSealedPlain.
+func (d *decoder) readSealedAs(as sealedRead, depth int, dst []byte) (ast.Expr, []byte, error) {
+	if as == sealedText {
+		out, err := d.appendNode(dst, depth)
+		return nil, out, err
+	}
+	v, err := d.node(depth)
+	return v, dst, err
 }
 
 // OpenEncryptedNode returns the plain node bytes sealed inside an nEncrypted

@@ -3,6 +3,8 @@ package collections
 import (
 	"errors"
 	"sync/atomic"
+
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // readFail names WHY a stored record could not be read. A read that misses returns a bare
@@ -116,6 +118,15 @@ var sealedSkippedNoIndex atomic.Int64
 // SealedProbesSkipped reports how many sealed-segment probes were skipped for want of a key
 // index. A rising count alongside delta-index-pending says reads are racing the reindex pass.
 func SealedProbesSkipped() int64 { return sealedSkippedNoIndex.Load() }
+
+// SealedInlineFormRecoveries reports how many sealed values were read from an interned record in the
+// inline-names key form, because they did not parse in the interned form every other sealed value in
+// such a record has. An earlier build's compaction copied sealed values unopened from inline-names
+// records into interned ones; a value holding a record literal was then unreadable, and its shard could
+// not compact. Each such value is now read in the form it was sealed in, and the next compaction of its
+// shard re-seals it in the interned form, after which it stops counting. A count that keeps rising
+// therefore means a shard that is not compacting. It counts reads, not records.
+func SealedInlineFormRecoveries() int64 { return wire.SealedInlineFormRecoveries() }
 
 // lastNoBase samples the shape of the most recent chain that had no whole record. The reason
 // name says which of three faults it was; this says how much of the chain was found, which is
