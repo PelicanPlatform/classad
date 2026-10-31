@@ -34,7 +34,11 @@ type colSegment struct {
 	// When false the payload was built for a segment with no dictionary and its tails carry global
 	// intern ids, which are renumbered at every Open -- so the section names them instead.
 	dictKeyed bool
-	blocks    []*columnarBlock
+	// sidecarMapped records that the blocks alias a sidecar file's mapping (read back by
+	// publishSidecar or installSidecar), so they must not outlive it: a sidecar rewrite that
+	// displaces the mapping has to displace them too. A freshly built block holds its own bytes.
+	sidecarMapped bool
+	blocks        []*columnarBlock
 	// offsB is the per-record arena offset map (record index -> its byte offset in the segment),
 	// packed as little-endian uint32 -- the exact on-disk form. A reopened segment ALIASES the mmap
 	// here (zero heap); a freshly built one holds a compact heap buffer. Read via offAt/offsLen. It
