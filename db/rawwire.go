@@ -259,7 +259,21 @@ var ErrSeqCursorExpired = collections.ErrSeqCursorExpired
 //
 // This is for a mutable table. An archive is already ordered newest-first with
 // its limit pushed down, so a "last K" read there needs no cursor at all.
+//
+// It is an entitled read: private attributes are kept and sealed values opened.
+// Serve anyone else with QueryRawProjectedFromSeqRedacted.
 func (db *DB) QueryRawProjectedFromSeq(constraint string, projection []string, after SeqCursor, limit int) (iter.Seq[collections.RawAd], *SeqPage, error) {
+	return db.queryRawProjectedFromSeq(constraint, projection, after, limit, false)
+}
+
+// QueryRawProjectedFromSeqRedacted is QueryRawProjectedFromSeq for a caller not
+// entitled to secrets, redacted as QueryRawProjected with redact set: private
+// attributes are dropped and sealed values render as undefined, read with no key.
+func (db *DB) QueryRawProjectedFromSeqRedacted(constraint string, projection []string, after SeqCursor, limit int) (iter.Seq[collections.RawAd], *SeqPage, error) {
+	return db.queryRawProjectedFromSeq(constraint, projection, after, limit, true)
+}
+
+func (db *DB) queryRawProjectedFromSeq(constraint string, projection []string, after SeqCursor, limit int, redact bool) (iter.Seq[collections.RawAd], *SeqPage, error) {
 	var q *vm.Query
 	if s := strings.TrimSpace(constraint); s != "" && !strings.EqualFold(s, "true") {
 		parsed, err := vm.Parse(constraint)
@@ -268,6 +282,12 @@ func (db *DB) QueryRawProjectedFromSeq(constraint string, projection []string, a
 		}
 		q = parsed
 	}
-	seq, page := db.c.QueryRawFromSeq(q, projection, after, limit)
+	var seq iter.Seq[collections.RawAd]
+	var page *SeqPage
+	if redact {
+		seq, page = db.c.QueryRawFromSeqRedacted(q, projection, after, limit)
+	} else {
+		seq, page = db.c.QueryRawFromSeq(q, projection, after, limit)
+	}
 	return gated(db, seq), page, nil
 }
