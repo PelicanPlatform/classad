@@ -180,7 +180,7 @@ func (c *Collection) wireLookupDict(dict *segDictHandle, a wire.Ad, name string)
 		if !ok {
 			return nil, false
 		}
-		return a.Lookup(id)
+		return a.Lookup(uint32(id))
 	}
 	return c.wireLookup(a, name)
 }

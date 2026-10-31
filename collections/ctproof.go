@@ -210,7 +210,7 @@ func namesCurrentTimeIn(w []byte, d *segDictHandle) bool {
 	if !ok {
 		return false
 	}
-	_, has := a.Lookup(lid)
+	_, has := a.Lookup(uint32(lid))
 	return has
 }
 

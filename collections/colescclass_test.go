@@ -63,7 +63,7 @@ func TestEscapeClassMatchesColdTail(t *testing.T) {
 				continue
 			}
 			checked++
-			_, found, err := blk.escapedNode(k, f.id, bc)
+			_, found, err := blk.escapedNode(k, globalID(f.id), bc)
 			if err != nil {
 				t.Fatal(err)
 			}

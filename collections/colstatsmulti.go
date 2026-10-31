@@ -141,7 +141,7 @@ func (c *numCol) at(k int, bc *blockCache) (colVal, bool) {
 func (c *numCol) cell(k int, bc *blockCache) (colVal, numCell) {
 	base := k * c.blk.bitsStride
 	if testBit(c.blk.bits[base:base+c.escBytes], c.fieldIdx) {
-		return c.blk.escapedNumCell(k, c.fieldID, bc)
+		return c.blk.escapedNumCell(k, globalID(c.fieldID), bc)
 	}
 	raw := readIntLE(c.region[c.start+k*c.width:], c.width, c.unsigned)
 	if c.isReal {

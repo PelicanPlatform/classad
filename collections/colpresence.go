@@ -149,7 +149,7 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 				// Unless its value was computed when the segment was columnarized, or this one record can
 				// be evaluated alone (heldValueNode): either is read below, before anything that would
 				// call the cell missing.
-				held := blk.heldAny(pred.fieldID)
+				held := blk.heldAny(globalID(pred.fieldID))
 				// No record in this block carries the attribute: every visible one of them is
 				// undefined, settled without touching a bitmap per record or the cold tail at all.
 				// The block's absence bit is about its own cells, so it says nothing once a record
@@ -185,8 +185,8 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 					// block's own cells never saw the expression.
 					if held {
 						node, ok := blk.computedNode(k, idx, bc)
-						if !ok && blk.heldAt(k, pred.fieldID) {
-							if node, ok = blk.heldValueNode(k, pred.fieldID, bc); !ok {
+						if !ok && blk.heldAt(k, globalID(pred.fieldID)) {
+							if node, ok = blk.heldValueNode(k, globalID(pred.fieldID), bc); !ok {
 								releaseWindows(wins)
 								return 0, false
 							}
@@ -208,7 +208,7 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 					// Either the field genuinely mixes the two, or this block predates the
 					// classification. Read just this field from the cold tail -- not the whole
 					// record.
-					node, found, err := blk.escapedNode(k, pred.fieldID, bc)
+					node, found, err := blk.escapedNode(k, globalID(pred.fieldID), bc)
 					if err != nil {
 						releaseWindows(wins)
 						return 0, false

@@ -268,7 +268,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 					// An interned record keys the attribute by the segment dictionary's id.
 					var nm []byte
 					if d != nil {
-						nm = d.name(id)
+						nm = d.name(segID(id))
 					}
 					if nm == nil {
 						remNamed = false // cannot name it: write no list rather than an incomplete one
@@ -987,7 +987,7 @@ func (c *Collection) globalIDOf(d *segDictHandle, id uint32, name string) (uint3
 		if d == nil {
 			return id, true // not interned: the record already carries global ids
 		}
-		nm := d.name(id)
+		nm := d.name(segID(id))
 		if nm == nil {
 			return 0, false
 		}

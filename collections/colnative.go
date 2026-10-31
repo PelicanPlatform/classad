@@ -229,7 +229,7 @@ func publishColRecord(c *Collection, seg *segment, o uint32) error {
 					continue
 				}
 				if lid, ok := cn.dict.lookup(name); ok {
-					cn.localOf[f.id] = lid
+					cn.localOf[f.id] = uint32(lid)
 				}
 			}
 		}
@@ -404,7 +404,7 @@ func (cn *colNative) spliceInto(c *Collection, remnant []byte, k int, dst []byte
 			//
 			// An interned segment needs no such step: its cold-tail ids are the segment dictionary's,
 			// which is the record's own key space, so they are emitted exactly as stored.
-			id = blk.remap.current(id)
+			id = uint32(blk.remap.current(storedID(id))) // POC boundary: id is a bare wire key here
 		}
 		switch {
 		case inline:
@@ -659,7 +659,7 @@ func (cn *colNative) appendGroupValues(c *Collection, dst []byte, added, k int, 
 				out = lid
 			}
 			if testBit(gb.blk.escapeAt(idx), fi) {
-				node, found, err := gb.blk.escapedNode(idx, f.id, sub.bc)
+				node, found, err := gb.blk.escapedNode(idx, globalID(f.id), sub.bc)
 				if err != nil {
 					return dst, added, err
 				}
@@ -742,11 +742,11 @@ func (cn *colNative) blockIndexAndLocal(k int) (int, int) {
 // This is what lets a columnar payload survive a restart without storing a name table beside it: the
 // segment already carries a dictionary naming every attribute its records use, so keying the payload
 // by that dictionary makes both sides of a restart agree by construction rather than by luck.
-func (c *Collection) segIDMapper(d *segDictHandle) func(uint32) (uint32, bool) {
+func (c *Collection) segIDMapper(d *segDictHandle) func(uint32) (segID, bool) {
 	if d == nil {
 		return nil
 	}
-	return func(id uint32) (uint32, bool) {
+	return func(id uint32) (segID, bool) {
 		name, ok := c.intern.Name(id)
 		if !ok {
 			return 0, false
@@ -762,15 +762,15 @@ func segIDRemap(c *Collection, d *segDictHandle) *idRemap {
 		return nil
 	}
 	n := d.count()
-	r := &idRemap{toStored: make(map[uint32]uint32, n), toCurrent: make(map[uint32]uint32, n)}
-	for lid := uint32(0); lid < n; lid++ {
+	r := &idRemap{toStored: make(map[globalID]storedID, n), toCurrent: make(map[storedID]globalID, n)}
+	for lid := segID(0); uint32(lid) < n; lid++ {
 		nm := d.name(lid)
 		if nm == nil {
 			continue
 		}
-		gid := c.intern.Intern(string(nm))
-		r.toStored[gid] = lid
-		r.toCurrent[lid] = gid
+		gid, sid := globalID(c.intern.Intern(string(nm))), storedID(lid)
+		r.toStored[gid] = sid
+		r.toCurrent[sid] = gid
 	}
 	return r
 }

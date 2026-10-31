@@ -264,7 +264,7 @@ func (c *Collection) scanNumValues(fieldID uint32, bc *blockCache, fn func(colVa
 					// The cold tail carries the wire node, so its kind is read from the node
 					// itself rather than assumed from this block's schema field. With row groups
 					// this decompresses only the escaped record's OWN group's tail.
-					switch nv, cell := blk.escapedNumCell(k, fieldID, bc); cell {
+					switch nv, cell := blk.escapedNumCell(k, globalID(fieldID), bc); cell {
 					case cellNumber:
 						fn(nv)
 					case cellExpr:

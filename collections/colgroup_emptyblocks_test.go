@@ -36,7 +36,7 @@ func TestEmptySegmentBuildsBlockWithoutGroupRow(t *testing.T) {
 	blocks, gblocks, _ := buildColumnarFromSegmentGrouped(seg.data, seg.used, nil, seg.codec,
 		c.regionCodec(), st.schema, st.hot, st.groups, c.colGrouping(),
 		func(dst, w []byte) ([]byte, bool) { return w, true },
-		func(u uint32) (uint32, bool) { return u, true },
+		func(u uint32) (segID, bool) { return segID(u), true },
 		func(o uint32) bool { return true }) // nothing is encodable
 
 	if len(blocks) != 1 {

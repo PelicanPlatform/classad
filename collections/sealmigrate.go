@@ -472,7 +472,7 @@ func (c *Collection) recordHasUnsealedValue(dict *segDictHandle, w []byte) bool 
 	switch {
 	case dict != nil:
 		wire.Ad(w).ForEach(func(id uint32, node []byte) bool {
-			if nm := dict.name(id); nm != nil && !sealedAlready(string(nm), node) {
+			if nm := dict.name(segID(id)); nm != nil && !sealedAlready(string(nm), node) {
 				found = true
 				return false
 			}

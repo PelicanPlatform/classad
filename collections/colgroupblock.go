@@ -154,7 +154,7 @@ func groupHave(w []byte, ids map[uint32]struct{}) int {
 // toLocal keys these blocks' cold tails by the SEGMENT's dictionary, for the same reason the base
 // block's are: an id written from the global intern table means nothing after a restart. nil keeps
 // them globally keyed, which is self-consistent but does not survive one.
-func buildGroupBlocks(groups []*colGroup, groupLayouts []*colLayout, iws [][]byte, regionCodec Codec, toLocal func(uint32) (uint32, bool)) []*colGroupBlock {
+func buildGroupBlocks(groups []*colGroup, groupLayouts []*colLayout, iws [][]byte, regionCodec Codec, toLocal func(uint32) (segID, bool)) []*colGroupBlock {
 	if len(groups) == 0 || len(iws) == 0 {
 		return nil
 	}
@@ -215,14 +215,14 @@ func groupSkipSet(groups []*colGroup, iw []byte) map[uint32]struct{} {
 
 // groupColdToField maps a group block's cold-tail ids to its schema's field indexes, in whichever id
 // space the tail was written in. See classifyEscapes for what goes wrong when the two disagree.
-func groupColdToField(s *adSchema, toLocal func(uint32) (uint32, bool)) map[uint32]int {
+func groupColdToField(s *adSchema, toLocal func(uint32) (segID, bool)) map[uint32]int {
 	if toLocal == nil {
 		return nil
 	}
 	m := make(map[uint32]int, len(s.fields))
 	for idx, f := range s.fields {
 		if lid, ok := toLocal(f.id); ok {
-			m[lid] = idx
+			m[uint32(lid)] = idx
 		}
 	}
 	return m

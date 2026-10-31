@@ -497,7 +497,7 @@ func (s *adSchema) encodeExcept(w wire.Ad, skip map[uint32]struct{}) []byte {
 // UNDEFINED after one -- silently, with no fallback. The segment's dictionary is durable and travels
 // with the records, so toLocal keys these entries by it. nil keeps the global id, which is only safe
 // for a payload that will not outlive the process.
-func (s *adSchema) encodeExceptLocal(w wire.Ad, skip map[uint32]struct{}, toLocal func(uint32) (uint32, bool)) []byte {
+func (s *adSchema) encodeExceptLocal(w wire.Ad, skip map[uint32]struct{}, toLocal func(uint32) (segID, bool)) []byte {
 	esc := make([]byte, s.escBytes)
 	fixed := make([]byte, s.fixedLen)
 	var cold []byte
@@ -622,10 +622,10 @@ func (s *adSchema) forEachKeyed(rec []byte, fn func(id uint32, node []byte, from
 
 // appendColdEntry writes one cold-tail entry, keyed by the segment's own id for the attribute when
 // one is available. See encodeExceptLocal for why the key matters.
-func appendColdEntry(cold []byte, id uint32, node []byte, toLocal func(uint32) (uint32, bool)) []byte {
+func appendColdEntry(cold []byte, id uint32, node []byte, toLocal func(uint32) (segID, bool)) []byte {
 	if toLocal != nil {
 		if lid, ok := toLocal(id); ok {
-			id = lid
+			id = uint32(lid) // POC: on a miss the key stays a GLOBAL id in a dictionary-keyed tail; the types expose it
 		}
 	}
 	return append(binary.AppendUvarint(cold, uint64(id)), node...)

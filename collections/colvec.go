@@ -337,13 +337,13 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 		node, found := s.blk.computedNode(k, idx, s.bc)
 		var err error
 		if !found {
-			node, found, err = s.blk.escapedNode(k, id, s.bc)
+			node, found, err = s.blk.escapedNode(k, globalID(id), s.bc)
 		}
 		if err != nil {
 			return false
 		}
 		if !found {
-			if s.blk.heldAt(k, id) {
+			if s.blk.heldAt(k, globalID(id)) {
 				return false // the value stayed in the record (an expression): only it can answer
 			}
 			dst.St[k] = vm.VsUndef

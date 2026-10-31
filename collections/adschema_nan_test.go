@@ -244,7 +244,7 @@ func TestNaNEscapeInColumnarBlock(t *testing.T) {
 		t.Fatalf("the NaN record classifies as missing=%v (ok=%v); it is present and exceptional",
 			missing, ok)
 	}
-	nv, cell := blk.escapedNumCell(nanAt, id, bc)
+	nv, cell := blk.escapedNumCell(nanAt, globalID(id), bc)
 	if cell != cellNumber || !math.IsNaN(nv.f) {
 		t.Fatalf("escaped cell = (%v, %d), want a NaN number", nv.f, cell)
 	}

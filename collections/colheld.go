@@ -34,8 +34,8 @@ import (
 // heldIndex is a columnarized segment's map of the schema-field cells its records still hold.
 type heldIndex struct {
 	once sync.Once
-	ok   bool                // false: the remnants could not be read, so nothing may be assumed absent
-	recs map[uint32][]uint32 // global attribute id -> ascending segment record indices holding it
+	ok   bool                  // false: the remnants could not be read, so nothing may be assumed absent
+	recs map[globalID][]uint32 // global attribute id -> ascending segment record indices holding it
 
 	// uncomputed caches, per (block's first record, field index), how many of the block's held cells
 	// of that field have no computed value -- the per-record exception budget (heldValueNode).
@@ -64,7 +64,7 @@ func (cs *colSegment) held() *heldIndex {
 }
 
 // scanHeld walks the segment's remnants and records, per schema field, the records holding it.
-func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
+func (cs *colSegment) scanHeld() (map[globalID][]uint32, bool) {
 	c, seg := cs.owner, cs.arena
 	if c == nil || c.intern == nil {
 		return nil, false
@@ -81,7 +81,7 @@ func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
 		}
 	}
 	d := seg.dict.Load()
-	recs := map[uint32][]uint32{}
+	recs := map[globalID][]uint32{}
 	var buf []byte
 	n := cs.offsLen()
 	dm := seg.damaged()
@@ -109,7 +109,7 @@ func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
 				return false
 			}
 			if _, isField := fields[gid]; isField {
-				recs[gid] = append(recs[gid], uint32(i))
+				recs[globalID(gid)] = append(recs[globalID(gid)], uint32(i))
 			}
 			return true
 		})
@@ -124,7 +124,7 @@ func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
 // columns -- a value the block cannot read. Always false for a block that is not part of a
 // columnarized segment, and always true when the segment's remnants could not be indexed: a reader
 // told true declines to the record, which is never wrong.
-func (b *columnarBlock) heldAt(k int, id uint32) bool {
+func (b *columnarBlock) heldAt(k int, id globalID) bool {
 	h := b.native.held()
 	if h == nil {
 		return false
@@ -144,7 +144,7 @@ func (b *columnarBlock) heldAt(k int, id uint32) bool {
 // heldKnown is heldAt without the benefit of the doubt: true only when the index is readable and
 // lists record k as holding field id. A caller that SKIPS work on true uses this; a caller that
 // declines on true uses heldAt.
-func (b *columnarBlock) heldKnown(k int, id uint32) bool {
+func (b *columnarBlock) heldKnown(k int, id globalID) bool {
 	h := b.native.held()
 	if h == nil || !h.ok {
 		return false
@@ -156,7 +156,7 @@ func (b *columnarBlock) heldKnown(k int, id uint32) bool {
 }
 
 // heldAny reports whether any record of this block holds field id in its record. See heldAt.
-func (b *columnarBlock) heldAny(id uint32) bool {
+func (b *columnarBlock) heldAny(id globalID) bool {
 	h := b.native.held()
 	if h == nil {
 		return false

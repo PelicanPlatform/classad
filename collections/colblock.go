@@ -521,7 +521,7 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 // row and no offset, so the rewrite that consumes these offsets does not carry it into the new
 // segment either. Used to drop DELTA records: each holds the attributes one write changed, so its
 // row would be almost entirely absent fields, and it is dead by the time its segment seals.
-func buildColumnarFromSegmentGrouped(data []byte, upto int, dm *damageSet, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+func buildColumnarFromSegmentGrouped(data []byte, upto int, dm *damageSet, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (segID, bool), skip func(uint32) bool) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
 	var buf []byte
 	for off := 0; off < upto; {
@@ -551,7 +551,7 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, dm *damageSet, arena
 // columnarized segment's records are remnants, so its full ads are reconstructed (remnant spliced
 // with the existing columns) before being re-split under a new group set. Sharing colBuild keeps the
 // block/group/offset logic byte-for-byte identical with the from-data path.
-func buildColumnarFromWires(offs []uint32, fulls [][]byte, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+func buildColumnarFromWires(offs []uint32, fulls [][]byte, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (segID, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
 	for i, w := range fulls {
 		cb.feed(offs[i], w)
@@ -569,7 +569,7 @@ type colBuild struct {
 	g            colGrouping
 	regionCodec  Codec
 	toInterned   func(dst, w []byte) ([]byte, bool)
-	toLocal      func(uint32) (uint32, bool)
+	toLocal      func(uint32) (segID, bool)
 	coldToField  map[uint32]int
 	rm           *idRemap
 	baseLayout   *colLayout
@@ -586,7 +586,7 @@ type colBuild struct {
 	alignedRows, alignedBytes int
 }
 
-func newColBuild(regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) *colBuild {
+func newColBuild(regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (segID, bool)) *colBuild {
 	// The cold tail is keyed by the segment's dictionary when there is one, so the classifier and the
 	// readers have to speak the same id space. Both maps are derived from the schema once, rather than
 	// per record.
@@ -594,12 +594,12 @@ func newColBuild(regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, 
 	var rm *idRemap
 	if toLocal != nil {
 		coldToField = make(map[uint32]int, len(s.fields))
-		rm = &idRemap{toStored: make(map[uint32]uint32, len(s.fields)), toCurrent: make(map[uint32]uint32, len(s.fields))}
+		rm = &idRemap{toStored: make(map[globalID]storedID, len(s.fields)), toCurrent: make(map[storedID]globalID, len(s.fields))}
 		for idx, f := range s.fields {
 			if lid, ok := toLocal(f.id); ok {
-				coldToField[lid] = idx
-				rm.toStored[f.id] = lid
-				rm.toCurrent[lid] = f.id
+				coldToField[uint32(lid)] = idx
+				rm.toStored[globalID(f.id)] = storedID(lid)
+				rm.toCurrent[storedID(lid)] = globalID(f.id)
 			}
 		}
 	}
@@ -1021,43 +1021,6 @@ func (b *columnarBlock) reconstructInto(dst []byte, k int, bc *blockCache) ([]by
 	return rec, nil
 }
 
-// escapedNumField reads the numeric value of an ESCAPED schema field (fieldID) for record k
-// straight from its cold-tail slice, skipping the whole-record reconstruct. A field is escaped
-// when it is missing or exceptional (out of the fitted width, or a type exception); an exceptional
-// value lives in the cold tail as a uvarint(id)+node entry alongside the record's non-schema
-// attributes. Returns (value, true) if fieldID has a numeric value here, or (0, false) if it is
-// missing or non-numeric. bc caches the decompressed cold stream, so a scan's many escaped reads
-// on one block share a single decompression. Callers use this only for records the scan has
-// already found escaped for fieldID; a hot/cold-column value never reaches here.
-func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (float64, bool, error) {
-	fieldID, known := b.remap.storedID(fieldID)
-	if !known {
-		return 0, false, nil // no attribute of that name in this payload's tail
-	}
-	tail, err := bc.stream(b, kindCold)
-	if err != nil {
-		return 0, false, err
-	}
-	cold := tail[b.coldOffAt(k):b.coldOffAt(k+1)]
-	for len(cold) > 0 {
-		id, m := binary.Uvarint(cold)
-		if m <= 0 {
-			return 0, false, nil // malformed tail: treat fieldID as absent
-		}
-		cold = cold[m:]
-		nl, ok := wire.NodeLen(cold)
-		if !ok || nl > len(cold) {
-			return 0, false, nil
-		}
-		if uint32(id) == fieldID {
-			f, found := literalFloat(cold[:nl])
-			return f, found, nil
-		}
-		cold = cold[nl:]
-	}
-	return 0, false, nil
-}
-
 // escapedNode returns the raw wire node an ESCAPED field holds in record k's cold tail, without
 // interpreting it. found=false means the attribute is not in the tail at all, i.e. genuinely absent
 // from the record.
@@ -1065,8 +1028,8 @@ func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (
 // Presence needs the node rather than a value: whether an attribute is UNDEFINED depends on which
 // literal it is (or on evaluating it, if it is an expression), and a value-returning accessor throws
 // exactly that away. Reads only this field, not the whole record.
-func (b *columnarBlock) escapedNode(k int, fieldID uint32, bc *blockCache) (node []byte, found bool, err error) {
-	fieldID, known := b.remap.storedID(fieldID)
+func (b *columnarBlock) escapedNode(k int, fieldID globalID, bc *blockCache) (node []byte, found bool, err error) {
+	stored, known := b.remap.storedID(fieldID)
 	if !known {
 		return nil, false, nil // no attribute of that name in this payload's tail
 	}
@@ -1085,7 +1048,7 @@ func (b *columnarBlock) escapedNode(k int, fieldID uint32, bc *blockCache) (node
 		if !ok || nl > len(cold) {
 			return nil, false, nil
 		}
-		if uint32(id) == fieldID {
+		if storedID(id) == stored {
 			return cold[:nl], true, nil
 		}
 		cold = cold[nl:]
@@ -1114,11 +1077,11 @@ const (
 //
 // The aggregate and count paths need the reason: an absent or non-numeric literal simply contributes
 // nothing, while an expression has a value they cannot compute.
-func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (colVal, numCell) {
+func (b *columnarBlock) escapedNumCell(k int, fieldID globalID, bc *blockCache) (colVal, numCell) {
 	// A computed cell first: its expression is in the record, never in the cold tail, so the tail walk
 	// below could only end at heldAt and decline.
 	if len(b.computed) > 0 {
-		if idx, ok := b.schema.byID[fieldID]; ok {
+		if idx, ok := b.schema.byID[uint32(fieldID)]; ok {
 			if node, ok := b.computedNode(k, idx, bc); ok {
 				if v, ok := nodeColVal(node); ok {
 					return v, cellNumber
@@ -1147,7 +1110,7 @@ func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (c
 		if !ok || nl > len(cold) {
 			return colVal{}, cellExpr
 		}
-		if uint32(id) == stored {
+		if storedID(id) == stored {
 			node := cold[:nl]
 			if v, ok := nodeColVal(node); ok {
 				return v, cellNumber
@@ -1176,24 +1139,12 @@ func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (c
 // idRemap translates between the attribute ids a payload was WRITTEN with and the ids the current
 // process assigns to the same names. nil means the two spaces coincide.
 type idRemap struct {
-	toStored  map[uint32]uint32
-	toCurrent map[uint32]uint32
+	toStored  map[globalID]storedID
+	toCurrent map[storedID]globalID
 }
 
-// stored maps a current intern id to the id this payload used for the same attribute. It is for
-// an id already known to be in the payload; a lookup uses storedID.
-func (r *idRemap) stored(id uint32) uint32 {
-	if r == nil {
-		return id
-	}
-	if v, ok := r.toStored[id]; ok {
-		return v
-	}
-	return id
-}
-
-// storedID is stored for a lookup: it reports false when the payload holds no attribute of that
-// name, which is then absent from every record of it.
+// storedID maps a current intern id to the id this payload used for the same attribute. It reports
+// false when the payload holds no attribute of that name, which is then absent from every record of it.
 //
 // It must not fall back to the id itself. The two id spaces are different numberings of different
 // name sets -- the current process interns names in the order it meets them, and the payload's ids
@@ -1201,9 +1152,9 @@ func (r *idRemap) stored(id uint32) uint32 {
 // does not know is, as often as not, the stored id of some OTHER attribute. Looking it up returned
 // that attribute's value under the asked-for name: after a restart, a projection naming an attribute
 // a record lacks came back with another attribute's value.
-func (r *idRemap) storedID(id uint32) (uint32, bool) {
+func (r *idRemap) storedID(id globalID) (storedID, bool) {
 	if r == nil {
-		return id, true
+		return storedID(id), true // the payload was written in this process's space
 	}
 	v, ok := r.toStored[id]
 	return v, ok
@@ -1238,12 +1189,12 @@ func collectColdIDs(cold []byte, into map[uint32]struct{}) {
 
 // current maps an id as stored in this payload back to the id the current process assigns that
 // attribute. The inverse of stored; used where a stored id has to be resolved to a NAME.
-func (r *idRemap) current(id uint32) uint32 {
+func (r *idRemap) current(id storedID) globalID {
 	if r == nil {
-		return id
+		return globalID(id) // the payload was written in this process's space
 	}
 	if v, ok := r.toCurrent[id]; ok {
 		return v
 	}
-	return id
+	return globalID(id)
 }

@@ -484,7 +484,7 @@ func adSummaryOrdered(c *Collection, dict *segDictHandle, w []byte) string {
 	wire.Ad(w).ForEachRaw(func(id uint32, name string, _ []byte) bool {
 		if name == "" {
 			if dict != nil {
-				name = string(dict.name(id))
+				name = string(dict.name(segID(id)))
 			} else if n, ok := c.intern.Name(id); ok {
 				name = n
 			}

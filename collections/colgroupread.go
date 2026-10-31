@@ -144,7 +144,7 @@ func (cs *colScope) resolveGroup(name string) (classad.Value, bool) {
 		}
 		// Membership is decided over the record's LITERALS, so a record holding this attribute as
 		// an expression is not a member either -- and the value is in the record, not undefined.
-		if cs.blk.heldAt(cs.k, id) {
+		if cs.blk.heldAt(cs.k, globalID(id)) {
 			cs.fallBack()
 			return classad.NewUndefinedValue(), true
 		}
@@ -235,7 +235,7 @@ func (cs *colScope) groupAbsentAt(name string, k int) (bool, bool) {
 	if _, member := gb.index(k); member {
 		return false, true
 	}
-	if cs.blk.heldAt(k, g.schema.fields[b.fi].id) {
+	if cs.blk.heldAt(k, globalID(g.schema.fields[b.fi].id)) {
 		return false, false // the value is in the record: membership proves nothing
 	}
 	return !gb.isException(k), true
@@ -287,7 +287,7 @@ func (s *blockVecSource) loadGroupColumn(name string, dst *vm.Vec) (bool, bool) 
 	// A record holding this attribute as a value the columns could not take (an expression) is
 	// neither a member nor an exception the cold tail can answer for, so the scatter below would
 	// present it as undefined. Decline the block; its per-record path reads the record.
-	if s.blk.heldAny(id) {
+	if s.blk.heldAny(globalID(id)) {
 		return false, true
 	}
 	dst.Mask = false
@@ -338,7 +338,7 @@ func (s *blockVecSource) fillGroupExceptions(gb *colGroupBlock, id uint32, dst *
 		if k >= s.blk.n {
 			return false
 		}
-		node, found, err := s.blk.escapedNode(k, id, s.bc)
+		node, found, err := s.blk.escapedNode(k, globalID(id), s.bc)
 		if err != nil {
 			return false
 		}

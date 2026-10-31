@@ -55,7 +55,7 @@ func wireLookupDictCtx(ctx wireCtx, dict *segDictHandle, a wire.Ad, name string)
 		if !ok {
 			return nil, false
 		}
-		return a.Lookup(id)
+		return a.Lookup(uint32(id))
 	}
 	return ctx.wireLookup(a, name)
 }

@@ -136,7 +136,7 @@ func (p *projPlan) localWanted(dict *segDictHandle) map[uint32]struct{} {
 	m := make(map[uint32]struct{}, len(p.names))
 	for _, n := range p.names {
 		if id, ok := dict.lookup(n); ok {
-			m[id] = struct{}{}
+			m[uint32(id)] = struct{}{}
 		}
 	}
 	p.localDict, p.local = dict, m
@@ -154,18 +154,18 @@ type projectScratch struct {
 	// fields -- the ones the tail is the only home of.
 	coldBlk       *columnarBlock
 	coldPlan      *projPlan
-	coldWant      []uint32
+	coldWant      []storedID
 	coldNonSchema int
 }
 
 // coldWanted returns p's attributes in blk's cold-tail id space, and how many are not schema fields.
-func (sc *projectScratch) coldWanted(blk *columnarBlock, p *projPlan) ([]uint32, int) {
+func (sc *projectScratch) coldWanted(blk *columnarBlock, p *projPlan) ([]storedID, int) {
 	if sc.coldBlk == blk && sc.coldPlan == p {
 		return sc.coldWant, sc.coldNonSchema
 	}
 	sc.coldWant, sc.coldNonSchema = sc.coldWant[:0], 0
 	for id := range p.ids {
-		sid, ok := blk.remap.storedID(id)
+		sid, ok := blk.remap.storedID(globalID(id))
 		if !ok {
 			continue // no record of this payload has it in its tail
 		}
@@ -268,7 +268,7 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 		if testBit(esc, idx) {
 			// A cell the record itself holds -- an expression, already in the remnant half above --
 			// has no cold-tail entry, so counting it would walk the whole tail looking for it.
-			if !blk.heldKnown(local, f.id) {
+			if !blk.heldKnown(local, globalID(f.id)) {
 				escWanted++
 			}
 			continue
@@ -324,7 +324,7 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 			}
 			node := cold[:nl]
 			cold = cold[nl:]
-			if !slices.Contains(cw, uint32(sid)) {
+			if !slices.Contains(cw, storedID(sid)) {
 				continue
 			}
 			found++
@@ -332,13 +332,13 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 			// the record's own key space, and an inline record names it through this process's ids.
 			name := ""
 			if inline {
-				nm, ok := c.intern.Name(blk.remap.current(uint32(sid)))
+				nm, ok := c.intern.Name(uint32(blk.remap.current(storedID(sid))))
 				if !ok {
 					return nil, false
 				}
 				name = nm
 			}
-			sc.entries = wire.AppendKey(sc.entries, inline, uint32(sid), name)
+			sc.entries = wire.AppendKey(sc.entries, inline, uint32(sid), name) // POC boundary: stored id as record key
 			sc.entries = append(sc.entries, node...)
 			added++
 		}
@@ -483,7 +483,7 @@ func (c *Collection) adClosed(w []byte, p *projPlan, sd *segDictHandle, sc *self
 		isEval = func(id uint32) bool {
 			var nm []byte
 			if sd != nil {
-				nm = sd.name(id)
+				nm = sd.name(segID(id))
 			} else if s, ok := c.intern.Name(id); ok {
 				nm = []byte(s)
 			} else {

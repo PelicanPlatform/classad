@@ -585,15 +585,15 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 		return nil
 	}
 	if nc > 0 {
-		r := &idRemap{toStored: make(map[uint32]uint32, nc), toCurrent: make(map[uint32]uint32, nc)}
+		r := &idRemap{toStored: make(map[globalID]storedID, nc), toCurrent: make(map[storedID]globalID, nc)}
 		for i := 0; i < nc; i++ {
-			stored := c.u32()
+			stored := storedID(c.u32()) // a globally-keyed payload's writer id, as the section stores it
 			name := string(c.bytes())
 			if c.err != nil {
 				return nil
 			}
 			if name != "" {
-				cur := internName(name)
+				cur := globalID(internName(name))
 				r.toStored[cur] = stored
 				r.toCurrent[stored] = cur
 			}

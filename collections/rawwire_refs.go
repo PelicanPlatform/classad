@@ -230,7 +230,7 @@ func (a *wireRowAssembler) markSealed(w []byte, dict *segDictHandle) {
 		case inlineName != "":
 			name = []byte(inlineName)
 		case dict != nil:
-			name = dict.name(id)
+			name = dict.name(segID(id))
 		default:
 			if n, ok := a.c.intern.Name(id); ok {
 				name = []byte(n)

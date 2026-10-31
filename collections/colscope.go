@@ -234,7 +234,7 @@ func (cs *colScope) slotValue(idx int) classad.Value {
 // schema field whose value escaped. An expression there sets fellBack, since only the ordinary
 // evaluator can resolve it against the rest of the ad.
 func (cs *colScope) fromColdTail(id uint32) classad.Value {
-	node, found, err := cs.blk.escapedNode(cs.k, id, cs.bc)
+	node, found, err := cs.blk.escapedNode(cs.k, globalID(id), cs.bc)
 	if err != nil {
 		cs.fallBack()
 		return classad.NewUndefinedValue()

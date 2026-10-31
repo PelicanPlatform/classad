@@ -360,7 +360,7 @@ func fixEscapedPlane(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, c
 			// The value is not in the column: missing, wrong kind, or too wide for the slot. Absent
 			// or non-numeric leaves the comparison UNDEFINED, so the record cannot satisfy the
 			// conjunction.
-			if nv, cell := blk.escapedNumCell(k, p.fieldID, bc); cell == cellExpr {
+			if nv, cell := blk.escapedNumCell(k, globalID(p.fieldID), bc); cell == cellExpr {
 				return false
 			} else if cell == cellNumber {
 				pass = p.eval(nv.f)
@@ -400,7 +400,7 @@ func narrowByRecord(blk *columnarBlock, idx int, f adField, p fieldPred, bc *blo
 			word &= word - 1
 			var v float64
 			if !escFree && testBit(blk.escapeAt(k), idx) {
-				nv, cell := blk.escapedNumCell(k, p.fieldID, bc)
+				nv, cell := blk.escapedNumCell(k, globalID(p.fieldID), bc)
 				if cell == cellExpr {
 					return false
 				}
@@ -438,7 +438,7 @@ func narrowByScan(blk *columnarBlock, idx int, isReal bool, p fieldPred, bc *blo
 		if !present {
 			// Escaped: read just this field from the cold tail. Absent or non-numeric leaves the
 			// comparison UNDEFINED, so the record cannot satisfy the conjunction.
-			nv, cell := blk.escapedNumCell(k, p.fieldID, bc)
+			nv, cell := blk.escapedNumCell(k, globalID(p.fieldID), bc)
 			if cell == cellExpr {
 				ok = false
 				return

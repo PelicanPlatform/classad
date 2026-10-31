@@ -590,7 +590,7 @@ var heldExceptionEvals atomic.Int64
 // heldUncomputed returns how many records of this block hold field idx (id) in the record without a
 // computed value, or -1 when the held index cannot say. Cached on the segment's held index, since both
 // the index and the computed values are fixed for the segment's life.
-func (b *columnarBlock) heldUncomputed(idx int, id uint32, bc *blockCache) int {
+func (b *columnarBlock) heldUncomputed(idx int, id globalID, bc *blockCache) int {
 	h := b.native.held()
 	if h == nil || !h.ok {
 		return -1
@@ -622,20 +622,20 @@ func (b *columnarBlock) heldUncomputed(idx int, id uint32, bc *blockCache) int {
 // heldValueNode evaluates schema field fieldID of record k, which holds it in the record uncomputed,
 // returning the value as a literal node when that is exactly the scan's value (see above). The caller
 // has the segment pinned, as for heldAt, and has already decided the record is visible.
-func (b *columnarBlock) heldValueNode(k int, fieldID uint32, bc *blockCache) ([]byte, bool) {
+func (b *columnarBlock) heldValueNode(k int, fieldID globalID, bc *blockCache) ([]byte, bool) {
 	cs := b.native
 	if cs == nil || cs.owner == nil || cs.arena == nil || cs.owner.intern == nil {
 		return nil, false
 	}
 	c, seg := cs.owner, cs.arena
-	idx, ok := b.schema.byID[fieldID]
+	idx, ok := b.schema.byID[uint32(fieldID)]
 	if !ok {
 		return nil, false
 	}
 	if n := b.heldUncomputed(idx, fieldID, bc); n < 0 || (n > heldExceptionFloor && n*heldExceptionShare > b.n) {
 		return nil, false
 	}
-	name, ok := c.intern.Name(fieldID)
+	name, ok := c.intern.Name(uint32(fieldID))
 	if !ok || c.shouldEncrypt(name) {
 		return nil, false
 	}

@@ -155,7 +155,7 @@ func (s *indexSpec) attrNode(ad wire.Ad, id uint32, dict *segDictHandle) ([]byte
 		// attribute's name (always available -- a persistent collection uses an inline spec)
 		// to this segment's local id, then read it.
 		if localid, ok := dict.lookup(s.names[id]); ok {
-			return ad.Lookup(localid)
+			return ad.Lookup(uint32(localid))
 		}
 		return nil, false
 	}

@@ -105,11 +105,13 @@ type segDictHandle struct {
 	names atomic.Pointer[[]string] // lazily-built id->name cache for the decode hot path (see resolve)
 }
 
-func (h *segDictHandle) lookup(name string) (uint32, bool) {
+// lookup, name and resolve are where a dictionary id enters and leaves the segID type: the format
+// layer below (segDictLookup, segDictName) reads raw u32s off the mapping.
+func (h *segDictHandle) lookup(name string) (segID, bool) {
 	return segDictLookup(h.data, h.base, name)
 }
-func (h *segDictHandle) name(id uint32) []byte { return segDictName(h.data, h.base, id) }
-func (h *segDictHandle) count() uint32         { return segDictCount(h.data, h.base) }
+func (h *segDictHandle) name(id segID) []byte { return segDictName(h.data, h.base, uint32(id)) }
+func (h *segDictHandle) count() uint32        { return segDictCount(h.data, h.base) }
 
 // resolve is the id->name function form for wire.DecodeResolve. It returns a SHARED, cached
 // string so a full-ad decode allocates no per-attribute name copy. Copying id->name off the
@@ -350,7 +352,7 @@ func segDictName(data []byte, base, id uint32) []byte {
 // mismatch, or non-member) it falls back to an authoritative binary search over the
 // folded-name-sorted index, so a build/probe discrepancy can only cost a redundant search,
 // never a wrong answer. ok=false means the name is not in this segment's dict.
-func segDictLookup(data []byte, base uint32, name string) (id uint32, ok bool) {
+func segDictLookup(data []byte, base uint32, name string) (id segID, ok bool) {
 	count := le32(data, base)
 	if count == 0 {
 		return 0, false
@@ -361,7 +363,7 @@ func segDictLookup(data []byte, base uint32, name string) (id uint32, ok bool) {
 	if slot, hit := mphLookupBytes(data, base+mphOff, folded); hit {
 		cid := le32(data, base+slotIdOff+slot*4)
 		if strings.EqualFold(string(segDictName(data, base, cid)), name) {
-			return cid, true
+			return segID(cid), true // an id enters the segID space where it is read off the mapping
 		}
 	}
 	return segDictSearch(data, base, folded)
@@ -369,7 +371,7 @@ func segDictLookup(data []byte, base uint32, name string) (id uint32, ok bool) {
 
 // segDictSearch is the authoritative fallback: binary search over the folded-name-sorted id
 // index. `folded` must already be lower-cased.
-func segDictSearch(data []byte, base uint32, folded string) (uint32, bool) {
+func segDictSearch(data []byte, base uint32, folded string) (segID, bool) {
 	count := le32(data, base)
 	sortedIdOff := le32(data, base+16)
 	lo, hi := uint32(0), count
@@ -379,7 +381,7 @@ func segDictSearch(data []byte, base uint32, folded string) (uint32, bool) {
 		nm := strings.ToLower(string(segDictName(data, base, id)))
 		switch {
 		case nm == folded:
-			return id, true
+			return segID(id), true
 		case nm < folded:
 			lo = mid + 1
 		default:

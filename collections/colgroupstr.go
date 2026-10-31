@@ -325,15 +325,15 @@ func escapedGroupComp(b *columnarBlock, k int, fieldID uint32, bc *blockCache, a
 			}
 		}
 	}
-	node, found, err := b.escapedNode(k, fieldID, bc)
+	node, found, err := b.escapedNode(k, globalID(fieldID), bc)
 	if err != nil {
 		return groupComp{}, false
 	}
 	if !found {
-		if b.heldAt(k, fieldID) {
+		if b.heldAt(k, globalID(fieldID)) {
 			// The value stayed in the record: only evaluating it answers, which this record alone may
 			// (see heldValueNode).
-			if held, ok := b.heldValueNode(k, fieldID, bc); ok {
+			if held, ok := b.heldValueNode(k, globalID(fieldID), bc); ok {
 				return litGroupComp(held, acc)
 			}
 			return groupComp{}, false
