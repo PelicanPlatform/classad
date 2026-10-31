@@ -207,6 +207,41 @@ func TestExprEqualAllCases(t *testing.T) {
 	}
 }
 
+// TestExprEqualNestedNegation pins Equal across the two spellings of a nested negative number:
+// a freshly parsed `--1` (a minus over a minus over 1) and the same value as a stored ad hands it
+// back (a minus over the literal -1, because the encoder folds the inner minus only). They must
+// compare equal, or an unchanged ad holding one reads as changed on every comparison.
+// A minus over a negative literal must not be collapsed into the positive literal, which is
+// what made them differ.
+func TestExprEqualNestedNegation(t *testing.T) {
+	minus := func(e ast.Expr) ast.Expr { return &ast.UnaryOp{Op: "-", Expr: e} }
+	i := func(v int64) ast.Expr { return &ast.IntegerLiteral{Value: v} }
+	r := func(v float64) ast.Expr { return &ast.RealLiteral{Value: v} }
+
+	cases := []struct {
+		name        string
+		left, right ast.Expr
+		equal       bool
+	}{
+		{"-1 vs literal -1", minus(i(1)), i(-1), true},
+		{"-0 vs literal 0", minus(i(0)), i(0), true},
+		{"--1 parsed vs stored", minus(minus(i(1))), minus(i(-1)), true},
+		{"--1.5 parsed vs stored", minus(minus(r(1.5))), minus(r(-1.5)), true},
+		{"--0.0 parsed vs stored", minus(minus(r(0))), minus(r(math.Copysign(0, -1))), true},
+		{"---1 parsed vs stored", minus(minus(minus(i(1)))), minus(minus(i(-1))), true},
+		{"stored --1 is not the literal -1", minus(i(-1)), i(-1), false},
+		{"- -MinInt64 vs itself", minus(i(math.MinInt64)), minus(i(math.MinInt64)), true},
+	}
+	for _, tc := range cases {
+		if got := exprFromAST(tc.left).Equal(exprFromAST(tc.right)); got != tc.equal {
+			t.Errorf("%s: Equal = %v, want %v", tc.name, got, tc.equal)
+		}
+		if got := exprFromAST(tc.right).Equal(exprFromAST(tc.left)); got != tc.equal {
+			t.Errorf("%s (swapped): Equal = %v, want %v", tc.name, got, tc.equal)
+		}
+	}
+}
+
 func TestExprEqualNilHandling(t *testing.T) {
 	var left *Expr
 	var right *Expr

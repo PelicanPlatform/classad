@@ -2168,8 +2168,15 @@ func (c *ClassAd) parseExpression(exprStr string) (ast.Expr, error) {
 }
 
 // signedLiteral collapses `-<numeric literal>` to the signed literal it denotes, leaving every
-// other expression alone. Negating the int64 minimum wraps to itself, which is what evaluating
-// the unary minus gives too.
+// other expression alone.
+//
+// Only a literal that is not already negative is collapsed (an int >= 0, a real with the sign bit
+// clear). The parser never puts a minus over a negative literal; that shape comes from a stored
+// ad, where `--1` is kept as a minus over the folded literal -1. Collapsing it here would turn it
+// into the literal 1 on one side while the freshly parsed `--1` (a minus over a minus over 1)
+// stays an operator on the other, and the two would compare unequal. Left alone, the comparison
+// descends into both operands and meets `-1` against the literal -1, which collapses. The int64
+// minimum is negative, so it is never negated here.
 func signedLiteral(e ast.Expr) ast.Expr {
 	u, ok := e.(*ast.UnaryOp)
 	if !ok || u.Op != "-" {
@@ -2177,9 +2184,13 @@ func signedLiteral(e ast.Expr) ast.Expr {
 	}
 	switch v := u.Expr.(type) {
 	case *ast.IntegerLiteral:
-		return &ast.IntegerLiteral{Value: -v.Value}
+		if v.Value >= 0 {
+			return &ast.IntegerLiteral{Value: -v.Value}
+		}
 	case *ast.RealLiteral:
-		return &ast.RealLiteral{Value: -v.Value}
+		if !math.Signbit(v.Value) {
+			return &ast.RealLiteral{Value: -v.Value}
+		}
 	}
 	return e
 }

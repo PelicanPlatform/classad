@@ -310,10 +310,7 @@ func (e *encoder) node(expr ast.Expr) {
 		e.node(v.Left)
 		e.node(v.Right)
 	case *ast.UnaryOp:
-		if lit, ok := negatedNumericLiteral(v); ok {
-			e.node(lit)
-			return
-		}
+		mark := len(e.buf)
 		if id, ok := unOpID[v.Op]; ok {
 			e.buf = append(e.buf, nUnOp, id)
 		} else {
@@ -321,6 +318,7 @@ func (e *encoder) node(expr ast.Expr) {
 			e.putString(v.Op)
 		}
 		e.node(v.Expr)
+		e.buf = foldNegatedLiteral(e.buf, mark)
 	case *ast.ListLiteral:
 		e.buf = append(e.buf, nList)
 		e.buf = binary.AppendUvarint(e.buf, uint64(len(v.Elements)))
@@ -381,9 +379,10 @@ func (e *encoder) putString(s string) {
 	e.buf = append(e.buf, s...)
 }
 
-// negatedNumericLiteral folds `-<int literal>` / `-<real literal>` into the single negative
-// literal it denotes, returning the folded literal and true, or (nil, false) for any other
-// unary expression.
+// foldNegatedLiteral folds a just-emitted `-<numeric literal>` node at buf[mark:] into the
+// single signed literal it denotes and returns the shortened buffer. Any other node at mark --
+// another operator, an operand that is not exactly one int/real literal node, or a literal the
+// rule below leaves alone -- is returned unchanged.
 //
 // Why the encoder and not the parser: the grammar really does make `-1` a unary minus applied
 // to 1, and the syntax tree is the one place that has to keep saying so -- its String() and the
@@ -399,26 +398,59 @@ func (e *encoder) putString(s string) {
 // vectorized scan back a per-record callback. None of that is a property of the number. It is a
 // property of the spelling, which is exactly what an encoder is entitled to normalize.
 //
-// Scope is deliberately one level over a bare numeric literal: `-(-1)`, `+1` and `-x` are left
+// Scope is deliberately one minus over a bare numeric literal: `-(-1)`, `+1` and `-x` are left
 // alone. The win is in the stored negative numbers real ads carry (ExitCode, offsets, Rank
 // terms), and a wider fold would start rewriting expressions for no storage benefit.
 //
-// Int overflow: negating the int64 minimum wraps to itself, which is precisely what the
-// evaluator and NumberValue compute for the unfolded node, so the folded and unfolded forms
-// still denote the same value.
+// Which literals fold -- an int > 0, a real with the sign bit clear -- is what holds the fold to
+// that one minus. The fold runs bottom-up, so in `--1` the inner minus is already the literal -1
+// when the outer one is decided. Folding that too would collapse a chain of operators into the
+// literal 1, the wider rewrite the scope rules out, and the stored ad would stop comparing Equal
+// (classad) to the parsed one. So the rule excludes every literal a fold can produce, and `--1`
+// is stored as a minus over the literal -1:
+//   - ints: a folded literal is negative, so the rule requires > 0. The int 0 is excluded too,
+//     because it is its own negation: if `-0` folded to the literal 0, the outer minus of `--0`
+//     would see a 0 and fold again. `-0` therefore stays a minus over 0; its value is 0 either way.
+//   - reals: the test is the sign bit, not `< 0`. Negation always sets it, so `-0.0` folds to
+//     negative zero exactly once, and a stored negative zero (or -Inf) is never flipped back.
+//
+// The same exclusion makes the encoding idempotent: decode then re-encode must reproduce the
+// same bytes, or the stored form drifts each time a record is rewritten. Decoding `--1` yields a
+// minus over the negative literal -1, a shape the parser never builds, and re-encoding it must
+// not fold it into 1. Because a fold never produces a literal the rule would fold again, the
+// operand as emitted is a foldable literal exactly when the syntax-tree operand is one, so the
+// decision can be made on the emitted bytes -- the only thing the wire-native parser
+// (NodeEmitter.FoldNegate) has -- and both encoders share this one function so they cannot
+// disagree.
+//
+// Int range: only an int in [1, MaxInt64] is negated, where negation cannot overflow. The int64
+// minimum (the parser's `-9223372036854775808`) is already a literal, and a minus over it stays a
+// minus, which evaluates (wrapping) to the same value.
 //
 // Reading back: nothing on the decode side changes. Records written before this fold still carry
 // the unary-minus node and still decode through it (TestEncodeNegativeOldFormDecodes pins that),
 // and NumberValue stays the accessor that sees through one.
-func negatedNumericLiteral(v *ast.UnaryOp) (ast.Expr, bool) {
-	if v.Op != "-" {
-		return nil, false
+func foldNegatedLiteral(buf []byte, mark int) []byte {
+	if len(buf)-mark < 3 || buf[mark] != nUnOp || buf[mark+1] != unOpMinusID {
+		return buf
 	}
-	switch in := v.Expr.(type) {
-	case *ast.IntegerLiteral:
-		return &ast.IntegerLiteral{Value: -in.Value}, true
-	case *ast.RealLiteral:
-		return &ast.RealLiteral{Value: -in.Value}, true
+	operand := buf[mark+2:]
+	switch operand[0] {
+	case nInt:
+		v, n := binary.Varint(operand[1:])
+		if n <= 0 || 1+n != len(operand) || v <= 0 {
+			return buf
+		}
+		return AppendIntNode(buf[:mark], -v)
+	case nReal:
+		if len(operand) != 9 {
+			return buf
+		}
+		f := math.Float64frombits(binary.LittleEndian.Uint64(operand[1:]))
+		if math.Signbit(f) {
+			return buf
+		}
+		return AppendRealNode(buf[:mark], -f)
 	}
-	return nil, false
+	return buf
 }

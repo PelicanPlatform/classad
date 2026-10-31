@@ -117,6 +117,9 @@ func FuzzInlineRoundTrip(f *testing.F) {
 	for _, src := range roundTripCases {
 		f.Add(src)
 	}
+	for _, src := range negationFoldSeeds {
+		f.Add(src)
+	}
 	f.Fuzz(func(t *testing.T, src string) {
 		orig, err := parser.ParseClassAd(src)
 		if err != nil || orig == nil {
