@@ -379,7 +379,10 @@ func (c *Collection) windowSamples(w segWindow, max int) [][]byte {
 			continue
 		}
 		buf = raw
-		iw := c.wireToInline(dict, raw)
+		iw, ok := c.wireToInline(dict, raw)
+		if !ok {
+			continue
+		}
 		out = append(out, append([]byte(nil), iw...))
 	}
 	return out

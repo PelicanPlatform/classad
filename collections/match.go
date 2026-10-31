@@ -504,7 +504,9 @@ func (c *Collection) matchWindow(t scanTask, mw *matchWorker, dbuf *[]byte, out 
 			return true
 		}
 		*dbuf = w
-		c.matchCandidate(c.wireToInline(dict, w), mw, out)
+		if iw, ok := c.wireToInline(dict, w); ok {
+			c.matchCandidate(iw, mw, out)
+		}
 		return true
 	})
 }

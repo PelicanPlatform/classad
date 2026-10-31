@@ -238,20 +238,26 @@ func (c *Collection) decodeAdDict(dict *segDictHandle, stored []byte, codec Code
 // segment's decompressed record becomes inline wire so a downstream consumer that reads it by
 // name -- CollectSamples -> buildAdSchema / ForEachNamed(c.intern) -- works without the dict.
 // nil dict (inline segment / in-memory global) returns w unchanged.
-func (c *Collection) wireToInline(dict *segDictHandle, w []byte) []byte {
+//
+// ok=false means the record would not decode against its dict, and the caller must skip it. Handing
+// w back instead is not a fallback: its ids are the segment's, so a reader expecting inline names or
+// the collection's global ids still parses it -- and names each id through the wrong table, putting
+// values under unrelated attributes and dropping the ones whose id names nothing there.
+func (c *Collection) wireToInline(dict *segDictHandle, w []byte) ([]byte, bool) {
 	if dict == nil {
-		return w
+		return w, true
 	}
 	a, err := c.decodeWireDict(dict, w) // sealer-aware: opens sealed values for an encrypted segment
 	if err != nil {
-		return w
+		noteReadSkip(err)
+		return nil, false
 	}
 	if c.sealer != nil {
 		// Re-seal on the way to inline so the sample never carries plaintext values (which would
 		// leak into a retrained dict or a columnar block); matches the active segment's form.
-		return wire.EncodeInlineWithHotEnc(nil, a, nil, c.shouldEncrypt, c.sealer)
+		return wire.EncodeInlineWithHotEnc(nil, a, nil, c.shouldEncrypt, c.sealer), true
 	}
-	return wire.EncodeInline(nil, a)
+	return wire.EncodeInline(nil, a), true
 }
 
 // renderKey is the key a render path is entitled to: none for a redacted read, the collection's for a
@@ -273,16 +279,17 @@ func (c *Collection) renderKey(redact bool) wire.Sealer {
 // then filtered out by NAME afterwards. Filtering is a deny-list; not holding the key is not.
 //
 // Nothing is re-sealed here because nothing sealed survives the decode, so the inline form carries
-// undefined where the secret was.
-func (c *Collection) wireToInlineNoKey(dict *segDictHandle, w []byte) []byte {
+// undefined where the secret was. ok=false is wireToInline's: skip the record.
+func (c *Collection) wireToInlineNoKey(dict *segDictHandle, w []byte) ([]byte, bool) {
 	if dict == nil {
-		return w
+		return w, true
 	}
 	a, err := wire.DecodeResolveEncRedact(w, dict.resolve, nil)
 	if err != nil {
-		return w
+		noteReadSkip(err)
+		return nil, false
 	}
-	return wire.EncodeInline(nil, a)
+	return wire.EncodeInline(nil, a), true
 }
 
 // wireToInlineRead is wireToInline for a SCAN serving a reader, and differs from it twice.
@@ -298,18 +305,21 @@ func (c *Collection) wireToInlineNoKey(dict *segDictHandle, w []byte) []byte {
 // scan's inline buffer is transient -- the subset assembler consumes it and it is dropped -- so
 // opening a value only to seal it again is work nobody reads, and the assembler then opens the
 // survivors a third time. On an encrypted store that round trip was the bulk of a read.
-func (c *Collection) wireToInlineRead(dict *segDictHandle, w []byte, redact bool) []byte {
+//
+// ok=false is wireToInline's: skip the record.
+func (c *Collection) wireToInlineRead(dict *segDictHandle, w []byte, redact bool) ([]byte, bool) {
 	if redact {
 		return c.wireToInlineNoKey(dict, w)
 	}
 	if dict == nil {
-		return w
+		return w, true
 	}
 	a, err := c.decodeWireDict(dict, w) // opens sealed values: this reader is entitled to them
 	if err != nil {
-		return w
+		noteReadSkip(err)
+		return nil, false
 	}
-	return wire.EncodeInline(nil, a)
+	return wire.EncodeInline(nil, a), true
 }
 
 // toSelfContained converts a stored record's (compressed) ad bytes into a form that decodes

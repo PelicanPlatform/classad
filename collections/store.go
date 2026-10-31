@@ -1888,7 +1888,10 @@ func (c *Collection) CollectSamples(max int) [][]byte {
 			buf = w
 			// Samples are consumed later (schema build / ForEachNamed) with no segment in
 			// scope, so an interned record must be flattened to inline wire now.
-			iw := c.wireToInline(dict, w)
+			iw, ok := c.wireToInline(dict, w)
+			if !ok {
+				return true
+			}
 			cp := make([]byte, len(iw))
 			copy(cp, iw)
 			out = append(out, cp)

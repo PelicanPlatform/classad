@@ -82,9 +82,11 @@ func (c *Collection) yieldRaw(yield func(RawAd) bool, redact bool) scanEmit {
 	return func(w []byte, dict *segDictHandle) bool {
 		// A redacted read holds no key: sealed values decode to undefined rather than being opened
 		// and re-sealed, so the secret is never materialized in this process at all.
-		w = c.wireToInline(dict, w) // interned segment -> inline for the mode-aware renderer
+		w, ok := c.wireToInline(dict, w) // interned segment -> inline for the mode-aware renderer
+		if !ok {
+			return true // undecodable against its dict: skip, keep scanning
+		}
 		var mt, tt string
-		var ok bool
 		buf, offs, mt, tt, ok = c.appendWireAd(w, buf, offs, redact)
 		if !ok {
 			return true // undecodable record: skip, keep scanning

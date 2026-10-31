@@ -203,10 +203,14 @@ func (c *Collection) yieldRawProjected(yield func(RawAd) bool, p *rawProjector) 
 		// A redacted projection holds no key, so an interned segment's sealed values become undefined
 		// as it is de-interned; a privileged one keeps them sealed here and the renderer below opens
 		// them with the key.
+		var ok bool
 		if p.redact {
-			w = c.wireToInlineNoKey(dict, w)
+			w, ok = c.wireToInlineNoKey(dict, w)
 		} else {
-			w = c.wireToInline(dict, w)
+			w, ok = c.wireToInline(dict, w)
+		}
+		if !ok {
+			return true // undecodable against its dict: skip, keep scanning
 		}
 		ra, ok := p.render(w)
 		if !ok {

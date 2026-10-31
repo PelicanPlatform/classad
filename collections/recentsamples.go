@@ -167,7 +167,10 @@ func (sh *shard) recentRecordSamples(c *Collection, maxRecords, maxBytes, lookBa
 			continue
 		}
 		buf = ww
-		iw := c.wireToInline(w.dict(), ww)
+		iw, ok := c.wireToInline(w.dict(), ww)
+		if !ok {
+			continue
+		}
 		cp := make([]byte, len(iw))
 		copy(cp, iw)
 		out = append(out, cp)
