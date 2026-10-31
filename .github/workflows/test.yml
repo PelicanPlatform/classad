@@ -86,8 +86,9 @@ jobs:
   #
   # The suite is SHARDED by test name across parallel jobs. Every test here is `package
   # collections`, so there is one test binary and `go test -p` (which parallelizes across
-  # packages) has nothing to work with, and most tests are serial: ~55 minutes of runner
-  # time under -race. The shards give it the cores one runner does not have, with no test
+  # packages) has nothing to work with: ~55 minutes of runner time under -race. Tests do
+  # overlap within a shard -- 71% of the recorded time calls t.Parallel() -- but that is
+  # bounded by the cores one runner has, which is what sharding adds to. The shards give it the cores one runner does not have, with no test
   # skipped and the race detector still on everywhere. Tests are packed by their recorded
   # durations (collections/shard-durations.txt), so each shard gets about the same time.
   # Four shards balanced by test COUNT left one at 19-25 minutes and it hit the 25m
