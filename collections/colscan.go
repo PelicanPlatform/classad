@@ -498,6 +498,9 @@ func (c *Collection) buildColSegment(seg *segment, s *adSchema, hot []int) *colS
 			cs.groups = append(cs.groups, sel)
 		}
 	}
+	// The build's own translation covers the schema's fields only (that is all its classifier needs);
+	// a reader also looks up the attributes the schema does not carry.
+	cs.bindDictRemap(c, d)
 	return cs
 }
 
