@@ -74,24 +74,34 @@ type SidecarSizes struct {
 func (c *Collection) SidecarSizes() SidecarSizes {
 	var out SidecarSizes
 	for _, sh := range c.shards {
-		sh.mu.RLock()
-		for _, seg := range sh.segs {
-			if seg == nil {
-				continue
-			}
-			mm := seg.msidx.Load()
-			if mm == nil {
-				continue
-			}
-			out.Segments++
-			out.MappedBytes += int64(len(mm.data))
-			mph, bloom := sidecarSketchBreakdown(mm.data)
-			out.MPHBytes += mph
-			out.BloomBytes += bloom
-		}
-		sh.mu.RUnlock()
+		sh.sidecarSizes(&out)
 	}
 	return out
+}
+
+// sidecarSizes adds one shard's sidecar sizes to out under its read lock. The release is deferred:
+// the breakdown parses mapped sidecar bytes, and a diagnostics read that panics there is failed alone
+// by a server that recovers it, which must not leave the shard locked.
+func (sh *shard) sidecarSizes(out *SidecarSizes) {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	if lockedReadHook != nil {
+		lockedReadHook("sidecarsizes")
+	}
+	for _, seg := range sh.segs {
+		if seg == nil {
+			continue
+		}
+		mm := seg.msidx.Load()
+		if mm == nil {
+			continue
+		}
+		out.Segments++
+		out.MappedBytes += int64(len(mm.data))
+		mph, bloom := sidecarSketchBreakdown(mm.data)
+		out.MPHBytes += mph
+		out.BloomBytes += bloom
+	}
 }
 
 // sidecarSketchBreakdown sums the MPH and bloom block bytes across a v6 sidecar's

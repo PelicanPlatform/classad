@@ -122,6 +122,9 @@ func (gc *groupCols) setBlock(blk *columnarBlock, fieldIdxs []int, fieldIDs []ui
 // ok=false when the field cannot be read here.
 func newGroupCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCache,
 	sc *groupColScratch, wholeKey bool) (groupCol, bool) {
+	if !blk.hasFieldIdx(fieldIdx) {
+		return groupCol{}, false
+	}
 	c := groupCol{blk: blk, fieldIdx: fieldIdx, fieldID: fieldID}
 	if blk.schema.fields[fieldIdx].kind != akString {
 		num, ok := newNumCol(blk, fieldIdx, fieldID, bc)

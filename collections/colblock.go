@@ -767,6 +767,9 @@ func (b *columnarBlock) escapeFree(fieldIdx int) bool {
 // both be tight loops over contiguous memory, which is what the vectorization spike measured as the
 // win -- applied to the paths that already exist rather than to a new engine.
 func (b *columnarBlock) loadIntBatch(fieldIdx int, bc *blockCache, dst []int64) bool {
+	if !b.hasFieldIdx(fieldIdx) {
+		return false
+	}
 	f := b.schema.fields[fieldIdx]
 	if !numericKind(f.kind) {
 		return false
@@ -837,6 +840,9 @@ func loadIntsTyped(dst []int64, src []byte, stride, off, width int, unsigned boo
 // uncompressed region and therefore of the mmap. Handing that to a comparison kernel is what makes a
 // width-native compare possible: 8 lanes of a 128-bit vector at a 2-byte width where int64 gives 2.
 func (b *columnarBlock) rawColumn(fieldIdx int, bc *blockCache) ([]byte, bool) {
+	if !b.hasFieldIdx(fieldIdx) {
+		return nil, false
+	}
 	f := b.schema.fields[fieldIdx]
 	if !numericKind(f.kind) {
 		return nil, false
@@ -859,11 +865,25 @@ func (b *columnarBlock) rawColumn(fieldIdx int, bc *blockCache) ([]byte, bool) {
 	return coldNum[start : start+need], true
 }
 
+// hasFieldIdx reports whether fieldIdx is a field of this block's schema.
+//
+// The per-block readers below take a field POSITION, which their callers resolve once per segment
+// against the segment's schema and apply to each of its blocks. That is sound because every block of
+// a segment is built under one schema; the check is the last line should that ever stop holding, so
+// a position from another schema declines the block (the caller then reads the records) instead of
+// indexing past the end of this one's.
+func (b *columnarBlock) hasFieldIdx(fieldIdx int) bool {
+	return fieldIdx >= 0 && fieldIdx < len(b.schema.fields)
+}
+
 // scanInt calls fn for each record's value of a numeric (int/real read as int bits) field: a
 // hot field reads the uncompressed region directly (no decode); a cold field decompresses its
 // column group once (via bc, nil for no cache). present is false for a missing/exceptional
 // record (its value is in the cold tail).
 func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, present bool, v int64)) error {
+	if !b.hasFieldIdx(fieldIdx) {
+		return errBadColBlock
+	}
 	f := b.schema.fields[fieldIdx]
 	if start, hot := b.hotColStart(fieldIdx); hot {
 		for k := 0; k < b.n; k++ {

@@ -15,7 +15,7 @@ import (
 //   - otherwise       -> holds NONE
 //
 // Returns the wire records, the group's attribute ids, and the expected state per record.
-func groupBlockFixture(t *testing.T, c *Collection, n int) ([][]byte, []uint32, []string) {
+func groupBlockFixture(t testing.TB, c *Collection, n int) ([][]byte, []uint32, []string) {
 	t.Helper()
 	var iws [][]byte
 	var state []string

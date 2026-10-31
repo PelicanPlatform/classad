@@ -18,6 +18,9 @@ import (
 //   - ErrTableReadOnly (a *ServerError): the table belongs to another writer on the
 //     server, so this connection may read it but not modify it. Deterministic; do not
 //     retry.
+//   - ErrInternal (a *ServerError): serving the request panicked -- a server bug. The
+//     server failed only that request and keeps serving; a replay most likely fails
+//     the same way, so surface it.
 //   - context.Canceled / context.DeadlineExceeded: the caller's context ended while
 //     waiting. Surface it; do not retry against the caller's wishes.
 //
@@ -53,6 +56,8 @@ func (e *ServerError) Is(target error) bool {
 		return strings.HasPrefix(e.Msg, archiveTablePrefix)
 	case ErrCursorExpired:
 		return strings.HasPrefix(e.Msg, cursorExpiredPrefix)
+	case ErrInternal:
+		return strings.HasPrefix(e.Msg, internalErrorPrefix)
 	}
 	return false
 }

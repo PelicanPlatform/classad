@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +35,10 @@ type Server struct {
 	// CloseGrace bounds how long Close waits for cancelled requests to unwind before it
 	// gives up on them. Zero means defaultCloseGrace. Set it before serving connections.
 	CloseGrace time.Duration
+
+	// Logger receives what the server reports on its own, such as a request that panicked
+	// (see containPanic). Nil uses slog.Default(). Set it before serving connections.
+	Logger *slog.Logger
 
 	// Shutdown barrier for the per-request goroutines ServeConnOpts dispatches. Those
 	// goroutines read the catalog's segments, which the caller munmaps when it closes the
@@ -640,8 +645,14 @@ func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 	var wmu sync.Mutex
 	sc.write = func(b []byte) {
 		wmu.Lock()
+		// Deferred so a panic in the transport cannot leave the lock held: containPanic writes
+		// the request's error through this same function, and every other request on the
+		// connection needs it too.
+		defer wmu.Unlock()
+		if h := writeHook.Load(); h != nil {
+			(*h)(b)
+		}
 		_ = conn.WriteMsg(b)
-		wmu.Unlock()
 	}
 	for {
 		frame, err := conn.ReadMsg()
@@ -723,6 +734,12 @@ func (sc *serverConn) dispatch(frame []byte) {
 	reqID, o, body, ok := reqHeader(frame)
 	if !ok {
 		return // unparseable header: cannot even address a response
+	}
+	if o.recoverable() {
+		defer sc.containPanic(reqID, o)
+	}
+	if h := dispatchHook.Load(); h != nil {
+		(*h)(o)
 	}
 	if sc.opts.ReadOnly && o.isMutating() {
 		sc.write(respErr(reqID, "read-only connection: "+o.String()+" not permitted"))

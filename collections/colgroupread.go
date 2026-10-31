@@ -37,7 +37,6 @@ type groupBind struct{ gi, fi int }
 // block's own index because a colGroupBlock is per (group, base block).
 func (cs *colScope) setGroups(seg *colSegment, bi int) {
 	cs.gblocks = cs.gblocks[:0]
-	prev := cs.groups
 	cs.groups = nil
 	cs.schemaOnly = seg != nil && seg.schemaOnly
 	// A sidecar block (not schemaOnly) holds every attribute of its records outside the schema in its
@@ -54,23 +53,13 @@ func (cs *colScope) setGroups(seg *colSegment, bi int) {
 			(seg.arena != nil && seg.arena.dict.Load() != nil && cs.c.appendOnly())
 	}
 	if seg == nil || len(seg.groups) == 0 {
-		if len(prev) != 0 {
-			cs.bindG = nil
-		}
 		return
 	}
 	cs.groups = seg.groups
-	// bindG caches (group, field) POSITIONS, which mean something only against the group list they
-	// were resolved in. One scope walks every segment of a scan, and segments built under different
-	// committed group sets -- the normal state while a schema change converges -- order and populate
-	// their groups differently: a cached hit then reads another group's field, and a cached miss sends
-	// a group member to a cold tail that never held it. So the cache is dropped whenever the list
-	// changes, as bindField's is when the base schema does.
-	if !sameGroupSchemas(prev, seg.groups) {
-		cs.bindG = nil
-	}
 	for _, g := range seg.groups {
-		if bi < len(g.blocks) {
+		// nil when the group has no selection for this block. A reader treats that as "unknown"
+		// and falls back, never as "no member": nothing says the records lack the group.
+		if bi >= 0 && bi < len(g.blocks) {
 			cs.gblocks = append(cs.gblocks, g.blocks[bi])
 		} else {
 			cs.gblocks = append(cs.gblocks, nil)
@@ -83,6 +72,9 @@ func sameGroupSchemas(a, b []*colGroup) bool {
 	if len(a) != len(b) {
 		return false
 	}
+	if len(a) == 0 || &a[0] == &b[0] {
+		return true // the same list: the common case, once per resolve, so kept O(1)
+	}
 	for i := range a {
 		if a[i].schema != b[i].schema {
 			return false
@@ -91,17 +83,27 @@ func sameGroupSchemas(a, b []*colGroup) bool {
 	return true
 }
 
-// bindGroupField finds name in a group schema, caching the answer for the query's lifetime as
-// bindField does for the base schema. ok is false when no group carries it.
+// bindGroupField finds name in a group schema, caching the answer as bindField does for the base
+// schema. ok is false when no group carries it.
+//
+// The cache holds (group, field) POSITIONS, which mean something only against the group list they
+// were resolved in. One scope walks every segment of a scan, and segments built under different
+// committed group sets -- the normal state while a schema change converges -- order and populate
+// their groups differently: a cached hit then reads another group's field (past the end of a
+// narrower group's schema, which crashed a daemon), and a cached miss sends a group member to a cold
+// tail that never held it. So the cache is checked against the list it was built for on every use,
+// here, rather than reset by whoever changes the list -- as bindField checks bindFor -- and no caller
+// can apply it to the wrong list by forgetting a reset.
 func (cs *colScope) bindGroupField(name string) (groupBind, bool) {
 	if len(cs.groups) == 0 {
 		return groupBind{}, false
 	}
-	if cs.bindG == nil {
+	if cs.bindG == nil || !sameGroupSchemas(cs.bindGFor, cs.groups) {
 		cs.bindG = make(map[string]groupBind, 4)
 	} else if b, ok := cs.bindG[name]; ok {
 		return b, b.gi >= 0
 	}
+	cs.bindGFor = cs.groups
 	miss := groupBind{gi: -1}
 	id, ok := cs.c.intern.LookupID(name)
 	if !ok {
@@ -126,10 +128,15 @@ func (cs *colScope) resolveGroup(name string) (classad.Value, bool) {
 	if !ok {
 		return classad.Value{}, false
 	}
-	gb := cs.gblocks[b.gi]
+	g, gb := cs.groupAt(b)
+	if gb == nil {
+		// No usable selection for this block: membership proves nothing, so read the record.
+		cs.fallBack()
+		return classad.NewUndefinedValue(), true
+	}
 	idx, member := gb.index(cs.k)
 	if !member {
-		id := cs.groups[b.gi].schema.fields[b.fi].id
+		id := g.schema.fields[b.fi].id
 		if gb.isException(cs.k) {
 			// Holds part of the group. Not in the group block, but a group attribute is not a
 			// base schema field either, so the base encoder left it in the cold tail.
@@ -145,6 +152,10 @@ func (cs *colScope) resolveGroup(name string) (classad.Value, bool) {
 		// membership bit alone -- no decode of any kind.
 		return classad.NewUndefinedValue(), true
 	}
+	if idx >= gb.blk.n {
+		cs.fallBack() // a rank past the group block's end: the bitmap and the block disagree
+		return classad.NewUndefinedValue(), true
+	}
 	sub := cs.groupScope(b.gi, gb)
 	sub.k = idx
 	sub.fellBack = false
@@ -153,6 +164,26 @@ func (cs *colScope) resolveGroup(name string) (classad.Value, bool) {
 		cs.fellBack = true
 	}
 	return v, true
+}
+
+// groupAt returns the group and this block's selection for a binding, or a nil selection when they
+// cannot be read by it: the binding does not fit the current list, the block has no selection for the
+// group, or the selection's block was built under a different schema than the group's (its field
+// positions would then be another schema's). bindGroupField already keeps a binding on its own list;
+// this is the last line, so a mismatch that gets past it costs a record read rather than an
+// out-of-range index or another field's value.
+func (cs *colScope) groupAt(b groupBind) (*colGroup, *colGroupBlock) {
+	if b.gi < 0 || b.gi >= len(cs.groups) || b.gi >= len(cs.gblocks) {
+		return nil, nil
+	}
+	g, gb := cs.groups[b.gi], cs.gblocks[b.gi]
+	if b.fi < 0 || b.fi >= len(g.schema.fields) {
+		return nil, nil
+	}
+	if gb != nil && gb.blk != nil && gb.blk.schema != g.schema {
+		return g, nil
+	}
+	return g, gb
 }
 
 // groupScope returns the reusable sub-scope for group gi, bound to gb's block.
@@ -179,6 +210,10 @@ func (cs *colScope) groupScope(gi int, gb *colGroupBlock) *colScope {
 // bound a name to a field. Split out so the group path can reuse it without re-resolving a name it
 // has already bound.
 func (cs *colScope) resolveField(fi int) classad.Value {
+	if fi < 0 || fi >= len(cs.blk.schema.fields) {
+		cs.fallBack() // not a field of this block's schema: see slotValue
+		return classad.NewUndefinedValue()
+	}
 	if testBit(cs.blk.escapeAt(cs.k), fi) {
 		return cs.fromColdTail(cs.blk.schema.fields[fi].id)
 	}
@@ -193,11 +228,14 @@ func (cs *colScope) groupAbsentAt(name string, k int) (bool, bool) {
 	if !ok {
 		return false, false
 	}
-	gb := cs.gblocks[b.gi]
+	g, gb := cs.groupAt(b)
+	if gb == nil {
+		return false, false // no usable selection: the caller reads the value instead
+	}
 	if _, member := gb.index(k); member {
 		return false, true
 	}
-	if cs.blk.heldAt(k, cs.groups[b.gi].schema.fields[b.fi].id) {
+	if cs.blk.heldAt(k, g.schema.fields[b.fi].id) {
 		return false, false // the value is in the record: membership proves nothing
 	}
 	return !gb.isException(k), true
@@ -213,7 +251,7 @@ func (s *blockVecSource) setGroups(seg *colSegment, bi int) {
 	}
 	s.groups = seg.groups
 	for _, g := range seg.groups {
-		if bi < len(g.blocks) {
+		if bi >= 0 && bi < len(g.blocks) {
 			s.gblocks = append(s.gblocks, g.blocks[bi])
 		} else {
 			s.gblocks = append(s.gblocks, nil)
@@ -235,8 +273,16 @@ func (s *blockVecSource) loadGroupColumn(name string, dst *vm.Vec) (bool, bool) 
 	if !ok {
 		return false, false
 	}
+	if b.gi >= len(s.gblocks) {
+		return false, true
+	}
 	gb := s.gblocks[b.gi]
 	g := s.groups[b.gi]
+	if gb == nil || (gb.blk != nil && gb.blk.schema != g.schema) {
+		// No selection for this block, or one built under another schema: nothing here says which
+		// records are members, so presenting them as undefined would be a guess. Decline the block.
+		return false, true
+	}
 	id := g.schema.fields[b.fi].id
 	// A record holding this attribute as a value the columns could not take (an expression) is
 	// neither a member nor an exception the cold tail can answer for, so the scatter below would
@@ -252,7 +298,7 @@ func (s *blockVecSource) loadGroupColumn(name string, dst *vm.Vec) (bool, bool) 
 	for k := 0; k < s.blk.n; k++ {
 		dst.St[k] = vm.VsUndef
 	}
-	if gb == nil || gb.blk == nil {
+	if gb.blk == nil {
 		// No member in this block; only the exceptions carry a value.
 		return s.fillGroupExceptions(gb, id, dst), true
 	}

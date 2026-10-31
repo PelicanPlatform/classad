@@ -327,13 +327,24 @@ func (c *Collection) ensureCTProofs(opened bool, budget int) {
 		}
 		sh.mu.RUnlock()
 		for _, t := range tgts {
-			t.seg.ct.mu.Lock()
-			if !t.seg.ct.failed.Load() && !t.seg.ctKnown(t.upto) {
-				c.proveSegCT(t.seg, t.upto)
-			}
-			t.seg.ct.mu.Unlock()
-			t.seg.unpin()
+			c.proveSegCTLocked(t.seg, t.upto)
 		}
+	}
+}
+
+// proveSegCTLocked runs proveSegCT on a pinned target under its proof lock, then unpins it. Both
+// releases are deferred: the walk decodes records read from disk, and a query that panics in it is
+// failed alone by a server that recovers it. A proof lock left held would stop every later
+// CurrentTime query on the segment, and a reindex with it.
+func (c *Collection) proveSegCTLocked(seg *segment, upto int) {
+	defer seg.unpin()
+	seg.ct.mu.Lock()
+	defer seg.ct.mu.Unlock()
+	if lockedReadHook != nil {
+		lockedReadHook("ctproof")
+	}
+	if !seg.ct.failed.Load() && !seg.ctKnown(upto) {
+		c.proveSegCT(seg, upto)
 	}
 }
 

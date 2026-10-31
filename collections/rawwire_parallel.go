@@ -1,7 +1,6 @@
 package collections
 
 import (
-	"sync"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
@@ -94,11 +93,9 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 	}
 	var next int64
 	var stopped atomic.Bool
-	var wg sync.WaitGroup
+	wg := workerGroup{stop: &stopped}
 	for i := 0; i < W; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			var dbuf []byte
 			// Per-worker, like dbuf and sc: it holds reusable buffers and a resolved-projection
 			// cache, so one shared between workers would both race and corrupt rows.
@@ -202,12 +199,17 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 					return true
 				})
 			}
-		}()
+		})
 	}
 	go func() {
 		wg.Wait()
 		close(results)
 	}()
+	// Deferred in this order so the drain runs first: a worker's panic is re-raised here only once
+	// every worker has returned, and a panic in yield still stops and waits for them before release()
+	// unpins what they read.
+	defer wg.rethrow()
+	defer stopAndDrain(&stopped, results)
 	for b := range results {
 		stop := false
 		for i := 0; i+1 < len(b.offs); i++ {
