@@ -32,11 +32,28 @@ func TestSIMDEngineTurnsOnByItself(t *testing.T) {
 	t.Logf("GOARCH=%s %s: engine compiled in = %v", arch, runtime.Version(), rawSupported)
 
 	if rawSupported {
-		// The engine is in. Confirm it actually answers for a width the store produces, so "compiled in" and
-		// "usable" cannot drift apart.
-		if !simdSupportsWidth(2, false) && !simdSupportsWidth(4, false) {
-			t.Errorf("engine compiled in but supports neither a 2- nor a 4-byte column; on amd64 this is the "+
-				"AVX2 check failing, which means this CPU (%s) falls back to scalar", arch)
+		// The engine is in. Confirm it actually answers for the widths the store produces, so "compiled in"
+		// and "usable" cannot drift apart.
+		//
+		// An engine that declines EVERY width is legitimate: on amd64 that is a CPU without AVX2, and
+		// declining wholesale costs speed and nothing else. What must not happen is a PARTIAL decline --
+		// some widths vectorized and others not -- because that is invisible. Every answer stays correct
+		// and only the columns of one width get slow, which is how width 2 came to be gated on AVX-512 and
+		// stay that way: the check here was an AND, so width 2 declining alone said nothing.
+		var served, declined []int
+		for _, w := range []int{1, 2, 4} {
+			if simdSupportsWidth(w, false) {
+				served = append(served, w)
+			} else {
+				declined = append(declined, w)
+			}
+		}
+		t.Logf("widths served=%v declined=%v", served, declined)
+		if len(served) > 0 && len(declined) > 0 {
+			t.Errorf("engine compiled in on %s and serves widths %v but declines %v. A width that declines "+
+				"on its own is a silent half-speed path, not a wrong answer, so nothing else will report it. "+
+				"Either the declining width needs a kernel this CPU can run, or this assertion needs to say "+
+				"why it may not have one.", arch, served, declined)
 		}
 		return
 	}
