@@ -12,7 +12,7 @@ import (
 
 // groupSchemaReadFixture attaches a group to one block of records and returns everything a read test
 // needs: the scope with the group bound, the base block, and the expected per-record state.
-func groupSchemaReadFixture(t *testing.T, c *Collection, n int) (*colScope, *colSegment, []string) {
+func groupSchemaReadFixture(t testing.TB, c *Collection, n int) (*colScope, *colSegment, []string) {
 	t.Helper()
 	iws, ids, state := groupBlockFixture(t, c, n)
 	base := buildAdSchema(iws, adSchemaOpts{Presence: 0.90, Fit: 0.95, Strings: true})

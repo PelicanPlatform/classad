@@ -78,7 +78,9 @@ type colScope struct {
 	groups  []*colGroup
 	gblocks []*colGroupBlock
 	bindG   map[string]groupBind
-	gscope  []*colScope
+	// bindGFor is the group list bindG was resolved against (see bindGroupField).
+	bindGFor []*colGroup
+	gscope   []*colScope
 
 	// dictEnt caches parsed dictionary entries PER FIELD for the current block, dropped by setBlock.
 	//
@@ -184,7 +186,16 @@ func (cs *colScope) fallBack() {
 // slotValue reads the in-slot value of schema field idx for the current record. Split out of
 // resolve so the group path (colgroupread.go) reads a group column through exactly the same
 // readers, rather than a parallel copy that could diverge.
+//
+// idx must be a field of the CURRENT block's schema. Every caller resolves it against that schema,
+// but the positions are cached across blocks and segments, and one resolved against another schema
+// is the shape of a crash this path has had. So an index past the schema's end is a fallback -- the
+// record answers -- rather than an out-of-range read that takes the process down.
 func (cs *colScope) slotValue(idx int) classad.Value {
+	if idx < 0 || idx >= len(cs.blk.schema.fields) {
+		cs.fallBack()
+		return classad.NewUndefinedValue()
+	}
 	f := cs.blk.schema.fields[idx]
 	switch f.kind {
 	case akInt:

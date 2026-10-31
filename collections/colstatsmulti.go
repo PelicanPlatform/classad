@@ -103,6 +103,9 @@ type numCol struct {
 // newNumCol resolves a column for repeated reads. ok=false when the field is not numeric here, or its
 // cold region cannot be decompressed.
 func newNumCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCache) (numCol, bool) {
+	if !blk.hasFieldIdx(fieldIdx) {
+		return numCol{}, false
+	}
 	f := blk.schema.fields[fieldIdx]
 	c := numCol{
 		blk: blk, fieldIdx: fieldIdx, fieldID: fieldID, escBytes: blk.schema.escBytes,
