@@ -266,7 +266,11 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 			continue
 		}
 		if testBit(esc, idx) {
-			escWanted++
+			// A cell the record itself holds -- an expression, already in the remnant half above --
+			// has no cold-tail entry, so counting it would walk the whole tail looking for it.
+			if !blk.heldKnown(local, f.id) {
+				escWanted++
+			}
 			continue
 		}
 		outID := f.id

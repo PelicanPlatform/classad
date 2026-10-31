@@ -164,6 +164,10 @@ func (cs *colScope) resolveAttr(name string, scope ast.AttributeScope) classad.V
 		return cs.fromColdTail(id)
 	}
 	if testBit(cs.blk.escapeAt(cs.k), idx) {
+		// An expression the record keeps, whose value was computed when the segment was columnarized.
+		if v, ok := cs.blk.computedValue(cs.k, idx, cs.bc); ok {
+			return v
+		}
 		// Escaped: missing, or present but not storable in its slot. Both live in the cold tail.
 		return cs.fromColdTail(cs.blk.schema.fields[idx].id)
 	}

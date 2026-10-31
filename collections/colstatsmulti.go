@@ -330,10 +330,10 @@ type fieldLookup func(d *segDictHandle, a wire.Ad) ([]byte, bool)
 func (c *Collection) attrLookup(id uint32) fieldLookup {
 	if c.inline {
 		if name, ok := c.intern.Name(id); ok {
-			return func(d *segDictHandle, a wire.Ad) ([]byte, bool) { return c.wireLookupDict(d, a, name) }
+			return c.evaluatingLookup(id, func(d *segDictHandle, a wire.Ad) ([]byte, bool) { return c.wireLookupDict(d, a, name) })
 		}
 	}
-	return func(_ *segDictHandle, a wire.Ad) ([]byte, bool) { return a.Lookup(id) }
+	return c.evaluatingLookup(id, func(_ *segDictHandle, a wire.Ad) ([]byte, bool) { return a.Lookup(id) })
 }
 
 // resolveStatsFields maps the aggregated field and every predicated field into this SEGMENT's schema.

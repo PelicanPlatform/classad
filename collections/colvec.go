@@ -332,7 +332,13 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 		if !testBit(s.blk.escapeAt(k), idx) {
 			continue
 		}
-		node, found, err := s.blk.escapedNode(k, id, s.bc)
+		// A computed cell is a literal like any other here; the expression it came from is in the
+		// record, and found below would only have led to heldAt.
+		node, found := s.blk.computedNode(k, idx, s.bc)
+		var err error
+		if !found {
+			node, found, err = s.blk.escapedNode(k, id, s.bc)
+		}
 		if err != nil {
 			return false
 		}

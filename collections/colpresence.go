@@ -145,13 +145,16 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 				// A record holding the attribute as an expression kept it in the record, where the
 				// block's escape bit, escape class and cold tail all describe it as missing. Its
 				// value needs evaluating, so the count is the row path's to give.
-				if blk.heldAny(pred.fieldID) {
-					releaseWindows(wins)
-					return 0, false
-				}
+				//
+				// Unless its value was computed when the segment was columnarized, or this one record can
+				// be evaluated alone (heldValueNode): either is read below, before anything that would
+				// call the cell missing.
+				held := blk.heldAny(pred.fieldID)
 				// No record in this block carries the attribute: every visible one of them is
 				// undefined, settled without touching a bitmap per record or the cold tail at all.
-				if blk.fieldAbsentFromBlock(idx) {
+				// The block's absence bit is about its own cells, so it says nothing once a record
+				// holds the attribute itself.
+				if !held && blk.fieldAbsentFromBlock(idx) {
 					for k := 0; k < blk.n; k++ {
 						gk := base + k
 						if gk >= cs.offsLen() {
@@ -177,6 +180,22 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 					if !testBit(blk.escapeAt(k), idx) {
 						tally(false) // value is in its fixed slot: present and a literal
 						continue
+					}
+					// Held and computed: the escape class would call this cell missing, since the
+					// block's own cells never saw the expression.
+					if held {
+						node, ok := blk.computedNode(k, idx, bc)
+						if !ok && blk.heldAt(k, pred.fieldID) {
+							if node, ok = blk.heldValueNode(k, pred.fieldID, bc); !ok {
+								releaseWindows(wins)
+								return 0, false
+							}
+						}
+						if ok {
+							undef, _ := nodeIsUndefined(node)
+							tally(undef)
+							continue
+						}
 					}
 					// Escaped: missing, or present but not storable in the slot. The block's
 					// per-field escape class often settles that without reading anything --

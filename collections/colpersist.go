@@ -390,6 +390,10 @@ func appendColSegment(dst []byte, cs *colSegment, nameOf func(uint32) (string, b
 	if cs.remnants != nil {
 		dst = appendRemnantTrailer(dst, cs.remnants.names)
 	}
+	// The computed values come after it, for the same reason (see colComputedTrailer).
+	if cs.hasComputed() {
+		dst = appendComputedTrailer(dst, cs.blocks)
+	}
 	return dst
 }
 
@@ -696,8 +700,23 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 	// Anything after the group section is the remnant-name trailer or nothing: an older payload ends
 	// exactly here. A malformed trailer drops only the trailer -- the segment then reads as one that
 	// predates it, which is correct, only slower.
-	cs.remnants = readRemnantTrailer(c.b[c.i:], internName)
+	cs.remnants = readPayloadTrailers(c.b[c.i:], cs, internName)
 	return cs
+}
+
+// readPayloadTrailers decodes what follows the group section: an optional remnant-name trailer, then an
+// optional computed-value trailer (colComputedTrailer), together occupying exactly rest. It attaches the
+// computed values to cs and returns the remnant set. Anything that does not parse drops both, so the
+// segment reads as one that predates them -- correct, only slower.
+func readPayloadTrailers(rest []byte, cs *colSegment, internName func(string) uint32) *remnantSet {
+	names, tail, hasNames := splitRemnantTrailer(rest)
+	if len(tail) > 0 && !readComputedTrailer(tail, cs) {
+		return nil
+	}
+	if !hasNames {
+		return nil
+	}
+	return remnantSetOf(names, internName)
 }
 
 // colRemnantTrailer marks the remnant-name trailer of a columnarized segment's payload: the magic,
@@ -744,21 +763,38 @@ func appendRemnantTrailer(dst []byte, names []string) []byte {
 // name, or returns nil when there is none or it does not parse. Names are read before any is interned,
 // so a torn trailer leaves nothing in the intern table.
 func readRemnantTrailer(rest []byte, internName func(string) uint32) *remnantSet {
+	names, tail, ok := splitRemnantTrailer(rest)
+	if !ok || len(tail) != 0 {
+		return nil
+	}
+	return remnantSetOf(names, internName)
+}
+
+// splitRemnantTrailer parses a remnant-name trailer at the start of rest WITHOUT interning anything,
+// returning its names and the bytes after it. With no trailer there, ok is false and tail is rest; with
+// one that does not parse, ok is false and tail is nil, so nothing after it is trusted either.
+func splitRemnantTrailer(rest []byte) (names []string, tail []byte, ok bool) {
 	c := &cursor{b: rest}
 	if len(rest) < 8 || c.u32() != colRemnantTrailer {
-		return nil
+		return nil, rest, false
 	}
 	n := int(c.u32())
 	if n < 0 || n > 1<<20 || c.err != nil {
-		return nil
+		return nil, nil, false
 	}
-	names := make([]string, 0, n)
+	names = make([]string, 0, n)
 	for range n {
 		names = append(names, string(c.bytes()))
 	}
-	if c.err != nil || c.i != len(rest) {
-		return nil
+	if c.err != nil {
+		return nil, nil, false
 	}
+	return names, rest[c.i:], true
+}
+
+// remnantSetOf interns a parsed remnant-name list.
+func remnantSetOf(names []string, internName func(string) uint32) *remnantSet {
+	n := len(names)
 	r := &remnantSet{names: names, ids: make(map[uint32]struct{}, n)}
 	for _, nm := range names {
 		r.ids[internName(nm)] = struct{}{}

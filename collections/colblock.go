@@ -285,6 +285,13 @@ type columnarBlock struct {
 	// for a sidecar block.
 	native  *colSegment
 	segBase int
+
+	// computed holds, for a columnarized segment's base block, the values of escaped cells whose
+	// expression the record keeps and which depend on the record alone, computed when the segment was
+	// columnarized (see colcomputed.go). computedComp is the compressed region and computed its
+	// per-field sections, sorted by field index. Both empty for every other block.
+	computed     []computedEntry
+	computedComp []byte
 }
 
 // blockZone is one numeric column's range within a block.
@@ -1108,6 +1115,18 @@ const (
 // The aggregate and count paths need the reason: an absent or non-numeric literal simply contributes
 // nothing, while an expression has a value they cannot compute.
 func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (colVal, numCell) {
+	// A computed cell first: its expression is in the record, never in the cold tail, so the tail walk
+	// below could only end at heldAt and decline.
+	if len(b.computed) > 0 {
+		if idx, ok := b.schema.byID[fieldID]; ok {
+			if node, ok := b.computedNode(k, idx, bc); ok {
+				if v, ok := nodeColVal(node); ok {
+					return v, cellNumber
+				}
+				return colVal{}, cellOther
+			}
+		}
+	}
 	tail, err := bc.stream(b, kindCold)
 	if err != nil {
 		return colVal{}, cellExpr
@@ -1141,6 +1160,14 @@ func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (c
 		cold = cold[nl:]
 	}
 	if b.heldAt(k, fieldID) {
+		// Held and not computed: evaluate this one record where that is exactly the scan's answer,
+		// rather than give the whole query back (see heldValueNode).
+		if node, ok := b.heldValueNode(k, fieldID, bc); ok {
+			if v, ok := nodeColVal(node); ok {
+				return v, cellNumber
+			}
+			return colVal{}, cellOther
+		}
 		return colVal{}, cellExpr
 	}
 	return colVal{}, cellAbsent
