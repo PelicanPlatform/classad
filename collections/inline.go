@@ -176,11 +176,11 @@ func (c *Collection) encodeInterned(dst []byte, ad *ast.ClassAd, table *wire.Int
 
 func (c *Collection) wireLookupDict(dict *segDictHandle, a wire.Ad, name string) ([]byte, bool) {
 	if dict != nil {
-		id, ok := dict.lookup(name)
+		id, ok := dict.segIDOf(name)
 		if !ok {
 			return nil, false
 		}
-		return a.Lookup(id)
+		return a.Lookup(uint32(id)) //idspace:translate a dictionary-keyed record is keyed by the segID
 	}
 	return c.wireLookup(a, name)
 }

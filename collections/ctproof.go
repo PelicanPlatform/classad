@@ -110,7 +110,7 @@ func (s *segment) ctDictProof(used int) bool {
 	if d == nil || s.dictUnusable.Load() {
 		return false
 	}
-	if _, has := d.lookup(currentTimeName); has {
+	if _, has := d.segIDOf(currentTimeName); has {
 		return false
 	}
 	s.ctAdvance(used)
@@ -206,11 +206,11 @@ func namesCurrentTimeIn(w []byte, d *segDictHandle) bool {
 			return true
 		}
 	}
-	lid, ok := d.lookup(currentTimeName)
+	lid, ok := d.segIDOf(currentTimeName)
 	if !ok {
 		return false
 	}
-	_, has := a.Lookup(lid)
+	_, has := a.Lookup(uint32(lid)) //idspace:translate a dictionary-keyed record is keyed by the segID
 	return has
 }
 
@@ -425,7 +425,7 @@ func (c *Collection) persistCTProofs() {
 			if d == nil {
 				return true
 			}
-			_, has := d.lookup(currentTimeName)
+			_, has := d.segIDOf(currentTimeName)
 			return has
 		})
 		for _, seg := range segs {

@@ -154,8 +154,8 @@ func (s *indexSpec) attrNode(ad wire.Ad, id uint32, dict *segDictHandle) ([]byte
 		// Interned segment: the record carries segment-local ids. Resolve the indexed
 		// attribute's name (always available -- a persistent collection uses an inline spec)
 		// to this segment's local id, then read it.
-		if localid, ok := dict.lookup(s.names[id]); ok {
-			return ad.Lookup(localid)
+		if localid, ok := dict.segIDOf(s.names[id]); ok {
+			return ad.Lookup(uint32(localid)) //idspace:translate a dictionary-keyed record is keyed by the segID
 		}
 		return nil, false
 	}

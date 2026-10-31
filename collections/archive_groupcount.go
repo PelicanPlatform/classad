@@ -364,8 +364,8 @@ type recAttr struct {
 // through the collection's own encoding (inline names, or global intern ids) otherwise.
 func (c *Collection) recAttrIn(w segWindow, name string) recAttr {
 	if d := w.dict(); d != nil {
-		id, ok := d.lookup(name)
-		return recAttr{id: id, has: ok}
+		id, ok := d.segIDOf(name)
+		return recAttr{id: uint32(id), has: ok} //idspace:translate a dictionary-keyed record is keyed by the segID
 	}
 	if c.inline {
 		return recAttr{name: name, byName: true, has: true}
