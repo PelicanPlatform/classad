@@ -963,6 +963,13 @@ A value that does not fit its slot — the wrong kind, an integer too wide, or a
 expression rather than a literal — **escapes**. Escaped values are carried elsewhere in
 the record, as described below.
 
+An expression cell that columnarizing will compute (see *Computed cells* below) counts
+toward its field's presence and kind as a literal of its computed kind would, so a field
+that is an expression in most records — a usage figure derived from another usage figure,
+say — can be a field at all. It does not count toward an integer's width, since a computed
+value never occupies the slot. Expressions that would not be computed count as before: a
+field with no dominant storable kind is dropped.
+
 The schema is derived when columnar storage is first enabled on a collection. Routine
 maintenance re-derives it when the required-attribute set changes, and otherwise at most
 hourly, and adopts the re-derivation only when the change is material: a required
@@ -981,6 +988,11 @@ a column nor in that list answers undefined for the whole segment without readin
 record; without the list it has to read each remnant. The list follows the group section,
 which older builds stop parsing at, so it does not change what they read. Segments written
 without it are stale and converge like any other.
+
+The computed-value trailer, when there is one, follows it. A build that does not know it
+still reads the payload correctly, since the records and columns are unchanged, but it can
+no longer parse the remnant-name list once something follows it, so it reads remnants that
+the list would have spared it — slower, never wrong.
 
 ### Group schemas
 
@@ -1079,6 +1091,7 @@ Each block (`columnarBlock`) holds:
 | string dictionaries | per field where values repeat: fold-sorted distinct values plus 1- or 2-byte code columns, compressed. **Authoritative**: a dictionary-coded string is not also written positionally |
 | zones | per numeric field `[min, max]` plus an `escaped` flag |
 | escape classes | per field: none, all-missing, all-exceptional, or mixed (with the exceptional record list); plus an all-absent bitmap |
+| computed region | columnarized segments only: per field, the computed values of held expression cells, compressed (see *Computed cells*) |
 
 Regions are compressed with a dictionary-less **region codec**, separate from the
 segment's trained codec. Decompressed regions live in a process-global, size-bounded
@@ -1096,6 +1109,34 @@ remnant. To the block it looks the same as a missing value. Readers that need to
 the two apart — any exact answer, such as a count or a column-decided match — consult a
 lazily built per-segment index of which cells each remnant still holds (`colheld.go`).
 Treating a held cell as UNDEFINED is precisely the class of bug Chapter 23 warns about.
+
+**Computed cells** (`colcomputed.go`). Sealed records are immutable, so a value computed
+from one when its segment is columnarized never goes stale. For a held cell whose
+expression depends on nothing but the record, the value is computed then and kept in a
+per-block computed region beside the block: one section per field, an `n+1` offset array
+over the cells' literal nodes, so a reader finds a value with two loads. The expression
+stays in the remnant and the cell stays escaped, so reassembly, projection and every
+reader that does not ask for the computed value see exactly what they saw before; a reader
+that meets the escaped cell asks for the computed value before deciding the record must be
+read. Dropping the region costs speed, never an answer.
+
+A cell is computed only when every attribute its value reaches through unscoped or `MY.`
+references is present in the record, none is sealed or sealable, nothing in that closure
+names `CurrentTime` or another ad (`TARGET.`, `PARENT.`, absolute), every function is on a
+short list of deterministic built-ins, and the value is a number, string or boolean.
+Requiring presence matters: an unscoped reference to an absent attribute is UNDEFINED when
+the ad is evaluated alone but falls through to the target ad in matchmaking, so a value
+computed from one would be right for one reader and wrong for another. With presence
+required, the value is the same in every evaluation context.
+
+The held cells left over — a user-written `TARGET.` expression, a reference to an absent
+attribute — are **per-record exceptions**. A numeric or grouping reader that meets one
+evaluates that record alone, as the scan it stands in for would, and goes on with the
+column; the row walk over a segment without columns does the same through its attribute
+lookup. Only where that is exactly the scan's value: nothing in the closure may read the
+clock or chance, and an ERROR value still gives the query back. A block whose held cells
+are mostly uncomputed (one columnarized before computed values existed) gives the query
+back too, since reading that many records one at a time is slower than the scan.
 
 ### Two homes for columnar blocks
 

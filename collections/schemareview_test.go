@@ -29,6 +29,8 @@ func reviewAd(i, gen int, secret bool) string {
 		reviewEpoch0+i*10, i, i%10, i%7, (i+gen)%7)
 	fmt.Fprintf(&b, `RemoteWallClockTime=%d.25; ResidentSetSize=%d; MemoryUsage=((ResidentSetSize + 1023) / 1024); `,
 		i%5000, 1000+i%77)
+	// An expression no record can compute, since it names the match target: it stays in the records.
+	b.WriteString(`MatchMemory=(TARGET.Memory / 1024); `)
 	for j := range 16 {
 		fmt.Fprintf(&b, "Pad%02d=%d; ", j, (i*(j+3))%1000)
 	}
@@ -416,7 +418,7 @@ func convergeUnderRequire(t *testing.T, deltas, secret bool) {
 	const budget = 4
 	f.c.colBudget = budget
 	f.opts.ColumnarSegmentBudget = budget
-	f.require = []string{"VacateReasonCode", "MemoryUsage"}
+	f.require = []string{"VacateReasonCode", "MatchMemory"}
 	if !f.c.AddSchemaRequireAttrs(f.require...) {
 		t.Fatal("require set did not change")
 	}
@@ -432,8 +434,12 @@ func convergeUnderRequire(t *testing.T, deltas, secret bool) {
 		if !schemaHas(f.c, "VacateReasonCode") {
 			t.Fatalf("pass %d: the required attribute was not adopted", pass)
 		}
-		if schemaHas(f.c, "MemoryUsage") {
-			t.Fatalf("pass %d: expression-valued MemoryUsage became a field despite the refusal", pass)
+		if schemaHas(f.c, "MatchMemory") {
+			t.Fatalf("pass %d: expression-valued MatchMemory became a field despite the refusal", pass)
+		}
+		// An expression every record computes is a field without being required.
+		if !schemaHas(f.c, "MemoryUsage") {
+			t.Fatalf("pass %d: MemoryUsage, computed in every record, is not a field", pass)
 		}
 		if n := changedPayloads(before, payloads(f.c)); n > 2*budget {
 			t.Fatalf("pass %d rewrote/rebuilt %d segments, budget is %d", pass, n, budget)
@@ -468,16 +474,16 @@ func convergeUnderRequire(t *testing.T, deltas, secret bool) {
 		t.Fatal("fixture never reached a mid-convergence state to restart in")
 	}
 	t.Logf("%d sealed segments converged in %d passes at budget %d", sealed, passes, budget)
-	// The expression-valued requirement is refused, and the refusal is what reports it.
+	// The uncomputable expression-valued requirement is refused, and the refusal is what reports it.
 	info := f.c.SchemaScanInfo()
 	var skipped bool
 	for _, s := range info.RequireSkipped {
-		if strings.EqualFold(s.Name, "MemoryUsage") && s.Reason == requireSkipNoLiteral {
+		if strings.EqualFold(s.Name, "MatchMemory") && s.Reason == requireSkipNoLiteral {
 			skipped = true
 		}
 	}
 	if !skipped {
-		t.Errorf("MemoryUsage refusal not reported: %+v", info.RequireSkipped)
+		t.Errorf("MatchMemory refusal not reported: %+v", info.RequireSkipped)
 	}
 
 	f.reopen()
