@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
@@ -17,9 +18,17 @@ import (
 
 // streamArchiveQuery streams an archive's newest-first, limit-capped matches.
 func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
+	start := time.Now()
 	name := r.str()
 	limit := int(r.i32())
 	constraint := r.str()
+	n := 0
+	if sc.qlog != nil {
+		defer func() {
+			sc.qlog(QueryLog{Op: "ArchiveQuery", Table: name, Constraint: constraint,
+				Limit: limit, Rows: n, Duration: time.Since(start)})
+		}()
+	}
 	if r.err != nil {
 		sc.write(respBad(reqID))
 		return
@@ -42,6 +51,7 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 			return // client gone
 		}
 		sc.write(putStr(respHead(reqID, stStream), adString(ad, sc.opts.IncludePrivate)))
+		n++
 	}
 	sc.write(respHead(reqID, stStreamEnd))
 }
@@ -72,6 +82,7 @@ func (sc *serverConn) streamArchiveAggregateStats(reqID uint64, r *reader) {
 // whether the frame is the wide form -- each group column followed by a bucket width, each
 // aggregate spec by a filter expression -- rather than the base opcode's narrow one.
 func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantStats bool) {
+	start := time.Now()
 	name := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -89,6 +100,16 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantSt
 	aggs, ok := readAggSpecs(r, reqID, sc.write, extended)
 	if !ok {
 		return
+	}
+	// Recorded under the same name the mutable handler gives an archive it resolved, so
+	// one history aggregate is one shape however the client reached it: through the
+	// archive opcodes or by naming the table.
+	obs := QueryLog{Op: "ArchiveAggregate", Table: name, Constraint: constraint, Groups: groupCols, Aggs: aggs}
+	if sc.qlog != nil {
+		defer func() {
+			obs.Duration = time.Since(start)
+			sc.qlog(obs)
+		}()
 	}
 	if !sc.opts.IncludePrivate {
 		if refusePrivateConstraint(reqID, constraint, sc.opts.IncludePrivate, sc.write) {
@@ -121,11 +142,15 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantSt
 		sc.write(respErr(reqID, "no such archive: "+name))
 		return
 	}
+	// The scan breakdown is computed when the client asked for it (EXPLAIN ANALYZE) and
+	// ALSO whenever the server is aggregating queries, so the shape report can say which
+	// tier answered instead of leaving its most diagnostic column blank.
 	var stats collections.ScanStats
 	var rows []db.AggRow
 	var err error
-	if wantStats {
+	if wantStats || sc.s.queryStatsOn() {
 		rows, err = a.AggregateColsStats(constraint, groupCols, aggs, &stats)
+		obs.Scan = stats
 	} else {
 		rows, err = a.AggregateCols(constraint, groupCols, aggs)
 	}
@@ -133,6 +158,7 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantSt
 		sc.write(respErr(reqID, err.Error()))
 		return
 	}
+	obs.Rows = len(rows)
 	for _, row := range rows {
 		if cancelled(sc.ctx) {
 			return // client gone

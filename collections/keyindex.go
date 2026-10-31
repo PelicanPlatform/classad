@@ -28,15 +28,35 @@ import (
 //	count * { hash u64, off u32 }   (sorted by hash, then off)
 //	crc32 u32   (IEEE, over all preceding bytes)
 //
+// A DELETE MARKER is indexed under the hash of the key it deletes, with kidxTombstone set in its
+// offset field (v2). It is a keyless record, so v1 hashed its empty inline key and filed every
+// marker in the store under one hash that no real key produces -- correct for a lookup, which
+// skips markers anyway, but it means a delete cannot be FOUND by the key it deletes. Recovery
+// needs exactly that: to decide from the sidecar alone whether a key's newest version is live or
+// deleted, without reading the record to look at its supersededBySeq, which is the random page
+// touch per live key that reading from sidecars is meant to remove. The bit is what makes the
+// answer readable without the deref; offsets are far below 2^31, so it costs no space.
+//
 // flags was a zero pad until it carried the segment's CurrentTime proof (kidxCTChecked,
 // kidxCTDefines; see ctproof.go). The version is unchanged because the field is optional both ways:
 // a build that predates it reads the flags as padding and ignores them, and writes zero, which this
 // build reads as "not checked".
 const (
-	keyIdxMagic     = 0x4b494458 // "KIDX"
-	keyIdxVersion   = 1
+	keyIdxMagic = 0x4b494458 // "KIDX"
+	// keyIdxVersionV1 filed delete markers under the hash of their empty inline key; v2 files
+	// them under the key they delete and flags them. Both are read: a sidecar is derived and
+	// disposable, so a v1 one is used as it always was and rebuilt in its own time rather than
+	// forcing a re-index of every sealed segment on the first open after an upgrade.
+	keyIdxVersionV1 = 1
+	keyIdxVersion   = 2
 	keyIdxHeaderLen = 16 // magic+version+pad+upto+count
 	keyIdxEntryLen  = 12 // hash u64 + off u32
+
+	// kidxTombstone marks an entry as a delete marker rather than a data record. It is the top
+	// bit of the offset field: a segment is orders of magnitude smaller than 2 GiB, so the bit
+	// is free, and masking it off is what every offset read does.
+	kidxTombstone = uint32(1) << 31
+	kidxOffMask   = kidxTombstone - 1
 )
 
 // A segment's two TRAILER records -- its attribute dictionary (appendDict) and its columnar
@@ -98,7 +118,12 @@ func buildKeyIndex(data []byte, upto int, h Hasher, dm *damageSet, flags uint16)
 		if total == 0 {
 			break
 		}
-		ents = append(ents, ent{h.Hash(recKey(data, o)), o})
+		if k, ok := recDeleteMarkerKey(data, o); ok {
+			// Filed under the key it deletes, so recovery can find the delete from the key.
+			ents = append(ents, ent{h.Hash(k), o | kidxTombstone})
+		} else {
+			ents = append(ents, ent{h.Hash(recKey(data, o)), o})
+		}
 		off += int(total)
 	}
 	sort.Slice(ents, func(i, j int) bool {
@@ -126,11 +151,17 @@ func buildKeyIndex(data []byte, upto int, h Hasher, dm *damageSet, flags uint16)
 // a plain slice in tests). It holds no heap copy of the entries -- lookups binary-
 // search directly over the mapping, so a large sidecar stays pageable.
 type mmapKeyIndex struct {
-	upto  uint32
-	count uint32
-	flags uint16 // the header's flags field (see the format above)
-	ents  []byte // count*keyIdxEntryLen bytes, sorted by hash
+	upto    uint32
+	count   uint32
+	flags   uint16 // the header's flags field (see the format above)
+	version uint16 // keyIdxVersionV1 files delete markers under no usable key; see the format above
+	ents    []byte // count*keyIdxEntryLen bytes, sorted by hash
 }
+
+// tombstonesUsable reports whether this sidecar files delete markers under the key they delete,
+// so an absent tombstone means the key was not deleted in this segment rather than "this index
+// cannot say". A v1 sidecar cannot say, and a caller that needs the answer must read the records.
+func (m *mmapKeyIndex) tombstonesUsable() bool { return m.version >= keyIdxVersion }
 
 // parseKeyIndex validates a key sidecar's bytes (magic, version, CRC, length) and
 // returns a view over them. The bytes must outlive the view (they alias the mmap).
@@ -141,8 +172,9 @@ func parseKeyIndex(data []byte) (*mmapKeyIndex, error) {
 	if binary.LittleEndian.Uint32(data) != keyIdxMagic {
 		return nil, fmt.Errorf("collections: key sidecar bad magic")
 	}
-	if v := binary.LittleEndian.Uint16(data[4:]); v != keyIdxVersion {
-		return nil, fmt.Errorf("collections: key sidecar version %d", v)
+	version := binary.LittleEndian.Uint16(data[4:])
+	if version != keyIdxVersion && version != keyIdxVersionV1 {
+		return nil, fmt.Errorf("collections: key sidecar version %d", version)
 	}
 	body := data[:len(data)-4]
 	if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(data[len(data)-4:]) {
@@ -155,20 +187,29 @@ func parseKeyIndex(data []byte) (*mmapKeyIndex, error) {
 	if entEnd != len(body) {
 		return nil, fmt.Errorf("collections: key sidecar count %d does not match length", count)
 	}
-	return &mmapKeyIndex{upto: upto, count: count, flags: binary.LittleEndian.Uint16(data[6:]), ents: data[entStart:entEnd]}, nil
+	return &mmapKeyIndex{
+		upto:    upto,
+		count:   count,
+		flags:   binary.LittleEndian.Uint16(data[6:]),
+		version: version,
+		ents:    data[entStart:entEnd],
+	}, nil
 }
 
 func (m *mmapKeyIndex) hashAt(i uint32) uint64 {
 	return binary.LittleEndian.Uint64(m.ents[i*keyIdxEntryLen:])
 }
 func (m *mmapKeyIndex) offAt(i uint32) uint32 {
-	return binary.LittleEndian.Uint32(m.ents[i*keyIdxEntryLen+8:])
+	return binary.LittleEndian.Uint32(m.ents[i*keyIdxEntryLen+8:]) & kidxOffMask
 }
 
-// lookup returns the offsets of every record in the segment whose key-hash == hash
-// (a key's several versions, plus any hash collisions). The caller reads each record
-// to match the full key and pick the live one (supersededBySeq == seqMax).
-func (m *mmapKeyIndex) lookup(hash uint64) []uint32 {
+// isTombstoneAt reports whether entry i is a delete marker rather than a data record.
+func (m *mmapKeyIndex) isTombstoneAt(i uint32) bool {
+	return binary.LittleEndian.Uint32(m.ents[i*keyIdxEntryLen+8:])&kidxTombstone != 0
+}
+
+// seek returns the index of the first entry whose hash is >= the given hash.
+func (m *mmapKeyIndex) seek(hash uint64) uint32 {
 	lo, hi := uint32(0), m.count
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -178,9 +219,36 @@ func (m *mmapKeyIndex) lookup(hash uint64) []uint32 {
 			hi = mid
 		}
 	}
+	return lo
+}
+
+// lookup returns the offsets of every DATA record in the segment whose key-hash == hash
+// (a key's several versions, plus any hash collisions). The caller reads each record
+// to match the full key and pick the live one (supersededBySeq == seqMax).
+//
+// Delete markers are left out although v2 files them under this same hash: every caller here
+// skips a marker after reading it, so handing them over would only add records to read. The
+// callers that want them ask for them.
+func (m *mmapKeyIndex) lookup(hash uint64) []uint32 {
 	var offs []uint32
-	for i := lo; i < m.count && m.hashAt(i) == hash; i++ {
-		offs = append(offs, m.offAt(i))
+	for i := m.seek(hash); i < m.count && m.hashAt(i) == hash; i++ {
+		if !m.isTombstoneAt(i) {
+			offs = append(offs, m.offAt(i))
+		}
+	}
+	return offs
+}
+
+// lookupTombstones returns the offsets of the delete markers filed under hash -- the deletes of
+// the key (or of another key that hashes the same) recorded in this segment. Always empty for a
+// v1 sidecar, which files no marker under a usable key, so a caller must check tombstonesUsable
+// before reading an empty result as "not deleted here".
+func (m *mmapKeyIndex) lookupTombstones(hash uint64) []uint32 {
+	var offs []uint32
+	for i := m.seek(hash); i < m.count && m.hashAt(i) == hash; i++ {
+		if m.isTombstoneAt(i) {
+			offs = append(offs, m.offAt(i))
+		}
 	}
 	return offs
 }

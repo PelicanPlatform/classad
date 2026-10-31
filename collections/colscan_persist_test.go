@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
@@ -299,4 +300,118 @@ func TestSchemaScanReindexKeepsBlock(t *testing.T) {
 	if n == 0 {
 		t.Fatal("Owner index query returned nothing after AddIndex")
 	}
+}
+
+// TestSchemaScanReindexKeepsColdTailNames: a sidecar block with no segment dictionary keys its cold
+// tail by the writing process's intern ids, and the section stores those ids' names so a later process
+// can translate. A block reloaded from disk holds only that translation, not the set of ids it was
+// built from, and a reindex re-marshaled it (colBlobPreserve) with no names at all: the next process
+// then read every cold tail in its own id space, so an escaped ClusterId and every rare X<n> counted
+// as absent. The writing process interns names the readers never see, so the two id spaces differ;
+// naming a stored id through the re-marshaling process's own table would be just as wrong.
+func TestSchemaScanReindexKeepsColdTailNames(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	open := func() *Collection {
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14, GroupSchemaCount: -1, ColumnarSegmentBudget: -1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := open()
+	for i := range 40 {
+		c.intern.Intern(fmt.Sprintf("Pad%d", i))
+	}
+	const rare = 24
+	for i := range 3000 {
+		extra := ""
+		if i%7 == 0 {
+			extra = fmt.Sprintf("; X%d=%d", (i/120)%rare, i)
+		}
+		cl := fmt.Sprintf("%d", i)
+		if i%50 == 0 {
+			cl = fmt.Sprintf(`"s%d"`, i) // escapes the int column into the cold tail
+		}
+		ad, err := classad.Parse(fmt.Sprintf(`[ ClusterId=%s; ProcId=%d; Owner="user%d"; JobStatus=%d%s ]`, cl, i%10, i%7, i%6, extra))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Fatal("no schema")
+	}
+	if n := columnarSegmentsForTest(c); n != 0 {
+		t.Fatalf("%d segments columnarized; this needs sidecar blocks", n)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	check := func(c *Collection, stage string) {
+		t.Helper()
+		exprs := []string{"ClusterId is undefined", `ClusterId == "s50"`}
+		for x := range rare {
+			exprs = append(exprs, fmt.Sprintf("X%d > 0", x))
+		}
+		served := 0
+		for _, e := range exprs {
+			q, err := vm.Parse(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, ok := c.CountQuery(q); ok {
+				served++
+				if want := len(readAll(t, c, e)); n != want {
+					t.Errorf("%s, counting %s: %d from the columns, %d from the records", stage, e, n, want)
+				}
+			}
+		}
+		if served == 0 {
+			t.Fatalf("%s: no count served from the columns", stage)
+		}
+	}
+
+	c = open()
+	// The reloaded blocks must translate, or the two id spaces never diverged and this proves nothing.
+	diverged := false
+	for _, seg := range c.shards[0].segs {
+		if seg == nil || seg.dict.Load() != nil {
+			continue
+		}
+		if cs := seg.colblk.Load(); cs != nil {
+			for _, b := range cs.blocks {
+				if b.remap != nil {
+					for stored, cur := range b.remap.toCurrent {
+						diverged = diverged || stored != cur
+					}
+				}
+			}
+		}
+	}
+	if !diverged {
+		t.Fatal("no reloaded sidecar block translates its cold tail; the stored and current ids coincide")
+	}
+	check(c, "after the first reopen")
+	before := colSegmentBuilds.Load()
+	// A new index spec makes Reindex rewrite every sealed sidecar, re-marshaling the reloaded block.
+	if !c.AddIndex([]string{"Owner"}, nil) {
+		t.Fatal("AddIndex returned false")
+	}
+	c.Reindex()
+	if built := colSegmentBuilds.Load() - before; built != 0 {
+		t.Fatalf("reindex rebuilt %d blocks; it must re-marshal the reloaded ones", built)
+	}
+	check(c, "after the reindex")
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c = open()
+	defer c.Close()
+	check(c, "after a reopen of the reindexed sidecars")
 }

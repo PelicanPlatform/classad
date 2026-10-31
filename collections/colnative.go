@@ -769,7 +769,11 @@ func (cs *colSegment) bindDictRemap(c *Collection, d *segDictHandle) bool {
 	}
 	rm := segIDRemap(c, d)
 	if rm == nil {
-		return false
+		// No dictionary. A section that stores no cold-tail names reads as dictionary-keyed, and so
+		// does one written by a process with nothing to name: no record of the segment has a cold
+		// tail. That payload needs no translation at all, and dropping it cost the segment its block
+		// at every reopen. Only a block that has cold-tail bytes is unreadable without one.
+		return !cs.hasColdTail()
 	}
 	for _, b := range cs.blocks {
 		b.remap = rm
@@ -778,6 +782,27 @@ func (cs *colSegment) bindDictRemap(c *Collection, d *segDictHandle) bool {
 		setGroupRemap(g.blocks, rm)
 	}
 	return true
+}
+
+// hasColdTail reports whether any record of the payload, in a base block or a group block, has a
+// cold-tail entry. The per-record offsets are cumulative, so the last one is the tail's whole length.
+func (cs *colSegment) hasColdTail() bool {
+	tail := func(b *columnarBlock) bool {
+		return b != nil && (len(b.coldOffB) < (b.n+1)*4 || b.coldOffAt(b.n) != 0)
+	}
+	for _, b := range cs.blocks {
+		if tail(b) {
+			return true
+		}
+	}
+	for _, g := range cs.groups {
+		for _, gb := range g.blocks {
+			if gb != nil && tail(gb.blk) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // segIDRemap rebuilds a reader's translation between this process's intern ids and the segment

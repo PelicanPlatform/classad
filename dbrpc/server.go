@@ -314,6 +314,22 @@ type QueryLog struct {
 	// User is the connection's authenticated identity (ServeOptions.Peer), or empty when
 	// the front end did not name one.
 	User string
+
+	// Groups and Aggs describe an AGGREGATE query: the GROUP BY columns (each with its
+	// bucket width, where it has one) and the functions reduced over each group. Both are
+	// empty on a plain read.
+	//
+	// They are recorded because grouping decides the work rather than merely the output.
+	// A single raw numeric group column is answered from the columnar blocks; the same
+	// WHERE grouped by an expression, or by a column the accelerator does not cover,
+	// falls through to rebuilding every matched record. Those are the same constraint and
+	// orders of magnitude apart, so a report that logged only the constraint would rank
+	// them as one shape and name neither.
+	//
+	// Note that Rows counts GROUPS for these -- a handful, however many records were read
+	// to produce them. Scan carries the cost.
+	Groups []GroupCol
+	Aggs   []AggSpec
 }
 
 // isMutating reports whether o writes to a transaction (and so is refused on a
@@ -780,11 +796,11 @@ func (sc *serverConn) dispatch(frame []byte) {
 	case opOrdered:
 		sc.s.streamOrdered(sc.ctx, reqID, body, priv, sc.write)
 	case opAggregate:
-		sc.s.streamAggregate(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamAggregate(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opAggregateFiltered:
-		sc.s.streamAggregateFiltered(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamAggregateFiltered(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opAggregateBucketed:
-		sc.s.streamAggregateBucketed(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamAggregateBucketed(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchTables:
 		sc.s.streamMatchTables(sc.ctx, reqID, body, sc.write)
 	case opWatch:
@@ -802,11 +818,11 @@ func (sc *serverConn) dispatch(frame []byte) {
 	case opArchiveAggregateStats:
 		sc.streamArchiveAggregateStats(reqID, body)
 	case opQueryKeys:
-		sc.s.streamQueryKeys(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamQueryKeys(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTxnQuery:
-		sc.s.streamTxnQuery(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamTxnQuery(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opTxnQueryKeys:
-		sc.s.streamTxnQueryKeys(sc.ctx, reqID, body, priv, sc.write)
+		sc.s.streamTxnQueryKeys(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opWatchStop:
 		sc.stopWatch(body.u64())
 		sc.write(resp(reqID, stOK))
@@ -916,9 +932,20 @@ type viewSealer interface {
 // caller can address matched rows for UPDATE/DELETE by their real db key regardless of any
 // self-reported key attribute. Read-only; no private-attribute exposure (keys are returned, not ad
 // bodies). The constraint is still evaluated server-side, so it may reference any attribute.
-func (s *Server) streamQueryKeys(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamQueryKeys(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
 	table := r.str()
 	constraint := r.str()
+	n := 0
+	// Returning keys rather than ads makes this cheap to SEND, not cheap to RUN: the
+	// constraint is evaluated over the same rows either way, and a caller that walks a
+	// large table by key pays for the scan every time.
+	if qlog != nil {
+		defer func() {
+			qlog(QueryLog{Op: "QueryKeys", Table: table, Constraint: constraint,
+				Rows: n, Duration: time.Since(start)})
+		}()
+	}
 	if r.err != nil {
 		write(respBad(reqID))
 		return
@@ -941,6 +968,7 @@ func (s *Server) streamQueryKeys(ctx context.Context, reqID uint64, r *reader, i
 			return // client gone: stop the scan
 		}
 		write(putStr(respHead(reqID, stStream), key))
+		n++
 	}
 	write(respHead(reqID, stStreamEnd))
 }
