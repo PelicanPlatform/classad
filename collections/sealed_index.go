@@ -402,12 +402,17 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 		seg.msidx.Store(mm)
 		seg.idx.Store(nil) // the heap copy stays dropped; msidx serves queries
 	}
-	if cs != nil && !seg.columnarized() {
+	if !seg.columnarized() {
 		// Never over a COLUMNARIZED segment's own block. Its payload lives in the segment and is
 		// where its schema'd attributes are STORED, so a sidecar section -- which by construction it
 		// should not have, since colBlobForSeg declines to write one -- must not be able to replace
 		// it with an older view of the same records. The guard states the invariant rather than
 		// leaving it to hold by a chain of reasoning about which sidecars can exist.
+		//
+		// Otherwise the new section's block replaces the old one even when there is none (cs nil).
+		// A block read from the previous sidecar aliases the mapping being displaced here, which is
+		// unmapped once no scan pins the segment; left published, the next columnar read of this
+		// segment faulted. Without a block the segment row-scans until one is built again.
 		seg.colblk.Store(cs)
 	}
 	seg.swapSidecarHook(func() { _ = closer() }, true)
