@@ -187,3 +187,21 @@ func eqI64s(a, b []int64) bool {
 	}
 	return true
 }
+
+// TestArchiveTopKUnfilteredUsesCutoff: an ORDER BY ... LIMIT k with no filter takes the columnar cutoff
+// like a filtered one. A constraint with no comparison in it is not a conjunction of numeric comparisons,
+// so the cutoff scan declined it -- except where the CurrentTime fold happened to rescue a bare `true`,
+// which needs every segment proven free of CurrentTime, and a history table with any time()-based
+// policy expression is not -- and every record was projected to find the top k.
+func TestArchiveTopKUnfilteredUsesCutoff(t *testing.T) {
+	at, _ := buildTopKArchive(t, 4000, true)
+	for _, constraint := range []string{"true", "", "1 == 1"} {
+		_, st, err := at.TopKStats(constraint, []string{"ClusterId"}, "ClusterId", true, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.RecordsVisited == 0 {
+			t.Errorf("TopK(%q): the cutoff scan did not run", constraint)
+		}
+	}
+}

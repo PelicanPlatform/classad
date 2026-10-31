@@ -97,7 +97,14 @@ func topKAugment(constraint, orderAttr string, desc bool, k int, threshold func(
 	if k <= 0 || k > topKMaxColumnar {
 		return q, nil
 	}
-	cut, seen, ok := threshold(q)
+	// A constraint that filters nothing is asked as no constraint at all. The cutoff scan serves a
+	// conjunction of numeric comparisons, and a bare `true` is not one -- it has no comparison to be
+	// exact about -- so an unfiltered ORDER BY ... LIMIT k fell to projecting every record.
+	tq := q
+	if IsMatchAll(base) {
+		tq = nil
+	}
+	cut, seen, ok := threshold(tq)
 	if !ok || seen <= k {
 		return q, nil // columnar cutoff unavailable, or <=k rows: nothing to narrow
 	}
