@@ -160,3 +160,90 @@ func TestBuiltSidecarBlockTranslatesNonSchemaAttributes(t *testing.T) {
 		t.Fatal("no block built over an interned segment")
 	}
 }
+
+// TestSidecarGroupBlockOnInternedSegmentReadsItsColdTail is the group-block half: a group column's own
+// cold tail is keyed by the segment dictionary too, and a value that escapes it (a string where the
+// group's slot holds an integer) read as absent through a sidecar block, before a reopen and after one.
+func TestSidecarGroupBlockOnInternedSegmentReadsItsColdTail(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	open := func() *Collection {
+		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: 4, GroupStabilityRuns: 1, ColumnarSegmentBudget: -1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	adText := func(i int) string {
+		if i%3 != 0 {
+			return fmt.Sprintf(`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d ]`, i, i%10, i%7, i%6)
+		}
+		exit := "1"
+		if i%150 == 0 {
+			exit = `"aborted"` // escapes the group's int slot into the group block's cold tail
+		}
+		return fmt.Sprintf(`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; AaStart=%d; AaEnd=%d; AaHost="h%d"; AaExit=%s ]`,
+			i, i%10, i%7, i%6, i, i+10, i%50, exit)
+	}
+	const n = 3000
+	c := open()
+	for i := range n {
+		ad, err := classad.Parse(adText(i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.RetrainDict(0); err != nil {
+		t.Fatal(err)
+	}
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Fatal("schema scan did not enable")
+	}
+	if st := c.schemaScan.Load(); st == nil || len(st.groups) == 0 {
+		t.Fatal("no group schema was derived; the case goes untested")
+	}
+	check := func(stage string) {
+		t.Helper()
+		grouped := 0
+		for _, seg := range c.shards[0].segs {
+			if seg == nil || seg.dict.Load() == nil || seg.columnarized() {
+				continue
+			}
+			if cs := seg.colblk.Load(); cs != nil && len(cs.groups) > 0 {
+				grouped++
+			}
+		}
+		if grouped == 0 {
+			t.Fatalf("%s: no sidecar block with groups over an interned segment", stage)
+		}
+		for _, e := range []string{`AaExit == "aborted"`, `AaExit == 1`, `AaExit is undefined`} {
+			q, err := vm.Parse(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 0
+			for i := range n {
+				ad, _ := classad.Parse(adText(i))
+				if q.Matches(ad) {
+					want++
+				}
+			}
+			if got, ok := c.CountQuery(q); ok && got != want {
+				t.Errorf("%s: CountQuery(%s) = %d, want %d", stage, e, got, want)
+			}
+			if got, ok := c.ColumnarEvalCount(q); ok && got != want {
+				t.Errorf("%s: ColumnarEvalCount(%s) = %d, want %d", stage, e, got, want)
+			}
+		}
+	}
+	check("before the reopen")
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c = open()
+	defer c.Close()
+	check("after the reopen")
+}
