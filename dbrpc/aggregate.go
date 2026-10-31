@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -179,7 +181,7 @@ func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint s
 
 // streamAggregate performs a server-side GROUP BY (raw group columns) and streams
 // one frame per group.
-func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
 	table := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -195,23 +197,23 @@ func (s *Server) streamAggregate(ctx context.Context, reqID uint64, r *reader, i
 	if !ok {
 		return
 	}
-	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write)
+	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write, qlog)
 }
 
 // streamAggregateBucketed is streamAggregate where each group column may carry a
 // bucket width (opAggregateBucketed).
-func (s *Server) streamAggregateBucketed(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
-	s.streamAggregateWidths(ctx, reqID, r, includePrivate, false, write)
+func (s *Server) streamAggregateBucketed(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, false, write, qlog)
 }
 
 // streamAggregateFiltered is streamAggregateBucketed whose specs carry a per-aggregate
 // filter (opAggregateFiltered). The request shape is otherwise identical, so a filtered
 // plain aggregate rides the bucketed frame with every width zero.
-func (s *Server) streamAggregateFiltered(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
-	s.streamAggregateWidths(ctx, reqID, r, includePrivate, true, write)
+func (s *Server) streamAggregateFiltered(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	s.streamAggregateWidths(ctx, reqID, r, includePrivate, true, write, qlog)
 }
 
-func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *reader, includePrivate, filtered bool, write func([]byte)) {
+func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *reader, includePrivate, filtered bool, write func([]byte), qlog func(QueryLog)) {
 	table := r.str()
 	constraint := r.str()
 	nGroup := int(r.i32())
@@ -228,7 +230,7 @@ func (s *Server) streamAggregateWidths(ctx context.Context, reqID uint64, r *rea
 	if !ok {
 		return
 	}
-	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write)
+	s.aggregate(ctx, reqID, table, constraint, groups, aggs, includePrivate, write, qlog)
 }
 
 // readAggSpecs reads the [nAgg]{[func u8][arg]} tail shared by the aggregate opcodes,
@@ -299,7 +301,30 @@ var ErrFilteredAggregateUnsupported = ErrExtendedAggregateUnsupported
 // private attributes for an unprivileged connection, projects only the attributes
 // the aggregation reads (so the scan stays wire-native), reduces via the db module's
 // shared aggregate engine, and streams one frame per group.
-func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint string, groupCols []GroupCol, aggs []AggSpec, includePrivate bool, write func([]byte)) {
+func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint string, groupCols []GroupCol, aggs []AggSpec, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	// The observed query is recorded when the handler returns, however it returns: a
+	// refused private attribute and a cancelled scan cost the server time too, and a
+	// shape that always fails is one an operator wants to see rather than one the report
+	// should hide. op and the row count are filled in as they become known.
+	start := time.Now()
+	obs := QueryLog{Op: "Aggregate", Table: table, Constraint: constraint, Groups: groupCols, Aggs: aggs}
+	// Scan stats are collected whenever the server is aggregating queries, as on the
+	// projection path: the aggregate ladder's cheap rungs answer without reading a record
+	// and leave the counts zero, so a large RecordsReassembled here is precisely the
+	// signature of the aggregate that fell through to the scan.
+	var stats *collections.ScanStats
+	if s.queryStatsOn() {
+		stats = &collections.ScanStats{}
+	}
+	if qlog != nil {
+		defer func() {
+			if stats != nil {
+				obs.Scan = *stats
+			}
+			obs.Duration = time.Since(start)
+			qlog(obs)
+		}()
+	}
 	if !includePrivate {
 		// The WHERE clause reads attributes too, and whether a row matches is itself the answer.
 		if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
@@ -348,13 +373,18 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	switch ref.kind {
 	case kindTable, kindView:
 	case kindArchive:
+		// Named for the engine that answered rather than for the opcode the client sent:
+		// a name resolving to an archive is reduced by the archive ladder, and its cost
+		// has nothing in common with the mutable one below.
+		obs.Op = "ArchiveAggregate"
 		// The archive ladder takes no stop callback, so this reduction runs to completion
 		// even once the client has gone -- unlike the mutable one below.
-		rows, aerr := ref.arch.AggregateCols(constraint, groupCols, aggs)
+		rows, aerr := ref.arch.AggregateColsStats(constraint, groupCols, aggs, stats)
 		if aerr != nil {
 			write(respErr(reqID, aerr.Error()))
 			return
 		}
+		obs.Rows = len(rows)
 		// writeAggRows terminates the stream itself.
 		writeAggRows(reqID, rows, write)
 		return
@@ -369,11 +399,12 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	// stay one implementation and an embedded caller of db gets the same planning this handler
 	// does. What stays here is the RPC layer's own job: table resolution, the private-attribute
 	// gates above, and framing. The stop callback abandons a scan whose client has gone away.
-	rows, err := d.AggregateColsStats(constraint, groupCols, aggs, nil, func() bool { return cancelled(ctx) })
+	rows, err := d.AggregateColsStats(constraint, groupCols, aggs, stats, func() bool { return cancelled(ctx) })
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
 	}
+	obs.Rows = len(rows)
 	if cancelled(ctx) {
 		return // client gone mid-scan: nothing left to stream
 	}

@@ -2,10 +2,12 @@ package dbrpc
 
 import (
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/db"
 	"github.com/PelicanPlatform/classad/parser"
 )
 
@@ -235,4 +237,88 @@ func scopePrefix(s ast.AttributeScope) string {
 	default:
 		return ""
 	}
+}
+
+// groupShape renders an aggregate's GROUP BY columns as a fingerprint: each attribute
+// lowercased (ClassAd names are case-insensitive) and, when the column is bucketed, its
+// bucket width after a slash -- `owner, qdate/3600`. Empty for an aggregate with no
+// grouping, which is one row over the whole match.
+//
+// Column ORDER is preserved where queryShape sorts a boolean spine, because order is not
+// incidental here: the group tuple is the result's row shape, and the columnar grouped
+// path packs its key in this order.
+//
+// The bucket width is kept rather than replaced by "?" even though it is a literal. It is
+// a plan parameter, not a value being tested: hourly and daily buckets over the same
+// window differ by 24x in group cardinality and routinely by a tier in how they are
+// answered, and a report that merged them would rank the pair by their sum while naming
+// neither.
+func groupShape(groups []GroupCol) string {
+	if len(groups) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(groups))
+	for _, g := range groups {
+		p := strings.ToLower(g.Attr)
+		if g.BucketWidth > 0 {
+			p += "/" + strconv.FormatInt(g.BucketWidth, 10)
+		}
+		parts = append(parts, p)
+	}
+	return clampShape(strings.Join(parts, ", "))
+}
+
+// aggShape renders the aggregate functions computed over each group -- `count(*),
+// sum(remotewallclocktime)` -- with any per-aggregate FILTER fingerprinted by queryShape,
+// so two filters differing only in their literals agree.
+//
+// The functions are part of the shape because they decide the work, not just the output:
+// an unconstrained COUNT(*) is answered from a stored tally without reading a record,
+// while SUM over the same grouping reads that attribute from every matched row.
+func aggShape(aggs []AggSpec) string {
+	if len(aggs) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(aggs))
+	for _, a := range aggs {
+		arg := a.Arg
+		if arg != "*" {
+			arg = strings.ToLower(arg)
+		}
+		p := aggFuncName(a.Func) + "(" + arg + ")"
+		if a.Filter != "" {
+			p += " filter " + queryShape(a.Filter)
+		}
+		parts = append(parts, p)
+	}
+	return clampShape(strings.Join(parts, ", "))
+}
+
+// aggFuncName names an aggregate function for a fingerprint. An unknown selector renders
+// by number rather than as one of the known names: a function added to the wire after this
+// was written must not be reported as a different one.
+func aggFuncName(f AggFunc) string {
+	switch f {
+	case db.AggCount:
+		return "count"
+	case db.AggCountDistinct:
+		return "count distinct"
+	case db.AggSum:
+		return "sum"
+	case db.AggAvg:
+		return "avg"
+	case db.AggMin:
+		return "min"
+	case db.AggMax:
+		return "max"
+	}
+	return "agg" + strconv.Itoa(int(f))
+}
+
+// clampShape bounds one rendered fingerprint, as queryShape bounds a constraint's.
+func clampShape(s string) string {
+	if len(s) > shapeMaxLen {
+		return s[:shapeMaxLen] + shapeTruncated
+	}
+	return s
 }
