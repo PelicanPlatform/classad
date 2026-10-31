@@ -169,8 +169,8 @@ type Options struct {
 	// RemnantDictionary decides whether columnarizing a segment also stores, per row group, the
 	// non-literal values its records repeat -- expressions, nested records and lists such as a
 	// cluster's shared Requirements -- once, with each record holding a short reference in their place
-	// (see colremdict.go). Measured on a production AP's history, that removed 12-22% of columnarized
-	// segment bytes. A positive value turns it on, a negative one off, and 0 takes the default, which
+	// (see colremdict.go). Measured on a production AP's history, that removed 13-30% of columnarized
+	// segment bytes (8-16% on epoch history). A positive value turns it on, a negative one off, and 0 takes the default, which
 	// is OFF in this release.
 	//
 	// Off by default because of what an older build does with such a segment: it refuses to open the

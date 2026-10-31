@@ -16,8 +16,9 @@ import (
 // time, so a node that every record of a block carries -- a Requirements shared by a cluster's procs, a
 // MemoryUsage nearly every job carries -- is paid for in full in every record. Measured on the tail of a
 // production AP's history (12.4k ads, ~180 attributes each), those repeated nodes were 469 of the 494
-// expression bytes in an average record, and removing the repeats cut 12-22% of the columnarized
-// segment's bytes (7-12% on epoch history); Requirements alone was 85% of the repeated bytes.
+// expression bytes in an average record. The dictionary below cut the columnarized segments' bytes by
+// 13-30% (8-16% on epoch history; the low end is a store whose records were compressed under a trained
+// dictionary); Requirements alone was 85% of the repeated expression bytes.
 //
 // So each base block may carry a REMNANT DICTIONARY: the distinct nodes that repeat across the block's
 // remnants, stored once, compressed with the block's other regions. A record holding one of them holds a

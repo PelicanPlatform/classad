@@ -551,36 +551,53 @@ func TestRemnantDictBench(t *testing.T) {
 			samples := map[int][]sample{}
 			bytesOf := map[int]int{}
 			recsOf := map[int]int{}
+			// One base store per corpus and shape, written and (for retrain) retrained once, so both arms
+			// columnarize exactly the same segments: a retrain samples records at random, and two stores
+			// retrained separately seal and intern different segments.
+			base := t.TempDir()
+			{
+				codec, err := NewZSTDCodec(nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				a, err := CreateArchive(ArchiveOptions{Dir: base, SegmentSize: 4 << 20, Codec: codec})
+				if err != nil {
+					t.Fatal(err)
+				}
+				warm := len(cp.ads) / 5
+				for i, ad := range cp.ads {
+					if retrain && i == warm {
+						if _, err := a.RetrainDict(0); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := a.Append(ad); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if retrain {
+					if _, err := a.RetrainDict(0); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := a.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
 			for r := range rounds {
 				arms := []int{-1, 1}
 				if r%2 == 1 {
 					arms = []int{1, -1}
 				}
 				for _, arm := range arms {
+					dir := copyStore(t, base)
 					codec, err := NewZSTDCodec(nil)
 					if err != nil {
 						t.Fatal(err)
 					}
-					dir := t.TempDir()
-					a, err := CreateArchive(ArchiveOptions{Dir: dir, SegmentSize: 4 << 20, Codec: codec, RemnantDictionary: arm})
+					a, err := OpenArchive(ArchiveOptions{Dir: dir, SegmentSize: 4 << 20, Codec: codec, RemnantDictionary: arm})
 					if err != nil {
 						t.Fatal(err)
-					}
-					warm := len(cp.ads) / 5
-					for i, ad := range cp.ads {
-						if retrain && i == warm {
-							if _, err := a.RetrainDict(0); err != nil {
-								t.Fatal(err)
-							}
-						}
-						if err := a.Append(ad); err != nil {
-							t.Fatal(err)
-						}
-					}
-					if retrain {
-						if _, err := a.RetrainDict(0); err != nil {
-							t.Fatal(err)
-						}
 					}
 					a.c.colBudget = 1 << 20
 					var s sample

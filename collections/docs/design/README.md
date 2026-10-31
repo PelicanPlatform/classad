@@ -1078,8 +1078,9 @@ The payload holds, in order:
 Remnants are compressed one record at a time, so a non-literal value repeated across a
 row group is paid for in full in every record: a cluster's shared `Requirements`, a
 `MemoryUsage` nearly every job carries, a nested record or list many jobs share. On the
-tail of a production history file those repeats were 12–22% of a columnarized segment's
-bytes (7–12% on epoch history); `Requirements` alone was 85% of them.
+tail of a production history file, storing them once per row group cut a columnarized
+segment's bytes by 13–30% (8–16% on epoch history); `Requirements` alone was 85% of the
+repeated expression bytes.
 
 With `Options.RemnantDictionary` on, each base block stores the distinct non-literal
 top-level nodes that repeat among its records' remnants once, as a compressed region
