@@ -508,6 +508,12 @@ type movedRec struct {
 // the pin was ever taken, so it guards a leak and says nothing about the bug this fixes.
 var compactPhase2Hook func(sources []*segment)
 
+// compactTranscode is the wire-level re-intern compaction uses (wire.AppendInternedFromInline). It is a
+// variable so a test can stand in the transcode of an earlier build, which copied sealed values unopened
+// and so wrote interned records whose sealed plaintext is in the inline-names form; the read and
+// compaction paths still have to recover those.
+var compactTranscode = wire.AppendInternedFromInline
+
 func (c *Collection) compactShard(sh *shard, target Codec) {
 	// Phase 1 (lock): choose the working-set sources (segments with a current record),
 	// capture the retain floor, and seal the active segment so concurrent writes land
@@ -741,7 +747,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			*curp = newDst(streamSegs, 0, target)
 			*st = newStream()
 		}
-		out, ok := wire.AppendInternedFromInline(wireBuf[:0], wire.Ad(w), st.table, st.hot)
+		out, ok := compactTranscode(wireBuf[:0], wire.Ad(w), st.table, st.hot)
 		if !ok {
 			internViaAST.Add(1)
 			return nil, 0, false
@@ -756,7 +762,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			*curp = newDst(streamSegs, rl+reserve, target)
 			*st = newStream()
 			// A fresh stream means a fresh table, so the ids have to be reassigned against it.
-			out, ok = wire.AppendInternedFromInline(wireBuf[:0], wire.Ad(w), st.table, st.hot)
+			out, ok = compactTranscode(wireBuf[:0], wire.Ad(w), st.table, st.hot)
 			if !ok {
 				internViaAST.Add(1)
 				return nil, 0, false

@@ -99,8 +99,7 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 				continue // no key (or tampered): the value is absent to this consumer
 			}
 			dst = appendInlineKey(dst, sc.nameBuf)
-			pc := &cursor{b: plain, ok: true}
-			if !inlineNode(pc, &dst, resolve, 0) {
+			if !appendSealedPlainInline(&dst, plain, resolve) {
 				return dst, false
 			}
 			kept++
@@ -118,6 +117,26 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 	}
 	patchUvarint5(dst[countAt:countAt+5], kept)
 	return dst, true
+}
+
+// appendSealedPlainInline appends to *dst the inline-names form of plain, the opened plaintext of a
+// sealed value in an interned ad. It reads plain under the decoder's rule (readSealedPlain): in the
+// interned form, rewritten to inline as any other node is; or, when that is rejected, in the inline
+// form an earlier build left some sealed values in, which is already the form wanted and is copied as
+// it is.
+func appendSealedPlainInline(dst *[]byte, plain []byte, resolve func(uint32) (string, bool)) bool {
+	base := len(*dst)
+	pc := &cursor{b: plain, ok: true}
+	if inlineNode(pc, dst, resolve, 0) && pc.pos == len(plain) {
+		return true
+	}
+	*dst = (*dst)[:base]
+	d := decoder{resolve: resolve}
+	if _, _, inlineForm, err := d.readSealedPlain(plain, 0, sealedExpr, nil); err == nil && inlineForm {
+		*dst = append(*dst, plain...)
+		return true
+	}
+	return false
 }
 
 // appendInlineKey writes an attribute key in the inline-names encoding (uvarint len + bytes).
