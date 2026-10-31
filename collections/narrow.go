@@ -95,13 +95,13 @@ func (nw *wireNarrower) localWanted(sel *wireSubsetSelector, dict *segDictHandle
 	}
 	m := make(map[uint32]struct{}, len(sel.names)+len(rawTypeFieldNames))
 	for _, n := range sel.names {
-		if id, ok := dict.lookup(n); ok {
-			m[id] = struct{}{}
+		if id, ok := dict.segIDOf(n); ok {
+			m[uint32(id)] = struct{}{} //idspace:translate a dictionary-keyed record is keyed by the segID
 		}
 	}
 	for _, n := range rawTypeFieldNames {
-		if id, ok := dict.lookup(n); ok {
-			m[id] = struct{}{}
+		if id, ok := dict.segIDOf(n); ok {
+			m[uint32(id)] = struct{}{} //idspace:translate a dictionary-keyed record is keyed by the segID
 		}
 	}
 	nw.dict, nw.localIDs = dict, m

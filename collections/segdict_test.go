@@ -33,12 +33,12 @@ func TestSegDictRoundTrip(t *testing.T) {
 			t.Errorf("segDictName(%d)=%q want %q", id, got, want)
 		}
 		// name -> id, canonical casing
-		if got, ok := segDictLookup(data, base, want); !ok || got != uint32(id) {
+		if got, ok := segDictLookup(data, base, want); !ok || got != segID(id) {
 			t.Errorf("lookup(%q)=%d,%v want %d,true", want, got, ok, id)
 		}
 		// name -> id, case-insensitive
 		for _, cased := range []string{strings.ToUpper(want), strings.ToLower(want)} {
-			if got, ok := segDictLookup(data, base, cased); !ok || got != uint32(id) {
+			if got, ok := segDictLookup(data, base, cased); !ok || got != segID(id) {
 				t.Errorf("lookup(%q)=%d,%v want %d,true (case-insensitive)", cased, got, ok, id)
 			}
 		}
@@ -87,10 +87,10 @@ func TestSegDictLarge(t *testing.T) {
 
 	for id, want := range names {
 		got, ok := segDictLookup(data, base, want)
-		if !ok || got != uint32(id) {
+		if !ok || got != segID(id) {
 			t.Fatalf("member lookup(%q)=%d,%v want %d", want, got, ok, id)
 		}
-		if got != uint32(id) || string(segDictName(data, base, got)) != want {
+		if got != segID(id) || string(segDictName(data, base, uint32(got))) != want {
 			t.Fatalf("id<->name mismatch at id %d", id)
 		}
 	}

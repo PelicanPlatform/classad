@@ -144,8 +144,8 @@ func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, in
 			var ok bool
 			switch {
 			case dict != nil: // interned segment: resolve the zone attr's segment-local id
-				if id, has := dict.lookup(za.name); has {
-					node, ok = ad.Lookup(id)
+				if id, has := dict.segIDOf(za.name); has {
+					node, ok = ad.Lookup(uint32(id)) //idspace:translate a dictionary-keyed record is keyed by the segID
 				}
 			case inline:
 				node, ok = ad.LookupByName(za.name)

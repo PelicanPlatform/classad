@@ -51,11 +51,11 @@ type wireScope struct {
 // else they fall to the mode-aware ctx (inline/global) -- byte-for-byte the prior behavior.
 func wireLookupDictCtx(ctx wireCtx, dict *segDictHandle, a wire.Ad, name string) ([]byte, bool) {
 	if dict != nil {
-		id, ok := dict.lookup(name)
+		id, ok := dict.segIDOf(name)
 		if !ok {
 			return nil, false
 		}
-		return a.Lookup(id)
+		return a.Lookup(uint32(id)) //idspace:translate a dictionary-keyed record is keyed by the segID
 	}
 	return ctx.wireLookup(a, name)
 }

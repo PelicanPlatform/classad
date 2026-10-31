@@ -79,7 +79,7 @@ Environment=""`,
 	// Every attribute name the records use must resolve name<->id both ways via the dict.
 	for id := uint32(0); id < segDictCount(dict, 0); id++ {
 		name := string(segDictName(dict, 0, id))
-		if gotID, ok := segDictLookup(dict, 0, name); !ok || gotID != id {
+		if gotID, ok := segDictLookup(dict, 0, name); !ok || gotID != segID(id) {
 			t.Errorf("dict name<->id inconsistency: id=%d name=%q -> %d,%v", id, name, gotID, ok)
 		}
 	}
