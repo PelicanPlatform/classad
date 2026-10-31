@@ -127,10 +127,32 @@ var exprSources = []string{
 	`Missing ?: 99`, `Cpus ?: 99`, `Missing ?: Missing ?: 7`, `error ?: 1`,
 	// ternary (delegated)
 	`Cpus > 2 ? "big" : "small"`, `Missing ? 1 : 2`, `Flag ? Cpus : Memory`,
-	// functions / list / record / select / subscript (delegated)
-	`strcat(Owner, "!")`, `size({1,2,3})`, `toUpper(Owner)`,
+	// list / record / select / subscript (delegated)
 	`{1, 2, Cpus}`, `[Q = Cpus + 1]`, `Nested.K`, `L[1]`,
-	`strcat(Owner, "/", State) =?= "bob/Idle"`,
+	// strict built-in calls, compiled natively to OpCallFunc
+	`toUpper(Owner)`, `toLower(Owner)`, `int(Cpus)`, `real(Cpus)`, `floor(R)`,
+	`ceiling(R)`, `round(R)`, `pow(Cpus, 2)`, `quantize(Memory, 100)`,
+	`strcmp(Owner, "alice")`, `stricmp(Owner, "ALICE")`, `string(Cpus)`, `bool(Flag)`,
+	`isUndefined(Missing)`, `isUndefined(Cpus)`, `isError(Cpus)`, `isString(Owner)`,
+	`isInteger(Cpus)`, `isReal(R)`, `isBoolean(Flag)`, `isList(L)`, `isClassAd(Nested)`,
+	`size(Owner)`, `substr(Owner, 1)`, `substr(Owner, 1, 2)`, `interval(Memory)`,
+	`regexp("^a", Owner)`, `versioncmp("1.2", "1.10")`,
+	// calls on absent, undefined and error arguments: the states a built-in must survive
+	`toUpper(Missing)`, `int(Missing)`, `floor(error)`, `pow(Missing, 2)`, `strcmp(Missing, "a")`,
+	// nested calls, and calls inside the native operators
+	`toUpper(toLower(Owner))`, `int(floor(R)) + 1`, `substr(Owner, 0, 2) == "al"`,
+	`isUndefined(Missing) || Cpus > 2`, `isUndefined(Cpus) && Flag`, `-int(Cpus)`,
+	`pow(2, 10)`, `quantize(7, 4)`, `floor(3.7)`, // every argument constant
+	// built-ins that must stay DELEGATED, each for a different reason (see StrictFunction)
+	`strcat(Owner, "!")`,                       // lazy: stops at the first undefined/error arg
+	`strcat(Owner, "/", State) =?= "bob/Idle"`, // same, in a comparison
+	`ifThenElse(Cpus > 2, "big", "small")`,     // lazy: only the selected branch
+	`ifThenElse(Missing, 1, 2)`,                //
+	`eval("Cpus + 1")`,                         // parses and resolves in the current scope
+	`unparse(Cpus)`,                            // needs the argument's raw AST
+	`size({1,2,3})`,                            // strict call, but a delegated argument
+	`pow(Cpus)`,                                // wrong arity: error without evaluating args
+	`noSuchFunction(Cpus)`,                     // unknown name: likewise
 	// mixed / nested parentheses
 	`(Cpus + 1) * (Memory - 2)`, `((Owner))`, `(Cpus > 2) && (R < 3.0 || Flag)`,
 }
@@ -288,4 +310,88 @@ func FuzzDifferential(f *testing.F) {
 				exprSrc, scopeSrc, describe(want), describe(got))
 		}
 	})
+}
+
+// TestFunctionCallsAreNative is the claim OpCallFunc exists to make. Native() is
+// what the columnar accelerators gate on -- the index probes (colagg), the column
+// prefilter (colprefilter), the presence and multi-field scans, and the vector
+// executor -- so a delegated call does not merely evaluate a bit slower, it takes
+// the whole query off those paths and onto the per-record one.
+//
+// The delegated half of the table is as important as the native half: each entry
+// is a built-in that MUST stay delegated, and the comment says what breaks if it
+// stops being. See classad.StrictFunction.
+func TestFunctionCallsAreNative(t *testing.T) {
+	native := []string{
+		`toUpper(Owner)`, `toLower(Owner)`, `int(Cpus)`, `real(Cpus)`,
+		`floor(R)`, `ceiling(R)`, `round(R)`, `pow(Cpus, 2)`,
+		`quantize(Memory, 100)`, `strcmp(Owner, "alice")`, `size(Owner)`,
+		`substr(Owner, 1)`, `substr(Owner, 1, 2)`, // optional argument, both arities
+		`isUndefined(Missing)`, `isString(Owner)`, `string(Cpus)`, `bool(Flag)`,
+		`regexp("^a", Owner)`, `versioncmp("1.2", "1.10")`, `interval(Memory)`,
+		`split("a b")`, // returns a list: native here, declined by the VECTOR executor
+		// composition: a native call nests inside, and under, the native operators
+		`toUpper(toLower(Owner))`, `int(floor(R)) + 1`, `substr(Owner, 0, 2) == "al"`,
+		`isUndefined(Missing) || Cpus > 2`, `-int(Cpus)`,
+		`Cpus > 2 && toUpper(Owner) == "ALICE"`,
+	}
+	for _, expr := range native {
+		q, err := Parse(expr)
+		if err != nil {
+			t.Fatalf("parse %q: %v", expr, err)
+		}
+		if !q.Native() {
+			t.Errorf("%q: want Native (a strict built-in must not delegate)", expr)
+		}
+	}
+
+	delegated := map[string]string{
+		`strcat(Owner, "!")`:            "lazy: stops at the first undefined/error argument",
+		`ifThenElse(Cpus > 2, 1, 2)`:    "lazy: evaluates only the selected branch",
+		`eval("Cpus + 1")`:              "parses a runtime string and resolves it in the scope",
+		`unparse(Cpus)`:                 "needs the argument's raw AST, not its value",
+		`countMatches(Cpus > 1, L)`:     "evaluates its first argument once per ad in the second",
+		`evalInEachContext(Cpus, L)`:    "likewise",
+		`random(Cpus)`:                  "nondeterministic: draws from the global PRNG",
+		`time()`:                        "nondeterministic: reads the wall clock",
+		`formatTime()`:                  "nondeterministic with no argument: reads the wall clock",
+		`pow(Cpus)`:                     "wrong arity: ERROR without evaluating the arguments",
+		`pow(1, 2, 3)`:                  "likewise",
+		`noSuchFunction(Cpus)`:          "unknown name: ERROR without evaluating the arguments",
+		`size({1, 2, 3})`:               "strict call, but its argument is a delegated list literal",
+		`toUpper(Cpus > 2 ? "a" : "b")`: "strict call, but its argument is a delegated conditional",
+	}
+	for expr, why := range delegated {
+		q, err := Parse(expr)
+		if err != nil {
+			t.Fatalf("parse %q: %v", expr, err)
+		}
+		if q.Native() {
+			t.Errorf("%q: want DELEGATED (%s)", expr, why)
+		}
+	}
+}
+
+// TestArityAndUnknownFunctionsDoNotEvaluateArgs pins the reason a wrong-arity or
+// unknown call must stay delegated rather than compile to a call that returns
+// ERROR: the reference engine checks arity BEFORE evaluating any argument, so a
+// cyclic argument is never reached. Compiling the call would evaluate it.
+func TestArityAndUnknownFunctionsDoNotEvaluateArgs(t *testing.T) {
+	// A0 references itself through the call, so evaluating the argument is a
+	// cyclic reference; not evaluating it leaves the =!= comparison well defined.
+	ad, err := classad.Parse(`[ A0 = 0 =!= noSuchFunction((A0)); A1 = 0 =!= pow((A1)) ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, attr := range []string{"A0", "A1"} {
+		expr, err := parser.ParseExpr(attr)
+		if err != nil {
+			t.Fatalf("parse %s: %v", attr, err)
+		}
+		got := Run(CompileProgram(expr), ad)
+		b, berr := got.BoolValue()
+		if berr != nil || !b {
+			t.Errorf("%s = %s, want true (the cyclic argument must never be evaluated)", attr, describe(got))
+		}
+	}
 }

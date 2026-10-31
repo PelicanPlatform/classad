@@ -1,16 +1,23 @@
 package vm
 
 import (
+	"strings"
+
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 )
 
 // CompileProgram lowers a ClassAd expression to a Program. Node types with
 // subtle scope/short-circuit/laziness semantics (conditional, list, record,
-// function call, select, subscript) are emitted as OpEvalNode and delegated to
-// the tree-walking evaluator at run time; the rest are native instructions.
-// The one function call compiled natively is member/identicalMember over a
-// list of constants (OpMember).
+// select, subscript) are emitted as OpEvalNode and delegated to the tree-walking
+// evaluator at run time; the rest are native instructions.
+//
+// A function call is native when classad.StrictFunction accepts it -- the
+// built-in is a pure function of its argument values -- and delegated otherwise.
+// That split is what keeps a program containing substr() or regexp() Native(),
+// and so keeps it eligible for the columnar accelerators. member/identicalMember
+// over a list of constants is compiled to its own specialized OpMember, which is
+// preferred over the generic call when it applies.
 func CompileProgram(expr ast.Expr) *Program {
 	c := &compiler{p: &Program{}, seen: map[string]bool{}}
 	if astHeight(expr) >= maxNativeDepth {
@@ -116,6 +123,11 @@ func (c *compiler) addRef(name string, scope ast.AttributeScope) int32 {
 	return int32(len(c.p.refs) - 1)
 }
 
+func (c *compiler) addFunc(name string, argc int) int32 {
+	c.p.funcs = append(c.p.funcs, funcInfo{name: strings.ToLower(name), argc: argc})
+	return int32(len(c.p.funcs) - 1)
+}
+
 func (c *compiler) addNode(n ast.Expr) int32 {
 	c.p.nodes = append(c.p.nodes, n)
 	return int32(len(c.p.nodes) - 1)
@@ -165,14 +177,34 @@ func (c *compiler) emit(expr ast.Expr) {
 		c.emit(v.Right)
 		c.patch(j, len(c.p.code))
 	case *ast.FunctionCall:
-		// member/identicalMember over a constant list is native; every other call
-		// is delegated.
-		if !c.emitMember(v) {
-			c.ins(OpEvalNode, c.addNode(expr))
+		// Three outcomes, in order of preference. member/identicalMember over a
+		// constant list has a real vector kernel, so it gets its specialized
+		// OpMember rather than the generic call -- memberVec tests a per-block
+		// bitset over dictionary codes, where a generic call would box every
+		// element and scan the list per record.
+		if c.emitMember(v) {
+			return
 		}
+		// Otherwise a STRICT built-in becomes a native call: its arguments are
+		// ordinary compiled expressions and the call itself is a pure value
+		// operation. Everything else falls through to delegation -- a lazy
+		// built-in, one that needs the scope or the raw AST, a nondeterministic
+		// one, an unknown name and a wrong argument count, all of which
+		// StrictFunction refuses and each of which would be observably wrong as
+		// an eager call (see its comment).
+		if !classad.StrictFunction(v.Name, len(v.Args)) {
+			c.ins(OpEvalNode, c.addNode(expr))
+			return
+		}
+		for _, a := range v.Args {
+			c.emit(a)
+		}
+		c.ins(OpCallFunc, c.addFunc(v.Name, len(v.Args)))
 	default:
 		// ConditionalExpr, ListLiteral, RecordLiteral, SelectExpr, SubscriptExpr,
-		// or any future node: delegate to the evaluator.
+		// or any future node: delegate to the evaluator. (A FunctionCall reaches
+		// the evaluator too, but only the ones StrictFunction refuses; the case
+		// above compiles the rest.)
 		c.ins(OpEvalNode, c.addNode(expr))
 	}
 }

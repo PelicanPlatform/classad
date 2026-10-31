@@ -167,6 +167,25 @@ var vecExprs = []string{
 	`S && true`, // a string as a logical operand
 	// string-VALUED results, so the payload itself is compared and not just the type
 	`S`, `S + 1`, `-S`,
+	// strict built-in calls, applied elementwise (see callFuncVec)
+	"int(A)", "real(A)", "floor(A)", "ceiling(A)", "round(A)",
+	"pow(B, 2)", "quantize(A, 4)", "interval(A)", "string(A)", "bool(F)",
+	"isUndefined(A)", "isError(A)", "isInteger(A)", "isReal(A)", "isBoolean(F)",
+	`isString(S)`, `toUpper(S)`, `toLower(S)`, `size(S)`,
+	`strcmp(S, "user3")`, `stricmp(S, "USER3")`, `substr(S, 0, 4)`,
+	`regexp("^user", S)`,
+	// calls combined with the native operators, and nested in each other
+	"int(A) > 4", "int(floor(A)) + 1", "-int(A)", "isUndefined(A) || A > 4",
+	"isUndefined(A) && F", `toUpper(S) == "USER3"`, `substr(S, 0, 4) == "user"`,
+	`toUpper(toLower(S))`,
+	// MASK-form arguments: a comparison or logical result carries its value in the bitplanes, not in
+	// the data arrays, so a call on one is only correct if it converts first (callFuncVec's toData).
+	// Without these the conversion can be deleted and every other expression here still passes.
+	"isBoolean(A > 4)", "isUndefined(A > 4)", "isInteger(A > 4)", "int(A > 4)",
+	"string(A > 4)", "bool(A > 4)", "isBoolean(A > 4 && B < 4)", "isBoolean(!F)",
+	"int(A > 4) + 1", "string(A > 4) == \"true\"",
+	// every argument constant: computed once, not per record
+	"pow(2, 10)", "floor(3.7)", "quantize(7, 4)",
 }
 
 // TestVecMatchesScalarPerRecord is the executor's core test: same Program, per-record equality.
@@ -209,9 +228,14 @@ func TestVecDeclinesUnsupported(t *testing.T) {
 		{"A": "1", "S": `"x"`},
 	})
 	for _, expr := range []string{
-		`A ?: 5`,          // Elvis: a per-record select, no combine opcode
-		`size({1,2,3})`,   // delegated subtree (OpEvalNode)
-		`strcat("a","b")`, // function returning a string
+		`A ?: 5`,                  // Elvis: a per-record select, no combine opcode
+		`size({1,2,3})`,           // a strict call whose ARGUMENT is a delegated subtree
+		`strcat("a","b")`,         // a lazy built-in: delegated, so OpEvalNode
+		`ifThenElse(A > 1, 2, 3)`, // likewise lazy
+		`eval("A + 1")`,           // resolves in the scope, which a column source is not
+		`split(S)`,                // strict, but returns a LIST, which a vector cannot hold
+		`splitUserName(S)`,        // likewise
+		`random(A)`,               // nondeterministic: never compiled natively
 	} {
 		q, err := Parse(expr)
 		if err != nil {

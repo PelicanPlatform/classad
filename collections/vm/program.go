@@ -5,6 +5,18 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 )
 
+// funcInfo is a pooled built-in call targeted by OpCallFunc: the folded function
+// name and the number of argument values the instruction pops.
+//
+// argc is recorded rather than re-derived from the name because several built-ins
+// are variadic or have optional arguments (join, split, substr, regexp), so the
+// arity accepted at compile time is the only thing that says how deep this call's
+// operands sit on the stack.
+type funcInfo struct {
+	name string // already lower-cased, as classad matches built-in names
+	argc int
+}
+
 // refInfo is a pooled attribute reference (name + scope) targeted by OpLoadRef.
 type refInfo struct {
 	name string
@@ -27,6 +39,8 @@ type Program struct {
 	ops    []string        // OpBinop / OpUnop operator strings
 	refs   []refInfo       // OpLoadRef
 	nodes  []ast.Expr      // OpEvalNode (delegated subtrees)
+	funcs  []funcInfo      // OpCallFunc
+
 	// members are the constant lists of member/identicalMember calls (OpMember).
 	members []*memberSet
 

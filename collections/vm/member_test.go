@@ -149,8 +149,11 @@ func usesOp(p *Program, op Opcode) bool {
 }
 
 // TestMemberNativeQuery checks the query-level consequence: a member over a constant list no longer
-// delegates, so the query is Native and every columnar and resolver-based path can take it. A list
-// that is not constant still delegates.
+// delegates, so the query is Native and every columnar and resolver-based path can take it.
+//
+// A member whose list argument is a LIST LITERAL that is not constant still delegates, because the
+// literal itself compiles to OpEvalNode. One whose list argument is an attribute REFERENCE no longer
+// does -- see the row below.
 func TestMemberNativeQuery(t *testing.T) {
 	for _, tc := range []struct {
 		src    string
@@ -159,10 +162,15 @@ func TestMemberNativeQuery(t *testing.T) {
 		{`member(ClusterId, {1, 2, 3}) && (JobStatus == 1 || JobStatus == 2)`, true},
 		{`identicalMember(Owner, {"alice", "bob"})`, true},
 		{`member(ClusterId, {1, -2, (3)})`, true},
-		{`member(ClusterId, {1, Other})`, false},
-		{`member(ClusterId, SomeList)`, false},
-		{`member(ClusterId)`, false},
-		{`member(ClusterId, {1}, 2)`, false},
+		{`member(ClusterId, {1, Other})`, false}, // a non-constant LIST LITERAL is OpEvalNode
+		{`member(ClusterId)`, false},             // wrong arity: ERROR without evaluating args
+		{`member(ClusterId, {1}, 2)`, false},     // likewise
+		// A list-valued attribute REFERENCE is native as of OpCallFunc: member is a strict built-in,
+		// so both arguments are OpLoadRef and the call is a value operation -- nothing is delegated.
+		// Native does not mean servable, and the columnar paths still refuse this one up front rather
+		// than part way through: SomeList is not a schema field, so newColPrefilter rejects it on the
+		// read plan and LoadColumn declines it. A decline, not a delegation.
+		{`member(ClusterId, SomeList)`, true},
 	} {
 		q, err := Parse(tc.src)
 		if err != nil {
@@ -499,5 +507,37 @@ func TestMemberProbeIsExactOnRecords(t *testing.T) {
 				t.Errorf("%s with X = %s: query is %s, probe says %v", src, v, describe(res), inSet)
 			}
 		}
+	}
+}
+
+// TestMemberPreferredOverGenericCall pins the compiler's preference order. member over a constant
+// list is ALSO a strict built-in, so it would compile to a generic OpCallFunc if emitMember were not
+// tried first -- and that would be a silent performance regression, not a test failure: memberVec
+// tests a per-block bitset over dictionary codes, where the generic path boxes every element and
+// rescans the list per record.
+func TestMemberPreferredOverGenericCall(t *testing.T) {
+	for _, src := range []string{
+		`member(ClusterId, {1, 2, 3})`,
+		`identicalMember(Owner, {"alice", "bob"})`,
+	} {
+		q, err := Parse(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := q.Program()
+		if !usesOp(p, OpMember) {
+			t.Errorf("%s: want the specialized OpMember", src)
+		}
+		if usesOp(p, OpCallFunc) {
+			t.Errorf("%s: compiled to the generic OpCallFunc; emitMember must be tried first", src)
+		}
+	}
+	// And the generic call is what a strict built-in with no specialization gets.
+	q, err := Parse(`toUpper(Owner)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !usesOp(q.Program(), OpCallFunc) {
+		t.Error(`toUpper(Owner): want OpCallFunc`)
 	}
 }

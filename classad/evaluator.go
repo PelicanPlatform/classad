@@ -2058,6 +2058,37 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 		args[i] = e.Evaluate(arg)
 	}
 
+	return applyBuiltin(e, funcName, args)
+}
+
+// applyBuiltin dispatches a STRICT built-in to its implementation: a function of
+// already-evaluated argument values, with no access to the raw AST and no
+// attribute lookup of its own. funcName must already be lower-cased.
+//
+// The evaluator parameter is NOT a scope for reading attributes. Ten
+// list-consuming built-ins (member, identicalMember, sum, avg, min, max, join,
+// quantize, anyCompare, allCompare) need one to MATERIALIZE a lazy list argument
+// -- a list value built from a literal holds its element expressions plus the ad
+// they were written in, and realizing its elements means evaluating them in that
+// captured scope (see Value.listValueIn). Nothing here resolves a free attribute
+// reference, which is what lets a compiled executor call a built-in at all.
+//
+// The consequence for a caller with no real scope is precise rather than vague:
+// hand these functions a list argument and the list decides its own scope, so the
+// evaluator passed here is irrelevant; hand them a non-list and they return ERROR
+// before touching it. collections/vm relies on the second half -- see callFuncVec.
+//
+// The non-strict built-ins -- the ones that are lazy or do need the calling scope
+// or the AST (eval, unparse, ifThenElse, strcat, countMatches, evalInEachContext)
+// -- are handled by evaluateFunctionCall before it gets here and never reach this
+// table. classad.StrictFunction is the predicate that keeps those two sets in
+// agreement; see its comment for the rule.
+//
+// Arity is NOT checked here: evaluateFunctionCall checks it before evaluating any
+// argument (an arity error must not evaluate a cyclic argument), and the compiler
+// checks it at compile time. An unknown name still returns ERROR, so a direct
+// caller cannot fall off the end of the table.
+func applyBuiltin(e *Evaluator, funcName string, args []Value) Value {
 	// Dispatch to the appropriate function (funcName is already lower-cased)
 	switch funcName {
 	// String functions

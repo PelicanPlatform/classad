@@ -93,6 +93,16 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value) (classad.Val
 				stack = stack[:len(stack)-1] // discard undefined; fall through to fallback
 				ip++
 			}
+		case OpCallFunc:
+			f := p.funcs[in.A]
+			base := len(stack) - f.argc
+			// The argument values are handed over as a slice of the stack itself, which
+			// is safe in both directions: no built-in retains or mutates its args (every
+			// list a built-in returns is freshly allocated), and the result is already a
+			// value by the time the stack is truncated under it.
+			res := classad.ApplyFunction(ev, f.name, stack[base:])
+			stack = append(stack[:base], res)
+			ip++
 		case OpEvalNode:
 			stack = append(stack, ev.Evaluate(p.nodes[in.A]))
 			ip++

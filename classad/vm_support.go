@@ -1,6 +1,10 @@
 package classad
 
-import "github.com/PelicanPlatform/classad/ast"
+import (
+	"strings"
+
+	"github.com/PelicanPlatform/classad/ast"
+)
 
 // This file exposes a small, thin surface over the evaluator so an external
 // bytecode interpreter (collections/vm) can reuse the exact value-operation
@@ -205,3 +209,93 @@ func RecoverCyclic(result *Value) {
 // to box each element and re-dispatch on the operator, but must still produce exactly what the
 // tree-walking evaluator produces. Sharing the function is what makes that a fact rather than a hope.
 func CompareStringsFold(a, b string) int { return compareStringsFold(a, b) }
+
+// nonStrictFunctions are the built-ins that CANNOT be compiled to a call on
+// pre-evaluated argument values, each for one of three reasons.
+//
+// LAZY -- the function decides whether to evaluate an argument at all, so eager
+// evaluation would change the result:
+//
+//	ifThenElse  evaluates only the selected branch, so ifThenElse(1, 0, B) is 0
+//	            even when B is self-referential (evaluateIfThenElse).
+//	strcat      stops at the first undefined/error argument, so strcat(undefined,
+//	            A2) with a cyclic A2 is undefined, not error (evaluateStrcat).
+//
+// SCOPE OR AST -- the function needs something an argument VALUE cannot carry:
+//
+//	eval               parses a runtime string and evaluates it in the current
+//	                   scope; its read set is not statically visible at all,
+//	                   which is also why ReadPlan.PartialSafe goes false for it.
+//	unparse            needs the argument's raw AST, not its value.
+//	countMatches       evaluate their first argument once per nested ad in the
+//	evalInEachContext  second, so they need the argument EXPRESSION and a scope.
+//
+// NONDETERMINISTIC -- the function returns a different value each call, so the
+// scalar and vector executors could not be differentially tested against each
+// other, and a vectorized call would differ per element in a way a per-record
+// call does not:
+//
+//	random      draws from the global PRNG.
+//	time        reads the wall clock.
+//	formatTime  reads the wall clock when called with no argument, or with an
+//	            undefined first argument (builtinFormatTime).
+//
+// Everything else in functionArity is strict, pure, and a function of its
+// argument values alone. Membership here is the single source of truth for that
+// split: evaluateFunctionCall special-cases exactly the lazy/scope/AST entries
+// before reaching applyBuiltin, and StrictFunction refuses exactly this set.
+var nonStrictFunctions = map[string]bool{
+	// lazy
+	"ifthenelse": true, "strcat": true,
+	// scope or AST
+	"eval": true, "unparse": true, "countmatches": true, "evalineachcontext": true,
+	// nondeterministic
+	"random": true, "time": true, "formattime": true,
+}
+
+// StrictFunction reports whether a call to name with argc arguments can be
+// compiled to an ApplyFunction call on pre-evaluated argument values -- that is,
+// whether the function is known, accepts that argument count, and is strict,
+// pure and independent of the calling scope.
+//
+// A compiler must treat false as "delegate this call to the tree-walking
+// evaluator", never as "this is an error". A false answer covers three different
+// situations that happen to share a handling: a lazy or scope-dependent built-in
+// (see nonStrictFunctions), an unknown function name, and a known function
+// called with the wrong number of arguments. The last two produce ERROR *without
+// evaluating the arguments*, which a compiled call cannot reproduce, because
+// evaluateFunctionCall checks arity before it evaluates anything -- so pow(A0)
+// with a self-referential A0 is error rather than a cyclic-reference failure.
+// Delegating gets all three right by construction.
+//
+// Names are matched case-insensitively, as the reference engine matches them.
+func StrictFunction(name string, argc int) bool {
+	folded := strings.ToLower(name)
+	if nonStrictFunctions[folded] {
+		return false
+	}
+	arity, known := functionArity[folded]
+	return known && arity.accepts(argc)
+}
+
+// ApplyFunction calls a strict built-in on already-evaluated argument values,
+// returning the same value the tree-walking evaluator would for the equivalent
+// *ast.FunctionCall. It is the function-call counterpart of ApplyBinaryOp: the
+// one place a compiled executor gets built-in semantics from, so it cannot
+// diverge from classad.Eval by having its own copy.
+//
+// e is used only to materialize a lazy LIST argument and never to resolve a free
+// attribute reference (see applyBuiltin). Pass the evaluator the arguments were
+// evaluated with, which is what makes the result identical to evaluating the call
+// as an AST node. A caller that cannot have one may pass a scope-less evaluator
+// if and only if no argument can be a list -- then the ten list-consuming
+// built-ins return ERROR without consulting it.
+//
+// The caller must have established StrictFunction(name, len(args)) first. Calling
+// it for a name that fails that predicate does not panic -- a lazy built-in is
+// simply applied eagerly and an unknown one returns ERROR -- but the result is
+// then not necessarily what evaluating the expression would have produced, which
+// is the whole property this surface exists to preserve.
+func ApplyFunction(e *Evaluator, name string, args []Value) Value {
+	return applyBuiltin(e, strings.ToLower(name), args)
+}
