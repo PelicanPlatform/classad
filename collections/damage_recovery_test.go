@@ -962,3 +962,86 @@ func TestMergeLeavesDamageOut(t *testing.T) {
 type otherHasher struct{}
 
 func (otherHasher) Hash(key []byte) uint64 { return fnvHasher{}.Hash(key) ^ 0x9e3779b97f4a7c15 }
+
+// TestWriteAfterDamagedDictionaryInLastSegment: Rewrite interns a mutable store, leaving an
+// interned output as the last segment and no write target. Open makes the last segment the write
+// target unless it is interned, and judged that by its published dictionary. A dictionary that
+// fails its checksum is not published, so the damaged segment became the write target: a Put
+// appended inline records after its dictionary, Put returned nil, and every read of them was
+// refused because the segment's dictionary is unusable. The write must go to a fresh segment,
+// whether Open restores the directory from its snapshot or rebuilds it from the records.
+func TestWriteAfterDamagedDictionaryInLastSegment(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	for _, snapshot := range []bool{true, false} {
+		t.Run(fmt.Sprintf("snapshot=%v", snapshot), func(t *testing.T) {
+			dir := t.TempDir()
+			opts := Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16}
+			c, err := Open(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range 200 {
+				if err := c.Put(fmt.Appendf(nil, "k%d", i), mustAd(t, fmt.Sprintf(`[Id = %d; Owner = "u%d"]`, i, i%3))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			c.Rewrite()
+			sh := c.shards[0]
+			sh.mu.RLock()
+			last := sh.segs[len(sh.segs)-1]
+			path, dict, act := last.path, last.dictRecOff(), sh.act
+			sh.mu.RUnlock()
+			if act != nil || dict == 0 {
+				t.Fatalf("Rewrite left a write target (%v) or an inline last segment (dictionary at %d)", act != nil, dict)
+			}
+			if err := c.Close(); err != nil {
+				t.Fatal(err)
+			}
+			// A bit in the dictionary's body: its checksum fails, its framing does not.
+			flipBit(t, path, int(dict)+recKeyOff+4+segDictHeaderBytes+8)
+			if !snapshot {
+				if err := os.Remove(filepath.Join(filepath.Dir(path), dirSnapName)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			unusable := SegDictsUnusable()
+			c, err = Open(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			sh = c.shards[0]
+			sh.mu.RLock()
+			damaged := sh.segs[len(sh.segs)-1].dictUnusable.Load()
+			sh.mu.RUnlock()
+			if SegDictsUnusable() == unusable || !damaged {
+				c.Close()
+				t.Fatal("open did not refuse the last segment's dictionary")
+			}
+			if rebuilt := c.openIdxDiag.Timing.DirRebuilt; rebuilt == snapshot {
+				c.Close()
+				t.Fatalf("open rebuilt the directory: %v, want %v", rebuilt, !snapshot)
+			}
+			if err := c.Put([]byte("fresh"), mustAd(t, `[Id = 9999; Owner = "new"]`)); err != nil {
+				c.Close()
+				t.Fatal(err)
+			}
+			if _, ok := c.Get([]byte("fresh")); !ok {
+				t.Error("a key written after the open does not read back")
+			}
+			if err := c.Close(); err != nil {
+				t.Fatal(err)
+			}
+			c, err = Open(opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer c.Close()
+			if _, ok := c.Get([]byte("fresh")); !ok {
+				t.Error("a key written after the open does not read back after another reopen")
+			}
+		})
+	}
+}

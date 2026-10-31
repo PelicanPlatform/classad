@@ -670,7 +670,9 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		}
 	}
 	tm.PublishColumns = time.Since(colStart)
-	if sh.act != nil && sh.act.dict.Load() != nil {
+	// A segment whose dictionary was refused is interned all the same, and every record in it is
+	// refused on read: inline records appended to it would be acknowledged and never read back.
+	if sh.act != nil && (sh.act.dict.Load() != nil || sh.act.dictUnusable.Load()) {
 		sh.act = nil
 	}
 	spec := c.spec.Load()
