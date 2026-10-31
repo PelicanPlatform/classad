@@ -1,6 +1,10 @@
 package vm
 
-import "github.com/PelicanPlatform/classad/classad"
+import (
+	"fmt"
+
+	"github.com/PelicanPlatform/classad/classad"
+)
 
 // A REGISTER form of a compiled expression, and the mechanical conversion of the stack form into it.
 //
@@ -143,10 +147,14 @@ func (rp *RegProgram) Source() *Program { return rp.src }
 // LowerToRegisters converts a compiled expression from stack form to register form.
 //
 // It accepts every Program compile.go can produce, including one delegated wholesale to the
-// evaluator, and it never fails: the stack form is well-formed by construction (the compiler emits
-// balanced pushes and pops and jumps only within the two patterns above), so there is no input for
-// which this can get stuck. A malformed Program would be a compiler bug, and the conversion panics
-// on an underflow rather than quietly producing a program that reads an undefined register.
+// evaluator, and it never fails on valid input: the stack form is well-formed by construction (the
+// compiler emits balanced pushes and pops, and jumps only within the two patterns above), so there is
+// no expression for which this can get stuck.
+//
+// It panics rather than degrades on input that cannot occur -- a stack underflow, a combine with no
+// matching short-circuit, or an opcode it has not been taught. Each is a compiler bug, and each would
+// otherwise produce a register program that quietly disagrees with the stack one. The last is the
+// one that will actually happen: adding an opcode without extending this conversion.
 func LowerToRegisters(p *Program) *RegProgram {
 	l := &lowerer{
 		src:     p,
@@ -383,11 +391,14 @@ func (l *lowerer) one(ip int) {
 		j := l.emit(RegInstr{Op: RJmpIfDefined, Dst: d, A: a, T: -1})
 		l.pending[int(in.A)] = append(l.pending[int(in.A)], elvisJoin{dst: d, jumpIdx: j})
 	default:
-		// An opcode this conversion has not been taught. The stack interpreter pushes ERROR for an
-		// unknown opcode and so does this, which keeps the two forms in agreement even here.
-		d := l.reg()
-		l.emit(RegInstr{Op: RError, Dst: d})
-		l.push(d)
+		// An opcode this conversion has not been taught. It must fail LOUDLY rather than produce
+		// something: the stack interpreter pushes ERROR for an opcode it does not know, and emitting
+		// ERROR here would match that -- but only for an opcode NEITHER form implements. The real
+		// case is an opcode the stack form implements and this one has not been taught yet, where
+		// emitting ERROR is a silent wrong answer in a form that looks like it agreed. Every Opcode
+		// is handled above today, so reaching this is a programming error: a new opcode was added
+		// without extending the lowering.
+		panic(fmt.Sprintf("vm: register lowering has no case for opcode %d; a new opcode must be taught to both forms", in.Op))
 	}
 }
 

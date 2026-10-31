@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -287,4 +288,23 @@ func FuzzRegisterParity(f *testing.F) {
 				exprSrc, scopeSrc, describe(want), describe(got))
 		}
 	})
+}
+
+// TestRegisterLoweringRefusesUnknownOpcode proves the tripwire works. Emitting something for an
+// opcode the lowering has not been taught is the one failure mode that would not show up as a
+// failure: the register form would quietly disagree with the stack form, in a conversion whose whole
+// claim is that it cannot. Every Opcode is handled today, so this constructs one that is not.
+func TestRegisterLoweringRefusesUnknownOpcode(t *testing.T) {
+	p := CompileProgram(nil)
+	p.code = []Instr{{Op: Opcode(200)}}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("lowering an unknown opcode did not panic; a new opcode could diverge silently")
+		}
+		if msg, ok := r.(string); !ok || !strings.Contains(msg, "no case for opcode") {
+			t.Errorf("panic = %v, want one naming the missing opcode", r)
+		}
+	}()
+	LowerToRegisters(p)
 }
