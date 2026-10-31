@@ -199,32 +199,16 @@ func (e *NodeEmitter) WrapSelect(mark int, attr string) {
 }
 
 // FoldNegate collapses a just-emitted `-<numeric literal>` at [mark:end] into the single
-// signed literal node it denotes, matching the fold the reference encoder applies to the
-// equivalent ast.UnaryOp (see negatedNumericLiteral). Anything else at mark is left alone.
+// signed literal node it denotes, by the same rule and the same function the reference encoder
+// applies to the equivalent ast.UnaryOp (see foldNegatedLiteral). Anything else at mark is left
+// alone.
 //
 // It runs after the operand is emitted rather than deciding on the next token, because
 // whether the minus applies to a bare literal is not known until the operand is parsed: in
 // `- 5[0]` the operand is the subscript, not the 5, exactly as the reference grammar binds it.
-// Checking the emitted bytes asks the same question the reference asks of the operand node.
 //
 // The two encoders are required to be byte-identical (TestParseExprToWireMatchesReference), so
 // this is not an optimization -- a fold on one side only is a divergence.
 func (e *NodeEmitter) FoldNegate(mark int) {
-	if len(e.buf)-mark < 3 || e.buf[mark] != nUnOp || e.buf[mark+1] != unOpMinusID {
-		return
-	}
-	operand := e.buf[mark+2:]
-	switch operand[0] {
-	case nInt:
-		v, n := binary.Varint(operand[1:])
-		if n <= 0 || 1+n != len(operand) {
-			return
-		}
-		e.buf = AppendIntNode(e.buf[:mark], -v)
-	case nReal:
-		if len(operand) != 9 {
-			return
-		}
-		e.buf = AppendRealNode(e.buf[:mark], -math.Float64frombits(binary.LittleEndian.Uint64(operand[1:])))
-	}
+	e.buf = foldNegatedLiteral(e.buf, mark)
 }

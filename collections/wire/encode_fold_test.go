@@ -2,10 +2,11 @@ package wire
 
 import (
 	"bytes"
+	"math"
 	"testing"
 
-	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/parser"
 )
 
 // TestEncodeFoldsNegatedLiterals pins the fold itself: `-<numeric literal>` reaches the wire as
@@ -23,7 +24,6 @@ func TestEncodeFoldsNegatedLiterals(t *testing.T) {
 	}{
 		{"X = -1", LitInt, -1, 0},
 		{"X = - 42", LitInt, -42, 0},
-		{"X = -0", LitInt, 0, 0},
 		{"X = -2.5", LitReal, 0, -2.5},
 		{"X = -1.0e10", LitReal, 0, -1e10},
 	}
@@ -51,8 +51,11 @@ func TestEncodeFoldsNegatedLiterals(t *testing.T) {
 // unparser puts it (classad's unparseUnary): unary minus directly on a numeric literal, nothing
 // else. Unary plus and a parenthesized operand stay expressions, so the two agree on what a
 // signed literal is.
+//
+// The int `-0` is the one place the encoder folds less than the unparser: 0 is its own negation,
+// so folding it would make `--0` unstable across a decode/re-encode (see foldNegatedLiteral).
 func TestEncodeDoesNotFoldBeyondOneLiteral(t *testing.T) {
-	for _, src := range []string{"X = +1", "X = -(1)", "X = -a", "X = -(1 + 2)"} {
+	for _, src := range []string{"X = +1", "X = -(1)", "X = -a", "X = -(1 + 2)", "X = -0"} {
 		ad, err := classad.ParseOld(src)
 		if err != nil {
 			t.Fatalf("%s: %v", src, err)
@@ -120,10 +123,8 @@ func TestFoldMatchesReferenceUnparser(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: %v", src, err)
 		}
-		folded := false
-		if u, ok := ad.AST().Attributes[0].Value.(*ast.UnaryOp); ok {
-			_, folded = negatedNumericLiteral(u)
-		}
+		node, _ := Ad(EncodeInline(nil, ad.AST())).LookupByName("X")
+		_, folded := LiteralValue(node)
 		// The reference serializer renders a folded operand with no space after "X =";
 		// an unfolded unary operator keeps the leading space ("X =  -a").
 		refFolded := !bytes.HasPrefix([]byte(ad.MarshalOld()), []byte("X =  "))
@@ -131,4 +132,109 @@ func TestFoldMatchesReferenceUnparser(t *testing.T) {
 			t.Errorf("%s: encoder folds=%v, reference unparser folds=%v (MarshalOld=%q)", src, folded, refFolded, ad.MarshalOld())
 		}
 	}
+}
+
+// negationFoldSeeds are the spellings at the edge of the fold: nested minuses over numeric
+// literals (including both zeros), the shapes the fold must leave alone, and the int64 extremes.
+// Both round-trip fuzzers seed from them.
+var negationFoldSeeds = []string{
+	`[A = --0]`, `[A = --1]`, `[A = --1.5]`, `[A = -0]`, `[A = -0.0]`, `[A = --0.0]`,
+	`[A = ---0]`, `[A = ---1]`, `[A = - - 1]`, `[A = -(-1)]`, `[A = - -x]`,
+	`[A = 9223372036854775807]`, `[A = -9223372036854775807]`, `[A = --9223372036854775807]`,
+	`[A = -9223372036854775808]`, `[A = - -9223372036854775808]`,
+}
+
+// TestEncodeNegationFoldIdempotent pins that encode -> decode -> encode reproduces the same
+// bytes for every spelling at the edge of the fold, in both the interned and the inline form,
+// that the value survives the trip exactly (same type, same number, same sign of zero), and
+// that the decoded ad still compares Equal to the parsed one.
+//
+// The fold runs bottom-up, so `--1` is stored as a minus over the literal -1, and decoding
+// yields a minus over a negative literal -- a shape the parser never builds. If the encoder
+// folded that shape too, the second encode would store the literal 1 and the bytes would move
+// on every rewrite. This is the deterministic form of what FuzzRoundTrip and
+// FuzzInlineRoundTrip found on `[A=--0]`.
+func TestEncodeNegationFoldIdempotent(t *testing.T) {
+	type form struct {
+		name   string
+		encode func(*testing.T, string) []byte
+		decode func([]byte) (*classad.ClassAd, error)
+	}
+	forms := []form{
+		{"interned",
+			func(t *testing.T, src string) []byte {
+				ad, err := parser.ParseClassAd(src)
+				if err != nil {
+					t.Fatalf("parse %q: %v", src, err)
+				}
+				return EncodeStandalone(ad)
+			},
+			func(b []byte) (*classad.ClassAd, error) {
+				ad, err := DecodeStandalone(b)
+				return toClassAd(ad), err
+			}},
+		{"inline",
+			func(t *testing.T, src string) []byte {
+				ad, err := parser.ParseClassAd(src)
+				if err != nil {
+					t.Fatalf("parse %q: %v", src, err)
+				}
+				return EncodeInline(nil, ad)
+			},
+			func(b []byte) (*classad.ClassAd, error) {
+				ad, err := DecodeInline(b)
+				return toClassAd(ad), err
+			}},
+	}
+	reencode := map[string]func(*classad.ClassAd) []byte{
+		"interned": func(c *classad.ClassAd) []byte { return EncodeStandalone(c.AST()) },
+		"inline":   func(c *classad.ClassAd) []byte { return EncodeInline(nil, c.AST()) },
+	}
+	for _, src := range negationFoldSeeds {
+		orig, err := parser.ParseClassAd(src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		want := toClassAd(orig).EvaluateAttr("A")
+		for _, f := range forms {
+			first := f.encode(t, src)
+			got, err := f.decode(first)
+			if err != nil {
+				t.Fatalf("%s %s: decode: %v", f.name, src, err)
+			}
+			second := reencode[f.name](got)
+			if !bytes.Equal(first, second) {
+				t.Errorf("%s %s: re-encode not stable:\n first  %x\n second %x", f.name, src, first, second)
+			}
+			v := got.EvaluateAttr("A")
+			if !sameValue(want, v) {
+				t.Errorf("%s %s: value changed across the round trip: %v -> %v", f.name, src, want, v)
+			}
+			// The stored ad must still compare Equal to the parsed one, or an unchanged ad reads
+			// as changed. A fold wider than one minus (`--1` stored as the literal 1) is stable
+			// and keeps the value, and this is the check that rejects it.
+			if !toClassAd(orig).Equal(got) {
+				t.Errorf("%s %s: decoded ad is not Equal to the parsed one: %s vs %s", f.name, src, orig, got.AST())
+			}
+		}
+	}
+}
+
+// sameValue is strict identity for the values the fold touches: same type, and for numbers the
+// same bits (so negative zero is not equal to positive zero).
+func sameValue(a, b classad.Value) bool {
+	if a.Type() != b.Type() {
+		return false
+	}
+	switch {
+	case a.IsInteger():
+		x, _ := a.IntValue()
+		y, _ := b.IntValue()
+		return x == y
+	case a.IsReal():
+		x, _ := a.RealValue()
+		y, _ := b.RealValue()
+		return math.Float64bits(x) == math.Float64bits(y)
+	}
+	return a.String() == b.String()
 }

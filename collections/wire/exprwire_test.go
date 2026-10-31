@@ -22,6 +22,8 @@ var handledExprs = []string{
 	`a ?: b`, `a ?: b ?: c`, `a ? : b`,
 	// a '-' that is part of a number literal binds as a primary
 	`-5[0]`, `a ?: -1`, `-.5`, `-00`, `1 - -2`, `-5 * 3`, `- 5`, `-0x10`,
+	// nested minuses: the fold must not apply to its own result (a minus over a negative literal)
+	`--0`, `--1`, `--1.5`, `-0.0`, `--0.0`, `---0`, `---1`, `- - 1`, `-(-1)`, `- -x`, `--9223372036854775807`,
 	`(TARGET.Cpus >= RequestCpus) && (TARGET.Memory >= RequestMemory)`,
 	`ifThenElse(State == "Claimed", RemoteOwner, "none")`,
 	`(GPUs =?= undefined) || (GPUs == 0) || ((CPUs > 8 * GPUs) && (Memory > 32000 * GPUs))`,
