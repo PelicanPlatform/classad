@@ -191,19 +191,10 @@ func publishColRecord(c *Collection, seg *segment, o uint32) error {
 	cs.bindNative(c, seg)
 	cn := &colNative{seg: cs, cache: c.sharedColCache(), rec: o}
 	cn.dict = seg.dict.Load()
-	// The payload's cold tails are keyed by the SEGMENT's dictionary, so readers translate
-	// through that dictionary rather than trusting this process's intern numbering.
-	// Only for a dictionary-keyed payload. A globally-keyed one already carries its own
-	// translation, built from the names the section stores, and overwriting it with a
-	// dictionary-derived map would point every cold-tail lookup at the wrong attribute.
-	if rm := segIDRemap(c, cn.dict); rm != nil && cs.dictKeyed {
-		for _, b := range cs.blocks {
-			b.remap = rm
-		}
-		for _, g := range cs.groups {
-			setGroupRemap(g.blocks, rm)
-		}
-	}
+	// A columnarized segment's dictionary is published before its payload is looked for, so a
+	// dictionary-keyed payload finds one here; its records, keyed by the same dictionary, could not be
+	// read without it either.
+	cs.bindDictRemap(c, cn.dict)
 	if cn.dict != nil {
 		cn.localOf = make(map[uint32]uint32, 256)
 		schemas := make([]*adSchema, 0, len(cs.blocks)+len(cs.groups))
@@ -753,6 +744,40 @@ func (c *Collection) segIDMapper(d *segDictHandle) func(uint32) (uint32, bool) {
 		}
 		return d.lookup(name)
 	}
+}
+
+// bindDictRemap hands a dictionary-keyed payload's blocks, base and group, the translation between
+// this process's intern ids and the segment dictionary's, so their cold tails are read in the space
+// they were written in. It reports false when the payload is dictionary-keyed and d is nil: nothing
+// can then translate a reader's id into the tail's, and the block must not be published.
+//
+// Every block of a dictionary-keyed payload needs it, wherever the payload came from. Its absence is
+// not an error anyone sees: a block with no translation looks its tail up by the reader's own intern
+// id, which names some other attribute of the dictionary or none, so values that are there read as
+// absent and a type exception reads as a missing value.
+//
+// It is the WHOLE dictionary, not just the schema's fields. A cold tail also holds every attribute
+// the schema does not carry, and a translation that covers only the fields answers each of those as
+// absent from the payload.
+//
+// A globally-keyed payload is left alone: it carries its own translation, built from the names the
+// section stores, and replacing it with a dictionary-derived one would point every cold-tail lookup
+// at the wrong attribute.
+func (cs *colSegment) bindDictRemap(c *Collection, d *segDictHandle) bool {
+	if !cs.dictKeyed {
+		return true
+	}
+	rm := segIDRemap(c, d)
+	if rm == nil {
+		return false
+	}
+	for _, b := range cs.blocks {
+		b.remap = rm
+	}
+	for _, g := range cs.groups {
+		setGroupRemap(g.blocks, rm)
+	}
+	return true
 }
 
 // segIDRemap rebuilds a reader's translation between this process's intern ids and the segment

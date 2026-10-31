@@ -69,6 +69,9 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	var cs *colSegment
 	if body := readColSection(col, seg.used); body != nil { // rejects truncated/corrupt/stale -> row-scan
 		cs = unmarshalColSegment(body, c.regionCodec(), c.intern.Intern)
+		if cs != nil && !cs.bindDictRemap(c, seg.dict.Load()) {
+			cs = nil // keyed by a dictionary the segment does not have: row-scan until rebuilt
+		}
 	} else {
 		c.seedSchemaFromSection(col, seg.used)
 	}
@@ -380,6 +383,9 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 	var cs *colSegment
 	if body := readColSection(col, seg.used); body != nil {
 		cs = unmarshalColSegment(body, c.regionCodec(), c.intern.Intern)
+		if cs != nil && !cs.bindDictRemap(c, seg.dict.Load()) {
+			cs = nil // keyed by a dictionary the segment does not have: row-scan until rebuilt
+		}
 	} else {
 		c.seedSchemaFromSection(col, seg.used)
 	}
