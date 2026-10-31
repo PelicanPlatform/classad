@@ -22,10 +22,12 @@ repos:
       - id: go-fmt
         args: [-w, -s]
       - id: go-vet
-        # .github/tools is its own module (it pins the goyacc CI runs), so
-        # vetting it from the root module fails with "no required module
-        # provides package .../.github/tools". Its own CI job vets it.
-        exclude: '^\.github/tools/'
+        # Every path here is its OWN Go module, so vetting it from the root
+        # module fails with "no required module provides package ...". Each has
+        # its own CI job that vets it in its own module. .github/tools pins the
+        # goyacc CI runs; changefeed, collections, db and dbrpc are the layered
+        # libraries.
+        exclude: '^(\.github/tools|changefeed|collections|db|dbrpc)/'
       - id: go-imports
         args: [-w]
       - id: go-unit-tests
