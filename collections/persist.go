@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -794,11 +795,24 @@ func (c *Collection) rebuildDir(sh *shard) {
 		sup uint64
 	}
 	type delMark struct {
-		key string
-		seq uint64
+		key  string
+		hash uint64
+		seq  uint64
 	}
+	// byKey holds each key's winning version, keyed by the key's HASH rather than by the key
+	// itself: a map[string] pays a string header plus the key bytes for every live key, and on a
+	// store with millions of them that is the largest thing recovery allocates. The hash is
+	// already what sh.dir is keyed by, so nothing below has to derive it a second time.
+	//
+	// A hash is not an identity, so collide holds the entries of any key whose hash another key
+	// already claimed. Letting a collision merge two keys would silently drop one of them, which
+	// is data loss, not a slow path -- so the two are distinguished by comparing the key bytes,
+	// which is free: the only place a collision can be introduced already reads the stored
+	// record to verify its checksum. collide stays nil on every store that has no collision,
+	// which is almost all of them.
 	var (
-		byKey    map[string]best
+		byKey    map[uint64]best
+		collide  map[string]best
 		maxSeq   uint64
 		marks    []mark
 		stamps   []stamped
@@ -833,9 +847,37 @@ func (c *Collection) rebuildDir(sh *shard) {
 		}
 		return ok
 	}
+	// keyOf reads the key of the record a best names. Every caller below is already reading
+	// that record for another reason, so the hash map costs no extra page touch.
+	keyOf := func(b best) []byte { return recKey(sh.segs[b.loc.seg].data, b.loc.off) }
+	// bestFor returns the winner recorded for a key, telling a repeat of the same key apart
+	// from a different key that merely hashes the same.
+	bestFor := func(h uint64, key []byte) (best, bool) {
+		b, ok := byKey[h]
+		if !ok {
+			return best{}, false
+		}
+		if bytes.Equal(keyOf(b), key) {
+			return b, true
+		}
+		b, ok = collide[string(key)] // not this key's slot: a collision, or nothing
+		return b, ok
+	}
+	// setBest records b as the winner for a key, sending it to the overflow if another key
+	// already holds its hash.
+	setBest := func(h uint64, key []byte, b best) {
+		if cur, ok := byKey[h]; ok && !bytes.Equal(keyOf(cur), key) {
+			if collide == nil {
+				collide = make(map[string]best)
+			}
+			collide[string(key)] = b
+			return
+		}
+		byKey[h] = b
+	}
 	reframed := map[*segment]int{}
 	for {
-		byKey = make(map[string]best)
+		byKey, collide = make(map[uint64]best), nil
 		maxSeq = 0
 		marks = marks[:0]
 		stamps, delMarks = stamps[:0], delMarks[:0]
@@ -887,15 +929,19 @@ func (c *Collection) rebuildDir(sh *shard) {
 					if hzOK && seq > hz {
 						if k, ok := recDeleteMarkerKey(seg.data, o); ok {
 							noteLast(seq, string(k))
-							delMarks = append(delMarks, delMark{string(k), seq})
+							delMarks = append(delMarks, delMark{string(k), c.h.Hash(k), seq})
 						} else if !recIsDict(seg.data, o) && !recIsCol(seg.data, o) {
 							noteLast(seq, "") // a time checkpoint carries its commit's sequence
 						}
 					}
 					continue
 				}
-				key := string(recKey(seg.data, o))
-				if hzOK {
+				k := recKey(seg.data, o)
+				h := c.h.Hash(k)
+				if hzOK && (seq > hz || (sup != seqMax && sup > hz)) {
+					// Only a record above the horizon needs its key as a string. Materializing
+					// one for every record walked was the rest of this pass's allocation.
+					key := string(k)
 					if seq > hz {
 						noteLast(seq, key)
 					}
@@ -904,7 +950,8 @@ func (c *Collection) rebuildDir(sh *shard) {
 					}
 				}
 				cand := loc{seg.id, o}
-				if b, ok := byKey[key]; ok {
+				b, seen := bestFor(h, k)
+				if seen {
 					// Two records claim the key. Whichever wins supersedes the other on disk, so
 					// neither is believed until its checksum is.
 					for _, l := range [2]loc{b.loc, cand} {
@@ -914,8 +961,8 @@ func (c *Collection) rebuildDir(sh *shard) {
 						}
 					}
 				}
-				if b, ok := byKey[key]; !ok || seq >= b.seq {
-					byKey[key] = best{cand, seq, sup}
+				if !seen || seq >= b.seq {
+					setBest(h, k, best{cand, seq, sup})
 				}
 				off += int(total)
 			}
@@ -951,7 +998,7 @@ func (c *Collection) rebuildDir(sh *shard) {
 	// Replay delete markers whose stamp did not survive: the key's newest surviving version
 	// predates the delete and is still current.
 	for _, dm := range delMarks {
-		b, ok := byKey[dm.key]
+		b, ok := bestFor(dm.hash, []byte(dm.key))
 		if !ok || b.seq >= dm.seq || b.superseded != seqMax {
 			continue
 		}
@@ -959,7 +1006,7 @@ func (c *Collection) rebuildDir(sh *shard) {
 		seg.supersedeRec(b.loc.off, dm.seq)
 		touched = append(touched, supRef{seg, b.loc.off})
 		b.superseded = dm.seq
-		byKey[dm.key] = b
+		setBest(dm.hash, []byte(dm.key), b)
 		c.openIdxDiag.DeletesReplayed++
 	}
 	// What recovery rewrote must be on disk before the horizon written at the end of Open says
@@ -1005,8 +1052,9 @@ func (c *Collection) rebuildDir(sh *shard) {
 				continue
 			}
 			if recSuperseded(seg.data, o) == seqMax {
-				b := byKey[string(recKey(seg.data, o))]
-				if b.loc.seg != seg.id || b.loc.off != o {
+				k := recKey(seg.data, o)
+				b, ok := bestFor(c.h.Hash(k), k)
+				if !ok || b.loc.seg != seg.id || b.loc.off != o {
 					// A stale still-current duplicate/older version: retire it at its
 					// own seq so seq <= S0 < sup is false for every scan.
 					seg.supersedeRec(o, recSeq(seg.data, o))
@@ -1016,7 +1064,7 @@ func (c *Collection) rebuildDir(sh *shard) {
 		}
 	}
 
-	sh.dir = make(map[uint64]loc, len(byKey))
+	sh.dir = make(map[uint64]loc, len(byKey)+len(collide))
 	// The last segment becomes the write target, and its records' links are not touched here:
 	// relinkActiveChains, which runs after either restore path, owns them. Relinking a current
 	// record in it to the other current records of its bucket, as is done for the sealed ones,
@@ -1027,17 +1075,24 @@ func (c *Collection) rebuildDir(sh *shard) {
 		actID = sh.segs[n-1].id
 	}
 	count := 0
-	for keyStr, b := range byKey {
+	// The hash is the map key now, so no entry has to be re-hashed on the way into sh.dir --
+	// which is keyed by the same hash.
+	addDir := func(h uint64, b best) {
 		if b.superseded != seqMax {
-			continue // latest version was superseded (deleted) -> key absent
+			return // latest version was superseded (deleted) -> key absent
 		}
 		count++
 		if b.loc.seg == actID {
-			continue
+			return
 		}
-		h := c.h.Hash([]byte(keyStr))
 		setRecNext(sh.segs[b.loc.seg].data, b.loc.off, dirGetOr(sh.dir, h))
 		sh.dir[h] = b.loc
+	}
+	for h, b := range byKey {
+		addDir(h, b)
+	}
+	for keyStr, b := range collide {
+		addDir(c.h.Hash([]byte(keyStr)), b) // empty on a store with no hash collision
 	}
 	sh.count = count
 	if len(sh.segs) > 0 {
