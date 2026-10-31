@@ -3,6 +3,7 @@ package collections
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -436,6 +437,94 @@ func TestSchemaReviewColumnarizesByDefault(t *testing.T) {
 	}
 	segs, saved := ColumnarizedSegments()
 	t.Logf("schema review columnarized %d segments by default (%d total, %d bytes saved)", got, segs, saved)
+}
+
+// TestReindexWritesNoSidecarCopyOfColumnarPayload guards the sidecar rewrite on a reindex. For a
+// columnarized segment the read-path columnar block IS the segment's own payload, so re-marshaling
+// that block into the rewritten sidecar stored a second copy of every schema'd column -- every
+// columnarized segment here gained a section, about 63KB in all -- which the reader then ignored.
+// Space only, but a reindex put back the duplication columnarizing removes. Reads must be unchanged
+// by the reindex and across a reopen of the rewritten sidecars.
+func TestReindexWritesNoSidecarCopyOfColumnarPayload(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	dir := t.TempDir()
+	c, _, _ := columnarFixtureIn(t, dir, 3000)
+	before := readAll(t, c, "true")
+	if !c.BuildAndEnableSchemaScan(4096, 8) {
+		t.Fatal("schema scan did not enable")
+	}
+	// sidecarCols counts the columnarized segments, how many sidecars were read, and the bytes of
+	// the column sections those sidecars carry.
+	sidecarCols := func() (native, read, withSection, bytes int) {
+		for _, seg := range c.shards[0].segs {
+			if seg == nil || !seg.columnarized() {
+				continue
+			}
+			native++
+			data, closer, err := mapFile(snapshotPath(seg))
+			if err != nil {
+				continue
+			}
+			if _, _, col, _, ok := splitSegmentSidecar(data); ok {
+				read++
+				if len(col) > 0 {
+					withSection++
+					bytes += len(col)
+				}
+			}
+			_ = closer()
+		}
+		return
+	}
+	if native, _, w, b := sidecarCols(); native == 0 {
+		t.Fatal("the schema review columnarized no segment")
+	} else if w != 0 {
+		t.Fatalf("before any reindex %d of %d columnarized sidecars already carry a column section (%d bytes)", w, native, b)
+	}
+
+	if !c.AddIndex([]string{"Owner"}, nil) {
+		t.Fatal("AddIndex returned false")
+	}
+	c.Reindex()
+	native, read, w, b := sidecarCols()
+	if read != native {
+		t.Fatalf("read %d of %d columnarized sidecars after the reindex", read, native)
+	}
+	if w != 0 {
+		t.Errorf("the reindex wrote a column section into %d of %d columnarized sidecars (%d bytes)", w, native, b)
+	}
+	check := func(stage string) {
+		t.Helper()
+		after := readAll(t, c, "true")
+		slices.Sort(before)
+		slices.Sort(after)
+		if !slices.Equal(after, before) {
+			t.Fatalf("%s: %d rows read back differently from the %d before", stage, len(after), len(before))
+		}
+		// A count served from the columns agrees with the records.
+		q, _ := vm.Parse("RequestMemory > 4096")
+		if n, ok := c.CountQuery(q); !ok {
+			t.Fatalf("%s: the columns did not serve a count", stage)
+		} else if want := len(readAll(t, c, "RequestMemory > 4096")); n != want {
+			t.Fatalf("%s: %d from the columns, %d from the records", stage, n, want)
+		}
+	}
+	check("after the reindex")
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	c = c2
+	if columnarSegmentsForTest(c) != native {
+		t.Fatalf("%d columnarized segments after the reopen, want %d", columnarSegmentsForTest(c), native)
+	}
+	check("after a reopen")
 }
 
 // TestColumnarSegmentBudgetDisables checks the off switch, which matters because it is the only way

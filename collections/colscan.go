@@ -553,6 +553,11 @@ func (c *Collection) colBlobForSeg(seg *segment) []byte {
 // records. Falls back to building the block when the segment has none yet but schema-scan is
 // enabled (an index added just after enabling schema-scan). nil when there is nothing to persist.
 func (c *Collection) colBlobPreserve(seg *segment) []byte {
+	if colNativeBlobRedundant(seg) {
+		// A columnarized segment's colblk is its own in-segment payload, not a sidecar block:
+		// re-marshaling it would store a second copy the reader never uses (see colBlobForSeg).
+		return nil
+	}
 	cs := seg.colblk.Load()
 	if cs == nil {
 		return c.colBlobForSeg(seg)
