@@ -3,6 +3,7 @@ package collections
 import (
 	"math"
 	"slices"
+	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -88,6 +89,16 @@ func (c *Collection) InternSealed() {
 	c.internSealedLocked()
 }
 
+// internSkippedDictUnusable counts segments interning passed over because their dictionary is
+// unusable, once per segment.
+var internSkippedDictUnusable atomic.Int64
+
+// InternSkippedDictUnusable reports how many segments, since the process started, InternSealed (and
+// RetrainDict, which runs it) has passed over because their attribute dictionary is unusable
+// (SegDictsUnusable): their records are interned, so there is nothing to transcode, and none of them
+// can be read to rewrite. Each segment counts once, however many passes skip it.
+func InternSkippedDictUnusable() int64 { return internSkippedDictUnusable.Load() }
+
 // internSealedLocked is InternSealed's body, for callers already holding maintMu (RetrainDict
 // runs it so a retrain still interns whatever has sealed since the last one -- a one-way,
 // once-per-segment transition, unlike recompression, which would otherwise repeat over the
@@ -103,9 +114,20 @@ func (c *Collection) internSealedLocked() {
 		act := sh.act
 		var srcs []*segment
 		for _, s := range sh.segs {
-			if s != nil && s != act && s.used > 0 && s.dict.Load() == nil {
-				srcs = append(srcs, s) // sealed + still inline: a transcode candidate
+			if s == nil || s == act || s.used == 0 || s.dict.Load() != nil {
+				continue
 			}
+			// No published dictionary does not make a segment inline: one whose dictionary failed
+			// its checksum, or was not recovered, is interned with nothing to resolve its ids. None
+			// of its records decode, so the transcode fails on the first one, and it used to be
+			// retried on every pass.
+			if s.dictUnusable.Load() {
+				if s.internSkipCounted.CompareAndSwap(false, true) {
+					internSkippedDictUnusable.Add(1)
+				}
+				continue
+			}
+			srcs = append(srcs, s) // sealed + still inline: a transcode candidate
 		}
 		sh.mu.Unlock()
 
