@@ -145,10 +145,11 @@ func (p *projPlan) localWanted(dict *segDictHandle) map[uint32]struct{} {
 
 // projectScratch holds the buffers a projected build reuses across records.
 type projectScratch struct {
-	remnant []byte
-	narrow  narrowScratch
-	entries []byte
-	out     []byte
+	remnant  []byte
+	expanded []byte // the remnant with its dictionary references expanded, when it held any
+	narrow   narrowScratch
+	entries  []byte
+	out      []byte
 	// coldBlk/coldPlan key coldWant: the plan's attributes as the ids the block's cold tail stores
 	// them under (one translation per block, not per record), and how many of them are not schema
 	// fields -- the ones the tail is the only home of.
@@ -211,6 +212,14 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 		return nil, false
 	}
 	sc.remnant = raw
+	// Expanded before anything looks inside it: a dictionary reference is not a value (colremdict.go).
+	// One that does not resolve sends the record to the full read, which refuses it.
+	if exp, expanded, eerr := blk.expandRemnant(raw, cs.bc, sc.expanded[:0]); eerr != nil {
+		return nil, false
+	} else if expanded {
+		sc.expanded = exp
+		raw = exp
+	}
 	if c.deltaRead && isDeltaRecord(raw) {
 		return nil, false // a delta's bytes are one write's changes, not the record: only the full read merges them
 	}

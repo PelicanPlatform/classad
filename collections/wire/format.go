@@ -88,6 +88,14 @@ const (
 	nEncrypted = 0x17
 )
 
+// TagExternalRef is a node tag this package never writes and never accepts: every decoder and
+// skipper here rejects it as malformed. It is reserved for a storage layer that replaces a node, in
+// place, with a reference into a table it keeps elsewhere, and that expands every such reference
+// back into the original node bytes before any of this package's readers sees the ad. Reserving it
+// here keeps a future node type from being assigned the same byte, which would make such a layer
+// read a real node as a reference.
+const TagExternalRef = 0xFF
+
 // nameHash32 is a case-insensitive 32-bit hash of an attribute name, used in the
 // hot header of inline-names ads (attribute names are case-insensitive, so the
 // hash folds case). FNV-1a over the lowercased bytes.

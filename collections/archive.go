@@ -124,6 +124,10 @@ type ArchiveOptions struct {
 	GroupMergeJaccard   float64
 	GroupMaxPartialFrac float64
 
+	// RemnantDictionary stores the values columnarized records repeat once per row group (see
+	// Options.RemnantDictionary). Off by default; positive turns it on.
+	RemnantDictionary int
+
 	// InternAtSeal interns each segment as soon as it seals (see Options.InternAtSeal), so an
 	// archive gets the interning density/decode win immediately instead of only after a later
 	// RetrainDict/Rewrite. Optional; default off. Trades a per-seal transcode (off the write
@@ -174,6 +178,7 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		GroupStabilityRuns:  opts.GroupStabilityRuns,
 		GroupMergeJaccard:   opts.GroupMergeJaccard,
 		GroupMaxPartialFrac: opts.GroupMaxPartialFrac,
+		RemnantDictionary:   opts.RemnantDictionary,
 		WatchHistory:        archiveWatchCap, // enable the append-stream watch
 		// Global shared ARCHIVE block-cache budget (0 keeps the current/default).
 		ArchiveBlockCacheBytes: opts.BlockCacheBytes,

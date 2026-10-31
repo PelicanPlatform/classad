@@ -350,7 +350,21 @@ func (c *Collection) recordWireIn(seg *segment, data []byte, off uint32, buf []b
 		}
 		return raw, nil // not a columnarized record (a marker, or written after the transform)
 	}
-	return cn.spliceInto(c, raw, k, nil)
+	// The remnant as it was before its block's dictionary replaced repeated nodes with references. No
+	// reader past this point -- the splice, nor anything that consumes the whole ad -- ever sees one.
+	blk, _ := cn.blockFor(k)
+	sc := getRecBuf()
+	rem, expanded, err := blk.expandRemnant(raw, cn.cache, sc)
+	if err != nil {
+		putRecBuf(sc)
+		return nil, err
+	}
+	if expanded {
+		sc = rem
+	}
+	out, err := cn.spliceInto(c, rem, k, nil)
+	putRecBuf(sc) // the splice copied the remnant into its own buffer
+	return out, err
 }
 
 // spliceInto rebuilds a full ad from a record's remnant and its columnar values.

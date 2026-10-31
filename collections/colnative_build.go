@@ -282,9 +282,33 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 				return true
 			})
 		}
-		enc := src.codec.Compress(nil, body)
-		rems = append(rems, remnant{off: o, body: enc})
-		total += recordLen(len(recKey(src.data, o)), len(enc))
+		rems = append(rems, remnant{off: o, body: body})
+	}
+	// The repeated non-literal values, stored once per block and referenced in place (colremdict.go).
+	// Built over the bodies exactly as they will be stored, after the name list read them, and before
+	// they are compressed -- the references are what makes each one smaller.
+	remDict := false
+	if c.writeRemnantDict() {
+		bodies := make([][]byte, len(rems))
+		for i := range rems {
+			bodies[i] = rems[i].body
+		}
+		attachRemnantDicts(blocks, bodies, c.regionCodec())
+		for i := range rems {
+			rems[i].body = bodies[i]
+		}
+		remDict = cs.hasRemnantDict()
+	}
+	for i := range rems {
+		enc := src.codec.Compress(nil, rems[i].body)
+		rems[i].body = enc
+		total += recordLen(len(recKey(src.data, rems[i].off)), len(enc))
+	}
+	if remDict && !remNamed {
+		// Re-marshaled so the payload carries the dictionaries and the size below includes them.
+		if blob = marshalColPayload(cs, func(id uint32) (string, bool) { return c.intern.Name(id) }); blob == nil {
+			return nil, nil, nil
+		}
 	}
 	if remNamed {
 		names := make([]string, 0, len(remNames))

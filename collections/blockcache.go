@@ -24,6 +24,7 @@ func (d *decodedStreams) cost() int64 { return int64(len(d.coldNum) + len(d.str)
 //	kindStrDict  per-field string dictionaries -- a string predicate or read
 //	kindStrCode  per-field string code columns -- a string predicate or read
 //	kindComputed computed values of expression cells -- an escaped cell's value
+//	kindRemDict  the remnant dictionary              -- reading a columnarized record
 //
 // Decompressing all three together meant reading one escaped integer also inflated the string
 // region, which on wide ads (a history record carries dozens of string attributes) is the largest
@@ -38,6 +39,7 @@ const (
 	kindStrDict
 	kindStrCode
 	kindComputed
+	kindRemDict
 	numStreamKinds
 )
 
@@ -212,6 +214,8 @@ func (bc *blockCache) stream(b *columnarBlock, k streamKind) ([]byte, error) {
 		comp = b.strCodeComp
 	case kindComputed:
 		comp = b.computedComp
+	case kindRemDict:
+		comp = b.remDictComp
 	}
 	raw, err := b.codec.Decompress(nil, comp)
 	if err != nil {
