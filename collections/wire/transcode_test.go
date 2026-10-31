@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/ast"
+	"github.com/PelicanPlatform/classad/collections/crypt"
 )
 
 // The claim AppendInternedFromInline rests on is that transcoding the bytes produces the SAME ad
@@ -335,5 +336,49 @@ func TestTranscodeStreamBytesMatch(t *testing.T) {
 		if nw != na {
 			t.Fatalf("id %d is %q via wire but %q via ast -- the canonical spelling diverged", id, nw, na)
 		}
+	}
+}
+
+// TestTranscodeRefusesSealedValues: a sealed value's plaintext was encoded in the key form of the ad
+// it was sealed in, so an inline-names record seals a nested record's member NAMES inline. Copied
+// unopened into an interned ad, every reader opens it with interned key semantics, reads a name's
+// length as an id and the name bytes as a node, and the whole record fails to decode. The transcode
+// cannot see inside the seal to tell which values are safe, so it must refuse any record with one,
+// leaving the caller's decode-and-re-seal path to produce the interned form.
+func TestTranscodeRefusesSealedValues(t *testing.T) {
+	dek, err := crypt.NewDEK()
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := dekSealer{dek}
+	rec := &ast.RecordLiteral{ClassAd: &ast.ClassAd{Attributes: []*ast.AttributeAssignment{
+		attr("a", &ast.IntegerLiteral{Value: 1}),
+		attr("b", &ast.StringLiteral{Value: "x"}),
+	}}}
+	cases := []struct {
+		name   string
+		secret ast.Expr
+	}{
+		{"record literal", rec},
+		{"record inside a list", &ast.ListLiteral{Elements: []ast.Expr{&ast.IntegerLiteral{Value: 2}, rec}}},
+		// No name inside, so copying it would have been harmless -- but nothing short of opening
+		// it can tell this case from the ones above.
+		{"string", &ast.StringLiteral{Value: "capability"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ad := &ast.ClassAd{Attributes: []*ast.AttributeAssignment{
+				attr("Id", &ast.IntegerLiteral{Value: 7}),
+				attr("Secret", tc.secret),
+			}}
+			inline := EncodeInlineWithHotEnc(nil, ad, nil, func(n string) bool { return n == "Secret" }, s)
+			tt := NewInternTable()
+			got, ok := AppendInternedFromInline(nil, Ad(inline), tt, nil)
+			if !ok {
+				return
+			}
+			back, err := DecodeResolveEnc(got, tt.Name, s)
+			t.Fatalf("transcoded a record with a sealed value; decoding it with the key gives %v, %v (want refusal)", back, err)
+		})
 	}
 }

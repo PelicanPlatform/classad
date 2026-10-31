@@ -733,8 +733,9 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 	// was 71% of a real compaction pass's allocation, 35% of it in readString copying every string
 	// value into a fresh Go string for the encoder to write straight out again.
 	//
-	// It reports false for a record the transcode will not take (already interned, standalone, or
-	// malformed), and the caller falls back to the ast path.
+	// It reports false for a record the transcode will not take (already interned, standalone,
+	// carrying a sealed value, or malformed), and the caller falls back to the ast path, which opens
+	// sealed values with the key and re-seals them in the interned form.
 	appendInternedWire := func(streamSegs *[]*segment, curp **segment, st *internStream, seq uint64, key, w []byte) (*segment, uint32, bool) {
 		if *curp == nil {
 			*curp = newDst(streamSegs, 0, target)

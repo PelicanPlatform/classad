@@ -15,22 +15,25 @@ import "encoding/binary"
 //	an attribute KEY   uvarint(nameLen) + name   becomes   uvarint(internID)
 //	a name-carrying NODE  nAttrRefStr/nFuncStr/nSelectStr  becomes  nAttrRef/nFunc/nSelect
 //
-// Everything else -- every literal, every operator, every list, every sealed value -- is the same
-// bytes in both forms. So the transcode copies, and only rewrites where the encoding genuinely
-// differs.
+// Everything else -- every literal, every operator, every list -- is the same bytes in both forms.
+// So the transcode copies, and only rewrites where the encoding genuinely differs.
 //
-// It never opens a sealed value, which is not just a saving: recordToInternedDict decodes with the
-// collection's key and must remember to re-seal on the way out, and the one time it did not, the
-// secret reached the derived schema and the on-disk sidecar in the clear. A transcode copies the
-// nEncrypted node's bytes without being able to read them, so that class of bug cannot occur.
+// A sealed value is the exception it cannot handle. Its plaintext is the value's node encoding in
+// the key form of the ad it was sealed in, so a record literal sealed by the inline-names write
+// path carries its member names inline, and a reader of the interned ad opens it expecting ids:
+// the name's length reads as an id, the name's bytes as a node, and the whole record fails to
+// decode. Which sealed values hold a record cannot be known without opening them, and this layer
+// holds no key, so a record with any sealed value is refused. The caller's fallback decodes with
+// the key and re-encodes interned with the sealer, sealing each value afresh in the interned form;
+// the cost is only that such records do not get the transcode's speedup.
 
 // AppendInternedFromInline appends to dst the INTERNED form of src, an inline-names ad, and
 // returns the extended buffer. Names are interned into t; ids present in hot get a hot-header
-// entry, matching EncodeWithHotEnc (a sealed value is never hot).
+// entry, matching EncodeWithHotEnc.
 //
 // It reports false when src is not a plain inline-names ad -- standalone (carrying its own intern
-// table) or already interned -- or when it is malformed. The caller falls back to decoding, which
-// is the source of truth.
+// table) or already interned -- when it carries a sealed value (see the note at the top of this
+// file), or when it is malformed. The caller falls back to decoding, which is the source of truth.
 func AppendInternedFromInline(dst []byte, src Ad, t *InternTable, hot map[uint32]struct{}) ([]byte, bool) {
 	c, ok := src.bodyStart()
 	if !ok || !c.inline || src[2]&flagStandalone != 0 {
@@ -57,16 +60,11 @@ func AppendInternedFromInline(dst []byte, src Ad, t *InternTable, hot map[uint32
 		id := t.InternBytes(name)
 		entries = binary.AppendUvarint(entries, uint64(id))
 		nodeOff := len(entries)
-		sealed := c.pos < len(c.b) && c.b[c.pos] == nEncrypted
 		if !transcodeNode(c, &entries, t, 0) {
 			return dst, false
 		}
-		// Matching EncodeWithHotEnc: a sealed attribute is never hot, because the hot header is
-		// there to be read without decoding and a sealed value cannot be.
-		if !sealed {
-			if _, isHot := hot[id]; isHot {
-				hots = append(hots, hotPair{id, uint32(nodeOff)})
-			}
+		if _, isHot := hot[id]; isHot {
+			hots = append(hots, hotPair{id, uint32(nodeOff)})
 		}
 	}
 	if !c.ok {
@@ -114,9 +112,9 @@ func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 		c.skip(int(c.uvarint()))
 		return copyFrom()
 	case nEncrypted:
-		c.skip(int(c.uvarint())) // nonce
-		c.skip(int(c.uvarint())) // ciphertext
-		return copyFrom()        // copied unopened; see the note at the top of this file
+		// Refused, not malformed: the plaintext may hold inline names that cannot be rewritten
+		// without opening it. See the note at the top of this file.
+		return false
 	case nAttrRef:
 		c.skip(1) // scope byte
 		c.uvarint()
