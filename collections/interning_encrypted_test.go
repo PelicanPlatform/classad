@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // TestEncryptedInterning is the phase-2 acceptance test: an encryption-at-rest collection now
@@ -357,4 +359,86 @@ func TestEncryptedInterningAppendOnly(t *testing.T) {
 	assertInterned("post-reopen", c2)
 	verify("post-reopen", c2)
 	assertSealedOnDisk("post-reopen")
+}
+
+// TestEncryptedInterningSealedRecordLiteral: a sealed attribute whose value is a record literal. The
+// write path seals the value's plaintext in inline-names form, nested member names included, and
+// compaction used to copy that sealed node unopened into the interned segment, where every reader
+// opens it expecting interned ids. The member name's length was read as an id and its bytes as a
+// node, so the whole record failed to decode: Get missed, and queries and scans skipped every
+// compacted record.
+func TestEncryptedInterningSealedRecordLiteral(t *testing.T) {
+	t.Parallel()
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	_, dataKey := deriveDataKey(t)
+	c, err := Open(Options{
+		Shards: 1, Dir: t.TempDir(), SegmentSize: 1 << 16,
+		DataKey:        dataKey,
+		EncryptedAttrs: []string{"Secret"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	const n = 40
+	for i := 0; i < n; i++ {
+		if err = c.Put([]byte(fmt.Sprintf("k%03d", i)),
+			mustAd(t, fmt.Sprintf(`[Id = %d; Val = %d; Secret = [a = %d; b = "x"]]`, i, i*10, i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, sh := range c.shards {
+		c.compactShard(sh, c.currentCodec())
+	}
+	c.reindexAfterCompaction()
+	interned := 0
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg != nil && seg.dict.Load() != nil {
+				interned++
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	if interned == 0 {
+		t.Fatal("compaction interned no segment; the test never reached the interned read path")
+	}
+
+	secretA, err := classad.ParseExpr("Secret.a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretOK := func(tag string, a *classad.ClassAd) {
+		t.Helper()
+		id, _ := a.EvaluateAttrInt("Id")
+		v := secretA.Eval(a)
+		if got, ierr := v.IntValue(); ierr != nil || got != id {
+			t.Errorf("%s: Secret.a = %v want %d", tag, v, id)
+		}
+	}
+	missing := 0
+	for i := 0; i < n; i++ {
+		if a, ok := c.Get([]byte(fmt.Sprintf("k%03d", i))); ok {
+			secretOK("Get", a)
+		} else {
+			missing++
+		}
+	}
+	queried := 0
+	for a := range c.Query(mustQuery(t, `Val >= 200 && Secret.b == "x"`)) {
+		secretOK("Query", a)
+		queried++
+	}
+	scanned := 0
+	for a := range c.Scan() {
+		secretOK("Scan", a)
+		scanned++
+	}
+	if missing != 0 || queried != n/2 || scanned != n {
+		t.Fatalf("after interning: Get missed %d of %d, Query matched %d of %d, Scan returned %d of %d",
+			missing, n, queried, n/2, scanned, n)
+	}
 }
