@@ -203,6 +203,9 @@ type segment struct {
 	// in the segment is keyed by that dictionary, so reads fail rather than resolve ids through
 	// bytes nothing vouches for (a flipped bit in a name renames that attribute in every ad).
 	dictUnusable atomic.Bool
+	// internSkipCounted is set once interning has counted this segment as skipped for an unusable
+	// dictionary (InternSkippedDictUnusable), so a segment counts once rather than once per pass.
+	internSkipCounted atomic.Bool
 	// damage is the byte ranges of this segment's records known to be damaged (see damage.go), nil
 	// when there are none. Every walk skips them. Set while the segment is opened, before anything
 	// else can see it, and persisted in its sidecar.
