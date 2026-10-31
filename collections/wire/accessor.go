@@ -2,6 +2,7 @@ package wire
 
 import (
 	"encoding/binary"
+	"math"
 
 	"github.com/PelicanPlatform/classad/ast"
 )
@@ -30,7 +31,10 @@ func (c *cursor) skipKey() {
 }
 
 func (c *cursor) uvarint() uint64 {
-	if !c.ok {
+	// pos past the end is reachable: a cursor can be started at an offset read from the ad (a hot
+	// pair), and slicing beyond len would panic.
+	if !c.ok || c.pos > len(c.b) {
+		c.ok = false
 		return 0
 	}
 	v, n := binary.Uvarint(c.b[c.pos:])
@@ -52,8 +56,22 @@ func (c *cursor) byteAt() byte {
 	return v
 }
 
+// id32 reads an interned id. Ids are uint32; a wider uvarint would truncate onto an unrelated real id,
+// so it marks the cursor malformed instead.
+func (c *cursor) id32() uint32 {
+	v := c.uvarint()
+	if v > math.MaxUint32 {
+		c.ok = false
+		return 0
+	}
+	return uint32(v)
+}
+
+// skip advances past n bytes. The bound is checked as n against the bytes remaining, not pos+n against
+// len: n comes from a uvarint on the wire, and a value near MaxInt overflows pos+n negative, which passed
+// the check and moved the cursor before the start of the buffer.
 func (c *cursor) skip(n int) {
-	if !c.ok || n < 0 || c.pos+n > len(c.b) {
+	if !c.ok || n < 0 || n > len(c.b)-c.pos {
 		c.ok = false
 		return
 	}
@@ -100,9 +118,9 @@ func (a Ad) Lookup(id uint32) ([]byte, bool) {
 	var hotOff uint32
 	hotHit := false
 	for i := uint64(0); i < hotCount && c.ok; i++ {
-		hid := c.uvarint()
+		hid := c.id32()
 		off := c.uvarint()
-		if c.ok && uint32(hid) == id {
+		if c.ok && hid == id {
 			hotOff = uint32(off)
 			hotHit = true
 		}
@@ -117,13 +135,13 @@ func (a Ad) Lookup(id uint32) ([]byte, bool) {
 	}
 	// Body: linear scan, skipping non-matching nodes.
 	for i := uint64(0); i < attrCount && c.ok; i++ {
-		aid := c.uvarint()
+		aid := c.id32()
 		start := c.pos
 		skipNode(c, 0)
 		if !c.ok {
 			return nil, false
 		}
-		if uint32(aid) == id {
+		if aid == id {
 			return a[start:c.pos], true
 		}
 	}
@@ -145,13 +163,13 @@ func (a Ad) ForEach(fn func(id uint32, node []byte) bool) bool {
 	}
 	attrCount := c.uvarint()
 	for i := uint64(0); i < attrCount && c.ok; i++ {
-		aid := c.uvarint()
+		aid := c.id32()
 		start := c.pos
 		skipNode(c, 0)
 		if !c.ok {
 			return false
 		}
-		if !fn(uint32(aid), a[start:c.pos]) {
+		if !fn(aid, a[start:c.pos]) {
 			return true
 		}
 	}
@@ -313,7 +331,7 @@ func (a Ad) ForEachIDNode(fn func(id uint32, node []byte) bool) bool {
 	}
 	attrCount := c.uvarint()
 	for i := uint64(0); i < attrCount && c.ok; i++ {
-		aid := c.uvarint()
+		aid := c.id32()
 		if !c.ok {
 			return false
 		}
@@ -322,7 +340,7 @@ func (a Ad) ForEachIDNode(fn func(id uint32, node []byte) bool) bool {
 		if !c.ok {
 			return false
 		}
-		if !fn(uint32(aid), a[nodeStart:c.pos]) {
+		if !fn(aid, a[nodeStart:c.pos]) {
 			return true
 		}
 	}
@@ -333,6 +351,9 @@ func (a Ad) forEachNamed(t *InternTable, redact bool, fn func(name string, node 
 	c, ok := a.bodyStart()
 	if !ok {
 		return false
+	}
+	if !c.inline && t == nil {
+		return false // an interned ad's ids cannot be named without a table
 	}
 	hotCount := c.uvarint()
 	for i := uint64(0); i < hotCount && c.ok; i++ {
@@ -356,18 +377,18 @@ func (a Ad) forEachNamed(t *InternTable, redact bool, fn func(name string, node 
 				continue
 			}
 		} else {
-			aid := c.uvarint()
+			aid := c.id32()
 			if !c.ok {
 				return false
 			}
-			if redact && t.IsPrivate(uint32(aid)) {
+			if redact && t.IsPrivate(aid) {
 				skipNode(c, 0) // private: skip before even resolving the name
 				if !c.ok {
 					return false
 				}
 				continue
 			}
-			n, ok := t.Name(uint32(aid))
+			n, ok := t.Name(aid)
 			if !ok {
 				skipNode(c, 0) // unresolved id: skip its node and continue
 				continue
@@ -436,7 +457,7 @@ func (a Ad) ForEachHotBuf(scratch []uint32, fn func(id uint32, node []byte) bool
 	}
 	scratch = scratch[:0]
 	for i := uint64(0); i < hotCount && c.ok; i++ {
-		scratch = append(scratch, uint32(c.uvarint()), uint32(c.uvarint()))
+		scratch = append(scratch, c.id32(), uint32(c.uvarint()))
 	}
 	c.uvarint() // attrCount
 	if !c.ok {
@@ -464,10 +485,15 @@ func (a Ad) ForEachHot(fn func(id uint32, node []byte) bool) bool {
 	if hotCount == 0 {
 		return c.ok
 	}
+	// Each pair takes at least two bytes, so a count beyond that is malformed -- and is checked
+	// before it sizes an allocation, which a damaged count would otherwise make arbitrarily large.
+	if !c.ok || hotCount > uint64(len(c.b)-c.pos)/2 {
+		return false
+	}
 	ids := make([]uint32, hotCount)
 	offs := make([]uint32, hotCount)
 	for i := uint64(0); i < hotCount && c.ok; i++ {
-		ids[i] = uint32(c.uvarint())
+		ids[i] = c.id32()
 		offs[i] = uint32(c.uvarint())
 	}
 	c.uvarint() // attrCount
@@ -504,7 +530,7 @@ func nodeBytesAt(a Ad, off int) ([]byte, bool) {
 // DecodeNode decodes raw node bytes (as returned by Lookup/ForEach) into an
 // ast.Expr, resolving interned ids via t.
 func DecodeNode(node []byte, t *InternTable) (ast.Expr, error) {
-	d := &decoder{b: node, resolve: t.Name}
+	d := &decoder{b: node, resolve: tableResolver(t)}
 	return d.node(0)
 }
 
@@ -585,11 +611,12 @@ func (a Ad) LookupByName(name string) ([]byte, bool) {
 // readNameBytes reads an inline name (uvarint len + bytes) as a subslice of the
 // cursor's buffer (no allocation).
 func (c *cursor) readNameBytes() []byte {
-	n := int(c.uvarint())
-	if !c.ok || n < 0 || c.pos+n > len(c.b) {
+	l := c.uvarint()
+	if !c.ok || l > uint64(len(c.b)-c.pos) { // against the bytes remaining: pos+l can overflow
 		c.ok = false
 		return nil
 	}
+	n := int(l)
 	b := c.b[c.pos : c.pos+n]
 	c.pos += n
 	return b
@@ -813,7 +840,7 @@ func (a Ad) ForEachRaw(fn func(id uint32, name string, node []byte) bool) bool {
 	}
 	attrCount := c.uvarint()
 	for i := uint64(0); i < attrCount && c.ok; i++ {
-		var id uint64
+		var id uint32
 		var name string
 		if inline {
 			n := c.uvarint()
@@ -824,14 +851,14 @@ func (a Ad) ForEachRaw(fn func(id uint32, name string, node []byte) bool) bool {
 			}
 			name = string(a[start:c.pos])
 		} else {
-			id = c.uvarint()
+			id = c.id32()
 		}
 		start := c.pos
 		skipNode(c, 0)
 		if !c.ok {
 			return false
 		}
-		if !fn(uint32(id), name, a[start:c.pos]) {
+		if !fn(id, name, a[start:c.pos]) {
 			return true
 		}
 	}

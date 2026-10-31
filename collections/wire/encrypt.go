@@ -51,17 +51,12 @@ func OpenEncryptedNode(node []byte, open Sealer) ([]byte, bool) {
 		return nil, false
 	}
 	c := &cursor{b: node, pos: 1, ok: true}
-	nl := int(c.uvarint())
-	if !c.ok || c.pos+nl > len(node) {
+	nonce := c.readNameBytes() // the same uvarint-length-prefixed bytes, bounds-checked
+	ct := c.readNameBytes()
+	if !c.ok {
 		return nil, false
 	}
-	nonce := node[c.pos : c.pos+nl]
-	c.pos += nl
-	cl := int(c.uvarint())
-	if !c.ok || c.pos+cl > len(node) {
-		return nil, false
-	}
-	plain, err := open.Open(nonce, node[c.pos:c.pos+cl])
+	plain, err := open.Open(nonce, ct)
 	if err != nil {
 		return nil, false
 	}

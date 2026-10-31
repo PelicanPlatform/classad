@@ -73,9 +73,9 @@ func refNode(c *cursor, depth int, dst []uint32) []uint32 {
 		c.skip(int(c.uvarint()))
 	case nAttrRef:
 		scope := c.byteAt()
-		id := c.uvarint()
+		id := c.id32()
 		if c.ok && (ast.AttributeScope(scope) == ast.NoScope || ast.AttributeScope(scope) == ast.MyScope) {
-			dst = append(dst, uint32(id))
+			dst = append(dst, id)
 		}
 	case nAttrRefStr:
 		c.skip(1)                // scope byte
@@ -311,9 +311,9 @@ func refsExact(c *cursor, depth int, r *NodeRefs, isEval func(uint32) bool) bool
 		c.skip(int(c.uvarint()))
 	case nAttrRef:
 		scope := c.byteAt()
-		id := c.uvarint()
+		id := c.id32()
 		if c.ok && (ast.AttributeScope(scope) == ast.NoScope || ast.AttributeScope(scope) == ast.MyScope) {
-			r.IDs = append(r.IDs, uint32(id))
+			r.IDs = append(r.IDs, id)
 		}
 	case nAttrRefStr:
 		scope := c.byteAt()
@@ -361,8 +361,8 @@ func refsExact(c *cursor, depth int, r *NodeRefs, isEval func(uint32) bool) bool
 		}
 	case nFunc, nFuncStr:
 		if tag == nFunc {
-			id := c.uvarint()
-			if isEval != nil && isEval(uint32(id)) {
+			id := c.id32()
+			if isEval != nil && isEval(id) {
 				return false
 			}
 		} else {
