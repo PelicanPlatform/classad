@@ -253,6 +253,7 @@ func TestGroupColumnsSurviveRestart(t *testing.T) {
 // test that the naming works: without it, a type-exception value on an attribute whose id moves reads
 // as undefined after a restart, exactly as it did for interned segments.
 func TestNonInternedColumnarSurvivesRestart(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	open := func() *Collection {
 		// Not append-only and no interning at seal, so the sealed segments stay inline.

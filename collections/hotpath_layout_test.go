@@ -300,6 +300,7 @@ func TestGroupAccumHotFieldOffsets(t *testing.T) {
 // interval table -- a method on *groupAccum opening with `m := &a.g2` -- is exactly the local that
 // crossed it.
 func TestGroupMemoPathsInline(t *testing.T) {
+	t.Parallel()
 	if testing.Short() {
 		t.Skip("compiles the package")
 	}

@@ -211,6 +211,7 @@ func TestStreamingIngestSealsPerAd(t *testing.T) {
 // stated contract and not what the code does -- the parallel QUERY path already opens sealed values from
 // its workers. Run under -race in CI, this is also the check that the claim was wrong.
 func TestParallelWireScanOverEncrypted(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -263,6 +264,7 @@ func TestParallelWireScanOverEncrypted(t *testing.T) {
 // columnarized (else it proves nothing), every ad still reads back with its sealed value (the exception
 // survived the rewrite), and no file on disk carries the plaintext.
 func TestColumnarNativeOverEncryptedStoresNoPlaintext(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

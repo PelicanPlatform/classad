@@ -155,6 +155,7 @@ func TestColumnarizedHeldExpressionsAreNotUndefined(t *testing.T) {
 // segment, and any segment without a block -- meets expressions too. Comparing or aggregating one needs
 // evaluating it, so it must give the query back rather than skip the record as if the value were absent.
 func TestColumnPathsDeclineOnRowExpressions(t *testing.T) {
+	t.Parallel()
 	c := heldFixture(t)
 	defer c.Close()
 	// Weight is expression-free so far; these land in the open segment, which has no block.

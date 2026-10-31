@@ -13,6 +13,7 @@ import (
 // nodes). Reads decrypt correctly over the interned+encrypted segments (before and after a
 // reopen), and the secret value never appears in plaintext in any segment file.
 func TestEncryptedInterning(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -165,6 +166,7 @@ func TestEncryptedInterning(t *testing.T) {
 // mix -- decodeAdDict routes each segment by seg.dict (nil -> DecodeInlineEnc, non-nil ->
 // DecodeResolveEnc) -- and recovery must restore that same mix (dict only for the interned ones).
 func TestEncryptedInterningMixed(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -255,6 +257,7 @@ func TestEncryptedInterningMixed(t *testing.T) {
 // TestEncryptedInterningAppendOnly is the append-only (archive) analog: an encrypted append-only
 // collection interns its segments at reseal (RetrainDict), sealing values, and reads decrypt.
 func TestEncryptedInterningAppendOnly(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

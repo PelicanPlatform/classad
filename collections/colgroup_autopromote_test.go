@@ -69,6 +69,7 @@ func sealedColumnarized(c *Collection) map[*segment]*colSegment {
 // Without the fix st.groups is frozen at its (empty) first-enable value forever, so the loop below
 // never sees a nonempty set and the test fails.
 func TestGroupSchemasAutoPromoteOnRefresh(t *testing.T) {
+	t.Parallel()
 	c := autoPromoteFixture(t, 0) // default columnar budget
 	defer c.Close()
 
@@ -121,6 +122,7 @@ func TestGroupSchemasAutoPromoteOnRefresh(t *testing.T) {
 // attributes each secondary schema holds without the DAEMON fresh-sample derivation. Without the
 // fix info.Groups is nil while info.GroupSchemas > 0.
 func TestSchemaScanInfoReportsCommittedGroupFields(t *testing.T) {
+	t.Parallel()
 	c := autoPromoteFixture(t, 0)
 	defer c.Close()
 
@@ -176,6 +178,7 @@ func TestSchemaScanInfoReportsCommittedGroupFields(t *testing.T) {
 // applied to segments that were columnarized BEFORE the group set qualified. Their columnar payload
 // must gain the group columns, within a bounded number of passes.
 func TestGroupSchemasAppliedToColumnarizedSegments(t *testing.T) {
+	t.Parallel()
 	c := autoPromoteFixture(t, 0)
 	defer c.Close()
 

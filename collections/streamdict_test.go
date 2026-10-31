@@ -24,6 +24,7 @@ import (
 // appear in records), and do little for column-major integers. This measures that rather than
 // assuming it, since a dictionary that does not fit a region is wasted work on every compress.
 func TestStreamDictionaryFit(t *testing.T) {
+	t.Parallel()
 	// A fixture that populates ALL THREE regions: many numeric attributes but few hot slots (so
 	// most are cold), several string attributes, and values that escape their fitted width.
 	c := New(Options{Shards: 1, SegmentSize: 1 << 14})

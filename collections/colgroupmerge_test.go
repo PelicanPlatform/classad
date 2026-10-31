@@ -104,6 +104,7 @@ func TestGroupMergeRespectsPartialCeiling(t *testing.T) {
 // TestGroupMergeKeepsAnswers: with relaxed groups the partial records read their group attributes
 // from the base block's cold tail. The answers must not move.
 func TestGroupMergeKeepsAnswers(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14,
 		GroupSchemaCount: 4, GroupStabilityRuns: 1,

@@ -114,6 +114,7 @@ var statsCases = []struct{ where, attr string }{
 // TestStatsMultiFieldMatchesReference is the equivalence gate, field by field so a promotion bug
 // cannot hide behind a matching Sum.
 func TestStatsMultiFieldMatchesReference(t *testing.T) {
+	t.Parallel()
 	c := statsFixture(t, 5000)
 	defer c.Close()
 	for _, tc := range statsCases {
@@ -155,6 +156,7 @@ func TestStatsMultiFieldMatchesReference(t *testing.T) {
 // TestStatsMultiFieldSeesEscapedExtremes is the case a column-only read would get wrong: the true MAX
 // is a value too wide for its slot, so it lives in the cold tail and is absent from the column.
 func TestStatsMultiFieldSeesEscapedExtremes(t *testing.T) {
+	t.Parallel()
 	c := statsFixture(t, 5000)
 	defer c.Close()
 	got, served := c.NumStatsQuery(nil, "ProcId")
@@ -184,6 +186,7 @@ func TestStatsMultiFieldSeesEscapedExtremes(t *testing.T) {
 // TestStatsMultiFieldMVCC checks supersession: an update that changes the aggregated value must move
 // the answer, and the old version must not contribute.
 func TestStatsMultiFieldMVCC(t *testing.T) {
+	t.Parallel()
 	c := statsFixture(t, 3000)
 	defer c.Close()
 	for i := 0; i < 200; i++ {

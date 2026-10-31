@@ -38,6 +38,7 @@ func TestDiffGroupSetsMagnitude(t *testing.T) {
 // a reason, and GroupSchemaDrift's committed-change count agrees. This is the churn a reader can act
 // on -- as opposed to the derivation-snapshot count, which is sampler wobble.
 func TestGroupSchemaChangeLogRecordsCommittedChurn(t *testing.T) {
+	t.Parallel()
 	c := autoPromoteFixture(t, 0)
 	defer c.Close()
 

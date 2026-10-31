@@ -43,6 +43,7 @@ func dictFixture(t *testing.T, n int) *Collection {
 // TestRegionSamplesShape checks the sampler does what it claims: equal-ish shares across the three
 // region kinds, drawn from block regions rather than records.
 func TestRegionSamplesShape(t *testing.T) {
+	t.Parallel()
 	c := dictFixture(t, 4000)
 	defer c.Close()
 
@@ -71,6 +72,7 @@ func TestRegionSamplesShape(t *testing.T) {
 // TestRegionSamplesLookBack checks the recency bias: a look-back budget must restrict the draw to
 // recent segments, which is what future writes resemble.
 func TestRegionSamplesLookBack(t *testing.T) {
+	t.Parallel()
 	c := dictFixture(t, 6000)
 	defer c.Close()
 
@@ -104,6 +106,7 @@ func TestRegionSamplesLookBack(t *testing.T) {
 // dictionary has less to add. Since ONE codec compresses both, the trade has to be netted -- see
 // TestDictStrategyNetBytes, which does that on held-out data and finds ad training ahead.
 func TestDictStrategies(t *testing.T) {
+	t.Parallel()
 	c := dictFixture(t, 4000)
 	defer c.Close()
 

@@ -296,6 +296,7 @@ func TestDeltaRemoveAndSetTogether(t *testing.T) {
 // runs, so this must read back intact -- and it must do so for MANY keys, because a single-key
 // test would pass on a store where compaction simply had nothing to reclaim.
 func TestDeltaSurvivesCompaction(t *testing.T) {
+	t.Parallel()
 	c, _ := openDelta(t, 8)
 	defer c.Close()
 	const n = 1200
@@ -436,6 +437,7 @@ func TestPatchAttrsReadYourWrites(t *testing.T) {
 // The test asserts the contents are unchanged across columnarization; if that is not yet true it
 // is a blocker, and this is the reproduction.
 func TestDeltaVsColumnarization(t *testing.T) {
+	t.Parallel()
 	c, _ := openDelta(t, 8)
 	defer c.Close()
 	const n = 2000
@@ -804,6 +806,7 @@ func TestNoLiveDeltaOutsideActiveSegment(t *testing.T) {
 // corruption written back to disk, which no amount of replay can undo. Reproduced at 40 of 40
 // keys truncated from 45 attributes to 5.
 func TestDeltaSurvivesRetrainDict(t *testing.T) {
+	t.Parallel()
 	c, _ := openDelta(t, 16)
 	defer c.Close()
 	// Enough records, with string content, for the dictionary trainer to accept the corpus --

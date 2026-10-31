@@ -75,6 +75,7 @@ func stripZones(c *Collection) int {
 
 // TestZonePruningPreservesAnswers is the correctness gate: pruning must not change any answer.
 func TestZonePruningPreservesAnswers(t *testing.T) {
+	t.Parallel()
 	queries := []string{
 		"ClusterId < 100",                         // only the earliest blocks
 		"ClusterId > 3900",                        // only the latest
@@ -131,6 +132,7 @@ func TestZonePruningPreservesAnswers(t *testing.T) {
 // its slot lives in the cold tail, so the column's [min,max] does not describe it -- pruning on that
 // range would drop a record that matches.
 func TestZonePruningRespectsEscapedValues(t *testing.T) {
+	t.Parallel()
 	const n = 4000
 	// The wide record sits early, so its block's COLUMN range is roughly [0,128) while the record
 	// itself holds 2^40. A query for the wide value must still find it.
@@ -187,6 +189,7 @@ func TestZonePruningRespectsEscapedValues(t *testing.T) {
 // TestZonesSurviveReopen covers persistence: zones are a performance property, so losing them on
 // reload would be silent.
 func TestZonesSurviveReopen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16})
 	if err != nil {

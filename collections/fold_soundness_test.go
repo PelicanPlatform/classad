@@ -13,6 +13,7 @@ import (
 // probe the count was then served from. A presence probe beside a conjunct that is not a
 // probe (`ClusterId > Owner`) is not the whole query either.
 func TestCountQueryLeftBiasedLogic(t *testing.T) {
+	t.Parallel()
 	c := presenceFixture(t, 4000)
 	defer c.Close()
 	for _, expr := range []string{

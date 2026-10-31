@@ -12,6 +12,7 @@ import "testing"
 // path: measured on 20k real job ads, 266ms against 93ms for a three-attribute projection.
 // RecordsClosureReassembled is the counter that tells the two apart.
 func TestClosureKeepsTheColumnarPathForLiterals(t *testing.T) {
+	t.Parallel()
 	c, _ := refFixture(t, 20000, true)
 	q := mustParseQ(t, "ProcId < 4")
 

@@ -151,6 +151,7 @@ func rawAdMap(t *testing.T, ra RawAd) map[string]string {
 // comparing the new path against the old whole-ad wire read would only show that both ship
 // enough bytes, not that the closure is right.
 func TestQueryRawWireRefsMatchesTextPath(t *testing.T) {
+	t.Parallel()
 	for _, columnar := range []bool{false, true} {
 		name := "interned+inline"
 		if columnar {
@@ -218,6 +219,7 @@ func TestQueryRawWireRefsMatchesTextPath(t *testing.T) {
 // ResidentSetSize, which Requirements never mentions. A closure that made a single pass would
 // return the first and miss the second, and every assertion above would still pass.
 func TestQueryRawWireRefsClosureIsPerRecord(t *testing.T) {
+	t.Parallel()
 	c, _ := refFixture(t, 2000, true)
 	proj := []string{"ClusterId", "Requirements"}
 	literal, expression := 0, 0

@@ -233,6 +233,7 @@ func archiveCount(t *testing.T, a *Archive, expr string) int {
 // every sealed segment covering the attribute, and that coverage must survive a reopen
 // without being rebuilt.
 func TestReindexAllCoversSegmentsOutsideHorizon(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -287,6 +288,7 @@ func TestReindexAllCoversSegmentsOutsideHorizon(t *testing.T) {
 // its byte budget's worth of segments, always the newest uncovered ones, and repeated passes
 // cover the whole archive.
 func TestBackfillIndexesBudgetNewestFirst(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -349,6 +351,7 @@ func TestBackfillIndexesBudgetNewestFirst(t *testing.T) {
 // TestBackfillIndexesResumesAfterRestart stops a backfill midway: the segments it finished
 // must stay finished across a reopen, so the next pass starts where the last one stopped.
 func TestBackfillIndexesResumesAfterRestart(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -469,6 +472,7 @@ func TestBackfillIndexesConcurrentQueriesAndAppends(t *testing.T) {
 // which does nothing once a key index exists -- so the index stayed on the heap for the life
 // of the process and was rebuilt from every record on every open.
 func TestReindexPersistsIndexOverKeyOnlySidecar(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

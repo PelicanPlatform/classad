@@ -18,6 +18,7 @@ import (
 // dictionaries, because dictWorthwhile needs distinct*2 <= records in the block and their
 // `user(i%512)` values over ~378-record row groups never clear it.
 func TestAggFuzzFixtureBuildsStringDictionaries(t *testing.T) {
+	t.Parallel()
 	for _, shape := range gen.Shapes() {
 		a, err := OpenArchive(ArchiveOptions{
 			Dir:              t.TempDir(),
