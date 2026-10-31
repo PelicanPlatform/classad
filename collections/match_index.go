@@ -4,7 +4,6 @@ import (
 	"math"
 	"sort"
 	"strings"
-	"sync"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -982,11 +981,10 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 
 	perWorker := make([][]rankedMatch, W)
 	var next int64
-	var wg sync.WaitGroup
+	var wg workerGroup
 	for i := 0; i < W; i++ {
-		wg.Add(1)
-		go func(wi int) {
-			defer wg.Done()
+		wg.Go(func() {
+			wi := i
 			jobCopy, _ := classad.Parse(jobText) // validated above
 			mw := newMatchWorker(jobCopy, c, jp, deferMat)
 			var local []rankedMatch
@@ -1001,9 +999,10 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 				})
 			}
 			perWorker[wi] = local
-		}(i)
+		})
 	}
 	wg.Wait()
+	wg.rethrow()
 	var out []rankedMatch
 	for _, lw := range perWorker {
 		out = append(out, lw...)

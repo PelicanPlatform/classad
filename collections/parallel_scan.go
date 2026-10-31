@@ -1,7 +1,6 @@
 package collections
 
 import (
-	"sync"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -199,11 +198,10 @@ func (c *Collection) runParallelQuery(qp queryPlan, yield func(*classad.ClassAd)
 	results := make(chan []*classad.ClassAd, W)
 	var next int64
 	var stopped atomic.Bool
-	var wg sync.WaitGroup
+	wg := workerGroup{stop: &stopped}
 	for i := 0; i < W; i++ {
-		wg.Add(1)
-		go func(wi int) {
-			defer wg.Done()
+		wg.Go(func() {
+			wi := i
 			wqp := c.workerPlan(qp)
 			if workerStats != nil {
 				wqp.stats = &workerStats[wi]
@@ -246,9 +244,14 @@ func (c *Collection) runParallelQuery(qp queryPlan, yield func(*classad.ClassAd)
 				visit, _ := c.refVisitorState(&st, tasks[idx].s0, wqp, emit)
 				forEachVisibleWindowRef(tasks[idx].s0, tasks[idx].win, visit)
 			}
-		}(i)
+		})
 	}
 	go func() { wg.Wait(); close(results) }()
+	// Deferred in this order so the drain runs first: a worker's panic is re-raised here only once
+	// every worker has returned, and a panic in yield still stops and waits for them before release()
+	// unpins what they read.
+	defer wg.rethrow()
+	defer stopAndDrain(&stopped, results)
 
 	// Consumer: always drain to close (so a blocked worker send unblocks and every
 	// worker exits before release() unpins), but stop yielding once asked to stop.

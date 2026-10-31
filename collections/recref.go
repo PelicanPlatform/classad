@@ -133,13 +133,27 @@ func (c *Collection) wireAtUncounted(r recRef, s0 uint64, buf []byte) ([]byte, e
 	key := r.key()
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	sh.mu.RLock()
-	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, buf[:0])
-	sh.mu.RUnlock()
+	merged, ok := sh.materializeLocked(c, key, h, s0, buf[:0])
 	if !ok {
 		return nil, errDeltaUnresolved // a fragment we cannot complete: skip, never serve half an ad
 	}
 	return merged, nil
+}
+
+// materializeLocked merges key's delta chain at s0 into wire form under the shard's read lock.
+//
+// The release is deferred, not written after the call: the merge decompresses and decodes records
+// read from disk, and a read that panics in it is failed alone by a server that recovers it. A lock
+// left held then would stop the next commit on this shard -- and, since a waiting writer blocks new
+// readers, every later read of the table with it.
+func (sh *shard) materializeLocked(c *Collection, key []byte, h, s0 uint64, dst []byte) ([]byte, bool) {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	if lockedReadHook != nil {
+		lockedReadHook("materialize")
+	}
+	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, dst)
+	return merged, ok
 }
 
 // errDeltaUnresolved is a delta record whose chain could not be merged into a whole ad.
@@ -352,9 +366,7 @@ func (c *Collection) adBytesErr(r recRef, s0 uint64, scratch *[]byte) ([]byte, C
 	key := r.key()
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	sh.mu.RLock()
-	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, (*scratch)[:0])
-	sh.mu.RUnlock()
+	merged, ok := sh.materializeLocked(c, key, h, s0, (*scratch)[:0])
 	if !ok {
 		return nil, nil, errDeltaUnresolved
 	}
