@@ -692,6 +692,12 @@ func unmarshalColSegment(data []byte, codec Codec, internName func(string) uint3
 			}
 			g.blocks = append(g.blocks, gb)
 		}
+		if remap != nil {
+			// The group blocks' cold tails are keyed by the same writer's ids as the base blocks', and
+			// the section's names cover both; without the translation a group value that escaped to the
+			// tail is looked up by this process's id and reads as absent, or as another attribute.
+			setGroupRemap(g.blocks, remap)
+		}
 		cs.groups = append(cs.groups, g)
 	}
 	if c.err != nil {
