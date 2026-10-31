@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Run one shard of the collections module's tests, under the race detector.
 #
-# WHY SHARD AT ALL: every test in this module is `package collections` -- 270 test files, all of them
+# WHY SHARD AT ALL: every test in this module is `package collections` -- 360 test files, all of them
 # reaching into package internals -- so there is exactly ONE test binary, and `go test -p` (which
-# parallelizes across PACKAGES) has nothing to work with. Only a fifth of the test files use
-# t.Parallel(), so the suite is mostly serial: ~55 minutes of CI-runner time under -race, which no
-# single job can fit under the 25m timeout. Sharding by test name across N jobs buys the cores a single
-# runner does not have, without skipping the race detector or dropping a single test.
+# parallelizes across PACKAGES) has nothing to work with. The suite is ~55 minutes of CI-runner time
+# under -race, which no single job can fit under the 25m timeout. Sharding by test name across N jobs
+# buys the cores a single runner does not have, without skipping the race detector or dropping a
+# single test.
+#
+# 388 top-level tests now call t.Parallel(), covering 71% of the time this table records, so a shard
+# also overlaps work within itself. What is left serial is mostly tests that touch the package's
+# process-global state -- the test hooks, the counters tests assert deltas on, the process-global
+# block-cache budgets -- which cannot be made parallel without moving that state.
 #
 # WHY NOT SUBMODULES: moving the heavy tests into a sub-package would let -p parallelize them, but every
 # one of the heavy test files uses 3-24 unexported identifiers from the package (segWindow, colSegment,
@@ -32,6 +37,13 @@
 # Usage: SHARD=<0-based index> SHARDS=<count> ./shard-test.sh [extra go test flags...]
 #        SHARD_LIST_ONLY=1 ... prints the partition and exits without running anything.
 #        SHARD_BUDGET=<seconds> overrides the per-shard budget the warnings compare against.
+#
+# A WARNING ABOUT REFRESHING shard-durations.txt: `go test -v` reports a parallel test's WALL time,
+# which includes everything that overlapped it. Refreshing the table from a run of a suite that is
+# 71% parallel therefore records far more time than those tests cost, and the packing estimate
+# climbs past SHARD_BUDGET even as real wall-clock falls. Read a refreshed estimate as a RELATIVE
+# weight for packing, not as seconds a shard will take, and compare the budget against the elapsed
+# time the script prints at the end of a real run instead.
 #
 # Bash 3.2 compatible (macOS ships 3.2): no mapfile, no associative arrays.
 set -euo pipefail
