@@ -184,7 +184,22 @@ func (r *seqRun) advance(s0, minSeq uint64) {
 // reports false while a match remains.
 //
 // limit <= 0 means no limit, in which case More is always false.
+//
+// It is an ENTITLED read: private attributes are kept and sealed values are opened. A caller
+// serving anyone not entitled to them uses QueryRawFromSeqRedacted.
 func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after SeqCursor, limit int) (iter.Seq[RawAd], *SeqPage) {
+	return c.queryRawFromSeq(q, projection, after, limit, false)
+}
+
+// QueryRawFromSeqRedacted is QueryRawFromSeq for a caller not entitled to secrets, redacted as
+// QueryRawProjected redacts: private attributes are dropped, and the read holds no key, so a sealed
+// value renders as undefined. The pages and cursors are the ones QueryRawFromSeq gives; only what a
+// row carries differs.
+func (c *Collection) QueryRawFromSeqRedacted(q *vm.Query, projection []string, after SeqCursor, limit int) (iter.Seq[RawAd], *SeqPage) {
+	return c.queryRawFromSeq(q, projection, after, limit, true)
+}
+
+func (c *Collection) queryRawFromSeq(q *vm.Query, projection []string, after SeqCursor, limit int, redact bool) (iter.Seq[RawAd], *SeqPage) {
 	page := &SeqPage{Next: after}
 
 	return func(yield func(RawAd) bool) {
@@ -209,7 +224,7 @@ func (c *Collection) QueryRawFromSeq(q *vm.Query, projection []string, after Seq
 		// Same in-walk projection as QueryRawProjected: an empty projection
 		// means the whole ad, so a caller asking for four attributes does not
 		// pay to render the rest.
-		render := c.yieldRawProjected(yield, c.newRawProjector(projection, false, false))
+		render := c.yieldRawProjected(yield, c.newRawProjector(projection, false, redact))
 
 		if unsatisfiable(rp.usable) || (rp.disjunctive() && unsatisfiableGroups(rp.groups)) {
 			// The constraint's indexed conjuncts contradict each other (in every

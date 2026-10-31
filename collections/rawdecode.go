@@ -80,9 +80,12 @@ func (c *Collection) yieldRaw(yield func(RawAd) bool, redact bool) scanEmit {
 	var offs []int
 	var exprs [][]byte
 	return func(w []byte, dict *segDictHandle) bool {
-		// A redacted read holds no key: sealed values decode to undefined rather than being opened
-		// and re-sealed, so the secret is never materialized in this process at all.
-		w, ok := c.wireToInline(dict, w) // interned segment -> inline for the mode-aware renderer
+		// An interned segment's record goes to inline names for the mode-aware renderer. A redacted
+		// read converts it with no key, so a sealed value becomes undefined and is never opened. Not
+		// wireToInline: that opens every sealed value and re-seals only the attributes the CURRENT
+		// policy names, so a value sealed under an earlier EncryptedAttrs would reach the renderer in
+		// the clear and be rendered for a reader not entitled to it.
+		w, ok := c.wireToInlineRead(dict, w, redact)
 		if !ok {
 			return true // undecodable against its dict: skip, keep scanning
 		}

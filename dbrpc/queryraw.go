@@ -413,7 +413,18 @@ func (s *Server) streamQueryRawProjectSeq(ctx context.Context, reqID uint64, r *
 	}
 	d := ref.db
 
-	seq, page, err := d.QueryRawProjectedFromSeq(constraint, attrs, after, limit)
+	// Redacted exactly as the unpaged projection op is: an unprivileged peer gets no private
+	// attribute and no sealed value, and the read that serves it holds no key.
+	var (
+		seq  iter.Seq[collections.RawAd]
+		page *collections.SeqPage
+		err  error
+	)
+	if includePrivate {
+		seq, page, err = d.QueryRawProjectedFromSeq(constraint, attrs, after, limit)
+	} else {
+		seq, page, err = d.QueryRawProjectedFromSeqRedacted(constraint, attrs, after, limit)
+	}
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
