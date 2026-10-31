@@ -36,6 +36,11 @@ type heldIndex struct {
 	once sync.Once
 	ok   bool                // false: the remnants could not be read, so nothing may be assumed absent
 	recs map[uint32][]uint32 // global attribute id -> ascending segment record indices holding it
+
+	// uncomputed caches, per (block's first record, field index), how many of the block's held cells
+	// of that field have no computed value -- the per-record exception budget (heldValueNode).
+	excMu      sync.Mutex
+	uncomputed map[[2]int]int
 }
 
 // heldIndexBuilds counts remnant passes, so a test can see the index is built once per segment.
@@ -131,6 +136,20 @@ func (b *columnarBlock) heldAt(k int, id uint32) bool {
 	if len(list) == 0 {
 		return false
 	}
+	want := uint32(b.segBase + k)
+	i := sort.Search(len(list), func(i int) bool { return list[i] >= want })
+	return i < len(list) && list[i] == want
+}
+
+// heldKnown is heldAt without the benefit of the doubt: true only when the index is readable and
+// lists record k as holding field id. A caller that SKIPS work on true uses this; a caller that
+// declines on true uses heldAt.
+func (b *columnarBlock) heldKnown(k int, id uint32) bool {
+	h := b.native.held()
+	if h == nil || !h.ok {
+		return false
+	}
+	list := h.recs[id]
 	want := uint32(b.segBase + k)
 	i := sort.Search(len(list), func(i int) bool { return list[i] >= want })
 	return i < len(list) && list[i] == want

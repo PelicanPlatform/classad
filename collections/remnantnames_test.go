@@ -60,8 +60,8 @@ func checkCounts(t *testing.T, label string, f *reviewFixture, expr string) int6
 
 // TestReopenAbsentAttributeNoFallback: after a restart, an attribute no record holds -- a typo, or one
 // only another table uses -- is answered exactly by the column readers, with no record handed to the
-// ordinary evaluator; so is a non-schema attribute in the cold tail; and an expression attribute that
-// lives only in remnants is still counted in full.
+// ordinary evaluator; so is a non-schema attribute in the cold tail; an expression attribute that
+// lives only in remnants is still counted in full; and one the columns computed needs no record.
 func TestReopenAbsentAttributeNoFallback(t *testing.T) {
 	f := newReviewFixture(t, 3000, false, false)
 	if !f.c.BuildAndEnableSchemaScan(4096, 8) {
@@ -76,8 +76,12 @@ func TestReopenAbsentAttributeNoFallback(t *testing.T) {
 			t.Errorf("%q: %d records fell back to the ordinary evaluator, want 0", expr, fb)
 		}
 	}
-	if fb := checkCounts(t, "after reopen", f, "MemoryUsage > 1"); fb == 0 {
-		t.Error("MemoryUsage is an expression and must be evaluated per record; nothing fell back")
+	if fb := checkCounts(t, "after reopen", f, "MatchMemory > 1 || MatchMemory is undefined"); fb == 0 {
+		t.Error("MatchMemory is an expression only its record can evaluate; nothing fell back")
+	}
+	// An expression every record computes when its segment is columnarized is read from the columns.
+	if fb := checkCounts(t, "after reopen", f, "MemoryUsage > 1"); fb != 0 {
+		t.Errorf("MemoryUsage is computed in the columns, yet %d records fell back", fb)
 	}
 }
 
@@ -152,6 +156,15 @@ func TestRemnantTrailerIsInvisibleToOlderParsers(t *testing.T) {
 			cs := unmarshalColSegment(body, f.c.regionCodec(), f.c.intern.Intern)
 			if cs == nil || cs.remnants == nil {
 				t.Fatal("payload without a remnant list")
+			}
+			// The computed-value trailer, when there is one, follows the remnant list; both sit after
+			// everything an older parser reads.
+			if cs.hasComputed() {
+				comp := appendComputedTrailer(nil, cs.blocks)
+				if !bytes.HasSuffix(body, comp) {
+					t.Fatal("the computed trailer is not the payload's last bytes")
+				}
+				body = body[:len(body)-len(comp)]
 			}
 			trailer := appendRemnantTrailer(nil, cs.remnants.names)
 			if !bytes.HasSuffix(body, trailer) {

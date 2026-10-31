@@ -172,8 +172,10 @@ func TestArchiveGroupedStringColumnEdgeGroups(t *testing.T) {
 }
 
 // TestArchiveGroupedStringColumnDeclinesExpressions is the inverse pin: a group value that only
-// evaluation can produce has to give the query back, because the scan makes a group out of it and a
-// column read cannot. Serving it would return a result with groups silently missing.
+// evaluation at query time can produce -- here one that reads the clock -- has to give the query back,
+// because the scan makes a group out of it and a column read cannot. Serving it would return a result
+// with groups silently missing. (An expression over the record alone is computed when its segment is
+// columnarized, and is served; see TestComputedValuesMatchBruteForce.)
 func TestArchiveGroupedStringColumnDeclinesExpressions(t *testing.T) {
 	cat, err := OpenCatalogConfig(CatalogConfig{Dir: t.TempDir()})
 	if err != nil {
@@ -188,7 +190,7 @@ func TestArchiveGroupedStringColumnDeclinesExpressions(t *testing.T) {
 		src := fmt.Sprintf("ClusterId = %d\nRequestMemory = %d\nCmd = \"/home/user%d/run.sh\"\n",
 			i, 1024+(i%32)*512, i%500)
 		if i%97 == 3 {
-			src += "Owner = strcat(\"user\", ClusterId % 7)\n"
+			src += "Owner = strcat(\"user\", ClusterId % 7, substr(string(time()), 0, 0))\n"
 		} else {
 			src += fmt.Sprintf("Owner = \"user%d\"\n", i%500)
 		}

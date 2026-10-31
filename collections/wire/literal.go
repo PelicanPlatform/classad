@@ -51,6 +51,9 @@ func StringLiteralValue(node []byte) ([]byte, bool) {
 // caller reconstruct a wire node from a typed value (e.g. the per-segment schema decoder
 // rebuilding a node from a fixed-layout field), producing bytes LiteralValue reads back
 // exactly.
+// AppendUndefinedNode appends the UNDEFINED literal node.
+func AppendUndefinedNode(dst []byte) []byte { return append(dst, nUndefined) }
+
 func AppendBoolNode(dst []byte, b bool) []byte {
 	if b {
 		return append(dst, nBoolTrue)

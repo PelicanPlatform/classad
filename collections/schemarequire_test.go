@@ -165,7 +165,7 @@ func TestSchemaRequireSetTiers(t *testing.T) {
 func TestSchemaRequireDrivesDerivation(t *testing.T) {
 	c := New(Options{Shards: 1, SegmentSize: 1 << 16})
 	for i := 0; i < 400; i++ {
-		src := fmt.Sprintf("Cpus = %d\nUsage = (Cpus * 2)\n", 1+i%8)
+		src := fmt.Sprintf("Cpus = %d\nUsage = (TARGET.Cpus * 2)\nDoubled = (Cpus * 2)\n", 1+i%8)
 		if i%10 == 0 {
 			src += fmt.Sprintf("Rss = %d\n", 100+i%50)
 		}
@@ -183,13 +183,20 @@ func TestSchemaRequireDrivesDerivation(t *testing.T) {
 	}
 	info := c.SchemaScanInfo()
 	var rss *SchemaScanField
+	doubled := false
 	for i := range info.Schema {
 		if info.Schema[i].Name == "Rss" {
 			rss = &info.Schema[i]
 		}
 		if info.Schema[i].Name == "Usage" {
-			t.Error("expression-valued Usage became a schema field")
+			t.Error("Usage, an expression no record can compute, became a schema field")
 		}
+		if info.Schema[i].Name == "Doubled" {
+			doubled = true
+		}
+	}
+	if !doubled {
+		t.Error("Doubled, an expression every record computes, is not a schema field")
 	}
 	if rss == nil {
 		t.Fatal("required Rss is not in the derived schema")

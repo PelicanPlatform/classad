@@ -318,13 +318,25 @@ func (c *groupCol) positionalStrAt(k int) (string, bool) {
 // escapedGroupComp reads the group component of a record whose column slot does not hold it: the
 // value is in the block's cold tail, or the record has no such attribute at all.
 func escapedGroupComp(b *columnarBlock, k int, fieldID uint32, bc *blockCache, acc *groupAccum) (groupComp, bool) {
+	if len(b.computed) > 0 {
+		if idx, ok := b.schema.byID[fieldID]; ok {
+			if node, ok := b.computedNode(k, idx, bc); ok {
+				return litGroupComp(node, acc)
+			}
+		}
+	}
 	node, found, err := b.escapedNode(k, fieldID, bc)
 	if err != nil {
 		return groupComp{}, false
 	}
 	if !found {
 		if b.heldAt(k, fieldID) {
-			return groupComp{}, false // the value stayed in the record: only evaluating it answers
+			// The value stayed in the record: only evaluating it answers, which this record alone may
+			// (see heldValueNode).
+			if held, ok := b.heldValueNode(k, fieldID, bc); ok {
+				return litGroupComp(held, acc)
+			}
+			return groupComp{}, false
 		}
 		return groupComp{kind: gkUndef}, true
 	}

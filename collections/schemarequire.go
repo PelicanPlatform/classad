@@ -137,7 +137,11 @@ func (c *Collection) requireIDs() (map[uint32]struct{}, map[uint32]string) {
 // store it twice.
 func (c *Collection) baseSchemaOpts() (adSchemaOpts, map[uint32]string) {
 	ids, byID := c.requireIDs()
-	return adSchemaOpts{Presence: basePresence, Fit: baseFit, Strings: true, Require: ids}, byID
+	opts := adSchemaOpts{Presence: basePresence, Fit: baseFit, Strings: true, Require: ids}
+	if cc := newCellComputer(c); cc != nil {
+		opts.Computed = cc.computedKind
+	}
+	return opts, byID
 }
 
 // basePresence / baseFit are the base schema's presence floor and int-width fit percentile.

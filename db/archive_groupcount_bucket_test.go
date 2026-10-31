@@ -248,9 +248,11 @@ func TestArchiveUnbucketedGroupKeepsUnbucketable(t *testing.T) {
 }
 
 // TestArchiveUnbucketedGroupStillDeclinesExpressions is what survives of the rule above. An
-// EXPRESSION is not a value a column read can render -- only evaluating it produces one -- and the
-// scan does make a group out of it, so serving the query would return a result with a group missing.
-// Unlike absent or string values, this declines whether or not a bucket was asked for.
+// EXPRESSION whose value depends on the clock is not a value a column read can render -- only
+// evaluating it at query time produces one -- and the scan does make a group out of it, so serving the
+// query would return a result with a group missing. Unlike absent or string values, this declines
+// whether or not a bucket was asked for. (An expression over the record alone is computed when its
+// segment is columnarized, and is served; see TestComputedValuesMatchBruteForce.)
 func TestArchiveUnbucketedGroupStillDeclinesExpressions(t *testing.T) {
 	cat, err := OpenCatalogConfig(CatalogConfig{Dir: t.TempDir()})
 	if err != nil {
@@ -264,7 +266,7 @@ func TestArchiveUnbucketedGroupStillDeclinesExpressions(t *testing.T) {
 	for i := 0; i < 4000; i++ {
 		src := fmt.Sprintf("ClusterId = %d\nJobStatus = 4\nCompletionDate = %d\n", i, 1700000000+i*60)
 		if i%50 == 7 {
-			src = fmt.Sprintf("ClusterId = %d\nJobStatus = 4\nCompletionDate = ClusterId + 1\n", i)
+			src = fmt.Sprintf("ClusterId = %d\nJobStatus = 4\nCompletionDate = ClusterId + 1 + time() * 0\n", i)
 		}
 		ad, perr := classad.ParseOld(src)
 		if perr != nil {

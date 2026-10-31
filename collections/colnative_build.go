@@ -109,6 +109,13 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// a record holding part of a group is not in that group's column, so its values must stay in the
 	// record, which is where the exception path already looks for them.
 	skips := make([]map[uint32]struct{}, 0, 512)
+	// Each record's computed cells, captured the same way and for the same reason: the builder sees only
+	// the literal half of the record, and an expression's value needs the whole of it (colcomputed.go).
+	var cc *cellComputer
+	if colComputeCells {
+		cc = newCellComputer(c)
+	}
+	cellRows := make([][]computedCell, 0, 512)
 
 	// The block sees only what the schema carries, and the remnant only what it does not. Without
 	// that split the block's COLD TAIL would hold the non-schema attributes -- which is precisely
@@ -122,6 +129,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		}
 		skip := groupSkipSet(groups, iw)
 		skips = append(skips, skip)
+		cellRows = append(cellRows, cc.cells(iw, s))
 		// EVERYTHING the block can store, not just the schema's fields. An attribute the schema does
 		// not carry lands in the block's COLD TAIL, which is one compressed region per ROW GROUP -- and
 		// that is the whole point of moving it: those attributes are the majority of a segment, and a
@@ -168,12 +176,14 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	if len(offs) != fed {
 		return nil, nil, nil
 	}
-	if len(skips) != len(offs) {
+	if len(skips) != len(offs) || len(cellRows) != len(offs) {
 		// The remnant pass indexes skips by record position, so the two passes must have seen the
 		// same records in the same order. Refuse rather than strip by a misaligned index, which
-		// would remove one record's attributes on the strength of another's membership.
+		// would remove one record's attributes on the strength of another's membership. The computed
+		// cells are indexed the same way, and misaligned they would give one record another's value.
 		return nil, nil, nil
 	}
+	attachComputed(blocks, cellRows, c.regionCodec())
 	cs := &colSegment{blocks: blocks, offsB: packU32s(offs), dictKeyed: d != nil}
 	// Re-key the pinned groups onto this segment's selections: the schema and members are shared, the
 	// per-block bitmaps are not.
@@ -410,6 +420,11 @@ func dataRecordCount(src *segment, skip func(uint32) bool) int {
 // shape every segment columnarized before it existed has, so a test can build the mixed store an
 // upgraded table holds. Production leaves it true.
 var colWriteRemnantList = true
+
+// colComputeCells is a test seam: false columnarizes without computed values (colcomputed.go), the shape
+// every segment columnarized before them has, so a test can compare the two over the same schema.
+// Production leaves it true.
+var colComputeCells = true
 
 // reconstructFullRecords rebuilds every live data record of an already-columnarized segment into its
 // FULL wire ad (remnant spliced with the segment's columnar values), in arena order, returning each
