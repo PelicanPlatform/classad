@@ -51,7 +51,7 @@ func TestArchiveMaintenanceMerges(t *testing.T) {
 		ArchiveMerge: db.MergeOptions{
 			TargetSegments: 4, TriggerSegments: 8, MinMergeBytes: 1, KeepRecent: 2,
 		},
-	})
+	}, nil)
 
 	after, err := c.ArchiveQuery(context.Background(), "history", "true", 0)
 	if err != nil {
@@ -99,7 +99,7 @@ func TestArchiveMaintenanceDisabled(t *testing.T) {
 		srv.maintainArchives(db.MaintainOptions{
 			ArchiveMergeDisabled: true,
 			ArchiveMerge:         db.MergeOptions{TargetSegments: 1, TriggerSegments: 2, MinMergeBytes: 1},
-		})
+		}, nil)
 		close(done)
 	}()
 	select {
@@ -182,7 +182,7 @@ func TestArchiveMaintenanceRefreshesHotSet(t *testing.T) {
 	a, srv, cleanup := archiveHotFixture(t)
 	defer cleanup()
 
-	srv.maintainArchives(db.MaintainOptions{HotTopN: 8, ArchiveMergeDisabled: false})
+	srv.maintainArchives(db.MaintainOptions{HotTopN: 8, ArchiveMergeDisabled: false}, nil)
 
 	if !hasHotFold(a.HotAttrs(), "GlobalJobId") {
 		t.Errorf("hot set after maintenance = %v, want the queried GlobalJobId", a.HotAttrs())
@@ -195,7 +195,7 @@ func TestArchiveMaintenanceHotRefreshDisabled(t *testing.T) {
 	a, srv, cleanup := archiveHotFixture(t)
 	defer cleanup()
 
-	srv.maintainArchives(db.MaintainOptions{HotTopN: 8, ArchiveHotRefreshDisabled: true})
+	srv.maintainArchives(db.MaintainOptions{HotTopN: 8, ArchiveHotRefreshDisabled: true}, nil)
 
 	if hasHotFold(a.HotAttrs(), "GlobalJobId") {
 		t.Errorf("hot set after a disabled refresh = %v, want it unchanged", a.HotAttrs())
@@ -208,7 +208,7 @@ func TestArchiveMaintenanceHotRefreshNeedsTopN(t *testing.T) {
 	a, srv, cleanup := archiveHotFixture(t)
 	defer cleanup()
 
-	srv.maintainArchives(db.MaintainOptions{})
+	srv.maintainArchives(db.MaintainOptions{}, nil)
 
 	if hasHotFold(a.HotAttrs(), "GlobalJobId") {
 		t.Errorf("hot set with HotTopN unset = %v, want it unchanged", a.HotAttrs())
@@ -294,7 +294,7 @@ func TestArchiveMaintenanceMergeDisabledStillTunes(t *testing.T) {
 	a, srv, cleanup := archiveHotFixture(t)
 	defer cleanup()
 
-	srv.maintainArchives(db.MaintainOptions{HotTopN: 8, ArchiveMergeDisabled: true})
+	srv.maintainArchives(db.MaintainOptions{HotTopN: 8, ArchiveMergeDisabled: true}, nil)
 
 	if !hasHotFold(a.HotAttrs(), "GlobalJobId") {
 		t.Errorf("hot set after a merge-disabled pass = %v, want the queried GlobalJobId: "+
@@ -353,7 +353,7 @@ func TestArchiveMaintenanceDerivesGroupsBeforeSchemaScan(t *testing.T) {
 	defer cleanup()
 
 	for range 2 {
-		srv.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8})
+		srv.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8}, nil)
 	}
 
 	info := a.SchemaScanInfo()
@@ -382,7 +382,7 @@ func TestArchiveMaintenanceSamplesOnceForTheWholePass(t *testing.T) {
 		t.Fatalf("fixture holds %d records, want %d", a.Count(), records)
 	}
 
-	srv.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8})
+	srv.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8}, nil)
 
 	sampled := lastGroupDerivationSampled(t, dir)
 	if sampled == 0 {

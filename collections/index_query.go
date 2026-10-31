@@ -6,7 +6,6 @@ import (
 	"slices"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/RoaringBitmap/roaring/v2"
 
@@ -36,8 +35,12 @@ func (c *Collection) Reindex() {
 	// cheap when there is nothing new to build.
 	c.reindexMu.Lock()
 	defer c.reindexMu.Unlock()
-	start := time.Now()
-	defer func() { c.opm.reindex.observe(time.Since(start)) }()
+	// Reindex nests inside compaction and inside a merge, so this publishes "reindex" while it
+	// runs and restores the enclosing phase when it returns -- an operator sees the innermost
+	// thing actually running rather than a pass that appears stuck in "compact". Its cumulative
+	// total still lands in opm.reindex, via mp.finish.
+	mp := c.beginMaint(MaintReindex, 0)
+	defer mp.finish()
 	spec := c.spec.Load()
 	persistent := c.dir != ""
 	for _, sh := range c.shards {

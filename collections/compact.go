@@ -110,11 +110,22 @@ func (c *Collection) Compact() int {
 	}
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
-	start := time.Now()
-	defer func() { c.opm.compact.observe(time.Since(start)) }()
+	// The pass's wall time is folded into opm.compact by mp.finish, which is where every
+	// maintenance phase's cumulative total now comes from -- one accumulator per phase rather
+	// than a timing here and a progress record somewhere else that disagree.
+	mp := c.beginMaint(MaintCompact, len(c.shards))
+	defer mp.finish()
 	target := c.currentCodec()
 	n := 0
 	for _, sh := range c.shards {
+		// Between shards, never inside compactShard: each shard's rewrite swaps its segments in
+		// one critical section, so a pass that stops here leaves every shard either fully
+		// compacted or entirely untouched. The shards it did not reach keep their dead bytes
+		// and are compacted by the next pass, which is what a pass that simply found them
+		// under the threshold would also have done.
+		if c.maintStopping() {
+			break
+		}
 		// First drop any fully-dead segment cheaply (unlink, no rewrite). This reclaims a
 		// segment whose records are all superseded without copying the shard's live data,
 		// and by removing those dead bytes it can pull the shard back under the compaction
@@ -130,6 +141,7 @@ func (c *Collection) Compact() int {
 		} else if reclaimed {
 			n++ // space was freed by unlinking dead segments, though no rewrite was needed
 		}
+		mp.step()
 	}
 	if n > 0 {
 		c.reindexAfterCompaction()
@@ -305,8 +317,13 @@ var retrainStallHook func()
 func (c *Collection) RetrainDict(sampleMax int) (int, error) {
 	c.maintMu.Lock()
 	defer c.maintMu.Unlock()
-	start := time.Now()
-	defer func() { c.opm.retrain.observe(time.Since(start)) }()
+	// Retrain reports no unit count: it is one indivisible operation (train, swap the codec,
+	// recompress every shard) with no boundary an operator could act on. What the progress
+	// record adds is the phase name and how long it has been running, which is the question
+	// "is this daemon hung" actually needs. The cumulative total still lands in opm.retrain,
+	// via mp.finish.
+	mp := c.beginMaint(MaintRetrain, 0)
+	defer mp.finish()
 	// Recent random records, not the oldest sampleMax of them: for an append-only table
 	// CollectSamples returns the first records ever stored, which is the least representative
 	// sample of what is arriving next (see CollectSamplesRecent). sampleMax keeps its meaning as a

@@ -164,7 +164,7 @@ func TestArchiveSchemaScanOnWhenConfigured(t *testing.T) {
 	}
 
 	// The same call the scheduled pass makes, with the option set.
-	s.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8, SampleMax: 2000})
+	s.maintainArchives(db.MaintainOptions{ArchiveSchemaScanHotTopN: 8, SampleMax: 2000}, nil)
 
 	info := a.SchemaScanInfo()
 	if !info.Enabled {

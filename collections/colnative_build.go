@@ -799,6 +799,12 @@ func (c *Collection) columnarizeSealed() int {
 	if budget <= 0 {
 		return 0 // disabled by Options.ColumnarSegmentBudget
 	}
+	// Published before the first segment, so a scrape taken anywhere in the pass -- including
+	// while the first rewrite is still running -- names the phase and its age. The budget is the
+	// honest up-front total: the pass rewrites at most that many, and setTotal narrows it once
+	// the candidate list turns out to be shorter.
+	mp := c.beginMaint(MaintColumnarize, budget)
+	defer mp.finish()
 	total := 0
 	for _, sh := range c.shards {
 		if total >= budget || c.maintStopping() {
@@ -816,6 +822,9 @@ func (c *Collection) columnarizeSealed() int {
 			}
 		}
 		sh.mu.Unlock()
+		if cand := total + len(srcs); cand < budget {
+			mp.setTotal(cand) // fewer candidates than the budget: report the real backlog
+		}
 		for _, src := range srcs {
 			// Between segments, not within one: a rewrite in progress must finish, because
 			// the close that follows unmaps what it is reading. Abandoning here costs
@@ -826,6 +835,7 @@ func (c *Collection) columnarizeSealed() int {
 			}
 			if c.columnarizeSealedSegment(sh, src, st.schema, st.hot) {
 				total++
+				mp.step()
 			}
 		}
 	}
@@ -867,6 +877,8 @@ func (c *Collection) recolumnarizeStale() int {
 		return 0
 	}
 	k := c.newStaleCheck(st)
+	mp := c.beginMaint(MaintColumnarize, budget)
+	defer mp.finish()
 	total := 0
 	for _, sh := range c.shards {
 		if total >= budget || c.maintStopping() {
@@ -895,6 +907,7 @@ func (c *Collection) recolumnarizeStale() int {
 				continue
 			}
 			total++
+			mp.step()
 			// The replacement is a new segment; find it by id to mark it if it still differs.
 			sh.mu.RLock()
 			for _, seg := range sh.segs {

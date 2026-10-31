@@ -396,6 +396,10 @@ type Collection struct {
 	// maintStop is set by StopMaintenance to ask an in-flight maintenance pass to stop at
 	// its next safe boundary, so closing does not wait out a whole bounded pass.
 	maintStop atomic.Bool
+	// maintProg is the in-flight maintenance pass's published progress, or nil when no pass
+	// is running. Deliberately an atomic pointer and NOT guarded by maintMu: it exists to be
+	// read while a pass holds that lock. See maintprogress.go.
+	maintProg atomic.Pointer[MaintProgress]
 	// ctQueried is set once this process has run a query reading CurrentTime, from which point
 	// Reindex proves the segments Open loaded without a CurrentTime proof (ctproof.go).
 	ctQueried atomic.Bool
@@ -603,8 +607,9 @@ type Collection struct {
 	sealer   wire.Sealer
 	encAttrs atomic.Pointer[encSetHolder]
 
-	// opm accumulates the collection-wide maintenance timings (compact/retrain/reindex)
-	// for OpStats; per-shard write/segment/sync timings live on each shard. See opstats.go.
+	// opm accumulates the collection-wide maintenance timings (compact/retrain/reindex/
+	// columnarize/rotate/merge) for OpStats; per-shard write/segment/sync timings live on
+	// each shard. See opstats.go.
 	opm opMetrics
 
 	// ttCfg is the active time-travel configuration, or nil when disabled (the

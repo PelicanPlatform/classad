@@ -133,9 +133,21 @@ func (c *Collection) mergePass(opts MergeOptions) int {
 	if c.sealedSegmentCount() < opts.TriggerSegments {
 		return 0 // below the high watermark: leave it alone
 	}
+	// MaxMerges is the only up-front bound a merge pass has; how many runs it actually finds is
+	// discovered a run at a time, so the total is the budget and Done is what has been merged.
+	mp := c.beginMaint(MaintMerge, opts.MaxMerges)
+	defer mp.finish()
 	merges := 0
 	var moved int64
 	for merges < opts.MaxMerges && moved < opts.MaxBytesPerPass {
+		// Between merges, never inside one: mergeSegments stages its output, publishes it and
+		// retires the sources in a single critical section (the same crash-safe stage/marker/
+		// rename protocol finishPendingMerges completes after a crash), so a pass that stops
+		// here has either done a whole merge or none of it. The runs it did not reach are
+		// untouched and are still eligible on the next pass.
+		if c.maintStopping() {
+			break
+		}
 		run, ok := c.nextMergeRun(opts, opts.MaxBytesPerPass-moved)
 		if !ok {
 			break
@@ -149,6 +161,7 @@ func (c *Collection) mergePass(opts MergeOptions) int {
 		}
 		merges++
 		moved += runBytes
+		mp.step()
 	}
 	if merges > 0 {
 		// The merged segments have no sidecar yet; build them so queries do not fall back
