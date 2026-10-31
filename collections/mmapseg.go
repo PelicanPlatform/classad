@@ -180,3 +180,33 @@ func (s *segment) unmap() error {
 	}
 	return err
 }
+
+// adviseSequential tells the kernel this mapping is about to be read front to back,
+// so it should read ahead aggressively and not retain the pages behind the cursor.
+//
+// Recovery is the caller. A record walk reads only header fields -- totalLen, seq, the
+// key -- and skips each ad body, but faults are page-granular: at a kilobyte per record
+// every 4 KiB page holds several headers, so walking headers faults in the WHOLE store.
+// On a 10 GB table that is 10 GB of read I/O and a matching resident spike, which in a
+// memory-limited container is the difference between a slow start and being killed. The
+// access pattern is strictly forward, so the kernel can do much better than its default
+// guess; it just has to be told.
+//
+// Best effort: an error means the hint was not applied, which costs speed and nothing
+// else, so it is dropped rather than failing an open.
+func (s *segment) adviseSequential() {
+	if !s.persistent || len(s.data) == 0 {
+		return
+	}
+	_ = unix.Madvise(s.data, unix.MADV_SEQUENTIAL)
+}
+
+// adviseNormal undoes adviseSequential. Steady-state access is by key and therefore
+// random, and MADV_SEQUENTIAL also asks the kernel to drop pages the cursor has passed --
+// both wrong once recovery is over, so the hint is reset rather than left behind.
+func (s *segment) adviseNormal() {
+	if !s.persistent || len(s.data) == 0 {
+		return
+	}
+	_ = unix.Madvise(s.data, unix.MADV_NORMAL)
+}
