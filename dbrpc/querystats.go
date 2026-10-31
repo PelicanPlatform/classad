@@ -69,6 +69,18 @@ type QueryShapeStat struct {
 	// because the same predicate with and without one does genuinely different work.
 	Limited bool `json:"limited"`
 
+	// GroupBy and Aggregates are an aggregate query's grouping and its reduced functions,
+	// fingerprinted (see groupShape and aggShape): `owner, qdate/3600` and
+	// `count(*), sum(remotewallclocktime)`. Both are empty for a plain read, and GroupBy
+	// alone is empty for an aggregate over the whole match.
+	//
+	// They are part of the shape key. Two aggregates over one constraint that group
+	// differently are not the same query in any sense an operator cares about: the
+	// grouping decides which tier answers, and merging them would report their summed
+	// cost against whichever grouping happened to be rendered.
+	GroupBy    string `json:"groupBy,omitempty"`
+	Aggregates string `json:"aggregates,omitempty"`
+
 	Count int64         `json:"count"`
 	Total time.Duration `json:"total"`
 	Max   time.Duration `json:"max"`
@@ -156,10 +168,14 @@ func (qs *queryStats) record(q QueryLog) {
 		return
 	}
 	shape := queryShape(q.Constraint)
+	groupBy, aggregates := groupShape(q.Groups), aggShape(q.Aggs)
 	limited := q.Limit > 0
 	key := q.Op + "\x00" + q.Table + "\x00" + shape
 	if limited {
 		key += "\x00L"
+	}
+	if groupBy != "" || aggregates != "" {
+		key += "\x00" + groupBy + "\x00" + aggregates
 	}
 
 	qs.mu.Lock()
@@ -170,7 +186,8 @@ func (qs *queryStats) record(q QueryLog) {
 		if len(qs.m) >= qs.opts.MaxShapes {
 			qs.evictLowest()
 		}
-		b = &shapeBucket{stat: QueryShapeStat{Op: q.Op, Table: q.Table, Shape: shape, Limited: limited}}
+		b = &shapeBucket{stat: QueryShapeStat{Op: q.Op, Table: q.Table, Shape: shape, Limited: limited,
+			GroupBy: groupBy, Aggregates: aggregates}}
 		qs.m[key] = b
 	}
 	st := &b.stat

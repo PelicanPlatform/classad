@@ -3,6 +3,7 @@ package dbrpc
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // ErrTxnReadUnsupported is returned by the Tx read methods against a server too old to
@@ -62,7 +63,8 @@ func txnReadErr(err error) error {
 
 // streamTxnQuery is the server side of opTxnQuery: the transaction's own view of a
 // constraint query, streamed like opQuery.
-func (s *Server) streamTxnQuery(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamTxnQuery(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
 	id := r.u64()
 	limit := int(r.i32())
 	constraint := r.str()
@@ -74,12 +76,22 @@ func (s *Server) streamTxnQuery(ctx context.Context, reqID uint64, r *reader, in
 		return
 	}
 	s.withTxnStream(reqID, id, write, func(st *serverTxn) {
+		// Logged like the connection-level query it mirrors, and under the transaction's
+		// own table -- a scan is a scan whether or not a transaction's write buffer is
+		// overlaid on it, and a writer that reads its staged rows back with an expensive
+		// constraint is exactly as worth seeing as the same query outside one.
+		n := 0
+		if qlog != nil {
+			defer func() {
+				qlog(QueryLog{Op: "TxnQuery", Table: st.table, Constraint: constraint,
+					Limit: limit, Rows: n, Duration: time.Since(start)})
+			}()
+		}
 		seq, err := st.tx.Query(constraint)
 		if err != nil {
 			write(respErr(reqID, err.Error()))
 			return
 		}
-		n := 0
 		for ad := range seq {
 			if cancelled(ctx) {
 				return // client gone: stop the scan
@@ -95,7 +107,8 @@ func (s *Server) streamTxnQuery(ctx context.Context, reqID uint64, r *reader, in
 }
 
 // streamTxnQueryKeys is the server side of opTxnQueryKeys.
-func (s *Server) streamTxnQueryKeys(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
+func (s *Server) streamTxnQueryKeys(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+	start := time.Now()
 	id := r.u64()
 	constraint := r.str()
 	if r.err != nil {
@@ -106,6 +119,13 @@ func (s *Server) streamTxnQueryKeys(ctx context.Context, reqID uint64, r *reader
 		return
 	}
 	s.withTxnStream(reqID, id, write, func(st *serverTxn) {
+		n := 0
+		if qlog != nil {
+			defer func() {
+				qlog(QueryLog{Op: "TxnQueryKeys", Table: st.table, Constraint: constraint,
+					Rows: n, Duration: time.Since(start)})
+			}()
+		}
 		seq, err := st.tx.KeysWhere(constraint)
 		if err != nil {
 			write(respErr(reqID, err.Error()))
@@ -116,6 +136,7 @@ func (s *Server) streamTxnQueryKeys(ctx context.Context, reqID uint64, r *reader
 				return
 			}
 			write(putStr(respHead(reqID, stStream), key))
+			n++
 		}
 		write(respHead(reqID, stStreamEnd))
 	})
