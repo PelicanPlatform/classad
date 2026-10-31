@@ -322,18 +322,33 @@ func appendColSegment(dst []byte, cs *colSegment, nameOf func(uint32) (string, b
 	if cs.dictKeyed {
 		dst = appendU32(dst, 0)
 	} else {
-		cold := map[uint32]struct{}{}
-		for _, b := range cs.blocks {
-			for id := range b.coldIDs {
-				cold[id] = struct{}{}
+		// Keyed by the id as the tails store it, named through the block's own translation. A block
+		// reloaded from disk carries no coldIDs, only the translation its section's names were read
+		// into, and its ids are the writing process's: naming them through this process's table would
+		// give the wrong names, and skipping them wrote no names at all.
+		cold := map[uint32]string{}
+		note := func(b *columnarBlock) {
+			add := func(id uint32) {
+				if _, ok := cold[id]; !ok {
+					cold[id], _ = nameOf(b.remap.current(id))
+				}
 			}
+			for id := range b.coldIDs {
+				add(id)
+			}
+			if b.remap != nil {
+				for id := range b.remap.toCurrent {
+					add(id)
+				}
+			}
+		}
+		for _, b := range cs.blocks {
+			note(b)
 		}
 		for _, g := range cs.groups {
 			for _, gb := range g.blocks {
 				if gb != nil && gb.blk != nil {
-					for id := range gb.blk.coldIDs {
-						cold[id] = struct{}{}
-					}
+					note(gb.blk)
 				}
 			}
 		}
@@ -344,9 +359,8 @@ func appendColSegment(dst []byte, cs *colSegment, nameOf func(uint32) (string, b
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 		dst = appendU32(dst, uint32(len(ids)))
 		for _, id := range ids {
-			name, _ := nameOf(id)
 			dst = appendU32(dst, id)
-			dst = appendBytes(dst, []byte(name))
+			dst = appendBytes(dst, []byte(cold[id]))
 		}
 	}
 	dst = appendU32(dst, uint32(len(hotNum)))
