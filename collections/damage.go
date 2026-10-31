@@ -313,10 +313,11 @@ func keyIndexDamage(data []byte, upto int, ki *mmapKeyIndex, h Hasher, known *da
 	type ent struct {
 		off  uint32
 		hash uint64
+		tomb bool // filed under the key it DELETES, not under its own (empty) inline key
 	}
 	ents := make([]ent, ki.count)
 	for i := uint32(0); i < ki.count; i++ {
-		ents[i] = ent{ki.offAt(i), ki.hashAt(i)}
+		ents[i] = ent{ki.offAt(i), ki.hashAt(i), ki.isTombstoneAt(i)}
 	}
 	sort.Slice(ents, func(i, j int) bool { return ents[i].off < ents[j].off })
 	var spans []damageSpan
@@ -348,7 +349,19 @@ func keyIndexDamage(data []byte, upto int, ki *mmapKeyIndex, h Hasher, known *da
 			spans = append(spans, damageSpan{e.off, end})
 			continue
 		}
-		if h.Hash(recKey(data, e.off)) != e.hash {
+		// A delete marker is keyless, so its entry's hash is not the hash of its inline key:
+		// since v2 it is the hash of the key it deletes, which is what lets recovery find a
+		// delete from the key. Checking it against the inline key would make this refuse the
+		// proof for every segment that holds a delete -- which is most of them.
+		want := h.Hash(recKey(data, e.off))
+		if e.tomb {
+			k, ok := recDeleteMarkerKey(data, e.off)
+			if !ok {
+				return nil, false // flagged a tombstone but is not one: not this segment's index
+			}
+			want = h.Hash(k)
+		}
+		if want != e.hash {
 			return nil, false
 		}
 		recEnd := e.off + recTotalLen(data, e.off)

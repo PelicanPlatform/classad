@@ -55,38 +55,50 @@ func TestKeyIndexSidecar(t *testing.T) {
 	// its own key-hash, and the sidecar's coverage/count are exact.
 	sealedWithIdx := 0
 	for _, sh := range c2.shards {
-		sh.mu.RLock()
-		for _, seg := range sh.segs {
-			if seg == nil || seg == sh.act {
-				continue
-			}
-			ki := seg.keyIdx.Load()
-			if ki == nil {
-				continue
-			}
-			sealedWithIdx++
-			if int(ki.upto) != seg.used {
-				t.Fatalf("sidecar upto=%d, seg.used=%d", ki.upto, seg.used)
-			}
-			recs := 0
-			for off := 0; off < seg.used; {
-				o := uint32(off)
-				total := recTotalLen(seg.data, o)
-				if total == 0 {
-					break
+		// The body runs in a closure so the read lock is released by a defer. It used to be
+		// unlocked at the end of the loop, which meant a t.Fatalf below -- runtime.Goexit --
+		// left the shard read-locked, and the deferred Close blocked on the write lock until
+		// the test binary's timeout. A one-line assertion failure cost a 40-minute run.
+		func() {
+			sh.mu.RLock()
+			defer sh.mu.RUnlock()
+			for _, seg := range sh.segs {
+				if seg == nil || seg == sh.act {
+					continue
 				}
-				recs++
-				offs := ki.lookup(c2.h.Hash(recKey(seg.data, o)))
-				if !containsOff(offs, o) {
-					t.Fatalf("record at off %d (key %q) missing from key sidecar", o, recKey(seg.data, o))
+				ki := seg.keyIdx.Load()
+				if ki == nil {
+					continue
 				}
-				off += int(total)
+				sealedWithIdx++
+				if int(ki.upto) != seg.used {
+					t.Fatalf("sidecar upto=%d, seg.used=%d", ki.upto, seg.used)
+				}
+				recs := 0
+				for off := 0; off < seg.used; {
+					o := uint32(off)
+					total := recTotalLen(seg.data, o)
+					if total == 0 {
+						break
+					}
+					recs++
+					// A delete marker is keyless and is filed under the key it DELETES, so it is
+					// found through lookupTombstones rather than by hashing its own inline key.
+					// Every record is still indexed exactly once, which the count below checks.
+					if dk, isDel := recDeleteMarkerKey(seg.data, o); isDel {
+						if !containsOff(ki.lookupTombstones(c2.h.Hash(dk)), o) {
+							t.Fatalf("delete marker at off %d (deletes %q) missing from key sidecar", o, dk)
+						}
+					} else if !containsOff(ki.lookup(c2.h.Hash(recKey(seg.data, o))), o) {
+						t.Fatalf("record at off %d (key %q) missing from key sidecar", o, recKey(seg.data, o))
+					}
+					off += int(total)
+				}
+				if int(ki.count) != recs {
+					t.Fatalf("sidecar count=%d, actual records=%d", ki.count, recs)
+				}
 			}
-			if int(ki.count) != recs {
-				t.Fatalf("sidecar count=%d, actual records=%d", ki.count, recs)
-			}
-		}
-		sh.mu.RUnlock()
+		}()
 	}
 	if sealedWithIdx == 0 {
 		t.Fatal("no sealed segment carried a key sidecar -- test is ineffective")
