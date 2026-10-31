@@ -61,5 +61,8 @@ func (c *Collection) OpStats() OpStats {
 	s.Retrain = c.opm.retrain.snapshot()
 	s.Reindex = c.opm.reindex.snapshot()
 	s.IndexBackfill = c.opm.backfill.snapshot()
+	s.Columnarize = c.opm.columnarize.snapshot()
+	s.Rotate = c.opm.rotate.snapshot()
+	s.Merge = c.opm.merge.snapshot()
 	return s
 }

@@ -37,6 +37,15 @@ type ArchiveTable struct {
 // boundary. See collections.Collection.StopMaintenance.
 func (a *ArchiveTable) StopMaintenance() { a.a.StopMaintenance() }
 
+// MaintProgress reports the maintenance pass running on this archive, or the zero value when
+// none is. It takes no lock, so it answers while the pass it describes holds the maintenance
+// lock. See collections.Collection.MaintProgress.
+func (a *ArchiveTable) MaintProgress() collections.MaintProgress { return a.a.MaintProgress() }
+
+// MaintenanceStopping reports whether this archive has been asked to stop maintenance. See
+// collections.Collection.MaintenanceStopping.
+func (a *ArchiveTable) MaintenanceStopping() bool { return a.a.MaintenanceStopping() }
+
 // ArchiveConfig configures an archive table. Dir is set by the catalog.
 type ArchiveConfig struct {
 	// SegmentSize is the sealed-segment file size in bytes (default 8 MiB).

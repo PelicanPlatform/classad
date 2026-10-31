@@ -127,10 +127,21 @@ func (c *Collection) BackfillIndexes(maxBytes int64) IndexBackfillResult {
 	// Interleave shards by age so no shard's newest data waits behind another's oldest.
 	sort.SliceStable(cands, func(i, j int) bool { return cands[i].rank < cands[j].rank })
 
+	mp := c.beginMaint(MaintBackfill, len(cands))
+	defer mp.finish()
 	for _, cd := range cands {
 		if maxBytes > 0 && res.RebuiltBytes >= maxBytes {
 			break
 		}
+		// Between segments, never inside backfillOne: a sidecar is swapped in whole, under the
+		// shard lock, and a segment whose sidecar was not rebuilt keeps the index it already
+		// had -- which still answers for the attributes it covers. A pass that stops here is
+		// therefore indistinguishable from one whose byte budget simply ran out a segment
+		// earlier, and IndexBackfillPending still names the remainder for the next pass.
+		if c.maintStopping() {
+			break
+		}
+		mp.step()
 		used, ok, done := c.backfillOne(cd.sh, cd.seg)
 		if !done {
 			continue // merged away, rotated out, or covered by someone else since the snapshot

@@ -471,6 +471,9 @@ func (db *DB) Maintain(opts MaintainOptions) {
 			db.saveIndexConfig() // persist auto add/drop (with provenance)
 		}
 	}
+	if db.c.MaintenanceStopping() {
+		return // asked to stop: do not start the steps that follow, which are the expensive ones
+	}
 	if opts.HotTopN > 0 {
 		// Through the DB wrapper, not the collection: the pass's refresh has to be persisted
 		// with its provenance, like the archive pass's is. Called on the collection directly
@@ -478,8 +481,14 @@ func (db *DB) Maintain(opts MaintainOptions) {
 		// to the hot set was discarded by every restart.
 		db.RefreshHotSet(opts.SampleMax, opts.HotTopN)
 	}
+	if db.c.MaintenanceStopping() {
+		return
+	}
 	if opts.Retrain {
 		_, _ = db.c.RetrainDict(opts.SampleMax) // recompacts + reindexes
+	}
+	if db.c.MaintenanceStopping() {
+		return
 	}
 	if opts.SchemaScanHotTopN > 0 {
 		// Derive and checkpoint the candidate group schemas BEFORE enabling, so the history the
@@ -1503,6 +1512,15 @@ func SealedProbesSkipped() int64 { return collections.SealedProbesSkipped() }
 // boundary, so a caller closing the server does not wait out a whole in-flight pass. See
 // collections.Collection.StopMaintenance.
 func (d *DB) StopMaintenance() { d.c.StopMaintenance() }
+
+// MaintProgress reports the maintenance pass running on this table, or the zero value when
+// none is. It takes no lock, so it answers while the pass it describes holds the maintenance
+// lock. See collections.Collection.MaintProgress.
+func (d *DB) MaintProgress() collections.MaintProgress { return d.c.MaintProgress() }
+
+// MaintenanceStopping reports whether this table has been asked to stop maintenance. See
+// collections.Collection.MaintenanceStopping.
+func (d *DB) MaintenanceStopping() bool { return d.c.MaintenanceStopping() }
 
 // FallbackReasons reports, process-wide, why patch writes had to store a whole record rather than
 // a delta: an attribute removal (which a delta cannot express), the chain reaching its bound, no

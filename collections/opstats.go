@@ -112,6 +112,14 @@ type opMetrics struct {
 	reindex    opCounter // index rebuild
 	backfill   opCounter // one sealed segment's sidecar rebuilt by BackfillIndexes
 	commitSync opCounter // per-commit durability wall time (the parallel shard-sync phase)
+	// The three maintenance passes that had no timing of their own. Columnarize is the one
+	// that motivated them: it is the longest pass an archive runs (a 64-segment budget of
+	// whole-segment rewrites) and, until this, the only evidence it had run at all was the
+	// segment count changing. Rotate and merge are cheap in steady state and expensive on the
+	// pass that is not, which is exactly when an operator is asking where the time went.
+	columnarize opCounter // ColumnarizeSealed / recolumnarizeStale rewriting sealed segments
+	rotate      opCounter // Rotate dropping whole oldest segments for retention
+	merge       opCounter // MergePass consolidating cold segment runs
 }
 
 // OpStat is one operation's cumulative call count and total wall-nanoseconds. Both
@@ -151,6 +159,12 @@ type OpStats struct {
 	// IndexBackfill counts sealed segments whose sidecar BackfillIndexes rebuilt to cover the
 	// current index set, one occurrence per segment.
 	IndexBackfill OpStat `json:"indexBackfill"`
+	// Columnarize, Rotate and Merge are the remaining maintenance passes' wall time, one
+	// occurrence per pass. Omitted from JSON when empty so a peer that predates them stays
+	// byte-compatible, exactly as CommitSync does.
+	Columnarize OpStat `json:"columnarize,omitempty"`
+	Rotate      OpStat `json:"rotate,omitempty"`
+	Merge       OpStat `json:"merge,omitempty"`
 }
 
 // add accumulates one shard's counters into the snapshot.

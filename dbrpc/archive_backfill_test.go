@@ -101,7 +101,7 @@ func TestArchiveMaintenanceBackfillsIndexes(t *testing.T) {
 	// Merging would fold the very segments being counted; keep it out of the way.
 	noMerge := db.MergeOptions{TriggerSegments: 1 << 20, TargetSegments: 1 << 19}
 
-	srv.maintainArchives(db.MaintainOptions{ArchiveMerge: noMerge, ArchiveIndexBackfillBytes: -1})
+	srv.maintainArchives(db.MaintainOptions{ArchiveMerge: noMerge, ArchiveIndexBackfillBytes: -1}, nil)
 	if got, _ := backfillPending(t, c); got != pending {
 		t.Fatalf("backfill turned off, yet pending went %d -> %d", pending, got)
 	}
@@ -113,7 +113,7 @@ func TestArchiveMaintenanceBackfillsIndexes(t *testing.T) {
 		if before == 0 {
 			break
 		}
-		srv.maintainArchives(db.MaintainOptions{ArchiveMerge: noMerge, ArchiveIndexBackfillBytes: budget})
+		srv.maintainArchives(db.MaintainOptions{ArchiveMerge: noMerge, ArchiveIndexBackfillBytes: budget}, nil)
 		passes++
 		after, _ := backfillPending(t, c)
 		if after >= before {

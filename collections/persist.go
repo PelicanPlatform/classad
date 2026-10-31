@@ -512,6 +512,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		c.openIdxDiag.ignoreFile(filepath.Join(shardDir, e.Name()))
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].num < files[j].num })
+	mapProg := newOpenProgress(shardDir, OpenMapSegments, len(files))
 
 	// Segments are collected first and ordered afterwards by CONTENT (see below), so the
 	// id assigned here is provisional.
@@ -521,7 +522,8 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	}
 	var loaded []loadedSeg
 
-	for _, sf := range files {
+	for sfi, sf := range files {
+		mapProg.step(sfi)
 		// Decode this segment with the codec it was written under (the dictionary named
 		// in its file). Loaded before this by Open via loadDicts.
 		codec, ok := c.dicts.codecFor(sf.dictID)
@@ -675,8 +677,20 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	}
 	spec := c.spec.Load()
 	sidecarStart := time.Now()
+	// Counts sealed segments, not slots: sh.segs is sparse (rotation nils reclaimed slots), so
+	// len(sh.segs) would overstate the total and make a finished phase read as half done.
+	sidecarTotal := 0
 	for _, seg := range sh.segs {
 		if seg != nil && seg != sh.act {
+			sidecarTotal++
+		}
+	}
+	sidecarProg := newOpenProgress(shardDir, OpenLoadSidecars, sidecarTotal)
+	sidecarDone := 0
+	for _, seg := range sh.segs {
+		if seg != nil && seg != sh.act {
+			sidecarProg.step(sidecarDone)
+			sidecarDone++
 			// Map the sidecar FIRST: a v3 container carries the segment's zone map, which
 			// loadSealedIndex adopts. Rebuilding one instead means decoding every record --
 			// measured at ~95% of reopen time, i.e. recovery scaling with the size of the

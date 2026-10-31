@@ -32,6 +32,8 @@ func (c *Collection) Rotate(now float64) (int, error) {
 	if c.ret == (Retention{}) {
 		return 0, nil // no bounds configured: keep everything
 	}
+	mp := c.beginMaint(MaintRotate, 0)
+	defer mp.finish()
 
 	sh := c.shards[0] // AppendOnly forces a single shard
 	// Resolve the two independent age attributes (via the shared intern table): MaxAgeAttr for
