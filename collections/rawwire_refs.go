@@ -206,7 +206,12 @@ func (a *wireRowAssembler) appendRowConverted(dst []byte, dict *segDictHandle, w
 	if dict != nil {
 		a.markSealed(w, dict)
 	}
-	out, ok := a.appendRow(dst, wire.Ad(a.c.wireToInlineRead(dict, w, a.sel.redact)), needed, open)
+	iw, ok := a.c.wireToInlineRead(dict, w, a.sel.redact)
+	if !ok {
+		a.sealed.reset()
+		return dst, false
+	}
+	out, ok := a.appendRow(dst, wire.Ad(iw), needed, open)
 	a.sealed.reset()
 	return out, ok
 }
