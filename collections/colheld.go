@@ -85,7 +85,19 @@ func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
 	var buf []byte
 	n := cs.offsLen()
 	dm := seg.damaged()
+	var exp []byte
+	bc := c.sharedColCache()
+	bi, blkEnd := 0, 0
 	for i := 0; i < n; i++ {
+		// The base block record i belongs to, whose dictionary its remnant's references point into.
+		for i >= blkEnd && bi < len(cs.blocks) {
+			blkEnd += cs.blocks[bi].n
+			bi++
+		}
+		if i >= blkEnd {
+			return nil, false // a row past every block: the payload does not describe this record
+		}
+		blk := cs.blocks[bi-1]
 		o := cs.offAt(i)
 		if int(o) >= len(seg.data) {
 			return nil, false
@@ -98,8 +110,17 @@ func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
 			return nil, false
 		}
 		buf = raw
+		// Expanded: the walk below must step over every node, and a reference is not one wire knows.
+		if e, expanded, eerr := blk.expandRemnant(raw, bc, exp[:0]); eerr != nil {
+			return nil, false
+		} else if expanded {
+			exp, raw = e, e
+		}
 		bad := false
-		wire.Ad(raw).ForEachRaw(func(id uint32, name string, node []byte) bool {
+		// A walk that stops short of the record's end leaves every attribute after the stop out of the
+		// index, and a cell the index omits is read as absent -- so a remnant that does not parse to
+		// its end makes the whole index untrusted, exactly as an unresolvable name does.
+		whole := wire.Ad(raw).ForEachRaw(func(id uint32, name string, node []byte) bool {
 			gid, ok := c.globalIDOf(d, id, name)
 			if !ok {
 				// An attribute the remnant names but this process cannot resolve. It cannot be a
@@ -113,7 +134,7 @@ func (cs *colSegment) scanHeld() (map[uint32][]uint32, bool) {
 			}
 			return true
 		})
-		if bad {
+		if bad || !whole {
 			return nil, false
 		}
 	}

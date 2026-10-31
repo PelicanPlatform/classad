@@ -18,7 +18,10 @@ import (
 // payloadFixtureOpts are the options every payload-version test opens its store with. Group schemas
 // are on, so the payloads carry group blocks as well as base blocks: the version covers both.
 func payloadFixtureOpts(dir string) Options {
-	return Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: 4, GroupStabilityRuns: 1}
+	// No remnant dictionary: these cases are about versions 0 and 1, whatever the default is. A payload
+	// that carries one is version 2, covered by the remnant dictionary tests.
+	return Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: 4, GroupStabilityRuns: 1,
+		RemnantDictionary: -1}
 }
 
 // payloadFixtureAds is how many ads the fixture writes: enough for several sealed segments.
@@ -366,7 +369,7 @@ func testColPayloadLegacyUnversionedReads(t *testing.T, dir string, want []strin
 // and nothing may rewrite or drop it.
 func testColPayloadFutureVersionRefused(t *testing.T, dir string, want []string) {
 
-	future := uint32(colPayloadVersion + 1)
+	future := uint32(colPayloadMaxVersion + 1)
 	var target string
 	editPayloads(t, dir, func(p string, blob []byte) []byte {
 		if target != "" {
@@ -464,7 +467,7 @@ func testColPayloadFutureVersionRepairLeavesDamagedSegment(t *testing.T, dir str
 		}
 		target = p
 		nb := append([]byte(nil), blob...)
-		binary.LittleEndian.PutUint32(nb[4:], colPayloadVersion+1)
+		binary.LittleEndian.PutUint32(nb[4:], colPayloadMaxVersion+1)
 		return nb
 	})
 	if target == "" {
@@ -628,7 +631,7 @@ func TestSplitColPayloadHeaders(t *testing.T) {
 		b := binary.LittleEndian.AppendUint32(nil, colPayloadMagic)
 		return append(binary.LittleEndian.AppendUint32(b, v), 1, 2, 3)
 	}
-	for _, v := range []uint32{0, colPayloadVersion + 1, 0xffffffff} {
+	for _, v := range []uint32{0, colPayloadMaxVersion + 1, 0xffffffff} {
 		if _, got, err := splitColPayload(hdr(v)); !errors.Is(err, ErrUnsupportedColumnarVersion) || got != v {
 			t.Errorf("version %d: got version %d, err %v; want ErrUnsupportedColumnarVersion", v, got, err)
 		}

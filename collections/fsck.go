@@ -222,7 +222,7 @@ func (r *FsckReport) String() string {
 		if s.ColumnarUnsupported {
 			fmt.Fprintf(&b, "    UNSUPPORTED columnar payload format version %d (this build reads 0-%d): "+
 				"not damage; open the collection with a build that reads it, and repair will not touch this segment\n",
-				s.ColumnarVersion, colPayloadVersion)
+				s.ColumnarVersion, colPayloadMaxVersion)
 		}
 		for _, d := range s.Damage {
 			kind := "DAMAGE"

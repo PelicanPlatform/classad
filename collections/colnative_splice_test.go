@@ -177,6 +177,11 @@ func TestSpliceNamesInlineRecordInInternedSegment(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			// The remnant as the readers see it: with any remnant dictionary reference expanded.
+			blk, _ := cn.blockFor(k)
+			if raw, _, err = blk.expandRemnant(raw, cn.cache, nil); err != nil {
+				t.Fatal(err)
+			}
 			rem, err := wire.DecodeResolve(raw, d.resolve)
 			if err != nil {
 				t.Fatal(err)

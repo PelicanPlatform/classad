@@ -166,6 +166,19 @@ type Options struct {
 	// flushed page cache -- the same failure a retrain caused when it resealed a whole archive.
 	// Each segment is rewritten at most once, so a bounded budget still converges.
 	ColumnarSegmentBudget int
+	// RemnantDictionary decides whether columnarizing a segment also stores, per row group, the
+	// non-literal values its records repeat -- expressions, nested records and lists such as a
+	// cluster's shared Requirements -- once, with each record holding a short reference in their place
+	// (see colremdict.go). Measured on a production AP's history, that removed 13-30% of columnarized
+	// segment bytes (8-16% on epoch history). 0 takes the default, which is ON; a negative value turns
+	// it off, and a positive one on.
+	//
+	// What an older build does with such a segment: it refuses to open the collection
+	// (ErrUnsupportedColumnarVersion) rather than misread a reference, and its fsck reports the segment's
+	// payload version as unsupported. Nothing is lost or modified, and rolling forward reads every
+	// record. A caller that must stay openable by a build that predates dictionaries sets this negative.
+	// Every build from this one on reads them whatever this is set to.
+	RemnantDictionary int
 	// RowGroupBytes is the uncompressed record-bytes budget for one columnar row group. 0 uses
 	// colGroupTargetBytes (128 KiB).
 	//
@@ -494,6 +507,7 @@ type Collection struct {
 	groupStability   int     // Options.GroupStabilityRuns
 	groupJac         float64 // Options.GroupMergeJaccard
 	colBudget        int     // Options.ColumnarSegmentBudget
+	remDict          int     // Options.RemnantDictionary
 	// rowGroupBytes is Options.RowGroupBytes, settable at runtime (SetRowGroupBytes) because it only
 	// governs row groups sealed from now on -- blocks already written record their own layout. Atomic
 	// because every scan that seals a segment reads it.
@@ -791,6 +805,7 @@ func New(opts Options) *Collection {
 		groupStability:   opts.GroupStabilityRuns,
 		groupJac:         opts.GroupMergeJaccard,
 		colBudget:        opts.ColumnarSegmentBudget,
+		remDict:          opts.RemnantDictionary,
 		groupMaxPart:     opts.GroupMaxPartialFrac,
 	}
 	c.rowGroupBytes.Store(int64(opts.RowGroupBytes))

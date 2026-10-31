@@ -292,6 +292,12 @@ type columnarBlock struct {
 	// per-field sections, sorted by field index. Both empty for every other block.
 	computed     []computedEntry
 	computedComp []byte
+
+	// remDictComp is the block's remnant dictionary, compressed, and remDictN its entry count: the nodes
+	// its records' remnants repeat, each stored once and referenced in place (see colremdict.go). Empty
+	// for a block with none, and always for a block that is not part of a columnarized segment.
+	remDictComp []byte
+	remDictN    int
 }
 
 // blockZone is one numeric column's range within a block.

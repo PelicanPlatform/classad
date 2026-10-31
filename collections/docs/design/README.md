@@ -1036,7 +1036,9 @@ A columnarized sealed segment holds three kinds of records:
    - escapes, i.e. schema values that did not fit their slot.
 
    A remnant has no hot header, is flagged `colFlag` without `markerFlag`, and is
-   compressed per record with the segment codec.
+   compressed per record with the segment codec. A non-literal value its row group
+   repeats may be replaced, in place, by a reference into the group's remnant dictionary
+   (see *Remnant dictionaries*).
 2. **The dictionary record**, as in any interned segment (Chapter 3).
 3. **The columnar payload**: one keyless `markerFlag|colFlag` record appended last.
 
@@ -1045,8 +1047,9 @@ not an index over them, and losing it is data loss rather than a rebuild. That i
 it lives *inside* the segment file rather than beside it: it shares the segment's
 framing, its record CRC, its fsync, and its lifetime, so no segment can be opened and
 found to be missing its columns. The payload begins
-with an 8-byte header: the magic `COLN` and a u32 format version (currently 1). A
-payload without the magic is a legacy, version-0 payload and reads unchanged. A legacy
+with an 8-byte header: the magic `COLN` and a u32 format version: 1, or 2 when its row
+groups carry remnant dictionaries. A payload without the magic is a legacy, version-0
+payload and reads unchanged. A legacy
 payload begins with its schema's field count, whose fourth byte is always zero; the
 magic's fourth byte is not. A payload in a version this build cannot read is **not**
 treated as damage, because the payload is the only copy of its values:
@@ -1065,7 +1068,42 @@ The payload holds, in order:
 - the **row-group blocks**;
 - the segment-wide **record-offset map**: one `u32` arena offset per record, ascending,
   binary-searched to go from a remnant to its row;
-- the group schemas and each base block's group selections.
+- the group schemas and each base block's group selections;
+- in version 2, each base block's remnant dictionary (required: its records cannot be
+  read without it);
+- the optional remnant-name and computed-value trailers.
+
+### Remnant dictionaries
+
+Remnants are compressed one record at a time, so a non-literal value repeated across a
+row group is paid for in full in every record: a cluster's shared `Requirements`, a
+`MemoryUsage` nearly every job carries, a nested record or list many jobs share. On the
+tail of a production history file, storing them once per row group cut a columnarized
+segment's bytes by 13–30% (8–16% on epoch history); `Requirements` alone was 85% of the
+repeated expression bytes.
+
+With `Options.RemnantDictionary` on, each base block stores the distinct non-literal
+top-level nodes that repeat among its records' remnants once, as a compressed region
+(`colremdict.go`). A record holding one carries `wire.TagExternalRef` and the entry's
+index in the node's place, at the same position, so the attribute keeps its key and its
+place and expanding every reference gives back the remnant's original bytes exactly.
+Entries are the stored node bytes, copied and never re-encoded, so any attribute
+reference inside one is in the record's own key space (names inline, the segment
+dictionary's ids when interned) and no process-local id is persisted; they are deduped on
+those bytes and numbered in first-occurrence order. A sealed node is never an entry. A
+rewrite that would not expand back to its original bytes is not stored.
+
+The three places that read a columnarized remnant expand it first: `recordWireIn` (which
+every full-ad read, splice, merge, compaction, reseal and index build goes through),
+`projectFromColumns`, and the held-cell pass. A reference that does not resolve fails the
+read. `wire` rejects the tag as malformed, so an unexpanded reference cannot be read as a
+value.
+
+A payload whose blocks carry a dictionary is written as version 2; one whose blocks do
+not is still version 1. A build that predates version 2 refuses a collection holding one
+(`ErrUnsupportedColumnarVersion`) rather than read references as values; nothing is lost,
+and rolling forward reads every record. The option is on by default, and a negative value
+turns it off. Existing segments gain dictionaries only when columnarization rewrites them.
 
 ### Row groups
 
@@ -2631,6 +2669,7 @@ type Options struct {
     Ordered             []OrderSpec
     // Columnar
     GroupSchemaCount, GroupStabilityRuns, ColumnarSegmentBudget, RowGroupBytes int
+    RemnantDictionary   int   // per-row-group dictionary of repeated remnant values; on by default
     GroupMergeJaccard, GroupMaxPartialFrac float64
     MutatingBlockCacheBytes, ArchiveBlockCacheBytes int64   // process-global budgets
     // Versions and history
