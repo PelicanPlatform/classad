@@ -18,6 +18,7 @@ import (
 // may simply be invisible right now (a mangled file name), and the bytes are only
 // recoverable while the dictionary still exists.
 func TestPruneRetiresDictionaryInsteadOfDeleting(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	dictsDir := filepath.Join(dir, "dicts")
 	if err := os.MkdirAll(dictsDir, 0o755); err != nil {
@@ -82,6 +83,7 @@ func TestPruneRetiresDictionaryInsteadOfDeleting(t *testing.T) {
 // TestAtticDictionaryStillDecodes: retiring is only worth anything if the file is
 // still usable. Move it back and it must decode what it encoded.
 func TestAtticDictionaryStillDecodes(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	dictsDir := filepath.Join(dir, "dicts")
 	if err := os.MkdirAll(dictsDir, 0o755); err != nil {

@@ -54,6 +54,7 @@ func selForOp(t *testing.T, c *Collection, query string) float64 {
 // Memory distribution, the old uniform-[min,max] model estimates `Memory > 4096` at ~99.5%,
 // while the true fraction is ~42%. The equi-depth histogram must estimate close to the truth.
 func TestHistogramSkewedRangeEstimate(t *testing.T) {
+	t.Parallel()
 	// The selectivity estimator reads sealed-segment indexes, so persist + Reindex to seal.
 	c, err := Open(Options{Dir: t.TempDir(), ValueAttrs: []string{"Memory"}, SegmentSize: 1 << 12})
 	if err != nil {
@@ -87,6 +88,7 @@ func TestHistogramSkewedRangeEstimate(t *testing.T) {
 // TestHistogramSurvivesReopen verifies the histogram is serialized into the sealed-segment
 // sidecar (v9) and reconstructed on reopen, so the skew-aware estimate persists.
 func TestHistogramSurvivesReopen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, ValueAttrs: []string{"Memory"}, SegmentSize: 1 << 12})
 	if err != nil {

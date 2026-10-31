@@ -157,6 +157,7 @@ func TestSpliceRefusesMalformedColdTail(t *testing.T) {
 // The remnant is the interned record re-encoded inline, which is the shape a materialized delta has:
 // the merge of a chain is written inline whatever segment it lands in.
 func TestSpliceNamesInlineRecordInInternedSegment(t *testing.T) {
+	t.Parallel()
 	c, segs := spliceFixture(t)
 	checked, withCold := 0, 0
 	for _, s := range segs {
@@ -209,6 +210,7 @@ func TestSpliceNamesInlineRecordInInternedSegment(t *testing.T) {
 // segment's dictionary and cannot read an inline one that way. It reaches the build here as a delta
 // plan's materialized ad, which is how such a record would.
 func TestColumnarizeRefusesRecordItCannotCarry(t *testing.T) {
+	t.Parallel()
 	c, segs := spliceFixture(t)
 	src := segs[0]
 	cn := src.colNative.Load()

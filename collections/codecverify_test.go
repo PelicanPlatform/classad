@@ -154,6 +154,7 @@ func codecAdDiff(ad *classad.ClassAd, i int) string {
 // Shards: 1 so that corrupting a key cannot also move the record to a different shard,
 // a confound that masked the read path in an earlier attempt at this.
 func TestZstdLeavesTheRecordHeaderUncovered(t *testing.T) {
+	t.Parallel()
 	zstd, err := NewZSTDCodec(nil)
 	if err != nil {
 		t.Fatal(err)

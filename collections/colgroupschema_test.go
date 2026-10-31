@@ -212,6 +212,7 @@ func TestGroupSchemasPersistAndDrift(t *testing.T) {
 // TestGroupSchemaAgreementAcrossSegments: the per-segment check is the guard against committing a
 // schema pointer to a group that only one segment's sample produced.
 func TestGroupSchemaAgreementAcrossSegments(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, SegmentSize: 1 << 13}) // small, so several segments seal
 	if err != nil {
@@ -288,6 +289,7 @@ func TestGroupSchemasRankByCellsNotSize(t *testing.T) {
 // group -- an in-sample holdout would have passed the group that later frayed -- while the same
 // groups against a snapshot hours later showed one at 0.167%.
 func TestGroupStabilityGate(t *testing.T) {
+	t.Parallel()
 	newColl := func(t *testing.T, dir string) *Collection {
 		c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 14, GroupSchemaCount: 4})
 		if err != nil {

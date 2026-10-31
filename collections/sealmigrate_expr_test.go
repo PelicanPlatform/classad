@@ -85,6 +85,7 @@ func sealFixtureAd(t *testing.T, i, cpus int, secrets bool, shapes []sealShape) 
 // seals everything in it: a literal anywhere in a segment would hide a detection that misses
 // expressions, and a trained dictionary makes every segment a candidate.
 func TestMigrateSealedAttrsSealsLegacyValues(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

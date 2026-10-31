@@ -35,6 +35,7 @@ func countSealedSegs(c *Collection) (sealed, interned int) {
 // next append) and is idempotent. Reads/queries are correct, and recovery restores the interned
 // segments across a reopen.
 func TestArchiveInternAtSeal(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -152,6 +153,7 @@ func TestArchiveInternAtSealOptOut(t *testing.T) {
 // its sealed segments on the manual pass, sealing the designated values. (The eager Append
 // trigger is Archive-only; encrypted archives drive InternSealed directly.)
 func TestInternSealedEncrypted(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

@@ -64,6 +64,7 @@ var multiQueries = []string{
 // TestMultiFieldCountMatchesRowPath is the equivalence test: whatever the columnar path serves must
 // equal the ordinary query path, including where a value is missing, non-numeric, or escaped.
 func TestMultiFieldCountMatchesRowPath(t *testing.T) {
+	t.Parallel()
 	c := multiFixture(t, 4000)
 	defer c.Close()
 	for _, expr := range multiQueries {
@@ -90,6 +91,7 @@ func TestMultiFieldCountMatchesRowPath(t *testing.T) {
 // TestMultiFieldStillDeclinesWhatItMust guards the boundary. These must NOT be served: the probes do
 // not cover the query, or the shape is not a scalar comparison on a numeric field.
 func TestMultiFieldStillDeclinesWhatItMust(t *testing.T) {
+	t.Parallel()
 	c := multiFixture(t, 2000)
 	defer c.Close()
 	for _, expr := range []string{
@@ -121,6 +123,7 @@ func TestMultiFieldStillDeclinesWhatItMust(t *testing.T) {
 // TestMultiFieldMVCC checks visibility: superseded versions must not be counted, and an update that
 // changes one of several predicated fields must move the answer.
 func TestMultiFieldMVCC(t *testing.T) {
+	t.Parallel()
 	c := multiFixture(t, 3000)
 	defer c.Close()
 	// Supersede a slice of records so they no longer satisfy RequestCpus >= 4.

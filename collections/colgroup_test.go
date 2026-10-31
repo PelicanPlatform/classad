@@ -108,6 +108,7 @@ func blockRecordBytes(tb testing.TB, b *columnarBlock) int {
 // segment-sized block is still CORRECT, still passes every equivalence test, and shows up only as a
 // query that got slower on data larger than any test fixture.
 func TestRowGroupsBoundedByBytes(t *testing.T) {
+	t.Parallel()
 	store, _ := fatFixture(t, 1200)
 	sealed, blocks, multi, biggest := 0, 0, 0, 0
 	for _, sh := range store.shards {
@@ -388,6 +389,7 @@ func TestColSegmentRejectsGroupOffsMismatch(t *testing.T) {
 // the next group. Below the floor the back-off is skipped, so blocks stay reasonably sized even where
 // that costs alignment.
 func TestRowGroupsNoRunts(t *testing.T) {
+	t.Parallel()
 	// The budget is pinned rather than inherited from the default. The fixture sizes its enormous
 	// record FROM the budget, so tracking a default that later moved made its data shrink with it --
 	// at which point nothing sealed and the test asserted nothing rather than failing. What is being

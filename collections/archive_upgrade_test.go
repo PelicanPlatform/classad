@@ -52,6 +52,7 @@ func archiveIDs(t *testing.T, a *Archive) []int64 {
 // they were written under and stay readable, because recovery reconstructs every registered
 // dictionary.
 func TestRetrainDoesNotRewriteArchive(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -111,6 +112,7 @@ func TestRetrainDoesNotRewriteArchive(t *testing.T) {
 // forever. The verdict is keyed to the dictionary generation, so a later retrain re-opens
 // the question rather than inheriting a stale answer.
 func TestUpgradeRecordsRejection(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
@@ -152,6 +154,7 @@ func TestUpgradeRecordsRejection(t *testing.T) {
 // TestUpgradeReencodesWhenItPays is the converse: with a reachable threshold the pass does
 // re-encode, the records survive, and the segments move onto the current codec.
 func TestUpgradeReencodesWhenItPays(t *testing.T) {
+	t.Parallel()
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}

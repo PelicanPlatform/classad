@@ -41,6 +41,7 @@ func stopFixture(t *testing.T, n int) *Collection {
 // vacuously: if the fixture stopped producing a backlog, the test fails rather than agreeing
 // with itself that zero equals zero.
 func TestColumnarizeSealedStopsWhenMaintenanceIsStopped(t *testing.T) {
+	t.Parallel()
 	pass := func(stop bool) int {
 		c := stopFixture(t, 6000)
 		defer c.Close()

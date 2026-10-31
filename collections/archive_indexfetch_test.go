@@ -180,6 +180,7 @@ func TestArchiveIndexedFetchMatchesScan(t *testing.T) {
 // Segments sealed before the attribute was indexed have no postings for it: the fetch walks
 // them in full and uses the index everywhere else, with the same result as a scan.
 func TestArchiveIndexedFetchUnindexedSegments(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	opts := historyArchiveOptions(dir, 64<<10)
 	opts.ValueAttrs = nil
@@ -218,6 +219,7 @@ func TestArchiveIndexedFetchUnindexedSegments(t *testing.T) {
 // filter's ProcId is answered from the columns for every candidate the index hands over,
 // and only the match is rebuilt. The scan breakdown says which path ran and over what.
 func TestArchiveIndexedFetchStats(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	a, err := CreateArchive(historyArchiveOptions(dir, 64<<10))
 	if err != nil {
@@ -268,6 +270,7 @@ func TestArchiveIndexedFetchStats(t *testing.T) {
 // consults first, or by its index. (With a long-lived cluster in the mix, as in the other tests,
 // no segment can be ruled out: each one's range spans it.)
 func TestArchiveIndexedFetchSkipsSegments(t *testing.T) {
+	t.Parallel()
 	a, err := CreateArchive(historyArchiveOptions(t.TempDir(), 64<<10))
 	if err != nil {
 		t.Fatal(err)
@@ -298,6 +301,7 @@ func TestArchiveIndexedFetchSkipsSegments(t *testing.T) {
 // EXPLAIN names the path and why: the index probe and its candidates, the scan when the
 // index would hand over nearly everything, or the scan when nothing is indexed.
 func TestArchiveIndexedFetchExplain(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	a, err := CreateArchive(historyArchiveOptions(dir, 64<<10))
 	if err != nil {

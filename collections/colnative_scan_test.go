@@ -209,6 +209,7 @@ func columnarReopenRound(t *testing.T) {
 // records, and zone pruning SKIPS segments that contain matches -- both silently, and faster than
 // the correct answer, which is why they are worth their own test rather than trusting the scan.
 func TestColumnarizedShardServesIndexedQueries(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c, err := Open(Options{
 		Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1,
@@ -440,6 +441,7 @@ func TestSchemaReviewColumnarizesByDefault(t *testing.T) {
 // TestColumnarSegmentBudgetDisables checks the off switch, which matters because it is the only way
 // back to the whole-record shape for a caller who does not want the rewrite.
 func TestColumnarSegmentBudgetDisables(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1,
 		ColumnarSegmentBudget: -1})
@@ -487,6 +489,7 @@ func TestColumnarSegmentBudgetDisables(t *testing.T) {
 // over a large existing archive converges over several maintenance intervals instead of stalling on
 // a single pass that rewrites the whole history.
 func TestColumnarSegmentBudgetBounds(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16, GroupSchemaCount: -1,
 		ColumnarSegmentBudget: 2})
@@ -695,6 +698,7 @@ func bothStorageForms(t *testing.T) (rows, cols *Collection) {
 }
 
 func TestColumnarPrefilterAgreesWithRowPath(t *testing.T) {
+	t.Parallel()
 	build := func(columnarize bool) *Collection {
 		budget := 0
 		if !columnarize {
@@ -808,6 +812,7 @@ func TestColumnarPrefilterAgreesWithRowPath(t *testing.T) {
 // `RequestMemory = ProcId * 512 + 7` came back as `Slack * 512 + 7`. Structurally perfect ad, every
 // literal correct, wrong query results, nothing logged. See storableInColumn.
 func TestColumnarizedAdsAreByteEqualIncludingExpressions(t *testing.T) {
+	t.Parallel()
 	rows, cols := bothStorageForms(t)
 	defer rows.Close()
 	defer cols.Close()
@@ -873,6 +878,7 @@ func readProjected(t *testing.T, c *Collection, expr string, proj []string) []st
 // sometimes an expression (never moved into a column), one that only some records define, and a
 // projection naming something absent everywhere.
 func TestColumnarProjectedReadsMatchRowPath(t *testing.T) {
+	t.Parallel()
 	rows, cols := bothStorageForms(t)
 	defer rows.Close()
 	defer cols.Close()
@@ -926,6 +932,7 @@ func TestColumnarProjectedReadsMatchRowPath(t *testing.T) {
 // block for a segment that already has one, the group accelerator silently disappears for every
 // columnarized segment -- correct answers, quietly slower, and nothing anywhere says so.
 func TestColumnarizedSegmentKeepsGroupColumns(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	// GroupStabilityRuns: 1 so one derivation promotes a group -- the default waits for members to
 	// keep recurring across passes, which a single-shot test cannot produce.
@@ -1075,6 +1082,7 @@ func bundledGroupFixture(t *testing.T, columnarize bool) *Collection {
 // deliberately includes PARTIAL members, whose values stay in the record and must therefore appear
 // exactly once rather than twice or not at all.
 func TestColumnarizedGroupAttributesRoundTrip(t *testing.T) {
+	t.Parallel()
 	rows := bundledGroupFixture(t, false)
 	defer rows.Close()
 	cols := bundledGroupFixture(t, true)
@@ -1149,6 +1157,7 @@ func TestColumnarizedGroupAttributesRoundTrip(t *testing.T) {
 // What this requires is that the ads keep reading back, and that the segments keep their columnar path
 // rather than silently degrading to reassembly for the rest of the process.
 func TestReschemaKeepsColumnarizedSegmentsReadable(t *testing.T) {
+	t.Parallel()
 	c := bundledGroupFixture(t, true)
 	defer c.Close()
 
@@ -1210,6 +1219,7 @@ func TestReschemaKeepsColumnarizedSegmentsReadable(t *testing.T) {
 // those attributes, with everything else looking correct -- which is the failure mode this format has
 // produced twice before and neither time announced itself.
 func TestColumnarizedGroupColumnsSurviveReopen(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	c, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16,
 		GroupSchemaCount: 4, GroupStabilityRuns: 1})

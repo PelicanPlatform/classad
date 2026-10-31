@@ -161,6 +161,7 @@ func TestBuildColumnarFromSegmentRowGroups(t *testing.T) {
 //
 // A segment's FINAL group is exempt and must be: it holds whatever records remain.
 func TestColGroupsAlignedToEight(t *testing.T) {
+	t.Parallel()
 	// Ads fat enough that the BYTE rule binds, which is the rule alignment applies to. If the row cap
 	// bound instead, every block would be colGroupMaxRows and the test would pass without testing
 	// anything.
