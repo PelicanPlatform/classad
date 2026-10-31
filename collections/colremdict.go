@@ -52,9 +52,9 @@ import (
 // as values. A segment with no dictionary is still written as version 1, readable by older builds.
 
 // remnantDictDefault is whether columnarization writes remnant dictionaries when Options.RemnantDictionary
-// is 0. Off for now: a build that reads them has to be the rollback target before any is written, because
-// an older build refuses the whole collection once one segment holds one.
-const remnantDictDefault = false
+// is 0. On: a build that predates them refuses a collection holding one rather than misread it, and a
+// caller that must stay readable by such a build sets the option negative.
+const remnantDictDefault = true
 
 // writeRemnantDict reports whether columnarization should build remnant dictionaries.
 func (c *Collection) writeRemnantDict() bool {

@@ -125,7 +125,7 @@ type ArchiveOptions struct {
 	GroupMaxPartialFrac float64
 
 	// RemnantDictionary stores the values columnarized records repeat once per row group (see
-	// Options.RemnantDictionary). Off by default; positive turns it on.
+	// Options.RemnantDictionary). On by default; negative turns it off.
 	RemnantDictionary int
 
 	// InternAtSeal interns each segment as soon as it seals (see Options.InternAtSeal), so an

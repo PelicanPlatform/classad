@@ -1101,9 +1101,9 @@ value.
 
 A payload whose blocks carry a dictionary is written as version 2; one whose blocks do
 not is still version 1. A build that predates version 2 refuses a collection holding one
-(`ErrUnsupportedColumnarVersion`) rather than read references as values, which is why the
-option is off by default until a build that reads it is the rollback target. Existing
-segments gain dictionaries only when columnarization rewrites them.
+(`ErrUnsupportedColumnarVersion`) rather than read references as values; nothing is lost,
+and rolling forward reads every record. The option is on by default, and a negative value
+turns it off. Existing segments gain dictionaries only when columnarization rewrites them.
 
 ### Row groups
 
@@ -2669,7 +2669,7 @@ type Options struct {
     Ordered             []OrderSpec
     // Columnar
     GroupSchemaCount, GroupStabilityRuns, ColumnarSegmentBudget, RowGroupBytes int
-    RemnantDictionary   int   // per-row-group dictionary of repeated remnant values; off by default
+    RemnantDictionary   int   // per-row-group dictionary of repeated remnant values; on by default
     GroupMergeJaccard, GroupMaxPartialFrac float64
     MutatingBlockCacheBytes, ArchiveBlockCacheBytes int64   // process-global budgets
     // Versions and history

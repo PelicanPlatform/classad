@@ -170,13 +170,14 @@ type Options struct {
 	// non-literal values its records repeat -- expressions, nested records and lists such as a
 	// cluster's shared Requirements -- once, with each record holding a short reference in their place
 	// (see colremdict.go). Measured on a production AP's history, that removed 13-30% of columnarized
-	// segment bytes (8-16% on epoch history). A positive value turns it on, a negative one off, and 0 takes the default, which
-	// is OFF in this release.
+	// segment bytes (8-16% on epoch history). 0 takes the default, which is ON; a negative value turns
+	// it off, and a positive one on.
 	//
-	// Off by default because of what an older build does with such a segment: it refuses to open the
-	// collection (ErrUnsupportedColumnarVersion) rather than misread a reference, so turning this on
-	// makes a rollback to a build that does not read dictionaries unable to open the table until it
-	// is rolled forward again. Every build from this one on reads them whatever this is set to.
+	// What an older build does with such a segment: it refuses to open the collection
+	// (ErrUnsupportedColumnarVersion) rather than misread a reference, and its fsck reports the segment's
+	// payload version as unsupported. Nothing is lost or modified, and rolling forward reads every
+	// record. A caller that must stay openable by a build that predates dictionaries sets this negative.
+	// Every build from this one on reads them whatever this is set to.
 	RemnantDictionary int
 	// RowGroupBytes is the uncompressed record-bytes budget for one columnar row group. 0 uses
 	// colGroupTargetBytes (128 KiB).
