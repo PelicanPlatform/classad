@@ -1447,19 +1447,60 @@ needs it.
      flag is an optimization and not a correctness dependency.
 
    What is left here is **`While`**, which declines. Its live mask narrows across iterations and the
-   loop runs until no record is still true, so it needs item 3 first — per-record trip accounting is
-   the thing that bounds it, and there is nothing else that could.
-3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Now also what `While`
-   waits on, which moves it from "required before O3" to "required before the vector path is
-   complete". Required *before* O3, not
-   after: budget consumption is one of the four quantities scalar and vector execution are supposed to
-   agree on elementwise, and it is the one that localizes a bug the values alone would hide.
+   loop runs until no record is still true, so it needs the per-record trip limit that is the
+   remainder of item 3 — that is the thing that bounds it, and there is nothing else that could.
+
+   The trip limit is cheaper than "per-record" makes it sound, and the reason is a property
+   predication already provides: **every live record in a loop is on the same iteration**, because
+   they advance in lockstep and a record that drops out stops being live. So a scalar per-region
+   iteration count plus the live mask *is* a per-record trip limit — the records still live at
+   iteration L are exactly the ones that have taken L trips.
+3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** ~~Required before O3.~~
+   **Built.** A charged step is now a *value operation*, the vector executor bills each record for
+   what it would have run scalar, and both are verified against the stack interpreter per record.
+   What is left of this item is the **per-record trip limit**, which only `While` needs.
+
+   Three things the build settled, none of which was in §3.1 or §14.5:
+
+   - **Which instructions count, and why the answer is forced.** The three executors span two
+     instruction sets. Counting every instruction makes them disagree by construction — the register
+     form spends a move on a join and on every local read, where the stack form leaves a value in
+     place, and neither is doing more work. Counting only value operations makes the lowering 1:1, so
+     a record's charge is a property of the **expression** rather than of the form it was lowered to.
+     That is what lets a divergence between two executors be attributed rather than merely noticed.
+     Measured over every corpus in the package before being built on: 17577 record-expression pairs,
+     zero disagreements.
+   - **The charge forced predication onto expressions, which turned out to be worth more than the
+     charge.** §14.5 resolved the charge for a predicated instruction and said nothing about the
+     three constructs that are not predicated — Elvis, the conditional, and the `&&`/`||`
+     short-circuit — which evaluate every path for everybody. Billing a record for a path it would
+     have jumped over required narrowing the live mask around each of them; and once the mask is
+     there, a path that **no** record takes can simply be skipped. 2.98x on a selective conjunction,
+     3.58x on an Elvis whose fallback is never needed, 1.51x on a conditional.
+   - **Accounting must not be per instruction.** Testing the opcode, accumulating the charge and
+     comparing it to the budget cost **11% of a string-comparison scan together**, where each alone
+     cost between 1% and 4%. The superlinearity is the signal: that is a code-layout effect in the
+     dispatch loop, not arithmetic, and the way out of one is to take the work out of the loop rather
+     than to shave it. The charge for a run of instructions is now read from a prefix sum built once
+     per program, and the executor does arithmetic only where a run ends.
+
+   §14.5 should absorb the first and third of those; §14.1's table should note that the live mask is
+   now read for something other than a store, which is the condition it named for its own rules
+   becoming load-bearing.
 4. **O3 itself (§7.3).** The deliverable that proves the retarget. Everything above exists to make it
    a real test rather than a tautology.
 5. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
    both need the vector path to exist before they mean anything — a form is a property of a `Vec`, and
    a deferred load defers a decompression. Measured context for sizing: roughly 78% of mutable read
    CPU is zstd, so a load not performed is worth more than any amount of arithmetic removed.
+
+   One concrete thing to build here, which arrived as a request from outside: **a `Vec` has nowhere
+   to record that its column is uniformly typed**, and the storage layer already knows. `loadNum`
+   writes one declared state across an escape-free column, and the `Raw` form carries no per-element
+   state at all. A consumer that could be told "every element of this column is an integer" rather
+   than having to scan for it gets the fact for free; today it has to rediscover it. The flag belongs
+   with form selection because it *is* a form distinction, and the rule that goes with it is the
+   ordinary one: any kernel that writes per-element states clears it.
 6. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
    blocks the database use, and `for` over a *per-record* list stays declined (§2.3) until open
    question 4 gets its density argument.
@@ -1597,6 +1638,14 @@ other than deciding a store — an early exit when no record is live, or compact
 §14.3's condition for predication paying for itself at all. So the rules are kept, and the fact that
 nothing tests them is written next to them rather than discovered later.
 
+**That condition has since arrived, from an unexpected direction.** Making the charge exact required
+narrowing `live` around the three constructs that evaluate every path — Elvis, the conditional and
+the short-circuit — and the executor now reads the narrowed mask to decide whether a path is taken
+by *nobody*, in which case it jumps over it. So `live` is read for something other than a store
+today, and the arm-mask rules above are closer to load-bearing than when this was written. They are
+still not *tested*, because the constructs that skip are expression-level and cannot fault; a
+statement-level early exit is what would finally make them so.
+
 ### 14.2 The one new kernel, which already half exists
 
 §2.3 calls masked assignment "the one genuinely new runtime primitive". It is closer than that
@@ -1702,6 +1751,37 @@ These are two different quantities and the draft conflated them. Resolution:
   charges exactly what vector execution charges lane *i*, and O3 can compare them elementwise.
 - **Real work** — a benchmark's business, not the budget's. It is the quantity §14.3's table is about,
   and it is what the optimizer minimizes.
+
+**Two things this section did not say, both settled by building it.**
+
+*Which instructions are charged at all.* Not every one: **a step is a value operation** — a literal,
+an attribute load, an operator, a logical combine, a member test, a call, a delegated subtree — and
+not a jump, a short-circuit test, a move, a local load or store, or a nop. The line is forced rather
+than chosen, because the three executors span **two instruction sets**: the stack interpreter and the
+vector executor share one, the register executor has its own. Counting every instruction makes them
+disagree by construction, since the register form spends a move on a join and on every local read
+where the stack form leaves a value in place, and neither is doing more work than the other. Counting
+value operations makes the lowering 1:1, so a record's charge is a property of the expression rather
+than of the form it was lowered to — which is the whole point of having the quantity. Checked over
+every corpus in the package before anything was built on it: 17577 record-expression pairs, zero
+disagreements.
+
+That choice has a termination obligation, and it is discharged against the **compiler** rather than
+the interpreter: a loop whose condition and body contained no value operation would never be billed
+and so would never stop, and it cannot exist because every back edge passes through a condition
+expression and the smallest expression is a literal.
+
+*Where the accounting happens.* **Not in the dispatch loop.** Testing the opcode, accumulating the
+charge and comparing it to the budget cost **11% of a string-comparison scan together**, where each
+one alone cost between 1% and 4%. The superlinearity is the whole signal — it says the cost is code
+layout in a hot switch rather than the arithmetic, and the answer to that is to remove the work, not
+to shave it. The charge for a contiguous run of instructions is a static property, so it is read from
+a prefix sum built once per program and billed only where a run ends: a jump, a region boundary, the
+end. The dispatch loop does no accounting at all, and the regression goes to a median of +0.45%.
+
+The general form is worth keeping: **a measurement whose parts are each small and whose sum is not is
+not telling you about the parts.** Three separate 1-4% costs that compose to 11% are one effect, and
+optimizing any of the three individually would have found nothing.
 
 The thing to notice before accepting this: charged steps no longer bound wall time tightly, because
 dead-lane work is unbilled. The slack is bounded by the batch width — at most 8192
