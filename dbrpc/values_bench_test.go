@@ -24,16 +24,29 @@ import (
 // as a value the benchmark reads. What differs is whether a record is rendered to ClassAd source
 // text for the consumer to parse straight back.
 func BenchmarkReadShapes(b *testing.B) {
-	for _, columnar := range []bool{false, true} {
-		name := "records"
-		if columnar {
-			name = "columnar"
+	// AD WIDTH is a dimension, not a detail. A six-column projection out of a nine-attribute
+	// record is a different question from the same projection out of a job ad, and the narrow
+	// case flatters whichever path reads the whole record: at nine attributes reassembly is
+	// nearly free, so a columnar projection has almost nothing to beat. Real job ads are wide,
+	// so a benchmark that only measured the narrow one would be measuring the fixture.
+	for _, wide := range []bool{false, true} {
+		width := "narrow"
+		if wide {
+			width = "wide"
 		}
-		b.Run(name, func(b *testing.B) { benchReadFixture(b, columnar) })
+		b.Run(width, func(b *testing.B) {
+			for _, columnar := range []bool{false, true} {
+				name := "records"
+				if columnar {
+					name = "columnar"
+				}
+				b.Run(name, func(b *testing.B) { benchReadFixture(b, columnar, wide) })
+			}
+		})
 	}
 }
 
-func benchReadFixture(b *testing.B, columnar bool) {
+func benchReadFixture(b *testing.B, columnar, wide bool) {
 	const n = 20000
 	cat, err := db.OpenCatalog(b.TempDir())
 	if err != nil {
@@ -45,11 +58,23 @@ func benchReadFixture(b *testing.B, columnar bool) {
 		b.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		ad, perr := classad.ParseOld(fmt.Sprintf(
+		text := fmt.Sprintf(
 			"ClusterId = %d\nProcId = %d\nOwner = \"u%d\"\nJobStatus = %d\n"+
 				"ResidentSetSize = %d\nMemoryUsage = (ResidentSetSize + 1023) / 1024\n"+
 				"RequestMemory = %d\nCmd = \"/bin/run%d\"\nQDate = %d\n",
-			i, i%10, i%43, 1+i%6, 1024*(1+i%37), 512*(1+i%5), i%7, 1700000000+i))
+			i, i%10, i%43, 1+i%6, 1024*(1+i%37), 512*(1+i%5), i%7, 1700000000+i)
+		if wide {
+			// Filler of the kind a real job ad carries: a mix of numbers and strings that no
+			// projection here names, so they cost the read exactly what carrying them costs.
+			for f := 0; f < 36; f++ {
+				if f%3 == 0 {
+					text += fmt.Sprintf("Pad%d = \"v%d-%d\"\n", f, f, i%97)
+				} else {
+					text += fmt.Sprintf("Pad%d = %d\n", f, (i*7+f)%100000)
+				}
+			}
+		}
+		ad, perr := classad.ParseOld(text)
 		if perr != nil {
 			b.Fatal(perr)
 		}
