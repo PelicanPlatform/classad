@@ -321,10 +321,10 @@ integers, per element:
 
 | guest | untrusted | trusted |
 |---|---|---|
-| version 1, a branch per element | 25.7 ns | 5.3 ns |
-| version 2, branch-free, one record per back-edge | 22.5 ns | 2.2 ns |
-| version 2, branch-free, eight records per back-edge | 5.6 ns | 1.9 ns |
-| version 2, the same eight as four `i64x2` lanes | 5.1 ns | 1.7 ns |
+| version 1, a branch per element | 25.9 ns | 5.29 ns |
+| version 2, branch-free, one record per back-edge | 22.7 ns | 2.18 ns |
+| version 2, branch-free, eight records per back-edge | 5.69 ns | 1.90 ns |
+| version 2, the same eight as four `i64x2` lanes | 5.23 ns | 1.69 ns |
 
 Read the last two rows together before you reach for SIMD. Most of the untrusted
 win is **unrolling**, not vector lanes: the runtime is charging you per back-edge
