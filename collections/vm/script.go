@@ -100,6 +100,54 @@ func (s *Script) Let(name string, expr ast.Expr) *Script {
 	return s
 }
 
+// If runs then when cond is true and els when it is false. Either block may be nil.
+//
+// A condition that is NEITHER true nor false -- UNDEFINED, or a type that cannot be one, such as a
+// string or a list -- is a FAULT: the script ends with ERROR. It is not a branch not taken. Treating
+// "I could not tell" as "no" is how a misspelled attribute silently turns a script into one that
+// quietly does nothing, and a script runs once, so there is no second record to notice.
+//
+// A local bound inside a branch is the same local as everywhere else -- one register -- so a read
+// after the If sees whatever path ran. Where no path bound it, it reads UNDEFINED, because the
+// lowering can see that no store reaches that read.
+func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
+	if s.err != nil {
+		return s
+	}
+	if s.hasRes {
+		s.err = errors.New("vm: If after Result")
+		return s
+	}
+	s.emitExpr(cond)
+	s.c.p.conds = append(s.c.p.conds, condTargets{})
+	k := int32(len(s.c.p.conds) - 1)
+	s.c.ins(OpBranchVoid, k)
+
+	if then != nil {
+		then(s)
+	}
+	jThen := s.c.ins(OpJmpVoid, -1)
+
+	onFalse := len(s.c.p.code)
+	if els != nil {
+		els(s)
+	}
+	jElse := s.c.ins(OpJmpVoid, -1)
+
+	onFault := len(s.c.p.code)
+	s.c.ins(OpFault, 0)
+
+	end := len(s.c.p.code)
+	// UNDEFINED and ERROR share the fault, because the script's answer is the same either way: it
+	// could not tell which branch to take.
+	s.c.p.conds[k] = condTargets{
+		onFalse: int32(onFalse), onUndef: int32(onFault), onError: int32(onFault), end: int32(end),
+	}
+	s.c.patch(jThen, end)
+	s.c.patch(jElse, end)
+	return s
+}
+
 // Result sets the script's value. It must be called last and exactly once.
 func (s *Script) Result(expr ast.Expr) *Script {
 	if s.err != nil {

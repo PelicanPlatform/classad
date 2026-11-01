@@ -65,7 +65,7 @@ func Optimize(rp *RegProgram, passes OptPasses) *RegProgram {
 func regUses(rp *RegProgram, in RegInstr, buf []int32) []int32 {
 	buf = buf[:0]
 	switch in.Op {
-	case RNop, RConst, RTrue, RFalse, RUndef, RError, RLoadRef, REvalNode, RJump:
+	case RNop, RConst, RTrue, RFalse, RUndef, RError, RLoadRef, REvalNode, RJump, RFault:
 		// No register operands.
 	case RBinop, RCombineAnd, RCombineOr:
 		buf = append(buf, in.A, in.B)
@@ -129,7 +129,7 @@ func jumpTargets(rp *RegProgram) []bool {
 // isBranch reports whether an instruction can transfer control other than to the next instruction.
 func isBranch(in RegInstr) bool {
 	switch in.Op {
-	case RShortAnd, RShortOr, RJmpIfDefined, RJump, RBranchCond:
+	case RShortAnd, RShortOr, RJmpIfDefined, RJump, RBranchCond, RFault:
 		return true
 	}
 	return false

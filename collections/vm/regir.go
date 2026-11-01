@@ -108,6 +108,9 @@ const (
 	// RJump jumps unconditionally to T.
 	RJump
 
+	// RFault ends execution with ERROR. See OpFault.
+	RFault
+
 	// RBranchCond dispatches on classad.ConditionState(A) using the register-form target triple
 	// RegProgram.conds[Imm]: CondTrue falls through, the rest jump. Dst is the register every path of
 	// the conditional writes, so the value is in one place at the join whichever path ran.
@@ -261,9 +264,9 @@ func stackJumpTargets(p *Program) []bool {
 	}
 	for _, in := range p.code {
 		switch in.Op {
-		case OpShortAnd, OpShortOr, OpJmpIfNotUndef, OpJmp:
+		case OpShortAnd, OpShortOr, OpJmpIfNotUndef, OpJmp, OpJmpVoid:
 			mark(in.A)
-		case OpBranchCond:
+		case OpBranchCond, OpBranchVoid:
 			c := p.conds[in.A]
 			mark(c.onFalse)
 			mark(c.onUndef)
@@ -571,6 +574,22 @@ func (l *lowerer) one(ip int) {
 		ci := l.emit(RegInstr{Op: RBranchCond, Dst: d, A: a, Imm: k})
 		l.condInstrs = append(l.condInstrs, ci)
 		l.openConds = append(l.openConds, &joinPoint{dst: d, end: -1, isCond: true})
+	case OpBranchVoid:
+		// A statement branch: the condition is consumed and nothing is produced, so there is no
+		// destination to join on and no entry on the open-conditional stack. Dst is a register
+		// nothing reads, which keeps the instruction's shape uniform for the optimizer's use/def
+		// view rather than making it a special case there.
+		a := l.pop()
+		t := l.src.conds[in.A]
+		l.rp.conds = append(l.rp.conds, t)
+		k := int32(len(l.rp.conds) - 1)
+		ci := l.emit(RegInstr{Op: RBranchCond, Dst: l.reg(), A: a, Imm: k})
+		l.condInstrs = append(l.condInstrs, ci)
+	case OpJmpVoid:
+		j := l.emit(RegInstr{Op: RJump, T: in.A})
+		l.jumps = append(l.jumps, j)
+	case OpFault:
+		l.emit(RegInstr{Op: RFault})
 	case OpJmp:
 		// Belongs to the innermost open conditional. Its value goes into that conditional's
 		// destination before the jump, and the jump lands just after the join's own move.
@@ -683,6 +702,10 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classa
 			ip++
 		case RJump:
 			ip = int(in.T)
+		case RFault:
+			// Ends the script. Returning here rather than jumping to an end label keeps the fault
+			// out of the register file: there is no result to have produced.
+			return classad.NewErrorValue()
 		case RBranchCond:
 			t := rp.conds[in.Imm]
 			switch classad.ConditionState(regs[in.A]) {

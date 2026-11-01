@@ -3,6 +3,8 @@ package vm
 import (
 	"testing"
 
+	"github.com/PelicanPlatform/classad/ast"
+
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/parser"
 )
@@ -404,5 +406,68 @@ func TestOptimizerKnowsTheOpcodesWeEmit(t *testing.T) {
 	}
 	for _, src := range parityCorpusExprs {
 		check(src)
+	}
+}
+
+// TestOptimizeAgreesOnBranchingScripts extends the law to scripts with control flow, which the
+// passes only started seeing in statement position when If arrived.
+//
+// It matters because both passes reason about reachability. Copy propagation refuses to substitute
+// across a point control can arrive at, and dead code elimination must not delete a store that only
+// one path makes. A straight-line corpus exercises neither.
+func TestOptimizeAgreesOnBranchingScripts(t *testing.T) {
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		return e
+	}
+	for _, cond := range []string{"Cpus > 2", "Cpus > 100", "Missing", "Flag", "Cpus"} {
+		for _, shape := range []struct {
+			name      string
+			then, els string
+			result    string
+		}{
+			{"both branches bind", "1", "2", "x"},
+			{"only then binds", "1", "", "x"},
+			{"only else binds", "", "2", "x"},
+			{"branch reads the local", "x + 1", "x - 1", "x"},
+			{"result mixes local and attribute", "1", "2", "x + Cpus"},
+			{"local read twice after merge", "1", "2", "x + x"},
+		} {
+			build := func() *ScriptProgram {
+				s := NewScript().Let("x", parse("0"))
+				s = s.If(parse(cond),
+					func(b *Script) {
+						if shape.then != "" {
+							b.Let("x", parse(shape.then))
+						}
+					},
+					func(b *Script) {
+						if shape.els != "" {
+							b.Let("x", parse(shape.els))
+						}
+					})
+				sp, err := s.Result(parse(shape.result)).Compile()
+				if err != nil {
+					t.Fatalf("compile: %v", err)
+				}
+				return sp
+			}
+			for _, scopeSrc := range []string{`[Cpus = 4; Flag = true]`, `[Cpus = 1; Flag = false]`, `[]`} {
+				scope, err := classad.Parse(scopeSrc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sp := build()
+				want := RunRegisters(sp.RegProgram(), scope)
+				got := RunRegisters(Optimize(sp.RegProgram(), AllPasses()), scope)
+				if !valuesEqual(want, got) {
+					t.Errorf("%s / cond=%q / scope=%s: unoptimized=%s optimized=%s",
+						shape.name, cond, scopeSrc, describe(want), describe(got))
+				}
+			}
+		}
 	}
 }

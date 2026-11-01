@@ -122,6 +122,30 @@ const (
 	//
 	// Popping is what makes a statement stack-neutral, so the next one starts clean.
 	OpStoreLocal
+
+	// OpBranchVoid pops the condition and dispatches on classad.ConditionState using conds[A], like
+	// OpBranchCond -- but it produces NO value and has no join.
+	//
+	// The two cannot be the same opcode. OpBranchCond is an expression: each of its paths leaves a
+	// value and they converge on one register. A statement branch's paths leave nothing, and what
+	// converges is the LOCALS they wrote, each of which is already a single register. There is
+	// nothing to join, and a lowering that tried to would be looking for values that are not there.
+	OpBranchVoid
+
+	// OpJmpVoid jumps unconditionally to A, carrying no value. OpJmp is its expression counterpart
+	// and moves the path's value into the conditional's destination first.
+	OpJmpVoid
+
+	// OpFault ends the script with ERROR.
+	//
+	// It is reached when a condition is neither true nor false -- UNDEFINED, or a type that cannot
+	// be one, such as a string or a list. That is a FAULT rather than a branch not taken, because
+	// the alternative is to treat "I could not tell" as "no", which is how a misspelled attribute
+	// silently turns a script into one that does nothing.
+	//
+	// In the scalar context a fault ends the script, which is the degenerate case of faulting the
+	// one record being evaluated.
+	OpFault
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose

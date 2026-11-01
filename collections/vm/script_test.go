@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/ast"
+
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/parser"
 )
@@ -371,5 +373,157 @@ func TestScriptStatementsAreStackNeutral(t *testing.T) {
 	}
 	if got := sp.Run(scope).String(); got != "15" {
 		t.Errorf("three bindings of Cpus+1 summed => %s, want 15", got)
+	}
+}
+
+// scriptIf builds `x = <init>; if <cond>: x = <then> else: x = <els>; result = x` and runs it.
+func scriptIf(t *testing.T, scope *classad.ClassAd, init, cond, then, els string) classad.Value {
+	t.Helper()
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		return e
+	}
+	s := NewScript()
+	if init != "" {
+		s = s.Let("x", parse(init))
+	}
+	s = s.If(parse(cond),
+		func(b *Script) {
+			if then != "" {
+				b.Let("x", parse(then))
+			}
+		},
+		func(b *Script) {
+			if els != "" {
+				b.Let("x", parse(els))
+			}
+		})
+	sp, err := s.Result(parse("x")).Compile()
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	return sp.Run(scope)
+}
+
+// TestScriptIf covers the branch itself: which path runs, that a local written on a path is visible
+// after the merge, and that a condition which is neither true nor false FAULTS rather than falling
+// through to the false branch.
+func TestScriptIf(t *testing.T) {
+	scope, err := classad.Parse(`[ Cpus = 4; Owner = "alice"; Flag = true ]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, init, cond, then, els, want string }{
+		{"true takes then", "0", "Cpus > 2", "1", "2", "1"},
+		{"false takes else", "0", "Cpus > 100", "1", "2", "2"},
+		{"nonzero number is true", "0", "Cpus", "1", "2", "1"},
+		{"zero is false", "0", "0", "1", "2", "2"},
+		{"then may leave it alone", "7", "Cpus > 2", "", "2", "7"},
+		{"else may leave it alone", "7", "Cpus > 100", "1", "", "7"},
+		{"the branch can read the local", "5", "Cpus > 2", "x + 1", "x - 1", "6"},
+		// A condition that is neither true nor false ends the script.
+		{"undefined condition faults", "0", "Missing", "1", "2", "error"},
+		{"string condition faults", "0", "Owner", "1", "2", "error"},
+		{"error condition faults", "0", "error", "1", "2", "error"},
+		{"list condition faults", "0", "{1, 2}", "1", "2", "error"},
+		// A fault beats whatever the branches would have produced.
+		{"fault even when both branches agree", "0", "Missing", "9", "9", "error"},
+	} {
+		if got := scriptIf(t, scope, tc.init, tc.cond, tc.then, tc.els).String(); got != tc.want {
+			t.Errorf("%s: got %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestScriptIfBindsOnOnePath is the shape the previous binding model could not express: a local
+// bound ONLY inside a branch, read after the merge. It is one register either way, so the read sees
+// the binding when the branch ran and UNDEFINED when it did not -- not a compile error, and not a
+// stale value from somewhere else.
+func TestScriptIfBindsOnOnePath(t *testing.T) {
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	build := func() *ScriptProgram {
+		sp, err := NewScript().
+			If(parse("Cpus > 2"), func(b *Script) { b.Let("y", parse("11")) }, nil).
+			Result(parse("y")).Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sp
+	}
+	for _, tc := range []struct{ scope, want string }{
+		{`[ Cpus = 4 ]`, "11"},        // the branch ran
+		{`[ Cpus = 1 ]`, "undefined"}, // it did not, and y was never stored
+	} {
+		scope, err := classad.Parse(tc.scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := build().Run(scope).String(); got != tc.want {
+			t.Errorf("%s: y after a one-sided binding = %s, want %s", tc.scope, got, tc.want)
+		}
+	}
+	// The read is not dominated by the store, so the lowering must have initialized it. Without that
+	// the undefined case above would read a register nothing ever wrote.
+	if !localsNeedingInit(build().Program())[0] {
+		t.Error("a local bound only inside a branch was not marked as needing an initializer")
+	}
+}
+
+// TestScriptIfNested checks that branches nest, including a fault raised inside one.
+func TestScriptIfNested(t *testing.T) {
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	build := func() *ScriptProgram {
+		sp, err := NewScript().
+			Let("x", parse("0")).
+			If(parse("Cpus > 2"),
+				func(b *Script) {
+					b.If(parse("Owner == \"alice\""),
+						func(c *Script) { c.Let("x", parse("1")) },
+						func(c *Script) { c.Let("x", parse("2")) })
+				},
+				func(b *Script) { b.Let("x", parse("3")) }).
+			Result(parse("x")).Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sp
+	}
+	for _, tc := range []struct{ scope, want string }{
+		{`[ Cpus = 4; Owner = "alice" ]`, "1"},
+		{`[ Cpus = 4; Owner = "bob" ]`, "2"},
+		{`[ Cpus = 1; Owner = "bob" ]`, "3"},
+		{`[ Cpus = 4 ]`, "error"}, // the INNER condition is undefined
+		{`[ Owner = "alice" ]`, "error"},
+	} {
+		scope, err := classad.Parse(tc.scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := build().Run(scope).String(); got != tc.want {
+			t.Errorf("%s: nested if = %s, want %s", tc.scope, got, tc.want)
+		}
+	}
+}
+
+// TestScriptIfErrors pins the misuse cases.
+func TestScriptIfErrors(t *testing.T) {
+	e, _ := parser.ParseExpr("1")
+	if _, err := NewScript().Result(e).If(e, nil, nil).Compile(); err == nil {
+		t.Error("If after Result: want an error")
 	}
 }
