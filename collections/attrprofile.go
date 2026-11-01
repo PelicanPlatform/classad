@@ -25,6 +25,16 @@ import (
 // profiles the SAMPLE rather than the schema: every attribute of every sampled record,
 // classified by wire.ClassifyNode, with exact bounds accumulated per numeric kind.
 //
+// STORED CLASSES, NOT EVALUATED ONES. This reports what the records HOLD. An attribute stored
+// as an expression is reported as wire.ClassExpr even though evaluating it would yield a
+// scalar -- on a real pool, MemoryUsage is an expression in almost every ad and an integer in a
+// few, and its evaluated type is integer throughout. A consumer whose rule is "evaluate first,
+// then type" therefore cannot read a type decision straight off these counts for any attribute
+// with a ClassExpr share; it needs the evaluated distribution, which is a separate measurement
+// (and a more expensive one, since evaluating an expression needs the whole ad rather than one
+// node). What this does answer for such an attribute is that it IS expression-valued and how
+// often, which is what decides whether evaluating is worth it at all.
+//
 // PRIVACY. Values are never reported -- only counts, and bounds for numeric kinds. An
 // encrypted value classifies as wire.ClassEncrypted and is never looked through, so its
 // contents cannot reach a profile. Private (secret) attributes are NOT filtered here: this is
@@ -68,10 +78,43 @@ type AttrTypeProfile struct {
 	RealMax  float64 `json:"realMax,omitempty"`
 }
 
-// Uniform reports whether every sampled value was the same class -- the case where a declared
-// type needs no coercion at all. It says nothing about absence: an attribute present in half
-// the sample and an integer every time it is present is uniform.
-func (p AttrTypeProfile) Uniform() bool { return len(p.Classes) == 1 }
+// UNDEFINED AND ERROR ARE NOT TYPES. A stored `undefined` says the attribute has no value
+// here, which is the same thing an absent attribute says and the same thing a consumer
+// represents as a null -- it does not compete with int or string for what the attribute's TYPE
+// is. Measured on a real pool, conflating them badly overstates how mixed the data is: the two
+// most heterogeneous-looking attributes in a 2000-ad history sample were 25 strings against
+// 1975 `undefined`, which is a uniformly-string attribute that is usually absent, not a mixed
+// one. So the type questions are asked over ValueClasses, and undefined/error are counted as
+// nulls alongside absence.
+
+// ValueClasses is Classes without the classes that carry no type -- undefined and error. It is
+// the set a declared type has to cover.
+func (p AttrTypeProfile) ValueClasses() map[string]int {
+	out := make(map[string]int, len(p.Classes))
+	for name, n := range p.Classes {
+		if name == wire.ClassUndefined.String() || name == wire.ClassError.String() {
+			continue
+		}
+		out[name] = n
+	}
+	return out
+}
+
+// Nulls counts the sampled values that carry no type: stored `undefined` and `error`. Absence
+// is NOT included -- that is Present against the sampled total, and a consumer that nulls both
+// has to add them.
+func (p AttrTypeProfile) Nulls() int {
+	return p.Classes[wire.ClassUndefined.String()] + p.Classes[wire.ClassError.String()]
+}
+
+// Uniform reports whether every sampled value that carries a type was the same class -- the
+// case where a declared type needs no coercion. Nulls and absence do not break uniformity;
+// they decide whether the declared type must admit nulls, which is a separate question.
+//
+// False for an attribute that was never anything but undefined: there is no type to be uniform
+// about, and reporting true would invite a caller to declare one. Distinguish that case with
+// len(ValueClasses()) == 0.
+func (p AttrTypeProfile) Uniform() bool { return len(p.ValueClasses()) == 1 }
 
 // maxExactFloat64Int is the largest integer magnitude a float64 represents exactly. Above it,
 // consecutive integers share a float64, so a conversion loses values rather than precision in

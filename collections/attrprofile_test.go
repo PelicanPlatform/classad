@@ -47,12 +47,124 @@ func TestAttrTypeProfilesClassifiesEachKind(t *testing.T) {
 		if p.Dominant != class {
 			t.Errorf("%s: dominant %q, want %q (classes %v)", name, p.Dominant, class, p.Classes)
 		}
-		if !p.Uniform() {
-			t.Errorf("%s: classes %v, want a single class", name, p.Classes)
-		}
 		if p.Present != 50 {
 			t.Errorf("%s: present %d, want 50", name, p.Present)
 		}
+		// Nothing is always `undefined`, which carries no type: there is nothing to be
+		// uniform about, and saying otherwise would invite a caller to declare a type
+		// for it.
+		if name == "Nothing" {
+			if p.Uniform() {
+				t.Errorf("Nothing: uniform, want false (undefined carries no type)")
+			}
+			if n := len(p.ValueClasses()); n != 0 {
+				t.Errorf("Nothing: %d value classes, want 0", n)
+			}
+			if p.Nulls() != 50 {
+				t.Errorf("Nothing: nulls %d, want 50", p.Nulls())
+			}
+			continue
+		}
+		if !p.Uniform() {
+			t.Errorf("%s: classes %v, want a single value class", name, p.Classes)
+		}
+	}
+}
+
+// TestAttrTypeProfilesUndefinedIsNotAType is the pattern that dominates real data: an
+// attribute that is a string whenever it has a value and `undefined` the rest of the time. It
+// is uniformly string, not mixed -- on a 2000-ad history sample the two most
+// heterogeneous-LOOKING attributes were exactly this shape (25 strings, 1975 undefined), and
+// counting undefined as a competing class would have sent a perfectly typeable attribute to a
+// fallback type.
+func TestAttrTypeProfilesUndefinedIsNotAType(t *testing.T) {
+	c := New(Options{Shards: 1, SegmentSize: 1 << 12})
+	defer c.Close()
+	for i := 0; i < 100; i++ {
+		src := `Site=undefined`
+		if i%10 == 0 {
+			src = `Site="CHTC"`
+		}
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(t, src)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := profileOf(t, c, 1000)["Site"]
+	if !p.Uniform() {
+		t.Errorf("Site: uniform=false, want true (classes %v)", p.Classes)
+	}
+	if p.Dominant != "undefined" {
+		t.Errorf("Site: dominant %q -- Dominant is over ALL classes, so undefined winning is expected", p.Dominant)
+	}
+	if vc := p.ValueClasses(); len(vc) != 1 || vc["string"] != 10 {
+		t.Errorf("Site: value classes %v, want exactly 10 string", vc)
+	}
+	if p.Nulls() != 90 {
+		t.Errorf("Site: nulls %d, want 90", p.Nulls())
+	}
+}
+
+// TestAttrTypeProfilesErrorIsNotAType covers ERROR alongside undefined. Both carry no type and
+// both are nulls to a consumer, but they arrive by different routes -- an undefined is usually
+// "no value", an error is usually "the value could not be produced" -- so it would be easy to
+// exclude one and forget the other. (Found by mutation: dropping the error case from
+// ValueClasses passed the whole suite until this existed.)
+func TestAttrTypeProfilesErrorIsNotAType(t *testing.T) {
+	c := New(Options{Shards: 1, SegmentSize: 1 << 12})
+	defer c.Close()
+	for i := 0; i < 100; i++ {
+		src := fmt.Sprintf("Code=%d", i)
+		if i%5 == 0 {
+			src = "Code=error"
+		}
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(t, src)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := profileOf(t, c, 1000)["Code"]
+	if p.Classes["error"] != 20 {
+		t.Fatalf("Code: classes %v, want 20 error (precondition: the ads really hold errors)", p.Classes)
+	}
+	if !p.Uniform() {
+		t.Errorf("Code: uniform=false, want true -- error carries no type (classes %v)", p.Classes)
+	}
+	if vc := p.ValueClasses(); len(vc) != 1 || vc["int"] != 80 {
+		t.Errorf("Code: value classes %v, want exactly 80 int", vc)
+	}
+	if p.Nulls() != 20 {
+		t.Errorf("Code: nulls %d, want 20", p.Nulls())
+	}
+}
+
+// TestAttrTypeProfilesIntRealMixIsTypeable is the other real-data pattern, and the one the
+// exact bounds exist for. ClassAd writes an integral float without a decimal point, so a
+// genuinely float-valued attribute arrives as a mix of int and real nodes -- BytesRecvd was 67
+// int to 1933 real on a real sample. It is mixed, but it is safely a float type as long as no
+// integer is past 2^53, which is what IntsLossyAsFloat reports.
+func TestAttrTypeProfilesIntRealMixIsTypeable(t *testing.T) {
+	c := New(Options{Shards: 1, SegmentSize: 1 << 12})
+	defer c.Close()
+	for i := 0; i < 100; i++ {
+		ad := mustAdOld(t, "Tag=1")
+		if i%20 == 0 {
+			ad.InsertAttr("Bytes", int64(i)) // integral: stored as an int node
+		} else {
+			ad.InsertAttrFloat("Bytes", float64(i)+0.5)
+		}
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p := profileOf(t, c, 1000)["Bytes"]
+	if p.Uniform() {
+		t.Fatalf("Bytes: reported uniform, classes %v", p.Classes)
+	}
+	if len(p.ValueClasses()) != 2 {
+		t.Errorf("Bytes: value classes %v, want int and real", p.ValueClasses())
+	}
+	// The decision this enables: every integer round-trips, so a float type loses nothing.
+	if p.IntsLossyAsFloat != 0 {
+		t.Errorf("Bytes: lossy=%d, want 0 -- a float type would be unsafe", p.IntsLossyAsFloat)
 	}
 }
 
