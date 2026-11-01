@@ -280,6 +280,11 @@ jobs:
   # Both suites are small -- seconds to a minute or so with -race -- so
   # they run unsharded and together. dbrpc/ is far slower and gets its
   # own sharded job below, for the same reason collections does.
+  #
+  # wasmudf/ joins them: it is its own module so that the wazero dependency
+  # is opt-in rather than reaching everyone who imports classad, and its
+  # suite is a couple of seconds (the wasm fixtures are hand-written and
+  # tiny, and the only slow test is a 250ms wall-clock backstop).
   modules:
     name: Module (${{ matrix.module }})
     runs-on: ubuntu-latest
@@ -287,7 +292,7 @@ jobs:
       # Each module reports: one failing must not hide a failure in the other.
       fail-fast: false
       matrix:
-        module: [db, changefeed]
+        module: [db, changefeed, wasmudf]
 
     steps:
     - name: Check out code
