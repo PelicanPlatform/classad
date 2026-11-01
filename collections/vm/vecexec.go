@@ -46,7 +46,9 @@ import (
 // evaluator's own fold comparison, or hooks, so the representation never reaches the semantics.
 //
 // NOT HANDLED, returning ok=false so the caller falls back rather than guessing: the Elvis operator (a
-// per-record select with no combine opcode to hang it on), the magic CurrentTime attribute, delegated
+// per-record select with no combine opcode to hang it on), a CONDITIONAL (OpBranchCond/OpJmp -- a
+// per-record branch, which a vector can only express as a blend under a mask and which is the same
+// primitive Elvis needs), the magic CurrentTime attribute, delegated
 // subtrees (OpEvalNode, which Native() already excludes), and any built-in call whose result a vector
 // cannot hold (a list or a nested ad -- see callFuncVec).
 //

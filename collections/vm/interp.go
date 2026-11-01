@@ -93,6 +93,23 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value) (classad.Val
 				stack = stack[:len(stack)-1] // discard undefined; fall through to fallback
 				ip++
 			}
+		case OpJmp:
+			ip = int(in.A)
+		case OpBranchCond:
+			n := len(stack)
+			cond := stack[n-1]
+			stack = stack[:n-1]
+			t := p.conds[in.A]
+			switch classad.ConditionState(cond) {
+			case classad.CondTrue:
+				ip++
+			case classad.CondFalse:
+				ip = int(t.onFalse)
+			case classad.CondUndef:
+				ip = int(t.onUndef)
+			default:
+				ip = int(t.onError)
+			}
 		case OpCallFunc:
 			f := p.funcs[in.A]
 			base := len(stack) - f.argc

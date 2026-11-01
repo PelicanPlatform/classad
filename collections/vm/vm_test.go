@@ -127,6 +127,17 @@ var exprSources = []string{
 	`Missing ?: 99`, `Cpus ?: 99`, `Missing ?: Missing ?: 7`, `error ?: 1`,
 	// ternary (delegated)
 	`Cpus > 2 ? "big" : "small"`, `Missing ? 1 : 2`, `Flag ? Cpus : Memory`,
+	// ifThenElse, native as a branch: every condition state, nesting, and a branch that must not be
+	// evaluated (Self is cyclic in the fixtures)
+	`ifThenElse(Cpus > 2, 1, 2)`, `ifThenElse(Cpus > 100, 1, 2)`,
+	`ifThenElse(Missing, 1, 2)`, `ifThenElse(Owner, 1, 2)`, `ifThenElse(error, 1, 2)`,
+	`ifThenElse(0, 1, 2)`, `ifThenElse(Cpus, 1, 2)`,
+	`ifThenElse(true, 1, Self)`, `ifThenElse(false, Self, 2)`,
+	`ifThenElse(Cpus > 2, Owner, "none")`, `ifThenElse(Cpus > 2, 1, 2) + 1`,
+	`ifThenElse(Cpus > 2, ifThenElse(Flag, 1, 2), 3)`,
+	`ifThenElse(Flag, 1, 2) && Cpus > 0`, `Cpus > 0 && ifThenElse(Flag, 1, 2)`,
+	`Missing ?: ifThenElse(Flag, 1, 2)`, `ifThenElse(Flag, Missing ?: 5, 6)`,
+	`ifThenElse(Cpus > 2, 1)`, `ifThenElse(Cpus > 2, 1, 2, 3)`, // bad arity: delegated
 	// list / record / select / subscript (delegated)
 	`{1, 2, Cpus}`, `[Q = Cpus + 1]`, `Nested.K`, `L[1]`,
 	// strict built-in calls, compiled natively to OpCallFunc
@@ -334,6 +345,13 @@ func TestFunctionCallsAreNative(t *testing.T) {
 		`toUpper(toLower(Owner))`, `int(floor(R)) + 1`, `substr(Owner, 0, 2) == "al"`,
 		`isUndefined(Missing) || Cpus > 2`, `-int(Cpus)`,
 		`Cpus > 2 && toUpper(Owner) == "ALICE"`,
+		// ifThenElse is native as a BRANCH, not as a call: classad.StrictFunction still refuses it
+		// (an eager call would evaluate both branches), and OpBranchCond lowers it instead.
+		`ifThenElse(Cpus > 2, 1, 2)`, `ifThenElse(Missing, 1, 2)`,
+		`ifThenElse(Cpus > 2, Owner, "none")`,
+		`ifThenElse(Cpus > 2, 1, 2) + 1`,
+		`ifThenElse(Cpus > 2, ifThenElse(Flag, 1, 2), 3)`, // nested
+		`IFTHENELSE(Cpus > 2, 1, 2)`,                      // names fold
 	}
 	for _, expr := range native {
 		q, err := Parse(expr)
@@ -346,8 +364,10 @@ func TestFunctionCallsAreNative(t *testing.T) {
 	}
 
 	delegated := map[string]string{
+		`ifThenElse(Cpus > 2, 1)`:       "wrong arity: ERROR without evaluating the arguments",
+		`ifThenElse(Cpus > 2, 1, 2, 3)`: "likewise",
+		`Cpus > 2 ? 1 : 2`:              "the ternary evaluates BOTH branches on an undefined condition",
 		`strcat(Owner, "!")`:            "lazy: stops at the first undefined/error argument",
-		`ifThenElse(Cpus > 2, 1, 2)`:    "lazy: evaluates only the selected branch",
 		`eval("Cpus + 1")`:              "parses a runtime string and resolves it in the scope",
 		`unparse(Cpus)`:                 "needs the argument's raw AST, not its value",
 		`countMatches(Cpus > 1, L)`:     "evaluates its first argument once per ad in the second",
@@ -392,6 +412,84 @@ func TestArityAndUnknownFunctionsDoNotEvaluateArgs(t *testing.T) {
 		b, berr := got.BoolValue()
 		if berr != nil || !b {
 			t.Errorf("%s = %s, want true (the cyclic argument must never be evaluated)", attr, describe(got))
+		}
+	}
+}
+
+// TestIfThenElseIsABranchNotACall pins the distinction that makes ifThenElse native without making it
+// strict. It must compile to OpBranchCond and must NOT compile to OpCallFunc: as a call it would
+// evaluate both branches, and a branch is allowed to be a cyclic self-reference that is never
+// reached. classad.StrictFunction still refuses it, which is what keeps the eager path shut.
+func TestIfThenElseIsABranchNotACall(t *testing.T) {
+	q, err := Parse(`ifThenElse(Cpus > 2, 1, 2)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := q.Program()
+	if !usesOp(p, OpBranchCond) {
+		t.Error("want OpBranchCond")
+	}
+	if usesOp(p, OpCallFunc) {
+		t.Error("compiled to a call; an eager call evaluates both branches")
+	}
+	if classad.StrictFunction("ifThenElse", 3) {
+		t.Error("StrictFunction accepts ifThenElse; the eager-call path must stay shut")
+	}
+	// The ternary keeps the same shape it had: delegated, because its undefined case evaluates both
+	// branches and a jump-based lowering would have to emit each branch twice.
+	tq, err := Parse(`Cpus > 2 ? 1 : 2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tq.Native() {
+		t.Error("the ternary is native; its undefined case evaluates both branches")
+	}
+}
+
+// TestIfThenElseLazinessAndStates is the semantic test: only the selected branch is evaluated, and
+// an undefined or non-coercible condition produces a value without evaluating EITHER branch.
+//
+// The expression under test is COMPILED, not read out of the ad. An earlier version of this test put
+// the ifThenElse in the ad and compiled a reference to it, which meant the resolver evaluated it
+// through the tree-walker and OpBranchCond never ran at all -- the test passed before the opcode
+// existed. Cyc is the cyclic attribute, so any branch that must not be reached is one that turns the
+// result into error if it is.
+func TestIfThenElseLazinessAndStates(t *testing.T) {
+	ad, err := classad.Parse(`[ Cyc = Cyc + 1; Flag = true; N = 3 ]`)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, tc := range []struct{ src, want string }{
+		{`ifThenElse(true, 1, Cyc)`, "1"},                // the false branch is cyclic and never reached
+		{`ifThenElse(false, Cyc, 2)`, "2"},               // likewise the true branch
+		{`ifThenElse(undefined, Cyc, Cyc)`, "undefined"}, // NEITHER branch is evaluated
+		{`ifThenElse("str", Cyc, Cyc)`, "error"},         // a string condition: likewise
+		{`ifThenElse(error, Cyc, Cyc)`, "error"},         // an error condition: likewise
+		{`ifThenElse({1,2}, Cyc, Cyc)`, "error"},         // a list condition
+		{`ifThenElse(0, 1, 2)`, "2"},                     // 0 is false
+		{`ifThenElse(N, 1, 2)`, "1"},                     // a nonzero number is true
+		{`ifThenElse(0.0, 1, 2)`, "2"},                   // and a real zero is false
+		{`ifThenElse(Flag, 1, Cyc)`, "1"},
+		{`ifThenElse(Missing, Cyc, Cyc)`, "undefined"}, // an absent attribute is undefined
+	} {
+		expr, err := parser.ParseExpr(tc.src)
+		if err != nil {
+			t.Fatalf("parse %s: %v", tc.src, err)
+		}
+		p := CompileProgram(expr)
+		if !usesOp(p, OpBranchCond) {
+			t.Fatalf("%s: did not compile to OpBranchCond, so this test is not testing it", tc.src)
+		}
+		got := Run(p, ad)
+		if got.String() != tc.want {
+			t.Errorf("%s = %s, want %s", tc.src, describe(got), tc.want)
+		}
+		// The tree-walker is the oracle, and the register form lowers the same branch.
+		if ref := refEval(ad, expr); !valuesEqual(ref, got) {
+			t.Errorf("%s: evaluator=%s compiled=%s", tc.src, describe(ref), describe(got))
+		}
+		if reg := RunRegisters(LowerToRegisters(p), ad); !valuesEqual(got, reg) {
+			t.Errorf("%s: stack=%s register=%s", tc.src, describe(got), describe(reg))
 		}
 	}
 }

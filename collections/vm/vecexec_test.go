@@ -236,6 +236,8 @@ func TestVecDeclinesUnsupported(t *testing.T) {
 		`split(S)`,                // strict, but returns a LIST, which a vector cannot hold
 		`splitUserName(S)`,        // likewise
 		`random(A)`,               // nondeterministic: never compiled natively
+		`ifThenElse(A > 1, 2, 3)`, // native as a BRANCH, but a branch is not vectorizable yet
+		`ifThenElse(A > 1, 2, 3) + 1`,
 	} {
 		q, err := Parse(expr)
 		if err != nil {

@@ -102,6 +102,14 @@ const (
 	RShortAnd
 	RShortOr
 
+	// RJump jumps unconditionally to T.
+	RJump
+
+	// RBranchCond dispatches on classad.ConditionState(A) using the register-form target triple
+	// RegProgram.conds[Imm]: CondTrue falls through, the rest jump. Dst is the register every path of
+	// the conditional writes, so the value is in one place at the join whichever path ran.
+	RBranchCond
+
 	// RJmpIfDefined is the Elvis test: if A is not UNDEFINED it sets Dst to A and jumps to T;
 	// otherwise it falls through to the fallback, which ends in an RMove into the same Dst.
 	RJmpIfDefined
@@ -124,7 +132,8 @@ type RegInstr struct {
 // the two forms from being able to disagree about what a constant or an operator is.
 type RegProgram struct {
 	code  []RegInstr
-	args  [][]int32 // RCallFunc argument register lists
+	args  [][]int32     // RCallFunc argument register lists
+	conds []condTargets // RBranchCond targets, as REGISTER-form indices
 	nregs int
 	res   int32 // the register holding the expression's value, or -1 for an empty program
 	src   *Program
@@ -160,7 +169,7 @@ func LowerToRegisters(p *Program) *RegProgram {
 		src:     p,
 		rp:      &RegProgram{src: p, res: -1},
 		newIdx:  make([]int32, len(p.code)+1),
-		pending: map[int][]elvisJoin{},
+		pending: map[int][]*joinPoint{},
 	}
 	l.lower()
 	return l.rp
@@ -178,8 +187,13 @@ type lowerer struct {
 	// RCombine. A stack because logical operators nest.
 	shortDst []int32
 
-	// pending maps a stack-form jump target to the Elvis joins that land there, innermost last.
-	pending map[int][]elvisJoin
+	// pending maps a stack-form jump target to the joins that land there, innermost last.
+	pending map[int][]*joinPoint
+
+	// openConds are the conditionals whose branches are still being emitted, innermost last. An
+	// OpJmp belongs to the innermost one, because conditionals nest properly and an inner one's join
+	// is applied -- and the entry popped -- before the outer one's jumps are reached.
+	openConds []*joinPoint
 
 	// newIdx[oldIp] is the register-form index that oldIp's code begins at, used to retarget jumps
 	// once all of it is emitted. It has one extra entry for a jump to the end of the program.
@@ -187,18 +201,33 @@ type lowerer struct {
 
 	// jumps are the register-form indices of instructions whose T is still a stack-form index.
 	jumps []int
+
+	// condInstrs are the register-form RBranchCond indices, whose conds entry still holds stack-form
+	// targets. They are ordinary code positions, so they retarget through newIdx -- unlike the jumps
+	// a joinPoint owns, which are patched to a point after a join's move and never go through it.
+	condInstrs []int
 }
 
-// elvisJoin is one Elvis whose fall-through path has to move its value into dst at a join, and whose
-// jump instruction is at jumpIdx in the register form.
+// joinPoint is one construct whose paths converge on a single register.
 //
-// The jump index is kept because each Elvis at a shared join needs its OWN landing point: it has
-// already written dst itself, so it must skip its own move -- but it must still run the moves of any
-// Elvis it is nested INSIDE, whose destination has not been written on this path. One landing point
-// per target cannot express that, which is what makes `A ?: (B ?: 7)` the shape that catches it.
-type elvisJoin struct {
-	dst     int32
-	jumpIdx int
+// Both constructs that need one work the same way. The path that FALLS THROUGH to the join gets an
+// RMove into dst emitted at the join; every path that JUMPS to the join has already written dst
+// itself, so it gets its move before its jump and lands immediately after this join's own move.
+//
+// Landing after its own move rather than after all of them is the part that is easy to get wrong: a
+// jumping path must skip the move that would overwrite dst with an operand it never evaluated, while
+// still running the moves of any join it is nested INSIDE, whose destination it has not written. One
+// landing point per target cannot express that, which is what makes `A ?: (B ?: 7)` the shape that
+// catches it.
+//
+// Elvis contributes one jumping path; a conditional contributes three (true, false, and whichever of
+// undefined/error does not fall through), which is why jumpIdxs is a slice and why end has to be
+// discovered from the first jump rather than known at the branch.
+type joinPoint struct {
+	dst      int32
+	jumpIdxs []int // register-form jumps that land just after this join's move
+	end      int32 // the stack-form index this join lands on, -1 until the first jump reveals it
+	isCond   bool  // a conditional, so it is also on the lowerer's open-conditional stack
 }
 
 func (l *lowerer) reg() int32 {
@@ -257,10 +286,19 @@ func (l *lowerer) lower() {
 func (l *lowerer) emitJoins(ip int) {
 	joins := l.pending[ip]
 	for i := len(joins) - 1; i >= 0; i-- {
+		jp := joins[i]
 		src := l.pop()
-		l.emit(RegInstr{Op: RMove, Dst: joins[i].dst, A: src})
-		l.push(joins[i].dst)
-		l.rp.code[joins[i].jumpIdx].T = int32(len(l.rp.code))
+		l.emit(RegInstr{Op: RMove, Dst: jp.dst, A: src})
+		l.push(jp.dst)
+		after := int32(len(l.rp.code))
+		for _, j := range jp.jumpIdxs {
+			l.rp.code[j].T = after
+		}
+		if jp.isCond {
+			if n := len(l.openConds); n > 0 && l.openConds[n-1] == jp {
+				l.openConds = l.openConds[:n-1]
+			}
+		}
 	}
 	delete(l.pending, ip)
 }
@@ -278,7 +316,16 @@ func (l *lowerer) needsEndPad() bool {
 		}
 	}
 	for i := range l.rp.code {
-		if l.rp.code[i].Op == RJmpIfDefined && int(l.rp.code[i].T) == end {
+		switch l.rp.code[i].Op {
+		case RJmpIfDefined, RJump:
+			if int(l.rp.code[i].T) == end {
+				return true
+			}
+		}
+	}
+	for _, ci := range l.condInstrs {
+		t := l.rp.conds[l.rp.code[ci].Imm]
+		if int(t.onFalse) == len(l.src.code) || int(t.onUndef) == len(l.src.code) || int(t.onError) == len(l.src.code) {
 			return true
 		}
 	}
@@ -289,6 +336,12 @@ func (l *lowerer) needsEndPad() bool {
 func (l *lowerer) retarget() {
 	for _, j := range l.jumps {
 		l.rp.code[j].T = l.newIdx[l.rp.code[j].T]
+	}
+	for _, ci := range l.condInstrs {
+		t := &l.rp.conds[l.rp.code[ci].Imm]
+		t.onFalse = l.newIdx[t.onFalse]
+		t.onUndef = l.newIdx[t.onUndef]
+		t.onError = l.newIdx[t.onError]
 	}
 }
 
@@ -381,6 +434,35 @@ func (l *lowerer) one(ip int) {
 		}
 		l.emit(RegInstr{Op: op, Dst: d, A: a, B: b})
 		l.push(d)
+	case OpBranchCond:
+		// The condition is consumed; every path of the conditional writes one destination, allocated
+		// here so the join has a single register to converge on. The join's own index is not known
+		// yet -- it is the common target of the branch's jumps -- so it is discovered at the first
+		// OpJmp below.
+		a := l.pop()
+		d := l.reg()
+		t := l.src.conds[in.A]
+		l.rp.conds = append(l.rp.conds, t) // stack-form targets; retarget() maps them
+		k := int32(len(l.rp.conds) - 1)
+		ci := l.emit(RegInstr{Op: RBranchCond, Dst: d, A: a, Imm: k})
+		l.condInstrs = append(l.condInstrs, ci)
+		l.openConds = append(l.openConds, &joinPoint{dst: d, end: -1, isCond: true})
+	case OpJmp:
+		// Belongs to the innermost open conditional. Its value goes into that conditional's
+		// destination before the jump, and the jump lands just after the join's own move.
+		n := len(l.openConds)
+		if n == 0 {
+			panic("vm: register lowering found an unconditional jump outside a conditional")
+		}
+		jp := l.openConds[n-1]
+		if jp.end < 0 {
+			jp.end = in.A
+			l.pending[int(in.A)] = append(l.pending[int(in.A)], jp)
+		}
+		src := l.pop()
+		l.emit(RegInstr{Op: RMove, Dst: jp.dst, A: src})
+		j := l.emit(RegInstr{Op: RJump, T: -1})
+		jp.jumpIdxs = append(jp.jumpIdxs, j)
 	case OpJmpIfNotUndef:
 		// The stack form pops the left operand on the fall-through path and leaves it as the result
 		// on the jump path, so the register form pops it here and the jump carries it into Dst.
@@ -389,7 +471,8 @@ func (l *lowerer) one(ip int) {
 		// Not added to l.jumps: emitJoins resolves this jump's target directly, because it lands
 		// after its own move rather than at the target's newIdx.
 		j := l.emit(RegInstr{Op: RJmpIfDefined, Dst: d, A: a, T: -1})
-		l.pending[int(in.A)] = append(l.pending[int(in.A)], elvisJoin{dst: d, jumpIdx: j})
+		l.pending[int(in.A)] = append(l.pending[int(in.A)],
+			&joinPoint{dst: d, jumpIdxs: []int{j}, end: in.A})
 	default:
 		// An opcode this conversion has not been taught. It must fail LOUDLY rather than produce
 		// something: the stack interpreter pushes ERROR for an opcode it does not know, and emitting
@@ -471,6 +554,20 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classa
 		case RMove:
 			regs[in.Dst] = regs[in.A]
 			ip++
+		case RJump:
+			ip = int(in.T)
+		case RBranchCond:
+			t := rp.conds[in.Imm]
+			switch classad.ConditionState(regs[in.A]) {
+			case classad.CondTrue:
+				ip++
+			case classad.CondFalse:
+				ip = int(t.onFalse)
+			case classad.CondUndef:
+				ip = int(t.onUndef)
+			default:
+				ip = int(t.onError)
+			}
 		case RShortAnd:
 			if res, done := ev.ShortCircuit("&&", regs[in.A]); done {
 				regs[in.Dst] = res

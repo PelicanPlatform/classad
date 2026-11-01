@@ -17,6 +17,12 @@ type funcInfo struct {
 	argc int
 }
 
+// condTargets is where OpBranchCond goes for each condition state other than true, which falls
+// through. All three are absolute instruction indices.
+type condTargets struct {
+	onFalse, onUndef, onError int32
+}
+
 // refInfo is a pooled attribute reference (name + scope) targeted by OpLoadRef.
 type refInfo struct {
 	name string
@@ -40,6 +46,7 @@ type Program struct {
 	refs   []refInfo       // OpLoadRef
 	nodes  []ast.Expr      // OpEvalNode (delegated subtrees)
 	funcs  []funcInfo      // OpCallFunc
+	conds  []condTargets   // OpBranchCond
 
 	// members are the constant lists of member/identicalMember calls (OpMember).
 	members []*memberSet

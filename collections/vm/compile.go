@@ -177,6 +177,11 @@ func (c *compiler) emit(expr ast.Expr) {
 		c.emit(v.Right)
 		c.patch(j, len(c.p.code))
 	case *ast.FunctionCall:
+		// ifThenElse becomes a branch, not a call, so it must be tried before the strict-call path
+		// (which refuses it anyway, because an eager call would evaluate both branches).
+		if c.emitIfThenElse(v) {
+			return
+		}
 		// Three outcomes, in order of preference. member/identicalMember over a
 		// constant list has a real vector kernel, so it gets its specialized
 		// OpMember rather than the generic call -- memberVec tests a per-block
@@ -207,6 +212,58 @@ func (c *compiler) emit(expr ast.Expr) {
 		// above compiles the rest.)
 		c.ins(OpEvalNode, c.addNode(expr))
 	}
+}
+
+// emitIfThenElse compiles ifThenElse(cond, t, f) to a branch, and reports whether it did.
+//
+// Layout, with each path pushing exactly one value so the stack stays balanced at the join:
+//
+//	  <cond>
+//	  branch          ; true falls through; false/undef/error jump
+//	  <t>
+//	  jmp end
+//	onFalse:
+//	  <f>
+//	  jmp end
+//	onUndef:
+//	  push undefined  ; NEITHER branch is evaluated
+//	  jmp end
+//	onError:
+//	  push error      ; likewise
+//	end:
+//
+// A call with the wrong argument count is declined, which leaves it delegated -- and delegation is
+// what gets it right, because the reference returns ERROR for a bad arity WITHOUT evaluating any
+// argument (evaluateFunctionCall special-cases ifThenElse before its arity check).
+func (c *compiler) emitIfThenElse(v *ast.FunctionCall) bool {
+	if !strings.EqualFold(v.Name, "ifThenElse") || len(v.Args) != 3 {
+		return false
+	}
+	c.emit(v.Args[0])
+	c.p.conds = append(c.p.conds, condTargets{})
+	k := int32(len(c.p.conds) - 1)
+	c.ins(OpBranchCond, k)
+
+	c.emit(v.Args[1]) // the true branch falls through
+	jTrue := c.ins(OpJmp, -1)
+
+	onFalse := len(c.p.code)
+	c.emit(v.Args[2])
+	jFalse := c.ins(OpJmp, -1)
+
+	onUndef := len(c.p.code)
+	c.ins(OpPushUndef, 0)
+	jUndef := c.ins(OpJmp, -1)
+
+	onError := len(c.p.code)
+	c.ins(OpPushError, 0)
+
+	end := len(c.p.code)
+	c.p.conds[k] = condTargets{onFalse: int32(onFalse), onUndef: int32(onUndef), onError: int32(onError)}
+	c.patch(jTrue, end)
+	c.patch(jFalse, end)
+	c.patch(jUndef, end)
+	return true
 }
 
 // emitLogical compiles a short-circuiting logical operator (&& or ||):

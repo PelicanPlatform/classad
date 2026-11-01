@@ -299,3 +299,42 @@ func StrictFunction(name string, argc int) bool {
 func ApplyFunction(e *Evaluator, name string, args []Value) Value {
 	return applyBuiltin(e, strings.ToLower(name), args)
 }
+
+// CondState is how a condition value selects a branch, as the conditional
+// constructs classify it.
+type CondState uint8
+
+const (
+	CondTrue  CondState = iota // a boolean true, or a nonzero integer/real
+	CondFalse                  // a boolean false, or a zero integer/real
+	CondUndef                  // UNDEFINED
+	CondError                  // ERROR, or any non-coercible type (string, list, ad)
+)
+
+// ConditionState classifies a condition value exactly as evaluateIfThenElse and
+// evaluateConditional classify it, by delegating to the same logicalView the
+// evaluator uses. A compiled executor needs this to lower a conditional to a
+// branch without reimplementing the coercion -- "1 ? a : b" selects a, and a
+// string condition is an error, neither of which is obvious.
+//
+// What a caller does with each state is NOT the same for the two constructs, and
+// the difference is not visible from here:
+//
+//	ifThenElse(c, t, f)  CondUndef yields UNDEFINED and evaluates NEITHER branch.
+//	c ? t : f            CondUndef yields UNDEFINED but still evaluates BOTH
+//	                     branches, because an error value in a branch is absorbed
+//	                     while a cyclic self-reference must still propagate.
+//
+// Both yield ERROR for CondError without evaluating either branch.
+func ConditionState(v Value) CondState {
+	switch logicalView(v) {
+	case lsTrue:
+		return CondTrue
+	case lsFalse:
+		return CondFalse
+	case lsUndef:
+		return CondUndef
+	default:
+		return CondError
+	}
+}
