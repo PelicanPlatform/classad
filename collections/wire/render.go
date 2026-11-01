@@ -69,8 +69,8 @@ func AppendNodeTextOldEnc(dst, node []byte, t *InternTable, open Sealer, redactS
 // the two walks structurally identical is deliberate: any node shape decode.go
 // handles, this must render the same way.
 func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
-	if depth > maxDepth {
-		return dst, ErrMalformed
+	if depth > MaxDepth {
+		return dst, errReadTooDeep
 	}
 	tag, err := d.byteAt()
 	if err != nil {
@@ -279,7 +279,7 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 			}
 			return dst, fmt.Errorf("%w: opening sealed value: %w", ErrMalformed, err)
 		}
-		_, dst, _, err = d.readSealedPlain(pt, depth+1, sealedText, dst)
+		_, dst, _, err = d.readSealedPlain(pt, d.sealedDepth(depth), sealedText, dst)
 		return dst, err
 	default:
 		return dst, ErrMalformed
@@ -290,8 +290,8 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 // to "[k0 = v0; k1 = v1; ...]", matching ast.ClassAd.String via
 // ast.AttributeAssignment.String.
 func (d *decoder) appendAdBody(dst []byte, depth int) ([]byte, error) {
-	if depth > maxDepth {
-		return dst, ErrMalformed
+	if depth > MaxDepth {
+		return dst, errReadTooDeep
 	}
 	hotCount, err := d.uvarint()
 	if err != nil {
@@ -320,7 +320,7 @@ func (d *decoder) appendAdBody(dst []byte, depth int) ([]byte, error) {
 		}
 		dst = ast.AppendQuoteAttributeName(dst, name)
 		dst = append(dst, " = "...)
-		if dst, err = d.appendNode(dst, depth+1); err != nil {
+		if dst, err = d.appendNode(dst, depth); err != nil {
 			return dst, err
 		}
 	}

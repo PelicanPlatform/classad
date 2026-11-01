@@ -52,7 +52,7 @@ func AppendNodeRefNames(node []byte, dst [][]byte) [][]byte {
 }
 
 func refNode(c *cursor, depth int, dst []uint32) []uint32 {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return dst
 	}
@@ -140,7 +140,7 @@ func refNode(c *cursor, depth int, dst []uint32) []uint32 {
 // refAdBody walks a nested record body ([hotCount][hot][attrCount][key+node]*),
 // collecting references from each member's value node.
 func refAdBody(c *cursor, depth int, dst []uint32) []uint32 {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return dst
 	}
@@ -152,13 +152,13 @@ func refAdBody(c *cursor, depth int, dst []uint32) []uint32 {
 	attrCount := c.uvarint()
 	for i := uint64(0); i < attrCount && c.ok; i++ {
 		c.skipKey()
-		dst = refNode(c, depth+1, dst)
+		dst = refNode(c, depth, dst)
 	}
 	return dst
 }
 
 func refNodeNames(c *cursor, depth int, dst [][]byte) [][]byte {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return dst
 	}
@@ -247,7 +247,7 @@ func refNodeNames(c *cursor, depth int, dst [][]byte) [][]byte {
 
 // refAdBodyNames is refAdBody for an inline-keyed ad's nested record body.
 func refAdBodyNames(c *cursor, depth int, dst [][]byte) [][]byte {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return dst
 	}
@@ -259,7 +259,7 @@ func refAdBodyNames(c *cursor, depth int, dst [][]byte) [][]byte {
 	attrCount := c.uvarint()
 	for i := uint64(0); i < attrCount && c.ok; i++ {
 		c.skipKey()
-		dst = refNodeNames(c, depth+1, dst)
+		dst = refNodeNames(c, depth, dst)
 	}
 	return dst
 }
@@ -293,7 +293,7 @@ func AppendNodeRefsExact(node []byte, inline bool, r *NodeRefs, isEval func(uint
 }
 
 func refsExact(c *cursor, depth int, r *NodeRefs, isEval func(uint32) bool) bool {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		return false
 	}
 	tag := c.byteAt()

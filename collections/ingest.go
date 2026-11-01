@@ -85,9 +85,15 @@ func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[ui
 		if e != nil {
 			return nil, e
 		}
+		if e := wire.CheckDepth(ad.AST()); e != nil {
+			return nil, e
+		}
 		return c.encodeAd(ad.AST()), nil
 	}
 	if err != nil {
+		return nil, err
+	}
+	if err := enc.Err(); err != nil {
 		return nil, err
 	}
 	return enc.Bytes(nil), nil
@@ -152,6 +158,8 @@ func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{
 		// error -- a construct the native parser does not handle, or malformed text --
 		// fall back to the reference parser, which is authoritative for both the
 		// encoding and the error message. ExprWire leaves no partial entry on error.
+		// That includes a value too deep to store: the reference encoder refuses it, naming the
+		// attribute and its depth, which the caller reads from enc.Err.
 		if err := enc.ExprWire(name, val); err == nil {
 			continue
 		}

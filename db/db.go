@@ -26,6 +26,7 @@ import (
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/collections/vm"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // DB is an embedded ClassAd log. Safe for concurrent use.
@@ -1117,13 +1118,39 @@ func (e *ConflictError) Error() string {
 // will not come back -- so a caller should record these and make progress rather than retry.
 // Treating them as conflicts made a tailer rewind and re-apply forever, escalating to full log
 // replays that changed nothing. See collections.CommitResult.Unapplied.
+//
+// A write refused because a value nests too deeply to store is one of these: errors.Is(err,
+// ErrTooDeep) reports it, and its reason names the attribute.
 type UnappliedError struct {
 	Keys []string
 	// Reasons is parallel to Keys: why each one could not be composed ("delta-no-base",
-	// "delta-chain-broken", ...). Carried so a caller can log what happened rather than only
-	// that something did.
+	// "delta-chain-broken", "too-deep: ..."). Carried so a caller can log what happened rather
+	// than only that something did.
 	Reasons []string
+	// Errs is parallel to Keys: the error behind each one, or nil where the reason alone says it.
+	// Unwrap exposes the non-nil ones to errors.Is and errors.As.
+	Errs []error
 }
+
+// Unwrap returns the errors behind the unapplied keys, so errors.Is(err, ErrTooDeep) finds a
+// refused write among them.
+func (e *UnappliedError) Unwrap() []error {
+	var out []error
+	for _, err := range e.Errs {
+		if err != nil {
+			out = append(out, err)
+		}
+	}
+	return out
+}
+
+// ErrTooDeep is collections.ErrTooDeep (and wire.ErrTooDeep), the same error value: a write
+// refused because a value nests deeper than any reader would read back. SetAttribute returns it
+// at once, naming the attribute; a whole-ad write (NewClassAd, Put) is refused at Commit as an
+// *UnappliedError that unwraps to it, leaving the key as it was; UpdateOld and an archive Append
+// return it. It is permanent -- the same write is refused every time -- so a caller drops or
+// changes the value and moves on, and must never retry it.
+var ErrTooDeep = collections.ErrTooDeep
 
 func (e *UnappliedError) Error() string {
 	if len(e.Reasons) == len(e.Keys) && len(e.Keys) > 0 {
@@ -1244,7 +1271,7 @@ func (t *Txn) Commit() error {
 		for i, k := range res.Unapplied {
 			keys[i] = string(k)
 		}
-		return &UnappliedError{Keys: keys, Reasons: res.UnappliedReasons}
+		return &UnappliedError{Keys: keys, Reasons: res.UnappliedReasons, Errs: res.UnappliedErrs}
 	}
 	return nil
 }
@@ -1310,6 +1337,11 @@ func (t *Txn) DestroyClassAd(key string) {
 func (t *Txn) SetAttribute(key, name, expr string) error {
 	e, err := classad.ParseExpr(expr)
 	if err != nil {
+		return fmt.Errorf("classad-db: SetAttribute %s[%s]: %w", key, name, err)
+	}
+	// Refused here, before anything is buffered, rather than at Commit: the caller learns which
+	// write it was and can carry on with the rest of the transaction.
+	if err := wire.CheckExprDepth(name, e.AST()); err != nil {
 		return fmt.Errorf("classad-db: SetAttribute %s[%s]: %w", key, name, err)
 	}
 	p := t.patchFor(key)

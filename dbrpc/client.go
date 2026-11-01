@@ -400,6 +400,11 @@ type AdReject struct {
 	Err   string
 }
 
+// Cause is the reject as an error, the *ServerError the same ad would have drawn from NewClassAd,
+// so a caller can classify it with errors.Is -- errors.Is(r.Cause(), ErrTooDeep) for an ad refused
+// because a value nests too deeply to store.
+func (r AdReject) Cause() error { return &ServerError{Msg: r.Err} }
+
 const (
 	// maxBatchFrameBytes bounds one opNewAdBatch frame so it stays under the CEDAR stream's
 	// MaxMessageSize (1 MiB); the margin covers the frame header, per-message framing, and

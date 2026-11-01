@@ -12,6 +12,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
+	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -1425,7 +1426,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			}
 			return b
 		}
-		return respErr(reqID, err.Error())
+		return respErr(reqID, refusalMsg(err))
 
 	case opCommitIdem:
 		id := r.u64()
@@ -1483,7 +1484,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			}
 			return b
 		}
-		return respErr(reqID, cerr.Error())
+		return respErr(reqID, refusalMsg(cerr))
 
 	case opAbort:
 		id := r.u64()
@@ -1507,6 +1508,12 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 				ad, err := classad.ParseOld(adText)
 				if err != nil {
 					return respErr(reqID, err.Error())
+				}
+				// Refused now, before it is buffered, so the client hears which ad it was -- and
+				// skips it, as it skips an unparseable one -- instead of the whole Commit failing.
+				// The wire-native path above declines such an ad, so every one lands here.
+				if err := wire.CheckDepth(ad.AST()); err != nil {
+					return respErr(reqID, refusalMsg(fmt.Errorf("NewClassAd %s: %w", key, err)))
 				}
 				st.tx.NewClassAd(key, ad)
 			}
@@ -1536,9 +1543,14 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 				// also where a malformed ad is rejected, by index, without losing the batch.
 				if !st.tx.NewClassAdOld(key, adText) {
 					ad, err := classad.ParseOld(adText)
+					if err == nil {
+						if derr := wire.CheckDepth(ad.AST()); derr != nil {
+							err = fmt.Errorf("NewClassAd %s: %w", key, derr)
+						}
+					}
 					if err != nil {
 						rejIdx = append(rejIdx, i)
-						rejMsg = append(rejMsg, err.Error())
+						rejMsg = append(rejMsg, refusalMsg(err))
 						continue
 					}
 					st.tx.NewClassAd(key, ad)
@@ -1570,7 +1582,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			}
 			st.wrote = true
 			if err := st.tx.SetAttribute(key, name, expr); err != nil {
-				return respErr(reqID, err.Error())
+				return respErr(reqID, refusalMsg(err))
 			}
 			st.record(s, WriteOp{Kind: WriteSetAttribute, Key: key, Name: name, Value: expr})
 			return resp(reqID, stOK)
@@ -1853,7 +1865,7 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 			return respErr(reqID, "no such archive: "+name)
 		}
 		if err := a.AppendOld(adText); err != nil {
-			return respErr(reqID, err.Error())
+			return respErr(reqID, refusalMsg(err))
 		}
 		return resp(reqID, stOK)
 

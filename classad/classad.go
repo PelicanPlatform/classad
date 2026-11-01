@@ -165,6 +165,11 @@ func (e *Expr) UnparseOld() string {
 	return unparseExprStringOld(e.expr)
 }
 
+// AST returns the expression's syntax tree, for serialization layers (e.g. collections/wire) that
+// measure or encode it directly, as ClassAd.AST does for a whole ad. The tree is shared with e and
+// must not be mutated.
+func (e *Expr) AST() ast.Expr { return e.internal() }
+
 // internal returns the internal ast.Expr representation.
 // This is used internally for operations that require the AST node.
 func (e *Expr) internal() ast.Expr {

@@ -31,6 +31,9 @@ type StreamEncoder struct {
 	hotNames    map[string]struct{}
 	curName     string // set by begin, used by end (inline hot check)
 	curEntryOff int    // set by begin, used by end (inline hot offset points at the entry)
+
+	// err is the first attribute refused since Reset; see Err.
+	err error
 }
 
 // NewStreamEncoder returns an encoder interning names into t. hot (may be nil) is
@@ -51,7 +54,14 @@ func (s *StreamEncoder) Reset() {
 	s.entries = s.entries[:0]
 	s.hots = s.hots[:0]
 	s.count = 0
+	s.err = nil
 }
+
+// Err reports the first attribute written since Reset that cannot be stored: a value nesting
+// deeper than MaxDepth, as a *DepthError (errors.Is ErrTooDeep). The refused attribute is not
+// written, but the ad as a whole must not be stored either -- it would silently lack the
+// attribute -- so a caller checks Err before Bytes.
+func (s *StreamEncoder) Err() error { return s.err }
 
 // SetHot replaces the hot-id set (e.g. after the store refreshes popularity).
 func (s *StreamEncoder) SetHot(hot map[uint32]struct{}) { s.hot = hot }
@@ -150,8 +160,15 @@ func (s *StreamEncoder) Error(name string) {
 	s.end(id, off)
 }
 
-// Expr writes a computed (non-literal) attribute from an ast.Expr subtree.
+// Expr writes a computed (non-literal) attribute from an ast.Expr subtree. A value deeper than
+// MaxDepth is refused instead (see Err).
 func (s *StreamEncoder) Expr(name string, e ast.Expr) {
+	if err := CheckExprDepth(name, e); err != nil {
+		if s.err == nil {
+			s.err = err
+		}
+		return
+	}
 	id, off := s.begin(name)
 	enc := encoder{buf: s.entries, t: s.t, inline: s.inline}
 	enc.node(e)
@@ -165,10 +182,16 @@ func (s *StreamEncoder) Expr(name string, e ast.Expr) {
 // magnitude, ...): it rolls the buffer back and returns the error, so the caller can
 // fall back to Expr(name, parser.ParseExpr(val)). Interned names added before a
 // rollback are harmless (unused ids in a shared table).
+//
+// A value deeper than MaxDepth is rolled back the same way, returning ErrTooDeep: the
+// fallback's Expr then refuses it with the attribute and its depth (see Err).
 func (s *StreamEncoder) ExprWire(name, val string) error {
 	start := len(s.entries)
 	id, off := s.begin(name)
 	buf, err := parseExprToWire(val, s.t, s.inline, s.entries)
+	if err == nil && !nodeFits(buf[off:], s.inline) {
+		err = ErrTooDeep
+	}
 	if err != nil {
 		s.entries = s.entries[:start]
 		return err

@@ -675,7 +675,7 @@ func skipNode(c *cursor, depth int) {
 	if !c.ok {
 		return
 	}
-	if depth > maxDepth {
+	if depth > MaxDepth {
 		c.ok = false
 		return
 	}
@@ -758,7 +758,7 @@ func skipNode(c *cursor, depth int) {
 
 // skipAdBody advances c past a nested ad body ([hotCount][hot][attrCount][entries]).
 func skipAdBody(c *cursor, depth int) {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return
 	}
@@ -770,7 +770,7 @@ func skipAdBody(c *cursor, depth int) {
 	attrCount := c.uvarint()
 	for i := uint64(0); i < attrCount && c.ok; i++ {
 		c.skipKey()
-		skipNode(c, depth+1)
+		skipNode(c, depth)
 	}
 }
 

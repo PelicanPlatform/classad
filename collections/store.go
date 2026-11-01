@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"fmt"
 	"iter"
 	"runtime"
 	"slices"
@@ -1000,6 +1001,13 @@ func (c *Collection) Update(batch []AdUpdate) error {
 	if len(batch) == 0 {
 		return nil
 	}
+	// Every ad is checked before any is encoded, so a refused ad leaves the whole batch unapplied
+	// rather than half of it committed.
+	for i := range batch {
+		if err := wire.CheckDepth(batch[i].Ad.AST()); err != nil {
+			return fmt.Errorf("collections: ad %d: %w", i, err)
+		}
+	}
 	codec := c.currentCodec()
 	byShard := make(map[int][]pendingPut, len(c.shards))
 	for i := range batch {
@@ -1052,6 +1060,9 @@ func (c *Collection) Put(key []byte, ad *classad.ClassAd) error { return c.put(k
 func (c *Collection) putDeferred(key []byte, ad *classad.ClassAd) error { return c.put(key, ad, true) }
 
 func (c *Collection) put(key []byte, ad *classad.ClassAd, deferred bool) error {
+	if err := wire.CheckDepth(ad.AST()); err != nil {
+		return err
+	}
 	codec := c.currentCodec()
 	raw := c.encodeAd(ad.AST())
 	stored := codec.Compress(nil, raw)
