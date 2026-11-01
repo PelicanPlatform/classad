@@ -252,6 +252,122 @@ func TestOptimizerKnowsEveryOpcode(t *testing.T) {
 	regUses(rp, RegInstr{Op: RegOp(250)}, nil)
 }
 
+// TestDeadCodeKeepsWhatCanPanic is the condition that makes this pass correct rather than plausible,
+// and it is not a general property of dead-code elimination -- it is specific to this evaluator.
+//
+// Resolving an attribute reference can be a CYCLIC reference, which panics, and RunRegisters turns
+// that panic into an error value. So a load nothing reads still decides the result: binding a local
+// to a cyclic attribute and never using it yields ERROR, not the result expression's value.
+// Removing the load would turn ERROR into 5.
+func TestDeadCodeKeepsWhatCanPanic(t *testing.T) {
+	scope, err := classad.Parse(`[ Cyc = Cyc + 1; Ok = 5 ]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rhs, err := parser.ParseExpr("Cyc")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := parser.ParseExpr("5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := NewScript().Let("unused", rhs).Result(res).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := RunRegisters(sp.RegProgram(), scope)
+	if before.String() != "error" {
+		t.Fatalf("unoptimized = %s, want error; this test is not set up to test what it says", before)
+	}
+	after := RunRegisters(Optimize(sp.RegProgram(), AllPasses()), scope)
+	if !valuesEqual(before, after) {
+		t.Errorf("optimized = %s, unoptimized = %s; a dead attribute load was removed, and resolving it is observable",
+			describe(after), describe(before))
+	}
+	// A DELEGATED SUBTREE is the same hazard by a different route: this one compiles to a single
+	// REvalNode, which hands the expression to the tree-walker, which hits the cycle.
+	cond, err := parser.ParseExpr("Cyc ? 1 : 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spc, err := NewScript().Let("unused", cond).Result(res).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countOp(spc.RegProgram(), REvalNode) == 0 {
+		t.Fatal("the conditional did not compile to REvalNode; this case is not testing what it says")
+	}
+	wantC := RunRegisters(spc.RegProgram(), scope)
+	if wantC.String() != "error" {
+		t.Fatalf("unoptimized conditional = %s, want error", wantC)
+	}
+	if gotC := RunRegisters(Optimize(spc.RegProgram(), AllPasses()), scope); !valuesEqual(wantC, gotC) {
+		t.Errorf("optimized = %s, unoptimized = %s; a dead delegated subtree was removed",
+			describe(gotC), describe(wantC))
+	}
+
+	// A dead LITERAL, by contrast, is removable: nothing about evaluating it can be observed.
+	lit, err := parser.ParseExpr("42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp2, err := NewScript().Let("alsoUnused", lit).Result(res).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if countOp(Optimize(sp2.RegProgram(), AllPasses()), RConst) >= countOp(sp2.RegProgram(), RConst) {
+		t.Error("a dead literal was not removed; the pass is doing nothing here")
+	}
+}
+
+// TestDeadCodeActuallyFires guards against the vacuous law: a pass that never fires agrees with the
+// unoptimized program on everything.
+func TestDeadCodeActuallyFires(t *testing.T) {
+	rhs, _ := parser.ParseExpr("1 + 2")
+	res, _ := parser.ParseExpr("t + t")
+	sp, err := NewScript().Let("t", rhs).Result(res).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := func(rp *RegProgram) int {
+		n := 0
+		for _, in := range rp.code {
+			if in.Op != RNop {
+				n++
+			}
+		}
+		return n
+	}
+	before := live(sp.RegProgram())
+	after := live(Optimize(sp.RegProgram(), AllPasses()))
+	if after >= before {
+		t.Errorf("live instructions: %d before, %d after; the passes did not fire", before, after)
+	}
+	scope, _ := classad.Parse(`[]`)
+	if got := RunRegisters(Optimize(sp.RegProgram(), AllPasses()), scope).String(); got != "6" {
+		t.Errorf("optimized result = %s, want 6", got)
+	}
+}
+
+// TestDeadCodeIsSwitchable pins that DeadCode runs only when selected, which is what lets the law
+// localize a divergence to one pass.
+func TestDeadCodeIsSwitchable(t *testing.T) {
+	lit, _ := parser.ParseExpr("42")
+	res, _ := parser.ParseExpr("1")
+	sp, err := NewScript().Let("unused", lit).Result(res).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := countOp(sp.RegProgram(), RConst)
+	if n := countOp(Optimize(sp.RegProgram(), OptPasses{CopyProp: true}), RConst); n != base {
+		t.Errorf("CopyProp alone changed the literal count (%d -> %d)", base, n)
+	}
+	if n := countOp(Optimize(sp.RegProgram(), OptPasses{DeadCode: true}), RConst); n >= base {
+		t.Errorf("DeadCode alone did nothing (%d -> %d)", base, n)
+	}
+}
+
 // TestOptimizerKnowsTheOpcodesWeEmit is the complement of TestOptimizerKnowsEveryOpcode, and the one
 // that actually catches a missed opcode.
 //

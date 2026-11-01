@@ -27,10 +27,14 @@ import "fmt"
 type OptPasses struct {
 	// CopyProp replaces reads of a copied register with the original and removes the copy.
 	CopyProp bool
+
+	// DeadCode removes instructions whose destination is never read, where removing them is
+	// provably unobservable. See removable.
+	DeadCode bool
 }
 
 // AllPasses enables every pass.
-func AllPasses() OptPasses { return OptPasses{CopyProp: true} }
+func AllPasses() OptPasses { return OptPasses{CopyProp: true, DeadCode: true} }
 
 // Optimize returns an optimized copy of rp. rp is not modified, so the unoptimized program stays
 // available as the oracle for the optimized one.
@@ -45,6 +49,10 @@ func Optimize(rp *RegProgram, passes OptPasses) *RegProgram {
 	// args stays shared, so copyProp deep-copies the one argument list it rewrites.
 	if passes.CopyProp {
 		copyProp(out)
+	}
+	// After CopyProp, so the copies it detaches from their readers are then dead.
+	if passes.DeadCode {
+		deadCode(out)
 	}
 	return out
 }
@@ -239,6 +247,82 @@ func substitute(rp *RegProgram, j int, from, to int32) {
 		if changed {
 			rp.args = append(append([][]int32(nil), rp.args...), cp)
 			in.Args = int32(len(rp.args) - 1)
+		}
+	}
+}
+
+// removable reports whether an instruction may be deleted when nothing reads its destination.
+//
+// The answer is NOT "any instruction with a dead destination", and the reason is specific to this
+// evaluator: resolving an attribute reference can be a CYCLIC reference, which panics, and
+// RunRegisters turns that panic into an error value. So a load whose result nobody reads still
+// decides the program's result:
+//
+//	t = Cyc          // Cyc = Cyc + 1
+//	result = 5       // evaluates to ERROR, not 5
+//
+// Deleting that load would turn ERROR into 5. A delegated subtree is the same: `Cyc ? 1 : 2` bound
+// to an unused local is ERROR, and it compiles to one REvalNode. Both are demonstrated by
+// TestDeadCodeKeepsWhatCanPanic.
+//
+// A built-in call is excluded as a PRECAUTION rather than a demonstrated hazard. Ten of them
+// materialize a lazy list, which is how a cycle would be reached, but every case tried --
+// sum/size/min/join/member over a self-referential list -- returned a value rather than panicking.
+// It stays out of the whitelist because "I could not construct one" is not "there is none", and the
+// cost of keeping it out is a dead call left in place.
+//
+// So this is a whitelist of instructions that compute from already-computed values and cannot fail:
+// literals, and register copies. That is enough to clear what copy propagation leaves behind, which
+// is what this pass is for. Widening it means proving the wider set cannot panic, not assuming it.
+func removable(in RegInstr) bool {
+	switch in.Op {
+	case RNop, RConst, RTrue, RFalse, RUndef, RError, RMove:
+		return true
+	}
+	return false
+}
+
+// deadCode removes instructions whose destination is never read.
+//
+// Liveness is computed to a fixpoint rather than in one backward sweep, because a jump can carry
+// control backwards over an instruction -- not in the shapes the compiler emits today, where every
+// jump is forward, but the pass should not be the thing that breaks when a loop arrives.
+func deadCode(rp *RegProgram) {
+	live := make([]bool, rp.nregs)
+	if rp.res >= 0 && int(rp.res) < len(live) {
+		live[rp.res] = true
+	}
+	kept := make([]bool, len(rp.code))
+	for i, in := range rp.code {
+		// An instruction that cannot be removed is kept regardless of whether its destination is
+		// read, and therefore its operands are live.
+		if !removable(in) {
+			kept[i] = true
+		}
+	}
+	var buf []int32
+	for changed := true; changed; {
+		changed = false
+		for i := len(rp.code) - 1; i >= 0; i-- {
+			if !kept[i] {
+				if d, ok := regDef(rp.code[i]); ok && int(d) < len(live) && live[d] {
+					kept[i], changed = true, true
+				}
+			}
+			if !kept[i] {
+				continue
+			}
+			buf = regUses(rp, rp.code[i], buf)
+			for _, u := range buf {
+				if int(u) < len(live) && !live[u] {
+					live[u], changed = true, true
+				}
+			}
+		}
+	}
+	for i := range rp.code {
+		if !kept[i] {
+			rp.code[i] = RegInstr{Op: RNop}
 		}
 	}
 }
