@@ -402,6 +402,11 @@ One unit per instruction executed **times the batch width at that point** — so
 the real cost model: it is proportional to work done, it is deterministic, and it is the same number
 whether a script is executed scalar or vector, which makes it an oracle-friendly quantity (§7.3).
 
+> **Corrected in §14.5.** "The same number whether scalar or vector" does not survive predication: a
+> predicated instruction touches dead lanes while scalar execution skips them. §14.5 splits this into
+> *charged steps* — the budget and the §7.3 comparison quantity, charged `popcount(live)` — and *real
+> work*, which is a benchmark's business. Read that before implementing this paragraph.
+
 Exhaustion **aborts the execution** and is reported to the host as an error, not as a per-record
 `ERROR`. It is a statement about the script, not about any record. A script that exhausts it would
 have produced the same result at any batch size, so a host must not retry it scalar.
@@ -1252,9 +1257,11 @@ switchable; form selection first, then liveness and allocation, then compaction,
 
 ## 10. Open questions
 
-1. **Does `ColumnSource.LoadColumn` promise per-batch purity?** §6.6's CSE on `OpLoadRef` needs it and
-   the interface does not state it (`collections/vm/vecexec.go:252-259`). `blockVecSource` appears to
-   satisfy it; confirm and write it down before CSE ships.
+1. ~~**Does `ColumnSource.LoadColumn` promise per-batch purity?**~~ **Answered in §14.7: yes, and it is
+   not the binding constraint.** `blockVecSource` satisfies it, but the vector kernels overwrite their
+   left operand and convert their right operand in place — and `toMask` is lossy on numbers — so CSE
+   on a load needs a copy at the second use or an ownership analysis, not merely a purity clause. The
+   clause should still be written into the interface's comment.
 2. **Compaction's real threshold.** The 1/4 inherited from `minLiveNum`/`minLiveDen`
    (`collections/colvec.go:62-63`) is a bail-out threshold, not a gather threshold, and the gather is
    cheaper. Measure with the §7.4 selectivity sweep; do not pick a number.
@@ -1420,9 +1427,9 @@ the concrete payoff of §2.6's rule that registrations are declared to the compi
    report — so F1–F4 are currently one undifferentiated outcome, and the per-record model of §2.2 is
    entirely unbuilt.
 
-### 11.4 Two findings from building it
+### 11.4 Three findings from building it
 
-Neither is a design change; both are the kind of thing this document exists to keep.
+None is a design change; all three are the kind of thing this document exists to keep.
 
 - **A real-arithmetic divergence, found by the parity fuzzer rather than by reading.** A real result
   that overflows to `+Inf` is `ERROR` in the reference while `-Inf` and NaN are not; the vector path
@@ -1436,6 +1443,21 @@ Neither is a design change; both are the kind of thing this document exists to k
   `collections/vm/plan.go:97-101`). §6.6 should absorb the general form: CSE and every other pass
   that reasons about a read set inherits this precondition, and `eval()` is the one construct that
   violates it.
+- **A blend dropped the dictionary its codes belonged to, and answered ERROR.** Found while reading
+  `blend` for §14.2, which proposes generalizing it into the masked store. The join built its result
+  with `Dict` set to nil and then copied each chosen element with `CopyElem`, which preserves a
+  dictionary *code*; a code with no dictionary resolves as ERROR, so over a dictionary-encoded string
+  column every record of `Owner ?: "nobody"` evaluated to ERROR. Not a decline — `Native()` admits
+  both Elvis and the conditional, and the columnar count path takes the result, so a constraint built
+  on one returned a **wrong count**. Fixed by having the result adopt one source's dictionary and
+  resolve every code that came from another.
+
+  The general form is worth carrying into §14.2, because the masked store inherits it exactly: a Vec
+  carries meaning outside its own elements — a dictionary, a `Const` flag, a `Raw` width — and
+  **moving an element between vectors is not the same operation as moving its value**. A store that
+  scatters elements into a destination has to answer, for each of those, whether the destination can
+  mean the same thing by them. The non-materialized representations of §6.5 are what make this a
+  recurring hazard rather than a one-off bug.
 
 ---
 
@@ -1458,19 +1480,111 @@ needs it.
    everything below it encodes: a vector executor for statements has nowhere to put "this record's
    condition was undefined" until the fault mask and the per-site report exist. Cheap — `VsError` and
    `mError` already exist — and it cannot be retrofitted around.
-2. **Predication for statements, and the masked blend (§2.3).** The one genuinely new runtime
-   primitive. Half of it is already there: `blend` (`collections/vm/vecexec.go:443`) selects per record
-   at a join. What it lacks is the mask *stack* and the rule that assignment under a predicate leaves
-   non-live lanes untouched. Note S2 — this is in addition to blending, not a replacement for it.
-3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Required *before* O3, not
-   after: budget consumption is one of the four quantities scalar and vector execution are supposed to
-   agree on elementwise, and it is the one that localizes a bug the values alone would hide.
-4. **O3 itself (§7.3).** The deliverable that proves the retarget. Everything above exists to make it
-   a real test rather than a tautology.
+2. **Predication for statements, and the masked blend (§2.3).** ~~The one genuinely new runtime
+   primitive.~~ **Built, for `If`.** `OpStoreLocal` and `OpLoadLocal` are served, so a script's
+   bindings are vectors; `OpBranchVoid` and `OpJmpVoid` are served, so an `If` splits the live mask,
+   runs both arms, and rejoins on their union; and a store under a predicate writes only its live
+   lanes. Measured at 2.2x the register executor per record for a flat `If` and 2.2x nested — lower
+   than the 3.2x–3.7x a straight-line script gets, which is the right shape, because both arms run.
+
+   Three things the build settled that the design had not:
+
+   - **A local is a place**, as in the register lowering — which is what makes a store under a
+     predicate expressible at all: there is a destination to leave untouched. A read of one is a
+     **copy**, forced by §14.7. The copy is the price of the whole model and it is ~3 ns/element,
+     against a 1.9x *win* where a binding is read twice.
+   - **Mask ownership is the hard part**, and it is not in §14.1. A nested region is entered with the
+     enclosing region's own arm mask as its live mask, so freeing it at the inner join corrupts the
+     enclosing region's join. A region borrows its outer mask and owns only the two it allocates.
+   - **Setting the planes up is not free.** Doing it per batch cost ~2% of an *expression* scan —
+     every block of every columnar scan — for state an expression cannot use. It is now conditional
+     on the program having statements, and a branch sets them up itself if they are missing, so the
+     flag is an optimization and not a correctness dependency.
+
+   **`While` is built too, so this item is done.** The trips run in lockstep and the live set
+   shrinks: a record that left on trip three is not live for trips four onward, so it is neither
+   re-executed nor billed for them. 3.5x where every record takes the same number of trips, 2.0x
+   with trips spread over 16, 1.6x over 256 — the win narrowing as the live set collapses earlier.
+
+   The trip limit was as cheap as predicted: one counter per loop is already a per-record trip count.
+
+   **A second bound was needed that was in no plan, and its absence is a hang rather than a wrong
+   answer.** A trip costs a full-WIDTH pass however few records are still going, because the kernels
+   do not compact — so one record taking a million trips does a million full-width passes, every one
+   of them permitted by the per-record budget. The executor compares the width it has spent against
+   what the records actually needed, which the charge already counts, and abandons the batch when
+   they diverge too far. Abandoning rather than faulting is what makes the guard free of risk: the
+   per-record path is exact, so only time is at stake.
+
+   That guard needs an absolute floor as well as a ratio, which is worth remembering past this
+   context: **a ratio says nothing about a small number.** On a batch of eight records the ratio
+   trips within a few trips and is right to — the vector path really is doing eight times the
+   necessary work — but it is doing it to a couple of hundred operations in total, and the re-run it
+   would trigger costs more than the waste.
+3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** ~~Required before O3.~~
+   **Built.** A charged step is now a *value operation*, the vector executor bills each record for
+   what it would have run scalar, and both are verified against the stack interpreter per record.
+   What is left of this item is the **per-record trip limit**, which only `While` needs.
+
+   Three things the build settled, none of which was in §3.1 or §14.5:
+
+   - **Which instructions count, and why the answer is forced.** The three executors span two
+     instruction sets. Counting every instruction makes them disagree by construction — the register
+     form spends a move on a join and on every local read, where the stack form leaves a value in
+     place, and neither is doing more work. Counting only value operations makes the lowering 1:1, so
+     a record's charge is a property of the **expression** rather than of the form it was lowered to.
+     That is what lets a divergence between two executors be attributed rather than merely noticed.
+     Measured over every corpus in the package before being built on: 17577 record-expression pairs,
+     zero disagreements.
+   - **The charge forced predication onto expressions, which turned out to be worth more than the
+     charge.** §14.5 resolved the charge for a predicated instruction and said nothing about the
+     three constructs that are not predicated — Elvis, the conditional, and the `&&`/`||`
+     short-circuit — which evaluate every path for everybody. Billing a record for a path it would
+     have jumped over required narrowing the live mask around each of them; and once the mask is
+     there, a path that **no** record takes can simply be skipped. 2.98x on a selective conjunction,
+     3.58x on an Elvis whose fallback is never needed, 1.51x on a conditional.
+   - **Accounting must not be per instruction.** Testing the opcode, accumulating the charge and
+     comparing it to the budget cost **11% of a string-comparison scan together**, where each alone
+     cost between 1% and 4%. The superlinearity is the signal: that is a code-layout effect in the
+     dispatch loop, not arithmetic, and the way out of one is to take the work out of the loop rather
+     than to shave it. The charge for a run of instructions is now read from a prefix sum built once
+     per program, and the executor does arithmetic only where a run ends.
+
+   §14.5 should absorb the first and third of those; §14.1's table should note that the live mask is
+   now read for something other than a store, which is the condition it named for its own rules
+   becoming load-bearing.
+4. **O3 itself (§7.3).** The deliverable that proves the retarget — and **now the top of the list**,
+   with everything it depends on built. Three of its four quantities are checked today, and the gaps
+   are specific rather than vague:
+
+   | O3 demands | state |
+   |---|---|
+   | values element-identical | **done** — every corpus in the package, per record |
+   | element-step consumption | **done** — per record at batch size 1, and as a batch sum |
+   | fault *mask* | **done** indirectly: a faulted record's answer is ERROR, which the value comparison catches, and the fault SETS are compared outright for the revival case |
+   | per-site fault *counts* | **not built.** The vector executor accumulates a fault plane and never attributes it to a site, so only the scalar half of that comparison exists |
+   | at every batch size, including 1 | partial — 1 and the corpus size, not a sweep |
+   | including a partial final batch | **not tested** |
+   | including a boundary inside a loop's divergence | **not tested**, and this is the interesting one |
+
+   The last row is where the value is. A split falling between two trips of a loop is precisely the
+   input that distinguishes an executor carrying no state across batches from one that happens to
+   work when nothing is in flight. Two bugs of exactly that shape have already been found and fixed
+   — a binding leaking between batches, and a mask released twice after a mid-loop decline — each
+   caught by a test written for it rather than by a law. A batch-invariance law turns that from luck
+   into coverage.
 5. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
    both need the vector path to exist before they mean anything — a form is a property of a `Vec`, and
    a deferred load defers a decompression. Measured context for sizing: roughly 78% of mutable read
    CPU is zstd, so a load not performed is worth more than any amount of arithmetic removed.
+
+   One concrete thing to build here, which arrived as a request from outside: **a `Vec` has nowhere
+   to record that its column is uniformly typed**, and the storage layer already knows. `loadNum`
+   writes one declared state across an escape-free column, and the `Raw` form carries no per-element
+   state at all. A consumer that could be told "every element of this column is an integer" rather
+   than having to scan for it gets the fact for free; today it has to rediscover it. The flag belongs
+   with form selection because it *is* a form distinction, and the rule that goes with it is the
+   ordinary one: any kernel that writes per-element states clears it.
 6. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
    blocks the database use, and `for` over a *per-record* list stays declined (§2.3) until open
    question 4 gets its density argument.
@@ -1560,3 +1674,292 @@ against the obvious shortcut of letting a UDAF receive the accumulated value sli
    the whole point of the vector engine is not to box. A batch-shaped accumulate is the same design
    question the vectorized WASM ABI is facing, and the two should share an answer rather than invent
    two.
+
+---
+
+## 14. The vector script executor, specified
+
+§12 puts the fault model, predication and the element-step budget first, in that order. They are one
+design and not three, because the fault mask is part of the predication state and the budget is what
+prices the two control-flow lowerings against each other. This section is that design, at the level
+of detail someone could build from. Writing it out turned up a **mistake in §3.1**, recorded in
+§14.5.
+
+### 14.1 The state one vector script execution carries
+
+| | What | Note |
+|---|---|---|
+| `regs` | the register file: one `*Vec` per register | `VecScratch` generalized (§6.7, D13); lazily allocated, released per block |
+| `live` | **one** plane, not a `(hi,lo)` pair | the records still executing |
+| mask stack | the enclosing `live` masks | depth is static and computed at compile time (§2.8), so it cannot overflow |
+| `faulted` | one plane, **monotone** | accumulated, never cleared |
+| `faultSites` | per site hit: instruction, class, count, first record | §2.2's report; per-site, not per-record |
+| `steps` | the charged-step counter | §14.5 |
+
+*(Corrected while building: the table first said `live` was a `(hi,lo)` pair, by analogy with a
+value's mask form. It is not. "Executing" is a boolean, where a value is three-valued, so `live` is
+one plane and so is `faulted`. `Vec.CountTrue` already took a single-plane live mask, so the
+convention was in the tree before this said otherwise.)*
+
+**`live` and `faulted` are not two views of one thing, and conflating them is the bug this layout
+exists to prevent.** `live` is pushed and popped at region boundaries; `faulted` only ever grows.
+And faulting record *i* must clear its bit from **every mask on the stack**, not just the top one —
+clearing only the top leaves the record dead inside the region and alive again at the reconvergence
+point, which is both wrong and plausible-looking. A fault is "this record is done for the rest of the
+script" (§2.2), and that sentence has to be true of the whole stack.
+
+**But that rule is currently unobservable, and knowing why matters more than the rule.** Because a
+faulted record's answer is overwritten with ERROR at the end whatever happened in between, excluding
+a faulted record from an arm mask changes no result: it could take both arms, or the wrong one, and
+still answer ERROR. Three separate mutations of exactly this — don't exclude faults from the then
+mask, from the else mask, or from the enclosing masks — survive the whole test suite, and no test
+written against the executor's output can catch them.
+
+That is not an argument for dropping them. It locates where predication's correctness actually
+lives: **in the fault plane, not in arm-mask hygiene.** The masks are about not doing work for
+records that are finished. They become load-bearing the moment anything reads `live` for something
+other than deciding a store — an early exit when no record is live, or compaction — which is exactly
+§14.3's condition for predication paying for itself at all. So the rules are kept, and the fact that
+nothing tests them is written next to them rather than discovered later.
+
+**That condition has since arrived, from an unexpected direction.** Making the charge exact required
+narrowing `live` around the three constructs that evaluate every path — Elvis, the conditional and
+the short-circuit — and the executor now reads the narrowed mask to decide whether a path is taken
+by *nobody*, in which case it jumps over it. So `live` is read for something other than a store
+today, and the arm-mask rules above are closer to load-bearing than when this was written. They are
+still not *tested*, because the constructs that skip are expression-level and cannot fault; a
+statement-level early exit is what would finally make them so.
+
+### 14.2 The one new kernel, which already half exists
+
+§2.3 calls masked assignment "the one genuinely new runtime primitive". It is closer than that
+suggests. The existing join blend selects per record between **two freshly computed vectors**
+(`collections/vm/vecexec.go:443`); a masked store selects per record between a computed vector and
+**the destination register's prior contents**. Same operation, different second operand. So this is a
+generalization of `blend`, not a new kernel beside it — and the two should share one implementation,
+because a selection written twice is a selection that will diverge on the `Const` and dictionary
+cases.
+
+One wrinkle that belongs in the design and not in the discovery: a masked store **forces its
+destination out of the forms that describe the whole vector at once**. A register held as `Const`
+says one thing about every record and one held as `Raw` is a column at a single stored width, so
+neither can absorb a value that differs per lane; both are expanded. §6.5 makes form part of a
+register's type precisely so that conversion is an instruction rather than a surprise, and a masked
+store is the place a silent materialization would otherwise appear. The exception worth
+special-casing is a `Const` source equal to the destination's existing constant, which is a no-op.
+
+**Correction, from building it: a dictionary is not one of those forms, and the first draft of this
+section was wrong to lump it in.** "A masked store forces its destination to data form" sounds right
+and costs a string per record. A dictionary describes a vector's codes *individually*, so a
+destination can keep its own codes while the store writes other values into other lanes — a mixed
+vector is a shape the executor already reads, and column `E` of the dictionary corpus is one. What
+genuinely cannot survive is a code from a **different** dictionary, because two dictionaries number
+their entries independently; such a code is resolved to its string as it lands. An unbound
+destination adopts the source's dictionary instead.
+
+The general rule, which §14.1's finding above and the blend bug in §11.4 are the other two instances
+of: **resolution is the correctness mechanism, and carrying a dictionary is the optimization.** A
+selection that resolves everything is always right and always slow; one that carries a dictionary it
+cannot justify is fast and wrong. Every place that moves elements between vectors has to answer that
+question, and there are now three of them — `blend`, the masked store, and `CopyElem`'s callers in
+the storage layer.
+
+### 14.3 Predication does not save work; predication *plus* something else does
+
+The conclusion that should govern the implementation order, and it is not the intuitive one.
+
+A masked instruction still touches every lane: the mask selects what is *kept*, not what is
+*computed*. So, counting real work over a batch of width *n*:
+
+| Lowering | Cost of a two-armed region | Wins when |
+|---|---|---|
+| **Blend** (speculate both arms, select at the join) | both arms at full *n*, no bookkeeping | always, among these two |
+| **Predicate** (mask each arm) | both arms at full *n*, **plus** mask push/pop and a masked store per assignment | never, on its own |
+| Predicate + **empty-mask early exit** (§6.8.11) | only the arms whose mask is non-empty, at full *n*, plus one popcount per 64 records (`collections/vm/vecexec.go:829`) | a whole block goes one way — common on clustered or sorted data |
+| Predicate + **compaction** (§6.4) | each arm at `popcount(live)`, plus a gather and a scatter at *n* | selectivity is low **and** the region is long enough to amortize the gather |
+
+So predication is *strictly worse than blending* until it is paired with early exit or compaction.
+That is the answer to the seam S2 opened: the two lowerings are not two philosophies, they are two
+points on one cost curve whose crossover is a function of **selectivity and region length** — the same
+two quantities §6.4's threshold already turns on (`collections/colvec.go:57-64`, fired at `:463`).
+The crossover is therefore *measurable*, with the §7.4 selectivity sweep, and the optimizer's choice
+is a cost-model decision rather than a taste one.
+
+Two corollaries worth having in writing:
+
+- **For expressions, blending is right and will stay right.** The region is one or two instructions, so
+  there is nothing to amortize a gather over. The crossover is reached only by statement regions, which
+  is why blending could ship for `?:` and `ifThenElse` without any of this machinery.
+- **Build the early exit before compaction.** It is a popcount and a jump, it is what `while` needs
+  anyway (§2.3), and it may move the crossover far enough that compaction's threshold question (open
+  question 2) stops mattering for control flow and stays confined to scans.
+
+### 14.4 When speculation is not merely expensive but *wrong*
+
+A region may be blended only if it is **bounded**, cannot **mutate**, and cannot **fault**.
+
+- *Bounded* rules out a `while` body, which has no static bound. Nothing recovers this; loops are
+  predicated.
+- *Cannot mutate* is free today, because §2.3 declines mutation in the vector context outright. It
+  becomes load-bearing the moment that changes, so it should be checked by the compiler now rather
+  than assumed.
+- *Cannot fault* is the subtle one, and it is where §14.1's monotone `faulted` mask bites. If both
+  arms are evaluated and arm A faults record *i* that actually took arm B, that fault must not be
+  recorded — but `faulted` is monotone *by design*, so there is nowhere to put a fault that may need
+  taking back. **Rollback is the wrong answer**: it reintroduces exactly the ordering dependence the
+  monotone mask exists to remove. The right answer is that a speculated region must be *provably*
+  fault-free.
+
+Which gives §6.8 item 13 — the definedness analysis — a second and larger job than the one it was
+listed for. It was justified as a kernel-selection pass (prove a subexpression is two-valued, emit the
+one-instruction AND instead of `planeAnd`). It is also **the analysis that licenses speculation**, and
+therefore the pass that decides whether a region gets the cheap lowering at all. That is a much
+stronger reason to build it than the one §6.8 gives, and it should move up that list.
+
+At the expression layer the obligation is discharged for nothing: expressions are total (§2.1), so
+they cannot fault. That is the whole reason blending shipped first.
+
+### 14.5 Charged steps, and a correction to §3.1
+
+§3.1 claims the element-step count is "the same number whether a script is executed scalar or vector,
+which makes it an oracle-friendly quantity" (§7.3 then uses it as one of the four things scalar and
+vector execution must agree on elementwise). **With predication that claim is false**, and the reason
+is §14.3: a predicated instruction touches dead lanes, while scalar execution — where the mask is
+uniform, so early exit always applies — skips them. Charge real work and the two paths disagree;
+charge what the two paths have in common and the number no longer tracks real work.
+
+These are two different quantities and the draft conflated them. Resolution:
+
+- **Charged steps** — the budget, and the O3 comparison quantity. A predicated instruction is charged
+  `popcount(live)`, not *n*. Batch-size-invariant by construction, so scalar execution of record *i*
+  charges exactly what vector execution charges lane *i*, and O3 can compare them elementwise.
+- **Real work** — a benchmark's business, not the budget's. It is the quantity §14.3's table is about,
+  and it is what the optimizer minimizes.
+
+**Three things this section did not say, all settled by building it.**
+
+*Which instructions are charged at all.* Not every one: **a step is a value operation** — a literal,
+an attribute load, an operator, a logical combine, a member test, a call, a delegated subtree — and
+not a jump, a short-circuit test, a move, a local load or store, or a nop. The line is forced rather
+than chosen, because the three executors span **two instruction sets**: the stack interpreter and the
+vector executor share one, the register executor has its own. Counting every instruction makes them
+disagree by construction, since the register form spends a move on a join and on every local read
+where the stack form leaves a value in place, and neither is doing more work than the other. Counting
+value operations makes the lowering 1:1, so a record's charge is a property of the expression rather
+than of the form it was lowered to — which is the whole point of having the quantity. Checked over
+every corpus in the package before anything was built on it: 17577 record-expression pairs, zero
+disagreements.
+
+That choice has a termination obligation, and it is discharged against the **compiler** rather than
+the interpreter: a loop whose condition and body contained no value operation would never be billed
+and so would never stop, and it cannot exist because every back edge passes through a condition
+expression and the smallest expression is a literal.
+
+*Where the accounting happens.* **Not in the dispatch loop.** Testing the opcode, accumulating the
+charge and comparing it to the budget cost **11% of a string-comparison scan together**, where each
+one alone cost between 1% and 4%. The superlinearity is the whole signal — it says the cost is code
+layout in a hot switch rather than the arithmetic, and the answer to that is to remove the work, not
+to shave it. The charge for a contiguous run of instructions is a static property, so it is read from
+a prefix sum built once per program and billed only where a run ends: a jump, a region boundary, the
+end. The dispatch loop does no accounting at all, and the regression goes to a median of +0.45%.
+
+*Where the accounting is wrong when nobody looks.* The charge is settled where a run of instructions
+ENDS, and every such point has to be found. Two were missed — the two arms of a statement-level `If`
+— so an arm was billed at whatever live count was last set. No test noticed, because the charge law
+ran over expressions and an `If` is a statement; extending the law to statements, which loops forced,
+found it immediately. The lesson is about the law rather than the bug: **a law checked over one kind
+of input says nothing about the other kind**, and the charge is exactly the sort of quantity whose
+coverage gap is invisible because the answers stay right.
+
+The general form of the cost finding is worth keeping too: **a measurement whose parts are each small
+and whose sum is not is not telling you about the parts.** Three separate 1-4% costs that compose to 11% are one effect, and
+optimizing any of the three individually would have found nothing.
+
+The thing to notice before accepting this: charged steps no longer bound wall time tightly, because
+dead-lane work is unbilled. The slack is bounded by the batch width — at most 8192
+(`collections/colblock.go:98`) — which is a known constant, and the budget's job is **termination**,
+not fine cost control. A factor-of-width slack is acceptable for termination and unacceptable for
+costing, which is exactly why the two quantities have to be named separately rather than reconciled.
+
+### 14.6 Build order, and what each step is proved by
+
+- **D2a — register file, `live` mask, masked store, `if`/`else` only.** No loops, no new faults. Proved
+  by O3 at every batch size including 1 and a partial final batch. This is the step that shows the
+  register model survives contact with the vector path; everything after it is additive.
+- **D2b — the fault mask, the site table, and the report.** Proved by §7.5's fault-locality law, which
+  is the one a careless mask bug breaks immediately, plus a test that a fault clears the record from
+  every enclosing mask (§14.1).
+- **D2c — `while`, per-record trip limits, and the empty-mask early exit**, which `while` needs anyway.
+  Proved by O3 on scripts whose records leave the loop at different iterations, and by §7.5's budget
+  monotonicity.
+- **Then measure §14.3's crossover**, before building compaction for control flow. If the early exit
+  moves it far enough, compaction stays a scan optimization and the control-flow path never needs it —
+  which would be the cheapest possible outcome and is not the one the draft assumed.
+
+### 14.7 Today's vector kernels are destructive in **both** operands, which constrains D2a and CSE
+
+Checking open question 1 — does `ColumnSource.LoadColumn` promise per-batch purity? — turned up
+something larger than the question. The answer to the question is yes:
+`blockVecSource.LoadColumn` reads a fixed block through a block cache, writes only `dst`, and is
+deterministic and idempotent for a given `(block, name, scope)` (`collections/colvec.go:105-131`).
+Purity holds and can be written into the interface's contract.
+
+**It is not the binding constraint.** The vector kernels do not compute into a destination; they
+**overwrite their left operand, and convert their right operand's representation in place**:
+
+```go
+func logicalVec(op string, l, r *Vec) bool {
+    l.toMask()
+    r.toMask()                                     // <- mutates r
+    planeAnd(l.Hi, l.Lo, r.Hi, r.Lo, l.Hi, l.Lo)   // <- result into l
+```
+— `collections/vm/vecexec.go:1488-1497`; `arithVec` does the same with `ensureInts`/`toData`
+(`:604-608`), `unopVec` and `strListVec` replace their single operand
+(`:744`, `collections/vm/strlist.go:128`), and `memberVec` writes `s.top()`
+(`collections/vm/member.go:340`).
+
+Two consequences, and the second is a correctness obligation rather than a performance note.
+
+**1. A register-form vector executor cannot map `Dst = op(A, B)` onto these kernels as written.** The
+register form's whole shape is a separate destination (`collections/vm/regir.go:127-137`), and these
+kernels have none. D2a therefore has to choose, per kernel, between copying an operand to the
+destination first (a memcpy at batch width) and keeping the stack machine's in-place discipline
+behind a register-level ownership rule — the same choice the allocator makes when it coalesces a
+result into a dying operand's register (§5.3). The right answer is probably "coalesce when the
+operand is dead here, copy when it is not", which is standard, but it has to be *decided* rather than
+discovered: a kernel called with a live operand silently corrupts it, and the corruption is a wrong
+value and not a crash.
+
+**2. `r.toMask()` is lossy, so CSE on a load needs more than purity.** A data vector of numbers
+converts to a mask by ClassAd operand truthiness — a nonzero number becomes TRUE — so a vector that
+has been through `toMask` no longer holds its numbers. In `x > 1 && x`, if the two reads of `x` were
+CSE'd to one vector, `logicalVec`'s `r.toMask()` would clobber the operand the comparison still
+needed. Today this cannot happen because every `OpLoadRef` pushes a fresh vector, which is precisely
+the cost CSE wants to remove.
+
+So §6.6's CSE on `OpLoadRef` needs **either** a copy at the second use **or** an ownership analysis
+that shares only where the sharer is the last consumer. The copy is still a win and should be the
+first version: a load is a *decompression* — roughly 78% of mutable read CPU is zstd — while a copy
+is a memcpy at batch width, so even an unconditional copy at every reuse buys most of the prize. The
+ownership analysis is the optimization *of* CSE, not its precondition.
+
+**What to change in the tree now, independent of any of this:** write the purity contract into
+`ColumnSource`'s doc comment (`collections/vm/vecexec.go:271-278`), which is what open question 1
+asked for, and write the destructiveness into each kernel's. The kernels' behaviour is currently
+discoverable only by reading their bodies, and it is the kind of contract that a future caller
+violates once and silently.
+
+**Since written, the first caller to hit consequence 1 chose the copy, and it is cheap.** Serving
+`OpLoadLocal` is exactly the case this section describes: a binding is live across its reads, so a
+read that handed the kernel the binding's own vector would corrupt it, and `t + t` would answer `4t`
+rather than `2t`. `loadLocal` copies, and `copyVec` copies the *form* rather than normalizing one —
+a mask as two bitplanes, a `Const` as a single element, the string payload only when some element is
+actually a string. Measured at 8192 records, that copy is ~3 ns/element against the equivalent
+inlined expression, against a 1.9x win where the binding is read twice. So the prediction above
+holds in the one case now built: "copy when the operand is live" is affordable, and the ownership
+rule that would avoid the copy is an optimization rather than a precondition.
+
+That is evidence for D2a's default, not a proof of it. The binding case is the *easy* one — a local
+is live by definition, so there was no coalescing decision to get wrong. The case that still has to
+be decided rather than discovered is the ordinary `Dst = op(A, B)` where `A` is dying: that is where
+a wrong answer is silent.
