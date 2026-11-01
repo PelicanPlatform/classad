@@ -24,6 +24,6 @@ func (m *Matcher) EvalResolved(resolver func(name string, scope ast.AttributeSco
 	m.ev.SetResolver(resolver)
 	defer m.ev.SetResolver(nil)
 	defer classad.RecoverCyclic(&result)
-	result, m.stack = exec(m.prog, m.ev, m.stack)
+	result, m.stack, _, _ = exec(m.prog, m.ev, m.stack, DefaultStepBudget)
 	return result
 }

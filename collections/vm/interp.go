@@ -18,18 +18,39 @@ func Run(p *Program, scope *classad.ClassAd) (result classad.Value) {
 	ev := classad.NewEvaluator(scope)
 	ev.PinCurrentTime(p.now)
 	defer classad.RecoverCyclic(&result)
-	result, _ = exec(p, ev, make([]classad.Value, 0, 16))
+	result, _, _, _ = exec(p, ev, make([]classad.Value, 0, 16), DefaultStepBudget)
 	return result
+}
+
+// RunLimited is Run with an explicit step budget. ok=false means the budget ran out, in which case
+// the value is ERROR.
+//
+// The two are distinguishable because they are different kinds of thing: ERROR is an answer the
+// program computed, while exhausting the budget means it did not finish.
+func RunLimited(p *Program, scope *classad.ClassAd, budget int) (result classad.Value, ok bool) {
+	ev := classad.NewEvaluator(scope)
+	ev.PinCurrentTime(p.now)
+	ok = true
+	defer classad.RecoverCyclic(&result)
+	result, _, _, ok = exec(p, ev, make([]classad.Value, 0, 16), budget)
+	return result, ok
 }
 
 // exec runs p against ev, using stack as scratch (stack[:0] is taken first). It
 // returns the result and the final stack slice, whose backing array the caller
 // may retain to amortize allocation across evaluations (see Matcher).
-func exec(p *Program, ev *classad.Evaluator, stack []classad.Value) (classad.Value, []classad.Value) {
+func exec(p *Program, ev *classad.Evaluator, stack []classad.Value, budget int) (classad.Value, []classad.Value, int, bool) {
 	stack = stack[:0]
 	code := p.code
+	steps := 0
 	for ip := 0; ip < len(code); {
 		in := code[ip]
+		if isValueOp(in.Op) {
+			steps++
+			if steps > budget {
+				return classad.NewErrorValue(), stack, steps, false
+			}
+		}
 		switch in.Op {
 		case OpPushConst:
 			stack = append(stack, p.consts[in.A])
@@ -135,7 +156,7 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value) (classad.Val
 		}
 	}
 	if len(stack) == 0 {
-		return classad.NewUndefinedValue(), stack
+		return classad.NewUndefinedValue(), stack, steps, true
 	}
-	return stack[len(stack)-1], stack
+	return stack[len(stack)-1], stack, steps, true
 }

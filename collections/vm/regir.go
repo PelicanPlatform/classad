@@ -624,20 +624,26 @@ func RunRegisters(rp *RegProgram, scope *classad.ClassAd) (result classad.Value)
 	return result
 }
 
-// DefaultStepBudget bounds how many instructions one execution may run.
+// DefaultStepBudget bounds how many CHARGED STEPS one execution may run. A step is a value
+// operation; step.go says which instructions those are and why the line is drawn there.
 //
 // A bound is not optional once a program can loop: `while true: x = x` has no answer, and the
-// evaluator's contract is that evaluation returns. It is counted in INSTRUCTIONS rather than in wall
-// clock on purpose -- a time limit makes the same script succeed or fail depending on what else the
+// evaluator's contract is that evaluation returns. It is counted in work rather than in wall clock
+// on purpose -- a time limit makes the same script succeed or fail depending on what else the
 // machine is doing, which is not reproducible, and a fault nobody can reproduce cannot be debugged
 // or differentially tested.
+//
+// It used to count every instruction. The same number now permits somewhat more of them, because
+// moves and jumps are no longer billed; that is a deliberate loosening, and the bound still holds
+// because every loop iteration passes through a condition expression and so is charged at least one
+// step (TestEveryLoopIterationIsCharged).
 //
 // The value is large enough that no terminating script written by hand will reach it and small
 // enough to stop a runaway quickly.
 const DefaultStepBudget = 1 << 22
 
-// RunRegistersLimited is RunRegisters with an explicit instruction budget. ok=false means the budget
-// ran out, in which case the value is ERROR.
+// RunRegistersLimited is RunRegisters with an explicit step budget. ok=false means the budget ran
+// out, in which case the value is ERROR.
 //
 // The two are distinguishable because they are different kinds of thing: ERROR is an answer the
 // script computed, while exhausting the budget means it did not finish. The design keeps that
@@ -647,7 +653,7 @@ const DefaultStepBudget = 1 << 22
 func RunRegistersLimited(rp *RegProgram, scope *classad.ClassAd, budget int) (result classad.Value, ok bool) {
 	ev := classad.NewEvaluator(scope)
 	defer classad.RecoverCyclic(&result)
-	result, ok, _ = execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
+	result, ok, _, _ = execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
 	return result, ok
 }
 
@@ -659,7 +665,7 @@ func RunRegistersLimited(rp *RegProgram, scope *classad.ClassAd, budget int) (re
 func RunRegistersFault(rp *RegProgram, scope *classad.ClassAd, budget int) (result classad.Value, ok bool, fault *Fault) {
 	ev := classad.NewEvaluator(scope)
 	defer classad.RecoverCyclic(&result)
-	result, ok, site := execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
+	result, ok, site, _ := execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
 	if site >= 0 {
 		fault = rp.src.faultAt(site)
 	}
@@ -672,16 +678,18 @@ func RunRegistersFault(rp *RegProgram, scope *classad.ClassAd, budget int) (resu
 // site is the fault site an RFault stopped at, or -1 if none did. It is returned rather than looked
 // up here because the lookup is a diagnostic the hot path should not pay for: a caller that does not
 // want a report ignores it.
-func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget int) (classad.Value, bool, int32) {
+func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget int) (classad.Value, bool, int32, int) {
 	p := rp.src
 	code := rp.code
 	steps := 0
 	for ip := 0; ip < len(code); {
-		steps++
-		if steps > budget {
-			return classad.NewErrorValue(), false, -1
-		}
 		in := code[ip]
+		if isRegValueOp(in.Op) {
+			steps++
+			if steps > budget {
+				return classad.NewErrorValue(), false, -1, steps
+			}
+		}
 		switch in.Op {
 		case RNop:
 			ip++
@@ -741,7 +749,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 		case RFault:
 			// Ends the script. Returning here rather than jumping to an end label keeps the fault
 			// out of the register file: there is no result to have produced.
-			return classad.NewErrorValue(), true, in.Imm
+			return classad.NewErrorValue(), true, in.Imm, steps
 		case RBranchCond:
 			t := rp.conds[in.Imm]
 			switch classad.ConditionState(regs[in.A]) {
@@ -781,7 +789,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 		}
 	}
 	if rp.res < 0 {
-		return classad.NewUndefinedValue(), true, -1
+		return classad.NewUndefinedValue(), true, -1, steps
 	}
-	return regs[rp.res], true, -1
+	return regs[rp.res], true, -1, steps
 }

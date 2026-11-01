@@ -161,7 +161,7 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 //
 // TERMINATION is not the loop's problem to solve but the interpreter's: `while true: x = x` has no
 // answer, and nothing the compiler can check would tell it apart from a loop that happens to run a
-// long time. The instruction budget in RunRegistersLimited is what bounds it.
+// long time. The step budget in RunRegistersLimited is what bounds it.
 func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 	if s.err != nil {
 		return s
@@ -259,7 +259,7 @@ func (sp *ScriptProgram) Run(scope *classad.ClassAd) classad.Value {
 	return RunRegisters(sp.rp, scope)
 }
 
-// RunLimited is Run with an explicit instruction budget. ok=false means the script did not finish
+// RunLimited is Run with an explicit step budget. ok=false means the script did not finish
 // within it, which is a different report from a script that finished and computed ERROR.
 func (sp *ScriptProgram) RunLimited(scope *classad.ClassAd, budget int) (classad.Value, bool) {
 	return RunRegistersLimited(sp.rp, scope, budget)
@@ -271,7 +271,7 @@ func (sp *ScriptProgram) RunLimited(scope *classad.ClassAd, budget int) (classad
 // expression can produce on purpose. That distinction is the reason this method exists: the value
 // alone cannot tell "the script decided the answer is ERROR" from "an if had no branch to take".
 //
-// ok=false means the instruction budget ran out, which is not a fault: the script did not finish, so
+// ok=false means the step budget ran out, which is not a fault: the script did not finish, so
 // there is no site to blame. See RunRegistersLimited.
 func (sp *ScriptProgram) RunWithFault(scope *classad.ClassAd) (result classad.Value, ok bool, fault *Fault) {
 	return RunRegistersFault(sp.rp, scope, DefaultStepBudget)
