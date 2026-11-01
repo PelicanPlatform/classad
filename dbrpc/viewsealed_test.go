@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -280,5 +281,64 @@ func TestViewSealedGroupedAggregateDoesNotSplitGroups(t *testing.T) {
 			t.Errorf("after sealing: group %v count = %s, want %s",
 				after[i].Group, after[i].Values[0], before[i].Values[0])
 		}
+	}
+}
+
+// The wire ops and a sealed view.
+//
+// An archive serves no wire-form rows, so once a continuous aggregate has sealed, neither
+// wire op can produce the whole view. The invariant is therefore not "it declines" but the
+// weaker and more useful one: it must never answer SHORT. Declining is how it satisfies
+// that -- the refusal is the same one a table with no wire rows gives, so the client falls
+// back to the text projection, which reads both halves.
+//
+// Stated that way on purpose. Whether a given view's backing can serve wire rows at all
+// depends on how the backing is stored, so a test that demanded a specific error would pass
+// or fail on that incidental detail rather than on the thing that matters. What matters is
+// that a caller never receives a subset believing it received everything.
+func TestViewSealedWireOpsNeverAnswerShort(t *testing.T) {
+	ctx := context.Background()
+	f := newSealedFixture(t)
+	defer f.close()
+
+	attrs := []string{"time", "metric_events"}
+	variants := []struct {
+		name string
+		run  func() (int, error)
+	}{
+		{"wire", func() (int, error) {
+			n := 0
+			err := f.c.QueryRawWireStream(ctx, sealView, "true", attrs, 0, false, func([]byte) bool { n++; return true })
+			return n, err
+		}},
+		{"wire-refs", func() (int, error) {
+			n := 0
+			err := f.c.QueryRawWireRefsStream(ctx, sealView, "true", attrs, 0, false, func([]byte) bool { n++; return true })
+			return n, err
+		}},
+	}
+
+	f.sealAll()
+	for _, v := range variants {
+		n, err := v.run()
+		switch {
+		case errors.Is(err, ErrRawWireUnsupported):
+			// Declined, so the client falls back. Correct.
+		case err != nil:
+			t.Errorf("%s: unexpected error %v", v.name, err)
+		case n != sealBuckets:
+			t.Errorf("%s: returned %d rows with no error, want %d or a refusal.\n"+
+				"Answering from the live backing alone hands back the unsealed tail and "+
+				"looks like success.", v.name, n, sealBuckets)
+		}
+	}
+
+	// Whichever way they went, the fallback path returns everything.
+	rows, err := f.c.QueryRawProject(ctx, sealView, "true", attrs, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != sealBuckets {
+		t.Errorf("text projection after sealing returned %d rows, want %d", len(rows), sealBuckets)
 	}
 }

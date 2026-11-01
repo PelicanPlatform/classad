@@ -475,15 +475,23 @@ func (s *Server) StartMaintenance(interval time.Duration, opts db.MaintainOption
 // its own existence to half the read surface -- and why a bug on one of those paths could
 // sit unseen, since the path was unreachable for the only table that exercises it.
 func (s *Server) tableOr(reqID uint64, o op, name string, write func([]byte)) (*db.DB, bool) {
+	ref, ok := s.tableRefOr(reqID, o, name, write)
+	return ref.db, ok
+}
+
+// tableRefOr is tableOr for a handler that needs more than the backing -- in practice, one
+// that must also reach a view's sealed half. A handler taking only ref.db from this is
+// taking exactly what tableOr gives, and should use tableOr.
+func (s *Server) tableRefOr(reqID uint64, o op, name string, write func([]byte)) (tableRef, bool) {
 	switch ref := s.resolveTable(name); ref.kind {
 	case kindTable, kindView:
-		return ref.db, true
+		return ref, true
 	case kindArchive:
 		write(respArchiveTable(reqID, name, archiveRefusal(o)))
 	default:
 		write(respErr(reqID, "no such table: "+name))
 	}
-	return nil, false
+	return tableRef{}, false
 }
 
 // defaultCloseGrace bounds, by default, how long Close waits for cancelled in-flight
