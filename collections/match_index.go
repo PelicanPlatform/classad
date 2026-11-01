@@ -981,35 +981,37 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 		}
 	}()
 
-	perWorker := make([][]rankedMatch, W)
+	// Per SHARD, not per worker -- see the same change in taskMatches. Stolen work made the
+	// order of the match set depend on which worker happened to take which shard, and on how
+	// many workers were acquired at all.
+	perShard := make([][]rankedMatch, len(shards))
 	var next int64
 	var wg workerGroup
 	for i := 0; i < W; i++ {
 		wg.Go(func() {
-			wi := i
 			jobCopy, _ := classad.Parse(jobText) // validated above
 			mw := newMatchWorker(jobCopy, c, jp, deferMat)
-			var local []rankedMatch
 			for {
 				idx := int(atomic.AddInt64(&next, 1)) - 1
 				if idx >= len(shards) {
 					break
 				}
+				var local []rankedMatch
 				c.scanShardCandidatesGroups(shards[idx], groups, func(w []byte, dict *segDictHandle) bool {
 					if iw, ok := c.matchInline(mw, dict, w); ok {
 						c.matchCandidate(iw, mw, &local)
 					}
 					return true
 				})
+				perShard[idx] = local
 			}
-			perWorker[wi] = local
 		})
 	}
 	wg.Wait()
 	wg.rethrow()
 	var out []rankedMatch
-	for _, lw := range perWorker {
-		out = append(out, lw...)
+	for _, ls := range perShard {
+		out = append(out, ls...)
 	}
 	return out
 }

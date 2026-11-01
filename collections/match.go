@@ -482,31 +482,39 @@ func (c *Collection) taskMatches(job *classad.ClassAd, jp *jobPlan, deferMat boo
 		}
 	}()
 
-	perWorker := make([][]rankedMatch, W)
+	// Collected per TASK, not per worker. Workers steal tasks, so which worker gets which
+	// task varies run to run; concatenating per-worker results therefore varied the order of
+	// the whole match set, and the number of workers varies too (tryAcquire may get none, in
+	// which case the serial path above runs instead). Keyed by task, the parallel result is
+	// the same sequence the serial path produces, whatever the stealing did.
+	//
+	// This is not a promise about order -- MatchSorted still documents ties as unspecified,
+	// and callers should not depend on one. It is about the same input giving the same answer
+	// twice, without which "this change did not alter matchmaking" is not a testable claim.
+	perTask := make([][]rankedMatch, len(tasks))
 	var next int64
 	var wg workerGroup
 	for i := 0; i < W; i++ {
 		wg.Go(func() {
-			wi := i
 			jobCopy, _ := classad.Parse(jobText) // validated above
 			mw := newMatchWorker(jobCopy, c, jp, deferMat)
 			var dbuf []byte
-			var local []rankedMatch
 			for {
 				idx := int(atomic.AddInt64(&next, 1)) - 1
 				if idx >= len(tasks) {
 					break
 				}
+				var local []rankedMatch
 				c.matchWindow(tasks[idx], mw, &dbuf, &local)
+				perTask[idx] = local
 			}
-			perWorker[wi] = local
 		})
 	}
 	wg.Wait()
 	wg.rethrow()
 	var out []rankedMatch
-	for _, lw := range perWorker {
-		out = append(out, lw...)
+	for _, lt := range perTask {
+		out = append(out, lt...)
 	}
 	return out
 }
