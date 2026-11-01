@@ -119,6 +119,50 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 	return dst, true
 }
 
+// AppendInlineFromInternedUnopened appends to dst the inline-names form of src, an interned ad whose
+// ids resolve names, and returns the extended buffer. Every entry is kept, in order, with a header of
+// flagInlineNames plus src's delta flag and no hot header; names and name-carrying nodes are rewritten
+// as AppendAdSubsetInlineFromInterned rewrites them.
+//
+// A sealed value is copied UNOPENED, so this needs no key and never holds a plaintext. That is also its
+// limit: a sealed value's plaintext is its node encoding in the key form of the ad it was sealed in, so
+// a value sealed in src keeps src's ids inside its ciphertext, and an inline-names reader that opened it
+// would parse those ids as inline names. The result is therefore only for a reader that never opens a
+// sealed value -- one with no key, or one that reads literals and treats a sealed value as opaque. To
+// such a reader a copied sealed value is exactly what any other sealed value is.
+//
+// Returns ok=false when src is malformed, standalone, already inline-names, or carries an id resolve
+// does not know -- the cases a keyed decode of src refuses too.
+func AppendInlineFromInternedUnopened(dst []byte, src Ad, resolve func(uint32) (string, bool)) ([]byte, bool) {
+	c, ok := src.bodyStart()
+	if !ok || c.inline || resolve == nil || src[2]&flagStandalone != 0 {
+		return dst, false
+	}
+	hotCount := c.uvarint()
+	for i := uint64(0); i < hotCount && c.ok; i++ {
+		c.uvarint()
+		c.uvarint()
+	}
+	n := c.uvarint()
+	if !c.ok {
+		return dst, false
+	}
+	dst = append(dst, magicByte, formatVer, flagInlineNames|src[2]&flagDelta)
+	dst = binary.AppendUvarint(dst, 0) // hot header: empty
+	dst = binary.AppendUvarint(dst, n)
+	for i := uint64(0); i < n; i++ {
+		id := c.id32()
+		if !c.ok || !appendInlineName(&dst, resolve, id) {
+			return dst, false
+		}
+		// inlineNode copies an nEncrypted node byte for byte, which is the whole of "unopened".
+		if !inlineNode(c, &dst, resolve, 0) {
+			return dst, false
+		}
+	}
+	return dst, c.ok
+}
+
 // appendSealedPlainInline appends to *dst the inline-names form of plain, the opened plaintext of a
 // sealed value in an interned ad. It reads plain under the decoder's rule (readSealedPlain): in the
 // interned form, rewritten to inline as any other node is; or, when that is rejected, in the inline

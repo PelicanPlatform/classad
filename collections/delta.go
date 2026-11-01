@@ -600,13 +600,23 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 		}
 		raws[i] = raw
 	}
+	// Bytes only, for a reader that never opens a sealed value: splice, after rewriting any interned
+	// participant to inline names with its sealed values copied unopened. That reader must not reach
+	// the decode below, which opens every sealed value with the key -- and for it the decode has
+	// nothing to offer, since what it would open the reader may not see. A participant the rewrite or
+	// the splice refuses is one the decode refuses too (malformed, standalone, or naming an id its
+	// dictionary does not hold), so a refusal here is a miss for every reader.
+	if want&mOpaque != 0 && want&mObj == 0 {
+		spliced, why := c.spliceMergeUnopened(dst, raws[base:], dicts[base:], ds)
+		return spliced, nil, why == failNone, why
+	}
 	// Bytes only: splice the entry bytes and never build an object. Splicing and then decoding
 	// for a caller that wanted an object is no cheaper than decoding and merging -- measured as a
 	// wash -- which is why this is gated on what the caller asked for rather than always tried.
 	// No guard for a mixed-encoding chain here: AppendAdMergedInline already refuses an interned
 	// participant and the splice falls back to the decode below (that refusal is what
 	// spliceFallbacks counts). Which is precisely why the decode has to be right -- it is where
-	// every chain spanning both encodings ends up.
+	// every chain spanning both encodings ends up for a reader that may open what it reads.
 	if want == mWire {
 		if spliced, ok := c.spliceMerge(dst, raws[base:]); ok {
 			return spliced, nil, true, failNone
@@ -645,10 +655,11 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 }
 
 // readWant is the form a point read needs: the object, except for a redacting read, which must
-// take the bytes because redaction happens in the decode.
+// take the bytes because redaction happens in the decode -- and which opens no sealed value in
+// them, so they are merged without the key.
 func readWant(redact bool) materializeWant {
 	if redact {
-		return mWire
+		return sealedUnopened.want()
 	}
 	return mObj
 }
@@ -659,6 +670,10 @@ type materializeWant uint8
 const (
 	mWire materializeWant = 1 << iota // the merged ad as wire bytes
 	mObj                              // the merged ad as an object
+	// mOpaque: the caller opens no sealed value in the bytes (see sealedUnopened), so the merge
+	// must not use the key either. Meaningful with mWire alone: an object is built by the keyed
+	// decode, so mObj ignores it.
+	mOpaque
 )
 
 // decompressState holds one reusable decompression buffer per chain position, for materializeAt.
@@ -666,6 +681,9 @@ type decompressState struct {
 	bufs  [][]byte
 	raws  [][]byte
 	dicts []*segDictHandle
+	// inl holds, per chain position, an interned participant rewritten to inline names for
+	// spliceMergeUnopened. Reused as bufs is.
+	inl [][]byte
 }
 
 // grow sizes the state for a chain of n participants and returns the raws slice to fill. The
@@ -675,6 +693,9 @@ type decompressState struct {
 func (d *decompressState) grow(n int) [][]byte {
 	for len(d.bufs) < n {
 		d.bufs = append(d.bufs, nil)
+	}
+	for len(d.inl) < n {
+		d.inl = append(d.inl, nil)
 	}
 	if cap(d.raws) < n {
 		d.raws = make([][]byte, n)
@@ -743,6 +764,47 @@ func (c *Collection) spliceMerge(dst []byte, raws [][]byte) ([]byte, bool) {
 	spliceMerges.Add(1)
 	return out, true
 }
+
+// spliceMergeUnopened is spliceMerge for a reader that never opens a sealed value (mOpaque). The
+// participants need not share an encoding: one from an interned segment (dicts[i] != nil) is first
+// rewritten to inline names through its own segment's dictionary -- the resolver the keyed decode
+// uses for it -- with its sealed values copied unopened (wire.AppendInlineFromInternedUnopened),
+// and then every participant is inline and the splice applies.
+//
+// That is the chain the plain splice refuses, and the only other way to merge it is to decode every
+// version with the key and seal the result again: work whose output this reader cannot see. The
+// copied sealed values keep their plaintext in their segment's key form, which is why the result is
+// only for this reader; see the wire function.
+//
+// raws[i] is replaced by the rewritten form, in ds's reused buffers. The reason a participant was
+// refused is the one the keyed decode would give for it.
+func (c *Collection) spliceMergeUnopened(dst []byte, raws [][]byte, dicts []*segDictHandle, ds *decompressState) ([]byte, readFail) {
+	for i, d := range dicts {
+		if d == nil {
+			continue
+		}
+		out, ok := wire.AppendInlineFromInternedUnopened(ds.inl[i][:0], wire.Ad(raws[i]), d.resolve)
+		if !ok {
+			if i == 0 {
+				noteDecodeFailure("base", errUnopenedRewrite)
+				return nil, failDeltaBaseDecode
+			}
+			noteDecodeFailure("patch", errUnopenedRewrite)
+			return nil, failDeltaPatchDecode
+		}
+		ds.inl[i] = out
+		raws[i] = out
+	}
+	spliced, ok := c.spliceMerge(dst, raws)
+	if !ok {
+		noteDecodeFailure("splice", errUnopenedRewrite)
+		return nil, failDecode
+	}
+	return spliced, failNone
+}
+
+// errUnopenedRewrite is a chain participant spliceMergeUnopened could not rewrite or splice.
+var errUnopenedRewrite = errors.New("collections: delta chain participant could not be merged without the key")
 
 // The three ways a delta merge can be served. Reported together because any one of them alone
 // misleads: a store whose merges all fall back is paying for the splice attempt and getting the

@@ -35,7 +35,7 @@ func (c *Collection) ScanRawProjected(projection []string, chaseRefs, redact boo
 		p := c.newRawProjector(projection, chaseRefs, redact)
 		emit := c.yieldRawProjected(yield, p)
 		// No query, so every record is a candidate for the columnar projection (see rawProjPlan).
-		q := queryPlan{proj: c.rawProjPlan(projection, chaseRefs)}
+		q := queryPlan{proj: c.rawProjPlan(projection, chaseRefs), sealed: sealedUseFor(redact)}
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {
 				return

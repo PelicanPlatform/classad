@@ -125,7 +125,7 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 					return
 				}
 				dict := tasks[idx].win.dict()
-				c.forEachVisibleWindowKeyed(tasks[idx].s0, tasks[idx].win, func(key, ad []byte, codec Codec) bool {
+				c.forEachVisibleWindowKeyed(tasks[idx].s0, tasks[idx].win, sealedUseFor(sel.redact), func(key, ad []byte, codec Codec) bool {
 					if stopped.Load() {
 						return false
 					}

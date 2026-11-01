@@ -159,20 +159,26 @@ var sealedLayouts = []sealedLayout{
 		// sealed Owner comes from the delta and its other sealed values from the interned base.
 		sealedPut(t, c, 0, sealedParityN)
 		internAll(c)
-		tx := c.Begin()
-		for i := 0; i < sealedParityN; i += 3 {
-			patch := classad.New()
-			patch.InsertAttr("JobStatus", int64(sealedParityJobStatus(i, true)))
-			patch.InsertAttrString("Owner", sealedParityOwner(i, true))
-			tx.PatchAttrs([]byte(fmt.Sprintf("%d.0", i)), patch, nil)
-		}
-		if r := tx.Commit(); r.Conflicted() {
-			t.Fatal("patch conflicted")
-		}
+		sealedPatch(t, c)
 		return c
 	}, layoutOK: func(c *Collection, _, d, _ int) bool {
 		deltas, _ := c.DeltaStats()
 		return d > 0 && deltas > 0
+	}},
+	{name: "delta-schema", patched: true, build: func(t *testing.T, c *Collection, _ string) *Collection {
+		// The delta layout with a columnar schema enabled: the column tiers serve the counts and
+		// groupings, and with no block over the active segment they read its records -- the delta
+		// chains -- one at a time.
+		sealedPut(t, c, 0, sealedParityN)
+		internAll(c)
+		if !c.BuildAndEnableSchemaScan(2000, 8) {
+			t.Fatal("no columnar schema derived")
+		}
+		sealedPatch(t, c)
+		return c
+	}, layoutOK: func(c *Collection, _, d, _ int) bool {
+		deltas, _ := c.DeltaStats()
+		return d > 0 && deltas > 0 && c.schemaScan.Load() != nil
 	}},
 	{name: "reopened", build: func(t *testing.T, c *Collection, dir string) *Collection {
 		sealedPut(t, c, 0, sealedParityN)
@@ -189,6 +195,22 @@ var sealedLayouts = []sealedLayout{
 		t.Cleanup(func() { c2.Close() })
 		return c2
 	}, layoutOK: func(_ *Collection, in, d, _ int) bool { return d > 0 && in+d == sealedParityN }},
+}
+
+// sealedPatch patches every third record as a delta (sealedParityAd(i, true)), changing a column and
+// a sealed attribute.
+func sealedPatch(t *testing.T, c *Collection) {
+	t.Helper()
+	tx := c.Begin()
+	for i := 0; i < sealedParityN; i += 3 {
+		patch := classad.New()
+		patch.InsertAttr("JobStatus", int64(sealedParityJobStatus(i, true)))
+		patch.InsertAttrString("Owner", sealedParityOwner(i, true))
+		tx.PatchAttrs([]byte(fmt.Sprintf("%d.0", i)), patch, nil)
+	}
+	if r := tx.Commit(); r.Conflicted() {
+		t.Fatal("patch conflicted")
+	}
 }
 
 // openSealedLayout opens a fresh encrypted store and lays the records out as lay says.

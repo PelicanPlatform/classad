@@ -162,7 +162,7 @@ func (sh *shard) recentRecordSamples(c *Collection, maxRecords, maxBytes, lookBa
 		sites[j], sites[n-1] = sites[n-1], sites[j]
 		s := sites[n-1]
 		w := wins[s.win]
-		ww, err := c.wire(recRef{w: w, off: s.off, dict: w.dict()}, buf)
+		ww, err := c.wire(recRef{w: w, off: s.off, dict: w.dict()}, buf, sealedOpened)
 		if err != nil {
 			continue
 		}

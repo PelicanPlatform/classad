@@ -370,7 +370,7 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup fieldLooku
 			break
 		}
 		if !recIsMarker(w.data, o) && w.visible(o, s0) {
-			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
+			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf, sealedUnopened); err == nil {
 				buf = ww
 				ad := wire.Ad(ww)
 				match := true

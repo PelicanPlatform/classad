@@ -1229,7 +1229,7 @@ func (c *Collection) Keys() []string {
 	var out []string
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		c.forEachVisibleKeyed(s0, wins, func(key, _ []byte, _ Codec, _ *segDictHandle) bool {
+		c.forEachVisibleKeyed(s0, wins, sealedUnopened, func(key, _ []byte, _ Codec, _ *segDictHandle) bool {
 			if c.isStructural != nil && c.isStructural(key) {
 				return true // parent-only ads are hidden, as in Scan
 			}
@@ -1255,7 +1255,7 @@ func (c *Collection) Scan() iter.Seq[*classad.ClassAd] {
 func (c *Collection) scanAs(redact bool) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
 		if c.parentKeyFor != nil {
-			qp := queryPlan{ws: &wireScope{ctx: c.evalCtx(redact)}} // q nil ⇒ no filter, just chain + hide structural
+			qp := queryPlan{ws: &wireScope{ctx: c.evalCtx(redact)}, sealed: sealedUseFor(redact)} // q nil ⇒ no filter, just chain + hide structural
 			for _, sh := range c.shards {
 				if !c.scanShardChained(sh, qp, yield, redact) {
 					return
@@ -1263,7 +1263,7 @@ func (c *Collection) scanAs(redact bool) iter.Seq[*classad.ClassAd] {
 			}
 			return
 		}
-		q := queryPlan{}
+		q := queryPlan{sealed: sealedUseFor(redact)}
 		emit := c.yieldAdAs(yield, redact)
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {
@@ -1625,7 +1625,7 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		// the attributes held in the segment's columnar payload. Asking the ref rather than
 		// decompressing here is what lets a columnarized segment be scanned at all: its records
 		// carry only what the schema does not cover.
-		w, err := c.wireAt(r, s0, st.dbuf)
+		w, err := c.wireAt(r, s0, st.dbuf, qp.sealed)
 		if err != nil {
 			return true // skip a record we cannot decode rather than abort the scan; wireAt counted it
 		}
@@ -1707,7 +1707,7 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 	// Pass 1: collect structural (parent) ads' decompressed wire bytes. Parents
 	// are few (one per family), so this map stays small.
 	parents := map[string]parentWire{}
-	c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+	c.forEachVisibleKeyed(s0, wins, sealedUseFor(redact), func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if isSystemKeyBytes(key) {
 			return true // internal system record: never a family parent
 		}
@@ -1726,7 +1726,7 @@ func (c *Collection) scanShardChained(sh *shard, qp queryPlan, yield func(*class
 	// Pass 2: evaluate children (and standalone ads); skip structural ads.
 	cont := true
 	var dbuf []byte
-	c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+	c.forEachVisibleKeyed(s0, wins, sealedUseFor(redact), func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if isSystemKeyBytes(key) {
 			return true // internal system record: hidden from client scans/queries
 		}

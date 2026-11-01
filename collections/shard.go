@@ -1054,11 +1054,13 @@ func releaseWindows(wins []segWindow) {
 // attributes rather than whole ads should use the recRef forms directly and ask the columns.
 
 // forEachVisible walks the frozen windows and calls fn with each visible record's full ad bytes and
-// the codec to decode them with.
+// the codec to decode them with, for a reader that may open their sealed values (see sealedUse): its
+// callers sample records for what the store builds and keeps from them. The iterators below take the
+// reader's use as a parameter instead, so each of their callers says which reader it serves.
 func (c *Collection) forEachVisible(s0 uint64, wins []segWindow, fn func(ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var rbuf []byte
 	forEachVisibleRef(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, s0, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf, sealedOpened)
 		if !ok {
 			return true
 		}
@@ -1069,23 +1071,10 @@ func (c *Collection) forEachVisible(s0 uint64, wins []segWindow, fn func(ad []by
 // forEachVisibleKeyed is forEachVisible that also passes each record's key (a view into the frozen
 // window; the callback must not retain it). Used by the chained scan, which needs a record's key to
 // find its parent.
-func (c *Collection) forEachVisibleKeyed(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
+func (c *Collection) forEachVisibleKeyed(s0 uint64, wins []segWindow, use sealedUse, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
 	var rbuf []byte
 	forEachVisibleRef(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, s0, &rbuf)
-		if !ok {
-			return true
-		}
-		return fn(r.key(), ad, codec, r.dict)
-	})
-}
-
-// forEachVisibleKeyedReverse is forEachVisibleKeyed in newest-first order, so a caller that stops
-// early after K records receives the K most recently appended.
-func (c *Collection) forEachVisibleKeyedReverse(s0 uint64, wins []segWindow, fn func(key, ad []byte, codec Codec, dict *segDictHandle) bool) {
-	var rbuf []byte
-	forEachVisibleRefReverse(s0, wins, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, s0, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf, use)
 		if !ok {
 			return true
 		}

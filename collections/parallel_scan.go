@@ -80,10 +80,10 @@ func (c *Collection) gatherTasksPruned(qp queryPlan) (tasks []scanTask, totalByt
 
 // forEachVisibleWindow walks one window's records visible at S0 (the single-window
 // form of forEachVisible), used by the per-segment workers.
-func (c *Collection) forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []byte, codec Codec) bool) {
+func (c *Collection) forEachVisibleWindow(s0 uint64, w segWindow, use sealedUse, fn func(ad []byte, codec Codec) bool) {
 	var rbuf []byte
 	forEachVisibleWindowRef(s0, w, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, s0, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf, use)
 		if !ok {
 			return true
 		}
@@ -96,10 +96,10 @@ func (c *Collection) forEachVisibleWindow(s0 uint64, w segWindow, fn func(ad []b
 // the client-facing result (the serial scanShard path does the same). The query
 // workers do not use it: they go through refVisitorState, which applies the same
 // filter along with the prefilter and the reassembly rules.
-func (c *Collection) forEachVisibleWindowKeyed(s0 uint64, w segWindow, fn func(key, ad []byte, codec Codec) bool) {
+func (c *Collection) forEachVisibleWindowKeyed(s0 uint64, w segWindow, use sealedUse, fn func(key, ad []byte, codec Codec) bool) {
 	var rbuf []byte
 	forEachVisibleWindowRef(s0, w, func(r recRef) bool {
-		ad, codec, ok := c.adBytes(r, s0, &rbuf)
+		ad, codec, ok := c.adBytes(r, s0, &rbuf, use)
 		if !ok {
 			return true
 		}

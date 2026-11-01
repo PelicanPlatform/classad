@@ -81,13 +81,53 @@ func (r recRef) stored() []byte { return recAd(r.w.data, r.off) }
 // codec returns the codec the record's bytes were compressed with.
 func (r recRef) codec() Codec { return r.w.codec }
 
+// sealedUse is what a reader does with the sealed values in the record bytes it is handed. It decides
+// how a DELTA record is completed for that reader, and nothing else: an ordinary record's bytes are
+// the same for every reader.
+//
+// A delta chain whose versions span an interned segment and an inline one cannot be spliced as it
+// stands, and merging it by decoding opens every sealed value with the key and seals it again. A reader
+// that will never open a sealed value -- one with no key, or one that reads literals and treats a
+// sealed value as opaque -- gets the chain merged without the key instead, and the sealed values in
+// its bytes are then readable only as sealed values (see wire.AppendInlineFromInternedUnopened). So
+// the choice is the caller's to state, and every caller states it: a reader given sealedUnopened bytes
+// that opened them would misread them, and one given sealedOpened bytes that does not need them made
+// the store decrypt for nothing.
+type sealedUse uint8
+
+const (
+	// sealedOpened: the reader may open a sealed value with the key -- an entitled read, or a path
+	// that keeps, re-encodes or samples what it reads.
+	sealedOpened sealedUse = iota
+	// sealedUnopened: the reader never opens a sealed value. A read not entitled to them, and one that
+	// reads only literal values (a sealed value is not one, and is never opened to find out).
+	sealedUnopened
+)
+
+// sealedUseFor is the sealedUse of a read in the entitlement redact names: a redacted read opens no
+// sealed value, an entitled one may.
+func sealedUseFor(redact bool) sealedUse {
+	if redact {
+		return sealedUnopened
+	}
+	return sealedOpened
+}
+
+// want is the materializeAt form for a reader that wants the merged bytes.
+func (u sealedUse) want() materializeWant {
+	if u == sealedUnopened {
+		return mWire | mOpaque
+	}
+	return mWire
+}
+
 // wire returns the record's full ad, decompressed into buf's backing where it fits.
 //
 // For an ordinary segment this is one Decompress. For a columnarized one it also splices in the
 // attributes held in the columnar payload, and it reports an error rather than returning a partial
-// ad if that payload cannot be trusted.
-func (c *Collection) wire(r recRef, buf []byte) ([]byte, error) {
-	return c.wireAt(r, seqMax, buf)
+// ad if that payload cannot be trusted. use is what the caller does with sealed values; see sealedUse.
+func (c *Collection) wire(r recRef, buf []byte, use sealedUse) ([]byte, error) {
+	return c.wireAt(r, seqMax, buf, use)
 }
 
 // wireAt is wire for a reader that knows the snapshot it is reading at, which a DELTA record
@@ -100,8 +140,8 @@ func (c *Collection) wire(r recRef, buf []byte) ([]byte, error) {
 //
 // Every failure is counted by reason (RecordReadSkips): the callers skip the record, so the count is
 // the only trace that an answer came back short.
-func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
-	w, err := c.wireAtUncounted(r, s0, buf)
+func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte, use sealedUse) ([]byte, error) {
+	w, err := c.wireAtUncounted(r, s0, buf, use)
 	if err != nil {
 		noteReadSkip(err)
 	}
@@ -109,7 +149,7 @@ func (c *Collection) wireAt(r recRef, s0 uint64, buf []byte) ([]byte, error) {
 }
 
 // wireAtUncounted is wireAt without the count, so each failure is counted once, in wireAt.
-func (c *Collection) wireAtUncounted(r recRef, s0 uint64, buf []byte) ([]byte, error) {
+func (c *Collection) wireAtUncounted(r recRef, s0 uint64, buf []byte, use sealedUse) ([]byte, error) {
 	if err := c.recordRefused(r.w.seg, r.w.data, r.off); err != nil {
 		return nil, err
 	}
@@ -133,7 +173,7 @@ func (c *Collection) wireAtUncounted(r recRef, s0 uint64, buf []byte) ([]byte, e
 	key := r.key()
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	merged, ok := sh.materializeLocked(c, key, h, s0, buf[:0])
+	merged, ok := sh.materializeLocked(c, key, h, s0, buf[:0], use)
 	if !ok {
 		return nil, errDeltaUnresolved // a fragment we cannot complete: skip, never serve half an ad
 	}
@@ -146,13 +186,13 @@ func (c *Collection) wireAtUncounted(r recRef, s0 uint64, buf []byte) ([]byte, e
 // read from disk, and a read that panics in it is failed alone by a server that recovers it. A lock
 // left held then would stop the next commit on this shard -- and, since a waiting writer blocks new
 // readers, every later read of the table with it.
-func (sh *shard) materializeLocked(c *Collection, key []byte, h, s0 uint64, dst []byte) ([]byte, bool) {
+func (sh *shard) materializeLocked(c *Collection, key []byte, h, s0 uint64, dst []byte, use sealedUse) ([]byte, bool) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	if lockedReadHook != nil {
 		lockedReadHook("materialize")
 	}
-	merged, _, ok := sh.materializeAt(c, key, h, s0, mWire, dst)
+	merged, _, ok := sh.materializeAt(c, key, h, s0, use.want(), dst)
 	return merged, ok
 }
 
@@ -303,11 +343,12 @@ func forEachVisibleWindowRef(s0 uint64, w segWindow, fn func(recRef) bool) {
 // sees a complete ad rather than the fraction the record physically holds.
 //
 // scratch is reused across records; the returned bytes are valid only until the next call, which is
-// already the contract for the compressed case (the window's mapping outlives neither).
+// already the contract for the compressed case (the window's mapping outlives neither). use is what
+// the caller does with sealed values; see sealedUse.
 //
 // A false return is counted by reason (RecordReadSkips), since every caller skips the record.
-func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Codec, bool) {
-	ad, codec, err := c.adBytesErr(r, s0, scratch)
+func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte, use sealedUse) ([]byte, Codec, bool) {
+	ad, codec, err := c.adBytesErr(r, s0, scratch, use)
 	if err != nil {
 		noteReadSkip(err)
 		return nil, nil, false
@@ -316,7 +357,7 @@ func (c *Collection) adBytes(r recRef, s0 uint64, scratch *[]byte) ([]byte, Code
 }
 
 // adBytesErr is adBytes reporting why a record could not be presented.
-func (c *Collection) adBytesErr(r recRef, s0 uint64, scratch *[]byte) ([]byte, Codec, error) {
+func (c *Collection) adBytesErr(r recRef, s0 uint64, scratch *[]byte, use sealedUse) ([]byte, Codec, error) {
 	seg := r.w.seg
 	if err := c.recordRefused(seg, r.w.data, r.off); err != nil {
 		return nil, nil, err
@@ -366,7 +407,7 @@ func (c *Collection) adBytesErr(r recRef, s0 uint64, scratch *[]byte) ([]byte, C
 	key := r.key()
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
-	merged, ok := sh.materializeLocked(c, key, h, s0, (*scratch)[:0])
+	merged, ok := sh.materializeLocked(c, key, h, s0, (*scratch)[:0], use)
 	if !ok {
 		return nil, nil, errDeltaUnresolved
 	}

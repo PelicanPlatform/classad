@@ -89,7 +89,7 @@ func refQueryRawFromSeqYield(c *Collection, q *vm.Query, projection []string, af
 					if isSystemKeyBytes(g.key) {
 						continue
 					}
-					w, err := c.wireAt(g.ref, s0, dbuf)
+					w, err := c.wireAt(g.ref, s0, dbuf, sealedOpened)
 					if err != nil {
 						continue
 					}

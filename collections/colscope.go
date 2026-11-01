@@ -661,7 +661,7 @@ func (c *Collection) newRowMatch(q *vm.Query, redact bool) *rowMatch {
 // call) for a caller that reads more from it. A record that cannot be read does not match.
 func (r *rowMatch) match(w segWindow, off uint32) ([]byte, bool) {
 	d := w.dict()
-	ww, err := r.c.wire(recRef{w: w, off: off, dict: d}, r.buf)
+	ww, err := r.c.wire(recRef{w: w, off: off, dict: d}, r.buf, r.qp.sealed)
 	if err != nil {
 		return nil, false
 	}

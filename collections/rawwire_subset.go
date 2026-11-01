@@ -39,7 +39,7 @@ func (c *Collection) ScanRawWire(projection []string, redact bool) iter.Seq[[]by
 			return
 		}
 		emit := c.yieldWireRow(yield, sel)
-		q := queryPlan{}
+		q := queryPlan{sealed: sealedUseFor(redact)}
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {
 				return

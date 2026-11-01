@@ -49,7 +49,7 @@ func (c *Collection) eachBlockRecord(w segWindow, s0 uint64, cs *colSegment, bas
 			continue
 		}
 		columnarFallbacks.Add(1)
-		ww, err := c.wire(recRef{w: w, off: o, dict: d}, buf)
+		ww, err := c.wire(recRef{w: w, off: o, dict: d}, buf, sealedUnopened)
 		if err != nil {
 			continue
 		}

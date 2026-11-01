@@ -275,7 +275,7 @@ func countAttrRange(c *Collection, w segWindow, attr string, from, to int, dbuf 
 		if recIsMarker(w.data, o) || isSystemKeyBytes(recKey(w.data, o)) {
 			continue
 		}
-		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
+		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf, sealedUnopened)
 		if err != nil {
 			return 0, false
 		}
@@ -316,7 +316,7 @@ func countAttrBucketRange(c *Collection, w segWindow, attr, bucketAttr string, w
 		if recIsMarker(w.data, o) || isSystemKeyBytes(recKey(w.data, o)) {
 			continue
 		}
-		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
+		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf, sealedUnopened)
 		if err != nil {
 			return 0, false
 		}

@@ -1865,8 +1865,9 @@ func (c *Collection) zoneWalkGroups(wins []segWindow, qp queryPlan, plan []vm.Pr
 // candidate intersection (groupCandidates), so onCand sees a superset of the union's true matches
 // and the caller re-verifies; onCand returns false to stop. A window no index serves for every
 // group, and every served window's un-indexed tail, are walked in full. No zone pruning: only an
-// append-only collection keeps zone maps, and a collection of slots is mutable.
-func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, onCand func(w []byte, dict *segDictHandle) bool) {
+// append-only collection keeps zone maps, and a collection of slots is mutable. use is what onCand
+// does with sealed values (see sealedUse).
+func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe, use sealedUse, onCand func(w []byte, dict *segDictHandle) bool) {
 	groups, none := liveGroups(groups)
 	if none {
 		return // every disjunct is impossible: the union is empty
@@ -1881,7 +1882,7 @@ func (c *Collection) scanShardCandidatesGroups(sh *shard, groups [][]usableProbe
 		if isSystemKeyBytes(r.key()) {
 			return true
 		}
-		ww, err := c.wireAt(r, s0, dbuf)
+		ww, err := c.wireAt(r, s0, dbuf, use)
 		if err != nil {
 			return true // counted by wireAt; skip it, as every reader does
 		}

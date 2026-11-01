@@ -523,7 +523,7 @@ func (c *Collection) taskMatches(job *classad.ClassAd, jp *jobPlan, deferMat boo
 // matchCandidate.
 func (c *Collection) matchWindow(t scanTask, mw *matchWorker, dbuf *[]byte, out *[]rankedMatch) {
 	dict := t.win.dict()
-	c.forEachVisibleWindow(t.s0, t.win, func(adBytes []byte, codec Codec) bool {
+	c.forEachVisibleWindow(t.s0, t.win, sealedUseFor(mw.keyless), func(adBytes []byte, codec Codec) bool {
 		w, err := codec.Decompress((*dbuf)[:0], adBytes)
 		if err != nil {
 			return true
