@@ -269,13 +269,23 @@ var nonStrictFunctions = map[string]bool{
 // Delegating gets all three right by construction.
 //
 // Names are matched case-insensitively, as the reference engine matches them.
+//
+// A registered USER-DEFINED function is accepted on the same terms as a built-in, which is what
+// makes a UDF compile natively and stay eligible for the columnar accelerators. Built-ins are
+// consulted first; RegisterFunction refuses a name that collides with one, so the order only
+// matters as a statement of precedence.
 func StrictFunction(name string, argc int) bool {
 	folded := strings.ToLower(name)
 	if nonStrictFunctions[folded] {
 		return false
 	}
-	arity, known := functionArity[folded]
-	return known && arity.accepts(argc)
+	if arity, known := functionArity[folded]; known {
+		return arity.accepts(argc)
+	}
+	if u, ok := lookupUDF(folded); ok {
+		return u.arity.accepts(argc)
+	}
+	return false
 }
 
 // ApplyFunction calls a strict built-in on already-evaluated argument values,
@@ -297,7 +307,18 @@ func StrictFunction(name string, argc int) bool {
 // then not necessarily what evaluating the expression would have produced, which
 // is the whole property this surface exists to preserve.
 func ApplyFunction(e *Evaluator, name string, args []Value) Value {
-	return applyBuiltin(e, strings.ToLower(name), args)
+	folded := strings.ToLower(name)
+	// Gated on the registry being non-empty, which it is in almost every process. This runs once per
+	// call PER RECORD, so a process that registered nothing must not pay a map lookup for the
+	// possibility: with no registrations the whole check is one atomic load of a nil pointer.
+	if udfs.Load() != nil {
+		if _, isBuiltin := functionArity[folded]; !isBuiltin {
+			if u, ok := lookupUDF(folded); ok {
+				return callUDF(u, args)
+			}
+		}
+	}
+	return applyBuiltin(e, folded, args)
 }
 
 // CondState is how a condition value selects a branch, as the conditional
