@@ -1310,13 +1310,53 @@ faster, and the reason the UDF question and the script question turned out to be
 
 ### 11.2 Decisions made while building, which belong in §9 and were not in the draft
 
-**S1 — Locals are places, not bindings.** One register per local for the whole program
-(`collections/vm/regir.go:146-152`), written by `OpStoreLocal` and read by `OpLoadLocal`
-(`collections/vm/opcode.go:104-124`). The alternative, a fresh register per binding, is what SSA
-wants and cannot express a binding made on one path of a branch and read after the join without a
-phi — and the compiler has no phi to emit there. The consequence is load-bearing for every pass:
-**the register form is not SSA for locals**, so a pass must count definitions rather than assume
-single assignment, which is what `defCounts` exists for (`collections/vm/optimize.go:98-107`).
+**S1 — Locals are places, not bindings, and §6.2 promised SSA.** One register per local for the
+whole program (`collections/vm/regir.go:146-152`), written by `OpStoreLocal` and read by
+`OpLoadLocal` (`collections/vm/opcode.go:104-124`). So **the register form is not SSA for locals**,
+and a pass must count definitions rather than assume single assignment, which is what `defCounts`
+exists for (`collections/vm/optimize.go:98-107`).
+
+This was a choice and not a necessity, and it is worth being exact about, because an earlier draft of
+this section justified it by saying SSA "cannot express a binding made on one path of a branch and
+read after the join without a phi." That is backwards: a phi is *exactly* how SSA expresses it. The
+real reasons were these.
+
+- **For expressions, the lowering is already phi elimination.** `LowerToRegisters` is a single forward
+  pass that pre-allocates a join's destination and has every path write it
+  (`collections/vm/regir.go:330-336` — `joinPoint`). That is what phi *elimination* produces, as
+  parallel copies at the predecessors, and elimination is mandatory before anything can execute
+  because no machine runs a phi. Building SSA and then eliminating it would have produced the same
+  instructions through two more passes.
+- **For loops, places avoid the one hard case.** A loop-carried value is where SSA construction is
+  genuinely fiddly, and a place needs no phi on a back edge at all: the register is simply written
+  each time round. `While`'s own comment says so.
+- **Nothing had asked for a CFG.** The lowerer has no basic blocks and no dominance, because no pass
+  needed them yet.
+
+**What it has cost so far**, concretely rather than in principle:
+
+- `localsNeedingInit` (`collections/vm/regir.go:223-255`) is a **hand-rolled conservative stand-in for
+  dominance**: it inserts an UNDEFINED initializer whenever the first store is after a read, or
+  whenever any jump target sits between the store and the read. Dominance answers that exactly, so
+  this is a pass that would be deleted rather than improved.
+- Copy propagation only fires in straight-line regions, because without single assignment it has to
+  bail at every jump target (§14's S4). Under SSA it would fire across joins.
+- **The one that matters, and it points the other way from the rest of this document.** A place's live
+  range is the entire program by construction. §6.1's whole argument is that peak live bytes is the
+  dominant cost because a register is ~200 KiB at *n* = 8192 — so places *maximize* precisely the
+  quantity the design says to minimize. In the scalar machine a register holds one `classad.Value` and
+  this is free, which is why it has not bitten yet. In the vector machine it pins 200 KiB per local for
+  the whole script.
+
+**So this is the decision to revisit before D2a, not after it**, and the argument for SSA is stronger
+than §6.2 made it: a phi has *two* lowerings here, and the vector one already exists. Scalar, a phi
+becomes moves at the predecessors — which is what `joinPoint` emits by hand today. Vector, it becomes
+a **blend under the live mask**, which is §14.2's primitive. One representation, two lowerings, and
+liveness computed over real live ranges instead of program-wide ones. The route is a separate pass
+over the completed program rather than work inside the incremental builder: `stackJumpTargets`
+(`collections/vm/regir.go:258`) already finds the block boundaries, so the missing pieces are
+dominance, phi insertion and renaming. The current form stays as the oracle — which is exactly what
+§7.4 is for.
 
 **S2 — Expression-level branches vectorize by *blending*, not by predication.** §2.3 says control
 flow is predication. What actually shipped for `?:` and `ifThenElse` evaluates **both paths
