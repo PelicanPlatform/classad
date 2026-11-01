@@ -250,6 +250,7 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 		}
 	}
 	s.c.p.readAttrs = kept
+	s.c.p.vops = vopPrefix(s.c.p.code)
 	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
 }
 
@@ -297,7 +298,7 @@ func (sp *ScriptProgram) VecEval(src ColumnSource, n int, scratch *VecScratch) (
 	if scratch == nil {
 		scratch = &VecScratch{}
 	}
-	return execVec(sp.p, scratch.evaluator(), src, n, scratch)
+	return execVec(sp.p, scratch.evaluator(), src, n, scratch, int64(n)*DefaultStepBudget)
 }
 
 // Program returns the underlying stack-form program.

@@ -69,6 +69,11 @@ type Program struct {
 	// ordinary expression program. Kept for diagnostics; execution goes by index.
 	locals []string
 
+	// vops[i] is how many charged instructions precede instruction i, with a final entry for the end
+	// (see vopPrefix). Built at compile time because a Program is shared by concurrent evaluations
+	// and must be read-only once compiled.
+	vops []int32
+
 	// hasStatements marks a program with statement-level control flow -- an If or a While. It is set
 	// by the script builder rather than derived, because the vector executor needs it BEFORE it has
 	// looked at an instruction: it decides whether to set up the predication planes, which cost about

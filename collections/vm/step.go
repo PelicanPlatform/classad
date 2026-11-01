@@ -69,3 +69,34 @@ func isClassified(op Opcode) bool {
 func isRegClassified(op RegOp) bool {
 	return op < 64 && uint64(regValueOps|regNonValueOps)>>op&1 != 0
 }
+
+// vopPrefix returns, for each instruction index, how many charged instructions precede it, plus a
+// final entry for the end of the program. The charge for executing a contiguous run [a, b) at a live
+// count L is therefore (vopPrefix[b] - vopPrefix[a]) * L.
+//
+// It is built ONCE per program rather than tested per instruction. Testing per instruction is not
+// expensive in itself -- a bitmask shift -- but adding it, the multiply-accumulate and the budget
+// comparison to the vector executor's dispatch loop together cost 11% of a string comparison scan,
+// where each alone cost between 1% and 4%. That is a code-layout effect rather than arithmetic, and
+// the way out of one is to take the work out of the loop rather than to shave it.
+func vopPrefix(code []Instr) []int32 {
+	return vopPrefixInto(nil, code)
+}
+
+// vopPrefixInto is vopPrefix reusing a caller's buffer.
+func vopPrefixInto(buf []int32, code []Instr) []int32 {
+	p := buf[:0]
+	if cap(p) < len(code)+1 {
+		p = make([]int32, 0, len(code)+1)
+	}
+	p = p[:len(code)+1]
+	n := int32(0)
+	for i, in := range code {
+		p[i] = n
+		if isValueOp(in.Op) {
+			n++
+		}
+	}
+	p[len(code)] = n
+	return p
+}

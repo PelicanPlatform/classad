@@ -125,7 +125,7 @@ func TestVecScriptUnboundLocalIsUndefined(t *testing.T) {
 	n := len(src.recs)
 	p := &Program{code: []Instr{{Op: OpLoadLocal, A: 0}}, locals: []string{"t"}}
 	var scratch VecScratch
-	got, ok := execVec(p, scratch.evaluator(), src, n, &scratch)
+	got, ok := execVec(p, scratch.evaluator(), src, n, &scratch, int64(n)*DefaultStepBudget)
 	if !ok {
 		t.Fatal("reading an unbound local declined; it has a defined answer")
 	}
@@ -157,7 +157,7 @@ func TestVecScriptBindingsDoNotLeakAcrossBatches(t *testing.T) {
 		consts: []classad.Value{classad.NewIntValue(42)},
 		locals: []string{"t"},
 	}
-	got, ok := execVec(bind, scratch.evaluator(), src, n, &scratch)
+	got, ok := execVec(bind, scratch.evaluator(), src, n, &scratch, int64(n)*DefaultStepBudget)
 	if !ok {
 		t.Fatal("the binding program declined")
 	}
@@ -167,7 +167,7 @@ func TestVecScriptBindingsDoNotLeakAcrossBatches(t *testing.T) {
 
 	// Batch two reads local 0 through the SAME scratch without storing it.
 	read := &Program{code: []Instr{{Op: OpLoadLocal, A: 0}}, locals: []string{"t"}}
-	got, ok = execVec(read, scratch.evaluator(), src, n, &scratch)
+	got, ok = execVec(read, scratch.evaluator(), src, n, &scratch, int64(n)*DefaultStepBudget)
 	if !ok {
 		t.Fatal("the reading program declined")
 	}
