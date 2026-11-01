@@ -479,7 +479,7 @@ func bruteCountMulti(c *Collection, w segWindow, s0 uint64, preds []fieldPred, l
 			break
 		}
 		if !recIsMarker(w.data, o) && w.visible(o, s0) {
-			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
+			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf, sealedUnopened); err == nil {
 				buf = ww
 				match, ok := wirePredsMatch(w.dict(), wire.Ad(ww), preds, lookups)
 				if !ok {

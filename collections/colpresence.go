@@ -248,7 +248,7 @@ func brutePresence(c *Collection, w segWindow, s0 uint64, lookup fieldLookup, ta
 			break
 		}
 		if !recIsMarker(w.data, o) && w.visible(o, s0) {
-			ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf)
+			ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf, sealedUnopened)
 			if err != nil {
 				return false
 			}

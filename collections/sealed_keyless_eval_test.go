@@ -348,6 +348,12 @@ func sameRankedSet(a, b []string, full bool) bool {
 	return !full || slices.Equal(slices.Sorted(slices.Values(a)), slices.Sorted(slices.Values(b)))
 }
 
+// sealedColumnFilters read only plain numeric attributes.
+var sealedColumnFilters = []string{
+	`ProcId < 4`,
+	`JobStatus == 2 && ProcId >= 1`,
+}
+
 // TestKeylessEvalNeverUsesKey: a redacted evaluation does not open a sealed value at all -- not to read
 // it, and not to open it and discard or re-seal it. Equal answers cannot show that (a path that opens a
 // value and seals it again answers the same), so this counts every use of the key while the redacted
@@ -358,19 +364,14 @@ func TestKeylessEvalNeverUsesKey(t *testing.T) {
 	}
 	job := `[ RequestMemory=512; Requirements = TARGET.Owner == "user3" || TARGET.ProcId < 3; Rank = TARGET.SealedNum ]`
 	for _, lay := range sealedLayouts {
-		if lay.patched {
-			// Not this layout: a delta chain whose base is interned and whose patches are inline cannot be
-			// spliced as bytes, so reading it -- for any reader -- merges the decoded versions and
-			// re-encodes them (materializeAt), opening each sealed value and sealing it again. Nothing
-			// opened there reaches the reader: the merged record is sealed as stored, and a redacted
-			// read evaluates it with no key, which TestSealedValueDictSegmentParity checks on this layout.
-			continue
-		}
 		t.Run(lay.name, func(t *testing.T) {
 			c := openSealedLayout(t, lay)
 			ctr := &countingSealer{inner: c.sealer}
 			c.sealer = ctr
-			for _, f := range sealedParityFilters {
+			// The parity filters each read a sealed attribute; the column-only ones are the shape the
+			// numeric column tiers serve, whose row fallbacks read records -- delta chains included --
+			// without evaluating them.
+			for _, f := range append(slices.Clone(sealedParityFilters), sealedColumnFilters...) {
 				q := mustParseQ(t, f)
 				for range c.QueryRedacted(q) {
 				}
@@ -385,11 +386,45 @@ func TestKeylessEvalNeverUsesKey(t *testing.T) {
 				for range c.QueryProjectRedacted(q, sealedProjectAttrs) {
 				}
 				c.CountQueryRedacted(q)
+				c.columnarEvalCountAs(q, true)
+				c.vectorEvalCountAs(q, true)
 				c.groupStatsQuery(q, []GroupSpec{{Attr: "JobStatus"}}, nil, nil, nil, true)
+				c.GroupStatsConstraintAggsRedacted(f, []GroupSpec{{Attr: "JobStatus"}},
+					[]GroupAggCol{{Attr: "ProcId"}}, nil)
 				for range c.BeginRedacted().Query(q) {
 				}
+				seq, _ := c.QueryRawFromSeqRedacted(q, sealedProj, SeqCursor{}, 0)
+				for range seq {
+				}
 			}
+			// The column tiers' row fallbacks read only literal values whoever the reader is, so even
+			// the entitled forms complete a delta chain without the key.
+			for _, f := range sealedColumnFilters {
+				q := mustParseQ(t, f)
+				c.NumStatsQuery(q, "ProcId")
+				c.TopKOrderThreshold(q, "ProcId", true, 3, nil)
+			}
+			c.PresenceCountQuery(mustParseQ(t, `ProcId =!= undefined`))
 			c.ForEachAdRedacted(func(string, *classad.ClassAd) bool { return true })
+			// The unfiltered scans, which redact in what they emit rather than in an evaluation.
+			for range c.ScanRawRedacted() {
+			}
+			for range c.ScanRawProjected(sealedProj, true, true) {
+			}
+			for range c.ScanRawWire(sealedProj, true) {
+			}
+			for range c.ScanRawWireRefs(sealedProj, true) {
+			}
+			for range c.scanAs(true) {
+			}
+			// Point reads, which complete a delta chain for the one key they read.
+			tx := c.BeginRedacted()
+			for i := 0; i < sealedParityN; i++ {
+				key := []byte(fmt.Sprintf("%d.0", i))
+				c.GetRedacted(key)
+				tx.Get(key)
+			}
+			c.MatchSortedRedacted(mustAd(t, job), 0)
 			for _, limit := range []int{0, 3} {
 				c.MatchSortedRankedRedacted(mustAd(t, job), limit)
 				if _, err := c.MatchSortedRankedFilteredRedacted(mustAd(t, job), `Token == "tok4" || ProcId < 5`, limit); err != nil {

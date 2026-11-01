@@ -374,7 +374,7 @@ func (c *Collection) windowSamples(w segWindow, max int) [][]byte {
 		if recIsMarker(w.data, o) {
 			continue
 		}
-		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf)
+		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf, sealedOpened)
 		if err != nil {
 			continue
 		}

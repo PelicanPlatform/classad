@@ -442,7 +442,7 @@ func TestProjectFromColumnsIsReassemblyNarrowed(t *testing.T) {
 					t.Errorf("record %s: no columnar build", r.key())
 					return true
 				}
-				full, err := c.wireAt(r, s0, nil)
+				full, err := c.wireAt(r, s0, nil, sealedOpened)
 				if err != nil {
 					t.Fatal(err)
 				}

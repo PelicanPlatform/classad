@@ -34,7 +34,7 @@ func (c *Collection) ScanRawWireRefs(projection []string, redact bool) iter.Seq[
 			return
 		}
 		emit := c.yieldWireRow(yield, sel)
-		q := queryPlan{}
+		q := queryPlan{sealed: sealedUseFor(redact)}
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {
 				return

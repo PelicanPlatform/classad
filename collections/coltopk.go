@@ -255,7 +255,7 @@ func (c *Collection) bruteTopK(w segWindow, s0 uint64, aggLookup fieldLookup,
 			break
 		}
 		if !recIsMarker(w.data, o) && w.visible(o, s0) {
-			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
+			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf, sealedUnopened); err == nil {
 				buf = ww
 				stats.visit()
 				stats.reassembled() // no columnar block here: the record was rebuilt to test it

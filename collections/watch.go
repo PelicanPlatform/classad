@@ -787,7 +787,7 @@ func (c *Collection) seedParentSig() map[string]map[string]string {
 	}
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
-		c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+		c.forEachVisibleKeyed(s0, wins, sealedOpened, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if c.isStructural(key) {
 				if pad, err := c.decodeAdDict(dict, ad, codec); err == nil {
 					sig[string(key)] = c.nonPrivateSig(pad)
@@ -825,7 +825,7 @@ func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]s
 	s0, wins := sh.snapshot()
 	defer releaseWindows(wins)
 	var out []rawEvent
-	c.forEachVisibleKeyed(s0, wins, func(k, ad []byte, codec Codec, dict *segDictHandle) bool {
+	c.forEachVisibleKeyed(s0, wins, sealedOpened, func(k, ad []byte, codec Codec, dict *segDictHandle) bool {
 		if c.isStructural != nil && c.isStructural(k) {
 			return true
 		}
@@ -975,7 +975,7 @@ func (c *Collection) catchupUpserts(i int, cursor, sReg uint64, wins []segWindow
 				// The FULL ad: a columnarized record carries only what its schema does not
 				// cover, and a watch event holding half an ad is indistinguishable from an ad
 				// whose attributes really were removed.
-				adBytes, adCodec, aok := c.adBytes(recRef{w: wn, off: o, dict: wn.dict()}, sReg, &wbuf)
+				adBytes, adCodec, aok := c.adBytes(recRef{w: wn, off: o, dict: wn.dict()}, sReg, &wbuf, sealedUseFor(redact))
 				if !aok {
 					off += int(total)
 					continue

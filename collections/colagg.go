@@ -306,7 +306,7 @@ func bruteNumValues(c *Collection, w segWindow, s0 uint64, lookup fieldLookup, f
 			break
 		}
 		if !recIsMarker(w.data, o) && w.visible(o, s0) {
-			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf); err == nil {
+			if ww, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, buf, sealedUnopened); err == nil {
 				buf = ww
 				if !numValueFromAd(w.dict(), wire.Ad(ww), lookup, fn) {
 					return false

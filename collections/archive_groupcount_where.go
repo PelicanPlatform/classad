@@ -368,7 +368,7 @@ func countAttrWhere(c *Collection, w segWindow, attr string, conds []rangeCond, 
 		if recIsMarker(w.data, o) || isSystemKeyBytes(recKey(w.data, o)) {
 			continue // not an ad (see countAttrRange)
 		}
-		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf)
+		raw, err := c.wire(recRef{w: w, off: o, dict: w.dict()}, *dbuf, sealedUnopened)
 		if err != nil {
 			return 0, false
 		}

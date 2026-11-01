@@ -346,7 +346,7 @@ func TestDNFCandidatesSkipMarkers(t *testing.T) {
 				zstd, tc.reverse, st.RecordsVisited, n, markers)
 		}
 		seen, notAds := 0, 0
-		c.scanShardCandidatesGroups(sh, groups, func(w []byte, _ *segDictHandle) bool {
+		c.scanShardCandidatesGroups(sh, groups, sealedOpened, func(w []byte, _ *segDictHandle) bool {
 			seen++
 			if len(w) == 0 || w[0] != 0xCA {
 				notAds++

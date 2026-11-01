@@ -61,7 +61,7 @@ func (c *Collection) ScanRawRedacted() iter.Seq[RawAd] {
 
 func (c *Collection) scanRaw(redact bool) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
-		q := queryPlan{}
+		q := queryPlan{sealed: sealedUseFor(redact)}
 		emit := c.yieldRaw(yield, redact)
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {

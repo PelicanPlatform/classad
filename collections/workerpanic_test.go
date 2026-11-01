@@ -164,7 +164,7 @@ func TestLockedReadPanicReleasesLock(t *testing.T) {
 		locked func() bool
 	}{
 		"materialize": {
-			run: func() { sh.materializeLocked(c, []byte("k"), 0, 0, nil) },
+			run: func() { sh.materializeLocked(c, []byte("k"), 0, 0, nil, sealedOpened) },
 			locked: func() bool {
 				if sh.mu.TryLock() {
 					sh.mu.Unlock()

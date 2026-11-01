@@ -41,6 +41,12 @@ type queryPlan struct {
 	// windows proven free of CurrentTime (segWindow.ctFree); nil when the query has none. It shares
 	// the plan's wireScope, projection and stats. See at.
 	fold *queryPlan
+	// sealed is what the scan's consumer does with sealed values, which decides how a delta chain
+	// is completed for it (see sealedUse). Set from the same redact flag as ws's context, so the
+	// bytes a scan hands over and the evaluation of them cannot disagree about the reader. A plan
+	// with no query still needs it: an unfiltered redacted scan redacts in its emit callback, and
+	// the records it is handed are completed before that.
+	sealed sealedUse
 }
 
 // newQueryPlan builds the scan plan for q: the reusable match state, the projection
@@ -78,6 +84,7 @@ func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats,
 		proj:     proj,
 		probes:   q.Probes(),
 		stats:    stats,
+		sealed:   sealedUseFor(redact),
 	}
 	if qf := c.foldFor(q); qf != nil {
 		f := qp

@@ -95,7 +95,7 @@ func (c *Collection) forEachAdAs(fn func(key string, ad *classad.ClassAd) bool, 
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		stop := false
-		c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+		c.forEachVisibleKeyed(s0, wins, sealedUseFor(redact), func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if isSystemKeyBytes(key) {
 				return true // internal system record: hidden from client iteration
 			}
@@ -138,7 +138,7 @@ func (c *Collection) forEachAdAtAs(snapOf func(shardIdx int) uint64, fn func(key
 		s0 := snapOf(i)
 		wins := sh.snapshotAt(s0)
 		stop := false
-		c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+		c.forEachVisibleKeyed(s0, wins, sealedUseFor(redact), func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if isSystemKeyBytes(key) {
 				return true // internal system record: hidden from client iteration
 			}
@@ -168,7 +168,7 @@ func (c *Collection) ForEachSystemAd(fn func(key string, ad *classad.ClassAd) bo
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		stop := false
-		c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
+		c.forEachVisibleKeyed(s0, wins, sealedOpened, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if !isSystemKeyBytes(key) {
 				return true // only system records
 			}
