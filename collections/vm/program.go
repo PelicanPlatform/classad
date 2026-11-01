@@ -69,6 +69,12 @@ type Program struct {
 	// ordinary expression program. Kept for diagnostics; execution goes by index.
 	locals []string
 
+	// hasStatements marks a program with statement-level control flow -- an If or a While. It is set
+	// by the script builder rather than derived, because the vector executor needs it BEFORE it has
+	// looked at an instruction: it decides whether to set up the predication planes, which cost about
+	// 2% of an expression scan and which an expression can never use.
+	hasStatements bool
+
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick
 	// the hot-header fast path; nil-safe to ignore.

@@ -109,3 +109,85 @@ func BenchmarkVecScript(b *testing.B) {
 		})
 	}
 }
+
+// BenchmarkVecPredicate times an If two ways: over a batch, and per record through the register
+// executor. The same compiled script in both arms.
+//
+// Predication does not skip work -- both arms run for every record and the store is what is masked --
+// so the question this answers is whether running both arms over a batch still beats running one arm
+// per record. The caveat on BenchmarkVecScript's per-record arm applies here too: testSource boxes a
+// value per record in LoadColumn, so the ratio is a floor.
+func BenchmarkVecPredicate(b *testing.B) {
+	const n = 8192
+	src := benchScriptSource(n)
+	ads := make([]*classad.ClassAd, n)
+	for i := range ads {
+		ads[i] = src.ad(i)
+	}
+	build := func(nest bool) *ScriptProgram {
+		cond, err := parser.ParseExpr("Cpus > 4")
+		if err != nil {
+			b.Fatal(err)
+		}
+		inner, err := parser.ParseExpr("Memory > 8192")
+		if err != nil {
+			b.Fatal(err)
+		}
+		hi, err := parser.ParseExpr("Memory * 2")
+		if err != nil {
+			b.Fatal(err)
+		}
+		lo, err := parser.ParseExpr("Memory / 2")
+		if err != nil {
+			b.Fatal(err)
+		}
+		zero, err := parser.ParseExpr("0")
+		if err != nil {
+			b.Fatal(err)
+		}
+		res, err := parser.ParseExpr("x > Disk")
+		if err != nil {
+			b.Fatal(err)
+		}
+		s := NewScript().Let("x", zero)
+		if nest {
+			s = s.If(cond, func(in *Script) {
+				in.If(inner, func(t *Script) { t.Let("x", hi) }, func(t *Script) { t.Let("x", lo) })
+			}, nil)
+		} else {
+			s = s.If(cond, func(t *Script) { t.Let("x", hi) }, func(t *Script) { t.Let("x", lo) })
+		}
+		sp, err := s.Result(res).Compile()
+		if err != nil {
+			b.Fatal(err)
+		}
+		return sp
+	}
+	for _, tc := range []struct {
+		name string
+		nest bool
+	}{{"flat", false}, {"nested", true}} {
+		sp := build(tc.nest)
+		var scratch VecScratch
+		if _, ok := sp.VecEval(src, n, &scratch); !ok {
+			b.Fatalf("%s declined", tc.name)
+		}
+		perElem := func(b *testing.B) {
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*n), "ns/elem")
+		}
+		b.Run(tc.name+"/vector", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				sp.VecEval(src, n, &scratch)
+			}
+			perElem(b)
+		})
+		b.Run(tc.name+"/per-record", func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				for _, ad := range ads {
+					sp.Run(ad)
+				}
+			}
+			perElem(b)
+		})
+	}
+}

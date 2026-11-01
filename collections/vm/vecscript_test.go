@@ -179,10 +179,11 @@ func TestVecScriptBindingsDoNotLeakAcrossBatches(t *testing.T) {
 	}
 }
 
-// TestVecScriptDeclinesControlFlow pins the boundary. If and While compile to OpBranchVoid, OpJmpVoid
-// and OpFault, none of which this executor implements, and a decline is the only safe answer: a branch
-// picks per record and the executor has no masked store yet. Serving one of these silently is the
-// failure this guards against.
+// TestVecScriptDeclinesControlFlow pins the boundary, which is now the BACK EDGE and not the branch.
+// If is served (see vecpred_test.go); While is not, because its live mask narrows across iterations
+// and the loop runs until no record is still true, which needs per-record trip accounting the
+// element-step budget has not been built for. Serving one silently is the failure this guards
+// against.
 func TestVecScriptDeclinesControlFlow(t *testing.T) {
 	src := vecCorpus()
 	n := len(src.recs)
@@ -202,9 +203,6 @@ func TestVecScriptDeclinesControlFlow(t *testing.T) {
 		name  string
 		build func() *Script
 	}{
-		{"if", func() *Script {
-			return NewScript().If(cond, func(s *Script) { s.Let("t", one) }, nil)
-		}},
 		{"while", func() *Script {
 			return NewScript().While(cond, func(s *Script) { s.Let("t", one) })
 		}},

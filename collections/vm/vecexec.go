@@ -297,12 +297,17 @@ func (q *Query) VecEval(src ColumnSource, n int, scratch *VecScratch) (*Vec, boo
 
 func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecScratch) (*Vec, bool) {
 	s.reset(n)
+	if p.hasStatements {
+		s.initPredicates()
+	}
 	for ip := 0; ip < len(p.code); {
 		// A branching construct converging here blends its paths before this instruction runs.
 		if !s.applyBlends(ip) {
 			return nil, false
 		}
 		in := p.code[ip]
+		// Statement-level control flow sets this; everything else falls through.
+		next := ip + 1
 		switch in.Op {
 		case OpPushConst:
 			if !broadcast(s.push(), p.consts[in.A]) {
@@ -378,19 +383,35 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			s.pushBlend(blendPending{target: int(p.conds[in.A].end), base: s.depth - 1, cond: true})
 		case OpJmp:
 			// No-op, like the short-circuit opcodes: every path is evaluated and the join blends them.
+		case OpBranchVoid:
+			t, ok := s.enterIf(p.conds[in.A], ip)
+			if !ok {
+				return nil, false
+			}
+			next = t
+		case OpJmpVoid:
+			t, ok := s.jmpVoid(in.A)
+			if !ok {
+				return nil, false // a back edge: see vecpred.go
+			}
+			next = t
 		default:
-			return nil, false // OpEvalNode, anything added later
+			return nil, false // OpEvalNode, OpFault, anything added later
 		}
-		ip++
+		ip = next
 	}
 	// Constructs converging on the end of the program.
 	if !s.applyBlends(len(p.code)) {
 		return nil, false
 	}
-	if s.depth != 1 || len(s.blends) != 0 {
+	if s.depth != 1 || len(s.blends) != 0 || len(s.preds) != 0 {
 		return nil, false
 	}
-	return s.top(), true
+	res := s.top()
+	if !s.applyFaults(res) {
+		return nil, false
+	}
+	return res, true
 }
 
 // VecScratch holds the vector stack and the evaluator so a scan reuses both across batches instead of
@@ -415,6 +436,15 @@ type VecScratch struct {
 	// blocks; the flags do not, because a binding is per batch.
 	locals    []*Vec
 	localsSet []bool
+
+	// Predication state; see vecpred.go. live and faulted are one plane each, preds is the stack of
+	// Ifs whose arms are in flight, and maskPool keeps the planes across batches.
+	live     []uint64
+	faulted  []uint64
+	preds    []predPending
+	maskPool [][]uint64
+	liveAll  bool // the live mask is the whole batch, so a store need not be masked
+	anyFault bool
 }
 
 // blendPending is one branching construct whose paths are being evaluated, waiting for its join.
@@ -522,6 +552,7 @@ func (s *VecScratch) reset(n int) {
 	for i := range s.localsSet {
 		s.localsSet[i] = false
 	}
+	s.resetPredicates()
 }
 
 // storeLocal binds the top of the stack to a local, the vector form of OpStoreLocal.
@@ -539,6 +570,11 @@ func (s *VecScratch) storeLocal(idx int) bool {
 	for len(s.locals) <= idx {
 		s.locals = append(s.locals, nil)
 		s.localsSet = append(s.localsSet, false)
+	}
+	if !s.liveAll {
+		// Under a predicate the binding keeps the lanes this store does not reach, so the vector
+		// cannot simply be taken over. See maskedStore.
+		return s.maskedStore(idx)
 	}
 	v := s.pop()
 	// Widened here rather than carried: Raw aliases the block's own bytes, and a binding that outlives

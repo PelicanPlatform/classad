@@ -118,6 +118,7 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 		s.err = errors.New("vm: If after Result")
 		return s
 	}
+	s.c.p.hasStatements = true
 	s.emitExpr(cond)
 	s.c.p.conds = append(s.c.p.conds, condTargets{})
 	k := int32(len(s.c.p.conds) - 1)
@@ -170,6 +171,7 @@ func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 		return s
 	}
 	header := len(s.c.p.code)
+	s.c.p.hasStatements = true
 	s.emitExpr(cond)
 	s.c.p.conds = append(s.c.p.conds, condTargets{})
 	k := int32(len(s.c.p.conds) - 1)
