@@ -61,6 +61,10 @@ type Program struct {
 	// strLists are the constant lists of stringListMember calls (OpStrListMember).
 	strLists []*strListSet
 
+	// locals are a script's local names, in binding order, indexed by OpLoadLocal. Empty for an
+	// ordinary expression program. Kept for diagnostics; execution goes by index.
+	locals []string
+
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick
 	// the hot-header fast path; nil-safe to ignore.

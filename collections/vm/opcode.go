@@ -100,6 +100,52 @@ const (
 	// first argument) with the call's value against members[A], a list of
 	// constants compiled to sets. See member.go.
 	OpMember
+
+	// OpLoadLocal pushes the value bound to locals[A] by an earlier statement of a script.
+	//
+	// A script's locals are NOT attributes: `x = Cpus + 1` binds a name that later statements read
+	// without the scope ever seeing it, so a reference to x must not compile to OpLoadRef and must
+	// not be shadowed by -- or shadow -- an attribute of the same name. The compiler decides which
+	// a reference is, because only the compiler knows what is bound at that point.
+	//
+	// It appears only in a script program, and the register lowering resolves it to the local's
+	// register, so it never reaches a running program in stack form. The stack interpreter therefore
+	// does not implement it; see ScriptProgram.
+	OpLoadLocal
+
+	// OpStoreLocal pops the top of the stack and binds it to locals[A].
+	//
+	// A local is a PLACE, not a value: it has one register for the whole script, written here and
+	// read by OpLoadLocal. That is what lets a binding made on one path of a branch and read after
+	// the merge be the same register either way, with no phi to construct -- which a model that gave
+	// each binding a fresh register could not express, and is why that model was replaced.
+	//
+	// Popping is what makes a statement stack-neutral, so the next one starts clean.
+	OpStoreLocal
+
+	// OpBranchVoid pops the condition and dispatches on classad.ConditionState using conds[A], like
+	// OpBranchCond -- but it produces NO value and has no join.
+	//
+	// The two cannot be the same opcode. OpBranchCond is an expression: each of its paths leaves a
+	// value and they converge on one register. A statement branch's paths leave nothing, and what
+	// converges is the LOCALS they wrote, each of which is already a single register. There is
+	// nothing to join, and a lowering that tried to would be looking for values that are not there.
+	OpBranchVoid
+
+	// OpJmpVoid jumps unconditionally to A, carrying no value. OpJmp is its expression counterpart
+	// and moves the path's value into the conditional's destination first.
+	OpJmpVoid
+
+	// OpFault ends the script with ERROR.
+	//
+	// It is reached when a condition is neither true nor false -- UNDEFINED, or a type that cannot
+	// be one, such as a string or a list. That is a FAULT rather than a branch not taken, because
+	// the alternative is to treat "I could not tell" as "no", which is how a misspelled attribute
+	// silently turns a script into one that does nothing.
+	//
+	// In the scalar context a fault ends the script, which is the degenerate case of faulting the
+	// one record being evaluated.
+	OpFault
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose

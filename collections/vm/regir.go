@@ -108,6 +108,9 @@ const (
 	// RJump jumps unconditionally to T.
 	RJump
 
+	// RFault ends execution with ERROR. See OpFault.
+	RFault
+
 	// RBranchCond dispatches on classad.ConditionState(A) using the register-form target triple
 	// RegProgram.conds[Imm]: CondTrue falls through, the rest jump. Dst is the register every path of
 	// the conditional writes, so the value is in one place at the join whichever path ran.
@@ -140,6 +143,11 @@ type RegProgram struct {
 	nregs int
 	res   int32 // the register holding the expression's value, or -1 for an empty program
 	src   *Program
+
+	// localRegs is the register holding each of a script's locals, in binding order. Empty for an
+	// ordinary expression. One register per local for the whole program is the model; this is what
+	// makes that checkable rather than merely intended.
+	localRegs []int32
 }
 
 // Len returns the instruction count (for tests and benchmarks).
@@ -167,21 +175,114 @@ func (rp *RegProgram) Source() *Program { return rp.src }
 // matching short-circuit, or an opcode it has not been taught. Each is a compiler bug, and each would
 // otherwise produce a register program that quietly disagrees with the stack one. The last is the
 // one that will actually happen: adding an opcode without extending this conversion.
+// LowerToRegisters converts a compiled expression -- or a script -- from stack form to register form.
+//
+// A SCRIPT's locals get one register each, allocated before any code and initialized to UNDEFINED.
+// That is what makes a local a place rather than a value: OpStoreLocal writes the register and
+// OpLoadLocal reads it, so a binding made on one path of a branch and read after the merge is the
+// same register either way, and no phi has to be constructed to say so.
+//
+// Initializing them matters for the same reason. A local read on a path that never bound it would
+// otherwise read a register nothing wrote; UNDEFINED is the answer ClassAd already has for "no value
+// here", and it keeps the register defined on every path, which the optimizer's liveness depends on.
 func LowerToRegisters(p *Program) *RegProgram {
 	l := &lowerer{
-		src:     p,
-		rp:      &RegProgram{src: p, res: -1},
-		newIdx:  make([]int32, len(p.code)+1),
-		pending: map[int][]*joinPoint{},
+		src:      p,
+		rp:       &RegProgram{src: p, res: -1},
+		newIdx:   make([]int32, len(p.code)+1),
+		pending:  map[int][]*joinPoint{},
+		localReg: make([]int32, len(p.locals)),
+	}
+	needInit := localsNeedingInit(p)
+	for i := range l.localReg {
+		l.localReg[i] = l.reg()
+		if needInit[i] {
+			l.emit(RegInstr{Op: RUndef, Dst: l.localReg[i]})
+		}
 	}
 	l.lower()
+	l.rp.localRegs = l.localReg
 	return l.rp
+}
+
+// localsNeedingInit reports which locals must be initialized to UNDEFINED before the script runs.
+//
+// Only the ones whose reads a store does not provably reach. A local that is stored and then read in
+// STRAIGHT-LINE code needs nothing: the store always ran. One read before any store, or across a
+// point control can jump to -- the merge after a branch, say -- needs an initializer, because the
+// path that reaches the read may not have stored anything.
+//
+// It is written as a dominance question rather than as "does this program have branches" on purpose.
+// That second rule would be right today, when the only jumps are inside a single expression and so
+// cannot skip a store, and would silently become wrong the moment a statement-level branch exists.
+// This one does not have to be revisited: the merge after such a branch is a jump target, so a read
+// after it stops being dominated and gets its initializer automatically.
+//
+// The cost of a spurious initializer is not an incorrect program; it is a second definition of the
+// local's register, which makes the optimizer refuse to propagate through it.
+func localsNeedingInit(p *Program) []bool {
+	need := make([]bool, len(p.locals))
+	if len(need) == 0 {
+		return need
+	}
+	firstStore := make([]int, len(p.locals))
+	for i := range firstStore {
+		firstStore[i] = -1
+	}
+	for ip, in := range p.code {
+		if in.Op == OpStoreLocal && int(in.A) < len(firstStore) && firstStore[in.A] < 0 {
+			firstStore[in.A] = ip
+		}
+	}
+	targets := stackJumpTargets(p)
+	for ip, in := range p.code {
+		if in.Op != OpLoadLocal || int(in.A) >= len(need) {
+			continue
+		}
+		s := firstStore[in.A]
+		if s < 0 || s > ip {
+			need[in.A] = true
+			continue
+		}
+		for j := s + 1; j <= ip; j++ {
+			if targets[j] {
+				need[in.A] = true
+				break
+			}
+		}
+	}
+	return need
+}
+
+// stackJumpTargets marks the stack-form indices control can arrive at other than by falling through.
+func stackJumpTargets(p *Program) []bool {
+	t := make([]bool, len(p.code)+1)
+	mark := func(x int32) {
+		if x >= 0 && int(x) < len(t) {
+			t[x] = true
+		}
+	}
+	for _, in := range p.code {
+		switch in.Op {
+		case OpShortAnd, OpShortOr, OpJmpIfNotUndef, OpJmp, OpJmpVoid:
+			mark(in.A)
+		case OpBranchCond, OpBranchVoid:
+			c := p.conds[in.A]
+			mark(c.onFalse)
+			mark(c.onUndef)
+			mark(c.onError)
+		}
+	}
+	return t
 }
 
 // lowerer holds the state of one conversion.
 type lowerer struct {
 	src *Program
 	rp  *RegProgram
+
+	// localReg is the register holding each of a script's locals. Empty for an ordinary expression.
+	localReg []int32
 
 	// vstack maps the stack form's operand stack to the registers currently holding those operands.
 	vstack []int32
@@ -269,6 +370,12 @@ func (l *lowerer) lower() {
 	// right operand ends the expression targets it.
 	l.newIdx[len(l.src.code)] = int32(len(l.rp.code))
 	l.emitJoins(len(l.src.code))
+	// Exactly one value, or none for an empty program. More than one means a statement did not leave
+	// the stack as it found it, which is the invariant that lets statements be sequenced at all --
+	// and which a branch will depend on, since its paths must reach the merge with the same stack.
+	if len(l.vstack) > 1 {
+		panic("vm: lowering ended with more than one value on the stack; a statement is not stack-neutral")
+	}
 	if len(l.vstack) > 0 {
 		l.rp.res = l.vstack[len(l.vstack)-1]
 	}
@@ -416,6 +523,14 @@ func (l *lowerer) one(ip int) {
 		d := l.reg()
 		l.emit(RegInstr{Op: REvalNode, Dst: d, Imm: in.A})
 		l.push(d)
+	case OpLoadLocal:
+		d := l.reg()
+		l.emit(RegInstr{Op: RMove, Dst: d, A: l.localReg[in.A]})
+		l.push(d)
+	case OpStoreLocal:
+		// The statement's value goes into the local's register and leaves the stack, so a statement
+		// is stack-neutral and the next one starts clean.
+		l.emit(RegInstr{Op: RMove, Dst: l.localReg[in.A], A: l.pop()})
 	case OpShortAnd, OpShortOr:
 		// The left operand stays on the stack for the combine; the destination is allocated here so
 		// that both the short-circuit path and the combine write the same register.
@@ -459,6 +574,22 @@ func (l *lowerer) one(ip int) {
 		ci := l.emit(RegInstr{Op: RBranchCond, Dst: d, A: a, Imm: k})
 		l.condInstrs = append(l.condInstrs, ci)
 		l.openConds = append(l.openConds, &joinPoint{dst: d, end: -1, isCond: true})
+	case OpBranchVoid:
+		// A statement branch: the condition is consumed and nothing is produced, so there is no
+		// destination to join on and no entry on the open-conditional stack. Dst is a register
+		// nothing reads, which keeps the instruction's shape uniform for the optimizer's use/def
+		// view rather than making it a special case there.
+		a := l.pop()
+		t := l.src.conds[in.A]
+		l.rp.conds = append(l.rp.conds, t)
+		k := int32(len(l.rp.conds) - 1)
+		ci := l.emit(RegInstr{Op: RBranchCond, Dst: l.reg(), A: a, Imm: k})
+		l.condInstrs = append(l.condInstrs, ci)
+	case OpJmpVoid:
+		j := l.emit(RegInstr{Op: RJump, T: in.A})
+		l.jumps = append(l.jumps, j)
+	case OpFault:
+		l.emit(RegInstr{Op: RFault})
 	case OpJmp:
 		// Belongs to the innermost open conditional. Its value goes into that conditional's
 		// destination before the jump, and the jump lands just after the join's own move.
@@ -503,17 +634,47 @@ func (l *lowerer) one(ip int) {
 // FuzzRegisterParity exists to enforce. Every value operation goes through the same classad hooks the
 // stack interpreter uses, so neither form has its own copy of any semantics.
 func RunRegisters(rp *RegProgram, scope *classad.ClassAd) (result classad.Value) {
+	result, _ = RunRegistersLimited(rp, scope, DefaultStepBudget)
+	return result
+}
+
+// DefaultStepBudget bounds how many instructions one execution may run.
+//
+// A bound is not optional once a program can loop: `while true: x = x` has no answer, and the
+// evaluator's contract is that evaluation returns. It is counted in INSTRUCTIONS rather than in wall
+// clock on purpose -- a time limit makes the same script succeed or fail depending on what else the
+// machine is doing, which is not reproducible, and a fault nobody can reproduce cannot be debugged
+// or differentially tested.
+//
+// The value is large enough that no terminating script written by hand will reach it and small
+// enough to stop a runaway quickly.
+const DefaultStepBudget = 1 << 22
+
+// RunRegistersLimited is RunRegisters with an explicit instruction budget. ok=false means the budget
+// ran out, in which case the value is ERROR.
+//
+// The two are distinguishable because they are different kinds of thing: ERROR is an answer the
+// script computed, while exhausting the budget means it did not finish. The design keeps that
+// distinction for the vector case, where a runaway costs one record and a budget overrun abandons
+// the whole batch; here the single record is the whole result, so both end the script and only the
+// caller's report differs.
+func RunRegistersLimited(rp *RegProgram, scope *classad.ClassAd, budget int) (result classad.Value, ok bool) {
 	ev := classad.NewEvaluator(scope)
 	defer classad.RecoverCyclic(&result)
-	return execReg(rp, ev, make([]classad.Value, rp.nregs))
+	return execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
 }
 
 // execReg runs rp against ev, using regs as the register file. regs must have at least rp.nregs
 // entries; the caller may retain its backing array to amortize allocation across evaluations.
-func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classad.Value {
+func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget int) (classad.Value, bool) {
 	p := rp.src
 	code := rp.code
+	steps := 0
 	for ip := 0; ip < len(code); {
+		steps++
+		if steps > budget {
+			return classad.NewErrorValue(), false
+		}
 		in := code[ip]
 		switch in.Op {
 		case RNop:
@@ -571,6 +732,10 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classa
 			ip++
 		case RJump:
 			ip = int(in.T)
+		case RFault:
+			// Ends the script. Returning here rather than jumping to an end label keeps the fault
+			// out of the register file: there is no result to have produced.
+			return classad.NewErrorValue(), true
 		case RBranchCond:
 			t := rp.conds[in.Imm]
 			switch classad.ConditionState(regs[in.A]) {
@@ -610,7 +775,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classa
 		}
 	}
 	if rp.res < 0 {
-		return classad.NewUndefinedValue()
+		return classad.NewUndefinedValue(), true
 	}
-	return regs[rp.res]
+	return regs[rp.res], true
 }
