@@ -314,8 +314,13 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
+	// A continuous aggregate's sealed buckets are not in its backing, so the projection runs
+	// over both halves and the sealed one is streamed after the live one. Without this the op
+	// returns the unsealed tail and silently omits everything older.
+	var sealed *db.ArchiveTable
 	switch ref := s.resolveTable(table); ref.kind {
 	case kindTable, kindView:
+		sealed = ref.sealed
 		switch {
 		case stats != nil && chaseRefs:
 			seq, err = ref.db.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
@@ -353,6 +358,38 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 		n++
 		if limit > 0 && n >= limit {
 			break
+		}
+	}
+	if sealed != nil && (limit <= 0 || n < limit) {
+		var sstats collections.ScanStats
+		var sseq iter.Seq[collections.RawAd]
+		var serr error
+		switch {
+		case stats != nil && chaseRefs:
+			sseq, serr = sealed.QueryRawProjectedRefsStats(constraint, attrs, redact, &sstats)
+		case stats != nil:
+			sseq, serr = sealed.QueryRawProjectedStats(constraint, attrs, redact, &sstats)
+		case chaseRefs:
+			sseq, serr = sealed.QueryRawProjectedRefs(constraint, attrs, redact)
+		default:
+			sseq, serr = sealed.QueryRawProjected(constraint, attrs, redact)
+		}
+		if serr != nil {
+			write(respErr(reqID, serr.Error()))
+			return
+		}
+		for ra := range sseq {
+			if cancelled(ctx) {
+				return
+			}
+			write(putStr(respHead(reqID, stStream), rawAdText(ra)))
+			n++
+			if limit > 0 && n >= limit {
+				break
+			}
+		}
+		if stats != nil {
+			addScanStats(stats, sstats)
 		}
 	}
 	if wantStats {

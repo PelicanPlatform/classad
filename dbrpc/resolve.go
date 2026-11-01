@@ -3,8 +3,17 @@ package dbrpc
 import (
 	"strconv"
 
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 )
+
+// viewSealedTabler is the optional Catalog capability to reach a continuous aggregate's
+// sealed history as a table. Optional for the same reason viewSealer is: a Catalog
+// implementation that has no views need not provide it, and one that predates sealing
+// simply reports none, leaving every read served from the backing alone as before.
+type viewSealedTabler interface {
+	ViewSealedTable(name string) (*db.ArchiveTable, bool)
+}
 
 // tableKind is which of the catalog's three namespaces a name was found in.
 //
@@ -22,13 +31,26 @@ const (
 )
 
 // tableRef is what a name resolved to. Exactly one of db / arch is set, per kind; both are
-// nil for kindMissing. A view resolves to its backing *db.DB, which is how every read of a
-// view has always reached its materialized rows.
+// nil for kindMissing.
+//
+// A view resolves to its backing *db.DB, which is where a read of a view has always found
+// its materialized rows -- but for a continuous aggregate that is only half of them. Sealing
+// moves a closed bucket out of the backing and into the view's archive, so its rows live in
+// TWO places, and sealed is that second one (nil unless this is a view that seals).
+//
+// A handler that serves kindView and consults only ref.db is not stale, it is WRONG: it
+// silently returns the unsealed tail and nothing older. For a five-minute bucket the seal
+// cadence is 150 seconds, so that is almost the whole series. Serve both halves, or refuse
+// the name -- do not answer from one.
 type tableRef struct {
-	kind tableKind
-	db   *db.DB
-	arch *db.ArchiveTable
+	kind   tableKind
+	db     *db.DB
+	arch   *db.ArchiveTable
+	sealed *db.ArchiveTable
 }
+
+// seals reports whether this name has a sealed half that a read must also consult.
+func (r tableRef) seals() bool { return r.sealed != nil }
 
 // resolveTable looks a name up in all three namespaces.
 //
@@ -41,7 +63,13 @@ func (s *Server) resolveTable(name string) tableRef {
 		return tableRef{kind: kindTable, db: d}
 	}
 	if d, ok := s.cat.ViewBacking(name); ok {
-		return tableRef{kind: kindView, db: d}
+		ref := tableRef{kind: kindView, db: d}
+		if vs, ok := s.cat.(viewSealedTabler); ok {
+			if a, has := vs.ViewSealedTable(name); has {
+				ref.sealed = a
+			}
+		}
+		return ref
 	}
 	if a, ok := s.cat.ArchiveTable(name); ok {
 		return tableRef{kind: kindArchive, arch: a}
@@ -110,4 +138,24 @@ func mergeSorted(a, b []string) []string {
 		}
 	}
 	return append(append(out, a[i:]...), b[j:]...)
+}
+
+// addScanStats folds the second scan's counts into the first, for a read served from both
+// halves of a view. Every field is a count of work done, so the total is the sum; Tier names
+// the strategy and is left as the first scan reported it, there being no sum of strategies.
+func addScanStats(dst *collections.ScanStats, add collections.ScanStats) {
+	dst.SegmentsTotal += add.SegmentsTotal
+	dst.SegmentsPruned += add.SegmentsPruned
+	dst.SegmentsScanned += add.SegmentsScanned
+	dst.RecordsVisited += add.RecordsVisited
+	dst.RecordsColumnDecided += add.RecordsColumnDecided
+	dst.RecordsConjunctRejected += add.RecordsConjunctRejected
+	dst.RecordsNarrowMatched += add.RecordsNarrowMatched
+	dst.RecordsReassembled += add.RecordsReassembled
+	dst.RecordsClosureReassembled += add.RecordsClosureReassembled
+	dst.RowsMatched += add.RowsMatched
+	dst.SegmentsIndexed += add.SegmentsIndexed
+	dst.SegmentsIndexSkipped += add.SegmentsIndexSkipped
+	dst.SegmentsUnindexed += add.SegmentsUnindexed
+	dst.IndexCandidates += add.IndexCandidates
 }

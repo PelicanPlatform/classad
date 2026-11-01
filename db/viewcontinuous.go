@@ -161,6 +161,23 @@ func (v *View) SealedQuery(constraint string) (iter.Seq[*classad.ClassAd], error
 	return arch.Query(constraint)
 }
 
+// SealedArchive returns the continuous aggregate's sealed history as an archive table, and
+// whether it has one (a gauge view and an in-memory catalog do not).
+//
+// SealedQuery streams its rows, which is all a whole-ad read needs. A projected read, a
+// top-K and an aggregate each need to run their OWN operation over the sealed half rather
+// than re-derive it from rows, which is what this exposes: the sealed half is an ordinary
+// archive table and answers the same reads as one.
+//
+// The caller must treat the two halves as one table. A view that seals holds its rows in
+// two places -- the live backing and this -- and a read that consults only one of them is
+// silently short, not merely stale.
+func (v *View) SealedArchive() (*ArchiveTable, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.archive, v.archive != nil
+}
+
 // LateDrops reports how many base rows were dropped because their time bucket was already
 // sealed (out-of-window late data).
 func (v *View) LateDrops() int64 {

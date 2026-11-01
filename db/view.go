@@ -774,6 +774,20 @@ func (cat *Catalog) ViewSealed(name, constraint string) (seq iter.Seq[*classad.C
 	return seq, true, err
 }
 
+// ViewSealedTable returns the archive holding a continuous aggregate's sealed history, and
+// whether name is a view that has one. It is ViewSealed's counterpart for a reader that must
+// run an operation over the sealed half -- a projection, a top-K, an aggregate -- rather than
+// consume its rows.
+func (cat *Catalog) ViewSealedTable(name string) (*ArchiveTable, bool) {
+	cat.mu.Lock()
+	v, found := cat.views[name]
+	cat.mu.Unlock()
+	if !found {
+		return nil, false
+	}
+	return v.SealedArchive()
+}
+
 // recoverViews reconstructs views from <dir>/views on catalog open. Data is not persisted,
 // so each view is rebuilt from its base table. A view whose base table is absent loads
 // stale (rebound on a later restart once the table exists); a view whose rebuild fails
