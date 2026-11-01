@@ -262,7 +262,7 @@ func TestVecMatchesScalarPerRecord(t *testing.T) {
 	n := len(src.recs)
 	var scratch VecScratch
 	declined := 0
-	for _, expr := range vecExprs {
+	for _, expr := range append(append([]string{}, vecExprs...), chargeShapes...) {
 		q, err := Parse(expr)
 		if err != nil {
 			t.Fatalf("parse %q: %v", expr, err)
@@ -283,10 +283,10 @@ func TestVecMatchesScalarPerRecord(t *testing.T) {
 	}
 	if declined > 0 {
 		t.Errorf("%d/%d expressions declined; the corpus is meant to be mostly servable",
-			declined, len(vecExprs))
+			declined, len(vecExprs)+len(chargeShapes))
 	}
 	t.Logf("%d expressions x %d records verified against the scalar interpreter (%d declined)",
-		len(vecExprs)-declined, n, declined)
+		len(vecExprs)+len(chargeShapes)-declined, n, declined)
 }
 
 // TestVecDeclinesUnsupported pins what the executor refuses, so a future change that starts silently

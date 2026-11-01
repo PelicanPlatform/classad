@@ -61,9 +61,24 @@ type Program struct {
 	// strLists are the constant lists of stringListMember calls (OpStrListMember).
 	strLists []*strListSet
 
+	// faultSites are the places a script can fault, indexed by OpFault's operand. Empty for an
+	// ordinary expression program, which cannot fault at all.
+	faultSites []faultSite
+
 	// locals are a script's local names, in binding order, indexed by OpLoadLocal. Empty for an
 	// ordinary expression program. Kept for diagnostics; execution goes by index.
 	locals []string
+
+	// vops[i] is how many charged instructions precede instruction i, with a final entry for the end
+	// (see vopPrefix). Built at compile time because a Program is shared by concurrent evaluations
+	// and must be read-only once compiled.
+	vops []int32
+
+	// hasStatements marks a program with statement-level control flow -- an If or a While. It is set
+	// by the script builder rather than derived, because the vector executor needs it BEFORE it has
+	// looked at an instruction: it decides whether to set up the predication planes, which cost about
+	// 2% of an expression scan and which an expression can never use.
+	hasStatements bool
 
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick

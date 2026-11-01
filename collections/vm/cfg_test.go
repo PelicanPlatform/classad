@@ -7,18 +7,6 @@ import (
 	"github.com/PelicanPlatform/classad/parser"
 )
 
-// mustExpr parses an expression or fails the test.
-func mustExpr(t *testing.T, src string) interface {
-	String() string
-} {
-	t.Helper()
-	e, err := parser.ParseExpr(src)
-	if err != nil || e == nil {
-		t.Fatalf("parse %q: %v", src, err)
-	}
-	return e
-}
-
 // allInit is the trivially correct initializer set: every local initialized, whatever the analysis
 // says. It is the oracle for localsNeedingInit, because initializing a local that did not need it
 // changes no answer -- the store that follows overwrites it -- while failing to initialize one that

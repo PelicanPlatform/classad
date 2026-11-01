@@ -118,6 +118,7 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 		s.err = errors.New("vm: If after Result")
 		return s
 	}
+	s.c.p.hasStatements = true
 	s.emitExpr(cond)
 	s.c.p.conds = append(s.c.p.conds, condTargets{})
 	k := int32(len(s.c.p.conds) - 1)
@@ -135,7 +136,7 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 	jElse := s.c.ins(OpJmpVoid, -1)
 
 	onFault := len(s.c.p.code)
-	s.c.ins(OpFault, 0)
+	s.c.ins(OpFault, s.c.p.addFaultSite(FaultCondition, "if"))
 
 	end := len(s.c.p.code)
 	// UNDEFINED and ERROR share the fault, because the script's answer is the same either way: it
@@ -160,7 +161,7 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 //
 // TERMINATION is not the loop's problem to solve but the interpreter's: `while true: x = x` has no
 // answer, and nothing the compiler can check would tell it apart from a loop that happens to run a
-// long time. The instruction budget in RunRegistersLimited is what bounds it.
+// long time. The step budget in RunRegistersLimited is what bounds it.
 func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 	if s.err != nil {
 		return s
@@ -170,6 +171,7 @@ func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 		return s
 	}
 	header := len(s.c.p.code)
+	s.c.p.hasStatements = true
 	s.emitExpr(cond)
 	s.c.p.conds = append(s.c.p.conds, condTargets{})
 	k := int32(len(s.c.p.conds) - 1)
@@ -184,7 +186,7 @@ func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 	s.c.ins(OpJmpVoid, int32(header))
 
 	onFault := len(s.c.p.code)
-	s.c.ins(OpFault, 0)
+	s.c.ins(OpFault, s.c.p.addFaultSite(FaultCondition, "while"))
 
 	end := len(s.c.p.code)
 	s.c.p.conds[k] = condTargets{
@@ -248,6 +250,7 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 		}
 	}
 	s.c.p.readAttrs = kept
+	s.c.p.vops = vopPrefix(s.c.p.code)
 	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
 }
 
@@ -257,10 +260,45 @@ func (sp *ScriptProgram) Run(scope *classad.ClassAd) classad.Value {
 	return RunRegisters(sp.rp, scope)
 }
 
-// RunLimited is Run with an explicit instruction budget. ok=false means the script did not finish
+// RunLimited is Run with an explicit step budget. ok=false means the script did not finish
 // within it, which is a different report from a script that finished and computed ERROR.
 func (sp *ScriptProgram) RunLimited(scope *classad.ClassAd, budget int) (classad.Value, bool) {
 	return RunRegistersLimited(sp.rp, scope, budget)
+}
+
+// RunWithFault evaluates the script and reports the fault that stopped it, if one did.
+//
+// fault is nil when the script completed, whatever value it produced -- including ERROR, which an
+// expression can produce on purpose. That distinction is the reason this method exists: the value
+// alone cannot tell "the script decided the answer is ERROR" from "an if had no branch to take".
+//
+// ok=false means the step budget ran out, which is not a fault: the script did not finish, so
+// there is no site to blame. See RunRegistersLimited.
+func (sp *ScriptProgram) RunWithFault(scope *classad.ClassAd) (result classad.Value, ok bool, fault *Fault) {
+	return RunRegistersFault(sp.rp, scope, DefaultStepBudget)
+}
+
+// VecEval runs the script over a batch of n records, returning one result element per record.
+//
+// ok=false when the script uses something the vector executor does not implement, which today means
+// anything with control flow: a branch picks per record, and until the masked store is built the
+// executor has no way to run a statement for some records and not others. A script of bindings and a
+// result expression is exactly the part that needs none of that, and it is the part a constraint is
+// made of.
+//
+// A DECLINE IS NOT A WRONG ANSWER. The caller falls back to running the script per record, which is
+// the same arrangement the expression executor has had since it was written.
+func (sp *ScriptProgram) VecEval(src ColumnSource, n int, scratch *VecScratch) (*Vec, bool) {
+	if sp == nil || sp.p == nil {
+		return nil, false
+	}
+	if len(sp.p.nodes) != 0 {
+		return nil, false // a delegated subtree needs a real per-record scope
+	}
+	if scratch == nil {
+		scratch = &VecScratch{}
+	}
+	return execVec(sp.p, scratch.evaluator(), src, n, scratch, int64(n)*DefaultStepBudget)
 }
 
 // Program returns the underlying stack-form program.

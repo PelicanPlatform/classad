@@ -320,17 +320,40 @@ func (q *Query) VecEval(src ColumnSource, n int, scratch *VecScratch) (*Vec, boo
 	if scratch == nil {
 		scratch = &VecScratch{}
 	}
-	return execVec(q.prog, scratch.evaluator(), src, n, scratch)
+	return execVec(q.prog, scratch.evaluator(), src, n, scratch, int64(n)*DefaultStepBudget)
 }
 
-func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecScratch) (*Vec, bool) {
+func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecScratch, budget int64) (*Vec, bool) {
 	s.reset(n)
+	if p.hasStatements {
+		s.initPredicates()
+	}
+	// A Program the compiler built carries its charged-instruction prefix. One built by hand -- a test,
+	// or any future caller assembling instructions directly -- does not, and the alternative to
+	// building it here is an index panic inside a daemon. It is built into the SCRATCH rather than
+	// onto the Program, because a Program is read-only once compiled and that is what lets one be
+	// evaluated concurrently.
+	vops := p.vops
+	if len(vops) != len(p.code)+1 {
+		s.vopsBuf = vopPrefixInto(s.vopsBuf, p.code)
+		vops = s.vopsBuf
+	}
 	for ip := 0; ip < len(p.code); {
+		// A conditionally-executed region converging here ends before this instruction runs, so the
+		// instruction is billed to whoever was live outside it.
+		s.endPaths(vops, ip)
+		// A conditional's next path begins here, or is skipped because no record takes it.
+		if t, skipped := s.condPathAt(vops, ip); skipped {
+			ip = t
+			continue
+		}
 		// A branching construct converging here blends its paths before this instruction runs.
 		if !s.applyBlends(ip) {
 			return nil, false
 		}
 		in := p.code[ip]
+		// Statement-level control flow sets this; everything else falls through.
+		next := ip + 1
 		switch in.Op {
 		case OpPushConst:
 			if !broadcast(s.push(), p.consts[in.A]) {
@@ -361,7 +384,25 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 				return nil, false
 			}
 		case OpShortAnd, OpShortOr:
-			// No-op: see the file comment. The combine below does the work.
+			// The right operand, and the combine that follows it, are executed only for the records
+			// whose left operand has not already decided the answer. Where that is no record at all,
+			// both are skipped and the left vector stands as the result -- see vecpath.go.
+			if s.depth == 0 {
+				return nil, false
+			}
+			left := s.top()
+			left.toMask()
+			need := s.takeMask()
+			needRightPlanes(in.Op, left, need, s.n)
+			s.intersectLive(need)
+			if maskEmpty(need) {
+				s.releaseMask(need)
+				s.flushCharge(vops, ip+1)
+				s.spanStart = int(in.A) // the right operand and the combine bill nobody
+				next = int(in.A)
+				break
+			}
+			s.openPath(vops, ip+1, in.A, need)
 		case OpCombineAnd:
 			right, left := s.pop(), s.top()
 			if !logicalVec("&&", left, right) {
@@ -384,33 +425,85 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			if !callFuncVec(ev, p.funcs[in.A], s) {
 				return nil, false
 			}
+		case OpStoreLocal:
+			if s.depth == 0 || !s.storeLocal(int(in.A)) {
+				return nil, false
+			}
+		case OpLoadLocal:
+			if !s.loadLocal(int(in.A)) {
+				return nil, false
+			}
 		case OpJmpIfNotUndef:
-			// The left operand stays on the stack as the blend's selector; the fallback is evaluated
-			// unconditionally and the join picks per record.
+			// The left operand stays on the stack as the blend's selector, and the fallback runs for
+			// the records whose left operand is undefined. Where that is no record, the fallback and
+			// the blend are both skipped and the left vector stands as the result -- which is what the
+			// scalar interpreter does, since a defined left operand IS the Elvis result.
 			if s.depth == 0 {
 				return nil, false
 			}
+			need := s.takeMask()
+			undefinedPlanes(s.top(), need, s.n)
+			s.intersectLive(need)
+			if maskEmpty(need) {
+				s.releaseMask(need)
+				s.flushCharge(vops, ip+1)
+				s.spanStart = int(in.A) // the fallback and the join bill nobody
+				next = int(in.A)
+				break
+			}
 			s.pushBlend(blendPending{target: int(in.A), base: s.depth - 1})
+			s.openPath(vops, ip+1, in.A, need)
 		case OpBranchCond:
 			if s.depth == 0 {
 				return nil, false
 			}
-			s.pushBlend(blendPending{target: int(p.conds[in.A].end), base: s.depth - 1, cond: true})
+			ct := p.conds[in.A]
+			b := blendPending{target: int(ct.end), base: s.depth - 1, cond: true}
+			b.bounds = [5]int32{int32(ip + 1), ct.onFalse, ct.onUndef, ct.onError, ct.end}
+			for k := range b.masks {
+				b.masks[k] = s.takeMask()
+			}
+			condStatePlanes(s.top(), b.masks, s.n)
+			for k := range b.masks {
+				s.intersectLive(b.masks[k])
+			}
+			s.pushBlend(b)
 		case OpJmp:
-			// No-op, like the short-circuit opcodes: every path is evaluated and the join blends them.
+			// Still a no-op. It is a conditional path's tail jump, and this executor runs every path in
+			// sequence and blends at the join -- so taking the jump would skip the paths that have not
+			// run yet. The accounting it would otherwise be needed for is handled by the path regions,
+			// which end exactly where each path does.
+		case OpBranchVoid:
+			t, ok := s.enterIf(p.conds[in.A], ip)
+			if !ok {
+				return nil, false
+			}
+			next = t
+		case OpJmpVoid:
+			t, ok := s.jmpVoid(in.A)
+			if !ok {
+				return nil, false // a back edge: see vecpred.go
+			}
+			next = t
 		default:
-			return nil, false // OpEvalNode, anything added later
+			return nil, false // OpEvalNode, OpFault, anything added later
 		}
-		ip++
+		ip = next
 	}
 	// Constructs converging on the end of the program.
 	if !s.applyBlends(len(p.code)) {
 		return nil, false
 	}
-	if s.depth != 1 || len(s.blends) != 0 {
+	s.endPaths(vops, len(p.code))
+	s.flushCharge(vops, len(p.code))
+	if s.depth != 1 || len(s.blends) != 0 || len(s.preds) != 0 || len(s.paths) != 0 {
 		return nil, false
 	}
-	return s.top(), true
+	res := s.top()
+	if !s.applyFaults(res) {
+		return nil, false
+	}
+	return res, true
 }
 
 // VecScratch holds the vector stack and the evaluator so a scan reuses both across batches instead of
@@ -429,6 +522,33 @@ type VecScratch struct {
 
 	// blends are the branching constructs whose joins have not been reached, innermost last.
 	blends []blendPending
+
+	// locals are a script's bindings, one vector per local for the whole batch, and localsSet says
+	// which of them a store has reached. The vectors survive reset so a scan reuses them across
+	// blocks; the flags do not, because a binding is per batch.
+	locals    []*Vec
+	localsSet []bool
+
+	// Predication state; see vecpred.go. live and faulted are one plane each, preds is the stack of
+	// Ifs whose arms are in flight, and maskPool keeps the planes across batches.
+	live     []uint64
+	faulted  []uint64
+	preds    []predPending
+	maskPool [][]uint64
+	liveAll  bool // the live mask is the whole batch, so a store need not be masked
+	anyFault bool
+
+	// paths are the conditionally-executed regions currently open; see vecpath.go. liveCount is the
+	// number of live records, maintained at region boundaries rather than recomputed, and charge is
+	// what the batch has been billed so far.
+	paths     []pathRegion
+	liveCount int
+	charge    int64
+	// spanStart is where the current run of instructions began -- the point the charge was last
+	// flushed from. See flushCharge.
+	spanStart int
+	// vopsBuf serves a Program that arrived without its prefix; see execVec.
+	vopsBuf []int32
 }
 
 // blendPending is one branching construct whose paths are being evaluated, waiting for its join.
@@ -442,6 +562,13 @@ type blendPending struct {
 	target int  // the stack-form index this construct converges on
 	base   int  // stack slot of the selector; path values follow it
 	cond   bool // a conditional (four paths); otherwise Elvis (two)
+
+	// For a conditional: where each path starts (plus the join, so every path has an end), which
+	// records take it, and which one has not been opened yet. The masks are owned HERE rather than by
+	// the regions that borrow them, because all four outlive the paths that run one at a time.
+	bounds   [5]int32
+	masks    [4][]uint64
+	nextPath int
 }
 
 // pushBlend records a construct whose join has not been reached.
@@ -455,7 +582,9 @@ func (s *VecScratch) applyBlends(ip int) bool {
 	for len(s.blends) > 0 && s.blends[len(s.blends)-1].target == ip {
 		b := s.blends[len(s.blends)-1]
 		s.blends = s.blends[:len(s.blends)-1]
-		if !s.blend(b) {
+		ok := s.blend(b)
+		s.releaseCondMasks(&b)
+		if !ok {
 			return false
 		}
 	}
@@ -532,7 +661,103 @@ func (s *VecScratch) evaluator() *classad.Evaluator {
 
 func (s *VecScratch) reset(n int) {
 	s.depth, s.n = 0, n
+	for i := range s.blends {
+		s.releaseCondMasks(&s.blends[i])
+	}
 	s.blends = s.blends[:0]
+	for i := range s.localsSet {
+		s.localsSet[i] = false
+	}
+	s.resetPredicates()
+	s.resetPaths()
+}
+
+// storeLocal binds the top of the stack to a local, the vector form of OpStoreLocal.
+//
+// A LOCAL IS A PLACE here exactly as it is in the register lowering: one vector per local for the
+// whole script, written by this and read by loadLocal. The binding's vector is TAKEN OUT of the
+// stack and a spare put back in its slot, rather than the local keeping a pointer into the stack:
+// the stack recycles by depth, so the next push would hand the binding's own vector to the next
+// value and overwrite it. That is the same hazard blendPending documents for a selector, and the
+// same answer.
+func (s *VecScratch) storeLocal(idx int) bool {
+	if idx < 0 {
+		return false
+	}
+	for len(s.locals) <= idx {
+		s.locals = append(s.locals, nil)
+		s.localsSet = append(s.localsSet, false)
+	}
+	if !s.liveAll {
+		// Under a predicate the binding keeps the lanes this store does not reach, so the vector
+		// cannot simply be taken over. See maskedStore.
+		return s.maskedStore(idx)
+	}
+	v := s.pop()
+	// Widened here rather than carried: Raw aliases the block's own bytes, and a binding that outlives
+	// the expression that produced it is not a thing to leave pointing into storage. The widening is
+	// paid once per binding instead of once per read of it.
+	v.ensureInts()
+	spare := s.locals[idx]
+	if spare == nil {
+		spare = newVec(s.n)
+	}
+	s.stack[s.depth] = spare
+	s.locals[idx], s.localsSet[idx] = v, true
+	return true
+}
+
+// loadLocal pushes a COPY of a local's vector, the vector form of OpLoadLocal.
+//
+// A copy, not the vector itself, because the kernels are destructive in their left operand: `t + 1`
+// hands the pushed vector to binopVec, which writes the sum over it. Aliasing the binding would make
+// the first read of a local its last.
+//
+// A local no store has reached reads as UNDEFINED, which is what the register lowering's initializer
+// does for the same case.
+func (s *VecScratch) loadLocal(idx int) bool {
+	dst := s.push()
+	if idx < 0 || idx >= len(s.localsSet) || !s.localsSet[idx] {
+		fillState(dst, VsUndef)
+		return true
+	}
+	return copyVec(dst, s.locals[idx])
+}
+
+// copyVec copies src over dst, which must hold the same number of elements.
+//
+// It copies whichever form src is in rather than normalizing to one, because converting is what the
+// forms exist to avoid: a mask copies as two bitplanes, a Const as a single element, and only a data
+// vector is copied per record. The string payload is copied only when some element actually is a
+// plain string -- 16 bytes per record for a column that is all codes or all numbers is the kind of
+// work that makes a vector path slower than the row path it replaces.
+func copyVec(dst, src *Vec) bool {
+	if src == nil || dst == nil || src.n != dst.n {
+		return false
+	}
+	dst.Mask, dst.Const, dst.Dict, dst.Raw = src.Mask, src.Const, src.Dict, nil
+	if src.Raw != nil {
+		return false // the caller widens before binding; see storeLocal
+	}
+	if src.Mask {
+		copy(dst.Hi, src.Hi)
+		copy(dst.Lo, src.Lo)
+		return true
+	}
+	if src.Const {
+		// Element 0 stands for the whole batch, and the rest is garbage in both vectors.
+		dst.St[0], dst.I[0], dst.S[0] = src.St[0], src.I[0], src.S[0]
+		return true
+	}
+	copy(dst.St, src.St)
+	copy(dst.I, src.I)
+	for i := 0; i < src.n; i++ {
+		if src.St[i] == VsString {
+			copy(dst.S, src.S)
+			break
+		}
+	}
+	return true
 }
 
 func (s *VecScratch) push() *Vec {

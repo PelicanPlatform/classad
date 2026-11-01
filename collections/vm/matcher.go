@@ -34,7 +34,7 @@ func (q *Query) Matcher() *Matcher {
 func (m *Matcher) Eval(scope *classad.ClassAd) (result classad.Value) {
 	m.ev.SetScope(scope)
 	defer classad.RecoverCyclic(&result)
-	result, m.stack = exec(m.prog, m.ev, m.stack)
+	result, m.stack, _, _ = exec(m.prog, m.ev, m.stack, DefaultStepBudget)
 	return result
 }
 
