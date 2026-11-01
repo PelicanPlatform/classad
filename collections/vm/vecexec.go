@@ -333,6 +333,15 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 	// building it here is an index panic inside a daemon. It is built into the SCRATCH rather than
 	// onto the Program, because a Program is read-only once compiled and that is what lets one be
 	// evaluated concurrently.
+	// The per-record share of the batch budget, which is what bounds a loop: every live record in a
+	// loop is on the same trip, so one counter per loop is already a per-record trip count.
+	perRecord := budget
+	if n > 0 {
+		perRecord = budget / int64(n)
+	}
+	if perRecord < 1 {
+		perRecord = 1
+	}
 	vops := p.vops
 	if len(vops) != len(p.code)+1 {
 		s.vopsBuf = vopPrefixInto(s.vopsBuf, p.code)
@@ -474,15 +483,30 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			// run yet. The accounting it would otherwise be needed for is handled by the path regions,
 			// which end exactly where each path does.
 		case OpBranchVoid:
-			t, ok := s.enterIf(p.conds[in.A], ip)
+			ct := p.conds[in.A]
+			var t int
+			var ok bool
+			if ct.loop {
+				t, ok = s.stepLoop(vops, ct, ip, perRecord)
+			} else {
+				t, ok = s.enterIf(vops, ct, ip)
+			}
 			if !ok {
 				return nil, false
 			}
 			next = t
 		case OpJmpVoid:
-			t, ok := s.jmpVoid(in.A)
+			if s.atLoopHeader(in.A) {
+				// A loop's back edge. Nothing between here and the header runs, so nothing there is
+				// billed; the header itself settles the rest.
+				s.flushCharge(vops, ip+1)
+				s.spanStart = int(in.A)
+				next = int(in.A)
+				break
+			}
+			t, ok := s.jmpVoid(vops, ip, in.A)
 			if !ok {
-				return nil, false // a back edge: see vecpred.go
+				return nil, false
 			}
 			next = t
 		default:
@@ -496,7 +520,7 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 	}
 	s.endPaths(vops, len(p.code))
 	s.flushCharge(vops, len(p.code))
-	if s.depth != 1 || len(s.blends) != 0 || len(s.preds) != 0 || len(s.paths) != 0 {
+	if s.depth != 1 || len(s.blends) != 0 || len(s.preds) != 0 || len(s.paths) != 0 || len(s.loops) != 0 {
 		return nil, false
 	}
 	res := s.top()
@@ -532,6 +556,7 @@ type VecScratch struct {
 	// Predication state; see vecpred.go. live and faulted are one plane each, preds is the stack of
 	// Ifs whose arms are in flight, and maskPool keeps the planes across batches.
 	live     []uint64
+	baseLive []uint64 // the batch-wide mask this scratch owns; s.live aliases it or a region's
 	faulted  []uint64
 	preds    []predPending
 	maskPool [][]uint64
@@ -549,6 +574,9 @@ type VecScratch struct {
 	spanStart int
 	// vopsBuf serves a Program that arrived without its prefix; see execVec.
 	vopsBuf []int32
+
+	// loops are the While regions whose trips are in flight; see vecloop.go.
+	loops []loopRegion
 }
 
 // blendPending is one branching construct whose paths are being evaluated, waiting for its join.
@@ -715,6 +743,7 @@ func (s *VecScratch) reset(n int) {
 	}
 	s.resetPredicates()
 	s.resetPaths()
+	s.resetLoops()
 }
 
 // storeLocal binds the top of the stack to a local, the vector form of OpStoreLocal.

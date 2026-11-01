@@ -28,6 +28,17 @@ type funcInfo struct {
 // order its tail.
 type condTargets struct {
 	onFalse, onUndef, onError, end int32
+
+	// loop marks a While's header rather than an If's branch. The two are told apart explicitly
+	// because the vector executor runs them differently -- an If evaluates both arms once, a loop
+	// re-enters this instruction with a smaller live set until none is left -- and the shapes are
+	// otherwise distinguishable only by the accident that a While's false target IS its end, which
+	// is a property of today's lowering rather than a rule.
+	loop bool
+
+	// header is the instruction a loop's condition starts at, which is where its back edge lands.
+	// Zero for an If.
+	header int32
 }
 
 // refInfo is a pooled attribute reference (name + scope) targeted by OpLoadRef.

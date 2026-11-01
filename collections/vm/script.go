@@ -191,6 +191,7 @@ func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 	end := len(s.c.p.code)
 	s.c.p.conds[k] = condTargets{
 		onFalse: int32(end), onUndef: int32(onFault), onError: int32(onFault), end: int32(end),
+		loop: true, header: int32(header),
 	}
 	return s
 }
