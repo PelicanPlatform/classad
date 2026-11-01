@@ -1381,9 +1381,9 @@ the concrete payoff of §2.6's rule that registrations are declared to the compi
    report — so F1–F4 are currently one undifferentiated outcome, and the per-record model of §2.2 is
    entirely unbuilt.
 
-### 11.4 Two findings from building it
+### 11.4 Three findings from building it
 
-Neither is a design change; both are the kind of thing this document exists to keep.
+None is a design change; all three are the kind of thing this document exists to keep.
 
 - **A real-arithmetic divergence, found by the parity fuzzer rather than by reading.** A real result
   that overflows to `+Inf` is `ERROR` in the reference while `-Inf` and NaN are not; the vector path
@@ -1397,6 +1397,21 @@ Neither is a design change; both are the kind of thing this document exists to k
   `collections/vm/plan.go:97-101`). §6.6 should absorb the general form: CSE and every other pass
   that reasons about a read set inherits this precondition, and `eval()` is the one construct that
   violates it.
+- **A blend dropped the dictionary its codes belonged to, and answered ERROR.** Found while reading
+  `blend` for §14.2, which proposes generalizing it into the masked store. The join built its result
+  with `Dict` set to nil and then copied each chosen element with `CopyElem`, which preserves a
+  dictionary *code*; a code with no dictionary resolves as ERROR, so over a dictionary-encoded string
+  column every record of `Owner ?: "nobody"` evaluated to ERROR. Not a decline — `Native()` admits
+  both Elvis and the conditional, and the columnar count path takes the result, so a constraint built
+  on one returned a **wrong count**. Fixed by having the result adopt one source's dictionary and
+  resolve every code that came from another.
+
+  The general form is worth carrying into §14.2, because the masked store inherits it exactly: a Vec
+  carries meaning outside its own elements — a dictionary, a `Const` flag, a `Raw` width — and
+  **moving an element between vectors is not the same operation as moving its value**. A store that
+  scatters elements into a destination has to answer, for each of those, whether the destination can
+  mean the same thing by them. The non-materialized representations of §6.5 are what make this a
+  recurring hazard rather than a one-off bug.
 
 ---
 
@@ -1411,9 +1426,25 @@ needs it.
    condition was undefined" until the fault mask and the per-site report exist. Cheap — `VsError` and
    `mError` already exist — and it cannot be retrofitted around.
 2. **Predication for statements, and the masked blend (§2.3).** The one genuinely new runtime
-   primitive. Half of it is already there: `blend` (`collections/vm/vecexec.go:443`) selects per record
-   at a join. What it lacks is the mask *stack* and the rule that assignment under a predicate leaves
-   non-live lanes untouched. Note S2 — this is in addition to blending, not a replacement for it.
+   primitive. Two of its three parts now exist. `blend` (`collections/vm/vecexec.go:443`) selects per
+   record at a join; and **bindings** are vectors — `OpStoreLocal` and `OpLoadLocal` are served, so a
+   script with no control flow runs on the vector path. What is still missing is the mask *stack* and
+   the rule that assignment under a predicate leaves non-live lanes untouched. Note S2 — this is in
+   addition to blending, not a replacement for it.
+
+   The binding half settled two things the predicated half will build on. A local is a **place** here
+   as it is in the register lowering — one vector per local for the batch — which is what makes a
+   store under a predicate expressible at all: there is a destination to leave untouched. And a read
+   of a local is a **copy**, forced by §14.7: the kernels write over their left operand, so aliasing a
+   binding would make its first read its last. That copy is the measured price of the whole model, and
+   it is small: ~3 ns/element for a binding read once, against a 1.9x *win* for a binding read twice,
+   where substituting it would compute the subexpression twice. A masked store writes into the same
+   place and so inherits the same copy discipline.
+
+   The remaining gap is narrow and specific: a read of a local no store has reached is UNDEFINED, and
+   that answer is already pinned — but **no script the compiler can emit produces that shape**, because
+   a name is not a local until `Let` has bound it. Only a branch does. So the answer is pinned today by
+   hand-built programs, and predication is what makes it reachable.
 3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Required *before* O3, not
    after: budget consumption is one of the four quantities scalar and vector execution are supposed to
    agree on elementwise, and it is the one that localizes a bug the values alone would hide.
@@ -1704,3 +1735,18 @@ ownership analysis is the optimization *of* CSE, not its precondition.
 asked for, and write the destructiveness into each kernel's. The kernels' behaviour is currently
 discoverable only by reading their bodies, and it is the kind of contract that a future caller
 violates once and silently.
+
+**Since written, the first caller to hit consequence 1 chose the copy, and it is cheap.** Serving
+`OpLoadLocal` is exactly the case this section describes: a binding is live across its reads, so a
+read that handed the kernel the binding's own vector would corrupt it, and `t + t` would answer `4t`
+rather than `2t`. `loadLocal` copies, and `copyVec` copies the *form* rather than normalizing one —
+a mask as two bitplanes, a `Const` as a single element, the string payload only when some element is
+actually a string. Measured at 8192 records, that copy is ~3 ns/element against the equivalent
+inlined expression, against a 1.9x win where the binding is read twice. So the prediction above
+holds in the one case now built: "copy when the operand is live" is affordable, and the ownership
+rule that would avoid the copy is an optimization rather than a precondition.
+
+That is evidence for D2a's default, not a proof of it. The binding case is the *easy* one — a local
+is live by definition, so there was no coalescing decision to get wrong. The case that still has to
+be decided rather than discovered is the ordinary `Dst = op(A, B)` where `A` is dying: that is where
+a wrong answer is silent.
