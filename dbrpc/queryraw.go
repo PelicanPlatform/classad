@@ -705,29 +705,48 @@ func (s *Server) streamQueryRawWireOpt(ctx context.Context, reqID uint64, r *rea
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	ref, ok := s.tableRefOr(reqID, wireOp(chaseRefs), table, write)
-	if !ok {
-		return
-	}
+	ref := s.resolveTable(table)
 	if ref.seals() {
-		// A continuous aggregate that has sealed holds half its rows in an archive, and an
-		// archive serves no wire-form rows -- so this op cannot produce the whole view. It
-		// declines exactly as a table that serves no wire rows at all does, which sends the
-		// client to the text projection, where both halves are read. Streaming the backing's
-		// wire rows instead would be fast and short.
+		// A continuous aggregate that has sealed holds half its rows in its backing table
+		// and half in an archive, and this op reads ONE source -- so it cannot produce the
+		// whole view. It declines the way a table that serves no wire rows at all does,
+		// which sends the client to the text projection, where both halves are read.
+		// Unioning the two here would be fast and short, and is not done yet.
+		//
+		// This is now the only reason an archive-adjacent table declines: a plain archive
+		// is served below.
 		write(respBad(reqID))
 		return
 	}
-	d := ref.db
 	var seq iter.Seq[[]byte]
 	var err error
-	switch {
-	case chaseRefs:
-		seq, err = d.QueryRawWireRefsStats(constraint, attrs, redact, stats)
-	case stats != nil:
-		seq, err = d.QueryRawWireStats(constraint, attrs, redact, stats)
+	switch ref.kind {
+	case kindTable, kindView:
+		switch {
+		case chaseRefs:
+			seq, err = ref.db.QueryRawWireRefsStats(constraint, attrs, redact, stats)
+		case stats != nil:
+			seq, err = ref.db.QueryRawWireStats(constraint, attrs, redact, stats)
+		default:
+			seq, err = ref.db.QueryRawWire(constraint, attrs, redact)
+		}
+	case kindArchive:
+		// An archive is the storage form wire rows suit BEST -- its records already carry
+		// inline names, so a row is assembled by slice copies with no intern table to
+		// consult -- and it was the one kind this op refused. `history` was therefore the
+		// only table a consumer could not read without the render-and-reparse round trip,
+		// which is most of what such a read costs.
+		switch {
+		case chaseRefs:
+			seq, err = ref.arch.QueryRawWireRefsStats(constraint, attrs, redact, stats)
+		case stats != nil:
+			seq, err = ref.arch.QueryRawWireStats(constraint, attrs, redact, stats)
+		default:
+			seq, err = ref.arch.QueryRawWire(constraint, attrs, redact)
+		}
 	default:
-		seq, err = d.QueryRawWire(constraint, attrs, redact)
+		write(respErr(reqID, "no such table: "+table))
+		return
 	}
 	if errors.Is(err, db.ErrRawWireUnsupported) {
 		// Not a failure: this table cannot produce self-contained rows (it is in
