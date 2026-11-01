@@ -9,7 +9,7 @@ order, and §13 states the one piece nothing here covers.
 
 This document exists so the semantics and the compilation model are argued before a parser or a code
 generator is written — which is still how the work is going: there is no surface syntax yet, by
-design (§12, item 8).
+design (§12, item 7).
 
 **What it is:** a small imperative language whose *expressions* are ClassAd expressions and which
 adds statements — assignment, conditionals, iteration, functions. Python-shaped surface, ClassAd
@@ -1341,22 +1341,28 @@ real reasons were these.
   this is a pass that would be deleted rather than improved.
 - Copy propagation only fires in straight-line regions, because without single assignment it has to
   bail at every jump target (§14's S4). Under SSA it would fire across joins.
-- **The one that matters, and it points the other way from the rest of this document.** A place's live
-  range is the entire program by construction. §6.1's whole argument is that peak live bytes is the
-  dominant cost because a register is ~200 KiB at *n* = 8192 — so places *maximize* precisely the
-  quantity the design says to minimize. In the scalar machine a register holds one `classad.Value` and
-  this is free, which is why it has not bitten yet. In the vector machine it pins 200 KiB per local for
-  the whole script.
+**A third cost I claimed here, and then measured, and it is not real.** The claim was that a place's
+live range must be the entire program by construction, so places *maximize* peak live bytes — the
+quantity §6.1 identifies as dominating cost. **Liveness says otherwise.** It is a property of
+definition and use positions rather than of names: `liveIn = uses u (liveOut \ def)` kills a register
+at its next definition and after its last read whether or not the same name is reused later. Eight
+locals bound in a chain with only the last read hold **two** registers live at a time, not eight; eight
+locals all read at the end hold nine, and that nine is inherent because the sum needs every operand at
+once. Both numbers are pinned by `TestPlacesDoNotInflatePeakLive`.
 
-**So this is the decision to revisit before D2a, not after it**, and the argument for SSA is stronger
-than §6.2 made it: a phi has *two* lowerings here, and the vector one already exists. Scalar, a phi
-becomes moves at the predecessors — which is what `joinPoint` emits by hand today. Vector, it becomes
-a **blend under the live mask**, which is §14.2's primitive. One representation, two lowerings, and
-liveness computed over real live ranges instead of program-wide ones. The route is a separate pass
-over the completed program rather than work inside the incremental builder: `stackJumpTargets`
-(`collections/vm/regir.go:258`) already finds the block boundaries, so the missing pieces are
-dominance, phi insertion and renaming. The current form stays as the oracle — which is exactly what
-§7.4 is for.
+The generalization those numbers only check: **at a join SSA is weakly *worse* for this quantity**,
+because a phi needs both of its operands live simultaneously while a place has already merged them
+into one register. And for the vector target specifically, §14.2's masked store needs a destination
+that persists across the join — which is what a place is.
+
+**So places are not the thing to fix before D2a, and §12 is ordered accordingly.** What SSA is still
+worth is naming for CSE and the interference structure a register allocator wants; what it is not
+worth is peak live bytes. Note also that the two costs above are real but were *both* paid off without
+SSA: dominance replaced `localsNeedingInit`'s approximation and copy propagation's straight-line
+condition, so the passes that places were blocking are unblocked. If SSA is built later the route is a
+separate pass over the completed program rather than work inside the incremental builder, the CFG
+already exists, and a phi has two lowerings — moves at the predecessors scalar, a blend under the live
+mask vector.
 
 **S2 — Expression-level branches vectorize by *blending*, not by predication.** §2.3 says control
 flow is predication. What actually shipped for `?:` and `ifThenElse` evaluates **both paths
@@ -1439,37 +1445,36 @@ Ordered by dependency rather than by appeal. The notable thing about the order i
 path to the database payoff does not pass through syntax at all** — D3 is last, and nothing above it
 needs it.
 
-1. **SSA construction over the register form (§6.2), which the implementation skipped.** Ahead of the
-   rest because it changes the IR everything below it encodes against, and because S1's places
-   *maximize* peak live bytes — the quantity §6.1 identifies as dominating cost. Free to defer while a
-   register holds one `classad.Value`; not free once a register is 200 KiB. Two steps, and the first
-   is useful on its own: a real CFG with dominators, replacing `localsNeedingInit`'s conservative
-   "any jump target between the store and the read" with actual dominance, which removes the spurious
-   second definitions that currently block copy propagation; then renaming and phi insertion, which is
-   what buys real live ranges. A phi lowers two ways — moves at the predecessors scalar (what
-   `joinPoint` already emits by hand), a blend under the live mask vector (§14.2) — so one
-   representation serves both executors.
-2. **The per-record fault model (§2.2).** Next, because it is a *representation* decision that
+0. **Done, and recorded here because it changed this list twice.** A real CFG with dominators, and
+   liveness over it. The CFG replaced two approximations — `localsNeedingInit`'s "any jump target
+   between the store and the read" and copy propagation's straight-line condition — with actual
+   dominance, and fixed a bug where the control-flow opcodes claimed to define register 0, which is
+   the first local, so copy propagation silently refused it in every script with a branch. Measured on
+   24 bind/branch/read scripts: initializers 25 → 1, optimized instruction count 288 → 242. Liveness
+   then **refuted the reason I had put SSA first** (see S1), so SSA is no longer at the head of this
+   list. The lesson worth keeping: §6.1's argument is quantitative, so a priority derived from it
+   should be measured before it is acted on.
+1. **The per-record fault model (§2.2).** First, because it is a *representation* decision that
    everything below it encodes: a vector executor for statements has nowhere to put "this record's
    condition was undefined" until the fault mask and the per-site report exist. Cheap — `VsError` and
    `mError` already exist — and it cannot be retrofitted around.
-3. **Predication for statements, and the masked blend (§2.3).** The one genuinely new runtime
+2. **Predication for statements, and the masked blend (§2.3).** The one genuinely new runtime
    primitive. Half of it is already there: `blend` (`collections/vm/vecexec.go:443`) selects per record
    at a join. What it lacks is the mask *stack* and the rule that assignment under a predicate leaves
    non-live lanes untouched. Note S2 — this is in addition to blending, not a replacement for it.
-4. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Required *before* O3, not
+3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Required *before* O3, not
    after: budget consumption is one of the four quantities scalar and vector execution are supposed to
    agree on elementwise, and it is the one that localizes a bug the values alone would hide.
-5. **O3 itself (§7.3).** The deliverable that proves the retarget. Everything above exists to make it
+4. **O3 itself (§7.3).** The deliverable that proves the retarget. Everything above exists to make it
    a real test rather than a tautology.
-6. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
+5. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
    both need the vector path to exist before they mean anything — a form is a property of a `Vec`, and
    a deferred load defers a decompression. Measured context for sizing: roughly 78% of mutable read
    CPU is zstd, so a load not performed is worth more than any amount of arithmetic removed.
-7. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
+6. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
    blocks the database use, and `for` over a *per-record* list stays declined (§2.3) until open
    question 4 gets its density argument.
-8. **D3, the lexer and parser.** Last on purpose. Every semantic question above is answerable through
+7. **D3, the lexer and parser.** Last on purpose. Every semantic question above is answerable through
    the builder API, and holding syntax back keeps the §4 lexical argument free to change.
 
 Two items on §6.8's list have been partly overtaken and should be re-costed rather than built as
