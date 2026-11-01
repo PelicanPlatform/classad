@@ -138,6 +138,7 @@ type JoinStats struct {
 	ScanRows int // rows streamed from the other side
 	Pairs    int // candidate pairs examined
 	Rows     int // joined rows produced
+	Groups   int // groups a reduced join returned (0 when the rows were not reduced)
 	Err      error
 
 	// ProbeAttr and ProbeKeys describe an index-based equi join: the attribute the hashed
@@ -170,7 +171,16 @@ type joinPlan struct {
 // before any row. A limit met part way through is reported in stats.Err, because by then the
 // sequence has already yielded rows and has no other way to say it stopped early.
 func (cat *Catalog) Join(spec JoinSpec, want JoinLimits, stats *JoinStats) (iter.Seq[*classad.ClassAd], error) {
-	p, err := compileJoin(spec, DefaultJoinLimits().clamp(want))
+	return cat.joinWith(spec, DefaultJoinLimits().clamp(want), stats)
+}
+
+// joinWith is Join with the limits already settled, so a caller whose rows do not cross a
+// wire can run the same join under its own defaults (see DefaultJoinAggLimits) without
+// DefaultJoinLimits being applied on top of them. It clamps nothing: every caller clamps
+// against its own defaults before it gets here, which is what keeps "a caller can only ask
+// for less" a property of every entry point rather than of this one.
+func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats) (iter.Seq[*classad.ClassAd], error) {
+	p, err := compileJoin(spec, limits)
 	if err != nil {
 		return nil, err
 	}
