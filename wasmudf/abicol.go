@@ -267,11 +267,12 @@ func recordException(st []uint8, i int, s uint8, exc []uint64) (int, Reason) {
 // implicit because the load-time sizing happens before the guest has reported its
 // version, and the direction of that inequality is what makes that safe.
 func colRegionBytes(n, argc int) int {
-	per := align8(uint32(n) * 8)
+	// One state byte, padded so the payloads that follow it are 8-byte aligned,
+	// then the payloads. The result has the same shape as an argument.
+	per := 8 + align8(uint32(n)*8)
 	total := uint32(argc+1)*descSize +
 		align8(uint32(maskWords(n))*8) + // decline mask
-		uint32(argc)*per + // arguments
-		8 + per // the result's single state byte, then its payloads
+		uint32(argc+1)*per // the arguments, then the result
 	return int(total)
 }
 

@@ -448,6 +448,30 @@ func TestColumnStateScan(t *testing.T) {
 	}
 }
 
+// TestColumnarFullWidthBatchFitsItsRegion -- the region is sized at load from the
+// version 1 frame, before the guest has said which version it speaks, so a
+// version 2 frame at the full configured width has to fit in it. If it did not,
+// nothing would fail: the batch would decline, the engine would fall back, and
+// the only symptom would be that the vector path was off.
+func TestColumnarFullWidthBatchFitsItsRegion(t *testing.T) {
+	const n = 4096
+	u := loadFixture(t, Options{MaxBatch: n}, "colvecconst", 2, 2)
+	k := constIntBatch(3, n)
+	xs := intBatch(make([]int64, n)...)
+	for i := range n {
+		xs.I[i] = int64(i)
+	}
+	out := outBatch(n)
+	if !u.CallBatch([]Batch{k, xs}, out) {
+		t.Fatalf("declined a full-width batch: %v", u.Stats().ByReason)
+	}
+	for _, i := range []int{0, 1, n / 2, n - 1} {
+		if out.St[i] != vsInt || out.I[i] != int64(i)*3 {
+			t.Errorf("element %d: state %d value %d, want integer %d", i, out.St[i], out.I[i], int64(i)*3)
+		}
+	}
+}
+
 // TestColumnarRegionFitsInsideTheVersionOneSizing -- the host region is sized at
 // load, before the guest has reported its version, so a version 2 frame has to be
 // no larger than the version 1 frame it was sized for. It is, because a columnar
