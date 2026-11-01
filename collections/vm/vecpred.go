@@ -17,7 +17,7 @@ import "math/bits"
 // and needs the (hi,lo) pair of vecmask.go.
 //
 // THE FAULT PLANE is one bit per record and MONOTONE: once a record faults it is done for the rest of
-// the script (§2.2's rule), and its answer is ERROR however the remaining statements turn out. A
+// the script, and its answer is ERROR however the remaining statements turn out. A
 // condition that is neither true nor false -- UNDEFINED, a string, a list -- faults the records it is
 // neither for, and does not pick a branch for them.
 //
@@ -36,8 +36,9 @@ import "math/bits"
 // anyway, for two reasons that are not visible yet. They stop the executor doing work for records
 // that are finished, which is the point of predication; and they become load-bearing the moment
 // anything consults the live mask for something other than a store -- an early exit when no record
-// is live, or compaction, both of which §14.3 says is where predication starts to pay. A rule that
-// is merely redundant today is cheaper to keep than to rediscover.
+// is live, or compaction. Those are also the only things that make predication FASTER than running
+// every record through every arm, so the masks will be read for more than a store before long. A rule
+// that is merely redundant today is cheaper to keep than to rediscover.
 //
 // WHAT IS NOT HERE. A loop. `While` has a back edge, so its live mask narrows across iterations and
 // the loop runs until no record is still true -- which needs the per-record trip accounting that the
@@ -304,7 +305,7 @@ func (s *VecScratch) maskedStore(idx int) bool {
 }
 
 // applyFaults forces every faulted record's result to ERROR, which is the script's answer for a
-// record whose condition it could not evaluate (§2.2).
+// record whose condition it could not evaluate.
 //
 // Applied once at the end rather than as each fault happens: the statements after the fault still run
 // for the other records, and the faulted record's own result is whatever they left behind, which is
