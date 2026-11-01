@@ -303,6 +303,34 @@ const (
 	// bounds would.
 	// [table][sampleMax i32] -> [json AttrTypeReport]
 	opAttrTypes op = 68
+
+	// opJoin joins two tables inside the store and streams the joined rows.
+	//
+	// A joined row is a ClassAd whose members are the two sides under their aliases, so the
+	// ON condition and the residual WHERE are ordinary ClassAd expressions over one ad and
+	// cross the wire as their own text. The server compiles and evaluates them; it does not
+	// learn a SQL dialect.
+	//
+	// The CALLER supplies the plan -- which conjuncts went to which side, which equalities
+	// drive the hash -- because that splitting is settled and identical wherever it runs,
+	// and re-deriving it here would be a second implementation of the same rules. What the
+	// opcode buys is that only the JOINED rows cross: a client join must fetch both sides
+	// whole and pair them at the far end, which measures a flat ~2.2x on a narrow projection
+	// and ~4.2x unprojected, before any network. It also holds one side instead of two.
+	//
+	// Limits are the server's own and a request can only ask for less, so a caller cannot
+	// ask a daemon to hold or produce an unbounded amount. A limit met part way through is
+	// reported as an stErr AFTER the rows already sent, which the streaming client surfaces
+	// as an error on a partial result -- a truncated join must not read as a complete one.
+	//
+	// Separate opcode (not a flag on a query op) so an older server rejects it as a bad
+	// request and the client falls back to joining the two sides itself.
+	// [kind u8][limit i32][maxHash i32][maxPairs i32][maxRows i32]
+	//   [lTable][lAlias][lConstraint][lNAttrs i32]{[attr]}
+	//   [rTable][rAlias][rConstraint][rNAttrs i32]{[attr]}
+	//   [nCond i32]{[expr]}[nPost i32]{[expr]}[nEqui i32]{[left][right]}
+	//     -> stream of [adText]
+	opJoin op = 69
 )
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
@@ -457,6 +485,8 @@ func (o op) String() string {
 		return "QueryRawWire"
 	case opQueryRawWireOpts:
 		return "QueryRawWireOpts"
+	case opJoin:
+		return "Join"
 	}
 	return "op(unknown)"
 }

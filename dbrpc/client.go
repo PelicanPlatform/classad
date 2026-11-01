@@ -650,7 +650,12 @@ func (c *Client) streamCtx(ctx context.Context, build func(id uint64) []byte) ([
 			switch status {
 			case stStream:
 				out = append(out, body.str())
-			case stErr:
+			case stErr, stBadReq:
+				// stBadReq is also how a server REJECTS AN OPCODE IT DOES NOT KNOW, which
+				// is the fallback signal for every op introduced after a peer was built.
+				// Dropping it here left the caller waiting for a stream terminator that
+				// was never coming: an older server hung the client instead of being
+				// detected. streamEachCursor got this right; these did not.
 				return out, statusErr(status, body)
 			}
 		}
@@ -708,7 +713,9 @@ func (c *Client) streamEachStats(ctx context.Context, build func(id uint64) []by
 				if onStats != nil {
 					onStats(body)
 				}
-			case stErr:
+			case stErr, stBadReq:
+				// See streamCtx: stBadReq is the unknown-opcode signal, and ignoring it
+				// hangs the caller against a server that does not implement the op.
 				return statusErr(status, body)
 			}
 		}
