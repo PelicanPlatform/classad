@@ -1,7 +1,15 @@
 # ClassAd Script — design
 
-**Status:** design proposal. Nothing implemented. This document exists so the semantics and the
-compilation model are argued before a parser or a code generator is written.
+**Status:** partly implemented. The scalar register machine, the binding model, `if`/`while`, two
+optimizer passes and the O2 reduction law are on `main`; the vector path for scripts, the per-record
+fault model and the rest of the optimizer are not. **§11 is the ledger** — what exists, with
+citations; the decisions taken while building that are not in §9; and the claims in §§2-6 that
+building has since made false. Read it before trusting the prose. §12 says what is left and in what
+order, and §13 states the one piece nothing here covers.
+
+This document exists so the semantics and the compilation model are argued before a parser or a code
+generator is written — which is still how the work is going: there is no surface syntax yet, by
+design (§12, item 7).
 
 **What it is:** a small imperative language whose *expressions* are ClassAd expressions and which
 adds statements — assignment, conditionals, iteration, functions. Python-shaped surface, ClassAd
@@ -1262,3 +1270,293 @@ switchable; form selection first, then liveness and allocation, then compaction,
    first. Is the `faulted` mask enough for consumers, or does a host need per-record sites?
 6. **Budget defaults.** The numbers in §3 are unset on purpose; derive them from the O4 corpus.
 7. **Naming.** "ClassAd Script" is a placeholder.
+
+---
+
+## 11. Implementation status, 2026-11-01
+
+Everything above §11 was written before any of it existed, and enough now exists that a reader
+cannot tell from the prose which parts are code and which are still argument. This section is the
+ledger. Every "shipped" claim is on `main` with a citation; §11.3 lists the places where the prose
+above is now **wrong**, and should be trusted over it.
+
+The short version: the scalar register machine, its two optimizer passes, the binding model and the
+O2 reduction law are real. The vector path for *scripts* is not built at all — what landed in the
+vector path is a widening of what an **expression** can contain, which is a prerequisite for it and
+is worth more on its own than it looks (§11.1, last row).
+
+### 11.1 Shipped
+
+| From | What | Where |
+|---|---|---|
+| D7 | Whole program → one instruction stream over a register file, with its own opcode set | `collections/vm/regir.go:49-125`, `:188` |
+| D17 | The unoptimized register interpreter, and it is in fact used as the optimizer's oracle | `collections/vm/regir.go:636`, `collections/vm/optimize_test.go:28-51` |
+| D8 | Expression leaves still lower through the existing `compile.go`, unforked | `collections/vm/script.go:215-226` |
+| D5 | Binding model: bare name is a local, locals fold case-insensitively, a scoped reference is always the attribute, `x = x + 1` reads the attribute and binds the local | `collections/vm/script.go:75-111`, pinned by `collections/vm/script_test.go:134` |
+| §2.1 | Statement layer exists: `Let`, `If`/`else`, `While`, `Result` | `collections/vm/script.go:75,113,164,197` |
+| §3 | A *deterministic* budget, with the no-wall-clock rule held | `collections/vm/regir.go:651,661` |
+| O2 | The reduction law — a script of local bindings plus a result equals `classad.Eval` of the inlined expression — as a corpus test and a fuzzer | `collections/vm/script_test.go:39-63,112` |
+| §6.8.8 | Dead code elimination | `collections/vm/optimize.go:290` |
+| D18 | Per-pass switches, with the zero value running nothing, and a test that the zero value is inert | `collections/vm/optimize.go:27-37`, `collections/vm/optimize_test.go:178` |
+| §2.6 | Host-registered functions, with both guards: a built-in name is refused, and the registration must satisfy the strictness contract | `classad/udf.go:100`, `classad/vm_support.go:277-289` |
+| §6.8.12 | The *built-in half* of the regexp LICM case: a compile cache, measured at 7.2x–16.5x on the call | `classad/regexpcache.go` |
+| §5.2 | Native calls, `member`, `stringListMember` over a constant list, `ifThenElse`, and Elvis all execute in the **vector** path, where before them a function call forced the whole expression off it | `collections/vm/vecexec.go:346-372` |
+
+That last row is the one with the most leverage and the least to show for itself in this document.
+`Query.Native()` gates every columnar accelerator, and before this work *any* function call in a
+constraint turned it off. Widening what the vector path accepts therefore buys the accelerators on
+expressions that previously fell to the row scan — a bigger effect than making any single opcode
+faster, and the reason the UDF question and the script question turned out to be the same question.
+
+### 11.2 Decisions made while building, which belong in §9 and were not in the draft
+
+**S1 — Locals are places, not bindings, and §6.2 promised SSA.** One register per local for the
+whole program (`collections/vm/regir.go:146-152`), written by `OpStoreLocal` and read by
+`OpLoadLocal` (`collections/vm/opcode.go:104-124`). So **the register form is not SSA for locals**,
+and a pass must count definitions rather than assume single assignment, which is what `defCounts`
+exists for (`collections/vm/optimize.go:98-107`).
+
+This was a choice and not a necessity, and it is worth being exact about, because an earlier draft of
+this section justified it by saying SSA "cannot express a binding made on one path of a branch and
+read after the join without a phi." That is backwards: a phi is *exactly* how SSA expresses it. The
+real reasons were these.
+
+- **For expressions, the lowering is already phi elimination.** `LowerToRegisters` is a single forward
+  pass that pre-allocates a join's destination and has every path write it
+  (`collections/vm/regir.go:330-336` — `joinPoint`). That is what phi *elimination* produces, as
+  parallel copies at the predecessors, and elimination is mandatory before anything can execute
+  because no machine runs a phi. Building SSA and then eliminating it would have produced the same
+  instructions through two more passes.
+- **For loops, places avoid the one hard case.** A loop-carried value is where SSA construction is
+  genuinely fiddly, and a place needs no phi on a back edge at all: the register is simply written
+  each time round. `While`'s own comment says so.
+- **Nothing had asked for a CFG.** The lowerer has no basic blocks and no dominance, because no pass
+  needed them yet.
+
+**What it has cost so far**, concretely rather than in principle:
+
+- `localsNeedingInit` (`collections/vm/regir.go:223-255`) is a **hand-rolled conservative stand-in for
+  dominance**: it inserts an UNDEFINED initializer whenever the first store is after a read, or
+  whenever any jump target sits between the store and the read. Dominance answers that exactly, so
+  this is a pass that would be deleted rather than improved.
+- Copy propagation only fires in straight-line regions, because without single assignment it has to
+  bail at every jump target (§14's S4). Under SSA it would fire across joins.
+**A third cost I claimed here, and then measured, and it is not real.** The claim was that a place's
+live range must be the entire program by construction, so places *maximize* peak live bytes — the
+quantity §6.1 identifies as dominating cost. **Liveness says otherwise.** It is a property of
+definition and use positions rather than of names: `liveIn = uses u (liveOut \ def)` kills a register
+at its next definition and after its last read whether or not the same name is reused later. Eight
+locals bound in a chain with only the last read hold **two** registers live at a time, not eight; eight
+locals all read at the end hold nine, and that nine is inherent because the sum needs every operand at
+once. Both numbers are pinned by `TestPlacesDoNotInflatePeakLive`.
+
+The generalization those numbers only check: **at a join SSA is weakly *worse* for this quantity**,
+because a phi needs both of its operands live simultaneously while a place has already merged them
+into one register. And for the vector target specifically, §14.2's masked store needs a destination
+that persists across the join — which is what a place is.
+
+**So places are not the thing to fix before D2a, and §12 is ordered accordingly.** What SSA is still
+worth is naming for CSE and the interference structure a register allocator wants; what it is not
+worth is peak live bytes. Note also that the two costs above are real but were *both* paid off without
+SSA: dominance replaced `localsNeedingInit`'s approximation and copy propagation's straight-line
+condition, so the passes that places were blocking are unblocked. If SSA is built later the route is a
+separate pass over the completed program rather than work inside the incremental builder, the CFG
+already exists, and a phi has two lowerings — moves at the predecessors scalar, a blend under the live
+mask vector.
+
+**S2 — Expression-level branches vectorize by *blending*, not by predication.** §2.3 says control
+flow is predication. What actually shipped for `?:` and `ifThenElse` evaluates **both paths
+unconditionally** and selects per record at the join (`collections/vm/vecexec.go:358-372`, blend at
+`:443`). That is sound *precisely because* expressions are total and pure (§2.1): evaluating a path
+no record took cannot fault, cannot mutate, and costs only time.
+
+It does not generalize, and the distinction needs to be written down before either half is extended.
+A `while` body cannot be evaluated unconditionally — it has no bound — and a statement region cannot
+be once mutation exists. So §2.3's mask-stack predication remains the design for **statements**, and
+blending is an expression-level special case that happens to be cheaper than predication where it
+applies. Expect both in the final executor, not one.
+
+**S3 — The shipped budget is an instruction count, not element-steps.** `DefaultStepBudget = 1 << 22`
+(`collections/vm/regir.go:651`), decremented per instruction in the scalar register machine, with
+exhaustion returning `ok=false` rather than a value. It satisfies §3.3's determinism requirement and
+nothing else: there are no per-record trip limits, so a runaway `while` consumes the whole budget and
+reports failure for the script instead of faulting the one record (§3.2). §3.1's element-step unit is
+still the right unit for the vector path and is still unbuilt.
+
+**S4 — Copy propagation, which §6.8 does not list.** §6.8's list assumed SSA, where a copy is a
+renaming rather than an instruction. Under S1 it is a real instruction and the dominant one: every
+read of a local lowers to a move, so an expression-heavy script accumulates them in proportion to how
+much it reuses its own bindings. The pass is at `collections/vm/optimize.go:167-220` with three
+soundness conditions, two of which currently overlap for the shapes the compiler emits — the source
+says which and why neither is removable, because an overlap that is a property of today's lowering is
+exactly what a later reader deletes.
+
+**S5 — A UDF registry in `classad/`, not in `collections/vm/`.** `classad.RegisterFunction`
+(`classad/udf.go:100`) publishes an append-only copy-on-write table through an atomic pointer, so the
+per-record read path is one atomic load and the whole check costs nothing when nothing is registered.
+Because `StrictFunction` consults it (`classad/vm_support.go:285-287`), a registered UDF
+**automatically** compiles to `OpCallFunc` and vectorizes elementwise with no further work — which is
+the concrete payoff of §2.6's rule that registrations are declared to the compiler.
+
+### 11.3 Corrections — prose above that is now false
+
+1. **The header.** "Nothing implemented" is no longer true; see §11.1.
+2. **§2.2** says `?:` "is currently *not* vectorized". It is, by blending (S2).
+3. **§2.2 is incomplete rather than wrong about calls.** It says the total predicates `isUndefined`
+   and `isError` compile to `OpCallFunc` and vectorize elementwise, which is still true. A reader will
+   reasonably assume `ifThenElse` takes the same route, since it is a function in the ClassAd grammar
+   — it does not. It compiles to `OpBranchCond`, a three-way dispatch on `classad.ConditionState`
+   (`collections/vm/opcode.go:61-75`), and in the vector path it blends. Which functions are *not*
+   calls is now a thing the compiler decides, and §5.2 should say so.
+4. **§6.8 item 12** says there is no regular-expression cache anywhere in the library. There is now
+   (`classad/regexpcache.go`); the *pass* it was arguing for is still unbuilt, and with the cache in
+   place its remaining value is smaller than the item claims.
+5. **§2.5's hazard is not yet guarded, and cannot yet fire.** D6 (strict local assignment) is *not*
+   implemented: a register holds whatever `classad.Value` the machine produced, lazy lists included.
+   It is unreachable today only because no ad mutation exists to change the scope underneath one. The
+   guard must land in the same change as the first mutation, not after it.
+6. **§2.1's fault table is aspirational.** Only `OpFault` exists (`collections/vm/opcode.go:139-148`),
+   which ends the script with `ERROR`. There is no fault mask, no fault-site table, and no fault
+   report — so F1–F4 are currently one undifferentiated outcome, and the per-record model of §2.2 is
+   entirely unbuilt.
+
+### 11.4 Two findings from building it
+
+Neither is a design change; both are the kind of thing this document exists to keep.
+
+- **A real-arithmetic divergence, found by the parity fuzzer rather than by reading.** A real result
+  that overflows to `+Inf` is `ERROR` in the reference while `-Inf` and NaN are not; the vector path
+  served `+Inf` (`collections/vm/vecexec.go:653-657`). It reproduced on the parent commit, so it was
+  pre-existing — the new fuzzer found it, the new code did not cause it.
+- **A static read set is only sound when every read is syntactically visible.** `IsMatchAll` /
+  `IsMatchNone` decided a constraint against an empty ad, guarded only by the references the
+  expression *mentions*; an `eval()` reads attributes named at run time, so a constraint containing
+  one was folded to "matches nothing" and `COUNT(*)` returned 0 where the row scan found 400. Fixed
+  by requiring `vm.SelfRefsSafe` (`db/archive.go:658-660`, `:695-697`;
+  `collections/vm/plan.go:97-101`). §6.6 should absorb the general form: CSE and every other pass
+  that reasons about a read set inherits this precondition, and `eval()` is the one construct that
+  violates it.
+
+---
+
+## 12. What is left, and what blocks what
+
+Ordered by dependency rather than by appeal. The notable thing about the order is that **the critical
+path to the database payoff does not pass through syntax at all** — D3 is last, and nothing above it
+needs it.
+
+0. **Done, and recorded here because it changed this list twice.** A real CFG with dominators, and
+   liveness over it. The CFG replaced two approximations — `localsNeedingInit`'s "any jump target
+   between the store and the read" and copy propagation's straight-line condition — with actual
+   dominance, and fixed a bug where the control-flow opcodes claimed to define register 0, which is
+   the first local, so copy propagation silently refused it in every script with a branch. Measured on
+   24 bind/branch/read scripts: initializers 25 → 1, optimized instruction count 288 → 242. Liveness
+   then **refuted the reason I had put SSA first** (see S1), so SSA is no longer at the head of this
+   list. The lesson worth keeping: §6.1's argument is quantitative, so a priority derived from it
+   should be measured before it is acted on.
+1. **The per-record fault model (§2.2).** First, because it is a *representation* decision that
+   everything below it encodes: a vector executor for statements has nowhere to put "this record's
+   condition was undefined" until the fault mask and the per-site report exist. Cheap — `VsError` and
+   `mError` already exist — and it cannot be retrofitted around.
+2. **Predication for statements, and the masked blend (§2.3).** The one genuinely new runtime
+   primitive. Half of it is already there: `blend` (`collections/vm/vecexec.go:443`) selects per record
+   at a join. What it lacks is the mask *stack* and the rule that assignment under a predicate leaves
+   non-live lanes untouched. Note S2 — this is in addition to blending, not a replacement for it.
+3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Required *before* O3, not
+   after: budget consumption is one of the four quantities scalar and vector execution are supposed to
+   agree on elementwise, and it is the one that localizes a bug the values alone would hide.
+4. **O3 itself (§7.3).** The deliverable that proves the retarget. Everything above exists to make it
+   a real test rather than a tautology.
+5. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
+   both need the vector path to exist before they mean anything — a form is a property of a `Vec`, and
+   a deferred load defers a decompression. Measured context for sizing: roughly 78% of mutable read
+   CPU is zstd, so a load not performed is worth more than any amount of arithmetic removed.
+6. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
+   blocks the database use, and `for` over a *per-record* list stays declined (§2.3) until open
+   question 4 gets its density argument.
+7. **D3, the lexer and parser.** Last on purpose. Every semantic question above is answerable through
+   the builder API, and holding syntax back keeps the §4 lexical argument free to change.
+
+Two items on §6.8's list have been partly overtaken and should be re-costed rather than built as
+written: item 12 (LICM for regexp) now has its built-in half done, and item 2 (liveness and
+allocation) competes with item 10 (tiling), which §6.8 itself flags as possibly belonging first.
+
+---
+
+## 13. The gap this document does not cover: user-defined *aggregates*
+
+§2.6 and the shipped registry (S5) give the host a user-defined **scalar** function: a function of
+argument values, compiled to `OpCallFunc`, vectorized elementwise. That covers projections and
+predicates. It does not cover aggregation — and aggregation is where this database's query layer
+actually spends its time, so a UDF story that stops at scalars stops short of the use that motivated
+it. This section states the problem and the one hard constraint, and deliberately does not pick a
+design.
+
+### 13.1 Why it is not a small extension
+
+**The selector is a closed byte on the wire.** `db.AggFunc` is a `uint8` enum of six values
+(`db/aggregate.go:21-38`), aliased straight into the RPC layer (`dbrpc/aggregate.go:18`) and decoded
+as `AggFunc(r.u8())` (`:247`). A user-defined aggregate needs a representation that is not one of six
+bytes, which is a wire-compatibility change and not a new case in a switch.
+
+**There are two aggregation paths, and only one of them can take a UDAF.**
+
+- The **row path** accumulates per group in `aggAcc` and defers the arithmetic to the ClassAd
+  library's own `Sum`/`Avg`/`Min`/`Max` at the end (`db/aggregate.go:333-365`). A UDAF plugs in here
+  cleanly.
+- The **columnar path** does not read values at all: it computes the answer from a zone's precomputed
+  `NumStats` (`db/colagg.go:124-131`). A UDAF cannot plug in here, because there is nothing to
+  accumulate — the point of that path is that the rows are never visited.
+
+So the honest headline for a UDAF is not "slower than a built-in". It is: **a UDAF forfeits the zone
+fast path**, and on the archive that is the difference between reading an index and scanning the
+rows. Any design must state that up front, and should probably offer the escape hatch rather than
+hide the cliff — a UDAF that can declare itself computable from the stats a zone already holds gets
+the fast path, and one that cannot says so.
+
+### 13.2 Four operations, and *merge* is the load-bearing one
+
+The interface is init / accumulate / **merge** / finalize, and the temptation is to ship the first,
+second and fourth and add merge later. That gets the capability wrong in three specific ways, each
+already visible in the tree:
+
+- **Parallel and per-segment scans produce partial states.** Without merge a UDAF is single-threaded
+  by construction, in the one place the engine is not.
+- **Materialized views are maintained by delta, and the view layer already classifies aggregates by
+  whether that is possible.** It admits only COUNT/SUM/AVG, and says why: "MIN/MAX would need a
+  rescan when the current extreme is removed" (`db/view.go:28-37`). A UDAF must declare which camp it
+  is in, and the view layer must refuse to maintain one that cannot merge under *deletion* — which is
+  a strictly stronger property than merging under union.
+- **Visit order is not stable.** Zone and segment identity has already produced one silent
+  wrong-count bug in this engine, so merge must be required to be **associative and commutative**,
+  not merely associative. A UDAF whose merge is order-sensitive would be correct in tests and wrong
+  in production, which is the worst available failure mode.
+
+### 13.3 An argument for an explicit state type, from the built-ins' own shape
+
+Worth recording because it inverts the expected direction. `aggAcc` **retains every argument value**
+for SUM/AVG/MIN/MAX — `a.vals = append(a.vals, v)` (`db/aggregate.go:363`) — and hands the whole
+slice to the library at the end. That is deliberate, and the comment says why: it makes type coercion
+(int64-exact sums, int/real promotion, boolean and undefined handling, error propagation) match
+HTCondor's `sum()`/`avg()` *exactly* rather than being a re-implementation of it
+(`db/aggregate.go:327-331`).
+
+The cost is that built-in aggregate state is O(group size), not O(1) — parity bought with memory. So
+a UDAF with an explicit, bounded state type would be **better behaved than the built-in it imitates**.
+That is an argument for giving the interface its own state rather than modelling it on `aggAcc`, and
+against the obvious shortcut of letting a UDAF receive the accumulated value slice.
+
+### 13.4 Questions a design has to answer
+
+1. **Who may register one?** The scalar registry is open to the host process. A UDAF that forfeits
+   zone pruning is a query-shape decision with a server-wide cost, which argues for the same
+   admin-labelled trust model the WASM loader needs for its unsandboxed path — configuration, not
+   something a module claims about itself.
+2. **What is the wire representation**, given §13.1, and does an unknown UDAF name on the server fail
+   the query or fall back to a client-side aggregation?
+3. **May a UDAF appear in a materialized view at all**, or is the first version query-only? Query-only
+   is a defensible place to start and should be stated rather than left to be discovered.
+4. **Does a UDAF see values or columns?** The scalar path is elementwise over boxed `classad.Value`s;
+   the whole point of the vector engine is not to box. A batch-shaped accumulate is the same design
+   question the vectorized WASM ABI is facing, and the two should share an answer rather than invent
+   two.
