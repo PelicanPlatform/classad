@@ -12,9 +12,9 @@ import (
 // ErrMalformed is returned when the input is not a well-formed wire ad.
 var ErrMalformed = errors.New("wire: malformed encoding")
 
-// maxDepth bounds recursion so a crafted deeply-nested input cannot overflow the
-// goroutine stack during decode.
-const maxDepth = 1000
+// errReadTooDeep is the decoders' refusal of input nested deeper than MaxDepth. It is ErrMalformed
+// to a caller; it is distinct so readSealedPlain can tell it from a key-form mismatch.
+var errReadTooDeep = fmt.Errorf("%w: nesting deeper than depth %d", ErrMalformed, MaxDepth)
 
 type decoder struct {
 	b       []byte
@@ -38,6 +38,26 @@ type decoder struct {
 	// oldStrings renders string literals for old-ClassAd text rather than mirroring
 	// ast.Expr.String(). Set by the AppendNodeText*Old renderers; see AppendNodeTextOld.
 	oldStrings bool
+	// inSealed marks a decoder reading a sealed value's plaintext. See sealedDepth.
+	inSealed bool
+}
+
+// sealedDepth is the level at which a sealed node's plaintext is read, given the sealed node's own.
+//
+// The same level, not one below: sealing wraps a value without nesting it, so an attribute must fit
+// MaxDepth whether or not it is encrypted at rest. Counting the wrapper as a level made an
+// encrypted attribute one level shallower than a plain one -- the write side would have had to know
+// the encryption policy to judge depth, and widening that policy later would have re-sealed a value
+// that fit into one that does not.
+//
+// A sealed value inside a sealed value's plaintext still costs a level. No encoder writes one (only
+// a top-level attribute value is ever sealed), and counting it keeps a crafted chain of them from
+// recursing without bound.
+func (d *decoder) sealedDepth(depth int) int {
+	if d.inSealed {
+		return depth + 1
+	}
+	return depth
 }
 
 // Decode parses an ad encoded with Encode or EncodeInline. Interned ads resolve
@@ -173,8 +193,8 @@ func (d *decoder) headerFlags() (byte, error) {
 
 // adBody reads [hotCount][hot entries][attrCount][attr entries].
 func (d *decoder) adBody(depth int) (*ast.ClassAd, error) {
-	if depth > maxDepth {
-		return nil, fmt.Errorf("%w: nesting too deep", ErrMalformed)
+	if depth > MaxDepth {
+		return nil, errReadTooDeep
 	}
 	hotCount, err := d.uvarint()
 	if err != nil {
@@ -201,7 +221,7 @@ func (d *decoder) adBody(depth int) (*ast.ClassAd, error) {
 		if err != nil {
 			return nil, err
 		}
-		val, err := d.node(depth + 1)
+		val, err := d.node(depth)
 		if err != nil {
 			return nil, err
 		}
@@ -255,8 +275,8 @@ func tableResolver(t *InternTable) func(uint32) (string, bool) {
 
 // node reads a single expression node.
 func (d *decoder) node(depth int) (ast.Expr, error) {
-	if depth > maxDepth {
-		return nil, fmt.Errorf("%w: expression too deep", ErrMalformed)
+	if depth > MaxDepth {
+		return nil, errReadTooDeep
 	}
 	tag, err := d.byteAt()
 	if err != nil {
@@ -494,7 +514,7 @@ func (d *decoder) node(depth int) (ast.Expr, error) {
 		}
 		// Decode the recovered node in the ad's key form, or in the inline form an earlier build
 		// left some sealed values in (see readSealedPlain).
-		v, _, _, err := d.readSealedPlain(pt, depth+1, sealedExpr, nil)
+		v, _, _, err := d.readSealedPlain(pt, d.sealedDepth(depth), sealedExpr, nil)
 		return v, err
 	default:
 		return nil, fmt.Errorf("%w: unknown node tag 0x%02x", ErrMalformed, tag)

@@ -161,7 +161,7 @@ func appendInlineName(dst *[]byte, resolve func(uint32) (string, bool), id uint3
 // case for case -- a tag handled there and missed here would silently truncate a record, so the
 // two are meant to be read side by side -- and it is transcodeNode read backwards.
 func inlineNode(c *cursor, out *[]byte, resolve func(uint32) (string, bool), depth int) bool {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return false
 	}
@@ -343,7 +343,7 @@ func inlineNode(c *cursor, out *[]byte, resolve func(uint32) (string, bool), dep
 // A nested body's keys are in the SAME encoding as the enclosing ad -- skipAdBody reads them
 // through the top-level cursor's mode -- so an interned ad's nested records are keyed by id too.
 func inlineAdBody(c *cursor, out *[]byte, resolve func(uint32) (string, bool), depth int) bool {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return false
 	}
@@ -366,7 +366,7 @@ func inlineAdBody(c *cursor, out *[]byte, resolve func(uint32) (string, bool), d
 		if !appendInlineName(out, resolve, id) {
 			return false
 		}
-		if !inlineNode(c, out, resolve, depth+1) {
+		if !inlineNode(c, out, resolve, depth) {
 			return false
 		}
 	}

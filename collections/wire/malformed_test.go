@@ -354,6 +354,14 @@ func FuzzReadersNoPanic(f *testing.F) {
 	}
 	f.Add(rawAd(0, nil, internedEntry(0, []byte{nAttrRefStr, 0, 1, 'A'})))
 	f.Add(rawAd(flagInlineNames, [][2]uint64{{1, 1 << 20}}, inlineEntry("A", []byte{nInt, 2})))
+	// Values at the depth limit and one past it, in every encoding: the readers' bound is exercised
+	// from both sides, sealed and plain.
+	for _, data := range [][]byte{{4, 0, 0, 4}, {5, 0, 0, 4}, {4, 1, 6, 7}, {5, 1, 6, 7}} {
+		ad, _, sealed := deepAd(data)
+		for _, e := range encodingsOf(ad, sealed) {
+			f.Add(e.enc)
+		}
+	}
 
 	f.Fuzz(func(t *testing.T, b []byte) {
 		readAllWays(b, tbl)

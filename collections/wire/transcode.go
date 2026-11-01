@@ -82,7 +82,7 @@ func AppendInternedFromInline(dst []byte, src Ad, t *InternTable, hot map[uint32
 // for case; a tag handled there and missed here would silently truncate a record, so the two are
 // meant to be read side by side.
 func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return false
 	}
@@ -234,7 +234,7 @@ func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 // transcodeAdBody is transcodeNode for a nested record literal: the same key rewrite as the
 // top-level ad, with no hot header of its own (nested bodies never carry one).
 func transcodeAdBody(c *cursor, out *[]byte, t *InternTable, depth int) bool {
-	if !c.ok || depth > maxDepth {
+	if !c.ok || depth > MaxDepth {
 		c.ok = false
 		return false
 	}
@@ -255,7 +255,7 @@ func transcodeAdBody(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 			return false
 		}
 		*out = binary.AppendUvarint(*out, uint64(t.InternBytes(name)))
-		if !transcodeNode(c, out, t, depth+1) {
+		if !transcodeNode(c, out, t, depth) {
 			return false
 		}
 	}

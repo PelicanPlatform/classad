@@ -2,6 +2,7 @@ package wire
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sync/atomic"
 
@@ -92,7 +93,7 @@ const (
 // that the common case, one accepted parse, allocates no decoder.
 func (d *decoder) readSealedPlain(pt []byte, depth int, as sealedRead, dst []byte) (ast.Expr, []byte, bool, error) {
 	sub := decoder{b: pt, inline: d.inline, resolve: d.resolve, open: d.open,
-		redactSealed: d.redactSealed, oldStrings: d.oldStrings}
+		redactSealed: d.redactSealed, oldStrings: d.oldStrings, inSealed: true}
 	v, out, err := sub.readSealedAs(as, depth, dst)
 	if err == nil && sub.pos != len(pt) {
 		err = fmt.Errorf("%w: %d bytes left over after a sealed value", ErrMalformed, len(pt)-sub.pos)
@@ -100,10 +101,13 @@ func (d *decoder) readSealedPlain(pt []byte, depth int, as sealedRead, dst []byt
 	if err == nil {
 		return v, out, false, nil
 	}
-	if d.inline {
+	// No retry when the interned parse failed for depth: that is not a key-form mismatch, and the
+	// inline reading of a too-deep interned value can SUCCEED -- a record member's id taken for its
+	// name's length, the bytes after it for the name -- returning a different, shallower value.
+	if d.inline || errors.Is(err, errReadTooDeep) {
 		return nil, dst, false, err
 	}
-	alt := decoder{b: pt, inline: true, resolve: refuseIDs, oldStrings: d.oldStrings}
+	alt := decoder{b: pt, inline: true, resolve: refuseIDs, oldStrings: d.oldStrings, inSealed: true}
 	av, aout, aerr := alt.readSealedAs(as, depth, dst)
 	if aerr != nil || alt.pos != len(pt) {
 		return nil, dst, false, err

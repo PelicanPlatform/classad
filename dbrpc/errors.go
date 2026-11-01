@@ -3,6 +3,8 @@ package dbrpc
 import (
 	"errors"
 	"strings"
+
+	"github.com/PelicanPlatform/classad/db"
 )
 
 // The error taxonomy a caller needs to drive reconnection policy. A dbrpc call
@@ -21,6 +23,9 @@ import (
 //   - ErrInternal (a *ServerError): serving the request panicked -- a server bug. The
 //     server failed only that request and keeps serving; a replay most likely fails
 //     the same way, so surface it.
+//   - ErrTooDeep (a *ServerError): a write was refused because a value nests too deeply
+//     to store. Permanent: nothing of the write was applied and replaying it is refused
+//     identically, so drop the value (or the ad) and carry on. Never retry it.
 //   - context.Canceled / context.DeadlineExceeded: the caller's context ended while
 //     waiting. Surface it; do not retry against the caller's wishes.
 //
@@ -58,8 +63,30 @@ func (e *ServerError) Is(target error) bool {
 		return strings.HasPrefix(e.Msg, cursorExpiredPrefix)
 	case ErrInternal:
 		return strings.HasPrefix(e.Msg, internalErrorPrefix)
+	case ErrTooDeep:
+		return strings.HasPrefix(e.Msg, tooDeepPrefix)
 	}
 	return false
+}
+
+// ErrTooDeep is db.ErrTooDeep, the same error value, as the client sees it: the server refused a
+// write because a value in it nests deeper than the store can read back. It arrives as a
+// *ServerError -- from NewClassAd and SetAttribute when the write is buffered, from Commit for a
+// write only Commit could judge, and from ArchiveAppend -- and in an AdReject's Cause for a batch.
+// Nothing of the refused write was applied, and replaying it fails the same way: drop it and move
+// on. A caller tailing a log must not rewind or retry on it.
+var ErrTooDeep = db.ErrTooDeep
+
+// tooDeepPrefix opens the message of a too-deep refusal, which the client maps to ErrTooDeep.
+const tooDeepPrefix = "too deep: "
+
+// refusalMsg is the message a write's error carries to the client: tagged with tooDeepPrefix when
+// it is a too-deep refusal (the client cannot unwrap a message, only read its prefix).
+func refusalMsg(err error) string {
+	if errors.Is(err, ErrTooDeep) {
+		return tooDeepPrefix + err.Error()
+	}
+	return err.Error()
 }
 
 // ErrTableReadOnly reports that the server refused to modify a table this connection may

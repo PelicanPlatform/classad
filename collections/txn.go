@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // conflictCheckCount counts per-key write-write conflict checks performed by
@@ -423,9 +424,11 @@ func (b *txnBuf) materialize() (*classad.ClassAd, bool) {
 //
 // Unapplied is the OTHER kind of not-applied, and the distinction is the point: those writes
 // could not be composed at all, and re-applying the identical write cannot change that. A patch
-// whose stored base is unreadable is the case that exists today -- the key is present but the
-// record behind it will not come back (a delta chain that no longer materializes, a segment that
-// went away), so there is nothing to merge the patch onto.
+// whose stored base is unreadable is one case -- the key is present but the record behind it will
+// not come back (a delta chain that no longer materializes, a segment that went away), so there is
+// nothing to merge the patch onto. A write whose value nests too deeply to store (ErrTooDeep) is
+// the other: nothing of it is written, and any earlier write to the same key in this transaction is
+// dropped with it, so the key keeps exactly what it held before.
 //
 // Reporting those as Conflicts made a caller that retries conflicts loop forever. On a production
 // mirror each one rewound the tailer, re-applied, failed identically, and after three attempts
@@ -440,6 +443,10 @@ type CommitResult struct {
 	// key reported without a reason is a bare fact with no action attached -- an operator reading
 	// it had to go to the daemon ad's counters and correlate by hand.
 	UnappliedReasons []string
+	// UnappliedErrs is parallel to Unapplied: the error behind each key, or nil where the reason
+	// alone says it. A refused write's error (ErrTooDeep, naming the attribute) is kept so a caller
+	// can match it with errors.Is.
+	UnappliedErrs []error
 }
 
 // Conflicted reports whether any buffered write lost a conflict.
@@ -710,6 +717,7 @@ func (tx *Txn) Commit() CommitResult {
 	// CommitResult.Unapplied.
 	var unreadable [][]byte
 	var unreadableWhy []string
+	var unreadableErr []error
 	for _, b := range tx.writes {
 		if b.del && tx.c.deltas != nil {
 			// The key's records are going away, so the tracker must stop believing a full
@@ -722,6 +730,15 @@ func (tx *Txn) Commit() CommitResult {
 		w := &txnWrite{hash: h, key: b.key, del: b.del, base: tx.snap[idx], adObj: b.ad, buf: b}
 		w.codec = tx.c.currentCodec() // a delete's marker allocates a segment with it if it must
 		if !b.del {
+			// Refused before anything below runs: encoding a delta advances the key's chain in the
+			// tracker, so a write that is then not stored would leave it counting a record that
+			// does not exist.
+			if err := b.checkDepth(); err != nil {
+				unreadable = append(unreadable, b.key)
+				unreadableWhy = append(unreadableWhy, "too-deep: "+err.Error())
+				unreadableErr = append(unreadableErr, err)
+				continue
+			}
 			// A wire-ingested put is already encoded; only an object put encodes here.
 			raw := b.wire
 			switch {
@@ -734,6 +751,7 @@ func (tx *Txn) Commit() CommitResult {
 				if !ok {
 					unreadable = append(unreadable, b.key)
 					unreadableWhy = append(unreadableWhy, why.String())
+					unreadableErr = append(unreadableErr, nil)
 					continue
 				}
 				encScratch = raw
@@ -801,6 +819,7 @@ func (tx *Txn) Commit() CommitResult {
 	var res CommitResult
 	res.Unapplied = append(res.Unapplied, unreadable...)
 	res.UnappliedReasons = append(res.UnappliedReasons, unreadableWhy...)
+	res.UnappliedErrs = append(res.UnappliedErrs, unreadableErr...)
 	for _, c := range commits {
 		if c.changed {
 			tx.c.shards[c.idx].publishTxn(tx.c, c.ws, c.seq)
@@ -844,6 +863,21 @@ func (tx *Txn) Commit() CommitResult {
 		}
 	}
 	return res
+}
+
+// checkDepth refuses a buffered write holding a value deeper than wire.MaxDepth. Wire bytes are not
+// checked here: PutOld's encoder refused such a value as it encoded (encodeOld), and putWire's bytes
+// are a record the store already holds.
+func (b *txnBuf) checkDepth() error {
+	switch {
+	case b.wire != nil:
+		return nil
+	case b.ad != nil:
+		return wire.CheckDepth(b.ad.AST())
+	case b.patch != nil:
+		return wire.CheckDepth(b.patch.AST())
+	}
+	return nil
 }
 
 // decodeWire rebuilds this buffer's ad from its wire bytes.

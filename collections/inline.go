@@ -12,6 +12,13 @@ import (
 // so segment files recover without a table). Every wire touchpoint routes through
 // these helpers so the rest of the store is oblivious to the mode.
 
+// ErrTooDeep is wire.ErrTooDeep, the same error value: a write refused because a value nests
+// deeper than any reader would read back (wire.MaxDepth). Every write path refuses such an ad
+// before it changes anything -- Put, Update and UpdateOld return the error, and a transaction
+// reports the key in CommitResult.Unapplied -- so the store never holds a record that cannot be
+// read. The refusal is permanent; retrying the same write fails the same way.
+var ErrTooDeep = wire.ErrTooDeep
+
 // encodeAd encodes an ad to wire bytes for storage, with the collection's hot set.
 // When encryption at rest is enabled, the designated attributes' values are sealed
 // with the DB data key (persistent/inline collections only).
