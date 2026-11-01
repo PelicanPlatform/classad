@@ -73,23 +73,36 @@ func (c *Collection) queryProjectAs(q *vm.Query, attrs []string, stats *ScanStat
 
 		scratch := make([]classad.Value, len(attrs))
 		rs := &wireScope{ctx: c.evalCtx(redact)} // projection resolver, distinct from the match ws
-		// NO PROJECTION PLAN HERE, deliberately -- this is the one scan that must not have one,
-		// and it is worth saying why because the plan would make it measurably faster (~3x, a
-		// third of the allocations) while silently changing answers.
+		// A CLOSURE PLAN, not a plain one, and the difference is the whole correctness story here.
 		//
-		// A plan lets the scan hand this emit an ad NARROWED to attrs, built from a
-		// columnarized segment's columns instead of reassembling the record. That is sufficient
-		// for a consumer that SHIPS the entries it is given (QueryRawWire does, and so has a
-		// plan). This one EVALUATES them: projectInto falls back to decoding the ad whenever a
-		// requested attribute is stored as an expression rather than a literal, and an
-		// expression's own references are not in the projection -- `RequestMemory = ProcId*512+7`
-		// projected as just RequestMemory loses ProcId and evaluates to UNDEFINED. Measured on a
-		// columnarized fixture: 14 of 3000 records turned UNDEFINED, with no error anywhere.
+		// A projection plan lets the scan hand this emit an ad NARROWED to attrs, built from a
+		// columnarized segment's columns instead of reassembling the record. That is sufficient for
+		// a consumer that SHIPS the entries it is given. This one EVALUATES them: projectInto
+		// decodes the ad whenever a requested attribute is stored as an expression rather than a
+		// literal, and a PLAIN plan narrows away exactly the references such an expression needs --
+		// `RequestMemory = ProcId*512+7` projected as just RequestMemory loses ProcId and evaluates
+		// to UNDEFINED. Measured on a columnarized fixture: 14 of 3000 records turned UNDEFINED,
+		// with no error anywhere. This scan backs COUNT and GROUP BY, where UNDEFINED is not an
+		// error the caller sees but a different answer, so that is not a trade to make.
 		//
-		// Expression-valued attributes are routine in real job ads, and this scan backs COUNT and
-		// GROUP BY, where UNDEFINED is not an error but a different answer. Pinned by
-		// TestQueryProjectExpressionValues.
-		c.scanQuery(c.newQueryPlan(q, nil, stats, redact), func(w []byte, dict *segDictHandle) bool {
+		// Marking the plan a closure plan removes the hazard rather than avoiding it: the scan
+		// keeps the narrowed ad only for a record where every reference its projected expressions
+		// reach is in it (adClosed), and reassembles the rest. So the fast path runs exactly where
+		// it reads the same as the whole record, and the 14 records above reassemble.
+		//
+		// Measured on that fixture (BenchmarkQueryProjectPlan): 1.58x and half the allocations,
+		// not the 3x a plan without the closure check would promise -- the difference is the
+		// records that fall back plus the projected attributes no schema covers, which are in the
+		// record either way. The speedup is a property of the projection, not a constant.
+		//
+		// Pinned by TestQueryProjectExpressionValues, which compares every value against the
+		// full-decode path, and by TestProjectedAdIsNotEvaluable, which holds the plain plan to
+		// still losing values -- that is what makes this a closure test rather than a plan test.
+		proj := c.newProjPlan(attrs)
+		if proj != nil {
+			proj.closure = true
+		}
+		c.scanQuery(c.newQueryPlan(q, proj, stats, redact), func(w []byte, dict *segDictHandle) bool {
 			rs.dict = dict
 			c.projectInto(rs, w, attrs, scratch)
 			return yield(scratch)

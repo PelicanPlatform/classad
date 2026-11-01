@@ -34,14 +34,14 @@ func adSummary(t *testing.T, c *Collection, w []byte) string {
 
 // columnarFixture fills a persistent collection, seals its segments, and returns it with the
 // derived schema.
-func columnarFixture(t *testing.T, n int) (*Collection, *adSchema, []int) {
+func columnarFixture(t testing.TB, n int) (*Collection, *adSchema, []int) {
 	t.Helper()
 	return columnarFixtureIn(t, t.TempDir(), n)
 }
 
 // columnarFixtureIn is columnarFixture in a caller-chosen directory, so a test can close the
 // collection and reopen the same files.
-func columnarFixtureIn(t *testing.T, dir string, n int) (*Collection, *adSchema, []int) {
+func columnarFixtureIn(t testing.TB, dir string, n int) (*Collection, *adSchema, []int) {
 	t.Helper()
 	// WatchHistory is on so the watch catch-up path is exercisable; it does not affect the
 	// storage shapes the other tests measure.

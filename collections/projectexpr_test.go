@@ -135,3 +135,103 @@ func TestProjectedAdIsNotEvaluable(t *testing.T) {
 	}
 	t.Logf("narrowed ad loses %d of %d values; reassembled record loses none", narrowed, rows)
 }
+
+// TestQueryProjectUsesTheColumnarPath is the other half of the closure plan: the test above shows
+// the VALUES are right, and this one shows the fast path that could have broken them is actually
+// running. Both are needed. A plan the scan silently declined would leave every value correct and
+// every record reassembled -- the correctness tests would stay green over a scan that had quietly
+// gone back to the slow path, which is the failure this pins.
+//
+// The measure is RecordsReassembled against the rows emitted: with no plan the scan cannot project
+// from columns at all and rebuilds every record, so the two are equal. With the closure plan only
+// the records that need it rebuild, and RecordsClosureReassembled names them.
+func TestQueryProjectUsesTheColumnarPath(t *testing.T) {
+	c, _, _ := columnarFixture(t, 3000)
+	defer c.Close()
+	if n := c.columnarizeSealed(); n == 0 {
+		t.Skip("no sealed segment was columnarized")
+	}
+	attrs := []string{"ClusterId", "RequestMemory", "Wide", "JobStatus"}
+	q, _ := vm.Parse(`true`)
+
+	var st ScanStats
+	rows := 0
+	undefined := 0
+	for vals := range c.QueryProjectStats(q, attrs, &st) {
+		rows++
+		// RequestMemory only: Wide and the Rare* attributes are carried by some ads and not
+		// others, so UNDEFINED is the right answer for them and counting it would measure the
+		// fixture rather than the plan. Every ad has a RequestMemory.
+		if vals[1].IsUndefined() {
+			undefined++
+		}
+	}
+	if rows == 0 {
+		t.Fatal("the scan emitted no rows")
+	}
+	if undefined != 0 {
+		t.Fatalf("RequestMemory came back UNDEFINED for %d of %d records; the closure plan is not "+
+			"holding", undefined, rows)
+	}
+	// The premise: without a plan this scan rebuilds every record it emits. Measured the same way,
+	// on the same fixture, so the comparison is like for like rather than a remembered number.
+	var base ScanStats
+	baseRows := 0
+	c.scanQuery(c.newQueryPlan(q, nil, &base, false), func(w []byte, dict *segDictHandle) bool {
+		baseRows++
+		return true
+	})
+	if base.RecordsReassembled != baseRows {
+		t.Fatalf("the no-plan scan reassembled %d of %d records, not all of them; this test's "+
+			"premise no longer holds", base.RecordsReassembled, baseRows)
+	}
+	if st.RecordsReassembled >= rows {
+		t.Fatalf("the closure-plan scan reassembled %d of %d records -- the columnar projection "+
+			"never ran, so the fast path this plan exists to enable is not engaged",
+			st.RecordsReassembled, rows)
+	}
+	// The closure check must be doing real work here: this fixture stores RequestMemory as an
+	// expression reaching outside the projection in a handful of records, and those are exactly
+	// the ones that must fall back. Zero would mean the fixture stopped exercising the hazard.
+	if st.RecordsClosureReassembled == 0 {
+		t.Fatalf("no record was reassembled for closure over %d rows: the fixture no longer stores "+
+			"a projected attribute as an expression reaching outside the projection, so this test "+
+			"and TestProjectedAdIsNotEvaluable are both measuring nothing", rows)
+	}
+	t.Logf("closure plan: %d of %d records reassembled (%d of them for closure); no plan: %d of %d",
+		st.RecordsReassembled, rows, st.RecordsClosureReassembled, base.RecordsReassembled, baseRows)
+}
+
+// BenchmarkQueryProjectPlan is what the closure plan is for: the same projected scan with the plan
+// the code passes and with the nil plan it used to pass.
+func BenchmarkQueryProjectPlan(b *testing.B) {
+	c, _, _ := columnarFixture(b, 3000)
+	defer c.Close()
+	if n := c.columnarizeSealed(); n == 0 {
+		b.Skip("no sealed segment was columnarized")
+	}
+	attrs := []string{"ClusterId", "RequestMemory", "Wide", "JobStatus"}
+	q, _ := vm.Parse(`true`)
+	run := func(b *testing.B, closure bool) {
+		scratch := make([]classad.Value, len(attrs))
+		rs := &wireScope{ctx: c}
+		b.ReportAllocs()
+		rows := 0
+		for i := 0; i < b.N; i++ {
+			var proj *projPlan
+			if closure {
+				proj = c.newProjPlan(attrs)
+				proj.closure = true
+			}
+			c.scanQuery(c.newQueryPlan(q, proj, nil, false), func(w []byte, dict *segDictHandle) bool {
+				rs.dict = dict
+				c.projectInto(rs, w, attrs, scratch)
+				rows++
+				return true
+			})
+		}
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(rows), "ns/row")
+	}
+	b.Run("no-plan", func(b *testing.B) { run(b, false) })
+	b.Run("closure-plan", func(b *testing.B) { run(b, true) })
+}
