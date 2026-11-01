@@ -793,7 +793,21 @@ func (t *ArchiveTable) Rotate(now float64) (int, error) { return t.a.Rotate(now)
 // mutable-table watch so the two are wire-identical. An empty cursor replays the retained
 // history, then goes live. See collections.Archive.Watch.
 func (t *ArchiveTable) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
-	seq, err := t.a.Watch(ctx, cursor)
+	return t.watchAs(ctx, cursor, false)
+}
+
+// WatchRedacted is Watch for a watcher NOT entitled to sealed values: each event's ad is decoded
+// with no key, so a sealed attribute arrives undefined. See DB.WatchRedacted.
+func (t *ArchiveTable) WatchRedacted(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
+	return t.watchAs(ctx, cursor, true)
+}
+
+func (t *ArchiveTable) watchAs(ctx context.Context, cursor []byte, redact bool) (iter.Seq[WatchEvent], error) {
+	watch := t.a.Watch
+	if redact {
+		watch = t.a.WatchRedacted
+	}
+	seq, err := watch(ctx, cursor)
 	if err != nil {
 		return nil, err
 	}

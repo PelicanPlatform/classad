@@ -880,9 +880,8 @@ func (sc *serverConn) streamWatch(reqID uint64, r *reader, wireForm bool) {
 		cancel()
 	}()
 
-	// One watch op serves all three kinds. The archive branch does not fork on privilege:
-	// ArchiveTable has no WatchRedacted, so an unprivileged peer watching an archive sees
-	// private attributes a query of the same archive would strip.
+	// One watch op serves all three kinds, each forking on privilege the way a read does: an
+	// unprivileged peer's watch decodes with no key, so a sealed value is never opened for it.
 	var seq iter.Seq[db.WatchEvent]
 	var err error
 	priv := sc.opts.IncludePrivate
@@ -894,7 +893,11 @@ func (sc *serverConn) streamWatch(reqID uint64, r *reader, wireForm bool) {
 			seq, err = ref.db.WatchRedacted(ctx, cursor)
 		}
 	case kindArchive:
-		seq, err = ref.arch.Watch(ctx, cursor)
+		if priv {
+			seq, err = ref.arch.Watch(ctx, cursor)
+		} else {
+			seq, err = ref.arch.WatchRedacted(ctx, cursor)
+		}
 	default:
 		sc.write(respErr(reqID, "no such table: "+table))
 		return

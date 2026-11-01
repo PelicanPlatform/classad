@@ -358,6 +358,26 @@ func (c *Collection) toSelfContained(dict *segDictHandle, ad []byte, codec Codec
 	return codec.Compress(nil, wire.EncodeInline(nil, a))
 }
 
+// toSelfContainedAs is toSelfContained for a watcher whose entitlement to sealed values is
+// redact (see WatchRedacted). toSelfContained opens each sealed value to re-encode the record
+// and seals it again; for a watcher not entitled to the value that is the key opened on its
+// behalf, so the record is re-encoded as that watcher decodes it instead -- a sealed value
+// undefined -- and carries nothing left to seal.
+func (c *Collection) toSelfContainedAs(dict *segDictHandle, ad []byte, codec Codec, redact bool) []byte {
+	if !redact || dict == nil {
+		return c.toSelfContained(dict, ad, codec)
+	}
+	dec, err := codec.Decompress(nil, ad)
+	if err != nil {
+		return ad
+	}
+	a, err := c.decodeWireDictAs(dict, dec, true)
+	if err != nil {
+		return ad
+	}
+	return codec.Compress(nil, wire.EncodeInline(nil, a))
+}
+
 // newStreamEncoder returns a StreamEncoder matching the collection's mode, for the
 // direct old-ClassAd ingest path (UpdateOld).
 func (c *Collection) newStreamEncoder() *wire.StreamEncoder {

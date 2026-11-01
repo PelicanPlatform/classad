@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 )
 
@@ -474,7 +475,7 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 			c.liveCoalesced(ctx, w, sReg, vec, yield, redact)
 			return
 		}
-		parentSig := c.seedParentSig() // parent -> non-private signature (fan-out diff baseline)
+		parentSig := c.seedParentSig(redact) // parent -> non-private signature (fan-out diff baseline)
 		for {
 			if w.lagged.Load() {
 				yield(WatchEvent{Kind: WatchResync})
@@ -497,7 +498,7 @@ func (c *Collection) watchAs(ctx context.Context, cursor []byte, redact bool) (i
 				if !raw.deleted && c.watchHidden(raw.key) {
 					// A structural (parent) change: fan out to its children if an
 					// inherited attribute changed; the parent itself is not emitted.
-					for _, ce := range c.fanoutChildren(raw, parentSig) {
+					for _, ce := range c.fanoutChildren(raw, parentSig, redact) {
 						ad, ok := c.watchAdAs(ce.key, ce.ad, ce.codec, redact)
 						if !ok {
 							continue
@@ -609,7 +610,7 @@ func WatchFilter(seq iter.Seq[WatchEvent], match func(*classad.ClassAd) bool) it
 func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []uint64, yield func(WatchEvent) bool, redact bool) {
 	pending := map[string]rawEvent{}
 	order := make([]string, 0, 16) // first-seen order; keys are unique per window
-	parentSig := c.seedParentSig()
+	parentSig := c.seedParentSig(redact)
 
 	ticker := time.NewTicker(c.watchCoalesce)
 	defer ticker.Stop()
@@ -683,7 +684,7 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 			if !raw.deleted && c.watchHidden(raw.key) {
 				// Structural parent change: coalesce its children's synthetic
 				// upserts (the parent itself is not emitted).
-				for _, ce := range c.fanoutChildren(raw, parentSig) {
+				for _, ce := range c.fanoutChildren(raw, parentSig, redact) {
 					cks := string(ce.key)
 					if _, seen := pending[cks]; !seen {
 						order = append(order, cks)
@@ -748,7 +749,15 @@ func (c *Collection) watchHidden(key []byte) bool {
 // nonPrivateSig renders a parent ad's non-private attributes to a comparable
 // signature, so a parent change that touched only parent-private attributes
 // (factory bookkeeping) is detected and does not fan out to children.
-func (c *Collection) nonPrivateSig(ad *classad.ClassAd) map[string]string {
+//
+// keyless says the parent was decoded for a watcher not entitled to sealed values (see
+// WatchRedacted) from a collection that seals some: each sealed value is then undefined, and
+// an undefined value is left out of the signature as if the attribute were absent. Otherwise a
+// parent that gained or lost a sealed attribute would fan out to such a watcher while one
+// whose sealed value merely changed would not, and the fan-out itself would report a change
+// the watcher may not see. Undefined and absent evaluate alike, so the signature still
+// changes with everything the watcher can observe of the parent.
+func (c *Collection) nonPrivateSig(ad *classad.ClassAd, keyless bool) map[string]string {
 	sig := make(map[string]string)
 	for _, name := range ad.GetAttributes() {
 		lname := strings.ToLower(name)
@@ -758,6 +767,11 @@ func (c *Collection) nonPrivateSig(ad *classad.ClassAd) map[string]string {
 			}
 		}
 		if expr, ok := ad.Lookup(name); ok {
+			if keyless {
+				if _, undef := expr.AST().(*ast.UndefinedLiteral); undef {
+					continue
+				}
+			}
 			sig[lname] = expr.String()
 		}
 	}
@@ -779,18 +793,21 @@ func sigEqual(a, b map[string]string) bool {
 // seedParentSig records the current non-private signature of every structural ad,
 // giving the live fan-out a baseline so a parent's first change is diffed (and a
 // change to only parent-private attributes does not fan out). Empty for a
-// non-chained collection.
-func (c *Collection) seedParentSig() map[string]map[string]string {
+// non-chained collection. redact is the watcher's entitlement (see WatchRedacted):
+// the baseline is what that watcher could see of each parent, decoded with no key
+// for a watcher without it.
+func (c *Collection) seedParentSig(redact bool) map[string]map[string]string {
 	sig := map[string]map[string]string{}
 	if c.parentKeyFor == nil || c.isStructural == nil {
 		return sig
 	}
+	keyless := redact && c.SealsValues()
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		c.forEachVisibleKeyed(s0, wins, func(key, ad []byte, codec Codec, dict *segDictHandle) bool {
 			if c.isStructural(key) {
-				if pad, err := c.decodeAdDict(dict, ad, codec); err == nil {
-					sig[string(key)] = c.nonPrivateSig(pad)
+				if pad, err := c.decodeAdDictAs(dict, ad, codec, redact); err == nil {
+					sig[string(key)] = c.nonPrivateSig(pad, keyless)
 				}
 			}
 			return true
@@ -806,17 +823,24 @@ func (c *Collection) seedParentSig() map[string]map[string]string {
 // changed); otherwise nil. sig caches parents' non-private signatures across the
 // watch so parent-private churn (bumped every proc a factory materializes) does
 // not fan out. The parent itself is never emitted.
-func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]string) []rawEvent {
-	np, err := c.decodeAd(parent.ad, parent.codec)
+//
+// redact is the watcher's entitlement (see WatchRedacted). Whether to fan out is itself
+// an answer about the parent: decided with the key, a watcher not entitled to a sealed
+// parent attribute would receive its children exactly when that attribute's value
+// changed. So for such a watcher the parent is decoded with no key and diffed as that
+// watcher sees it, and a change to sealed parent attributes alone fans out no more than
+// a parent-private one does.
+func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]string, redact bool) []rawEvent {
+	np, err := c.decodeAdDictAs(nil, parent.ad, parent.codec, redact)
 	if err != nil {
 		return nil
 	}
 	pkey := string(parent.key)
-	newSig := c.nonPrivateSig(np)
+	newSig := c.nonPrivateSig(np, redact && c.SealsValues())
 	old, seen := sig[pkey]
 	sig[pkey] = newSig
 	if seen && sigEqual(old, newSig) {
-		return nil // only parent-private attributes changed: no fan-out
+		return nil // nothing of the parent this watcher can see changed: no fan-out
 	}
 	// Collect the parent's children (co-located in the parent's shard) with their
 	// current stored ads, as synthetic upserts stamped at the parent's sequence.
@@ -832,7 +856,7 @@ func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]s
 		if pk := c.parentKeyFor(k); pk != nil && bytes.Equal(pk, parent.key) {
 			// This event's ad bytes outlive the scan (decoded later by watchAd, when the
 			// segment/dict is gone), so make an interned record self-contained now.
-			sc := c.toSelfContained(dict, ad, codec)
+			sc := c.toSelfContainedAs(dict, ad, codec, redact)
 			out = append(out, rawEvent{
 				shard: parent.shard,
 				seq:   parent.seq,
