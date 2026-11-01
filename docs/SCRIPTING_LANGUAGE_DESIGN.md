@@ -1425,27 +1425,33 @@ needs it.
    everything below it encodes: a vector executor for statements has nowhere to put "this record's
    condition was undefined" until the fault mask and the per-site report exist. Cheap — `VsError` and
    `mError` already exist — and it cannot be retrofitted around.
-2. **Predication for statements, and the masked blend (§2.3).** The one genuinely new runtime
-   primitive. Two of its three parts now exist. `blend` (`collections/vm/vecexec.go:443`) selects per
-   record at a join; and **bindings** are vectors — `OpStoreLocal` and `OpLoadLocal` are served, so a
-   script with no control flow runs on the vector path. What is still missing is the mask *stack* and
-   the rule that assignment under a predicate leaves non-live lanes untouched. Note S2 — this is in
-   addition to blending, not a replacement for it.
+2. **Predication for statements, and the masked blend (§2.3).** ~~The one genuinely new runtime
+   primitive.~~ **Built, for `If`.** `OpStoreLocal` and `OpLoadLocal` are served, so a script's
+   bindings are vectors; `OpBranchVoid` and `OpJmpVoid` are served, so an `If` splits the live mask,
+   runs both arms, and rejoins on their union; and a store under a predicate writes only its live
+   lanes. Measured at 2.2x the register executor per record for a flat `If` and 2.2x nested — lower
+   than the 3.2x–3.7x a straight-line script gets, which is the right shape, because both arms run.
 
-   The binding half settled two things the predicated half will build on. A local is a **place** here
-   as it is in the register lowering — one vector per local for the batch — which is what makes a
-   store under a predicate expressible at all: there is a destination to leave untouched. And a read
-   of a local is a **copy**, forced by §14.7: the kernels write over their left operand, so aliasing a
-   binding would make its first read its last. That copy is the measured price of the whole model, and
-   it is small: ~3 ns/element for a binding read once, against a 1.9x *win* for a binding read twice,
-   where substituting it would compute the subexpression twice. A masked store writes into the same
-   place and so inherits the same copy discipline.
+   Three things the build settled that the design had not:
 
-   The remaining gap is narrow and specific: a read of a local no store has reached is UNDEFINED, and
-   that answer is already pinned — but **no script the compiler can emit produces that shape**, because
-   a name is not a local until `Let` has bound it. Only a branch does. So the answer is pinned today by
-   hand-built programs, and predication is what makes it reachable.
-3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Required *before* O3, not
+   - **A local is a place**, as in the register lowering — which is what makes a store under a
+     predicate expressible at all: there is a destination to leave untouched. A read of one is a
+     **copy**, forced by §14.7. The copy is the price of the whole model and it is ~3 ns/element,
+     against a 1.9x *win* where a binding is read twice.
+   - **Mask ownership is the hard part**, and it is not in §14.1. A nested region is entered with the
+     enclosing region's own arm mask as its live mask, so freeing it at the inner join corrupts the
+     enclosing region's join. A region borrows its outer mask and owns only the two it allocates.
+   - **Setting the planes up is not free.** Doing it per batch cost ~2% of an *expression* scan —
+     every block of every columnar scan — for state an expression cannot use. It is now conditional
+     on the program having statements, and a branch sets them up itself if they are missing, so the
+     flag is an optimization and not a correctness dependency.
+
+   What is left here is **`While`**, which declines. Its live mask narrows across iterations and the
+   loop runs until no record is still true, so it needs item 3 first — per-record trip accounting is
+   the thing that bounds it, and there is nothing else that could.
+3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Now also what `While`
+   waits on, which moves it from "required before O3" to "required before the vector path is
+   complete". Required *before* O3, not
    after: budget consumption is one of the four quantities scalar and vector execution are supposed to
    agree on elementwise, and it is the one that localizes a bug the values alone would hide.
 4. **O3 itself (§7.3).** The deliverable that proves the retarget. Everything above exists to make it
@@ -1559,11 +1565,16 @@ of detail someone could build from. Writing it out turned up a **mistake in §3.
 | | What | Note |
 |---|---|---|
 | `regs` | the register file: one `*Vec` per register | `VecScratch` generalized (§6.7, D13); lazily allocated, released per block |
-| `live` | one `(hi,lo)` bitplane pair (`collections/vm/vecmask.go:8-11`) | the records still executing |
+| `live` | **one** plane, not a `(hi,lo)` pair | the records still executing |
 | mask stack | the enclosing `live` masks | depth is static and computed at compile time (§2.8), so it cannot overflow |
 | `faulted` | one plane, **monotone** | accumulated, never cleared |
 | `faultSites` | per site hit: instruction, class, count, first record | §2.2's report; per-site, not per-record |
 | `steps` | the charged-step counter | §14.5 |
+
+*(Corrected while building: the table first said `live` was a `(hi,lo)` pair, by analogy with a
+value's mask form. It is not. "Executing" is a boolean, where a value is three-valued, so `live` is
+one plane and so is `faulted`. `Vec.CountTrue` already took a single-plane live mask, so the
+convention was in the tree before this said otherwise.)*
 
 **`live` and `faulted` are not two views of one thing, and conflating them is the bug this layout
 exists to prevent.** `live` is pushed and popped at region boundaries; `faulted` only ever grows.
@@ -1571,6 +1582,20 @@ And faulting record *i* must clear its bit from **every mask on the stack**, not
 clearing only the top leaves the record dead inside the region and alive again at the reconvergence
 point, which is both wrong and plausible-looking. A fault is "this record is done for the rest of the
 script" (§2.2), and that sentence has to be true of the whole stack.
+
+**But that rule is currently unobservable, and knowing why matters more than the rule.** Because a
+faulted record's answer is overwritten with ERROR at the end whatever happened in between, excluding
+a faulted record from an arm mask changes no result: it could take both arms, or the wrong one, and
+still answer ERROR. Three separate mutations of exactly this — don't exclude faults from the then
+mask, from the else mask, or from the enclosing masks — survive the whole test suite, and no test
+written against the executor's output can catch them.
+
+That is not an argument for dropping them. It locates where predication's correctness actually
+lives: **in the fault plane, not in arm-mask hygiene.** The masks are about not doing work for
+records that are finished. They become load-bearing the moment anything reads `live` for something
+other than deciding a store — an early exit when no record is live, or compaction — which is exactly
+§14.3's condition for predication paying for itself at all. So the rules are kept, and the fact that
+nothing tests them is written next to them rather than discovered later.
 
 ### 14.2 The one new kernel, which already half exists
 
@@ -1583,12 +1608,28 @@ because a selection written twice is a selection that will diverge on the `Const
 cases.
 
 One wrinkle that belongs in the design and not in the discovery: a masked store **forces its
-destination to data form**. A register currently held as `Dict` cannot absorb a value that is not in
-that block's dictionary, and one held as `Raw` cannot absorb a value of a different stored width. §6.5
-makes form part of a register's type precisely so that conversion is an instruction rather than a
-surprise, and a masked store is the place a silent materialization would otherwise appear. The
-exception worth special-casing is a `Const` source equal to the destination's existing constant, which
-is a no-op.
+destination out of the forms that describe the whole vector at once**. A register held as `Const`
+says one thing about every record and one held as `Raw` is a column at a single stored width, so
+neither can absorb a value that differs per lane; both are expanded. §6.5 makes form part of a
+register's type precisely so that conversion is an instruction rather than a surprise, and a masked
+store is the place a silent materialization would otherwise appear. The exception worth
+special-casing is a `Const` source equal to the destination's existing constant, which is a no-op.
+
+**Correction, from building it: a dictionary is not one of those forms, and the first draft of this
+section was wrong to lump it in.** "A masked store forces its destination to data form" sounds right
+and costs a string per record. A dictionary describes a vector's codes *individually*, so a
+destination can keep its own codes while the store writes other values into other lanes — a mixed
+vector is a shape the executor already reads, and column `E` of the dictionary corpus is one. What
+genuinely cannot survive is a code from a **different** dictionary, because two dictionaries number
+their entries independently; such a code is resolved to its string as it lands. An unbound
+destination adopts the source's dictionary instead.
+
+The general rule, which §14.1's finding above and the blend bug in §11.4 are the other two instances
+of: **resolution is the correctness mechanism, and carrying a dictionary is the optimization.** A
+selection that resolves everything is always right and always slow; one that carries a dictionary it
+cannot justify is fast and wrong. Every place that moves elements between vectors has to answer that
+question, and there are now three of them — `blend`, the masked store, and `CopyElem`'s callers in
+the storage layer.
 
 ### 14.3 Predication does not save work; predication *plus* something else does
 
