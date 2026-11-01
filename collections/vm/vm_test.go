@@ -138,6 +138,20 @@ var exprSources = []string{
 	`ifThenElse(Flag, 1, 2) && Cpus > 0`, `Cpus > 0 && ifThenElse(Flag, 1, 2)`,
 	`Missing ?: ifThenElse(Flag, 1, 2)`, `ifThenElse(Flag, Missing ?: 5, 6)`,
 	`ifThenElse(Cpus > 2, 1)`, `ifThenElse(Cpus > 2, 1, 2, 3)`, // bad arity: delegated
+	// stringListMember over a literal list, compiled to a set lookup. The sharp edges are the
+	// element TRIMMING, the default delimiter splitting on space as well as comma, and an undefined
+	// item acting as the empty string.
+	`stringListMember(Owner, "alice,bob")`, `stringListMember(Owner, "bob,carol")`,
+	`stringListMember(Owner, "")`, `stringListMember(Owner, "alice")`,
+	`stringListMember(Missing, "alice,,bob")`, `stringListMember(Missing, "alice,bob")`,
+	`stringListMember(Cpus, "alice,bob")`, `stringListMember(Flag, "alice")`,
+	`stringListMember(Owner, " alice , bob ")`, `stringListMember(Owner, "a b,alice")`,
+	`stringListMember(Owner, "alice;bob", ";")`, `stringListMember(Owner, "alice|bob", "|,")`,
+	`stringListMember(Owner, "alice,bob") && Cpus > 2`,
+	`stringListMember(Owner, Owner)`,         // list not constant: delegated
+	`stringListIMember(Owner, "ALICE")`,      // case-insensitive: never specialized
+	`stringListMember(Owner)`,                // bad arity: delegated
+	`stringListMember(Owner, "a", ",", "x")`, // likewise
 	// list / record / select / subscript (delegated)
 	`{1, 2, Cpus}`, `[Q = Cpus + 1]`, `Nested.K`, `L[1]`,
 	// strict built-in calls, compiled natively to OpCallFunc

@@ -48,6 +48,13 @@ const (
 	// and fall through to the compiled fallback expression.
 	OpJmpIfNotUndef
 
+	// OpStrListMember applies stringListMember over the constant list strLists[A] to the value on
+	// top of the stack, replacing it with the result.
+	//
+	// Only the case-sensitive variant over a LITERAL list compiles this way; see strlist.go for why
+	// stringListIMember does not.
+	OpStrListMember
+
 	// OpJmp jumps unconditionally to A. Emitted only by a conditional, to leave a taken branch.
 	OpJmp
 

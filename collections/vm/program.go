@@ -58,6 +58,9 @@ type Program struct {
 	// members are the constant lists of member/identicalMember calls (OpMember).
 	members []*memberSet
 
+	// strLists are the constant lists of stringListMember calls (OpStrListMember).
+	strLists []*strListSet
+
 	// readAttrs is the set of distinct unscoped attribute names the program may
 	// read, in first-seen order. Used by the store's query planner (M3) to pick
 	// the hot-header fast path; nil-safe to ignore.

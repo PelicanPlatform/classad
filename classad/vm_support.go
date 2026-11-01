@@ -338,3 +338,29 @@ func ConditionState(v Value) CondState {
 		return CondError
 	}
 }
+
+// SplitStringList splits a delimited string list exactly as the stringList
+// built-ins split it: on any rune in delimiter, with each element trimmed of
+// surrounding space, and with ", " as the delimiter set when delimiter is empty.
+//
+// It exists so a compiler can split a CONSTANT list once instead of per record,
+// without reimplementing the split. stringListMember re-splits its list argument
+// on every call, which for a literal list is the same work repeated for every ad
+// in a scan.
+func SplitStringList(list, delimiter string) []string {
+	return parseStringList(list, delimiter)
+}
+
+// StringListArg coerces a value to the string a stringList built-in treats it
+// as: a string is itself, UNDEFINED is the empty string, and anything else is
+// not usable (ok=false), which those built-ins report as ERROR.
+//
+// Note an undefined item does NOT match a list that looks like it has an empty
+// element: the split uses strings.FieldsFunc, which drops empty fields, so
+// "a,,b" is two elements and stringListMember(undefined, "a,,b") is FALSE. The
+// empty string is only ever found in a list that is itself empty of elements,
+// which no list is. That is worth stating because the opposite is the obvious
+// guess.
+func StringListArg(v Value) (string, bool) {
+	return stringListStrArg(v)
+}
