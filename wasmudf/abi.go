@@ -68,8 +68,12 @@ type frame struct {
 // otherwise produce it again -- the same value, for a different record, with
 // nothing anywhere reporting a problem.
 func writeArgs(mem api.Memory, base, size uint32, args []classad.Value) (frame, Reason) {
-	need := uint32(len(args)+1) * slotSize
-	if need > size {
+	// In 64 bits, because (argc+1)*16 computed in uint32 WRAPS at 2^28 arguments
+	// and a wrapped small total would pass this check and then write slots past
+	// the end of the region. Not a shape any expression has, and not a bug worth
+	// leaving in a bounds check.
+	need := (uint64(len(args)) + 1) * slotSize
+	if need > uint64(size) {
 		return frame{}, ReasonArgsTooLarge
 	}
 	f := frame{args: base, result: base + uint32(len(args))*slotSize}
