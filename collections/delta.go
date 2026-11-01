@@ -135,6 +135,17 @@ func (t *deltaTracker) mustCompose(h uint64) {
 	t.mu.Unlock()
 }
 
+// deltaInstead records that the write next just sent to a whole record was stored as a delta after
+// all: a writer not entitled to sealed values whose whole record would have had to carry one it cannot
+// open (see encodePatchKeyless). The chain grows one past the bound, which is advisory.
+func (t *deltaTracker) deltaInstead(h uint64) {
+	t.mu.Lock()
+	t.depth[h]++
+	t.mu.Unlock()
+	t.fulls.Add(-1)
+	t.deltas.Add(1)
+}
+
 // reset empties the tracker: every chain it described has just been collapsed.
 func (t *deltaTracker) reset() {
 	t.mu.Lock()
@@ -465,92 +476,9 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 // answer is what left a production mirror reporting every refused write under a single count.
 // See readFail.
 func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64, want materializeWant, dst []byte) ([]byte, *classad.ClassAd, bool, readFail) {
-	var vers []deltaVer
-	add := func(seg *segment, off uint32) {
-		if seg == nil {
-			return
-		}
-		if recSeq(seg.data, off) <= s0 && bytes.Equal(recKey(seg.data, off), key) {
-			vers = append(vers, deltaVer{recSeq(seg.data, off), seg, off})
-		}
-	}
-	chainBroke := false
-	for l := sh.dirGet(h); l.valid(); {
-		seg := sh.segForLoc(l)
-		if seg == nil {
-			// A link into a segment that no longer exists ends the walk -- and with it every
-			// OLDER version, which is where a chain's whole record lives. Recorded because that
-			// truncation and a base that was genuinely reclaimed are indistinguishable from the
-			// empty result, and they are different faults.
-			chainBroke = true
-			break
-		}
-		add(seg, l.off)
-		l = recNext(seg.data, l.off)
-	}
-	sealedSkipped := 0
-	sh.forEachSealedRecordCounting(key, h, &sealedSkipped, func(seg *segment, off uint32) bool {
-		add(seg, off)
-		return true
-	})
-	// The active segment is the one place neither route above is guaranteed to cover:
-	// forEachSealedRecord skips it by construction, so its records are reachable only through the
-	// chain. relinkActiveChains rebuilds that chain at Open, but a chain is only as good as every
-	// path that writes one, and the cost of a miss is a merge that silently drops a delta. So the
-	// versions found are checked for completeness from the record headers below, and the active
-	// segment is read directly when they are not: when no whole record was found, or when the
-	// versions from the base forward do not join up.
-	actScanned := false
-	scanAct := func() {
-		actScanned = true
-		seg := sh.act
-		for off := uint32(0); off < uint32(seg.used); {
-			if end, ok := seg.damaged().skip(off); ok {
-				off = end
-				continue
-			}
-			tl := recTotalLen(seg.data, off)
-			if tl == 0 || off+tl > uint32(seg.used) {
-				break
-			}
-			// recIsMarker, not recKeyLen()&markerFlag: recKeyLen MASKS the flag bits off, so that
-			// test was always true and this walk never skipped a marker. Harmless as it stood --
-			// a marker is keyless and add() matches on the key -- but it was not doing what it
-			// said, and with a second flag now in the same field it would matter.
-			if !recIsMarker(seg.data, off) {
-				add(seg, off)
-			}
-			off += tl
-		}
-	}
-	if !sh.hasFull(vers) && sh.act != nil {
-		scanAct()
-	}
-	if len(vers) == 0 {
-		return nil, nil, false, failDeltaNoVersions
-	}
-	vers = sortDeltaVers(vers)
-	base := deltaBase(vers)
-	if base >= 0 && !actScanned && sh.act != nil && deltaChainGap(vers[base:]) {
-		deltaChainGapScans.Add(1)
-		scanAct()
-		vers = sortDeltaVers(vers)
-		base = deltaBase(vers)
-	}
-	if base < 0 {
-		// No whole record anywhere in the chain. Three different faults land here and the
-		// repairs are unrelated, so record which one this was rather than leaving the caller
-		// to guess: the walk truncated at a dead link, a sealed segment could not be probed
-		// because its key index is not built yet (a WINDOW, so this one is transient and the
-		// write would succeed on a retry), or the base is genuinely gone.
-		noteNoBase(len(vers), chainBroke, sealedSkipped)
-		switch {
-		case chainBroke:
-			return nil, nil, false, failDeltaChainBroken
-		case sealedSkipped > 0:
-			return nil, nil, false, failDeltaIndexPending
-		}
-		return nil, nil, false, failDeltaNoBase
+	vers, base, why := sh.chainVersions(key, h, s0)
+	if why != failNone {
+		return nil, nil, false, why
 	}
 	// Decompress the participants into reused buffers. They all have to be live at once (the
 	// merge reads every one), so this is one buffer per chain position, reused across calls rather
@@ -642,6 +570,100 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 		return nil, merged, true, failNone
 	}
 	return c.encodeAdInto(dst, merged.AST()), merged, true, failNone
+}
+
+// chainVersions gathers every version of key visible at s0, sorted by commit sequence, and locates
+// the base: the newest whole record, the one the deltas after it merge over. A failure names why the
+// chain cannot be resolved. The caller holds at least the shard read lock.
+func (sh *shard) chainVersions(key []byte, h, s0 uint64) ([]deltaVer, int, readFail) {
+	var vers []deltaVer
+	add := func(seg *segment, off uint32) {
+		if seg == nil {
+			return
+		}
+		if recSeq(seg.data, off) <= s0 && bytes.Equal(recKey(seg.data, off), key) {
+			vers = append(vers, deltaVer{recSeq(seg.data, off), seg, off})
+		}
+	}
+	chainBroke := false
+	for l := sh.dirGet(h); l.valid(); {
+		seg := sh.segForLoc(l)
+		if seg == nil {
+			// A link into a segment that no longer exists ends the walk -- and with it every
+			// OLDER version, which is where a chain's whole record lives. Recorded because that
+			// truncation and a base that was genuinely reclaimed are indistinguishable from the
+			// empty result, and they are different faults.
+			chainBroke = true
+			break
+		}
+		add(seg, l.off)
+		l = recNext(seg.data, l.off)
+	}
+	sealedSkipped := 0
+	sh.forEachSealedRecordCounting(key, h, &sealedSkipped, func(seg *segment, off uint32) bool {
+		add(seg, off)
+		return true
+	})
+	// The active segment is the one place neither route above is guaranteed to cover:
+	// forEachSealedRecord skips it by construction, so its records are reachable only through the
+	// chain. relinkActiveChains rebuilds that chain at Open, but a chain is only as good as every
+	// path that writes one, and the cost of a miss is a merge that silently drops a delta. So the
+	// versions found are checked for completeness from the record headers below, and the active
+	// segment is read directly when they are not: when no whole record was found, or when the
+	// versions from the base forward do not join up.
+	actScanned := false
+	scanAct := func() {
+		actScanned = true
+		seg := sh.act
+		for off := uint32(0); off < uint32(seg.used); {
+			if end, ok := seg.damaged().skip(off); ok {
+				off = end
+				continue
+			}
+			tl := recTotalLen(seg.data, off)
+			if tl == 0 || off+tl > uint32(seg.used) {
+				break
+			}
+			// recIsMarker, not recKeyLen()&markerFlag: recKeyLen MASKS the flag bits off, so that
+			// test was always true and this walk never skipped a marker. Harmless as it stood --
+			// a marker is keyless and add() matches on the key -- but it was not doing what it
+			// said, and with a second flag now in the same field it would matter.
+			if !recIsMarker(seg.data, off) {
+				add(seg, off)
+			}
+			off += tl
+		}
+	}
+	if !sh.hasFull(vers) && sh.act != nil {
+		scanAct()
+	}
+	if len(vers) == 0 {
+		return nil, -1, failDeltaNoVersions
+	}
+	vers = sortDeltaVers(vers)
+	base := deltaBase(vers)
+	if base >= 0 && !actScanned && sh.act != nil && deltaChainGap(vers[base:]) {
+		deltaChainGapScans.Add(1)
+		scanAct()
+		vers = sortDeltaVers(vers)
+		base = deltaBase(vers)
+	}
+	if base < 0 {
+		// No whole record anywhere in the chain. Three different faults land here and the
+		// repairs are unrelated, so record which one this was rather than leaving the caller
+		// to guess: the walk truncated at a dead link, a sealed segment could not be probed
+		// because its key index is not built yet (a WINDOW, so this one is transient and the
+		// write would succeed on a retry), or the base is genuinely gone.
+		noteNoBase(len(vers), chainBroke, sealedSkipped)
+		switch {
+		case chainBroke:
+			return nil, -1, failDeltaChainBroken
+		case sealedSkipped > 0:
+			return nil, -1, failDeltaIndexPending
+		}
+		return nil, -1, failDeltaNoBase
+	}
+	return vers, base, failNone
 }
 
 // readWant is the form a point read needs: the object, except for a redacting read, which must
@@ -875,7 +897,10 @@ func (c *Collection) collapseBeforeRewrite() {
 func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isDelta, ok bool, why readFail) {
 	c := tx.c
 	eligible := len(b.removed) == 0 && b.patch != nil
-	if eligible && c.deltaMax > 0 && c.deltas != nil && c.inline && c.canWriteDelta() {
+	// Evaluated in the order the test always was: canWriteDelta records the store's delta mode, so it
+	// is asked only when a delta is otherwise possible.
+	deltaOK := eligible && c.deltaMax > 0 && c.deltas != nil && c.inline && c.canWriteDelta()
+	if deltaOK {
 		if c.deltas.next(h, true, c.keyExists(b.key, h), c.deltaMax) {
 			return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true, true, failNone
 		}
@@ -895,6 +920,11 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isD
 		}
 		// Record the decision so the chain restarts here even when delta mode declined.
 		c.deltas.next(h, false, false, c.deltaMax)
+	}
+	// A transaction not entitled to sealed values reads them as undefined, so composing from its read
+	// would store undefined over every one. It composes from the stored bytes instead.
+	if tx.redact && c.SealsValues() {
+		return tx.encodePatchKeyless(dst, b, h, deltaOK)
 	}
 	// A whole record is required: compose it from the stored ad plus this write's changes.
 	// b.ad is filled in so the rest of Commit (ordered-index maintenance, watch publication)

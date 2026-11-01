@@ -93,7 +93,7 @@ func sealedLayoutCounts(c *Collection) (inline, dict, columnar int) {
 
 // sealedPut stores records [lo, hi) in one transaction: the reads are what is under test, and a
 // durable commit per record is most of the fixture's time.
-func sealedPut(t *testing.T, c *Collection, lo, hi int) {
+func sealedPut(t testing.TB, c *Collection, lo, hi int) {
 	t.Helper()
 	tx := c.Begin()
 	for i := lo; i < hi; i++ {

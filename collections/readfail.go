@@ -40,6 +40,12 @@ const (
 	failDeltaChainBroken  // the version walk truncated at a link into a segment that is gone
 	failDeltaIndexPending // a sealed segment could not be probed: its key index is not built yet
 
+	// A write by a transaction not entitled to sealed values (BeginRedacted) that had to compose a
+	// whole record, where the record would have to keep a sealed value from an interned record. Its
+	// plaintext is keyed by that segment's dictionary, and only opening it could re-key it; the
+	// transaction may not. The record was readable -- to this writer, it was not usable.
+	failSealedNeedsKey
+
 	failMax // not a reason; bounds the counter array
 )
 
@@ -75,6 +81,8 @@ func (r readFail) String() string {
 		return "delta-chain-broken"
 	case failDeltaIndexPending:
 		return "delta-index-pending"
+	case failSealedNeedsKey:
+		return "sealed-needs-key"
 	}
 	return "unknown"
 }

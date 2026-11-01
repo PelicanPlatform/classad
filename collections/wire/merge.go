@@ -119,6 +119,29 @@ func asciiFoldEqual(a, b []byte) bool {
 // outright (hotClosureMatch requires flagHotClosure, which this does not set). AppendAdSubsetInline
 // emits none for the same reason.
 func AppendAdMergedInline(dst []byte, base Ad, overlays []Ad, sc *MergeScratch) ([]byte, bool) {
+	return appendMergedInline(dst, base, overlays, nil, sc)
+}
+
+// AppendAdPatchedInline is AppendAdMergedInline that also removes the attributes named in removed
+// (compared case-insensitively) wherever they appear, in base or in an overlay. It is what a write
+// that sets some attributes and deletes others composes a whole record with, when the record must be
+// built without opening the sealed values it carries: every attribute the write does not name is
+// copied from base or an overlay byte for byte, ciphertext included.
+func AppendAdPatchedInline(dst []byte, base Ad, overlays []Ad, removed []string, sc *MergeScratch) ([]byte, bool) {
+	return appendMergedInline(dst, base, overlays, removed, sc)
+}
+
+// isRemoved reports whether name is one of removed, ignoring ASCII case.
+func isRemoved(removed []string, name []byte) bool {
+	for _, r := range removed {
+		if foldEqualBytes(name, r) {
+			return true
+		}
+	}
+	return false
+}
+
+func appendMergedInline(dst []byte, base Ad, overlays []Ad, removed []string, sc *MergeScratch) ([]byte, bool) {
 	sc.Reset()
 	for _, ov := range overlays {
 		c, ok := ov.bodyStart()
@@ -141,6 +164,9 @@ func AppendAdMergedInline(dst []byte, base Ad, overlays []Ad, sc *MergeScratch) 
 			skipNode(c, 0)
 			if !c.ok {
 				return dst, false
+			}
+			if isRemoved(removed, name) {
+				continue
 			}
 			sc.set(name, ov[nodeStart:c.pos], ov[entStart:c.pos])
 		}
@@ -188,6 +214,11 @@ func AppendAdMergedInline(dst []byte, base Ad, overlays []Ad, sc *MergeScratch) 
 		skipNode(bc, 0)
 		if !bc.ok {
 			return dst, false
+		}
+		if isRemoved(removed, name) {
+			flushRun(entStart)
+			runStart = bc.pos
+			continue
 		}
 		idx := sc.find(name)
 		if idx < 0 {
