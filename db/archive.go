@@ -652,6 +652,14 @@ func IsMatchAll(constraint string) bool {
 	if len(empty.ExternalRefs(expr)) != 0 {
 		return false
 	}
+	// A visible reference is not the whole question: the read set has to be statically VISIBLE at
+	// all. eval() parses its argument at run time, so an expression with no attribute reference in
+	// its syntax may still read every attribute of every record -- and deciding it against an empty
+	// ad then answers for a read that never happened. vm.SelfRefsSafe is the predicate for exactly
+	// that, and eval() is the one construct that clears it.
+	if _, staticReads := vm.SelfRefsSafe(expr.AST()); !staticReads {
+		return false
+	}
 	b, err := expr.Eval(empty).BoolValue()
 	return err == nil && b
 }
@@ -679,6 +687,14 @@ func IsMatchNone(constraint string) bool {
 	}
 	empty := classad.New()
 	if len(empty.ExternalRefs(expr)) != 0 {
+		return false
+	}
+	// A visible reference is not the whole question: the read set has to be statically VISIBLE at
+	// all. eval() parses its argument at run time, so an expression with no attribute reference in
+	// its syntax may still read every attribute of every record -- and deciding it against an empty
+	// ad then answers for a read that never happened. vm.SelfRefsSafe is the predicate for exactly
+	// that, and eval() is the one construct that clears it.
+	if _, staticReads := vm.SelfRefsSafe(expr.AST()); !staticReads {
 		return false
 	}
 	b, err := expr.Eval(empty).BoolValue()

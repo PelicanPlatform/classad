@@ -137,12 +137,13 @@ func TestArchiveCountConstraintFallsBackGracefully(t *testing.T) {
 	// unparse() cannot expire for a structural reason rather than an implementation one: it takes the
 	// SYNTAX of its argument, not its value, and no value-level instruction can carry an AST.
 	//
-	// eval() would do as well and is not used, for an unrelated reason: the aggregate path answers an
-	// eval() constraint with a WRONG count rather than declining -- 0 where the row scan finds 400 --
-	// which reproduces on a clean checkout. Adding it here would make this test fail for something it
-	// is not about.
+	// eval() belongs here for the same reason and now behaves: it was excluded while the aggregate
+	// ladder answered an eval() constraint with a WRONG count rather than declining -- 0 where the
+	// row scan found 400 -- because the match-none fold decided it against an empty ad. The fold now
+	// requires the read set to be statically visible (TestMatchFoldRequiresStaticReads).
 	for _, constraint := range []string{
 		`unparse(JobStatus) == "JobStatus"`,
+		`eval("JobStatus") == 1`,
 	} {
 		if _, served := a.CountConstraint(constraint); served {
 			t.Errorf("%s was served columnar; it cannot be lowered, so something is answering it wrongly", constraint)
