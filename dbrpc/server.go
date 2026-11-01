@@ -1202,7 +1202,9 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		}
 		id := s.nextID.Add(1)
 		// The transaction carries the session's entitlement, so every read through it -- opLookupAd,
-		// opTxnQuery -- reads with no key for an unprivileged session. Writes are unaffected.
+		// opTxnQuery -- reads with no key for an unprivileged session. Its SetAttribute and
+		// DeleteAttribute change only the attribute named and never open a sealed value (see
+		// db.DB.BeginRedacted).
 		begin := d.Begin
 		if !sc.opts.IncludePrivate {
 			begin = d.BeginRedacted

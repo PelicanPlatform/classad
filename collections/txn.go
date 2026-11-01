@@ -463,8 +463,11 @@ func (c *Collection) Begin() *Txn {
 }
 
 // BeginRedacted is Begin for a caller NOT entitled to sealed values: reads through the transaction decode
-// with no key, so a sealed attribute comes back undefined. Writes are unaffected -- a redacted transaction
-// can still store an ad, and encodeAd seals what the collection's policy says to seal.
+// with no key, so a sealed attribute comes back undefined. It can still write: an ad it stores is sealed
+// as the collection's policy says, and a patch (PatchAttrs) changes only the attributes it names -- a
+// sealed value it does not name is kept exactly as stored, never opened. A patch whose whole record
+// would have to carry a sealed value from an interned record is stored as a delta where it can be and
+// otherwise refused (CommitResult.Unapplied, reason "sealed-needs-key"); see redactwrite.go.
 //
 // The entitlement lives on the transaction rather than on each read, so a new read method inherits it
 // instead of having to remember it.
@@ -627,6 +630,13 @@ func (tx *Txn) putWireAd(key, wire []byte, ad *classad.ClassAd, decode func([]by
 // removed names attributes the write deletes. Reads through this transaction still see the
 // merged view (Get applies the patch over the stored ad), so read-your-writes is unaffected.
 func (tx *Txn) PatchAttrs(key []byte, patch *classad.ClassAd, removed []string) {
+	if patch == nil {
+		// A write that only removes has nothing to set, and nil is the natural way to say so. Commit
+		// tells a patch buffer from a whole-ad one by a non-nil patch, so a nil one was taken for a
+		// Put of a nil ad and stored the key as an EMPTY ad -- every attribute gone, not just the
+		// removed ones.
+		patch = classad.New()
+	}
 	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
 	// Reuse an existing patch buffer for this key instead of replacing it. A caller applying a
 	// schedd transaction calls this once per attribute it changed, accumulating into one patch
