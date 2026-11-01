@@ -108,10 +108,20 @@ const (
 	// not be shadowed by -- or shadow -- an attribute of the same name. The compiler decides which
 	// a reference is, because only the compiler knows what is bound at that point.
 	//
-	// It appears only in a script program, and the register lowering resolves it to the register the
-	// binding statement left its value in, so it never reaches a running program in stack form. The
-	// stack interpreter therefore does not implement it; see ScriptProgram.
+	// It appears only in a script program, and the register lowering resolves it to the local's
+	// register, so it never reaches a running program in stack form. The stack interpreter therefore
+	// does not implement it; see ScriptProgram.
 	OpLoadLocal
+
+	// OpStoreLocal pops the top of the stack and binds it to locals[A].
+	//
+	// A local is a PLACE, not a value: it has one register for the whole script, written here and
+	// read by OpLoadLocal. That is what lets a binding made on one path of a branch and read after
+	// the merge be the same register either way, with no phi to construct -- which a model that gave
+	// each binding a fresh register could not express, and is why that model was replaced.
+	//
+	// Popping is what makes a statement stack-neutral, so the next one starts clean.
+	OpStoreLocal
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose

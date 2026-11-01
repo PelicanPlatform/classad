@@ -140,6 +140,11 @@ type RegProgram struct {
 	nregs int
 	res   int32 // the register holding the expression's value, or -1 for an empty program
 	src   *Program
+
+	// localRegs is the register holding each of a script's locals, in binding order. Empty for an
+	// ordinary expression. One register per local for the whole program is the model; this is what
+	// makes that checkable rather than merely intended.
+	localRegs []int32
 }
 
 // Len returns the instruction count (for tests and benchmarks).
@@ -167,41 +172,105 @@ func (rp *RegProgram) Source() *Program { return rp.src }
 // matching short-circuit, or an opcode it has not been taught. Each is a compiler bug, and each would
 // otherwise produce a register program that quietly disagrees with the stack one. The last is the
 // one that will actually happen: adding an opcode without extending this conversion.
-func LowerToRegisters(p *Program) *RegProgram {
-	return lowerMarked(p, nil)
-}
-
-// scriptMark records that the statement ending at stack-form index ip binds local `local`, or is the
-// result expression when local is -1.
+// LowerToRegisters converts a compiled expression -- or a script -- from stack form to register form.
 //
-// ip is one PAST the statement's last instruction -- the same convention a jump target uses, and for
-// the same reason: a statement whose expression ends in an Elvis has a join to run at that index, and
-// the register holding its value is the join's destination rather than what was on the stack before.
-type scriptMark struct {
-	ip    int
-	local int32
-}
-
-// lowerMarked is LowerToRegisters with the statement boundaries of a script, recording which register
-// each binding left its value in so OpLoadLocal can be resolved to it.
-func lowerMarked(p *Program, marks []scriptMark) *RegProgram {
-	byIP := make(map[int][]scriptMark, len(marks))
-	for _, m := range marks {
-		byIP[m.ip] = append(byIP[m.ip], m)
-	}
+// A SCRIPT's locals get one register each, allocated before any code and initialized to UNDEFINED.
+// That is what makes a local a place rather than a value: OpStoreLocal writes the register and
+// OpLoadLocal reads it, so a binding made on one path of a branch and read after the merge is the
+// same register either way, and no phi has to be constructed to say so.
+//
+// Initializing them matters for the same reason. A local read on a path that never bound it would
+// otherwise read a register nothing wrote; UNDEFINED is the answer ClassAd already has for "no value
+// here", and it keeps the register defined on every path, which the optimizer's liveness depends on.
+func LowerToRegisters(p *Program) *RegProgram {
 	l := &lowerer{
 		src:      p,
 		rp:       &RegProgram{src: p, res: -1},
 		newIdx:   make([]int32, len(p.code)+1),
 		pending:  map[int][]*joinPoint{},
-		marks:    byIP,
 		localReg: make([]int32, len(p.locals)),
 	}
+	needInit := localsNeedingInit(p)
 	for i := range l.localReg {
-		l.localReg[i] = -1
+		l.localReg[i] = l.reg()
+		if needInit[i] {
+			l.emit(RegInstr{Op: RUndef, Dst: l.localReg[i]})
+		}
 	}
 	l.lower()
+	l.rp.localRegs = l.localReg
 	return l.rp
+}
+
+// localsNeedingInit reports which locals must be initialized to UNDEFINED before the script runs.
+//
+// Only the ones whose reads a store does not provably reach. A local that is stored and then read in
+// STRAIGHT-LINE code needs nothing: the store always ran. One read before any store, or across a
+// point control can jump to -- the merge after a branch, say -- needs an initializer, because the
+// path that reaches the read may not have stored anything.
+//
+// It is written as a dominance question rather than as "does this program have branches" on purpose.
+// That second rule would be right today, when the only jumps are inside a single expression and so
+// cannot skip a store, and would silently become wrong the moment a statement-level branch exists.
+// This one does not have to be revisited: the merge after such a branch is a jump target, so a read
+// after it stops being dominated and gets its initializer automatically.
+//
+// The cost of a spurious initializer is not an incorrect program; it is a second definition of the
+// local's register, which makes the optimizer refuse to propagate through it.
+func localsNeedingInit(p *Program) []bool {
+	need := make([]bool, len(p.locals))
+	if len(need) == 0 {
+		return need
+	}
+	firstStore := make([]int, len(p.locals))
+	for i := range firstStore {
+		firstStore[i] = -1
+	}
+	for ip, in := range p.code {
+		if in.Op == OpStoreLocal && int(in.A) < len(firstStore) && firstStore[in.A] < 0 {
+			firstStore[in.A] = ip
+		}
+	}
+	targets := stackJumpTargets(p)
+	for ip, in := range p.code {
+		if in.Op != OpLoadLocal || int(in.A) >= len(need) {
+			continue
+		}
+		s := firstStore[in.A]
+		if s < 0 || s > ip {
+			need[in.A] = true
+			continue
+		}
+		for j := s + 1; j <= ip; j++ {
+			if targets[j] {
+				need[in.A] = true
+				break
+			}
+		}
+	}
+	return need
+}
+
+// stackJumpTargets marks the stack-form indices control can arrive at other than by falling through.
+func stackJumpTargets(p *Program) []bool {
+	t := make([]bool, len(p.code)+1)
+	mark := func(x int32) {
+		if x >= 0 && int(x) < len(t) {
+			t[x] = true
+		}
+	}
+	for _, in := range p.code {
+		switch in.Op {
+		case OpShortAnd, OpShortOr, OpJmpIfNotUndef, OpJmp:
+			mark(in.A)
+		case OpBranchCond:
+			c := p.conds[in.A]
+			mark(c.onFalse)
+			mark(c.onUndef)
+			mark(c.onError)
+		}
+	}
+	return t
 }
 
 // lowerer holds the state of one conversion.
@@ -209,9 +278,7 @@ type lowerer struct {
 	src *Program
 	rp  *RegProgram
 
-	// marks are a script's statement boundaries, by stack-form index, and localReg the register each
-	// local was bound to. Both empty for an ordinary expression.
-	marks    map[int][]scriptMark
+	// localReg is the register holding each of a script's locals. Empty for an ordinary expression.
 	localReg []int32
 
 	// vstack maps the stack form's operand stack to the registers currently holding those operands.
@@ -294,15 +361,18 @@ func (l *lowerer) lower() {
 		// Its value is what the fall-through produced, so the destinations here must receive it.
 		l.newIdx[ip] = int32(len(l.rp.code))
 		l.emitJoins(ip)
-		// AFTER the joins, for the reason scriptMark.ip documents.
-		l.bind(ip)
 		l.one(ip)
 	}
 	// The end of the program is a jump target too -- every Elvis and every logical operator whose
 	// right operand ends the expression targets it.
 	l.newIdx[len(l.src.code)] = int32(len(l.rp.code))
 	l.emitJoins(len(l.src.code))
-	l.bind(len(l.src.code))
+	// Exactly one value, or none for an empty program. More than one means a statement did not leave
+	// the stack as it found it, which is the invariant that lets statements be sequenced at all --
+	// and which a branch will depend on, since its paths must reach the merge with the same stack.
+	if len(l.vstack) > 1 {
+		panic("vm: lowering ended with more than one value on the stack; a statement is not stack-neutral")
+	}
 	if len(l.vstack) > 0 {
 		l.rp.res = l.vstack[len(l.vstack)-1]
 	}
@@ -311,22 +381,6 @@ func (l *lowerer) lower() {
 		l.emit(RegInstr{Op: RNop})
 	}
 	l.retarget()
-}
-
-// bind records the register holding the value of each statement that ends at stack-form index ip.
-//
-// A script's statements are emitted one after another and each leaves exactly one value, so the top
-// of the stack at a boundary is that statement's value. Nothing is popped: a local stays live for the
-// rest of the script, which is exactly the lifetime a stack cannot express and a register file can.
-func (l *lowerer) bind(ip int) {
-	for _, m := range l.marks[ip] {
-		if len(l.vstack) == 0 {
-			panic("vm: a script statement produced no value")
-		}
-		if m.local >= 0 {
-			l.localReg[m.local] = l.vstack[len(l.vstack)-1]
-		}
-	}
 }
 
 // emitJoins applies the Elvis joins registered for stack-form index ip, innermost first, and gives
@@ -467,15 +521,13 @@ func (l *lowerer) one(ip int) {
 		l.emit(RegInstr{Op: REvalNode, Dst: d, Imm: in.A})
 		l.push(d)
 	case OpLoadLocal:
-		// Resolved to the register the binding statement left its value in. A move rather than an
-		// alias keeps the form single-definition; collapsing it is copy propagation's job.
-		src := l.localReg[in.A]
-		if src < 0 {
-			panic("vm: a script reads a local before it is bound")
-		}
 		d := l.reg()
-		l.emit(RegInstr{Op: RMove, Dst: d, A: src})
+		l.emit(RegInstr{Op: RMove, Dst: d, A: l.localReg[in.A]})
 		l.push(d)
+	case OpStoreLocal:
+		// The statement's value goes into the local's register and leaves the stack, so a statement
+		// is stack-neutral and the next one starts clean.
+		l.emit(RegInstr{Op: RMove, Dst: l.localReg[in.A], A: l.pop()})
 	case OpShortAnd, OpShortOr:
 		// The left operand stays on the stack for the combine; the destination is allocated here so
 		// that both the short-circuit path and the combine write the same register.

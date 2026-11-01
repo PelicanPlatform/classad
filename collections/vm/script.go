@@ -27,6 +27,12 @@ import (
 // is inlined and nothing is re-lowered: a local that three statements read is computed once and read
 // from a register three times, which is the property the reduction law below actually tests.
 //
+// A LOCAL IS A PLACE. Each one has a single register for the whole script, written by OpStoreLocal
+// and read by OpLoadLocal, and every statement leaves the stack as it found it. An earlier model
+// gave each binding whatever register its expression happened to land in; that works in a straight
+// line and cannot survive a branch, where a binding made on one path has to be the same place a read
+// after the merge finds.
+//
 // THE ORACLE. A script of pure local bindings and a result expression has an obvious reference
 // implementation -- substitute the bindings into the result and evaluate THAT with classad.Eval:
 //
@@ -44,9 +50,7 @@ var ErrNoResult = errors.New("vm: script has no result expression")
 // Script accumulates statements. The zero value is not usable; call NewScript.
 type Script struct {
 	c      *compiler
-	marks  []scriptMark
 	byName map[string]int32
-	names  []string
 	hasRes bool
 	err    error
 }
@@ -90,9 +94,8 @@ func (s *Script) Let(name string, expr ast.Expr) *Script {
 		idx = int32(len(s.c.p.locals))
 		s.c.p.locals = append(s.c.p.locals, name)
 		s.byName[folded] = idx
-		s.names = append(s.names, folded)
 	}
-	s.marks = append(s.marks, scriptMark{ip: len(s.c.p.code), local: idx})
+	s.c.ins(OpStoreLocal, idx)
 	s.c.locals = s.byName
 	return s
 }
@@ -107,7 +110,6 @@ func (s *Script) Result(expr ast.Expr) *Script {
 		return s
 	}
 	s.emitExpr(expr)
-	s.marks = append(s.marks, scriptMark{ip: len(s.c.p.code), local: -1})
 	s.hasRes = true
 	return s
 }
@@ -153,7 +155,7 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 		}
 	}
 	s.c.p.readAttrs = kept
-	return &ScriptProgram{rp: lowerMarked(s.c.p, s.marks), p: s.c.p}, nil
+	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
 }
 
 // Run evaluates the script against scope and returns its result.

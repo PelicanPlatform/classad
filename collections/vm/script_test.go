@@ -266,3 +266,110 @@ func TestScriptErrors(t *testing.T) {
 		t.Error("empty local name: want an error")
 	}
 }
+
+// TestLocalsNeedingInit exercises the initializer rule directly, on hand-built programs.
+//
+// It has to be direct: the Script API cannot currently produce a read that a store does not reach,
+// because Let always stores before any later statement can load. The rule exists for the shapes a
+// statement-level branch will introduce, and testing it only through the API would leave it
+// unexercised until then -- which is how a rule written in advance turns out to be wrong.
+func TestLocalsNeedingInit(t *testing.T) {
+	load := Instr{Op: OpLoadLocal, A: 0}
+	store := Instr{Op: OpStoreLocal, A: 0}
+	one := Instr{Op: OpPushTrue}
+
+	for _, tc := range []struct {
+		name string
+		code []Instr
+		want bool
+	}{
+		{"store then load, straight line", []Instr{one, store, load}, false},
+		{"load with no store at all", []Instr{load}, true},
+		{"load before the store", []Instr{load, one, store}, true},
+		{"second load still dominated", []Instr{one, store, load, load}, false},
+	} {
+		p := &Program{code: tc.code, locals: []string{"x"}}
+		if got := localsNeedingInit(p)[0]; got != tc.want {
+			t.Errorf("%s: needs init = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+
+	// A read the store reaches only on one path. The jump target between them is what makes the
+	// store stop dominating it, and it is why the rule is written as dominance rather than as "does
+	// this program contain a branch".
+	jumpOver := []Instr{
+		{Op: OpPushTrue},            // 0
+		{Op: OpJmpIfNotUndef, A: 4}, // 1: jumps PAST the store
+		one,                         // 2
+		store,                       // 3
+		load,                        // 4: a jump target, so the store does not reach it
+	}
+	p := &Program{code: jumpOver, locals: []string{"x"}}
+	if !localsNeedingInit(p)[0] {
+		t.Error("a read control can reach without passing the store was not marked as needing an initializer")
+	}
+}
+
+// TestScriptLocalIsOnePlace pins the model this rework exists for: a local has ONE register for the
+// whole script, so rebinding writes the same place rather than creating a second one.
+//
+// Under the model it replaced, each binding took whatever register its expression landed in. That
+// works in a straight line and cannot survive a branch, where a binding made on one path has to be
+// the same place a read after the merge finds.
+func TestScriptLocalIsOnePlace(t *testing.T) {
+	scope, err := classad.Parse(`[]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e1, _ := parser.ParseExpr("1")
+	inc, _ := parser.ParseExpr("x + 1")
+	res, _ := parser.ParseExpr("x")
+	sp, err := NewScript().Let("x", e1).Let("x", inc).Let("x", inc).Result(res).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := len(sp.Locals()); n != 1 {
+		t.Errorf("%d locals, want 1: rebinding must not create a second one", n)
+	}
+	if got := sp.Run(scope).String(); got != "3" {
+		t.Errorf("x = 1; x = x + 1; x = x + 1; x  => %s, want 3", got)
+	}
+	// One REGISTER for the local, written by all three bindings. Checking the local INDEX instead
+	// would pass under the model this replaced, where each binding took a fresh register.
+	rp := sp.RegProgram()
+	if len(rp.localRegs) != 1 {
+		t.Fatalf("%d local registers, want 1", len(rp.localRegs))
+	}
+	writes := 0
+	for _, in := range rp.code {
+		if d, ok := regDef(in); ok && d == rp.localRegs[0] {
+			writes++
+		}
+	}
+	if writes != 3 {
+		t.Errorf("%d writes to the local's register, want 3 (one per binding to the same place)", writes)
+	}
+}
+
+// TestScriptStatementsAreStackNeutral pins that a statement leaves the stack as it found it, which
+// is what lets statements be sequenced at all -- and what a branch will depend on, since its paths
+// have to arrive at the merge with the same stack.
+func TestScriptStatementsAreStackNeutral(t *testing.T) {
+	e, _ := parser.ParseExpr("Cpus + 1")
+	res, _ := parser.ParseExpr("a + b + c")
+	sp, err := NewScript().Let("a", e).Let("b", e).Let("c", e).Result(res).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// One value at the end -- the result -- and no accumulation from the bindings.
+	if sp.RegProgram().res < 0 {
+		t.Fatal("no result register")
+	}
+	scope, err := classad.Parse(`[ Cpus = 4 ]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sp.Run(scope).String(); got != "15" {
+		t.Errorf("three bindings of Cpus+1 summed => %s, want 15", got)
+	}
+}
