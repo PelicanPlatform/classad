@@ -100,6 +100,18 @@ const (
 	// first argument) with the call's value against members[A], a list of
 	// constants compiled to sets. See member.go.
 	OpMember
+
+	// OpLoadLocal pushes the value bound to locals[A] by an earlier statement of a script.
+	//
+	// A script's locals are NOT attributes: `x = Cpus + 1` binds a name that later statements read
+	// without the scope ever seeing it, so a reference to x must not compile to OpLoadRef and must
+	// not be shadowed by -- or shadow -- an attribute of the same name. The compiler decides which
+	// a reference is, because only the compiler knows what is bound at that point.
+	//
+	// It appears only in a script program, and the register lowering resolves it to the register the
+	// binding statement left its value in, so it never reaches a running program in stack form. The
+	// stack interpreter therefore does not implement it; see ScriptProgram.
+	OpLoadLocal
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose

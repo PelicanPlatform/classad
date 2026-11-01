@@ -94,6 +94,10 @@ func astHeight(e ast.Expr) int {
 type compiler struct {
 	p    *Program
 	seen map[string]bool
+
+	// locals maps a folded local name to its index, for a SCRIPT. Nil for an ordinary expression, in
+	// which case every unscoped reference is an attribute. See Script.
+	locals map[string]int32
 }
 
 // ins appends an instruction and returns its index (for later backpatching).
@@ -152,6 +156,15 @@ func (c *compiler) emit(expr ast.Expr) {
 	case *ast.StringLiteral:
 		c.pushConst(classad.NewStringValue(v.Value))
 	case *ast.AttributeReference:
+		// In a script, a BARE name that is currently bound is a local, not an attribute. A scoped
+		// reference (MY.x, TARGET.x) is always an attribute, which is what gives a script a way to
+		// reach an attribute whose name a local has taken.
+		if v.Scope == ast.NoScope && c.locals != nil {
+			if idx, ok := c.locals[v.NormalizedName()]; ok {
+				c.ins(OpLoadLocal, idx)
+				return
+			}
+		}
 		c.ins(OpLoadRef, c.addRef(v.Name, v.Scope))
 	case *ast.ParenExpr:
 		// Parentheses are transparent to evaluation.

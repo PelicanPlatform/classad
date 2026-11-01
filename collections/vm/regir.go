@@ -168,11 +168,37 @@ func (rp *RegProgram) Source() *Program { return rp.src }
 // otherwise produce a register program that quietly disagrees with the stack one. The last is the
 // one that will actually happen: adding an opcode without extending this conversion.
 func LowerToRegisters(p *Program) *RegProgram {
+	return lowerMarked(p, nil)
+}
+
+// scriptMark records that the statement ending at stack-form index ip binds local `local`, or is the
+// result expression when local is -1.
+//
+// ip is one PAST the statement's last instruction -- the same convention a jump target uses, and for
+// the same reason: a statement whose expression ends in an Elvis has a join to run at that index, and
+// the register holding its value is the join's destination rather than what was on the stack before.
+type scriptMark struct {
+	ip    int
+	local int32
+}
+
+// lowerMarked is LowerToRegisters with the statement boundaries of a script, recording which register
+// each binding left its value in so OpLoadLocal can be resolved to it.
+func lowerMarked(p *Program, marks []scriptMark) *RegProgram {
+	byIP := make(map[int][]scriptMark, len(marks))
+	for _, m := range marks {
+		byIP[m.ip] = append(byIP[m.ip], m)
+	}
 	l := &lowerer{
-		src:     p,
-		rp:      &RegProgram{src: p, res: -1},
-		newIdx:  make([]int32, len(p.code)+1),
-		pending: map[int][]*joinPoint{},
+		src:      p,
+		rp:       &RegProgram{src: p, res: -1},
+		newIdx:   make([]int32, len(p.code)+1),
+		pending:  map[int][]*joinPoint{},
+		marks:    byIP,
+		localReg: make([]int32, len(p.locals)),
+	}
+	for i := range l.localReg {
+		l.localReg[i] = -1
 	}
 	l.lower()
 	return l.rp
@@ -182,6 +208,11 @@ func LowerToRegisters(p *Program) *RegProgram {
 type lowerer struct {
 	src *Program
 	rp  *RegProgram
+
+	// marks are a script's statement boundaries, by stack-form index, and localReg the register each
+	// local was bound to. Both empty for an ordinary expression.
+	marks    map[int][]scriptMark
+	localReg []int32
 
 	// vstack maps the stack form's operand stack to the registers currently holding those operands.
 	vstack []int32
@@ -263,12 +294,15 @@ func (l *lowerer) lower() {
 		// Its value is what the fall-through produced, so the destinations here must receive it.
 		l.newIdx[ip] = int32(len(l.rp.code))
 		l.emitJoins(ip)
+		// AFTER the joins, for the reason scriptMark.ip documents.
+		l.bind(ip)
 		l.one(ip)
 	}
 	// The end of the program is a jump target too -- every Elvis and every logical operator whose
 	// right operand ends the expression targets it.
 	l.newIdx[len(l.src.code)] = int32(len(l.rp.code))
 	l.emitJoins(len(l.src.code))
+	l.bind(len(l.src.code))
 	if len(l.vstack) > 0 {
 		l.rp.res = l.vstack[len(l.vstack)-1]
 	}
@@ -277,6 +311,22 @@ func (l *lowerer) lower() {
 		l.emit(RegInstr{Op: RNop})
 	}
 	l.retarget()
+}
+
+// bind records the register holding the value of each statement that ends at stack-form index ip.
+//
+// A script's statements are emitted one after another and each leaves exactly one value, so the top
+// of the stack at a boundary is that statement's value. Nothing is popped: a local stays live for the
+// rest of the script, which is exactly the lifetime a stack cannot express and a register file can.
+func (l *lowerer) bind(ip int) {
+	for _, m := range l.marks[ip] {
+		if len(l.vstack) == 0 {
+			panic("vm: a script statement produced no value")
+		}
+		if m.local >= 0 {
+			l.localReg[m.local] = l.vstack[len(l.vstack)-1]
+		}
+	}
 }
 
 // emitJoins applies the Elvis joins registered for stack-form index ip, innermost first, and gives
@@ -415,6 +465,16 @@ func (l *lowerer) one(ip int) {
 	case OpEvalNode:
 		d := l.reg()
 		l.emit(RegInstr{Op: REvalNode, Dst: d, Imm: in.A})
+		l.push(d)
+	case OpLoadLocal:
+		// Resolved to the register the binding statement left its value in. A move rather than an
+		// alias keeps the form single-definition; collapsing it is copy propagation's job.
+		src := l.localReg[in.A]
+		if src < 0 {
+			panic("vm: a script reads a local before it is bound")
+		}
+		d := l.reg()
+		l.emit(RegInstr{Op: RMove, Dst: d, A: src})
 		l.push(d)
 	case OpShortAnd, OpShortOr:
 		// The left operand stays on the stack for the combine; the destination is allocated here so
