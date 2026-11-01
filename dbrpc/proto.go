@@ -277,6 +277,32 @@ const (
 	// without DAEMON (it would let any reader erase the evidence).
 	// [table ("" = all)][reset u8] -> [json QueryStatsReport]
 	opQueryStats op = 66
+
+	// opAttrTypes profiles what a table's attributes HOLD: per attribute, the classes of
+	// value it carried across a sample and the exact bounds of the numeric ones (see
+	// db.AttrTypeProfile). It is what a consumer that must publish one declared type per
+	// attribute -- an Arrow schema, a catalog -- reads to decide those types.
+	//
+	// READ-level and non-mutating, deliberately, and each of those is a correction to an
+	// easier answer:
+	//
+	//   - It is NOT one of the schema.* admin actions, even though it belongs to that
+	//     family by subject. opAdmin is in isMutating(), so a read-only connection cannot
+	//     reach it at all, and on an ARCHIVE the whole op requires DAEMON -- which would
+	//     make the measurement unavailable on history, the table whose attribute variety
+	//     most needs measuring. That is the same trap schemaScanTable was introduced to
+	//     fix for schema.rebuild.
+	//   - It samples and classifies. It writes nothing, so a read-only connection is not
+	//     refused.
+	//
+	// PRIVACY: a profile reports no values, but it does report numeric BOUNDS, and a bound
+	// on a private attribute discloses plenty -- min/max of a secret is not a secret kept.
+	// So private attributes are omitted entirely unless the connection may see them.
+	// Omitted rather than reported-with-bounds-elided, because which attributes are private
+	// is already public (it is configured), so their absence leaks nothing while their
+	// bounds would.
+	// [table][sampleMax i32] -> [json AttrTypeReport]
+	opAttrTypes op = 68
 )
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
