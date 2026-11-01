@@ -340,6 +340,31 @@ jobs:
       working-directory: ${{ matrix.module }}
       run: go test -race -count=1 ./...
 
+    # wasmudf's guest fixtures are committed TWICE: the .wat a reviewer reads and
+    # the .wasm the tests load. Nothing in the suite relates the two -- it loads
+    # the binary, deliberately, so that running the tests needs no wasm toolchain
+    # and no test can skip itself on a machine without one.
+    #
+    # The gap that leaves is a .wat edited without rebuilding its .wasm. The tests
+    # stay green, because they are testing the old binary, while the source a
+    # reviewer reads says something else. This step closes it in the one place a
+    # toolchain is cheap to have.
+    - name: Fixture sources match their binaries (wasmudf)
+      if: matrix.module == 'wasmudf'
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq wabt
+        cd wasmudf/testdata
+        rc=0
+        for f in *.wat; do
+          wat2wasm "$f" -o "/tmp/$(basename "${f%.wat}").wasm" || { echo "::error::$f does not compile"; rc=1; continue; }
+          cmp -s "${f%.wat}.wasm" "/tmp/$(basename "${f%.wat}").wasm" || {
+            echo "::error file=wasmudf/testdata/$f::${f%.wat}.wasm is stale; run wasmudf/testdata/build.sh"
+            rc=1
+          }
+        done
+        echo "checked $(ls *.wat | wc -l) fixture pairs"
+        exit $rc
+
   # dbrpc/ is a separate Go module, and the root module's `go test ./...` does not
   # descend into a nested one -- so the RPC server for the whole database ran in NO CI
   # job at all. A dispatch bug lived there long enough to ship a broken feature
