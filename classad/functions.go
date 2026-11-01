@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -912,7 +911,7 @@ func builtinRegexp(args []Value) Value {
 
 	// Compile the regex with flags prepended
 	fullPattern := flags + pattern
-	re, err := regexp.Compile(fullPattern)
+	re, err := compileRegexpCached(fullPattern)
 	if err != nil {
 		return NewErrorValue()
 	}
@@ -2539,7 +2538,7 @@ func builtinStringListRegexpMember(args []Value) Value {
 	}
 
 	fullPattern := flags + pattern
-	re, err := regexp.Compile(fullPattern)
+	re, err := compileRegexpCached(fullPattern)
 	if err != nil {
 		return NewErrorValue()
 	}
@@ -2599,7 +2598,7 @@ func builtinRegexpMember(ev *Evaluator, args []Value) Value {
 	}
 
 	fullPattern := flags + pattern
-	re, err := regexp.Compile(fullPattern)
+	re, err := compileRegexpCached(fullPattern)
 	if err != nil {
 		return NewErrorValue()
 	}
@@ -2662,7 +2661,7 @@ func builtinRegexps(args []Value) Value {
 	}
 
 	fullPattern := flags + pattern
-	re, err := regexp.Compile(fullPattern)
+	re, err := compileRegexpCached(fullPattern)
 	if err != nil {
 		return NewErrorValue()
 	}
@@ -2717,7 +2716,7 @@ func builtinReplace(args []Value) Value {
 	}
 
 	fullPattern := flags + pattern
-	re, err := regexp.Compile(fullPattern)
+	re, err := compileRegexpCached(fullPattern)
 	if err != nil {
 		return NewErrorValue()
 	}
