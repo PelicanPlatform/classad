@@ -1257,9 +1257,11 @@ switchable; form selection first, then liveness and allocation, then compaction,
 
 ## 10. Open questions
 
-1. **Does `ColumnSource.LoadColumn` promise per-batch purity?** §6.6's CSE on `OpLoadRef` needs it and
-   the interface does not state it (`collections/vm/vecexec.go:252-259`). `blockVecSource` appears to
-   satisfy it; confirm and write it down before CSE ships.
+1. ~~**Does `ColumnSource.LoadColumn` promise per-batch purity?**~~ **Answered in §14.7: yes, and it is
+   not the binding constraint.** `blockVecSource` satisfies it, but the vector kernels overwrite their
+   left operand and convert their right operand in place — and `toMask` is lossy on numbers — so CSE
+   on a load needs a copy at the second use or an ownership analysis, not merely a purity clause. The
+   clause should still be written into the interface's comment.
 2. **Compaction's real threshold.** The 1/4 inherited from `minLiveNum`/`minLiveDen`
    (`collections/colvec.go:62-63`) is a bail-out threshold, not a gather threshold, and the gather is
    cheaper. Measure with the §7.4 selectivity sweep; do not pick a number.
@@ -1649,3 +1651,56 @@ costing, which is exactly why the two quantities have to be named separately rat
 - **Then measure §14.3's crossover**, before building compaction for control flow. If the early exit
   moves it far enough, compaction stays a scan optimization and the control-flow path never needs it —
   which would be the cheapest possible outcome and is not the one the draft assumed.
+
+### 14.7 Today's vector kernels are destructive in **both** operands, which constrains D2a and CSE
+
+Checking open question 1 — does `ColumnSource.LoadColumn` promise per-batch purity? — turned up
+something larger than the question. The answer to the question is yes:
+`blockVecSource.LoadColumn` reads a fixed block through a block cache, writes only `dst`, and is
+deterministic and idempotent for a given `(block, name, scope)` (`collections/colvec.go:104-131`).
+Purity holds and can be written into the interface's contract.
+
+**It is not the binding constraint.** The vector kernels do not compute into a destination; they
+**overwrite their left operand, and convert their right operand's representation in place**:
+
+```go
+func logicalVec(op string, l, r *Vec) bool {
+    l.toMask()
+    r.toMask()                                     // <- mutates r
+    planeAnd(l.Hi, l.Lo, r.Hi, r.Lo, l.Hi, l.Lo)   // <- result into l
+```
+— `collections/vm/vecexec.go:1488-1497`; `arithVec` does the same with `ensureInts`/`toData`
+(`:604-608`), `unopVec` and `strListVec` replace their single operand
+(`:744`, `collections/vm/strlist.go:128`), and `memberVec` writes `s.top()`
+(`collections/vm/member.go:340`).
+
+Two consequences, and the second is a correctness obligation rather than a performance note.
+
+**1. A register-form vector executor cannot map `Dst = op(A, B)` onto these kernels as written.** The
+register form's whole shape is a separate destination (`collections/vm/regir.go:127-137`), and these
+kernels have none. D2a therefore has to choose, per kernel, between copying an operand to the
+destination first (a memcpy at batch width) and keeping the stack machine's in-place discipline
+behind a register-level ownership rule — the same choice the allocator makes when it coalesces a
+result into a dying operand's register (§5.3). The right answer is probably "coalesce when the
+operand is dead here, copy when it is not", which is standard, but it has to be *decided* rather than
+discovered: a kernel called with a live operand silently corrupts it, and the corruption is a wrong
+value and not a crash.
+
+**2. `r.toMask()` is lossy, so CSE on a load needs more than purity.** A data vector of numbers
+converts to a mask by ClassAd operand truthiness — a nonzero number becomes TRUE — so a vector that
+has been through `toMask` no longer holds its numbers. In `x > 1 && x`, if the two reads of `x` were
+CSE'd to one vector, `logicalVec`'s `r.toMask()` would clobber the operand the comparison still
+needed. Today this cannot happen because every `OpLoadRef` pushes a fresh vector, which is precisely
+the cost CSE wants to remove.
+
+So §6.6's CSE on `OpLoadRef` needs **either** a copy at the second use **or** an ownership analysis
+that shares only where the sharer is the last consumer. The copy is still a win and should be the
+first version: a load is a *decompression* — roughly 78% of mutable read CPU is zstd — while a copy
+is a memcpy at batch width, so even an unconditional copy at every reuse buys most of the prize. The
+ownership analysis is the optimization *of* CSE, not its precondition.
+
+**What to change in the tree now, independent of any of this:** write the purity contract into
+`ColumnSource`'s doc comment (`collections/vm/vecexec.go:271-278`), which is what open question 1
+asked for, and write the destructiveness into each kernel's. The kernels' behaviour is currently
+discoverable only by reading their bodies, and it is the kind of contract that a future caller
+violates once and silently.
