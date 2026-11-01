@@ -180,3 +180,26 @@ func (s *ScanStats) mergeWorker(w *ScanStats) {
 	s.RecordsClosureReassembled += w.RecordsClosureReassembled
 	s.RowsMatched += w.RowsMatched
 }
+
+// Add folds another scan's counts into s, for a query answered by more than one scan -- a
+// read of a view served from both its live backing and its sealed archive, say. Every field
+// above is a count of work done, so the total is the sum.
+//
+// Tier is the exception: it names WHICH strategy answered, and two strategies have no sum,
+// so s keeps the one it already reported.
+func (s *ScanStats) Add(o ScanStats) {
+	s.SegmentsTotal += o.SegmentsTotal
+	s.SegmentsPruned += o.SegmentsPruned
+	s.SegmentsScanned += o.SegmentsScanned
+	s.RecordsVisited += o.RecordsVisited
+	s.RecordsColumnDecided += o.RecordsColumnDecided
+	s.RecordsConjunctRejected += o.RecordsConjunctRejected
+	s.RecordsNarrowMatched += o.RecordsNarrowMatched
+	s.RecordsReassembled += o.RecordsReassembled
+	s.RecordsClosureReassembled += o.RecordsClosureReassembled
+	s.RowsMatched += o.RowsMatched
+	s.SegmentsIndexed += o.SegmentsIndexed
+	s.SegmentsIndexSkipped += o.SegmentsIndexSkipped
+	s.SegmentsUnindexed += o.SegmentsUnindexed
+	s.IndexCandidates += o.IndexCandidates
+}

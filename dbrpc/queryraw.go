@@ -389,7 +389,7 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 			}
 		}
 		if stats != nil {
-			addScanStats(stats, sstats)
+			stats.Add(sstats)
 		}
 	}
 	if wantStats {

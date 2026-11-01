@@ -219,3 +219,82 @@ func loadViewState(stateDir string) (viewState, error) {
 	}
 	return st, nil
 }
+
+// TopK answers a top-K over the WHOLE view: the live backing and, for a continuous
+// aggregate that has sealed, its archive too.
+//
+// It is not a top-K of the backing with the archive's rows appended. The k best of a union
+// are within the union of each half's k best, so each half runs its own top-K -- keeping the
+// columnar cutoff scan that makes a top-K cheaper than a sort -- and the two results are
+// merged through the same heap the single-table path uses. Reusing that heap is the point:
+// a merge with its own comparator would order the union by one rule and a single half by
+// another, and the difference would show only once a view started sealing.
+func (v *View) TopK(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, error) {
+	return v.topKUnion(constraint, attrs, orderAttr, desc, k, nil)
+}
+
+// TopKStats is TopK that also returns the scan breakdown, summed over both halves.
+func (v *View) TopKStats(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, collections.ScanStats, error) {
+	var stats collections.ScanStats
+	rows, err := v.topKUnion(constraint, attrs, orderAttr, desc, k, &stats)
+	return rows, stats, err
+}
+
+func (v *View) topKUnion(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats) ([][]classad.Value, error) {
+	arch, sealed := v.SealedArchive()
+	// Project the order attribute explicitly, so neither half trims it and the merge below
+	// can still see what to order by. withOrderAttr then reports added=false for each half,
+	// and the trimming happens once, here.
+	proj, orderIdx, added := withOrderAttr(attrs, orderAttr)
+
+	var live [][]classad.Value
+	var err error
+	if stats != nil {
+		var s collections.ScanStats
+		live, s, err = v.backing.TopKStats(constraint, proj, orderAttr, desc, k)
+		stats.Add(s)
+	} else {
+		live, err = v.backing.TopK(constraint, proj, orderAttr, desc, k)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !sealed {
+		return trimOrderCol(live, added), nil
+	}
+
+	var old [][]classad.Value
+	if stats != nil {
+		var s collections.ScanStats
+		old, s, err = arch.TopKStats(constraint, proj, orderAttr, desc, k)
+		stats.Add(s)
+	} else {
+		old, err = arch.TopK(constraint, proj, orderAttr, desc, k)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return topKResult(func(yield func([]classad.Value) bool) {
+		for _, row := range live {
+			if !yield(row) {
+				return
+			}
+		}
+		for _, row := range old {
+			if !yield(row) {
+				return
+			}
+		}
+	}, orderIdx, desc, k, added), nil
+}
+
+// trimOrderCol drops the order column that withOrderAttr appended, when it appended one.
+func trimOrderCol(rows [][]classad.Value, added bool) [][]classad.Value {
+	if !added {
+		return rows
+	}
+	for i, row := range rows {
+		rows[i] = row[:len(row)-1]
+	}
+	return rows
+}

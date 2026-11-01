@@ -3,16 +3,16 @@ package dbrpc
 import (
 	"strconv"
 
-	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 )
 
-// viewSealedTabler is the optional Catalog capability to reach a continuous aggregate's
-// sealed history as a table. Optional for the same reason viewSealer is: a Catalog
-// implementation that has no views need not provide it, and one that predates sealing
-// simply reports none, leaving every read served from the backing alone as before.
-type viewSealedTabler interface {
-	ViewSealedTable(name string) (*db.ArchiveTable, bool)
+// viewOwner is the optional Catalog capability to reach a view itself, rather than only its
+// backing. It is what lets a handler ask the view for a complete answer -- a top-K or an
+// aggregate over both halves -- instead of assembling one from parts it would have to know
+// about. Optional for the same reason viewSealer is: a Catalog with no views need not
+// provide it, and one that does not leaves reads served from the backing alone, as before.
+type viewOwner interface {
+	View(name string) (*db.View, bool)
 }
 
 // tableKind is which of the catalog's three namespaces a name was found in.
@@ -46,7 +46,8 @@ type tableRef struct {
 	kind   tableKind
 	db     *db.DB
 	arch   *db.ArchiveTable
-	sealed *db.ArchiveTable
+	view   *db.View         // kindView only, when the catalog exposes it
+	sealed *db.ArchiveTable // kindView only, when the view has sealed history
 }
 
 // seals reports whether this name has a sealed half that a read must also consult.
@@ -64,9 +65,12 @@ func (s *Server) resolveTable(name string) tableRef {
 	}
 	if d, ok := s.cat.ViewBacking(name); ok {
 		ref := tableRef{kind: kindView, db: d}
-		if vs, ok := s.cat.(viewSealedTabler); ok {
-			if a, has := vs.ViewSealedTable(name); has {
-				ref.sealed = a
+		if vo, ok := s.cat.(viewOwner); ok {
+			if v, has := vo.View(name); has {
+				ref.view = v
+				if a, sealed := v.SealedArchive(); sealed {
+					ref.sealed = a
+				}
 			}
 		}
 		return ref
@@ -138,24 +142,4 @@ func mergeSorted(a, b []string) []string {
 		}
 	}
 	return append(append(out, a[i:]...), b[j:]...)
-}
-
-// addScanStats folds the second scan's counts into the first, for a read served from both
-// halves of a view. Every field is a count of work done, so the total is the sum; Tier names
-// the strategy and is left as the first scan reported it, there being no sum of strategies.
-func addScanStats(dst *collections.ScanStats, add collections.ScanStats) {
-	dst.SegmentsTotal += add.SegmentsTotal
-	dst.SegmentsPruned += add.SegmentsPruned
-	dst.SegmentsScanned += add.SegmentsScanned
-	dst.RecordsVisited += add.RecordsVisited
-	dst.RecordsColumnDecided += add.RecordsColumnDecided
-	dst.RecordsConjunctRejected += add.RecordsConjunctRejected
-	dst.RecordsNarrowMatched += add.RecordsNarrowMatched
-	dst.RecordsReassembled += add.RecordsReassembled
-	dst.RecordsClosureReassembled += add.RecordsClosureReassembled
-	dst.RowsMatched += add.RowsMatched
-	dst.SegmentsIndexed += add.SegmentsIndexed
-	dst.SegmentsIndexSkipped += add.SegmentsIndexSkipped
-	dst.SegmentsUnindexed += add.SegmentsUnindexed
-	dst.IndexCandidates += add.IndexCandidates
 }

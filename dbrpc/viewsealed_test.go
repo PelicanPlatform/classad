@@ -167,3 +167,40 @@ func TestViewSealedRespectsLimitAcrossHalves(t *testing.T) {
 		t.Errorf("limit %d returned %d rows; the limit must bound the union of both halves", limit, len(rows))
 	}
 }
+
+// A top-K over a sealed view must be the k best of the UNION. The fixture's buckets ascend
+// with time and metric_size ascends with the bucket, so the largest sizes are in the OLDEST
+// buckets only if the data says so -- here they are in the newest, which seal first. That is
+// the case that catches a top-K served from the live backing alone: it would return the
+// unsealed tail's best, which are not the view's best at all.
+func TestViewSealedTopKSpansBothHalves(t *testing.T) {
+	ctx := context.Background()
+	f := newSealedFixture(t)
+	defer f.close()
+
+	const k = 3
+	want, err := f.c.TopK(ctx, sealView, "true", []string{"time", "metric_size"}, "metric_size", true, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != k {
+		t.Fatalf("before sealing: top-%d returned %d rows", k, len(want))
+	}
+
+	f.sealAll()
+
+	got, err := f.c.TopK(ctx, sealView, "true", []string{"time", "metric_size"}, "metric_size", true, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("after sealing: top-%d returned %d rows, want %d", k, len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("after sealing: top-%d row %d = %q, want %q.\n"+
+				"The k best of the union are not the k best of the live backing; sealing must "+
+				"not change which rows a top-K returns.", k, i, got[i], want[i])
+		}
+	}
+}
