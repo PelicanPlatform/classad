@@ -186,6 +186,16 @@ func (rp *RegProgram) Source() *Program { return rp.src }
 // otherwise read a register nothing wrote; UNDEFINED is the answer ClassAd already has for "no value
 // here", and it keeps the register defined on every path, which the optimizer's liveness depends on.
 func LowerToRegisters(p *Program) *RegProgram {
+	return lowerWithInit(p, localsNeedingInit(p))
+}
+
+// lowerWithInit is LowerToRegisters with the initializer set supplied rather than computed.
+//
+// It exists for the test that makes the dominance analysis safe to trust: initializing EVERY local is
+// trivially correct, so lowering a program both ways and comparing results checks the analysis
+// against the one answer that needs no proof. A spurious initializer costs instructions; a missing
+// one is a wrong answer, and this is what says there is no missing one.
+func lowerWithInit(p *Program, needInit []bool) *RegProgram {
 	l := &lowerer{
 		src:      p,
 		rp:       &RegProgram{src: p, res: -1},
@@ -193,7 +203,6 @@ func LowerToRegisters(p *Program) *RegProgram {
 		pending:  map[int][]*joinPoint{},
 		localReg: make([]int32, len(p.locals)),
 	}
-	needInit := localsNeedingInit(p)
 	for i := range l.localReg {
 		l.localReg[i] = l.reg()
 		if needInit[i] {
@@ -207,73 +216,48 @@ func LowerToRegisters(p *Program) *RegProgram {
 
 // localsNeedingInit reports which locals must be initialized to UNDEFINED before the script runs.
 //
-// Only the ones whose reads a store does not provably reach. A local that is stored and then read in
-// STRAIGHT-LINE code needs nothing: the store always ran. One read before any store, or across a
-// point control can jump to -- the merge after a branch, say -- needs an initializer, because the
-// path that reaches the read may not have stored anything.
+// Only the ones whose reads no store DOMINATES. If a store to the local is on every path from the
+// start of the program to the read, the store ran and the register holds its value; otherwise some
+// path reaches the read having stored nothing, and UNDEFINED is the answer ClassAd already has for
+// "no value here".
 //
-// It is written as a dominance question rather than as "does this program have branches" on purpose.
-// That second rule would be right today, when the only jumps are inside a single expression and so
-// cannot skip a store, and would silently become wrong the moment a statement-level branch exists.
-// This one does not have to be revisited: the merge after such a branch is a jump target, so a read
-// after it stops being dominated and gets its initializer automatically.
+// This asks the dominance question directly. It used to approximate it -- a local needed an
+// initializer if its FIRST store came after the read, or if any jump target lay between the two --
+// which was sound but inserted initializers that were not needed: anything after the merge of a
+// branch got one whether or not both paths stored. That is not a wrong answer, it is a second
+// definition of the local's register, and a second definition is what makes copy propagation refuse
+// to propagate through it (see optimize.go). So the approximation cost optimization, not correctness,
+// and the fix is the exact question rather than a better heuristic.
 //
-// The cost of a spurious initializer is not an incorrect program; it is a second definition of the
-// local's register, which makes the optimizer refuse to propagate through it.
+// An UNREACHABLE read is ignored: it cannot happen, so no initializer can be needed for it.
 func localsNeedingInit(p *Program) []bool {
 	need := make([]bool, len(p.locals))
 	if len(need) == 0 {
 		return need
 	}
-	firstStore := make([]int, len(p.locals))
-	for i := range firstStore {
-		firstStore[i] = -1
-	}
+	stores := make([][]int, len(p.locals))
 	for ip, in := range p.code {
-		if in.Op == OpStoreLocal && int(in.A) < len(firstStore) && firstStore[in.A] < 0 {
-			firstStore[in.A] = ip
+		if in.Op == OpStoreLocal && int(in.A) < len(stores) {
+			stores[in.A] = append(stores[in.A], ip)
 		}
 	}
-	targets := stackJumpTargets(p)
+	c := buildCFG(len(p.code), func(ip int, buf []int) []int { return stackSuccs(p, ip, buf) })
 	for ip, in := range p.code {
-		if in.Op != OpLoadLocal || int(in.A) >= len(need) {
+		if in.Op != OpLoadLocal || int(in.A) >= len(need) || need[in.A] || !c.reach[ip] {
 			continue
 		}
-		s := firstStore[in.A]
-		if s < 0 || s > ip {
-			need[in.A] = true
-			continue
-		}
-		for j := s + 1; j <= ip; j++ {
-			if targets[j] {
-				need[in.A] = true
+		dominated := false
+		for _, st := range stores[in.A] {
+			if c.dominates(st, ip) {
+				dominated = true
 				break
 			}
 		}
+		if !dominated {
+			need[in.A] = true
+		}
 	}
 	return need
-}
-
-// stackJumpTargets marks the stack-form indices control can arrive at other than by falling through.
-func stackJumpTargets(p *Program) []bool {
-	t := make([]bool, len(p.code)+1)
-	mark := func(x int32) {
-		if x >= 0 && int(x) < len(t) {
-			t[x] = true
-		}
-	}
-	for _, in := range p.code {
-		switch in.Op {
-		case OpShortAnd, OpShortOr, OpJmpIfNotUndef, OpJmp, OpJmpVoid:
-			mark(in.A)
-		case OpBranchCond, OpBranchVoid:
-			c := p.conds[in.A]
-			mark(c.onFalse)
-			mark(c.onUndef)
-			mark(c.onError)
-		}
-	}
-	return t
 }
 
 // lowerer holds the state of one conversion.

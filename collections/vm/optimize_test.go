@@ -139,10 +139,11 @@ func TestCopyPropActuallyFires(t *testing.T) {
 // over-caution. An Elvis join writes one destination from several paths, so it is NOT
 // single-definition, and substituting it would take whichever path the pass looked at.
 //
-// This pins the OBSERVABLE behaviour -- the join's copy survives and both paths stay right -- and
-// not which of copyProp's conditions enforces it. Two of them do, independently, for the shapes the
-// compiler currently emits, so neither can be removed on its own and have any test notice. What
-// notices the unsound combination is TestOptimizeAgreesOnScripts, through a local bound to an Elvis.
+// The definition count is now the ONLY condition that refuses a join. It used to share the job with
+// a straight-line test -- no branch between the copy and the read -- which dominance replaced, and
+// dominance does not refuse a join on its own: a join's copy DOES dominate the reads that follow it.
+// So this test went from redundant to load-bearing without its text changing, which is the reason
+// to say so here.
 //
 // The expression deliberately uses the join's value somewhere other than as the program's result: a
 // bare `Missing ?: 7` has the join destination AS the result, so the result check refuses it and
@@ -393,8 +394,17 @@ func TestOptimizerKnowsTheOpcodesWeEmit(t *testing.T) {
 		for i, in := range rp.code {
 			// A panic here is the failure; the message names the opcode.
 			buf = regUses(rp, in, buf)
-			if _, ok := regDef(in); !ok && in.Op != RNop {
-				t.Errorf("%s instruction %d (op %d) defines nothing and is not a nop", src, i, in.Op)
+			// A control-flow opcode carries no destination, so it defines nothing; everything else
+			// must, or a pass that reasons about definitions has an instruction it cannot see.
+			switch in.Op {
+			case RNop, RJump, RFault, RBranchCond:
+				if _, ok := regDef(in); ok {
+					t.Errorf("%s instruction %d (op %d) claims a definition it does not have", src, i, in.Op)
+				}
+			default:
+				if _, ok := regDef(in); !ok {
+					t.Errorf("%s instruction %d (op %d) defines nothing and is not control flow", src, i, in.Op)
+				}
 			}
 		}
 	}
