@@ -3,6 +3,7 @@ package vm
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -25,14 +26,14 @@ import (
 // each attribute's literal into a Vec element, the scalar side by inserting the same parsed expression
 // into a ClassAd. Neither side is derived from the other, so the test cannot be circular.
 type testSource struct {
-	recs []map[string]string
-	// vals caches each attribute's evaluated literal. LoadColumn must not allocate, or an allocation
-	// test of the executor would be measuring the fixture.
-	vals []map[string]classad.Value
+	recs  []map[string]string
+	vals  []map[string]classad.Value
+	names map[string]string // any spelling of an attribute name -> the spelling vals is keyed by
 }
 
 func newTestSource(recs []map[string]string) *testSource {
-	s := &testSource{recs: recs, vals: make([]map[string]classad.Value, len(recs))}
+	s := &testSource{recs: recs, vals: make([]map[string]classad.Value, len(recs)),
+		names: map[string]string{}}
 	for i, r := range recs {
 		s.vals[i] = make(map[string]classad.Value, len(r))
 		for k, src := range r {
@@ -40,7 +41,22 @@ func newTestSource(recs []map[string]string) *testSource {
 			if err != nil {
 				panic(err)
 			}
+			// Stored under BOTH the given spelling and the folded one, because ClassAd attribute
+			// names are case-insensitive and a real source resolves them through an intern table,
+			// which folds. A case-sensitive lookup here made `a != 0` serve all-undefined against a
+			// record carrying `A`, where the scalar interpreter resolved it -- a harness that
+			// disagreed with the product, found by FuzzVecParity within two seconds.
+			//
+			// Both spellings rather than only the folded one so the common lookup is an exact hit:
+			// strings.ToLower allocates for a name that is not already lower-case, and
+			// TestVecScratchReuse requires a steady-state LoadColumn to allocate nothing at all.
 			s.vals[i][k] = q.Eval(classad.New())
+			// Both spellings resolve to the stored one. A real source resolves a name through its
+			// intern table, which folds; doing it with a table rather than by folding at lookup time
+			// is what keeps LoadColumn allocation-free, since strings.ToLower allocates for any name
+			// that is not already lower-case and TestVecScratchReuse requires zero.
+			s.names[k] = k
+			s.names[strings.ToLower(k)] = k
 		}
 	}
 	return s
@@ -50,8 +66,15 @@ func (s *testSource) LoadColumn(name string, scope ast.AttributeScope, dst *Vec)
 	if scope != ast.NoScope && scope != ast.MyScope {
 		return false
 	}
+	// Resolved once, outside the record loop. An attribute no record carries is not in the table, and
+	// folding it is the only case that allocates -- it then misses every record and is served as
+	// undefined, which is what a source that knows the attribute is absent everywhere should do.
+	key, known := s.names[name]
+	if !known {
+		key = strings.ToLower(name)
+	}
 	for i := range s.recs {
-		v, ok := s.vals[i][name]
+		v, ok := s.vals[i][key]
 		if !ok {
 			dst.St[i] = VsUndef
 			continue
@@ -184,6 +207,34 @@ var vecExprs = []string{
 	"isBoolean(A > 4)", "isUndefined(A > 4)", "isInteger(A > 4)", "int(A > 4)",
 	"string(A > 4)", "bool(A > 4)", "isBoolean(A > 4 && B < 4)", "isBoolean(!F)",
 	"int(A > 4) + 1", "string(A > 4) == \"true\"",
+	// ELVIS, now a blend. A is undefined in some records and absent in others, so the fallback path
+	// is exercised rather than merely present.
+	"A ?: 5", "A ?: B", "A ?: 0", `S ?: "x"`, `A ?: S`, "F ?: true",
+	"(A ?: 1) + (B ?: 2)", "(A ?: 1) > 4",
+	// Right-nested Elvis: both operators converge on ONE instruction, so the join order matters.
+	"A ?: (B ?: 9)", "A ?: (B ?: (A ?: 11))",
+	// CONDITIONALS, also a blend. Every condition state: true/false, a number, undefined, a string
+	// (error), and a mask-form condition.
+	"ifThenElse(A > 4, 1, 2)", "ifThenElse(F, A, B)", "ifThenElse(A, 1, 2)",
+	"ifThenElse(S, 1, 2)", "ifThenElse(A, A, B)", "ifThenElse(B, 1, 2)",
+	`ifThenElse(A > 4, S, "none")`, "ifThenElse(A > 4, 1, 2) + 1",
+	"ifThenElse(A > 4, A + B, A - B)", "-ifThenElse(F, 1, 2)",
+	"ifThenElse(A > 4, 1, 2) == 1", "ifThenElse(F, 1, 2) && A > 0",
+	// Nested conditionals, and the two constructs sharing a join.
+	"ifThenElse(A > 4, ifThenElse(F, 1, 2), 3)",
+	"ifThenElse(F, ifThenElse(A > 4, 1, 2), ifThenElse(B > 2, 3, 4))",
+	"A ?: ifThenElse(F, 1, 2)", "ifThenElse(F, A ?: 1, B ?: 2)",
+	"ifThenElse(A > 4, 1, 2) ?: 99", "(A ?: 1) ?: 2",
+	// REAL OVERFLOW, which is asymmetric in the reference: a result of +Inf is ERROR, while -Inf and
+	// NaN are ordinary real values. The fast arithmetic loop has to agree with that, and pinning both
+	// directions is what keeps a fix for one from breaking the other.
+	"A + 1.7977e308 + 1.7977e308",   // +Inf: must be ERROR
+	"1.7977e308 * 1.7977e308",       // likewise
+	"A * 1.7977e308 * 1.7977e308",   //
+	"0.0 - 1.7977e308 - 1.7977e308", // -Inf: must stay a real
+	"A - 1.7977e308 - 1.7977e308",   //
+	"-(1.7977e308 + 1.7977e308)",    // ERROR negated, not -Inf
+	"(A + 1.7977e308 + 1.7977e308) > 0",
 	// every argument constant: computed once, not per record
 	"pow(2, 10)", "floor(3.7)", "quantize(7, 4)",
 }
@@ -223,21 +274,24 @@ func TestVecMatchesScalarPerRecord(t *testing.T) {
 
 // TestVecDeclinesUnsupported pins what the executor refuses, so a future change that starts silently
 // serving one of these has to update the test and say so.
+//
+// Elvis and conditionals used to be here. They are served now, as blends, and live in vecExprs where
+// every record is checked against the scalar interpreter. What is left is refused for one of three
+// durable reasons: the program is not native at all (a delegated subtree), the RESULT is a value a
+// Vec cannot hold (a list or a nested ad), or the built-in is nondeterministic.
 func TestVecDeclinesUnsupported(t *testing.T) {
 	src := newTestSource([]map[string]string{
 		{"A": "1", "S": `"x"`},
 	})
 	for _, expr := range []string{
-		`A ?: 5`,                  // Elvis: a per-record select, no combine opcode
-		`size({1,2,3})`,           // a strict call whose ARGUMENT is a delegated subtree
-		`strcat("a","b")`,         // a lazy built-in: delegated, so OpEvalNode
-		`ifThenElse(A > 1, 2, 3)`, // likewise lazy
-		`eval("A + 1")`,           // resolves in the scope, which a column source is not
-		`split(S)`,                // strict, but returns a LIST, which a vector cannot hold
-		`splitUserName(S)`,        // likewise
-		`random(A)`,               // nondeterministic: never compiled natively
-		`ifThenElse(A > 1, 2, 3)`, // native as a BRANCH, but a branch is not vectorizable yet
-		`ifThenElse(A > 1, 2, 3) + 1`,
+		`size({1,2,3})`,    // a strict call whose ARGUMENT is a delegated subtree
+		`strcat("a","b")`,  // a lazy built-in: delegated, so OpEvalNode
+		`eval("A + 1")`,    // resolves in the scope, which a column source is not
+		`unparse(A)`,       // needs its argument's syntax, so it can never be a value operation
+		`split(S)`,         // strict, but returns a LIST, which a vector cannot hold
+		`splitUserName(S)`, // likewise
+		`random(A)`,        // nondeterministic: never compiled natively
+		`{1, 2, A}`,        // a list literal is delegated, and a vector cannot hold a list anyway
 	} {
 		q, err := Parse(expr)
 		if err != nil {
@@ -431,4 +485,40 @@ func TestVecIdentityExhaustive(t *testing.T) {
 			}
 		}
 	}
+}
+
+// FuzzVecParity is the differential gate on the VECTOR executor, where the corpus test is the
+// hand-written one. The oracle is the scalar interpreter over the same Program and the same records,
+// which is itself fuzzed against the tree-walking evaluator (FuzzDifferential).
+//
+// The contract it enforces is one-sided, and that is the point: DECLINING is always acceptable, so a
+// mutation that makes the executor refuse more is not a failure. Serving a record with a value the
+// scalar interpreter does not agree with is the only failure, because a decline falls back and a
+// wrong answer does not.
+func FuzzVecParity(f *testing.F) {
+	for _, es := range vecExprs {
+		f.Add(es)
+	}
+	f.Fuzz(func(t *testing.T, exprSrc string) {
+		q, err := Parse(exprSrc)
+		if err != nil || q == nil {
+			return
+		}
+		// Built per iteration rather than shared: a fuzz target runs concurrently, and a source
+		// shared across workers would make a failure depend on which worker got there first.
+		src := vecCorpus()
+		n := len(src.recs)
+		var scratch VecScratch
+		got, ok := q.VecEval(src, n, &scratch)
+		if !ok {
+			return
+		}
+		for i := 0; i < n; i++ {
+			want := q.Eval(src.ad(i))
+			if !sameValue(got.value(i), want) {
+				t.Fatalf("expr=%q record %d: vector %s (state %d) != scalar %s",
+					exprSrc, i, got.value(i), got.St[i], want)
+			}
+		}
+	})
 }

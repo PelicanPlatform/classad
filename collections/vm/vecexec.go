@@ -45,12 +45,21 @@ import (
 // against a plain string, either against a number -- resolves the code and compares with the
 // evaluator's own fold comparison, or hooks, so the representation never reaches the semantics.
 //
-// NOT HANDLED, returning ok=false so the caller falls back rather than guessing: the Elvis operator (a
-// per-record select with no combine opcode to hang it on), a CONDITIONAL (OpBranchCond/OpJmp -- a
-// per-record branch, which a vector can only express as a blend under a mask and which is the same
-// primitive Elvis needs), the magic CurrentTime attribute, delegated
-// subtrees (OpEvalNode, which Native() already excludes), and any built-in call whose result a vector
-// cannot hold (a list or a nested ad -- see callFuncVec).
+// BRANCHES become BLENDS. The Elvis operator and a conditional (ifThenElse) both select per record,
+// which a vector cannot do by jumping, so every path is evaluated and the join picks each element
+// from the path that record's condition chose. See blendPending.
+//
+// Evaluating a path the scalar executor would have skipped is safe here, and for the same reason
+// OpShortAnd is a no-op above: ClassAd values are TOTAL, so a skipped path still produces a value --
+// ERROR, perhaps -- and the blend discards it. The one way a skipped path could differ observably is
+// a cyclic reference, which panics rather than producing a value; that cannot arise in this executor
+// because OpLoadRef is served by the ColumnSource and never by evaluating an ad attribute's
+// expression, and OpEvalNode is excluded by Native(). If a reference here ever resolved through the
+// evaluator, this reasoning would fail and both constructs would have to decline again.
+//
+// NOT HANDLED, returning ok=false so the caller falls back rather than guessing: the magic CurrentTime
+// attribute, delegated subtrees (OpEvalNode, which Native() already excludes), and any built-in call
+// whose result a vector cannot hold (a list or a nested ad -- see callFuncVec).
 //
 // FUNCTION CALLS are handled, but elementwise rather than as kernels: see callFuncVec for why that is
 // the useful increment and what would change that. member/identicalMember over a constant list is the
@@ -289,6 +298,10 @@ func (q *Query) VecEval(src ColumnSource, n int, scratch *VecScratch) (*Vec, boo
 func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecScratch) (*Vec, bool) {
 	s.reset(n)
 	for ip := 0; ip < len(p.code); {
+		// A branching construct converging here blends its paths before this instruction runs.
+		if !s.applyBlends(ip) {
+			return nil, false
+		}
 		in := p.code[ip]
 		switch in.Op {
 		case OpPushConst:
@@ -339,12 +352,30 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			if !callFuncVec(ev, p.funcs[in.A], s) {
 				return nil, false
 			}
+		case OpJmpIfNotUndef:
+			// The left operand stays on the stack as the blend's selector; the fallback is evaluated
+			// unconditionally and the join picks per record.
+			if s.depth == 0 {
+				return nil, false
+			}
+			s.pushBlend(blendPending{target: int(in.A), base: s.depth - 1})
+		case OpBranchCond:
+			if s.depth == 0 {
+				return nil, false
+			}
+			s.pushBlend(blendPending{target: int(p.conds[in.A].end), base: s.depth - 1, cond: true})
+		case OpJmp:
+			// No-op, like the short-circuit opcodes: every path is evaluated and the join blends them.
 		default:
-			return nil, false // OpJmpIfNotUndef (Elvis), OpEvalNode, anything added later
+			return nil, false // OpEvalNode, anything added later
 		}
 		ip++
 	}
-	if s.depth != 1 {
+	// Constructs converging on the end of the program.
+	if !s.applyBlends(len(p.code)) {
+		return nil, false
+	}
+	if s.depth != 1 || len(s.blends) != 0 {
 		return nil, false
 	}
 	return s.top(), true
@@ -363,6 +394,91 @@ type VecScratch struct {
 	// argbuf is the boxed argument list handed to one built-in call, reused across elements and
 	// across batches so an elementwise call does not allocate per record.
 	argbuf []classad.Value
+
+	// blends are the branching constructs whose joins have not been reached, innermost last.
+	blends []blendPending
+}
+
+// blendPending is one branching construct whose paths are being evaluated, waiting for its join.
+//
+// base is the stack slot holding the construct's SELECTOR -- the Elvis left operand, or the
+// conditional's condition -- which is deliberately left on the stack rather than popped. Popping it
+// would hand its slot straight back to the next push, because VecScratch recycles by depth, and the
+// selector is needed at the join. So the paths' values accumulate above it at known offsets and the
+// join reads them from there.
+type blendPending struct {
+	target int  // the stack-form index this construct converges on
+	base   int  // stack slot of the selector; path values follow it
+	cond   bool // a conditional (four paths); otherwise Elvis (two)
+}
+
+// pushBlend records a construct whose join has not been reached.
+func (s *VecScratch) pushBlend(b blendPending) { s.blends = append(s.blends, b) }
+
+// applyBlends resolves every construct that converges on stack-form index ip, innermost first.
+//
+// Innermost first is required, not merely tidy: with `A ?: (B ?: 7)` both Elvis operators converge on
+// the same instruction, and the inner one's result is the outer one's right operand.
+func (s *VecScratch) applyBlends(ip int) bool {
+	for len(s.blends) > 0 && s.blends[len(s.blends)-1].target == ip {
+		b := s.blends[len(s.blends)-1]
+		s.blends = s.blends[:len(s.blends)-1]
+		if !s.blend(b) {
+			return false
+		}
+	}
+	return true
+}
+
+// blend computes one construct's result and leaves it in the selector's slot.
+//
+// The result is built in a freshly pushed vector and swapped into place rather than written over the
+// selector, because the selector is still being READ per element -- and for a mask-form selector the
+// read is from the bitplanes while the write would be to the data arrays, so writing in place would
+// mean a vector that is half one form and half the other.
+func (s *VecScratch) blend(b blendPending) bool {
+	// How many path values sit above the selector. A conditional pushes four (true, false, undefined,
+	// error). Elvis pushes ONE: its left operand is both the selector and the value taken when the
+	// selector is defined, so only the fallback is a separate path.
+	nPaths := 1
+	if b.cond {
+		nPaths = 4
+	}
+	if s.depth != b.base+1+nPaths {
+		return false // a path did not leave exactly one value; decline rather than guess
+	}
+	sel := s.stack[b.base]
+	paths := s.stack[b.base+1 : b.base+1+nPaths]
+	dst := s.push()
+	dst.Dict, dst.Const, dst.Mask = nil, false, false
+	for i := 0; i < dst.n; i++ {
+		var from *Vec
+		if b.cond {
+			switch classad.ConditionState(sel.value(i)) {
+			case classad.CondTrue:
+				from = paths[0]
+			case classad.CondFalse:
+				from = paths[1]
+			case classad.CondUndef:
+				from = paths[2]
+			default:
+				from = paths[3]
+			}
+		} else if sel.value(i).IsUndefined() {
+			from = paths[0] // the Elvis fallback
+		} else {
+			from = sel // the left operand IS the value when it is defined
+		}
+		from.toData()
+		if !dst.CopyElem(i, from, i) {
+			return false
+		}
+	}
+	// Move the result into the selector's slot and drop the paths, swapping pointers so every vector
+	// stays in the pool (see callFuncVec).
+	s.stack[b.base], s.stack[s.depth-1] = s.stack[s.depth-1], s.stack[b.base]
+	s.depth = b.base + 1
+	return true
 }
 
 // args returns argbuf sized to exactly argc elements.
@@ -384,6 +500,7 @@ func (s *VecScratch) evaluator() *classad.Evaluator {
 
 func (s *VecScratch) reset(n int) {
 	s.depth, s.n = 0, n
+	s.blends = s.blends[:0]
 }
 
 func (s *VecScratch) push() *Vec {
@@ -528,6 +645,16 @@ func arithVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 			f = a - b
 		case "*":
 			f = a * b
+		}
+		// A real result that OVERFLOWS to positive infinity is ERROR in the reference, while -Inf and
+		// NaN are ordinary real values (classad's realArithResult). The integer path above already
+		// hands its overflow to the hook; this is the same case one type over, and leaving it out
+		// served +Inf where the evaluator says error -- found by FuzzVecParity, not by reading.
+		if math.IsInf(f, 1) {
+			if !hookOne(ev, op, l, r, i) {
+				return false
+			}
+			continue
 		}
 		l.SetReal(i, f)
 	}

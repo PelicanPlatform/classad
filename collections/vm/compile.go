@@ -259,7 +259,9 @@ func (c *compiler) emitIfThenElse(v *ast.FunctionCall) bool {
 	c.ins(OpPushError, 0)
 
 	end := len(c.p.code)
-	c.p.conds[k] = condTargets{onFalse: int32(onFalse), onUndef: int32(onUndef), onError: int32(onError)}
+	c.p.conds[k] = condTargets{
+		onFalse: int32(onFalse), onUndef: int32(onUndef), onError: int32(onError), end: int32(end),
+	}
 	c.patch(jTrue, end)
 	c.patch(jFalse, end)
 	c.patch(jUndef, end)

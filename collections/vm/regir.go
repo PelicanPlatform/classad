@@ -342,6 +342,10 @@ func (l *lowerer) retarget() {
 		t.onFalse = l.newIdx[t.onFalse]
 		t.onUndef = l.newIdx[t.onUndef]
 		t.onError = l.newIdx[t.onError]
+		// end is unused by the register form -- a conditional's paths converge through joinPoint,
+		// not by a recorded index -- but it is mapped anyway so the struct never holds a mix of
+		// stack-form and register-form indices for the next reader to trip over.
+		t.end = l.newIdx[t.end]
 	}
 }
 
