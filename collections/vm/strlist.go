@@ -39,20 +39,35 @@ func newStrListSet(elems []string) *strListSet {
 	return s
 }
 
-// eval applies stringListMember(item, <the constant list>) to one item value.
+// lookup answers stringListMember(item, <the constant list>) as two separate outcomes: whether the
+// item is in the list, and whether the item was usable at all.
 //
-// It reproduces the reference's argument handling rather than assuming the item is a string: a string
-// is itself, UNDEFINED is the EMPTY STRING, and anything else is ERROR. (An undefined item does not
-// thereby match "a,,b": the split drops empty fields, so that list has two elements and no empty
-// one.) The reference's "both arguments undefined is UNDEFINED" rule
-// cannot apply here, because this is only compiled when the list argument is a string literal, which
-// is never undefined; emitStrListMember is what guarantees that.
-func (s *strListSet) eval(item classad.Value) classad.Value {
+// Keeping them separate is what lets the vector kernel write a result directly. A single Value
+// return would make every element's answer a boxed value that the kernel then has to unbox, and
+// would leave it with an "unrepresentable result" branch that cannot happen -- the answers here are
+// exactly a boolean and ERROR, both of which a Vec holds.
+//
+// The item coercion is the reference's, not a simplification of it: a string is itself, UNDEFINED is
+// the EMPTY STRING, and anything else is unusable. (An undefined item does not thereby match
+// "a,,b": the split drops empty fields, so that list has two elements and no empty one.) The
+// reference's "both arguments undefined is UNDEFINED" rule cannot apply, because this is only
+// compiled when the list argument is a string literal, which is never undefined; emitStrListMember
+// is what guarantees that.
+func (s *strListSet) lookup(item classad.Value) (found, usable bool) {
 	str, ok := classad.StringListArg(item)
 	if !ok {
+		return false, false
+	}
+	_, found = s.elems[str]
+	return found, true
+}
+
+// eval is lookup boxed back into a Value, for the scalar and register executors.
+func (s *strListSet) eval(item classad.Value) classad.Value {
+	found, usable := s.lookup(item)
+	if !usable {
 		return classad.NewErrorValue()
 	}
-	_, found := s.elems[str]
 	return classad.NewBoolValue(found)
 }
 
@@ -113,22 +128,26 @@ func (c *compiler) emitStrListMember(fc *ast.FunctionCall) bool {
 func strListVec(s *strListSet, v *Vec) bool {
 	v.toData()
 	v.ensureInts()
-	if v.Const {
-		// Every record holds the same item, so the answer is the same for all of them.
-		res := s.eval(v.valueData(0))
-		if !v.setValueData(0, res) {
-			return false
+	set := func(i int, found, usable bool) {
+		if usable {
+			v.SetBool(i, found)
+			return
 		}
+		v.St[i] = VsError
+	}
+	if v.Const {
+		// Every record holds the same item, so the answer is the same for all of them and element 0
+		// stands for the batch.
+		found, usable := s.lookup(v.valueData(0))
+		set(0, found, usable)
 		v.Const, v.Dict = true, nil
 		return true
 	}
 	// valueData resolves a dictionary code to its string, so a coded column is handled without the
 	// result carrying the dictionary over.
 	for i := 0; i < v.n; i++ {
-		res := s.eval(v.valueData(i))
-		if !v.setValueData(i, res) {
-			return false
-		}
+		found, usable := s.lookup(v.valueData(i))
+		set(i, found, usable)
 	}
 	v.Dict = nil
 	return true

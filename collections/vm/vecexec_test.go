@@ -230,6 +230,12 @@ var vecExprs = []string{
 	`stringListMember(S, "")`, `stringListMember(S, "user3;user10", ";")`,
 	`stringListMember(S, " user3 , user10 ")`, `stringListMember(S, "user3,user10") && A > 4`,
 	`stringListMember(A, "user3")`, // a numeric item: ERROR
+	// A CONSTANT item: the whole batch has one answer, so the kernel computes it once instead of
+	// per record. Without these the const path is never entered -- every other case here reads a
+	// column -- and could be deleted with the suite still green.
+	`stringListMember("user3", "user3,user10")`, `stringListMember("nope", "user3,user10")`,
+	`stringListMember("user3", "user3,user10") && A > 4`,
+	`stringListMember(undefined, "user3")`, // const UNDEFINED item: the empty string, so no match
 	// A MASK-form item. The states a mask can hold are true/false/undefined/error, and the undefined
 	// one is what distinguishes a correct read from a stale one: an undefined item is the EMPTY
 	// STRING and so matches nothing (false), while reading the data arrays of a mask-form vector
