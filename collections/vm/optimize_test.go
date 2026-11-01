@@ -205,3 +205,49 @@ func FuzzOptimizeAgrees(f *testing.F) {
 		optAgrees(t, scopeSrc, exprSrc)
 	})
 }
+
+// TestOptimizeCarriesEveryField guards the way this broke once. Optimize used to copy RegProgram
+// field by field, so when the conditional branch added a target table the optimized program got a
+// nil one and indexed an empty slice at run time. A struct copy carries a new field by default;
+// this asserts the one that was dropped, and the behaviour that depended on it.
+func TestOptimizeCarriesEveryField(t *testing.T) {
+	expr, err := parser.ParseExpr(`ifThenElse(Cpus > 2, 1, 2)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp := LowerToRegisters(CompileProgram(expr))
+	if len(rp.conds) == 0 {
+		t.Fatal("the conditional compiled with no target table; this test is not testing what it says")
+	}
+	opt := Optimize(rp, AllPasses())
+	if len(opt.conds) != len(rp.conds) {
+		t.Errorf("optimized program has %d condition targets, source has %d", len(opt.conds), len(rp.conds))
+	}
+	for _, tc := range []struct{ scope, want string }{
+		{`[Cpus = 4]`, "1"},
+		{`[Cpus = 1]`, "2"},
+		{`[]`, "undefined"},
+	} {
+		scope, err := classad.Parse(tc.scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := RunRegisters(opt, scope).String(); got != tc.want {
+			t.Errorf("%s: optimized ifThenElse = %s, want %s", tc.scope, got, tc.want)
+		}
+	}
+}
+
+// TestOptimizerKnowsEveryOpcode is the tripwire for the other half of the same hazard: a pass that
+// treats a new instruction as reading no registers will happily delete what it reads. regUses lists
+// every opcode and panics on anything else, so adding one without teaching the optimizer fails here
+// rather than silently.
+func TestOptimizerKnowsEveryOpcode(t *testing.T) {
+	rp := &RegProgram{src: &Program{}, res: -1, nregs: 1}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("regUses accepted an unknown opcode; a new one could be analyzed as reading nothing")
+		}
+	}()
+	regUses(rp, RegInstr{Op: RegOp(250)}, nil)
+}

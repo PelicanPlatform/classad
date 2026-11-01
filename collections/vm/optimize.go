@@ -1,5 +1,7 @@
 package vm
 
+import "fmt"
+
 // The register form's OPTIMIZER.
 //
 // Two rules govern everything here, and both come from how this gets validated rather than from
@@ -33,14 +35,14 @@ func AllPasses() OptPasses { return OptPasses{CopyProp: true} }
 // Optimize returns an optimized copy of rp. rp is not modified, so the unoptimized program stays
 // available as the oracle for the optimized one.
 func Optimize(rp *RegProgram, passes OptPasses) *RegProgram {
-	out := &RegProgram{
-		code:  append([]RegInstr(nil), rp.code...),
-		args:  rp.args,
-		nregs: rp.nregs,
-		res:   rp.res,
-		src:   rp.src,
-	}
-	// args is shared rather than copied, so copyProp deep-copies the one argument list it rewrites.
+	// Copied as a STRUCT, not field by field. An earlier version listed the fields, and when the
+	// conditional branch added a target table it was silently left nil -- the optimized program then
+	// indexed an empty slice at run time. A new field now comes along by default, and only the
+	// slices a pass mutates are detached below.
+	cp := *rp
+	out := &cp
+	out.code = append([]RegInstr(nil), rp.code...)
+	// args stays shared, so copyProp deep-copies the one argument list it rewrites.
 	if passes.CopyProp {
 		copyProp(out)
 	}
@@ -55,12 +57,18 @@ func Optimize(rp *RegProgram, passes OptPasses) *RegProgram {
 func regUses(rp *RegProgram, in RegInstr, buf []int32) []int32 {
 	buf = buf[:0]
 	switch in.Op {
+	case RNop, RConst, RTrue, RFalse, RUndef, RError, RLoadRef, REvalNode, RJump:
+		// No register operands.
 	case RBinop, RCombineAnd, RCombineOr:
 		buf = append(buf, in.A, in.B)
-	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined:
+	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond:
 		buf = append(buf, in.A)
 	case RCallFunc:
 		buf = append(buf, rp.args[in.Args]...)
+	default:
+		// Loudly, because the alternative is a pass that quietly treats a new instruction as reading
+		// nothing -- and then deletes what it reads. Every opcode is listed above.
+		panic(fmt.Sprintf("vm: optimizer has no use list for opcode %d", in.Op))
 	}
 	return buf
 }
@@ -94,9 +102,16 @@ func jumpTargets(rp *RegProgram) []bool {
 	t := make([]bool, len(rp.code)+1)
 	for _, in := range rp.code {
 		switch in.Op {
-		case RShortAnd, RShortOr, RJmpIfDefined:
+		case RShortAnd, RShortOr, RJmpIfDefined, RJump:
 			if in.T >= 0 && int(in.T) < len(t) {
 				t[in.T] = true
+			}
+		case RBranchCond:
+			// Three targets, all of them places control can arrive from elsewhere.
+			for _, tgt := range []int32{rp.conds[in.Imm].onFalse, rp.conds[in.Imm].onUndef, rp.conds[in.Imm].onError} {
+				if tgt >= 0 && int(tgt) < len(t) {
+					t[tgt] = true
+				}
 			}
 		}
 	}
@@ -106,7 +121,7 @@ func jumpTargets(rp *RegProgram) []bool {
 // isBranch reports whether an instruction can transfer control other than to the next instruction.
 func isBranch(in RegInstr) bool {
 	switch in.Op {
-	case RShortAnd, RShortOr, RJmpIfDefined:
+	case RShortAnd, RShortOr, RJmpIfDefined, RJump, RBranchCond:
 		return true
 	}
 	return false
@@ -206,7 +221,7 @@ func substitute(rp *RegProgram, j int, from, to int32) {
 		if in.B == from {
 			in.B = to
 		}
-	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined:
+	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond:
 		if in.A == from {
 			in.A = to
 		}
