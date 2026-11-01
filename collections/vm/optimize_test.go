@@ -251,3 +251,42 @@ func TestOptimizerKnowsEveryOpcode(t *testing.T) {
 	}()
 	regUses(rp, RegInstr{Op: RegOp(250)}, nil)
 }
+
+// TestOptimizerKnowsTheOpcodesWeEmit is the complement of TestOptimizerKnowsEveryOpcode, and the one
+// that actually catches a missed opcode.
+//
+// That test proves the tripwire fires for an opcode nobody emits. This one walks every expression
+// corpus the package maintains, lowers each, and asks regUses about every instruction -- so an
+// opcode the compiler DOES emit and the optimizer has not been taught fails here.
+//
+// Without it the gap is latent rather than loud: regUses is reached from copy propagation only when
+// there is a copy to consider, so a program without one can carry an unknown opcode straight through
+// a pass that would have deleted what it reads. A merged stringListMember specialization did exactly
+// that, and every test still passed.
+func TestOptimizerKnowsTheOpcodesWeEmit(t *testing.T) {
+	var buf []int32
+	check := func(src string) {
+		t.Helper()
+		expr, err := parser.ParseExpr(src)
+		if err != nil || expr == nil {
+			return
+		}
+		rp := LowerToRegisters(CompileProgram(expr))
+		for i, in := range rp.code {
+			// A panic here is the failure; the message names the opcode.
+			buf = regUses(rp, in, buf)
+			if _, ok := regDef(in); !ok && in.Op != RNop {
+				t.Errorf("%s instruction %d (op %d) defines nothing and is not a nop", src, i, in.Op)
+			}
+		}
+	}
+	for _, src := range exprSources {
+		check(src)
+	}
+	for _, src := range vecExprs {
+		check(src)
+	}
+	for _, src := range parityCorpusExprs {
+		check(src)
+	}
+}

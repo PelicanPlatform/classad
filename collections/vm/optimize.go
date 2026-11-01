@@ -61,7 +61,7 @@ func regUses(rp *RegProgram, in RegInstr, buf []int32) []int32 {
 		// No register operands.
 	case RBinop, RCombineAnd, RCombineOr:
 		buf = append(buf, in.A, in.B)
-	case RUnop, RMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond:
+	case RUnop, RMember, RStrListMember, RMove, RShortAnd, RShortOr, RJmpIfDefined, RBranchCond:
 		buf = append(buf, in.A)
 	case RCallFunc:
 		buf = append(buf, rp.args[in.Args]...)
