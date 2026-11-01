@@ -39,7 +39,7 @@ import (
 // caller should branch on is a Feature, because a server may be built without
 // one. Bump it when an opcode is added or an existing opcode's reply changes
 // shape, and add a Feature for anything a client would otherwise probe for.
-const ProtocolVersion = 2
+const ProtocolVersion = 3
 
 // Session attribute names carried in the CEDAR post-authentication ad. The
 // application wires these through: a server publishes ServerSessionAttrs() as
@@ -94,6 +94,16 @@ const (
 	// FeatQueryValues is the typed, evaluated value-batch stream (opQueryValues). Like
 	// FeatJoin it postdates advertisement, so a peer that says nothing does not have it.
 	FeatQueryValues Feature = "queryvalues"
+
+	// FeatEvalTypes is the EVALUATED half of the attribute type report (opAttrTypes with
+	// attrFlagEvaluate). Postdates advertisement, so silence is a no.
+	//
+	// It is a feature rather than a probe precisely because the old reply is a valid one:
+	// a server without it answers the request, successfully, with stored classes only. A
+	// client that inferred support from a non-error would conclude that every
+	// expression-valued attribute is untypeable, which is the wrong answer rather than a
+	// missing one.
+	FeatEvalTypes Feature = "evaltypes"
 )
 
 // featuresPredatingAdvertisement are the features that existed before a server advertised
@@ -123,6 +133,7 @@ var serverFeatures = []Feature{
 	FeatTxnRead,
 	FeatJoin,
 	FeatQueryValues,
+	FeatEvalTypes,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar

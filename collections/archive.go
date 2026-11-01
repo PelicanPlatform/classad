@@ -997,6 +997,12 @@ func (a *Archive) AttrTypeProfiles(sampleMax int) ([]AttrTypeProfile, int) {
 	return a.c.AttrTypeProfiles(sampleMax)
 }
 
+// AttrTypeProfilesWith is AttrTypeProfiles with the measurement selected by o (see
+// Collection.AttrTypeProfilesWith).
+func (a *Archive) AttrTypeProfilesWith(o AttrTypeOptions) ([]AttrTypeProfile, int) {
+	return a.c.AttrTypeProfilesWith(o)
+}
+
 // GroupSchemaDrift reports how the archive's derived groups have moved (see
 // Collection.GroupSchemaDrift).
 func (a *Archive) GroupSchemaDrift() GroupSchemaDrift { return a.c.GroupSchemaDrift() }

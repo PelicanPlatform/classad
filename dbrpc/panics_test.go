@@ -241,7 +241,7 @@ func TestOnlyReadsAreContained(t *testing.T) {
 		}
 	}
 	for _, o := range []op{opQuery, opQueryRawWire, opArchiveAggregate, opArchiveAggregateStats, opAggregate,
-		opTopK, opWatch, opLookupAd, opTxnQuery, opListTables} {
+		opTopK, opWatch, opLookupAd, opTxnQuery, opListTables, opQueryValues, opAttrTypes} {
 		if !o.recoverable() {
 			t.Errorf("%s is not contained; a read should be", o)
 		}

@@ -65,7 +65,7 @@ func (o op) recoverable() bool {
 		opWatch, opWatchWire, opWatchHead, opWatchStop, opSnapshot,
 		opLookupAd, opLookupAttr, opTxnQuery, opTxnQueryKeys,
 		opDiag, opExplain, opListTables, opListViews, opListExporters, opGetExporter, opGetExporterState,
-		opQueryStats:
+		opQueryStats, opAttrTypes:
 		return true
 	}
 	return false

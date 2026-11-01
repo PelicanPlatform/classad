@@ -1005,6 +1005,13 @@ func (t *ArchiveTable) CategoricalGroupCountsWhere(attr, constraint string) (map
 // AttrTypeProfile is one attribute's measured type profile (see collections.AttrTypeProfile).
 type AttrTypeProfile = collections.AttrTypeProfile
 
+// AttrValueCounts is one measurement within a profile (see collections.AttrValueCounts).
+type AttrValueCounts = collections.AttrValueCounts
+
+// AttrTypeOptions selects what an AttrTypeProfilesWith call measures (see
+// collections.AttrTypeOptions).
+type AttrTypeOptions = collections.AttrTypeOptions
+
 type MergeOptions = collections.MergeOptions
 
 // AutoTuneOptions and AutoTuneResult are re-exported so a caller can tune an archive's
@@ -1544,6 +1551,12 @@ func (t *ArchiveTable) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
 // AttrTypeProfiles profiles what this archive's attributes hold (see DB.AttrTypeProfiles).
 func (t *ArchiveTable) AttrTypeProfiles(sampleMax int) ([]AttrTypeProfile, int) {
 	return t.a.AttrTypeProfiles(sampleMax)
+}
+
+// AttrTypeProfilesWith is AttrTypeProfiles with the measurement selected by o (see
+// DB.AttrTypeProfilesWith).
+func (t *ArchiveTable) AttrTypeProfilesWith(o AttrTypeOptions) ([]AttrTypeProfile, int) {
+	return t.a.AttrTypeProfilesWith(o)
 }
 
 // GroupSchemaDrift reports how the archive's derived groups have moved.

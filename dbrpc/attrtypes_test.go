@@ -2,9 +2,11 @@ package dbrpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -163,11 +165,14 @@ func TestAttrTypeProfilesArchive(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 60; i++ {
-		src := fmt.Sprintf("ClusterId = %d\nBytes = %d\nClaimId = \"secret-%d\"", i, i, i)
+		// Scaled is written as an expression in every record, because an archive is where
+		// a consumer most needs this measurement and where a job ad most reliably stores
+		// one -- and because the archive is a separate branch of the handler.
+		src := fmt.Sprintf("ClusterId = %d\nBytes = %d\nScaled = Bytes * 8\nClaimId = \"secret-%d\"", i, i, i)
 		if i%10 == 0 {
 			// A real float among the integers: the dominant heterogeneity on real data,
 			// where ClassAd writes an integral float without a decimal point.
-			src = fmt.Sprintf("ClusterId = %d\nBytes = %d.5\nClaimId = \"secret-%d\"", i, i, i)
+			src = fmt.Sprintf("ClusterId = %d\nBytes = %d.5\nScaled = Bytes * 8\nClaimId = \"secret-%d\"", i, i, i)
 		}
 		if err := priv.ArchiveAppend(ctx, "history", src); err != nil {
 			t.Fatal(err)
@@ -195,6 +200,25 @@ func TestAttrTypeProfilesArchive(t *testing.T) {
 	if _, ok := got["ClaimId"]; ok {
 		t.Error("ClaimId profile served to an unprivileged peer from an archive")
 	}
+	if p := got["Scaled"]; p.Dominant != "expr" || p.Evaluated != nil {
+		t.Errorf("Scaled stored classes are %v with evaluated=%v; the fixture must store it as an "+
+			"expression and the default report must not evaluate it", p.Classes, p.Evaluated)
+	}
+
+	// And the evaluated option reaches the archive branch, which is the half a test on the
+	// mutable table alone would leave unserved -- the mistake this op's own history records.
+	erep, err := unpriv.AttrTypeProfilesEvaluated(ctx, "history", 1000)
+	if err != nil {
+		t.Fatalf("read-only peer refused an evaluated archive profile: %v", err)
+	}
+	p := byName(erep)["Scaled"]
+	if p.Evaluated == nil {
+		t.Fatal("Scaled has no evaluated counts from the archive")
+	}
+	// Bytes is an int in nine records of ten and a real in the tenth, so Bytes*8 is both.
+	if p.Evaluated.Ints == 0 || p.Evaluated.Reals == 0 {
+		t.Fatalf("Scaled evaluated to %v, want the int/real mix Bytes carries into it", p.Evaluated.Classes)
+	}
 }
 
 func TestAttrTypeProfilesUnknownTable(t *testing.T) {
@@ -202,5 +226,186 @@ func TestAttrTypeProfilesUnknownTable(t *testing.T) {
 	defer cleanup()
 	if _, err := priv.AttrTypeProfiles(context.Background(), "nosuch", 100); err == nil {
 		t.Error("AttrTypeProfiles on a missing table returned no error")
+	}
+}
+
+// TestAttrTypeProfilesEvaluatedTypesAnExpression is why the evaluated option exists. Mem is
+// written as an expression over Cpus in every ad, so the stored classes rule it untypeable --
+// and a consumer that evaluates before it encodes would be publishing no column for an
+// attribute that is an integer in every row.
+func TestAttrTypeProfilesEvaluatedTypesAnExpression(t *testing.T) {
+	priv, _, cleanup := attrTypePair(t)
+	defer cleanup()
+	ctx := context.Background()
+	tx, err := priv.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		src := fmt.Sprintf("Cpus = %d\nMem = Cpus * 1024\n", 1+i%4)
+		if err := tx.NewClassAd(ctx, fmt.Sprintf("k%d", i), src); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	stored, err := priv.AttrTypeProfiles(ctx, DefaultTable, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := byName(stored)["Mem"]; p.Dominant != "expr" {
+		t.Fatalf("Mem stored classes are %v; the fixture must store it as an expression", p.Classes)
+	} else if p.Evaluated != nil {
+		t.Fatal("the default report carries evaluated counts, which are the expensive measurement")
+	}
+
+	rep, err := priv.AttrTypeProfilesEvaluated(ctx, DefaultTable, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := byName(rep)["Mem"]
+	if p.Evaluated == nil {
+		t.Fatal("Mem has no evaluated counts")
+	}
+	// Cpus runs 1..4, so Mem runs 1024..4096.
+	if !p.Evaluated.Uniform() || p.Evaluated.Dominant != "int" ||
+		p.Evaluated.IntMin != 1024 || p.Evaluated.IntMax != 4096 {
+		t.Fatalf("Mem evaluates to %v in [%d,%d], want a uniform int in [1024,4096]",
+			p.Evaluated.Classes, p.Evaluated.IntMin, p.Evaluated.IntMax)
+	}
+}
+
+// TestAttrTypeProfilesEvaluatedWithholdsSealedValues is the disclosure the option opens and the
+// server has to close. The stored classes never look through a sealed node, so the privilege of
+// the connection did not matter to this op before; evaluating an expression resolves its
+// references, and an expression over a sealed attribute would hand an unprivileged peer the
+// bounds of a value it may not read -- under a name the private-attribute filter has no reason
+// to suspect.
+func TestAttrTypeProfilesEvaluatedWithholdsSealedValues(t *testing.T) {
+	d, err := db.OpenConfig(db.Config{
+		Dir:            t.TempDir(),
+		PoolKeys:       []db.KEK{{ID: "POOL", Material: []byte("test-pool-key-material-32-bytes!!")}},
+		EncryptedAttrs: []string{"Salary"},
+	})
+	if err != nil {
+		t.Skipf("encrypted table unavailable here: %v", err)
+	}
+	defer d.Close()
+	tx := d.Begin()
+	for i := 0; i < 60; i++ {
+		ad, perr := classad.ParseOld(fmt.Sprintf("Cpus = %d\nSalary = %d\nDerived = Salary * 2", 1+i%4, 100000+i))
+		if perr != nil {
+			t.Fatal(perr)
+		}
+		tx.NewClassAd(fmt.Sprintf("%d.0", i), ad)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	s := NewServer(d)
+	defer s.Close()
+	dial := func(opts ServeOptions) *Client {
+		cc, sc := netPipe()
+		go func() { _ = s.ServeConnOpts(sc, opts) }()
+		c := NewClient(cc)
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	ctx := context.Background()
+
+	priv, err := dial(ServeOptions{Privileged: true, IncludePrivate: true}).
+		AttrTypeProfilesEvaluated(ctx, DefaultTable, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The premise: the entitled read DOES see through the expression. Without this the test
+	// would pass against a server that evaluated nothing at all.
+	if p := byName(priv)["Derived"]; p.Evaluated == nil || p.Evaluated.Ints == 0 {
+		t.Fatalf("the entitled report does not evaluate Derived (%v); there is nothing to withhold", p.Evaluated)
+	}
+
+	unpriv, err := dial(ServeOptions{ReadOnly: true}).AttrTypeProfilesEvaluated(ctx, DefaultTable, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := byName(unpriv)["Derived"]
+	if p.Evaluated == nil {
+		t.Fatal("Derived has no evaluated counts for the unprivileged reader")
+	}
+	if p.Evaluated.Ints != 0 {
+		t.Fatalf("the unprivileged report carries %d integers in [%d,%d] for Derived = Salary * 2: "+
+			"the bounds of a sealed value reached a peer that may not read it",
+			p.Evaluated.Ints, p.Evaluated.IntMin, p.Evaluated.IntMax)
+	}
+}
+
+// TestAttrTypeProfilesRejectsUnknownFlags holds the op to the same rule as the streaming ones: a
+// request asking for something this server does not know is refused, never served without it. The
+// quiet failure is the dangerous one here, because the reply looks exactly like a successful
+// measurement of a table whose attributes happen to be untypeable.
+func TestAttrTypeProfilesRejectsUnknownFlags(t *testing.T) {
+	priv, _, cleanup := attrTypePair(t)
+	defer cleanup()
+	seedAttrTypeAds(t, priv)
+
+	unknown := ^attrFlagsKnown
+	if _, err := priv.attrTypeProfiles(context.Background(), DefaultTable, 100, unknown); err == nil {
+		t.Fatal("a request with unknown flag bits was served")
+	}
+}
+
+// flagStrippingConn is a server-side transport that chops the trailing flags word off every
+// attr-types request, which is exactly the frame an older client sends and exactly what an
+// older server would read from a newer one. It makes both halves of the compatibility story
+// testable for real: the server must answer such a request rather than refuse it, and the
+// client must not report the stored-only answer it gets back as the evaluated one it asked for.
+type flagStrippingConn struct {
+	MsgConn
+}
+
+func (c *flagStrippingConn) ReadMsg() ([]byte, error) {
+	frame, err := c.MsgConn.ReadMsg()
+	if err != nil {
+		return nil, err
+	}
+	if o, ok := frameOp(frame); ok && o == opAttrTypes && len(frame) >= 4 {
+		return frame[:len(frame)-4], nil
+	}
+	return frame, nil
+}
+
+// TestAttrTypeProfilesWithoutTheFlagsWord is the mixed-version pair in both directions.
+//
+// A request with no flags word is well formed, not malformed: it is what every client built
+// before the option sends, and refusing it would break the measurement on an upgrade. And a
+// client that asked for the evaluated classes must not be handed that older report as though it
+// were the answer -- it is a different answer, and a caller acting on it would conclude that
+// every expression-valued attribute in the table is untypeable.
+func TestAttrTypeProfilesWithoutTheFlagsWord(t *testing.T) {
+	d, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(d)
+	cconn, sconn := netPipe()
+	go func() { _ = s.ServeConn(&flagStrippingConn{MsgConn: sconn}) }()
+	c := NewClient(cconn)
+	defer func() { c.Close(); s.Close(); d.Close() }()
+	seedAttrTypeAds(t, c)
+	ctx := context.Background()
+
+	rep, err := c.AttrTypeProfiles(ctx, DefaultTable, 1000)
+	if err != nil {
+		t.Fatalf("a request with no flags word was refused: %v", err)
+	}
+	if rep.Sampled == 0 || len(rep.Profiles) == 0 {
+		t.Fatalf("the stored-classes request came back empty: %+v", rep)
+	}
+
+	if _, err := c.AttrTypeProfilesEvaluated(ctx, DefaultTable, 1000); !errors.Is(err, ErrEvalTypesUnsupported) {
+		t.Fatalf("asking a server that drops the flag for evaluated classes returned %v, want ErrEvalTypesUnsupported", err)
 	}
 }

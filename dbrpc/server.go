@@ -1682,16 +1682,36 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 	case opAttrTypes:
 		table := r.str()
 		sampleMax := int(r.i32())
+		// The flags word postdates this op, so a client that predates it sends none and
+		// the reader reports the shortfall. That is a valid request for the stored
+		// classes, not a malformed one.
+		flags := uint32(0)
+		if f, ok := r.optI32(); ok {
+			flags = uint32(f) //nolint:gosec // a flags word, read back as it was written
+		}
 		if r.err != nil || sampleMax < 0 {
 			return respBad(reqID)
+		}
+		if flags&^attrFlagsKnown != 0 {
+			return respErr(reqID, "unknown attr-types flags")
+		}
+		// Redact tracks the connection's entitlement, and it matters only once this
+		// measurement evaluates: an expression's references are resolved to produce the
+		// evaluated classes, so without it an unprivileged peer could read the bounds of a
+		// sealed value through an attribute that merely mentions it. The stored classes
+		// never look through a sealed node, which is why this was not needed before.
+		opts := db.AttrTypeOptions{
+			SampleMax: sampleMax,
+			Evaluate:  flags&attrFlagEvaluate != 0,
+			Redact:    !includePrivate,
 		}
 		var profs []db.AttrTypeProfile
 		var sampled int
 		switch ref := s.resolveTable(table); ref.kind {
 		case kindTable:
-			profs, sampled = ref.db.AttrTypeProfiles(sampleMax)
+			profs, sampled = ref.db.AttrTypeProfilesWith(opts)
 		case kindArchive:
-			profs, sampled = ref.arch.AttrTypeProfiles(sampleMax)
+			profs, sampled = ref.arch.AttrTypeProfilesWith(opts)
 		default:
 			return respErr(reqID, "no such table: "+table)
 		}
