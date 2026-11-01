@@ -510,6 +510,8 @@ func (a *Archive) QueryRawWireRefsStats(q *vm.Query, projection []string, redact
 	return a.c.QueryRawWireRefsStats(q, projection, redact, stats)
 }
 
+// QueryProject scans the matching records and yields each projected to just attrs' values,
+// read wire-native where possible. See Collection.QueryProject.
 func (a *Archive) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classad.Value] {
 	return a.c.QueryProject(q, attrs)
 }
@@ -529,6 +531,16 @@ func (a *Archive) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanStat
 // QueryLimitRedacted is QueryLimit read with no key.
 func (a *Archive) QueryLimitRedacted(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] {
 	return firstN(a.c.QueryRedacted(q), limit)
+}
+
+// QueryProjectRedacted is QueryProject read with no key.
+//
+// The stats form below had this and the plain one did not, which is a trap for the layer above: a
+// history table is read by the same unprivileged peers a mutable table is, and a projected read
+// that could only be made entitled would either refuse those peers or serve them the plaintext --
+// which is how the paged projection came to ignore its session's privilege.
+func (a *Archive) QueryProjectRedacted(q *vm.Query, attrs []string) iter.Seq[[]classad.Value] {
+	return a.c.QueryProjectRedacted(q, attrs)
 }
 
 // QueryProjectStatsRedacted is QueryProjectStats read with no key.

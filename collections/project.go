@@ -102,9 +102,45 @@ func (c *Collection) queryProjectAs(q *vm.Query, attrs []string, stats *ScanStat
 		if proj != nil {
 			proj.closure = true
 		}
+		// A redacted read withholds private attributes BY NAME, resolved once here rather than
+		// per record. Leaving this to the sealed-value path is not enough, and the gap is in the
+		// STORE rather than in this scan: where a sealer exists, a private attribute is sealed as
+		// it is written (shouldEncrypt) and the keyless context finds UNDEFINED -- but a store
+		// that seals nothing has no keyless context at all (evalCtx returns the collection), so
+		// the plaintext it wrote is simply read back. Measured before this was added: the same
+		// projection of ClaimId over one such archive returned the plaintext in every row under
+		// redact, while the RAW projection of the same records over the same scan dropped it,
+		// because that path filters names (rawProjector) instead of relying on sealing.
+		//
+		// It is also a different set from the one keylessHides covers. That set is the sealing
+		// POLICY's, withheld because a value written before the policy named it can still sit in
+		// the clear; this one is the private set, which is private whether or not anything is
+		// sealed here.
+		//
+		// So the entitlement a caller asks for here is now the entitlement it gets on either table
+		// kind, which is the whole point of the Redacted spelling. The constraint is a separate
+		// question with a separate answer: evaluating a private attribute is an oracle even when
+		// its value is never returned, and the RPC layer refuses such a constraint by name before
+		// the scan starts.
+		var private []bool
+		if redact {
+			for i, n := range attrs {
+				if classad.IsPrivateAttribute(n) {
+					if private == nil {
+						private = make([]bool, len(attrs))
+					}
+					private[i] = true
+				}
+			}
+		}
 		c.scanQuery(c.newQueryPlan(q, proj, stats, redact), func(w []byte, dict *segDictHandle) bool {
 			rs.dict = dict
 			c.projectInto(rs, w, attrs, scratch)
+			for i := range private {
+				if private[i] {
+					scratch[i] = classad.NewUndefinedValue()
+				}
+			}
 			return yield(scratch)
 		})
 	}

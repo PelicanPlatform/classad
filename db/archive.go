@@ -397,6 +397,14 @@ func (t *ArchiveTable) QueryProjectStats(constraint string, attrs []string, stat
 	return gatedArch(t, t.a.QueryProjectStats(q, attrs, stats)), nil
 }
 
+// QueryProjectRedacted is QueryProject for a caller NOT entitled to sealed values: the constraint
+// is matched and attrs are read with no key, so a sealed value is undefined to both. It is the
+// archive counterpart of DB.QueryProjectRedacted, and a read surface that serves both table kinds
+// needs the pair -- without it, an unprivileged peer reading history has no call to make.
+func (t *ArchiveTable) QueryProjectRedacted(constraint string, attrs []string) (iter.Seq[[]classad.Value], error) {
+	return t.QueryProjectStatsRedacted(constraint, attrs, nil)
+}
+
 // QueryRawProjected yields each matching ad as a raw projected subset (only the projection
 // attributes, rendered from the stored representation), newest first — the archive-side of the
 // server-side projection op. redact strips private attributes. It mirrors db.DB.QueryRawProjected
