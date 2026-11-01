@@ -802,6 +802,8 @@ func (sc *serverConn) dispatch(frame []byte) {
 		sc.s.streamQueryRawWireOpts(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opJoin:
 		sc.s.streamJoin(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
+	case opQueryValues:
+		sc.s.streamQueryValues(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchSorted:
 		sc.s.streamMatchSorted(sc.ctx, reqID, body, priv, sc.write)
 	case opOrdered:

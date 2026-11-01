@@ -66,7 +66,15 @@ type rawOpRead struct {
 	run  func(t *testing.T, c *Client) []string
 	// wire rows are inline wire, rendered to old-ClassAd text before the check.
 	wire bool
+	// values rows come from the typed value stream, rendered one entry per line. Like a wire
+	// row, a cell with no value is absent rather than present-and-undefined.
+	values bool
 }
+
+// omitsAbsent reports whether this op leaves an attribute OUT rather than serving it as
+// undefined -- true of the wire rows and of the typed value columns, and the reason the
+// sealed-attribute check below accepts either shape.
+func (r rawOpRead) omitsAbsent() bool { return r.wire || r.values }
 
 func rawOpReads() []rawOpRead {
 	ctx := context.Background()
@@ -153,6 +161,36 @@ func rawOpReads() []rawOpRead {
 				})
 			}})
 	}
+	// The typed value stream needs an explicit projection: it packs one column per REQUESTED
+	// attribute, so there is no "whole ad" shape to join the loop above with.
+	//
+	// redact=false here too: the request asks for everything, and the session's privilege wins.
+	reads = append(reads,
+		rawOpRead{name: "QueryValues/projected", values: true, run: func(t *testing.T, c *Client) []string {
+			var rows []string
+			err := c.QueryValuesStream(ctx, DefaultTable, where, attrs, 0, false, func(b *ValueBatch) bool {
+				for row := 0; row < b.Rows; row++ {
+					var line []string
+					for col, name := range attrs {
+						v := b.ValueAt(col, row)
+						if v.IsUndefined() {
+							continue
+						}
+						txt, ok := v.Unparse()
+						if !ok {
+							txt = v.String()
+						}
+						line = append(line, name+" = "+txt)
+					}
+					rows = append(rows, strings.Join(line, "\n"))
+				}
+				return true
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			return rows
+		}})
 	return reads
 }
 
@@ -216,9 +254,9 @@ func TestUnprivilegedRawOpsNeverServePlaintext(t *testing.T) {
 						}
 					}
 				}
-				// Text rows render the sealed attribute as undefined; wire rows leave it out, which
-				// reads the same at the far end.
-				if salary != 1 && (salary != 0 || !rd.wire) {
+				// Text rows render the sealed attribute as undefined; wire rows and value columns
+				// leave it out, which reads the same at the far end.
+				if salary != 1 && (salary != 0 || !rd.omitsAbsent()) {
 					t.Fatalf("row carries Salary %d times, want once as undefined: %q", salary, r)
 				}
 			}

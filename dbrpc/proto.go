@@ -331,6 +331,24 @@ const (
 	//   [nCond i32]{[expr]}[nPost i32]{[expr]}[nEqui i32]{[left][right]}
 	//     -> stream of [adText]
 	opJoin op = 69
+
+	// opQueryValues streams matching records as TYPED, EVALUATED value batches, column-major
+	// and aligned with the requested attributes -- see values.go for the frame and for why a
+	// column is a kind, a validity bitmap and an exceptions list.
+	//
+	// It is the only read op that does not relay the stored form. The text projections render
+	// each record to ClassAd source for the consumer to parse back, and the wire-row ops ship
+	// the stored nodes for the consumer to decode and evaluate; both put the work of turning
+	// storage into values on the far side. A consumer that wants columns pays for a relay it
+	// did not ask for, and the render and the reparse together are the large majority of what
+	// such a read costs.
+	//
+	// [table][limit i32][flags u32][redact u8][constraint][nattrs i32]{[attr]}
+	//   -> stream of [nrows i32][ncols i32]{column}
+	//
+	// The flags word is reserved and currently empty; an unknown bit is REFUSED, for the same
+	// reason the wire-row ops refuse one.
+	opQueryValues op = 70
 )
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
@@ -485,6 +503,8 @@ func (o op) String() string {
 		return "QueryRawWire"
 	case opQueryRawWireOpts:
 		return "QueryRawWireOpts"
+	case opQueryValues:
+		return "QueryValues"
 	case opJoin:
 		return "Join"
 	}

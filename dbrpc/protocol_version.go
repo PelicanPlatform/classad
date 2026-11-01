@@ -90,6 +90,10 @@ const (
 	// so for this feature, and every one added from here, unknown IS no. See
 	// SupportsNewer.
 	FeatJoin Feature = "join"
+
+	// FeatQueryValues is the typed, evaluated value-batch stream (opQueryValues). Like
+	// FeatJoin it postdates advertisement, so a peer that says nothing does not have it.
+	FeatQueryValues Feature = "queryvalues"
 )
 
 // featuresPredatingAdvertisement are the features that existed before a server advertised
@@ -118,6 +122,7 @@ var serverFeatures = []Feature{
 	FeatWatchWire,
 	FeatTxnRead,
 	FeatJoin,
+	FeatQueryValues,
 }
 
 // ServerSessionAttrs is what a dbrpc BUILD implements. Pass it as the cedar
