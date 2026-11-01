@@ -31,11 +31,25 @@ type JoinRequest struct {
 // Join streams the joined rows as old-ClassAd text, one per row, each a composite ad whose
 // members are the two sides under their aliases.
 //
-// An error can arrive AFTER rows have been yielded, which is the point: a join that met a
-// limit part way through has produced a partial answer, and reading that as a complete one is
-// the failure this reports. A caller that must not emit a partial result should not commit to
-// its output until Join returns nil.
+// It reports ErrJoinUnsupported WITHOUT sending anything when the handshake already says the
+// server cannot join. FeatJoin was introduced after feature advertisement existed, so a peer
+// that advertised nothing cannot have the opcode and a peer that advertised a list without it
+// definitely lacks it -- in both cases the request would buy a guaranteed round-trip
+// rejection, on exactly the mixed-version link where that costs most.
+//
+// The rejection path is kept for the case advertisement cannot cover: a server that names the
+// feature and then cannot honour it. That should not happen, since a server advertises
+// FeatJoin only when it holds a catalog, but a definite yes that turns out wrong must still
+// reach the caller as the same sentinel rather than as an opaque bad request.
+//
+// An error can arrive AFTER rows have been yielded, which is the other point: a join that met
+// a limit part way through has produced a partial answer, and reading that as a complete one
+// is the failure this reports. A caller that must not emit a partial result should not commit
+// to its output until Join returns nil.
 func (c *Client) Join(ctx context.Context, jr JoinRequest, yield func(row string) bool) error {
+	if !c.SupportsNewer(FeatJoin) {
+		return ErrJoinUnsupported
+	}
 	err := c.streamEach(ctx, joinFrame(jr), yield)
 	if errors.Is(err, ErrBadRequest) {
 		return ErrJoinUnsupported

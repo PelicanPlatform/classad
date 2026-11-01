@@ -56,7 +56,10 @@ func newJoinFixture(t *testing.T) *joinFixture {
 	f := &joinFixture{s: NewServerCatalog(cat), cat: cat}
 	cconn, sconn := netPipe()
 	go func() { _ = f.s.ServeConnOpts(sconn, ServeOptions{IncludePrivate: true, Privileged: true}) }()
-	f.c = NewClient(cconn)
+	// The handshake the application carries over CEDAR, simulated: the server states what IT
+	// can serve and the client is given what it captured. Without this the client correctly
+	// declines to send a join at all, which is the whole point of the advertisement.
+	f.c = NewClient(cconn, WithPeerSessionAttrs(f.s.SessionAttrs()))
 	return f
 }
 
@@ -182,10 +185,15 @@ func TestJoinReportsATruncatedResultAfterTheRows(t *testing.T) {
 	}
 }
 
-// A server that cannot join says so as a bad request, which the client maps to a sentinel so
-// a caller falls back to joining the two sides itself rather than reading an empty result as
-// "nothing matched".
-func TestJoinFallsBackWhenTheServerCannotJoin(t *testing.T) {
+// A server that cannot join is known not to from the handshake, so the client does not send
+// the request at all.
+//
+// FeatJoin was introduced after advertisement existed, so silence about it is conclusive
+// rather than uninformative: a peer advertising nothing was built before advertisement, which
+// was built before the join. A single-database server is the case that must not advertise it
+// -- a join reads two tables and it holds one -- and (*Server).SessionAttrs is what leaves it
+// out.
+func TestJoinIsNotSentToAServerThatCannotJoin(t *testing.T) {
 	d, err := db.Open("")
 	if err != nil {
 		t.Fatal(err)
@@ -193,14 +201,40 @@ func TestJoinFallsBackWhenTheServerCannotJoin(t *testing.T) {
 	defer d.Close()
 	s := NewServer(d)
 	defer s.Close()
+
+	// The build implements a join; THIS server cannot serve one, and says so.
+	if got := s.SessionAttrs()[SessionAttrFeatures]; strings.Contains(got, string(FeatJoin)) {
+		t.Errorf("a single-database server advertised %q in %q; it has no second table to join",
+			FeatJoin, got)
+	}
+	if !strings.Contains(ServerSessionAttrs()[SessionAttrFeatures], string(FeatJoin)) {
+		t.Errorf("the BUILD should still advertise %q; only this server cannot serve it", FeatJoin)
+	}
+
 	cconn, sconn := netPipe()
 	go func() { _ = s.ServeConnOpts(sconn, ServeOptions{Privileged: true}) }()
-	c := NewClient(cconn)
+	c := NewClient(cconn, WithPeerSessionAttrs(s.SessionAttrs()))
 	defer c.Close()
 
-	_, jerr := c.JoinRows(context.Background(), equiReq(db.JoinInner))
-	if !errors.Is(jerr, ErrJoinUnsupported) {
+	if _, jerr := c.JoinRows(context.Background(), equiReq(db.JoinInner)); !errors.Is(jerr, ErrJoinUnsupported) {
 		t.Errorf("error = %v, want ErrJoinUnsupported", jerr)
+	}
+}
+
+// A peer that advertised nothing at all is the other half of the same rule: it predates
+// advertisement, so it predates the join, so there is nothing to ask.
+func TestJoinIsNotSentToAPeerThatAdvertisedNothing(t *testing.T) {
+	// A bare client: no peer attributes captured, and no connection either, since the rule
+	// under test reads only what the handshake recorded.
+	silent := &Client{}
+	if silent.SupportsNewer(FeatJoin) {
+		t.Errorf("a peer that advertised nothing was treated as having a feature introduced " +
+			"after advertisement existed")
+	}
+	// And a feature that PREDATES advertisement keeps the old reading: silence is not a no.
+	if !silent.SupportsNewer(FeatProjectRefs) {
+		t.Errorf("a peer that advertised nothing was treated as lacking a feature that " +
+			"predates advertisement; that would refuse work such a server does perfectly well")
 	}
 }
 
