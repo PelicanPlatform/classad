@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -58,6 +59,20 @@ type Options struct {
 	// wrong answer and this is a value-producing API.
 	MaxResultBytes int
 
+	// MaxBatch is the largest vector batch a UDF with a vector entry point will
+	// be handed, and so how much of its memory the host reserves for the call
+	// frame. Default 4096, matching the row-group scale the engine scans at.
+	//
+	// A batch larger than this declines, which is correct (the engine falls back
+	// to calling per record) and slow, so the counter for it exists -- see
+	// ReasonBatchTooLarge.
+	MaxBatch int
+
+	// MaxBatchArgs sizes the vector call frame for a VARIADIC UDF, which has no
+	// declared maximum arity to compute from. Default 4. A UDF with a declared
+	// maximum ignores this and is sized from that instead, exactly.
+	MaxBatchArgs int
+
 	// MaxInstances bounds how many instances of one UDF exist at once, and so how
 	// many calls to it run concurrently; a caller past the bound waits. Default
 	// GOMAXPROCS, on the grounds that a UDF is CPU-bound and an instance beyond a
@@ -93,6 +108,12 @@ func (o Options) withDefaults() Options {
 	if o.MaxResultBytes <= 0 {
 		o.MaxResultBytes = 64 * 1024
 	}
+	if o.MaxBatch <= 0 {
+		o.MaxBatch = 4096
+	}
+	if o.MaxBatchArgs <= 0 {
+		o.MaxBatchArgs = 4
+	}
 	if o.MaxInstances <= 0 {
 		o.MaxInstances = runtime.GOMAXPROCS(0)
 	}
@@ -117,20 +138,83 @@ func (o Options) withDefaults() Options {
 // linear memory, so two concurrent calls would be writing each other's call
 // frames, and its guest may keep state there besides.
 type Loader struct {
-	rt   wazero.Runtime
 	opts Options
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// rts holds one runtime per interruption mode, created on demand and indexed
+	// by whether a guest compiled into it can be stopped by the clock.
+	//
+	// It has to be two runtimes rather than one with a per-call choice, because
+	// interruptibility is a property of the COMPILED CODE: wazero emits a
+	// termination check at loop back-edges and call sites to make the stop
+	// possible, so the machine code for a trusted module and an untrusted one
+	// genuinely differs and the two cannot share a compilation. That is also why
+	// the second runtime is lazy -- a process that loads no trusted module never
+	// builds one.
+	rts    [2]wazero.Runtime
 	udfs   map[string]*UDF
 	closed bool
 }
 
-// NewLoader creates a Loader and its wasm runtime.
+// LoadOptions are the per-module decisions an ADMIN makes about a module, as
+// distinct from the per-process ones in Options.
+type LoadOptions struct {
+	// Trusted runs the module without the wall-clock backstop and on wazero's
+	// non-interruptible code path: ~15ns per call against ~350ns, which is the
+	// whole reason the label exists (BenchmarkRawGuestInterruptible).
+	//
+	// It does NOT relax the deterministic step budget, the memory cap, the result
+	// validation, the poisoned result slot, or discarding an instance that
+	// trapped. Those are not the expensive part -- the measurement is unambiguous
+	// that the cost is wazero's interruptibility and the per-call deadline
+	// context, not the budget, which costs nothing at all for a guest that
+	// declares no steps. And the budget is the only bound whose failures are
+	// reproducible, so dropping it would mean a trusted module and an untrusted
+	// one could not be run against each other on the same input and compared.
+	//
+	// What it does give up is liveness: a trusted module that loops forever hangs
+	// its goroutine, with nothing able to stop it. That is the trade, and it is
+	// why this is the admin's decision and not the module's.
+	//
+	// TRUST IS NOT SOMETHING A MODULE CAN CLAIM. This field is the only input.
+	// Nothing in the wasm -- an export, a custom section, a name, a start
+	// section -- is consulted, and there is deliberately no ABI through which a
+	// guest could ask. A module arrives trusted because configuration said so,
+	// which is the only party in a position to know.
+	Trusted bool
+}
+
+// NewLoader creates a Loader. Its wasm runtimes are built on demand by Load.
 func NewLoader(ctx context.Context, opts Options) (*Loader, error) {
-	opts = opts.withDefaults()
+	l := &Loader{opts: opts.withDefaults(), udfs: map[string]*UDF{}}
+	// The runtime for the default mode is built eagerly so that a configuration
+	// error -- an impossible memory limit, say -- is reported by NewLoader rather
+	// than by whichever Load happens to be first.
+	if _, err := l.runtime(ctx, false); err != nil {
+		return nil, err
+	}
+	return l, nil
+}
+
+// runtime returns the runtime for one interruption mode, building it on first
+// use. The caller holds l.mu, except in NewLoader where nothing else can see it.
+func (l *Loader) runtime(ctx context.Context, trusted bool) (wazero.Runtime, error) {
+	// A trusted module is not interruptible. An untrusted one is, unless the
+	// caller disabled the backstop for every module in the process, in which case
+	// there is no deadline left for the machinery to deliver and charging for it
+	// would be charging for nothing.
+	interruptible := !trusted && l.opts.Timeout >= 0
+
+	idx := 0
+	if !interruptible {
+		idx = 1
+	}
+	if rt := l.rts[idx]; rt != nil {
+		return rt, nil
+	}
 
 	cfg := wazero.NewRuntimeConfig().
-		WithMemoryLimitPages(opts.MemoryLimitPages).
+		WithMemoryLimitPages(l.opts.MemoryLimitPages).
 		// Without this the runtime cannot interrupt a guest at all, and a bare
 		// infinite loop would hold its goroutine until the process died.
 		//
@@ -138,10 +222,8 @@ func NewLoader(ctx context.Context, opts Options) (*Loader, error) {
 		// cost is ~340ns per CALL on an Apple M2 (see
 		// BenchmarkRawGuestInterruptible, where the same guest costs 15ns
 		// without it), which is more than everything else this package does per
-		// call put together. So it is enabled exactly when there is a deadline
-		// for it to enforce -- a caller who has disabled the backstop is not
-		// also charged for the machinery that would have delivered it.
-		WithCloseOnContextDone(opts.Timeout >= 0).
+		// call put together.
+		WithCloseOnContextDone(interruptible).
 		// Pinned rather than left at the runtime's default so that a wazero
 		// upgrade enabling a new proposal does not silently widen what a guest
 		// can do. Threads in particular would give two instances a shared memory
@@ -149,12 +231,12 @@ func NewLoader(ctx context.Context, opts Options) (*Loader, error) {
 		WithCoreFeatures(api.CoreFeaturesV2)
 
 	rt := wazero.NewRuntimeWithConfig(ctx, cfg)
-
 	if err := installFuel(ctx, rt); err != nil {
 		_ = rt.Close(ctx)
 		return nil, err
 	}
-	return &Loader{rt: rt, opts: opts, udfs: map[string]*UDF{}}, nil
+	l.rts[idx] = rt
+	return rt, nil
 }
 
 // Load compiles wasm and returns the UDF it defines, accepting minArgs..maxArgs
@@ -170,6 +252,11 @@ func NewLoader(ctx context.Context, opts Options) (*Loader, error) {
 //
 // A returned error means nothing was loaded and nothing registered.
 func (l *Loader) Load(ctx context.Context, name string, minArgs, maxArgs int, wasm []byte) (*UDF, error) {
+	return l.LoadWith(ctx, name, minArgs, maxArgs, wasm, LoadOptions{})
+}
+
+// LoadWith is Load with the per-module options an admin sets. See LoadOptions.
+func (l *Loader) LoadWith(ctx context.Context, name string, minArgs, maxArgs int, wasm []byte, lo LoadOptions) (*UDF, error) {
 	if name == "" {
 		return nil, errors.New("wasmudf: empty function name")
 	}
@@ -186,7 +273,11 @@ func (l *Loader) Load(ctx context.Context, name string, minArgs, maxArgs int, wa
 		return nil, fmt.Errorf("wasmudf: %s is already loaded", name)
 	}
 
-	compiled, err := l.rt.CompileModule(ctx, wasm)
+	rt, err := l.runtime(ctx, lo.Trusted)
+	if err != nil {
+		return nil, fmt.Errorf("wasmudf: %s: %w", name, err)
+	}
+	compiled, err := rt.CompileModule(ctx, wasm)
 	if err != nil {
 		return nil, fmt.Errorf("wasmudf: %s: %w", name, err)
 	}
@@ -205,9 +296,31 @@ func (l *Loader) Load(ctx context.Context, name string, minArgs, maxArgs int, wa
 		maxArgs:  maxArgs,
 		compiled: compiled,
 		loader:   l,
+		rt:       rt,
 		opts:     l.opts,
+		trusted:  lo.Trusted,
+		vectored: hasVectorEntry(compiled),
 		free:     make(chan *instance, l.opts.MaxInstances),
 		tokens:   make(chan struct{}, l.opts.MaxInstances),
+	}
+	// A trusted module runs with no deadline, so no deadline context is derived
+	// for it and nothing is charged for the interruption support it does not have.
+	u.timeout = l.opts.Timeout
+	if lo.Trusted {
+		u.timeout = -1
+	}
+	// The region has to hold the largest vector frame this UDF can be handed, or
+	// the vector path turns itself off one batch at a time and the only symptom is
+	// that it is slow. Sized from the declared arity where there is one; a
+	// variadic UDF has no bound to compute from, so MaxBatchArgs supplies it.
+	if u.vectored {
+		argc := maxArgs
+		if argc < 0 {
+			argc = l.opts.MaxBatchArgs
+		}
+		u.region = max(l.opts.RegionBytes, vectorRegionBytes(l.opts.MaxBatch, argc))
+	} else {
+		u.region = l.opts.RegionBytes
 	}
 	for range l.opts.MaxInstances {
 		u.tokens <- struct{}{}
@@ -260,8 +373,21 @@ func (l *Loader) Close(ctx context.Context) error {
 		return nil
 	}
 	l.closed = true
+	rts := l.rts
 	l.mu.Unlock()
-	return l.rt.Close(ctx)
+
+	// Both runtimes, and the first error rather than the last: a Close that
+	// reported only the second would hide a failure to release the first.
+	var firstErr error
+	for _, rt := range rts {
+		if rt == nil {
+			continue
+		}
+		if err := rt.Close(ctx); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // checkImports refuses a module wanting anything the host does not offer.
@@ -318,13 +444,44 @@ func checkExports(c wazero.CompiledModule) error {
 	if !ok {
 		return fmt.Errorf("no exported function %q", exportCall)
 	}
-	wantParams := []api.ValueType{api.ValueTypeI32, api.ValueTypeI32, api.ValueTypeI32}
-	if !slices.Equal(call.ParamTypes(), wantParams) ||
-		len(call.ResultTypes()) != 1 || call.ResultTypes()[0] != api.ValueTypeI32 {
-		return fmt.Errorf("%s must be (func (param i32 i32 i32) (result i32)), got params %v results %v",
-			exportCall, call.ParamTypes(), call.ResultTypes())
+	if err := checkSignature(exportCall, call, 3); err != nil {
+		return err
+	}
+
+	// The vector entry point is OPTIONAL -- a module without one is simply called
+	// per record -- but the scalar one is not, and that is what makes the escape
+	// hatch safe by construction: a vectorized guest can always decline a record,
+	// because the path those records go to is a function every module must export.
+	// There is no module shape in which a decline has nowhere to go.
+	if vec, ok := fns[exportCallVec]; ok {
+		if err := checkSignature(exportCallVec, vec, 5); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// checkSignature requires (func (param i32 x nparams) (result i32)).
+func checkSignature(name string, fn api.FunctionDefinition, nparams int) error {
+	want := make([]api.ValueType, nparams)
+	for i := range want {
+		want[i] = api.ValueTypeI32
+	}
+	if !slices.Equal(fn.ParamTypes(), want) ||
+		len(fn.ResultTypes()) != 1 || fn.ResultTypes()[0] != api.ValueTypeI32 {
+		return fmt.Errorf("%s must be (func (param%s) (result i32)), got params %v results %v",
+			name, strings.Repeat(" i32", nparams), fn.ParamTypes(), fn.ResultTypes())
+	}
+	return nil
+}
+
+// hasVectorEntry reports whether the module exports the batch entry point. It is
+// read from the COMPILED MODULE and nowhere else -- not from a name, a custom
+// section or anything else a module author could write -- for the same reason
+// trust is: what a guest says about itself is not a capability.
+func hasVectorEntry(c wazero.CompiledModule) bool {
+	_, ok := c.ExportedFunctions()[exportCallVec]
+	return ok
 }
 
 // checkVersion calls the guest's version export. It is the one load check that

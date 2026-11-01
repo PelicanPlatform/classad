@@ -62,7 +62,18 @@ func (classAdRegistry) RegisterFunction(_ string, _, _ int, _ func(args []classa
 // name is taken, and silently discarding a compiled module on the way out of a
 // failed call makes a retry under another name recompile for no reason.
 func Register(ctx context.Context, l *Loader, reg Registry, name string, minArgs, maxArgs int, wasm []byte) (*UDF, error) {
-	u, err := l.Load(ctx, name, minArgs, maxArgs, wasm)
+	return RegisterWith(ctx, l, reg, name, minArgs, maxArgs, wasm, LoadOptions{})
+}
+
+// RegisterWith is Register with the per-module options an admin sets.
+//
+// It is a separate function rather than a changed signature because the registry
+// is append-only and so is this API: a caller already registering UDFs keeps
+// compiling. The trust label arrives HERE, from configuration, and reaches the
+// Loader as a Go value -- there is no path by which the module being registered
+// could influence it.
+func RegisterWith(ctx context.Context, l *Loader, reg Registry, name string, minArgs, maxArgs int, wasm []byte, lo LoadOptions) (*UDF, error) {
+	u, err := l.LoadWith(ctx, name, minArgs, maxArgs, wasm, lo)
 	if err != nil {
 		return nil, err
 	}

@@ -101,6 +101,50 @@
 // could not be compiled into a query at all -- see classad's nonStrictFunctions,
 // where time and random sit for exactly this reason.
 //
+// # Two entry points
+//
+// A module always exports the SCALAR entry point, called once per record. It may
+// also export a VECTOR entry point, called once per batch, which is what gets a
+// UDF into the vector engine's hot loop instead of pulling the whole query off
+// it. CallBatch uses the vector one and falls back to the scalar one for anything
+// it cannot do; see Batch and abivec.go for the batch representation and the
+// escape hatch by which a vectorized guest declines individual records.
+//
+// Requiring the scalar one is what makes the escape hatch unconditional: there is
+// no module shape in which a declined record has nowhere to go.
+//
+// The measured difference, on an Apple M2 Pro, per element, for a UDF that
+// doubles a number:
+//
+//	scalar, untrusted                 782 ns
+//	scalar, trusted                   106 ns
+//	batch of 4096, untrusted         27.9 ns
+//	batch of 4096, trusted            6.3 ns
+//
+// Batching is worth 28x on its own and 17x on top of trust, so the two are not
+// substitutes: trust removes a per-call cost, batching removes a per-call cost
+// AND amortizes the marshalling, and what is left at 6.3 ns is the work.
+//
+// # Trust
+//
+// An admin may label a module trusted (LoadOptions.Trusted). A trusted module is
+// compiled into a runtime that cannot be interrupted and runs with no wall-clock
+// deadline, which is where almost all of the scalar path's overhead was.
+//
+// It does NOT relax the deterministic step budget, the memory cap, the poisoned
+// result slot, the validation of what a guest returns, or discarding an instance
+// that trapped. The measurement is why: the budget is not where the time goes,
+// and it is the only bound whose failures are reproducible, so relaxing it would
+// buy nothing and cost the one property that makes a trusted module and an
+// untrusted one comparable on the same input.
+//
+// Trust is CONFIGURATION. Nothing in a module is consulted -- not an export, not
+// a custom section, not a name -- and there is deliberately no ABI through which a
+// guest could ask, because a capability a module can assert is a request rather
+// than a capability. What a trusted module gives up is liveness: one that loops
+// forever hangs its goroutine with nothing able to stop it, which is precisely
+// why the decision belongs to the party that configured the pool.
+//
 // # Bounds
 //
 // Memory is capped by the runtime (a hard bound; the guest's grow simply fails).
@@ -126,6 +170,11 @@
 // bytecode to inject the charges, which this increment does not do. The two
 // failures are reported as different reasons (ReasonStepLimit, ReasonTimeout) so a
 // test can assert that a given module only ever hits the deterministic one.
+//
+// The deadline is set up ONCE per CallBatch, covering the vector call and every
+// record escalated out of it, rather than once per record. That is the right scope
+// as well as the cheap one: the engine's unit of work is the batch, so a deadline
+// per record would let a batch of 4096 run for 4096 times the configured limit.
 //
 // # Failures
 //

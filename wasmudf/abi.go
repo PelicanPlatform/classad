@@ -15,6 +15,7 @@ import (
 const (
 	exportABIVersion = "classad_udf_abi_version"
 	exportCall       = "classad_udf_call"
+	exportCallVec    = "classad_udf_call_vec"
 	exportMemory     = "memory"
 
 	importModule = "classad_udf"

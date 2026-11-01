@@ -1,6 +1,7 @@
 package wasmudf
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -171,4 +172,104 @@ func TestConcurrentLoads(t *testing.T) {
 			t.Errorf("%s is missing from the loader", string(rune('a'+i)))
 		}
 	}
+}
+
+// TestConcurrentBatches is the instance pool under the vector path. A batch owns
+// its instance for the whole call AND for every record it escalates out of it, so
+// two concurrent batches sharing one would be overwriting each other's argument
+// columns in one linear memory -- 4096 records at a time instead of one.
+//
+// vecdecline is used rather than a guest that declines nothing, so each goroutine
+// exercises the vector path and the escape hatch in the same call. Each uses a
+// distinct value range and checks its own answers, which is what makes a crossed
+// batch visible: a shared instance shows up as one goroutine reading another's
+// column, not as a crash.
+func TestConcurrentBatches(t *testing.T) {
+	const goroutines, each, n = 8, 40, 64
+	u := loadFixture(t, Options{MaxInstances: 3, MaxBatch: n}, "vecdecline", 1, 1)
+
+	var wg sync.WaitGroup
+	bad := make(chan string, goroutines*each)
+	for g := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			vals := make([]int64, n)
+			st := make([]uint8, n)
+			for i := range n {
+				// Half odd, half even, so half of every batch escalates.
+				vals[i] = int64(g*1_000_000 + i)
+				st[i] = vsInt
+			}
+			in := Batch{N: n, St: st, I: vals}
+			out := &Batch{N: n, St: make([]uint8, n), I: make([]int64, n)}
+			for range each {
+				if !u.CallBatch([]Batch{in}, out) {
+					bad <- "declined"
+					return
+				}
+				for i := range n {
+					if out.St[i] != vsInt || out.I[i] != vals[i]*2 {
+						bad <- fmt.Sprintf("element %d = (%d,%d), want %d",
+							i, out.St[i], out.I[i], vals[i]*2)
+						return
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(bad)
+	for e := range bad {
+		t.Fatalf("concurrent batch: %s", e)
+	}
+
+	s := u.Stats()
+	if s.Batches != goroutines*each {
+		t.Errorf("Batches = %d, want %d", s.Batches, goroutines*each)
+	}
+	if s.Failures != 0 {
+		t.Errorf("unexpected failures: %v", s.ByReason)
+	}
+	if s.Instances > 3 {
+		t.Errorf("created %d instances with MaxInstances=3", s.Instances)
+	}
+	requireFullSemaphore(t, u)
+}
+
+// TestConcurrentTrustedAndUntrusted runs both runtimes at once. They are separate
+// wazero runtimes sharing nothing but this Loader, and a lazily built second one
+// is built while the first is in use.
+func TestConcurrentTrustedAndUntrusted(t *testing.T) {
+	l := newLoader(t, Options{})
+	plain, err := l.Load(t.Context(), "plain", 1, 1, fixture(t, "identity"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := range 500 {
+			if got := plain.Call([]classad.Value{classad.NewIntValue(int64(i))}); got.IsError() {
+				t.Errorf("plain(%d) = ERROR", i)
+				return
+			}
+		}
+	}()
+
+	// Loading a trusted module builds the second runtime, concurrently with calls
+	// into the first.
+	fast, err := l.LoadWith(t.Context(), "fast", 1, 1, fixture(t, "identity"),
+		LoadOptions{Trusted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range 500 {
+		if got := fast.Call([]classad.Value{classad.NewIntValue(int64(i))}); got.IsError() {
+			t.Fatalf("fast(%d) = ERROR", i)
+		}
+	}
+	wg.Wait()
 }

@@ -51,11 +51,29 @@ const (
 	// design; counted rather than assumed away, because the alternative to
 	// counting it is a daemon dying of a bug in this package.
 	ReasonPanic
+
+	// The three below are DECLINES rather than failures: no record got ERROR,
+	// the vector path simply did not run and the caller falls back to calling
+	// per record. They are counted anyway, and OnFailure fires for them, because
+	// a vector path that has quietly turned itself off is otherwise visible only
+	// as a query being slower than it ought to be -- the hardest kind of problem
+	// to find, since nothing is wrong with the answers.
+
+	// ReasonBatchTooLarge -- the batch has more records, or more arguments, than
+	// the region was sized for at load. Raise Options.MaxBatch or MaxBatchArgs.
+	ReasonBatchTooLarge
+	// ReasonBatchStrings -- an argument column holds strings or dictionary codes,
+	// which the vector ABI does not carry. See Batch.
+	ReasonBatchStrings
+	// ReasonBatchShape -- the columns do not agree on a record count, a column is
+	// shorter than it claims, the result column is not in the data form, or the
+	// argument count is outside the registered arity.
+	ReasonBatchShape
 )
 
 // reasonCount sizes the per-reason counters. It is derived from the last constant
 // rather than written out, so adding a Reason cannot leave a counter unallocated.
-const reasonCount = int(ReasonPanic) + 1
+const reasonCount = int(ReasonBatchShape) + 1
 
 var reasonNames = [reasonCount]string{
 	ReasonNone:           "none",
@@ -69,6 +87,9 @@ var reasonNames = [reasonCount]string{
 	ReasonStatus:         "guest status",
 	ReasonBadResult:      "malformed result",
 	ReasonPanic:          "host panic",
+	ReasonBatchTooLarge:  "batch too large",
+	ReasonBatchStrings:   "batch holds strings",
+	ReasonBatchShape:     "malformed batch",
 }
 
 func (r Reason) String() string {

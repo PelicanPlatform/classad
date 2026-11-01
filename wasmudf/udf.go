@@ -98,9 +98,23 @@ type instance struct {
 	ctx  context.Context
 	fuel callState
 
+	// callVec is the batch entry point, nil for a module that has none.
+	callVec api.Function
+
 	// stack is the wasm call stack for CallWithStack, reused so a call allocates
-	// neither its arguments nor its results.
-	stack [3]uint64
+	// neither its arguments nor its results. Five words: the vector entry takes
+	// five parameters and the scalar one three, and one array sized for the wider
+	// of them is one fewer thing to get wrong than two arrays.
+	stack [5]uint64
+
+	// declined is the decline bitmask read back out of guest memory, sized for
+	// MaxBatch once per instance rather than allocated per batch.
+	declined []uint64
+
+	// scalarArgs is the boxed argument list for one escalated record, reused
+	// across the records of a batch so an escape hatch that fires often does not
+	// allocate per record.
+	scalarArgs []classad.Value
 }
 
 // UDF is one loaded wasm function.
@@ -110,7 +124,20 @@ type UDF struct {
 
 	compiled wazero.CompiledModule
 	loader   *Loader
+	rt       wazero.Runtime
 	opts     Options
+
+	// trusted, vectored, timeout and region are fixed at load.
+	//
+	// timeout is the UDF's own deadline rather than the Loader's because trust is
+	// per module: a trusted module's is negative, which is what suppresses the
+	// per-call deadline context to match the non-interruptible runtime it was
+	// compiled into. Keeping them in step is not optional -- a deadline over a
+	// guest that cannot be interrupted is a timer that fires into nothing.
+	trusted  bool
+	vectored bool
+	timeout  time.Duration
+	region   int
 
 	// free holds idle instances and tokens bounds how many exist. A caller takes
 	// a token first (waiting if MaxInstances calls are already in flight) and
@@ -121,9 +148,18 @@ type UDF struct {
 	tokens chan struct{}
 
 	calls     atomic.Uint64
+	batches   atomic.Uint64
+	escalated atomic.Uint64
 	instances atomic.Uint64
 	failures  [reasonCount]atomic.Uint64
 }
+
+// Trusted reports whether the module was labelled trusted at load.
+func (u *UDF) Trusted() bool { return u.trusted }
+
+// Vectored reports whether the module exports the batch entry point, and so
+// whether CallBatch can do anything but decline.
+func (u *UDF) Vectored() bool { return u.vectored }
 
 // Name returns the name the UDF was loaded under.
 func (u *UDF) Name() string { return u.name }
@@ -133,7 +169,17 @@ func (u *UDF) Arity() (minArgs, maxArgs int) { return u.minArgs, u.maxArgs }
 
 // Stats is a snapshot of one UDF's counters.
 type Stats struct {
+	// Calls counts scalar calls, INCLUDING the ones made to serve records a
+	// vector call declined. Batches counts vector calls, and Escalated counts the
+	// records inside them that went through the escape hatch.
+	//
+	// Escalated against Batches times the batch size is the number that says
+	// whether a vectorized UDF is earning its vector entry point: a guest
+	// declining most of its records is the scalar path with a vector call in
+	// front of it, which is slower than not having one.
 	Calls     uint64
+	Batches   uint64
+	Escalated uint64
 	Failures  uint64
 	Instances uint64
 	ByReason  map[Reason]uint64
@@ -145,6 +191,8 @@ type Stats struct {
 func (u *UDF) Stats() Stats {
 	s := Stats{
 		Calls:     u.calls.Load(),
+		Batches:   u.batches.Load(),
+		Escalated: u.escalated.Load(),
 		Instances: u.instances.Load(),
 		ByReason:  map[Reason]uint64{},
 	}
@@ -197,7 +245,16 @@ func (u *UDF) Call(args []classad.Value) classad.Value {
 		return u.fail(ReasonInstance, err)
 	}
 
-	v, r, cerr := u.invoke(in, args)
+	// One call, one deadline. CallBatch derives ONE for a whole batch instead and
+	// passes it down to every escalated record, which is why invoke takes a
+	// context rather than making its own: ~290ns per record is 39% of a scalar
+	// call and 0.07ns of a 4096-record one.
+	ctx, cancel := in.callContext(u.timeout)
+	if cancel != nil {
+		defer cancel()
+	}
+
+	v, r, cerr := u.invoke(in, ctx, args)
 
 	if r.fromGuest() {
 		u.discard(in)
@@ -212,7 +269,7 @@ func (u *UDF) Call(args []classad.Value) classad.Value {
 
 // invoke is the body of one call against an instance the caller owns. It returns
 // ReasonNone with the guest's value, or a reason and the error behind it.
-func (u *UDF) invoke(in *instance, args []classad.Value) (v classad.Value, r Reason, cerr error) {
+func (u *UDF) invoke(in *instance, ctx context.Context, args []classad.Value) (v classad.Value, r Reason, cerr error) {
 	defer func() {
 		// recover() must be called DIRECTLY by the deferred function literal: a
 		// helper that calls it leaves recover one frame too deep, where it
@@ -232,10 +289,6 @@ func (u *UDF) invoke(in *instance, args []classad.Value) (v classad.Value, r Rea
 		return classad.NewErrorValue(), reason, nil
 	}
 
-	ctx, cancel := in.callContext(u.opts.Timeout)
-	if cancel != nil {
-		defer cancel()
-	}
 	in.fuel.steps = u.opts.Steps
 
 	in.stack[0] = uint64(f.args)
@@ -348,7 +401,7 @@ func (u *UDF) newInstance(ctx context.Context) (*instance, error) {
 		// runs regardless.
 		WithStartFunctions()
 
-	mod, err := u.loader.rt.InstantiateModule(in.ctx, u.compiled, cfg)
+	mod, err := u.rt.InstantiateModule(in.ctx, u.compiled, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -362,8 +415,20 @@ func (u *UDF) newInstance(ctx context.Context) (*instance, error) {
 		_ = mod.Close(ctx)
 		return nil, errors.New("instance is missing an export the module declares")
 	}
+	if u.vectored {
+		in.callVec = mod.ExportedFunction(exportCallVec)
+		if in.callVec == nil {
+			_ = mod.Close(ctx)
+			return nil, errors.New("instance is missing the vector export the module declares")
+		}
+		// Sized once per instance for the largest batch the UDF accepts, so a
+		// batch allocates nothing: the decline mask is the one buffer a vector
+		// call needs that is not already in the caller's batch or the guest's
+		// memory.
+		in.declined = make([]uint64, maskWords(u.opts.MaxBatch))
+	}
 
-	pages := uint32((u.opts.RegionBytes + 65535) / 65536)
+	pages := uint32((u.region + 65535) / 65536)
 	prev, ok := in.mem.Grow(pages)
 	if !ok {
 		// The guest's declared maximum, or the runtime's memory limit, leaves no
@@ -371,7 +436,7 @@ func (u *UDF) newInstance(ctx context.Context) (*instance, error) {
 		// an ERROR per call if a later instance somehow differs.
 		_ = mod.Close(ctx)
 		return nil, fmt.Errorf("cannot grow memory by %d pages for the %d-byte call region",
-			pages, u.opts.RegionBytes)
+			pages, u.region)
 	}
 	in.base = prev * 65536
 	in.size = pages * 65536
