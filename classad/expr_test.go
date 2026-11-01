@@ -2,6 +2,8 @@ package classad
 
 import (
 	"testing"
+
+	"github.com/PelicanPlatform/classad/ast"
 )
 
 // TestParseExpr tests parsing expressions directly
@@ -340,5 +342,21 @@ func TestExprWithoutContext(t *testing.T) {
 	value, _ := result.IntValue()
 	if value != 14 {
 		t.Errorf("Expected 14, got %d", value)
+	}
+}
+
+// TestExprAST: AST hands back the parsed tree itself, and nil for a nil Expr, as ClassAd.AST does.
+func TestExprAST(t *testing.T) {
+	e, err := ParseExpr("a || b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, ok := e.AST().(*ast.BinaryOp)
+	if !ok || b.Op != "||" || b.String() != e.String() {
+		t.Fatalf("AST() = %#v, want the parsed a || b", e.AST())
+	}
+	var nilExpr *Expr
+	if nilExpr.AST() != nil {
+		t.Fatal("a nil Expr's AST is not nil")
 	}
 }
