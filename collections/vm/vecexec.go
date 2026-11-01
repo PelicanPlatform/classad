@@ -65,6 +65,27 @@ import (
 // the useful increment and what would change that. member/identicalMember over a constant list is the
 // one call that does NOT go that way -- it has a real kernel, memberVec, and the compiler prefers it.
 
+// THE KERNEL CONTRACT, and the reason no caller may share a vector between two kernels.
+//
+// A kernel does not compute into a destination. It OVERWRITES ITS LEFT OPERAND with the result and
+// CONVERTS ITS RIGHT OPERAND'S REPRESENTATION IN PLACE; a one-operand kernel replaces that operand.
+// logicalVec is the clearest case (it calls toMask on both and writes the planes back into l) and
+// arithVec, compareVec, unopVec, strListVec and memberVec have the same shape.
+//
+// That is deliberate: it is what keeps every vector in the pool instead of copying 200 KiB per
+// instruction, and callFuncVec's result-by-pointer-swap is the same idea (see its comment).
+//
+// The stack executor is safe by construction, because every OpLoadRef pushes a FRESH vector, so no two
+// kernels ever see the same one. Two foreseeable changes break that and must copy or prove ownership
+// first: a register file with one register per value, and a common-subexpression pass that shares one
+// loaded column between two consumers.
+//
+// Sharing is a WRONG ANSWER and not a crash, because the conversions lose information. A number
+// converts to a mask by operand truthiness -- nonzero is TRUE -- and converting back reconstructs the
+// element from the planes rather than restoring what was there, so 3 comes back as TRUE. In
+// `x > 1 && x` a shared x would be clobbered by the logical operator while the comparison still needed
+// it. kernel_contract_test.go pins all of this.
+
 // Element states. A vector carries one per element, which is how three-valued logic and ERROR survive
 // vectorization, and how int and real stay distinguishable -- 7/2 is not 7.0/2.0.
 const (
@@ -273,6 +294,13 @@ type DictResolver interface {
 //
 // ok=false means the reference cannot be served as a vector -- a string column, or an attribute whose
 // values are expressions -- and the evaluation declines as a whole.
+//
+// PURITY, per batch: within one batch, two LoadColumn calls for the same (name, scope) must fill dst
+// with equal contents, and the call must have no effect a later call can observe except through dst.
+// An implementation may cache, since caching is not observable through this interface. A pass that
+// deduplicates loads needs this, and blockVecSource satisfies it -- it reads a fixed block through a
+// block cache and writes only dst. It is NOT sufficient on its own: see THE KERNEL CONTRACT above,
+// because a deduplicated load is a SHARED vector and the kernels destroy what they are given.
 type ColumnSource interface {
 	LoadColumn(name string, scope ast.AttributeScope, dst *Vec) bool
 }
@@ -601,6 +629,10 @@ func binopVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 		return hookAll(ev, op, l, r)
 	}
 }
+
+// arithVec applies an arithmetic operator over a batch.
+//
+// DESTRUCTIVE: the result goes into l and r is converted in place. See THE KERNEL CONTRACT.
 func arithVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 	l.ensureInts()
 	r.ensureInts()
@@ -741,6 +773,7 @@ func callFuncVec(ev *classad.Evaluator, f funcInfo, s *VecScratch) bool {
 	return true
 }
 
+// DESTRUCTIVE: v IS the destination. See THE KERNEL CONTRACT.
 func unopVec(ev *classad.Evaluator, op string, v *Vec) bool {
 	v.ensureInts()
 	if op == "!" {
@@ -1485,6 +1518,7 @@ func identicalConst(negate bool, dst, col, lit *Vec) bool {
 // Operands arrive as masks when they came from a comparison, which is the common case, and are converted
 // with ClassAd's operand truthiness otherwise -- numbers are truthy, strings are an error. See
 // dataStateToMask, and note that is a DIFFERENT notion of truth from IsTrue.
+// DESTRUCTIVE: the result goes into l and r is converted in place. See THE KERNEL CONTRACT.
 func logicalVec(op string, l, r *Vec) bool {
 	l.toMask()
 	r.toMask()
