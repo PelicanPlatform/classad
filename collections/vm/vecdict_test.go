@@ -204,6 +204,13 @@ var dictExprs = []string{
 	`D == "user3" && A > 2`, `D == "user3" || D == "user10"`, `D != "user3" && E == "user3"`,
 	// string-VALUED results: the payload has to come back out of the dictionary
 	`D`, `E`, `D + 1`,
+	// BLENDED results. A conditional and an Elvis both copy a chosen element into a fresh vector, and a
+	// code copied out of its dictionary is not a value -- see blendDictSource. `D ?: "zz"` covers the
+	// Elvis path where the code comes from the SELECTOR rather than from a pushed path, and
+	// `ifThenElse(A > 2, D, D2)` covers two dictionaries meeting in one result.
+	`D ?: "zz"`, `Missing ?: D`, `ifThenElse(A > 2, D, "x")`, `ifThenElse(A > 2, D, D2)`,
+	`ifThenElse(A > 2, D, E)`, `(D ?: "zz") == "user3"`, `(Missing ?: D) == "user10"`,
+	`ifThenElse(A > 2, D, D2) =?= "user10"`,
 }
 
 // TestVecDictMatchesScalarPerRecord holds the dictionary kernels to the same per-record parity as the
@@ -460,5 +467,79 @@ func TestVecDictIdentityExhaustive(t *testing.T) {
 					expr, recs[i]["D"], recs[i]["D2"], got.value(i), want)
 			}
 		}
+	}
+}
+
+// TestVecDictBlendKeepsCodesCoded is the guard against a vacuous fix. Resolving every code to its
+// string during a blend is CORRECT -- it is what the result does for every source whose dictionary it
+// did not adopt -- so a blendDictSource that always returned nil would pass every parity test above
+// while materializing a string per record, which is the cost the dictionary exists to avoid.
+//
+// So this pins the optimization rather than the semantics: with one dictionary in play the blend's
+// result must still be CODES, carrying the resolver that assigned them.
+func TestVecDictBlendKeepsCodesCoded(t *testing.T) {
+	src := dictCorpus()
+	n := len(src.recs)
+	for _, expr := range []string{`D ?: "zz"`, `ifThenElse(A > 2, D, "x")`} {
+		q, err := Parse(expr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, ok := q.VecEval(src, n, nil)
+		if !ok {
+			t.Fatalf("%q declined", expr)
+		}
+		if got.Dict == nil {
+			t.Errorf("%q: the blend dropped the dictionary; every code is being materialized", expr)
+			continue
+		}
+		coded := 0
+		for i := 0; i < n; i++ {
+			if got.St[i] == VsDictCode {
+				coded++
+			}
+		}
+		if coded == 0 {
+			t.Errorf("%q: no element came through as a code", expr)
+		}
+	}
+}
+
+// TestVecDictBlendAcrossDictionaries pins the case the per-element resolve exists for: two columns with
+// SEPARATE dictionaries meeting in one result. Their codes number independently, so a result can hold at
+// most one of them coded and the other has to arrive as a string -- and the two columns here are built so
+// that a code read against the wrong dictionary gives a real string rather than an out-of-range error,
+// which is what makes the failure a silently wrong value instead of a visible one.
+func TestVecDictBlendAcrossDictionaries(t *testing.T) {
+	src := dictCorpus()
+	n := len(src.recs)
+	q, err := Parse(`ifThenElse(A > 2, D, D2)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := q.VecEval(src, n, nil)
+	if !ok {
+		t.Fatal("declined")
+	}
+	// Taken from the scalar interpreter's answer rather than restated, so this cannot drift from it.
+	for i := 0; i < n; i++ {
+		want := q.Eval(src.ad(i))
+		if !sameValue(got.value(i), want) {
+			t.Errorf("record %d: vector %s != scalar %s", i, got.value(i), want)
+		}
+	}
+	// And the mixed result really is mixed: if every element were resolved to a string this would pass
+	// on values alone and say nothing about the fast path.
+	var codes, strs int
+	for i := 0; i < n; i++ {
+		switch got.St[i] {
+		case VsDictCode:
+			codes++
+		case VsString:
+			strs++
+		}
+	}
+	if codes == 0 || strs == 0 {
+		t.Errorf("result has %d codes and %d strings; the two-dictionary blend should produce both", codes, strs)
 	}
 }
