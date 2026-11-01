@@ -1,7 +1,7 @@
 # Writing a WebAssembly user-defined function for ClassAd
 
 **Status:** implemented, `classad/wasmudf` (its own Go module)
-**ABI version:** 1
+**ABI versions:** 1 and 2, both spoken by the host
 **Audience:** someone writing a guest module, in any language that compiles to wasm
 
 This describes the contract between the host (the `wasmudf` package) and a guest
@@ -16,6 +16,13 @@ records, is optional, and is where the performance is. The relationship between
 them is half the design: a vector guest is allowed to hand individual records
 back to its own scalar implementation, so it never has to express every awkward
 case in batch-shaped code.
+
+The vector convention comes in two shapes, and the number your module reports
+from `classad_udf_abi_version` chooses which one it is handed. **Version 1**
+carries a type tag beside every element, so one column can hold five kinds of
+value. **Version 2** carries one type for the whole column and escalates the
+records that do not fit it. If you are writing a new module, write version 2 —
+section 4a says why, and it is a large difference rather than a tidier one.
 
 ---
 
@@ -39,15 +46,22 @@ at all. The purity is what buys the speed.
 
 ```wat
 (memory (export "memory") 1)                                     ;; required
-(func (export "classad_udf_abi_version") (result i32))           ;; required, must return 1
+(func (export "classad_udf_abi_version") (result i32))           ;; required, must return 1 or 2
 (func (export "classad_udf_call") (param i32 i32 i32) (result i32))        ;; required
 (func (export "classad_udf_call_vec") (param i32 i32 i32 i32 i32) (result i32)) ;; optional
 ```
 
 The memory must be exported under the name `memory`. The version function must
-return `1`; if it returns anything else the module is refused at load with both
-numbers in the message, rather than quietly reading fields at offsets the host no
-longer writes.
+return `1` or `2`; if it returns anything else the module is refused at load with
+your number and the host's range in the message, rather than quietly reading
+fields at offsets the host no longer writes.
+
+The version is not merely checked, it is **kept**, and it decides which descriptor
+forms your vector entry point is handed for the life of the module. That is the
+only thing that decides it: not the batch, not a flag, not anything you can ask
+for per call. Reading the wrong one of these two forms is the single mistake this
+boundary cannot catch — every byte involved is legal and in bounds — so the choice
+is made once, from a number you declare, and never guessed.
 
 Anything else you export is ignored. In particular:
 
@@ -184,6 +198,13 @@ classad_udf_call_vec(n, argsPtr, argc, resPtr, declinePtr) -> status
 - `declinePtr` — a bitmask, one bit per record, for records you will not handle
   (section 5)
 
+Which **forms** you are handed depends on the version you reported:
+
+| you report | you may be handed |
+|---|---|
+| 1 | the data form (0) and the mask form (1) |
+| 2 | the **columnar** form (2) and the mask form (1) — never the data form |
+
 The status means the same thing it does in the scalar ABI: `0` says your output
 column is written, anything else says it is not.
 
@@ -267,6 +288,102 @@ distinction and neither does the evaluator it has to agree with, so inventing on
 here would be inventing semantics. If you are looking for an absent mask, this is
 the answer: it is the undefined mask.
 
+### 4a. The columnar form (`form == 2`, ABI version 2 only)
+
+This is the data form with the state plane shortened to **one element**.
+
+```
+offset  0   u32   form      2
+offset  4   u32   flags     bit 0 set = const
+offset  8   u32   aPtr      ONE state byte: the state of every record in the column
+offset 12   u32   bPtr      n i64 payloads (one, if const)
+```
+
+Same 16 bytes, same field offsets, same state codes 0–4. The only difference is
+that `aPtr` points at a single byte rather than at `n` of them, so you read the
+column's type **once, before your loop**, instead of once per element.
+
+#### Why that is the whole point
+
+A ClassAd column genuinely can hold an integer, a real and an UNDEFINED in three
+consecutive records, which is what the data form is honest about. The cost of
+that honesty is not the branch itself. It is that a loop with a branch per element
+retires **one record per loop back-edge** — it cannot be unrolled, the lanes
+cannot be made to agree, and nothing can be hoisted out of it. And a back-edge is
+the unit an interruptible runtime charges for: measured on an Apple M2, about
+20ns, against about 0.6ns for the arithmetic. So a byte that exists to describe
+the rare record sets the price of every record.
+
+With one state for the column there is nothing to branch on. The loop that remains
+is a branch-free pass over int64 lanes, which you can unroll, and which you can
+write with `v128` if you want to. Measured end to end over a 4096-record batch of
+integers, per element:
+
+| guest | untrusted | trusted |
+|---|---|---|
+| version 1, a branch per element | 25.7 ns | 5.3 ns |
+| version 2, branch-free, one record per back-edge | 22.5 ns | 2.2 ns |
+| version 2, branch-free, eight records per back-edge | 5.6 ns | 1.9 ns |
+| version 2, the same eight as four `i64x2` lanes | 5.1 ns | 1.7 ns |
+
+Read the last two rows together before you reach for SIMD. Most of the untrusted
+win is **unrolling**, not vector lanes: the runtime is charging you per back-edge
+and a vector instruction's only relevance is that it needs fewer of them. The
+vector instructions themselves are worth about 10% on top. They are worth having
+and they are not the reason this form exists.
+
+#### The records that do not fit
+
+A column is given one state, so the records whose value is not in that state
+cannot be represented. They are not dropped and they do not get a worse answer:
+**the host sets their bit in the decline mask before calling you**, and they take
+the per-record scalar path, which is the same path version 1's escape hatch sends
+them down. The host picks the state that covers the most records, so one UNDEFINED
+in a column of integers escalates one record rather than all the others.
+
+That has a consequence worth stating plainly, because it is what makes a
+branch-free guest possible at all:
+
+> **You may ignore the decline mask entirely.** Compute every lane, including the
+> lanes of records you were never given. The host does not read a declined lane,
+> so what you put there cannot be wrong.
+
+So that this is safe rather than merely usual, the host writes a **benign value**
+into those lanes before the call — integer 1, real 1.0 — rather than leaving the
+bits the engine happened to have there. An operation that can trap on a value, an
+integer division above all, cannot be made to trap by a record you were not given.
+(It can still trap on a real one. A zero divisor is your problem either way.)
+
+If you would rather skip the work, the mask is there and you may read it. What you
+must not do is **clear** a bit in it — see section 5.
+
+#### Your output column, when you report version 2
+
+The result descriptor is also `form == 2`: `aPtr` is one state byte, `bPtr` is `n`
+payloads. Write the state **once**, write the payloads, return 0.
+
+```wat
+(i32.store8 (i32.load offset=8 (local.get $res)) (i32.const 0))  ;; "this column is integers"
+```
+
+Everything the data-form result requires still holds: states 0–4 only, a boolean
+payload is 0 or 1, and the host reads **its own** pointers rather than the ones in
+the descriptor. One state describes the whole column, so one illegal state byte is
+the whole column being a value of no kind, and the batch is refused.
+
+If you declined every record, write nothing. There is no column, and the host does
+not ask you to describe one.
+
+#### What this form gives up, honestly
+
+Version 1 poisons `n` result state bytes, so a guest that fills half a column and
+declines nothing is caught at the first element it skipped. There is one state byte
+to poison here, so that guest is caught **only if it also forgot the state**. In
+exchange the host zeroes the payload array before every call, so the part you did
+not write is deterministic zeros rather than the previous batch's answers for other
+records. That is a smaller net and a stale-value leak closed, not a straight win.
+Fill the column you described.
+
 ### The const flag
 
 If `flags` bit 0 is set, **only element 0 of that column is meaningful** — every
@@ -279,13 +396,17 @@ commonest shape a UDF call in a query has, and materializing one would mean
 writing nine identical bytes per record to say the same thing `n` times — the cost
 the engine's own const representation exists to remove.
 
+The flag means the same thing in the columnar form, where the column is one state
+byte and one payload whatever `n` is.
+
 One case you do **not** have to handle: if *every* argument is const, the host
 computes the single answer through your **scalar** entry point and never calls the
 vector one. So a const flag on every column is something you will not see.
 
-### Your output column
+### Your output column (version 1)
 
-The result descriptor always describes the **data form**, with arrays the host
+A version 2 guest writes the columnar result described above; this is the version
+1 shape. The result descriptor describes the **data form**, with arrays the host
 allocated: `aPtr` → `n` state bytes, `bPtr` → `n` i64 payloads. Write a state and
 a payload for each record you handled.
 
@@ -321,12 +442,18 @@ at any bytes of your own that happened to look legal.)
   *every* record, so escalating them one at a time would be the per-record path
   with a vector call in front of it.
 - **Stored-width columns.** The engine sometimes holds a column in the width it
-  occupies on disk — two or four bytes, signed or unsigned. Exposing that would
-  put four code paths in every guest and break them all the next time the block
-  format changed, so the host widens it to int64 first.
+  occupies on disk — two or four bytes, signed or unsigned, and sometimes an odd
+  fitted width like six. Exposing that would put four code paths in every guest
+  and break them all the next time the block format changed, so the host widens it
+  to int64 first. A two-byte column is eight lanes of a 128-bit vector against
+  two, which is the argument for carrying it, and the measurements in section 4a
+  are the argument against hurrying: the guest's loop is a quarter of a trusted
+  call and a seventh of an untrusted one, so four times the lanes inside it moves
+  a number that is not the one in front. It would be a new **form**, not a new
+  field, so nothing here has a hole shaped like it.
 
-Both may be added later; both would be an ABI version bump, because they change
-what a guest must understand.
+Both may be added later; both would be a new form or an ABI version bump, because
+they change what a guest must understand.
 
 ---
 
@@ -356,9 +483,17 @@ Three rules:
    all. "I declined this record" means "do not look", and the host does not.
    (`testdata/vecdecline.wat` deliberately leaves an illegal state there, so that
    this is a test rather than a promise.)
-2. **The host clears the mask before every call.** A bit you set in one batch does
-   not carry into the next. You never need to clear it yourself and you must not
-   assume anything about what was there before — it is zero.
+2. **The mask holds the host's own declines when you are called,** and nothing
+   from any previous batch. For a version 1 guest that is always zero, which is
+   what version 1 promised. For a version 2 guest it is the records whose value is
+   not of the state their column was given (section 4a).
+
+   So: **OR into the mask, never store over it.** A guest that stores would wipe
+   bits that are not its to wipe. The host ORs its own declines back in after
+   reading yours, so doing it wrong cannot produce a wrong answer — it would mean
+   claiming records you were never given, and the host does not let you have them.
+   Clearing a bit buys you nothing and the arithmetic for ORing is the same either
+   way.
 3. **The mask is read only if you return status 0.** If you trap, run out of
    steps, or report a nonzero status, the mask you left behind says nothing about
    which records you handled, so the host escalates nothing and the whole batch
@@ -524,7 +659,8 @@ able to stop it.
 ## 8. To write a UDF, in order
 
 1. **Export a memory called `memory`** with at least one page.
-2. **Export `classad_udf_abi_version`** returning `1`.
+2. **Export `classad_udf_abi_version`** returning `2` for a new module, or `1` to
+   be handed the per-element typed forms a version 1 module was written for.
 3. **Export `classad_udf_call(argsPtr, argc, resultPtr) -> i32`.** Check `argc`
    first and return nonzero if it is not what you expect. Read each argument's tag
    and dispatch on it. Decide, explicitly, what your answer is for UNDEFINED and
@@ -537,10 +673,17 @@ able to stop it.
    UDF. The vector entry point is an optimization.
 7. **If you add `classad_udf_call_vec`:** check `argc`; check each descriptor's
    `form` and const flag and refuse with a nonzero status if they are not what you
-   support; loop over `n` records writing your output column; set a decline bit for
-   every record you do not handle, and **make sure your scalar implementation
+   support; loop over `n` records writing your output column; OR a decline bit in
+   for every record you do not handle, and **make sure your scalar implementation
    handles everything you decline** — that is where those records go.
-8. **Keep the two in agreement.** A vectorized module is two implementations of one
+8. **At version 2, read each column's state once and write a loop with no branch
+   in it.** Then unroll it. That ordering is deliberate: the unrolling is where
+   most of the measured difference is, and it is only available to you because the
+   state came out of the loop.
+9. **Decline a state you have no loop for by setting every bit,** not by returning
+   a nonzero status. A nonzero status makes every record ERROR; a full decline mask
+   gives every record its scalar answer.
+10. **Keep the two in agreement.** A vectorized module is two implementations of one
    function. Nothing stops them from disagreeing except you testing that they do
    not, over every state and a range of payloads.
 
@@ -576,7 +719,14 @@ rule testable rather than merely stated:
 | `tagecho.wat` | the scalar ABI across every tag |
 | `identity.wat` | the cheapest possible guest; the round-trip of every value state |
 | `concat.wat` | building a string result in memory you own |
-| `vecdouble.wat` | the typed vector path plus the escape hatch |
+| `vecdouble.wat` | the typed vector path plus the escape hatch (version 1) |
+| `colvecdouble.wat` | the same function on the columnar form (version 2) |
+| `colvecunroll.wat`, `colvecsimd.wat` | eight records per back-edge, scalar and `i64x2` |
+| `colvecconst.wat` | a const argument in the columnar form |
+| `colvecstomp.wat` | a guest that stores over the decline mask, and gets nothing for it |
+| `colvecdeclineall.wat` | declining every record, and a result that describes no column |
+| `colvecsilent.wat`, `colvecbadstate.wat`, `colvecbadbool.wat` | the three ways a columnar result fails validation |
+| `colvecpartial.wat` | filling half a column, and the tail not being the last batch's |
 | `vecmaskarg.wat` | reading the mask-form bitplanes |
 | `vecconst.wat` | requiring the const flag, so the host cannot quietly materialize it |
 | `vecdecline.wat` | declining by value, leaving an illegal state in the declined slots |
@@ -607,8 +757,11 @@ else.
 
 - the export names and their signatures, and the import name `classad_udf.fuel`
 - the scalar slot: 16 bytes, the field offsets, and tags 0–5 with their meanings
-- the batch descriptor: 16 bytes, the field offsets, `form` 0 and 1, `flags` bit 0
-- the data-form state codes 0–4 and the mask-form `(hi, lo)` pairs
+- the batch descriptor: 16 bytes, the field offsets, `form` 0, 1 and 2, `flags`
+  bit 0
+- the data-form state codes 0–4, the mask-form `(hi, lo)` pairs, and the columnar
+  form's single state byte
+- which forms each reported version is handed
 - the status convention, the result poisoning, and the decline mask's semantics
   including the three rules in section 5
 - the ownership and lifetime rules in section 6
@@ -623,12 +776,16 @@ width, the per-call region size, and the number of pooled instances. Do not enco
 any of these as constants in your module. In particular `n` is a parameter of
 every vector call and is not fixed.
 
+**Version 1 is not deprecated.** It is what a column with a state per element
+needs, and the host will keep sending it to a guest that asks for it. What it is
+not is the shape to write something new in.
+
 **Not built.** Named here so you do not plan around something that does not exist:
 
 - bytecode rewriting to inject step charges — so the step budget is cooperative
   and only bounds a module that calls `fuel`
-- strings or dictionary-encoded columns in the vector ABI
-- stored-width (narrow) columns in the vector ABI
+- strings or dictionary-encoded columns in either vector form
+- stored-width (narrow) columns, which would be a new form rather than a new field
 - per-module step and time limits. The budget and the deadline come from the
   loader, so two policies mean two loaders. The trusted label is the one
   per-module decision, and it is a yes or no rather than a number
@@ -643,6 +800,8 @@ every vector call and is not fixed.
 |---|---|
 | the scalar slot, encode and decode | `wasmudf/abi.go` |
 | the vector descriptors, the decline mask, the poison | `wasmudf/abivec.go` |
+| the columnar form, the uniformity scan, the exception mask | `wasmudf/abicol.go` |
+| bulk moves between an int64 column and guest memory | `wasmudf/bulk.go` |
 | the column representation and the engine's state codes | `wasmudf/batch.go` |
 | loading, validation, the two runtimes, the trust label | `wasmudf/loader.go` |
 | the scalar call path, the step counter, the instance pool | `wasmudf/udf.go` |

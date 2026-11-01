@@ -79,6 +79,27 @@ type Batch struct {
 
 	// Hi and Lo are the MASK form: three-valued logic as two bitplanes.
 	Hi, Lo []uint64
+
+	// Uniform asserts that every one of the N elements is in state State, so the
+	// host does not have to look. It is a DECLARATION, not a hint: nothing
+	// verifies it, and a batch that sets it wrongly hands the guest a column
+	// described as something it is not.
+	//
+	// It is here because for the columns that matter the answer is already known
+	// rather than discoverable. A numeric column loaded from a columnar block with
+	// no escaped values has its state written across it by the loader, from the
+	// field's declared kind; a boolean one arrives as a mask. Proving afterwards
+	// what the loader just did would be the only pass over the column the whole
+	// call makes.
+	//
+	// Left false, the host scans, which is a pass it was making anyway on the
+	// version 1 path to find strings. So this buys the scan back, it does not
+	// unlock the form.
+	Uniform bool
+
+	// State is the state every element is in when Uniform is set, using the same
+	// codes as St. Ignored otherwise.
+	State uint8
 }
 
 // Vector element states. These numbers are the ABI, and they are the engine's

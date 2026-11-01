@@ -22,11 +22,29 @@ const (
 	importFuel   = "fuel"
 )
 
-// abiVersion is what a guest must report from exportABIVersion. It is checked at
-// load, not per call, and it exists so that a change to the slot layout is a
+// The ABI versions this host speaks. A guest reports one from exportABIVersion
+// and it is checked at load, not per call, so that a change to a layout is a
 // refusal naming two numbers rather than a guest reading fields at offsets the
 // host no longer writes -- which would not fail, it would return wrong values.
-const abiVersion = 1
+//
+// Version 1 is the per-element typed vector form: a state byte beside every
+// payload, so one column can hold five different kinds of value. Version 2 adds
+// the COLUMNAR form, where a column has one state for all of it and the records
+// that do not fit are escalated instead of being represented. The host speaks
+// both, and what it sends is decided by what the guest reports: a version 1 guest
+// is handed exactly what it was handed before.
+//
+// The two are not alternatives for the host to choose between per batch. A guest
+// reading a form it was not written for is the one failure this boundary cannot
+// detect -- the bytes are all legal -- so the version is what selects the form,
+// and nothing else is.
+const (
+	abiVersion1 = 1
+	abiVersion2 = 2
+
+	abiVersionMin = abiVersion1
+	abiVersionMax = abiVersion2
+)
 
 // Slot geometry. See the package comment for the layout and why it is fixed width.
 const (

@@ -342,11 +342,13 @@ func (l *Loader) LoadWith(ctx context.Context, name string, minArgs, maxArgs int
 		_ = compiled.Close(ctx)
 		return nil, fmt.Errorf("wasmudf: %s: %w", name, err)
 	}
-	if verr := checkVersion(in); verr != nil {
+	ver, verr := checkVersion(in)
+	if verr != nil {
 		u.discard(in)
 		_ = compiled.Close(ctx)
 		return nil, fmt.Errorf("wasmudf: %s: %w", name, verr)
 	}
+	u.abi = ver
 	u.release(in)
 
 	l.udfs[name] = u
@@ -484,19 +486,28 @@ func hasVectorEntry(c wazero.CompiledModule) bool {
 	return ok
 }
 
-// checkVersion calls the guest's version export. It is the one load check that
-// needs the guest to run, which is also why it doubles as the proof that the
-// module can be instantiated and called at all.
-func checkVersion(in *instance) error {
+// checkVersion calls the guest's version export and returns the version it
+// reports. It is the one load check that needs the guest to run, which is also
+// why it doubles as the proof that the module can be instantiated and called at
+// all.
+//
+// The version it returns is not merely validated, it is KEPT: it decides which
+// descriptor forms the guest is handed for the rest of its life. A host that
+// checked the number and threw it away would have to guess per batch, and the
+// guess that is wrong -- a version 1 guest handed a columnar column -- reads a
+// state byte array where there is one state byte, in bounds, and returns numbers.
+func checkVersion(in *instance) (uint32, error) {
 	res, err := in.version.Call(in.ctx)
 	if err != nil {
-		return fmt.Errorf("calling %s: %w", exportABIVersion, err)
+		return 0, fmt.Errorf("calling %s: %w", exportABIVersion, err)
 	}
 	if len(res) != 1 {
-		return fmt.Errorf("%s returned %d values", exportABIVersion, len(res))
+		return 0, fmt.Errorf("%s returned %d values", exportABIVersion, len(res))
 	}
-	if got := uint32(res[0]); got != abiVersion {
-		return fmt.Errorf("module speaks ABI version %d, host speaks %d", got, abiVersion)
+	got := uint32(res[0])
+	if got < abiVersionMin || got > abiVersionMax {
+		return 0, fmt.Errorf("module speaks ABI version %d, host speaks %d..%d",
+			got, abiVersionMin, abiVersionMax)
 	}
-	return nil
+	return got, nil
 }

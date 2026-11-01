@@ -63,10 +63,15 @@ func (u *UDF) CallBatch(args []Batch, out *Batch) bool {
 		u.fail(ReasonBatchTooLarge, fmt.Errorf("batch of %d exceeds MaxBatch %d", n, u.opts.MaxBatch))
 		return false
 	}
-	for i := range args {
-		if args[i].carriesStrings() {
-			u.fail(ReasonBatchStrings, nil)
-			return false
+	if u.abi < abiVersion2 {
+		// Version 2 answers the same question inside the uniformity scan, which
+		// has to look at every state byte anyway; running both would be two
+		// passes over every column to learn one thing.
+		for i := range args {
+			if args[i].carriesStrings() {
+				u.fail(ReasonBatchStrings, nil)
+				return false
+			}
 		}
 	}
 
@@ -84,12 +89,25 @@ func (u *UDF) CallBatch(args []Batch, out *Batch) bool {
 	}
 	out.Const = false
 
-	u.batches.Add(1)
 	in, err := u.acquire()
 	if err != nil {
+		u.batches.Add(1)
 		u.fail(ReasonInstance, err)
 		return u.errorBatch(out, n)
 	}
+
+	// Version 2 decides each column's form before anything is written, because a
+	// column with no uniform state to give it declines the batch -- and a decline
+	// is not a failure, so it must happen before the batch is counted as one. The
+	// scan needs the instance's scratch, which is why it is here and not above
+	// the acquire.
+	if u.abi >= abiVersion2 {
+		if !u.planColumns(in, n, args) {
+			u.release(in)
+			return false
+		}
+	}
+	u.batches.Add(1)
 
 	// ONE deadline for the whole batch, and for every record escalated out of it.
 	//
@@ -172,7 +190,13 @@ func (u *UDF) invokeVec(in *instance, ctx context.Context, n int, args []Batch, 
 		}
 	}()
 
-	f, fits := writeBatchArgs(in.mem, in.base, in.size, n, args)
+	var f vecFrame
+	var fits bool
+	if u.abi >= abiVersion2 {
+		f, fits = writeColBatchArgs(in.mem, in.base, in.size, n, args, in.plan, in.hostDeclined)
+	} else {
+		f, fits = writeBatchArgs(in.mem, in.base, in.size, n, args)
+	}
 	if !fits {
 		// The region was sized for MaxBatch at load, so this means the frame is
 		// wider than that sizing assumed -- a variadic UDF handed more arguments
@@ -199,6 +223,20 @@ func (u *UDF) invokeVec(in *instance, ctx context.Context, n int, args []Batch, 
 	// failure paths above never reach this.
 	if !readDeclineMask(in.mem, f.decline, n, in.declined) {
 		return ReasonBadResult, fmt.Errorf("cannot read the decline mask at %d", f.decline)
+	}
+	if u.abi >= abiVersion2 {
+		// The host's own declines go back in. They were handed to the guest as the
+		// mask's starting value, but version 1 promised a zero mask and so allowed
+		// a guest to STORE its bits rather than OR them; one that does would
+		// otherwise be credited with records whose value was never of the state its
+		// column declared, and the host would read a lane computed from a filler.
+		for w := range maskWords(n) {
+			in.declined[w] |= in.hostDeclined[w]
+		}
+		if !readColBatchResult(in.mem, f, n, in.declined, out) {
+			return ReasonBadResult, fmt.Errorf("the result column holds a state that is not a value")
+		}
+		return ReasonNone, nil
 	}
 	if !readBatchResult(in.mem, f, n, in.declined, out) {
 		return ReasonBadResult, fmt.Errorf("the result column holds a state that is not a value")

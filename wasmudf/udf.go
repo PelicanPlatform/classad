@@ -111,6 +111,26 @@ type instance struct {
 	// MaxBatch once per instance rather than allocated per batch.
 	declined []uint64
 
+	// hostDeclined is the host's OWN declines for the current batch: the records
+	// whose value does not fit the state its column was given in the columnar
+	// form. It is written into guest memory as the mask's starting value and ORed
+	// back in after the guest's mask is read.
+	//
+	// Both, not either. Passing it in lets a guest skip work it would only throw
+	// away; ORing it back is what makes the answer not depend on the guest having
+	// left those bits alone. A guest that stores its mask rather than ORing into
+	// it -- which version 1 promised it could, since the mask arrived zero --
+	// would otherwise clear the host's bits and be credited with records whose
+	// argument was never of the type it was told the column held.
+	hostDeclined []uint64
+
+	// colExceptions is scratch for one column's exception bits during the
+	// uniformity scan, reused across columns and batches.
+	colExceptions []uint64
+
+	// plan is the form decided for each argument of the current version 2 batch.
+	plan []colPlan
+
 	// scalarArgs is the boxed argument list for one escalated record, reused
 	// across the records of a batch so an escape hatch that fires often does not
 	// allocate per record.
@@ -138,6 +158,10 @@ type UDF struct {
 	vectored bool
 	timeout  time.Duration
 	region   int
+
+	// abi is the version the guest reported at load, and it selects which
+	// descriptor forms a vector call hands it. See checkVersion.
+	abi uint32
 
 	// free holds idle instances and tokens bounds how many exist. A caller takes
 	// a token first (waiting if MaxInstances calls are already in flight) and
@@ -426,6 +450,8 @@ func (u *UDF) newInstance(ctx context.Context) (*instance, error) {
 		// call needs that is not already in the caller's batch or the guest's
 		// memory.
 		in.declined = make([]uint64, maskWords(u.opts.MaxBatch))
+		in.hostDeclined = make([]uint64, maskWords(u.opts.MaxBatch))
+		in.colExceptions = make([]uint64, maskWords(u.opts.MaxBatch))
 	}
 
 	pages := uint32((u.region + 65535) / 65536)

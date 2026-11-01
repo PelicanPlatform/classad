@@ -228,18 +228,16 @@ func writeDesc(mem api.Memory, at, form, flags, aPtr, bPtr uint32) bool {
 
 // writeInts and writeWords copy a slice of 64-bit values into guest memory.
 //
-// They go through the memory's byte view in one Write rather than n
-// WriteUint64Le calls, because the bounds check and the slice reslice happen once
-// instead of per element -- the difference between a memmove and a loop at the
-// one place in this package that is per element rather than per call.
+// They resolve the destination with one mem.Read, so the bounds check and the
+// reslice happen once rather than per element, and then hand the copy to putInts
+// -- which on a little-endian host is a memmove, because guest memory and a Go
+// int64 slice are then the same bytes in the same order. See bulk.go.
 func writeInts(mem api.Memory, at uint32, xs []int64) bool {
 	dst, ok := mem.Read(at, uint32(len(xs))*8)
 	if !ok {
 		return false
 	}
-	for i, x := range xs {
-		binary.LittleEndian.PutUint64(dst[i*8:], uint64(x))
-	}
+	putInts(dst, xs)
 	return true
 }
 
@@ -248,9 +246,7 @@ func writeWords(mem api.Memory, at uint32, xs []uint64) bool {
 	if !ok {
 		return false
 	}
-	for i, x := range xs {
-		binary.LittleEndian.PutUint64(dst[i*8:], x)
-	}
+	putWords(dst, xs)
 	return true
 }
 
