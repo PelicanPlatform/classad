@@ -593,6 +593,12 @@ They are committed as both `.wat` (the source, for reading) and `.wasm` (what th
 tests load), with `testdata/build.sh` to rebuild them. The tests load the
 committed binary, so running the suite needs no wasm toolchain.
 
+If you change a fixture, **run `build.sh`**. It records the hash of every source
+it compiled in `testdata/fixtures.sha256`, and `TestFixtureBinariesAreCurrent`
+fails if a `.wat` has changed since — otherwise the suite would stay green while
+testing the old binary, and the source you were reading would say something
+else.
+
 ---
 
 ## 10. What is stable, and what may change

@@ -2,8 +2,11 @@ package wasmudf
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -282,5 +285,74 @@ func TestLoaderLookup(t *testing.T) {
 	}
 	if lo, hi := u.Arity(); lo != 1 || hi != 1 {
 		t.Errorf("Arity = %d..%d, want 1..1", lo, hi)
+	}
+}
+
+// TestFixtureBinariesAreCurrent -- every .wat was compiled by build.sh since it
+// was last edited.
+//
+// The fixtures are committed twice: the .wat a reviewer reads and the .wasm the
+// tests load. The suite loads the binary on purpose, so that it needs no wasm
+// toolchain and no test can skip itself on a machine without one -- and nothing
+// in it would otherwise notice a source edited without a rebuild. The tests would
+// stay green against the old binary while the source said something else, which
+// is the worst shape this can take: the documentation and the thing under test
+// disagree and everything reports success.
+//
+// So build.sh records the hash of every SOURCE it compiled, and this compares.
+// Hashing the sources rather than rebuilding and comparing bytes is deliberate:
+// wat2wasm's output is only comparable against the same wabt, so a byte
+// comparison in CI would fail on an encoder change with nothing actually stale.
+func TestFixtureBinariesAreCurrent(t *testing.T) {
+	const manifest = "testdata/fixtures.sha256"
+	raw, err := os.ReadFile(manifest)
+	if err != nil {
+		t.Fatalf("reading %s: %v (run wasmudf/testdata/build.sh)", manifest, err)
+	}
+
+	// name -> hex digest, as `sha256sum *.wat` writes it.
+	recorded := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			t.Fatalf("%s: cannot parse %q", manifest, line)
+		}
+		recorded[strings.TrimPrefix(fields[1], "*")] = fields[0]
+	}
+
+	sources, err := filepath.Glob(filepath.Join("testdata", "*.wat"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sources) == 0 {
+		t.Fatal("no .wat fixtures found")
+	}
+
+	for _, src := range sources {
+		name := filepath.Base(src)
+		b, err := os.ReadFile(src)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		sum := fmt.Sprintf("%x", sha256.Sum256(b))
+		want, ok := recorded[name]
+		if !ok {
+			t.Errorf("%s is not in %s: run wasmudf/testdata/build.sh", name, manifest)
+			continue
+		}
+		if sum != want {
+			t.Errorf("%s has changed since it was last compiled; %s.wasm is stale. Run wasmudf/testdata/build.sh",
+				name, strings.TrimSuffix(name, ".wat"))
+		}
+		delete(recorded, name)
+
+		// And the binary the tests actually load exists.
+		if _, err := os.Stat(filepath.Join("testdata", strings.TrimSuffix(name, ".wat")+".wasm")); err != nil {
+			t.Errorf("%s has no compiled binary: %v", name, err)
+		}
+	}
+	for name := range recorded {
+		t.Errorf("%s is in %s but no longer exists: run wasmudf/testdata/build.sh", name, manifest)
 	}
 }
