@@ -337,6 +337,7 @@ func (c *compiler) emitMember(fc *ast.FunctionCall) bool {
 // DICTIONARY-ENCODED string column is decided per distinct value instead: the codes a block's
 // dictionary assigns to set members are marked once, in a bitset over the dictionary, and each record
 // is then a bit test on its code -- the strings themselves are never compared per record.
+// DESTRUCTIVE: v IS the destination. See THE KERNEL CONTRACT in vecexec.go.
 func memberVec(s *memberSet, v *Vec, sc *VecScratch) bool {
 	v.ensureInts()
 	v.toData()

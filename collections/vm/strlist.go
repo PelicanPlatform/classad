@@ -125,6 +125,7 @@ func (c *compiler) emitStrListMember(fc *ast.FunctionCall) bool {
 // shape. A dictionary-encoded column could be decided per DISTINCT value instead, marking the codes
 // whose string is in the set once per block and testing a bit per record, which is what memberVec
 // does; that is a further specialization of this one and not a different mechanism.
+// DESTRUCTIVE: v IS the destination. See THE KERNEL CONTRACT in vecexec.go.
 func strListVec(s *strListSet, v *Vec) bool {
 	v.toData()
 	v.ensureInts()
