@@ -330,16 +330,16 @@ func (p *joinPlan) run(hashSeq, scanSeq iter.Seq[*classad.ClassAd], stats *JoinS
 				if !p.condHolds(l, r) {
 					continue
 				}
-				ok, stop := p.emit(l, r, stats, yield)
-				if stop {
+				// The pair matched. Whether the row then survives the post-filter is a
+				// SEPARATE question, and conflating the two is a wrong answer: a matched
+				// row that WHERE drops must not come back as a null-extended one.
+				matched = true
+				if stop := p.emit(l, r, stats, yield); stop {
 					return
-				}
-				if ok {
-					matched = true
 				}
 			}
 			if !matched && p.kind == JoinLeft {
-				if _, stop := p.emit(l, nil, stats, yield); stop {
+				if stop := p.emit(l, nil, stats, yield); stop {
 					return
 				}
 			}
@@ -350,25 +350,23 @@ func (p *joinPlan) run(hashSeq, scanSeq iter.Seq[*classad.ClassAd], stats *JoinS
 	}
 }
 
-// emit forms the joined row, applies the post-filter and yields it. ok reports that a row was
-// produced; stop reports that the caller stopped or a limit ended the join.
-func (p *joinPlan) emit(l, r *classad.ClassAd, stats *JoinStats, yield func(*classad.ClassAd) bool) (ok, stop bool) {
+// emit forms the joined row, applies the post-filter and yields it. It reports only whether
+// the join should STOP -- whether the row survived the filter is deliberately not reported,
+// because the one caller that used to branch on it drew the wrong conclusion from it.
+func (p *joinPlan) emit(l, r *classad.ClassAd, stats *JoinStats, yield func(*classad.ClassAd) bool) (stop bool) {
 	row := p.composite(l, r)
 	for _, ex := range p.post {
 		if !isTrue(ex.Eval(row)) {
-			return false, false
+			return false
 		}
 	}
 	if stats.Rows >= p.limits.MaxRows {
 		stats.Err = fmt.Errorf("the join produced more than %d rows; narrow it with a constraint",
 			p.limits.MaxRows)
-		return false, true
+		return true
 	}
 	stats.Rows++
-	if !yield(row) {
-		return true, true
-	}
-	return true, false
+	return !yield(row)
 }
 
 // composite builds the joined row: one ClassAd whose members are the two sides under their
