@@ -86,10 +86,15 @@ func TestGroupCountGeneralPredicates(t *testing.T) {
 // falls to per-record evaluation WITHIN the block -- it must still contribute its groups.
 func TestGroupCountScopedBlocks(t *testing.T) {
 	c := groupReadFixture(t)
-	// An Elvis operator is not lowered by the vector executor, so every block goes to the scoped path.
-	// The exact form matters: `(Missing ?: RequestMemory) > 4096` DOES vectorize, so a test written with
-	// that one asserts the scoped tier while never reaching it.
-	const expr = `RequestMemory > 4096 ?: false`
+	// The expression has to be one the vector executor DECLINES while the query is still native --
+	// non-native would be refused earlier and never reach this choice at all.
+	//
+	// It used to be an Elvis operator, with a comment warning that the exact form mattered because
+	// some Elvis forms vectorized. Elvis now vectorizes in every form (it is a blend), so that whole
+	// family stopped reaching the scoped tier. A call whose RESULT is a list is a durable choice
+	// instead: split returns a list, a Vec has no state that can hold one, and that is a property of
+	// the vector representation rather than of how much has been implemented.
+	const expr = `size(split(Owner)) > 0`
 	checkGroupsMatchRows(t, c, expr, "ProcId")
 	split := lastGroupSplit.Load()
 	if split == nil || split.scopeBlocks == 0 {
