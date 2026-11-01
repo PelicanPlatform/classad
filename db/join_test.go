@@ -243,3 +243,34 @@ func TestJoinLimitsClampToTheStores(t *testing.T) {
 		t.Errorf("a caller raised MaxPairs to %d; the store's own limit must stand", clamped.MaxPairs)
 	}
 }
+
+// The anti-join idiom: a LEFT join whose post-filter keeps only the rows that did NOT pair.
+//
+// It is the one shape where "did this pair satisfy the condition" and "did the row survive
+// the post-filter" have to stay separate questions. Treating a row the filter dropped as a
+// row that never paired null-extends its left side and emits it instead, so a filter meant
+// to select the unmatched rows selects every row.
+func TestJoinLeftPostFilterDoesNotResurrectAPairedRow(t *testing.T) {
+	cat := joinFixture(t)
+	spec := equiSpec(JoinLeft)
+	spec.Post = []string{"h.ClusterId =?= undefined"}
+	got, _ := drain(t, cat, spec)
+	// Only cluster 3 pairs with nothing. Clusters 1 and 2 paired, so they are gone --
+	// dropped by the filter, not null-extended and kept.
+	want := []string{"alice/undefined"}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Errorf("rows = %v, want %v", got, want)
+	}
+}
+
+// The same rule from the other direction: when the filter rejects every paired row, the
+// left rows that paired must not reappear null-extended.
+func TestJoinLeftPostFilterRejectingEveryPairEmitsNothing(t *testing.T) {
+	cat := joinFixture(t)
+	spec := equiSpec(JoinLeft)
+	spec.Post = []string{"h.ExitCode == 42"} // no history row has it
+	got, _ := drain(t, cat, spec)
+	if len(got) != 0 {
+		t.Errorf("rows = %v, want none", got)
+	}
+}

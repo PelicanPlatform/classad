@@ -139,6 +139,14 @@ type JoinStats struct {
 	Pairs    int // candidate pairs examined
 	Rows     int // joined rows produced
 	Err      error
+
+	// ProbeAttr and ProbeKeys describe an index-based equi join: the attribute the hashed
+	// side's scan was narrowed on, and how many distinct key values it was narrowed to.
+	// ProbeKeys is 0 when the scan was not narrowed, and ProbeWhy then says why -- because
+	// a plan that silently did not use an index reads exactly like one that had none.
+	ProbeAttr string
+	ProbeKeys int
+	ProbeWhy  string
 }
 
 // joinPlan is a compiled JoinSpec.
@@ -168,16 +176,43 @@ func (cat *Catalog) Join(spec JoinSpec, want JoinLimits, stats *JoinStats) (iter
 	}
 	// The RIGHT side is hashed and the left streamed, matching the caller's own naming so a
 	// plan reads the same here as where it was made.
-	hashSeq, err := cat.joinSource(spec.Right)
-	if err != nil {
-		return nil, err
-	}
 	scanSeq, err := cat.joinSource(spec.Left)
 	if err != nil {
 		return nil, err
 	}
 	if stats == nil {
 		stats = &JoinStats{}
+	}
+
+	// Before reading the hashed side whole, see whether an index can be made to read only
+	// the rows whose key the other side actually holds (see db/joinprobe.go).
+	right := spec.Right
+	if probe, why := cat.planIndexProbe(p, spec, scanSeq); probe != nil {
+		if why == "" {
+			right.Constraint = probe.cons
+			stats.ProbeKeys = probe.keys
+			stats.ProbeAttr = probe.attr
+		} else {
+			stats.ProbeWhy = why
+		}
+		// The streamed side was held to count its keys; stream it from there either way,
+		// so declining the probe does not cost a second scan.
+		scanSeq = adsSeq(probe.held)
+	} else {
+		stats.ProbeWhy = why
+		// A nil probe can mean the decision gave up PART WAY through the streamed side --
+		// the one gate that declines after reading rows is the one for a side too large to
+		// hold. Whether a source sequence may be ranged twice is a property of each kind
+		// of table, not something this can assume, so the side is resolved again rather
+		// than re-ranged. It costs a query's construction, not a scan.
+		if scanSeq, err = cat.joinSource(spec.Left); err != nil {
+			return nil, err
+		}
+	}
+
+	hashSeq, err := cat.joinSource(right)
+	if err != nil {
+		return nil, err
 	}
 	return p.run(hashSeq, scanSeq, stats), nil
 }
@@ -330,16 +365,16 @@ func (p *joinPlan) run(hashSeq, scanSeq iter.Seq[*classad.ClassAd], stats *JoinS
 				if !p.condHolds(l, r) {
 					continue
 				}
-				ok, stop := p.emit(l, r, stats, yield)
-				if stop {
+				// The pair matched. Whether the row then survives the post-filter is a
+				// SEPARATE question, and conflating the two is a wrong answer: a matched
+				// row that WHERE drops must not come back as a null-extended one.
+				matched = true
+				if stop := p.emit(l, r, stats, yield); stop {
 					return
-				}
-				if ok {
-					matched = true
 				}
 			}
 			if !matched && p.kind == JoinLeft {
-				if _, stop := p.emit(l, nil, stats, yield); stop {
+				if stop := p.emit(l, nil, stats, yield); stop {
 					return
 				}
 			}
@@ -350,25 +385,23 @@ func (p *joinPlan) run(hashSeq, scanSeq iter.Seq[*classad.ClassAd], stats *JoinS
 	}
 }
 
-// emit forms the joined row, applies the post-filter and yields it. ok reports that a row was
-// produced; stop reports that the caller stopped or a limit ended the join.
-func (p *joinPlan) emit(l, r *classad.ClassAd, stats *JoinStats, yield func(*classad.ClassAd) bool) (ok, stop bool) {
+// emit forms the joined row, applies the post-filter and yields it. It reports only whether
+// the join should STOP -- whether the row survived the filter is deliberately not reported,
+// because the one caller that used to branch on it drew the wrong conclusion from it.
+func (p *joinPlan) emit(l, r *classad.ClassAd, stats *JoinStats, yield func(*classad.ClassAd) bool) (stop bool) {
 	row := p.composite(l, r)
 	for _, ex := range p.post {
 		if !isTrue(ex.Eval(row)) {
-			return false, false
+			return false
 		}
 	}
 	if stats.Rows >= p.limits.MaxRows {
 		stats.Err = fmt.Errorf("the join produced more than %d rows; narrow it with a constraint",
 			p.limits.MaxRows)
-		return false, true
+		return true
 	}
 	stats.Rows++
-	if !yield(row) {
-		return true, true
-	}
-	return true, false
+	return !yield(row)
 }
 
 // composite builds the joined row: one ClassAd whose members are the two sides under their
