@@ -2029,6 +2029,22 @@ func (e *Evaluator) evaluateFunctionCall(fc *ast.FunctionCall) Value {
 	// A((A0)) and pow(A0) -- with A0 the attribute itself -- are error without
 	// the cyclic argument ever being evaluated.
 	arity, known := functionArity[funcName]
+	if !known {
+		// A registered user-defined function, reached the same way and with the same arity rule. The
+		// tree-walking evaluator has to know about them: a UDF that worked only in a compiled program
+		// would be a divergence between the two engines, which is the one thing this package does not
+		// allow itself.
+		if u, udf := lookupUDF(funcName); udf {
+			if !u.arity.accepts(len(fc.Args)) {
+				return NewErrorValue()
+			}
+			args := make([]Value, len(fc.Args))
+			for i, arg := range fc.Args {
+				args[i] = e.Evaluate(arg)
+			}
+			return callUDF(u, args)
+		}
+	}
 	if !known || !arity.accepts(len(fc.Args)) {
 		return NewErrorValue()
 	}
