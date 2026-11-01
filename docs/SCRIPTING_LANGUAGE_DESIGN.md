@@ -1657,7 +1657,7 @@ costing, which is exactly why the two quantities have to be named separately rat
 Checking open question 1 — does `ColumnSource.LoadColumn` promise per-batch purity? — turned up
 something larger than the question. The answer to the question is yes:
 `blockVecSource.LoadColumn` reads a fixed block through a block cache, writes only `dst`, and is
-deterministic and idempotent for a given `(block, name, scope)` (`collections/colvec.go:104-131`).
+deterministic and idempotent for a given `(block, name, scope)` (`collections/colvec.go:105-131`).
 Purity holds and can be written into the interface's contract.
 
 **It is not the binding constraint.** The vector kernels do not compute into a destination; they
