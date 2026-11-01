@@ -190,6 +190,10 @@ func (c *compiler) emit(expr ast.Expr) {
 		if c.emitMember(v) {
 			return
 		}
+		// stringListMember over a literal list is a set lookup rather than a per-record split.
+		if c.emitStrListMember(v) {
+			return
+		}
 		// Otherwise a STRICT built-in becomes a native call: its arguments are
 		// ordinary compiled expressions and the call itself is a pure value
 		// operation. Everything else falls through to delegation -- a lazy

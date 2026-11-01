@@ -90,6 +90,9 @@ const (
 	// RMember sets Dst to src.members[Imm].eval(A).
 	RMember
 
+	// RStrListMember sets Dst to src.strLists[Imm].eval(A).
+	RStrListMember
+
 	// REvalNode sets Dst to the tree-walking evaluation of src.nodes[Imm].
 	REvalNode
 
@@ -394,6 +397,11 @@ func (l *lowerer) one(ip int) {
 		d := l.reg()
 		l.emit(RegInstr{Op: RMember, Dst: d, A: a, Imm: in.A})
 		l.push(d)
+	case OpStrListMember:
+		a := l.pop()
+		d := l.reg()
+		l.emit(RegInstr{Op: RStrListMember, Dst: d, A: a, Imm: in.A})
+		l.push(d)
 	case OpCallFunc:
 		f := l.src.funcs[in.A]
 		args := make([]int32, f.argc)
@@ -542,6 +550,9 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classa
 			ip++
 		case RMember:
 			regs[in.Dst] = p.members[in.Imm].eval(regs[in.A])
+			ip++
+		case RStrListMember:
+			regs[in.Dst] = p.strLists[in.Imm].eval(regs[in.A])
 			ip++
 		case RCallFunc:
 			f := p.funcs[in.Imm]

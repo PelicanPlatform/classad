@@ -200,3 +200,70 @@ func TestConditionState(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitStringList pins the two behaviours a caller is most likely to assume wrongly, both of
+// which a compiler that splits a constant list once depends on.
+//
+// The default delimiter set is ", " -- comma AND SPACE -- so "alice bob" is two elements. And the
+// split drops EMPTY fields, so "a,,b" is two elements with no empty one, which means the empty
+// string is never a member of any list. A doc comment in this package asserted the opposite until a
+// test disagreed.
+func TestSplitStringList(t *testing.T) {
+	for _, tc := range []struct {
+		list, delim string
+		want        []string
+	}{
+		{"a,b,c", "", []string{"a", "b", "c"}},
+		{"alice bob", "", []string{"alice", "bob"}}, // space is a default delimiter
+		{"a,,b", "", []string{"a", "b"}},            // empty fields are dropped
+		{" a , b ", "", []string{"a", "b"}},         // elements are trimmed
+		{"", "", nil},                               // an empty list has no elements
+		{"a;b", ";", []string{"a", "b"}},            // a custom delimiter set
+		{"a;b", "", []string{"a;b"}},                // ';' is not a default delimiter
+		{"a|b,c", "|", []string{"a", "b,c"}},        // a custom set REPLACES the default
+		{"a b;c", ";", []string{"a b", "c"}},        // so space is no longer one
+	} {
+		got := SplitStringList(tc.list, tc.delim)
+		if len(got) != len(tc.want) {
+			t.Errorf("SplitStringList(%q, %q) = %q, want %q", tc.list, tc.delim, got, tc.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tc.want[i] {
+				t.Errorf("SplitStringList(%q, %q) = %q, want %q", tc.list, tc.delim, got, tc.want)
+				break
+			}
+		}
+	}
+}
+
+// TestStringListArg pins the item coercion: a string is itself, UNDEFINED is the empty string, and
+// anything else is unusable -- which the stringList built-ins report as ERROR.
+//
+// The undefined rule is the surprising one, and it is narrower than it looks: the empty string it
+// produces matches nothing, because the split never yields an empty element.
+func TestStringListArg(t *testing.T) {
+	for _, tc := range []struct {
+		src    string
+		want   string
+		usable bool
+	}{
+		{`"abc"`, "abc", true},
+		{`""`, "", true},
+		{`undefined`, "", true},
+		{`error`, "", false},
+		{`5`, "", false},
+		{`2.5`, "", false},
+		{`true`, "", false},
+		{`{1, 2}`, "", false},
+	} {
+		expr, err := ParseExpr(tc.src)
+		if err != nil {
+			t.Fatalf("parse %s: %v", tc.src, err)
+		}
+		got, usable := StringListArg(expr.Eval(nil))
+		if usable != tc.usable || got != tc.want {
+			t.Errorf("StringListArg(%s) = (%q, %v), want (%q, %v)", tc.src, got, usable, tc.want, tc.usable)
+		}
+	}
+}

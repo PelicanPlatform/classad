@@ -348,6 +348,10 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			if !memberVec(p.members[in.A], s.top(), s) {
 				return nil, false
 			}
+		case OpStrListMember:
+			if !strListVec(p.strLists[in.A], s.top()) {
+				return nil, false
+			}
 		case OpCallFunc:
 			if !callFuncVec(ev, p.funcs[in.A], s) {
 				return nil, false

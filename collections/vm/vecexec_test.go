@@ -225,6 +225,23 @@ var vecExprs = []string{
 	"ifThenElse(F, ifThenElse(A > 4, 1, 2), ifThenElse(B > 2, 3, 4))",
 	"A ?: ifThenElse(F, 1, 2)", "ifThenElse(F, A ?: 1, B ?: 2)",
 	"ifThenElse(A > 4, 1, 2) ?: 99", "(A ?: 1) ?: 2",
+	// stringListMember over a literal list, against a string column.
+	`stringListMember(S, "user3,user10")`, `stringListMember(S, "user10")`,
+	`stringListMember(S, "")`, `stringListMember(S, "user3;user10", ";")`,
+	`stringListMember(S, " user3 , user10 ")`, `stringListMember(S, "user3,user10") && A > 4`,
+	`stringListMember(A, "user3")`, // a numeric item: ERROR
+	// A CONSTANT item: the whole batch has one answer, so the kernel computes it once instead of
+	// per record. Without these the const path is never entered -- every other case here reads a
+	// column -- and could be deleted with the suite still green.
+	`stringListMember("user3", "user3,user10")`, `stringListMember("nope", "user3,user10")`,
+	`stringListMember("user3", "user3,user10") && A > 4`,
+	`stringListMember(undefined, "user3")`, // const UNDEFINED item: the empty string, so no match
+	// A MASK-form item. The states a mask can hold are true/false/undefined/error, and the undefined
+	// one is what distinguishes a correct read from a stale one: an undefined item is the EMPTY
+	// STRING and so matches nothing (false), while reading the data arrays of a mask-form vector
+	// finds whatever was last there and reports ERROR.
+	`stringListMember(A > 4, "true,false")`, `stringListMember(A > 4, "")`,
+	`stringListMember(F && A > 4, "true")`,
 	// REAL OVERFLOW, which is asymmetric in the reference: a result of +Inf is ERROR, while -Inf and
 	// NaN are ordinary real values. The fast arithmetic loop has to agree with that, and pinning both
 	// directions is what keeps a fix for one from breaking the other.
