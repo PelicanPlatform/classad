@@ -412,6 +412,7 @@ func TestVectorMalformedResults(t *testing.T) {
 	for _, tc := range []struct{ fixture, why string }{
 		{"vecbadstate", "a state code the engine does not have"},
 		{"vecstring", "a string state with no string storage behind it"},
+		{"vecbadbool", "a boolean payload above 1, which the scalar ABI also refuses"},
 	} {
 		t.Run(tc.fixture, func(t *testing.T) {
 			u := loadFixture(t, Options{}, tc.fixture, 1, 1)
@@ -667,4 +668,27 @@ func TestBackstopDisabledSharesTheRuntime(t *testing.T) {
 	if l.rts[0] != nil {
 		t.Error("an interruptible runtime was built with no deadline to enforce")
 	}
+}
+
+// TestResultDescriptorRewriteIsIgnored -- the result descriptor is the host
+// telling the guest where to write, not the guest telling the host where to read.
+//
+// vecredirect fills a buffer it owns with legal-looking integers, points the
+// descriptor at it, and leaves the host's slots untouched. A host that re-read
+// the descriptor after the call would return 1234 for every record and count no
+// failure: the poison only guarantees anything if the host reads the slots it
+// poisoned, and a guest can rewrite anything in its own memory.
+func TestResultDescriptorRewriteIsIgnored(t *testing.T) {
+	u := loadFixture(t, Options{}, "vecredirect", 1, 1)
+	out := outBatch(4)
+	if !u.CallBatch([]Batch{intBatch(1, 2, 3, 4)}, out) {
+		t.Fatal("declined")
+	}
+	for i := range 4 {
+		if out.I[i] == 1234 {
+			t.Errorf("element %d came from the guest's own buffer", i)
+		}
+	}
+	wantAllError(t, out, 4)
+	requireReason(t, u, ReasonBadResult)
 }

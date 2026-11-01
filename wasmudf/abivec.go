@@ -83,6 +83,17 @@ type vecFrame struct {
 	args    uint32 // argc descriptors
 	result  uint32 // one descriptor
 	decline uint32 // ceil(n/64) u64 words
+
+	// resSt and resI are the result arrays the host allocated and poisoned.
+	//
+	// They are kept HERE rather than re-read from the result descriptor after the
+	// call, and that is not a micro-optimization. The descriptor lives in guest
+	// memory, so a guest can rewrite it; a host that re-read it would follow the
+	// new pointers to bytes it never poisoned, and a guest that wrote nothing
+	// could have its output taken from any region of its own memory that happened
+	// to hold legal state codes. The poison only guarantees anything if the host
+	// reads the slots it poisoned.
+	resSt, resI uint32
 }
 
 // align8 rounds up to the next multiple of 8, so every i64 array the guest reads
@@ -165,6 +176,7 @@ func writeBatchArgs(mem api.Memory, base, size uint32, n int, args []Batch) (vec
 	if !writeDesc(mem, f.result, formData, 0, stPtr, iPtr) {
 		return f, false
 	}
+	f.resSt, f.resI = stPtr, iPtr
 	return f, true
 }
 
@@ -294,19 +306,14 @@ func readDeclineMask(mem api.Memory, at uint32, n int, dst []uint64) bool {
 // one has produced a value with nothing behind it. A call result is never
 // dictionary-coded in the engine either (callFuncVec clears Dict unconditionally).
 func readBatchResult(mem api.Memory, f vecFrame, n int, declined []uint64, out *Batch) bool {
-	stPtr, ok := mem.ReadUint32Le(f.result + offDescA)
+	// f.resSt and f.resI, not the descriptor: see vecFrame. The result descriptor
+	// is the host telling the guest where to write, not the guest telling the
+	// host where to read.
+	st, ok := mem.Read(f.resSt, uint32(n))
 	if !ok {
 		return false
 	}
-	iPtr, ok := mem.ReadUint32Le(f.result + offDescB)
-	if !ok {
-		return false
-	}
-	st, ok := mem.Read(stPtr, uint32(n))
-	if !ok {
-		return false
-	}
-	payload, ok := mem.Read(iPtr, uint32(n)*8)
+	payload, ok := mem.Read(f.resI, uint32(n)*8)
 	if !ok {
 		return false
 	}
@@ -320,8 +327,19 @@ func readBatchResult(mem api.Memory, f vecFrame, n int, declined []uint64, out *
 			// Covers the poison (0xFF), vsString, vsDictCode and anything else.
 			return false
 		}
+		v := int64(binary.LittleEndian.Uint64(payload[i*8:]))
+		if s == vsBool && uint64(v) > 1 {
+			// The same rule the scalar path applies to a boolean slot, and it has
+			// to be the same: a vectorized module is two implementations of one
+			// function, and the differential test between them is only worth
+			// anything if the host holds both to the same contract. The engine
+			// would read a nonzero payload as TRUE and the scalar path refuses it,
+			// so without this a guest could get different answers from its own two
+			// entry points for the same input.
+			return false
+		}
 		out.St[i] = s
-		out.I[i] = int64(binary.LittleEndian.Uint64(payload[i*8:]))
+		out.I[i] = v
 	}
 	return true
 }

@@ -3,6 +3,12 @@
 // It is a separate Go module so the wazero dependency is opt-in: a program that
 // imports classad but never wants a sandboxed UDF does not link a wasm compiler.
 //
+// Writing a guest module is documented in prose, for someone who is not reading
+// this code and may not write Go, in docs/wasm-udf-abi.md at the repository root.
+// It covers both calling conventions, the ownership and lifetime rules, and what
+// is stable across versions. The comments here and in abivec.go explain why the
+// host is built the way it is; that file explains what a module author has to do.
+//
 // # What a UDF is here
 //
 // Exactly what classad's registry says it is: a pure function of its argument
