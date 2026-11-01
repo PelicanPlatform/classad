@@ -402,6 +402,11 @@ One unit per instruction executed **times the batch width at that point** — so
 the real cost model: it is proportional to work done, it is deterministic, and it is the same number
 whether a script is executed scalar or vector, which makes it an oracle-friendly quantity (§7.3).
 
+> **Corrected in §14.5.** "The same number whether scalar or vector" does not survive predication: a
+> predicated instruction touches dead lanes while scalar execution skips them. §14.5 splits this into
+> *charged steps* — the budget and the §7.3 comparison quantity, charged `popcount(live)` — and *real
+> work*, which is a benchmark's business. Read that before implementing this paragraph.
+
 Exhaustion **aborts the execution** and is reported to the host as an error, not as a per-record
 `ERROR`. It is a statement about the script, not about any record. A script that exhausts it would
 have produced the same result at any batch size, so a host must not retry it scalar.
@@ -1505,3 +1510,142 @@ against the obvious shortcut of letting a UDAF receive the accumulated value sli
    the whole point of the vector engine is not to box. A batch-shaped accumulate is the same design
    question the vectorized WASM ABI is facing, and the two should share an answer rather than invent
    two.
+
+---
+
+## 14. The vector script executor, specified
+
+§12 puts the fault model, predication and the element-step budget first, in that order. They are one
+design and not three, because the fault mask is part of the predication state and the budget is what
+prices the two control-flow lowerings against each other. This section is that design, at the level
+of detail someone could build from. Writing it out turned up a **mistake in §3.1**, recorded in
+§14.5.
+
+### 14.1 The state one vector script execution carries
+
+| | What | Note |
+|---|---|---|
+| `regs` | the register file: one `*Vec` per register | `VecScratch` generalized (§6.7, D13); lazily allocated, released per block |
+| `live` | one `(hi,lo)` bitplane pair (`collections/vm/vecmask.go:8-11`) | the records still executing |
+| mask stack | the enclosing `live` masks | depth is static and computed at compile time (§2.8), so it cannot overflow |
+| `faulted` | one plane, **monotone** | accumulated, never cleared |
+| `faultSites` | per site hit: instruction, class, count, first record | §2.2's report; per-site, not per-record |
+| `steps` | the charged-step counter | §14.5 |
+
+**`live` and `faulted` are not two views of one thing, and conflating them is the bug this layout
+exists to prevent.** `live` is pushed and popped at region boundaries; `faulted` only ever grows.
+And faulting record *i* must clear its bit from **every mask on the stack**, not just the top one —
+clearing only the top leaves the record dead inside the region and alive again at the reconvergence
+point, which is both wrong and plausible-looking. A fault is "this record is done for the rest of the
+script" (§2.2), and that sentence has to be true of the whole stack.
+
+### 14.2 The one new kernel, which already half exists
+
+§2.3 calls masked assignment "the one genuinely new runtime primitive". It is closer than that
+suggests. The existing join blend selects per record between **two freshly computed vectors**
+(`collections/vm/vecexec.go:443`); a masked store selects per record between a computed vector and
+**the destination register's prior contents**. Same operation, different second operand. So this is a
+generalization of `blend`, not a new kernel beside it — and the two should share one implementation,
+because a selection written twice is a selection that will diverge on the `Const` and dictionary
+cases.
+
+One wrinkle that belongs in the design and not in the discovery: a masked store **forces its
+destination to data form**. A register currently held as `Dict` cannot absorb a value that is not in
+that block's dictionary, and one held as `Raw` cannot absorb a value of a different stored width. §6.5
+makes form part of a register's type precisely so that conversion is an instruction rather than a
+surprise, and a masked store is the place a silent materialization would otherwise appear. The
+exception worth special-casing is a `Const` source equal to the destination's existing constant, which
+is a no-op.
+
+### 14.3 Predication does not save work; predication *plus* something else does
+
+The conclusion that should govern the implementation order, and it is not the intuitive one.
+
+A masked instruction still touches every lane: the mask selects what is *kept*, not what is
+*computed*. So, counting real work over a batch of width *n*:
+
+| Lowering | Cost of a two-armed region | Wins when |
+|---|---|---|
+| **Blend** (speculate both arms, select at the join) | both arms at full *n*, no bookkeeping | always, among these two |
+| **Predicate** (mask each arm) | both arms at full *n*, **plus** mask push/pop and a masked store per assignment | never, on its own |
+| Predicate + **empty-mask early exit** (§6.8.11) | only the arms whose mask is non-empty, at full *n*, plus one popcount per 64 records (`collections/vm/vecexec.go:829`) | a whole block goes one way — common on clustered or sorted data |
+| Predicate + **compaction** (§6.4) | each arm at `popcount(live)`, plus a gather and a scatter at *n* | selectivity is low **and** the region is long enough to amortize the gather |
+
+So predication is *strictly worse than blending* until it is paired with early exit or compaction.
+That is the answer to the seam S2 opened: the two lowerings are not two philosophies, they are two
+points on one cost curve whose crossover is a function of **selectivity and region length** — the same
+two quantities §6.4's threshold already turns on (`collections/colvec.go:57-64`, fired at `:463`).
+The crossover is therefore *measurable*, with the §7.4 selectivity sweep, and the optimizer's choice
+is a cost-model decision rather than a taste one.
+
+Two corollaries worth having in writing:
+
+- **For expressions, blending is right and will stay right.** The region is one or two instructions, so
+  there is nothing to amortize a gather over. The crossover is reached only by statement regions, which
+  is why blending could ship for `?:` and `ifThenElse` without any of this machinery.
+- **Build the early exit before compaction.** It is a popcount and a jump, it is what `while` needs
+  anyway (§2.3), and it may move the crossover far enough that compaction's threshold question (open
+  question 2) stops mattering for control flow and stays confined to scans.
+
+### 14.4 When speculation is not merely expensive but *wrong*
+
+A region may be blended only if it is **bounded**, cannot **mutate**, and cannot **fault**.
+
+- *Bounded* rules out a `while` body, which has no static bound. Nothing recovers this; loops are
+  predicated.
+- *Cannot mutate* is free today, because §2.3 declines mutation in the vector context outright. It
+  becomes load-bearing the moment that changes, so it should be checked by the compiler now rather
+  than assumed.
+- *Cannot fault* is the subtle one, and it is where §14.1's monotone `faulted` mask bites. If both
+  arms are evaluated and arm A faults record *i* that actually took arm B, that fault must not be
+  recorded — but `faulted` is monotone *by design*, so there is nowhere to put a fault that may need
+  taking back. **Rollback is the wrong answer**: it reintroduces exactly the ordering dependence the
+  monotone mask exists to remove. The right answer is that a speculated region must be *provably*
+  fault-free.
+
+Which gives §6.8 item 13 — the definedness analysis — a second and larger job than the one it was
+listed for. It was justified as a kernel-selection pass (prove a subexpression is two-valued, emit the
+one-instruction AND instead of `planeAnd`). It is also **the analysis that licenses speculation**, and
+therefore the pass that decides whether a region gets the cheap lowering at all. That is a much
+stronger reason to build it than the one §6.8 gives, and it should move up that list.
+
+At the expression layer the obligation is discharged for nothing: expressions are total (§2.1), so
+they cannot fault. That is the whole reason blending shipped first.
+
+### 14.5 Charged steps, and a correction to §3.1
+
+§3.1 claims the element-step count is "the same number whether a script is executed scalar or vector,
+which makes it an oracle-friendly quantity" (§7.3 then uses it as one of the four things scalar and
+vector execution must agree on elementwise). **With predication that claim is false**, and the reason
+is §14.3: a predicated instruction touches dead lanes, while scalar execution — where the mask is
+uniform, so early exit always applies — skips them. Charge real work and the two paths disagree;
+charge what the two paths have in common and the number no longer tracks real work.
+
+These are two different quantities and the draft conflated them. Resolution:
+
+- **Charged steps** — the budget, and the O3 comparison quantity. A predicated instruction is charged
+  `popcount(live)`, not *n*. Batch-size-invariant by construction, so scalar execution of record *i*
+  charges exactly what vector execution charges lane *i*, and O3 can compare them elementwise.
+- **Real work** — a benchmark's business, not the budget's. It is the quantity §14.3's table is about,
+  and it is what the optimizer minimizes.
+
+The thing to notice before accepting this: charged steps no longer bound wall time tightly, because
+dead-lane work is unbilled. The slack is bounded by the batch width — at most 8192
+(`collections/colblock.go:98`) — which is a known constant, and the budget's job is **termination**,
+not fine cost control. A factor-of-width slack is acceptable for termination and unacceptable for
+costing, which is exactly why the two quantities have to be named separately rather than reconciled.
+
+### 14.6 Build order, and what each step is proved by
+
+- **D2a — register file, `live` mask, masked store, `if`/`else` only.** No loops, no new faults. Proved
+  by O3 at every batch size including 1 and a partial final batch. This is the step that shows the
+  register model survives contact with the vector path; everything after it is additive.
+- **D2b — the fault mask, the site table, and the report.** Proved by §7.5's fault-locality law, which
+  is the one a careless mask bug breaks immediately, plus a test that a fault clears the record from
+  every enclosing mask (§14.1).
+- **D2c — `while`, per-record trip limits, and the empty-mask early exit**, which `while` needs anyway.
+  Proved by O3 on scripts whose records leave the loop at different iterations, and by §7.5's budget
+  monotonicity.
+- **Then measure §14.3's crossover**, before building compaction for control flow. If the early exit
+  moves it far enough, compaction stays a scan optimization and the control-flow path never needs it —
+  which would be the cheapest possible outcome and is not the one the draft assumed.
