@@ -399,7 +399,16 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 	// stay one implementation and an embedded caller of db gets the same planning this handler
 	// does. What stays here is the RPC layer's own job: table resolution, the private-attribute
 	// gates above, and framing. The stop callback abandons a scan whose client has gone away.
-	rows, err := d.AggregateColsStats(constraint, groupCols, aggs, stats, func() bool { return cancelled(ctx) })
+	// A continuous aggregate that has sealed holds its rows in two places, and an aggregate
+	// over one of them is not an aggregate over the view. The view reduces the union in a
+	// single pass, because AVG and COUNT(DISTINCT) cannot be combined from per-half results.
+	var rows []db.AggRow
+	var err error
+	if ref.seals() && ref.view != nil {
+		rows, err = ref.view.AggregateColsStats(constraint, groupCols, aggs, stats, func() bool { return cancelled(ctx) })
+	} else {
+		rows, err = d.AggregateColsStats(constraint, groupCols, aggs, stats, func() bool { return cancelled(ctx) })
+	}
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return

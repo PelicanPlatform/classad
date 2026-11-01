@@ -192,7 +192,15 @@ func (s *Server) streamQueryRaw(ctx context.Context, reqID uint64, r *reader, in
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	d, ok := s.tableOr(reqID, opQueryRaw, table, write)
+	// opQueryRaw reads whole ads; a sealed view's other half is reachable here only as
+	// parsed ads, which is what the plain query op already serves. Decline rather than
+	// answer from the backing alone.
+	refRaw, ok := s.tableRefOr(reqID, opQueryRaw, table, write)
+	if ok && refRaw.seals() {
+		write(respBad(reqID))
+		return
+	}
+	d := refRaw.db
 	if !ok {
 		return
 	}
@@ -314,8 +322,13 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
+	// A continuous aggregate's sealed buckets are not in its backing, so the projection runs
+	// over both halves and the sealed one is streamed after the live one. Without this the op
+	// returns the unsealed tail and silently omits everything older.
+	var sealed *db.ArchiveTable
 	switch ref := s.resolveTable(table); ref.kind {
 	case kindTable, kindView:
+		sealed = ref.sealed
 		switch {
 		case stats != nil && chaseRefs:
 			seq, err = ref.db.QueryRawProjectedRefsStats(constraint, attrs, redact, stats)
@@ -353,6 +366,38 @@ func (s *Server) streamQueryRawProjectOpt(ctx context.Context, reqID uint64, r *
 		n++
 		if limit > 0 && n >= limit {
 			break
+		}
+	}
+	if sealed != nil && (limit <= 0 || n < limit) {
+		var sstats collections.ScanStats
+		var sseq iter.Seq[collections.RawAd]
+		var serr error
+		switch {
+		case stats != nil && chaseRefs:
+			sseq, serr = sealed.QueryRawProjectedRefsStats(constraint, attrs, redact, &sstats)
+		case stats != nil:
+			sseq, serr = sealed.QueryRawProjectedStats(constraint, attrs, redact, &sstats)
+		case chaseRefs:
+			sseq, serr = sealed.QueryRawProjectedRefs(constraint, attrs, redact)
+		default:
+			sseq, serr = sealed.QueryRawProjected(constraint, attrs, redact)
+		}
+		if serr != nil {
+			write(respErr(reqID, serr.Error()))
+			return
+		}
+		for ra := range sseq {
+			if cancelled(ctx) {
+				return
+			}
+			write(putStr(respHead(reqID, stStream), rawAdText(ra)))
+			n++
+			if limit > 0 && n >= limit {
+				break
+			}
+		}
+		if stats != nil {
+			stats.Add(sstats)
 		}
 	}
 	if wantStats {
@@ -660,10 +705,20 @@ func (s *Server) streamQueryRawWireOpt(ctx context.Context, reqID uint64, r *rea
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
-	d, ok := s.tableOr(reqID, wireOp(chaseRefs), table, write)
+	ref, ok := s.tableRefOr(reqID, wireOp(chaseRefs), table, write)
 	if !ok {
 		return
 	}
+	if ref.seals() {
+		// A continuous aggregate that has sealed holds half its rows in an archive, and an
+		// archive serves no wire-form rows -- so this op cannot produce the whole view. It
+		// declines exactly as a table that serves no wire rows at all does, which sends the
+		// client to the text projection, where both halves are read. Streaming the backing's
+		// wire rows instead would be fast and short.
+		write(respBad(reqID))
+		return
+	}
+	d := ref.db
 	var seq iter.Seq[[]byte]
 	var err error
 	switch {

@@ -132,6 +132,17 @@ func (s *Server) streamTopKOpt(ctx context.Context, reqID uint64, r *reader, inc
 	var err error
 	switch ref := s.resolveTable(table); ref.kind {
 	case kindTable, kindView:
+		// A continuous aggregate that has sealed holds its rows in two places, and the k
+		// best of the union are not the k best of the backing. Ask the view, which merges
+		// each half's own top-K; only a view with nothing sealed is its backing alone.
+		if ref.seals() && ref.view != nil {
+			if useStats {
+				rows, stats, err = ref.view.TopKStats(constraint, attrs, orderAttr, desc, k)
+			} else {
+				rows, err = ref.view.TopK(constraint, attrs, orderAttr, desc, k)
+			}
+			break
+		}
 		if useStats {
 			rows, stats, err = ref.db.TopKStats(constraint, attrs, orderAttr, desc, k)
 		} else {

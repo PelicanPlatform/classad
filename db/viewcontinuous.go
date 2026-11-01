@@ -161,6 +161,23 @@ func (v *View) SealedQuery(constraint string) (iter.Seq[*classad.ClassAd], error
 	return arch.Query(constraint)
 }
 
+// SealedArchive returns the continuous aggregate's sealed history as an archive table, and
+// whether it has one (a gauge view and an in-memory catalog do not).
+//
+// SealedQuery streams its rows, which is all a whole-ad read needs. A projected read, a
+// top-K and an aggregate each need to run their OWN operation over the sealed half rather
+// than re-derive it from rows, which is what this exposes: the sealed half is an ordinary
+// archive table and answers the same reads as one.
+//
+// The caller must treat the two halves as one table. A view that seals holds its rows in
+// two places -- the live backing and this -- and a read that consults only one of them is
+// silently short, not merely stale.
+func (v *View) SealedArchive() (*ArchiveTable, bool) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.archive, v.archive != nil
+}
+
 // LateDrops reports how many base rows were dropped because their time bucket was already
 // sealed (out-of-window late data).
 func (v *View) LateDrops() int64 {
@@ -201,4 +218,126 @@ func loadViewState(stateDir string) (viewState, error) {
 		return viewState{}, err
 	}
 	return st, nil
+}
+
+// TopK answers a top-K over the WHOLE view: the live backing and, for a continuous
+// aggregate that has sealed, its archive too.
+//
+// It is not a top-K of the backing with the archive's rows appended. The k best of a union
+// are within the union of each half's k best, so each half runs its own top-K -- keeping the
+// columnar cutoff scan that makes a top-K cheaper than a sort -- and the two results are
+// merged through the same heap the single-table path uses. Reusing that heap is the point:
+// a merge with its own comparator would order the union by one rule and a single half by
+// another, and the difference would show only once a view started sealing.
+func (v *View) TopK(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, error) {
+	return v.topKUnion(constraint, attrs, orderAttr, desc, k, nil)
+}
+
+// TopKStats is TopK that also returns the scan breakdown, summed over both halves.
+func (v *View) TopKStats(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, collections.ScanStats, error) {
+	var stats collections.ScanStats
+	rows, err := v.topKUnion(constraint, attrs, orderAttr, desc, k, &stats)
+	return rows, stats, err
+}
+
+func (v *View) topKUnion(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats) ([][]classad.Value, error) {
+	arch, sealed := v.SealedArchive()
+	// Project the order attribute explicitly, so neither half trims it and the merge below
+	// can still see what to order by. withOrderAttr then reports added=false for each half,
+	// and the trimming happens once, here.
+	proj, orderIdx, added := withOrderAttr(attrs, orderAttr)
+
+	var live [][]classad.Value
+	var err error
+	if stats != nil {
+		var s collections.ScanStats
+		live, s, err = v.backing.TopKStats(constraint, proj, orderAttr, desc, k)
+		stats.Add(s)
+	} else {
+		live, err = v.backing.TopK(constraint, proj, orderAttr, desc, k)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !sealed {
+		return trimOrderCol(live, added), nil
+	}
+
+	var old [][]classad.Value
+	if stats != nil {
+		var s collections.ScanStats
+		old, s, err = arch.TopKStats(constraint, proj, orderAttr, desc, k)
+		stats.Add(s)
+	} else {
+		old, err = arch.TopK(constraint, proj, orderAttr, desc, k)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return topKResult(func(yield func([]classad.Value) bool) {
+		for _, row := range live {
+			if !yield(row) {
+				return
+			}
+		}
+		for _, row := range old {
+			if !yield(row) {
+				return
+			}
+		}
+	}, orderIdx, desc, k, added), nil
+}
+
+// trimOrderCol drops the order column that withOrderAttr appended, when it appended one.
+func trimOrderCol(rows [][]classad.Value, added bool) [][]classad.Value {
+	if !added {
+		return rows
+	}
+	for i, row := range rows {
+		rows[i] = row[:len(row)-1]
+	}
+	return rows
+}
+
+// AggregateColsStats reduces an aggregate over the WHOLE view: the live backing and, for a
+// continuous aggregate that has sealed, its archive too.
+//
+// Unlike the top-K above, this does NOT reduce each half and combine the results, because
+// not every aggregate can be combined from finished ones. SUM, MIN, MAX and COUNT can; AVG
+// cannot (an average of averages is not the average), and COUNT(DISTINCT) cannot at all,
+// since a count has thrown away the values it would have to compare. Special-casing the
+// mergeable ones would leave the other two either wrong or refused.
+//
+// So the union is reduced ONCE, in a single pass over both halves' projected rows, through
+// the same reducer the scanning path uses. That gives up the columnar fast paths, and the
+// reason it is still the right trade is that only a continuous aggregate seals: its
+// materialized rows are one per bucket per series and bounded by the view's cardinality cap,
+// so the scan is small by construction. A gauge view never reaches here -- it has no archive,
+// and falls through to the backing's own ladder with every fast path intact.
+func (v *View) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats, stop func() bool) ([]AggRow, error) {
+	arch, sealed := v.SealedArchive()
+	if !sealed {
+		return v.backing.AggregateColsStats(constraint, groupCols, aggs, stats, stop)
+	}
+	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
+	live, err := v.backing.QueryProject(constraint, attrs)
+	if err != nil {
+		return nil, err
+	}
+	old, err := arch.QueryProject(constraint, attrs)
+	if err != nil {
+		return nil, err
+	}
+	return AggregateValues(func(yield func([]classad.Value) bool) {
+		for row := range live {
+			if !yield(row) {
+				return
+			}
+		}
+		for row := range old {
+			if !yield(row) {
+				return
+			}
+		}
+	}, attrs, groupCols, aggs, groupCol, aggCol, stop)
 }

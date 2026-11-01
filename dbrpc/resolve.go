@@ -6,6 +6,15 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 )
 
+// viewOwner is the optional Catalog capability to reach a view itself, rather than only its
+// backing. It is what lets a handler ask the view for a complete answer -- a top-K or an
+// aggregate over both halves -- instead of assembling one from parts it would have to know
+// about. Optional for the same reason viewSealer is: a Catalog with no views need not
+// provide it, and one that does not leaves reads served from the backing alone, as before.
+type viewOwner interface {
+	View(name string) (*db.View, bool)
+}
+
 // tableKind is which of the catalog's three namespaces a name was found in.
 //
 // The catalog keeps mutable tables, materialized views and append-only archives in three
@@ -22,13 +31,27 @@ const (
 )
 
 // tableRef is what a name resolved to. Exactly one of db / arch is set, per kind; both are
-// nil for kindMissing. A view resolves to its backing *db.DB, which is how every read of a
-// view has always reached its materialized rows.
+// nil for kindMissing.
+//
+// A view resolves to its backing *db.DB, which is where a read of a view has always found
+// its materialized rows -- but for a continuous aggregate that is only half of them. Sealing
+// moves a closed bucket out of the backing and into the view's archive, so its rows live in
+// TWO places, and sealed is that second one (nil unless this is a view that seals).
+//
+// A handler that serves kindView and consults only ref.db is not stale, it is WRONG: it
+// silently returns the unsealed tail and nothing older. For a five-minute bucket the seal
+// cadence is 150 seconds, so that is almost the whole series. Serve both halves, or refuse
+// the name -- do not answer from one.
 type tableRef struct {
-	kind tableKind
-	db   *db.DB
-	arch *db.ArchiveTable
+	kind   tableKind
+	db     *db.DB
+	arch   *db.ArchiveTable
+	view   *db.View         // kindView only, when the catalog exposes it
+	sealed *db.ArchiveTable // kindView only, when the view has sealed history
 }
+
+// seals reports whether this name has a sealed half that a read must also consult.
+func (r tableRef) seals() bool { return r.sealed != nil }
 
 // resolveTable looks a name up in all three namespaces.
 //
@@ -41,7 +64,16 @@ func (s *Server) resolveTable(name string) tableRef {
 		return tableRef{kind: kindTable, db: d}
 	}
 	if d, ok := s.cat.ViewBacking(name); ok {
-		return tableRef{kind: kindView, db: d}
+		ref := tableRef{kind: kindView, db: d}
+		if vo, ok := s.cat.(viewOwner); ok {
+			if v, has := vo.View(name); has {
+				ref.view = v
+				if a, sealed := v.SealedArchive(); sealed {
+					ref.sealed = a
+				}
+			}
+		}
+		return ref
 	}
 	if a, ok := s.cat.ArchiveTable(name); ok {
 		return tableRef{kind: kindArchive, arch: a}
