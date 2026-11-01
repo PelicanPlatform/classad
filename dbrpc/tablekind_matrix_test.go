@@ -393,8 +393,16 @@ var mxWant = map[string]map[mxKind]string{
 		// A view's backing store is an in-memory db, and a RAM table serves wire rows now
 		// (its interned keys are rewritten to names as the row is assembled), so a view
 		// streams here like it already did for every other raw read.
-		kView:    "stream",
-		kArchive: "err: archive table \"hist\": QueryRawWire is not served from an archive; use QueryRawProject, which does read one",
+		kView: "stream",
+		// An archive serves wire rows now, and is the storage form they suit best: its
+		// records already carry inline names, so a row is assembled by slice copies with
+		// no intern table to consult. It used to refuse, which made history the one table
+		// a consumer could not read without the render-and-reparse round trip.
+		//
+		// A SEALED view still refuses, because that one has half its rows in an archive
+		// and half in its backing and this op reads one source -- see
+		// TestViewSealedWireOpsNeverAnswerShort. kView here is a view that has not sealed.
+		kArchive: "stream",
 		kMissing: "err: no such table: nope",
 	},
 	"QueryRawWireRefs": {
@@ -402,8 +410,10 @@ var mxWant = map[string]map[mxKind]string{
 		// Same as QueryRawWire above: a view is backed by an in-memory db, and those serve
 		// wire rows now. The closure runs on that path too -- the record is rewritten to
 		// name space first -- so a view gets chased rows rather than a refusal.
-		kView:    "stream",
-		kArchive: "err: archive table \"hist\": QueryRawWire is not served from an archive; use QueryRawProject, which does read one",
+		kView: "stream",
+		// As QueryRawWire above: an archive serves wire rows, and the closure runs on that
+		// path too.
+		kArchive: "stream",
 		kMissing: "err: no such table: nope",
 	},
 	"QueryStats": {

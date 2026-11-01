@@ -324,6 +324,64 @@ func (t *ArchiveTable) QueryRawProjectedRefsStats(constraint string, projection 
 	return gatedArch(t, t.a.QueryRawProjectedStats(q, projection, true, redact, stats)), nil
 }
 
+// WIRE-FORM ROWS FROM AN ARCHIVE.
+//
+// The relay op that reads wire rows used to refuse an archive, which made `history` -- the
+// table most queries are about -- the one table no consumer could read the cheap way. The text
+// projection it fell back to renders every record and makes the consumer parse it back, which a
+// downstream measurement put at roughly two fifths of a read's CPU and 86 allocations a row.
+//
+// Shaped exactly like DB's four, deliberately: same gate, same empty/true-constraint scan path,
+// same error for a bad constraint. A caller should not have to know which kind of table it has
+// to know what these return, and the two are easy to let drift apart.
+
+// QueryRawWire yields each matching record as a self-contained WIRE-FORM ROW, newest first
+// (see DB.QueryRawWire and collections.Archive.QueryRawWire). projection restricts the entries
+// (empty = whole record); redact strips private attributes at the source.
+func (t *ArchiveTable) QueryRawWire(constraint string, projection []string, redact bool) (iter.Seq[[]byte], error) {
+	return t.QueryRawWireStats(constraint, projection, redact, nil)
+}
+
+// QueryRawWireStats is QueryRawWire that also fills stats (may be nil) with the per-scan work
+// breakdown. An empty/true constraint takes the no-WHERE scan path and leaves stats zero.
+func (t *ArchiveTable) QueryRawWireStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[[]byte], error) {
+	if !t.a.SupportsRawWire() {
+		return nil, ErrRawWireUnsupported
+	}
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return gatedArch(t, t.a.ScanRawWire(projection, redact)), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return gatedArch(t, t.a.QueryRawWireStats(q, projection, redact, stats)), nil
+}
+
+// QueryRawWireRefs is QueryRawWire whose projection also carries the attributes the projected
+// expressions reference, transitively, so each yielded row EVALUATES self-contained. Which of
+// the two a caller wants is decided as it is for a mutable table (see DB.QueryRawWireRefs): the
+// plain form reproduces HTCondor's projection protocol, this one serves a consumer that will
+// evaluate what it receives, for which the references are not optional.
+func (t *ArchiveTable) QueryRawWireRefs(constraint string, projection []string, redact bool) (iter.Seq[[]byte], error) {
+	return t.QueryRawWireRefsStats(constraint, projection, redact, nil)
+}
+
+// QueryRawWireRefsStats is QueryRawWireRefs that also fills stats (may be nil).
+func (t *ArchiveTable) QueryRawWireRefsStats(constraint string, projection []string, redact bool, stats *collections.ScanStats) (iter.Seq[[]byte], error) {
+	if !t.a.SupportsRawWire() {
+		return nil, ErrRawWireUnsupported
+	}
+	if s := strings.TrimSpace(constraint); s == "" || strings.EqualFold(s, "true") {
+		return gatedArch(t, t.a.ScanRawWireRefs(projection, redact)), nil
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return gatedArch(t, t.a.QueryRawWireRefsStats(q, projection, redact, stats)), nil
+}
+
 // Aggregate runs a server-side GROUP BY over the archive's matches: it applies the
 // constraint (using the archive's zone-map pruning, so segments no matching record can
 // fall in are never scanned), groups by the raw group columns, and reduces each group

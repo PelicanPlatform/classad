@@ -440,6 +440,58 @@ func (a *Archive) QueryRawProjectedStats(q *vm.Query, projection []string, chase
 	return a.c.QueryRawProjectedStats(q, projection, chaseRefs, redact, stats)
 }
 
+// WIRE-FORM ROWS FROM AN ARCHIVE.
+//
+// These delegate, and the delegation is the whole implementation, for the same reason
+// QueryRawProjected's is: the backing Collection scans newest-first, so the archive's ordering
+// and its pushed-down LIMIT (the caller stopping early) fall out of the shared walk. An archive
+// is also the storage form wire rows suit best -- its records already carry inline names, so a
+// row is assembled by slice copies with no intern table to consult.
+//
+// They exist because the relay op that reads them refused an archive, which made `history` --
+// the table most queries are about -- the one table that could not be read the cheap way. The
+// text projection it fell back to renders every record and makes the consumer parse it back,
+// measured at roughly two fifths of a read's CPU and 86 allocations a row downstream.
+
+// SupportsRawWire reports whether the wire-form scans can serve this archive
+// (Collection.SupportsRawWire).
+func (a *Archive) SupportsRawWire() bool { return a.c.SupportsRawWire() }
+
+// ScanRawWire yields every retained record as a self-contained wire-form row, newest first
+// (Collection.ScanRawWire).
+func (a *Archive) ScanRawWire(projection []string, redact bool) iter.Seq[[]byte] {
+	return a.c.ScanRawWire(projection, redact)
+}
+
+// QueryRawWire yields each record matching q as a self-contained wire-form row, newest first
+// (Collection.QueryRawWire).
+func (a *Archive) QueryRawWire(q *vm.Query, projection []string, redact bool) iter.Seq[[]byte] {
+	return a.c.QueryRawWire(q, projection, redact)
+}
+
+// QueryRawWireStats is QueryRawWire that also fills stats (may be nil) with the per-scan work
+// breakdown.
+func (a *Archive) QueryRawWireStats(q *vm.Query, projection []string, redact bool, stats *ScanStats) iter.Seq[[]byte] {
+	return a.c.QueryRawWireStats(q, projection, redact, stats)
+}
+
+// ScanRawWireRefs is ScanRawWire whose projection also carries the attributes the projected
+// expressions reference (Collection.ScanRawWireRefs). This is the form a consumer that
+// EVALUATES what it receives needs.
+func (a *Archive) ScanRawWireRefs(projection []string, redact bool) iter.Seq[[]byte] {
+	return a.c.ScanRawWireRefs(projection, redact)
+}
+
+// QueryRawWireRefs is QueryRawWire with the reference closure of ScanRawWireRefs.
+func (a *Archive) QueryRawWireRefs(q *vm.Query, projection []string, redact bool) iter.Seq[[]byte] {
+	return a.c.QueryRawWireRefs(q, projection, redact)
+}
+
+// QueryRawWireRefsStats is QueryRawWireRefs that also fills stats (may be nil).
+func (a *Archive) QueryRawWireRefsStats(q *vm.Query, projection []string, redact bool, stats *ScanStats) iter.Seq[[]byte] {
+	return a.c.QueryRawWireRefsStats(q, projection, redact, stats)
+}
+
 func (a *Archive) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classad.Value] {
 	return a.c.QueryProject(q, attrs)
 }
