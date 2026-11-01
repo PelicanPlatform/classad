@@ -379,7 +379,11 @@ func (s *Server) aggregate(ctx context.Context, reqID uint64, table, constraint 
 		obs.Op = "ArchiveAggregate"
 		// The archive ladder takes no stop callback, so this reduction runs to completion
 		// even once the client has gone -- unlike the mutable one below.
-		rows, aerr := ref.arch.AggregateColsStats(constraint, groupCols, aggs, stats)
+		archAggregate := ref.arch.AggregateColsStats
+		if !includePrivate {
+			archAggregate = ref.arch.AggregateColsStatsRedacted // see the mutable branch below
+		}
+		rows, aerr := archAggregate(constraint, groupCols, aggs, stats)
 		if aerr != nil {
 			write(respErr(reqID, aerr.Error()))
 			return

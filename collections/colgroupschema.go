@@ -114,6 +114,9 @@ func (c *Collection) deriveGroupSchemas(samples [][]byte, base *adSchema, k int)
 			if base != nil && base.hasField(id) {
 				return true // already columnar in every record
 			}
+			if c.schemaExcludes(id) {
+				return true // never a column (see schemaExcludes)
+			}
 			b := present[id]
 			if b == nil {
 				b = make([]byte, stride)

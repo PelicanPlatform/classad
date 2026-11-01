@@ -100,7 +100,7 @@ func TestArchiveReopensCommittedConfig(t *testing.T) {
 	dir := t.TempDir()
 	copyFixture(t, archiveConfigFile, filepath.Join(dir, archiveConfigFile))
 
-	a, err := openArchiveTable(dir, ArchiveConfig{})
+	a, err := openArchiveTable(dir, ArchiveConfig{}, nil)
 	if err != nil {
 		t.Fatalf("reopen over the committed config: %v", err)
 	}
@@ -363,7 +363,7 @@ func TestIndexConfigSaveDerivesUnderTheLock(t *testing.T) {
 // index whose backfill read the whole history to build.
 func TestArchiveIndexSaveDerivesUnderTheLock(t *testing.T) {
 	dir := t.TempDir()
-	a, err := openArchiveTable(dir, ArchiveConfig{IndexBackfillBytes: archiveTestHorizon})
+	a, err := openArchiveTable(dir, ArchiveConfig{IndexBackfillBytes: archiveTestHorizon}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -67,6 +67,17 @@ type NumStats struct {
 	AnyNaN bool `json:"anyNaN,omitempty"`
 }
 
+// NumStatsQueryRedacted is NumStatsQuery for a reader NOT entitled to sealed values. Columns never
+// hold a sealed value, so it answers as NumStatsQuery does -- except on a store that may hold a sealed
+// attribute's values in the clear (see hidesClearSealed), where aggregating one declines to the keyless
+// scan and the constraint is planned as that reader evaluates it (keylessQuery).
+func (c *Collection) NumStatsQueryRedacted(q *vm.Query, attr string) (NumStats, bool) {
+	if c.keylessHides(attr) {
+		return NumStats{}, false
+	}
+	return c.NumStatsQuery(c.keylessQuery(q), attr)
+}
+
 // NumStatsQuery computes the numeric aggregate inputs for attr over the records matching q, using
 // the columnar scan. A nil q means every record.
 //

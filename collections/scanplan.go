@@ -67,6 +67,9 @@ type queryPlan struct {
 // chained scan, the disjunctive index path, the point-in-time scan), and those scans
 // read the constraint's attributes out of every record just the same.
 func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats, redact bool) queryPlan {
+	if redact {
+		q = c.keylessQuery(q) // before anything is planned from it: see vm.Query.Hiding
+	}
 	plan := q.ReadPlan()
 	ws := &wireScope{ctx: c.evalCtx(redact)}
 	// Read demand for the attributes the constraint evaluates -- once per scan, never

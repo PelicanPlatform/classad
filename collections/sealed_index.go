@@ -316,7 +316,7 @@ func (c *Collection) rezoneSealed(sh *shard, seg *segment) {
 	if !appendOnly || len(attrs) == 0 {
 		return
 	}
-	zones := computeSegZones(c, seg, seg.used, attrs, inline)
+	zones := computeSegZones(c, seg, seg.used, attrs, inline, sh.sealsName)
 	sh.mu.Lock()
 	seg.zones = zones
 	sh.mu.Unlock()
@@ -559,7 +559,7 @@ func (c *Collection) zonesForSeg(sh *shard, seg *segment) map[uint32]zoneRange {
 	if !appendOnly || len(attrs) == 0 {
 		return nil
 	}
-	return computeSegZones(c, seg, seg.used, attrs, inline)
+	return computeSegZones(c, seg, seg.used, attrs, inline, sh.sealsName)
 }
 
 // adoptPersistedZones restores a sealed segment's zone map from its sidecar, so recovery does

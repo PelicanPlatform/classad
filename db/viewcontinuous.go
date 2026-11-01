@@ -54,7 +54,9 @@ func (v *View) initContinuous(stateDir string) error {
 	if v.spec.Retention > 0 {
 		cfg.Retention = collections.Retention{MaxAgeAttr: timeAlias, MaxAge: float64(v.spec.Retention)}
 	}
-	arch, err := openArchiveTable(filepath.Join(stateDir, viewArchiveSubdir), cfg)
+	// No key: the view's rows are aggregates built with no key for every reader (see View), so there
+	// is nothing in them to seal and nothing to withhold.
+	arch, err := openArchiveTable(filepath.Join(stateDir, viewArchiveSubdir), cfg, nil)
 	if err != nil {
 		return err
 	}

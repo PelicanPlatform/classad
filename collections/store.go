@@ -905,6 +905,9 @@ func New(opts Options) *Collection {
 			}
 		}
 		c.encAttrs.Store(&encSetHolder{set: enc})
+		for _, sh := range c.shards {
+			sh.sealsName = c.shouldEncrypt
+		}
 	}
 	if opts.WatchHistory > 0 {
 		c.hub = newWatchHub()

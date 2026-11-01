@@ -248,6 +248,48 @@ func (c *Collection) GroupStatsAllAggs(groups []GroupSpec, aggCols []GroupAggCol
 	return c.groupStatsAll(groups, attrs, filters, countFilters)
 }
 
+// GroupStatsAllAggsRedacted is GroupStatsAllAggs for a reader NOT entitled to sealed values. It reads
+// only columns, which never hold a sealed value, so it answers as GroupStatsAllAggs does -- except on a
+// store that may hold a sealed attribute's values in the clear (see hidesClearSealed), where a group,
+// aggregate or filter naming one declines to the keyless scan.
+func (c *Collection) GroupStatsAllAggsRedacted(groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string) ([]GroupStats, bool) {
+	attrs, filters := splitAggCols(aggCols)
+	if c.keylessHidesGroupAggs(groups, attrs, filters, countFilters) {
+		return nil, false
+	}
+	return c.groupStatsAll(groups, attrs, filters, countFilters)
+}
+
+// keylessHidesGroupAggs reports whether a grouped aggregate reads, through a group column, an aggregate
+// argument or a filter, an attribute keylessHides withholds. A filter that does not parse is reported
+// as reading one: it is declined either way, and declining here keeps the answer in the scan.
+func (c *Collection) keylessHidesGroupAggs(groups []GroupSpec, aggAttrs, colFilters, countFilters []string) bool {
+	if !c.hidesClearSealed() {
+		return false
+	}
+	for _, g := range groups {
+		if c.shouldEncrypt(g.Attr) {
+			return true
+		}
+	}
+	if c.keylessHidesAny(aggAttrs...) {
+		return true
+	}
+	for _, fs := range [][]string{colFilters, countFilters} {
+		for _, f := range fs {
+			if f == "" {
+				continue
+			}
+			fq, err := vm.Parse(f)
+			if err != nil || c.keylessQuery(fq) != fq {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // splitAggCols splits aggregate columns into the parallel attribute and filter lists the internals
 // carry, which keeps the attribute list the one shape every tier below already resolves.
 func splitAggCols(aggCols []GroupAggCol) ([]string, []string) {
@@ -267,6 +309,16 @@ func (c *Collection) groupStatsQuery(q *vm.Query, groups []GroupSpec, aggAttrs, 
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil {
 		return nil, false
+	}
+	if redact {
+		// A store that may hold a sealed attribute's values in the clear has them in its columns too,
+		// so the columns cannot group, aggregate or filter on one for this reader; the keyless scan
+		// reads them as undefined. The constraint is rewritten rather than declined (see
+		// keylessQuery).
+		if c.keylessHidesGroupAggs(groups, aggAttrs, colFilters, countFilters) {
+			return nil, false
+		}
+		q = c.keylessQuery(q)
 	}
 	groupIDs, buckets, aggIDs, ok := c.resolveGroupAttrs(st, groups, aggAttrs)
 	if !ok {

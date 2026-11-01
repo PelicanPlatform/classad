@@ -54,7 +54,7 @@ func checkSealedZones(t *testing.T, label string, a *Archive, exact bool) (seale
 			t.Errorf("%s: sealed segment %d (interned=%v) has no zone map", label, seg.id, seg.dict.Load() != nil)
 			continue
 		}
-		want := computeSegZones(c, seg, seg.used, sh.zoneAttrs, sh.zoneInline)
+		want := computeSegZones(c, seg, seg.used, sh.zoneAttrs, sh.zoneInline, sh.sealsName)
 		for id, z := range seg.zones {
 			r, ok := want[id]
 			name, _ := c.intern.Name(id)

@@ -1275,9 +1275,27 @@ deployment configured. The engine seals them at the *value* level (`encrypt.go`,
   as UNDEFINED. The secret is never opened only to be dropped later by a serializer.
 - **Migration.** `MigrateSealedAttrs` re-encodes legacy stores written before sealing
   was mandatory, and writes `sealed-attrs.done` when finished.
-- **Gap.** Archives opened through the `db` catalog are currently opened without a data
-  key, so a history archive stores private attributes **in the clear**.
-  `Archive.EncryptionEnabled` reports this rather than hiding it.
+- **Archives.** A history archive opened through the `db` catalog resolves its own
+  master key in its directory, from the catalog's pool keys, exactly as a table does, and
+  seals the same attributes. Its runtime set is persisted in `archiveconfig.json`
+  (`ArchiveConfig.EncryptedAttrs`). An archive is not migrated at open: that would rewrite
+  the whole history. Records written before the archive had a key, or before an attribute
+  joined the set, keep their values in the clear until maintenance rewrites their segment
+  anyway. A merge, a dictionary retrain, interning and `Rewrite` re-encode records under
+  the key and seal those values; columnarizing does not decode records, so it does not.
+  Until then the archive's `*Redacted` reads withhold every attribute the policy names
+  *by name*, whatever its stored form: a constraint is planned with those references
+  replaced by `undefined` (`vm.Query.Hiding`), a keyless lookup or decode reads them as
+  `undefined`, and the column, zone-map and index tiers decline any request that reads
+  one. New zone maps and columnar (base and group) schemas leave such attributes out.
+  An attribute both sealed and indexed is refused, as for a table. An archive whose
+  saved configuration indexes an attribute that is now sealed opens without that index.
+- **Rollback.** A build from before archives were sealed opens a sealed archive without
+  a key. It never shows a sealed value: a full-ad read or raw projection of a record
+  holding one fails to decode and skips the record, and a projection asking for one
+  gets `error` for that row. Its maintenance cannot decode those records either, so it
+  leaves their segments as they are. No record is lost; reopening with the current
+  build and the same pool keys reads every one.
 
 ---
 

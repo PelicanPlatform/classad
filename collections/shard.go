@@ -51,6 +51,11 @@ type shard struct {
 	// inline flag is finalized in Open. Never mutated after.
 	zoneAttrs  []zoneAttr
 	zoneInline bool
+	// sealsName is the collection's sealing policy (Collection.shouldEncrypt), or nil when it has no
+	// key. A zone map is never kept for an attribute it names: the map is derived from values, and a
+	// record written before the attribute was sealed holds its value in the clear. Set at
+	// construction; never mutated (the policy it calls is read live).
+	sealsName func(string) bool
 
 	commitSeq uint64 // bumped once per committed batch; scan snapshots capture it
 	count     int    // number of live keys

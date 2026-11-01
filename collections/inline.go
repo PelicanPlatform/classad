@@ -149,16 +149,40 @@ func (c *Collection) decodeWireDictAs(dict *segDictHandle, w []byte, redact bool
 	if !redact {
 		return c.decodeWireDict(dict, w)
 	}
-	if dict != nil {
-		return wire.DecodeResolveEncRedact(w, dict.resolve, nil)
+	var a *ast.ClassAd
+	var err error
+	switch {
+	case dict != nil:
+		a, err = wire.DecodeResolveEncRedact(w, dict.resolve, nil)
+	case c.inline:
+		// dict == nil means one of two encodings, and getting this wrong breaks every read rather than
+		// leaking: an INLINE (persistent) ad carries its own names, while an in-memory collection's ad
+		// is interned against the collection-wide table. Mirror decodeWire's split.
+		a, err = wire.DecodeInlineRedact(w)
+	default:
+		a, err = wire.DecodeResolveEncRedact(w, c.intern.Name, nil)
 	}
-	// dict == nil means one of two encodings, and getting this wrong breaks every read rather than
-	// leaking: an INLINE (persistent) ad carries its own names, while an in-memory collection's ad is
-	// interned against the collection-wide table. Mirror decodeWire's split.
-	if c.inline {
-		return wire.DecodeInlineRedact(w)
+	if err == nil {
+		c.withholdClearSealed(a)
 	}
-	return wire.DecodeResolveEncRedact(w, c.intern.Name, nil)
+	return a, err
+}
+
+// withholdClearSealed replaces, in an ad decoded for a read not entitled to sealed values, the value of
+// every attribute the sealing policy names with undefined -- what a sealed value of it decodes to -- when
+// the store may hold such values in the clear (see hidesClearSealed). Every keyless full decode passes
+// through here, so a record written before the attribute was sealed reads the same as one written after.
+func (c *Collection) withholdClearSealed(a *ast.ClassAd) {
+	if a == nil || !c.hidesClearSealed() {
+		return
+	}
+	for _, attr := range a.Attributes {
+		if c.shouldEncrypt(attr.Name) {
+			if _, undef := attr.Value.(*ast.UndefinedLiteral); !undef {
+				attr.Value = &ast.UndefinedLiteral{}
+			}
+		}
+	}
 }
 
 func (c *Collection) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error) {

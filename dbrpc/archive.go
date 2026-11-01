@@ -41,7 +41,13 @@ func (sc *serverConn) streamArchiveQuery(reqID uint64, r *reader) {
 		sc.write(respErr(reqID, "no such archive: "+name))
 		return
 	}
-	seq, err := a.QueryLimit(constraint, limit) // limit pushed down (newest-first)
+	// An unprivileged session reads with no key, as on a mutable table: a sealed attribute arrives
+	// undefined rather than being decrypted here and stripped by name afterwards.
+	query := a.QueryLimit
+	if !sc.opts.IncludePrivate {
+		query = a.QueryLimitRedacted
+	}
+	seq, err := query(constraint, limit) // limit pushed down (newest-first)
 	if err != nil {
 		sc.write(respErr(reqID, err.Error()))
 		return
@@ -148,11 +154,17 @@ func (sc *serverConn) archiveAggregate(reqID uint64, r *reader, extended, wantSt
 	var stats collections.ScanStats
 	var rows []db.AggRow
 	var err error
+	// An unprivileged session aggregates with no key, so a sealed value is undefined to the WHERE
+	// clause, the groups, the aggregates and their filters rather than evaluated.
+	aggregate := a.AggregateColsStats
+	if !sc.opts.IncludePrivate {
+		aggregate = a.AggregateColsStatsRedacted
+	}
 	if wantStats || sc.s.queryStatsOn() {
-		rows, err = a.AggregateColsStats(constraint, groupCols, aggs, &stats)
+		rows, err = aggregate(constraint, groupCols, aggs, &stats)
 		obs.Scan = stats
 	} else {
-		rows, err = a.AggregateCols(constraint, groupCols, aggs)
+		rows, err = aggregate(constraint, groupCols, aggs, nil)
 	}
 	if err != nil {
 		sc.write(respErr(reqID, err.Error()))

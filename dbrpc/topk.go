@@ -152,10 +152,14 @@ func (s *Server) streamTopKOpt(ctx context.Context, reqID uint64, r *reader, inc
 			rows, err = topK(constraint, attrs, orderAttr, desc, k)
 		}
 	case kindArchive:
+		topK, topKStats := ref.arch.TopK, ref.arch.TopKStats
+		if !includePrivate {
+			topK, topKStats = ref.arch.TopKRedacted, ref.arch.TopKStatsRedacted
+		}
 		if useStats {
-			rows, stats, err = ref.arch.TopKStats(constraint, attrs, orderAttr, desc, k)
+			rows, stats, err = topKStats(constraint, attrs, orderAttr, desc, k)
 		} else {
-			rows, err = ref.arch.TopK(constraint, attrs, orderAttr, desc, k)
+			rows, err = topK(constraint, attrs, orderAttr, desc, k)
 		}
 	default:
 		write(respErr(reqID, "no such table: "+table))

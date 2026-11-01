@@ -451,6 +451,11 @@ func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 				return true
 			}
 		}
+		if p.redact && p.c.keylessHidesBytes(name) {
+			// Sealed by policy but possibly stored in the clear (see hidesClearSealed): rendered as a
+			// sealed value is to this reader, and nothing it might reference is chased.
+			node = undefinedNode
+		}
 		p.buf = append(p.buf, name...)
 		p.buf = append(p.buf, ' ', '=', ' ')
 		var aerr error

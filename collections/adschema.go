@@ -94,6 +94,8 @@ type adSchemaOpts struct {
 	// most records -- and computed in the columns -- can be a field at all. It does not count toward an
 	// int's width: a computed value is kept beside the column, never in the slot.
 	Computed func(iw []byte, id uint32) adKind
+	// Exclude, when set, names attribute ids that are never fields, whatever the sample says.
+	Exclude func(id uint32) bool
 }
 
 // Why a required attribute was not admitted after all. A required attribute that quietly does
@@ -314,6 +316,9 @@ func buildAdSchemaReport(sample [][]byte, opts adSchemaOpts) (*adSchema, []requi
 	var fields []adField
 	var skipped []requireSkip
 	for id, st := range stats {
+		if opts.Exclude != nil && opts.Exclude(id) {
+			continue
+		}
 		_, required := opts.Require[id]
 		domK, domC := akNone, 0
 		for k := akBool; k <= akString; k++ {

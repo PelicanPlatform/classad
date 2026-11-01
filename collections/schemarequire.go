@@ -141,7 +141,24 @@ func (c *Collection) baseSchemaOpts() (adSchemaOpts, map[uint32]string) {
 	if cc := newCellComputer(c); cc != nil {
 		opts.Computed = cc.computedKind
 	}
+	if c.sealer != nil {
+		opts.Exclude = c.schemaExcludes
+	}
 	return opts, byID
+}
+
+// schemaExcludes reports whether the attribute with the collection-wide id is one the sealing policy
+// names, which is never made a column. A sealed value is no column's literal anyway -- it escapes
+// whatever slot it lands in -- but a record written before its attribute was sealed holds the value
+// in the clear, and a column of those would put them in every block built from then on, outside the
+// record the next rewrite seals. A required attribute is excluded too: no configuration makes a
+// sealed value columnar.
+func (c *Collection) schemaExcludes(id uint32) bool {
+	if c.sealer == nil || c.intern == nil {
+		return false
+	}
+	name, ok := c.intern.Name(id)
+	return ok && c.shouldEncrypt(name)
 }
 
 // basePresence / baseFit are the base schema's presence floor and int-width fit percentile.
