@@ -570,7 +570,8 @@ func TestArchiveGroupedGeneralPredicates(t *testing.T) {
 		{"RequestMemory > RequestCpus * 512", "ProcId", true, "arithmetic"},
 		{"RequestMemory >= 2048 || RequestCpus >= 4", "ProcId", true, "a disjunction"},
 		{`Owner == "user3" || JobStatus == 4`, "JobStatus", true, "string OR numeric"},
-		{`regexp("user3", Owner)`, "ProcId", false, "not native: cannot be lowered at all"},
+		{`regexp("user3", Owner)`, "ProcId", true, "a strict built-in call, native since OpCallFunc"},
+		{`ifThenElse(JobStatus == 1, 1, 0) == 1`, "ProcId", false, "a lazy built-in is never compiled eagerly, so it cannot be lowered"},
 		{"RequestMemory > 4096", "Owner", true, "a STRING group column reads through the block dictionary"},
 	} {
 		groupCols := []GroupCol{{Attr: tc.group}}

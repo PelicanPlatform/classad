@@ -46,8 +46,13 @@ import (
 // evaluator's own fold comparison, or hooks, so the representation never reaches the semantics.
 //
 // NOT HANDLED, returning ok=false so the caller falls back rather than guessing: the Elvis operator (a
-// per-record select with no combine opcode to hang it on), the magic CurrentTime attribute, and
-// delegated subtrees (OpEvalNode, which Native() already excludes).
+// per-record select with no combine opcode to hang it on), the magic CurrentTime attribute, delegated
+// subtrees (OpEvalNode, which Native() already excludes), and any built-in call whose result a vector
+// cannot hold (a list or a nested ad -- see callFuncVec).
+//
+// FUNCTION CALLS are handled, but elementwise rather than as kernels: see callFuncVec for why that is
+// the useful increment and what would change that. member/identicalMember over a constant list is the
+// one call that does NOT go that way -- it has a real kernel, memberVec, and the compiler prefers it.
 
 // Element states. A vector carries one per element, which is how three-valued logic and ERROR survive
 // vectorization, and how int and real stay distinguishable -- 7/2 is not 7.0/2.0.
@@ -328,6 +333,10 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			if !memberVec(p.members[in.A], s.top(), s) {
 				return nil, false
 			}
+		case OpCallFunc:
+			if !callFuncVec(ev, p.funcs[in.A], s) {
+				return nil, false
+			}
 		default:
 			return nil, false // OpJmpIfNotUndef (Elvis), OpEvalNode, anything added later
 		}
@@ -348,6 +357,18 @@ type VecScratch struct {
 	ev    *classad.Evaluator
 	// codeBits is OpMember's per-block bitset over a dictionary's codes (see memberCodes).
 	codeBits []uint64
+
+	// argbuf is the boxed argument list handed to one built-in call, reused across elements and
+	// across batches so an elementwise call does not allocate per record.
+	argbuf []classad.Value
+}
+
+// args returns argbuf sized to exactly argc elements.
+func (s *VecScratch) args(argc int) []classad.Value {
+	if cap(s.argbuf) < argc {
+		s.argbuf = make([]classad.Value, argc)
+	}
+	return s.argbuf[:argc]
 }
 
 func (s *VecScratch) evaluator() *classad.Evaluator {
@@ -508,6 +529,82 @@ func arithVec(ev *classad.Evaluator, op string, l, r *Vec) bool {
 		}
 		l.SetReal(i, f)
 	}
+	return true
+}
+
+// callFuncVec applies a strict built-in to the argc argument vectors on top of the stack, replacing
+// them with one result vector.
+//
+// It is ELEMENTWISE: it boxes each element's arguments and calls classad.ApplyFunction, the same
+// entry point the scalar interpreter uses, once per record. There are deliberately no vector kernels
+// yet, for two reasons. Parity -- the built-in semantics come from the reference implementation
+// rather than from a second copy here, which is the same bargain hookAll strikes for the rare
+// operand states, taken for all of them. And value -- what a native call buys is not call speed but
+// Native(): with the call delegated the whole query falls off the index probes, the column prefilter
+// and this executor onto the per-record path, so an elementwise call already wins the large factor
+// and a kernel would win a small one on top of it.
+//
+// The first kernels worth writing are visible from here. A built-in whose arguments are all Const is
+// already called once instead of n times, below. Beyond that, the shape that matters is a Const
+// argument that is EXPENSIVE to re-consume per element -- regexp()'s pattern above all, which
+// classad compiles with regexp.Compile on every call (functions.go) and so recompiles per record in
+// the scalar path too. Hoisting that compile out of the element loop is a bigger win than
+// vectorizing any of the arithmetic here, and it is a change to the built-in, not to this file.
+//
+// ok=false declines the whole evaluation, never a partial answer: the result of a call can be a list
+// or a nested ad (split, splitUserName, regexps), which a vector cannot hold, and setValueData says
+// so per element.
+//
+// THE EVALUATOR. classad.ApplyFunction takes one because ten list-consuming built-ins need it to
+// materialize a lazy list argument, and the one this executor has is scope-less by construction
+// (VecScratch.evaluator: "never resolves a reference through the evaluator"). That is sound here, and
+// provably rather than incidentally: an argument element is boxed by valueData, whose codomain is
+// int, real, bool, string, UNDEFINED and ERROR -- it cannot produce a list or a nested ad, because a
+// Vec has no state that holds one. So the lazy-list path inside those ten is unreachable from here,
+// and they return ERROR for a non-list argument exactly as the tree-walker would for the same value.
+// If a Vec ever gains a list state, this reasoning fails and the lazy-list argument has to decline.
+func callFuncVec(ev *classad.Evaluator, f funcInfo, s *VecScratch) bool {
+	base := s.depth - f.argc
+	if base < 0 {
+		return false
+	}
+	dst := s.push() // may grow s.stack, so the argument window is taken after it
+	args := s.stack[base : base+f.argc]
+
+	// A mask-form argument -- isUndefined(Cpus > 2) -- has its value in the bitplanes, so it has to be
+	// converted before valueData can read it. Const is NOT materialized: valueData reads element 0 for
+	// a const vector, so an unmaterialized literal is read correctly n times for free.
+	allConst := true
+	for _, a := range args {
+		a.toData()
+		if !a.Const {
+			allConst = false
+		}
+	}
+
+	// Every argument const means the result is too: compute it once and leave dst const, which keeps a
+	// call on literals -- quantize(4, 8), pow(2, 10) -- off the per-record loop entirely.
+	n := dst.n
+	if allConst {
+		n = 1
+	}
+	dst.Dict = nil // a call result is never dictionary-coded, whatever its arguments were
+	vals := s.args(f.argc)
+	for i := 0; i < n; i++ {
+		for j, a := range args {
+			vals[j] = a.valueData(i)
+		}
+		if !dst.setValueData(i, classad.ApplyFunction(ev, f.name, vals)) {
+			return false
+		}
+	}
+	dst.Const = allConst
+
+	// Move the result into the deepest argument's slot and drop the arguments. Swapping the pointers
+	// rather than copying the payload keeps every vector in the pool: the displaced argument vector
+	// lands in the slot dst came from and is handed out again by the next push.
+	s.stack[base], s.stack[base+f.argc] = s.stack[base+f.argc], s.stack[base]
+	s.depth = base + 1
 	return true
 }
 

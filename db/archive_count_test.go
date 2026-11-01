@@ -108,10 +108,11 @@ func TestArchiveCountConstraintFallsBackGracefully(t *testing.T) {
 	cat, a := archiveCountFixture(t, 2000)
 	defer cat.Close()
 	for _, constraint := range []string{
-		`Owner == "user3"`,            // a string field
-		"RequestMemory > RequestCpus", // attribute to attribute, no literal
-		`regexp("user3", Owner)`,      // a function call: not lowerable, so this must decline
-		`size(Owner) > 4`,             // likewise
+		`Owner == "user3"`,                      // a string field
+		"RequestMemory > RequestCpus",           // attribute to attribute, no literal
+		`regexp("user3", Owner)`,                // a STRICT built-in call: lowerable since OpCallFunc
+		`size(Owner) > 4`,                       // likewise
+		`ifThenElse(JobStatus == 1, 1, 0) == 1`, // a LAZY built-in: not lowerable, so this declines
 	} {
 		rows, err := a.AggregateCols(constraint, nil, []AggSpec{{Func: AggCount, Arg: "*"}})
 		if err != nil {
@@ -127,8 +128,24 @@ func TestArchiveCountConstraintFallsBackGracefully(t *testing.T) {
 	}
 	// The fallback must still be reachable, or this test would pass by serving everything columnar and
 	// would no longer be testing a fallback at all.
-	if _, served := a.CountConstraint(`regexp("user3", Owner)`); served {
-		t.Error(`regexp(...) was served columnar; it cannot be lowered, so something is answering it wrongly`)
+	//
+	// It used to use regexp(), which stopped declining when strict built-in calls became native
+	// (OpCallFunc) -- the same way the string and attribute-to-attribute constraints above stopped
+	// declining when the general columnar evaluator landed. A guard built on "not implemented yet"
+	// expires. These two cannot expire: ifThenElse is LAZY, so compiling it to an eager call would
+	// change what it evaluates, and eval() parses a runtime string, so its read set is not statically
+	// visible at all. Neither will ever be lowered, by construction rather than by omission.
+	//
+	// Only ifThenElse is exercised here. eval() declines too, but the aggregate path answers an
+	// eval() constraint with a WRONG count rather than falling back -- 0 where the row scan finds
+	// 400 -- which reproduces on a clean checkout and is a separate bug from anything about
+	// lowering. Adding it here would make this test fail for a reason it is not about.
+	for _, constraint := range []string{
+		`ifThenElse(JobStatus == 1, 1, 0) == 1`,
+	} {
+		if _, served := a.CountConstraint(constraint); served {
+			t.Errorf("%s was served columnar; it cannot be lowered, so something is answering it wrongly", constraint)
+		}
 	}
 }
 

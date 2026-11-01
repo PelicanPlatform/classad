@@ -48,6 +48,23 @@ const (
 	// and fall through to the compiled fallback expression.
 	OpJmpIfNotUndef
 
+	// OpCallFunc calls funcs[A], a STRICT built-in: it pops the function's argc
+	// argument values (arg0 deepest), applies classad.ApplyFunction to them and
+	// pushes the result.
+	//
+	// Only built-ins that classad.StrictFunction accepts are compiled to this.
+	// A lazy one (ifThenElse, strcat), one needing the scope or the raw AST
+	// (eval, unparse, countMatches, evalInEachContext), a nondeterministic one
+	// (random, time, formatTime), an unknown name and a wrong argument count all
+	// stay OpEvalNode -- see StrictFunction's comment for why each must.
+	//
+	// The point of compiling a call natively is not call speed. It is that a
+	// program containing one stays Native(), and Native() is what the columnar
+	// accelerators gate on: with the call delegated, a single substr() or
+	// regexp() in a constraint takes the whole query off the index probes, the
+	// column prefilter and the vector executor and onto the per-record path.
+	OpCallFunc
+
 	// OpEvalNode delegates nodes[A] (an ast.Expr subtree) to the tree-walking
 	// evaluator and pushes its value. The escape hatch for node types the
 	// compiler does not lower to native instructions.
