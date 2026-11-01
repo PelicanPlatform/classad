@@ -446,6 +446,11 @@ Two details:
 - The budget is **per call** and is refilled before each one. It also covers your
   start section, so an instrumented module's initialization is metered like
   anything else.
+- **A vector call gets ONE budget for the whole batch**, not one per record. If
+  you charge a step per record then a batch of 4096 costs 4096 steps; if you
+  charge per inner-loop iteration, multiply accordingly. Each record escalated out
+  of the batch then gets its own fresh budget for its scalar call, because that is
+  a separate call.
 
 ### The wall-clock backstop
 
@@ -618,8 +623,9 @@ every vector call and is not fixed.
   and only bounds a module that calls `fuel`
 - strings or dictionary-encoded columns in the vector ABI
 - stored-width (narrow) columns in the vector ABI
-- per-module step and time limits — those are per-loader today, so two policies
-  mean two loaders
+- per-module step and time limits. The budget and the deadline come from the
+  loader, so two policies mean two loaders. The trusted label is the one
+  per-module decision, and it is a yes or no rather than a number
 - any mechanism by which a module influences whether it is trusted, which is not
   a gap to be filled but a property to be preserved
 
