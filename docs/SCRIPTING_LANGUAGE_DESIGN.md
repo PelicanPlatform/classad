@@ -9,7 +9,7 @@ order, and §13 states the one piece nothing here covers.
 
 This document exists so the semantics and the compilation model are argued before a parser or a code
 generator is written — which is still how the work is going: there is no surface syntax yet, by
-design (§12, item 7).
+design (§12, item 8).
 
 **What it is:** a small imperative language whose *expressions* are ClassAd expressions and which
 adds statements — assignment, conditionals, iteration, functions. Python-shaped surface, ClassAd
@@ -1439,27 +1439,37 @@ Ordered by dependency rather than by appeal. The notable thing about the order i
 path to the database payoff does not pass through syntax at all** — D3 is last, and nothing above it
 needs it.
 
-1. **The per-record fault model (§2.2).** First, because it is a *representation* decision that
+1. **SSA construction over the register form (§6.2), which the implementation skipped.** Ahead of the
+   rest because it changes the IR everything below it encodes against, and because S1's places
+   *maximize* peak live bytes — the quantity §6.1 identifies as dominating cost. Free to defer while a
+   register holds one `classad.Value`; not free once a register is 200 KiB. Two steps, and the first
+   is useful on its own: a real CFG with dominators, replacing `localsNeedingInit`'s conservative
+   "any jump target between the store and the read" with actual dominance, which removes the spurious
+   second definitions that currently block copy propagation; then renaming and phi insertion, which is
+   what buys real live ranges. A phi lowers two ways — moves at the predecessors scalar (what
+   `joinPoint` already emits by hand), a blend under the live mask vector (§14.2) — so one
+   representation serves both executors.
+2. **The per-record fault model (§2.2).** Next, because it is a *representation* decision that
    everything below it encodes: a vector executor for statements has nowhere to put "this record's
    condition was undefined" until the fault mask and the per-site report exist. Cheap — `VsError` and
    `mError` already exist — and it cannot be retrofitted around.
-2. **Predication for statements, and the masked blend (§2.3).** The one genuinely new runtime
+3. **Predication for statements, and the masked blend (§2.3).** The one genuinely new runtime
    primitive. Half of it is already there: `blend` (`collections/vm/vecexec.go:443`) selects per record
    at a join. What it lacks is the mask *stack* and the rule that assignment under a predicate leaves
    non-live lanes untouched. Note S2 — this is in addition to blending, not a replacement for it.
-3. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Required *before* O3, not
+4. **The element-step budget (§3.1), and per-record trip limits (§3.2).** Required *before* O3, not
    after: budget consumption is one of the four quantities scalar and vector execution are supposed to
    agree on elementwise, and it is the one that localizes a bug the values alone would hide.
-4. **O3 itself (§7.3).** The deliverable that proves the retarget. Everything above exists to make it
+5. **O3 itself (§7.3).** The deliverable that proves the retarget. Everything above exists to make it
    a real test rather than a tautology.
-5. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
+6. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
    both need the vector path to exist before they mean anything — a form is a property of a `Vec`, and
    a deferred load defers a decompression. Measured context for sizing: roughly 78% of mutable read
    CPU is zstd, so a load not performed is worth more than any amount of arithmetic removed.
-6. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
+7. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
    blocks the database use, and `for` over a *per-record* list stays declined (§2.3) until open
    question 4 gets its density argument.
-7. **D3, the lexer and parser.** Last on purpose. Every semantic question above is answerable through
+8. **D3, the lexer and parser.** Last on purpose. Every semantic question above is answerable through
    the builder API, and holding syntax back keeps the §4 lexical argument free to change.
 
 Two items on §6.8's list have been partly overtaken and should be re-costed rather than built as
