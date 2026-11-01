@@ -232,13 +232,22 @@ func TestVecPredicateScratchSurvivesADecline(t *testing.T) {
 	n := len(src.recs)
 	var scratch VecScratch
 
-	loop, err := NewScript().
-		While(mustExpr(t, "A > 4"), func(s *Script) { s.Let("x", mustExpr(t, "A - 1")) }).
+	// A loop that ONE record goes round a very long time while the rest leave at once. It declines
+	// because the vector path is doing full-width passes for one record's benefit -- quickly, which
+	// matters here only because the test should not take seconds. What it leaves behind is the point:
+	// an open loop region whose masks are in flight, and a live mask aliasing one of them.
+	runaway := make([]map[string]string, 64)
+	for i := range runaway {
+		runaway[i] = map[string]string{"A": "1"}
+	}
+	runaway[0]["A"] = "1000000"
+	loop, err := NewScript().Let("x", mustExpr(t, "0")).
+		While(mustExpr(t, "x < A"), func(s *Script) { s.Let("x", mustExpr(t, "x + 1")) }).
 		Result(mustExpr(t, "x")).Compile()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := loop.VecEval(src, n, &scratch); ok {
+	if _, ok := loop.VecEval(newTestSource(runaway), len(runaway), &scratch); ok {
 		t.Fatal("the loop was served; this test needs it to decline part-way through")
 	}
 

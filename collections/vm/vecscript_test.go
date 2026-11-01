@@ -2,6 +2,7 @@ package vm
 
 import (
 	"testing"
+	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/parser"
@@ -179,41 +180,43 @@ func TestVecScriptBindingsDoNotLeakAcrossBatches(t *testing.T) {
 	}
 }
 
-// TestVecScriptDeclinesControlFlow pins the boundary, which is now the BACK EDGE and not the branch.
-// If is served (see vecpred_test.go); While is not, because its live mask narrows across iterations
-// and the loop runs until no record is still true, which needs per-record trip accounting the
-// element-step budget has not been built for. Serving one silently is the failure this guards
-// against.
-func TestVecScriptDeclinesControlFlow(t *testing.T) {
+// TestVecScriptDeclinesNonTerminatingLoops pins what is left of the boundary.
+//
+// It used to say "While is not served". That is no longer true -- a terminating loop runs over a
+// batch, and vecloop_test.go is where it is checked. What a loop cannot do is run forever, so what
+// this guards is that a loop with no exit DECLINES, handing the batch to the per-record path where
+// each record meets its own budget and gets its own ERROR, rather than spinning.
+//
+// The budget is passed explicitly and small. Through the public entry point the same program
+// declines after the per-record budget's worth of trips, which is correct and takes seconds; the
+// question here is the behaviour, not the constant.
+func TestVecScriptDeclinesNonTerminatingLoops(t *testing.T) {
 	src := vecCorpus()
 	n := len(src.recs)
-	one, err := parser.ParseExpr("1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cond, err := parser.ParseExpr("A > 4")
-	if err != nil {
-		t.Fatal(err)
-	}
-	res, err := parser.ParseExpr("t")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, tc := range []struct {
-		name  string
-		build func() *Script
-	}{
-		{"while", func() *Script {
-			return NewScript().While(cond, func(s *Script) { s.Let("t", one) })
-		}},
+	for _, tc := range []struct{ name, cond string }{
+		// A condition that never changes: every record that enters goes round forever.
+		{"constant condition", "A > 4"},
+		{"literally true", "true"},
 	} {
-		sp, err := tc.build().Result(res).Compile()
+		sp, err := NewScript().
+			While(mustExpr(t, tc.cond), func(s *Script) { s.Let("t", mustExpr(t, "1")) }).
+			Result(mustExpr(t, "t")).Compile()
 		if err != nil {
 			t.Fatalf("%s: compile: %v", tc.name, err)
 		}
-		if _, ok := sp.VecEval(src, n, nil); ok {
-			t.Errorf("%s was SERVED by the vector executor, which has no masked store; "+
-				"if that changed on purpose, this test says so", tc.name)
+		var scratch VecScratch
+		done := make(chan bool, 1)
+		go func() {
+			_, ok := execVec(sp.Program(), scratch.evaluator(), src, n, &scratch, int64(n)*4096)
+			done <- ok
+		}()
+		select {
+		case ok := <-done:
+			if ok {
+				t.Errorf("%s was served; a loop with no exit must decline", tc.name)
+			}
+		case <-time.After(20 * time.Second):
+			t.Fatalf("%s did not return: a loop with no exit is spinning rather than declining", tc.name)
 		}
 	}
 }

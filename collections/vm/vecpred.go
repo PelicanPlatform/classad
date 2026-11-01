@@ -104,29 +104,30 @@ func (s *VecScratch) releaseMask(m []uint64) {
 // is a poor price for state an expression cannot use. initPredicates does that, and only a program
 // that actually has statements calls it.
 func (s *VecScratch) resetPredicates() {
-	// Exactly once each, which is the whole difficulty: s.live ALIASES one of the masks below while a
-	// region is open, and an `outer` aliases the enclosing region's arm mask. Releasing a slice twice
-	// would put it in the pool twice, and takeMask would then hand the same backing array to two
-	// masks that are supposed to be different.
-	if len(s.preds) > 0 {
-		s.releaseMask(s.preds[0].outer) // the batch-wide mask, borrowed down the whole stack
-		for i := range s.preds {
-			s.releaseMask(s.preds[i].thenMask)
-			s.releaseMask(s.preds[i].elseMask)
-		}
-	} else {
-		s.releaseMask(s.live)
+	// EVERY MASK HAS EXACTLY ONE OWNER, and releasing one twice is the bug this spells out to avoid:
+	// the pool would then hand the same backing array to two masks that are supposed to be
+	// different, and the symptom is wrong answers in a LATER batch.
+	//
+	// So each region releases only what it allocated -- its arm masks -- and never its `outer`,
+	// which is always somebody else's: an enclosing region's mask, or baseLive. s.live is not
+	// released here at all, because while any region is open it ALIASES that region's mask. baseLive
+	// is the one this function owns.
+	for i := range s.preds {
+		s.releaseMask(s.preds[i].thenMask)
+		s.releaseMask(s.preds[i].elseMask)
 	}
 	s.preds = s.preds[:0]
 	s.releaseMask(s.faulted)
-	s.live, s.faulted = nil, nil
+	s.releaseMask(s.baseLive)
+	s.live, s.baseLive, s.faulted = nil, nil, nil
 	s.liveAll, s.anyFault = true, false
 }
 
 // initPredicates gives the batch its live and fault planes, for a program that has statements.
 func (s *VecScratch) initPredicates() {
-	s.live, s.faulted = s.takeMask(), s.takeMask()
-	fillLive(s.live, s.n)
+	s.baseLive, s.faulted = s.takeMask(), s.takeMask()
+	fillLive(s.baseLive, s.n)
+	s.live = s.baseLive
 	s.liveAll, s.anyFault = true, false
 }
 
@@ -156,7 +157,7 @@ func maskEmpty(m []uint64) bool {
 // The condition is converted to mask form, where TRUE is 01, FALSE is 00 and the hi plane marks
 // exactly the states that are neither -- UNDEFINED and ERROR, which this treats alike because the
 // script's answer is the same either way: it could not tell which branch to take.
-func (s *VecScratch) enterIf(ct condTargets, at int) (int, bool) {
+func (s *VecScratch) enterIf(vops []int32, ct condTargets, at int) (int, bool) {
 	if s.depth == 0 {
 		return 0, false
 	}
@@ -166,6 +167,8 @@ func (s *VecScratch) enterIf(ct condTargets, at int) (int, bool) {
 		// not a nil mask, which would be a panic inside a daemon rather than a wrong answer.
 		s.initPredicates()
 	}
+	// The condition was evaluated for whoever reached it; settle that before the arms narrow it.
+	s.flushCharge(vops, at+1)
 	cond := s.pop()
 	cond.toMask()
 	thenM, elseM := s.takeMask(), s.takeMask()
@@ -195,6 +198,8 @@ func (s *VecScratch) enterIf(ct condTargets, at int) (int, bool) {
 		thenMask: thenM, elseMask: elseM, outer: s.live,
 	})
 	s.live, s.liveAll = thenM, false
+	s.liveCount = popcountMask(thenM)
+	s.spanStart = at + 1
 	return at + 1, true
 }
 
@@ -204,7 +209,7 @@ func (s *VecScratch) enterIf(ct condTargets, at int) (int, bool) {
 // of an If jump to the SAME place and only the region knows which of them just finished. A jump that
 // does not match the innermost region is a back edge or a shape this executor was not written for,
 // and it declines.
-func (s *VecScratch) jmpVoid(target int32) (int, bool) {
+func (s *VecScratch) jmpVoid(vops []int32, at int, target int32) (int, bool) {
 	if len(s.preds) == 0 {
 		return 0, false
 	}
@@ -212,9 +217,12 @@ func (s *VecScratch) jmpVoid(target int32) (int, bool) {
 	if pd.end != target {
 		return 0, false
 	}
+	// Each arm is billed to the records that took it, so the run ends here whichever arm just did.
+	s.flushCharge(vops, at+1)
 	if pd.arm == armThen {
 		pd.arm = armElse
-		s.live = pd.elseMask
+		s.live, s.liveCount = pd.elseMask, popcountMask(pd.elseMask)
+		s.spanStart = int(pd.elseAt)
 		return int(pd.elseAt), true
 	}
 	// The join. A record is executing again if it was executing on either path, which is NOT the same
@@ -225,13 +233,15 @@ func (s *VecScratch) jmpVoid(target int32) (int, bool) {
 		pd.outer[w] = pd.thenMask[w] | pd.elseMask[w]
 	}
 	s.live = pd.outer
+	s.liveCount = popcountMask(pd.outer)
 	s.releaseMask(pd.thenMask)
 	s.releaseMask(pd.elseMask)
 	s.preds = s.preds[:len(s.preds)-1]
 	if len(s.preds) == 0 && !s.anyFault {
 		// Back to the whole batch, so stores take the unmasked path again.
-		s.liveAll = true
+		s.liveAll, s.liveCount = true, s.n
 	}
+	s.spanStart = int(target)
 	return int(target), true
 }
 
