@@ -298,3 +298,46 @@ func trimOrderCol(rows [][]classad.Value, added bool) [][]classad.Value {
 	}
 	return rows
 }
+
+// AggregateColsStats reduces an aggregate over the WHOLE view: the live backing and, for a
+// continuous aggregate that has sealed, its archive too.
+//
+// Unlike the top-K above, this does NOT reduce each half and combine the results, because
+// not every aggregate can be combined from finished ones. SUM, MIN, MAX and COUNT can; AVG
+// cannot (an average of averages is not the average), and COUNT(DISTINCT) cannot at all,
+// since a count has thrown away the values it would have to compare. Special-casing the
+// mergeable ones would leave the other two either wrong or refused.
+//
+// So the union is reduced ONCE, in a single pass over both halves' projected rows, through
+// the same reducer the scanning path uses. That gives up the columnar fast paths, and the
+// reason it is still the right trade is that only a continuous aggregate seals: its
+// materialized rows are one per bucket per series and bounded by the view's cardinality cap,
+// so the scan is small by construction. A gauge view never reaches here -- it has no archive,
+// and falls through to the backing's own ladder with every fast path intact.
+func (v *View) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats, stop func() bool) ([]AggRow, error) {
+	arch, sealed := v.SealedArchive()
+	if !sealed {
+		return v.backing.AggregateColsStats(constraint, groupCols, aggs, stats, stop)
+	}
+	attrs, groupCol, aggCol := AggProjection(groupCols, aggs)
+	live, err := v.backing.QueryProject(constraint, attrs)
+	if err != nil {
+		return nil, err
+	}
+	old, err := arch.QueryProject(constraint, attrs)
+	if err != nil {
+		return nil, err
+	}
+	return AggregateValues(func(yield func([]classad.Value) bool) {
+		for row := range live {
+			if !yield(row) {
+				return
+			}
+		}
+		for row := range old {
+			if !yield(row) {
+				return
+			}
+		}
+	}, attrs, groupCols, aggs, groupCol, aggCol, stop)
+}

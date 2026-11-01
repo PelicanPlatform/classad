@@ -204,3 +204,81 @@ func TestViewSealedTopKSpansBothHalves(t *testing.T) {
 		}
 	}
 }
+
+// An aggregate over a sealed view must reduce the union. AVG is the case that matters most:
+// it is the one a per-half merge gets WRONG rather than merely short, because an average of
+// two averages is not the average unless the halves happen to be the same size -- and the
+// halves here are not, since sealing moves buckets across one at a time. MIN and MAX would
+// survive a naive merge, so they are here to show the union is not merely non-empty.
+func TestViewSealedAggregatesReduceTheUnion(t *testing.T) {
+	ctx := context.Background()
+	f := newSealedFixture(t)
+	defer f.close()
+
+	aggs := []AggSpec{
+		{Func: AggCount, Arg: "*"},
+		{Func: AggSum, Arg: "metric_size"},
+		{Func: AggAvg, Arg: "metric_size"},
+		{Func: AggMin, Arg: "metric_size"},
+		{Func: AggMax, Arg: "metric_size"},
+	}
+	read := func() []AggRow {
+		t.Helper()
+		rows, err := f.c.AggregateTable(ctx, sealView, "true", nil, aggs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+
+	before := read()
+	if len(before) != 1 || len(before[0].Values) != len(aggs) {
+		t.Fatalf("before sealing: got %d rows", len(before))
+	}
+	f.sealAll()
+	after := read()
+	if len(after) != len(before) {
+		t.Fatalf("after sealing: %d aggregate rows, want %d", len(after), len(before))
+	}
+	names := []string{"COUNT(*)", "SUM", "AVG", "MIN", "MAX"}
+	for i := range before[0].Values {
+		if after[0].Values[i] != before[0].Values[i] {
+			t.Errorf("after sealing: %s = %s, want %s.\n"+
+				"Sealing moves buckets into the view's archive; an aggregate must reduce both "+
+				"halves, and AVG in particular cannot be recombined from per-half results.",
+				names[i], after[0].Values[i], before[0].Values[i])
+		}
+	}
+}
+
+// Grouping must also span the halves: a GROUP BY whose groups straddle the seal boundary
+// must return one row per group, not one per group per half.
+func TestViewSealedGroupedAggregateDoesNotSplitGroups(t *testing.T) {
+	ctx := context.Background()
+	f := newSealedFixture(t)
+	defer f.close()
+
+	aggs := []AggSpec{{Func: AggCount, Arg: "*"}}
+	groups := []string{"metric_events"} // every bucket has the same event count, so ONE group
+	read := func() []AggRow {
+		t.Helper()
+		rows, err := f.c.AggregateTable(ctx, sealView, "true", groups, aggs)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+
+	before := read()
+	f.sealAll()
+	after := read()
+	if len(after) != len(before) {
+		t.Fatalf("after sealing: %d groups, want %d (a group split across the halves)", len(after), len(before))
+	}
+	for i := range before {
+		if after[i].Values[0] != before[i].Values[0] {
+			t.Errorf("after sealing: group %v count = %s, want %s",
+				after[i].Group, after[i].Values[0], before[i].Values[0])
+		}
+	}
+}
