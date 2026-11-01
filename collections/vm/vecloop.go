@@ -155,7 +155,7 @@ func (s *VecScratch) stepLoop(vops []int32, ct condTargets, ip int, perRecord in
 	}
 	s.releaseMask(r.owned)
 	r.owned = cont
-	s.live, s.liveAll, s.liveCount = cont, false, popcountMask(cont)
+	s.setLive(cont)
 	s.spanStart = ip + 1
 	return ip + 1, true
 }
@@ -171,7 +171,7 @@ func (s *VecScratch) endLoop(r *loopRegion) {
 		for w := range r.outer {
 			r.outer[w] &^= s.faulted[w]
 		}
-		s.live, s.liveAll, s.liveCount = r.outer, false, popcountMask(r.outer)
+		s.setLive(r.outer)
 	} else {
 		s.live, s.liveAll, s.liveCount = r.outer, r.outerAll, r.outerCount
 	}

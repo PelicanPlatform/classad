@@ -105,6 +105,20 @@ func loopShapes() []loopShape {
 				}).
 				Result(mustExpr(t, "acc"))
 		}},
+		// A branch in the body whose RESULT is the counter the loop advances. "branch in body" above
+		// reads an accumulator the arms write, so a store that wrongly wrote every lane would corrupt
+		// only the counter -- which nothing reads. Here the counter is the answer, which is what makes
+		// a live set mishandled inside the body a wrong value rather than a wrong charge.
+		{"branch then counter is the result", func(t *testing.T, s *Script) *Script {
+			return s.Let("x", mustExpr(t, "0")).Let("acc", mustExpr(t, "0")).
+				While(mustExpr(t, "x < A"), func(b *Script) {
+					b.If(mustExpr(t, "B > 1"),
+						func(c *Script) { c.Let("acc", mustExpr(t, "acc + 10")) },
+						func(c *Script) { c.Let("acc", mustExpr(t, "acc + 1")) })
+					b.Let("x", mustExpr(t, "x + 1"))
+				}).
+				Result(mustExpr(t, "x"))
+		}},
 		// A short-circuit in the CONDITION, so a path region opens and closes at the header.
 		{"short-circuit condition", func(t *testing.T, s *Script) *Script {
 			return s.Let("x", mustExpr(t, "0")).

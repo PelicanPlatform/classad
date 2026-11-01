@@ -129,6 +129,19 @@ func (s *VecScratch) flushCharge(prefix []int32, cur int) {
 	s.spanStart = cur
 }
 
+// setLive makes mask the live set, deriving everything else from it.
+//
+// ONE PLACE, because the three fields have to agree and they were being maintained in six. liveAll
+// is not an independent fact -- it is "the mask is the whole batch" -- and a path that set it
+// separately got it wrong: a nested If restored it to true on the way out of the inner region,
+// while the outer region's arm was still narrowed, and the next store wrote every lane. Deriving it
+// makes that unrepresentable.
+func (s *VecScratch) setLive(mask []uint64) {
+	s.live = mask
+	s.liveCount = popcountMask(mask)
+	s.liveAll = s.liveCount == s.n
+}
+
 // intersectLive narrows mask in place to the records that are also live now.
 func (s *VecScratch) intersectLive(mask []uint64) {
 	if s.liveAll {
@@ -183,8 +196,7 @@ func (s *VecScratch) openPathAs(prefix []int32, at int, end int32, mask, owned [
 	s.paths = append(s.paths, pathRegion{
 		end: end, saved: s.live, savedAll: s.liveAll, savedCount: s.liveCount, owned: owned,
 	})
-	s.live, s.liveAll = mask, false
-	s.liveCount = popcountMask(mask)
+	s.setLive(mask)
 }
 
 // endPaths closes every region converging on ip, innermost first.

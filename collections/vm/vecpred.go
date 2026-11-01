@@ -197,8 +197,7 @@ func (s *VecScratch) enterIf(vops []int32, ct condTargets, at int) (int, bool) {
 		elseAt: ct.onFalse, end: ct.end, arm: armThen,
 		thenMask: thenM, elseMask: elseM, outer: s.live,
 	})
-	s.live, s.liveAll = thenM, false
-	s.liveCount = popcountMask(thenM)
+	s.setLive(thenM)
 	s.spanStart = at + 1
 	return at + 1, true
 }
@@ -221,7 +220,7 @@ func (s *VecScratch) jmpVoid(vops []int32, at int, target int32) (int, bool) {
 	s.flushCharge(vops, at+1)
 	if pd.arm == armThen {
 		pd.arm = armElse
-		s.live, s.liveCount = pd.elseMask, popcountMask(pd.elseMask)
+		s.setLive(pd.elseMask)
 		s.spanStart = int(pd.elseAt)
 		return int(pd.elseAt), true
 	}
@@ -232,15 +231,18 @@ func (s *VecScratch) jmpVoid(vops []int32, at int, target int32) (int, bool) {
 	for w := range pd.outer {
 		pd.outer[w] = pd.thenMask[w] | pd.elseMask[w]
 	}
-	s.live = pd.outer
-	s.liveCount = popcountMask(pd.outer)
 	s.releaseMask(pd.thenMask)
 	s.releaseMask(pd.elseMask)
 	s.preds = s.preds[:len(s.preds)-1]
-	if len(s.preds) == 0 && !s.anyFault {
-		// Back to the whole batch, so stores take the unmasked path again.
-		s.liveAll, s.liveCount = true, s.n
-	}
+	// COUNT THE MASK rather than reason about who is left. This used to say "no enclosing branch and
+	// nothing faulted means the whole batch", which is wrong wherever something other than a branch
+	// has narrowed the live set -- inside a loop, most of all, where the records still going round
+	// are a fraction of the batch and an If in the body would hand the rest back.
+	//
+	// It was invisible for a long time because it needs a batch with no fault in it: with a fault
+	// anywhere the old condition declined to fire and happened to be right. The batch-invariance law
+	// is what surfaced it, by splitting a corpus so that some batches had no faulting record.
+	s.setLive(pd.outer)
 	s.spanStart = int(target)
 	return int(target), true
 }
