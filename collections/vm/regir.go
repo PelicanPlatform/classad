@@ -634,17 +634,47 @@ func (l *lowerer) one(ip int) {
 // FuzzRegisterParity exists to enforce. Every value operation goes through the same classad hooks the
 // stack interpreter uses, so neither form has its own copy of any semantics.
 func RunRegisters(rp *RegProgram, scope *classad.ClassAd) (result classad.Value) {
+	result, _ = RunRegistersLimited(rp, scope, DefaultStepBudget)
+	return result
+}
+
+// DefaultStepBudget bounds how many instructions one execution may run.
+//
+// A bound is not optional once a program can loop: `while true: x = x` has no answer, and the
+// evaluator's contract is that evaluation returns. It is counted in INSTRUCTIONS rather than in wall
+// clock on purpose -- a time limit makes the same script succeed or fail depending on what else the
+// machine is doing, which is not reproducible, and a fault nobody can reproduce cannot be debugged
+// or differentially tested.
+//
+// The value is large enough that no terminating script written by hand will reach it and small
+// enough to stop a runaway quickly.
+const DefaultStepBudget = 1 << 22
+
+// RunRegistersLimited is RunRegisters with an explicit instruction budget. ok=false means the budget
+// ran out, in which case the value is ERROR.
+//
+// The two are distinguishable because they are different kinds of thing: ERROR is an answer the
+// script computed, while exhausting the budget means it did not finish. The design keeps that
+// distinction for the vector case, where a runaway costs one record and a budget overrun abandons
+// the whole batch; here the single record is the whole result, so both end the script and only the
+// caller's report differs.
+func RunRegistersLimited(rp *RegProgram, scope *classad.ClassAd, budget int) (result classad.Value, ok bool) {
 	ev := classad.NewEvaluator(scope)
 	defer classad.RecoverCyclic(&result)
-	return execReg(rp, ev, make([]classad.Value, rp.nregs))
+	return execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
 }
 
 // execReg runs rp against ev, using regs as the register file. regs must have at least rp.nregs
 // entries; the caller may retain its backing array to amortize allocation across evaluations.
-func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classad.Value {
+func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget int) (classad.Value, bool) {
 	p := rp.src
 	code := rp.code
+	steps := 0
 	for ip := 0; ip < len(code); {
+		steps++
+		if steps > budget {
+			return classad.NewErrorValue(), false
+		}
 		in := code[ip]
 		switch in.Op {
 		case RNop:
@@ -705,7 +735,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classa
 		case RFault:
 			// Ends the script. Returning here rather than jumping to an end label keeps the fault
 			// out of the register file: there is no result to have produced.
-			return classad.NewErrorValue()
+			return classad.NewErrorValue(), true
 		case RBranchCond:
 			t := rp.conds[in.Imm]
 			switch classad.ConditionState(regs[in.A]) {
@@ -745,7 +775,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value) classa
 		}
 	}
 	if rp.res < 0 {
-		return classad.NewUndefinedValue()
+		return classad.NewUndefinedValue(), true
 	}
-	return regs[rp.res]
+	return regs[rp.res], true
 }

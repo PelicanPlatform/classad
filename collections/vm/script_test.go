@@ -527,3 +527,212 @@ func TestScriptIfErrors(t *testing.T) {
 		t.Error("If after Result: want an error")
 	}
 }
+
+// TestScriptWhile covers the loop: that it runs, that a local carried across iterations works, that
+// a false condition skips the body entirely, and that a condition which is neither true nor false
+// faults as it does in If.
+func TestScriptWhile(t *testing.T) {
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		return e
+	}
+	// i = 0; sum = 0; while i < N: sum = sum + i; i = i + 1; result = sum
+	sumBelow := func(n string) *ScriptProgram {
+		sp, err := NewScript().
+			Let("i", parse("0")).
+			Let("sum", parse("0")).
+			While(parse("i < "+n), func(b *Script) {
+				b.Let("sum", parse("sum + i")).Let("i", parse("i + 1"))
+			}).
+			Result(parse("sum")).Compile()
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		return sp
+	}
+	scope, err := classad.Parse(`[ Cpus = 4; Owner = "alice" ]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ n, want string }{
+		{"0", "0"}, // the body never runs
+		{"1", "0"}, // 0
+		{"4", "6"}, // 0+1+2+3
+		{"10", "45"},
+	} {
+		if got := sumBelow(tc.n).Run(scope).String(); got != tc.want {
+			t.Errorf("sum of i below %s = %s, want %s", tc.n, got, tc.want)
+		}
+	}
+
+	// A condition that is neither true nor false faults, as in If.
+	for _, cond := range []string{"Missing", "Owner", "error", "{1,2}"} {
+		sp, err := NewScript().
+			Let("x", parse("1")).
+			While(parse(cond), func(b *Script) { b.Let("x", parse("2")) }).
+			Result(parse("x")).Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := sp.Run(scope).String(); got != "error" {
+			t.Errorf("while %s: got %s, want error", cond, got)
+		}
+	}
+}
+
+// TestScriptWhileIsBounded is the property that makes a loop safe to have at all. `while true` has
+// no answer, and nothing the compiler can check distinguishes it from a loop that runs a long time,
+// so the interpreter bounds it.
+//
+// The budget is in INSTRUCTIONS, not wall clock, so this is deterministic: the same script fails at
+// the same point every time, which is what makes the fault reproducible and testable.
+func TestScriptWhileIsBounded(t *testing.T) {
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	scope, err := classad.Parse(`[]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp, err := NewScript().
+		Let("x", parse("0")).
+		While(parse("true"), func(b *Script) { b.Let("x", parse("x + 1")) }).
+		Result(parse("x")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := sp.RunLimited(scope, 10000)
+	if ok {
+		t.Fatal("an infinite loop reported that it finished")
+	}
+	if got.String() != "error" {
+		t.Errorf("exhausted value = %s, want error", got)
+	}
+	// Deterministic: the same budget gives the same answer, every time.
+	for i := 0; i < 3; i++ {
+		if _, ok := sp.RunLimited(scope, 10000); ok {
+			t.Fatal("the same script finished on a later run; the bound is not deterministic")
+		}
+	}
+	// And a terminating loop is NOT reported as exhausted, so the signal means something.
+	fin, err := NewScript().
+		Let("i", parse("0")).
+		While(parse("i < 3"), func(b *Script) { b.Let("i", parse("i + 1")) }).
+		Result(parse("i")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, ok := fin.RunLimited(scope, 10000)
+	if !ok {
+		t.Error("a terminating loop was reported as exhausting its budget")
+	}
+	if v.String() != "3" {
+		t.Errorf("terminating loop result = %s, want 3", v)
+	}
+}
+
+// TestScriptWhileBackEdge pins that the loop really is a loop: a jump that goes BACKWARD. Every
+// other jump this compiler emits goes forward, and a forward-only lowering that silently dropped the
+// back edge would still produce a program that runs -- it would just run the body once.
+func TestScriptWhileBackEdge(t *testing.T) {
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	sp, err := NewScript().
+		Let("i", parse("0")).
+		While(parse("i < 3"), func(b *Script) { b.Let("i", parse("i + 1")) }).
+		Result(parse("i")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	back := 0
+	for i, in := range sp.RegProgram().code {
+		if in.Op == RJump && int(in.T) <= i {
+			back++
+		}
+	}
+	if back != 1 {
+		t.Errorf("%d backward jumps, want 1; the loop does not loop", back)
+	}
+}
+
+// TestScriptWhileNesting checks loops nest with each other and with branches, including a local
+// bound only inside a loop body and read after it.
+func TestScriptWhileNesting(t *testing.T) {
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return e
+	}
+	scope, err := classad.Parse(`[]`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Nested loops: 3 x 3 increments.
+	sp, err := NewScript().
+		Let("i", parse("0")).Let("n", parse("0")).
+		While(parse("i < 3"), func(b *Script) {
+			b.Let("j", parse("0")).
+				While(parse("j < 3"), func(c *Script) {
+					c.Let("n", parse("n + 1")).Let("j", parse("j + 1"))
+				}).
+				Let("i", parse("i + 1"))
+		}).
+		Result(parse("n")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sp.Run(scope).String(); got != "9" {
+		t.Errorf("nested loops = %s, want 9", got)
+	}
+
+	// An if inside a loop: count the odd numbers below 6.
+	sp2, err := NewScript().
+		Let("i", parse("0")).Let("odd", parse("0")).
+		While(parse("i < 6"), func(b *Script) {
+			b.If(parse("i % 2 == 1"), func(c *Script) { c.Let("odd", parse("odd + 1")) }, nil).
+				Let("i", parse("i + 1"))
+		}).
+		Result(parse("odd")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sp2.Run(scope).String(); got != "3" {
+		t.Errorf("odd count below 6 = %s, want 3", got)
+	}
+
+	// A local bound only inside a loop body, read after it. The loop may not run, so the read is not
+	// dominated and must see UNDEFINED rather than an unwritten register.
+	build := func(limit string) *ScriptProgram {
+		p, err := NewScript().
+			Let("i", parse("0")).
+			While(parse("i < "+limit), func(b *Script) {
+				b.Let("seen", parse("i")).Let("i", parse("i + 1"))
+			}).
+			Result(parse("seen")).Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if got := build("2").Run(scope).String(); got != "1" {
+		t.Errorf("seen after a loop that ran = %s, want 1", got)
+	}
+	if got := build("0").Run(scope).String(); got != "undefined" {
+		t.Errorf("seen after a loop that never ran = %s, want undefined", got)
+	}
+}

@@ -148,6 +148,51 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 	return s
 }
 
+// While runs body for as long as cond is true.
+//
+// The back edge is the only thing here that the lowering had not seen before, and it works because a
+// statement leaves the stack as it found it: the value stack at the loop header is identical on
+// every iteration, so there is nothing to reconcile between them. Locals are places, so a value
+// carried across iterations is just a register written each time round -- no phi, and no loop-carried
+// analysis to get wrong.
+//
+// A condition that is neither true nor false faults, exactly as in If.
+//
+// TERMINATION is not the loop's problem to solve but the interpreter's: `while true: x = x` has no
+// answer, and nothing the compiler can check would tell it apart from a loop that happens to run a
+// long time. The instruction budget in RunRegistersLimited is what bounds it.
+func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
+	if s.err != nil {
+		return s
+	}
+	if s.hasRes {
+		s.err = errors.New("vm: While after Result")
+		return s
+	}
+	header := len(s.c.p.code)
+	s.emitExpr(cond)
+	s.c.p.conds = append(s.c.p.conds, condTargets{})
+	k := int32(len(s.c.p.conds) - 1)
+	s.c.ins(OpBranchVoid, k)
+
+	if body != nil {
+		body(s)
+	}
+	// The back edge. Every other jump this compiler emits goes forward; this one does not, and the
+	// lowering needs no special case for it because targets are resolved after the whole program is
+	// laid out.
+	s.c.ins(OpJmpVoid, int32(header))
+
+	onFault := len(s.c.p.code)
+	s.c.ins(OpFault, 0)
+
+	end := len(s.c.p.code)
+	s.c.p.conds[k] = condTargets{
+		onFalse: int32(end), onUndef: int32(onFault), onError: int32(onFault), end: int32(end),
+	}
+	return s
+}
+
 // Result sets the script's value. It must be called last and exactly once.
 func (s *Script) Result(expr ast.Expr) *Script {
 	if s.err != nil {
@@ -206,9 +251,16 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
 }
 
-// Run evaluates the script against scope and returns its result.
+// Run evaluates the script against scope and returns its result, under the default instruction
+// budget.
 func (sp *ScriptProgram) Run(scope *classad.ClassAd) classad.Value {
 	return RunRegisters(sp.rp, scope)
+}
+
+// RunLimited is Run with an explicit instruction budget. ok=false means the script did not finish
+// within it, which is a different report from a script that finished and computed ERROR.
+func (sp *ScriptProgram) RunLimited(scope *classad.ClassAd, budget int) (classad.Value, bool) {
+	return RunRegistersLimited(sp.rp, scope, budget)
 }
 
 // Program returns the underlying stack-form program.

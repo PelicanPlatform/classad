@@ -471,3 +471,96 @@ func TestOptimizeAgreesOnBranchingScripts(t *testing.T) {
 		}
 	}
 }
+
+// TestOptimizeAgreesOnLoops extends the law to loops, where copy propagation's reasoning meets a
+// jump target that sits BEHIND the move rather than ahead of it.
+//
+// The analysis survives that for a reason worth stating: a loop header is a marked jump target, so a
+// move whose read lies on the far side of one stops being substitutable, while a move and read
+// wholly inside one iteration keep their order on every iteration. Loops with the read before and
+// after the header are both here, because only the first kind must be refused.
+func TestOptimizeAgreesOnLoops(t *testing.T) {
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		return e
+	}
+	for _, shape := range []struct {
+		name  string
+		build func() *ScriptProgram
+	}{
+		{"accumulate across iterations", func() *ScriptProgram {
+			sp, _ := NewScript().
+				Let("i", parse("0")).Let("s", parse("0")).
+				While(parse("i < 4"), func(b *Script) {
+					b.Let("s", parse("s + i")).Let("i", parse("i + 1"))
+				}).Result(parse("s")).Compile()
+			return sp
+		}},
+		{"local read twice in one iteration", func() *ScriptProgram {
+			sp, _ := NewScript().
+				Let("i", parse("0")).Let("s", parse("0")).
+				While(parse("i < 4"), func(b *Script) {
+					b.Let("t", parse("i + 1")).Let("s", parse("s + t + t")).Let("i", parse("i + 1"))
+				}).Result(parse("s")).Compile()
+			return sp
+		}},
+		{"bound in the body, read after the loop", func() *ScriptProgram {
+			sp, _ := NewScript().
+				Let("i", parse("0")).
+				While(parse("i < 3"), func(b *Script) {
+					b.Let("last", parse("i")).Let("i", parse("i + 1"))
+				}).Result(parse("last")).Compile()
+			return sp
+		}},
+		{"loop that never runs", func() *ScriptProgram {
+			sp, _ := NewScript().
+				Let("i", parse("9")).
+				While(parse("i < 3"), func(b *Script) { b.Let("i", parse("i + 1")) }).
+				Result(parse("i")).Compile()
+			return sp
+		}},
+		{"if inside a loop", func() *ScriptProgram {
+			sp, _ := NewScript().
+				Let("i", parse("0")).Let("n", parse("0")).
+				While(parse("i < 5"), func(b *Script) {
+					b.If(parse("i % 2 == 0"), func(c *Script) { c.Let("n", parse("n + 1")) }, nil).
+						Let("i", parse("i + 1"))
+				}).Result(parse("n")).Compile()
+			return sp
+		}},
+		{"nested loops", func() *ScriptProgram {
+			sp, _ := NewScript().
+				Let("i", parse("0")).Let("n", parse("0")).
+				While(parse("i < 2"), func(b *Script) {
+					b.Let("j", parse("0")).
+						While(parse("j < 2"), func(c *Script) {
+							c.Let("n", parse("n + 1")).Let("j", parse("j + 1"))
+						}).Let("i", parse("i + 1"))
+				}).Result(parse("n")).Compile()
+			return sp
+		}},
+	} {
+		sp := shape.build()
+		if sp == nil {
+			t.Fatalf("%s: compile failed", shape.name)
+		}
+		for _, scopeSrc := range []string{`[]`, `[Cpus = 4]`} {
+			scope, err := classad.Parse(scopeSrc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, okW := RunRegistersLimited(sp.RegProgram(), scope, 100000)
+			got, okG := RunRegistersLimited(Optimize(sp.RegProgram(), AllPasses()), scope, 100000)
+			if okW != okG {
+				t.Errorf("%s: finished unoptimized=%v optimized=%v", shape.name, okW, okG)
+			}
+			if !valuesEqual(want, got) {
+				t.Errorf("%s / %s: unoptimized=%s optimized=%s",
+					shape.name, scopeSrc, describe(want), describe(got))
+			}
+		}
+	}
+}
