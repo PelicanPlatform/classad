@@ -61,6 +61,10 @@ type Program struct {
 	// strLists are the constant lists of stringListMember calls (OpStrListMember).
 	strLists []*strListSet
 
+	// faultSites are the places a script can fault, indexed by OpFault's operand. Empty for an
+	// ordinary expression program, which cannot fault at all.
+	faultSites []faultSite
+
 	// locals are a script's local names, in binding order, indexed by OpLoadLocal. Empty for an
 	// ordinary expression program. Kept for diagnostics; execution goes by index.
 	locals []string

@@ -417,6 +417,56 @@ func TestOptimizerKnowsTheOpcodesWeEmit(t *testing.T) {
 	for _, src := range parityCorpusExprs {
 		check(src)
 	}
+	// SCRIPTS TOO, because they are where the opcodes this test exists for actually live. The
+	// expression corpora above cannot emit OpFault, OpBranchVoid, OpLoadLocal or OpStoreLocal at all,
+	// so walking only them left every script-only opcode outside the tripwire -- which is the same
+	// gap that let a merged specialization through once.
+	checkReg := func(name string, rp *RegProgram) {
+		t.Helper()
+		for i, in := range rp.code {
+			buf = regUses(rp, in, buf)
+			switch in.Op {
+			case RNop, RJump, RFault, RBranchCond:
+				if _, ok := regDef(in); ok {
+					t.Errorf("%s instruction %d (op %d) claims a definition it does not have", name, i, in.Op)
+				}
+			default:
+				if _, ok := regDef(in); !ok {
+					t.Errorf("%s instruction %d (op %d) defines nothing and is not control flow", name, i, in.Op)
+				}
+			}
+		}
+	}
+	parse := func(src string) ast.Expr {
+		e, err := parser.ParseExpr(src)
+		if err != nil || e == nil {
+			t.Fatalf("parse %q: %v", src, err)
+		}
+		return e
+	}
+	bind, err := NewScript().Let("x", parse("Cpus + 1")).Result(parse("x + x")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkReg("script: bind and read", bind.RegProgram())
+
+	branch, err := NewScript().
+		Let("x", parse("Cpus + 1")).
+		If(parse("Cpus > 2"), func(b *Script) { b.Let("y", parse("x")) }, func(b *Script) { b.Let("y", parse("0")) }).
+		Result(parse("y")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkReg("script: if/else", branch.RegProgram())
+
+	loop, err := NewScript().
+		Let("n", parse("0")).
+		While(parse("n < Cpus"), func(b *Script) { b.Let("n", parse("n + 1")) }).
+		Result(parse("n")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkReg("script: while", loop.RegProgram())
 }
 
 // TestOptimizeAgreesOnBranchingScripts extends the law to scripts with control flow, which the

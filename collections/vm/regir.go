@@ -573,7 +573,9 @@ func (l *lowerer) one(ip int) {
 		j := l.emit(RegInstr{Op: RJump, T: in.A})
 		l.jumps = append(l.jumps, j)
 	case OpFault:
-		l.emit(RegInstr{Op: RFault})
+		// The operand is the fault site, carried through so the runner can report WHICH construct
+		// faulted rather than only that one did.
+		l.emit(RegInstr{Op: RFault, Imm: in.A})
 	case OpJmp:
 		// Belongs to the innermost open conditional. Its value goes into that conditional's
 		// destination before the jump, and the jump lands just after the join's own move.
@@ -645,19 +647,39 @@ const DefaultStepBudget = 1 << 22
 func RunRegistersLimited(rp *RegProgram, scope *classad.ClassAd, budget int) (result classad.Value, ok bool) {
 	ev := classad.NewEvaluator(scope)
 	defer classad.RecoverCyclic(&result)
-	return execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
+	result, ok, _ = execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
+	return result, ok
+}
+
+// RunRegistersFault is RunRegistersLimited plus the fault report: which construct stopped the script
+// and why, or nil if none did.
+//
+// It is a separate entry point rather than a wider return on the existing ones because the report is
+// a diagnostic, and the two existing signatures are what every caller in the tree uses.
+func RunRegistersFault(rp *RegProgram, scope *classad.ClassAd, budget int) (result classad.Value, ok bool, fault *Fault) {
+	ev := classad.NewEvaluator(scope)
+	defer classad.RecoverCyclic(&result)
+	result, ok, site := execReg(rp, ev, make([]classad.Value, rp.nregs), budget)
+	if site >= 0 {
+		fault = rp.src.faultAt(site)
+	}
+	return result, ok, fault
 }
 
 // execReg runs rp against ev, using regs as the register file. regs must have at least rp.nregs
 // entries; the caller may retain its backing array to amortize allocation across evaluations.
-func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget int) (classad.Value, bool) {
+//
+// site is the fault site an RFault stopped at, or -1 if none did. It is returned rather than looked
+// up here because the lookup is a diagnostic the hot path should not pay for: a caller that does not
+// want a report ignores it.
+func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget int) (classad.Value, bool, int32) {
 	p := rp.src
 	code := rp.code
 	steps := 0
 	for ip := 0; ip < len(code); {
 		steps++
 		if steps > budget {
-			return classad.NewErrorValue(), false
+			return classad.NewErrorValue(), false, -1
 		}
 		in := code[ip]
 		switch in.Op {
@@ -719,7 +741,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 		case RFault:
 			// Ends the script. Returning here rather than jumping to an end label keeps the fault
 			// out of the register file: there is no result to have produced.
-			return classad.NewErrorValue(), true
+			return classad.NewErrorValue(), true, in.Imm
 		case RBranchCond:
 			t := rp.conds[in.Imm]
 			switch classad.ConditionState(regs[in.A]) {
@@ -759,7 +781,7 @@ func execReg(rp *RegProgram, ev *classad.Evaluator, regs []classad.Value, budget
 		}
 	}
 	if rp.res < 0 {
-		return classad.NewUndefinedValue(), true
+		return classad.NewUndefinedValue(), true, -1
 	}
-	return regs[rp.res], true
+	return regs[rp.res], true, -1
 }

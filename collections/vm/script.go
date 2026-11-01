@@ -135,7 +135,7 @@ func (s *Script) If(cond ast.Expr, then, els func(*Script)) *Script {
 	jElse := s.c.ins(OpJmpVoid, -1)
 
 	onFault := len(s.c.p.code)
-	s.c.ins(OpFault, 0)
+	s.c.ins(OpFault, s.c.p.addFaultSite(FaultCondition, "if"))
 
 	end := len(s.c.p.code)
 	// UNDEFINED and ERROR share the fault, because the script's answer is the same either way: it
@@ -184,7 +184,7 @@ func (s *Script) While(cond ast.Expr, body func(*Script)) *Script {
 	s.c.ins(OpJmpVoid, int32(header))
 
 	onFault := len(s.c.p.code)
-	s.c.ins(OpFault, 0)
+	s.c.ins(OpFault, s.c.p.addFaultSite(FaultCondition, "while"))
 
 	end := len(s.c.p.code)
 	s.c.p.conds[k] = condTargets{
@@ -261,6 +261,18 @@ func (sp *ScriptProgram) Run(scope *classad.ClassAd) classad.Value {
 // within it, which is a different report from a script that finished and computed ERROR.
 func (sp *ScriptProgram) RunLimited(scope *classad.ClassAd, budget int) (classad.Value, bool) {
 	return RunRegistersLimited(sp.rp, scope, budget)
+}
+
+// RunWithFault evaluates the script and reports the fault that stopped it, if one did.
+//
+// fault is nil when the script completed, whatever value it produced -- including ERROR, which an
+// expression can produce on purpose. That distinction is the reason this method exists: the value
+// alone cannot tell "the script decided the answer is ERROR" from "an if had no branch to take".
+//
+// ok=false means the instruction budget ran out, which is not a fault: the script did not finish, so
+// there is no site to blame. See RunRegistersLimited.
+func (sp *ScriptProgram) RunWithFault(scope *classad.ClassAd) (result classad.Value, ok bool, fault *Fault) {
+	return RunRegistersFault(sp.rp, scope, DefaultStepBudget)
 }
 
 // Program returns the underlying stack-form program.
