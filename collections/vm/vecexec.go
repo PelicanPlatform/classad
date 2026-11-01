@@ -356,6 +356,14 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			if !callFuncVec(ev, p.funcs[in.A], s) {
 				return nil, false
 			}
+		case OpStoreLocal:
+			if s.depth == 0 || !s.storeLocal(int(in.A)) {
+				return nil, false
+			}
+		case OpLoadLocal:
+			if !s.loadLocal(int(in.A)) {
+				return nil, false
+			}
 		case OpJmpIfNotUndef:
 			// The left operand stays on the stack as the blend's selector; the fallback is evaluated
 			// unconditionally and the join picks per record.
@@ -401,6 +409,12 @@ type VecScratch struct {
 
 	// blends are the branching constructs whose joins have not been reached, innermost last.
 	blends []blendPending
+
+	// locals are a script's bindings, one vector per local for the whole batch, and localsSet says
+	// which of them a store has reached. The vectors survive reset so a scan reuses them across
+	// blocks; the flags do not, because a binding is per batch.
+	locals    []*Vec
+	localsSet []bool
 }
 
 // blendPending is one branching construct whose paths are being evaluated, waiting for its join.
@@ -505,6 +519,92 @@ func (s *VecScratch) evaluator() *classad.Evaluator {
 func (s *VecScratch) reset(n int) {
 	s.depth, s.n = 0, n
 	s.blends = s.blends[:0]
+	for i := range s.localsSet {
+		s.localsSet[i] = false
+	}
+}
+
+// storeLocal binds the top of the stack to a local, the vector form of OpStoreLocal.
+//
+// A LOCAL IS A PLACE here exactly as it is in the register lowering: one vector per local for the
+// whole script, written by this and read by loadLocal. The binding's vector is TAKEN OUT of the
+// stack and a spare put back in its slot, rather than the local keeping a pointer into the stack:
+// the stack recycles by depth, so the next push would hand the binding's own vector to the next
+// value and overwrite it. That is the same hazard blendPending documents for a selector, and the
+// same answer.
+func (s *VecScratch) storeLocal(idx int) bool {
+	if idx < 0 {
+		return false
+	}
+	for len(s.locals) <= idx {
+		s.locals = append(s.locals, nil)
+		s.localsSet = append(s.localsSet, false)
+	}
+	v := s.pop()
+	// Widened here rather than carried: Raw aliases the block's own bytes, and a binding that outlives
+	// the expression that produced it is not a thing to leave pointing into storage. The widening is
+	// paid once per binding instead of once per read of it.
+	v.ensureInts()
+	spare := s.locals[idx]
+	if spare == nil {
+		spare = newVec(s.n)
+	}
+	s.stack[s.depth] = spare
+	s.locals[idx], s.localsSet[idx] = v, true
+	return true
+}
+
+// loadLocal pushes a COPY of a local's vector, the vector form of OpLoadLocal.
+//
+// A copy, not the vector itself, because the kernels are destructive in their left operand: `t + 1`
+// hands the pushed vector to binopVec, which writes the sum over it. Aliasing the binding would make
+// the first read of a local its last.
+//
+// A local no store has reached reads as UNDEFINED, which is what the register lowering's initializer
+// does for the same case.
+func (s *VecScratch) loadLocal(idx int) bool {
+	dst := s.push()
+	if idx < 0 || idx >= len(s.localsSet) || !s.localsSet[idx] {
+		fillState(dst, VsUndef)
+		return true
+	}
+	return copyVec(dst, s.locals[idx])
+}
+
+// copyVec copies src over dst, which must hold the same number of elements.
+//
+// It copies whichever form src is in rather than normalizing to one, because converting is what the
+// forms exist to avoid: a mask copies as two bitplanes, a Const as a single element, and only a data
+// vector is copied per record. The string payload is copied only when some element actually is a
+// plain string -- 16 bytes per record for a column that is all codes or all numbers is the kind of
+// work that makes a vector path slower than the row path it replaces.
+func copyVec(dst, src *Vec) bool {
+	if src == nil || dst == nil || src.n != dst.n {
+		return false
+	}
+	dst.Mask, dst.Const, dst.Dict, dst.Raw = src.Mask, src.Const, src.Dict, nil
+	if src.Raw != nil {
+		return false // the caller widens before binding; see storeLocal
+	}
+	if src.Mask {
+		copy(dst.Hi, src.Hi)
+		copy(dst.Lo, src.Lo)
+		return true
+	}
+	if src.Const {
+		// Element 0 stands for the whole batch, and the rest is garbage in both vectors.
+		dst.St[0], dst.I[0], dst.S[0] = src.St[0], src.I[0], src.S[0]
+		return true
+	}
+	copy(dst.St, src.St)
+	copy(dst.I, src.I)
+	for i := 0; i < src.n; i++ {
+		if src.St[i] == VsString {
+			copy(dst.S, src.S)
+			break
+		}
+	}
+	return true
 }
 
 func (s *VecScratch) push() *Vec {

@@ -275,6 +275,29 @@ func (sp *ScriptProgram) RunWithFault(scope *classad.ClassAd) (result classad.Va
 	return RunRegistersFault(sp.rp, scope, DefaultStepBudget)
 }
 
+// VecEval runs the script over a batch of n records, returning one result element per record.
+//
+// ok=false when the script uses something the vector executor does not implement, which today means
+// anything with control flow: a branch picks per record, and until the masked store is built the
+// executor has no way to run a statement for some records and not others. A script of bindings and a
+// result expression is exactly the part that needs none of that, and it is the part a constraint is
+// made of.
+//
+// A DECLINE IS NOT A WRONG ANSWER. The caller falls back to running the script per record, which is
+// the same arrangement the expression executor has had since it was written.
+func (sp *ScriptProgram) VecEval(src ColumnSource, n int, scratch *VecScratch) (*Vec, bool) {
+	if sp == nil || sp.p == nil {
+		return nil, false
+	}
+	if len(sp.p.nodes) != 0 {
+		return nil, false // a delegated subtree needs a real per-record scope
+	}
+	if scratch == nil {
+		scratch = &VecScratch{}
+	}
+	return execVec(sp.p, scratch.evaluator(), src, n, scratch)
+}
+
 // Program returns the underlying stack-form program.
 //
 // It is NOT runnable by the stack interpreter: a script's local loads are resolved by the register
