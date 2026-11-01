@@ -2,6 +2,8 @@ package wasmudf
 
 import (
 	"encoding/binary"
+	"fmt"
+	"sync"
 	"testing"
 )
 
@@ -571,5 +573,62 @@ func TestColumnarUnwrittenTailDoesNotLeakThePreviousBatch(t *testing.T) {
 		if out.I[i] != int64(i+1)*2 {
 			t.Errorf("element %d: %d, want %d", i, out.I[i], int64(i+1)*2)
 		}
+	}
+}
+
+// TestColumnarConcurrentBatches -- the uniformity scan, the exception mask and
+// the plan are all per-instance scratch, and instances are shared between
+// concurrent callers. Each goroutine sends a column with its own exceptions in
+// its own places, so a scan writing into another call's mask shows up as a record
+// escalated or not escalated in the wrong batch rather than as a crash.
+func TestColumnarConcurrentBatches(t *testing.T) {
+	const goroutines, each, n = 8, 40, 70
+	u := loadFixture(t, Options{MaxInstances: 3, MaxBatch: n}, "colvecsimd", 1, 1)
+
+	var wg sync.WaitGroup
+	bad := make(chan string, goroutines*each)
+	for g := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			in := intBatch(make([]int64, n)...)
+			for i := range n {
+				in.I[i] = int64(g*1_000_000 + i)
+			}
+			// A different record is UNDEFINED in each goroutine's column, so a
+			// mask leaking between calls lands on a record this one did not
+			// decline.
+			undef := g * 7
+			in.St[undef], in.I[undef] = vsUndef, 0
+			out := outBatch(n)
+			for range each {
+				if !u.CallBatch([]Batch{in}, out) {
+					bad <- "declined"
+					return
+				}
+				for i := range n {
+					if i == undef {
+						if out.St[i] != vsUndef {
+							bad <- fmt.Sprintf("g%d element %d: state %d, want UNDEFINED", g, i, out.St[i])
+							return
+						}
+						continue
+					}
+					if out.St[i] != vsInt || out.I[i] != in.I[i]*2 {
+						bad <- fmt.Sprintf("g%d element %d = (%d,%d), want %d",
+							g, i, out.St[i], out.I[i], in.I[i]*2)
+						return
+					}
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(bad)
+	for e := range bad {
+		t.Fatal(e)
+	}
+	if s := u.Stats(); s.Escalated != goroutines*each {
+		t.Errorf("Escalated = %d, want %d", s.Escalated, goroutines*each)
 	}
 }
