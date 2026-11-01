@@ -293,10 +293,11 @@ func TestGroupCountQueryDeclinesUnservable(t *testing.T) {
 	// this the test would pass on an implementation that claimed to serve everything.
 	//
 	// It used to use `size(Args) > 0`, which stopped declining when strict built-in calls became
-	// native (OpCallFunc) -- the third time this test has had an assertion expire that way. So the
-	// guard now uses a built-in that cannot ever be lowered rather than one that merely was not yet:
-	// ifThenElse is LAZY, and compiling it to an eager call would change which branch it evaluates.
-	if _, ok := c.GroupCountQuery(mustParseQuery(t, `ifThenElse(RequestMemory > 4096, 1, 0) == 1`), "ProcId"); ok {
+	// native, and then ifThenElse, which stopped declining when conditionals became a branch. That is
+	// four expired assertions in this one test, so the guard is now something that cannot be lowered
+	// for a STRUCTURAL reason rather than a current-implementation one: unparse() takes the SYNTAX of
+	// its argument, not its value, and no value-level instruction can carry an AST.
+	if _, ok := c.GroupCountQuery(mustParseQuery(t, `unparse(RequestMemory) == "RequestMemory"`), "ProcId"); ok {
 		t.Error("served a non-native query; nothing can evaluate that against columns")
 	}
 }

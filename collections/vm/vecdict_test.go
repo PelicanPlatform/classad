@@ -2,6 +2,7 @@ package vm
 
 import (
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -85,16 +86,20 @@ func newDictSource(recs []map[string]string, coded ...string) *dictSource {
 	names := map[string]bool{}
 	for i := range recs {
 		for k := range recs[i] {
-			names[k] = true
+			names[strings.ToLower(k)] = true
 		}
 	}
 	isCoded := map[string]bool{}
 	for _, name := range coded {
+		// Folded, like testSource.vals and like a real source's intern table.
+		name = strings.ToLower(name)
 		isCoded[name] = true
 		var vals []string
 		seen := map[string]bool{}
 		for i := range recs {
-			v, ok := s.vals[i][name]
+			// Through names: this loop iterates FOLDED names, while testSource.vals is keyed by the
+			// spelling the record used.
+			v, ok := s.vals[i][s.names[name]]
 			if !ok || v.Type() != classad.StringValue {
 				continue
 			}
@@ -113,7 +118,7 @@ func newDictSource(recs []map[string]string, coded ...string) *dictSource {
 		col.dict = d
 		scratch := &Vec{n: len(recs), I: col.i, S: col.s, St: col.st}
 		for i := range recs {
-			v, ok := s.vals[i][name]
+			v, ok := s.vals[i][s.names[name]]
 			switch {
 			case !ok:
 				col.st[i] = VsUndef
@@ -145,7 +150,7 @@ func (s *dictSource) LoadColumn(name string, scope ast.AttributeScope, dst *Vec)
 	if scope != ast.NoScope && scope != ast.MyScope {
 		return false
 	}
-	col, ok := s.cols[name]
+	col, ok := s.cols[strings.ToLower(name)]
 	if !ok {
 		for i := range s.recs {
 			dst.St[i] = VsUndef

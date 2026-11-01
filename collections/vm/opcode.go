@@ -48,6 +48,25 @@ const (
 	// and fall through to the compiled fallback expression.
 	OpJmpIfNotUndef
 
+	// OpJmp jumps unconditionally to A. Emitted only by a conditional, to leave a taken branch.
+	OpJmp
+
+	// OpBranchCond pops the condition and dispatches on classad.ConditionState using the target
+	// triple conds[A]: CondTrue falls through to the following instruction, and CondFalse, CondUndef
+	// and CondError jump to onFalse, onUndef and onError.
+	//
+	// This is what makes ifThenElse native. It cannot be a call, however strict-looking: it
+	// evaluates only the branch it selects, so an eager call would evaluate both -- and a branch is
+	// allowed to be a cyclic self-reference that must never be reached. A branch, not a call, is also
+	// why the UNDEFINED and ERROR cases get their own targets rather than a shared one: they produce
+	// a value without evaluating either branch, which only control flow can express.
+	//
+	// Note it does NOT lower the ternary `c ? t : f`, whose semantics differ in exactly one place: an
+	// UNDEFINED condition still evaluates BOTH branches (absorbing an error value but propagating a
+	// cyclic reference), which a jump-based lowering can only express by emitting both branches
+	// twice -- exponential in nesting depth. The ternary stays delegated.
+	OpBranchCond
+
 	// OpCallFunc calls funcs[A], a STRICT built-in: it pops the function's argc
 	// argument values (arg0 deepest), applies classad.ApplyFunction to them and
 	// pushes the result.

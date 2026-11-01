@@ -17,6 +17,19 @@ type funcInfo struct {
 	argc int
 }
 
+// condTargets is where OpBranchCond goes for each condition state other than true, which falls
+// through, plus the instruction the whole conditional converges on. All four are absolute
+// instruction indices.
+//
+// end is not needed to execute the stack form -- each branch jumps there and the interpreter just
+// follows -- but the VECTOR executor evaluates every branch and blends at the join, so it has to know
+// where the join is. Recording it here keeps that out of the emitter's layout: inferring it as
+// "one past the error push" would make the vector executor depend on how emitIfThenElse happens to
+// order its tail.
+type condTargets struct {
+	onFalse, onUndef, onError, end int32
+}
+
 // refInfo is a pooled attribute reference (name + scope) targeted by OpLoadRef.
 type refInfo struct {
 	name string
@@ -40,6 +53,7 @@ type Program struct {
 	refs   []refInfo       // OpLoadRef
 	nodes  []ast.Expr      // OpEvalNode (delegated subtrees)
 	funcs  []funcInfo      // OpCallFunc
+	conds  []condTargets   // OpBranchCond
 
 	// members are the constant lists of member/identicalMember calls (OpMember).
 	members []*memberSet

@@ -155,3 +155,48 @@ func TestStrictFunctionRejects(t *testing.T) {
 		}
 	}
 }
+
+// TestConditionState pins the coercion a conditional applies to its condition, which is the table
+// OpBranchCond branches on. It is not obvious from the outside: a nonzero INTEGER or REAL is true, so
+// `1 ? a : b` selects a, while a string or a list is neither true nor false but an ERROR.
+//
+// Checked against evaluating a real ifThenElse as well as against ConditionState directly, so the
+// classification and the construct that depends on it cannot drift apart.
+func TestConditionState(t *testing.T) {
+	for _, tc := range []struct {
+		src   string
+		state CondState
+		ite   string // what ifThenElse(<src>, "T", "F") evaluates to
+	}{
+		{`true`, CondTrue, `"T"`},
+		{`false`, CondFalse, `"F"`},
+		{`1`, CondTrue, `"T"`},
+		{`-1`, CondTrue, `"T"`},
+		{`0`, CondFalse, `"F"`},
+		{`2.5`, CondTrue, `"T"`},
+		{`0.0`, CondFalse, `"F"`},
+		{`-0.0`, CondFalse, `"F"`},
+		{`undefined`, CondUndef, `undefined`},
+		{`error`, CondError, `error`},
+		{`"yes"`, CondError, `error`}, // a non-empty string is NOT true
+		{`""`, CondError, `error`},
+		{`{1, 2}`, CondError, `error`},
+		{`[a = 1]`, CondError, `error`},
+	} {
+		expr, err := ParseExpr(tc.src)
+		if err != nil {
+			t.Fatalf("parse %s: %v", tc.src, err)
+		}
+		if got := ConditionState(expr.Eval(nil)); got != tc.state {
+			t.Errorf("ConditionState(%s) = %v, want %v", tc.src, got, tc.state)
+		}
+		// The construct that consumes it must agree.
+		ite, err := ParseExpr(`ifThenElse(` + tc.src + `, "T", "F")`)
+		if err != nil {
+			t.Fatalf("parse ifThenElse(%s): %v", tc.src, err)
+		}
+		if got := ite.Eval(nil).String(); got != tc.ite {
+			t.Errorf("ifThenElse(%s, \"T\", \"F\") = %s, want %s", tc.src, got, tc.ite)
+		}
+	}
+}
