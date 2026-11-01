@@ -454,7 +454,21 @@ func (s *VecScratch) blend(b blendPending) bool {
 	sel := s.stack[b.base]
 	paths := s.stack[b.base+1 : b.base+1+nPaths]
 	dst := s.push()
-	dst.Dict, dst.Const, dst.Mask = nil, false, false
+	dst.Const, dst.Mask = false, false
+	// A DICTIONARY CODE MEANS NOTHING WITHOUT THE DICTIONARY THAT ASSIGNED IT, and a blend has one
+	// result vector and several sources, each of which may have its own. So the result adopts ONE
+	// source's dictionary and copies that source's codes straight through -- which is the whole point
+	// of coding the column -- while a code from any other source is resolved to its string as it is
+	// copied. Which source is adopted is a performance choice and not a correctness one: the
+	// per-element check below is what makes the result well formed whichever it is.
+	//
+	// Dropping the resolver and copying the code anyway is what this used to do, and it is not a
+	// decline: valueData reads a code with no dictionary as ERROR, so `Owner ?: "nobody"` over a
+	// dictionary-encoded column answered ERROR for every record and a count built on it was wrong.
+	carried := blendDictSource(sel, paths, b.cond)
+	if carried != nil {
+		dst.Dict = carried.Dict
+	}
 	for i := 0; i < dst.n; i++ {
 		var from *Vec
 		if b.cond {
@@ -477,12 +491,43 @@ func (s *VecScratch) blend(b blendPending) bool {
 		if !dst.CopyElem(i, from, i) {
 			return false
 		}
+		if dst.St[i] == VsDictCode && from != carried {
+			// This source's codes are not the ones dst carries, so the code is resolved here. An
+			// unresolvable code boxes as ERROR, which is what the element would have meant anyway.
+			if !dst.setValueData(i, from.valueData(i)) {
+				return false
+			}
+		}
 	}
 	// Move the result into the selector's slot and drop the paths, swapping pointers so every vector
 	// stays in the pool (see callFuncVec).
 	s.stack[b.base], s.stack[s.depth-1] = s.stack[s.depth-1], s.stack[b.base]
 	s.depth = b.base + 1
 	return true
+}
+
+// blendDictSource returns the first source carrying a dictionary, whose codes the blended result will
+// then hold directly. nil when no source has one.
+//
+// It does not try to find the BEST source, and deliberately does not ask whether two sources share a
+// dictionary. The caller resolves every code that did not come from this source, so the result is well
+// formed for any choice; and comparing two DictResolver interface values would PANIC if their shared
+// dynamic type were ever non-comparable, which is a poor thing to risk for a choice that cannot be
+// wrong. The cost is that two sources holding the same dictionary resolve one of them -- slower, never
+// incorrect.
+//
+// For a conditional the selector is the condition and never a source of the result, so it is not
+// considered. For an Elvis it IS one: the left operand is the value taken wherever it is defined.
+func blendDictSource(sel *Vec, paths []*Vec, cond bool) *Vec {
+	if !cond && sel != nil && sel.Dict != nil {
+		return sel
+	}
+	for _, p := range paths {
+		if p != nil && p.Dict != nil {
+			return p
+		}
+	}
+	return nil
 }
 
 // args returns argbuf sized to exactly argc elements.
