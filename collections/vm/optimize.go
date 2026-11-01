@@ -83,11 +83,18 @@ func regUses(rp *RegProgram, in RegInstr, buf []int32) []int32 {
 
 // regDef returns the register instruction in writes, and whether it writes one.
 //
-// A branch writes its destination only on the path it takes, which is still a definition: the
-// register's value after the instruction depends on it.
+// RShortAnd, RShortOr and RJmpIfDefined write their destination only on the path they take, which is
+// still a definition: the register's value after the instruction depends on it.
+//
+// THE CONTROL-FLOW OPCODES WRITE NOTHING, and saying otherwise was a real bug. RJump, RFault and
+// RBranchCond carry no destination, so their Dst field holds whatever the zero value or the lowerer
+// left there -- usually 0. Reporting that as a definition made register 0 look multiply-defined in
+// every script containing a branch, and register 0 is the first local, so copy propagation silently
+// refused to touch it. It cost optimization and not correctness: deadCode keeps every instruction
+// `removable` declines, which includes all three, so none of them was ever at risk of being removed.
 func regDef(in RegInstr) (int32, bool) {
 	switch in.Op {
-	case RNop:
+	case RNop, RJump, RFault, RBranchCond:
 		return 0, false
 	default:
 		return in.Dst, true
@@ -105,36 +112,6 @@ func defCounts(rp *RegProgram) []int {
 	return n
 }
 
-// jumpTargets returns, for each instruction index, whether control can arrive there from a jump.
-func jumpTargets(rp *RegProgram) []bool {
-	t := make([]bool, len(rp.code)+1)
-	for _, in := range rp.code {
-		switch in.Op {
-		case RShortAnd, RShortOr, RJmpIfDefined, RJump:
-			if in.T >= 0 && int(in.T) < len(t) {
-				t[in.T] = true
-			}
-		case RBranchCond:
-			// Three targets, all of them places control can arrive from elsewhere.
-			for _, tgt := range []int32{rp.conds[in.Imm].onFalse, rp.conds[in.Imm].onUndef, rp.conds[in.Imm].onError} {
-				if tgt >= 0 && int(tgt) < len(t) {
-					t[tgt] = true
-				}
-			}
-		}
-	}
-	return t
-}
-
-// isBranch reports whether an instruction can transfer control other than to the next instruction.
-func isBranch(in RegInstr) bool {
-	switch in.Op {
-	case RShortAnd, RShortOr, RJmpIfDefined, RJump, RBranchCond, RFault:
-		return true
-	}
-	return false
-}
-
 // copyProp replaces reads of a copied register with the copy's source and turns the copy into a nop.
 //
 // The copies worth removing are not incidental. A script's every read of a local lowers to one
@@ -145,10 +122,11 @@ func isBranch(in RegInstr) bool {
 //
 //   - The copy's destination and its source must each be defined EXACTLY ONCE. A join destination is
 //     written by several instructions, so substituting it would take the value of whichever path the
-//     pass happened to look at.
-//   - Every read of the destination must be reachable from the copy in STRAIGHT-LINE code: no branch
-//     between them, and nothing that a jump can land on. Otherwise control can reach the read without
-//     passing the copy, and the source may hold something else -- or nothing -- there.
+//     pass happened to look at. Single definition of the SOURCE is what makes the substituted value
+//     the same value everywhere, and single definition of the DESTINATION is what makes removing the
+//     copy safe.
+//   - The copy must DOMINATE every read of its destination: every path to the read has to pass
+//     through the copy, or the read could see a register the copy never wrote.
 //   - The destination must not be the program's result, which is read after the last instruction and
 //     so has a use the instruction stream does not show.
 //
@@ -156,18 +134,22 @@ func isBranch(in RegInstr) bool {
 // only go when nothing reads its destination any more. So a copy that fails any condition is left
 // entirely alone.
 //
-// THE FIRST TWO OVERLAP TODAY, and it is worth knowing which is load-bearing. For the shapes the
-// compiler currently emits, a join destination's reads always sit at or beyond a jump target -- the
-// branch lands just after the join's move -- so the straight-line condition already refuses every
-// join, and the definition count already refuses it too. Dropping either one alone changes nothing
-// observable; dropping BOTH breaks a script whose local is bound to an Elvis, which is what the
-// script corpus catches. Both are kept because the overlap is a property of today's lowering rather
-// than an invariant, and a future shape that separates them should not also have to rediscover why
-// the condition was needed.
+// THE SECOND CONDITION USED TO BE A STRAIGHT-LINE TEST -- no branch between the copy and the read,
+// and nothing a jump could land on -- which is sound but much weaker: a script that binds a local,
+// branches, and then reads the local got no propagation at all, and that is the ordinary shape of a
+// script rather than an edge case. Dominance is the exact question, and it also subsumes the old
+// test's accidental protection of join destinations, which the definition count now carries alone.
+//
+// WHY SUBSTITUTING ACROSS A BRANCH IS SOUND, since this is the step that looks unsafe. If the source
+// has exactly one definition and the copy reads it, that definition must dominate the copy -- any
+// path reaching the copy without it would read a register nothing wrote, which the lowering does not
+// emit. Dominance is transitive, so the source's definition also dominates every read of the
+// destination, and the value substituted at the read is the one the copy would have carried there.
 func copyProp(rp *RegProgram) {
 	defs := defCounts(rp)
-	targets := jumpTargets(rp)
+	c := regCFG(rp)
 	var buf []int32
+	var reads []int
 
 	for i, in := range rp.code {
 		if in.Op != RMove {
@@ -180,36 +162,29 @@ func copyProp(rp *RegProgram) {
 		if d == rp.res {
 			continue
 		}
-		// The straight-line region following the copy: it ends at the first instruction a jump can
-		// land on, or just after the first branch.
-		end := len(rp.code)
-		for j := i + 1; j < len(rp.code); j++ {
-			if targets[j] {
-				end = j
-				break
+		// Every reachable read of d must be dominated by the copy.
+		reads := reads[:0]
+		ok := true
+		for j := 0; j < len(rp.code) && ok; j++ {
+			if j == i || !c.reach[j] {
+				continue
 			}
-			if isBranch(rp.code[j]) {
-				end = j + 1
-				break
-			}
-		}
-		// Every read of d has to fall inside it. A read at or past the end is one control could
-		// reach without passing the copy.
-		escapes := false
-		for j := end; j < len(rp.code) && !escapes; j++ {
 			buf = regUses(rp, rp.code[j], buf)
 			for _, u := range buf {
-				if u == d {
-					escapes = true
+				if u != d {
+					continue
+				}
+				if !c.dominates(i, j) {
+					ok = false
 					break
 				}
+				reads = append(reads, j)
 			}
 		}
-		if escapes {
+		if !ok {
 			continue
 		}
-		// Substitute, then drop the copy.
-		for j := i + 1; j < end; j++ {
+		for _, j := range reads {
 			substitute(rp, j, d, s)
 		}
 		rp.code[i] = RegInstr{Op: RNop}
