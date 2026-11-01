@@ -1,6 +1,7 @@
 package classad
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -166,6 +167,43 @@ func TestUDFPanicIsContained(t *testing.T) {
 	// Through the compiled path as well.
 	if got := ApplyFunction(NewEvaluator(nil), "udfExplode", nil).String(); got != "error" {
 		t.Errorf("ApplyFunction on a panicking UDF produced %s, want error", got)
+	}
+}
+
+// TestRegisterFunctionErrorsAreDistinguishable pins the sentinels. A loader registering a batch of
+// functions acts differently on each: colliding with a built-in is a mistake in what it was asked to
+// load, already-registered is usually a double-load it can ignore, and a malformed name or arity is a
+// bug in whatever produced them. Matching on the message text instead is not an interface.
+func TestRegisterFunctionErrorsAreDistinguishable(t *testing.T) {
+	ok := func(args []Value) Value { return NewUndefinedValue() }
+	mustRegister(t, "udfSentinelTaken", 0, 0, ok)
+	for _, tc := range []struct {
+		name    string
+		minArgs int
+		maxArgs int
+		fn      Func
+		want    error
+	}{
+		{"strcat", 0, 1, ok, ErrBuiltinName},
+		{"SUBSTR", 1, 1, ok, ErrBuiltinName},
+		{"udfSentinelTaken", 0, 0, ok, ErrFunctionExists},
+		{"UDFSENTINELTAKEN", 0, 0, ok, ErrFunctionExists},
+		{"udfSentinelNil", 0, 0, nil, ErrBadFunction},
+		{"9bad", 0, 0, ok, ErrBadFunction},
+		{"udfSentinelArity", 3, 1, ok, ErrBadFunction},
+	} {
+		err := RegisterFunction(tc.name, tc.minArgs, tc.maxArgs, tc.fn)
+		if !errors.Is(err, tc.want) {
+			t.Errorf("RegisterFunction(%q): err = %v, want errors.Is(..., %v)", tc.name, err, tc.want)
+		}
+		// The message still names the function, so a log line is useful on its own.
+		if err != nil && !strings.Contains(err.Error(), tc.name) {
+			t.Errorf("RegisterFunction(%q): message %q does not name the function", tc.name, err)
+		}
+	}
+	// The three are distinct, so a caller can switch on them.
+	if errors.Is(ErrBuiltinName, ErrFunctionExists) || errors.Is(ErrFunctionExists, ErrBadFunction) {
+		t.Error("the sentinels are not distinct")
 	}
 }
 
