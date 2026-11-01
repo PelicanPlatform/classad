@@ -45,7 +45,11 @@ type queryPlan struct {
 
 // newQueryPlan builds the scan plan for q: the reusable match state, the projection
 // the consumer will keep (nil for none), the stats sink (nil for none), and the
-// query's probes.
+// query's probes. redact is the reader's entitlement: a redacted plan evaluates
+// with no key (see evalCtx), so a sealed value matches as undefined. It is a
+// parameter rather than a default because every caller has to say which reader it
+// serves -- a plan that quietly evaluated with the key would answer questions about
+// values its reader is not allowed to see.
 //
 // It is the only constructor of a plan that carries a query. Every filtered scan
 // path goes through it, so none can be written that evaluates q but skips index
@@ -56,9 +60,9 @@ type queryPlan struct {
 // deliberate: planQuery is skipped by the paths that do not plan an index (the
 // chained scan, the disjunctive index path, the point-in-time scan), and those scans
 // read the constraint's attributes out of every record just the same.
-func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats) queryPlan {
+func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats, redact bool) queryPlan {
 	plan := q.ReadPlan()
-	ws := &wireScope{ctx: c}
+	ws := &wireScope{ctx: c.evalCtx(redact)}
 	// Read demand for the attributes the constraint evaluates -- once per scan, never
 	// per record. Only the FILTER half: a path with a projection records that itself,
 	// because not every path has one and "no projection" means the whole ad, which is
@@ -110,7 +114,7 @@ func constTrue(qp *queryPlan) bool {
 // The stats sink is dropped: ScanStats is not safe for concurrent accumulation, and
 // a worker that inherited one would corrupt an EXPLAIN ANALYZE rather than fail.
 func (c *Collection) workerPlan(qp queryPlan) queryPlan {
-	ws := &wireScope{ctx: c}
+	ws := &wireScope{ctx: qp.ws.ctx} // the plan's entitlement, not the collection's key
 	qp.m = qp.q.Matcher()
 	qp.ws = ws
 	qp.resolver = ws.resolve

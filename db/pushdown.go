@@ -101,11 +101,23 @@ func (db *DB) withWriteRetry(stage func(*Txn)) error {
 var deleteWhereAfterScanHook func()
 
 func (db *DB) DeleteWhere(constraint string) (int, error) {
+	return db.deleteWhereAs(constraint, false)
+}
+
+// DeleteWhereRedacted is DeleteWhere for a caller NOT entitled to sealed values: the constraint is
+// matched -- at the scan and again in the deleting transaction -- against ads decoded with no key, so a
+// sealed value is undefined to it. How many rows a constraint deletes is an answer about every value it
+// read, and a write session that may not see a value must not be able to delete by it either.
+func (db *DB) DeleteWhereRedacted(constraint string) (int, error) {
+	return db.deleteWhereAs(constraint, true)
+}
+
+func (db *DB) deleteWhereAs(constraint string, redact bool) (int, error) {
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return 0, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
-	pending := db.matchingKeysAll(q) // one scan: the rows matching at statement start
+	pending := db.matchingKeysAll(q, redact) // one scan: the rows matching at statement start
 	if deleteWhereAfterScanHook != nil {
 		deleteWhereAfterScanHook()
 	}
@@ -114,7 +126,7 @@ func (db *DB) DeleteWhere(constraint string) (int, error) {
 		var conflicted []string
 		for i := 0; i < len(pending); i += deleteBatch {
 			end := min(i+deleteBatch, len(pending))
-			deleted, conf, derr := db.deleteMatching(q, pending[i:end])
+			deleted, conf, derr := db.deleteMatching(q, pending[i:end], redact)
 			if derr != nil {
 				return total, derr
 			}
@@ -135,12 +147,22 @@ func (db *DB) DeleteWhere(constraint string) (int, error) {
 // parsed eagerly (a parse error returns before any scan); the scan is lazy and stops early if the
 // caller's yield returns false. It matches against decoded ads (a full scan, like DeleteWhere).
 func (db *DB) KeysWhere(constraint string) (iter.Seq[string], error) {
+	return db.keysWhereAs(constraint, false)
+}
+
+// KeysWhereRedacted is KeysWhere for a caller NOT entitled to sealed values: each ad is matched as
+// decoded with no key, so which keys come back says nothing about a sealed value.
+func (db *DB) KeysWhereRedacted(constraint string) (iter.Seq[string], error) {
+	return db.keysWhereAs(constraint, true)
+}
+
+func (db *DB) keysWhereAs(constraint string, redact bool) (iter.Seq[string], error) {
 	q, err := vm.Parse(constraint)
 	if err != nil {
 		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
 	}
 	return gated(db, func(yield func(string) bool) {
-		db.c.ForEachAd(func(key string, ad *classad.ClassAd) bool {
+		db.forEachAdAs(redact, func(key string, ad *classad.ClassAd) bool {
 			if q.Matches(ad) {
 				return yield(key)
 			}
@@ -152,9 +174,9 @@ func (db *DB) KeysWhere(constraint string) (iter.Seq[string], error) {
 // matchingKeysAll collects every key whose ad matches q at the time of the scan. Unbounded
 // by design: DeleteWhere snapshots the whole match set once (keys are small strings), rather
 // than re-scanning per round, so the sweep cannot chase matches that appear after it starts.
-func (db *DB) matchingKeysAll(q *vm.Query) []string {
+func (db *DB) matchingKeysAll(q *vm.Query, redact bool) []string {
 	var keys []string
-	db.c.ForEachAd(func(key string, ad *classad.ClassAd) bool {
+	db.forEachAdAs(redact, func(key string, ad *classad.ClassAd) bool {
 		if q.Matches(ad) {
 			keys = append(keys, key)
 		}
@@ -169,8 +191,11 @@ func (db *DB) matchingKeysAll(q *vm.Query) []string {
 // snapshot; the optimistic commit spares one refreshed after it (its key
 // conflicts and is reported, not removed). Returns the number actually removed and
 // the keys that conflicted (concurrently rewritten) so the caller can retry just those.
-func (db *DB) deleteMatching(q *vm.Query, keys []string) (int, []string, error) {
+func (db *DB) deleteMatching(q *vm.Query, keys []string, redact bool) (int, []string, error) {
 	t := db.Begin()
+	if redact {
+		t = db.BeginRedacted() // the re-check reads as the scan did
+	}
 	staged := 0
 	for _, k := range keys {
 		ad, ok := t.LookupClassAd(k)
@@ -197,4 +222,14 @@ func (db *DB) deleteMatching(q *vm.Query, keys []string) (int, []string, error) 
 		return staged - len(ce.Keys), ce.Keys, nil
 	}
 	return 0, nil, err
+}
+
+// forEachAdAs is ForEach over every stored ad, decoded with no key when redact is set (see
+// collections.Collection.ForEachAdRedacted).
+func (db *DB) forEachAdAs(redact bool, fn func(key string, ad *classad.ClassAd) bool) {
+	if redact {
+		db.c.ForEachAdRedacted(fn)
+		return
+	}
+	db.c.ForEachAd(fn)
 }

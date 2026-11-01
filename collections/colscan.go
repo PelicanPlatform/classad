@@ -816,6 +816,16 @@ func (c *Collection) CountConstraint(constraint string) (int, bool) {
 	return c.CountQuery(q)
 }
 
+// CountConstraintRedacted is CountConstraint for a reader NOT entitled to sealed values (see
+// CountQueryRedacted).
+func (c *Collection) CountConstraintRedacted(constraint string) (int, bool) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return 0, false
+	}
+	return c.CountQueryRedacted(q)
+}
+
 // CountQuery counts the records matching q using the columnar scan, when q is exactly (Native)
 // one or more numeric comparisons on a single INT schema field -- the common count-where. It
 // returns (count, true) on that fast path, or (0, false) to signal the caller to use the normal
@@ -824,6 +834,18 @@ func (c *Collection) CountConstraint(constraint string) (int, bool) {
 // escaped out of the hot column is read from the cold tail, and Native() rules out any residual
 // program the columnar path would miss.
 func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
+	return c.countQueryAs(q, false)
+}
+
+// CountQueryRedacted is CountQuery for a reader NOT entitled to sealed values: a sealed value counts as
+// undefined. The column tiers need nothing for it -- a sealed value is never a column, and every one of
+// them declines a cell it cannot read as a literal -- so only the per-record fallback the vectorized
+// tier hands such a cell to is keyless.
+func (c *Collection) CountQueryRedacted(q *vm.Query) (int, bool) {
+	return c.countQueryAs(q, true)
+}
+
+func (c *Collection) countQueryAs(q *vm.Query, redact bool) (int, bool) {
 	st := c.schemaScan.Load()
 	if st == nil {
 		return 0, false
@@ -852,7 +874,7 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 		}
 		// Some value is an expression, which the column scan cannot compare. The vectorized tier
 		// evaluates exactly those records one at a time, so it still answers from the columns.
-		return c.vectorCountUnlessIndexed(q)
+		return c.vectorCountUnlessIndexed(q, redact)
 	}
 	fieldID, eval, ok := c.numPredOnField(q, st.schema)
 	if !ok {
@@ -875,7 +897,7 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 		// so against a selective indexed constraint the scan wins, and a routing that ignored that was
 		// measured 2.9x slower on exactly such a query.
 		// Skipped only when an index could prune the row path instead.
-		return c.vectorCountUnlessIndexed(q)
+		return c.vectorCountUnlessIndexed(q, redact)
 	}
 	// As NumStatsQuery: record the predicate's attribute so the hot tier keeps tracking the
 	// columns queries actually read, instead of freezing once the accelerator starts serving them.
@@ -885,14 +907,14 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 	if n, ok := c.schemaScanCount(fieldID, st.cache, eval); ok {
 		return n, true
 	}
-	return c.vectorCountUnlessIndexed(q) // an expression among the values; see above
+	return c.vectorCountUnlessIndexed(q, redact) // an expression among the values; see above
 }
 
 // vectorCountUnlessIndexed is CountQuery's last tier: VectorEvalCount, unless an index could prune the
 // row path instead (see CountQuery for why that routing matters).
-func (c *Collection) vectorCountUnlessIndexed(q *vm.Query) (int, bool) {
+func (c *Collection) vectorCountUnlessIndexed(q *vm.Query, redact bool) (int, bool) {
 	if !c.indexCanPrune(q) {
-		return c.VectorEvalCount(q)
+		return c.vectorEvalCountAs(q, redact)
 	}
 	return 0, false
 }

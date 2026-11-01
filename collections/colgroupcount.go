@@ -185,7 +185,7 @@ func (c *Collection) GroupStatsQueryBucketed(q *vm.Query, groupAttr string, buck
 // truncating past it would merge groups that differ only in a dropped component, so the query goes
 // back to the scan instead.
 func (c *Collection) GroupStatsQueryCols(q *vm.Query, groups []GroupSpec, aggAttrs []string) ([]GroupStats, bool) {
-	return c.groupStatsQuery(q, groups, aggAttrs, nil, nil)
+	return c.groupStatsQuery(q, groups, aggAttrs, nil, nil, false)
 }
 
 // GroupAggCol is one aggregate column of a grouped columnar query: the numeric attribute it reads
@@ -220,7 +220,24 @@ func (c *Collection) GroupStatsConstraintAggs(constraint string, groups []GroupS
 		return nil, false
 	}
 	attrs, filters := splitAggCols(aggCols)
-	return c.groupStatsQuery(q, groups, attrs, filters, countFilters)
+	return c.groupStatsQuery(q, groups, attrs, filters, countFilters, false)
+}
+
+// GroupStatsConstraintAggsRedacted is GroupStatsConstraintAggs for a reader NOT entitled to sealed
+// values: a record whose constraint the columns cannot decide is matched with no key, so a sealed
+// value is undefined to it. Group and aggregate values need nothing: a sealed one is never a column
+// and a cell holding one declines the whole query, which then goes back to the (keyless) scan.
+//
+// The match-all form, GroupStatsAllAggs, serves both readers as it is: it evaluates no constraint and
+// reads nothing but columns.
+func (c *Collection) GroupStatsConstraintAggsRedacted(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string) ([]GroupStats, bool) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, false
+	}
+	attrs, filters := splitAggCols(aggCols)
+	return c.groupStatsQuery(q, groups, attrs, filters, countFilters, true)
 }
 
 // GroupStatsAllAggs is GroupStatsConstraintAggs over every record, for a constraint the caller has
@@ -246,7 +263,7 @@ func splitAggCols(aggCols []GroupAggCol) ([]string, []string) {
 }
 
 func (c *Collection) groupStatsQuery(q *vm.Query, groups []GroupSpec, aggAttrs, colFilters,
-	countFilters []string) ([]GroupStats, bool) {
+	countFilters []string, redact bool) ([]GroupStats, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil {
 		return nil, false
@@ -277,7 +294,7 @@ func (c *Collection) groupStatsQuery(q *vm.Query, groups []GroupSpec, aggAttrs, 
 	if c.indexCanPrune(q) {
 		return nil, false
 	}
-	acc, ok := c.vecGroupStats(q, groupIDs, aggIDs, buckets, gf, st)
+	acc, ok := c.vecGroupStats(q, groupIDs, aggIDs, buckets, gf, st, redact)
 	if !ok {
 		return nil, false
 	}

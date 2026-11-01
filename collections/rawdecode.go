@@ -44,7 +44,7 @@ func (c *Collection) QueryRawRedacted(q *vm.Query) iter.Seq[RawAd] {
 
 func (c *Collection) queryRaw(q *vm.Query, redact bool) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
-		c.scanQuery(c.newQueryPlan(q, nil, nil), c.yieldRaw(yield, redact))
+		c.scanQuery(c.newQueryPlan(q, nil, nil, redact), c.yieldRaw(yield, redact))
 	}
 }
 

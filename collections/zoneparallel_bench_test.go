@@ -91,7 +91,7 @@ func BenchmarkZoneParallelQuery(b *testing.B) {
 		}
 		b.Run(arm.name, func(b *testing.B) {
 			var st ScanStats
-			c.runParallelQuery(c.newQueryPlan(q, nil, &st), func(*classad.ClassAd) bool { return true }, false)
+			c.runParallelQuery(c.newQueryPlan(q, nil, &st, false), func(*classad.ClassAd) bool { return true }, false)
 			b.ReportAllocs()
 			b.ResetTimer()
 			rows := 0

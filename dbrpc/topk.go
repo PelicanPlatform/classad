@@ -117,8 +117,10 @@ func (s *Server) streamTopKOpt(ctx context.Context, reqID uint64, r *reader, inc
 		return
 	}
 	// Same private-attribute protection as the projection ops: no private ref in the constraint,
-	// and -- unprivileged -- no private attribute projected or used as the order key (TopK's
-	// underlying QueryProject does not redact, so the gate is here).
+	// and -- unprivileged -- no private attribute projected or used as the order key. Beyond the
+	// names, an unprivileged session runs the keyless top-K: a sealed value is undefined to the
+	// constraint, the order and the projection alike, so it neither comes back nor decides which
+	// rows do.
 	if refusePrivateConstraint(reqID, constraint, includePrivate, write) {
 		return
 	}
@@ -134,19 +136,20 @@ func (s *Server) streamTopKOpt(ctx context.Context, reqID uint64, r *reader, inc
 	case kindTable, kindView:
 		// A continuous aggregate that has sealed holds its rows in two places, and the k
 		// best of the union are not the k best of the backing. Ask the view, which merges
-		// each half's own top-K; only a view with nothing sealed is its backing alone.
+		// each half's own top-K; only a view with nothing sealed is its backing alone. A
+		// view is built with no key for every reader, so it serves both alike; a table
+		// runs the keyless top-K for an unprivileged session.
+		topK, topKStats := ref.db.TopK, ref.db.TopKStats
+		if !includePrivate {
+			topK, topKStats = ref.db.TopKRedacted, ref.db.TopKStatsRedacted
+		}
 		if ref.seals() && ref.view != nil {
-			if useStats {
-				rows, stats, err = ref.view.TopKStats(constraint, attrs, orderAttr, desc, k)
-			} else {
-				rows, err = ref.view.TopK(constraint, attrs, orderAttr, desc, k)
-			}
-			break
+			topK, topKStats = ref.view.TopK, ref.view.TopKStats
 		}
 		if useStats {
-			rows, stats, err = ref.db.TopKStats(constraint, attrs, orderAttr, desc, k)
+			rows, stats, err = topKStats(constraint, attrs, orderAttr, desc, k)
 		} else {
-			rows, err = ref.db.TopK(constraint, attrs, orderAttr, desc, k)
+			rows, err = topK(constraint, attrs, orderAttr, desc, k)
 		}
 	case kindArchive:
 		if useStats {

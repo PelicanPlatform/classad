@@ -38,6 +38,9 @@ type jobPlan struct {
 	vals        *jobScope // the job's attribute values and which depend on the slot
 	deps        []depAttr // target-dependent job attributes and the slot attributes they read
 	order       []int     // short-circuit order of the Requirements' top-level conjuncts, or nil
+	// redact is the reader's entitlement: a redacted match reads every slot with no key (see
+	// newMatchWorker), so a sealed slot value is undefined to both Requirements and the Rank.
+	redact bool
 }
 
 // jobRankExpr returns the job's Rank expression, or nil if absent.
@@ -115,10 +118,10 @@ func (c *Collection) appendSurvivor(mw *matchWorker, w []byte, rank float64, has
 	if mw.deferMat {
 		wc := make([]byte, len(w))
 		copy(wc, w)
-		*out = append(*out, rankedMatch{wire: wc, rank: rank, hasRank: hasRank})
+		*out = append(*out, rankedMatch{wire: wc, ctx: mw.ctx, rank: rank, hasRank: hasRank})
 		return
 	}
-	node, err := c.decodeWire(w)
+	node, err := mw.ctx.decodeWire(w)
 	if err != nil {
 		return
 	}
@@ -132,7 +135,11 @@ func (c *Collection) materialize(rm *rankedMatch) *classad.ClassAd {
 	if rm.ad != nil {
 		return rm.ad
 	}
-	node, err := c.decodeWire(rm.wire)
+	ctx := rm.ctx
+	if ctx == nil {
+		ctx = c
+	}
+	node, err := ctx.decodeWire(rm.wire)
 	if err != nil {
 		return nil
 	}

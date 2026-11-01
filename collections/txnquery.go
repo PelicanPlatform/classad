@@ -53,7 +53,9 @@ func (tx *Txn) KeysWhere(q *vm.Query) iter.Seq[string] {
 // caller stopped early.
 func (tx *Txn) scanCommitted(q *vm.Query, visit func(key string, ad *classad.ClassAd) bool) bool {
 	ok := true
-	tx.c.ForEachAdAt(tx.snapOf, func(key string, ad *classad.ClassAd) bool {
+	// In the transaction's entitlement, as every read through it is: a redacted transaction matches q
+	// with no key, so its scan cannot answer a question about a value its point reads do not return.
+	tx.c.forEachAdAtAs(tx.snapOf, func(key string, ad *classad.ClassAd) bool {
 		if _, superseded := tx.writes[key]; superseded {
 			return true
 		}
@@ -62,7 +64,7 @@ func (tx *Txn) scanCommitted(q *vm.Query, visit func(key string, ad *classad.Cla
 		}
 		ok = visit(key, ad)
 		return ok
-	})
+	}, tx.redact)
 	return ok
 }
 

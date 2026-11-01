@@ -41,7 +41,7 @@ func refQueryRawFromSeqYield(c *Collection, q *vm.Query, projection []string, af
 	page := SeqPage{Next: after}
 	var qp queryPlan
 	if q != nil {
-		qp = c.newQueryPlan(q, nil, nil)
+		qp = c.newQueryPlan(q, nil, nil, false)
 	} else {
 		s := &wireScope{ctx: c}
 		qp.ws, qp.resolver = s, s.resolve

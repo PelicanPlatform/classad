@@ -520,7 +520,13 @@ func (v *View) run(ctx context.Context, base *DB, ready chan<- error) {
 
 	cursor := []byte(nil) // start from the beginning
 	for {
-		seq, err := base.Watch(ctx, cursor)
+		// With no key. A view is shared state: any session that can name it reads its groups and
+		// metrics, whatever that session may see in the base table. Built with the key, a view
+		// grouped by a sealed attribute would hand its distinct values to every reader as group
+		// labels, and one counting under a sealed value would answer for it. A view therefore
+		// sees the base table as an unentitled reader does -- a sealed value undefined -- which
+		// is the one answer safe to give everyone who can read it.
+		seq, err := base.WatchRedacted(ctx, cursor)
 		if err != nil {
 			signal(err)
 			return

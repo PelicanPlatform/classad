@@ -92,7 +92,7 @@ func dnfStats(t *testing.T, c *Collection, expr string) (ScanStats, int) {
 		t.Fatalf("%s: not planned through the disjunctive index path", expr)
 	}
 	var st ScanStats
-	qp := c.newQueryPlan(q, nil, &st)
+	qp := c.newQueryPlan(q, nil, &st, false)
 	rows := 0
 	for _, sh := range c.shards {
 		c.scanShardIndexedGroups(sh, groups, plan, qp, func([]byte, *segDictHandle) bool {
@@ -480,7 +480,7 @@ func TestDNFPlanIgnoresMarkers(t *testing.T) {
 	if frac, est := c.planFrac(groups); !est || frac > maxPushdownFrac {
 		t.Errorf("the union is estimated at %.3f of the collection (estimable=%v); the pushdown gate is %.2f", frac, est, maxPushdownFrac)
 	}
-	if rp := c.planReadQuery(c.newQueryPlan(q, nil, nil)); !rp.disjunctive() {
+	if rp := c.planReadQuery(c.newQueryPlan(q, nil, nil, false)); !rp.disjunctive() {
 		t.Error("`Owner is undefined || ClusterId == 7` is not planned through the union of its disjuncts")
 	}
 	sigsEqual(t, "Query(Owner is undefined || ClusterId == 7)",

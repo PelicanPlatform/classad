@@ -22,11 +22,15 @@ import (
 // constraint is then re-checked on each matched slot. An empty constraint is exactly
 // MatchSortedRanked. Returns an error only if targetConstraint fails to parse.
 func (c *Collection) MatchSortedRankedFiltered(job *classad.ClassAd, targetConstraint string, limit int) ([]RankedMatch, error) {
+	return c.matchSortedRankedFilteredAs(job, targetConstraint, limit, false)
+}
+
+func (c *Collection) matchSortedRankedFilteredAs(job *classad.ClassAd, targetConstraint string, limit int, redact bool) ([]RankedMatch, error) {
 	if job == nil {
 		return nil, nil
 	}
 	if strings.TrimSpace(targetConstraint) == "" {
-		return c.MatchSortedRanked(job, limit), nil
+		return c.matchSortedRankedAs(job, limit, redact), nil
 	}
 	tq, err := vm.Parse(targetConstraint)
 	if err != nil {
@@ -34,7 +38,9 @@ func (c *Collection) MatchSortedRankedFiltered(job *classad.ClassAd, targetConst
 	}
 	// Materialize survivors (deferMat=false) so the constraint can be re-checked on the
 	// slot ad before ranking/truncation.
-	matches := c.collectMatchesFiltered(job, tq.Expr())
+	// The constraint is re-checked on the slot as the match decoded it, so a redacted match checks it on
+	// the keyless slot too.
+	matches := c.collectMatchesFiltered(job, tq.Expr(), redact)
 	kept := matches[:0]
 	for i := range matches {
 		ad := matches[i].ad
@@ -72,11 +78,12 @@ func (c *Collection) MatchSortedRankedFiltered(job *classad.ClassAd, targetConst
 // pushed into the candidate plan. It mirrors collectMatches but combines the job's DNF
 // candidate groups with the constraint's, so the indexed scan visits the intersection.
 // Materialization is never deferred here (the caller re-checks the constraint on the ad).
-func (c *Collection) collectMatchesFiltered(job *classad.ClassAd, targetExpr ast.Expr) []rankedMatch {
+func (c *Collection) collectMatchesFiltered(job *classad.ClassAd, targetExpr ast.Expr, redact bool) []rankedMatch {
 	if c.parentKeyFor != nil {
-		return c.serialScanMatches(job) // chained: the caller re-checks the constraint
+		return c.serialScanMatches(job, redact) // chained: the caller re-checks the constraint
 	}
 	jp := c.compileJobSide(job)
+	jp.redact = redact
 	c.demand.record(c.slotProbes(job, jp.vals))
 	c.recordMatchReads(job, jp)
 

@@ -189,7 +189,7 @@ func integrityConsumers(t *testing.T, c *Collection, q *vm.Query) map[string]fun
 // wireAt, whose integrity gate is the behaviour the columnar projection must reproduce.
 func integrityReference(t *testing.T, c *Collection, q *vm.Query) []int {
 	return rawIDs(t, func(yield func(RawAd) bool) {
-		c.scanQuery(c.newQueryPlan(q, nil, nil), c.yieldRawProjected(yield, c.newRawProjector(integrityProj, false, false)))
+		c.scanQuery(c.newQueryPlan(q, nil, nil, false), c.yieldRawProjected(yield, c.newRawProjector(integrityProj, false, false)))
 	})
 }
 

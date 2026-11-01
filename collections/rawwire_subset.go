@@ -66,7 +66,7 @@ func (c *Collection) QueryRawWireStats(q *vm.Query, projection []string, redact 
 		if len(projection) > 0 {
 			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
 		}
-		qp := c.newQueryPlan(q, proj, stats)
+		qp := c.newQueryPlan(q, proj, stats, redact)
 		rp := c.planReadQuery(qp)
 		// A full-scan constrained read fans out across segments, on the same terms the full-decode
 		// Query does: no index plan to walk (the fan-out visits whole segments), and no reverse

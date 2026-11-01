@@ -127,6 +127,11 @@ func (c *Collection) anySealedAttr(seen map[uint32]struct{}) bool {
 // rest is active). Without it, EncryptedAttrs is inert.
 func (c *Collection) EncryptionEnabled() bool { return c.sealer != nil }
 
+// SealsValues reports whether any stored value can be sealed: a key, and a persistent collection. An
+// in-memory collection may hold a key but never seals -- its records are interned against the shared
+// table and encoded without one -- so a reader not entitled to sealed values is withheld nothing there.
+func (c *Collection) SealsValues() bool { return c.sealer != nil && c.inline }
+
 // checkNotIndexed errors if any of names (case-insensitive) is currently an indexed
 // attribute: an encrypted value is stored opaque, so it can never satisfy an index.
 func (c *Collection) checkNotIndexed(names []string) error {
