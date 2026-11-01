@@ -1,6 +1,7 @@
 package classad
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"sync/atomic"
@@ -29,6 +30,22 @@ import (
 // Programs are cached and shared. Withdrawing a registration would leave compiled programs calling
 // something that is gone, and re-deciding it would mean invalidating every cached program in the
 // process. Registration is expected during start-up, before anything compiles.
+
+// Registration failures a caller can act on differently, as sentinels rather than only as messages.
+//
+// A loader registering a batch of functions wants to tell these apart: colliding with a built-in is a
+// mistake in what it was asked to load, already-registered is usually a double-load it can ignore,
+// and a malformed name or arity is a bug in the thing that produced them. Without sentinels a caller
+// can only re-wrap the text, and text is not an interface.
+var (
+	// ErrBuiltinName means the name is already a built-in, which a UDF may not shadow.
+	ErrBuiltinName = errors.New("classad: name is a built-in")
+	// ErrFunctionExists means the name is already registered as a UDF.
+	ErrFunctionExists = errors.New("classad: function already registered")
+	// ErrBadFunction means the registration itself is malformed: a nil function, a name no
+	// expression could call, or an impossible arity.
+	ErrBadFunction = errors.New("classad: invalid function registration")
+)
 
 // Func is a user-defined function: a pure function of its argument values.
 //
@@ -82,17 +99,17 @@ func validUDFName(name string) bool {
 // initialization order.
 func RegisterFunction(name string, minArgs, maxArgs int, fn Func) error {
 	if fn == nil {
-		return fmt.Errorf("classad: RegisterFunction(%q): nil function", name)
+		return fmt.Errorf("RegisterFunction(%q): nil function: %w", name, ErrBadFunction)
 	}
 	if !validUDFName(name) {
-		return fmt.Errorf("classad: RegisterFunction(%q): not a name an expression can call", name)
+		return fmt.Errorf("RegisterFunction(%q): not a name an expression can call: %w", name, ErrBadFunction)
 	}
 	if minArgs < 0 || (maxArgs >= 0 && maxArgs < minArgs) {
-		return fmt.Errorf("classad: RegisterFunction(%q): bad arity %d..%d", name, minArgs, maxArgs)
+		return fmt.Errorf("RegisterFunction(%q): bad arity %d..%d: %w", name, minArgs, maxArgs, ErrBadFunction)
 	}
 	folded := strings.ToLower(name)
 	if _, isBuiltin := functionArity[folded]; isBuiltin {
-		return fmt.Errorf("classad: RegisterFunction(%q): a built-in already has that name", name)
+		return fmt.Errorf("RegisterFunction(%q): %w", name, ErrBuiltinName)
 	}
 	entry := udfEntry{name: name, arity: funcArity{min: minArgs, max: maxArgs}, fn: fn}
 	for {
@@ -104,7 +121,7 @@ func RegisterFunction(name string, minArgs, maxArgs int, fn Func) error {
 			}
 		}
 		if prev, dup := next[folded]; dup {
-			return fmt.Errorf("classad: RegisterFunction(%q): already registered as %q", name, prev.name)
+			return fmt.Errorf("RegisterFunction(%q): registered as %q: %w", name, prev.name, ErrFunctionExists)
 		}
 		next[folded] = entry
 		if udfs.CompareAndSwap(cur, &next) {
