@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -190,16 +191,34 @@ func TestQueryProjectUsesTheColumnarPath(t *testing.T) {
 			"never ran, so the fast path this plan exists to enable is not engaged",
 			st.RecordsReassembled, rows)
 	}
-	// The closure check must be doing real work here: this fixture stores RequestMemory as an
-	// expression reaching outside the projection in a handful of records, and those are exactly
-	// the ones that must fall back. Zero would mean the fixture stopped exercising the hazard.
-	if st.RecordsClosureReassembled == 0 {
-		t.Fatalf("no record was reassembled for closure over %d rows: the fixture no longer stores "+
-			"a projected attribute as an expression reaching outside the projection, so this test "+
-			"and TestProjectedAdIsNotEvaluable are both measuring nothing", rows)
+	// The hazard must still be IN the fixture, or this test and TestProjectedAdIsNotEvaluable are
+	// both measuring nothing. Checked directly, by looking for the stored expression, rather than
+	// through RecordsClosureReassembled: that counter used to be the evidence, and it now reads
+	// zero on a healthy fixture, because an escaped expression cell whose value was precomputed is
+	// substituted before the closure check ever sees it. A fixture check that doubles as a
+	// behaviour check stops being either the moment the behaviour improves.
+	exprs := 0
+	q2, _ := vm.Parse(`true`)
+	for w := range c.QueryRawWireRefs(q2, []string{"RequestMemory"}, false) {
+		buf, offs, _, _, ok := RenderRawAdInline(w, nil, nil)
+		if !ok {
+			t.Fatal("RenderRawAdInline failed on a wire row")
+		}
+		for i := 0; i+1 < len(offs); i++ {
+			if e := string(buf[offs[i]:offs[i+1]]); strings.HasPrefix(e, "RequestMemory") &&
+				strings.Contains(e, "ProcId") {
+				exprs++
+			}
+		}
 	}
-	t.Logf("closure plan: %d of %d records reassembled (%d of them for closure); no plan: %d of %d",
-		st.RecordsReassembled, rows, st.RecordsClosureReassembled, base.RecordsReassembled, baseRows)
+	if exprs == 0 {
+		t.Fatalf("no record of %d stores RequestMemory as an expression over its siblings: the "+
+			"fixture no longer carries the hazard, so this test and TestProjectedAdIsNotEvaluable "+
+			"are both measuring nothing", rows)
+	}
+	t.Logf("closure plan: %d of %d records reassembled (%d of them for closure, %d records store "+
+		"the expression); no plan: %d of %d",
+		st.RecordsReassembled, rows, st.RecordsClosureReassembled, exprs, base.RecordsReassembled, baseRows)
 }
 
 // BenchmarkQueryProjectPlan is what the closure plan is for: the same projected scan with the plan
