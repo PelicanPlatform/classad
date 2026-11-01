@@ -210,6 +210,15 @@ Server-side `constraint` (a ClassAd expression evaluated per event; non-matching
 `project` (emit only the named attributes). Keeps the payload — and the sink's store — to what the
 subscriber actually wants.
 
+Both run under the subscriber's entitlement (`Grant.Privileged`, decided by the authorizer). An
+unprivileged subscriber is served what an unprivileged read is: its events are decoded with no key, so
+a sealed value is `undefined` in the ad it receives and in the constraint that selects it, and a
+constraint that references a private attribute (or names attributes dynamically) is refused with 403.
+Which events it receives therefore does not depend on a sealed value either: a chained parent whose
+sealed attributes alone change does not fan out to it, and a write that changes only a record's sealed
+attributes delivers an upsert identical to the one before it. Only a privileged subscriber's watch opens
+the key. With no authorizer, or the allow/deny `Auth`, every subscriber is unprivileged.
+
 ---
 
 ## 9. Toolkit API sketch (`classad/changefeed`)
@@ -217,10 +226,15 @@ subscriber actually wants.
 ```go
 // ---- SOURCE (mounted by htcondordb or any classad/db service) ----
 
-type Authorizer func(r *http.Request) (src string, sub string, ok bool) // token -> identity
+type Grant struct {
+    Src, Subscriber string
+    Privileged      bool // entitled to sealed values; false => served as an unprivileged read
+}
+type GrantAuthorizer func(r *http.Request) (Grant, bool) // token -> identity + entitlement
 
 type ServerOptions struct {
-    Auth       Authorizer
+    Authorize  GrantAuthorizer
+    Auth       Authorizer // deprecated allow/deny form; admits unprivileged only
     Registry   Registry        // durable subscriber store (see below)
     LeaseTTL   time.Duration
     Heartbeat  time.Duration

@@ -458,6 +458,12 @@ func (a *Archive) Watch(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent
 	return a.c.Watch(ctx, cursor)
 }
 
+// WatchRedacted is Watch for a watcher NOT entitled to sealed values: every event's ad is decoded
+// with no key. See Collection.WatchRedacted.
+func (a *Archive) WatchRedacted(ctx context.Context, cursor []byte) (iter.Seq[WatchEvent], error) {
+	return a.c.WatchRedacted(ctx, cursor)
+}
+
 // WatchCursor returns an opaque cursor at the current head of the archive's change log,
 // so a following Watch streams only subsequent appends rather than replaying what is
 // retained. See Collection.WatchCursor.

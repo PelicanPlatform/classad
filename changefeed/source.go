@@ -22,12 +22,45 @@ const (
 	PathAck       = "/changefeed/v1/ack"
 )
 
+// Grant is what an authenticated request may act as.
+type Grant struct {
+	Src        string // the source label stamped on the subscriber's events
+	Subscriber string // the subscriber id its acks and lease are recorded under
+
+	// Privileged entitles the subscriber to sealed values. Its events are decoded, and its
+	// constraint evaluated, with the table's key, and its constraint may reference private
+	// attributes.
+	//
+	// Without it the subscriber is served what an unprivileged read of the table is: each event is
+	// decoded with no key, so a sealed value is undefined in the ad it receives and in the
+	// constraint that chose it, and a constraint referencing a private attribute is refused. Which
+	// events reach it is then as independent of sealed values as their content: a filter cannot
+	// match on a value the subscriber may not see, and a chained parent whose sealed attributes
+	// alone changed does not fan out to it. A write that changes only sealed attributes of a
+	// record still delivers that record, identical to the upsert the subscriber last received,
+	// which is what any write that changes nothing it can see delivers.
+	Privileged bool
+}
+
+// GrantAuthorizer authenticates a request and returns what it may act as. ok=false rejects (401).
+type GrantAuthorizer func(r *http.Request) (g Grant, ok bool)
+
 // Authorizer authenticates a request and returns the source label and subscriber id it is allowed
-// to act as. ok=false rejects (401). A nil Authorizer allows all, taking src/subscriber from query.
+// to act as. ok=false rejects (401).
+//
+// Deprecated: an Authorizer can only allow or deny, so a subscriber it admits is unprivileged (see
+// Grant.Privileged). Use GrantAuthorizer through ServerOptions.Authorize to admit a privileged one.
 type Authorizer func(r *http.Request) (src, subscriber string, ok bool)
 
 // ServerOptions configure the feed Handler.
 type ServerOptions struct {
+	// Authorize authenticates each request and decides its entitlement. It takes precedence over
+	// Auth. With neither set every request is allowed, unprivileged, taking src and subscriber from
+	// the query.
+	Authorize GrantAuthorizer
+	// Auth is the allow/deny authorizer; every subscriber it admits is unprivileged.
+	//
+	// Deprecated: use Authorize.
 	Auth      Authorizer
 	Registry  Registry      // records acks + leases, computes the GC floor; MemRegistry if nil
 	Heartbeat time.Duration // SSE keep-alive comment cadence; default 15s
@@ -59,6 +92,7 @@ type server struct {
 // watchable is satisfied by both *db.DB (mutable) and *db.ArchiveTable.
 type watchable interface {
 	Watch(ctx context.Context, cursor []byte) (iter.Seq[db.WatchEvent], error)
+	WatchRedacted(ctx context.Context, cursor []byte) (iter.Seq[db.WatchEvent], error)
 }
 
 func (s *server) resolve(table string) (watchable, bool) {
@@ -71,15 +105,19 @@ func (s *server) resolve(table string) (watchable, bool) {
 	return nil, false
 }
 
-func (s *server) authOf(r *http.Request) (src, sub string, ok bool) {
-	if s.opts.Auth != nil {
-		return s.opts.Auth(r)
+func (s *server) authOf(r *http.Request) (Grant, bool) {
+	if s.opts.Authorize != nil {
+		return s.opts.Authorize(r)
 	}
-	return r.URL.Query().Get("src"), r.URL.Query().Get("subscriber"), true
+	if s.opts.Auth != nil {
+		src, sub, ok := s.opts.Auth(r)
+		return Grant{Src: src, Subscriber: sub}, ok
+	}
+	return Grant{Src: r.URL.Query().Get("src"), Subscriber: r.URL.Query().Get("subscriber")}, true
 }
 
 func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
-	src, sub, ok := s.authOf(r)
+	g, ok := s.authOf(r)
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -102,6 +140,21 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	var matcher *vm.Query
 	if c := strings.TrimSpace(q.Get("constraint")); c != "" {
+		// As for an unprivileged read: evaluating a constraint has no notion of privacy, so one
+		// that reads a private attribute would answer for its value through which events
+		// arrive. Refuse it, and one naming attributes dynamically, whose targets cannot be
+		// checked.
+		if !g.Privileged {
+			attr, dynamic := db.PrivateConstraintRef(c)
+			if attr != "" {
+				http.Error(w, "cannot reference private attribute "+attr+" in a constraint", http.StatusForbidden)
+				return
+			}
+			if dynamic {
+				http.Error(w, "cannot use a dynamic attribute reference in a constraint", http.StatusForbidden)
+				return
+			}
+		}
 		matcher, err = vm.Parse(c)
 		if err != nil {
 			http.Error(w, "bad constraint: "+err.Error(), http.StatusBadRequest)
@@ -124,7 +177,14 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ctx := r.Context()
-	seq, err := tbl.Watch(ctx, cursor)
+	// The watch, not the stream, carries the entitlement: an unprivileged subscriber's events are
+	// decoded with no key, so the constraint below and every ad it is sent see a sealed value as
+	// undefined, and the key is never opened on its behalf.
+	watch := tbl.WatchRedacted
+	if g.Privileged {
+		watch = tbl.Watch
+	}
+	seq, err := watch(ctx, cursor)
 	if err != nil {
 		s.writeSSE(w, flusher, Event{Kind: replicate.KindGap}) // best-effort signal; connection then ends
 		return
@@ -151,7 +211,7 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 		case <-ctx.Done():
 			return
 		case <-hb.C:
-			s.opts.Registry.Renew(table, sub, time.Now())
+			s.opts.Registry.Renew(table, g.Subscriber, time.Now())
 			if _, err := w.Write([]byte(": hb\n\n")); err != nil {
 				return
 			}
@@ -160,7 +220,7 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return // watch ended (ctx cancel)
 			}
-			ch, ok := replicate.ChangeFromWatch(we, src, ver)
+			ch, ok := replicate.ChangeFromWatch(we, g.Src, ver)
 			if !ok {
 				continue // resync: not sink-visible
 			}
@@ -182,7 +242,7 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			if ch.Kind == replicate.KindSynced {
-				s.opts.Registry.Renew(table, sub, time.Now())
+				s.opts.Registry.Renew(table, g.Subscriber, time.Now())
 			}
 		}
 	}
@@ -213,7 +273,7 @@ type ackResponse struct {
 }
 
 func (s *server) ack(w http.ResponseWriter, r *http.Request) {
-	_, authSub, ok := s.authOf(r)
+	g, ok := s.authOf(r)
 	if !ok {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
@@ -224,8 +284,8 @@ func (s *server) ack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sub := req.Subscriber
-	if authSub != "" {
-		sub = authSub // the authenticated identity wins over a client-claimed id
+	if g.Subscriber != "" {
+		sub = g.Subscriber // the authenticated identity wins over a client-claimed id
 	}
 	if sub == "" || req.Table == "" {
 		http.Error(w, "subscriber and table required", http.StatusBadRequest)
