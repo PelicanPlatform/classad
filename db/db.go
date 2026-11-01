@@ -559,6 +559,12 @@ func (db *DB) EnableSchemaScan(sampleMax, hotTopN int) bool {
 // collections.Collection.CountConstraint.
 func (db *DB) CountConstraint(constraint string) (int, bool) { return db.c.CountConstraint(constraint) }
 
+// CountConstraintRedacted is CountConstraint for a caller NOT entitled to sealed values. See
+// collections.Collection.CountQueryRedacted.
+func (db *DB) CountConstraintRedacted(constraint string) (int, bool) {
+	return db.c.CountConstraintRedacted(constraint)
+}
+
 // GroupStatsConstraint answers a per-group record count plus the aggregate inputs for each aggAttr over
 // the rows matching constraint, via the columnar accelerator, or ok=false so the caller scans. This is
 // the mutable-table half of what ArchiveTable already exposes; dbrpc's aggregate routes a grouped
@@ -891,6 +897,12 @@ func (db *DB) EncryptedAttrNames() []string { return db.c.EncryptedAttrNames() }
 // nothing and is reported here as false.
 func (db *DB) EncryptionEnabled() bool { return db.enc.protected() }
 
+// SealsValues reports whether this table seals any attribute values at all -- every persistent table
+// does, since private attributes are always sealed, whether or not EncryptionEnabled; an in-memory one
+// never does. A table that seals nothing has nothing to withhold from a reader not entitled to sealed
+// values. See collections.Collection.SealsValues.
+func (db *DB) SealsValues() bool { return db.c.SealsValues() }
+
 // Compact reclaims dead space in shards whose dead-byte ratio warrants it,
 // returning the number of shards compacted.
 func (db *DB) Compact() int { return db.c.Compact() }
@@ -980,6 +992,17 @@ func (db *DB) QueryAsOf(constraint string, t time.Time) (iter.Seq[*classad.Class
 	return gatedErr(db, seq, err)
 }
 
+// QueryAsOfRedacted is QueryAsOf for a caller NOT entitled to sealed values: the constraint is matched,
+// and each ad decoded, with no key. See collections.Collection.QueryAsOfRedacted.
+func (db *DB) QueryAsOfRedacted(constraint string, t time.Time) (iter.Seq[*classad.ClassAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	seq, err := db.c.QueryAsOfRedacted(q, t)
+	return gatedErr(db, seq, err)
+}
+
 // SetTimeTravel enables (with a positive maxDistance), retunes, or disables (maxDistance
 // <= 0) point-in-time queries for this table, and persists the setting so it survives a
 // restart. A zero checkpoint interval uses the collections default (1 minute). Enabling
@@ -1021,6 +1044,30 @@ func (db *DB) QueryProjectStats(constraint string, attrs []string, stats *collec
 	return gated(db, db.c.QueryProjectStats(q, attrs, stats)), nil
 }
 
+// QueryProjectRedacted is QueryProject for a caller NOT entitled to sealed values: the constraint is
+// matched and attrs are read with no key, so a sealed value is undefined to both. See
+// collections.Collection.QueryProjectRedacted.
+func (db *DB) QueryProjectRedacted(constraint string, attrs []string) (iter.Seq[[]classad.Value], error) {
+	return db.QueryProjectStatsRedacted(constraint, attrs, nil)
+}
+
+// QueryProjectStatsRedacted is QueryProjectStats with QueryProjectRedacted's entitlement.
+func (db *DB) QueryProjectStatsRedacted(constraint string, attrs []string, stats *collections.ScanStats) (iter.Seq[[]classad.Value], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("classad-db: bad constraint %q: %w", constraint, err)
+	}
+	return gated(db, db.c.QueryProjectStatsRedacted(q, attrs, stats)), nil
+}
+
+// queryProjectStatsAs is QueryProjectStats in the entitlement redact names.
+func (db *DB) queryProjectStatsAs(constraint string, attrs []string, stats *collections.ScanStats, redact bool) (iter.Seq[[]classad.Value], error) {
+	if redact {
+		return db.QueryProjectStatsRedacted(constraint, attrs, stats)
+	}
+	return db.QueryProjectStats(constraint, attrs, stats)
+}
+
 // Match returns the ads that symmetrically match job (bilateral Requirements), pushed
 // down to the store. For the negotiator's pick-best pattern, prefer MatchSorted.
 func (db *DB) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {
@@ -1047,6 +1094,12 @@ func (db *DB) MatchSorted(job *classad.ClassAd, limit int) []*classad.ClassAd {
 	return db.c.MatchSorted(job, limit)
 }
 
+// MatchSortedRedacted is MatchSorted for a caller NOT entitled to sealed values: every slot is matched,
+// ranked and returned as decoded with no key. See collections.Collection.MatchSortedRedacted.
+func (db *DB) MatchSortedRedacted(job *classad.ClassAd, limit int) []*classad.ClassAd {
+	return db.c.MatchSortedRedacted(job, limit)
+}
+
 // RankedMatch is a matched ad with the job's Rank of it.
 type RankedMatch = collections.RankedMatch
 
@@ -1063,6 +1116,13 @@ func (db *DB) MatchSortedRanked(job *classad.ClassAd, limit int) []RankedMatch {
 // each matched slot. An empty constraint is exactly MatchSortedRanked.
 func (db *DB) MatchSortedRankedFiltered(job *classad.ClassAd, targetConstraint string, limit int) ([]RankedMatch, error) {
 	return db.c.MatchSortedRankedFiltered(job, targetConstraint, limit)
+}
+
+// MatchSortedRankedFilteredRedacted is MatchSortedRankedFiltered for a caller NOT entitled to sealed
+// values: the slots, and the resource-side constraint on them, are evaluated with no key. See
+// collections.Collection.MatchSortedRankedFilteredRedacted.
+func (db *DB) MatchSortedRankedFilteredRedacted(job *classad.ClassAd, targetConstraint string, limit int) ([]RankedMatch, error) {
+	return db.c.MatchSortedRankedFilteredRedacted(job, targetConstraint, limit)
 }
 
 // MatchSignature is HTCondor's autocluster key: a 64-bit checksum over the given

@@ -215,10 +215,10 @@ func (c *Collection) queryRawFromSeq(q *vm.Query, projection []string, after Seq
 			rp readPlan
 		)
 		if q != nil {
-			qp = c.newQueryPlan(q, proj, nil)
+			qp = c.newQueryPlan(q, proj, nil, redact)
 			rp = c.planReadQuery(qp)
 		} else {
-			s := &wireScope{ctx: c}
+			s := &wireScope{ctx: c.evalCtx(redact)}
 			qp.ws, qp.resolver, qp.proj = s, s.resolve, proj
 		}
 		// Same in-walk projection as QueryRawProjected: an empty projection

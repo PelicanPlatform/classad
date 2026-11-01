@@ -109,7 +109,7 @@ func seqCandidates(t *testing.T, c *Collection, expr string) (cand, segs int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	qp := c.newQueryPlan(q, nil, nil)
+	qp := c.newQueryPlan(q, nil, nil, false)
 	rp := c.planReadQuery(qp)
 	for i, sh := range c.shards {
 		sh.mu.RLock()
@@ -148,10 +148,10 @@ func checkDNFReads(t *testing.T, label string, c *Collection) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if rp := c.planReadQuery(c.newQueryPlan(ref, nil, nil)); rp.disjunctive() || len(rp.usable) > 0 {
+		if rp := c.planReadQuery(c.newQueryPlan(ref, nil, nil, false)); rp.disjunctive() || len(rp.usable) > 0 {
 			t.Fatalf("%s: the reference for %s is index-planned; it would not be a plain walk", label, tc.expr)
 		}
-		if rp := c.planReadQuery(c.newQueryPlan(q, nil, nil)); rp.disjunctive() != tc.union {
+		if rp := c.planReadQuery(c.newQueryPlan(q, nil, nil, false)); rp.disjunctive() != tc.union {
 			t.Fatalf("%s: %s planned disjunctive=%v, want %v", label, tc.expr, rp.disjunctive(), tc.union)
 		}
 		got, want := dnfReads(t, c, tc.expr), dnfReads(t, c, dnfReference(tc.expr))

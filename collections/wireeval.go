@@ -23,6 +23,62 @@ type wireCtx interface {
 	decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr, error)
 }
 
+// keylessCtx is the wire context of an evaluation for a reader NOT entitled to sealed values. It names
+// attributes exactly as the collection does but holds no key, so a sealed value decodes to undefined --
+// what that reader is shown if it projects the attribute -- and is never opened.
+//
+// Redacting only what a read RETURNS is not enough. Evaluation decides which records match, which
+// group a record lands in and where it sorts, and each of those is itself an answer: `count(*) where
+// Secret == "guess"` confirms a guess, a range constraint binary-searches a number, and GROUP BY
+// Secret hands back the distinct values as group keys. A reader that may not see a value must not be
+// able to evaluate it either, so its evaluation reads through this context and never through the
+// collection's key.
+type keylessCtx struct{ c *Collection }
+
+func (k keylessCtx) decodeWire(w []byte) (*ast.ClassAd, error) {
+	return k.c.decodeWireDictAs(nil, w, true)
+}
+
+func (k keylessCtx) wireLookup(a wire.Ad, name string) ([]byte, bool) { return k.c.wireLookup(a, name) }
+
+func (k keylessCtx) decodeNode(node []byte) (ast.Expr, error) { return k.decodeNodeDict(nil, node) }
+
+func (k keylessCtx) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd, error) {
+	return k.c.decodeWireDictAs(dict, w, true)
+}
+
+// decodeNodeDict decodes one attribute's value node. A sealed node is undefined, as the redacting ad
+// decoders make it; anything else carries no sealed value inside it (only a whole attribute value is
+// ever sealed), so it decodes without a key.
+func (k keylessCtx) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr, error) {
+	if wire.IsEncryptedNode(node) {
+		return &ast.UndefinedLiteral{}, nil
+	}
+	switch {
+	case dict != nil:
+		return wire.DecodeNodeResolveEnc(node, dict.resolve, nil)
+	case k.c.inline:
+		return wire.DecodeNodeInline(node)
+	default:
+		return wire.DecodeNode(node, k.c.intern)
+	}
+}
+
+// evalCtx is the wire context an evaluation runs in: the collection itself (which holds the key) for an
+// entitled read, keylessCtx for a redacted one. A collection that seals nothing (SealsValues) has
+// nothing to open, so its redacted reads take the same context as its entitled ones and cost nothing
+// extra.
+//
+// Every evaluating read path takes its context from here, with the same redact flag that picks the
+// renderer for what it returns (renderKey), so what a reader can match on and what it is shown cannot
+// disagree.
+func (c *Collection) evalCtx(redact bool) wireCtx {
+	if redact && c.SealsValues() {
+		return keylessCtx{c}
+	}
+	return c
+}
+
 // wireScope resolves attribute references directly from an ad's wire bytes for
 // wire-native query evaluation, so a match test builds no ClassAd. It handles the
 // common case where the queried attributes are scalar literals; if it encounters

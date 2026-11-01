@@ -376,11 +376,15 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 // ok=false only when there is no columnar state at all; individual blocks that cannot be vectorized
 // are served by colScope, and segments without a block by a row walk, so the answer is always complete.
 func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
+	return c.vectorEvalCountAs(q, false)
+}
+
+func (c *Collection) vectorEvalCountAs(q *vm.Query, redact bool) (int, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil || !q.Native() {
 		return 0, false
 	}
-	sides := c.newEvalSides(q)
+	sides := c.newEvalSides(q, redact)
 	cs := &colScope{bc: st.cache, c: c}
 	resolver := cs.resolve
 	src := &blockVecSource{c: c, bc: st.cache}

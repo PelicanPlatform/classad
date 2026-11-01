@@ -487,14 +487,14 @@ type evalSides struct {
 	ct     bool
 }
 
-func (c *Collection) newEvalSides(q *vm.Query) *evalSides {
+func (c *Collection) newEvalSides(q *vm.Query, redact bool) *evalSides {
 	s := &evalSides{
-		orig:   evalSide{q: q, m: q.Matcher(), rm: c.newRowMatch(q), prune: !q.ReadsCurrentTime()},
+		orig:   evalSide{q: q, m: q.Matcher(), rm: c.newRowMatch(q, redact), prune: !q.ReadsCurrentTime()},
 		probes: q.Probes(),
 		ct:     q.ReadsCurrentTime(),
 	}
 	if qf := c.foldFor(q); qf != nil && qf.Native() {
-		s.fold = &evalSide{q: qf, m: qf.Matcher(), rm: c.newRowMatch(qf), prune: true}
+		s.fold = &evalSide{q: qf, m: qf.Matcher(), rm: c.newRowMatch(qf, redact), prune: true}
 	}
 	return s
 }

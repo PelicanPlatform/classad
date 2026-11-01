@@ -182,7 +182,7 @@ func refRawProjected(c *Collection, q *vm.Query, projection []string, chaseRefs,
 			}
 			return
 		}
-		c.scanQuery(c.newQueryPlan(q, nil, st), c.yieldRawProjected(yield, p))
+		c.scanQuery(c.newQueryPlan(q, nil, st, false), c.yieldRawProjected(yield, p))
 	}
 }
 

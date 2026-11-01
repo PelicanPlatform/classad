@@ -32,7 +32,8 @@ import (
 // materialize builds the ClassAd (only for records actually returned).
 type rankedMatch struct {
 	ad      *classad.ClassAd
-	wire    []byte // deferred: a copy of the slot's decompressed wire bytes (nil once ad is built)
+	wire    []byte  // deferred: a copy of the slot's decompressed wire bytes (nil once ad is built)
+	ctx     wireCtx // deferred: the match's wire context, which decodes wire for its reader
 	rank    float64
 	hasRank bool
 }
@@ -91,7 +92,7 @@ func (c *Collection) Match(job *classad.ClassAd) iter.Seq[*classad.ClassAd] {
 		}
 		// Unlimited: every match is returned, so materialize inline (deferMat=false);
 		// records already carry their ad.
-		for _, rm := range c.collectMatches(job, false) {
+		for _, rm := range c.collectMatches(job, false, false) {
 			if !yield(rm.ad) {
 				return
 			}
@@ -130,12 +131,16 @@ type RankedMatch struct {
 // visit only index-candidate slots when an index covers it (the matchmaking
 // pushdown), rather than bilaterally evaluating every slot.
 func (c *Collection) MatchSortedRanked(job *classad.ClassAd, limit int) []RankedMatch {
+	return c.matchSortedRankedAs(job, limit, false)
+}
+
+func (c *Collection) matchSortedRankedAs(job *classad.ClassAd, limit int, redact bool) []RankedMatch {
 	if job == nil {
 		return nil
 	}
 	// Defer ClassAd materialization when a limit will discard most survivors: rank
 	// records wire-native, sort, truncate, then build only the returned ads.
-	matches := c.collectMatches(job, limit > 0)
+	matches := c.collectMatches(job, limit > 0, redact)
 	sort.SliceStable(matches, func(i, j int) bool {
 		a, b := matches[i], matches[j]
 		if a.hasRank != b.hasRank {
@@ -161,11 +166,12 @@ func (c *Collection) MatchSortedRanked(job *classad.ClassAd, limit int) []Ranked
 // collectMatches gathers all symmetric matches, in parallel when possible. When the
 // job's Requirements yield an index-usable constraint on the slots, it visits only
 // candidate slots (A2); otherwise it scans every slot with the wire-native reject.
-func (c *Collection) collectMatches(job *classad.ClassAd, deferMat bool) []rankedMatch {
+func (c *Collection) collectMatches(job *classad.ClassAd, deferMat, redact bool) []rankedMatch {
 	if c.parentKeyFor != nil {
-		return c.serialScanMatches(job) // chained: need Scan's flatten/hide-structural view
+		return c.serialScanMatches(job, redact) // chained: need Scan's flatten/hide-structural view
 	}
 	jp := c.compileJobSide(job)
+	jp.redact = redact
 	// Record the slot-side probes as resource-index demand -- even when nothing is
 	// indexed yet -- so SuggestIndexes/.suggest can recommend indexing the attributes
 	// the match filters slots on. When an index already covers them, use it to visit
@@ -202,13 +208,14 @@ func (c *Collection) recordMatchReads(job *classad.ClassAd, jp *jobPlan) {
 	c.demand.recordReads(reads)
 }
 
-// serialScanMatches matches over Scan (the chained/structural-aware read view).
-func (c *Collection) serialScanMatches(job *classad.ClassAd) []rankedMatch {
+// serialScanMatches matches over Scan (the chained/structural-aware read view), decoded with no key
+// for a redacted match.
+func (c *Collection) serialScanMatches(job *classad.ClassAd, redact bool) []rankedMatch {
 	orig := job.GetTarget()
 	defer job.SetTarget(orig)
 	m := classad.NewMatchClassAd(job, nil)
 	var out []rankedMatch
-	for ad := range c.Scan() {
+	for ad := range c.scanAs(redact) {
 		if ok, r, hr := matchOne(m, ad); ok {
 			out = append(out, rankedMatch{ad: ad, rank: r, hasRank: hr})
 		}
@@ -393,6 +400,11 @@ type matchWorker struct {
 	rankPresent bool        // job has a Rank attribute
 	deferMat    bool        // defer ClassAd materialization (MatchSorted with a limit)
 	ms          *matchScope
+	// ctx decodes slot wire in the match's entitlement, and keyless says it holds no key (see
+	// newMatchWorker). Every decode of a slot -- the wire-native reject, the closure and hot-set
+	// partial ads, the full decode and a deferred materialization -- goes through ctx.
+	ctx     wireCtx
+	keyless bool
 
 	// Closure-decode scratch (deferred path, wide interned ads): a partial ClassAd of
 	// just the match closure instead of a full FromAST. Buffers are reused per worker.
@@ -407,7 +419,12 @@ type matchWorker struct {
 }
 
 func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat bool) *matchWorker {
-	mw := &matchWorker{mc: classad.NewMatchClassAd(job, nil), rankPresent: jp.rankPresent, deferMat: deferMat}
+	// A redacted match evaluates both sides against the slot its reader is shown: decoded with no key,
+	// a sealed value undefined. Which slots match and how the job ranks them are answers about every
+	// value the Requirements and the Rank read, so a reader that may not see a value must not be able
+	// to match on it either.
+	mw := &matchWorker{mc: classad.NewMatchClassAd(job, nil), rankPresent: jp.rankPresent, deferMat: deferMat,
+		ctx: c.evalCtx(jp.redact), keyless: jp.redact && c.SealsValues()}
 	if jp.order != nil {
 		// Built over this worker's own job copy, so no AST is shared across workers.
 		mw.leftReq = orderedConjunction(jobRequirementsExpr(job), jp.order)
@@ -417,7 +434,7 @@ func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat b
 	}
 	if jp.req != nil {
 		mw.jm = jp.req.Matcher()
-		mw.ms = &matchScope{ctx: c, job: jp.vals, inline: c.inline, intern: c.intern}
+		mw.ms = &matchScope{ctx: mw.ctx, job: jp.vals, inline: c.inline, intern: c.intern}
 		if !jp.rankOpaque {
 			mw.closureSeeds = buildClosureSeeds(jp.rankRefs)
 			mw.rankRefs = jp.rankRefs
@@ -504,11 +521,20 @@ func (c *Collection) matchWindow(t scanTask, mw *matchWorker, dbuf *[]byte, out 
 			return true
 		}
 		*dbuf = w
-		if iw, ok := c.wireToInline(dict, w); ok {
+		if iw, ok := c.matchInline(mw, dict, w); ok {
 			c.matchCandidate(iw, mw, out)
 		}
 		return true
 	})
+}
+
+// matchInline is wireToInline in the match's entitlement: a keyless match converts an interned slot
+// with no key (sealed values become undefined), where wireToInline would open them to re-seal.
+func (c *Collection) matchInline(mw *matchWorker, dict *segDictHandle, w []byte) ([]byte, bool) {
+	if mw.keyless {
+		return c.wireToInlineNoKey(dict, w)
+	}
+	return c.wireToInline(dict, w)
 }
 
 // matchCandidate matches one slot (given its decompressed wire bytes) against the
@@ -561,7 +587,7 @@ func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatc
 			}
 		}
 	}
-	node, err := c.decodeWire(w)
+	node, err := mw.ctx.decodeWire(w)
 	if err != nil {
 		return
 	}

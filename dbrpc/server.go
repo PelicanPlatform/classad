@@ -811,7 +811,7 @@ func (sc *serverConn) dispatch(frame []byte) {
 	case opAggregateBucketed:
 		sc.s.streamAggregateBucketed(sc.ctx, reqID, body, priv, sc.write, sc.qlog)
 	case opMatchTables:
-		sc.s.streamMatchTables(sc.ctx, reqID, body, sc.write)
+		sc.s.streamMatchTables(sc.ctx, reqID, body, priv, sc.write)
 	case opWatch:
 		sc.streamWatch(reqID, body, false)
 	case opWatchWire:
@@ -967,7 +967,11 @@ func (s *Server) streamQueryKeys(ctx context.Context, reqID uint64, r *reader, i
 	if !ok {
 		return
 	}
-	seq, err := d.KeysWhere(constraint)
+	keysWhere := d.KeysWhere
+	if !includePrivate {
+		keysWhere = d.KeysWhereRedacted // matched with no key, like the ads a query would return
+	}
+	seq, err := keysWhere(constraint)
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
@@ -1087,7 +1091,11 @@ func (s *Server) streamQueryAsOf(ctx context.Context, reqID uint64, r *reader, i
 	if !ok {
 		return
 	}
-	seq, err := d.QueryAsOf(constraint, asOf)
+	queryAsOf := d.QueryAsOf
+	if !includePrivate {
+		queryAsOf = d.QueryAsOfRedacted // matched, and decoded, with no key
+	}
+	seq, err := queryAsOf(constraint, asOf)
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return
@@ -1124,7 +1132,13 @@ func (s *Server) streamMatchSorted(ctx context.Context, reqID uint64, r *reader,
 		write(respErr(reqID, err.Error()))
 		return
 	}
-	for _, ad := range d.MatchSorted(job, int(limit)) {
+	// An unprivileged session matches against the slots as it is shown them: with no key, a sealed
+	// value undefined to both Requirements and the Rank, and absent from the ads returned.
+	matchSorted := d.MatchSorted
+	if !includePrivate {
+		matchSorted = d.MatchSortedRedacted
+	}
+	for _, ad := range matchSorted(job, int(limit)) {
 		write(putStr(respHead(reqID, stStream), adString(ad, includePrivate)))
 	}
 	write(respHead(reqID, stStreamEnd))
@@ -1148,6 +1162,16 @@ func (s *Server) streamOrdered(ctx context.Context, reqID uint64, r *reader, inc
 	}
 	ordered := d.Ordered
 	if !includePrivate {
+		// An ordered index is maintained on the write path, with the key: membership, partition,
+		// order and cluster signature are all computed from the plaintext. Redacting the ads it
+		// returns does not undo that -- probing a partition by value, or reading the order, answers
+		// for any sealed value the spec reads -- and which values those are depends on each record,
+		// not on the spec. A table that seals nothing has nothing to withhold.
+		if d.SealsValues() {
+			write(respErr(reqID, "ordered index reads require DAEMON authorization on a table that "+
+				"seals values: the index is maintained from the sealed plaintext"))
+			return
+		}
 		ordered = d.OrderedRedacted // read with no key rather than decrypt-then-filter
 	}
 	for oa := range ordered(int(index), partition, db.OrderCursor{}) {
@@ -1723,7 +1747,13 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		if !ok {
 			return respErr(reqID, "no such table: "+table)
 		}
-		removed, err := d.DeleteWhere(constraint)
+		// An unprivileged session matches with no key: how many rows a constraint removes is an answer
+		// about a sealed value it read, whether or not the attribute is private by name.
+		deleteWhere := d.DeleteWhere
+		if !includePrivate {
+			deleteWhere = d.DeleteWhereRedacted
+		}
+		removed, err := deleteWhere(constraint)
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}
@@ -1774,6 +1804,17 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		if r.err != nil {
 			return respBad(reqID)
 		}
+		// The selector picks the request, and the plan bakes the request's own values into the slot
+		// predicate it shows: both read the request table, so both get the gates a query does.
+		if !includePrivate {
+			for _, c := range []string{selector, targetWhere} {
+				if attr, dynamic := db.PrivateConstraintRef(c); attr != "" {
+					return respErr(reqID, "cannot reference private attribute "+attr+" in a constraint")
+				} else if dynamic {
+					return respErr(reqID, "cannot use a dynamic attribute reference in a constraint")
+				}
+			}
+		}
 		reqDB, ok := s.cat.Table(reqTable)
 		if !ok {
 			return respErr(reqID, "no such table: "+reqTable)
@@ -1782,7 +1823,11 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		if !ok {
 			return respErr(reqID, "no such table: "+resTable)
 		}
-		seq, err := reqDB.Query(orTrue(selector))
+		query := reqDB.Query
+		if !includePrivate {
+			query = reqDB.QueryRedacted // which request matches, and the values baked into its plan
+		}
+		seq, err := query(orTrue(selector))
 		if err != nil {
 			return respErr(reqID, err.Error())
 		}

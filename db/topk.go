@@ -54,25 +54,47 @@ func (t *ArchiveTable) topKRun(constraint string, attrs []string, orderAttr stri
 
 // TopK is ArchiveTable.TopK for a mutable table.
 func (db *DB) TopK(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, error) {
-	rows, err := db.topKRun(constraint, attrs, orderAttr, desc, k, nil)
+	rows, err := db.topKRun(constraint, attrs, orderAttr, desc, k, nil, false)
 	return rows, err
 }
 
 // TopKStats is DB.TopK that also returns the cutoff scan's ScanStats, for EXPLAIN ANALYZE.
 func (db *DB) TopKStats(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, collections.ScanStats, error) {
 	var stats collections.ScanStats
-	rows, err := db.topKRun(constraint, attrs, orderAttr, desc, k, &stats)
+	rows, err := db.topKRun(constraint, attrs, orderAttr, desc, k, &stats, false)
 	return rows, stats, err
 }
 
-func (db *DB) topKRun(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats) ([][]classad.Value, error) {
+// TopKRedacted is TopK for a caller NOT entitled to sealed values: the constraint is matched, the rows
+// ordered and the projection read with no key, so a sealed value is undefined throughout -- it neither
+// comes back nor decides which rows do or in what order.
+func (db *DB) TopKRedacted(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, error) {
+	return db.topKRun(constraint, attrs, orderAttr, desc, k, nil, true)
+}
+
+// TopKStatsRedacted is TopKStats with TopKRedacted's entitlement.
+func (db *DB) TopKStatsRedacted(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, collections.ScanStats, error) {
+	var stats collections.ScanStats
+	rows, err := db.topKRun(constraint, attrs, orderAttr, desc, k, &stats, true)
+	return rows, stats, err
+}
+
+// topKRun serves both entitlements. The columnar cutoff takes no key either way: it reads only columns,
+// which never hold a sealed value, and declines on any record whose order or predicate value it cannot
+// read as a literal -- a sealed one included -- so a cutoff it does return is the same for both readers.
+// The projection pass decides the rows, so it is the one that has to be keyless.
+func (db *DB) topKRun(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats, redact bool) ([][]classad.Value, error) {
 	proj, orderIdx, added := withOrderAttr(attrs, orderAttr)
 	c2, err := topKAugment(constraint, orderAttr, desc, k,
 		func(q *vm.Query) (float64, int, bool) { return db.c.TopKOrderThreshold(q, orderAttr, desc, k, stats) })
 	if err != nil {
 		return nil, err
 	}
-	return topKResult(db.c.QueryProject(c2, proj), orderIdx, desc, k, added), nil
+	project := db.c.QueryProject
+	if redact {
+		project = db.c.QueryProjectRedacted
+	}
+	return topKResult(project(c2, proj), orderIdx, desc, k, added), nil
 }
 
 // topKAugment returns the query the projection pass should use: the original with

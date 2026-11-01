@@ -108,7 +108,7 @@ func TestProjectedAdIsNotEvaluable(t *testing.T) {
 	countUndefined := func(proj *projPlan) (undef, rows int) {
 		scratch := make([]classad.Value, len(attrs))
 		rs := &wireScope{ctx: c}
-		c.scanQuery(c.newQueryPlan(q, proj, nil), func(w []byte, dict *segDictHandle) bool {
+		c.scanQuery(c.newQueryPlan(q, proj, nil, false), func(w []byte, dict *segDictHandle) bool {
 			rs.dict = dict
 			c.projectInto(rs, w, attrs, scratch)
 			rows++

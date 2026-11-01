@@ -34,6 +34,22 @@ func (c *Collection) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classa
 // numerically) can show WHERE the time went -- specifically a large RecordsReassembled, the slow
 // per-record path. Stats accumulate as the returned sequence is consumed.
 func (c *Collection) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanStats) iter.Seq[[]classad.Value] {
+	return c.queryProjectAs(q, attrs, stats, false)
+}
+
+// QueryProjectRedacted is QueryProject for a reader NOT entitled to sealed values: q is matched and attrs
+// are read with no key, so a sealed value is undefined in both. Every aggregate and top-K over this scan
+// is therefore an answer about what the reader may see, not about the plaintext.
+func (c *Collection) QueryProjectRedacted(q *vm.Query, attrs []string) iter.Seq[[]classad.Value] {
+	return c.queryProjectAs(q, attrs, nil, true)
+}
+
+// QueryProjectStatsRedacted is QueryProjectStats with QueryProjectRedacted's entitlement.
+func (c *Collection) QueryProjectStatsRedacted(q *vm.Query, attrs []string, stats *ScanStats) iter.Seq[[]classad.Value] {
+	return c.queryProjectAs(q, attrs, stats, true)
+}
+
+func (c *Collection) queryProjectAs(q *vm.Query, attrs []string, stats *ScanStats, redact bool) iter.Seq[[]classad.Value] {
 	return func(yield func([]classad.Value) bool) {
 		// Projection demand: every record this scan yields has each of attrs read out of
 		// it. Recorded before the chained fallback, which returns through Query -- and
@@ -43,7 +59,7 @@ func (c *Collection) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanS
 		// Chained collections need parent attributes merged in; fall back to the
 		// full-decode path (correctness over speed for the rarer chained case).
 		if c.parentKeyFor != nil {
-			for ad := range c.Query(q) {
+			for ad := range c.queryAs(q, redact) {
 				vals := make([]classad.Value, len(attrs))
 				for i, n := range attrs {
 					vals[i] = ad.EvaluateAttr(n)
@@ -56,7 +72,7 @@ func (c *Collection) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanS
 		}
 
 		scratch := make([]classad.Value, len(attrs))
-		rs := &wireScope{ctx: c} // projection resolver, distinct from the match ws
+		rs := &wireScope{ctx: c.evalCtx(redact)} // projection resolver, distinct from the match ws
 		// NO PROJECTION PLAN HERE, deliberately -- this is the one scan that must not have one,
 		// and it is worth saying why because the plan would make it measurably faster (~3x, a
 		// third of the allocations) while silently changing answers.
@@ -73,7 +89,7 @@ func (c *Collection) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanS
 		// Expression-valued attributes are routine in real job ads, and this scan backs COUNT and
 		// GROUP BY, where UNDEFINED is not an error but a different answer. Pinned by
 		// TestQueryProjectExpressionValues.
-		c.scanQuery(c.newQueryPlan(q, nil, stats), func(w []byte, dict *segDictHandle) bool {
+		c.scanQuery(c.newQueryPlan(q, nil, stats, redact), func(w []byte, dict *segDictHandle) bool {
 			rs.dict = dict
 			c.projectInto(rs, w, attrs, scratch)
 			return yield(scratch)
@@ -103,11 +119,11 @@ func (c *Collection) projectInto(rs *wireScope, w []byte, attrs []string, out []
 		}
 	}
 	if needDecode {
-		// Through the record's segment dictionary, with the collection's key: an interned record is
-		// keyed by that segment's local ids, which the collection-wide decode cannot read -- it failed,
-		// and every attribute of the row came back ERROR -- and a sealed value has to be opened to be
-		// evaluated, as it is in an inline segment.
-		if a, err := c.decodeWireDict(rs.dict, w); err == nil {
+		// Through the record's segment dictionary, in the scan's context: an interned record is keyed by
+		// that segment's local ids, which the collection-wide decode cannot read -- it failed, and every
+		// attribute of the row came back ERROR -- and a sealed value is opened with the key for an
+		// entitled read, as it is in an inline segment, and is undefined for a redacted one.
+		if a, err := rs.ctx.decodeWireDict(rs.dict, w); err == nil {
 			full := classad.FromAST(a)
 			for i, name := range attrs {
 				out[i] = full.EvaluateAttr(name)

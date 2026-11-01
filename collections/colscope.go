@@ -562,11 +562,15 @@ func (c *Collection) indexCanPrune(q *vm.Query) bool {
 // Because it evaluates the query rather than a summary of it, it is exact by construction -- the class
 // of bug that required ExactProbes cannot arise here.
 func (c *Collection) ColumnarEvalCount(q *vm.Query) (int, bool) {
+	return c.columnarEvalCountAs(q, false)
+}
+
+func (c *Collection) columnarEvalCountAs(q *vm.Query, redact bool) (int, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil || !q.Native() {
 		return 0, false
 	}
-	sides := c.newEvalSides(q)
+	sides := c.newEvalSides(q, redact)
 	cs := &colScope{bc: st.cache, c: c}
 	resolver := cs.resolve // hoisted: a method value expression allocates
 	count := 0
@@ -645,8 +649,12 @@ type rowMatch struct {
 	buf []byte
 }
 
-func (c *Collection) newRowMatch(q *vm.Query) *rowMatch {
-	return &rowMatch{c: c, qp: c.newQueryPlan(q, nil, nil)}
+// newRowMatch builds the fallback for q in the entitlement redact names (see newQueryPlan). The column
+// scans need no key of their own -- a sealed value is never a column, so it reaches them only as a cell
+// they cannot read -- and every such cell comes here, so this is where a column scan's entitlement is
+// decided.
+func (c *Collection) newRowMatch(q *vm.Query, redact bool) *rowMatch {
+	return &rowMatch{c: c, qp: c.newQueryPlan(q, nil, nil, redact)}
 }
 
 // match reports whether the record at off matches, and returns its wire bytes (valid until the next

@@ -138,13 +138,24 @@ func (c *Collection) resolveAsOf(t time.Time) ([]uint64, error) {
 // parallel, and chained fast paths are current-time only); the query constraint is
 // still applied to every candidate.
 func (c *Collection) QueryAsOf(q *vm.Query, t time.Time) (iter.Seq[*classad.ClassAd], error) {
+	return c.queryAsOfAs(q, t, false)
+}
+
+// QueryAsOfRedacted is QueryAsOf for a reader NOT entitled to sealed values: q is matched, and each ad
+// decoded, with no key, so a sealed value is undefined both to the constraint and in the result. An
+// older version of a record is no less secret than the current one.
+func (c *Collection) QueryAsOfRedacted(q *vm.Query, t time.Time) (iter.Seq[*classad.ClassAd], error) {
+	return c.queryAsOfAs(q, t, true)
+}
+
+func (c *Collection) queryAsOfAs(q *vm.Query, t time.Time, redact bool) (iter.Seq[*classad.ClassAd], error) {
 	seqs, err := c.resolveAsOf(t)
 	if err != nil {
 		return nil, err
 	}
 	return func(yield func(*classad.ClassAd) bool) {
-		qp := c.newQueryPlan(q, nil, nil)
-		emit := c.yieldAd(yield)
+		qp := c.newQueryPlan(q, nil, nil, redact)
+		emit := c.yieldAdAs(yield, redact)
 		for i, sh := range c.shards {
 			if !c.scanShardAt(sh, seqs[i], qp, emit) {
 				return

@@ -34,7 +34,15 @@ import (
 // callback rather than a context because every other query entry point here takes none, and the
 // one caller that cares already holds the connection's context.
 func (db *DB) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats, stop func() bool) ([]AggRow, error) {
-	return runAggLadder(db.aggLadder(stats, stop), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
+	return runAggLadder(db.aggLadder(stats, stop, false), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
+}
+
+// AggregateColsStatsRedacted is AggregateColsStats for a caller NOT entitled to sealed values: every
+// rung answers as if the table had no key, so a sealed value is undefined to the WHERE clause, the
+// group key, the aggregate and its FILTER alike. A count that a sealed value decided is as much an
+// answer about it as the value itself.
+func (db *DB) AggregateColsStatsRedacted(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats, stop func() bool) ([]AggRow, error) {
+	return runAggLadder(db.aggLadder(stats, stop, true), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
 }
 
 // aggLadder is the mutable table's ordered list of aggregate strategies, the counterpart of
@@ -60,7 +68,12 @@ func (db *DB) AggregateColsStats(constraint string, groupCols []GroupCol, aggs [
 // Only the last rung fills stats, and only because it is the only one that scans records; the
 // rungs above it reassemble nothing and leave the counts zero, which is what the doc above reads
 // as "served without a per-record scan".
-func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool) []AggStrategy {
+//
+// redact is the caller's entitlement. The rungs that read only columns -- the live count, the numeric
+// column statistics -- serve both readers as they are: a sealed value is never a column, and they
+// decline any cell they cannot read as a literal. The rungs that fall back to evaluating a record take
+// the entitlement down to it.
+func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact bool) []AggStrategy {
 	return []AggStrategy{
 		aggRung{"live-count", func(req AggRequest) ([]AggRow, bool, error) {
 			// An unconstrained COUNT(*) with no grouping is the collection's live row count,
@@ -84,7 +97,11 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool) []AggStr
 			if !req.isPlainCount() || IsMatchAll(req.Constraint) {
 				return nil, false, nil
 			}
-			n, ok := db.CountConstraint(req.Constraint)
+			count := db.CountConstraint
+			if redact {
+				count = db.CountConstraintRedacted
+			}
+			n, ok := count(req.Constraint)
 			if !ok {
 				return nil, false, nil
 			}
@@ -115,7 +132,11 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool) []AggStr
 			// a predicate not proven free of CurrentTime, or a chained table -- the DB.GroupStats* wrappers refuse a chained table
 			// because the columnar pass reads a record's own columns and knows nothing about the
 			// parent it would have inherited the group or aggregate attribute from.
-			rows, ok := GroupedFromColumns(db, req.Constraint, req.GroupCols, req.Aggs)
+			var src GroupStatsSource = db
+			if redact {
+				src = redactedGroupStats{db}
+			}
+			rows, ok := GroupedFromColumns(src, req.Constraint, req.GroupCols, req.Aggs)
 			return rows, ok, nil
 		}},
 		aggRung{"projected-scan", func(req AggRequest) ([]AggRow, bool, error) {
@@ -130,7 +151,7 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool) []AggStr
 			// exactly as it is -- making it decline would leave the ladder with no rung that
 			// answers, which is a behaviour change dressed as a description.
 			attrs, groupCol, aggCol := AggProjection(req.GroupCols, req.Aggs)
-			seq, err := db.QueryProjectStats(req.Constraint, attrs, stats)
+			seq, err := db.queryProjectStatsAs(req.Constraint, attrs, stats, redact)
 			if err != nil {
 				return nil, false, err
 			}
@@ -141,4 +162,22 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool) []AggStr
 			return rows, true, nil
 		}},
 	}
+}
+
+// redactedGroupStats is the GroupStatsSource of a redacted aggregate: a record whose constraint the
+// columns cannot decide is matched with no key (see collections.GroupStatsConstraintAggsRedacted). The
+// match-all form evaluates no constraint and reads only columns, so it is the table's own.
+type redactedGroupStats struct{ db *DB }
+
+func (r redactedGroupStats) GroupStatsConstraintAggs(constraint string, groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string) ([]collections.GroupStats, bool) {
+	if r.db.c.Chained() {
+		return nil, false // as DB.GroupStatsConstraintAggs
+	}
+	return r.db.c.GroupStatsConstraintAggsRedacted(constraint, groups, aggCols, countFilters)
+}
+
+func (r redactedGroupStats) GroupStatsAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
+	countFilters []string) ([]collections.GroupStats, bool) {
+	return r.db.GroupStatsAllAggs(groups, aggCols, countFilters)
 }

@@ -56,7 +56,7 @@ func (c *Collection) QueryRawProjected(q *vm.Query, projection []string, chaseRe
 func (c *Collection) QueryRawProjectedStats(q *vm.Query, projection []string, chaseRefs, redact bool, stats *ScanStats) iter.Seq[RawAd] {
 	return func(yield func(RawAd) bool) {
 		p := c.newRawProjector(projection, chaseRefs, redact)
-		c.scanQuery(c.newQueryPlan(q, c.rawProjPlan(projection, chaseRefs), stats), c.yieldRawProjected(yield, p))
+		c.scanQuery(c.newQueryPlan(q, c.rawProjPlan(projection, chaseRefs), stats, redact), c.yieldRawProjected(yield, p))
 	}
 }
 

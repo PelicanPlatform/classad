@@ -114,7 +114,7 @@ func (c *Collection) hotClosureMatch(w []byte, mw *matchWorker) *classad.ClassAd
 	// collect those references and resolve them once the hot set is known.
 	jobRefs := mw.jobRefScratch[:0]
 	a.ForEachHot(func(id uint32, node []byte) bool {
-		if expr, err := c.decodeNode(node); err == nil {
+		if expr, err := mw.ctx.decodeNode(node); err == nil {
 			if name, ok := c.intern.Name(id); ok {
 				partial.Insert(name, expr)
 				mw.hotPresent[strings.ToLower(name)] = true
@@ -258,7 +258,7 @@ func (c *Collection) topUpRef(a wire.Ad, partial *classad.ClassAd, mw *matchWork
 			ok = c.topUpJobAttr(a, partial, mw, name)
 			continue
 		}
-		expr, err := c.decodeNode(node)
+		expr, err := mw.ctx.decodeNode(node)
 		if err != nil {
 			continue
 		}
@@ -318,7 +318,7 @@ func (c *Collection) closureDecode(w []byte, mw *matchWorker) *classad.ClassAd {
 		if !ok {
 			continue
 		}
-		expr, err := c.decodeNode(node)
+		expr, err := mw.ctx.decodeNode(node)
 		if err != nil {
 			continue
 		}

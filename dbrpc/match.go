@@ -88,7 +88,7 @@ type matchResult struct {
 // ranked candidates. limit caps the number of requests assigned. With significant
 // attributes supplied, identical requests (by signature) reuse a single cached
 // ranked-candidate list (assignment still consumes resources per request).
-func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader, write func([]byte)) {
+func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte)) {
 	reqTable := r.str()
 	resTable := r.str()
 	keyAttr := r.str()
@@ -109,6 +109,19 @@ func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader,
 		return
 	}
 
+	// Both filters read a table, the key attribute's value is returned for every row, and which requests
+	// and resources pair up is an answer about every value the match reads. An unprivileged session gets
+	// the private-attribute gates a query does, and matches with no key below.
+	if !includePrivate {
+		if refusePrivateConstraint(reqID, reqWhere, includePrivate, write) ||
+			refusePrivateConstraint(reqID, targetWhere, includePrivate, write) {
+			return
+		}
+		if classad.IsPrivateAttribute(keyAttr) {
+			write(respErr(reqID, "cannot reference private attribute "+keyAttr))
+			return
+		}
+	}
 	reqDB, ok := s.cat.Table(reqTable)
 	if !ok {
 		write(respErr(reqID, "no such table: "+reqTable))
@@ -134,8 +147,12 @@ func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader,
 	// consumes machines, so a later job may need one ranked past every machine an earlier
 	// job claimed. Under autoclustering this list is computed once per signature and
 	// shared, so the full-list cost is paid once for a whole autocluster.
+	matchFiltered, query := resDB.MatchSortedRankedFiltered, reqDB.Query
+	if !includePrivate {
+		matchFiltered, query = resDB.MatchSortedRankedFilteredRedacted, reqDB.QueryRedacted
+	}
 	candidatesFor := func(reqAd *classad.ClassAd) []matchResult {
-		matches, err := resDB.MatchSortedRankedFiltered(reqAd, targetWhere, 0)
+		matches, err := matchFiltered(reqAd, targetWhere, 0)
 		if err != nil {
 			return nil // a bad filter was already reported above
 		}
@@ -157,7 +174,7 @@ func (s *Server) streamMatchTables(ctx context.Context, reqID uint64, r *reader,
 	// removing it from the pool. limit bounds the number of *jobs* assigned.
 	claimed := map[string]bool{}
 
-	seq, err := reqDB.Query(orTrue(reqWhere))
+	seq, err := query(orTrue(reqWhere))
 	if err != nil {
 		write(respErr(reqID, err.Error()))
 		return

@@ -283,7 +283,7 @@ func TestIndexedDNFPlanZonePrunes(t *testing.T) {
 		}
 		var st ScanStats
 		var got []int64
-		qp := c.newQueryPlan(q, nil, &st)
+		qp := c.newQueryPlan(q, nil, &st, false)
 		for _, sh := range c.shards {
 			c.scanShardIndexedGroups(sh, groups, plan, qp, func(w []byte, dict *segDictHandle) bool {
 				ad, err := c.decodeWireDict(dict, w)

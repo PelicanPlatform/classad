@@ -95,7 +95,7 @@ func TestZoneMapPruneParallelStats(t *testing.T) {
 	q, _ := vm.Parse(`Ts >= 100000`)
 	var st ScanStats
 	rows := 0
-	c.runParallelQuery(c.newQueryPlan(q, nil, &st), func(*classad.ClassAd) bool {
+	c.runParallelQuery(c.newQueryPlan(q, nil, &st, false), func(*classad.ClassAd) bool {
 		rows++
 		return true
 	}, false)
@@ -117,7 +117,7 @@ func TestZoneMapPruneParallelStats(t *testing.T) {
 	q2, _ := vm.Parse(`Ts >= 380`)
 	var st2 ScanStats
 	got := 0
-	c.runParallelQuery(c.newQueryPlan(q2, nil, &st2), func(*classad.ClassAd) bool {
+	c.runParallelQuery(c.newQueryPlan(q2, nil, &st2, false), func(*classad.ClassAd) bool {
 		got++
 		return true
 	}, false)

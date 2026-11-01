@@ -967,7 +967,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 		var out []rankedMatch
 		for _, sh := range shards {
 			c.scanShardCandidatesGroups(sh, groups, func(w []byte, dict *segDictHandle) bool {
-				if iw, ok := c.wireToInline(dict, w); ok {
+				if iw, ok := c.matchInline(mw, dict, w); ok {
 					c.matchCandidate(iw, mw, &out)
 				}
 				return true
@@ -996,7 +996,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 					break
 				}
 				c.scanShardCandidatesGroups(shards[idx], groups, func(w []byte, dict *segDictHandle) bool {
-					if iw, ok := c.wireToInline(dict, w); ok {
+					if iw, ok := c.matchInline(mw, dict, w); ok {
 						c.matchCandidate(iw, mw, &local)
 					}
 					return true

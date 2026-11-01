@@ -141,7 +141,7 @@ func TestAggLaddersAreOrderedLists(t *testing.T) {
 		}
 		return strings.Join(out, ",")
 	}
-	if got, want := names(d.aggLadder(nil, nil)),
+	if got, want := names(d.aggLadder(nil, nil, false)),
 		"live-count,count-constraint,columnar-aggregate,grouped-columns,projected-scan"; got != want {
 		t.Errorf("mutable ladder = %q, want %q", got, want)
 	}
@@ -281,7 +281,7 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 		}
 		t.Logf("%s: rungs exercised %v", kind, answered)
 	}
-	check(t, "mutable", d.aggLadder(nil, nil))
+	check(t, "mutable", d.aggLadder(nil, nil, false))
 	check(t, "archive", a.aggLadder(nil))
 	check(t, "archive-plain", plain.aggLadder(nil))
 

@@ -80,6 +80,18 @@ func (c *Collection) Truncate() {
 // for encrypted attributes, decrypted). Iteration stops early if fn returns false. Per-shard
 // consistent snapshot, like Scan.
 func (c *Collection) ForEachAd(fn func(key string, ad *classad.ClassAd) bool) {
+	c.forEachAdAs(fn, false)
+}
+
+// ForEachAdRedacted is ForEachAd for a reader NOT entitled to sealed values: each ad is decoded with no
+// key, so a sealed attribute is undefined -- to fn's evaluation of it as much as to anything fn returns.
+// It is what a constraint-driven key scan (db.KeysWhere, db.DeleteWhere) runs on for such a reader;
+// which keys match is an answer about the values the constraint read.
+func (c *Collection) ForEachAdRedacted(fn func(key string, ad *classad.ClassAd) bool) {
+	c.forEachAdAs(fn, true)
+}
+
+func (c *Collection) forEachAdAs(fn func(key string, ad *classad.ClassAd) bool, redact bool) {
 	for _, sh := range c.shards {
 		s0, wins := sh.snapshot()
 		stop := false
@@ -87,7 +99,7 @@ func (c *Collection) ForEachAd(fn func(key string, ad *classad.ClassAd) bool) {
 			if isSystemKeyBytes(key) {
 				return true // internal system record: hidden from client iteration
 			}
-			decoded, err := c.decodeAdDict(dict, ad, codec)
+			decoded, err := c.decodeAdDictAs(dict, ad, codec, redact)
 			if err != nil {
 				noteReadSkip(err)
 				return true // skip an undecodable record rather than abort the backup
@@ -116,6 +128,12 @@ func (c *Collection) ForEachAd(fn func(key string, ad *classad.ClassAd) bool) {
 // This is what lets a transaction scan the committed store at its own snapshot: the same
 // versions its point lookups see, rather than whatever has committed since.
 func (c *Collection) ForEachAdAt(snapOf func(shardIdx int) uint64, fn func(key string, ad *classad.ClassAd) bool) {
+	c.forEachAdAtAs(snapOf, fn, false)
+}
+
+// forEachAdAtAs is ForEachAdAt decoding with no key when redact is set (see ForEachAdRedacted): a
+// redacted transaction's scans read through it.
+func (c *Collection) forEachAdAtAs(snapOf func(shardIdx int) uint64, fn func(key string, ad *classad.ClassAd) bool, redact bool) {
 	for i, sh := range c.shards {
 		s0 := snapOf(i)
 		wins := sh.snapshotAt(s0)
@@ -124,7 +142,7 @@ func (c *Collection) ForEachAdAt(snapOf func(shardIdx int) uint64, fn func(key s
 			if isSystemKeyBytes(key) {
 				return true // internal system record: hidden from client iteration
 			}
-			decoded, err := c.decodeAdDict(dict, ad, codec)
+			decoded, err := c.decodeAdDictAs(dict, ad, codec, redact)
 			if err != nil {
 				noteReadSkip(err)
 				return true // skip an undecodable record, as ForEachAd does

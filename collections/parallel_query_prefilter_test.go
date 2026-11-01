@@ -124,7 +124,7 @@ func runParQuery(t *testing.T, c *Collection, qtext string, redact bool, limit i
 		c.parallelMinBytes = 1 << 62
 	}
 	var stats ScanStats
-	qp := c.newQueryPlan(mustParseQ(t, qtext), nil, &stats)
+	qp := c.newQueryPlan(mustParseQ(t, qtext), nil, &stats, false)
 	rows := make(map[string]map[string]string)
 	count := 0
 	before := queryFanouts.Load()
@@ -317,7 +317,7 @@ func TestQueryParallelProjection(t *testing.T) {
 			c.parallelMinBytes = 1 << 62
 		}
 		var stats ScanStats
-		qp := c.newQueryPlan(mustParseQ(t, q), c.newProjPlan(proj), &stats)
+		qp := c.newQueryPlan(mustParseQ(t, q), c.newProjPlan(proj), &stats, false)
 		rows := map[string]map[string]string{}
 		before := queryFanouts.Load()
 		c.runParallelQuery(qp, func(a *classad.ClassAd) bool {

@@ -1247,18 +1247,24 @@ func (c *Collection) Keys() []string {
 // compaction run. An ad updated mid-scan is seen at whichever version was current
 // when that shard's scan started.
 func (c *Collection) Scan() iter.Seq[*classad.ClassAd] {
+	return c.scanAs(false)
+}
+
+// scanAs is Scan decoding with no key when redact is set: a sealed attribute is undefined in every ad it
+// yields. It is the read view of a keyless evaluation that has no query to plan (see matchKeyless).
+func (c *Collection) scanAs(redact bool) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
 		if c.parentKeyFor != nil {
-			qp := queryPlan{ws: &wireScope{ctx: c}} // q nil ⇒ no filter, just chain + hide structural
+			qp := queryPlan{ws: &wireScope{ctx: c.evalCtx(redact)}} // q nil ⇒ no filter, just chain + hide structural
 			for _, sh := range c.shards {
-				if !c.scanShardChained(sh, qp, yield, false) {
+				if !c.scanShardChained(sh, qp, yield, redact) {
 					return
 				}
 			}
 			return
 		}
 		q := queryPlan{}
-		emit := c.yieldAd(yield)
+		emit := c.yieldAdAs(yield, redact)
 		for _, sh := range c.shards {
 			if !c.scanShard(sh, q, emit) {
 				return
@@ -1293,7 +1299,7 @@ func (c *Collection) QueryRedacted(q *vm.Query) iter.Seq[*classad.ClassAd] {
 
 func (c *Collection) queryAs(q *vm.Query, redact bool) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
-		qp := c.newQueryPlan(q, nil, nil)
+		qp := c.newQueryPlan(q, nil, nil, redact)
 		// Chained collection: a serial two-pass scan per shard resolves each ad's
 		// inherited (parent) attributes. Indexes and query fan-out are bypassed here
 		// (they don't yet understand chaining); correctness first.

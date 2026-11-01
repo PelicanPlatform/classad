@@ -238,6 +238,19 @@ func sealedSources(t *testing.T, patched bool) []*classad.ClassAd {
 	return out
 }
 
+// sealedHiddenSources is sealedSources as a reader not entitled to sealed values is shown them: every
+// sealed attribute removed. Such a reader's evaluation must give the answer these give.
+func sealedHiddenSources(t *testing.T, patched bool) []*classad.ClassAd {
+	t.Helper()
+	out := sealedSources(t, patched)
+	for _, ad := range out {
+		for _, name := range append(slices.Clone(sealedParityAttrs), "ClaimId") {
+			ad.Delete(name)
+		}
+	}
+	return out
+}
+
 // sealedOracle evaluates q against every source ad: the answer every read must give.
 func sealedOracle(q *vm.Query, src []*classad.ClassAd) map[int]bool {
 	out := map[int]bool{}
@@ -359,6 +372,7 @@ func TestSealedValueDictSegmentParity(t *testing.T) {
 		t.Skip("persistence is unix-only")
 	}
 	sources := map[bool][]*classad.ClassAd{false: sealedSources(t, false), true: sealedSources(t, true)}
+	hidden := map[bool][]*classad.ClassAd{false: sealedHiddenSources(t, false), true: sealedHiddenSources(t, true)}
 	for _, lay := range sealedLayouts {
 		t.Run(lay.name, func(t *testing.T) {
 			c := openSealedLayout(t, lay)
@@ -374,6 +388,7 @@ func TestSealedValueDictSegmentParity(t *testing.T) {
 				for _, f := range sealedParityFilters {
 					q := mustParseQ(t, f)
 					want := sealedOracle(q, sources[lay.patched])
+					wantHidden := sealedOracle(q, hidden[lay.patched])
 					if len(want) == 0 || len(want) == sealedParityN {
 						t.Fatalf("%s: the oracle selects %d of %d records; the filter discriminates nothing",
 							f, len(want), sealedParityN)
@@ -385,7 +400,7 @@ func TestSealedValueDictSegmentParity(t *testing.T) {
 						}
 						restore := arm.set()
 						sealedCheckReads(t, c, f, fmt.Sprintf("%s parallel=%v", arm.name, parallel), q, want,
-							lay.patched, full)
+							wantHidden, lay.patched, full)
 						restore()
 					}
 				}
@@ -413,7 +428,10 @@ func TestSealedValueDictSegmentParity(t *testing.T) {
 
 // sealedCheckReads runs the reads of q over c and compares each with want. full runs every read;
 // otherwise only Query, which reaches every arm of the matcher the configuration switches between.
-func sealedCheckReads(t *testing.T, c *Collection, f, arm string, q *vm.Query, want map[int]bool, patched, full bool) {
+//
+// A redacted read is checked against wantHidden: it evaluates with no key, so it must select exactly what
+// the plain evaluation of the source ads with every sealed attribute removed selects.
+func sealedCheckReads(t *testing.T, c *Collection, f, arm string, q *vm.Query, want, wantHidden map[int]bool, patched, full bool) {
 	t.Helper()
 	lbl := func(read string) string { return fmt.Sprintf("[%s] %s: %s", arm, read, f) }
 
@@ -430,7 +448,9 @@ func sealedCheckReads(t *testing.T, c *Collection, f, arm string, q *vm.Query, w
 	for ad := range c.QueryRedacted(q) {
 		ids = append(ids, checkSealedRow(t, lbl("QueryRedacted"), adRow(ad), true, patched))
 	}
-	sameIDs(t, lbl("QueryRedacted"), ids, want)
+	sameIDs(t, lbl("QueryRedacted"), ids, wantHidden)
+
+	sealedCheckKeyless(t, c, lbl, q, wantHidden, patched)
 
 	for _, count := range []struct {
 		name string
@@ -447,23 +467,27 @@ func sealedCheckReads(t *testing.T, c *Collection, f, arm string, q *vm.Query, w
 	}
 
 	for _, redact := range []bool{false, true} {
+		wantAs := want
+		if redact {
+			wantAs = wantHidden
+		}
 		for _, chase := range []bool{false, true} {
 			ids = ids[:0]
 			for ra := range c.QueryRawProjected(q, sealedProj, chase, redact) {
 				ids = append(ids, checkSealedRow(t, lbl("QueryRawProjected"), rawAdMap(t, ra), redact, patched))
 			}
-			sameIDs(t, lbl(fmt.Sprintf("QueryRawProjected chase=%v redact=%v", chase, redact)), ids, want)
+			sameIDs(t, lbl(fmt.Sprintf("QueryRawProjected chase=%v redact=%v", chase, redact)), ids, wantAs)
 		}
 		ids = ids[:0]
 		for row := range c.QueryRawWire(q, sealedProj, redact) {
 			ids = append(ids, checkSealedRow(t, lbl("QueryRawWire"), wireRowMap(t, row), redact, patched))
 		}
-		sameIDs(t, lbl(fmt.Sprintf("QueryRawWire redact=%v", redact)), ids, want)
+		sameIDs(t, lbl(fmt.Sprintf("QueryRawWire redact=%v", redact)), ids, wantAs)
 		ids = ids[:0]
 		for row := range c.QueryRawWireRefs(q, sealedProj, redact) {
 			ids = append(ids, checkSealedRow(t, lbl("QueryRawWireRefs"), wireRowMap(t, row), redact, patched))
 		}
-		sameIDs(t, lbl(fmt.Sprintf("QueryRawWireRefs redact=%v", redact)), ids, want)
+		sameIDs(t, lbl(fmt.Sprintf("QueryRawWireRefs redact=%v", redact)), ids, wantAs)
 	}
 
 	ids = ids[:0]

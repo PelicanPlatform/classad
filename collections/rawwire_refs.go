@@ -68,7 +68,7 @@ func (c *Collection) QueryRawWireRefsStats(q *vm.Query, projection []string, red
 			proj = c.newProjPlan(append(slices.Clip(projection), rawTypeFieldNames...))
 			proj.closure = true
 		}
-		qp := c.newQueryPlan(q, proj, stats)
+		qp := c.newQueryPlan(q, proj, stats, redact)
 		rp := c.planReadQuery(qp)
 		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 && !c.reverseScan {
 			if c.runParallelWireQuery(qp, sel, sel.neededCount(), yield) {
