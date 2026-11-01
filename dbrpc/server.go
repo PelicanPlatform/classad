@@ -1626,6 +1626,32 @@ func (s *Server) handle(sc *serverConn, reqID uint64, o op, r *reader, includePr
 		}
 		return putStr(resp(reqID, stOK), string(data))
 
+	case opAttrTypes:
+		table := r.str()
+		sampleMax := int(r.i32())
+		if r.err != nil || sampleMax < 0 {
+			return respBad(reqID)
+		}
+		var profs []db.AttrTypeProfile
+		var sampled int
+		switch ref := s.resolveTable(table); ref.kind {
+		case kindTable:
+			profs, sampled = ref.db.AttrTypeProfiles(sampleMax)
+		case kindArchive:
+			profs, sampled = ref.arch.AttrTypeProfiles(sampleMax)
+		default:
+			return respErr(reqID, "no such table: "+table)
+		}
+		rep := AttrTypeReport{
+			Profiles: filterPrivateProfiles(profs, includePrivate),
+			Sampled:  sampled,
+		}
+		js, err := json.Marshal(rep)
+		if err != nil {
+			return respErr(reqID, err.Error())
+		}
+		return putStr(resp(reqID, stOK), string(js))
+
 	case opQueryStats:
 		table := r.str()
 		reset := r.u8() != 0
