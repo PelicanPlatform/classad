@@ -714,6 +714,9 @@ func (t *ArchiveTable) CategoricalGroupCountsWhere(attr, constraint string) (map
 
 // MergeOptions tunes a merge pass over an archive; see collections.MergeOptions. The zero
 // value is usable and fills in defaults.
+// AttrTypeProfile is one attribute's measured type profile (see collections.AttrTypeProfile).
+type AttrTypeProfile = collections.AttrTypeProfile
+
 type MergeOptions = collections.MergeOptions
 
 // AutoTuneOptions and AutoTuneResult are re-exported so a caller can tune an archive's
@@ -1205,6 +1208,11 @@ func (t *ArchiveTable) AutoIndexNames() []string { return t.a.AutoIndexNames() }
 // GroupSchemas derives and reports candidate group schemas for the archive (see DB.GroupSchemas).
 func (t *ArchiveTable) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
 	return t.a.GroupSchemas(sampleMax, k)
+}
+
+// AttrTypeProfiles profiles what this archive's attributes hold (see DB.AttrTypeProfiles).
+func (t *ArchiveTable) AttrTypeProfiles(sampleMax int) ([]AttrTypeProfile, int) {
+	return t.a.AttrTypeProfiles(sampleMax)
 }
 
 // GroupSchemaDrift reports how the archive's derived groups have moved.

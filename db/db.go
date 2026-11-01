@@ -1448,6 +1448,14 @@ func (db *DB) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
 	return db.c.GroupSchemas(sampleMax, k)
 }
 
+// AttrTypeProfiles profiles what this table's attributes hold -- the classes of value each
+// one carried across a sample, with exact bounds for the numeric ones. It is what a consumer
+// that must publish one declared type per attribute reads to decide those types; see
+// collections.AttrTypeProfiles for what it does and does not answer.
+func (db *DB) AttrTypeProfiles(sampleMax int) ([]AttrTypeProfile, int) {
+	return db.c.AttrTypeProfiles(sampleMax)
+}
+
 // GroupSchemaDrift reports how the derived groups have moved across retained derivations.
 func (db *DB) GroupSchemaDrift() GroupSchemaDrift { return db.c.GroupSchemaDrift() }
 

@@ -833,6 +833,14 @@ func (a *Archive) GroupSchemas(sampleMax, k int) GroupSchemaInfo {
 	return a.c.GroupSchemas(sampleMax, k)
 }
 
+// AttrTypeProfiles profiles what the archive's attributes hold (see
+// Collection.AttrTypeProfiles). History is where attribute variety is widest -- a table that
+// has accumulated every shape its submitters ever sent -- so this is the side a consumer
+// declaring types most needs.
+func (a *Archive) AttrTypeProfiles(sampleMax int) ([]AttrTypeProfile, int) {
+	return a.c.AttrTypeProfiles(sampleMax)
+}
+
 // GroupSchemaDrift reports how the archive's derived groups have moved (see
 // Collection.GroupSchemaDrift).
 func (a *Archive) GroupSchemaDrift() GroupSchemaDrift { return a.c.GroupSchemaDrift() }
