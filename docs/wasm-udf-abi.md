@@ -55,7 +55,8 @@ Anything else you export is ignored. In particular:
   which for a UDF would mean running your `main` once per pooled instance. If your
   module needs initialization, put it in the wasm **start section**, which
   instantiation always runs.
-- Nothing you export or declare can grant your module any privilege. See section 8.
+- Nothing you export or declare can grant your module any privilege. The trusted
+  path in section 7 is the admin's decision and there is no way to ask for it.
 
 ---
 
@@ -291,9 +292,13 @@ a payload for each record you handled.
 You may write only states **0 through 4** (integer, real, boolean, UNDEFINED,
 ERROR). States 5 and 6 are refused: this ABI carries no string storage in the
 vector direction, so claiming one would be producing a value with nothing behind
-it. Every element the host reads is validated, and one bad state makes the whole
-batch ERROR — a guest that got one element's state wrong has no claim to the
-others.
+it. A boolean element's payload must be **0 or 1**, exactly as in the scalar ABI
+— the engine would read any nonzero payload as TRUE while the scalar path calls
+it malformed, so allowing it here would let your own two entry points disagree
+about the same input.
+
+Every element the host reads is validated, and one bad element makes the whole
+batch ERROR — a guest that got one element wrong has no claim to the others.
 
 The result column is **poisoned** before every call, the same discipline as the
 scalar slot and for the same reason: `0xFF` in every state byte, which is not a
