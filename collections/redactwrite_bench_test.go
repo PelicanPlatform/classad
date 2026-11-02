@@ -8,17 +8,18 @@ import (
 )
 
 // BenchmarkWholeRecordCompose times one patch write that needs a whole record (a removal, delta records
-// off) on an inline encrypted store, as an entitled transaction composes it (decode with the key, merge,
-// re-encode and re-seal) and as a redacted one does (splice the stored bytes, nothing opened). Encode
-// only; nothing is committed.
+// off) on an encrypted store, as an entitled transaction composes it (decode with the key, merge,
+// re-encode and re-seal) and as a redacted one does (splice the stored bytes; for an interned record,
+// re-seal the sealed values it carries). Inline and interned records. Encode only; nothing is committed.
 func BenchmarkWholeRecordCompose(b *testing.B) {
 	if !mmapSupported {
 		b.Skip("persistence is unix-only")
 	}
 	for _, arm := range []struct {
-		name   string
-		redact bool
-	}{{"entitled", false}, {"redacted", true}} {
+		name     string
+		redact   bool
+		interned bool
+	}{{"entitled", false, false}, {"redacted", true, false}, {"entitled-interned", false, true}, {"redacted-interned", true, true}} {
 		b.Run(arm.name, func(b *testing.B) {
 			c, err := Open(sealedParityOpts(b.TempDir()))
 			if err != nil {
@@ -26,6 +27,9 @@ func BenchmarkWholeRecordCompose(b *testing.B) {
 			}
 			defer c.Close()
 			sealedPut(b, c, 0, sealedParityN)
+			if arm.interned {
+				internAll(c)
+			}
 			c.deltaMax = 0
 			patch := classad.New()
 			patch.InsertAttr("JobStatus", 3)

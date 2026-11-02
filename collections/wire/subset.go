@@ -93,6 +93,9 @@ type SubsetScratch struct {
 	// whose keep test takes bytes while an intern table hands back a string. Reused so
 	// resolving a name costs no allocation per entry.
 	nameBuf []byte
+	// plainBuf holds one re-keyed sealed plaintext at a time for the resealing assembler; it is zeroed
+	// after each use (see resealInline).
+	plainBuf []byte
 }
 
 // AppendAdSubsetInlineHotFirst is AppendAdSubsetInline with the hot-header

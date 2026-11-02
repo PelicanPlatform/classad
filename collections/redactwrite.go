@@ -28,12 +28,21 @@ import (
 //
 // One thing the bytes cannot do. A sealed value's plaintext is its node encoding in the key form of
 // the record it was sealed in, and compaction seals into INTERNED records, whose names are ids into
-// their segment's dictionary. Such a value cannot be moved into an inline-names record without
-// opening it to re-key it, and nothing in the ciphertext says whether it holds a name at all. When the
-// result would have to carry one, the write is stored as a delta where it can be (a delta names only
-// the attributes it sets, so the chain bound is exceeded rather than a value lost -- the bound is
-// advisory, and the next seal collapses the chain with the key), and otherwise it is refused as
-// unapplied: a removal, or a store with delta records off. A refusal leaves the key exactly as it was.
+// their segment's dictionary. Such a value cannot be moved into an inline-names record unopened, and
+// nothing in the ciphertext says whether it holds a name at all. So when the result has to carry one,
+// the store re-keys it itself: the value is opened, its ids rewritten as names, and sealed again, all
+// inside one step of the rewrite (wire.AppendAdInlineFromInternedResealed). That is the store's own
+// maintenance, the same thing compaction does to every value it rewrites, done on the writer's behalf;
+// the writer gains nothing from it. Its plaintext is never returned, logged, put in an error or kept,
+// and nothing the session can observe depends on it: whether the write applies, how it is stored and
+// what Commit reports follow only from which attributes the stored record and the write name. Only the
+// values that need it are opened -- an interned sealed value the result keeps. One the write replaces
+// or removes, or a later part of the chain supersedes, is dropped unopened, and one in an inline-names
+// record is already in the form the result needs and is copied byte for byte.
+//
+// The one failure left is a carried value that will not open or parse, which only damage or a foreign
+// key can produce; a keyed read of the record fails on it too. The write is then refused as "decode",
+// the reason any undecodable record gives, and the key is left as it was.
 
 // keylessPart is one stored record a keyless compose reads: its decompressed bytes, which the caller
 // owns, and, for an interned record, its segment's dictionary.
@@ -43,19 +52,30 @@ type keylessPart struct {
 }
 
 // Counters for the keyless compose, so an operator can see how a redacted writer's whole-record writes
-// were served: composed from bytes, stored as a delta past the bound because the record held an
-// interned sealed value, or refused for the same reason (counted under unreadableByReason).
+// were served: composed from bytes, and how many of those had to re-seal interned sealed values (and
+// how many values).
 var (
-	keylessComposes     atomic.Int64
-	keylessOverBoundDel atomic.Int64
+	keylessComposes      atomic.Int64
+	keylessOverBoundDel  atomic.Int64 // no longer incremented; see KeylessWriteStats
+	keylessResealRecords atomic.Int64
+	keylessResealValues  atomic.Int64
 )
 
 // KeylessWriteStats reports how a transaction not entitled to sealed values stored the writes that
-// needed a whole record: composed from the stored bytes, or stored as a delta past the chain bound
-// because the record held a sealed value only the key could carry. Refusals for that reason appear in
-// UnreadableBaseReasons as "sealed-needs-key".
+// needed a whole record: composed counts every one composed from the stored bytes.
+//
+// overBoundDeltas is always 0. It counted writes stored as a delta past the chain bound because the
+// record held a sealed value only the key could re-key; the store now re-seals such a value itself (see
+// KeylessResealStats), so no write takes that path. It is kept so existing callers still compile.
 func KeylessWriteStats() (composed, overBoundDeltas int64) {
 	return keylessComposes.Load(), keylessOverBoundDel.Load()
+}
+
+// KeylessResealStats reports, of the whole records a transaction not entitled to sealed values composed
+// from the stored bytes, how many carried sealed values from an interned record and so had the store
+// re-seal them, and how many values that was in all.
+func KeylessResealStats() (records, values int64) {
+	return keylessResealRecords.Load(), keylessResealValues.Load()
 }
 
 // keylessParts returns the stored records key's current version is made of at s0, oldest first: the
@@ -129,16 +149,16 @@ func keylessPartAt(c *Collection, seg *segment, off uint32, reassemble, decompre
 	return p, failNone
 }
 
-// composeKeyless builds, without opening any sealed value, the whole inline-names record formed by
-// parts (a base and the deltas over it, oldest first) with patch applied and removed deleted. It
-// appends to dst.
+// composeKeyless builds the whole inline-names record formed by parts (a base and the deltas over it,
+// oldest first) with patch applied and removed deleted, appending it to dst. resealed counts the sealed
+// values it had to re-key.
 //
-// An interned part is rewritten to inline names first. Its sealed values cannot be rewritten (see
-// above), so each must be one the result does not keep -- set or removed by the write, or set by a
-// later part; if any is kept the compose reports failSealedNeedsKey and builds nothing.
-func (c *Collection) composeKeyless(dst []byte, parts []keylessPart, patch *classad.ClassAd, removed []string) ([]byte, readFail) {
+// An interned part is rewritten to inline names first. Each of its sealed values the result keeps --
+// not set or removed by the write, not set by a later part -- is re-sealed in the inline form (see
+// above); every other one is dropped unopened. Inline parts are copied, sealed values unopened.
+func (c *Collection) composeKeyless(dst []byte, parts []keylessPart, patch *classad.ClassAd, removed []string) (out []byte, resealed int, why readFail) {
 	if len(parts) == 0 {
-		return dst, failDeltaNoVersions
+		return dst, 0, failDeltaNoVersions
 	}
 	// later holds the folded names whose value in an earlier part cannot reach the result: the write
 	// sets or removes them, or a part after it sets them. Walking newest first grows it as it goes.
@@ -151,6 +171,16 @@ func (c *Collection) composeKeyless(dst []byte, parts []keylessPart, patch *clas
 	for _, n := range removed {
 		later[strings.ToLower(n)] = struct{}{}
 	}
+	// carry is the rewrite's keep test for an interned part: an unsealed entry is always kept (the merge
+	// below lets a later value win), a sealed one only if it reaches the result. It reads later as it
+	// stands before the part's own names are added, so it must run before they are.
+	carry := func(name, node []byte) bool {
+		if !wire.IsEncryptedNode(node) {
+			return true
+		}
+		_, gone := later[strings.ToLower(string(name))]
+		return !gone
+	}
 	inl := make([]wire.Ad, len(parts))
 	var sc wire.SubsetScratch
 	var names []string
@@ -159,11 +189,11 @@ func (c *Collection) composeKeyless(dst []byte, parts []keylessPart, patch *clas
 		a := wire.Ad(p.raw)
 		_, _, _, inline, ok := a.SplitBody()
 		if !ok || (!inline && p.resolve == nil) {
-			return dst, failDecode
+			return dst, resealed, failDecode
 		}
 		names = names[:0]
-		carried, unresolved := false, false
-		ok = a.ForEachRaw(func(id uint32, name string, node []byte) bool {
+		unresolved := false
+		ok = a.ForEachRaw(func(id uint32, name string, _ []byte) bool {
 			if !inline {
 				n, found := p.resolve(id)
 				if !found {
@@ -172,36 +202,27 @@ func (c *Collection) composeKeyless(dst []byte, parts []keylessPart, patch *clas
 				}
 				name = n
 			}
-			folded := strings.ToLower(name)
-			if !inline && wire.IsEncryptedNode(node) {
-				if _, gone := later[folded]; !gone {
-					carried = true
-					return false
-				}
-			}
-			names = append(names, folded)
+			names = append(names, strings.ToLower(name))
 			return true
 		})
-		switch {
-		case carried:
-			return dst, failSealedNeedsKey
-		case !ok || unresolved:
-			return dst, failDecode
+		if !ok || unresolved {
+			return dst, resealed, failDecode
+		}
+		if inline {
+			inl[i] = a
+		} else {
+			rec, n, ok := wire.AppendAdInlineFromInternedResealed(nil, a, p.resolve, carry, c.sealer, &sc)
+			resealed += n
+			if !ok {
+				// Malformed, or a carried sealed value that would not open or parse. Either way the
+				// record cannot be composed; the reason is the one a keyed read of it would give.
+				return dst, resealed, failDecode
+			}
+			inl[i] = rec
 		}
 		for _, n := range names {
 			later[n] = struct{}{}
 		}
-		if inline {
-			inl[i] = a
-			continue
-		}
-		// No key: the rewrite drops this part's sealed entries, every one of which was just shown to
-		// be replaced or removed in the result.
-		out, ok := wire.AppendAdSubsetInlineFromInterned(nil, a, p.resolve, nil, nil, &sc)
-		if !ok {
-			return dst, failDecode
-		}
-		inl[i] = out
 	}
 	overlays := inl[1:]
 	if patch != nil && len(patch.AST().Attributes) > 0 {
@@ -211,29 +232,31 @@ func (c *Collection) composeKeyless(dst []byte, parts []keylessPart, patch *clas
 	var msc wire.MergeScratch
 	out, ok := wire.AppendAdPatchedInline(dst, inl[0], overlays, removed, &msc)
 	if !ok {
-		return dst, failDecode
+		return dst, resealed, failDecode
 	}
-	return out, failNone
+	return out, resealed, failNone
 }
 
 // encodePatchKeyless is encodePatchOnly's whole-record path for a transaction not entitled to sealed
 // values: the record is composed from the stored bytes (composeKeyless), never from a redacted read.
-// deltaOK says a delta would be a correct encoding of this write (no removal, delta records on), which
-// is the way out when the stored record holds a sealed value only the key could carry.
-func (tx *Txn) encodePatchKeyless(dst []byte, b *txnBuf, h uint64, deltaOK bool) (raw []byte, isDelta, ok bool, why readFail) {
+func (tx *Txn) encodePatchKeyless(dst []byte, b *txnBuf, h uint64) (raw []byte, isDelta, ok bool, why readFail) {
 	c := tx.c
 	storeReads.Add(1)
 	idx := c.shardOf(b.key, h)
 	parts, why := c.shards[idx].keylessParts(c, b.key, h, tx.snapOf(idx))
 	if why == failNone {
 		var out []byte
-		if out, why = c.composeKeyless(dst, parts, b.patch, b.removed); why == failNone {
+		var n int
+		if out, n, why = c.composeKeyless(dst, parts, b.patch, b.removed); why == failNone {
 			keylessComposes.Add(1)
+			if n > 0 {
+				keylessResealRecords.Add(1)
+				keylessResealValues.Add(int64(n))
+			}
 			return out, false, true, failNone
 		}
 	}
-	switch {
-	case why == failNotVisible && !c.keyExists(b.key, h):
+	if why == failNotVisible && !c.keyExists(b.key, h) {
 		// A create: nothing is stored, so nothing sealed can be lost, and the record is the patch.
 		ad := classad.New()
 		mergeDelta(ad, b.patch)
@@ -242,11 +265,6 @@ func (tx *Txn) encodePatchKeyless(dst []byte, b *txnBuf, h uint64, deltaOK bool)
 		}
 		b.ad = ad
 		return c.encodeAdInto(dst, ad.AST()), false, true, failNone
-	case why == failSealedNeedsKey && deltaOK:
-		// The key exists (it was just read), so a delta has a base; only the chain bound is exceeded.
-		c.deltas.deltaInstead(h)
-		keylessOverBoundDel.Add(1)
-		return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true, true, failNone
 	}
 	fallbackUnreadableBase.Add(1)
 	unreadableByReason[why].Add(1)

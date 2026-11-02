@@ -978,8 +978,8 @@ func (db *DB) LookupClassAdRedacted(key string) (*classad.ClassAd, bool) {
 
 // BeginRedacted is Begin for a caller not entitled to sealed values: reads through the transaction decode
 // with no key. SetAttribute and DeleteAttribute change only the attribute they name, sealed or not, and
-// keep every other sealed value as stored; one that cannot be applied without opening a sealed value is
-// refused at Commit as an *UnappliedError with reason "sealed-needs-key", leaving the ad as it was.
+// keep every other sealed value; where one has to be re-keyed into the rewritten record, the store does
+// that itself and the transaction never sees it.
 // NewClassAd and DestroyClassAd replace or remove the whole ad, as they do for any caller. See
 // collections.Collection.BeginRedacted.
 func (db *DB) BeginRedacted() *Txn { return &Txn{tx: db.c.BeginRedacted(), db: db} }

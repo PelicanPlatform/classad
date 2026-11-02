@@ -55,11 +55,47 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 	if c.inline {
 		return AppendAdSubsetInline(dst, src, keep, open)
 	}
+	dst, _, ok = appendSubsetInlineFromInterned(dst, src, c, resolve, keep, open, false, sc)
+	return dst, ok
+}
+
+// AppendAdInlineFromInternedResealed is AppendAdSubsetInlineFromInterned for a WRITER that has to carry
+// an interned ad's sealed values into an inline-names record it will store. A sealed value's plaintext
+// is its node encoding in the key form of the ad it was sealed in, so one sealed in src holds src's ids
+// and cannot be moved unopened (see AppendInlineFromInternedUnopened). Here each sealed value keep
+// selects is opened with s, its plaintext rewritten to the inline-names form, and sealed again with s;
+// the entry is emitted sealed, never in the clear.
+//
+// The plaintext exists only inside that step (resealInline): it is never appended to dst, returned, or
+// put in an error, and both the opened buffer and its rewritten form are zeroed once the new ciphertext
+// exists. A sealed value keep rejects is skipped before it is opened, so a caller that drops the values
+// it does not need opens only the ones it carries.
+//
+// resealed counts the values opened and re-sealed. ok=false for everything AppendAdSubsetInlineFromInterned
+// refuses, and also when a kept sealed value does not open (tampered, or another key) or its plaintext
+// does not parse: a writer that dropped it would lose the value, and one that copied it would store bytes
+// no reader can parse, so the caller must not store the result. The partial append in dst is then junk.
+//
+// An inline-names src is refused (ok=false): its sealed values are already in the form an inline record
+// needs, and the caller copies them unopened instead.
+func AppendAdInlineFromInternedResealed(dst []byte, src Ad, resolve func(uint32) (string, bool),
+	keep func(name, node []byte) bool, s Sealer, sc *SubsetScratch) (out []byte, resealed int, ok bool) {
+	c, ok := src.bodyStart()
+	if !ok || c.inline || s == nil {
+		return dst, 0, false
+	}
+	return appendSubsetInlineFromInterned(dst, src, c, resolve, keep, s, true, sc)
+}
+
+// appendSubsetInlineFromInterned is the interned arm of both: c is positioned at src's body. A sealed
+// value is opened with key and emitted in the clear, or with reseal emitted sealed again under key.
+func appendSubsetInlineFromInterned(dst []byte, src Ad, c *cursor, resolve func(uint32) (string, bool),
+	keep func(name, node []byte) bool, key Sealer, reseal bool, sc *SubsetScratch) ([]byte, int, bool) {
 	if resolve == nil {
-		return dst, false // an interned src's ids cannot be named without one
+		return dst, 0, false // an interned src's ids cannot be named without one
 	}
 	if src[2]&flagStandalone != 0 {
-		return dst, false // ids index the embedded table, which resolve knows nothing about
+		return dst, 0, false // ids index the embedded table, which resolve knows nothing about
 	}
 	hotCount := c.uvarint()
 	for i := uint64(0); i < hotCount && c.ok; i++ {
@@ -68,7 +104,7 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 	}
 	attrCount := c.uvarint()
 	if !c.ok {
-		return dst, false
+		return dst, 0, false
 	}
 
 	dst = append(dst, magicByte, formatVer, flagInlineNames)
@@ -76,31 +112,42 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 	countAt := len(dst)
 	dst = append(dst, 0x80, 0x80, 0x80, 0x80, 0x00) // 5-byte uvarint placeholder, patched below
 	kept := uint64(0)
+	resealed := 0
 
 	for i := uint64(0); i < attrCount && c.ok; i++ {
 		id := c.id32()
 		nodeStart := c.pos
 		skipNode(c, 0)
 		if !c.ok {
-			return dst, false
+			return dst, resealed, false
 		}
 		node := src[nodeStart:c.pos]
 		name, found := resolve(id)
 		if !found {
-			return dst, false // a record keyed by an id this table does not know: malformed
+			return dst, resealed, false // a record keyed by an id this table does not know: malformed
 		}
 		sc.nameBuf = append(sc.nameBuf[:0], name...)
 		if keep != nil && !keep(sc.nameBuf, node) {
 			continue
 		}
+		if IsEncryptedNode(node) && reseal {
+			dst = appendInlineKey(dst, sc.nameBuf)
+			var ok bool
+			if dst, ok = resealInline(dst, node, resolve, key, sc); !ok {
+				return dst, resealed, false
+			}
+			resealed++
+			kept++
+			continue
+		}
 		if IsEncryptedNode(node) {
-			plain, opened := OpenEncryptedNode(node, open)
+			plain, opened := OpenEncryptedNode(node, key)
 			if !opened {
 				continue // no key (or tampered): the value is absent to this consumer
 			}
 			dst = appendInlineKey(dst, sc.nameBuf)
 			if !appendSealedPlainInline(&dst, plain, resolve) {
-				return dst, false
+				return dst, resealed, false
 			}
 			kept++
 			continue
@@ -108,15 +155,46 @@ func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (
 		dst = appendInlineKey(dst, sc.nameBuf)
 		nc := &cursor{b: node, ok: true}
 		if !inlineNode(nc, &dst, resolve, 0) {
-			return dst, false
+			return dst, resealed, false
 		}
 		kept++
 	}
 	if !c.ok {
-		return dst, false
+		return dst, resealed, false
 	}
 	patchUvarint5(dst[countAt:countAt+5], kept)
-	return dst, true
+	return dst, resealed, true
+}
+
+// resealInline appends to dst, as an nEncrypted node, node (a sealed value from an interned ad whose ids
+// resolve names) re-keyed to the inline-names form: opened with s, its plaintext rewritten as
+// appendSealedPlainInline rewrites it, and sealed again with s. This is the only step of the resealing
+// rewrite that holds a plaintext. The opened buffer and the rewritten one (sc.plainBuf, reused across
+// calls) are zeroed before it returns, whether or not it succeeds, so no plaintext outlives it in memory
+// this package owns. On failure dst is returned as it was passed.
+func resealInline(dst, node []byte, resolve func(uint32) (string, bool), s Sealer, sc *SubsetScratch) ([]byte, bool) {
+	plain, opened := OpenEncryptedNode(node, s)
+	if !opened {
+		return dst, false
+	}
+	pt := sc.plainBuf[:0]
+	ok := appendSealedPlainInline(&pt, plain, resolve)
+	clear(plain)
+	var nonce, ct []byte
+	var err error
+	if ok {
+		nonce, ct, err = s.Seal(pt)
+	}
+	clear(pt[:cap(pt)]) // a rejected first parse may have written past len before truncating
+	sc.plainBuf = pt[:0]
+	if !ok || err != nil {
+		return dst, false
+	}
+	dst = append(dst, nEncrypted)
+	dst = binary.AppendUvarint(dst, uint64(len(nonce)))
+	dst = append(dst, nonce...)
+	dst = binary.AppendUvarint(dst, uint64(len(ct)))
+	return append(dst, ct...), true
 }
 
 // AppendInlineFromInternedUnopened appends to dst the inline-names form of src, an interned ad whose

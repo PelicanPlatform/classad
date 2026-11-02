@@ -135,17 +135,6 @@ func (t *deltaTracker) mustCompose(h uint64) {
 	t.mu.Unlock()
 }
 
-// deltaInstead records that the write next just sent to a whole record was stored as a delta after
-// all: a writer not entitled to sealed values whose whole record would have had to carry one it cannot
-// open (see encodePatchKeyless). The chain grows one past the bound, which is advisory.
-func (t *deltaTracker) deltaInstead(h uint64) {
-	t.mu.Lock()
-	t.depth[h]++
-	t.mu.Unlock()
-	t.fulls.Add(-1)
-	t.deltas.Add(1)
-}
-
 // reset empties the tracker: every chain it described has just been collapsed.
 func (t *deltaTracker) reset() {
 	t.mu.Lock()
@@ -986,7 +975,7 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isD
 	// A transaction not entitled to sealed values reads them as undefined, so composing from its read
 	// would store undefined over every one. It composes from the stored bytes instead.
 	if tx.redact && c.SealsValues() {
-		return tx.encodePatchKeyless(dst, b, h, deltaOK)
+		return tx.encodePatchKeyless(dst, b, h)
 	}
 	// A whole record is required: compose it from the stored ad plus this write's changes.
 	// b.ad is filled in so the rest of Commit (ordered-index maintenance, watch publication)
