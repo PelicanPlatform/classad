@@ -428,3 +428,73 @@ func TestASmallPassDoesNotFanOut(t *testing.T) {
 		t.Fatalf("got %v, want %d", rows, want)
 	}
 }
+
+// TestSegmentPathCountersTellTheTwoPathsApart.
+//
+// The counters are what every other test and the benchmark use to assert the columnar path ran, so
+// a counter that mislabels the row fallback as columnar makes all of those guards vacuous -- they
+// would keep passing over a pass that never touched a column. A mutation swapping the two increments
+// survived the whole suite until this test existed.
+//
+// Two fixtures over the same records, differing only in segment size. With small segments the data
+// seals and columnarizes; with segments large enough that nothing seals, every segment falls to the
+// row fallback while the rung still reports success, which is the case that made the first scaling
+// numbers here nonsense.
+func TestSegmentPathCountersTellTheTwoPathsApart(t *testing.T) {
+	build := func(segSize int) (cols, rows int64) {
+		d, err := OpenConfig(Config{SegmentSize: segSize, QueryParallelism: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer d.Close()
+		tx := d.Begin()
+		for i := 0; i < 50000; i++ {
+			ad := classad.New()
+			ad.InsertAttr("Cpus", int64(i%64))
+			tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		if !d.EnableSchemaScan(4000, 8) {
+			t.Skip("no sealed segments to accelerate")
+		}
+		c0, r0 := collections.AggSegmentPaths()
+		got, err := d.AggregateColsStats("true", nil, []AggSpec{{Func: AggSum, Arg: "Cpus"}}, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Both fixtures must produce the right answer -- the point is that the counters tell apart
+		// two paths that are indistinguishable from the result.
+		var want int64
+		for i := 0; i < 50000; i++ {
+			want += int64(i % 64)
+		}
+		if len(got) != 1 || got[0].Values[0] != fmt.Sprint(want) {
+			t.Fatalf("segSize=%d: got %v, want %d", segSize, got, want)
+		}
+		c1, r1 := collections.AggSegmentPaths()
+		return c1 - c0, r1 - r0
+	}
+
+	smallCols, smallRows := build(1 << 16)
+	if smallCols == 0 {
+		t.Fatalf("small segments: %d columnar, %d row; this fixture is meant to columnarize", smallCols, smallRows)
+	}
+	bigCols, bigRows := build(1 << 20)
+	if bigRows == 0 {
+		t.Fatalf("large segments: %d columnar, %d row; this fixture is meant to seal nothing", bigCols, bigRows)
+	}
+	if bigCols != 0 {
+		t.Fatalf("large segments: %d segments counted as columnar, but none of them has a block", bigCols)
+	}
+	// Both fixtures keep one unsealed live segment per shard, so the row count does NOT separate
+	// them -- it is the same on both sides. What separates them is that the small fixture has
+	// columnar segments and the large one has none, over identical records giving an identical
+	// answer.
+	if smallCols <= smallRows {
+		t.Fatalf("small segments: %d columnar against %d row; the columnar path should dominate here",
+			smallCols, smallRows)
+	}
+	t.Logf("small=(%d columnar, %d row)  large=(%d columnar, %d row)", smallCols, smallRows, bigCols, bigRows)
+}

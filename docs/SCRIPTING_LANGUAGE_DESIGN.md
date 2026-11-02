@@ -1915,9 +1915,31 @@ direction nobody checks.** The reasoning that set the initial value — the aggr
 per record than a `Query`, so the same bytes are a shorter pass, so the fan-out should be gated
 *lower* — is sound and gave the wrong answer, because what the fan-out has to amortize is a fixed
 cost against *total work*, and a cheaper pass per record means a given byte count is **less** work to
-win back, not more. Measured, the crossover sits far above where that reasoning put it. The lesson is
-the same one §12's item 0 records: an argument that is quantitative in form is still not a
-measurement, and this one was wrong by more than an order of magnitude while reading as obvious.
+win back, not more. Measured, the crossover sits far above where that reasoning put it:
+
+| pass size | serial vs fanned out |
+|---|---|
+| 2 MB | 0.62x — fan-out loses |
+| 4 MB | 0.73x — loses |
+| 8 MB | 0.77x — loses |
+| 16 MB | 1.05x — break-even |
+| 32 MB | **2.80x — wins** |
+| 64 MB | **2.35x — wins** |
+
+The gate went to 32 MB, 128x the value the argument produced. The lesson is the same one §12's item 0
+records: an argument that is quantitative in form is still not a measurement, and this one was wrong
+by two orders of magnitude while reading as obvious.
+
+**The gate is set where the win is decisive, not at the crossover**, and that choice is partly about
+measurement hygiene rather than about performance. A fan-out that merely breaks even is not worth
+the worker tokens it takes from concurrent queries, which draw from the same budget — so there is no
+reason to chase the crossover. And a crossover is the kind of quantity a loaded machine invents: it
+has to be re-measured per machine, where a 2x margin survives one. The numbers above were taken on a
+box under load, which biases *against* the fan-out, so the threshold is conservative by construction.
+
+A gate also needs a test from the side nobody writes. Every test here asserts the fan-out *happened*,
+so all of them would pass with the threshold deleted and every aggregate fanned out — a 25-40%
+regression no correctness test can see. `TestASmallPassDoesNotFanOut` is the other direction.
 
 #### What is left here
 
