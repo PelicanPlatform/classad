@@ -158,10 +158,13 @@ type joinPlan struct {
 	rightProject []string
 	cond         []*classad.Expr
 	post         []*classad.Expr
-	equiLeft     []*classad.Expr
-	equiRight    []*classad.Expr
-	limit        int
-	limits       JoinLimits
+	// condAlias is cond compiled to read the two sides directly, or nil when a term
+	// needs a real record. See joincond.go.
+	condAlias *aliasedCond
+	equiLeft  []*classad.Expr
+	equiRight []*classad.Expr
+	limit     int
+	limits    JoinLimits
 }
 
 // Join pairs two tables and streams the joined rows.
@@ -282,6 +285,7 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 	if p.cond, err = compileAll("ON", spec.Cond); err != nil {
 		return nil, err
 	}
+	p.condAlias = compileAliasedCond(spec.Cond, p.leftAlias, p.rightAlias)
 	if p.post, err = compileAll("WHERE", spec.Post); err != nil {
 		return nil, err
 	}
@@ -444,6 +448,11 @@ func project(ad *classad.ClassAd, attrs []string) *classad.ClassAd {
 func (p *joinPlan) condHolds(l, r *classad.ClassAd) bool {
 	if len(p.cond) == 0 {
 		return true
+	}
+	if p.condAlias != nil {
+		if held, ok := p.condAlias.holds(l, r); ok {
+			return held
+		}
 	}
 	row := classad.New()
 	row.InsertAttrClassAd(p.leftAlias, l)
