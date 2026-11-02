@@ -18,13 +18,23 @@ import (
 // the shared GROUP BY core reduces with it exactly as it reduces with SUM.
 //
 // WHAT IT COSTS, stated first because it is the thing a caller has to decide about. A built-in
-// numeric aggregate over an unconstrained column is answered WITHOUT READING THE ROWS: the columnar
-// pass computes it from statistics a zone already carries. A user-defined aggregate cannot be, for
-// a reason that is structural rather than a missing feature -- there is nothing to accumulate from,
-// because the point of that path is that the values are never visited. So the honest headline is
-// not "slower than a built-in", it is: A USER-DEFINED AGGREGATE FORFEITS THE ZONE FAST PATH, and on
-// a history table that is the difference between reading an index and scanning the rows. The cliff
-// is deliberately left visible rather than hidden: ColumnarAggregate declines AggUser outright.
+// numeric aggregate reads its argument as a CONTIGUOUS COLUMN: one pass over the column's blocks,
+// with a segment's zone map and each block's own min/max ruling whole blocks out before any value
+// is touched, and no record decode and no boxing for the values that survive. A user-defined
+// aggregate is served from the RECORD SCAN instead -- every matching record decoded, its argument
+// evaluated into a classad.Value, one call per row.
+//
+// So the honest headline is not "slower than a built-in": A USER-DEFINED AGGREGATE FORFEITS THE
+// COLUMNAR VALUE PASS. What is lost is the column layout, the block pruning and the absence of
+// boxing. What is NOT lost is reading the values, because the columnar pass reads them too -- it
+// computes the statistics it reports, it does not look them up. (The one aggregate path that truly
+// visits no values is the archive's index-resident GROUP BY count, which attributes a whole
+// segment's postings; SUM, AVG, MIN and MAX do not use that one either.)
+//
+// That distinction is worth keeping straight, because it says what could change. Nothing about this
+// interface forecloses a column-shaped accumulate riding the same pass; an aggregate that could be
+// handed a column rather than a value per row would lose only the statistics shortcut itself. The
+// cliff is deliberately left visible meanwhile: ColumnarAggregate declines AggUser outright.
 //
 // THE SAME CHANNEL COUNT(DISTINCT) ALREADY CUT. Its selector sits past AggMax, which is what routes
 // a request carrying it onto the extended RPC opcodes and makes an older server refuse rather than

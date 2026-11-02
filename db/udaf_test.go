@@ -423,8 +423,9 @@ func TestUserAggregatePanicFailsTheQueryRatherThanTheProcess(t *testing.T) {
 }
 
 // TestColumnarAggregateDeclinesAUserAggregate pins the cliff that the registry's own comment leads
-// with. The zone fast path answers from statistics without reading the rows, so there is nothing
-// for an accumulator to see; answering from them would report some other aggregate's number.
+// with. The columnar pass reports a fixed set of numeric statistics -- count, sum, extremes and the
+// type flags the built-ins need -- and an accumulator is not a function of those; answering from
+// them would report some other aggregate's number.
 func TestColumnarAggregateDeclinesAUserAggregate(t *testing.T) {
 	name := mustRegister(t, "colagg_sum", sumInts{})
 	stats := func(string) (NumStats, bool) {

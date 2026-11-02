@@ -1631,15 +1631,34 @@ structural is worth re-costing against the last feature of its shape that shippe
 draft of this section had read the code and still over-estimated, because it reasoned from the enum
 rather than from what the most recent addition to the enum had cost.
 
-**What did not change is the cliff.** The row path accumulates per group and defers the arithmetic to
-the ClassAd library's own `Sum`/`Avg`/`Min`/`Max` at the end, and a user-defined aggregate plugs in
-there cleanly. The columnar path does not read values at all: it computes the answer from a zone's
-precomputed `NumStats`. A user-defined aggregate cannot plug in there, because there is nothing to
-accumulate — the point of that path is that the rows are never visited. So the headline is not
-"slower than a built-in", it is: **a user-defined aggregate forfeits the zone fast path**, and on the
-archive that is the difference between reading an index and scanning the rows. The registry's own
-doc comment leads with that, and a test pins the decline rather than leaving it to a `default:` arm
-nobody reads.
+**The cliff is real, and the first draft of this section described the wrong one.** It said the
+columnar path "does not read values at all: it computes the answer from a zone's precomputed
+`NumStats`", and that a user-defined aggregate therefore could not plug in because the rows are never
+visited. That is false, and it was repeated from the draft into the shipped doc comment before
+anyone checked it. `NumStats` is the **output** of a columnar pass, not an input to it:
+`schemaScanStatsMulti` walks a segment's blocks, rules whole blocks out by zone map and per-block
+min/max, and then *reads the surviving column's values* into an accumulator.
+
+There are three tiers, and only the middle one is what a built-in SUM actually gets:
+
+| tier | what it reads | who uses it |
+|---|---|---|
+| index-resident | nothing — attributes a segment's postings | the archive's GROUP BY **count** only |
+| columnar value pass | the argument as a contiguous column, block-pruned, unboxed | COUNT(attr), SUM, AVG, MIN, MAX |
+| record scan | every matching record decoded, argument boxed per row | everything else, including a user-defined aggregate |
+
+So the headline is: **a user-defined aggregate forfeits the columnar value pass**. What it loses is
+the column layout, the block pruning and the absence of boxing — not the reading of values, which
+both tiers do. SUM and MIN do not get the index-resident tier either, so that one is not part of the
+gap between a built-in and a user-defined aggregate.
+
+Getting this right matters because it changes what is buildable. "The rows are never visited" makes
+the gap structural and closes the question; "the values are read from a column instead of from
+decoded records" makes it an interface question, and nothing about `Accumulator` forecloses a
+column-shaped accumulate riding the same pass. §13.6 carries that as work rather than as a
+limitation. The row path, meanwhile, accumulates per group and defers the arithmetic to the ClassAd
+library's own `Sum`/`Avg`/`Min`/`Max` at the end, and a user-defined aggregate plugs in there
+cleanly; a test pins the columnar decline rather than leaving it to a `default:` arm nobody reads.
 
 ### 13.2 Four operations, and *merge* is required and **not yet called**
 
@@ -1752,9 +1771,15 @@ mutation then died.
 - **A parallel or per-segment reduction**, which is what would make `Merge` load-bearing rather than
   merely required. Note that it is also what turns the built-in float SUM's arrival-order dependence
   from latent into live.
-- **The escape hatch for the cliff.** An aggregate that can declare itself computable from the
-  statistics a zone already holds could keep the fast path. Nothing needs it yet, and building it
-  before something does would be guessing at the shape of the declaration.
+- **A column-shaped accumulate**, which is the real answer to the cliff and is now the top of this
+  list. An aggregate handed its argument as a column — the same column `schemaScanStatsMulti`
+  already walks, block-pruned and unboxed — gets everything a built-in SUM gets except the fixed
+  statistics themselves. This is reachable because the columnar pass reads values; it was written
+  off in the first draft of this section on the false premise that it does not.
+- **The statistics shortcut**, separately and much narrower: an aggregate that can declare itself a
+  function of the `NumStats` a pass already computes (a range, a mean) could be answered from them
+  without its own accumulate. Worth far less than the item above, and worth building only after
+  something asks for it.
 - **Views**, if ever, and only behind merge-under-deletion.
 
 ---
