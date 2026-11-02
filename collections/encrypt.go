@@ -379,7 +379,7 @@ func (c *Collection) keylessComputedHides(q *vm.Query, names ...string) bool {
 }
 
 // computedFieldIDs returns the ids of every schema field some columnarized segment keeps computed values
-// for.
+// for, in the column or in a legacy region beside it.
 func (c *Collection) computedFieldIDs() map[uint32]struct{} {
 	var out map[uint32]struct{}
 	for _, sh := range c.shards {
@@ -393,14 +393,21 @@ func (c *Collection) computedFieldIDs() map[uint32]struct{} {
 				continue
 			}
 			for _, b := range cs.blocks {
+				idxs := make([]int, 0, len(b.computed)+len(b.ccols))
 				for _, e := range b.computed {
-					if b.schema == nil || e.idx >= len(b.schema.fields) {
+					idxs = append(idxs, e.idx)
+				}
+				for i := range b.ccols {
+					idxs = append(idxs, b.ccols[i].idx)
+				}
+				for _, idx := range idxs {
+					if b.schema == nil || idx >= len(b.schema.fields) {
 						continue
 					}
 					if out == nil {
 						out = map[uint32]struct{}{}
 					}
-					out[b.schema.fields[e.idx].id] = struct{}{}
+					out[b.schema.fields[idx].id] = struct{}{}
 				}
 			}
 		}
