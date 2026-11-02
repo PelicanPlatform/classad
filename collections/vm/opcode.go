@@ -146,6 +146,14 @@ const (
 	// In the scalar context a fault ends the script, which is the degenerate case of faulting the
 	// one record being evaluated.
 	OpFault
+
+	// OpLoadAlias resolves aliasRefs[A] -- a QUALIFIED reference `alias.Attr`, where alias
+	// names one side of a join -- through the evaluator's alias resolver, and pushes the
+	// result. With no alias resolver installed it evaluates the original select expression
+	// against the scope instead, which is what the reference compiled to before this opcode
+	// existed; so a program carrying one is correct either way and the opcode is purely an
+	// optimization of the case where the sides are not in one record.
+	OpLoadAlias
 )
 
 // Instr is one instruction: an opcode and a single integer argument whose

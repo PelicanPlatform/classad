@@ -19,7 +19,12 @@ import (
 // over a list of constants is compiled to its own specialized OpMember, which is
 // preferred over the generic call when it applies.
 func CompileProgram(expr ast.Expr) *Program {
-	c := &compiler{p: &Program{}, seen: map[string]bool{}}
+	return compileProgramAliases(expr, nil)
+}
+
+// compileProgramAliases is CompileProgram with the join aliases of CompileAliases known.
+func compileProgramAliases(expr ast.Expr, aliases aliasIndex) *Program {
+	c := &compiler{p: &Program{}, seen: map[string]bool{}, aliases: aliases}
 	if astHeight(expr) >= maxNativeDepth {
 		// Pathologically deep expression: delegate the whole thing to the
 		// tree-walking evaluator so its recursion-depth guard (maxEvalDepth)
@@ -99,6 +104,10 @@ type compiler struct {
 	// locals maps a folded local name to its index, for a SCRIPT. Nil for an ordinary expression, in
 	// which case every unscoped reference is an attribute. See Script.
 	locals map[string]int32
+
+	// aliases maps a case-folded join alias to its index, for an expression compiled with
+	// CompileAliases. Nil otherwise, in which case every select is delegated as before.
+	aliases aliasIndex
 }
 
 // ins appends an instruction and returns its index (for later backpatching).
@@ -223,11 +232,17 @@ func (c *compiler) emit(expr ast.Expr) {
 			c.emit(a)
 		}
 		c.ins(OpCallFunc, c.addFunc(v.Name, len(v.Args)))
+	case *ast.SelectExpr:
+		// `alias.Attr` over a declared join alias is a native load; every other select
+		// needs the record, so it delegates with the rest.
+		if c.emitAliasSelect(v) {
+			return
+		}
+		c.ins(OpEvalNode, c.addNode(expr))
 	default:
-		// ConditionalExpr, ListLiteral, RecordLiteral, SelectExpr, SubscriptExpr,
-		// or any future node: delegate to the evaluator. (A FunctionCall reaches
-		// the evaluator too, but only the ones StrictFunction refuses; the case
-		// above compiles the rest.)
+		// ConditionalExpr, ListLiteral, RecordLiteral, SubscriptExpr, or any future
+		// node: delegate to the evaluator. (A FunctionCall reaches the evaluator too,
+		// but only the ones StrictFunction refuses; the case above compiles the rest.)
 		c.ins(OpEvalNode, c.addNode(expr))
 	}
 }
