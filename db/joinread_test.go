@@ -233,11 +233,20 @@ func TestNonLiteralEquiHalfDeclinesOneSide(t *testing.T) {
 	}
 }
 
-// TestWireRowsSurviveTheirBuffer pins the assumption decodeWireRows rests on. Wire rows alias
-// a buffer the scan reuses, and a join HOLDS the hashed side, so if decoding aliased those
-// bytes every held row would be overwritten by the next one and the join would silently
-// produce rows built from the wrong record. Decoding copies; this fails if that changes.
-func TestWireRowsSurviveTheirBuffer(t *testing.T) {
+// TestHeldWireRowsSurviveTheirBuffer pins the copy wireRows makes.
+//
+// Each row a raw scan yields aliases a buffer the scan REUSES, and a join holds rows: the
+// whole hashed side, and the streamed side too whenever the index probe held it to count
+// keys. Keeping the slice as handed over would leave every held row pointing at whatever the
+// scan last decoded into that buffer -- so the join would pair rows that look like the LAST
+// row of the side, silently, with no error anywhere.
+//
+// Decoding used to hide this, because the decoder copies every string it reads. That is a
+// property of another package and it no longer stands between the join and the bytes.
+//
+// Both ways of reading a held row are checked, because they are different code: attr reads
+// the bytes directly, and record decodes them.
+func TestHeldWireRowsSurviveTheirBuffer(t *testing.T) {
 	cat := readJoinFixture(t)
 	d, ok := cat.Table("history")
 	if !ok {
@@ -247,17 +256,20 @@ func TestWireRowsSurviveTheirBuffer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var held []*classad.ClassAd
-	for ad := range decodeWireRows(rows) {
-		held = append(held, ad)
+	var held []*joinRow
+	for r := range wireRows(rows) {
+		held = append(held, r)
 	}
 	if len(held) != 24 {
 		t.Fatalf("held %d rows, want 24", len(held))
 	}
-	// Every ad was decoded before the buffer moved on; all of them must still read right.
+	// Reading the bytes, which is what a hash key and a condition do.
 	seen := map[int64]bool{}
-	for i, ad := range held {
-		v := ad.EvaluateAttr("ClusterId")
+	for i, r := range held {
+		v, fromWire := r.attr("ClusterId")
+		if !fromWire {
+			t.Fatalf("row %d: ClusterId is an integer literal; it should read off the wire", i)
+		}
 		n, verr := v.IntValue()
 		if verr != nil {
 			t.Fatalf("row %d: ClusterId did not survive the buffer: %v", i, verr)
@@ -266,10 +278,21 @@ func TestWireRowsSurviveTheirBuffer(t *testing.T) {
 			t.Fatalf("ClusterId %d seen twice: held rows alias one reused buffer", n)
 		}
 		seen[n] = true
-		o := ad.EvaluateAttr("Owner")
+		o, _ := r.attr("Owner")
 		s, serr := o.StringValue()
 		if serr != nil || !strings.HasPrefix(s, "user") {
 			t.Fatalf("row %d: Owner did not survive the buffer: %q (%v)", i, s, serr)
+		}
+	}
+	// And decoding them, which is what the output row does.
+	for i, r := range held {
+		ad := r.record()
+		n, verr := ad.EvaluateAttr("ClusterId").IntValue()
+		if verr != nil {
+			t.Fatalf("row %d: decoded ClusterId did not survive the buffer: %v", i, verr)
+		}
+		if !seen[n] {
+			t.Fatalf("row %d: decoded ClusterId %d is not one the bytes reported", i, n)
 		}
 	}
 }

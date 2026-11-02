@@ -76,16 +76,20 @@ func compileAliasedCond(srcs []string, leftAlias, rightAlias string) *aliasedCon
 //
 // A nil right side -- an unmatched LEFT row -- resolves undefined for every attribute of it,
 // which is what an absent member of the composite evaluates to.
-func (a *aliasedCond) holds(l, r *classad.ClassAd) (held, ok bool) {
+func (a *aliasedCond) holds(l, r *joinRow) (held, ok bool) {
 	resolve := func(side int, name string) classad.Value {
-		ad := l
+		row := l
 		if side == rightSide {
-			ad = r
+			row = r
 		}
-		if ad == nil {
+		if row == nil {
 			return classad.NewUndefinedValue()
 		}
-		return ad.EvaluateAttr(name)
+		// The row answers from its bytes when it can, and is decoded when it cannot.
+		// Which of the two happened is invisible here and must stay so: the value is the
+		// same either way, and a condition that read differently depending on how its row
+		// arrived would make the join's answer depend on the read plan.
+		return row.eval(name)
 	}
 	// An unqualified reference in an ON term names an attribute of the joined row itself,
 	// and the joined row has only the two members. So it is undefined, which is what it

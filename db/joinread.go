@@ -7,7 +7,6 @@ import (
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/vm"
-	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/PelicanPlatform/classad/parser"
 )
 
@@ -210,7 +209,7 @@ func (s *attrSet) union(project []string) []string {
 // every refusal does: no projection was planned, the store cannot serve wire rows, or a row
 // did not decode. None of those is an error, because the whole-ad read answers all of them.
 
-func narrowTableRead(d *DB, constraint string, read []string) (iter.Seq[*classad.ClassAd], bool) {
+func narrowTableRead(d *DB, constraint string, read []string) (iter.Seq[*joinRow], bool) {
 	if len(read) == 0 {
 		return nil, false
 	}
@@ -218,10 +217,10 @@ func narrowTableRead(d *DB, constraint string, read []string) (iter.Seq[*classad
 	if err != nil {
 		return nil, false
 	}
-	return decodeWireRows(rows), true
+	return wireRows(rows), true
 }
 
-func narrowArchiveRead(a *ArchiveTable, constraint string, read []string) (iter.Seq[*classad.ClassAd], bool) {
+func narrowArchiveRead(a *ArchiveTable, constraint string, read []string) (iter.Seq[*joinRow], bool) {
 	if len(read) == 0 {
 		return nil, false
 	}
@@ -229,28 +228,5 @@ func narrowArchiveRead(a *ArchiveTable, constraint string, read []string) (iter.
 	if err != nil {
 		return nil, false
 	}
-	return decodeWireRows(rows), true
-}
-
-// decodeWireRows turns wire-form rows into ads.
-//
-// Each row aliases a buffer the scan reuses, and the hashed side of a join is HELD, so a
-// decoded ad must not point into those bytes. It does not: the decoder copies every string
-// and name it reads out of the buffer, which TestWireRowsSurviveTheirBuffer pins, because
-// that is a property of another package that this one would corrupt rows by assuming.
-//
-// A row that will not decode is dropped rather than failing the join. It cannot be: these
-// bytes were just assembled by the store from a record it had already read.
-func decodeWireRows(rows iter.Seq[[]byte]) iter.Seq[*classad.ClassAd] {
-	return func(yield func(*classad.ClassAd) bool) {
-		for row := range rows {
-			a, err := wire.DecodeInline(row)
-			if err != nil {
-				continue
-			}
-			if !yield(classad.FromAST(a)) {
-				return
-			}
-		}
-	}
+	return wireRows(rows), true
 }
