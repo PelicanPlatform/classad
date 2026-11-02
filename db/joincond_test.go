@@ -133,7 +133,8 @@ func TestAliasedCondHoldsDeclines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := a.holds(ad, ad); ok {
+	row := &joinRow{ad: ad}
+	if _, ok := a.holds(row, row); ok {
 		t.Fatal("holds accepted a term EvalAliased declined; the caller would keep an undefined answer")
 	}
 	// And the whole point: compileAliasedCond would not have produced this.

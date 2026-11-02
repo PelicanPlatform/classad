@@ -168,8 +168,13 @@ type joinPlan struct {
 	postAlias *aliasedCond
 	equiLeft  []*classad.Expr
 	equiRight []*classad.Expr
-	limit     int
-	limits    JoinLimits
+	// equiLeftAttr and equiRightAttr name the attribute each equality half reads when it
+	// is a bare reference, and are empty when it is anything else. A bare half is read off
+	// the row's bytes; anything else is evaluated against the decoded ad. See key.
+	equiLeftAttr  []string
+	equiRightAttr []string
+	limit         int
+	limits        JoinLimits
 }
 
 // Join pairs two tables and streams the joined rows.
@@ -187,6 +192,20 @@ func (cat *Catalog) Join(spec JoinSpec, want JoinLimits, stats *JoinStats) (iter
 // against its own defaults before it gets here, which is what keeps "a caller can only ask
 // for less" a property of every entry point rather than of this one.
 func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats) (iter.Seq[*classad.ClassAd], error) {
+	return joinStream(cat, spec, limits, stats,
+		func(p *joinPlan, l, r *joinRow) (*classad.ClassAd, bool) { return p.composite(l, r), true })
+}
+
+// joinStream is the join with the form of its output rows left to the caller: mk turns a
+// surviving pair into one row, and reports false to drop it.
+//
+// It exists so that a caller wanting something other than a composite ClassAd -- rows
+// rendered straight from the two sides' wire bytes, say -- gets the SAME pair loop rather
+// than a second one beside it. The loop is where a join's correctness lives: which pairs the
+// condition keeps, when an unmatched LEFT row is null-extended, which limit stops what. A
+// second copy of that is a second set of answers to those questions.
+func joinStream[T any](cat *Catalog, spec JoinSpec, limits JoinLimits, stats *JoinStats,
+	mk func(p *joinPlan, l, r *joinRow) (T, bool)) (iter.Seq[T], error) {
 	p, err := compileJoin(spec, limits)
 	if err != nil {
 		return nil, err
@@ -215,7 +234,7 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 		}
 		// The streamed side was held to count its keys; stream it from there either way,
 		// so declining the probe does not cost a second scan.
-		scanSeq = adsSeq(probe.held)
+		scanSeq = rowsSeq(probe.held)
 	} else {
 		stats.ProbeWhy = why
 		// A nil probe can mean the decision gave up PART WAY through the streamed side --
@@ -232,15 +251,15 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 	if err != nil {
 		return nil, err
 	}
-	return p.run(hashSeq, scanSeq, stats), nil
+	return runJoin(p, hashSeq, scanSeq, stats, mk), nil
 }
 
-// joinSource resolves one side to a sequence of its ads, whatever kind of thing it names.
+// joinSource resolves one side to a sequence of its rows, whatever kind of thing it names.
 //
 // A view resolves to BOTH of its halves. A continuous aggregate moves closed buckets out of
 // its live backing into an archive, so a join that read only the backing would silently join
 // against the unsealed tail -- the same bug the read paths had.
-func (cat *Catalog) joinSource(s JoinSide, read []string) (iter.Seq[*classad.ClassAd], error) {
+func (cat *Catalog) joinSource(s JoinSide, read []string) (iter.Seq[*joinRow], error) {
 	constraint := s.Constraint
 	if strings.TrimSpace(constraint) == "" {
 		constraint = "true"
@@ -249,7 +268,11 @@ func (cat *Catalog) joinSource(s JoinSide, read []string) (iter.Seq[*classad.Cla
 		if seq, narrowed := narrowTableRead(d, constraint, read); narrowed {
 			return seq, nil
 		}
-		return d.Query(constraint)
+		ads, err := d.Query(constraint)
+		if err != nil {
+			return nil, err
+		}
+		return adRows(ads), nil
 	}
 	if d, ok := cat.ViewBacking(s.Table); ok {
 		live, err := d.Query(constraint)
@@ -258,17 +281,17 @@ func (cat *Catalog) joinSource(s JoinSide, read []string) (iter.Seq[*classad.Cla
 		}
 		v, has := cat.View(s.Table)
 		if !has {
-			return live, nil
+			return adRows(live), nil
 		}
 		arch, sealed := v.SealedArchive()
 		if !sealed {
-			return live, nil
+			return adRows(live), nil
 		}
 		old, err := arch.Query(constraint)
 		if err != nil {
 			return nil, err
 		}
-		return func(yield func(*classad.ClassAd) bool) {
+		return adRows(func(yield func(*classad.ClassAd) bool) {
 			for ad := range live {
 				if !yield(ad) {
 					return
@@ -279,13 +302,17 @@ func (cat *Catalog) joinSource(s JoinSide, read []string) (iter.Seq[*classad.Cla
 					return
 				}
 			}
-		}, nil
+		}), nil
 	}
 	if a, ok := cat.ArchiveTable(s.Table); ok {
 		if seq, narrowed := narrowArchiveRead(a, constraint, read); narrowed {
 			return seq, nil
 		}
-		return a.Query(constraint)
+		ads, err := a.Query(constraint)
+		if err != nil {
+			return nil, err
+		}
+		return adRows(ads), nil
 	}
 	return nil, fmt.Errorf("no such table: %s", s.Table)
 }
@@ -322,6 +349,8 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 		}
 		p.equiLeft = append(p.equiLeft, l)
 		p.equiRight = append(p.equiRight, r)
+		p.equiLeftAttr = append(p.equiLeftAttr, bareAttrName(e.Left))
+		p.equiRightAttr = append(p.equiRightAttr, bareAttrName(e.Right))
 	}
 	return p, nil
 }
@@ -338,16 +367,18 @@ func compileAll(what string, srcs []string) ([]*classad.Expr, error) {
 	return out, nil
 }
 
-// run builds the hash from one side and streams the other against it.
-func (p *joinPlan) run(hashSeq, scanSeq iter.Seq[*classad.ClassAd], stats *JoinStats) iter.Seq[*classad.ClassAd] {
-	return func(yield func(*classad.ClassAd) bool) {
+// runJoin builds the hash from one side and streams the other against it, handing each
+// surviving pair to mk for the caller's row form.
+func runJoin[T any](p *joinPlan, hashSeq, scanSeq iter.Seq[*joinRow], stats *JoinStats,
+	mk func(p *joinPlan, l, r *joinRow) (T, bool)) iter.Seq[T] {
+	return func(yield func(T) bool) {
 		// Hash the right side on the equality keys when there are any; otherwise every
 		// left row is paired against every right row and decided by the condition alone.
-		var buckets map[string][]*classad.ClassAd
-		var all []*classad.ClassAd
+		var buckets map[string][]*joinRow
+		var all []*joinRow
 		hashed := len(p.equiRight) > 0
 		if hashed {
-			buckets = map[string][]*classad.ClassAd{}
+			buckets = map[string][]*joinRow{}
 		}
 		for ad := range hashSeq {
 			if stats.HashRows >= p.limits.MaxHashRows {
@@ -395,12 +426,12 @@ func (p *joinPlan) run(hashSeq, scanSeq iter.Seq[*classad.ClassAd], stats *JoinS
 				// SEPARATE question, and conflating the two is a wrong answer: a matched
 				// row that WHERE drops must not come back as a null-extended one.
 				matched = true
-				if stop := p.emit(l, r, stats, yield); stop {
+				if stop := emitJoin(p, l, r, stats, mk, yield); stop {
 					return
 				}
 			}
 			if !matched && p.kind == JoinLeft {
-				if stop := p.emit(l, nil, stats, yield); stop {
+				if stop := emitJoin(p, l, nil, stats, mk, yield); stop {
 					return
 				}
 			}
@@ -414,11 +445,15 @@ func (p *joinPlan) run(hashSeq, scanSeq iter.Seq[*classad.ClassAd], stats *JoinS
 // emit forms the joined row, applies the post-filter and yields it. It reports only whether
 // the join should STOP -- whether the row survived the filter is deliberately not reported,
 // because the one caller that used to branch on it drew the wrong conclusion from it.
-func (p *joinPlan) emit(l, r *classad.ClassAd, stats *JoinStats, yield func(*classad.ClassAd) bool) (stop bool) {
+func emitJoin[T any](p *joinPlan, l, r *joinRow, stats *JoinStats,
+	mk func(p *joinPlan, l, r *joinRow) (T, bool), yield func(T) bool) (stop bool) {
 	if !p.postHolds(l, r) {
 		return false
 	}
-	row := p.composite(l, r)
+	row, ok := mk(p, l, r)
+	if !ok {
+		return false // the row form could not be made; it is not a reason to stop
+	}
 	if stats.Rows >= p.limits.MaxRows {
 		stats.Err = fmt.Errorf("the join produced more than %d rows; narrow it with a constraint",
 			p.limits.MaxRows)
@@ -441,7 +476,7 @@ func (p *joinPlan) emit(l, r *classad.ClassAd, stats *JoinStats, yield func(*cla
 // undefined, exactly as it is for the ON condition. Dropping the row here does NOT bring it
 // back null-extended: run decides that from whether the pair MATCHED, which is a separate
 // question answered before this (see the comment there).
-func (p *joinPlan) postHolds(l, r *classad.ClassAd) bool {
+func (p *joinPlan) postHolds(l, r *joinRow) bool {
 	if len(p.post) == 0 {
 		return true
 	}
@@ -451,13 +486,15 @@ func (p *joinPlan) postHolds(l, r *classad.ClassAd) bool {
 		}
 	}
 	// A term the alias compiler would not take reads the sides out of a composite, which is
-	// built WITHOUT the output projection for the reason above.
+	// built WITHOUT the output projection for the reason above. Building it decodes both
+	// sides, which is exactly what the wire form avoids -- so it is built only here, for the
+	// terms that genuinely need a record.
 	row := classad.New()
 	if l != nil {
-		row.InsertAttrClassAd(p.leftAlias, l)
+		row.InsertAttrClassAd(p.leftAlias, l.record())
 	}
 	if r != nil {
-		row.InsertAttrClassAd(p.rightAlias, r)
+		row.InsertAttrClassAd(p.rightAlias, r.record())
 	}
 	for _, ex := range p.post {
 		if !isTrue(ex.Eval(row)) {
@@ -470,13 +507,13 @@ func (p *joinPlan) postHolds(l, r *classad.ClassAd) bool {
 // composite builds the joined row: one ClassAd whose members are the two sides under their
 // aliases. A nil right side -- an unmatched LEFT row -- is simply absent, so every reference
 // through its alias evaluates to undefined.
-func (p *joinPlan) composite(l, r *classad.ClassAd) *classad.ClassAd {
+func (p *joinPlan) composite(l, r *joinRow) *classad.ClassAd {
 	row := classad.New()
 	if l != nil {
-		row.InsertAttrClassAd(p.leftAlias, project(l, p.leftProject))
+		row.InsertAttrClassAd(p.leftAlias, l.member(p.leftProject))
 	}
 	if r != nil {
-		row.InsertAttrClassAd(p.rightAlias, project(r, p.rightProject))
+		row.InsertAttrClassAd(p.rightAlias, r.member(p.rightProject))
 	}
 	return row
 }
@@ -504,7 +541,7 @@ func project(ad *classad.ClassAd, attrs []string) *classad.ClassAd {
 // not commutative: the only way `A && B` is true is for both to be true, which does not
 // depend on their order. The VALUE of the conjunction is order-dependent; the match set is
 // not.
-func (p *joinPlan) condHolds(l, r *classad.ClassAd) bool {
+func (p *joinPlan) condHolds(l, r *joinRow) bool {
 	if len(p.cond) == 0 {
 		return true
 	}
@@ -514,9 +551,9 @@ func (p *joinPlan) condHolds(l, r *classad.ClassAd) bool {
 		}
 	}
 	row := classad.New()
-	row.InsertAttrClassAd(p.leftAlias, l)
+	row.InsertAttrClassAd(p.leftAlias, l.record())
 	if r != nil {
-		row.InsertAttrClassAd(p.rightAlias, r)
+		row.InsertAttrClassAd(p.rightAlias, r.record())
 	}
 	for _, ex := range p.cond {
 		if !isTrue(ex.Eval(row)) {
@@ -532,17 +569,29 @@ func (p *joinPlan) condHolds(l, r *classad.ClassAd) bool {
 // rendered through float64 whatever its stored width and a string is folded: ClassAd compares
 // 1 and 1.0 equal, and strings case-insensitively. Anything with no scalar form -- undefined,
 // error, a list, a nested ad -- equals nothing and reports false.
-func (p *joinPlan) key(ad *classad.ClassAd, left bool) (string, bool) {
+func (p *joinPlan) key(row *joinRow, left bool) (string, bool) {
 	var b strings.Builder
 	for i := range p.equiLeft {
 		ex := p.equiRight[i]
 		if left {
 			ex = p.equiLeft[i]
 		}
+		// An equality half is a bare attribute name in every plan that drives a hash, and
+		// then the row answers it without being decoded. Anything else is an expression
+		// that has to be evaluated in the context of its own ad.
+		var v classad.Value
+		name := p.equiRightAttr[i]
+		if left {
+			name = p.equiLeftAttr[i]
+		}
+		if name != "" {
+			v = row.eval(name)
+		} else {
+			v = ex.Eval(row.record())
+		}
 		// Each accessor's error is consulted rather than discarded: a value that claims a
 		// kind and then will not produce it has no key, and hashing the zero it returns
 		// would put it in a bucket it does not belong to.
-		v := ex.Eval(ad)
 		switch {
 		case v.IsBool():
 			x, err := v.BoolValue()

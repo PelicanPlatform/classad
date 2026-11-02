@@ -80,7 +80,7 @@ type joinProbe struct {
 	attr string // the bare attribute the constraint names
 	rows int    // rows the hashed side holds in total
 	keys int    // distinct key values the streamed side turned out to hold
-	held []*classad.ClassAd
+	held []*joinRow
 	cons string // the membership constraint
 }
 
@@ -94,7 +94,7 @@ type joinProbe struct {
 // pays before it knows the answer. So the gates that need no scan come first: one equality
 // on a bare attribute, an index covering it, no constraint of the hashed side's own, and a
 // hashed side big enough to be worth avoiding. Only then is the other side read.
-func (cat *Catalog) planIndexProbe(p *joinPlan, spec JoinSpec, scanSeq iter.Seq[*classad.ClassAd]) (*joinProbe, string) {
+func (cat *Catalog) planIndexProbe(p *joinPlan, spec JoinSpec, scanSeq iter.Seq[*joinRow]) (*joinProbe, string) {
 	if len(p.equiLeft) != 1 {
 		if len(p.equiLeft) == 0 {
 			return nil, "the condition has no equality to probe an index with"
@@ -141,7 +141,7 @@ func (cat *Catalog) planIndexProbe(p *joinPlan, spec JoinSpec, scanSeq iter.Seq[
 	// bound the hashed side has -- so a join that takes this path can hold two bounded
 	// sides rather than one. That is the price of the decision, and it is why every gate
 	// that can be checked without reading a row is checked above.
-	held := make([]*classad.ClassAd, 0, 256)
+	held := make([]*joinRow, 0, 256)
 	seen := make(map[string]bool, 256)
 	var lits []string
 	for ad := range scanSeq {
@@ -154,7 +154,16 @@ func (cat *Catalog) planIndexProbe(p *joinPlan, spec JoinSpec, scanSeq iter.Seq[
 		if len(lits) > maxProbeKeys {
 			continue // already past the cap; keep reading so the held side stays complete
 		}
-		lit, ok := joinKeyLiteral(p.equiLeft[0].Eval(ad))
+		// The same bare-attribute shortcut the hash key uses: the probe reads the FIRST
+		// equality half of every streamed row, so decoding each one to read one attribute
+		// is the cost this scan exists to avoid.
+		var kv classad.Value
+		if name := p.equiLeftAttr[0]; name != "" {
+			kv = ad.eval(name)
+		} else {
+			kv = p.equiLeft[0].Eval(ad.record())
+		}
+		lit, ok := joinKeyLiteral(kv)
 		if !ok {
 			// No usable key value: this row matches nothing through the equality, so it
 			// contributes no term -- and must not narrow the other side on its behalf.
