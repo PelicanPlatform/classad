@@ -85,6 +85,11 @@ type Program struct {
 	// and must be read-only once compiled.
 	vops []int32
 
+	// refSlots[i] is the cache slot for refs[i], or -1 when that column is named once and is loaded
+	// straight onto the stack. nColSlots is how many slots there are. See veccolcache.go.
+	refSlots  []int32
+	nColSlots int
+
 	// hasStatements marks a program with statement-level control flow -- an If or a While. It is set
 	// by the script builder rather than derived, because the vector executor needs it BEFORE it has
 	// looked at an instruction: it decides whether to set up the predication planes, which cost about

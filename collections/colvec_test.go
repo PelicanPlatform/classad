@@ -183,6 +183,10 @@ func BenchmarkVectorEval(b *testing.B) {
 	for _, expr := range []string{
 		"RequestMemory > 4096",
 		"RequestMemory > 4096 && RequestCpus >= 4",
+		// A RANGE predicate: one column constrained from both sides, which is the shape that names
+		// the same column twice and therefore decompressed it twice.
+		"RequestMemory > 2048 && RequestMemory < 8192",
+		"RequestCpus >= 2 && RequestCpus <= 8 && RequestMemory > 1024",
 		"RequestMemory > RequestCpus * 512",
 		"RequestMemory > 4096 && (JobStatus == 1 || JobStatus == 4)",
 		"WantCheckpoint && RequestCpus > 2",

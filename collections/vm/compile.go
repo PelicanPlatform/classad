@@ -34,6 +34,7 @@ func CompileProgram(expr ast.Expr) *Program {
 	c.p.readAttrs = collectReads(expr, map[string]bool{}, nil)
 	c.p.expr = expr
 	c.p.vops = vopPrefix(c.p.code)
+	c.p.refSlots, c.p.nColSlots = colSlots(c.p.refs)
 	return c.p
 }
 
