@@ -172,8 +172,14 @@ func feedRender(t *testing.T, ev Event, dropUndefined bool) string {
 	return fmt.Sprintf("%s src=%s ver=%d key=%s ts=%d %s", ev.Kind, ev.Src, ev.Ver, ev.Key, ev.TS, ad)
 }
 
-// feedRun writes feedSteps and the sentinel to a fresh store, subscribes from the beginning under opts,
-// and returns the stream through the sentinel's event.
+// feedRun writes feedSteps to a fresh store, subscribes from the beginning under opts, and returns the
+// stream through the sentinel's event.
+//
+// The sentinel is written only once the synced event has arrived. A subscription replays everything
+// visible when its watch snapshots the end of catch-up, and that snapshot is taken after the response
+// headers the client is waiting on: a sentinel written before it is replayed in shard order rather than
+// delivered live, so it need not come last, and the read below would stop on it and drop the rest of the
+// catch-up along with synced.
 func feedRun(t *testing.T, store feedStore, opts ServerOptions, constraint string, dropUndefined bool) []string {
 	t.Helper()
 	cat, tbl := feedCatalog(t, store)
@@ -187,10 +193,14 @@ func feedRun(t *testing.T, store feedStore, opts ServerOptions, constraint strin
 	if status != http.StatusOK {
 		t.Fatalf("subscribe %q: status %d", constraint, status)
 	}
-	feedApply(t, tbl, store, []feedStep{feedSentinel})
 	var got []string
+	sent := false
 	for ev := range events {
 		got = append(got, feedRender(t, ev, dropUndefined))
+		if ev.Kind == replicate.KindSynced && !sent {
+			sent = true
+			feedApply(t, tbl, store, []feedStep{feedSentinel})
+		}
 		if ev.Key == feedSentinel.key {
 			cancel()
 			return got
