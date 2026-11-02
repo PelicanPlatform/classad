@@ -2003,6 +2003,24 @@ in a different order, and an exactly-known count per owner. The test asserts the
 group's value, that no owner appears twice, and that the per-group counts sum to the record count —
 the last two being what a split and a fusion respectively look like from outside.
 
+**A test that was flaky because its premise was false, which is worth more than the test.** The
+decline test here first used §13.8's technique: store an expression-valued cell, which the pass
+cannot read, and assert it declines. It passed in isolation and failed about one run in four — *by
+reporting a correct answer*. The grouped path has a scoped tier that **evaluates** such a cell: 10
+declines in 12 runs over an identical fixture, every serving run agreeing with the scan. The fixture
+was not provoking the condition under test, it was racing a tier choice. The ungrouped pass has no
+such tier, which is the whole reason the technique is sound one section up, and nothing said so.
+
+Two theories were wrong on the way to that and are recorded so they are not re-derived: a constant
+expression is **not** folded by the encoder (`1 + 1` is stored as `(1 + 1)`), and the parallel path
+is **not** failing to propagate declines. What settled it was catching the serving case and
+comparing it against the scan oracle — the check that should have come first, since "is the answer
+wrong, or is my expectation wrong" is the only question that distinguishes a bug from a bad test.
+
+The decline is now injected through a test-only hook. What is under test is the fan-out's handling
+of a decline, not the storage condition that provokes one, and injecting it makes the distinction
+explicit instead of relying on a fixture to hold a tier choice still.
+
 ---
 
 ## 14. The vector script executor, specified
