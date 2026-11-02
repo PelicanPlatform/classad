@@ -18,10 +18,31 @@ import (
 // to whichever worker is free rather than to whichever worker drew the long straw.
 
 // defaultAggMinBytes is the minimum live segment bytes an aggregate pass must cover before fan-out
-// is worth its fixed cost. It is lower than a Query's because the per-record work is lower: the same
-// bytes are a shorter pass, so the threshold that a Query needs to clear would gate out aggregate
-// passes that fan out profitably. Benchmark-tuned.
-const defaultAggMinBytes = 1 << 18
+// is worth its fixed cost.
+//
+// It is far HIGHER than a Query's 1 MiB, which is the opposite of what the obvious argument
+// predicts, and the argument is worth writing down because it is wrong in a way that reads as
+// obvious: the aggregate pass is cheaper per record than a Query, so the same bytes are a shorter
+// pass, so the gate should be lower. What a fan-out has to amortize is a fixed cost against TOTAL
+// WORK, and a cheaper pass per record means a given byte count is LESS work to win back, not more.
+// Cheaper per record argues the threshold UP.
+//
+// Measured, serial against fanned out, over the same data (BenchmarkAggParallel), the built-in and
+// user-defined arms agreeing at every size:
+//
+//	 2 MB  0.62x   fan-out loses
+//	 4 MB  0.73x   loses
+//	 8 MB  0.77x   loses
+//	16 MB  1.05x   break-even
+//	32 MB  2.80x   wins
+//	64 MB  2.35x   wins
+//
+// The gate is set where the win is DECISIVE rather than at the crossover, for two reasons. A
+// fan-out that merely breaks even is not worth taking worker tokens from concurrent queries, which
+// draw from the same budget. And a crossover is a quantity a noisy machine invents: it has to be
+// re-measured per machine, where a 2x margin survives one. These numbers were taken on a loaded
+// box, which biases against the fan-out, so the threshold is conservative by construction.
+const defaultAggMinBytes = 1 << 25
 
 // aggFanouts counts the aggregate passes that actually fanned out.
 //
@@ -34,6 +55,28 @@ var aggFanouts atomic.Int64
 // AggFanouts reports how many aggregate passes have fanned out across segments. Test-only
 // observability; see aggFanouts.
 func AggFanouts() int64 { return aggFanouts.Load() }
+
+// Segments the aggregate pass answered from a columnar block, and segments it had to read record by
+// record instead.
+//
+// WHY THESE EXIST. The row fallback costs 17-26x what a columnar block costs per record, and the
+// pass reports success either way -- so a request served ENTIRELY from the row fallback is an order
+// of magnitude off its advertised cost and nothing in the answer says so. That is not hypothetical:
+// a fixture built with segments large enough that none of them had sealed sent every segment down
+// the row fallback, and the first scaling numbers taken off it were nonsense in a way that read as
+// a surprising result rather than as a broken fixture. A benchmark or test that means to measure the
+// columnar path can now assert it ran, instead of inferring it from a timing that is exactly what is
+// in question.
+var (
+	aggColSegments atomic.Int64
+	aggRowSegments atomic.Int64
+)
+
+// AggSegmentPaths reports how many segments the aggregate value pass has answered from a columnar
+// block and how many it has read record by record. See the note above the counters.
+func AggSegmentPaths() (columnar, row int64) {
+	return aggColSegments.Load(), aggRowSegments.Load()
+}
 
 // valuesPar runs the columnar value pass over every segment, fanning it across workers when the
 // pass is large enough and the collection's worker budget has capacity.

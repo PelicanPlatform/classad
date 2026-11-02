@@ -1846,14 +1846,89 @@ mutation then died.
 - **The wire.** A frame that can carry an aggregate's name, under its own opcode, with the
   `ErrExtendedAggregateUnsupported` precedent for a server too old to know it. Until then a
   user-defined aggregate runs against the `db` package in process.
-- **A parallel or per-segment reduction**, which is what would make `Merge` load-bearing rather than
-  merely required. Note that it is also what turns the built-in float SUM's arrival-order dependence
-  from latent into live.
+- ~~**A parallel or per-segment reduction**~~ — **built, for the ungrouped pass; see §13.8.** It did
+  make `Merge` load-bearing, and it did turn the built-in float SUM's arrival-order dependence from
+  latent into live, both exactly as predicted here.
 - **The statistics shortcut**, separately and much narrower: an aggregate that can declare itself a
   function of the `NumStats` a pass already computes (a range, a mean) could be answered from them
   without its own accumulate. Worth far less than the item above, and worth building only after
   something asks for it.
 - **Views**, if ever, and only behind merge-under-deletion.
+
+---
+
+### 13.8 Fanning the pass out, and what the measurement said instead
+
+The pass walks segment windows, and a segment window is what a parallel `Query` already fans out
+over: immutable bytes, lock-free reads, no cross-segment dependency. So the fan-out is the existing
+one with a different consumer — work stolen a window at a time, one accumulator per worker, folded
+on the calling goroutine once every worker has returned.
+
+**The fold is the caller's, not the pass's**, through a `newSink`/`merge` pair, because the two
+callers fold different things: `NumStats` merges field by field, and a user-defined aggregate merges
+with its own `Merge`. Three promises make an unsynchronized accumulator safe, and they are worth
+stating because they are what a reader has to check rather than infer: `newSink` is called once per
+worker **on the calling goroutine** before any worker starts; each sink is fed by **exactly one**
+goroutine; `merge` runs **on the calling goroutine** after every worker has returned, and not at all
+if the pass declined. The serial path calls both the same way, so a caller has one path to get right
+rather than two.
+
+**`Merge`'s laws turned out to be exactly the fan-out's preconditions, which is not a coincidence but
+is worth noticing.** `CheckAggregate` already enforces associativity, commutativity and identity
+because §13.2 argued a parallel reduction would need them. Which worker draws which segment is a
+race, so the fold order is not fixed between two runs of the same query — and that is precisely the
+hypothesis those three laws discharge. The laws were written against an imagined caller and fit the
+real one without amendment.
+
+**Exactly one field moved, and the test says so.** `TestStatsAccumMergeMatchesOnePass` splits a value
+list at every split point and compares the merged accumulator against one serial pass, field by
+field. It failed the first time it ran, on `Sum` and on nothing else — float64 addition is not
+associative, so a different grouping lands on different last bits. Everything else is exact and is
+compared exactly: `IntSum` accumulates in `int64`, and `Min`/`Max` are comparisons rather than
+accumulations, so no grouping can move them. The test states the float difference as a **bound** —
+within a relative epsilon of the sum of the magnitudes, which is the error bound float summation
+actually obeys — rather than widening the comparison until it passes. §13.6 predicted this field and
+no other; it is pleasant to have the prediction land, and it would have been much easier to ship a
+tolerance over the whole struct and never find out.
+
+**A declining worker aborts the whole pass.** The alternative — drop that window, let the others
+answer — returns an aggregate over a subset of the records as though it covered all of them, which
+is the exact failure every rung of this ladder exists to avoid. The fold does not run either, so no
+caller can read a partial accumulator by mistake.
+
+#### What the measurement said that the design did not
+
+Two things, neither of which was in the plan.
+
+**The row fallback, not the columnar block, is where the time goes — and the fast path reports
+success while taking it.** Instrumenting the pass per path gave **~12 ns/record through a columnar
+block and ~206-315 ns/record through the row fallback**, a 17-26x gap. On a fixture built with 1 MiB
+segments, *every* segment fell to the row fallback — `blocks=0` — because nothing had sealed, and the
+`columnar-aggregate` rung answered, correctly and 15x slower than it looks, with nothing in the
+result saying which path ran. The first scaling numbers off that fixture were nonsense for this
+reason, and the only thing that caught it was counting what the pass actually did rather than
+trusting the rung's name. A rung that can silently degrade needs an observable that says it did; this
+one still does not have one, and that belongs on the list below.
+
+**The threshold is not the `Query` threshold, and borrowing it would have been wrong in the
+direction nobody checks.** The reasoning that set the initial value — the aggregate pass is cheaper
+per record than a `Query`, so the same bytes are a shorter pass, so the fan-out should be gated
+*lower* — is sound and gave the wrong answer, because what the fan-out has to amortize is a fixed
+cost against *total work*, and a cheaper pass per record means a given byte count is **less** work to
+win back, not more. Measured, the crossover sits far above where that reasoning put it. The lesson is
+the same one §12's item 0 records: an argument that is quantitative in form is still not a
+measurement, and this one was wrong by more than an order of magnitude while reading as obvious.
+
+#### What is left here
+
+- **The grouped pass.** `GroupValues` is a second pass with its own shape — per-worker group maps
+  folded by label — and the fold it needs already exists, since two storage groups rendering to one
+  label is the case `Merge` was first written for.
+- **An observable for the degraded path**, per the finding above: a pass that answered entirely from
+  the row fallback is 17-26x off its advertised cost and says nothing.
+- **A worker budget shared with the scans.** The aggregate pass draws from the same `qsem`, so the
+  two compete, which is intended; whether the per-query cap should differ between them has not been
+  measured.
 
 ---
 

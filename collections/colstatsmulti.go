@@ -306,6 +306,7 @@ func (c *Collection) valuePassWindow(p *valuePassPlan, st *valuePassState, w seg
 	cs := w.seg.colblk.Load()
 	aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)
 	if !ok {
+		aggRowSegments.Add(1)
 		if !bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, sink) {
 			return false
 		}
@@ -319,6 +320,7 @@ func (c *Collection) valuePassWindow(p *valuePassPlan, st *valuePassState, w seg
 			otherIdxs = append(otherIdxs, allIdxs[i])
 		}
 	}
+	aggColSegments.Add(1)
 	base := 0
 	for _, blk := range cs.blocks {
 		// Only the PREDICATE columns can rule a block out; the aggregated column's values

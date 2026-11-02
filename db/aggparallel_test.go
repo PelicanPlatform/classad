@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +19,28 @@ import (
 // calling goroutine and gives the same answer -- so a change that disabled the dispatch, or a
 // fixture that never grew past the size threshold, would leave every comparison below passing while
 // comparing the serial path with itself. The counter is the only thing that can tell those apart.
+
+// parPad makes each record wide enough that a modest record count still clears the fan-out
+// threshold, which is a byte count. Padding the records rather than multiplying them keeps these
+// tests to tens of thousands of records instead of nearly a million, and the gate under test is a
+// byte gate either way. The content varies per record so the segment does not compress to nothing
+// and fall back under the threshold.
+//
+// The width is set with margin rather than to just clear the gate: at 480 bytes the fixtures landed
+// either side of it depending on which attributes a given test inserted, and a test that stops
+// exercising the fan-out does not fail loudly on its own -- the guards here are what caught it.
+func parPad(i int) string {
+	// RANDOM, not a generated pattern. The first version of this cycled through the alphabet, which
+	// zstd crushed to nothing: the records were wide and the SEGMENTS were not, so the fixture sat
+	// under the gate while looking like it cleared it by a wide margin. The gate counts stored
+	// bytes, so the padding has to survive compression.
+	rng := rand.New(rand.NewSource(int64(i)))
+	b := make([]byte, 600)
+	for j := range b {
+		b[j] = byte('!' + rng.Intn(90))
+	}
+	return string(b)
+}
 
 // parTable builds a table big enough to clear the fan-out threshold, with par as its
 // QueryParallelism (1 serial, 0 auto).
@@ -36,6 +59,7 @@ func parTable(t *testing.T, n, par int) *DB {
 		// A real column as well, because the integer fields are exact under any fold order and
 		// would not notice a merge that mishandled the float accumulation.
 		ad.InsertAttrFloat("Load", float64(i%97)/7.0)
+		ad.InsertAttrString("Pad", parPad(i))
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 		if i%20000 == 19999 {
 			if err := tx.Commit(); err != nil {
@@ -277,6 +301,7 @@ func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
 	for i := 0; i < n; i++ {
 		ad := classad.New()
 		ad.InsertAttr("JobStatus", int64(i%5))
+		ad.InsertAttrString("Pad", parPad(i))
 		if i == n-1 {
 			// The LAST record, so a pass that declines only after reading almost everything is
 			// the case under test -- the partial accumulator is at its most complete and most
@@ -350,5 +375,56 @@ func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
 	}
 	if len(rows) != 1 || rows[0].Values[0] != fmt.Sprint(want) {
 		t.Fatalf("after the decline the scan should answer %d, got %v", want, rows)
+	}
+}
+
+// TestASmallPassDoesNotFanOut pins the gate from the other side.
+//
+// Every other test here asserts the fan-out HAPPENED, so all of them would still pass if the
+// threshold were removed entirely and every aggregate fanned out. Measured, a fan-out below the gate
+// is 25-40% SLOWER than running the pass on the calling goroutine, and it spends worker tokens that
+// concurrent queries draw from the same budget -- so fanning out a small pass is a regression that
+// no correctness test can see.
+//
+// Same records as the fixtures above, without the padding that makes them wide.
+func TestASmallPassDoesNotFanOut(t *testing.T) {
+	d, err := OpenConfig(Config{SegmentSize: 1 << 16, QueryParallelism: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	tx := d.Begin()
+	for i := 0; i < 20000; i++ {
+		ad := classad.New()
+		ad.InsertAttr("Cpus", int64(i%64))
+		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if !d.EnableSchemaScan(4000, 8) {
+		t.Skip("no sealed segments to accelerate")
+	}
+	var rows []AggRow
+	col0, _ := collections.AggSegmentPaths()
+	if fannedOut(t, func() {
+		rows, err = d.AggregateColsStats("true", nil, []AggSpec{{Func: AggSum, Arg: "Cpus"}}, nil, nil)
+	}) {
+		t.Fatal("a pass this small fanned out; below the gate that is slower than staying serial")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	// And it really did run the columnar pass -- otherwise this would pass just as well against a
+	// request the columnar rung never served at all.
+	if col, _ := collections.AggSegmentPaths(); col == col0 {
+		t.Fatal("no segment took the columnar path, so this says nothing about the gate")
+	}
+	var want int64
+	for i := 0; i < 20000; i++ {
+		want += int64(i % 64)
+	}
+	if len(rows) != 1 || rows[0].Values[0] != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %d", rows, want)
 	}
 }

@@ -67,12 +67,24 @@ func BenchmarkAggParallel(b *testing.B) {
 			} {
 				b.Run(fmt.Sprintf("n=%d/%s/%s", n, c.what, lbl), func(b *testing.B) {
 					before := collections.AggFanouts()
+					col0, row0 := collections.AggSegmentPaths()
 					for i := 0; i < b.N; i++ {
 						if _, err := d.AggregateColsStats("true", nil, c.aggs, nil, nil); err != nil {
 							b.Fatal(err)
 						}
 					}
+					col, row := collections.AggSegmentPaths()
+					// FAIL rather than warn. The row fallback costs 17-26x what a columnar block
+					// costs per record and the pass reports success either way, so a run that took
+					// it throughout is not a slow columnar pass -- it is a different pass, and the
+					// number it produces is one someone will reason from. A warning printed beside
+					// a column of timings is invisible; this is the whole point of the counters.
+					if col-col0 == 0 {
+						b.Fatalf("every segment went down the row fallback (%d of them): this is not "+
+							"measuring the columnar pass", row-row0)
+					}
 					b.ReportMetric(float64(collections.AggFanouts()-before)/float64(b.N), "fanouts/op")
+					b.ReportMetric(float64(row-row0)/float64((col-col0)+(row-row0)), "rowsegfrac")
 				})
 			}
 		}
