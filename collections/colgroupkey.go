@@ -338,11 +338,6 @@ type groupState3 struct {
 // accumulator pointer, the string table -- so NO FIELD OF THIS STRUCT IS SIZED BY maxGroupCols, and
 // a fourth arity is a fourth state field behind the third, moving nothing ahead of it.
 type groupAccum struct {
-	// newSink, when set, makes each group carry a CALLER's accumulators instead of the built-in
-	// NumStats ones: a user-defined aggregate reduced from the columns. It is nil for every query
-	// that is not one, and a group then allocates and accumulates exactly what it always did.
-	newSink func() GroupSink
-
 	// The fields the per-record paths read, first and together. The bucketed single-column hit --
 	// the shape a time series asks, and the one the memo exists for -- reads n, bktN, mAcc and one
 	// interval and touches nothing else, and in this order those are one cache line.
@@ -385,6 +380,16 @@ type groupAccum struct {
 	// a block's decompressed region -- and an INSERT clones, once per distinct value.
 	strID  map[string]int64
 	strVal []string
+
+	// newSink, when set, makes each group carry a CALLER's accumulators instead of the built-in
+	// NumStats ones: a user-defined aggregate reduced from the columns. It is nil for every query
+	// that is not one, and a group then allocates and accumulates exactly what it always did.
+	//
+	// LAST ON PURPOSE. The fields above are ordered so the per-record hot path -- n, bktN, mAcc and
+	// one bucket interval -- lands in a single cache line, and a test pins their byte offsets. Put
+	// here first, this pushed every one of them along by 8 and cost the built-in grouped path a
+	// line it was built to avoid. It is read once per QUERY, so it belongs with the cold fields.
+	newSink func() GroupSink
 }
 
 // bucketMemoMargin is how far inside its top edge a bucket interval has to be for the memo to decide
