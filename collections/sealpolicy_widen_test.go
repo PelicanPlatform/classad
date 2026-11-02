@@ -34,22 +34,24 @@ func sealedWiden(t testing.TB, c *Collection) {
 	}
 }
 
-// widenModes are when the policy is widened relative to building a layout. early widens half way
-// through writing the records, before the layout's maintenance -- interning, columnarizing, patching
-// -- runs over both halves; interning re-encodes every record it moves under the current policy, so
-// in a layout that interns everything the early half is resealed and what remains to test is the
-// structures built after the widen. late builds the whole layout under the narrow policy, so its
-// segments, columns and delta records hold the newly sealed values in the clear, widens, then rewrites
-// every fourth record as it reads now.
+// widenModes are when the policy is widened relative to building a layout. late builds the whole
+// layout under the narrow policy, so its segments, columns and delta records hold the newly sealed
+// values in the clear, widens, then rewrites every fourth record as it reads now. early widens half way
+// through writing the records, before the layout's maintenance runs over both halves. Interning
+// re-encodes every record it moves under the current policy, so in a layout that interns every record
+// written before the widen nothing is left in the clear and early adds nothing to late; early runs only
+// on the layouts that keep pre-widen records as written (earlyLayouts).
 var widenModes = []struct {
 	name  string
 	early bool
 }{{"early", true}, {"late", false}}
 
+var earlyLayouts = map[string]bool{"inline": true, "mixed": true}
+
 // openWidenedLayout opens a store sealing only the private attributes and lays the parity records out
-// as lay says with the explicit set widened to sealedParityAttrs at the point early names. A late widen
-// must leave records holding a newly sealed value in the clear visible -- otherwise the comparison tests
-// nothing -- and either must leave some records sealed. A reopened layout reopens under the widened
+// as lay says with the explicit set widened to sealedParityAttrs at the point early names. Records
+// holding a newly sealed value in the clear must still be visible -- otherwise the comparison tests
+// nothing -- and some records must be sealed. A reopened layout reopens under the widened
 // policy, as a restart that restores the persisted set does.
 func openWidenedLayout(t *testing.T, lay sealedLayout, early bool) *Collection {
 	t.Helper()
@@ -86,7 +88,7 @@ func openWidenedLayout(t *testing.T, lay sealedLayout, early bool) *Collection {
 			t.Fatal("put conflicted")
 		}
 	}
-	if n := visibleUnsealed(t, c); n == 0 && !early {
+	if n := visibleUnsealed(t, c); n == 0 {
 		t.Fatalf("layout %s: no visible record holds a newly sealed value in the clear; the test is vacuous", lay.name)
 	} else if n == sealedParityN {
 		t.Fatalf("layout %s: every visible record holds a newly sealed value in the clear; none was written after the widen", lay.name)
@@ -146,15 +148,18 @@ func visibleUnsealed(t *testing.T, c *Collection) int {
 // built, every read of a filter on a newly sealed attribute returns for a reader not entitled to sealed
 // values exactly what the plain evaluation of the source ads with every sealed attribute removed
 // returns, and for an entitled reader what the plain evaluation of the source ads returns.
+//
+// Serial: the reads switch the package's match configuration (narrowBenchArm.set) as they go.
 func TestWidenedSealPolicyParity(t *testing.T) {
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
-	t.Parallel()
 	for _, lay := range sealedLayouts {
 		for _, mode := range widenModes {
+			if mode.early && !earlyLayouts[lay.name] {
+				continue
+			}
 			t.Run(lay.name+"/"+mode.name, func(t *testing.T) {
-				t.Parallel()
 				sealedCheckLayout(t, openWidenedLayout(t, lay, mode.early), lay)
 			})
 		}
@@ -171,6 +176,9 @@ func TestWidenedSealPolicyEmittingReads(t *testing.T) {
 	t.Parallel()
 	for _, lay := range sealedLayouts {
 		for _, mode := range widenModes {
+			if mode.early && !earlyLayouts[lay.name] {
+				continue
+			}
 			t.Run(lay.name+"/"+mode.name, func(t *testing.T) {
 				t.Parallel()
 				c := openWidenedLayout(t, lay, mode.early)
@@ -674,15 +682,14 @@ func TestWidenedSealPolicyComputedValues(t *testing.T) {
 
 // TestWidenedSealPolicyMigration: a seal migration run on the open store after a widen -- what table
 // maintenance does -- leaves no newly sealed value in the clear in any layout, every read still answers
-// as the oracle says, and the computed values the store keeps afterwards are trusted again.
+// as the oracle says, and the computed values the store keeps afterwards are trusted again. The reads
+// run serially under the default match configuration only (see TestWidenedSealPolicyParity).
 func TestWidenedSealPolicyMigration(t *testing.T) {
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
-	t.Parallel()
 	for _, lay := range sealedLayouts {
 		t.Run(lay.name, func(t *testing.T) {
-			t.Parallel()
 			c := openWidenedLayout(t, lay, false)
 			if c.computedTrusted() {
 				t.Fatal("computed values are trusted right after a widen")
@@ -696,7 +703,9 @@ func TestWidenedSealPolicyMigration(t *testing.T) {
 			if !c.computedTrusted() {
 				t.Fatal("a clean migration did not certify the store")
 			}
-			sealedCheckLayout(t, c, lay)
+			serial := lay
+			serial.every = false
+			sealedCheckLayout(t, c, serial)
 		})
 	}
 }
