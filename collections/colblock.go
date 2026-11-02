@@ -111,9 +111,16 @@ const (
 	// within the first colGroupAlign records.
 	colGroupAlign = 8
 
-	// colGroupRows is the reference point the measurements above were taken at: what
-	// colGroupTargetBytes works out to for OSPool slot ads (~8867 B/ad of regions). Kept as the
-	// documented equivalence, and used by tests that need an exact row-count grouping.
+	// colGroupRows is the reference point the measurements above were taken at, and used by tests
+	// that need an exact row-count grouping.
+	//
+	// It is NOT what colGroupTargetBytes works out to on OSPool slot ads, which an earlier version of
+	// this comment claimed: at ~8.6 KB of row form per ad the byte budget seals a group at about
+	// SIXTEEN records, not 128, and 128 of them would be eight times the budget. Measured p50 = 16,
+	// max = 16, record-weighted mean 14.7 over the committed pool sample
+	// (TestProductionBlockWidthIsSetByBytesNotRows). The difference matters outside this file: it is
+	// the width the vector executor's batch actually is, and a cost model for the vector register
+	// file was written against colGroupMaxRows on the assumption that the row cap is what binds.
 	colGroupRows = 128
 )
 
