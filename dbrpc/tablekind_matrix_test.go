@@ -376,6 +376,16 @@ var mxWant = map[string]map[mxKind]string{
 		kArchive: "stream",
 		kMissing: "err: no such table: nope",
 	},
+	"QueryValues": {
+		// Every kind that holds records streams: this op reads through the projected scan,
+		// which serves a mutable table, a view's backing and an archive alike. A SEALED view
+		// refuses, as it does for the wire-row ops, because it has half its rows in an
+		// archive and this op reads one source; kView here has not sealed.
+		kTable:   "stream",
+		kView:    "stream",
+		kArchive: "stream",
+		kMissing: "err: no such table: nope",
+	},
 	"QueryRawProjRefsStats": {
 		kTable:   "stream",
 		kView:    "stream",
@@ -645,6 +655,16 @@ func mxCases() []mxCase {
 			return func(id uint64) []byte {
 				b := putStr(req(id, opQueryRawWire), n)
 				b = putI32(b, 0)
+				b = putU8(b, 0)
+				b = putStr(b, "true")
+				return projTail(b)
+			}
+		}},
+		{op: "QueryValues", build: func(n string) func(uint64) []byte {
+			return func(id uint64) []byte {
+				b := putStr(req(id, opQueryValues), n)
+				b = putI32(b, 0)
+				b = putI32(b, 0) // flags
 				b = putU8(b, 0)
 				b = putStr(b, "true")
 				return projTail(b)

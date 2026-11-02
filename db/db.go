@@ -1552,6 +1552,13 @@ func (db *DB) AttrTypeProfiles(sampleMax int) ([]AttrTypeProfile, int) {
 	return db.c.AttrTypeProfiles(sampleMax)
 }
 
+// AttrTypeProfilesWith is AttrTypeProfiles with the measurement selected by o -- in particular
+// with the EVALUATED classes alongside the stored ones, which is what a consumer that evaluates
+// before it types has to read instead. See collections.AttrTypeProfilesWith.
+func (db *DB) AttrTypeProfilesWith(o AttrTypeOptions) ([]AttrTypeProfile, int) {
+	return db.c.AttrTypeProfilesWith(o)
+}
+
 // GroupSchemaDrift reports how the derived groups have moved across retained derivations.
 func (db *DB) GroupSchemaDrift() GroupSchemaDrift { return db.c.GroupSchemaDrift() }
 

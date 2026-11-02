@@ -58,14 +58,14 @@ const internalErrorPrefix = "internal error: "
 func (o op) recoverable() bool {
 	switch o {
 	case opQuery, opQueryAsOf, opQueryRaw, opQueryRawProj, opQueryRawProjSeq, opQueryRawProjRefs,
-		opQueryRawProjRefsStats, opQueryRawWire, opQueryRawWireOpts, opQueryKeys,
+		opQueryRawProjRefsStats, opQueryRawWire, opQueryRawWireOpts, opQueryValues, opQueryKeys,
 		opTopK, opTopKStats, opMatchSorted, opMatchTables, opMatchExplain, opOrdered,
 		opAggregate, opAggregateFiltered, opAggregateBucketed,
 		opArchiveQuery, opArchiveAggregate, opArchiveAggregateFiltered, opArchiveAggregateStats, opArchiveList,
 		opWatch, opWatchWire, opWatchHead, opWatchStop, opSnapshot,
 		opLookupAd, opLookupAttr, opTxnQuery, opTxnQueryKeys,
 		opDiag, opExplain, opListTables, opListViews, opListExporters, opGetExporter, opGetExporterState,
-		opQueryStats:
+		opQueryStats, opAttrTypes:
 		return true
 	}
 	return false

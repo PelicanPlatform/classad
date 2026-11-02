@@ -301,7 +301,23 @@ const (
 	// Omitted rather than reported-with-bounds-elided, because which attributes are private
 	// is already public (it is configured), so their absence leaks nothing while their
 	// bounds would.
-	// [table][sampleMax i32] -> [json AttrTypeReport]
+	//
+	// EVALUATED CLASSES are an option on the flags word (attrFlagEvaluate), not the default.
+	// Without it the report describes what the records STORE, which is what a consumer
+	// relaying the stored form needs and is wrong for one that evaluates first: an attribute
+	// a pool keeps as an expression reads as "expr" and gets no declared type, although it
+	// evaluates to the same scalar kind in every ad. With it, each profile carries a second
+	// set of counts over the values those cells evaluate to. It costs more -- an expression
+	// is evaluated against its record rather than classified from one node -- so it is asked
+	// for. The privacy rule above extends to it at the SOURCE rather than here: an
+	// expression's references are resolved with private attributes withheld and, for an
+	// unprivileged connection, with no key for sealed ones, so a bound cannot arrive under
+	// an attribute name this filter has no reason to suspect.
+	//
+	// The flags word is new, so a server that predates it reads the request without it and
+	// answers with stored classes only. FeatEvalTypes is what tells a client which it will
+	// get, and a reply whose profiles carry no evaluated counts is the other answer.
+	// [table][sampleMax i32][flags i32] -> [json AttrTypeReport]
 	opAttrTypes op = 68
 
 	// opJoin joins two tables inside the store and streams the joined rows.
@@ -331,6 +347,24 @@ const (
 	//   [nCond i32]{[expr]}[nPost i32]{[expr]}[nEqui i32]{[left][right]}
 	//     -> stream of [adText]
 	opJoin op = 69
+
+	// opQueryValues streams matching records as TYPED, EVALUATED value batches, column-major
+	// and aligned with the requested attributes -- see values.go for the frame and for why a
+	// column is a kind, a validity bitmap and an exceptions list.
+	//
+	// It is the only read op that does not relay the stored form. The text projections render
+	// each record to ClassAd source for the consumer to parse back, and the wire-row ops ship
+	// the stored nodes for the consumer to decode and evaluate; both put the work of turning
+	// storage into values on the far side. A consumer that wants columns pays for a relay it
+	// did not ask for, and the render and the reparse together are the large majority of what
+	// such a read costs.
+	//
+	// [table][limit i32][flags u32][redact u8][constraint][nattrs i32]{[attr]}
+	//   -> stream of [nrows i32][ncols i32]{column}
+	//
+	// The flags word is reserved and currently empty; an unknown bit is REFUSED, for the same
+	// reason the wire-row ops refuse one.
+	opQueryValues op = 70
 )
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
@@ -485,6 +519,8 @@ func (o op) String() string {
 		return "QueryRawWire"
 	case opQueryRawWireOpts:
 		return "QueryRawWireOpts"
+	case opQueryValues:
+		return "QueryValues"
 	case opJoin:
 		return "Join"
 	}
@@ -579,6 +615,18 @@ func (r *reader) i32() int32 {
 	r.b = r.b[4:]
 	return v
 }
+
+// optI32 reads a trailing i32 that a request MAY carry, reporting whether it was there. It
+// exists for a field appended to an opcode that shipped without one: an older client simply
+// sends a shorter frame, and reading its absence as a malformed request would refuse a request
+// that is entirely well formed. It never sets err, so a short frame stays readable.
+func (r *reader) optI32() (int32, bool) {
+	if r.err != nil || len(r.b) < 4 {
+		return 0, false
+	}
+	return r.i32(), true
+}
+
 func (r *reader) u8() uint8 {
 	if r.err != nil || len(r.b) < 1 {
 		r.fail()

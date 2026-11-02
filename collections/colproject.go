@@ -58,10 +58,21 @@ type projPlan struct {
 	// would keep the wrong attributes.
 	localDict *segDictHandle
 	local     map[uint32]struct{}
-	// closure marks a plan whose consumer will EVALUATE the projected ad rather than just
-	// relay it. Such a plan is still used, but each projected record is checked for being
-	// closed (adClosed) and reassembled when it is not.
+	// closure marks a plan whose consumer FOLLOWS REFERENCES out of the entries it is given --
+	// the refs-chasing wire-row and text projections, and the evaluating projection. Such a plan
+	// is still used, but each projected record is checked for being closed (adClosed) and
+	// reassembled when it is not.
 	closure bool
+	// evaluates marks the narrower set of those whose consumer only ever sees the EVALUATED
+	// result, never the entries themselves. It is a strictly stronger claim than closure, and
+	// the two must not be conflated: QueryRawWireRefs follows references and then SHIPS what it
+	// was given, so it sets closure and not this.
+	//
+	// It licenses exactly one thing -- substituting a precomputed literal for an escaped
+	// expression cell (see projectFromColumns) -- and it is the only licence that would be
+	// sound, because such a substitution changes what the ad CONTAINS while leaving what it
+	// MEANS alone. A relaying consumer would ship the difference.
+	evaluates bool
 	// readsSealed marks a narrowed-match plan naming an attribute the collection seals. Matching
 	// on such a record opens the sealed value (a decrypt and a partial decode), which makes the
 	// narrowed match dearer than the column conjuncts the scan otherwise asks after it; see
@@ -157,6 +168,56 @@ type projectScratch struct {
 	coldPlan      *projPlan
 	coldWant      []uint32
 	coldNonSchema int
+	// substIdx/substNode are the escaped schema cells of the CURRENT record whose precomputed
+	// literal the column half substitutes for the stored expression, and substID/substName the
+	// same cells in the record's own key space so the record half can leave them out. Per
+	// record, reused across them.
+	substIdx  []int
+	substNode [][]byte
+	substID   []uint32
+	substName []string
+	// substCand is which PROJECTED schema fields could have a computed cell in this block at
+	// all, resolved once per block rather than per record. Whether a given record's cell is
+	// computed still has to be asked per record; this only stops the per-record pass walking
+	// every schema field of a wide schema to discover that none of them can be.
+	substBlk  *columnarBlock
+	substPlan *projPlan
+	substCand []int
+}
+
+// substCandidates returns the projected schema fields of blk that have a computed section, caching
+// per block and plan. A field with no section cannot have a computed cell in any record of the
+// block, so the per-record pass need not consider it.
+func (sc *projectScratch) substCandidates(blk *columnarBlock, p *projPlan) []int {
+	if sc.substBlk == blk && sc.substPlan == p {
+		return sc.substCand
+	}
+	sc.substBlk, sc.substPlan = blk, p
+	sc.substCand = sc.substCand[:0]
+	if len(blk.computed) == 0 {
+		return sc.substCand
+	}
+	for idx := range blk.schema.fields {
+		if _, in := p.ids[blk.schema.fields[idx].id]; !in {
+			continue
+		}
+		if _, ok := blk.computedEntryOf(idx); ok {
+			sc.substCand = append(sc.substCand, idx)
+		}
+	}
+	return sc.substCand
+}
+
+// substNodeFor returns the precomputed literal collected for schema field idx, if any. Linear over
+// a list that holds one entry per PROJECTED expression-valued field -- a handful at most, and
+// usually none -- which is cheaper here than a map allocated per record.
+func (sc *projectScratch) substNodeFor(idx int) ([]byte, bool) {
+	for i, x := range sc.substIdx {
+		if x == idx {
+			return sc.substNode[i], true
+		}
+	}
+	return nil, false
 }
 
 // coldWanted returns p's attributes in blk's cold-tail id space, and how many are not schema fields.
@@ -227,6 +288,64 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 	if sd != nil {
 		want = p.localWanted(sd)
 	}
+
+	// SUBSTITUTING A PRECOMPUTED VALUE FOR AN ESCAPED EXPRESSION CELL.
+	//
+	// A schema field whose value is an expression is escaped out of its column and stays in the
+	// record, so a projection naming one cannot be served from the columns: the expression comes
+	// back in the narrowed ad, the closure check rejects it (its references are the attributes the
+	// projection did not name), and after a few such records the scan stops trying the fast path
+	// at all. One ordinary attribute -- a usage figure written over another -- therefore costs the
+	// whole projection its columnar path, for every row, because every row has one.
+	//
+	// The value is already there. Columnarizing computes such a cell once and keeps the literal
+	// beside the block (colcomputed.go), which is how the aggregates read these attributes from
+	// columns today. This substitutes it here as well.
+	//
+	// ONLY FOR AN EVALUATING PLAN, and that is the whole of the safety argument. The storage
+	// layer's rule is that a computed value never appears in an ad as if it were the attribute's
+	// stored literal -- a consumer that RELAYS what it is given would then ship an ad different
+	// from the record. projPlan.evaluates marks the plans whose consumer sees only the evaluated
+	// result, which is by construction the value the expression has.
+	//
+	// NOT projPlan.closure, which is the near miss: closure means the consumer follows
+	// references, and QueryRawWireRefs does that and then ships the entries. Gating on it would
+	// put computed literals into relayed rows.
+	//
+	// It also makes the closure check pass rather than circumventing it: the substituted entry is
+	// a literal, so the walk from it reaches nothing, and the narrowed ad is self-contained for
+	// real.
+	sc.substIdx, sc.substNode = sc.substIdx[:0], sc.substNode[:0]
+	sc.substID, sc.substName = sc.substID[:0], sc.substName[:0]
+	if p.evaluates {
+		esc0 := blk.escapeAt(local)
+		for _, idx := range sc.substCandidates(blk, p) {
+			f := &blk.schema.fields[idx]
+			if !testBit(esc0, idx) {
+				continue
+			}
+			node, ok := blk.computedNode(local, idx, cs.bc)
+			if !ok {
+				continue
+			}
+			if sd != nil {
+				lid, ok := cn.localOf[f.id]
+				if !ok {
+					continue
+				}
+				sc.substID = append(sc.substID, lid)
+			} else {
+				nm, ok := c.intern.Name(f.id)
+				if !ok {
+					continue
+				}
+				sc.substName = append(sc.substName, nm)
+			}
+			sc.substIdx = append(sc.substIdx, idx)
+			sc.substNode = append(sc.substNode, node)
+		}
+	}
+
 	narrowed, ok := narrowAd(&sc.narrow, raw, func(id uint32, name string) bool {
 		if name != "" {
 			// An inline entry (an inline-keyed segment's remnant holds nothing else): keep it only if
@@ -235,7 +354,20 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 			// instead would hand the closure check (adClosed) every expression in the remnant, and
 			// one of them reaching outside the plan sends a record that never asked for it back to
 			// reassembly.
-			return p.wantsName(name)
+			if !p.wantsName(name) {
+				return false
+			}
+			// Substituted below, from the computed region: keeping the stored expression too
+			// would put the attribute in the ad twice.
+			for _, nm := range sc.substName {
+				if foldEqualStrings(name, nm) {
+					return false
+				}
+			}
+			return true
+		}
+		if slices.Contains(sc.substID, id) {
+			return false
 		}
 		if want == nil {
 			_, in := p.ids[id]
@@ -275,6 +407,30 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 			continue
 		}
 		if testBit(esc, idx) {
+			// An escaped cell with a precomputed literal: emit that, in place of the expression
+			// the record half was told to leave out.
+			if node, ok := sc.substNodeFor(idx); ok {
+				outID := f.id
+				if sd != nil {
+					lid, ok := cn.localOf[f.id]
+					if !ok {
+						return nil, false
+					}
+					outID = lid
+				}
+				name := ""
+				if inline {
+					nm, ok := c.intern.Name(f.id)
+					if !ok {
+						return nil, false
+					}
+					name = nm
+				}
+				sc.entries = wire.AppendKey(sc.entries, inline, outID, name)
+				sc.entries = append(sc.entries, node...)
+				added++
+				continue
+			}
 			// A cell the record itself holds -- an expression, already in the remnant half above --
 			// has no cold-tail entry, so counting it would walk the whole tail looking for it.
 			if !blk.heldKnown(local, f.id) {
