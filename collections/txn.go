@@ -465,9 +465,9 @@ func (c *Collection) Begin() *Txn {
 // BeginRedacted is Begin for a caller NOT entitled to sealed values: reads through the transaction decode
 // with no key, so a sealed attribute comes back undefined. It can still write: an ad it stores is sealed
 // as the collection's policy says, and a patch (PatchAttrs) changes only the attributes it names -- a
-// sealed value it does not name is kept exactly as stored, never opened. A patch whose whole record
-// would have to carry a sealed value from an interned record is stored as a delta where it can be and
-// otherwise refused (CommitResult.Unapplied, reason "sealed-needs-key"); see redactwrite.go.
+// sealed value it does not name is kept as stored. One that sits in an interned record and has to move
+// into the new whole record is re-sealed by the store in the form that record needs, without the
+// transaction ever holding its plaintext; see redactwrite.go.
 //
 // The entitlement lives on the transaction rather than on each read, so a new read method inherits it
 // instead of having to remember it.

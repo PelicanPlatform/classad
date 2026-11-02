@@ -1,13 +1,13 @@
 package db
 
 import (
-	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 )
 
 // A transaction not entitled to sealed values (BeginRedacted -- what an unprivileged dbrpc session
@@ -79,21 +79,14 @@ func redactedFixture(t *testing.T, deltaMax int, compact bool) (*DB, map[string]
 	return d, model
 }
 
-// redactedCommit runs ops in one redacted transaction and reports whether it was refused for a sealed
-// value only the key could carry. Any other failure fails the test.
-func redactedCommit(t *testing.T, d *DB, ops func(tx *Txn)) bool {
+// redactedCommit runs ops in one redacted transaction and fails the test if the commit fails.
+func redactedCommit(t *testing.T, d *DB, ops func(tx *Txn)) {
 	t.Helper()
 	tx := d.BeginRedacted()
 	ops(tx)
-	err := tx.Commit()
-	if err == nil {
-		return false
-	}
-	var ue *UnappliedError
-	if !errors.As(err, &ue) || len(ue.Reasons) == 0 || ue.Reasons[0] != "sealed-needs-key" {
+	if err := tx.Commit(); err != nil {
 		t.Fatalf("commit: %v", err)
 	}
-	return true
 }
 
 func checkRedactedModel(t *testing.T, d *DB, model map[string]*classad.ClassAd) {
@@ -148,57 +141,45 @@ func TestRedactedTxnPreservesSealed(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, model := redactedFixture(t, tc.deltaMax, tc.compact)
-			// A compacted record's sealed values are keyed by its segment's dictionary and cannot be
-			// carried into a new record without the key, so a write that must compose one is refused --
-			// never applied with the values lost. Everywhere else every write applies.
-			mayRefuse := tc.compact
+			// Every write applies. A compacted record's sealed values are keyed by its segment's
+			// dictionary; the store re-seals the ones a write has to carry, and only those.
+			resealed0, _ := collections.KeylessResealStats()
+			defer func() {
+				resealed, _ := collections.KeylessResealStats()
+				if (resealed > resealed0) != tc.compact {
+					t.Errorf("compacted=%v but %d records re-sealed: the fixture is not the layout it names", tc.compact, resealed-resealed0)
+				}
+			}()
 
 			// Removal of an unrelated attribute: the reproduction.
-			switch refused := redactedCommit(t, d, func(tx *Txn) { tx.DeleteAttribute("a", "Note") }); {
-			case !refused:
-				model["a"].Delete("Note")
-			case !mayRefuse:
-				t.Error("removal refused on an inline record")
-			}
-			if kept := hasAttr(t, d, "a", "Note"); kept != mayRefuse {
-				t.Fatalf("compacted=%v but Note kept=%v: the fixture is not the layout it names", tc.compact, kept)
+			redactedCommit(t, d, func(tx *Txn) { tx.DeleteAttribute("a", "Note") })
+			model["a"].Delete("Note")
+			if hasAttr(t, d, "a", "Note") {
+				t.Fatal("Note kept after its removal")
 			}
 			// Named writes to sealed attributes the session cannot read: applied, as any other write is.
-			// They name every sealed value the record holds, so nothing needs carrying, even interned.
-			if redactedCommit(t, d, func(tx *Txn) {
+			redactedCommit(t, d, func(tx *Txn) {
 				_ = tx.SetAttribute("d", "Salary", "1")
 				tx.DeleteAttribute("d", "ClaimId")
-			}) {
-				t.Fatal("named sealed writes refused")
-			}
+			})
 			setModel(t, model, "d", "Salary", "1")
 			model["d"].Delete("ClaimId")
 			// The chain bound, one transaction per set so the tracker reaches it.
 			for k := 0; k < 6; k++ {
 				expr := fmt.Sprint(10 + k)
-				if redactedCommit(t, d, func(tx *Txn) { _ = tx.SetAttribute("b", "Cpus", expr) }) {
-					if tc.deltaMax > 0 || !mayRefuse {
-						t.Fatalf("set %d refused (deltas %d)", k, tc.deltaMax)
-					}
-					continue
-				}
+				redactedCommit(t, d, func(tx *Txn) { _ = tx.SetAttribute("b", "Cpus", expr) })
 				setModel(t, model, "b", "Cpus", expr)
 			}
 			// A first write to a key, sealed attribute included.
-			if redactedCommit(t, d, func(tx *Txn) {
+			redactedCommit(t, d, func(tx *Txn) {
 				_ = tx.SetAttribute("new", "Cpus", "1")
 				_ = tx.SetAttribute("new", "ClaimId", `"<claim-new>"`)
-			}) {
-				t.Fatal("first write refused")
-			}
+			})
 			setModel(t, model, "new", "Cpus", "1")
 			setModel(t, model, "new", "ClaimId", `"<claim-new>"`)
 			// A plain set: a delta where delta records are on.
-			if !redactedCommit(t, d, func(tx *Txn) { _ = tx.SetAttribute("c", "Note", `"edited"`) }) {
-				setModel(t, model, "c", "Note", `"edited"`)
-			} else if tc.deltaMax > 0 || !mayRefuse {
-				t.Fatal("plain set refused")
-			}
+			redactedCommit(t, d, func(tx *Txn) { _ = tx.SetAttribute("c", "Note", `"edited"`) })
+			setModel(t, model, "c", "Note", `"edited"`)
 			checkRedactedModel(t, d, model)
 			for _, k := range []string{"a", "b", "c", "e", "f"} {
 				got, _ := d.LookupClassAd(k)

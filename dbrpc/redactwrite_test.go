@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -19,7 +20,7 @@ import (
 const writeSessionSecret = "payroll-4471-not-a-private-name"
 
 // writeSessionPair serves an encrypted table to an unprivileged (WRITE, not DAEMON) session. compact
-// leaves the ads in interned segments, where a sealed value cannot be carried without the key.
+// leaves the ads in interned segments, where a carried sealed value has to be re-sealed.
 func writeSessionPair(t *testing.T, deltaMax int, compact bool) (*Client, *db.DB) {
 	t.Helper()
 	d, err := db.OpenConfig(db.Config{
@@ -152,21 +153,21 @@ func TestWriteSessionPreservesSealed(t *testing.T) {
 	}
 }
 
-// TestWriteSessionRefusalLeavesAdIntact: where a whole record would have to carry a sealed value from
-// an interned record, the commit fails with the reason and the ad is exactly as it was.
-func TestWriteSessionRefusalLeavesAdIntact(t *testing.T) {
+// TestWriteSessionCompactedRecord: on a record compaction left interned, whose sealed values are keyed
+// by its segment's dictionary, a removal and sets past the chain bound all apply, and every sealed value
+// the session did not name survives.
+func TestWriteSessionCompactedRecord(t *testing.T) {
 	c, d := writeSessionPair(t, 2, true)
 	before := storedAdText(t, d, "a")
-	err := sessionWrite(t, c, func(ctx context.Context, tx *Tx) error {
+	resealed0, _ := collections.KeylessResealStats()
+	if err := sessionWrite(t, c, func(ctx context.Context, tx *Tx) error {
 		return tx.DeleteAttribute(ctx, "a", "Note")
-	})
-	if err == nil || !strings.Contains(err.Error(), "sealed-needs-key") {
-		t.Fatalf("commit = %v, want a refusal naming sealed-needs-key", err)
+	}); err != nil {
+		t.Fatalf("removal: %v", err)
 	}
-	if after := storedAdText(t, d, "a"); after != before {
-		t.Errorf("refused write changed the ad:\n before %s\n after  %s", before, after)
+	if resealed, _ := collections.KeylessResealStats(); resealed == resealed0 {
+		t.Fatal("the removal re-sealed nothing: the record is not the interned one the test needs")
 	}
-	// A set on the same record is stored as a delta past the bound, not refused.
 	for k := 0; k < 5; k++ {
 		if err := sessionWrite(t, c, func(ctx context.Context, tx *Tx) error {
 			return tx.SetAttribute(ctx, "a", "Cpus", fmt.Sprint(20+k))
@@ -174,7 +175,11 @@ func TestWriteSessionRefusalLeavesAdIntact(t *testing.T) {
 			t.Fatalf("set %d: %v", k, err)
 		}
 	}
-	if got, want := storedAdText(t, d, "a"), strings.Replace(before, "Cpus = 4", "Cpus = 24", 1); got != want {
-		t.Errorf("after sets:\n got  %s\n want %s", got, want)
+	want := strings.Replace(strings.Replace(before, "Cpus = 4", "Cpus = 24", 1), `Note = "note-a"; `, "", 1)
+	if got := storedAdText(t, d, "a"); got != want {
+		t.Errorf("after the writes:\n got  %s\n want %s", got, want)
+	}
+	if !strings.Contains(want, writeSessionSecret) || !strings.Contains(want, "<claim-a>") {
+		t.Fatalf("the expected ad %s lost a sealed value; the comparison is wrong", want)
 	}
 }

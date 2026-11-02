@@ -1812,7 +1812,12 @@ res := tx.Commit()              // {Committed, Conflicts, Unapplied, UnappliedRe
 - **Durability.** Commit syncs every touched shard in parallel. `SetDurable(false)`
   defers that for callers that batch durability themselves.
 - **Redaction.** `BeginRedacted` starts a transaction whose reads decode without the
-  data key (Chapter 10).
+  data key (Chapter 10). Its patch writes change only the attributes they name. One that
+  needs a whole record composes it from the stored bytes: sealed values from inline
+  records are copied unopened, and a sealed value from an interned record, whose
+  plaintext holds that segment's ids, is opened, re-keyed to inline names and sealed
+  again inside the rewrite (`KeylessResealStats` counts them). The transaction never
+  holds the plaintext, and whether the write applies does not depend on it.
 
 ### Delta records
 
