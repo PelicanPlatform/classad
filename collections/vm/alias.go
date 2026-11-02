@@ -171,3 +171,31 @@ func compileAliasesAt(expr ast.Expr, aliases []string, now int64) *Query {
 	}
 	return q
 }
+
+// AliasRef is one qualified reference a compiled program makes to a join side: which side,
+// by its index in the alias list the program was compiled with, and which attribute on it.
+type AliasRef struct {
+	Alias int
+	Name  string
+}
+
+// AliasRefs lists the qualified references the program makes, as written and with
+// duplicates, in compilation order.
+//
+// It is only an ANSWER for an AliasNative program, and a caller must check that first. A
+// delegated node holds an arbitrary expression evaluated against the whole scope, which can
+// reach a side in ways no list of attribute names describes -- `h` passed to a function, a
+// select through a nested record, a reference the compiler never saw because the subtree was
+// handed over whole. So a caller deciding what to READ from a side must treat a program that
+// is not AliasNative as needing the entire ad, not as making the references it happens to
+// list here.
+func (q *Query) AliasRefs() []AliasRef {
+	if q == nil || q.prog == nil {
+		return nil
+	}
+	out := make([]AliasRef, 0, len(q.prog.aliasRefs))
+	for _, r := range q.prog.aliasRefs {
+		out = append(out, AliasRef{Alias: r.alias, Name: r.name})
+	}
+	return out
+}

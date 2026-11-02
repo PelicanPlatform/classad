@@ -162,6 +162,10 @@ type joinPlan struct {
 	// condAlias is cond compiled to read the two sides directly, or nil when a term
 	// needs a real record. See joincond.go.
 	condAlias *aliasedCond
+	// postAlias is the same for the residual WHERE. It is not only a speed-up there: the
+	// filter has to see the sides as they were READ, not as the output projection leaves
+	// them (see emit).
+	postAlias *aliasedCond
 	equiLeft  []*classad.Expr
 	equiRight []*classad.Expr
 	limit     int
@@ -189,7 +193,8 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 	}
 	// The RIGHT side is hashed and the left streamed, matching the caller's own naming so a
 	// plan reads the same here as where it was made.
-	scanSeq, err := cat.joinSource(spec.Left)
+	readProj := planJoinRead(spec)
+	scanSeq, err := cat.joinSource(spec.Left, readProj.left)
 	if err != nil {
 		return nil, err
 	}
@@ -218,12 +223,12 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 		// hold. Whether a source sequence may be ranged twice is a property of each kind
 		// of table, not something this can assume, so the side is resolved again rather
 		// than re-ranged. It costs a query's construction, not a scan.
-		if scanSeq, err = cat.joinSource(spec.Left); err != nil {
+		if scanSeq, err = cat.joinSource(spec.Left, readProj.left); err != nil {
 			return nil, err
 		}
 	}
 
-	hashSeq, err := cat.joinSource(right)
+	hashSeq, err := cat.joinSource(right, readProj.right)
 	if err != nil {
 		return nil, err
 	}
@@ -235,12 +240,15 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 // A view resolves to BOTH of its halves. A continuous aggregate moves closed buckets out of
 // its live backing into an archive, so a join that read only the backing would silently join
 // against the unsealed tail -- the same bug the read paths had.
-func (cat *Catalog) joinSource(s JoinSide) (iter.Seq[*classad.ClassAd], error) {
+func (cat *Catalog) joinSource(s JoinSide, read []string) (iter.Seq[*classad.ClassAd], error) {
 	constraint := s.Constraint
 	if strings.TrimSpace(constraint) == "" {
 		constraint = "true"
 	}
 	if d, ok := cat.Table(s.Table); ok {
+		if seq, narrowed := narrowTableRead(d, constraint, read); narrowed {
+			return seq, nil
+		}
 		return d.Query(constraint)
 	}
 	if d, ok := cat.ViewBacking(s.Table); ok {
@@ -274,6 +282,9 @@ func (cat *Catalog) joinSource(s JoinSide) (iter.Seq[*classad.ClassAd], error) {
 		}, nil
 	}
 	if a, ok := cat.ArchiveTable(s.Table); ok {
+		if seq, narrowed := narrowArchiveRead(a, constraint, read); narrowed {
+			return seq, nil
+		}
 		return a.Query(constraint)
 	}
 	return nil, fmt.Errorf("no such table: %s", s.Table)
@@ -299,6 +310,7 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 	if p.post, err = compileAll("WHERE", spec.Post); err != nil {
 		return nil, err
 	}
+	p.postAlias = compileAliasedCond(spec.Post, p.leftAlias, p.rightAlias)
 	for i, e := range spec.Equi {
 		l, lerr := classad.ParseExpr(e.Left)
 		if lerr != nil {
@@ -403,12 +415,10 @@ func (p *joinPlan) run(hashSeq, scanSeq iter.Seq[*classad.ClassAd], stats *JoinS
 // the join should STOP -- whether the row survived the filter is deliberately not reported,
 // because the one caller that used to branch on it drew the wrong conclusion from it.
 func (p *joinPlan) emit(l, r *classad.ClassAd, stats *JoinStats, yield func(*classad.ClassAd) bool) (stop bool) {
-	row := p.composite(l, r)
-	for _, ex := range p.post {
-		if !isTrue(ex.Eval(row)) {
-			return false
-		}
+	if !p.postHolds(l, r) {
+		return false
 	}
+	row := p.composite(l, r)
 	if stats.Rows >= p.limits.MaxRows {
 		stats.Err = fmt.Errorf("the join produced more than %d rows; narrow it with a constraint",
 			p.limits.MaxRows)
@@ -416,6 +426,45 @@ func (p *joinPlan) emit(l, r *classad.ClassAd, stats *JoinStats, yield func(*cla
 	}
 	stats.Rows++
 	return !yield(row)
+}
+
+// postHolds reports whether every residual WHERE term is TRUE for this pair.
+//
+// It reads the two sides AS READ, not through the output projection. That distinction is the
+// whole point of this existing separately from emit: a WHERE is not a projection, and
+// `WHERE e.MemoryUsage > 1000` has to work whether or not the caller asked to SEE
+// MemoryUsage. Filtering the projected row instead -- which is what this used to do, by
+// building the row first -- made such a term read UNDEFINED and silently match nothing, so a
+// join answered a perfectly ordinary query with no rows and no error.
+//
+// A nil right side is an unmatched LEFT row, and every reference through its alias is
+// undefined, exactly as it is for the ON condition. Dropping the row here does NOT bring it
+// back null-extended: run decides that from whether the pair MATCHED, which is a separate
+// question answered before this (see the comment there).
+func (p *joinPlan) postHolds(l, r *classad.ClassAd) bool {
+	if len(p.post) == 0 {
+		return true
+	}
+	if p.postAlias != nil {
+		if held, ok := p.postAlias.holds(l, r); ok {
+			return held
+		}
+	}
+	// A term the alias compiler would not take reads the sides out of a composite, which is
+	// built WITHOUT the output projection for the reason above.
+	row := classad.New()
+	if l != nil {
+		row.InsertAttrClassAd(p.leftAlias, l)
+	}
+	if r != nil {
+		row.InsertAttrClassAd(p.rightAlias, r)
+	}
+	for _, ex := range p.post {
+		if !isTrue(ex.Eval(row)) {
+			return false
+		}
+	}
+	return true
 }
 
 // composite builds the joined row: one ClassAd whose members are the two sides under their
