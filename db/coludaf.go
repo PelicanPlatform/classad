@@ -10,7 +10,7 @@ import (
 // argument evaluated into a classad.Value, one Add per row. The built-in numeric aggregates are not
 // -- they read the argument as a contiguous column, with whole blocks ruled out by zone maps and
 // per-block extremes, and no decode and no boxing for what survives. Measured on 50k records that
-// is 8.4x ungrouped and 6.8x grouped.
+// is 8.4x ungrouped and 6.4x grouped.
 //
 // An aggregate that can take its values from a column closes most of that. It says so by
 // implementing ColumnAccumulator, and the implementing IS the declaration -- see the two things it

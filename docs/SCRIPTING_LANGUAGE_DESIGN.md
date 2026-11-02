@@ -1617,12 +1617,18 @@ ladder feed it from the same block-pruned, unboxed passes that answer SUM — th
 pass, and the grouping machinery itself, with each group carrying the caller's accumulators instead
 of the fixed numeric statistics. Measured on 50k records:
 
-| | scan | column | built-in |
-|---|---|---|---|
-| ungrouped | 13.35 ms | **1.56 ms** | 1.62 ms |
-| grouped | 18.13 ms | **2.92 ms** | 2.88 ms |
+| | scan | column | built-in | speed-up |
+|---|---|---|---|---|
+| ungrouped | 17.84 ms | **2.13 ms** | 2.15 ms | 8.4x |
+| grouped | 24.72 ms | **3.87 ms** | 3.86 ms | 6.4x |
 
-Both at parity with the built-in they imitate. The grouped rung takes `COUNT(*)` alongside, filtered
+Both at parity with the built-in they imitate — within 1% either way, which is the claim that
+matters; the absolute figures are from one run on a machine that was not idle, so they are
+comparable to each other and not to a number measured elsewhere.
+
+An earlier draft of this table quoted faster absolutes that were measured **before** the layout bug
+in §13.6 was fixed, which means they were measured against a handicapped built-in. The parity
+conclusion survived the fix; the numbers did not, and are replaced here rather than left standing. The grouped rung takes `COUNT(*)` alongside, filtered
 or not, since a group's record count is kept beside the accumulators rather than derived from them;
 a *built-in value* aggregate in the same request is refused, because a group holds either the fixed
 statistics or the caller's accumulators and never both.
@@ -1785,7 +1791,7 @@ The rung is held to the ladder's existing rule — every rung's answer equals th
 same request — by the test that already enforces it for every other rung, with the new one named
 explicitly so that silently declining everything cannot pass as success.
 
-### 13.6 Three findings from building it
+### 13.6 Four findings from building it
 
 **The laws cannot be exact for a floating-point aggregate, and that is not the implementation's
 fault.** The obvious first thing anyone writes here is a variance — precisely because its state is
@@ -1809,6 +1815,21 @@ function of every row in it, so a state that stopped being updated part-way does
 answer, it yields a **wrong one that is indistinguishable from a right one**. The query fails
 instead. Per query also costs nothing per row, where a recovery around each `Add` would be a deferred
 call on the hottest loop in the reduction.
+
+**A struct's field ORDER was load-bearing, the comment said so, and I inserted above it anyway.**
+Carrying the sink factory meant adding one field to `groupAccum`, and it went at the top. That
+pushed `n`, `bktN`, `mAcc` and the bucket intervals along by eight bytes each — the fields ordered
+so that the single-column bucketed memo hit, the shape a time series asks, reads one cache line.
+`TestGroupAccumHotFieldOffsets` pins their byte offsets and failed immediately. The struct's own
+comment explains the ordering, directly above the line the field was added to.
+
+Two things worth keeping from it. The first is that **a layout invariant needs a test that fails,
+because a comment does not stop anyone** — this one has one, it worked, and that is the only reason
+the regression lasted minutes rather than until someone profiled a dashboard. The second is about
+measurement: the grouped benchmark was run *before* the fix, so it compared a user-defined
+aggregate against a **handicapped built-in**, and the parity it reported was not the parity it
+looked like. It happened to survive re-measurement, which is luck rather than method. A benchmark
+run between writing a change and testing it is measuring something that does not exist yet.
 
 **A surviving mutation does not always mean delete the guard.** Cutting the checker's split points
 down to the midpoint alone survived the whole suite. The previous time a mutation survived in this
