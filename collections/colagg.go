@@ -167,11 +167,11 @@ type NumValue struct {
 // NumValuesQueryRedacted is NumValuesQuery for a reader NOT entitled to sealed values, on the same
 // terms as NumStatsQueryRedacted: columns never hold a sealed value, so it answers as NumValuesQuery
 // does, except on a store that may hold a sealed attribute's values in the clear, where it declines.
-func (c *Collection) NumValuesQueryRedacted(q *vm.Query, attr string, sink func(NumValue)) bool {
+func (c *Collection) NumValuesQueryRedacted(q *vm.Query, attr string, newSink func() func(NumValue), merge func()) bool {
 	if c.keylessHides(attr) {
 		return false
 	}
-	return c.NumValuesQuery(c.keylessQuery(q), attr, sink)
+	return c.NumValuesQuery(c.keylessQuery(q), attr, newSink, merge)
 }
 
 // NumValuesQuery feeds every numeric value of attr, over the records matching q, to sink -- through
@@ -179,18 +179,26 @@ func (c *Collection) NumValuesQueryRedacted(q *vm.Query, attr string, sink func(
 // every record. It returns false when the columnar path cannot serve the request, on the same terms
 // as NumStatsQuery, and the caller must scan instead.
 //
-// VALUES ARRIVE IN BLOCK ORDER. That is not the order a record scan visits the same records in, and
-// not insertion order: the pass walks segments, then blocks, skipping whole blocks a zone map rules
-// out. A sink whose answer depends on the order it is fed will therefore disagree with the scan over
-// the same records -- which is not a defect here but a property a caller has to be able to promise
-// it does not have. The reference's own min()/max() cannot promise it over a column holding a NaN,
-// which is why NumStats flags that case rather than answering it.
-func (c *Collection) NumValuesQuery(q *vm.Query, attr string, sink func(NumValue)) bool {
+// VALUES ARRIVE IN BLOCK ORDER, AND ACROSS SEVERAL SINKS. That is not the order a record scan visits
+// the same records in, and not insertion order: the pass walks segments, then blocks, skipping whole
+// blocks a zone map rules out -- and when it fans out across segments, which sink sees which segment
+// is a race. A sink whose answer depends on the order it is fed will therefore disagree with the
+// scan over the same records, and may disagree with ITSELF between two runs. That is not a defect
+// here but a property a caller has to be able to promise it does not have. The reference's own
+// min()/max() cannot promise it over a column holding a NaN, which is why NumStats flags that case
+// rather than answering it.
+//
+// newSink is called once per worker and merge once at the end, both on the CALLING goroutine; each
+// sink is fed by one goroutine only. See valuesPar for the full contract.
+func (c *Collection) NumValuesQuery(q *vm.Query, attr string, newSink func() func(NumValue), merge func()) bool {
 	id, preds, cache, ok := c.numScanPlan(q, attr)
 	if !ok {
 		return false
 	}
-	return c.schemaScanValuesMulti(id, preds, cache, func(nv colVal) { sink(publicNumValue(nv)) })
+	return c.valuesPar(id, preds, cache, func() numSink {
+		sink := newSink()
+		return func(nv colVal) { sink(publicNumValue(nv)) }
+	}, merge)
 }
 
 // publicNumValue converts the scan's internal cell to the exported one.

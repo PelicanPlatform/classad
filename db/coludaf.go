@@ -58,9 +58,13 @@ type ColumnAccumulator interface {
 	AddNum(v NumValue)
 }
 
-// NumValueScan feeds the numeric values of attr, over the records a request matched, to sink. It
-// reports false when the columnar path cannot serve the request and the caller must scan.
-type NumValueScan func(attr string, sink func(NumValue)) bool
+// NumValueScan feeds the numeric values of attr, over the records a request matched, to one sink per
+// worker. It reports false when the columnar path cannot serve the request and the caller must scan.
+//
+// newSink is called once per worker and merge once afterwards, both on the CALLING goroutine, and
+// each sink is fed by exactly one goroutine -- so an accumulator needs no synchronization of its
+// own. A pass that declines calls merge not at all.
+type NumValueScan func(attr string, newSink func() func(NumValue), merge func()) bool
 
 // ColumnarUserAggregate answers one ungrouped user-defined aggregate from the columnar value pass,
 // when the registered aggregate's accumulator takes column values. ok=false means nothing was
@@ -85,13 +89,27 @@ func ColumnarUserAggregate(values NumValueScan, groupCols []GroupCol, aggs []Agg
 		// reports ErrNoSuchAggregate, in one place, with the argument checks beside it.
 		return nil, false, nil
 	}
-	acc, ok := agg.NewAccumulator().(ColumnAccumulator)
+	// Deciding whether the aggregate opted in needs an instance, and that instance is then the
+	// first worker's -- not a throwaway. NewAccumulator is the caller's code and may count its
+	// calls or hold a resource, so building one only to type-assert it and drop it is a side
+	// effect this rung has no business causing.
+	first, ok := agg.NewAccumulator().(ColumnAccumulator)
 	if !ok {
 		return nil, false, nil
 	}
+	// One accumulator per worker, folded with the aggregate's own Merge.
+	//
+	// THIS IS WHAT MERGE IS FOR. The four-operation interface carried Merge from the start on the
+	// argument that a parallel pass would need it, and until now nothing parallel used it -- its
+	// only real caller folded two storage groups that rendered to one label. Here it is doing the
+	// job it was designed for, and the laws CheckAggregate already enforces on it (associative,
+	// commutative, identity) are exactly the laws a fan-out needs, because which worker gets which
+	// segment is a race and the fold order is therefore not fixed.
+	var accs []ColumnAccumulator
 	// A panic is contained for the whole query exactly as the scan contains one, and for the same
 	// reason: a state that stopped being updated part-way yields a wrong answer that looks like a
-	// right one.
+	// right one. A panic on a WORKER is re-raised on this goroutine once every worker has returned,
+	// so it arrives here as an ordinary panic and this recover sees it.
 	var row []AggRow
 	err := func() (err error) {
 		defer func() {
@@ -99,10 +117,28 @@ func ColumnarUserAggregate(values NumValueScan, groupCols []GroupCol, aggs []Agg
 				err = &udafPanic{name: a.UserFunc, val: r}
 			}
 		}()
-		if !values(a.Arg, acc.AddNum) {
+		newSink := func() func(NumValue) {
+			acc := first
+			if acc == nil {
+				// A second type assertion, and it can fail where the first did not only if the
+				// aggregate returns different types from one call to the next. That is a broken
+				// aggregate, and the panic it raises here is caught by the recover above and
+				// reported against its name, which is the diagnosis a caller needs.
+				acc = agg.NewAccumulator().(ColumnAccumulator)
+			}
+			first = nil
+			accs = append(accs, acc)
+			return acc.AddNum
+		}
+		merge := func() {
+			for _, b := range accs[1:] {
+				accs[0].Merge(b)
+			}
+		}
+		if !values(a.Arg, newSink, merge) {
 			return nil // ok stays false below
 		}
-		row = []AggRow{{Values: []string{ValueText(acc.Result())}}}
+		row = []AggRow{{Values: []string{ValueText(accs[0].Result())}}}
 		return nil
 	}()
 	if err != nil {

@@ -760,8 +760,8 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats, redact bool) []Ag
 			if redact {
 				values = t.NumValuesRedacted
 			}
-			rows, ok, err := ColumnarUserAggregate(func(attr string, sink func(NumValue)) bool {
-				return values(req.Constraint, attr, sink)
+			rows, ok, err := ColumnarUserAggregate(func(attr string, newSink func() func(NumValue), merge func()) bool {
+				return values(req.Constraint, attr, newSink, merge)
 			}, req.GroupCols, req.Aggs)
 			if err != nil || !ok {
 				return nil, false, err

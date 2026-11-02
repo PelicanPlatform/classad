@@ -126,8 +126,8 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact b
 			if redact {
 				scan = db.NumValuesRedacted
 			}
-			return ColumnarUserAggregate(func(attr string, sink func(NumValue)) bool {
-				return scan(req.Constraint, attr, sink)
+			return ColumnarUserAggregate(func(attr string, newSink func() func(NumValue), merge func()) bool {
+				return scan(req.Constraint, attr, newSink, merge)
 			}, req.GroupCols, req.Aggs)
 		}},
 		aggRung{"grouped-user-columns", func(req AggRequest) ([]AggRow, bool, error) {

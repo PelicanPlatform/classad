@@ -522,6 +522,9 @@ type Collection struct {
 	queryPar         int
 	qsem             chan struct{}
 	parallelMinBytes int
+	// aggMinBytes is parallelMinBytes for the aggregate value pass, which is cheaper per record
+	// and so amortizes a fan-out over fewer bytes.
+	aggMinBytes int
 
 	// internAtSeal interns each append-only segment as soon as it seals (see
 	// Options.InternAtSeal), via InternSealed from the Archive.Append eager-seal hook.
@@ -945,6 +948,7 @@ func New(opts Options) *Collection {
 		}
 	}
 	c.parallelMinBytes = defaultParallelMinBytes
+	c.aggMinBytes = defaultAggMinBytes
 	c.reverseScan = opts.ReverseScan
 	// Persistent (Dir set) append-only only: c.inline (set later in persist setup) is exactly
 	// Dir != "", and InternSealed is a no-op otherwise, so gate on the option's preconditions here.
