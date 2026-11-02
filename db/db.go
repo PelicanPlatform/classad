@@ -651,6 +651,26 @@ func (db *DB) GroupStatsAllAggs(groups []collections.GroupSpec, aggCols []collec
 	return db.c.GroupStatsAllAggs(groups, aggCols, countFilters)
 }
 
+// GroupValuesConstraintAggs is GroupStatsConstraintAggs reduced into caller-supplied accumulators.
+// Declines on a chained table for the reason above.
+func (db *DB) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string,
+	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	if db.c.Chained() {
+		return nil, false
+	}
+	return db.c.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink)
+}
+
+// GroupValuesAllAggs is GroupValuesConstraintAggs over every row.
+func (db *DB) GroupValuesAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
+	countFilters []string, newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	if db.c.Chained() {
+		return nil, false
+	}
+	return db.c.GroupValuesAllAggs(groups, aggCols, countFilters, newSink)
+}
+
 // LookupClassAd returns the committed ad for key (the hash table, outside any
 // transaction), or (nil, false).
 func (db *DB) LookupClassAd(key string) (*classad.ClassAd, bool) {

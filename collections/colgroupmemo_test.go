@@ -65,7 +65,7 @@ func TestBucketIntervalMemoMatchesBucketOf(t *testing.T) {
 	for _, width := range []int64{1, 7, 3600, 86400, 1 << 40} {
 		rng := rand.New(rand.NewSource(width))
 		keys := memoKeys(width, rng)
-		a := newGroupAccum([]int64{width})
+		a := newGroupAccum([]int64{width}, nil)
 		want := map[int64]int{}
 		for i, k := range keys {
 			g, ok := accFor1(a, k, 0)
@@ -119,7 +119,7 @@ func TestBucketIntervalMemoMatchesBucketOf(t *testing.T) {
 // non-numeric record into a full recomputation for the next real one.
 func TestBucketMemoDoesNotPrimeOnNonNumbers(t *testing.T) {
 	const day = 86400
-	a := newGroupAccum([]int64{day})
+	a := newGroupAccum([]int64{day}, nil)
 	live, ok := accFor1(a, groupComp{kind: gkInt, raw: 3*day + 10}, 0)
 	if !ok || live == nil {
 		t.Fatal("a plain timestamp formed no group")
@@ -184,7 +184,7 @@ func TestBucketMemoDeclinesTheCoarseTopEdge(t *testing.T) {
 			t.Fatalf("width %d: %v now buckets to %d like the rest of the interval, so this case no "+
 				"longer exercises the top edge", tc.width, top, tc.start)
 		}
-		a := newGroupAccum([]int64{tc.width})
+		a := newGroupAccum([]int64{tc.width}, nil)
 		primed, ok := accFor1(a, realKey(mid), 0)
 		if !ok || primed == nil {
 			t.Fatalf("width %d: the priming value formed no group", tc.width)
@@ -220,7 +220,7 @@ func TestBucketMemoDeclinesTheCoarseTopEdge(t *testing.T) {
 // accumulator and leaves the map empty. A miss re-creates the group, which the map then shows.
 func TestBucketMemoDecidesARepeatedRecord(t *testing.T) {
 	for _, shape := range memoShapes() {
-		a := newGroupAccum(shape.buckets)
+		a := newGroupAccum(shape.buckets, nil)
 		first, ok := accForN(a, shape.comps, 0)
 		if !ok || first == nil {
 			t.Fatalf("%s: the first record formed no group (ok %v)", shape.name, ok)
@@ -277,7 +277,7 @@ func TestBucketMemoDeclinesARecordThatMovedBucket(t *testing.T) {
 			if shape.buckets[moved] == 0 {
 				continue // an unbucketed component is the probe's job, not the interval's
 			}
-			a := newGroupAccum(shape.buckets)
+			a := newGroupAccum(shape.buckets, nil)
 			if _, ok := accForN(a, shape.comps, 0); !ok {
 				t.Fatalf("%s: the first record formed no group", shape.name)
 			}

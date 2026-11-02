@@ -130,6 +130,15 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact b
 				return scan(req.Constraint, attr, sink)
 			}, req.GroupCols, req.Aggs)
 		}},
+		aggRung{"grouped-user-columns", func(req AggRequest) ([]AggRow, bool, error) {
+			// A GROUP BY whose value aggregates are all user-defined and take column values.
+			var src GroupValuesSource = db
+			if redact {
+				src = redactedGroupStats{db}
+			}
+			rows, ok, err := GroupedUserFromColumns(src, req.Constraint, req.GroupCols, req.Aggs)
+			return rows, ok, err
+		}},
 		aggRung{"grouped-columns", func(req AggRequest) ([]AggRow, bool, error) {
 			// A GROUP BY one or more columns -- each numeric or string, each raw or bucketed --
 			// with COUNT(*) and/or MIN/MAX/SUM/AVG/COUNT(attr), answered from the columnar blocks.
@@ -193,4 +202,26 @@ func (r redactedGroupStats) GroupStatsConstraintAggs(constraint string, groups [
 func (r redactedGroupStats) GroupStatsAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
 	countFilters []string) ([]collections.GroupStats, bool) {
 	return r.db.GroupStatsAllAggs(groups, aggCols, countFilters)
+}
+
+// The GroupValuesSource half of the same wrapper. It calls the collection's *Redacted entry points
+// outright rather than delegating to the unredacted ones: the two are identical on a mutable
+// collection today, because withholding a sealed value from a keyless reader applies only to an
+// append-only store, but "identical today" is a property of hidesClearSealed rather than of this
+// code, and naming the redacted call keeps this correct if that changes.
+func (r redactedGroupStats) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string,
+	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	if r.db.c.Chained() {
+		return nil, false // as DB.GroupValuesConstraintAggs
+	}
+	return r.db.c.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink)
+}
+
+func (r redactedGroupStats) GroupValuesAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
+	countFilters []string, newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	if r.db.c.Chained() {
+		return nil, false
+	}
+	return r.db.c.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink)
 }

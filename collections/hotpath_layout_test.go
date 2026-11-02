@@ -76,7 +76,7 @@ func TestGroupKeyIsPlainMemory(t *testing.T) {
 			if bucketed {
 				buckets[n-1] = 3600
 			}
-			a := newGroupAccum(buckets)
+			a := newGroupAccum(buckets, nil)
 			if a.n != n {
 				t.Fatalf("%d group columns built an accumulator of arity %d: maxGroupCols admits "+
 					"an arity with no key type", n, a.n)

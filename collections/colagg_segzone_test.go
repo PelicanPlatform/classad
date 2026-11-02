@@ -158,7 +158,7 @@ func TestColumnAggregatesZonePruneSchemaLagSegments(t *testing.T) {
 				})
 				check("vecGroupStats", true, func() bool {
 					grp := []uint32{mustID(t, c, "Grp")}
-					acc, ok := c.vecGroupStats(q, grp, []uint32{mustID(t, c, "Val")}, []int64{0}, nil, c.schemaScan.Load(), false)
+					acc, ok := c.vecGroupStats(q, grp, []uint32{mustID(t, c, "Val")}, []int64{0}, nil, c.schemaScan.Load(), false, nil)
 					if !ok {
 						return false
 					}
@@ -167,7 +167,7 @@ func TestColumnAggregatesZonePruneSchemaLagSegments(t *testing.T) {
 						checkGroups(gs)
 					}
 					if split := lastGroupSplit.Load(); split.prunedSegs < 10 {
-						t.Errorf("vecGroupStats(%s) split reports %d pruned segments", expr, split.prunedSegs)
+						t.Errorf("vecGroupStats(%s, nil) split reports %d pruned segments", expr, split.prunedSegs)
 					}
 					return ok
 				})

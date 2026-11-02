@@ -380,6 +380,16 @@ type groupAccum struct {
 	// a block's decompressed region -- and an INSERT clones, once per distinct value.
 	strID  map[string]int64
 	strVal []string
+
+	// newSink, when set, makes each group carry a CALLER's accumulators instead of the built-in
+	// NumStats ones: a user-defined aggregate reduced from the columns. It is nil for every query
+	// that is not one, and a group then allocates and accumulates exactly what it always did.
+	//
+	// LAST ON PURPOSE. The fields above are ordered so the per-record hot path -- n, bktN, mAcc and
+	// one bucket interval -- lands in a single cache line, and a test pins their byte offsets. Put
+	// here first, this pushed every one of them along by 8 and cost the built-in grouped path a
+	// line it was built to avoid. It is read once per QUERY, so it belongs with the cold fields.
+	newSink func() GroupSink
 }
 
 // bucketMemoMargin is how far inside its top edge a bucket interval has to be for the memo to decide
@@ -398,8 +408,8 @@ const bucketMemoMargin = 1.0 / (1 << 50)
 // formed, so nothing can be truncated into one. The eligibility test callers run before reading
 // anything (resolveGroupAttrs) refuses the same arities, so this is the backstop rather than the
 // gate.
-func newGroupAccum(buckets []int64) *groupAccum {
-	a := &groupAccum{}
+func newGroupAccum(buckets []int64, newSink func() GroupSink) *groupAccum {
+	a := &groupAccum{newSink: newSink}
 	if len(buckets) < 1 || len(buckets) > maxGroupCols {
 		return a
 	}
@@ -530,7 +540,7 @@ func (a *groupAccum) accFor(comps *[maxGroupCols]groupComp, nAgg int) (*groupAcc
 			m.key.raw[0], m.key.kind[0] = comps[0].raw, comps[0].kind
 			g := m.acc[m.key]
 			if g == nil {
-				g = newGroupAcc(nAgg, a.nFilt)
+				g = newGroupAcc(nAgg, a.nFilt, a.newSink)
 				m.acc[m.key] = g
 			}
 			g.n++
@@ -689,8 +699,8 @@ func packProbeN[R rawArr, K kindArr](k *groupKeyN[R, K], comps *[maxGroupCols]gr
 // area -- and the caller is the per-record lookup, whose frame then carries a whole key it never
 // otherwise needs.
 func newGroupN[R rawArr, K kindArr](m *groupMap[groupKeyN[R, K]], k *groupKeyN[R, K],
-	nAgg, nFilt int) *groupAcc {
-	g := newGroupAcc(nAgg, nFilt)
+	nAgg, nFilt int, newSink func() GroupSink) *groupAcc {
+	g := newGroupAcc(nAgg, nFilt, newSink)
 	m.acc[*k] = g
 	return g
 }
@@ -723,7 +733,7 @@ func (a *groupAccum) accForRaw2(comps *[maxGroupCols]groupComp, nAgg int) (*grou
 	m.key.raw[1], m.key.kind[1] = comps[1].raw, comps[1].kind
 	g := m.acc[m.key]
 	if g == nil {
-		g = newGroupN(&m.groupMap, &m.key, nAgg, a.nFilt)
+		g = newGroupN(&m.groupMap, &m.key, nAgg, a.nFilt, a.newSink)
 	}
 	g.n++
 	return g, true
@@ -736,7 +746,7 @@ func (a *groupAccum) accForRaw3(comps *[maxGroupCols]groupComp, nAgg int) (*grou
 	m.key.raw[2], m.key.kind[2] = comps[2].raw, comps[2].kind
 	g := m.acc[m.key]
 	if g == nil {
-		g = newGroupN(&m.groupMap, &m.key, nAgg, a.nFilt)
+		g = newGroupN(&m.groupMap, &m.key, nAgg, a.nFilt, a.newSink)
 	}
 	g.n++
 	return g, true
@@ -833,7 +843,7 @@ func (a *groupAccum) enterBuckets2(comps *[maxGroupCols]groupComp, nAgg int,
 	}
 	g := m.acc[key]
 	if g == nil {
-		g = newGroupN(&m.groupMap, &key, nAgg, a.nFilt)
+		g = newGroupN(&m.groupMap, &key, nAgg, a.nFilt, a.newSink)
 	}
 	g.n++
 	m.armMemo(&key, a.bktN)
@@ -859,7 +869,7 @@ func (a *groupAccum) enterBuckets3(comps *[maxGroupCols]groupComp, nAgg int,
 	}
 	g := m.acc[key]
 	if g == nil {
-		g = newGroupN(&m.groupMap, &key, nAgg, a.nFilt)
+		g = newGroupN(&m.groupMap, &key, nAgg, a.nFilt, a.newSink)
 	}
 	g.n++
 	m.armMemo(&key, a.bktN)
@@ -887,7 +897,7 @@ func (a *groupAccum) enterBucket1(f float64, nAgg int) (*groupAcc, bool) {
 	m.key.raw[0], m.key.kind[0] = b, gkInt
 	g := m.acc[m.key]
 	if g == nil {
-		g = newGroupAcc(nAgg, a.nFilt)
+		g = newGroupAcc(nAgg, a.nFilt, a.newSink)
 		m.acc[m.key] = g
 	}
 	g.n++
@@ -975,11 +985,29 @@ type groupAcc struct {
 	n     int
 	stats []statsAccum
 	rows  []int32
+	// sink is this group's caller-supplied accumulators, when the query asked for them. Exactly
+	// one of sink and stats is ever fed, decided once for the whole query.
+	sink GroupSink
 }
 
-func newGroupAcc(nAgg, nFilt int) *groupAcc {
+// addAgg folds one aggregate column's value into whichever accumulator this query is using.
+//
+// The branch is on a field that is nil for every query that is not a user-defined aggregate, so it
+// predicts perfectly on the path that existed before and costs the one that did not a test it has
+// to make anyway.
+func (g *groupAcc) addAgg(i int, av colVal) {
+	if g.sink != nil {
+		g.sink.AddNum(i, publicNumValue(av))
+		return
+	}
+	g.stats[i].add(av)
+}
+
+func newGroupAcc(nAgg, nFilt int, newSink func() GroupSink) *groupAcc {
 	g := &groupAcc{}
-	if nAgg > 0 {
+	if newSink != nil {
+		g.sink = newSink()
+	} else if nAgg > 0 {
 		g.stats = make([]statsAccum, nAgg)
 		for i := range g.stats {
 			g.stats[i] = newStatsAccum()

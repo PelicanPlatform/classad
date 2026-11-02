@@ -70,7 +70,7 @@ func valueText(v classad.Value) string {
 //
 // Fold is for ORDERING AND PRUNING. Identity is exact bytes.
 func TestGroupKeyStringsAreExactBytes(t *testing.T) {
-	a := newGroupAccum([]int64{0})
+	a := newGroupAccum([]int64{0}, nil)
 	// Pairs that fold equal and must stay apart, plus one repeat of each spelling so the test also
 	// says that the SAME bytes do land together.
 	spellings := []string{"u07", "U07", "u07", "U07", "U07", "site-A", "SITE-a", "Site-A", "", ""}
@@ -115,7 +115,7 @@ func TestGroupKeyStringsAreExactBytes(t *testing.T) {
 // because it only ever merges. The values here all render differently, so the scan has them as
 // separate groups and so must this.
 func TestGroupKeyKindSeparatesRawBits(t *testing.T) {
-	a := newGroupAccum([]int64{0})
+	a := newGroupAccum([]int64{0}, nil)
 	comps := []groupComp{
 		{kind: gkInt, raw: 0},
 		{kind: gkInt, raw: 1},
@@ -152,7 +152,7 @@ func TestGroupKeyKindSeparatesRawBits(t *testing.T) {
 // rendered group -- and where it does, the db layer merges them by their rendered text. A key that
 // could COARSEN has no such repair, so this is the direction that is checked.
 func TestGroupKeyRefinesRenderedIdentity(t *testing.T) {
-	a := newGroupAccum([]int64{0})
+	a := newGroupAccum([]int64{0}, nil)
 	comps := []groupComp{
 		{kind: gkInt, raw: 42},
 		a.strComp("42"),
@@ -339,7 +339,7 @@ func TestGroupStatsColsBucketsPerComponent(t *testing.T) {
 // group the previous record happened to be in.
 func TestBucketMemoAcrossComponents(t *testing.T) {
 	const day = 86400
-	a := newGroupAccum([]int64{0, day})
+	a := newGroupAccum([]int64{0, day}, nil)
 	owners := []groupComp{a.strComp("alice"), a.strComp("bob")}
 	ts := func(f int64) groupComp { return groupComp{kind: gkInt, raw: f} }
 
@@ -374,7 +374,7 @@ func TestBucketMemoAcrossComponents(t *testing.T) {
 // still gone if its timestamp is a NaN.
 func TestBucketedComponentDropsTheWholeRecord(t *testing.T) {
 	const day = 86400
-	a := newGroupAccum([]int64{0, day})
+	a := newGroupAccum([]int64{0, day}, nil)
 	owner := a.strComp("alice")
 	real := func(f float64) groupComp { return groupComp{kind: gkReal, raw: int64(math.Float64bits(f))} }
 	for _, bad := range []groupComp{
@@ -455,7 +455,7 @@ func TestBucketedKeyMatchesBucketOfPerComponent(t *testing.T) {
 		math.NaN(), math.Inf(1), math.Inf(-1),
 	}
 	for _, width := range []int64{1, 2, 3600, 86400} {
-		a := newGroupAccum([]int64{width})
+		a := newGroupAccum([]int64{width}, nil)
 		for _, v := range values {
 			comp := groupComp{kind: gkReal, raw: int64(math.Float64bits(v))}
 			g, ok := accFor1(a, comp, 0)
@@ -624,7 +624,7 @@ func tupleText(a *groupAccum, cs []groupComp) string {
 // and a slot can be missed on its own.
 func TestGroupKeyArityKeepsEveryComponent(t *testing.T) {
 	for n := 1; n <= maxGroupCols; n++ {
-		a := newGroupAccum(make([]int64, n))
+		a := newGroupAccum(make([]int64, n), nil)
 		variants := []groupComp{
 			{kind: gkInt, raw: 1},
 			{kind: gkInt, raw: 2},
@@ -692,7 +692,7 @@ func TestGroupKeyArityKeepsEveryComponent(t *testing.T) {
 // rows look like ordinary rows.
 func TestGroupAccumDeclinesPastTopArity(t *testing.T) {
 	for n := maxGroupCols + 1; n <= maxGroupCols+2; n++ {
-		a := newGroupAccum(make([]int64, n))
+		a := newGroupAccum(make([]int64, n), nil)
 		if a.n != 0 {
 			t.Fatalf("%d group columns built an accumulator of arity %d; no key type covers it", n, a.n)
 		}
@@ -725,7 +725,7 @@ func TestGroupAccumDeclinesPastTopArity(t *testing.T) {
 // a probe that compared only the first would attribute a record to the previous record's group.
 func TestBucketMemoAcrossThreeComponents(t *testing.T) {
 	const day = 86400
-	a := newGroupAccum([]int64{0, 0, day})
+	a := newGroupAccum([]int64{0, 0, day}, nil)
 	alice, bob := a.strComp("alice"), a.strComp("bob")
 	sa, sb := a.strComp("site-a"), a.strComp("site-b")
 	ts := func(f int64) groupComp { return groupComp{kind: gkInt, raw: f} }

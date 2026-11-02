@@ -144,7 +144,7 @@ func TestAggLaddersAreOrderedLists(t *testing.T) {
 		return strings.Join(out, ",")
 	}
 	if got, want := names(d.aggLadder(nil, nil, false)),
-		"live-count,count-constraint,columnar-aggregate,columnar-user-aggregate,grouped-columns,projected-scan"; got != want {
+		"live-count,count-constraint,columnar-aggregate,columnar-user-aggregate,grouped-user-columns,grouped-columns,projected-scan"; got != want {
 		t.Errorf("mutable ladder = %q, want %q", got, want)
 	}
 	cat, err := OpenCatalog(t.TempDir())
@@ -157,7 +157,7 @@ func TestAggLaddersAreOrderedLists(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, want := names(a.aggLadder(nil, false)),
-		"match-none,index-unconstrained,count-constraint,grouped-columns,index-constrained,columnar-aggregate,columnar-user-aggregate,projected-scan"; got != want {
+		"match-none,index-unconstrained,count-constraint,grouped-columns,index-constrained,columnar-aggregate,grouped-user-columns,columnar-user-aggregate,projected-scan"; got != want {
 		t.Errorf("archive ladder = %q, want %q", got, want)
 	}
 }
@@ -236,6 +236,21 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 		{Constraint: "true", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderKinds, Arg: "WallClock"}}},
 		{Constraint: "JobStatus == 4", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderKinds, Arg: "WallClock"}}},
 		{Constraint: "true", GroupCols: []GroupCol{{Attr: "Owner"}}, Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
+		{Constraint: "JobStatus == 4", GroupCols: []GroupCol{{Attr: "Owner"}}, Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
+		// COUNT(*) rides along with a user aggregate: a group's record count is kept beside the
+		// accumulators rather than derived from them.
+		{Constraint: "true", GroupCols: []GroupCol{{Attr: "JobStatus"}}, Aggs: []AggSpec{{Func: AggCount, Arg: "*"}, {Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
+		// Two user aggregates over ONE column: they must get separate accumulators, not one shared
+		// the way MIN(x) and MAX(x) share a statistics accumulator.
+		{Constraint: "true", GroupCols: []GroupCol{{Attr: "Owner"}}, Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}, {Func: AggUser, UserFunc: ladderKinds, Arg: "ProcId"}}},
+		// Bucketed, which is what makes a time series take the columns.
+		{Constraint: "true", GroupCols: []GroupCol{{Attr: "QDate", BucketWidth: 86400}}, Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
+		{Constraint: "true", GroupCols: []GroupCol{{Attr: "Owner"}}, Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderKinds, Arg: "WallClock"}}},
+		// A user aggregate beside a BUILT-IN value aggregate: refused, because a group holds either
+		// the fixed statistics or the caller's accumulators and never both.
+		{Constraint: "true", GroupCols: []GroupCol{{Attr: "Owner"}}, Aggs: []AggSpec{{Func: AggSum, Arg: "ProcId"}, {Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
+		// Did not opt in: must fall to the scan even grouped.
+		{Constraint: "true", GroupCols: []GroupCol{{Attr: "Owner"}}, Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumScan, Arg: "ProcId"}}},
 		{Constraint: "true", Aggs: []AggSpec{{Func: AggCount, Arg: "*"}}},
 		{Constraint: "JobStatus == 4", Aggs: []AggSpec{{Func: AggCount, Arg: "*"}}},
 		{Constraint: "false", Aggs: []AggSpec{{Func: AggCount, Arg: "*"}}},
@@ -305,8 +320,10 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 		// Named explicitly, because "some rung answered" would stay true if this one silently
 		// declined every user aggregate -- which is exactly how a columnar rung stops earning
 		// its keep without anything going red.
-		if accelerated && !answered["columnar-user-aggregate"] {
-			t.Errorf("%s: the columnar-user-aggregate rung answered nothing; it is not being reached", kind)
+		for _, rung := range []string{"columnar-user-aggregate", "grouped-user-columns"} {
+			if accelerated && !answered[rung] {
+				t.Errorf("%s: the %s rung answered nothing; it is not being reached", kind, rung)
+			}
 		}
 		t.Logf("%s: rungs exercised %v", kind, answered)
 	}
@@ -330,6 +347,7 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 		"grouped-columns":         collections.TierColumnar,
 		"columnar-aggregate":      collections.TierColumnar,
 		"columnar-user-aggregate": collections.TierColumnar,
+		"grouped-user-columns":    collections.TierColumnar,
 		"projected-scan":          collections.TierScan,
 	}
 	tagged := map[string]bool{}

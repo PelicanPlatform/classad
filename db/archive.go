@@ -730,6 +730,24 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats, redact bool) []Ag
 			stats.SetTier(collections.TierColumnar)
 			return rows, true, nil
 		}},
+		aggRung{"grouped-user-columns", func(req AggRequest) ([]AggRow, bool, error) {
+			// A GROUP BY whose value aggregates are all user-defined and take column values.
+			// Placed beside the built-in grouped rung rather than below the ungrouped one,
+			// because it serves a shape neither of those can.
+			if scanOnly(req) {
+				return nil, false, nil
+			}
+			var src GroupValuesSource = t
+			if redact {
+				src = redactedGroupValues{t}
+			}
+			rows, ok, err := GroupedUserFromColumns(src, req.Constraint, req.GroupCols, req.Aggs)
+			if err != nil || !ok {
+				return nil, false, err
+			}
+			stats.SetTier(collections.TierColumnar)
+			return rows, true, nil
+		}},
 		aggRung{"columnar-user-aggregate", func(req AggRequest) ([]AggRow, bool, error) {
 			// A single ungrouped user-defined aggregate whose accumulator takes column values.
 			// The archive is where this matters most: a history table is the one a whole-column
@@ -1300,6 +1318,35 @@ func (t *ArchiveTable) GroupStatsConstraintAggs(constraint string, groups []coll
 func (t *ArchiveTable) GroupStatsAllAggs(groups []collections.GroupSpec,
 	aggCols []collections.GroupAggCol, countFilters []string) ([]collections.GroupStats, bool) {
 	return t.a.GroupStatsAllAggs(groups, aggCols, countFilters)
+}
+
+// GroupValuesConstraintAggs is GroupStatsConstraintAggs reduced into caller-supplied accumulators.
+func (t *ArchiveTable) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string,
+	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	return t.a.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink)
+}
+
+// GroupValuesAllAggs is GroupValuesConstraintAggs over every row.
+func (t *ArchiveTable) GroupValuesAllAggs(groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string,
+	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	return t.a.GroupValuesAllAggs(groups, aggCols, countFilters, newSink)
+}
+
+// redactedGroupValues is GroupValuesSource for a reader not entitled to sealed values.
+type redactedGroupValues struct{ t *ArchiveTable }
+
+func (r redactedGroupValues) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string,
+	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	return r.t.a.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink)
+}
+
+func (r redactedGroupValues) GroupValuesAllAggs(groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string,
+	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	return r.t.a.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink)
 }
 
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).

@@ -1610,12 +1610,28 @@ it.
 name, named in an `AggSpec` as `AggUser` plus that name, and the shared GROUP BY core reduces with it
 exactly as it reduces with SUM.
 
-**So is the columnar half, for the ungrouped case** (`db/coludaf.go`, `collections.NumValuesQuery`).
-An aggregate that can take its argument as a column says so by implementing `ColumnAccumulator`, and
-a rung of the aggregate ladder then feeds it from the same block-pruned, unboxed pass that answers
-SUM. Measured on 50k records: an ungrouped user-defined sum goes from **13.35 ms to 1.56 ms**,
-against the built-in's 1.62 ms — the whole gap, closed to parity. Grouped is untouched and still
-falls to the scan, because the pass yields values with no group key attached.
+**So is the columnar half, grouped and ungrouped** (`db/coludaf.go`, `db/colgroupudaf.go`,
+`collections.NumValuesQuery`, `collections.GroupValuesConstraintAggs`). An aggregate that can take
+its argument as a column says so by implementing `ColumnAccumulator`, and two rungs of the aggregate
+ladder feed it from the same block-pruned, unboxed passes that answer SUM — the ungrouped value
+pass, and the grouping machinery itself, with each group carrying the caller's accumulators instead
+of the fixed numeric statistics. Measured on 50k records:
+
+| | scan | column | built-in | speed-up |
+|---|---|---|---|---|
+| ungrouped | 17.84 ms | **2.13 ms** | 2.15 ms | 8.4x |
+| grouped | 24.72 ms | **3.87 ms** | 3.86 ms | 6.4x |
+
+Both at parity with the built-in they imitate — within 1% either way, which is the claim that
+matters; the absolute figures are from one run on a machine that was not idle, so they are
+comparable to each other and not to a number measured elsewhere.
+
+An earlier draft of this table quoted faster absolutes that were measured **before** the layout bug
+in §13.6 was fixed, which means they were measured against a handicapped built-in. The parity
+conclusion survived the fix; the numbers did not, and are replaced here rather than left standing. The grouped rung takes `COUNT(*)` alongside, filtered
+or not, since a group's record count is kept beside the accumulators rather than derived from them;
+a *built-in value* aggregate in the same request is refused, because a group holds either the fixed
+statistics or the caller's accumulators and never both.
 
 What is *not* built is the wire: no frame has a field to put an aggregate's name in, so both ends of
 the RPC refuse one rather than send a request that looks well formed and asks for something
@@ -1669,21 +1685,31 @@ limitation. The row path, meanwhile, accumulates per group and defers the arithm
 library's own `Sum`/`Avg`/`Min`/`Max` at the end, and a user-defined aggregate plugs in there
 cleanly; a test pins the columnar decline rather than leaving it to a `default:` arm nobody reads.
 
-### 13.2 Four operations, and *merge* is required and **not yet called**
+### 13.2 Four operations, and *merge* turned out to be load-bearing for an unexpected reason
 
 The interface is init / accumulate / merge / finalize, as `Aggregate.NewAccumulator` and
 `Accumulator.Add` / `Merge` / `Result`.
 
-Merge is in it, and **the engine never calls it**. The reduction core is strictly serial over one
-`iter.Seq`, so every accumulator the package builds is folded by `Add` alone. Saying so plainly
-matters more than it looks: an interface with an uncalled method invites someone to conclude the
-engine is parallel, and it is not.
+Merge was put in the interface for a parallelism that does not exist: the record-scan reduction is
+strictly serial over one `iter.Seq`, so every accumulator it builds is folded by `Add` alone. This
+section used to say so plainly, and the justification was that leaving merge out would bake the
+serialism into the contract — the moment a per-segment reduction exists, an interface without merge
+is single-threaded *by construction* in the one place the engine is not.
 
-It is required anyway, because leaving it out would bake the serialism into the contract. The moment
-a per-segment or parallel reduction exists, an interface without merge is single-threaded *by
-construction* in the one place the engine is not — and every aggregate already written would have to
-be revisited. Requiring it now costs an implementation one method; adding it later costs every
-implementor a rewrite.
+**The grouped columnar rung calls it, and not for that reason.** Two *storage* groups can render to
+the same label — an integer `1` and a real `1.0` are distinct group values and one output row — so
+the shaper folds them together before emitting, exactly as the built-in path folds their statistics.
+Folding two groups' accumulators is `Merge`. The law it is held to, associative *and* commutative, is
+what makes folding in storage-group order sound.
+
+Worth recording as a shape rather than a detail: **a requirement justified by a parallelism that did
+not exist turned out to be load-bearing for a reason that had nothing to do with parallelism.** Had
+the interface shipped without merge, the grouped rung would have had to grow a second way to combine
+two groups, or silently emit a duplicate row the reference does not.
+
+It also stayed untested far longer than it looked. The ladder's shared fixture is all integers, so no
+two groups ever collided there; deleting the `Merge` call outright left every test green until a
+fixture with a mostly-integer column holding the occasional real was written for it.
 
 The law it must satisfy is **associative and commutative**, not merely associative, because nothing
 promises the order partial states are produced or combined in — zone and segment identity has
@@ -1765,7 +1791,7 @@ The rung is held to the ladder's existing rule — every rung's answer equals th
 same request — by the test that already enforces it for every other rung, with the new one named
 explicitly so that silently declining everything cannot pass as success.
 
-### 13.6 Three findings from building it
+### 13.6 Four findings from building it
 
 **The laws cannot be exact for a floating-point aggregate, and that is not the implementation's
 fault.** The obvious first thing anyone writes here is a variance — precisely because its state is
@@ -1790,6 +1816,21 @@ answer, it yields a **wrong one that is indistinguishable from a right one**. Th
 instead. Per query also costs nothing per row, where a recovery around each `Add` would be a deferred
 call on the hottest loop in the reduction.
 
+**A struct's field ORDER was load-bearing, the comment said so, and I inserted above it anyway.**
+Carrying the sink factory meant adding one field to `groupAccum`, and it went at the top. That
+pushed `n`, `bktN`, `mAcc` and the bucket intervals along by eight bytes each — the fields ordered
+so that the single-column bucketed memo hit, the shape a time series asks, reads one cache line.
+`TestGroupAccumHotFieldOffsets` pins their byte offsets and failed immediately. The struct's own
+comment explains the ordering, directly above the line the field was added to.
+
+Two things worth keeping from it. The first is that **a layout invariant needs a test that fails,
+because a comment does not stop anyone** — this one has one, it worked, and that is the only reason
+the regression lasted minutes rather than until someone profiled a dashboard. The second is about
+measurement: the grouped benchmark was run *before* the fix, so it compared a user-defined
+aggregate against a **handicapped built-in**, and the parity it reported was not the parity it
+looked like. It happened to survive re-measurement, which is luck rather than method. A benchmark
+run between writing a change and testing it is measuring something that does not exist yet.
+
 **A surviving mutation does not always mean delete the guard.** Cutting the checker's split points
 down to the midpoint alone survived the whole suite. The previous time a mutation survived in this
 work it proved a guard redundant and the guard went. Here the opposite was right, and the
@@ -1808,10 +1849,6 @@ mutation then died.
 - **A parallel or per-segment reduction**, which is what would make `Merge` load-bearing rather than
   merely required. Note that it is also what turns the built-in float SUM's arrival-order dependence
   from latent into live.
-- **The grouped columnar rung**, now the top of this list and the larger remaining prize: GROUP BY is
-  the shape a dashboard actually asks, and it is the one still falling to the scan at 6.8x. The
-  ungrouped pass yields values with no group key, so this needs the grouping machinery
-  `GroupedFromColumns` already has, driving an accumulator per group instead of fixed statistics.
 - **The statistics shortcut**, separately and much narrower: an aggregate that can declare itself a
   function of the `NumStats` a pass already computes (a range, a mean) could be answered from them
   without its own accumulate. Worth far less than the item above, and worth building only after

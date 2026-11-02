@@ -33,7 +33,7 @@ import (
 // produce -- the same give-up condition as the predicate-analysis path, for the same reason (see
 // GroupStatsQuery).
 func (c *Collection) vecGroupStats(q *vm.Query, groupIDs []uint32, aggIDs []uint32, buckets []int64,
-	gf *groupFilters, st *schemaScanState, redact bool) (*groupAccum, bool) {
+	gf *groupFilters, st *schemaScanState, redact bool, newSink func() GroupSink) (*groupAccum, bool) {
 	if q == nil || !q.Native() {
 		return nil, false
 	}
@@ -47,7 +47,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupIDs []uint32, aggIDs []uint
 	if gf != nil {
 		return nil, false
 	}
-	acc := newGroupAccum(buckets)
+	acc := newGroupAccum(buckets, newSink)
 	sides := c.newEvalSides(q, redact)
 	cs := &colScope{bc: st.cache, c: c}
 	resolver := cs.resolve
@@ -225,7 +225,7 @@ func addGroupFromColumns(k int, cols *groupCols, aggCols []numCol, bc *blockCach
 			return false
 		}
 		if cell == cellNumber {
-			g.stats[i].add(av)
+			g.addAgg(i, av)
 		}
 	}
 	return true
@@ -335,7 +335,7 @@ func addGroupFromAd(d *segDictHandle, ad wire.Ad, groupLookups []fieldLookup,
 				return false
 			}
 			if av, isNum := nodeColVal(an); isNum {
-				g.stats[i].add(av)
+				g.addAgg(i, av)
 			}
 		}
 	}
