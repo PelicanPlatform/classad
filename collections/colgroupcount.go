@@ -801,6 +801,9 @@ func (c *Collection) groupPassWindow(p *groupPassPlan, st *groupPassState, w seg
 	groupIDs, aggIDs, preds := p.groupIDs, p.aggIDs, p.preds
 	lookups, groupLookups, aggLookups := p.lookups, p.groupLookups, p.aggLookups
 	cand, sc, cols, aggCols, gf := &st.cand, &st.sc, &st.cols, st.aggCols, st.gf
+	if groupPassDeclineHook != nil && groupPassDeclineHook(w) {
+		return false
+	}
 	if p.ct && !w.ctFree {
 		return false // a folded predicate is exact only in a proven window
 	}
