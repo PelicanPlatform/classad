@@ -58,13 +58,14 @@ type refInfo struct {
 // Program is a compiled expression: a flat instruction stream plus the constant
 // pools its instructions index into.
 type Program struct {
-	code   []Instr
-	consts []classad.Value // OpPushConst
-	ops    []string        // OpBinop / OpUnop operator strings
-	refs   []refInfo       // OpLoadRef
-	nodes  []ast.Expr      // OpEvalNode (delegated subtrees)
-	funcs  []funcInfo      // OpCallFunc
-	conds  []condTargets   // OpBranchCond
+	code      []Instr
+	consts    []classad.Value // OpPushConst
+	ops       []string        // OpBinop / OpUnop operator strings
+	refs      []refInfo       // OpLoadRef
+	aliasRefs []aliasRef      // OpLoadAlias
+	nodes     []ast.Expr      // OpEvalNode (delegated subtrees)
+	funcs     []funcInfo      // OpCallFunc
+	conds     []condTargets   // OpBranchCond
 
 	// members are the constant lists of member/identicalMember calls (OpMember).
 	members []*memberSet

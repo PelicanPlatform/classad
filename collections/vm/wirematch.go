@@ -9,7 +9,12 @@ import (
 // with no delegated (OpEvalNode) subtrees. Only native queries can be evaluated
 // with EvalResolved, because a delegated subtree needs a real ClassAd scope for
 // its function/select/subscript/list semantics.
-func (q *Query) Native() bool { return len(q.prog.nodes) == 0 }
+//
+// A query carrying QUALIFIED references (CompileAliases) is not Native however it compiled:
+// EvalResolved's resolver is given a name and a scope, and has no way to say which side of a
+// join a name belongs to. Those are evaluated with EvalAliased instead, which AliasNative
+// gates.
+func (q *Query) Native() bool { return len(q.prog.nodes) == 0 && len(q.prog.aliasRefs) == 0 }
 
 // EvalResolved evaluates the query using a custom attribute resolver instead of a
 // ClassAd scope, reusing the Matcher's evaluator and stack. resolver(name, scope)

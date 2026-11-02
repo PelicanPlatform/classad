@@ -144,6 +144,16 @@ func exec(p *Program, ev *classad.Evaluator, stack []classad.Value, budget int) 
 		case OpEvalNode:
 			stack = append(stack, ev.Evaluate(p.nodes[in.A]))
 			ip++
+		case OpLoadAlias:
+			r := p.aliasRefs[in.A]
+			if v, ok := ev.ResolveAlias(r.alias, r.name); ok {
+				stack = append(stack, v)
+			} else {
+				// No alias resolver: this is an ordinary evaluation against a real
+				// record, so select out of it exactly as the delegated form did.
+				stack = append(stack, ev.Evaluate(r.node))
+			}
+			ip++
 		case OpStrListMember:
 			stack[len(stack)-1] = p.strLists[in.A].eval(stack[len(stack)-1])
 			ip++

@@ -385,3 +385,31 @@ func SplitStringList(list, delimiter string) []string {
 func StringListArg(v Value) (string, bool) {
 	return stringListStrArg(v)
 }
+
+// SetAliasResolver installs (or clears, with nil) a resolver for QUALIFIED attribute
+// references -- `alias.Attr`, where alias names one side of a join. While set, a program
+// compiled with vm.CompileAliases resolves such a reference through fn(alias, name) rather
+// than selecting a member out of a materialized record, so a join condition can be evaluated
+// against two separately-stored rows with no composite ClassAd built.
+//
+// alias is the INDEX of the alias in the list the program was compiled with, not its text:
+// the match is made once, at compile time, so evaluation compares no names.
+//
+// fn returns the attribute's value, or undefined when the named side does not define it --
+// which is also how an absent side reads, and deliberately so: a LEFT JOIN's unmatched row
+// has no member for the inner side, and ClassAd's spelling of that is undefined for every
+// attribute of it. The Evaluator is not safe for concurrent use.
+func (e *Evaluator) SetAliasResolver(fn func(alias int, name string) Value) {
+	e.aliasResolver = fn
+}
+
+// ResolveAlias resolves a qualified reference through the alias resolver. ok is false when
+// none is installed, in which case the caller must fall back to evaluating the reference the
+// ordinary way -- against a real record -- so a program carrying qualified references is
+// never silently answered from a resolver that is not there.
+func (e *Evaluator) ResolveAlias(alias int, name string) (Value, bool) {
+	if e.aliasResolver == nil {
+		return Value{}, false
+	}
+	return e.aliasResolver(alias, name), true
+}

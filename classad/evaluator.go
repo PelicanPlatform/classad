@@ -386,6 +386,10 @@ type Evaluator struct {
 	// scope (see SetResolver). It lets a caller evaluate against an alternate
 	// backing (e.g. an encoded ad) without materializing a ClassAd.
 	resolver func(name string, scope ast.AttributeScope) Value
+	// aliasResolver, when non-nil, supplies the value of a QUALIFIED reference --
+	// `alias.Attr` naming one side of a join -- by alias index rather than by selecting a
+	// member out of a record (see SetAliasResolver).
+	aliasResolver func(alias int, name string) Value
 	// bind, when non-nil, supplies TARGET for the ads it names in place of their own
 	// target field, so an evaluation can be run against a target without writing it
 	// onto either ad (see targetOf).
