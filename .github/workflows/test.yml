@@ -336,9 +336,18 @@ jobs:
         go build ./...
         go vet ./...
 
+    # -timeout, because `db` under -race measured 596.7s against go test's 600s DEFAULT on
+    # origin/main: a 3.3-second margin, which is not a margin. Any change costing more than a few
+    # seconds failed this job with a timeout panic rather than with whatever it actually broke, and
+    # the panic names whichever test happened to be running at the ten-minute mark -- which is not
+    # the slow one and sends the reader somewhere irrelevant. collections and dbrpc are sharded for
+    # the same reason and pass their own timeouts; this job had neither.
+    #
+    # This raises the ceiling, it does not make the suite faster. `db` is now the longest unsharded
+    # job here and should be sharded the way collections/shard-test.sh does it once it grows again.
     - name: Test (race detector)
       working-directory: ${{ matrix.module }}
-      run: go test -race -count=1 ./...
+      run: go test -race -count=1 -timeout 25m ./...
 
   # dbrpc/ is a separate Go module, and the root module's `go test ./...` does not
   # descend into a nested one -- so the RPC server for the whole database ran in NO CI

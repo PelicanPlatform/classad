@@ -211,6 +211,9 @@ type Config struct {
 	// when per-record work is small the scheduling can cost more than the scan -- and
 	// without this the db layer gave no way to find that out, let alone configure it.
 	QueryParallelism int
+	// AggMinBytes is collections.Options.AggMinBytes: the live segment bytes an aggregate pass
+	// must cover before it fans out across segments. 0 takes the measured default.
+	AggMinBytes int
 }
 
 // Open opens a ClassAd log with default configuration. A non-empty dir makes it
@@ -248,6 +251,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		EncryptedAttrs:          cfg.EncryptedAttrs,
 		SegmentSize:             cfg.SegmentSize, // 0 ⇒ collections default (8 MiB)
 		QueryParallelism:        cfg.QueryParallelism,
+		AggMinBytes:             cfg.AggMinBytes,
 		// Process-global shared block-cache budgets (0 ⇒ collections default). Both are set here at DB
 		// open: collections.New applies BOTH the mutating and archive budgets to the process globals,
 		// so archives opened later from a plain ArchiveConfig inherit the archive budget set now.

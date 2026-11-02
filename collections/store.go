@@ -282,6 +282,13 @@ type Options struct {
 	// oversubscribing). Small scans and indexed queries run serial regardless.
 	// See parallel_scan.go / docs/PARALLEL_QUERY.md.
 	QueryParallelism int
+	// AggMinBytes overrides the live segment bytes an AGGREGATE pass must cover before it fans
+	// out across segments. 0 takes the measured default; see defaultAggMinBytes, which carries the
+	// numbers it was set from. A value below the default buys nothing on a real workload -- the
+	// fan-out is measurably slower than staying serial under it -- so this exists for a test that
+	// needs to exercise the fanned-out path without building the tens of megabytes the real gate
+	// asks for, and for an operator who has measured their own hardware and disagrees.
+	AggMinBytes int
 	// WatchHistory enables the Watch subscription verb (see docs/WATCH.md). It is the
 	// per-shard capacity of the delete journal — how many recent deletes are retained
 	// so a resuming watcher can be told precisely which keys were removed. 0 (default)
@@ -524,6 +531,9 @@ type Collection struct {
 	queryPar         int
 	qsem             chan struct{}
 	parallelMinBytes int
+	// aggMinBytes is parallelMinBytes for the aggregate value pass, which is cheaper per record
+	// and so amortizes a fan-out over fewer bytes.
+	aggMinBytes int
 
 	// internAtSeal interns each append-only segment as soon as it seals (see
 	// Options.InternAtSeal), via InternSealed from the Archive.Append eager-seal hook.
@@ -953,6 +963,10 @@ func New(opts Options) *Collection {
 		}
 	}
 	c.parallelMinBytes = defaultParallelMinBytes
+	c.aggMinBytes = defaultAggMinBytes
+	if opts.AggMinBytes > 0 {
+		c.aggMinBytes = opts.AggMinBytes
+	}
 	c.reverseScan = opts.ReverseScan
 	// Persistent (Dir set) append-only only: c.inline (set later in persist setup) is exactly
 	// Dir != "", and InternSealed is a no-op otherwise, so gate on the option's preconditions here.

@@ -95,9 +95,9 @@ func BenchmarkAggregateBuiltinVsUser(b *testing.B) {
 		{"ungrouped/user-column", nil, []AggSpec{{Func: AggUser, UserFunc: colName, Arg: "Cpus"}}},
 		{"grouped/builtin", []GroupCol{{Attr: "JobStatus"}}, []AggSpec{{Func: AggSum, Arg: "Cpus"}}},
 		{"grouped/user-scan", []GroupCol{{Attr: "JobStatus"}}, []AggSpec{{Func: AggUser, UserFunc: name, Arg: "Cpus"}}},
-		// Grouped has no columnar rung for a user aggregate yet: the value pass yields values
-		// with no group key attached, so a grouped request falls to the scan whether or not the
-		// aggregate opted in. Measured here so that stays visible rather than being assumed.
+		// Grouped now has a columnar rung of its own, so this arm and the one above it differ in
+		// which rung serves them rather than in whether any does. Kept as a pair so a regression
+		// that quietly sent a grouped user aggregate back to the scan shows up as a ratio.
 		{"grouped/user-column", []GroupCol{{Attr: "JobStatus"}}, []AggSpec{{Func: AggUser, UserFunc: colName, Arg: "Cpus"}}},
 	}
 	for _, c := range cases {

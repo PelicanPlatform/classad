@@ -4,6 +4,8 @@ import (
 	"math"
 	"math/bits"
 
+	"github.com/PelicanPlatform/classad/collections/vm"
+
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
@@ -178,14 +180,26 @@ func (b *columnarBlock) fieldIntAt(k, fieldIdx int, bc *blockCache) (int64, bool
 // fall back to a row walk reading only those attributes -- never a full ad decode.
 //
 // ok=false when a value involved is an expression, which the columns cannot evaluate.
-// schemaScanStatsMulti is the NumStats instantiation of schemaScanValuesMulti: the same pass, with
-// the reference's type-promotion accumulator as its sink.
+// schemaScanStatsMulti is the NumStats instantiation of the columnar value pass: the same pass, with
+// the reference's type-promotion accumulator as its sink, and that accumulator's own merge as the
+// fold when the pass fans out.
 func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *blockCache) (NumStats, bool) {
-	acc := newStatsAccum()
-	if !c.schemaScanValuesMulti(aggID, preds, bc, acc.add) {
+	var accs []*statsAccum
+	ok := c.valuesPar(aggID, preds, bc,
+		func() numSink {
+			a := newStatsAccum()
+			accs = append(accs, &a)
+			return a.add
+		},
+		func() {
+			for _, b := range accs[1:] {
+				accs[0].merge(b)
+			}
+		})
+	if !ok {
 		return NumStats{}, false
 	}
-	return acc.result(), true
+	return accs[0].result(), true
 }
 
 // numSink receives one numeric value of the aggregated column. The pass calls it once per
@@ -202,6 +216,44 @@ type numSink func(colVal)
 // proven window, an unreadable column with no usable row fallback, or an expression-valued cell,
 // which has no numeric reading at all.
 func (c *Collection) schemaScanValuesMulti(aggID uint32, preds []fieldPred, bc *blockCache, sink numSink) bool {
+	p := c.planValuePass(aggID, preds)
+	var st valuePassState
+	for _, sh := range c.shards {
+		s0, wins := sh.snapshot()
+		for _, w := range wins {
+			if !c.valuePassWindow(&p, &st, w, s0, bc, sink) {
+				releaseWindows(wins)
+				return false
+			}
+		}
+		releaseWindows(wins)
+	}
+	return true
+}
+
+// valuePassPlan is everything a value pass resolves once, before it touches a segment: the split of
+// the predicates into those on the aggregated column (fused into the value read) and those that
+// narrow, their wire lookups, and the zone probes. It is READ-ONLY once built, which is what lets
+// every worker of a parallel pass share one.
+type valuePassPlan struct {
+	aggID      uint32
+	preds      []fieldPred
+	otherPreds []fieldPred
+	lookups    []fieldLookup
+	aggLookup  fieldLookup
+	selfOK     func(float64) bool
+	ct         bool
+	zp         []vm.Probe
+}
+
+// valuePassState is the scratch one goroutine needs to walk a window. One per worker, never shared:
+// the same per-goroutine-state rule that governs the matcher and the prefilter.
+type valuePassState struct {
+	cand candSet
+	sc   predScratch
+}
+
+func (c *Collection) planValuePass(aggID uint32, preds []fieldPred) valuePassPlan {
 	// A predicate on the AGGREGATED attribute is applied during the value pass, not as a narrowing
 	// pass of its own: the value is being read anyway, so testing it there costs nothing, while a
 	// separate pass reads the same column twice. Skipping that fusion made
@@ -214,123 +266,125 @@ func (c *Collection) schemaScanValuesMulti(aggID uint32, preds []fieldPred, bc *
 			otherPreds = append(otherPreds, p)
 		}
 	}
-	selfOK := func(v float64) bool {
-		for _, p := range selfPreds {
-			if !p.eval(v) {
-				return false
-			}
-		}
-		return true
-	}
 	lookups := make([]fieldLookup, len(otherPreds))
 	for i, p := range otherPreds {
 		lookups[i] = c.attrLookup(p.fieldID)
 	}
-	aggLookup := c.attrLookup(aggID)
-
-	var cand candSet
-	var sc predScratch
-	ct := predsNeedCT(preds)
-	zp := predZoneProbes(preds)
-	for _, sh := range c.shards {
-		s0, wins := sh.snapshot()
-		for _, w := range wins {
-			if ct && !w.ctFree {
-				releaseWindows(wins) // a folded predicate is exact only in a proven window
-				return false
-			}
-			// No record here can match, so none contributes; see schemaScanCountMulti.
-			if c.segZoneExcludes(w, zp, ct) {
-				continue
-			}
-			cs := w.seg.colblk.Load()
-			aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)
-			if !ok {
-				if !bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, sink) {
-					releaseWindows(wins)
+	return valuePassPlan{
+		aggID:      aggID,
+		preds:      preds,
+		otherPreds: otherPreds,
+		lookups:    lookups,
+		aggLookup:  c.attrLookup(aggID),
+		selfOK: func(v float64) bool {
+			for _, p := range selfPreds {
+				if !p.eval(v) {
 					return false
 				}
-				continue
 			}
-			// Narrowing uses only the OTHER fields; pruning may use them all, since ruling a block
-			// out is sound for any predicate including one on the aggregated column.
-			otherIdxs := make([]int, 0, len(otherPreds))
-			for i, p := range preds {
-				if p.fieldID != aggID {
-					otherIdxs = append(otherIdxs, allIdxs[i])
+			return true
+		},
+		ct: predsNeedCT(preds),
+		zp: predZoneProbes(preds),
+	}
+}
+
+// valuePassWindow walks one segment window, handing every contributing value to sink. false means
+// the pass cannot serve the request and the caller must scan.
+func (c *Collection) valuePassWindow(p *valuePassPlan, st *valuePassState, w segWindow, s0 uint64,
+	bc *blockCache, sink numSink) bool {
+	aggID, preds, otherPreds := p.aggID, p.preds, p.otherPreds
+	lookups, aggLookup, selfOK := p.lookups, p.aggLookup, p.selfOK
+	cand, sc := &st.cand, &st.sc
+	if p.ct && !w.ctFree {
+		return false // a folded predicate is exact only in a proven window
+	}
+	// No record here can match, so none contributes; see schemaScanCountMulti.
+	if c.segZoneExcludes(w, p.zp, p.ct) {
+		return true
+	}
+	cs := w.seg.colblk.Load()
+	aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)
+	if !ok {
+		aggRowSegments.Add(1)
+		if !bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, sink) {
+			return false
+		}
+		return true
+	}
+	// Narrowing uses only the OTHER fields; pruning may use them all, since ruling a block
+	// out is sound for any predicate including one on the aggregated column.
+	otherIdxs := make([]int, 0, len(otherPreds))
+	for i, p := range preds {
+		if p.fieldID != aggID {
+			otherIdxs = append(otherIdxs, allIdxs[i])
+		}
+	}
+	aggColSegments.Add(1)
+	base := 0
+	for _, blk := range cs.blocks {
+		// Only the PREDICATE columns can rule a block out; the aggregated column's values
+		// are the answer.
+		if !blockMayMatch(blk, allIdxs, preds) {
+			base += blk.n
+			continue
+		}
+		// The schema carries every field, but a column may still not read (an unreadable
+		// cold stream). Answer that block from its records rather than drop them.
+		col, colOK := newNumCol(blk, aggIdx, aggID, bc)
+		if !colOK || !blk.numColsReadable(otherIdxs, bc) {
+			if !c.statsBlockRows(w, s0, cs, base, blk.n, aggLookup, otherPreds, lookups, selfOK, sink) {
+				return false
+			}
+			base += blk.n
+			continue
+		}
+		if len(otherPreds) == 0 {
+			// One fused pass: visibility, value, and the aggregated column's own predicate.
+			for k := 0; k < blk.n; k++ {
+				gk := base + k
+				if gk >= cs.offsLen() {
+					break
+				}
+				o := cs.offAt(gk)
+				if !w.visible(o, s0) {
+					continue
+				}
+				nv, cell := col.cell(k, bc)
+				if cell == cellExpr {
+					return false
+				}
+				if cell == cellNumber && selfOK(nv.f) {
+					sink(nv)
 				}
 			}
-			base := 0
-			for _, blk := range cs.blocks {
-				// Only the PREDICATE columns can rule a block out; the aggregated column's values
-				// are the answer.
-				if !blockMayMatch(blk, allIdxs, preds) {
-					base += blk.n
-					continue
-				}
-				// The schema carries every field, but a column may still not read (an unreadable
-				// cold stream). Answer that block from its records rather than drop them.
-				col, colOK := newNumCol(blk, aggIdx, aggID, bc)
-				if !colOK || !blk.numColsReadable(otherIdxs, bc) {
-					if !c.statsBlockRows(w, s0, cs, base, blk.n, aggLookup, otherPreds, lookups, selfOK, sink) {
-						releaseWindows(wins)
-						return false
-					}
-					base += blk.n
-					continue
-				}
-				if len(otherPreds) == 0 {
-					// One fused pass: visibility, value, and the aggregated column's own predicate.
-					for k := 0; k < blk.n; k++ {
-						gk := base + k
-						if gk >= cs.offsLen() {
-							break
-						}
-						o := cs.offAt(gk)
-						if !w.visible(o, s0) {
-							continue
-						}
-						nv, cell := col.cell(k, bc)
-						if cell == cellExpr {
-							releaseWindows(wins)
-							return false
-						}
-						if cell == cellNumber && selfOK(nv.f) {
-							sink(nv)
-						}
-					}
-					base += blk.n
-					continue
-				}
-				sc.prepare(blk.n)
-				cand.setVisible(cs, w, s0, base, blk.n)
-				for i := range otherPreds {
-					if cand.live == 0 {
-						break
-					}
-					if !narrowByField(blk, otherIdxs[i], otherPreds[i], bc, &cand, &sc) {
-						releaseWindows(wins)
-						return false
-					}
-				}
-				for wi, word := range cand.w {
-					for word != 0 {
-						k := wi*64 + bits.TrailingZeros64(word)
-						word &= word - 1
-						nv, cell := col.cell(k, bc)
-						if cell == cellExpr {
-							releaseWindows(wins)
-							return false
-						}
-						if cell == cellNumber && selfOK(nv.f) {
-							sink(nv)
-						}
-					}
-				}
-				base += blk.n
+			base += blk.n
+			continue
+		}
+		sc.prepare(blk.n)
+		cand.setVisible(cs, w, s0, base, blk.n)
+		for i := range otherPreds {
+			if cand.live == 0 {
+				break
+			}
+			if !narrowByField(blk, otherIdxs[i], otherPreds[i], bc, cand, sc) {
+				return false
 			}
 		}
-		releaseWindows(wins)
+		for wi, word := range cand.w {
+			for word != 0 {
+				k := wi*64 + bits.TrailingZeros64(word)
+				word &= word - 1
+				nv, cell := col.cell(k, bc)
+				if cell == cellExpr {
+					return false
+				}
+				if cell == cellNumber && selfOK(nv.f) {
+					sink(nv)
+				}
+			}
+		}
+		base += blk.n
 	}
 	return true
 }

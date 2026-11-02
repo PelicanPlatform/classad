@@ -115,7 +115,7 @@ func TestCheckAggregateColumnLawsNeedNumbers(t *testing.T) {
 func TestColumnarUserAggregateRefusals(t *testing.T) {
 	name := registerOnce(t, "refuse_sum_col", ladderSumColAgg{})
 	scanName := registerOnce(t, "refuse_sum_scan", ladderSumScanAgg{})
-	values := func(attr string, sink func(NumValue)) bool {
+	values := func(attr string, newSink func() func(NumValue), merge func()) bool {
 		t.Errorf("the rung ran a scan for a request it should have refused")
 		return false
 	}
@@ -146,8 +146,8 @@ func TestColumnarUserAggregateRefusals(t *testing.T) {
 // accumulator.
 func TestColumnarUserAggregateDeclinesWhenTheScanCannot(t *testing.T) {
 	name := registerOnce(t, "halffed_sum_col", ladderSumColAgg{})
-	values := func(attr string, sink func(NumValue)) bool {
-		sink(NumValue{F: 7, I: 7, Kind: NumInt}) // fed something, then gave up
+	values := func(attr string, newSink func() func(NumValue), merge func()) bool {
+		newSink()(NumValue{F: 7, I: 7, Kind: NumInt}) // fed something, then gave up
 		return false
 	}
 	rows, ok, err := ColumnarUserAggregate(values, nil, []AggSpec{{Func: AggUser, UserFunc: name, Arg: "N"}})
@@ -160,8 +160,9 @@ func TestColumnarUserAggregateDeclinesWhenTheScanCannot(t *testing.T) {
 // the same reason -- a half-accumulated group is a wrong answer that looks like a right one.
 func TestColumnarUserAggregatePanicFailsTheQuery(t *testing.T) {
 	name := registerOnce(t, "panic_sum_col", colPanics{})
-	values := func(attr string, sink func(NumValue)) bool {
-		sink(NumValue{F: 1, I: 1, Kind: NumInt})
+	values := func(attr string, newSink func() func(NumValue), merge func()) bool {
+		newSink()(NumValue{F: 1, I: 1, Kind: NumInt})
+		merge()
 		return true
 	}
 	rows, ok, err := ColumnarUserAggregate(values, nil, []AggSpec{{Func: AggUser, UserFunc: name, Arg: "N"}})

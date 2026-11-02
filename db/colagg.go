@@ -28,23 +28,27 @@ func (db *DB) NumStats(constraint, attr string) (NumStats, bool) {
 	return db.c.NumStatsQuery(q, attr)
 }
 
-// NumValues feeds the numeric values of attr, over the records matching constraint, to sink via the
+// NumValues feeds the numeric values of attr, over the records matching constraint, to sinks via the
 // columnar scan. false means the columnar path cannot serve it and the caller should scan.
-func (db *DB) NumValues(constraint, attr string, sink func(NumValue)) bool {
+//
+// The pass may fan out across segments: newSink is called once per worker and merge once at the end,
+// both on the calling goroutine, and each sink is fed by one goroutine only. See
+// collections.NumValuesQuery.
+func (db *DB) NumValues(constraint, attr string, newSink func() func(NumValue), merge func()) bool {
 	q, ok := numStatsQuery(constraint)
 	if !ok {
 		return false
 	}
-	return db.c.NumValuesQuery(q, attr, sink)
+	return db.c.NumValuesQuery(q, attr, newSink, merge)
 }
 
 // NumValuesRedacted is DB.NumValues for a reader not entitled to sealed values.
-func (db *DB) NumValuesRedacted(constraint, attr string, sink func(NumValue)) bool {
+func (db *DB) NumValuesRedacted(constraint, attr string, newSink func() func(NumValue), merge func()) bool {
 	q, ok := numStatsQuery(constraint)
 	if !ok {
 		return false
 	}
-	return db.c.NumValuesQueryRedacted(q, attr, sink)
+	return db.c.NumValuesQueryRedacted(q, attr, newSink, merge)
 }
 
 // NumStats is DB.NumStats for an archive (history) table.
@@ -57,21 +61,21 @@ func (t *ArchiveTable) NumStats(constraint, attr string) (NumStats, bool) {
 }
 
 // NumValues is DB.NumValues for an archive (history) table.
-func (t *ArchiveTable) NumValues(constraint, attr string, sink func(NumValue)) bool {
+func (t *ArchiveTable) NumValues(constraint, attr string, newSink func() func(NumValue), merge func()) bool {
 	q, ok := numStatsQuery(constraint)
 	if !ok {
 		return false
 	}
-	return t.a.NumValuesQuery(q, attr, sink)
+	return t.a.NumValuesQuery(q, attr, newSink, merge)
 }
 
 // NumValuesRedacted is DB.NumValuesRedacted for an archive (history) table.
-func (t *ArchiveTable) NumValuesRedacted(constraint, attr string, sink func(NumValue)) bool {
+func (t *ArchiveTable) NumValuesRedacted(constraint, attr string, newSink func() func(NumValue), merge func()) bool {
 	q, ok := numStatsQuery(constraint)
 	if !ok {
 		return false
 	}
-	return t.a.NumValuesQueryRedacted(q, attr, sink)
+	return t.a.NumValuesQueryRedacted(q, attr, newSink, merge)
 }
 
 // numStatsQuery turns a constraint into the query the columnar aggregate takes: nil for match-all
