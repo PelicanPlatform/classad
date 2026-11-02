@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/collections"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // fakeRung is a strategy whose answer is dictated by the test, recording that it was consulted.
@@ -142,7 +144,7 @@ func TestAggLaddersAreOrderedLists(t *testing.T) {
 		return strings.Join(out, ",")
 	}
 	if got, want := names(d.aggLadder(nil, nil, false)),
-		"live-count,count-constraint,columnar-aggregate,grouped-columns,projected-scan"; got != want {
+		"live-count,count-constraint,columnar-aggregate,columnar-user-aggregate,grouped-columns,projected-scan"; got != want {
 		t.Errorf("mutable ladder = %q, want %q", got, want)
 	}
 	cat, err := OpenCatalog(t.TempDir())
@@ -155,7 +157,7 @@ func TestAggLaddersAreOrderedLists(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got, want := names(a.aggLadder(nil, false)),
-		"match-none,index-unconstrained,count-constraint,grouped-columns,index-constrained,columnar-aggregate,projected-scan"; got != want {
+		"match-none,index-unconstrained,count-constraint,grouped-columns,index-constrained,columnar-aggregate,columnar-user-aggregate,projected-scan"; got != want {
 		t.Errorf("archive ladder = %q, want %q", got, want)
 	}
 }
@@ -212,7 +214,28 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 	d.EnableSchemaScan(1000, 8)
 	a.BuildAndEnableSchemaScan(1000, 8)
 
+	// A user-defined aggregate on both sides of the opt-in. ladderSumCol takes column values, so
+	// the columnar rung serves it and its answer has to equal the scan's; ladderSumScan is the
+	// SAME arithmetic without AddNum, so every rung above the scan must decline it. Having both
+	// here is what makes the comparison mean something: one proves the fast rung is right, the
+	// other proves the opt-in is what selects it rather than the aggregate's name.
+	ladderSumCol := registerOnce(t, "ladder_sum_col", ladderSumColAgg{})
+	// An aggregate that BRANCHES ON THE KIND of each value, over both an integer column and a real
+	// one. Without it nothing distinguishes the two through the columnar path: every other
+	// aggregate here reads the value, which is right for a real whether or not its kind is, so
+	// mislabelling a real as an integer went undetected.
+	ladderKinds := registerOnce(t, "ladder_kinds", ladderKindsAgg{})
+	ladderSumScan := registerOnce(t, "ladder_sum_scan", ladderSumScanAgg{})
+
 	reqs := []AggRequest{
+		{Constraint: "true", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
+		{Constraint: "JobStatus == 2", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
+		{Constraint: "ProcId >= 2", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
+		{Constraint: "true", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumScan, Arg: "ProcId"}}},
+		{Constraint: "true", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderKinds, Arg: "ProcId"}}},
+		{Constraint: "true", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderKinds, Arg: "WallClock"}}},
+		{Constraint: "JobStatus == 4", Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderKinds, Arg: "WallClock"}}},
+		{Constraint: "true", GroupCols: []GroupCol{{Attr: "Owner"}}, Aggs: []AggSpec{{Func: AggUser, UserFunc: ladderSumCol, Arg: "ProcId"}}},
 		{Constraint: "true", Aggs: []AggSpec{{Func: AggCount, Arg: "*"}}},
 		{Constraint: "JobStatus == 4", Aggs: []AggSpec{{Func: AggCount, Arg: "*"}}},
 		{Constraint: "false", Aggs: []AggSpec{{Func: AggCount, Arg: "*"}}},
@@ -248,7 +271,7 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 		}
 		return true
 	}
-	check := func(t *testing.T, kind string, ladder []AggStrategy) {
+	check := func(t *testing.T, kind string, ladder []AggStrategy, accelerated bool) {
 		t.Helper()
 		ref := ladder[len(ladder)-1]
 		answered := map[string]bool{}
@@ -279,12 +302,20 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 		if len(answered) == 0 {
 			t.Fatalf("%s: no fast rung answered any request; the comparison tested nothing", kind)
 		}
+		// Named explicitly, because "some rung answered" would stay true if this one silently
+		// declined every user aggregate -- which is exactly how a columnar rung stops earning
+		// its keep without anything going red.
+		if accelerated && !answered["columnar-user-aggregate"] {
+			t.Errorf("%s: the columnar-user-aggregate rung answered nothing; it is not being reached", kind)
+		}
 		t.Logf("%s: rungs exercised %v", kind, answered)
 	}
-	check(t, "mutable", d.aggLadder(nil, nil, false))
-	check(t, "archive", a.aggLadder(nil, false))
-	check(t, "archive-plain", plain.aggLadder(nil, false))
-	check(t, "archive-redacted", a.aggLadder(nil, true))
+	check(t, "mutable", d.aggLadder(nil, nil, false), true)
+	check(t, "archive", a.aggLadder(nil, false), true)
+	// plain carries no columnar accelerator, so every columnar rung declines on it by design --
+	// which is the point of having it, and why it is not held to reaching one.
+	check(t, "archive-plain", plain.aggLadder(nil, false), false)
+	check(t, "archive-redacted", a.aggLadder(nil, true), true)
 
 	// The tier each archive rung reports: the caller-visible statement about which strategy ran,
 	// which several rungs share (three report TierColumnar, and the two halves of the split index
@@ -292,13 +323,14 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 	// Each rung is driven on its own ladder bound to its own stats block, so a tier is
 	// attributable to the rung that set it rather than to whichever one happened to answer.
 	tiers := map[string]collections.AggTier{
-		"match-none":          collections.TierMatchNone,
-		"index-unconstrained": collections.TierIndex,
-		"index-constrained":   collections.TierIndex,
-		"count-constraint":    collections.TierColumnar,
-		"grouped-columns":     collections.TierColumnar,
-		"columnar-aggregate":  collections.TierColumnar,
-		"projected-scan":      collections.TierScan,
+		"match-none":              collections.TierMatchNone,
+		"index-unconstrained":     collections.TierIndex,
+		"index-constrained":       collections.TierIndex,
+		"count-constraint":        collections.TierColumnar,
+		"grouped-columns":         collections.TierColumnar,
+		"columnar-aggregate":      collections.TierColumnar,
+		"columnar-user-aggregate": collections.TierColumnar,
+		"projected-scan":          collections.TierScan,
 	}
 	tagged := map[string]bool{}
 	for _, tbl := range []*ArchiveTable{a, plain} {
@@ -321,5 +353,75 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 	if len(tagged) != len(tiers) {
 		t.Errorf("tier checked for %d of %d archive rungs (%v); the untested ones assert nothing",
 			len(tagged), len(tiers), tagged)
+	}
+}
+
+// ladderSumScanAgg is an exact integer sum with no AddNum, so no rung above the scan may serve it.
+type ladderSumScanAgg struct{}
+
+func (ladderSumScanAgg) NewAccumulator() Accumulator { return &ladderSumAcc{} }
+
+type ladderSumAcc struct{ n int64 }
+
+func (a *ladderSumAcc) Add(v classad.Value) {
+	if i, err := v.IntValue(); err == nil {
+		a.n += i
+	}
+}
+func (a *ladderSumAcc) Merge(o Accumulator) { a.n += o.(*ladderSumAcc).n }
+func (a *ladderSumAcc) Result() classad.Value {
+	return classad.NewIntValue(a.n)
+}
+
+// ladderSumColAgg is the same arithmetic that also takes column values. Summing integers is
+// order-independent and ignores non-numbers on both paths, which is what lets it promise what
+// ColumnAccumulator requires.
+type ladderSumColAgg struct{}
+
+func (ladderSumColAgg) NewAccumulator() Accumulator { return &ladderSumColAcc{} }
+
+type ladderSumColAcc struct{ ladderSumAcc }
+
+func (a *ladderSumColAcc) Merge(o Accumulator) { a.n += o.(*ladderSumColAcc).n }
+func (a *ladderSumColAcc) AddNum(v NumValue) {
+	if v.Kind == NumInt {
+		a.n += v.I
+	}
+}
+
+// ladderKindsAgg reports how many values of each kind it saw. It is the only aggregate here whose
+// answer depends on the KIND rather than the value, which is what makes a real column reported as
+// an integer one -- or the other way round -- a visible difference between the two rungs.
+type ladderKindsAgg struct{}
+
+func (ladderKindsAgg) NewAccumulator() Accumulator { return &ladderKindsAcc{} }
+
+type ladderKindsAcc struct{ ints, reals, bools int }
+
+func (a *ladderKindsAcc) Add(v classad.Value) {
+	switch {
+	case v.IsBool():
+		a.bools++
+	case v.IsInteger():
+		a.ints++
+	case v.IsReal():
+		a.reals++
+	}
+}
+func (a *ladderKindsAcc) Merge(o Accumulator) {
+	b := o.(*ladderKindsAcc)
+	a.ints, a.reals, a.bools = a.ints+b.ints, a.reals+b.reals, a.bools+b.bools
+}
+func (a *ladderKindsAcc) Result() classad.Value {
+	return classad.NewStringValue(fmt.Sprintf("i=%d r=%d b=%d", a.ints, a.reals, a.bools))
+}
+func (a *ladderKindsAcc) AddNum(v NumValue) {
+	switch v.Kind {
+	case NumBool:
+		a.bools++
+	case NumInt:
+		a.ints++
+	case NumReal:
+		a.reals++
 	}
 }

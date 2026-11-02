@@ -722,6 +722,27 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats, redact bool) []Ag
 			stats.SetTier(collections.TierColumnar)
 			return rows, true, nil
 		}},
+		aggRung{"columnar-user-aggregate", func(req AggRequest) ([]AggRow, bool, error) {
+			// A single ungrouped user-defined aggregate whose accumulator takes column values.
+			// The archive is where this matters most: a history table is the one a whole-column
+			// aggregate is asked over, and the scan it would otherwise fall to decodes every
+			// matching record.
+			if scanOnly(req) {
+				return nil, false, nil
+			}
+			values := t.NumValues
+			if redact {
+				values = t.NumValuesRedacted
+			}
+			rows, ok, err := ColumnarUserAggregate(func(attr string, sink func(NumValue)) bool {
+				return values(req.Constraint, attr, sink)
+			}, req.GroupCols, req.Aggs)
+			if err != nil || !ok {
+				return nil, false, err
+			}
+			stats.SetTier(collections.TierColumnar)
+			return rows, true, nil
+		}},
 		aggRung{"projected-scan", func(req AggRequest) ([]AggRow, bool, error) {
 			// The reference, and the rung that must never decline. Scan wire-native, reading only
 			// the attributes the aggregation projects (empty for a pure COUNT), so it does not

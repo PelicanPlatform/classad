@@ -1608,9 +1608,18 @@ it.
 
 **The reduction half is now built** (`db/udaf.go`, `db/udafcheck.go`). An aggregate is registered by
 name, named in an `AggSpec` as `AggUser` plus that name, and the shared GROUP BY core reduces with it
-exactly as it reduces with SUM. What is *not* built is the wire: no frame has a field to put an
-aggregate's name in, so both ends of the RPC refuse one rather than send a request that looks well
-formed and asks for something unnameable.
+exactly as it reduces with SUM.
+
+**So is the columnar half, for the ungrouped case** (`db/coludaf.go`, `collections.NumValuesQuery`).
+An aggregate that can take its argument as a column says so by implementing `ColumnAccumulator`, and
+a rung of the aggregate ladder then feeds it from the same block-pruned, unboxed pass that answers
+SUM. Measured on 50k records: an ungrouped user-defined sum goes from **13.35 ms to 1.56 ms**,
+against the built-in's 1.62 ms — the whole gap, closed to parity. Grouped is untouched and still
+falls to the scan, because the pass yields values with no group key attached.
+
+What is *not* built is the wire: no frame has a field to put an aggregate's name in, so both ends of
+the RPC refuse one rather than send a request that looks well formed and asks for something
+unnameable.
 
 ### 13.1 Why it looked like more than it was
 
@@ -1728,7 +1737,35 @@ slice. `Accumulator` is therefore the implementation's own type, and the engine 
    question the vectorized WASM ABI faces therefore does not bind here, and the two do not need a
    shared answer after all.
 
-### 13.5 Three findings from building it
+### 13.5 The columnar rung, and the two promises opting into it makes
+
+The pass that answers SUM differs from the record scan in two ways an aggregate can be sensitive to,
+and no signature can check either. Implementing `ColumnAccumulator` is the declaration that neither
+applies — which is why it is an opt-in interface rather than something the engine infers.
+
+**Order.** The pass walks segments, then blocks, skipping blocks a zone map rules out. That is not
+the order a record scan visits the same records in, and not insertion order. An aggregate whose
+answer depends on the order it is fed gives a *different answer depending on which rung served the
+query* — and which rung runs depends on the schema, the constraint and what has been sealed, so it
+can change under a caller who changed nothing. Both answers look right. The reference's own
+`min()`/`max()` cannot make this promise over a column holding a NaN, which is exactly why the
+built-in path declines that case instead of answering it.
+
+**What is offered.** The pass yields only the column's *numeric* values. A record whose argument is
+absent, undefined, a string or an expression is never offered — where the record scan calls `Add`
+for every row in the group, undefined included. An aggregate that counts what it was handed, or
+treats undefined as a contribution, must not implement the interface; one that already skips
+non-numbers, as SUM, AVG, MIN and MAX all do, loses nothing.
+
+`CheckAggregate` tests both for any aggregate that opts in: `AddNum` must agree with `Add` over the
+same numbers, and must give the same answer over them reversed and rotated. Neither check runs for
+an ordinary `Accumulator`, which is not claiming either property.
+
+The rung is held to the ladder's existing rule — every rung's answer equals the reference's for the
+same request — by the test that already enforces it for every other rung, with the new one named
+explicitly so that silently declining everything cannot pass as success.
+
+### 13.6 Three findings from building it
 
 **The laws cannot be exact for a floating-point aggregate, and that is not the implementation's
 fault.** The obvious first thing anyone writes here is a variance — precisely because its state is
@@ -1763,7 +1800,7 @@ to write the bug the cuts exist for — an aggregate wrong only when one side of
 one element, which is what special-casing a state of one and getting it wrong looks like — and the
 mutation then died.
 
-### 13.6 What is left
+### 13.7 What is left
 
 - **The wire.** A frame that can carry an aggregate's name, under its own opcode, with the
   `ErrExtendedAggregateUnsupported` precedent for a server too old to know it. Until then a
@@ -1771,11 +1808,10 @@ mutation then died.
 - **A parallel or per-segment reduction**, which is what would make `Merge` load-bearing rather than
   merely required. Note that it is also what turns the built-in float SUM's arrival-order dependence
   from latent into live.
-- **A column-shaped accumulate**, which is the real answer to the cliff and is now the top of this
-  list. An aggregate handed its argument as a column — the same column `schemaScanStatsMulti`
-  already walks, block-pruned and unboxed — gets everything a built-in SUM gets except the fixed
-  statistics themselves. This is reachable because the columnar pass reads values; it was written
-  off in the first draft of this section on the false premise that it does not.
+- **The grouped columnar rung**, now the top of this list and the larger remaining prize: GROUP BY is
+  the shape a dashboard actually asks, and it is the one still falling to the scan at 6.8x. The
+  ungrouped pass yields values with no group key, so this needs the grouping machinery
+  `GroupedFromColumns` already has, driving an accumulator per group instead of fixed statistics.
 - **The statistics shortcut**, separately and much narrower: an aggregate that can declare itself a
   function of the `NumStats` a pass already computes (a range, a mean) could be answered from them
   without its own accumulate. Worth far less than the item above, and worth building only after

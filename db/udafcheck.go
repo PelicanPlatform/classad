@@ -170,7 +170,116 @@ func CheckAggregateEqual(agg Aggregate, samples []classad.Value, equal func(a, b
 		return fmt.Errorf("CheckAggregate: a three-way merge disagrees with the serial fold: want %q, got %q",
 			ValueText(want), ValueText(left))
 	}
+	if _, isCol := empty.(ColumnAccumulator); isCol {
+		return checkColumnLaws(agg, samples, same)
+	}
 	return nil
+}
+
+// checkColumnLaws tests the two extra promises a ColumnAccumulator makes, which are the two ways the
+// columnar value pass differs from the record scan. Both are checked only for an aggregate that
+// opted in, because only that aggregate is claiming them.
+//
+// Getting either wrong produces the failure this whole interface is most exposed to: the SAME query
+// answered differently depending on which rung of the ladder served it, with both answers looking
+// right. Which rung runs depends on the schema, the constraint and what has been sealed, so it can
+// change under a caller with no query change at all.
+func checkColumnLaws(agg Aggregate, samples []classad.Value, same func(a, b classad.Value) bool) error {
+	nums := make([]NumValue, 0, len(samples))
+	numVals := make([]classad.Value, 0, len(samples))
+	for _, v := range samples {
+		nv, ok := numValueOf(v)
+		if !ok {
+			continue // the pass would not offer it, so neither does this check
+		}
+		nums = append(nums, nv)
+		numVals = append(numVals, v)
+	}
+	if len(nums) < 2 {
+		return fmt.Errorf("CheckAggregate: %d of %d samples are numeric, too few to check a ColumnAccumulator; "+
+			"pass numbers it will really see: %w", len(nums), len(samples), ErrBadAggregate)
+	}
+	foldNum := func(vs []NumValue) (classad.Value, error) {
+		acc, ok := agg.NewAccumulator().(ColumnAccumulator)
+		if !ok {
+			return classad.Value{}, errors.New("CheckAggregate: NewAccumulator stopped returning a ColumnAccumulator")
+		}
+		for _, v := range vs {
+			acc.AddNum(v)
+		}
+		return acc.Result(), nil
+	}
+
+	// The two rungs agree. The scan folds the boxed values with Add; the columnar pass folds the
+	// same column with AddNum, and is offered ONLY the numeric ones -- so the comparison is against
+	// a scan over exactly those, not over every sample.
+	viaAdd := agg.NewAccumulator()
+	for _, v := range numVals {
+		viaAdd.Add(v)
+	}
+	viaCol, err := foldNum(nums)
+	if err != nil {
+		return err
+	}
+	if !same(viaAdd.Result(), viaCol) {
+		return fmt.Errorf("CheckAggregate: AddNum disagrees with Add over the same numbers: "+
+			"the record scan would say %q and the columnar pass %q",
+			ValueText(viaAdd.Result()), ValueText(viaCol))
+	}
+
+	// Order independence, since the pass yields values in block order. Reversed is the cheapest
+	// order that is not the one it was written in, and a rotation catches an aggregate that is
+	// merely symmetric about its ends.
+	rev := make([]NumValue, len(nums))
+	for i, v := range nums {
+		rev[len(nums)-1-i] = v
+	}
+	rot := append(append([]NumValue(nil), nums[len(nums)/2:]...), nums[:len(nums)/2]...)
+	for _, c := range []struct {
+		what string
+		vals []NumValue
+	}{{"reversed", rev}, {"rotated", rot}} {
+		got, err := foldNum(c.vals)
+		if err != nil {
+			return err
+		}
+		if !same(viaCol, got) {
+			return fmt.Errorf("CheckAggregate: AddNum is order-dependent: %q in order, %q %s. "+
+				"The columnar pass yields values in block order, so this aggregate must not implement "+
+				"ColumnAccumulator", ValueText(viaCol), ValueText(got), c.what)
+		}
+	}
+	return nil
+}
+
+// numValueOf renders a value as the columnar pass would have yielded it, or ok=false for one the
+// pass would not have offered at all.
+func numValueOf(v classad.Value) (NumValue, bool) {
+	switch {
+	case v.IsInteger():
+		i, err := v.IntValue()
+		if err != nil {
+			return NumValue{}, false
+		}
+		return NumValue{F: float64(i), I: i, Kind: NumInt}, true
+	case v.IsReal():
+		f, err := v.RealValue()
+		if err != nil {
+			return NumValue{}, false
+		}
+		return NumValue{F: f, Kind: NumReal}, true
+	case v.IsBool():
+		b, err := v.BoolValue()
+		if err != nil {
+			return NumValue{}, false
+		}
+		var i int64
+		if b {
+			i = 1
+		}
+		return NumValue{F: float64(i), I: i, Kind: NumBool}, true
+	}
+	return NumValue{}, false
 }
 
 // nilIf returns nil when drop is set, so a merge-identity case can name which side is empty

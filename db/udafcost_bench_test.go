@@ -32,6 +32,22 @@ func (a *benchSumAcc) Add(v classad.Value) {
 func (a *benchSumAcc) Merge(other Accumulator) { a.n += other.(*benchSumAcc).n }
 func (a *benchSumAcc) Result() classad.Value   { return classad.NewIntValue(a.n) }
 
+// benchSumCol is benchSum that also takes column values, so the two differ only in which rung of
+// the ladder serves them. Summing integers is order-independent and ignores non-numbers either way,
+// which is what lets it make the promises ColumnAccumulator requires.
+type benchSumCol struct{}
+
+func (benchSumCol) NewAccumulator() Accumulator { return &benchSumColAcc{} }
+
+type benchSumColAcc struct{ benchSumAcc }
+
+func (a *benchSumColAcc) Merge(other Accumulator) { a.n += other.(*benchSumColAcc).n }
+func (a *benchSumColAcc) AddNum(v NumValue) {
+	if v.Kind == NumInt {
+		a.n += v.I
+	}
+}
+
 // benchAggFixture is a mutable table with the accelerator on: a numeric column to aggregate and a
 // low-cardinality one to group by.
 func benchAggFixture(b *testing.B, n int) *DB {
@@ -59,10 +75,12 @@ func benchAggFixture(b *testing.B, n int) *DB {
 
 func BenchmarkAggregateBuiltinVsUser(b *testing.B) {
 	const n = 50000
-	name := "bench_sum"
-	if _, ok := LookupAggregate(name); !ok {
-		if err := RegisterAggregate(name, benchSum{}); err != nil {
-			b.Fatal(err)
+	name, colName := "bench_sum", "bench_sum_col"
+	for n, a := range map[string]Aggregate{name: benchSum{}, colName: benchSumCol{}} {
+		if _, ok := LookupAggregate(n); !ok {
+			if err := RegisterAggregate(n, a); err != nil {
+				b.Fatal(err)
+			}
 		}
 	}
 	d := benchAggFixture(b, n)
@@ -73,9 +91,14 @@ func BenchmarkAggregateBuiltinVsUser(b *testing.B) {
 		aggs   []AggSpec
 	}{
 		{"ungrouped/builtin", nil, []AggSpec{{Func: AggSum, Arg: "Cpus"}}},
-		{"ungrouped/user", nil, []AggSpec{{Func: AggUser, UserFunc: name, Arg: "Cpus"}}},
+		{"ungrouped/user-scan", nil, []AggSpec{{Func: AggUser, UserFunc: name, Arg: "Cpus"}}},
+		{"ungrouped/user-column", nil, []AggSpec{{Func: AggUser, UserFunc: colName, Arg: "Cpus"}}},
 		{"grouped/builtin", []GroupCol{{Attr: "JobStatus"}}, []AggSpec{{Func: AggSum, Arg: "Cpus"}}},
-		{"grouped/user", []GroupCol{{Attr: "JobStatus"}}, []AggSpec{{Func: AggUser, UserFunc: name, Arg: "Cpus"}}},
+		{"grouped/user-scan", []GroupCol{{Attr: "JobStatus"}}, []AggSpec{{Func: AggUser, UserFunc: name, Arg: "Cpus"}}},
+		// Grouped has no columnar rung for a user aggregate yet: the value pass yields values
+		// with no group key attached, so a grouped request falls to the scan whether or not the
+		// aggregate opted in. Measured here so that stays visible rather than being assumed.
+		{"grouped/user-column", []GroupCol{{Attr: "JobStatus"}}, []AggSpec{{Func: AggUser, UserFunc: colName, Arg: "Cpus"}}},
 	}
 	for _, c := range cases {
 		b.Run(c.what, func(b *testing.B) {

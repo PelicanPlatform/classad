@@ -649,6 +649,18 @@ func (a *Archive) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 	return a.c.NumStatsQuery(q, attr)
 }
 
+// NumValuesQuery is Collection.NumValuesQuery for an archive (history) table.
+func (a *Archive) NumValuesQuery(q *vm.Query, attr string, sink func(NumValue)) bool {
+	return a.c.NumValuesQuery(q, attr, sink)
+}
+
+// NumValuesQueryRedacted is NumValuesQuery for a reader NOT entitled to sealed values, on the same
+// terms as NumStatsQueryRedacted: an attribute a keyless read withholds declines outright, and the
+// constraint is planned as that reader evaluates it.
+func (a *Archive) NumValuesQueryRedacted(q *vm.Query, attr string, sink func(NumValue)) bool {
+	return a.c.NumValuesQueryRedacted(q, attr, sink)
+}
+
 // TopKOrderThreshold computes the ORDER BY orderAttr {DESC|ASC} LIMIT k cutoff over the archive's
 // matching records via the columnar scan (see Collection.TopKOrderThreshold). stats (may be nil)
 // records the cutoff scan's work for EXPLAIN ANALYZE.

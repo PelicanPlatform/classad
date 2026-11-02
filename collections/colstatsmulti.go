@@ -178,7 +178,30 @@ func (b *columnarBlock) fieldIntAt(k, fieldIdx int, bc *blockCache) (int64, bool
 // fall back to a row walk reading only those attributes -- never a full ad decode.
 //
 // ok=false when a value involved is an expression, which the columns cannot evaluate.
+// schemaScanStatsMulti is the NumStats instantiation of schemaScanValuesMulti: the same pass, with
+// the reference's type-promotion accumulator as its sink.
 func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *blockCache) (NumStats, bool) {
+	acc := newStatsAccum()
+	if !c.schemaScanValuesMulti(aggID, preds, bc, acc.add) {
+		return NumStats{}, false
+	}
+	return acc.result(), true
+}
+
+// numSink receives one numeric value of the aggregated column. The pass calls it once per
+// contributing value, in BLOCK ORDER -- which is not the order a record scan would visit the same
+// records in, and not insertion order.
+type numSink func(colVal)
+
+// schemaScanValuesMulti is the columnar value pass: narrow the candidate records with one pass per
+// predicate column (skipping blocks their zones rule out), then read the AGGREGATED column for the
+// survivors and hand each value to sink. The aggregated column is deliberately not zone-pruned --
+// its values are the answer, not a filter.
+//
+// ok=false means the pass could not complete and the caller must scan: a folded predicate outside a
+// proven window, an unreadable column with no usable row fallback, or an expression-valued cell,
+// which has no numeric reading at all.
+func (c *Collection) schemaScanValuesMulti(aggID uint32, preds []fieldPred, bc *blockCache, sink numSink) bool {
 	// A predicate on the AGGREGATED attribute is applied during the value pass, not as a narrowing
 	// pass of its own: the value is being read anyway, so testing it there costs nothing, while a
 	// separate pass reads the same column twice. Skipping that fusion made
@@ -199,7 +222,6 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 		}
 		return true
 	}
-	acc := newStatsAccum()
 	lookups := make([]fieldLookup, len(otherPreds))
 	for i, p := range otherPreds {
 		lookups[i] = c.attrLookup(p.fieldID)
@@ -215,7 +237,7 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 		for _, w := range wins {
 			if ct && !w.ctFree {
 				releaseWindows(wins) // a folded predicate is exact only in a proven window
-				return NumStats{}, false
+				return false
 			}
 			// No record here can match, so none contributes; see schemaScanCountMulti.
 			if c.segZoneExcludes(w, zp, ct) {
@@ -224,9 +246,9 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 			cs := w.seg.colblk.Load()
 			aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)
 			if !ok {
-				if !bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, &acc) {
+				if !bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, sink) {
 					releaseWindows(wins)
-					return NumStats{}, false
+					return false
 				}
 				continue
 			}
@@ -250,9 +272,9 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 				// cold stream). Answer that block from its records rather than drop them.
 				col, colOK := newNumCol(blk, aggIdx, aggID, bc)
 				if !colOK || !blk.numColsReadable(otherIdxs, bc) {
-					if !c.statsBlockRows(w, s0, cs, base, blk.n, aggLookup, otherPreds, lookups, selfOK, &acc) {
+					if !c.statsBlockRows(w, s0, cs, base, blk.n, aggLookup, otherPreds, lookups, selfOK, sink) {
 						releaseWindows(wins)
-						return NumStats{}, false
+						return false
 					}
 					base += blk.n
 					continue
@@ -271,10 +293,10 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 						nv, cell := col.cell(k, bc)
 						if cell == cellExpr {
 							releaseWindows(wins)
-							return NumStats{}, false
+							return false
 						}
 						if cell == cellNumber && selfOK(nv.f) {
-							acc.add(nv)
+							sink(nv)
 						}
 					}
 					base += blk.n
@@ -288,7 +310,7 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 					}
 					if !narrowByField(blk, otherIdxs[i], otherPreds[i], bc, &cand, &sc) {
 						releaseWindows(wins)
-						return NumStats{}, false
+						return false
 					}
 				}
 				for wi, word := range cand.w {
@@ -298,10 +320,10 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 						nv, cell := col.cell(k, bc)
 						if cell == cellExpr {
 							releaseWindows(wins)
-							return NumStats{}, false
+							return false
 						}
 						if cell == cellNumber && selfOK(nv.f) {
-							acc.add(nv)
+							sink(nv)
 						}
 					}
 				}
@@ -310,7 +332,7 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 		}
 		releaseWindows(wins)
 	}
-	return acc.result(), true
+	return true
 }
 
 // fieldLookup reads one attribute from a record's own wire form, given the dictionary of the segment
@@ -357,7 +379,7 @@ func resolveStatsFields(cs *colSegment, aggID uint32, preds []fieldPred) (int, [
 // bruteStatsMulti is the row fallback: walk a window's visible records, test the predicated
 // attributes, and accumulate the aggregated one -- reading only those attributes from the wire ad.
 func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup fieldLookup,
-	preds []fieldPred, lookups []fieldLookup, selfOK func(float64) bool, acc *statsAccum) bool {
+	preds []fieldPred, lookups []fieldLookup, selfOK func(float64) bool, sink numSink) bool {
 	var buf []byte
 	for off := 0; off < w.used; {
 		o := uint32(off)
@@ -395,7 +417,7 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup fieldLooku
 							return false
 						}
 						if nv, isNum := nodeColVal(node); isNum && selfOK(nv.f) {
-							acc.add(nv)
+							sink(nv)
 						}
 					}
 				}
@@ -411,9 +433,9 @@ func bruteStatsMulti(c *Collection, w segWindow, s0 uint64, aggLookup fieldLooku
 // code is the same whether or not a block ever falls back.
 func (c *Collection) statsBlockRows(w segWindow, s0 uint64, cs *colSegment, base, n int,
 	aggLookup fieldLookup, preds []fieldPred, lookups []fieldLookup,
-	selfOK func(float64) bool, acc *statsAccum) bool {
+	selfOK func(float64) bool, sink numSink) bool {
 	return c.eachBlockRecord(w, s0, cs, base, n, func(ad wire.Ad) bool {
-		return statsFromAd(w.dict(), ad, aggLookup, preds, lookups, selfOK, acc)
+		return statsFromAd(w.dict(), ad, aggLookup, preds, lookups, selfOK, sink)
 	})
 }
 
@@ -422,7 +444,7 @@ func (c *Collection) statsBlockRows(w segWindow, s0 uint64, cs *colSegment, base
 // takes the same step inline; routing it through here measured 3-5% slower on the COLUMN pass of
 // schemaScanStatsMulti, which does not even call it.
 func statsFromAd(d *segDictHandle, ad wire.Ad, aggLookup fieldLookup, preds []fieldPred,
-	lookups []fieldLookup, selfOK func(float64) bool, acc *statsAccum) bool {
+	lookups []fieldLookup, selfOK func(float64) bool, sink numSink) bool {
 	match, ok := wirePredsMatch(d, ad, preds, lookups)
 	if !ok {
 		return false
@@ -438,7 +460,7 @@ func statsFromAd(d *segDictHandle, ad wire.Ad, aggLookup fieldLookup, preds []fi
 		return false
 	}
 	if nv, isNum := nodeColVal(node); isNum && selfOK(nv.f) {
-		acc.add(nv)
+		sink(nv)
 	}
 	return true
 }

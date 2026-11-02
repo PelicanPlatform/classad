@@ -87,20 +87,35 @@ func (c *Collection) NumStatsQueryRedacted(q *vm.Query, attr string) (NumStats, 
 // over a different field would need a second column read per record, which this pass does not do.
 // A caller that gets false scans instead.
 func (c *Collection) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
-	st := c.schemaScan.Load()
-	if st == nil {
-		return NumStats{}, false
-	}
-	if c.intern == nil {
-		return NumStats{}, false
-	}
-	id, ok := c.intern.LookupID(attr)
+	id, preds, cache, ok := c.numScanPlan(q, attr)
 	if !ok {
 		return NumStats{}, false
 	}
+	return c.schemaScanStatsMulti(id, preds, cache)
+}
+
+// numScanPlan is the gating both columnar value passes share: it resolves attr to a numeric schema
+// field, decomposes q into per-field predicates, and records the read so the hot tier learns about
+// it. ok=false means the columnar path cannot serve the request at all.
+//
+// Shared rather than duplicated because the two passes must decline on exactly the same terms. A
+// value pass that accepted a request the stats pass refuses would answer from a column the stats
+// pass does not trust.
+func (c *Collection) numScanPlan(q *vm.Query, attr string) (uint32, []fieldPred, *blockCache, bool) {
+	st := c.schemaScan.Load()
+	if st == nil {
+		return 0, nil, nil, false
+	}
+	if c.intern == nil {
+		return 0, nil, nil, false
+	}
+	id, ok := c.intern.LookupID(attr)
+	if !ok {
+		return 0, nil, nil, false
+	}
 	idx, ok := st.schema.byID[id]
 	if !ok || !numericKind(st.schema.fields[idx].kind) {
-		return NumStats{}, false
+		return 0, nil, nil, false
 	}
 	// The predicate may constrain ANY numeric fields, not just the aggregated one. Requiring it to
 	// constrain the aggregated attribute meant `max(ProcId) where JobStatus == 4` -- the shape a
@@ -110,7 +125,7 @@ func (c *Collection) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 		var ok bool
 		preds, ok = c.numPredsCT(q, st.schema)
 		if !ok {
-			return NumStats{}, false // not a conjunction of scalar comparisons on numeric fields
+			return 0, nil, nil, false // not a conjunction of scalar comparisons on numeric fields
 		}
 	}
 	// Record the read so the hot tier learns about it. The tier holds the top-N numeric fields by
@@ -128,7 +143,65 @@ func (c *Collection) NumStatsQuery(q *vm.Query, attr string) (NumStats, bool) {
 	}
 	c.demand.recordReads(reads)
 
-	return c.schemaScanStatsMulti(id, preds, st.cache)
+	return id, preds, st.cache, true
+}
+
+// NumValueKind says how a column value was stored, which a sink needs in order to reproduce the
+// reference's type rules: a sum over integers stays integral, and an integer past 2^53 survives only
+// in I.
+type NumValueKind uint8
+
+const (
+	NumInt  NumValueKind = iota // an integer column value; I is exact
+	NumReal                     // a real column value; only F is meaningful, and it may be a NaN
+	NumBool                     // a boolean, coerced to 0 or 1 in both F and I
+)
+
+// NumValue is one value read from a numeric column.
+type NumValue struct {
+	F    float64 // every kind as a float; for NumInt past 2^53 this is lossy, so use I
+	I    int64   // the exact integer, for NumInt and NumBool; meaningless for NumReal
+	Kind NumValueKind
+}
+
+// NumValuesQueryRedacted is NumValuesQuery for a reader NOT entitled to sealed values, on the same
+// terms as NumStatsQueryRedacted: columns never hold a sealed value, so it answers as NumValuesQuery
+// does, except on a store that may hold a sealed attribute's values in the clear, where it declines.
+func (c *Collection) NumValuesQueryRedacted(q *vm.Query, attr string, sink func(NumValue)) bool {
+	if c.keylessHides(attr) {
+		return false
+	}
+	return c.NumValuesQuery(c.keylessQuery(q), attr, sink)
+}
+
+// NumValuesQuery feeds every numeric value of attr, over the records matching q, to sink -- through
+// the same columnar pass that answers SUM and MIN, rather than by decoding records. A nil q means
+// every record. It returns false when the columnar path cannot serve the request, on the same terms
+// as NumStatsQuery, and the caller must scan instead.
+//
+// VALUES ARRIVE IN BLOCK ORDER. That is not the order a record scan visits the same records in, and
+// not insertion order: the pass walks segments, then blocks, skipping whole blocks a zone map rules
+// out. A sink whose answer depends on the order it is fed will therefore disagree with the scan over
+// the same records -- which is not a defect here but a property a caller has to be able to promise
+// it does not have. The reference's own min()/max() cannot promise it over a column holding a NaN,
+// which is why NumStats flags that case rather than answering it.
+func (c *Collection) NumValuesQuery(q *vm.Query, attr string, sink func(NumValue)) bool {
+	id, preds, cache, ok := c.numScanPlan(q, attr)
+	if !ok {
+		return false
+	}
+	return c.schemaScanValuesMulti(id, preds, cache, func(nv colVal) { sink(publicNumValue(nv)) })
+}
+
+// publicNumValue converts the scan's internal cell to the exported one.
+func publicNumValue(nv colVal) NumValue {
+	switch nv.kind {
+	case akReal:
+		return NumValue{F: nv.f, Kind: NumReal}
+	case akBool:
+		return NumValue{F: nv.f, I: nv.i, Kind: NumBool}
+	}
+	return NumValue{F: nv.f, I: nv.i, Kind: NumInt}
 }
 
 // numericKind reports whether a schema field's kind is one the numeric column scan can read.

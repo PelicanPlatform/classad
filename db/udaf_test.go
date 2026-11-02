@@ -186,6 +186,16 @@ func mustRegister(t *testing.T, name string, agg Aggregate) string {
 	return name
 }
 
+// registerOnce registers name unless it is already there, for a test that may run more than once in
+// a process (-count=2) against an append-only registry.
+func registerOnce(t *testing.T, name string, agg Aggregate) string {
+	t.Helper()
+	if _, ok := LookupAggregate(name); ok {
+		return name
+	}
+	return mustRegister(t, name, agg)
+}
+
 // rowSeq turns rows of values into the sequence the reduction core consumes.
 func rowSeq(rows [][]classad.Value) iter.Seq[[]classad.Value] {
 	return func(yield func([]classad.Value) bool) {
