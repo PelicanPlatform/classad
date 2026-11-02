@@ -252,6 +252,7 @@ func (s *Script) Compile() (*ScriptProgram, error) {
 	}
 	s.c.p.readAttrs = kept
 	s.c.p.vops = vopPrefix(s.c.p.code)
+	s.c.p.refSlots, s.c.p.nColSlots = colSlots(s.c.p.refs)
 	return &ScriptProgram{rp: LowerToRegisters(s.c.p), p: s.c.p}, nil
 }
 

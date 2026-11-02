@@ -342,6 +342,13 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 	if perRecord < 1 {
 		perRecord = 1
 	}
+	// Which columns are named more than once. Computed with the program, like the charge prefix, and
+	// rebuilt here only for a Program assembled by hand.
+	slots, nSlots := p.refSlots, p.nColSlots
+	if len(slots) != len(p.refs) {
+		slots, nSlots = colSlots(p.refs)
+	}
+	s.resetColCache(nSlots)
 	vops := p.vops
 	if len(vops) != len(p.code)+1 {
 		s.vopsBuf = vopPrefixInto(s.vopsBuf, p.code)
@@ -380,7 +387,18 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 			r := p.refs[in.A]
 			// A column reads an absent CurrentTime as undefined, where the evaluator reads
 			// the time; per-record evaluation gets that right.
-			if r.curTime || !src.LoadColumn(r.name, r.scope, s.push()) {
+			if r.curTime {
+				return nil, false
+			}
+			if slot := slots[in.A]; slot >= 0 && !s.colIsCheap(slot) {
+				// Named more than once, so it is loaded once and copied here; see veccolcache.go.
+				col, ok := s.loadShared(src, r, slot, nSlots)
+				if !ok || !copyVec(s.push(), col) {
+					return nil, false
+				}
+				break
+			}
+			if !src.LoadColumn(r.name, r.scope, s.push()) {
 				return nil, false
 			}
 		case OpBinop:
@@ -577,6 +595,12 @@ type VecScratch struct {
 
 	// loops are the While regions whose trips are in flight; see vecloop.go.
 	loops []loopRegion
+
+	// colCache holds one vector per shared column for the batch, and colValid says which have been
+	// loaded; see veccolcache.go.
+	colCache []*Vec
+	colValid []bool
+	colCheap []bool
 }
 
 // blendPending is one branching construct whose paths are being evaluated, waiting for its join.
@@ -809,9 +833,14 @@ func copyVec(dst, src *Vec) bool {
 	if src == nil || dst == nil || src.n != dst.n {
 		return false
 	}
-	dst.Mask, dst.Const, dst.Dict, dst.Raw = src.Mask, src.Const, src.Dict, nil
+	dst.Mask, dst.Const, dst.Dict = src.Mask, src.Const, src.Dict
+	dst.Raw, dst.RawWidth, dst.RawUnsigned, dst.RawReal = src.Raw, src.RawWidth, src.RawUnsigned, src.RawReal
 	if src.Raw != nil {
-		return false // the caller widens before binding; see storeLocal
+		// The stored bytes are SHARED, not copied. Raw points into the block the ColumnSource is
+		// serving and nothing writes through it -- a kernel that cannot read it calls ensureInts,
+		// which fills I and drops the pointer rather than modifying what it points at. Copying the
+		// bytes would also throw away the one thing Raw is for, which is that lanes come from width.
+		return true
 	}
 	if src.Mask {
 		copy(dst.Hi, src.Hi)
