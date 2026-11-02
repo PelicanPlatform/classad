@@ -5,7 +5,8 @@ optimizer passes and the O2 reduction law are on `main`; the vector path for scr
 fault model and the rest of the optimizer are not. **§11 is the ledger** — what exists, with
 citations; the decisions taken while building that are not in §9; and the claims in §§2-6 that
 building has since made false. Read it before trusting the prose. §12 says what is left and in what
-order, and §13 states the one piece nothing here covers.
+order, and §13 covers aggregation, which the rest of this document does not: its reduction half is
+built and its wire half is deliberately refused rather than guessed at.
 
 This document exists so the semantics and the compilation model are argued before a parser or a code
 generator is written — which is still how the work is going: there is no surface syntax yet, by
@@ -1597,83 +1598,225 @@ allocation) competes with item 10 (tiling), which §6.8 itself flags as possibly
 
 ---
 
-## 13. The gap this document does not cover: user-defined *aggregates*
+## 13. User-defined *aggregates*
 
 §2.6 and the shipped registry (S5) give the host a user-defined **scalar** function: a function of
 argument values, compiled to `OpCallFunc`, vectorized elementwise. That covers projections and
 predicates. It does not cover aggregation — and aggregation is where this database's query layer
 actually spends its time, so a UDF story that stops at scalars stops short of the use that motivated
-it. This section states the problem and the one hard constraint, and deliberately does not pick a
-design.
+it.
 
-### 13.1 Why it is not a small extension
+**The reduction half is now built** (`db/udaf.go`, `db/udafcheck.go`). An aggregate is registered by
+name, named in an `AggSpec` as `AggUser` plus that name, and the shared GROUP BY core reduces with it
+exactly as it reduces with SUM.
 
-**The selector is a closed byte on the wire.** `db.AggFunc` is a `uint8` enum of six values
-(`db/aggregate.go:21-38`), aliased straight into the RPC layer (`dbrpc/aggregate.go:18`) and decoded
-as `AggFunc(r.u8())` (`:247`). A user-defined aggregate needs a representation that is not one of six
-bytes, which is a wire-compatibility change and not a new case in a switch.
+**So is the columnar half, for the ungrouped case** (`db/coludaf.go`, `collections.NumValuesQuery`).
+An aggregate that can take its argument as a column says so by implementing `ColumnAccumulator`, and
+a rung of the aggregate ladder then feeds it from the same block-pruned, unboxed pass that answers
+SUM. Measured on 50k records: an ungrouped user-defined sum goes from **13.35 ms to 1.56 ms**,
+against the built-in's 1.62 ms — the whole gap, closed to parity. Grouped is untouched and still
+falls to the scan, because the pass yields values with no group key attached.
 
-**There are two aggregation paths, and only one of them can take a UDAF.**
+What is *not* built is the wire: no frame has a field to put an aggregate's name in, so both ends of
+the RPC refuse one rather than send a request that looks well formed and asks for something
+unnameable.
 
-- The **row path** accumulates per group in `aggAcc` and defers the arithmetic to the ClassAd
-  library's own `Sum`/`Avg`/`Min`/`Max` at the end (`db/aggregate.go:333-365`). A UDAF plugs in here
-  cleanly.
-- The **columnar path** does not read values at all: it computes the answer from a zone's precomputed
-  `NumStats` (`db/colagg.go:124-131`). A UDAF cannot plug in here, because there is nothing to
-  accumulate — the point of that path is that the rows are never visited.
+### 13.1 Why it looked like more than it was
 
-So the honest headline for a UDAF is not "slower than a built-in". It is: **a UDAF forfeits the zone
-fast path**, and on the archive that is the difference between reading an index and scanning the
-rows. Any design must state that up front, and should probably offer the escape hatch rather than
-hide the cliff — a UDAF that can declare itself computable from the stats a zone already holds gets
-the fast path, and one that cannot says so.
+This section previously argued the extension was large, on two grounds. One held up and one did not.
 
-### 13.2 Four operations, and *merge* is the load-bearing one
+**The selector really is a closed byte on the wire.** `db.AggFunc` is a `uint8` enum aliased straight
+into the RPC layer and decoded as `AggFunc(r.u8())`. That part was right, and it is why §13.6 still
+has a wire item in it.
 
-The interface is init / accumulate / **merge** / finalize, and the temptation is to ship the first,
-second and fourth and add merge later. That gets the capability wrong in three specific ways, each
-already visible in the tree:
+**But the channel was already cut, by COUNT DISTINCT.** Its selector sits past `AggMax`, and three
+behaviours follow from that alone: `anyFiltered` routes any request carrying it onto the extended
+opcodes, so an older server refuses rather than silently answering a *different* aggregate;
+`ColumnarAggregate`'s switch declines it through the default arm; and the materialized-view layer
+cannot name it, because `ViewAggFunc` is a separate string enum admitting only count/sum/avg.
+`AggUser` inherits all three by sitting past `AggMax` too. The honest size of the change was
+therefore a registry, a reduction case, and a refusal — not a new mechanism. **A feature that looks
+structural is worth re-costing against the last feature of its shape that shipped**; the previous
+draft of this section had read the code and still over-estimated, because it reasoned from the enum
+rather than from what the most recent addition to the enum had cost.
 
-- **Parallel and per-segment scans produce partial states.** Without merge a UDAF is single-threaded
-  by construction, in the one place the engine is not.
-- **Materialized views are maintained by delta, and the view layer already classifies aggregates by
-  whether that is possible.** It admits only COUNT/SUM/AVG, and says why: "MIN/MAX would need a
-  rescan when the current extreme is removed" (`db/view.go:28-37`). A UDAF must declare which camp it
-  is in, and the view layer must refuse to maintain one that cannot merge under *deletion* — which is
-  a strictly stronger property than merging under union.
-- **Visit order is not stable.** Zone and segment identity has already produced one silent
-  wrong-count bug in this engine, so merge must be required to be **associative and commutative**,
-  not merely associative. A UDAF whose merge is order-sensitive would be correct in tests and wrong
-  in production, which is the worst available failure mode.
+**The cliff is real, and the first draft of this section described the wrong one.** It said the
+columnar path "does not read values at all: it computes the answer from a zone's precomputed
+`NumStats`", and that a user-defined aggregate therefore could not plug in because the rows are never
+visited. That is false, and it was repeated from the draft into the shipped doc comment before
+anyone checked it. `NumStats` is the **output** of a columnar pass, not an input to it:
+`schemaScanStatsMulti` walks a segment's blocks, rules whole blocks out by zone map and per-block
+min/max, and then *reads the surviving column's values* into an accumulator.
 
-### 13.3 An argument for an explicit state type, from the built-ins' own shape
+There are three tiers, and only the middle one is what a built-in SUM actually gets:
 
-Worth recording because it inverts the expected direction. `aggAcc` **retains every argument value**
-for SUM/AVG/MIN/MAX — `a.vals = append(a.vals, v)` (`db/aggregate.go:363`) — and hands the whole
-slice to the library at the end. That is deliberate, and the comment says why: it makes type coercion
-(int64-exact sums, int/real promotion, boolean and undefined handling, error propagation) match
-HTCondor's `sum()`/`avg()` *exactly* rather than being a re-implementation of it
-(`db/aggregate.go:327-331`).
+| tier | what it reads | who uses it |
+|---|---|---|
+| index-resident | nothing — attributes a segment's postings | the archive's GROUP BY **count** only |
+| columnar value pass | the argument as a contiguous column, block-pruned, unboxed | COUNT(attr), SUM, AVG, MIN, MAX |
+| record scan | every matching record decoded, argument boxed per row | everything else, including a user-defined aggregate |
+
+So the headline is: **a user-defined aggregate forfeits the columnar value pass**. What it loses is
+the column layout, the block pruning and the absence of boxing — not the reading of values, which
+both tiers do. SUM and MIN do not get the index-resident tier either, so that one is not part of the
+gap between a built-in and a user-defined aggregate.
+
+Getting this right matters because it changes what is buildable. "The rows are never visited" makes
+the gap structural and closes the question; "the values are read from a column instead of from
+decoded records" makes it an interface question, and nothing about `Accumulator` forecloses a
+column-shaped accumulate riding the same pass. §13.6 carries that as work rather than as a
+limitation. The row path, meanwhile, accumulates per group and defers the arithmetic to the ClassAd
+library's own `Sum`/`Avg`/`Min`/`Max` at the end, and a user-defined aggregate plugs in there
+cleanly; a test pins the columnar decline rather than leaving it to a `default:` arm nobody reads.
+
+### 13.2 Four operations, and *merge* is required and **not yet called**
+
+The interface is init / accumulate / merge / finalize, as `Aggregate.NewAccumulator` and
+`Accumulator.Add` / `Merge` / `Result`.
+
+Merge is in it, and **the engine never calls it**. The reduction core is strictly serial over one
+`iter.Seq`, so every accumulator the package builds is folded by `Add` alone. Saying so plainly
+matters more than it looks: an interface with an uncalled method invites someone to conclude the
+engine is parallel, and it is not.
+
+It is required anyway, because leaving it out would bake the serialism into the contract. The moment
+a per-segment or parallel reduction exists, an interface without merge is single-threaded *by
+construction* in the one place the engine is not — and every aggregate already written would have to
+be revisited. Requiring it now costs an implementation one method; adding it later costs every
+implementor a rewrite.
+
+The law it must satisfy is **associative and commutative**, not merely associative, because nothing
+promises the order partial states are produced or combined in — zone and segment identity has
+already produced one silent wrong-count bug in this engine. An aggregate whose merge is
+order-sensitive would be correct in every test its author thought to write, because an author tests
+the order their own code produces, and wrong in production. That is the worst failure mode
+available, which is why the law got a checker rather than a sentence (§13.5).
+
+The view layer's requirement is **strictly stronger** and remains unmet by design: a view maintained
+by delta needs merge under *deletion*, not merge under union. It admits only COUNT/SUM/AVG and says
+why — "MIN/MAX would need a rescan when the current extreme is removed". A user-defined aggregate is
+query-only, and the type system enforces that rather than a check.
+
+### 13.3 An explicit state type, from the built-ins' own shape
+
+Worth recording because it inverts the expected direction. The built-in accumulator **retains every
+argument value** for SUM/AVG/MIN/MAX and hands the whole slice to the library at the end. That is
+deliberate: it makes type coercion (int64-exact sums, int/real promotion, boolean and undefined
+handling, error propagation) match HTCondor's `sum()`/`avg()` *exactly* rather than being a
+re-implementation of it.
 
 The cost is that built-in aggregate state is O(group size), not O(1) — parity bought with memory. So
-a UDAF with an explicit, bounded state type would be **better behaved than the built-in it imitates**.
-That is an argument for giving the interface its own state rather than modelling it on `aggAcc`, and
-against the obvious shortcut of letting a UDAF receive the accumulated value slice.
+an aggregate with its own bounded state is **better behaved than the built-in it imitates**. That is
+the argument for giving the interface a state of its own rather than modelling it on the built-in
+accumulator, and against the obvious shortcut of handing an implementation the accumulated value
+slice. `Accumulator` is therefore the implementation's own type, and the engine only ever hands a
+`Merge` an accumulator from the same registration.
 
-### 13.4 Questions a design has to answer
+### 13.4 The four questions, answered
 
-1. **Who may register one?** The scalar registry is open to the host process. A UDAF that forfeits
-   zone pruning is a query-shape decision with a server-wide cost, which argues for the same
-   admin-labelled trust model the WASM loader needs for its unsandboxed path — configuration, not
-   something a module claims about itself.
-2. **What is the wire representation**, given §13.1, and does an unknown UDAF name on the server fail
-   the query or fall back to a client-side aggregation?
-3. **May a UDAF appear in a materialized view at all**, or is the first version query-only? Query-only
-   is a defensible place to start and should be stated rather than left to be discovered.
-4. **Does a UDAF see values or columns?** The scalar path is elementwise over boxed `classad.Value`s;
-   the whole point of the vector engine is not to box. A batch-shaped accumulate is the same design
-   question the vectorized WASM ABI is facing, and the two should share an answer rather than invent
-   two.
+1. **Who may register one?** The host process, at start-up, by linking Go code into the server. The
+   trust model question this previously raised — the admin-labelled trust the WASM loader needs —
+   **does not arise**, because nothing here is *loaded*. Registering an aggregate requires the
+   ability to link code into the process, which is already total trust; a trust label would be
+   ceremony on top of a decision already made. It becomes a real question the moment aggregates
+   become loadable, and not before.
+2. **What is the wire representation?** Unresolved, and **refused rather than half-answered**. Every
+   aggregate frame is a function selector plus an argument (plus a filter, on the extended opcodes);
+   none has a field for a name. Sending `AggUser` over the existing frame would arrive as "the
+   selector past MAX, argument such-and-such" without the one thing identifying which aggregate was
+   meant, and the server would look up the *empty name*. So the client refuses locally, with its own
+   sentinel, and the server treats such a frame as malformed — because a client built against this
+   package will never produce one, and one that did is not asking for anything expressible.
+3. **May one appear in a materialized view?** No, and the view layer's own enum already prevents it.
+   Query-only is the stated starting point (§13.2).
+4. **Does it see values or columns?** **Values**, and the reason is specific rather than
+   conservative: the path a user-defined aggregate plugs into has already boxed them. The reduction
+   evaluates each row's argument into a `classad.Value` before any aggregate sees it, so a
+   batch-shaped accumulate would save nothing *there*. The path where not boxing matters is the
+   columnar one — and that is exactly the path a user-defined aggregate cannot use at all. The
+   question the vectorized WASM ABI faces therefore does not bind here, and the two do not need a
+   shared answer after all.
+
+### 13.5 The columnar rung, and the two promises opting into it makes
+
+The pass that answers SUM differs from the record scan in two ways an aggregate can be sensitive to,
+and no signature can check either. Implementing `ColumnAccumulator` is the declaration that neither
+applies — which is why it is an opt-in interface rather than something the engine infers.
+
+**Order.** The pass walks segments, then blocks, skipping blocks a zone map rules out. That is not
+the order a record scan visits the same records in, and not insertion order. An aggregate whose
+answer depends on the order it is fed gives a *different answer depending on which rung served the
+query* — and which rung runs depends on the schema, the constraint and what has been sealed, so it
+can change under a caller who changed nothing. Both answers look right. The reference's own
+`min()`/`max()` cannot make this promise over a column holding a NaN, which is exactly why the
+built-in path declines that case instead of answering it.
+
+**What is offered.** The pass yields only the column's *numeric* values. A record whose argument is
+absent, undefined, a string or an expression is never offered — where the record scan calls `Add`
+for every row in the group, undefined included. An aggregate that counts what it was handed, or
+treats undefined as a contribution, must not implement the interface; one that already skips
+non-numbers, as SUM, AVG, MIN and MAX all do, loses nothing.
+
+`CheckAggregate` tests both for any aggregate that opts in: `AddNum` must agree with `Add` over the
+same numbers, and must give the same answer over them reversed and rotated. Neither check runs for
+an ordinary `Accumulator`, which is not claiming either property.
+
+The rung is held to the ladder's existing rule — every rung's answer equals the reference's for the
+same request — by the test that already enforces it for every other rung, with the new one named
+explicitly so that silently declining everything cannot pass as success.
+
+### 13.6 Three findings from building it
+
+**The laws cannot be exact for a floating-point aggregate, and that is not the implementation's
+fault.** The obvious first thing anyone writes here is a variance — precisely because its state is
+bounded where the built-in's is O(group size). Floating-point addition is not associative, so a
+correct variance gives answers differing in the last bits depending on how the rows were divided
+into partial states. A checker demanding exact equality would reject every correct implementation of
+it while happily passing an integer aggregate that is genuinely broken. So the comparison is the
+caller's (`CheckAggregateEqual`), and an aggregate needing slack has thereby *said* it needs slack,
+in its own tests, where a reader can see how much and judge it. A tolerance built into the checker
+would have applied silently to aggregates that should have been exact.
+
+The same is quietly true of the **built-in** SUM over reals, which sums the retained values in
+arrival order. It is order-dependent in the same last bits; it is simply serial today, so nothing has
+noticed. Whatever introduces a parallel or per-segment reduction inherits that, and it is not a
+user-defined-aggregate problem.
+
+**Containment is per query, not per row — the opposite of the scalar rule.** A scalar UDF that panics
+is turned into an ERROR *value*, and can be, because one record evaluating to ERROR is an ordinary
+outcome that says nothing about the others. An aggregate has no such room: a group's answer is a
+function of every row in it, so a state that stopped being updated part-way does not yield a worse
+answer, it yields a **wrong one that is indistinguishable from a right one**. The query fails
+instead. Per query also costs nothing per row, where a recovery around each `Add` would be a deferred
+call on the hottest loop in the reduction.
+
+**A surviving mutation does not always mean delete the guard.** Cutting the checker's split points
+down to the midpoint alone survived the whole suite. The previous time a mutation survived in this
+work it proved a guard redundant and the guard went. Here the opposite was right, and the
+discriminator is *whose* code the guard protects: that one guarded a path this package's own tests
+could cover, so coverage was the proof it was unnecessary; this one guards implementations this
+package will never see, so the test corpus is not a sample of the population it serves. The fix was
+to write the bug the cuts exist for — an aggregate wrong only when one side of a merge holds exactly
+one element, which is what special-casing a state of one and getting it wrong looks like — and the
+mutation then died.
+
+### 13.7 What is left
+
+- **The wire.** A frame that can carry an aggregate's name, under its own opcode, with the
+  `ErrExtendedAggregateUnsupported` precedent for a server too old to know it. Until then a
+  user-defined aggregate runs against the `db` package in process.
+- **A parallel or per-segment reduction**, which is what would make `Merge` load-bearing rather than
+  merely required. Note that it is also what turns the built-in float SUM's arrival-order dependence
+  from latent into live.
+- **The grouped columnar rung**, now the top of this list and the larger remaining prize: GROUP BY is
+  the shape a dashboard actually asks, and it is the one still falling to the scan at 6.8x. The
+  ungrouped pass yields values with no group key, so this needs the grouping machinery
+  `GroupedFromColumns` already has, driving an accumulator per group instead of fixed statistics.
+- **The statistics shortcut**, separately and much narrower: an aggregate that can declare itself a
+  function of the `NumStats` a pass already computes (a range, a mean) could be answered from them
+  without its own accumulate. Worth far less than the item above, and worth building only after
+  something asks for it.
+- **Views**, if ever, and only behind merge-under-deletion.
 
 ---
 

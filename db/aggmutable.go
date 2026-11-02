@@ -117,6 +117,19 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact b
 			}, req.GroupCols, req.Aggs)
 			return rows, ok, nil
 		}},
+		aggRung{"columnar-user-aggregate", func(req AggRequest) ([]AggRow, bool, error) {
+			// A single ungrouped user-defined aggregate whose accumulator takes column values,
+			// read from the columnar blocks rather than by decoding every record. Declines
+			// unless the aggregate opted in (see ColumnAccumulator); the scan below answers it
+			// either way, so this rung is a speed-up and never the only thing that can serve.
+			scan := db.NumValues
+			if redact {
+				scan = db.NumValuesRedacted
+			}
+			return ColumnarUserAggregate(func(attr string, sink func(NumValue)) bool {
+				return scan(req.Constraint, attr, sink)
+			}, req.GroupCols, req.Aggs)
+		}},
 		aggRung{"grouped-columns", func(req AggRequest) ([]AggRow, bool, error) {
 			// A GROUP BY one or more columns -- each numeric or string, each raw or bucketed --
 			// with COUNT(*) and/or MIN/MAX/SUM/AVG/COUNT(attr), answered from the columnar blocks.

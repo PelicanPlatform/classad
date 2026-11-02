@@ -35,6 +35,11 @@ const (
 	// switch to a sketch: a query written COUNT(DISTINCT ...) gets a true count, and an
 	// approximate one would have to be asked for by name.
 	AggCountDistinct
+	// AggUser is a user-defined aggregate, named by AggSpec.UserFunc and registered with
+	// RegisterAggregate. It sits past AggMax on purpose: that is what routes a request
+	// carrying one onto the extended RPC opcodes, so a server too old to know it refuses
+	// rather than answering a different aggregate.
+	AggUser
 )
 
 // AggSpec is one aggregate in a query: a function over an argument attribute.
@@ -55,6 +60,12 @@ type AggSpec struct {
 	Func   AggFunc
 	Arg    string
 	Filter string
+
+	// UserFunc names the registered aggregate when Func is AggUser, and is empty otherwise.
+	// It is a separate field rather than an overload of Arg because a user-defined aggregate
+	// still takes an argument attribute: p95(RequestMemory) is UserFunc "p95", Arg
+	// "RequestMemory".
+	UserFunc string
 }
 
 // AggRow is one group's result: the group-by column values followed by the
@@ -233,12 +244,25 @@ func bindValue(ad *classad.ClassAd, name string, v classad.Value) {
 // undefined). If stop is non-nil it is polled per row and, when it returns true,
 // the scan halts early with the groups accumulated so far -- used to abandon a
 // scan whose client has gone away.
-func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []GroupCol, aggs []AggSpec, groupCol, aggCol []int, stop func() bool) ([]AggRow, error) {
+func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []GroupCol, aggs []AggSpec, groupCol, aggCol []int, stop func() bool) (rows []AggRow, err error) {
 	nGroup := len(groupCols)
 	for _, a := range aggs {
 		if a.Func == AggCountDistinct && a.Arg == "*" {
 			return nil, fmt.Errorf("COUNT(DISTINCT *) is not meaningful; name an attribute")
 		}
+	}
+	// Resolve user-defined aggregates once, so the reduction does no lookup per group, and
+	// contain a panic from one for the whole query rather than per row (see udafPanic).
+	userAggs, err := resolveAggregates(aggs)
+	if err != nil {
+		return nil, err
+	}
+	if userAggs != nil {
+		defer func() {
+			if r := recover(); r != nil {
+				rows, err = nil, &udafPanic{name: userAggName(aggs), val: r}
+			}
+		}()
 	}
 	filters, anyFilter, err := compileFilters(attrs, aggs)
 	if err != nil {
@@ -280,7 +304,7 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 		key := strings.Join(scratch, "\x00")
 		gs := groups[key]
 		if gs == nil {
-			gs = &groupState{gvals: append([]string(nil), scratch...), accs: make([]aggAcc, len(aggs))}
+			gs = newGroupState(append([]string(nil), scratch...), aggs, userAggs)
 			groups[key] = gs
 			order = append(order, key)
 		}
@@ -298,7 +322,7 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 
 	// A group-less aggregate over an empty match still yields one row.
 	if nGroup == 0 && len(order) == 0 {
-		gs := &groupState{accs: make([]aggAcc, len(aggs))}
+		gs := newGroupState(nil, aggs, userAggs)
 		row := AggRow{Values: make([]string, len(aggs))}
 		for i, a := range aggs {
 			row.Values[i] = gs.accs[i].result(a)
@@ -324,6 +348,35 @@ type groupState struct {
 	accs  []aggAcc
 }
 
+// newGroupState builds a group's accumulators, giving each user-defined aggregate a fresh
+// accumulator of its own. A group gets its own state the moment it exists rather than on its
+// first contributing row, because a group every one of whose rows fails its aggregate's FILTER
+// still appears in the output -- and its answer is then the aggregate's identity, which only an
+// accumulator can say.
+func newGroupState(gvals []string, aggs []AggSpec, userAggs []Aggregate) *groupState {
+	gs := &groupState{gvals: gvals, accs: make([]aggAcc, len(aggs))}
+	for i := range aggs {
+		if userAggs != nil && userAggs[i] != nil {
+			gs.accs[i].user = userAggs[i].NewAccumulator()
+		}
+	}
+	return gs
+}
+
+// userAggName names the user-defined aggregate a contained panic came from. With more than one in
+// the request there is no way to tell which from the recovered value, so it names them all rather
+// than guessing: a report that says "one of these" is worth more than one that may finger the
+// wrong aggregate.
+func userAggName(aggs []AggSpec) string {
+	var names []string
+	for _, a := range aggs {
+		if a.Func == AggUser {
+			names = append(names, a.UserFunc)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
 // aggAcc accumulates one group's data for one aggregate. COUNT needs only
 // counters; SUM/AVG/MIN/MAX collect the evaluated argument values and hand them
 // to the ClassAd library's aggregate functions at the end, so type coercion
@@ -335,6 +388,7 @@ type aggAcc struct {
 	defN int                 // rows where the argument is defined (COUNT(col))
 	vals []classad.Value     // argument values for SUM/AVG/MIN/MAX
 	seen map[string]struct{} // distinct defined argument values (COUNT DISTINCT)
+	user Accumulator         // a user-defined aggregate's own state (AggUser)
 }
 
 // update folds one row's already-resolved argument value v into the accumulator.
@@ -350,6 +404,11 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value) {
 	}
 	switch spec.Func {
 	case AggCount:
+	case AggUser:
+		// Every row is offered, undefined included: whether to skip one is the aggregate's
+		// decision, exactly as it is for the built-ins, which drop undefined inside the
+		// reference implementation rather than before it.
+		a.user.Add(v)
 	case AggCountDistinct:
 		// Keyed on the same rendering the group tuple uses, so two rows count as one
 		// value exactly when they would group together.
@@ -382,6 +441,8 @@ func (a *aggAcc) result(spec AggSpec) string {
 		return ValueText(classad.Min(a.vals))
 	case AggMax:
 		return ValueText(classad.Max(a.vals))
+	case AggUser:
+		return ValueText(a.user.Result())
 	}
 	return "undefined"
 }
