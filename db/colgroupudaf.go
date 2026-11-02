@@ -23,17 +23,37 @@ type GroupValuesSource interface {
 	// group a sink from newSink the first time it is seen.
 	GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
 		aggCols []collections.GroupAggCol, countFilters []string,
-		newSink func() collections.GroupSink) ([]collections.GroupValues, bool)
+		newSink func() collections.GroupSink,
+		mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool)
 	// GroupValuesAllAggs answers them over every row, for a constraint the caller has established
 	// is match-all.
 	GroupValuesAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
-		countFilters []string, newSink func() collections.GroupSink) ([]collections.GroupValues, bool)
+		countFilters []string, newSink func() collections.GroupSink,
+		mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool)
 }
 
 // udafGroupSink is one group's accumulators, in the order the aggregate columns were requested.
 type udafGroupSink struct{ accs []ColumnAccumulator }
 
 func (s *udafGroupSink) AddNum(agg int, v collections.NumValue) { s.accs[agg].AddNum(v) }
+
+// mergeUDAFGroupSinks folds one group's accumulators into another's, column by column, with each
+// aggregate's own Merge.
+//
+// The storage layer cannot do this: it holds a GroupSink, which only accepts values. It is needed
+// because a fanned-out grouped pass gives every worker its own sink per group, so a group two
+// workers both saw arrives as two sets of accumulators to fold into one -- the same reason Merge
+// exists at all, now reached by a second caller.
+//
+// Both sides come from this package's own newSink, so the assertion cannot fail for any input; it
+// would fail only if the storage layer handed back a sink it did not get from us, which is a bug
+// here rather than bad data, and the panic is contained for the query like every other.
+func mergeUDAFGroupSinks(dst, src collections.GroupSink) {
+	d, s := dst.(*udafGroupSink), src.(*udafGroupSink)
+	for i := range d.accs {
+		d.accs[i].Merge(s.accs[i])
+	}
+}
 
 // GroupedUserFromColumns answers a GROUP BY whose value aggregates are all user-defined, from src's
 // columns. ok=false means nothing was computed and the caller must scan.
@@ -128,9 +148,9 @@ func GroupedUserFromColumns(src GroupValuesSource, constraint string, groupCols 
 		var groups []collections.GroupValues
 		var ok bool
 		if IsMatchAll(constraint) {
-			groups, ok = src.GroupValuesAllAggs(specs, cols, countFilters, newSink)
+			groups, ok = src.GroupValuesAllAggs(specs, cols, countFilters, newSink, mergeUDAFGroupSinks)
 		} else {
-			groups, ok = src.GroupValuesConstraintAggs(constraint, specs, cols, countFilters, newSink)
+			groups, ok = src.GroupValuesConstraintAggs(constraint, specs, cols, countFilters, newSink, mergeUDAFGroupSinks)
 		}
 		if !ok {
 			return nil

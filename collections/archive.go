@@ -397,26 +397,26 @@ func (a *Archive) GroupStatsAllAggs(groups []GroupSpec, aggCols []GroupAggCol,
 // GroupValuesConstraintAggs is GroupStatsConstraintAggs reduced into caller-supplied accumulators.
 // See Collection.GroupValuesConstraintAggs.
 func (a *Archive) GroupValuesConstraintAggs(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
-	return a.c.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink)
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink) ([]GroupValues, bool) {
+	return a.c.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // GroupValuesConstraintAggsRedacted is GroupValuesConstraintAggs for a reader not entitled to sealed values.
 func (a *Archive) GroupValuesConstraintAggsRedacted(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
-	return a.c.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink)
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink) ([]GroupValues, bool) {
+	return a.c.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // GroupValuesAllAggs is GroupValuesConstraintAggs over every record. See Collection.GroupValuesAllAggs.
 func (a *Archive) GroupValuesAllAggs(groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
-	return a.c.GroupValuesAllAggs(groups, aggCols, countFilters, newSink)
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink) ([]GroupValues, bool) {
+	return a.c.GroupValuesAllAggs(groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // GroupValuesAllAggsRedacted is GroupValuesAllAggs for a reader not entitled to sealed values.
 func (a *Archive) GroupValuesAllAggsRedacted(groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
-	return a.c.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink)
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink) ([]GroupValues, bool) {
+	return a.c.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // GroupCountAll returns the per-value record counts of groupAttr over EVERY record, read out of the

@@ -211,17 +211,17 @@ func (r redactedGroupStats) GroupStatsAllAggs(groups []collections.GroupSpec, ag
 // code, and naming the redacted call keeps this correct if that changes.
 func (r redactedGroupStats) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
 	aggCols []collections.GroupAggCol, countFilters []string,
-	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {
 	if r.db.c.Chained() {
 		return nil, false // as DB.GroupValuesConstraintAggs
 	}
-	return r.db.c.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink)
+	return r.db.c.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 func (r redactedGroupStats) GroupValuesAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
-	countFilters []string, newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	countFilters []string, newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {
 	if r.db.c.Chained() {
 		return nil, false
 	}
-	return r.db.c.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink)
+	return r.db.c.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink, mergeSink)
 }

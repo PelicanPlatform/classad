@@ -331,7 +331,7 @@ func splitAggCols(aggCols []GroupAggCol) ([]string, []string) {
 
 func (c *Collection) groupStatsQuery(q *vm.Query, groups []GroupSpec, aggAttrs, colFilters,
 	countFilters []string, redact bool) ([]GroupStats, bool) {
-	ga, groupIDs, aggIDs, gf, ok := c.groupAccumQuery(q, groups, aggAttrs, colFilters, countFilters, redact, nil)
+	ga, groupIDs, aggIDs, gf, ok := c.groupAccumQuery(q, groups, aggAttrs, colFilters, countFilters, redact, nil, nil)
 	if !ok {
 		return nil, false
 	}
@@ -346,7 +346,7 @@ func (c *Collection) groupStatsQuery(q *vm.Query, groups []GroupSpec, aggAttrs, 
 // answer, and a second copy would be a second set of them -- which is how one shaper quietly starts
 // serving a shape the other declines.
 func (c *Collection) groupAccumQuery(q *vm.Query, groups []GroupSpec, aggAttrs, colFilters,
-	countFilters []string, redact bool, newSink func() GroupSink) (*groupAccum, []uint32, []uint32, *groupFilters, bool) {
+	countFilters []string, redact bool, newSink func() GroupSink, mergeSink MergeGroupSink) (*groupAccum, []uint32, []uint32, *groupFilters, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil {
 		return nil, nil, nil, nil, false
@@ -372,7 +372,7 @@ func (c *Collection) groupAccumQuery(q *vm.Query, groups []GroupSpec, aggAttrs, 
 	// First tier: a conjunction of numeric comparisons against literals, narrowed column by column with
 	// zone-map pruning. Fastest, and the shape a history dashboard asks most.
 	if preds, pok := c.numPredsCT(q, st.schema); pok {
-		if ga, served := c.schemaScanGroupStats(groupIDs, aggIDs, buckets, preds, newSink, gf, st.cache); served || !predsNeedCT(preds) {
+		if ga, served := c.schemaScanGroupStats(groupIDs, aggIDs, buckets, preds, newSink, mergeSink, gf, st.cache); served || !predsNeedCT(preds) {
 			if !served {
 				return nil, nil, nil, nil, false
 			}
@@ -406,19 +406,19 @@ func (c *Collection) groupAccumQuery(q *vm.Query, groups []GroupSpec, aggAttrs, 
 // It declines on exactly the same terms as GroupStatsConstraintAggs, because it is the same plan and
 // the same scan -- only the accumulator differs.
 func (c *Collection) GroupValuesConstraintAggs(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
-	return c.groupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink, false)
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink) ([]GroupValues, bool) {
+	return c.groupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink, mergeSink, false)
 }
 
 // GroupValuesConstraintAggsRedacted is GroupValuesConstraintAggs for a reader NOT entitled to sealed
 // values, on the same terms as GroupStatsConstraintAggsRedacted.
 func (c *Collection) GroupValuesConstraintAggsRedacted(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
-	return c.groupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink, true)
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink) ([]GroupValues, bool) {
+	return c.groupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink, mergeSink, true)
 }
 
 func (c *Collection) groupValuesConstraintAggs(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink, redact bool) ([]GroupValues, bool) {
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink, redact bool) ([]GroupValues, bool) {
 	if newSink == nil {
 		return nil, false
 	}
@@ -427,7 +427,7 @@ func (c *Collection) groupValuesConstraintAggs(constraint string, groups []Group
 		return nil, false
 	}
 	attrs, filters := splitAggCols(aggCols)
-	ga, groupIDs, aggIDs, gf, ok := c.groupAccumQuery(q, groups, attrs, filters, countFilters, redact, newSink)
+	ga, groupIDs, aggIDs, gf, ok := c.groupAccumQuery(q, groups, attrs, filters, countFilters, redact, newSink, mergeSink)
 	if !ok {
 		return nil, false
 	}
@@ -512,7 +512,7 @@ func (c *Collection) groupStatsAll(groups []GroupSpec, aggAttrs, colFilters,
 // groupAccumAll is groupStatsAll stopping at the filled accumulator, so both shapers share the
 // match-all plan exactly as groupAccumQuery shares the constrained one.
 func (c *Collection) groupAccumAll(groups []GroupSpec, aggAttrs, colFilters, countFilters []string,
-	newSink func() GroupSink) (*groupAccum, []uint32, []uint32, *groupFilters, bool) {
+	newSink func() GroupSink, mergeSink MergeGroupSink) (*groupAccum, []uint32, []uint32, *groupFilters, bool) {
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil {
 		return nil, nil, nil, nil, false
@@ -525,7 +525,7 @@ func (c *Collection) groupAccumAll(groups []GroupSpec, aggAttrs, colFilters, cou
 	if !ok {
 		return nil, nil, nil, nil, false
 	}
-	ga, served := c.schemaScanGroupStats(groupIDs, aggIDs, buckets, nil, newSink, gf, st.cache)
+	ga, served := c.schemaScanGroupStats(groupIDs, aggIDs, buckets, nil, newSink, mergeSink, gf, st.cache)
 	if !served {
 		return nil, nil, nil, nil, false
 	}
@@ -535,18 +535,18 @@ func (c *Collection) groupAccumAll(groups []GroupSpec, aggAttrs, colFilters, cou
 // GroupValuesAllAggs is GroupValuesConstraintAggs over every record, for a constraint the caller has
 // established is match-all. See Collection.GroupStatsAllAggs.
 func (c *Collection) GroupValuesAllAggs(groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
-	return c.groupValuesAllAggs(groups, aggCols, countFilters, newSink, false)
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink) ([]GroupValues, bool) {
+	return c.groupValuesAllAggs(groups, aggCols, countFilters, newSink, mergeSink, false)
 }
 
 // GroupValuesAllAggsRedacted is GroupValuesAllAggs for a reader NOT entitled to sealed values.
 func (c *Collection) GroupValuesAllAggsRedacted(groups []GroupSpec, aggCols []GroupAggCol,
-	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
-	return c.groupValuesAllAggs(groups, aggCols, countFilters, newSink, true)
+	countFilters []string, newSink func() GroupSink, mergeSink MergeGroupSink) ([]GroupValues, bool) {
+	return c.groupValuesAllAggs(groups, aggCols, countFilters, newSink, mergeSink, true)
 }
 
 func (c *Collection) groupValuesAllAggs(groups []GroupSpec, aggCols []GroupAggCol, countFilters []string,
-	newSink func() GroupSink, redact bool) ([]GroupValues, bool) {
+	newSink func() GroupSink, mergeSink MergeGroupSink, redact bool) ([]GroupValues, bool) {
 	if newSink == nil {
 		return nil, false
 	}
@@ -554,7 +554,7 @@ func (c *Collection) groupValuesAllAggs(groups []GroupSpec, aggCols []GroupAggCo
 	if redact && c.keylessHidesGroupAggs(groups, attrs, filters, countFilters) {
 		return nil, false
 	}
-	ga, groupIDs, aggIDs, gf, ok := c.groupAccumAll(groups, attrs, filters, countFilters, newSink)
+	ga, groupIDs, aggIDs, gf, ok := c.groupAccumAll(groups, attrs, filters, countFilters, newSink, mergeSink)
 	if !ok {
 		return nil, false
 	}
@@ -617,7 +617,7 @@ func (c *Collection) resolveGroupAttrs(st *schemaScanState, groups []GroupSpec, 
 // the columns and the predicate set are resolved. A nil preds means every visible record survives.
 func (c *Collection) groupStats(groupIDs []uint32, aggIDs []uint32, buckets []int64, preds []fieldPred,
 	gf *groupFilters, st *schemaScanState) ([]GroupStats, bool) {
-	acc, ok := c.schemaScanGroupStats(groupIDs, aggIDs, buckets, preds, nil, gf, st.cache)
+	acc, ok := c.schemaScanGroupStats(groupIDs, aggIDs, buckets, preds, nil, nil, gf, st.cache)
 	if !ok {
 		return nil, false
 	}
@@ -741,10 +741,40 @@ func groupValueLess(a, b classad.Value) bool {
 // ok=false means a surviving record's GROUP value is one only evaluation can produce, which this cannot
 // turn into a group (see GroupStatsQuery); the partial result is then discarded and the caller scans.
 func (c *Collection) schemaScanGroupStats(groupIDs []uint32, aggIDs []uint32, buckets []int64, preds []fieldPred,
-	newSink func() GroupSink,
+	newSink func() GroupSink, mergeSink MergeGroupSink,
 	gf *groupFilters, bc *blockCache) (*groupAccum, bool) {
-	acc := newGroupAccum(buckets, newSink)
-	acc.nFilt = gf.n()
+	return c.groupsPar(groupIDs, aggIDs, buckets, preds, newSink, mergeSink, gf, bc)
+}
+
+// groupPassPlan is what a grouped pass resolves once, before it touches a segment. READ-ONLY after
+// it is built, which is what lets every worker of a fanned-out pass share one.
+type groupPassPlan struct {
+	groupIDs     []uint32
+	aggIDs       []uint32
+	preds        []fieldPred
+	lookups      []fieldLookup
+	groupLookups []fieldLookup
+	aggLookups   []fieldLookup
+	ct           bool
+	zp           []vm.Probe
+}
+
+// groupPassState is the scratch one goroutine needs to walk a window: the narrowing planes, the
+// group column readers, the aggregate column readers, and this worker's own filter planes. One per
+// worker, never shared -- gf.pass in particular is rewritten per RECORD.
+type groupPassState struct {
+	cand    candSet
+	sc      predScratch
+	cols    groupCols
+	aggCols []numCol
+	gf      *groupFilters
+}
+
+func newGroupPassState(nAgg int, gf *groupFilters) groupPassState {
+	return groupPassState{aggCols: make([]numCol, nAgg), gf: gf}
+}
+
+func (c *Collection) planGroupPass(groupIDs, aggIDs []uint32, preds []fieldPred) groupPassPlan {
 	lookups := make([]fieldLookup, len(preds))
 	for i, p := range preds {
 		lookups[i] = c.attrLookup(p.fieldID)
@@ -757,105 +787,99 @@ func (c *Collection) schemaScanGroupStats(groupIDs []uint32, aggIDs []uint32, bu
 	for i, id := range aggIDs {
 		aggLookups[i] = c.attrLookup(id)
 	}
+	return groupPassPlan{
+		groupIDs: groupIDs, aggIDs: aggIDs, preds: preds,
+		lookups: lookups, groupLookups: groupLookups, aggLookups: aggLookups,
+		ct: predsNeedCT(preds), zp: predZoneProbes(preds),
+	}
+}
 
-	var cand candSet
-	var sc predScratch
-	var cols groupCols
-	aggCols := make([]numCol, len(aggIDs))
-	ct := predsNeedCT(preds)
-	zp := predZoneProbes(preds)
-	for _, sh := range c.shards {
-		s0, wins := sh.snapshot()
-		for _, w := range wins {
-			if ct && !w.ctFree {
-				releaseWindows(wins) // a folded predicate is exact only in a proven window
-				return nil, false
-			}
-			// No record here can match, so it adds no group; see schemaScanCountMulti.
-			if c.segZoneExcludes(w, zp, ct) {
-				continue
-			}
-			cs := w.seg.colblk.Load()
-			groupIdxs, aggIdxs, predIdxs, ok := resolveGroupFields(cs, groupIDs, aggIDs, preds)
-			// A filter whose field this segment's schema lacks sends the segment down the same
-			// row fallback a missing group or predicate column does, rather than evaluating the
-			// filter against a column that is not there.
-			if ok {
-				ok = gf.resolveSeg(cs)
-			}
-			if !ok {
-				if !bruteGroupStats(c, w, s0, groupLookups, aggLookups, preds, lookups, gf, acc) {
-					releaseWindows(wins)
-					return nil, false
-				}
-				continue
-			}
-			base := 0
-			for _, blk := range cs.blocks {
-				// Only the PREDICATE columns can rule a block out; the group and aggregate columns'
-				// values are the answer.
-				if !blockMayMatch(blk, predIdxs, preds) {
-					base += blk.n
-					continue
-				}
-				colOK := cols.setBlock(blk, groupIdxs, groupIDs, bc)
-				if !colOK {
-					// The block's schema carries the field but its column will not read (an
-					// unreadable cold stream, an unreadable dictionary). Skipping the block would
-					// drop its records from their groups without saying so, so the query goes back
-					// to the scan.
-					releaseWindows(wins)
-					return nil, false
-				}
-				for i := range aggIDs {
-					aggCols[i], colOK = newNumCol(blk, aggIdxs[i], aggIDs[i], bc)
-					if !colOK {
-						releaseWindows(wins)
-						return nil, false
-					}
-				}
-				sc.prepare(blk.n)
-				cand.setVisible(cs, w, s0, base, blk.n)
-				for i := range preds {
-					if cand.live == 0 {
-						break
-					}
-					if !narrowByField(blk, predIdxs[i], preds[i], bc, &cand, &sc) {
-						releaseWindows(wins)
-						return nil, false
-					}
-				}
-				// The per-aggregate FILTER planes, built AFTER the WHERE narrowing and only for a
-				// block that still has survivors. A filter plane costs a pass over its column
-				// whatever the block contributes, so building it for a block the WHERE emptied
-				// would be a scan whose every bit is then never read. The planes themselves are
-				// not intersected with cand: they are consulted only at a record cand already
-				// kept, so the intersection would be work with no reader either.
-				if cand.live > 0 && !gf.narrowBlock(blk, bc, &sc) {
-					releaseWindows(wins)
-					return nil, false
-				}
-				// One test per 64 records rules out a word of them, and the survivors are
-				// reached by their set bits rather than by reading a byte for each of the
-				// records an earlier pass already removed.
-				for wi, word := range cand.w {
-					for word != 0 {
-						k := wi*64 + bits.TrailingZeros64(word)
-						word &= word - 1
-						// Shared with the vector tier, so group identity and the aggregate
-						// skip rules cannot depend on which tier answered.
-						if !addGroupFromColumns(k, &cols, aggCols, bc, acc, gf) {
-							releaseWindows(wins)
-							return nil, false
-						}
-					}
-				}
-				base += blk.n
+// groupPassWindow walks one segment window into acc. false means the pass cannot serve the request
+// and the caller must scan.
+func (c *Collection) groupPassWindow(p *groupPassPlan, st *groupPassState, w segWindow, s0 uint64,
+	bc *blockCache, acc *groupAccum) bool {
+	groupIDs, aggIDs, preds := p.groupIDs, p.aggIDs, p.preds
+	lookups, groupLookups, aggLookups := p.lookups, p.groupLookups, p.aggLookups
+	cand, sc, cols, aggCols, gf := &st.cand, &st.sc, &st.cols, st.aggCols, st.gf
+	if p.ct && !w.ctFree {
+		return false // a folded predicate is exact only in a proven window
+	}
+	// No record here can match, so it adds no group; see schemaScanCountMulti.
+	if c.segZoneExcludes(w, p.zp, p.ct) {
+		return true
+	}
+	cs := w.seg.colblk.Load()
+	groupIdxs, aggIdxs, predIdxs, ok := resolveGroupFields(cs, groupIDs, aggIDs, preds)
+	// A filter whose field this segment's schema lacks sends the segment down the same
+	// row fallback a missing group or predicate column does, rather than evaluating the
+	// filter against a column that is not there.
+	if ok {
+		ok = gf.resolveSeg(cs)
+	}
+	if !ok {
+		if !bruteGroupStats(c, w, s0, groupLookups, aggLookups, preds, lookups, gf, acc) {
+			return false
+		}
+		return true
+	}
+	base := 0
+	for _, blk := range cs.blocks {
+		// Only the PREDICATE columns can rule a block out; the group and aggregate columns'
+		// values are the answer.
+		if !blockMayMatch(blk, predIdxs, preds) {
+			base += blk.n
+			continue
+		}
+		colOK := cols.setBlock(blk, groupIdxs, groupIDs, bc)
+		if !colOK {
+			// The block's schema carries the field but its column will not read (an
+			// unreadable cold stream, an unreadable dictionary). Skipping the block would
+			// drop its records from their groups without saying so, so the query goes back
+			// to the scan.
+			return false
+		}
+		for i := range aggIDs {
+			aggCols[i], colOK = newNumCol(blk, aggIdxs[i], aggIDs[i], bc)
+			if !colOK {
+				return false
 			}
 		}
-		releaseWindows(wins)
+		sc.prepare(blk.n)
+		cand.setVisible(cs, w, s0, base, blk.n)
+		for i := range preds {
+			if cand.live == 0 {
+				break
+			}
+			if !narrowByField(blk, predIdxs[i], preds[i], bc, cand, sc) {
+				return false
+			}
+		}
+		// The per-aggregate FILTER planes, built AFTER the WHERE narrowing and only for a
+		// block that still has survivors. A filter plane costs a pass over its column
+		// whatever the block contributes, so building it for a block the WHERE emptied
+		// would be a scan whose every bit is then never read. The planes themselves are
+		// not intersected with cand: they are consulted only at a record cand already
+		// kept, so the intersection would be work with no reader either.
+		if cand.live > 0 && !gf.narrowBlock(blk, bc, sc) {
+			return false
+		}
+		// One test per 64 records rules out a word of them, and the survivors are
+		// reached by their set bits rather than by reading a byte for each of the
+		// records an earlier pass already removed.
+		for wi, word := range cand.w {
+			for word != 0 {
+				k := wi*64 + bits.TrailingZeros64(word)
+				word &= word - 1
+				// Shared with the vector tier, so group identity and the aggregate
+				// skip rules cannot depend on which tier answered.
+				if !addGroupFromColumns(k, cols, aggCols, bc, acc, gf) {
+					return false
+				}
+			}
+		}
+		base += blk.n
 	}
-	return acc, true
+	return true
 }
 
 // resolveGroupFields maps every group column, every aggregate column and every predicated field into

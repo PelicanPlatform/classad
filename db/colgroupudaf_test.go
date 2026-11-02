@@ -141,13 +141,13 @@ func (db *DB) aggLadderAnswer(t *testing.T, rung string, req AggRequest) ([]AggR
 type refusingGroupValues struct{ t *testing.T }
 
 func (r refusingGroupValues) GroupValuesConstraintAggs(string, []collections.GroupSpec,
-	[]collections.GroupAggCol, []string, func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	[]collections.GroupAggCol, []string, func() collections.GroupSink, collections.MergeGroupSink) ([]collections.GroupValues, bool) {
 	r.t.Errorf("the grouped rung ran a pass for a request it should have refused")
 	return nil, false
 }
 
 func (r refusingGroupValues) GroupValuesAllAggs([]collections.GroupSpec, []collections.GroupAggCol,
-	[]string, func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	[]string, func() collections.GroupSink, collections.MergeGroupSink) ([]collections.GroupValues, bool) {
 	r.t.Errorf("the grouped rung ran a pass for a request it should have refused")
 	return nil, false
 }
@@ -190,15 +190,15 @@ func TestGroupedUserFromColumnsRefusals(t *testing.T) {
 type shortCountOfSource struct{}
 
 func (shortCountOfSource) GroupValuesConstraintAggs(_ string, _ []collections.GroupSpec,
-	_ []collections.GroupAggCol, _ []string, newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	_ []collections.GroupAggCol, _ []string, newSink func() collections.GroupSink, _ collections.MergeGroupSink) ([]collections.GroupValues, bool) {
 	return []collections.GroupValues{{
 		Values: []classad.Value{classad.NewStringValue("alice")}, Count: 1, Sink: newSink(),
 	}}, true
 }
 
 func (s shortCountOfSource) GroupValuesAllAggs(_ []collections.GroupSpec, _ []collections.GroupAggCol,
-	_ []string, newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
-	return s.GroupValuesConstraintAggs("", nil, nil, nil, newSink)
+	_ []string, newSink func() collections.GroupSink, _ collections.MergeGroupSink) ([]collections.GroupValues, bool) {
+	return s.GroupValuesConstraintAggs("", nil, nil, nil, newSink, nil)
 }
 
 func TestGroupedUserDeclinesAShortCountOf(t *testing.T) {
