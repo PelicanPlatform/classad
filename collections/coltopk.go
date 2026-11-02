@@ -68,10 +68,11 @@ func (t *topKKeep) threshold() (float64, bool) {
 // hold a sealed attribute's values in the clear (see hidesClearSealed): there an order attribute the
 // policy seals declines, and the constraint is planned as that reader evaluates it (keylessQuery).
 func (c *Collection) TopKOrderThresholdRedacted(q *vm.Query, orderAttr string, desc bool, k int, stats *ScanStats) (threshold float64, seen int, ok bool) {
-	if c.keylessHides(orderAttr) {
+	q = c.keylessQuery(q)
+	if c.keylessHides(orderAttr) || c.keylessComputedHides(q, orderAttr) {
 		return 0, 0, false
 	}
-	return c.TopKOrderThreshold(c.keylessQuery(q), orderAttr, desc, k, stats)
+	return c.TopKOrderThreshold(q, orderAttr, desc, k, stats)
 }
 
 // TopKOrderThreshold computes the cutoff order value for ORDER BY orderAttr {DESC|ASC} LIMIT k over

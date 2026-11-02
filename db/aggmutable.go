@@ -69,10 +69,11 @@ func (db *DB) AggregateColsStatsRedacted(constraint string, groupCols []GroupCol
 // rungs above it reassemble nothing and leave the counts zero, which is what the doc above reads
 // as "served without a per-record scan".
 //
-// redact is the caller's entitlement. The rungs that read only columns -- the live count, the numeric
-// column statistics -- serve both readers as they are: a sealed value is never a column, and they
-// decline any cell they cannot read as a literal. The rungs that fall back to evaluating a record take
-// the entitlement down to it.
+// redact is the caller's entitlement, and every rung but the live count takes it down. A sealed value
+// is never a column, but a value written before its attribute was sealed can be: a segment
+// columnarized before the sealing policy was widened holds that attribute's clear values in its
+// columns until a rewrite seals them. The redacted column reads decline anything that groups,
+// aggregates, orders or filters on an attribute the policy seals, so the scan reads it as undefined.
 func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact bool) []AggStrategy {
 	return []AggStrategy{
 		aggRung{"live-count", func(req AggRequest) ([]AggRow, bool, error) {
@@ -112,8 +113,12 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact b
 			// rather than by decoding every record. Only counting was routed here before, so an
 			// unconstrained MAX over a large table scanned row-wise. Declines unless the table has
 			// schema-scan enabled and the aggregate is in scope (see ColumnarAggregate).
+			numStats := db.NumStats
+			if redact {
+				numStats = db.numStatsRedacted
+			}
 			rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
-				return db.NumStats(req.Constraint, attr)
+				return numStats(req.Constraint, attr)
 			}, req.GroupCols, req.Aggs)
 			return rows, ok, nil
 		}},
@@ -187,8 +192,9 @@ func (db *DB) aggLadder(stats *collections.ScanStats, stop func() bool, redact b
 }
 
 // redactedGroupStats is the GroupStatsSource of a redacted aggregate: a record whose constraint the
-// columns cannot decide is matched with no key (see collections.GroupStatsConstraintAggsRedacted). The
-// match-all form evaluates no constraint and reads only columns, so it is the table's own.
+// columns cannot decide is matched with no key, and a group, aggregate or filter on an attribute the
+// sealing policy names declines to the keyless scan (see collections.GroupStatsConstraintAggsRedacted
+// and GroupStatsAllAggsRedacted).
 type redactedGroupStats struct{ db *DB }
 
 func (r redactedGroupStats) GroupStatsConstraintAggs(constraint string, groups []collections.GroupSpec,
@@ -201,7 +207,19 @@ func (r redactedGroupStats) GroupStatsConstraintAggs(constraint string, groups [
 
 func (r redactedGroupStats) GroupStatsAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
 	countFilters []string) ([]collections.GroupStats, bool) {
-	return r.db.GroupStatsAllAggs(groups, aggCols, countFilters)
+	if r.db.c.Chained() {
+		return nil, false // as DB.GroupStatsAllAggs
+	}
+	return r.db.c.GroupStatsAllAggsRedacted(groups, aggCols, countFilters)
+}
+
+// numStatsRedacted is NumStats for a caller not entitled to sealed values.
+func (db *DB) numStatsRedacted(constraint, attr string) (NumStats, bool) {
+	q, ok := numStatsQuery(constraint)
+	if !ok {
+		return NumStats{}, false
+	}
+	return db.c.NumStatsQueryRedacted(q, attr)
 }
 
 // The GroupValuesSource half of the same wrapper. It calls the collection's *Redacted entry points

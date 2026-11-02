@@ -2,6 +2,7 @@ package collections
 
 import (
 	"math/bits"
+	"slices"
 	"sort"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -250,11 +251,10 @@ func (c *Collection) GroupStatsConstraintAggs(constraint string, groups []GroupS
 
 // GroupStatsConstraintAggsRedacted is GroupStatsConstraintAggs for a reader NOT entitled to sealed
 // values: a record whose constraint the columns cannot decide is matched with no key, so a sealed
-// value is undefined to it. Group and aggregate values need nothing: a sealed one is never a column
-// and a cell holding one declines the whole query, which then goes back to the (keyless) scan.
-//
-// The match-all form, GroupStatsAllAggs, serves both readers as it is: it evaluates no constraint and
-// reads nothing but columns.
+// value is undefined to it. A sealed group or aggregate value is never a column, and a cell holding one
+// declines the whole query, which then goes back to the (keyless) scan; a group, aggregate or filter on
+// an attribute the policy names, or on a field whose computed values are not trusted, declines too
+// (see keylessHidesGroupAggs), since a column may hold its values from before it was sealed.
 func (c *Collection) GroupStatsConstraintAggsRedacted(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
 	countFilters []string) ([]GroupStats, bool) {
 	q, err := vm.Parse(constraint)
@@ -274,9 +274,10 @@ func (c *Collection) GroupStatsAllAggs(groups []GroupSpec, aggCols []GroupAggCol
 }
 
 // GroupStatsAllAggsRedacted is GroupStatsAllAggs for a reader NOT entitled to sealed values. It reads
-// only columns, which never hold a sealed value, so it answers as GroupStatsAllAggs does -- except on a
-// store that may hold a sealed attribute's values in the clear (see hidesClearSealed), where a group,
-// aggregate or filter naming one declines to the keyless scan.
+// only columns, which never hold a sealed value, so it answers as GroupStatsAllAggs does -- except where
+// the store may hold a sealed attribute's values in the clear (see hidesClearSealed): a group, aggregate
+// or filter naming one, or reading a field whose computed values are not trusted, declines to the
+// keyless scan.
 func (c *Collection) GroupStatsAllAggsRedacted(groups []GroupSpec, aggCols []GroupAggCol,
 	countFilters []string) ([]GroupStats, bool) {
 	attrs, filters := splitAggCols(aggCols)
@@ -287,16 +288,22 @@ func (c *Collection) GroupStatsAllAggsRedacted(groups []GroupSpec, aggCols []Gro
 }
 
 // keylessHidesGroupAggs reports whether a grouped aggregate reads, through a group column, an aggregate
-// argument or a filter, an attribute keylessHides withholds. A filter that does not parse is reported
-// as reading one: it is declined either way, and declining here keeps the answer in the scan.
+// argument or a filter, an attribute keylessHides withholds, or a field whose computed values are not
+// trusted (keylessComputedHides). A filter that does not parse is reported as reading one: it is
+// declined either way, and declining here keeps the answer in the scan.
 func (c *Collection) keylessHidesGroupAggs(groups []GroupSpec, aggAttrs, colFilters, countFilters []string) bool {
 	if !c.hidesClearSealed() {
 		return false
 	}
+	read := slices.Clone(aggAttrs)
 	for _, g := range groups {
 		if c.shouldEncrypt(g.Attr) {
 			return true
 		}
+		read = append(read, g.Attr)
+	}
+	if c.keylessComputedHides(nil, read...) {
+		return true
 	}
 	if c.keylessHidesAny(aggAttrs...) {
 		return true
@@ -307,7 +314,7 @@ func (c *Collection) keylessHidesGroupAggs(groups []GroupSpec, aggAttrs, colFilt
 				continue
 			}
 			fq, err := vm.Parse(f)
-			if err != nil || c.keylessQuery(fq) != fq {
+			if err != nil || c.keylessQuery(fq) != fq || c.keylessComputedHides(fq) {
 				return true
 			}
 		}
@@ -360,6 +367,9 @@ func (c *Collection) groupAccumQuery(q *vm.Query, groups []GroupSpec, aggAttrs, 
 			return nil, nil, nil, nil, false
 		}
 		q = c.keylessQuery(q)
+		if c.keylessComputedHides(q) {
+			return nil, false
+		}
 	}
 	groupIDs, buckets, aggIDs, ok := c.resolveGroupAttrs(st, groups, aggAttrs)
 	if !ok {

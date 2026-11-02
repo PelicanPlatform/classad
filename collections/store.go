@@ -633,6 +633,12 @@ type Collection struct {
 	// are always sealed regardless). Encrypted attributes are never indexed and never hot.
 	sealer   wire.Sealer
 	encAttrs atomic.Pointer[encSetHolder]
+	// sealGen counts the widenings of the explicit set (SetEncryptedAttrs adding a name), and
+	// sealCleanGen is the sealGen under which the store was last known to hold no value the policy
+	// names in the clear -- a clean seal migration, or a store that had no records when it opened --
+	// or -1 when it never was. See computedTrusted.
+	sealGen      atomic.Uint64
+	sealCleanGen atomic.Int64
 
 	// opm accumulates the collection-wide maintenance timings (compact/retrain/reindex/
 	// columnarize/rotate/merge) for OpStats; per-shard write/segment/sync timings live on
@@ -908,6 +914,7 @@ func New(opts Options) *Collection {
 	// Encryption at rest: build the DB-wide data-key sealer and the explicit encrypted-attr
 	// set. An encrypted attribute (explicit, or an always-encrypted private attribute) must
 	// not also be indexed -- its value is stored opaque, so it could never satisfy an index.
+	c.sealCleanGen.Store(-1)
 	// A data key that cannot seal is refused here, like any other misconfiguration New is
 	// handed (Open reports it as an error instead): see ErrInvalidDataKey.
 	sealer, err := newDataKeySealer(opts.DataKey)

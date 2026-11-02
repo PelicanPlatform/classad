@@ -1274,7 +1274,25 @@ deployment configured. The engine seals them at the *value* level (`encrypt.go`,
   decode with no key, so for a caller not entitled to secrets a sealed attribute reads
   as UNDEFINED. The secret is never opened only to be dropped later by a serializer.
 - **Migration.** `MigrateSealedAttrs` re-encodes legacy stores written before sealing
-  was mandatory, and writes `sealed-attrs.done` when finished.
+  was mandatory, and writes `sealed-attrs.done` when finished. The marker names the
+  policy (pass version and explicit set) the pass started under, so widening the set
+  makes the next pass run. A table runs it at open and on every `db.Maintain` pass
+  (one worker, stopping between shards on `StopMaintenance`), so values left in the
+  clear by a runtime widen are sealed on disk by the next maintenance pass.
+- **Runtime widen.** `SetEncryptedAttrs` seals new writes at once; records written
+  before keep a newly named attribute in the clear -- in their segments, and in the
+  columns of segments columnarized before -- until the migration rewrites them. From
+  the moment the set is installed every `*Redacted` read of a table or an archive
+  withholds every attribute the policy names *by name*, whatever its stored form: a
+  constraint is planned with those references replaced by `undefined`
+  (`vm.Query.Hiding`), a keyless lookup, decode, match or text render reads them as
+  `undefined`, a wire row drops them as it drops a sealed value, and the column tiers
+  decline any request that groups, aggregates, orders or filters on one. This is not
+  limited to while a migration is pending: once every value is sealed it changes no
+  answer. Computed column values (an expression cell's value kept beside the block) may
+  derive from a newly sealed attribute, so redacted column reads that touch a field with
+  computed values decline to the keyless scan until a clean migration (or a store that
+  opened empty) certifies the current policy.
 - **Archives.** A history archive opened through the `db` catalog resolves its own
   master key in its directory, from the catalog's pool keys, exactly as a table does, and
   seals the same attributes. Its runtime set is persisted in `archiveconfig.json`
@@ -1283,11 +1301,9 @@ deployment configured. The engine seals them at the *value* level (`encrypt.go`,
   joined the set, keep their values in the clear until maintenance rewrites their segment
   anyway. A merge, a dictionary retrain, interning and `Rewrite` re-encode records under
   the key and seal those values; columnarizing does not decode records, so it does not.
-  Until then the archive's `*Redacted` reads withhold every attribute the policy names
-  *by name*, whatever its stored form: a constraint is planned with those references
-  replaced by `undefined` (`vm.Query.Hiding`), a keyless lookup or decode reads them as
-  `undefined`, and the column, zone-map and index tiers decline any request that reads
-  one. New zone maps and columnar (base and group) schemas leave such attributes out.
+  Until then the archive's `*Redacted` reads withhold them by name, as above, and the
+  zone-map and index tiers decline any request that reads one. New zone maps and
+  columnar (base and group) schemas leave such attributes out.
   An attribute both sealed and indexed is refused, as for a table. An archive whose
   saved configuration indexes an attribute that is now sealed opens without that index.
 - **Rollback.** A build from before archives were sealed opens a sealed archive without

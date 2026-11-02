@@ -244,6 +244,10 @@ type matchScope struct {
 	ctx      wireCtx
 	job      *jobScope
 	fellBack bool
+	// hide, when set, names the slot attributes a keyless match reads as undefined whatever their
+	// stored form (Collection.keylessHides): the reject below reads slot wire directly rather than
+	// through ctx, so it applies the keyless context's withholding itself.
+	hide func(string) bool
 
 	// resolution caches, keyed by the reference name as it appears in the expression.
 	inline   bool                // collection uses inline names (no intern table)
@@ -329,6 +333,16 @@ func (ms *matchScope) resolveTarget(name string) classad.Value {
 // It mirrors Collection.wireLookup exactly (inline path unchanged: LookupByName
 // already compares case-insensitively without allocating).
 func (ms *matchScope) lookupTarget(name string) ([]byte, bool) {
+	if ms.hide != nil && ms.hide(name) {
+		if _, ok := ms.slotLookup(name); ok {
+			return undefinedNode, true // what a sealed value of it reads as: present, undefined
+		}
+		return nil, false
+	}
+	return ms.slotLookup(name)
+}
+
+func (ms *matchScope) slotLookup(name string) ([]byte, bool) {
 	if ms.inline {
 		return ms.slot.LookupByName(name)
 	}
@@ -435,6 +449,9 @@ func newMatchWorker(job *classad.ClassAd, c *Collection, jp *jobPlan, deferMat b
 	if jp.req != nil {
 		mw.jm = jp.req.Matcher()
 		mw.ms = &matchScope{ctx: mw.ctx, job: jp.vals, inline: c.inline, intern: c.intern}
+		if mw.keyless {
+			mw.ms.hide = c.keylessHides
+		}
 		if !jp.rankOpaque {
 			mw.closureSeeds = buildClosureSeeds(jp.rankRefs)
 			mw.rankRefs = jp.rankRefs

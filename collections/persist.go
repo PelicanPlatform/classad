@@ -421,6 +421,11 @@ func Open(opts Options) (*Collection, error) {
 	if err := c.persistOpenHorizons(); err != nil {
 		return nil, errors.Join(err, c.releaseLoadedSegments())
 	}
+	// A store that opens with no records holds no value in the clear that its policy names, so nothing
+	// columnarized from here on can derive from one until the policy is widened (see computedTrusted).
+	if c.storeHoldsNoRecords() {
+		c.sealCleanGen.Store(int64(c.sealGen.Load()))
+	}
 	// Every phase that walks records has run by now, so the walk count is final.
 	c.openIdxDiag.Timing.RecordsWalked = int(c.recWalked.Load())
 	// Emit the sidecar-adoption summary gathered during recovery (before the Reindex above

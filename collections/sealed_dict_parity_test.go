@@ -95,6 +95,14 @@ func sealedLayoutCounts(c *Collection) (inline, dict, columnar int) {
 // durable commit per record is most of the fixture's time.
 func sealedPut(t testing.TB, c *Collection, lo, hi int) {
 	t.Helper()
+	if at, ok := sealedWidenAt.Load(c); ok && lo <= at.(int) && at.(int) < hi {
+		// A widened layout (see openWidenedLayout): records below at are written before the policy
+		// seals the explicit set, the rest after.
+		sealedPut(t, c, lo, at.(int))
+		sealedWiden(t, c)
+		sealedPut(t, c, at.(int), hi)
+		return
+	}
 	tx := c.Begin()
 	for i := lo; i < hi; i++ {
 		tx.Put([]byte(fmt.Sprintf("%d.0", i)), mustAd(t, sealedParityAd(i, false)))
@@ -393,58 +401,63 @@ func TestSealedValueDictSegmentParity(t *testing.T) {
 	if !mmapSupported {
 		t.Skip("persistence is unix-only")
 	}
-	sources := map[bool][]*classad.ClassAd{false: sealedSources(t, false), true: sealedSources(t, true)}
-	hidden := map[bool][]*classad.ClassAd{false: sealedHiddenSources(t, false), true: sealedHiddenSources(t, true)}
 	for _, lay := range sealedLayouts {
 		t.Run(lay.name, func(t *testing.T) {
-			c := openSealedLayout(t, lay)
-			for _, parallel := range []bool{false, true} {
-				if parallel && !lay.every {
-					continue
-				}
-				if parallel {
-					c.parallelMinBytes = 0
-				} else {
-					c.parallelMinBytes = 1 << 62
-				}
-				for _, f := range sealedParityFilters {
-					q := mustParseQ(t, f)
-					want := sealedOracle(q, sources[lay.patched])
-					wantHidden := sealedOracle(q, hidden[lay.patched])
-					if len(want) == 0 || len(want) == sealedParityN {
-						t.Fatalf("%s: the oracle selects %d of %d records; the filter discriminates nothing",
-							f, len(want), sealedParityN)
-					}
-					for _, arm := range narrowBenchArms {
-						full := arm.narrow && arm.conjunct // the default configuration
-						if (parallel || !lay.every) && !full {
-							continue // see sealedLayout.every
-						}
-						restore := arm.set()
-						sealedCheckReads(t, c, f, fmt.Sprintf("%s parallel=%v", arm.name, parallel), q, want,
-							wantHidden, lay.patched, full)
-						restore()
-					}
-				}
-			}
-			if t.Failed() {
-				return
-			}
-			for i := 0; i < sealedParityN; i++ {
-				key := []byte(fmt.Sprintf("%d.0", i))
-				for _, redact := range []bool{false, true} {
-					get := c.Get
-					if redact {
-						get = c.GetRedacted
-					}
-					ad, ok := get(key)
-					if !ok {
-						t.Fatalf("Get(%s) redact=%v: missing", key, redact)
-					}
-					checkSealedRow(t, fmt.Sprintf("Get redact=%v", redact), adRow(ad), redact, lay.patched)
-				}
-			}
+			sealedCheckLayout(t, openSealedLayout(t, lay), lay)
 		})
+	}
+}
+
+// sealedCheckLayout runs every read of every parity filter over c, laid out as lay, and every point read
+// of every record, against the oracle.
+func sealedCheckLayout(t *testing.T, c *Collection, lay sealedLayout) {
+	t.Helper()
+	sources, hidden := sealedSources(t, lay.patched), sealedHiddenSources(t, lay.patched)
+	for _, parallel := range []bool{false, true} {
+		if parallel && !lay.every {
+			continue
+		}
+		if parallel {
+			c.parallelMinBytes = 0
+		} else {
+			c.parallelMinBytes = 1 << 62
+		}
+		for _, f := range sealedParityFilters {
+			q := mustParseQ(t, f)
+			want := sealedOracle(q, sources)
+			wantHidden := sealedOracle(q, hidden)
+			if len(want) == 0 || len(want) == sealedParityN {
+				t.Fatalf("%s: the oracle selects %d of %d records; the filter discriminates nothing",
+					f, len(want), sealedParityN)
+			}
+			for _, arm := range narrowBenchArms {
+				full := arm.narrow && arm.conjunct // the default configuration
+				if (parallel || !lay.every) && !full {
+					continue // see sealedLayout.every
+				}
+				restore := arm.set()
+				sealedCheckReads(t, c, f, fmt.Sprintf("%s parallel=%v", arm.name, parallel), q, want,
+					wantHidden, lay.patched, full)
+				restore()
+			}
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	for i := 0; i < sealedParityN; i++ {
+		key := []byte(fmt.Sprintf("%d.0", i))
+		for _, redact := range []bool{false, true} {
+			get := c.Get
+			if redact {
+				get = c.GetRedacted
+			}
+			ad, ok := get(key)
+			if !ok {
+				t.Fatalf("Get(%s) redact=%v: missing", key, redact)
+			}
+			checkSealedRow(t, fmt.Sprintf("Get redact=%v", redact), adRow(ad), redact, lay.patched)
+		}
 	}
 }
 

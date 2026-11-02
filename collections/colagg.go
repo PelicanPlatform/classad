@@ -72,10 +72,11 @@ type NumStats struct {
 // attribute's values in the clear (see hidesClearSealed), where aggregating one declines to the keyless
 // scan and the constraint is planned as that reader evaluates it (keylessQuery).
 func (c *Collection) NumStatsQueryRedacted(q *vm.Query, attr string) (NumStats, bool) {
-	if c.keylessHides(attr) {
+	q = c.keylessQuery(q)
+	if c.keylessHides(attr) || c.keylessComputedHides(q, attr) {
 		return NumStats{}, false
 	}
-	return c.NumStatsQuery(c.keylessQuery(q), attr)
+	return c.NumStatsQuery(q, attr)
 }
 
 // NumStatsQuery computes the numeric aggregate inputs for attr over the records matching q, using

@@ -479,6 +479,16 @@ func (db *DB) Maintain(opts MaintainOptions) {
 	if db.c.MaintenanceStopping() {
 		return // asked to stop: do not start the steps that follow, which are the expensive ones
 	}
+	// A runtime widen of the sealing policy (SetEncryptedAttrs) seals new writes only; the records
+	// written before it hold the newly named attributes in the clear, on disk, until a migration
+	// rewrites them. Unprivileged reads withhold those values by name meanwhile, so this is about the
+	// bytes at rest, and it runs here rather than only at the next open so they do not linger for the
+	// life of the process. On a store with nothing to migrate it is one read of the marker. One worker:
+	// each holds a rewritten segment in memory, and the pass yields to StopMaintenance between shards.
+	db.c.MigrateSealedAttrs(1)
+	if db.c.MaintenanceStopping() {
+		return
+	}
 	if opts.HotTopN > 0 {
 		// Through the DB wrapper, not the collection: the pass's refresh has to be persisted
 		// with its provenance, like the archive pass's is. Called on the collection directly
@@ -900,9 +910,10 @@ func (db *DB) RefreshHotSet(sampleMax, topN int) int {
 // human-toggled set; private attributes are always encrypted). It errors if encryption
 // is disabled or a named attribute is indexed. The policy is persisted so it survives a
 // restart and, in HA, lets a follower converge on reload. New writes seal the new set;
-// existing records are sealed by the migration the next open runs (see
-// collections.MigrateSealedAttrs) -- compaction copies stored values as they are. The
-// named attributes' values must not refer to other attributes (see Config.EncryptedAttrs).
+// existing records are sealed by the migration the next maintenance pass or open runs (see
+// collections.MigrateSealedAttrs) -- compaction copies stored values as they are. Until then
+// unprivileged reads withhold every attribute the set names, whatever form it is stored in.
+// The named attributes' values must not refer to other attributes (see Config.EncryptedAttrs).
 func (db *DB) SetEncryptedAttrs(attrs []string) error {
 	if err := db.c.SetEncryptedAttrs(attrs); err != nil {
 		return err

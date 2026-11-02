@@ -165,15 +165,23 @@ func foldedHas[T string | []byte](set map[string]struct{}, name T) bool {
 //
 // Sealing is applied when a record is encoded, so a record written before an attribute was sealed --
 // before the store had a key at all, or before the attribute joined EncryptedAttrs -- still holds its
-// value in the clear. A mutable table rewrites such records when it opens (MigrateSealedAttrs), so by
-// the time it serves a read every value the policy names is sealed and the keyless decode alone keeps
-// it from an unentitled reader. An append-only store does not: rewriting a history to seal it is a
-// rewrite of the whole history, so its legacy records are resealed only when maintenance rewrites
-// them anyway (a merge, a retrain, interning). Until then the keyless decode would serve them, so its
-// keyless reads also treat every attribute the policy names as sealed, whatever form it is stored in.
+// value in the clear. Every store can hold such records. An append-only store reseals its legacy
+// records only when maintenance rewrites them anyway (a merge, a retrain, interning), since sealing a
+// history in place is a rewrite of the whole history. A mutable table rewrites them when it opens
+// (MigrateSealedAttrs), but its explicit set can be widened while it is open (SetEncryptedAttrs), and
+// from then until the next migration its earlier records hold the newly named attribute in the clear
+// -- in their segments, and in the columns of any segment columnarized before the widen. The keyless
+// decode would serve those values, so every keyless read also treats each attribute the policy names
+// as sealed, whatever form it is stored in.
+//
+// It is not narrowed to "while a migration is pending". Once every value the policy names is sealed,
+// withholding by name changes no answer -- a sealed value reads as undefined to this reader anyway, and
+// no column, zone map or index is ever built over a sealed attribute -- so the only thing a pending
+// flag would buy is a per-read saving the withholding does not measurably cost, against a flag that has
+// to be exactly right across a widen, a migration racing commits, and a crash between them.
 //
 // An in-memory store never seals (see SealsValues), so it withholds nothing here either.
-func (c *Collection) hidesClearSealed() bool { return c.appendOnly() && c.SealsValues() }
+func (c *Collection) hidesClearSealed() bool { return c.SealsValues() }
 
 // keylessHides reports whether a read not entitled to sealed values must read name as undefined
 // whatever its stored form (see hidesClearSealed).
@@ -290,7 +298,9 @@ func (c *Collection) EncryptedAttrNames() []string {
 // Options.EncryptedAttrs.
 // New records use the new set immediately; existing records keep their prior form until
 // MigrateSealedAttrs rewrites them. Compaction does not: it copies stored values as they are.
-// The migration's marker records the set it ran under, so the next open after a change runs it.
+// The migration's marker records the set it ran under, so the next pass after a change runs it.
+// Reads not entitled to sealed values withhold every attribute the set names from the moment it
+// is installed, whatever form a record stores it in (see hidesClearSealed).
 func (c *Collection) SetEncryptedAttrs(attrs []string) error {
 	if c.sealer == nil {
 		return errEncryptionDisabled
@@ -298,6 +308,118 @@ func (c *Collection) SetEncryptedAttrs(attrs []string) error {
 	if err := c.checkNotIndexed(attrs); err != nil {
 		return err
 	}
-	c.encAttrs.Store(&encSetHolder{set: foldedSet(attrs)})
+	next := foldedSet(attrs)
+	prev := c.encryptedAttrs()
+	c.encAttrs.Store(&encSetHolder{set: next})
+	for name := range next {
+		if _, had := prev[name]; !had {
+			// Widened: records written before now may hold this attribute in the clear, and a
+			// computed value derived from it. Bumped after the store, so a reader that sees the new
+			// generation also sees the set that caused it.
+			c.sealGen.Add(1)
+			break
+		}
+	}
 	return nil
+}
+
+// computedTrusted reports whether every computed value kept beside a column (colcomputed.go) is known
+// to derive from no attribute the sealing policy now names.
+//
+// A computed value is a function of the attributes its expression reads, and is computed only from
+// attributes that are not sealed when the segment is columnarized. Widening the policy afterwards does
+// not touch it: MemDouble = RequestMemory * 2, computed while RequestMemory was in the clear, is still a
+// function of RequestMemory's plaintext once RequestMemory is sealed. Such a value lives only in a
+// segment whose records still hold that plaintext, so a seal migration that leaves nothing in the clear
+// also leaves no such value -- it rewrites those segments, columns and all. Which computed values a
+// widen made suspect cannot be told from the values themselves, so until then none is trusted for a
+// reader not entitled to sealed values (see keylessComputedHides).
+func (c *Collection) computedTrusted() bool {
+	return !c.SealsValues() || c.sealCleanGen.Load() == int64(c.sealGen.Load())
+}
+
+// keylessComputedHides reports whether a read not entitled to sealed values must not be answered from
+// the columns because it reads -- through names, or through q's constraint -- a field some segment
+// keeps computed values for, while those are not trusted (see computedTrusted). The read then declines
+// to the keyless scan, which evaluates the expression in the record with the sealed attributes read as
+// undefined. A constraint whose reads are not statically known (eval) is taken to read every field.
+func (c *Collection) keylessComputedHides(q *vm.Query, names ...string) bool {
+	if c.computedTrusted() || c.intern == nil {
+		return false
+	}
+	fields := c.computedFieldIDs()
+	if len(fields) == 0 {
+		return false
+	}
+	has := func(name string) bool {
+		id, ok := c.intern.LookupID(name)
+		if !ok {
+			return false
+		}
+		_, computed := fields[id]
+		return computed
+	}
+	for _, n := range names {
+		if has(n) {
+			return true
+		}
+	}
+	if q != nil {
+		rp := q.ReadPlan()
+		if !rp.PartialSafe {
+			return true
+		}
+		for _, n := range rp.Seeds {
+			if has(n) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// computedFieldIDs returns the ids of every schema field some columnarized segment keeps computed values
+// for.
+func (c *Collection) computedFieldIDs() map[uint32]struct{} {
+	var out map[uint32]struct{}
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg == nil {
+				continue
+			}
+			cs := seg.colblk.Load()
+			if cs == nil {
+				continue
+			}
+			for _, b := range cs.blocks {
+				for _, e := range b.computed {
+					if b.schema == nil || e.idx >= len(b.schema.fields) {
+						continue
+					}
+					if out == nil {
+						out = map[uint32]struct{}{}
+					}
+					out[b.schema.fields[e.idx].id] = struct{}{}
+				}
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return out
+}
+
+// storeHoldsNoRecords reports whether no segment of the store holds a record.
+func (c *Collection) storeHoldsNoRecords() bool {
+	for _, sh := range c.shards {
+		sh.mu.RLock()
+		for _, seg := range sh.segs {
+			if seg != nil && seg.used > 0 {
+				sh.mu.RUnlock()
+				return false
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return true
 }

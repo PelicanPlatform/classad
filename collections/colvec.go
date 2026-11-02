@@ -392,6 +392,12 @@ func (c *Collection) VectorEvalCount(q *vm.Query) (int, bool) {
 }
 
 func (c *Collection) vectorEvalCountAs(q *vm.Query, redact bool) (int, bool) {
+	if redact {
+		q = c.keylessQuery(q) // a column of a sealed attribute's clear values is not this reader's to count on
+		if c.keylessComputedHides(q) {
+			return 0, false
+		}
+	}
 	st := c.schemaScan.Load()
 	if st == nil || c.intern == nil || q == nil || !q.Native() {
 		return 0, false

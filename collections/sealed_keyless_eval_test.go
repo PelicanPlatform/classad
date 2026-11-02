@@ -90,21 +90,34 @@ func sealedCheckKeyless(t *testing.T, c *Collection, lbl func(string) string, q 
 		}
 	}
 
-	// The column statistics take no entitlement: they read only columns and decline any cell they
-	// cannot read as a literal, a sealed one included. So whenever they answer, the answer must be the
-	// keyless reader's as well as the entitled one's (which TestSealedValueDictSegmentParity checks).
-	if ns, ok := c.NumStatsQuery(q, "RequestMemory"); ok && (ns.N != len(wantHidden) || ns.IntSum != memSum) {
-		t.Errorf("%s(RequestMemory) = n %d sum %d, want n %d sum %d (keyless)", lbl("NumStatsQuery"),
+	// The column statistics read only columns and decline any cell they cannot read as a literal, a
+	// sealed one included; the redacted forms also decline an attribute the policy seals, whose clear
+	// values a column built before it was sealed may hold. Whenever they answer, the answer must be
+	// the keyless reader's.
+	if ns, ok := c.NumStatsQueryRedacted(q, "RequestMemory"); ok && (ns.N != len(wantHidden) || ns.IntSum != memSum) {
+		t.Errorf("%s(RequestMemory) = n %d sum %d, want n %d sum %d (keyless)", lbl("NumStatsQueryRedacted"),
 			ns.N, ns.IntSum, len(wantHidden), memSum)
 	}
-	if ns, ok := c.NumStatsQuery(q, "SealedNum"); ok && ns.N != 0 {
-		t.Errorf("%s(SealedNum) answered from %d sealed values", lbl("NumStatsQuery"), ns.N)
+	if ns, ok := c.NumStatsQueryRedacted(q, "SealedNum"); ok && ns.N != 0 {
+		t.Errorf("%s(SealedNum) answered from %d sealed values", lbl("NumStatsQueryRedacted"), ns.N)
 	}
-	if _, seen, ok := c.TopKOrderThreshold(q, "RequestMemory", true, 5, nil); ok && seen != len(wantHidden) {
-		t.Errorf("%s(RequestMemory): seen %d, want %d (keyless)", lbl("TopKOrderThreshold"), seen, len(wantHidden))
+	if _, seen, ok := c.TopKOrderThresholdRedacted(q, "RequestMemory", true, 5, nil); ok && seen != len(wantHidden) {
+		t.Errorf("%s(RequestMemory): seen %d, want %d (keyless)", lbl("TopKOrderThresholdRedacted"), seen, len(wantHidden))
 	}
-	if _, seen, ok := c.TopKOrderThreshold(q, "SealedNum", true, 5, nil); ok && seen != 0 {
-		t.Errorf("%s(SealedNum): ordered %d sealed values", lbl("TopKOrderThreshold"), seen)
+	if _, seen, ok := c.TopKOrderThresholdRedacted(q, "SealedNum", true, 5, nil); ok && seen != 0 {
+		t.Errorf("%s(SealedNum): ordered %d sealed values", lbl("TopKOrderThresholdRedacted"), seen)
+	}
+	for _, g := range [][]GroupSpec{{{Attr: "JobStatus"}}, {{Attr: "SealedNum"}}} {
+		if gs, ok := c.GroupStatsAllAggsRedacted(g, []GroupAggCol{{Attr: "SealedNum"}}, nil); ok {
+			for _, s := range gs {
+				if len(s.Stats) > 0 && s.Stats[0].N != 0 {
+					t.Errorf("%s by %s aggregated %d sealed values", lbl("GroupStatsAllAggsRedacted"), g[0].Attr, s.Stats[0].N)
+				}
+			}
+			if g[0].Attr == "SealedNum" && len(gs) > 1 {
+				t.Errorf("%s by SealedNum produced %d groups", lbl("GroupStatsAllAggsRedacted"), len(gs))
+			}
+		}
 	}
 
 	// The key scans behind KeysWhere/DeleteWhere, and a redacted transaction's query.

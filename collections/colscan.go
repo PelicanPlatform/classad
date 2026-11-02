@@ -848,9 +848,11 @@ func (c *Collection) CountQuery(q *vm.Query) (int, bool) {
 }
 
 // CountQueryRedacted is CountQuery for a reader NOT entitled to sealed values: a sealed value counts as
-// undefined. The column tiers need nothing for it -- a sealed value is never a column, and every one of
-// them declines a cell it cannot read as a literal -- so only the per-record fallback the vectorized
-// tier hands such a cell to is keyless.
+// undefined. A sealed value is never a column, and every column tier declines a cell it cannot read as
+// a literal, so the per-record fallback the vectorized tier hands such a cell to is keyless. A column
+// can hold an attribute's values from before the policy sealed it, so the constraint is planned with
+// every attribute the policy names read as undefined (keylessQuery), and a constraint on a field whose
+// computed values are not trusted declines (keylessComputedHides).
 func (c *Collection) CountQueryRedacted(q *vm.Query) (int, bool) {
 	return c.countQueryAs(q, true)
 }
@@ -858,6 +860,9 @@ func (c *Collection) CountQueryRedacted(q *vm.Query) (int, bool) {
 func (c *Collection) countQueryAs(q *vm.Query, redact bool) (int, bool) {
 	if redact {
 		q = c.keylessQuery(q) // a column of a sealed attribute's clear values is not this reader's to count on
+		if c.keylessComputedHides(q) {
+			return 0, false
+		}
 	}
 	st := c.schemaScan.Load()
 	if st == nil {
