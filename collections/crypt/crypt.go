@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 )
 
 const (
@@ -123,26 +124,102 @@ func WrapDEK(dek, key []byte) (nonce, wrapped []byte, err error) { return Seal(k
 func UnwrapDEK(key, nonce, wrapped []byte) ([]byte, error) { return Open(key, nonce, wrapped) }
 
 // Seal encrypts plaintext with AES-256-GCM under key, returning a fresh nonce and the
-// ciphertext (with the GCM tag appended).
+// ciphertext (with the GCM tag appended). It builds the cipher for this one call; a caller
+// sealing repeatedly under one key should hold an AEAD instead.
 func Seal(key, plaintext []byte) (nonce, ciphertext []byte, err error) {
 	g, err := newGCM(key)
 	if err != nil {
 		return nil, nil, err
 	}
-	nonce, err = randBytes(nonceSize)
-	if err != nil {
-		return nil, nil, err
-	}
-	return nonce, g.Seal(nil, nonce, plaintext, nil), nil
+	return sealWith(g, plaintext)
 }
 
 // Open decrypts a Seal result, verifying the GCM tag (returns an error on tampering or a
-// wrong key).
+// wrong key). Like Seal it builds the cipher for this one call.
 func Open(key, nonce, ciphertext []byte) ([]byte, error) {
 	g, err := newGCM(key)
 	if err != nil {
 		return nil, err
 	}
+	return openWith(g, nonce, ciphertext)
+}
+
+// AEAD is AES-256-GCM bound to one key: Seal and Open with the same results and the same
+// format as the package-level Seal and Open under that key, without rebuilding the cipher on
+// every call. Building it -- the AES key schedule and the GHASH table -- costs more than sealing
+// a short value, and a store seals or opens every encrypted attribute of every record it
+// writes or reads.
+//
+// An AEAD holds its own copy of the key it was built with and never uses any other, and there is
+// no cache shared between AEADs: a holder whose key changes builds a new AEAD, and the old one
+// cannot be handed back for the new key.
+//
+// It is safe for concurrent use. crypto/cipher does not document whether a cipher.AEAD may be
+// shared between goroutines -- only the counter-nonce GCM variants document that they may not --
+// and although the AES-GCM implementation in the Go 1.26 standard library keeps no per-call state
+// in the cipher (Seal and Open read the key schedule and GHASH table and work on stack locals),
+// that is not a promise a later release must keep. So no cipher is shared: each call takes one
+// from a pool and returns it after, and a cipher the garbage collector drops from the pool is
+// rebuilt from the key on demand.
+type AEAD struct {
+	key  []byte
+	pool sync.Pool // of cipher.AEAD
+}
+
+// NewAEAD returns an AEAD for key, which must be KeySize bytes (any AES key size is accepted, as
+// by Seal). The key is copied.
+func NewAEAD(key []byte) (*AEAD, error) {
+	g, err := newGCM(key)
+	if err != nil {
+		return nil, err
+	}
+	a := &AEAD{key: append([]byte(nil), key...)}
+	a.pool.Put(g)
+	return a, nil
+}
+
+func (a *AEAD) get() (cipher.AEAD, error) {
+	if g, ok := a.pool.Get().(cipher.AEAD); ok {
+		return g, nil
+	}
+	return newGCM(a.key)
+}
+
+// Seal is the package-level Seal under a's key.
+func (a *AEAD) Seal(plaintext []byte) (nonce, ciphertext []byte, err error) {
+	g, err := a.get()
+	if err != nil {
+		return nil, nil, err
+	}
+	nonce, ciphertext, err = sealWith(g, plaintext)
+	a.pool.Put(g)
+	return nonce, ciphertext, err
+}
+
+// Open is the package-level Open under a's key.
+func (a *AEAD) Open(nonce, ciphertext []byte) ([]byte, error) {
+	g, err := a.get()
+	if err != nil {
+		return nil, err
+	}
+	pt, err := openWith(g, nonce, ciphertext)
+	a.pool.Put(g)
+	return pt, err
+}
+
+// sealWith seals plaintext under g with a fresh random nonce. The nonce and the ciphertext share
+// one allocation; the nonce is capped at its length so appending to it cannot overwrite the
+// ciphertext.
+func sealWith(g cipher.AEAD, plaintext []byte) (nonce, ciphertext []byte, err error) {
+	buf := make([]byte, nonceSize, nonceSize+len(plaintext)+g.Overhead())
+	if _, err = io.ReadFull(rand.Reader, buf); err != nil {
+		return nil, nil, err
+	}
+	nonce = buf[:nonceSize:nonceSize]
+	return nonce, g.Seal(buf[nonceSize:nonceSize], nonce, plaintext, nil), nil
+}
+
+func openWith(g cipher.AEAD, nonce, ciphertext []byte) ([]byte, error) {
 	if len(nonce) != g.NonceSize() {
 		return nil, fmt.Errorf("crypt: bad nonce size %d", len(nonce))
 	}

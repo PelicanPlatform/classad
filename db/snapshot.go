@@ -80,6 +80,7 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 	}
 
 	var snapKey []byte
+	var snapAEAD *crypt.AEAD // snapKey's cipher, built once for every frame it seals
 	if enc.protected() {
 		// Embed the master envelope, then a fresh snapshot key wrapped by the backup key.
 		rowsJSON, err := json.Marshal(enc.rows)
@@ -90,6 +91,9 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 			return nil, err
 		}
 		if snapKey, err = crypt.NewDEK(); err != nil {
+			return nil, err
+		}
+		if snapAEAD, err = crypt.NewAEAD(snapKey); err != nil {
 			return nil, err
 		}
 		nonce, wrapped, err := crypt.Seal(enc.backupKey, snapKey)
@@ -114,8 +118,8 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 		}
 		comp := snapZW.EncodeAll(batch, nil)
 		payload := comp
-		if snapKey != nil {
-			nonce, ct, err := crypt.Seal(snapKey, comp)
+		if snapAEAD != nil {
+			nonce, ct, err := snapAEAD.Seal(comp)
 			if err != nil {
 				return err
 			}
@@ -236,7 +240,7 @@ func (db *DB) restoreFrom(br *bufio.Reader, keys SnapshotKeys) error {
 	}
 	encrypted := flags&snapFlagEncrypted != 0
 
-	var snapKey []byte
+	var snapAEAD *crypt.AEAD // the snapshot key's cipher, built once for every frame it opens
 	if encrypted {
 		// Read the whole key header (envelope rows, then the backup-key-wrapped snapshot
 		// key), then resolve the snapshot key from whichever key level was supplied.
@@ -252,8 +256,14 @@ func (db *DB) restoreFrom(br *bufio.Reader, keys SnapshotKeys) error {
 		if err != nil {
 			return err
 		}
-		if snapKey, err = db.deriveSnapKey(keys, rowsJSON, nonce, wrapped); err != nil {
+		snapKey, err := db.deriveSnapKey(keys, rowsJSON, nonce, wrapped)
+		if err != nil {
 			return err
+		}
+		// Built before the store is emptied, so a snapshot key AES cannot use (a caller-supplied
+		// SnapshotKey of the wrong length) fails the restore with the store intact.
+		if snapAEAD, err = crypt.NewAEAD(snapKey); err != nil {
+			return fmt.Errorf("db: snapshot key: %w", err)
 		}
 	}
 
@@ -279,7 +289,7 @@ func (db *DB) restoreFrom(br *bufio.Reader, keys SnapshotKeys) error {
 			}
 			nl := int(payload[0])
 			nonce, ct := payload[1:1+nl], payload[1+nl:]
-			if comp, err = crypt.Open(snapKey, nonce, ct); err != nil {
+			if comp, err = snapAEAD.Open(nonce, ct); err != nil {
 				return fmt.Errorf("db: decrypting snapshot frame: %w", err)
 			}
 		}

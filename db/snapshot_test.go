@@ -230,6 +230,54 @@ func TestSnapshotKeyLevels(t *testing.T) {
 	}
 }
 
+// TestSnapshotKeyMultiFrame: a snapshot whose body spans several frames, all sealed under one snapshot
+// key, restores in full; and a snapshot key AES cannot use fails the restore before the destination is
+// emptied, leaving its own ads in place.
+func TestSnapshotKeyMultiFrame(t *testing.T) {
+	src, err := OpenConfig(Config{Dir: t.TempDir(), PoolKeys: []KEK{poolKey("SRC")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 3*snapBatchAds + 17
+	fill(t, src, "m", n)
+	var snap bytes.Buffer
+	snapKey, err := src.SnapshotWithKey(&snap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	src.Close()
+
+	dst, err := OpenConfig(Config{Dir: t.TempDir(), PoolKeys: []KEK{poolKey("DST")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dst.Close()
+	fill(t, dst, "own", 5)
+	if err := dst.RestoreWith(bytes.NewReader(snap.Bytes()), SnapshotKeys{SnapshotKey: snapKey[:7]}); err == nil {
+		t.Fatal("restore with a 7-byte snapshot key succeeded")
+	}
+	if dst.Len() != 5 {
+		t.Fatalf("after a refused restore Len = %d, want the destination's own 5", dst.Len())
+	}
+
+	if err := dst.RestoreWith(bytes.NewReader(snap.Bytes()), SnapshotKeys{SnapshotKey: snapKey}); err != nil {
+		t.Fatal(err)
+	}
+	if dst.Len() != n {
+		t.Fatalf("restored Len = %d, want %d", dst.Len(), n)
+	}
+	for _, i := range []int{0, snapBatchAds, n - 1} {
+		key := fmt.Sprintf("m%d", i)
+		ad, ok := dst.LookupClassAd(key)
+		if !ok {
+			t.Fatalf("%s missing after restore", key)
+		}
+		if v, _ := ad.EvaluateAttrString("ClaimId"); v != fmt.Sprintf("secret-m-%d", i) {
+			t.Errorf("%s: ClaimId = %q", key, v)
+		}
+	}
+}
+
 // TestSnapshotPlaintext verifies snapshot/restore also work with encryption disabled.
 func TestSnapshotPlaintext(t *testing.T) {
 	db, err := Open(t.TempDir())

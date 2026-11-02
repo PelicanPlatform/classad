@@ -40,9 +40,9 @@ const wirePrefixBytes = 3 << 10
 // An encrypted collection used to be excluded here too, on the grounds that the Sealer contract is
 // single-goroutine per pass. That is not the contract wire.Sealer states, and it is not what the code
 // does: the parallel QUERY path already opens sealed values from its workers (parallel_scan.go), and the
-// only implementation, dataKeySealer, builds a fresh GCM per call over an immutable key with a
-// crypto/rand nonce -- no shared mutable state. Excluding encrypted stores cost them parallel wire scans
-// for a constraint that was never true.
+// only implementation, dataKeySealer, is safe for concurrent use (crypt.AEAD gives each call its own
+// cipher, with a crypto/rand nonce). Excluding encrypted stores cost them parallel wire scans for a
+// constraint that was never true.
 func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yield func([]byte) bool) bool {
 	tasks, totalBytes, release := c.gatherTasks()
 	W := 0
