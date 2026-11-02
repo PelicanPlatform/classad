@@ -758,3 +758,61 @@ func TestWidenDuringMigrationIsNotCertified(t *testing.T) {
 		t.Error("a clean pass under the current policy did not certify it")
 	}
 }
+
+// TestWidenMigrationSealFailureIsNotCertified: the migration maintenance runs after a widen re-seals
+// each record that holds a newly named attribute in the clear. When those seals fail the pass rewrites
+// nothing, so the store still holds that plaintext: it must neither write a marker for the widened
+// policy nor certify the store (computed values derived from the plaintext stay untrusted), unentitled
+// reads must keep withholding the attribute, and no record may be lost. Once sealing works the next
+// pass seals what is left and certifies the store.
+func TestWidenMigrationSealFailureIsNotCertified(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	opts := sealedParityOpts(t.TempDir())
+	opts.EncryptedAttrs = nil
+	c, err := Open(opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	sealedPut(t, c, 0, sealedParityN)
+	sealedWiden(t, c)
+	before := visibleUnsealed(t, c)
+	if before == 0 {
+		t.Fatal("fixture: nothing is in the clear under the widened policy; the pass has nothing to do")
+	}
+	withheld := mustParseQ(t, `Owner =!= undefined`)
+	fs := injectSealFailure(c)
+	if got := c.MigrateSealedAttrs(1); got != 0 {
+		t.Errorf("MigrateSealedAttrs rewrote %d segments while every Seal failed", got)
+	}
+	if c.sealMigrationDone() {
+		t.Error("the marker certifies a policy no record could be sealed under")
+	}
+	if c.computedTrusted() {
+		t.Error("the store is certified clean while it still holds newly sealed values in the clear")
+	}
+	if n := visibleUnsealed(t, c); n != before {
+		t.Errorf("%d records hold a newly sealed value in the clear after the failed pass, want the %d before it", n, before)
+	}
+	if n := c.Len(); n != sealedParityN {
+		t.Errorf("the failed pass left %d records, want %d", n, sealedParityN)
+	}
+	if n := countSeq(c.QueryRedacted(withheld)); n != 0 {
+		t.Errorf("after the failed pass an unentitled read sees Owner in %d records", n)
+	}
+	fs.failing.Store(false)
+	if c.MigrateSealedAttrs(1) == 0 {
+		t.Fatal("the pass after sealing recovered rewrote nothing")
+	}
+	if n := visibleUnsealed(t, c); n != 0 {
+		t.Fatalf("%d records still hold a value the policy names in the clear", n)
+	}
+	if !c.sealMigrationDone() || !c.computedTrusted() {
+		t.Error("a clean pass under the current policy did not certify it")
+	}
+	if n := c.Len(); n != sealedParityN {
+		t.Errorf("the migration left %d records, want %d", n, sealedParityN)
+	}
+}
