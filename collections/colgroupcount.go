@@ -368,7 +368,7 @@ func (c *Collection) groupAccumQuery(q *vm.Query, groups []GroupSpec, aggAttrs, 
 		}
 		q = c.keylessQuery(q)
 		if c.keylessComputedHides(q) {
-			return nil, false
+			return nil, nil, nil, nil, false
 		}
 	}
 	groupIDs, buckets, aggIDs, ok := c.resolveGroupAttrs(st, groups, aggAttrs)
