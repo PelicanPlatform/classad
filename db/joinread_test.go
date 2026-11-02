@@ -283,26 +283,114 @@ func hasProjAttr(list []string, want string) bool {
 	return false
 }
 
-// TestWhereReadsOnlyTheProjectedRow pins a sharp edge that is older than the read
-// projection and is not changed by it: emit builds the joined row THROUGH the output
-// projection and only then applies the residual WHERE, so a WHERE term naming an attribute
-// the output does not carry reads UNDEFINED and the join yields nothing at all.
-//
-// Recorded as behaviour rather than fixed here, because changing when the filter runs
-// changes what a join means and belongs with the caller that plans one. The read projection
-// carries the WHERE's references anyway, so that order is free to change without this
-// having to change with it.
-func TestWhereReadsOnlyTheProjectedRow(t *testing.T) {
+// TestWhereReadsTheSidesNotTheProjectedRow is the fix for a silently wrong answer: a WHERE
+// term naming an attribute the OUTPUT projection does not carry used to read UNDEFINED and
+// match nothing, because emit built the row through the projection and filtered afterwards.
+// A WHERE is not a projection, and the two have no reason to be the same list.
+func TestWhereReadsTheSidesNotTheProjectedRow(t *testing.T) {
 	cat := readJoinFixture(t)
 	spec := readProjectionSpecs()["plain equi"] // right side projects NumShadowStarts only
 	spec.Post = []string{"e.MemoryUsage > 1000"}
 
-	if got := joinRowTexts(t, cat, spec); len(got) != 0 {
-		t.Fatalf("a WHERE over an unprojected attribute yielded %d rows; it reads undefined", len(got))
+	got := joinRowTexts(t, cat, spec)
+	if len(got) == 0 {
+		t.Fatal("a WHERE over an unprojected attribute matched nothing; it must read the side as read")
 	}
-	// Carrying the attribute is what makes the same filter work.
-	spec.Right.Project = []string{"NumShadowStarts", "MemoryUsage"}
+	// MemoryUsage is 900/1100/1300 per job, so exactly two of the three attempts survive,
+	// and the filter is doing work rather than passing everything.
+	if want := 24 * 2; len(got) != want {
+		t.Fatalf("got %d rows, want %d", len(got), want)
+	}
+	// The output still carries only what was projected: filtering on an attribute does not
+	// smuggle it into the result.
+	for _, row := range got {
+		if strings.Contains(row, "MemoryUsage") {
+			t.Fatalf("the filtered attribute leaked into the output row: %s", row)
+		}
+	}
+}
+
+// TestWhereOnAnUnprojectedAttributeMatchesTheWholeReadPath pins that the fix is in the
+// FILTER, not in the read: the same query answers the same whether the sides were narrowed
+// or read whole.
+func TestWhereOnAnUnprojectedAttributeMatchesTheWholeReadPath(t *testing.T) {
+	cat := readJoinFixture(t)
+	spec := readProjectionSpecs()["plain equi"]
+	spec.Post = []string{"e.MemoryUsage > 1000"}
+
+	narrow := joinRowTexts(t, cat, spec)
+	withWholeRead(t)
+	whole := joinRowTexts(t, cat, spec)
+	if len(narrow) != len(whole) {
+		t.Fatalf("narrowed read gave %d rows, whole read gave %d", len(narrow), len(whole))
+	}
+	for i := range narrow {
+		if narrow[i] != whole[i] {
+			t.Fatalf("row %d differs\n narrow: %s\n whole:  %s", i, narrow[i], whole[i])
+		}
+	}
+}
+
+// TestLeftJoinWhereDropsRatherThanNullExtends: a LEFT row whose pair MATCHED and was then
+// dropped by WHERE must stay dropped, not come back null-extended. Now that the filter reads
+// the unprojected sides it drops rows it previously never saw, so the rule it must not break
+// is worth re-asserting against an attribute the output does not carry.
+func TestLeftJoinWhereDropsRatherThanNullExtends(t *testing.T) {
+	cat := readJoinFixture(t)
+	spec := readProjectionSpecs()["plain equi"]
+	spec.Kind = JoinLeft
+	spec.Post = []string{"e.MemoryUsage > 100000"} // matches nothing
+
+	got := joinRowTexts(t, cat, spec)
+	if len(got) != 0 {
+		t.Fatalf("every pair matched and was dropped by WHERE, so no row should survive; got %d:\n%v",
+			len(got), got[:min(3, len(got))])
+	}
+}
+
+// TestDeclinedWhereTermStillReadsTheSides: a term the alias compiler will not take falls
+// back to a composite, and that composite must be built WITHOUT the output projection too --
+// otherwise the bug simply moves into the fallback.
+func TestDeclinedWhereTermStillReadsTheSides(t *testing.T) {
+	cat := readJoinFixture(t)
+	spec := readProjectionSpecs()["plain equi"]
+	spec.Post = []string{`strcat(e.Filler, "") == "y"`} // strcat is not strict: declined
+
+	p, err := compileJoin(spec, DefaultJoinLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.postAlias != nil {
+		t.Fatal("strcat should not compile natively; this test is not exercising the fallback")
+	}
 	if got := joinRowTexts(t, cat, spec); len(got) == 0 {
-		t.Fatal("projecting the attribute the WHERE reads should bring the rows back")
+		t.Fatal("the fallback filtered a projected row; it must read the sides as read")
+	}
+}
+
+// TestWhereIdentityAgainstUndefinedChangesAnswer records the one way this fix is NOT purely
+// additive, so it is not discovered as a surprise.
+//
+// Everywhere else, filtering the sides rather than the projected row can only turn dropped
+// rows into kept ones: a term that read UNDEFINED was not true, so its rows were lost. But
+// `=?=` and `is` compare identity, and UNDEFINED =?= UNDEFINED is TRUE -- so a term asking
+// whether an attribute is undefined used to be true for every row merely because the
+// projection had hidden the attribute, and is now true only when the side really lacks it.
+//
+// That is the correct reading of the term. It does mean such a query answers differently.
+func TestWhereIdentityAgainstUndefinedChangesAnswer(t *testing.T) {
+	cat := readJoinFixture(t)
+	spec := readProjectionSpecs()["plain equi"] // right side projects NumShadowStarts only
+
+	// MemoryUsage is defined on every epoch row but is not projected.
+	spec.Post = []string{"e.MemoryUsage =?= UNDEFINED"}
+	if got := joinRowTexts(t, cat, spec); len(got) != 0 {
+		t.Fatalf("the attribute is defined on the side, so the term is false: got %d rows", len(got))
+	}
+
+	// An attribute no row defines is undefined whichever way it is read.
+	spec.Post = []string{"e.NoSuchAttribute =?= UNDEFINED"}
+	if got := joinRowTexts(t, cat, spec); len(got) == 0 {
+		t.Fatal("an attribute absent from the side really is undefined; the term should hold")
 	}
 }
