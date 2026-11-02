@@ -2,7 +2,6 @@ package db
 
 import (
 	"fmt"
-	"math/rand"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -20,33 +19,19 @@ import (
 // fixture that never grew past the size threshold, would leave every comparison below passing while
 // comparing the serial path with itself. The counter is the only thing that can tell those apart.
 
-// parPad makes each record wide enough that a modest record count still clears the fan-out
-// threshold, which is a byte count. Padding the records rather than multiplying them keeps these
-// tests to tens of thousands of records instead of nearly a million, and the gate under test is a
-// byte gate either way. The content varies per record so the segment does not compress to nothing
-// and fall back under the threshold.
-//
-// The width is set with margin rather than to just clear the gate: at 480 bytes the fixtures landed
-// either side of it depending on which attributes a given test inserted, and a test that stops
-// exercising the fan-out does not fail loudly on its own -- the guards here are what caught it.
-func parPad(i int) string {
-	// RANDOM, not a generated pattern. The first version of this cycled through the alphabet, which
-	// zstd crushed to nothing: the records were wide and the SEGMENTS were not, so the fixture sat
-	// under the gate while looking like it cleared it by a wide margin. The gate counts stored
-	// bytes, so the padding has to survive compression.
-	rng := rand.New(rand.NewSource(int64(i)))
-	b := make([]byte, 600)
-	for j := range b {
-		b[j] = byte('!' + rng.Intn(90))
-	}
-	return string(b)
-}
+// testAggGate is the fan-out gate these tests run with. The real gate is tens of megabytes, which
+// is the right value on a real workload and the wrong one to build in a test: clearing it needs a
+// fixture per table large enough that the suite stopped fitting its CI timeout, under -race, for
+// data whose size is incidental to everything being tested here. The gate's own value is pinned by
+// TestASmallPassDoesNotFanOut, which runs at the DEFAULT and is cheap because it asserts the pass
+// does NOT fan out.
+const testAggGate = 1 << 12
 
-// parTable builds a table big enough to clear the fan-out threshold, with par as its
-// QueryParallelism (1 serial, 0 auto).
+// parTable builds a table that fans out at testAggGate, with par as its QueryParallelism (1 serial,
+// 0 auto).
 func parTable(t *testing.T, n, par int) *DB {
 	t.Helper()
-	d, err := OpenConfig(Config{SegmentSize: 1 << 16, QueryParallelism: par})
+	d, err := OpenConfig(Config{SegmentSize: 1 << 16, QueryParallelism: par, AggMinBytes: testAggGate})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +44,6 @@ func parTable(t *testing.T, n, par int) *DB {
 		// A real column as well, because the integer fields are exact under any fold order and
 		// would not notice a merge that mishandled the float accumulation.
 		ad.InsertAttrFloat("Load", float64(i%97)/7.0)
-		ad.InsertAttrString("Pad", parPad(i))
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 		if i%20000 == 19999 {
 			if err := tx.Commit(); err != nil {
@@ -89,7 +73,7 @@ func fannedOut(t *testing.T, fn func()) bool {
 // text on both paths. Text, not a number, because a type promotion that came out differently would
 // be as wrong as an arithmetic one and much easier to miss.
 func TestBuiltinAggregatesAgreeAcrossTheFanout(t *testing.T) {
-	const n = 60000
+	const n = 20000
 	serial := parTable(t, n, 1)
 	par := parTable(t, n, 0)
 
@@ -138,7 +122,7 @@ func TestBuiltinAggregatesAgreeAcrossTheFanout(t *testing.T) {
 // quietly comparing the text would either flake or, worse, pass only because the fixture happened to
 // sum without rounding.
 func TestRealSumAgreesToItsErrorBound(t *testing.T) {
-	const n = 60000
+	const n = 20000
 	serial := parTable(t, n, 1)
 	par := parTable(t, n, 0)
 
@@ -212,7 +196,7 @@ func (a *parSumAcc) Result() classad.Value { return classad.NewIntValue(a.n) }
 func TestUserAggregateIsFoldedFromPerWorkerAccumulators(t *testing.T) {
 	var news, merges atomic.Int64
 	name := registerOnce(t, "par_fold_sum", parSum{news: &news, merges: &merges})
-	const n = 60000
+	const n = 20000
 	par := parTable(t, n, 0)
 
 	var want int64
@@ -269,7 +253,7 @@ func (a *colPanicsOnNumAcc) Result() classad.Value { return classad.NewIntValue(
 // whose code did it.
 func TestUserAggregatePanicOnAWorkerFailsTheQuery(t *testing.T) {
 	name := registerOnce(t, "par_panic_col", colPanicsOnNum{})
-	par := parTable(t, 60000, 0)
+	par := parTable(t, 20000, 0)
 	rows, err := par.AggregateColsStats("true", nil,
 		[]AggSpec{{Func: AggUser, UserFunc: name, Arg: "Cpus"}}, nil, nil)
 	if err == nil {
@@ -291,8 +275,8 @@ func TestUserAggregatePanicOnAWorkerFailsTheQuery(t *testing.T) {
 // An expression-valued cell in the aggregated column is the decline that is reachable from data: the
 // column has no numeric reading of it at all.
 func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
-	const n = 60000
-	d, err := OpenConfig(Config{SegmentSize: 1 << 16, QueryParallelism: 0})
+	const n = 20000
+	d, err := OpenConfig(Config{SegmentSize: 1 << 16, QueryParallelism: 0, AggMinBytes: testAggGate})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -301,7 +285,6 @@ func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
 	for i := 0; i < n; i++ {
 		ad := classad.New()
 		ad.InsertAttr("JobStatus", int64(i%5))
-		ad.InsertAttrString("Pad", parPad(i))
 		if i == n-1 {
 			// The LAST record, so a pass that declines only after reading almost everything is
 			// the case under test -- the partial accumulator is at its most complete and most
@@ -497,4 +480,64 @@ func TestSegmentPathCountersTellTheTwoPathsApart(t *testing.T) {
 			smallCols, smallRows)
 	}
 	t.Logf("small=(%d columnar, %d row)  large=(%d columnar, %d row)", smallCols, smallRows, bigCols, bigRows)
+}
+
+// TestTheDefaultGateStillLetsARealPassFanOut is the one test here that pays for a fixture at the
+// real gate's scale, and it buys the one property the cheap tests cannot.
+//
+// Every other fan-out test runs at testAggGate, so all of them would keep passing if the DEFAULT
+// gate were raised to something nothing ever reaches -- the fan-out would simply never happen in
+// production and no test would say so. TestASmallPassDoesNotFanOut catches a default that is too
+// LOW; this catches one that is too high. Together they bracket it.
+//
+// Plain records, no padding: the gate counts stored bytes, and reaching tens of megabytes with
+// ordinary records is a few hundred thousand of them, which is cheaper than it sounds and much
+// cheaper than making each record wide.
+func TestTheDefaultGateStillLetsARealPassFanOut(t *testing.T) {
+	if raceEnabled {
+		// Minutes, under -race, to build a fixture whose only job is to be large. The race
+		// detector cannot say anything about whether a gate constant permits a fan-out, so the
+		// ordinary build carries this one.
+		t.Skip("builds a fixture at the real fan-out gate; too slow under -race for nothing gained")
+	}
+	d, err := OpenConfig(Config{SegmentSize: 1 << 16, QueryParallelism: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	var want int64
+	tx := d.Begin()
+	for i := 0; i < 700000; i++ {
+		ad := classad.New()
+		ad.InsertAttr("Cpus", int64(i%64))
+		ad.InsertAttr("JobStatus", int64(i%5))
+		ad.InsertAttr("Mem", int64(i%4096))
+		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
+		want += int64(i % 64)
+		if i%50000 == 49999 {
+			if err := tx.Commit(); err != nil {
+				t.Fatal(err)
+			}
+			tx = d.Begin()
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if !d.EnableSchemaScan(4000, 8) {
+		t.Skip("no sealed segments to accelerate")
+	}
+	var rows []AggRow
+	if !fannedOut(t, func() {
+		rows, err = d.AggregateColsStats("true", nil, []AggSpec{{Func: AggSum, Arg: "Cpus"}}, nil, nil)
+	}) {
+		t.Fatal("a pass this size did not fan out at the default gate; the gate is set above what " +
+			"any real aggregate reaches, so the fan-out never happens in production")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].Values[0] != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %d", rows, want)
+	}
 }

@@ -1937,9 +1937,23 @@ reason to chase the crossover. And a crossover is the kind of quantity a loaded 
 has to be re-measured per machine, where a 2x margin survives one. The numbers above were taken on a
 box under load, which biases *against* the fan-out, so the threshold is conservative by construction.
 
-A gate also needs a test from the side nobody writes. Every test here asserts the fan-out *happened*,
-so all of them would pass with the threshold deleted and every aggregate fanned out — a 25-40%
-regression no correctness test can see. `TestASmallPassDoesNotFanOut` is the other direction.
+A gate needs testing from BOTH sides, and the second side was found by the CI timeout rather than by
+thinking about it. Every fan-out test asserts the fan-out *happened*, so all of them would pass with
+the threshold deleted and every aggregate fanned out — a 25-40% regression no correctness test can
+see. `TestASmallPassDoesNotFanOut` closes that.
+
+The other side is subtler. Those tests originally cleared the real gate by building a fixture at its
+scale, which under `-race` put the `db` module over its CI timeout — tens of megabytes per fixture,
+seven of them, for data whose size is incidental to everything being tested. Lowering the gate for
+the tests (`Options.AggMinBytes`) fixes the cost and introduces the hole: with every fan-out test on
+an override, raising the DEFAULT to something nothing reaches would leave the whole suite green while
+the fan-out never happened in production. So exactly one test pays for a real-scale fixture and
+asserts a pass that size *does* fan out at the default. The two together bracket the constant —
+one catches a default too low, the other a default too high — and a mutation of the constant in
+either direction now dies.
+
+That test skips under `-race`: the race detector has nothing to say about whether a gate constant
+permits a fan-out, and building the fixture under it takes minutes.
 
 #### What is left here
 
