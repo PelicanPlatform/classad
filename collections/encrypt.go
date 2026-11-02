@@ -8,6 +8,7 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/crypt"
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
@@ -99,8 +100,89 @@ func (c *Collection) shouldEncrypt(name string) bool {
 		return true
 	}
 	if set := c.encryptedAttrs(); set != nil {
-		_, ok := set[strings.ToLower(name)]
+		return foldedHas(set, name)
+	}
+	return false
+}
+
+// foldedHas reports whether set (case-folded names) holds name, case-insensitively. Folding into a
+// stack buffer keeps it allocation-free for ordinary attribute names: the keyless reads of an archive
+// consult the sealing policy per attribute looked up (see keylessHides), where strings.ToLower's
+// allocation for every mixed-case name would be a cost per record.
+func foldedHas[T string | []byte](set map[string]struct{}, name T) bool {
+	var buf [64]byte
+	if len(name) > len(buf) {
+		_, ok := set[strings.ToLower(string(name))]
 		return ok
+	}
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+		if b >= 0x80 {
+			_, ok := set[strings.ToLower(string(name))]
+			return ok
+		}
+		if 'A' <= b && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		buf[i] = b
+	}
+	_, ok := set[string(buf[:len(name)])]
+	return ok
+}
+
+// hidesClearSealed reports whether a read not entitled to sealed values must also withhold, by name,
+// the values of sealed attributes that are stored in the clear.
+//
+// Sealing is applied when a record is encoded, so a record written before an attribute was sealed --
+// before the store had a key at all, or before the attribute joined EncryptedAttrs -- still holds its
+// value in the clear. A mutable table rewrites such records when it opens (MigrateSealedAttrs), so by
+// the time it serves a read every value the policy names is sealed and the keyless decode alone keeps
+// it from an unentitled reader. An append-only store does not: rewriting a history to seal it is a
+// rewrite of the whole history, so its legacy records are resealed only when maintenance rewrites
+// them anyway (a merge, a retrain, interning). Until then the keyless decode would serve them, so its
+// keyless reads also treat every attribute the policy names as sealed, whatever form it is stored in.
+//
+// An in-memory store never seals (see SealsValues), so it withholds nothing here either.
+func (c *Collection) hidesClearSealed() bool { return c.appendOnly() && c.SealsValues() }
+
+// keylessHides reports whether a read not entitled to sealed values must read name as undefined
+// whatever its stored form (see hidesClearSealed).
+func (c *Collection) keylessHides(name string) bool {
+	return c.hidesClearSealed() && c.shouldEncrypt(name)
+}
+
+// keylessHidesBytes is keylessHides for a name held as bytes, for a renderer walking a record's
+// stored names.
+func (c *Collection) keylessHidesBytes(name []byte) bool {
+	if !c.hidesClearSealed() {
+		return false
+	}
+	if isPrivateNameBytes(name) {
+		return true
+	}
+	set := c.encryptedAttrs()
+	return set != nil && foldedHas(set, name)
+}
+
+// keylessQuery is q as a read not entitled to sealed values must plan and evaluate it: with every
+// reference to an attribute the policy seals replaced by undefined when the store may hold such values
+// in the clear (see hidesClearSealed and vm.Query.Hiding), and q itself otherwise.
+func (c *Collection) keylessQuery(q *vm.Query) *vm.Query {
+	if q == nil || !c.hidesClearSealed() {
+		return q
+	}
+	return q.Hiding(c.shouldEncrypt)
+}
+
+// keylessHidesAny reports whether any of names is one keylessHides withholds.
+func (c *Collection) keylessHidesAny(names ...string) bool {
+	if !c.hidesClearSealed() {
+		return false
+	}
+	for _, n := range names {
+		if c.shouldEncrypt(n) {
+			return true
+		}
 	}
 	return false
 }

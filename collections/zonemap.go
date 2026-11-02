@@ -91,8 +91,21 @@ func zoneValue(node []byte) (float64, zoneCell) {
 // schema does not cover, and a zone map that under-reports a range makes the scan SKIP segments that
 // contain matches. That is the worst shape of wrong answer here -- silent, and faster than the
 // correct one.
-func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, inline bool) map[uint32]zoneRange {
+func computeSegZones(c *Collection, seg *segment, upto int, attrs []zoneAttr, inline bool, sealed func(string) bool) map[uint32]zoneRange {
 	data, dict := seg.data, seg.dict.Load()
+	if sealed != nil {
+		// No zone for an attribute the sealing policy names. A sealed value already leaves its
+		// attribute without one (it is not a number, so the zone could not bound it), but a record
+		// written before the attribute was sealed still holds the value in the clear, and a range
+		// derived from it would carry that value into the sidecar and into every pruning decision.
+		kept := attrs[:0:0]
+		for _, za := range attrs {
+			if !sealed(za.name) {
+				kept = append(kept, za)
+			}
+		}
+		attrs = kept
+	}
 	// c is nil only from the seal path, whose subject is the ACTIVE segment -- never columnarized,
 	// since only a sealed segment is rewritten. Refuse rather than assume if that ever changes: no
 	// zone map means no pruning, which is slow, while a partial one means wrong answers.
@@ -244,5 +257,5 @@ func (sh *shard) sealZones(seg *segment) {
 	}
 	// nil collection: the segment being sealed is the active append target, which is whole-record by
 	// construction (only sealed segments are columnarized), so no reassembly can be needed here.
-	seg.zones = computeSegZones(nil, seg, seg.used, sh.zoneAttrs, sh.zoneInline)
+	seg.zones = computeSegZones(nil, seg, seg.used, sh.zoneAttrs, sh.zoneInline, sh.sealsName)
 }

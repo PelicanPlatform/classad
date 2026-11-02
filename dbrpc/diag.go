@@ -136,9 +136,9 @@ func (s *Server) archiveDiagJSON(a *db.ArchiveTable) ([]byte, error) {
 		SchemaScan:         a.SchemaScanInfo(),
 		GroupDrift:         a.GroupSchemaDrift(),
 		GroupChanges:       a.GroupSchemaChanges(),
-		// The same three a mutable table reports. Encryption in particular is reported rather than
-		// left zero: an archive is NOT sealed today (its open path passes no data key), and a missing
-		// line reads as "not applicable" when the truth is "not protected".
+		// The same three a mutable table reports, with the same meaning: an archive resolves its data
+		// key as a mutable table does, so it seals the same attributes and reports encryption at rest
+		// on the same terms.
 		Hot:               a.HotAttrs(),
 		EncryptionEnabled: a.EncryptionEnabled(),
 		EncryptedAttrs:    a.EncryptedAttrNames(),
@@ -332,7 +332,7 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 // archiveAdmin runs a management action on an append-only archive (history) table: the
 // layout-tuning subset of table admin -- retrain the ZSTD dictionary, add/drop/rebuild
 // per-segment indexes, refresh the hot set, rewrite, set retention, rotate -- plus truncate
-// (empty the archive). Encryption and time-travel actions do not apply to an archive.
+// (empty the archive) and encrypt.set. Time-travel actions do not apply to an archive.
 // DAEMON-gated by the caller, like the mutable-table admin.
 //
 // The hot-set actions behave as they do on a mutable table except in reach: an archive's hot
@@ -346,6 +346,14 @@ func (s *Server) admin(t *db.DB, action string, args []string, privileged bool) 
 func archiveAdmin(a *db.ArchiveTable, action string, args []string, maintainOpts db.MaintainOptions) (string, error) {
 	hotTopN := maintainOpts.HotTopN
 	switch action {
+	case "encrypt.set":
+		// The same security-policy change as on a mutable table: args is the new explicit set
+		// (private attributes are always sealed), empty clears it. Records already appended keep
+		// their form until maintenance rewrites their segment.
+		if err := a.SetEncryptedAttrs(args); err != nil {
+			return "", err
+		}
+		return "encrypted attributes: " + join(a.EncryptedAttrNames()), nil
 	case "truncate":
 		// Destructive reset: drop every record (a from-scratch re-sync empties the archive,
 		// then re-ingests from the source). Retention/index config is preserved.

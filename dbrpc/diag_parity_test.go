@@ -16,7 +16,7 @@ import (
 // The two diagnostics builders drifted: each grew fields the other never got, so `.stats <table>` and
 // `.stats <archive>` described the same storage engine in different terms. A mutable table reported no
 // sidecar bytes and therefore no on-disk total; an archive reported no columnar accelerator, no hot
-// attributes and no encryption state -- the last of which matters, because an archive really is
+// attributes and no encryption state -- the last of which mattered, because an archive was then
 // unsealed, and a missing line reads as "not applicable" rather than "not protected".
 //
 // This test is reflective on purpose. Asserting a fixed list of fields would go stale the moment someone
@@ -30,11 +30,6 @@ var kindSpecificFields = map[string]string{
 	"ZoneAttrs":       "zone maps are an append-only construct",
 	"Suggestions":     "GAP, not a design: ArchiveTable has no SuggestIndexes yet",
 	"DropSuggestions": "GAP, not a design: ArchiveTable has no SuggestDrops yet",
-	// This one is a real difference in the STORE, not in the reporting, and it is listed here so the
-	// parity check stays meaningful rather than being satisfied by hiding the field: with pool keys
-	// configured, a mutable table is encrypted at rest and an archive is NOT, because the archive open
-	// path passes no data key. See TestArchiveReportsItIsNotEncrypted.
-	"EncryptionEnabled": "GAP in the STORE: an archive is never sealed; reported so it is visible",
 }
 
 func TestDiagnosticsFieldsPopulatedForBothKinds(t *testing.T) {
@@ -140,27 +135,35 @@ func TestDiagnosticsFieldsPopulatedForBothKinds(t *testing.T) {
 	t.Logf("%d fields verified populated for both kinds", verified)
 }
 
-// TestArchiveReportsItIsNotEncrypted pins the substance behind one of those fields. An archive's open
-// path passes no data key, so history holds private attributes in the clear while a mutable table always
-// seals them. Whatever is decided about that, the diagnostics must SAY so -- silence is what let it sit.
-func TestArchiveReportsItIsNotEncrypted(t *testing.T) {
-	cat, err := db.OpenCatalog(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := NewServerCatalog(cat)
-	defer func() { s.Close(); cat.Close() }()
-	arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := arch.AppendOld(parityAd(1)); err != nil {
-		t.Fatal(err)
-	}
-	got := mustDiag(t, func() ([]byte, error) { return s.archiveDiagJSON(arch) })
-	if got.EncryptionEnabled {
-		t.Error("an archive reports encryption at rest; if that became true, this test should be " +
-			"inverted deliberately rather than deleted")
+// TestArchiveReportsEncryptionAtRest pins the substance behind one of those fields. An archive resolves
+// its data key as a mutable table does, so with pool keys it is encrypted at rest and says so, and
+// without them it seals private attributes all the same but does not claim encryption at rest -- its
+// master sits beside the data. Before archives had a key this reported false in both catalogs, and
+// the line was what made that visible.
+func TestArchiveReportsEncryptionAtRest(t *testing.T) {
+	for _, keyed := range []bool{false, true} {
+		cfg := db.CatalogConfig{Dir: t.TempDir()}
+		if keyed {
+			cfg.PoolKeys = []db.KEK{{ID: "POOL", Material: []byte("diag-parity-test-pool-key-material!!")}}
+		}
+		cat, err := db.OpenCatalogConfig(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s := NewServerCatalog(cat)
+		arch, err := cat.CreateArchiveTable("history", db.ArchiveConfig{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := arch.AppendOld(parityAd(1)); err != nil {
+			t.Fatal(err)
+		}
+		got := mustDiag(t, func() ([]byte, error) { return s.archiveDiagJSON(arch) })
+		if got.EncryptionEnabled != keyed {
+			t.Errorf("pool keys %v: archive reports encryption at rest %v", keyed, got.EncryptionEnabled)
+		}
+		s.Close()
+		cat.Close()
 	}
 }
 

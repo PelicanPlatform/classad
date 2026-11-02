@@ -139,6 +139,18 @@ type ArchiveOptions struct {
 	// this one. 0 keeps the current/default archive budget. Setting it here is equivalent to
 	// calling SetArchiveBlockCacheBudget.
 	BlockCacheBytes int64
+
+	// DataKey and EncryptedAttrs are encryption at rest, exactly as for a mutable collection (see
+	// Options.DataKey and Options.EncryptedAttrs): with a key, every private attribute and every
+	// attribute EncryptedAttrs names is sealed as it is appended. An attribute both sealed and indexed
+	// is refused as it is there -- the caller must leave it out of CategoricalAttrs/ValueAttrs.
+	//
+	// Records appended before the archive had a key, or before an attribute joined the set, keep their
+	// values in the clear until maintenance next rewrites their segment (a merge, a retrain, interning).
+	// A read not entitled to sealed values treats those as sealed too, by name; see the archive's
+	// *Redacted reads.
+	DataKey        []byte
+	EncryptedAttrs []string
 }
 
 const defaultArchiveSegmentSize = 8 << 20 // 8 MiB
@@ -182,6 +194,8 @@ func archiveCollectionOptions(opts ArchiveOptions) Options {
 		WatchHistory:        archiveWatchCap, // enable the append-stream watch
 		// Global shared ARCHIVE block-cache budget (0 keeps the current/default).
 		ArchiveBlockCacheBytes: opts.BlockCacheBytes,
+		DataKey:                opts.DataKey,
+		EncryptedAttrs:         opts.EncryptedAttrs,
 	}
 }
 
@@ -407,16 +421,20 @@ func (a *Archive) Query(q *vm.Query) iter.Seq[*classad.ClassAd] { return a.Query
 // limit results (limit <= 0 ⇒ unlimited). Because the backing Collection scans
 // newest-first, stopping early yields the most recent limit matches — a pushed-down LIMIT.
 func (a *Archive) QueryLimit(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] {
+	return firstN(a.c.Query(q), limit)
+}
+
+// firstN yields the first limit ads of seq (limit <= 0: all of them), stopping seq there.
+func firstN(seq iter.Seq[*classad.ClassAd], limit int) iter.Seq[*classad.ClassAd] {
 	return func(yield func(*classad.ClassAd) bool) {
 		n := 0
-		for ad := range a.c.Query(q) {
+		for ad := range seq {
 			if !yield(ad) {
 				return
 			}
-			if limit > 0 {
-				if n++; n >= limit {
-					return
-				}
+			n++
+			if limit > 0 && n >= limit {
+				return
 			}
 		}
 	}
@@ -500,6 +518,49 @@ func (a *Archive) QueryProject(q *vm.Query, attrs []string) iter.Seq[[]classad.V
 // breakdown, for an EXPLAIN ANALYZE of an aggregate that falls to the projected scan.
 func (a *Archive) QueryProjectStats(q *vm.Query, attrs []string, stats *ScanStats) iter.Seq[[]classad.Value] {
 	return a.c.QueryProjectStats(q, attrs, stats)
+}
+
+// Reads for a caller NOT entitled to sealed values. Each is the read above it with no key: a sealed
+// value is undefined to the constraint, to what is returned and to anything computed from it -- the
+// rules a mutable table's *Redacted reads follow. An archive may also hold a sealed attribute's values
+// in the clear, written before it was sealed; these reads withhold those by name as well, so such a
+// reader sees the same undefined for every record whatever form its value is stored in.
+
+// QueryLimitRedacted is QueryLimit read with no key.
+func (a *Archive) QueryLimitRedacted(q *vm.Query, limit int) iter.Seq[*classad.ClassAd] {
+	return firstN(a.c.QueryRedacted(q), limit)
+}
+
+// QueryProjectStatsRedacted is QueryProjectStats read with no key.
+func (a *Archive) QueryProjectStatsRedacted(q *vm.Query, attrs []string, stats *ScanStats) iter.Seq[[]classad.Value] {
+	return a.c.QueryProjectStatsRedacted(q, attrs, stats)
+}
+
+// CountConstraintRedacted is CountConstraint read with no key.
+func (a *Archive) CountConstraintRedacted(constraint string) (int, bool) {
+	return a.c.CountConstraintRedacted(constraint)
+}
+
+// NumStatsQueryRedacted is NumStatsQuery read with no key.
+func (a *Archive) NumStatsQueryRedacted(q *vm.Query, attr string) (NumStats, bool) {
+	return a.c.NumStatsQueryRedacted(q, attr)
+}
+
+// TopKOrderThresholdRedacted is TopKOrderThreshold read with no key.
+func (a *Archive) TopKOrderThresholdRedacted(q *vm.Query, orderAttr string, desc bool, k int, stats *ScanStats) (float64, int, bool) {
+	return a.c.TopKOrderThresholdRedacted(q, orderAttr, desc, k, stats)
+}
+
+// GroupStatsConstraintAggsRedacted is GroupStatsConstraintAggs read with no key.
+func (a *Archive) GroupStatsConstraintAggsRedacted(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string) ([]GroupStats, bool) {
+	return a.c.GroupStatsConstraintAggsRedacted(constraint, groups, aggCols, countFilters)
+}
+
+// GroupStatsAllAggsRedacted is GroupStatsAllAggs read with no key.
+func (a *Archive) GroupStatsAllAggsRedacted(groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string) ([]GroupStats, bool) {
+	return a.c.GroupStatsAllAggsRedacted(groups, aggCols, countFilters)
 }
 
 // Watch streams the archive as change data: a full replay of retained records (oldest
@@ -628,16 +689,41 @@ func (a *Archive) RefreshHotSet(sampleMax, topN int) int { return a.c.RefreshHot
 // writes only; existing records keep the header they were written with.
 func (a *Archive) AddHotAttrs(names ...string) []string { return a.c.AddHotAttrs(names...) }
 
-// EncryptionEnabled reports whether this archive's values are sealed (mirroring
-// Collection.EncryptionEnabled). It is currently FALSE for every archive a catalog opens: the archive
-// open path passes no data key, so an archive stores private attributes in the clear where a mutable
-// table always seals them. Exposing it is what makes that asymmetry visible instead of absent from
-// the diagnostics -- an operator reading "encryption at rest: on" for a table should not have to guess
-// what its history table does.
+// EncryptionEnabled reports whether this archive holds a data key, so that the attributes the sealing
+// policy names are sealed as they are appended (mirroring Collection.EncryptionEnabled).
 func (a *Archive) EncryptionEnabled() bool { return a.c.EncryptionEnabled() }
+
+// SealsValues reports whether any value this archive stores can be sealed (see
+// Collection.SealsValues).
+func (a *Archive) SealsValues() bool { return a.c.SealsValues() }
 
 // EncryptedAttrNames reports the attributes this archive seals, mirroring Collection.EncryptedAttrNames.
 func (a *Archive) EncryptedAttrNames() []string { return a.c.EncryptedAttrNames() }
+
+// SetEncryptedAttrs replaces the explicit set of sealed attributes, as Collection.SetEncryptedAttrs
+// does: it errors without a key, and for an attribute that is currently indexed. Records appended from
+// now on are sealed under the new set; earlier ones keep their form until maintenance rewrites their
+// segment, and the *Redacted reads withhold an attribute the set names whatever form it is stored in.
+func (a *Archive) SetEncryptedAttrs(attrs []string) error { return a.c.SetEncryptedAttrs(attrs) }
+
+// KeylessWithholds reports whether a read not entitled to sealed values withholds any of names --
+// reads them as undefined whatever their stored form -- because the sealing policy names it. Such an
+// attribute's clear values from before it was sealed can sit in this archive's columns, zone maps and
+// indexes, so a caller planning such a read must not answer it from those.
+func (a *Archive) KeylessWithholds(names ...string) bool { return a.c.keylessHidesAny(names...) }
+
+// KeylessWithholdsIn reports whether constraint references an attribute KeylessWithholds reports. A
+// constraint that does not parse reports true: it reaches no answer either way.
+func (a *Archive) KeylessWithholdsIn(constraint string) bool {
+	if !a.c.hidesClearSealed() {
+		return false
+	}
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return true
+	}
+	return a.c.keylessQuery(q) != q
+}
 
 // RetrainDict trains a fresh ZSTD dictionary from up to sampleMax records and recompresses
 // every segment in place under it (an append-only reseal that preserves order), returning

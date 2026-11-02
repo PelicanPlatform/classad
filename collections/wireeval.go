@@ -39,7 +39,18 @@ func (k keylessCtx) decodeWire(w []byte) (*ast.ClassAd, error) {
 	return k.c.decodeWireDictAs(nil, w, true)
 }
 
-func (k keylessCtx) wireLookup(a wire.Ad, name string) ([]byte, bool) { return k.c.wireLookup(a, name) }
+func (k keylessCtx) wireLookup(a wire.Ad, name string) ([]byte, bool) {
+	node, ok := k.c.wireLookup(a, name)
+	if ok && k.c.keylessHides(name) {
+		return undefinedNode, true
+	}
+	return node, ok
+}
+
+// undefinedNode is the wire node a keyless read sees for an attribute it must withhold whatever its
+// stored form (see Collection.hidesClearSealed): undefined, which is what the same attribute reads as
+// where it is sealed. Present rather than absent, as a sealed value is.
+var undefinedNode = wire.AppendUndefinedNode(nil)
 
 func (k keylessCtx) decodeNode(node []byte) (ast.Expr, error) { return k.decodeNodeDict(nil, node) }
 
@@ -111,7 +122,15 @@ func wireLookupDictCtx(ctx wireCtx, dict *segDictHandle, a wire.Ad, name string)
 		if !ok {
 			return nil, false
 		}
-		return a.Lookup(uint32(id)) //idspace:translate a dictionary-keyed record is keyed by the segID
+		node, ok := a.Lookup(uint32(id)) //idspace:translate a dictionary-keyed record is keyed by the segID
+		// The dictionary branch reads the record itself rather than through ctx, so it applies the
+		// keyless context's withholding itself.
+		if ok {
+			if k, keyless := ctx.(keylessCtx); keyless && k.c.keylessHides(name) {
+				return undefinedNode, true
+			}
+		}
+		return node, ok
 	}
 	return ctx.wireLookup(a, name)
 }

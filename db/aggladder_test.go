@@ -154,7 +154,7 @@ func TestAggLaddersAreOrderedLists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := names(a.aggLadder(nil)),
+	if got, want := names(a.aggLadder(nil, false)),
 		"match-none,index-unconstrained,count-constraint,grouped-columns,index-constrained,columnar-aggregate,projected-scan"; got != want {
 		t.Errorf("archive ladder = %q, want %q", got, want)
 	}
@@ -282,8 +282,9 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 		t.Logf("%s: rungs exercised %v", kind, answered)
 	}
 	check(t, "mutable", d.aggLadder(nil, nil, false))
-	check(t, "archive", a.aggLadder(nil))
-	check(t, "archive-plain", plain.aggLadder(nil))
+	check(t, "archive", a.aggLadder(nil, false))
+	check(t, "archive-plain", plain.aggLadder(nil, false))
+	check(t, "archive-redacted", a.aggLadder(nil, true))
 
 	// The tier each archive rung reports: the caller-visible statement about which strategy ran,
 	// which several rungs share (three report TierColumnar, and the two halves of the split index
@@ -301,10 +302,10 @@ func TestAggLadderEveryRungMatchesTheReference(t *testing.T) {
 	}
 	tagged := map[string]bool{}
 	for _, tbl := range []*ArchiveTable{a, plain} {
-		for i := range tbl.aggLadder(nil) {
+		for i := range tbl.aggLadder(nil, false) {
 			for _, req := range reqs {
 				var st collections.ScanStats
-				s := tbl.aggLadder(&st)[i]
+				s := tbl.aggLadder(&st, false)[i]
 				if _, ok, err := s.Answer(req); err != nil || !ok {
 					continue
 				}

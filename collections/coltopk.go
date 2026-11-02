@@ -63,6 +63,17 @@ func (t *topKKeep) threshold() (float64, bool) {
 	return t.vals[t.worstIdx()], true
 }
 
+// TopKOrderThresholdRedacted is TopKOrderThreshold for a reader NOT entitled to sealed values. The cutoff
+// reads only literals, never a sealed value, so it is TopKOrderThreshold's -- except on a store that may
+// hold a sealed attribute's values in the clear (see hidesClearSealed): there an order attribute the
+// policy seals declines, and the constraint is planned as that reader evaluates it (keylessQuery).
+func (c *Collection) TopKOrderThresholdRedacted(q *vm.Query, orderAttr string, desc bool, k int, stats *ScanStats) (threshold float64, seen int, ok bool) {
+	if c.keylessHides(orderAttr) {
+		return 0, 0, false
+	}
+	return c.TopKOrderThreshold(c.keylessQuery(q), orderAttr, desc, k, stats)
+}
+
 // TopKOrderThreshold computes the cutoff order value for ORDER BY orderAttr {DESC|ASC} LIMIT k over
 // the records matching q: the k-th largest (desc) or k-th smallest (asc). It returns
 // (threshold, seen, ok): seen is the number of matching records with a numeric order value, and ok

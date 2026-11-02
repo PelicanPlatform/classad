@@ -734,7 +734,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 			// one -- timed separately (ZoneRecompute) so the log can pin it.
 			if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {
 				zoneStart := time.Now()
-				seg.zones = computeSegZones(c, seg, seg.used, sh.zoneAttrs, sh.zoneInline)
+				seg.zones = computeSegZones(c, seg, seg.used, sh.zoneAttrs, sh.zoneInline, sh.sealsName)
 				tm.ZoneRecompute += time.Since(zoneStart)
 				tm.ZoneRecomputed++
 				// Write the freshly computed zone map back into the sidecar (a legacy sidecar

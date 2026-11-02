@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"iter"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,6 +32,14 @@ type ArchiveTable struct {
 	// the update and the file write for that reason; see db/configpersist.go, which the
 	// mutable table's indexcfg.json goes through too.
 	cfg *configFile[ArchiveConfig]
+
+	// enc is the archive's encryption state, resolved for its own directory exactly as a mutable
+	// table's is (see resolveCrypto), or nil for an archive opened with no sealing at all -- a
+	// continuous view's, whose rows are built with no key for every reader.
+	enc *dbCrypto
+	// sealedIndexes names the configured indexes this open left out because the sealing policy
+	// names their attribute (see openArchiveTable).
+	sealedIndexes []string
 }
 
 // StopMaintenance asks any maintenance pass running on this archive to stop at its next safe
@@ -127,6 +136,18 @@ type ArchiveConfig struct {
 	GroupMaxPartialFrac float64
 	// Retention bounds what rotation keeps (max segments / bytes / age). Zero keeps all.
 	Retention collections.Retention
+	// EncryptedAttrs is the explicit set of attributes sealed at rest (private attributes are always
+	// sealed), as for a mutable table (see Config.EncryptedAttrs). Empty takes the catalog's default
+	// set. A non-empty set is authoritative, and it is what SetEncryptedAttrs persists, so a runtime
+	// change survives a restart exactly as a mutable table's does.
+	EncryptedAttrs []string `json:",omitempty"`
+}
+
+// archiveSealing is what an archive table seals with: the catalog's pool keys, which protect the
+// master key resolved for the archive's directory, and its default explicit set.
+type archiveSealing struct {
+	poolKeys []KEK
+	encAttrs []string
 }
 
 // defaultIndexBackfillBytes is how far back an index change is carried when the config does
@@ -154,10 +175,59 @@ func (cfg ArchiveConfig) backfillHorizon() int64 {
 // already-created archive, distinguishing "open" from "create".
 const archiveConfigFile = "archiveconfig.json"
 
+// archiveDirFresh reports whether dir holds no archive yet: it is absent, empty, or holds only the
+// master key a creation that stopped part way resolved before anything else.
+func archiveDirFresh(dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return true // absent (or unreadable, which the open then reports)
+	}
+	for _, e := range entries {
+		switch strings.TrimSuffix(e.Name(), ".tmp") {
+		case masterKeysFile, unprotectedMasterFile:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// sealingPolicy is the predicate a collection with a key seals by: every private attribute, and the
+// explicit set, case-insensitively (see collections.Collection.shouldEncrypt).
+func sealingPolicy(explicit []string) func(string) bool {
+	set := make(map[string]struct{}, len(explicit))
+	for _, n := range explicit {
+		set[strings.ToLower(n)] = struct{}{}
+	}
+	return func(name string) bool {
+		if classad.IsPrivateAttribute(name) {
+			return true
+		}
+		_, ok := set[strings.ToLower(name)]
+		return ok
+	}
+}
+
+// splitSealed returns names without the ones sealed reports, appending those to dropped.
+func splitSealed(names []string, sealed func(string) bool, dropped []string) (kept, allDropped []string) {
+	for _, n := range names {
+		if sealed(n) {
+			dropped = append(dropped, n)
+			continue
+		}
+		kept = append(kept, n)
+	}
+	return kept, dropped
+}
+
 // openArchiveTable creates or reopens an archive under dir. On reopen the persisted
 // config is authoritative (cfg is ignored). Archives always use a dictless ZSTD codec
 // (deterministic, so recovery needs no persisted codec identity).
-func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
+//
+// seal, when non-nil, gives the archive a data key, resolved for dir exactly as a mutable table's is,
+// so it seals private attributes always and the explicit set too, as a mutable table does. nil opens
+// it with none.
+func openArchiveTable(dir string, cfg ArchiveConfig, seal *archiveSealing) (*ArchiveTable, error) {
 	// archiveconfig.json is written on create and is authoritative on reopen, so its
 	// presence distinguishes "open" from "create" (the backing store keeps no separate
 	// catalog file of its own).
@@ -165,6 +235,35 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 	create := !exists
 	if ok {
 		cfg = saved // reopen with the config the archive was created with
+	}
+	// The store refuses to be created over existing files, and the key resolved below is one, so
+	// that check is made here first. A directory holding nothing but a key is one whose creation
+	// stopped between the two, and is created as if empty.
+	if create && !archiveDirFresh(dir) {
+		return nil, fmt.Errorf("archive: %s already initialized (use OpenArchive)", dir)
+	}
+	var enc *dbCrypto
+	encAttrs := cfg.EncryptedAttrs
+	if seal != nil {
+		var err error
+		if enc, err = resolveCrypto(dir, seal.poolKeys); err != nil {
+			return nil, err
+		}
+		if len(encAttrs) == 0 {
+			encAttrs = seal.encAttrs
+		}
+	}
+	// A sealed value is stored opaque and can never satisfy an index, so an attribute both sealed and
+	// indexed is refused (collections.Options.EncryptedAttrs). Here the sealing wins, as it does when a
+	// mutable table reloads its persisted indexes: an archive created before it had a key, or before
+	// the attribute was sealed, may have indexed it, and refusing the open over it would take the
+	// archive -- and the catalog opening it -- down with it.
+	var sealedIndexes []string
+	categorical, value := cfg.CategoricalAttrs, cfg.ValueAttrs
+	if enc != nil {
+		sealed := sealingPolicy(encAttrs)
+		categorical, sealedIndexes = splitSealed(categorical, sealed, sealedIndexes)
+		value, sealedIndexes = splitSealed(value, sealed, sealedIndexes)
 	}
 
 	codec, err := collections.NewZSTDCodec(nil)
@@ -181,23 +280,21 @@ func openArchiveTable(dir string, cfg ArchiveConfig) (*ArchiveTable, error) {
 		GroupStabilityRuns:  cfg.GroupStabilityRuns,
 		GroupMergeJaccard:   cfg.GroupMergeJaccard,
 		GroupMaxPartialFrac: cfg.GroupMaxPartialFrac,
-		CategoricalAttrs:    cfg.CategoricalAttrs,
-		ValueAttrs:          cfg.ValueAttrs,
+		CategoricalAttrs:    categorical,
+		ValueAttrs:          value,
 		ZoneAttrs:           cfg.ZoneAttrs,
 		SchemaRequireAttrs:  cfg.SchemaRequireAttrs,
 		IndexBackfillBytes:  cfg.backfillHorizon(),
 		Retention:           cfg.Retention,
+		DataKey:             enc.data(),
+		EncryptedAttrs:      encAttrs,
 	}
-	var a *collections.Archive
-	if create {
-		a, err = collections.CreateArchive(opts)
-	} else {
-		a, err = collections.OpenArchive(opts)
-	}
+	// Created or reopened alike: the emptiness CreateArchive would check was checked above.
+	a, err := collections.OpenArchive(opts)
 	if err != nil {
 		return nil, err
 	}
-	t := &ArchiveTable{a: a, cfg: newConfigFile(dir, archiveConfigFile, cfg)}
+	t := &ArchiveTable{a: a, cfg: newConfigFile(dir, archiveConfigFile, cfg), enc: enc, sealedIndexes: sealedIndexes}
 	// The index set above was rebuilt from the config as human-created; re-mark the ones
 	// the tuner made. This adds no index (they are already present) -- it only restores
 	// provenance.
@@ -259,6 +356,27 @@ func (t *ArchiveTable) QueryLimit(constraint string, limit int) (iter.Seq[*class
 		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
 	}
 	return gatedArch(t, t.a.QueryLimit(q, limit)), nil
+}
+
+// QueryLimitRedacted is QueryLimit for a caller NOT entitled to sealed values, as DB.QueryRedacted is
+// for a mutable table: the constraint is matched and the ads decoded with no key, so a sealed attribute
+// is undefined in both. An attribute the archive seals reads as undefined in its older records too,
+// where it may be stored in the clear (see SetEncryptedAttrs).
+func (t *ArchiveTable) QueryLimitRedacted(constraint string, limit int) (iter.Seq[*classad.ClassAd], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return gatedArch(t, t.a.QueryLimitRedacted(q, limit)), nil
+}
+
+// QueryProjectStatsRedacted is QueryProjectStats with QueryLimitRedacted's entitlement.
+func (t *ArchiveTable) QueryProjectStatsRedacted(constraint string, attrs []string, stats *collections.ScanStats) (iter.Seq[[]classad.Value], error) {
+	q, err := vm.Parse(constraint)
+	if err != nil {
+		return nil, fmt.Errorf("archive: parsing constraint: %w", err)
+	}
+	return gatedArch(t, t.a.QueryProjectStatsRedacted(q, attrs, stats)), nil
 }
 
 // QueryProject scans the matching ads and yields each projected to just attrs' values, read
@@ -417,7 +535,40 @@ func (t *ArchiveTable) AggregateCols(constraint string, groupCols []GroupCol, ag
 // an untagged return reports TierUnreported, which reads as "did not say" and cannot be told from
 // a peer too old to report a tier at all.
 func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats) ([]AggRow, error) {
-	return runAggLadder(t.aggLadder(stats), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
+	return runAggLadder(t.aggLadder(stats, false), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
+}
+
+// AggregateColsStatsRedacted is AggregateColsStats for a caller NOT entitled to sealed values, as
+// DB.AggregateColsStatsRedacted is for a mutable table: every rung answers as if the archive had no
+// key, so a sealed value is undefined to the WHERE clause, the group key, the aggregate and its FILTER
+// alike. A sealed attribute whose older records hold it in the clear reads as undefined in those too.
+func (t *ArchiveTable) AggregateColsStatsRedacted(constraint string, groupCols []GroupCol, aggs []AggSpec, stats *collections.ScanStats) ([]AggRow, error) {
+	return runAggLadder(t.aggLadder(stats, true), AggRequest{Constraint: constraint, GroupCols: groupCols, Aggs: aggs})
+}
+
+// keylessWithholds reports whether a redacted aggregate reads, anywhere -- the constraint, a group
+// column, an aggregate or its filter -- an attribute the archive withholds from that reader by name
+// (see collections.Archive.KeylessWithholds). Records written before such an attribute was sealed
+// hold it in the clear, and so do the index postings, zone maps and columns built from them; only the
+// keyless scan reads it as that reader must, as undefined.
+func (t *ArchiveTable) keylessWithholds(req AggRequest) bool {
+	if t.a.KeylessWithholdsIn(req.Constraint) {
+		return true
+	}
+	for _, g := range req.GroupCols {
+		if t.a.KeylessWithholds(g.Attr) {
+			return true
+		}
+	}
+	for _, a := range req.Aggs {
+		if a.Arg != "*" && t.a.KeylessWithholds(a.Arg) {
+			return true
+		}
+		if a.Filter != "" && t.a.KeylessWithholdsIn(a.Filter) {
+			return true
+		}
+	}
+	return false
 }
 
 // aggLadder is the archive's ordered list of aggregate strategies: each serves the whole request
@@ -439,8 +590,17 @@ func (t *ArchiveTable) AggregateColsStats(constraint string, groupCols []GroupCo
 // untagged return reports TierUnreported, which reads as "did not say" and cannot be told from a
 // peer too old to report a tier at all. A rung that declines tags nothing, so the tier a caller
 // sees is always the tier of the rung that actually answered.
-func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
+//
+// redact is the caller's entitlement, as in the mutable ladder. The rungs that read only stored counts
+// and columns serve both readers, since neither ever holds a sealed value; those that evaluate a record
+// take the entitlement down to it. The index rung for a constrained count is skipped for a redacted
+// caller: it decides straddling segments by evaluating records with the key. And a redacted request
+// that reads a sealed attribute at all goes straight to the scan (see keylessWithholds).
+func (t *ArchiveTable) aggLadder(stats *collections.ScanStats, redact bool) []AggStrategy {
 	var matchAll matchAllMemo
+	// Asked per rung rather than memoized: a ladder may be driven with several requests, and the
+	// answer is a parse of the request's expressions, and only on an archive that seals.
+	scanOnly := func(req AggRequest) bool { return redact && t.keylessWithholds(req) }
 	return []AggStrategy{
 		aggRung{"match-none", func(req AggRequest) ([]AggRow, bool, error) {
 			// A constraint that can never match needs no data read at all. Answered by running the
@@ -465,7 +625,7 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
 			// Postings and stored counts, reading no record at all -- the one strategy that is not
 			// a scan of anything. Unbeatable for the unconstrained shapes, which is why this half
 			// of the rung sits above the columnar ones.
-			if !matchAll.is(req.Constraint) {
+			if scanOnly(req) || !matchAll.is(req.Constraint) {
 				return nil, false, nil
 			}
 			rows, ok := t.aggregateFromIndex(req.Constraint, req.GroupCols, req.Aggs)
@@ -486,10 +646,14 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
 			// Not gated on match-all, unlike its mutable counterpart: an unconstrained plain count
 			// has already been taken by the index rung above unless that declined, and this is a
 			// better answer than the scan when it does.
-			if !req.isPlainCount() {
+			if !req.isPlainCount() || scanOnly(req) {
 				return nil, false, nil
 			}
-			n, ok := t.a.CountConstraint(req.Constraint)
+			count := t.a.CountConstraint
+			if redact {
+				count = t.a.CountConstraintRedacted
+			}
+			n, ok := count(req.Constraint)
 			if !ok {
 				return nil, false, nil
 			}
@@ -508,7 +672,14 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
 			// rung at all. Declines, among other reasons, for a predicate not proven free of
 			// CurrentTime: a window whose bounds move between the two passes is not one segment
 			// statistics can be attributed to.
-			rows, ok := t.groupedFromColumns(req.Constraint, req.GroupCols, req.Aggs)
+			if scanOnly(req) {
+				return nil, false, nil
+			}
+			var src GroupStatsSource = t
+			if redact {
+				src = redactedArchiveGroupStats{t}
+			}
+			rows, ok := GroupedFromColumns(src, req.Constraint, req.GroupCols, req.Aggs)
 			if !ok {
 				return nil, false, nil
 			}
@@ -520,7 +691,7 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
 			// constrained shapes it answers from zone verdicts -- which read every straddling
 			// segment record by record, and so lose to the columnar pass by an order of magnitude
 			// on exactly the windowed grouped counts a dashboard asks. See the measurement above.
-			if matchAll.is(req.Constraint) {
+			if redact || matchAll.is(req.Constraint) {
 				return nil, false, nil
 			}
 			rows, ok := t.aggregateFromIndex(req.Constraint, req.GroupCols, req.Aggs)
@@ -535,8 +706,15 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
 			// per-segment columnar blocks instead of decoding every record. Declines (and falls
 			// through to the scan) unless the archive carries an accelerator and the aggregate is
 			// in scope.
+			if scanOnly(req) {
+				return nil, false, nil
+			}
+			numStats := t.NumStats
+			if redact {
+				numStats = t.numStatsRedacted
+			}
 			rows, ok := ColumnarAggregate(func(attr string) (NumStats, bool) {
-				return t.NumStats(req.Constraint, attr)
+				return numStats(req.Constraint, attr)
 			}, req.GroupCols, req.Aggs)
 			if !ok {
 				return nil, false, nil
@@ -565,7 +743,11 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
 			// it one would be a new behaviour rather than a description of this one.
 			attrs, groupCol, aggCol := AggProjection(req.GroupCols, req.Aggs)
 			stats.SetTier(collections.TierScan)
-			seq, err := t.QueryProjectStats(req.Constraint, attrs, stats)
+			project := t.QueryProjectStats
+			if redact {
+				project = t.QueryProjectStatsRedacted
+			}
+			seq, err := project(req.Constraint, attrs, stats)
 			if err != nil {
 				return nil, false, err
 			}
@@ -576,6 +758,30 @@ func (t *ArchiveTable) aggLadder(stats *collections.ScanStats) []AggStrategy {
 			return rows, true, nil
 		}},
 	}
+}
+
+// redactedArchiveGroupStats is the GroupStatsSource of a redacted archive aggregate (see
+// collections.Archive.GroupStatsConstraintAggsRedacted), the archive's counterpart of
+// redactedGroupStats.
+type redactedArchiveGroupStats struct{ t *ArchiveTable }
+
+func (r redactedArchiveGroupStats) GroupStatsConstraintAggs(constraint string, groups []collections.GroupSpec,
+	aggCols []collections.GroupAggCol, countFilters []string) ([]collections.GroupStats, bool) {
+	return r.t.a.GroupStatsConstraintAggsRedacted(constraint, groups, aggCols, countFilters)
+}
+
+func (r redactedArchiveGroupStats) GroupStatsAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
+	countFilters []string) ([]collections.GroupStats, bool) {
+	return r.t.a.GroupStatsAllAggsRedacted(groups, aggCols, countFilters)
+}
+
+// numStatsRedacted is NumStats for a caller not entitled to sealed values.
+func (t *ArchiveTable) numStatsRedacted(constraint, attr string) (NumStats, bool) {
+	q, ok := numStatsQuery(constraint)
+	if !ok {
+		return NumStats{}, false
+	}
+	return t.a.NumStatsQueryRedacted(q, attr)
 }
 
 // aggregateFromIndex answers the aggregate without reading records where the per-segment
@@ -869,6 +1075,11 @@ func (t *ArchiveTable) watchAs(ctx context.Context, cursor []byte, redact bool) 
 	if err != nil {
 		return nil, err
 	}
+	return archiveWatchEvents(seq), nil
+}
+
+// archiveWatchEvents converts an archive's change stream to db watch events.
+func archiveWatchEvents(seq iter.Seq[collections.WatchEvent]) iter.Seq[WatchEvent] {
 	return func(yield func(WatchEvent) bool) {
 		for ev := range seq {
 			we := WatchEvent{Key: string(ev.Key), Ad: ev.Ad, Cursor: ev.Cursor}
@@ -886,7 +1097,7 @@ func (t *ArchiveTable) watchAs(ctx context.Context, cursor []byte, redact bool) 
 				return
 			}
 		}
-	}, nil
+	}
 }
 
 // WatchCursor returns an opaque cursor at the current head of the archive's change log.
@@ -1136,14 +1347,38 @@ func mergeNames(base, add []string) []string {
 	return base
 }
 
-// EncryptionEnabled reports whether this archive's values are sealed. See
-// collections.Archive.EncryptionEnabled: today this is false for every archive, because the archive
-// open path passes no data key. It is reported rather than omitted so the difference from a mutable
-// table is visible in .stats instead of implied by a missing line.
-func (t *ArchiveTable) EncryptionEnabled() bool { return t.a.EncryptionEnabled() }
+// EncryptionEnabled reports ENCRYPTION AT REST, as DB.EncryptionEnabled does: the archive's master key
+// is wrapped under pool keys. Without them the archive still seals (see SealsValues), but its master
+// sits beside the data in the clear, which protects nothing and is reported here as false.
+func (t *ArchiveTable) EncryptionEnabled() bool { return t.enc.protected() }
+
+// SealsValues reports whether this archive seals any attribute values at all -- private attributes
+// always, and the explicit set -- as DB.SealsValues does. A table that seals nothing has nothing to
+// withhold from a reader not entitled to sealed values.
+func (t *ArchiveTable) SealsValues() bool { return t.a.SealsValues() }
 
 // EncryptedAttrNames reports the attributes this archive seals, matching DB.EncryptedAttrNames.
 func (t *ArchiveTable) EncryptedAttrNames() []string { return t.a.EncryptedAttrNames() }
+
+// SealedIndexes names the configured indexes this open left out because the sealing policy names
+// their attribute. Normally empty; see openArchiveTable.
+func (t *ArchiveTable) SealedIndexes() []string { return append([]string(nil), t.sealedIndexes...) }
+
+// SetEncryptedAttrs replaces the explicit set of attributes sealed at rest and persists it
+// (archiveconfig.json), as DB.SetEncryptedAttrs does for a mutable table. It errors if the archive has
+// no key or a named attribute is indexed.
+//
+// Appends from now on seal the new set. Records already appended keep the form they were written in
+// until maintenance next rewrites their segment (a merge, a retrain, interning), which seals them; a
+// history is not rewritten just for this. Until then a read not entitled to sealed values withholds
+// the attribute by name, so what such a reader sees does not depend on when a record was written.
+func (t *ArchiveTable) SetEncryptedAttrs(attrs []string) error {
+	if err := t.a.SetEncryptedAttrs(attrs); err != nil {
+		return err
+	}
+	names := t.a.EncryptedAttrNames()
+	return t.cfg.update(func(cfg *ArchiveConfig) { cfg.EncryptedAttrs = names })
+}
 
 // StaleIndexSegments reports how many sealed segments within the backfill horizon still carry
 // an index built under an older configuration, and how many are sealed in total. Normally zero;

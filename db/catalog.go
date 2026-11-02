@@ -247,7 +247,7 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	}
 	openedArchives, err := openConcurrently(archiveNames, "archive", cfg.OnOpenStep,
 		func(name string) (*ArchiveTable, error) {
-			return openArchiveTable(filepath.Join(aroot, name), ArchiveConfig{})
+			return openArchiveTable(filepath.Join(aroot, name), ArchiveConfig{}, cat.archiveSealing())
 		},
 		func(a *ArchiveTable) { _ = a.Close() })
 	if err != nil {
@@ -296,6 +296,12 @@ func (cat *Catalog) tableConfig(dir string) Config {
 		cfg.OnSealMigration = func(segments int) { cat.onSealMigration(name, segments) }
 	}
 	return cfg
+}
+
+// archiveSealing is what every archive table this catalog opens seals with: the catalog's pool keys and
+// its default explicit set, as tableConfig gives each mutable table.
+func (cat *Catalog) archiveSealing() *archiveSealing {
+	return &archiveSealing{poolKeys: cat.poolKeys, encAttrs: cat.encAttrs}
 }
 
 // deltaMaxForDir returns the delta-record bound for the table living in dir: its per-table
@@ -523,7 +529,7 @@ func (cat *Catalog) CreateArchiveTable(name string, cfg ArchiveConfig) (*Archive
 	if cat.dir == "" {
 		return nil, fmt.Errorf("catalog: archive tables require a persistent catalog")
 	}
-	at, err := openArchiveTable(filepath.Join(cat.dir, archivesSubdir, name), cfg)
+	at, err := openArchiveTable(filepath.Join(cat.dir, archivesSubdir, name), cfg, cat.archiveSealing())
 	if err != nil {
 		return nil, fmt.Errorf("catalog: creating archive %q: %w", name, err)
 	}

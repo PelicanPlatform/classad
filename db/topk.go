@@ -38,18 +38,44 @@ func (t *ArchiveTable) TopKStats(constraint string, attrs []string, orderAttr st
 	return rows, stats, err
 }
 
+// TopKRedacted is TopK for a caller NOT entitled to sealed values, as DB.TopKRedacted is for a mutable
+// table: the constraint is matched, the rows ordered and the projection read with no key.
+func (t *ArchiveTable) TopKRedacted(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, error) {
+	return t.topKRunAs(constraint, attrs, orderAttr, desc, k, nil, true)
+}
+
+// TopKStatsRedacted is TopKStats with TopKRedacted's entitlement.
+func (t *ArchiveTable) TopKStatsRedacted(constraint string, attrs []string, orderAttr string, desc bool, k int) ([][]classad.Value, collections.ScanStats, error) {
+	var stats collections.ScanStats
+	rows, err := t.topKRunAs(constraint, attrs, orderAttr, desc, k, &stats, true)
+	return rows, stats, err
+}
+
 // topKRun is the shared two-pass body: a columnar cutoff scan finds the k-th order value (filling
 // stats when non-nil), then the projection runs with `orderAttr {>=|<=} cutoff` appended -- which
 // the columns and zone maps narrow to ~k rows -- instead of projecting every matching row and
 // heaping the lot. Falls back to the plain path (unaugmented) when the columnar cutoff is unavailable.
 func (t *ArchiveTable) topKRun(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats) ([][]classad.Value, error) {
+	return t.topKRunAs(constraint, attrs, orderAttr, desc, k, stats, false)
+}
+
+// topKRunAs is topKRun for either entitlement. A redacted caller's cutoff is the redacted one, which
+// declines where the archive may hold the order attribute's sealed values in the clear (see
+// collections.Archive.TopKOrderThresholdRedacted), and its projection pass is keyless.
+func (t *ArchiveTable) topKRunAs(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats, redact bool) ([][]classad.Value, error) {
 	proj, orderIdx, added := withOrderAttr(attrs, orderAttr)
+	threshold := t.a.TopKOrderThreshold
+	project := t.a.QueryProjectStats
+	if redact {
+		threshold = t.a.TopKOrderThresholdRedacted
+		project = t.a.QueryProjectStatsRedacted
+	}
 	c2, err := topKAugment(constraint, orderAttr, desc, k,
-		func(q *vm.Query) (float64, int, bool) { return t.a.TopKOrderThreshold(q, orderAttr, desc, k, stats) })
+		func(q *vm.Query) (float64, int, bool) { return threshold(q, orderAttr, desc, k, stats) })
 	if err != nil {
 		return nil, err
 	}
-	return topKResult(t.a.QueryProjectStats(c2, proj, nil), orderIdx, desc, k, added), nil
+	return topKResult(project(c2, proj, nil), orderIdx, desc, k, added), nil
 }
 
 // TopK is ArchiveTable.TopK for a mutable table.

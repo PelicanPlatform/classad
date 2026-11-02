@@ -124,9 +124,17 @@ func TestArchiveAdminOverRPC(t *testing.T) {
 		t.Errorf("ClusterId==321 matched %d after maintenance, want 1", n)
 	}
 
-	// Unknown archive admin action errors.
-	if _, err := c.AdminTable(ctx, "history", "encrypt.set", "X"); err == nil {
-		t.Error("encrypt.set should be rejected for an archive table")
+	// An unknown archive admin action errors.
+	if _, err := c.AdminTable(ctx, "history", "no.such.action", "X"); err == nil {
+		t.Error("an unknown action should be rejected for an archive table")
+	}
+	// encrypt.set is the same policy change it is on a mutable table, and refused, as there, for an
+	// indexed attribute.
+	if msg, err := c.AdminTable(ctx, "history", "encrypt.set", "X"); err != nil || !strings.Contains(msg, "x") {
+		t.Errorf("archive encrypt.set = %q, %v", msg, err)
+	}
+	if _, err := c.AdminTable(ctx, "history", "encrypt.set", "ClusterId"); err == nil {
+		t.Error("encrypt.set accepted an indexed attribute")
 	}
 
 	// Admin is DAEMON-gated: a non-privileged connection is refused.

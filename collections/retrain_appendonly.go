@@ -408,10 +408,26 @@ func (c *Collection) rewriteZones(sh *shard, srcs []*segment, out *segment) map[
 		return nil
 	}
 	if slices.ContainsFunc(zs, func(z map[uint32]zoneRange) bool { return z == nil }) {
-		return computeSegZones(c, out, out.used, attrs, inline)
+		return computeSegZones(c, out, out.used, attrs, inline, sh.sealsName)
+	}
+	// A source zoned before an attribute was sealed carries a range of its clear values; the rewrite
+	// seals them, so the output keeps no zone for it (see computeSegZones).
+	var sealedIDs map[uint32]struct{}
+	if sh.sealsName != nil {
+		for _, za := range attrs {
+			if sh.sealsName(za.name) {
+				if sealedIDs == nil {
+					sealedIDs = map[uint32]struct{}{}
+				}
+				sealedIDs[za.id] = struct{}{}
+			}
+		}
 	}
 	merged := make(map[uint32]zoneRange, len(zs[0]))
 	for id, z := range zs[0] {
+		if _, sealed := sealedIDs[id]; sealed {
+			continue
+		}
 		ok := true
 		for _, other := range zs[1:] {
 			o, has := other[id]

@@ -846,6 +846,9 @@ func (c *Collection) CountQueryRedacted(q *vm.Query) (int, bool) {
 }
 
 func (c *Collection) countQueryAs(q *vm.Query, redact bool) (int, bool) {
+	if redact {
+		q = c.keylessQuery(q) // a column of a sealed attribute's clear values is not this reader's to count on
+	}
 	st := c.schemaScan.Load()
 	if st == nil {
 		return 0, false
