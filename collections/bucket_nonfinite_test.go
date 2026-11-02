@@ -86,7 +86,7 @@ func TestGroupAccumDropsNonFiniteBucket(t *testing.T) {
 	realKey := func(f float64) groupComp {
 		return groupComp{kind: gkReal, raw: int64(math.Float64bits(f))}
 	}
-	a := newGroupAccum([]int64{day})
+	a := newGroupAccum([]int64{day}, nil)
 	for _, f := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
 		g, ok := accFor1(a, realKey(f), 0)
 		if !ok || g != nil {

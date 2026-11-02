@@ -394,6 +394,31 @@ func (a *Archive) GroupStatsAllAggs(groups []GroupSpec, aggCols []GroupAggCol,
 	return a.c.GroupStatsAllAggs(groups, aggCols, countFilters)
 }
 
+// GroupValuesConstraintAggs is GroupStatsConstraintAggs reduced into caller-supplied accumulators.
+// See Collection.GroupValuesConstraintAggs.
+func (a *Archive) GroupValuesConstraintAggs(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
+	return a.c.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink)
+}
+
+// GroupValuesConstraintAggsRedacted is GroupValuesConstraintAggs for a reader not entitled to sealed values.
+func (a *Archive) GroupValuesConstraintAggsRedacted(constraint string, groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
+	return a.c.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink)
+}
+
+// GroupValuesAllAggs is GroupValuesConstraintAggs over every record. See Collection.GroupValuesAllAggs.
+func (a *Archive) GroupValuesAllAggs(groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
+	return a.c.GroupValuesAllAggs(groups, aggCols, countFilters, newSink)
+}
+
+// GroupValuesAllAggsRedacted is GroupValuesAllAggs for a reader not entitled to sealed values.
+func (a *Archive) GroupValuesAllAggsRedacted(groups []GroupSpec, aggCols []GroupAggCol,
+	countFilters []string, newSink func() GroupSink) ([]GroupValues, bool) {
+	return a.c.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink)
+}
+
 // GroupCountAll returns the per-value record counts of groupAttr over EVERY record, read out of the
 // columnar blocks. The caller must have established that its query matches all records.
 // ok=false ⇒ not columnar-eligible; group by scanning records.

@@ -155,7 +155,7 @@ func BenchmarkGroupAccum(b *testing.B) {
 			b.ReportAllocs()
 			var comps [maxGroupCols]groupComp
 			for i := 0; i < b.N; i++ {
-				a := newGroupAccum([]int64{arm.bucket})
+				a := newGroupAccum([]int64{arm.bucket}, nil)
 				for j := range keys {
 					comps[0] = keys[j]
 					a.accFor(&comps, 0)
@@ -210,7 +210,7 @@ func BenchmarkGroupAccumTwoCols(b *testing.B) {
 			const base = 1700000000
 			var comps [maxGroupCols]groupComp
 			for i := 0; i < b.N; i++ {
-				a := newGroupAccum([]int64{0, arm.bucket})
+				a := newGroupAccum([]int64{0, arm.bucket}, nil)
 				for j := 0; j < n; j++ {
 					comps[0] = groupComp{kind: gkString, raw: arm.owner(j)}
 					if arm.second != nil {
@@ -263,7 +263,7 @@ func BenchmarkGroupThreeCols(b *testing.B) {
 			const base = 1700000000
 			var comps [maxGroupCols]groupComp
 			for i := 0; i < b.N; i++ {
-				a := newGroupAccum([]int64{0, 0, arm.bucket})
+				a := newGroupAccum([]int64{0, 0, arm.bucket}, nil)
 				for j := 0; j < n; j++ {
 					comps[0] = groupComp{kind: gkString, raw: arm.owner(j)}
 					comps[1] = groupComp{kind: gkString, raw: arm.site(j)}
