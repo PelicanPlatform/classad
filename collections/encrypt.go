@@ -45,12 +45,28 @@ var errEncryptionDisabled = errors.New("collections: encryption at rest is not e
 // the two comparisons it replaces, and the cache grew without bound over an unbounded key
 // space. The explicit set can change at runtime (SetEncryptedAttrs), so it is consulted live.
 
-// dataKeySealer adapts the DB data key to wire.Sealer via crypt's AES-256-GCM.
-type dataKeySealer struct{ key []byte }
+// dataKeySealer adapts the DB data key to wire.Sealer via crypt's AES-256-GCM. The cipher is built
+// once, with the sealer (crypt.AEAD), not per value: a collection's data key is fixed for its
+// lifetime, so its sealer is too, and a store opened under another key builds another sealer.
+// err is set instead of aead when the key is one AES cannot use; every call then fails with it, as
+// every call did when the cipher was built per call.
+type dataKeySealer struct {
+	aead *crypt.AEAD
+	err  error
+}
 
-func (s dataKeySealer) Seal(pt []byte) (nonce, ct []byte, err error) { return crypt.Seal(s.key, pt) }
+func (s dataKeySealer) Seal(pt []byte) (nonce, ct []byte, err error) {
+	if s.err != nil {
+		return nil, nil, s.err
+	}
+	return s.aead.Seal(pt)
+}
+
 func (s dataKeySealer) Open(nonce, ct []byte) ([]byte, error) {
-	return crypt.Open(s.key, nonce, ct)
+	if s.err != nil {
+		return nil, s.err
+	}
+	return s.aead.Open(nonce, ct)
 }
 
 // newDataKeySealer builds the DB-wide Sealer from a data key. The key must be the
@@ -60,7 +76,8 @@ func newDataKeySealer(dataKey []byte) wire.Sealer {
 	if len(dataKey) == 0 {
 		return nil
 	}
-	return dataKeySealer{append([]byte(nil), dataKey...)}
+	a, err := crypt.NewAEAD(dataKey)
+	return dataKeySealer{aead: a, err: err}
 }
 
 // encSetHolder is the immutable, atomically-swappable set of case-folded attribute

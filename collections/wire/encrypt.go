@@ -16,7 +16,7 @@ import (
 // wrong key). It is used from a single goroutine per encode/decode pass.
 // Implementations must be safe for concurrent use: both the parallel query scan and the parallel wire
 // scan open sealed values from several goroutines at once, and nothing serializes them. The built-in
-// dataKeySealer satisfies this by holding only an immutable key and building a fresh GCM per call.
+// dataKeySealer satisfies this through crypt.AEAD, which never hands one cipher to two goroutines at once.
 type Sealer interface {
 	Seal(plaintext []byte) (nonce, ciphertext []byte, err error)
 	Open(nonce, ciphertext []byte) (plaintext []byte, err error)
