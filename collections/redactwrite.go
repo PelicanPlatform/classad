@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"errors"
 	"strings"
 	"sync/atomic"
 
@@ -42,7 +43,9 @@ import (
 //
 // The one failure left is a carried value that will not open or parse, which only damage or a foreign
 // key can produce; a keyed read of the record fails on it too. The write is then refused as "decode",
-// the reason any undecodable record gives, and the key is left as it was.
+// the reason any undecodable record gives, and the key is left as it was. A carried value that opens but
+// will not seal again refuses the write as "seal-failed", as a write whose own value will not seal is:
+// the record is never stored with that value in the clear.
 
 // keylessPart is one stored record a keyless compose reads: its decompressed bytes, which the caller
 // owns, and, for an interned record, its segment's dictionary.
@@ -211,9 +214,15 @@ func (c *Collection) composeKeyless(dst []byte, parts []keylessPart, patch *clas
 		if inline {
 			inl[i] = a
 		} else {
-			rec, n, ok := wire.AppendAdInlineFromInternedResealed(nil, a, p.resolve, carry, c.sealer, &sc)
+			rec, n, err := wire.AppendAdInlineFromInternedResealedErr(nil, a, p.resolve, carry, c.sealer, &sc)
 			resealed += n
-			if !ok {
+			if errors.Is(err, wire.ErrSealFailed) {
+				// A carried value opened but would not seal again. Nothing is composed: the only
+				// record left to write holds it in the clear, so the write is refused instead, as a
+				// write whose own value would not seal is.
+				return dst, resealed, failSeal
+			}
+			if err != nil {
 				// Malformed, or a carried sealed value that would not open or parse. Either way the
 				// record cannot be composed; the reason is the one a keyed read of it would give.
 				return dst, resealed, failDecode
@@ -260,8 +269,8 @@ func (tx *Txn) encodePatchKeyless(dst []byte, b *txnBuf, h uint64) (raw []byte, 
 		}
 	}
 	if why == failSeal {
-		// The stored record was readable; a value of this write would not seal. Nothing was
-		// encoded, and the write is refused rather than stored in the clear.
+		// The stored record was readable; a value of this write, or one the compose re-sealed, would
+		// not seal. Nothing was encoded, and the write is refused rather than stored in the clear.
 		return nil, false, false, why
 	}
 	if why == failNotVisible && !c.keyExists(b.key, h) {

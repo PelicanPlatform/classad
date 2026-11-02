@@ -428,3 +428,64 @@ func TestSealFailureKeepsDeltaChainBounded(t *testing.T) {
 		t.Errorf("Salary = %q, want three", v)
 	}
 }
+
+// TestSealFailureRefusesRedactedReseal: a transaction not entitled to sealed values that rewrites an
+// interned record whole has the store open each sealed value the result carries, rewrite it to the
+// inline form, and seal it again. When that Seal fails the write is refused as "seal-failed" and the
+// record stays as it was: the rewritten plaintext is not stored in place of the ciphertext, and the
+// write is not reported as a damaged record ("decode"), which it is not. The write sets nothing sealed,
+// so every Seal it makes is a re-seal.
+func TestSealFailureRefusesRedactedReseal(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	c, _ := resealFixture(t, 4, func(i int) [3]string {
+		return [3]string{`"user"`, `"tok"`, fmt.Sprintf("%q", failClosedSecret)}
+	})
+	c.deltaMax = 0 // every patch takes the whole-record path
+	fs := injectSealFailure(c)
+	ctr := &resealSealer{inner: fs}
+	c.sealer = ctr
+	write := func() CommitResult {
+		tx := c.BeginRedacted()
+		tx.PatchAttrs([]byte("1.0"), mustAd(t, `[JobStatus=2]`), []string{"Filler0"})
+		return tx.Commit()
+	}
+
+	res := write()
+	if ctr.opens.Load() == 0 || ctr.seals.Load() == 0 {
+		t.Fatalf("the write opened %d and sealed %d values; the fixture never reached the re-seal", ctr.opens.Load(), ctr.seals.Load())
+	}
+	i := slices.IndexFunc(res.Unapplied, func(k []byte) bool { return string(k) == "1.0" })
+	if i < 0 {
+		t.Fatalf("the write was not refused: %+v", res)
+	}
+	if res.UnappliedReasons[i] != failSeal.String() || !errors.Is(res.UnappliedErrs[i], wire.ErrSealFailed) {
+		t.Errorf("refused as %q (%v), want %q / wire.ErrSealFailed", res.UnappliedReasons[i], res.UnappliedErrs[i], failSeal)
+	}
+	got, ok := c.Get([]byte("1.0"))
+	if !ok {
+		t.Fatal("the record is gone")
+	}
+	if v, _ := got.EvaluateAttrInt("JobStatus"); v != 1 {
+		t.Errorf("JobStatus = %d, want 1 (the write was refused)", v)
+	}
+	if _, has := got.Lookup("Filler0"); !has {
+		t.Error("Filler0 was removed by a refused write")
+	}
+	if v, _ := got.EvaluateAttrString("ClaimId"); v != failClosedSecret {
+		t.Errorf("ClaimId = %q, want the stored value", v)
+	}
+	assertNoPlaintext(t, c, c.dir, failClosedSecret)
+
+	// The same write applies once sealing works: the refusal was the Seal failure, not the record.
+	fs.failing.Store(false)
+	if res := write(); res.HasUnapplied() || res.Committed != 1 {
+		t.Fatalf("the write was refused once sealing worked: %+v", res)
+	}
+	got, _ = c.Get([]byte("1.0"))
+	if v, _ := got.EvaluateAttrString("ClaimId"); v != failClosedSecret {
+		t.Errorf("ClaimId = %q after the re-sealed write, want the stored value", v)
+	}
+	assertNoPlaintext(t, c, c.dir, failClosedSecret)
+}
