@@ -47,6 +47,12 @@ type queryPlan struct {
 	// with no query still needs it: an unfiltered redacted scan redacts in its emit callback, and
 	// the records it is handed are completed before that.
 	sealed sealedUse
+	// noColDecide is set for a reader not entitled to sealed values whose query reads a field with
+	// computed values that are not trusted (keylessComputedHides): such a value may be a function of
+	// an attribute the policy has sealed since, computed from its plaintext, so the columns must not
+	// decide the query for this reader -- neither accept a record nor reject one. Each record is
+	// matched as it reads with no key instead.
+	noColDecide bool
 }
 
 // newQueryPlan builds the scan plan for q: the reusable match state, the projection
@@ -89,6 +95,7 @@ func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats,
 		stats:    stats,
 		sealed:   sealedUseFor(redact),
 	}
+	qp.noColDecide = redact && c.keylessComputedHides(q)
 	if qf := c.foldFor(q); qf != nil {
 		f := qp
 		fplan := qf.ReadPlan()

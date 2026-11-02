@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -575,22 +576,19 @@ func TestWidenedSealPolicyColumnTiers(t *testing.T) {
 	}
 }
 
-// TestWidenedSealPolicyComputedValues: a computed value kept beside a column is a function of the
-// attributes its expression reads. One computed before the policy sealed such an attribute is a function
-// of that attribute's plaintext, and a reader not entitled to sealed values must not be answered from
-// it: MemDouble = RequestMemory * 2 reads as undefined to such a reader once RequestMemory is sealed.
-func TestWidenedSealPolicyComputedValues(t *testing.T) {
-	if !mmapSupported {
-		t.Skip("persistence is unix-only")
-	}
-	t.Parallel()
+// widenedComputedStore builds the parity records interned and columnarized under a policy that seals
+// only the private attributes, so a segment keeps computed values of MemDouble = RequestMemory * 2, and
+// then widens the policy to seal RequestMemory: every kept MemDouble is a function of a value the
+// policy now seals.
+func widenedComputedStore(t *testing.T) *Collection {
+	t.Helper()
 	opts := sealedParityOpts(t.TempDir())
 	opts.EncryptedAttrs = nil
 	c, err := Open(opts)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
+	t.Cleanup(func() { c.Close() })
 	sealedPut(t, c, 0, sealedParityN)
 	internAll(c)
 	if !c.BuildAndEnableSchemaScan(2000, 8) {
@@ -616,6 +614,19 @@ func TestWidenedSealPolicyComputedValues(t *testing.T) {
 	if err := c.SetEncryptedAttrs([]string{"RequestMemory"}); err != nil {
 		t.Fatal(err)
 	}
+	return c
+}
+
+// TestWidenedSealPolicyComputedValues: a computed value kept beside a column is a function of the
+// attributes its expression reads. One computed before the policy sealed such an attribute is a function
+// of that attribute's plaintext, and a reader not entitled to sealed values must not be answered from
+// it: MemDouble = RequestMemory * 2 reads as undefined to such a reader once RequestMemory is sealed.
+func TestWidenedSealPolicyComputedValues(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	t.Parallel()
+	c := widenedComputedStore(t)
 	// Premise: the entitled count is served, from the computed values, with the real answer.
 	want := 0
 	for _, ad := range sealedSources(t, false) {
@@ -678,6 +689,111 @@ func TestWidenedSealPolicyComputedValues(t *testing.T) {
 	if n, ok := c.CountQuery(mustParseQ(t, `MemDouble > 2000`)); ok && n != want {
 		t.Errorf("after the migration the entitled count = %d, want %d", n, want)
 	}
+}
+
+// TestWidenedSealPolicyComputedProjection: a computed value kept beside a column stands in for an
+// expression-valued cell in two places the scans share: the evaluating projection serves the cell from
+// it, and the column prefilter decides a constraint with it, accepting or rejecting the record without
+// reading the record. After a widen that seals RequestMemory a kept MemDouble is a function of
+// RequestMemory's plaintext, so for a reader not entitled to sealed values neither may be used: every
+// read returns MemDouble, and matches a constraint on it, as the record evaluates for that reader --
+// with RequestMemory undefined. NumValuesQueryRedacted must not feed it the kept values either. After a
+// migration certifies the store, both readers still read as the oracle says.
+func TestWidenedSealPolicyComputedProjection(t *testing.T) {
+	if !mmapSupported {
+		t.Skip("persistence is unix-only")
+	}
+	t.Parallel()
+	c := widenedComputedStore(t)
+	attrs := []string{"ClusterId", "MemDouble"}
+	// The oracle: the plain evaluation of the source ads, and of the same ads without RequestMemory.
+	sources := sealedSources(t, false)
+	stripped := make([]*classad.ClassAd, len(sources))
+	for i, ad := range sources {
+		stripped[i] = mustAd(t, ad.String())
+		stripped[i].Delete("RequestMemory")
+	}
+	filters := []string{`true`, `ClusterId >= 0`, `MemDouble > 2000`, `MemDouble =!= undefined`,
+		// Constraints the record answers TRUE for this reader while a kept value would reject it.
+		`MemDouble =?= undefined`, `(MemDouble > 2000) =!= true`, `(MemDouble > 2000) =!= true && ClusterId >= 0`}
+	check := func(stage string, redact bool) {
+		t.Helper()
+		oracle := sources
+		if redact {
+			oracle = stripped
+		}
+		for _, f := range filters {
+			q := mustParseQ(t, f)
+			wantRows, wantDefined := 0, 0
+			for _, ad := range oracle {
+				if q.Matches(ad) {
+					wantRows++
+					if !ad.EvaluateAttr("MemDouble").IsUndefined() {
+						wantDefined++
+					}
+				}
+			}
+			if redact && (wantDefined != 0 || (strings.Contains(f, "=?= undefined") || strings.Contains(f, "=!= true")) && wantRows != sealedParityN) {
+				t.Fatalf("oracle: %s matches %d records, %d with MemDouble defined", f, wantRows, wantDefined)
+			}
+			project := func(st *ScanStats) func(func([]classad.Value) bool) {
+				switch {
+				case redact && st != nil:
+					return c.QueryProjectStatsRedacted(q, attrs, st)
+				case redact:
+					return c.QueryProjectRedacted(q, attrs)
+				case st != nil:
+					return c.QueryProjectStats(q, attrs, st)
+				default:
+					return c.QueryProject(q, attrs)
+				}
+			}
+			for _, withStats := range []bool{false, true} {
+				var st *ScanStats
+				name := "QueryProject"
+				if withStats {
+					st, name = &ScanStats{}, "QueryProjectStats"
+				}
+				rows, defined := 0, 0
+				for vals := range project(st) {
+					rows++
+					if !vals[1].IsUndefined() {
+						defined++
+					}
+				}
+				if rows != wantRows || defined != wantDefined {
+					t.Errorf("%s: %s(%s) redact=%v returned %d rows, %d with MemDouble defined; want %d, %d", stage, name, f, redact, rows, defined, wantRows, wantDefined)
+				}
+			}
+			if !redact {
+				continue
+			}
+			if n := countSeq(c.QueryRedacted(q)); n != wantRows {
+				t.Errorf("%s: QueryRedacted(%s) matched %d, want %d", stage, f, n, wantRows)
+			}
+			if n := countSeq(c.QueryRawRedacted(q)); n != wantRows {
+				t.Errorf("%s: QueryRawRedacted(%s) matched %d, want %d", stage, f, n, wantRows)
+			}
+			if n, ok := c.CountQueryRedacted(q); ok && n != wantRows {
+				t.Errorf("%s: CountQueryRedacted(%s) = %d, want %d", stage, f, n, wantRows)
+			}
+			var fed atomic.Int64
+			sink := func() func(NumValue) { return func(NumValue) { fed.Add(1) } }
+			if ok := c.NumValuesQueryRedacted(q, "MemDouble", sink, func() {}); ok && fed.Load() != 0 {
+				t.Errorf("%s: NumValuesQueryRedacted(%s, MemDouble) fed %d values", stage, f, fed.Load())
+			}
+		}
+	}
+	check("after the widen", true)
+	check("after the widen", false)
+	if c.MigrateSealedAttrs(0) == 0 {
+		t.Fatal("the migration rewrote nothing")
+	}
+	if !c.computedTrusted() {
+		t.Fatal("a clean migration did not certify the store")
+	}
+	check("after the migration", true)
+	check("after the migration", false)
 }
 
 // TestWidenedSealPolicyMigration: a seal migration run on the open store after a widen -- what table

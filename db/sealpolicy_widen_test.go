@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections"
 )
 
 // A table whose sealing policy is widened while it is open (SetEncryptedAttrs) holds the newly named
@@ -53,8 +54,11 @@ func widenPut(t *testing.T, d *DB, hidden bool, from, step int) {
 }
 
 // widenTables returns the widened table and the reference: the same writes with SecretNum and Salary
-// left out, in a table that seals nothing.
-func widenTables(t *testing.T) (sealed, hidden *DB, dir string) {
+// left out, in a table that seals nothing. interned retrains both before columnarizing them: the
+// recompaction interns the records, and only interned segments are columnarized, which is where the
+// columns and the computed values of MemDouble live. Otherwise every segment is inline, and every read
+// is answered from the records.
+func widenTables(t *testing.T, interned bool) (sealed, hidden *DB, dir string) {
 	t.Helper()
 	dir = t.TempDir()
 	pool := KEK{ID: "POOL", Material: []byte("pool-signing-key-material-for-the-widen-test")}
@@ -73,6 +77,11 @@ func widenTables(t *testing.T) (sealed, hidden *DB, dir string) {
 		hidden bool
 	}{{sealed, false}, {hidden, true}} {
 		widenPut(t, tbl.d, tbl.hidden, 0, 1)
+		if interned {
+			if n, err := tbl.d.c.RetrainDict(4096); err != nil || n == 0 {
+				t.Fatalf("fixture: retrain recompacted %d shards (%v), so no segment is interned", n, err)
+			}
+		}
 		if !tbl.d.EnableSchemaScan(2000, 8) {
 			t.Fatal("no columnar schema derived")
 		}
@@ -90,7 +99,38 @@ func widenTables(t *testing.T) (sealed, hidden *DB, dir string) {
 	if st, ok := sealed.NumStats("", "SecretNum"); !ok || st.N != widenN {
 		t.Fatalf("fixture: after the widen the columns serve %d SecretNum values (ok=%v), want %d", st.N, ok, widenN)
 	}
+	if interned {
+		// Premise: the columns decide a constraint on MemDouble for an entitled reader, from the values
+		// computed while SecretNum was in the clear -- the ones a redacted read must not be decided by.
+		var st collections.ScanStats
+		seq, err := sealed.QueryProjectStats("MemDouble > 14600", []string{"ClusterId"}, &st)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for range seq {
+			n++
+		}
+		// MemDouble = 2*(7000+i) > 14600 for i > 300.
+		if want := widenN - 301; n != want || st.RecordsColumnDecided == 0 || st.RecordsReassembled != 0 {
+			t.Fatalf("fixture: entitled MemDouble > 14600 matched %d (want %d); the columns decided %d records and %d were reassembled, want the computed values to decide them all", n, want, st.RecordsColumnDecided, st.RecordsReassembled)
+		}
+	}
 	return sealed, hidden, dir
+}
+
+// renderProjected renders projected rows order-independently.
+func renderProjected(seq func(func([]classad.Value) bool)) string {
+	var out []string
+	for vals := range seq {
+		row := make([]string, len(vals))
+		for i, v := range vals {
+			row[i] = v.String()
+		}
+		out = append(out, strings.Join(row, ","))
+	}
+	slices.Sort(out)
+	return strings.Join(out, "\n")
 }
 
 func renderAggRows(rows []AggRow) string {
@@ -123,13 +163,41 @@ var widenAggs = []struct {
 
 // TestWidenedSealPolicyTableReads: every unprivileged read of a widened table answers as the table
 // without the newly sealed attributes does, before and after the maintenance pass that migrates it,
-// and that pass leaves none of their values in the clear on disk.
+// over inline segments and over interned, columnarized ones, and on the inline table that pass leaves
+// none of their values in the clear on disk (a dictionary-compressed segment hides plaintext from a
+// search of the files as well as a cipher does, so the check is made where it can see).
 func TestWidenedSealPolicyTableReads(t *testing.T) {
 	t.Parallel()
-	sealed, hidden, dir := widenTables(t)
+	for _, interned := range []bool{false, true} {
+		name := "inline"
+		if interned {
+			name = "interned"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			testWidenedSealPolicyTableReads(t, interned)
+		})
+	}
+}
+
+func testWidenedSealPolicyTableReads(t *testing.T, interned bool) {
+	sealed, hidden, dir := widenTables(t, interned)
+	// A user-defined aggregate that takes column values, which the ladder reads through
+	// NumValuesRedacted rather than the built-in aggregates' column reads.
+	sumCol := registerOnce(t, "widen_sum_col", ladderSumColAgg{})
+	aggs := slices.Clone(widenAggs)
+	for _, arg := range []string{"SecretNum", "MemDouble"} {
+		for _, where := range []string{"true", "RequestMemory > 1100"} {
+			aggs = append(aggs, struct {
+				where  string
+				groups []GroupCol
+				aggs   []AggSpec
+			}{where, nil, []AggSpec{{Func: AggUser, UserFunc: sumCol, Arg: arg}}})
+		}
+	}
 	check := func(when string) {
 		t.Helper()
-		for _, a := range widenAggs {
+		for _, a := range aggs {
 			got, err := sealed.AggregateColsStatsRedacted(a.where, a.groups, a.aggs, nil, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -171,6 +239,20 @@ func TestWidenedSealPolicyTableReads(t *testing.T) {
 			}
 		}
 		for _, where := range []string{`SecretNum > 7300`, `Salary =!= undefined`, `MemDouble > 14600`, `true`} {
+			// The evaluating projection: MemDouble is an expression over SecretNum, served from the
+			// value computed beside its column when that value is trusted.
+			attrs := []string{"ClusterId", "MemDouble", "SecretNum"}
+			pseq, err := sealed.QueryProjectRedacted(where, attrs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hpseq, err := hidden.QueryProject(where, attrs)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if g, w := renderProjected(pseq), renderProjected(hpseq); g != w {
+				t.Errorf("%s: redacted projection %s\n got: %.300s\nwant: %.300s", when, where, g, w)
+			}
 			seq, err := sealed.QueryRedacted(where)
 			if err != nil {
 				t.Fatal(err)
@@ -206,21 +288,25 @@ func TestWidenedSealPolicyTableReads(t *testing.T) {
 		t.Fatalf("entitled MAX(SecretNum) = %s (%v)", renderAggRows(rows), err)
 	}
 
-	clearBefore := 0
-	disk := readAll(t, dir)
-	for i := 0; i < widenN; i++ {
-		if bytes.Contains(disk, []byte(widenToken(i))) {
-			clearBefore++
+	if interned {
+		sealed.Maintain(MaintainOptions{})
+	} else {
+		clearBefore := 0
+		disk := readAll(t, dir)
+		for i := 0; i < widenN; i++ {
+			if bytes.Contains(disk, []byte(widenToken(i))) {
+				clearBefore++
+			}
 		}
-	}
-	if clearBefore == 0 {
-		t.Fatal("fixture: no record's Salary is in the clear on disk before maintenance; the migration check tests nothing")
-	}
-	sealed.Maintain(MaintainOptions{})
-	disk = readAll(t, dir)
-	for i := 0; i < widenN; i++ {
-		if bytes.Contains(disk, []byte(widenToken(i))) {
-			t.Fatalf("record %d's Salary is still in the clear on disk after maintenance (%d were before)", i, clearBefore)
+		if clearBefore == 0 {
+			t.Fatal("fixture: no record's Salary is in the clear on disk before maintenance; the migration check tests nothing")
+		}
+		sealed.Maintain(MaintainOptions{})
+		disk = readAll(t, dir)
+		for i := 0; i < widenN; i++ {
+			if bytes.Contains(disk, []byte(widenToken(i))) {
+				t.Fatalf("record %d's Salary is still in the clear on disk after maintenance (%d were before)", i, clearBefore)
+			}
 		}
 	}
 	if n := sealed.c.MigrateSealedAttrs(1); n != 0 {

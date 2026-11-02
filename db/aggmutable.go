@@ -223,10 +223,9 @@ func (db *DB) numStatsRedacted(constraint, attr string) (NumStats, bool) {
 }
 
 // The GroupValuesSource half of the same wrapper. It calls the collection's *Redacted entry points
-// outright rather than delegating to the unredacted ones: the two are identical on a mutable
-// collection today, because withholding a sealed value from a keyless reader applies only to an
-// append-only store, but "identical today" is a property of hidesClearSealed rather than of this
-// code, and naming the redacted call keeps this correct if that changes.
+// outright rather than delegating to the unredacted ones: a mutable table whose sealing policy was
+// widened holds the newly sealed attributes' earlier values in the clear, in its columns and in the
+// values computed beside them, and only the redacted entry points decline to answer from those.
 func (r redactedGroupStats) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
 	aggCols []collections.GroupAggCol, countFilters []string,
 	newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {

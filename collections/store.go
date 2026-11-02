@@ -1503,10 +1503,14 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		st.built = true
 		// Ask the columns before rebuilding a record: over a columnarized segment a rejected record
 		// would otherwise be reassembled in full and then thrown away. nil when the columns cannot
-		// usefully decide this query, which leaves the scan exactly as it was.
-		st.pre = c.newColPrefilter(qp.q)
-		if qp.fold != nil {
-			st.preFold = c.newColPrefilter(qp.fold.q)
+		// usefully decide this query, which leaves the scan exactly as it was -- and when they must
+		// not decide it for this reader (see queryPlan.noColDecide): their scope reads a computed
+		// value where the record keeps an expression.
+		if !qp.noColDecide {
+			st.pre = c.newColPrefilter(qp.q)
+			if qp.fold != nil {
+				st.preFold = c.newColPrefilter(qp.fold.q)
+			}
 		}
 		// A projected read can be built from the named columns instead of reassembling the record and
 		// then discarding most of it -- but only when the match did not need the ad. See colproject.go.

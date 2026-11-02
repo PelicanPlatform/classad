@@ -102,8 +102,12 @@ func (c *Collection) queryProjectAs(q *vm.Query, attrs []string, stats *ScanStat
 		if proj != nil {
 			proj.closure = true
 			// This consumer never sees the entries, only the values they evaluate to, which is
-			// what lets the scan serve an expression-valued cell from its precomputed literal.
-			proj.evaluates = true
+			// what lets the scan serve an expression-valued cell from its precomputed literal --
+			// except for a reader not entitled to sealed values while those literals are not trusted:
+			// one may be a function of an attribute the policy has since sealed (see computedTrusted),
+			// and this reader evaluates the record's expression with that attribute undefined. The
+			// narrowed ad also answers the constraint, so the literal would leak through it as well.
+			proj.evaluates = !redact || c.computedTrusted()
 		}
 		// A redacted read withholds private attributes BY NAME, resolved once here rather than
 		// per record. Leaving this to the sealed-value path is not enough, and the gap is in the

@@ -167,12 +167,15 @@ type NumValue struct {
 
 // NumValuesQueryRedacted is NumValuesQuery for a reader NOT entitled to sealed values, on the same
 // terms as NumStatsQueryRedacted: columns never hold a sealed value, so it answers as NumValuesQuery
-// does, except on a store that may hold a sealed attribute's values in the clear, where it declines.
+// does, except on a store that may hold a sealed attribute's values in the clear, where it declines --
+// and where attr or the constraint reads a field whose computed values are not trusted, since a value
+// computed before a widen can be a function of a now-sealed attribute (keylessComputedHides).
 func (c *Collection) NumValuesQueryRedacted(q *vm.Query, attr string, newSink func() func(NumValue), merge func()) bool {
-	if c.keylessHides(attr) {
+	q = c.keylessQuery(q)
+	if c.keylessHides(attr) || c.keylessComputedHides(q, attr) {
 		return false
 	}
-	return c.NumValuesQuery(c.keylessQuery(q), attr, newSink, merge)
+	return c.NumValuesQuery(q, attr, newSink, merge)
 }
 
 // NumValuesQuery feeds every numeric value of attr, over the records matching q, to sink -- through
