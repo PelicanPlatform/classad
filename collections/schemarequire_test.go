@@ -27,7 +27,7 @@ func requireCorpus(t *testing.T, n int) (*Collection, [][]byte) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wires = append(wires, c.encodeAd(ad.AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 	}
 	return c, wires
 }

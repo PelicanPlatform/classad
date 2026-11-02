@@ -571,7 +571,7 @@ func TestColPayloadMagicCannotBeLegacy(t *testing.T) {
 		}
 		var wires [][]byte
 		for range 16 {
-			wires = append(wires, c.encodeAd(mustAdOld(t, sb.String()).AST()))
+			wires = append(wires, mustEncodeAd(c.encodeAd(mustAdOld(t, sb.String()).AST())))
 		}
 		s := buildAdSchema(wires, adSchemaOpts{Presence: 0.80, Fit: 0.90, Strings: true})
 		blk := encodeColumnarBlock(s, encodeRows(s, wires), resolveColLayout(s, nil), identityCodec{}, nil)
@@ -600,7 +600,7 @@ func TestColPayloadVersion1BodyIsLegacyPayload(t *testing.T) {
 	c := New(Options{Shards: 1})
 	var wires [][]byte
 	for i := range 64 {
-		wires = append(wires, c.encodeAd(mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d\nArch=\"X86_64\"\nExtra=%d", 1+i%8, 1024+i, i*100000)).AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d\nArch=\"X86_64\"\nExtra=%d", 1+i%8, 1024+i, i*100000)).AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.80, Fit: 0.90, Strings: true})
 	blk := encodeColumnarBlock(s, encodeRows(s, wires), resolveColLayout(s, hotHalf(s)), identityCodec{}, nil)

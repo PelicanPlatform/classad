@@ -285,7 +285,10 @@ func TestWireRowAssemblerSkipsOpenedSealedValues(t *testing.T) {
 		}
 		defer c.Close()
 		table := wire.NewInternTable()
-		w := c.encodeInterned(nil, ad.AST(), table, nil)
+		w, err := c.encodeInterned(nil, ad.AST(), table, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !recordHasSealedEntry(w) {
 			t.Fatal("the encoded record holds no sealed value")
 		}

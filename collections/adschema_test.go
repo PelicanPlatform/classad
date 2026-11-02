@@ -75,7 +75,7 @@ func TestAdSchemaRoundTripSynthetic(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		w := c.encodeAd(ad.AST())
+		w := mustEncodeAd(c.encodeAd(ad.AST()))
 		wires = append(wires, w)
 		return w
 	}

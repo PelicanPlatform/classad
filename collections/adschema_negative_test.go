@@ -59,7 +59,7 @@ func TestNegativeFromTextIsColumnar(t *testing.T) {
 					ad.InsertAttr("ExitCode", tc.val(i))
 					ad.InsertAttrString("Owner", fmt.Sprintf("user%02d", i))
 				}
-				wires = append(wires, c.encodeAd(ad.AST()))
+				wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 			}
 			s := buildAdSchema(wires, negAdSchemaOpts)
 			id, _ := c.intern.LookupID("ExitCode")
@@ -106,7 +106,7 @@ func TestNegativeStaysOutOfUnsignedColumn(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wires = append(wires, c.encodeAd(ad.AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 	}
 	s := buildAdSchema(wires, negAdSchemaOpts)
 	assertIntField(t, s, c, "ExitCode", true)
@@ -115,7 +115,7 @@ func TestNegativeStaysOutOfUnsignedColumn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := c.encodeAd(odd.AST())
+	w := mustEncodeAd(c.encodeAd(odd.AST()))
 	assertRoundTrip(t, s, w, "negative into an unsigned column")
 }
 
@@ -139,7 +139,7 @@ func TestOldFormNegativeRoundTrips(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wires = append(wires, c.encodeAd(ad.AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 	}
 	s := buildAdSchema(wires, negAdSchemaOpts)
 	assertIntField(t, s, c, "ExitCode", false)
@@ -229,7 +229,7 @@ func TestNegativeRealFromTextIsColumnar(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			wires = append(wires, c.encodeAd(ad.AST()))
+			wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 		}
 		s := buildAdSchema(wires, negAdSchemaOpts)
 		id, _ := c.intern.LookupID("Rate")

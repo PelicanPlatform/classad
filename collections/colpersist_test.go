@@ -17,7 +17,7 @@ func TestColSegmentMarshalRoundTrip(t *testing.T) {
 		ad := mustAdOld(t, fmt.Sprintf(
 			"Cpus=%d\nMemory=%d\nDisk=%d\nBig=%t\nLoad=%f\nArch=\"X86_64\"\nMachine=\"m%03d.example.org\"\nExtra=%d",
 			1+i%8, 1024+i*64, i*4096, i%2 == 0, float64(i)/3, i, i*100000)) // Extra escapes small widths
-		wires = append(wires, c.encodeAd(ad.AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.80, Fit: 0.90, Strings: true})
 	recs := encodeRows(s, wires)
@@ -84,7 +84,7 @@ func TestUnmarshalColSegmentTruncated(t *testing.T) {
 	c := New(Options{Shards: 1})
 	var wires [][]byte
 	for i := 0; i < 20; i++ {
-		wires = append(wires, c.encodeAd(mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d", 1+i, 1024+i)).AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d", 1+i, 1024+i)).AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.5, Fit: 0.95})
 	blk := encodeColumnarBlock(s, encodeRows(s, wires), resolveColLayout(s, nil), identityCodec{}, nil)
@@ -105,8 +105,8 @@ func TestColSegmentSchemaNameAnchored(t *testing.T) {
 	c := New(Options{Shards: 1})
 	var wires [][]byte
 	for i := 0; i < 80; i++ {
-		wires = append(wires, c.encodeAd(mustAdOld(t,
-			fmt.Sprintf("Cpus=%d\nMemory=%d\nDisk=%d", 1+i%8, 1024+i*64, i*4096)).AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(mustAdOld(t,
+			fmt.Sprintf("Cpus=%d\nMemory=%d\nDisk=%d", 1+i%8, 1024+i*64, i*4096)).AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.8, Fit: 0.95})
 	blk := encodeColumnarBlock(s, encodeRows(s, wires), resolveColLayout(s, hotHalf(s)), identityCodec{}, nil)

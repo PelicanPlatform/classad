@@ -374,7 +374,11 @@ func (c *Collection) sealedSamples(n int) [][]byte {
 		if err != nil {
 			continue // a sample that does not decode is left out, never kept as it was
 		}
-		out = append(out, c.encodeAd(ad))
+		enc, err := c.encodeAd(ad)
+		if err != nil {
+			continue // nor is one whose values will not seal: kept, it would be plaintext in the dictionary
+		}
+		out = append(out, enc)
 	}
 	return out
 }

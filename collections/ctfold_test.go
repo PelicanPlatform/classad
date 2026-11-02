@@ -520,7 +520,7 @@ func TestNamesCurrentTime(t *testing.T) {
 			`[CurrentTimeX = 1; XCurrentTime = 2]`:         false,
 			`[A = 11; B = "currenttime"; C = CurrentTime]`: false,
 		} {
-			w := c.encodeAd(mustAd(t, src).AST())
+			w := mustEncodeAd(c.encodeAd(mustAd(t, src).AST()))
 			if got := c.namesCurrentTime(w); got != want {
 				t.Errorf("inline=%v %s: namesCurrentTime = %v, want %v", inline, src, got, want)
 			}

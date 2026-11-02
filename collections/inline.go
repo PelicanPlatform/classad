@@ -22,7 +22,11 @@ var ErrTooDeep = wire.ErrTooDeep
 // encodeAd encodes an ad to wire bytes for storage, with the collection's hot set.
 // When encryption at rest is enabled, the designated attributes' values are sealed
 // with the DB data key (persistent/inline collections only).
-func (c *Collection) encodeAd(ad *ast.ClassAd) []byte {
+//
+// The error is a value that could not be sealed (wire.ErrSealFailed). The caller must not
+// store the ad: there are no bytes to store, because the alternative was the value in the
+// clear, and every write path refuses the write instead.
+func (c *Collection) encodeAd(ad *ast.ClassAd) ([]byte, error) {
 	return c.encodeAdInto(nil, ad)
 }
 
@@ -30,15 +34,15 @@ func (c *Collection) encodeAd(ad *ast.ClassAd) []byte {
 // which in Commit they are: the record is compressed out of them and they are dead on the next
 // line. Every encode allocating its own buffer made that 12% of a real queue replay's allocation.
 // A caller that RETAINS the result (Txn.putWire buffers it until the commit lands) must pass nil.
-func (c *Collection) encodeAdInto(dst []byte, ad *ast.ClassAd) []byte {
+func (c *Collection) encodeAdInto(dst []byte, ad *ast.ClassAd) ([]byte, error) {
 	if c.inline {
 		if c.sealer != nil {
-			return wire.EncodeInlineWithHotEnc(dst, ad, c.currentHotNames(), c.shouldEncrypt, c.sealer)
+			return wire.EncodeInlineWithHotSealed(dst, ad, c.currentHotNames(), c.shouldEncrypt, c.sealer)
 		}
-		return wire.EncodeInlineWithHot(dst, ad, c.currentHotNames())
+		return wire.EncodeInlineWithHot(dst, ad, c.currentHotNames()), nil
 	}
 	hot, closureComplete := c.hotSetForEncode(ad)
-	return wire.EncodeWithHotClosure(dst, ad, c.intern, hot, closureComplete)
+	return wire.EncodeWithHotClosure(dst, ad, c.intern, hot, closureComplete), nil
 }
 
 // decodeWire decodes stored wire bytes back to an ast.ClassAd, opening any encrypted
@@ -125,8 +129,9 @@ func (c *Collection) recordToInternedDict(dict *segDictHandle, dst, w []byte) ([
 		// schema (a sealed ClaimId reappeared as a string FIELD) and in the .idx sidecar on disk.
 		//
 		// encodeInterned, ten lines below, is the same re-encode done correctly; this one simply did not
-		// pass the sealer.
-		return wire.EncodeWithHotEnc(dst[:0], ad, c.intern, nil, c.shouldEncrypt, c.sealer), true
+		// pass the sealer. A value that will not seal leaves the record out, as one that will not decode is.
+		out, err := wire.EncodeWithHotSealed(dst[:0], ad, c.intern, nil, c.shouldEncrypt, c.sealer)
+		return out, err == nil
 	}
 	return wire.Encode(dst[:0], ad, c.intern), true
 }
@@ -197,12 +202,13 @@ func (c *Collection) decodeWireDict(dict *segDictHandle, w []byte) (*ast.ClassAd
 // encodeInterned encodes ad in the form the compaction/reseal transcode writes an interned
 // segment: segment-local ids against `table` with a hot header, sealing designated attribute
 // values when the collection encrypts at rest. Mirrors encodeAd's persistent branch, but
-// interned rather than inline.
-func (c *Collection) encodeInterned(dst []byte, ad *ast.ClassAd, table *wire.InternTable, hot map[uint32]struct{}) []byte {
+// interned rather than inline. The error is encodeAd's: a value that would not seal, and the
+// record must not be written.
+func (c *Collection) encodeInterned(dst []byte, ad *ast.ClassAd, table *wire.InternTable, hot map[uint32]struct{}) ([]byte, error) {
 	if c.sealer != nil {
-		return wire.EncodeWithHotEnc(dst, ad, table, hot, c.shouldEncrypt, c.sealer)
+		return wire.EncodeWithHotSealed(dst, ad, table, hot, c.shouldEncrypt, c.sealer)
 	}
-	return wire.EncodeWithHot(dst, ad, table, hot)
+	return wire.EncodeWithHot(dst, ad, table, hot), nil
 }
 
 func (c *Collection) wireLookupDict(dict *segDictHandle, a wire.Ad, name string) ([]byte, bool) {
@@ -285,8 +291,10 @@ func (c *Collection) wireToInline(dict *segDictHandle, w []byte) ([]byte, bool) 
 	}
 	if c.sealer != nil {
 		// Re-seal on the way to inline so the sample never carries plaintext values (which would
-		// leak into a retrained dict or a columnar block); matches the active segment's form.
-		return wire.EncodeInlineWithHotEnc(nil, a, nil, c.shouldEncrypt, c.sealer), true
+		// leak into a retrained dict or a columnar block); matches the active segment's form. A
+		// value that will not seal skips the record rather than hand it on unsealed.
+		out, err := wire.EncodeInlineWithHotSealed(nil, a, nil, c.shouldEncrypt, c.sealer)
+		return out, err == nil
 	}
 	return wire.EncodeInline(nil, a), true
 }
@@ -376,8 +384,13 @@ func (c *Collection) toSelfContained(dict *segDictHandle, ad []byte, codec Codec
 		return ad
 	}
 	if c.sealer != nil {
-		// Re-seal so a deferred event's copied bytes stay sealed at rest, matching the source.
-		return codec.Compress(nil, wire.EncodeInlineWithHotEnc(nil, a, nil, c.shouldEncrypt, c.sealer))
+		// Re-seal so a deferred event's copied bytes stay sealed at rest, matching the source. A
+		// value that will not seal returns the input, as any other failure here does.
+		out, err := wire.EncodeInlineWithHotSealed(nil, a, nil, c.shouldEncrypt, c.sealer)
+		if err != nil {
+			return ad
+		}
+		return codec.Compress(nil, out)
 	}
 	return codec.Compress(nil, wire.EncodeInline(nil, a))
 }

@@ -54,8 +54,8 @@ func TestIntWidth6Byte(t *testing.T) {
 	big := func(i int) int64 { return 5_000_000_000_000 + int64(i)*1_000_003 } // ~5e12, >2^32, <2^47
 	var wires [][]byte
 	for i := 0; i < 300; i++ {
-		wires = append(wires, c.encodeAd(mustAdOld(t,
-			fmt.Sprintf("Cpus=%d\nBig=%d", 1+i%8, big(i))).AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(mustAdOld(t,
+			fmt.Sprintf("Cpus=%d\nBig=%d", 1+i%8, big(i))).AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.9, Fit: 1.0})
 	bigID, _ := c.intern.LookupID("Big")
@@ -97,7 +97,7 @@ func BenchmarkIntWidth6vs8(b *testing.B) {
 	var wires [][]byte
 	for i := 0; i < 4000; i++ {
 		v := 5_000_000_000_000 + int64(i)*1_000_003 // fits 6 bytes
-		wires = append(wires, c.encodeAd(mustAdB(b, fmt.Sprintf("Cpus=%d\nBig=%d", 1+i%8, v)).AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(mustAdB(b, fmt.Sprintf("Cpus=%d\nBig=%d", 1+i%8, v)).AST())))
 	}
 	codec, _ := NewZSTDCodec(nil)
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.9, Fit: 1.0}) // Big -> 6B

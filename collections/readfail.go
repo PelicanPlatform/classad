@@ -40,6 +40,11 @@ const (
 	failDeltaChainBroken  // the version walk truncated at a link into a segment that is gone
 	failDeltaIndexPending // a sealed segment could not be probed: its key index is not built yet
 
+	// A value the collection seals could not be sealed, so the record was not encoded (see
+	// wire.ErrSealFailed). Not a read failure: the record that would have been written does not
+	// exist, and the only alternative was to write that value in the clear.
+	failSeal
+
 	failMax // not a reason; bounds the counter array
 )
 
@@ -75,6 +80,8 @@ func (r readFail) String() string {
 		return "delta-chain-broken"
 	case failDeltaIndexPending:
 		return "delta-index-pending"
+	case failSeal:
+		return "seal-failed"
 	}
 	return "unknown"
 }

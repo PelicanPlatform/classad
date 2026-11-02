@@ -702,6 +702,17 @@ func (tx *Txn) Delete(key []byte) {
 	tx.writes[string(key)] = &txnBuf{key: append([]byte(nil), key...), del: true}
 }
 
+// refusedSealedWrite is the bookkeeping for a write refused because a value it would seal could
+// not be sealed (see wire.ErrSealFailed); the write is reported in CommitResult.Unapplied with
+// reason "seal-failed". Encoding it already advanced the key's chain in the delta tracker, for a
+// record that will not exist, so the key's next write is made whole rather than chained on that
+// count.
+func (tx *Txn) refusedSealedWrite(h uint64) {
+	if tx.c.deltas != nil {
+		tx.c.deltas.mustCompose(h)
+	}
+}
+
 // Commit applies the buffered writes, each independently: a write whose key is
 // unchanged since the transaction's snapshot commits; one whose key was modified by
 // another committer is reported in CommitResult.Conflicts and not applied (the
@@ -759,14 +770,27 @@ func (tx *Txn) Commit() CommitResult {
 				var why readFail
 				raw, w.delta, ok, why = tx.encodePatchOnly(encScratch[:0], b, h)
 				if !ok {
+					var err error
+					if why == failSeal {
+						err = wire.ErrSealFailed
+						tx.refusedSealedWrite(h)
+					}
 					unreadable = append(unreadable, b.key)
 					unreadableWhy = append(unreadableWhy, why.String())
-					unreadableErr = append(unreadableErr, nil)
+					unreadableErr = append(unreadableErr, err)
 					continue
 				}
 				encScratch = raw
 			default:
-				raw, w.delta = tx.c.encodeDelta(encScratch[:0], b.key, h, b.ad, b.changed, b.noDelta)
+				var err error
+				raw, w.delta, err = tx.c.encodeDelta(encScratch[:0], b.key, h, b.ad, b.changed, b.noDelta)
+				if err != nil {
+					tx.refusedSealedWrite(h)
+					unreadable = append(unreadable, b.key)
+					unreadableWhy = append(unreadableWhy, failSeal.String())
+					unreadableErr = append(unreadableErr, err)
+					continue
+				}
 				encScratch = raw
 			}
 			w.ct = tx.c.namesCurrentTime(raw)

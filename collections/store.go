@@ -333,7 +333,9 @@ type Options struct {
 	// AES-256-GCM under this key before being written to a segment. It must be the DB
 	// master key's DataInfo subkey (crypt.Subkey(master, crypt.DataInfo)) -- distinct
 	// from the master itself -- so a stolen database is useless without a pool key.
-	// Empty ⇒ encryption disabled (EncryptedAttrs is then inert). See encrypt.go.
+	// Empty ⇒ encryption disabled (EncryptedAttrs is then inert). Otherwise it must be exactly
+	// crypt.KeySize (32) bytes: Open refuses any other length with ErrInvalidDataKey, and New
+	// panics with it. See encrypt.go.
 	DataKey []byte
 	// EncryptedAttrs names the attributes to encrypt at rest (case-insensitive). Only
 	// meaningful with DataKey set. An encrypted attribute may NOT also be indexed
@@ -896,7 +898,13 @@ func New(opts Options) *Collection {
 	// Encryption at rest: build the DB-wide data-key sealer and the explicit encrypted-attr
 	// set. An encrypted attribute (explicit, or an always-encrypted private attribute) must
 	// not also be indexed -- its value is stored opaque, so it could never satisfy an index.
-	if c.sealer = newDataKeySealer(opts.DataKey); c.sealer != nil {
+	// A data key that cannot seal is refused here, like any other misconfiguration New is
+	// handed (Open reports it as an error instead): see ErrInvalidDataKey.
+	sealer, err := newDataKeySealer(opts.DataKey)
+	if err != nil {
+		panic("collections.New: " + err.Error())
+	}
+	if c.sealer = sealer; c.sealer != nil {
 		enc := foldedSet(opts.EncryptedAttrs)
 		for _, idxAttr := range append(append([]string{}, opts.CategoricalAttrs...), opts.ValueAttrs...) {
 			_, explicit := enc[strings.ToLower(idxAttr)]
@@ -1014,7 +1022,12 @@ func (c *Collection) Update(batch []AdUpdate) error {
 	codec := c.currentCodec()
 	byShard := make(map[int][]pendingPut, len(c.shards))
 	for i := range batch {
-		raw := c.encodeAd(batch[i].Ad.AST())
+		// Encoded before any shard commits, so a value that will not seal refuses the whole batch,
+		// as a too-deep ad does above.
+		raw, err := c.encodeAd(batch[i].Ad.AST())
+		if err != nil {
+			return fmt.Errorf("collections: ad %d: %w", i, err)
+		}
 		stored := codec.Compress(nil, raw)
 		h := c.h.Hash(batch[i].Key)
 		si := c.shardOf(batch[i].Key, h)
@@ -1067,7 +1080,10 @@ func (c *Collection) put(key []byte, ad *classad.ClassAd, deferred bool) error {
 		return err
 	}
 	codec := c.currentCodec()
-	raw := c.encodeAd(ad.AST())
+	raw, err := c.encodeAd(ad.AST())
+	if err != nil {
+		return err // a value that would not seal: nothing is stored, rather than the value in the clear
+	}
 	stored := codec.Compress(nil, raw)
 	h := c.h.Hash(key)
 	sh := c.shards[c.shardOf(key, h)]
@@ -1089,7 +1105,7 @@ func (c *Collection) put(key []byte, ad *classad.ClassAd, deferred bool) error {
 	// until some later transaction happened along -- and a restart in between stranded every
 	// fragment in the sealed segment.
 	c.collapseSealedChains()
-	err := c.writeError()
+	err = c.writeError()
 	if err == nil {
 		c.maintainOrdered(key, ad)
 	}

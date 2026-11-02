@@ -22,24 +22,34 @@ type Sealer interface {
 	Open(nonce, ciphertext []byte) (plaintext []byte, err error)
 }
 
+// ErrSealFailed is returned (wrapped, with the Sealer's own error) by the encoders that report
+// errors when a value the caller's predicate names for sealing could not be sealed. Nothing is
+// encoded for such an ad: a value that was meant to be encrypted at rest is never written in the
+// clear in its place.
+var ErrSealFailed = errors.New("wire: sealing a value failed")
+
 // encNode writes v as an nEncrypted node: v's ordinary node encoding is produced with
 // a sub-encoder sharing this encoder's mode (and intern table, so any interned name in
 // v resolves against the same table on decode), then sealed. Layout after the tag:
-// uvarint(len nonce) + nonce + uvarint(len ct) + ct. If sealing fails, it falls back to
-// the plaintext node so a data value is never lost (Seal failure is not expected).
-func (e *encoder) encNode(v ast.Expr) {
+// uvarint(len nonce) + nonce + uvarint(len ct) + ct.
+//
+// If sealing fails it writes nothing and returns the error; the caller abandons the whole ad.
+// Writing the plaintext node instead -- what this once did, so that a value was never lost --
+// stored a secret in the clear in a record that every reader takes to be sealed wherever the
+// policy says so, which is the one outcome encryption at rest exists to prevent.
+func (e *encoder) encNode(name string, v ast.Expr) error {
 	sub := encoder{t: e.t, inline: e.inline}
 	sub.node(v)
 	nonce, ct, err := e.seal.Seal(sub.buf)
 	if err != nil {
-		e.node(v)
-		return
+		return fmt.Errorf("%w: attribute %s: %w", ErrSealFailed, name, err)
 	}
 	e.buf = append(e.buf, nEncrypted)
 	e.buf = binary.AppendUvarint(e.buf, uint64(len(nonce)))
 	e.buf = append(e.buf, nonce...)
 	e.buf = binary.AppendUvarint(e.buf, uint64(len(ct)))
 	e.buf = append(e.buf, ct...)
+	return nil
 }
 
 // sealedInlineFormRecoveries counts sealed values read in the inline-names key form from inside an

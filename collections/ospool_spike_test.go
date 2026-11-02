@@ -73,7 +73,7 @@ func encodeOSPool(tb testing.TB, ads []*classad.ClassAd) (*Collection, [][]byte)
 	wires := make([][]byte, len(ads))
 	var attrs int
 	for i, ad := range ads {
-		wires[i] = c.encodeAd(ad.AST())
+		wires[i] = mustEncodeAd(c.encodeAd(ad.AST()))
 		attrs += len(ad.AST().Attributes)
 	}
 	tb.Logf("OSPool spike: %d ads, avg %d attrs/ad", len(ads), attrs/len(ads))
@@ -437,7 +437,7 @@ func TestOSPoolHotHeaderCost(t *testing.T) {
 	}
 	var rawBase, rawHot, zBase, zHot int
 	for i, ad := range ads {
-		base := c.encodeAd(ad.AST()) // default hot set
+		base := mustEncodeAd(c.encodeAd(ad.AST())) // default hot set
 		hot := wire.EncodeWithHot(nil, ad.AST(), c.intern, idSet(c.closureIDs(wire.Ad(wires[i]))))
 		rawBase += len(base)
 		rawHot += len(hot)
@@ -548,8 +548,8 @@ func TestOSPoolClosureStorageCost(t *testing.T) {
 	encH := make([][]byte, len(ads))
 	var rawP, rawH, hotAttrs int
 	for i, ad := range ads {
-		encP[i] = plain.encodeAd(ad.AST())
-		encH[i] = hot.encodeAd(ad.AST())
+		encP[i] = mustEncodeAd(plain.encodeAd(ad.AST()))
+		encH[i] = mustEncodeAd(hot.encodeAd(ad.AST()))
 		rawP += len(encP[i])
 		rawH += len(encH[i])
 		hotAttrs += len(hot.closureIDs(wire.Ad(encH[i])))

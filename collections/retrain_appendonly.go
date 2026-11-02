@@ -306,13 +306,21 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 			if err != nil {
 				return nil
 			}
+			// A value that will not seal refuses the reseal, as a record that will not decode does:
+			// the segment is left as it is rather than rebuilt with that value in the clear.
 			var stored []byte
 			if intern {
-				wireBuf = c.encodeInterned(wireBuf[:0], ad, table, hot)
+				if wireBuf, err = c.encodeInterned(wireBuf[:0], ad, table, hot); err != nil {
+					return nil
+				}
 				refreshHot()
 				stored = targetCodec.Compress(nil, wireBuf)
 			} else {
-				stored = targetCodec.Compress(nil, c.encodeAd(ad))
+				raw, err := c.encodeAd(ad)
+				if err != nil {
+					return nil
+				}
+				stored = targetCodec.Compress(nil, raw)
 			}
 			entries = append(entries, resealEntry{seq: seq, key: key, stored: stored})
 			total += recordLen(len(key), len(stored))

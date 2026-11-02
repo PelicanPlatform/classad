@@ -18,8 +18,8 @@ func TestRefitHotIntWidths(t *testing.T) {
 		if i%50 == 0 {
 			v = 5_000_000 + i // ~2% tail, overflows 2 bytes
 		}
-		wires = append(wires, c.encodeAd(mustAdOld(t,
-			fmt.Sprintf("Cpus=%d\nMem=%d\nCold=%d", 1+i%8, v, v)).AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(mustAdOld(t,
+			fmt.Sprintf("Cpus=%d\nMem=%d\nCold=%d", 1+i%8, v, v)).AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.9, Fit: 0.95, Strings: true})
 	memID, _ := c.intern.LookupID("Mem")

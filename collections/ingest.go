@@ -88,7 +88,7 @@ func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[ui
 		if e := wire.CheckDepth(ad.AST()); e != nil {
 			return nil, e
 		}
-		return c.encodeAd(ad.AST()), nil
+		return c.encodeAd(ad.AST())
 	}
 	if err != nil {
 		return nil, err

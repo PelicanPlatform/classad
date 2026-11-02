@@ -164,7 +164,10 @@ func TestInterningSizeTradeoffEncrypted(t *testing.T) {
 	}
 	encrypt := func(name string) bool { _, ok := secret[name]; return ok }
 	_, dataKey := deriveDataKey(t)
-	seal := newDataKeySealer(dataKey)
+	seal, err := newDataKeySealer(dataKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Measure how much of the value payload is sealed (context for the win).
 	sealedAds := 0

@@ -85,18 +85,35 @@ func EncodeInline(dst []byte, ad *ast.ClassAd) []byte {
 	return EncodeInlineWithHot(dst, ad, nil)
 }
 
-// EncodeInlineWithHot is EncodeInline with a populated hot header: attributes whose
-// (case-folded) name is in hot are indexed by a (nameHash32, entries-relative
-// offset-to-entry) pair, so Ad.LookupByName finds them without scanning. hot keys
-// must be lower-cased. hot may be nil.
-// EncodeWithHotEnc is EncodeWithHot for at-rest encryption: any attribute for which
+// EncodeWithHotEnc is EncodeWithHotSealed for a caller that cannot handle an error. It panics
+// if a value cannot be sealed, rather than store it in the clear.
+//
+// Deprecated: use EncodeWithHotSealed, which reports a Seal failure as an error.
+func EncodeWithHotEnc(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint32]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+	return mustSeal(EncodeWithHotSealed(dst, ad, t, hot, encrypt, seal))
+}
+
+// mustSeal is the deprecated non-error encoders' handling of a Seal failure. There is no value
+// they could return that is both a valid ad and free of the plaintext, so they do not return.
+func mustSeal(out []byte, err error) []byte {
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// EncodeWithHotSealed is EncodeWithHot for at-rest encryption: any attribute for which
 // encrypt(name) is true is sealed with seal and stored as an nEncrypted node (its value's
-// interned node encoding, sealed), exactly as EncodeInlineWithHotEnc does for inline ads.
+// interned node encoding, sealed), exactly as EncodeInlineWithHotSealed does for inline ads.
 // Encrypted attributes are never hot (never indexed), so they never enter the hot header.
 // encrypt and seal must both be non-nil to encrypt anything; with seal nil this is EncodeWithHot.
-func EncodeWithHotEnc(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint32]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+//
+// If any value cannot be sealed it returns dst unchanged and an error wrapping ErrSealFailed:
+// the ad is not encoded at all, and in particular that value is never written in the clear.
+// Names the ad carries may already have been interned into t; an unused name there is harmless.
+func EncodeWithHotSealed(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint32]struct{}, encrypt func(name string) bool, seal Sealer) ([]byte, error) {
 	if ad == nil {
-		return Encode(dst, ad, t)
+		return Encode(dst, ad, t), nil
 	}
 	e := encoder{t: t, seal: seal, buf: getScratch()}
 	defer func() { putScratch(e.buf) }()
@@ -106,7 +123,9 @@ func EncodeWithHotEnc(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint3
 		e.buf = binary.AppendUvarint(e.buf, uint64(id))
 		nodeOff := len(e.buf)
 		if seal != nil && encrypt != nil && encrypt(attr.Name) {
-			e.encNode(attr.Value) // sealed; never hot
+			if err := e.encNode(attr.Name, attr.Value); err != nil { // sealed; never hot
+				return dst, err
+			}
 			continue
 		}
 		e.node(attr.Value)
@@ -114,33 +133,57 @@ func EncodeWithHotEnc(dst []byte, ad *ast.ClassAd, t *InternTable, hot map[uint3
 			hots = append(hots, hotPair{id, uint32(nodeOff)})
 		}
 	}
-	return frame(dst, 0 /* flags */, hots, len(ad.Attributes), e.buf)
+	return frame(dst, 0 /* flags */, hots, len(ad.Attributes), e.buf), nil
 }
 
+// EncodeInlineWithHot is EncodeInline with a populated hot header: attributes whose
+// (case-folded) name is in hot are indexed by a (nameHash32, entries-relative
+// offset-to-entry) pair, so Ad.LookupByName finds them without scanning. hot keys
+// must be lower-cased. hot may be nil.
 func EncodeInlineWithHot(dst []byte, ad *ast.ClassAd, hot map[string]struct{}) []byte {
-	return EncodeInlineWithHotEnc(dst, ad, hot, nil, nil)
+	return mustSeal(encodeInline(dst, ad, hot, nil, nil, 0)) // no sealer: nothing is sealed, nothing can fail
 }
 
-// EncodeInlineWithHotEnc is EncodeInlineWithHot with at-rest encryption: the value of
+// EncodeInlineWithHotEnc is EncodeInlineWithHotSealed for a caller that cannot handle an error.
+// It panics if a value cannot be sealed, rather than store it in the clear.
+//
+// Deprecated: use EncodeInlineWithHotSealed, which reports a Seal failure as an error.
+func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+	return mustSeal(encodeInline(dst, ad, hot, encrypt, seal, 0))
+}
+
+// EncodeInlineWithHotSealed is EncodeInlineWithHot with at-rest encryption: the value of
 // any attribute for which encrypt(name) is true is sealed with seal and stored as an
 // nEncrypted node (decodable only with the matching Opener). A predicate (rather than a
 // set) lets the caller encrypt by rule -- e.g. HTCondor's private-attribute prefix --
 // not just an enumerable list. An encrypted attribute is never hot: it is opaque to the
 // index/match fast path, so it is excluded from the hot header even if listed in hot.
 // encrypt and seal must both be non-nil to encrypt anything.
-func EncodeInlineWithHotEnc(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+//
+// If any value cannot be sealed it returns dst unchanged and an error wrapping ErrSealFailed:
+// the ad is not encoded at all, and in particular that value is never written in the clear.
+func EncodeInlineWithHotSealed(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) ([]byte, error) {
 	return encodeInline(dst, ad, hot, encrypt, seal, 0)
 }
 
-// EncodeInlineDelta encodes ad as a DELTA record: byte-identical to an ordinary inline ad
-// except that flagDelta is set, so a reader knows these are only the attributes one write
-// changed and that the rest must be merged in from older versions of the key. The caller is
-// responsible for having built ad from exactly the changed attributes.
+// EncodeInlineDelta is EncodeInlineDeltaSealed for a caller that cannot handle an error. It
+// panics if a value cannot be sealed, rather than store it in the clear.
+//
+// Deprecated: use EncodeInlineDeltaSealed, which reports a Seal failure as an error.
 func EncodeInlineDelta(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) []byte {
+	return mustSeal(encodeInline(dst, ad, hot, encrypt, seal, flagDelta))
+}
+
+// EncodeInlineDeltaSealed encodes ad as a DELTA record: byte-identical to an ordinary inline
+// ad except that flagDelta is set, so a reader knows these are only the attributes one write
+// changed and that the rest must be merged in from older versions of the key. The caller is
+// responsible for having built ad from exactly the changed attributes. A Seal failure is
+// reported as for EncodeInlineWithHotSealed.
+func EncodeInlineDeltaSealed(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer) ([]byte, error) {
 	return encodeInline(dst, ad, hot, encrypt, seal, flagDelta)
 }
 
-func encodeInline(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer, extraFlags byte) []byte {
+func encodeInline(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt func(name string) bool, seal Sealer, extraFlags byte) ([]byte, error) {
 	e := encoder{inline: true, seal: seal, buf: getScratch()}
 	defer func() { putScratch(e.buf) }()
 	var hots []hotPair
@@ -171,7 +214,9 @@ func encodeInline(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt 
 			}
 			e.putString(attr.Name)
 			if seal != nil && encrypt != nil && encrypt(attr.Name) {
-				e.encNode(attr.Value)
+				if err := e.encNode(attr.Name, attr.Value); err != nil {
+					return dst, err
+				}
 				continue
 			}
 			e.node(attr.Value)
@@ -181,7 +226,7 @@ func encodeInline(dst []byte, ad *ast.ClassAd, hot map[string]struct{}, encrypt 
 	if ad != nil {
 		n = len(ad.Attributes)
 	}
-	return frame(dst, flagInlineNames|extraFlags, hots, n, e.buf)
+	return frame(dst, flagInlineNames|extraFlags, hots, n, e.buf), nil
 }
 
 // inFolded reports whether set (keyed by foldASCII'd names) contains name, without

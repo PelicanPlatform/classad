@@ -532,7 +532,7 @@ func reviewWires(t *testing.T, c *Collection, n int, src func(i int) string) [][
 		if err != nil {
 			t.Fatal(err)
 		}
-		out = append(out, c.encodeAd(ad.AST()))
+		out = append(out, mustEncodeAd(c.encodeAd(ad.AST())))
 	}
 	return out
 }

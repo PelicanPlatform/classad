@@ -336,9 +336,14 @@ func MigrateSkippedLiveDelta() int64 { return migrateSkippedLiveDelta.Load() }
 // h is the key's hash, which the caller has already computed: taking the key as a string and
 // re-deriving it here cost a string allocation for the parameter and a []byte allocation per use
 // of it, three per write, for a number the caller was holding.
-func (c *Collection) encodeDelta(dst []byte, key []byte, h uint64, ad *classad.ClassAd, changed []string, removed bool) ([]byte, bool) {
+//
+// The error is encodeAd's: a value that would not seal. Nothing is to be stored for the write, and
+// the tracker has already counted it, so the caller must make the key's next write whole (see
+// deltaTracker.mustCompose).
+func (c *Collection) encodeDelta(dst, key []byte, h uint64, ad *classad.ClassAd, changed []string, removed bool) ([]byte, bool, error) {
 	if c.deltaMax <= 0 || c.deltas == nil || !c.inline {
-		return c.encodeAdInto(dst, ad.AST()), false
+		raw, err := c.encodeAdInto(dst, ad.AST())
+		return raw, false, err
 	}
 	var d *ast.ClassAd
 	eligible := !removed && len(changed) > 0
@@ -354,11 +359,13 @@ func (c *Collection) encodeDelta(dst []byte, key []byte, h uint64, ad *classad.C
 		eligible = false
 	}
 	if !c.deltas.next(h, eligible, c.keyExists(key, h), c.deltaMax) {
-		return c.encodeAdInto(dst, ad.AST()), false
+		raw, err := c.encodeAdInto(dst, ad.AST())
+		return raw, false, err
 	}
 	// Deltas are encoded with the inline-name form and no hot header: the hot header indexes
 	// a whole ad for the match fast path, and a fragment has no business claiming to be one.
-	return wire.EncodeInlineDelta(dst, d, nil, c.shouldEncrypt, c.sealer), true
+	raw, err := wire.EncodeInlineDeltaSealed(dst, d, nil, c.shouldEncrypt, c.sealer)
+	return raw, true, err
 }
 
 // materializeAt reconstructs the whole ad for key as of snapshot s0 from a delta chain,
@@ -568,7 +575,11 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	if want&mWire == 0 {
 		return nil, merged, true, failNone
 	}
-	return c.encodeAdInto(dst, merged.AST()), merged, true, failNone
+	raw, err := c.encodeAdInto(dst, merged.AST())
+	if err != nil {
+		return nil, nil, false, failSeal
+	}
+	return raw, merged, true, failNone
 }
 
 // chainVersions gathers every version of key visible at s0, sorted by commit sequence, and locates
@@ -953,7 +964,11 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isD
 	deltaOK := eligible && c.deltaMax > 0 && c.deltas != nil && c.inline && c.canWriteDelta()
 	if deltaOK {
 		if c.deltas.next(h, true, c.keyExists(b.key, h), c.deltaMax) {
-			return wire.EncodeInlineDelta(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer), true, true, failNone
+			raw, err := wire.EncodeInlineDeltaSealed(dst, b.patch.AST(), nil, c.shouldEncrypt, c.sealer)
+			if err != nil {
+				return nil, false, false, failSeal
+			}
+			return raw, true, true, failNone
 		}
 		// The delta was permissible but the tracker declined: either the key has no whole record
 		// to chain to, or the chain has reached DeltaMax. Distinguishing them matters because the
@@ -1014,7 +1029,10 @@ func (tx *Txn) encodePatchOnly(dst []byte, b *txnBuf, h uint64) (raw []byte, isD
 		ad.Delete(n)
 	}
 	b.ad = ad
-	return c.encodeAdInto(dst, ad.AST()), false, true, failNone
+	if raw, err := c.encodeAdInto(dst, ad.AST()); err == nil {
+		return raw, false, true, failNone
+	}
+	return nil, false, false, failSeal
 }
 
 // deltaModeFile records that a store has written delta records, so a later open knows it must
