@@ -189,7 +189,8 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 	}
 	// The RIGHT side is hashed and the left streamed, matching the caller's own naming so a
 	// plan reads the same here as where it was made.
-	scanSeq, err := cat.joinSource(spec.Left)
+	readProj := planJoinRead(spec)
+	scanSeq, err := cat.joinSource(spec.Left, readProj.left)
 	if err != nil {
 		return nil, err
 	}
@@ -218,12 +219,12 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 		// hold. Whether a source sequence may be ranged twice is a property of each kind
 		// of table, not something this can assume, so the side is resolved again rather
 		// than re-ranged. It costs a query's construction, not a scan.
-		if scanSeq, err = cat.joinSource(spec.Left); err != nil {
+		if scanSeq, err = cat.joinSource(spec.Left, readProj.left); err != nil {
 			return nil, err
 		}
 	}
 
-	hashSeq, err := cat.joinSource(right)
+	hashSeq, err := cat.joinSource(right, readProj.right)
 	if err != nil {
 		return nil, err
 	}
@@ -235,12 +236,15 @@ func (cat *Catalog) joinWith(spec JoinSpec, limits JoinLimits, stats *JoinStats)
 // A view resolves to BOTH of its halves. A continuous aggregate moves closed buckets out of
 // its live backing into an archive, so a join that read only the backing would silently join
 // against the unsealed tail -- the same bug the read paths had.
-func (cat *Catalog) joinSource(s JoinSide) (iter.Seq[*classad.ClassAd], error) {
+func (cat *Catalog) joinSource(s JoinSide, read []string) (iter.Seq[*classad.ClassAd], error) {
 	constraint := s.Constraint
 	if strings.TrimSpace(constraint) == "" {
 		constraint = "true"
 	}
 	if d, ok := cat.Table(s.Table); ok {
+		if seq, narrowed := narrowTableRead(d, constraint, read); narrowed {
+			return seq, nil
+		}
 		return d.Query(constraint)
 	}
 	if d, ok := cat.ViewBacking(s.Table); ok {
@@ -274,6 +278,9 @@ func (cat *Catalog) joinSource(s JoinSide) (iter.Seq[*classad.ClassAd], error) {
 		}, nil
 	}
 	if a, ok := cat.ArchiveTable(s.Table); ok {
+		if seq, narrowed := narrowArchiveRead(a, constraint, read); narrowed {
+			return seq, nil
+		}
 		return a.Query(constraint)
 	}
 	return nil, fmt.Errorf("no such table: %s", s.Table)
