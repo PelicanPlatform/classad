@@ -43,6 +43,9 @@ func (c *Client) Aggregate(ctx context.Context, constraint string, groupBy []str
 
 // AggregateTable is Aggregate on the named table.
 func (c *Client) AggregateTable(ctx context.Context, table, constraint string, groupBy []string, aggs []AggSpec) ([]AggRow, error) {
+	if err := refuseUserAggregates(aggs); err != nil {
+		return nil, err
+	}
 	filtered := anyFiltered(aggs)
 	build := func(id uint64) []byte {
 		// A filtered request goes out on the newer opcode, whose group tuple carries a
@@ -121,6 +124,9 @@ func (c *Client) AggregateBucketed(ctx context.Context, constraint string, group
 
 // AggregateBucketedTable is AggregateBucketed on the named table.
 func (c *Client) AggregateBucketedTable(ctx context.Context, table, constraint string, groups []GroupCol, aggs []AggSpec) ([]AggRow, error) {
+	if err := refuseUserAggregates(aggs); err != nil {
+		return nil, err
+	}
 	filtered := anyFiltered(aggs)
 	build := func(id uint64) []byte {
 		o := opAggregateBucketed
@@ -248,12 +254,39 @@ func readAggSpecs(r *reader, reqID uint64, write func([]byte), filtered bool) ([
 		if filtered {
 			aggs[i].Filter = r.str()
 		}
+		// No frame carries an aggregate NAME, so a selector asking for a user-defined one
+		// cannot be satisfied by anything this reader produces: it would reach the engine as
+		// a lookup of the empty name. That is a malformed frame rather than a query that
+		// fails late, and a client built against this package refuses to send one.
+		if aggs[i].Func == db.AggUser {
+			write(respBad(reqID))
+			return nil, false
+		}
 	}
 	if r.err != nil {
 		write(respBad(reqID))
 		return nil, false
 	}
 	return aggs, true
+}
+
+// ErrUserAggregateUnsupported is returned when a request names a user-defined aggregate. The
+// reduction engine takes one, but no opcode here has a field to put its NAME in: every aggregate
+// frame is a function selector plus an argument, so a user-defined one would go out as "the
+// selector past MAX, argument such-and-such" and arrive without the one thing identifying which
+// aggregate was meant. Refusing locally is the whole point -- the alternative is a frame that
+// LOOKS well formed and asks the server for something unnameable.
+var ErrUserAggregateUnsupported = errors.New(
+	"dbrpc: a user-defined aggregate cannot be sent over this protocol; run it against the db package directly")
+
+// refuseUserAggregates rejects a request the wire cannot express.
+func refuseUserAggregates(aggs []AggSpec) error {
+	for _, a := range aggs {
+		if a.Func == db.AggUser {
+			return fmt.Errorf("%w: %q", ErrUserAggregateUnsupported, a.UserFunc)
+		}
+	}
+	return nil
 }
 
 // anyFiltered reports whether some spec needs the extended opcodes: a per-aggregate filter,
