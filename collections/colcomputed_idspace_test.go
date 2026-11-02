@@ -350,7 +350,8 @@ func runIDSpaces(t *testing.T, archive, interned bool) {
 }
 
 // idsComputedEverywhere reports which columnarized segment, if any, lacks computed values for a field
-// every record computes: each block must carry a section at that field's position in its own schema.
+// every record computes: each block must carry a computed bitmap at that field's position in its own
+// schema.
 func idsComputedEverywhere(c *Collection) string {
 	for _, sh := range c.shards {
 		for _, seg := range sh.segs {
@@ -368,7 +369,7 @@ func idsComputedEverywhere(c *Collection) string {
 					if !ok {
 						return seg.path + ": no field " + n
 					}
-					if _, ok := b.computedEntryOf(idx); !ok {
+					if b.computedColOf(idx) == nil {
 						return seg.path + ": " + n + " not computed"
 					}
 				}

@@ -164,9 +164,23 @@ func (cs *colScope) resolveAttr(name string, scope ast.AttributeScope) classad.V
 		return cs.fromColdTail(id)
 	}
 	if testBit(cs.blk.escapeAt(cs.k), idx) {
-		// An expression the record keeps, whose value was computed when the segment was columnarized.
+		// An expression the record keeps, whose value was computed when the segment was columnarized and
+		// written into the slot (colcomputed.go) -- or, in an older segment, kept beside the column.
+		if cb := cs.blk.computedBits(idx); cb != nil && testBit(cb, cs.k) {
+			return cs.slotValue(idx)
+		}
 		if v, ok := cs.blk.computedValue(cs.k, idx, cs.bc); ok {
 			return v
+		}
+		// Held uncomputed -- an expression the builder could not compute, or whose value did not fit the
+		// column: this one record may be evaluated alone where that is exactly the scan's answer, as the
+		// other column readers do (see heldValueNode), rather than handing the record back.
+		if id := cs.blk.schema.fields[idx].id; cs.blk.heldAt(cs.k, id) {
+			if node, ok := cs.blk.heldValueNode(cs.k, id, cs.bc); ok {
+				if lit, ok := scalarValue(node); ok {
+					return litToValue(lit)
+				}
+			}
 		}
 		// Escaped: missing, or present but not storable in its slot. Both live in the cold tail.
 		return cs.fromColdTail(cs.blk.schema.fields[idx].id)

@@ -154,12 +154,21 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	var blocks []*columnarBlock
 	var gblocks [][]*colGroupBlock
 	var offs []uint32
+	// The computed cells go into the blocks as each is sealed. cellRows is appended by toInterned, once per
+	// record the build keeps, so position i in it is the build's record i; a record toInterned refused
+	// would misalign the two, which the length check below refuses the whole build for.
+	cellsFor := func(lo, hi int) [][]computedCell {
+		if cc == nil || lo < 0 || hi > len(cellRows) || lo > hi {
+			return nil
+		}
+		return cellRows[lo:hi]
+	}
 	if fromWires {
 		blocks, gblocks, offs = buildColumnarFromWires(recolOffs, recolFulls,
-			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d))
+			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), cellsFor)
 	} else {
-		blocks, gblocks, offs = buildColumnarFromSegmentGrouped(src.data, src.used, src.damaged(), src.codec,
-			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), skipDelta)
+		blocks, gblocks, offs = buildColumnarFromSegmentComputed(src.data, src.used, src.damaged(), src.codec,
+			c.regionCodec(), s, hot, groups, c.colGrouping(), toInterned, c.segIDMapper(d), skipDelta, cellsFor)
 	}
 	if len(blocks) == 0 || len(offs) == 0 {
 		return nil, nil, nil
@@ -183,7 +192,6 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		// cells are indexed the same way, and misaligned they would give one record another's value.
 		return nil, nil, nil
 	}
-	attachComputed(blocks, cellRows, c.regionCodec())
 	cs := &colSegment{blocks: blocks, offsB: packU32s(offs), dictKeyed: d != nil}
 	// Re-key the pinned groups onto this segment's selections: the schema and members are shared, the
 	// per-block bitmaps are not.

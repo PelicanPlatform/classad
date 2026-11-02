@@ -318,7 +318,7 @@ func narrowByField(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, can
 	f := blk.schema.fields[idx]
 	if p.intOK && intLowerable(f) {
 		if plane, built := comparePlane(blk, idx, f, p.ints, bc, sc); built {
-			if blk.escapeFree(idx) {
+			if blk.valueEscapeFree(idx) {
 				cand.and(plane)
 				return true
 			}
@@ -353,8 +353,8 @@ func fixEscapedPlane(blk *columnarBlock, idx int, p fieldPred, bc *blockCache, c
 		for word != 0 {
 			k := wi*64 + bits.TrailingZeros64(word)
 			word &= word - 1
-			if !testBit(blk.escapeAt(k), idx) {
-				continue
+			if !blk.valueEscaped(k, idx) {
+				continue // a literal or a computed cell: the kernel read its value from the slot
 			}
 			pass := false
 			// The value is not in the column: missing, wrong kind, or too wide for the slot. Absent
@@ -391,7 +391,7 @@ func narrowByRecord(blk *columnarBlock, idx int, f adField, p fieldPred, bc *blo
 	if !blk.loadIntBatch(idx, bc, sc.ints) {
 		return narrowByScan(blk, idx, isReal, p, bc, cand)
 	}
-	escFree := blk.escapeFree(idx)
+	escFree := blk.valueEscapeFree(idx)
 	live := 0
 	for wi, word := range cand.w {
 		keep := word
@@ -399,7 +399,7 @@ func narrowByRecord(blk *columnarBlock, idx int, f adField, p fieldPred, bc *blo
 			k := wi*64 + bits.TrailingZeros64(word)
 			word &= word - 1
 			var v float64
-			if !escFree && testBit(blk.escapeAt(k), idx) {
+			if !escFree && blk.valueEscaped(k, idx) {
 				nv, cell := blk.escapedNumCell(k, p.fieldID, bc)
 				if cell == cellExpr {
 					return false

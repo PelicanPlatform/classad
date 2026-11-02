@@ -168,6 +168,9 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 					base += blk.n
 					continue
 				}
+				// A computed cell's value is in its slot (colcomputed.go), and a computed value is never
+				// UNDEFINED, so it is present exactly as a literal is.
+				cbits := blk.computedBits(idx)
 				for k := 0; k < blk.n; k++ {
 					gk := base + k
 					if gk >= cs.offsLen() {
@@ -177,8 +180,8 @@ func (c *Collection) schemaScanPresenceCount(pred presencePred, bc *blockCache) 
 					if !w.visible(o, s0) {
 						continue // not visible at this snapshot
 					}
-					if !testBit(blk.escapeAt(k), idx) {
-						tally(false) // value is in its fixed slot: present and a literal
+					if !testBit(blk.escapeAt(k), idx) || (cbits != nil && testBit(cbits, k)) {
+						tally(false) // value is in its fixed slot: present and a literal or computed value
 						continue
 					}
 					// Held and computed: the escape class would call this cell missing, since the

@@ -174,6 +174,8 @@ type projectScratch struct {
 	// record, reused across them.
 	substIdx  []int
 	substNode [][]byte
+	substBuf  []byte // the nodes read from a column, which substNode slices
+	substEnd  []int  // per substituted cell, the end of its node in substBuf, or -1 for one held elsewhere
 	substID   []uint32
 	substName []string
 	// substCand is which PROJECTED schema fields could have a computed cell in this block at
@@ -194,14 +196,14 @@ func (sc *projectScratch) substCandidates(blk *columnarBlock, p *projPlan) []int
 	}
 	sc.substBlk, sc.substPlan = blk, p
 	sc.substCand = sc.substCand[:0]
-	if len(blk.computed) == 0 {
+	if !blk.anyComputed() {
 		return sc.substCand
 	}
 	for idx := range blk.schema.fields {
 		if _, in := p.ids[blk.schema.fields[idx].id]; !in {
 			continue
 		}
-		if _, ok := blk.computedEntryOf(idx); ok {
+		if _, ok := blk.computedEntryOf(idx); ok || blk.computedColOf(idx) != nil {
 			sc.substCand = append(sc.substCand, idx)
 		}
 	}
@@ -317,6 +319,12 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 	// real.
 	sc.substIdx, sc.substNode = sc.substIdx[:0], sc.substNode[:0]
 	sc.substID, sc.substName = sc.substID[:0], sc.substName[:0]
+	sc.substBuf, sc.substEnd = sc.substBuf[:0], sc.substEnd[:0]
+	if cs.blk != blk {
+		cs.setBlock(blk)
+		cs.setGroups(cn.seg, cn.blockIndexOf(blk))
+	}
+	cs.k, cs.fellBack = local, false
 	if p.evaluates {
 		esc0 := blk.escapeAt(local)
 		for _, idx := range sc.substCandidates(blk, p) {
@@ -324,9 +332,23 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 			if !testBit(esc0, idx) {
 				continue
 			}
-			node, ok := blk.computedNode(local, idx, cs.bc)
-			if !ok {
-				continue
+			// A value computed into the column is encoded from its slot through the scope, which keeps
+			// the block's dictionaries parsed across records; one kept beside the column is a node already.
+			var node []byte
+			end := -1
+			if cb := blk.computedBits(idx); cb != nil && testBit(cb, local) {
+				start := len(sc.substBuf)
+				var ok bool
+				if sc.substBuf, ok = cs.appendSlotNode(sc.substBuf, idx, f); !ok || cs.fellBack {
+					sc.substBuf, cs.fellBack = sc.substBuf[:start], false
+					continue
+				}
+				end = len(sc.substBuf)
+			} else {
+				var ok bool
+				if node, ok = blk.computedNode(local, idx, cs.bc); !ok {
+					continue
+				}
 			}
 			if sd != nil {
 				lid, ok := cn.localOf[f.id]
@@ -343,6 +365,16 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 			}
 			sc.substIdx = append(sc.substIdx, idx)
 			sc.substNode = append(sc.substNode, node)
+			sc.substEnd = append(sc.substEnd, end)
+		}
+		// Slice the column-read nodes out only now that substBuf has stopped growing.
+		start := 0
+		for i, end := range sc.substEnd {
+			if end < 0 {
+				continue
+			}
+			sc.substNode[i] = sc.substBuf[start:end]
+			start = end
 		}
 	}
 
@@ -392,12 +424,8 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 	}
 
 	// The column half: only p's schema fields held in their slots. An escaped field is in the cold
-	// tail if anywhere, and is taken from there below, in the tail's order.
-	if cs.blk != blk {
-		cs.setBlock(blk)
-		cs.setGroups(cn.seg, cn.blockIndexOf(blk))
-	}
-	cs.k, cs.fellBack = local, false
+	// tail if anywhere, and is taken from there below, in the tail's order. (The scope was bound to this
+	// block and record above.)
 	sc.entries = append(sc.entries[:0], entries...)
 	added, escWanted := 0, 0
 	esc := blk.escapeAt(local)

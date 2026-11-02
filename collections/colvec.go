@@ -152,8 +152,10 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 			// integer range test in the executor and no string is materialized at all. With escapes present
 			// the column is mixed -- an escaped value comes from the cold tail as a real string, and a code
 			// cannot represent it -- so those blocks deliver strings, which is also exactly the condition
-			// noEscape already records for pruning.
-			if info.noEscape {
+			// noEscape already records for pruning. A computed cell is coded like a literal (colcomputed.go),
+			// so a block whose only escapes are computed cells is all codes too.
+			cb := b.computedBits(idx)
+			if info.noEscape || b.valueEscapeFree(idx) {
 				d := s.dictFor(idx)
 				d.entries = entries
 				dst.Dict = d
@@ -167,7 +169,7 @@ func (s *blockVecSource) loadStr(idx int, id uint32, dst *vm.Vec) bool {
 				return true
 			}
 			for k := 0; k < b.n; k++ {
-				if testBit(b.escapeAt(k), idx) {
+				if testBit(b.escapeAt(k), idx) && (cb == nil || !testBit(cb, k)) {
 					dst.St[k] = vm.VsUndef // repaired from the cold tail below
 					continue
 				}
@@ -257,7 +259,7 @@ func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst *vm.Vec) boo
 	// St here as well made every widening path write it twice -- which cost 0.81x on the arithmetic shapes,
 	// where both operands widen. Vec.IsTrue and CountTrue answer from Raw directly, which is what removes the
 	// stale-state hazard that filling it was guarding against.
-	if vm.RawColumnUseful(f.width, f.unsigned) && s.blk.escapeFree(idx) {
+	if vm.RawColumnUseful(f.width, f.unsigned) && s.blk.valueEscapeFree(idx) {
 		if raw, ok := s.blk.rawColumn(idx, s.bc); ok {
 			dst.Raw, dst.RawWidth = raw, f.width
 			dst.RawUnsigned, dst.RawReal = f.unsigned, f.kind == akReal
@@ -274,7 +276,7 @@ func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst *vm.Vec) boo
 	for k := 0; k < s.blk.n; k++ {
 		dst.St[k] = st
 	}
-	if s.blk.escapeFree(idx) {
+	if s.blk.valueEscapeFree(idx) {
 		return true
 	}
 	return s.fixEscapes(idx, id, dst)
@@ -291,7 +293,7 @@ func (s *blockVecSource) loadNum(idx int, f adField, id uint32, dst *vm.Vec) boo
 // the reference applies.
 func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst *vm.Vec) bool {
 	b := s.blk
-	if b.escapeFree(idx) {
+	if b.valueEscapeFree(idx) {
 		for w := range dst.Hi {
 			start := w * 64
 			end := start + 64
@@ -328,12 +330,14 @@ func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst *vm.Vec) bo
 // keeps a handful of odd records from declining a whole block: the kernels route a mismatched type
 // through the parity hook and get the reference's answer for it.
 func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
+	// A computed cell's value is in the column the loader just read (colcomputed.go), so it is not an
+	// escape here: the element already holds it.
+	cb := s.blk.computedBits(idx)
 	for k := 0; k < s.blk.n; k++ {
-		if !testBit(s.blk.escapeAt(k), idx) {
+		if !testBit(s.blk.escapeAt(k), idx) || (cb != nil && testBit(cb, k)) {
 			continue
 		}
-		// A computed cell is a literal like any other here; the expression it came from is in the
-		// record, and found below would only have led to heldAt.
+		// A block columnarized before computed values moved into the column keeps them beside it.
 		node, found := s.blk.computedNode(k, idx, s.bc)
 		var err error
 		if !found {
@@ -343,11 +347,19 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 			return false
 		}
 		if !found {
-			if s.blk.heldAt(k, id) {
-				return false // the value stayed in the record (an expression): only it can answer
+			if !s.blk.heldAt(k, id) {
+				dst.St[k] = vm.VsUndef
+				continue
 			}
-			dst.St[k] = vm.VsUndef
-			continue
+			// The value stayed in the record uncomputed (an expression the builder could not compute,
+			// or one whose value did not fit the column): this one record may be evaluated alone where
+			// that is exactly the scan's answer, as the other column readers do (see heldValueNode).
+			// Anything else gives the block to the per-record resolver.
+			held, ok := s.blk.heldValueNode(k, id, s.bc)
+			if !ok {
+				return false
+			}
+			node = held
 		}
 		lit, ok := scalarValue(node)
 		if !ok {

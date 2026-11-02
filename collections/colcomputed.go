@@ -23,8 +23,8 @@ import (
 //
 // Sealed records are immutable, so a value computed from one at columnarize time never goes stale. For
 // a schema field whose cell is an expression that depends on nothing but the record itself, the value
-// is computed once, when the segment is columnarized, and kept beside the block. A reader that meets the
-// escaped cell asks for the computed value before deciding the record must be read.
+// is computed once, when the segment is columnarized, and written into the field's column (see COMPUTED
+// CELLS LIVE IN THE COLUMN below), so the column readers read it like any other value.
 //
 // WHAT DOES NOT CHANGE. The expression stays in the record, exactly as it is today, and the cell stays
 // escaped. Reassembly, projection, re-columnarization and every reader that does not ask for a computed
@@ -321,85 +321,549 @@ func valueNode(v classad.Value) ([]byte, bool) {
 	return nil, false
 }
 
-// computedKind is the kind a schema derivation counts an expression-valued cell as: the kind of the
-// value it would be computed to, or akNone when it would not be computed. The sample is global-interned
-// wire, the form the builder computes from, so a field the derivation admits on its computed values is
-// one the builder will compute.
-func (cc *cellComputer) computedKind(iw []byte, id uint32) adKind {
+// computedKind is the kind and value a schema derivation counts an expression-valued cell as: what it
+// would be computed to, or akNone when it would not be. The sample is global-interned wire, the form the
+// builder computes from, so a field the derivation admits on its computed values is one the builder will
+// compute.
+func (cc *cellComputer) computedKind(iw []byte, id uint32) (adKind, wire.Literal) {
 	if cc == nil {
-		return akNone
+		return akNone, wire.Literal{}
 	}
 	if !cc.load(iw) {
-		return akNone
+		return akNone, wire.Literal{}
 	}
 	node, ok := cc.value(id)
 	if !ok {
-		return akNone
+		return akNone, wire.Literal{}
 	}
-	k, _ := nodeKind(node)
-	return k
+	return nodeKind(node)
 }
 
 // computedCellsBuilt counts computed cells written into columnarized segments, so a test can see the
 // builder took the path it is meant to.
 var computedCellsBuilt atomic.Int64
 
-// computedEntry locates one field's computed cells in a block's decompressed computed region.
+// COMPUTED CELLS LIVE IN THE COLUMN.
+//
+// A computed value is written into its field's own storage, exactly where a literal of that field would
+// be: the typed fixed slot for an int, real or bool (same width and encoding), and the block's string
+// dictionary for a string. A per-block, per-field bitmap marks which cells hold one. Column-at-a-time
+// readers -- the vector loader, the aggregates, GROUP BY, TopK, presence, zone pruning -- therefore read
+// a computed cell as they read any other, and an Arrow-shaped export of the block finds the values in the
+// value buffer and the dictionary.
+//
+// THE ESCAPE BIT STAYS SET. A computed cell is still, for every purpose but its value, the cell of a
+// record that keeps an expression: the record holds the expression, the cell is escaped, nothing is in
+// the cold tail. The bitmap says only "this escaped cell's slot holds the value the expression evaluates
+// to". That is a deliberate choice of which readers have to know about it:
+//
+//   - A reader that rebuilds an ad or ships an attribute -- reassembly, projection, raw wire, text,
+//     re-columnarization, everything recordWire feeds -- tests the escape bit, finds the cell escaped, and
+//     takes the attribute from the record: the expression. It reads exactly the bits and bytes it read
+//     before the value was in the slot, so it cannot emit the value as if it were the attribute's
+//     literal, and no form reader had to change. With the escape bit clear, every one of them would have
+//     had to learn the bitmap, and one that did not would silently ship MemoryUsage = 1234.
+//   - A reader of VALUES asks for the bitmap (valueEscaped, valueEscapeFree, computedBits) and treats a
+//     computed cell as present. One that has not been taught sees an escaped held cell and takes the
+//     per-record path, as it did before: slower, never wrong.
+//   - A build that predates this reads the same payload correctly. Escaped slots are undefined bytes to it
+//     (it never reads one without consulting the escape bit), the persisted zones and dictionary flags
+//     are written by the rules it knows, and the bitmap rides where it ignores it (see readComputedTrailer).
+//     So no payload version changes, and a rollback costs speed, not records.
+//
+// WHAT IS STORED. A value goes into the column only when it fits it as a literal would: the same kind as
+// the field (an int is not stored in a real column, nor the reverse -- the two differ under =?= and
+// integer division), an int within the slot's width, a string only where the block keeps a dictionary for
+// the field (forced for a field with computed strings, since the positional string region is walked by
+// readers that skip escaped cells). A value that does not fit -- a real result among an int column's, say,
+// or one integer far wider than the rest -- is kept beside the column instead, as a literal node in the
+// field's short list of exceptions, which a per-record reader finds by record index. The column then has
+// no value for that cell (its bit is clear, the block is not exact), so a column reader treats it as any
+// escape and asks for it: one lookup, never an evaluation.
+//
+// Beside each field's bitmap the block keeps whether every escape of the field in the block is a computed
+// cell (exact) and, for a numeric field, the range of literal and computed values together. The persisted
+// zone and the dictionary's noEscape flag keep their meaning -- literals only -- so an older build prunes
+// exactly as it did; this build prunes on the value range when it is exact (see valueZone).
+
+// computedCol is one schema field's computed cells in a block.
+type computedCol struct {
+	idx      int
+	exact    bool    // every escaped cell of the field in this block is a computed cell in the column
+	min, max float64 // numeric fields: the range of the literal and computed values, when exact
+	bits     []byte  // one bit per record, set where the cell is computed into the column
+	// The computed cells that do not fit the column (see WHAT IS STORED): misRecs their record indices,
+	// ascending, as little-endian u32s; misOffs (len(misRecs)/4 + 1) u32 offsets into misNodes, which holds
+	// each one's literal node. All empty when every computed cell fits.
+	misRecs, misOffs, misNodes []byte
+}
+
+// misfitNode returns record k's computed value kept beside the column, if it has one. The offsets and the
+// node are checked rather than trusted.
+func (cc *computedCol) misfitNode(k int) ([]byte, bool) {
+	m := len(cc.misRecs) / 4
+	if m == 0 {
+		return nil, false
+	}
+	i := sort.Search(m, func(i int) bool { return int(binary.LittleEndian.Uint32(cc.misRecs[4*i:])) >= k })
+	if i >= m || int(binary.LittleEndian.Uint32(cc.misRecs[4*i:])) != k {
+		return nil, false
+	}
+	o1 := int(binary.LittleEndian.Uint32(cc.misOffs[4*i:]))
+	o2 := int(binary.LittleEndian.Uint32(cc.misOffs[4*i+4:]))
+	if o1 >= o2 || o2 > len(cc.misNodes) {
+		return nil, false
+	}
+	node := cc.misNodes[o1:o2]
+	if nl, ok := wire.NodeLen(node); !ok || nl != len(node) {
+		return nil, false
+	}
+	if _, ok := wire.LiteralValue(node); !ok {
+		return nil, false
+	}
+	return node, true
+}
+
+// colComputedColsMagic opens a block's computed-cell blob (see encodeComputedCols).
+const colComputedColsMagic = 0x4c4f4343 // "CCOL" on disk (little-endian)
+
+// computedColOf returns field idx's computed cells in this block, or nil when it has none.
+func (b *columnarBlock) computedColOf(idx int) *computedCol {
+	for i := range b.ccols {
+		if b.ccols[i].idx == idx {
+			return &b.ccols[i]
+		}
+	}
+	return nil
+}
+
+// computedBits returns field idx's computed bitmap, nil when no cell of it is computed in this block.
+func (b *columnarBlock) computedBits(idx int) []byte {
+	if cc := b.computedColOf(idx); cc != nil {
+		return cc.bits
+	}
+	return nil
+}
+
+// valueEscaped reports whether record k's cell of field idx has no value in the column: escaped and not
+// computed. A value reader uses it where it would test the escape bit; a form reader must not.
+func (b *columnarBlock) valueEscaped(k, idx int) bool {
+	if !testBit(b.escapeAt(k), idx) {
+		return false
+	}
+	cb := b.computedBits(idx)
+	return cb == nil || !testBit(cb, k)
+}
+
+// valueEscapeFree reports whether every record of the block has field idx's value in the column, as a
+// literal or a computed cell -- escapeFree for value readers.
+func (b *columnarBlock) valueEscapeFree(idx int) bool {
+	if b.escapeFree(idx) {
+		return true
+	}
+	cc := b.computedColOf(idx)
+	return cc != nil && cc.exact
+}
+
+// valueZone is zone for value readers: where the literal zone is inexact only because of computed cells,
+// the range covering them too.
+func (b *columnarBlock) valueZone(idx int) (blockZone, bool) {
+	z, ok := b.zone(idx)
+	if !ok || !z.escaped {
+		return z, ok
+	}
+	if cc := b.computedColOf(idx); cc != nil && cc.exact {
+		return blockZone{Min: cc.min, Max: cc.max}, true
+	}
+	return z, true
+}
+
+// anyComputed reports whether the block keeps any computed value, in either form.
+func (b *columnarBlock) anyComputed() bool { return len(b.ccols) > 0 || len(b.computed) > 0 }
+
+// slotNode encodes record k's in-column value of field idx as a scalar literal node.
+func (b *columnarBlock) slotNode(k, idx int, bc *blockCache) ([]byte, bool) {
+	f := &b.schema.fields[idx]
+	switch f.kind {
+	case akBool:
+		base := k*b.bitsStride + b.schema.escBytes
+		return wire.AppendBoolNode(nil, testBit(b.bits[base:base+b.schema.boolBytes], f.boolBit)), true
+	case akInt, akReal:
+		v, ok := b.fieldIntAt(k, idx, bc)
+		if !ok {
+			return nil, false
+		}
+		if f.kind == akReal {
+			return wire.AppendRealNode(nil, math.Float64frombits(uint64(v))), true
+		}
+		return wire.AppendIntNode(nil, v), true
+	case akString:
+		var buf [][]byte
+		entries, ok := b.dictEntries(idx, bc, &buf)
+		if !ok {
+			return nil, false
+		}
+		codes, w, ok := b.dictCodes(idx, bc)
+		if !ok {
+			return nil, false
+		}
+		c := dictCodeAt(codes, w, k)
+		if c >= len(entries) {
+			return nil, false
+		}
+		return wire.AppendStringNode(nil, string(entries[c])), true
+	}
+	return nil, false
+}
+
+// computedBuild collects one block's computed cells while it is encoded: which survive into the column,
+// and the string values the dictionary builder has to see.
+type computedBuild struct {
+	s     *adSchema
+	n     int
+	cells [][]computedCell // per record, the cells that fit their column
+	strs  map[int]*computedStrs
+	mis   map[int][]misfit // per field, the cells that do not, in record order
+}
+
+// misfit is one computed cell kept beside the column.
+type misfit struct {
+	k    int
+	node []byte
+}
+
+// computedStrs is one string field's computed values, by record.
+type computedStrs struct {
+	vals    [][]byte
+	present []bool
+}
+
+// newComputedBuild sorts each record's computed cells into those that fit their column as a literal would
+// and those kept beside it (see WHAT IS STORED). recs are the block's records in row form, in which every
+// computed cell is escaped: the builder never sees the expression, only its absence. A cell that is not
+// escaped there is a field the record also holds as a literal, which a well-formed record cannot do, and
+// it is dropped.
+func newComputedBuild(s *adSchema, recs [][]byte, cells [][]computedCell) *computedBuild {
+	if len(cells) != len(recs) {
+		return nil
+	}
+	cb := &computedBuild{s: s, n: len(recs), cells: make([][]computedCell, len(recs))}
+	kept := false
+	for k, row := range cells {
+		for _, cell := range row {
+			if cell.idx < 0 || cell.idx >= len(s.fields) || !testBit(recs[k][:s.escBytes], cell.idx) {
+				continue
+			}
+			f := &s.fields[cell.idx]
+			kind, lit := nodeKind(cell.node)
+			if kind != f.kind || (kind == akInt && !intFits(lit.Int, f.width, f.unsigned)) || realEscapes(kind, lit.Real) ||
+				(kind == akString && !strDictEnabled) {
+				// Not this column's literal -- or, for a string, no dictionary to hold it, and the
+				// positional region cannot: beside the column.
+				if cb.mis == nil {
+					cb.mis = map[int][]misfit{}
+				}
+				cb.mis[cell.idx] = append(cb.mis[cell.idx], misfit{k: k, node: cell.node})
+				kept = true
+				continue
+			}
+			if kind == akString {
+				if cb.strs == nil {
+					cb.strs = map[int]*computedStrs{}
+				}
+				cs := cb.strs[cell.idx]
+				if cs == nil {
+					cs = &computedStrs{vals: make([][]byte, len(recs)), present: make([]bool, len(recs))}
+					cb.strs[cell.idx] = cs
+				}
+				cs.vals[k], cs.present[k] = []byte(lit.Str), true
+			}
+			cb.cells[k] = append(cb.cells[k], cell)
+			kept = true
+		}
+	}
+	if !kept {
+		return nil
+	}
+	return cb
+}
+
+// stringsFor returns the computed string values the dictionary builder must include, nil for none.
+func (cb *computedBuild) stringsFor() map[int]*computedStrs {
+	if cb == nil {
+		return nil
+	}
+	return cb.strs
+}
+
+// apply writes the computed values into b's columns -- the hot columns and b.bits in place, the cold
+// numerics into coldRaw before it is compressed, the strings as codes in codeRaw against the dictionaries
+// that took them -- and records the per-field bitmaps. recs are the block's records in row form.
+func (cb *computedBuild) apply(b *columnarBlock, recs [][]byte, coldRaw []byte, dicts map[int]strDictField, dictRaw, codeRaw []byte) {
+	if cb == nil {
+		return
+	}
+	s := b.schema
+	cols := map[int]*computedCol{}
+	var strIndex map[int]map[string]int
+	for k, row := range cb.cells {
+		for _, cell := range row {
+			f := &s.fields[cell.idx]
+			lit, _ := wire.LiteralValue(cell.node)
+			switch f.kind {
+			case akBool:
+				if lit.Bool {
+					setBit(b.bits[k*b.bitsStride+s.escBytes:], f.boolBit)
+				}
+			case akInt, akReal:
+				raw := lit.Int
+				if f.kind == akReal {
+					raw = int64(math.Float64bits(lit.Real))
+				}
+				if start, hot := b.hotColStart(cell.idx); hot {
+					putIntLE(b.hotCol[start+k*f.width:], raw, f.width)
+				} else if start, ok := b.coldFieldStart(cell.idx); ok {
+					putIntLE(coldRaw[start+k*f.width:], raw, f.width)
+				} else {
+					continue
+				}
+			case akString:
+				info, ok := dicts[cell.idx]
+				if !ok {
+					// The dictionary was not built after all: beside the column.
+					if cb.mis == nil {
+						cb.mis = map[int][]misfit{}
+					}
+					cb.mis[cell.idx] = append(cb.mis[cell.idx], misfit{k: k, node: cell.node})
+					continue
+				}
+				if strIndex == nil {
+					strIndex = map[int]map[string]int{}
+				}
+				index := strIndex[cell.idx]
+				if index == nil {
+					index = dictIndex(dictRaw, info)
+					strIndex[cell.idx] = index
+				}
+				code, ok := index[lit.Str]
+				if !ok {
+					continue
+				}
+				off := info.codeStart + k*info.codeWidth
+				codeRaw[off] = byte(code)
+				if info.codeWidth == 2 {
+					codeRaw[off+1] = byte(code >> 8)
+				}
+			default:
+				continue
+			}
+			cc := cols[cell.idx]
+			if cc == nil {
+				cc = &computedCol{idx: cell.idx, bits: make([]byte, (cb.n+7)/8)}
+				cols[cell.idx] = cc
+			}
+			setBit(cc.bits, k)
+			computedCellsBuilt.Add(1)
+		}
+	}
+	for idx, ms := range cb.mis {
+		cc := cols[idx]
+		if cc == nil {
+			cc = &computedCol{idx: idx, bits: make([]byte, (cb.n+7)/8)}
+			cols[idx] = cc
+		}
+		sort.Slice(ms, func(i, j int) bool { return ms[i].k < ms[j].k })
+		cc.misOffs = binary.LittleEndian.AppendUint32(nil, 0)
+		for _, m := range ms {
+			cc.misRecs = binary.LittleEndian.AppendUint32(cc.misRecs, uint32(m.k))
+			cc.misNodes = append(cc.misNodes, m.node...)
+			cc.misOffs = binary.LittleEndian.AppendUint32(cc.misOffs, uint32(len(cc.misNodes)))
+		}
+		computedCellsBuilt.Add(int64(len(ms)))
+	}
+	if len(cols) == 0 {
+		return
+	}
+	for idx, cc := range cols {
+		f := &s.fields[idx]
+		cc.exact = true
+		cc.min, cc.max = math.Inf(1), math.Inf(-1)
+		for k, r := range recs {
+			escaped := testBit(r[:s.escBytes], idx)
+			if escaped && !testBit(cc.bits, k) {
+				cc.exact = false
+				break
+			}
+			if numericKind(f.kind) {
+				var raw int64
+				if escaped {
+					raw, _ = b.slotIntIn(k, idx, coldRaw)
+				} else {
+					raw = readIntLE(r[s.escBytes+f.off:], f.width, f.unsigned)
+				}
+				v := float64(raw)
+				if f.kind == akReal {
+					v = math.Float64frombits(uint64(raw))
+				}
+				cc.min, cc.max = math.Min(cc.min, v), math.Max(cc.max, v)
+			}
+		}
+		if !cc.exact || !numericKind(f.kind) {
+			cc.min, cc.max = 0, 0
+		}
+		b.ccols = append(b.ccols, *cc)
+	}
+	sort.Slice(b.ccols, func(i, j int) bool { return b.ccols[i].idx < b.ccols[j].idx })
+	b.ccBlob = encodeComputedCols(b.ccols, b.n)
+}
+
+// slotIntIn reads record k's raw numeric slot of field idx from the block's hot columns or from coldRaw,
+// the cold numerics as they are before compression.
+func (b *columnarBlock) slotIntIn(k, idx int, coldRaw []byte) (int64, bool) {
+	f := &b.schema.fields[idx]
+	if start, hot := b.hotColStart(idx); hot {
+		return readIntLE(b.hotCol[start+k*f.width:], f.width, f.unsigned), true
+	}
+	if start, ok := b.coldFieldStart(idx); ok {
+		return readIntLE(coldRaw[start+k*f.width:], f.width, f.unsigned), true
+	}
+	return 0, false
+}
+
+// dictIndex maps each of a field's dictionary entries to its code, from the raw dictionary region.
+func dictIndex(dictRaw []byte, info strDictField) map[string]int {
+	out := make(map[string]int, info.count)
+	p := dictRaw[info.dictStart:]
+	for c := 0; c < info.count; c++ {
+		l, m := binary.Uvarint(p)
+		if m <= 0 || m+int(l) > len(p) {
+			return out
+		}
+		out[string(p[m:m+int(l)])] = c
+		p = p[m+int(l):]
+	}
+	return out
+}
+
+// encodeComputedCols lays out a block's computed cells:
+//
+//	magic u32 | field count u32 | per field:
+//	    index u32 | flags u32 (1: exact) | min f64 | max f64 | bitmap |
+//	    misfit count m u32 | m record indices u32 | m+1 offsets u32 | nodes (u32 length, bytes)
+//
+// with each bitmap (n+7)/8 bytes. Stored uncompressed: it is small, and reading it is the first thing a
+// column reader does with the block, so it aliases the mapping like the block's other bitsets.
+func encodeComputedCols(cols []computedCol, n int) []byte {
+	if len(cols) == 0 {
+		return nil
+	}
+	nb := (n + 7) / 8
+	dst := make([]byte, 0, 8+len(cols)*(24+nb))
+	dst = appendU32(dst, colComputedColsMagic)
+	dst = appendU32(dst, uint32(len(cols)))
+	for i := range cols {
+		cc := &cols[i]
+		dst = appendU32(dst, uint32(cc.idx))
+		var flags uint32
+		if cc.exact {
+			flags |= 1
+		}
+		dst = appendU32(dst, flags)
+		dst = binary.LittleEndian.AppendUint64(dst, math.Float64bits(cc.min))
+		dst = binary.LittleEndian.AppendUint64(dst, math.Float64bits(cc.max))
+		dst = append(dst, cc.bits[:nb]...)
+		m := len(cc.misRecs) / 4
+		dst = appendU32(dst, uint32(m))
+		if m > 0 {
+			dst = append(dst, cc.misRecs...)
+			dst = append(dst, cc.misOffs...)
+			dst = appendBytes(dst, cc.misNodes)
+		}
+	}
+	return dst
+}
+
+// parseComputedCols decodes b's computed-cell blob. Every field must be one the block can hold a computed
+// value for -- a scalar field, a string one only with a dictionary -- in ascending order, with a bitmap of
+// the block's length. The bitmaps alias blob.
+func parseComputedCols(blob []byte, b *columnarBlock) ([]computedCol, bool) {
+	c := &cursor{b: blob}
+	if len(blob) < 8 || c.u32() != colComputedColsMagic {
+		return nil, false
+	}
+	nf := int(c.u32())
+	if c.err != nil || nf <= 0 || b.schema == nil || nf > len(b.schema.fields) {
+		return nil, false
+	}
+	nb := (b.n + 7) / 8
+	out := make([]computedCol, 0, nf)
+	prev := -1
+	for range nf {
+		idx := int(c.u32())
+		flags := c.u32()
+		lo := c.u64()
+		hi := c.u64()
+		if c.err != nil || idx <= prev || idx >= len(b.schema.fields) || !c.need(nb) {
+			return nil, false
+		}
+		switch b.schema.fields[idx].kind {
+		case akBool, akInt, akReal:
+		case akString:
+			if !b.dictOwns(idx) {
+				return nil, false
+			}
+		default:
+			return nil, false
+		}
+		prev = idx
+		bits := c.b[c.i : c.i+nb : c.i+nb]
+		c.i += nb
+		cc := computedCol{idx: idx, exact: flags&1 != 0,
+			min: math.Float64frombits(lo), max: math.Float64frombits(hi), bits: bits}
+		m := int(c.u32())
+		if c.err != nil || m < 0 || m > b.n {
+			return nil, false
+		}
+		if m > 0 {
+			if !c.need(8*m + 4) {
+				return nil, false
+			}
+			cc.misRecs = c.b[c.i : c.i+4*m : c.i+4*m]
+			c.i += 4 * m
+			cc.misOffs = c.b[c.i : c.i+4*(m+1) : c.i+4*(m+1)]
+			c.i += 4 * (m + 1)
+			cc.misNodes = c.bytes()
+			last := -1
+			for i := 0; i < m; i++ {
+				k := int(binary.LittleEndian.Uint32(cc.misRecs[4*i:]))
+				if k <= last || k >= b.n {
+					return nil, false
+				}
+				last = k
+			}
+		}
+		out = append(out, cc)
+	}
+	if c.err != nil || c.i != len(blob) {
+		return nil, false
+	}
+	return out, true
+}
+
+// LEGACY COMPUTED REGIONS.
+//
+// Segments columnarized before computed values moved into the column keep them in a per-block region
+// beside it: one section per field, (n+1) offsets over the cells' literal nodes, compressed. Nothing
+// writes that form any more. It is still read, so those segments keep their computed values until their
+// next re-columnarization writes them into the column.
+
+// computedEntry locates one field's computed cells in a block's decompressed legacy computed region.
 type computedEntry struct {
 	idx   int    // schema field index
 	start uint32 // the field's section offset in the decompressed region
 }
 
-// buildComputedRegion lays out a block's computed cells. rows[k] are record k's cells, sorted by field.
-//
-// The region is one section per field that has any computed cell, each
-//
-//	(n+1) little-endian u32 offsets | the cells' literal nodes, concatenated
-//
-// so record k's value is nodes[off[k]:off[k+1]], and an empty span means the cell is not computed. A
-// reader finds a value with two loads and no walk, which is what lets the per-record readers ask for one
-// at the cost of an escaped literal rather than a record read.
-func buildComputedRegion(rows [][]computedCell) ([]computedEntry, []byte) {
-	n := len(rows)
-	var idxs []int
-	seen := map[int]struct{}{}
-	for _, r := range rows {
-		for _, cell := range r {
-			if _, ok := seen[cell.idx]; !ok {
-				seen[cell.idx] = struct{}{}
-				idxs = append(idxs, cell.idx)
-			}
-		}
-	}
-	if len(idxs) == 0 {
-		return nil, nil
-	}
-	sort.Ints(idxs)
-	var raw []byte
-	entries := make([]computedEntry, 0, len(idxs))
-	cursor := make([]int, n) // per record, the next of its cells to consider
-	for _, idx := range idxs {
-		entries = append(entries, computedEntry{idx: idx, start: uint32(len(raw))})
-		var nodes []byte
-		offs := make([]byte, 0, 4*(n+1))
-		offs = binary.LittleEndian.AppendUint32(offs, 0)
-		for k, r := range rows {
-			for cursor[k] < len(r) && r[cursor[k]].idx < idx {
-				cursor[k]++
-			}
-			if cursor[k] < len(r) && r[cursor[k]].idx == idx {
-				nodes = append(nodes, r[cursor[k]].node...)
-				cursor[k]++
-			}
-			offs = binary.LittleEndian.AppendUint32(offs, uint32(len(nodes)))
-		}
-		raw = append(raw, offs...)
-		raw = append(raw, nodes...)
-	}
-	return entries, raw
-}
-
-// computedEntryOf returns field idx's section in the block's computed region.
+// computedEntryOf returns field idx's section in the block's legacy computed region.
 func (b *columnarBlock) computedEntryOf(idx int) (computedEntry, bool) {
 	i := sort.Search(len(b.computed), func(i int) bool { return b.computed[i].idx >= idx })
 	if i < len(b.computed) && b.computed[i].idx == idx {
@@ -409,9 +873,19 @@ func (b *columnarBlock) computedEntryOf(idx int) (computedEntry, bool) {
 }
 
 // computedNode returns record k's computed value for schema field idx, as a scalar literal node. ok is
-// false when the cell is not computed -- or when the region cannot be read, which a caller treats
-// exactly the same way, since the record still holds the expression.
+// false when the cell is not computed -- or when its value cannot be read, which a caller treats exactly
+// the same way, since the record still holds the expression.
 func (b *columnarBlock) computedNode(k, idx int, bc *blockCache) ([]byte, bool) {
+	if len(b.ccols) > 0 {
+		cc := b.computedColOf(idx)
+		if cc == nil || k < 0 || k >= b.n {
+			return nil, false
+		}
+		if !testBit(cc.bits, k) {
+			return cc.misfitNode(k)
+		}
+		return b.slotNode(k, idx, bc)
+	}
 	if len(b.computed) == 0 {
 		return nil, false
 	}
@@ -426,7 +900,7 @@ func (b *columnarBlock) computedNode(k, idx int, bc *blockCache) ([]byte, bool) 
 	return computedNodeIn(raw, e.start, b.n, k)
 }
 
-// computedNodeIn reads record k's cell from a field section starting at start in the decompressed
+// computedNodeIn reads record k's cell from a legacy field section starting at start in the decompressed
 // region raw, for a block of n records. Bounds and the literal are checked rather than trusted.
 func computedNodeIn(raw []byte, start uint32, n, k int) ([]byte, bool) {
 	hdr := int(start)
@@ -463,19 +937,21 @@ func (b *columnarBlock) computedValue(k, idx int, bc *blockCache) (classad.Value
 }
 
 // colComputedTrailer marks a columnarized segment's computed-value trailer: the magic, the base block
-// count, then per block its compressed region and its field sections as (field index, start) pairs.
+// count, then per block a byte string and that block's legacy field sections as (field index, start)
+// pairs. A block written now has no legacy sections, and its byte string is its computed-cell blob
+// (encodeComputedCols); a legacy block's is its compressed legacy region.
 //
-// A TRAILER, after the remnant-name list, rather than a payload version: the records and the columns are
-// unchanged, so a build that does not know about computed values reads such a payload correctly by
-// ignoring what follows the group section, and a store written here still opens under it. It cannot
-// parse the remnant-name list once something follows it, so such a build answers some reads by the
-// record that the list would have settled -- slower, never wrong.
+// A TRAILER, after the remnant-name list, rather than a payload version: the records are unchanged and a
+// computed cell is still an escaped one, so a build that predates computed cells reads such a payload
+// correctly by ignoring what follows the group section, and one that reads legacy regions parses this
+// trailer as blocks with no sections and never looks at their bytes. A store written here still opens
+// under either.
 const colComputedTrailer = 0x504d4f43 // "COMP" on disk (little-endian)
 
 // hasComputed reports whether any base block of the segment carries computed values.
 func (cs *colSegment) hasComputed() bool {
 	for _, b := range cs.blocks {
-		if len(b.computed) > 0 {
+		if b.anyComputed() {
 			return true
 		}
 	}
@@ -486,19 +962,24 @@ func appendComputedTrailer(dst []byte, blocks []*columnarBlock) []byte {
 	dst = appendU32(dst, colComputedTrailer)
 	dst = appendU32(dst, uint32(len(blocks)))
 	for _, b := range blocks {
-		dst = appendBytes(dst, b.computedComp)
-		dst = appendU32(dst, uint32(len(b.computed)))
-		for _, e := range b.computed {
-			dst = appendU32(dst, uint32(e.idx))
-			dst = appendU32(dst, e.start)
+		if len(b.computed) > 0 {
+			dst = appendBytes(dst, b.computedComp)
+			dst = appendU32(dst, uint32(len(b.computed)))
+			for _, e := range b.computed {
+				dst = appendU32(dst, uint32(e.idx))
+				dst = appendU32(dst, e.start)
+			}
+			continue
 		}
+		dst = appendBytes(dst, b.ccBlob)
+		dst = appendU32(dst, 0)
 	}
 	return dst
 }
 
 // readComputedTrailer decodes a computed trailer occupying exactly rest onto cs's base blocks. A trailer
-// that does not parse, or describes a different block list, is dropped whole: the cells read as they did
-// before computed values existed.
+// that does not parse, or describes a different block list, is dropped whole: the cells read as held
+// cells with no computed value, which is correct, only slower.
 func readComputedTrailer(rest []byte, cs *colSegment) bool {
 	c := &cursor{b: rest}
 	if len(rest) < 8 || c.u32() != colComputedTrailer {
@@ -510,6 +991,7 @@ func readComputedTrailer(rest []byte, cs *colSegment) bool {
 	}
 	comps := make([][]byte, nb)
 	entries := make([][]computedEntry, nb)
+	cols := make([][]computedCol, nb)
 	for i := 0; i < nb; i++ {
 		comps[i] = c.bytes()
 		ne := int(c.u32())
@@ -529,33 +1011,25 @@ func readComputedTrailer(rest []byte, cs *colSegment) bool {
 		if ne > 0 && len(comps[i]) == 0 {
 			return false
 		}
+		if ne == 0 && len(comps[i]) > 0 {
+			cc, ok := parseComputedCols(comps[i], cs.blocks[i])
+			if !ok {
+				return false
+			}
+			cols[i] = cc
+		}
 	}
 	if c.err != nil || c.i != len(rest) {
 		return false
 	}
 	for i, b := range cs.blocks {
+		if cols[i] != nil {
+			b.ccols, b.ccBlob = cols[i], comps[i]
+			continue
+		}
 		b.computedComp, b.computed = comps[i], entries[i]
 	}
 	return true
-}
-
-// attachComputed gives each block its computed region, from rows indexed by segment record position.
-// The blocks are in record order and partition the rows.
-func attachComputed(blocks []*columnarBlock, rows [][]computedCell, codec Codec) {
-	base := 0
-	for _, b := range blocks {
-		if base+b.n > len(rows) {
-			return
-		}
-		entries, raw := buildComputedRegion(rows[base : base+b.n])
-		if len(entries) > 0 {
-			b.computed, b.computedComp = entries, codec.Compress(nil, raw)
-			for _, r := range rows[base : base+b.n] {
-				computedCellsBuilt.Add(int64(len(r)))
-			}
-		}
-		base += b.n
-	}
 }
 
 // PER-RECORD EXCEPTIONS.
@@ -604,9 +1078,14 @@ func (b *columnarBlock) heldUncomputed(idx int, id uint32, bc *blockCache) int {
 	}
 	list := h.recs[id]
 	lo := uint32(b.segBase)
+	cb := b.computedBits(idx)
 	i := sort.Search(len(list), func(i int) bool { return list[i] >= lo })
 	for ; i < len(list) && list[i] < lo+uint32(b.n); i++ {
-		if _, ok := b.computedNode(int(list[i]-lo), idx, bc); !ok {
+		k := int(list[i] - lo)
+		if cb != nil && testBit(cb, k) {
+			continue // computed into the column: no value to decode to know that
+		}
+		if _, ok := b.computedNode(k, idx, bc); !ok {
 			v++
 		}
 	}
