@@ -45,39 +45,52 @@ var errEncryptionDisabled = errors.New("collections: encryption at rest is not e
 // the two comparisons it replaces, and the cache grew without bound over an unbounded key
 // space. The explicit set can change at runtime (SetEncryptedAttrs), so it is consulted live.
 
+// ErrInvalidDataKey is returned (wrapped) by Open, CreateArchive and OpenArchive, and is the panic New
+// raises, when Options.DataKey is set but is not a key this package seals with: it must be exactly
+// crypt.KeySize bytes, an AES-256 key.
+//
+// It is refused when the store is built rather than when a value is first sealed. A key AES cannot use
+// fails every Seal; refusing it up front means a store that claims encryption at rest (EncryptionEnabled)
+// either has a working key or does not exist. A shorter AES key (16 or 24 bytes) would seal, but under a
+// weaker cipher than the one Options.DataKey documents, so it is refused as well.
+var ErrInvalidDataKey = errors.New("collections: invalid data key")
+
+// checkDataKey reports whether dataKey is usable as Options.DataKey: empty (encryption disabled) or
+// exactly crypt.KeySize bytes.
+func checkDataKey(dataKey []byte) error {
+	if len(dataKey) == 0 || len(dataKey) == crypt.KeySize {
+		return nil
+	}
+	return fmt.Errorf("%w: %d bytes, want %d (AES-256)", ErrInvalidDataKey, len(dataKey), crypt.KeySize)
+}
+
 // dataKeySealer adapts the DB data key to wire.Sealer via crypt's AES-256-GCM. The cipher is built
 // once, with the sealer (crypt.AEAD), not per value: a collection's data key is fixed for its
 // lifetime, so its sealer is too, and a store opened under another key builds another sealer.
-// err is set instead of aead when the key is one AES cannot use; every call then fails with it, as
-// every call did when the cipher was built per call.
 type dataKeySealer struct {
 	aead *crypt.AEAD
-	err  error
 }
 
-func (s dataKeySealer) Seal(pt []byte) (nonce, ct []byte, err error) {
-	if s.err != nil {
-		return nil, nil, s.err
-	}
-	return s.aead.Seal(pt)
-}
+func (s dataKeySealer) Seal(pt []byte) (nonce, ct []byte, err error) { return s.aead.Seal(pt) }
 
-func (s dataKeySealer) Open(nonce, ct []byte) ([]byte, error) {
-	if s.err != nil {
-		return nil, s.err
-	}
-	return s.aead.Open(nonce, ct)
-}
+func (s dataKeySealer) Open(nonce, ct []byte) ([]byte, error) { return s.aead.Open(nonce, ct) }
 
 // newDataKeySealer builds the DB-wide Sealer from a data key. The key must be the
 // master's DataInfo subkey (crypt.Subkey(master, crypt.DataInfo)), never the master
-// itself. A nil/empty key returns nil (encryption disabled).
-func newDataKeySealer(dataKey []byte) wire.Sealer {
+// itself. A nil/empty key returns nil (encryption disabled); a key checkDataKey refuses
+// returns its error, never a sealer that would fail every Seal.
+func newDataKeySealer(dataKey []byte) (wire.Sealer, error) {
 	if len(dataKey) == 0 {
-		return nil
+		return nil, nil
+	}
+	if err := checkDataKey(dataKey); err != nil {
+		return nil, err
 	}
 	a, err := crypt.NewAEAD(dataKey)
-	return dataKeySealer{aead: a, err: err}
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidDataKey, err)
+	}
+	return dataKeySealer{aead: a}, nil
 }
 
 // encSetHolder is the immutable, atomically-swappable set of case-folded attribute

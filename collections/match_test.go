@@ -233,10 +233,10 @@ func TestMatchHotClosure(t *testing.T) {
 	sample := mustAd(t, `[ Cpus=8; Memory=8192; State="Unclaimed";
 		Start = (Cpus > 0) && (TARGET.RequestMemory <= Memory);
 		Requirements = Start && (State == "Unclaimed"); Pad=1 ]`)
-	if !wire.Ad(hot.encodeAd(sample.AST())).HotClosureComplete() {
+	if !wire.Ad(mustEncodeAd(hot.encodeAd(sample.AST()))).HotClosureComplete() {
 		t.Fatal("expected encoded ad flagged HotClosureComplete with MatchClosureRoots")
 	}
-	if wire.Ad(plain.encodeAd(sample.AST())).HotClosureComplete() {
+	if wire.Ad(mustEncodeAd(plain.encodeAd(sample.AST()))).HotClosureComplete() {
 		t.Fatal("plain collection must not flag HotClosureComplete")
 	}
 

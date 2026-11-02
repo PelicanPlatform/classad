@@ -931,7 +931,14 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			*curp = newDst(streamSegs, 0, target)
 			*st = newStream()
 		}
-		wireBuf = c.encodeInterned(wireBuf[:0], ad, st.table, st.hot)
+		// A value that will not seal aborts the round, as a dictionary overflow does: the record
+		// cannot be written sealed, and writing it any other way is writing the secret in the clear.
+		// The shard stays uncompacted, its sources in place.
+		var err error
+		if wireBuf, err = c.encodeInterned(wireBuf[:0], ad, st.table, st.hot); err != nil {
+			abort = true
+			return nil, 0
+		}
 		refreshHot(st) // pick up any hot names this ad interned, for later records
 		body := target.Compress(encBuf[:0], wireBuf)
 		encBuf = body
@@ -940,7 +947,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			finalizeInterned(*curp, st)
 			*curp = newDst(streamSegs, rl+reserve, target)
 			*st = newStream()
-			wireBuf = c.encodeInterned(wireBuf[:0], ad, st.table, st.hot)
+			if wireBuf, err = c.encodeInterned(wireBuf[:0], ad, st.table, st.hot); err != nil {
+				abort = true
+				return nil, 0
+			}
 			refreshHot(st)
 			body = target.Compress(encBuf[:0], wireBuf)
 			encBuf = body

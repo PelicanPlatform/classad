@@ -248,6 +248,11 @@ func (c *Collection) loadDicts(dictsDir string) (latest uint32, err error) {
 // directory (rebuilding the directory + index from the segment files) is the next
 // milestone.
 func Open(opts Options) (*Collection, error) {
+	// Before anything else, and before New (which panics on it): a bad key is a configuration
+	// error to report, and refusing it before the directory is touched leaves nothing behind.
+	if err := checkDataKey(opts.DataKey); err != nil {
+		return nil, err
+	}
 	if opts.Dir == "" {
 		return New(opts), nil
 	}

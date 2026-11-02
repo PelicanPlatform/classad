@@ -226,8 +226,11 @@ func (c *Collection) composeKeyless(dst []byte, parts []keylessPart, patch *clas
 	}
 	overlays := inl[1:]
 	if patch != nil && len(patch.AST().Attributes) > 0 {
-		overlays = append(overlays[:len(overlays):len(overlays)],
-			wire.EncodeInlineDelta(nil, patch.AST(), nil, c.shouldEncrypt, c.sealer))
+		enc, err := wire.EncodeInlineDeltaSealed(nil, patch.AST(), nil, c.shouldEncrypt, c.sealer)
+		if err != nil {
+			return dst, resealed, failSeal
+		}
+		overlays = append(overlays[:len(overlays):len(overlays)], enc)
 	}
 	var msc wire.MergeScratch
 	out, ok := wire.AppendAdPatchedInline(dst, inl[0], overlays, removed, &msc)
@@ -256,6 +259,11 @@ func (tx *Txn) encodePatchKeyless(dst []byte, b *txnBuf, h uint64) (raw []byte, 
 			return out, false, true, failNone
 		}
 	}
+	if why == failSeal {
+		// The stored record was readable; a value of this write would not seal. Nothing was
+		// encoded, and the write is refused rather than stored in the clear.
+		return nil, false, false, why
+	}
 	if why == failNotVisible && !c.keyExists(b.key, h) {
 		// A create: nothing is stored, so nothing sealed can be lost, and the record is the patch.
 		ad := classad.New()
@@ -264,7 +272,10 @@ func (tx *Txn) encodePatchKeyless(dst []byte, b *txnBuf, h uint64) (raw []byte, 
 			ad.Delete(n)
 		}
 		b.ad = ad
-		return c.encodeAdInto(dst, ad.AST()), false, true, failNone
+		if raw, err := c.encodeAdInto(dst, ad.AST()); err == nil {
+			return raw, false, true, failNone
+		}
+		return nil, false, false, failSeal
 	}
 	fallbackUnreadableBase.Add(1)
 	unreadableByReason[why].Add(1)

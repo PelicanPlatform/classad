@@ -42,7 +42,7 @@ func TestColBlockLayoutSharedAcrossBlocks(t *testing.T) {
 	for i := 0; i < 60; i++ {
 		ad := mustAdOld(t, fmt.Sprintf("Cpus=%d\nMemory=%d\nOwner=\"u%d\"\nExtra=%d",
 			1+i%8, 1024+i*64, i%5, i*100000)) // Extra escapes narrow widths -> cold tail exercised
-		wires = append(wires, c.encodeAd(ad.AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.80, Fit: 0.90, Strings: true})
 	recs := encodeRows(s, wires)

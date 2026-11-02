@@ -60,7 +60,7 @@ func TestColumnarBlockRoundTrip(t *testing.T) {
 		ad := mustAdOld(t, fmt.Sprintf(
 			"Cpus = %d\nMemory = %d\nBig = %t\nLoad = %f\nArch = \"X86_64\"\nMachine = \"node%02d.example.org\"\nExtra = %d\nReq = (Cpus >= 1)",
 			1+i%8, 1024+i*64, i%2 == 0, float64(i)/3, i, i*100000)) // Extra overflows small widths -> escapes
-		wires = append(wires, c.encodeAd(ad.AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.80, Fit: 0.90, Strings: true})
 	recs := encodeRows(s, wires)
@@ -90,7 +90,7 @@ func TestColumnarBlockScanInt(t *testing.T) {
 	var wires [][]byte
 	for i := 0; i < 300; i++ {
 		ad := mustAdOld(t, fmt.Sprintf("Cpus = %d\nMemory = %d\nDisk = %d", 1+i%16, 1024+(i%50)*512, i*1000))
-		wires = append(wires, c.encodeAd(ad.AST()))
+		wires = append(wires, mustEncodeAd(c.encodeAd(ad.AST())))
 	}
 	s := buildAdSchema(wires, adSchemaOpts{Presence: 0.90, Fit: 0.95})
 	recs := encodeRows(s, wires)

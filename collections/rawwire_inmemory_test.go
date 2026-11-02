@@ -61,7 +61,7 @@ func wireExprCollection(t *testing.T) *Collection {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, inline, ok := wire.Ad(c.encodeAd(probe.AST())).SplitBody(); !ok || inline {
+	if _, _, _, inline, ok := wire.Ad(mustEncodeAd(c.encodeAd(probe.AST()))).SplitBody(); !ok || inline {
 		t.Fatalf("stored records are inline (ok=%v): the fixture is not interned", ok)
 	}
 	return c
