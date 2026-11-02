@@ -57,10 +57,12 @@ func TestCountDistinct(t *testing.T) {
 	for _, r := range rows {
 		got[r.Group[0]] = r.Values
 	}
+	// A group reads as the value it is, so a string group carries its quotes: that is what
+	// keeps it apart from the number or the boolean that would otherwise print the same.
 	want := map[string][]string{
-		"alice": {"3", "2", "2"}, // 3 rows, hosts {a,b}, statuses {4,2}
-		"bob":   {"2", "1", "1"},
-		"carol": {"1", "1", "1"},
+		`"alice"`: {"3", "2", "2"}, // 3 rows, hosts {a,b}, statuses {4,2}
+		`"bob"`:   {"2", "1", "1"},
+		`"carol"`: {"1", "1", "1"},
 	}
 	for owner, w := range want {
 		g := got[owner]

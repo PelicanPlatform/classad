@@ -2,6 +2,7 @@ package db
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -175,7 +176,9 @@ func TestArchiveGroupedMultipleColumnsKeepsCaseApart(t *testing.T) {
 	want := map[string]int{}
 	for i := 0; i < n; i++ {
 		ts := base + int64(i%5)*day + int64(i%day)
-		want[multiColOwner(i)+"\x00"+fmt.Sprint(ts/day*day)]++
+		// The owner is quoted because a group reads as the VALUE it is, which is what keeps a
+		// string out of the group of the number or boolean it spells.
+		want[strconv.Quote(multiColOwner(i))+"\x00"+fmt.Sprint(ts/day*day)]++
 	}
 	rows, served := a.groupedFromColumns("", []GroupCol{{Attr: "Owner"}, {Attr: "Ts", BucketWidth: day}},
 		[]AggSpec{{Func: AggCount, Arg: "*"}})
@@ -205,11 +208,11 @@ func TestArchiveGroupedMultipleColumnsKeepsCaseApart(t *testing.T) {
 		lo, up := 0, 0
 		for k, v := range got {
 			switch {
-			case strings.HasPrefix(k, pair[0]+"\x00"):
+			case strings.HasPrefix(k, strconv.Quote(pair[0])+"\x00"):
 				n := 0
 				fmt.Sscan(v, &n)
 				lo += n
-			case strings.HasPrefix(k, pair[1]+"\x00"):
+			case strings.HasPrefix(k, strconv.Quote(pair[1])+"\x00"):
 				n := 0
 				fmt.Sscan(v, &n)
 				up += n

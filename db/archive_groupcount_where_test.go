@@ -5,10 +5,24 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // whereRefCount is the obviously-correct reference: fetch every matching ad and count by
 // hand. The constrained index path is only trustworthy if it agrees with this.
+// whereRefLabelCount is whereRefCount keyed the way a GROUP BY names its groups, for a
+// comparison against AggRow.Group. See groupLabelCountByScan for why the two are separate.
+func whereRefLabelCount(t *testing.T, hist *ArchiveTable, attr, constraint string) map[string]int64 {
+	t.Helper()
+	raw := whereRefCount(t, hist, attr, constraint)
+	out := make(map[string]int64, len(raw))
+	for v, n := range raw {
+		out[GroupValueText(classad.NewStringValue(v))] = n
+	}
+	return out
+}
+
 func whereRefCount(t *testing.T, hist *ArchiveTable, attr, constraint string) map[string]int64 {
 	t.Helper()
 	seq, err := hist.Query(constraint)
@@ -186,7 +200,7 @@ func TestConstrainedAggregateMatchesScan(t *testing.T) {
 				fmt.Sscan(r.Values[0], &v)
 				got[r.Group[0]] = v
 			}
-			want := whereRefCount(t, hist, "Owner", c)
+			want := whereRefLabelCount(t, hist, "Owner", c)
 			if len(got) != len(want) {
 				t.Fatalf("groups = %v, want %v", got, want)
 			}

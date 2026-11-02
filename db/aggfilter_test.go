@@ -56,9 +56,10 @@ func TestAggregateFilterPivot(t *testing.T) {
 		got[r.Group[0]] = r.Values
 	}
 	// alice: 4 rows, 2 completed, 1 running (4 cpus); bob: 3 rows, 1 completed, 2 running (18).
+	// A group reads as the value it is, so a string group carries its quotes.
 	want := map[string][]string{
-		"alice": {"4", "2", "1", "4"},
-		"bob":   {"3", "1", "2", "18"},
+		`"alice"`: {"4", "2", "1", "4"},
+		`"bob"`:   {"3", "1", "2", "18"},
 	}
 	for owner, w := range want {
 		g := got[owner]
@@ -92,7 +93,7 @@ func TestAggregateFilterNarrowsAggregateNotGroup(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("groups = %v, want both owners to survive", got)
 	}
-	if got["alice"] != "1" || got["bob"] != "0" {
+	if got[`"alice"`] != "1" || got[`"bob"`] != "0" {
 		t.Errorf("counts = %v, want alice 1 and bob 0", got)
 	}
 }
@@ -182,10 +183,10 @@ func TestAggregateUnfilteredUnchanged(t *testing.T) {
 	for _, r := range rows {
 		got[r.Group[0]] = r.Values
 	}
-	if g := got["alice"]; g[0] != "4" || g[1] != "15" || g[2] != "8" {
+	if g := got[`"alice"`]; g[0] != "4" || g[1] != "15" || g[2] != "8" {
 		t.Errorf("alice = %v, want [4 15 8]", g)
 	}
-	if g := got["bob"]; g[0] != "3" || g[1] != "19" || g[2] != "16" {
+	if g := got[`"bob"`]; g[0] != "3" || g[1] != "19" || g[2] != "16" {
 		t.Errorf("bob = %v, want [3 19 16]", g)
 	}
 }

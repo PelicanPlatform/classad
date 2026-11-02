@@ -163,7 +163,7 @@ func GroupedUserFromColumns(src GroupValuesSource, constraint string, groupCols 
 				return nil // not a sink this made; answering from it would be a guess
 			}
 			for j := range g.Values {
-				scratch[j] = ValueText(g.Values[j])
+				scratch[j] = GroupValueText(g.Values[j])
 			}
 			text := strings.Join(scratch, "\x00")
 			if j, dup := rowAt[text]; dup {

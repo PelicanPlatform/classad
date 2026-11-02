@@ -100,9 +100,10 @@ func TestAggregateFilterOverRPC(t *testing.T) {
 	for _, r := range rows {
 		got[r.Group[0]] = r.Values
 	}
+	// A group reads as the value it is, so a string group carries its quotes.
 	want := map[string][]string{
-		"alice": {"4", "2", "1", "4"},
-		"bob":   {"3", "1", "2", "18"},
+		`"alice"`: {"4", "2", "1", "4"},
+		`"bob"`:   {"3", "1", "2", "18"},
 	}
 	for owner, w := range want {
 		g := got[owner]
@@ -166,10 +167,10 @@ func TestAggregateFilterBucketed(t *testing.T) {
 	for _, r := range rows {
 		got[r.Group[0]] = r.Values
 	}
-	if g := got["alice"]; len(g) != 2 || g[0] != "4" || g[1] != "1" {
+	if g := got[`"alice"`]; len(g) != 2 || g[0] != "4" || g[1] != "1" {
 		t.Errorf("alice = %v, want [4 1]", g)
 	}
-	if g := got["bob"]; len(g) != 2 || g[0] != "3" || g[1] != "2" {
+	if g := got[`"bob"`]; len(g) != 2 || g[0] != "3" || g[1] != "2" {
 		t.Errorf("bob = %v, want [3 2]", g)
 	}
 }
@@ -238,11 +239,11 @@ func TestCountDistinctOverRPC(t *testing.T) {
 		got[r.Group[0]] = r.Values
 	}
 	// alice: 4 rows, statuses {4,2,5}; with Cpus>1 her rows are cpus 2(st 4),4(st 2),8(st 5).
-	if g := got["alice"]; len(g) != 3 || g[0] != "4" || g[1] != "3" || g[2] != "3" {
+	if g := got[`"alice"`]; len(g) != 3 || g[0] != "4" || g[1] != "3" || g[2] != "3" {
 		t.Errorf("alice = %v, want [4 3 3]", g)
 	}
 	// bob: 3 rows, statuses {4,2}; with Cpus>1 his rows are cpus 2(st 2),16(st 2) -> {2}.
-	if g := got["bob"]; len(g) != 3 || g[0] != "3" || g[1] != "2" || g[2] != "1" {
+	if g := got[`"bob"`]; len(g) != 3 || g[0] != "3" || g[1] != "2" || g[2] != "1" {
 		t.Errorf("bob = %v, want [3 2 1]", g)
 	}
 }

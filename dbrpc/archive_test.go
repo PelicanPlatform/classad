@@ -200,7 +200,7 @@ func TestArchiveAggregateOverRPC(t *testing.T) {
 	// GROUP BY Owner COUNT(*): assert against a client-side count over every row.
 	wantCounts := map[string]int{}
 	for _, o := range owners {
-		wantCounts[o]++
+		wantCounts[groupLabel(o)]++
 	}
 	rows, err = c.ArchiveAggregate(context.Background(), "history", "true", []string{"Owner"}, []AggSpec{{Func: AggCount, Arg: "*"}})
 	if err != nil {

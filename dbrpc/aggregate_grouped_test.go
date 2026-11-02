@@ -238,7 +238,7 @@ func TestRPCGroupedAggregateFallbackStillCorrect(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, text := range texts {
-		o := attrStr(t, text, "Owner")
+		o := groupLabel(attrStr(t, text, "Owner"))
 		if want[o] == nil {
 			want[o] = map[int64]bool{}
 		}
@@ -280,7 +280,7 @@ func TestRPCGroupedAggregateStringColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, text := range texts {
-		want[attrStr(t, text, "Owner")]++
+		want[groupLabel(attrStr(t, text, "Owner"))]++
 	}
 	if len(rows) != len(want) {
 		t.Errorf("got %d groups, want %d", len(rows), len(want))

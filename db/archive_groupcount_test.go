@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections"
 )
 
@@ -23,13 +24,37 @@ func groupCountByScan(t *testing.T, hist *ArchiveTable, attr string) map[string]
 	for ad := range seq {
 		v, ok := ad.EvaluateAttrString(attr)
 		if !ok {
-			// The aggregate engine renders an absent or non-string value as the literal
-			// "undefined" and groups those together, so the reference must do the same --
-			// these records are exactly the ones the index-resident path cannot attribute,
-			// and it must decline rather than drop them.
+			// An absent or non-string value groups under the bare word undefined -- these
+			// records are exactly the ones the index-resident path cannot attribute, and
+			// it must decline rather than drop them.
 			v = "undefined"
 		}
 		got[v]++
+	}
+	return got
+}
+
+// groupLabelCountByScan is groupCountByScan keyed the way a GROUP BY names its groups, for a
+// comparison against AggRow.Group rather than against the storage layer's own map.
+//
+// The two cannot be one helper. The storage API keys by the value's stored spelling, which is
+// a string and carries no quotes; a group label renders the VALUE, so a string arrives quoted
+// and an absent attribute stays the bare word undefined. That difference is the whole point of
+// the rendering -- a record with no Owner and one whose Owner IS "undefined" are two groups --
+// and a shared helper would have to pick one and be wrong for the other caller.
+func groupLabelCountByScan(t *testing.T, hist *ArchiveTable, attr string) map[string]int64 {
+	t.Helper()
+	seq, err := hist.Query("true")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int64{}
+	for ad := range seq {
+		key := "undefined"
+		if v, ok := ad.EvaluateAttrString(attr); ok {
+			key = GroupValueText(classad.NewStringValue(v))
+		}
+		got[key]++
 	}
 	return got
 }
@@ -129,7 +154,7 @@ func TestArchiveGroupCountMatchesScan(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			hist := mkHist(t, c.cfg, c.ads)
-			want := groupCountByScan(t, hist, "Owner")
+			want := groupLabelCountByScan(t, hist, "Owner")
 			got := aggGroupCounts(t, hist, "Owner")
 			if len(got) != len(want) {
 				t.Fatalf("groups = %v, want %v", got, want)
@@ -163,7 +188,7 @@ func TestArchiveGroupCountAcrossSegments(t *testing.T) {
 	if segs := hist.Stats().Segments; segs < 2 {
 		t.Fatalf("expected multiple segments, got %d", segs)
 	}
-	want := groupCountByScan(t, hist, "Owner")
+	want := groupLabelCountByScan(t, hist, "Owner")
 	got := aggGroupCounts(t, hist, "Owner")
 	if len(got) != len(owners) {
 		t.Fatalf("groups = %v, want %d", got, len(owners))

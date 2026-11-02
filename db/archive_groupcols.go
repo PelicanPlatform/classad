@@ -202,14 +202,18 @@ func GroupedFromColumns(src GroupStatsSource, constraint string, groupCols []Gro
 			}
 		}
 		// The rendered tuple, joined exactly as AggregateValues joins it. Rendering goes through
-		// ValueText for every component, bucketed or not: storage has already floored a bucketed
-		// component to an integer bucket start, and bucketKeyText renders that start with the same
-		// FormatInt, so one renderer covers both and there is no second spelling to drift.
+		// GroupValueText for every component, bucketed or not: storage has already floored a
+		// bucketed component to an integer bucket start, and an integer renders the same through
+		// either, so one renderer covers both and there is no second spelling to drift.
+		//
+		// It matters that this is the renderer and not ValueText. The merge below only ever JOINS
+		// keys, never splits them, so any two groups this renders alike are one group from here
+		// on -- and ValueText renders 4 and "4" alike.
 		if len(g.Values) != len(groupCols) {
 			return nil, false // a component short: nothing here can invent the missing one
 		}
 		for j := range g.Values {
-			scratch[j] = ValueText(g.Values[j])
+			scratch[j] = GroupValueText(g.Values[j])
 		}
 		text := strings.Join(scratch, "\x00")
 		if j, dup := rowAt[text]; dup {

@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"iter"
+	"math"
 	"strconv"
 	"strings"
 
@@ -295,7 +296,7 @@ func AggregateValues(seq iter.Seq[[]classad.Value], attrs []string, groupCols []
 				}
 				scratch[i] = kt
 			} else {
-				scratch[i] = ValueText(vals[groupCol[i]])
+				scratch[i] = GroupValueText(vals[groupCol[i]])
 			}
 		}
 		if drop {
@@ -416,7 +417,7 @@ func (a *aggAcc) update(spec AggSpec, v classad.Value) {
 			if a.seen == nil {
 				a.seen = map[string]struct{}{}
 			}
-			a.seen[ValueText(v)] = struct{}{}
+			a.seen[GroupValueText(v)] = struct{}{}
 		}
 	default:
 		a.vals = append(a.vals, v) // the library aggregates skip undefined / coerce
@@ -484,7 +485,108 @@ func numberOf(v classad.Value) (float64, bool) {
 
 func trimFloat(f float64) string { return strconv.FormatFloat(f, 'g', -1, 64) }
 
-// ValueText renders a value as a group-key/display string.
+// GroupValueText renders a value as its GROUP: the text that both names the group and decides
+// which values share one.
+//
+// GROUPING IS AN EQUIVALENCE RELATION, AND `==` IS NOT ONE. Two values belong in one group
+// exactly when they are the same value, which neither ClassAd operator quite says:
+//
+//	a          b              a == b       a =?= b     one group?
+//	undefined  undefined      undefined    true        yes
+//	error      error          error        true        yes
+//	4          "4"            error        false       no
+//	true       "true"         error        false       no
+//	"alice"    "Alice"        true         false       no
+//	1          1.0            true         false       YES
+//	true       1              true         false       no
+//
+// `==` disqualifies itself twice over: under it an undefined value is not equal to ITSELF, so
+// there is no group to put it in, and a cross-type pair answers `error` rather than
+// "different". A relation that is neither reflexive nor total cannot partition rows. That is
+// the same corner SQL turns, and it turns it the same way -- GROUP BY is defined on "is not
+// distinct from", not on `=`, which is why NULL groups with NULL.
+//
+// `=?=` IS total and reflexive, and for strings, bools and undefined it is exactly right. It
+// is wrong in one place: it separates 1 from 1.0. Those are one quantity written two ways,
+// and HTCondor ads genuinely carry both spellings of the same attribute, so splitting them
+// gives two rows for one number -- a surprise with nothing behind it. The storage layer keys
+// by (bits, type) and separates them; this is the layer that decides they are one group.
+//
+// So the relation is: a number equals a number when they are numerically equal, a string
+// equals a string when it is byte-identical, every other kind equals only its own kind and
+// value, and undefined and error each form one group. Within numbers that is `==`; within
+// strings it is `=?=`; across kinds it is neither, because neither answers.
+//
+// WHY ONE FUNCTION AND NOT TWO. The key and the label are the same channel: AggRow.Group is
+// what a caller reads AND what it keys on. A key finer than its label yields two output rows
+// with one name -- which is what a tagged key over ValueText's labels produced, and
+// TestArchiveGroupedStringColumn says it plainly: "group "undefined" appears twice". The
+// rendering is made FAITHFUL instead, so distinct groups always read differently: a string
+// arrives quoted, which is what keeps it from reading as the number or the bool it spells.
+//
+// That faithfulness is also what lets 1 and 1.0 be one group WITHOUT hiding anything. They
+// render alike because they ARE alike here; 4 and "4" render differently because they are not.
+//
+// AND WHY THIS MUST NOT SHARE A RENDERER WITH joinPlan.key, which looks like the same job.
+// The two have OPPOSITE requirements. A group key has to be exact: it partitions rows, so
+// merging two values that are not the same value is a wrong row. A join's hash key has to be
+// COARSE: it only narrows candidates, and the condition re-checks every surviving pair, so
+// putting two unequal rows in one bucket costs a comparison -- while separating two rows the
+// condition WOULD match loses them. A join's condition is usually `==`, so its key folds case
+// on purpose, which is exactly what this must not do.
+//
+// A NaN groups with other NaNs, though `NaN == NaN` is false, and an infinity with its own
+// sign. Both are the same choice undefined and error get: a relation has no answer, and one
+// group for all of them says more than one group per row. A bucketed series drops them
+// before they reach here anyway.
+//
+// A LIST OR A NESTED AD is reached by no operator at all: `{1,2} =?= {1,2}` is error, so even
+// reflexivity fails there. They group by canonical text, which collects identical ones
+// together -- the most that can be said about values no relation reaches, and more useful than
+// one group per row.
+func GroupValueText(v classad.Value) string {
+	switch {
+	case v.IsString():
+		// Quoted, which is the whole of what keeps "4" out of the integer 4's group and
+		// "undefined" out of undefined's. Value.String() quotes and escapes it.
+		return v.String()
+	case v.IsInteger():
+		if n, err := v.IntValue(); err == nil {
+			return strconv.FormatInt(n, 10)
+		}
+	case v.IsReal():
+		if f, err := v.RealValue(); err == nil {
+			return numberGroupText(f)
+		}
+	}
+	return v.String()
+}
+
+// numberGroupText renders a real so that an integral one reads as the integer it equals, and
+// nothing else changes.
+//
+// FormatInt and not 'g', because the integer it has to match is rendered by FormatInt: 'g'
+// would give a large integral real an exponent (9.007199254740992e+15) where the integer of
+// the same value spells itself out, and the two would miss each other though they are one
+// number. Integers are never routed through a float at all -- 9007199254740993 and
+// 9007199254740992 are different numbers and one float64, so rounding them together would
+// merge two groups that are not the same value.
+//
+// The range test is strict at the top on purpose. math.MaxInt64 converted to a float64 is
+// 9223372036854775808, one MORE than MaxInt64, so `f <= math.MaxInt64` admits a value that
+// int64() cannot represent -- and in Go that conversion is implementation-defined, which is
+// the same trap bucketFloorInt documents. The bound here is that float, excluded.
+func numberGroupText(f float64) string {
+	const twoPow63 = float64(1 << 63) // the first float64 above MaxInt64
+	if f == math.Trunc(f) && f >= -twoPow63 && f < twoPow63 {
+		return strconv.FormatInt(int64(f), 10)
+	}
+	return strconv.FormatFloat(f, 'g', -1, 64)
+}
+
+// ValueText renders a value as a plain display string, for an aggregate's RESULT. It is not a
+// group rendering and must not be used as one: it drops the quoting and the decimal point that
+// tell two groups apart. See GroupValueText.
 func ValueText(v classad.Value) string {
 	switch {
 	case v.IsUndefined():

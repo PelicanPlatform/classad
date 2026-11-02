@@ -5,6 +5,7 @@ import (
 	"sort"
 	"testing"
 
+	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -35,11 +36,11 @@ func TestAggregateGroupBy(t *testing.T) {
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Group[0] < rows[j].Group[0] })
 
 	// alice: count 2, sum 12, max 8
-	if rows[0].Group[0] != "alice" || rows[0].Values[0] != "2" || rows[0].Values[1] != "12" || rows[0].Values[2] != "8" {
+	if rows[0].Group[0] != `"alice"` || rows[0].Values[0] != "2" || rows[0].Values[1] != "12" || rows[0].Values[2] != "8" {
 		t.Fatalf("alice group = %+v", rows[0])
 	}
 	// bob: count 1, sum 16, max 16
-	if rows[1].Group[0] != "bob" || rows[1].Values[0] != "1" || rows[1].Values[1] != "16" || rows[1].Values[2] != "16" {
+	if rows[1].Group[0] != `"bob"` || rows[1].Values[0] != "1" || rows[1].Values[1] != "16" || rows[1].Values[2] != "16" {
 		t.Fatalf("bob group = %+v", rows[1])
 	}
 }
@@ -63,7 +64,8 @@ func TestAggregateMultiColumnGroup(t *testing.T) {
 	for _, r := range rows {
 		counts[r.Group[0]+"/"+r.Group[1]] = r.Values[0]
 	}
-	if counts["alice/Run"] != "2" || counts["alice/Idle"] != "1" {
+	if counts[groupLabel("alice")+"/"+groupLabel("Run")] != "2" ||
+		counts[groupLabel("alice")+"/"+groupLabel("Idle")] != "1" {
 		t.Fatalf("multi-column group counts = %v", counts)
 	}
 }
@@ -195,7 +197,14 @@ func TestAggregateBucketedWithLabel(t *testing.T) {
 		got[r.Group[0]+"/"+r.Group[1]] = r.Values[0]
 	}
 	// bucket 3600: alice=2, bob=1 ; bucket 7200: alice=1
-	if got["3600/alice"] != "2" || got["3600/bob"] != "1" || got["7200/alice"] != "1" {
+	if got["3600/"+groupLabel("alice")] != "2" || got["3600/"+groupLabel("bob")] != "1" ||
+		got["7200/"+groupLabel("alice")] != "1" {
 		t.Fatalf("bucketed+label counts = %v", got)
 	}
 }
+
+// groupLabel renders a string value the way a GROUP BY names its group. A group reads as the
+// VALUE it is, so a string carries its quotes -- which is what keeps it out of the group of the
+// number or boolean it spells. A reference built from raw owner strings has to render them the
+// same way, or it is keyed differently from the answer it is checking.
+func groupLabel(s string) string { return db.GroupValueText(classad.NewStringValue(s)) }
