@@ -715,25 +715,57 @@ unchanged.
 
 ## 6. The optimizer
 
-### 6.1 The cost model: a register is a batch, so allocation is a bandwidth problem
+### 6.1 The cost model: a register is a batch, so FORM is what costs
+
+*(Retitled. This was "so allocation is a bandwidth problem"; the bandwidth half is measured false
+below and the form half is what survived.)*
 
 An earlier draft rejected SSA, liveness, register assignment and CSE on the grounds that ClassAd
 expressions are a handful of AST levels deep. **That is the wrong cost model and should be
 discarded.** It measured the *depth of an expression* and the cost of *instruction dispatch*, when
 the quantity that matters is the *size of a live value*.
 
-The arithmetic. A batch is 8192 records (`collections/colblock.go:98`). A `Vec` in data form carries
-`I []int64` (8 B/record), `S []string` (16 B/record — a string header) and `St []uint8` (1 B/record)
-(`collections/vm/vecexec.go:64-72`). So:
+The arithmetic. A `Vec` in data form carries `I []int64` (8 B/record), `S []string` (16 B/record — a
+string header) and `St []uint8` (1 B/record) (`collections/vm/vecexec.go:64-72`), plus two bitplanes
+at 0.25 B/record. So:
 
-| Register form | Bytes per record | At *n* = 8192 | Relative |
-|---|---|---|---|
-| Data | 25 | ~200 KiB | 1x |
-| Raw, 2-byte column | 2 | ~16 KiB | 1/12 |
-| Mask (two bitplanes) | 0.25 | ~2 KiB | 1/100 |
-| `Const` | — (one element) | ~25 B | 1/8000 |
+| Register form | Bytes per record | At *n* = 8192 | At *n* = 16 | Relative |
+|---|---|---|---|---|
+| Data | 25 | ~200 KiB | ~400 B | 1x |
+| Raw, 2-byte column | 2 | ~16 KiB | 32 B | 1/12 |
+| Mask (two bitplanes) | 0.25 | ~2 KiB | 4 B | 1/100 |
+| `Const` | — (one element) | ~25 B | ~25 B | 1/8000 |
 
-Three consequences that change what the optimizer is *for*:
+**The *n* = 8192 column is the wrong one to read, and it is the one this section was built on.** 8192
+is `colGroupMaxRows`, a row BACKSTOP; what seals a row group on real ads is `colGroupTargetBytes`,
+128 KiB of uncompressed row form (`collections/colblock.go:88-98`). An OSPool slot ad is ~8.6 KB of
+that, so a block — and therefore the batch, and therefore a register — is about **sixteen records**.
+Measured over the committed real pool sample: p50 = 16, max = 16, record-weighted mean 14.7, pinned
+by `TestProductionBlockWidthIsSetByBytesNotRows` (`collections/blockwidth_test.go`). The row cap
+would bind only on ads narrow enough that 8192 of them fit in 128 KiB — about 16 bytes of row form
+each, which no ClassAd worth storing is; thirty numeric attributes still seals at 2048 on the byte
+rule. So 8192 is not the other common case, it is a bound nothing reaches.
+
+**Two further corrections to the 25 B.** Only 9 of it is touched by numeric work: `S` is allocated
+unconditionally so that `LoadColumn` can receive a `Vec` by value (`:153-157`) and `copyVec`
+explicitly skips it unless some element really is a string (`:836-842`). For the numeric arithmetic
+this section is about, the cache-relevant figure is `I` + `St` and the other 16 B is never read.
+
+And the live register COUNT for a real constraint is two to four vectors, not the five to ten
+assumed below. The reason is stronger than
+"real constraints are small": **expression size does not buy register pressure at all.** The
+lowering is left-associative, so a four-conjunct `&&` holds the same three vectors as a two-conjunct
+one, and a seven-term arithmetic chain over four columns — fourteen value operations — also holds
+three, because each product is consumed by the sum above it and only the accumulator lives. Pinned
+across all of those by `TestVectorPeakLiveIsExpressionShaped`. Only a script binding read after its
+definition raises the count, which is why §11.2's "eight locals all read at the end" had to be
+constructed on purpose to reach nine.
+
+Peak live bytes for a real production constraint is therefore about **a kilobyte** — three vectors
+at sixteen records — not the one to two megabytes consequence 3 assumes.
+
+The three consequences are kept because the first two survive and the third does not, and which is
+which is the point:
 
 1. **Spilling a register spills a batch.** A spill is ~200 KiB of traffic, not 8 bytes. Spilling must
    be treated as nearly prohibitive, and **rematerialization is cheap by comparison** — reloading a
@@ -744,16 +776,61 @@ Three consequences that change what the optimizer is *for*:
    registers would make exactly the wrong decisions: fifty live mask registers cost a quarter of one
    live data register. Form must be part of the cost function, which means it must be part of the IR
    (§6.5).
-3. **The target is cache residency.** At ~200 KiB per data register, five to ten simultaneously-live
-   data registers evict the batch itself from a 1–2 MiB L2. The current executor stays small by
-   accident — its stack depth is the expression's height — and a script with locals and loop-carried
-   values has no such natural bound. That is precisely why allocation becomes necessary rather than
-   decorative.
+3. ~~**The target is cache residency.** At ~200 KiB per data register, five to ten
+   simultaneously-live data registers evict the batch itself from a 1–2 MiB L2.~~ **Measured, and
+   false** — and not merely at the real batch width. False even at 8192 with thirty-four live
+   vectors, where the register file is 6.9 MiB allocated and 2.4 MiB touched. Sweeping the batch
+   width from 8192 down to 16 is tiling's effect without tiling's machinery, and throughput per
+   element does not improve at any narrower width at any register pressure; below about 512 it gets
+   steadily worse. Best width is 512-4096 at every pressure, and 8192 is within 3% of it. See
+   `BenchmarkTileHot` (`collections/vm/tilewidth_bench_test.go`) and the strike
+   of §6.8 item 10, which has the numbers.
 
-Everything in §6.2–6.7 is designed against this model. The earlier objection — "real ClassAd
-expressions are a handful of AST levels deep, so a peephole over five nodes earns nothing" — is
-answered rather than ignored: it is true, and irrelevant, because nothing here optimizes instruction
-count.
+   The "1–2 MiB L2" is also not this hardware. An M2 Pro has 128 KiB of L1d per P-core and **16 MiB
+   of L2 shared across the P-core cluster** (`sysctl hw.perflevel0.l2cachesize`), so even granting
+   the 200 KiB figure it would take eighty live data registers to fill L2, not five to ten. The
+   sentence was wrong about the register, wrong about the cache, and wrong about the conclusion;
+   only the last of those needed measuring.
+
+   **Why the mechanism was never going to fire.** Cache capacity pays only where there is reuse to
+   capture. A register here is written by one instruction and streamed by the next, in order, which
+   is the access pattern a hardware prefetcher serves perfectly; and the interpretive cost in those
+   script arms is 4.3-5.4 ns per element per value operation, fifteen to nineteen cycles, which is
+   more than the L2 hit a smaller working set would have avoided and does not move as the working
+   set ranges over four orders of magnitude. Nothing here is stalling on memory, so there is no
+   stall for residency to remove. **An argument from bytes needs a measured stall before it is an
+   argument about time.**
+
+What survives of 1 and 2 is their RELATIVE content, which is width-independent and therefore
+untouched: a spill and a rematerialization both scale with the batch, so reloading a column stays
+cheaper than spilling a derived vector at sixteen records exactly as at 8192, and a mask stays 100x
+cheaper than data at every width. What does not survive is consequence 1's absolute gloss — a spill
+is ~400 bytes at the real width, which is not "nearly prohibitive", it is a memcpy — and the whole
+of consequence 3. What dies with it is the inference from "a register is large" to "allocation
+controls cache residency", so §6.2–6.7 should be read as designed against *form selection*
+(consequence 2), which measures, and not against residency, which does not. The earlier objection — "real ClassAd expressions are a handful of AST
+levels deep, so a peephole over five nodes earns nothing" — is still answered rather than ignored:
+it is true, and irrelevant, because nothing here optimizes instruction count.
+
+**The gate this section should be read through, which is the general result and not a footnote to
+one struck item.** Every argument from bytes moved — this section's own, and several passes on
+§6.8's list — imports one premise without stating it: **that the compute per element is small
+compared to the memory cost per element.** That premise is checkable in an afternoon, before
+anything is built, and it has a number:
+
+> **Cycles per element per value operation.** Near one, the memory-traffic arguments apply and
+> everything in this section is live. Near twenty, the executor is its own bottleneck, no working
+> set fits well enough to matter, and every byte-based argument about it is premature.
+
+This executor measures **fifteen to nineteen** — 4.3 ns per element per value operation at one live
+binding, 5.4 ns at thirty-two, counting the column loads and local copies that go with them. A state
+byte examined, a switch dispatched, three-valued logic reconstructed; more than an L1 miss that hits
+L2. The floor is lower and shows what kind of problem this is: a `Const`-specialized comparison runs
+at 1.7 ns per element, about six cycles, so the gap between six and nineteen is dispatch and
+generality rather than memory. That is why §6.8 item 10 was struck, and it is the first thing to re-measure if the kernels
+ever get substantially faster, because it is the quantity that decides whether this whole section is
+describing the real cost or a plausible one. **A pass justified by bytes now has to discharge that
+premise rather than assume it**; §12 says which of §6.8's items do and which do not.
 
 ### 6.2 SSA construction and predication
 
@@ -1038,13 +1115,80 @@ that a trivial allocator is no longer good enough.
    `if RequestGpus > 0:`, a block where nothing passes must never touch that column. The
    counterpart to loop-invariant hoisting, in the opposite direction: hoist out of loops, sink into
    predicates.
-10. **Tiling and kernel fusion.** Attacks §6.1's cost model head on rather than working around it.
-   Peak live bytes is `registers x 8192 x 25B`; tile the batch into L2-sized sub-batches and fuse
-   each straight-line region over a tile, and the peak falls by 8-16x -- at which point MORE live
-   registers become affordable, not fewer. So tiling and register assignment are substitutes for the
-   same problem, and this may belong ahead of 2 rather than after it. Two constraints: a tile
-   shortens the region a compaction has to amortize over (§6.4), and `Raw`/`Dict` are block-scoped
-   (§6.5), so a tile must not straddle a block.
+10. ~~**Tiling and kernel fusion.**~~ **Struck. Measured, and it does not pay.** The claim was that
+   peak live bytes is `registers x 8192 x 25B`, so tiling the batch into cache-sized sub-batches
+   would cut the peak 8-16x and make MORE live registers affordable rather than fewer, which would
+   put it ahead of item 2. Two things are wrong with it, and the second is the one that matters.
+
+   **The width is wrong by ~512x.** 8192 is `colGroupMaxRows`, a backstop; the byte budget seals a
+   real block at about sixteen records (§6.1). A tile is a subdivision of a batch, and the batch is
+   already sixteen wide. The constraint this item names — `Raw` and `Dict` are block-scoped, so a
+   tile must not straddle a block — is what fixes that: it is precisely the rule that prevents a
+   batch from being *larger* than a block, and it leaves tiling nothing to subdivide. The constraint
+   listed as limiting the optimization turns out to eliminate it.
+
+   **And the mechanism does not fire even at 8192.** `BenchmarkTileHot`
+   (`collections/vm/tilewidth_bench_test.go`) sweeps the width from 8192 down to 16 over a
+   cache-resident corpus, so the register file is the only thing that grows with the width, across a
+   register-pressure gradient from 2 to 34 live vectors — 404 KiB to 6.9 MiB allocated, 144 KiB to
+   2.4 MiB touched. Narrowing the width never helps. Best width is 512-4096 at every pressure, and
+   width 8192 is within 3% of it; below 512 the curve degrades steadily.
+
+   **The control is what settles it rather than the flatness.** The predicted signature was specific:
+   no effect at low register pressure, a growing effect as pressure rises, with the turnover width
+   moving as the working set crosses the cache. The observed signature is the exact inverse. Relative
+   cost at width 16 against each arm's own best, min of 14 runs over both sweep directions, on an idle machine:
+
+   | live vectors | allocated at *n*=8192 | best ns/elem | at w=16 | w=16 vs best |
+   |---|---|---|---|---|
+   | 2 (the control, `A0 > 32`) | 404 KiB | 1.69 | 5.10 | **3.02x** |
+   | 3 (one binding) | 606 KiB | 12.89 | 19.76 | 1.53x |
+   | 4 (two bindings) | 808 KiB | 28.61 | 41.46 | 1.45x |
+   | 6 (four bindings) | 1.2 MiB | 60.38 | 84.52 | 1.40x |
+   | 10 (eight bindings) | 2.0 MiB | 128.20 | 173.20 | 1.35x |
+   | 18 (sixteen bindings) | 3.6 MiB | 259.30 | 338.60 | 1.31x |
+   | 34 (thirty-two bindings) | 6.9 MiB | 519.60 | 667.10 | 1.28x |
+
+   The penalty is *largest* where the working set is *smallest*, and falls monotonically as live
+   bytes grow by a factor of seventeen. That is per-call fixed cost being amortized over more
+   per-element work, not residency — and the control arm, whose working set does not vary with
+   register pressure at all, shows the strongest version of it. **A working-set effect cannot be
+   strongest in the arm that has no working set.** Had the sweep been run at one register pressure,
+   or without the control, the rising part of the curve would have been easy to read as the
+   predicted effect with the sign misremembered.
+
+   **Why the argument was appealing, which matters more than that it was wrong.** It is not a bad
+   argument. It is *the* argument for tiling in vectorized query execution, and it is correct in the
+   systems it comes from — where kernels are compiled, a pass over a column costs on the order of one
+   cycle per element, and memory genuinely is the limit. Imported here it carries a premise it does
+   not state: **that the compute per element is small compared to the memory cost per element.** This
+   executor spends fifteen to nineteen cycles per element per value operation on interpretive
+   overhead — a state byte examined, a switch dispatched, three-valued logic reconstructed — which is
+   more than an L1 miss that hits L2. Under that premise there is no stall to recover and tiling cannot
+   help, however large the register file gets.
+
+   So the discriminating quantity is **cycles per element per operation**, and it is cheap to check
+   before building anything: if it is near one, the tiling argument applies; if it is near twenty,
+   the executor is its own bottleneck and every byte-based argument about it is premature. That is
+   the generalization worth keeping, and it applies to §6.1's whole cost model rather than only to
+   this item.
+
+   Nothing here argues against tiling in general; it argues that **this executor is not memory-bound
+   and so has no tiling-shaped headroom.** If the kernels ever get fast enough for memory to bind,
+   the same sweep is how that will show: a minimum would appear below 8192 and would move with
+   register pressure. Re-run it then; do not re-derive it from the byte count.
+
+   **What was NOT tested, and should not be struck with it: kernel fusion.** This item bundles two
+   things. Tiling is narrowing the batch, which is what the sweep varies and what the refuted
+   argument was about. Fusion is running several instructions over one tile before moving to the
+   next, so an intermediate never reaches memory at all — a different mechanism, and a width sweep
+   over an unfused executor says nothing about it. It survives as a candidate, with its justification
+   changed: its value here cannot be the memory traffic it saves, since there is no memory stall to
+   recover, but the per-element interpretive work it removes — one pass's loop setup and one round of
+   per-element state dispatch per instruction fused away. That is the quantity this measurement
+   identifies as the limit, so fusion belongs beside item 1 and costed in operations removed, not
+   ahead of item 2 and costed in bytes. Measuring it needs a fused kernel to compare against and is
+   a build, not a sweep.
 11. **Early exit on an empty live mask.** A popcount at region entry and a jump past it. §2.3 gives
    `while` this; nothing else has it, and on a selective script it is nearly free.
 12. **Loop-invariant code motion.** The motivating case is concrete: there is no regular-expression
@@ -1203,6 +1347,67 @@ diagnostic. **D4** the optimizer, one pass at a time, each gated on its O4 law a
 switchable; form selection first, then liveness and allocation, then compaction, then CSE. **D5**
 `def`/`return` with inlining, `defer`/`${}`, and host function registration.
 
+### 7.7 O6 — a test asserts its own fixture still exercises the rule it guards
+
+The companion to §7.8, and the more general of the two: **a passing test and a vacuous test look
+identical in the output.** If a fixture drifts so that it no longer reaches the condition an
+assertion is about, the assertion holds trivially and the suite stays green. Nothing distinguishes
+that from coverage.
+
+This is not hypothetical here either, and it is what made a mutation run informative rather than
+merely noisy. Mutating `colGrouping.full` to ignore the byte budget failed exactly five tests in the
+`collections` package. Two of them — `TestRowGroupsNoRunts` and `TestColGroupsAlignedToEight` —
+failed not because an assertion went false but because each checks that its fixture still produced
+more than one row group, and said so:
+
+> *"no segment held more than one row group, so the aligned-prefix back-off never ran and this test
+> asserted nothing"*
+
+Without that check those two would have **passed while testing nothing**, the mutation would have
+looked better contained than it was, and "exactly five failed" would have been a coincidence rather
+than evidence. `colgroup_bench_test.go` records the same hazard from the benchmark side, where a
+segment smaller than the group size being measured makes two "different" regimes the same
+measurement.
+
+**So: any test whose assertion depends on its fixture reaching some condition checks that condition
+and fails when it stops holding.** The cost is one branch; what it buys is that a mutation run, a
+refactor, or a changed default cannot quietly convert coverage into green. State the precondition,
+not only the result.
+
+### 7.8 O7 — which path ran, because a declining fast path is a silent wrong *measurement*
+
+The sharper, path-specific case of §7.7, added after a measurement was very nearly taken on a code
+path it was not measuring.
+
+**The hazard.** A fast path that declines per unit of work and falls back to a correct slow path
+produces a result that is **right in value and wrong in provenance**. Every oracle in §7.1–7.5
+compares values, so every one of them passes. A benchmark then reports a number for the fast path
+that is the slow path's number, and someone reasons from it.
+
+**It is not hypothetical and it is not rare.** Building the §6.8 item 10 measurement, an end-to-end
+scan over the committed real pool sample measured ~4000 ns/record and was read as a slow vector
+path. It was not the vector path at all: `lastVecSplit` showed `vecBlocks: 0, scopeBlocks: 1673` —
+every block falling to `colScope` — while `VectorEvalCount` returned `ok=true` and the correct
+count. The cause is worth knowing because the fixture is the natural one to write:
+`BuildAndEnableSchemaScan` picks the hot tier **by demand**, and a fixture that drives no demand
+gets whichever eight attributes the sample happens to favour — here `OpSysMajorVer`, `UpdatesLost`,
+`DetectedCpus` and four `Monitor*` attributes. `Memory` and `Cpus`, which is what a constraint over
+these ads would actually read, sit in the cold tail, and a constraint over a cold column declines
+the vector path on every block. Querying a hot attribute instead put the same scan at ~100
+ns/record: a **40x** error, with nothing in the result saying so.
+
+**So the law**, which is §7.7 applied to the one precondition that matters most here. Any test or
+benchmark claiming to exercise an accelerated path asserts **which path ran**, from a counter the path itself maintains, and does so **before** it reports anything.
+`lastVecSplit` already is that counter for the vector scan; `BenchmarkVecScanBlockWidth`
+(`collections/blockwidth_bench_test.go`) fails outright when `vecBlocks == 0`.
+
+Two details that are the difference between the guard working and not. It must **fail, not warn** —
+a warning in benchmark output is invisible beside the numbers, which is exactly how ~4000
+ns/record got read as a slow fast-path rather than as a different path. And it belongs in the
+**benchmark** as much as the test: a test that silently exercises the fallback loses coverage, which
+is bad, but a benchmark that silently measures the fallback emits a number that then gets built on,
+which is worse.
+
 ---
 
 ## 8. What this is not
@@ -1243,7 +1448,7 @@ switchable; form selection first, then liveness and allocation, then compaction,
 | D6 | Local assignment is **strict** (forces lazy lists) | `listData` holds a live scope pointer (`evaluator.go:793-806`) while `Insert` mutates in place (`classad.go:498`) | A cheaper fix such as copy-on-write in `Insert` — but that changes the ad layer for everyone |
 | D7 | Whole script → **one instruction stream over a register file**; no statement walker | An optimizer must see across statements; predication must thread one region; a stack cannot express long-lived locals | A profile showing the optimizer wins nothing — but that is D9's question, not this one |
 | D8 | Expression leaves still lower through the **existing** `compile.go` | Keeps one lowering site (`opcode.go:4-9`), which is what O1 depends on | Nothing |
-| D9 | A real optimizer: form selection, SSA, liveness, linear-scan allocation, coalescing, rematerialization, compaction, CSE | **A register is a batch**: ~200 KiB in data form vs ~2 KiB in mask form at *n*=8192 (§6.1), so allocation controls cache residency and a spill moves 200 KiB | A profile showing peak live bytes is not the bottleneck — i.e. that scripts stay at expression-like register pressure after all |
+| D9 | A real optimizer: form selection, SSA, liveness, linear-scan allocation, coalescing, rematerialization, compaction, CSE | **A register is a batch**, so form selection is worth a factor of 100 in bytes AND in operations. ~~Allocation controls cache residency~~ — the residency half is **measured false** (§6.1 consequence 3, §6.8 item 10), and with it the ranking that put allocation second | **Already changed, by exactly the evidence this row named.** The sweep is the profile showing peak live bytes is not the bottleneck: flat from 400 B to 6.9 MiB of live register. What survives is the form half |
 | D10 | **Form is part of a register's type**; materialization is an explicit instruction | The forms differ by up to 8000x in bytes; an invisible conversion already cost a measured 9.8% win once (`vecexec.go:824-829`) | Nothing — this is the trap, documented in the source |
 | D11 | Compaction: **static site selection, dynamic firing**; `Raw` rematerialized rather than compacted; `Const` never compacted | Selectivity is data-dependent, so firing must be dynamic, as the existing 25% guard already is (`colvec.go:444`); `CopyElem` widens `Raw` (`vecexec.go:1241`) | A measurement that a static selectivity estimate is accurate enough per block |
 | D12 | CSE is **sound in the vector context**, including on `OpLoadRef`, given a purity clause added to `ColumnSource` | The cycle-marker hazard is scalar-only: the vector executor resolves no reference through the evaluator (`vecexec.go:296-300`, `:353-357`) | A `ColumnSource` implementation that cannot promise purity per batch — then CSE drops `OpLoadRef` and keeps the rest |
@@ -1592,9 +1797,57 @@ needs it.
 7. **D3, the lexer and parser.** Last on purpose. Every semantic question above is answerable through
    the builder API, and holding syntax back keeps the §4 lexical argument free to change.
 
-Two items on §6.8's list have been partly overtaken and should be re-costed rather than built as
-written: item 12 (LICM for regexp) now has its built-in half done, and item 2 (liveness and
-allocation) competes with item 10 (tiling), which §6.8 itself flags as possibly belonging first.
+Three items on §6.8's list have been overtaken and should be re-costed rather than built as written.
+Item 12 (LICM for regexp) now has its built-in half done. Item 10's **tiling half is struck**: it
+was measured before being acted on, as item 0's lesson requires, and the measurement refutes it —
+see §6.8 item 10 for the numbers and §6.1 consequence 3 for what it takes down with it. Its
+**fusion half is not struck**, because a width sweep does not test it; it moves down the list rather
+than up, and is re-justified by operations removed rather than by bytes.
+
+**And the premise §6.1's gate names is now owed by every pass on that list that was justified by
+memory traffic rather than by operations removed.** The measurement that struck item 10 did not
+strike those, but it did withdraw the assumption they were ranked on, so each needs re-reading
+against it. The audit, which is a claim to check rather than a result:
+
+| item | justified by | survives the premise? |
+|---|---|---|
+| 1, form selection | 100x fewer bytes **and** fewer operations — a mask is one `planeAnd` per 64 records, not per record | **Yes**, and on the operations half, which never needed the premise. Unaffected; still first |
+| 9, deferred column loads | a load not performed is a **decompression** not performed, ~78% of mutable read CPU | **Yes**, and most strongly. Decompression is real work per element, not a cache effect, so the premise is irrelevant to it. This is the item the measurement most clearly leaves standing |
+| 5, constant folding / `Const` propagation | a `Const` is one element instead of *n*; materializing one cost a measured 9.8% of a scan | **Yes** — the 9.8% was *measured*, not derived from a byte count, and what it removes is per-element writes |
+| 8, dead code elimination | "a dead data register is 200 KiB" | **Weakened, not struck.** The byte figure is ~400 B at the real width, so the motivation is the operations a dead computation runs, not the memory it holds. Still worth doing, worth much less than the entry implies |
+| 3, compaction | each arm runs at `popcount(live)` instead of *n* | **Yes** — it removes *work for records*, which is operations, not bytes. §6.4's open question about its threshold is unaffected |
+| 2, liveness and register assignment | **peak live bytes controls cache residency** | **No.** This is the one the measurement takes, below |
+| 10, tiling | peak live bytes | **No.** Struck |
+
+The pattern is worth naming: **every item justified by work removed survives, and every item
+justified only by bytes resident does not.** Nothing on the list needs rebuilding; what needs
+redoing is the ranking, which was ordered by a quantity that turns out not to bind.
+
+And item 2 (liveness and register allocation) **loses the argument it was ranked by**, because the
+same measurement takes it. Item 2 is second on §6.8's list on the strength of §6.1's claim that peak
+live bytes controls cache residency; that claim is now measured false over a working set ranging
+from 400 bytes to 6.9 MiB. What is left of item 2 is real but much smaller: coalescing removes
+moves, and rematerialization removes work. Neither is a residency argument, and neither is worth
+being second. It should be re-costed against what the sweep actually found, which is that the limit
+is **per-element interpretive cost — fifteen to nineteen cycles per value operation, flat across
+four orders of magnitude of working set.** The passes that attack that are the ones that reduce
+operations per element or the per-element cost of one: item 1 (form selection, where a mask is 100x
+less data *and* fewer operations), item 9 (deferred loads, where the elided work is a
+decompression), item 5 (constant folding) and item 11 (early exit). Items ranked by bytes moved
+should be re-ranked by operations removed until a measurement says otherwise.
+
+**A second-order finding, and the one place the width does cost something.** At the real
+sixteen-record block, the per-call fixed cost the sweep exposes is being paid once per sixteen
+records. In the isolated microbenchmark that is worth 1.28x-3.02x. End to end over a real scan it is
+much less, because decompression and block setup dominate what the width cannot change: forcing
+whole-segment blocks (969 records against the byte-sealed 11.6) is worth **1.16x** on a minimal
+constraint and **1.05x** on a seven-term chain, and most of that is already had by 64 records
+(`BenchmarkVecScanBlockWidth`, min of 10 over both orders, idle machine). So it is a real but minor effect, pointing the opposite way
+from tiling: the batch is already small, and what little the width is worth lies in making it
+*bigger*. It is also not freely available, for exactly the reason item 10 named — `Raw` and `Dict`
+alias one block's bytes, so a batch cannot straddle a block — and the byte budget that sets the
+block has its own justification in point-read latency and compression ratio
+(`collections/colblock.go:82-92`) that a vector-executor argument does not get to overrule.
 
 ---
 
