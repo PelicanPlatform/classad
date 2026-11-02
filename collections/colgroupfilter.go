@@ -289,3 +289,30 @@ func (c *candSet) setAll(n int) {
 	}
 	c.live = n
 }
+
+// clone returns a groupFilters that shares this one's compiled, read-only halves -- the predicates,
+// their row-fallback lookups and the aggregate-to-filter maps -- and owns fresh copies of
+// everything written during a pass.
+//
+// It exists because a fanned-out grouped pass runs the filters on several goroutines at once, and
+// three of these fields are scratch: cand is rebuilt per block, idxs per segment, and pass is
+// rewritten PER RECORD. Sharing one groupFilters across workers would have them overwriting each
+// other's per-record verdicts, which does not corrupt anything detectable -- it attributes one
+// record's filter result to another record, in another group, and the answer is a plausible number.
+//
+// nil clones to nil: a query with no filters threads nil through every path below as "no filters",
+// and a clone must not turn that into an empty one.
+func (gf *groupFilters) clone() *groupFilters {
+	if gf == nil {
+		return nil
+	}
+	return &groupFilters{
+		preds:   gf.preds,
+		lookups: gf.lookups,
+		colOf:   gf.colOf,
+		countOf: gf.countOf,
+		cand:    make([]candSet, len(gf.preds)),
+		idxs:    make([][]int, len(gf.preds)),
+		pass:    make([]bool, len(gf.preds)),
+	}
+}

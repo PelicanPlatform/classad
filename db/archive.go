@@ -1323,15 +1323,15 @@ func (t *ArchiveTable) GroupStatsAllAggs(groups []collections.GroupSpec,
 // GroupValuesConstraintAggs is GroupStatsConstraintAggs reduced into caller-supplied accumulators.
 func (t *ArchiveTable) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
 	aggCols []collections.GroupAggCol, countFilters []string,
-	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
-	return t.a.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink)
+	newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {
+	return t.a.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // GroupValuesAllAggs is GroupValuesConstraintAggs over every row.
 func (t *ArchiveTable) GroupValuesAllAggs(groups []collections.GroupSpec,
 	aggCols []collections.GroupAggCol, countFilters []string,
-	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
-	return t.a.GroupValuesAllAggs(groups, aggCols, countFilters, newSink)
+	newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {
+	return t.a.GroupValuesAllAggs(groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // redactedGroupValues is GroupValuesSource for a reader not entitled to sealed values.
@@ -1339,14 +1339,14 @@ type redactedGroupValues struct{ t *ArchiveTable }
 
 func (r redactedGroupValues) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
 	aggCols []collections.GroupAggCol, countFilters []string,
-	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
-	return r.t.a.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink)
+	newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {
+	return r.t.a.GroupValuesConstraintAggsRedacted(constraint, groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 func (r redactedGroupValues) GroupValuesAllAggs(groups []collections.GroupSpec,
 	aggCols []collections.GroupAggCol, countFilters []string,
-	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
-	return r.t.a.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink)
+	newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {
+	return r.t.a.GroupValuesAllAggsRedacted(groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // CodecStats reports the archive's compression (codec, dict size, last retrain, sampled ratio).

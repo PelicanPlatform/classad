@@ -2210,14 +2210,69 @@ permits a fan-out, and building the fixture under it takes minutes.
 
 #### What is left here
 
-- **The grouped pass.** `GroupValues` is a second pass with its own shape — per-worker group maps
-  folded by label — and the fold it needs already exists, since two storage groups rendering to one
-  label is the case `Merge` was first written for.
+- ~~**The grouped pass.**~~ **Built; see §13.9.**
 - **An observable for the degraded path**, per the finding above: a pass that answered entirely from
   the row fallback is 17-26x off its advertised cost and says nothing.
 - **A worker budget shared with the scans.** The aggregate pass draws from the same `qsem`, so the
   two compete, which is intended; whether the per-query cap should differ between them has not been
   measured.
+
+### 13.9 The grouped fold, and the one thing that is not a map union
+
+The grouped pass fans out on the same terms as the ungrouped one. What differs is the state a worker
+owns: an ungrouped worker needs an accumulator, where a grouped one needs an accumulator, a group
+map, **its own string table**, and its own copy of the filter planes.
+
+**The string table is the whole difficulty, and it is the kind that does not announce itself.** A
+string group component's key holds a *query-local* id into the accumulator's `strVal`, assigned in
+the order that accumulator happened to meet values. Two workers therefore disagree twice over: the
+same owner is id 3 to one and id 17 to the other, and two different owners collide on one id. A fold
+that unioned the maps by their stored keys would **split** one group across two ids and **fuse** two
+groups that shared one — and what comes back is a plausible set of counts over plausible-looking
+group labels. No assertion on the shape of the result catches it. So every string component is
+resolved back through the source's table and re-interned into the destination's.
+
+This is the same hazard as a process-local intern id read against the wrong table, one scope down.
+
+**Nothing else is remapped, deliberately.** A bucketed component's stored raw is already its bucket's
+edge, so the key is canonical. Re-entering it through the group-forming path would floor an
+already-floored value — idempotent in exact arithmetic, and not a thing to ask of a float quotient
+twice. Merging on the stored key avoids the question rather than reasoning about it.
+
+**The filter planes are per-worker for a reason worth stating.** `groupFilters` looks like compiled,
+read-only state and is three-quarters that, but `cand` is rebuilt per block, `idxs` per segment, and
+`pass` is rewritten **per record**. Sharing one across workers does not corrupt a structure or trip
+the race detector's view of anything a test asserts; it attributes one record's filter verdict to a
+different record in a different group. The answer is a number, and it is wrong.
+
+**The sink fold has to come from the caller.** The storage layer holds a `GroupSink`, which only
+accepts values — it cannot fold two of them. So a caller supplying `newSink` supplies
+`MergeGroupSink` too, and for a user-defined aggregate that is its own `Merge`, column by column.
+`Merge` now has three callers: group-label collision folding, the ungrouped fan-out, and this.
+
+**What the tests are built around**, since the failure mode is a plausible answer rather than an
+error: a fixture with 37 distinct string owners interleaved so every worker meets a different subset
+in a different order, and an exactly-known count per owner. The test asserts the group count, every
+group's value, that no owner appears twice, and that the per-group counts sum to the record count —
+the last two being what a split and a fusion respectively look like from outside.
+
+**A test that was flaky because its premise was false, which is worth more than the test.** The
+decline test here first used §13.8's technique: store an expression-valued cell, which the pass
+cannot read, and assert it declines. It passed in isolation and failed about one run in four — *by
+reporting a correct answer*. The grouped path has a scoped tier that **evaluates** such a cell: 10
+declines in 12 runs over an identical fixture, every serving run agreeing with the scan. The fixture
+was not provoking the condition under test, it was racing a tier choice. The ungrouped pass has no
+such tier, which is the whole reason the technique is sound one section up, and nothing said so.
+
+Two theories were wrong on the way to that and are recorded so they are not re-derived: a constant
+expression is **not** folded by the encoder (`1 + 1` is stored as `(1 + 1)`), and the parallel path
+is **not** failing to propagate declines. What settled it was catching the serving case and
+comparing it against the scan oracle — the check that should have come first, since "is the answer
+wrong, or is my expectation wrong" is the only question that distinguishes a bug from a bad test.
+
+The decline is now injected through a test-only hook. What is under test is the fan-out's handling
+of a decline, not the storage condition that provokes one, and injecting it makes the distinction
+explicit instead of relying on a fixture to hold a tier choice still.
 
 ---
 

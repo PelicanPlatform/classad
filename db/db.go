@@ -659,20 +659,20 @@ func (db *DB) GroupStatsAllAggs(groups []collections.GroupSpec, aggCols []collec
 // Declines on a chained table for the reason above.
 func (db *DB) GroupValuesConstraintAggs(constraint string, groups []collections.GroupSpec,
 	aggCols []collections.GroupAggCol, countFilters []string,
-	newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {
 	if db.c.Chained() {
 		return nil, false
 	}
-	return db.c.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink)
+	return db.c.GroupValuesConstraintAggs(constraint, groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // GroupValuesAllAggs is GroupValuesConstraintAggs over every row.
 func (db *DB) GroupValuesAllAggs(groups []collections.GroupSpec, aggCols []collections.GroupAggCol,
-	countFilters []string, newSink func() collections.GroupSink) ([]collections.GroupValues, bool) {
+	countFilters []string, newSink func() collections.GroupSink, mergeSink collections.MergeGroupSink) ([]collections.GroupValues, bool) {
 	if db.c.Chained() {
 		return nil, false
 	}
-	return db.c.GroupValuesAllAggs(groups, aggCols, countFilters, newSink)
+	return db.c.GroupValuesAllAggs(groups, aggCols, countFilters, newSink, mergeSink)
 }
 
 // LookupClassAd returns the committed ad for key (the hash table, outside any
