@@ -5,6 +5,7 @@ import (
 	"errors"
 	"iter"
 	"math"
+	"math/bits"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -130,10 +131,79 @@ type ValueBatch struct {
 	Cols []ValueColumn
 }
 
-// ValueAt reassembles one cell, for a caller that wants a value rather than a column -- a test
-// oracle, or a consumer reading a handful of cells. It is deliberately the slow way round: the
-// op exists to hand out columns, and a caller using this for every cell has given up the point
-// of it.
+// Column expands one column's rows into dst in order, appending and returning the extended
+// slice so a caller can reuse one buffer per column across batches.
+//
+// This is how a batch is meant to be read. A column is a dense slice indexed by how many valid
+// rows PRECEDE a row, so the index is cheap to carry forward and expensive to recover -- which
+// is exactly what ValueAt does, per call, from row zero. Reading a whole batch through ValueAt
+// is therefore quadratic in the batch size, and it is the obvious way to read one: measured on
+// a six-column projection it was three quarters of a read's total cost, and the read looked
+// like the op was slow rather than the accessor.
+//
+// A row-wise consumer expands each column once and then indexes them together; that is still
+// one forward pass per column, and it is what the endpoint this op was built for does.
+func (b *ValueBatch) Column(col int, dst []classad.Value) []classad.Value {
+	if col < 0 || col >= len(b.Cols) {
+		return dst
+	}
+	return b.Cols[col].Values(b.Rows, dst)
+}
+
+// Values is Column without the batch, for a caller holding a ValueColumn directly. rows is the
+// batch's row count, which the column itself does not carry: its dense slices hold only the
+// valid rows, so nothing in the column says how many rows it spans.
+func (c *ValueColumn) Values(rows int, dst []classad.Value) []classad.Value {
+	dense, exc := 0, 0
+	for row := 0; row < rows; row++ {
+		if !bitSet(c.Valid, row) {
+			// Exceptions are in ascending Row order, so this cursor only moves forward.
+			for exc < len(c.Exceptions) && c.Exceptions[exc].Row < row {
+				exc++
+			}
+			if exc < len(c.Exceptions) && c.Exceptions[exc].Row == row {
+				dst = append(dst, c.Exceptions[exc].Value)
+			} else {
+				dst = append(dst, classad.NewUndefinedValue())
+			}
+			continue
+		}
+		dst = append(dst, c.denseAt(dense))
+		dense++
+	}
+	return dst
+}
+
+// denseAt reads the i'th packed value, by the column's kind.
+func (c *ValueColumn) denseAt(i int) classad.Value {
+	switch c.Kind {
+	case KindInt:
+		if i < len(c.Ints) {
+			return classad.NewIntValue(c.Ints[i])
+		}
+	case KindReal:
+		if i < len(c.Reals) {
+			return classad.NewRealValue(c.Reals[i])
+		}
+	case KindBool:
+		if i < len(c.Bools) {
+			return classad.NewBoolValue(c.Bools[i])
+		}
+	case KindString:
+		if i < len(c.Strs) {
+			return classad.NewStringValue(c.Strs[i])
+		}
+	}
+	return classad.NewErrorValue()
+}
+
+// ValueAt reassembles ONE cell, for a caller that wants a value rather than a column -- a test
+// oracle, or a consumer reading a handful of cells at known positions.
+//
+// It is linear in row, because a column's dense slice is indexed by how many valid rows precede
+// this one and nothing records that per row. Reading a whole batch through it is therefore
+// quadratic in the batch size; use Column, which carries the index forward in one pass. The
+// popcount below makes this cheaper by a constant, not by an order.
 func (b *ValueBatch) ValueAt(col, row int) classad.Value {
 	if col < 0 || col >= len(b.Cols) || row < 0 || row >= b.Rows {
 		return classad.NewErrorValue()
@@ -147,24 +217,19 @@ func (b *ValueBatch) ValueAt(col, row int) classad.Value {
 		}
 		return classad.NewUndefinedValue()
 	}
-	// The dense index is how many valid rows precede this one.
-	dense := 0
-	for i := 0; i < row; i++ {
-		if bitSet(c.Valid, i) {
-			dense++
-		}
+	// The dense index is how many valid rows precede this one: whole bytes by popcount, then
+	// the bits of the partial byte this row sits in.
+	dense, full := 0, row>>3
+	if full > len(c.Valid) {
+		full = len(c.Valid)
 	}
-	switch c.Kind {
-	case KindInt:
-		return classad.NewIntValue(c.Ints[dense])
-	case KindReal:
-		return classad.NewRealValue(c.Reals[dense])
-	case KindBool:
-		return classad.NewBoolValue(c.Bools[dense])
-	case KindString:
-		return classad.NewStringValue(c.Strs[dense])
+	for i := 0; i < full; i++ {
+		dense += bits.OnesCount8(c.Valid[i])
 	}
-	return classad.NewErrorValue()
+	if full < len(c.Valid) {
+		dense += bits.OnesCount8(c.Valid[full] & byte((1<<(uint(row)&7))-1))
+	}
+	return c.denseAt(dense)
 }
 
 func bitSet(b []byte, i int) bool {
