@@ -83,17 +83,17 @@ func newMXFixture(t *testing.T) *mxFixture {
 		if perr != nil {
 			t.Fatal(perr)
 		}
-		if err := base.Put(k, ad); err != nil {
-			t.Fatal(err)
+		if putErr := base.Put(k, ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
-	if err := cat.CreateView(mxView, db.ViewSpec{
+	if createViewErr := cat.CreateView(mxView, db.ViewSpec{
 		BaseTable:   mxTable,
 		Groups:      []db.ViewGroupCol{{Attr: "Owner", Alias: "label_owner"}},
 		Metrics:     []db.ViewMetric{{Func: db.ViewCount, Arg: "*", Alias: "metric_n"}},
 		Cardinality: 100,
-	}); err != nil {
-		t.Fatal(err)
+	}); createViewErr != nil {
+		t.Fatal(createViewErr)
 	}
 	a, err := cat.CreateArchiveTable(mxArchive, db.ArchiveConfig{})
 	if err != nil {

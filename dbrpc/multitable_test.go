@@ -12,11 +12,11 @@ func TestMultiTable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cat.CreateTable("machines"); err != nil {
-		t.Fatal(err)
+	if _, createTableErr := cat.CreateTable("machines"); createTableErr != nil {
+		t.Fatal(createTableErr)
 	}
-	if _, err := cat.CreateTable("jobs"); err != nil {
-		t.Fatal(err)
+	if _, createTableErr := cat.CreateTable("jobs"); createTableErr != nil {
+		t.Fatal(createTableErr)
 	}
 	s := NewServerCatalog(cat)
 	cconn, sconn := netPipe()

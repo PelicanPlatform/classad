@@ -17,8 +17,8 @@ func archiveFixture(t *testing.T) *Client {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cat.CreateTable("jobs"); err != nil {
-		t.Fatal(err)
+	if _, createTableErr := cat.CreateTable("jobs"); createTableErr != nil {
+		t.Fatal(createTableErr)
 	}
 	a, err := cat.CreateArchiveTable("history", db.ArchiveConfig{})
 	if err != nil {

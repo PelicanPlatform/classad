@@ -134,8 +134,8 @@ func TestMutableTopKOverRPC(t *testing.T) {
 		}
 		tx.NewClassAdOld(fmt.Sprintf("%d.0", i), fmt.Sprintf("ClusterId = %d\nJobStatus = %d", i, st))
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	s := NewServer(d)
 	cconn, sconn := netPipe()

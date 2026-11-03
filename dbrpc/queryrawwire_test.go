@@ -169,12 +169,12 @@ func TestQueryRawWireServesMemoryTable(t *testing.T) {
 			"Requirements = MY.Cpus > 4\nState = \"Claimed\"\nRank = -Cpus",
 	}
 	for k, text := range ads {
-		if err := tx.NewClassAd(ctx, k, text); err != nil {
-			t.Fatal(err)
+		if newClassAdErr := tx.NewClassAd(ctx, k, text); newClassAdErr != nil {
+			t.Fatal(newClassAdErr)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	// The text stream is the reference.
@@ -239,8 +239,8 @@ func TestQueryRawWireServesMemoryTable(t *testing.T) {
 	}
 
 	// A persistent table on the same server still serves wire rows.
-	if err := c.CreateTable(ctx, "durable"); err != nil {
-		t.Fatal(err)
+	if createTableErr := c.CreateTable(ctx, "durable"); createTableErr != nil {
+		t.Fatal(createTableErr)
 	}
 	tx, err = c.BeginTable(ctx, "durable")
 	if err != nil {

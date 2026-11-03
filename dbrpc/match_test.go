@@ -15,8 +15,8 @@ func TestMatchTables(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"jobs", "machines"} {
-		if _, err := cat.CreateTable(name); err != nil {
-			t.Fatal(err)
+		if _, createTableErr := cat.CreateTable(name); createTableErr != nil {
+			t.Fatal(createTableErr)
 		}
 	}
 	s := NewServerCatalog(cat)
@@ -30,8 +30,8 @@ func TestMatchTables(t *testing.T) {
 	_ = mtx.NewClassAd(context.Background(), "slot1", "Key = \"slot1\"\nCpus = 8\nRequirements = true")
 	_ = mtx.NewClassAd(context.Background(), "slot2", "Key = \"slot2\"\nCpus = 4\nRequirements = true")
 	_ = mtx.NewClassAd(context.Background(), "slot3", "Key = \"slot3\"\nCpus = 16\nRequirements = true")
-	if err := mtx.Commit(context.Background()); err != nil {
-		t.Fatal(err)
+	if commitErr := mtx.Commit(context.Background()); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	// Two identical jobs: assignment consumes machines, so they can't both take
 	// slot3. Each ranks by Cpus.
@@ -39,8 +39,8 @@ func TestMatchTables(t *testing.T) {
 	job := "Key = %q\nRequestCpus = 4\nRequirements = (TARGET.Cpus >= RequestCpus)\nRank = TARGET.Cpus"
 	_ = jtx.NewClassAd(context.Background(), "1.0", fmt.Sprintf(job, "1.0"))
 	_ = jtx.NewClassAd(context.Background(), "2.0", fmt.Sprintf(job, "2.0"))
-	if err := jtx.Commit(context.Background()); err != nil {
-		t.Fatal(err)
+	if commitErr := jtx.Commit(context.Background()); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	// LIMIT bounds jobs: one job assigned, taking the best machine (slot3, Cpus 16).

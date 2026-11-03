@@ -61,8 +61,8 @@ func TestDiagnosticsAndAdmin(t *testing.T) {
 	}
 
 	// Build the segment indexes over the existing ads so selectivity stats exist.
-	if _, err := c.Admin(context.Background(), "index.reindex"); err != nil {
-		t.Fatal(err)
+	if _, adminErr := c.Admin(context.Background(), "index.reindex"); adminErr != nil {
+		t.Fatal(adminErr)
 	}
 
 	// Explain: a query on the indexed categorical attribute uses the index.
