@@ -32,33 +32,30 @@ import (
 // serial ones finish, which is what keeps this from needing synchronisation.
 var forceCompositeCond bool
 
-// aliasedCond is a join condition compiled for evaluation against the two sides separately.
+// aliasedCond is a join condition compiled for evaluation against the sides separately.
 // It is nil when any term declined, in which case the composite path runs unchanged.
 type aliasedCond struct {
 	ms []*vm.Matcher
 }
 
-// leftSide and rightSide are the alias indexes compileAliasedCond declares, and the ones the
-// resolver is handed back at evaluation.
-const (
-	leftSide  = 0
-	rightSide = 1
-)
-
-// compileAliasedCond compiles the ON terms with both aliases known. It returns nil when any
+// compileAliasedCond compiles the ON terms with every alias known. It returns nil when any
 // term is not AliasNative -- all or nothing, because a join that evaluated some terms one way
 // and some the other would build the composite anyway, which is the cost this avoids.
-func compileAliasedCond(srcs []string, leftAlias, rightAlias string) *aliasedCond {
+//
+// The alias list is the whole chain, not the two sides visible to one step. A step's terms
+// cannot name a later side -- compileJoin refuses that before this is reached -- so the extra
+// aliases cost a longer compile-time table and nothing at evaluation.
+func compileAliasedCond(srcs []string, aliases []string) *aliasedCond {
 	if len(srcs) == 0 || forceCompositeCond {
 		return nil
 	}
 	ms := make([]*vm.Matcher, 0, len(srcs))
 	for _, src := range srcs {
-		q, err := vm.ParseAliases(src, []string{leftAlias, rightAlias})
+		q, err := vm.ParseAliases(src, aliases)
 		if err != nil {
-			// The term already parsed once, into p.cond; a second parser disagreeing is
-			// not something to paper over, so decline and let the composite path -- which
-			// holds the form that DID parse -- run.
+			// The term already parsed once, into the plan's cond; a second parser
+			// disagreeing is not something to paper over, so decline and let the composite
+			// path -- which holds the form that DID parse -- run.
 			return nil
 		}
 		if !q.AliasNative() {
@@ -69,36 +66,43 @@ func compileAliasedCond(srcs []string, leftAlias, rightAlias string) *aliasedCon
 	return &aliasedCond{ms: ms}
 }
 
-// holds reports whether every term is TRUE for this pair, reading the two sides directly.
-// ok is false when any term declined at evaluation, and then nothing it returned may be
-// used: the caller must fall back to the composite, because a declined term reads undefined
-// rather than failing and the join would silently return too few rows.
+// sideResolver answers (side index, attribute name) out of the row's sides.
 //
-// A nil right side -- an unmatched LEFT row -- resolves undefined for every attribute of it,
-// which is what an absent member of the composite evaluates to.
-func (a *aliasedCond) holds(l, r *joinRow) (held, ok bool) {
-	resolve := func(side int, name string) classad.Value {
-		row := l
-		if side == rightSide {
-			row = r
-		}
-		if row == nil {
+// A side index past what the row holds, and a side that is absent -- the null-extended half
+// of an unmatched LEFT row -- both resolve undefined, which is what an absent member of the
+// composite evaluates to.
+func sideResolver(rows []*joinRow) func(int, string) classad.Value {
+	return func(side int, name string) classad.Value {
+		if side < 0 || side >= len(rows) || rows[side] == nil {
 			return classad.NewUndefinedValue()
 		}
 		// The row answers from its bytes when it can, and is decoded when it cannot.
 		// Which of the two happened is invisible here and must stay so: the value is the
 		// same either way, and a condition that read differently depending on how its row
 		// arrived would make the join's answer depend on the read plan.
-		return row.eval(name)
+		return rows[side].eval(name)
 	}
-	// An unqualified reference in an ON term names an attribute of the joined row itself,
-	// and the joined row has only the two members. So it is undefined, which is what it
-	// evaluates to against the composite.
-	unqualified := func(string, ast.AttributeScope) classad.Value {
-		return classad.NewUndefinedValue()
-	}
+}
+
+// unqualifiedUndefined answers every unqualified, MY- or TARGET-scoped reference as
+// undefined.
+//
+// An unqualified reference in an ON term names an attribute of the joined row itself, and the
+// joined row's only attributes are the aliases. So it is undefined, which is what it
+// evaluates to against the composite -- and MY and TARGET name the row for the same reason,
+// which is why nothing here maps them to a side.
+func unqualifiedUndefined(string, ast.AttributeScope) classad.Value {
+	return classad.NewUndefinedValue()
+}
+
+// holds reports whether every term is TRUE for this row. ok is false when any term declined
+// at evaluation, and then nothing it returned may be used: the caller must fall back to the
+// composite, because a declined term reads undefined rather than failing and the join would
+// silently return too few rows.
+func (a *aliasedCond) holds(rows []*joinRow) (held, ok bool) {
+	resolve := sideResolver(rows)
 	for _, m := range a.ms {
-		v, accepted := m.EvalAliased(resolve, unqualified)
+		v, accepted := m.EvalAliased(resolve, unqualifiedUndefined)
 		if !accepted {
 			// Unreachable by construction: compileAliasedCond admits only AliasNative
 			// terms, which is the same condition EvalAliased declines on. Kept because
@@ -112,4 +116,31 @@ func (a *aliasedCond) holds(l, r *joinRow) (held, ok bool) {
 		}
 	}
 	return true, true
+}
+
+// aliasedValue is one equality half compiled to read the row's sides directly. It is the
+// value twin of aliasedCond: the same compilation, asked for a value rather than a verdict,
+// because an equality half produces the hash key rather than a verdict.
+type aliasedValue struct {
+	m *vm.Matcher
+}
+
+// compileAliasedValue compiles one equality half over the accumulated row, or returns nil
+// when it is not AliasNative and has to be evaluated against a composite.
+func compileAliasedValue(src string, aliases []string) *aliasedValue {
+	if forceCompositeCond {
+		return nil
+	}
+	q, err := vm.ParseAliases(src, aliases)
+	if err != nil || !q.AliasNative() {
+		return nil
+	}
+	return &aliasedValue{m: q.Matcher()}
+}
+
+// eval returns the half's value for this row. ok is false when the term declined, and the
+// caller must then evaluate against a composite -- a declined term reads undefined, which
+// would silently put every row in the no-key bucket and match nothing.
+func (a *aliasedValue) eval(rows []*joinRow) (classad.Value, bool) {
+	return a.m.EvalAliased(sideResolver(rows), unqualifiedUndefined)
 }
