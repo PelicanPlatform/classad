@@ -1146,13 +1146,32 @@ that a trivial allocator is no longer good enough.
    guarding it, which the current lowering mostly does not produce, since a load is emitted at its
    use site.
 
-   **Where the remaining value most likely is**, and this is a claim to measure rather than a
-   result: the skip fires only when the guarding predicate is written FIRST, so ordering a
-   conjunction to put a cheap, selective term ahead of an expensive string one would convert loads
-   that are always paid into loads that are usually skipped. `collections/match_reorder.go` already
-   does cost-ordered conjunct reordering, but only for matchmaking, and its cost model scores
-   EVALUATION rather than the per-form LOAD cost that governs here -- which is the same fact item 1
-   needs and the storage layer already knows.
+   **Where the remaining value might be -- measured, and the answer is the opposite of the guess.**
+   The skip fires only when the guarding predicate is written FIRST, so it looked as though ordering
+   a conjunction to put a cheap selective term ahead of an expensive string one would convert loads
+   that are always paid into loads that are usually skipped. `BenchmarkConjunctOrder` says no: over
+   the committed OSPool sample, on the SAME hundred surviving blocks, putting the STRING term first
+   runs about 1.6x faster than putting the numeric term first.
+
+   The reason is the thing the correction above already named. The string operand is not the
+   expensive one when its column is dictionary encoded: a constant equality resolves the literal to
+   a code once per block, and a literal absent from that block's dictionary settles every record in
+   it without reading any. The numeric operand has no such shortcut and compares every record. So
+   the cheap term was the string one all along, and a pass that ordered by a static syntactic notion
+   of cost would have confidently produced the slower order.
+
+   **That makes ordering depend on item 1 rather than stand beside it.** Which operand is cheap is a
+   property of the column's FORM -- dictionary or positional, fitted or escaped -- which is
+   storage's knowledge and is exactly what a `Vec` cannot currently carry.
+   `collections/match_reorder.go` does do cost-ordered conjunct reordering, but only for
+   matchmaking, and it scores EVALUATION cost, which is the model just shown to give the wrong
+   answer here. Ordering is not an independent win to be collected first; it is downstream of form
+   selection.
+
+   Pruning is not part of this question, and the fourth shape in that benchmark exists to show why:
+   `string-alone` scans 192 blocks where the conjunctions scan 100, because the numeric operand
+   prunes at the zone map whether or not it is evaluated first. Ordering only decides what happens
+   inside a block that survives pruning.
 10. ~~**Tiling and kernel fusion.**~~ **Struck. Measured, and it does not pay.** The claim was that
    peak live bytes is `registers x 8192 x 25B`, so tiling the batch into cache-sized sub-batches
    would cut the peak 8-16x and make MORE live registers affordable rather than fewer, which would
