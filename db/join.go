@@ -8,15 +8,24 @@ package db
 // the select operator over a nested ad, and an unmatched LEFT row simply has no member for
 // the right side, which is ClassAd's own spelling of SQL's NULL.
 //
-// WHY IT IS WORTH DOING HERE rather than above the store. A client join must fetch both
-// sides whole and pair them at the far end, so every surviving row of both tables is
-// serialized, shipped and rebuilt before a single pair is examined -- measured at a flat
-// ~2.2x on a narrow projection and ~4.2x on an unprojected one, before any network. A join
-// is the one query shape where selectivity can only be applied AFTER serialization from
-// outside, and before it from inside. Only the joined output crosses from here.
+// WHEN IT IS WORTH DOING HERE rather than above the store, which is NOT always, and the
+// caller is the one that decides. A joined row carries both sides, so a join that EXPANDS
+// ships more from here than its inputs were: the left ad is repeated once per output row.
+// Measured over a real connection, a two-table chain that expands puts 1.86x the bytes on
+// the wire that a client pairing the same rows does, and a three-table chain 2.30x; a chain
+// that filters puts far fewer. The direction is set by the expansion ratio -- output rows
+// over input rows -- and nothing here estimates it, so a caller that cannot estimate it
+// either should not assume this is the cheaper place. The measurement is in dbrpc, under
+// TestNwayWireVolumeGrowsWithTheChain.
 //
-// It also materializes less. The hash is built on one side and the other is streamed
-// against it, so one side is held at a time; a client join holds both.
+// Nor does a client have to fetch both sides whole: it can narrow the second side's read to
+// the key values the first side turned out to hold, which is the same trick planIndexProbe
+// plays here. What a client cannot do is decide well whether that narrowing pays, because
+// the statistics it needs are on this side.
+//
+// What is unconditional is the materialization. The hash is built on one side and the other
+// is streamed against it, so one side is held at a time; a client join holds the rows it has
+// accumulated AND the side it is folding into them.
 //
 // WHAT THIS IS NOT, yet. The caller supplies the plan -- which conjuncts went to which
 // side, which equalities drive the hash -- because that splitting is settled, tested and
@@ -24,6 +33,15 @@ package db
 // the same rules. Block-level zone skipping, which is the thing a client genuinely cannot
 // do, is not here either: it belongs with the columnar machinery and arrives separately.
 // What this buys is the wire and the single-side materialization.
+//
+// AND IT JOINS EXACTLY TWO TABLES, on purpose. A chain of three or more is left-deep -- this
+// join run n-1 times, each step folding in one more table -- so an n-ary opcode would be a
+// generalization rather than a second algorithm, and it is still not built. The measurement
+// above sharpens with every table added: an expanding chain's overshipping grows (1.86x at
+// two tables, 2.30x at three), and the chain that WOULD gain -- one that filters -- gains
+// more from being started at its selective table than from being moved here at all. On that
+// fixture a client that orders its chain ships 13,351 bytes where a three-way join in the
+// store ships 30,679. Join ORDER is the lever that case wants; join LOCATION is not.
 
 import (
 	"fmt"
