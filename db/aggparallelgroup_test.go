@@ -174,9 +174,11 @@ func TestGroupedFanoutIsNotFooledByStringIds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Keyed the way a GROUP BY names its groups: a string group arrives quoted, so a reference
+	// keyed by the raw owner would miss every row and read as ids crossing tables.
 	want := map[string]int{}
 	for i := 0; i < n; i++ {
-		want[fmt.Sprintf("user%d", i%37)]++
+		want[GroupValueText(classad.NewStringValue(fmt.Sprintf("user%d", i%37)))]++
 	}
 	if len(rows) != len(want) {
 		t.Fatalf("%d groups, want %d: the fold split or fused string groups", len(rows), len(want))
