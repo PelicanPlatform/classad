@@ -1,6 +1,7 @@
 package db
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"sort"
@@ -199,7 +200,7 @@ func TestWireRowsAliasOneBuffer(t *testing.T) {
 	// Both kept slices point into the same buffer, so they now read alike. The point is not
 	// that this is desirable -- it is that it is the documented contract, and a caller that
 	// wants to keep a row copies it.
-	if string(kept[0]) != string(kept[1]) {
+	if !bytes.Equal(kept[0], kept[1]) {
 		t.Skip("the buffer did not have to grow, so the rows did not alias; nothing to pin here")
 	}
 	// And a copy survives, which is what every caller in this package does.

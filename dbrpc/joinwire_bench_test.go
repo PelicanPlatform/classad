@@ -199,7 +199,7 @@ func BenchmarkProbeWhereTheRPCJoinSpends(b *testing.B) {
 			}
 			n := 0
 			for ad := range seq {
-				if s := ad.String(); len(s) == 0 {
+				if s := ad.String(); s == "" {
 					b.Fatal("empty render")
 				}
 				n++
