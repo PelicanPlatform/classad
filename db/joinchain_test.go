@@ -298,3 +298,49 @@ func TestChainRefusesAForwardReferenceInAnEqualityHalf(t *testing.T) {
 		t.Errorf("error does not say what is wrong: %v", err)
 	}
 }
+
+// TestChainAggregateReducesTheChainsRows pins that a grouped aggregate reduces a CHAIN's rows,
+// not only a pair's.
+//
+// Nothing in the aggregate path was changed for this, which is the point of testing it: it
+// reads the join's rows through the same entry point, so widening the join widened it too. A
+// test is what turns "it should still work" into something that stays true -- and the group
+// key here is a dotted path onto the THIRD table, which did not exist before.
+//
+// The expectation is SQL's, over the five rows the LEFT/LEFT chain produces: clusters 1 and 2
+// each find their own metrics row, and 3, 4 and 5 find none, so grouping by m.ClusterId gives
+// three groups and the undefined one holds three rows.
+func TestChainAggregateReducesTheChainsRows(t *testing.T) {
+	cat := chainFixture(t)
+	var stats JoinStats
+	rows, err := cat.JoinAggregate(JoinAggSpec{
+		Join:      chainSpec(JoinLeft, JoinLeft),
+		GroupCols: []GroupCol{{Attr: "m.ClusterId"}},
+		Aggs:      []AggSpec{{Func: AggCount, Arg: "*"}},
+	}, JoinLimits{}, &stats, nil)
+	if err != nil {
+		t.Fatalf("JoinAggregate over a chain: %v", err)
+	}
+	if stats.Rows != 5 {
+		t.Errorf("the chain produced %d rows to reduce, want 5", stats.Rows)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("got %d groups, want 3 (metrics 1, metrics 2, and no metrics row): %+v", len(rows), rows)
+	}
+	counts := map[string]string{}
+	for _, r := range rows {
+		if len(r.Group) != 1 || len(r.Values) != 1 {
+			t.Fatalf("unexpected group shape: %+v", r)
+		}
+		counts[r.Group[0]] = r.Values[0]
+	}
+	if counts["1"] != "1" || counts["2"] != "1" {
+		t.Errorf("the matched groups should hold one row each, got %v", counts)
+	}
+	// The rows with no metrics row group together, however the undefined key is spelled.
+	for g, c := range counts {
+		if g != "1" && g != "2" && c != "3" {
+			t.Errorf("the group for rows with no metrics row holds %s rows, want 3 (%v)", c, counts)
+		}
+	}
+}
