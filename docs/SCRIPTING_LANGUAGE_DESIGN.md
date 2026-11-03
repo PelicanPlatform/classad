@@ -1123,8 +1123,14 @@ that a trivial allocator is no longer good enough.
    and says so in its own header -- for a fitted-width numeric column with no escapes the extraction
    is a SLICE of bytes the block already holds, so eliding it saves almost nothing, while for a
    string column it is a dictionary parse or a positional walk over every preceding field, measured
-   at -38% on a two-term string disjunction. The value of this item is therefore concentrated
-   entirely on string and materialized columns, and is near zero on raw numeric ones. The 78% figure
+   at -38% on a two-term string disjunction. `loadStr` puts the same cost the other way round and
+   more sharply: without a dictionary the string region is positional, so reaching a field means
+   walking the fields before it once per record, and that walk measured **55% of a string scan** --
+   which is why the dictionary exists. The value of this item is therefore concentrated entirely on
+   string and materialized columns, is near zero on raw numeric ones, and is largest exactly where
+   the dictionary is absent. Note also what it is NOT bounded by: the hot tier is numeric by
+   construction, but that governs which columns stay uncompressed for the count paths, not what the
+   vector executor can load -- `LoadColumn` serves any string field of the block's schema. The 78% figure
    is real but belongs to the MUTABLE per-record read path, where each record's payload is
    compressed individually and no block-level cache can help; carrying it onto the columnar vector
    path conflated two different readers.
