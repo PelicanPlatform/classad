@@ -346,11 +346,11 @@ func (s *segment) unpin() {
 	}
 	s.reapMu.Unlock()
 	if doReap {
-		s.reapAndHook()
+		s.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		return
 	}
 	if doUnmap {
-		_ = s.unmapAndHook()
+		_ = s.unmapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		return
 	}
 	// Not retiring: a sidecar displaced by an in-place re-index becomes unreachable as
@@ -595,13 +595,13 @@ func (s *segment) appendFlagged(seq uint64, next loc, key, ad []byte, hdrFlags u
 // reuses the ordinary record framing (empty key, 8-byte "ad") so the linear arena
 // walk, CRC, and recovery treat it uniformly; only the flag bit distinguishes it. The
 // caller holds the shard lock.
-func (s *segment) appendMarker(seq uint64, millis uint64) (uint32, bool) {
+func (s *segment) appendMarker(seq, millis uint64) bool {
 	var ad [8]byte
 	binary.LittleEndian.PutUint64(ad[:], millis)
 	rl := recordLen(0, len(ad))
 	off := s.used
 	if off+rl > len(s.data) {
-		return 0, false
+		return false
 	}
 	b := s.data[off : off+rl]
 	s.used = off + rl
@@ -628,7 +628,7 @@ func (s *segment) appendMarker(seq uint64, millis uint64) (uint32, bool) {
 	// carries only superseded records plus checkpoints still reaches dead >= used (and
 	// is thus recognized as fully dead / skippable / reclaimable once aged out).
 	s.dead += int64(rl)
-	return uint32(off), true
+	return true
 }
 
 // appendDict writes an interned segment's dictionary record: a keyless record whose body is
@@ -917,20 +917,16 @@ func recAd(b []byte, off uint32) []byte {
 	return b[start:end]
 }
 
-// appendRawRecord copies a record's identity from src -- its commit seq, its supersession seq, its
-// key -- while replacing the ad payload. Used by the columnarizing rewrite, where a record keeps
-// everything that decides visibility and ordering and loses only the attributes a column now holds.
+// appendRawRecordFlags copies a record's identity from src -- its commit seq, its supersession
+// seq, its key -- while replacing the ad payload and giving the destination's header flags
+// explicitly. Used by the columnarizing rewrite, where a record keeps everything that decides
+// visibility and ordering and loses only the attributes a column now holds.
 //
-// Preserving the supersession seq matters as much as the commit seq: a record superseded before the
-// rewrite must stay superseded after it, or a scan would resurrect an old version.
-func (s *segment) appendRawRecord(srcData []byte, srcOff uint32, ad []byte) (uint32, bool) {
-	return s.appendRawRecordFlags(srcData, srcOff, ad, srcHdrFlags(srcData, srcOff))
-}
-
-// appendRawRecordFlags is appendRawRecord with the destination's header flags given explicitly,
-// for a rewrite that changes what the record IS rather than only how it is stored. The one caller
-// that needs it is columnarization MATERIALIZING a delta: the new record holds the whole ad, so it
-// must not carry deltaFlag forward or every reader would go looking for a chain to merge.
+// Preserving the supersession seq matters as much as the commit seq: a record superseded before
+// the rewrite must stay superseded after it, or a scan would resurrect an old version. The flags
+// are explicit because a rewrite can change what the record IS rather than only how it is stored:
+// columnarization MATERIALIZING a delta writes a record holding the whole ad, so it must not
+// carry deltaFlag forward or every reader would go looking for a chain to merge.
 func (s *segment) appendRawRecordFlags(srcData []byte, srcOff uint32, ad []byte, hdrFlags uint32) (uint32, bool) {
 	key := recKey(srcData, srcOff)
 	off, ok := s.appendFlagged(recSeq(srcData, srcOff), loc{seg: noSeg}, key, ad, hdrFlags)

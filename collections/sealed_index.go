@@ -24,24 +24,25 @@ func snapshotPath(seg *segment) string {
 // publishSidecar maps a just-written or existing container file at path and publishes
 // its sections into the segment: keyIdx always (the primary-key sidecar, phase 1 of
 // the pageable index), and msidx when a valid attribute-index section covering the
-// segment is present. One mapping backs both, released by a single reap hook. spec, if
-// non-nil, gates the attribute section on its generation (a reopen); a nil spec accepts
-// any (a fresh seal). Returns false (unmapping) on any mismatch; the sidecar is derived,
-// so any doubt is left unpublished and rebuilt later.
-func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) bool {
+// segment is present. One mapping backs both, released by a single reap hook. The index
+// configuration the section was built under is deliberately NOT matched here -- see the
+// comment on the attribute section below for why, and for what is checked instead.
+// Returns false (unmapping) on any mismatch; the sidecar is derived, so any doubt is left
+// unpublished and rebuilt later.
+func (c *Collection) publishSidecar(seg *segment, path string) bool {
 	data, closer, err := mapFile(path)
 	if err != nil {
 		return false
 	}
 	attr, key, col, zone, ok := splitSegmentSidecar(data)
 	if !ok {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
 	c.adoptPersistedZones(seg, zone)
 	ki, err := parseKeyIndex(key)
 	if err != nil || int(ki.upto) != seg.used {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
 	seg.ctAdoptKIDX(ki) // the key index covers exactly this segment's records, so its proof does
@@ -81,7 +82,7 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 	// keyIdx is set exactly once per seal and is the "sealed" marker; CAS so a
 	// concurrent seal cannot leak a mapping.
 	if !seg.keyIdx.CompareAndSwap(nil, ki) {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
 	if cs != nil && !seg.columnarized() {
@@ -96,7 +97,7 @@ func (c *Collection) publishSidecar(seg *segment, path string, spec *indexSpec) 
 		seg.msidx.Store(mm)
 		seg.idx.Store(nil) // free the heap attr index; readIdx now returns msidx
 	}
-	seg.setOnReapKey(func() { _ = closer() })
+	seg.setOnReapKey(func() { _ = closer() }) //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	return true
 }
 
@@ -155,7 +156,7 @@ func (c *Collection) sealSegmentIndex(seg *segment, si *segIndex) {
 	if err := writeFileAtomic(path, container); err != nil {
 		return
 	}
-	c.publishSidecar(seg, path, nil)
+	c.publishSidecar(seg, path)
 }
 
 // persistSegZonesUpgrade rewrites an already-sealed persistent segment's sidecar to ADD a zone-map
@@ -187,7 +188,7 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 	// recomputes. Treating "present" as "nothing to do" meant that segment decoded every
 	// record on every open, forever, with no way to tell from the outside.
 	if !ok {
-		_ = closer() // the container itself is unreadable; leave it for a reindex to rebuild
+		_ = closer() //nolint:errcheck // the container itself is unreadable; leave it for a reindex to rebuild
 		return false
 	}
 	// A legacy section (id-keyed, or ZNM2 with ranges that skipped expressions) is well-formed
@@ -195,7 +196,7 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 	// is left alone.
 	if len(zone) > 0 {
 		if _, st := parseZoneBlob(zone, c.intern.LookupID); st == zoneBlobOK {
-			_ = closer() // a usable zone section: genuinely nothing to upgrade
+			_ = closer() //nolint:errcheck // a usable zone section: genuinely nothing to upgrade
 			return false
 		}
 	}
@@ -203,7 +204,7 @@ func (c *Collection) persistSegZonesUpgrade(seg *segment) bool {
 	// independent of the file we are about to replace.
 	attrCopy := append([]byte(nil), attr...)
 	colCopy := append([]byte(nil), col...)
-	_ = closer()
+	_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	container := buildSegmentSidecar(attrCopy, c.segKeyIndex(seg), colCopy,
 		buildZoneBlob(seg.zones, c.intern.Name), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	// Report the write. Discarding this error is how a permanently slow start stays
@@ -256,12 +257,12 @@ func (c *Collection) persistSegTrailerHintsUpgrade(seg *segment, haveColRec uint
 	}
 	attr, key, col, zone, ok := splitSegmentSidecar(data)
 	if !ok {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
 	reflagged := reflagKeyIndex(key, ki.flags|want)
 	if reflagged == nil {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
 	// The sections alias the mapping; copy them before unmapping so the rebuilt container is
@@ -269,7 +270,7 @@ func (c *Collection) persistSegTrailerHintsUpgrade(seg *segment, haveColRec uint
 	attrCopy := append([]byte(nil), attr...)
 	colCopy := append([]byte(nil), col...)
 	zoneCopy := append([]byte(nil), zone...)
-	_ = closer()
+	_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	container := buildSegmentSidecar(attrCopy, reflagged, colCopy, zoneCopy,
 		seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
 	return writeFileAtomic(path, container) == nil
@@ -360,13 +361,13 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 	}
 	attr, key, col, zone, ok := splitSegmentSidecar(data)
 	if !ok {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
 	c.adoptPersistedZones(seg, zone)
 	ki, err := parseKeyIndex(key)
 	if err != nil || int(ki.upto) != seg.used {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return false
 	}
 	seg.ctAdoptKIDX(ki) // the key index covers exactly this segment's records, so its proof does
@@ -377,7 +378,7 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 		}
 	}
 	if mm == nil && seg.msidx.Load() != nil {
-		_ = closer() // would drop the segment's live attribute index: abort, keep the old sidecar
+		_ = closer() //nolint:errcheck // would drop the segment's live attribute index: abort, keep the old sidecar
 		return false
 	}
 	// The columnar block, if present, ALIASES this new mapping (zero-copy) like msidx, so it is
@@ -426,7 +427,7 @@ func (c *Collection) installSidecar(sh *shard, seg *segment, path string, contai
 			seg.colblk.CompareAndSwap(old, nil)
 		}
 	}
-	seg.swapSidecarHook(func() { _ = closer() }, true)
+	seg.swapSidecarHook(func() { _ = closer() }, true) //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	sh.mu.Unlock()
 	seg.releaseStale() // free the displaced mapping now if no scan is reading it
 	return true
@@ -443,7 +444,7 @@ func (c *Collection) reindexSealedAnon(sh *shard, seg *segment, si *segIndex) bo
 	sh.mu.Lock()
 	seg.msidx.Store(mm)
 	seg.idx.Store(nil)
-	seg.swapSidecarHook(func() { _ = closer() }, false)
+	seg.swapSidecarHook(func() { _ = closer() }, false) //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	sh.mu.Unlock()
 	seg.releaseStale()
 	return true
@@ -494,14 +495,14 @@ func (c *Collection) sealAndEvictShard(sh *shard) {
 }
 
 // loadSealedIndex maps a sealed persistent segment's sidecar container on Open,
-// publishing its key index (always) and, if valid and matching spec, its attribute
-// index. A miss leaves the segment unsealed so the reopen rebuilds it.
-func (c *Collection) loadSealedIndex(seg *segment, spec *indexSpec) bool {
+// publishing its key index (always) and, when valid, its attribute index. A miss leaves
+// the segment unsealed so the reopen rebuilds it.
+func (c *Collection) loadSealedIndex(seg *segment) bool {
 	path := snapshotPath(seg)
 	if path == "" {
 		return false
 	}
-	return c.publishSidecar(seg, path, spec)
+	return c.publishSidecar(seg, path)
 }
 
 // sealSegmentIndexAnon is the in-memory analogue of sealSegmentIndex: it converts a sealed
@@ -520,10 +521,10 @@ func (c *Collection) sealSegmentIndexAnon(seg *segment, si *segIndex) {
 		return
 	}
 	if !seg.msidx.CompareAndSwap(nil, mm) {
-		_ = closer() // lost the race to a concurrent conversion; unmap our own and bail
+		_ = closer() //nolint:errcheck // lost the race to a concurrent conversion; unmap our own and bail
 		return
 	}
-	seg.setOnReap(func() { _ = closer() })
+	seg.setOnReap(func() { _ = closer() }) //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	seg.idx.Store(nil)
 }
 
@@ -540,7 +541,7 @@ func sealedIndexAnon(si *segIndex) (*mmapSegIndex, func() error, error) {
 	}
 	mm, err := parseMmapSidecar(data)
 	if err != nil {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return nil, nil, err
 	}
 	return mm, closer, nil

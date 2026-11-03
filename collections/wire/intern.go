@@ -107,7 +107,7 @@ func (t *InternTable) Intern(name string) uint32 {
 		// names are rare after warmup, so the copy is cheap.
 		old := *t.canon.Load()
 		id = uint32(len(old))
-		next := append(old[:len(old):len(old)], internEntry{
+		next := append(old[:len(old):len(old)], internEntry{ //nolint:gocritic // a copy-append to a NEW slice, deliberately not written back to old
 			name:    name,
 			private: t.privacy != nil && t.privacy(name),
 		})

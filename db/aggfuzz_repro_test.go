@@ -216,7 +216,7 @@ func signatureOf(tier collections.AggTier, diffs []string) string {
 	}
 	d := diffs[0]
 	d = regexp.MustCompile(`"[^"]*"`).ReplaceAllString(d, `"_"`)
-	d = regexp.MustCompile(`-?[0-9][0-9.eE+-]*`).ReplaceAllString(d, "N")
+	d = regexp.MustCompile(`-?\d[0-9.eE+-]*`).ReplaceAllString(d, "N")
 	return tier.String() + " | " + d
 }
 

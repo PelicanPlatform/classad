@@ -124,7 +124,7 @@ func ColumnarUserAggregate(values NumValueScan, groupCols []GroupCol, aggs []Agg
 				// aggregate returns different types from one call to the next. That is a broken
 				// aggregate, and the panic it raises here is caught by the recover above and
 				// reported against its name, which is the diagnosis a caller needs.
-				acc = agg.NewAccumulator().(ColumnAccumulator)
+				acc = agg.NewAccumulator().(ColumnAccumulator) //nolint:errcheck // see above
 			}
 			first = nil
 			accs = append(accs, acc)

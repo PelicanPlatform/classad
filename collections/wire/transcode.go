@@ -81,6 +81,18 @@ func AppendInternedFromInline(dst []byte, src Ad, t *InternTable, hot map[uint32
 // interned forms and leaving everything else byte-identical. It mirrors skipNode's grammar case
 // for case; a tag handled there and missed here would silently truncate a record, so the two are
 // meant to be read side by side.
+// transcodeOperands transcodes the next n operand nodes in order. Each call advances the cursor,
+// so these are n DIFFERENT nodes rather than one expression repeated, and it stops at the first
+// that refuses, as the chain of && it replaces did.
+func transcodeOperands(c *cursor, out *[]byte, t *InternTable, depth, n int) bool {
+	for range n {
+		if !transcodeNode(c, out, t, depth+1) {
+			return false
+		}
+	}
+	return true
+}
+
 func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 	if !c.ok || depth > MaxDepth {
 		c.ok = false
@@ -140,13 +152,13 @@ func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 		if !copyFrom() {
 			return false
 		}
-		return transcodeNode(c, out, t, depth+1) && transcodeNode(c, out, t, depth+1)
+		return transcodeOperands(c, out, t, depth, 2)
 	case nBinOpStr:
 		c.skip(int(c.uvarint())) // op string, kept as-is
 		if !copyFrom() {
 			return false
 		}
-		return transcodeNode(c, out, t, depth+1) && transcodeNode(c, out, t, depth+1)
+		return transcodeOperands(c, out, t, depth, 2)
 	case nUnOp:
 		c.skip(1)
 		if !copyFrom() {
@@ -198,14 +210,12 @@ func transcodeNode(c *cursor, out *[]byte, t *InternTable, depth int) bool {
 		if !copyFrom() {
 			return false
 		}
-		return transcodeNode(c, out, t, depth+1) &&
-			transcodeNode(c, out, t, depth+1) &&
-			transcodeNode(c, out, t, depth+1)
+		return transcodeOperands(c, out, t, depth, 3)
 	case nElvis, nSubscript:
 		if !copyFrom() {
 			return false
 		}
-		return transcodeNode(c, out, t, depth+1) && transcodeNode(c, out, t, depth+1)
+		return transcodeOperands(c, out, t, depth, 2)
 	case nSelectStr:
 		// node(record) + inline name -> node(record) + id. The TAG has to be written before the
 		// record node, so it cannot share the copyFrom path.

@@ -15,7 +15,7 @@ import (
 //   - a "container" group (ContainerImage, WantContainer) on conFrac, together and INDEPENDENTLY
 //     of the ran group, so the two cannot be captured by partitioning ads into clusters
 //   - a scattered attribute on a pseudo-random 40%, belonging to no group
-func groupCorpus(n int, ranFrac, conFrac int) []string {
+func groupCorpus(n, ranFrac, conFrac int) []string {
 	out := make([]string, 0, n)
 	for i := range n {
 		var sb strings.Builder

@@ -126,7 +126,7 @@ func (c *compiler) emitStrListMember(fc *ast.FunctionCall) bool {
 // whose string is in the set once per block and testing a bit per record, which is what memberVec
 // does; that is a further specialization of this one and not a different mechanism.
 // DESTRUCTIVE: v IS the destination. See THE KERNEL CONTRACT in vecexec.go.
-func strListVec(s *strListSet, v *Vec) bool {
+func strListVec(s *strListSet, v *Vec) {
 	v.toData()
 	v.ensureInts()
 	set := func(i int, found, usable bool) {
@@ -142,7 +142,7 @@ func strListVec(s *strListSet, v *Vec) bool {
 		found, usable := s.lookup(v.valueData(0))
 		set(0, found, usable)
 		v.Const, v.Dict = true, nil
-		return true
+		return
 	}
 	// valueData resolves a dictionary code to its string, so a coded column is handled without the
 	// result carrying the dictionary over.
@@ -151,5 +151,4 @@ func strListVec(s *strListSet, v *Vec) bool {
 		set(i, found, usable)
 	}
 	v.Dict = nil
-	return true
 }

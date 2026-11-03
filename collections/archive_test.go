@@ -34,7 +34,7 @@ func buildArchive(t *testing.T, dir string, n int, opts ArchiveOptions) (*Archiv
 	states := []string{"Completed", "Removed", "Held"}
 	for i := 0; i < n; i++ {
 		ad, err := classad.Parse(fmt.Sprintf(
-			`[ ID=%d; Owner="%s"; JobStatus="%s"; ClusterId=%d; Memory=%d; CompletionDate=%d ]`,
+			`[ ID=%d; Owner=%q; JobStatus=%q; ClusterId=%d; Memory=%d; CompletionDate=%d ]`,
 			i, owners[i%len(owners)], states[i%len(states)], i/10, ((i%16)+1)*512, 1_700_000_000+i))
 		if err != nil {
 			t.Fatal(err)
@@ -126,7 +126,7 @@ func TestArchiveExactCaseMatch(t *testing.T) {
 	arches := []string{"X86_64", "x86_64", "aarch64"}
 	src := map[int]*classad.ClassAd{}
 	for i := 0; i < 300; i++ {
-		ad, err := classad.Parse(fmt.Sprintf(`[ ID=%d; Arch="%s" ]`, i, arches[i%len(arches)]))
+		ad, err := classad.Parse(fmt.Sprintf(`[ ID=%d; Arch=%q ]`, i, arches[i%len(arches)]))
 		if err != nil {
 			t.Fatal(err)
 		}

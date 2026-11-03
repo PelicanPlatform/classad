@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -319,7 +320,7 @@ func TestTranscodeStreamBytesMatch(t *testing.T) {
 			t.Fatal(err)
 		}
 		gotAST := Encode(nil, decoded, ta)
-		if string(gotWire) != string(gotAST) {
+		if !bytes.Equal(gotWire, gotAST) {
 			t.Fatalf("record %d: the two routes encode different bytes\n wire %x\n ast  %x", i, gotWire, gotAST)
 		}
 	}

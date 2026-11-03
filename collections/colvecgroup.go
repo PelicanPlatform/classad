@@ -52,7 +52,7 @@ func (c *Collection) vecGroupStats(q *vm.Query, groupIDs []uint32, aggIDs []uint
 	cs := &colScope{bc: st.cache, c: c}
 	resolver := cs.resolve
 	src := &blockVecSource{c: c, bc: st.cache}
-	scratch := vecScratchPool.Get().(*vm.VecScratch)
+	scratch := vecScratchPool.Get().(*vm.VecScratch) //nolint:errcheck // the pool's New returns exactly this type
 	defer func() {
 		scratch.Release()
 		vecScratchPool.Put(scratch)

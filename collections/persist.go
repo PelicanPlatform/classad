@@ -569,7 +569,7 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 		// there must verify, so a truncated file or a sidecar left over from a different
 		// segment falls back to the scan rather than being trusted.
 		// The same trailer read also yields the offset of the segment's dictionary record,
-		// used below so publishSegDict need not search for it.
+		// used below so publishSegDictAt need not search for it.
 		// A v5 sidecar also names the segment's damaged records, which are skipped from here on
 		// (see damage.go); the set must fit the segment or the extent is not trusted either.
 		facts := readSidecarTrailer(seg.path + ".idx")
@@ -687,7 +687,6 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	if sh.act != nil && (sh.act.dict.Load() != nil || sh.act.dictUnusable.Load()) {
 		sh.act = nil
 	}
-	spec := c.spec.Load()
 	sidecarStart := time.Now()
 	// Counts sealed segments, not slots: sh.segs is sparse (rotation nils reclaimed slots), so
 	// len(sh.segs) would overstate the total and make a finished phase read as half done.
@@ -700,82 +699,83 @@ func (c *Collection) loadShard(sh *shard, shardDir string) (uint64, error) {
 	sidecarProg := newOpenProgress(shardDir, OpenLoadSidecars, sidecarTotal)
 	sidecarDone := 0
 	for _, seg := range sh.segs {
-		if seg != nil && seg != sh.act {
-			sidecarProg.step(sidecarDone)
-			sidecarDone++
-			// Map the sidecar FIRST: a v3 container carries the segment's zone map, which
-			// loadSealedIndex adopts. Rebuilding one instead means decoding every record --
-			// measured at ~95% of reopen time, i.e. recovery scaling with the size of the
-			// archive rather than its segment count.
-			c.openIdxDiag.SealedSegments++
-			hasSidecar := sidecarFileExists(seg)
-			if hasSidecar {
-				c.openIdxDiag.SidecarFiles++
+		if seg == nil || seg == sh.act {
+			continue
+		}
+		sidecarProg.step(sidecarDone)
+		sidecarDone++
+		// Map the sidecar FIRST: a v3 container carries the segment's zone map, which
+		// loadSealedIndex adopts. Rebuilding one instead means decoding every record --
+		// measured at ~95% of reopen time, i.e. recovery scaling with the size of the
+		// archive rather than its segment count.
+		c.openIdxDiag.SealedSegments++
+		hasSidecar := sidecarFileExists(seg)
+		if hasSidecar {
+			c.openIdxDiag.SidecarFiles++
+		}
+		loaded := c.loadSealedIndex(seg)
+		// Damage found by this open, in a segment whose existing sidecar was adopted, goes into
+		// that sidecar now: the next open may trust its extent, and must then know what to skip.
+		// A segment with no adopted sidecar gets one, with its damage, when it is sealed.
+		if seg.damageUnsaved && seg.keyIdx.Load() != nil {
+			c.persistSegDamage(seg)
+		}
+		// Record how this segment's index was handled: an adopted attribute index needs no
+		// rebuild; anything else the post-Open Reindex rebuilds by decoding every record,
+		// which is the slow-startup path this diagnostic exists to explain.
+		if seg.keyIdx.Load() != nil {
+			c.openIdxDiag.KeyIndexAdopted++
+		}
+		if seg.msidx.Load() != nil {
+			c.openIdxDiag.AttrIndexAdopted++
+		} else {
+			switch {
+			case !hasSidecar:
+				c.openIdxDiag.note("no-sidecar-file")
+			case !loaded:
+				c.openIdxDiag.note("sidecar-rejected")
+			default:
+				c.openIdxDiag.note("attr-section-missing-or-stale")
 			}
-			loaded := c.loadSealedIndex(seg, spec)
-			// Damage found by this open, in a segment whose existing sidecar was adopted, goes into
-			// that sidecar now: the next open may trust its extent, and must then know what to skip.
-			// A segment with no adopted sidecar gets one, with its damage, when it is sealed.
-			if seg.damageUnsaved && seg.keyIdx.Load() != nil {
-				c.persistSegDamage(seg)
-			}
-			// Record how this segment's index was handled: an adopted attribute index needs no
-			// rebuild; anything else the post-Open Reindex rebuilds by decoding every record,
-			// which is the slow-startup path this diagnostic exists to explain.
-			if seg.keyIdx.Load() != nil {
-				c.openIdxDiag.KeyIndexAdopted++
-			}
-			if seg.msidx.Load() != nil {
-				c.openIdxDiag.AttrIndexAdopted++
+		}
+		// Fall back to rebuilding only when the sidecar carried no zone map it can trust
+		// (written before v3, in an older section format, or with none configured at the
+		// time). This decodes every record of the
+		// segment, so it is the phase that turns a segment-count reopen into a record-count
+		// one -- timed separately (ZoneRecompute) so the log can pin it.
+		if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {
+			zoneStart := time.Now()
+			seg.zones = computeSegZones(c, seg, seg.used, sh.zoneAttrs, sh.zoneInline, sh.sealsName)
+			tm.ZoneRecompute += time.Since(zoneStart)
+			tm.ZoneRecomputed++
+			// Write the freshly computed zone map back into the sidecar (a legacy sidecar
+			// predating zone persistence), so the next open ADOPTS it instead of decoding
+			// every record again -- otherwise this recompute recurs on every start forever
+			// (sealSegmentIndex never revisits an already-sealed segment). One-time per
+			// segment; this open already paid the decode.
+			if c.persistSegZonesUpgrade(seg) {
+				tm.ZoneUpgraded++
 			} else {
-				switch {
-				case !hasSidecar:
-					c.openIdxDiag.note("no-sidecar-file")
-				case !loaded:
-					c.openIdxDiag.note("sidecar-rejected")
-				default:
-					c.openIdxDiag.note("attr-section-missing-or-stale")
-				}
+				tm.ZoneUpgradeFailed++
 			}
-			// Fall back to rebuilding only when the sidecar carried no zone map it can trust
-			// (written before v3, in an older section format, or with none configured at the
-			// time). This decodes every record of the
-			// segment, so it is the phase that turns a segment-count reopen into a record-count
-			// one -- timed separately (ZoneRecompute) so the log can pin it.
-			if sh.appendOnly && len(sh.zoneAttrs) > 0 && seg.zones == nil {
-				zoneStart := time.Now()
-				seg.zones = computeSegZones(c, seg, seg.used, sh.zoneAttrs, sh.zoneInline, sh.sealsName)
-				tm.ZoneRecompute += time.Since(zoneStart)
-				tm.ZoneRecomputed++
-				// Write the freshly computed zone map back into the sidecar (a legacy sidecar
-				// predating zone persistence), so the next open ADOPTS it instead of decoding
-				// every record again -- otherwise this recompute recurs on every start forever
-				// (sealSegmentIndex never revisits an already-sealed segment). One-time per
-				// segment; this open already paid the decode.
-				if c.persistSegZonesUpgrade(seg) {
-					tm.ZoneUpgraded++
-				} else {
-					tm.ZoneUpgradeFailed++
-				}
+		}
+		// Record in the sidecar where this segment's trailer records are, or that it has
+		// none, when its sidecar predates those fields. The searches above ran over every
+		// record of the segment to establish it; writing it back is what stops the next open
+		// doing the same (see persistSegTrailerHintsUpgrade).
+		if loaded && segTrailerHintsStale(seg, segColHint[seg], segFlags[seg]) {
+			if c.persistSegTrailerHintsUpgrade(seg, segColHint[seg]) {
+				tm.TrailerFlagsUpgraded++
+			} else {
+				tm.TrailerFlagsUpgradeFailed++
 			}
-			// Record in the sidecar where this segment's trailer records are, or that it has
-			// none, when its sidecar predates those fields. The searches above ran over every
-			// record of the segment to establish it; writing it back is what stops the next open
-			// doing the same (see persistSegTrailerHintsUpgrade).
-			if loaded && segTrailerHintsStale(seg, segColHint[seg], segFlags[seg]) {
-				if c.persistSegTrailerHintsUpgrade(seg, segColHint[seg]) {
-					tm.TrailerFlagsUpgraded++
-				} else {
-					tm.TrailerFlagsUpgradeFailed++
-				}
-			}
-			if loaded {
-				// Phase 3: the segment's keys are now reachable through the sealed
-				// probe, so evict them from the resident directory -- the RAM win. Safe
-				// here because loadShard runs single-threaded during Open and every
-				// sealed segment is indexed, so no version escapes the probe.
-				sh.evictSegKeys(seg)
-			}
+		}
+		if loaded {
+			// Phase 3: the segment's keys are now reachable through the sealed
+			// probe, so evict them from the resident directory -- the RAM win. Safe
+			// here because loadShard runs single-threaded during Open and every
+			// sealed segment is indexed, so no version escapes the probe.
+			sh.evictSegKeys(seg)
 		}
 	}
 	tm.LoadSidecars = time.Since(sidecarStart)
@@ -1383,7 +1383,7 @@ func (c *Collection) Close() error {
 // point a table of the same name may have recreated the very paths a late dir-snapshot
 // write would land on. Writing nothing is what makes deferring safe.
 func (c *Collection) Discard() error {
-	if c.gate.beginClose(func() { _ = c.teardown(true) }) {
+	if c.gate.beginClose(func() { _ = c.teardown(true) }) { //nolint:errcheck // nothing left to report it to: this runs as the close hook
 		return nil
 	}
 	return c.teardown(true)

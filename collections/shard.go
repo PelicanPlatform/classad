@@ -605,7 +605,7 @@ func (sh *shard) writeMarker(seq, millis uint64) bool {
 	if sh.act == nil {
 		return false
 	}
-	if _, ok := sh.act.appendMarker(seq, millis); !ok {
+	if !sh.act.appendMarker(seq, millis) {
 		return false
 	}
 	if sh.alloc != nil && (len(sh.dirty) == 0 || sh.dirty[len(sh.dirty)-1] != sh.act) {
@@ -775,7 +775,7 @@ func (sh *shard) lookupSealed(key []byte, h uint64) (loc, bool) {
 
 // lookupSealedAt returns the location of key's record live at snapshot s0
 // (seq <= s0 < supersededBySeq) among this shard's sealed segments, or (noLoc, false).
-func (sh *shard) lookupSealedAt(key []byte, h uint64, s0 uint64) (loc, bool) {
+func (sh *shard) lookupSealedAt(key []byte, h, s0 uint64) (loc, bool) {
 	var found loc
 	ok := false
 	sh.forEachSealedRecord(key, h, func(seg *segment, off uint32) bool {

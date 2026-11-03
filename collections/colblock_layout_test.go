@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 )
@@ -112,7 +113,7 @@ func TestColBlockLayoutSharedAcrossBlocks(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(a) != string(g) {
+			if !bytes.Equal(a, g) {
 				t.Fatalf("block %d rec %d differs after marshal round-trip", bi, k)
 			}
 		}

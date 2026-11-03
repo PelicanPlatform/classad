@@ -3,8 +3,9 @@ package collections
 import (
 	"fmt"
 
-	"github.com/PelicanPlatform/classad/classad"
 	"testing"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // scanCensus walks the whole collection the way a query does (ForEachAd, which goes

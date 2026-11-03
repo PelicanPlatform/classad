@@ -162,7 +162,7 @@ func compileFilters(attrs []string, aggs []AggSpec) ([]*aggFilter, bool, error) 
 	for i, a := range attrs {
 		col[strings.ToLower(a)] = i
 	}
-	any := false
+	hasFilter := false
 	for i, a := range aggs {
 		if a.Filter == "" {
 			continue
@@ -183,9 +183,9 @@ func compileFilters(attrs []string, aggs []AggSpec) ([]*aggFilter, bool, error) 
 			}
 		}
 		out[i] = f
-		any = true
+		hasFilter = true
 	}
-	return out, any, nil
+	return out, hasFilter, nil
 }
 
 // keeps reports whether a row passes this filter. The scope ad is reused across rows and
@@ -357,7 +357,7 @@ type groupState struct {
 func newGroupState(gvals []string, aggs []AggSpec, userAggs []Aggregate) *groupState {
 	gs := &groupState{gvals: gvals, accs: make([]aggAcc, len(aggs))}
 	for i := range aggs {
-		if userAggs != nil && userAggs[i] != nil {
+		if i < len(userAggs) && userAggs[i] != nil {
 			gs.accs[i].user = userAggs[i].NewAccumulator()
 		}
 	}
@@ -474,10 +474,10 @@ func bucketKeyText(v classad.Value, width int64) (string, bool) {
 func numberOf(v classad.Value) (float64, bool) {
 	switch {
 	case v.IsInteger():
-		i, _ := v.IntValue()
+		i, _ := v.IntValue() //nolint:errcheck // the case above established the type
 		return float64(i), true
 	case v.IsReal():
-		r, _ := v.RealValue()
+		r, _ := v.RealValue() //nolint:errcheck // the case above established the type
 		return r, true
 	}
 	return 0, false
@@ -594,16 +594,16 @@ func ValueText(v classad.Value) string {
 	case v.IsError():
 		return "error"
 	case v.IsBool():
-		b, _ := v.BoolValue()
+		b, _ := v.BoolValue() //nolint:errcheck // the case above established the type
 		return strconv.FormatBool(b)
 	case v.IsString():
-		s, _ := v.StringValue()
+		s, _ := v.StringValue() //nolint:errcheck // the case above established the type
 		return s
 	case v.IsInteger():
-		i, _ := v.IntValue()
+		i, _ := v.IntValue() //nolint:errcheck // the case above established the type
 		return strconv.FormatInt(i, 10)
 	case v.IsReal():
-		r, _ := v.RealValue()
+		r, _ := v.RealValue() //nolint:errcheck // the case above established the type
 		return trimFloat(r)
 	default:
 		return v.String()

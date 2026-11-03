@@ -24,21 +24,10 @@ func statsCatPair(t *testing.T, opts ServeOptions) (*Client, *Server, func()) {
 	return c, s, func() { c.Close(); s.Close(); cat.Close() }
 }
 
-// shapeFor returns the one tracked shape whose grouping matches, or fails.
-func shapeFor(t *testing.T, rep QueryStatsReport, groupBy string) QueryShapeStat {
-	t.Helper()
-	for _, sh := range rep.Shapes {
-		if sh.GroupBy == groupBy {
-			return sh
-		}
-	}
-	t.Fatalf("no shape grouped by %q; tracked: %s", groupBy, shapeSummary(rep))
-	return QueryShapeStat{}
-}
-
 func shapeSummary(rep QueryStatsReport) string {
 	out := ""
-	for _, sh := range rep.Shapes {
+	for i := range rep.Shapes {
+		sh := &rep.Shapes[i]
 		out += fmt.Sprintf("\n  op=%s table=%s where=%s group=[%s] aggs=[%s] count=%d rows=%d",
 			sh.Op, sh.Table, sh.Shape, sh.GroupBy, sh.Aggregates, sh.Count, sh.Rows)
 	}

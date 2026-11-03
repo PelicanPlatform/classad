@@ -11,7 +11,7 @@ import (
 )
 
 // realOSPoolAds loads the committed OSPool slot corpus (condor_status -l), skipping when absent.
-func realOSPoolAds(tb testing.TB, max int) []*classad.ClassAd {
+func realOSPoolAds(tb testing.TB, limit int) []*classad.ClassAd {
 	tb.Helper()
 	data, err := os.ReadFile("testdata/ospool_slots.ldif")
 	if err != nil {
@@ -27,7 +27,7 @@ func realOSPoolAds(tb testing.TB, max int) []*classad.ClassAd {
 			continue
 		}
 		ads = append(ads, ad)
-		if len(ads) >= max {
+		if len(ads) >= limit {
 			break
 		}
 	}

@@ -717,8 +717,8 @@ func groupValueLess(a, b classad.Value) bool {
 	}
 	switch ar {
 	case 0:
-		af, _ := a.NumberValue()
-		bf, _ := b.NumberValue()
+		af, _ := a.NumberValue() //nolint:errcheck // guarded by the type check above
+		bf, _ := b.NumberValue() //nolint:errcheck // guarded by the type check above
 		// NaN sorts last rather than comparing false against everything, which would leave it
 		// anywhere and stop equal values from landing next to each other.
 		if an, bn := af != af, bf != bf; an || bn {
@@ -726,8 +726,8 @@ func groupValueLess(a, b classad.Value) bool {
 		}
 		return af < bf
 	case 1:
-		as, _ := a.StringValue()
-		bs, _ := b.StringValue()
+		as, _ := a.StringValue() //nolint:errcheck // guarded by the type check above
+		bs, _ := b.StringValue() //nolint:errcheck // guarded by the type check above
 		// The evaluator's own case-insensitive comparison, which is also the order the block
 		// dictionaries are sorted in, with a byte tiebreak so values that fold equal -- distinct
 		// groups, since the scan groups by exact text -- still have a stable place.
@@ -736,8 +736,8 @@ func groupValueLess(a, b classad.Value) bool {
 		}
 		return as < bs
 	case 2:
-		ab, _ := a.BoolValue()
-		bb, _ := b.BoolValue()
+		ab, _ := a.BoolValue() //nolint:errcheck // guarded by the type check above
+		bb, _ := b.BoolValue() //nolint:errcheck // guarded by the type check above
 		return !ab && bb
 	case 5:
 		return a.String() < b.String()
@@ -830,10 +830,7 @@ func (c *Collection) groupPassWindow(p *groupPassPlan, st *groupPassState, w seg
 		ok = gf.resolveSeg(cs)
 	}
 	if !ok {
-		if !bruteGroupStats(c, w, s0, groupLookups, aggLookups, preds, lookups, gf, acc) {
-			return false
-		}
-		return true
+		return bruteGroupStats(c, w, s0, groupLookups, aggLookups, preds, lookups, gf, acc)
 	}
 	base := 0
 	for _, blk := range cs.blocks {

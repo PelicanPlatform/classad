@@ -356,7 +356,7 @@ func (c *Collection) coverSealedSegments(s *adSchema, hot []int) {
 		// long enough that holding them all would keep every replaced segment's file on disk for the
 		// duration. The deferred sweep is a safety net for a panic mid-loop.
 		done := 0
-		defer func() { unpinAll(segs[done:]) }()
+		defer func() { unpinAll(segs[done:]) }() //nolint:gocritic // deliberate, as the comment above says: a panic-safety net, not a per-iteration release
 		for i, seg := range segs {
 			if cs := c.buildColSegment(seg, s, hot); cs != nil {
 				seg.colblk.Store(cs)
@@ -393,12 +393,12 @@ func (c *Collection) persistColSeg(sh *shard, seg *segment) {
 	}
 	attr, key, _, zone, ok := splitSegmentSidecar(data)
 	if !ok {
-		_ = closer()
+		_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 		return
 	}
 	container := buildSegmentSidecar(append([]byte(nil), attr...), append([]byte(nil), key...), colBlob,
 		append([]byte(nil), zone...), seg.used, seg.dictRecOff(), seg.colRecOff(), encodeDamage(seg.damaged()))
-	_ = closer()
+	_ = closer() //nolint:errcheck // best effort: unmapping a sidecar this call is done with
 	c.installSidecar(sh, seg, path, container)
 }
 
@@ -730,7 +730,7 @@ func (c *Collection) deriveSchemaFrom(samples [][]byte, hotTopN int) (*adSchema,
 		var reads int64
 		if name, ok := c.intern.Name(s.fields[i].id); ok {
 			if v, ok := c.demand.m.Load(strings.ToLower(name)); ok {
-				reads = v.(*demandCounts).reads.Load()
+				reads = v.(*demandCounts).reads.Load() //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 			}
 		}
 		nums = append(nums, fieldDemand{i, reads})

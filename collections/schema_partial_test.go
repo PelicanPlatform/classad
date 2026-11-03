@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // Partial-decompression experiment: compress the fixed numeric prefixes of a block of records

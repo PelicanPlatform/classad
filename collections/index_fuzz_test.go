@@ -46,7 +46,7 @@ func fuzzCorpus() (*Collection, map[int]*classad.ClassAd) {
 		for _, a := range arch {
 			for _, cp := range cpus {
 				for _, ld := range load {
-					add(fmt.Sprintf(`[ ID=%d; Arch="%s"; State="%s"; Cpus=%s; Load=%s ]`,
+					add(fmt.Sprintf(`[ ID=%d; Arch=%q; State=%q; Cpus=%s; Load=%s ]`,
 						i, a, state[i%len(state)], cp, ld))
 				}
 			}

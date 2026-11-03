@@ -488,7 +488,7 @@ func testColPayloadFutureVersionRepairLeavesDamagedSegment(t *testing.T, dir str
 	for i := range r.Segments {
 		s := &r.Segments[i]
 		if s.Path == target {
-			needs = segmentNeedsRepair(*s)
+			needs = segmentNeedsRepair(s)
 		}
 	}
 	if !needs {

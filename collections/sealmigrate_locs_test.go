@@ -96,7 +96,7 @@ func TestRecFitsRejectsOverrunAndWrap(t *testing.T) {
 
 // plantHeader writes just the two length fields recFits reads: the key length in the fixed header, and the
 // ad length that follows the key.
-func plantHeader(b []byte, off uint32, keyLen, adLen uint32) {
+func plantHeader(b []byte, off, keyLen, adLen uint32) {
 	binary.LittleEndian.PutUint32(b[off+recKeyLenOff:], keyLen)
 	binary.LittleEndian.PutUint32(b[off+recKeyOff+keyLen:], adLen)
 }

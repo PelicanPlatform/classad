@@ -20,7 +20,7 @@ import (
 // down the whole-record composition path -- the only path that reads the base, and so the only
 // one that can fabricate. An eligible patch is stored as a delta and never reads anything, which
 // is why the first version of this test passed a plain patch and proved nothing.
-func patchTx(t *testing.T, c *Collection, key string, attr string, v int64, removed ...string) CommitResult {
+func patchTx(t *testing.T, c *Collection, key, attr string, v int64, removed ...string) CommitResult {
 	t.Helper()
 	patch := classad.New()
 	patch.InsertAttr(attr, v)

@@ -219,7 +219,7 @@ func (sh *shard) trackPublishLocked(seq uint64) bool {
 
 // A tracked seq that never retired would hold every later cursor back (resumes then
 // over-deliver; nothing is lost), so every commit that tracks a seq must publish it:
-// applyOne/applyWrites/applyBatch, Delete, and Txn.Commit/commitTxn via publishTxn. A
+// applyOne/applyWrites/applyBatch, Delete, and Txn.Commit via publishTxn. A
 // deferred append (commitDeferred) publishes from the sync that makes it durable
 // (publishDeferred), or is retired unpublished when Truncate drops it.
 
@@ -294,7 +294,7 @@ type rawEvent struct {
 	key   []byte
 	// ad is the raw stored bytes: codec-compressed and, for encrypted attributes,
 	// sealed with THIS node's data key. It is an internal, node-local representation.
-	// INVARIANT: it must be decoded via watchAd/decodeAd (which decompresses and
+	// INVARIANT: it must be decoded via watchAdAs/decodeAd (which decompresses and
 	// decrypts) before it leaves the process. Never ship rawEvent.ad over the wire or
 	// to a replica -- a follower has a different data key and could not open it, and it
 	// would bypass the private-attribute stripping that adString applies to a decoded ad.
@@ -702,16 +702,11 @@ func (c *Collection) liveCoalesced(ctx context.Context, w *watcher, sReg, vec []
 	}
 }
 
-// watchAd decodes a watched key's stored ad for a WatchUpsert event. For a
-// chained collection it flattens the ad's parent in (so watch events, like query
-// results, carry inherited attributes) and returns ok=false for a structural
-// (parent-only) ad, which is hidden from watches. For a plain collection it just
-// decodes. ok=false also means "skip this event" (undecodable or hidden).
-func (c *Collection) watchAd(key, rawAd []byte, codec Codec) (*classad.ClassAd, bool) {
-	return c.watchAdAs(key, rawAd, codec, false)
-}
-
-// watchAdAs is watchAd for a watcher that may not be entitled to sealed values (see WatchRedacted).
+// watchAdAs decodes a watched key's stored ad for a WatchUpsert event. For a chained collection
+// it flattens the ad's parent in (so watch events, like query results, carry inherited
+// attributes) and returns ok=false for a structural (parent-only) ad, which is hidden from
+// watches. ok=false also means "skip this event" (undecodable or hidden). redact is for a
+// watcher that may not be entitled to sealed values (see WatchRedacted).
 func (c *Collection) watchAdAs(key, rawAd []byte, codec Codec, redact bool) (*classad.ClassAd, bool) {
 	return c.watchAdDictAs(key, rawAd, codec, nil, redact)
 }
@@ -854,7 +849,7 @@ func (c *Collection) fanoutChildren(parent rawEvent, sig map[string]map[string]s
 			return true
 		}
 		if pk := c.parentKeyFor(k); pk != nil && bytes.Equal(pk, parent.key) {
-			// This event's ad bytes outlive the scan (decoded later by watchAd, when the
+			// This event's ad bytes outlive the scan (decoded later by watchAdAs, when the
 			// segment/dict is gone), so make an interned record self-contained now.
 			sc := c.toSelfContainedAs(dict, ad, codec, redact)
 			out = append(out, rawEvent{

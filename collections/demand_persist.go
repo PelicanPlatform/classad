@@ -87,12 +87,12 @@ func (d *demandTracker) decay(f float64) {
 	d.total.Store(scaleCount(d.total.Load(), f))
 	var dead []string
 	d.m.Range(func(k, v any) bool {
-		c := v.(*demandCounts)
+		c := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 		eq := float64(c.eq.Load()) * f
 		rng := float64(c.rng.Load()) * f
 		reads := float64(c.reads.Load()) * f
 		if eq < demandFloor && rng < demandFloor && reads < demandFloor {
-			dead = append(dead, k.(string))
+			dead = append(dead, k.(string)) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 			return true
 		}
 		c.eq.Store(int64(math.Round(eq)))
@@ -136,10 +136,10 @@ func (d *demandTracker) snapshot(now time.Time) persistedDemand {
 		Attrs:     map[string]persistedCounts{},
 	}
 	d.m.Range(func(k, v any) bool {
-		c := v.(*demandCounts)
+		c := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 		eq, rng, reads := float64(c.eq.Load()), float64(c.rng.Load()), float64(c.reads.Load())
 		if eq >= demandFloor || rng >= demandFloor || reads >= demandFloor {
-			p.Attrs[k.(string)] = persistedCounts{Eq: eq, Rng: rng, Reads: reads}
+			p.Attrs[k.(string)] = persistedCounts{Eq: eq, Rng: rng, Reads: reads} //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 		}
 		return true
 	})
@@ -161,7 +161,7 @@ func (d *demandTracker) restore(p persistedDemand, halfLife time.Duration, now t
 			continue
 		}
 		v, _ := d.m.LoadOrStore(name, &demandCounts{})
-		c := v.(*demandCounts)
+		c := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 		c.eq.Add(int64(math.Round(eq)))
 		c.rng.Add(int64(math.Round(rng)))
 		c.reads.Add(int64(math.Round(reads)))
@@ -208,7 +208,7 @@ func (c *Collection) SaveDemand() {
 	if err != nil {
 		return
 	}
-	_ = writeFileSync(filepath.Join(c.dir, demandFile), data)
+	_ = writeFileSync(filepath.Join(c.dir, demandFile), data) //nolint:errcheck // best effort: the file is a cache, rebuilt from the data when it is missing
 }
 
 // loadDemand restores the checkpoint written by SaveDemand. Any problem reading it leaves

@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -304,11 +305,11 @@ func TestColSegmentPersistMultiGroup(t *testing.T) {
 		if a.n != b.n || a.bitsStride != b.bitsStride {
 			t.Errorf("group %d: n/stride = %d/%d, want %d/%d", i, b.n, b.bitsStride, a.n, a.bitsStride)
 		}
-		if string(a.bits) != string(b.bits) || string(a.hotCol) != string(b.hotCol) {
+		if !bytes.Equal(a.bits, b.bits) || !bytes.Equal(a.hotCol, b.hotCol) {
 			t.Errorf("group %d: hot region differs after round-trip", i)
 		}
-		if string(a.strComp) != string(b.strComp) || string(a.coldComp) != string(b.coldComp) ||
-			string(a.coldNumComp) != string(b.coldNumComp) {
+		if !bytes.Equal(a.strComp, b.strComp) || !bytes.Equal(a.coldComp, b.coldComp) ||
+			!bytes.Equal(a.coldNumComp, b.coldNumComp) {
 			t.Errorf("group %d: a compressed stream differs after round-trip", i)
 		}
 	}
@@ -408,13 +409,13 @@ func TestRowGroupsNoRunts(t *testing.T) {
 		// one ad that crosses the whole budget by itself. That is the shape that makes the aligned-prefix
 		// back-off emit a runt, and the only shape that exercises the floor.
 		for i := 0; i < colGroupAlign; i++ {
-			src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nBlob = \"%s\"", n, n%10, small)
+			src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nBlob = %q", n, n%10, small)
 			if err := c.Put([]byte(fmt.Sprintf("k%d", n)), mustAdOld(t, src)); err != nil {
 				t.Fatal(err)
 			}
 			n++
 		}
-		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nBlob = \"%s\"", n, n%10, huge)
+		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nBlob = %q", n, n%10, huge)
 		if err := c.Put([]byte(fmt.Sprintf("k%d", n)), mustAdOld(t, src)); err != nil {
 			t.Fatal(err)
 		}
@@ -449,14 +450,14 @@ func TestRowGroupsNoRunts(t *testing.T) {
 				blocks++
 				// A non-final block should either be alignment-driven and substantial, or contain one of
 				// the enormous records. Either way it must not be a runt.
-				bytes := blk.n*blk.bitsStride + len(blk.hotCol)
+				nbytes := blk.n*blk.bitsStride + len(blk.hotCol)
 				if r, ok := blockRegionBytes(blk); ok {
-					bytes += r
+					nbytes += r
 				}
-				if bytes < floor/8 {
+				if nbytes < floor/8 {
 					runts++
 					t.Errorf("non-final block %d/%d holds %d records / ~%d B, far below the %d B floor",
-						i, len(seg.blocks), blk.n, bytes, floor)
+						i, len(seg.blocks), blk.n, nbytes, floor)
 				}
 			}
 		}

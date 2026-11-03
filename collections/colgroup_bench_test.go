@@ -162,7 +162,7 @@ func benchAggregate(b *testing.B, newStore func(testing.TB) (*Collection, string
 
 // BenchmarkRowGroupOSPool is the fat-ad case: real slot ads, where bounding the block is the win.
 func BenchmarkRowGroupOSPool(b *testing.B) {
-	benchAggregate(b, func(tb testing.TB) (*Collection, string) { return ospoolFixture(tb) })
+	benchAggregate(b, ospoolFixture)
 }
 
 // BenchmarkRowGroupSmallAds is the small-ad case: blocks so small that splitting them changes
@@ -216,7 +216,7 @@ func BenchmarkRowGroupBlockBytes(b *testing.B) {
 		name  string
 		build func(testing.TB) (*Collection, string)
 	}{
-		{"ospool", func(tb testing.TB) (*Collection, string) { return ospoolFixture(tb) }},
+		{"ospool", ospoolFixture},
 		{"smallAds", func(tb testing.TB) (*Collection, string) {
 			c, _ := groupFixture(tb, 8000)
 			return c, "ProcId"

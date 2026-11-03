@@ -210,13 +210,13 @@ func (c *Collection) MigrateSealedAttrs(workers int) int {
 				}
 			} else {
 				r.dst.retire()
-				r.dst.reapAndHook() // slot moved under us: drop the fresh file rather than leak it
+				r.dst.reapAndHook() //nolint:errcheck // slot moved under us: drop the fresh file rather than leak it
 				complete = false
 			}
 			sh.mu.Unlock()
 		}
 		for _, seg := range toReap {
-			seg.reapAndHook() // munmap + unlink the superseded file, off-lock
+			seg.reapAndHook() //nolint:errcheck // munmap + unlink the superseded file, off-lock
 		}
 	}
 	if migrated > 0 {
@@ -557,5 +557,5 @@ func (c *Collection) markSealMigrationDone(stamp string) {
 	if err := os.WriteFile(tmp, []byte(stamp), 0o600); err != nil {
 		return
 	}
-	_ = os.Rename(tmp, path)
+	_ = os.Rename(tmp, path) //nolint:errcheck // best effort, as the comment above says
 }

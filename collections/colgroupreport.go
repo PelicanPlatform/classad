@@ -175,7 +175,7 @@ func (c *Collection) mutateGroupSchemaFile(fn func(*persistedGroupSchemas)) {
 	}
 	fn(&rec)
 	if data, err := json.Marshal(rec); err == nil {
-		_ = writeFileSync(filepath.Join(c.dir, groupSchemaFile), data)
+		_ = writeFileSync(filepath.Join(c.dir, groupSchemaFile), data) //nolint:errcheck // best effort: the file is a cache, rebuilt from the data when it is missing
 	}
 }
 
@@ -356,11 +356,11 @@ func (c *Collection) saveAgreement(ag GroupSchemaAgreement, groups []GroupSchema
 // windowSamples draws up to max records from one pinned segment window, in the same wire
 // convention CollectSamplesRecentN produces (inline-flattened for a persistent collection), so
 // the caller normalizes both the same way.
-func (c *Collection) windowSamples(w segWindow, max int) [][]byte {
+func (c *Collection) windowSamples(w segWindow, limit int) [][]byte {
 	var out [][]byte
 	var buf []byte
 	dict := w.dict()
-	for off := 0; off < w.used && len(out) < max; {
+	for off := 0; off < w.used && len(out) < limit; {
 		o := uint32(off)
 		if end, ok := w.dmg.skip(o); ok {
 			off = int(end)

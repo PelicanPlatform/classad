@@ -19,19 +19,6 @@ func fastMatches(c *Collection, q *vm.Query) []string {
 	return out
 }
 
-// refMatches returns the multiset of ads the reference (full decode of every ad,
-// then match) yields.
-func refMatches(c *Collection, q *vm.Query) []string {
-	var out []string
-	for ad := range c.Scan() {
-		if q.Matches(ad) {
-			out = append(out, ad.String())
-		}
-	}
-	sort.Strings(out)
-	return out
-}
-
 func assertSameMatches(t *testing.T, c *Collection, exprs []string) {
 	t.Helper()
 	// The reference decodes every ad and renders each match. Doing that per expression means N full

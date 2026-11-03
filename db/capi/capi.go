@@ -36,6 +36,16 @@ import (
 
 func main() {}
 
+// handleAs returns the Go value behind an opaque handle as T. Handles cross the C boundary
+// as plain integers, so nothing on this side can stop a caller passing a transaction handle
+// where a database was wanted, or the handle of something it has already freed. Unchecked,
+// that mistake is a Go panic unwinding into C++, which takes the host process with it;
+// checked, each entry point below returns its own failure code and the caller lives.
+func handleAs[T any](h C.uintptr_t) (T, bool) {
+	v, ok := cgo.Handle(h).Value().(T)
+	return v, ok
+}
+
 // result codes shared with the C side (see classad_db.h).
 const (
 	cadbOK      = 0
@@ -58,16 +68,20 @@ func cadb_open(dir *C.char) C.uintptr_t {
 //
 //export cadb_close
 func cadb_close(h C.uintptr_t) {
-	hd := cgo.Handle(h)
-	_ = hd.Value().(*db.DB).Close()
-	hd.Delete()
+	if d, ok := handleAs[*db.DB](h); ok {
+		_ = d.Close() //nolint:errcheck // the handle is being freed; there is nobody left to tell
+	}
+	cgo.Handle(h).Delete()
 }
 
 // Begins an independent transaction on the log; returns an opaque transaction handle.
 //
 //export cadb_begin
 func cadb_begin(h C.uintptr_t) C.uintptr_t {
-	d := cgo.Handle(h).Value().(*db.DB)
+	d, ok := handleAs[*db.DB](h)
+	if !ok {
+		return 0
+	}
 	return C.uintptr_t(cgo.NewHandle(d.Begin()))
 }
 
@@ -76,9 +90,11 @@ func cadb_begin(h C.uintptr_t) C.uintptr_t {
 //
 //export cadb_commit
 func cadb_commit(h C.uintptr_t) C.int {
-	hd := cgo.Handle(h)
-	tx := hd.Value().(*db.Txn)
-	defer hd.Delete()
+	tx, ok := handleAs[*db.Txn](h)
+	if !ok {
+		return cadbErr
+	}
+	defer cgo.Handle(h).Delete()
 	if err := tx.Commit(); err != nil {
 		if ce, ok := err.(*db.ConflictError); ok {
 			return C.int(len(ce.Keys))
@@ -92,9 +108,10 @@ func cadb_commit(h C.uintptr_t) C.int {
 //
 //export cadb_abort
 func cadb_abort(h C.uintptr_t) {
-	hd := cgo.Handle(h)
-	hd.Value().(*db.Txn).Abort()
-	hd.Delete()
+	if tx, ok := handleAs[*db.Txn](h); ok {
+		tx.Abort()
+	}
+	cgo.Handle(h).Delete()
 }
 
 // NewClassAd: stores the ad parsed from ad_text (old-ClassAd, newline-separated
@@ -106,7 +123,11 @@ func cadb_new_classad(h C.uintptr_t, key, adText *C.char) C.int {
 	if err != nil {
 		return cadbErr
 	}
-	cgo.Handle(h).Value().(*db.Txn).NewClassAd(C.GoString(key), ad)
+	tx, ok := handleAs[*db.Txn](h)
+	if !ok {
+		return cadbErr
+	}
+	tx.NewClassAd(C.GoString(key), ad)
 	return cadbOK
 }
 
@@ -114,7 +135,9 @@ func cadb_new_classad(h C.uintptr_t, key, adText *C.char) C.int {
 //
 //export cadb_destroy_classad
 func cadb_destroy_classad(h C.uintptr_t, key *C.char) {
-	cgo.Handle(h).Value().(*db.Txn).DestroyClassAd(C.GoString(key))
+	if tx, ok := handleAs[*db.Txn](h); ok {
+		tx.DestroyClassAd(C.GoString(key))
+	}
 }
 
 // SetAttribute: sets key's attribute name to the expression parsed from expr.
@@ -122,8 +145,11 @@ func cadb_destroy_classad(h C.uintptr_t, key *C.char) {
 //
 //export cadb_set_attribute
 func cadb_set_attribute(h C.uintptr_t, key, name, expr *C.char) C.int {
-	if err := cgo.Handle(h).Value().(*db.Txn).SetAttribute(
-		C.GoString(key), C.GoString(name), C.GoString(expr)); err != nil {
+	tx, ok := handleAs[*db.Txn](h)
+	if !ok {
+		return cadbErr
+	}
+	if err := tx.SetAttribute(C.GoString(key), C.GoString(name), C.GoString(expr)); err != nil {
 		return cadbErr
 	}
 	return cadbOK
@@ -133,7 +159,9 @@ func cadb_set_attribute(h C.uintptr_t, key, name, expr *C.char) C.int {
 //
 //export cadb_delete_attribute
 func cadb_delete_attribute(h C.uintptr_t, key, name *C.char) {
-	cgo.Handle(h).Value().(*db.Txn).DeleteAttribute(C.GoString(key), C.GoString(name))
+	if tx, ok := handleAs[*db.Txn](h); ok {
+		tx.DeleteAttribute(C.GoString(key), C.GoString(name))
+	}
 }
 
 // LookupInTransaction: writes the unparsed expression of key's attribute name (as the
@@ -142,7 +170,12 @@ func cadb_delete_attribute(h C.uintptr_t, key, name *C.char) {
 //
 //export cadb_lookup_attr
 func cadb_lookup_attr(h C.uintptr_t, key, name *C.char, out **C.char) C.int {
-	v, ok := cgo.Handle(h).Value().(*db.Txn).LookupAttr(C.GoString(key), C.GoString(name))
+	tx, ok := handleAs[*db.Txn](h)
+	if !ok {
+		*out = nil
+		return cadbErr
+	}
+	v, ok := tx.LookupAttr(C.GoString(key), C.GoString(name))
 	if !ok {
 		*out = nil
 		return cadbMissing
@@ -158,7 +191,10 @@ func cadb_lookup_attr(h C.uintptr_t, key, name *C.char, out **C.char) C.int {
 //
 //export cadb_watch_start
 func cadb_watch_start(h C.uintptr_t, notify_fd C.int) C.uintptr_t {
-	d := cgo.Handle(h).Value().(*db.DB)
+	d, ok := handleAs[*db.DB](h)
+	if !ok {
+		return 0
+	}
 	w, err := db.NewWatcher(d, int(notify_fd), nil)
 	if err != nil {
 		return 0
@@ -172,8 +208,14 @@ func cadb_watch_start(h C.uintptr_t, notify_fd C.int) C.uintptr_t {
 // then after a wakeup); the key is NULL when 0.
 //
 //export cadb_watch_next
-func cadb_watch_next(h C.uintptr_t, outType *C.int, outKey **C.char, outAd **C.char) C.int {
-	ev, ok := cgo.Handle(h).Value().(*db.Watcher).Next()
+func cadb_watch_next(h C.uintptr_t, outType *C.int, outKey, outAd **C.char) C.int {
+	w, ok := handleAs[*db.Watcher](h)
+	if !ok {
+		*outKey = nil
+		*outAd = nil
+		return 0
+	}
+	ev, ok := w.Next()
 	if !ok {
 		*outKey = nil
 		*outAd = nil
@@ -193,9 +235,10 @@ func cadb_watch_next(h C.uintptr_t, outType *C.int, outKey **C.char, outAd **C.c
 //
 //export cadb_watch_stop
 func cadb_watch_stop(h C.uintptr_t) {
-	hd := cgo.Handle(h)
-	hd.Value().(*db.Watcher).Stop()
-	hd.Delete()
+	if w, ok := handleAs[*db.Watcher](h); ok {
+		w.Stop()
+	}
+	cgo.Handle(h).Delete()
 }
 
 // queryIter holds a pull-style cursor over a Query's push iterator, so the C side can drain
@@ -215,7 +258,10 @@ type queryIter struct {
 //
 //export cadb_query
 func cadb_query(h C.uintptr_t, constraint *C.char) C.uintptr_t {
-	d := cgo.Handle(h).Value().(*db.DB)
+	d, ok := handleAs[*db.DB](h)
+	if !ok {
+		return 0
+	}
 	seq, err := d.Query(C.GoString(constraint))
 	if err != nil {
 		return 0
@@ -230,7 +276,11 @@ func cadb_query(h C.uintptr_t, constraint *C.char) C.uintptr_t {
 //
 //export cadb_query_next
 func cadb_query_next(qh C.uintptr_t, out **C.char) C.int {
-	qi := cgo.Handle(qh).Value().(*queryIter)
+	qi, ok := handleAs[*queryIter](qh)
+	if !ok {
+		*out = nil
+		return cadbErr
+	}
 	ad, ok := qi.next()
 	if !ok {
 		*out = nil
@@ -245,9 +295,10 @@ func cadb_query_next(qh C.uintptr_t, out **C.char) C.int {
 //
 //export cadb_query_free
 func cadb_query_free(qh C.uintptr_t) {
-	hd := cgo.Handle(qh)
-	hd.Value().(*queryIter).stop()
-	hd.Delete()
+	if qi, ok := handleAs[*queryIter](qh); ok {
+		qi.stop()
+	}
+	cgo.Handle(qh).Delete()
 }
 
 // Frees a string returned by the library (e.g. cadb_lookup_attr).

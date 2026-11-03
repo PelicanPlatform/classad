@@ -91,11 +91,11 @@ func TestMergePassRespectsLimits(t *testing.T) {
 		dir := t.TempDir()
 		a := buildMergeArchive(t, dir, 4000)
 		defer a.Close()
-		const cap = 24 << 10
-		a.MergePass(MergeOptions{TargetSegments: 1, TriggerSegments: 2, MinMergeBytes: 1, MaxSegmentBytes: cap, KeepRecent: 0})
+		const capBytes = 24 << 10
+		a.MergePass(MergeOptions{TargetSegments: 1, TriggerSegments: 2, MinMergeBytes: 1, MaxSegmentBytes: capBytes, KeepRecent: 0})
 		for _, s := range policySegments(t, a) {
-			if int64(s.used) > cap*2 {
-				t.Errorf("segment holds %d bytes, well past the %d cap", s.used, cap)
+			if int64(s.used) > capBytes*2 {
+				t.Errorf("segment holds %d bytes, well past the %d cap", s.used, capBytes)
 			}
 		}
 	})

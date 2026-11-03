@@ -295,7 +295,7 @@ func (c *Collection) reclaimDeadShard(sh *shard) int {
 	sh.mu.Unlock()
 
 	for _, seg := range toReap {
-		_ = seg.reapAndHook()
+		_ = seg.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 	}
 	return len(dead)
 }
@@ -905,9 +905,12 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		rl := recordLen(len(key), len(body))
 		if (*curp).used+rl+reserve > len((*curp).data) {
 			finalizeInterned(*curp, st)
-			*curp = newDst(streamSegs, rl+reserve, target)
 			*st = newStream()
-			// A fresh stream means a fresh table, so the ids have to be reassigned against it.
+			// A fresh stream means a fresh table, so the ids have to be reassigned against it,
+			// and the re-encoded record is not the same size as the one rl was measured from.
+			// So re-encode FIRST and size the destination from what came out. Sizing it from
+			// the old encoding was only safe while the new one happened to be no larger -- and
+			// when the record is bigger than a segment of its own, that slack is all there is.
 			out, ok = compactTranscode(wireBuf[:0], wire.Ad(w), st.table, st.hot)
 			if !ok {
 				internViaAST.Add(1)
@@ -918,8 +921,15 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			body = target.Compress(encBuf[:0], out)
 			encBuf = body
 			rl = recordLen(len(key), len(body))
+			*curp = newDst(streamSegs, rl+reserve, target)
 		}
-		off, _ := (*curp).append(seq, noLoc, key, body)
+		off, ok := (*curp).append(seq, noLoc, key, body)
+		if !ok {
+			// Nowhere to put it. Offset 0 is a real record's offset, so handing it back would
+			// point the directory at whatever else is there; refuse and let the ast path take it.
+			internViaAST.Add(1)
+			return nil, 0, false
+		}
 		// Counted here, not at the transcode above: the rollover path can still refuse and hand
 		// the record to the ast fallback, and a counter used to check "no silent fallbacks" has
 		// to report the route the record actually went out by.
@@ -945,8 +955,9 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		rl := recordLen(len(key), len(body))
 		if (*curp).used+rl+reserve > len((*curp).data) {
 			finalizeInterned(*curp, st)
-			*curp = newDst(streamSegs, rl+reserve, target)
 			*st = newStream()
+			// Re-encoded against a fresh table the record is not the size rl was measured from,
+			// so size the destination from the new encoding, not the one it replaces.
 			if wireBuf, err = c.encodeInterned(wireBuf[:0], ad, st.table, st.hot); err != nil {
 				abort = true
 				return nil, 0
@@ -955,8 +966,15 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 			body = target.Compress(encBuf[:0], wireBuf)
 			encBuf = body
 			rl = recordLen(len(key), len(body))
+			*curp = newDst(streamSegs, rl+reserve, target)
 		}
-		off, _ := (*curp).append(seq, noLoc, key, body)
+		off, ok := (*curp).append(seq, noLoc, key, body)
+		if !ok {
+			// Offset 0 is a real record's offset; returning it for a record that was not
+			// written would point the directory somewhere else entirely. Leave the shard alone.
+			abort = true
+			return nil, 0
+		}
 		return *curp, off
 	}
 
@@ -1122,10 +1140,10 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		// Unpublished destinations: unmap + unlink them and leave the shard uncompacted (its
 		// sources remain in place; sh.act stays as Phase 1 / concurrent writes left it).
 		for _, s := range dstSegs {
-			_ = s.reap()
+			_ = s.reap() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		}
 		for _, s := range histSegs {
-			_ = s.reap()
+			_ = s.reap() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		}
 		for _, s := range preserveSegs {
 			_ = s.reap() //nolint:errcheck // best-effort, as for the destinations above
@@ -1261,7 +1279,7 @@ func (c *Collection) compactShard(sh *shard, target Codec) {
 		// reapAndHook (not bare reap) so a sealed segment's mmap sidecar index is unmapped
 		// with its data (onReap); a no-op for segments without a sidecar. toReap holds only
 		// unpinned segments, so unmapping now is safe.
-		_ = seg.reapAndHook()
+		_ = seg.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 	}
 }
 

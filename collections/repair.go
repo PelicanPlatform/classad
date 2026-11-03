@@ -148,7 +148,8 @@ func Repair(dir string, opts RepairOptions) (*RepairReport, error) {
 	}
 	rep := &RepairReport{Dir: dir, DryRun: opts.DryRun}
 
-	for _, seg := range scan.Segments {
+	for i := range scan.Segments {
+		seg := &scan.Segments[i]
 		if seg.ColumnarUnsupported {
 			rep.Unsupported = append(rep.Unsupported, seg.Path)
 			continue
@@ -180,7 +181,7 @@ func Repair(dir string, opts RepairOptions) (*RepairReport, error) {
 // what an interrupted write looks like, the data was never committed, and Open
 // already handles it exactly right by stopping there. Rewriting would churn the file
 // for no gain.
-func segmentNeedsRepair(s FsckSegment) bool {
+func segmentNeedsRepair(s *FsckSegment) bool {
 	if s.ColumnarMismatch != "" {
 		return true // not rewritable (it is columnarized), but listed so the report names it
 	}
@@ -294,7 +295,7 @@ func repairSegment(path string, opts RepairOptions) (*RepairSegment, error) {
 
 	if err := os.Rename(tmp, path); err != nil {
 		// Put the original back rather than leaving the segment absent.
-		_ = os.Rename(quarantined, path)
+		_ = os.Rename(quarantined, path) //nolint:errcheck // best effort, as the comment above says
 		_ = os.Remove(tmp)
 		return nil, err
 	}

@@ -122,6 +122,8 @@ func (c *Collection) yieldWireRow(yield func([]byte) bool, sel *wireSubsetSelect
 //
 // Immutable once built, which is what lets the parallel scan share one across its workers. Any
 // per-scan state that has to be written belongs in the per-worker wireNarrower, not here.
+//
+//nolint:gocritic // this file is ordered as an explanation, narrowest concept last
 type wireSubsetSelector struct {
 	wantAll bool
 	redact  bool
@@ -184,7 +186,8 @@ func (sel *wireSubsetSelector) keepHashed(name []byte, h uint32, _ []byte) bool 
 		return true
 	}
 	if sel.wantAll {
-		return !(sel.redact && isPrivateNameBytes(name))
+		hidden := sel.redact && isPrivateNameBytes(name)
+		return !hidden
 	}
 	return sel.inProjection(name, h)
 }
@@ -208,7 +211,7 @@ func (sel *wireSubsetSelector) inProjection(name []byte, h uint32) bool {
 // message.PutClassAdRawBytes consumes. This is the LAST-MINUTE conversion at
 // the client edge; everything upstream of it stays in wire form. buf/offs are
 // reset and reused (pass the previous call's returns to avoid allocation).
-func RenderRawAdInline(w []byte, buf []byte, offs []int) (outBuf []byte, outOffs []int, myType, targetType string, ok bool) {
+func RenderRawAdInline(w, buf []byte, offs []int) (outBuf []byte, outOffs []int, myType, targetType string, ok bool) {
 	buf = buf[:0]
 	offs = append(offs[:0], 0)
 	good := true

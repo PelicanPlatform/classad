@@ -478,7 +478,10 @@ func TestComputedCellPurity(t *testing.T) {
 		src := "[ " + base + "Self = " + tc.expr + "; Field = " + tc.expr + " ]"
 		ad := mustAd(t, src)
 		// The record as the builder sees it: global-interned wire, sealed values sealed.
-		iw := wire.EncodeWithHotEnc(nil, ad.AST(), c.intern, nil, c.shouldEncrypt, c.sealer)
+		iw, err := wire.EncodeWithHotSealed(nil, ad.AST(), c.intern, nil, c.shouldEncrypt, c.sealer)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if err := c.SetEncryptedAttrs([]string{"Secret", "Plain"}); err != nil {
 			t.Fatal(err)
 		}

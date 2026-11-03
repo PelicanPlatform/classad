@@ -57,7 +57,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	//
 	// Dropping is possible at all because the rewrite below carries forward exactly the records
 	// these offsets name -- one excluded here is simply not in the new segment. Nothing points at
-	// it: appendRawRecord writes no chain link, and the key index is rebuilt over the new offsets.
+	// it: appendRawRecordFlags writes no chain link, and the key index is rebuilt over the new offsets.
 	if plan != nil && plan.unresolved {
 		// A delta that has to survive but whose chain will not resolve. There is nothing to write
 		// in its place, so leave the segment alone: an uncolumnarized segment costs an
@@ -139,10 +139,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		// Group-owned attributes come along too, so the builder can put them in their group's column;
 		// it leaves those out of the base cold tail itself (groupSkipSet), so nothing is stored twice.
 		only, ok := keepAttrs(iw, func(id uint32, name string, node []byte) bool {
-			if !storableInColumn(node) {
-				return false
-			}
-			return true
+			return storableInColumn(node)
 		})
 		return only, ok
 	}
@@ -262,10 +259,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		// `RequestMemory = ProcId * 512 + 7` came back as `Slack * 512 + 7`. So a record is now usually
 		// just a header and a key.
 		body, ok := stripSchemaAttrs(raw, func(id uint32, name string, node []byte) bool {
-			if !storableInColumn(node) {
-				return false
-			}
-			return true
+			return storableInColumn(node)
 		})
 		if !ok {
 			return nil, nil, nil
@@ -362,7 +356,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 		no, ok := dst.appendRawRecordFlags(src.data, r.off, r.body, flags)
 		if !ok {
 			dst.retire()
-			dst.reapAndHook()
+			dst.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 			return nil, nil, nil
 		}
 		newOffs = append(newOffs, no)
@@ -377,7 +371,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 				dst.dict.Store(&segDictHandle{data: dst.data, base: doff + recKeyOff + 4, rec: doff})
 			} else {
 				dst.retire()
-				dst.reapAndHook()
+				dst.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 				return nil, nil, nil
 			}
 		}
@@ -386,19 +380,19 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// a record to another record's columns.
 	cs.offsB = packU32s(newOffs)
 	blob = marshalColPayload(cs, func(id uint32) (string, bool) { return c.intern.Name(id) })
-	if blob == nil || len(blob) == 0 {
+	if len(blob) == 0 {
 		dst.retire()
-		dst.reapAndHook()
+		dst.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		return nil, nil, nil
 	}
 	if _, ok := dst.appendCol(blob); !ok {
 		dst.retire()
-		dst.reapAndHook()
+		dst.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		return nil, nil, nil
 	}
 	if err := dst.syncAll(); err != nil {
 		dst.retire()
-		dst.reapAndHook()
+		dst.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		return nil, nil, nil
 	}
 	// The zone map is derived from the records, and the rewritten segment holds the same records
@@ -418,7 +412,7 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	ki, kerr := parseKeyIndex(c.segKeyIndex(dst))
 	if perr != nil || !dst.columnarized() || kerr != nil {
 		dst.retire()
-		dst.reapAndHook()
+		dst.reapAndHook()    //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		return nil, nil, nil // the payload did not read back (or its key index would not parse): refuse
 	}
 	dst.keyIdx.Store(ki)

@@ -159,14 +159,12 @@ func (h *segDictHandle) buildNameCache() *[]string {
 	return &s
 }
 
-// publishSegDict scans a recovered segment for its dictionary record (an interned segment
-// carries one, appended at compaction/seal via appendDict) and, if found, publishes the
-// segment's dict handle so its records resolve segment-local ids. A segment with no dict record
-// is inline -- seg.dict stays nil. Called during Open before any body decode. The dict record
-// is a trailer, so this walks to it; the walk reads only record headers (no decompress).
-func publishSegDict(seg *segment) { publishSegDictAt(seg, 0, 0) }
-
-// publishSegDictAt is publishSegDict with a hint: the dict record's offset as recorded in the
+// publishSegDictAt scans a recovered segment for its dictionary record (an interned segment
+// carries one, appended at compaction/seal via appendDict) and, if found, publishes the segment's
+// dict handle so its records resolve segment-local ids. A segment with no dict record is inline --
+// seg.dict stays nil. Called during Open before any body decode.
+//
+// hint is the dict record's offset as recorded in the
 // segment's sidecar. The dict is a TRAILER, so the unhinted walk always traverses the whole
 // segment -- reading only headers, but touching a cache line per record, which makes recovery
 // scale with total records rather than with segment count. The writer knows the offset

@@ -18,7 +18,7 @@ func putDynAds(t *testing.T, c *Collection, n int) map[int]*classad.ClassAd {
 	src := map[int]*classad.ClassAd{}
 	for i := 0; i < n; i++ {
 		ad, err := classad.Parse(fmt.Sprintf(
-			`[ ID=%d; Owner="%s"; Arch="%s"; Memory=%d ]`,
+			`[ ID=%d; Owner=%q; Arch=%q; Memory=%d ]`,
 			i, owners[i%len(owners)], arches[i%len(arches)], ((i%16)+1)*512))
 		if err != nil {
 			t.Fatal(err)

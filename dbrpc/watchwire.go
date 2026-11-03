@@ -65,7 +65,7 @@ func (c *Client) WatchWireTable(ctx context.Context, table string, cursor []byte
 	var once sync.Once
 	stop := func() {
 		once.Do(func() {
-			_, _, _ = c.callCtx(context.Background(), func(rid uint64) []byte { return putU64(req(rid, opWatchStop), id) })
+			_, _, _ = c.callCtx(context.Background(), func(rid uint64) []byte { return putU64(req(rid, opWatchStop), id) }) //nolint:errcheck // best effort: a server that never hears the stop drops the watch when the connection goes
 		})
 	}
 	// A server too old to know the opcode rejects the request rather than streaming, so the

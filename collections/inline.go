@@ -33,7 +33,7 @@ func (c *Collection) encodeAd(ad *ast.ClassAd) ([]byte, error) {
 // encodeAdInto is encodeAd appending into dst, for a caller whose encoded bytes are transient --
 // which in Commit they are: the record is compressed out of them and they are dead on the next
 // line. Every encode allocating its own buffer made that 12% of a real queue replay's allocation.
-// A caller that RETAINS the result (Txn.putWire buffers it until the commit lands) must pass nil.
+// A caller that RETAINS the result (Txn.putWireAd buffers it until the commit lands) must pass nil.
 func (c *Collection) encodeAdInto(dst []byte, ad *ast.ClassAd) ([]byte, error) {
 	if c.inline {
 		if c.sealer != nil {
@@ -229,16 +229,6 @@ func (c *Collection) decodeNodeDict(dict *segDictHandle, node []byte) (ast.Expr,
 	return c.decodeNode(node)
 }
 
-// decodeAdDict is decodeAd (decompress + decode to a ClassAd) that resolves an interned
-// segment's ids via its dict. dict==nil => the existing decodeAd path (inline/global).
-// decodeAdAs is decodeAd for a read that may not be entitled to sealed values; see decodeWireDictAs.
-func (c *Collection) decodeAdAs(stored []byte, codec Codec, redact bool) (*classad.ClassAd, error) {
-	if !redact {
-		return c.decodeAd(stored, codec)
-	}
-	return c.decodeAdDictAs(nil, stored, codec, true)
-}
-
 // decodeAdDictAs is decodeAdDict for a read that may not be entitled to sealed values; see
 // decodeWireDictAs.
 func (c *Collection) decodeAdDictAs(dict *segDictHandle, stored []byte, codec Codec, redact bool) (*classad.ClassAd, error) {
@@ -256,6 +246,8 @@ func (c *Collection) decodeAdDictAs(dict *segDictHandle, stored []byte, codec Co
 	return classad.FromAST(a), nil
 }
 
+// decodeAdDict is decodeAd (decompress + decode to a ClassAd) that resolves an interned
+// segment's ids via its dict. dict==nil => the existing decodeAd path (inline/global).
 func (c *Collection) decodeAdDict(dict *segDictHandle, stored []byte, codec Codec) (*classad.ClassAd, error) {
 	if dict == nil {
 		return c.decodeAd(stored, codec)

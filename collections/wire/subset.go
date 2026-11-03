@@ -30,8 +30,7 @@ func AppendAdSubsetInline(dst []byte, src Ad, keep func(name, node []byte) bool,
 
 	// Reserve the header now; the entry count is back-patched as a fixed-width
 	// uvarint so entries can stream directly into dst with no second buffer.
-	dst = append(dst, magicByte, formatVer, flagInlineNames)
-	dst = append(dst, 0) // hotCount = 0
+	dst = append(dst, magicByte, formatVer, flagInlineNames, 0) // trailing 0 = hotCount
 	countAt := len(dst)
 	dst = append(dst, 0x80, 0x80, 0x80, 0x80, 0x00) // 5-byte uvarint placeholder (value patched below)
 	kept := uint64(0)
@@ -125,14 +124,13 @@ func AppendAdSubsetInlineHotFirst(dst []byte, src Ad, keep func(name, node []byt
 	}
 	entriesStart := c.pos
 
-	dst = append(dst, magicByte, formatVer, flagInlineNames)
-	dst = append(dst, 0) // hotCount = 0
+	dst = append(dst, magicByte, formatVer, flagInlineNames, 0) // trailing 0 = hotCount
 	countAt := len(dst)
 	dst = append(dst, 0x80, 0x80, 0x80, 0x80, 0x00)
 	kept := uint64(0)
 	sc.copied = sc.copied[:0]
 
-	emit := func(entryStart, nameEnd int, name, node []byte) bool {
+	emit := func(entryStart, nameEnd int, node []byte) bool {
 		if IsEncryptedNode(node) {
 			plain, opened := OpenEncryptedNode(node, open)
 			if !opened {
@@ -175,7 +173,7 @@ func AppendAdSubsetInlineHotFirst(dst []byte, src Ad, keep func(name, node []byt
 		if dup {
 			continue
 		}
-		if emit(entryStart, nameEnd, name, node) {
+		if emit(entryStart, nameEnd, node) {
 			sc.copied = append(sc.copied, entryStart)
 			kept++
 		}
@@ -213,7 +211,7 @@ func AppendAdSubsetInlineHotFirst(dst []byte, src Ad, keep func(name, node []byt
 		if keep != nil && !keep(name, node) {
 			continue
 		}
-		if emit(entryStart, nameEnd, name, node) {
+		if emit(entryStart, nameEnd, node) {
 			kept++
 		}
 	}

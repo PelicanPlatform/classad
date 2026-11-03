@@ -90,7 +90,7 @@ func TestSidecarContainerZones(t *testing.T) {
 	if !ok {
 		t.Fatal("v3 container did not parse")
 	}
-	if string(a) != string(attr) || string(k) != string(key) || string(cc) != string(col) {
+	if !bytes.Equal(a, attr) || !bytes.Equal(k, key) || !bytes.Equal(cc, col) {
 		t.Fatalf("sections mangled: attr=%q key=%q col=%q", a, k, cc)
 	}
 	got, st := parseZoneBlob(z, idOf)

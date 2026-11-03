@@ -102,7 +102,7 @@ func (c *Collection) encodeOld(text string, enc *wire.StreamEncoder, seen map[ui
 // encodeOldText parses old-ClassAd text (one ad) directly into enc, recording
 // each attribute name in seen to detect duplicates.
 func encodeOldText(text string, enc *wire.StreamEncoder, seen map[uint32]struct{}, unesc *[]byte) error {
-	for len(text) > 0 {
+	for text != "" {
 		var line string
 		if nl := strings.IndexByte(text, '\n'); nl >= 0 {
 			line, text = text[:nl], text[nl+1:]
@@ -373,5 +373,5 @@ func isBareName(name string) bool {
 			return false
 		}
 	}
-	return len(name) > 0
+	return name != ""
 }

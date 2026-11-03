@@ -177,7 +177,8 @@ func (c *Collection) runParallelWireScan(sel *wireSubsetSelector, needed int, yi
 								batch.buf = out[:start]
 							}
 						}
-						if consecFail++; consecFail >= 8 {
+						consecFail++
+						if consecFail >= 8 {
 							usePrefix = false
 						}
 					}

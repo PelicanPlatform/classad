@@ -2,9 +2,7 @@ package collections
 
 import (
 	"iter"
-	"strconv"
 
-	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
 )
@@ -138,7 +136,7 @@ func (c *Collection) decodeAdRaw(stored []byte, codec Codec, dst []byte) (exprs 
 // as trailing fields, not numbered expressions). Passing the previous ad's buf/offs
 // reuses their backing, so a streaming scan allocates no per-ad expression strings.
 // Returns ok=false for inline-name ads (no intern table).
-func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int, redact bool) (outBuf []byte, outOffs []int, myType, targetType string, ok bool) {
+func (c *Collection) appendWireAd(wireBytes, buf []byte, offs []int, redact bool) (outBuf []byte, outOffs []int, myType, targetType string, ok bool) {
 	buf = buf[:0]
 	offs = append(offs[:0], 0)
 	// ForEachNamed handles both encodings: an inline (persistent) ad yields its
@@ -194,41 +192,10 @@ func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int, reda
 	return buf, offs, myType, targetType, true
 }
 
-// appendWireValue appends a wire node's canonical ClassAd value text to dst,
-// matching ast.Expr.String(). Literals are appended directly (no intermediate
-// string allocation); computed expressions decode to an ast.Expr and render.
-// appendWireValueEnc is appendWireValue for wire that may carry sealed values; see
+// appendWireValueEnc appends a wire node's canonical ClassAd value text to dst, matching
+// ast.Expr.String(), for wire that may carry sealed values. Literals are appended directly (no
+// intermediate string allocation); computed expressions decode to an ast.Expr and render. See
 // wire.AppendNodeTextInlineOldEnc for what open/redactSealed mean.
 func appendWireValueEnc(dst, node []byte, table *wire.InternTable, open wire.Sealer, redactSealed bool) ([]byte, error) {
 	return wire.AppendNodeTextOldEnc(dst, node, table, open, redactSealed)
-}
-
-func appendWireValue(dst, node []byte, table *wire.InternTable) ([]byte, error) {
-	// String literals are the most common non-numeric attribute value; quote their
-	// bytes straight from the wire (no string copy) before the general literal path.
-	if s, ok := wire.StringLiteralValue(node); ok {
-		return ast.AppendQuoteStringOldBytes(dst, s), nil
-	}
-	if lit, ok := wire.LiteralValue(node); ok {
-		switch lit.Kind {
-		case wire.LitInt:
-			return strconv.AppendInt(dst, lit.Int, 10), nil
-		case wire.LitReal:
-			return strconv.AppendFloat(dst, lit.Real, 'g', -1, 64), nil
-		case wire.LitString:
-			return ast.AppendQuoteStringOld(dst, lit.Str), nil
-		case wire.LitBool:
-			if lit.Bool {
-				return append(dst, "true"...), nil
-			}
-			return append(dst, "false"...), nil
-		case wire.LitUndef:
-			return append(dst, "undefined"...), nil
-		case wire.LitError:
-			return append(dst, "error"...), nil
-		}
-	}
-	// Non-scalar: a list, record, or computed expression. Render it straight from
-	// the wire (AST-free) instead of decoding an ast.Expr and calling String().
-	return wire.AppendNodeTextOld(dst, node, table)
 }

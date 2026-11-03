@@ -187,7 +187,7 @@ func TestGroupedFanoutIsNotFooledByStringIds(t *testing.T) {
 	total := 0
 	seen := map[string]bool{}
 	for _, r := range rows {
-		owner := fmt.Sprint(r.Group[0])
+		owner := r.Group[0]
 		w, ok := want[owner]
 		if !ok {
 			t.Fatalf("group %q is not an owner in the data; a string id was read against the wrong table", owner)

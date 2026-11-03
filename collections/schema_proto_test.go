@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/collections/wire"
-	"github.com/klauspost/compress/zstd"
 )
 
 // Measurement harness for the per-segment schema (adschema.go), over the real OSPool slot

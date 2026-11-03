@@ -56,6 +56,8 @@ func (cn *colNative) indexOf(off uint32) (int, bool) {
 
 // colNative is a sealed segment's authoritative columnar payload, published on recovery the way a
 // segment dictionary is.
+//
+//nolint:gocritic // this file is ordered as an explanation, narrowest concept last
 type colNative struct {
 	seg *colSegment // schema + blocks + per-record arena offsets
 	// A reader holding an arena record offset finds its record index by BINARY SEARCH over the
@@ -84,7 +86,7 @@ type colNative struct {
 	localOf map[uint32]uint32
 }
 
-// publishColNative finds a segment's columnar record and parses it, as publishSegDict does for the
+// publishColNative finds a segment's columnar record and parses it, as publishSegDictAt does for the
 // dictionary. A segment without one is whole-record and reads unchanged.
 //
 // A payload that fails its checksum or does not parse marks the segment colDamaged and returns nil:
@@ -304,8 +306,8 @@ func ColNativeOffsetMismatches() int64 { return colNativeOffsetMismatches.Load()
 // waste this format removes.
 func colNativeBlobRedundant(seg *segment) bool { return seg != nil && seg.colNative.Load() != nil }
 
-func (c *Collection) recordWire(seg *segment, off uint32, buf []byte) ([]byte, error) {
-	return c.recordWireIn(seg, seg.data, off, buf)
+func (c *Collection) recordWire(seg *segment, off uint32) ([]byte, error) {
+	return c.recordWireIn(seg, seg.data, off, nil)
 }
 
 // recordWireIn is recordWire reading through a caller-supplied view of the segment's bytes.
@@ -601,7 +603,7 @@ var recBufPool = sync.Pool{New: func() any { b := make([]byte, 0, 4096); return 
 // caller is finished. Returning it here would hand the same backing array to the next concurrent
 // reader while this one still held it, which is the data race a pool is supposed to prevent.
 func getRecBuf() []byte {
-	return (*recBufPool.Get().(*[]byte))[:0]
+	return (*recBufPool.Get().(*[]byte))[:0] //nolint:errcheck // the pool's New returns exactly this type
 }
 
 // putRecBuf returns a buffer to the pool, keeping whatever capacity it grew to so the next record
@@ -700,7 +702,7 @@ type groupScopes struct {
 
 var groupScopePool = sync.Pool{New: func() any { return &groupScopes{} }}
 
-func getGroupScopes() *groupScopes { return groupScopePool.Get().(*groupScopes) }
+func getGroupScopes() *groupScopes { return groupScopePool.Get().(*groupScopes) } //nolint:errcheck // the pool's New returns exactly this type
 
 func putGroupScopes(gs *groupScopes) {
 	for _, sub := range gs.scopes {

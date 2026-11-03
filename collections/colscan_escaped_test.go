@@ -7,7 +7,7 @@ import (
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
-// TestSchemaScanEscapedField drives the escaped-value scan path (escapedNumField): most Memory
+// TestSchemaScanEscapedField drives the escaped-value scan path (escapedNumCell): most Memory
 // values fit a small int width, but a heavy tail of huge values ESCAPE it and live in the cold
 // tail. A threshold placed among the escaped values forces the scan to read those escaped values
 // (not just the hot column) -- the columnar count must equal the row truth across the boundary.

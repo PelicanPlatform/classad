@@ -111,7 +111,7 @@ func (c *Collection) Reindex() {
 		// compaction's reap, so the cost is that replaced segment files linger for the rest of this
 		// reindex; releasing them earlier would mean restructuring a loop whose body branches with
 		// continue, which is not worth doing in a correctness fix.
-		defer unpinAll(pinned)
+		defer unpinAll(pinned) //nolint:gocritic // deliberate, as the comment above says: held until Reindex returns
 		for _, t := range tgts {
 			if t.reseal {
 				c.reindexSealed(sh, t.seg, spec)
@@ -1314,15 +1314,6 @@ func (si *segIndex) coversProbe(up usableProbe) bool {
 // candidates".
 func (si *segIndex) candidateOffsets(usable []usableProbe) *roaring.Bitmap {
 	return indexCandidateOffsets(si, usable)
-}
-
-// selectivityOrder returns indices into usable ordered by ascending estimated
-// candidate count (most selective first). It is a pure ordering heuristic: the
-// AND is commutative, so this never changes the result, only the work. Ties and
-// missing stats fall back to input order for a deterministic plan.
-func (si *segIndex) selectivityOrder(usable []usableProbe) []int {
-	order, _ := indexSelectivityOrder(si, usable)
-	return order
 }
 
 // statsFor returns the segStats for a probe's attribute, or nil if that segment

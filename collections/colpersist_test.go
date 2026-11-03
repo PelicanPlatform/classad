@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -54,7 +55,7 @@ func TestColSegmentMarshalRoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if string(a) != string(b) {
+			if !bytes.Equal(a, b) {
 				t.Fatalf("%s: rec[%d] differs after marshal round-trip", codec.Name(), k)
 			}
 			// And decodes to the same attributes as the source ad.

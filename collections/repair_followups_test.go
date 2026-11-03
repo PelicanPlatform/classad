@@ -240,7 +240,7 @@ func TestRepairLeavesDamagedDictionaryAlone(t *testing.T) {
 				t.Fatal(err)
 			}
 			seg := fsckSegmentOf(t, r, target)
-			if !seg.DictDamaged || !segmentNeedsRepair(seg) {
+			if !seg.DictDamaged || !segmentNeedsRepair(&seg) {
 				t.Fatalf("fsck does not report the dictionary as damaged:\n%s", r.String())
 			}
 			if !strings.Contains(r.String(), "DICTIONARY DAMAGED") {

@@ -793,11 +793,11 @@ func New(opts Options) *Collection {
 	if segSize <= 0 {
 		segSize = defaultSegmentSize
 	}
-	var h Hasher = opts.Hasher
+	h := opts.Hasher
 	if h == nil {
 		h = fnvHasher{}
 	}
-	var codec Codec = opts.Codec
+	codec := opts.Codec
 	if codec == nil {
 		codec = identityCodec{}
 	}
@@ -1824,13 +1824,9 @@ type parentWire struct {
 	dict *segDictHandle
 }
 
-// yieldAd is the emit callback for the classic Query/Scan path: decode w to a
-// *classad.ClassAd (skipping malformed records) and yield it.
-func (c *Collection) yieldAd(yield func(*classad.ClassAd) bool) scanEmit {
-	return c.yieldAdAs(yield, false)
-}
-
-// yieldAdAs is yieldAd for a read that may not be entitled to sealed values (see QueryRedacted).
+// yieldAdAs is the emit callback for the classic Query/Scan path: decode w to a *classad.ClassAd
+// (skipping malformed records) and yield it. redact is for a read that may not be entitled to
+// sealed values (see QueryRedacted).
 func (c *Collection) yieldAdAs(yield func(*classad.ClassAd) bool, redact bool) scanEmit {
 	return func(w []byte, dict *segDictHandle) bool {
 		a, err := c.decodeWireDictAs(dict, w, redact)
@@ -1948,11 +1944,11 @@ func (c *Collection) decodeAd(stored []byte, codec Codec) (*classad.ClassAd, err
 // CollectSamples returns the decompressed wire bytes of up to max ads, for
 // training a ZSTD dictionary (see TrainDict). It samples across shards, decoding
 // each record with the codec it was stored under.
-func (c *Collection) CollectSamples(max int) [][]byte {
-	out := make([][]byte, 0, max)
+func (c *Collection) CollectSamples(limit int) [][]byte {
+	out := make([][]byte, 0, limit)
 	var buf []byte // reused decompression scratch; each sample is copied out exactly
 	for _, sh := range c.shards {
-		if len(out) >= max {
+		if len(out) >= limit {
 			break
 		}
 		s0, wins := sh.snapshot()
@@ -1971,7 +1967,7 @@ func (c *Collection) CollectSamples(max int) [][]byte {
 			cp := make([]byte, len(iw))
 			copy(cp, iw)
 			out = append(out, cp)
-			return len(out) < max
+			return len(out) < limit
 		})
 		releaseWindows(wins)
 	}

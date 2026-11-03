@@ -170,7 +170,7 @@ func TestColumnarizeRoundTrip(t *testing.T) {
 		if recIsMarker(dst.data, o) {
 			continue
 		}
-		full, err := c.recordWire(dst, o, nil)
+		full, err := c.recordWire(dst, o)
 		if err != nil {
 			t.Fatalf("record %d: %v", o, err)
 		}
@@ -258,7 +258,7 @@ func TestColumnarizeRemovesTheRowCopy(t *testing.T) {
 			remnantsWith, records)
 	}
 	// And it must still be readable, from the column.
-	full, err := c.recordWire(dst, firstDataRecord(dst), nil)
+	full, err := c.recordWire(dst, firstDataRecord(dst))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,7 +358,7 @@ func TestColumnarPayloadCorruptionFailsLoudly(t *testing.T) {
 		t.Fatal("not columnarized")
 	}
 	rec := firstDataRecord(dst)
-	if _, err := c.recordWire(dst, rec, nil); err != nil {
+	if _, err := c.recordWire(dst, rec); err != nil {
 		t.Fatalf("a healthy segment must read: %v", err)
 	}
 
@@ -402,7 +402,7 @@ func TestColumnarPayloadCorruptionFailsLoudly(t *testing.T) {
 		t.Error("the refusal was not counted")
 	}
 	// And the crucial half: reads must ERROR, not quietly return the remnant.
-	got, err := c.recordWire(dst, rec, nil)
+	got, err := c.recordWire(dst, rec)
 	if err == nil {
 		t.Fatalf("read succeeded on a damaged segment, returning %d bytes -- a short ad", len(got))
 	}
@@ -464,7 +464,7 @@ func TestColumnarizedSegmentPublishesItsOwnBlock(t *testing.T) {
 		if recIsMarker(dst.data, o) {
 			continue
 		}
-		if _, err := c.recordWire(dst, o, nil); err != nil {
+		if _, err := c.recordWire(dst, o); err != nil {
 			t.Fatalf("record %d: %v", o, err)
 		}
 		checked++

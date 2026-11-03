@@ -70,7 +70,7 @@ func TestSeekSeqMatchesWalk(t *testing.T) {
 					seq := seqOf(i)
 					top = max(top, seq)
 					if i%53 == 0 {
-						if _, ok := seg.appendMarker(seq, uint64(i)); !ok {
+						if !seg.appendMarker(seq, uint64(i)) {
 							t.Fatal("segment full")
 						}
 						continue

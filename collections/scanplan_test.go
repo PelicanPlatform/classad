@@ -28,7 +28,9 @@ const planConstructorFile = "scanplan.go"
 func TestQueryPlanHasOneConstructor(t *testing.T) {
 	t.Parallel()
 	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool {
+	// ParseDir is deprecated for not honouring build tags. That is exactly what this test
+	// wants: every non-test source file in the directory, whatever it is tagged for.
+	pkgs, err := parser.ParseDir(fset, ".", func(fi fs.FileInfo) bool { //nolint:staticcheck // see above
 		return !strings.HasSuffix(fi.Name(), "_test.go")
 	}, 0)
 	if err != nil {

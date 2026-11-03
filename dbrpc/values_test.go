@@ -227,6 +227,8 @@ func TestQueryValuesColumnShapes(t *testing.T) {
 						t.Errorf("Tags: %d exceptions over %d rows, want every cell",
 							len(tags.Exceptions), b.Rows)
 					}
+					// Every row, not just the first: an unconditional break here meant the
+					// other rows' exceptions were never looked at.
 					for _, x := range tags.Exceptions {
 						if !x.NonScalar {
 							t.Errorf("Tags exception at row %d is not flagged non-scalar, so a "+
@@ -235,7 +237,6 @@ func TestQueryValuesColumnShapes(t *testing.T) {
 						if s, _ := x.Value.StringValue(); !strings.Contains(s, "\"a\"") {
 							t.Errorf("Tags exception at row %d lost the list text: %q", x.Row, s)
 						}
-						break
 					}
 					// Absent is UNDEFINED, which is an answer and not a failure, and it stays
 					// distinguishable from a packed value.

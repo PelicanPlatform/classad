@@ -105,15 +105,6 @@ func (c *Collection) newQueryPlan(q *vm.Query, proj *projPlan, stats *ScanStats,
 	return qp
 }
 
-// at returns the plan to evaluate in window w: the folded form's where w is proven free of
-// CurrentTime, qp's own everywhere else.
-func (qp *queryPlan) at(w segWindow) *queryPlan {
-	if qp.fold != nil && w.ctFree {
-		return qp.fold
-	}
-	return qp
-}
-
 // prunesCT reports whether qp's probes were computed with CurrentTime folded to the pinned time
 // (vm.Query.ReadsCurrentTime), so they may prune only a window proven free of CurrentTime.
 func (qp *queryPlan) prunesCT() bool { return qp.q != nil && qp.q.ReadsCurrentTime() }
@@ -221,9 +212,10 @@ func (c *Collection) dnfReadPlan(plan []vm.ProbeGroup) ([][]usableProbe, bool) {
 
 // runQuery drives the per-shard scan for a planned query: a shard whose index can
 // narrow the candidates is visited through it, the rest are walked in full, and both
-// re-verify the whole predicate before emit sees a record. Returns false if the
-// consumer stopped iteration.
-func (c *Collection) runQuery(qp queryPlan, rp readPlan, emit scanEmit) bool {
+// re-verify the whole predicate before emit sees a record. It stops early when the
+// consumer stops iterating, which is the consumer's own business: no caller here has
+// anything to do with the difference.
+func (c *Collection) runQuery(qp queryPlan, rp readPlan, emit scanEmit) {
 	for _, sh := range c.shards {
 		var cont bool
 		switch {
@@ -235,15 +227,16 @@ func (c *Collection) runQuery(qp queryPlan, rp readPlan, emit scanEmit) bool {
 			cont = c.scanShard(sh, qp, emit)
 		}
 		if !cont {
-			return false
+			return
 		}
 	}
-	return true
 }
 
 // scanQuery is the whole filtered scan: plan the read, then run it. The scan paths
 // that have no special case of their own -- the projected, raw-projected and
-// wire-subset scans -- are this call plus their own emitter.
-func (c *Collection) scanQuery(qp queryPlan, emit scanEmit) bool {
-	return c.runQuery(qp, c.planReadQuery(qp), emit)
+// wire-subset scans -- are this call plus their own emitter. It returns nothing: the
+// only thing runQuery reports is whether the emitter asked to stop early, which is the
+// emitter's own business and never the caller's here.
+func (c *Collection) scanQuery(qp queryPlan, emit scanEmit) {
+	c.runQuery(qp, c.planReadQuery(qp), emit)
 }

@@ -180,7 +180,7 @@ func TestSegmentAllocFailureIsGraceful(t *testing.T) {
 			failing = true
 		}
 		key := fmt.Sprintf("k%d", i)
-		err := c.Put([]byte(key), mustAd(t, fmt.Sprintf(`[Id=%d;pad="%s"]`, i, pad(200))))
+		err := c.Put([]byte(key), mustAd(t, fmt.Sprintf(`[Id=%d;pad=%q]`, i, pad(200))))
 		if err != nil {
 			if !errors.Is(err, enospc) {
 				t.Fatalf("Put(%s) failed with %v, want the injected ENOSPC", key, err)

@@ -117,7 +117,8 @@ func TestColumnarizeSealedStopsMidPass(t *testing.T) {
 		if stopOnFirst {
 			n := 0
 			colCommitStallHook = func() {
-				if n++; n == 1 {
+				n++
+				if n == 1 {
 					c.StopMaintenance()
 				}
 			}
@@ -178,7 +179,8 @@ func TestRecolumnarizeStaleGroupsStopsMidPass(t *testing.T) {
 		if stopOnFirst {
 			n := 0
 			colCommitStallHook = func() {
-				if n++; n == 1 {
+				n++
+				if n == 1 {
 					c.StopMaintenance()
 				}
 			}

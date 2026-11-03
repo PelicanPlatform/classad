@@ -209,7 +209,7 @@ func TestTinyCacheColnativeUnchanged(t *testing.T) {
 			if recIsMarker(dst.data, o) {
 				continue
 			}
-			full, err := c.recordWire(dst, o, nil)
+			full, err := c.recordWire(dst, o)
 			if err != nil {
 				t.Fatalf("pass %d record %d: %v", pass, o, err)
 			}

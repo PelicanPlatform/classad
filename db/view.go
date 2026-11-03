@@ -425,7 +425,7 @@ func (v *View) applyUpsert(key string, ad *classad.ClassAd) error {
 		if err := v.add(newC); err != nil {
 			// Roll back the subtraction so the accumulators stay consistent, then fail.
 			if existed {
-				_ = v.add(old)
+				_ = v.add(old) //nolint:errcheck // re-adding what sub just removed: it was accepted once already
 				v.contrib[key] = old
 			}
 			return err
@@ -454,14 +454,15 @@ func (v *View) applyDelete(key string) {
 }
 
 // renderGroup syncs the backing row for groupKey: writes the rendered ad, or deletes it if
-// the group was evicted.
+// the group was evicted. The backing DB is in memory and this view is its only writer, always
+// under v.mu, so there is no optimistic conflict to lose and no I/O to fail on.
 func (v *View) renderGroup(groupKey string) {
 	g := v.groups[groupKey]
 	if g == nil {
-		_, _ = v.backing.Delete(groupKey)
+		_, _ = v.backing.Delete(groupKey) //nolint:errcheck // see renderGroup's note on the backing DB
 		return
 	}
-	_ = v.backing.Put(groupKey, v.renderGroupAd(g))
+	_ = v.backing.Put(groupKey, v.renderGroupAd(g)) //nolint:errcheck // see above
 }
 
 // renderGroupAd builds the materialized ad for a group: each group column under its alias
@@ -625,16 +626,16 @@ func renderLabel(v classad.Value) string {
 	case v.IsUndefined(), v.IsError():
 		return ""
 	case v.IsString():
-		s, _ := v.StringValue()
+		s, _ := v.StringValue() //nolint:errcheck // the case above established the type
 		return s
 	case v.IsBool():
-		b, _ := v.BoolValue()
+		b, _ := v.BoolValue() //nolint:errcheck // the case above established the type
 		return strconv.FormatBool(b)
 	case v.IsInteger():
-		i, _ := v.IntValue()
+		i, _ := v.IntValue() //nolint:errcheck // the case above established the type
 		return strconv.FormatInt(i, 10)
 	case v.IsReal():
-		r, _ := v.RealValue()
+		r, _ := v.RealValue() //nolint:errcheck // the case above established the type
 		return strconv.FormatFloat(r, 'g', -1, 64)
 	default:
 		return v.String()

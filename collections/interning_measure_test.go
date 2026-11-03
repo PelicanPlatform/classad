@@ -5,9 +5,10 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/PelicanPlatform/classad/ast"
 	"github.com/PelicanPlatform/classad/collections/wire"
-	"github.com/klauspost/compress/zstd"
 )
 
 // This measurement answers: for persistent segments, what is the size/speed tradeoff of
@@ -192,8 +193,15 @@ func TestInterningSizeTradeoffEncrypted(t *testing.T) {
 			var inlSeg, psRecs []byte
 			pt := wire.NewInternTable()
 			for _, a := range asts[lo:hi] {
-				inlSeg = wire.EncodeInlineWithHotEnc(inlSeg, a, nil, encrypt, seal)
-				psRecs = appendRec(psRecs, wire.EncodeWithHotEnc(nil, a, pt, nil, encrypt, seal))
+				var err error
+				if inlSeg, err = wire.EncodeInlineWithHotSealed(inlSeg, a, nil, encrypt, seal); err != nil {
+					t.Fatal(err)
+				}
+				rec, err := wire.EncodeWithHotSealed(nil, a, pt, nil, encrypt, seal)
+				if err != nil {
+					t.Fatal(err)
+				}
+				psRecs = appendRec(psRecs, rec)
 				for _, at := range a.Attributes {
 					if encrypt(at.Name) {
 						sealedNodes++

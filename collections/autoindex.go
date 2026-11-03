@@ -82,7 +82,7 @@ func (d *demandTracker) record(probes []vm.Probe) {
 	}
 	for _, p := range probes {
 		v, _ := d.m.LoadOrStore(strings.ToLower(p.Attr), &demandCounts{})
-		c := v.(*demandCounts)
+		c := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 		switch p.Op {
 		case "<", "<=", ">", ">=", "!<", "!<=", "!>", "!>=":
 			c.rng.Add(1) // the negated orderings are range-shaped demand too
@@ -137,7 +137,7 @@ func (d *demandTracker) recordReads(names []string) {
 		if !ok {
 			v, _ = d.m.LoadOrStore(fold, &demandCounts{})
 		}
-		v.(*demandCounts).reads.Add(1)
+		v.(*demandCounts).reads.Add(1) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 	}
 }
 
@@ -271,12 +271,12 @@ func (c *Collection) SuggestIndexes(sampleMax int) []IndexSuggestion {
 	profiles := c.profileAttrs(sampleMax)
 	var out []IndexSuggestion
 	c.demand.m.Range(func(k, v any) bool {
-		d := v.(*demandCounts)
+		d := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 		eq, rng := d.eq.Load(), d.rng.Load()
 		if eq == 0 && rng == 0 {
 			return true
 		}
-		fold := k.(string) // demand keys are already folded
+		fold := k.(string) //nolint:errcheck // demand keys are already folded
 		p := profiles[fold]
 		if p == nil || p.present == 0 {
 			return true // queried a name no sampled ad had -> nothing to index
@@ -366,7 +366,7 @@ func (c *Collection) SuggestDrops(sampleMax int) []DropSuggestion {
 		}
 		var eq, rng int64
 		if v, ok := c.demand.m.Load(fold); ok {
-			d := v.(*demandCounts)
+			d := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 			eq, rng = d.eq.Load(), d.rng.Load()
 		}
 		ds := DropSuggestion{Attr: display, Kind: kind, QueriesEq: eq, QueriesRange: rng}
@@ -589,7 +589,7 @@ func (c *Collection) budgetTrim(highFrac, lowFrac float64, slackBytes int64) []I
 	}
 	demandOf := func(attr string) int64 {
 		if v, ok := c.demand.m.Load(strings.ToLower(attr)); ok {
-			d := v.(*demandCounts)
+			d := v.(*demandCounts) //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 			return d.eq.Load() + d.rng.Load()
 		}
 		return 0
@@ -611,19 +611,6 @@ func (c *Collection) budgetTrim(highFrac, lowFrac float64, slackBytes int64) []I
 		remaining -= s.Bytes
 	}
 	return drop
-}
-
-// alreadyIndexed reports whether attr id already has a configured index.
-func (c *Collection) alreadyIndexed(id uint32) bool {
-	spec := c.spec.Load()
-	if spec == nil {
-		return false
-	}
-	if _, ok := spec.cat[id]; ok {
-		return true
-	}
-	_, ok := spec.val[id]
-	return ok
 }
 
 // alreadyIndexedName reports whether the folded attribute name is already indexed, in

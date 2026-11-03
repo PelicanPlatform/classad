@@ -323,10 +323,9 @@ func TestASmallPassDoesNotFanOut(t *testing.T) {
 	}
 }
 
-// TestSegmentPathCountersTellTheTwoPathsApart.
-//
-// The counters are what every other test and the benchmark use to assert the columnar path ran, so
-// a counter that mislabels the row fallback as columnar makes all of those guards vacuous -- they
+// TestSegmentPathCountersTellTheTwoPathsApart guards the counters that every other test and the
+// benchmark use to assert the columnar path ran, so that a counter which mislabels the row
+// fallback as columnar cannot make all of those guards vacuous -- they
 // would keep passing over a pass that never touched a column. A mutation swapping the two increments
 // survived the whole suite until this test existed.
 //

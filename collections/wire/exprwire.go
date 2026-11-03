@@ -59,7 +59,7 @@ func ParseExprToWire(input string, t *InternTable, dst []byte) ([]byte, error) {
 // parseExprToWire is ParseExprToWire with an explicit inline flag (inline-name node
 // variants, no interning), for the persistent-store encoding.
 func parseExprToWire(input string, t *InternTable, inline bool, dst []byte) ([]byte, error) {
-	w := wireParsePool.Get().(*wireParseState)
+	w := wireParsePool.Get().(*wireParseState) //nolint:errcheck // the pool's New returns exactly this type
 	w.lex.Reset(input)
 	p := &w.p
 	p.lex = w.lex
@@ -179,8 +179,8 @@ func (p *exprParser) parseExpr(minBP int) error {
 		if bp <= minBP {
 			break
 		}
-		switch {
-		case k == '?': // ternary cond ? true : false (right-assoc)
+		switch k {
+		case '?': // ternary cond ? true : false (right-assoc)
 			p.advance()
 			if err := p.parseExpr(0); err != nil { // true branch, up to ':'
 				return err
@@ -193,13 +193,13 @@ func (p *exprParser) parseExpr(minBP int) error {
 				return err
 			}
 			p.em.WrapCond(mark)
-		case k == parser.ELVIS:
+		case parser.ELVIS:
 			p.advance()
 			if err := p.parseExpr(bp); err != nil {
 				return err
 			}
 			p.em.WrapElvis(mark)
-		case k == '.': // select record.attr
+		case '.': // select record.attr
 			p.advance()
 			if p.cur.Kind != parser.IDENTIFIER {
 				return ErrUnsupported
@@ -207,7 +207,7 @@ func (p *exprParser) parseExpr(minBP int) error {
 			attr := p.cur.Str
 			p.advance()
 			p.em.WrapSelect(mark, attr)
-		case k == '[': // subscript container[index]
+		case '[': // subscript container[index]
 			p.advance()
 			if err := p.parseExpr(0); err != nil {
 				return err

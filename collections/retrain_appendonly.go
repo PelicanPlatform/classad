@@ -56,12 +56,12 @@ func (c *Collection) resealAppendOnly(targetCodec Codec) {
 				// Slot moved under us: drop the freshly built segment's file rather than
 				// leak it.
 				newseg.retire()
-				newseg.reapAndHook()
+				newseg.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 			}
 			sh.mu.Unlock()
 		}
 		for _, seg := range toReap {
-			seg.reapAndHook() // munmap + unlink the old segment file, off-lock
+			seg.reapAndHook() //nolint:errcheck // munmap + unlink the old segment file, off-lock
 		}
 	}
 	// Rebuild the per-segment indexes (and seal sidecars) over the fresh segments, and
@@ -148,12 +148,12 @@ func (c *Collection) internSealedLocked() {
 				}
 			} else {
 				newseg.retire()
-				newseg.reapAndHook() // slot moved under us: drop the fresh file, don't leak it
+				newseg.reapAndHook() //nolint:errcheck // slot moved under us: drop the fresh file, don't leak it
 			}
 			sh.mu.Unlock()
 		}
 		for _, seg := range toReap {
-			seg.reapAndHook() // munmap + unlink the old inline file, off-lock
+			seg.reapAndHook() //nolint:errcheck // munmap + unlink the old inline file, off-lock
 		}
 	}
 	if swapped {
@@ -359,7 +359,7 @@ func (c *Collection) resealSegmentsAs(sh *shard, srcs []*segment, targetCodec Co
 	// Pass 2: append the staged records in order.
 	for _, e := range entries {
 		if e.marker {
-			if _, ok := newseg.appendMarker(e.seq, e.millis); !ok {
+			if !newseg.appendMarker(e.seq, e.millis) {
 				return nil
 			}
 			continue

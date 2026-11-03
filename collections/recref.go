@@ -451,7 +451,8 @@ func segStoredOrReassembledWhy(c *Collection, seg *segment, off uint32) ([]byte,
 		noteReadSkip(errSegDictUnusable)
 		return nil, nil, false, failDecode
 	}
-	if !(seg.columnarized() || seg.colDamaged.Load() || recIsStripped(seg.data, off)) {
+	rewritten := seg.columnarized() || seg.colDamaged.Load() || recIsStripped(seg.data, off)
+	if !rewritten {
 		return recAd(seg.data, off), seg.codec, true, failNone
 	}
 	full, err := c.recordWireIn(seg, seg.data, off, nil)

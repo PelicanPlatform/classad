@@ -218,11 +218,6 @@ func (c *Client) streamEnd(p *pending) error {
 	return p.broken
 }
 
-// send assigns a request id, registers the pending call, and writes the request.
-func (c *Client) send(build func(reqID uint64) []byte, stream bool) (chan []byte, error) {
-	return c.sendID(c.nextReq.Add(1), build, stream)
-}
-
 func (c *Client) sendID(id uint64, build func(reqID uint64) []byte, stream bool) (chan []byte, error) {
 	ch, _, err := c.sendIDTimed(id, build, stream)
 	return ch, err
@@ -910,7 +905,7 @@ func (c *Client) WatchTable(ctx context.Context, table string, cursor []byte) (<
 	var once sync.Once
 	stop := func() {
 		once.Do(func() {
-			_, _, _ = c.callCtx(context.Background(), func(rid uint64) []byte { return putU64(req(rid, opWatchStop), id) })
+			_, _, _ = c.callCtx(context.Background(), func(rid uint64) []byte { return putU64(req(rid, opWatchStop), id) }) //nolint:errcheck // best effort: a server that never hears the stop drops the watch when the connection goes
 		})
 	}
 	events := make(chan WatchEvent, 64)

@@ -39,3 +39,19 @@ func TestChooseBaseCodec(t *testing.T) {
 		t.Errorf("legacy dir basecodec file = %q, want identity", b)
 	}
 }
+
+// TestChooseBaseCodecIdentityWhenChoiceCannotBePersisted: the marker file is the only record of
+// which codec id-0 records were written under, and a reopen that does not find it falls back to
+// identity. A store that cannot write the marker must therefore not be compressed, or it comes
+// back as a store that cannot decode its own records.
+func TestChooseBaseCodecIdentityWhenChoiceCannotBePersisted(t *testing.T) {
+	dir := t.TempDir()
+	// A directory squatting on the marker's name makes both the read and the write fail, on
+	// every platform and whatever the process's privileges are.
+	if err := os.Mkdir(filepath.Join(dir, baseCodecFile), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if c := chooseBaseCodec(dir); c != nil {
+		t.Fatalf("chose %q for a store whose codec choice could not be recorded; a reopen finds no marker and decodes those records as identity", c.Name())
+	}
+}

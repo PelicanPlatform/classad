@@ -8,9 +8,10 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/klauspost/compress/zstd"
+
 	"github.com/PelicanPlatform/classad/classad"
 	"github.com/PelicanPlatform/classad/collections/crypt"
-	"github.com/klauspost/compress/zstd"
 )
 
 // Snapshot / restore: a self-contained, compressed, optionally-encrypted backup of the
@@ -30,8 +31,8 @@ const (
 
 // package-level zstd codecs; EncodeAll/DecodeAll are safe for concurrent use.
 var (
-	snapZW, _ = zstd.NewWriter(nil)
-	snapZR, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0))
+	snapZW, _ = zstd.NewWriter(nil)                                 //nolint:errcheck // no option here can be rejected
+	snapZR, _ = zstd.NewReader(nil, zstd.WithDecoderConcurrency(0)) //nolint:errcheck // ditto
 )
 
 // Snapshot writes a consistent backup of every ad to w. It holds the DB-wide lock shared,
@@ -140,7 +141,8 @@ func (db *DB) snapshotTo(bw *bufio.Writer) ([]byte, error) {
 	appendAd := func(key string, ad *classad.ClassAd) bool {
 		batch = appendChunk(batch, []byte(key))
 		batch = appendChunk(batch, []byte(ad.MarshalOldWithPrivate()))
-		if nInBatch++; nInBatch >= snapBatchAds {
+		nInBatch++
+		if nInBatch >= snapBatchAds {
 			ferr = flush()
 			return ferr == nil
 		}

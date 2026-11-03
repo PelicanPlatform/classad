@@ -101,7 +101,7 @@ func readPersistedTimeTravel(dir string) *collections.TimeTravelOptions {
 // AddHotAttrs passes, so the name someone asked for and the save that records it cannot be
 // split by another saver. Every other caller passes none.
 func (db *DB) saveIndexConfig(pinHot ...string) {
-	_ = db.cfg.update(func(cfg *persistedIndexConfig) {
+	_ = db.cfg.update(func(cfg *persistedIndexConfig) { //nolint:errcheck // best-effort: the change stays live for this run, unpersisted
 		*cfg = db.deriveIndexConfig(mergeNames(cfg.Hot, pinHot))
 	})
 }
@@ -225,7 +225,7 @@ func (db *DB) loadIndexConfig() {
 	// ignored if encryption is disabled on this open (no data key) or an attribute has
 	// since become indexed. Private attributes are always encrypted regardless.
 	if len(cfg.Encrypted) > 0 {
-		_ = db.c.SetEncryptedAttrs(cfg.Encrypted)
+		_ = db.c.SetEncryptedAttrs(cfg.Encrypted) //nolint:errcheck // best-effort, as the comment above says
 	}
 }
 

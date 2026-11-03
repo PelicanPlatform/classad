@@ -330,13 +330,13 @@ func BenchmarkNumStats(b *testing.B) {
 			b.Fatal(err)
 		}
 		for i := 0; i < b.N; i++ {
-			max := math.Inf(-1)
+			hi := math.Inf(-1)
 			for ad := range c.Query(all) {
-				if v, ok := ad.EvaluateAttrNumber("ProcId"); ok && v > max {
-					max = v
+				if v, ok := ad.EvaluateAttrNumber("ProcId"); ok && v > hi {
+					hi = v
 				}
 			}
-			if math.IsInf(max, -1) {
+			if math.IsInf(hi, -1) {
 				b.Fatal("no values")
 			}
 		}

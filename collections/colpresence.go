@@ -75,7 +75,7 @@ func (c *Collection) presencePredOnField(q *vm.Query, s *adSchema) (presencePred
 //
 // ok=false means the node is an expression: it cannot be judged without evaluating it against the
 // rest of the ad, so the caller must decline rather than guess.
-func nodeIsUndefined(node []byte) (undefined bool, ok bool) {
+func nodeIsUndefined(node []byte) (undefined, ok bool) {
 	lit, isLit := scalarValue(node)
 	if !isLit {
 		return false, false // an expression

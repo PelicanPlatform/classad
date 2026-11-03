@@ -1122,7 +1122,7 @@ func (b *columnarBlock) heldValueNode(k int, fieldID uint32, bc *blockCache) ([]
 	if gk >= cs.offsLen() || seg.dictUnusable.Load() {
 		return nil, false
 	}
-	ww, err := c.recordWire(seg, cs.offAt(gk), nil)
+	ww, err := c.recordWire(seg, cs.offAt(gk))
 	if err != nil {
 		return nil, false
 	}

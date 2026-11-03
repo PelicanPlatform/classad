@@ -1,7 +1,6 @@
 package vm
 
 import (
-	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -410,7 +409,7 @@ func TestVecBatchInvariantToSize(t *testing.T) {
 	}
 	var want []string
 	for i := range big.recs {
-		want = append(want, fmt.Sprint(whole.value(i)))
+		want = append(want, whole.value(i).String())
 	}
 	for _, batch := range []int{1, 2, 3, 5, 7} {
 		var got []string
@@ -425,7 +424,7 @@ func TestVecBatchInvariantToSize(t *testing.T) {
 				t.Fatalf("batch %d declined", batch)
 			}
 			for i := 0; i < end-start; i++ {
-				got = append(got, fmt.Sprint(v.value(i)))
+				got = append(got, v.value(i).String())
 			}
 		}
 		for i := range want {

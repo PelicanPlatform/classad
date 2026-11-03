@@ -15,7 +15,7 @@ package collections
 // IsSystemKey reports whether key is a reserved internal system key (begins with a
 // NUL byte). Exported so callers (and the db/dbrpc layers) can classify a key
 // without duplicating the sentinel.
-func IsSystemKey(key string) bool { return len(key) > 0 && key[0] == 0 }
+func IsSystemKey(key string) bool { return key != "" && key[0] == 0 }
 
 // SystemKey builds a system key from a name by prefixing the reserved NUL byte. The
 // name is otherwise opaque; callers namespace it however they like.

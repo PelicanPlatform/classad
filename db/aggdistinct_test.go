@@ -32,7 +32,7 @@ func distinctArchive(t *testing.T) *ArchiveTable {
 	}
 	for i, r := range rows {
 		if err := a.AppendOld(fmt.Sprintf(
-			"Owner = \"%s\"\nHost = \"%s\"\nJobStatus = %d\nID = %d\n",
+			"Owner = %q\nHost = %q\nJobStatus = %d\nID = %d\n",
 			r.owner, r.host, r.status, i)); err != nil {
 			t.Fatal(err)
 		}

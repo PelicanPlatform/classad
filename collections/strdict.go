@@ -91,15 +91,11 @@ type strDictField struct {
 	noEscape bool
 }
 
-// buildStrDicts decides which string fields of this block to dictionary-encode and builds them.
+// buildStrDictsComputed decides which string fields of this block to dictionary-encode and builds
+// them, returning the per-field locations plus the two raw regions, uncompressed; the caller
+// compresses them with the region codec like every other stream.
 //
-// Returns the per-field locations plus the two raw regions, uncompressed; the caller compresses them with
-// the region codec like every other stream.
-func buildStrDicts(s *adSchema, recs [][]byte, n int) (map[int]strDictField, []byte, []byte) {
-	return buildStrDictsComputed(s, recs, n, nil)
-}
-
-// buildStrDictsComputed is buildStrDicts where comp names, per string field, the values its computed
+// comp names, per string field, the values its computed
 // cells take (see colcomputed.go). Such a field always gets a dictionary, whatever its cardinality: the
 // dictionary is the only place a computed string can be kept, since readers walking the positional
 // region skip escaped cells. Its entries include the computed values; its codes are assigned for them

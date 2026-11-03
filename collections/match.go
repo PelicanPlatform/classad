@@ -513,7 +513,7 @@ func (c *Collection) taskMatches(job *classad.ClassAd, jp *jobPlan, deferMat boo
 	var wg workerGroup
 	for i := 0; i < W; i++ {
 		wg.Go(func() {
-			jobCopy, _ := classad.Parse(jobText) // validated above
+			jobCopy, _ := classad.Parse(jobText) //nolint:errcheck // validated above
 			mw := newMatchWorker(jobCopy, c, jp, deferMat)
 			var dbuf []byte
 			for {
@@ -573,7 +573,7 @@ func (c *Collection) matchCandidate(w []byte, mw *matchWorker, out *[]rankedMatc
 		mw.ms.fellBack = false
 		v := mw.jm.EvalResolved(mw.ms.resolve)
 		if !mw.ms.fellBack && v.IsBool() {
-			b, _ := v.BoolValue()
+			b, _ := v.BoolValue() //nolint:errcheck // guarded by the type check above
 			if !b {
 				return // job definitely rejects this slot: skip the decode
 			}

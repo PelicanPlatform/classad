@@ -27,19 +27,6 @@ const (
 	stE = mError
 )
 
-func setPlaneState(v *Vec, i, st int) {
-	switch st {
-	case stF:
-		v.SetBool(i, false)
-	case stT:
-		v.SetBool(i, true)
-	case stU:
-		v.St[i] = VsUndef
-	case stE:
-		v.St[i] = VsError
-	}
-}
-
 func maskName(st int) string {
 	return map[int]string{stF: "FALSE", stT: "TRUE", stU: "UNDEF", stE: "ERROR"}[st]
 }

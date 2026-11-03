@@ -221,7 +221,7 @@ func topKResult(seq iter.Seq[[]classad.Value], orderIdx int, desc bool, k int, t
 	// back-to-front to get best-first (the ORDER BY order).
 	out := make([][]classad.Value, h.Len())
 	for i := len(out) - 1; i >= 0; i-- {
-		row := heap.Pop(h).(krow).row
+		row := heap.Pop(h).(krow).row //nolint:errcheck // container/heap hands back what Push gave it
 		if trimOrder {
 			row = row[:len(row)-1]
 		}
@@ -251,7 +251,7 @@ func (h *valHeap) Less(i, j int) bool {
 	return h.rows[i].v > h.rows[j].v // max at root
 }
 func (h *valHeap) Swap(i, j int) { h.rows[i], h.rows[j] = h.rows[j], h.rows[i] }
-func (h *valHeap) Push(x any)    { h.rows = append(h.rows, x.(krow)) }
+func (h *valHeap) Push(x any)    { h.rows = append(h.rows, x.(krow)) } //nolint:errcheck // only this file pushes, and only krow
 func (h *valHeap) Pop() any      { n := len(h.rows); x := h.rows[n-1]; h.rows = h.rows[:n-1]; return x }
 func (h *valHeap) better(v, worst float64) bool {
 	if h.desc {

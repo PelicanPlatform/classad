@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -163,7 +164,7 @@ func TestHotPrefixDecodable(t *testing.T) {
 				if !gok {
 					t.Fatalf("subset not servable from a %dB prefix (hot region not front-loaded?)", prefix)
 				}
-				if string(got) != string(want) {
+				if !bytes.Equal(got, want) {
 					t.Fatal("prefix-served subset differs from full-record subset")
 				}
 			}

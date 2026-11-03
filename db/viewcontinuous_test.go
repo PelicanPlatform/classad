@@ -189,15 +189,15 @@ func TestContinuousAggregateRetentionRotation(t *testing.T) {
 	seal(v, newest+width+100000)
 
 	times := map[int64]int{}
-	var min, max int64 = 1 << 62, -1
+	var lo, hi int64 = 1 << 62, -1
 	for _, ad := range archiveAds(t, v) {
 		ts, _ := ad.EvaluateAttrInt("time")
 		times[ts]++
-		if ts < min {
-			min = ts
+		if ts < lo {
+			lo = ts
 		}
-		if ts > max {
-			max = ts
+		if ts > hi {
+			hi = ts
 		}
 	}
 	if len(times) >= K {
@@ -209,10 +209,10 @@ func TestContinuousAggregateRetentionRotation(t *testing.T) {
 	if times[newest] != 1 {
 		t.Errorf("newest bucket %d should be retained (in the active segment)", newest)
 	}
-	if min <= oldest {
-		t.Errorf("min retained time = %d, want > oldest %d (old segment dropped)", min, oldest)
+	if lo <= oldest {
+		t.Errorf("min retained time = %d, want > oldest %d (old segment dropped)", lo, oldest)
 	}
-	if max != newest {
-		t.Errorf("max retained time = %d, want newest %d", max, newest)
+	if hi != newest {
+		t.Errorf("max retained time = %d, want newest %d", hi, newest)
 	}
 }

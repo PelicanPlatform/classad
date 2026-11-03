@@ -125,7 +125,7 @@ func benchmarkRLockOnly(b *testing.B, fanIn int) {
 		for pb.Next() {
 			sh := c.shards[i%fanIn]
 			sh.mu.RLock()
-			sh.mu.RUnlock()
+			sh.mu.RUnlock() //nolint:staticcheck,gocritic // an empty critical section, unlocked at once: the lock round trip IS what this benchmark measures
 			i++
 		}
 	})

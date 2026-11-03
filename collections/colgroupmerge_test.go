@@ -27,9 +27,8 @@ func parGroupFixture(tb testing.TB, n int) *Collection {
 	return c
 }
 
-// TestOneDecliningWindowDeclinesTheWholeGroupedFanout.
-//
-// A worker that finds a window the pass cannot read must abort the WHOLE pass. If it merely stops,
+// TestOneDecliningWindowDeclinesTheWholeGroupedFanout: a worker that finds a window the pass
+// cannot read must abort the WHOLE pass. If it merely stops,
 // the other workers' group maps are intact and get folded and returned -- a GROUP BY over a SUBSET
 // of the records, with every group label right and every count plausible. There is nothing about
 // the shape of that answer to assert against, which is why it needs a test of its own: a mutation
@@ -39,8 +38,10 @@ func parGroupFixture(tb testing.TB, n int) *Collection {
 // on an expression-valued cell, which a fixture can store; the grouped pass has a scoped tier that
 // EVALUATES such a cell and answers correctly, so whether a given run declines is a property of
 // which tier took the block -- measured at 10 declines in 12 runs over an identical fixture. A test
-// built on that premise fails one run in six by reporting a correct answer. What is under test is
-// the fan-out's handling of a decline, not the storage condition that provokes one.
+// built on that premise fails one run in six by reporting a correct answer.
+//
+// TestOneDecliningWindowDeclinesTheWholeGroupedFanout therefore tests the fan-out's handling of a
+// decline, not the storage condition that provokes one.
 func TestOneDecliningWindowDeclinesTheWholeGroupedFanout(t *testing.T) {
 	c := parGroupFixture(t, 20000)
 

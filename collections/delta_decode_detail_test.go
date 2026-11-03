@@ -99,7 +99,8 @@ func TestBaseVersusPatchDecodeFailure(t *testing.T) {
 			before := UnreadableBaseReasons()[tc.reason]
 			n := 0
 			deltaDecodeFailHook = func() error {
-				if n++; n == tc.failOn {
+				n++
+				if n == tc.failOn {
 					return errors.New("wire: synthetic decode failure")
 				}
 				return nil
