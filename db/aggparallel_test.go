@@ -264,102 +264,13 @@ func TestUserAggregatePanicOnAWorkerFailsTheQuery(t *testing.T) {
 	}
 }
 
-// TestADecliningWindowDeclinesTheWholeFanout is the highest-stakes test here.
-//
-// A worker that finds a window the pass cannot read must abort the WHOLE pass, not drop that window
-// and let the others answer. Dropping it would produce a sum over a subset of the records and return
-// it as the sum over all of them -- a wrong answer with nothing about it that looks wrong, which is
-// the failure mode every rung of this ladder is built to avoid. The fold must also not run, so a
-// caller cannot read a partial accumulator by mistake.
-//
-// An expression-valued cell in the aggregated column is the decline that is reachable from data: the
-// column has no numeric reading of it at all.
-func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
-	const n = 20000
-	d, err := OpenConfig(Config{SegmentSize: 1 << 16, QueryParallelism: 0, AggMinBytes: testAggGate})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer d.Close()
-	tx := d.Begin()
-	for i := 0; i < n; i++ {
-		ad := classad.New()
-		ad.InsertAttr("JobStatus", int64(i%5))
-		if i == n-1 {
-			// The LAST record, so a pass that declines only after reading almost everything is
-			// the case under test -- the partial accumulator is at its most complete and most
-			// plausible exactly here.
-			ad.InsertExpr("Cpus", mustExpr(t, "JobStatus + 1"))
-		} else {
-			ad.InsertAttr("Cpus", int64(i%64))
-		}
-		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
-		if i%20000 == 19999 {
-			if err := tx.Commit(); err != nil {
-				t.Fatal(err)
-			}
-			tx = d.Begin()
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
-	}
-	if !d.EnableSchemaScan(4000, 8) {
-		t.Skip("no sealed segments to accelerate")
-	}
-
-	var merges atomic.Int64
-	var news atomic.Int64
-	name := registerOnce(t, "par_decline_col", parSum{news: &news, merges: &merges})
-
-	for _, c := range []struct {
-		what string
-		aggs []AggSpec
-		rung string
-	}{
-		{"built-in", []AggSpec{{Func: AggSum, Arg: "Cpus"}}, "columnar-aggregate"},
-		{"user-defined", []AggSpec{{Func: AggUser, UserFunc: name, Arg: "Cpus"}}, "columnar-user-aggregate"},
-	} {
-		t.Run(c.what, func(t *testing.T) {
-			merges.Store(0)
-			var rows []AggRow
-			var ok bool
-			var err error
-			if !fannedOut(t, func() {
-				rows, ok, err = d.aggLadderAnswer(t, c.rung, AggRequest{Constraint: "true", Aggs: c.aggs})
-			}) {
-				t.Fatal("the pass never fanned out, so this tests the serial decline, not the fan-out")
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if ok {
-				t.Fatalf("the rung answered %v over a column it cannot read; that answer covers only "+
-					"the records read before the pass gave up", rows)
-			}
-			if rows != nil {
-				t.Fatalf("a declining rung must return no rows, got %v", rows)
-			}
-			if got := merges.Load(); got != 0 {
-				t.Fatalf("the fold ran %d time(s) on a pass that declined", got)
-			}
-		})
-	}
-
-	// And the query as a whole still gets the right answer, from the rung below.
-	var want int64
-	for i := 0; i < n-1; i++ {
-		want += int64(i % 64)
-	}
-	want += int64((n-1)%5) + 1 // the expression record, evaluated
-	rows, err := d.AggregateColsStats("true", nil, []AggSpec{{Func: AggSum, Arg: "Cpus"}}, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 1 || rows[0].Values[0] != fmt.Sprint(want) {
-		t.Fatalf("after the decline the scan should answer %d, got %v", want, rows)
-	}
-}
+// The test that a declining worker declines the WHOLE pass lives in collections, not here: see
+// TestOneDecliningWindowDeclinesTheWholeValueFanout and TestADecliningValuePassNeverFoldsItsSinks.
+// It was written here, against an expression-valued cell the aggregated column had no numeric
+// reading of, until a computed cell's value moved into the column and that fixture started getting
+// a correct answer instead of a decline. The decline now has no provocation reachable from data, so
+// the tests inject it -- which needs the storage layer's own hook, and a caller's fold is visible
+// there too.
 
 // TestASmallPassDoesNotFanOut pins the gate from the other side.
 //
