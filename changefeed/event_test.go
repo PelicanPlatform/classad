@@ -25,12 +25,12 @@ func TestEventCodecRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	var buf bytes.Buffer
-	if err := WriteEvent(&buf, ev); err != nil {
-		t.Fatal(err)
+	if werr := WriteEvent(&buf, ev); werr != nil {
+		t.Fatal(werr)
 	}
 	var got Event
-	if err := DecodeEvents(&buf, func(e Event) bool { got = e; return false }); err != nil {
-		t.Fatal(err)
+	if derr := DecodeEvents(&buf, func(e Event) bool { got = e; return false }); derr != nil {
+		t.Fatal(derr)
 	}
 	out, err := ToChange(got)
 	if err != nil {
