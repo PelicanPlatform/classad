@@ -1835,13 +1835,47 @@ needs it.
    mostly form selection, since the load cost this item attacks is near zero on a raw numeric column
    and real only on a string one.
 
-   One concrete thing to build here, which arrived as a request from outside: **a `Vec` has nowhere
+   One concrete thing was proposed here, and arrived as a request from outside: **a `Vec` has nowhere
    to record that its column is uniformly typed**, and the storage layer already knows. `loadNum`
    writes one declared state across an escape-free column, and the `Raw` form carries no per-element
-   state at all. A consumer that could be told "every element of this column is an integer" rather
-   than having to scan for it gets the fact for free; today it has to rediscover it. The flag belongs
-   with form selection because it *is* a form distinction, and the rule that goes with it is the
-   ordinary one: any kernel that writes per-element states clears it.
+   state at all. A consumer told "every element of this column is an integer" would not have to
+   rediscover it. The rule that goes with it is the ordinary one: any kernel that writes per-element
+   states clears the flag.
+
+   **Spiked, and NOT recommended. Two findings, and the second is the reason.**
+
+   The place it would pay is real. `compareVecConst` serves `column OP literal`, the commonest shape
+   a constraint has, and it loads `St[i]` and runs a switch chain PER ELEMENT. And it is not a
+   corner: `RawColumnUseful` is `simdSupportsWidth`, which is false in any build without
+   `GOEXPERIMENT=simd`, so the ordinary build never takes the `Raw` path and every numeric column
+   arrives through the state-filling one.
+
+   **The invariant is harder to hold than "clear it in the kernels" suggests, and it leaked within
+   four test shapes.** A spike that set the flag in `loadNum` and cleared it in every kernel that
+   writes `St` still returned a wrong answer -- 19206 against a true 18642 on an arithmetic chain.
+   The audit that found it reported a vector tagged from an eight-record block being compared at
+   twenty-four elements: vectors are pooled and reused across blocks, so a scalar field survives
+   where the slice contents are replaced. Three separate paths have to agree for the flag to be
+   true, and one of them cannot be fixed where you would look for it -- **`SetInt` and `SetReal`
+   have VALUE receivers.** They mutate through the aliased slices, so a struct field assigned inside
+   them is written to a copy and lost. Any such flag must therefore be maintained at kernel
+   granularity rather than by the setters, which is also where it belongs for cost, but it means the
+   obvious place to put the discipline is the one place it cannot go.
+
+   **And the win does not pay for that.** The invariant-free alternative is to decide uniformity per
+   batch -- one pass over the state bytes before the kernel runs -- which is always correct and
+   needs no flag at all. Measured against the unmodified executor over the OSPool sample, with the
+   arms interleaved and eight rounds each, the two orders disagree in SIGN: 0.98x on the minimum and
+   1.07x on the median. The effect is below the noise floor of the machine available, and it cannot
+   be large in principle, because the batch is about sixteen records -- so the per-element switch
+   that the flag removes and the scan that the alternative adds are both tiny, and the flag's
+   advantage over the scan is smaller still.
+
+   **This is the third item in the same family to fail for the same reason**, after tiling (§6.8
+   item 10) and the deferred-load ranking (item 9): an optimization justified by removing
+   per-element work, where the batch is already too small for per-element work to be what costs.
+   Worth stating as a rule for this list -- at a sixteen-record block, an optimization has to remove
+   a PASS or a LOAD, not a branch.
 6. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
    blocks the database use, and `for` over a *per-record* list stays declined (§2.3) until open
    question 4 gets its density argument.
