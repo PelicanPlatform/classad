@@ -100,6 +100,7 @@ type numCol struct {
 	width    int
 	unsigned bool
 	isReal   bool
+	computed []byte // the field's computed bitmap in this block (colcomputed.go), nil for none
 }
 
 // newNumCol resolves a column for repeated reads. ok=false when the field is not numeric here, or its
@@ -111,7 +112,7 @@ func newNumCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCache)
 	f := blk.schema.fields[fieldIdx]
 	c := numCol{
 		blk: blk, fieldIdx: fieldIdx, fieldID: fieldID, escBytes: blk.schema.escBytes,
-		width: f.width, unsigned: f.unsigned, isReal: f.kind == akReal,
+		width: f.width, unsigned: f.unsigned, isReal: f.kind == akReal, computed: blk.computedBits(fieldIdx),
 	}
 	// Hot and cold numerics are both columnar, so resolving a column is picking a buffer and an offset;
 	// the per-record read below no longer branches on which it was.
@@ -142,7 +143,7 @@ func (c *numCol) at(k int, bc *blockCache) (colVal, bool) {
 // this and give up on cellExpr: skipping an expression as if it were missing is a wrong answer.
 func (c *numCol) cell(k int, bc *blockCache) (colVal, numCell) {
 	base := k * c.blk.bitsStride
-	if testBit(c.blk.bits[base:base+c.escBytes], c.fieldIdx) {
+	if testBit(c.blk.bits[base:base+c.escBytes], c.fieldIdx) && (c.computed == nil || !testBit(c.computed, k)) {
 		return c.blk.escapedNumCell(k, c.fieldID, bc)
 	}
 	raw := readIntLE(c.region[c.start+k*c.width:], c.width, c.unsigned)

@@ -749,7 +749,7 @@ func (c *Collection) deriveSchemaFrom(samples [][]byte, hotTopN int) (*adSchema,
 	// forces the block's cold-stream decompression + a cold-tail walk, so a hot field wants a
 	// width that covers essentially all its values. Cold fields keep the tight base width. See
 	// refitHotIntWidths.
-	s, hot = refitHotIntWidths(s, samples, hot, hotIntFit)
+	s, hot = refitHotIntWidthsComputed(s, samples, hot, hotIntFit, opts.Computed)
 	return s, hot, reqSkipped, true
 }
 
@@ -765,6 +765,12 @@ const hotIntFit = 0.999
 // schema; cold fields and non-int hot fields are untouched. Returns the re-fitted schema and the
 // hot field indices remapped into its (re-sorted) layout. A no-op when no hot int field exists.
 func refitHotIntWidths(s *adSchema, samples [][]byte, hot []int, hotFit float64) (*adSchema, []int) {
+	return refitHotIntWidthsComputed(s, samples, hot, hotFit, nil)
+}
+
+// refitHotIntWidthsComputed is refitHotIntWidths counting each expression-valued cell as the value it
+// is computed to (computed, as adSchemaOpts.Computed), since that value is stored in the slot too.
+func refitHotIntWidthsComputed(s *adSchema, samples [][]byte, hot []int, hotFit float64, computed func(iw []byte, id uint32) (adKind, wire.Literal)) (*adSchema, []int) {
 	hotByID := make(map[uint32]bool, len(hot)) // all hot fields (int+real), for index remap
 	hotIntIDs := map[uint32]bool{}             // hot int fields, for width re-fit
 	for _, i := range hot {
@@ -780,7 +786,11 @@ func refitHotIntWidths(s *adSchema, samples [][]byte, hot []int, hotFit float64)
 	for _, w := range samples {
 		wire.Ad(w).ForEach(func(id uint32, node []byte) bool {
 			if hotIntIDs[id] {
-				if k, lit := sampledKind(node); k == akInt {
+				k, lit := sampledKind(node)
+				if k == akNone && computed != nil && !storableInColumn(node) {
+					k, lit = computed(w, id)
+				}
+				if k == akInt {
 					vals[id] = append(vals[id], lit.Int)
 				}
 			}

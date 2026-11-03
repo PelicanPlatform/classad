@@ -96,6 +96,15 @@ type strDictField struct {
 // Returns the per-field locations plus the two raw regions, uncompressed; the caller compresses them with
 // the region codec like every other stream.
 func buildStrDicts(s *adSchema, recs [][]byte, n int) (map[int]strDictField, []byte, []byte) {
+	return buildStrDictsComputed(s, recs, n, nil)
+}
+
+// buildStrDictsComputed is buildStrDicts where comp names, per string field, the values its computed
+// cells take (see colcomputed.go). Such a field always gets a dictionary, whatever its cardinality: the
+// dictionary is the only place a computed string can be kept, since readers walking the positional
+// region skip escaped cells. Its entries include the computed values; its codes are assigned for them
+// too, by the caller (computedBuild.apply). noEscape keeps its meaning, literals only.
+func buildStrDictsComputed(s *adSchema, recs [][]byte, n int, comp map[int]*computedStrs) (map[int]strDictField, []byte, []byte) {
 	if !strDictEnabled {
 		return nil, nil, nil
 	}
@@ -136,8 +145,14 @@ func buildStrDicts(s *adSchema, recs [][]byte, n int) (map[int]strDictField, []b
 	out := map[int]strDictField{}
 	var dictRaw, codeRaw []byte
 	for _, i := range fields {
-		uniq := distinctFold(vals[i], present[i])
-		if !dictWorthwhile(len(uniq), n) {
+		uv, up := vals[i], present[i]
+		cs := comp[i]
+		if cs != nil {
+			uv = append(append(make([][]byte, 0, 2*n), vals[i]...), cs.vals...)
+			up = append(append(make([]bool, 0, 2*n), present[i]...), cs.present...)
+		}
+		uniq := distinctFold(uv, up)
+		if len(uniq) >= dictMaxCardinality || (cs == nil && !dictWorthwhile(len(uniq), n)) {
 			continue
 		}
 		info := strDictField{
@@ -359,11 +374,12 @@ func (b *columnarBlock) dictRange(fieldIdx int, lit string, bc *blockCache, buf 
 // dictPrunes reports whether this block can be ruled out by any of the string comparison conjuncts.
 //
 // Completeness is the whole soundness condition, and noEscape records it: an escaped record's value lives in
-// the cold tail where the dictionary cannot see it, so a partial dictionary must not prune.
+// the cold tail where the dictionary cannot see it, so a partial dictionary must not prune. A computed cell's
+// value is in the dictionary (colcomputed.go), so a block whose only escapes are computed cells is complete.
 func (b *columnarBlock) dictPrunes(probes []strProbe, bc *blockCache, buf *[][]byte) bool {
 	for _, p := range probes {
 		info, ok := b.strDictOf(p.fieldIdx)
-		if !ok || !info.noEscape {
+		if !ok || (!info.noEscape && !b.valueEscapeFree(p.fieldIdx)) {
 			continue
 		}
 		if b.probePrunes(p, info, bc, buf) {

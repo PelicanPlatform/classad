@@ -293,10 +293,14 @@ type columnarBlock struct {
 	native  *colSegment
 	segBase int
 
-	// computed holds, for a columnarized segment's base block, the values of escaped cells whose
-	// expression the record keeps and which depend on the record alone, computed when the segment was
-	// columnarized (see colcomputed.go). computedComp is the compressed region and computed its
-	// per-field sections, sorted by field index. Both empty for every other block.
+	// ccols marks, per field, the escaped cells of a columnarized segment's base block whose slot (or
+	// dictionary code) holds the value of the expression the record keeps, computed when the segment was
+	// columnarized (see colcomputed.go), sorted by field index. ccBlob is their persisted form, which the
+	// bitmaps alias. Both empty for every other block.
+	ccols  []computedCol
+	ccBlob []byte
+	// computed and computedComp are a LEGACY block's computed values, kept beside the column in a
+	// compressed region of per-field sections; read, never written (see LEGACY COMPUTED REGIONS).
 	computed     []computedEntry
 	computedComp []byte
 
@@ -440,6 +444,12 @@ func (b *columnarBlock) coldOffAt(k int) int {
 }
 
 func encodeColumnarBlock(s *adSchema, recs [][]byte, layout *colLayout, regionCodec Codec, coldToField map[uint32]int) *columnarBlock {
+	return encodeColumnarBlockComputed(s, recs, nil, layout, regionCodec, coldToField)
+}
+
+// encodeColumnarBlockComputed is encodeColumnarBlock writing each record's computed cells (cells[k] for
+// recs[k], or nil for none) into their columns (see colcomputed.go).
+func encodeColumnarBlockComputed(s *adSchema, recs [][]byte, cells [][]computedCell, layout *colLayout, regionCodec Codec, coldToField map[uint32]int) *columnarBlock {
 	b := &columnarBlock{id: colBlockSeq.Add(1), schema: s, codec: regionCodec, n: len(recs), layout: layout}
 	b.bitsStride = layout.bitsStride
 	cp := 0
@@ -455,7 +465,11 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, layout *colLayout, regionCo
 	coldRaw := make([]byte, cp)
 	// Decided BEFORE the record loop, because the positional region omits whatever the dictionary owns and
 	// the loop is what writes that region.
-	dicts, dictRaw, codeRaw := buildStrDicts(s, recs, len(recs))
+	var cbuild *computedBuild
+	if cells != nil {
+		cbuild = newComputedBuild(s, recs, cells)
+	}
+	dicts, dictRaw, codeRaw := buildStrDictsComputed(s, recs, len(recs), cbuild.stringsFor())
 	var strCat, coldCat []byte
 	coldIDs := map[uint32]struct{}{}
 	b.strOffB = binary.LittleEndian.AppendUint32(b.strOffB[:0], 0)
@@ -487,6 +501,9 @@ func encodeColumnarBlock(s *adSchema, recs [][]byte, layout *colLayout, regionCo
 		b.coldOffB = binary.LittleEndian.AppendUint32(b.coldOffB, uint32(len(coldCat)))
 	}
 	b.coldIDs = coldIDs
+	// Into the columns before any of them is compressed. The zones and escape classes below are built from
+	// recs, in which a computed cell is escaped, so they keep their meaning: literals only.
+	cbuild.apply(b, recs, coldRaw, dicts, dictRaw, codeRaw)
 	b.zones = numericZones(s, b, recs)
 	b.escClass, b.escExcRecs, b.escAbsent = classifyEscapes(s, recs, coldToField)
 	if dicts != nil {
@@ -535,7 +552,15 @@ func buildColumnarFromSegment(data []byte, upto int, arenaCodec, regionCodec Cod
 // segment either. Used to drop DELTA records: each holds the attributes one write changed, so its
 // row would be almost entirely absent fields, and it is dead by the time its segment seals.
 func buildColumnarFromSegmentGrouped(data []byte, upto int, dm *damageSet, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+	return buildColumnarFromSegmentComputed(data, upto, dm, arenaCodec, regionCodec, s, hot, groups, g, toInterned, toLocal, skip, nil)
+}
+
+// buildColumnarFromSegmentComputed is buildColumnarFromSegmentGrouped writing computed cells into the
+// columns: cellsFor(lo, hi) returns the cells of the records fed in positions [lo, hi), or nil for none
+// (see colBuild.cellsFor).
+func buildColumnarFromSegmentComputed(data []byte, upto int, dm *damageSet, arenaCodec, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), skip func(uint32) bool, cellsFor func(lo, hi int) [][]computedCell) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
+	cb.cellsFor = cellsFor
 	var buf []byte
 	for off := 0; off < upto; {
 		o := uint32(off)
@@ -564,8 +589,9 @@ func buildColumnarFromSegmentGrouped(data []byte, upto int, dm *damageSet, arena
 // columnarized segment's records are remnants, so its full ads are reconstructed (remnant spliced
 // with the existing columns) before being re-split under a new group set. Sharing colBuild keeps the
 // block/group/offset logic byte-for-byte identical with the from-data path.
-func buildColumnarFromWires(offs []uint32, fulls [][]byte, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
+func buildColumnarFromWires(offs []uint32, fulls [][]byte, regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool), cellsFor func(lo, hi int) [][]computedCell) ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	cb := newColBuild(regionCodec, s, hot, groups, g, toInterned, toLocal)
+	cb.cellsFor = cellsFor
 	for i, w := range fulls {
 		cb.feed(offs[i], w)
 	}
@@ -597,6 +623,21 @@ type colBuild struct {
 	// The group's extent as of the last colGroupAlign boundary, so an over-budget group can be
 	// sealed there rather than past it. See sealAt.
 	alignedRows, alignedBytes int
+	// cellsFor, when set, returns the computed cells (colcomputed.go) of the records fed in positions
+	// [lo, hi) -- the position counting every record feed kept, which is the index into offs. A block is
+	// sealed from the front of the pending records, so its first record's position is
+	// len(offs) - len(recs).
+	cellsFor func(lo, hi int) [][]computedCell
+}
+
+// sealBlock encodes the first seal pending records as a base block, with their computed cells.
+func (cb *colBuild) sealBlock(seal int) *columnarBlock {
+	var cells [][]computedCell
+	if cb.cellsFor != nil {
+		lo := len(cb.offs) - len(cb.recs)
+		cells = cb.cellsFor(lo, lo+seal)
+	}
+	return encodeColumnarBlockComputed(cb.s, cb.recs[:seal], cells, cb.baseLayout, cb.regionCodec, cb.coldToField)
 }
 
 func newColBuild(regionCodec Codec, s *adSchema, hot []int, groups []*colGroup, g colGrouping, toInterned func(dst, w []byte) ([]byte, bool), toLocal func(uint32) (uint32, bool)) *colBuild {
@@ -654,7 +695,7 @@ func (cb *colBuild) feed(o uint32, w []byte) {
 	}
 	if cb.g.full(len(cb.recs), cb.groupBytes) {
 		seal, sealBytes := cb.g.sealAt(len(cb.recs), cb.groupBytes, cb.alignedRows, cb.alignedBytes)
-		nb := encodeColumnarBlock(cb.s, cb.recs[:seal], cb.baseLayout, cb.regionCodec, cb.coldToField)
+		nb := cb.sealBlock(seal)
 		nb.remap = cb.rm
 		cb.blocks = append(cb.blocks, nb)
 		if len(cb.groups) > 0 {
@@ -680,7 +721,7 @@ func (cb *colBuild) feed(o uint32, w []byte) {
 // finish seals the trailing group and returns the accumulated blocks, group blocks and offsets.
 func (cb *colBuild) finish() ([]*columnarBlock, [][]*colGroupBlock, []uint32) {
 	if len(cb.recs) > 0 {
-		fb := encodeColumnarBlock(cb.s, cb.recs, cb.baseLayout, cb.regionCodec, cb.coldToField) // short final group
+		fb := cb.sealBlock(len(cb.recs)) // short final group
 		fb.remap = cb.rm
 		cb.blocks = append(cb.blocks, fb)
 		if len(cb.groups) > 0 {
@@ -744,9 +785,10 @@ func numericZones(s *adSchema, b *columnarBlock, recs [][]byte) []blockZoneEntry
 }
 
 // mayMatch reports whether this block could hold a record satisfying every test on field idx. A block
-// with no zone for the field, or an inexact one (some record escaped), is never ruled out.
+// with no zone for the field, or an inexact one (some record escaped and its value is not in the column),
+// is never ruled out. A computed cell's value is in the column, so the zone covering it is valueZone's.
 func (b *columnarBlock) mayMatch(idx int, tests []zoneTest) bool {
-	z, ok := b.zone(idx)
+	z, ok := b.valueZone(idx)
 	if !ok || z.escaped {
 		return true
 	}
@@ -899,15 +941,18 @@ func (b *columnarBlock) hasFieldIdx(fieldIdx int) bool {
 // scanInt calls fn for each record's value of a numeric (int/real read as int bits) field: a
 // hot field reads the uncompressed region directly (no decode); a cold field decompresses its
 // column group once (via bc, nil for no cache). present is false for a missing/exceptional
-// record (its value is in the cold tail).
+// record (its value is in the cold tail, or the record keeps it), and true for a computed cell.
+// A VALUE reader: a computed cell's slot is its value, never the attribute's stored form.
 func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, present bool, v int64)) error {
 	if !b.hasFieldIdx(fieldIdx) {
 		return errBadColBlock
 	}
 	f := b.schema.fields[fieldIdx]
+	// A computed cell is escaped and its value is in the slot (colcomputed.go), so it is present here.
+	cb := b.computedBits(fieldIdx)
 	if start, hot := b.hotColStart(fieldIdx); hot {
 		for k := 0; k < b.n; k++ {
-			if testBit(b.escapeAt(k), fieldIdx) {
+			if testBit(b.escapeAt(k), fieldIdx) && (cb == nil || !testBit(cb, k)) {
 				fn(k, false, 0)
 				continue
 			}
@@ -924,7 +969,7 @@ func (b *columnarBlock) scanInt(fieldIdx int, bc *blockCache, fn func(rec int, p
 		return err
 	}
 	for k := 0; k < b.n; k++ {
-		if testBit(b.escapeAt(k), fieldIdx) {
+		if testBit(b.escapeAt(k), fieldIdx) && (cb == nil || !testBit(cb, k)) {
 			fn(k, false, 0)
 			continue
 		}
@@ -1130,7 +1175,7 @@ const (
 func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (colVal, numCell) {
 	// A computed cell first: its expression is in the record, never in the cold tail, so the tail walk
 	// below could only end at heldAt and decline.
-	if len(b.computed) > 0 {
+	if b.anyComputed() {
 		if idx, ok := b.schema.byID[fieldID]; ok {
 			if node, ok := b.computedNode(k, idx, bc); ok {
 				if v, ok := nodeColVal(node); ok {

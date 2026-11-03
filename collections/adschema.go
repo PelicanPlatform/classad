@@ -88,12 +88,12 @@ type adSchemaOpts struct {
 	// The library attaches no meaning to the names -- which attributes deserve this is a
 	// property of the data's lifecycle, which only the use case knows.
 	Require map[uint32]struct{}
-	// Computed, when set, gives the kind an expression-valued cell is computed to when its segment is
-	// columnarized (cellComputer.computedKind), or akNone when it would not be. Such a cell counts toward
-	// its field's presence and kind as a literal of that kind would, so a field that is an expression in
-	// most records -- and computed in the columns -- can be a field at all. It does not count toward an
-	// int's width: a computed value is kept beside the column, never in the slot.
-	Computed func(iw []byte, id uint32) adKind
+	// Computed, when set, gives the kind and value an expression-valued cell is computed to when its
+	// segment is columnarized (cellComputer.computedKind), or akNone when it would not be. Such a cell
+	// counts toward its field's presence, kind and int width exactly as a literal of that value would: it
+	// is stored in the slot, so a field that is an expression in most records -- and computed in the
+	// columns -- can be a field at all, and its width has to hold the computed values.
+	Computed func(iw []byte, id uint32) (adKind, wire.Literal)
 	// Exclude, when set, names attribute ids that are never fields, whatever the sample says.
 	Exclude func(id uint32) bool
 }
@@ -302,8 +302,7 @@ func buildAdSchemaReport(sample [][]byte, opts adSchemaOpts) (*adSchema, []requi
 			}
 			k, lit := sampledKind(node)
 			if k == akNone && opts.Computed != nil && !storableInColumn(node) {
-				st.kinds[opts.Computed(w, id)]++
-				return true
+				k, lit = opts.Computed(w, id)
 			}
 			st.kinds[k]++
 			if k == akInt {
@@ -347,11 +346,7 @@ func buildAdSchemaReport(sample [][]byte, opts adSchemaOpts) (*adSchema, []requi
 		switch domK {
 		case akInt:
 			f.width, f.unsigned = chooseIntWidth(st.intVals, opts.Fit)
-			if len(st.intVals) == 0 {
-				// Every sampled cell is computed, and a computed value never occupies the slot, so
-				// the narrowest one wastes the least.
-				f.width, f.unsigned = 1, true
-			}
+
 		case akReal:
 			f.width = 8
 		} // akString has no fixed width -- it is positional in the string region

@@ -66,8 +66,11 @@ type groupCol struct {
 	entries [][]byte
 	codes   []byte
 	codeW   int
-	codeAcc []*groupAcc
-	codeID  []int64
+	// computed is the field's computed bitmap in this block (colcomputed.go): a computed string is coded
+	// in the dictionary like a literal, so those escaped cells take the code path too.
+	computed []byte
+	codeAcc  []*groupAcc
+	codeID   []int64
 
 	// String fields with no dictionary in this block: the decompressed positional string region,
 	// walked per record.
@@ -147,6 +150,7 @@ func newGroupCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCach
 			return groupCol{}, false
 		}
 		c.hasDict, c.entries, c.codes, c.codeW = true, entries, codes, w
+		c.computed = blk.computedBits(fieldIdx)
 		if wholeKey {
 			if cap(sc.code) < len(entries) {
 				sc.code = make([]*groupAcc, len(entries))
@@ -184,7 +188,7 @@ func (gc *groupCols) accFor(k int, bc *blockCache, acc *groupAccum, nAgg int) (*
 		// group is resolved once per distinct value per block, so this loop does no hashing at all
 		// after the block's first few records. Sound only because this column alone decides the
 		// group, which is what newGroupCol's wholeKey established.
-		if c.hasDict && !testBit(c.blk.escapeAt(k), c.fieldIdx) {
+		if c.hasDict && c.coded(k) {
 			// Under a bucket this record's value comes from the string dictionary, and a string
 			// has no bucket to be floored into, so it leaves the series exactly as the scan drops
 			// it.
@@ -223,7 +227,7 @@ func (gc *groupCols) accFor(k int, bc *blockCache, acc *groupAccum, nAgg int) (*
 		// The same dictionary fast path, one level down: the code names the COMPONENT rather than
 		// the group, so it resolves to a query-local string id by array index and the key is
 		// assembled from that. A dictionary-coded component still costs no string hash per record.
-		if c.hasDict && !testBit(c.blk.escapeAt(k), c.fieldIdx) {
+		if c.hasDict && c.coded(k) {
 			// A string has no bucket to be floored into, and the reference drops a RECORD as soon
 			// as any one of its bucket keys fails to render -- so this record is in no group at
 			// all, whatever the other columns say. Only this record, not the column: a number that
@@ -254,6 +258,11 @@ func (gc *groupCols) accFor(k int, bc *blockCache, acc *groupAccum, nAgg int) (*
 	return acc.accFor(&gc.comps, nAgg)
 }
 
+// coded reports whether record k's value is a code of the dictionary: a literal, or a computed cell.
+func (c *groupCol) coded(k int) bool {
+	return !testBit(c.blk.escapeAt(k), c.fieldIdx) || (c.computed != nil && testBit(c.computed, k))
+}
+
 // compAt derives record k's component the slow way: for a numeric column, a block where the string
 // field has no dictionary, or an escaped record whose value lives in the cold tail.
 func (c *groupCol) compAt(k int, bc *blockCache, acc *groupAccum) (groupComp, bool) {
@@ -271,8 +280,8 @@ func (c *groupCol) compAt(k int, bc *blockCache, acc *groupAccum) (groupComp, bo
 		return escapedGroupComp(c.blk, k, c.fieldID, bc, acc)
 	}
 	if c.hasDict || testBit(c.blk.escapeAt(k), c.fieldIdx) {
-		// With a dictionary this is reached only for an ESCAPED record -- accFor serves every other
-		// one -- and an escaped value is never in the dictionary.
+		// With a dictionary this is reached only for an ESCAPED record that is not computed -- accFor
+		// serves every other one -- and such a value is never in the dictionary.
 		return escapedGroupComp(c.blk, k, c.fieldID, bc, acc)
 	}
 	s, ok := c.positionalStrAt(k)
@@ -318,7 +327,7 @@ func (c *groupCol) positionalStrAt(k int) (string, bool) {
 // escapedGroupComp reads the group component of a record whose column slot does not hold it: the
 // value is in the block's cold tail, or the record has no such attribute at all.
 func escapedGroupComp(b *columnarBlock, k int, fieldID uint32, bc *blockCache, acc *groupAccum) (groupComp, bool) {
-	if len(b.computed) > 0 {
+	if b.anyComputed() {
 		if idx, ok := b.schema.byID[fieldID]; ok {
 			if node, ok := b.computedNode(k, idx, bc); ok {
 				return litGroupComp(node, acc)

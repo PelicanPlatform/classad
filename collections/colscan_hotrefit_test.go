@@ -101,3 +101,34 @@ func TestHotTierRefitEndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// TestRefitHotIntWidthsCountsComputed: a computed value is stored in its slot like a literal, so the hot
+// re-fit sizes the column for the computed values too. Mem is a small literal in a few records and an
+// expression computing far wider values in the rest; fitted to the literals alone, every computed value
+// would escape the column and be read a record at a time.
+func TestRefitHotIntWidthsCountsComputed(t *testing.T) {
+	c := New(Options{Shards: 1})
+	var wires [][]byte
+	for i := 0; i < 3000; i++ {
+		mem := fmt.Sprint(i % 200)
+		if i%10 != 0 {
+			mem = "Base * 1000"
+		}
+		wires = append(wires, mustEncodeAd(c.encodeAd(mustAdOld(t,
+			fmt.Sprintf("Base=%d\nMem=%s", 70000+i, mem)).AST())))
+	}
+	opts, _ := c.baseSchemaOpts()
+	s := buildAdSchema(wires, opts)
+	memID, _ := c.intern.LookupID("Mem")
+	idx, ok := s.byID[memID]
+	if !ok {
+		t.Fatal("Mem is not a field")
+	}
+	if f := s.fields[idx]; !intFits(72999*1000, f.width, f.unsigned) {
+		t.Fatalf("base width %d does not hold the computed values", f.width)
+	}
+	s2, _ := refitHotIntWidthsComputed(s, wires, []int{idx}, hotIntFit, opts.Computed)
+	if f := s2.fields[s2.byID[memID]]; !intFits(72999*1000, f.width, f.unsigned) {
+		t.Fatalf("hot re-fit width %d does not hold the computed values", f.width)
+	}
+}

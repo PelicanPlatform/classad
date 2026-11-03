@@ -2,6 +2,7 @@ package collections
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"math"
 	"slices"
@@ -412,8 +413,8 @@ func TestComputedCellsReassembleByteIdentically(t *testing.T) {
 		for _, seg := range sh.segs {
 			if cn := seg.colNative.Load(); cn != nil {
 				for _, b := range cn.seg.blocks {
-					computed += len(b.computed)
-					b.computed, b.computedComp = nil, nil
+					computed += len(b.ccols)
+					b.ccols, b.ccBlob = nil, nil
 				}
 			}
 		}
@@ -534,7 +535,7 @@ func TestComputedTrailerIsOptional(t *testing.T) {
 			}
 			// Drop the computed values from the live segment: the answers must not move.
 			for _, b := range cn.seg.blocks {
-				b.computed, b.computedComp = nil, nil
+				b.ccols, b.ccBlob = nil, nil
 			}
 			checked++
 		}
@@ -543,4 +544,146 @@ func TestComputedTrailerIsOptional(t *testing.T) {
 		t.Fatal("no segment carries computed values")
 	}
 	checkComputedFixture(t, c, "without computed values")
+}
+
+// buildLegacyComputedRegion lays out a block's computed cells the way segments columnarized before
+// computed values moved into the column hold them: one section per field, (n+1) little-endian u32
+// offsets over the cells' literal nodes, so record k's value is nodes[off[k]:off[k+1]]. rows[k] are
+// record k's cells, sorted by field. Only tests write this form now.
+func buildLegacyComputedRegion(rows [][]computedCell) ([]computedEntry, []byte) {
+	var idxs []int
+	seen := map[int]struct{}{}
+	for _, r := range rows {
+		for _, cell := range r {
+			if _, ok := seen[cell.idx]; !ok {
+				seen[cell.idx] = struct{}{}
+				idxs = append(idxs, cell.idx)
+			}
+		}
+	}
+	sort.Ints(idxs)
+	var raw []byte
+	var entries []computedEntry
+	for _, idx := range idxs {
+		entries = append(entries, computedEntry{idx: idx, start: uint32(len(raw))})
+		var nodes []byte
+		offs := binary.LittleEndian.AppendUint32(nil, 0)
+		for _, r := range rows {
+			for _, cell := range r {
+				if cell.idx == idx {
+					nodes = append(nodes, cell.node...)
+				}
+			}
+			offs = binary.LittleEndian.AppendUint32(offs, uint32(len(nodes)))
+		}
+		raw = append(append(raw, offs...), nodes...)
+	}
+	return entries, raw
+}
+
+// toLegacyComputed rewrites every block of c holding computed cells into the legacy form: the values
+// move into a region beside the column, read through the block cache, and the bitmaps go. Returns how
+// many cells moved.
+func toLegacyComputed(t *testing.T, c *Collection) int {
+	t.Helper()
+	moved := 0
+	for _, sh := range c.shards {
+		for _, seg := range sh.segs {
+			cn := seg.colNative.Load()
+			if cn == nil {
+				continue
+			}
+			for _, b := range cn.seg.blocks {
+				if len(b.ccols) == 0 {
+					continue
+				}
+				rows := make([][]computedCell, b.n)
+				for i := range b.ccols {
+					cc := &b.ccols[i]
+					for k := 0; k < b.n; k++ {
+						node, ok := b.computedNode(k, cc.idx, cn.cache)
+						if !ok {
+							continue
+						}
+						rows[k] = append(rows[k], computedCell{idx: cc.idx, node: node})
+						moved++
+					}
+				}
+				for k := range rows {
+					sort.Slice(rows[k], func(i, j int) bool { return rows[k][i].idx < rows[k][j].idx })
+				}
+				entries, raw := buildLegacyComputedRegion(rows)
+				b.computed, b.computedComp = entries, b.codec.Compress(nil, raw)
+				b.ccols, b.ccBlob = nil, nil
+			}
+		}
+	}
+	return moved
+}
+
+// TestComputedLegacyRegionsStillRead: a segment columnarized before computed values moved into the
+// column keeps them in a region beside it, and is read as it was -- every answer exact, the values
+// served from the region rather than by evaluating records -- until it is re-columnarized, which writes
+// them into the column. Its trailer round-trips through the payload format unchanged.
+func TestComputedLegacyRegionsStillRead(t *testing.T) {
+	c := buildComputedFixture(t, t.TempDir(), 2000, 1000, false)
+	q, _ := vm.Parse("ProcId >= 0")
+	before := heldExceptionEvals.Load()
+	if _, ok := c.NumStatsQuery(q, "MemUse"); !ok {
+		t.Fatal("NumStatsQuery(MemUse) gave the query back")
+	}
+	inColumn := heldExceptionEvals.Load() - before
+	if toLegacyComputed(t, c) == 0 {
+		t.Fatal("no computed cell to move")
+	}
+	for _, sh := range c.shards {
+		for _, seg := range sh.segs {
+			cn := seg.colNative.Load()
+			if cn == nil || !cn.seg.hasComputed() {
+				continue
+			}
+			trailer := appendComputedTrailer(nil, cn.seg.blocks)
+			back := &colSegment{blocks: make([]*columnarBlock, len(cn.seg.blocks))}
+			for i, b := range cn.seg.blocks {
+				back.blocks[i] = &columnarBlock{schema: b.schema, n: b.n, strDict: b.strDict}
+			}
+			if !readComputedTrailer(trailer, back) {
+				t.Fatal("a legacy computed trailer does not read back")
+			}
+			for i, b := range back.blocks {
+				if len(b.ccols) != 0 || !slices.Equal(b.computed, cn.seg.blocks[i].computed) ||
+					!bytes.Equal(b.computedComp, cn.seg.blocks[i].computedComp) {
+					t.Fatal("a legacy computed trailer read back differently")
+				}
+			}
+		}
+	}
+	checkComputedFixture(t, c, "legacy regions")
+	// The same records are evaluated one at a time as with the values in the column -- the uncomputable
+	// ones, and the unsealed segment's -- so the regions served the rest.
+	before = heldExceptionEvals.Load()
+	if _, ok := c.NumStatsQuery(q, "MemUse"); !ok {
+		t.Fatal("NumStatsQuery(MemUse) gave the query back over legacy regions")
+	}
+	if got := heldExceptionEvals.Load() - before; got != inColumn {
+		t.Errorf("NumStatsQuery(MemUse) evaluated %d records one at a time over legacy regions, %d with the values in the column", got, inColumn)
+	}
+	if recolumnarizeAll(t, c) == 0 {
+		t.Fatal("nothing was re-columnarized")
+	}
+	for _, sh := range c.shards {
+		for _, seg := range sh.segs {
+			if cn := seg.colNative.Load(); cn != nil {
+				for _, b := range cn.seg.blocks {
+					if len(b.computed) > 0 {
+						t.Fatal("re-columnarizing kept a legacy computed region")
+					}
+				}
+			}
+		}
+	}
+	if !columnarHoldsComputed(c) {
+		t.Fatal("re-columnarizing did not write the computed values into the column")
+	}
+	checkComputedFixture(t, c, "converted")
 }
