@@ -89,3 +89,33 @@ func TestVecBothArmsEmptySkipsToTheJoin(t *testing.T) {
 		t.Errorf("an arm no record takes read a column: %v", src.loads)
 	}
 }
+
+// TestVecLoopNeverEnteredAvoidsTheColumnLoad pins the neighbouring case, which was already correct
+// when the `if` arm above was not. A While whose condition is false for every record must not run
+// its body, and so must not load the columns the body reads.
+//
+// It is here rather than taken on trust because "the statement forms skip an empty path" is the rule
+// the arm skip completes, and a rule with one member tested and one assumed is how the `if` hole
+// survived in the first place.
+func TestVecLoopNeverEnteredAvoidsTheColumnLoad(t *testing.T) {
+	recs := []map[string]string{{"A": "0", "B": "5"}, {"A": "0", "B": "6"}}
+	src := newCountingSource(recs)
+	s := NewScript().Let("i", mustExpr(t, "A"))
+	s = s.While(mustExpr(t, "i > 100"), func(s *Script) {
+		s.Let("i", mustExpr(t, "i + B"))
+	})
+	sp, err := s.Result(mustExpr(t, "i")).Compile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var scratch VecScratch
+	if _, ok := sp.VecEval(src, len(recs), &scratch); !ok {
+		t.Fatal("the vector executor declined this script")
+	}
+	if got := src.loads["b"]; got != 0 {
+		t.Errorf("a loop body no record enters loaded B %d time(s) (loads: %v)", got, src.loads)
+	}
+	if src.loads["a"] == 0 {
+		t.Errorf("the condition's own column was never loaded (loads: %v)", src.loads)
+	}
+}
