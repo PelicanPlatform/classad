@@ -176,7 +176,10 @@ func TestGroupedFanoutIsNotFooledByStringIds(t *testing.T) {
 	}
 	want := map[string]int{}
 	for i := 0; i < n; i++ {
-		want[fmt.Sprintf("user%d", i%37)]++
+		// A group's label is the value's ClassAd literal, so a string group carries its quotes.
+		// That is what keeps the string "4" and the integer 4 in separate groups, and it means an
+		// expected label has to be written the same way rather than as the bare owner name.
+		want[fmt.Sprintf("%q", fmt.Sprintf("user%d", i%37))]++
 	}
 	if len(rows) != len(want) {
 		t.Fatalf("%d groups, want %d: the fold split or fused string groups", len(rows), len(want))

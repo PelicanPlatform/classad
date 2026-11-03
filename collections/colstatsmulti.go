@@ -294,6 +294,9 @@ func (c *Collection) planValuePass(aggID uint32, preds []fieldPred) valuePassPla
 // the pass cannot serve the request and the caller must scan.
 func (c *Collection) valuePassWindow(p *valuePassPlan, st *valuePassState, w segWindow, s0 uint64,
 	bc *blockCache, sink numSink) bool {
+	if valuePassDeclineHook != nil && valuePassDeclineHook(w) {
+		return false
+	}
 	aggID, preds, otherPreds := p.aggID, p.preds, p.otherPreds
 	lookups, aggLookup, selfOK := p.lookups, p.aggLookup, p.selfOK
 	cand, sc := &st.cand, &st.sc
