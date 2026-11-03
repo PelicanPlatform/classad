@@ -31,10 +31,10 @@ func newMmapSegment(id uint32, size int, codec Codec, path string) (*segment, er
 	// Reserve the segment's blocks up front (fallocate on Linux) rather than a sparse Truncate, so a
 	// disk-full surfaces here as a clean allocation error instead of later at mmap writeback (where
 	// it can silently lose data or SIGBUS). See segreserve_*.go.
-	if err := reserve(f, int64(size)); err != nil {
+	if reserveErr := reserve(f, int64(size)); reserveErr != nil {
 		f.Close()
 		os.Remove(path)
-		return nil, err
+		return nil, reserveErr
 	}
 	data, err := unix.Mmap(int(f.Fd()), 0, size, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_SHARED)
 	if err != nil {

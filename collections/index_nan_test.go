@@ -434,8 +434,8 @@ func TestArchiveValueIndexNaNSidecar(t *testing.T) {
 				wantHigh++
 			}
 		}
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
 	sealed, indexed := sealedIndexed(a)

@@ -196,10 +196,10 @@ func TestZonesSurviveReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 4000; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)),
 			mustAdOld(t, fmt.Sprintf("ClusterId = %d\nProcId = %d\nRequestMemory = %d",
-				i, i%10, 1024+(i%32)*512))); err != nil {
-			t.Fatal(err)
+				i, i%10, 1024+(i%32)*512))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	if !c.BuildAndEnableSchemaScan(4000, 8) {
@@ -213,8 +213,8 @@ func TestZonesSurviveReopen(t *testing.T) {
 	if !served {
 		t.Fatal("declined before reopen")
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	c2, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 1 << 16})

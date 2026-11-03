@@ -22,8 +22,8 @@ func TestReverseScan(t *testing.T) {
 	const n = 200
 	for i := 0; i < n; i++ {
 		ad, _ := classad.Parse(fmt.Sprintf(`[ N = %d; Even = %v ]`, i, i%2 == 0))
-		if err := c.Put([]byte("k"), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte("k"), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 

@@ -262,7 +262,7 @@ func (c *Collection) topUpRef(a wire.Ad, partial *classad.ClassAd, mw *matchWork
 		if err != nil {
 			continue
 		}
-		if cname, ok := c.intern.Name(id); ok {
+		if cname, named := c.intern.Name(id); named {
 			partial.Insert(cname, expr)
 		}
 		if _, safe := vm.SelfRefsSafe(expr); !safe {

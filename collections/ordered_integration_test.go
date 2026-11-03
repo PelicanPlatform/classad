@@ -161,8 +161,8 @@ func TestOrderedRecoveryRebuild(t *testing.T) {
 	putJob(t, c, "j1", "alice", 1, 10, 0) // idle
 	putJob(t, c, "j2", "alice", 1, 20, 0) // idle, higher prio
 	putJob(t, c, "j3", "alice", 2, 99, 0) // running -> excluded
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	c2, err := Open(opts)

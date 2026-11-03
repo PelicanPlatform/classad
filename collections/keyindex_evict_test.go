@@ -31,8 +31,8 @@ func TestOperationTimeEviction(t *testing.T) {
 	}
 	defer c.Close()
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("c%05d", i)), mustAd(t, `[ N = 0 ]`)); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("c%05d", i)), mustAd(t, `[ N = 0 ]`)); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	// Before eviction the directory holds (nearly) every key -- sealing/eviction has not
@@ -62,8 +62,8 @@ func TestOperationTimeEviction(t *testing.T) {
 	// Roundtrip: a clean Close now snapshots an already-partial directory (dir.snap stores
 	// the live count separately from the resident entries), and the reopen must restore the
 	// full store -- every key present, count intact -- served by the sealed probe.
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	c2, err := Open(Options{Dir: dir, Shards: 4, SegmentSize: 4096})
 	if err != nil {

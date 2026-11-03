@@ -128,9 +128,9 @@ func TestDeltaSurvivesReopen(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		ad, _ := c.Get(key)
 		ad.InsertAttr("N", int64(i))
-		tx := c.Begin()
-		tx.PutPatch(key, ad, []string{"N"}, false)
-		if r := tx.Commit(); r.Conflicted() {
+		ptx := c.Begin()
+		ptx.PutPatch(key, ad, []string{"N"}, false)
+		if r := ptx.Commit(); r.Conflicted() {
 			t.Fatalf("round %d conflicted", i)
 		}
 	}
@@ -934,7 +934,7 @@ func TestDeltaModeMarkerIsLazyAndReversible(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
 		t.Fatal("marker written at open, before any delta was stored")
 	}
 	// Whole-ad writes only: still no deltas, so still no marker.
@@ -945,7 +945,7 @@ func TestDeltaModeMarkerIsLazyAndReversible(t *testing.T) {
 			t.Fatalf("put %d conflicted", i)
 		}
 	}
-	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
 		t.Fatal("marker written for a store that has only whole records")
 	}
 	// The first delta must put it down.
@@ -959,11 +959,11 @@ func TestDeltaModeMarkerIsLazyAndReversible(t *testing.T) {
 	if d, _ := c.DeltaStats(); d == 0 {
 		t.Fatal("no delta stored; the test is not exercising what it claims")
 	}
-	if _, err := os.Stat(marker); err != nil {
-		t.Fatalf("marker absent after a delta was stored: %v", err)
+	if _, statErr := os.Stat(marker); statErr != nil {
+		t.Fatalf("marker absent after a delta was stored: %v", statErr)
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	// And the marker keeps replay on when reopened without the option.
 	c2, err := Open(Options{Dir: dir, Shards: 2, SegmentSize: 1 << 16})

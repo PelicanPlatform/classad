@@ -22,8 +22,8 @@ func TestMsyncErrorSurfaced(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer c.Close()
-	if err := c.Put([]byte("k0"), mustAd(t, `[Id=0]`)); err != nil {
-		t.Fatalf("baseline Put failed: %v", err)
+	if putErr := c.Put([]byte("k0"), mustAd(t, `[Id=0]`)); putErr != nil {
+		t.Fatalf("baseline Put failed: %v", putErr)
 	}
 
 	eio := unix.EIO // a real "data did not reach disk" errno (EINVAL etc. are benign, not latched)

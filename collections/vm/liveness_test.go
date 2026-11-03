@@ -267,9 +267,9 @@ func TestPlacesDoNotInflatePeakLive(t *testing.T) {
 	// is not an artifact of the measurement.
 	summed := NewScript()
 	for i, nm := range []string{"l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"} {
-		ex, err := parser.ParseExpr("Cpus + " + string(rune('1'+i)))
-		if err != nil {
-			t.Fatal(err)
+		ex, perr := parser.ParseExpr("Cpus + " + string(rune('1'+i)))
+		if perr != nil {
+			t.Fatal(perr)
 		}
 		summed = summed.Let(nm, ex)
 	}

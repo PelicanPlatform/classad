@@ -631,7 +631,7 @@ func (c *Collection) alreadyIndexedName(fold string) bool {
 	if !ok {
 		return false
 	}
-	if _, ok := spec.cat[id]; ok {
+	if _, inCat := spec.cat[id]; inCat {
 		return true
 	}
 	_, ok = spec.val[id]

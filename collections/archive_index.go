@@ -179,13 +179,13 @@ func buildSidecarIndex(si *segIndex) ([]byte, error) {
 		for i, p := range exPairs {
 			exKeys[i], exBmOffs[i] = p.key, p.off
 		}
-		excOff, err := emit(cp.exc)
-		if err != nil {
-			return nil, err
+		excOff, offErr := emit(cp.exc)
+		if offErr != nil {
+			return nil, offErr
 		}
-		postedOff, err := emit(cp.posted)
-		if err != nil {
-			return nil, err
+		postedOff, offErr := emit(cp.posted)
+		if offErr != nil {
+			return nil, offErr
 		}
 		catBlks = append(catBlks, catBlk{id, excOff, postedOff, keys, bmOffs, exKeys, exBmOffs, &cp.stats})
 	}

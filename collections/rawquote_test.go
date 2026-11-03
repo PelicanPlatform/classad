@@ -106,8 +106,8 @@ func TestRawTextRoundTripsNestedStrings(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := c.Put([]byte("k"), src); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte("k"), src); putErr != nil {
+			t.Fatal(putErr)
 		}
 
 		list, err := rawReparse(t, c).EvaluateAttr("Args").ListValue()

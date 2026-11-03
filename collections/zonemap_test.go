@@ -37,8 +37,8 @@ func TestZoneMapPrune(t *testing.T) {
 	const n = 400
 	for i := 0; i < n; i++ {
 		ad, _ := classad.Parse(fmt.Sprintf(`[ N = %d; Ts = %d ]`, i, i))
-		if err := c.Put([]byte("k"), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte("k"), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	sh := c.shards[0]
@@ -51,9 +51,9 @@ func TestZoneMapPrune(t *testing.T) {
 	// pruned Query result (sorted) must equal it exactly -- pruning may not drop a match.
 	check := func(qs string, wantLo, wantHi int) {
 		t.Helper()
-		q, err := vm.Parse(qs)
-		if err != nil {
-			t.Fatal(err)
+		q, qerr := vm.Parse(qs)
+		if qerr != nil {
+			t.Fatal(qerr)
 		}
 		want := map[int64]bool{}
 		for v := wantLo; v <= wantHi; v++ {
@@ -155,8 +155,8 @@ func TestZoneMapMaxAgeRetention(t *testing.T) {
 	const n = 400
 	for i := 0; i < n; i++ {
 		ad, _ := classad.Parse(fmt.Sprintf(`[ N = %d; CompletionDate = %d ]`, i, i))
-		if err := c.Put([]byte("k"), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte("k"), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	dropped, err := c.Rotate(400)

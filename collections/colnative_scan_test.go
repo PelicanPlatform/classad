@@ -346,14 +346,14 @@ func TestColumnarizedShardServesTimeTravel(t *testing.T) {
 	}
 	defer c.Close()
 	put := func(i int, owner string, status int) {
-		ad, err := classad.Parse(fmt.Sprintf(
+		ad, perr := classad.Parse(fmt.Sprintf(
 			`[ ClusterId=%d; ProcId=%d; Owner=%q; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep" ]`,
 			i, i%10, owner, status, (i%16)*1024))
-		if err != nil {
-			t.Fatal(err)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	for i := range 2000 {
@@ -653,14 +653,14 @@ func TestColumnarizeKeepsMidBuildDeletes(t *testing.T) {
 	defer c.Close()
 	const n = 3000
 	for i := range n {
-		ad, err := classad.Parse(fmt.Sprintf(
+		ad, perr := classad.Parse(fmt.Sprintf(
 			`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d ]`,
 			i, i%10, i%7, i%6, (i%16)*1024))
-		if err != nil {
-			t.Fatal(err)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	c.RetrainDict(0)
@@ -1320,12 +1320,12 @@ func TestColumnarizedGroupColumnsSurviveReopen(t *testing.T) {
 			text = fmt.Sprintf(`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; RanStart=%d; RanEnd=%d; RanHost="h%d"; RanExit=%d ]`,
 				i, i%10, i%7, i%6, (i%16)*1024, i, i+10, i%50, i%3)
 		}
-		ad, err := classad.Parse(text)
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.Parse(text)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	c.RetrainDict(0)
@@ -1342,8 +1342,8 @@ func TestColumnarizedGroupColumnsSurviveReopen(t *testing.T) {
 		}
 	}
 	before := readAll(t, c, "true")
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	if withGroups == 0 {
 		t.Skip("no columnarized segment carried group columns")
