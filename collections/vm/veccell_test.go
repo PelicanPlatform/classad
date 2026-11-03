@@ -5,6 +5,28 @@ import (
 	"testing"
 )
 
+// setMaskStateAt writes one record's two bits, clearing whatever was there -- the inverse of
+// maskStateAt, which is what the mask form is read back through.
+//
+// It lives beside its only caller rather than in vecmask.go, where it used to be. The mask form
+// is WRITTEN by the kernels, a word at a time, so nothing in the package needs to set one record's
+// bits; only a test constructing a mask vector by hand does. Put back next to production code it
+// would be unused there again, and the lint pass that removed it would be right a second time.
+func setMaskStateAt(hi, lo []uint64, i, st int) {
+	w, b := i/64, uint(i%64)
+	m := uint64(1) << b
+	if st&2 != 0 {
+		hi[w] |= m
+	} else {
+		hi[w] &^= m
+	}
+	if st&1 != 0 {
+		lo[w] |= m
+	} else {
+		lo[w] &^= m
+	}
+}
+
 // fakeDict is a DictResolver over a fixed entry list.
 type fakeDict []string
 
