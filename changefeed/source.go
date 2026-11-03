@@ -186,7 +186,7 @@ func (s *server) subscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	seq, err := watch(ctx, cursor)
 	if err != nil {
-		s.writeSSE(w, flusher, Event{Kind: replicate.KindGap}) // best-effort signal; connection then ends
+		_ = s.writeSSE(w, flusher, Event{Kind: replicate.KindGap}) //nolint:errcheck // best-effort signal; the connection ends either way
 		return
 	}
 
@@ -295,7 +295,7 @@ func (s *server) ack(w http.ResponseWriter, r *http.Request) {
 	s.opts.Registry.Ack(req.Table, sub, req.AckMillis, now)
 	floor, held := s.opts.Registry.Floor(req.Table, now)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ackResponse{FloorMillis: floor, Held: held})
+	_ = json.NewEncoder(w).Encode(ackResponse{FloorMillis: floor, Held: held}) //nolint:errcheck // ack already recorded; a client that drops the reply sees the floor on its next one
 }
 
 // stampTS reads the record's age attribute (unix seconds) and returns it as unix millis, or 0.

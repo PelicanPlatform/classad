@@ -85,7 +85,15 @@ func pullOnce(parent context.Context, cfg PullConfig, sink replicate.Sink) error
 	var lastCursor atomic.Pointer[[]byte]
 	commitAndAck := func() {
 		if cp := lastCursor.Load(); cp != nil {
-			_ = sink.Commit(*cp)
+			if err := sink.Commit(*cp); err != nil {
+				// The ack authorises the source to GC up to the watermark, and the
+				// committed cursor is the only thing that lets this subscriber ask
+				// for those records again after a restart. If the cursor did not
+				// reach durable storage, acking would let the source discard
+				// records this sink can no longer resume from. Ack nothing; the
+				// next tick retries both.
+				return
+			}
 		}
 		postAck(ctx, cfg, maxTS.Load())
 	}
@@ -155,7 +163,7 @@ func (cfg PullConfig) subscribe(ctx context.Context, cursor []byte) (*http.Respo
 	}
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), http.NoBody)
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +185,7 @@ func (cfg PullConfig) subscribe(ctx context.Context, cursor []byte) (*http.Respo
 // postAck sends the ack watermark; failures are ignored (the next tick retries; the resume cursor,
 // not the ack, is what guarantees correctness).
 func postAck(ctx context.Context, cfg PullConfig, ackMillis int64) {
-	body, _ := json.Marshal(ackRequest{Subscriber: cfg.Subscriber, Table: cfg.Table, AckMillis: ackMillis})
+	body, _ := json.Marshal(ackRequest{Subscriber: cfg.Subscriber, Table: cfg.Table, AckMillis: ackMillis}) //nolint:errcheck // two strings and an int64: Marshal has nothing to fail on
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(cfg.BaseURL, "/")+PathAck, bytes.NewReader(body))
 	if err != nil {
 		return

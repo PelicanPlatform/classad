@@ -2,7 +2,9 @@ package changefeed
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,4 +139,71 @@ func TestHTTPFeedSelectiveFanIn(t *testing.T) {
 	assertContains(t, dst, `Src == "ap40"`, 1)
 	assertContains(t, dst, `Src == "ap55"`, 1)
 	assertContains(t, dst, `Owner == "eve" || Owner == "mallory"`, 0)
+}
+
+// failCommitSink applies every change but can never record a resume cursor -- the shape of a sink
+// whose cursor store is unwritable (full disk, lost mount). Apply deliberately does not commit on
+// KindSynced: the periodic commit-and-ack is what is under test here, and letting Apply fail would
+// just tear the connection down before the ticker ran.
+type failCommitSink struct {
+	mu      sync.Mutex
+	applied int
+}
+
+func (s *failCommitSink) Apply(c replicate.Change) error {
+	if c.Kind == replicate.KindUpsert {
+		s.mu.Lock()
+		s.applied++
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+func (s *failCommitSink) Commit([]byte) error { return errors.New("cursor store is unwritable") }
+func (s *failCommitSink) Cursor() []byte      { return nil }
+
+func (s *failCommitSink) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applied
+}
+
+// TestHTTPFeedNoAckWhenCursorUncommitted: the ACK authorises the source to reclaim records, and the
+// committed cursor is the only thing that lets a subscriber ask for them again after a restart. A
+// sink that cannot persist its cursor must therefore not move the source's GC floor, however many
+// records it has in hand.
+func TestHTTPFeedNoAckWhenCursorUncommitted(t *testing.T) {
+	srcCat, srcArch := mustCatalogArchive(t, "history")
+	reg := &MemRegistry{LeaseTTL: time.Hour}
+	srv := httptest.NewServer(Handler(srcCat, ServerOptions{
+		Registry: reg, AgeAttr: "EnteredHistoryTime", Heartbeat: 50 * time.Millisecond,
+	}))
+	defer srv.Close()
+
+	for _, text := range []string{
+		`GlobalJobId = "ap40#12.0"; Owner = "alice"; ClusterId = 12; EnteredHistoryTime = 1700000100`,
+		`GlobalJobId = "ap40#13.0"; Owner = "bob";   ClusterId = 13; EnteredHistoryTime = 1700000200`,
+	} {
+		if err := srcArch.AppendOld(text); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sink := &failCommitSink{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = Pull(ctx, PullConfig{BaseURL: srv.URL, Table: "history", Subscriber: "sink1", Src: "ap40", AckEvery: 20 * time.Millisecond}, sink)
+	}()
+
+	// Both records reach the sink, so it has something it could (wrongly) ack for.
+	waitFor(t, 5*time.Second, func() bool { return sink.count() == 2 })
+
+	// Give the ack ticker many turns, then confirm the floor never left zero. The subscriber is
+	// live (the open stream renews its lease), so held is true -- it is the watermark that must
+	// not move.
+	time.Sleep(300 * time.Millisecond)
+	if floor, _ := reg.Floor("history", time.Now()); floor != 0 {
+		t.Fatalf("GC floor advanced to %d with no committed cursor; the source may now reclaim records this sink cannot resume from", floor)
+	}
 }
