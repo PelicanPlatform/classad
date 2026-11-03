@@ -629,8 +629,20 @@ func checkComputedExtra(t *testing.T, f *formFixture, label string) {
 			}
 		}
 		// Every value the column yields, as a multiset, against evaluation.
+		// One list per worker, each fed by one goroutine, joined once the pass is done.
+		var parts []*[]string
 		var got []string
-		if c.NumValuesQuery(all, attr, func(v NumValue) { got = append(got, fmt.Sprint(v)) }) {
+		newSink := func() func(NumValue) {
+			part := new([]string)
+			parts = append(parts, part)
+			return func(v NumValue) { *part = append(*part, fmt.Sprint(v)) }
+		}
+		merge := func() {
+			for _, p := range parts {
+				got = append(got, *p...)
+			}
+		}
+		if c.NumValuesQuery(all, attr, newSink, merge) {
 			var want []string
 			for _, ad := range ads {
 				v := ad.EvaluateAttr(attr)
