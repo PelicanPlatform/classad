@@ -1071,3 +1071,20 @@ func (a *Archive) AcquireRead() bool { return a.c.AcquireRead() }
 
 // ReleaseRead balances an AcquireRead that returned true.
 func (a *Archive) ReleaseRead() { a.c.ReleaseRead() }
+
+// ColumnsServable reports whether ScanColumns can serve this query (Collection.ColumnsServable).
+func (a *Archive) ColumnsServable(q *vm.Query, attrs []string) bool {
+	return a.c.ColumnsServable(q, attrs)
+}
+
+// ScanColumns yields the values of attrs for every record matching q, a column at a time
+// (Collection.ScanColumns). The batch handed to fn is borrowed and valid only for that call.
+func (a *Archive) ScanColumns(q *vm.Query, attrs []string, fn func(*Batch) bool) (ColumnScanStats, bool) {
+	return a.c.ScanColumns(q, attrs, fn)
+}
+
+// ScanColumnsRedacted is ScanColumns for a reader not entitled to sealed values
+// (Collection.ScanColumnsRedacted).
+func (a *Archive) ScanColumnsRedacted(q *vm.Query, attrs []string, fn func(*Batch) bool) (ColumnScanStats, bool) {
+	return a.c.ScanColumnsRedacted(q, attrs, fn)
+}

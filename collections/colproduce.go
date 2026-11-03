@@ -161,11 +161,25 @@ func (c *Collection) ScanColumnsRedacted(q *vm.Query, attrs []string, fn func(*B
 	return c.scanColumns(q, attrs, true, fn)
 }
 
+// ColumnsServable reports whether ScanColumns can serve this query at all, without scanning.
+//
+// Every reason ScanColumns declines is knowable before it reads anything -- there is no
+// accelerator, the query is not native, nothing was asked for -- which is what lets a caller that
+// must commit to an answer before the first row decide up front. A relay that returned a sequence
+// and only then discovered it could not serve one would be indistinguishable from a query that
+// matched nothing.
+//
+// ScanColumns asks this same question rather than repeating the conditions, so the two cannot
+// drift into disagreeing about what is servable.
+func (c *Collection) ColumnsServable(q *vm.Query, attrs []string) bool {
+	return c.schemaScan.Load() != nil && c.intern != nil && q != nil && q.Native() && len(attrs) > 0
+}
+
 func (c *Collection) scanColumns(q *vm.Query, attrs []string, redact bool, fn func(*Batch) bool) (ColumnScanStats, bool) {
-	st := c.schemaScan.Load()
-	if st == nil || c.intern == nil || q == nil || !q.Native() || len(attrs) == 0 || fn == nil {
+	if fn == nil || !c.ColumnsServable(q, attrs) {
 		return ColumnScanStats{}, false
 	}
+	st := c.schemaScan.Load()
 	p := newColumnProducer(c, attrs, fn, st.cache, redact)
 	p.run(q, redact)
 	return p.stats, true
