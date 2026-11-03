@@ -36,16 +36,17 @@ type MergeGroupSink func(dst, src GroupSink)
 // groupPassDeclineHook, when non-nil, is consulted once per window and makes the pass decline that
 // window when it returns true.
 //
-// TEST-ONLY, and it exists because the condition it stands in for cannot be reached from data on
-// this path. The ungrouped pass declines on an expression-valued cell, which a fixture can simply
-// store; the GROUPED pass has a scoped tier that EVALUATES such a cell and answers correctly, so
-// whether a given run declines depends on which tier took the block -- measured at 10 declines in 12
-// runs of an identical fixture. A test built on that premise fails one run in six by reporting a
-// correct answer, which is a worse defect than the one it was guarding.
+// TEST-ONLY. An expression-valued cell provokes a decline from data, but only where it sits in a
+// columnar block: a segment with no block -- the shard's write target -- is read record by record,
+// and that fallback evaluates the cell and answers correctly. A fixture that writes the cell in one
+// big transaction does not control which of the two it gets, because a commit applies its writes
+// in map order, so the cell lands anywhere in its shard. Such a test fails a run in four or so by
+// reporting a correct answer.
 //
 // What is under test here is the fan-out's handling of a decline -- that ONE worker stopping aborts
-// the whole pass rather than letting the others answer over a subset -- not the storage condition
-// that provokes one. The hook makes that deterministic. One nil check per window, never per record.
+// the whole pass rather than letting the others answer over a subset -- and WHICH window declines
+// matters to that: the first, before any worker has a group, and a later one, after they have. The
+// hook chooses the window directly. One nil check per window, never per record.
 var groupPassDeclineHook func(segWindow) bool
 
 // mergeGroupAccum folds src's groups into dst. Both must have been built from the same request, so

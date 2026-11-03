@@ -272,8 +272,17 @@ func TestUserAggregatePanicOnAWorkerFailsTheQuery(t *testing.T) {
 // the failure mode every rung of this ladder is built to avoid. The fold must also not run, so a
 // caller cannot read a partial accumulator by mistake.
 //
-// An expression-valued cell in the aggregated column is the decline that is reachable from data: the
-// column has no numeric reading of it at all.
+// An expression-valued cell in a columnar block is the decline that is reachable from data: the
+// column has no numeric reading of it at all. It has to be IN a columnar block, though. A segment
+// with no block -- the shard's write target above all -- is read record by record, and that
+// fallback evaluates the expression and answers correctly, so a fixture whose expression lands
+// there tests nothing and fails by reporting the right sum.
+//
+// Where it lands is decided by the commit, not by insertion order: a transaction applies its
+// writes in map order, so the record written last is anywhere in its shard. Written last in one
+// big transaction, it reached the write target about one run in four. It is committed ALONE and
+// FIRST instead, which makes it the first record of its shard, in a segment that seals long before
+// the fixture is done.
 func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
 	const n = 20000
 	d, err := OpenConfig(Config{SegmentSize: 1 << 16, QueryParallelism: 0, AggMinBytes: testAggGate})
@@ -281,27 +290,26 @@ func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
+	exprKey := n - 1
 	tx := d.Begin()
+	exprAd := classad.New()
+	exprAd.InsertAttr("JobStatus", int64(exprKey%5))
+	exprAd.InsertExpr("Cpus", mustExpr(t, "JobStatus + 1"))
+	tx.NewClassAd(fmt.Sprintf("k%d", exprKey), exprAd)
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	tx = d.Begin()
 	for i := 0; i < n; i++ {
+		if i == exprKey {
+			continue
+		}
 		ad := classad.New()
 		ad.InsertAttr("JobStatus", int64(i%5))
-		if i == n-1 {
-			// The LAST record, so a pass that declines only after reading almost everything is
-			// the case under test -- the partial accumulator is at its most complete and most
-			// plausible exactly here.
-			ad.InsertExpr("Cpus", mustExpr(t, "JobStatus + 1"))
-		} else {
-			ad.InsertAttr("Cpus", int64(i%64))
-		}
+		ad.InsertAttr("Cpus", int64(i%64))
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
-		if i%20000 == 19999 {
-			if err := tx.Commit(); err != nil {
-				t.Fatal(err)
-			}
-			tx = d.Begin()
-		}
 	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	if !d.EnableSchemaScan(4000, 8) {

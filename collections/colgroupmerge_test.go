@@ -35,12 +35,11 @@ func parGroupFixture(tb testing.TB, n int) *Collection {
 // the shape of that answer to assert against, which is why it needs a test of its own: a mutation
 // turning the decline into a `continue` survived every other test in this package and in db.
 //
-// The decline is injected rather than provoked from data, deliberately. The ungrouped pass declines
-// on an expression-valued cell, which a fixture can store; the grouped pass has a scoped tier that
-// EVALUATES such a cell and answers correctly, so whether a given run declines is a property of
-// which tier took the block -- measured at 10 declines in 12 runs over an identical fixture. A test
-// built on that premise fails one run in six by reporting a correct answer. What is under test is
-// the fan-out's handling of a decline, not the storage condition that provokes one.
+// The decline is injected rather than provoked from data, deliberately. An expression-valued cell
+// declines only from a columnar block; in the shard's write target the row fallback evaluates it
+// and answers correctly, and a cell written in one big transaction lands in either, because a
+// commit applies its writes in map order. What is under test is the fan-out's handling of a
+// decline, and which window declines, not the storage condition that provokes one.
 func TestOneDecliningWindowDeclinesTheWholeGroupedFanout(t *testing.T) {
 	c := parGroupFixture(t, 20000)
 
