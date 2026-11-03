@@ -122,8 +122,21 @@ func planJoinRead(spec JoinSpec) joinReadProjection {
 				ok[side] = false
 			}
 			if side == 1 {
-				// At the first step the row half is written against the FROM side's own
-				// ad, so it is read exactly as a table half is.
+				// At the first step the row half may be bare -- written against the FROM
+				// side's own ad -- or qualified. Try the qualified reading first, so a
+				// chain that qualifies every step is read as narrowly as one that does
+				// not; fall back to the bare reading, which is the two-table spelling.
+				if q, qerr := vm.ParseAliases(e.Left, aliases); qerr == nil && q.AliasNative() {
+					if refs := q.AliasRefs(); len(refs) > 0 {
+						for _, r := range refs {
+							if r.Alias < 0 || r.Alias >= len(sets) {
+								return whole
+							}
+							sets[r.Alias].add(r.Name)
+						}
+						continue
+					}
+				}
 				if !addSideRefs(sets[0], e.Left) {
 					ok[0] = false
 				}

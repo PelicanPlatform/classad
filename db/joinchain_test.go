@@ -262,3 +262,39 @@ func TestChainReadsOnlyWhatItNeeds(t *testing.T) {
 		t.Errorf("side 0 reads Owner, which nothing asked for: %v", proj[0])
 	}
 }
+
+// TestChainAcceptsEitherRowHalfSpellingAtTheFirstStep pins that the first step takes a bare
+// row half AND a qualified one, and answers the same.
+//
+// The trap this closes is silent. At the first step the row holds one side, so both spellings
+// are unambiguous -- but a qualified half read against that side's OWN ad is undefined, an
+// undefined key matches nothing, and the join returns no rows and no error. A caller writing a
+// chain qualifies every step, which is exactly the spelling that would have failed.
+func TestChainAcceptsEitherRowHalfSpellingAtTheFirstStep(t *testing.T) {
+	cat := chainFixture(t)
+	bare := chainSpec(JoinInner, JoinInner)
+	qualified := chainSpec(JoinInner, JoinInner)
+	qualified.Steps[0].Equi = []JoinEqui{{Left: "h.ClusterId", Right: "ClusterId"}}
+
+	got := chainRows(t, cat, qualified)
+	wantRows(t, "a qualified row half at the first step", got, []string{"1:1:1", "2:2:2"})
+	wantRows(t, "the two spellings agree", got, chainRows(t, cat, bare))
+}
+
+// TestChainRefusesAForwardReferenceInAnEqualityHalf pins that the forward-reference rule
+// covers the equality halves and not only the ON terms, at EVERY step including the first.
+//
+// A row half naming a side a later step folds in reads undefined, which matches nothing -- the
+// same silent no-rows answer, reached a different way.
+func TestChainRefusesAForwardReferenceInAnEqualityHalf(t *testing.T) {
+	cat := chainFixture(t)
+	spec := chainSpec(JoinInner, JoinInner)
+	spec.Steps[0].Equi = []JoinEqui{{Left: "m.ClusterId", Right: "ClusterId"}}
+	_, err := cat.Join(spec, JoinLimits{}, nil)
+	if err == nil {
+		t.Fatal("an equality half naming a later side was accepted; it matches nothing silently")
+	}
+	if !strings.Contains(err.Error(), "forward reference") {
+		t.Errorf("error does not say what is wrong: %v", err)
+	}
+}

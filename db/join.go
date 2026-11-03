@@ -1,22 +1,22 @@
 package db
 
-// Joining two tables inside the store.
+// Joining two or more tables inside the store.
 //
-// A joined row is a ClassAd whose members are the two sides under their aliases, so `ON`,
+// A joined row is a ClassAd whose members are the sides under their aliases, so `ON`,
 // the residual `WHERE` and everything a caller writes afterwards are ordinary ClassAd
 // expressions over one ad. Nothing here teaches the evaluator a new rule: `h.ClusterId` is
 // the select operator over a nested ad, and an unmatched LEFT row simply has no member for
-// the right side, which is ClassAd's own spelling of SQL's NULL.
+// the side that matched nothing, which is ClassAd's own spelling of SQL's NULL.
 //
-// WHEN IT IS WORTH DOING HERE rather than above the store, which is NOT always, and the
-// caller is the one that decides. A joined row carries both sides, so a join that EXPANDS
-// ships more from here than its inputs were: the left ad is repeated once per output row.
-// Measured over a real connection, a two-table chain that expands puts 1.86x the bytes on
-// the wire that a client pairing the same rows does, and a three-table chain 2.30x; a chain
-// that filters puts far fewer. The direction is set by the expansion ratio -- output rows
-// over input rows -- and nothing here estimates it, so a caller that cannot estimate it
-// either should not assume this is the cheaper place. The measurement is in dbrpc, under
-// TestNwayWireVolumeGrowsWithTheChain.
+// WHAT IT SHIPS AND WHAT IT COSTS ARE DIFFERENT QUESTIONS, and they have different answers.
+// A joined row carries every side, so a join that EXPANDS ships more from here than its
+// inputs were: an earlier side is repeated once per output row, 1.86x the bytes a client
+// pairing the same rows ships at two tables and 2.30x at three. That is measured, it is
+// structural, and it is NOT the cost -- the same expanding chain still answers faster here.
+// Bytes are worth knowing about for a link that is actually narrow; they are not the reason
+// to choose where a join runs. Both measurements are in dbrpc:
+// TestNwayWireVolumeGrowsWithTheChain for the bytes, BenchmarkJoinChainWhereItRuns for the
+// clock.
 //
 // Nor does a client have to fetch both sides whole: it can narrow the second side's read to
 // the key values the first side turned out to hold, which is the same trick planIndexProbe
@@ -34,14 +34,18 @@ package db
 // do, is not here either: it belongs with the columnar machinery and arrives separately.
 // What this buys is the wire and the single-side materialization.
 //
-// AND IT JOINS EXACTLY TWO TABLES, on purpose. A chain of three or more is left-deep -- this
-// join run n-1 times, each step folding in one more table -- so an n-ary opcode would be a
-// generalization rather than a second algorithm, and it is still not built. The measurement
-// above sharpens with every table added: an expanding chain's overshipping grows (1.86x at
-// two tables, 2.30x at three), and the chain that WOULD gain -- one that filters -- gains
-// more from being started at its selective table than from being moved here at all. On that
-// fixture a client that orders its chain ships 13,351 bytes where a three-way join in the
-// store ships 30,679. Join ORDER is the lever that case wants; join LOCATION is not.
+// AND IT JOINS A CHAIN, not only a pair. A chain of three or more is left-deep -- this join
+// run n-1 times, each step folding in one more table -- so it is a generalization rather than
+// a second algorithm, and it runs as one nested loop over one hash per step.
+//
+// It is worth doing here for the reason the two-table case is, only more so: measured end to
+// end over a connection, a three-table chain answers faster in the store than a client pairing
+// the same rows does, on every shape tried and whichever order both are given -- 1.14x on a
+// chain that expands, 3.00x on one that filters, with a fifth of the allocations in the best
+// case. The numbers and the fixture are in dbrpc, under BenchmarkJoinChainWhereItRuns.
+//
+// The expanding case is the one to notice, because it is where this ships MORE: it wins
+// anyway. Which says that what a join costs is not what it ships.
 
 import (
 	"fmt"
@@ -538,14 +542,28 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 			// the first step that is exactly what it holds -- so there the half is read
 			// against the FROM side's own ad, which is what the two-table spelling has
 			// always meant by it. Past the first step it has to be qualified.
+			// A row half may name a side a later step folds in at ANY step, and it reads
+			// undefined if it does -- so the whole chain is checked, not only past the
+			// first step.
+			if err := refuseUnscopedSides("join equality", []string{e.Left}, p.aliases, sp.side-1); err != nil {
+				return nil, err
+			}
 			bare := ""
 			var al *aliasedValue
 			if sp.side == 1 {
+				// At the first step the row holds one side, so BOTH spellings are
+				// unambiguous and both are accepted: a bare path, which is what the
+				// two-table spelling has always written and which the row answers without
+				// being decoded, and a qualified one, which a caller writing a chain will
+				// naturally write at every step including this one. Accepting only the
+				// bare one would be a silent wrong answer rather than an error, since a
+				// qualified half read against the side's own ad is undefined and an
+				// undefined key matches nothing.
 				bare = bareAttrName(e.Left)
-			} else {
-				if err := refuseUnscopedSides("join equality", []string{e.Left}, p.aliases, sp.side-1); err != nil {
-					return nil, err
+				if bare == "" && namesASide(e.Left, p.aliases) {
+					al = compileAliasedValue(e.Left, p.aliases)
 				}
+			} else {
 				if err := requireNamesASide(e.Left, p.aliases); err != nil {
 					return nil, err
 				}
@@ -573,11 +591,22 @@ func requireNamesASide(src string, aliases []string) error {
 		// the row, where the same ambiguity is at least evaluated consistently.
 		return nil
 	}
-	if len(q.AliasRefs()) == 0 {
+	if !namesASide(src, aliases) {
 		return fmt.Errorf("join equality row half %q names no side; past the first step the "+
 			"row holds several, so it must say which one (%s)", src, strings.Join(aliases, ", "))
 	}
 	return nil
+}
+
+// namesASide reports whether an expression qualifies at least one reference with a join
+// alias, which is what makes it readable against the accumulated row rather than against one
+// side's own ad.
+func namesASide(src string, aliases []string) bool {
+	q, err := vm.ParseAliases(src, aliases)
+	if err != nil || !q.AliasNative() {
+		return false
+	}
+	return len(q.AliasRefs()) > 0
 }
 
 // refuseUnscopedSides rejects a term that names a side not yet in the row, or that uses MY

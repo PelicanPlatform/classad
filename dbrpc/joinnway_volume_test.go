@@ -11,7 +11,20 @@ import (
 	"github.com/PelicanPlatform/classad/db"
 )
 
-// WHAT AN N-WAY JOIN IN THE STORE COULD BUY, PRICED BEFORE BUILDING ONE.
+// WHAT A CHAIN JOIN PUTS ON THE WIRE. ONE INPUT, NOT THE VERDICT.
+//
+// Read this next to BenchmarkJoinChainWhereItRuns, which times the same question and answers
+// it the other way. The bytes below are real and the arithmetic behind them is sound; what
+// they are NOT is the cost of a join. On the expanding shape the store ships 2.30x what the
+// client ships and still answers faster, so a decision made from this file alone would have
+// been made from the wrong quantity. These numbers are worth keeping for a link that is
+// genuinely narrow, and for understanding what a joined row IS -- every side, once per output
+// row. They are not worth choosing where a join runs.
+//
+// The arm named "most selective FIRST, all client-side" is the one to be most careful with.
+// It ships the least of anything here, and it is the SLOWEST arm in the timing benchmark, for
+// a reason this file cannot see: a client narrows a later read by sending a constraint, and a
+// constraint over an archive scan filters rather than replaces it.
 //
 // The store's join opcode carries two tables, so a client joining three or more pairs them
 // itself: it fetches each table in turn, narrowing every table after the first to the keys
