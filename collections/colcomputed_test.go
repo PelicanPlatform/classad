@@ -102,13 +102,13 @@ var computedQueries = []string{
 
 // buildComputedFixture writes n fixture records into a persistent collection (archive when archive is
 // true), columnarizes, closes and reopens it so the columns are read back from disk.
-func buildComputedFixture(t *testing.T, dir string, n, excEvery int, archive bool) *Collection {
+func buildComputedFixture(t testing.TB, dir string, n, excEvery int, archive bool) *Collection {
 	return buildComputedFixtureOpts(t, dir, n, excEvery, archive, false)
 }
 
 // buildComputedFixtureOpts is buildComputedFixture; interned archives key each sealed segment's records
 // by its own dictionary.
-func buildComputedFixtureOpts(t *testing.T, dir string, n, excEvery int, archive, interned bool) *Collection {
+func buildComputedFixtureOpts(t testing.TB, dir string, n, excEvery int, archive, interned bool) *Collection {
 	t.Helper()
 	reopened := false
 	type store struct {

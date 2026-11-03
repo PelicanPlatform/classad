@@ -47,6 +47,10 @@ type InternTable struct {
 	// nil means nothing is private. Set at construction only -- flags computed for
 	// already-interned ids are never revisited.
 	privacy func(string) bool
+	// resolve is Name as a bound method value, built once. Handing Name to a decoder as a
+	// func(uint32) (string, bool) otherwise allocates a closure per call -- once per node
+	// decoded, which on a row walk is per attribute of per record.
+	resolve func(uint32) (string, bool)
 }
 
 // internEntry is one id's published state: its canonical (first-seen) casing and
@@ -75,6 +79,7 @@ func NewInternTableWithPrivacy(privacy func(string) bool) *InternTable {
 	}
 	empty := []internEntry{}
 	t.canon.Store(&empty)
+	t.resolve = t.Name
 	return t
 }
 
