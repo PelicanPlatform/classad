@@ -132,6 +132,11 @@ type wireSubsetSelector struct {
 	chaseRefs bool
 	names     []string
 	hashes    []uint32
+	// hide, set for a redacted read of a store that may hold a sealed attribute's values in the
+	// clear (Collection.keylessHidesBytes), names the attributes a row never carries whatever their
+	// stored form. Dropping them is what this path does with a sealed value it holds no key for, so
+	// a value written before its attribute was sealed leaves the row exactly as a sealed one does.
+	hide func([]byte) bool
 }
 
 func (c *Collection) newWireSubsetSelector(projection []string, redact bool) *wireSubsetSelector {
@@ -140,6 +145,9 @@ func (c *Collection) newWireSubsetSelector(projection []string, redact bool) *wi
 
 func (c *Collection) newWireSubsetSelectorRefs(projection []string, redact, chaseRefs bool) *wireSubsetSelector {
 	sel := &wireSubsetSelector{wantAll: len(projection) == 0, redact: redact, chaseRefs: chaseRefs}
+	if redact && c.hidesClearSealed() {
+		sel.hide = c.keylessHidesBytes
+	}
 	seen := make(map[string]struct{}, len(projection))
 	for _, name := range projection {
 		fold := strings.ToLower(name)
@@ -168,6 +176,9 @@ func (sel *wireSubsetSelector) keep(name, node []byte) bool {
 // keepHashed is keep for a caller that has already hashed the name -- the reference closure,
 // which hashes each name once per record and then tests it on every pass.
 func (sel *wireSubsetSelector) keepHashed(name []byte, h uint32, _ []byte) bool {
+	if sel.hide != nil && sel.hide(name) {
+		return false
+	}
 	// The type fields always ship so the row stays typed (never private).
 	if wire.FoldEqualBytes(name, "MyType") || wire.FoldEqualBytes(name, "TargetType") {
 		return true

@@ -105,20 +105,24 @@ func (db *DB) TopKStatsRedacted(constraint string, attrs []string, orderAttr str
 	return rows, stats, err
 }
 
-// topKRun serves both entitlements. The columnar cutoff takes no key either way: it reads only columns,
-// which never hold a sealed value, and declines on any record whose order or predicate value it cannot
-// read as a literal -- a sealed one included -- so a cutoff it does return is the same for both readers.
-// The projection pass decides the rows, so it is the one that has to be keyless.
+// topKRun serves both entitlements. The columnar cutoff takes no key either way: it reads only columns
+// and declines on any record whose order or predicate value it cannot read as a literal, a sealed one
+// included. A column can still hold an attribute's values from before the policy sealed it, so a
+// redacted caller's cutoff is the redacted one, which declines an order attribute the policy seals and
+// plans the constraint as that caller evaluates it (see collections.TopKOrderThresholdRedacted). The
+// projection pass decides the rows, so it is keyless too.
 func (db *DB) topKRun(constraint string, attrs []string, orderAttr string, desc bool, k int, stats *collections.ScanStats, redact bool) ([][]classad.Value, error) {
 	proj, orderIdx, added := withOrderAttr(attrs, orderAttr)
-	c2, err := topKAugment(constraint, orderAttr, desc, k,
-		func(q *vm.Query) (float64, int, bool) { return db.c.TopKOrderThreshold(q, orderAttr, desc, k, stats) })
-	if err != nil {
-		return nil, err
-	}
+	threshold := db.c.TopKOrderThreshold
 	project := db.c.QueryProject
 	if redact {
+		threshold = db.c.TopKOrderThresholdRedacted
 		project = db.c.QueryProjectRedacted
+	}
+	c2, err := topKAugment(constraint, orderAttr, desc, k,
+		func(q *vm.Query) (float64, int, bool) { return threshold(q, orderAttr, desc, k, stats) })
+	if err != nil {
+		return nil, err
 	}
 	return topKResult(project(c2, proj), orderIdx, desc, k, added), nil
 }

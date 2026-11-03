@@ -280,8 +280,8 @@ func (a *wireRowAssembler) note(node []byte) bool {
 			continue
 		}
 		// A private attribute never leaves a redacted row, reference or not -- the same rule
-		// the text projection's closure applies.
-		if a.sel.redact && isPrivateNameBytes(rn) {
+		// the text projection's closure applies -- and neither does one the selector hides.
+		if a.sel.redact && (isPrivateNameBytes(rn) || (a.sel.hide != nil && a.sel.hide(rn))) {
 			continue
 		}
 		h := wire.NameHash32Bytes(rn)

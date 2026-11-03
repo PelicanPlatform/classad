@@ -149,6 +149,11 @@ func (c *Collection) appendWireAd(wireBytes []byte, buf []byte, offs []int, reda
 	// name re-classification and private values are never rendered.
 	good := true
 	emit := func(name string, node []byte) bool {
+		if redact && c.keylessHides(name) {
+			// Sealed by policy but possibly stored in the clear (see hidesClearSealed): rendered as
+			// a sealed value is to this reader.
+			node = undefinedNode
+		}
 		if name == "MyType" || name == "TargetType" {
 			if lit, lok := wire.LiteralValue(node); lok && lit.Kind == wire.LitString {
 				if name == "MyType" {

@@ -84,7 +84,14 @@ func (c *Collection) MigrateSealedAttrs(workers int) int {
 	if c.sealer == nil || c.dir == "" {
 		return 0 // nothing to seal with, or nothing durable to rewrite
 	}
-	if c.sealMigrationDone() {
+	// The policy this pass establishes, read once: the explicit set can be widened while the pass
+	// runs (SetEncryptedAttrs), and records copied before the widen are not sealed under it. So the
+	// marker names the policy the pass started under, and the store is certified clean only for that
+	// generation -- a widen during the pass leaves it uncertified, and the next pass runs.
+	gen := c.sealGen.Load()
+	stamp := c.sealMigrationStamp()
+	if c.sealMigrationDoneFor(stamp) {
+		c.sealCleanGen.Store(int64(gen))
 		return 0
 	}
 	c.maintMu.Lock()
@@ -111,6 +118,12 @@ func (c *Collection) MigrateSealedAttrs(workers int) int {
 	complete := true
 	migrated := 0
 	for _, sh := range c.shards {
+		if c.maintStopping() {
+			// Between shards nothing is mid-rewrite: each shard's segments are swapped whole or
+			// not at all. What is left is the next pass's, and the marker stays unwritten.
+			complete = false
+			break
+		}
 		sh.mu.Lock()
 		// Refuse to retire an active segment that still holds a live delta: the collapse above
 		// runs off the shard lock, so a commit can land between it and here. Skipping the shard
@@ -234,7 +247,8 @@ func (c *Collection) MigrateSealedAttrs(workers int) int {
 		c.deleteDictsBelow(retiredBelow)
 	}
 	if complete {
-		c.markSealMigrationDone()
+		c.markSealMigrationDone(stamp)
+		c.sealCleanGen.Store(int64(gen))
 	}
 	return migrated
 }
@@ -517,21 +531,25 @@ func (c *Collection) sealMigrationStamp() string {
 }
 
 func (c *Collection) sealMigrationDone() bool {
+	return c.sealMigrationDoneFor(c.sealMigrationStamp())
+}
+
+// sealMigrationDoneFor reports whether the marker records a clean pass under stamp.
+func (c *Collection) sealMigrationDoneFor(stamp string) bool {
 	if c.dir == "" {
 		return false
 	}
 	got, err := os.ReadFile(c.sealMigrationPath())
-	return err == nil && string(got) == c.sealMigrationStamp()
+	return err == nil && string(got) == stamp
 }
 
-// markSealMigrationDone records a clean pass. A failure to write it costs a rescan next time, which is
-// why it is not reported: the store is correct either way.
-func (c *Collection) markSealMigrationDone() {
+// markSealMigrationDone records a clean pass under stamp, the policy the pass ran under. A failure to
+// write it costs a rescan next time, which is why it is not reported: the store is correct either way.
+func (c *Collection) markSealMigrationDone(stamp string) {
 	if c.dir == "" {
 		return
 	}
 	path := c.sealMigrationPath()
-	stamp := c.sealMigrationStamp()
 	if got, err := os.ReadFile(path); err == nil && string(got) == stamp {
 		return
 	}

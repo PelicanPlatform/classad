@@ -633,6 +633,12 @@ type Collection struct {
 	// are always sealed regardless). Encrypted attributes are never indexed and never hot.
 	sealer   wire.Sealer
 	encAttrs atomic.Pointer[encSetHolder]
+	// sealGen counts the widenings of the explicit set (SetEncryptedAttrs adding a name), and
+	// sealCleanGen is the sealGen under which the store was last known to hold no value the policy
+	// names in the clear -- a clean seal migration, or a store that had no records when it opened --
+	// or -1 when it never was. See computedTrusted.
+	sealGen      atomic.Uint64
+	sealCleanGen atomic.Int64
 
 	// opm accumulates the collection-wide maintenance timings (compact/retrain/reindex/
 	// columnarize/rotate/merge) for OpStats; per-shard write/segment/sync timings live on
@@ -908,6 +914,7 @@ func New(opts Options) *Collection {
 	// Encryption at rest: build the DB-wide data-key sealer and the explicit encrypted-attr
 	// set. An encrypted attribute (explicit, or an always-encrypted private attribute) must
 	// not also be indexed -- its value is stored opaque, so it could never satisfy an index.
+	c.sealCleanGen.Store(-1)
 	// A data key that cannot seal is refused here, like any other misconfiguration New is
 	// handed (Open reports it as an error instead): see ErrInvalidDataKey.
 	sealer, err := newDataKeySealer(opts.DataKey)
@@ -1496,10 +1503,14 @@ func (c *Collection) refVisitorState(st *scanVisitState, s0 uint64, qp queryPlan
 		st.built = true
 		// Ask the columns before rebuilding a record: over a columnarized segment a rejected record
 		// would otherwise be reassembled in full and then thrown away. nil when the columns cannot
-		// usefully decide this query, which leaves the scan exactly as it was.
-		st.pre = c.newColPrefilter(qp.q)
-		if qp.fold != nil {
-			st.preFold = c.newColPrefilter(qp.fold.q)
+		// usefully decide this query, which leaves the scan exactly as it was -- and when they must
+		// not decide it for this reader (see queryPlan.noColDecide): their scope reads a computed
+		// value where the record keeps an expression.
+		if !qp.noColDecide {
+			st.pre = c.newColPrefilter(qp.q)
+			if qp.fold != nil {
+				st.preFold = c.newColPrefilter(qp.fold.q)
+			}
 		}
 		// A projected read can be built from the named columns instead of reassembling the record and
 		// then discarding most of it -- but only when the match did not need the ad. See colproject.go.
