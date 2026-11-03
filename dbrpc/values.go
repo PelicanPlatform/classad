@@ -346,7 +346,8 @@ func (c *Client) QueryValues(ctx context.Context, table, constraint string, attr
 
 func (b *ValueBatch) clone() ValueBatch {
 	out := ValueBatch{Rows: b.Rows, Cols: make([]ValueColumn, len(b.Cols))}
-	for i, c := range b.Cols {
+	for i := range b.Cols {
+		c := &b.Cols[i]
 		out.Cols[i] = ValueColumn{
 			Kind:       c.Kind,
 			Valid:      append([]byte(nil), c.Valid...),
@@ -543,19 +544,19 @@ func (e *valueEncoder) encode(b []byte) []byte {
 			switch kind {
 			case KindInt:
 				if v.Type() == classad.IntegerValue {
-					n, _ := v.IntValue()
+					n, _ := v.IntValue() //nolint:errcheck // the case above established the type
 					ints = append(ints, n)
 					packed = true
 				}
 			case KindReal:
 				if v.Type() == classad.RealValue {
-					f, _ := v.RealValue()
+					f, _ := v.RealValue() //nolint:errcheck // the case above established the type
 					reals = append(reals, f)
 					packed = true
 				}
 			case KindBool:
 				if v.Type() == classad.BooleanValue {
-					t, _ := v.BoolValue()
+					t, _ := v.BoolValue() //nolint:errcheck // the case above established the type
 					if nbool%8 == 0 {
 						boolBits = append(boolBits, 0)
 					}
@@ -567,7 +568,7 @@ func (e *valueEncoder) encode(b []byte) []byte {
 				}
 			case KindString:
 				if v.Type() == classad.StringValue {
-					s, _ := v.StringValue()
+					s, _ := v.StringValue() //nolint:errcheck // the case above established the type
 					strs = append(strs, s)
 					packed = true
 				}
@@ -619,20 +620,20 @@ func appendExcValue(b []byte, v classad.Value) []byte {
 	case classad.ErrorValue:
 		return append(b, excError)
 	case classad.IntegerValue:
-		n, _ := v.IntValue()
+		n, _ := v.IntValue() //nolint:errcheck // the case label established the type
 		return putU64(append(b, excInt), uint64(n))
 	case classad.RealValue:
-		f, _ := v.RealValue()
+		f, _ := v.RealValue() //nolint:errcheck // the case label established the type
 		return putU64(append(b, excReal), math.Float64bits(f))
 	case classad.BooleanValue:
-		t, _ := v.BoolValue()
+		t, _ := v.BoolValue() //nolint:errcheck // the case label established the type
 		x := byte(0)
 		if t {
 			x = 1
 		}
 		return append(append(b, excBool), x)
 	case classad.StringValue:
-		s, _ := v.StringValue()
+		s, _ := v.StringValue() //nolint:errcheck // the case label established the type
 		return putStr(append(b, excString), s)
 	}
 	// A list or a nested ad: its text is the only form that keeps it whole.
@@ -682,9 +683,9 @@ func decodeValueBatch(r *reader, out *ValueBatch) bool {
 				c.Reals = append(c.Reals, math.Float64frombits(r.u64()))
 			}
 		case KindBool:
-			bits := r.bytesRef()
+			packed := r.bytesRef()
 			for k := 0; k < m; k++ {
-				c.Bools = append(c.Bools, bitSet(bits, k))
+				c.Bools = append(c.Bools, bitSet(packed, k))
 			}
 		case KindString:
 			for k := 0; k < m; k++ {

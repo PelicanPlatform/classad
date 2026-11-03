@@ -27,7 +27,7 @@ func TestStartMaintenanceCompactsDeadSpace(t *testing.T) {
 
 	big := strings.Repeat("x", 500)
 	mkAd := func(i int) *classad.ClassAd {
-		ad, perr := classad.ParseOld(fmt.Sprintf("Name = \"k%d\"\nData = \"%s\"", i, big))
+		ad, perr := classad.ParseOld(fmt.Sprintf("Name = \"k%d\"\nData = %q", i, big))
 		if perr != nil {
 			t.Fatal(perr)
 		}
@@ -95,7 +95,7 @@ func TestStartMaintenanceCompactionDisabled(t *testing.T) {
 	for pass := 0; pass < 3; pass++ {
 		tx := d.Begin()
 		for i := 0; i < 4000; i++ {
-			ad, _ := classad.ParseOld(fmt.Sprintf("Name = \"k%d\"\nData = \"%s\"", i, big))
+			ad, _ := classad.ParseOld(fmt.Sprintf("Name = \"k%d\"\nData = %q", i, big))
 			tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 		}
 		_ = tx.Commit()

@@ -149,12 +149,11 @@ func (s *Server) streamTxnQueryKeys(ctx context.Context, reqID uint64, r *reader
 // concurrent use -- a write op pipelined onto the same transaction mid-scan would race
 // the scan's read of the write buffer.
 func (s *Server) withTxnStream(reqID, id uint64, write func([]byte), fn func(*serverTxn)) {
-	v, ok := s.txns.Load(id)
+	st, ok := s.loadTxn(id)
 	if !ok {
 		write(respErr(reqID, "no such transaction"))
 		return
 	}
-	st := v.(*serverTxn)
 	st.lastTouch.Store(nowNano())
 	st.mu.Lock()
 	defer st.mu.Unlock()

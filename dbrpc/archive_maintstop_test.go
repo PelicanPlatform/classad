@@ -42,7 +42,7 @@ func TestArchiveMaintenanceStopsBetweenSteps(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer cat.Close() //nolint:errcheck
+		defer cat.Close() //nolint:errcheck // nothing left to do with a close failure at the end of a test helper
 		a, err := cat.CreateArchiveTable("history", db.ArchiveConfig{SegmentSize: 1 << 12})
 		if err != nil {
 			t.Fatal(err)

@@ -29,7 +29,7 @@ func (c *oldServerConn) ReadMsg() ([]byte, error) {
 			return frame, nil
 		}
 		reqID, _ := frameReqID(frame)
-		if err := c.MsgConn.WriteMsg(respBad(reqID)); err != nil {
+		if err := c.WriteMsg(respBad(reqID)); err != nil {
 			return nil, err
 		}
 	}
@@ -71,7 +71,7 @@ func seedStatusMix(t *testing.T, c *Client) {
 	}
 	for i, r := range rows {
 		if err := tx.NewClassAd(ctx, fmt.Sprintf("k%d", i), fmt.Sprintf(
-			"Owner = \"%s\"\nJobStatus = %d\nCpus = %d\n", r.owner, r.status, r.cpus)); err != nil {
+			"Owner = %q\nJobStatus = %d\nCpus = %d\n", r.owner, r.status, r.cpus)); err != nil {
 			t.Fatal(err)
 		}
 	}

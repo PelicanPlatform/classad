@@ -802,15 +802,8 @@ func (s *Server) streamQueryRawWireOpt(ctx context.Context, reqID uint64, r *rea
 	write(respHead(reqID, stStreamEnd))
 }
 
-// wireOp and wireOpName name the wire-row contract a request arrived under, so the archive
-// refusal and the query log both say which one the caller asked for.
-func wireOp(chaseRefs bool) op {
-	if chaseRefs {
-		return opQueryRawWireOpts
-	}
-	return opQueryRawWire
-}
-
+// wireOpName names the wire-row contract a request arrived under, so the archive refusal and
+// the query log both say which one the caller asked for.
 func wireOpName(chaseRefs bool) string {
 	if chaseRefs {
 		return "QueryRawWireRefs"

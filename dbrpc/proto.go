@@ -691,7 +691,9 @@ func reqHeader(frame []byte) (reqID uint64, o op, body *reader, ok bool) {
 	return reqID, o, r, true
 }
 
-func respHeader(frame []byte) (reqID uint64, status int32, body *reader, ok bool) {
+// respHeader parses a response frame header. reqID is returned for symmetry with reqHeader
+// and because the frame carries it either way; no caller needs it today.
+func respHeader(frame []byte) (reqID uint64, status int32, body *reader, ok bool) { //nolint:unparam // see above
 	r := &reader{b: frame}
 	reqID = r.u64()
 	status = r.i32()

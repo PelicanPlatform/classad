@@ -140,9 +140,9 @@ func TestArchiveAdminOverRPC(t *testing.T) {
 	// Admin is DAEMON-gated: a non-privileged connection is refused.
 	rc, rcleanup := catServerPair(t, ServeOptions{})
 	defer rcleanup()
-	if err := rc.CreateArchiveTable(ctx, "history", db.ArchiveConfig{}); err != nil {
-		// created on its own catalog; ignore
-	}
+	// rc has its own catalog, so this may or may not have to create the table; either way the
+	// next call is what the test is about.
+	_ = rc.CreateArchiveTable(ctx, "history", db.ArchiveConfig{}) //nolint:errcheck // see above
 	if _, err := rc.AdminTable(ctx, "history", "codec.retrain"); err == nil {
 		t.Error("archive admin should require DAEMON authorization")
 	}

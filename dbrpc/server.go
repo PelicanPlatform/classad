@@ -677,7 +677,7 @@ func (s *Server) ServeConnOpts(conn MsgConn, opts ServeOptions) error {
 		if h := writeHook.Load(); h != nil {
 			(*h)(b)
 		}
-		_ = conn.WriteMsg(b)
+		_ = conn.WriteMsg(b) //nolint:errcheck // a dead connection is noticed by the read loop, which is the one place that reports it
 	}
 	for {
 		frame, err := conn.ReadMsg()
@@ -1978,11 +1978,10 @@ func (s *Server) withTxn(reqID uint64, r *reader, fn func(*serverTxn) []byte) []
 	if r.err != nil {
 		return respBad(reqID)
 	}
-	v, ok := s.txns.Load(id)
+	st, ok := s.loadTxn(id)
 	if !ok {
 		return respErr(reqID, "no such transaction")
 	}
-	st := v.(*serverTxn)
 	st.lastTouch.Store(nowNano())
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -2035,11 +2034,14 @@ func (s *Server) reapIdleTxns(maxIdle time.Duration) int {
 	cutoff := nowNano() - int64(maxIdle)
 	reaped := 0
 	s.txns.Range(func(k, v any) bool {
-		st := v.(*serverTxn)
-		if st.lastTouch.Load() > cutoff {
+		st, ok := v.(*serverTxn)
+		if !ok || st.lastTouch.Load() > cutoff {
 			return true
 		}
-		id := k.(uint64)
+		id, ok := k.(uint64)
+		if !ok {
+			return true
+		}
 		if taken, ok := s.take(id); ok {
 			taken.mu.Lock()
 			taken.tx.Abort()
@@ -2090,13 +2092,26 @@ func (st *serverTxn) record(s *Server, op WriteOp) {
 	}
 }
 
+// loadTxn returns the live transaction with this id. s.txns is keyed uint64 and only ever
+// holds *serverTxn, so the assertion is a formality -- but a formality that costs nothing
+// and will not panic the server if that ever stops being true.
+func (s *Server) loadTxn(id uint64) (*serverTxn, bool) {
+	v, ok := s.txns.Load(id)
+	if !ok {
+		return nil, false
+	}
+	st, ok := v.(*serverTxn)
+	return st, ok
+}
+
 // take removes and returns a transaction (for commit/abort).
 func (s *Server) take(id uint64) (*serverTxn, bool) {
 	v, ok := s.txns.LoadAndDelete(id)
 	if !ok {
 		return nil, false
 	}
-	return v.(*serverTxn), true
+	st, ok := v.(*serverTxn)
+	return st, ok
 }
 
 // --- response frame builders ---
