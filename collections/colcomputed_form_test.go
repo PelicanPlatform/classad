@@ -629,8 +629,21 @@ func checkComputedExtra(t *testing.T, f *formFixture, label string) {
 			}
 		}
 		// Every value the column yields, as a multiset, against evaluation.
+		// One sink per worker, merged on the calling goroutine: the pass fans out across
+		// segments, so a single closure appending to one slice would be a data race.
 		var got []string
-		if c.NumValuesQuery(all, attr, func(v NumValue) { got = append(got, fmt.Sprint(v)) }) {
+		var sinks []*[]string
+		newSink := func() func(NumValue) {
+			s := new([]string)
+			sinks = append(sinks, s)
+			return func(v NumValue) { *s = append(*s, fmt.Sprint(v)) }
+		}
+		merge := func() {
+			for _, s := range sinks {
+				got = append(got, *s...)
+			}
+		}
+		if c.NumValuesQuery(all, attr, newSink, merge) {
 			var want []string
 			for _, ad := range ads {
 				v := ad.EvaluateAttr(attr)
