@@ -205,12 +205,12 @@ func TestArchiveGroupedStringColumnDeclinesExpressions(t *testing.T) {
 		} else {
 			src += fmt.Sprintf("Owner = \"user%d\"\n", i%500)
 		}
-		ad, err := classad.ParseOld(src)
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.ParseOld(src)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
 	if !a.BuildAndEnableSchemaScan(4000, 8) {

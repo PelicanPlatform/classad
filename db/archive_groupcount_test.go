@@ -268,9 +268,9 @@ func TestArchiveGroupCountSurvivesReopen(t *testing.T) {
 	}
 	owners := []string{"alice", "bob", "carol"}
 	for i := 0; i < 3000; i++ {
-		if err := hist.AppendOld(fmt.Sprintf("Owner = %q\nPad = %q",
-			owners[i%3], strings.Repeat("y", 200))); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(fmt.Sprintf("Owner = %q\nPad = %q",
+			owners[i%3], strings.Repeat("y", 200))); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	cat.Close()

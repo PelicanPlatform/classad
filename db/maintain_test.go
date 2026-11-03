@@ -83,14 +83,14 @@ func TestMaintainAutoTunesIndexes(t *testing.T) {
 		ad, _ := classad.ParseOld(fmt.Sprintf("Owner = \"user%d\"\nArch = \"X86_64\"", i%25))
 		tx.NewClassAd(fmt.Sprintf("%d.0", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	// Generate demand on Owner (equality queries).
 	for i := 0; i < 20; i++ {
-		seq, err := d.Query(`Owner == "user1"`)
-		if err != nil {
-			t.Fatal(err)
+		seq, qerr := d.Query(`Owner == "user1"`)
+		if qerr != nil {
+			t.Fatal(qerr)
 		}
 		for range seq {
 		}

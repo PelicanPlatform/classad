@@ -116,9 +116,9 @@ func CheckAggregateEqual(agg Aggregate, samples []classad.Value, equal func(a, b
 		what       string
 		data, unit bool // which side of the merge carries the samples
 	}{{"acc.Merge(empty)", true, false}, {"empty.Merge(acc)", false, true}} {
-		got, err := mergeOf(fold, nilIf(samples, !c.data), nilIf(samples, !c.unit))
-		if err != nil {
-			return err
+		got, merr := mergeOf(fold, nilIf(samples, !c.data), nilIf(samples, !c.unit))
+		if merr != nil {
+			return merr
 		}
 		if !same(want, got) {
 			return fmt.Errorf("CheckAggregate: %s is not the identity: want %q, got %q",
@@ -131,17 +131,17 @@ func CheckAggregateEqual(agg Aggregate, samples []classad.Value, equal func(a, b
 	// almost never wrong only at one cut.
 	for _, k := range splitPoints(len(samples)) {
 		a, b := samples[:k], samples[k:]
-		ab, err := mergeOf(fold, a, b)
-		if err != nil {
-			return err
+		ab, merr := mergeOf(fold, a, b)
+		if merr != nil {
+			return merr
 		}
 		if !same(want, ab) {
 			return fmt.Errorf("CheckAggregate: merge of a %d/%d split disagrees with the serial fold: want %q, got %q",
 				len(a), len(b), ValueText(want), ValueText(ab))
 		}
-		ba, err := mergeOf(fold, b, a)
-		if err != nil {
-			return err
+		ba, merr := mergeOf(fold, b, a)
+		if merr != nil {
+			return merr
 		}
 		if !same(ab, ba) {
 			return fmt.Errorf("CheckAggregate: merge is not commutative at a %d/%d split: %q one way, %q the other",

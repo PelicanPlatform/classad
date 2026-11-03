@@ -30,8 +30,8 @@ func TestDBTimeTravel(t *testing.T) {
 	}
 
 	// Disabled by default.
-	if _, err := db.QueryAsOf("true", time.Now()); err != collections.ErrTimeTravelDisabled {
-		t.Fatalf("QueryAsOf before enable = %v, want ErrTimeTravelDisabled", err)
+	if _, queryAsOfErr := db.QueryAsOf("true", time.Now()); queryAsOfErr != collections.ErrTimeTravelDisabled {
+		t.Fatalf("QueryAsOf before enable = %v, want ErrTimeTravelDisabled", queryAsOfErr)
 	}
 
 	// Enable with a fine checkpoint cadence so distinct writes get distinct checkpoints.
@@ -56,8 +56,8 @@ func TestDBTimeTravel(t *testing.T) {
 		t.Errorf("count(JobStatus==2) AS OF now = %d, want 1", n)
 	}
 
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := db.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: the setting persisted, and AS OF still resolves (index rebuilt on recovery).
@@ -74,11 +74,11 @@ func TestDBTimeTravel(t *testing.T) {
 
 	// Disable, and confirm it is refused and persists.
 	db2.SetTimeTravel(0, 0)
-	if _, err := db2.QueryAsOf("true", time.Now()); err != collections.ErrTimeTravelDisabled {
-		t.Fatalf("QueryAsOf after disable = %v, want ErrTimeTravelDisabled", err)
+	if _, queryAsOfErr := db2.QueryAsOf("true", time.Now()); queryAsOfErr != collections.ErrTimeTravelDisabled {
+		t.Fatalf("QueryAsOf after disable = %v, want ErrTimeTravelDisabled", queryAsOfErr)
 	}
-	if err := db2.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := db2.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	db3, err := Open(dir)
 	if err != nil {

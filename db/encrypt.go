@@ -184,8 +184,8 @@ func loadOrMintMaster(dir string, poolKeys []KEK) (master []byte, rows []crypt.M
 			}
 			rows = append(rows, row)
 		}
-		if err := saveMasterRows(path, rows); err != nil {
-			return nil, nil, err
+		if saveErr := saveMasterRows(path, rows); saveErr != nil {
+			return nil, nil, saveErr
 		}
 		return master, rows, nil
 	}
@@ -195,8 +195,8 @@ func loadOrMintMaster(dir string, poolKeys []KEK) (master []byte, rows []crypt.M
 	// Rotation: add a wrapping for any available pool key not yet on file, so a
 	// newly-provisioned key can open the DB on the next start.
 	if addMissingWraps(&rows, master, poolKeys) {
-		if err := saveMasterRows(path, rows); err != nil {
-			return nil, nil, err
+		if saveErr := saveMasterRows(path, rows); saveErr != nil {
+			return nil, nil, saveErr
 		}
 	}
 	return master, rows, nil

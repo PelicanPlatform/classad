@@ -208,13 +208,13 @@ func TestArchiveGroupedCountRealAndIntSameGroup(t *testing.T) {
 		if i%100 == 3 {
 			tally = fmt.Sprintf("Tally = %d", i%4)
 		}
-		ad, err := classad.ParseOld(fmt.Sprintf("ClusterId = %d\nRequestMemory = %d\n%s",
+		ad, perr := classad.ParseOld(fmt.Sprintf("ClusterId = %d\nRequestMemory = %d\n%s",
 			i, 1024+(i%32)*512, tally))
-		if err != nil {
-			t.Fatal(err)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
 	if !a.BuildAndEnableSchemaScan(4000, 8) {

@@ -28,8 +28,8 @@ func TestArchiveConfigConcurrentPersist(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 50; i++ {
-		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nCompletionDate = %d\nOwner = \"u\"\nRequestMemory = %d", i, 1000+i, i)); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nCompletionDate = %d\nOwner = \"u\"\nRequestMemory = %d", i, 1000+i, i)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 
@@ -48,14 +48,14 @@ func TestArchiveConfigConcurrentPersist(t *testing.T) {
 	run(func() { hist.AddIndex([]string{"Owner"}, nil) })
 	run(func() { hist.AddIndex(nil, []string{"RequestMemory"}) })
 	run(func() {
-		if _, err := hist.SetSchemaRequireAttrs([]string{"RequestMemory", "CompletionDate"}); err != nil {
-			t.Errorf("SetSchemaRequireAttrs: %v", err)
+		if _, setSchemaRequireAttrsErr := hist.SetSchemaRequireAttrs([]string{"RequestMemory", "CompletionDate"}); setSchemaRequireAttrsErr != nil {
+			t.Errorf("SetSchemaRequireAttrs: %v", setSchemaRequireAttrsErr)
 		}
 	})
 	run(func() { hist.AddHotAttrs("Owner") })
 	run(func() {
-		if err := hist.SetRowGroupBytes(1 << 16); err != nil {
-			t.Errorf("SetRowGroupBytes: %v", err)
+		if setRowGroupBytesErr := hist.SetRowGroupBytes(1 << 16); setRowGroupBytesErr != nil {
+			t.Errorf("SetRowGroupBytes: %v", setRowGroupBytesErr)
 		}
 	})
 	close(start)

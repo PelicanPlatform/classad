@@ -18,18 +18,18 @@ func TestExporterCRUDAndState(t *testing.T) {
 		Kind:   "kafka",
 		Config: json.RawMessage(`{"brokers":["b:9092"],"topic":"htc.jobs"}`),
 	}
-	if err := cat.CreateExporter(def); err != nil {
-		t.Fatalf("CreateExporter: %v", err)
+	if createExporterErr := cat.CreateExporter(def); createExporterErr != nil {
+		t.Fatalf("CreateExporter: %v", createExporterErr)
 	}
 	// Duplicate is rejected.
-	if err := cat.CreateExporter(def); err == nil {
+	if createExporterErr := cat.CreateExporter(def); createExporterErr == nil {
 		t.Fatal("creating a duplicate exporter should fail")
 	}
 	// Invalid name / missing kind rejected.
-	if err := cat.CreateExporter(ExporterDef{Name: "bad name", Kind: "kafka"}); err == nil {
+	if createExporterErr := cat.CreateExporter(ExporterDef{Name: "bad name", Kind: "kafka"}); createExporterErr == nil {
 		t.Fatal("invalid exporter name should fail")
 	}
-	if err := cat.CreateExporter(ExporterDef{Name: "nokind"}); err == nil {
+	if createExporterErr := cat.CreateExporter(ExporterDef{Name: "nokind"}); createExporterErr == nil {
 		t.Fatal("missing kind should fail")
 	}
 
@@ -43,30 +43,30 @@ func TestExporterCRUDAndState(t *testing.T) {
 	}
 
 	// No state until the first checkpoint.
-	if _, ok, err := cat.LoadExporterState("jobs"); err != nil || ok {
-		t.Fatalf("fresh exporter should have no state: ok=%v err=%v", ok, err)
+	if _, loadExporterStateOK, stateErr := cat.LoadExporterState("jobs"); stateErr != nil || loadExporterStateOK {
+		t.Fatalf("fresh exporter should have no state: loadExporterStateOK=%v err=%v", loadExporterStateOK, stateErr)
 	}
 	// Save then load state round-trips.
 	state := []byte("cursor=abc;seq=42")
-	if err := cat.SaveExporterState("jobs", state); err != nil {
-		t.Fatalf("SaveExporterState: %v", err)
+	if saveExporterStateErr := cat.SaveExporterState("jobs", state); saveExporterStateErr != nil {
+		t.Fatalf("SaveExporterState: %v", saveExporterStateErr)
 	}
 	blob, ok, err := cat.LoadExporterState("jobs")
 	if err != nil || !ok || !bytes.Equal(blob, state) {
 		t.Fatalf("LoadExporterState = %q, %v, %v", blob, ok, err)
 	}
 	// Overwrite replaces.
-	if err := cat.SaveExporterState("jobs", []byte("cursor=def;seq=99")); err != nil {
-		t.Fatal(err)
+	if saveExporterStateErr := cat.SaveExporterState("jobs", []byte("cursor=def;seq=99")); saveExporterStateErr != nil {
+		t.Fatal(saveExporterStateErr)
 	}
 	if blob, _, _ := cat.LoadExporterState("jobs"); string(blob) != "cursor=def;seq=99" {
 		t.Fatalf("state after overwrite = %q", blob)
 	}
 	// State on a non-existent exporter is an error.
-	if _, _, err := cat.LoadExporterState("ghost"); err == nil {
+	if _, _, loadExporterStateErr := cat.LoadExporterState("ghost"); loadExporterStateErr == nil {
 		t.Fatal("state of a non-existent exporter should error")
 	}
-	if err := cat.SaveExporterState("ghost", state); err == nil {
+	if saveExporterStateErr := cat.SaveExporterState("ghost", state); saveExporterStateErr == nil {
 		t.Fatal("saving state for a non-existent exporter should error")
 	}
 	cat.Close()
@@ -85,15 +85,15 @@ func TestExporterCRUDAndState(t *testing.T) {
 	}
 
 	// Drop removes definition and state from disk.
-	if err := cat2.DropExporter("jobs"); err != nil {
-		t.Fatalf("DropExporter: %v", err)
+	if dropExporterErr := cat2.DropExporter("jobs"); dropExporterErr != nil {
+		t.Fatalf("DropExporter: %v", dropExporterErr)
 	}
 	if got := cat2.Exporters(); len(got) != 0 {
 		t.Fatalf("after drop, Exporters = %+v", got)
 	}
 	// Dropping again is a no-op.
-	if err := cat2.DropExporter("jobs"); err != nil {
-		t.Fatalf("second DropExporter should be a no-op, got %v", err)
+	if dropExporterErr := cat2.DropExporter("jobs"); dropExporterErr != nil {
+		t.Fatalf("second DropExporter should be a no-op, got %v", dropExporterErr)
 	}
 
 	cat3, err := OpenCatalog(dir)
