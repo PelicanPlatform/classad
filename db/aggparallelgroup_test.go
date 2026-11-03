@@ -174,9 +174,12 @@ func TestGroupedFanoutIsNotFooledByStringIds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// A group reads as the VALUE it is, so a string group carries its quotes (see
+	// GroupValueText). The reference has to render its owners the same way or it is keyed
+	// differently from the answer it checks.
 	want := map[string]int{}
 	for i := 0; i < n; i++ {
-		want[fmt.Sprintf("user%d", i%37)]++
+		want[GroupValueText(classad.NewStringValue(fmt.Sprintf("user%d", i%37)))]++
 	}
 	if len(rows) != len(want) {
 		t.Fatalf("%d groups, want %d: the fold split or fused string groups", len(rows), len(want))
