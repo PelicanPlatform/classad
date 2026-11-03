@@ -282,9 +282,11 @@ jobs:
   # own sharded job below, for the same reason collections does.
   #
   # wasmudf/ joins them: it is its own module so that the wazero dependency
-  # is opt-in rather than reaching everyone who imports classad, and its
-  # suite is a couple of seconds (the wasm fixtures are hand-written and
-  # tiny, and the only slow test is a 250ms wall-clock backstop).
+  # is opt-in rather than reaching everyone who imports classad. Its suite is
+  # well under a minute with -race -- the wasm fixtures are hand-written and
+  # tiny; what costs is a handful of aggregate tests that build a 20k-record
+  # table to make the engine's aggregate pass fan out, plus a 250ms wall-clock
+  # backstop.
   modules:
     name: Module (${{ matrix.module }})
     runs-on: ubuntu-latest
