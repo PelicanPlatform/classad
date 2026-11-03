@@ -116,6 +116,17 @@ func popcountMask(m []uint64) int {
 	return n
 }
 
+// maskAny reports whether any record is set. Cheaper than popcountMask where only emptiness matters,
+// and it is asked once per arm rather than per record.
+func maskAny(m []uint64) bool {
+	for _, w := range m {
+		if w != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // flushCharge bills everything executed since the last flush, at the live count that was in force
 // for it, and starts a new run at cur.
 //

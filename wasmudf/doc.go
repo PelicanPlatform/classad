@@ -182,11 +182,64 @@
 // as well as the cheap one: the engine's unit of work is the batch, so a deadline
 // per record would let a batch of 4096 run for 4096 times the configured limit.
 //
+// # Aggregates
+//
+// A guest can also supply an AGGREGATE, which the database engine reduces with
+// exactly as it reduces with SUM. It is a separate export set under its own
+// version -- a module is one or the other -- because the two have nothing in
+// common at the boundary except the value slot above.
+//
+//	(memory (export "memory") ...)
+//	(func (export "classad_udaf_abi_version") (result i32))
+//	(func (export "classad_udaf_init")   (param i32 i32) (result i32))
+//	(func (export "classad_udaf_fold")   (param i32 i32 i32 i32 i32 i32) (result i32))
+//	(func (export "classad_udaf_merge")  (param i32 i32 i32 i32 i32 i32) (result i32))
+//	(func (export "classad_udaf_result") (param i32 i32 i32) (result i32))
+//
+// Four operations: produce the identity state, fold a batch of value slots into a
+// state, merge two states, render a state as one value slot. init and fold and
+// merge return the length of the state they wrote, or a negative number to refuse;
+// result returns a status like a scalar call.
+//
+// THE STATE IS BYTES THE HOST HOLDS, not a handle into guest memory, and the
+// reason is lifetime rather than speed. An accumulator holding a handle would pin
+// the instance that minted it, and the engine's accumulator interface has no
+// close -- worse, when the columnar pass declines, every worker's accumulator is
+// dropped with neither merge nor result ever called, so there is no moment at
+// which guest memory could even be inferred to be free. With the state in the
+// host, an accumulator is an ordinary Go value, instances are borrowed per call as
+// the scalar path borrows them, and merging two states works whichever instances
+// they were folded in. The copy that costs is amortized by folding a BATCH of
+// values per call.
+//
+// MERGE IS NOT DECORATION. The engine's columnar aggregate pass fans out across
+// segment windows: one state per worker, folded once every worker has returned.
+// Which worker draws which segment is a race, so merge must be associative and
+// commutative and the aggregate must not depend on the order values arrive in. A
+// guest that gets this wrong is wrong only sometimes, and plausibly.
+//
+// The OPTIONAL export classad_udaf_fold_num, with fold's signature and slot
+// layout, is how a guest says it may be fed from a column: that its answer does
+// not depend on arrival order, and that it does not count what it was never
+// offered -- the column pass yields only a column's numeric values, so a record
+// whose argument is absent or a string is not offered at all. A guest for which
+// both hold exports the same function under both names. Without it the aggregate
+// is served from the record scan, which is correct and slower, never wrong.
+// db.CheckAggregate tests all of it against a real sample.
+//
 // # Failures
 //
-// Everything a guest can do wrong is either a load error or the ClassAd value
-// ERROR. Nothing becomes a panic: a daemon evaluating an expression runs no
+// Everything a FUNCTION guest can do wrong is either a load error or the ClassAd
+// value ERROR. Nothing becomes a panic: a daemon evaluating an expression runs no
 // top-level recover, so a panic escaping here would reach the process, and a UDF
 // in a Requirements expression would take the daemon down one match at a time.
 // See Reason for the full list and UDF.Call for the classification.
+//
+// AN AGGREGATE IS THE OPPOSITE, deliberately. It reports a failure by panicking
+// with an *AggError, because containment for an aggregate is per query rather than
+// per row: a record evaluating to ERROR says nothing about the others, where a
+// state that stopped being updated part-way is a wrong answer indistinguishable
+// from a right one. The engine's aggregate pass recovers it -- on the calling
+// goroutine, even for a panic raised on a worker -- and fails the query naming the
+// aggregate. Nothing here is left for a caller of this package to recover.
 package wasmudf

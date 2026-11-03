@@ -365,6 +365,27 @@ const (
 	// The flags word is reserved and currently empty; an unknown bit is REFUSED, for the same
 	// reason the wire-row ops refuse one.
 	opQueryValues op = 70
+
+	// opJoinWire is opJoin with its rows in WIRE FORM, batched many per frame: the request
+	// frame is opJoin's with a redact byte appended, and the reply is
+	//   -> stream of [nRows i32]{[len u32][row bytes]}, then stStreamEnd
+	// exactly as opQueryRawWire's is.
+	//
+	// Two costs it removes, measured on a history-to-epoch_history join of 8000 rows. The
+	// server renders every joined row to old-ClassAd text (350,978 allocations) and the
+	// consumer parses it back (536,132) -- together about twice what the join itself costs,
+	// and neither depends on the transport. And opJoin sends ONE FRAME PER ROW, which a
+	// batched reply turns into a frame per 64KB.
+	//
+	// It does NOT ship fewer bytes, and is not meant to. A joined row carries both sides, so
+	// an expanding join repeats the left ad once per output row; that is structural, the
+	// crossover sits where the join stops being selective, and no encoding moves it because
+	// an encoding scales both arms alike.
+	//
+	// redact withholds each side's private attributes, which the text reply does in its
+	// render. The join still runs over the FULL rows: redacting before the condition would
+	// make which rows match depend on who asked.
+	opJoinWire op = 71
 )
 
 // putScanStats appends a ScanStats trailer: counts as int32 (each well under 2^31 for any real
@@ -523,6 +544,8 @@ func (o op) String() string {
 		return "QueryValues"
 	case opJoin:
 		return "Join"
+	case opJoinWire:
+		return "JoinWire"
 	}
 	return "op(unknown)"
 }

@@ -69,11 +69,18 @@ const (
 	// shorter than it claims, the result column is not in the data form, or the
 	// argument count is outside the registered arity.
 	ReasonBatchShape
+
+	// ReasonAggState -- an aggregate's serialized state does not fit the buffer
+	// it was given: either the host holds one longer than MaxStateBytes, or the
+	// guest reported writing more than the capacity it was handed. It is kept
+	// apart from ReasonStatus, which is the guest DECLINING, because one is a
+	// module asking for more room and the other is a module refusing the input.
+	ReasonAggState
 )
 
 // reasonCount sizes the per-reason counters. It is derived from the last constant
 // rather than written out, so adding a Reason cannot leave a counter unallocated.
-const reasonCount = int(ReasonBatchShape) + 1
+const reasonCount = int(ReasonAggState) + 1
 
 var reasonNames = [reasonCount]string{
 	ReasonNone:           "none",
@@ -90,6 +97,7 @@ var reasonNames = [reasonCount]string{
 	ReasonBatchTooLarge:  "batch too large",
 	ReasonBatchStrings:   "batch holds strings",
 	ReasonBatchShape:     "malformed batch",
+	ReasonAggState:       "aggregate state does not fit",
 }
 
 func (r Reason) String() string {

@@ -197,9 +197,31 @@ func (s *VecScratch) enterIf(vops []int32, ct condTargets, at int) (int, bool) {
 		elseAt: ct.onFalse, end: ct.end, arm: armThen,
 		thenMask: thenM, elseMask: elseM, outer: s.live,
 	})
+	if !maskAny(thenM) {
+		// No record takes the then arm, so none of its work is for anybody -- including the column
+		// loads in it, which is the expensive part. The operators already do this (see vecpath.go);
+		// a statement arm is the same situation one level up, and the arm mask is what says so.
+		return s.beginElseArm(vops)
+	}
 	s.setLive(thenM)
 	s.spanStart = at + 1
 	return at + 1, true
+}
+
+// beginElseArm advances from the end of the then arm to whatever runs next: the else arm, or the
+// join when no record takes that either.
+//
+// It is shared by enterIf and jmpVoid because "the then arm is over" is the same state whether it
+// ran or was skipped, and the else arm has to be tested for emptiness in both cases.
+func (s *VecScratch) beginElseArm(vops []int32) (int, bool) {
+	pd := &s.preds[len(s.preds)-1]
+	pd.arm = armElse
+	if !maskAny(pd.elseMask) {
+		return s.joinIf()
+	}
+	s.setLive(pd.elseMask)
+	s.spanStart = int(pd.elseAt)
+	return int(pd.elseAt), true
 }
 
 // jmpVoid resolves a statement-level jump: the end of an arm, or the end of the If.
@@ -219,15 +241,23 @@ func (s *VecScratch) jmpVoid(vops []int32, at int, target int32) (int, bool) {
 	// Each arm is billed to the records that took it, so the run ends here whichever arm just did.
 	s.flushCharge(vops, at+1)
 	if pd.arm == armThen {
-		pd.arm = armElse
-		s.setLive(pd.elseMask)
-		s.spanStart = int(pd.elseAt)
-		return int(pd.elseAt), true
+		return s.beginElseArm(vops)
 	}
-	// The join. A record is executing again if it was executing on either path, which is NOT the same
-	// as the mask the If was entered with: a record that faulted inside an arm has been cleared from
-	// both and must stay cleared. The union goes back into the borrowed outer mask, which is what the
-	// enclosing region -- if there is one -- is still holding.
+	return s.joinIf()
+}
+
+// joinIf closes the innermost region and returns the instruction to continue at.
+//
+// A record is executing again if it was executing on either path, which is NOT the same as the mask
+// the If was entered with: a record that faulted inside an arm has been cleared from both and must
+// stay cleared. The union goes back into the borrowed outer mask, which is what the enclosing region
+// -- if there is one -- is still holding.
+//
+// An arm that was SKIPPED leaves its mask empty rather than absent, so the union is the same
+// expression whether both arms ran, one did, or neither.
+func (s *VecScratch) joinIf() (int, bool) {
+	pd := &s.preds[len(s.preds)-1]
+	target := pd.end
 	for w := range pd.outer {
 		pd.outer[w] = pd.thenMask[w] | pd.elseMask[w]
 	}

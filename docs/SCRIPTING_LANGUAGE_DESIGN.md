@@ -1107,14 +1107,52 @@ that a trivial allocator is no longer good enough.
    only way such a loop vectorizes at all (§2.3).
 8. **Dead code and dead store elimination**, which falls out of SSA and matters here because a dead
    data register is 200 KiB.
-9. **Deferred column loads -- sinking a load into the narrowest predicate that needs it.** The
-   highest-value pass on this list, and distinct from both 4 and 8: CSE deduplicates a load and DCE
-   removes one nothing reads, but neither defers one that is read only under a predicate. A column
-   load is a *decompression*, and roughly 78% of mutable read CPU is zstd, so eliding one is worth
-   far more than eliding any amount of arithmetic. If `Owner` is read only inside
+9. **Deferred column loads -- sinking a load into the narrowest predicate that needs it.**
+   Distinct from both 4 and 8: CSE deduplicates a load and DCE removes one nothing reads, but
+   neither defers one that is read only under a predicate. If `Owner` is read only inside
    `if RequestGpus > 0:`, a block where nothing passes must never touch that column. The
    counterpart to loop-invariant hoisting, in the opposite direction: hoist out of loops, sink into
    predicates.
+
+   **Two corrections, and the second changes what is left of this item.**
+
+   **A column load is not a decompression on this path, and the 78% does not apply to it.** The
+   entry used to say it was, and rank this item first on that basis. The block cache decompresses a
+   *region* once; a load extracts one column from bytes that are already decompressed, so what a
+   skipped load elides is an extraction, not a zstd pass. `veccolcache.go` had already measured this
+   and says so in its own header -- for a fitted-width numeric column with no escapes the extraction
+   is a SLICE of bytes the block already holds, so eliding it saves almost nothing, while for a
+   string column it is a dictionary parse or a positional walk over every preceding field, measured
+   at -38% on a two-term string disjunction. `loadStr` puts the same cost the other way round and
+   more sharply: without a dictionary the string region is positional, so reaching a field means
+   walking the fields before it once per record, and that walk measured **55% of a string scan** --
+   which is why the dictionary exists. The value of this item is therefore concentrated entirely on
+   string and materialized columns, is near zero on raw numeric ones, and is largest exactly where
+   the dictionary is absent. Note also what it is NOT bounded by: the hot tier is numeric by
+   construction, but that governs which columns stay uncompressed for the count paths, not what the
+   vector executor can load -- `LoadColumn` serves any string field of the block's schema. The 78% figure
+   is real but belongs to the MUTABLE per-record read path, where each record's payload is
+   compressed individually and no block-level cache can help; carrying it onto the columnar vector
+   path conflated two different readers.
+
+   **The motivating example was already half built.** `&&`, `||`, Elvis and the conditional already
+   narrow the live set and take the jump when it is empty (`vecpath.go`), and
+   `TestVecSkipAvoidsTheColumnLoad` asserts the column is not merely unused but never LOADED. What
+   had no such skip was the `if` STATEMENT: `enterIf` narrowed the live mask to an empty set and
+   then ran the arm regardless, loading every column the body reads for nobody. **That half is now
+   built** -- an empty arm jumps to the else arm, and an empty else arm jumps to the join -- which
+   is the statement form of the same rule, and is exactly this item's own example. What remains of
+   item 9 beyond it is genuine code motion: sinking a load that is lowered ABOVE the predicate
+   guarding it, which the current lowering mostly does not produce, since a load is emitted at its
+   use site.
+
+   **Where the remaining value most likely is**, and this is a claim to measure rather than a
+   result: the skip fires only when the guarding predicate is written FIRST, so ordering a
+   conjunction to put a cheap, selective term ahead of an expensive string one would convert loads
+   that are always paid into loads that are usually skipped. `collections/match_reorder.go` already
+   does cost-ordered conjunct reordering, but only for matchmaking, and its cost model scores
+   EVALUATION rather than the per-form LOAD cost that governs here -- which is the same fact item 1
+   needs and the storage layer already knows.
 10. ~~**Tiling and kernel fusion.**~~ **Struck. Measured, and it does not pay.** The claim was that
    peak live bytes is `registers x 8192 x 25B`, so tiling the batch into cache-sized sub-batches
    would cut the peak 8-16x and make MORE live registers affordable rather than fewer, which would
@@ -1769,20 +1807,33 @@ needs it.
    | element-step consumption | **done** — per record at batch size 1, and as a batch sum |
    | fault *mask* | **done** indirectly: a faulted record's answer is ERROR, which the value comparison catches, and the fault SETS are compared outright for the revival case |
    | per-site fault *counts* | **not built.** The vector executor accumulates a fault plane and never attributes it to a site, so only the scalar half of that comparison exists |
-   | at every batch size, including 1 | partial — 1 and the corpus size, not a sweep |
-   | including a partial final batch | **not tested** |
-   | including a boundary inside a loop's divergence | **not tested**, and this is the interesting one |
+   | at every batch size, including 1 | **done** — `TestVecBatchInvariance` sweeps every split pattern of the corpus, not two sizes |
+   | including a partial final batch | **done** — the sweep's uneven splits end in one |
+   | including a boundary inside a loop's divergence | **done** — the law runs a loop corpus as well as an expression one |
 
    The last row is where the value is. A split falling between two trips of a loop is precisely the
    input that distinguishes an executor carrying no state across batches from one that happens to
    work when nothing is in flight. Two bugs of exactly that shape have already been found and fixed
    — a binding leaking between batches, and a mask released twice after a mid-loop decline — each
-   caught by a test written for it rather than by a law. A batch-invariance law turns that from luck
-   into coverage.
+   caught by a test written for it rather than by a law. **The law is now built** and turns that from
+   luck into coverage: `TestVecBatchInvariance` compares values AND charge, per record, over every
+   split pattern of both corpora, and `TestVecBatchInvarianceIsNotVacuous` fails if the programs all
+   declined or the corpus collapsed to one record. It has already earned itself — the stale join
+   condition recorded further down this section was found by it, by splitting a corpus so that some
+   batches contained no faulting record.
+
+   So the one row of this item still open is **per-site fault counts**, and the reason is structural
+   rather than pending: the vector executor declines `OpFault` outright, so there is no vector half
+   of that comparison to make.
 5. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
-   both need the vector path to exist before they mean anything — a form is a property of a `Vec`, and
-   a deferred load defers a decompression. Measured context for sizing: roughly 78% of mutable read
-   CPU is zstd, so a load not performed is worth more than any amount of arithmetic removed.
+   both need the vector path to exist before they mean anything — a form is a property of a `Vec`,
+   and what a deferred load elides is a function of that same form. **The sizing this item used to
+   carry was wrong and is withdrawn:** "a deferred load defers a decompression, and roughly 78% of
+   mutable read CPU is zstd" is true of the mutable per-record reader and false of this path, where
+   the block cache decompresses each region once and a load extracts a column from already
+   decompressed bytes. See §6.8 item 9 for the measurement and for what survives it — which is
+   mostly form selection, since the load cost this item attacks is near zero on a raw numeric column
+   and real only on a string one.
 
    One concrete thing to build here, which arrived as a request from outside: **a `Vec` has nowhere
    to record that its column is uniformly typed**, and the storage layer already knows. `loadNum`
@@ -1812,7 +1863,7 @@ against it. The audit, which is a claim to check rather than a result:
 | item | justified by | survives the premise? |
 |---|---|---|
 | 1, form selection | 100x fewer bytes **and** fewer operations — a mask is one `planeAnd` per 64 records, not per record | **Yes**, and on the operations half, which never needed the premise. Unaffected; still first |
-| 9, deferred column loads | a load not performed is a **decompression** not performed, ~78% of mutable read CPU | **Yes**, and most strongly. Decompression is real work per element, not a cache effect, so the premise is irrelevant to it. This is the item the measurement most clearly leaves standing |
+| 9, deferred column loads | a load not performed is a **decompression** not performed, ~78% of mutable read CPU | **The justification is withdrawn** — it was the one row of this audit that was wrong, and in the direction that flatters it. A load on this path is an *extraction* from an already-decompressed region, not a decompression, so this IS a cache effect and the 78% belongs to another reader entirely. What survives is narrower and form-dependent: near zero on a raw numeric column, real on a string one. See §6.8 item 9 |
 | 5, constant folding / `Const` propagation | a `Const` is one element instead of *n*; materializing one cost a measured 9.8% of a scan | **Yes** — the 9.8% was *measured*, not derived from a byte count, and what it removes is per-element writes |
 | 8, dead code elimination | "a dead data register is 200 KiB" | **Weakened, not struck.** The byte figure is ~400 B at the real width, so the motivation is the operations a dead computation runs, not the memory it holds. Still worth doing, worth much less than the entry implies |
 | 3, compaction | each arm runs at `popcount(live)` instead of *n* | **Yes** — it removes *work for records*, which is operations, not bytes. §6.4's open question about its threshold is unaffected |
@@ -1995,10 +2046,11 @@ slice. `Accumulator` is therefore the implementation's own type, and the engine 
 
 1. **Who may register one?** The host process, at start-up, by linking Go code into the server. The
    trust model question this previously raised — the admin-labelled trust the WASM loader needs —
-   **does not arise**, because nothing here is *loaded*. Registering an aggregate requires the
-   ability to link code into the process, which is already total trust; a trust label would be
-   ceremony on top of a decision already made. It becomes a real question the moment aggregates
-   become loadable, and not before.
+   did not arise while nothing here was *loaded*: registering a Go aggregate requires the ability to
+   link code into the process, which is already total trust, so a trust label would be ceremony on
+   top of a decision already made. **That moment has now arrived** — an aggregate can be a WASM
+   module (§13.10) — and the answer is the loader's existing one: trust is the admin's field, the
+   module has no way to ask for it, and it relaxes the wall-clock backstop and nothing else.
 2. **What is the wire representation?** Unresolved, and **refused rather than half-answered**. Every
    aggregate frame is a function selector plus an argument (plus a filter, on the extended opcodes);
    none has a field for a name. Sending `AggUser` over the existing frame would arrive as "the
@@ -2106,6 +2158,8 @@ mutation then died.
   function of the `NumStats` a pass already computes (a range, a mean) could be answered from them
   without its own accumulate. Worth far less than the item above, and worth building only after
   something asks for it.
+- ~~**A loadable aggregate**~~ — **built; see §13.10.** The trust question §13.4 deferred came due
+  exactly as predicted, and was answered by the loader's existing label rather than by anything new.
 - **Views**, if ever, and only behind merge-under-deletion.
 
 ---
@@ -2273,6 +2327,63 @@ wrong, or is my expectation wrong" is the only question that distinguishes a bug
 The decline is now injected through a test-only hook. What is under test is the fan-out's handling
 of a decline, not the storage condition that provokes one, and injecting it makes the distinction
 explicit instead of relying on a fixture to hold a tier choice still.
+
+---
+
+### 13.10 A loadable aggregate: WASM, and where the state has to live
+
+`wasmudf` could already supply a user-defined *function*. It can now supply a user-defined
+*aggregate*: `Loader.LoadAggregate` compiles a module exporting init / fold / merge / result under
+its own ABI version, `UDAF.Aggregate()` hands it back as a `db.Aggregate`, and
+`wasmudf.RegisterAggregate` is the one-call form. The four operations of §13.2 are the four exports,
+which is pleasant but not the interesting part.
+
+**The interesting part is that the obvious representation does not work, and the reason is a
+lifetime rather than a cost.** A guest would naturally allocate an accumulator in its own memory and
+hand the host an opaque *handle*. That is the fast design — nothing crosses the boundary per fold —
+and it is what anyone writes first. It is unimplementable here. A handle is meaningful only inside
+the instance that minted it, so an accumulator holding one **pins that instance for its whole life**;
+`Accumulator` is Add/Merge/Result with no close, so nothing tells the host when one is finished; and
+there is no moment that could be *inferred* either, because **when the columnar pass declines, every
+worker's accumulator is dropped with neither Merge nor Result ever called** — §13.8's abort rule,
+arriving as a memory-management problem two sections later. The guest memory could then be reclaimed
+only by a finalizer, and the instances it pinned would be unavailable to other queries until the
+collector got round to them.
+
+So the state is **bytes the host owns**: fold and merge are pure functions of byte ranges, instances
+are borrowed per call exactly as the scalar path borrows them, an accumulator is an ordinary Go
+value, and the host can *cap* the state, which it cannot do for memory behind a handle. What it
+costs is a copy in and out per call, which is why a fold takes a **batch**. Measured on an M2 Pro,
+one column value through the guest costs 1657 ns at a batch of 1, 51 ns at 256 and 44–57 ns at 1024
+— so the batch is worth about 30x and the default is set at the knee rather than at the end.
+
+**Two findings worth keeping.**
+
+*The interruptibility tax changes shape between a function and an aggregate.* wazero's termination
+check sits at every loop **back-edge**, and §2's measurement of it (~340 ns per *call*) was taken
+against a scalar guest, which crosses one back-edge per call. An aggregate's fold crosses one per
+**value**. The same module labelled trusted folds a value in 18 ns against 57 ns untrusted: roughly
+**two thirds of the per-value cost is the ability to stop the guest**, where for a function it was a
+fixed per-call fee. Nothing about the ABI explains the number, and nobody would have predicted it
+from §2's figure.
+
+*The columnar opt-in is the one thing the guest gets to declare, and it is not a capability.*
+`db.ColumnAccumulator` is Go's way of making §13.5's two promises; a WASM guest makes them by
+exporting an optional `classad_udaf_fold_num` with fold's signature. The loader reads the export from
+the **compiled module**, like the vector entry point, and the accumulator it then builds is a
+*different Go type* — because the engine decides with a type assertion, and a single type carrying a
+flag would be asserted successfully by every aggregate and the promise would be unenforceable. This
+is deliberately *not* the trust label: it is a claim about the guest's own arithmetic, and a guest
+that declares it falsely computes a wrong aggregate exactly as a guest that adds wrongly does.
+
+**One small thing the engine does that this made visible.** `ColumnarUserAggregate` builds an
+accumulator to decide whether the aggregate opted in and keeps it as worker zero, because
+constructing one may have side effects. A WASM accumulator has that property more strongly — it
+could own guest memory — but with the state in the host the identity is read from the guest *once,
+at load*, and constructing one is a slice copy with no side effect at all. The engine's care is
+still right for the aggregates it cannot see; it simply does not bite here. What *is* visible is the
+other arm: when the assertion **fails**, that accumulator is discarded, so a scan-served query builds
+two and the accumulator count cannot be used to tell the rungs apart. The merge count can.
 
 ---
 

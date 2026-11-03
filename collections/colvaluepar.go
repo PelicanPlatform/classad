@@ -56,6 +56,22 @@ var aggFanouts atomic.Int64
 // observability; see aggFanouts.
 func AggFanouts() int64 { return aggFanouts.Load() }
 
+// valuePassDeclineHook, when non-nil, is consulted once per window and makes the pass decline that
+// window when it returns true.
+//
+// TEST-ONLY, and it exists because the condition it stands in for is no longer reachable from data.
+// The pass used to decline on an expression-valued cell in the aggregated column, which a fixture
+// could simply store; a computed cell's value now lives in the column itself, so that fixture gets a
+// correct answer rather than a decline -- the better behaviour, and it leaves the decline with no
+// provocation a test can write.
+//
+// What is under test is the fan-out's handling of a decline -- that ONE worker stopping aborts the
+// whole pass rather than letting the others answer over a subset -- not the storage condition that
+// provokes one. The hook makes that deterministic and independent of what the column can read.
+// One nil check per window, never per record. The grouped pass has the same hook for a related
+// reason; see groupPassDeclineHook.
+var valuePassDeclineHook func(segWindow) bool
+
 // Segments the aggregate pass answered from a columnar block, and segments it had to read record by
 // record instead.
 //
