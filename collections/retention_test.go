@@ -49,8 +49,8 @@ func TestRetentionRotate(t *testing.T) {
 	const n = 300
 	for i := 0; i < n; i++ {
 		ad, _ := classad.Parse(fmt.Sprintf(`[ N = %d ]`, i))
-		if err := c.Put([]byte("k"), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte("k"), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	sh := c.shards[0]

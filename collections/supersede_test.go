@@ -151,8 +151,8 @@ func TestFsckAcceptsLegitimateSupersession(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s missing before rewrite", s.keys[i])
 		}
-		if err := c.Put([]byte(s.keys[i]), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(s.keys[i]), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	for i := 100; i < 150; i++ {
@@ -160,8 +160,8 @@ func TestFsckAcceptsLegitimateSupersession(t *testing.T) {
 			t.Fatalf("delete of %s did nothing", s.keys[i])
 		}
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	r, err := Fsck(s.dir)
@@ -191,8 +191,8 @@ func TestFsckSkipsTheBoundCheckAfterACrash(t *testing.T) {
 			t.Fatalf("delete of %s did nothing", s.keys[i])
 		}
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Simulate a crash: the snapshot a clean Close wrote is not there.

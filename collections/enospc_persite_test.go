@@ -58,8 +58,8 @@ func TestENOSPCSidecarWriteDegrades(t *testing.T) {
 	const n = 3000
 	for i := 0; i < n; i++ {
 		ad := mustAd(t, fmt.Sprintf(`[Id=%d;pad=%q]`, i, strings.Repeat("x", 200)))
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
-			t.Fatalf("Put(k%d) failed on a (rebuildable) sidecar ENOSPC: %v", i, err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); putErr != nil {
+			t.Fatalf("Put(k%d) failed on a (rebuildable) sidecar ENOSPC: %v", i, putErr)
 		}
 	}
 	c.Reindex() // rebuilds sealed-segment sidecars synchronously -> writes .idx (which the hook fails)
@@ -69,8 +69,8 @@ func TestENOSPCSidecarWriteDegrades(t *testing.T) {
 	verifyAll(t, c, n, "pre-reopen")
 
 	writeFaultHook = nil
-	if err := c.Close(); err != nil {
-		t.Logf("Close returned %v (acceptable)", err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Logf("Close returned %v (acceptable)", closeErr)
 	}
 	c2, err := Open(Options{Shards: 1, Dir: dir, SegmentSize: 1 << 12})
 	if err != nil {
@@ -96,8 +96,8 @@ func TestENOSPCSnapshotWriteDegrades(t *testing.T) {
 	}
 	const n = 500
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 
@@ -146,8 +146,8 @@ func TestENOSPCDictWriteFailsCleanly(t *testing.T) {
 	const n = 400
 	wantOwner := func(i int) string { return fmt.Sprintf("user_%d", i) }
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), retrainAd(t, i)); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), retrainAd(t, i)); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	verifyOwner := func(store *Collection, label string) {
@@ -175,7 +175,7 @@ func TestENOSPCDictWriteFailsCleanly(t *testing.T) {
 	defer func() { writeFaultHook = nil }()
 
 	// RetrainDict persists a new dictionary; the failing .zst write must be reported, not swallowed.
-	if _, err := c.RetrainDict(n); err == nil {
+	if _, retrainDictErr := c.RetrainDict(n); retrainDictErr == nil {
 		t.Error("RetrainDict should fail when the dictionary write hits ENOSPC")
 	}
 	if !fired.Load() {
@@ -185,8 +185,8 @@ func TestENOSPCDictWriteFailsCleanly(t *testing.T) {
 	// The pre-retrain data must be intact (a failed retrain must not corrupt or drop it).
 	writeFaultHook = nil
 	verifyOwner(c, "post-failed-retrain")
-	if err := c.Close(); err != nil {
-		t.Logf("Close returned %v", err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Logf("Close returned %v", closeErr)
 	}
 	c2, err := Open(Options{Shards: 1, Dir: dir, SegmentSize: 1 << 12})
 	if err != nil {

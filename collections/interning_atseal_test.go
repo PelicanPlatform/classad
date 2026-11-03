@@ -49,9 +49,9 @@ func TestArchiveInternAtSeal(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		if err := a.Append(mustAd(t,
-			fmt.Sprintf("[Id=%d; Ts=%d; Val=%d; Host=\"h%d.example.org\"]", i, i, i%100, i))); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(mustAd(t,
+			fmt.Sprintf("[Id=%d; Ts=%d; Val=%d; Host=\"h%d.example.org\"]", i, i, i%100, i))); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
 
@@ -93,8 +93,8 @@ func TestArchiveInternAtSeal(t *testing.T) {
 		}
 	}
 	verify("pre-reopen", a)
-	if err := a.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := a.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	a2, err := OpenArchive(ArchiveOptions{

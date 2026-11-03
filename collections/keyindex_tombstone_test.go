@@ -27,12 +27,12 @@ func TestKeyIndexFilesDeleteMarkersUnderTheirKey(t *testing.T) {
 	key := []byte("gone")
 	kept := []byte("stays")
 	for _, k := range [][]byte{key, kept} {
-		ad, err := classad.Parse(`[ A=1 ]`)
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.Parse(`[ A=1 ]`)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := c.Put(k, ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put(k, ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	if !c.Delete(key) {
@@ -134,12 +134,12 @@ func TestKeyIndexDamageProofAcceptsDeleteMarkers(t *testing.T) {
 	defer c.Close()
 
 	for i := range 8 {
-		ad, err := classad.Parse(`[ A=1 ]`)
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.Parse(`[ A=1 ]`)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := c.Put(fmt.Appendf(nil, "k%d", i), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put(fmt.Appendf(nil, "k%d", i), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	for i := 0; i < 8; i += 3 { // several deletes, so several markers land in the segment

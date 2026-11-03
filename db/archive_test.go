@@ -27,8 +27,8 @@ func TestArchiveTableBasics(t *testing.T) {
 	}
 	const n = 200
 	for i := 0; i < n; i++ {
-		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nCompletionDate = %d\nJobStatus = 4", i, 1000+i)); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nCompletionDate = %d\nJobStatus = 4", i, 1000+i)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	if hist.Count() != n {
@@ -141,8 +141,8 @@ func TestArchiveTableAggregate(t *testing.T) {
 	owners := []string{"alice", "alice", "alice", "bob", "bob", "carol"}
 	cpus := []int{4, 8, 2, 16, 4, 1}
 	for i, o := range owners {
-		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nOwner = %q\nCpus = %d", i, o, cpus[i])); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nOwner = %q\nCpus = %d", i, o, cpus[i])); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 
@@ -209,8 +209,8 @@ func TestArchiveRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 2000; i++ {
-		if err := hist.AppendOld(fmt.Sprintf("Id = %d\nPad = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"", i)); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(fmt.Sprintf("Id = %d\nPad = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"", i)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	before := hist.Count()
@@ -237,12 +237,12 @@ func TestArchiveBackfillHorizonReachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	const horizon = 32 << 20
-	if _, err := cat.CreateArchiveTable("history", ArchiveConfig{
+	if _, createArchiveTableErr := cat.CreateArchiveTable("history", ArchiveConfig{
 		SegmentSize:        1 << 20,
 		CategoricalAttrs:   []string{"Owner"},
 		IndexBackfillBytes: horizon,
-	}); err != nil {
-		t.Fatal(err)
+	}); createArchiveTableErr != nil {
+		t.Fatal(createArchiveTableErr)
 	}
 	cat.Close()
 

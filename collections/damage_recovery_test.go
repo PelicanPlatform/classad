@@ -983,8 +983,8 @@ func TestWriteAfterDamagedDictionaryInLastSegment(t *testing.T) {
 				t.Fatal(err)
 			}
 			for i := range 200 {
-				if err := c.Put(fmt.Appendf(nil, "k%d", i), mustAd(t, fmt.Sprintf(`[Id = %d; Owner = "u%d"]`, i, i%3))); err != nil {
-					t.Fatal(err)
+				if putErr := c.Put(fmt.Appendf(nil, "k%d", i), mustAd(t, fmt.Sprintf(`[Id = %d; Owner = "u%d"]`, i, i%3))); putErr != nil {
+					t.Fatal(putErr)
 				}
 			}
 			c.Rewrite()
@@ -996,14 +996,14 @@ func TestWriteAfterDamagedDictionaryInLastSegment(t *testing.T) {
 			if act != nil || dict == 0 {
 				t.Fatalf("Rewrite left a write target (%v) or an inline last segment (dictionary at %d)", act != nil, dict)
 			}
-			if err := c.Close(); err != nil {
-				t.Fatal(err)
+			if closeErr := c.Close(); closeErr != nil {
+				t.Fatal(closeErr)
 			}
 			// A bit in the dictionary's body: its checksum fails, its framing does not.
 			flipBit(t, path, int(dict)+recKeyOff+4+segDictHeaderBytes+8)
 			if !snapshot {
-				if err := os.Remove(filepath.Join(filepath.Dir(path), dirSnapName)); err != nil {
-					t.Fatal(err)
+				if removeErr := os.Remove(filepath.Join(filepath.Dir(path), dirSnapName)); removeErr != nil {
+					t.Fatal(removeErr)
 				}
 			}
 
@@ -1024,15 +1024,15 @@ func TestWriteAfterDamagedDictionaryInLastSegment(t *testing.T) {
 				c.Close()
 				t.Fatalf("open rebuilt the directory: %v, want %v", rebuilt, !snapshot)
 			}
-			if err := c.Put([]byte("fresh"), mustAd(t, `[Id = 9999; Owner = "new"]`)); err != nil {
+			if putErr := c.Put([]byte("fresh"), mustAd(t, `[Id = 9999; Owner = "new"]`)); putErr != nil {
 				c.Close()
-				t.Fatal(err)
+				t.Fatal(putErr)
 			}
 			if _, ok := c.Get([]byte("fresh")); !ok {
 				t.Error("a key written after the open does not read back")
 			}
-			if err := c.Close(); err != nil {
-				t.Fatal(err)
+			if closeErr := c.Close(); closeErr != nil {
+				t.Fatal(closeErr)
 			}
 			c, err = Open(opts)
 			if err != nil {

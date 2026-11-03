@@ -617,7 +617,7 @@ func TestScriptWhileIsBounded(t *testing.T) {
 	}
 	// Deterministic: the same budget gives the same answer, every time.
 	for i := 0; i < 3; i++ {
-		if _, ok := sp.RunLimited(scope, 10000); ok {
+		if _, runLimitedOK := sp.RunLimited(scope, 10000); runLimitedOK {
 			t.Fatal("the same script finished on a later run; the bound is not deterministic")
 		}
 	}

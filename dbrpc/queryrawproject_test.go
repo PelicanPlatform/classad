@@ -22,8 +22,8 @@ func TestQueryRawProject(t *testing.T) {
 	}
 	_ = tx.NewClassAd(ctx, "a", `MyType = "Machine"`+"\n"+`Name = "slot1"`+"\n"+`Cpus = 8`+"\n"+`Memory = 4096`+"\n"+`State = "Idle"`)
 	_ = tx.NewClassAd(ctx, "b", `MyType = "Machine"`+"\n"+`Name = "slot2"`+"\n"+`Cpus = 4`+"\n"+`Memory = 2048`+"\n"+`State = "Claimed"`)
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	// Project to Name + Cpus (lowercase on the wire to exercise case-insensitivity).

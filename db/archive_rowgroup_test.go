@@ -51,12 +51,12 @@ func TestArchiveRowGroupBytesRuntimeAndPersisted(t *testing.T) {
 		t.Fatalf("a fresh archive reports RowGroupBytes=%d, want 0 (the default)", got)
 	}
 	for i := range 200 {
-		if err := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nJobStatus = 4", i)); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(fmt.Sprintf("ClusterId = %d\nJobStatus = 4", i)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
-	if err := hist.SetRowGroupBytes(64 << 10); err != nil {
-		t.Fatal(err)
+	if setRowGroupBytesErr := hist.SetRowGroupBytes(64 << 10); setRowGroupBytesErr != nil {
+		t.Fatal(setRowGroupBytesErr)
 	}
 	if got := hist.RowGroupBytes(); got != 64<<10 {
 		t.Fatalf("after SetRowGroupBytes the archive reports %d, want %d", got, 64<<10)
@@ -66,8 +66,8 @@ func TestArchiveRowGroupBytesRuntimeAndPersisted(t *testing.T) {
 		t.Errorf("%d records after changing the budget, want 200: segments sealed under the old budget "+
 			"must keep reading, since each block records its own layout", n)
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// It has to survive the restart, or it could not live in a config file.
@@ -76,8 +76,8 @@ func TestArchiveRowGroupBytesRuntimeAndPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(data, &saved); err != nil {
-		t.Fatal(err)
+	if unmarshalErr := json.Unmarshal(data, &saved); unmarshalErr != nil {
+		t.Fatal(unmarshalErr)
 	}
 	if saved.RowGroupBytes != 64<<10 {
 		t.Errorf("persisted RowGroupBytes=%d, want %d", saved.RowGroupBytes, 64<<10)

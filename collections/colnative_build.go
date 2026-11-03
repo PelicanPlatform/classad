@@ -366,8 +366,8 @@ func (c *Collection) columnarizeSegment(sh *shard, src *segment, s *adSchema, ho
 	// come with them. Without it the rewritten records are unreadable, which is the kind of failure
 	// that shows up as every record mismatching rather than as an error.
 	if d != nil {
-		if blob := segDictBlob(src); blob != nil {
-			if doff, ok := dst.appendDict(blob); ok {
+		if dictBlob := segDictBlob(src); dictBlob != nil {
+			if doff, ok := dst.appendDict(dictBlob); ok {
 				dst.dict.Store(&segDictHandle{data: dst.data, base: doff + recKeyOff + 4, rec: doff})
 			} else {
 				dst.retire()

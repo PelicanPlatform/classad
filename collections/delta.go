@@ -1508,19 +1508,19 @@ func writeFileDurable(path string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	if _, err := f.Write(data); err != nil {
+	if _, writeErr := f.Write(data); writeErr != nil {
 		f.Close()
-		return err
+		return writeErr
 	}
-	if err := f.Sync(); err != nil {
+	if syncErr := f.Sync(); syncErr != nil {
 		f.Close()
-		return err
+		return syncErr
 	}
-	if err := f.Close(); err != nil {
-		return err
+	if closeErr := f.Close(); closeErr != nil {
+		return closeErr
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
+	if renameErr := os.Rename(tmp, path); renameErr != nil {
+		return renameErr
 	}
 	d, err := os.Open(filepath.Dir(path))
 	if err != nil {

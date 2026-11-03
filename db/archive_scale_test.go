@@ -192,8 +192,8 @@ func runScaleCase(t *testing.T, records, segSize, ndv int) scaleResult {
 	start := time.Now()
 	for i := 0; i < records; i++ {
 		ad := scaleAd(i, ndv) + fmt.Sprintf("Owner2 = %q\n", fmt.Sprintf("user%04d", i%ndv))
-		if err := hist.AppendOld(ad); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(ad); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	res.buildMS = float64(time.Since(start).Microseconds()) / 1000

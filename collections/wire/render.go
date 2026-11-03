@@ -86,73 +86,73 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 	case nBoolTrue:
 		return append(dst, "true"...), nil
 	case nInt:
-		v, err := d.varint()
-		if err != nil {
-			return dst, err
+		v, derr := d.varint()
+		if derr != nil {
+			return dst, derr
 		}
 		return strconv.AppendInt(dst, v, 10), nil
 	case nReal:
-		bits, err := d.uint64()
-		if err != nil {
-			return dst, err
+		bits, derr := d.uint64()
+		if derr != nil {
+			return dst, derr
 		}
 		return strconv.AppendFloat(dst, math.Float64frombits(bits), 'g', -1, 64), nil
 	case nString:
-		s, err := d.readStringBytes()
-		if err != nil {
-			return dst, err
+		s, derr := d.readStringBytes()
+		if derr != nil {
+			return dst, derr
 		}
 		if d.oldStrings {
 			return ast.AppendQuoteStringOldBytes(dst, s), nil
 		}
 		return ast.AppendQuoteStringBytes(dst, s), nil
 	case nAttrRef, nAttrRefStr:
-		scope, err := d.byteAt()
-		if err != nil {
-			return dst, err
+		scope, derr := d.byteAt()
+		if derr != nil {
+			return dst, derr
 		}
-		name, err := d.refName(tag == nAttrRefStr)
-		if err != nil {
-			return dst, err
+		name, derr := d.refName(tag == nAttrRefStr)
+		if derr != nil {
+			return dst, derr
 		}
 		dst = appendScope(dst, scope)
 		return ast.AppendQuoteAttributeName(dst, name), nil
 	case nBinOp, nBinOpStr:
-		op, err := d.opString(tag == nBinOpStr, binOps)
-		if err != nil {
-			return dst, err
+		op, derr := d.opString(tag == nBinOpStr, binOps)
+		if derr != nil {
+			return dst, derr
 		}
 		// ast.BinaryOp.String: "(left op right)".
 		dst = append(dst, '(')
-		if dst, err = d.appendNode(dst, depth+1); err != nil {
-			return dst, err
+		if dst, derr = d.appendNode(dst, depth+1); derr != nil {
+			return dst, derr
 		}
 		dst = append(dst, ' ')
 		dst = append(dst, op...)
 		dst = append(dst, ' ')
-		if dst, err = d.appendNode(dst, depth+1); err != nil {
-			return dst, err
+		if dst, derr = d.appendNode(dst, depth+1); derr != nil {
+			return dst, derr
 		}
 		return append(dst, ')'), nil
 	case nUnOp, nUnOpStr:
-		op, err := d.opString(tag == nUnOpStr, unOps)
-		if err != nil {
-			return dst, err
+		op, derr := d.opString(tag == nUnOpStr, unOps)
+		if derr != nil {
+			return dst, derr
 		}
 		// ast.UnaryOp.String: "(op expr)" with no space between op and expr.
 		dst = append(dst, '(')
 		dst = append(dst, op...)
-		if dst, err = d.appendNode(dst, depth+1); err != nil {
-			return dst, err
+		if dst, derr = d.appendNode(dst, depth+1); derr != nil {
+			return dst, derr
 		}
 		return append(dst, ')'), nil
 	case nList:
-		n, err := d.uvarint()
-		if err != nil {
-			return dst, err
+		n, derr := d.uvarint()
+		if derr != nil {
+			return dst, derr
 		}
-		if err := d.checkCount(n); err != nil {
-			return dst, err
+		if countErr := d.checkCount(n); countErr != nil {
+			return dst, countErr
 		}
 		// ast.ListLiteral.String: "{e0, e1, ...}".
 		dst = append(dst, '{')
@@ -160,24 +160,24 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 			if i > 0 {
 				dst = append(dst, ',', ' ')
 			}
-			if dst, err = d.appendNode(dst, depth+1); err != nil {
-				return dst, err
+			if dst, derr = d.appendNode(dst, depth+1); derr != nil {
+				return dst, derr
 			}
 		}
 		return append(dst, '}'), nil
 	case nRecord:
 		return d.appendAdBody(dst, depth+1)
 	case nFunc, nFuncStr:
-		name, err := d.refName(tag == nFuncStr)
-		if err != nil {
-			return dst, err
+		name, derr := d.refName(tag == nFuncStr)
+		if derr != nil {
+			return dst, derr
 		}
-		argc, err := d.uvarint()
-		if err != nil {
-			return dst, err
+		argc, derr := d.uvarint()
+		if derr != nil {
+			return dst, derr
 		}
-		if err := d.checkCount(argc); err != nil {
-			return dst, err
+		if countErr := d.checkCount(argc); countErr != nil {
+			return dst, countErr
 		}
 		// ast.FunctionCall.String: "name(a0, a1, ...)".
 		dst = append(dst, name...)
@@ -186,8 +186,8 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 			if i > 0 {
 				dst = append(dst, ',', ' ')
 			}
-			if dst, err = d.appendNode(dst, depth+1); err != nil {
-				return dst, err
+			if dst, derr = d.appendNode(dst, depth+1); derr != nil {
+				return dst, derr
 			}
 		}
 		return append(dst, ')'), nil
@@ -233,9 +233,9 @@ func (d *decoder) appendNode(dst []byte, depth int) ([]byte, error) {
 			dst = append(dst, ' ')
 		}
 		dst = append(dst, '.')
-		name, err := d.refName(tag == nSelectStr)
-		if err != nil {
-			return dst, err
+		name, nameErr := d.refName(tag == nSelectStr)
+		if nameErr != nil {
+			return dst, nameErr
 		}
 		return ast.AppendQuoteAttributeName(dst, name), nil
 	case nSubscript:
@@ -298,11 +298,11 @@ func (d *decoder) appendAdBody(dst []byte, depth int) ([]byte, error) {
 		return dst, err
 	}
 	for i := uint64(0); i < hotCount; i++ {
-		if _, err := d.uvarint(); err != nil { // internID / nameHash
-			return dst, err
+		if _, idErr := d.uvarint(); idErr != nil { // internID / nameHash
+			return dst, idErr
 		}
-		if _, err := d.uvarint(); err != nil { // offset
-			return dst, err
+		if _, offErr := d.uvarint(); offErr != nil { // offset
+			return dst, offErr
 		}
 	}
 	attrCount, err := d.uvarint()

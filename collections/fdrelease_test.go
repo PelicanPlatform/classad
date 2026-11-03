@@ -21,12 +21,12 @@ func TestPersistentSegmentsReleaseFDs(t *testing.T) {
 
 	const n = 400
 	for i := 0; i < n; i++ {
-		ad, err := classad.Parse(fmt.Sprintf(`[ Owner="u%d"; Seq=%d ]`, i%7, i))
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.Parse(fmt.Sprintf(`[ Owner="u%d"; Seq=%d ]`, i%7, i))
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 
@@ -59,8 +59,8 @@ func TestPersistentSegmentsReleaseFDs(t *testing.T) {
 
 	// Durability across all those fd-released segments: reopen and confirm every ad
 	// survived with its value intact.
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	c2, err := Open(Options{Dir: dir, Shards: 1, SegmentSize: 4096})
 	if err != nil {

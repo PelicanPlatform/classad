@@ -349,8 +349,8 @@ func heteroGroupFixture(tb testing.TB, n int, shape func(i int) string) *Collect
 	c := New(Options{Shards: 1, SegmentSize: 1 << 16, Codec: cd})
 	for i := 0; i < n; i++ {
 		src := fmt.Sprintf("ClusterId = %d\nRequestMemory = %d\n%s", i, 1024+(i%32)*512, shape(i))
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(tb, src)); err != nil {
-			tb.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(tb, src)); putErr != nil {
+			tb.Fatal(putErr)
 		}
 	}
 	q, err := vm.Parse("RequestMemory >= 0 && Tally >= 0")

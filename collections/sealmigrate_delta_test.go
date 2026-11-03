@@ -36,8 +36,8 @@ func TestMigrateWillNotRetireASegmentHoldingALiveDelta(t *testing.T) {
 			t.Fatal("seed conflicted")
 		}
 	}
-	if err := pre.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := pre.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	if hits := diskBytesContaining(t, dir, secret); len(hits) == 0 {
 		t.Fatal("no plaintext on disk: the migration would have nothing to do")

@@ -61,15 +61,15 @@ func TestScaleSoak(t *testing.T) {
 	for i := 0; i < n; i++ {
 		batch = append(batch, AdUpdate{Key: []byte(fmt.Sprintf("k%d", i)), Ad: mustAd(t, fmt.Sprintf(`[Id=%d]`, i))})
 		if len(batch) == batchSize {
-			if err := c.Update(batch); err != nil {
-				t.Fatal(err)
+			if updateErr := c.Update(batch); updateErr != nil {
+				t.Fatal(updateErr)
 			}
 			batch = batch[:0]
 		}
 	}
 	if len(batch) > 0 {
-		if err := c.Update(batch); err != nil {
-			t.Fatal(err)
+		if updateErr := c.Update(batch); updateErr != nil {
+			t.Fatal(updateErr)
 		}
 	}
 	if c.Len() != n {
@@ -101,8 +101,8 @@ func TestScaleSoak(t *testing.T) {
 			local := 0
 			for ctx.Err() == nil {
 				i := r.Intn(n)
-				if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdNoT(fmt.Sprintf(`[Id=%d;R=%d]`, i, local))); err != nil {
-					fail("writer Put(k%d) failed: %v", i, err)
+				if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdNoT(fmt.Sprintf(`[Id=%d;R=%d]`, i, local))); putErr != nil {
+					fail("writer Put(k%d) failed: %v", i, putErr)
 					return
 				}
 				local++
@@ -149,9 +149,9 @@ func TestScaleSoak(t *testing.T) {
 			for ctx.Err() == nil {
 				lo := r.Intn(n - width + 1)
 				hi := lo + width
-				q, err := vm.Parse(fmt.Sprintf("Id >= %d && Id < %d", lo, hi))
-				if err != nil {
-					fail("vm.Parse: %v", err)
+				q, qerr := vm.Parse(fmt.Sprintf("Id >= %d && Id < %d", lo, hi))
+				if qerr != nil {
+					fail("vm.Parse: %v", qerr)
 					return
 				}
 				got := 0
@@ -255,8 +255,8 @@ func TestScaleSoak(t *testing.T) {
 	}
 
 	// Recovery at scale: reopen and re-verify the count and a value sample.
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	c2, err := Open(Options{Shards: 16, Dir: dir, SegmentSize: 1 << 20})
 	if err != nil {

@@ -337,9 +337,9 @@ func Fsck(dir string) (*FsckReport, error) {
 			continue
 		}
 		shardDir := filepath.Join(dir, e.Name())
-		files, err := os.ReadDir(shardDir)
-		if err != nil {
-			return nil, fmt.Errorf("fsck: reading %s: %w", shardDir, err)
+		files, shardErr := os.ReadDir(shardDir)
+		if shardErr != nil {
+			return nil, fmt.Errorf("fsck: reading %s: %w", shardDir, shardErr)
 		}
 		for _, f := range files {
 			if f.IsDir() {
@@ -356,15 +356,15 @@ func Fsck(dir string) (*FsckReport, error) {
 					"not a segment data file; recovery ignores it"})
 				continue
 			}
-			if _, err := fmt.Sscanf(f.Name(), "seg-%d.d%d.dat", &n, &dictID); err != nil {
+			if _, sscanfErr := fmt.Sscanf(f.Name(), "seg-%d.d%d.dat", &n, &dictID); sscanfErr != nil {
 				r.Strays = append(r.Strays, FsckStray{path,
 					"does not match seg-<n>.d<dict>.dat; recovery ignores it, and the " +
 						"dictionary it needs may be pruned at the next open"})
 				continue
 			}
-			seg, err := fsckSegment(path, dictID)
-			if err != nil {
-				r.Strays = append(r.Strays, FsckStray{path, err.Error()})
+			seg, segErr := fsckSegment(path, dictID)
+			if segErr != nil {
+				r.Strays = append(r.Strays, FsckStray{path, segErr.Error()})
 				continue
 			}
 			if !have[dictID] {

@@ -176,8 +176,8 @@ func TestChainedArchiveFlatten(t *testing.T) {
 		if d, _ := flat.EvaluateAttrInt("DAGManJobId"); d != 42 {
 			t.Errorf("Flatten(%s) DAGManJobId=%d, want 42 (inherited)", key, d)
 		}
-		if err := arch.Append(flat); err != nil {
-			t.Fatal(err)
+		if appendErr := arch.Append(flat); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
 

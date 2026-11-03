@@ -162,8 +162,10 @@ func copyProp(rp *RegProgram) {
 		if d == rp.res {
 			continue
 		}
-		// Every reachable read of d must be dominated by the copy.
-		reads := reads[:0]
+		// Every reachable read of d must be dominated by the copy. `reads =`, not `reads :=`:
+		// the slice is hoisted out of the loop to have its capacity reused, and a fresh
+		// declaration here left the hoisted one empty forever and reallocated every round.
+		reads = reads[:0]
 		ok := true
 		for j := 0; j < len(rp.code) && ok; j++ {
 			if j == i || !c.reach[j] {

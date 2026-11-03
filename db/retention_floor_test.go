@@ -30,8 +30,8 @@ func TestArchiveGCFloor(t *testing.T) {
 	const n, base = 400, 1000
 	const now = base + n - 1 // 1399
 	for i := 0; i < n; i++ {
-		if err := hist.AppendOld(fmt.Sprintf("N = %d\nCompletionDate = %d", i, base+i)); err != nil {
-			t.Fatal(err)
+		if appendOldErr := hist.AppendOld(fmt.Sprintf("N = %d\nCompletionDate = %d", i, base+i)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	full := hist.Count()
@@ -42,8 +42,8 @@ func TestArchiveGCFloor(t *testing.T) {
 	if got := hist.GCFloor(); got != 1e9 {
 		t.Fatalf("GCFloor = %v, want 1e9", got)
 	}
-	if _, err := hist.Rotate(now); err != nil {
-		t.Fatal(err)
+	if _, rotateErr := hist.Rotate(now); rotateErr != nil {
+		t.Fatal(rotateErr)
 	}
 	drained := hist.Count()
 	if drained >= full {
@@ -53,8 +53,8 @@ func TestArchiveGCFloor(t *testing.T) {
 		t.Fatalf("GC floor drained everything; MinAge must have kept the newest records")
 	}
 
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: the GC floor is not persisted, so it starts cleared and a Rotate does no early

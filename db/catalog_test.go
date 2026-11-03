@@ -19,21 +19,21 @@ func TestCatalogCreateDropPersist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cat.CreateTable("jobs"); err != nil {
-		t.Fatal(err)
+	if _, createTableErr := cat.CreateTable("jobs"); createTableErr != nil {
+		t.Fatal(createTableErr)
 	}
 	// Write into one table; it must not appear in the other.
 	tx := machines.Begin()
 	ad, _ := classad.ParseOld("Name = \"slot1\"\nCpus = 8")
 	tx.NewClassAd("slot1", ad)
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	if got := cat.Tables(); len(got) != 2 || got[0] != "jobs" || got[1] != "machines" {
 		t.Fatalf("Tables() = %v, want [jobs machines]", got)
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: tables and their data are recovered.
@@ -57,8 +57,8 @@ func TestCatalogCreateDropPersist(t *testing.T) {
 	}
 
 	// Drop removes the table and its data.
-	if err := cat2.DropTable("machines"); err != nil {
-		t.Fatal(err)
+	if dropTableErr := cat2.DropTable("machines"); dropTableErr != nil {
+		t.Fatal(dropTableErr)
 	}
 	if _, ok := cat2.Table("machines"); ok {
 		t.Fatal("machines still present after drop")
@@ -99,22 +99,22 @@ func TestCatalogInMemoryTable(t *testing.T) {
 		tx := tc.d.Begin()
 		ad, _ := classad.ParseOld("Name = \"" + tc.name + "\"")
 		tx.NewClassAd("k", ad)
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
+		if commitErr := tx.Commit(); commitErr != nil {
+			t.Fatal(commitErr)
 		}
 	}
 
 	// The in-memory table must not create a <dir>/tables/<name> directory.
 	memDir := filepath.Join(dir, tablesSubdir, "ephemeral")
-	if _, err := os.Stat(memDir); !os.IsNotExist(err) {
-		t.Fatalf("in-memory table created on-disk dir %s (err=%v)", memDir, err)
+	if _, statErr := os.Stat(memDir); !os.IsNotExist(statErr) {
+		t.Fatalf("in-memory table created on-disk dir %s (statErr=%v)", memDir, statErr)
 	}
 	diskDir := filepath.Join(dir, tablesSubdir, "persisted")
-	if _, err := os.Stat(diskDir); err != nil {
-		t.Fatalf("persistent table missing on-disk dir %s: %v", diskDir, err)
+	if _, statErr := os.Stat(diskDir); statErr != nil {
+		t.Fatalf("persistent table missing on-disk dir %s: %v", diskDir, statErr)
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: the persistent table's data survives; the in-memory table is gone.

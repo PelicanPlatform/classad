@@ -53,8 +53,8 @@ func TestTxQuerySeesUncommittedWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.NewClassAd(ctx, "a", adText("alice", 8)); err != nil {
-		t.Fatal(err)
+	if newClassAdErr := tx.NewClassAd(ctx, "a", adText("alice", 8)); newClassAdErr != nil {
+		t.Fatal(newClassAdErr)
 	}
 
 	rows, err := tx.Query(ctx, "Cpus >= 4", 0)
@@ -74,8 +74,8 @@ func TestTxQuerySeesUncommittedWrites(t *testing.T) {
 		t.Errorf("Client.Query got %v, want no rows before commit", got)
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	committed, err = c.Query(ctx, "Cpus >= 4")
 	if err != nil {
@@ -96,12 +96,12 @@ func TestTxQueryOverlaysDeletesAndRewrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	for key, ad := range map[string]string{"a": adText("alice", 8), "b": adText("bob", 8)} {
-		if err := seed.NewClassAd(ctx, key, ad); err != nil {
-			t.Fatal(err)
+		if newClassAdErr := seed.NewClassAd(ctx, key, ad); newClassAdErr != nil {
+			t.Fatal(newClassAdErr)
 		}
 	}
-	if err := seed.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := seed.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	tx, err := c.Begin(ctx)
@@ -109,11 +109,11 @@ func TestTxQueryOverlaysDeletesAndRewrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Abort(ctx)
-	if err := tx.DestroyClassAd(ctx, "b"); err != nil {
-		t.Fatal(err)
+	if destroyClassAdErr := tx.DestroyClassAd(ctx, "b"); destroyClassAdErr != nil {
+		t.Fatal(destroyClassAdErr)
 	}
-	if err := tx.NewClassAd(ctx, "c", adText("carol", 8)); err != nil {
-		t.Fatal(err)
+	if newClassAdErr := tx.NewClassAd(ctx, "c", adText("carol", 8)); newClassAdErr != nil {
+		t.Fatal(newClassAdErr)
 	}
 
 	rows, err := tx.Query(ctx, "Cpus >= 4", 0)
@@ -136,8 +136,8 @@ func TestTxQueryLimit(t *testing.T) {
 	}
 	defer tx.Abort(ctx)
 	for _, key := range []string{"a", "b", "c", "d"} {
-		if err := tx.NewClassAd(ctx, key, adText(key, 8)); err != nil {
-			t.Fatal(err)
+		if newClassAdErr := tx.NewClassAd(ctx, key, adText(key, 8)); newClassAdErr != nil {
+			t.Fatal(newClassAdErr)
 		}
 	}
 
@@ -162,8 +162,8 @@ func TestTxKeysWhereSeesUncommittedWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer tx.Abort(ctx)
-	if err := tx.NewClassAd(ctx, "staged", adText("alice", 8)); err != nil {
-		t.Fatal(err)
+	if newClassAdErr := tx.NewClassAd(ctx, "staged", adText("alice", 8)); newClassAdErr != nil {
+		t.Fatal(newClassAdErr)
 	}
 
 	keys, err := tx.KeysWhere(ctx, "Cpus >= 4")
@@ -176,8 +176,8 @@ func TestTxKeysWhereSeesUncommittedWrites(t *testing.T) {
 
 	// The key is addressable within the same transaction: set an attribute on the row
 	// the transaction just created and read it back through the transaction.
-	if err := tx.SetAttribute(ctx, keys[0], "JobStatus", "2"); err != nil {
-		t.Fatal(err)
+	if setAttributeErr := tx.SetAttribute(ctx, keys[0], "JobStatus", "2"); setAttributeErr != nil {
+		t.Fatal(setAttributeErr)
 	}
 	rows, err := tx.Query(ctx, "JobStatus == 2", 0)
 	if err != nil {
@@ -232,11 +232,11 @@ func TestTxQueryAfterAbort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.NewClassAd(ctx, "a", adText("alice", 8)); err != nil {
-		t.Fatal(err)
+	if newClassAdErr := tx.NewClassAd(ctx, "a", adText("alice", 8)); newClassAdErr != nil {
+		t.Fatal(newClassAdErr)
 	}
-	if err := tx.Abort(ctx); err != nil {
-		t.Fatal(err)
+	if abortErr := tx.Abort(ctx); abortErr != nil {
+		t.Fatal(abortErr)
 	}
 
 	rows, err := c.Query(ctx, "Cpus >= 4")

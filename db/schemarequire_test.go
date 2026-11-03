@@ -33,8 +33,8 @@ func TestArchiveSchemaRequirePersistsAcrossReopen(t *testing.T) {
 	if !changed {
 		t.Fatal("AddSchemaRequireAttrs reported no change")
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	cat2, err := OpenCatalog(dir)
@@ -97,11 +97,11 @@ func TestDBSchemaRequirePersistsAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if changed, err := d.AddSchemaRequireAttrs("ImageSize"); err != nil || !changed {
-		t.Fatalf("AddSchemaRequireAttrs = (%v, %v)", changed, err)
+	if changed, addSchemaRequireAttrsErr := d.AddSchemaRequireAttrs("ImageSize"); addSchemaRequireAttrsErr != nil || !changed {
+		t.Fatalf("AddSchemaRequireAttrs = (%v, %v)", changed, addSchemaRequireAttrsErr)
 	}
-	if err := d.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := d.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopened with a DIFFERENT configured set: the runtime addition must still be there.

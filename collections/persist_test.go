@@ -106,14 +106,14 @@ func TestPersistentCompactReopenNoDup(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	for r := 0; r < 2; r++ {
 		for i := 0; i < n; i++ {
-			if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d;R=%d]`, i, r))); err != nil {
-				t.Fatal(err)
+			if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d;R=%d]`, i, r))); putErr != nil {
+				t.Fatal(putErr)
 			}
 		}
 	}
@@ -247,9 +247,9 @@ func TestPersistentBasic(t *testing.T) {
 
 	const n = 2000
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
-			mustAd(t, fmt.Sprintf(`[Id=%d; Cpus=%d; Owner=%q]`, i, i%8, []string{"alice", "bob"}[i%2]))); err != nil {
-			t.Fatalf("put %d: %v", i, err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)),
+			mustAd(t, fmt.Sprintf(`[Id=%d; Cpus=%d; Owner=%q]`, i, i%8, []string{"alice", "bob"}[i%2]))); putErr != nil {
+			t.Fatalf("put %d: %v", i, putErr)
 		}
 	}
 	if c.Len() != n {
@@ -327,15 +327,15 @@ func TestPersistentReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d; V=0]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d; V=0]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	// Update the first 1000 (V=1) and delete every 10th of those.
 	deleted := map[int]bool{}
 	for i := 0; i < 1000; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d; V=1]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d; V=1]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	for i := 0; i < 1000; i += 10 {
@@ -348,8 +348,8 @@ func TestPersistentReopen(t *testing.T) {
 	if c.Len() != wantLen {
 		t.Fatalf("Len before close = %d, want %d", c.Len(), wantLen)
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen and verify the recovered state matches exactly.
@@ -462,12 +462,12 @@ func TestPersistentRecoveryNoPanicOnGarbageTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	// Overwrite the last 64 bytes of the (large, mostly-zero) file with 0xFF — a
 	// record length there is huge and out-of-bounds, which recovery must reject
@@ -482,8 +482,8 @@ func TestPersistentRecoveryNoPanicOnGarbageTail(t *testing.T) {
 	for i := range garbage {
 		garbage[i] = 0xFF
 	}
-	if _, err := f.WriteAt(garbage, st.Size()-64); err != nil {
-		t.Fatal(err)
+	if _, writeAtErr := f.WriteAt(garbage, st.Size()-64); writeAtErr != nil {
+		t.Fatal(writeAtErr)
 	}
 	f.Close()
 
@@ -512,12 +512,12 @@ func TestPersistentCRCStopsAtCorruptRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ { // distinct keys, no updates: one record each
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Locate record #corruptAt and flip a byte in its ad payload (an immutable,
@@ -537,8 +537,8 @@ func TestPersistentCRCStopsAtCorruptRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt([]byte{data[adByteOff] ^ 0xFF}, int64(adByteOff)); err != nil {
-		t.Fatal(err)
+	if _, writeAtErr := f.WriteAt([]byte{data[adByteOff] ^ 0xFF}, int64(adByteOff)); writeAtErr != nil {
+		t.Fatal(writeAtErr)
 	}
 	f.Close()
 
@@ -603,8 +603,8 @@ func TestPersistentRetrainDictReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), retrainAd(t, i)); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), retrainAd(t, i)); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	dsz, err := c.RetrainDict(n)
@@ -615,15 +615,15 @@ func TestPersistentRetrainDictReopen(t *testing.T) {
 		t.Fatalf("dict size = %d", dsz)
 	}
 	// The dictionary was written to disk.
-	if _, err := os.Stat(filepath.Join(dir, "dicts", "1.zst")); err != nil {
-		t.Fatalf("dict file not persisted: %v", err)
+	if _, statErr := os.Stat(filepath.Join(dir, "dicts", "1.zst")); statErr != nil {
+		t.Fatalf("dict file not persisted: %v", statErr)
 	}
 	// After retrain, the compacted segments must be the dict-tagged (.d1) files.
 	if got := countSegFiles(t, filepath.Join(dir, "0")); got == 0 {
 		t.Fatal("no segment files in shard 0 after retrain")
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: recovery must load the dictionary and decode the zstd+dict segments.
@@ -677,21 +677,21 @@ func TestPersistentMultiRetrainReopen(t *testing.T) {
 	}
 	for gen := 0; gen < 3; gen++ {
 		for i := 0; i < n; i++ {
-			if err := c.Put([]byte(fmt.Sprintf("k%d", i)), retrainAd(t, i+gen)); err != nil {
-				t.Fatal(err)
+			if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), retrainAd(t, i+gen)); putErr != nil {
+				t.Fatal(putErr)
 			}
 		}
-		if _, err := c.RetrainDict(n); err != nil {
-			t.Fatalf("RetrainDict gen %d: %v", gen, err)
+		if _, retrainDictErr := c.RetrainDict(n); retrainDictErr != nil {
+			t.Fatalf("RetrainDict gen %d: %v", gen, retrainDictErr)
 		}
 	}
 	// Only the latest dictionary survives: each retrain recompacted every segment to
 	// its new codec, so the superseded generations were pruned from disk.
-	if _, err := os.Stat(filepath.Join(dir, "dicts", "3.zst")); err != nil {
-		t.Fatalf("current dict not persisted: %v", err)
+	if _, statErr := os.Stat(filepath.Join(dir, "dicts", "3.zst")); statErr != nil {
+		t.Fatalf("current dict not persisted: %v", statErr)
 	}
 	for id := 1; id <= 2; id++ {
-		if _, err := os.Stat(filepath.Join(dir, "dicts", fmt.Sprintf("%d.zst", id))); err == nil {
+		if _, statErr := os.Stat(filepath.Join(dir, "dicts", fmt.Sprintf("%d.zst", id))); statErr == nil {
 			t.Fatalf("superseded dict %d still on disk, want pruned", id)
 		}
 	}
@@ -757,8 +757,8 @@ func TestPersistentDeleteSurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAd(t, fmt.Sprintf(`[Id=%d]`, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	// Delete every third key.

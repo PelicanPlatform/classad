@@ -38,8 +38,8 @@ func TestIndexSpecSignatureSurvivesReopen(t *testing.T) {
 	for i := 0; i < 1200; i++ {
 		ad := mustAdOld(t, fmt.Sprintf("Owner = %q\nGroup = %q\nPad = %q",
 			fmt.Sprintf("u%d", i%4), fmt.Sprintf("g%d", i%8), strings.Repeat("s", 60)))
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	// A configuration change, then a full reindex: nothing should be stale afterwards.
@@ -90,8 +90,8 @@ func TestSegmentsMayHoldDifferentIndexConfigs(t *testing.T) {
 		for i := from; i < to; i++ {
 			ad := mustAdOld(t, fmt.Sprintf("Owner = %q\nGroup = %q\nPad = %q",
 				fmt.Sprintf("u%d", i%4), fmt.Sprintf("g%d", (i/4)%8), strings.Repeat("s", 60)))
-			if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
-				t.Fatal(err)
+			if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); putErr != nil {
+				t.Fatal(putErr)
 			}
 		}
 	}

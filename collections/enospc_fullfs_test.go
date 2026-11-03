@@ -60,8 +60,8 @@ func TestENOSPCFullFilesystem(t *testing.T) {
 	)
 	for {
 		ad := mustAdNoT2(fmt.Sprintf(`[Id=%d;pad=%q]`, committed, pad))
-		if err := c.Put([]byte(fmt.Sprintf("k%d", committed)), ad); err != nil {
-			putErr = err
+		if perr := c.Put([]byte(fmt.Sprintf("k%d", committed)), ad); perr != nil {
+			putErr = perr
 			break
 		}
 		committed++
@@ -89,7 +89,7 @@ func TestENOSPCFullFilesystem(t *testing.T) {
 	if putErr != nil {
 		t.Logf("disk filled after %d acknowledged records: %v", committed, putErr)
 		// Further writes must keep failing cleanly (sticky fail-stop), never panic.
-		if err := c.Put([]byte("after-full"), mustAdNoT2(`[Id=-1]`)); err == nil {
+		if putErr := c.Put([]byte("after-full"), mustAdNoT2(`[Id=-1]`)); putErr == nil {
 			t.Log("note: a small Put succeeded after the disk-full (fit an already-allocated segment)")
 		}
 	} else {
@@ -98,8 +98,8 @@ func TestENOSPCFullFilesystem(t *testing.T) {
 
 	// Close may itself fail to write its snapshot on a full disk; that is acceptable (reopen falls
 	// back to a scan). Reopen must recover the acknowledged data consistently.
-	if err := c.Close(); err != nil {
-		t.Logf("Close on a full disk returned: %v (acceptable; reopen rebuilds from segments)", err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Logf("Close on a full disk returned: %v (acceptable; reopen rebuilds from segments)", closeErr)
 	}
 	c2, err := Open(Options{Shards: 4, Dir: dir, SegmentSize: 1 << 20})
 	if err != nil {

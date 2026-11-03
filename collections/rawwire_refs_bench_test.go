@@ -74,8 +74,8 @@ func BenchmarkWireRefsUncompressed(b *testing.B) {
 	const n = 20000
 	put := func(lo, hi int) {
 		for i := lo; i < hi; i++ {
-			if err := c.Put([]byte(fmt.Sprintf("%d.%d", i, i%10)), mustAd(b, refFixtureAd(i))); err != nil {
-				b.Fatal(err)
+			if putErr := c.Put([]byte(fmt.Sprintf("%d.%d", i, i%10)), mustAd(b, refFixtureAd(i))); putErr != nil {
+				b.Fatal(putErr)
 			}
 		}
 	}

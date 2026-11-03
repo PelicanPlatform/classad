@@ -311,11 +311,11 @@ func TestQueryRawWireRefsServesBothStorageKinds(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := tx.NewClassAd(ctx, "k1", ad); err != nil {
-			t.Fatal(err)
+		if newClassAdErr := tx.NewClassAd(ctx, "k1", ad); newClassAdErr != nil {
+			t.Fatal(newClassAdErr)
 		}
-		if err := tx.Commit(ctx); err != nil {
-			t.Fatal(err)
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			t.Fatal(commitErr)
 		}
 
 		var names []string

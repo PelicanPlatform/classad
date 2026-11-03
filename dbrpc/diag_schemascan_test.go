@@ -22,13 +22,13 @@ func TestDiagnosticsSchemaScan(t *testing.T) {
 		ad, _ := classad.ParseOld(fmt.Sprintf("Memory = %d\nCpus = %d\nName = \"n%05d\"", 1024+(i%64)*256, 1+i%8, i))
 		tx.NewClassAd(fmt.Sprintf("%d.0", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	for i := 0; i < 15; i++ { // Memory read demand -> hot
-		seq, err := d.QueryProject("true", []string{"Memory"})
-		if err != nil {
-			t.Fatal(err)
+		seq, qerr := d.QueryProject("true", []string{"Memory"})
+		if qerr != nil {
+			t.Fatal(qerr)
 		}
 		for range seq {
 		}

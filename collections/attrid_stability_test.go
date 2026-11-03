@@ -44,8 +44,8 @@ func TestInlineAttrIDsSurviveDropAndReopen(t *testing.T) {
 		}
 		ad := mustAdOld(t, fmt.Sprintf("Owner = %q\nGroup = %q\nPad = %q",
 			fmt.Sprintf("user%d", i%4), grp, strings.Repeat("x", 60)))
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	c.Reindex() // seal sidecars for the segments written so far

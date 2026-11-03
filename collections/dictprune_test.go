@@ -42,14 +42,14 @@ func TestRetrainPrunesOldDicts(t *testing.T) {
 	}
 	const n = 2000
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), sample[i%len(sample)]); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)), sample[i%len(sample)]); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 
 	for round := 0; round < 3; round++ {
-		if _, err := c.RetrainDict(1500); err != nil {
-			t.Skipf("RetrainDict unavailable on this corpus: %v", err)
+		if _, retrainDictErr := c.RetrainDict(1500); retrainDictErr != nil {
+			t.Skipf("RetrainDict unavailable on this corpus: %v", retrainDictErr)
 		}
 	}
 
@@ -67,8 +67,8 @@ func TestRetrainPrunesOldDicts(t *testing.T) {
 	if c.Len() != n {
 		t.Fatalf("Len=%d want %d after retrains", c.Len(), n)
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: data intact under the surviving dictionary, registry stays pruned.

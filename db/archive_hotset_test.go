@@ -90,8 +90,8 @@ func TestArchiveRefreshHotSetPersistsAcrossReopen(t *testing.T) {
 	if !hasFold(a.HotAttrs(), "GlobalJobId") {
 		t.Fatalf("hot set after refresh = %v, want the queried GlobalJobId", a.HotAttrs())
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	cat2, err := OpenCatalog(dir)
@@ -175,8 +175,8 @@ func TestArchiveAddHotAttrsPersistsAsHuman(t *testing.T) {
 	if hasFold(saved.AutoHotAttrs, "ExitCode") {
 		t.Errorf("persisted AutoHotAttrs = %v, want an explicit add attributed to the operator", saved.AutoHotAttrs)
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	cat2, err := OpenCatalog(dir)
@@ -219,12 +219,12 @@ func TestArchiveRecordsSurviveAHotSetChange(t *testing.T) {
 		ad.Set("Owner", fmt.Sprintf("user%d", i%7))
 		ad.Set("GlobalJobId", fmt.Sprintf("ap1#%d.0#1700000000", i))
 		ad.Set("ExitCode", int64(i%3))
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	cat2, err := OpenCatalog(dir)
