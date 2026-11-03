@@ -378,6 +378,12 @@ func TestNwayWireVolumeGrowsWithTheChain(t *testing.T) {
 			}
 			// The prefix push: the first pair joined in the store with the opcode that
 			// already exists, the last table read and folded by the client.
+			//
+			// The tail is read unnarrowed, where a real prefix push would narrow it to the
+			// keys the composite rows hold. That costs this arm nothing on either shape
+			// here -- the expanding chain holds every key, so the narrowed read is the same
+			// read, and the filtering chain's third table is 41 rows whole -- and the term
+			// that decides the arm is the prefix's own output, which is measured exactly.
 			_, tailBytes, err := runNway(nwayWireFetch(c), chain[2:])
 			if err != nil {
 				t.Fatalf("tail read: %v", err)
