@@ -1448,6 +1448,45 @@ which is worse.
 
 ---
 
+**It happened anyway, to the benchmark fixture rather than to a kernel, and it cost two retracted
+measurements.**
+
+`poolSampleFixture` wrote twenty thousand ads and enabled the accelerator. What it did not do was
+close the **active segment**, which has no columnar block and therefore goes to `rowEvalWindow` and
+through the whole ClassAd evaluator (`colvec.go`, the `seg == nil` arm). On a simple constraint that
+tail was **624 records of 20000 -- 3% of the rows and about three quarters of the CPU**, which puts
+the row path at roughly **88x the per-record cost** of the vector one.
+
+Nothing about the output looked wrong. The scan answered correctly, `vecBlocks` was large,
+`scopeBlocks` was zero, and the ns/op was plausible. The counter that would have said so,
+`rowWindows`, was the one field of the split nobody printed.
+
+Two conclusions were drawn from it and both were wrong. A conjunction-ordering benchmark reported
+the string operand first running 1.6x faster and attributed it to dictionary encoding; on the sealed
+fixture the same comparison is **1.02x**, and the original effect was the row evaluator, where
+short-circuiting changes which attribute is looked up and lookup is a positional walk through the
+record. A uniform-state flag was reported as below the noise floor and *not worth building*; the
+truthful statement was that the harness could not see it, since the vector executor was about a
+quarter of what was being timed.
+
+`sealActiveSegments` now closes the tail and `assertNoRowWindows` fails the fixture if one ever
+returns. With the tail gone the same scan runs **0.59 ms against 1.76 ms**, and
+`BenchmarkVecScanBlockWidth` reports **29.7 ns/elem** where it used to report about 88 -- so **the
+recorded width figures in §6.8 item 10 predate this and should be re-taken** before being quoted
+again.
+
+**What the clean scan actually spends its time on is worth more than either retracted result.**
+`LoadColumn` is about 62% of it, and inside that the visible costs are `fixEscapes` and
+`escapedNode` -- repairing escaped values by walking the record's wire form in the cold tail, per
+escaped record, on every scan. The comparison kernel the two spikes were trying to improve is a
+small slice of the remainder: with the uniform fast path firing on 94% of `compareVecConst` calls,
+it is worth about 1%. **Escape repair is the cost centre on this shape, not arithmetic and not
+dispatch.**
+
+The rule this adds to §7.8: a fixture is part of the path, and **a benchmark has to assert its
+fixture takes the path it claims to measure**, not merely that the fast path exists.
+
+
 ## 8. What this is not
 
 - **Not a general-purpose language.** No modules or imports, no classes, no dict or set types, no
