@@ -83,8 +83,13 @@ func (c *Column) Text(i int) string { return c.Str[i] }
 // Batch is one block's -- or one chunk of one window's -- surviving records, as columns.
 //
 // BORROWED, AND ONLY UNTIL THE CALLBACK RETURNS. The slices are the producer's own and are refilled
-// for the next batch, and a string in Str may alias the block it was read from, which is unmapped or
-// rewritten once the scan moves on. A consumer that keeps anything past its callback must copy it.
+// for the next batch, so a cell read after that is some later record's.
+//
+// A STRING IN Str ALIASES THE BLOCK'S DECOMPRESSED REGION -- it is an unsafe.String over the
+// dictionary entry, not a copy. Keeping one past the callback therefore pins that whole region for
+// as long as the string lives, which on a scan of any size is a great deal more memory than the
+// consumer thinks it is holding, and it stays valid only while that region does. A consumer that
+// keeps anything past its callback copies it.
 //
 // Cols is in the order the attributes were requested, one entry each, and that order and length are
 // the same for every batch of a scan -- including a batch no column could be read for, which reports
