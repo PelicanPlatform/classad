@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -90,7 +91,7 @@ func TestEncryptedAttributeNotHot(t *testing.T) {
 
 func indexOf(hay, needle []byte) int {
 	for i := 0; i+len(needle) <= len(hay); i++ {
-		if string(hay[i:i+len(needle)]) == string(needle) {
+		if bytes.Equal(hay[i:i+len(needle)], needle) {
 			return i
 		}
 	}

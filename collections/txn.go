@@ -86,6 +86,8 @@ func (sh *shard) getAt(c *Collection, h uint64, key []byte, s0 uint64, want mate
 // unrelated causes -- an MVCC miss, a reaped segment, a missing columnar payload, an
 // unresolvable delta chain -- and a caller that must explain the failure needs to tell them
 // apart. See readFail.
+//
+//nolint:gocritic // the results are a read's whole answer; bundling them in a struct would allocate on the hottest path here
 func (sh *shard) getAtWhy(c *Collection, h uint64, key []byte, s0 uint64, want materializeWant) ([]byte, Codec, *segDictHandle, *classad.ClassAd, bool, readFail) {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
@@ -205,7 +207,7 @@ func (sh *shard) conflictSince(h uint64, key []byte, s0 uint64) bool {
 }
 
 // txnWrite is one buffered write ready to apply, with its snapshot base for the
-// conflict check. ok is set by commitTxn.
+// conflict check. ok is set when the commit applies the write.
 type txnWrite struct {
 	hash  uint64
 	key   []byte
@@ -231,21 +233,6 @@ func (w *txnWrite) hdrFlags() uint32 {
 		return deltaFlag
 	}
 	return 0
-}
-
-// commitTxn applies a shard's buffered transactional writes with per-write conflict
-// detection, all under one shard write lock so the check and apply are atomic with
-// respect to other committers (first-committer-wins). Conflicting writes are skipped
-// and flagged; the rest commit at one fresh sequence.
-func (sh *shard) commitTxn(c *Collection, ws []*txnWrite, durable bool) {
-	changed, seq := sh.applyTxn(ws)
-	if !changed {
-		return
-	}
-	if durable {
-		sh.sync()
-	}
-	sh.publishTxn(c, ws, seq)
 }
 
 // applyTxn applies a shard's buffered writes under the write lock, advancing the shard's
@@ -373,7 +360,7 @@ type txnBuf struct {
 	// noDelta forces a full record even when changed is populated: set when the write also
 	// REMOVED an attribute, which a delta of present attributes cannot express.
 	noDelta bool
-	// decodeWireFn rebuilds the object from wire when there is no source text; see putWire.
+	// decodeWireFn rebuilds the object from wire when there is no source text; see putWireAd.
 	decodeWireFn func([]byte) (*classad.ClassAd, error)
 	// patch holds ONLY the attributes this write changed, with no full ad beside it -- the
 	// point being that the writer never had to read the stored ad to produce it. removed names
@@ -400,7 +387,7 @@ func (b *txnBuf) materialize() (*classad.ClassAd, bool) {
 	if b.ad == nil && b.wire != nil {
 		if b.text == "" {
 			// Wire bytes with no source text: a whole record the caller already had encoded
-			// (see Txn.putWire). Decode them only if something actually needs the object --
+			// (see Txn.putWireAd). Decode them only if something actually needs the object --
 			// which for most tables is nothing, so the common path never pays it.
 			ad, err := b.decodeWire()
 			if err != nil {
@@ -595,26 +582,21 @@ func (tx *Txn) Has(key []byte) bool {
 	return tx.c.shards[idx].hasAt(h, key, tx.snapOf(idx))
 }
 
-// putWire buffers a whole record the caller already holds in encoded form, skipping the
-// decode-and-re-encode round trip a Put would make of it.
+// putWireAd buffers a whole record the caller already holds in encoded form, skipping the
+// decode-and-re-encode round trip a Put would make of it, together with the ad those bytes
+// encode. It exists for the seal collapse, whose whole job is to turn a resolved chain into one
+// whole record: materializeAt hands back exactly those bytes, and routing them through a ClassAd
+// and back was 57% of the ingest run. The bytes must be a complete record in this collection's
+// encoding -- nothing validates that, which is why this is unexported.
 //
-// It exists for the seal collapse, whose whole job is to turn a resolved chain into one whole
-// record: materializeAt hands back exactly those bytes, and routing them through a ClassAd and
-// back was 57% of the ingest run. The bytes must be a complete record in this collection's
-// encoding -- nothing validates that, which is why this is unexported and has one caller.
-func (tx *Txn) putWire(key, wire []byte, decode func([]byte) (*classad.ClassAd, error)) {
-	tx.putWireAd(key, wire, nil, decode)
-}
-
-// putWireAd is putWire for a caller that already holds the ad these bytes encode. The object is
-// buffered beside the bytes, so anything in Commit that wants it (ordered-index maintenance,
-// watch publication) gets it for free instead of decoding the bytes back into the object they
-// were just encoded from. decode is still required: ad may be nil, and a later caller may need
-// to materialize from bytes alone.
-func (tx *Txn) putWireAd(key, wire []byte, ad *classad.ClassAd, decode func([]byte) (*classad.ClassAd, error)) {
+// The object is buffered beside the bytes, so anything in Commit that wants it (ordered-index
+// maintenance, watch publication) gets it for free instead of decoding the bytes back into the
+// object they were just encoded from. decode is still required: ad may be nil, and a later
+// caller may need to materialize from bytes alone.
+func (tx *Txn) putWireAd(key, enc []byte, ad *classad.ClassAd, decode func([]byte) (*classad.ClassAd, error)) {
 	tx.snapOf(tx.c.shardOf(key, tx.c.h.Hash(key)))
 	tx.writes[string(key)] = &txnBuf{
-		key: append([]byte(nil), key...), wire: wire, ad: ad, decodeWireFn: decode,
+		key: append([]byte(nil), key...), wire: enc, ad: ad, decodeWireFn: decode,
 	}
 }
 
@@ -764,7 +746,7 @@ func (tx *Txn) Commit() CommitResult {
 			raw := b.wire
 			switch {
 			case raw != nil:
-				// Bytes the caller buffered (Txn.putWire); they are not ours to reuse.
+				// Bytes the caller buffered (Txn.putWireAd); they are not ours to reuse.
 			case b.patch != nil && b.ad == nil:
 				var ok bool
 				var why readFail
@@ -900,7 +882,7 @@ func (tx *Txn) Commit() CommitResult {
 }
 
 // checkDepth refuses a buffered write holding a value deeper than wire.MaxDepth. Wire bytes are not
-// checked here: PutOld's encoder refused such a value as it encoded (encodeOld), and putWire's bytes
+// checked here: PutOld's encoder refused such a value as it encoded (encodeOld), and putWireAd's bytes
 // are a record the store already holds.
 func (b *txnBuf) checkDepth() error {
 	switch {

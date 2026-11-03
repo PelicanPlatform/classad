@@ -53,13 +53,13 @@ func buildPersistentIndexedCorpus(t *testing.T, dir string) (*Collection, map[in
 		var text string
 		switch {
 		case i%37 == 0:
-			text = fmt.Sprintf(`[ ID = %d; Arch = "%s"; State = "%s"; Owner = "%s"; Cpus = Base + 1; Memory = 1024 * %d ]`,
+			text = fmt.Sprintf(`[ ID = %d; Arch = %q; State = %q; Owner = %q; Cpus = Base + 1; Memory = 1024 * %d ]`,
 				i, arches[i%len(arches)], states[i%len(states)], owners[i%len(owners)], (i%8)+1)
 		case i%41 == 0:
-			text = fmt.Sprintf(`[ ID = %d; Arch = %d; Owner = "%s"; Cpus = %d; Memory = %d ]`,
+			text = fmt.Sprintf(`[ ID = %d; Arch = %d; Owner = %q; Cpus = %d; Memory = %d ]`,
 				i, i, owners[i%len(owners)], (i%8)+1, ((i%16)+1)*512)
 		default:
-			text = fmt.Sprintf(`[ ID = %d; Arch = "%s"; State = "%s"; Owner = "%s"; Cpus = %d; Memory = %d ]`,
+			text = fmt.Sprintf(`[ ID = %d; Arch = %q; State = %q; Owner = %q; Cpus = %d; Memory = %d ]`,
 				i, arches[i%len(arches)], states[i%len(states)], owners[i%len(owners)], (i%8)+1, ((i%16)+1)*512)
 		}
 		ad, err := classad.Parse(text)

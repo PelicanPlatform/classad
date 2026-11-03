@@ -169,7 +169,7 @@ func TestColGroupsAlignedToEight(t *testing.T) {
 	defer c.Close()
 	pad := strings.Repeat("x", 4096)
 	for i := 0; i < 4000; i++ {
-		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nRequestMemory = %d\nOwner = \"user%d\"\nBlob = \"%s\"",
+		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nRequestMemory = %d\nOwner = \"user%d\"\nBlob = %q",
 			i, i%10, 1024+(i%32)*512, i%512, pad)
 		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(t, src)); err != nil {
 			t.Fatal(err)

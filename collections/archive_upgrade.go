@@ -206,14 +206,14 @@ func (c *Collection) recodeSegment(sh *shard, src *segment, target Codec) bool {
 	if int(src.id) >= len(sh.segs) || sh.segs[src.id] != src {
 		sh.mu.Unlock()
 		newseg.retire()
-		newseg.reapAndHook()
+		newseg.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		return false
 	}
 	sh.segs[src.id] = newseg
 	retire := src.retire()
 	sh.mu.Unlock()
 	if retire {
-		src.reapAndHook()
+		src.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 	}
 	return true
 }
@@ -236,5 +236,5 @@ func saveUpgradeVerdicts(dir string, v *upgradeVerdicts) {
 	if err != nil {
 		return
 	}
-	_ = writeFileSync(filepath.Join(dir, upgradeVerdictsFile), data) // best-effort
+	_ = writeFileSync(filepath.Join(dir, upgradeVerdictsFile), data) //nolint:errcheck // best-effort
 }

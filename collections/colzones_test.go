@@ -19,7 +19,7 @@ import (
 // while RequestMemory cycles (so blocks are not clustered by that). Optionally one record carries a
 // too-wide ClusterId, which ESCAPES: its value is not in the column, so the column range does not
 // describe it.
-func zoneFixture(tb testing.TB, n int, wideAt int) *Collection {
+func zoneFixture(tb testing.TB, n, wideAt int) *Collection {
 	tb.Helper()
 	c := New(Options{Shards: 1, SegmentSize: 1 << 16})
 	for i := 0; i < n; i++ {

@@ -6,8 +6,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/PelicanPlatform/classad/classad"
 	"github.com/tidwall/btree"
+
+	"github.com/PelicanPlatform/classad/classad"
 )
 
 // SortKey is one component of an ordered index's sort order: an attribute name or
@@ -60,16 +61,16 @@ func strVal(s string) orderVal  { return orderVal{kind: kStr, str: s} }
 func valueToOrderVal(v classad.Value) orderVal {
 	switch {
 	case v.IsBool():
-		b, _ := v.BoolValue()
+		b, _ := v.BoolValue() //nolint:errcheck // guarded by the type check above
 		if b {
 			return orderVal{kind: kBool, num: 1}
 		}
 		return orderVal{kind: kBool, num: 0}
 	case v.IsNumber():
-		n, _ := v.NumberValue()
+		n, _ := v.NumberValue() //nolint:errcheck // guarded by the type check above
 		return numVal(n)
 	case v.IsString():
-		s, _ := v.StringValue()
+		s, _ := v.StringValue() //nolint:errcheck // guarded by the type check above
 		return strVal(s)
 	default:
 		return orderVal{kind: kUndef}

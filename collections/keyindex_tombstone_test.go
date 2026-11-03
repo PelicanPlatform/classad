@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
@@ -56,7 +57,7 @@ func TestKeyIndexFilesDeleteMarkersUnderTheirKey(t *testing.T) {
 	if len(marks) != 1 {
 		t.Fatalf("lookupTombstones(%q) = %d markers, want 1", key, len(marks))
 	}
-	if k, ok := recDeleteMarkerKey(seg.data, marks[0]); !ok || string(k) != string(key) {
+	if k, ok := recDeleteMarkerKey(seg.data, marks[0]); !ok || !bytes.Equal(k, key) {
 		t.Fatalf("entry at off %d is not %q's delete marker (got %q, ok=%v)", marks[0], key, k, ok)
 	}
 

@@ -32,7 +32,7 @@ type vecRunner struct {
 // invarianceRunners builds the programs the law runs over: expressions, predicated scripts, and
 // loops — because the state that can leak differs for each. An expression leaves nothing behind; a
 // script leaves bindings; a loop leaves bindings, a live mask, and a region stack.
-func invarianceRunners(t *testing.T) (exprs []vecRunner, loops []vecRunner) {
+func invarianceRunners(t *testing.T) (exprs, loops []vecRunner) {
 	t.Helper()
 	for _, src := range append(append([]string{}, vecExprs...), chargeShapes...) {
 		q, err := Parse(src)

@@ -116,22 +116,6 @@ func maskStateAt(hi, lo []uint64, i int) int {
 	return int((hi[w]>>b)&1)<<1 | int((lo[w]>>b)&1)
 }
 
-// setMaskStateAt writes one record's two bits, clearing whatever was there.
-func setMaskStateAt(hi, lo []uint64, i, st int) {
-	w, b := i/64, uint(i%64)
-	m := uint64(1) << b
-	if st&2 != 0 {
-		hi[w] |= m
-	} else {
-		hi[w] &^= m
-	}
-	if st&1 != 0 {
-		lo[w] |= m
-	} else {
-		lo[w] &^= m
-	}
-}
-
 // dataStateToMask maps one DATA element to its mask state as a logical operand.
 //
 // Numbers are TRUTHY in ClassAd's logical operators -- `1 && true` is TRUE, `0 && true` is FALSE, `0.0` is

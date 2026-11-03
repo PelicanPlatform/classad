@@ -307,7 +307,8 @@ func (c *Collection) queryRawFromSeq(q *vm.Query, projection []string, after Seq
 						return false // shard exhausted; fall through to the next
 					}
 					gseq := group[0].seq
-					for _, g := range group {
+					for gi := range group {
+						g := &group[gi]
 						// Within the cursor's own commit, skip what the last
 						// page already emitted. Elsewhere the whole group is
 						// new.

@@ -347,7 +347,7 @@ func TestDispatchesAgree(t *testing.T) {
 	if hs != ps {
 		t.Fatal("scans disagree between the header and payload dispatches")
 	}
-	if len(hs) == 0 {
+	if hs == "" {
 		t.Fatal("the scan produced nothing: the comparison is vacuous")
 	}
 }

@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -95,7 +96,7 @@ func TestEncodeDeterministic(t *testing.T) {
 			t.Fatal(err)
 		}
 		b := EncodeStandalone(dec)
-		if string(a) != string(b) {
+		if !bytes.Equal(a, b) {
 			t.Errorf("re-encode not stable for %q: %d vs %d bytes", src, len(a), len(b))
 		}
 	}
@@ -226,7 +227,7 @@ func FuzzRoundTrip(f *testing.F) {
 			t.Fatalf("decode failed for parseable ad %q: %v", src, err)
 		}
 		// Re-encoding the freshly-decoded ad must be byte-stable.
-		if string(enc) != string(EncodeStandalone(got)) {
+		if !bytes.Equal(enc, EncodeStandalone(got)) {
 			t.Fatalf("re-encode not stable for %q", src)
 		}
 		if !toClassAd(orig).Equal(toClassAd(got)) {

@@ -151,7 +151,7 @@ func intFits(v int64, w int, unsigned bool) bool {
 	case 4:
 		return v >= math.MinInt32 && v <= math.MaxInt32
 	case 6:
-		return v >= -(1<<47) && v <= (1<<47)-1
+		return v >= -(1<<47) && v < (1<<47)
 	}
 	return true
 }
@@ -322,7 +322,7 @@ func buildAdSchemaReport(sample [][]byte, opts adSchemaOpts) (*adSchema, []requi
 		domK, domC := akNone, 0
 		for k := akBool; k <= akString; k++ {
 			if st.kinds[k] > domC {
-				domC, domK = st.kinds[k], adKind(k)
+				domC, domK = st.kinds[k], k
 			}
 		}
 		switch {

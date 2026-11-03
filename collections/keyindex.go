@@ -387,12 +387,16 @@ func splitSegmentSidecar(data []byte) (attr, key, col, zone []byte, ok bool) {
 }
 
 // splitSegmentSidecarFull also returns the recorded sealed extent (0 when absent).
+//
+//nolint:gocritic // the results ARE the container's sections; a struct would only rename them
 func splitSegmentSidecarFull(data []byte) (attr, key, col, zone []byte, segUsed int, ok bool) {
 	a, k, c, z, u, _, o := splitSegmentSidecarV4(data)
 	return a, k, c, z, u, o
 }
 
 // splitSegmentSidecarV4 also returns the recorded dictionary record offset (0 when absent).
+//
+//nolint:gocritic // the results ARE the container's sections; a struct would only rename them
 func splitSegmentSidecarV4(data []byte) (attr, key, col, zone []byte, segUsed int, dictRec uint32, ok bool) {
 	if v5, isV5 := splitSidecarV5(data); isV5 {
 		return v5.attr, v5.key, v5.col, v5.zone, v5.used, v5.dictRec, v5.ok
@@ -489,6 +493,7 @@ func splitSidecarV5(data []byte) (out sidecarV5, isV5 bool) {
 		used: used, dictRec: binary.LittleEndian.Uint32(t[28:]), ok: true}, true
 }
 
+//nolint:gocritic // the results ARE the container's sections; a struct would only rename them
 func splitSegmentSidecarOld(data []byte) (attr, key, col, zone []byte, segUsed int, ok bool) {
 	if len(data) >= sidecarTrailerLenV3 {
 		t := data[len(data)-sidecarTrailerLenV3:]
@@ -720,14 +725,6 @@ func legacyZoneBlobValid(b []byte) bool {
 		}
 	}
 	return true
-}
-
-// readSidecarExtent reads just the trailer of a sealed segment's sidecar to recover the
-// segment's written extent, without mapping the sidecar (mapping every sidecar at open is
-// itself a cost worth avoiding). Returns 0 when the file is absent, too short, or not a v3
-// container -- the caller then falls back to scanning.
-func readSidecarExtent(path string) int {
-	return readSidecarTrailer(path).used
 }
 
 // sidecarFacts is what a sealed segment's sidecar trailer tells recovery before anything else of

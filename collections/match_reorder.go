@@ -135,16 +135,16 @@ func (c *Collection) operandTrueProb(operand ast.Expr, js *jobScope) (float64, b
 	// An operand that is itself a small conjunction yields several probes; treat them as
 	// independent (product of fractions) -- a rough but monotone estimate.
 	frac := 1.0
-	any := false
+	anyCovered := false
 	for _, up := range ups {
 		cand, covered := c.estimateCandidates(up)
 		if !covered {
 			continue
 		}
-		any = true
+		anyCovered = true
 		frac *= math.Min(1, cand/total)
 	}
-	if !any {
+	if !anyCovered {
 		return 0, false
 	}
 	return frac, true

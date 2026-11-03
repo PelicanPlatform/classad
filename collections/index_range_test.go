@@ -8,8 +8,9 @@ import (
 
 	"github.com/PelicanPlatform/classad/classad"
 
-	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/RoaringBitmap/roaring/v2"
+
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 // TestCoalesceRanges pins the planner's range-merging rules: opposite bounds on one

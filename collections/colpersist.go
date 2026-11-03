@@ -813,17 +813,6 @@ func appendRemnantTrailer(dst []byte, names []string) []byte {
 	return dst
 }
 
-// readRemnantTrailer decodes a trailer from rest (the bytes after the group section), interning every
-// name, or returns nil when there is none or it does not parse. Names are read before any is interned,
-// so a torn trailer leaves nothing in the intern table.
-func readRemnantTrailer(rest []byte, internName func(string) uint32) *remnantSet {
-	names, tail, ok := splitRemnantTrailer(rest)
-	if !ok || len(tail) != 0 {
-		return nil
-	}
-	return remnantSetOf(names, internName)
-}
-
 // splitRemnantTrailer parses a remnant-name trailer at the start of rest WITHOUT interning anything,
 // returning its names and the bytes after it. With no trailer there, ok is false and tail is rest; with
 // one that does not parse, ok is false and tail is nil, so nothing after it is trusted either.

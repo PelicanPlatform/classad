@@ -3,8 +3,9 @@ package collections
 import (
 	"testing"
 
-	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // BenchmarkSchemaScanCompressed quantifies the scan cost when records are zstd-compressed

@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -87,10 +88,10 @@ func TestRepairKeepsTheOriginal(t *testing.T) {
 	if err != nil {
 		t.Fatalf("quarantined original is not readable: %v", err)
 	}
-	if string(got) != string(damaged) {
+	if !bytes.Equal(got, damaged) {
 		t.Error("the quarantined file is not the original bytes")
 	}
-	if string(got) == string(before) {
+	if bytes.Equal(got, before) {
 		t.Error("test flaw: the damage never reached the file")
 	}
 }

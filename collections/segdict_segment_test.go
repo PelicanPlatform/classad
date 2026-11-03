@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -57,7 +58,7 @@ Rank=Memory*1.0`,
 	if recKeyLen(seg.data, dictOff) != 0 {
 		t.Errorf("dict record keyLen=%d, want 0", recKeyLen(seg.data, dictOff))
 	}
-	if string(recAd(seg.data, dictOff)) != string(dict) {
+	if !bytes.Equal(recAd(seg.data, dictOff), dict) {
 		t.Errorf("dict record body != serialized dict")
 	}
 
@@ -79,7 +80,7 @@ Rank=Memory*1.0`,
 		if err != nil {
 			t.Fatal(err)
 		}
-		if string(wire.EncodeInline(nil, ref)) != string(wire.EncodeInline(nil, got)) {
+		if !bytes.Equal(wire.EncodeInline(nil, ref), wire.EncodeInline(nil, got)) {
 			t.Errorf("rec %d: handle-decode != table-decode", i)
 		}
 	}

@@ -268,7 +268,7 @@ func (z *zstdCodec) DecompressPrefix(dst, src []byte, want int) ([]byte, error) 
 		}
 		sd = &streamDec{dec: dec, br: new(bytes.Reader)}
 	} else {
-		sd = v.(*streamDec)
+		sd = v.(*streamDec) //nolint:errcheck // this pool only ever holds *streamDec
 	}
 	sd.br.Reset(src)
 	if err := sd.dec.Reset(sd.br); err != nil {

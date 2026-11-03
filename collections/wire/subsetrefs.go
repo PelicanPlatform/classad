@@ -54,8 +54,7 @@ func AppendAdSubsetInlineRefs(dst []byte, src Ad, keep func(name []byte, h uint3
 	}
 	entriesStart := c.pos
 
-	dst = append(dst, magicByte, formatVer, flagInlineNames)
-	dst = append(dst, 0) // hotCount = 0
+	dst = append(dst, magicByte, formatVer, flagInlineNames, 0) // trailing 0 = hotCount
 	countAt := len(dst)
 	dst = append(dst, 0x80, 0x80, 0x80, 0x80, 0x00)
 	kept := uint64(0)

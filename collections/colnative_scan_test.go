@@ -347,7 +347,7 @@ func TestColumnarizedShardServesTimeTravel(t *testing.T) {
 	defer c.Close()
 	put := func(i int, owner string, status int) {
 		ad, err := classad.Parse(fmt.Sprintf(
-			`[ ClusterId=%d; ProcId=%d; Owner="%s"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep" ]`,
+			`[ ClusterId=%d; ProcId=%d; Owner=%q; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep" ]`,
 			i, i%10, owner, status, (i%16)*1024))
 		if err != nil {
 			t.Fatal(err)
@@ -753,8 +753,7 @@ func bothStorageForms(t *testing.T) (rows, cols *Collection) {
 			text := fmt.Sprintf(
 				`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Slack=%d ]`,
 				i, i%10, i%7, i%6, (i%16)*1024, i%11-5)
-			switch i % 7 {
-			case 0:
+			if i%7 == 0 {
 				text = fmt.Sprintf(
 					`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Slack=%d; Sometimes=%d ]`,
 					i, i%10, i%7, i%6, (i%16)*1024, i%11-5, i)
@@ -805,8 +804,7 @@ func TestColumnarPrefilterAgreesWithRowPath(t *testing.T) {
 			text := fmt.Sprintf(
 				`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Slack=%d ]`,
 				i, i%10, i%7, i%6, (i%16)*1024, i%11-5)
-			switch i % 7 {
-			case 0:
+			if i%7 == 0 {
 				text = fmt.Sprintf(
 					`[ ClusterId=%d; ProcId=%d; Owner="user%d"; JobStatus=%d; RequestMemory=%d; Cmd="/bin/sleep"; Slack=%d; Sometimes=%d ]`,
 					i, i%10, i%7, i%6, (i%16)*1024, i%11-5, i)

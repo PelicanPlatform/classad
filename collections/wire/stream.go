@@ -219,7 +219,7 @@ func (s *StreamEncoder) Bytes(dst []byte) []byte {
 		// first-occurrence-wins duplicate semantics intact.
 		s.reorderHotFirstInline()
 	}
-	out := append(dst, magicByte, formatVer, flags)
+	out := append(dst, magicByte, formatVer, flags) //nolint:gocritic // dst is the caller's buffer; out is the result built on top of it
 	out = binary.AppendUvarint(out, uint64(len(s.hots)))
 	for _, h := range s.hots {
 		out = binary.AppendUvarint(out, uint64(h.id))

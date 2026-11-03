@@ -57,10 +57,10 @@ func TestSchemaScanIntCountMVCC(t *testing.T) {
 	}
 	for i := 0; i < n; i++ {
 		mem := 1024 + (i%64)*512 // fits uint16
-		switch {
-		case i%50 == 7:
+		switch i % 50 {
+		case 7:
 			put(fmt.Sprintf("k%d", i), fmt.Sprintf("Cpus=%d\nMemory=%d\nMachine=\"m%03d\"", 1+i%8, 100000, i)) // out-of-uint16 -> escapes
-		case i%50 == 11:
+		case 11:
 			put(fmt.Sprintf("k%d", i), fmt.Sprintf("Cpus=%d\nMemory=\"unknown\"\nMachine=\"m%03d\"", 1+i%8, i)) // string -> escapes
 		default:
 			put(fmt.Sprintf("k%d", i), fmt.Sprintf("Cpus=%d\nMemory=%d\nMachine=\"m%03d\"", 1+i%8, mem, i))

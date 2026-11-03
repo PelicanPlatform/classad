@@ -573,7 +573,7 @@ func (a Ad) LookupByName(name string) ([]byte, bool) {
 	for i := uint64(0); i < hotCount && c.ok; i++ {
 		hh := c.uvarint()  // nameHash32
 		off := c.uvarint() // entries-relative offset to the (name, node) entry
-		if c.ok && uint32(hh) == h {
+		if c.ok && hh == uint64(h) {
 			hotEntryOff, hotHit = uint32(off), true
 		}
 	}

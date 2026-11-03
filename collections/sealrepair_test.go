@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -97,7 +98,7 @@ func TestPreCompactionCollapseFindsStrandedFragments(t *testing.T) {
 
 	found := func(keys [][]byte, want []byte) bool {
 		for _, k := range keys {
-			if string(k) == string(want) {
+			if bytes.Equal(k, want) {
 				return true
 			}
 		}

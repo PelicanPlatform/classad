@@ -33,7 +33,7 @@ func TestSuggestIndexes(t *testing.T) {
 	owners := []string{"alice", "bob", "carol", "dave", "eve"}
 	for i := 0; i < 300; i++ {
 		ad, err := classad.Parse(fmt.Sprintf(
-			`[ Owner="%s"; Arch="X86_64"; Memory=%d; Rank=Cpus*2 ]`,
+			`[ Owner=%q; Arch="X86_64"; Memory=%d; Rank=Cpus*2 ]`,
 			owners[i%len(owners)], (i%20)*512))
 		if err != nil {
 			t.Fatal(err)
@@ -83,7 +83,7 @@ func TestSuggestIndexesPersistent(t *testing.T) {
 	populate := func(c *Collection) {
 		owners := []string{"alice", "bob", "carol"}
 		for i := 0; i < 200; i++ {
-			ad, err := classad.Parse(fmt.Sprintf(`[ Owner="%s"; JobStatus=%d ]`, owners[i%3], i%5))
+			ad, err := classad.Parse(fmt.Sprintf(`[ Owner=%q; JobStatus=%d ]`, owners[i%3], i%5))
 			if err != nil {
 				t.Fatal(err)
 			}

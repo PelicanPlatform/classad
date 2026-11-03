@@ -376,9 +376,9 @@ func TestBucketedComponentDropsTheWholeRecord(t *testing.T) {
 	const day = 86400
 	a := newGroupAccum([]int64{0, day}, nil)
 	owner := a.strComp("alice")
-	real := func(f float64) groupComp { return groupComp{kind: gkReal, raw: int64(math.Float64bits(f))} }
+	mkReal := func(f float64) groupComp { return groupComp{kind: gkReal, raw: int64(math.Float64bits(f))} }
 	for _, bad := range []groupComp{
-		real(math.NaN()), real(math.Inf(1)), real(math.Inf(-1)),
+		mkReal(math.NaN()), mkReal(math.Inf(1)), mkReal(math.Inf(-1)),
 		{kind: gkUndef}, {kind: gkBool, raw: 1}, a.strComp("tuesday"),
 	} {
 		g, ok := accForN(a, []groupComp{owner, bad}, 0)

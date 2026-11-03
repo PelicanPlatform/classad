@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
@@ -75,7 +76,7 @@ func TestColumnarBlockRoundTrip(t *testing.T) {
 				}
 				assertRoundTrip(t, s, wires[k], fmt.Sprintf("%s hot=%d rec[%d]", codec.Name(), len(hot), k))
 				// The reconstructed row record must be byte-identical to the encoded row.
-				if string(got) != string(recs[k]) {
+				if !bytes.Equal(got, recs[k]) {
 					t.Errorf("%s hot=%d rec[%d]: reconstructed record differs from row form", codec.Name(), len(hot), k)
 				}
 			}

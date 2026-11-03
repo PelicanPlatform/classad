@@ -118,7 +118,7 @@ func (c *compiler) ins(op Opcode, a int32) int {
 }
 
 // patch sets the argument of a previously-emitted instruction (a jump target).
-func (c *compiler) patch(i int, target int) {
+func (c *compiler) patch(i, target int) {
 	c.p.code[i].A = int32(target)
 }
 

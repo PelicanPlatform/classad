@@ -74,7 +74,8 @@ func TestRefreshHotSet(t *testing.T) {
 		return false
 	}
 	if !has("MyType") && !has("TargetType") {
-		t.Logf("hot set: %v", names) // informational; corpus-dependent
+		// Informational; corpus-dependent.
+		t.Logf("hot set: %v", names)
 	}
 
 	// After refresh, new writes carry hot headers for the chosen attrs and queries

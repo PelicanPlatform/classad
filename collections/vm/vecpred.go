@@ -201,7 +201,7 @@ func (s *VecScratch) enterIf(vops []int32, ct condTargets, at int) (int, bool) {
 		// No record takes the then arm, so none of its work is for anybody -- including the column
 		// loads in it, which is the expensive part. The operators already do this (see vecpath.go);
 		// a statement arm is the same situation one level up, and the arm mask is what says so.
-		return s.beginElseArm(vops)
+		return s.beginElseArm()
 	}
 	s.setLive(thenM)
 	s.spanStart = at + 1
@@ -213,7 +213,7 @@ func (s *VecScratch) enterIf(vops []int32, ct condTargets, at int) (int, bool) {
 //
 // It is shared by enterIf and jmpVoid because "the then arm is over" is the same state whether it
 // ran or was skipped, and the else arm has to be tested for emptiness in both cases.
-func (s *VecScratch) beginElseArm(vops []int32) (int, bool) {
+func (s *VecScratch) beginElseArm() (int, bool) {
 	pd := &s.preds[len(s.preds)-1]
 	pd.arm = armElse
 	if !maskAny(pd.elseMask) {
@@ -241,7 +241,7 @@ func (s *VecScratch) jmpVoid(vops []int32, at int, target int32) (int, bool) {
 	// Each arm is billed to the records that took it, so the run ends here whichever arm just did.
 	s.flushCharge(vops, at+1)
 	if pd.arm == armThen {
-		return s.beginElseArm(vops)
+		return s.beginElseArm()
 	}
 	return s.joinIf()
 }
@@ -352,9 +352,9 @@ func (s *VecScratch) maskedStore(idx int) bool {
 // Applied once at the end rather than as each fault happens: the statements after the fault still run
 // for the other records, and the faulted record's own result is whatever they left behind, which is
 // not an answer.
-func (s *VecScratch) applyFaults(res *Vec) bool {
+func (s *VecScratch) applyFaults(res *Vec) {
 	if !s.anyFault || res == nil {
-		return true
+		return
 	}
 	res.toData()
 	res.ensureInts()
@@ -370,5 +370,4 @@ func (s *VecScratch) applyFaults(res *Vec) bool {
 			res.St[i] = VsError
 		}
 	}
-	return true
 }

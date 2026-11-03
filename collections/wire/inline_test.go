@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"bytes"
 	"testing"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -94,7 +95,7 @@ func TestInlineStreamEncoder(t *testing.T) {
 	s.Real("R", 2.5)
 	streamed := s.Bytes(nil)
 
-	if want := EncodeInline(nil, orig); string(streamed) != string(want) {
+	if want := EncodeInline(nil, orig); !bytes.Equal(streamed, want) {
 		t.Errorf("streamed bytes differ from EncodeInline (%d vs %d)", len(streamed), len(want))
 	}
 	got, err := DecodeInline(streamed)
@@ -131,7 +132,7 @@ func FuzzInlineRoundTrip(f *testing.F) {
 			t.Fatalf("decode failed for parseable ad %q: %v", src, err)
 		}
 		// Stability check must precede Equal, which sorts nested records in place.
-		if string(enc) != string(EncodeInline(nil, got)) {
+		if !bytes.Equal(enc, EncodeInline(nil, got)) {
 			t.Fatalf("inline re-encode not stable for %q", src)
 		}
 		if !toClassAd(orig).Equal(toClassAd(got)) {

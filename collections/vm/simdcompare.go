@@ -148,6 +148,8 @@ func scalarBaseMaskInts(base cmpBase, vals []int64, lit int64, n int, lo []uint6
 // Row groups are sealed on multiples of eight (see colGroupAlign), so only a segment's final group has a tail
 // at all -- but it does have one, and reading a vector past the end of the column would be a fault rather
 // than a wrong answer.
+//
+//nolint:unused // called only from simdengine_{amd64,arm64}.go, which build under goexperiment.simd
 func scalarTailInt(base cmpBase, raw []byte, width int, unsigned bool, lit int64, from, n, wordStart int) uint64 {
 	var word uint64
 	for i := from; i < n && i < wordStart+64; i++ {
@@ -168,11 +170,26 @@ func scalarTailInt(base cmpBase, raw []byte, width int, unsigned bool, lit int64
 	return word
 }
 
-func fitsInt8(v int64) bool   { return v >= -1<<7 && v < 1<<7 }
-func fitsUint8(v int64) bool  { return v >= 0 && v < 1<<8 }
-func fitsInt16(v int64) bool  { return v >= -1<<15 && v < 1<<15 }
+// The fits* predicates pick the narrowest lane width a literal can be compared in. They are
+// called only from simdengine_{amd64,arm64}.go, which build under goexperiment.simd, so a lint
+// run in the default configuration sees no caller for any of them.
+
+//nolint:unused // see above
+func fitsInt8(v int64) bool { return v >= -1<<7 && v < 1<<7 }
+
+//nolint:unused // see above
+func fitsUint8(v int64) bool { return v >= 0 && v < 1<<8 }
+
+//nolint:unused // see above
+func fitsInt16(v int64) bool { return v >= -1<<15 && v < 1<<15 }
+
+//nolint:unused // see above
 func fitsUint16(v int64) bool { return v >= 0 && v < 1<<16 }
-func fitsInt32(v int64) bool  { return v >= -1<<31 && v < 1<<31 }
+
+//nolint:unused // see above
+func fitsInt32(v int64) bool { return v >= -1<<31 && v < 1<<31 }
+
+//nolint:unused // see above
 func fitsUint32(v int64) bool { return v >= 0 && v < 1<<32 }
 
 // --- Bitplane comparison, for callers that are not running a Vec through the executor ---

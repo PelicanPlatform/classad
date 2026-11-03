@@ -66,7 +66,8 @@ func (b *columnarBlock) escapeIsMissing(idx, k int) (missing, ok bool) {
 		}
 		// Ascending and rare by construction, so a binary search over a short slice beats a map.
 		i := sort.Search(len(recs), func(i int) bool { return int(recs[i]) >= k })
-		return !(i < len(recs) && int(recs[i]) == k), true
+		listed := i < len(recs) && int(recs[i]) == k
+		return !listed, true
 	}
 	return false, false
 }
@@ -153,14 +154,14 @@ func classifyEscapes(s *adSchema, recs [][]byte, coldToField map[uint32]int) ([]
 	var absent []byte
 	if len(recs) > 0 {
 		absent = make([]byte, (len(s.fields)+7)/8)
-		any := false
+		anyAbsent := false
 		for i := range s.fields {
 			if !sawInSlot[i] && !sawExcept[i] && sawMissing[i] {
 				setBit(absent, i)
-				any = true
+				anyAbsent = true
 			}
 		}
-		if !any {
+		if !anyAbsent {
 			absent = nil
 		}
 	}

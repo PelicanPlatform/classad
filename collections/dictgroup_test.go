@@ -166,21 +166,21 @@ func TestDictStrategyNetBytes(t *testing.T) {
 	measBlocks := blocksAt(t, c, measSegs, defaultColGrouping())
 	measRecs := segmentRecordSamples(t, c, measSegs, 2000)
 
-	for _, strat := range []struct {
+	for _, strategy := range []struct {
 		name string
 		cd   Codec
 	}{{"none", mk(nil)}, {"ad-trained", mk(adDict)}, {"region-trained", mk(regionDict)}} {
 		arena := 0
 		for _, p := range measRecs {
-			arena += len(strat.cd.Compress(nil, p))
+			arena += len(strategy.cd.Compress(nil, p))
 		}
 		regions := 0
 		for _, k := range kinds {
 			for _, p := range regionsOf(measBlocks, k) {
-				regions += len(strat.cd.Compress(nil, p))
+				regions += len(strategy.cd.Compress(nil, p))
 			}
 		}
-		t.Logf("%-15s arena=%9d  regions=%8d  TOTAL=%9d", strat.name, arena, regions, arena+regions)
+		t.Logf("%-15s arena=%9d  regions=%8d  TOTAL=%9d", strategy.name, arena, regions, arena+regions)
 	}
 }
 
@@ -324,12 +324,12 @@ func TestDictStrategyByGroupSize(t *testing.T) {
 
 // segmentRecordSamples collects whole-record wire samples from specific segments -- the held-out
 // equivalent of CollectSamples, which draws from the entire collection.
-func segmentRecordSamples(t *testing.T, c *Collection, segs []*segment, max int) [][]byte {
+func segmentRecordSamples(t *testing.T, c *Collection, segs []*segment, limit int) [][]byte {
 	t.Helper()
 	var out [][]byte
 	for _, seg := range segs {
 		d := seg.dict.Load()
-		for off := 0; off < seg.used && len(out) < max; {
+		for off := 0; off < seg.used && len(out) < limit; {
 			o := uint32(off)
 			total := recTotalLen(seg.data, o)
 			if total == 0 {

@@ -46,7 +46,7 @@ func (c *Collection) RefreshHotSet(sampleMax, topN int) int {
 	}
 	reads := func(fold string) int64 {
 		if v, ok := c.demand.m.Load(fold); ok {
-			return v.(*demandCounts).reads.Load()
+			return v.(*demandCounts).reads.Load() //nolint:errcheck // the demand map is keyed by folded name and only ever holds *demandCounts
 		}
 		return 0
 	}

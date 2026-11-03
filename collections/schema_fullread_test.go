@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/PelicanPlatform/classad/collections/wire"
 	"github.com/klauspost/compress/zstd"
+
+	"github.com/PelicanPlatform/classad/collections/wire"
 )
 
 // A columnar block: numeric prefixes uncompressed (fixed stride), string regions and cold

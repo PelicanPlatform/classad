@@ -198,7 +198,7 @@ func (s *segment) adviseSequential() {
 	if !s.persistent || len(s.data) == 0 {
 		return
 	}
-	_ = unix.Madvise(s.data, unix.MADV_SEQUENTIAL)
+	_ = unix.Madvise(s.data, unix.MADV_SEQUENTIAL) //nolint:errcheck // an advisory hint; the kernel is free to ignore it and so are we
 }
 
 // adviseNormal undoes adviseSequential. Steady-state access is by key and therefore
@@ -208,5 +208,5 @@ func (s *segment) adviseNormal() {
 	if !s.persistent || len(s.data) == 0 {
 		return
 	}
-	_ = unix.Madvise(s.data, unix.MADV_NORMAL)
+	_ = unix.Madvise(s.data, unix.MADV_NORMAL) //nolint:errcheck // an advisory hint; the kernel is free to ignore it and so are we
 }

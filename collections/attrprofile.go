@@ -437,7 +437,6 @@ func (c *Collection) evaluatedCounts(samples [][]byte, redact bool) map[string]*
 				if key, known = folded[name]; !known {
 					key = strings.ToLower(name)
 					folded[name] = key
-					known = true
 				}
 			} else if !known {
 				var ok bool

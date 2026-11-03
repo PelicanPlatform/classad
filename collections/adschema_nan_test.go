@@ -82,7 +82,7 @@ func coldHas(s *adSchema, rec []byte, id uint32) bool {
 		if !ok || nl > len(cold) {
 			return false
 		}
-		if uint32(got) == id {
+		if got == uint64(id) {
 			return true
 		}
 		cold = cold[nl:]
@@ -128,7 +128,7 @@ func TestNaNEscapesRealSlot(t *testing.T) {
 		// expression node at encode time, so it has no literal kind and escapes for the ordinary
 		// reason. Covered so a change to the literal rule cannot be mistaken for covering both.
 		{"NaN by arithmetic", nanAdText(t, "0.0/0.0"), true, true, false, 0},
-		{"absent", func() *classad.ClassAd { return classad.New() }, true, false, false, 0},
+		{"absent", classad.New, true, false, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := wire.Encode(nil, tc.ad().AST(), c.intern)

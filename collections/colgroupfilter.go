@@ -82,14 +82,14 @@ type groupFilters struct {
 // before this existed: nil threads through every path below as "no filters" without a branch per
 // record beyond the nil test the compiler hoists.
 func (c *Collection) compileGroupFilters(s *adSchema, colFilters, countFilters []string) (*groupFilters, bool) {
-	any := false
+	anyCol := false
 	for _, f := range colFilters {
 		if f != "" {
-			any = true
+			anyCol = true
 			break
 		}
 	}
-	if !any && len(countFilters) == 0 {
+	if !anyCol && len(countFilters) == 0 {
 		return nil, true
 	}
 	gf := &groupFilters{

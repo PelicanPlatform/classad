@@ -34,8 +34,8 @@ func TestENOSPCFullFilesystem(t *testing.T) {
 		t.Skip("persistence is unix-only")
 	}
 	base := os.Getenv("CLASSAD_ENOSPC_DIR")
-	real := base != ""
-	if !real {
+	onRealFS := base != ""
+	if !onRealFS {
 		base = t.TempDir() // harness validation on a normal FS: budget-capped, no real ENOSPC
 	}
 	dir, err := os.MkdirTemp(base, "enospc")

@@ -88,8 +88,8 @@ func TestSegDictHintRejectsBadOffset(t *testing.T) {
 		t.Fatal("fixture produced no interned segments")
 	}
 	seg := segs[0]
-	real := seg.dict.Load().rec
-	if real == 0 {
+	realOff := seg.dict.Load().rec
+	if realOff == 0 {
 		t.Fatal("dict record at offset 0; the test cannot distinguish hint from fallback")
 	}
 
@@ -100,7 +100,7 @@ func TestSegDictHintRejectsBadOffset(t *testing.T) {
 		{"past the written extent", uint32(seg.used) + 1},
 		{"way out of bounds", 1 << 30},
 		{"a real record that is not the dict", 0}, // offset 0 is the first DATA record
-		{"mid-record, not a record boundary", real + 3},
+		{"mid-record, not a record boundary", realOff + 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			hint := tc.hint
@@ -118,9 +118,9 @@ func TestSegDictHintRejectsBadOffset(t *testing.T) {
 			if got == nil {
 				t.Fatalf("bad hint %d left the segment with no dict at all", hint)
 			}
-			if got.rec != real {
+			if got.rec != realOff {
 				t.Errorf("bad hint %d published dict at %d, want the real one at %d",
-					hint, got.rec, real)
+					hint, got.rec, realOff)
 			}
 			// And the dictionary actually resolves: a wrong base would give nonsense.
 			if n := got.count(); n == 0 || n > 1000 {
@@ -140,7 +140,7 @@ func TestSegDictNamesResolveAfterReopen(t *testing.T) {
 	for ad := range c.Scan() {
 		n++
 		if v, ok := ad.Lookup("Owner"); ok {
-			seen[fmt.Sprint(v)] = true
+			seen[v.String()] = true
 		}
 	}
 	if n != 3000 {

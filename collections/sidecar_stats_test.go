@@ -9,7 +9,7 @@ import (
 
 // TestSidecarStatsRoundTrip verifies the v7 per-attribute stats block: the summary a
 // mmapSegIndex reads back (statsFor) is identical to the in-RAM segIndex's build-time stats.
-// This is what lets a sealed segment answer canSkip/estCandidates/selectivityOrder over the
+// This is what lets a sealed segment answer canSkip/estCandidates/indexSelectivityOrder over the
 // mmap without paging its postings to recompute finishStats.
 func TestSidecarStatsRoundTrip(t *testing.T) {
 	t.Parallel()

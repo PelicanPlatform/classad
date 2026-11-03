@@ -64,7 +64,7 @@ func (c *Collection) Truncate() {
 		// otherwise the sidecar mapping leaks. Every other drop path (compact/retention/
 		// retrain) already routes through reapAndHook; Truncate must too.
 		for _, seg := range toReap {
-			_ = seg.reapAndHook()
+			_ = seg.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		}
 	}
 	for _, oi := range c.ordered {

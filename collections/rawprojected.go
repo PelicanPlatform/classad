@@ -361,7 +361,7 @@ func boolInt(b bool) int {
 // noteInlineRef adds a referenced name to the current ad's wanted set, reporting whether
 // it was new. A name already in the projection is not added: it is either emitted or will
 // be reached by the walk on its own.
-func (p *rawProjector) noteInlineRef(name []byte, gen uint32) bool {
+func (p *rawProjector) noteInlineRef(name []byte) bool {
 	h := wire.NameHash32Bytes(name)
 	for i, wh := range p.inHashes {
 		if wh == h && wire.FoldEqualBytes(name, p.inNames[i]) {
@@ -468,7 +468,7 @@ func (p *rawProjector) renderInline(w []byte) (RawAd, bool) {
 		if p.chaseRefs && !p.wantAll {
 			p.refNames = wire.AppendNodeRefNames(node, p.refNames[:0])
 			for _, rn := range p.refNames {
-				if p.noteInlineRef(rn, gen) {
+				if p.noteInlineRef(rn) {
 					again = true
 				}
 			}

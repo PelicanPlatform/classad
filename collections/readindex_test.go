@@ -6,8 +6,9 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/RoaringBitmap/roaring/v2"
+
+	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
 // TestReadIndexParity is the anchor for the shared planner logic: for every built segment,

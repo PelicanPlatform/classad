@@ -45,7 +45,7 @@ func (c *Collection) StartAutoRetrain(interval time.Duration, sampleMax, hotTopN
 				if hotTopN > 0 {
 					c.RefreshHotSet(sampleMax, hotTopN)
 				}
-				_, _ = c.RetrainDict(sampleMax)
+				_, _ = c.RetrainDict(sampleMax) //nolint:errcheck // best effort: a failed retrain leaves the current dictionary in place
 			}
 		}
 	}()

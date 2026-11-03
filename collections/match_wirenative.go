@@ -57,11 +57,11 @@ func jobRankExpr(job *classad.ClassAd) ast.Expr {
 // integer or real ranks; anything else does not (sorted after ranked matches).
 func rankValue(v classad.Value) (float64, bool) {
 	if v.IsInteger() {
-		i, _ := v.IntValue()
+		i, _ := v.IntValue() //nolint:errcheck // guarded by the type check above
 		return float64(i), true
 	}
 	if v.IsReal() {
-		f, _ := v.RealValue()
+		f, _ := v.RealValue() //nolint:errcheck // guarded by the type check above
 		return f, true
 	}
 	return 0, false

@@ -167,7 +167,9 @@ func (c *Collection) GroupSchemaLastAgreement() (GroupSchemaLastAgreement, bool)
 	pa := rec.LastAgreement
 	out := GroupSchemaLastAgreement{Unix: pa.Unix, Segments: pa.Segments}
 	for _, g := range pa.Groups {
-		out.Groups = append(out.Groups, GroupAgreementItem{Attrs: g.Attrs, Frac: g.Frac})
+		// Field by field on purpose: the persisted record and the public type are free to
+		// drift, and a conversion would carry a new persisted field into the API silently.
+		out.Groups = append(out.Groups, GroupAgreementItem{Attrs: g.Attrs, Frac: g.Frac}) //nolint:staticcheck // see above
 	}
 	return out, true
 }

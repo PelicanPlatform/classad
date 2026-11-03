@@ -406,7 +406,7 @@ func (c *Collection) vectorEvalCountAs(q *vm.Query, redact bool) (int, bool) {
 	cs := &colScope{bc: st.cache, c: c}
 	resolver := cs.resolve
 	src := &blockVecSource{c: c, bc: st.cache}
-	scratch := vecScratchPool.Get().(*vm.VecScratch)
+	scratch := vecScratchPool.Get().(*vm.VecScratch) //nolint:errcheck // the pool's New returns exactly this type
 	defer func() {
 		scratch.Release()
 		vecScratchPool.Put(scratch)

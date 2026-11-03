@@ -1079,43 +1079,6 @@ func (b *columnarBlock) reconstructInto(dst []byte, k int, bc *blockCache) ([]by
 	return rec, nil
 }
 
-// escapedNumField reads the numeric value of an ESCAPED schema field (fieldID) for record k
-// straight from its cold-tail slice, skipping the whole-record reconstruct. A field is escaped
-// when it is missing or exceptional (out of the fitted width, or a type exception); an exceptional
-// value lives in the cold tail as a uvarint(id)+node entry alongside the record's non-schema
-// attributes. Returns (value, true) if fieldID has a numeric value here, or (0, false) if it is
-// missing or non-numeric. bc caches the decompressed cold stream, so a scan's many escaped reads
-// on one block share a single decompression. Callers use this only for records the scan has
-// already found escaped for fieldID; a hot/cold-column value never reaches here.
-func (b *columnarBlock) escapedNumField(k int, fieldID uint32, bc *blockCache) (float64, bool, error) {
-	fieldID, known := b.remap.storedID(fieldID)
-	if !known {
-		return 0, false, nil // no attribute of that name in this payload's tail
-	}
-	tail, err := bc.stream(b, kindCold)
-	if err != nil {
-		return 0, false, err
-	}
-	cold := tail[b.coldOffAt(k):b.coldOffAt(k+1)]
-	for len(cold) > 0 {
-		id, m := binary.Uvarint(cold)
-		if m <= 0 {
-			return 0, false, nil // malformed tail: treat fieldID as absent
-		}
-		cold = cold[m:]
-		nl, ok := wire.NodeLen(cold)
-		if !ok || nl > len(cold) {
-			return 0, false, nil
-		}
-		if uint32(id) == fieldID {
-			f, found := literalFloat(cold[:nl])
-			return f, found, nil
-		}
-		cold = cold[nl:]
-	}
-	return 0, false, nil
-}
-
 // escapedNode returns the raw wire node an ESCAPED field holds in record k's cold tail, without
 // interpreting it. found=false means the attribute is not in the tail at all, i.e. genuinely absent
 // from the record.
@@ -1143,7 +1106,7 @@ func (b *columnarBlock) escapedNode(k int, fieldID uint32, bc *blockCache) (node
 		if !ok || nl > len(cold) {
 			return nil, false, nil
 		}
-		if uint32(id) == fieldID {
+		if id == uint64(fieldID) {
 			return cold[:nl], true, nil
 		}
 		cold = cold[nl:]
@@ -1165,7 +1128,12 @@ const (
 	cellExpr
 )
 
-// escapedNumCell is escapedNumField returning the value WITH its ClassAd kind. A caller that
+// escapedNumCell reads an ESCAPED schema field (fieldID) for record k straight from its cold-tail
+// slice, skipping the whole-record reconstruct, and returns the value WITH its ClassAd kind. A
+// field is escaped when it is missing or exceptional (out of the fitted width, or a type
+// exception); an exceptional value lives in the cold tail as a uvarint(id)+node entry alongside
+// the record's non-schema attributes. bc caches the decompressed cold stream, so a scan's many
+// escaped reads on one block share one decompression. A caller that
 // renders or sums the value needs the kind, and the cold tail carries the wire node, so it is read
 // from the node rather than assumed from the segment's schema (an escaped value is by definition
 // one the schema field did not fit). It also says WHY there is no number (see numCell).
@@ -1189,7 +1157,7 @@ func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (c
 	if err != nil {
 		return colVal{}, cellExpr
 	}
-	// The tail is keyed by the ids it was WRITTEN with, as escapedNode and escapedNumField read it.
+	// The tail is keyed by the ids it was WRITTEN with, as escapedNode and escapedNumCell read it.
 	stored, known := b.remap.storedID(fieldID)
 	cold := tail[b.coldOffAt(k):b.coldOffAt(k+1)]
 	if !known {
@@ -1205,7 +1173,7 @@ func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (c
 		if !ok || nl > len(cold) {
 			return colVal{}, cellExpr
 		}
-		if uint32(id) == stored {
+		if id == uint64(stored) {
 			node := cold[:nl]
 			if v, ok := nodeColVal(node); ok {
 				return v, cellNumber
@@ -1236,18 +1204,6 @@ func (b *columnarBlock) escapedNumCell(k int, fieldID uint32, bc *blockCache) (c
 type idRemap struct {
 	toStored  map[uint32]uint32
 	toCurrent map[uint32]uint32
-}
-
-// stored maps a current intern id to the id this payload used for the same attribute. It is for
-// an id already known to be in the payload; a lookup uses storedID.
-func (r *idRemap) stored(id uint32) uint32 {
-	if r == nil {
-		return id
-	}
-	if v, ok := r.toStored[id]; ok {
-		return v
-	}
-	return id
 }
 
 // storedID is stored for a lookup: it reports false when the payload holds no attribute of that

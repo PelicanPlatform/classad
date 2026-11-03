@@ -237,7 +237,7 @@ func dirHasEntries(dir string) bool {
 		return false // does not exist (or unreadable): treat as fresh
 	}
 	defer f.Close()
-	names, _ := f.Readdirnames(1)
+	names, _ := f.Readdirnames(1) //nolint:errcheck // an empty directory reports io.EOF here, which is the answer the caller wants
 	return len(names) > 0
 }
 

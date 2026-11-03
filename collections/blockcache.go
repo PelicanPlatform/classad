@@ -13,8 +13,6 @@ type decodedStreams struct {
 	coldNum, str, cold []byte
 }
 
-func (d *decodedStreams) cost() int64 { return int64(len(d.coldNum) + len(d.str) + len(d.cold)) }
-
 // streamKind names one of a block's three independently-compressed regions. They are cached and
 // decompressed SEPARATELY because most readers want exactly one of them:
 //

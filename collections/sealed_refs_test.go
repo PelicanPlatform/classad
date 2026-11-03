@@ -301,7 +301,10 @@ func TestWireRowAssemblerSkipsOpenedSealedValues(t *testing.T) {
 	t.Run("in-memory", func(t *testing.T) {
 		c := New(Options{Shards: 1, DataKey: sealedRefKey(), EncryptedAttrs: []string{"Secret"}})
 		defer c.Close()
-		w := wire.EncodeWithHotEnc(nil, ad.AST(), c.intern, nil, c.shouldEncrypt, c.sealer)
+		w, err := wire.EncodeWithHotSealed(nil, ad.AST(), c.intern, nil, c.shouldEncrypt, c.sealer)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if !recordHasSealedEntry(w) {
 			t.Fatal("the encoded record holds no sealed value")
 		}

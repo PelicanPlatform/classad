@@ -106,7 +106,7 @@ func (c *Collection) mergeSegments(sh *shard, run []*segment) bool {
 func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segment, reconcile, postSwap func()) bool {
 	abort := func() bool {
 		out.retire()
-		out.reapAndHook()
+		out.reapAndHook() //nolint:errcheck // best effort: the segment is already out of service, so a failed munmap or unlink leaks a file rather than corrupting one
 		return false
 	}
 	if err := out.flush(); err != nil {
@@ -165,7 +165,7 @@ func (c *Collection) commitSegmentRewrite(sh *shard, srcs []*segment, out *segme
 	}
 	sh.mu.Unlock()
 	for _, s := range toReap {
-		s.reapAndHook() // munmap + unlink, off-lock
+		s.reapAndHook() //nolint:errcheck // munmap + unlink, off-lock
 	}
 	// Any source still pinned by an in-flight scan is unlinked when its pins drain; the
 	// marker is removed regardless, because the output file is in place and named, and a

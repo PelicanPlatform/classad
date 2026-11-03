@@ -283,14 +283,14 @@ func (c *Collection) meldTargetConstraint(ex *MatchExplain, targetConstraint str
 		ups := c.planIndex(vm.Compile(cj).Probes())
 		if len(ups) > 0 {
 			ce.Probed = true
-			frac, any := 1.0, false
+			frac, anyCovered := 1.0, false
 			for _, up := range ups {
 				if cand, covered := c.estimateCandidates(up); covered {
-					any = true
+					anyCovered = true
 					frac *= math.Min(1, cand/tot)
 				}
 			}
-			if any && tot > 0 {
+			if anyCovered && tot > 0 {
 				ce.Indexed = true
 				ce.HasSelectivity = true
 				ce.TrueFrac = frac
@@ -560,7 +560,7 @@ func isPureExpr(e ast.Expr) bool {
 // distinctCatValues returns up to max distinct exact-case values of a categorically
 // indexed attribute across the live segment indexes, or nil if the attribute is not
 // categorically indexed or has more than max distinct values (too many to materialize).
-func (c *Collection) distinctCatValues(attr string, max int) []string {
+func (c *Collection) distinctCatValues(attr string, limit int) []string {
 	spec := c.spec.Load()
 	if spec == nil {
 		return nil
@@ -585,7 +585,7 @@ func (c *Collection) distinctCatValues(attr string, max int) []string {
 			seen[v] = true
 			out = append(out, v)
 		}
-		return len(out) <= max
+		return len(out) <= limit
 	}
 	for _, sh := range c.shards {
 		_, wins := sh.snapshot()
@@ -923,16 +923,16 @@ const minDampExp = 1.0 / 64
 func valueToLiteral(v classad.Value) ast.Expr {
 	switch {
 	case v.IsBool():
-		b, _ := v.BoolValue()
+		b, _ := v.BoolValue() //nolint:errcheck // guarded by the type check above
 		return &ast.BooleanLiteral{Value: b}
 	case v.IsInteger():
-		i, _ := v.IntValue()
+		i, _ := v.IntValue() //nolint:errcheck // guarded by the type check above
 		return &ast.IntegerLiteral{Value: i}
 	case v.IsReal():
-		f, _ := v.RealValue()
+		f, _ := v.RealValue() //nolint:errcheck // guarded by the type check above
 		return &ast.RealLiteral{Value: f}
 	case v.IsString():
-		s, _ := v.StringValue()
+		s, _ := v.StringValue() //nolint:errcheck // guarded by the type check above
 		return &ast.StringLiteral{Value: s}
 	}
 	return nil
@@ -989,7 +989,7 @@ func (c *Collection) indexedMatches(job *classad.ClassAd, groups [][]usableProbe
 	var wg workerGroup
 	for i := 0; i < W; i++ {
 		wg.Go(func() {
-			jobCopy, _ := classad.Parse(jobText) // validated above
+			jobCopy, _ := classad.Parse(jobText) //nolint:errcheck // validated above
 			mw := newMatchWorker(jobCopy, c, jp, deferMat)
 			for {
 				idx := int(atomic.AddInt64(&next, 1)) - 1

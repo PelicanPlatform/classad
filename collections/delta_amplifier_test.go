@@ -37,10 +37,10 @@ func setRecDeltaForTest(seg *segment, off uint32) {
 func TestFailedCollapseForcesTheNextWriteToCompose(t *testing.T) {
 	tr := newDeltaTracker()
 	const h = 0x1234
-	const max = 16
+	const maxChain = 16
 
 	// A healthy key chains, as it should.
-	if !tr.next(h, true, true, max) {
+	if !tr.next(h, true, true, maxChain) {
 		t.Fatal("a healthy key did not chain; the tracker is not in the state this test assumes")
 	}
 
@@ -48,14 +48,14 @@ func TestFailedCollapseForcesTheNextWriteToCompose(t *testing.T) {
 	tr.mustCompose(h)
 
 	// The next write must compose a whole record rather than extend the chain...
-	if tr.next(h, true, true, max) {
+	if tr.next(h, true, true, maxChain) {
 		t.Error("the write after a failed collapse extended the chain")
 	}
 	// ...and repeatedly, if it keeps failing: next() resets depth to 0 on the compose branch, so
 	// re-marking is what keeps it from drifting back into chaining.
 	tr.mustCompose(h)
 	for i := range 3 {
-		if tr.next(h, true, true, max) {
+		if tr.next(h, true, true, maxChain) {
 			t.Fatalf("write %d after a failed collapse extended the chain", i)
 		}
 		tr.mustCompose(h)

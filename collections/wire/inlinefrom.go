@@ -140,8 +140,7 @@ func appendSubsetInlineFromInterned(dst []byte, src Ad, c *cursor, resolve func(
 		return dst, 0, errNotRewritable
 	}
 
-	dst = append(dst, magicByte, formatVer, flagInlineNames)
-	dst = append(dst, 0) // hotCount = 0
+	dst = append(dst, magicByte, formatVer, flagInlineNames, 0) // trailing 0 = hotCount
 	countAt := len(dst)
 	dst = append(dst, 0x80, 0x80, 0x80, 0x80, 0x00) // 5-byte uvarint placeholder, patched below
 	kept := uint64(0)
@@ -310,7 +309,7 @@ func appendSealedPlainInline(dst *[]byte, plain []byte, resolve func(uint32) (st
 }
 
 // appendInlineKey writes an attribute key in the inline-names encoding (uvarint len + bytes).
-func appendInlineKey(dst []byte, name []byte) []byte {
+func appendInlineKey(dst, name []byte) []byte {
 	dst = binary.AppendUvarint(dst, uint64(len(name)))
 	return append(dst, name...)
 }
@@ -330,6 +329,19 @@ func appendInlineName(dst *[]byte, resolve func(uint32) (string, bool), id uint3
 // their inline forms and leaving everything else byte-identical. It mirrors skipNode's grammar
 // case for case -- a tag handled there and missed here would silently truncate a record, so the
 // two are meant to be read side by side -- and it is transcodeNode read backwards.
+// inlineOperands rewrites the next n operand nodes in order. Each call advances the cursor, so
+// these are n DIFFERENT nodes, not one test repeated; a chain of && said the same thing but read
+// as a copy-paste and had a linter agreeing. It stops at the first operand that will not rewrite,
+// exactly as the chain's short-circuit did.
+func inlineOperands(c *cursor, out *[]byte, resolve func(uint32) (string, bool), depth, n int) bool {
+	for range n {
+		if !inlineNode(c, out, resolve, depth+1) {
+			return false
+		}
+	}
+	return true
+}
+
 func inlineNode(c *cursor, out *[]byte, resolve func(uint32) (string, bool), depth int) bool {
 	if !c.ok || depth > MaxDepth {
 		c.ok = false
@@ -394,13 +406,13 @@ func inlineNode(c *cursor, out *[]byte, resolve func(uint32) (string, bool), dep
 		if !copyFrom() {
 			return false
 		}
-		return inlineNode(c, out, resolve, depth+1) && inlineNode(c, out, resolve, depth+1)
+		return inlineOperands(c, out, resolve, depth, 2)
 	case nBinOpStr:
 		c.skip(int(c.uvarint())) // op string, kept as-is
 		if !copyFrom() {
 			return false
 		}
-		return inlineNode(c, out, resolve, depth+1) && inlineNode(c, out, resolve, depth+1)
+		return inlineOperands(c, out, resolve, depth, 2)
 	case nUnOp:
 		c.skip(1)
 		if !copyFrom() {
@@ -463,14 +475,12 @@ func inlineNode(c *cursor, out *[]byte, resolve func(uint32) (string, bool), dep
 		if !copyFrom() {
 			return false
 		}
-		return inlineNode(c, out, resolve, depth+1) &&
-			inlineNode(c, out, resolve, depth+1) &&
-			inlineNode(c, out, resolve, depth+1)
+		return inlineOperands(c, out, resolve, depth, 3)
 	case nElvis, nSubscript:
 		if !copyFrom() {
 			return false
 		}
-		return inlineNode(c, out, resolve, depth+1) && inlineNode(c, out, resolve, depth+1)
+		return inlineOperands(c, out, resolve, depth, 2)
 	case nSelect:
 		// node(record) + id -> node(record) + inline name. The TAG has to be written before the
 		// record node, so it cannot share the copyFrom path.

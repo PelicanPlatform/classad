@@ -275,7 +275,7 @@ func buildAdSchemaFor(samples [][]byte, ids []uint32) *adSchema {
 		domK, domC := akNone, 0
 		for k := akBool; k <= akString; k++ {
 			if ks[k] > domC {
-				domC, domK = ks[k], adKind(k)
+				domC, domK = ks[k], k
 			}
 		}
 		if domK == akNone {

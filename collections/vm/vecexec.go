@@ -445,9 +445,7 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 				return nil, false
 			}
 		case OpStrListMember:
-			if !strListVec(p.strLists[in.A], s.top()) {
-				return nil, false
-			}
+			strListVec(p.strLists[in.A], s.top())
 		case OpCallFunc:
 			if !callFuncVec(ev, p.funcs[in.A], s) {
 				return nil, false
@@ -542,9 +540,7 @@ func execVec(p *Program, ev *classad.Evaluator, src ColumnSource, n int, s *VecS
 		return nil, false
 	}
 	res := s.top()
-	if !s.applyFaults(res) {
-		return nil, false
-	}
+	s.applyFaults(res)
 	return res, true
 }
 
@@ -1209,7 +1205,7 @@ func (v *Vec) ensureInts() {
 	if !rawSupported || v.Raw == nil {
 		return
 	}
-	st := uint8(VsInt)
+	st := VsInt
 	if v.RawReal {
 		st = VsReal
 	}

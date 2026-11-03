@@ -174,7 +174,8 @@ type FsckReport struct {
 
 // Totals sums the per-segment counts.
 func (r *FsckReport) Totals() (records, damagedRuns, damagedRecords int) {
-	for _, s := range r.Segments {
+	for i := range r.Segments {
+		s := &r.Segments[i]
 		records += s.Records
 		for _, d := range s.Damage {
 			if d.Trailing {
@@ -214,7 +215,8 @@ func (r *FsckReport) String() string {
 	if dictDamaged > 0 {
 		fmt.Fprintf(&b, "  %d segment(s) with a damaged attribute dictionary\n", dictDamaged)
 	}
-	for _, s := range r.Segments {
+	for i := range r.Segments {
+		s := &r.Segments[i]
 		if len(s.Damage) == 0 && s.Sidecar == "ok" && !s.ColumnarUnsupported && s.ColumnarMismatch == "" {
 			continue
 		}
@@ -391,7 +393,8 @@ func Fsck(dir string) (*FsckReport, error) {
 	// Fold in the supersession findings. The "commit that never happened" ones were
 	// collected against a running maximum, so a later segment may have raised it past
 	// them; re-check against the whole store's maximum before reporting any of them.
-	for _, seg := range r.Segments {
+	for i := range r.Segments {
+		seg := &r.Segments[i]
 		if seg.maxSeq > r.MaxSeq {
 			r.MaxSeq = seg.maxSeq
 		}
@@ -405,7 +408,8 @@ func Fsck(dir string) (*FsckReport, error) {
 			r.MaxSeq = cs
 		}
 	}
-	for _, seg := range r.Segments {
+	for i := range r.Segments {
+		seg := &r.Segments[i]
 		for _, f := range seg.supersede {
 			if f.Sup > f.Seq {
 				// "Never happened" is only decidable against a real commit sequence.
@@ -792,7 +796,7 @@ func fsckCommitSeq(dir string) (uint64, bool) {
 	if err != nil {
 		return 0, false
 	}
-	var max uint64
+	var highest uint64
 	var found bool
 	for _, e := range entries {
 		if !e.IsDir() || e.Name() == "dicts" || e.Name() == quarantineDir {
@@ -810,10 +814,10 @@ func fsckCommitSeq(dir string) (uint64, bool) {
 			!dirSnapVersionKnown(binary.LittleEndian.Uint32(body[4:])) {
 			continue
 		}
-		if cs := binary.LittleEndian.Uint64(body[8:]); cs > max {
-			max = cs
+		if cs := binary.LittleEndian.Uint64(body[8:]); cs > highest {
+			highest = cs
 		}
 		found = true
 	}
-	return max, found
+	return highest, found
 }

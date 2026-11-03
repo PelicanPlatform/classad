@@ -120,7 +120,7 @@ func TestSpliceRefusesMalformedColdTail(t *testing.T) {
 	}
 
 	rows, skips := ColNativeBadRows(), readSkipsOf("reassemble")
-	if _, err := c.recordWire(seg, off, nil); !errors.Is(err, errBadRemnant) {
+	if _, err := c.recordWire(seg, off); !errors.Is(err, errBadRemnant) {
 		t.Errorf("recordWire = %v, want errBadRemnant", err)
 	}
 	if ad, ok := c.Get([]byte(key)); ok {
@@ -165,7 +165,7 @@ func TestSpliceNamesInlineRecordInInternedSegment(t *testing.T) {
 		d := s.dict.Load()
 		for k := 0; k < cn.seg.offsLen(); k++ {
 			off := cn.seg.offAt(k)
-			full, err := c.recordWire(s, off, nil)
+			full, err := c.recordWire(s, off)
 			if err != nil {
 				t.Fatalf("record %d: %v", k, err)
 			}
@@ -220,7 +220,7 @@ func TestColumnarizeRefusesRecordItCannotCarry(t *testing.T) {
 	src := segs[0]
 	cn := src.colNative.Load()
 	off := cn.seg.offAt(cn.seg.offsLen() / 2)
-	full, err := c.recordWire(src, off, nil)
+	full, err := c.recordWire(src, off)
 	if err != nil {
 		t.Fatal(err)
 	}

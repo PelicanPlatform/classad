@@ -129,7 +129,7 @@ func flipBit(t *testing.T, path string, off int) {
 // readable, plus any error from Open itself. A key counts as surviving only if its
 // ad comes back and its QDate is the one written -- a key that reads back wrong is
 // worse than one that is missing, and must never be counted as recovered.
-func (s *corruptStore) survivors() (found []string, missing []string, wrong []string, openErr error) {
+func (s *corruptStore) survivors() (found, missing, wrong []string, openErr error) {
 	c, err := Open(Options{Dir: s.dir, Shards: 1, SegmentSize: 1 << 14})
 	if err != nil {
 		return nil, nil, nil, err
@@ -164,13 +164,6 @@ func (s *corruptStore) report(label string) (found, missing, wrong int) {
 		s.t.Errorf("%s: %d keys read back with wrong contents: %v", label, len(w), w[:min(len(w), 5)])
 	}
 	return len(f), len(m), len(w)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // TestHarnessBaselineIsClean is the control. Without it, every other test in this

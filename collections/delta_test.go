@@ -18,10 +18,10 @@ import (
 
 // openDelta opens a persistent collection with delta records on. Persistent because deltas
 // require inline-name records: a fragment has to decode without a shared intern table.
-func openDelta(t *testing.T, max int) (*Collection, string) {
+func openDelta(t *testing.T, limit int) (*Collection, string) {
 	t.Helper()
 	dir := t.TempDir()
-	c, err := Open(Options{Dir: dir, Shards: 4, SegmentSize: 1 << 16, DeltaMax: max})
+	c, err := Open(Options{Dir: dir, Shards: 4, SegmentSize: 1 << 16, DeltaMax: limit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,8 @@ func TestDeltaRemovedAttributeForcesFullRecord(t *testing.T) {
 		t.Fatal("precondition: Doomed should exist")
 	}
 	tx = c.Begin()
-	tx.PutPatch(key, ad, []string{"Doomed"}, true) // removed = true
+	// The trailing true is the "removed" flag.
+	tx.PutPatch(key, ad, []string{"Doomed"}, true)
 	if r := tx.Commit(); r.Conflicted() {
 		t.Fatal("delete conflicted")
 	}

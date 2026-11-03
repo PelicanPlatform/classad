@@ -98,7 +98,7 @@ func TestRepairLeavesDamagedColumnarizedSegmentAlone(t *testing.T) {
 					seg = &r.Segments[i]
 				}
 			}
-			if seg == nil || !segmentNeedsRepair(*seg) {
+			if seg == nil || !segmentNeedsRepair(seg) {
 				t.Fatal("the damage did not register; the test proves nothing")
 			}
 			if !seg.Columnarized {
@@ -215,7 +215,7 @@ func TestColNativeRecordWithoutRowFails(t *testing.T) {
 	}
 
 	before := ColNativeRowMisses()
-	if _, err := c.recordWire(seg, off, nil); err != errColRowMissing {
+	if _, err := c.recordWire(seg, off); err != errColRowMissing {
 		t.Errorf("recordWire = %v, want errColRowMissing", err)
 	}
 	if ad, ok := c.Get([]byte(key)); ok {

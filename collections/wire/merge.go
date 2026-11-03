@@ -189,8 +189,7 @@ func appendMergedInline(dst []byte, base Ad, overlays []Ad, removed []string, sc
 		return dst, false
 	}
 
-	dst = append(dst, magicByte, formatVer, flagInlineNames)
-	dst = append(dst, 0) // hotCount = 0
+	dst = append(dst, magicByte, formatVer, flagInlineNames, 0) // trailing 0 = hotCount
 	countAt := len(dst)
 	dst = append(dst, 0x80, 0x80, 0x80, 0x80, 0x00) // 5-byte uvarint slot, patched below
 	emitted := uint64(0)

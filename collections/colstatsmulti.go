@@ -132,13 +132,6 @@ func newNumCol(blk *columnarBlock, fieldIdx int, fieldID uint32, bc *blockCache)
 	return c, true
 }
 
-// at reads record k's value with its ClassAd kind, taking the cold-tail path only when the value
-// escaped its slot.
-func (c *numCol) at(k int, bc *blockCache) (colVal, bool) {
-	v, cell := c.cell(k, bc)
-	return v, cell == cellNumber
-}
-
 // cell is at saying why there is no value (see numCell). A caller that skips missing values must use
 // this and give up on cellExpr: skipping an expression as if it were missing is a wrong answer.
 func (c *numCol) cell(k int, bc *blockCache) (colVal, numCell) {
@@ -207,30 +200,6 @@ func (c *Collection) schemaScanStatsMulti(aggID uint32, preds []fieldPred, bc *b
 // contributing value, in BLOCK ORDER -- which is not the order a record scan would visit the same
 // records in, and not insertion order.
 type numSink func(colVal)
-
-// schemaScanValuesMulti is the columnar value pass: narrow the candidate records with one pass per
-// predicate column (skipping blocks their zones rule out), then read the AGGREGATED column for the
-// survivors and hand each value to sink. The aggregated column is deliberately not zone-pruned --
-// its values are the answer, not a filter.
-//
-// ok=false means the pass could not complete and the caller must scan: a folded predicate outside a
-// proven window, an unreadable column with no usable row fallback, or an expression-valued cell,
-// which has no numeric reading at all.
-func (c *Collection) schemaScanValuesMulti(aggID uint32, preds []fieldPred, bc *blockCache, sink numSink) bool {
-	p := c.planValuePass(aggID, preds)
-	var st valuePassState
-	for _, sh := range c.shards {
-		s0, wins := sh.snapshot()
-		for _, w := range wins {
-			if !c.valuePassWindow(&p, &st, w, s0, bc, sink) {
-				releaseWindows(wins)
-				return false
-			}
-		}
-		releaseWindows(wins)
-	}
-	return true
-}
 
 // valuePassPlan is everything a value pass resolves once, before it touches a segment: the split of
 // the predicates into those on the aggregated column (fused into the value read) and those that
@@ -311,10 +280,7 @@ func (c *Collection) valuePassWindow(p *valuePassPlan, st *valuePassState, w seg
 	aggIdx, allIdxs, ok := resolveStatsFields(cs, aggID, preds)
 	if !ok {
 		aggRowSegments.Add(1)
-		if !bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, sink) {
-			return false
-		}
-		return true
+		return bruteStatsMulti(c, w, s0, aggLookup, otherPreds, lookups, selfOK, sink)
 	}
 	// Narrowing uses only the OTHER fields; pruning may use them all, since ruling a block
 	// out is sound for any predicate including one on the aggregated column.

@@ -1,6 +1,7 @@
 package collections
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
@@ -69,7 +70,7 @@ func TestCollectSamplesRecentPrefersRecent(t *testing.T) {
 		if i >= n/2 {
 			era = "NEW"
 		}
-		ad := mustAdOld(t, fmt.Sprintf("ClusterId = %d\nEra = \"%s\"\nPad = \"%s\"", i, era, strings.Repeat("x", 200)))
+		ad := mustAdOld(t, fmt.Sprintf("ClusterId = %d\nEra = %q\nPad = %q", i, era, strings.Repeat("x", 200)))
 		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), ad); err != nil {
 			t.Fatal(err)
 		}
@@ -141,7 +142,7 @@ func TestCollectSamplesRecentRandomizes(t *testing.T) {
 		t.Fatalf("pinned draws differ in length: %d vs %d", len(a), len(b))
 	}
 	for i := range a {
-		if string(a[i]) != string(b[i]) {
+		if !bytes.Equal(a[i], b[i]) {
 			t.Fatalf("pinned draw is not reproducible at sample %d", i)
 		}
 	}
@@ -150,7 +151,7 @@ func TestCollectSamplesRecentRandomizes(t *testing.T) {
 	d := c.collectSamplesRecent(20, 1<<30, 0, seqRand(1, 2, 3, 4, 5))
 	same := 0
 	for i := range a {
-		if i < len(d) && string(a[i]) == string(d[i]) {
+		if i < len(d) && bytes.Equal(a[i], d[i]) {
 			same++
 		}
 	}

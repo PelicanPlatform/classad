@@ -7,6 +7,7 @@ package collections
 // could ever decode them again.
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -126,7 +127,7 @@ func TestAtticDictionaryStillDecodes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("retired dictionary could not decode what it encoded: %v", err)
 	}
-	if string(got) != string(plain) {
+	if !bytes.Equal(got, plain) {
 		t.Fatal("retired dictionary decoded to the wrong bytes")
 	}
 	t.Log("a retired dictionary still decodes its segments after being moved back")

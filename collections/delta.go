@@ -90,7 +90,7 @@ const maxTrackedKeys = 1 << 20
 // next reports whether the write for key should be a delta, and records the decision. A
 // caller that cannot use a delta (an attribute was deleted, nothing changed, the key has no
 // full record yet, or the bound is reached) gets false and the key's depth resets.
-func (t *deltaTracker) next(h uint64, eligible, baseExists bool, max int) bool {
+func (t *deltaTracker) next(h uint64, eligible, baseExists bool, limit int) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if len(t.depth) >= maxTrackedKeys {
@@ -101,7 +101,7 @@ func (t *deltaTracker) next(h uint64, eligible, baseExists bool, max int) bool {
 	// key has a whole record, so the only question left is whether the key exists at all --
 	// which the caller answers with a location lookup, no decode. Treating absence as "no
 	// base" instead would force a whole record per key per seal.
-	if !eligible || !baseExists || d >= max {
+	if !eligible || !baseExists || d >= limit {
 		t.depth[h] = 0 // this write is a full record; the chain restarts here
 		t.fulls.Add(1)
 		return false
@@ -462,7 +462,7 @@ func deltaChainGap(vers []deltaVer) bool {
 // transient and who already owns a reusable buffer (the scan iterators do, and their contract
 // already says the bytes live only until the next record). A caller that RETAINS the bytes must
 // pass nil: the collapse buffers them until its commit lands.
-func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, want materializeWant, dst []byte) ([]byte, *classad.ClassAd, bool) {
+func (sh *shard) materializeAt(c *Collection, key []byte, h, s0 uint64, want materializeWant, dst []byte) ([]byte, *classad.ClassAd, bool) {
 	raw, ad, ok, _ := sh.materializeAtWhy(c, key, h, s0, want, dst)
 	return raw, ad, ok
 }
@@ -471,7 +471,7 @@ func (sh *shard) materializeAt(c *Collection, key []byte, h uint64, s0 uint64, w
 // Every exit below is a different fault with a different repair, and collapsing them into one
 // answer is what left a production mirror reporting every refused write under a single count.
 // See readFail.
-func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64, want materializeWant, dst []byte) ([]byte, *classad.ClassAd, bool, readFail) {
+func (sh *shard) materializeAtWhy(c *Collection, key []byte, h, s0 uint64, want materializeWant, dst []byte) ([]byte, *classad.ClassAd, bool, readFail) {
 	vers, base, why := sh.chainVersions(key, h, s0)
 	if why != failNone {
 		return nil, nil, false, why
@@ -481,7 +481,7 @@ func (sh *shard) materializeAtWhy(c *Collection, key []byte, h uint64, s0 uint64
 	// than allocated per call -- which at DeltaMax deltas of a multi-KB ad was 9% of a real queue
 	// replay's allocation. The pooled state therefore retains up to DeltaMax ad buffers per pooled
 	// instance, which is the memory this trades for the churn.
-	ds, _ := decompressPool.Get().(*decompressState)
+	ds, _ := decompressPool.Get().(*decompressState) //nolint:errcheck // the pool's New returns exactly this type
 	if ds == nil {
 		ds = &decompressState{}
 	}
@@ -760,7 +760,7 @@ func (c *Collection) spliceMerge(dst []byte, raws [][]byte) ([]byte, bool) {
 	// materializeAt's REUSED decompression buffer, which the next merge overwrites -- and the
 	// collapse retains what it is given until its commit lands. The splice below copies.
 
-	ms, _ := mergePool.Get().(*mergeState)
+	ms, _ := mergePool.Get().(*mergeState) //nolint:errcheck // the pool's New returns exactly this type
 	if ms == nil {
 		ms = &mergeState{}
 	}
@@ -877,6 +877,8 @@ func (c *Collection) DeltaStats() (deltas, fulls int64) {
 // redacting read, since the object holds every sealed value open.
 //
 // Callers must hold the shard read lock: materializeAt reads other segments' bytes.
+//
+//nolint:gocritic // the results are a read's whole answer; bundling them in a struct would allocate on the hottest path here
 func (sh *shard) resolveDelta(c *Collection, key []byte, h, s0 uint64, isDelta bool, stored []byte, codec Codec, want materializeWant) ([]byte, Codec, *classad.ClassAd, bool, bool, readFail) {
 	// nil dst: a point read's bytes are copied out from under the shard lock by its caller.
 	if !c.deltaRead {
@@ -1278,7 +1280,7 @@ const (
 func (c *Collection) collapseBatch(keys [][]byte) [][]byte {
 	var retry [][]byte
 	tx := c.Begin()
-	n, bytes := 0, 0
+	n, nbytes := 0, 0
 	flush := func() {
 		if n == 0 {
 			return
@@ -1288,7 +1290,7 @@ func (c *Collection) collapseBatch(keys [][]byte) [][]byte {
 			retry = append(retry, append([]byte(nil), k...))
 		}
 		tx = c.Begin()
-		n, bytes = 0, 0
+		n, nbytes = 0, 0
 	}
 	for _, key := range keys {
 		h := c.h.Hash(key)
@@ -1307,7 +1309,7 @@ func (c *Collection) collapseBatch(keys [][]byte) [][]byte {
 			want |= mObj
 		}
 		sh.mu.RLock()
-		// nil dst: the collapse buffers these bytes until its commit lands.
+		// nil dst: the collapse buffers these nbytes until its commit lands.
 		merged, mergedAd, ok := sh.materializeAt(c, key, h, s0, want, nil)
 		sh.mu.RUnlock()
 		if !ok {
@@ -1316,7 +1318,7 @@ func (c *Collection) collapseBatch(keys [][]byte) [][]byte {
 			// lands here, and dropping it would leave the fragment behind. Ask the store.
 			//
 			// endsInDelta answers by INDEX lookup while the key was found by SCANNING segment
-			// bytes, and the two disagree exactly where it matters: lookupSealed skips a sealed
+			// nbytes, and the two disagree exactly where it matters: lookupSealed skips a sealed
 			// segment whose key index is not built, findCurrent stops at a dead link, and
 			// segForLoc can return nil. Each makes a genuinely stranded fragment look absent, so
 			// it was dropped here and re-found by the next scan, identically, forever. Trust the
@@ -1330,8 +1332,8 @@ func (c *Collection) collapseBatch(keys [][]byte) [][]byte {
 		}
 		tx.putWireAd(key, merged, mergedAd, c.decodeWireAd)
 		n++
-		bytes += len(merged)
-		if n >= maxCollapseBatch || bytes >= maxCollapseBatchBytes {
+		nbytes += len(merged)
+		if n >= maxCollapseBatch || nbytes >= maxCollapseBatchBytes {
 			flush()
 		}
 	}
@@ -1536,11 +1538,11 @@ type deltaVer struct {
 }
 
 // errNoWireDecoder reports a wire-buffered write whose object was asked for without a decoder
-// having been supplied. Only putWire creates such a buffer, and it always supplies one.
+// having been supplied. Only putWireAd creates such a buffer, and it always supplies one.
 var errNoWireDecoder = errors.New("collections: wire-buffered write has no decoder")
 
 // decodeWireAd is decodeWire returning the public ClassAd wrapper, for callers that need the
-// object rather than the AST (see Txn.putWire).
+// object rather than the AST (see Txn.putWireAd).
 func (c *Collection) decodeWireAd(w []byte) (*classad.ClassAd, error) {
 	a, err := c.decodeWire(w)
 	if err != nil {
