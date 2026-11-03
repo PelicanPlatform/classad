@@ -95,6 +95,12 @@ const (
 	// FeatJoin it postdates advertisement, so a peer that says nothing does not have it.
 	FeatQueryValues Feature = "queryvalues"
 
+	// FeatJoinWire is the wire-form, batched join row stream (opJoinWire). Postdates
+	// advertisement, so silence is a no -- and a peer that advertises FeatJoin but not this
+	// one is a server that can join and cannot batch, which is exactly the fallback the
+	// client takes.
+	FeatJoinWire Feature = "joinwire"
+
 	// FeatEvalTypes is the EVALUATED half of the attribute type report (opAttrTypes with
 	// attrFlagEvaluate). Postdates advertisement, so silence is a no.
 	//
@@ -132,6 +138,7 @@ var serverFeatures = []Feature{
 	FeatWatchWire,
 	FeatTxnRead,
 	FeatJoin,
+	FeatJoinWire,
 	FeatQueryValues,
 	FeatEvalTypes,
 }
@@ -158,6 +165,15 @@ func (s *Server) SessionAttrs() map[string]string {
 	for _, f := range serverFeatures {
 		if f == FeatJoin {
 			if _, ok := s.cat.(joinCatalog); !ok {
+				continue
+			}
+		}
+		// The wire-form join needs the same catalog AND the capability to produce wire
+		// rows from it. They are separate interfaces, so a catalog could have one and not
+		// the other, and advertising on the strength of the other one would be the wrong
+		// kind of yes.
+		if f == FeatJoinWire {
+			if _, ok := s.cat.(joinWireCatalog); !ok {
 				continue
 			}
 		}
