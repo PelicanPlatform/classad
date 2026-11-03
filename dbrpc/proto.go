@@ -677,6 +677,22 @@ func (r *reader) bytesRef() []byte {
 	r.b = r.b[n:]
 	return v
 }
+
+// uvarint reads one unsigned varint, failing the reader rather than returning a plausible zero
+// on a truncated or malformed one -- a code read as 0 would be a real dictionary entry.
+func (r *reader) uvarint() uint64 {
+	if r.err != nil {
+		return 0
+	}
+	v, n := binary.Uvarint(r.b)
+	if n <= 0 {
+		r.fail()
+		return 0
+	}
+	r.b = r.b[n:]
+	return v
+}
+
 func (r *reader) str() string { return string(r.bytesRef()) }
 func (r *reader) fail()       { r.err = errShort }
 

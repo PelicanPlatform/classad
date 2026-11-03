@@ -101,6 +101,13 @@ const (
 	// client takes.
 	FeatJoinWire Feature = "joinwire"
 
+	// FeatValueDict is the DICTIONARY form of a string column in the value stream
+	// (KindStringDict, requested with valueFlagDict). Postdates advertisement, so silence is
+	// a no -- and it must be, because an older server REFUSES a request flag it does not
+	// know rather than ignoring it, so asking a silent peer would turn an optimization into
+	// an error.
+	FeatValueDict Feature = "valuedict"
+
 	// FeatEvalTypes is the EVALUATED half of the attribute type report (opAttrTypes with
 	// attrFlagEvaluate). Postdates advertisement, so silence is a no.
 	//
@@ -140,6 +147,7 @@ var serverFeatures = []Feature{
 	FeatJoin,
 	FeatJoinWire,
 	FeatQueryValues,
+	FeatValueDict,
 	FeatEvalTypes,
 }
 
