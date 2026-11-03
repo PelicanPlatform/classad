@@ -1107,14 +1107,46 @@ that a trivial allocator is no longer good enough.
    only way such a loop vectorizes at all (§2.3).
 8. **Dead code and dead store elimination**, which falls out of SSA and matters here because a dead
    data register is 200 KiB.
-9. **Deferred column loads -- sinking a load into the narrowest predicate that needs it.** The
-   highest-value pass on this list, and distinct from both 4 and 8: CSE deduplicates a load and DCE
-   removes one nothing reads, but neither defers one that is read only under a predicate. A column
-   load is a *decompression*, and roughly 78% of mutable read CPU is zstd, so eliding one is worth
-   far more than eliding any amount of arithmetic. If `Owner` is read only inside
+9. **Deferred column loads -- sinking a load into the narrowest predicate that needs it.**
+   Distinct from both 4 and 8: CSE deduplicates a load and DCE removes one nothing reads, but
+   neither defers one that is read only under a predicate. If `Owner` is read only inside
    `if RequestGpus > 0:`, a block where nothing passes must never touch that column. The
    counterpart to loop-invariant hoisting, in the opposite direction: hoist out of loops, sink into
    predicates.
+
+   **Two corrections, and the second changes what is left of this item.**
+
+   **A column load is not a decompression on this path, and the 78% does not apply to it.** The
+   entry used to say it was, and rank this item first on that basis. The block cache decompresses a
+   *region* once; a load extracts one column from bytes that are already decompressed, so what a
+   skipped load elides is an extraction, not a zstd pass. `veccolcache.go` had already measured this
+   and says so in its own header -- for a fitted-width numeric column with no escapes the extraction
+   is a SLICE of bytes the block already holds, so eliding it saves almost nothing, while for a
+   string column it is a dictionary parse or a positional walk over every preceding field, measured
+   at -38% on a two-term string disjunction. The value of this item is therefore concentrated
+   entirely on string and materialized columns, and is near zero on raw numeric ones. The 78% figure
+   is real but belongs to the MUTABLE per-record read path, where each record's payload is
+   compressed individually and no block-level cache can help; carrying it onto the columnar vector
+   path conflated two different readers.
+
+   **The motivating example was already half built.** `&&`, `||`, Elvis and the conditional already
+   narrow the live set and take the jump when it is empty (`vecpath.go`), and
+   `TestVecSkipAvoidsTheColumnLoad` asserts the column is not merely unused but never LOADED. What
+   had no such skip was the `if` STATEMENT: `enterIf` narrowed the live mask to an empty set and
+   then ran the arm regardless, loading every column the body reads for nobody. **That half is now
+   built** -- an empty arm jumps to the else arm, and an empty else arm jumps to the join -- which
+   is the statement form of the same rule, and is exactly this item's own example. What remains of
+   item 9 beyond it is genuine code motion: sinking a load that is lowered ABOVE the predicate
+   guarding it, which the current lowering mostly does not produce, since a load is emitted at its
+   use site.
+
+   **Where the remaining value most likely is**, and this is a claim to measure rather than a
+   result: the skip fires only when the guarding predicate is written FIRST, so ordering a
+   conjunction to put a cheap, selective term ahead of an expensive string one would convert loads
+   that are always paid into loads that are usually skipped. `collections/match_reorder.go` already
+   does cost-ordered conjunct reordering, but only for matchmaking, and its cost model scores
+   EVALUATION rather than the per-form LOAD cost that governs here -- which is the same fact item 1
+   needs and the storage layer already knows.
 10. ~~**Tiling and kernel fusion.**~~ **Struck. Measured, and it does not pay.** The claim was that
    peak live bytes is `registers x 8192 x 25B`, so tiling the batch into cache-sized sub-batches
    would cut the peak 8-16x and make MORE live registers affordable rather than fewer, which would
@@ -1769,20 +1801,33 @@ needs it.
    | element-step consumption | **done** — per record at batch size 1, and as a batch sum |
    | fault *mask* | **done** indirectly: a faulted record's answer is ERROR, which the value comparison catches, and the fault SETS are compared outright for the revival case |
    | per-site fault *counts* | **not built.** The vector executor accumulates a fault plane and never attributes it to a site, so only the scalar half of that comparison exists |
-   | at every batch size, including 1 | partial — 1 and the corpus size, not a sweep |
-   | including a partial final batch | **not tested** |
-   | including a boundary inside a loop's divergence | **not tested**, and this is the interesting one |
+   | at every batch size, including 1 | **done** — `TestVecBatchInvariance` sweeps every split pattern of the corpus, not two sizes |
+   | including a partial final batch | **done** — the sweep's uneven splits end in one |
+   | including a boundary inside a loop's divergence | **done** — the law runs a loop corpus as well as an expression one |
 
    The last row is where the value is. A split falling between two trips of a loop is precisely the
    input that distinguishes an executor carrying no state across batches from one that happens to
    work when nothing is in flight. Two bugs of exactly that shape have already been found and fixed
    — a binding leaking between batches, and a mask released twice after a mid-loop decline — each
-   caught by a test written for it rather than by a law. A batch-invariance law turns that from luck
-   into coverage.
+   caught by a test written for it rather than by a law. **The law is now built** and turns that from
+   luck into coverage: `TestVecBatchInvariance` compares values AND charge, per record, over every
+   split pattern of both corpora, and `TestVecBatchInvarianceIsNotVacuous` fails if the programs all
+   declined or the corpus collapsed to one record. It has already earned itself — the stale join
+   condition recorded further down this section was found by it, by splitting a corpus so that some
+   batches contained no faulting record.
+
+   So the one row of this item still open is **per-site fault counts**, and the reason is structural
+   rather than pending: the vector executor declines `OpFault` outright, so there is no vector half
+   of that comparison to make.
 5. **Form selection (§6.8.1) and deferred column loads (§6.8.9).** The two highest-value passes, and
-   both need the vector path to exist before they mean anything — a form is a property of a `Vec`, and
-   a deferred load defers a decompression. Measured context for sizing: roughly 78% of mutable read
-   CPU is zstd, so a load not performed is worth more than any amount of arithmetic removed.
+   both need the vector path to exist before they mean anything — a form is a property of a `Vec`,
+   and what a deferred load elides is a function of that same form. **The sizing this item used to
+   carry was wrong and is withdrawn:** "a deferred load defers a decompression, and roughly 78% of
+   mutable read CPU is zstd" is true of the mutable per-record reader and false of this path, where
+   the block cache decompresses each region once and a load extracts a column from already
+   decompressed bytes. See §6.8 item 9 for the measurement and for what survives it — which is
+   mostly form selection, since the load cost this item attacks is near zero on a raw numeric column
+   and real only on a string one.
 
    One concrete thing to build here, which arrived as a request from outside: **a `Vec` has nowhere
    to record that its column is uniformly typed**, and the storage layer already knows. `loadNum`
@@ -1812,7 +1857,7 @@ against it. The audit, which is a claim to check rather than a result:
 | item | justified by | survives the premise? |
 |---|---|---|
 | 1, form selection | 100x fewer bytes **and** fewer operations — a mask is one `planeAnd` per 64 records, not per record | **Yes**, and on the operations half, which never needed the premise. Unaffected; still first |
-| 9, deferred column loads | a load not performed is a **decompression** not performed, ~78% of mutable read CPU | **Yes**, and most strongly. Decompression is real work per element, not a cache effect, so the premise is irrelevant to it. This is the item the measurement most clearly leaves standing |
+| 9, deferred column loads | a load not performed is a **decompression** not performed, ~78% of mutable read CPU | **The justification is withdrawn** — it was the one row of this audit that was wrong, and in the direction that flatters it. A load on this path is an *extraction* from an already-decompressed region, not a decompression, so this IS a cache effect and the 78% belongs to another reader entirely. What survives is narrower and form-dependent: near zero on a raw numeric column, real on a string one. See §6.8 item 9 |
 | 5, constant folding / `Const` propagation | a `Const` is one element instead of *n*; materializing one cost a measured 9.8% of a scan | **Yes** — the 9.8% was *measured*, not derived from a byte count, and what it removes is per-element writes |
 | 8, dead code elimination | "a dead data register is 200 KiB" | **Weakened, not struck.** The byte figure is ~400 B at the real width, so the motivation is the operations a dead computation runs, not the memory it holds. Still worth doing, worth much less than the entry implies |
 | 3, compaction | each arm runs at `popcount(live)` instead of *n* | **Yes** — it removes *work for records*, which is operations, not bytes. §6.4's open question about its threshold is unaffected |
