@@ -2,6 +2,7 @@ package dbrpc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"iter"
 	"math"
@@ -60,6 +61,21 @@ const (
 	KindReal   ValueKind = 2
 	KindBool   ValueKind = 3
 	KindString ValueKind = 4
+	// KindStringDict is a string column shipped as a DICTIONARY plus one code per cell,
+	// for a column whose values repeat. It carries the same values KindString would and
+	// decodes to the same per-cell strings; what changes is how many of them exist.
+	//
+	// A pool's Owner, a job's status text, a site name: storage already holds these as a
+	// per-block dictionary, and KindString expanded them to one string per ROW -- 20000
+	// allocations on the sending side and 20000 more on the receiving side to carry 64
+	// distinct values. Here the receiver allocates the dictionary and the per-cell slice
+	// holds references into it, so the count follows the column's CARDINALITY rather than
+	// its length.
+	//
+	// Gated on the client asking (valueFlagDict), because an older decoder refuses a kind
+	// it does not know -- which is the right thing for it to do and the reason this cannot
+	// simply be switched on.
+	KindStringDict ValueKind = 5
 )
 
 func (k ValueKind) String() string {
@@ -72,6 +88,8 @@ func (k ValueKind) String() string {
 		return "bool"
 	case KindString:
 		return "string"
+	case KindStringDict:
+		return "string-dict"
 	}
 	return "none"
 }
@@ -190,7 +208,8 @@ func (c *ValueColumn) denseAt(i int) classad.Value {
 		if i < len(c.Bools) {
 			return classad.NewBoolValue(c.Bools[i])
 		}
-	case KindString:
+	case KindString, KindStringDict:
+		// The dictionary was expanded at decode, so both forms read the same slice here.
 		if i < len(c.Strs) {
 			return classad.NewStringValue(c.Strs[i])
 		}
@@ -261,7 +280,12 @@ var ErrValuesUnsupported = errors.New("dbrpc: typed value batches unavailable fo
 // an unknown bit is REFUSED rather than served without the option, for the same reason the
 // wire-row ops refuse one -- a stream that silently lacks what was asked for is the dangerous
 // shape, not the loud failure.
-const valueFlagsKnown uint32 = 0
+// valueFlagDict says the client understands KindStringDict and would like string columns
+// shipped as a dictionary where that pays. A client that does not set it gets KindString, which
+// every decoder has always understood.
+const valueFlagDict uint32 = 1 << 0
+
+const valueFlagsKnown uint32 = valueFlagDict
 
 // QueryValuesStream streams matching records as typed, EVALUATED value batches, column-major and
 // aligned with attrs. Each batch is handed to yield and is valid only until yield returns: its
@@ -272,6 +296,27 @@ const valueFlagsKnown uint32 = 0
 //
 // Returns ErrValuesUnsupported, before any batch, when the stream is unavailable.
 func (c *Client) QueryValuesStream(ctx context.Context, table, constraint string, attrs []string, limit int, redact bool, yield func(*ValueBatch) bool) error {
+	return c.QueryValuesStreamOpts(ctx, table, constraint, attrs, limit, redact, ValueStreamOptions{}, yield)
+}
+
+// ValueStreamOptions are the opt-in parts of the value stream.
+type ValueStreamOptions struct {
+	// Dictionary asks for string columns as a DICTIONARY plus one code per cell where that
+	// pays (KindStringDict). The decoder expands it into the same ValueColumn.Strs slice the
+	// plain form fills, so a caller reading values through ValueAt or Strs needs no change --
+	// only one that SWITCHES ON Kind has to learn the new one, which is the whole reason this
+	// is opt-in rather than always on.
+	//
+	// Ignored against a server that does not advertise FeatValueDict: an older one refuses a
+	// flag it does not know, and getting an error back for asking would be a poor trade for
+	// an optimization.
+	Dictionary bool
+}
+
+// QueryValuesStreamOpts is QueryValuesStream with the opt-in parts of the stream (see
+// ValueStreamOptions).
+func (c *Client) QueryValuesStreamOpts(ctx context.Context, table, constraint string, attrs []string,
+	limit int, redact bool, opts ValueStreamOptions, yield func(*ValueBatch) bool) error {
 	if len(attrs) == 0 {
 		// A projection of nothing has no columns to return, and "every attribute" is not a
 		// shape this op can give: it packs one column per REQUESTED name, and a record's
@@ -282,7 +327,11 @@ func (c *Client) QueryValuesStream(ctx context.Context, table, constraint string
 	build := func(id uint64) []byte {
 		b := putStr(req(id, opQueryValues), table)
 		b = putI32(b, int32(limit))
-		b = putI32(b, 0) // flags
+		flags := uint32(0)
+		if opts.Dictionary && c.SupportsNewer(FeatValueDict) {
+			flags |= valueFlagDict
+		}
+		b = putI32(b, int32(flags))
 		r := byte(0)
 		if redact {
 			r = 1
@@ -441,6 +490,7 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 	}
 
 	enc := newValueEncoder(len(attrs))
+	enc.dict = flags&valueFlagDict != 0
 	flush := func() {
 		if enc.rows == 0 {
 			return
@@ -542,7 +592,7 @@ func (e *valueEncoder) appendBatch(b *collections.Batch, row int) {
 			case collections.ValueBool:
 				v = classad.NewBoolValue(col.Bool(row))
 			case collections.ValueString:
-				v = classad.NewStringValue(strings.Clone(col.Text(row)))
+				v = classad.NewStringValue(e.intern(col.Text(row)))
 			case collections.ValueUndefined:
 			default:
 				v = classad.NewErrorValue()
@@ -560,11 +610,41 @@ func (e *valueEncoder) appendBatch(b *collections.Batch, row int) {
 type valueEncoder struct {
 	rows int
 	cols [][]classad.Value
+	// dict says the client asked for dictionary string columns (valueFlagDict).
+	dict bool
+	// owned maps an owned string to itself, so a repeated value is copied ONCE per scan
+	// rather than once per cell.
+	//
+	// Keyed by the OWNED copy, never by the borrowed one. A map retains its keys, so
+	// interning under the borrowed string would pin the very block the copy exists to
+	// release. A lookup with a borrowed string is fine: it hashes and compares without
+	// retaining.
+	owned map[string]string
 }
+
+// ownedStringCap bounds the intern table. A column whose values are nearly all distinct -- a
+// job id, a path -- would otherwise grow it for the whole scan to save nothing, so past the cap
+// a value is simply copied as before.
+const ownedStringCap = 4096
 
 func newValueEncoder(ncols int) *valueEncoder {
 	e := &valueEncoder{cols: make([][]classad.Value, ncols)}
 	return e
+}
+
+// intern returns an owned copy of a borrowed string, reusing one it has already made.
+func (e *valueEncoder) intern(s string) string {
+	if e.owned == nil {
+		e.owned = make(map[string]string, 64)
+	}
+	if got, ok := e.owned[s]; ok {
+		return got
+	}
+	c := strings.Clone(s)
+	if len(e.owned) < ownedStringCap {
+		e.owned[c] = c
+	}
+	return c
 }
 
 func (e *valueEncoder) reset() {
@@ -617,6 +697,13 @@ func (e *valueEncoder) encode(b []byte) []byte {
 	validBytes := (e.rows + 7) / 8
 	for _, vals := range e.cols {
 		kind := chooseKind(vals)
+		var codes []int32
+		var dictStrs []string
+		if kind == KindString && e.dict {
+			if codes, dictStrs = buildStringDict(vals); dictStrs != nil {
+				kind = KindStringDict
+			}
+		}
 		b = append(b, byte(kind))
 		valid := make([]byte, validBytes)
 		var ints []int64
@@ -662,6 +749,11 @@ func (e *valueEncoder) encode(b []byte) []byte {
 					strs = append(strs, s)
 					packed = true
 				}
+			case KindStringDict:
+				// buildStringDict already decided which cells pack, and it used the same
+				// test -- a string cell packs, anything else is an exception -- so the
+				// codes it produced line up with the cells counted here.
+				packed = v.Type() == classad.StringValue
 			}
 			if packed {
 				setBit(valid, i)
@@ -691,6 +783,18 @@ func (e *valueEncoder) encode(b []byte) []byte {
 			for _, s := range strs {
 				b = putStr(b, s)
 			}
+		case KindStringDict:
+			// The dense count first, as every other kind writes it, so the decoder reads one
+			// fixed-shape header per column; then the dictionary, then one code per packed
+			// cell.
+			b = putI32(b, int32(len(codes)))
+			b = putI32(b, int32(len(dictStrs)))
+			for _, s := range dictStrs {
+				b = putStr(b, s)
+			}
+			for _, c := range codes {
+				b = binary.AppendUvarint(b, uint64(c))
+			}
 		default:
 			b = putI32(b, 0)
 		}
@@ -701,6 +805,57 @@ func (e *valueEncoder) encode(b []byte) []byte {
 		}
 	}
 	return b
+}
+
+// buildStringDict builds the dictionary and per-cell codes for a string column, or returns a nil
+// dictionary when shipping one would not pay.
+//
+// IT HAS TO PAY IN BYTES AS WELL AS ALLOCATIONS, and the codes are VARINTS because of it. Fixed
+// 4-byte codes lose on the columns this exists for: a pool's Owner is a handful of short names,
+// and four bytes to avoid writing "u3" is more wire than the string. A varint code for a small
+// dictionary is one byte, so the form wins on both axes or declines on both.
+//
+// The test is the honest one -- the dictionary form must be SMALLER -- so a column of long,
+// nearly-distinct values ships plainly rather than paying for a dictionary and a code per row to
+// save allocations the receiver was going to make anyway.
+func buildStringDict(vals []classad.Value) ([]int32, []string) {
+	index := make(map[string]int32, 16)
+	var dict []string
+	codes := make([]int32, 0, len(vals))
+	plain, dictBytes, codeBytes := 0, 0, 0
+	for _, v := range vals {
+		if v.Type() != classad.StringValue {
+			continue // an exception; it ships in the exception list either way
+		}
+		str, _ := v.StringValue()
+		plain += len(str) + 2 // the string plus its length prefix, near enough
+		c, ok := index[str]
+		if !ok {
+			c = int32(len(dict))
+			index[str] = c
+			dict = append(dict, str)
+			dictBytes += len(str) + 2
+		}
+		codes = append(codes, c)
+		codeBytes += uvarintLen(uint64(c))
+	}
+	if len(codes) == 0 {
+		return nil, nil
+	}
+	if dictBytes+codeBytes >= plain {
+		return nil, nil
+	}
+	return codes, dict
+}
+
+// uvarintLen is how many bytes binary.AppendUvarint will write for x.
+func uvarintLen(x uint64) int {
+	n := 1
+	for x >= 0x80 {
+		x >>= 7
+		n++
+	}
+	return n
 }
 
 func appendExcValue(b []byte, v classad.Value) []byte {
@@ -780,6 +935,33 @@ func decodeValueBatch(r *reader, out *ValueBatch) bool {
 		case KindString:
 			for k := 0; k < m; k++ {
 				c.Strs = append(c.Strs, r.str())
+			}
+		case KindStringDict:
+			// Expanded into the SAME Strs slice the plain form fills, so nothing above this
+			// has to know which form arrived. The expansion copies string HEADERS, not
+			// bytes: only the dictionary is allocated, and the per-cell slice points into
+			// it. That is the whole saving -- one allocation per distinct value instead of
+			// one per row.
+			ndict := int(r.i32())
+			if r.err != nil || ndict < 0 {
+				return false
+			}
+			dict := make([]string, 0, ndict)
+			for k := 0; k < ndict; k++ {
+				dict = append(dict, r.str())
+			}
+			if r.err != nil {
+				return false
+			}
+			for k := 0; k < m; k++ {
+				code := int(r.uvarint())
+				if r.err != nil || code < 0 || code >= len(dict) {
+					// A code with no entry is a corrupt or truncated frame. Refusing the
+					// batch is the only honest answer: substituting a blank would put a
+					// value in the result that no record ever held.
+					return false
+				}
+				c.Strs = append(c.Strs, dict[code])
 			}
 		case KindNone:
 			// m is the count field, written as 0; nothing dense follows.
