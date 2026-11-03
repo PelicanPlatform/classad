@@ -33,7 +33,7 @@ func benchColInts(n int) Batch {
 // benchColMixed is a column with one record in a hundred that does not fit, which
 // is the shape the escape hatch is for: those records cross nothing and take the
 // scalar path.
-func benchColMixed(n int, every int) Batch {
+func benchColMixed(n, every int) Batch {
 	b := benchInts(n)
 	for i := every; i < n; i += every {
 		b.St[i] = vsUndef
@@ -146,10 +146,12 @@ func BenchmarkColumnarUniformityScan(b *testing.B) {
 	declared.Uniform, declared.State = true, vsInt
 	mixed := benchColMixed(n, 64)
 
-	for _, tc := range []struct {
+	cases := []struct {
 		name string
 		arg  Batch
-	}{{"declared", declared}, {"uniform", uniform}, {"mixed", mixed}} {
+	}{{"declared", declared}, {"uniform", uniform}, {"mixed", mixed}}
+	for i := range cases {
+		tc := &cases[i]
 		b.Run(tc.name, func(b *testing.B) {
 			args := []Batch{tc.arg}
 			for b.Loop() {

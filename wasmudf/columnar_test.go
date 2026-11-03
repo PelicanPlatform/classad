@@ -10,7 +10,7 @@ import (
 // mixedBatch builds a data-form column of integers with one element put into
 // another state, which is the shape the columnar form exists to deal with: a
 // column that is one type except where it is not.
-func mixedBatch(n int, at int, st uint8, payload int64) Batch {
+func mixedBatch(n, at int, st uint8, payload int64) Batch {
 	b := intBatch(make([]int64, n)...)
 	for i := range n {
 		b.I[i] = int64(i)

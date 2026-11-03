@@ -73,6 +73,19 @@ linters:
       - linters:
           - gocritic
         path: fuzz/oracle/cgo/
+      # govet's shadow check is off in the submodules. It is not part of go
+      # vet's default suite, and it is the one check here that flags a style
+      # choice rather than a defect: `if err := f(); err != nil` inside a
+      # function that already has an `err` is the shape the language
+      # encourages. The root module was written with the check on and stays
+      # that way. These five modules are separate Go modules that the lint job
+      # never entered, so the check never shaped them -- it has 358 hits, and
+      # rewriting that much error handling to satisfy a style preference is a
+      # far better way to introduce a bug than to find one.
+      - linters:
+          - govet
+        path: ^(changefeed|collections|db|dbrpc|wasmudf)/
+        text: '^shadow: '
     paths:
       - bin
       - vendor
