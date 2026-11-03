@@ -96,7 +96,7 @@ func (v *View) sealAged(now int64) {
 			continue // keep the bucket live and retry on the next tick
 		}
 		delete(v.groups, a.key)
-		_, _ = v.backing.Delete(a.key)
+		_, _ = v.backing.Delete(a.key) //nolint:errcheck // in-memory backing, single writer under v.mu
 		if a.start > v.watermark {
 			v.watermark = a.start
 			advanced = true
@@ -113,10 +113,10 @@ func (v *View) sealAged(now int64) {
 		}
 	}
 	if v.spec.Retention > 0 {
-		_, _ = v.archive.Rotate(float64(now))
+		_, _ = v.archive.Rotate(float64(now)) //nolint:errcheck // retention trim is best effort; the next tick tries again
 	}
 	if v.stateDir != "" {
-		_ = saveViewState(v.stateDir, viewState{Watermark: v.watermark})
+		_ = saveViewState(v.stateDir, viewState{Watermark: v.watermark}) //nolint:errcheck // an unwritten watermark re-seals from the last saved one, which is safe
 	}
 }
 

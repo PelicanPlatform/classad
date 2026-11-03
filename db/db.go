@@ -325,7 +325,7 @@ func loadOrCreateDBID(dir string) string {
 		}
 	}
 	id := randID()
-	_ = os.WriteFile(p, []byte(id+"\n"), 0o644)
+	_ = os.WriteFile(p, []byte(id+"\n"), 0o644) //nolint:errcheck // an unwritable dir yields a fresh id next open, which beats refusing to open
 	return id
 }
 
@@ -500,7 +500,7 @@ func (db *DB) Maintain(opts MaintainOptions) {
 		return
 	}
 	if opts.Retrain {
-		_, _ = db.c.RetrainDict(opts.SampleMax) // recompacts + reindexes
+		_, _ = db.c.RetrainDict(opts.SampleMax) //nolint:errcheck // recompacts + reindexes; a failed pass is retried on the next cadence
 	}
 	if db.c.MaintenanceStopping() {
 		return

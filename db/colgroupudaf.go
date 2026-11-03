@@ -49,7 +49,7 @@ func (s *udafGroupSink) AddNum(agg int, v collections.NumValue) { s.accs[agg].Ad
 // would fail only if the storage layer handed back a sink it did not get from us, which is a bug
 // here rather than bad data, and the panic is contained for the query like every other.
 func mergeUDAFGroupSinks(dst, src collections.GroupSink) {
-	d, s := dst.(*udafGroupSink), src.(*udafGroupSink)
+	d, s := dst.(*udafGroupSink), src.(*udafGroupSink) //nolint:errcheck // see above
 	for i := range d.accs {
 		d.accs[i].Merge(s.accs[i])
 	}
@@ -129,7 +129,7 @@ func GroupedUserFromColumns(src GroupValuesSource, constraint string, groupCols 
 	newSink := func() collections.GroupSink {
 		s := &udafGroupSink{accs: make([]ColumnAccumulator, len(userAggs))}
 		for i, agg := range userAggs {
-			s.accs[i] = agg.NewAccumulator().(ColumnAccumulator)
+			s.accs[i] = agg.NewAccumulator().(ColumnAccumulator) //nolint:errcheck // the caller already checked this aggregate yields a ColumnAccumulator
 		}
 		return s
 	}
@@ -196,7 +196,7 @@ func GroupedUserFromColumns(src GroupValuesSource, constraint string, groupCols 
 		}
 		out := make([]AggRow, 0, len(merged))
 		for n, g := range merged {
-			sink := g.Sink.(*udafGroupSink)
+			sink := g.Sink.(*udafGroupSink) //nolint:errcheck // every sink here came from newSink above
 			values := make([]string, len(aggs))
 			for i := range aggs {
 				switch {
@@ -230,7 +230,7 @@ func mergeGroupValues(a, b *collections.GroupValues) {
 			a.CountOf[i] += b.CountOf[i]
 		}
 	}
-	as, bs := a.Sink.(*udafGroupSink), b.Sink.(*udafGroupSink)
+	as, bs := a.Sink.(*udafGroupSink), b.Sink.(*udafGroupSink) //nolint:errcheck // both sinks came from this package's newSink
 	for i := range as.accs {
 		as.accs[i].Merge(bs.accs[i])
 	}

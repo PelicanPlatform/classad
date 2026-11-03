@@ -30,7 +30,7 @@ func chooseBaseCodec(dir string) collections.Codec {
 	if dir == "" {
 		return zstd() // in-memory: always compress
 	}
-	_ = os.MkdirAll(dir, 0o755) // ensure the dir exists so the choice can be persisted
+	_ = os.MkdirAll(dir, 0o755) //nolint:errcheck // the WriteFile below is what has to succeed, and it reports for both
 	path := filepath.Join(dir, baseCodecFile)
 	if b, err := os.ReadFile(path); err == nil {
 		if string(b) == "identity" {
@@ -41,10 +41,18 @@ func chooseBaseCodec(dir string) collections.Codec {
 	// No recorded choice: an existing store (already has shard data written under the old
 	// identity default) keeps identity; a fresh store gets ZSTD. Persist it either way.
 	if hasShardData(dir) {
-		_ = os.WriteFile(path, []byte("identity"), 0o644)
+		// Recording it is a convenience here: identity is what an unmarked store with data
+		// resolves to anyway, so a failed write changes nothing.
+		_ = os.WriteFile(path, []byte("identity"), 0o644) //nolint:errcheck // see above
 		return nil
 	}
-	_ = os.WriteFile(path, []byte("zstd"), 0o644)
+	// This file is the ONLY record of which codec id-0 records were written under, and the
+	// branch above is what a reopen takes without it: no marker, shard data present,
+	// identity. So a store whose choice could not be written must not be compressed -- it
+	// would come back as a store that cannot decode its own records.
+	if err := os.WriteFile(path, []byte("zstd"), 0o644); err != nil {
+		return nil
+	}
 	return zstd()
 }
 

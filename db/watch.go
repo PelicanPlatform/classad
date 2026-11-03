@@ -134,7 +134,7 @@ func (w *Watcher) enqueue(ev WatchEvent) {
 	if signal {
 		// One byte is enough to wake a level/edge-triggered poll; the reader drains the
 		// whole queue and clears ready via Next.
-		_, _ = syscall.Write(w.fd, []byte{1})
+		_, _ = syscall.Write(w.fd, []byte{1}) //nolint:errcheck // a full pipe already holds a wakeup; a dead fd is the reader's problem
 	}
 }
 

@@ -73,6 +73,14 @@ linters:
       - linters:
           - gocritic
         path: fuzz/oracle/cgo/
+      # Same cgo preamble, same two spurious checks, in the C archive the C++ side
+      # links against: cgo rewrites the file before gocritic sees it, so it reports
+      # `import "C"` as a duplicate import and misreads the rewritten statements.
+      # Every other gocritic check still applies there.
+      - linters:
+          - gocritic
+        path: ^db/capi/
+        text: '^(dupImport|uncheckedInlineErr):'
       # govet's shadow check is off in the submodules. It is not part of go
       # vet's default suite, and it is the one check here that flags a style
       # choice rather than a defect: `if err := f(); err != nil` inside a

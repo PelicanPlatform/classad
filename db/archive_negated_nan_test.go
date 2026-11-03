@@ -219,7 +219,7 @@ func TestNegatedOrderingNaN(t *testing.T) {
 				if gcs, ok := h.GroupCountConstraint(c, "Bucket"); ok {
 					got := map[string]int{}
 					for _, gc := range gcs {
-						k := fmt.Sprint(gc.Value)
+						k := gc.Value.String()
 						if i, err := gc.Value.IntValue(); err == nil {
 							k = strconv.FormatInt(i, 10)
 						}

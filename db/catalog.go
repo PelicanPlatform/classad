@@ -225,7 +225,7 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		func(name string) (*DB, error) { return OpenConfig(cat.tableConfig(filepath.Join(root, name))) },
 		func(d *DB) { _ = d.Close() })
 	if err != nil {
-		cat.closeAll()
+		cat.closeAll() //nolint:errcheck // already failing; the open error is the one worth reporting
 		return nil, fmt.Errorf("catalog: opening %w", err)
 	}
 	for i, name := range tableNames {
@@ -235,7 +235,7 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	aroot := filepath.Join(cfg.Dir, archivesSubdir)
 	aentries, err := os.ReadDir(aroot)
 	if err != nil && !os.IsNotExist(err) {
-		cat.closeAll()
+		cat.closeAll() //nolint:errcheck // already failing; the open error is the one worth reporting
 		return nil, fmt.Errorf("catalog: reading archives dir: %w", err)
 	}
 	var archiveNames []string
@@ -251,7 +251,7 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 		},
 		func(a *ArchiveTable) { _ = a.Close() })
 	if err != nil {
-		cat.closeAll()
+		cat.closeAll() //nolint:errcheck // already failing; the open error is the one worth reporting
 		return nil, fmt.Errorf("catalog: opening %w", err)
 	}
 	for i, name := range archiveNames {
@@ -263,14 +263,14 @@ func OpenCatalogConfig(cfg CatalogConfig) (*Catalog, error) {
 	// cardinality) or whose base table is absent does NOT fail catalog open -- it loads in
 	// the failed/stale state and can be fixed by the operator.
 	if err := cat.recoverViews(); err != nil {
-		cat.closeAll()
+		cat.closeAll() //nolint:errcheck // already failing; the open error is the one worth reporting
 		return nil, err
 	}
 	// Recover external-sink exporter definitions from <dir>/exporters/. These are inert
 	// records: the catalog holds each definition (and, on disk, its opaque resume state)
 	// but never runs the exporter. A corrupt definition is skipped, not fatal.
 	if err := cat.recoverExporters(); err != nil {
-		cat.closeAll()
+		cat.closeAll() //nolint:errcheck // already failing; the open error is the one worth reporting
 		return nil, err
 	}
 	return cat, nil

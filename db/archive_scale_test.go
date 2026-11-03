@@ -3,6 +3,7 @@ package db
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -45,7 +46,7 @@ import (
 
 // scaleAd renders one history-shaped record: a spread of typed attributes plus padding, so
 // bytes/record is in the range a real completed-job ad occupies rather than a toy.
-func scaleAd(i int, ndv int) string {
+func scaleAd(i, ndv int) string {
 	return fmt.Sprintf(
 		"ClusterId = %d\nProcId = 0\nOwner = %q\nAccountingGroup = %q\n"+
 			"CompletionDate = %d\nEnteredHistoryTime = %d\nJobStatus = 4\nExitCode = %d\n"+
@@ -271,7 +272,7 @@ func dirBytes(t *testing.T, dir string) int64 {
 	var walk func(string, []os.DirEntry)
 	walk = func(base string, es []os.DirEntry) {
 		for _, e := range es {
-			p := base + string(os.PathSeparator) + e.Name()
+			p := filepath.Join(base, e.Name())
 			if e.IsDir() {
 				sub, err := os.ReadDir(p)
 				if err == nil {

@@ -1220,7 +1220,7 @@ func (t *ArchiveTable) DropIndex(names ...string) bool {
 // other kind, lands as categorical). Mirrors DB.saveIndexConfig, including its best-effort
 // contract: a write failure is ignored, leaving the change live for this run but unpersisted.
 func (t *ArchiveTable) saveIndexConfig() {
-	_ = t.cfg.update(func(cfg *ArchiveConfig) {
+	_ = t.cfg.update(func(cfg *ArchiveConfig) { //nolint:errcheck // best-effort by contract, as the comment above says
 		cfg.CategoricalAttrs, cfg.ValueAttrs = t.a.IndexedAttrs()
 		cfg.AutoAttrs = t.a.AutoIndexNames()
 	})
@@ -1421,7 +1421,7 @@ func (t *ArchiveTable) AddHotAttrs(names ...string) []string {
 // demand-driven refresh put on top. Best-effort, like saveIndexConfig: a write failure
 // leaves the change live for this run but unpersisted.
 func (t *ArchiveTable) saveHotConfig() {
-	_ = t.cfg.update(func(cfg *ArchiveConfig) {
+	_ = t.cfg.update(func(cfg *ArchiveConfig) { //nolint:errcheck // best-effort by contract, as the comment above says
 		cfg.AutoHotAttrs = autoHotNames(cfg.HotAttrs, t.a.HotAttrNames())
 	})
 }

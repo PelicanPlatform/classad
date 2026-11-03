@@ -31,7 +31,7 @@ func aggFilterArchive(t *testing.T) *ArchiveTable {
 	}
 	for i, r := range rows {
 		if err := a.AppendOld(fmt.Sprintf(
-			"Owner = \"%s\"\nJobStatus = %d\nCpus = %d\nID = %d\n", r.owner, r.status, r.cpus, i)); err != nil {
+			"Owner = %q\nJobStatus = %d\nCpus = %d\nID = %d\n", r.owner, r.status, r.cpus, i)); err != nil {
 			t.Fatal(err)
 		}
 	}

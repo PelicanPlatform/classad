@@ -127,12 +127,12 @@ func bucketOddFixture(tb testing.TB) (*Catalog, *ArchiveTable) {
 	}
 	for i := 0; i < 4000; i++ {
 		var src string
-		switch {
-		case i%50 == 7: // absent
+		switch i % 50 {
+		case 7: // absent
 			src = fmt.Sprintf("ClusterId = %d\nJobStatus = 4\n", i)
-		case i%50 == 11: // present but not a number
+		case 11: // present but not a number
 			src = fmt.Sprintf("ClusterId = %d\nJobStatus = 4\nCompletionDate = \"never\"\n", i)
-		case i%50 == 23: // a boolean, which the columnar layer calls a number and the reference does not
+		case 23: // a boolean, which the columnar layer calls a number and the reference does not
 			src = fmt.Sprintf("ClusterId = %d\nJobStatus = 4\nCompletionDate = true\n", i)
 		default:
 			src = fmt.Sprintf("ClusterId = %d\nJobStatus = 4\nCompletionDate = %d\n", i, 1700000000+i*60)
@@ -330,7 +330,7 @@ func TestArchiveBucketedGroupRealColumn(t *testing.T) {
 		if _, err := strconv.ParseInt(k, 10, 64); err != nil {
 			t.Errorf("bucket key %q is not an integer; a bucket start must render the same whatever the column's type", k)
 		}
-		if got[k] == nil || got[k][0] != wv[0] {
+		if len(got[k]) == 0 || got[k][0] != wv[0] {
 			t.Errorf("bucket %s = %v, scan says %s", k, got[k], wv[0])
 		}
 	}
@@ -487,7 +487,7 @@ func TestArchiveUnbucketedGroupOnStringColumnStillGroups(t *testing.T) {
 		t.Fatalf("got %d groups, scan says %d", len(got), len(want))
 	}
 	for k, wv := range want {
-		if got[k] == nil || got[k][0] != wv[0] {
+		if len(got[k]) == 0 || got[k][0] != wv[0] {
 			t.Errorf("group %s = %v, scan says %s", k, got[k], wv[0])
 		}
 	}
