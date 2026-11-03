@@ -73,6 +73,25 @@ type Options struct {
 	// maximum ignores this and is sized from that instead, exactly.
 	MaxBatchArgs int
 
+	// MaxStateBytes caps one aggregate accumulator's serialized state. Default
+	// 16 KiB, which holds a counter set or a sketch of a few thousand bytes; an
+	// aggregate needing more says so here rather than being truncated, since a
+	// truncated state is a wrong answer.
+	//
+	// The region reserves THREE buffers this size in every aggregate instance --
+	// two inputs to a merge and one output -- so raising it costs three times
+	// what it looks like, per instance.
+	MaxStateBytes int
+
+	// AggBatch is how many values an accumulator buffers before one fold call.
+	// Default 1024.
+	//
+	// It exists because the state crosses the boundary per call: at one value per
+	// call the copy would dominate everything, and at 1024 it is amortized to
+	// nothing. Larger is not better without limit -- the values wait in host
+	// memory, and a batch is also the granularity at which a trap loses work.
+	AggBatch int
+
 	// MaxInstances bounds how many instances of one UDF exist at once, and so how
 	// many calls to it run concurrently; a caller past the bound waits. Default
 	// GOMAXPROCS, on the grounds that a UDF is CPU-bound and an instance beyond a
@@ -117,6 +136,12 @@ func (o Options) withDefaults() Options {
 	if o.MaxInstances <= 0 {
 		o.MaxInstances = runtime.GOMAXPROCS(0)
 	}
+	if o.MaxStateBytes <= 0 {
+		o.MaxStateBytes = 16 * 1024
+	}
+	if o.AggBatch <= 0 {
+		o.AggBatch = 1024
+	}
 	return o
 }
 
@@ -153,6 +178,7 @@ type Loader struct {
 	// builds one.
 	rts    [2]wazero.Runtime
 	udfs   map[string]*UDF
+	aggs   map[string]*UDAF
 	closed bool
 }
 
@@ -186,7 +212,7 @@ type LoadOptions struct {
 
 // NewLoader creates a Loader. Its wasm runtimes are built on demand by Load.
 func NewLoader(ctx context.Context, opts Options) (*Loader, error) {
-	l := &Loader{opts: opts.withDefaults(), udfs: map[string]*UDF{}}
+	l := &Loader{opts: opts.withDefaults(), udfs: map[string]*UDF{}, aggs: map[string]*UDAF{}}
 	// The runtime for the default mode is built eagerly so that a configuration
 	// error -- an impossible memory limit, say -- is reported by NewLoader rather
 	// than by whichever Load happens to be first.

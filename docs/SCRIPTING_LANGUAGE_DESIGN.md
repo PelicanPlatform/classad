@@ -2046,10 +2046,11 @@ slice. `Accumulator` is therefore the implementation's own type, and the engine 
 
 1. **Who may register one?** The host process, at start-up, by linking Go code into the server. The
    trust model question this previously raised — the admin-labelled trust the WASM loader needs —
-   **does not arise**, because nothing here is *loaded*. Registering an aggregate requires the
-   ability to link code into the process, which is already total trust; a trust label would be
-   ceremony on top of a decision already made. It becomes a real question the moment aggregates
-   become loadable, and not before.
+   did not arise while nothing here was *loaded*: registering a Go aggregate requires the ability to
+   link code into the process, which is already total trust, so a trust label would be ceremony on
+   top of a decision already made. **That moment has now arrived** — an aggregate can be a WASM
+   module (§13.10) — and the answer is the loader's existing one: trust is the admin's field, the
+   module has no way to ask for it, and it relaxes the wall-clock backstop and nothing else.
 2. **What is the wire representation?** Unresolved, and **refused rather than half-answered**. Every
    aggregate frame is a function selector plus an argument (plus a filter, on the extended opcodes);
    none has a field for a name. Sending `AggUser` over the existing frame would arrive as "the
@@ -2157,6 +2158,8 @@ mutation then died.
   function of the `NumStats` a pass already computes (a range, a mean) could be answered from them
   without its own accumulate. Worth far less than the item above, and worth building only after
   something asks for it.
+- ~~**A loadable aggregate**~~ — **built; see §13.10.** The trust question §13.4 deferred came due
+  exactly as predicted, and was answered by the loader's existing label rather than by anything new.
 - **Views**, if ever, and only behind merge-under-deletion.
 
 ---
@@ -2324,6 +2327,63 @@ wrong, or is my expectation wrong" is the only question that distinguishes a bug
 The decline is now injected through a test-only hook. What is under test is the fan-out's handling
 of a decline, not the storage condition that provokes one, and injecting it makes the distinction
 explicit instead of relying on a fixture to hold a tier choice still.
+
+---
+
+### 13.10 A loadable aggregate: WASM, and where the state has to live
+
+`wasmudf` could already supply a user-defined *function*. It can now supply a user-defined
+*aggregate*: `Loader.LoadAggregate` compiles a module exporting init / fold / merge / result under
+its own ABI version, `UDAF.Aggregate()` hands it back as a `db.Aggregate`, and
+`wasmudf.RegisterAggregate` is the one-call form. The four operations of §13.2 are the four exports,
+which is pleasant but not the interesting part.
+
+**The interesting part is that the obvious representation does not work, and the reason is a
+lifetime rather than a cost.** A guest would naturally allocate an accumulator in its own memory and
+hand the host an opaque *handle*. That is the fast design — nothing crosses the boundary per fold —
+and it is what anyone writes first. It is unimplementable here. A handle is meaningful only inside
+the instance that minted it, so an accumulator holding one **pins that instance for its whole life**;
+`Accumulator` is Add/Merge/Result with no close, so nothing tells the host when one is finished; and
+there is no moment that could be *inferred* either, because **when the columnar pass declines, every
+worker's accumulator is dropped with neither Merge nor Result ever called** — §13.8's abort rule,
+arriving as a memory-management problem two sections later. The guest memory could then be reclaimed
+only by a finalizer, and the instances it pinned would be unavailable to other queries until the
+collector got round to them.
+
+So the state is **bytes the host owns**: fold and merge are pure functions of byte ranges, instances
+are borrowed per call exactly as the scalar path borrows them, an accumulator is an ordinary Go
+value, and the host can *cap* the state, which it cannot do for memory behind a handle. What it
+costs is a copy in and out per call, which is why a fold takes a **batch**. Measured on an M2 Pro,
+one column value through the guest costs 1657 ns at a batch of 1, 51 ns at 256 and 44–57 ns at 1024
+— so the batch is worth about 30x and the default is set at the knee rather than at the end.
+
+**Two findings worth keeping.**
+
+*The interruptibility tax changes shape between a function and an aggregate.* wazero's termination
+check sits at every loop **back-edge**, and §2's measurement of it (~340 ns per *call*) was taken
+against a scalar guest, which crosses one back-edge per call. An aggregate's fold crosses one per
+**value**. The same module labelled trusted folds a value in 18 ns against 57 ns untrusted: roughly
+**two thirds of the per-value cost is the ability to stop the guest**, where for a function it was a
+fixed per-call fee. Nothing about the ABI explains the number, and nobody would have predicted it
+from §2's figure.
+
+*The columnar opt-in is the one thing the guest gets to declare, and it is not a capability.*
+`db.ColumnAccumulator` is Go's way of making §13.5's two promises; a WASM guest makes them by
+exporting an optional `classad_udaf_fold_num` with fold's signature. The loader reads the export from
+the **compiled module**, like the vector entry point, and the accumulator it then builds is a
+*different Go type* — because the engine decides with a type assertion, and a single type carrying a
+flag would be asserted successfully by every aggregate and the promise would be unenforceable. This
+is deliberately *not* the trust label: it is a claim about the guest's own arithmetic, and a guest
+that declares it falsely computes a wrong aggregate exactly as a guest that adds wrongly does.
+
+**One small thing the engine does that this made visible.** `ColumnarUserAggregate` builds an
+accumulator to decide whether the aggregate opted in and keeps it as worker zero, because
+constructing one may have side effects. A WASM accumulator has that property more strongly — it
+could own guest memory — but with the state in the host the identity is read from the guest *once,
+at load*, and constructing one is a slice copy with no side effect at all. The engine's care is
+still right for the aggregates it cannot see; it simply does not bite here. What *is* visible is the
+other arm: when the assertion **fails**, that accumulator is discarded, so a scan-served query builds
+two and the accumulator count cannot be used to tell the rungs apart. The merge count can.
 
 ---
 

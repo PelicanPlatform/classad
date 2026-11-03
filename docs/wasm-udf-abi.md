@@ -751,7 +751,126 @@ else.
 
 ---
 
-## 10. What is stable, and what may change
+## 10. Aggregates: a different module, not a different function
+
+Everything above is a *function*: one call, argument values in, one value out. A
+guest can instead supply an **aggregate**, which the database engine reduces with
+exactly as it reduces with `SUM` — one state per group, and, on the columnar
+pass, one state per worker.
+
+It is a **separate export set under a separate version**, and a module exports one
+set or the other. They share nothing but the 16-byte value slot of section 2, and
+giving them one version number would mean a change to either forcing a rebuild of
+every module of both kinds.
+
+```wat
+(memory (export "memory") 1)
+(func (export "classad_udaf_abi_version") (result i32) (i32.const 1))
+(func (export "classad_udaf_init")   (param i32 i32) (result i32))
+(func (export "classad_udaf_fold")   (param i32 i32 i32 i32 i32 i32) (result i32))
+(func (export "classad_udaf_merge")  (param i32 i32 i32 i32 i32 i32) (result i32))
+(func (export "classad_udaf_result") (param i32 i32 i32) (result i32))
+```
+
+| export | parameters | returns |
+|---|---|---|
+| `classad_udaf_init` | `outPtr, outCap` | the identity state's length, or negative to refuse |
+| `classad_udaf_fold` | `statePtr, stateLen, valsPtr, valCount, outPtr, outCap` | the new state's length, or negative |
+| `classad_udaf_merge` | `aPtr, aLen, bPtr, bLen, outPtr, outCap` | the merged state's length, or negative |
+| `classad_udaf_result` | `statePtr, stateLen, resultPtr` | 0 if the value slot was written, nonzero to refuse |
+
+`valsPtr` points at `valCount` ordinary value slots, laid out exactly as section 2
+describes, with any string bytes in an arena after the last slot. The three state
+buffers never overlap each other or the values, so you never have to tolerate
+aliasing.
+
+### Your state is bytes the host holds
+
+Not a handle into your memory. **Nothing you allocate survives between calls**,
+and you are never asked to free anything.
+
+That is a lifetime decision, not a speed one. A handle would pin one instance for
+as long as the accumulator lived, and there is no point at which the host could
+learn that an accumulator was finished — when the columnar pass *declines*, every
+worker's accumulator is dropped with neither `merge` nor `result` ever called.
+Bytes in the host make an accumulator an ordinary value the collector reclaims.
+
+So: write your whole state into `outPtr` and return its length. If `outCap` is too
+small for it, return a negative number rather than writing what fits — a truncated
+state is a wrong answer. The cap is the host's `MaxStateBytes` (16 KiB by
+default), and an aggregate that needs more says so in the host's configuration.
+
+A fold is handed a **batch** of values, up to `AggBatch` (1024 by default), which
+is what amortizes copying the state in and out. Do not assume any particular
+count: it is a parameter of every call, and the last batch of a group is whatever
+was left.
+
+### Merge is load-bearing, and the laws are not advice
+
+The engine's columnar aggregate pass **fans out across segment windows**: one
+state per worker, each fed by one goroutine, merged once every worker has
+returned. **Which worker draws which segment is a race**, so the order two partial
+states are combined in is not fixed between two runs of the same query.
+
+Therefore `merge` must be **associative and commutative**, and `init` must produce
+a true identity for it. An aggregate that breaks this is correct in every test its
+author thought to write — an author tests the order their own code produces — and
+wrong in production, intermittently, by a number that looks plausible.
+
+Floating-point addition is not associative, so a float sum *will* move in its last
+bits between runs. That is the arithmetic, not a bug, and it is why the host's
+checker lets you supply your own comparison. Accumulate integers in `i64` if you
+want them exact, as the worked fixture does.
+
+### Opting into the column pass
+
+Export **`classad_udaf_fold_num`**, with `fold`'s signature and slot layout, and
+the engine will feed your accumulator straight from a numeric column — block
+pruned, no record decode, no boxing. Withhold it and you are served from the
+record scan: correct, and several times slower.
+
+The export is a declaration of **two things**, neither of which a signature can
+check:
+
+1. **Order does not matter to you.** The pass walks segments, then blocks,
+   skipping blocks a zone map rules out. That is not the scan's order and not
+   insertion order.
+2. **You do not count what you were not offered.** The pass yields only the
+   column's *numeric* values. A record whose argument is absent, undefined, a
+   string or an expression is never offered at all — where the scan calls your
+   fold for every row. An aggregate that counts its inputs, or treats undefined as
+   a contribution, must **not** export this: it would return a different number on
+   each rung, and both would look right.
+
+If both hold for you, export one function under both names — that is the common
+case and what the worked fixture does. `db.CheckAggregate` tests all of it,
+including the two promises, against a sample you supply.
+
+### Failing
+
+A fold or a merge that returns a negative length, a `result` that returns nonzero,
+a trap, the step budget and the wall-clock deadline all **fail the whole query**.
+There is no per-record fallback as there is for a declining vector call, and that
+is not an omission: a group's answer is a function of every row in it, so a state
+that stopped being updated part-way is not a worse answer, it is a wrong one that
+nothing about the result distinguishes from a right one.
+
+`init` is called **once, at load**. A module whose identity state does not fit is a
+registration error naming the problem, rather than a query that fails identically
+for every caller forever.
+
+### A minimal aggregate
+
+`wasmudf/testdata/aggsum.wat` is the worked example: a sum that keeps its integer
+and real contributions in separate fields of a 24-byte state, counts what it
+folded, promotes to a real only once it has seen one, and exports its fold under
+both names. The separate fields are deliberate — a merge that forgot one of them
+gives the right answer for a fixture whose values are all of one kind, which is
+the fixture anyone writes first.
+
+---
+
+## 11. What is stable, and what may change
 
 **Stable within ABI version 1.** Depend on these:
 
@@ -765,6 +884,9 @@ else.
 - the status convention, the result poisoning, and the decline mask's semantics
   including the three rules in section 5
 - the ownership and lifetime rules in section 6
+- the aggregate export set and its four return conventions, under its OWN version
+  number: `classad_udaf_abi_version` is counted separately from
+  `classad_udf_abi_version` and the two move independently
 
 **May change, and will come with a version bump:** new tags or states appended
 (so do not treat an unknown one as a particular value — refuse it); new descriptor
@@ -791,10 +913,15 @@ not is the shape to write something new in.
   per-module decision, and it is a yes or no rather than a number
 - any mechanism by which a module influences whether it is trusted, which is not
   a gap to be filled but a property to be preserved
+- a wire representation for a user-defined aggregate: no RPC frame has a field to
+  put its name in, so an aggregate runs against the engine in process
+- grouped aggregation handing a guest its group key. The grouped columnar pass
+  carries user accumulators, so a guest aggregate works under GROUP BY, but it
+  never sees which group it is accumulating
 
 ---
 
-## 11. Where this lives in the code
+## 12. Where this lives in the code
 
 | what | where |
 |---|---|
@@ -806,5 +933,8 @@ not is the shape to write something new in.
 | loading, validation, the two runtimes, the trust label | `wasmudf/loader.go` |
 | the scalar call path, the step counter, the instance pool | `wasmudf/udf.go` |
 | the batch call path and the escape hatch | `wasmudf/vector.go` |
+| the aggregate slot layout and state transfer | `wasmudf/abiagg.go` |
+| aggregate loading and the four operations | `wasmudf/aggregate.go` |
+| the engine-side accumulator | `wasmudf/dbagg.go` |
 | what each failure means | `wasmudf/reason.go` |
 | guest fixtures | `wasmudf/testdata/` |
