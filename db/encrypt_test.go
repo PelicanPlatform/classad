@@ -100,8 +100,8 @@ func TestEncryptedAttrsPersistAcrossReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetEncryptedAttrs([]string{"Region"}); err != nil {
-		t.Fatal(err)
+	if setEncryptedAttrsErr := db.SetEncryptedAttrs([]string{"Region"}); setEncryptedAttrsErr != nil {
+		t.Fatal(setEncryptedAttrsErr)
 	}
 	if got := db.EncryptedAttrNames(); len(got) != 1 || got[0] != "region" {
 		t.Fatalf("EncryptedAttrNames = %v, want [region]", got)

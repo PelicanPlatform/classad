@@ -25,15 +25,15 @@ func TestAppendOnlyInterning(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%05d", i)),
-			mustAd(t, fmt.Sprintf("[Id=%d; Ts=%d; Val=%d; Host=\"h%d.example.org\"]", i, i, i%100, i))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("k%05d", i)),
+			mustAd(t, fmt.Sprintf("[Id=%d; Ts=%d; Val=%d; Host=\"h%d.example.org\"]", i, i, i%100, i))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 
 	// Retrain the dictionary -> reseal every segment (now interned + recompressed).
-	if _, err := c.RetrainDict(n); err != nil {
-		t.Fatalf("RetrainDict: %v", err)
+	if _, retrainDictErr := c.RetrainDict(n); retrainDictErr != nil {
+		t.Fatalf("RetrainDict: %v", retrainDictErr)
 	}
 
 	assertInterned := func(tag string, col *Collection) {
@@ -90,8 +90,8 @@ func TestAppendOnlyInterning(t *testing.T) {
 
 	assertInterned("post-retrain", c)
 	verify("post-retrain", c)
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	c2, err := Open(Options{AppendOnly: true, Dir: dir, SegmentSize: 1 << 16, ValueAttrs: []string{"Ts"}})

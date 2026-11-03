@@ -110,8 +110,8 @@ func TestCountDistinctIgnoresUndefined(t *testing.T) {
 		"Owner = \"alice\"\nHost = \"b\"\n",
 		"Owner = \"alice\"\n", // no Host at all
 	} {
-		if err := a.AppendOld(text); err != nil {
-			t.Fatal(err)
+		if appendOldErr := a.AppendOld(text); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	rows, err := a.Aggregate("true", nil, []AggSpec{
@@ -167,8 +167,8 @@ func TestCountDistinctNumericIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, text := range []string{"N = 1\n", "N = 1\n", "N = 2\n", "N = 2.0\n"} {
-		if err := a.AppendOld(text); err != nil {
-			t.Fatal(err)
+		if appendOldErr := a.AppendOld(text); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	distinct, err := a.Aggregate("true", nil, []AggSpec{{Func: AggCountDistinct, Arg: "N"}})

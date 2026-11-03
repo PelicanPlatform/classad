@@ -21,11 +21,11 @@ func TestUpdateOldVisibleInQueryRawAndWatch(t *testing.T) {
 	}
 	defer func() { _ = d.Close() }()
 
-	if err := d.UpdateOld("a", `Name = "a"`+"\n"+`State = "Idle"`); err != nil {
-		t.Fatal(err)
+	if updateOldErr := d.UpdateOld("a", `Name = "a"`+"\n"+`State = "Idle"`); updateOldErr != nil {
+		t.Fatal(updateOldErr)
 	}
-	if err := d.UpdateOld("b", `Name = "b"`+"\n"+`State = "Busy"`); err != nil {
-		t.Fatal(err)
+	if updateOldErr := d.UpdateOld("b", `Name = "b"`+"\n"+`State = "Busy"`); updateOldErr != nil {
+		t.Fatal(updateOldErr)
 	}
 
 	// Query sees both.
@@ -91,11 +91,11 @@ func TestQueryRawInline(t *testing.T) {
 	}
 	defer func() { _ = d.Close() }()
 
-	if err := d.UpdateOld("a", "MyType = \"Machine\"\nName = \"slot1\"\nState = \"Idle\"\nCpus = 8"); err != nil {
-		t.Fatal(err)
+	if updateOldErr := d.UpdateOld("a", "MyType = \"Machine\"\nName = \"slot1\"\nState = \"Idle\"\nCpus = 8"); updateOldErr != nil {
+		t.Fatal(updateOldErr)
 	}
-	if err := d.UpdateOld("b", "MyType = \"Machine\"\nName = \"slot2\"\nState = \"Busy\""); err != nil {
-		t.Fatal(err)
+	if updateOldErr := d.UpdateOld("b", "MyType = \"Machine\"\nName = \"slot2\"\nState = \"Busy\""); updateOldErr != nil {
+		t.Fatal(updateOldErr)
 	}
 
 	// Match-all (ScanRaw path).
@@ -283,16 +283,16 @@ func TestQueryRawWireInMemoryTable(t *testing.T) {
 			"Requirements = Cpus > 2\nRank = -Cpus",
 	}
 	for k, text := range ads {
-		if err := d.UpdateOld(k, text); err != nil {
-			t.Fatal(err)
+		if updateOldErr := d.UpdateOld(k, text); updateOldErr != nil {
+			t.Fatal(updateOldErr)
 		}
 	}
 
 	collect := func(constraint string, proj []string, redact bool) map[string]map[string]string {
 		t.Helper()
-		seq, err := d.QueryRawWire(constraint, proj, redact)
-		if err != nil {
-			t.Fatalf("QueryRawWire: %v", err)
+		seq, qerr := d.QueryRawWire(constraint, proj, redact)
+		if qerr != nil {
+			t.Fatalf("QueryRawWire: %v", qerr)
 		}
 		out := map[string]map[string]string{}
 		var buf []byte
@@ -317,9 +317,9 @@ func TestQueryRawWireInMemoryTable(t *testing.T) {
 	}
 	collectText := func(constraint string, proj []string, redact bool) map[string]map[string]string {
 		t.Helper()
-		seq, err := d.QueryRawProjected(constraint, proj, redact)
-		if err != nil {
-			t.Fatalf("QueryRawProjected: %v", err)
+		seq, qerr := d.QueryRawProjected(constraint, proj, redact)
+		if qerr != nil {
+			t.Fatalf("QueryRawProjected: %v", qerr)
 		}
 		out := map[string]map[string]string{}
 		for ra := range seq {

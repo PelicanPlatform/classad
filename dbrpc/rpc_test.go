@@ -32,18 +32,18 @@ func TestRPCRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tx.NewClassAd(context.Background(), "1.0", "ProcId = 0\nClusterId = 1"); err != nil {
-		t.Fatal(err)
+	if newClassAdErr := tx.NewClassAd(context.Background(), "1.0", "ProcId = 0\nClusterId = 1"); newClassAdErr != nil {
+		t.Fatal(newClassAdErr)
 	}
-	if err := tx.SetAttribute(context.Background(), "1.0", "JobStatus", "1"); err != nil {
-		t.Fatal(err)
+	if setAttributeErr := tx.SetAttribute(context.Background(), "1.0", "JobStatus", "1"); setAttributeErr != nil {
+		t.Fatal(setAttributeErr)
 	}
 	// Read-your-writes over the wire.
-	if v, ok, err := tx.LookupAttr(context.Background(), "1.0", "JobStatus"); err != nil || !ok || v != "1" {
-		t.Fatalf("LookupAttr = %q,%v,%v want 1", v, ok, err)
+	if v, ok, lookupAttrErr := tx.LookupAttr(context.Background(), "1.0", "JobStatus"); lookupAttrErr != nil || !ok || v != "1" {
+		t.Fatalf("LookupAttr = %q,%v,%v want 1", v, ok, lookupAttrErr)
 	}
-	if err := tx.Commit(context.Background()); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(context.Background()); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	// New transaction sees the committed state.
@@ -152,8 +152,8 @@ func TestRPCOrdered(t *testing.T) {
 	_ = tx.NewClassAd(context.Background(), "1", "Owner = \"alice\"\nJobPrio = 5")
 	_ = tx.NewClassAd(context.Background(), "2", "Owner = \"alice\"\nJobPrio = 10")
 	_ = tx.NewClassAd(context.Background(), "3", "Owner = \"bob\"\nJobPrio = 1")
-	if err := tx.Commit(context.Background()); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(context.Background()); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	rows, err := c.Ordered(context.Background(), 0, "alice")

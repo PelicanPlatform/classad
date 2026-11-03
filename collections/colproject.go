@@ -437,19 +437,19 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 		if testBit(esc, idx) {
 			// An escaped cell with a precomputed literal: emit that, in place of the expression
 			// the record half was told to leave out.
-			if node, ok := sc.substNodeFor(idx); ok {
+			if node, haveSubst := sc.substNodeFor(idx); haveSubst {
 				outID := f.id
 				if sd != nil {
-					lid, ok := cn.localOf[f.id]
-					if !ok {
+					lid, haveLocal := cn.localOf[f.id]
+					if !haveLocal {
 						return nil, false
 					}
 					outID = lid
 				}
 				name := ""
 				if inline {
-					nm, ok := c.intern.Name(f.id)
-					if !ok {
+					nm, haveName := c.intern.Name(f.id)
+					if !haveName {
 						return nil, false
 					}
 					name = nm
@@ -468,16 +468,16 @@ func (c *Collection) projectFromColumns(cn *colNative, r recRef, k int, p *projP
 		}
 		outID := f.id
 		if sd != nil {
-			lid, ok := cn.localOf[f.id]
-			if !ok {
+			lid, haveLocal := cn.localOf[f.id]
+			if !haveLocal {
 				return nil, false
 			}
 			outID = lid
 		}
 		name := ""
 		if inline {
-			nm, ok := c.intern.Name(f.id)
-			if !ok {
+			nm, haveName := c.intern.Name(f.id)
+			if !haveName {
 				return nil, false
 			}
 			name = nm

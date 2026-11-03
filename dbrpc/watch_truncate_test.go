@@ -96,8 +96,8 @@ func TestWatchTableResetsOnAdminTruncate(t *testing.T) {
 		t.Fatalf("initial sync carried %d upserts, want 20", n)
 	}
 
-	if _, err := c.AdminTable(ctx, "jobs", "truncate"); err != nil {
-		t.Fatal(err)
+	if _, adminTableErr := c.AdminTable(ctx, "jobs", "truncate"); adminTableErr != nil {
+		t.Fatal(adminTableErr)
 	}
 	expectResyncThenEnd(t, events)
 
@@ -143,12 +143,12 @@ func TestArchiveWatchResetsOnAdminTruncate(t *testing.T) {
 		t.Fatalf("initial sync carried %d upserts, want 5", n)
 	}
 
-	if _, err := c.AdminTable(ctx, "history", "truncate"); err != nil {
-		t.Fatal(err)
+	if _, adminTableErr := c.AdminTable(ctx, "history", "truncate"); adminTableErr != nil {
+		t.Fatal(adminTableErr)
 	}
 	expectResyncThenEnd(t, events)
-	if err := c.ArchiveAppend(ctx, "history", "ClusterId = 99\nJobStatus = 4"); err != nil {
-		t.Fatal(err)
+	if archiveAppendErr := c.ArchiveAppend(ctx, "history", "ClusterId = 99\nJobStatus = 4"); archiveAppendErr != nil {
+		t.Fatal(archiveAppendErr)
 	}
 
 	events2, stop2, err := c.WatchTable(ctx, "history", cur)

@@ -27,9 +27,9 @@ func TestSealedSegmentsGoMmap(t *testing.T) {
 	src := map[int]bool{} // ids expected to match the probe query below
 	put := func(i int) {
 		mem := (i%16 + 1) * 512
-		if err := c.Put([]byte(fmt.Sprintf("m%d", i)),
-			mustAd(t, fmt.Sprintf(`[ Id=%d; Owner="u%d"; Memory=%d ]`, i, i%40, mem))); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("m%d", i)),
+			mustAd(t, fmt.Sprintf(`[ Id=%d; Owner="u%d"; Memory=%d ]`, i, i%40, mem))); putErr != nil {
+			t.Fatal(putErr)
 		}
 		src[i] = (i%40 == 3) && mem >= 4096
 	}
@@ -67,9 +67,9 @@ func TestSealedSegmentsGoMmap(t *testing.T) {
 	}
 
 	q := func() *vm.Query {
-		x, err := vm.Parse(`Owner == "u3" && Memory >= 4096`)
-		if err != nil {
-			t.Fatal(err)
+		x, qerr := vm.Parse(`Owner == "u3" && Memory >= 4096`)
+		if qerr != nil {
+			t.Fatal(qerr)
 		}
 		return x
 	}
@@ -97,8 +97,8 @@ func TestSealedSegmentsGoMmap(t *testing.T) {
 	if got := queryIDs(t, c, q()); !equalInts(got, want) {
 		t.Fatalf("after compaction: got %d ids, want %d", len(got), len(want))
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: sealed segments map their sidecars from disk (no CLIX, no full re-index).

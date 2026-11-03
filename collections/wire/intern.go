@@ -95,8 +95,8 @@ func (t *InternTable) Intern(name string) uint32 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	// Re-check byExact in case a concurrent Intern added it since the RUnlock.
-	if id, ok := t.byExact[name]; ok {
-		return id
+	if cached, found := t.byExact[name]; found {
+		return cached
 	}
 	id, ok = t.byFold[fold]
 	if !ok {

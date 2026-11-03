@@ -107,12 +107,12 @@ func TestCommitIdempotentDurableAcrossRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	c, _, cleanup := idemServer(t, d)
-	if err := commitOne(t, c, "k", "first", "unit-1"); err != nil {
-		t.Fatal(err)
+	if commitOneErr := commitOne(t, c, "k", "first", "unit-1"); commitOneErr != nil {
+		t.Fatal(commitOneErr)
 	}
 	cleanup()
-	if err := d.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := d.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Restart: reopen the same directory, replay unit-1 with different data.

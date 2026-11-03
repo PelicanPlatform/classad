@@ -126,17 +126,17 @@ func TestArchiveExactCaseMatch(t *testing.T) {
 	arches := []string{"X86_64", "x86_64", "aarch64"}
 	src := map[int]*classad.ClassAd{}
 	for i := 0; i < 300; i++ {
-		ad, err := classad.Parse(fmt.Sprintf(`[ ID=%d; Arch=%q ]`, i, arches[i%len(arches)]))
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.Parse(fmt.Sprintf(`[ ID=%d; Arch=%q ]`, i, arches[i%len(arches)]))
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 		src[i] = ad
 	}
-	if err := a.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := a.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	b, err := OpenArchive(ArchiveOptions{Dir: dir, CategoricalAttrs: []string{"Arch"}})
 	if err != nil {
@@ -180,17 +180,17 @@ func TestArchivePresenceMatch(t *testing.T) {
 		default:
 			text = fmt.Sprintf(`[ ID=%d; Owner=Base; Memory=%d ]`, i, (i%8+1)*512) // Owner undefined
 		}
-		ad, err := classad.Parse(text)
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.Parse(text)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 		src[i] = ad
 	}
-	if err := a.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := a.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	b, err := OpenArchive(ArchiveOptions{Dir: dir, CategoricalAttrs: []string{"Owner"}, ValueAttrs: []string{"Memory"}})
 	if err != nil {
@@ -358,8 +358,8 @@ func TestArchiveRotation(t *testing.T) {
 	}
 
 	// Reopen: rotation persisted.
-	if err := a.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := a.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	b, err := OpenArchive(ArchiveOptions{Dir: dir, CategoricalAttrs: []string{"Owner"}, Retention: Retention{MaxSegments: 2}})
 	if err != nil {
@@ -461,17 +461,17 @@ func TestArchiveHighCardinalityIndex(t *testing.T) {
 	}
 	src := map[int]*classad.ClassAd{}
 	for i := 0; i < 600; i++ {
-		ad, err := classad.Parse(fmt.Sprintf(`[ ID=%d; Seq=%d; GJID="job.%d.0" ]`, i, i*7, i))
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.Parse(fmt.Sprintf(`[ ID=%d; Seq=%d; GJID="job.%d.0" ]`, i, i*7, i))
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := a.Append(ad); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 		src[i] = ad
 	}
-	if err := a.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := a.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	b, err := OpenArchive(opts)
 	if err != nil {
@@ -526,8 +526,8 @@ func TestArchiveWatch(t *testing.T) {
 	}
 	defer a.Close()
 	for i := 0; i < 20; i++ {
-		if err := a.Append(mustAd(t, fmt.Sprintf(`[ ID=%d ]`, i))); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(mustAd(t, fmt.Sprintf(`[ ID=%d ]`, i))); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -572,8 +572,8 @@ func TestArchiveWatch(t *testing.T) {
 
 	// A cursor below the retained floor after rotation triggers a Reset.
 	for i := 20; i < 400; i++ {
-		if err := a.Append(mustAd(t, fmt.Sprintf(`[ ID=%d ]`, i))); err != nil {
-			t.Fatal(err)
+		if appendErr := a.Append(mustAd(t, fmt.Sprintf(`[ ID=%d ]`, i))); appendErr != nil {
+			t.Fatal(appendErr)
 		}
 	}
 	if dropped, _ := a.Rotate(0); dropped == 0 {

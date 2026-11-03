@@ -112,8 +112,8 @@ func TestSuggestIndexesPersistent(t *testing.T) {
 	}
 	populate(c)
 	check(c, "fresh persistent")
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: records are recovered from the sealed segments (still inline, no intern

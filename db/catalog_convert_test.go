@@ -31,17 +31,17 @@ func TestConvertTableToMemory(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, k := range []string{"1.0", "2.0", "3.0"} {
-		if err := d.Put(k, mustParseOld(t, `Owner = "alice"`)); err != nil {
-			t.Fatal(err)
+		if putErr := d.Put(k, mustParseOld(t, `Owner = "alice"`)); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	tableDir := filepath.Join(dir, tablesSubdir, "jobs")
-	if _, err := os.Stat(tableDir); err != nil {
-		t.Fatalf("persistent table dir missing before convert: %v", err)
+	if _, statErr := os.Stat(tableDir); statErr != nil {
+		t.Fatalf("persistent table dir missing before convert: %v", statErr)
 	}
 
-	if err := cat.ConvertTableToMemory("jobs"); err != nil {
-		t.Fatalf("ConvertTableToMemory: %v", err)
+	if convertTableToMemoryErr := cat.ConvertTableToMemory("jobs"); convertTableToMemoryErr != nil {
+		t.Fatalf("ConvertTableToMemory: %v", convertTableToMemoryErr)
 	}
 
 	// Data preserved, table now RAM-only, on-disk backing gone.
@@ -58,16 +58,16 @@ func TestConvertTableToMemory(t *testing.T) {
 	if _, ok := got.LookupClassAd("2.0"); !ok {
 		t.Fatal("key 2.0 missing after convert")
 	}
-	if _, err := os.Stat(tableDir); !os.IsNotExist(err) {
-		t.Fatalf("on-disk table dir still present after convert (err=%v)", err)
+	if _, statErr := os.Stat(tableDir); !os.IsNotExist(statErr) {
+		t.Fatalf("on-disk table dir still present after convert (statErr=%v)", statErr)
 	}
 
 	// Idempotent: converting again is a no-op.
-	if err := cat.ConvertTableToMemory("jobs"); err != nil {
-		t.Fatalf("second ConvertTableToMemory should be a no-op: %v", err)
+	if convertTableToMemoryErr := cat.ConvertTableToMemory("jobs"); convertTableToMemoryErr != nil {
+		t.Fatalf("second ConvertTableToMemory should be a no-op: %v", convertTableToMemoryErr)
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// After a restart the converted table is not recovered (it was RAM-only).

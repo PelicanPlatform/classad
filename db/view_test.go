@@ -198,11 +198,11 @@ func TestViewReloadRebuilds(t *testing.T) {
 	base, _ := cat.CreateTable("jobs")
 	base.Put("1", viewJob(t, "alice", 100))
 	base.Put("2", viewJob(t, "bob", 200))
-	if err := cat.CreateView("cluster_usage", clusterUsageSpec()); err != nil {
-		t.Fatal(err)
+	if createViewErr := cat.CreateView("cluster_usage", clusterUsageSpec()); createViewErr != nil {
+		t.Fatal(createViewErr)
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Reopen: the view definition is persisted; its data is rebuilt from the base table.

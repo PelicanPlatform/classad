@@ -274,8 +274,8 @@ func TestRepairSurvivesATotallyDestroyedSegment(t *testing.T) {
 	for i := range noise {
 		noise[i] = byte(i*31 + 7)
 	}
-	if _, err := f.WriteAt(noise, 0); err != nil {
-		t.Fatal(err)
+	if _, writeAtErr := f.WriteAt(noise, 0); writeAtErr != nil {
+		t.Fatal(writeAtErr)
 	}
 	f.Close()
 

@@ -84,12 +84,12 @@ func staleSegmentRederiveCase(t *testing.T, tune func(*Options)) {
 		t.Fatal(err)
 	}
 	for i := range orderAdCount {
-		ad, err := classad.Parse(orderAdText(i))
-		if err != nil {
-			t.Fatal(err)
+		ad, perr := classad.Parse(orderAdText(i))
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	c.RetrainDict(0)
@@ -102,8 +102,8 @@ func staleSegmentRederiveCase(t *testing.T, tune func(*Options)) {
 	if bad := checkOrderAds(t, c, "process A"); bad != 0 {
 		t.Fatalf("process A: %d mismatches", bad)
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// --- process B: adopt a re-derived schema that moves Z out of the int/4 group, and converge
@@ -133,8 +133,8 @@ func staleSegmentRederiveCase(t *testing.T, tune func(*Options)) {
 	if bad := checkOrderAds(t, c2, "process B"); bad != 0 {
 		t.Errorf("process B: %d mismatches", bad)
 	}
-	if err := c2.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c2.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// --- process C: the next restart. Every segment must still read its own values.

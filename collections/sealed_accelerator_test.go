@@ -63,10 +63,10 @@ func TestAcceleratorOverEncryptedStoresNoPlaintext(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 3000; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)),
 			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; JobStatus=%d; ClaimId=%q]`,
-				i, 1+i%5, secret))); err != nil {
-			t.Fatal(err)
+				i, 1+i%5, secret))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 
@@ -280,10 +280,10 @@ func TestColumnarNativeOverEncryptedStoresNoPlaintext(t *testing.T) {
 	}
 	const n = 3000
 	for i := 0; i < n; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k%d", i)),
+		if putErr := c.Put([]byte(fmt.Sprintf("k%d", i)),
 			mustAd(t, fmt.Sprintf(`[Owner="alice"; Cpus=%d; JobStatus=%d; ClaimId=%q]`,
-				i, 1+i%5, secret))); err != nil {
-			t.Fatal(err)
+				i, 1+i%5, secret))); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	if !c.BuildAndEnableSchemaScan(4000, 8) {

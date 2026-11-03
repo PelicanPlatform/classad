@@ -167,8 +167,8 @@ func TestQueryColumnsRefusesBeforeAnyBatch(t *testing.T) {
 		ad.InsertAttr("Idx", int64(i))
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if cerr := tx.Commit(); cerr != nil {
+		t.Fatal(cerr)
 	}
 
 	// No accelerator yet: refused, and refused with the sequence nil rather than empty.
@@ -257,8 +257,8 @@ func TestQueryColumnsRedactedWithholdsSealedValues(t *testing.T) {
 		ad.InsertAttrString("Secret", fmt.Sprintf("s3cret-%d", i%7))
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if cerr := tx.Commit(); cerr != nil {
+		t.Fatal(cerr)
 	}
 	if !d.EnableSchemaScan(4000, 8) {
 		t.Skip("no sealed segments to accelerate")

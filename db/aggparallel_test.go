@@ -293,8 +293,8 @@ func TestASmallPassDoesNotFanOut(t *testing.T) {
 		ad.InsertAttr("Cpus", int64(i%64))
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	if !d.EnableSchemaScan(4000, 8) {
 		t.Skip("no sealed segments to accelerate")
@@ -346,8 +346,8 @@ func TestSegmentPathCountersTellTheTwoPathsApart(t *testing.T) {
 			ad.InsertAttr("Cpus", int64(i%64))
 			tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 		}
-		if err := tx.Commit(); err != nil {
-			t.Fatal(err)
+		if commitErr := tx.Commit(); commitErr != nil {
+			t.Fatal(commitErr)
 		}
 		if !d.EnableSchemaScan(4000, 8) {
 			t.Skip("no sealed segments to accelerate")
@@ -425,14 +425,14 @@ func TestTheDefaultGateStillLetsARealPassFanOut(t *testing.T) {
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 		want += int64(i % 64)
 		if i%50000 == 49999 {
-			if err := tx.Commit(); err != nil {
-				t.Fatal(err)
+			if commitErr := tx.Commit(); commitErr != nil {
+				t.Fatal(commitErr)
 			}
 			tx = d.Begin()
 		}
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	if !d.EnableSchemaScan(4000, 8) {
 		t.Skip("no sealed segments to accelerate")

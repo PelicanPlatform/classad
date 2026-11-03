@@ -18,20 +18,20 @@ func internedArchive(t *testing.T, dir string) *Collection {
 		t.Fatal(err)
 	}
 	for i := range 3000 {
-		ad, err := classad.Parse(fmt.Sprintf(
+		ad, perr := classad.Parse(fmt.Sprintf(
 			`[ ClusterId=%d; Owner="user%d"; JobStatus=%d; Cmd="/bin/sleep" ]`, i, i%7, i%6))
-		if err != nil {
-			t.Fatal(err)
+		if perr != nil {
+			t.Fatal(perr)
 		}
-		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
-	if _, err := c.RetrainDict(1024); err != nil { // interns the sealed segments
-		t.Fatal(err)
+	if _, retrainDictErr := c.RetrainDict(1024); retrainDictErr != nil { // interns the sealed segments
+		t.Fatal(retrainDictErr)
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	c2, err := Open(Options{AppendOnly: true, Dir: dir, SegmentSize: 1 << 16})
 	if err != nil {

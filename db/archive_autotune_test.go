@@ -113,8 +113,8 @@ func TestArchiveAutoTunePersistsAcrossReopen(t *testing.T) {
 	if res := a.AutoTune(AutoTuneOptions{MinDemand: 5, Reindex: true}); !res.Changed {
 		t.Fatal("AutoTune made no change")
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	cat2, err := OpenCatalog(dir)
@@ -164,8 +164,8 @@ func autoIndexedArchive(t *testing.T, dir string) *ArchiveTable {
 	if res := a.AutoTune(AutoTuneOptions{MinDemand: 5, Reindex: true}); !res.Changed {
 		t.Fatal("setup: AutoTune added nothing")
 	}
-	if err := cat.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := cat.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 	cat2, err := OpenCatalog(dir)
 	if err != nil {

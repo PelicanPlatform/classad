@@ -24,8 +24,8 @@ func TestRPCQueryKeys(t *testing.T) {
 	_ = tx.NewClassAd(ctx, "0O.-1", `MyType = "Owner"`+"\n"+`State = "Idle"`)
 	_ = tx.NewClassAd(ctx, "0O.-2", `MyType = "Owner"`+"\n"+`State = "Idle"`)
 	_ = tx.NewClassAd(ctx, "1.0", `MyType = "Job"`+"\n"+`State = "Claimed"`)
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	got, err := c.QueryKeysTable(ctx, DefaultTable, `MyType == "Owner"`)
@@ -66,8 +66,8 @@ func TestRPCQueryKeysReadOnly(t *testing.T) {
 	}
 	tx := d.Begin()
 	tx.NewClassAd("k1", ad)
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	s := NewServer(d)

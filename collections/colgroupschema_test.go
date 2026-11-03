@@ -185,8 +185,8 @@ func TestGroupSchemasPersistAndDrift(t *testing.T) {
 		t.Fatal("no groups derived on a persistent collection (inline records not canonicalized?)")
 	}
 	c.GroupSchemas(4096, 4)
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	c2, err := Open(Options{Dir: dir, SegmentSize: 1 << 16})

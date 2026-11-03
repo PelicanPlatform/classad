@@ -129,8 +129,8 @@ func TestMigrateSealedAttrsResumesAfterInterruption(t *testing.T) {
 
 	// Simulate a crash before the marker landed: remove it and run again. Nothing is left to do, so the
 	// pass must be a no-op rather than a rewrite of everything.
-	if err := os.Remove(filepath.Join(dir, sealMigrationMarker)); err != nil {
-		t.Fatal(err)
+	if removeErr := os.Remove(filepath.Join(dir, sealMigrationMarker)); removeErr != nil {
+		t.Fatal(removeErr)
 	}
 	c2, err := Open(Options{Shards: 2, Dir: dir, SegmentSize: 1 << 16, DataKey: dataKey})
 	if err != nil {
@@ -203,14 +203,14 @@ func TestMigrateSealedAttrsKeepsLookupsWorking(t *testing.T) {
 
 	// A write after the migration has to land and be readable: the pass retires each shard's active
 	// segment, so the next write allocates a fresh one.
-	if err := c.Put([]byte("k-new"), mustAd(t, `[Owner="bob"; Cpus=1; ClaimId="new-capability"]`)); err != nil {
-		t.Fatal(err)
+	if putErr := c.Put([]byte("k-new"), mustAd(t, `[Owner="bob"; Cpus=1; ClaimId="new-capability"]`)); putErr != nil {
+		t.Fatal(putErr)
 	}
 	if _, ok := c.Get([]byte("k-new")); !ok {
 		t.Error("a key written after the migration is not readable")
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// And after a restart: a key sidecar left describing the pre-migration layout would reintroduce this

@@ -87,8 +87,8 @@ func TestCodecDensityReport(t *testing.T) {
 	// best-effort measurement rather than a failure.
 	train := New(Options{Shards: 4})
 	for i := 0; i < 3000; i++ {
-		if err := train.Put([]byte("t"+fmt.Sprint(i)), sample[i%len(sample)]); err != nil {
-			t.Fatal(err)
+		if putErr := train.Put([]byte("t"+fmt.Sprint(i)), sample[i%len(sample)]); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	dict, err := TrainDict(train.CollectSamples(3000))

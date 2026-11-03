@@ -150,8 +150,8 @@ func TestTimeTravelRecovery(t *testing.T) {
 	_ = c.Put([]byte("k"), mustAd(t, `[V=2]`))
 	set(25_000)
 	_ = c.Put([]byte("k"), mustAd(t, `[V=3]`))
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	c2, err := Open(opts)

@@ -101,15 +101,15 @@ func TestDemandDecaysAcrossDowntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	var p persistedDemand
-	if err := json.Unmarshal(data, &p); err != nil {
-		t.Fatal(err)
+	if unmarshalErr := json.Unmarshal(data, &p); unmarshalErr != nil {
+		t.Fatal(unmarshalErr)
 	}
 	p.SavedUnix = time.Now().Add(-3 * defaultDemandHalfLife).UnixNano()
 	if data, err = json.Marshal(p); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatal(err)
+	if writeFileErr := os.WriteFile(path, data, 0o644); writeFileErr != nil {
+		t.Fatal(writeFileErr)
 	}
 
 	c2, err := Open(Options{Dir: dir, SegmentSize: 1 << 16})
@@ -204,8 +204,8 @@ func TestDemandDecayDisabled(t *testing.T) {
 	}
 	for i := range 50 {
 		ad, _ := classad.Parse(fmt.Sprintf(`[ ClusterId=%d; Owner="user%d" ]`, i, i%7))
-		if err := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); err != nil {
-			t.Fatal(err)
+		if putErr := c.Put([]byte(fmt.Sprintf("%d.0", i)), ad); putErr != nil {
+			t.Fatal(putErr)
 		}
 	}
 	for range 16 {
@@ -217,8 +217,8 @@ func TestDemandDecayDisabled(t *testing.T) {
 	path := filepath.Join(dir, demandFile)
 	data, _ := os.ReadFile(path)
 	var p persistedDemand
-	if err := json.Unmarshal(data, &p); err != nil {
-		t.Fatal(err)
+	if unmarshalErr := json.Unmarshal(data, &p); unmarshalErr != nil {
+		t.Fatal(unmarshalErr)
 	}
 	p.SavedUnix = time.Now().Add(-10 * defaultDemandHalfLife).UnixNano()
 	data, _ = json.Marshal(p)

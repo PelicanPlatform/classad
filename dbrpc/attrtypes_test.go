@@ -161,8 +161,8 @@ func TestAttrTypeProfilesArchive(t *testing.T) {
 	defer func() { priv.Close(); unpriv.Close(); s.Close(); cat.Close() }()
 	ctx := context.Background()
 
-	if err := priv.CreateArchiveTable(ctx, "history", db.ArchiveConfig{ValueAttrs: []string{"ClusterId"}}); err != nil {
-		t.Fatal(err)
+	if createArchiveTableErr := priv.CreateArchiveTable(ctx, "history", db.ArchiveConfig{ValueAttrs: []string{"ClusterId"}}); createArchiveTableErr != nil {
+		t.Fatal(createArchiveTableErr)
 	}
 	for i := 0; i < 60; i++ {
 		// Scaled is written as an expression in every record, because an archive is where
@@ -174,8 +174,8 @@ func TestAttrTypeProfilesArchive(t *testing.T) {
 			// where ClassAd writes an integral float without a decimal point.
 			src = fmt.Sprintf("ClusterId = %d\nBytes = %d.5\nScaled = Bytes * 8\nClaimId = \"secret-%d\"", i, i, i)
 		}
-		if err := priv.ArchiveAppend(ctx, "history", src); err != nil {
-			t.Fatal(err)
+		if archiveAppendErr := priv.ArchiveAppend(ctx, "history", src); archiveAppendErr != nil {
+			t.Fatal(archiveAppendErr)
 		}
 	}
 
@@ -243,12 +243,12 @@ func TestAttrTypeProfilesEvaluatedTypesAnExpression(t *testing.T) {
 	}
 	for i := 0; i < 60; i++ {
 		src := fmt.Sprintf("Cpus = %d\nMem = Cpus * 1024\n", 1+i%4)
-		if err := tx.NewClassAd(ctx, fmt.Sprintf("k%d", i), src); err != nil {
-			t.Fatal(err)
+		if newClassAdErr := tx.NewClassAd(ctx, fmt.Sprintf("k%d", i), src); newClassAdErr != nil {
+			t.Fatal(newClassAdErr)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(ctx); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	stored, err := priv.AttrTypeProfiles(ctx, DefaultTable, 1000)
@@ -301,8 +301,8 @@ func TestAttrTypeProfilesEvaluatedWithholdsSealedValues(t *testing.T) {
 		}
 		tx.NewClassAd(fmt.Sprintf("%d.0", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	s := NewServer(d)

@@ -43,8 +43,8 @@ func BenchmarkArchiveOldRowFetch(b *testing.B) {
 		if perr != nil {
 			b.Fatal(perr)
 		}
-		if err := a.Append(ad); err != nil {
-			b.Fatal(err)
+		if appendErr := a.Append(ad); appendErr != nil {
+			b.Fatal(appendErr)
 		}
 	}
 	if !a.BuildAndEnableSchemaScan(5000, 32) {

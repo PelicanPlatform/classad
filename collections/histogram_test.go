@@ -96,8 +96,8 @@ func TestHistogramSurvivesReopen(t *testing.T) {
 	}
 	trueHigh := putSkewedMemory(c, 4000, 3000, 8)
 	c.Reindex() // seal + write v9 sidecars
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	d, err := Open(Options{Dir: dir, ValueAttrs: []string{"Memory"}, SegmentSize: 1 << 12})

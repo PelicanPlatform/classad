@@ -30,8 +30,8 @@ func TestAdminAnalyzeRefreshesHotSet(t *testing.T) {
 		}
 		tx.NewClassAd(fmt.Sprintf("k%d", i), ad)
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	// Build read demand on Memory: projected reads tally recordReads(projection).
@@ -91,8 +91,8 @@ func TestArchiveAdminAnalyze(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 100; i++ {
-		if err := a.AppendOld(fmt.Sprintf("Memory = %d", 1024+i)); err != nil {
-			t.Fatal(err)
+		if appendOldErr := a.AppendOld(fmt.Sprintf("Memory = %d", 1024+i)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	msg, err := archiveAdmin(a, "analyze", nil, db.MaintainOptions{})

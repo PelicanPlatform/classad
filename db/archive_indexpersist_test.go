@@ -28,10 +28,10 @@ func TestArchiveIndexConfigPersists(t *testing.T) {
 	}
 	const n = 200
 	for i := 0; i < n; i++ {
-		if err := hist.AppendOld(fmt.Sprintf(
+		if appendOldErr := hist.AppendOld(fmt.Sprintf(
 			"ClusterId = %d\nCompletionDate = %d\nOwner = %q", i, 1000+i, fmt.Sprintf("user%d", i%4),
-		)); err != nil {
-			t.Fatal(err)
+		)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 
@@ -102,10 +102,10 @@ func TestArchiveDropIndexPersists(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := 0; i < 50; i++ {
-		if err := hist.AppendOld(fmt.Sprintf(
+		if appendOldErr := hist.AppendOld(fmt.Sprintf(
 			"CompletionDate = %d\nOwner = %q\nAccountingGroup = \"grp\"", 1000+i, fmt.Sprintf("user%d", i%4),
-		)); err != nil {
-			t.Fatal(err)
+		)); appendOldErr != nil {
+			t.Fatal(appendOldErr)
 		}
 	}
 	if !hist.DropIndex("AccountingGroup") {

@@ -26,8 +26,8 @@ func TestRPCQueryRawPrivileged(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = tx.NewClassAd(context.Background(), "a", "MyType = \"Machine\"\nState = \"Idle\"\nCapability = \"secret-claim\"")
-	if err := tx.Commit(context.Background()); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(context.Background()); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	rows, err := c.QueryRaw(context.Background(), "true")
@@ -57,8 +57,8 @@ func TestRPCQueryRawStripsPrivate(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = tx.NewClassAd(context.Background(), "a", "MyType = \"Machine\"\nState = \"Idle\"\nCapability = \"secret-claim\"")
-	if err := tx.Commit(context.Background()); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(context.Background()); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 
 	rows, err := c.QueryRaw(context.Background(), "true")

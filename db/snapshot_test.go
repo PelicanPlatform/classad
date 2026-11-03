@@ -37,8 +37,8 @@ func TestSnapshotRestoreEncrypted(t *testing.T) {
 	fill(t, db, "job", n)
 
 	var snap bytes.Buffer
-	if err := db.Snapshot(&snap); err != nil {
-		t.Fatalf("Snapshot: %v", err)
+	if snapshotErr := db.Snapshot(&snap); snapshotErr != nil {
+		t.Fatalf("Snapshot: %v", snapshotErr)
 	}
 	// The snapshot must not contain a secret in the clear.
 	if bytes.Contains(snap.Bytes(), []byte("secret-job-0")) {
@@ -51,16 +51,16 @@ func TestSnapshotRestoreEncrypted(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		tx.DestroyClassAd(fmt.Sprintf("job%d", i))
 	}
-	if err := tx.Commit(); err != nil {
-		t.Fatal(err)
+	if commitErr := tx.Commit(); commitErr != nil {
+		t.Fatal(commitErr)
 	}
 	if db.Len() != n-100+50 {
 		t.Fatalf("pre-restore Len = %d, want %d", db.Len(), n-100+50)
 	}
 
 	// Restore returns to the exact snapshot state.
-	if err := db.Restore(bytes.NewReader(snap.Bytes())); err != nil {
-		t.Fatalf("Restore: %v", err)
+	if restoreErr := db.Restore(bytes.NewReader(snap.Bytes())); restoreErr != nil {
+		t.Fatalf("Restore: %v", restoreErr)
 	}
 	if db.Len() != n {
 		t.Fatalf("post-restore Len = %d, want %d", db.Len(), n)
@@ -103,8 +103,8 @@ func TestSnapshotCrossKeyPortable(t *testing.T) {
 	}
 	fill(t, src, "k", 40)
 	var snap bytes.Buffer
-	if err := src.Snapshot(&snap); err != nil {
-		t.Fatal(err)
+	if snapshotErr := src.Snapshot(&snap); snapshotErr != nil {
+		t.Fatal(snapshotErr)
 	}
 	src.Close()
 
@@ -113,8 +113,8 @@ func TestSnapshotCrossKeyPortable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := dst.Restore(bytes.NewReader(snap.Bytes())); err != nil {
-		t.Fatalf("cross-key restore with shared key: %v", err)
+	if restoreErr := dst.Restore(bytes.NewReader(snap.Bytes())); restoreErr != nil {
+		t.Fatalf("cross-key restore with shared key: %v", restoreErr)
 	}
 	if dst.Len() != 40 {
 		t.Fatalf("restored Len = %d, want 40", dst.Len())
@@ -153,8 +153,8 @@ func TestSnapshotBackupKeyEscrow(t *testing.T) {
 		t.Fatal("BackupKey returned nothing for an encrypted DB")
 	}
 	var snap bytes.Buffer
-	if err := src.Snapshot(&snap); err != nil {
-		t.Fatal(err)
+	if snapshotErr := src.Snapshot(&snap); snapshotErr != nil {
+		t.Fatal(snapshotErr)
 	}
 	src.Close()
 

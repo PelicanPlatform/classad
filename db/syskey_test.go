@@ -26,16 +26,16 @@ func TestSystemKeyHiddenFromClientButDurable(t *testing.T) {
 	if !IsSystemKey(sysKey) {
 		t.Fatalf("SystemKey did not produce a system key: %q", sysKey)
 	}
-	if err := d.Put(sysKey, mustAd(t, "Marker = 1\nState = \"Idle\"")); err != nil {
-		t.Fatal(err)
+	if putErr := d.Put(sysKey, mustAd(t, "Marker = 1\nState = \"Idle\"")); putErr != nil {
+		t.Fatal(putErr)
 	}
 
 	// Query(true) returns only the normal ads (never the system record), even though
 	// the system record's State matches the constraint.
 	{
-		seq, err := d.Query("true")
-		if err != nil {
-			t.Fatal(err)
+		seq, qerr := d.Query("true")
+		if qerr != nil {
+			t.Fatal(qerr)
 		}
 		count := 0
 		for ad := range seq {

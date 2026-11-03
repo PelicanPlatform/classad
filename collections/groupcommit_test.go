@@ -42,8 +42,8 @@ func TestGroupCommitCoalescesSyncs(t *testing.T) {
 	if passes >= n {
 		t.Errorf("no coalescing: %d msync passes for %d concurrent commits", passes, n)
 	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
+	if closeErr := c.Close(); closeErr != nil {
+		t.Fatal(closeErr)
 	}
 
 	// Durability: every acked commit must be present after reopen.
