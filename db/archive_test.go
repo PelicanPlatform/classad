@@ -177,10 +177,11 @@ func TestArchiveTableAggregate(t *testing.T) {
 	for _, r := range rows {
 		got[r.Group[0]] = [3]string{r.Values[0], r.Values[1], r.Values[2]}
 	}
+	// A group reads as the value it is, so a string group carries its quotes.
 	want := map[string][3]string{
-		"alice": {"3", "14", "8"},
-		"bob":   {"2", "20", "16"},
-		"carol": {"1", "1", "1"},
+		`"alice"`: {"3", "14", "8"},
+		`"bob"`:   {"2", "20", "16"},
+		`"carol"`: {"1", "1", "1"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("GROUP BY Owner produced %d groups, want %d: %+v", len(got), len(want), got)

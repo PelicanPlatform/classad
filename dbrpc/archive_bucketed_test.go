@@ -37,7 +37,7 @@ func TestArchiveAggregateBucketedOverRPC(t *testing.T) {
 			fmt.Sprintf("CompletionDate = %d\nOwner = %q", ts, o)); err != nil {
 			t.Fatalf("ArchiveAppend: %v", err)
 		}
-		want[fmt.Sprintf("%d|%s", ts/day*day, o)]++
+		want[fmt.Sprintf("%d|%s", ts/day*day, groupLabel(o))]++
 	}
 
 	groups := []GroupCol{{Attr: "Owner"}, {Attr: "CompletionDate", BucketWidth: day}}
@@ -137,7 +137,7 @@ func TestArchiveAggregateBucketedWithFilters(t *testing.T) {
 			t.Fatal(err)
 		}
 		if o == "alice" {
-			want[fmt.Sprintf("%d|%s", ts/day*day, o)]++
+			want[fmt.Sprintf("%d|%s", ts/day*day, groupLabel(o))]++
 		}
 	}
 
@@ -154,7 +154,7 @@ func TestArchiveAggregateBucketedWithFilters(t *testing.T) {
 			t.Fatalf("non-numeric count %q", r.Values[0])
 		}
 		key := r.Group[1] + "|" + r.Group[0]
-		if r.Group[0] == "alice" && want[key] != got {
+		if r.Group[0] == groupLabel("alice") && want[key] != got {
 			t.Errorf("%s = %d, want %d", key, got, want[key])
 		}
 		if r.Group[0] == "bob" && got != 0 {

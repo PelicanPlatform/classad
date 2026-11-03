@@ -181,8 +181,12 @@ func TestArchiveUnconstrainedGroupedCount(t *testing.T) {
 }
 
 // TestArchiveGroupedCountRealAndIntSameGroup pins the divergence the storage layer cannot see: it keys a
-// group by (bits, type), so an integer 3 and a real 3.0 are different keys, while the scan path keys by
-// rendered text and both render "3". Unmerged, the same label would appear on two rows.
+// group by (bits, type), so an integer 3 and a real 3.0 are different keys, while this layer decides they
+// are one number and one group. Unmerged, the same label would appear on two rows.
+//
+// That the two layers disagree is deliberate on both sides. (bits, type) is what storage can key cheaply
+// and it loses nothing by being finer; the merge belongs here, where the question is what a user means by
+// a group, and 1024 and 1024.0 are one memory size written two ways.
 func TestArchiveGroupedCountRealAndIntSameGroup(t *testing.T) {
 	cat, err := OpenCatalogConfig(CatalogConfig{Dir: t.TempDir()})
 	if err != nil {

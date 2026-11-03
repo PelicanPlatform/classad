@@ -204,7 +204,11 @@ func (f *aggFixture) scanTols(constraint string, groups []GroupCol, aggs []AggSp
 				}
 				scratch[i] = kt
 			} else {
-				scratch[i] = ValueText(vals[groupCol[i]])
+				// GroupValueText, so this map is keyed the way the engine keys its
+				// groups. Keyed any other way the lookup silently misses, every
+				// tolerance reads as zero, and a float average is compared exactly --
+				// which is a failure that looks like a grouping bug and is not.
+				scratch[i] = GroupValueText(vals[groupCol[i]])
 			}
 		}
 		if drop {

@@ -42,7 +42,7 @@ func ownerCount(kind JoinKind) JoinAggSpec {
 func TestJoinAggregateGroupsByADottedPath(t *testing.T) {
 	cat := joinFixture(t)
 	got, st := aggOf(t, cat, ownerCount(JoinInner))
-	want := []string{"alice=1", "bob=2"}
+	want := []string{`"alice"=1`, `"bob"=2`}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("rows = %v, want %v", got, want)
 	}
@@ -73,7 +73,10 @@ func TestJoinAggregateAgreesWithGroupingTheRowsByHand(t *testing.T) {
 			}
 			byHand := map[string]int{}
 			for row := range seq {
-				byHand[evalText(row, "j.Owner")]++
+				// GroupValueText, not evalText: this is reproducing the GROUPING, so it
+				// has to render a group the way the engine renders one. evalText prints a
+				// value for a message.
+				byHand[GroupValueText(groupValue(t, row, "j.Owner"))]++
 			}
 			if st.Err != nil {
 				t.Fatal(st.Err)
@@ -152,13 +155,14 @@ func TestJoinAggregateGroupsAsTheSingleTableAggregateDoes(t *testing.T) {
 			// Pinned so the agreement above cannot be two paths agreeing on nothing.
 			// Owner: "alice" and "Alice" are SEPARATE groups, although ClassAd's ==
 			// reports them equal -- a group key renders the value and two spellings are
-			// two values. That is the single-table engine's rule and the one thing a
+			// two values. They arrive quoted, which is what keeps a string out of the
+			// group of the number or boolean it spells. That is the single-table engine's rule and the one thing a
 			// join aggregate must not quietly decide differently, since the spelling it
 			// dropped is the one it would have to put in the output. Cpus: 4 and 4.0
 			// are ONE group, which is where a rendering could have disagreed with ==
 			// and does not.
 			pinned := map[string][]string{
-				"Owner": {"Alice=1", "alice=1", "bob=2"},
+				"Owner": {`"Alice"=1`, `"alice"=1`, `"bob"=2`},
 				"Cpus":  {"2=2", "4=2"},
 			}[c.tablePath]
 			if strings.Join(joined, " ") != strings.Join(pinned, " ") {
@@ -185,7 +189,7 @@ func TestJoinAggregateHandlesAnUndefinedArgument(t *testing.T) {
 	}
 	got, _ := aggOf(t, cat, spec)
 	// alice has two left rows: cluster 1 (exit 0) and cluster 3, which paired with nothing.
-	want := []string{"alice=2,1,0,0", "bob=2,2,8,7"}
+	want := []string{`"alice"=2,1,0,0`, `"bob"=2,2,8,7`}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("rows = %v, want %v", got, want)
 	}
@@ -208,7 +212,7 @@ func TestJoinAggregateFilterSeesTheJoinedRow(t *testing.T) {
 	}
 	got, _ := aggOf(t, cat, spec)
 	// A filter narrows its own aggregate, never the group: bob keeps its row with a 0.
-	want := []string{"alice=1,1,0", "bob=2,0,2"}
+	want := []string{`"alice"=1,1,0`, `"bob"=2,0,2`}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("rows = %v, want %v", got, want)
 	}
@@ -248,7 +252,7 @@ func TestJoinAggregateFilterOverAMissingSideExcludesTheRow(t *testing.T) {
 	}
 	got, _ := aggOf(t, cat, spec)
 	// alice's unmatched row has no h at all, so the filter is undefined for it and it is out.
-	want := []string{"alice=2,1", "bob=2,2"}
+	want := []string{`"alice"=2,1`, `"bob"=2,2`}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("rows = %v, want %v", got, want)
 	}
@@ -483,7 +487,7 @@ func TestJoinAggregateInternsAPathOnce(t *testing.T) {
 		t.Errorf("projected %v, want j.Owner and h.ExitCode once each", p.attrs)
 	}
 	got, _ := aggOf(t, cat, spec)
-	want := []string{"alice=1,0,0", "bob=2,7,1"}
+	want := []string{`"alice"=1,0,0`, `"bob"=2,7,1`}
 	if strings.Join(got, " ") != strings.Join(want, " ") {
 		t.Errorf("rows = %v, want %v", got, want)
 	}
@@ -513,4 +517,15 @@ func TestJoinAggregateFilterColumnDoesNotCollideWithAPath(t *testing.T) {
 	if strings.Join(got, " ") != "undefined=3,1" {
 		t.Errorf("rows = %v, want [undefined=3,1]", got)
 	}
+}
+
+// groupValue evaluates a dotted path over a joined row, for a test reproducing a grouping by
+// hand.
+func groupValue(t *testing.T, row *classad.ClassAd, path string) classad.Value {
+	t.Helper()
+	ex, err := classad.ParseExpr(path)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return ex.Eval(row)
 }

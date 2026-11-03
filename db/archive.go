@@ -841,6 +841,18 @@ func (t *ArchiveTable) numStatsRedacted(constraint, attr string) (NumStats, bool
 // Row order differs from the scan path's first-seen order: rows come back sorted by group
 // value (then bucket). GROUP BY without ORDER BY has no defined order either way, and
 // sorted is at least deterministic.
+// categoricalGroup renders an index-held value as the group it names.
+//
+// A categorical index is over STRING values and holds each one's exact spelling, so these
+// arrive as the strings they are and have to be rendered as such -- the same quoting every
+// other path gives them, which is what keeps a string out of the group of the number it
+// spells. This path builds its rows from index postings and never evaluates an ad, so it is
+// the one place a group is formed with no classad.Value in hand, and so the one place the
+// rendering has to be restated rather than reached through the value.
+func categoricalGroup(v string) string {
+	return GroupValueText(classad.NewStringValue(v))
+}
+
 func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCol, aggs []AggSpec) ([]AggRow, bool) {
 	if len(aggs) != 1 || aggs[0].Func != AggCount || aggs[0].Arg != "*" {
 		return nil, false
@@ -885,7 +897,7 @@ func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCo
 		rows := make([]AggRow, 0, len(vals))
 		for _, v := range vals {
 			rows = append(rows, AggRow{
-				Group:  []string{v},
+				Group:  []string{categoricalGroup(v)},
 				Values: []string{strconv.FormatInt(counts[v], 10)},
 			})
 		}
@@ -928,7 +940,7 @@ func (t *ArchiveTable) aggregateFromIndex(constraint string, groupCols []GroupCo
 			sort.Strings(vals)
 			for _, v := range vals {
 				group := make([]string, 2)
-				group[cat] = v
+				group[cat] = categoricalGroup(v)
 				group[bucket] = strconv.FormatInt(b, 10)
 				rows = append(rows, AggRow{
 					Group:  group,

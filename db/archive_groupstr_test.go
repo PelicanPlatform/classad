@@ -119,9 +119,15 @@ func TestArchiveGroupedStringColumn(t *testing.T) {
 	}
 }
 
-// TestArchiveGroupedStringColumnEdgeGroups pins the three groups that are easy to get wrong and that a
+// TestArchiveGroupedStringColumnEdgeGroups pins the groups that are easy to get wrong and that a
 // comparison of totals would not notice: the records with no Owner at all, the ones holding a number
-// where a string was expected, and the merge of the absent ones with the literal text "undefined".
+// where a string was expected, and the ones holding the literal text "undefined".
+//
+// That last pair used to be ONE group. Both rendered "undefined", so the scan merged them and the
+// columnar path had to as well -- two rows under one label is worse than a wrong partition, and the
+// comment here used to say so. They no longer render alike: a group reads as the value it is, so the
+// string arrives quoted and a record with no Owner is a different group from one whose Owner is the
+// word. That is the answer that was wanted all along; only the rendering stood in the way.
 func TestArchiveGroupedStringColumnEdgeGroups(t *testing.T) {
 	cat, a := groupStrFixture(t, 6000)
 	defer cat.Close()
@@ -133,8 +139,8 @@ func TestArchiveGroupedStringColumnEdgeGroups(t *testing.T) {
 	got := rowMap(t, rows)
 
 	// 6000 records: one in 97 has no Owner, and of the rest one in 89 holds the text "undefined".
-	// Both render "undefined", and the scan makes ONE group of them -- if the columnar path emitted
-	// two rows under one label, rowMap would already have failed on the duplicate.
+	// They are two groups, told apart by the quoting, and rowMap would fail on the duplicate if
+	// they were ever rendered alike again.
 	absent, literal, numeric := 0, 0, 0
 	for i := 0; i < 6000; i++ {
 		switch {
@@ -149,13 +155,18 @@ func TestArchiveGroupedStringColumnEdgeGroups(t *testing.T) {
 	if absent == 0 || literal == 0 || numeric == 0 {
 		t.Fatalf("fixture lost its edge cases: absent=%d literal=%d numeric=%d", absent, literal, numeric)
 	}
-	if got["undefined"] != strconv.Itoa(absent+literal) {
-		t.Errorf("group \"undefined\" counted %q, want %d (%d records with no Owner merged with %d "+
-			"holding the text)", got["undefined"], absent+literal, absent, literal)
+	if got["undefined"] != strconv.Itoa(absent) {
+		t.Errorf("group undefined counted %q, want %d (the records with no Owner at all)",
+			got["undefined"], absent)
 	}
-	// A number stored in a string column escapes the column; it still groups, under its own text.
+	if got[`"undefined"`] != strconv.Itoa(literal) {
+		t.Errorf("group %q counted %q, want %d (the records whose Owner IS the word)",
+			`"undefined"`, got[`"undefined"`], literal)
+	}
+	// A number stored in a string column escapes the column; it still groups, under its own text --
+	// and as the NUMBER it is, so it does not land in the group of the string "42".
 	if got["42"] != strconv.Itoa(numeric) {
-		t.Errorf("group \"42\" counted %q, want %d", got["42"], numeric)
+		t.Errorf("group 42 counted %q, want %d", got["42"], numeric)
 	}
 	// And the whole thing still partitions the table.
 	total := 0
