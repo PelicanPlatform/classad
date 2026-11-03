@@ -6,6 +6,7 @@ import (
 	"iter"
 	"math"
 	"math/bits"
+	"strings"
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
@@ -379,6 +380,7 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 	if s.queryStatsOn() {
 		stats = &collections.ScanStats{}
 	}
+	var colStats collections.ColumnScanStats
 	if qlog != nil {
 		defer func() {
 			q := QueryLog{Op: "QueryValues", Table: table, Constraint: constraint, Limit: limit,
@@ -386,6 +388,7 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 			if stats != nil {
 				q.Scan = *stats
 			}
+			q.Columns = colStats
 			qlog(q)
 		}()
 	}
@@ -444,6 +447,22 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 		write(enc.encode(respHead(reqID, stStream)))
 		enc.reset()
 	}
+
+	// THE COLUMN SOURCE, where the table can serve one. This op's reply is already a batch of
+	// typed columns; what it reads to fill them is a stream of RECORDS, each materialized from
+	// the columns it was stored in and then taken apart again. Reading the columns directly is
+	// about twenty times cheaper over the attributes a table's schema carries, and changes
+	// nothing a client sees -- the same values, packed the same way, in the same frames.
+	//
+	// ONLY FOR AN UNLIMITED READ. A column scan walks records block by block rather than as
+	// stored, which this op never promised to do either way -- but under a LIMIT the order
+	// decides WHICH rows come back, and silently returning a different subset is more than a
+	// reordering. A limited read also stops early, so it is the one case with nothing to win.
+	if limit <= 0 && columnSource(ref, constraint, attrs, redact, ctx, enc, flush, &n, &colStats) {
+		write(respHead(reqID, stStreamEnd))
+		return
+	}
+
 	for vals := range seq {
 		if cancelled(ctx) {
 			return
@@ -460,6 +479,77 @@ func (s *Server) streamQueryValues(ctx context.Context, reqID uint64, r *reader,
 	}
 	flush()
 	write(respHead(reqID, stStreamEnd))
+}
+
+// columnSource fills the encoder from the column relay, returning false -- having written
+// nothing -- when this table cannot serve one, so the caller falls through to the record scan.
+//
+// The decision is made before the first batch (see db.ErrColumnsUnsupported), which is what lets
+// this be a clean fall-through rather than a half-sent reply.
+func columnSource(ref tableRef, constraint string, attrs []string, redact bool, ctx context.Context,
+	enc *valueEncoder, flush func(), n *int, colStats *collections.ColumnScanStats) bool {
+	var seq iter.Seq[*collections.Batch]
+	var err error
+	switch ref.kind {
+	case kindTable, kindView:
+		seq, err = ref.db.QueryColumnsStats(constraint, attrs, redact, colStats)
+	case kindArchive:
+		seq, err = ref.arch.QueryColumnsStats(constraint, attrs, redact, colStats)
+	default:
+		return false
+	}
+	if err != nil {
+		return false
+	}
+	for b := range seq {
+		if cancelled(ctx) {
+			// Abandoning the stream without the end frame, exactly as the record path does:
+			// a truncated reply must not read as a complete one.
+			return true
+		}
+		for r := range b.N {
+			enc.appendBatch(b, r)
+			*n++
+			if enc.rows >= ValueBatchRows {
+				flush()
+			}
+		}
+	}
+	flush()
+	return true
+}
+
+// appendBatch appends row r of a column batch, boxing each cell as the encoder holds them.
+//
+// STRINGS ARE COPIED. The encoder holds its values until a flush that may be several batches
+// away, and a batch's string is an unsafe.String over the block's decompressed region rather than
+// a copy of it -- so retaining one pins that whole region until the batch is encoded and sent.
+//
+// It is a RETENTION fix rather than a correctness one, and worth saying so: a probe that retained
+// 20000 of them, under a block cache far too small to hold the table, read back every value
+// correctly. What it was holding to do that is the point.
+func (e *valueEncoder) appendBatch(b *collections.Batch, row int) {
+	for i := range e.cols {
+		v := classad.NewUndefinedValue()
+		if i < len(b.Cols) {
+			col := &b.Cols[i]
+			switch col.Kind[row] {
+			case collections.ValueInt:
+				v = classad.NewIntValue(col.Int(row))
+			case collections.ValueReal:
+				v = classad.NewRealValue(col.Float(row))
+			case collections.ValueBool:
+				v = classad.NewBoolValue(col.Bool(row))
+			case collections.ValueString:
+				v = classad.NewStringValue(strings.Clone(col.Text(row)))
+			case collections.ValueUndefined:
+			default:
+				v = classad.NewErrorValue()
+			}
+		}
+		e.cols[i] = append(e.cols[i], v)
+	}
+	e.rows++
 }
 
 // valueEncoder accumulates one batch column by column. Values are held as classad.Value until

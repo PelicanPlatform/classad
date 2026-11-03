@@ -680,6 +680,17 @@ func (c *Collection) newRowMatch(q *vm.Query, redact bool) *rowMatch {
 // match reports whether the record at off matches, and returns its wire bytes (valid until the next
 // call) for a caller that reads more from it. A record that cannot be read does not match.
 func (r *rowMatch) match(w segWindow, off uint32) ([]byte, bool) {
+	ww, ok := r.adAt(w, off)
+	if !ok {
+		return nil, false
+	}
+	return ww, matchWire(ww, r.qp)
+}
+
+// adAt materializes the record at off without evaluating anything, in the same buffer and under the
+// same entitlement match uses -- so a caller that has ALREADY decided a record matches can read its
+// bytes without deciding it again. Same lifetime: valid until the next call on this rowMatch.
+func (r *rowMatch) adAt(w segWindow, off uint32) ([]byte, bool) {
 	d := w.dict()
 	ww, err := r.c.wire(recRef{w: w, off: off, dict: d}, r.buf, r.qp.sealed)
 	if err != nil {
@@ -687,7 +698,7 @@ func (r *rowMatch) match(w segWindow, off uint32) ([]byte, bool) {
 	}
 	r.buf = ww
 	r.qp.ws.dict = d
-	return ww, matchWire(ww, r.qp)
+	return ww, true
 }
 
 // evalOneRecord evaluates the query against a single arena record (see rowMatch).

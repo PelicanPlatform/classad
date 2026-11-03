@@ -312,6 +312,16 @@ type QueryLog struct {
 	// no work.
 	Scan collections.ScanStats
 
+	// Columns is the work breakdown when the read was served from the table's COLUMNS rather
+	// than by materializing each record -- including how many cells came from a block's
+	// columns and how many still had to be read from the records themselves.
+	//
+	// Zero means the read was NOT served that way, which is the ordinary case for a table
+	// with no columnar accelerator, for a constraint the columns cannot evaluate, and for
+	// any read carrying a LIMIT. A caller wondering why a read is slow wants to know which
+	// of those it got, and nothing else in this log says.
+	Columns collections.ColumnScanStats
+
 	// User is the connection's authenticated identity (ServeOptions.Peer), or empty when
 	// the front end did not name one.
 	User string
