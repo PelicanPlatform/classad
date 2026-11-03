@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/PelicanPlatform/classad/classad"
+	"github.com/PelicanPlatform/classad/collections/vm"
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -48,14 +49,27 @@ type JoinRequest struct {
 // is the failure this reports. A caller that must not emit a partial result should not commit
 // to its output until Join returns nil.
 func (c *Client) Join(ctx context.Context, jr JoinRequest, yield func(row string) bool) error {
-	if !c.SupportsNewer(FeatJoin) {
+	o, feat := joinOpFor(jr, opJoin, opJoinChain, FeatJoin, FeatJoinChain)
+	if !c.SupportsNewer(feat) {
 		return ErrJoinUnsupported
 	}
-	err := c.streamEach(ctx, joinFrame(jr), yield)
+	err := c.streamEach(ctx, joinFrameOp(jr, o, false, false), yield)
 	if errors.Is(err, ErrBadRequest) {
 		return ErrJoinUnsupported
 	}
 	return err
+}
+
+// joinOpFor picks the opcode and the feature a plan needs, from the plan alone.
+//
+// A spec carrying steps is a chain and can only go to the chain opcode; anything else is the
+// two-table request that has always been sent, byte for byte. Deciding here rather than at
+// each call site is what keeps a caller from having to know there are two.
+func joinOpFor(jr JoinRequest, pair, chain op, pairFeat, chainFeat Feature) (op, Feature) {
+	if len(jr.Spec.Steps) > 0 {
+		return chain, chainFeat
+	}
+	return pair, pairFeat
 }
 
 // JoinRows is Join collected into a slice, for a caller small enough not to care.
@@ -64,8 +78,6 @@ func (c *Client) JoinRows(ctx context.Context, jr JoinRequest) ([]string, error)
 	err := c.Join(ctx, jr, func(row string) bool { out = append(out, row); return true })
 	return out, err
 }
-
-func joinFrame(jr JoinRequest) func(uint64) []byte { return joinFrameOp(jr, opJoin, false, false) }
 
 // joinFrameOp encodes a join request for either opcode. The plan is encoded ONCE here, so the
 // two ops cannot drift into two spellings of the same statement; opJoinWire's frame is this
@@ -78,12 +90,20 @@ func joinFrameOp(jr JoinRequest, o op, withRedact, redact bool) func(uint64) []b
 		b = putI32(b, int32(jr.Limits.MaxPairs))
 		b = putI32(b, int32(jr.Limits.MaxRows))
 		b = putJoinSide(b, jr.Spec.Left)
-		b = putJoinSide(b, jr.Spec.Right)
-		b = putStrs(b, jr.Spec.Cond)
-		b = putStrs(b, jr.Spec.Post)
-		b = putI32(b, int32(len(jr.Spec.Equi)))
-		for _, e := range jr.Spec.Equi {
-			b = putStr(putStr(b, e.Left), e.Right)
+		if joinOpCarriesChain(o) {
+			b = putStrs(b, jr.Spec.Post)
+			b = putI32(b, int32(len(jr.Spec.Steps)))
+			for _, st := range jr.Spec.Steps {
+				b = append(b, byte(st.Kind))
+				b = putJoinSide(b, st.Side)
+				b = putStrs(b, st.Cond)
+				b = putJoinEqui(b, st.Equi)
+			}
+		} else {
+			b = putJoinSide(b, jr.Spec.Right)
+			b = putStrs(b, jr.Spec.Cond)
+			b = putStrs(b, jr.Spec.Post)
+			b = putJoinEqui(b, jr.Spec.Equi)
 		}
 		if withRedact {
 			r := byte(0)
@@ -94,6 +114,14 @@ func joinFrameOp(jr JoinRequest, o op, withRedact, redact bool) func(uint64) []b
 		}
 		return b
 	}
+}
+
+func putJoinEqui(b []byte, eq []db.JoinEqui) []byte {
+	b = putI32(b, int32(len(eq)))
+	for _, e := range eq {
+		b = putStr(putStr(b, e.Left), e.Right)
+	}
+	return b
 }
 
 func putJoinSide(b []byte, s db.JoinSide) []byte {
@@ -131,9 +159,9 @@ func readJoinSide(r *reader) db.JoinSide {
 }
 
 // streamJoin serves opJoin.
-func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includePrivate, chain bool, write func([]byte), qlog func(QueryLog)) {
 	start := time.Now()
-	jr, ok := readJoinRequest(r)
+	jr, ok := readJoinRequest(r, chain)
 	if !ok {
 		write(respBad(reqID))
 		return
@@ -142,7 +170,7 @@ func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includ
 	var stats db.JoinStats
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: "Join", Table: jr.Spec.Left.Table + "," + jr.Spec.Right.Table,
+			qlog(QueryLog{Op: joinOpName("Join", chain), Table: joinTables(jr.Spec),
 				Constraint: joinLogConstraint(jr.Spec), Limit: jr.Spec.Limit,
 				Rows: stats.Rows, Duration: time.Since(start)})
 		}()
@@ -156,10 +184,13 @@ func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includ
 			return
 		}
 	}
+	if refusePrivateJoinRef(reqID, jr.Spec, includePrivate, write) {
+		return
+	}
 
 	jc, ok := s.cat.(joinCatalog)
-	if !ok {
-		write(respBad(reqID)) // this catalog serves no join; the client joins for itself
+	if !ok || (chain && !catalogJoinsChains(s.cat)) {
+		write(respBad(reqID)) // this catalog serves no such join; the client joins for itself
 		return
 	}
 	seq, err := jc.Join(jr.Spec, jr.Limits, &stats)
@@ -188,9 +219,9 @@ func (s *Server) streamJoin(ctx context.Context, reqID uint64, r *reader, includ
 //
 // A single over-budget row still gets its own frame, which is exactly opJoin's
 // one-frame-per-row behaviour -- so a jumbo joined row is never unshippable.
-func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, includePrivate bool, write func([]byte), qlog func(QueryLog)) {
+func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, includePrivate, chain bool, write func([]byte), qlog func(QueryLog)) {
 	start := time.Now()
-	jr, ok := readJoinRequest(r)
+	jr, ok := readJoinRequest(r, chain)
 	if !ok {
 		write(respBad(reqID))
 		return
@@ -207,7 +238,7 @@ func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, in
 	var stats db.JoinStats
 	if qlog != nil {
 		defer func() {
-			qlog(QueryLog{Op: "JoinWire", Table: jr.Spec.Left.Table + "," + jr.Spec.Right.Table,
+			qlog(QueryLog{Op: joinOpName("JoinWire", chain), Table: joinTables(jr.Spec),
 				Constraint: joinLogConstraint(jr.Spec), Limit: jr.Spec.Limit,
 				Rows: stats.Rows, Duration: time.Since(start)})
 		}()
@@ -217,9 +248,12 @@ func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, in
 			return
 		}
 	}
+	if refusePrivateJoinRef(reqID, jr.Spec, includePrivate, write) {
+		return
+	}
 	jc, ok := s.cat.(joinWireCatalog)
-	if !ok {
-		write(respBad(reqID)) // this catalog serves no wire join; the client takes the text one
+	if !ok || (chain && !catalogJoinsChains(s.cat)) {
+		write(respBad(reqID)) // this catalog serves no such join; the client takes the text one
 		return
 	}
 	seq, err := jc.JoinWire(jr.Spec, jr.Limits, redact, &stats)
@@ -278,9 +312,13 @@ func (s *Server) streamJoinWire(ctx context.Context, reqID uint64, r *reader, in
 	write(respHead(reqID, stStreamEnd))
 }
 
-// readJoinRequest decodes the plan both join opcodes carry. One decoder, so the two cannot
-// drift into reading the same bytes differently.
-func readJoinRequest(r *reader) (JoinRequest, bool) {
+// readJoinRequest decodes the plan every join opcode carries. ONE decoder, so no two of them
+// can drift into reading the same bytes differently, and it is the mirror of joinFrameOp --
+// the two share both the prefix and the test that picks the body.
+//
+// maxJoinChainSides bounds what one request may ask to be joined, because the step count is
+// read off the wire before anything is allocated for it.
+func readJoinRequest(r *reader, chain bool) (JoinRequest, bool) {
 	var jr JoinRequest
 	jr.Spec.Kind = db.JoinKind(r.u8())
 	jr.Spec.Limit = int(r.i32())
@@ -288,14 +326,70 @@ func readJoinRequest(r *reader) (JoinRequest, bool) {
 	jr.Limits.MaxPairs = int(r.i32())
 	jr.Limits.MaxRows = int(r.i32())
 	jr.Spec.Left = readJoinSide(r)
-	jr.Spec.Right = readJoinSide(r)
-	jr.Spec.Cond = readStrs(r)
+	if !chain {
+		jr.Spec.Right = readJoinSide(r)
+		jr.Spec.Cond = readStrs(r)
+		jr.Spec.Post = readStrs(r)
+		jr.Spec.Equi = readJoinEqui(r)
+		return jr, r.err == nil
+	}
+	// A chain's kind byte is written and ignored; the kinds that matter are per step.
+	jr.Spec.Kind = db.JoinInner
 	jr.Spec.Post = readStrs(r)
-	nEqui := int(r.i32())
-	for i := 0; i < nEqui; i++ {
-		jr.Spec.Equi = append(jr.Spec.Equi, db.JoinEqui{Left: r.str(), Right: r.str()})
+	nSteps := int(r.i32())
+	if r.err != nil || nSteps < 1 || nSteps > maxJoinChainSides-1 {
+		return jr, false
+	}
+	for i := 0; i < nSteps; i++ {
+		st := db.JoinStep{Kind: db.JoinKind(r.u8())}
+		st.Side = readJoinSide(r)
+		st.Cond = readStrs(r)
+		st.Equi = readJoinEqui(r)
+		jr.Spec.Steps = append(jr.Spec.Steps, st)
 	}
 	return jr, r.err == nil
+}
+
+// maxJoinChainSides caps the tables one request may join. It bounds an allocation made from a
+// count read off the wire, and it is generous: a chain past this is a query shape nobody
+// writes, and the pair budget would stop it long before the side count did.
+const maxJoinChainSides = 16
+
+func readJoinEqui(r *reader) []db.JoinEqui {
+	n := int(r.i32())
+	if n <= 0 {
+		return nil
+	}
+	out := make([]db.JoinEqui, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, db.JoinEqui{Left: r.str(), Right: r.str()})
+	}
+	return out
+}
+
+// joinOpName labels the query log, so a slow chain is not filed under the two-table op.
+func joinOpName(base string, chain bool) string {
+	if chain {
+		return base + "Chain"
+	}
+	return base
+}
+
+// joinChainCatalog is the optional capability to join MORE THAN TWO tables.
+//
+// It is a separate interface, and a marker method rather than a second Join, for the reason
+// FeatJoinWire has its own: the chain opcode must be advertised only by a catalog that can
+// really serve one. A catalog from a build whose join predates chains satisfies joinCatalog
+// perfectly well and would accept the request and then answer the wrong query -- a definite
+// yes that is wrong, which is the situation advertisement exists to prevent.
+type joinChainCatalog interface {
+	JoinsChains() bool
+}
+
+// catalogJoinsChains reports whether this server's catalog can join more than two tables.
+func catalogJoinsChains(cat any) bool {
+	jc, ok := cat.(joinChainCatalog)
+	return ok && jc.JoinsChains()
 }
 
 // joinCatalog is the optional Catalog capability to run a join. Optional for the same reason
@@ -314,19 +408,101 @@ func joinExprs(spec db.JoinSpec) []string {
 	for _, e := range spec.Equi {
 		out = append(out, e.Left, e.Right)
 	}
+	// Every step is an expression the server will evaluate too. Missing one here would let
+	// a private attribute through the gate by the simple expedient of putting it in a third
+	// table's constraint, which is exactly the hole this closes.
+	for _, st := range spec.Steps {
+		out = append(out, st.Side.Constraint)
+		out = append(out, st.Cond...)
+		for _, e := range st.Equi {
+			out = append(out, e.Left, e.Right)
+		}
+	}
 	return out
+}
+
+// joinAliases lists the aliases the plan's expressions may qualify a reference with.
+func joinAliases(spec db.JoinSpec) []string {
+	out := make([]string, 0, len(spec.Steps)+2)
+	out = append(out, spec.Left.Alias)
+	if spec.Right.Alias != "" {
+		out = append(out, spec.Right.Alias)
+	}
+	for _, st := range spec.Steps {
+		out = append(out, st.Side.Alias)
+	}
+	return out
+}
+
+// refusePrivateJoinRef refuses a join expression that reaches a private attribute THROUGH AN
+// ALIAS -- `h.ClaimId == "x"` -- which the ordinary constraint gate does not see.
+//
+// It does not see it because that gate walks the expression for attribute REFERENCES, and
+// `h.ClaimId` is a select whose member name is a plain string field on the node rather than a
+// reference of its own. So the name is never visited, and the check passes.
+//
+// What the hole is worth to a caller is an ORACLE, not a disclosure: the reply is still
+// redacted, so the value does not come back, but the caller chooses which rows come back
+// using it and can narrow a private attribute down by asking repeatedly. Nothing about the
+// answer looks wrong, which is why this needs a test of its own rather than a functional one.
+//
+// It covers the terms the alias compiler can account for in full. A term it delegates can
+// still reach a side in ways no list of names describes -- that residue is not closed here,
+// and closing it means refusing those terms outright for an unprivileged caller.
+func refusePrivateJoinRef(reqID uint64, spec db.JoinSpec, includePrivate bool, write func([]byte)) bool {
+	if includePrivate {
+		return false
+	}
+	aliases := joinAliases(spec)
+	for _, src := range joinExprs(spec) {
+		if strings.TrimSpace(src) == "" {
+			continue
+		}
+		q, err := vm.ParseAliases(src, aliases)
+		if err != nil || !q.AliasNative() {
+			continue
+		}
+		for _, r := range q.AliasRefs() {
+			if classad.IsPrivateAttribute(r.Name) {
+				write(respErr(reqID, "cannot reference private attribute "+r.Name+
+					" in a join condition"))
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// joinTables names every table the plan reads, for the query log.
+func joinTables(spec db.JoinSpec) string {
+	names := make([]string, 0, len(spec.Steps)+2)
+	names = append(names, spec.Left.Table)
+	if spec.Right.Table != "" {
+		names = append(names, spec.Right.Table)
+	}
+	for _, st := range spec.Steps {
+		names = append(names, st.Side.Table)
+	}
+	return strings.Join(names, ",")
 }
 
 // joinLogConstraint renders the plan's predicates for the query log, so a slow join is
 // identifiable by what it asked rather than only by which tables it touched.
 func joinLogConstraint(spec db.JoinSpec) string {
 	parts := make([]string, 0, 4)
-	for _, p := range [...]string{spec.Left.Constraint, spec.Right.Constraint} {
+	cons := []string{spec.Left.Constraint, spec.Right.Constraint}
+	for _, st := range spec.Steps {
+		cons = append(cons, st.Side.Constraint)
+	}
+	for _, p := range cons {
 		if p != "" {
 			parts = append(parts, p)
 		}
 	}
 	parts = append(parts, spec.Cond...)
+	for _, st := range spec.Steps {
+		parts = append(parts, st.Cond...)
+	}
 	parts = append(parts, spec.Post...)
 	return strings.Join(parts, " && ")
 }
@@ -360,10 +536,11 @@ type joinWireCatalog interface {
 // It returns ErrJoinWireUnsupported, before any row, when the stream is unavailable. An empty
 // stream means the join produced no rows; it never means the server could not answer.
 func (c *Client) JoinWire(ctx context.Context, jr JoinRequest, redact bool, yield func(row []byte) bool) error {
-	if !c.SupportsNewer(FeatJoinWire) {
+	o, feat := joinOpFor(jr, opJoinWire, opJoinChainWire, FeatJoinWire, FeatJoinChainWire)
+	if !c.SupportsNewer(feat) {
 		return ErrJoinWireUnsupported
 	}
-	_, ch, strm, err := c.callStream(joinFrameOp(jr, opJoinWire, true, redact))
+	_, ch, strm, err := c.callStream(joinFrameOp(jr, o, true, redact))
 	if err != nil {
 		return err
 	}

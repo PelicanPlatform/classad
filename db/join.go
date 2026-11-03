@@ -330,7 +330,15 @@ type joinStepPlan struct {
 	rowReadsOnlySide0 bool
 }
 
-// Join pairs two tables and streams the joined rows.
+// JoinsChains reports that this catalog's join accepts a chain of more than two tables.
+//
+// It is a capability marker, for a relay deciding whether to advertise the chain opcode. A
+// catalog from a build whose join predates chains satisfies the same join interface and would
+// accept a chain request and answer a different query, so "it has a Join method" is not the
+// question a relay needs answered.
+func (cat *Catalog) JoinsChains() bool { return true }
+
+// Join pairs two or more tables and streams the joined rows.
 //
 // Setup problems -- an unknown table, an expression that does not parse -- are returned
 // before any row. A limit met part way through is reported in stats.Err, because by then the
