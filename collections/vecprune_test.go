@@ -7,58 +7,74 @@ import (
 )
 
 // The zone-prunable probe analysis depends only on the query and the schema, and a scan visits one window
-// per SEGMENT -- 162 on a 60k-record table -- which all share a single schema object. Recomputing it per
-// window repeated identical work 161 times: 11% of a scan's time and 44% of its allocations, for an answer
-// that never changed.
+// per SEGMENT -- 162 on a 60k-record table -- so recomputing it per window repeated identical work 161
+// times: 11% of a scan's time and 44% of its allocations, for an answer that never changed.
 //
-// This holds that line for both scans. It counts the analyses rather than timing them, because the failure
-// mode is invisible: an un-hoisted analysis is still CORRECT, and only shows up as a query that got slower
-// on a table with many segments -- which is precisely why the cost went unnoticed until the scan was
-// attributed phase by phase.
+// This holds that line for both scans AND BOTH STORAGE BACKINGS, which is the part that was missing. The
+// cache is keyed on the schema OBJECT. An in-memory collection's sealed segments carry sidecar blocks that
+// point at the live committed schema, so they all share one object and the cache hits whatever else is
+// wrong; a persistent collection's segments are rewritten into columnar-native form, each carrying its own
+// copy of the schema inside its own payload. Measured before the collection canonicalized those copies, the
+// persistent table ran the analysis 226 times over 226 segments -- the hoist this test guards did not hold
+// on any real table, and the in-memory fixture it was written against could not say so.
+//
+// It counts the analyses rather than timing them, because the failure mode is invisible: an un-hoisted
+// analysis is still CORRECT, and only shows up as a query that got slower on a table with many segments --
+// which is precisely why the cost went unnoticed until the scan was attributed phase by phase.
 func TestZonePruneAnalyzedOncePerQuery(t *testing.T) {
-	c := scopeFixtureCodec(t, 60000)
-	defer c.Close()
-
-	segments := 0
-	for _, sh := range c.shards {
-		_, ws := sh.snapshot()
-		for _, w := range ws {
-			if seg := w.seg.colblk.Load(); seg != nil && seg.schema() != nil {
-				segments++
-			}
-		}
-		releaseWindows(ws)
-	}
-	if segments < 10 {
-		t.Fatalf("fixture has only %d columnar segments; with so few, a per-window analysis would cost "+
-			"nothing and this test would pass without testing anything", segments)
-	}
-
-	for _, tc := range []struct {
+	for _, backing := range []struct {
 		name string
-		run  func(*vm.Query)
+		open func(testing.TB, int) *Collection
 	}{
-		{"VectorEvalCount", func(q *vm.Query) { c.VectorEvalCount(q) }},
-		{"ColumnarEvalCount", func(q *vm.Query) { c.ColumnarEvalCount(q) }},
+		{"in-memory/sidecar", scopeFixtureCodec},
+		{"persistent/columnar-native", scopeFixturePersistentColumnar},
 	} {
-		for _, expr := range []string{
-			"RequestMemory > 4096",
-			"RequestMemory > 4096 && RequestCpus >= 4",
-			`Owner == "user3"`, // no prunable probe at all: must still analyze only once
-		} {
-			q, err := vm.Parse(expr)
-			if err != nil {
-				t.Fatal(err)
+		t.Run(backing.name, func(t *testing.T) {
+			c := backing.open(t, 60000)
+			defer c.Close()
+
+			segments := 0
+			for _, sh := range c.shards {
+				_, ws := sh.snapshot()
+				for _, w := range ws {
+					if seg := w.seg.colblk.Load(); seg != nil && seg.schema() != nil {
+						segments++
+					}
+				}
+				releaseWindows(ws)
 			}
-			tc.run(q) // warm any lazily built state
-			before := zonePruneAnalyses.Load()
-			tc.run(q)
-			got := zonePruneAnalyses.Load() - before
-			if got > 1 {
-				t.Errorf("%s(%q): analyzed the probes %d times across %d segments; it depends only on the "+
-					"query and the schema, so once is enough", tc.name, expr, got, segments)
+			if segments < 10 {
+				t.Fatalf("fixture has only %d columnar segments; with so few, a per-window analysis would cost "+
+					"nothing and this test would pass without testing anything", segments)
 			}
-		}
+
+			for _, tc := range []struct {
+				name string
+				run  func(*vm.Query)
+			}{
+				{"VectorEvalCount", func(q *vm.Query) { c.VectorEvalCount(q) }},
+				{"ColumnarEvalCount", func(q *vm.Query) { c.ColumnarEvalCount(q) }},
+			} {
+				for _, expr := range []string{
+					"RequestMemory > 4096",
+					"RequestMemory > 4096 && RequestCpus >= 4",
+					`Owner == "user3"`, // no prunable probe at all: must still analyze only once
+				} {
+					q, err := vm.Parse(expr)
+					if err != nil {
+						t.Fatal(err)
+					}
+					tc.run(q) // warm any lazily built state
+					before := zonePruneAnalyses.Load()
+					tc.run(q)
+					got := zonePruneAnalyses.Load() - before
+					if got > 1 {
+						t.Errorf("%s(%q): analyzed the probes %d times across %d segments; it depends only on the "+
+							"query and the schema, so once is enough", tc.name, expr, got, segments)
+					}
+				}
+			}
+		})
 	}
 }
 

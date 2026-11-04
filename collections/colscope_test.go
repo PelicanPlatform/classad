@@ -249,6 +249,58 @@ func scopeFixtureCodec(tb testing.TB, n int) *Collection {
 	return c
 }
 
+// scopeFixturePersistentColumnar is scopeFixtureCodec on a PERSISTENT collection, whose sealed
+// segments are rewritten into columnar-native form -- the shape every production table has and the
+// one an in-memory fixture cannot produce.
+//
+// The distinction is not cosmetic for anything that keys on a schema OBJECT. A sidecar block points
+// at the live committed schema, so an in-memory fixture's segments all share one; a columnarized
+// segment carries its schema inside its own payload and gets a fresh object per segment unless the
+// collection canonicalizes it (schemacanon.go). A measurement taken only on the in-memory fixture
+// therefore cannot see the difference between "once per query" and "once per segment".
+//
+// The budget is raised past anything the fixture can produce so ONE enable pass columnarizes every
+// sealed segment, rather than converging over several maintenance passes as production does.
+func scopeFixturePersistentColumnar(tb testing.TB, n int) *Collection {
+	tb.Helper()
+	cd, err := NewZSTDCodec(nil)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	c, err := Open(Options{Dir: tb.TempDir(), Shards: 1, SegmentSize: 1 << 16, Codec: cd,
+		ColumnarSegmentBudget: 1 << 20})
+	if err != nil {
+		tb.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		src := fmt.Sprintf("ClusterId = %d\nProcId = %d\nJobStatus = %d\nRequestMemory = %d\n"+
+			"RequestCpus = %d\nOwner = \"user%d\"\nCmd = \"/home/user%d/run.sh\"\nWantCheckpoint = %t\n"+
+			"Args = \"--input in%d.dat --output out%d.dat\"\nIwd = \"/scratch/user%d/run%d\"",
+			i, i%10, 1+i%5, 1024+(i%32)*512, 1+i%8, i%512, i%512, i%3 == 0, i, i, i%512, i)
+		if err := c.Put([]byte(fmt.Sprintf("k%d", i)), mustAdOld(tb, src)); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	for _, e := range []string{"ProcId >= 0", "JobStatus >= 0", "RequestMemory >= 0", "RequestCpus >= 0"} {
+		q, err := vm.Parse(e)
+		if err != nil {
+			tb.Fatal(err)
+		}
+		for i := 0; i < 20; i++ {
+			for range c.Query(q) {
+			}
+		}
+	}
+	if !c.BuildAndEnableSchemaScan(4000, 8) {
+		tb.Skip("no sealed segments")
+	}
+	if info := c.SchemaScanInfo(); info.ColumnarSegments == 0 {
+		tb.Fatalf("no sealed segment was columnarized (%d sealed, %d covered): this fixture would be "+
+			"the sidecar one under another name", info.SealedSegments, info.CoveredSegments)
+	}
+	return c
+}
+
 // BenchmarkColScopeCompressed is the production-shaped comparison: records ZSTD-compressed, so the
 // row path pays a decompress PER RECORD while colScope pays one per block region.
 func BenchmarkColScopeCompressed(b *testing.B) {

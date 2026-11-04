@@ -354,6 +354,13 @@ func (c *Collection) installSchemaScanLocked(s *adSchema, hot []int, reason stri
 		// scan and the colNative reconstruct read the SAME columnar blocks (keyed by process-unique
 		// block id), so two caches held largely the same decompressed blocks twice -- a needless
 		// ~256MiB on top of the per-collection cache. Sharing dedups them.
+		// The committed schema becomes the canonical object for its layout, so a segment loaded
+		// afterwards -- which carries its own copy of the schema inside its payload -- canonicalizes
+		// onto THIS object rather than onto some earlier equal one. See schemacanon.go.
+		c.adoptCanonSchema(s)
+		for _, g := range groups {
+			c.adoptCanonSchema(g.schema)
+		}
 		st = &schemaScanState{schema: s, hot: hot, cache: c.sharedColCache(), groups: groups}
 		c.schemaScan.Store(st)
 	}
@@ -615,6 +622,7 @@ func (c *Collection) adoptPersistedSchemaScan() {
 	// fallback for a store written before the schema was committed separately.
 	if s, hot, ok := c.loadCommittedBaseSchema(); ok {
 		c.baseCommitted.Store(true)
+		c.adoptCanonSchema(s) // see installSchemaScanLocked
 		c.schemaScan.Store(&schemaScanState{schema: s, hot: hot, cache: c.sharedColCache()})
 		return
 	}
@@ -647,6 +655,9 @@ func (c *Collection) adoptPersistedSchemaScan() {
 		return
 	}
 	// Share the collection's one columnar-block cache (see installSchemaScan) rather than a second.
+	// The seed is adopted as canonical too: it came from one segment, and the segments loaded after
+	// it describe the same schema and should share its object. See schemacanon.go.
+	schema = c.canonSchema(schema)
 	c.schemaScan.Store(&schemaScanState{schema: schema, hot: hot, cache: c.sharedColCache()})
 }
 
