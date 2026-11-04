@@ -3,8 +3,8 @@
 #
 # WHY SHARD AT ALL: every test in this module is `package collections` -- 360 test files, all of them
 # reaching into package internals -- so there is exactly ONE test binary, and `go test -p` (which
-# parallelizes across PACKAGES) has nothing to work with. The suite is ~55 minutes of CI-runner time
-# under -race, which no single job can fit under the 25m timeout. Sharding by test name across N jobs
+# parallelizes across PACKAGES) has nothing to work with. The suite is over an hour of CI-runner time
+# under -race, which no single job can fit under any sane timeout. Sharding by test name across N jobs
 # buys the cores a single runner does not have, without skipping the race detector or dropping a
 # single test.
 #
@@ -44,19 +44,30 @@
 # Refresh it when a shard warns that too many tests are unrecorded, or that it ran over budget. A shard
 # that FAILED contributes only the tests that finished, so refresh from a run where every shard is green.
 #
+# THE THREE ALARMS, and why they are separate. Each watches one thing and is expressed in the units of
+# the thing it watches, because the version of this script that mixed them up is how the suite drifted
+# into failing: its only alarm compared the packer's estimate, in inflated wall-seconds, against a
+# budget in real seconds, so it fired on every shard of every run and became something to scroll past.
+#   SHARD_STALE_PCT     -- share of tests the duration table does not know. Watches the TABLE.
+#   SHARD_WEIGHT_BUDGET -- recorded seconds each shard carries. Watches the SUITE's size against the
+#                          matrix, and is the one number here that does not move with runner speed.
+#   SHARD_BUDGET        -- real elapsed seconds. Watches a single RUN for a near miss on the timeout.
+# Only the last can be set off by an unlucky host, which is why it is the one set closest to failure.
+#
 # Usage: SHARD=<0-based index> SHARDS=<count> ./shard-test.sh [extra go test flags...]
 #        SHARD_LIST_ONLY=1 ... prints the partition and exits without running anything.
-#        SHARD_BUDGET=<seconds> overrides the elapsed-time budget the warning compares against.
-#        SHARD_STALE_PCT=<percent> overrides when the unrecorded-tests warning fires.
+#        SHARD_TIMEOUT, SHARD_WEIGHT_BUDGET, SHARD_BUDGET, SHARD_STALE_PCT override the four settings
+#        below; the defaults are what CI uses.
 #
 # A WARNING ABOUT READING THE ESTIMATE: `go test -v` reports a parallel test's WALL time, which
 # includes everything that overlapped it. In a suite that is 71% parallel the table therefore records
 # considerably more time than those tests cost -- measured across a full run, a shard's elapsed time
 # comes out at about 0.59x the sum of its recorded durations, plus ~90s of race-detector build. So an
 # estimate is a RELATIVE weight for packing, never a prediction of seconds. Only the elapsed time this
-# script prints at the end of a real run is in real seconds, and that is what SHARD_BUDGET compares
-# against. An earlier version compared the estimate against the budget too; being in the wrong units it
-# fired on every shard of every run, which is a large part of why nobody noticed the table going stale.
+# script prints at the end of a real run is in real seconds. Balancing the estimate is still the right
+# thing to do -- it is what keeps one shard from being handed four times another's work -- it just does
+# not promise that two equally weighted shards finish together, because what they finish in is mostly
+# down to the host.
 #
 # Bash 3.2 compatible (macOS ships 3.2): no mapfile, no associative arrays.
 set -euo pipefail
@@ -71,11 +82,21 @@ fi
 
 here=$(cd "$(dirname "$0")" && pwd)
 DURATIONS="$here/shard-durations.txt"
-# Per-shard budget in REAL elapsed seconds, covering the race-detector build and the tests. The go test
-# timeout below is 25m; this sits at 60% of it, so a shard that trips it still passes and still leaves
-# ten minutes of room before anything goes red. It is the early warning that the table needs refreshing
-# or the matrix needs another shard.
-SHARD_BUDGET="${SHARD_BUDGET:-900}"
+# Deadlock detection for the test binary: what turns a wedged test into a goroutine dump instead of a
+# job that runs until the runner is killed. It must clear the SLOWEST runner the pool can hand us, not
+# the typical one -- see the note where it is passed to go test.
+SHARD_TIMEOUT="${SHARD_TIMEOUT:-40m}"
+
+# GROWTH ALARM, in recorded seconds per shard. This is the one number here that does not move with
+# runner speed: it is just how much of the suite each shard has been given, so it answers "has the suite
+# outgrown this matrix" without being drowned out by which host a job landed on. 1000s per shard is the
+# size at which a shard runs about ten minutes on a typical runner, which is the shape worth holding.
+SHARD_WEIGHT_BUDGET="${SHARD_WEIGHT_BUDGET:-1000}"
+
+# NEAR-MISS ALARM, in real elapsed seconds: a run that got this close to SHARD_TIMEOUT still passed, but
+# only just, and the next one may not. 70% of the timeout.
+SHARD_BUDGET="${SHARD_BUDGET:-1680}"
+
 # Warn when this percentage of the listed tests has no recorded duration. Unrecorded tests are charged
 # the table's mean, which is a reasonable guess for a handful of them and a worse one for hundreds: past
 # this fraction the packing is guesswork and the table should be refreshed.
@@ -167,8 +188,16 @@ summary=$(printf '%s\n' "$assigned" | awk -v n="$SHARDS" '
 	END { for (i = 0; i < n; i++) printf "%d/%.0fs ", c[i], l[i] }
 ')
 estimate=$(printf '%s\n' "$assigned" | awk -v s="$SHARD" '$1 == s { l += $2 } END { printf "%.0f", l }')
+heaviest=$(printf '%s\n' "$assigned" | awk -v n="$SHARDS" '
+	{ l[$1] += $2 }
+	END { m = 0; for (i = 0; i < n; i++) if (l[i] > m) m = l[i]; printf "%.0f", m }
+')
 
 echo "shard $SHARD/$SHARDS: $count of $listed_total tests, ~${estimate}s recorded (tests/estimate per shard: $summary)"
+if [ "$heaviest" -gt "$SHARD_WEIGHT_BUDGET" ]; then
+	want=$(awk -v h="$heaviest" -v n="$SHARDS" -v b="$SHARD_WEIGHT_BUDGET" 'BEGIN { printf "%d", int(h * n / b) + 1 }')
+	warn "each shard carries ${heaviest}s of recorded test time, over the ${SHARD_WEIGHT_BUDGET}s per-shard budget: the suite needs about $want shards, there are $SHARDS. Add indices to the collections matrix in .github/workflows/test.yml"
+fi
 # The estimate is in inflated wall-seconds and is NOT compared against the budget; see the header. The
 # share of tests the table does not know is what tells you the packing has stopped being trustworthy.
 if [ "$unrecorded" -gt 0 ]; then
@@ -195,15 +224,24 @@ start=$SECONDS
 # -p 4 overlaps this module's four packages (collections, crypt, vm, wire); the small three finish while
 # the big one is still going.
 #
-# -timeout is deadlock detection, not a budget: it turns a wedged test into a goroutine dump instead of
-# a job that runs until the runner is killed. It stays at 25m. It was raised to 25m once already, when
-# the shards had grown to within a couple of minutes of it, and raising it again would restore exactly
-# that state: growth would keep arriving as a panic that reads like a hang, on whichever runner happened
-# to be slow that morning. SHARD_BUDGET above is what watches for growth now, and it warns while the run
-# is still green. Leaving the timeout where it is also keeps the real constraint in place -- the shards
-# have to stay short enough to fit under it.
+# -timeout is deadlock detection, not a budget. It has to clear the slowest runner the pool can hand us,
+# and that spread is LARGE: in run 41924017120 the six shards carried identical recorded weight (1748s
+# each) and finished in 752s, 796s, 1048s, 1071s, 1235s and one that hit the 25m timeout -- a 2x spread
+# with nothing to do with what each shard was asked to run. The fixed-size "Build and vet" step in those
+# same six jobs took 13s, 13s, 14s, 18s, 18s and 19s, in the same order, so it is the hosts, not the
+# partition. A timeout at twice the typical shard is therefore not slack at all; it is a coin flip.
+#
+# This is the second time it has been raised, and the reason it had to be is worth naming: it was the
+# only thing watching the suite's size, so it was set just above what the suite took and was overtaken
+# the moment the suite grew. That job now belongs to SHARD_WEIGHT_BUDGET, which measures how much of the
+# suite each shard carries and does not move with runner speed, so it says "add shards" on a green run
+# instead of waiting to fail one. With a real growth alarm in place the timeout is free to be sized for
+# what it is for, and 40m is about 3x the typical shard.
+#
+# It should come back down as the matrix grows: at twelve shards the typical shard is near seven minutes
+# and 25m is ample again.
 set +e
-go test -race -count=1 -timeout 25m -p 4 -v -run "$re" "$@" ./... >"$log" 2>&1
+go test -race -count=1 -timeout "$SHARD_TIMEOUT" -p 4 -v -run "$re" "$@" ./... >"$log" 2>&1
 rc=$?
 set -e
 elapsed=$((SECONDS - start))
@@ -228,6 +266,6 @@ echo "::endgroup::"
 
 echo "shard $SHARD/$SHARDS finished in ${elapsed}s (estimated ${estimate}s)"
 if [ "$rc" -eq 0 ] && [ "$elapsed" -gt "$SHARD_BUDGET" ]; then
-	warn "took ${elapsed}s, over the ${SHARD_BUDGET}s budget, leaving under $(( 1500 - elapsed ))s before the 25m timeout: add shards to the collections matrix in .github/workflows/test.yml, or refresh shard-durations.txt if many tests are unrecorded (see shard-test.sh)"
+	warn "took ${elapsed}s against a ${SHARD_TIMEOUT} timeout, past the ${SHARD_BUDGET}s near-miss mark: this run passed with little to spare. Add indices to the collections matrix in .github/workflows/test.yml (see shard-test.sh)"
 fi
 exit "$rc"
