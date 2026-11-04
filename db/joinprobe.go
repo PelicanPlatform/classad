@@ -300,14 +300,3 @@ func quoteClassAdString(s string) string {
 	b.WriteByte('"')
 	return b.String()
 }
-
-// adsSeq streams a materialized side.
-func adsSeq(ads []*classad.ClassAd) iter.Seq[*classad.ClassAd] {
-	return func(yield func(*classad.ClassAd) bool) {
-		for _, ad := range ads {
-			if !yield(ad) {
-				return
-			}
-		}
-	}
-}
