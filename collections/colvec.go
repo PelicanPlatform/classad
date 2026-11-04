@@ -320,6 +320,27 @@ func (s *blockVecSource) loadBool(idx int, f adField, id uint32, dst *vm.Vec) bo
 	return s.fixEscapes(idx, id, dst)
 }
 
+// escapeMissingHere reports whether the block's escape classification already PROVES record k's
+// escape of field idx is a missing attribute. A missing attribute is by definition not in the cold
+// tail, so the tail walk that would follow can only fail, and skipping it reaches the same element
+// state by the same path -- the caller's not-found branch, held value and all.
+//
+// It is worth asking because the walk it skips is not cheap and almost always fails: the tail is a
+// list of uvarint(id)+node entries scanned from the front, so proving an attribute ABSENT means
+// parsing every entry of the record's tail, and fetching that tail is a block-cache lookup per
+// element. Measured on the OSPool scan fixture, every escape of a numeric column was missing --
+// 776 lookups on the single-term constraint and 3104 on the seven-term chain, walking 8051 and
+// 98067 tail entries respectively to find nothing each time. The classification answers all of them
+// from two bits. That matches the ratio the classification was built on, where 95.7% of escaped
+// record x field pairs were missing rather than out-of-slot.
+//
+// A block that predates the classification, or a field that genuinely mixes the two, answers false
+// and takes the walk as before.
+func (b *columnarBlock) escapeMissingHere(idx, k int) bool {
+	missing, ok := b.escapeIsMissing(idx, k)
+	return ok && missing
+}
+
 // fixEscapes overwrites the elements whose value did not fit its slot. An escape means the value is
 // MISSING or UNSTORABLE: missing is UNDEFINED, and any scalar literal is read from the cold tail --
 // including one of the wrong type for the column, since a number where the schema expects a string is
@@ -340,7 +361,7 @@ func (s *blockVecSource) fixEscapes(idx int, id uint32, dst *vm.Vec) bool {
 		// A block columnarized before computed values moved into the column keeps them beside it.
 		node, found := s.blk.computedNode(k, idx, s.bc)
 		var err error
-		if !found {
+		if !found && !s.blk.escapeMissingHere(idx, k) {
 			node, found, err = s.blk.escapedNode(k, id, s.bc)
 		}
 		if err != nil {

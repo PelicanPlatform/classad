@@ -8,6 +8,26 @@ import (
 	"github.com/PelicanPlatform/classad/collections/vm"
 )
 
+// sealActiveSegments closes every shard's active segment, so everything written becomes sealed and
+// can be columnarized.
+//
+// WITHOUT THIS A SCAN BENCHMARK DOES NOT MEASURE THE COLUMNAR PATH. The active segment has no
+// columnar block, so its records go to rowEvalWindow and through the whole ClassAd evaluator -- a
+// path measured at roughly 88x the per-record cost of the vector one. On this fixture that tail is
+// ~600 records out of 20000, 3% of the rows and about three quarters of the CPU, which is enough to
+// hide any change to the vector executor entirely and to produce differences that look like
+// executor effects and are not. Two measurements were drawn and retracted before this was found.
+//
+// Production amortizes the tail over far more sealed data; a benchmark with twenty segments does
+// not, so it has to be made explicit here.
+func sealActiveSegments(c *Collection) {
+	for _, sh := range c.shards {
+		sh.mu.Lock()
+		sh.act = nil
+		sh.mu.Unlock()
+	}
+}
+
 // poolSampleFixture loads the committed real OSPool `condor_status -l` sample into a store with
 // sealed segments, which is the ad shape (~8.6 KB each) the production block width is set by.
 func poolSampleFixture(tb testing.TB) *Collection {
@@ -29,13 +49,38 @@ func poolSampleFixture(tb testing.TB) *Collection {
 	if err := c.Update(batch); err != nil {
 		tb.Fatal(err)
 	}
+	sealActiveSegments(c)
 	if !c.BuildAndEnableSchemaScan(2000, 8) {
 		tb.Skip("no schema derived from the pool sample")
 	}
 	if info := c.SchemaScanInfo(); info.CoveredSegments == 0 {
 		tb.Skipf("accelerator covers no sealed segment (%d sealed)", info.SealedSegments)
 	}
+	assertNoRowWindows(tb, c)
 	return c
+}
+
+// assertNoRowWindows fails if any window of this fixture still lacks a columnar block.
+//
+// It is the precondition every scan measurement here rests on, and it is asserted rather than
+// assumed because the failure is silent: a fixture with a row window still answers correctly, still
+// reports vecBlocks greater than zero, and still prints a plausible ns/op -- while spending most of
+// that time in a different executor. Nothing about the output looks wrong.
+func assertNoRowWindows(tb testing.TB, c *Collection) {
+	tb.Helper()
+	q, err := vm.Parse("true")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	c.VectorEvalCount(q)
+	sp := lastVecSplit.Load()
+	if sp == nil {
+		tb.Fatal("no scan split recorded; the fixture's path cannot be checked")
+	}
+	if sp.rowWindows != 0 {
+		tb.Fatalf("%d window(s) have no columnar block, so this fixture measures the row evaluator "+
+			"as much as the vector path", sp.rowWindows)
+	}
 }
 
 // widthPolicies sweeps the row group across the whole range the vector executor can be handed, from

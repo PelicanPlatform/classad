@@ -1448,6 +1448,45 @@ which is worse.
 
 ---
 
+**It happened anyway, to the benchmark fixture rather than to a kernel, and it cost two retracted
+measurements.**
+
+`poolSampleFixture` wrote twenty thousand ads and enabled the accelerator. What it did not do was
+close the **active segment**, which has no columnar block and therefore goes to `rowEvalWindow` and
+through the whole ClassAd evaluator (`colvec.go`, the `seg == nil` arm). On a simple constraint that
+tail was **624 records of 20000 -- 3% of the rows and about three quarters of the CPU**, which puts
+the row path at roughly **88x the per-record cost** of the vector one.
+
+Nothing about the output looked wrong. The scan answered correctly, `vecBlocks` was large,
+`scopeBlocks` was zero, and the ns/op was plausible. The counter that would have said so,
+`rowWindows`, was the one field of the split nobody printed.
+
+Two conclusions were drawn from it and both were wrong. A conjunction-ordering benchmark reported
+the string operand first running 1.6x faster and attributed it to dictionary encoding; on the sealed
+fixture the same comparison is **1.02x**, and the original effect was the row evaluator, where
+short-circuiting changes which attribute is looked up and lookup is a positional walk through the
+record. A uniform-state flag was reported as below the noise floor and *not worth building*; the
+truthful statement was that the harness could not see it, since the vector executor was about a
+quarter of what was being timed.
+
+`sealActiveSegments` now closes the tail and `assertNoRowWindows` fails the fixture if one ever
+returns. With the tail gone the same scan runs **0.59 ms against 1.76 ms**, and
+`BenchmarkVecScanBlockWidth` reports **29.7 ns/elem** where it used to report about 88 -- so **the
+recorded width figures in §6.8 item 10 predate this and should be re-taken** before being quoted
+again.
+
+**What the clean scan actually spends its time on is worth more than either retracted result.**
+`LoadColumn` is about 62% of it, and inside that the visible costs are `fixEscapes` and
+`escapedNode` -- repairing escaped values by walking the record's wire form in the cold tail, per
+escaped record, on every scan. The comparison kernel the two spikes were trying to improve is a
+small slice of the remainder: with the uniform fast path firing on 94% of `compareVecConst` calls,
+it is worth about 1%. **Escape repair is the cost centre on this shape, not arithmetic and not
+dispatch.**
+
+The rule this adds to §7.8: a fixture is part of the path, and **a benchmark has to assert its
+fixture takes the path it claims to measure**, not merely that the fast path exists.
+
+
 ## 8. What this is not
 
 - **Not a general-purpose language.** No modules or imports, no classes, no dict or set types, no
@@ -1835,13 +1874,47 @@ needs it.
    mostly form selection, since the load cost this item attacks is near zero on a raw numeric column
    and real only on a string one.
 
-   One concrete thing to build here, which arrived as a request from outside: **a `Vec` has nowhere
+   One concrete thing was proposed here, and arrived as a request from outside: **a `Vec` has nowhere
    to record that its column is uniformly typed**, and the storage layer already knows. `loadNum`
    writes one declared state across an escape-free column, and the `Raw` form carries no per-element
-   state at all. A consumer that could be told "every element of this column is an integer" rather
-   than having to scan for it gets the fact for free; today it has to rediscover it. The flag belongs
-   with form selection because it *is* a form distinction, and the rule that goes with it is the
-   ordinary one: any kernel that writes per-element states clears it.
+   state at all. A consumer told "every element of this column is an integer" would not have to
+   rediscover it. The rule that goes with it is the ordinary one: any kernel that writes per-element
+   states clears the flag.
+
+   **Spiked, and NOT recommended. Two findings, and the second is the reason.**
+
+   The place it would pay is real. `compareVecConst` serves `column OP literal`, the commonest shape
+   a constraint has, and it loads `St[i]` and runs a switch chain PER ELEMENT. And it is not a
+   corner: `RawColumnUseful` is `simdSupportsWidth`, which is false in any build without
+   `GOEXPERIMENT=simd`, so the ordinary build never takes the `Raw` path and every numeric column
+   arrives through the state-filling one.
+
+   **The invariant is harder to hold than "clear it in the kernels" suggests, and it leaked within
+   four test shapes.** A spike that set the flag in `loadNum` and cleared it in every kernel that
+   writes `St` still returned a wrong answer -- 19206 against a true 18642 on an arithmetic chain.
+   The audit that found it reported a vector tagged from an eight-record block being compared at
+   twenty-four elements: vectors are pooled and reused across blocks, so a scalar field survives
+   where the slice contents are replaced. Three separate paths have to agree for the flag to be
+   true, and one of them cannot be fixed where you would look for it -- **`SetInt` and `SetReal`
+   have VALUE receivers.** They mutate through the aliased slices, so a struct field assigned inside
+   them is written to a copy and lost. Any such flag must therefore be maintained at kernel
+   granularity rather than by the setters, which is also where it belongs for cost, but it means the
+   obvious place to put the discipline is the one place it cannot go.
+
+   **And the win does not pay for that.** The invariant-free alternative is to decide uniformity per
+   batch -- one pass over the state bytes before the kernel runs -- which is always correct and
+   needs no flag at all. Measured against the unmodified executor over the OSPool sample, with the
+   arms interleaved and eight rounds each, the two orders disagree in SIGN: 0.98x on the minimum and
+   1.07x on the median. The effect is below the noise floor of the machine available, and it cannot
+   be large in principle, because the batch is about sixteen records -- so the per-element switch
+   that the flag removes and the scan that the alternative adds are both tiny, and the flag's
+   advantage over the scan is smaller still.
+
+   **This is the third item in the same family to fail for the same reason**, after tiling (§6.8
+   item 10) and the deferred-load ranking (item 9): an optimization justified by removing
+   per-element work, where the batch is already too small for per-element work to be what costs.
+   Worth stating as a rule for this list -- at a sixteen-record block, an optimization has to remove
+   a PASS or a LOAD, not a branch.
 6. **`for` over a `Const` list, and `def` with inlining (§6.8.6-7).** Language completeness. Neither
    blocks the database use, and `for` over a *per-record* list stays declined (§2.3) until open
    question 4 gets its density argument.
