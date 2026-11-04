@@ -266,29 +266,26 @@ func TestAWasmTrapOnAWorkerFailsTheQueryAndNamesTheAggregate(t *testing.T) {
 	}
 }
 
-// TestADecliningWindowDeclinesTheWholeFanout, with the state in the guest.
+// declineTable builds the fixture both halves of TestADecliningWindowDeclinesTheWholeFanout
+// run on: a table whose aggregated column, Cpus, holds an expression in one record of every
+// segment. It returns the table and the sum of the column over every record, the expression
+// ones evaluated -- the answer the row path gives, and so the answer whatever serves the
+// query has to give.
 //
-// A worker meeting a window the pass cannot read must abort the WHOLE pass and
-// the fold must not run, so no caller can read a partial accumulator. The record
-// scan then answers the same query, and its answer is the one to compare against
-// -- a pass that dropped the unreadable window and let the others answer would
-// return a sum over a subset of the records as though it covered all of them.
+// budget is Config.ColumnarSegmentBudget, which is what picks the tier.
 //
-// An expression-valued cell in the aggregated column is the decline reachable
-// from data: the column has no numeric reading of it at all. There has to be one
-// in EVERY segment, not just the last: whether a single one provokes a decline
-// depends on whether its segment got a columnar schema, and a segment that did
-// not is served by a row fallback that evaluates the cell quite happily. A
-// fixture with one of them passes in isolation and, about one run in four,
-// reports a correct answer having never declined at all.
-func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
-	a, name := registerWasmAgg(t, "aggsum", "wasm_decline_sum", Options{})
-	const n = 20000
-	d, err := db.OpenConfig(db.Config{SegmentSize: 1 << 16, QueryParallelism: 0, AggMinBytes: testAggGate})
+// There has to be an expression in EVERY segment, not just the last. A segment the columnar
+// rewrite has not reached is served by its sidecar, so a fixture with a single one tests
+// whichever tier that one segment happened to land in -- it passes in isolation and, about
+// one run in four, reports a correct answer having exercised nothing it names.
+func declineTable(t *testing.T, n, budget int) (*db.DB, int64) {
+	t.Helper()
+	d, err := db.OpenConfig(db.Config{SegmentSize: 1 << 16, QueryParallelism: 0,
+		AggMinBytes: testAggGate, ColumnarSegmentBudget: budget})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer d.Close()
+	t.Cleanup(func() { d.Close() })
 	expr, err := classad.ParseExpr("JobStatus + 1")
 	if err != nil {
 		t.Fatal(err)
@@ -316,22 +313,97 @@ func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
 	if !d.EnableSchemaScan(4000, 8) {
 		t.Skip("no sealed segments to accelerate")
 	}
+	return d, want
+}
 
-	before := a.Stats()
+// sumWith runs the registered aggregate over one attribute and reports the answer with the
+// number of states the fold consumed.
+func sumWith(t *testing.T, d *db.DB, a *UDAF, name, attr string) (string, uint64) {
+	t.Helper()
+	before := a.Stats().Merges
 	rows, err := d.AggregateColsStats("true", nil,
-		[]db.AggSpec{{Func: db.AggUser, UserFunc: name, Arg: "Cpus"}}, nil, nil)
+		[]db.AggSpec{{Func: db.AggUser, UserFunc: name, Arg: attr}}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].Values[0] != fmt.Sprint(want) {
-		t.Fatalf("got %v, want %d -- a declined window must not be dropped from the answer", rows, want)
+	if len(rows) != 1 {
+		t.Fatalf("%d rows, want 1", len(rows))
 	}
-	// The scan serves it, so exactly one state exists and nothing is folded. A
-	// merge here would mean the declining pass had folded its partial states
-	// anyway, which is how a subset gets reported as a whole.
-	if merges := a.Stats().Merges - before.Merges; merges != 0 {
-		t.Fatalf("%d merges on a query the columnar pass declined; the fold must not run", merges)
-	}
+	return rows[0].Values[0], a.Stats().Merges - before
+}
+
+// TestADecliningWindowDeclinesTheWholeFanout, with the state in the guest.
+//
+// A worker meeting a window the pass cannot read must abort the WHOLE pass and
+// the fold must not run, so no caller can read a partial accumulator. The record
+// scan then answers the same query, and its answer is the one to compare against
+// -- a pass that dropped the unreadable window and let the others answer would
+// return a sum over a subset of the records as though it covered all of them.
+//
+// WHICH TIER THE DECLINE LIVES IN. An expression-valued cell in the aggregated
+// column is a decline reachable from data in one of the two columnar tiers, not
+// both. A SIDECAR block is built beside the records it describes and its columns
+// hold literals, so such a cell escapes into the block's cold tail and the
+// column has no numeric reading of it at all: the pass declines. A COLUMNARIZED
+// segment stores the value the expression evaluates to beside the column, so its
+// columns answer and there is nothing to decline.
+//
+// The fixture is in-memory, which used to settle that by accident -- an
+// in-memory table kept its sealed segments row-native, so it always got the
+// sidecar tier and never said so. It columnarizes now, so each tier is asked for
+// by name and gets the assertion that belongs to it: the decline where the
+// decline exists, and the row path's own answer where it does not. Both halves
+// must produce that answer, because which tier served the query is a storage
+// decision and no caller of an aggregate can see it.
+func TestADecliningWindowDeclinesTheWholeFanout(t *testing.T) {
+	const n = 20000
+
+	// SIDECAR TIER, deliberately: ColumnarSegmentBudget -1 keeps the sealed segments
+	// row-native with a columnar copy beside them, which is the tier whose columns cannot
+	// read an expression-valued cell.
+	t.Run("sidecar", func(t *testing.T) {
+		a, name := registerWasmAgg(t, "aggsum", "wasm_decline_sum", Options{})
+		d, want := declineTable(t, n, -1)
+
+		// Over JobStatus first -- same table, same query shape, a column with no
+		// expression in it. It shows the pass reaches the columnar rung here and folds
+		// when it gets there, so the zero below is this column's doing and not a fixture
+		// that never reached a worker at all.
+		if _, merges := sumWith(t, d, a, name, "JobStatus"); merges < 1 {
+			t.Fatal("the pass folded nothing over a plain column; this fixture never reached the rung, " +
+				"so a zero over the expression column proves nothing")
+		}
+
+		got, merges := sumWith(t, d, a, name, "Cpus")
+		if got != fmt.Sprint(want) {
+			t.Fatalf("got %v, want %d -- a declined window must not be dropped from the answer", got, want)
+		}
+		// The scan serves it, so exactly one state exists and nothing is folded. A
+		// merge here would mean the declining pass had folded its partial states
+		// anyway, which is how a subset gets reported as a whole.
+		if merges != 0 {
+			t.Fatalf("%d merges on a query the columnar pass declined; the fold must not run", merges)
+		}
+	})
+
+	// COLUMNAR-NATIVE TIER, the one an in-memory table now gets by default and the one every
+	// persistent table already had. The expression's value is in the column, so the pass is
+	// entitled to serve the query -- and the requirement that applies is not a refusal but
+	// the row path's answer, reached over the fan-out rather than around it.
+	t.Run("columnar-native", func(t *testing.T) {
+		a, name := registerWasmAgg(t, "aggsum", "wasm_computed_sum", Options{})
+		d, want := declineTable(t, n, 0)
+
+		got, merges := sumWith(t, d, a, name, "Cpus")
+		if merges < 1 {
+			t.Fatal("the pass folded nothing, so it declined or ran serially; this asserts the " +
+				"answer of a fan-out that did NOT decline, and there was none")
+		}
+		if got != fmt.Sprint(want) {
+			t.Fatalf("got %v, want %d -- a column holding an expression's value must sum to what "+
+				"the row path sums the expressions to", got, want)
+		}
+	})
 }
 
 func abs(f float64) float64 {

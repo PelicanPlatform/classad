@@ -171,6 +171,19 @@ type Config struct {
 	GroupMergeJaccard   float64
 	GroupMaxPartialFrac float64
 
+	// ColumnarSegmentBudget is how many sealed segments one maintenance pass may rewrite into
+	// COLUMNAR-NATIVE form -- every value the schema carries stored once, in the segment's own
+	// columnar payload, and removed from the records. 0 takes the default (64 per pass, so an
+	// existing table converges over several passes rather than stalling on one); a NEGATIVE value
+	// disables the rewrite, leaving every sealed segment whole-record with a columnar copy beside
+	// it in the sidecar. See collections.Options.ColumnarSegmentBudget for the measurement behind
+	// the default and for what the two forms cost.
+	//
+	// The two forms answer the same questions and differ in what the columns can read: a sidecar
+	// column holds literals only, while a columnarized one also holds the value an expression-valued
+	// cell evaluates to. A caller that needs one of them specifically has to say so.
+	ColumnarSegmentBudget int
+
 	// SealMigrationWorkers bounds the concurrent segment rewrites when an existing store is migrated
 	// to sealed private attributes at open (see collections.MigrateSealedAttrs). 0 takes a default
 	// derived from GOMAXPROCS.
@@ -244,6 +257,7 @@ func OpenConfig(cfg Config) (*DB, error) {
 		GroupStabilityRuns:      cfg.GroupStabilityRuns,
 		GroupMergeJaccard:       cfg.GroupMergeJaccard,
 		GroupMaxPartialFrac:     cfg.GroupMaxPartialFrac,
+		ColumnarSegmentBudget:   cfg.ColumnarSegmentBudget,
 		DeltaMax:                resolveDeltaMax(cfg.DeltaMax),
 		DisableReadVerification: cfg.DisableReadVerification,
 		Codec:                   chooseBaseCodec(cfg.Dir), // ZSTD by default for new stores
