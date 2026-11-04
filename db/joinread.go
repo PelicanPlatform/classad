@@ -92,7 +92,8 @@ func planJoinRead(spec JoinSpec) joinReadProjection {
 	// A term written over the joined row can read ANY side, so one declined term takes
 	// EVERY side's projection away: the term may have been reaching into any of them.
 	overRow := append([]string{}, spec.Post...)
-	for _, st := range steps {
+	for i := range steps {
+		st := &steps[i]
 		overRow = append(overRow, st.Cond...)
 	}
 	for _, src := range overRow {
@@ -114,7 +115,8 @@ func planJoinRead(spec JoinSpec) joinReadProjection {
 	// An equality's halves are NOT terms over the joined row, and the difference matters:
 	// each half reads a known part of it, so a half this cannot account for costs only
 	// what that half could have read rather than every side's projection.
-	for _, st := range steps {
+	for i := range steps {
+		st := &steps[i]
 		side := sideIndexOf(sides, st.Side.Alias)
 		for _, e := range st.Equi {
 			// The table half reads this step's own table, written against that table's ad.

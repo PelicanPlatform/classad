@@ -93,7 +93,8 @@ func joinFrameOp(jr JoinRequest, o op, withRedact, redact bool) func(uint64) []b
 		if joinOpCarriesChain(o) {
 			b = putStrs(b, jr.Spec.Post)
 			b = putI32(b, int32(len(jr.Spec.Steps)))
-			for _, st := range jr.Spec.Steps {
+			for i := range jr.Spec.Steps {
+				st := &jr.Spec.Steps[i]
 				b = append(b, byte(st.Kind))
 				b = putJoinSide(b, st.Side)
 				b = putStrs(b, st.Cond)
@@ -411,7 +412,8 @@ func joinExprs(spec db.JoinSpec) []string {
 	// Every step is an expression the server will evaluate too. Missing one here would let
 	// a private attribute through the gate by the simple expedient of putting it in a third
 	// table's constraint, which is exactly the hole this closes.
-	for _, st := range spec.Steps {
+	for i := range spec.Steps {
+		st := &spec.Steps[i]
 		out = append(out, st.Side.Constraint)
 		out = append(out, st.Cond...)
 		for _, e := range st.Equi {
@@ -428,7 +430,8 @@ func joinAliases(spec db.JoinSpec) []string {
 	if spec.Right.Alias != "" {
 		out = append(out, spec.Right.Alias)
 	}
-	for _, st := range spec.Steps {
+	for i := range spec.Steps {
+		st := &spec.Steps[i]
 		out = append(out, st.Side.Alias)
 	}
 	return out
@@ -480,7 +483,8 @@ func joinTables(spec db.JoinSpec) string {
 	if spec.Right.Table != "" {
 		names = append(names, spec.Right.Table)
 	}
-	for _, st := range spec.Steps {
+	for i := range spec.Steps {
+		st := &spec.Steps[i]
 		names = append(names, st.Side.Table)
 	}
 	return strings.Join(names, ",")
@@ -491,7 +495,8 @@ func joinTables(spec db.JoinSpec) string {
 func joinLogConstraint(spec db.JoinSpec) string {
 	parts := make([]string, 0, 4)
 	cons := []string{spec.Left.Constraint, spec.Right.Constraint}
-	for _, st := range spec.Steps {
+	for i := range spec.Steps {
+		st := &spec.Steps[i]
 		cons = append(cons, st.Side.Constraint)
 	}
 	for _, p := range cons {
@@ -500,7 +505,8 @@ func joinLogConstraint(spec db.JoinSpec) string {
 		}
 	}
 	parts = append(parts, spec.Cond...)
-	for _, st := range spec.Steps {
+	for i := range spec.Steps {
+		st := &spec.Steps[i]
 		parts = append(parts, st.Cond...)
 	}
 	parts = append(parts, spec.Post...)

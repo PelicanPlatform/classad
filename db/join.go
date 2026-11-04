@@ -275,7 +275,8 @@ func (s JoinSpec) chain() ([]JoinSide, []JoinStep, error) {
 	}
 	sides := make([]JoinSide, 0, len(s.Steps)+1)
 	sides = append(sides, s.Left)
-	for _, st := range s.Steps {
+	for i := range s.Steps {
+		st := &s.Steps[i]
 		sides = append(sides, st.Side)
 	}
 	return sides, s.Steps, nil
@@ -508,12 +509,13 @@ func compileJoin(spec JoinSpec, limits JoinLimits) (*joinPlan, error) {
 	}
 	// The residual WHERE is applied once, to the finished row, so every side is in scope
 	// for it and there is no forward reference to refuse.
-	if err := refuseUnscopedSides("WHERE", spec.Post, p.aliases, len(p.aliases)-1); err != nil {
-		return nil, err
+	if scopeErr := refuseUnscopedSides("WHERE", spec.Post, p.aliases, len(p.aliases)-1); scopeErr != nil {
+		return nil, scopeErr
 	}
 	p.postAlias = compileAliasedCond(spec.Post, p.aliases)
 
-	for i, st := range steps {
+	for i := range steps {
+		st := &steps[i]
 		sp := &joinStepPlan{kind: st.Kind, side: i + 1}
 		if sp.cond, err = compileAll("ON", st.Cond); err != nil {
 			return nil, err
@@ -627,7 +629,7 @@ func namesASide(src string, aliases []string) bool {
 // A term the alias compiler will not take is passed over rather than refused: it is evaluated
 // against a composite of the row, where a forward reference is undefined for the same reason
 // it is here, and refusing on a reference this could not see would refuse valid plans.
-func refuseUnscopedSides(what string, srcs []string, aliases []string, maxSide int) error {
+func refuseUnscopedSides(what string, srcs, aliases []string, maxSide int) error {
 	for _, src := range srcs {
 		if strings.TrimSpace(src) == "" {
 			continue

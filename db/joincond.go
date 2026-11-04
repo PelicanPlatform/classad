@@ -45,7 +45,7 @@ type aliasedCond struct {
 // The alias list is the whole chain, not the two sides visible to one step. A step's terms
 // cannot name a later side -- compileJoin refuses that before this is reached -- so the extra
 // aliases cost a longer compile-time table and nothing at evaluation.
-func compileAliasedCond(srcs []string, aliases []string) *aliasedCond {
+func compileAliasedCond(srcs, aliases []string) *aliasedCond {
 	if len(srcs) == 0 || forceCompositeCond {
 		return nil
 	}
