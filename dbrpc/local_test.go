@@ -14,20 +14,16 @@ import (
 
 func localPair(t *testing.T, includePrivate bool) (*LocalSession, *Client, func()) {
 	t.Helper()
-	// A COLUMNAR table, not an in-memory one: an in-memory table declines the column scan, both
-	// paths fall through to the record scan, and a comparison between them would be comparing
-	// the framed path with itself.
-	dir := t.TempDir()
-	cat, err := db.OpenCatalog(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	d, err := cat.CreateTable(DefaultTable)
+	// SMALL SEGMENTS, so the arena actually SEALS. At the default 8 MiB nothing seals on a
+	// fixture this size, every read is a record scan whatever its backing, and a comparison
+	// between the two paths is a comparison of the record path with itself. assertColumnar
+	// below holds the fixture to this rather than trusting it.
+	d, err := db.OpenConfig(db.Config{Dir: t.TempDir(), SegmentSize: 64 << 10})
 	if err != nil {
 		t.Fatal(err)
 	}
 	tx := d.Begin()
-	for i := 0; i < 2000; i++ {
+	for i := 0; i < 20000; i++ {
 		claim := privateSecret
 		if i%2 == 1 {
 			claim = fmt.Sprintf("other-%d", i)
@@ -40,14 +36,43 @@ func localPair(t *testing.T, includePrivate bool) (*LocalSession, *Client, func(
 		t.Fatal(err)
 	}
 	for i := 0; i < 8; i++ {
-		d.EnableSchemaScan(2000, 8)
+		d.EnableSchemaScan(4096, 8)
 	}
-	s := NewServerCatalog(cat)
+	assertColumnar(t, d)
+	s := NewServer(d)
 	opts := ServeOptions{ReadOnly: true, IncludePrivate: includePrivate}
 	cconn, sconn := netPipe()
 	go func() { _ = s.ServeConnOpts(sconn, opts) }()
 	c := NewClient(cconn, WithPeerSessionAttrs(ServerSessionAttrs()))
-	return s.LocalSession(opts), c, func() { c.Close(); s.Close(); cat.Close() }
+	return s.LocalSession(opts), c, func() { c.Close(); s.Close(); d.Close() }
+}
+
+// assertColumnar fails the FIXTURE, not the test, when a read of it would not take the column
+// path. A fixture that record-scans answers every question here correctly and proves nothing about
+// the path under test, and at the default segment size that is exactly what this one did.
+//
+// It asks about a SCHEMA'D attribute. A private attribute never gets a column -- ClaimId is absent
+// from the derived schema at any cardinality -- so the secret below is always read from the
+// record remnant, and asserting on it would assert the fixture is broken.
+func assertColumnar(t *testing.T, d *db.DB) {
+	t.Helper()
+	info := d.SchemaScanInfo()
+	if !info.Enabled || info.ColumnarSegments == 0 {
+		t.Fatalf("fixture has %d of %d sealed segments in columnar form (enabled=%v): nothing "+
+			"would be read from columns, so it cannot pose the question",
+			info.ColumnarSegments, info.SealedSegments, info.Enabled)
+	}
+	var st collections.ColumnScanStats
+	seq, err := d.QueryColumnsStats("true", []string{"Cpus"}, false, &st)
+	if err != nil {
+		t.Fatalf("fixture cannot serve a column scan: %v", err)
+	}
+	for range seq {
+	}
+	if st.ColumnCells <= st.RecordCells {
+		t.Fatalf("fixture read %d cells from columns and %d from records even for a schema'd "+
+			"attribute: it is record-scanning", st.ColumnCells, st.RecordCells)
+	}
 }
 
 // TestLocalSessionRefusesPrivateConstraints: the in-process reader is a NEW read op, and the gate's
@@ -96,6 +121,11 @@ func TestLocalSessionIsNotRefusedWhenPrivileged(t *testing.T) {
 // TestLocalSessionRedactsLikeTheWire: the same session options must produce the same VALUES through
 // both paths. Redaction is the other half of what IncludePrivate decides, and a reader that skipped
 // it would return the secret while the framed path returned undefined.
+//
+// The secret arrives through the RECORD remnant, not a column: a private attribute is absent from
+// the derived schema whatever its cardinality, so a columnar read of one always falls back. That is
+// the path worth covering here, because it is the only path a private attribute ever takes -- but
+// the fixture is columnar (assertColumnar) so the rest of the read is the path under test.
 func TestLocalSessionRedactsLikeTheWire(t *testing.T) {
 	for _, includePrivate := range []bool{false, true} {
 		t.Run(fmt.Sprintf("includePrivate=%v", includePrivate), func(t *testing.T) {
