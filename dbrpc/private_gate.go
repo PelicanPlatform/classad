@@ -1,6 +1,8 @@
 package dbrpc
 
 import (
+	"errors"
+
 	"github.com/PelicanPlatform/classad/db"
 )
 
@@ -29,18 +31,30 @@ import (
 // cannot see is a reference it cannot check. eval("ClaimId") IS seen -- the constant is checked as if it
 // had been written as a reference.
 func refusePrivateConstraint(reqID uint64, constraint string, includePrivate bool, write func([]byte)) bool {
-	if includePrivate {
-		return false
-	}
-	attr, dynamic := db.PrivateConstraintRef(constraint)
-	if attr != "" {
-		write(respErr(reqID, "cannot reference private attribute "+attr+" in a constraint"))
-		return true
-	}
-	if dynamic {
-		write(respErr(reqID, "cannot use a dynamic attribute reference in a constraint: "+
-			"its target cannot be checked against the private-attribute rules"))
+	if err := privateConstraintError(constraint, includePrivate); err != nil {
+		write(respErr(reqID, err.Error()))
 		return true
 	}
 	return false
+}
+
+// privateConstraintError IS the gate; refusePrivateConstraint is it plus an error frame.
+//
+// Split so the in-process reader applies the SAME rule rather than its own copy of it. An
+// authorization check with two implementations is two checks, and the second one is the one that
+// gets forgotten when the first is tightened -- which is how this one was reached in the first
+// place (the aggregate gate checked group columns and filters and never the WHERE clause).
+func privateConstraintError(constraint string, includePrivate bool) error {
+	if includePrivate {
+		return nil
+	}
+	attr, dynamic := db.PrivateConstraintRef(constraint)
+	if attr != "" {
+		return errors.New("cannot reference private attribute " + attr + " in a constraint")
+	}
+	if dynamic {
+		return errors.New("cannot use a dynamic attribute reference in a constraint: " +
+			"its target cannot be checked against the private-attribute rules")
+	}
+	return nil
 }
