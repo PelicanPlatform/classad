@@ -33,7 +33,7 @@ func localPair(t *testing.T, includePrivate bool) (*LocalSession, *Client, func(
 			claim = fmt.Sprintf("other-%d", i)
 		}
 		tx.NewClassAdOld(fmt.Sprintf("j%d", i), fmt.Sprintf(
-			"Cpus = %d\nJobStatus = %d\nOwner = \"u%d\"\nClaimId = \"%s\"\nCapability = \"cap-%d\"",
+			"Cpus = %d\nJobStatus = %d\nOwner = \"u%d\"\nClaimId = %q\nCapability = \"cap-%d\"",
 			i%8, i%5, i%16, claim, i))
 	}
 	if err := tx.Commit(); err != nil {
