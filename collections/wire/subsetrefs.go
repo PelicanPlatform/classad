@@ -39,7 +39,9 @@ func AppendAdSubsetInlineRefs(dst []byte, src Ad, keep func(name []byte, h uint3
 	if needed <= 0 || keep == nil || note == nil || pending == nil {
 		return AppendAdSubsetInline(dst, src, func(n, nd []byte) bool { return keep(n, NameHash32Bytes(n), nd) }, open)
 	}
-	c, ok := src.bodyStart()
+	var cBuf cursor
+	ok := src.bodyStartIn(&cBuf)
+	c := &cBuf
 	if !ok || !c.inline {
 		return dst, false
 	}

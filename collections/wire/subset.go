@@ -14,7 +14,9 @@ package wire
 // (its consumer renders linearly). Returns ok=false when src is not a
 // well-formed inline-names ad; keep=nil keeps every entry.
 func AppendAdSubsetInline(dst []byte, src Ad, keep func(name, node []byte) bool, open Sealer) ([]byte, bool) {
-	c, ok := src.bodyStart()
+	var cBuf cursor
+	ok := src.bodyStartIn(&cBuf)
+	c := &cBuf
 	if !ok || !c.inline {
 		return dst, false
 	}
@@ -109,7 +111,9 @@ func AppendAdSubsetInlineHotFirst(dst []byte, src Ad, keep func(name, node []byt
 	if needed <= 0 {
 		return AppendAdSubsetInline(dst, src, keep, open)
 	}
-	c, ok := src.bodyStart()
+	var cBuf cursor
+	ok := src.bodyStartIn(&cBuf)
+	c := &cBuf
 	if !ok || !c.inline {
 		return dst, false
 	}

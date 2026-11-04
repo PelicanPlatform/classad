@@ -51,7 +51,9 @@ import (
 // across goroutines.
 func AppendAdSubsetInlineFromInterned(dst []byte, src Ad, resolve func(uint32) (string, bool),
 	keep func(name, node []byte) bool, open Sealer, sc *SubsetScratch) ([]byte, bool) {
-	c, ok := src.bodyStart()
+	var cBuf cursor
+	ok := src.bodyStartIn(&cBuf)
+	c := &cBuf
 	if !ok {
 		return dst, false
 	}
@@ -99,7 +101,9 @@ func AppendAdInlineFromInternedResealed(dst []byte, src Ad, resolve func(uint32)
 // record needs, and the caller copies them unopened instead.
 func AppendAdInlineFromInternedResealedErr(dst []byte, src Ad, resolve func(uint32) (string, bool),
 	keep func(name, node []byte) bool, s Sealer, sc *SubsetScratch) (out []byte, resealed int, err error) {
-	c, ok := src.bodyStart()
+	var cBuf cursor
+	ok := src.bodyStartIn(&cBuf)
+	c := &cBuf
 	switch {
 	case !ok:
 		return dst, 0, fmt.Errorf("%w: unreadable ad header", ErrMalformed)
@@ -259,7 +263,9 @@ var (
 // Returns ok=false when src is malformed, standalone, already inline-names, or carries an id resolve
 // does not know -- the cases a keyed decode of src refuses too.
 func AppendInlineFromInternedUnopened(dst []byte, src Ad, resolve func(uint32) (string, bool)) ([]byte, bool) {
-	c, ok := src.bodyStart()
+	var cBuf cursor
+	ok := src.bodyStartIn(&cBuf)
+	c := &cBuf
 	if !ok || c.inline || resolve == nil || src[2]&flagStandalone != 0 {
 		return dst, false
 	}
