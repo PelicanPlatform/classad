@@ -85,15 +85,12 @@ func (s *VecScratch) loadShared(src ColumnSource, r refInfo, slot int32, nSlots 
 	for len(s.colCheap) < nSlots {
 		s.colCheap = append(s.colCheap, false)
 	}
-	v := s.colCache[slot]
-	if v == nil || v.n != s.n || cap(v.I) < s.n {
-		v = newVec(s.n)
-		s.colCache[slot] = v
-	}
-	v.n = s.n
-	v.I, v.S, v.St = v.I[:s.n], v.S[:s.n], v.St[:s.n]
-	v.Hi, v.Lo = v.Hi[:maskWords(s.n)], v.Lo[:maskWords(s.n)]
-	v.Mask, v.Const, v.Raw, v.Dict = false, false, nil, nil
+	// Through fitVec, the same reuse the stack makes in push(). This slot used to insist on an exact
+	// length match and so allocated six slices per cached column per block -- on the OSPool scan
+	// fixture that was 30% of the seven-term chain's scan spent in newVec, every call of it from
+	// here, in the structure that exists to do LESS work per block than loading the column twice.
+	v := fitVec(s.colCache[slot], s.n)
+	s.colCache[slot] = v
 	if !src.LoadColumn(r.name, r.scope, v) {
 		return nil, false
 	}
