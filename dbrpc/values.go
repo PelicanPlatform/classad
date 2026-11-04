@@ -570,6 +570,25 @@ func columnSource(ref tableRef, constraint string, attrs []string, redact bool, 
 	return true
 }
 
+// valueEncoder accumulates one batch column by column. Values are held as classad.Value until
+// the batch is complete, because a column's kind is a property of the whole batch: deciding it
+// from the first row would let one odd row at the front demote a column that is otherwise
+// uniform.
+type valueEncoder struct {
+	rows int
+	cols [][]classad.Value
+	// dict says the client asked for dictionary string columns (valueFlagDict).
+	dict bool
+	// owned maps an owned string to itself, so a repeated value is copied ONCE per scan
+	// rather than once per cell.
+	//
+	// Keyed by the OWNED copy, never by the borrowed one. A map retains its keys, so
+	// interning under the borrowed string would pin the very block the copy exists to
+	// release. A lookup with a borrowed string is fine: it hashes and compares without
+	// retaining.
+	owned map[string]string
+}
+
 // appendBatch appends row r of a column batch, boxing each cell as the encoder holds them.
 //
 // STRINGS ARE COPIED. The encoder holds its values until a flush that may be several batches
@@ -601,25 +620,6 @@ func (e *valueEncoder) appendBatch(b *collections.Batch, row int) {
 		e.cols[i] = append(e.cols[i], v)
 	}
 	e.rows++
-}
-
-// valueEncoder accumulates one batch column by column. Values are held as classad.Value until
-// the batch is complete, because a column's kind is a property of the whole batch: deciding it
-// from the first row would let one odd row at the front demote a column that is otherwise
-// uniform.
-type valueEncoder struct {
-	rows int
-	cols [][]classad.Value
-	// dict says the client asked for dictionary string columns (valueFlagDict).
-	dict bool
-	// owned maps an owned string to itself, so a repeated value is copied ONCE per scan
-	// rather than once per cell.
-	//
-	// Keyed by the OWNED copy, never by the borrowed one. A map retains its keys, so
-	// interning under the borrowed string would pin the very block the copy exists to
-	// release. A lookup with a borrowed string is fine: it hashes and compares without
-	// retaining.
-	owned map[string]string
 }
 
 // ownedStringCap bounds the intern table. A column whose values are nearly all distinct -- a
@@ -827,8 +827,8 @@ func buildStringDict(vals []classad.Value) ([]int32, []string) {
 		if v.Type() != classad.StringValue {
 			continue // an exception; it ships in the exception list either way
 		}
-		str, _ := v.StringValue()
-		plain += len(str) + 2 // the string plus its length prefix, near enough
+		str, _ := v.StringValue() //nolint:errcheck // the guard above established the type
+		plain += len(str) + 2     // the string plus its length prefix, near enough
 		c, ok := index[str]
 		if !ok {
 			c = int32(len(dict))

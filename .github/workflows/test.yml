@@ -74,8 +74,8 @@ jobs:
       uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
       with:
         files: ./coverage.out
-        flags: unittests
-        name: codecov-umbrella
+        flags: root
+        name: codecov-root
         fail_ci_if_error: false
         token: ${{ secrets.CODECOV_TOKEN }}
 
@@ -147,12 +147,23 @@ jobs:
     # sized to a few thousand ads. The script prints its shard sizes and refuses to run a
     # partition that would drop or duplicate a test. SHARDS comes from the matrix size, so
     # the shard list above is the only place the count is written down.
+    # shard-test.sh forwards its arguments to `go test`, so the profile comes out per
+    # shard; Codecov merges the uploads that carry the same flag.
     - name: Test (race detector)
       working-directory: collections
       env:
         SHARD: ${{ matrix.shard }}
         SHARDS: ${{ strategy.job-total }}
-      run: ./shard-test.sh
+      run: ./shard-test.sh -coverprofile=coverage.out
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        files: ./collections/coverage.out
+        flags: collections
+        name: codecov-collections-${{ matrix.shard }}
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   # A single check that stays green/red for the whole sharded suite, so a required status
   # check (and anyone reading the PR) has one "Collections module" result to look at rather
@@ -349,7 +360,19 @@ jobs:
     # job here and should be sharded the way collections/shard-test.sh does it once it grows again.
     - name: Test (race detector)
       working-directory: ${{ matrix.module }}
-      run: go test -race -count=1 -timeout 25m ./...
+      run: go test -race -count=1 -timeout 25m -coverprofile=coverage.out ./...
+
+    # Without this Codecov described the ROOT module and nothing else, so every number
+    # on a PR touching db, changefeed or wasmudf was about code the PR did not change.
+    # The flag keeps each module's coverage its own.
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        files: ./${{ matrix.module }}/coverage.out
+        flags: ${{ matrix.module }}
+        name: codecov-${{ matrix.module }}
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   # dbrpc/ is a separate Go module, and the root module's `go test ./...` does not
   # descend into a nested one -- so the RPC server for the whole database ran in NO CI
@@ -412,12 +435,23 @@ jobs:
         go build ./...
         go vet ./...
 
+    # As for collections: the script forwards its arguments to `go test`, and Codecov
+    # merges the per-shard uploads under one flag.
     - name: Test (race detector)
       working-directory: dbrpc
       env:
         SHARD: ${{ matrix.shard }}
         SHARDS: 3
-      run: ./shard-test.sh
+      run: ./shard-test.sh -coverprofile=coverage.out
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      with:
+        files: ./dbrpc/coverage.out
+        flags: dbrpc
+        name: codecov-dbrpc-${{ matrix.shard }}
+        fail_ci_if_error: false
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   # One check for the whole sharded suite, so a required status check (and anyone reading
   # the PR) has a single "dbrpc module" result rather than three. Without it, adding or
@@ -437,9 +471,20 @@ jobs:
         # failure here, because a suite that did not run is not a suite that passed.
         [ "$RESULT" = "success" ] || exit 1
 
+  # One lint job PER MODULE. golangci-lint enters the module it is run in, and
+  # changefeed, collections, db, dbrpc and wasmudf are each a module of their own that
+  # `./...` from the root does not reach -- so for as long as this job ran only at the
+  # root, those five were linted nowhere, by anyone. They were clean by accident or not
+  # at all; the backlog the first run found was 400-plus real findings, including two
+  # silent-data-loss bugs. The matrix is what stops that coming back.
   lint:
-    name: Lint
+    name: Lint (${{ matrix.module }})
     runs-on: ubuntu-latest
+    strategy:
+      # Every module reports: one failing must not hide a failure in another.
+      fail-fast: false
+      matrix:
+        module: ['.', changefeed, collections, db, dbrpc, wasmudf]
 
     steps:
     - name: Check out code
@@ -474,9 +519,11 @@ jobs:
         goyacc -o parser/y.go -p yy parser/classad.y
 
     - name: Run go vet
+      working-directory: ${{ matrix.module }}
       run: go vet ./...
 
     - name: Run go fmt
+      working-directory: ${{ matrix.module }}
       run: |
         if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
           echo "Go code is not formatted:"
@@ -484,8 +531,30 @@ jobs:
           exit 1
         fi
 
+    # The config lives at the repository root and is shared: golangci-lint walks up from
+    # the working directory to find it, and the exclusion paths in it are written
+    # relative to the root, so they match whichever module this entry is.
     - name: Run golangci-lint
       uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
       with:
         version: latest
         skip-cache: true
+        working-directory: ${{ matrix.module }}
+
+  # One check for the whole matrix, keeping the name this job has always reported under
+  # ("Lint") now that the job itself reports once per module. Without it, splitting the
+  # job would silently retire the status check anything required.
+  lint-result:
+    name: Lint
+    needs: lint
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check module results
+      env:
+        RESULT: ${{ needs.lint.result }}
+      run: |
+        echo "modules: $RESULT"
+        # 'success' only when every module succeeded; skipped/cancelled count as failure,
+        # because a module that was not linted is not a module that linted clean.
+        [ "$RESULT" = "success" ] || exit 1
