@@ -29,7 +29,7 @@ func localPair(t *testing.T, includePrivate bool) (*LocalSession, *Client, func(
 			claim = fmt.Sprintf("other-%d", i)
 		}
 		tx.NewClassAdOld(fmt.Sprintf("j%d", i), fmt.Sprintf(
-			"Cpus = %d\nJobStatus = %d\nOwner = \"u%d\"\nClaimId = \"%s\"\nCapability = \"cap-%d\"",
+			"Cpus = %d\nJobStatus = %d\nOwner = \"u%d\"\nClaimId = %q\nCapability = \"cap-%d\"",
 			i%8, i%5, i%16, claim, i))
 	}
 	if err := tx.Commit(); err != nil {
@@ -292,5 +292,60 @@ func TestLocalSessionContainsAPanic(t *testing.T) {
 	}
 	if rows == 0 {
 		t.Fatal("the next read returned nothing")
+	}
+}
+
+// TestLocalSessionFallsThroughWhenColumnsAreUnavailable: a table that cannot serve a column scan
+// must say so BEFORE yielding anything, so the caller can take the framed path and get the same
+// answer. A reader that instead returned an empty result, or a partial one, would turn "this
+// table is not columnar" into "this table has no rows".
+func TestLocalSessionFallsThroughWhenColumnsAreUnavailable(t *testing.T) {
+	// No EnableSchemaScan: the accelerator is off, so there are no columns to read. Same for a
+	// table whose rows are all still in the open segment.
+	d, err := db.Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	tx := d.Begin()
+	tx.NewClassAdOld("j1", "Cpus = 4\nJobStatus = 2")
+	if cerr := tx.Commit(); cerr != nil {
+		t.Fatal(cerr)
+	}
+	s := NewServer(d)
+	defer s.Close()
+	ls := s.LocalSession(ServeOptions{ReadOnly: true, IncludePrivate: true})
+
+	yielded := 0
+	err = ls.ScanColumns(context.Background(), DefaultTable, "true", []string{"Cpus"}, false,
+		func(b *collections.Batch) bool { yielded++; return true })
+	if !errors.Is(err, ErrLocalUnsupported) {
+		t.Fatalf("got %v, want ErrLocalUnsupported so the caller falls back", err)
+	}
+	if yielded != 0 {
+		t.Fatalf("yielded %d batches before declining: a fall-through must happen before any "+
+			"rows reach the caller, or the caller cannot retry on the framed path", yielded)
+	}
+}
+
+// TestLocalSessionRejectsAnEmptyProjection pins the one argument check: a column scan with no
+// attributes has nothing to read, and the framed op refuses it too.
+func TestLocalSessionRejectsAnEmptyProjection(t *testing.T) {
+	ls, _, cleanup := localPair(t, true)
+	defer cleanup()
+	if err := ls.ScanColumns(context.Background(), DefaultTable, "true", nil, false,
+		func(b *collections.Batch) bool { return true }); err == nil {
+		t.Fatal("an empty projection was accepted")
+	}
+}
+
+// TestLocalSessionUnknownTable: a name that resolves to nothing is an error, not an empty read.
+func TestLocalSessionUnknownTable(t *testing.T) {
+	ls, _, cleanup := localPair(t, true)
+	defer cleanup()
+	err := ls.ScanColumns(context.Background(), "no-such-table", "true", []string{"Cpus"}, false,
+		func(b *collections.Batch) bool { return true })
+	if err == nil || !strings.Contains(err.Error(), "no such table") {
+		t.Fatalf("got %v, want a no-such-table error", err)
 	}
 }
