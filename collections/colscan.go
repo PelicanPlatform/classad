@@ -101,13 +101,30 @@ type schemaScanState struct {
 // diagnostics. Enabled means a numeric COUNT(*) WHERE can take the columnar fast path; HotFields
 // are the demand-hot numeric columns kept uncompressed for O(1) scan; SchemaFields is the schema's
 // field count; and CoveredSegments of SealedSegments carry a columnar block (the rest row-fall-back
-// until a rewrite/reindex reaches them).
+// until a rewrite/reindex reaches them). Coverage is not the same as ColumnarSegments -- see there,
+// because the gap between the two is what makes a read fall back to whole records.
 type SchemaScanInfo struct {
 	Enabled         bool     `json:"enabled"`
 	HotFields       []string `json:"hotFields,omitempty"`
 	SchemaFields    int      `json:"schemaFields,omitempty"`
 	SealedSegments  int      `json:"sealedSegments,omitempty"`
 	CoveredSegments int      `json:"coveredSegments,omitempty"`
+	// ColumnarSegments is how many of SealedSegments have been rewritten into columnar-native
+	// form, where each schema'd attribute is stored once in the segment's own columnar payload
+	// rather than repeated in every record.
+	//
+	// This is NOT CoveredSegments, and the difference is why it is reported separately. A
+	// sidecar block is built for every sealed segment on the ordinary schema scan, unbounded,
+	// so CoveredSegments reaches SealedSegments almost at once -- which reads as "fully
+	// columnar" and is not. The native rewrite is bounded by ColumnarSegmentBudget, because one
+	// unbounded pass over a real archive is hours of I/O, so a table that has just enabled the
+	// accelerator keeps serving most reads from the record path for as many maintenance passes
+	// as the backlog takes to clear.
+	//
+	// SealedSegments - ColumnarSegments is that backlog, and it is the figure to look at when
+	// columnar reads are slower than expected on a table that reports full coverage.
+	// ColumnScanStats.RecordReads counts the same shortfall from the read side.
+	ColumnarSegments int `json:"columnarSegments,omitempty"`
 	// StaleSegments is how many covered segments were built under an earlier committed schema, hot
 	// tier or group set and are still to be brought current -- the backlog a schema change leaves,
 	// which maintenance works through ColumnarSegmentBudget segments per pass. Such a segment reads
@@ -254,6 +271,9 @@ func (c *Collection) SchemaScanInfo() SchemaScanInfo {
 		for _, seg := range sh.segs {
 			if seg != nil && seg != act && seg.used > 0 {
 				info.SealedSegments++
+				if seg.columnarized() {
+					info.ColumnarSegments++
+				}
 				if seg.colblk.Load() != nil {
 					info.CoveredSegments++
 					if stale != nil && stale.segStale(seg) {
