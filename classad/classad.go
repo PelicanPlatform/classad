@@ -467,6 +467,25 @@ func adopt(a *ast.ClassAd) *ClassAd {
 	return c
 }
 
+// NewView wraps a in a read-only ClassAd that does NOT build the name index an owned
+// ad keeps (see the index field): lookups scan a's attributes with a case-folding
+// comparison instead, which allocates nothing at all. Building the index costs a map
+// plus one lowercased key per attribute, which is the right trade for an ad that is
+// looked up many times, and the wrong one for a handful of attributes read once --
+// the shape the evaluator already treats this way for a nested record literal.
+//
+// a is NOT copied, and the view must be treated as read-only by its caller: the first
+// write detaches it onto a private copy (see own), so a's attributes are never
+// modified through the view, but a view built over a slice the caller goes on to reuse
+// reads whatever that slice holds at the time. Callers that reuse a backing array
+// between views must therefore be done with one view before refilling it.
+//
+// Unlike FromAST, a view neither sorts nor deduplicates a: a repeated name resolves to
+// its LAST assignment, matching the last-assignment-wins rule.
+func NewView(a *ast.ClassAd) *ClassAd {
+	return &ClassAd{ad: a}
+}
+
 // own prepares c for a write. A zero ClassAd gets an empty attribute list, and a view
 // is detached onto a private copy of its attributes -- new assignments as well as a
 // new slice, since Insert writes through an assignment's Value slot -- so the write

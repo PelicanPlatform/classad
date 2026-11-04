@@ -81,10 +81,22 @@ func (c *cursor) skip(n int) {
 // bodyStart positions a cursor at the start of the ad body, past the header and
 // any embedded standalone intern table. Returns false if the header is invalid.
 func (a Ad) bodyStart() (*cursor, bool) {
-	if len(a) < 3 || a[0] != magicByte || a[1] != formatVer {
+	var c cursor
+	if !a.bodyStartIn(&c) {
 		return nil, false
 	}
-	c := &cursor{b: a, pos: 3, ok: true, inline: a[2]&flagInlineNames != 0}
+	return &c, true
+}
+
+// bodyStartIn is bodyStart positioning a cursor the caller owns. The attribute readers called once per
+// attribute per record (Lookup, LookupByName) use it so the cursor can stay on their stack: returning
+// a *cursor forces one heap allocation per lookup, which on a row walk is an allocation per attribute
+// of every record read.
+func (a Ad) bodyStartIn(c *cursor) bool {
+	if len(a) < 3 || a[0] != magicByte || a[1] != formatVer {
+		return false
+	}
+	*c = cursor{b: a, pos: 3, ok: true, inline: a[2]&flagInlineNames != 0}
 	if a[2]&flagStandalone != 0 {
 		n := c.uvarint()
 		for i := uint64(0); i < n && c.ok; i++ {
@@ -92,10 +104,7 @@ func (a Ad) bodyStart() (*cursor, bool) {
 			c.skip(int(l))
 		}
 	}
-	if !c.ok {
-		return nil, false
-	}
-	return c, true
+	return c.ok
 }
 
 // Lookup returns the raw node bytes for the attribute with the given interned
@@ -107,10 +116,11 @@ func (a Ad) bodyStart() (*cursor, bool) {
 // directly, skipping the linear scan of the body. Non-hot attributes fall back
 // to a linear skip-scan.
 func (a Ad) Lookup(id uint32) ([]byte, bool) {
-	c, ok := a.bodyStart()
-	if !ok {
+	var cur cursor
+	if !a.bodyStartIn(&cur) {
 		return nil, false
 	}
+	c := &cur
 	// Hot header: (internID, entries-relative offset-to-node) pairs. The offsets
 	// resolve against the entries region, whose start is known only after the
 	// attrCount that follows the hot header, so record a hit and resolve below.
@@ -562,10 +572,11 @@ func DecodeNodeInline(node []byte) (ast.Expr, error) {
 // O(1) via the hot header (keyed by a case-folded name hash, verified against the
 // stored name); others fall back to a linear scan.
 func (a Ad) LookupByName(name string) ([]byte, bool) {
-	c, ok := a.bodyStart()
-	if !ok || !c.inline {
+	var cur cursor
+	if !a.bodyStartIn(&cur) || !cur.inline {
 		return nil, false
 	}
+	c := &cur
 	h := nameHash32(name)
 	hotCount := c.uvarint()
 	var hotEntryOff uint32

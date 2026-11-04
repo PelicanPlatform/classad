@@ -270,6 +270,9 @@ func tableResolver(t *InternTable) func(uint32) (string, bool) {
 	if t == nil {
 		return nil
 	}
+	if t.resolve != nil {
+		return t.resolve // the bound method built once; see InternTable.resolve
+	}
 	return t.Name
 }
 

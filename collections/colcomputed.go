@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/PelicanPlatform/classad/ast"
@@ -1138,11 +1139,20 @@ func (c *Collection) recordValueNode(d *segDictHandle, a wire.Ad, name string) (
 	if c.intern == nil {
 		return nil, false
 	}
-	ad := classad.New()
-	seen := map[string]struct{}{strings.ToLower(name): {}}
-	queue := []string{name}
-	for i := 0; i < len(queue); i++ {
-		nm := queue[i]
+	s := getRecordScratch()
+	defer func() {
+		s.reset()
+		recordScratchPool.Put(s)
+	}()
+
+	// names is the closure walk's queue AND its visited set: every name in it has been queued, so a
+	// reference already there is a duplicate. It replaces a map keyed by strings.ToLower(name), whose
+	// fold allocated a string per reference of every record read -- a closure is at most
+	// computedClosureMax names and in practice two or three, so a folding scan of it is cheaper than
+	// one map key.
+	s.names = append(s.names, name)
+	for i := 0; i < len(s.names); i++ {
+		nm := s.names[i]
 		node, ok := c.wireLookupDict(d, a, nm)
 		if !ok {
 			continue // absent: UNDEFINED, alone as in the whole record
@@ -1154,24 +1164,34 @@ func (c *Collection) recordValueNode(d *segDictHandle, a wire.Ad, name string) (
 		if err != nil {
 			return nil, false
 		}
-		refs, ok := deterministicRefs(expr, nil)
+		refs, ok := deterministicRefs(expr, s.refs[:0])
 		if !ok {
 			return nil, false
 		}
-		ad.Insert(nm, expr)
+		s.refs = refs
+		s.assigns = append(s.assigns, ast.AttributeAssignment{Name: nm, Value: expr})
 		for _, r := range refs {
-			f := strings.ToLower(r)
-			if _, dup := seen[f]; dup {
+			if s.queued(r) {
 				continue
 			}
-			if len(seen) >= computedClosureMax {
+			if len(s.names) >= computedClosureMax {
 				return nil, false
 			}
-			seen[f] = struct{}{}
-			queue = append(queue, r)
+			s.names = append(s.names, r)
 		}
 	}
-	v := ad.EvaluateAttr(name)
+	// The closure as a READ-ONLY ad. An owned ad (classad.New plus an Insert per attribute) builds a
+	// name index: a map, and a lowercased key per attribute, both thrown away with the record. The
+	// closure is read a handful of times by one evaluation, so a view -- which resolves a name by a
+	// folding scan of the attributes -- answers identically and allocates nothing per attribute.
+	//
+	// The walk is over, so assigns is not appended to again and these pointers stay valid for the rest
+	// of the call; the next call's reset drops them before it refills assigns.
+	for i := range s.assigns {
+		s.ptrs = append(s.ptrs, &s.assigns[i])
+	}
+	s.ad.Attributes = s.ptrs
+	v := classad.NewView(&s.ad).EvaluateAttr(name)
 	var node []byte
 	switch {
 	case v.IsUndefined():
@@ -1190,6 +1210,50 @@ func (c *Collection) recordValueNode(d *segDictHandle, a wire.Ad, name string) (
 	}
 	heldExceptionEvals.Add(1)
 	return node, true
+}
+
+// recordScratch is the working state of one recordValueNode call: the closure's names, the reference
+// list walkRefs fills, and the attribute list the closure ad reads. All of it is per record and thrown
+// away, which on a row walk over an unsealed segment is per row of the scan, so it is pooled and reused
+// instead. Nothing in it outlives the call: reset drops every reference before the scratch goes back,
+// so one record's attributes cannot be read as the next record's and a pooled scratch does not pin a
+// record's decoded expressions.
+type recordScratch struct {
+	ad      ast.ClassAd                // the closure, as the view's AST
+	assigns []ast.AttributeAssignment  // its attributes, stored by value
+	ptrs    []*ast.AttributeAssignment // ad.Attributes, pointing into assigns
+	names   []string                   // the closure walk's queue and visited set
+	refs    []string                   // walkRefs' output for the node being walked
+}
+
+var recordScratchPool = sync.Pool{New: func() any { return new(recordScratch) }}
+
+// getRecordScratch takes a scratch from the pool, ready to fill.
+func getRecordScratch() *recordScratch {
+	if s, ok := recordScratchPool.Get().(*recordScratch); ok {
+		return s
+	}
+	return new(recordScratch)
+}
+
+// queued reports whether name is already in the closure walk's queue, case-insensitively.
+func (s *recordScratch) queued(name string) bool {
+	for _, n := range s.names {
+		if foldEqualStrings(n, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// reset empties the scratch, dropping every reference it holds.
+func (s *recordScratch) reset() {
+	s.ad.Attributes = nil
+	clear(s.assigns)
+	clear(s.ptrs)
+	clear(s.names)
+	clear(s.refs)
+	s.assigns, s.ptrs, s.names, s.refs = s.assigns[:0], s.ptrs[:0], s.names[:0], s.refs[:0]
 }
 
 // evaluatingLookup wraps a row fallback's attribute lookup so an expression-valued attribute comes back
