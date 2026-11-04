@@ -39,7 +39,9 @@ import "encoding/binary"
 // table) or already interned -- when it carries a sealed value (see the note at the top of this
 // file), or when it is malformed. The caller falls back to decoding, which is the source of truth.
 func AppendInternedFromInline(dst []byte, src Ad, t *InternTable, hot map[uint32]struct{}) ([]byte, bool) {
-	c, ok := src.bodyStart()
+	var cBuf cursor
+	ok := src.bodyStartIn(&cBuf)
+	c := &cBuf
 	if !ok || !c.inline || src[2]&flagStandalone != 0 {
 		return dst, false
 	}

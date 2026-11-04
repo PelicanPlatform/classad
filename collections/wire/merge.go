@@ -144,7 +144,9 @@ func isRemoved(removed []string, name []byte) bool {
 func appendMergedInline(dst []byte, base Ad, overlays []Ad, removed []string, sc *MergeScratch) ([]byte, bool) {
 	sc.Reset()
 	for _, ov := range overlays {
-		c, ok := ov.bodyStart()
+		var cBuf cursor
+		ok := ov.bodyStartIn(&cBuf)
+		c := &cBuf
 		if !ok || !c.inline || ov[2]&flagStandalone != 0 {
 			return dst, false
 		}
@@ -175,7 +177,9 @@ func appendMergedInline(dst []byte, base Ad, overlays []Ad, removed []string, sc
 		}
 	}
 
-	bc, ok := base.bodyStart()
+	var bcBuf cursor
+	ok := base.bodyStartIn(&bcBuf)
+	bc := &bcBuf
 	if !ok || !bc.inline || base[2]&flagStandalone != 0 {
 		return dst, false
 	}
