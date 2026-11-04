@@ -30,7 +30,7 @@ import (
 func (c *Collection) ScanRawWireRefs(projection []string, redact bool) iter.Seq[[]byte] {
 	return func(yield func([]byte) bool) {
 		sel := c.newWireSubsetSelectorRefs(projection, redact, true)
-		if c.runParallelWireScan(sel, sel.neededCount(), yield) {
+		if c.runUnconstrainedWireFanout(sel, redact, yield) {
 			return
 		}
 		emit := c.yieldWireRow(yield, sel)
@@ -70,8 +70,8 @@ func (c *Collection) QueryRawWireRefsStats(q *vm.Query, projection []string, red
 		}
 		qp := c.newQueryPlan(q, proj, stats, redact)
 		rp := c.planReadQuery(qp)
-		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 && !c.reverseScan {
-			if c.runParallelWireQuery(qp, sel, sel.neededCount(), yield) {
+		if c.queryPar > 1 && !rp.disjunctive() && len(rp.usable) == 0 {
+			if c.runWireFanout(qp, sel, sel.neededCount(), yield) {
 				return
 			}
 		}

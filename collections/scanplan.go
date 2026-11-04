@@ -122,8 +122,18 @@ func constTrue(qp *queryPlan) bool {
 // The stats sink is dropped: ScanStats is not safe for concurrent accumulation, and
 // a worker that inherited one would corrupt an EXPLAIN ANALYZE rather than fail.
 func (c *Collection) workerPlan(qp queryPlan) queryPlan {
-	ws := &wireScope{ctx: qp.ws.ctx} // the plan's entitlement, not the collection's key
-	qp.m = qp.q.Matcher()
+	// The ZERO plan is legitimate here: it is "the unfiltered plan the Scan paths use" (see
+	// queryPlan), and the ordered fan-out runs those scans too -- an unconstrained wire read over
+	// a newest-first collection arrives with no query, and so with no matcher to clone and no
+	// wireScope to take an entitlement from.
+	var ctx wireCtx
+	if qp.ws != nil {
+		ctx = qp.ws.ctx
+	}
+	ws := &wireScope{ctx: ctx} // the plan's entitlement, not the collection's key
+	if qp.q != nil {
+		qp.m = qp.q.Matcher()
+	}
 	qp.ws = ws
 	qp.resolver = ws.resolve
 	qp.stats = nil
