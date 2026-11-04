@@ -141,3 +141,72 @@ func TestOrderedWireQueryEarlyStopIsNewest(t *testing.T) {
 		}
 	}
 }
+
+// THE WORKER BUDGET IS SHARED, AND A BUSY STORE REFUSES WORKERS MID-READ.
+//
+// runOrderedWireQuery asks for its workers AFTER walking the newest segment on the caller's
+// goroutine, and by then it has already yielded: it can no longer return false and let the caller
+// re-run the whole read serially. A refusal there has to be answered by finishing the remaining
+// segments in place. That path is reached only when the budget is short, so nothing exercises it
+// on an idle machine -- and a read that silently dropped every segment after the first would
+// still return rows, in the right order, just not all of them.
+func TestOrderedFanoutFinishesSeriallyWhenBudgetRefused(t *testing.T) {
+	const n = 20000
+	c := orderedFixture(t, n, 8)
+	// Leave exactly one token free. tryAcquire then returns 1, which is below the two workers
+	// a fan-out needs, so the read must finish the rest itself.
+	held := cap(c.qsem) - 1
+	for i := 0; i < held; i++ {
+		c.qsem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < held; i++ {
+			<-c.qsem
+		}
+	}()
+
+	before := wireOrderedFanouts.Load()
+	got := orderedClusterIds(t, c, "JobStatus >= 0")
+	if wireOrderedFanouts.Load() != before {
+		t.Fatal("the read fanned out; this test is meant to exercise the serial finish after the prelude")
+	}
+	if len(got) != n {
+		t.Fatalf("%d rows, want %d: the segments after the prelude were dropped", len(got), n)
+	}
+	for i, v := range got {
+		if want := int64(n - 1 - i); v != want {
+			t.Fatalf("row %d: ClusterId %d, want %d (newest-first)", i, v, want)
+		}
+	}
+}
+
+// Each worker counts into its OWN ScanStats, because ScanStats carries no synchronization, and the
+// caller's copy is filled by merging them at the end. Drop that merge and every counter reads zero
+// while the rows themselves are perfectly correct -- so the scan would look free, and
+// .slow reports and the columnar-vs-record accounting would quietly describe nothing.
+func TestOrderedFanoutMergesWorkerStats(t *testing.T) {
+	const n = 20000
+	c := orderedFixture(t, n, 8)
+	q, err := vm.Parse("JobStatus >= 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st ScanStats
+	before := wireOrderedFanouts.Load()
+	rows := 0
+	for range c.QueryRawWireRefsStats(q, []string{"ClusterId"}, false, &st) {
+		rows++
+	}
+	if wireOrderedFanouts.Load() == before {
+		t.Fatal("the read did not fan out; the per-worker merge is not what this measured")
+	}
+	if rows != n {
+		t.Fatalf("%d rows, want %d", rows, n)
+	}
+	if st.RecordsVisited != n {
+		t.Fatalf("stats merged %d visited records, want %d", st.RecordsVisited, n)
+	}
+	if st.RowsMatched != n {
+		t.Fatalf("stats merged %d matched rows, want %d", st.RowsMatched, n)
+	}
+}
